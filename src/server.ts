@@ -2151,6 +2151,28 @@ function routes(app: Express): void {
       const sid = req.get("mcp-session-id");
       const sess = sid ? mcpSessions.get(sid) : undefined;
       if (!sess) {
+        // OpenAI/ChatGPT (openai-mcp UA) probes a NEW conversation with a
+        // sessionless GET before any initialize; answering 400 is surfaced to
+        // the connector as "invalid_mcp_response" and the conversation never
+        // recovers. Serve the probe with a well-framed, short SSE 200: it is a
+        // valid text/event-stream (never misread as an invalid MCP response),
+        // creates no session, and ends immediately (no long-lived connection
+        // leak). Non-OpenAI sessionless GETs keep the standard 400/stateful
+        // behavior — the GET stream still requires a real session.
+        if (isStatelessClient(req)) {
+          res.status(200);
+          res.set({
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache, no-transform",
+            Connection: "keep-alive",
+            "X-Accel-Buffering": "no",
+          });
+          // Single SSE comment (keepalive-style) then close: a valid stream
+          // that carries no JSON-RPC payload and leaks no connection.
+          res.write(": connected\n\n");
+          res.end();
+          return;
+        }
         res.status(400).json({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: session required for GET stream" }, id: null });
         return;
       }

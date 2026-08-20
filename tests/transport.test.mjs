@@ -409,6 +409,47 @@ test("GET / without session -> 400 (not 405/501), GET /mcp/ alias parity", async
   assert.equal(r2.status, 400);
 });
 
+// OpenAI/ChatGPT GET probe recovery: a NEW conversation probes with a
+// sessionless GET (openai-mcp UA, no Mcp-Session-Id) before any initialize.
+// A 400 here is surfaced by the connector as "invalid_mcp_response" and the
+// conversation never recovers. The server must answer with a well-framed,
+// short SSE 200 — a valid text/event-stream that creates no session and
+// closes immediately (no long-lived connection leak) — while non-OpenAI
+// sessionless GETs keep the standard 400/stateful behavior above.
+test("openai-mcp UA: sessionless GET probe on / and /mcp -> 200 SSE, no session, ends immediately", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    for (const p of ["/", "/mcp"]) {
+      const probe = await fetch(`${BASE}${p}`, {
+        method: "GET",
+        headers: { ...headers(), "User-Agent": OPENAI_UA },
+        signal: AbortSignal.timeout(5000),
+      });
+      assert.equal(probe.status, 200, `openai-mcp GET probe on ${p} must be 200, got ${probe.status}`);
+      assert.match(probe.headers.get("content-type") ?? "", /text\/event-stream/i,
+        `openai-mcp GET probe on ${p} must be framed as text/event-stream`);
+      assert.equal(probe.headers.get("mcp-session-id"), null,
+        `openai-mcp GET probe on ${p} must NOT create a session`);
+      // Body is a keepalive-style SSE comment (or empty) — never a JSON-RPC
+      // error payload the client could misread as invalid_mcp_response.
+      const body = await probe.text();
+      assert.doesNotMatch(body, /jsonrpc/, `probe body on ${p} must not carry JSON-RPC: ${body.slice(0, 80)}`);
+      assert.doesNotMatch(body, /invalid_mcp_response/, `probe body on ${p} must not contain error text`);
+    }
+    // The probe must not have created a session: a follow-up stateless
+    // initialize still returns NO Mcp-Session-Id, and tools/list works.
+    const init = await rpc("initialize", openaiInit, { noSession: true, ua: OPENAI_UA });
+    assert.equal(init.status, 200);
+    assert.equal(init.res.headers.get("mcp-session-id"), null);
+    const list = await rpc("tools/list", {}, { noSession: true, ua: OPENAI_UA });
+    assert.equal(list.status, 200);
+    assert.equal(list.msg.result.tools.length, 9);
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
 test("GET /mcp with a valid session opens SSE stream", async () => {
   const savedSid = sessionId;
   sessionId = null;
