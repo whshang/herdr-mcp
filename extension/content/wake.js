@@ -7,7 +7,7 @@
 // - 权限弹窗: 唤醒期间检测页面内权限对话框, 自动点"允许" (保守 fail-closed)
 // 状态反馈: 页内不再画点 (用户反馈困惑), 改用工具栏图标徽章 (background 驱动)。
 // 版本: 与 background.js 的 H2W_SCRIPT_VERSION 同步 bump (改 content 代码必须)。
-const H2W_CONTENT_VERSION = "0.1.1";
+const H2W_CONTENT_VERSION = "0.1.2";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] 无适配器, 跳过"); return; }
@@ -75,34 +75,19 @@ const H2W_CONTENT_VERSION = "0.1.1";
     return ADAPTER.send();
   }
 
-  // ---- 权限弹窗自动允许 (页面内 DOM 弹窗; 浏览器原生权限条无法自动点) ----
-  // 仅在有权限类字样的对话框/弹层里点明确肯定按钮, 拒绝/取消类绝不点。
-  const PERM_DLG_SELECTORS = '[role="dialog"], [role="alertdialog"], .modal, [class*="modal"], [class*="dialog"], [class*="Dialog"], [class*="popup"]';
+  // ---- 权限弹窗自动允许 (页面内 DOM 弹窗/工具权限卡片; 浏览器原生权限条无法自动点) ----
+  // 复用 base.js 的 __H2W_PERMISSION__ 纯逻辑 (fail-closed): 只点可见/可用/明确
+  // 文本的"允许"按钮, 且按钮所在最小卡片须含权限类标题说明 + 明确拒绝按钮。
+  // 重复 mutation 不重复点击 (WeakSet 去重, 见 base.js 的 createPermissionClicker)。
+  const PERM = window.__H2W_PERMISSION__;
+  let permClicker = null;
   let permObs = null;
   let permDeadline = 0;
-  let permHandled = new WeakSet();
-  function findPermissionDialog() {
-    const els = [...document.querySelectorAll(PERM_DLG_SELECTORS)];
-    return els.find((el) => isPermissionDialogText(el.innerText || ""));
-  }
-  function findAllowButtonIn(dlg) {
-    const btns = [...dlg.querySelectorAll("button, [role=button], [class*=btn]")];
-    for (const b of btns) {
-      const label = (b.innerText || b.textContent || b.getAttribute("aria-label") || "").trim();
-      if (isAllowButtonText(label)) return b;
-    }
-    return null;
-  }
   function permissionTryClick() {
     if (!runtimeAlive() || Date.now() > permDeadline) { permissionStop(); return; }
-    const dlg = findPermissionDialog();
-    if (dlg && !permHandled.has(dlg)) {
-      permHandled.add(dlg);
-      const btn = findAllowButtonIn(dlg);
-      if (btn) {
-        console.log(`[h2w] 权限弹窗自动点「${(btn.innerText || btn.textContent || "?").trim()}」`);
-        btn.click();
-      }
+    const r = permClicker.tryClick(document);
+    if (r.handled) {
+      console.log(`[h2w] 权限卡片自动点「${(r.button.innerText || r.button.textContent || "?").trim()}」`);
     }
   }
   function permissionStop() {
@@ -111,9 +96,18 @@ const H2W_CONTENT_VERSION = "0.1.1";
   function startPermissionWatch(durationMs = 90000) {
     if (permObs) return; // 已在观察
     permDeadline = Date.now() + durationMs;
+    // 卡片先出现/按钮后挂载: 只在 findAllowAction 实际找到并点击后才由 clicker 标记,
+    // 不会因提前标记而漏掉后挂载的按钮。
+    permClicker = PERM.createPermissionClicker();
     permissionTryClick();
     permObs = new MutationObserver(() => permissionTryClick());
-    try { permObs.observe(document.body, { childList: true, subtree: true }); } catch (e) {}
+    // childList 覆盖按钮后挂载; attributes 让初始 disabled/hidden 的按钮后来变可用
+    try {
+      permObs.observe(document.body, {
+        childList: true, subtree: true,
+        attributes: true, attributeFilter: ["disabled", "hidden", "aria-disabled", "aria-hidden", "style"],
+      });
+    } catch (e) {}
     setTimeout(permissionStop, durationMs + 5000);
   }
 

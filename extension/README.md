@@ -53,15 +53,31 @@ extension/
 | 唤醒失败 (wake ack error) | 红 `!` (8s) |
 | 其余时间 / 无绑定 | 无徽章 (绑定状态看 popup) |
 
-## 权限弹窗自动允许 (v0.1.1)
+## 权限弹窗自动允许 (v0.1.1; 卡片识别扩展 v0.1.2)
 
-唤醒期间 (提交前 ~90s 窗口) 检测**页面内**权限弹窗并自动点肯定按钮:
+唤醒期间 (提交前 ~90s 窗口) 检测**页面内**权限弹窗/权限卡片并自动点肯定按钮:
 
-- 判定 (保守 fail-closed, 见 `content/base.js` 纯函数 + 单测):
-  - 弹窗需形如 `[role=dialog] / .modal / [class*=dialog]` 且文本含权限类字样
-    (允许/授权/权限/同意/allow/permission/grant/approve);
-  - 按钮需为肯定前缀 (允许/同意/授权/allow/approve/grant) 或整词 (ok/yes/continue);
-  - **拒绝/取消/不允许/deny/decline/block/no 一律不点**;
+- 识别目标分两类:
+  1. **经典弹窗**: `[role=dialog] / [role=alertdialog] / .modal / [class*=dialog]` 等容器;
+  2. **tool-action 权限卡片** (ChatGPT 工具权限, v0.1.2 新增): 非固定 role, 卡片含
+     权限标题 + 说明, 下方按钮区同时有明确拒绝按钮与"允许"主按钮, 右侧还可能有
+     `aria-haspopup=menu` 的下拉箭头。
+     - **优先精确按钮区**: ChatGPT 真实卡片按钮区带 `data-testid="tool-action-buttons"`
+       (常量 `TOOL_ACTION_BUTTONS_ID`), 仅当该 testid 区同时含 deny + 主 allow 才接受;
+     - **语义 fallback**: 无该 testid 时, 才用"最小含 deny 祖先"语义 (从 action button
+       向上排除 body/html), 旧 dialog/无 testid 站仍可识别;
+     - 从候选 action button 向上定位**最小**同时满足以下条件的祖先卡片:
+       - 卡片**非按钮文本**满足 `isPermissionDialogText` (允许/授权/权限/同意/allow/...);
+       - 卡片内存在明确**拒绝/取消**按钮 (fail-closed 必要条件)。
+- 判定 (保守 fail-closed, 见 `content/base.js` 纯函数 `window.__H2W_PERMISSION__` + 单测):
+  - 只点**可见、可用 (非 disabled/aria-disabled/hidden/aria-hidden)、有明确文本**的
+    肯定按钮 (允许/同意/授权/allow/approve/grant 前缀或整词 ok/yes/continue);
+  - **排除**: 拒绝/取消/不允许/deny/decline/block/no、`aria-haspopup` 下拉触发、
+    `aria-label` 含 menu/dropdown/更多/菜单 的纯图标按钮、无文本按钮;
+  - 绝不因父容器 (含整个页面) 某处有"允许"而误点; 无拒绝按钮的卡片不点。
+- 去重: 仅当实际找到并点击后才标记 (`WeakSet`), 卡片先出现/按钮后挂载时
+  MutationObserver (childList+subtree+disabled/hidden 属性) 仍能补点; 重复 mutation
+  不重复点击。
 - 开关: 选项页 "唤醒后自动点允许权限弹窗" (默认开)。
 - **平台硬限制 (如实说明)**: 浏览器**原生**权限条 (通知/麦克风/摄像头/剪贴板) 不是
   页面 DOM, 扩展无法自动点击 — 这类提示仍需用户手动点。

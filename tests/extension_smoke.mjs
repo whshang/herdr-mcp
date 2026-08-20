@@ -137,5 +137,297 @@ console.log("\n[permission auto-allow 判定]");
   ok(fn("isAllowButtonText('不要允许')") === false, "否定句不点");
 }
 
+console.log("\n[tool-action 权限卡片 DOM 自动允许]");
+{
+  // 轻量自建 DOM fixture (不新增依赖): 支持 base.js __H2W_PERMISSION__ 用到的 API。
+  // 仅实现 helper 实际使用的子集: parentElement / childNodes / querySelectorAll /
+  // hasAttribute/getAttribute / matches / innerText / click 计数。
+  class MockEl {
+    constructor(tag, attrs = {}) {
+      this.tagName = tag.toUpperCase();
+      this.nodeType = 1;
+      this.parentElement = null;
+      this.childNodes = [];
+      this.attrs = { ...attrs };
+      this.clickCount = 0;
+      this.isConnected = true;
+      this.disabled = false;
+      this.hidden = false;
+    }
+    get className() { return this.attrs.class || ""; }
+    getAttribute(n) { return this.attrs[n] ?? null; }
+    hasAttribute(n) { return n in this.attrs; }
+    matches(sel) {
+      const btnSel = "button, [role=button], [class*=btn]";
+      if (sel !== btnSel) return false;
+      return this.tagName === "BUTTON" || this.getAttribute("role") === "button"
+        || (this.className || "").toLowerCase().includes("btn");
+    }
+    click() { this.clickCount++; }
+    get innerText() {
+      // 与浏览器一致的近似: 拼接文本子树 (跳过 aria-hidden 区不计, 此处简化为全部文本)
+      let out = "";
+      for (const c of this.childNodes) {
+        if (c.nodeType === 3) out += c.data;
+        else if (c.nodeType === 1) out += c.innerText;
+      }
+      return out;
+    }
+    get textContent() { return this.innerText; }
+    querySelectorAll(sel) {
+      const out = [];
+      (function walk(n) {
+        for (const c of n.childNodes || []) {
+          if (c.nodeType === 1) {
+            if (typeof c.matches === "function" && c.matches(sel)) out.push(c);
+            walk(c);
+          }
+        }
+      })(this);
+      return out;
+    }
+  }
+  function textNode(data) { return { nodeType: 3, data, innerText: data, textContent: data }; }
+  function el(tag, attrs = {}, ...kids) {
+    const e = new MockEl(tag, attrs);
+    for (const k of kids) {
+      if (typeof k === "string") e.childNodes.push(textNode(k));
+      else { k.parentElement = e; e.childNodes.push(k); }
+    }
+    return e;
+  }
+  function btn(label, attrs = {}) {
+    const b = el("button", attrs, label);
+    b.disabled = !!attrs.disabled;
+    b.hidden = !!attrs.hidden;
+    return b;
+  }
+  // 文档根: body 作为 cardForButton 向上遍历的终点 (真实 DOM: btn.ownerDocument.body)
+  function buildDoc(card) {
+    const docEl = el("html", {});
+    const body = el("body", {});
+    body.childNodes.push(card); card.parentElement = body;
+    docEl.childNodes.push(body); body.parentElement = docEl;
+    const doc = { body, documentElement: docEl };
+    (function setOwner(n) {
+      for (const c of n.childNodes || []) {
+        if (c.nodeType === 1) { c.ownerDocument = doc; setOwner(c); }
+      }
+    })(body);
+    return { document: body, body, documentElement: docEl };
+  }
+
+  // 加载 base.js 到 vm, 取得 __H2W_PERMISSION__ 测试 hook
+  const code = readFileSync(path.join(EXT, "content/base.js"), "utf8");
+  const window = {};
+  const ctx = vm.createContext({ window, document: { querySelectorAll: () => [] }, console });
+  vm.runInContext(code, ctx);
+  const P = vm.runInContext("window.__H2W_PERMISSION__", ctx);
+
+  // 1) 新 tool-action card: 点主"允许"恰好 1 次
+  {
+    const allow = btn("允许");
+    const deny = btn("拒绝");
+    const drop = btn("", { "aria-haspopup": "menu", "aria-label": "更多操作" });
+    const card = el("div", { class: "tool-action-card" },
+      el("h3", {}, "ChatGPT 请求使用工具"),
+      el("p", {}, "此工具需要权限访问你的文件"),
+      el("div", { class: "btn-area", "data-testid": "tool-action-buttons" }, deny, allow, drop));
+    const { document } = buildDoc(card);
+    const clicker = P.createPermissionClicker();
+    const r1 = clicker.tryClick(document);
+    ok(r1.handled === true && r1.button === allow, "tool-action card 找到可点允许按钮");
+    const r2 = clicker.tryClick(document);
+    ok(r2.duplicate === true && r2.handled === false, "重复 mutation 不重复点击 (duplicate)");
+    ok(allow.clickCount === 1, "允许按钮恰好点击 1 次");
+    ok(deny.clickCount === 0, "拒绝按钮不点");
+    ok(drop.clickCount === 0, "aria-haspopup=menu 下拉不点");
+  }
+  // 2) 下拉箭头单独存在时也不点 (卡片含拒绝+允许+下拉: 只点允许)
+  {
+    const allow = btn("允许");
+    const deny = btn("拒绝");
+    const drop = btn("", { "aria-haspopup": "menu", "aria-label": "更多操作" });
+    const card = el("div", { class: "tool-action-card" },
+      el("h3", {}, "ChatGPT 请求使用工具"),
+      el("p", {}, "此工具需要权限"),
+      el("div", { class: "btn" }, deny, allow, drop));
+    const { document } = buildDoc(card);
+    const clicker = P.createPermissionClicker();
+    const r = clicker.tryClick(document);
+    ok(r.handled === true && r.button === allow, "允许+下拉(含拒绝): 点允许不点下拉");
+    ok(drop.clickCount === 0, "下拉箭头点击计数 0");
+  }
+  // 3) 无拒绝按钮 → 不点 (fail-closed)
+  {
+    const allow = btn("允许");
+    const card = el("div", { class: "tool-action-card" },
+      el("h3", {}, "ChatGPT 请求使用工具"),
+      el("p", {}, "此工具需要权限"),
+      el("div", { class: "btn" }, allow));
+    const { document } = buildDoc(card);
+    const clicker = P.createPermissionClicker();
+    const r = clicker.tryClick(document);
+    ok(r.handled === false && allow.clickCount === 0, "无拒绝按钮 → 不点");
+  }
+  // 4) 标题非权限 → 不点 (允许二字只在按钮里, 不把卡片判成权限)
+  {
+    const allow = btn("允许");
+    const deny = btn("拒绝");
+    const card = el("div", { class: "tool-action-card" },
+      el("h3", {}, "保存确认"),
+      el("div", { class: "btn" }, deny, allow));
+    const { document } = buildDoc(card);
+    const clicker = P.createPermissionClicker();
+    const r = clicker.tryClick(document);
+    ok(r.handled === false && allow.clickCount === 0, "标题非权限 → 不点");
+  }
+  // 5) disabled / hidden 允许按钮 → 不点
+  {
+    const allowDis = btn("允许", { disabled: true });
+    const allowHid = btn("允许", { hidden: true });
+    const deny = btn("拒绝");
+    const card1 = el("div", { class: "tool-action-card" },
+      el("h3", {}, "ChatGPT 请求使用工具"), el("p", {}, "需要权限"),
+      el("div", { class: "btn" }, deny, allowDis));
+    const card2 = el("div", { class: "tool-action-card" },
+      el("h3", {}, "ChatGPT 请求使用工具"), el("p", {}, "需要权限"),
+      el("div", { class: "btn" }, deny, allowHid));
+    for (const [card, a, tag] of [[card1, allowDis, "disabled"], [card2, allowHid, "hidden"]]) {
+      const { document } = buildDoc(card);
+      const clicker = P.createPermissionClicker();
+      const r = clicker.tryClick(document);
+      ok(r.handled === false && a.clickCount === 0, `${tag} 允许按钮 → 不点`);
+    }
+  }
+  // 6) 旧 role=dialog 仍可识别
+  {
+    const allow = btn("Allow");
+    const deny = btn("Deny");
+    const card = el("div", { role: "dialog", "aria-modal": "true" },
+      el("h3", {}, "Grant permission"),
+      el("p", {}, "Allow this tool to access your data"),
+      el("div", { class: "btn" }, deny, allow));
+    const { document } = buildDoc(card);
+    const clicker = P.createPermissionClicker();
+    const r = clicker.tryClick(document);
+    ok(r.handled === true && r.button === allow && allow.clickCount === 1, "旧 role=dialog 仍可识别并点 Allow 1 次");
+    ok(deny.clickCount === 0, "dialog 内 Deny 不点");
+  }
+  // 7) 无文本按钮 / aria-label=更多 的纯图标按钮不点
+  {
+    const iconBtn = btn("", { "aria-label": "更多操作" });
+    const allow = btn("允许");
+    const deny = btn("拒绝");
+    const card = el("div", { class: "tool-action-card" },
+      el("h3", {}, "ChatGPT 请求使用工具"), el("p", {}, "需要权限"),
+      el("div", { class: "btn" }, iconBtn, deny, allow));
+    const { document } = buildDoc(card);
+    const clicker = P.createPermissionClicker();
+    const r = clicker.tryClick(document);
+    ok(r.handled === true && r.button === allow && iconBtn.clickCount === 0, "无文本/更多图标按钮不点");
+  }
+  // 8) aria-disabled=true / aria-hidden=true → 不点 (fail-closed)
+  {
+    const allowArDis = btn("允许", { "aria-disabled": "true" });
+    const allowArHid = btn("允许", { "aria-hidden": "true" });
+    const deny = btn("拒绝");
+    const mkCard = (allow) => el("div", { class: "tool-action-card" },
+      el("h3", {}, "ChatGPT 请求使用工具"), el("p", {}, "需要权限"),
+      el("div", { class: "btn" }, deny, allow));
+    for (const [allow, tag] of [[allowArDis, "aria-disabled=true"], [allowArHid, "aria-hidden=true"]]) {
+      const { document } = buildDoc(mkCard(allow));
+      const clicker = P.createPermissionClicker();
+      const r = clicker.tryClick(document);
+      ok(r.handled === false && allow.clickCount === 0, `${tag} 允许按钮 → 不点`);
+    }
+  }
+  // 9) ChatGPT 卡外另有"允许"按钮: 仍只点 action area 主允许, 不取外部按钮
+  {
+    const mainAllow = btn("允许");
+    const deny = btn("拒绝");
+    const card = el("div", { class: "tool-action-card" },
+      el("h3", {}, "ChatGPT 请求使用工具"), el("p", {}, "此工具需要权限"),
+      el("div", { class: "btn-area" }, deny, mainAllow));
+    // 外部孤立"允许"按钮 (在同一 body 下, 但其所在 action 区无拒绝 → 精确路径拒绝)
+    const externalAllow = btn("允许");
+    // 注意: 外部按钮 DOM 顺序在前, 确保 findAllowAction 先扫到它也跳过, 再选主允许
+    const docEl = el("html", {});
+    const body = el("body", {}, externalAllow, card);
+    externalAllow.parentElement = body; card.parentElement = body;
+    docEl.childNodes.push(body); body.parentElement = docEl;
+    const doc = { body, documentElement: docEl };
+    (function setOwner(n) {
+      for (const c of n.childNodes || []) {
+        if (c.nodeType === 1) { c.ownerDocument = doc; setOwner(c); }
+      }
+    })(body);
+    const clicker = P.createPermissionClicker();
+    const r = clicker.tryClick(body);
+    ok(r.handled === true && r.button === mainAllow, "卡外另有允许: 仍选 action area 主允许");
+    ok(mainAllow.clickCount === 1 && externalAllow.clickCount === 0, "外部允许按钮不被点");
+  }
+  // 10) 初始 disabled 允许按钮 → 移除属性后再次 tryClick (等价 Observer callback) 能补点, 随后去重
+  {
+    const allow = btn("允许", { disabled: true });
+    const deny = btn("拒绝");
+    const card = el("div", { class: "tool-action-card" },
+      el("h3", {}, "ChatGPT 请求使用工具"), el("p", {}, "需要权限"),
+      el("div", { class: "btn" }, deny, allow));
+    const { document } = buildDoc(card);
+    const clicker = P.createPermissionClicker();
+    const r1 = clicker.tryClick(document);
+    ok(r1.handled === false && allow.clickCount === 0, "初始 disabled → 不点");
+    // 模拟站点后挂载 enabled: 移除 disabled 属性 + 清 disabled 标志 (observer callback 会再调 tryClick)
+    delete allow.attrs.disabled;
+    allow.disabled = false;
+    const r2 = clicker.tryClick(document); // 等价 Observer callback 再跑一次
+    ok(r2.handled === true && r2.button === allow && allow.clickCount === 1, "移除 disabled 后补点 1 次");
+    const r3 = clicker.tryClick(document);
+    ok(r3.duplicate === true && r3.handled === false && allow.clickCount === 1, "补点后再次 tryClick 去重 (不重复点击)");
+  }
+  // 11) 嵌套外层含 deny + 卡外 allow 的负例: 仍只点 exact action area 主允许
+  //     卡内 action area 有 data-testid=tool-action-buttons; 外层再包一个含 deny 的容器,
+  //     卡外另有一个孤立 allow。actionAreaFor 必须优先 testid 区, 不扩大到外层 deny。
+  {
+    const mainAllow = btn("允许");
+    const innerDeny = btn("拒绝");
+    const actionArea = el("div", { class: "btn-area", "data-testid": "tool-action-buttons" }, innerDeny, mainAllow);
+    const card = el("div", { class: "tool-action-card" },
+      el("h3", {}, "ChatGPT 请求使用工具"), el("p", {}, "此工具需要权限"), actionArea);
+    // 外层更大的 deny 容器 (含卡片): 精确 testid 区应阻止扩大到这层
+    const outerDeny = btn("拒绝");
+    const outerWrap = el("div", { class: "outer" }, outerDeny, card);
+    // 卡外孤立 allow (与卡片无关)
+    const externalAllow = btn("允许");
+    const docEl = el("html", {});
+    const body = el("body", {}, externalAllow, outerWrap);
+    externalAllow.parentElement = body; outerWrap.parentElement = body;
+    docEl.childNodes.push(body); body.parentElement = docEl;
+    const doc = { body, documentElement: docEl };
+    (function setOwner(n) {
+      for (const c of n.childNodes || []) {
+        if (c.nodeType === 1) { c.ownerDocument = doc; setOwner(c); }
+      }
+    })(body);
+    const clicker = P.createPermissionClicker();
+    const r = clicker.tryClick(body);
+    ok(r.handled === true && r.button === mainAllow, "嵌套外层含 deny: 仍点真实 testid action area 主允许");
+    ok(mainAllow.clickCount === 1 && externalAllow.clickCount === 0 && outerDeny.clickCount === 0, "仅主允许被点 (外部/外层 deny 均不点)");
+  }
+  // 12) 无 data-testid 的语义 fallback: 最小含 deny 祖先仍可识别 (旧 dialog/无 testid 站)
+  {
+    const allow = btn("允许");
+    const deny = btn("拒绝");
+    const card = el("div", { class: "tool-action-card" },
+      el("h3", {}, "ChatGPT 请求使用工具"), el("p", {}, "此工具需要权限"),
+      el("div", { class: "btn" }, deny, allow)); // 无 data-testid
+    const { document } = buildDoc(card);
+    const clicker = P.createPermissionClicker();
+    const r = clicker.tryClick(document);
+    ok(r.handled === true && r.button === allow && allow.clickCount === 1, "无 data-testid: 语义 fallback 仍点主允许 1 次");
+  }
+}
+
 console.log(`\n=== ${failures === 0 ? "EXTENSION SMOKE ALL PASS" : failures + " FAILURES"} ===`);
 process.exit(failures === 0 ? 0 : 1);

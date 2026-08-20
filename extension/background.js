@@ -10,7 +10,7 @@
 // H2W_SCRIPT_VERSION (background) 与 H2W_CONTENT_VERSION (wake.js)。
 import { decideWake, pruneExpired, bindingRevision, buildWakeTemplate } from "./binding-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.1";
+const H2W_SCRIPT_VERSION = "0.1.2";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const tabVersions = new Map();
 const reloadedTabs = new Set();
