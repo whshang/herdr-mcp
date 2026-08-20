@@ -1,0 +1,51 @@
+{
+  "manifest_version": 3,
+  "name": "herdr → Web wake",
+  "version": "0.1.0",
+  "description": "herdr agent 干完活 → 向绑定的网页会话输入框写消息并提交,唤醒网页 AI (z.ai / DeepSeek / Claude / ChatGPT)",
+  "permissions": ["storage", "scripting"],
+  "host_permissions": [
+    "http://127.0.0.1:8772/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": ["https://chat.z.ai/*"],
+      "js": ["content/base.js", "content/injector/zai.js", "content/webmcp/speaks-json.js", "content/wake.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["content/base.js", "content/injector/deepseek.js", "content/webmcp/speaks-json.js", "content/wake.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": ["content/base.js", "content/injector/claude.js", "content/wake.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content/base.js", "content/injector/chatgpt.js", "content/wake.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

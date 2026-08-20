@@ -1,0 +1,48 @@
+# --- Node.js build / cache ---
+node_modules/
+dist/
+*.tsbuildinfo
+
+# --- Test / coverage / tooling artifacts ---
+coverage/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# --- Logs / temp ---
+*.log
+*.tmp
+tmp/
+*.swp
+*~
+.DS_Store
+
+# --- Secrets / local auth (never commit real values; keep .env.example) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+*.p8
+
+# --- OAuth / session / local runtime state ---
+.pi/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.sublime-*
+Thumbs.db
+Desktop.ini
+
+# --- Herdr / PI / OMP local artifacts ---
+.herdr/
+.omp/
+.hermes/

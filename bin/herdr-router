@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""
+herdr-mcp path router — 单一公网入口, 按路径前缀转发到各项目 MCP server。
+
+URL 形态:
+  https://herdr-mcp.<domain>/<project>/mcp
+  https://herdr-mcp.<domain>/<project>/oauth/...
+  https://herdr-mcp.<domain>/<project>/.well-known/...
+
+OAuth (RFC 8414) 兼容:
+  Claude 等 OAuth 客户端在「源根」发现 /.well-known/oauth-authorization-server。
+  单项目时把这些根级路径转发给唯一项目 (后端返回带 /<project> 前缀的绝对 URL, 客户端随后走前缀路径, 一切自洽)。
+  多项目时根级发现无法消歧 → 返回 404 + 提示。
+
+
+本机:
+  GET  /            → 状态页 (项目列表 + 健康)
+  GET  /projects    → JSON 项目列表 (浏览器扩展用)
+  *    /<project>/* → 剥前缀后反代到 127.0.0.1:<port>/*
+
+路由表: $HERDR_MCP_ROUTER_STATE_DIR/routes.json
+  {"project": {"port": 8772, "token": "...", "path": "/path/to/project"}, ...}
+
+环境:
+  HERDR_MCP_ROUTER_STATE_DIR  默认 ~/.config/herdr-mcp/router
+  HERDR_MCP_ROUTER_HOST       默认 127.0.0.1
+  HERDR_MCP_ROUTER_PORT       默认 8773 (独立于 MCP origin 8772)
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import sys
+import threading
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+
+# 不跟随重定向: 302 (OAuth authorize 回跳 redirect_uri) 必须原样透传给浏览器,
+# 由浏览器带自己的 cookie/session 去访问回调 (urlopen 默认跟随会丢会话 → 卡在授权页)
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+STATE_DIR = os.path.expanduser(os.environ.get("HERDR_MCP_ROUTER_STATE_DIR", "~/.config/herdr-mcp/router"))
+HOST = os.environ.get("HERDR_MCP_ROUTER_HOST", "127.0.0.1")
+PORT = int(os.environ.get("HERDR_MCP_ROUTER_PORT", "8773"))
+# 子域路由后缀, 如 ".herdr-mcp.<你的域名>": Host=<proj><后缀> 时按子域路由,
+# 路径原样转发 (无路径 issuer, Claude OAuth 兼容)
+HOST_SUFFIX = os.environ.get("HERDR_MCP_HOST_SUFFIX", "")
+ROUTES_FILE = os.path.join(STATE_DIR, "routes.json")
+# 请求转发给上游时跳过的头 (Content-Length 由 urllib 按 body 自己设)
+HOP_BY_HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+    "host",
+}
+# 响应回给客户端时跳过的头: 保留 Content-Length (分帧关键), 仅跳其余逐跳头
+RESPONSE_SKIP = HOP_BY_HOP - {"content-length"}
+
+
+def load_routes() -> dict[str, dict[str, Any]]:
+    try:
+        with open(ROUTES_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"[herdr-mcp-router] routes load error: {exc}", file=sys.stderr)
+        return {}
+
+
+def rebuild_routes_from_confs() -> dict[str, dict[str, Any]]:
+    """Fallback: scan *.conf if routes.json missing."""
+    routes: dict[str, dict[str, Any]] = {}
+    try:
+        for name in os.listdir(STATE_DIR):
+            if not name.endswith(".conf"):
+                continue
+            cfg: dict[str, str] = {}
+            with open(os.path.join(STATE_DIR, name), encoding="utf-8") as f:
+                for line in f:
+                    if "=" in line:
+                        k, v = line.strip().split("=", 1)
+                        cfg[k] = v
+            short = cfg.get("name") or name[: -len(".conf")]
+            port = cfg.get("port")
+            if not port:
+                continue
+            routes[short] = {
+                "port": int(port),
+                "token": cfg.get("token", ""),
+                "path": cfg.get("path", ""),
+            }
+    except FileNotFoundError:
+        pass
+    return routes
+
+
+_routes_lock = threading.Lock()
+_routes_cache: dict[str, dict[str, Any]] = {}
+_routes_mtime = 0.0
+
+
+def get_routes() -> dict[str, dict[str, Any]]:
+    global _routes_cache, _routes_mtime
+    with _routes_lock:
+        try:
+            mtime = os.path.getmtime(ROUTES_FILE)
+        except OSError:
+            mtime = 0.0
+            routes = rebuild_routes_from_confs()
+            _routes_cache = routes
+            _routes_mtime = mtime
+            return routes
+        if mtime != _routes_mtime or not _routes_cache:
+            _routes_cache = load_routes() or rebuild_routes_from_confs()
+            _routes_mtime = mtime
+        return _routes_cache
+
+
+# 根级 OAuth / well-known 发现路径 (RFC 8414 / RFC 7591): 无项目前缀, 单项目时转发给唯一项目
+def _root_oauth_path(path: str) -> bool:
+    return (
+        path.startswith("/.well-known/")
+        or path.startswith("/oauth/")
+        or path == "/register"
+    )
+
+
+# Claude.ai (MCP auth spec) 用「路径插入」构造发现 URL:
+#   https://herdr-mcp.<d>/novo/mcp → /.well-known/oauth-authorization-server/novo[/mcp]
+# 或 serverUrl 尾缀带 /mcp (Claude.ai 新版):
+#   https://<proj>.<d>/mcp     → /.well-known/oauth-protected-resource/mcp
+# 识别并剥掉项目段 (或 /mcp 尾缀), 转发规范路径给后端。
+def _split_discovery_insertion(path: str) -> tuple[str | None, str | None]:
+    parts = [p for p in path.split("/") if p]
+    routes = get_routes()
+    if len(parts) < 3:
+        return None, None
+    if parts[0] == ".well-known":
+        if parts[2] in routes:
+            return parts[2], "/.well-known/" + parts[1]
+        if parts[2] == "mcp":  # serverUrl 尾缀: /<kind>/mcp → /<kind>
+            return None, "/.well-known/" + parts[1]
+    elif parts[0] == "oauth":
+        if parts[2] in routes:
+            return parts[2], "/oauth/" + parts[1]
+    return None, None
+
+
+def _strip_well_known_mcp_suffix(path: str) -> str:
+    """Claude.ai 把 serverUrl 的 /mcp 尾缀带到 well-known 发现路径上,
+    /.well-known/<kind>/mcp → /.well-known/<kind>, 其余路径原样。"""
+    if not path.startswith("/.well-known/"):
+        return path
+    if path.endswith("/mcp"):
+        stripped = path[: -len("/mcp")]
+        if stripped != "/.well-known" and stripped.startswith("/.well-known/"):
+            return stripped
+    return path
+
+
+def resolve_route(path: str, host: str = "") -> tuple[str | None, dict[str, Any] | None, str]:
+    """Return (project, route, remainder_path). remainder always starts with /.
+
+    host 匹配 HERDR_MCP_HOST_SUFFIX 时按子域路由 (如 novo.herdr-mcp.<域名> → novo, 路径原样转发)。
+    """
+    # ---- 子域路由: <proj><HOST_SUFFIX>, 无路径 issuer (Claude OAuth 兼容) ----
+    if HOST_SUFFIX and host:
+        h = host.split(":", 1)[0].lower()
+        if h.endswith(HOST_SUFFIX):
+            prefix = h[: -len(HOST_SUFFIX)]
+            if prefix and "." not in prefix:
+                routes = get_routes()
+                if prefix in routes:
+                    return prefix, routes[prefix], _strip_well_known_mcp_suffix(
+                        path.split("?", 1)[0] or "/"
+                    )
+    # ---- 路径路由 ----
+    clean = path.split("?", 1)[0]
+    if clean.startswith("/"):
+        clean = clean[1:]
+    if not clean:
+        return None, None, "/"
+    parts = clean.split("/", 1)
+    project = parts[0]
+    rest = "/" + (parts[1] if len(parts) > 1 else "")
+    routes = get_routes()
+    route = routes.get(project)
+    if route is not None:
+        return project, route, rest if rest != "/" else "/mcp"
+    # 根级 OAuth/well-known 发现: 无项目前缀, 单项目时消歧到唯一项目
+    if _root_oauth_path("/" + clean):
+        # 先试「插入式」(kind + 项目段): /.well-known/oauth-authorization-server/novo
+        ins_proj, canonical = _split_discovery_insertion("/" + clean)
+        if ins_proj and ins_proj in routes:
+            return ins_proj, routes[ins_proj], canonical
+        if canonical and canonical != "/" + clean and len(routes) == 1:
+            only = next(iter(routes))
+            return only, routes[only], canonical
+        if len(routes) == 1:
+            only = next(iter(routes))
+            # Claude 发现失败后的兜底: POST /register → 后端 /oauth/register
+            target = "/oauth/register" if clean == "register" else "/" + clean
+            return only, routes[only], target
+        return None, None, "/" + clean  # 多项目: 由调用方给出明确 404 提示
+    return project, None, rest
+
+
+class RouterHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        sys.stderr.write(f"[herdr-mcp-router] {self.address_string()} {fmt % args}\n")
+
+    # ---- 请求体读取: 兼容 Content-Length 与 chunked + Expect: 100-continue ----
+    def _read_body(self) -> bytes:
+        te = self.headers.get("Transfer-Encoding", "").lower()
+        if "chunked" in te:
+            chunks = []
+            while True:
+                line = self.rfile.readline().strip()
+                try:
+                    size = int(line.split(b";", 1)[0], 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    self.rfile.readline()  # trailing CRLF (忽略 trailers)
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.read(2)  # CRLF
+            return b"".join(chunks)
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length > 0 else b""
+
+    def _drain_body(self) -> None:
+        """HTTP/1.1 keep-alive desync guard (herdr-mcp P0).
+
+        任何不消费请求体的响应路径 (404 unknown project / 405 / 根级 OAuth 404
+        等) 必须先把 body 从 rfile 读干净, 否则残余字节会被 BaseHTTPRequestHandler
+        当作下一个请求的 request-line 解析, 产生:
+            code 400, message Bad request syntax ('{"jsonrpc":...}POST / HTTP/1.1')
+        客户端表现为 'Session terminated' / network_error / 502。
+        Expect: 100-continue 时先回 100 再读 (否则客户端死等)。
+        读失败 (客户端已断开) 则关闭连接 — close 比半开连接安全。
+        """
+        if self.headers.get("Expect", "").lower() == "100-continue":
+            try:
+                self.send_response_only(100)
+                self.end_headers()
+            except OSError:
+                self.close_connection = True
+                return
+        try:
+            self._read_body()
+        except (OSError, ValueError):
+            self.close_connection = True
+
+    def _write_chunked(self, data: bytes) -> None:
+        if data:
+            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+
+    def do_OPTIONS(self) -> None:
+        if self.path.split("?", 1)[0] in {"/", "/healthz", "/projects"}:
+            self._drain_body()
+            self.send_response(204)
+            self._cors()
+            self.end_headers()
+            return
+        self._proxy()
+
+    def do_GET(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path in {"/", "/healthz"}:
+            self._status_page()
+            return
+        if path == "/projects":
+            self._projects_json()
+            return
+        self._proxy()
+
+    def do_HEAD(self) -> None:
+        if self.path.split("?", 1)[0] in {"/", "/healthz"}:
+            self._drain_body()
+            self.send_response(200)
+            self._cors()
+            self.end_headers()
+            return
+        self._proxy()
+
+    def do_POST(self) -> None:
+        self._proxy()
+
+    def do_PUT(self) -> None:
+        self._proxy()
+
+    def do_DELETE(self) -> None:
+        self._proxy()
+
+    def do_PATCH(self) -> None:
+        self._proxy()
+
+    def _cors(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Expose-Headers", "*")
+
+    def _status_page(self) -> None:
+        self._drain_body()  # keep-alive guard: GET with a body must not poison the next request
+        routes = get_routes()
+        rows = []
+        for name, r in sorted(routes.items()):
+            port = r.get("port")
+            ok = self._probe(port)
+            rows.append(
+                f"<tr><td><b>{name}</b></td><td>{port}</td>"
+                f"<td>{'✅ up' if ok else '❌ down'}</td>"
+                f"<td><code>/{name}/mcp</code></td></tr>"
+            )
+        body = (
+            "<!doctype html><html><head><meta charset=utf-8>"
+            "<title>herdr-mcp router</title>"
+            "<style>body{font-family:system-ui;margin:2rem}"
+            "table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px 10px}"
+            "code{background:#f4f4f4;padding:2px 4px}</style></head><body>"
+            "<h1>herdr-mcp router</h1>"
+            f"<p>listening on {HOST}:{PORT} · routes from <code>{ROUTES_FILE}</code></p>"
+            "<table><tr><th>project</th><th>port</th><th>health</th><th>path</th></tr>"
+            + ("".join(rows) if rows else "<tr><td colspan=4>(no projects)</td></tr>")
+            + "</table></body></html>"
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _projects_json(self) -> None:
+        self._drain_body()  # keep-alive guard (same as _status_page)
+        routes = get_routes()
+        projects = []
+        for name, r in sorted(routes.items()):
+            port = r.get("port", "")
+            projects.append(
+                {
+                    "name": name,
+                    "port": str(port),
+                    "token": r.get("token", ""),
+                    "url": f"http://127.0.0.1:{port}/mcp",
+                    "public_path": f"/{name}/mcp",
+                    "path": r.get("path", ""),
+                }
+            )
+        body = json.dumps({"projects": projects}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _probe(self, port: Any) -> bool:
+        try:
+            p = int(port)
+        except (TypeError, ValueError):
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", p), timeout=0.4):
+                return True
+        except OSError:
+            return False
+
+    def _send_error(self, status: int, msg: str) -> None:
+        # keep-alive desync guard: 404/502 error paths never read the request
+        # body (unknown project, upstream error) — drain it or the next
+ # request on this connection parses as garbage (Bad request syntax).
+        self._drain_body()
+        body = msg.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _proxy(self) -> None:
+        raw_path = self.path
+        path_only = raw_path.split("?", 1)[0]
+        qs = raw_path.split("?", 1)[1] if "?" in raw_path else ""
+        project, route, rest = resolve_route(path_only, self.headers.get("Host", ""))
+        if route is None:
+            if _root_oauth_path(path_only) and project is None and len(get_routes()) > 1:
+                self._send_error(
+                    404,
+                    "herdr-mcp-router: 根级 OAuth/.well-known 发现需要唯一项目。"
+                    "多项目共享同一 hostname 时无法消歧,请用完整前缀 URL: "
+                    "https://herdr-mcp.<域名>/<项目>/.well-known/oauth-authorization-server\n",
+                )
+            else:
+                self._send_error(404, f"herdr-mcp-router: unknown project '{project}'\n")
+            return
+
+        port = int(route["port"])
+        target_path = rest + (f"?{qs}" if qs else "")
+        url = f"http://127.0.0.1:{port}{target_path}"
+
+        # Expect: 100-continue — 先回 100 再读 body, 否则客户端会干等
+        if self.headers.get("Expect", "").lower() == "100-continue":
+            self.send_response_only(100)
+            self.end_headers()
+        body = self._read_body()
+
+        req = urllib.request.Request(url, data=body, method=self.command)
+        for key, value in self.headers.items():
+            lk = key.lower()
+            if lk in HOP_BY_HOP or lk == "expect":
+                continue
+            req.add_header(key, value)
+        req.add_header("X-Forwarded-Prefix", f"/{project}")
+        req.add_header("X-Herdr-MCP-Project", project)
+
+        try:
+            with _OPENER.open(req, timeout=600) as resp:
+                self.send_response(resp.status)
+                upstream_chunked = False
+                for key, value in resp.headers.items():
+                    lk = key.lower()
+                    if lk in RESPONSE_SKIP:
+                        if lk == "transfer-encoding" and "chunked" in value.lower():
+                            upstream_chunked = True
+                        continue
+                    self.send_header(key, value)
+                self._cors()
+                self.end_headers()
+                if self.command == "HEAD":
+                    return
+                if upstream_chunked:
+                    # 上游是 chunked (SSE/流式): 重新按 chunked 分帧, 客户端能读到 0-chunk 结束
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        self._write_chunked(chunk)
+                        self.wfile.flush()  # SSE/长流: 必须即时刷出, 否则堵在缓冲
+                    self.wfile.write(b"0\r\n\r\n")
+                else:
+                    while True:
+                        if resp.length is None and not resp.chunked:
+                            # close-delimited 流 (HTTP/1.0 无 Content-Length, 如 SSE):
+                            # resp.read() 会阻塞等满, 改用 fp.read1 读可用数据
+                            chunk = resp.fp.read1(65536)
+                        else:
+                            chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        if len(chunk) < 65536 or self.command == "GET":
+                            # SSE/长流 (无 Content-Length 边界的 GET) 必须逐块 flush
+                            self.wfile.flush()
+        except urllib.error.HTTPError as exc:
+            self.send_response(exc.code)
+            upstream_chunked = False
+            for key, value in exc.headers.items():
+                lk = key.lower()
+                if lk in RESPONSE_SKIP:
+                    if lk == "transfer-encoding" and "chunked" in value.lower():
+                        upstream_chunked = True
+                    continue
+                self.send_header(key, value)
+            self._cors()
+            self.end_headers()
+            if self.command != "HEAD":
+                data = exc.read()
+                if data:
+                    if upstream_chunked:
+                        self._write_chunked(data)
+                    else:
+                        self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # 客户端 (如 Claude SSE) 断开, 无需回写
+        except Exception as exc:
+            try:
+                self._send_error(502, f"herdr-mcp-router: upstream error: {exc}\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+
+def main() -> int:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    routes = get_routes()
+    print(
+        f"herdr-mcp-router listening on http://{HOST}:{PORT} "
+        f"({len(routes)} routes, state={STATE_DIR})",
+        file=sys.stderr,
+        flush=True,
+    )
+    httpd = ThreadingHTTPServer((HOST, PORT), RouterHandler)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nherdr-mcp-router stopped", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

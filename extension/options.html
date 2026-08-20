@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font: 14px/1.6 -apple-system, sans-serif; max-width: 640px; margin: 24px auto; color: #1f2937; padding: 0 16px; }
+    h1 { font-size: 18px; }
+    label { display: block; margin: 12px 0 4px; font-weight: 600; font-size: 13px; color: #374151; }
+    input[type=text], textarea { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; font: 13px/1.5 monospace; }
+    textarea { height: 120px; }
+    button { margin-top: 16px; padding: 8px 18px; border: 1px solid #d1d5db; background: #f9fafb; border-radius: 6px; cursor: pointer; }
+    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    .hint { color: #6b7280; font-size: 12px; margin-top: 2px; }
+    #status { margin-top: 12px; font-size: 13px; }
+    .ok { color: #16a34a; } .err { color: #dc2626; white-space: pre-line; }
+  </style>
+</head>
+<body>
+  <h1>herdr → Web 唤醒 · 配置</h1>
+  <label>herdr-mcp 地址 (本地)</label>
+  <input type="text" id="url" placeholder="http://127.0.0.1:8772">
+  <div class="hint">插件从 background 访问本地地址并带 Bearer 头, 不走公网隧道。</div>
+
+  <label>Bearer Token</label>
+  <input type="text" id="token" placeholder="HERDR_MCP_TOKEN">
+  <div class="hint">与 /mcp 同一个 token。查看: <code>herdr-mcp token</code></div>
+
+  <label>唤醒消息模板</label>
+  <textarea id="template">{agent} · {pane} · {status} · {output} 的占位符示例</textarea>
+  <div class="hint">支持占位符: {agent} {pane} {status} {output}</div>
+
+  <label><input type="checkbox" id="autoAllow"> 唤醒后自动点"允许"权限弹窗</label>
+  <div class="hint">页面内权限弹窗 (允许/同意/Allow) 自动点击; 浏览器原生权限条 (通知/麦克风等) 无法自动点。</div>
+
+  <label><input type="checkbox" id="enabled"> 启用自动唤醒</label>
+
+  <button class="primary" id="save">保存</button>
+  <button id="test">测试连接</button>
+  <div id="status"></div>
+
+  <script src="options.js"></script>
+</body>
+</html>

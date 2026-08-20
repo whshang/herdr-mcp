@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# herdr-mcp CLI — manage the herdr MCP server (launchd + config + diagnostics)
+# Install: ln -sf ~/Documents/herdr-mcp/bin/herdr-mcp ~/.local/bin/herdr-mcp
+#
+# Usage:
+#   herdr-mcp                    # 交互菜单
+#   herdr-mcp status             # 状态 (进程/launchd/本地/公网/socket)
+#   herdr-mcp connector          # 打印接入信息 (URL + Token)
+#   herdr-mcp start|stop|restart # launchd 服务管理
+#   herdr-mcp logs [-f]          # 查看日志
+#   herdr-mcp token              # 复制 token 到剪贴板
+#   herdr-mcp url                # 复制公网 URL
+
+set -euo pipefail
+
+PLIST="$HOME/Library/LaunchAgents/dev.herdr-mcp.server.plist"
+LABEL="dev.herdr-mcp.server"
+LOG_FILE="$HOME/.config/herdr-mcp/server.log"
+LOCAL_URL="http://127.0.0.1:8772/mcp"
+
+# Colors
+R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; C=$'\033[36m'; B=$'\033[1m'; N=$'\033[0m'
+
+log()  { echo -e "  ${G}✅${N} $*"; }
+warn() { echo -e "  ${Y}⚠️${N} $*"; }
+err()  { echo -e "  ${R}❌${N} $*" >&2; }
+
+# ---- 从 plist 读配置 ----
+get_plist_value() {
+  /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$PLIST" 2>/dev/null || echo ""
+}
+
+get_token()   { get_plist_value "HERDR_MCP_TOKEN"; }
+get_port()    { get_plist_value "HERDR_MCP_PORT" || echo "8772"; }
+get_base_url(){ get_plist_value "HERDR_MCP_BASE_URL"; }
+
+get_public_url() {
+  local base
+  base=$(get_base_url)
+  if [[ -n "$base" ]]; then
+    echo "${base%/}/mcp"
+  else
+    echo "https://xxxx.trycloudflare.com/mcp"
+  fi
+}
+
+# ---- 服务状态 ----
+is_running() {
+  pgrep -f "dist/server.js" >/dev/null 2>&1
+}
+
+service_pid() {
+  pgrep -f "dist/server.js" 2>/dev/null | head -1 || echo ""
+}
+
+# ---- 本地 MCP 探活 ----
+check_local() {
+  local token code
+  token=$(get_token)
+  code=$(curl -s -o /dev/null -w "%{http_code}" -m 3 \
+    -X POST "$LOCAL_URL" \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"cli-check","version":"0"}}}' \
+    2>/dev/null || echo "000")
+  echo "$code"
+}
+
+check_public() {
+  local token pub_url code
+  token=$(get_token)
+  pub_url=$(get_public_url)
+  code=$(curl -s -o /dev/null -w "%{http_code}" -m 5 \
+    -X POST "$pub_url" \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"cli-check","version":"0"}}}' \
+    2>/dev/null || echo "000")
+  echo "$code"
+}
+
+# ---- 命令 ----
+
+cmd_status() {
+  echo ""
+  echo -e "${B}${C}═══════════════════════════════════════════════════════════${N}"
+  echo -e "${B}${C}  herdr-mcp 状态${N}"
+  echo -e "${B}${C}═══════════════════════════════════════════════════════════${N}"
+  echo ""
+
+  # 进程
+  if is_running; then
+    local pid
+    pid=$(service_pid)
+    log "进程: ${G}运行中${N} (PID $pid)"
+  else
+    err "进程: ${R}未运行${N}"
+  fi
+
+  # launchd
+  if launchctl list 2>/dev/null | python3 -c "
+import sys
+found = any('dev.herdr-mcp' in l for l in sys.stdin)
+sys.exit(0 if found else 1)
+"; then
+    log "launchd: ${G}已加载${N}"
+  else
+    warn "launchd: ${Y}未加载${N} (服务不会自动启动)"
+  fi
+  local lcode
+  lcode=$(check_local)
+  if [[ "$lcode" == "200" ]]; then
+    log "本地 MCP: ${G}响应正常${N} ($LOCAL_URL)"
+  elif [[ "$lcode" == "401" ]]; then
+    warn "本地 MCP: ${Y}401 (token 不匹配? plist 里的 token 可能过期)${N}"
+  elif [[ "$lcode" == "000" ]]; then
+    err "本地 MCP: ${R}不可达${N} (服务未启动?)"
+  else
+    err "本地 MCP: ${R}HTTP $lcode${N}"
+  fi
+
+  # 公网 MCP
+  local pcode pub_url
+  pcode=$(check_public)
+  pub_url=$(get_public_url)
+  if [[ "$pcode" == "200" ]]; then
+    log "公网 MCP: ${G}可达${N} ($pub_url)"
+  elif [[ "$pcode" == "000" ]]; then
+    warn "公网 MCP: ${Y}不可达${N} (cloudflared 未跑? DNS 问题?)"
+  else
+    warn "公网 MCP: ${Y}HTTP $pcode${N}"
+  fi
+
+  # herdr socket
+  local sock
+  sock="${HERDR_SOCKET_PATH:-$HOME/.config/herdr/herdr.sock}"
+  if [[ -S "$sock" ]]; then
+    log "herdr socket: ${G}存在${N} ($sock)"
+  else
+    err "herdr socket: ${R}不存在${N} ($sock) — herdr 没在跑?"
+  fi
+
+  echo ""
+}
+
+cmd_connector() {
+  local token base
+  token=$(get_token)
+  base=$(get_base_url); base="${base%/}"
+  [[ -n "$base" ]] || base="https://xxxx.trycloudflare.com"
+  echo ""
+  echo -e "${B}${C}═══════════════════════════════════════════════════════════${N}"
+  echo -e "${B}${C}  herdr-mcp 接入信息${N}"
+  echo -e "${B}${C}═══════════════════════════════════════════════════════════${N}"
+  echo ""
+  echo "  ChatGPT : $base              (OAuth, 不填 API key)"
+  echo "  Claude  : $base/mcp                (OAuth, DCR 自动注册)"
+  echo "  Token   : $token          (仅本地 curl 测试用)"
+  echo ""
+  echo "  配置步骤见 README.md「各平台接入」。"
+  echo ""
+}
+
+cmd_start() {
+  if is_running; then
+    log "已在运行 (PID $(service_pid)) — 如需加载新代码请用 restart"
+    return 0
+  fi
+  launchctl load "$PLIST" 2>&1
+  sleep 2
+  if is_running; then
+    log "已启动 (PID $(service_pid))"
+  else
+    err "启动失败 — 查看日志: herdr-mcp logs"
+  fi
+}
+
+cmd_stop() {
+  launchctl unload "$PLIST" 2>&1 || true
+  sleep 1
+  if is_running; then
+    pkill -f "dist/server.js" 2>/dev/null || true
+    sleep 1
+  fi
+  if is_running; then
+    err "停止失败"
+  else
+    log "已停止"
+  fi
+}
+
+cmd_restart() {
+  # 强杀 (launchd 会自动拉起) — 确保 dist 新代码生效
+  pkill -f "dist/server.js" 2>/dev/null || true
+  sleep 1
+  # 如果 launchd 没拉起, 手动 load
+  if ! is_running; then
+    launchctl load "$PLIST" 2>/dev/null || true
+    sleep 3
+  fi
+  if is_running; then
+    log "已重启 (PID $(service_pid))"
+  else
+    err "重启失败 — 查看: herdr-mcp logs"
+  fi
+}
+
+cmd_logs() {
+  local follow="${1:-}"
+  if [[ ! -f "$LOG_FILE" ]]; then
+    warn "无日志文件: $LOG_FILE"
+    return 0
+  fi
+  if [[ "$follow" == "-f" ]]; then
+    tail -f "$LOG_FILE"
+  else
+    tail -50 "$LOG_FILE"
+  fi
+}
+
+cmd_token() {
+  local token
+  token=$(get_token)
+  if [[ -z "$token" ]]; then
+    err "未配置 token (plist 里没有 HERDR_MCP_TOKEN)"
+    return 1
+  fi
+  echo -n "$token" | pbcopy 2>/dev/null && echo "(已复制到剪贴板)" || true
+  echo "Token: $token"
+}
+
+cmd_url() {
+  local pub_url
+  pub_url=$(get_public_url)
+  echo -n "$pub_url" | pbcopy 2>/dev/null && echo "(已复制到剪贴板)" || true
+  echo "URL: $pub_url"
+}
+
+# ---- 交互菜单 ----
+cmd_menu() {
+  # 首次进入：直接展示查看状态 + 查看接入信息，不用再选一次。
+  cmd_status
+  cmd_connector
+
+  while true; do
+    echo ""
+    echo -e "${B}${C}═══════════════════════════════════════════════════════════${N}"
+    echo -e "${B}${C}  herdr-mcp  (herdr 作为 MCP 工具面)${N}"
+    echo -e "${B}${C}═══════════════════════════════════════════════════════════${N}"
+    echo ""
+    echo "  任意键退出 (或输入 1-8 继续操作):"
+    echo "    1) 查看状态 (进程/launchd/本地/公网)"
+    echo "    2) 查看接入信息 (URL + Token)"
+    echo "    3) 重启服务"
+    echo "    4) 启动服务"
+    echo "    5) 停止服务"
+    echo "    6) 查看日志 (最近 50 行)"
+    echo "    7) 复制 Token 到剪贴板"
+    echo "    8) 复制公网 URL 到剪贴板"
+    echo ""
+    # 任意键退出：非 q 也退出。若 stdin 是管道/非 tty（比如被脚本调用），
+    # 没有可读按键时视为退出，避免挂死。
+    if ! read -n 1 -s -r -p "  按任意键退出，或输入 1-8 继续: " choice 2>/dev/null; then
+      echo ""
+      exit 0
+    fi
+    echo ""
+    case "$choice" in
+      1) cmd_status ;;
+      2) cmd_connector ;;
+      3) cmd_restart ;;
+      4) cmd_start ;;
+      5) cmd_stop ;;
+      6) cmd_logs ;;
+      7) cmd_token ;;
+      8) cmd_url ;;
+      q|Q|quit|exit) exit 0 ;;
+      *) exit 0 ;;  # 任意其它键退出
+    esac
+  done
+}
+
+# ---- 入口 ----
+case "${1:-}" in
+  status)   cmd_status ;;
+  connector) cmd_connector ;;
+  start)    cmd_start ;;
+  stop)     cmd_stop ;;
+  restart)  cmd_restart ;;
+  logs)     cmd_logs "${2:-}" ;;
+  token)    cmd_token ;;
+  url)      cmd_url ;;
+  ""|menu)  cmd_menu ;;
+  -h|--help)
+    echo "Usage: herdr-mcp [command]"
+    echo ""
+    echo "Commands:"
+    echo "  (no args)   交互菜单"
+    echo "  status      状态 (进程/launchd/本地/公网/socket)"
+    echo "  connector   接入信息 (URL + Token + 各平台配置指引)"
+    echo "  start       启动 (launchd)"
+    echo "  stop        停止"
+    echo "  restart     重启"
+    echo "  logs [-f]   日志 (跟随)"
+    echo "  token       复制 Token"
+    echo "  url         复制公网 URL"
+    ;;
+  *)
+    err "未知命令: $1 (herdr-mcp --help 查看可用命令)"
+    exit 1
+    ;;
+esac

@@ -1,0 +1,633 @@
+// Transport regression tests (P0): the exact failure classes seen from
+// ChatGPT/Claude connectors against herdr-mcp.
+//
+//  1. stateless: initialize, then tools/list + tools/call WITHOUT Mcp-Session-Id
+//  2. stateful: initialize -> carry Mcp-Session-Id through consecutive calls
+//  3. keep-alive reuse: raw socket, sequential initialize -> tools/list ->
+//     tools/call on ONE connection with the session id carried — responses are
+//     byte-length framed and MUST NOT be concatenated / leaked into the next
+//     unit (the router Bad-request-syntax desync class). Bodies contain
+//     multi-byte UTF-8 (CJK / em-dashes), so framing is asserted on Buffers at
+//     byte offsets, never on chunk-decoded strings.
+//  4. 100 sequential requests alternating light tools
+//  5. reconnect: drop everything, re-initialize, stateless call
+//  6. HERDR_MCP_ALL_TOOLS=1 restores the full 22-tool surface (advanced +
+//     deprecated), while the default surface stays exactly 9.
+//
+// Server runs from dist/ on an ephemeral port with a temp token. Never 8772.
+// All child processes are terminated in after()/finally; no process outlives
+// the test file.
+import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import * as net from "node:net";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PORT = 9817;
+const ALL_PORT = PORT + 1;
+const TOKEN = "transport-test-token";
+const BASE = `http://127.0.0.1:${PORT}`;
+
+let server;
+let sessionId = null;
+
+// OpenAI/ChatGPT connector UA — must be served fully stateless (initialize
+// included): no Mcp-Session-Id is ever issued, so a stale id after a server
+// restart can never surface as -32600 "Session terminated".
+const OPENAI_UA = "openai-mcp/1.0.0";
+
+/** Poll a TCP port until a server accepts connections (or reject after 15s). */
+function waitReady(port) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + 15000;
+    const poll = setInterval(() => {
+      const probe = net.connect(port, "127.0.0.1");
+      probe.on("connect", () => { clearInterval(poll); probe.destroy(); resolve(); });
+      probe.on("error", () => {
+        if (Date.now() > deadline) {
+          clearInterval(poll);
+          reject(new Error(`server on 127.0.0.1:${port} did not become ready in 15s`));
+          return;
+        }
+        probe.destroy();
+      });
+    }, 150);
+  });
+}
+
+async function spawnServer(port, extraEnv = {}) {
+  const proc = spawn("node", [path.join(__dirname, "..", "dist", "server.js")], {
+    env: { ...process.env, HERDR_MCP_PORT: String(port), HERDR_MCP_TOKEN: TOKEN, ...extraEnv },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  proc.stdout.on("data", () => {}); // drain — a full pipe would block the child
+  proc.stderr.on("data", () => {}); // drain
+  await waitReady(port);
+  return proc;
+}
+
+/** SIGTERM -> await exit -> SIGKILL fallback. Never leaves a child behind. */
+async function stopServer(proc) {
+  if (!proc || proc.exitCode !== null) return;
+  proc.kill("SIGTERM");
+  await new Promise((resolve) => {
+    const killTimer = setTimeout(() => { proc.kill("SIGKILL"); resolve(); }, 3000);
+    proc.once("exit", () => { clearTimeout(killTimer); resolve(); });
+  });
+}
+
+before(async () => {
+  server = await spawnServer(PORT);
+});
+
+after(async () => {
+  await stopServer(server);
+});
+
+function headers(extra = {}) {
+  return {
+    Authorization: `Bearer ${TOKEN}`,
+    "Content-Type": "application/json",
+    Accept: "application/json, text/event-stream",
+    ...extra,
+  };
+}
+
+/** Parse a Streamable HTTP response body: JSON or SSE data lines -> last JSON-RPC message. */
+async function parseRpc(res) {
+  const text = await res.text();
+  if (text.trimStart().startsWith("{")) return JSON.parse(text);
+  const datas = text.split("\n").filter((l) => l.startsWith("data: ")).map((l) => l.slice(6));
+  assert.ok(datas.length > 0, `no JSON-RPC payload in response: ${text.slice(0, 200)}`);
+  return JSON.parse(datas[datas.length - 1]);
+}
+
+async function rpc(method, params = {}, opts = {}) {
+  const base = opts.base ?? BASE;
+  const h = headers();
+  if (opts.ua) h["User-Agent"] = opts.ua;
+  if (opts.sid !== undefined) h["Mcp-Session-Id"] = opts.sid;
+  else if (sessionId && !opts.noSession) h["Mcp-Session-Id"] = sessionId;
+  else if (opts.noSession) delete h["Mcp-Session-Id"];
+  const res = await fetch(`${base}${opts.path ?? "/"}`, {
+    method: "POST", headers: h,
+    body: JSON.stringify({ jsonrpc: "2.0", id: Math.floor(Math.random() * 1e9), method, params }),
+  });
+  const sid = res.headers.get("mcp-session-id");
+  if (sid) sessionId = sid;
+  return { status: res.status, res, msg: await parseRpc(res) };
+}
+
+async function tool(name, args = {}, opts = {}) {
+  const r = await rpc("tools/call", { name, arguments: args }, opts);
+  assert.equal(r.msg.error, undefined, `tools/call ${name} error: ${JSON.stringify(r.msg.error)}`);
+  return JSON.parse(r.msg.result.content[0].text);
+}
+
+test("stateless: initialize then calls WITHOUT session id (ChatGPT pattern)", async () => {
+  // fresh state: do not reuse module sessionId
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    const init = await rpc("initialize",
+      { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "stateless-t", version: "1" } },
+      { noSession: true });
+    assert.equal(init.status, 200);
+    assert.ok(init.msg.result?.serverInfo?.name, "initialize result missing serverInfo");
+    // ChatGPT sends tools/call with NO session header at all
+    const list = await rpc("tools/list", {}, { noSession: true });
+    assert.equal(list.status, 200);
+    assert.ok(Array.isArray(list.msg.result?.tools));
+    assert.equal(list.msg.result.tools.length, 9, `default tools/list must expose exactly 9 tools, got ${list.msg.result.tools.length}: ${list.msg.result.tools.map((t) => t.name).join(",")}`);
+    for (let i = 0; i < 3; i++) {
+      const insp = await tool("herdr_methods", { query: "ping" }, { noSession: true });
+      assert.equal(insp.ok, true, `stateless herdr_methods #${i}: ${JSON.stringify(insp).slice(0, 120)}`);
+      assert.ok(insp.count >= 1);
+    }
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
+test("stateful: initialize -> session id honored on consecutive calls", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    const init = await rpc("initialize",
+      { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "stateful-t", version: "1" } });
+    assert.ok(sessionId, "initialize did not return Mcp-Session-Id");
+    const note = await rpc("notifications/initialized", {});
+    // notifications: 202 accepted (or 200 with empty body depending on SDK version) — no JSON-RPC error payload
+    assert.ok(note.status === 202 || note.status === 200, `notification status ${note.status}`);
+    const list = await rpc("tools/list", {});
+    assert.equal(list.status, 200);
+    assert.ok(list.msg.result.tools.length > 0);
+    const m = await tool("herdr_methods", { query: "" });
+    assert.equal(m.ok, true);
+    // unknown session id -> explicit 404 Session not found, NOT a silent tool failure
+    const bad = await fetch(`${BASE}/`, {
+      method: "POST",
+      headers: headers({ "Mcp-Session-Id": "definitely-not-a-session" }),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+    assert.equal(bad.status, 404);
+    const badMsg = await parseRpc(bad);
+    assert.equal(badMsg.error.code, -32001);
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
+test("keep-alive: initialize -> tools/list -> tools/call strictly framed on ONE raw TCP connection", async () => {
+  // Drive HTTP by hand so keep-alive framing is asserted, not assumed by fetch.
+  // The transport sets Content-Length on JSON and SSE responses alike, so each
+  // unit is byte-length framed. Bodies contain multi-byte UTF-8 (CJK / em
+  // dashes in tool descriptions), so the parser MUST accumulate Buffers and
+  // slice at byte offsets: decoding each chunk to a string corrupts byte
+  // accounting whenever a chunk boundary splits a multibyte character and the
+  // parser then waits forever for a body that can never complete (the original
+  // P0 hang this test guards against).
+  const conn = net.connect(PORT, "127.0.0.1");
+  conn.setNoDelay(true);
+  let buf = Buffer.alloc(0);
+  const responses = [];
+  let waiter = null; // { resolve, reject }
+  let waiterTimer = null;
+  let fatal = null;
+
+  const failParse = (err) => {
+    fatal = err;
+    if (waiter) {
+      const w = waiter; waiter = null;
+      clearTimeout(waiterTimer);
+      w.reject(err);
+    }
+  };
+  const onResponse = (r) => {
+    responses.push(r);
+    if (waiter) {
+      const w = waiter; waiter = null;
+      clearTimeout(waiterTimer);
+      w.resolve(responses.shift());
+    }
+  };
+  const parseLoop = () => {
+    const HTTP_START = Buffer.from("HTTP/1.1");
+    // Decode a chunked body at `start`; null while incomplete. Returns the
+    // decoded bytes and the absolute end offset (incl. terminating 0-chunk).
+    const decodeChunked = (b, start) => {
+      let i = start;
+      const parts = [];
+      while (true) {
+        const nl = b.indexOf("\r\n", i);
+        if (nl < 0) return null; // size line incomplete
+        const size = parseInt(b.subarray(i, nl).toString("utf-8").split(";")[0].trim(), 16);
+        if (Number.isNaN(size)) return null;
+        i = nl + 2;
+        if (size === 0) {
+          // 0-chunk: consume trailers up to the terminating empty line
+          while (true) {
+            const te = b.indexOf("\r\n", i);
+            if (te < 0) return null;
+            if (te === i) return { body: Buffer.concat(parts), end: te + 2 };
+            i = te + 2;
+          }
+        }
+        if (b.length < i + size + 2) return null; // chunk data incomplete
+        parts.push(b.subarray(i, i + size));
+        i += size + 2;
+      }
+    };
+    while (true) {
+      if (buf.length === 0) return;
+      if (!(buf.length >= HTTP_START.length && buf.subarray(0, HTTP_START.length).equals(HTTP_START))) {
+        // tolerate keep-alive CRLF padding; anything else = desync
+        if (!/^[\r\n]/.test(buf.slice(0, 2).toString())) {
+          throw new Error(`connection desynced — next bytes are not a status line: ${JSON.stringify(buf.slice(0, 120).toString())}`);
+        }
+        buf = buf.subarray(2);
+        continue;
+      }
+      const hEnd = buf.indexOf("\r\n\r\n");
+      if (hEnd < 0) return; // header incomplete — wait for more bytes
+      const head = buf.slice(0, hEnd).toString("utf-8");
+      const sm = /HTTP\/1\.1 (\d+)/.exec(head);
+      if (!sm) throw new Error(`bad status line: ${head.slice(0, 80)}`);
+      const cl = /Content-Length:\s*(\d+)/i.exec(head);
+      const chunked = /Transfer-Encoding:\s*chunked/i.test(head);
+      let bodyBuf;
+      let total;
+      if (cl) {
+        total = hEnd + 4 + Number(cl[1]);
+        if (buf.length < total) return; // body incomplete — wait for more bytes
+        bodyBuf = buf.slice(hEnd + 4, total);
+      } else if (chunked) {
+        const dec = decodeChunked(buf, hEnd + 4);
+        if (!dec) return; // chunk stream incomplete — wait for more bytes
+        bodyBuf = dec.body;
+        total = dec.end;
+      } else {
+        throw new Error(`response framing unknown (no Content-Length, no chunked): ${head.slice(0, 120)}`);
+      }
+      const body = bodyBuf.toString("utf-8");
+      const sid = /^mcp-session-id:\s*(\S+)/im.exec(head)?.[1] ?? null;
+      buf = buf.slice(total);
+      onResponse({ status: Number(sm[1]), body, sid });
+    }
+  };
+  conn.on("data", (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    try { parseLoop(); } catch (e) { failParse(e); }
+  });
+  conn.on("error", (e) => failParse(new Error(`raw connection error: ${e.message}`)));
+  conn.on("close", () => {
+    if (waiter) {
+      const w = waiter; waiter = null;
+      clearTimeout(waiterTimer);
+      w.reject(new Error("raw connection closed before the next response"));
+    }
+  });
+  await new Promise((r) => conn.once("connect", r));
+
+  const nextResponse = (timeoutMs = 20000) => new Promise((resolve, reject) => {
+    if (fatal) return reject(fatal);
+    if (responses.length > 0) return resolve(responses.shift());
+    waiterTimer = setTimeout(() => {
+      waiter = null;
+      reject(new Error(`timeout waiting for next response (buffered=${responses.length}, fatal=${fatal?.message ?? "none"})`));
+    }, timeoutMs);
+    waiter = { resolve, reject };
+  });
+
+  let sid = null;
+  const mkReq = (method, params, extraHeaders = "") => {
+    const body = JSON.stringify({ jsonrpc: "2.0", id: Math.floor(Math.random() * 1e9), method, params });
+    return `POST / HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer ${TOKEN}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n${extraHeaders}${sid ? `Mcp-Session-Id: ${sid}\r\n` : ""}Connection: keep-alive\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+  };
+  async function roundTrip(method, params, extraHeaders = "") {
+    conn.write(mkReq(method, params, extraHeaders));
+    const r = await nextResponse();
+    if (r.sid) sid = r.sid; // capture session id from initialize for later calls
+    return r;
+  }
+  const parseMsg = (body) => JSON.parse(/^data: (.+)$/m.exec(body)?.[1] ?? body);
+
+  try {
+    // 1) initialize — assigns the session id carried by every later request
+    const init = await roundTrip("initialize",
+      { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "keepalive-t", version: "1" } });
+    assert.equal(init.status, 200);
+    assert.ok(parseMsg(init.body).result?.serverInfo?.name, "initialize result missing serverInfo");
+    assert.ok(sid, "initialize did not assign Mcp-Session-Id on the raw connection");
+
+    // 2) tools/list with the session id — exactly the default 9-tool surface
+    const list = await roundTrip("tools/list", {});
+    assert.equal(list.status, 200);
+    const listMsg = parseMsg(list.body);
+    assert.ok(Array.isArray(listMsg.result?.tools), "tools/list result missing tools array");
+    assert.equal(listMsg.result.tools.length, 9, `default tools/list must be exactly 9, got ${listMsg.result.tools.length}`);
+
+    // 3) tools/call + interleaved methods on the SAME connection (stateful sid)
+    for (let i = 0; i < 5; i++) {
+      const u = await roundTrip("tools/call", { name: "herdr_methods", arguments: { query: "ping" } });
+      assert.equal(u.status, 200, `interleave #${i} status`);
+      const msg = parseMsg(u.body);
+      assert.ok(msg.result !== undefined || msg.error !== undefined, "non-JSON-RPC body");
+      assert.ok(!/Bad request|<!DOCTYPE/i.test(u.body), `protocol garbage leaked into body: ${u.body.slice(0, 120)}`);
+    }
+
+    // 4) a malformed-JSON body must yield a clean framed 400 that does NOT
+    //    desync the next request on the same connection (the router
+    //    Bad-request-syntax class, asserted against Express itself).
+    conn.write(`POST / HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer ${TOKEN}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n${sid ? `Mcp-Session-Id: ${sid}\r\n` : ""}Connection: keep-alive\r\nContent-Length: 7\r\n\r\n{broken`);
+    const bad = await nextResponse();
+    assert.equal(bad.status, 400, `malformed JSON must be a clean 400, got ${bad.status}`);
+    const after = await roundTrip("tools/list", {});
+    assert.equal(after.status, 200);
+    assert.ok(parseMsg(after.body).result, "request after 400 got corrupted");
+  } finally {
+    conn.destroy();
+  }
+});
+
+test("stress: 100 sequential requests alternating light tools, no transport errors", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    const init = await rpc("initialize",
+      { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "stress-t", version: "1" } });
+    assert.equal(init.status, 200);
+    let errs = 0;
+    for (let i = 0; i < 100; i++) {
+      const which = i % 3;
+      if (which === 0) {
+        const r = await rpc("tools/list", {});
+        if (r.status !== 200 || !Array.isArray(r.msg.result?.tools)) errs++;
+      } else if (which === 1) {
+        const r = await tool("herdr_methods", { query: "ping" });
+        if (r.ok !== true) errs++;
+      } else {
+        const r = await tool("herdr_methods", { query: "agent.start" });
+        if (r.ok !== true) errs++;
+      }
+    }
+    assert.equal(errs, 0, `${errs} of 100 sequential requests failed`);
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
+test("reconnect: transport dropped -> fresh initialize + stateless call works", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    // simulate client losing its session (server restart class): use an expired sid
+    const stale = await fetch(`${BASE}/`, {
+      method: "POST",
+      headers: headers({ "Mcp-Session-Id": "stale-session-id" }),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+    assert.equal(stale.status, 404, "stale session must be an explicit 404, not a tool failure");
+    // client falls back to a clean initialize
+    const init = await rpc("initialize",
+      { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "reconnect-t", version: "1" } },
+      { noSession: true });
+    assert.equal(init.status, 200);
+    const insp = await tool("herdr_methods", { query: "" }, { noSession: true });
+    assert.equal(insp.ok, true);
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
+test("GET / without session -> 400 (not 405/501), GET /mcp/ alias parity", async () => {
+  const r1 = await fetch(`${BASE}/`, { headers: headers() });
+  assert.equal(r1.status, 400);
+  const r2 = await fetch(`${BASE}/mcp`, { headers: headers() });
+  assert.equal(r2.status, 400);
+});
+
+test("GET /mcp with a valid session opens SSE stream", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  let controller;
+  try {
+    const init = await rpc("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "get-sse-t", version: "1" },
+    });
+    assert.equal(init.status, 200);
+    assert.ok(sessionId, "initialize did not return Mcp-Session-Id for GET SSE");
+    controller = new AbortController();
+    const stream = await fetch(`${BASE}/mcp`, {
+      method: "GET",
+      headers: headers({ "Mcp-Session-Id": sessionId }),
+      signal: controller.signal,
+    });
+    assert.equal(stream.status, 200);
+    assert.match(stream.headers.get("content-type") ?? "", /text\/event-stream/i);
+    controller.abort();
+  } finally {
+    controller?.abort();
+    sessionId = savedSid;
+  }
+});
+
+test("server/discover (sessionless bootstrap probe) answered, never desyncs", async () => {
+  const r = await fetch(`${BASE}/`, {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({ jsonrpc: "2.0", id: 7, method: "server/discover", params: {} }),
+  });
+  assert.equal(r.status, 200);
+  const msg = await parseRpc(r);
+  assert.ok(msg.result !== undefined || msg.error !== undefined);
+  // follow-up request on a NEW connection still fine
+  const list = await rpc("tools/list", {}, { noSession: true });
+  assert.equal(list.status, 200);
+});
+
+test("HERDR_MCP_ALL_TOOLS=1 restores the full 22-tool surface (advanced + deprecated)", async () => {
+  const allSrv = await spawnServer(ALL_PORT, { HERDR_MCP_ALL_TOOLS: "1" });
+  try {
+    const list = await rpc("tools/list", {}, { base: `http://127.0.0.1:${ALL_PORT}`, noSession: true });
+    assert.equal(list.status, 200);
+    const names = list.msg.result.tools.map((t) => t.name);
+    assert.equal(names.length, 22, `all-tools mode must register all 22 tools, got ${names.length}: ${names.join(",")}`);
+    const advanced = ["herdr_wait", "herdr_task", "herdr_task_handoff", "herdr_parallel", "herdr_task_reap",
+      "herdr_read", "herdr_explain", "herdr_prompt_status", "herdr_transcript", "herdr_diff"];
+    const deprecated = ["herdr_session", "herdr_handoff", "herdr_reap"];
+    for (const n of [...advanced, ...deprecated]) {
+      assert.ok(names.includes(n), `HERDR_MCP_ALL_TOOLS=1 must register ${n}`);
+    }
+    // the default 9 remain registered too
+    const defaults = ["herdr_inspect", "herdr_since", "herdr_methods", "herdr_call", "herdr_prompt",
+      "herdr_fs_read", "herdr_fs_write", "herdr_fs_edit", "herdr_exec"];
+    for (const n of defaults) {
+      assert.ok(names.includes(n), `all-tools mode must keep ${n}`);
+    }
+  } finally {
+    await stopServer(allSrv);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ChatGPT / openai-mcp stateless transport ("Session terminated" root fix):
+// the connector stores the Mcp-Session-Id from initialize and reuses the stale
+// id after a server restart; the new process has no such session and the client
+// reports JSON-RPC -32600 "Session terminated" without recovering. openai-mcp
+// UA traffic is therefore served stateless END-TO-END — initialize included —
+// so no session id is ever issued and there is nothing that can go stale.
+// ---------------------------------------------------------------------------
+
+const openaiInit = {
+  protocolVersion: "2025-06-18",
+  capabilities: {},
+  clientInfo: { name: "ChatGPT", version: "1" },
+};
+
+const openaiToolCall = (name, args = {}) =>
+  tool(name, args, { noSession: true, ua: OPENAI_UA });
+
+test("openai-mcp UA: initialize returns NO Mcp-Session-Id on / and /mcp (stateless end-to-end)", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    for (const p of ["/", "/mcp"]) {
+      const init = await rpc("initialize", openaiInit, { noSession: true, ua: OPENAI_UA, path: p });
+      assert.equal(init.status, 200, `initialize on ${p}`);
+      assert.equal(init.res.headers.get("mcp-session-id"), null,
+        `openai-mcp initialize on ${p} must NOT return Mcp-Session-Id — issuing one is what goes stale after restart`);
+      assert.ok(init.msg.result?.serverInfo?.name, `initialize result missing serverInfo on ${p}`);
+      assert.equal(typeof init.msg.result?.instructions, "string",
+        `initialize must carry the instructions field on ${p}`);
+    }
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
+test("openai-mcp UA: initialize -> tools/list -> tools/call consecutive, stale sid tolerated", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    const init = await rpc("initialize", openaiInit, { noSession: true, ua: OPENAI_UA });
+    assert.equal(init.status, 200);
+    assert.equal(init.res.headers.get("mcp-session-id"), null);
+    const list = await rpc("tools/list", {}, { noSession: true, ua: OPENAI_UA });
+    assert.equal(list.status, 200);
+    assert.equal(list.msg.result.tools.length, 9,
+      `openai-mcp tools/list must expose exactly 9 tools, got ${list.msg.result.tools.length}`);
+    // tools/call while still carrying a (now-meaningless) session id header — the
+    // restart class: the server must serve it statelessly, never 404 -32001.
+    const m = await tool("herdr_methods", { query: "ping" },
+      { noSession: true, ua: OPENAI_UA, sid: "stale-session-id" });
+    assert.equal(m.ok, true, `stateless tools/call failed: ${JSON.stringify(m).slice(0, 160)}`);
+    // notifications/initialized with a stale sid must not error either
+    const note = await fetch(`${BASE}/`, {
+      method: "POST",
+      headers: headers({ "User-Agent": OPENAI_UA, "Mcp-Session-Id": "stale-session-id" }),
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }),
+    });
+    assert.ok(note.status === 200 || note.status === 202 || note.status === 204,
+      `openai-mcp notification status ${note.status}`);
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
+test("openai-mcp UA: server restart on the same port -> stateless tools/call still succeeds (no Session terminated)", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    // handshake against the live server
+    const init = await rpc("initialize", openaiInit, { noSession: true, ua: OPENAI_UA });
+    assert.equal(init.status, 200);
+    assert.equal(init.res.headers.get("mcp-session-id"), null);
+    const before = await openaiToolCall("herdr_methods", { query: "ping" });
+    assert.equal(before.ok, true);
+
+    // kill + restart on the SAME port — the new process has zero sessions.
+    await stopServer(server);
+    server = await spawnServer(PORT);
+
+    // The client's stale-session tools/call must still succeed: no 404/-32001,
+    // which is exactly what surfaced as JSON-RPC -32600 "Session terminated".
+    const after = await tool("herdr_methods", { query: "ping" },
+      { noSession: true, ua: OPENAI_UA, sid: "pre-restart-stale-session" });
+    assert.equal(after.ok, true, `stateless tools/call after restart failed: ${JSON.stringify(after).slice(0, 200)}`);
+    const list = await rpc("tools/list", {}, { noSession: true, ua: OPENAI_UA, sid: "pre-restart-stale-session" });
+    assert.equal(list.status, 200);
+    assert.equal(list.msg.result.tools.length, 9, `tools/list after restart must stay 9`);
+    // a fresh initialize after restart is stateless too
+    const init2 = await rpc("initialize", openaiInit, { noSession: true, ua: OPENAI_UA });
+    assert.equal(init2.res.headers.get("mcp-session-id"), null);
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
+test("openai-mcp UA: 100 sequential stateless calls all succeed", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    let errs = 0;
+    for (let i = 0; i < 100; i++) {
+      if (i % 2 === 0) {
+        const r = await rpc("tools/list", {}, { noSession: true, ua: OPENAI_UA });
+        if (r.status !== 200 || !Array.isArray(r.msg.result?.tools)) errs++;
+      } else {
+        const r = await openaiToolCall("herdr_methods", { query: "ping" });
+        if (r.ok !== true) errs++;
+      }
+    }
+    assert.equal(errs, 0, `${errs} of 100 openai-mcp stateless requests failed`);
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
+test("stateful client (non-openai UA): initialize still returns Mcp-Session-Id; stale sid still 404 -32001", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    const ua = "claude-connector/1.0";
+    for (const p of ["/", "/mcp"]) {
+      const init = await rpc("initialize",
+        { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "claude-desktop", version: "1" } },
+        { noSession: true, ua, path: p });
+      assert.equal(init.status, 200, `stateful initialize on ${p}`);
+      assert.ok(init.res.headers.get("mcp-session-id"),
+        `non-openai initialize on ${p} must return Mcp-Session-Id`);
+      const list = await rpc("tools/list", {}, { path: p });
+      assert.equal(list.status, 200, `stateful tools/list on ${p} with its session`);
+      // unknown sid stays a spec-correct 404 + -32001 for stateful clients
+      const bad = await fetch(`${BASE}${p}`, {
+        method: "POST",
+        headers: headers({ "User-Agent": ua, "Mcp-Session-Id": "definitely-not-a-session" }),
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+      });
+      assert.equal(bad.status, 404, `stale stateful sid on ${p} must 404`);
+      const badMsg = await parseRpc(bad);
+      assert.equal(badMsg.error.code, -32001);
+    }
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
+test("openai-mcp UA: server/discover is -32601 on both / and /mcp (forces legacy handshake)", async () => {
+  for (const p of ["/", "/mcp"]) {
+    const r = await fetch(`${BASE}${p}`, {
+      method: "POST",
+      headers: headers({ "User-Agent": OPENAI_UA }),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 7, method: "server/discover", params: {} }),
+    });
+    assert.equal(r.status, 200, `discover on ${p}`);
+    const msg = await parseRpc(r);
+    assert.equal(msg.error?.code, -32601, `openai-mcp discover on ${p} must be -32601`);
+  }
+});
