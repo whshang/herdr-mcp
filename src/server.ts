@@ -28,6 +28,7 @@ import { get as sessionGet, save as sessionSave, type SessionData, type SessionP
 import { waitForAgent } from "./wait.js";
 import { registerPushRoutes } from "./push.js";
 import { registerOAuthRoutes, mcpBearerAuth } from "./oauth.js";
+import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 
 // ---------------------------------------------------------------------------
 // Config from environment (mirrors server.py)
@@ -72,6 +73,7 @@ const BUILD_INFO = {
 function buildInfo(): Record<string, unknown> {
   return {
     ...BUILD_INFO,
+    server_version: SERVER_VERSION,
     started_at: BUILD_INFO.started_at,
     pid: process.pid,
     stale: BUILD_INFO.built_at > BUILD_INFO.started_at, // false in normal operation
@@ -1949,7 +1951,7 @@ const SERVER_INSTRUCTIONS =
 
 function mcpServerForSession(): McpServer {
   const server = new McpServer(
-    { name: "herdr-mcp", version: "0.2.0" },
+    { name: SERVER_NAME, version: SERVER_VERSION },
     { capabilities: {}, instructions: SERVER_INSTRUCTIONS },
   );
   registerTools(server);
@@ -2048,7 +2050,7 @@ async function handleMcpRequest(req: Request, res: Response): Promise<void> {
         instructions: SERVER_INSTRUCTIONS,
         ttlMs: 3600000,
         cacheScope: "private",
-        _meta: { "io.modelcontextprotocol/serverInfo": { name: "herdr-mcp", version: "0.2.0" } },
+        _meta: { "io.modelcontextprotocol/serverInfo": { name: SERVER_NAME, version: SERVER_VERSION } },
       },
     });
     return;

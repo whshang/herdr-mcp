@@ -38,6 +38,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { Router, Request, Response, NextFunction } from "express";
 import type { Express } from "express";
+import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 
 // ---------------------------------------------------------------------------
 // Config (mirrors server.ts env handling; self-contained on purpose)
@@ -609,7 +610,7 @@ export function registerOAuthRoutes(app: Express): void {
   });
   // MCP server card (serverUrl required by MCP 2025-06-18+ spec).
   router.get("/.well-known/mcp.json", (_req, res) => {
-    res.status(200).json({ serverUrl: oauthResourceUrl(), name: "herdr-mcp", version: "0.2.0" });
+    res.status(200).json({ serverUrl: oauthResourceUrl(), name: SERVER_NAME, version: SERVER_VERSION });
   });
 
   router.post("/oauth/register", (req, res) => {
