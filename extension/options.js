@@ -1,14 +1,14 @@
 // options.js — 配置页
 const $ = (id) => document.getElementById(id);
-const KEYS = ["herdrMcpUrl", "token", "wakeTemplate", "progressTickSec", "progressTemplate", "autoAllow", "enabled"];
+const KEYS = ["herdrMcpUrl", "token", "wakeTemplate", "progressTickSec", "progressFallbackSec", "progressTemplate", "autoAllow", "enabled"];
 const DEFAULT_TEMPLATE = "herdr agent {agent} ({pane}) 已完成 ({status})。\n\n{output}\n\n请基于以上结果继续。";
 const DEFAULT_PROGRESS_TEMPLATE = "herdr agent {agent} ({pane}) 仍在执行 ({status})。\n\n{output}\n\n请调用 herdr_since 或继续观察进度，不要停在本轮。";
 
-/** 秒数解析: 非数字/缺失 → 120 默认; 负数/NaN → 0 (关闭); 上限 86400。 */
-function parseTickSec(v) {
+/** 秒数解析: 非数字/缺失 → fallback 默认; 负数/NaN → 0 (关闭); 上限 86400。 */
+function parseTickSec(v, fallback = 60) {
   const n = Number(v);
-  if (v === "" || v === undefined || v === null) return 120;
-  if (!Number.isFinite(n)) return 120;
+  if (v === "" || v === undefined || v === null) return fallback;
+  if (!Number.isFinite(n)) return fallback;
   if (n <= 0) return 0;
   return Math.min(Math.floor(n), 86400);
 }
@@ -17,7 +17,8 @@ chrome.storage.local.get(KEYS, (cfg) => {
   $("url").value = cfg.herdrMcpUrl || "http://127.0.0.1:8772";
   $("token").value = cfg.token || "";
   $("template").value = cfg.wakeTemplate || DEFAULT_TEMPLATE;
-  $("progressTickSec").value = cfg.progressTickSec ?? 120;
+  $("progressTickSec").value = cfg.progressTickSec ?? 60;
+  $("progressFallbackSec").value = cfg.progressFallbackSec ?? 600;
   $("progressTemplate").value = cfg.progressTemplate || DEFAULT_PROGRESS_TEMPLATE;
   $("autoAllow").checked = cfg.autoAllow !== false;
   $("enabled").checked = cfg.enabled !== false;
@@ -33,7 +34,8 @@ $("save").addEventListener("click", () => {
     herdrMcpUrl: $("url").value.trim(),
     token: $("token").value.trim(),
     wakeTemplate: $("template").value,
-    progressTickSec: parseTickSec($("progressTickSec").value),
+    progressTickSec: parseTickSec($("progressTickSec").value, 60),
+    progressFallbackSec: parseTickSec($("progressFallbackSec").value, 600),
     progressTemplate: $("progressTemplate").value,
     autoAllow: $("autoAllow").checked,
     enabled: $("enabled").checked,

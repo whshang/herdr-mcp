@@ -25,8 +25,27 @@ herdr-mcp **不会** 把每个 herdr 方法都做成 MCP 工具。那会烧上�
 
 1. **当前产品只保留一条正确路径** — 不为想象中的第二种客户端预留配置。
 2. **变更** 限制在托管 git 根内；可选 `HERDR_MCP_READONLY` / `HERDR_MCP_WRITE_ROOTS`。
-3. **投递不确定** — 传输失败后不要对非幂等 prompt 盲目重试；先用 inspect/since 核对。
+3. **投递不确定** — 传输失败后不要对非幂等 prompt 盲目重试；先用 inspect/since 核对。mutation 默认走 `herdr_prompt`（省略 `wait`）并带 `idempotency_key`；状态用 `herdr_since` / `herdr_inspect`。
 4. **版本是缓存键** — 工具面或握手语义变了就 bump `src/version.ts` + `package.json`。
+
+## 错误语义（`herdr_call` / `herdr_prompt`）
+
+| `failure` / `failure_phase` | 含义 | 可否盲重试 |
+|---|---|---|
+| `herdr_transport` | 真连接/socket 问题 | 视方法；mutation 仍先核对 |
+| `agent_status_wait_timeout` / `post_submission_status_wait` | 投递后等 agent 状态超时（常见于带 `wait` 的 `agent.prompt`） | **否** — 先 inspect/since |
+| `herdr_error` | 其它 daemon 业务错误 | 视 `retryable` |
+
+`herdr_prompt` 成功时带 `state_observation: { changed: true\|false\|"unknown", fresh }`；无 `wait` 时未变快照为 `"unknown"`（不是「没投递」）。兼容字段 `state_changed` 仍保留。
+
+## 远程工作站闸门
+
+| 闸门 | `herdr_fs_*` | `herdr_exec` |
+|---|---|---|
+| readonly / write_roots | 有 | 有 |
+| secret-path（路径校验） | 有 | **无**（自由 shell 可 `cat .env`；文件 IO 请用 fs） |
+| working agent | edit/write 默认拒绝，`confirm_busy` 可过 | 默认拒绝，`confirm_busy` 可过 |
+| dirty confirm | edit/write 有 | **无**（脏树上跑命令是常态） |
 
 ## 传输
 
@@ -38,5 +57,5 @@ herdr-mcp **不会** 把每个 herdr 方法都做成 MCP 工具。那会烧上�
 
 - [extension.md](./extension.md) — 扩展双主线总览
 - [chatgpt-connector.md](./chatgpt-connector.md) — ChatGPT OAuth、schema、权限卡
-- [extension-wake.md](./extension-wake.md) — 主线 A：进度回推
+- [extension-wake.md](./extension-wake.md) — 主线 A：进度回推（检查间隔 + 新摘要才发 + 可配置兜底）
 - [extension-bridge.md](./extension-bridge.md) — 主线 B：JSON→MCP

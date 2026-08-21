@@ -9,7 +9,7 @@
 //   其它站点仍在唤醒窗口期内观察 (站点常在唤醒后弹权限)。
 // 状态反馈: 页内不再画点 (用户反馈困惑), 改用工具栏图标徽章 (background 驱动)。
 // 版本: 与 background.js 的 H2W_SCRIPT_VERSION 同步 bump (改 content 代码必须)。
-const H2W_CONTENT_VERSION = "0.1.4";
+const H2W_CONTENT_VERSION = "0.1.7";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] 无适配器, 跳过"); return; }
@@ -29,6 +29,7 @@ const H2W_CONTENT_VERSION = "0.1.4";
     });
   }
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const normText = (s) => String(s || "").replace(/\s+/g, " ").trim();
 
   // ---- MAIN world 插入 (contenteditable 站点) ----
   function insertMainWorld(text, selector) {
@@ -44,7 +45,8 @@ const H2W_CONTENT_VERSION = "0.1.4";
   function mainWorldCommitted(text) {
     const el = ADAPTER.getInputEl();
     if (!el) return false;
-    return (el.innerText || el.textContent || "").includes(text);
+    // ProseMirror 会把 \n 拆成段落, innerText 空白与模板不完全一致 → 归一化再比
+    return normText(el.innerText || el.textContent).includes(normText(text));
   }
   async function ensureCommitted(text, maxAttempts = 3) {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -62,17 +64,43 @@ const H2W_CONTENT_VERSION = "0.1.4";
     return mainWorldCommitted(text);
   }
 
+  function sendButtonReady(btn) {
+    if (!btn || !btn.offsetParent) return false;
+    if (btn.disabled) return false;
+    if (btn.getAttribute("aria-disabled") === "true") return false;
+    if (btn.getAttribute("data-disabled") === "true") return false;
+    return true;
+  }
+
   // ---- 发送 ----
+  // contenteditable 站点: 等发送按钮可点再 click; 仅键盘事件常被 ProseMirror 吞掉。
+  // 成功判定: 输入框被清空 (真正发出去了)。假阳性 return true 会导致「框里堆着字却以为发了」。
   async function submit() {
     if (ADAPTER.needsMainWorldInsert) {
-      const btn = ADAPTER.getSendButton();
-      if (btn && !btn.disabled) { btn.click(); return true; }
+      await wait(350); // 等编辑模型吃进 insertText, 按钮才从 disabled 变可点
+      for (let i = 0; i < 20; i++) {
+        const btn = ADAPTER.getSendButton();
+        if (sendButtonReady(btn)) {
+          btn.click();
+          for (let j = 0; j < 15; j++) {
+            await wait(200);
+            if (!ADAPTER.inputHasContent()) return true;
+          }
+          // 点了但框还在 → 可能没发出, 继续重试 / 换策略
+          console.warn("[h2w] 点了发送但输入框仍有内容, 重试");
+        }
+        await wait(150);
+      }
       const el = ADAPTER.getInputEl();
       if (!el) return false;
       el.focus();
-      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
-      el.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
-      return true;
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true, cancelable: true }));
+      el.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true, cancelable: true }));
+      for (let j = 0; j < 10; j++) {
+        await wait(200);
+        if (!ADAPTER.inputHasContent()) return true;
+      }
+      return false;
     }
     return ADAPTER.send();
   }
@@ -121,40 +149,65 @@ const H2W_CONTENT_VERSION = "0.1.4";
   }
 
   // ---- 执行一次唤醒 ----
+  let wakeInFlight = false;
+  let lastWakeNorm = "";
+  let lastWakeAt = 0;
   async function performWake(data) {
     if (!runtimeAlive()) return { ok: false, error: "context-invalidated" };
-    if (ADAPTER.inputHasContent()) {
-      return { ok: false, blocked: "user-typing" };
-    }
+    if (wakeInFlight) return { ok: false, blocked: "wake-in-flight" };
     const text = (data.template || "").trim();
     if (!text) return { ok: false, error: "empty-template" };
-    // 权限弹窗观察: 提交前开启, 覆盖提交后的窗口期 (站点常在唤醒后弹权限)
-    if (data.autoAllow !== false) startPermissionWatch();
-
-    let committedOk = false;
-    if (ADAPTER.needsMainWorldInsert) {
-      committedOk = await ensureCommitted(text);
-      if (!committedOk) {
-        try {
-          const el = ADAPTER.getInputEl();
-          const strip = (n) => { for (const c of [...n.childNodes]) { if (c.nodeType === 3 && c.data.includes(text)) c.remove(); else strip(c); } };
-          if (el) strip(el);
-        } catch (e) {}
-        return { ok: false, error: "insert-failed" };
-      }
-      const sent = await submit();
-      return { ok: sent, committed: true, site: ADAPTER.name };
+    const n = normText(text);
+    // 短窗口去重: 重试/双扩展/双 timer 叠同一条时不反复往框里灌
+    if (n && n === lastWakeNorm && Date.now() - lastWakeAt < 8000) {
+      return { ok: false, blocked: "dedupe" };
     }
+    if (ADAPTER.inputHasContent()) {
+      // 框里已是同文案 → 只补发送, 不再插入
+      if (mainWorldCommitted(text) || normText((ADAPTER.getInputEl()?.innerText || ADAPTER.getInputEl()?.textContent || "")).includes(n.slice(0, 80))) {
+        wakeInFlight = true;
+        try {
+          if (data.autoAllow !== false) startPermissionWatch();
+          const sent = await submit();
+          if (sent) { lastWakeNorm = n; lastWakeAt = Date.now(); }
+          return { ok: sent, committed: true, resumed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+        } finally { wakeInFlight = false; }
+      }
+      return { ok: false, blocked: "user-typing" };
+    }
+    wakeInFlight = true;
+    try {
+      if (data.autoAllow !== false) startPermissionWatch();
 
-    const el = ADAPTER.getInputEl();
-    if (!el) return { ok: false, error: "no-input" };
-    const oldOpacity = el.style.opacity;
-    el.style.opacity = "0";
-    ADAPTER.fillInput(text);
-    await wait(420); // React 受控组件异步提交 value (ctmc 教训)
-    const sent = await submit();
-    setTimeout(() => { if (el) el.style.opacity = oldOpacity ?? ""; }, 600);
-    return { ok: sent, site: ADAPTER.name };
+      let committedOk = false;
+      if (ADAPTER.needsMainWorldInsert) {
+        committedOk = await ensureCommitted(text);
+        if (!committedOk) {
+          try {
+            const el = ADAPTER.getInputEl();
+            const strip = (node) => { for (const c of [...node.childNodes]) { if (c.nodeType === 3 && c.data.includes(text)) c.remove(); else strip(c); } };
+            if (el) strip(el);
+          } catch (e) {}
+          return { ok: false, error: "insert-failed" };
+        }
+        const sent = await submit();
+        if (sent) { lastWakeNorm = n; lastWakeAt = Date.now(); }
+        return { ok: sent, committed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+      }
+
+      const el = ADAPTER.getInputEl();
+      if (!el) return { ok: false, error: "no-input" };
+      const oldOpacity = el.style.opacity;
+      el.style.opacity = "0";
+      ADAPTER.fillInput(text);
+      await wait(420); // React 受控组件异步提交 value (ctmc 教训)
+      const sent = await submit();
+      setTimeout(() => { if (el) el.style.opacity = oldOpacity ?? ""; }, 600);
+      if (sent) { lastWakeNorm = n; lastWakeAt = Date.now(); }
+      return { ok: sent, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+    } finally {
+      wakeInFlight = false;
+    }
   }
 
   // ---- 投递确认 (SpeaksJSON 站点): 提交后等回复区出现/内容变化 ----

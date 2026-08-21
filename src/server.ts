@@ -35,6 +35,11 @@ import {
   getRequestOAuthClientId,
 } from "./oauth.js";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
+import {
+  isAgentStatusWaitTimeout,
+  isTrueTransportFailure,
+  buildStateObservation,
+} from "./prompt-semantics.js";
 
 /** SDK-supported wire version used when ChatGPT advertises 2026-07-28. */
 const SDK_WIRE_PROTOCOL = "2025-11-25";
@@ -404,21 +409,41 @@ function toResult(data: unknown) {
   };
 }
 
-/** P1-F: transparent transport errors for MCP clients. */
+/** P1-F: transparent transport / status-wait errors for MCP clients. */
 function herdrErrorResult(error: unknown, context?: string) {
   const err = error instanceof HerdrError
     ? error
     : new HerdrError("unknown", error instanceof Error ? error.message : String(error));
+  const detail = err.toDetail();
+  const daemon = {
+    socket_path: process.env.HERDR_SOCKET_PATH ?? `${process.env.HOME}/.config/herdr/herdr.sock`,
+    mcp_pid: process.pid,
+    build: buildInfo(),
+  };
+
+  // Daemon waited for agent status after accept — not a socket transport failure.
+  if (isAgentStatusWaitTimeout(detail.message) || isAgentStatusWaitTimeout(err.message)) {
+    return toResult({
+      ok: false,
+      failure: "agent_status_wait_timeout",
+      failure_phase: "post_submission_status_wait",
+      submitted: "unknown",
+      delivery_uncertain: true,
+      context,
+      ...detail,
+      // Status-wait timeout after a mutation: never blind-retry
+      retryable: false,
+      hint: "submission may have succeeded — verify with herdr_inspect / herdr_since (or herdr_prompt_status) before re-sending",
+      daemon,
+    });
+  }
+
   return toResult({
     ok: false,
-    failure: "herdr_transport",
+    failure: isTrueTransportFailure(detail.code, detail.message) ? "herdr_transport" : "herdr_error",
     context,
-    ...err.toDetail(),
-    daemon: {
-      socket_path: process.env.HERDR_SOCKET_PATH ?? `${process.env.HOME}/.config/herdr/herdr.sock`,
-      mcp_pid: process.pid,
-      build: buildInfo(),
-    },
+    ...detail,
+    daemon,
   });
 }
 
@@ -585,12 +610,17 @@ function registerTools(server: McpServer): void {
   server.registerTool(
     "herdr_call",
     {
-      description: "Generic passthrough to the herdr socket API, VALIDATED against the live schema " +
+      description:
+        "Generic passthrough to the herdr socket API, VALIDATED against the live schema " +
         "(schema reflected from the installed herdr binary, 60s cache). Params are checked before " +
         "sending: missing required / wrong type / wrong enum -> invalid_params error (no socket " +
         "call); unknown params -> warnings. Call herdr_methods first when the schema is unknown; " +
-        "prefer explicit pane_id/workspace_id over bare names. Never blind-retry a mutating call " +
-        "after a transport failure — delivery is uncertain, verify state before re-sending.",
+        "prefer explicit pane_id/workspace_id over bare names. " +
+        "For agent.prompt prefer herdr_prompt (fire-and-forget + idempotency_key + delivery " +
+        "evidence); do not pass wait on mutations unless you intentionally want submit+wait. " +
+        "Never blind-retry a mutating call after failure — delivery may be uncertain; verify " +
+        "with herdr_inspect / herdr_since first. Status-wait timeouts are failure " +
+        "agent_status_wait_timeout (not herdr_transport).",
       inputSchema: {
         method: z.string().describe("herdr socket method, e.g. pane.split, agent.start"),
         // ChatGPT/OpenAI rejects Zod's z.record → propertyNames + additionalProperties:{}.
@@ -1555,7 +1585,10 @@ function registerTools(server: McpServer): void {
         "cd; it never depends on the pane's current foreground_cwd. When the workspace has " +
         "MULTIPLE project roots and project_root is omitted, the call is REFUSED and returns " +
         "candidates (one of them is the exact value to pass next). Gated by HERDR_MCP_READONLY / " +
-        "HERDR_MCP_WRITE_ROOTS. Returns exit_code + effective_cwd/project_root + stripped output. " +
+        "HERDR_MCP_WRITE_ROOTS. If any agent in that project is working, refused unless " +
+        "confirm_busy:true (returns warnings.working). Freeform shell is NOT secret-path gated " +
+        "(unlike herdr_fs_* — a command can still read .env); prefer fs tools for file IO. " +
+        "Returns exit_code + effective_cwd/project_root + stripped output. " +
         "On timeout the command may still be running in the pane; partial output is returned " +
         "with ok:false code:exec_timeout.",
       inputSchema: {
@@ -1563,9 +1596,10 @@ function registerTools(server: McpServer): void {
         command: z.string().describe("Shell command line to run in the utility pane"),
         project_root: z.string().optional().describe("Explicit project root within this workspace (workspaces[].projects[].root from herdr_inspect). REQUIRED when the workspace has multiple project roots; the command runs with this root as cwd via subshell cd"),
         timeout_ms: z.number().int().min(1).max(300000).default(30000),
+        confirm_busy: z.boolean().default(false).describe("Force exec even when an agent in the project is working (returns warnings.working)"),
       },
     },
-    async ({ workspace: wsTarget, command, project_root, timeout_ms }) => {
+    async ({ workspace: wsTarget, command, project_root, timeout_ms, confirm_busy }) => {
       const c = clientGet();
       let snap: HerdrResult;
       try { snap = await c.snapshot(); } catch (e) {
@@ -1625,6 +1659,13 @@ function registerTools(server: McpServer): void {
       const execCwd = effectiveRoot;
       const gate = mutationDenied(execCwd, "herdr_exec");
       if (gate) return toResult(gate);
+      const working = workingAgentsForRoot(snap, execCwd);
+      if (working.length > 0 && !confirm_busy) {
+        return toResult({
+          ok: false, reason: "agent_working", root: execCwd, working,
+          hint: "an agent in this project is working — pass confirm_busy:true to force, or wait for idle/done",
+        });
+      }
 
       const panesRaw = ((snap["panes"] as unknown[]) ?? [])
         .map((p) => (p ?? {}) as Record<string, unknown>)
@@ -1714,6 +1755,7 @@ function registerTools(server: McpServer): void {
         return toResult({ ok: false, code: timedOut ? "exec_timeout" : err.code, message: timedOut ? undefined : err.message,
           workspace: wsId, pane_id: paneId, command, effective_cwd: execCwd, project_root: effectiveRoot ?? null,
           partial_output: partial.slice(-4000),
+          ...(working.length > 0 ? { warnings: { working } } : {}),
           hint: timedOut
             ? "command may still be running in the utility pane — inspect it via pane.read"
             : `wait_for_output failed (${err.code}) — the pane may have died` });
@@ -1734,7 +1776,8 @@ function registerTools(server: McpServer): void {
       const output = cleanTerminalOutput(seg).trim();
       return toResult({ ok: exitCode === 0, workspace: wsId, pane_id: paneId, created_utility_pane: created,
         command, exit_code: exitCode, effective_cwd: execCwd, project_root: effectiveRoot ?? null,
-        output: output.slice(-8000) });
+        output: output.slice(-8000),
+        ...(working.length > 0 ? { warnings: { working } } : {}) });
     },
   );
 
@@ -1845,21 +1888,21 @@ function registerTools(server: McpServer): void {
     {
       description:
         "Send a prompt to a herdr agent via the socket-level agent.prompt (server-owned " +
-        "delivery; NEVER pane.send_text). Returns the RAW result + delivery evidence " +
-        "(agent_status/state_change_seq before+after, resolved_pane, state_changed). Blocked " +
-        "target -> status 'agent_blocked', submitted:false, no input sent. idempotency_key " +
-        "makes replays safe (non-idempotent: never auto-retried; on transport failure the body " +
-        "carries failure_phase + before-state so the caller can decide). Optional native wait " +
-        "{until, timeout_ms} makes submit+wait atomic. NOTE: without wait, seq may lag — " +
-        "state_changed:false does NOT prove non-delivery; check herdr_prompt_status. " +
-        "Delivery rule: a prompt is a mutation — after a transport failure delivery is " +
-        "uncertain, NEVER blind-retry; verify (herdr_explain/herdr_read) first. Worker " +
-        "invariant: a dev worker must run with project root == pane cwd == foreground cwd; " +
-        "if herdr_inspect shows a mismatch, stop the current pane and prompt the correct one.",
+        "delivery; NEVER pane.send_text). DEFAULT: fire-and-forget (omit wait) — confirm " +
+        "progress with herdr_since / herdr_inspect. Strongly prefer idempotency_key on every " +
+        "call (replays return the stored result; never auto-retried). Returns delivery " +
+        "evidence: submitted, before/after, state_observation " +
+        "({changed:true|false|\"unknown\", fresh}), plus legacy state_changed. Blocked target " +
+        "-> status 'agent_blocked', submitted:false. Optional wait {until, timeout_ms} is " +
+        "submit+wait; a status-wait timeout is failure_phase post_submission_status_wait " +
+        "(not a socket transport failure) — verify before re-sending. Worker invariant: " +
+        "project root == pane cwd == foreground cwd.",
       inputSchema: {
         target: z.string().describe("Agent name or pane_id to prompt"),
         text: z.string().describe("Prompt text (multi-line/CJK safe; the server owns submission)"),
-        idempotency_key: z.string().optional().describe("Client-generated key; a replay returns the stored result without re-sending (prompt is non-idempotent)"),
+        idempotency_key: z.string().optional().describe(
+          "STRONGLY RECOMMENDED client key; replay returns stored result without re-sending",
+        ),
         wait: z
           .object({
             until: z.array(z.enum(["idle", "working", "blocked", "done", "unknown"])).optional()
@@ -1868,7 +1911,7 @@ function registerTools(server: McpServer): void {
               .describe("Wait budget; default 25s when wait is given"),
           })
           .optional()
-          .describe("Native agent.prompt wait — submit+wait in one request; omit for fire-and-forget"),
+          .describe("OPTIONAL submit+wait — omit for fire-and-forget (recommended)"),
       },
     },
     async ({ target, text, idempotency_key, wait }) => {
@@ -1896,14 +1939,46 @@ function registerTools(server: McpServer): void {
         r = await c.call("agent.prompt", params, callTimeout);
       } catch (e) {
         const err = e instanceof HerdrError ? e : new HerdrError("error", String(e));
-        // Cannot distinguish "never sent" from "sent, response lost". prompt is
-        // non-idempotent, so we do NOT record a replayable result — the caller
-        // must verify state (herdr_explain/herdr_read) before re-sending.
- const resolveFail = err.code === "agent_not_found" || err.code === "unknown_agent" || err.code === "unknown_pane";
+        const resolveFail = err.code === "agent_not_found" || err.code === "unknown_agent" || err.code === "unknown_pane";
+        const afterProbe = await agentStateOf(c, target);
+        if (isAgentStatusWaitTimeout(err.message)) {
+          const likelyWorking = afterProbe?.agent_status === "working";
+          const seqMoved = !!(before && afterProbe
+            && before.state_change_seq !== afterProbe.state_change_seq);
+          const submitted = likelyWorking || seqMoved ? true : "unknown";
+          const result = {
+            ok: false,
+            target,
+            failure: "agent_status_wait_timeout",
+            failure_phase: "post_submission_status_wait",
+            submitted,
+            delivery_uncertain: submitted === "unknown",
+            resolved_pane: afterProbe?.pane_id ?? before?.pane_id ?? null,
+            before: before ? { agent_status: before.agent_status, state_change_seq: before.state_change_seq } : null,
+            after: afterProbe ? { agent_status: afterProbe.agent_status, state_change_seq: afterProbe.state_change_seq } : null,
+            ...buildStateObservation({ before, after: afterProbe, waited: true }),
+            code: err.code,
+            message: err.message,
+            retryable: false,
+            hint: "status wait timed out after accept — verify with herdr_inspect / herdr_since before re-sending",
+            wait: { completed: false, reason: "agent_status_timeout" },
+          };
+          // Safe to remember when we believe submission landed (blocks blind re-prompt)
+          if (idempotency_key && submitted === true) {
+            rememberPrompt(idempotency_key, {
+              ok: true, target, status: "submitted", submitted: true,
+              resolved_pane: result.resolved_pane, before: result.before, after: result.after,
+              wait: { completed: false, reason: "agent_status_timeout" },
+              idempotent_note: "first call timed out waiting for status; submission already landed",
+            });
+          }
+          return toResult(result);
+        }
         const result = {
           ok: false, target, failure_phase: resolveFail ? "resolve" : "submit_or_response_lost",
           resolved_pane: before?.pane_id ?? null,
           before: before ? { agent_status: before.agent_status, state_change_seq: before.state_change_seq } : null,
+          after: afterProbe ? { agent_status: afterProbe.agent_status, state_change_seq: afterProbe.state_change_seq } : null,
           code: err.code, message: err.message, retryable: err.retryable,
           hint: err.retryable
             ? "non-idempotent: a timeout may still have delivered — verify with herdr_explain/herdr_read before re-sending"
@@ -1920,17 +1995,17 @@ function registerTools(server: McpServer): void {
         await new Promise<void>((resolve) => setTimeout(resolve, 250));
         after = await agentStateOf(c, target);
       }
-      const changed =
-        !!before && !!after &&
-        (before.state_change_seq !== after.state_change_seq || before.agent_status !== after.agent_status);
+      const obs = buildStateObservation({ before, after, waited: !!wait });
       const result = {
         ok: true, target,
         resolved_pane: after?.pane_id ?? before?.pane_id ?? null,
         status, submitted: status !== "agent_blocked",
         before: before ? { agent_status: before.agent_status, state_change_seq: before.state_change_seq } : null,
         after: after ? { agent_status: after.agent_status, state_change_seq: after.state_change_seq } : null,
-        state_changed: changed, seq_note: !wait ? "seq may lag; unchanged does NOT prove non-delivery" : undefined,
+        ...obs,
+        seq_note: !wait ? "seq may lag; state_observation.changed=unknown does NOT prove non-delivery" : undefined,
         prompt: pr,
+        ...(idempotency_key ? {} : { idempotency_hint: "pass idempotency_key on mutating prompts to make retries safe" }),
       };
       if (idempotency_key) rememberPrompt(idempotency_key, result);
       return toResult(result);

@@ -86,8 +86,8 @@ before(async () => {
         try { req = JSON.parse(line); } catch { continue; }
         if (req.method === "session.snapshot") {
           const snap = {
-            agents: [{ pane_id: "wH:p1", cwd: root, agent_status: "working", agent: "pi" }],
-            panes: [{ pane_id: "wH:p1", cwd: root }],
+            agents: [{ pane_id: "wH:p1", workspace_id: "wH", cwd: root, agent_status: "working", agent: "pi" }],
+            panes: [{ pane_id: "wH:p1", workspace_id: "wH", cwd: root }],
             workspaces: [{ workspace_id: "wH", label: "wH", projects: [{ root }] }],
           };
           sock.write(JSON.stringify({ id: req.id, result: { snapshot: snap } }) + "\n");
@@ -231,4 +231,11 @@ test("fs_edit/fs_write: default refuses working agent, confirm_busy forces with 
   assert.equal(writeOk.ok, true, JSON.stringify(writeOk));
   assert.ok(writeOk.warnings?.working?.length > 0, "write must carry warnings.working");
   assert.equal(fs.readFileSync(path.join(root, "new.txt"), "utf-8"), "x");
+});
+
+test("herdr_exec: default refuses working agent (confirm_busy escapes)", async () => {
+  const refuse = await tool("herdr_exec", { workspace: "wH", command: "echo hi" });
+  assert.equal(refuse.ok, false, JSON.stringify(refuse));
+  assert.equal(refuse.reason, "agent_working");
+  assert.ok(Array.isArray(refuse.working) && refuse.working.length > 0, "working list expected");
 });

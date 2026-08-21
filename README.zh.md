@@ -87,13 +87,13 @@ herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法
 | `herdr_call` | 用 `{ method, params }` 调任意 herdr 方法（pane / workspace / agent 等），避免「一方法一工具」。 |
 | `herdr_inspect` | 一次看清连接 + workspaces / tabs / panes / agents（cwd、状态）。通常第一个调用。 |
 | `herdr_since` | 按 cursor 增量摘要，续聊时不用整包重拉状态。 |
-| `herdr_prompt` | 经 socket `agent.prompt` 投递提示（不要往 pane 里模拟打字）。建议带 `idempotency_key`。 |
+| `herdr_prompt` | 经 socket `agent.prompt` 投递（默认 fire-and-forget；强烈建议 `idempotency_key`；状态用 `herdr_since` / `herdr_inspect`）。 |
 | `herdr_fs_read` | 读本机 managed git 项目内的文件。 |
 | `herdr_fs_list` | 列 managed root 下目录（跳过 `.git` / 疑似密钥名）。 |
 | `herdr_fs_grep` | 在 managed root 内搜内容（优先 `rg`）。 |
 | `herdr_fs_write` | 新建/覆盖文件（脏文件 / 忙碌闸门；`confirm_dirty` / `confirm_busy`）。 |
 | `herdr_fs_edit` | 精确唯一字符串替换（闸门同 write）。 |
-| `herdr_exec` | 在 workspace 可见的 `herdr-mcp:utility` pane 里跑 shell（可观察，非无头）。 |
+| `herdr_exec` | 在 workspace 可见的 `herdr-mcp:utility` pane 里跑 shell；同项目有 working agent 时默认拒绝（`confirm_busy` 可过）。无 secret-path 闸门。 |
 
 可选：`HERDR_MCP_ALL_TOOLS=1` 打开高级/废弃生命周期工具。写操作限 managed git root；`HERDR_MCP_READONLY=1` / `HERDR_MCP_WRITE_ROOTS=/a,/b` 可再收紧。
 
@@ -103,7 +103,7 @@ herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法
 
 **两条对等主线**（见 [docs/extension.md](docs/extension.md)）：
 
-1. **进度回推**：herdr working/settled → 往绑定网页写提醒并提交（chatgpt / deepseek / z.ai / claude）
+1. **进度回推**：herdr working（新摘要 / 可配置兜底，默认 10 分钟）与 settled → 往绑定网页写提醒并提交（chatgpt / deepseek / z.ai / claude）
 2. **JSON→MCP**：DeepSeek / z.ai 无 connector 时，助手 JSON → 本机 `/mcp`（路线见 [docs/extension-bridge.md](docs/extension-bridge.md)）
 
 共享本地 `127.0.0.1:8772` 与静态 token。这不是给 DeepSeek「安装」ChatGPT 式 OAuth connector。

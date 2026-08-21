@@ -92,13 +92,14 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 
 ## 「TaskGroup」/ omp 挂了却说读不了文件
 
-交叉验证（健康的 0.3.9+）：
+交叉验证（健康的 0.3.10+）：
 
 | 工具 | 期望 |
 |---|---|
 | `herdr_fs_list` / `herdr_fs_read` / `herdr_fs_grep` | 托管 git 根下 `ok: true` |
-| `herdr_exec` | 工作区 utility 窗格有退出码和输出 |
+| `herdr_exec` | 工作区 utility 窗格有退出码和输出；同项目 working 时需 `confirm_busy` |
 | `herdr_call` `agent.start` | 同一窗格二次启动可能 `error` — 这是 herdr，不是 fs |
+| `herdr_prompt` / `herdr_call` `agent.prompt` | 等状态超时 → `failure: agent_status_wait_timeout`（不是 `herdr_transport`）；默认省略 `wait`，带 `idempotency_key` |
 
 上述都通，则 TaskGroup **不是** herdr-mcp 文件通道故障。常见情况：
 
@@ -122,7 +123,7 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 
 Connector 只解决「ChatGPT → herdr」。若工具很快返回「已提交」，而 agent 仍在窗格里跑，网页对话常不再自动 `herdr_since` / 继续。
 
-闭环要靠浏览器扩展：绑定该 chatgpt 会话 ↔ 干活的 pane，agent **settled**（以及将来的进度 tick）时往输入框塞继续提示并提交。见 [extension-wake.md](./extension-wake.md)。
+闭环要靠浏览器扩展：绑定该 chatgpt 会话 ↔ 干活的 pane；agent **working** 期间按「新摘要才发 + 10 分钟兜底」回推进度，**settled** 时再塞继续提示并提交。见 [extension-wake.md](./extension-wake.md)。
 
 未绑定扩展时，这不是 MCP 故障，是缺回推环。
 

@@ -80,7 +80,7 @@ export function bindingRevision(b) {
  *   - progressTickSec <= 0 (或非数字): 关闭, 永不 tick
  *   - prev.status !== "working": 不 tick (settled 走收工唤醒)
  *   - 距上次 tick (armed 时 = armedAt) 未满 progressTickSec: 不 tick
- *   - 满间隔: tick
+ *   - 满间隔: tick (仅表示「到检查点」, 是否真发消息见 shouldSendProgress)
  *
  * @param {{status: string|null, lastTickAt: number|null}} prev
  * @param {number} now Date.now()
@@ -96,13 +96,49 @@ export function shouldProgressTick(prev, now, cfg) {
   return now - lastTickAt >= sec * 1000;
 }
 
-/** 唤醒模板渲染: {agent} {pane} {status} {output}。 */
+/**
+ * 是否真的向网页发一条进度消息 (检查点通过之后)。
+ *
+ * 规则:
+ *   - 有非空 output 且与上次已发摘要不同 → 发 (new_output)
+ *   - 否则若 progressFallbackSec > 0 且距上次实发 ≥ 兜底间隔 → 发 (fallback)
+ *   - 否则跳过 (skip) — 避免空转刷屏
+ *
+ * lastSentAt: 武装时初始化为 now (不立刻发), 每次实发后更新。
+ *
+ * @param {{lastSentAt: number|null, lastOutputSent: string}} prev
+ * @param {number} now
+ * @param {string} output 本轮摘要
+ * @param {{progressFallbackSec?: number}} cfg
+ * @returns {{send: boolean, reason: "new_output"|"fallback"|"skip"}}
+ */
+export function shouldSendProgress(prev, now, output, cfg) {
+  const out = String(output ?? "").trim();
+  const prevOut = String(prev?.lastOutputSent ?? "").trim();
+  if (out.length > 0 && out !== prevOut) {
+    return { send: true, reason: "new_output" };
+  }
+  const fallbackSec = Number(cfg?.progressFallbackSec);
+  if (Number.isFinite(fallbackSec) && fallbackSec > 0) {
+    const lastSentAt = prev?.lastSentAt;
+    if (typeof lastSentAt === "number" && now - lastSentAt >= fallbackSec * 1000) {
+      return { send: true, reason: "fallback" };
+    }
+  }
+  return { send: false, reason: "skip" };
+}
+
+/** 唤醒模板渲染: {agent} {pane} {status} {output}。空 output 时压掉多余空行。 */
 export function buildWakeTemplate(template, fields) {
   const t = (template ?? "").trim();
   if (!t) return "";
-  return t
+  const output = String(fields.output ?? "").slice(0, 4000).trim();
+  let out = t
     .replaceAll("{agent}", fields.agent ?? "")
     .replaceAll("{pane}", fields.pane ?? "")
     .replaceAll("{status}", fields.status ?? "")
-    .replaceAll("{output}", (fields.output ?? "").slice(0, 4000));
+    .replaceAll("{output}", output);
+  // 模板常写 `\n\n{output}\n\n`; output 为空时会留下大段空行
+  out = out.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  return out;
 }

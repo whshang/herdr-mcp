@@ -18,7 +18,16 @@ class ChatGPTAdapter extends BaseAdapter {
 
   getSendButton() {
     return document.querySelector(
-      'button[data-testid="send-button"], button[aria-label*="发送"], button[aria-label*="Send" i]',
+      [
+        'button[data-testid="send-button"]',
+        'button[data-testid="composer-send-button"]',
+        'button[aria-label="发送提示"]',
+        'button[aria-label="Send prompt"]',
+        'button[aria-label*="发送提示"]',
+        'button[aria-label*="Send prompt" i]',
+        'button[aria-label*="发送"]',
+        'button[aria-label*="Send" i]',
+      ].join(", "),
     );
   }
 

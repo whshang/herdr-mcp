@@ -60,11 +60,14 @@ class BaseAdapter {
   }
 
   // 当前输入框里已有内容? (提交前防覆盖用户正在输入的文字)
+  // contenteditable / ProseMirror: 空段落也会留下空白字符 → 用 trim 后的可见文本判断
   inputHasContent() {
     const el = this.getInputEl();
     if (!el) return false;
-    const t = el.value ?? el.textContent ?? "";
-    return t.trim().length > 0;
+    const t = (el.value != null && el.tagName !== "DIV")
+      ? el.value
+      : (el.innerText || el.textContent || "");
+    return String(t).replace(/\u200b/g, "").trim().length > 0;
   }
 }
 

@@ -39,6 +39,7 @@ const RECONCILE_MS = 10_000;   // periodic re-seed vs cache.agentViews() (missed
 const HEARTBEAT_MS = 15_000;   // SSE keepalive comment (cloudflared-safe)
 const OUTPUT_READ_MS = 2000;   // bounded best-effort agent.read for settled output snippet
 const OUTPUT_LINES = 40;
+const WORKING_SNIPPET_MS = 60_000; // while working, refresh output snippet at most once/min
 const DEBUG = process.env.HERDR_MCP_PUSH_DEBUG === "1";
 
 interface PushFilters {
@@ -109,6 +110,7 @@ class PushHub {
   private reconcileTimer: NodeJS.Timeout | null = null;
   private heartbeatTimers = new Set<NodeJS.Timeout>();
   private lastOutputSnippet = new Map<string, { at: number; output: string }>();
+  private lastWorkingSnippetAt = new Map<string, number>();
 
   constructor(client: HerdrClient) {
     this.client = client;
@@ -163,7 +165,7 @@ class PushHub {
     }
   }
 
-  /** Best-effort bounded agent.read → second event with cleaned output. */
+  /** Best-effort bounded agent.read → emit agent_output only when text changes. */
   private async readOutputSnippet(ref: AgentRef): Promise<void> {
     if (!ref.pane) return;
     try {
@@ -174,6 +176,8 @@ class PushHub {
       const text = String(rd["content"] ?? rd["text"] ?? rd["output"] ?? "");
       const output = cleanTerminalOutput(text).slice(0, 2000);
       if (!output.trim()) return;
+      const prev = this.lastOutputSnippet.get(ref.pane)?.output;
+      if (prev === output) return; // 无变化不刷 SSE
       this.lastOutputSnippet.set(ref.pane, { at: Date.now(), output });
       this.emit("agent_output", { agent: ref.name, pane: ref.pane, at: new Date().toISOString(), output });
     } catch {
@@ -187,7 +191,21 @@ class PushHub {
       if (!a.pane) continue;
       const prev = this.lastStatusByPane.get(a.pane);
       const next = { status: a.status, name: a.name };
-      if (!prev || prev.status === next.status) continue;
+      if (!prev || prev.status === next.status) {
+        // working 期间节流拉摘要, 供扩展「有新 output 才发进度」
+        if (next.status === "working") {
+          const last = this.lastWorkingSnippetAt.get(a.pane) ?? 0;
+          if (Date.now() - last >= WORKING_SNIPPET_MS) {
+            this.lastWorkingSnippetAt.set(a.pane, Date.now());
+            const title = typeof a.terminal_title === "string" ? a.terminal_title : null;
+            void this.readOutputSnippet({
+              name: a.name, pane: a.pane, status: a.status, workspace: a.workspace,
+              cwd: a.cwd, label: null, terminalTitle: title, seq: typeof a.state_change_seq === "number" ? a.state_change_seq : null,
+            });
+          }
+        }
+        continue;
+      }
       this.lastStatusByPane.set(a.pane, next);
       const seq = typeof a.state_change_seq === "number" ? (a.state_change_seq as number) : undefined;
       if (next.status === "working") {
@@ -241,6 +259,7 @@ class PushHub {
       agents: this.cache.agentViews().map((a: AgentView) => ({
         name: a.name, pane: a.pane, status: a.status, workspace: a.workspace,
         cwd: a.cwd, started_at: a.started_at, last_activity_at: a.last_activity_at,
+        terminal_title: typeof a.terminal_title === "string" ? a.terminal_title : undefined,
         seq: typeof a.state_change_seq === "number" ? (a.state_change_seq as number) : undefined,
       })),
     });
@@ -263,6 +282,7 @@ class PushHub {
       agents: this.cache.agentViews().map((a: AgentView) => ({
         name: a.name, pane: a.pane, status: a.status, workspace: a.workspace,
         cwd: a.cwd, started_at: a.started_at, last_activity_at: a.last_activity_at,
+        terminal_title: typeof a.terminal_title === "string" ? a.terminal_title : undefined,
         seq: typeof a.state_change_seq === "number" ? (a.state_change_seq as number) : undefined,
       })),
     };

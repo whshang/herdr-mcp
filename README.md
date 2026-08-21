@@ -85,13 +85,13 @@ herdr’s native surface is a large Unix-socket API (`herdr api schema`, ~90 met
 | `herdr_call` | Call any herdr method with validated params (`{ method, params }`). Covers panes, workspaces, agents, etc. without one MCP tool per method. |
 | `herdr_inspect` | One-shot: connection health + workspaces / tabs / panes / agents (cwd, status). Usual first call. |
 | `herdr_since` | Cheap digest since a cursor — resume a conversation without re-dumping full state. |
-| `herdr_prompt` | Deliver a prompt to a herdr agent via socket `agent.prompt` (not typing into the pane). Prefer with `idempotency_key`. |
+| `herdr_prompt` | Deliver via socket `agent.prompt` (default fire-and-forget; strongly prefer `idempotency_key`; track with `herdr_since` / `herdr_inspect`). |
 | `herdr_fs_read` | Read a file inside a managed git project on the workstation. |
 | `herdr_fs_list` | List a directory under a managed root (skips `.git` / secret-ish names). |
 | `herdr_fs_grep` | Search file contents under a managed root (`rg` when available). |
 | `herdr_fs_write` | Create / overwrite a file (dirty / busy gates; `confirm_dirty` / `confirm_busy`). |
 | `herdr_fs_edit` | Exact unique string replace in a file (same gates as write). |
-| `herdr_exec` | Run a shell command in the workspace’s visible `herdr-mcp:utility` pane (observable, not headless). |
+| `herdr_exec` | Shell in the workspace’s visible `herdr-mcp:utility` pane; refuses when an agent in that project is working unless `confirm_busy`. Not secret-path gated. |
 
 Optional: `HERDR_MCP_ALL_TOOLS=1` adds advanced/deprecated lifecycle tools. Mutations stay in managed git roots; `HERDR_MCP_READONLY=1` / `HERDR_MCP_WRITE_ROOTS=/a,/b` tighten writes.
 
@@ -101,7 +101,7 @@ Folder: `extension/` (MV3). Load unpacked in `chrome://extensions`.
 
 Two equal jobs ([docs/extension.md](docs/extension.md), 中文):
 
-1. **Progress nudge** — herdr working/settled → inject continue/progress into the bound web chat (chatgpt / deepseek / z.ai / claude)
+1. **Progress nudge** — herdr working (new summary or configurable fallback, default 10 min) and settled → inject into the bound web chat (chatgpt / deepseek / z.ai / claude)
 2. **JSON → MCP** — on DeepSeek / z.ai (no connector), parse assistant `{"tool":...}` → local `/mcp`
 
 Same local `127.0.0.1:8772` token. Not a substitute for ChatGPT’s OAuth connector.

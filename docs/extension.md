@@ -35,8 +35,9 @@
 
 ### 已实现（主线 A 定时进度通报）
 
-- Options：`progressTickSec`（默认 `120` 秒；填 `0` = 关闭）、进度模板与收工模板分开（`progressTemplate` / `wakeTemplate`）
-- `working` 起每 N 秒：读已缓存输出或 `/push/state` 该 pane 摘要 → 往绑定会话塞「仍在工作，请 herdr_since / 继续观察」并提交；同一 convKey 只一个定时器，重复 `working` 重置下次到期不叠加
+- Options：`progressTickSec`（默认 `60` 秒检查一次；填 `0` = 关闭）、`progressFallbackSec`（默认 `600` 秒无新摘要兜底）、进度模板与收工模板分开（`progressTemplate` / `wakeTemplate`）
+- 进度实发规则：检查点到了之后，仅当 herdr 侧摘要相对上次实发有**新的非空内容**才往网页灌一条；否则满 `progressFallbackSec` 才兜底一条，避免空转刷屏
+- `working`：每 `progressTickSec` **检查**摘要；仅新非空内容或满 `progressFallbackSec` 才往绑定会话灌进度并提交；同一 convKey 只一个定时器，重复 `working` 不丢已有实发基线
 - `settled`：先取消 tick 定时器，再按收工模板唤醒一次
 - 全站同一套；站点差异只在 injector 写入/发送
 

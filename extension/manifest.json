@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "herdr → Web wake",
-  "version": "0.1.0",
+  "version": "0.1.8",
   "description": "herdr agent 干完活 → 向绑定的网页会话输入框写消息并提交,唤醒网页 AI (z.ai / DeepSeek / Claude / ChatGPT)",
-  "permissions": ["storage", "scripting"],
+  "permissions": ["storage", "scripting", "alarms"],
   "host_permissions": [
     "http://127.0.0.1:8772/*",
     "<all_urls>"
