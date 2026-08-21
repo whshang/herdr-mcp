@@ -36,6 +36,7 @@ herdr-mcp **不会** 把每个 herdr 方法都做成 MCP 工具。那会烧上�
 
 ## 相关文档
 
+- [extension.md](./extension.md) — 扩展双主线总览
 - [chatgpt-connector.md](./chatgpt-connector.md) — ChatGPT OAuth、schema、权限卡
-- [extension-wake.md](./extension-wake.md) — 浏览器扩展（唤醒 ≠ MCP）
-- [extension-bridge.md](./extension-bridge.md) — 页面 JSON → 本地 MCP 路线（协议 → 能力 → 完整面）
+- [extension-wake.md](./extension-wake.md) — 主线 A：进度回推
+- [extension-bridge.md](./extension-bridge.md) — 主线 B：JSON→MCP
