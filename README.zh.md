@@ -39,7 +39,9 @@ Quick Tunnel 每次重启 `cloudflared` 子域会变。要稳定主机名可用 
 2. 选 OAuth，**不要**粘贴 Token
 3. 配好后**开新对话**（旧对话会持有旧 tool snapshot）
 
-ChatGPT 踩坑与硬性要求见 [docs/chatgpt-connector.md](docs/chatgpt-connector.md)。
+ChatGPT 踩坑与硬性要求见 [docs/chatgpt-connector.md](docs/chatgpt-connector.md)（含「允许使用 herdr」权限卡说明）。
+
+浏览器扩展：唤醒见 [docs/extension-wake.md](docs/extension-wake.md)；z.ai / DeepSeek 接到本机 MCP 的路线见 [docs/extension-bridge.md](docs/extension-bridge.md)。
 
 ### 3. Cursor（本机）
 

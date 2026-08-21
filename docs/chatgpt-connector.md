@@ -1,105 +1,123 @@
-# ChatGPT Connector — hard-won requirements
+# ChatGPT Connector 经验备忘
 
-Audience: operators wiring ChatGPT to herdr-mcp, and agents changing OAuth / Streamable HTTP.
+读者：给 ChatGPT 接 herdr-mcp 的人，以及改 OAuth / Streamable HTTP 的代理。
 
-Related entrypoints: [README.md](../README.md), `src/oauth.ts`, `src/server.ts`.
+相关入口：[README.md](../README.md)、`src/oauth.ts`、`src/server.ts`。
 
-## What “connected” means
+## 「已连接」到底指什么
 
-ChatGPT has **two** layers:
+ChatGPT 有两层：
 
-1. **OAuth / connector install** — plugin appears in settings.
-2. **Tool schema registration** — `tools/list` succeeds *and* ChatGPT accepts every `inputSchema`.
+1. **OAuth / 安装 connector** — 设置里能看到插件。
+2. **工具 schema 注册** — `tools/list` 成功，且 ChatGPT 接受每一份 `inputSchema`。
 
-A connector can show as installed with **0 tools** in the current chat if (2) failed or the chat still holds an old tool snapshot. **Start a new chat** after reconnecting. Re-installing 2–3 times is often ChatGPT cache, not a dead server.
+可能出现：设置里已安装，但当前对话 **0 个工具**。常见原因是 (2) 失败，或旧对话还握着旧工具快照。重连后请 **开新对话**。反复装 2～3 次多半是缓存，不一定是服务挂了。
 
-## Public URL
+## 公网 URL
 
-- Resource URL ChatGPT uses: `{HERDR_MCP_BASE_URL}/mcp`
-- Issuer / OAuth discovery: `{HERDR_MCP_BASE_URL}` (no `/mcp` suffix in env)
-- Free default for others: Cloudflare Quick Tunnel `*.trycloudflare.com`
-- After changing the public origin: restart herdr-mcp so JWT `iss` / `aud` match
+- ChatGPT 用的资源地址：`{HERDR_MCP_BASE_URL}/mcp`
+- Issuer / OAuth 发现：`{HERDR_MCP_BASE_URL}`（环境变量不要带 `/mcp` 后缀）
+- 默认免费公网：Cloudflare Quick Tunnel `*.trycloudflare.com`
+- 改公网源后要重启 herdr-mcp，让 JWT 的 `iss` / `aud` 对齐
 
-## OAuth (CIMD)
+## 工具权限卡：「允许 ChatGPT 使用 herdr？」
 
-ChatGPT prefers **Client ID Metadata Document** (`https://chatgpt.com/oauth/.../client.json`), not classic DCR secrets.
+这是 **ChatGPT 网页自己的审批 UI**，不是 herdr-mcp 服务端开关。
 
-Must work:
-
-| Step | Expect |
+| 你想做的事 | 现实 |
 |---|---|
-| Protected-resource metadata | `/.well-known/oauth-protected-resource` and `.../mcp` |
-| AS metadata | `/.well-known/oauth-authorization-server` (+ path variants under `/mcp`) |
-| OpenID | `/.well-known/openid-configuration` (ChatGPT probes this; 404 historically aborted connect) |
-| Authorize | Auto-approve redirect with PKCE |
-| Token | `authorization_code` + optional `private_key_jwt` (`client_assertion`); fetch ChatGPT JWKS |
-| Access token | JWT, `aud` = resource URL |
+| 服务端强制「全部自动允许」 | **做不到。** Connector 网页没有稳定的 `require_approval: never`；那是 Responses API 开发者参数，不是 chatgpt.com 设置项 |
+| 点一次「Always allow」后永久生效 | 社区反馈不稳定，有时会丢会话 / 重走 OAuth |
+| 少点几次「允许」 | 装本仓库浏览器扩展；在 **chatgpt.com** 标签页里对页面内权限卡片自动点「允许」（见下） |
 
-Do **not** paste a static Bearer into the ChatGPT connector UI. Static token is for Cursor / curl.
+扩展行为（`extension/`，内容脚本 ≥ 0.1.3）：
 
-Transient failure seen in production: `client_assertion` JWKS fetch timeout → token `400`; retry usually works.
+- 识别页面内「允许 / 拒绝」工具权限卡（含 `data-testid=tool-action-buttons`）
+- **chatgpt.com 打开后常驻观察**（不再只绑在 herdr→网页「唤醒」的 90 秒窗口）
+- 只点可见、可用、文案明确为允许类的按钮；有拒绝按钮同卡才点（fail-closed）
+- **点不了**：浏览器原生权限条、非 DOM 的系统对话框
 
-## MCP wire (openai-mcp UA)
+服务端可做的只是诚实标注（例如 `readOnlyHint`）；ChatGPT 目前常忽略，仍可能把只读工具当成写操作来问。
 
-Observed UA: `openai-mcp/1.0.0`.
+每次工具调用仍弹卡时：确认扩展已加载、当前标签是 `chatgpt.com`、内容脚本版本 ≥ 0.1.3（扩展重载后旧标签会自动刷新）。
 
-| Rule | Why |
+## OAuth（CIMD）
+
+ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../client.json`），不是经典 DCR 密钥。
+
+必须通：
+
+| 步骤 | 期望 |
 |---|---|
-| Fully **stateless** — never issue `Mcp-Session-Id` | Stale sid after restart → client `-32600 Session terminated` |
-| Ignore / skip unknown sid | Same |
-| `server/discover` must succeed post-OAuth | Returning `-32601` stopped ChatGPT before `initialize` |
-| Advertise SDK versions **first**, keep `2026-07-28` in the list | Discover completes; prefer `2025-11-25` wire |
-| Rewrite request header `Mcp-Protocol-Version: 2026-*` → `2025-11-25` in **both** `req.headers` and `rawHeaders` | Hono builds Web Request from `rawHeaders`; headers-only patch is a no-op → SDK `400 Unsupported protocol version` |
-| `initialize` / `tools/list` → **SSE** (`text/event-stream`) | Forcing JSON on all POSTs (0.3.6) correlated with OAuth OK + initialize OK + **no** follow-up `tools/list` |
-| `tools/call` → JSON OK | Long tool payloads through tunnels |
-| Close throwaway transports on `res` finish/close only | Eager `finally` close races SDK `_closed` → `404/-32001` |
-| Auth failure JSON-RPC code ≠ `-32600` | ChatGPT surfaces `-32600` as “Session terminated” |
+| Protected-resource 元数据 | `/.well-known/oauth-protected-resource` 与 `.../mcp` |
+| AS 元数据 | `/.well-known/oauth-authorization-server`（含 `/mcp` 下变体） |
+| OpenID | `/.well-known/openid-configuration`（ChatGPT 会探；404 曾直接中断连接） |
+| Authorize | PKCE 自动批准跳转 |
+| Token | `authorization_code` + 可选 `private_key_jwt`；拉取 ChatGPT JWKS |
+| Access token | JWT，`aud` = 资源 URL |
 
-Detect ChatGPT without relying on initialize `clientInfo`: UA `openai-mcp` **or** OAuth JWT `client_id` / `sub` on `chatgpt.com`.
+不要把静态 Bearer 贴进 ChatGPT connector UI。静态 token 给 Cursor / curl。
 
-## Tool schemas ChatGPT rejects
+线上见过：`client_assertion` 拉 JWKS 超时 → token `400`；重试通常好。
 
-One bad tool can drop the **entire** catalog while the connector still looks installed.
+## MCP 线路（UA `openai-mcp`）
 
-Avoid in `inputSchema`:
+| 规则 | 原因 |
+|---|---|
+| 完全 **无状态** — 不发 `Mcp-Session-Id` | 重启后陈旧 sid → 客户端 `-32600 Session terminated` |
+| 忽略未知 sid | 同上 |
+| OAuth 后 `server/discover` 必须成功 | 回 `-32601` 会卡在 `initialize` 前 |
+| discover 列表：**SDK 版本在前**，保留 `2026-07-28` | 发现能完成；线上仍偏好 `2025-11-25` |
+| 请求头 `Mcp-Protocol-Version: 2026-*` → 改写为 `2025-11-25`（`req.headers` **和** `rawHeaders`） | Hono 用 `rawHeaders` 建 Web Request；只改 headers 等于没改 → SDK `400 Unsupported protocol version` |
+| `initialize` / `tools/list` → **SSE** | 全改 JSON（0.3.6）曾出现 OAuth OK、initialize OK、却不再跟 `tools/list` |
+| `tools/call` → JSON 可以 | 隧道下大载荷更稳 |
+| 一次性 transport 只在 `res` finish/close 时关 | `finally` 里抢关会和 SDK `_closed` 竞态 → `404/-32001` |
+| 鉴权失败 JSON-RPC 不要用 `-32600` | ChatGPT 会显示成「Session terminated」 |
+
+识别 ChatGPT：UA `openai-mcp`，或 OAuth JWT 的 `client_id` / `sub` 落在 `chatgpt.com`。
+
+## ChatGPT 会整表丢弃的 schema
+
+一个坏工具就能让 **整张工具表** 消失，connector 看起来仍已安装。
+
+`inputSchema` 里避免：
 
 - `propertyNames`
-- `additionalProperties: {}` (empty object; Zod `z.record` / catchall often emits this — want boolean `true` or a typed schema, or avoid free-form objects)
-- `exclusiveMinimum` (Zod `.positive()` → use `.min(1)` instead)
+- `additionalProperties: {}`（空对象；Zod `z.record` 常长这样 — 要用布尔 `true`、有类型的 schema，或别用自由对象）
+- `exclusiveMinimum`（Zod `.positive()` → 改 `.min(1)`）
 
-`herdr_call.params` is advertised as a **string** (JSON object text). Runtime still accepts a real object via preprocess.
+`herdr_call.params` 对外标成 **string**（JSON 对象文本）。运行时仍用 preprocess 接受真对象。
 
-Bump `SERVER_VERSION` / `package.json` / mcp.json identity when the tool surface or handshake changes so clients re-list.
+改工具面或握手时 bump `SERVER_VERSION` / `package.json`，逼客户端重新 `tools/list`。
 
-## “TaskGroup” / omp exited while reading files
+## 「TaskGroup」/ omp 挂了却说读不了文件
 
-Observed ChatGPT narration: workspace control OK, but “file read / command channel” returns a server **TaskGroup** error; newly started `omp` does not stay up.
+交叉验证（健康的 0.3.9+）：
 
-Cross-check on a healthy 0.3.9+ build:
-
-| Tool | Expected |
+| 工具 | 期望 |
 |---|---|
-| `herdr_fs_list` / `herdr_fs_read` / `herdr_fs_grep` | `ok: true` for paths under a managed git root |
-| `herdr_exec` | exit code + output from a workspace utility pane |
-| `herdr_call` `agent.start` | may `error` on a second start of the same pane — that is herdr, not fs |
+| `herdr_fs_list` / `herdr_fs_read` / `herdr_fs_grep` | 托管 git 根下 `ok: true` |
+| `herdr_exec` | 工作区 utility 窗格有退出码和输出 |
+| `herdr_call` `agent.start` | 同一窗格二次启动可能 `error` — 这是 herdr，不是 fs |
 
-If those four succeed locally with the same Bearer, the TaskGroup string is **not** a herdr-mcp filesystem bug. Typical causes:
+上述都通，则 TaskGroup **不是** herdr-mcp 文件通道故障。常见情况：
 
-1. ChatGPT routed “read the project” through `herdr_prompt` / an agent tool instead of `herdr_fs_*`
-2. A pane agent crashed; logs show `call=agent.*` not `tool=herdr_fs_*`
-3. A second `agent.start` on an occupied pane
+1. 把「读项目」走成了 `herdr_prompt` / agent 工具，而不是 `herdr_fs_*`
+2. 窗格 agent 崩了；日志是 `call=agent.*`，不是 `tool=herdr_fs_*`
+3. 占用中的窗格又 `agent.start` 一次
 
-Access logs now include `call=<method>` on `herdr_call` (method name only). Prefer `herdr_fs_*` + `herdr_exec` for content; use agents for coding work.
+访问日志在 `herdr_call` 上会带 `call=<method>`（只记方法名）。读内容优先 `herdr_fs_*` + `herdr_exec`。
 
-## Debugging checklist
+## 排障清单
 
-1. `herdr-mcp logs -f` during connect
-2. Expect: authorize → token `200` → (optional discover) → initialize → `notifications/initialized` → **`tools/list`**
-3. If token `200` but no initialize: discovery / token shape / client abort
-4. If `tools/list` `200` but chat shows 0 tools: schema rejection or **old chat snapshot** → new chat
-5. Confirm `/.well-known/mcp.json` `version` matches the build you think is running
-6. For “cannot read files”: confirm the failing call is `herdr_fs_*` / `herdr_exec`, not `herdr_call call=agent.*`
+1. 连接时 `herdr-mcp logs -f`
+2. 期望：authorize → token `200` →（可选 discover）→ initialize → `notifications/initialized` → **`tools/list`**
+3. token `200` 但无 initialize：发现端 / token 形态 / 客户端中止
+4. `tools/list` `200` 但对话 0 工具：schema 拒收或 **旧对话快照** → 开新对话
+5. `/.well-known/mcp.json` 的 `version` 是否等于你以为在跑的构建
+6. 「读不了文件」：确认失败调用是 `herdr_fs_*` / `herdr_exec`，不是 `herdr_call call=agent.*`
+7. 权限卡不停：扩展是否在 chatgpt.com、内容脚本 ≥ 0.1.3
 
-## Acceptance (real ChatGPT)
+## 验收（真 ChatGPT）
 
-Not curl. Two consecutive rounds with zero of: Session terminated, session 400/404, `network_error`, `invalid_mcp_response`. New chat after every reconnect.
+不要只靠 curl。连续两轮对话，且没有：Session terminated、session 400/404、`network_error`、`invalid_mcp_response`。每次重连后开新对话。

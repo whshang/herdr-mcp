@@ -39,7 +39,7 @@ Quick Tunnel URLs change when you restart `cloudflared`. For a stable hostname, 
 2. OAuth — do **not** paste a token
 3. Start a **new** chat after connecting (old chats keep a stale tool snapshot)
 
-Hard-won ChatGPT requirements (OAuth, stateless transport, schema pitfalls): [docs/chatgpt-connector.md](docs/chatgpt-connector.md).
+Hard-won ChatGPT requirements (OAuth, stateless transport, schema pitfalls, permission cards): [docs/chatgpt-connector.md](docs/chatgpt-connector.md) (中文).
 
 ### 3. Cursor (this machine)
 
@@ -107,9 +107,10 @@ This is **not** the ChatGPT MCP connector. z.ai / DeepSeek do not receive the 11
 
 | Doc | Topic |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | herdr vs MCP tool layers |
-| [docs/chatgpt-connector.md](docs/chatgpt-connector.md) | ChatGPT OAuth + wire + schema |
-| [docs/extension-wake.md](docs/extension-wake.md) | Browser wake extension |
+| [docs/architecture.md](docs/architecture.md) | herdr vs MCP tool layers（中文） |
+| [docs/chatgpt-connector.md](docs/chatgpt-connector.md) | ChatGPT OAuth / 线路 / schema / 权限卡（中文） |
+| [docs/extension-wake.md](docs/extension-wake.md) | 浏览器唤醒扩展（中文） |
+| [docs/extension-bridge.md](docs/extension-bridge.md) | z.ai / DeepSeek → 本地 MCP 路线（中文） |
 | [tests/README.md](tests/README.md) | Default vs manual tests |
 
 Process notes live in `docs/_wip/` (gitignored).

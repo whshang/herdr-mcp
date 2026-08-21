@@ -4,10 +4,12 @@
 // - contenteditable 站点 (claude/chatgpt): 经 background `chrome.scripting` **MAIN world** `execCommand("insertText")`
 //   (隔离世界不提交编辑模型, ctmc 实测教训), 再点发送按钮
 // - 有 SpeaksJSON 的站点: 提交后等回复区出现 (与提交前快照对比), 回报投递确认
-// - 权限弹窗: 唤醒期间检测页面内权限对话框, 自动点"允许" (保守 fail-closed)
+// - 权限弹窗: 页面内「允许/拒绝」卡片自动点允许 (保守 fail-closed)。
+//   ChatGPT Connector 每次 tools/call 都会弹卡 — chatgpt 站点常驻观察;
+//   其它站点仍在唤醒窗口期内观察 (站点常在唤醒后弹权限)。
 // 状态反馈: 页内不再画点 (用户反馈困惑), 改用工具栏图标徽章 (background 驱动)。
 // 版本: 与 background.js 的 H2W_SCRIPT_VERSION 同步 bump (改 content 代码必须)。
-const H2W_CONTENT_VERSION = "0.1.2";
+const H2W_CONTENT_VERSION = "0.1.3";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] 无适配器, 跳过"); return; }
@@ -94,8 +96,15 @@ const H2W_CONTENT_VERSION = "0.1.2";
     if (permObs) { try { permObs.disconnect(); } catch (e) {} permObs = null; }
   }
   function startPermissionWatch(durationMs = 90000) {
-    if (permObs) return; // 已在观察
-    permDeadline = Date.now() + durationMs;
+    const persistent = !Number.isFinite(durationMs);
+    // 已有常驻观察时, 有限窗口的二次启动不必打断; 常驻可覆盖有限窗口。
+    if (permObs && (persistent || permDeadline === Number.POSITIVE_INFINITY)) {
+      if (persistent) permDeadline = Number.POSITIVE_INFINITY;
+      permissionTryClick();
+      return;
+    }
+    if (permObs) permissionStop();
+    permDeadline = persistent ? Number.POSITIVE_INFINITY : (Date.now() + durationMs);
     // 卡片先出现/按钮后挂载: 只在 findAllowAction 实际找到并点击后才由 clicker 标记,
     // 不会因提前标记而漏掉后挂载的按钮。
     permClicker = PERM.createPermissionClicker();
@@ -108,7 +117,7 @@ const H2W_CONTENT_VERSION = "0.1.2";
         attributes: true, attributeFilter: ["disabled", "hidden", "aria-disabled", "aria-hidden", "style"],
       });
     } catch (e) {}
-    setTimeout(permissionStop, durationMs + 5000);
+    if (!persistent) setTimeout(permissionStop, durationMs + 5000);
   }
 
   // ---- 执行一次唤醒 ----
@@ -192,5 +201,7 @@ const H2W_CONTENT_VERSION = "0.1.2";
     if (!runtimeAlive()) return;
     try { chrome.runtime.sendMessage({ type: "h2w_hello", version: H2W_CONTENT_VERSION }); } catch (e) {}
     await sendBg({ type: "h2w_register", convKey: ADAPTER.getConversationKey(), url: location.href, site: ADAPTER.name });
+    // ChatGPT Connector 工具权限卡与「唤醒」无关 — 页面加载后即常驻自动允许。
+    if (ADAPTER.name === "chatgpt" && PERM) startPermissionWatch(Number.POSITIVE_INFINITY);
   })();
 })();
