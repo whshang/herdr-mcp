@@ -169,8 +169,8 @@ herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法
 |---|---|
 | `herdr_methods` | 列出当前 herdr socket 方法与参数 schema（反射缓存）。陌生调用前先查。 |
 | `herdr_call` | 用 `{ method, params }` 调任意 herdr 方法（pane / workspace / agent 等），避免「一方法一工具」。 |
-| `herdr_inspect` | 一次看清连接 + workspaces / tabs / panes / agents（cwd、状态）。通常第一个调用。 |
-| `herdr_since` | 按 cursor 增量摘要，续聊时不用整包重拉状态。 |
+| `herdr_inspect` | 一次看清连接 + workspaces / tabs / panes / agents（cwd、状态），以及 `workstation_info`、`boot_id`、`exec_sessions`。通常第一个调用。 |
+| `herdr_since` | 按 cursor 增量摘要，续聊时不用整包重拉状态（跨 MCP 重启有 `boot_id` / `cursor_reset`）。 |
 | `herdr_prompt` | 经 socket `agent.prompt` 投递（默认 fire-and-forget；强烈建议 `idempotency_key`；状态用 `herdr_since` / `herdr_inspect`）。优先便宜 worker；不要把规划/转派交给本机 Claude/OMP。 |
 | `herdr_fs_read` | 读本机 managed git 项目内的文件。 |
 | `herdr_fs_list` | 列 managed root 下目录（跳过 `.git` / 疑似密钥名）。 |
@@ -180,7 +180,7 @@ herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法
 | `herdr_fs_patch` | coding-tools 风格 `*** Begin Patch` 多文件补丁（`dry_run`）。 |
 | `herdr_fs_image` | 读托管根内图片，MCP image 回传。 |
 | `herdr_git` | `status` / `diff` / `log` 确定性 git 事实（勿派本地 agent 代劳）。 |
-| `herdr_exec` | 短命令：workspace 可见 `herdr-mcp:utility` pane。 |
+| `herdr_exec` | 短命令：workspace 可见 `herdr-mcp:utility` pane。若控制面 TaskGroup 在 **投递前** 阻断窗格操作，自动降级本机 zsh（`backend:local_fallback`）；已投递后绝不重发。 |
 | `herdr_exec_start` / `read` / `kill` | 长命令后台会话（本机进程，非 utility pane）。 |
 
 可选：`HERDR_MCP_ALL_TOOLS=1` 打开高级/废弃生命周期工具。写操作限 managed git root；`HERDR_MCP_READONLY=1` / `HERDR_MCP_WRITE_ROOTS=/a,/b` 可再收紧。

@@ -55,6 +55,7 @@ import {
   recoverExecSessionsOnBoot,
 } from "./exec-sessions.js";
 import { commitAtomic } from "./atomic-files.js";
+import { runLocalShell } from "./local-exec.js";
 
 /** Process boot id — returned by inspect/since so clients detect cursor reset. */
 const BOOT_ID = randomUUID().slice(0, 12);
@@ -2158,7 +2159,10 @@ function registerTools(server: McpServer): void {
         "(unlike herdr_fs_* — a command can still read .env); prefer fs tools for file IO. " +
         "Returns exit_code + effective_cwd/project_root + stripped output. " +
         "On timeout the command may still be running in the pane; partial output is returned " +
-        "with ok:false code:exec_timeout.",
+        "with ok:false code:exec_timeout. " +
+        "If herdr control-plane TaskGroup/ExceptionGroup blocks pane ops BEFORE the command is " +
+        "delivered, automatically falls back to a local zsh process (backend:local_fallback) — " +
+        "same cwd/gates, no double-run. After send_text, never re-sends or falls back.",
       inputSchema: {
         workspace: z.string().describe("workspace_id or label (from herdr_inspect)"),
         command: z.string().describe("Shell command line to run in the utility pane"),
@@ -2177,11 +2181,7 @@ function registerTools(server: McpServer): void {
         .find((w) => w["workspace_id"] === wsTarget || w["label"] === wsTarget);
       if (!wsRec) return toResult({ ok: false, reason: "workspace_not_found", workspace: wsTarget });
       const wsId = wsRec["workspace_id"] as string;
-      const wsCwd = typeof wsRec["cwd"] === "string" ? (wsRec["cwd"] as string) : null;
 
-      // ---- cwd safety: the command must run inside a known project root, never
-      // the utility pane's current foreground_cwd (which drifts as panes are
-      // reused/renamed or the user works elsewhere). ----
       const currentProjects = projectsForWorkspace(snap, wsId);
       const roots = currentProjects.map((p) => p.root);
       let effectiveRoot: string | null = null;
@@ -2233,45 +2233,114 @@ function registerTools(server: McpServer): void {
         });
       }
 
+      const busyWarn = working.length > 0 ? { warnings: { working } } : {};
+
+      const localFallback = async (reason: string) => {
+        const local = await runLocalShell({
+          command,
+          cwd: execCwd!,
+          timeoutMs: timeout_ms,
+          maxOutputBytes: 8000,
+        });
+        if (local.timed_out) {
+          return toResult({
+            ok: false,
+            code: "exec_timeout",
+            backend: "local_fallback",
+            fallback_reason: reason,
+            workspace: wsId,
+            command,
+            effective_cwd: execCwd,
+            project_root: effectiveRoot,
+            exit_code: local.exit_code,
+            output: local.output,
+            hint: "local_fallback timed out — command may still be running as a local process",
+            ...busyWarn,
+          });
+        }
+        return toResult({
+          ok: local.exit_code === 0,
+          backend: "local_fallback",
+          fallback_reason: reason,
+          workspace: wsId,
+          command,
+          exit_code: local.exit_code,
+          effective_cwd: execCwd,
+          project_root: effectiveRoot,
+          output: local.output,
+          ...busyWarn,
+        });
+      };
+
       const panesRaw = ((snap["panes"] as unknown[]) ?? [])
         .map((p) => (p ?? {}) as Record<string, unknown>)
         .filter((p) => p["workspace_id"] === wsId);
-      const utilityLabel = panesRaw.find((p) => p["label"] === "herdr-mcp:utility")?.["pane_id"];
-      let paneId: string | null = typeof utilityLabel === "string" ? utilityLabel : null;
+
+      // Pre-send: resolve/create utility pane with TaskGroup retries, then local fallback.
+      let paneId: string | null = null;
       let created = false;
-      if (!paneId) {
-        const seed = panesRaw[0]?.["pane_id"];
-        void seed;
-        let r: HerdrResult;
+      let preSendBlip: string | null = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          r = await c.call("pane.split",
-            { ...(seed ? { target_pane_id: seed } : {}), cwd: execCwd, direction: "right", focus: false },
-            10000);
+          const utilityLabel = panesRaw.find((p) => p["label"] === "herdr-mcp:utility")?.["pane_id"];
+          paneId = typeof utilityLabel === "string" ? utilityLabel : null;
+          created = false;
+          if (!paneId) {
+            // Re-read panes from a fresh snapshot when possible (label may have appeared).
+            let seed = panesRaw[0]?.["pane_id"];
+            try {
+              const fresh = await c.snapshot();
+              const freshPanes = ((fresh["panes"] as unknown[]) ?? [])
+                .map((p) => (p ?? {}) as Record<string, unknown>)
+                .filter((p) => p["workspace_id"] === wsId);
+              const labeled = freshPanes.find((p) => p["label"] === "herdr-mcp:utility");
+              if (typeof labeled?.["pane_id"] === "string") {
+                paneId = labeled["pane_id"] as string;
+              } else {
+                seed = freshPanes[0]?.["pane_id"] ?? seed;
+              }
+            } catch (e) {
+              if (!isHerdrControlPlaneTaskGroup(e instanceof Error ? e.message : String(e))) throw e;
+              // keep seed from cache
+            }
+            if (!paneId) {
+              const r = await c.call("pane.split",
+                { ...(typeof seed === "string" ? { target_pane_id: seed } : {}), cwd: execCwd, direction: "right", focus: false },
+                10000);
+              const created0 = (r["pane"] ?? r) as Record<string, unknown>;
+              paneId = (created0["pane_id"] ?? created0["id"] ?? null) as string | null;
+              if (!paneId) return toResult({ ok: false, reason: "pane_split_failed", detail: r });
+              created = true;
+              try { await c.call("pane.rename", { pane_id: paneId, label: "herdr-mcp:utility" }, 5000); } catch { /* optional */ }
+              try {
+                await c.call("pane.wait_for_output",
+                  { pane_id: paneId, source: "recent_unwrapped", match: { type: "regex", value: "[%#$>❯] ?$" }, timeout_ms: 5000 },
+                  6000);
+              } catch { /* best effort */ }
+              await new Promise<void>((resolve) => setTimeout(resolve, 300));
+            }
+          }
+          preSendBlip = null;
+          break;
         } catch (e) {
-          const err = e instanceof HerdrError ? e : new HerdrError("error", String(e));
-          return toResult({ ok: false, code: err.code, message: err.message, hint: "failed to split a utility pane" });
+          const msg = e instanceof Error ? e.message : String(e);
+          if (isHerdrControlPlaneTaskGroup(msg)) {
+            preSendBlip = msg;
+            await new Promise<void>((r) => setTimeout(r, 100 + attempt * 200));
+            continue;
+          }
+          const err = e instanceof HerdrError ? e : new HerdrError("error", msg);
+          return toResult({ ok: false, code: err.code, message: err.message, hint: "failed to prepare utility pane" });
         }
-        const created0 = (r["pane"] ?? r) as Record<string, unknown>;
-        paneId = (created0["pane_id"] ?? created0["id"] ?? null) as string | null;
-        if (!paneId) return toResult({ ok: false, reason: "pane_split_failed", detail: r });
-        created = true;
-        try { await c.call("pane.rename", { pane_id: paneId, label: "herdr-mcp:utility" }, 5000); } catch { /* label optional */ }
-        // A fresh shell swallows input sent during zsh init — wait for a
-        // prompt before the first command.
-        try {
-          await c.call("pane.wait_for_output",
-            { pane_id: paneId, source: "recent_unwrapped", match: { type: "regex", value: "[%#$>❯] ?$" }, timeout_ms: 5000 },
-            6000);
-        } catch { /* best effort */ }
-        await new Promise<void>((resolve) => setTimeout(resolve, 300));
+      }
+      if (preSendBlip || !paneId) {
+        return localFallback(preSendBlip
+          ? "control_plane_taskgroup_before_send"
+          : "utility_pane_unavailable");
       }
 
       const nonce = randomUUID().slice(0, 8);
       const marker = `__HM_EXEC_${nonce}_EXIT_`;
-      // Trailing \n submits the line (send_text types it; without Enter the
-      // command would sit unentered in the shell — same failure class as the
-      // herdr_prompt delivery bug). Multiline / heredoc commands are written to
-      // a temp script so the utility shell never sees raw heredoc continuation.
       const shq = (s: string): string => "'" + s.replace(/'/g, `'\\''`) + "'";
       const scriptPath = path.join(
         process.env.TMPDIR || "/tmp",
@@ -2293,32 +2362,74 @@ function registerTools(server: McpServer): void {
         const rd = ((rr["read"] as Record<string, unknown>) ?? rr) as Record<string, unknown>;
         return String(rd["content"] ?? rd["text"] ?? rd["output"] ?? "");
       };
+
+      let delivered = false;
       try {
         await c.call("pane.send_text", { pane_id: paneId, text: cmdline + "\n" }, 5000);
+        delivered = true;
       } catch (e) {
-        // Utility pane died between snapshot and send: safe to recreate and
-        // resend ONCE — the command was never delivered.
         const err = e instanceof HerdrError ? e : new HerdrError("error", String(e));
-        if (err.code !== "pane_not_found" && err.code !== "unknown_pane") throw err;
-        const fresh = await c.snapshot();
-        const freshPanes = ((fresh["panes"] as unknown[]) ?? [])
-          .map((p) => (p ?? {}) as Record<string, unknown>)
-          .filter((p) => p["workspace_id"] === wsId && p["label"] === "herdr-mcp:utility");
-        let nextId: string | null = null;
-        if (freshPanes.length > 0 && typeof freshPanes[0]["pane_id"] === "string") {
-          nextId = freshPanes[0]["pane_id"] as string; // a second utility pane exists
+        // Known undelivered: pane gone — recreate once and send (existing path).
+        if (err.code === "pane_not_found" || err.code === "unknown_pane") {
+          try {
+            const fresh = await c.snapshot();
+            const freshPanes = ((fresh["panes"] as unknown[]) ?? [])
+              .map((p) => (p ?? {}) as Record<string, unknown>)
+              .filter((p) => p["workspace_id"] === wsId && p["label"] === "herdr-mcp:utility");
+            let nextId: string | null = null;
+            if (freshPanes.length > 0 && typeof freshPanes[0]["pane_id"] === "string") {
+              nextId = freshPanes[0]["pane_id"] as string;
+            } else {
+              const seedRaw = panesRaw[0]?.["pane_id"];
+              const r2 = await c.call("pane.split",
+                { ...(typeof seedRaw === "string" ? { target_pane_id: seedRaw } : {}), cwd: execCwd, direction: "right", focus: false }, 10000);
+              const p2 = (r2["pane"] ?? r2) as Record<string, unknown>;
+              nextId = (p2["pane_id"] ?? p2["id"] ?? null) as string | null;
+              if (nextId) {
+                try { await c.call("pane.rename", { pane_id: nextId, label: "herdr-mcp:utility" }, 5000); } catch { /* optional */ }
+                created = true;
+              }
+            }
+            if (!nextId) throw err;
+            paneId = nextId;
+            await c.call("pane.send_text", { pane_id: paneId, text: cmdline + "\n" }, 5000);
+            delivered = true;
+          } catch (e2) {
+            const msg2 = e2 instanceof Error ? e2.message : String(e2);
+            // Recreate/send never confirmed — safe to local-fallback only if control-plane
+            // and we never marked delivered.
+            if (!delivered && isHerdrControlPlaneTaskGroup(msg2)) {
+              return localFallback("control_plane_taskgroup_pane_recover");
+            }
+            if (!delivered) {
+              // pane_not_found after recover failed — command not sent
+              return localFallback(`pane_recover_failed:${err.code}`);
+            }
+            const err2 = e2 instanceof HerdrError ? e2 : new HerdrError("error", msg2);
+            return toResult({
+              ok: false, code: err2.code, message: err2.message,
+              workspace: wsId, pane_id: paneId, command,
+              delivery: "uncertain",
+              hint: "send may have reached the utility pane — check pane output; do not blind-retry",
+              ...busyWarn,
+            });
+          }
+        } else if (isHerdrControlPlaneTaskGroup(err.message)) {
+          // send_text + TaskGroup: delivery uncertain — NEVER local_fallback / re-send
+          return toResult({
+            ok: false,
+            code: "delivery_uncertain",
+            failure: "herdr_internal",
+            message: unwrapControlPlaneMessage(err.message),
+            workspace: wsId, pane_id: paneId, command,
+            hint: "pane.send_text hit control-plane TaskGroup — command may or may not have run; inspect utility pane or herdr_since, do not re-send the same command",
+            ...busyWarn,
+          });
         } else {
-          const seedRaw = panesRaw[0]?.["pane_id"];
-          const r2 = await c.call("pane.split",
-            { ...(typeof seedRaw === "string" ? { target_pane_id: seedRaw } : {}), cwd: execCwd, direction: "right", focus: false }, 10000);
-          const p2 = (r2["pane"] ?? r2) as Record<string, unknown>;
-          nextId = (p2["pane_id"] ?? p2["id"] ?? null) as string | null;
-          if (nextId) { try { await c.call("pane.rename", { pane_id: nextId, label: "herdr-mcp:utility" }, 5000); } catch { /* optional */ } created = true; }
+          return toResult({ ok: false, code: err.code, message: err.message, workspace: wsId, pane_id: paneId, command });
         }
-        if (!nextId) throw err;
-        paneId = nextId;
-        await c.call("pane.send_text", { pane_id: paneId, text: cmdline + "\n" }, 5000);
       }
+
       try {
         await c.call("pane.wait_for_output",
           { pane_id: paneId, source: "recent_unwrapped", match: { type: "regex", value: `${marker}\\d+__` }, timeout_ms },
@@ -2331,20 +2442,36 @@ function registerTools(server: McpServer): void {
           partial = readText(rr);
         } catch { /* best effort */ }
         const timedOut = err.code === "timeout";
-        return toResult({ ok: false, code: timedOut ? "exec_timeout" : err.code, message: timedOut ? undefined : err.message,
+        return toResult({
+          ok: false,
+          code: timedOut ? "exec_timeout" : err.code,
+          message: timedOut ? undefined : err.message,
+          backend: "utility_pane",
           workspace: wsId, pane_id: paneId, command, effective_cwd: execCwd, project_root: effectiveRoot ?? null,
           partial_output: partial.slice(-4000),
-          ...(working.length > 0 ? { warnings: { working } } : {}),
+          ...busyWarn,
           hint: timedOut
             ? "command may still be running in the utility pane — inspect it via pane.read"
-            : `wait_for_output failed (${err.code}) — the pane may have died` });
+            : `wait_for_output failed (${err.code}) — command was already sent; do not re-send`,
+        });
       }
-      const rr = await c.call("pane.read", { pane_id: paneId, source: "recent_unwrapped", lines: 200, strip_ansi: true }, 5000);
+      let rr: HerdrResult;
+      try {
+        rr = await c.call("pane.read", { pane_id: paneId, source: "recent_unwrapped", lines: 200, strip_ansi: true }, 5000);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        // Post-send read failure: no fallback (would double-run). One more wait already done.
+        return toResult({
+          ok: false,
+          code: "pane_read_failed",
+          message: isHerdrControlPlaneTaskGroup(msg) ? unwrapControlPlaneMessage(msg) : msg,
+          backend: "utility_pane",
+          workspace: wsId, pane_id: paneId, command,
+          hint: "command was sent; retry herdr_call pane.read on this pane_id — do not re-run herdr_exec with the same command",
+          ...busyWarn,
+        });
+      }
       const raw = readText(rr);
-      // Extract ONLY this call's output: from the shell echo of our cmdline
-      // (last occurrence — the utility pane is reused and scrollback accumulates)
-      // up to THIS call's marker. Prior calls' markers/cmdlines stay behind the
-      // slice boundary, so the returned body does not grow across calls.
       let seg = raw;
       const cmdEcho = raw.lastIndexOf(cmdline);
       if (cmdEcho >= 0) seg = raw.slice(cmdEcho + cmdline.length);
@@ -2353,10 +2480,14 @@ function registerTools(server: McpServer): void {
       const full = raw.match(new RegExp(`${marker}(\\d+)__`));
       const exitCode = full ? Number(full[1]) : null;
       const output = cleanTerminalOutput(seg).trim();
-      return toResult({ ok: exitCode === 0, workspace: wsId, pane_id: paneId, created_utility_pane: created,
+      return toResult({
+        ok: exitCode === 0,
+        backend: "utility_pane",
+        workspace: wsId, pane_id: paneId, created_utility_pane: created,
         command, exit_code: exitCode, effective_cwd: execCwd, project_root: effectiveRoot ?? null,
         output: output.slice(-8000),
-        ...(working.length > 0 ? { warnings: { working } } : {}) });
+        ...busyWarn,
+      });
     },
   );
 

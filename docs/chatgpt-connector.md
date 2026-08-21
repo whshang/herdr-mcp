@@ -90,9 +90,9 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 
 改工具面或握手时 bump `SERVER_VERSION` / `package.json`，逼客户端重新 `tools/list`。
 
-当前身份：**0.3.17**。若工具描述仍缺 `herdr_fs_write.overwrite`、或看不到 `inspect.exec_sessions`：
+当前身份：**0.3.18**。若工具描述仍缺 `herdr_fs_write.overwrite`、或看不到 `inspect.exec_sessions`：
 
-1. 确认公网进程已重启且 `/.well-known/mcp.json` 的 `version` 为 `0.3.17`
+1. 确认公网进程已重启且 `/.well-known/mcp.json` 的 `version` 为 `0.3.18`
 2. ChatGPT 里刷新 / 重连 connector
 3. **开新对话**（旧对话会锁住旧 `tools/list` 快照）
 
@@ -105,7 +105,7 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 | 工具 | 期望 |
 |---|---|
 | `herdr_fs_list` / `herdr_fs_read` / `herdr_fs_grep` | 托管 git 根下 `ok: true` |
-| `herdr_exec` | 工作区 utility 窗格有退出码和输出；同项目 working 时需 `confirm_busy` |
+| `herdr_exec` | 优先 utility 窗格拿 `exit_code` + `output`（`backend:utility_pane`）；投递前撞 TaskGroup 时可为 `backend:local_fallback`；同项目 working 时需 `confirm_busy`。若 `delivery_uncertain`：**不要**重发同一命令，先看窗格 |
 | `herdr_call` `agent.start` | 同一窗格二次启动可能 `error` — 这是 herdr，不是 fs |
 | `herdr_prompt` / `herdr_call` `agent.prompt` | 等状态超时 → `failure: agent_status_wait_timeout`（不是 `herdr_transport`）；默认省略 `wait`，带 `idempotency_key` |
 

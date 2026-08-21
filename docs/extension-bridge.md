@@ -35,7 +35,7 @@ Options 打开 `herdr_exec`、写文件、`herdr_prompt` 等；默认仍关。
 
 ### C — 完整 MCP 面
 
-对齐 ChatGPT 默认 11 工具（仅本地，不经公网）。
+对齐 ChatGPT 默认 17 工具（仅本地，不经公网）。
 
 ## 与主线 A 的配合
 

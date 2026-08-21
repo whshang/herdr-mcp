@@ -31,6 +31,7 @@ herdr-mcp **不会** 把每个 herdr 方法都做成 MCP 工具。那会烧上�
 6. **Agent 软隐藏** — `herdr_inspect` / `herdr_since` 默认只列出执行 agent（`pi`/`cline`/`opencode`/`anti`）与审计（`droid`/`grok`）；Claude/OMP/Codex 不出现在列表。`herdr_prompt` **不拦**。`HERDR_MCP_AGENT_ALLOW=*` 显示全部；逗号名单可覆盖默认。
 7. **默认 17 工具** — `HERDR_MCP_ALL_TOOLS=1` 时 30；`inspect` 含 `boot_id` + `exec_sessions`；`HERDR_MCP_READONLY=1` 挡住含 `herdr_prompt` 在内的 mutation（`herdr_fs_patch` 的 `dry_run` 除外）。
 8. **工作站稳健性（≥0.3.17）** — `commitAtomic` 失败会删掉本次新增文件；exec journal 仅杀掉仍带 `HERDR_MCP_EXEC_ID` 的孤儿；`exec_read stream=both` 按写入顺序交错；`fs_read` 字节截断只返回完整行。
+9. **`herdr_exec` 控制面降级（≥0.3.18）** — utility 窗格在 `send_text` **之前**若连续撞 TaskGroup，自动改本地 zsh（`backend:local_fallback`）；一旦已投递则绝不重发、也不降级（避免双跑）。
 
 ## 错误语义（`herdr_call` / `herdr_prompt` / 只读聚合）
 
@@ -48,14 +49,15 @@ herdr-mcp **不会** 把每个 herdr 方法都做成 MCP 工具。那会烧上�
 
 典型现象：agent 仍在 `working`，但 `inspect` / `since` / `pane.read` / `fs_*` 间歇返回失败；几秒后同样请求又成功。根因在 herdr daemon 的并发聚合（snapshot / events.subscribe / socket 重连），某个 child task 抛错时未隔离，整次 RPC 被包成裸 `ExceptionGroup`。
 
-herdr-mcp 侧（≥0.3.12）能做的：
+herdr-mcp 侧（≥0.3.12，exec 降级 ≥0.3.18）能做的：
 
 - 只读自动重试（控制面毛刺最多 2 次）
 - `failure=herdr_internal` + `code=snapshot_refresh_failed` + `retryable=true`（展开子异常文案，不让裸 ExceptionGroup 当唯一信息）
 - `fs_*` / inspect 在 snapshot 失败时尽量用 SnapshotCache
+- `herdr_exec`：`send_text` **之前** TaskGroup → 重试后 `backend:local_fallback`；已投递则返回结构化错误，禁止降级/重发
 - mutation 失败后仍要求先 inspect/since，禁止盲重试
 
-消不掉的：daemon 里 TaskGroup 未隔离 / 未 flatten 的真正根因，需 herdr 上游修。0.3.16+ 现场仍可能在 `inspect` / `since` / `git` / `fs_*` 上偶发裸失败；只读侧已重试 + 结构化 `herdr_internal`，但模型编排仍应把偶发失败当可重试毛刺，而不是业务结论。
+消不掉的：daemon 里 TaskGroup 未隔离 / 未 flatten 的真正根因，需 herdr 上游修。0.3.16+ 现场仍可能在 `inspect` / `since` / `git` / `fs_*` 上偶发失败；`herdr_exec` 在 0.3.18+ 对「投递前」毛刺可降级本地跑。只读侧已重试 + 结构化 `herdr_internal`，模型编排仍应把偶发失败当可重试毛刺，而不是业务结论。
 
 `herdr_prompt` 成功时带 `state_observation: { changed: true\|false\|"unknown", fresh }`；无 `wait` 时未变快照为 `"unknown"`（不是「没投递」）。兼容字段 `state_changed` 仍保留。
 

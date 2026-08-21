@@ -55,7 +55,7 @@
 
 1. **协议**：解析 → `tools/call` → 回填（默认只读白名单）
 2. **能力**：按需开 exec / 写文件 / prompt
-3. **完整面**：对齐 ChatGPT 默认 11 工具（仍仅本地）
+3. **完整面**：对齐 ChatGPT 默认 17 工具（仍仅本地）
 
 详见 [extension-bridge.md](./extension-bridge.md)。
 

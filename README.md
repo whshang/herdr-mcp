@@ -168,8 +168,8 @@ herdr’s native surface is a large Unix-socket API (`herdr api schema`, ~90 met
 |---|---|
 | `herdr_methods` | List live herdr socket methods + parameter schemas (cached reflection). Use before unknown `herdr_call`s. |
 | `herdr_call` | Call any herdr method with validated params (`{ method, params }`). Covers panes, workspaces, agents, etc. without one MCP tool per method. |
-| `herdr_inspect` | One-shot: connection health + workspaces / tabs / panes / agents (cwd, status). Usual first call. |
-| `herdr_since` | Cheap digest since a cursor — resume a conversation without re-dumping full state. |
+| `herdr_inspect` | One-shot: connection health + workspaces / tabs / panes / agents (cwd, status), plus `workstation_info`, `boot_id`, and `exec_sessions`. Usual first call. |
+| `herdr_since` | Cheap digest since a cursor — resume a conversation without re-dumping full state (`boot_id` / `cursor_reset` across MCP restarts). |
 | `herdr_prompt` | Deliver via socket `agent.prompt` (default fire-and-forget; strongly prefer `idempotency_key`; track with `herdr_since` / `herdr_inspect`). Prefer cheap workers; do not hand planning/delegation to local Claude/OMP. |
 | `herdr_fs_read` | Read a file inside a managed git project on the workstation. |
 | `herdr_fs_list` | List a directory under a managed root (skips `.git` / secret-ish names). |
@@ -179,7 +179,7 @@ herdr’s native surface is a large Unix-socket API (`herdr api schema`, ~90 met
 | `herdr_fs_patch` | coding-tools-style `*** Begin Patch` multi-file patch (`dry_run`). |
 | `herdr_fs_image` | Read an image under a managed root; return MCP image content. |
 | `herdr_git` | Deterministic `status` / `diff` / `log` (do not spend a local agent on this). |
-| `herdr_exec` | Short shell in the workspace’s visible `herdr-mcp:utility` pane. |
+| `herdr_exec` | Short shell in the workspace’s visible `herdr-mcp:utility` pane. If control-plane TaskGroup blocks pane ops **before** the command is sent, falls back to a local zsh (`backend:local_fallback`) — never double-runs after delivery. |
 | `herdr_exec_start` / `read` / `kill` | Long background shell sessions (local process, not the utility pane). |
 
 Optional: `HERDR_MCP_ALL_TOOLS=1` adds advanced/deprecated lifecycle tools. Mutations stay in managed git roots; `HERDR_MCP_READONLY=1` / `HERDR_MCP_WRITE_ROOTS=/a,/b` tighten writes.
