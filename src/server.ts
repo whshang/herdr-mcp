@@ -11,7 +11,7 @@
  *  - Bearer auth on /mcp via HERDR_MCP_TOKEN.
  */
 import express, { Express, Request, Response, NextFunction } from "express";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, writeFile, realpath } from "node:fs/promises";
 import * as path from "node:path";
 import { exec, execSync } from "node:child_process";
@@ -1916,6 +1916,24 @@ interface McpSession {
 const mcpSessions = new Map<string, McpSession>();
 
 /**
+ * Persistent stateless (OpenAI/ChatGPT) SSE probe streams. The connector
+ * opens a GET and keeps it open; EOF is treated as "transport terminated",
+ * so we hold the stream open with heartbeats until the client disconnects.
+ * Each entry carries its heartbeat timer so close/abort can clear it and the
+ * process can tear everything down on shutdown without a leak.
+ */
+const statelessSseStreams = new Set<{
+  res: Response;
+  hb: NodeJS.Timeout;
+}>();
+
+function clearStatelessSse(entry: { res: Response; hb: NodeJS.Timeout }): void {
+  clearInterval(entry.hb);
+  statelessSseStreams.delete(entry);
+}
+
+
+/**
  * Instructions advertised in BOTH the initialize result (official spec field;
  * McpServer options inject it via the SDK) and the server/discover answer.
  * Deliberately terse — points at the right tool per situation, never restates
@@ -2123,19 +2141,49 @@ function routes(app: Express): void {
   registerPushRoutes(app, clientGet);
 
   // Access log: diagnose Connector protocol failures without logging prompts/tokens.
+  // Emits a single line per MCP GET/POST/DELETE on res finish. Never logs the
+  // Authorization header, request body, prompt, or session contents. The
+  // Mcp-Session-Id is emitted as "none" or a short SHA-256 fingerprint (never
+  // the raw value); the response's own mcp-session-id is logged as present/none.
   app.use((req, res, next) => {
     const started = Date.now();
-    res.on("finish", () => {
+    const requestId = randomUUID().slice(0, 8);
+    // isStatelessClient reads req.body (already parsed by express.json above).
+    const stateless = isStatelessClient(req);
+    const rawSid = req.get("mcp-session-id") ?? "";
+    const sid = rawSid
+      ? (stateless ? "stale(skip)" : `hash:${createHash("sha256").update(rawSid).digest("hex").slice(0, 12)}`)
+      : "none";
+    // Route classification for the trace.
+    let route = req.method === "GET"
+      ? (rawSid
+          ? (stateless ? "openai-probe(stale)" : (mcpSessions.has(rawSid) ? "sse-stream" : "unknown-session"))
+          : (stateless ? "openai-probe" : "unknown-session"))
+      : (stateless ? "stateless" : "stateful");
+    res.on("finish", () => { emitTrace(); });
+    res.on("close", () => { emitTrace(); });
+    let logged = false;
+    function emitTrace(): void {
+      if (logged) return; // finish + close may both fire for the same request
+      logged = true;
       const body = (req.body ?? {}) as Record<string, unknown>;
       const params = (body["params"] ?? {}) as Record<string, unknown>;
-      const method = typeof body["method"] === "string" ? body["method"] : "-";
+      const method = !Array.isArray(req.body) && typeof body["method"] === "string" ? body["method"] : "-";
       const tool = typeof params["name"] === "string" ? params["name"] : "-";
-      const sid = req.get("mcp-session-id") ? "present" : "none";
       const authz = req.get("authorization");
       const auth = authz ? (/^Bearer\s/i.test(authz) ? "bearer" : "other") : "none";
-      const ua = (req.get("user-agent") ?? "-").slice(0, 80);
-      console.log(`[herdr-mcp] ${req.method} ${req.originalUrl} -> ${res.statusCode} ${Date.now() - started}ms method=${method} tool=${tool} sid=${sid} auth=${auth} ua=${ua}`);
-    });
+      // UA truncated to first token + length, never the full string.
+      const uaRaw = (req.get("user-agent") ?? "-");
+      const uaFirst = uaRaw === "-" ? "-" : (uaRaw.split(/[\s;]/)[0] || "?");
+      const ua = `${uaFirst}(${uaRaw.length})`;
+      const proto = req.get("mcp-protocol-version") ?? "-";
+      const respSid = res.get("mcp-session-id") ? "present" : "none";
+      const ct = res.get("content-type") ?? "-";
+      const dur = Date.now() - started;
+      console.log(`[herdr-mcp] rid=${requestId} ${req.method} ${req.originalUrl} -> ${res.statusCode} ${dur}ms` +
+        ` method=${method} tool=${tool} ua=${ua} proto=${proto} sid=${sid} stateless=${stateless}` +
+        ` route=${route} auth=${auth} resp-sid=${respSid} ct=${ct}`);
+    }
     next();
   });
   // OAuth 2.1 discovery / DCR / PKCE endpoints (RFC 8414/9728/7591) — see ./oauth.ts.
@@ -2152,13 +2200,11 @@ function routes(app: Express): void {
       const sess = sid ? mcpSessions.get(sid) : undefined;
       if (!sess) {
         // OpenAI/ChatGPT (openai-mcp UA) probes a NEW conversation with a
-        // sessionless GET before any initialize; answering 400 is surfaced to
-        // the connector as "invalid_mcp_response" and the conversation never
-        // recovers. Serve the probe with a well-framed, short SSE 200: it is a
-        // valid text/event-stream (never misread as an invalid MCP response),
-        // creates no session, and ends immediately (no long-lived connection
-        // leak). Non-OpenAI sessionless GETs keep the standard 400/stateful
-        // behavior — the GET stream still requires a real session.
+        // sessionless GET before any initialize. It must be a PERSISTENT SSE
+        // stream: the connector keeps the GET open and treats an EOF as
+        // "transport terminated" (it then refuses to send further requests).
+        // Hold the stream open with heartbeats until the client disconnects.
+        // No Mcp-Session-Id is issued and no mcpSessions entry is created.
         if (isStatelessClient(req)) {
           res.status(200);
           res.set({
@@ -2167,10 +2213,30 @@ function routes(app: Express): void {
             Connection: "keep-alive",
             "X-Accel-Buffering": "no",
           });
-          // Single SSE comment (keepalive-style) then close: a valid stream
-          // that carries no JSON-RPC payload and leaks no connection.
+          res.flushHeaders();
           res.write(": connected\n\n");
-          res.end();
+          const hb = setInterval(() => {
+            try {
+              res.write(": keepalive\n\n");
+            } catch {
+              /* stream gone */
+            }
+          }, 15_000);
+          const entry = { res, hb };
+          statelessSseStreams.add(entry);
+          // Cleanup on client disconnect / abort / error: clear the timer and
+          // end the response safely. The access-log middleware listens on
+          // res close/finish, so it records this GET with the final status.
+          const cleanup = () => {
+            clearStatelessSse(entry);
+            if (!res.destroyed) {
+              try { res.end(); } catch { /* already closed */ }
+            }
+          };
+          req.on("close", cleanup);
+          req.on("aborted", cleanup);
+          res.on("close", cleanup);
+          res.on("error", cleanup);
           return;
         }
         res.status(400).json({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: session required for GET stream" }, id: null });

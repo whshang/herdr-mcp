@@ -23,6 +23,7 @@ import { spawn } from "node:child_process";
 import * as net from "node:net";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 9817;
@@ -416,7 +417,7 @@ test("GET / without session -> 400 (not 405/501), GET /mcp/ alias parity", async
 // short SSE 200 — a valid text/event-stream that creates no session and
 // closes immediately (no long-lived connection leak) — while non-OpenAI
 // sessionless GETs keep the standard 400/stateful behavior above.
-test("openai-mcp UA: sessionless GET probe on / and /mcp -> 200 SSE, no session, ends immediately", async () => {
+test("openai-mcp UA: sessionless GET probe on / and /mcp -> 200 persistent SSE, no session, no EOF", async () => {
   const savedSid = sessionId;
   sessionId = null;
   try {
@@ -431,11 +432,18 @@ test("openai-mcp UA: sessionless GET probe on / and /mcp -> 200 SSE, no session,
         `openai-mcp GET probe on ${p} must be framed as text/event-stream`);
       assert.equal(probe.headers.get("mcp-session-id"), null,
         `openai-mcp GET probe on ${p} must NOT create a session`);
-      // Body is a keepalive-style SSE comment (or empty) — never a JSON-RPC
-      // error payload the client could misread as invalid_mcp_response.
-      const body = await probe.text();
-      assert.doesNotMatch(body, /jsonrpc/, `probe body on ${p} must not carry JSON-RPC: ${body.slice(0, 80)}`);
-      assert.doesNotMatch(body, /invalid_mcp_response/, `probe body on ${p} must not contain error text`);
+      assert.equal(probe.headers.get("cache-control"), "no-cache, no-transform");
+      // Read the FIRST chunk only (never await EOF — the stream stays open).
+      // The first bytes must be the keepalive comment, not a JSON-RPC error
+      // the connector could misread as invalid_mcp_response.
+      const reader = probe.body.getReader();
+      const { value } = await reader.read();
+      const first = new TextDecoder().decode(value ?? new Uint8Array());
+      assert.doesNotMatch(first, /jsonrpc/, `probe first chunk on ${p} must not carry JSON-RPC: ${first}`);
+      assert.match(first, /^: connected/, `probe first chunk on ${p} must be the SSE comment`);
+      // Abort — the server must clean up the persistent stream without a leak.
+      reader.releaseLock();
+      probe.body.cancel();
     }
     // The probe must not have created a session: a follow-up stateless
     // initialize still returns NO Mcp-Session-Id, and tools/list works.
@@ -670,5 +678,263 @@ test("openai-mcp UA: server/discover is -32601 on both / and /mcp (forces legacy
     assert.equal(r.status, 200, `discover on ${p}`);
     const msg = await parseRpc(r);
     assert.equal(msg.error?.code, -32601, `openai-mcp discover on ${p} must be -32601`);
+  }
+});
+
+// Poisoned-session full-chain regression: an OpenAI/ChatGPT conversation whose
+// transport has latched onto a stale Mcp-Session-Id (e.g. after a server
+// restart) must still complete the WHOLE MCP flow — GET probe, initialize,
+// tools/list, tools/call herdr_inspect, tools/call herdr_since — with that old
+// sid carried on EVERY step. Every response must be 200/202, must NOT echo an
+// mcp-session-id, and must never surface -32600/-32001 / "Session terminated".
+const POISON = "poisoned-stale-session-0001";
+async function openaiRpcRaw(path, payload, sid) {
+  const h = headers({ "User-Agent": OPENAI_UA });
+  if (sid) h["Mcp-Session-Id"] = sid;
+  else delete h["Mcp-Session-Id"];
+  const res = await fetch(`${BASE}${path}`, {
+    method: "POST", headers: h,
+    body: JSON.stringify(payload),
+  });
+  const sidResp = res.headers.get("mcp-session-id");
+  return { status: res.status, sidResp, msg: await parseRpc(res), res };
+}
+async function openaiChain(path) {
+  const out = {};
+  // GET probe with poisoned sid — read first chunk then cancel (no EOF await).
+  const probe = await fetch(`${BASE}${path}`, {
+    method: "GET", headers: { ...headers(), "User-Agent": OPENAI_UA, "Mcp-Session-Id": POISON },
+    signal: AbortSignal.timeout(5000),
+  });
+  out.probe = { status: probe.status, ct: probe.headers.get("content-type"), sid: probe.headers.get("mcp-session-id") };
+  const reader = probe.body.getReader();
+  const { value } = await reader.read();
+  const first = new TextDecoder().decode(value ?? new Uint8Array());
+  out.probeFirst = first;
+  reader.releaseLock();
+  await probe.body.cancel();
+  // GET probe again (round coverage on GET) — also read-first then abort.
+  const probe2 = await fetch(`${BASE}${path}`, {
+    method: "GET", headers: { ...headers(), "User-Agent": OPENAI_UA, "Mcp-Session-Id": POISON },
+    signal: AbortSignal.timeout(5000),
+  });
+  out.probe2 = probe2.status;
+  await probe2.body?.cancel();
+  // initialize (carries poisoned sid)
+  const init = await openaiRpcRaw(path, { jsonrpc: "2.0", id: 1, method: "initialize", params: openaiInit }, POISON);
+  out.init = { status: init.status, sid: init.sidResp, ok: !!init.msg.result?.serverInfo };
+  // tools/list
+  const list = await openaiRpcRaw(path, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, POISON);
+  out.list = { status: list.status, sid: list.sidResp, tools: list.msg.result?.tools?.length };
+  // tools/call herdr_inspect
+  const insp = await openaiRpcRaw(path, { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "herdr_inspect", arguments: {} } }, POISON);
+  out.inspect = { status: insp.status, sid: insp.sidResp, text: insp.msg.result?.content?.[0]?.text };
+  // tools/call herdr_since
+  const since = await openaiRpcRaw(path, { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "herdr_since", arguments: { cursor: 0, workspace: "w44" } } }, POISON);
+  out.since = { status: since.status, sid: since.sidResp, text: since.msg.result?.content?.[0]?.text };
+  return out;
+}
+function assertPoisonChain(out, label) {
+  for (const [k, v] of Object.entries(out)) {
+    // probeFirst is a raw string chunk, not a {status} wrapper — skip it here
+    // (asserted separately below).
+    if (k === "probeFirst") continue;
+    const st = typeof v === "object" && v !== null && "status" in v ? v.status : v;
+    assert.equal(st, 200, `${label} ${k} must be 200, got ${st}`);
+  }
+  assert.equal(out.probe.sid, null, `${label} GET probe must not return a session id`);
+  assert.match(out.probe.ct ?? "", /text\/event-stream/i, `${label} GET probe must be SSE`);
+  assert.match(out.probeFirst ?? "", /^: connected/, `${label} probe first chunk must be the SSE comment`);
+  assert.doesNotMatch(out.probeFirst ?? "", /jsonrpc/, `${label} probe first chunk must not carry JSON-RPC`);
+  assert.equal(out.init.sid, null, `${label} initialize must not return a session id`);
+  assert.equal(out.list.sid, null, `${label} tools/list must not return a session id`);
+  assert.equal(out.inspect.sid, null, `${label} herdr_inspect must not return a session id`);
+  assert.equal(out.since.sid, null, `${label} herdr_since must not return a session id`);
+  assert.doesNotMatch(JSON.stringify(out), /-32600|-32001|Session terminated|invalid_mcp_response/, `${label} must not surface termination markers`);
+  assert.ok(JSON.parse(out.inspect.text).focused_workspace, `${label} inspect must return focused_workspace`);
+  assert.ok(out.since.text.includes("cursor"), `${label} since must return cursor`);
+}
+
+test("openai-mcp UA poisoned-session: stale sid carried on EVERY step, GET/init/list/inspect/since all 200, no sid, two rounds", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    for (let round = 1; round <= 2; round++) {
+      for (const p of ["/", "/mcp"]) {
+        const out = await openaiChain(p);
+        assertPoisonChain(out, `round${round}:${p}`);
+      }
+    }
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
+test("openai-mcp UA poisoned-session: full chain STILL 200 after server restart (no Session terminated)", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    await stopServer(server);
+    server = await spawnServer(PORT);
+    for (const p of ["/", "/mcp"]) {
+      const out = await openaiChain(p);
+      assertPoisonChain(out, `restart:${p}`);
+    }
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
+test("stateful client (non-openai UA): poisoned/stale sid still 404 -32001 (reverse guard)", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    const ua = "claude-connector/1.0";
+    const sid = "poisoned-stateful-sid";
+    // GET with poisoned sid -> must stay 400 (not 200 SSE)
+    const probe = await fetch(`${BASE}/`, {
+      method: "GET", headers: headers({ "User-Agent": ua, "Mcp-Session-Id": sid }),
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(probe.status, 400, `stateful GET with unknown sid must 400, got ${probe.status}`);
+    // POST tools/list with poisoned sid -> must 404 -32001
+    const bad = await fetch(`${BASE}/`, {
+      method: "POST", headers: headers({ "User-Agent": ua, "Mcp-Session-Id": sid }),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+    assert.equal(bad.status, 404, `stateful POST unknown sid must 404`);
+    const badMsg = await parseRpc(bad);
+    assert.equal(badMsg.error.code, -32001);
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Real-client state machine (Grok verifier repro): a ChatGPT-like transport
+// keeps the GET SSE stream open and, when it hits EOF, marks itself
+// "terminated" and refuses to send the NEXT request (inspect 200 -> since
+// never leaves the client). With a PERSISTENT server SSE (no EOF until the
+// client aborts), the second tools/call must still be sent and succeed.
+//
+// We use the actual @modelcontextprotocol/sdk StreamableHTTPClientTransport
+// and hold the GET reader open (never awaiting EOF) to exercise the same
+// connection semantics as the connector.
+// ---------------------------------------------------------------------------
+
+test("real SDK client: persistent GET SSE held open; inspect -> since both actually sent; abort -> server cleans up", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  let heldGet = null;
+  try {
+    const transport = new StreamableHTTPClientTransport(new URL(`${BASE}/`), {
+      requestInit: { headers: { Authorization: `Bearer ${TOKEN}`, "User-Agent": OPENAI_UA } },
+    });
+    const messages = [];
+    const errors = [];
+    transport.onmessage = (m) => { messages.push(m); };
+    transport.onerror = (e) => { errors.push(e?.message ?? String(e)); };
+    await transport.start();
+
+    // initialize (stateless: no session id)
+    await transport.send({
+      jsonrpc: "2.0", id: "init", method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "ChatGPT", version: "1" } },
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(transport.sessionId, undefined, "openai-mcp initialize must NOT yield a session id");
+
+    // notifications/initialized -> SDK client opens the persistent GET SSE.
+    // We hold that GET open (persistent SSE). Grab its response and keep a
+    // reader so it does not get GC'd; never await EOF.
+    const probe = await fetch(`${BASE}/`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${TOKEN}`, "User-Agent": OPENAI_UA },
+    });
+    heldGet = probe;
+    assert.equal(probe.status, 200, "persistent GET must be 200");
+    const reader = probe.body.getReader();
+    const { value } = await reader.read();
+    assert.match(new TextDecoder().decode(value ?? new Uint8Array()), /^: connected/, "first chunk must be SSE comment");
+    // keep reader open; the stream must NOT EOF
+
+    // first tools/call -> herdr_inspect
+    await transport.send({
+      jsonrpc: "2.0", id: "insp", method: "tools/call",
+      params: { name: "herdr_inspect", arguments: {} },
+    });
+    await new Promise((r) => setTimeout(r, 700));
+    // second tools/call -> herdr_since (the call that used to never go out)
+    await transport.send({
+      jsonrpc: "2.0", id: "since", method: "tools/call",
+      params: { name: "herdr_since", arguments: { cursor: 0, workspace: "w44" } },
+    });
+    await new Promise((r) => setTimeout(r, 900));
+
+    const byId = Object.fromEntries(messages.filter((m) => m.id !== undefined).map((m) => [m.id, m]));
+    assert.ok(byId["insp"]?.result, "herdr_inspect result must be received by the client");
+    assert.ok(JSON.parse(byId.insp.result.content[0].text).focused_workspace, "inspect must carry focused_workspace");
+    assert.ok(byId["since"] && byId.since.result?.content?.[0]?.text?.includes("cursor"),
+      "herdr_since must be received (the second call actually went out), got ids: " + Object.keys(byId).join(","));
+    assert.equal(errors.length, 0, `no client errors: ${errors.join("; ")}`);
+
+    // cleanup: abort the held GET -> server must tear down the stream
+    reader.releaseLock();
+    await probe.body.cancel();
+    await transport.close();
+    // A tiny wait to let the server process the abort cleanly.
+    await new Promise((r) => setTimeout(r, 200));
+  } finally {
+    await heldGet?.body?.cancel().catch(() => undefined);
+    sessionId = savedSid;
+  }
+});
+
+// ChatGPT-like transport EOF=>terminated simulator: proves that with a
+// PERSISTENT server stream the client does NOT hit EOF (so it never flips to
+// "terminated"), and that the second call still reaches the server. If the
+// server sent a short stream, this simulator's reader would EOF.
+test("ChatGPT-like EOF simulator: persistent server stream stays open (no EOF), second call still out of band", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    // Simulate the connector: open GET, hold it, expect NO EOF. Then issue
+    // inspect and since via plain POSTs (the connector's send path) while the
+    // GET is still held open.
+    const probe = await fetch(`${BASE}/`, {
+      method: "GET", headers: { ...headers(), "User-Agent": OPENAI_UA, "Mcp-Session-Id": "sim-eof-stale" },
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(probe.status, 200);
+    const reader = probe.body.getReader();
+    let eof = false;
+    let first = "";
+    // Read exactly ONE chunk. With persistent SSE the stream stays open (no
+    // EOF); a short-SSE server would EOF here and the simulator would flip to
+    // "terminated" — the exact failure we are guarding against. We must NOT
+    // wait for a second chunk: persistent streams only emit a heartbeat every
+    // 15s, so a multi-read loop would block.
+    {
+      const { value, done } = await reader.read();
+      if (done) eof = true;
+      else first = new TextDecoder().decode(value ?? new Uint8Array());
+    }
+    assert.equal(eof, false, "persistent SSE must NOT EOF while held open (short-SSE would EOF -> transport 'terminated')");
+    assert.match(first ?? "", /^: connected/);
+
+    // Now the two sequential POSTs must BOTH go out and succeed while the GET
+    // is still open (the real failure was since never being sent).
+    const insp = await openaiRpcRaw("/", { jsonrpc: "2.0", id: "insp", method: "tools/call", params: { name: "herdr_inspect", arguments: {} } }, "stale-eof-sid");
+    assert.equal(insp.status, 200, "inspect POST must be 200");
+    assert.ok(JSON.parse(insp.msg.result.content[0].text).focused_workspace);
+    const since = await openaiRpcRaw("/", { jsonrpc: "2.0", id: "since", method: "tools/call", params: { name: "herdr_since", arguments: { cursor: 0, workspace: "w44" } } }, "stale-eof-sid");
+    assert.equal(since.status, 200, "since POST must be 200 (proves second call left the client)");
+    assert.ok(since.msg.result.content[0].text.includes("cursor"));
+
+    // cleanup: abort GET, server cleans up
+    reader.releaseLock();
+    await probe.body.cancel();
+  } finally {
+    sessionId = savedSid;
   }
 });
