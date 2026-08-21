@@ -8,25 +8,40 @@ English: [README.md](README.md).
 
 | 用途 | URL |
 |---|---|
-| 公网 MCP（ChatGPT / Claude） | `https://xxxx.trycloudflare.com/mcp` |
 | 本机 MCP | `http://127.0.0.1:8772/mcp` |
+| 公网 MCP（默认推荐） | `https://<subdomain>.trycloudflare.com/mcp` |
 | 浏览器插件推送 | `http://127.0.0.1:8772/push/events` |
+
+**给其他人的默认公网方案：** Cloudflare 免费 Quick Tunnel（`*.trycloudflare.com`），不必自备域名。把该 HTTPS 源站（不含 `/mcp`）写入 `HERDR_MCP_BASE_URL`，OAuth 发现才会和 ChatGPT/Claude 填的地址一致。
 
 Connector 认证走 **OAuth（自动注册）**，不要填 API key。静态 Bearer 只给本机 curl / Cursor：`herdr-mcp token`。
 
 ## 接入
 
-### ChatGPT / Claude
-
-1. 添加 Connector，MCP URL 填：`https://xxxx.trycloudflare.com/mcp`
-2. 选 OAuth，**不要**粘贴 Token
-3. 配好后**开新对话**
+### 1. 公网（免费 Cloudflare）
 
 ```bash
-herdr-mcp connector
+# 终端 A — MCP 已在 :8772 运行
+cloudflared tunnel --url http://127.0.0.1:8772
+# → https://xxxx.trycloudflare.com
+
+# LaunchAgent / 环境变量写入源站（不要带 /mcp）:
+# HERDR_MCP_BASE_URL=https://xxxx.trycloudflare.com
+herdr-mcp restart
+herdr-mcp connector   # 打印 …/mcp 给 ChatGPT / Claude
 ```
 
-### Cursor（本机）
+Quick Tunnel 每次重启 `cloudflared` 子域会变。要稳定主机名可用 Cloudflare 免费命名隧道，或自有域名——可选，不是默认前提。
+
+### 2. ChatGPT / Claude
+
+1. MCP URL：`https://xxxx.trycloudflare.com/mcp`（以 `herdr-mcp connector` 为准）
+2. 选 OAuth，**不要**粘贴 Token
+3. 配好后**开新对话**（旧对话会持有旧 tool snapshot）
+
+ChatGPT 踩坑与硬性要求见 [docs/chatgpt-connector.md](docs/chatgpt-connector.md)。
+
+### 3. Cursor（本机）
 
 `~/.cursor/mcp.json` 只挂本地（同一配置里不要再挂公网，Cursor 会对相同工具面去重）：
 
@@ -43,8 +58,6 @@ herdr-mcp connector
 }
 ```
 
-别的机器或只走公网：用上面的 `/mcp` + Bearer，或客户端支持的 OAuth。
-
 ## 命令行
 
 ```bash
@@ -56,17 +69,50 @@ herdr-mcp logs [-f]
 herdr-mcp token | url
 ```
 
-## 默认工具
+## 默认工具（为什么是这 11 个）
 
-`herdr_methods` · `herdr_inspect` · `herdr_call` · `herdr_since` · `herdr_prompt` · `herdr_fs_read` · `herdr_fs_list` · `herdr_fs_grep` · `herdr_fs_write` · `herdr_fs_edit` · `herdr_exec`
+herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法）。herdr-mcp **不会**把每个方法都做成 MCP 工具（占上下文、也和 herdr 重复），而是三层：
 
-写操作限制在 managed git root。可选：`HERDR_MCP_READONLY=1`、`HERDR_MCP_WRITE_ROOTS=/a,/b`。
+| 层 | MCP 工具 | 和 herdr 的关系 |
+|---|---|---|
+| 透传 | `herdr_methods`、`herdr_call` | 直接打到 **herdr 原生** socket。先 `herdr_methods` 查 schema，再用 `herdr_call` 调任意方法。 |
+| 远程编排 | `herdr_inspect`、`herdr_since`、`herdr_prompt` | 给「只有用户发消息才跑」的网页客户端用的薄封装，基于 snapshot/events/`agent.prompt`，不是另造一套 herdr 能力。 |
+| 远程工作站 | `herdr_fs_*`、`herdr_exec` | **不是** herdr 工具。MCP 客户端在远端，看不到你这台机器的磁盘；在 managed git root 里补读写与可见 shell。 |
+
+| 工具 | 做什么 |
+|---|---|
+| `herdr_methods` | 列出当前 herdr socket 方法与参数 schema（反射缓存）。陌生调用前先查。 |
+| `herdr_call` | 用 `{ method, params }` 调任意 herdr 方法（pane / workspace / agent 等），避免「一方法一工具」。 |
+| `herdr_inspect` | 一次看清连接 + workspaces / tabs / panes / agents（cwd、状态）。通常第一个调用。 |
+| `herdr_since` | 按 cursor 增量摘要，续聊时不用整包重拉状态。 |
+| `herdr_prompt` | 经 socket `agent.prompt` 投递提示（不要往 pane 里模拟打字）。建议带 `idempotency_key`。 |
+| `herdr_fs_read` | 读本机 managed git 项目内的文件。 |
+| `herdr_fs_list` | 列 managed root 下目录（跳过 `.git` / 疑似密钥名）。 |
+| `herdr_fs_grep` | 在 managed root 内搜内容（优先 `rg`）。 |
+| `herdr_fs_write` | 新建/覆盖文件（脏文件 / 忙碌闸门；`confirm_dirty` / `confirm_busy`）。 |
+| `herdr_fs_edit` | 精确唯一字符串替换（闸门同 write）。 |
+| `herdr_exec` | 在 workspace 可见的 `herdr-mcp:utility` pane 里跑 shell（可观察，非无头）。 |
+
+可选：`HERDR_MCP_ALL_TOOLS=1` 打开高级/废弃生命周期工具。写操作限 managed git root；`HERDR_MCP_READONLY=1` / `HERDR_MCP_WRITE_ROOTS=/a,/b` 可再收紧。
 
 ## 浏览器插件
 
 目录 `extension/`（MV3）。在 `chrome://extensions` 加载「未打包的扩展」。
 
-herdr agent 结束后经 `/push/events` 唤醒已绑定的网页对话。在扩展选项里填本机 URL 与 token。支持站点：z.ai、deepseek、claude.ai、chatgpt.com。
+**只做唤醒**：herdr agent 结束后经 `/push/events` 往绑定的网页对话写消息。站点：z.ai、deepseek、claude.ai、chatgpt.com。
+
+这 **不是** ChatGPT MCP 连接器。插件不会让 z.ai / DeepSeek 拥有那 11 个 MCP 工具。说明见 [docs/extension-wake.md](docs/extension-wake.md)。
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | herdr 与 MCP 分层 |
+| [docs/chatgpt-connector.md](docs/chatgpt-connector.md) | ChatGPT OAuth / 传输 / schema |
+| [docs/extension-wake.md](docs/extension-wake.md) | 浏览器唤醒插件 |
+| [tests/README.md](tests/README.md) | 默认测试 vs 手工脚本 |
+
+过程笔记在 `docs/_wip/`（gitignore，不入库）。
 
 ## 运维
 

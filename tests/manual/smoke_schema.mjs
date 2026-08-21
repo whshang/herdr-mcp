@@ -1,5 +1,5 @@
 // A-1 validation smoke: exercise validateMethodParams against real schema.
-import { validateMethodParams, getMethodParamsSchema, listMethods } from "../dist/schema.js";
+import { validateMethodParams, getMethodParamsSchema, listMethods } from "../../dist/schema.js";
 
 const cases = [
   ["pane.split", { direction: "right" }],                    // OK (required satisfied)

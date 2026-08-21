@@ -4,10 +4,10 @@
  * Starts the shared cache, waits for >=3 live events to be applied, then prints
  * agents[] including last_activity_at. Exit code 0 on success.
  *
- * Run: npx tsx tests/smoke_state.mjs   (or node dist/tests/... after build)
+ * Run: npx tsx tests/manual/smoke_state.mjs   (or node dist/tests/... after build)
  */
-import { HerdrClient } from "../dist/herdr.js";
-import { getSnapshotCache } from "../dist/state.js";
+import { HerdrClient } from "../../dist/herdr.js";
+import { getSnapshotCache } from "../../dist/state.js";
 
 const c = new HerdrClient();
 const cache = getSnapshotCache(c);

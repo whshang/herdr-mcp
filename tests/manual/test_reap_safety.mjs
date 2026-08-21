@@ -12,7 +12,7 @@
  * git repos under /tmp. Never touches existing workspaces. All panes closed
  * belong to the dedicated test workspace; cleanup in finally.
  *
- * Usage: node tests/test_reap_safety.mjs <port> <token>
+ * Usage: node tests/manual/test_reap_safety.mjs <port> <token>
  */
 import { execSync } from "node:child_process";
 import { mkdirSync, realpathSync, rmSync, writeFileSync, readFileSync } from "node:fs";

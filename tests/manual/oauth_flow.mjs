@@ -19,7 +19,7 @@
  *     access tokens and refresh tokens survive
  *   - static HERDR_MCP_TOKEN still authenticates /mcp (Claude compat)
  *
- * Usage: node tests/oauth_flow.mjs
+ * Usage: node tests/manual/oauth_flow.mjs
  */
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -48,7 +48,7 @@ function ok(cond, label, detail = "") {
 // Server lifecycle
 // ---------------------------------------------------------------------------
 async function startServer() {
-  server = spawn("node", [path.join(__dirname, "..", "dist", "server.js")], {
+  server = spawn("node", [path.join(__dirname, "..", "..", "dist", "server.js")], {
     env: {
       ...process.env,
       HERDR_MCP_PORT: String(PORT),
@@ -193,8 +193,8 @@ async function testDiscovery() {
   const card = await getJson(`${BASE}/.well-known/mcp.json`);
   ok(card.status === 200 && card.json.serverUrl === RESOURCE,
     "mcp.json 200 with absolute serverUrl === /mcp", `got ${card.json.serverUrl}`);
-  ok(card.json.version === "0.3.5",
-    "mcp.json version must be 0.3.5 (cache invalidation identity)", `got ${card.json.version}`);
+  ok(card.json.version === "0.3.9",
+    "mcp.json version must be 0.3.9 (cache invalidation identity)", `got ${card.json.version}`);
 
   // Path-aware AS + CORS (ChatGPT browser discovery) + CIMD flag + /mcp/register
   const asMcp = await getJson(`${BASE}/.well-known/oauth-authorization-server/mcp`);

@@ -27,8 +27,17 @@ import { validateMethodParams, listMethods } from "./schema.js";
 import { get as sessionGet, save as sessionSave, type SessionData, type SessionProject } from "./session.js";
 import { waitForAgent } from "./wait.js";
 import { registerPushRoutes } from "./push.js";
-import { registerOAuthRoutes, mcpBearerAuth, oauthCors } from "./oauth.js";
+import {
+  registerOAuthRoutes,
+  mcpBearerAuth,
+  oauthCors,
+  isChatgptOAuthClientId,
+  getRequestOAuthClientId,
+} from "./oauth.js";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
+
+/** SDK-supported wire version used when ChatGPT advertises 2026-07-28. */
+const SDK_WIRE_PROTOCOL = "2025-11-25";
 
 // ---------------------------------------------------------------------------
 // Config from environment (mirrors server.py)
@@ -584,7 +593,15 @@ function registerTools(server: McpServer): void {
         "after a transport failure — delivery is uncertain, verify state before re-sending.",
       inputSchema: {
         method: z.string().describe("herdr socket method, e.g. pane.split, agent.start"),
-        params: z.record(z.string(), z.unknown()).default({}).describe("Method arguments"),
+        // ChatGPT/OpenAI rejects Zod's z.record → propertyNames + additionalProperties:{}.
+        // Accept object or JSON string; advertise a plain string schema.
+        params: z
+          .preprocess((v) => {
+            if (v === undefined || v === null) return undefined;
+            if (typeof v === "object") return JSON.stringify(v);
+            return v;
+          }, z.string().optional())
+          .describe("Method arguments as a JSON object string; omit for {}"),
       },
     },
     async ({ method, params }) => {
@@ -593,7 +610,19 @@ function registerTools(server: McpServer): void {
           hint: "HERDR_MCP_READONLY=1 blocks side-effecting methods; read-only methods still pass" });
       }
       const c = clientGet();
-      const given = params ?? {};
+      let given: Record<string, unknown> = {};
+      if (typeof params === "string" && params.trim() !== "") {
+        try {
+          const parsed = JSON.parse(params) as unknown;
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            given = parsed as Record<string, unknown>;
+          } else {
+            return toResult({ ok: false, code: "invalid_params", method, errors: ["params must be a JSON object"] });
+          }
+        } catch {
+          return toResult({ ok: false, code: "invalid_params", method, errors: ["params is not valid JSON"] });
+        }
+      }
       // A-1: validate against the live schema BEFORE touching the socket.
       const v = validateMethodParams(method, given);
       if (!v.ok) {
@@ -1297,17 +1326,18 @@ function registerTools(server: McpServer): void {
     "herdr_fs_read",
     {
       description:
-        "Read a file from a MANAGED (git) project root on the workstation (remote-workstation " +
-        "layer — the client cannot reach these files otherwise). Gates: path must sit inside a " +
-        "git-backed project root from the live snapshot ($HOME / non-git roots refused); " +
-        "secret-ish files (.env*, *.pem, id_rsa*, *.key, .git/config, *secret*/*token*/*credential*) " +
-        "denied; budget defaults to 200 lines / 16KB — raise explicitly (cap 256KB). " +
-        "Diff-sized reads are cheap; whole-source reads are not.",
+        "PREFERRED way to read project source on the workstation. Reads a file from a MANAGED " +
+        "(git) project root (remote-workstation layer — the client cannot reach these files " +
+        "otherwise). Do not use herdr_prompt / omp / agent.read for ordinary file IO. Gates: " +
+        "path must sit inside a git-backed project root from the live snapshot ($HOME / non-git " +
+        "roots refused); secret-ish files (.env*, *.pem, id_rsa*, *.key, .git/config, " +
+        "*secret*/*token*/*credential*) denied; budget defaults to 200 lines / 16KB — raise " +
+        "explicitly (cap 256KB). Diff-sized reads are cheap; whole-source reads are not.",
       inputSchema: {
         path: z.string().describe("Absolute file path inside a managed project root"),
-        start_line: z.number().int().positive().optional().describe("1-based first line (default 1)"),
-        end_line: z.number().int().positive().optional().describe("1-based last line (default start+199)"),
-        max_bytes: z.number().int().positive().max(262144).optional().describe("Byte ceiling (default 16384, cap 262144)"),
+        start_line: z.number().int().min(1).optional().describe("1-based first line (default 1)"),
+        end_line: z.number().int().min(1).optional().describe("1-based last line (default start+199)"),
+        max_bytes: z.number().int().min(1).max(262144).optional().describe("Byte ceiling (default 16384, cap 262144)"),
       },
     },
     async ({ path: p, start_line, end_line, max_bytes }) => {
@@ -1352,7 +1382,7 @@ function registerTools(server: McpServer): void {
         path: z.string().describe("Absolute directory path inside a managed project root"),
         recursive: z.boolean().default(false).describe("Recursively list subdirectories (default false)"),
         glob: z.string().optional().describe("Optional glob filter on entry names (e.g. '*.ts')"),
-        max_entries: z.number().int().positive().max(2000).optional().describe("Max entries returned (default 200)"),
+        max_entries: z.number().int().min(1).max(2000).optional().describe("Max entries returned (default 200)"),
       },
     },
     async ({ path: p, recursive, glob, max_entries }) => {
@@ -1418,8 +1448,8 @@ function registerTools(server: McpServer): void {
         pattern: z.string().describe("Search pattern (literal string, or regex when regex:true)"),
         regex: z.boolean().default(false).describe("Treat pattern as a regular expression (default false)"),
         glob: z.string().optional().describe("Optional glob filter on file names (e.g. '*.ts')"),
-        max_matches: z.number().int().positive().max(1000).optional().describe("Max matches returned (default 50)"),
-        max_bytes: z.number().int().positive().max(1048576).optional().describe("Per-file byte ceiling (default 65536)"),
+        max_matches: z.number().int().min(1).max(1000).optional().describe("Max matches returned (default 50)"),
+        max_bytes: z.number().int().min(1).max(1048576).optional().describe("Per-file byte ceiling (default 65536)"),
         case_insensitive: z.boolean().default(false).describe("Case-insensitive match (default false)"),
       },
     },
@@ -1532,7 +1562,7 @@ function registerTools(server: McpServer): void {
         workspace: z.string().describe("workspace_id or label (from herdr_inspect)"),
         command: z.string().describe("Shell command line to run in the utility pane"),
         project_root: z.string().optional().describe("Explicit project root within this workspace (workspaces[].projects[].root from herdr_inspect). REQUIRED when the workspace has multiple project roots; the command runs with this root as cwd via subshell cd"),
-        timeout_ms: z.number().int().positive().max(300000).default(30000),
+        timeout_ms: z.number().int().min(1).max(300000).default(30000),
       },
     },
     async ({ workspace: wsTarget, command, project_root, timeout_ms }) => {
@@ -1834,7 +1864,7 @@ function registerTools(server: McpServer): void {
           .object({
             until: z.array(z.enum(["idle", "working", "blocked", "done", "unknown"])).optional()
               .describe("Agent statuses that end the wait"),
-            timeout_ms: z.number().int().positive().max(3600000).optional()
+            timeout_ms: z.number().int().min(1).max(3600000).optional()
               .describe("Wait budget; default 25s when wait is given"),
           })
           .optional()
@@ -2126,8 +2156,11 @@ function clearStatelessSse(entry: { res: Response; hb: NodeJS.Timeout }): void {
  */
 const SERVER_INSTRUCTIONS =
   "Herdr terminal-multiplexer control plane. Start: herdr_inspect. Resume: herdr_since(cursor). " +
+  "Read/list/search project files: herdr_fs_read / herdr_fs_list / herdr_fs_grep (managed git roots only). " +
+  "Shell in a workspace: herdr_exec. Do NOT route file IO through herdr_prompt / omp / agent tools — " +
+  "pane agents may crash with unrelated TaskGroup errors and that is not a herdr-mcp fs failure. " +
   "Unknown native API: herdr_methods then herdr_call. Agent prompt: herdr_prompt + idempotency_key. " +
-  "Fallback: herdr_fs_read / herdr_fs_list / herdr_fs_grep / herdr_fs_write / herdr_fs_edit + herdr_exec. Before dev work require " +
+  "Write/edit: herdr_fs_write / herdr_fs_edit. Before dev work require " +
   "project_root == pane cwd == foreground cwd; use explicit workspace/pane IDs, never UI focus. " +
   "Roles: main=planning, worker=implementation, verifier=audit. Never blind-retry a mutation after " +
   "a transport failure — delivery is uncertain.";
@@ -2177,12 +2210,17 @@ function handleMcpGet(_req: Request, res: Response): void {
  * id after a server restart; the new process has no such session, the client
  * then reports JSON-RPC -32600 "Session terminated" and never recovers.
  * Serving it stateless end-to-end (initialize included) means no session id is
- * ever issued, so there is nothing that can go stale. Detection is UA-based,
- * with a clientInfo fallback for the initialize body.
+ * ever issued, so there is nothing that can go stale.
+ *
+ * Detection (any match → stateless), order independent of initialize body:
+ *  1. User-Agent contains openai-mcp
+ *  2. OAuth access-token client_id is a ChatGPT CIMD URL (UA may be stripped)
+ *  3. initialize clientInfo name looks like ChatGPT/OpenAI
  */
 function isStatelessClient(req: Request): boolean {
   const ua = (req.get("user-agent") ?? "").toLowerCase();
   if (ua.includes("openai-mcp")) return true;
+  if (isChatgptOAuthClientId(getRequestOAuthClientId(req))) return true;
   const body = (req.body ?? {}) as Record<string, unknown>;
   if (!Array.isArray(body) && body["method"] === "initialize") {
     const params = (body["params"] ?? {}) as Record<string, unknown>;
@@ -2193,6 +2231,70 @@ function isStatelessClient(req: Request): boolean {
   return false;
 }
 
+/**
+ * ChatGPT discover may latch onto 2026-07-28; the SDK only speaks <= 2025-11-25.
+ * Rewrite the wire header before the transport validates it, otherwise some
+ * later tools/call batches 400 and the connector surfaces Session terminated.
+ *
+ * Must patch BOTH `req.headers` and `rawHeaders`: @hono/node-server builds the
+ * Web Request from rawHeaders, so mutating only the headers object leaves the
+ * unsupported version visible to the SDK (observed: 400 Unsupported protocol
+ * version: 2026-07-28 while Express req.get already showed 2025-11-25).
+ */
+function normalizeProtocolVersionHeader(req: Request): void {
+  const raw = req.get("mcp-protocol-version");
+  if (!raw) return;
+  if (raw !== "2026-07-28" && !raw.startsWith("2026-")) return;
+  req.headers["mcp-protocol-version"] = SDK_WIRE_PROTOCOL;
+  const rh = (req as Request & { rawHeaders?: string[] }).rawHeaders;
+  if (!Array.isArray(rh)) return;
+  for (let i = 0; i < rh.length; i += 2) {
+    if (String(rh[i]).toLowerCase() === "mcp-protocol-version") {
+      rh[i + 1] = SDK_WIRE_PROTOCOL;
+    }
+  }
+}
+
+async function handleStatelessMcpRequest(req: Request, res: Response): Promise<void> {
+  normalizeProtocolVersionHeader(req);
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const method = !Array.isArray(req.body) && typeof body["method"] === "string" ? body["method"] : "";
+  // ChatGPT registration (initialize / tools/list) historically completes on SSE.
+  // 0.3.6 forced JSON for every openai POST; production then showed OAuth OK +
+  // initialize 200, but NEVER a follow-up tools/list — connector connected with
+  // zero schemas. Keep SSE for handshake/list; use JSON only for tools/call so
+  // long tool payloads stay proxy-safe without breaking schema registration.
+  const enableJsonResponse = method === "tools/call";
+  const server = mcpServerForSession();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    onsessionclosed: undefined,
+    enableJsonResponse,
+  });
+  let closed = false;
+  const shutdown = (): void => {
+    if (closed) return;
+    closed = true;
+    void transport.close().catch(() => undefined);
+    void server.close().catch(() => undefined);
+  };
+  try {
+    await server.connect(transport);
+    // Only tear down after the HTTP response fully finishes. Closing inside a
+    // finally that races the SDK stream causes SDK `_closed` → 404/-32001
+    // "Session not found" (ChatGPT: Session terminated) on in-flight work.
+    res.on("finish", shutdown);
+    res.on("close", shutdown);
+    await transport.handleRequest(req, res, req.body);
+  } catch (e) {
+    console.error("[herdr-mcp] stateless request error:", e);
+    shutdown();
+    if (!res.headersSent) {
+      res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: String(e) }, id: null });
+    }
+  }
+}
+
 async function handleMcpRequest(req: Request, res: Response): Promise<void> {
   // Stateless clients never consult the session map: a stale Mcp-Session-Id on
   // a restarted server must not 404 — that 404/-32001 (surfacing as "Session
@@ -2200,6 +2302,11 @@ async function handleMcpRequest(req: Request, res: Response): Promise<void> {
   const statelessClient = isStatelessClient(req);
   const sessionId = req.get("mcp-session-id");
   let session = !statelessClient && sessionId ? mcpSessions.get(sessionId) : undefined;
+  // Soft-recover: openai/chatgpt with a stale sid must never take the 404 path,
+  // even if classification somehow raced. Force session=undefined.
+  if (statelessClient) {
+    session = undefined;
+  }
 
   // MCP 2026-07-28 clients (e.g. the Claude Connector) probe with the sessionless
   // bootstrap method "server/discover" before any initialize. The SDK (which
@@ -2211,14 +2318,14 @@ async function handleMcpRequest(req: Request, res: Response): Promise<void> {
   //    2026-07-28 and a Bearer token. Returning -32601 used to force a legacy
   //    initialize fallback for unauthenticated probes, but after OAuth the
   //    client stops with "连接出现问题" and never calls initialize. Advertise
-  //    2026-07-28 plus legacy versions so discovery completes; subsequent
-  //    initialize still runs on the SDK-supported wire format.
+  //    SDK wire versions FIRST, keep 2026-07-28 in the list so discovery still
+  //    completes; prefer negotiation onto 2025-11-25 for subsequent POSTs.
   const discoverBody = (req.body ?? {}) as Record<string, unknown>;
   if (!Array.isArray(req.body) && discoverBody["method"] === "server/discover") {
     const ua = (req.get("user-agent") ?? "").toLowerCase();
-    const versions = ua.startsWith("openai-mcp")
-      ? ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"]
-      : ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
+    const versions = ua.startsWith("openai-mcp") || isChatgptOAuthClientId(getRequestOAuthClientId(req))
+      ? [SDK_WIRE_PROTOCOL, "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07", "2026-07-28"]
+      : [SDK_WIRE_PROTOCOL, "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
     res.status(200).json({
       jsonrpc: "2.0",
       id: discoverBody["id"] ?? null,
@@ -2235,9 +2342,9 @@ async function handleMcpRequest(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  // A non-initialization request with an unknown session id -> 404.
-  // Stateless clients are exempt: openai-mcp reuses stale ids after a restart;
-  // answering 404 is what the client reports as -32600 "Session terminated".
+  // A non-initialization request with an unknown session id -> 404 for
+  // stateful clients only. Stateless/ChatGPT is exempt (and already forced
+  // session=undefined above).
   if (!session && sessionId && !statelessClient) {
     res.status(404).json({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null });
     return;
@@ -2250,35 +2357,15 @@ async function handleMcpRequest(req: Request, res: Response): Promise<void> {
   const body = (req.body ?? {}) as Record<string, unknown>;
   const isNew = !session;
   const isInitialize = !Array.isArray(req.body) && body["method"] === "initialize";
-  // Stateless branch: (a) any request from an openai-mcp client — initialize
-  // INCLUDED, so the response never carries Mcp-Session-Id and there is no
-  // tracked session to leak — or (b) a sessionless non-initialize request
-  // (legacy stateless usage). The stateless path never registers a session.
+  // Stateless branch: (a) any request from an openai-mcp / ChatGPT-OAuth client
+  // — initialize INCLUDED, so the response never carries Mcp-Session-Id — or
+  // (b) a sessionless non-initialize request (legacy). Never registers a session.
   if (statelessClient || (isNew && !isInitialize)) {
-    const server = mcpServerForSession();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless: no session assignment
-      onsessionclosed: undefined,
-    });
-    try {
-      await server.connect(transport);
-      // The SDK stateless transport is one-request-only. Explicitly close both
-      // layers in finally; relying only on res.close leaves transport stream
-      // cleanup timing dependent on the HTTP adapter.
-      res.on("close", () => { void transport.close(); void server.close(); });
-      await transport.handleRequest(req, res, req.body);
-    } catch (e) {
-      console.error("[herdr-mcp] stateless request error:", e);
-      if (!res.headersSent) {
-        res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: String(e) }, id: null });
-      }
-    } finally {
-      await transport.close().catch(() => undefined);
-      await server.close().catch(() => undefined);
-    }
+    await handleStatelessMcpRequest(req, res);
     return;
   }
   if (isNew) {
+    normalizeProtocolVersionHeader(req);
     const server = mcpServerForSession();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
@@ -2299,6 +2386,7 @@ async function handleMcpRequest(req: Request, res: Response): Promise<void> {
 
   const transport = session!.transport;
   try {
+    normalizeProtocolVersionHeader(req);
     await transport.handleRequest(req, res, req.body);
     // Once the transport has assigned its session id (initialize), register it.
     if (isNew) {
@@ -2324,48 +2412,67 @@ function routes(app: Express): void {
   registerPushRoutes(app, clientGet);
 
   // Access log: diagnose Connector protocol failures without logging prompts/tokens.
-  // Emits a single line per MCP GET/POST/DELETE on res finish. Never logs the
+  // Emits start + finish lines per MCP GET/POST/DELETE. Never logs the
   // Authorization header, request body, prompt, or session contents. The
   // Mcp-Session-Id is emitted as "none" or a short SHA-256 fingerprint (never
   // the raw value); the response's own mcp-session-id is logged as present/none.
   app.use((req, res, next) => {
     const started = Date.now();
+    const startedIso = new Date(started).toISOString();
     const requestId = randomUUID().slice(0, 8);
-    // isStatelessClient reads req.body (already parsed by express.json above).
-    const stateless = isStatelessClient(req);
+    // isStatelessClient reads req.body (already parsed by express.json above)
+    // and optional OAuth client_id attached by mcpBearerAuth (set later for
+    // /mcp — first pass may be UA-only; finish line re-checks).
     const rawSid = req.get("mcp-session-id") ?? "";
-    const sid = rawSid
-      ? (stateless ? "stale(skip)" : `hash:${createHash("sha256").update(rawSid).digest("hex").slice(0, 12)}`)
-      : "none";
-    // Route classification for the trace.
-    let route = req.method === "GET"
-      ? (rawSid
-          ? (stateless ? "openai-probe(stale)" : (mcpSessions.has(rawSid) ? "sse-stream" : "unknown-session"))
-          : (stateless ? "openai-probe" : "unknown-session"))
-      : (stateless ? "stateless" : "stateful");
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const params = (body["params"] ?? {}) as Record<string, unknown>;
+    const method = !Array.isArray(req.body) && typeof body["method"] === "string" ? body["method"] : "-";
+    const tool = typeof params["name"] === "string" ? params["name"] : "-";
+    // For herdr_call only: log the native method name (not args) so ChatGPT
+    // "TaskGroup / omp died" reports can be correlated without body dumps.
+    const toolArgs = (params["arguments"] ?? {}) as Record<string, unknown>;
+    const callMethod =
+      tool === "herdr_call" && typeof toolArgs["method"] === "string"
+        ? String(toolArgs["method"]).slice(0, 64)
+        : "";
+    const toolExtra = callMethod ? ` call=${callMethod}` : "";
+    const uaRaw = (req.get("user-agent") ?? "-");
+    const uaFirst = uaRaw === "-" ? "-" : (uaRaw.split(/[\s;]/)[0] || "?");
+    const ua = `${uaFirst}(${uaRaw.length})`;
+    const protoIn = req.get("mcp-protocol-version") ?? "-";
+    console.log(
+      `[herdr-mcp] ${startedIso} rid=${requestId} START ${req.method} ${req.originalUrl}` +
+        ` method=${method} tool=${tool}${toolExtra} ua=${ua} proto=${protoIn}` +
+        ` sid=${rawSid ? "present" : "none"}`,
+    );
     res.on("finish", () => { emitTrace(); });
     res.on("close", () => { emitTrace(); });
     let logged = false;
     function emitTrace(): void {
       if (logged) return; // finish + close may both fire for the same request
       logged = true;
-      const body = (req.body ?? {}) as Record<string, unknown>;
-      const params = (body["params"] ?? {}) as Record<string, unknown>;
-      const method = !Array.isArray(req.body) && typeof body["method"] === "string" ? body["method"] : "-";
-      const tool = typeof params["name"] === "string" ? params["name"] : "-";
+      const stateless = isStatelessClient(req);
+      const sid = rawSid
+        ? (stateless ? "stale(skip)" : `hash:${createHash("sha256").update(rawSid).digest("hex").slice(0, 12)}`)
+        : "none";
+      let route = req.method === "GET"
+        ? (rawSid
+            ? (stateless ? "openai-probe(stale)" : (mcpSessions.has(rawSid) ? "sse-stream" : "unknown-session"))
+            : (stateless ? "openai-probe" : "unknown-session"))
+        : (stateless ? "stateless" : "stateful");
       const authz = req.get("authorization");
       const auth = authz ? (/^Bearer\s/i.test(authz) ? "bearer" : "other") : "none";
-      // UA truncated to first token + length, never the full string.
-      const uaRaw = (req.get("user-agent") ?? "-");
-      const uaFirst = uaRaw === "-" ? "-" : (uaRaw.split(/[\s;]/)[0] || "?");
-      const ua = `${uaFirst}(${uaRaw.length})`;
       const proto = req.get("mcp-protocol-version") ?? "-";
       const respSid = res.get("mcp-session-id") ? "present" : "none";
       const ct = res.get("content-type") ?? "-";
       const dur = Date.now() - started;
-      console.log(`[herdr-mcp] rid=${requestId} ${req.method} ${req.originalUrl} -> ${res.statusCode} ${dur}ms` +
-        ` method=${method} tool=${tool} ua=${ua} proto=${proto} sid=${sid} stateless=${stateless}` +
-        ` route=${route} auth=${auth} resp-sid=${respSid} ct=${ct}`);
+      const lookup = (!stateless && !!rawSid) ? (mcpSessions.has(rawSid) ? "hit" : "miss") : "skipped";
+      console.log(
+        `[herdr-mcp] ${new Date().toISOString()} rid=${requestId} ${req.method} ${req.originalUrl}` +
+          ` -> ${res.statusCode} ${dur}ms method=${method} tool=${tool}${toolExtra} ua=${ua} proto=${proto}` +
+          ` sid=${sid} stateless=${stateless} lookup=${lookup} route=${route}` +
+          ` auth=${auth} resp-sid=${respSid} ct=${ct}`,
+      );
     }
     next();
   });

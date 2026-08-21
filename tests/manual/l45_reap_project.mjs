@@ -7,7 +7,7 @@
  * (e.g. wH). Cleanup in `finally` closes only the dedicated test workspace.
  *
  * Usage:
- *   node tests/l45_reap_project.mjs <port> <token>
+ *   node tests/manual/l45_reap_project.mjs <port> <token>
  */
 import { execSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync, readFileSync, realpathSync } from "node:fs";

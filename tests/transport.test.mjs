@@ -551,7 +551,7 @@ test("openai-mcp UA: initialize returns NO Mcp-Session-Id on / and /mcp (statele
       assert.equal(init.res.headers.get("mcp-session-id"), null,
         `openai-mcp initialize on ${p} must NOT return Mcp-Session-Id — issuing one is what goes stale after restart`);
       assert.ok(init.msg.result?.serverInfo?.name, `initialize result missing serverInfo on ${p}`);
-      assert.equal(init.msg.result?.serverInfo?.version, "0.3.5", `initialize serverInfo.version on ${p} must be 0.3.5`);
+      assert.equal(init.msg.result?.serverInfo?.version, "0.3.9", `initialize serverInfo.version on ${p} must be 0.3.9`);
       assert.equal(typeof init.msg.result?.instructions, "string",
         `initialize must carry the instructions field on ${p}`);
     }
@@ -669,7 +669,7 @@ test("stateful client (non-openai UA): initialize still returns Mcp-Session-Id; 
   }
 });
 
-test("openai-mcp UA: server/discover returns 2026-07-28 so post-OAuth handshake continues", async () => {
+test("openai-mcp UA: server/discover advertises SDK wire first and keeps 2026-07-28", async () => {
   for (const p of ["/", "/mcp"]) {
     const r = await fetch(`${BASE}${p}`, {
       method: "POST",
@@ -687,11 +687,69 @@ test("openai-mcp UA: server/discover returns 2026-07-28 so post-OAuth handshake 
       msg.result.supportedVersions.includes("2026-07-28"),
       `openai-mcp discover on ${p} must advertise 2026-07-28`,
     );
+    assert.equal(
+      msg.result.supportedVersions[0],
+      "2025-11-25",
+      `openai-mcp discover on ${p} must prefer SDK wire version first`,
+    );
+  }
+});
+
+test("openai-mcp UA: initialize/tools.list stay SSE; tools/call uses JSON", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    const init = await fetch(`${BASE}/mcp`, {
+      method: "POST",
+      headers: headers({ "User-Agent": OPENAI_UA, Accept: "application/json, text/event-stream" }),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: openaiInit }),
+    });
+    assert.equal(init.status, 200);
+    assert.match(init.headers.get("content-type") ?? "", /text\/event-stream/i,
+      "initialize must stay SSE so ChatGPT continues to tools/list");
+    assert.equal(init.headers.get("mcp-session-id"), null);
+    const list = await fetch(`${BASE}/mcp`, {
+      method: "POST",
+      headers: headers({
+        "User-Agent": OPENAI_UA,
+        Accept: "application/json, text/event-stream",
+        "Mcp-Protocol-Version": "2025-11-25",
+      }),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+    });
+    assert.equal(list.status, 200);
+    assert.match(list.headers.get("content-type") ?? "", /text\/event-stream/i,
+      "tools/list must stay SSE for schema registration");
+    const listMsg = await parseRpc(list);
+    assert.equal(listMsg.result.tools.length, 11);
+    assert.ok(listMsg.result.tools.every((t) => t.inputSchema), "every tool needs inputSchema");
+    const call = await fetch(`${BASE}/mcp`, {
+      method: "POST",
+      headers: headers({
+        "User-Agent": OPENAI_UA,
+        Accept: "application/json, text/event-stream",
+        "Mcp-Protocol-Version": "2026-07-28",
+      }),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 9,
+        method: "tools/call",
+        params: { name: "herdr_methods", arguments: { query: "ping" } },
+      }),
+    });
+    assert.equal(call.status, 200);
+    assert.match(call.headers.get("content-type") ?? "", /application\/json/i,
+      "tools/call may use JSON for proxy-safe payloads");
+    const msg = await parseRpc(call);
+    assert.ok(msg.result?.content?.[0]?.text, "tools/call must return tool content");
+    assert.doesNotMatch(JSON.stringify(msg), /-32001|Session not found|Session terminated/);
+  } finally {
+    sessionId = savedSid;
   }
 });
 
 // Non-OpenAI discover advertises the serverInfo identity (version).
-test("server/discover (non-openai) result _meta serverInfo.version is 0.3.5", async () => {
+test("server/discover (non-openai) result _meta serverInfo.version is 0.3.9", async () => {
   for (const p of ["/", "/mcp"]) {
     const r = await fetch(`${BASE}${p}`, {
       method: "POST",
@@ -703,24 +761,24 @@ test("server/discover (non-openai) result _meta serverInfo.version is 0.3.5", as
     const si = msg.result?._meta?.["io.modelcontextprotocol/serverInfo"];
     assert.ok(si, `discover _meta serverInfo missing on ${p}`);
     assert.equal(si.name, "herdr-mcp", `discover serverInfo.name on ${p}`);
-    assert.equal(si.version, "0.3.5", `discover serverInfo.version on ${p} must be 0.3.5, got ${si.version}`);
+    assert.equal(si.version, "0.3.9", `discover serverInfo.version on ${p} must be 0.3.9, got ${si.version}`);
   }
 });
 
 // Cache-key regression: an OpenAI client that previously cached a 0.2.0
-// catalog MUST, upon seeing the new 0.3.5 identity (initialize serverInfo +
+// catalog MUST, upon seeing the new 0.3.9 identity (initialize serverInfo +
 // mcp.json + discover), re-run tools/list and obtain the current 11 tools.
-// We assert all identity surfaces agree on 0.3.5 and that a fresh tools/list
+// We assert all identity surfaces agree on 0.3.9 and that a fresh tools/list
 // returns exactly the 11 default tools (i.e. a re-fetch after a version bump
 // does NOT resurrect the old 22-tool surface).
-test("cache-key regression: 0.3.5 identity consistent, fresh tools/list = 11 (no stale 22)", async () => {
+test("cache-key regression: 0.3.9 identity consistent, fresh tools/list = 11 (no stale 22)", async () => {
   const savedSid = sessionId;
   sessionId = null;
   try {
     // initialize -> serverInfo.version
     for (const p of ["/", "/mcp"]) {
       const init = await rpc("initialize", openaiInit, { noSession: true, ua: OPENAI_UA, path: p });
-      assert.equal(init.msg.result?.serverInfo?.version, "0.3.5", `initialize ${p} version`);
+      assert.equal(init.msg.result?.serverInfo?.version, "0.3.9", `initialize ${p} version`);
       const list = await rpc("tools/list", {}, { noSession: true, ua: OPENAI_UA, path: p });
       const names = list.msg.result.tools.map((t) => t.name);
       assert.equal(names.length, 11, `fresh tools/list on ${p} must be 11 after version bump, got ${names.length}`);
@@ -731,7 +789,7 @@ test("cache-key regression: 0.3.5 identity consistent, fresh tools/list = 11 (no
     const card = await fetch(`${BASE}/.well-known/mcp.json`, { headers: { Authorization: `Bearer ${TOKEN}` } });
     assert.equal(card.status, 200);
     const cardJson = await card.json();
-    assert.equal(cardJson.version, "0.3.5", `mcp.json version must be 0.3.5, got ${cardJson.version}`);
+    assert.equal(cardJson.version, "0.3.9", `mcp.json version must be 0.3.9, got ${cardJson.version}`);
   } finally {
     sessionId = savedSid;
   }
@@ -950,6 +1008,29 @@ test("real SDK client: persistent GET SSE held open; inspect -> since both actua
 // PERSISTENT server stream the client does NOT hit EOF (so it never flips to
 // "terminated"), and that the second call still reaches the server. If the
 // server sent a short stream, this simulator's reader would EOF.
+
+test("openai-mcp tools/list schemas have no ChatGPT-hostile JSON Schema markers", async () => {
+  const savedSid = sessionId;
+  sessionId = null;
+  try {
+    await rpc("initialize", openaiInit, { noSession: true, ua: OPENAI_UA });
+    const list = await rpc("tools/list", {}, { noSession: true, ua: OPENAI_UA });
+    assert.equal(list.status, 200);
+    const tools = list.msg.result.tools;
+    assert.equal(tools.length, 11);
+    const blob = JSON.stringify(tools);
+    assert.doesNotMatch(blob, /"propertyNames"/, "propertyNames breaks ChatGPT tool registration");
+    assert.doesNotMatch(blob, /"additionalProperties"\s*:\s*\{/, "additionalProperties:{} breaks ChatGPT");
+    assert.doesNotMatch(blob, /"exclusiveMinimum"/, "exclusiveMinimum breaks ChatGPT");
+    const call = tools.find((x) => x.name === "herdr_call");
+    assert.ok(call);
+    assert.equal(call.inputSchema.properties.params.type, "string",
+      "herdr_call.params must advertise string (not z.record object)");
+  } finally {
+    sessionId = savedSid;
+  }
+});
+
 test("ChatGPT-like EOF simulator: persistent server stream stays open (no EOF), second call still out of band", async () => {
   const savedSid = sessionId;
   sessionId = null;

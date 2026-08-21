@@ -310,12 +310,14 @@ function protectedResourceMetadata(resource: string): Record<string, unknown> {
 // ---------------------------------------------------------------------------
 // Bearer auth for /mcp (static token + OAuth opaque tokens)
 // ---------------------------------------------------------------------------
-function accessTokenValid(token: string): boolean {
-  // Sync wrapper — real work is in accessTokenValidAsync; mcpBearerAuth awaits it.
-  return false;
-}
+/** Result of resolving a presented Bearer token (static or OAuth). */
+export type AccessTokenInfo = {
+  ok: boolean;
+  /** OAuth client_id / JWT sub when known (CIMD URLs include chatgpt.com). */
+  clientId?: string;
+};
 
-async function accessTokenValidAsync(token: string): Promise<boolean> {
+async function resolveAccessToken(token: string): Promise<AccessTokenInfo> {
   await jwtReady;
   // Preferred: JWT access token with aud=resource (OpenAI auth guide).
   if (token.includes(".") && jwtPublicKey) {
@@ -327,22 +329,50 @@ async function accessTokenValidAsync(token: string): Promise<boolean> {
       const audOk = Array.isArray(aud)
         ? aud.includes(oauthResourceUrl()) || aud.includes(oauthIssuer())
         : aud === oauthResourceUrl() || aud === oauthIssuer();
-      if (!audOk) return false;
-      if (typeof payload.exp === "number" && payload.exp <= Math.floor(Date.now() / 1000)) return false;
-      return true;
+      if (!audOk) return { ok: false };
+      if (typeof payload.exp === "number" && payload.exp <= Math.floor(Date.now() / 1000)) {
+        return { ok: false };
+      }
+      const clientId =
+        (typeof payload.client_id === "string" && payload.client_id) ||
+        (typeof payload.sub === "string" && payload.sub) ||
+        undefined;
+      return { ok: true, ...(clientId ? { clientId } : {}) };
     } catch {
       /* fall through to opaque legacy tokens */
     }
   }
   const h = hashToken(token);
   const entry = accessTokens.get(h);
-  if (!entry) return false;
+  if (!entry) return { ok: false };
   if (Math.floor(Date.now() / 1000) > entry.expires_at) {
     accessTokens.delete(h);
     void persist("tokens");
+    return { ok: false };
+  }
+  return { ok: true, clientId: entry.client_id };
+}
+
+/** True when an OAuth client_id belongs to ChatGPT CIMD (chatgpt.com). */
+export function isChatgptOAuthClientId(clientId: string | undefined): boolean {
+  if (!clientId) return false;
+  try {
+    if (!/^https:\/\//i.test(clientId)) return false;
+    const host = new URL(clientId).hostname.toLowerCase();
+    return host === "chatgpt.com" || host === "www.chatgpt.com";
+  } catch {
     return false;
   }
-  return true;
+}
+
+/** Attach OAuth client_id on the request for downstream ChatGPT detection. */
+export function getRequestOAuthClientId(req: Request): string | undefined {
+  const v = (req as Request & { herdrOAuthClientId?: string }).herdrOAuthClientId;
+  return typeof v === "string" ? v : undefined;
+}
+
+export function setRequestOAuthClientId(req: Request, clientId: string): void {
+  (req as Request & { herdrOAuthClientId?: string }).herdrOAuthClientId = clientId;
 }
 
 /**
@@ -368,17 +398,22 @@ export function mcpBearerAuth(req: Request, res: Response, next: NextFunction): 
     const m = /^Bearer\s+(.+)$/i.exec(auth);
     const presented = m ? m[1].trim() : "";
     const okStatic = presented !== "" && safeEqual(presented, AUTH_TOKEN);
-    const okOauth = presented !== "" && (await accessTokenValidAsync(presented));
-    if (!okStatic && !okOauth) {
+    const oauth = presented !== "" && !okStatic ? await resolveAccessToken(presented) : { ok: false };
+    if (!okStatic && !oauth.ok) {
       res.set(
         "WWW-Authenticate",
         `Bearer resource_metadata="${protectedResourceMetadataUrl()}", scope="${SCOPE}"`,
       );
+      // Do not use JSON-RPC -32600 here: ChatGPT Connector surfaces that code as
+      // "Session terminated". Auth failure is HTTP 401 + a distinct RPC code.
       res.status(401).json({
         jsonrpc: "2.0",
-        error: { code: -32600, message: "unauthorized" },
+        error: { code: -32000, message: "unauthorized" },
       });
       return;
+    }
+    if (oauth.ok && oauth.clientId) {
+      setRequestOAuthClientId(req, oauth.clientId);
     }
     next();
   })().catch((e) => {

@@ -8,7 +8,7 @@
  *    同 seq 不去重 / 重连 hello 补唤醒 / 过期剪枝 / 模板渲染
  * 4. speaks-json.js (vm 加载, 假 window): 嵌套括号 / 转义字符串的 tool-call 解析
  *
- * Usage: node tests/extension_smoke.mjs
+ * Usage: node tests/manual/extension_smoke.mjs
  */
 import { readFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -17,10 +17,10 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   decideWake, pruneExpired, bindingRevision, buildWakeTemplate,
-} from "../extension/binding-core.js";
+} from "../../extension/binding-core.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const EXT = path.join(__dirname, "..", "extension");
+const EXT = path.join(__dirname, "..", "..", "extension");
 let failures = 0;
 function ok(cond, label, detail = "") {
   if (cond) console.log(`  ✅ ${label}`);

@@ -4,7 +4,7 @@
  * 验证 popup 触发 h2w_bind 的完整链路 (绑定创建/推送流/消息路由)。
  * 不依赖真实 Chrome; 答案在"点击绑定"是否在逻辑层可用。
  *
- * Usage: node tests/background_bind_test.mjs
+ * Usage: node tests/manual/background_bind_test.mjs
  */
 import { pathToFileURL } from "node:url";
 import * as path from "node:path";
@@ -78,7 +78,7 @@ function installContentScript(tabId, url, convKey) {
 }
 
 // ---- 加载 background.js ----
-await import(pathToFileURL(path.join(__dirname, "..", "extension", "background.js")).href);
+await import(pathToFileURL(path.join(__dirname, "..", "..", "extension", "background.js")).href);
 const onMsg = listeners.onMessage[0];
 ok(!!onMsg, "background onMessage 监听器已注册");
 

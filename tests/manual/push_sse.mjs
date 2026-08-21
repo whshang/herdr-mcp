@@ -11,8 +11,8 @@
  *    fires; then closes the workspace.
  *
  * Usage:
- *   node tests/push_sse.mjs            # plumbing only (no herdr agent)
- *   node tests/push_sse.mjs --integration
+ *   node tests/manual/push_sse.mjs            # plumbing only (no herdr agent)
+ *   node tests/manual/push_sse.mjs --integration
  */
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -36,7 +36,7 @@ function ok(cond, label, detail = "") {
 }
 
 async function startServer() {
-  server = spawn("node", [path.join(__dirname, "..", "dist", "server.js")], {
+  server = spawn("node", [path.join(__dirname, "..", "..", "dist", "server.js")], {
     env: { ...process.env, HERDR_MCP_PORT: String(PORT), HERDR_MCP_TOKEN: TOKEN },
     stdio: ["ignore", "pipe", "pipe"],
   });

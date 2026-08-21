@@ -40,7 +40,8 @@ get_public_url() {
   if [[ -n "$base" ]]; then
     echo "${base%/}/mcp"
   else
-    echo "https://xxxx.trycloudflare.com/mcp"
+    # No hardcoded personal domain — README recommends free *.trycloudflare.com
+    echo ""
   fi
 }
 
@@ -71,6 +72,10 @@ check_public() {
   local token pub_url code
   token=$(get_token)
   pub_url=$(get_public_url)
+  if [[ -z "$pub_url" ]]; then
+    echo "unset"
+    return 0
+  fi
   code=$(curl -s -o /dev/null -w "%{http_code}" -m 5 \
     -X POST "$pub_url" \
     -H "Authorization: Bearer $token" \
@@ -125,7 +130,9 @@ sys.exit(0 if found else 1)
   local pcode pub_url
   pcode=$(check_public)
   pub_url=$(get_public_url)
-  if [[ "$pcode" == "200" ]]; then
+  if [[ "$pcode" == "unset" ]]; then
+    warn "公网 MCP: ${Y}未配置 HERDR_MCP_BASE_URL${N} (推荐: cloudflared Quick Tunnel → *.trycloudflare.com)"
+  elif [[ "$pcode" == "200" ]]; then
     log "公网 MCP: ${G}可达${N} ($pub_url)"
   elif [[ "$pcode" == "000" ]]; then
     warn "公网 MCP: ${Y}不可达${N} (cloudflared 未跑? DNS 问题?)"
@@ -146,20 +153,28 @@ sys.exit(0 if found else 1)
 }
 
 cmd_connector() {
-  local token base
+  local token base pub
   token=$(get_token)
   base=$(get_base_url); base="${base%/}"
-  [[ -n "$base" ]] || base="https://xxxx.trycloudflare.com"
+  pub=$(get_public_url)
   echo ""
   echo -e "${B}${C}═══════════════════════════════════════════════════════════${N}"
   echo -e "${B}${C}  herdr-mcp 接入信息${N}"
   echo -e "${B}${C}═══════════════════════════════════════════════════════════${N}"
   echo ""
-  echo "  ChatGPT : $base/mcp              (OAuth, 不填 API key)"
-  echo "  Claude  : $base/mcp              (OAuth, DCR 自动注册)"
-  echo "  Token   : $token          (仅本地 curl 测试用)"
+  if [[ -n "$pub" ]]; then
+    echo "  ChatGPT : $pub              (OAuth, 不填 API key)"
+    echo "  Claude  : $pub              (OAuth, DCR 自动注册)"
+  else
+    echo "  Public  : (未配置 HERDR_MCP_BASE_URL)"
+    echo "  推荐    : cloudflared tunnel --url http://127.0.0.1:8772"
+    echo "            → https://xxxx.trycloudflare.com"
+    echo "            写入 HERDR_MCP_BASE_URL 后 restart；MCP 填 …/mcp"
+  fi
+  echo "  Local   : $LOCAL_URL"
+  echo "  Token   : $token          (仅本地 curl / Cursor 用)"
   echo ""
-  echo "  配置步骤见 README.md / README.zh.md。"
+  echo "  配置步骤见 README.md / README.zh.md（默认免费 Cloudflare Quick Tunnel）。"
   echo ""
 }
 
@@ -234,6 +249,10 @@ cmd_token() {
 cmd_url() {
   local pub_url
   pub_url=$(get_public_url)
+  if [[ -z "$pub_url" ]]; then
+    err "未配置 HERDR_MCP_BASE_URL — 见 README（cloudflared tunnel --url http://127.0.0.1:8772）"
+    return 1
+  fi
   echo -n "$pub_url" | pbcopy 2>/dev/null && echo "(已复制到剪贴板)" || true
   echo "URL: $pub_url"
 }
