@@ -125,3 +125,7 @@ Connector 只解决「ChatGPT → herdr」。若工具很快返回「已提交�
 闭环要靠浏览器扩展：绑定该 chatgpt 会话 ↔ 干活的 pane，agent **settled**（以及将来的进度 tick）时往输入框塞继续提示并提交。见 [extension-wake.md](./extension-wake.md)。
 
 未绑定扩展时，这不是 MCP 故障，是缺回推环。
+
+## 验收（真 ChatGPT）
+
+不要只靠 curl。连续两轮对话，且没有：Session terminated、session 400/404、`network_error`、`invalid_mcp_response`。每次重连后开新对话。派活长任务时：扩展已绑定该对话 ↔ 干活 pane，settled 后网页应自动出现继续提示。
