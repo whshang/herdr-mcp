@@ -193,8 +193,38 @@ async function testDiscovery() {
   const card = await getJson(`${BASE}/.well-known/mcp.json`);
   ok(card.status === 200 && card.json.serverUrl === RESOURCE,
     "mcp.json 200 with absolute serverUrl === /mcp", `got ${card.json.serverUrl}`);
-  ok(card.json.version === "0.3.2",
-    "mcp.json version must be 0.3.2 (cache invalidation identity)", `got ${card.json.version}`);
+  ok(card.json.version === "0.3.3",
+    "mcp.json version must be 0.3.3 (cache invalidation identity)", `got ${card.json.version}`);
+
+  // Path-aware AS + CORS (ChatGPT browser discovery) + CIMD flag + /mcp/register
+  const asMcp = await getJson(`${BASE}/.well-known/oauth-authorization-server/mcp`);
+  ok(asMcp.status === 200, "AS metadata /mcp path-aware 200", `status=${asMcp.status}`);
+  ok(asMcp.json.client_id_metadata_document_supported === true,
+    "AS advertises client_id_metadata_document_supported (CIMD)", JSON.stringify(asMcp.json.client_id_metadata_document_supported));
+  const cors = await fetch(`${BASE}/.well-known/oauth-authorization-server`, {
+    headers: { Origin: "https://chatgpt.com", Accept: "application/json" },
+  });
+  ok(cors.headers.get("access-control-allow-origin") === "*",
+    "AS metadata CORS Allow-Origin *", `got ${cors.headers.get("access-control-allow-origin")}`);
+  const opt = await fetch(`${BASE}/mcp`, {
+    method: "OPTIONS",
+    headers: {
+      Origin: "https://chatgpt.com",
+      "Access-Control-Request-Method": "POST",
+      "Access-Control-Request-Headers": "authorization,content-type",
+    },
+  });
+  ok(opt.status === 204 || opt.status === 200, "OPTIONS /mcp not 401", `status=${opt.status}`);
+  ok(opt.headers.get("access-control-allow-origin") === "*",
+    "OPTIONS /mcp CORS", `got ${opt.headers.get("access-control-allow-origin")}`);
+  const mcpReg = await postJson(`${BASE}/mcp/register`, {
+    client_name: "path-dcr",
+    redirect_uris: ["https://chatgpt.com/connector/oauth/callback"],
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+  });
+  ok(mcpReg.status === 201, "POST /mcp/register → 201", `status=${mcpReg.status}`);
 
   console.log("\n1b) Path-aware AS discovery (ChatGPT /mcp server URL, RFC 8414 §4)");
   const pathAware = [
@@ -249,10 +279,9 @@ async function testDcrRoutes() {
   const fallbackSlash = await postJson(`${BASE}/register/`, payload);
   ok(fallbackSlash.status === 201, "POST /register/ → 201", `status=${fallbackSlash.status}`);
   ok(typeof fallbackSlash.json.client_id === "string", "/register/ returns client_id");
-  // reverse: /mcp/oauth/register must NOT be a DCR route (no unbounded alias)
-  const mcpReg = await postJson(`${BASE}/mcp/oauth/register`, payload);
-  ok(mcpReg.status === 401 || mcpReg.status === 404,
-    "POST /mcp/oauth/register → 401/404 (not a DCR route)", `status=${mcpReg.status}`);
+  // ChatGPT may resolve DCR relative to the /mcp connector URL.
+  const mcpOauthReg = await postJson(`${BASE}/mcp/oauth/register`, payload);
+  ok(mcpOauthReg.status === 201, "POST /mcp/oauth/register → 201", `status=${mcpOauthReg.status}`);
   // /.well-known/oauth-registration is not a route either
   const wkReg = await postJson(`${BASE}/.well-known/oauth-registration`, payload);
   ok(wkReg.status === 401 || wkReg.status === 404,

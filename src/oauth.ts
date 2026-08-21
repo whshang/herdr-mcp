@@ -248,6 +248,9 @@ export function oauthMetadata(): Record<string, unknown> {
     token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
     code_challenge_methods_supported: ["S256"],
     authorization_response_iss_parameter_supported: true, // RFC 9207 §4.2
+    // OpenAI ChatGPT prefers CIMD when advertised
+    // (https://developers.openai.com/plugins/build/auth.md).
+    client_id_metadata_document_supported: true,
     protected_resources: [oauthResourceUrl()], // RFC 9728 §4
   };
 }
@@ -286,6 +289,12 @@ function accessTokenValid(token: string): boolean {
  * OAuth from the 401 alone.
  */
 export function mcpBearerAuth(req: Request, res: Response, next: NextFunction): void {
+  // Browser OAuth discovery (ChatGPT connector UI) sends CORS preflight to /mcp.
+  // Never challenge OPTIONS — CORS middleware already answered or will fall through.
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
   if (!AUTH_TOKEN) {
     next();
     return;
@@ -307,6 +316,77 @@ export function mcpBearerAuth(req: Request, res: Response, next: NextFunction): 
     return;
   }
   next();
+}
+
+/** CORS for ChatGPT / Claude browser-side OAuth discovery and DCR. */
+export function oauthCors(req: Request, res: Response, next: NextFunction): void {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET,HEAD,POST,OPTIONS");
+  res.set(
+    "Access-Control-Allow-Headers",
+    "Authorization, Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version",
+  );
+  res.set("Access-Control-Expose-Headers", "WWW-Authenticate, Mcp-Session-Id");
+  res.set("Access-Control-Max-Age", "86400");
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+  next();
+}
+
+/** ChatGPT CIMD redirect allowlist (OpenAI connector / platform callbacks). */
+function isChatgptRedirectUri(uri: string): boolean {
+  try {
+    const u = new URL(uri);
+    if (u.protocol !== "https:") return false;
+    const host = u.hostname.toLowerCase();
+    if (host !== "chatgpt.com" && host !== "www.chatgpt.com") return false;
+    return (
+      u.pathname === "/connector_platform_oauth_redirect" ||
+      u.pathname.startsWith("/connector/oauth") ||
+      u.pathname.startsWith("/oauth/")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isCimdClientId(clientId: string): boolean {
+  return /^https:\/\//i.test(clientId);
+}
+
+/**
+ * Resolve a DCR-registered client, or a ChatGPT CIMD client_id (HTTPS URL).
+ * See https://developers.openai.com/plugins/build/auth.md — ChatGPT prefers CIMD
+ * when client_id_metadata_document_supported is true.
+ */
+function resolveClient(clientId: string): StoredClient | undefined {
+  const existing = clients.get(clientId);
+  if (existing) return existing;
+  if (!isCimdClientId(clientId)) return undefined;
+  let host = "";
+  try {
+    host = new URL(clientId).hostname.toLowerCase();
+  } catch {
+    return undefined;
+  }
+  if (host !== "chatgpt.com" && host !== "www.chatgpt.com") return undefined;
+  return {
+    client_secret_hash: "",
+    redirect_uris: [], // validated via isChatgptRedirectUri
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code", "refresh_token"],
+    scope: SCOPE,
+    client_name: "ChatGPT CIMD",
+    issued_at: Math.floor(Date.now() / 1000),
+  };
+}
+
+function redirectUriAllowed(client: StoredClient, redirectUri: string): boolean {
+  if (client.redirect_uris.includes(redirectUri)) return true;
+  if (client.redirect_uris.length === 0 && isChatgptRedirectUri(redirectUri)) return true;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -414,13 +494,13 @@ function handleAuthorize(req: Request, res: Response): void {
     typeof q["code_challenge_method"] === "string" ? q["code_challenge_method"] : "S256";
   const scope = typeof q["scope"] === "string" ? q["scope"] : "";
 
-  const client = clients.get(clientId);
+  const client = resolveClient(clientId);
   if (!client) {
     // RFC 6749 §4.1.2.1: unknown client / unverifiable redirect_uri → no redirect.
     res.status(400).json({ error: "invalid_request", error_description: "unknown client_id" });
     return;
   }
-  if (!redirectUri || !client.redirect_uris.includes(redirectUri)) {
+  if (!redirectUri || !redirectUriAllowed(client, redirectUri)) {
     res.status(400).json({
       error: "invalid_request",
       error_description: "redirect_uri is not registered for this client",
@@ -500,11 +580,11 @@ async function handleToken(req: Request, res: Response): Promise<void> {
     tokenError(res, "invalid_target", `resource must be ${oauthIssuer()} or ${oauthResourceUrl()}`);
     return;
   }
-  if (!clientId || !clients.has(clientId)) {
+  const client = clientId ? resolveClient(clientId) : undefined;
+  if (!clientId || !client) {
     tokenError(res, "invalid_client", "unknown client_id");
     return;
   }
-  const client = clients.get(clientId)!;
   if (!authenticateClient(client, presentedSecret)) {
     tokenError(res, "invalid_client", "client authentication failed");
     return;
@@ -649,6 +729,17 @@ export function registerOAuthRoutes(app: Express): void {
     void handleRegister(req, res);
   });
   router.post("/register/", (req, res) => {
+    void handleRegister(req, res);
+  });
+  // When the connector URL is `…/mcp`, some OpenAI clients resolve DCR
+  // relative to that path → POST /mcp/register (historically 401 via MCP auth).
+  router.post("/mcp/register", (req, res) => {
+    void handleRegister(req, res);
+  });
+  router.post("/mcp/register/", (req, res) => {
+    void handleRegister(req, res);
+  });
+  router.post("/mcp/oauth/register", (req, res) => {
     void handleRegister(req, res);
   });
   router.get("/oauth/authorize", handleAuthorize);

@@ -27,7 +27,7 @@ import { validateMethodParams, listMethods } from "./schema.js";
 import { get as sessionGet, save as sessionSave, type SessionData, type SessionProject } from "./session.js";
 import { waitForAgent } from "./wait.js";
 import { registerPushRoutes } from "./push.js";
-import { registerOAuthRoutes, mcpBearerAuth } from "./oauth.js";
+import { registerOAuthRoutes, mcpBearerAuth, oauthCors } from "./oauth.js";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 
 // ---------------------------------------------------------------------------
@@ -2320,6 +2320,8 @@ function routes(app: Express): void {
   // --- MCP endpoint (Streamable HTTP) with Bearer auth ---
   app.use(express.json({ limit: "10mb" }));
   app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+  // ChatGPT connector UI discovers OAuth from the browser — needs CORS + OPTIONS.
+  app.use(oauthCors);
 
   // --- Browser-extension push channel (herdr → 网页唤醒) ---
   // GET /push/events (SSE) + GET /push/state, same Bearer token as /mcp.
