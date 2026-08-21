@@ -9,7 +9,7 @@
 //   其它站点仍在唤醒窗口期内观察 (站点常在唤醒后弹权限)。
 // 状态反馈: 页内不再画点 (用户反馈困惑), 改用工具栏图标徽章 (background 驱动)。
 // 版本: 与 background.js 的 H2W_SCRIPT_VERSION 同步 bump (改 content 代码必须)。
-const H2W_CONTENT_VERSION = "0.1.3";
+const H2W_CONTENT_VERSION = "0.1.4";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] 无适配器, 跳过"); return; }
