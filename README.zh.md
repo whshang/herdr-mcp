@@ -99,19 +99,24 @@ herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法
 
 ## 浏览器插件
 
-目录 `extension/`（MV3）。在 `chrome://extensions` 加载「未打包的扩展」。
+目录 `extension/`（MV3）。`chrome://extensions` 加载未打包扩展。
 
-**只做唤醒**：herdr agent 结束后经 `/push/events` 往绑定的网页对话写消息。站点：z.ai、deepseek、claude.ai、chatgpt.com。
+**两条对等主线**（见 [docs/extension.md](docs/extension.md)）：
 
-这 **不是** ChatGPT MCP 连接器。插件不会让 z.ai / DeepSeek 拥有那 11 个 MCP 工具。说明见 [docs/extension-wake.md](docs/extension-wake.md)。
+1. **进度回推**：herdr working/settled → 往绑定网页写提醒并提交（chatgpt / deepseek / z.ai / claude）
+2. **JSON→MCP**：DeepSeek / z.ai 无 connector 时，助手 JSON → 本机 `/mcp`（路线见 [docs/extension-bridge.md](docs/extension-bridge.md)）
+
+共享本地 `127.0.0.1:8772` 与静态 token。这不是给 DeepSeek「安装」ChatGPT 式 OAuth connector。
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
+| [docs/extension.md](docs/extension.md) | 扩展双主线总览（中文） |
 | [docs/architecture.md](docs/architecture.md) | herdr 与 MCP 分层 |
 | [docs/chatgpt-connector.md](docs/chatgpt-connector.md) | ChatGPT OAuth / 传输 / schema |
-| [docs/extension-wake.md](docs/extension-wake.md) | 浏览器唤醒插件 |
+| [docs/extension-wake.md](docs/extension-wake.md) | 主线 A：进度回推 |
+| [docs/extension-bridge.md](docs/extension-bridge.md) | 主线 B：JSON→MCP |
 | [tests/README.md](tests/README.md) | 默认测试 vs 手工脚本 |
 
 过程笔记在 `docs/_wip/`（gitignore，不入库）。
