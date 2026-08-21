@@ -75,11 +75,9 @@ herdr-mcp url          # 复制公网 URL 到剪贴板
 ## 各平台接入
 
 ### ChatGPT Connector（实测有效）
-Settings → Connectors → Add new connector → 填 **ROOT URL（不带 /mcp）**：
-`https://xxxx.trycloudflare.com` — 认证走 OAuth 自动注册（DCR），**不要填 API key**。
-服务器实现 RFC 8414/9728/7591/7636/9207 的 OAuth 2.1 发现 + DCR + PKCE 流程（`/.well-known/oauth-authorization-server`、`/.well-known/openid-configuration`（RFC 8414 §5 OAuth 兼容文档，不声明 OIDC）、`/.well-known/oauth-protected-resource[/mcp]`；401 带 `WWW-Authenticate: Bearer resource_metadata=…`）。
-
-> 注意: `/mcp` 路径形式在早期失败后已被 ChatGPT 负缓存——**同 URL 反复失败时换 root 形式重建**。
+Settings → Connectors → Add new connector → 填 **MCP URL**：
+`https://xxxx.trycloudflare.com/mcp` — 认证走 OAuth 自动注册（DCR），**不要填 API key**。
+服务器实现 RFC 8414/9728/7591/7636/9207 的 OAuth 2.1 发现 + DCR + PKCE 流程（`/.well-known/oauth-authorization-server`、`/.well-known/openid-configuration`（RFC 8414 §5 OAuth 兼容文档，不声明 OIDC）、`/.well-known/oauth-protected-resource/mcp`；401 带 `WWW-Authenticate: Bearer resource_metadata=…`）。DCR 注册端点同时接受 `/oauth/register` 与 `/register`（ChatGPT 兼容 fallback）。
 
 ### Claude Connector
 Settings → Connectors → Add → 认证选 OAuth → **Client ID / Secret 留空**（走 DCR 自动注册）→ 授权页自动完成

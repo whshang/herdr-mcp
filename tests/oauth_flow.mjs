@@ -33,7 +33,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 8801;
 const TOKEN = "test-token";
 const BASE = `http://127.0.0.1:${PORT}`;
-const RESOURCE = BASE; // canonical resource = issuer base (ChatGPT/ctmc convention)
+const RESOURCE = `${BASE}/mcp`; // canonical protected resource = issuer + /mcp (RFC 9728)
 const OAUTH_DIR = mkdtempSync(path.join(os.tmpdir(), "herdr-mcp-oauth-test-"));
 
 let failures = 0;
@@ -187,12 +187,12 @@ async function testDiscovery() {
 
   const prMcp = await getJson(`${BASE}/.well-known/oauth-protected-resource/mcp`);
   ok(prMcp.status === 200 && prMcp.json.resource === RESOURCE,
-    "oauth-protected-resource/mcp 200, resource === canonical base", `got ${prMcp.json.resource}`);
+    "oauth-protected-resource/mcp 200, resource === canonical /mcp", `got ${prMcp.json.resource}`);
   ok(prMcp.json.authorization_servers?.[0] === BASE, "path-aware authorization_servers[0] === base");
 
   const card = await getJson(`${BASE}/.well-known/mcp.json`);
   ok(card.status === 200 && card.json.serverUrl === RESOURCE,
-    "mcp.json 200 with absolute serverUrl", `got ${card.json.serverUrl}`);
+    "mcp.json 200 with absolute serverUrl === /mcp", `got ${card.json.serverUrl}`);
   ok(card.json.version === "0.3.0",
     "mcp.json version must be 0.3.0 (cache invalidation identity)", `got ${card.json.version}`);
 }
@@ -203,8 +203,42 @@ async function test401Challenge() {
   ok(r.status === 401, "unauthenticated /mcp → 401", `status=${r.status}`);
   const wa = r.headers.get("www-authenticate") ?? "";
   ok(wa.includes("Bearer"), "WWW-Authenticate Bearer scheme", wa);
-  ok(wa.includes(`resource_metadata="${BASE}/.well-known/oauth-protected-resource"`),
-    "WWW-Authenticate resource_metadata points at protected-resource (root)", wa);
+  ok(wa.includes(`resource_metadata="${BASE}/.well-known/oauth-protected-resource/mcp"`),
+    "WWW-Authenticate resource_metadata points at path-aware protected-resource (/mcp)", wa);
+}
+
+async function testDcrRoutes() {
+  console.log("\n2b) DCR register routes: canonical + trailing slash + ChatGPT /register fallback");
+  const payload = {
+    redirect_uris: [`${BASE}/callback`],
+    client_name: "dcr-route-test",
+    grant_types: ["authorization_code", "refresh_token"],
+    token_endpoint_auth_method: "none",
+  };
+  // canonical
+  const canonical = await postJson(`${BASE}/oauth/register`, payload);
+  ok(canonical.status === 201, "POST /oauth/register → 201", `status=${canonical.status}`);
+  ok(typeof canonical.json.client_id === "string", "canonical returns client_id");
+  // trailing slash
+  const trailing = await postJson(`${BASE}/oauth/register/`, payload);
+  ok(trailing.status === 201, "POST /oauth/register/ → 201", `status=${trailing.status}`);
+  ok(typeof trailing.json.client_id === "string", "trailing-slash returns client_id");
+  // ChatGPT fallback /register
+  const fallback = await postJson(`${BASE}/register`, payload);
+  ok(fallback.status === 201, "POST /register → 201 (ChatGPT DCR fallback)", `status=${fallback.status}`);
+  ok(typeof fallback.json.client_id === "string", "/register returns client_id");
+  // fallback trailing slash
+  const fallbackSlash = await postJson(`${BASE}/register/`, payload);
+  ok(fallbackSlash.status === 201, "POST /register/ → 201", `status=${fallbackSlash.status}`);
+  ok(typeof fallbackSlash.json.client_id === "string", "/register/ returns client_id");
+  // reverse: /mcp/oauth/register must NOT be a DCR route (no unbounded alias)
+  const mcpReg = await postJson(`${BASE}/mcp/oauth/register`, payload);
+  ok(mcpReg.status === 401 || mcpReg.status === 404,
+    "POST /mcp/oauth/register → 401/404 (not a DCR route)", `status=${mcpReg.status}`);
+  // /.well-known/oauth-registration is not a route either
+  const wkReg = await postJson(`${BASE}/.well-known/oauth-registration`, payload);
+  ok(wkReg.status === 401 || wkReg.status === 404,
+    "POST /.well-known/oauth-registration → 401/404 (not a route)", `status=${wkReg.status}`);
 }
 
 async function fullDcrPkceFlow() {
@@ -403,6 +437,7 @@ async function main() {
 
     await testDiscovery();
     await test401Challenge();
+    await testDcrRoutes();
     const { clientId, accessToken, refreshToken } = await fullDcrPkceFlow();
     await testWrongVerifier(clientId);
     await testCodeReuse(clientId);

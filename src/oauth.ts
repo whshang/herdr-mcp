@@ -62,18 +62,20 @@ export function oauthIssuer(): string {
 }
 
 /**
- * Canonical protected resource identifier. ChatGPT supplies the issuer base
- * (not `/mcp`) in its authorization request even when the configured server
- * URL ends in `/mcp`; ctmc uses the same normalization. Treat both inputs as
- * this base resource so token audience, 401 challenge, and authorization
- * request stay identical.
+ * Canonical protected resource identifier. The MCP endpoint is served at
+ * `<issuer>/mcp` (the configured server URL), so per RFC 9728 the protected
+ * resource is `<issuer>/mcp`, not the bare issuer. ChatGPT/ctmc may still
+ * supply the issuer base in an authorization request; normalizeResource maps
+ * both the issuer and `<issuer>/mcp` to this canonical resource so the token
+ * audience, 401 challenge, and authorization request stay consistent.
  */
 export function oauthResourceUrl(): string {
-  return oauthIssuer();
+  return `${oauthIssuer()}/mcp`;
 }
 
+/** RFC 9728 §5.1: path-aware protected-resource metadata for the /mcp resource. */
 function protectedResourceMetadataUrl(): string {
-  return `${oauthIssuer()}/.well-known/oauth-protected-resource`;
+  return `${oauthIssuer()}/.well-known/oauth-protected-resource/mcp`;
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +616,17 @@ export function registerOAuthRoutes(app: Express): void {
   });
 
   router.post("/oauth/register", (req, res) => {
+    void handleRegister(req, res);
+  });
+  // ChatGPT DCR fallback: some clients POST to `/register` (no `/oauth`
+  // prefix) instead of the advertised `/oauth/register`. Serve the same
+  // handler on both the canonical and trailing-slash forms. These are OAuth
+  // routes registered BEFORE the MCP bearer-auth middleware, so they are not
+  // 401'd by mcpBearerAuth.
+  router.post("/register", (req, res) => {
+    void handleRegister(req, res);
+  });
+  router.post("/register/", (req, res) => {
     void handleRegister(req, res);
   });
   router.get("/oauth/authorize", handleAuthorize);
