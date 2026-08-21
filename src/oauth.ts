@@ -17,27 +17,40 @@
  *  - RFC 9207 `iss` returned on the authorize callback (and error redirects).
  *  - 401 /mcp challenges carry `WWW-Authenticate: Bearer resource_metadata=…`
  *    (RFC 9728 §5.1) so clients discover OAuth from the resource server.
- *  - Dynamic client registry (RFC 7591) + opaque access/refresh tokens
- *    persisted atomically (tmp + rename, mode 0600) under
- *    ~/.config/herdr-mcp/oauth (override HERDR_MCP_OAUTH_DIR) — restart-safe.
+ *  - Dynamic client registry (RFC 7591) + JWT access tokens (aud=resource) and
+ *    opaque rotating refresh tokens, persisted under ~/.config/herdr-mcp/oauth
+ *    (override HERDR_MCP_OAUTH_DIR) — restart-safe. JWT access tokens follow
+ *    OpenAI's guidance to embed the resource as `aud`
+ *    (https://developers.openai.com/plugins/build/auth.md).
  *  - Authorization codes are one-use and bound to client_id / redirect_uri /
  *    resource; PKCE S256 code_verifier is required and verified.
  *  - Refresh tokens rotate: each refresh mints a new access+refresh token and
  *    the previous refresh token is rejected on reuse.
  *  - `resource` is normalized (missing / base URL / base+"/mcp" all map to the
  *    canonical protected resource) and cross-checked at the token endpoint.
+ *  - CIMD: `client_id_metadata_document_supported` + ChatGPT HTTPS client_ids;
+ *    token endpoint accepts `none` and verifies `private_key_jwt` against the
+ *    CIMD JWKS when a client_assertion is presented.
  *
  * Claude compatibility is retained: HERDR_MCP_TOKEN still validates as a
  * static Bearer credential on /mcp, and the DCR + PKCE + refresh flow is
  * exactly what Claude's connector already performs.
  */
-import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { randomBytes, createHash, timingSafeEqual, generateKeyPairSync } from "node:crypto";
+import { readFileSync, existsSync } from "node:fs";
 import { writeFile, mkdir, chmod, rename } from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 import { Router, Request, Response, NextFunction } from "express";
 import type { Express } from "express";
+import {
+  SignJWT,
+  jwtVerify,
+  importPKCS8,
+  importSPKI,
+  createRemoteJWKSet,
+  type CryptoKey,
+} from "jose";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 
 // ---------------------------------------------------------------------------
@@ -55,6 +68,34 @@ const ACCESS_TOKEN_TTL_S = Number(process.env.HERDR_MCP_OAUTH_ACCESS_TTL_S ?? "8
 const REFRESH_TOKEN_TTL_S = Number(process.env.HERDR_MCP_OAUTH_REFRESH_TTL_S ?? "2592000"); // 30 days
 const CODE_TTL_MS = 5 * 60_000;
 const PKCE_VERIFIER_RE = /^[A-Za-z0-9\-._~]{43,128}$/;
+
+// RS256 keypair for access-token JWTs (aud=resource). Generated once under OAUTH_DIR.
+let jwtPrivateKey: CryptoKey | null = null;
+let jwtPublicKey: CryptoKey | null = null;
+const jwtReady: Promise<void> = (async () => {
+  await mkdir(OAUTH_DIR, { recursive: true });
+  const privPath = path.join(OAUTH_DIR, "jwt-private.pem");
+  const pubPath = path.join(OAUTH_DIR, "jwt-public.pem");
+  try {
+    if (existsSync(privPath) && existsSync(pubPath)) {
+      jwtPrivateKey = await importPKCS8(readFileSync(privPath, "utf8"), "RS256");
+      jwtPublicKey = await importSPKI(readFileSync(pubPath, "utf8"), "RS256");
+      return;
+    }
+  } catch (e) {
+    console.error("[herdr-mcp] oauth jwt key load failed, regenerating:", e);
+  }
+  const { privateKey, publicKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  await writeFile(privPath, privateKey, { mode: 0o600 });
+  await writeFile(pubPath, publicKey, { mode: 0o644 });
+  try { await chmod(privPath, 0o600); } catch { /* best-effort */ }
+  jwtPrivateKey = await importPKCS8(privateKey, "RS256");
+  jwtPublicKey = await importSPKI(publicKey, "RS256");
+})();
 
 /** The OAuth issuer identifier (RFC 8414) — the base URL of this server. */
 export function oauthIssuer(): string {
@@ -245,7 +286,7 @@ export function oauthMetadata(): Record<string, unknown> {
     scopes_supported: [SCOPE],
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
-    token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
+    token_endpoint_auth_methods_supported: ["none", "private_key_jwt", "client_secret_post"],
     code_challenge_methods_supported: ["S256"],
     authorization_response_iss_parameter_supported: true, // RFC 9207 §4.2
     // OpenAI ChatGPT prefers CIMD when advertised
@@ -270,6 +311,29 @@ function protectedResourceMetadata(resource: string): Record<string, unknown> {
 // Bearer auth for /mcp (static token + OAuth opaque tokens)
 // ---------------------------------------------------------------------------
 function accessTokenValid(token: string): boolean {
+  // Sync wrapper — real work is in accessTokenValidAsync; mcpBearerAuth awaits it.
+  return false;
+}
+
+async function accessTokenValidAsync(token: string): Promise<boolean> {
+  await jwtReady;
+  // Preferred: JWT access token with aud=resource (OpenAI auth guide).
+  if (token.includes(".") && jwtPublicKey) {
+    try {
+      const { payload } = await jwtVerify(token, jwtPublicKey, {
+        issuer: oauthIssuer(),
+      });
+      const aud = payload.aud;
+      const audOk = Array.isArray(aud)
+        ? aud.includes(oauthResourceUrl()) || aud.includes(oauthIssuer())
+        : aud === oauthResourceUrl() || aud === oauthIssuer();
+      if (!audOk) return false;
+      if (typeof payload.exp === "number" && payload.exp <= Math.floor(Date.now() / 1000)) return false;
+      return true;
+    } catch {
+      /* fall through to opaque legacy tokens */
+    }
+  }
   const h = hashToken(token);
   const entry = accessTokens.get(h);
   if (!entry) return false;
@@ -299,23 +363,28 @@ export function mcpBearerAuth(req: Request, res: Response, next: NextFunction): 
     next();
     return;
   }
-  const auth = req.get("authorization") ?? "";
-  const m = /^Bearer\s+(.+)$/i.exec(auth);
-  const presented = m ? m[1].trim() : "";
-  const okStatic = presented !== "" && safeEqual(presented, AUTH_TOKEN);
-  const okOauth = presented !== "" && accessTokenValid(presented);
-  if (!okStatic && !okOauth) {
-    res.set(
-      "WWW-Authenticate",
-      `Bearer resource_metadata="${protectedResourceMetadataUrl()}", scope="${SCOPE}"`,
-    );
-    res.status(401).json({
-      jsonrpc: "2.0",
-      error: { code: -32600, message: "unauthorized" },
-    });
-    return;
-  }
-  next();
+  void (async () => {
+    const auth = req.get("authorization") ?? "";
+    const m = /^Bearer\s+(.+)$/i.exec(auth);
+    const presented = m ? m[1].trim() : "";
+    const okStatic = presented !== "" && safeEqual(presented, AUTH_TOKEN);
+    const okOauth = presented !== "" && (await accessTokenValidAsync(presented));
+    if (!okStatic && !okOauth) {
+      res.set(
+        "WWW-Authenticate",
+        `Bearer resource_metadata="${protectedResourceMetadataUrl()}", scope="${SCOPE}"`,
+      );
+      res.status(401).json({
+        jsonrpc: "2.0",
+        error: { code: -32600, message: "unauthorized" },
+      });
+      return;
+    }
+    next();
+  })().catch((e) => {
+    console.error("[herdr-mcp] mcpBearerAuth error:", e);
+    res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "auth error" } });
+  });
 }
 
 /** CORS for ChatGPT / Claude browser-side OAuth discovery and DCR. */
@@ -408,10 +477,25 @@ function tokenError(res: Response, error: string, description: string): void {
 }
 
 async function issueTokens(clientId: string, resource: string): Promise<Record<string, unknown>> {
-  const at = newToken();
-  const rt = newToken();
+  await jwtReady;
+  if (!jwtPrivateKey) throw new Error("jwt private key not ready");
   const now = Math.floor(Date.now() / 1000);
-  accessTokens.set(hashToken(at), {
+  const jti = randomBytes(16).toString("hex");
+  const at = await new SignJWT({
+    client_id: clientId,
+    scope: SCOPE,
+  })
+    .setProtectedHeader({ alg: "RS256", typ: "at+jwt" })
+    .setIssuer(oauthIssuer())
+    .setAudience(resource)
+    .setSubject(clientId)
+    .setJti(jti)
+    .setIssuedAt(now)
+    .setExpirationTime(now + ACCESS_TOKEN_TTL_S)
+    .sign(jwtPrivateKey);
+  const rt = newToken();
+  // Keep a jti index for ops/debug; verification is cryptographic (JWT).
+  accessTokens.set(jti, {
     client_id: clientId, resource, scope: SCOPE, expires_at: now + ACCESS_TOKEN_TTL_S,
   });
   refreshTokens.set(hashToken(rt), {
@@ -585,10 +669,50 @@ async function handleToken(req: Request, res: Response): Promise<void> {
     tokenError(res, "invalid_client", "unknown client_id");
     return;
   }
-  if (!authenticateClient(client, presentedSecret)) {
+
+  // CIMD private_key_jwt (OpenAI): verify client_assertion against ChatGPT JWKS.
+  const assertion = first(body["client_assertion"]);
+  const assertionType = first(body["client_assertion_type"]);
+  if (assertion) {
+    if (
+      assertionType &&
+      assertionType !== "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+    ) {
+      tokenError(res, "invalid_client", "unsupported client_assertion_type");
+      return;
+    }
+    try {
+      let jwksUrl: URL;
+      if (isCimdClientId(clientId)) {
+        jwksUrl = new URL("/oauth/jwks.json", new URL(clientId).origin);
+      } else {
+        tokenError(res, "invalid_client", "client_assertion requires CIMD client_id");
+        return;
+      }
+      const JWKS = createRemoteJWKSet(jwksUrl);
+      const { payload } = await jwtVerify(assertion, JWKS, {
+        issuer: clientId,
+        audience: [`${oauthIssuer()}/oauth/token`, oauthIssuer()],
+      });
+      const sub = typeof payload.sub === "string" ? payload.sub : "";
+      if (sub && sub !== clientId) {
+        tokenError(res, "invalid_client", "client_assertion sub mismatch");
+        return;
+      }
+    } catch (e) {
+      console.error("[herdr-mcp] oauth client_assertion verify failed:", e instanceof Error ? e.message : e);
+      tokenError(res, "invalid_client", "client_assertion verification failed");
+      return;
+    }
+  } else if (!authenticateClient(client, presentedSecret)) {
     tokenError(res, "invalid_client", "client authentication failed");
     return;
   }
+
+  console.log(
+    `[herdr-mcp] oauth/token grant=${grantType || "-"} client=${clientId.slice(0, 64)}` +
+      ` assertion=${assertion ? "yes" : "no"} resource=${resource}`,
+  );
 
   if (grantType === "authorization_code") {
     const code = first(body["code"]);
@@ -669,6 +793,7 @@ async function handleToken(req: Request, res: Response): Promise<void> {
 // Route mounting
 // ---------------------------------------------------------------------------
 export function registerOAuthRoutes(app: Express): void {
+  void jwtReady;
   const router = Router();
 
   // RFC 8414 authorization-server metadata.

@@ -193,8 +193,8 @@ async function testDiscovery() {
   const card = await getJson(`${BASE}/.well-known/mcp.json`);
   ok(card.status === 200 && card.json.serverUrl === RESOURCE,
     "mcp.json 200 with absolute serverUrl === /mcp", `got ${card.json.serverUrl}`);
-  ok(card.json.version === "0.3.3",
-    "mcp.json version must be 0.3.3 (cache invalidation identity)", `got ${card.json.version}`);
+  ok(card.json.version === "0.3.4",
+    "mcp.json version must be 0.3.4 (cache invalidation identity)", `got ${card.json.version}`);
 
   // Path-aware AS + CORS (ChatGPT browser discovery) + CIMD flag + /mcp/register
   const asMcp = await getJson(`${BASE}/.well-known/oauth-authorization-server/mcp`);
