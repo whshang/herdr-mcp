@@ -16,7 +16,7 @@ import vm from "node:vm";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  decideWake, pruneExpired, bindingRevision, buildWakeTemplate,
+  decideWake, pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick,
 } from "../../extension/binding-core.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -94,6 +94,26 @@ const { kept, prunedKeys } = pruneExpired({
 ok(Object.keys(kept).length === 2 && prunedKeys.length === 1 && prunedKeys[0] === "stale", "过期剪枝 (含无 expires_at 保留)");
 ok(/^h2w:[0-9a-f]+$/.test(bindingRevision({ pane: "wH:p1", convKey: "https://chat.z.ai/chat/s/1", created_at: 1 })), "bindingRevision 格式");
 ok(buildWakeTemplate("a {agent} {pane} {status} {output}", { agent: "pi", pane: "wH:p1", status: "done", output: "hello\nworld" }).includes("hello\nworld"), "模板渲染保留 output 换行");
+
+console.log("\n[shouldProgressTick]");
+// 关闭 (<=0 / 非数字) → 永不 tick
+ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 100000, { progressTickSec: 0 }), "progressTickSec=0 → 关闭, 不 tick");
+ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 100000, { progressTickSec: -5 }), "progressTickSec<0 → 不 tick");
+ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 100000, { progressTickSec: "abc" }), "非数字 → 不 tick");
+ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 100000, {}), "缺 cfg.progressTickSec → 不 tick");
+// 非 working → 不 tick
+ok(!shouldProgressTick({ status: "idle", lastTickAt: 0 }, 100000, { progressTickSec: 120 }), "非 working → 不 tick");
+ok(!shouldProgressTick({ status: null, lastTickAt: 0 }, 100000, { progressTickSec: 120 }), "status=null → 不 tick");
+ok(!shouldProgressTick(null, 100000, { progressTickSec: 120 }), "无 prev → 不 tick");
+// 未到期 / 无基线
+ok(!shouldProgressTick({ status: "working", lastTickAt: null }, 100000, { progressTickSec: 120 }), "无 lastTickAt 基线 → 不 tick");
+ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 119999, { progressTickSec: 120 }), "未满间隔 (119999 < 120000) → 不 tick");
+// 恰好到期 / 超过
+ok(shouldProgressTick({ status: "working", lastTickAt: 0 }, 120000, { progressTickSec: 120 }), "恰满间隔 (120000) → tick");
+ok(shouldProgressTick({ status: "working", lastTickAt: 0 }, 240001, { progressTickSec: 120 }), "超间隔 → tick");
+// 小数秒/1s 间隔边界
+ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 999, { progressTickSec: 1 }), "1s 未满 (999) → 不 tick");
+ok(shouldProgressTick({ status: "working", lastTickAt: 0 }, 1000, { progressTickSec: 1 }), "1s 恰满 (1000) → tick");
 
 // ---- 4. speaks-json.js 解析 (vm + 假 window) ----
 console.log("\n[speaks-json extractToolCalls]");

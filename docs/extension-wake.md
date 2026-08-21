@@ -17,11 +17,14 @@
 
 | 事件 | 行为 |
 |---|---|
-| `agent_working` | 只武装，不写网页 |
-| `agent_settled` | 若此前 working → 唤醒一次 |
-| 重连 `hello` | 可补一次错过的 settle |
+| `agent_working` | 武装；若间隔 >0 则启动进度定时器（每 N 秒通报一次，首次 tick 在间隔到期后） |
+| 进度 tick | 仍 working → 用进度模板 `routeWake`（占位符同收工） |
+| `agent_settled` | 先停 tick，若此前 working → 收工模板唤醒一次 |
+| 重连 `hello` | 可补一次错过的 settle；若快照仍 working → 续 tick |
 
-缺口：working 期间无定时 tick（见 [extension.md](./extension.md) 拟定）。
+**working 定时进度通报（主线 A）**：绑定会话在 agent `working` 期间，每隔 `progressTickSec` 秒向网页输入框提交一条进度提醒（提醒模板与收工模板分开），`settled` 时仍按现逻辑唤醒一次并停止 tick。
+
+默认值：`progressTickSec = 120`（秒；填 `0` = 关闭，仅保留收工唤醒）；进度模板 `progressTemplate` 默认 `herdr agent {agent} ({pane}) 仍在执行 ({status})。\n\n{output}\n\n请调用 herdr_since 或继续观察进度，不要停在本轮。`。两者均在 options 页可改。
 
 ## 安装与绑定
 

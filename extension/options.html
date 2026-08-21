@@ -25,9 +25,17 @@
   <input type="text" id="token" placeholder="HERDR_MCP_TOKEN">
   <div class="hint">与 /mcp 同一个 token。查看: <code>herdr-mcp token</code></div>
 
-  <label>唤醒消息模板</label>
+  <label>唤醒消息模板（收工）</label>
   <textarea id="template">{agent} · {pane} · {status} · {output} 的占位符示例</textarea>
   <div class="hint">支持占位符: {agent} {pane} {status} {output}</div>
+
+  <label>进度通报间隔（秒）</label>
+  <input type="number" id="progressTickSec" min="0" step="1">
+  <div class="hint">agent 工作期间每隔 N 秒向绑定会话提交一条进度提醒。默认 120；填 0 = 关闭（仅保留收工唤醒）。</div>
+
+  <label>进度通报模板（working 期间）</label>
+  <textarea id="progressTemplate">{agent} 仍在执行 {pane} ({status}) 的进度占位示例</textarea>
+  <div class="hint">与上方收工模板分开。占位符: {agent} {pane} {status} {output}</div>
 
   <label><input type="checkbox" id="autoAllow"> 唤醒后自动点"允许"权限弹窗</label>
   <div class="hint">页面内权限弹窗 (允许/同意/Allow) 自动点击; 浏览器原生权限条 (通知/麦克风等) 无法自动点。</div>

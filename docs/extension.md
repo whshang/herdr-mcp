@@ -29,15 +29,15 @@
 
 ### 缺口
 
-1. **`working` 期间定时进度通报**（用户明确要的「执行过程之中」）
+1. ~~working 期间定时进度通报~~（已实现，见下）
 2. 绑定摩擦：未绑定则回推为零
 3. 无 agent 的 `herdr_exec` utility 不进 agent 状态机（可选后续）
 
-### 拟定（待你点头再写代码）
+### 已实现（主线 A 定时进度通报）
 
-- Options：`progressTickSec`（默认 120；0=关闭）、进度模板与收工模板分开
-- `working` 起每 N 秒：读摘要（agent.read 有界）→ 往绑定会话塞「仍在工作，请 herdr_since / 继续观察」并提交；同一 tick 去重
-- `settled`：仍按现逻辑唤醒一次，并取消该绑定的 tick 定时器
+- Options：`progressTickSec`（默认 `120` 秒；填 `0` = 关闭）、进度模板与收工模板分开（`progressTemplate` / `wakeTemplate`）
+- `working` 起每 N 秒：读已缓存输出或 `/push/state` 该 pane 摘要 → 往绑定会话塞「仍在工作，请 herdr_since / 继续观察」并提交；同一 convKey 只一个定时器，重复 `working` 重置下次到期不叠加
+- `settled`：先取消 tick 定时器，再按收工模板唤醒一次
 - 全站同一套；站点差异只在 injector 写入/发送
 
 ## B. JSON→MCP（DeepSeek / z.ai）

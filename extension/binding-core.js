@@ -72,6 +72,30 @@ export function bindingRevision(b) {
   return `h2w:${(h >>> 0).toString(16)}`;
 }
 
+/**
+ * 进度 tick 决策纯函数 (主线 A): 是否该在本次定时器到期时向网页通报进度。
+ * 用于 background 的 setInterval 回调 (now=Date.now()), 避免真实定时器竞态/叠加。
+ *
+ * 规则:
+ *   - progressTickSec <= 0 (或非数字): 关闭, 永不 tick
+ *   - prev.status !== "working": 不 tick (settled 走收工唤醒)
+ *   - 距上次 tick (armed 时 = armedAt) 未满 progressTickSec: 不 tick
+ *   - 满间隔: tick
+ *
+ * @param {{status: string|null, lastTickAt: number|null}} prev
+ * @param {number} now Date.now()
+ * @param {{progressTickSec: number}} cfg
+ * @returns {boolean}
+ */
+export function shouldProgressTick(prev, now, cfg) {
+  const sec = Number(cfg?.progressTickSec);
+  if (!Number.isFinite(sec) || sec <= 0) return false; // 关闭
+  if (!prev || prev.status !== "working") return false; // 非工作不 tick
+  const lastTickAt = prev.lastTickAt ?? null;
+  if (typeof lastTickAt !== "number") return false; // 无基线
+  return now - lastTickAt >= sec * 1000;
+}
+
 /** 唤醒模板渲染: {agent} {pane} {status} {output}。 */
 export function buildWakeTemplate(template, fields) {
   const t = (template ?? "").trim();

@@ -8,20 +8,21 @@
 // 版本同步 (ctmc 教训): 内容脚本不随扩展重载自动重注入 — 版本变化时扫描目标站
 // 标签页, 版本不匹配强制 reload。改 content 代码必须同步 bump
 // H2W_SCRIPT_VERSION (background) 与 H2W_CONTENT_VERSION (wake.js)。
-import { decideWake, pruneExpired, bindingRevision, buildWakeTemplate } from "./binding-core.js";
+import { decideWake, pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick } from "./binding-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.3";
+const H2W_SCRIPT_VERSION = "0.1.4";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const tabVersions = new Map();
 const reloadedTabs = new Set();
 const DEFAULT_TEMPLATE = "herdr agent {agent} ({pane}) 已完成 ({status})。\n\n{output}\n\n请基于以上结果继续。";
+const DEFAULT_PROGRESS_TEMPLATE = "herdr agent {agent} ({pane}) 仍在执行 ({status})。\n\n{output}\n\n请调用 herdr_since 或继续观察进度，不要停在本轮。";
 
 function callLog(...args) { console.log("[h2w]", ...args); }
 function runtimeAlive() { try { return !!chrome.runtime?.id; } catch { return false; } }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- 配置 (configReady: onStartup/重建流前必须等 storage 加载完, 否则用默认空 token 连) ----
-let CFG = { herdrMcpUrl: "http://127.0.0.1:8772", token: "", enabled: true, autoAllow: true, wakeTemplate: DEFAULT_TEMPLATE };
+let CFG = { herdrMcpUrl: "http://127.0.0.1:8772", token: "", enabled: true, autoAllow: true, wakeTemplate: DEFAULT_TEMPLATE, progressTickSec: 120, progressTemplate: DEFAULT_PROGRESS_TEMPLATE };
 let resolveConfigReady;
 const configReady = new Promise((r) => { resolveConfigReady = r; });
 (async () => {
@@ -81,7 +82,7 @@ async function loadBindings() {
   const { kept, prunedKeys } = pruneExpired(b);
   if (prunedKeys.length) {
     callLog(`剪枝 ${prunedKeys.length} 个过期绑定: ${prunedKeys.join(", ")}`);
-    for (const k of prunedKeys) { const s = pushStreams.get(k); if (s) { try { s.ctrl.abort(); } catch {} } pushStreams.delete(k); }
+    for (const k of prunedKeys) { const s = pushStreams.get(k); if (s) { try { s.ctrl.abort(); } catch {} } pushStreams.delete(k); clearProgressTimer(k); }
     try { await chrome.storage.local.set({ herdrWakeBindings: kept }); } catch (e) {}
   }
   return kept;
@@ -168,6 +169,7 @@ async function onPushHello(convKey, data) {
   b.status = d.status;
   b.lastSettle = d.lastSettle;
   await saveBindings(bindings);
+  if (d.status === "working") armProgressTimer(convKey); // SW 重启/重连后仍是 working → 续 tick
   if (d.wake) {
     callLog(`hello 补唤醒: ${b.pane} → ${ag?.status} (离线期间错过 settle)`);
     await routeWake(b, { status: ag?.status ?? "idle", output: "" });
@@ -181,12 +183,14 @@ async function onPushWorking(convKey, data) {
   b.status = "working";
   await saveBindings(bindings);
   setActionBadge("…", "#d97706");
+  armProgressTimer(convKey); // 重复 working 重置下次到期, 不叠加 interval
 }
 
 async function onPushSettled(convKey, data) {
   const bindings = await loadBindings();
   const b = bindings[convKey];
   if (!b || b.pane !== data.pane) return;
+  clearProgressTimer(convKey); // 先停 tick, 再走收工唤醒
   const d = decideWake({ status: b.status, lastSettle: b.lastSettle }, "settled", data);
   b.status = d.status;
   b.lastSettle = d.lastSettle;
@@ -212,13 +216,80 @@ async function onPushSettled(convKey, data) {
   setActionBadge("✓", "#16a34a", 4000);
 }
 
-// ---- 唤醒路由: 定位绑定的 tab, 发 h2w_wake ----
-async function routeWake(b, extra) {
+// ---- working 进度定时通报 (主线 A) ----
+// 每个 convKey 一个 setInterval; 重复 working 事件先 clear 再重设 (不叠加)。
+// lastTickAt: armed 时初始化为 Date.now(), 每次 tick 后更新 — 首次 tick 恰好在
+// 一个间隔之后 (不在 working 瞬间立刻唤醒)。inFlight 防 tick 与 settled 竞态重叠。
+const progressTimers = new Map(); // convKey -> { id, lastTickAt, inFlight }
+
+function progressTickSecMs() {
+  const sec = Number(CFG.progressTickSec);
+  if (!Number.isFinite(sec) || sec <= 0) return 0;
+  return Math.min(sec, 86400) * 1000;
+}
+
+function armProgressTimer(convKey) {
+  const ms = progressTickSecMs();
+  if (ms <= 0) return;
+  const t = progressTimers.get(convKey);
+  if (t) clearInterval(t.id);
+  const ts = { id: 0, lastTickAt: Date.now(), inFlight: false };
+  ts.id = setInterval(() => tickProgress(convKey, ts), ms);
+  progressTimers.set(convKey, ts);
+  callLog(`progress tick 启动: ${convKey} 每 ${ms / 1000}s`);
+}
+
+function clearProgressTimer(convKey) {
+  const t = progressTimers.get(convKey);
+  if (t) { clearInterval(t.id); progressTimers.delete(convKey); }
+}
+
+async function tickProgress(convKey, ts) {
+  if (ts.inFlight) return;
+  const bindings = await loadBindings();
+  const b = bindings[convKey];
+  if (!b) { clearProgressTimer(convKey); return; }
+  if (b.status !== "working" || !CFG.enabled) { clearProgressTimer(convKey); return; }
+  if (!shouldProgressTick({ status: b.status, lastTickAt: ts.lastTickAt }, Date.now(), CFG)) return;
+  ts.inFlight = true;
+  try {
+    ts.lastTickAt = Date.now();
+    // output: 优先已缓存的 agent_output 片段; 否则尝试 /push/state 该 pane 摘要; 都没有则空串
+    let output = pendingOutput.get(convKey) || "";
+    if (!output) {
+      try {
+        const st = await fetchState();
+        const ag = (st.agents || []).find((a) => a.pane === b.pane);
+        output = (ag && (ag.summary || ag.output || ag.status_text)) || "";
+      } catch (e) { output = ""; }
+    }
+    // tick 途中绑定可能已 settle/unbind — 以最新状态为准, 不再 tick
+    const cur = progressTimers.get(convKey);
+    if (cur !== ts || !CFG.enabled) return;
+    const curB = (await loadBindings())[convKey];
+    if (!curB || curB.status !== "working") return;
+    callLog(`progress tick: ${b.pane} → ${convKey} (仍 ${b.status})`);
+    await routeWake(b, { status: b.status, output }, CFG.progressTemplate || DEFAULT_PROGRESS_TEMPLATE);
+  } finally {
+    ts.inFlight = false;
+  }
+}
+
+// 配置/流重建后重新对账: working 绑定重挂定时器; 其余/关闭/禁用则清除。
+function reconcileProgressTimers(bindings) {
+  for (const convKey of progressTimers.keys()) clearProgressTimer(convKey);
+  if (!CFG.enabled || progressTickSecMs() <= 0) return;
+  for (const [convKey, b] of Object.entries(bindings)) {
+    if (b.status === "working") armProgressTimer(convKey);
+  }
+}
+
+async function routeWake(b, extra, template = CFG.wakeTemplate || DEFAULT_TEMPLATE) {
   if (!CFG.enabled) return;
-  const template = buildWakeTemplate(CFG.wakeTemplate || DEFAULT_TEMPLATE, {
+  const rendered = buildWakeTemplate(template, {
     agent: b.agent, pane: b.pane, status: extra.status, output: extra.output,
   });
-  const payload = { type: "h2w_wake", data: { agent: b.agent, pane: b.pane, status: extra.status, output: (extra.output || "").slice(0, 4000), template, autoAllow: CFG.autoAllow !== false } };
+  const payload = { type: "h2w_wake", data: { agent: b.agent, pane: b.pane, status: extra.status, output: (extra.output || "").slice(0, 4000), template: rendered, autoAllow: CFG.autoAllow !== false } };
 
   // 1) 直接发到已知 tabId (register 刷新过)
   if (b.tabId) {
@@ -375,6 +446,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (!b) { sendResponse({ ok: false, error: "not-found" }); return; }
       delete bindings[msg.convKey];
       await saveBindings(bindings);
+      clearProgressTimer(msg.convKey);
       const stream = pushStreams.get(msg.convKey);
       if (stream) { stream.ctrl.abort(); pushStreams.delete(msg.convKey); }
       if (b.tabId) { try { chrome.tabs.sendMessage(b.tabId, { type: "h2w_unbound" }); } catch (e) {} }
@@ -417,6 +489,7 @@ async function rebuildStreams() {
   for (const convKey of Object.keys(bindings)) {
     ensurePushStream(bindings, convKey);
   }
+  reconcileProgressTimers(bindings); // 配置变化 → 重挂 working 的 tick / 关停
 }
 
 // ---- 安装/浏览器启动: 配置加载完再重建推送流 (绑定存 storage, SW 重启后恢复) ----
@@ -424,6 +497,6 @@ chrome.runtime.onStartup.addListener(() => { void rebuildStreams(); });
 chrome.runtime.onInstalled.addListener(() => {
   void rebuildStreams();
   chrome.storage.local.get(["herdrMcpUrl"], (cfg) => {
-    if (!cfg.herdrMcpUrl) chrome.storage.local.set({ herdrMcpUrl: "http://127.0.0.1:8772", token: "", enabled: true, autoAllow: true, wakeTemplate: DEFAULT_TEMPLATE });
+    if (!cfg.herdrMcpUrl) chrome.storage.local.set({ herdrMcpUrl: "http://127.0.0.1:8772", token: "", enabled: true, autoAllow: true, wakeTemplate: DEFAULT_TEMPLATE, progressTickSec: 120, progressTemplate: DEFAULT_PROGRESS_TEMPLATE });
   });
 });
