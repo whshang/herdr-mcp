@@ -1,6 +1,6 @@
 {
   "name": "herdr-mcp",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Expose herdr as a lean MCP tool surface for ChatGPT Connector / Claude / other web LLMs",
   "type": "module",
   "main": "dist/server.js",

@@ -155,11 +155,11 @@ cmd_connector() {
   echo -e "${B}${C}  herdr-mcp 接入信息${N}"
   echo -e "${B}${C}═══════════════════════════════════════════════════════════${N}"
   echo ""
-  echo "  ChatGPT : $base              (OAuth, 不填 API key)"
-  echo "  Claude  : $base/mcp                (OAuth, DCR 自动注册)"
+  echo "  ChatGPT : $base/mcp              (OAuth, 不填 API key)"
+  echo "  Claude  : $base/mcp              (OAuth, DCR 自动注册)"
   echo "  Token   : $token          (仅本地 curl 测试用)"
   echo ""
-  echo "  配置步骤见 README.md「各平台接入」。"
+  echo "  配置步骤见 README.md / README.zh.md。"
   echo ""
 }
 

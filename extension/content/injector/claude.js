@@ -1,6 +1,6 @@
 // injector/claude.js — claude.ai 适配器 (只做"唤醒": 定位输入框 → 写入 → 提交)
 // ⚠️ 选择器未实测: 本机 claude.ai 未登录 (ego-browser 实测被重定向到 /login)。
-//    使用防御性选择器链, 登录后需实测校准 (见 extension/README.md 待办)。
+//    使用防御性选择器链, 登录后需实测校准。
 // 依据: claude.ai 输入区为 contenteditable 富文本编辑器 (ProseMirror/Quill 系),
 //    需要 MAIN world execCommand 插入 (同 ChatGPT, content script 隔离世界不提交模型)。
 class ClaudeAdapter extends BaseAdapter {

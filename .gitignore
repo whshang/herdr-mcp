@@ -46,3 +46,7 @@ Desktop.ini
 .herdr/
 .omp/
 .hermes/
+
+# --- Local-only notes (not published) ---
+docs/
+TODO.md

@@ -193,8 +193,26 @@ async function testDiscovery() {
   const card = await getJson(`${BASE}/.well-known/mcp.json`);
   ok(card.status === 200 && card.json.serverUrl === RESOURCE,
     "mcp.json 200 with absolute serverUrl === /mcp", `got ${card.json.serverUrl}`);
-  ok(card.json.version === "0.3.1",
-    "mcp.json version must be 0.3.1 (cache invalidation identity)", `got ${card.json.version}`);
+  ok(card.json.version === "0.3.2",
+    "mcp.json version must be 0.3.2 (cache invalidation identity)", `got ${card.json.version}`);
+
+  console.log("\n1b) Path-aware AS discovery (ChatGPT /mcp server URL, RFC 8414 §4)");
+  const pathAware = [
+    `${BASE}/.well-known/oauth-authorization-server/mcp`,
+    `${BASE}/.well-known/openid-configuration/mcp`,
+    `${BASE}/mcp/.well-known/oauth-authorization-server`,
+    `${BASE}/mcp/.well-known/openid-configuration`,
+  ];
+  for (const p of pathAware) {
+    const r = await getJson(p);
+    ok(r.status === 200, `${p} 200 (must NOT 401)`, `status=${r.status}`);
+    ok(r.json.issuer === BASE, `${p} issuer === base`, `got ${r.json.issuer}`);
+    ok(r.json.registration_endpoint === as.json.registration_endpoint,
+      `${p} registration_endpoint matches root doc`, r.json.registration_endpoint);
+  }
+  const prMcpPath = await getJson(`${BASE}/mcp/.well-known/oauth-protected-resource`);
+  ok(prMcpPath.status === 200 && prMcpPath.json.resource === RESOURCE,
+    "/mcp/.well-known/oauth-protected-resource 200, resource === canonical /mcp", `got ${prMcpPath.json.resource}`);
 }
 
 async function test401Challenge() {

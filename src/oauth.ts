@@ -601,6 +601,24 @@ export function registerOAuthRoutes(app: Express): void {
   router.get("/.well-known/openid-configuration", (_req, res) => {
     res.status(200).json(oauthMetadata());
   });
+  // Path-aware aliases (RFC 8414 §4): when ChatGPT uses `…/mcp` as the server
+  // URL it probes discovery at `/.well-known/oauth-authorization-server/mcp`,
+  // `/.well-known/openid-configuration/mcp`, and the `/mcp/.well-known/…`
+  // forms. Without these the paths fell through to mcpBearerAuth -> 401 and
+  // ChatGPT judged the server as "does not implement OAuth". All return the
+  // same oauthMetadata() as the root document.
+  router.get("/.well-known/oauth-authorization-server/mcp", (_req, res) => {
+    res.status(200).json(oauthMetadata());
+  });
+  router.get("/.well-known/openid-configuration/mcp", (_req, res) => {
+    res.status(200).json(oauthMetadata());
+  });
+  router.get("/mcp/.well-known/oauth-authorization-server", (_req, res) => {
+    res.status(200).json(oauthMetadata());
+  });
+  router.get("/mcp/.well-known/openid-configuration", (_req, res) => {
+    res.status(200).json(oauthMetadata());
+  });
   // RFC 9728 protected-resource metadata: root form (resource = issuer) …
   router.get("/.well-known/oauth-protected-resource", (_req, res) => {
     res.status(200).json(protectedResourceMetadata(oauthIssuer()));
@@ -608,6 +626,10 @@ export function registerOAuthRoutes(app: Express): void {
   // … and path-aware form (resource = issuer + /mcp). `resource` always
   // matches the URL the client used to fetch the document (RFC 9728 §3.3).
   router.get("/.well-known/oauth-protected-resource/mcp", (_req, res) => {
+    res.status(200).json(protectedResourceMetadata(oauthResourceUrl()));
+  });
+  // Path-aware protected-resource form (RFC 9728 §5.1) for the `/mcp` URL.
+  router.get("/mcp/.well-known/oauth-protected-resource", (_req, res) => {
     res.status(200).json(protectedResourceMetadata(oauthResourceUrl()));
   });
   // MCP server card (serverUrl required by MCP 2025-06-18+ spec).
