@@ -97,16 +97,32 @@ export function shouldProgressTick(prev, now, cfg) {
 }
 
 /**
+ * 进度摘要指纹: 去掉 spinner / 跑表时间 / 空白后再比, 避免「看起来一样」却每分钟当 new_output。
+ */
+export function progressOutputFingerprint(output) {
+  return String(output ?? "")
+    .replace(/\u001b\[[0-9;]*[A-Za-z]/g, "")
+    .replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒■□▪▫•●○◎◉]+/g, "")
+    .replace(/\b\d{1,2}:\d{2}(:\d{2})?\b/g, "")
+    .replace(/\b\d+[ms]\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(-1200);
+}
+
+/**
  * 是否真的向网页发一条进度消息 (检查点通过之后)。
  *
  * 规则:
- *   - 有非空 output 且与上次已发摘要不同 → 发 (new_output)
- *   - 否则若 progressFallbackSec > 0 且距上次实发 ≥ 兜底间隔 → 发 (fallback)
- *   - 否则跳过 (skip) — 避免空转刷屏
+ *   - progressTickSec 只决定「多久检查一次」, 不决定发送节奏
+ *   - 一旦已经实发过 (hasProgressSent), 距 lastSentAt 未满 progressFallbackSec → 一律 skip
+ *     (底线从「最后一次发送」起算, 不是从武装/整点起的固定 cron)
+ *   - 未满底线之外: 指纹有变 → new_output; 满底线且无新指纹 → fallback
  *
- * lastSentAt: 武装时初始化为 now (不立刻发), 每次实发后更新。
+ * lastSentAt: 武装时 = now (尚未实发); 每次实发后更新。
+ * hasProgressSent: 本轮 working 是否已向网页发过进度 (含空 output 的 fallback)。
  *
- * @param {{lastSentAt: number|null, lastOutputSent: string}} prev
+ * @param {{lastSentAt: number|null, lastOutputSent: string, hasProgressSent?: boolean}} prev
  * @param {number} now
  * @param {string} output 本轮摘要
  * @param {{progressFallbackSec?: number}} cfg
@@ -114,16 +130,23 @@ export function shouldProgressTick(prev, now, cfg) {
  */
 export function shouldSendProgress(prev, now, output, cfg) {
   const out = String(output ?? "").trim();
-  const prevOut = String(prev?.lastOutputSent ?? "").trim();
-  if (out.length > 0 && out !== prevOut) {
+  const fp = progressOutputFingerprint(out);
+  const prevFp = progressOutputFingerprint(prev?.lastOutputSent ?? "");
+  const lastSentAt = prev?.lastSentAt;
+  const fallbackSec = Number(cfg?.progressFallbackSec);
+  const fallbackMs = Number.isFinite(fallbackSec) && fallbackSec > 0 ? fallbackSec * 1000 : 0;
+  const hasProgressSent = prev?.hasProgressSent === true;
+
+  // 已实发过 → 底线从最后一次发送起算; 未满一律不发 (含「又有一点新 output」)
+  if (hasProgressSent && typeof lastSentAt === "number" && fallbackMs > 0 && now - lastSentAt < fallbackMs) {
+    return { send: false, reason: "skip" };
+  }
+
+  if (fp.length > 0 && fp !== prevFp) {
     return { send: true, reason: "new_output" };
   }
-  const fallbackSec = Number(cfg?.progressFallbackSec);
-  if (Number.isFinite(fallbackSec) && fallbackSec > 0) {
-    const lastSentAt = prev?.lastSentAt;
-    if (typeof lastSentAt === "number" && now - lastSentAt >= fallbackSec * 1000) {
-      return { send: true, reason: "fallback" };
-    }
+  if (fallbackMs > 0 && typeof lastSentAt === "number" && now - lastSentAt >= fallbackMs) {
+    return { send: true, reason: "fallback" };
   }
   return { send: false, reason: "skip" };
 }

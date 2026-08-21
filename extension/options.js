@@ -2,7 +2,7 @@
 const $ = (id) => document.getElementById(id);
 const KEYS = ["herdrMcpUrl", "token", "wakeTemplate", "progressTickSec", "progressFallbackSec", "progressTemplate", "autoAllow", "enabled"];
 const DEFAULT_TEMPLATE = "herdr agent {agent} ({pane}) 已完成 ({status})。\n\n{output}\n\n请基于以上结果继续。";
-const DEFAULT_PROGRESS_TEMPLATE = "herdr agent {agent} ({pane}) 仍在执行 ({status})。\n\n{output}\n\n请调用 herdr_since 或继续观察进度，不要停在本轮。";
+const DEFAULT_PROGRESS_TEMPLATE = "herdr agent {agent} ({pane}) 仍在执行 ({status})。\n\n{output}\n\n请用 herdr_since 续看；能 fs/exec 就不要再开贵模型。网页继续编排，勿把规划交给本机 Claude/OMP。";
 
 /** 秒数解析: 非数字/缺失 → fallback 默认; 负数/NaN → 0 (关闭); 上限 86400。 */
 function parseTickSec(v, fallback = 60) {

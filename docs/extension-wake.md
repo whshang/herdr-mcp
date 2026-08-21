@@ -25,11 +25,13 @@
 **working 定时进度通报（主线 A）**：绑定会话在 agent `working` 期间，每隔 `progressTickSec` 秒**检查**一次是否要向网页提交进度提醒；`settled` 时仍按现逻辑唤醒一次并停止 tick。
 
 实发规则（避免空转刷屏）：
-- 有相对上次实发**更新的非空** output 摘要（SSE `agent_output` / `terminal_title` / 节流 `agent.read`）→ 发
-- 否则距上次实发满 `progressFallbackSec` → 兜底发一条
-- 否则 `progress skip`，不写输入框
+- `progressTickSec` 只决定**检查**间隔（默认 60s），不是发送间隔
+- **首次**实发：有指纹变化的非空摘要 → `new_output`
+- **已实发过**：距**上一次发送**未满 `progressFallbackSec`（默认 600s）→ **一律不发**（底线从最后一次发送起算，不是固定 cron）
+- 满底线后：指纹有变 → `new_output`；否则 → `fallback`
+- 实发基线写进绑定（`lastProgressSentAt` / `lastProgressOutput`），Service Worker 被杀后仍去重
 
-默认值：`progressTickSec = 60`（检查间隔；填 `0` = 关闭进度通报）；`progressFallbackSec = 600`（10 分钟兜底；填 `0` = 只在有新摘要时发）；进度模板 `progressTemplate` 默认 `herdr agent {agent} ({pane}) 仍在执行 ({status})。\n\n{output}\n\n请调用 herdr_since 或继续观察进度，不要停在本轮。`。均在 options 页可改。
+默认值：`progressTickSec = 60`（检查间隔；填 `0` = 关闭进度通报）；`progressFallbackSec = 600`（10 分钟兜底；填 `0` = 只在有新摘要时发）；进度模板 `progressTemplate` 默认 `herdr agent {agent} ({pane}) 仍在执行 ({status})。\n\n{output}\n\n请用 herdr_since 续看；能 fs/exec 就不要再开贵模型。网页继续编排，勿把规划交给本机 Claude/OMP。`。均在 options 页可改。
 
 ## 安装与绑定
 

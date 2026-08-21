@@ -17,6 +17,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   decideWake, pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
+  progressOutputFingerprint,
 } from "../../extension/binding-core.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -120,15 +121,17 @@ ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 999, { progressTick
 ok(shouldProgressTick({ status: "working", lastTickAt: 0 }, 1000, { progressTickSec: 1 }), "1s 恰满 (1000) → tick");
 
 console.log("\n[shouldSendProgress]");
-const base = { lastSentAt: 0, lastOutputSent: "" };
-ok(shouldSendProgress(base, 1000, "hello", { progressFallbackSec: 600 }).reason === "new_output", "非空新摘要 → new_output");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello" }, 1000, "hello", { progressFallbackSec: 600 }).reason === "skip", "摘要未变且未满兜底 → skip");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello" }, 1000, "hello world", { progressFallbackSec: 600 }).reason === "new_output", "摘要变化 → new_output");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello" }, 1000, "", { progressFallbackSec: 600 }).reason === "skip", "空摘要不算新 → skip");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello" }, 600_000, "", { progressFallbackSec: 600 }).reason === "fallback", "满 600s 兜底 → fallback");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello" }, 599_999, "hello", { progressFallbackSec: 600 }).reason === "skip", "差 1ms 未满兜底 → skip");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "" }, 600_000, "", { progressFallbackSec: 0 }).reason === "skip", "fallback=0 关闭兜底 → skip");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "a" }, 1000, "  a  ", { progressFallbackSec: 600 }).reason === "skip", "trim 后相同 → skip");
+const base = { lastSentAt: 0, lastOutputSent: "", hasProgressSent: false };
+ok(shouldSendProgress(base, 1000, "hello", { progressFallbackSec: 600 }).reason === "new_output", "首次非空新摘要 → new_output");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 1000, "hello", { progressFallbackSec: 600 }).reason === "skip", "已实发且未满底线 → skip");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 1000, "hello world", { progressFallbackSec: 600 }).reason === "skip", "已实发未满底线即使摘要变了也不发");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 600_000, "hello world", { progressFallbackSec: 600 }).reason === "new_output", "满底线且指纹变 → new_output");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 600_000, "hello", { progressFallbackSec: 600 }).reason === "fallback", "满底线指纹未变 → fallback");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 599_999, "hello", { progressFallbackSec: 600 }).reason === "skip", "差 1ms 未满底线 → skip");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "", hasProgressSent: false }, 600_000, "", { progressFallbackSec: 0 }).reason === "skip", "fallback=0 关闭兜底 → skip");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "a", hasProgressSent: false }, 1000, "  a  ", { progressFallbackSec: 600 }).reason === "skip", "未实发但指纹相同 → skip");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "build ok", hasProgressSent: true }, 1000, "⠋ build ok 12:34", { progressFallbackSec: 600 }).reason === "skip", "已实发未满底线 → skip");
+ok(progressOutputFingerprint("⠋ x 1s") === progressOutputFingerprint("⠙ x 2s"), "指纹忽略 spinner 与短时标");
 
 // ---- 4. speaks-json.js 解析 (vm + 假 window) ----
 console.log("\n[speaks-json extractToolCalls]");

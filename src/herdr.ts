@@ -13,6 +13,7 @@
 import * as net from "node:net";
 import * as path from "node:path";
 import { homedir } from "node:os";
+import { isHerdrControlPlaneTaskGroup } from "./prompt-semantics.js";
 
 export interface HerdrErrorDetail {
   code: string;
@@ -155,16 +156,26 @@ export class HerdrClient {
     retry?: boolean,
   ): Promise<HerdrResult> {
     const allowRetry = retry === undefined ? !NON_IDEMPOTENT_METHODS.has(method) : retry;
+    const timeout = timeoutMs ?? this.defaultTimeoutMs;
+    const body = params ?? {};
     try {
-      return await this.callOnce(method, params ?? {}, timeoutMs ?? this.defaultTimeoutMs);
+      return await this.callOnce(method, body, timeout);
     } catch (e) {
       const err = e instanceof HerdrError ? e : new HerdrError("unknown", String(e), { method });
-      if (allowRetry && err.retryable) {
-        // Short jitter lets a just-restarted herdr daemon recreate its socket.
-        await new Promise<void>((resolve) => setTimeout(resolve, 100));
-        return this.callOnce(method, params ?? {}, timeoutMs ?? this.defaultTimeoutMs);
+      if (!(allowRetry && err.retryable)) throw err;
+      // First transparent retry (transport or control-plane TaskGroup).
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      try {
+        return await this.callOnce(method, body, timeout);
+      } catch (e2) {
+        const err2 = e2 instanceof HerdrError ? e2 : new HerdrError("unknown", String(e2), { method });
+        // Control-plane races often need a second beat after snapshot/event reconnect.
+        if (isHerdrControlPlaneTaskGroup(err2.message)) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 250));
+          return this.callOnce(method, body, timeout);
+        }
+        throw err2;
       }
-      throw err;
     }
   }
 
@@ -182,7 +193,12 @@ export class HerdrClient {
       try {
         const env = parseEnvelope(buf.slice(0, nl));
         if (env.error) {
-          reject(new HerdrError(env.error.code ?? "error", env.error.message ?? "", { method, retryable: false }));
+          const code = env.error.code ?? "error";
+          const message = env.error.message ?? "";
+          // Control-plane TaskGroup blips are intermittent; treat as retryable so
+          // call() does one transparent retry for idempotent reads (pane.read etc.).
+          const retryable = isHerdrControlPlaneTaskGroup(message);
+          reject(new HerdrError(code, message, { method, retryable }));
         } else {
           resolve((env.result ?? {}) as HerdrResult);
         }

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Copy to: ~/Library/LaunchAgents/dev.herdr-mcp.server.plist
+  Replace REPLACE_ME_* placeholders, then: launchctl load ~/Library/LaunchAgents/dev.herdr-mcp.server.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.herdr-mcp.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_ME_NODE</string>
+    <string>REPLACE_ME_REPO/dist/server.js</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>REPLACE_ME_REPO</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERDR_MCP_HOST</key>
+    <string>127.0.0.1</string>
+    <key>HERDR_MCP_PORT</key>
+    <string>8772</string>
+    <key>HERDR_MCP_TOKEN</key>
+    <string>REPLACE_ME_TOKEN</string>
+    <key>HERDR_MCP_BASE_URL</key>
+    <string>https://xxxx.trycloudflare.com</string>
+    <key>HERDR_SOCKET_PATH</key>
+    <string>REPLACE_ME_HOME/.config/herdr/herdr.sock</string>
+    <key>PATH</key>
+    <string>REPLACE_ME_HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>REPLACE_ME_HOME</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>REPLACE_ME_HOME/.config/herdr-mcp/server.log</string>
+  <key>StandardErrorPath</key>
+  <string>REPLACE_ME_HOME/.config/herdr-mcp/server.log</string>
+</dict>
+</plist>

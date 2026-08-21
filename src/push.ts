@@ -42,6 +42,18 @@ const OUTPUT_LINES = 40;
 const WORKING_SNIPPET_MS = 60_000; // while working, refresh output snippet at most once/min
 const DEBUG = process.env.HERDR_MCP_PUSH_DEBUG === "1";
 
+/** Match extension binding-core progressOutputFingerprint — spinner/clock noise ≠ new output. */
+function progressSnippetFingerprint(output: string | undefined): string {
+  return String(output ?? "")
+    .replace(/\u001b\[[0-9;]*[A-Za-z]/g, "")
+    .replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒■□▪▫•●○◎◉]+/g, "")
+    .replace(/\b\d{1,2}:\d{2}(:\d{2})?\b/g, "")
+    .replace(/\b\d+[ms]\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(-1200);
+}
+
 interface PushFilters {
   agent?: string;
   pane?: string;
@@ -177,7 +189,8 @@ class PushHub {
       const output = cleanTerminalOutput(text).slice(0, 2000);
       if (!output.trim()) return;
       const prev = this.lastOutputSnippet.get(ref.pane)?.output;
-      if (prev === output) return; // 无变化不刷 SSE
+      // 指纹级去重: spinner / 时钟跳动不算「新摘要」, 避免扩展每分钟当 new_output
+      if (progressSnippetFingerprint(prev) === progressSnippetFingerprint(output)) return;
       this.lastOutputSnippet.set(ref.pane, { at: Date.now(), output });
       this.emit("agent_output", { agent: ref.name, pane: ref.pane, at: new Date().toISOString(), output });
     } catch {

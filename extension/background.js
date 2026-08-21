@@ -15,7 +15,7 @@ const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.
 const tabVersions = new Map();
 const reloadedTabs = new Set();
 const DEFAULT_TEMPLATE = "herdr agent {agent} ({pane}) 已完成 ({status})。\n\n{output}\n\n请基于以上结果继续。";
-const DEFAULT_PROGRESS_TEMPLATE = "herdr agent {agent} ({pane}) 仍在执行 ({status})。\n\n{output}\n\n请调用 herdr_since 或继续观察进度，不要停在本轮。";
+const DEFAULT_PROGRESS_TEMPLATE = "herdr agent {agent} ({pane}) 仍在执行 ({status})。\n\n{output}\n\n请用 herdr_since 续看；能 fs/exec 就不要再开贵模型。网页继续编排，勿把规划交给本机 Claude/OMP。";
 
 function callLog(...args) { console.log("[h2w]", ...args); }
 function runtimeAlive() { try { return !!chrome.runtime?.id; } catch { return false; } }
@@ -180,7 +180,7 @@ async function onPushHello(convKey, data) {
   b.status = d.status;
   b.lastSettle = d.lastSettle;
   await saveBindings(bindings);
-  if (d.status === "working") armProgressTimer(convKey); // SW 重启/重连后仍是 working → 续 tick
+  if (d.status === "working") armProgressTimer(convKey, b); // SW 重启/重连后仍是 working → 续 tick
   if (d.wake) {
     callLog(`hello 补唤醒: ${b.pane} → ${ag?.status} (离线期间错过 settle)`);
     await routeWake(b, { status: ag?.status ?? "idle", output: "" });
@@ -194,7 +194,7 @@ async function onPushWorking(convKey, data) {
   b.status = "working";
   await saveBindings(bindings);
   setActionBadge("…", "#d97706");
-  armProgressTimer(convKey); // 重复 working 重置下次到期, 不叠加 interval
+  armProgressTimer(convKey, b); // 重复 working 重置下次到期, 不叠加 interval; 保留实发基线
 }
 
 async function onPushSettled(convKey, data) {
@@ -229,9 +229,9 @@ async function onPushSettled(convKey, data) {
 
 // ---- working 进度定时检查 (主线 A) ----
 // 每个 convKey 一个 setInterval; 重复 working 事件先 clear 再重设 (不叠加 interval)。
-// lastTickAt: 检查节奏 (默认 60s)。lastSentAt / lastOutputSent: 实发去重 + 10 分钟兜底。
-// 仅当摘要有新内容, 或距上次实发 ≥ progressFallbackSec 才 routeWake。
-const progressTimers = new Map(); // convKey -> { id, lastTickAt, lastSentAt, lastOutputSent, inFlight }
+// lastTickAt: 检查节奏 (默认 60s)。lastSentAt: 上次实发时刻 (底线从这里起算)。
+// hasProgressSent: 本轮 working 是否已发过; 发过则未满 progressFallbackSec 一律不发。
+const progressTimers = new Map(); // convKey -> { id, lastTickAt, lastSentAt, lastOutputSent, hasProgressSent, inFlight }
 
 function progressTickSecMs() {
   const sec = Number(CFG.progressTickSec);
@@ -239,23 +239,29 @@ function progressTickSecMs() {
   return Math.min(sec, 86400) * 1000;
 }
 
-function armProgressTimer(convKey) {
+function armProgressTimer(convKey, bindingSeed = null) {
   const ms = progressTickSecMs();
   if (ms <= 0) return;
   const prev = progressTimers.get(convKey);
   if (prev) clearInterval(prev.id);
   const now = Date.now();
+  const seedSent = typeof prev?.lastSentAt === "number" ? prev.lastSentAt
+    : typeof bindingSeed?.lastProgressSentAt === "number" ? bindingSeed.lastProgressSentAt : now;
+  const seedOut = typeof prev?.lastOutputSent === "string" ? prev.lastOutputSent
+    : typeof bindingSeed?.lastProgressOutput === "string" ? bindingSeed.lastProgressOutput : "";
+  const seedHasSent = prev?.hasProgressSent === true
+    || typeof bindingSeed?.lastProgressSentAt === "number";
   const ts = {
     id: 0,
     lastTickAt: now,
-    // 保留已有实发基线, 避免 rebuild/重复 working 重置 10 分钟兜底; 首次武装 = now (不立刻发)
-    lastSentAt: typeof prev?.lastSentAt === "number" ? prev.lastSentAt : now,
-    lastOutputSent: typeof prev?.lastOutputSent === "string" ? prev.lastOutputSent : "",
+    lastSentAt: seedSent,
+    lastOutputSent: seedOut,
+    hasProgressSent: seedHasSent,
     inFlight: false,
   };
   ts.id = setInterval(() => tickProgress(convKey, ts), ms);
   progressTimers.set(convKey, ts);
-  callLog(`progress tick 启动: ${convKey} 每 ${ms / 1000}s 检查 (新摘要才发, 兜底 ${CFG.progressFallbackSec || 0}s)`);
+  callLog(`progress tick 启动: ${convKey} 每 ${ms / 1000}s 检查 (实发后 ${CFG.progressFallbackSec || 0}s 内不重发)`);
 }
 
 function clearProgressTimer(convKey) {
@@ -273,21 +279,26 @@ async function tickProgress(convKey, ts) {
   ts.inFlight = true;
   try {
     ts.lastTickAt = Date.now();
-    // output: 优先 SSE agent_output; 否则 /push/state 的 terminal_title / 摘要字段
+    // output: 优先 SSE agent_output; 否则 /push/state 的摘要字段 (不用 terminal_title — 太抖, 会每分钟误判 new_output)
     let output = pendingOutput.get(convKey) || "";
     if (!output) {
       try {
         const st = await fetchState();
         const ag = (st.agents || []).find((a) => a.pane === b.pane);
-        output = (ag && (ag.summary || ag.output || ag.status_text || ag.terminal_title)) || "";
+        output = (ag && (ag.summary || ag.output || ag.status_text)) || "";
       } catch (e) { output = ""; }
     }
     const cur = progressTimers.get(convKey);
     if (cur !== ts || !CFG.enabled) return;
-    const curB = (await loadBindings())[convKey];
+    const bindingsNow = await loadBindings();
+    const curB = bindingsNow[convKey];
     if (!curB || curB.status !== "working") return;
     const decision = shouldSendProgress(
-      { lastSentAt: ts.lastSentAt, lastOutputSent: ts.lastOutputSent },
+      {
+        lastSentAt: ts.lastSentAt,
+        lastOutputSent: ts.lastOutputSent,
+        hasProgressSent: ts.hasProgressSent === true,
+      },
       Date.now(),
       output,
       CFG,
@@ -297,9 +308,15 @@ async function tickProgress(convKey, ts) {
       return;
     }
     callLog(`progress send: ${b.pane} → ${convKey} (${decision.reason})`);
-    await routeWake(b, { status: b.status, output }, CFG.progressTemplate || DEFAULT_PROGRESS_TEMPLATE);
+    await routeWake(curB, { status: curB.status, output }, CFG.progressTemplate || DEFAULT_PROGRESS_TEMPLATE);
     ts.lastSentAt = Date.now();
     ts.lastOutputSent = String(output || "").trim();
+    ts.hasProgressSent = true;
+    pendingOutput.delete(convKey);
+    curB.lastProgressSentAt = ts.lastSentAt;
+    curB.lastProgressOutput = ts.lastOutputSent;
+    bindingsNow[convKey] = curB;
+    await saveBindings(bindingsNow);
   } finally {
     ts.inFlight = false;
   }
@@ -316,7 +333,7 @@ function reconcileProgressTimers(bindings) {
     if (!b || b.status !== "working") clearProgressTimer(convKey);
   }
   for (const [convKey, b] of Object.entries(bindings)) {
-    if (b.status === "working") armProgressTimer(convKey);
+    if (b.status === "working") armProgressTimer(convKey, b);
   }
 }
 

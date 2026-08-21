@@ -3,18 +3,17 @@
  * herdr-mcp — Node.js (TypeScript) MCP server.
  *
  * Faithful rewrite of herdr_mcp/server.py on @modelcontextprotocol/sdk + express:
- *  - 7 MCP tools over Streamable HTTP (stateful sessions): herdr_inspect,
- *    herdr_call, herdr_wait, herdr_session, herdr_handoff, herdr_parallel,
- *    herdr_reap.
+ *  - Default MCP tool surface (17): inspect/call/since/prompt + fs_* + git + exec/exec_*.
+ *  - HERDR_MCP_ALL_TOOLS=1 adds advanced/deprecated lifecycle tools (30 total).
  *  - Express on HERDR_MCP_PORT (default 8772).
  *  - OAuth DCR endpoints for Claude.ai / ChatGPT connectors.
  *  - Bearer auth on /mcp via HERDR_MCP_TOKEN.
  */
 import express, { Express, Request, Response, NextFunction } from "express";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, writeFile, realpath, readdir, stat } from "node:fs/promises";
+import { readFile, writeFile, realpath, readdir, stat, unlink, mkdir } from "node:fs/promises";
 import * as path from "node:path";
-import { exec, execSync, spawn } from "node:child_process";
+import { exec, execSync, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -22,6 +21,11 @@ import * as z from "zod/v4";
 
 import { HerdrClient, HerdrError, HerdrResult, NON_IDEMPOTENT_METHODS } from "./herdr.js";
 import { getSnapshotCache } from "./state.js";
+import {
+  filterVisibleAgents,
+  redactPaneAgents,
+  visibilityMeta,
+} from "./agent-visibility.js";
 import { cleanTerminalOutput } from "./clean.js";
 import { validateMethodParams, listMethods } from "./schema.js";
 import { get as sessionGet, save as sessionSave, type SessionData, type SessionProject } from "./session.js";
@@ -37,9 +41,23 @@ import {
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 import {
   isAgentStatusWaitTimeout,
+  isHerdrControlPlaneTaskGroup,
   isTrueTransportFailure,
+  unwrapControlPlaneMessage,
   buildStateObservation,
 } from "./prompt-semantics.js";
+import { parsePatch, applyUpdateHunks, PatchError } from "./patch.js";
+import {
+  startExecSession,
+  readExecSession,
+  killExecSession,
+  listExecSessions,
+  recoverExecSessionsOnBoot,
+} from "./exec-sessions.js";
+import { commitAtomic } from "./atomic-files.js";
+
+/** Process boot id — returned by inspect/since so clients detect cursor reset. */
+const BOOT_ID = randomUUID().slice(0, 12);
 
 /** SDK-supported wire version used when ChatGPT advertises 2026-07-28. */
 const SDK_WIRE_PROTOCOL = "2025-11-25";
@@ -50,11 +68,9 @@ const SDK_WIRE_PROTOCOL = "2025-11-25";
 const PORT = Number(process.env.HERDR_MCP_PORT ?? "8772");
 const BASE_URL = process.env.HERDR_MCP_BASE_URL ?? ""; // e.g. https://xxxx.trycloudflare.com
 const AUTH_TOKEN = process.env.HERDR_MCP_TOKEN ?? "";
-// Tool-surface switch: default exposes exactly the 11 lean tools; HERDR_MCP_ALL_TOOLS=1
-// additionally registers the advanced + deprecated lifecycle tools (herdr_wait,
-// herdr_task/session, handoff/reap + aliases, herdr_parallel, herdr_read,
-// herdr_explain, herdr_prompt_status, herdr_transcript, herdr_diff) that cost
-// model context when listed in tools/list.
+// Tool-surface switch: default exposes the lean 17-tool surface; HERDR_MCP_ALL_TOOLS=1
+// additionally registers advanced + deprecated lifecycle tools (wait/task/session/handoff/
+// reap/parallel/read/explain/prompt_status/transcript/diff) — 30 total.
 const ALL_TOOLS = process.env.HERDR_MCP_ALL_TOOLS === "1";
 // E: authorization switches. READONLY blocks every mutating operation;
 // WRITE_ROOTS (csv) limits mutations to listed roots (unset = all managed roots).
@@ -373,11 +389,12 @@ function projectSnapshot(snap: HerdrResult): Record<string, unknown> {
     };
   });
 
-  const agents = agentsRaw.map((a) => {
+  const agentsAll = agentsRaw.map((a) => {
     const arec = (a ?? {}) as Record<string, unknown>;
     const sess = arec["agent_session"];
     return {
       name: arec["agent"],
+      kind: arec["kind"] ?? arec["agent_kind"],
       pane: arec["pane_id"],
       status: arec["agent_status"] ?? arec["status"],
       workspace: arec["workspace_id"],
@@ -387,14 +404,17 @@ function projectSnapshot(snap: HerdrResult): Record<string, unknown> {
       session_ref: typeof sess === "object" && sess !== null ? sess : null,
     };
   });
+  const agents = filterVisibleAgents(agentsAll);
+  const panesVisible = redactPaneAgents(panes);
 
   return {
     focused_workspace: snap["focused_workspace_id"],
     focused_pane: snap["focused_pane_id"],
     workspaces,
     tabs,
-    panes,
+    panes: panesVisible,
     agents,
+    ...visibilityMeta(agentsAll.length - agents.length),
     shared_projects: sharedProjects,
   };
 }
@@ -404,13 +424,23 @@ function projectSnapshot(snap: HerdrResult): Record<string, unknown> {
 // ---------------------------------------------------------------------------
 /** Wrap a plain JS value as a JSON text MCP tool result (matches Python's dict return). */
 function toResult(data: unknown) {
+  if (data && typeof data === "object" && (data as { ok?: unknown }).ok === false) {
+    const d = data as Record<string, unknown>;
+    const code = d["code"] ?? d["reason"] ?? d["failure"] ?? "-";
+    const msg = String(d["message"] ?? d["hint"] ?? "").replace(/\s+/g, " ").slice(0, 160);
+    console.log(
+      `[herdr-mcp] ${new Date().toISOString()} tool_result ok=false code=${code}` +
+        (d["context"] ? ` context=${d["context"]}` : "") +
+        (msg ? ` message=${msg}` : ""),
+    );
+  }
   return {
     content: [{ type: "text" as const, text: JSON.stringify(data) }],
   };
 }
 
-/** P1-F: transparent transport / status-wait errors for MCP clients. */
-function herdrErrorResult(error: unknown, context?: string) {
+/** P1-F: transparent transport / status-wait / control-plane errors for MCP clients. */
+function herdrErrorResult(error: unknown, context?: string, failurePhase?: string) {
   const err = error instanceof HerdrError
     ? error
     : new HerdrError("unknown", error instanceof Error ? error.message : String(error));
@@ -420,9 +450,10 @@ function herdrErrorResult(error: unknown, context?: string) {
     mcp_pid: process.pid,
     build: buildInfo(),
   };
+  const msg = detail.message || err.message;
 
   // Daemon waited for agent status after accept — not a socket transport failure.
-  if (isAgentStatusWaitTimeout(detail.message) || isAgentStatusWaitTimeout(err.message)) {
+  if (isAgentStatusWaitTimeout(msg)) {
     return toResult({
       ok: false,
       failure: "agent_status_wait_timeout",
@@ -433,18 +464,69 @@ function herdrErrorResult(error: unknown, context?: string) {
       ...detail,
       // Status-wait timeout after a mutation: never blind-retry
       retryable: false,
-      hint: "submission may have succeeded — verify with herdr_inspect / herdr_since (or herdr_prompt_status) before re-sending",
+      hint: "submission may have succeeded — verify with herdr_inspect / herdr_since before re-sending",
+      daemon,
+    });
+  }
+
+  // Control-plane TaskGroup / ExceptionGroup (intermittent; agent/pane usually fine).
+  if (isHerdrControlPlaneTaskGroup(msg)) {
+    const rootMessage = unwrapControlPlaneMessage(msg);
+    return toResult({
+      ok: false,
+      code: "snapshot_refresh_failed",
+      failure: "herdr_internal",
+      failure_phase: failurePhase ?? "control_plane_taskgroup",
+      context,
+      method: detail.method ?? context,
+      request_id: `mcp-${process.pid}-${Date.now().toString(36)}`,
+      retryable: true,
+      message: rootMessage,
+      error: {
+        type: /ExceptionGroup/i.test(msg) ? "ExceptionGroup" : "TaskGroup",
+        message: rootMessage,
+        raw: msg.slice(0, 2000),
+      },
+      hint: "Shared herdr control-plane blip (snapshot/events/socket). Agent is usually still fine — retry the same read; do not blind-retry mutations.",
       daemon,
     });
   }
 
   return toResult({
     ok: false,
-    failure: isTrueTransportFailure(detail.code, detail.message) ? "herdr_transport" : "herdr_error",
+    failure: isTrueTransportFailure(detail.code, msg) ? "herdr_transport" : "herdr_error",
     context,
     ...detail,
     daemon,
   });
+}
+
+/**
+ * Live session.snapshot with SnapshotCache fallback.
+ * fs_* / inspect helpers must not surface bare ExceptionGroup when a cached
+ * snapshot can still authorize managed roots.
+ */
+async function liveSnapshot(
+  c: HerdrClient,
+  context: string,
+): Promise<
+  | { ok: true; snap: HerdrResult; warnings: string[] }
+  | { ok: false; result: ReturnType<typeof toResult> }
+> {
+  const cache = getSnapshotCache(c);
+  await Promise.race([cache.whenReady(), new Promise<void>((r) => setTimeout(r, 800))]);
+  const cached = cache.getSnapshot();
+  const cacheUseful = Array.isArray(cached["workspaces"])
+    || Array.isArray(cached["panes"])
+    || (Array.isArray(cached["agents"]) && (cached["agents"] as unknown[]).length > 0);
+  try {
+    return { ok: true, snap: await c.snapshot(), warnings: [] };
+  } catch (e) {
+    if (cacheUseful) {
+      return { ok: true, snap: cached, warnings: ["snapshot_refresh_failed_used_cache"] };
+    }
+    return { ok: false, result: herdrErrorResult(e, context, "snapshot_refresh") };
+  }
 }
 
 /**
@@ -573,10 +655,14 @@ function registerTools(server: McpServer): void {
     {
       description:
         "Check herdr connection and list workspaces (with cwd), tabs, panes, and agents in one call. " +
+        "Also returns workstation_info: default_cwd hints, server/build, readonly/write_roots, " +
+        "and a short exec_environment summary (PATH binaries relevant to local coding). " +
         "Agents come from the shared SnapshotCache (live events + 30s snapshot fallback) and carry " +
-        "started_at + last_activity_at. Collaboration roles: main=research/planning/delegation, " +
-        "worker=implementation+child cleanup, verifier=independent validation. Prefer explicit " +
-        "pane_id/workspace_id from this view when addressing targets in other tools.",
+        "started_at + last_activity_at. YOU (web) are the planner/orchestrator. Prefer herdr_fs_* / " +
+        "herdr_exec / herdr_git before any herdr_prompt. Agent lists soft-hide expensive kinds " +
+        "(Claude/OMP/Codex); only allowlisted workers (pi, cline, opencode, anti) and auditors " +
+        "(droid, grok) appear — override with HERDR_MCP_AGENT_ALLOW. herdr_prompt by known " +
+        "name/pane_id is NOT blocked. Prefer explicit pane_id/workspace_id from this view.",
     },
     async () => {
       const c = clientGet();
@@ -584,26 +670,95 @@ function registerTools(server: McpServer): void {
       try {
         pong = await c.ping();
       } catch (e) {
-        return herdrErrorResult(e, "herdr_inspect");
+        return herdrErrorResult(e, "herdr_inspect", "ping");
       }
       const cache = getSnapshotCache(c);
       // Await the cache's first bootstrap (short cap) so an immediate inspect
       // doesn't read an empty state; fall back to a direct snapshot if the
-      // cache can't bootstrap (daemon hiccup) — inspect never hangs.
+      // cache can't bootstrap (daemon hiccup) — inspect never hangs / never throws.
       await Promise.race([cache.whenReady(), new Promise<void>((r) => setTimeout(r, 1500))]);
+      const warnings: string[] = [];
       let snap = cache.getSnapshot();
-      if (!Array.isArray(snap["agents"]) || (snap["agents"] as unknown[]).length === 0) {
-        snap = await c.snapshot();
+      const cacheEmpty = !Array.isArray(snap["agents"]) || (snap["agents"] as unknown[]).length === 0;
+      if (cacheEmpty) {
+        try {
+          snap = await c.snapshot();
+        } catch (e) {
+          // Prefer any partial cache over a bare ExceptionGroup / TaskGroup to the client.
+          const cached = cache.getSnapshot();
+          const hasPartial = Array.isArray(cached["workspaces"]) || Array.isArray(cached["panes"])
+            || Array.isArray(cached["agents"]);
+          if (hasPartial) {
+            snap = cached;
+            warnings.push("snapshot_refresh_failed_used_cache");
+          } else {
+            return herdrErrorResult(e, "herdr_inspect", "snapshot_refresh");
+          }
+        }
       }
-      const view = projectSnapshot(snap);
-      // Agents from the single source of truth, enriched with activity timestamps.
-      const enriched = cache.agentViews();
-      view["agents"] = enriched.length > 0 ? enriched : ((snap["agents"] as unknown[]) ?? []);
-      view["ok"] = true;
-      view["herdr_version"] = pong["version"];
-      view["protocol"] = pong["protocol"];
-      view["build"] = buildInfo();
-      return toResult(view);
+      try {
+        const view = projectSnapshot(snap);
+        const enriched = filterVisibleAgents(cache.agentViews());
+        const rawCount = ((snap["agents"] as unknown[]) ?? []).length;
+        view["agents"] = enriched.length > 0 ? enriched : filterVisibleAgents(
+          ((snap["agents"] as unknown[]) ?? []).map((a) => {
+            const rec = (a ?? {}) as Record<string, unknown>;
+            return {
+              name: rec["agent"],
+              kind: rec["kind"] ?? rec["agent_kind"],
+              pane: rec["pane_id"],
+              status: rec["agent_status"] ?? rec["status"],
+              workspace: rec["workspace_id"],
+              cwd: rec["cwd"] ?? rec["foreground_cwd"],
+            };
+          }),
+        );
+        Object.assign(view, visibilityMeta(Math.max(0, rawCount - (view["agents"] as unknown[]).length)));
+        view["ok"] = true;
+        view["herdr_version"] = pong["version"];
+        view["protocol"] = pong["protocol"];
+        view["build"] = buildInfo();
+        const managed = managedRoots(snap);
+        const which = (bin: string): string | null => {
+          try {
+            return execSync(`command -v ${bin}`, { timeout: 500, stdio: ["ignore", "pipe", "ignore"] })
+              .toString().trim() || null;
+          } catch { return null; }
+        };
+        view["workstation_info"] = {
+          server_name: SERVER_NAME,
+          server_version: SERVER_VERSION,
+          boot_id: BOOT_ID,
+          default_cwd: typeof view["focused_pane"] === "string"
+            ? ((view["panes"] as { id?: string; cwd?: string }[] | undefined)?.find((p) => p.id === view["focused_pane"])?.cwd
+              ?? (view["workspaces"] as { focused?: boolean; cwd?: string }[] | undefined)?.find((w) => w.focused)?.cwd
+              ?? null)
+            : ((view["workspaces"] as { focused?: boolean; cwd?: string }[] | undefined)?.find((w) => w.focused)?.cwd ?? null),
+          managed_git_roots: managed.sort(),
+          readonly_mode: READONLY_MODE,
+          write_roots: WRITE_ROOTS.length ? WRITE_ROOTS : null,
+          agent_visibility: view["agent_visibility"],
+          exec_sessions: listExecSessions(),
+          exec_environment: {
+            shell: process.env.SHELL ?? "/bin/zsh",
+            node: process.version,
+            path_has: {
+              git: which("git"),
+              rg: which("rg"),
+              npm: which("npm"),
+              python3: which("python3"),
+            },
+            hint: "Short sync shell: herdr_exec. Long jobs: herdr_exec_start → herdr_exec_read → herdr_exec_kill. Git facts: herdr_git. Patches: herdr_fs_patch.",
+          },
+        };
+        if (warnings.length) view["warnings"] = warnings;
+        if (cache.lastError) {
+          view["cache_loop_error"] = cache.lastError.message;
+        }
+        return toResult(view);
+      } catch (e) {
+        return herdrErrorResult(e, "herdr_inspect", "project_snapshot");
+      }
     },
   );
 
@@ -1219,38 +1374,80 @@ function registerTools(server: McpServer): void {
     },
     async ({ cursor, workspace }) => {
       const c = clientGet();
-      const cache = getSnapshotCache(c);
-      await Promise.race([cache.whenReady(), new Promise<void>((r) => setTimeout(r, 2000))]);
-      const dig = cache.digestSince(cursor);
-      let events = dig.events;
-      let agents = dig.agents;
-      let workspaces = dig.workspaces;
-      if (workspace) {
-        // resolve label -> workspace_id
-        const ids = new Set<string>();
-        for (const w of workspaces) {
-          const rec = w as Record<string, unknown>;
-          if (rec["workspace_id"] === workspace || rec["label"] === workspace) {
-            if (typeof rec["workspace_id"] === "string") ids.add(rec["workspace_id"] as string);
+      try {
+        const cache = getSnapshotCache(c);
+        await Promise.race([cache.whenReady(), new Promise<void>((r) => setTimeout(r, 2000))]);
+        const dig = cache.digestSince(cursor);
+        let events = dig.events;
+        let agents = dig.agents;
+        let workspaces = dig.workspaces;
+        const warnings: string[] = [];
+        // Live digest empty after reconnect blip → one direct snapshot for agents, keep events from cache.
+        if (agents.length === 0) {
+          try {
+            const snap = await c.snapshot();
+            const snapAgents = ((snap["agents"] as unknown[]) ?? []) as Record<string, unknown>[];
+            if (snapAgents.length > 0) {
+              agents = snapAgents.map((rec) => ({
+                name: typeof rec["agent"] === "string" ? rec["agent"] : null,
+                pane: typeof rec["pane_id"] === "string" ? rec["pane_id"] : null,
+                status: typeof rec["agent_status"] === "string" ? rec["agent_status"]
+                  : typeof rec["status"] === "string" ? rec["status"] : null,
+                workspace: typeof rec["workspace_id"] === "string" ? rec["workspace_id"] : null,
+                cwd: typeof rec["cwd"] === "string" ? rec["cwd"] : null,
+                started_at: null as string | null,
+                last_activity_at: null as string | null,
+                state_change_seq: rec["state_change_seq"],
+              }));
+              warnings.push("since_used_snapshot_fallback");
+            }
+            if (workspaces.length === 0 && Array.isArray(snap["workspaces"])) {
+              workspaces = snap["workspaces"] as Record<string, unknown>[];
+            }
+          } catch (e) {
+            if (isHerdrControlPlaneTaskGroup(e instanceof Error ? e.message : String(e))) {
+              warnings.push("since_snapshot_fallback_taskgroup");
+            } else {
+              return herdrErrorResult(e, "herdr_since", "snapshot_fallback");
+            }
           }
         }
-        if (ids.size === 0) ids.add(workspace);
-        events = events.filter((e: { workspace_id?: string; pane_id?: string }) =>
-          (e.workspace_id && ids.has(e.workspace_id)) || false);
-        agents = agents.filter((a: { workspace?: string | null }) => a.workspace && ids.has(a.workspace));
+        if (workspace) {
+          const ids = new Set<string>();
+          for (const w of workspaces) {
+            const rec = w as Record<string, unknown>;
+            if (rec["workspace_id"] === workspace || rec["label"] === workspace) {
+              if (typeof rec["workspace_id"] === "string") ids.add(rec["workspace_id"] as string);
+            }
+          }
+          if (ids.size === 0) ids.add(workspace);
+          events = events.filter((e: { workspace_id?: string; pane_id?: string }) =>
+            (e.workspace_id && ids.has(e.workspace_id)) || false);
+          agents = agents.filter((a: { workspace?: string | null }) => a.workspace && ids.has(a.workspace));
+        }
+        const agentsBeforeHide = agents.length;
+        agents = filterVisibleAgents(agents);
+        const cursorReset = cursor > dig.cursor;
+        if (cursorReset) warnings.push("cursor_reset_boot_or_rollover");
+        return toResult({
+          ok: true,
+          boot_id: BOOT_ID,
+          cursor: dig.cursor,
+          cursor_reset: cursorReset,
+          event_count: events.length,
+          events,
+          agents,
+          workspaces: workspaces.map((w) => {
+            const r = w as Record<string, unknown>;
+            return { workspace_id: r["workspace_id"], label: r["label"], cwd: r["cwd"], panes: r["pane_count"], tabs: r["tab_count"] };
+          }),
+          ...visibilityMeta(agentsBeforeHide - agents.length),
+          ...(warnings.length ? { warnings } : {}),
+          hint: "save boot_id+cursor; if boot_id changes or cursor_reset=true, start from cursor 0",
+        });
+      } catch (e) {
+        return herdrErrorResult(e, "herdr_since", "digest");
       }
-      return toResult({
-        ok: true,
-        cursor: dig.cursor,
-        event_count: events.length,
-        events,
-        agents,
-        workspaces: workspaces.map((w) => {
-          const r = w as Record<string, unknown>;
-          return { workspace_id: r["workspace_id"], label: r["label"], cwd: r["cwd"], panes: r["pane_count"], tabs: r["tab_count"] };
-        }),
-        hint: "save cursor; pass it as the cursor arg next time for an incremental view",
-      });
     },
   );
 
@@ -1372,11 +1569,9 @@ function registerTools(server: McpServer): void {
     },
     async ({ path: p, start_line, end_line, max_bytes }) => {
       const c = clientGet();
-      let snap: HerdrResult;
-      try { snap = await c.snapshot(); } catch (e) {
-        const err = e instanceof HerdrError ? e : new HerdrError("error", String(e));
-        return toResult({ ok: false, code: err.code, message: err.message });
-      }
+      const live = await liveSnapshot(c, "herdr_fs_read");
+      if (!live.ok) return live.result;
+      const snap = live.snap;
       const v = await validateManagedFile(snap, p, true);
       if (!v.ok) return toResult(v.err);
       let data: Buffer;
@@ -1389,12 +1584,31 @@ function registerTools(server: McpServer): void {
       const e0 = Math.min(end_line ?? s0 + 199, allLines.length);
       let content = allLines.slice(s0 - 1, e0).join("\n");
       let truncated = e0 < allLines.length;
+      let truncated_by: "lines" | "bytes" | null = truncated ? "lines" : null;
       if (Buffer.byteLength(content, "utf-8") > budget) {
-        content = Buffer.from(content, "utf-8").subarray(0, budget).toString("utf-8");
+        // Keep only complete lines so next_start_line never skips a partial line's tail.
+        const buf = Buffer.from(content, "utf-8").subarray(0, budget);
+        const lastNl = buf.lastIndexOf(0x0a);
+        content = lastNl >= 0 ? buf.subarray(0, lastNl).toString("utf-8") : "";
         truncated = true;
+        truncated_by = "bytes";
       }
+      const linesDelivered = content === "" ? 0 : content.split("\n").length;
+      const next_start_line = truncated
+        ? (truncated_by === "bytes"
+          ? (linesDelivered === 0 ? s0 : s0 + linesDelivered)
+          : e0 + 1)
+        : null;
       return toResult({ ok: true, path: v.resolved, root: v.root,
-        lines: { start: s0, end: e0, total: allLines.length }, bytes: data.length, budget, truncated, content });
+        lines: {
+          start: s0,
+          end: truncated_by === "bytes"
+            ? (linesDelivered === 0 ? s0 - 1 : s0 + linesDelivered - 1)
+            : e0,
+          total: allLines.length,
+        },
+        next_start_line, truncated_by, bytes: data.length, budget, truncated, content,
+        ...(live.warnings.length ? { warnings: live.warnings } : {}) });
     },
   );
 
@@ -1417,11 +1631,9 @@ function registerTools(server: McpServer): void {
     },
     async ({ path: p, recursive, glob, max_entries }) => {
       const c = clientGet();
-      let snap: HerdrResult;
-      try { snap = await c.snapshot(); } catch (e) {
-        const err = e instanceof HerdrError ? e : new HerdrError("error", String(e));
-        return toResult({ ok: false, code: err.code, message: err.message });
-      }
+      const live = await liveSnapshot(c, "herdr_fs_list");
+      if (!live.ok) return live.result;
+      const snap = live.snap;
       const v = await validateManagedFile(snap, p, true);
       if (!v.ok) return toResult(v.err);
       let st;
@@ -1452,7 +1664,12 @@ function registerTools(server: McpServer): void {
           } else if (globRe && !globRe.test(name)) {
             continue;
           }
-          const rec: Record<string, unknown> = { name, type };
+          const rec: Record<string, unknown> = {
+            name,
+            type,
+            path: full,
+            relative_path: path.relative(v.real, full) || ".",
+          };
           if (type === "file") {
             try { const fs = await stat(full); rec.size = fs.size; rec.mtime = fs.mtime.toISOString(); } catch { /* ignore */ }
           }
@@ -1485,11 +1702,9 @@ function registerTools(server: McpServer): void {
     },
     async ({ root: p, pattern, regex, glob, max_matches, max_bytes, case_insensitive }) => {
       const c = clientGet();
-      let snap: HerdrResult;
-      try { snap = await c.snapshot(); } catch (e) {
-        const err = e instanceof HerdrError ? e : new HerdrError("error", String(e));
-        return toResult({ ok: false, code: err.code, message: err.message });
-      }
+      const live = await liveSnapshot(c, "herdr_fs_grep");
+      if (!live.ok) return live.result;
+      const snap = live.snap;
       const v = await validateManagedFile(snap, p, true);
       if (!v.ok) return toResult(v.err);
       let st;
@@ -1507,7 +1722,7 @@ function registerTools(server: McpServer): void {
       const re = regex ? new RegExp(pattern, case_insensitive ? "i" : "") : null;
       const lit = regex ? null : pattern;
 
-      // Prefer ripgrep (rg) when available; fall back to a Node traversal.
+      // Prefer ripgrep (rg) when available; stream lines and stop at budgets.
       const rgArgs = [
         "--line-number", "--no-heading", "--color", "never",
         ...(regex ? [] : ["-F"]),
@@ -1516,30 +1731,46 @@ function registerTools(server: McpServer): void {
         "--max-count", String(matchBudget),
         pattern, v.real,
       ];
-      const rgOut = await new Promise<string | null>((resolve) => {
+      const rgOk = await new Promise<boolean>((resolve) => {
         let child;
         try { child = spawn("rg", rgArgs, { stdio: ["ignore", "pipe", "ignore"] }); }
-        catch { resolve(null); return; }
-        let buf = "";
-        child.stdout.on("data", (d) => { buf += d.toString("utf-8"); });
-        child.on("error", () => resolve(null));
-        child.on("close", () => resolve(buf));
+        catch { resolve(false); return; }
+        let carry = "";
+        let totalBytes = 0;
+        child.stdout.on("data", (d: Buffer) => {
+          totalBytes += d.length;
+          if (totalBytes > byteBudget * 8) { // hard ceiling on rg stdout
+            truncated = true;
+            try { child.kill("SIGTERM"); } catch { /* ignore */ }
+            return;
+          }
+          carry += d.toString("utf-8");
+          const parts = carry.split("\n");
+          carry = parts.pop() ?? "";
+          for (const line of parts) {
+            if (!line.trim()) continue;
+            if (out.length >= matchBudget) {
+              truncated = true;
+              try { child.kill("SIGTERM"); } catch { /* ignore */ }
+              return;
+            }
+            const idx = line.indexOf(":");
+            if (idx < 0) continue;
+            const file = line.slice(0, idx);
+            const rest = line.slice(idx + 1);
+            const idx2 = rest.indexOf(":");
+            if (idx2 < 0) continue;
+            const lineNo = Number(rest.slice(0, idx2));
+            const content = rest.slice(idx2 + 1);
+            if (Buffer.byteLength(content, "utf-8") > byteBudget) { truncated = true; continue; }
+            if (deniedSecretPath(file)) continue;
+            out.push({ file, line: lineNo, content });
+          }
+        });
+        child.on("error", () => resolve(false));
+        child.on("close", () => resolve(true));
       });
-      if (rgOut !== null) {
-        for (const line of rgOut.split("\n")) {
-          if (!line.trim()) continue;
-          if (out.length >= matchBudget) { truncated = true; break; }
-          const idx = line.indexOf(":");
-          if (idx < 0) continue;
-          const file = line.slice(0, idx);
-          const rest = line.slice(idx + 1);
-          const idx2 = rest.indexOf(":");
-          if (idx2 < 0) continue;
-          const lineNo = Number(rest.slice(0, idx2));
-          const content = rest.slice(idx2 + 1);
-          if (deniedSecretPath(file)) continue;
-          out.push({ file, line: lineNo, content });
-        }
+      if (rgOk) {
         return toResult({ ok: true, root: v.resolved, count: out.length, truncated, matches: out, engine: "rg" });
       }
 
@@ -1575,6 +1806,343 @@ function registerTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "herdr_fs_patch",
+    {
+      description:
+        "Apply a coding-tools/Codex-style patch (*** Begin Patch / *** End Patch) inside a managed " +
+        "git root. Prefer this over herdr_fs_edit for multi-hunk / multi-file edits. Paths in the " +
+        "patch may be absolute or relative to root. dry_run:true validates without writing. " +
+        "Same dirty/busy gates as herdr_fs_edit when applying.",
+      inputSchema: {
+        root: z.string().describe("Managed git project root (absolute)"),
+        patch: z.string().describe("Full *** Begin Patch ... *** End Patch text"),
+        dry_run: z.boolean().default(false),
+        confirm_dirty: z.boolean().default(false),
+        confirm_busy: z.boolean().default(false),
+      },
+    },
+    async ({ root: rootIn, patch, dry_run, confirm_dirty, confirm_busy }) => {
+      const c = clientGet();
+      const live = await liveSnapshot(c, "herdr_fs_patch");
+      if (!live.ok) return live.result;
+      const snap = live.snap;
+      const rootV = await validateManagedFile(snap, rootIn, true);
+      if (!rootV.ok) return toResult(rootV.err);
+      let st;
+      try { st = await stat(rootV.real); } catch (e) {
+        return toResult({ ok: false, reason: "stat_failed", path: rootV.resolved, message: String(e) });
+      }
+      if (!st.isDirectory()) return toResult({ ok: false, reason: "not_a_directory", path: rootV.resolved });
+      // dry_run is read-only validation — allow under HERDR_MCP_READONLY
+      if (!dry_run) {
+        const gate = mutationDenied(rootV.root, "herdr_fs_patch");
+        if (gate) return toResult(gate);
+      }
+      const working = workingAgentsForRoot(snap, rootV.root);
+      if (working.length > 0 && !confirm_busy && !dry_run) {
+        return toResult({ ok: false, reason: "agent_working", root: rootV.root, working,
+          hint: "pass confirm_busy:true to force, or wait for idle" });
+      }
+      let ops;
+      try { ops = parsePatch(patch); }
+      catch (e) {
+        const err = e instanceof PatchError ? e : new PatchError("PATCH_FAILED", String(e));
+        return toResult({ ok: false, code: err.code, message: err.message, ...(err.details ?? {}) });
+      }
+      if (!ops.length) return toResult({ ok: false, code: "PATCH_FAILED", message: "No files were modified." });
+
+      const resolveTarget = async (raw: string, mustExist: boolean) => {
+        const abs = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(rootV.real, raw);
+        return validateManagedFile(snap, abs, mustExist);
+      };
+
+      type Staged = { display: string; real: string; content: string | null; op: string };
+      const staged: Staged[] = [];
+      const summaries: string[] = [];
+      let additions = 0;
+      let removals = 0;
+
+      try {
+        for (const op of ops) {
+          if (op.kind === "add") {
+            const v = await resolveTarget(op.path, false);
+            if (!v.ok) return toResult({ ...v.err, patch_op: "add" });
+            try { await stat(v.real); return toResult({ ok: false, code: "PATCH_FAILED", message: "Cannot add file that already exists.", path: v.resolved }); }
+            catch { /* expected missing */ }
+            staged.push({ display: v.resolved, real: v.real, content: op.content, op: "add" });
+            summaries.push(`A ${v.resolved}`);
+            additions += op.content.split("\n").length;
+          } else if (op.kind === "delete") {
+            const v = await resolveTarget(op.path, true);
+            if (!v.ok) return toResult({ ...v.err, patch_op: "delete" });
+            const text = await readFile(v.real, "utf-8");
+            staged.push({ display: v.resolved, real: v.real, content: null, op: "delete" });
+            summaries.push(`D ${v.resolved}`);
+            removals += text.split("\n").length;
+          } else {
+            const v = await resolveTarget(op.path, true);
+            if (!v.ok) return toResult({ ...v.err, patch_op: "update" });
+            const old = await readFile(v.real, "utf-8");
+            const updated = applyUpdateHunks(old, op.hunks, v.resolved);
+            for (const hunk of op.hunks) {
+              for (const line of hunk) {
+                if (line.startsWith("+")) additions += 1;
+                if (line.startsWith("-")) removals += 1;
+              }
+            }
+            if (op.move_to) {
+              const dest = await resolveTarget(op.move_to, false);
+              if (!dest.ok) return toResult({ ...dest.err, patch_op: "move" });
+              staged.push({ display: v.resolved, real: v.real, content: null, op: "delete" });
+              staged.push({ display: dest.resolved, real: dest.real, content: updated, op: "add" });
+              summaries.push(`R ${v.resolved} -> ${dest.resolved}`);
+            } else {
+              staged.push({ display: v.resolved, real: v.real, content: updated, op: "update" });
+              summaries.push(`M ${v.resolved}`);
+            }
+          }
+        }
+      } catch (e) {
+        const err = e instanceof PatchError ? e : new PatchError("PATCH_FAILED", String(e));
+        return toResult({ ok: false, code: err.code, message: err.message, ...(err.details ?? {}) });
+      }
+
+      if (!dry_run) {
+        for (const s of staged) {
+          if (s.content === null) {
+            if (fileDirty(rootV.root, s.real) && !confirm_dirty) {
+              return toResult({ ok: false, reason: "file_dirty_confirmation_required", path: s.display,
+                hint: "re-send with confirm_dirty:true" });
+            }
+          } else if (s.op !== "add") {
+            if (fileDirty(rootV.root, s.real) && !confirm_dirty) {
+              return toResult({ ok: false, reason: "file_dirty_confirmation_required", path: s.display,
+                hint: "re-send with confirm_dirty:true" });
+            }
+          }
+        }
+        try {
+          await commitAtomic(staged.map((s) => ({ real: s.real, content: s.content })));
+        } catch (e) {
+          return toResult({
+            ok: false,
+            code: "PATCH_COMMIT_FAILED",
+            message: e instanceof Error ? e.message : String(e),
+            hint: "patch rolled back when possible; re-read files and regenerate",
+          });
+        }
+      }
+
+      return toResult({
+        ok: true,
+        dry_run,
+        root: rootV.root,
+        summary: summaries.join("\n"),
+        affected_files: staged.map((s) => ({ path: s.display, operation: s.op })),
+        additions,
+        removals,
+        ...(working.length ? { warnings: { working } } : {}),
+        ...(live.warnings.length ? { cache_warnings: live.warnings } : {}),
+      });
+    },
+  );
+
+  server.registerTool(
+    "herdr_fs_image",
+    {
+      description:
+        "Read an image under a managed git root and return it as an MCP image (plus JSON metadata). " +
+        "Use for screenshots/UI assets so the web model can see pixels without a local agent.",
+      inputSchema: {
+        path: z.string().describe("Absolute image path inside a managed project root"),
+        max_bytes: z.number().int().min(1).max(8_000_000).optional()
+          .describe("Byte ceiling (default 2097152)"),
+      },
+    },
+    async ({ path: p, max_bytes }) => {
+      const c = clientGet();
+      const live = await liveSnapshot(c, "herdr_fs_image");
+      if (!live.ok) return live.result;
+      const v = await validateManagedFile(live.snap, p, true);
+      if (!v.ok) return toResult(v.err);
+      const budget = max_bytes ?? 2_097_152;
+      let data: Buffer;
+      try { data = await readFile(v.real); }
+      catch (e) { return toResult({ ok: false, reason: "read_failed", path: v.resolved, message: String(e) }); }
+      if (data.length > budget) {
+        return toResult({ ok: false, reason: "image_too_large", path: v.resolved, bytes: data.length, max_bytes: budget });
+      }
+      const ext = path.extname(v.real).toLowerCase();
+      const mime =
+        ext === ".png" ? "image/png"
+        : ext === ".jpg" || ext === ".jpeg" ? "image/jpeg"
+        : ext === ".gif" ? "image/gif"
+        : ext === ".webp" ? "image/webp"
+        : null;
+      if (!mime) {
+        return toResult({ ok: false, reason: "unsupported_image", path: v.resolved, hint: "png/jpeg/gif/webp only" });
+      }
+      const meta = {
+        ok: true,
+        path: v.resolved,
+        root: v.root,
+        mime_type: mime,
+        bytes: data.length,
+      };
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(meta) },
+          { type: "image" as const, data: data.toString("base64"), mimeType: mime },
+        ],
+      };
+    },
+  );
+
+  server.registerTool(
+    "herdr_git",
+    {
+      description:
+        "Deterministic git facts for a managed root — prefer this over herdr_prompt to a local agent. " +
+        "action=status|diff|log. Web planner should call this itself to verify changes.",
+      inputSchema: {
+        root: z.string().describe("Managed git project root (absolute)"),
+        action: z.enum(["status", "diff", "log"]).describe("Git action"),
+        path: z.string().optional().describe("Optional path for diff (repo-relative or absolute under root)"),
+        staged: z.boolean().default(false).describe("diff --staged when action=diff"),
+        max_count: z.number().int().min(1).max(100).optional().describe("log -n (default 20)"),
+        max_bytes: z.number().int().min(1).max(512_000).optional().describe("Output byte ceiling (default 65536)"),
+      },
+    },
+    async ({ root: rootIn, action, path: pathIn, staged, max_count, max_bytes }) => {
+      const c = clientGet();
+      const live = await liveSnapshot(c, "herdr_git");
+      if (!live.ok) return live.result;
+      const rootV = await validateManagedFile(live.snap, rootIn, true);
+      if (!rootV.ok) return toResult(rootV.err);
+      if (gitToplevel(rootV.real) !== rootV.real && gitToplevel(rootV.real) !== rootV.root) {
+        // allow if root is the git toplevel
+        const top = gitToplevel(rootV.real);
+        if (!top) return toResult({ ok: false, reason: "not_a_git_repo", root: rootV.resolved });
+      }
+      const budget = max_bytes ?? 65536;
+      const args: string[] =
+        action === "status" ? ["status", "--porcelain", "-b"]
+        : action === "diff"
+          ? ["diff", ...(staged ? ["--staged"] : []), ...(pathIn ? ["--", path.isAbsolute(pathIn) ? pathIn : pathIn] : [])]
+          : ["log", `-n${max_count ?? 20}`, "--oneline", "--decorate"];
+      const r = spawnSync("git", args, {
+        cwd: rootV.real,
+        timeout: 15_000,
+        maxBuffer: Math.max(budget + 4096, 8_388_608),
+        encoding: "utf-8",
+      });
+      if (r.error) {
+        return toResult({ ok: false, root: rootV.root, action, message: String(r.error) });
+      }
+      let text = String(r.stdout ?? "");
+      let truncated = false;
+      if (Buffer.byteLength(text, "utf-8") > budget) {
+        text = Buffer.from(text, "utf-8").subarray(0, budget).toString("utf-8");
+        truncated = true;
+      }
+      // git diff without --exit-code returns 0 even with changes; nonzero = real error.
+      if ((r.status ?? 0) !== 0) {
+        return toResult({
+          ok: false,
+          root: rootV.root,
+          action,
+          exit_code: r.status,
+          output: text,
+          stderr: String(r.stderr ?? ""),
+        });
+      }
+      return toResult({
+        ok: true,
+        root: rootV.root,
+        action,
+        exit_code: 0,
+        truncated,
+        output: text,
+        ...(r.stderr ? { stderr: String(r.stderr).slice(0, 2000) } : {}),
+        ...(live.warnings.length ? { warnings: live.warnings } : {}),
+      });
+    },
+  );
+
+  server.registerTool(
+    "herdr_exec_start",
+    {
+      description:
+        "Start a long-running shell command in a managed project root as a background session " +
+        "(local process, not the herdr utility pane). Returns session_id. Then poll with " +
+        "herdr_exec_read and finish with herdr_exec_kill. For short commands prefer herdr_exec.",
+      inputSchema: {
+        root: z.string().describe("Managed git project root used as cwd"),
+        command: z.string().describe("Shell command line"),
+        confirm_busy: z.boolean().default(false),
+      },
+    },
+    async ({ root: rootIn, command, confirm_busy }) => {
+      const c = clientGet();
+      const live = await liveSnapshot(c, "herdr_exec_start");
+      if (!live.ok) return live.result;
+      const rootV = await validateManagedFile(live.snap, rootIn, true);
+      if (!rootV.ok) return toResult(rootV.err);
+      const gate = mutationDenied(rootV.root, "herdr_exec_start");
+      if (gate) return toResult(gate);
+      const working = workingAgentsForRoot(live.snap, rootV.root);
+      if (working.length > 0 && !confirm_busy) {
+        return toResult({ ok: false, reason: "agent_working", root: rootV.root, working,
+          hint: "pass confirm_busy:true to force" });
+      }
+      const s = startExecSession({ command, cwd: rootV.real });
+      return toResult({
+        ok: true,
+        session_id: s.id,
+        root: rootV.root,
+        command,
+        hint: "poll herdr_exec_read with session_id; herdr_exec_kill when done",
+        ...(working.length ? { warnings: { working } } : {}),
+      });
+    },
+  );
+
+  server.registerTool(
+    "herdr_exec_read",
+    {
+      description:
+        "Read stdout/stderr from a herdr_exec_start session. Pass offset=next_offset to continue. " +
+        "running=false when the process has exited.",
+      inputSchema: {
+        session_id: z.string(),
+        stream: z.enum(["stdout", "stderr", "both"]).default("both"),
+        offset: z.number().int().min(0).optional(),
+        limit: z.number().int().min(1).max(262144).optional(),
+      },
+    },
+    async ({ session_id, stream, offset, limit }) => {
+      const r = readExecSession(session_id, { stream, offset, limit });
+      if (!r.ok) return toResult(r);
+      return toResult(r);
+    },
+  );
+
+  server.registerTool(
+    "herdr_exec_kill",
+    {
+      description: "Terminate a herdr_exec_start session (SIGTERM then SIGKILL).",
+      inputSchema: {
+        session_id: z.string(),
+      },
+    },
+    async ({ session_id }) => {
+      const r = killExecSession(session_id);
+      if (!r.ok) return toResult({ ok: false, reason: r.reason });
+      return toResult(r);
+    },
+  );
+
+  server.registerTool(
     "herdr_exec",
     {
       description:
@@ -1601,11 +2169,9 @@ function registerTools(server: McpServer): void {
     },
     async ({ workspace: wsTarget, command, project_root, timeout_ms, confirm_busy }) => {
       const c = clientGet();
-      let snap: HerdrResult;
-      try { snap = await c.snapshot(); } catch (e) {
-        const err = e instanceof HerdrError ? e : new HerdrError("error", String(e));
-        return toResult({ ok: false, code: err.code, message: err.message });
-      }
+      const live = await liveSnapshot(c, "herdr_exec");
+      if (!live.ok) return live.result;
+      const snap = live.snap;
       const wsRec = ((snap["workspaces"] as unknown[]) ?? [])
         .map((w) => (w ?? {}) as Record<string, unknown>)
         .find((w) => w["workspace_id"] === wsTarget || w["label"] === wsTarget);
@@ -1688,6 +2254,7 @@ function registerTools(server: McpServer): void {
         const created0 = (r["pane"] ?? r) as Record<string, unknown>;
         paneId = (created0["pane_id"] ?? created0["id"] ?? null) as string | null;
         if (!paneId) return toResult({ ok: false, reason: "pane_split_failed", detail: r });
+        created = true;
         try { await c.call("pane.rename", { pane_id: paneId, label: "herdr-mcp:utility" }, 5000); } catch { /* label optional */ }
         // A fresh shell swallows input sent during zsh init — wait for a
         // prompt before the first command.
@@ -1703,13 +2270,25 @@ function registerTools(server: McpServer): void {
       const marker = `__HM_EXEC_${nonce}_EXIT_`;
       // Trailing \n submits the line (send_text types it; without Enter the
       // command would sit unentered in the shell — same failure class as the
-      // herdr_prompt delivery bug). The command runs in a SUBSHELL so `exit N`
-      // cannot kill the utility shell before the marker printf runs. When a
-      // project root is selected we `cd` INSIDE the subshell — the utility
-      // pane's foreground_cwd is deliberately not touched (cwd-safety P0).
+      // herdr_prompt delivery bug). Multiline / heredoc commands are written to
+      // a temp script so the utility shell never sees raw heredoc continuation.
       const shq = (s: string): string => "'" + s.replace(/'/g, `'\\''`) + "'";
-      const cdPart = effectiveRoot ? `cd -- ${shq(effectiveRoot)} && ` : "";
-      const cmdline = `(${cdPart}${command}); printf '\\n${marker}%s__' "$?"`;
+      const scriptPath = path.join(
+        process.env.TMPDIR || "/tmp",
+        `herdr-mcp-exec-${nonce}.sh`,
+      );
+      const scriptBody = [
+        "#!/bin/zsh",
+        "set +e",
+        effectiveRoot ? `cd -- ${shq(effectiveRoot)} || exit 127` : "",
+        command,
+      ].filter(Boolean).join("\n") + "\n";
+      try {
+        await writeFile(scriptPath, scriptBody, { encoding: "utf-8", mode: 0o700 });
+      } catch (e) {
+        return toResult({ ok: false, reason: "script_write_failed", message: String(e) });
+      }
+      const cmdline = `zsh ${shq(scriptPath)}; ec=$?; rm -f -- ${shq(scriptPath)}; printf '\\n${marker}%s__' "$ec"`;
       const readText = (rr: HerdrResult): string => {
         const rd = ((rr["read"] as Record<string, unknown>) ?? rr) as Record<string, unknown>;
         return String(rd["content"] ?? rd["text"] ?? rd["output"] ?? "");
@@ -1800,11 +2379,9 @@ function registerTools(server: McpServer): void {
     },
     async ({ path: p, old_string, new_string, confirm_dirty, confirm_busy }) => {
       const c = clientGet();
-      let snap: HerdrResult;
-      try { snap = await c.snapshot(); } catch (e) {
-        const err = e instanceof HerdrError ? e : new HerdrError("error", String(e));
-        return toResult({ ok: false, code: err.code, message: err.message });
-      }
+      const live = await liveSnapshot(c, "herdr_fs_edit");
+      if (!live.ok) return live.result;
+      const snap = live.snap;
       const v = await validateManagedFile(snap, p, true);
       if (!v.ok) return toResult(v.err);
       const gate = mutationDenied(v.root, "herdr_fs_edit");
@@ -1849,17 +2426,16 @@ function registerTools(server: McpServer): void {
       inputSchema: {
         path: z.string().describe("Absolute target path inside a managed project root"),
         content: z.string().describe("Full file content"),
+        overwrite: z.boolean().default(false).describe("Required true when overwriting an existing file"),
         confirm_dirty: z.boolean().default(false).describe("Acknowledge overwriting a git-dirty existing file"),
         confirm_busy: z.boolean().default(false).describe("Force write even when an agent in the project is working (returns warnings.working)"),
       },
     },
-    async ({ path: p, content, confirm_dirty, confirm_busy }) => {
+    async ({ path: p, content, overwrite, confirm_dirty, confirm_busy }) => {
       const c = clientGet();
-      let snap: HerdrResult;
-      try { snap = await c.snapshot(); } catch (e) {
-        const err = e instanceof HerdrError ? e : new HerdrError("error", String(e));
-        return toResult({ ok: false, code: err.code, message: err.message });
-      }
+      const live = await liveSnapshot(c, "herdr_fs_write");
+      if (!live.ok) return live.result;
+      const snap = live.snap;
       const v = await validateManagedFile(snap, p, false);
       if (!v.ok) return toResult(v.err);
       const gate = mutationDenied(v.root, "herdr_fs_write");
@@ -1871,6 +2447,10 @@ function registerTools(server: McpServer): void {
       }
       let existed = false;
       try { await readFile(v.real); existed = true; } catch { existed = false; }
+      if (existed && !overwrite) {
+        return toResult({ ok: false, reason: "overwrite_confirmation_required", path: v.resolved,
+          hint: "file exists — re-send with overwrite:true (and confirm_dirty:true if dirty)" });
+      }
       if (existed && fileDirty(v.root, v.real) && !confirm_dirty) {
         return toResult({ ok: false, reason: "file_dirty_confirmation_required", path: v.resolved,
           hint: "existing file has uncommitted changes — re-send with confirm_dirty:true to overwrite" });
@@ -1887,11 +2467,13 @@ function registerTools(server: McpServer): void {
     "herdr_prompt",
     {
       description:
-        "Send a prompt to a herdr agent via the socket-level agent.prompt (server-owned " +
-        "delivery; NEVER pane.send_text). DEFAULT: fire-and-forget (omit wait) — confirm " +
-        "progress with herdr_since / herdr_inspect. Strongly prefer idempotency_key on every " +
-        "call (replays return the stored result; never auto-retried). Returns delivery " +
-        "evidence: submitted, before/after, state_observation " +
+        "Send a prompt to a herdr agent via socket agent.prompt (NEVER pane.send_text). " +
+        "Prefer herdr_fs_* / herdr_exec when the work is deterministic file/shell IO (no local API burn). " +
+        "Target a cheap/fast worker (pi, flash, …) with a self-contained task; do NOT prompt " +
+        "Claude/OMP/main to plan or to command other panes — the web client owns orchestration. " +
+        "DEFAULT: fire-and-forget (omit wait); confirm with herdr_since / herdr_inspect. " +
+        "Strongly prefer idempotency_key (replays return stored result; never auto-retried). " +
+        "Returns delivery evidence: submitted, before/after, state_observation " +
         "({changed:true|false|\"unknown\", fresh}), plus legacy state_changed. Blocked target " +
         "-> status 'agent_blocked', submitted:false. Optional wait {until, timeout_ms} is " +
         "submit+wait; a status-wait timeout is failure_phase post_submission_status_wait " +
@@ -1915,6 +2497,8 @@ function registerTools(server: McpServer): void {
       },
     },
     async ({ target, text, idempotency_key, wait }) => {
+      const gate = mutationDenied(null, "herdr_prompt");
+      if (gate) return toResult(gate);
       const c = clientGet();
       // P0-2: idempotent replay — never re-send a non-idempotent prompt.
       if (idempotency_key) {
@@ -2230,15 +2814,16 @@ function clearStatelessSse(entry: { res: Response; hb: NodeJS.Timeout }): void {
  * every tool description.
  */
 const SERVER_INSTRUCTIONS =
-  "Herdr terminal-multiplexer control plane. Start: herdr_inspect. Resume: herdr_since(cursor). " +
-  "Read/list/search project files: herdr_fs_read / herdr_fs_list / herdr_fs_grep (managed git roots only). " +
-  "Shell in a workspace: herdr_exec. Do NOT route file IO through herdr_prompt / omp / agent tools — " +
-  "pane agents may crash with unrelated TaskGroup errors and that is not a herdr-mcp fs failure. " +
-  "Unknown native API: herdr_methods then herdr_call. Agent prompt: herdr_prompt + idempotency_key. " +
-  "Write/edit: herdr_fs_write / herdr_fs_edit. Before dev work require " +
-  "project_root == pane cwd == foreground cwd; use explicit workspace/pane IDs, never UI focus. " +
-  "Roles: main=planning, worker=implementation, verifier=audit. Never blind-retry a mutation after " +
-  "a transport failure — delivery is uncertain.";
+  "Herdr control plane for a WEB planner. Ladder: (1) herdr_fs_read/list/grep/patch/image + " +
+  "herdr_git + herdr_exec (short) / herdr_exec_start|read|kill (long) — zero local-agent API; " +
+  "(2) only if agent reasoning is required, herdr_prompt a cheap/fast worker (pi, flash, cline, " +
+  "opencode, anti) or auditor (droid, grok) with a self-contained task + idempotency_key; " +
+  "inspect/since soft-hide Claude/OMP/Codex (HERDR_MCP_AGENT_ALLOW overrides; prompt by known id still works); " +
+  "(3) YOU keep the plan — poll herdr_since / herdr_inspect and re-prompt workers yourself. " +
+  "Do NOT herdr_prompt Claude/OMP/main to plan, research, or delegate to other panes. " +
+  "Start: herdr_inspect (includes workstation_info). Unknown native API: herdr_methods then herdr_call. " +
+  "Before edits require project_root == pane cwd == foreground cwd; use explicit IDs, never UI focus. " +
+  "Never blind-retry mutations after uncertain delivery.";
 
 function mcpServerForSession(): McpServer {
   const server = new McpServer(
@@ -2628,7 +3213,9 @@ export function start(): void {
   const app = express();
   routes(app);
   app.listen(PORT, "127.0.0.1", () => {
-    console.log(`[herdr-mcp] listening on 127.0.0.1:${PORT}`);
+    const recovered = recoverExecSessionsOnBoot();
+    console.log(`[herdr-mcp] listening on 127.0.0.1:${PORT} boot_id=${BOOT_ID}` +
+      (recovered.reaped ? ` reaped_orphans=${recovered.reaped}` : ""));
   });
 }
 

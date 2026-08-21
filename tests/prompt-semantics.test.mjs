@@ -6,6 +6,8 @@ import assert from "node:assert/strict";
 import {
   isAgentStatusWaitTimeout,
   isTrueTransportFailure,
+  isHerdrControlPlaneTaskGroup,
+  unwrapControlPlaneMessage,
   buildStateObservation,
 } from "../dist/prompt-semantics.js";
 
@@ -18,6 +20,15 @@ test("status-wait message is not a true transport failure", () => {
 test("connect timeout remains transport", () => {
   assert.equal(isTrueTransportFailure("timeout", "connect /tmp/herdr.sock"), true);
   assert.equal(isTrueTransportFailure("connection_refused", "ECONNREFUSED"), true);
+});
+
+test("ExceptionGroup / TaskGroup is control-plane, not transport", () => {
+  const msg = "ExceptionGroup:\nunhandled errors in a TaskGroup (1 sub-exception)";
+  assert.equal(isHerdrControlPlaneTaskGroup(msg), true);
+  assert.equal(isTrueTransportFailure("UNKNOWN", msg), false);
+  assert.match(unwrapControlPlaneMessage(msg), /control-plane TaskGroup blip/);
+  const withRoot = "ExceptionGroup:\nConnectionResetError: socket closed";
+  assert.match(unwrapControlPlaneMessage(withRoot), /ConnectionResetError/);
 });
 
 test("state_observation: without wait, unchanged → unknown", () => {

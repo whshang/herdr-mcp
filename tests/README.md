@@ -6,8 +6,11 @@ Runs `tests/*.test.mjs` only:
 
 | File | Covers |
 |---|---|
-| `transport.test.mjs` | Streamable HTTP, openai-mcp stateless, sessions, discover, schema hygiene |
-| `fs_browse.test.mjs` | `herdr_fs_list` / `herdr_fs_grep` / write gates |
+| `transport.test.mjs` | Streamable HTTP, openai-mcp stateless, sessions, discover, schema hygiene, version cache-key |
+| `fs_browse.test.mjs` | Default 17 tools, `herdr_fs_list` / `herdr_fs_grep` / write gates, `overwrite` schema |
+| `atomic-files.test.mjs` | `commitAtomic` rollback (new-file cleanup + backup restore) |
+| `exec-sessions.test.mjs` / `exec-both-order.test.mjs` | closed/signal + `stream=both` interleave |
+| `agent-visibility.test.mjs` / `patch.test.mjs` / `prompt-semantics.test.mjs` | allowlist, patch parse, TaskGroup classification |
 
 ## Manual / integration (`tests/manual/`)
 

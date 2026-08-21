@@ -90,9 +90,17 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 
 改工具面或握手时 bump `SERVER_VERSION` / `package.json`，逼客户端重新 `tools/list`。
 
+当前身份：**0.3.17**。若工具描述仍缺 `herdr_fs_write.overwrite`、或看不到 `inspect.exec_sessions`：
+
+1. 确认公网进程已重启且 `/.well-known/mcp.json` 的 `version` 为 `0.3.17`
+2. ChatGPT 里刷新 / 重连 connector
+3. **开新对话**（旧对话会锁住旧 `tools/list` 快照）
+
+输入字段落后（尤其 `overwrite`）会导致「能建文件、不能按契约覆盖」。
+
 ## 「TaskGroup」/ omp 挂了却说读不了文件
 
-交叉验证（健康的 0.3.10+）：
+交叉验证（健康的 0.3.10+；控制面毛刺在 0.3.16+ 现场仍可能偶发）：
 
 | 工具 | 期望 |
 |---|---|
@@ -108,6 +116,16 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 3. 占用中的窗格又 `agent.start` 一次
 
 访问日志在 `herdr_call` 上会带 `call=<method>`（只记方法名）。读内容优先 `herdr_fs_*` + `herdr_exec`。
+
+## 编排：网页规划，本机省 API
+
+| 优先级 | 做法 | 本地 agent API |
+|---|---|---|
+| 1 | `herdr_fs_*` / `herdr_exec` 读改搜跑 | 不消耗 |
+| 2 | `herdr_prompt` → 便宜/高速 worker（pi、flash…），任务自包含 | 只烧便宜模型 |
+| 禁止默认 | `herdr_prompt` → Claude/OMP/main 再让它指挥其他窗格 | 贵模型大头 |
+
+网页模型用 `herdr_since` / `herdr_inspect` 自己续调度；插件「继续」也应推动网页再查状态，而不是把规划丢回本机主 agent。
 
 ## 排障清单
 

@@ -11,8 +11,8 @@
 //     byte offsets, never on chunk-decoded strings.
 //  4. 100 sequential requests alternating light tools
 //  5. reconnect: drop everything, re-initialize, stateless call
-//  6. HERDR_MCP_ALL_TOOLS=1 restores the full 22-tool surface (advanced +
-//     deprecated), while the default surface stays exactly 11.
+//  6. HERDR_MCP_ALL_TOOLS=1 restores the full 30-tool surface (advanced +
+//     deprecated), while the default surface stays exactly 17.
 //
 // Server runs from dist/ on an ephemeral port with a temp token. Never 8772.
 // All child processes are terminated in after()/finally; no process outlives
@@ -141,7 +141,7 @@ test("stateless: initialize then calls WITHOUT session id (ChatGPT pattern)", as
     const list = await rpc("tools/list", {}, { noSession: true });
     assert.equal(list.status, 200);
     assert.ok(Array.isArray(list.msg.result?.tools));
-    assert.equal(list.msg.result.tools.length, 11, `default tools/list must expose exactly 11 tools, got ${list.msg.result.tools.length}: ${list.msg.result.tools.map((t) => t.name).join(",")}`);
+    assert.equal(list.msg.result.tools.length, 17, `default tools/list must expose exactly 17 tools, got ${list.msg.result.tools.length}: ${list.msg.result.tools.map((t) => t.name).join(",")}`);
     for (let i = 0; i < 3; i++) {
       const insp = await tool("herdr_methods", { query: "ping" }, { noSession: true });
       assert.equal(insp.ok, true, `stateless herdr_methods #${i}: ${JSON.stringify(insp).slice(0, 120)}`);
@@ -323,12 +323,12 @@ test("keep-alive: initialize -> tools/list -> tools/call strictly framed on ONE 
     assert.ok(parseMsg(init.body).result?.serverInfo?.name, "initialize result missing serverInfo");
     assert.ok(sid, "initialize did not assign Mcp-Session-Id on the raw connection");
 
-    // 2) tools/list with the session id — exactly the default 11-tool surface
+    // 2) tools/list with the session id — exactly the default 17-tool surface
     const list = await roundTrip("tools/list", {});
     assert.equal(list.status, 200);
     const listMsg = parseMsg(list.body);
     assert.ok(Array.isArray(listMsg.result?.tools), "tools/list result missing tools array");
-    assert.equal(listMsg.result.tools.length, 11, `default tools/list must be exactly 11, got ${listMsg.result.tools.length}`);
+    assert.equal(listMsg.result.tools.length, 17, `default tools/list must be exactly 17, got ${listMsg.result.tools.length}`);
 
     // 3) tools/call + interleaved methods on the SAME connection (stateful sid)
     for (let i = 0; i < 5; i++) {
@@ -452,7 +452,7 @@ test("openai-mcp UA: sessionless GET probe on / and /mcp -> 200 persistent SSE, 
     assert.equal(init.res.headers.get("mcp-session-id"), null);
     const list = await rpc("tools/list", {}, { noSession: true, ua: OPENAI_UA });
     assert.equal(list.status, 200);
-    assert.equal(list.msg.result.tools.length, 11);
+    assert.equal(list.msg.result.tools.length, 17);
   } finally {
     sessionId = savedSid;
   }
@@ -499,20 +499,20 @@ test("server/discover (sessionless bootstrap probe) answered, never desyncs", as
   assert.equal(list.status, 200);
 });
 
-test("HERDR_MCP_ALL_TOOLS=1 restores the full 24-tool surface (advanced + deprecated)", async () => {
+test("HERDR_MCP_ALL_TOOLS=1 restores the full 30-tool surface (advanced + deprecated)", async () => {
   const allSrv = await spawnServer(ALL_PORT, { HERDR_MCP_ALL_TOOLS: "1" });
   try {
     const list = await rpc("tools/list", {}, { base: `http://127.0.0.1:${ALL_PORT}`, noSession: true });
     assert.equal(list.status, 200);
     const names = list.msg.result.tools.map((t) => t.name);
-    assert.equal(names.length, 24, `all-tools mode must register all 24 tools, got ${names.length}: ${names.join(",")}`);
+    assert.equal(names.length, 30, `all-tools mode must register all 30 tools, got ${names.length}: ${names.join(",")}`);
     const advanced = ["herdr_wait", "herdr_task", "herdr_task_handoff", "herdr_parallel", "herdr_task_reap",
       "herdr_read", "herdr_explain", "herdr_prompt_status", "herdr_transcript", "herdr_diff"];
     const deprecated = ["herdr_session", "herdr_handoff", "herdr_reap"];
     for (const n of [...advanced, ...deprecated]) {
       assert.ok(names.includes(n), `HERDR_MCP_ALL_TOOLS=1 must register ${n}`);
     }
-    // the default 11 remain registered too
+    // the default 17 remain registered too
     const defaults = ["herdr_inspect", "herdr_since", "herdr_methods", "herdr_call", "herdr_prompt",
       "herdr_fs_read", "herdr_fs_list", "herdr_fs_grep", "herdr_fs_write", "herdr_fs_edit", "herdr_exec"];
     for (const n of defaults) {
@@ -551,7 +551,7 @@ test("openai-mcp UA: initialize returns NO Mcp-Session-Id on / and /mcp (statele
       assert.equal(init.res.headers.get("mcp-session-id"), null,
         `openai-mcp initialize on ${p} must NOT return Mcp-Session-Id — issuing one is what goes stale after restart`);
       assert.ok(init.msg.result?.serverInfo?.name, `initialize result missing serverInfo on ${p}`);
-      assert.equal(init.msg.result?.serverInfo?.version, "0.3.9", `initialize serverInfo.version on ${p} must be 0.3.9`);
+      assert.equal(init.msg.result?.serverInfo?.version, "0.3.17", `initialize serverInfo.version on ${p} must be 0.3.17`);
       assert.equal(typeof init.msg.result?.instructions, "string",
         `initialize must carry the instructions field on ${p}`);
     }
@@ -569,8 +569,8 @@ test("openai-mcp UA: initialize -> tools/list -> tools/call consecutive, stale s
     assert.equal(init.res.headers.get("mcp-session-id"), null);
     const list = await rpc("tools/list", {}, { noSession: true, ua: OPENAI_UA });
     assert.equal(list.status, 200);
-    assert.equal(list.msg.result.tools.length, 11,
-      `openai-mcp tools/list must expose exactly 11 tools, got ${list.msg.result.tools.length}`);
+    assert.equal(list.msg.result.tools.length, 17,
+      `openai-mcp tools/list must expose exactly 17 tools, got ${list.msg.result.tools.length}`);
     // tools/call while still carrying a (now-meaningless) session id header — the
     // restart class: the server must serve it statelessly, never 404 -32001.
     const m = await tool("herdr_methods", { query: "ping" },
@@ -611,7 +611,7 @@ test("openai-mcp UA: server restart on the same port -> stateless tools/call sti
     assert.equal(after.ok, true, `stateless tools/call after restart failed: ${JSON.stringify(after).slice(0, 200)}`);
     const list = await rpc("tools/list", {}, { noSession: true, ua: OPENAI_UA, sid: "pre-restart-stale-session" });
     assert.equal(list.status, 200);
-    assert.equal(list.msg.result.tools.length, 11, `tools/list after restart must stay 11`);
+    assert.equal(list.msg.result.tools.length, 17, `tools/list after restart must stay 17`);
     // a fresh initialize after restart is stateless too
     const init2 = await rpc("initialize", openaiInit, { noSession: true, ua: OPENAI_UA });
     assert.equal(init2.res.headers.get("mcp-session-id"), null);
@@ -721,7 +721,7 @@ test("openai-mcp UA: initialize/tools.list stay SSE; tools/call uses JSON", asyn
     assert.match(list.headers.get("content-type") ?? "", /text\/event-stream/i,
       "tools/list must stay SSE for schema registration");
     const listMsg = await parseRpc(list);
-    assert.equal(listMsg.result.tools.length, 11);
+    assert.equal(listMsg.result.tools.length, 17);
     assert.ok(listMsg.result.tools.every((t) => t.inputSchema), "every tool needs inputSchema");
     const call = await fetch(`${BASE}/mcp`, {
       method: "POST",
@@ -749,7 +749,7 @@ test("openai-mcp UA: initialize/tools.list stay SSE; tools/call uses JSON", asyn
 });
 
 // Non-OpenAI discover advertises the serverInfo identity (version).
-test("server/discover (non-openai) result _meta serverInfo.version is 0.3.9", async () => {
+test("server/discover (non-openai) result _meta serverInfo.version is 0.3.17", async () => {
   for (const p of ["/", "/mcp"]) {
     const r = await fetch(`${BASE}${p}`, {
       method: "POST",
@@ -761,27 +761,27 @@ test("server/discover (non-openai) result _meta serverInfo.version is 0.3.9", as
     const si = msg.result?._meta?.["io.modelcontextprotocol/serverInfo"];
     assert.ok(si, `discover _meta serverInfo missing on ${p}`);
     assert.equal(si.name, "herdr-mcp", `discover serverInfo.name on ${p}`);
-    assert.equal(si.version, "0.3.9", `discover serverInfo.version on ${p} must be 0.3.9, got ${si.version}`);
+    assert.equal(si.version, "0.3.17", `discover serverInfo.version on ${p} must be 0.3.17, got ${si.version}`);
   }
 });
 
 // Cache-key regression: an OpenAI client that previously cached a 0.2.0
-// catalog MUST, upon seeing the new 0.3.9 identity (initialize serverInfo +
-// mcp.json + discover), re-run tools/list and obtain the current 11 tools.
-// We assert all identity surfaces agree on 0.3.9 and that a fresh tools/list
-// returns exactly the 11 default tools (i.e. a re-fetch after a version bump
+// catalog MUST, upon seeing the new 0.3.17 identity (initialize serverInfo +
+// mcp.json + discover), re-run tools/list and obtain the current 17 tools.
+// We assert all identity surfaces agree on 0.3.17 and that a fresh tools/list
+// returns exactly the 17 default tools (i.e. a re-fetch after a version bump
 // does NOT resurrect the old 22-tool surface).
-test("cache-key regression: 0.3.9 identity consistent, fresh tools/list = 11 (no stale 22)", async () => {
+test("cache-key regression: 0.3.17 identity consistent, fresh tools/list = 17 (no stale 22)", async () => {
   const savedSid = sessionId;
   sessionId = null;
   try {
     // initialize -> serverInfo.version
     for (const p of ["/", "/mcp"]) {
       const init = await rpc("initialize", openaiInit, { noSession: true, ua: OPENAI_UA, path: p });
-      assert.equal(init.msg.result?.serverInfo?.version, "0.3.9", `initialize ${p} version`);
+      assert.equal(init.msg.result?.serverInfo?.version, "0.3.17", `initialize ${p} version`);
       const list = await rpc("tools/list", {}, { noSession: true, ua: OPENAI_UA, path: p });
       const names = list.msg.result.tools.map((t) => t.name);
-      assert.equal(names.length, 11, `fresh tools/list on ${p} must be 11 after version bump, got ${names.length}`);
+      assert.equal(names.length, 17, `fresh tools/list on ${p} must be 17 after version bump, got ${names.length}`);
       assert.ok(!names.includes("herdr_session") && !names.includes("herdr_reap"),
         `fresh tools/list on ${p} must NOT contain 22-only tools`);
     }
@@ -789,7 +789,7 @@ test("cache-key regression: 0.3.9 identity consistent, fresh tools/list = 11 (no
     const card = await fetch(`${BASE}/.well-known/mcp.json`, { headers: { Authorization: `Bearer ${TOKEN}` } });
     assert.equal(card.status, 200);
     const cardJson = await card.json();
-    assert.equal(cardJson.version, "0.3.9", `mcp.json version must be 0.3.9, got ${cardJson.version}`);
+    assert.equal(cardJson.version, "0.3.17", `mcp.json version must be 0.3.17, got ${cardJson.version}`);
   } finally {
     sessionId = savedSid;
   }
@@ -1017,7 +1017,7 @@ test("openai-mcp tools/list schemas have no ChatGPT-hostile JSON Schema markers"
     const list = await rpc("tools/list", {}, { noSession: true, ua: OPENAI_UA });
     assert.equal(list.status, 200);
     const tools = list.msg.result.tools;
-    assert.equal(tools.length, 11);
+    assert.equal(tools.length, 17);
     const blob = JSON.stringify(tools);
     assert.doesNotMatch(blob, /"propertyNames"/, "propertyNames breaks ChatGPT tool registration");
     assert.doesNotMatch(blob, /"additionalProperties"\s*:\s*\{/, "additionalProperties:{} breaks ChatGPT");

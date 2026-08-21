@@ -149,15 +149,18 @@ async function tool(name, args = {}, opts = {}) {
   return JSON.parse(r.msg.result.content[0].text);
 }
 
-test("tools/list exposes the 11 lean tools incl. herdr_fs_list + herdr_fs_grep", async () => {
+test("tools/list exposes the 17 lean tools incl. herdr_fs_list + herdr_fs_grep", async () => {
   const saved = sessionId; sessionId = null;
   try {
     await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fs-t", version: "1" } }, { noSession: true });
     const list = await rpc("tools/list", {}, { noSession: true });
     const names = list.msg.result.tools.map((t) => t.name);
-    assert.equal(names.length, 11, `default tools/list must be 11, got ${names.length}: ${names.join(",")}`);
+    assert.equal(names.length, 17, `default tools/list must be 17, got ${names.length}: ${names.join(",")}`);
     assert.ok(names.includes("herdr_fs_list"), "herdr_fs_list missing");
     assert.ok(names.includes("herdr_fs_grep"), "herdr_fs_grep missing");
+    assert.ok(names.includes("herdr_fs_write"), "herdr_fs_write missing");
+    const write = list.msg.result.tools.find((t) => t.name === "herdr_fs_write");
+    assert.ok(write?.inputSchema?.properties?.overwrite, "herdr_fs_write.overwrite must be in tools/list schema");
   } finally { sessionId = saved; }
 });
 
