@@ -193,8 +193,8 @@ async function testDiscovery() {
   const card = await getJson(`${BASE}/.well-known/mcp.json`);
   ok(card.status === 200 && card.json.serverUrl === RESOURCE,
     "mcp.json 200 with absolute serverUrl === /mcp", `got ${card.json.serverUrl}`);
-  ok(card.json.version === "0.3.0",
-    "mcp.json version must be 0.3.0 (cache invalidation identity)", `got ${card.json.version}`);
+  ok(card.json.version === "0.3.1",
+    "mcp.json version must be 0.3.1 (cache invalidation identity)", `got ${card.json.version}`);
 }
 
 async function test401Challenge() {

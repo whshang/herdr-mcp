@@ -12,9 +12,9 @@
  */
 import express, { Express, Request, Response, NextFunction } from "express";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, writeFile, realpath } from "node:fs/promises";
+import { readFile, writeFile, realpath, readdir, stat } from "node:fs/promises";
 import * as path from "node:path";
-import { exec, execSync } from "node:child_process";
+import { exec, execSync, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -36,7 +36,7 @@ import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 const PORT = Number(process.env.HERDR_MCP_PORT ?? "8772");
 const BASE_URL = process.env.HERDR_MCP_BASE_URL ?? ""; // e.g. https://xxxx.trycloudflare.com
 const AUTH_TOKEN = process.env.HERDR_MCP_TOKEN ?? "";
-// Tool-surface switch: default exposes exactly the 9 lean tools; HERDR_MCP_ALL_TOOLS=1
+// Tool-surface switch: default exposes exactly the 11 lean tools; HERDR_MCP_ALL_TOOLS=1
 // additionally registers the advanced + deprecated lifecycle tools (herdr_wait,
 // herdr_task/session, handoff/reap + aliases, herdr_parallel, herdr_read,
 // herdr_explain, herdr_prompt_status, herdr_transcript, herdr_diff) that cost
@@ -1339,6 +1339,182 @@ function registerTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "herdr_fs_list",
+    {
+      description:
+        "List a directory inside a MANAGED (git) project root on the workstation. " +
+        "Gates: path must be an existing directory inside a git-backed project root " +
+        "from the live snapshot (same validation as herdr_fs_read); secret-ish files " +
+        "(.env*, *.pem, id_rsa*, *.key, .git/config, *secret*/*token*/*credential*) " +
+        "are skipped; .git is always skipped. Returns name/type(file|dir|symlink)/size?/mtime? " +
+        "per entry. recursive:true walks subdirectories (bounded by max_entries).",
+      inputSchema: {
+        path: z.string().describe("Absolute directory path inside a managed project root"),
+        recursive: z.boolean().default(false).describe("Recursively list subdirectories (default false)"),
+        glob: z.string().optional().describe("Optional glob filter on entry names (e.g. '*.ts')"),
+        max_entries: z.number().int().positive().max(2000).optional().describe("Max entries returned (default 200)"),
+      },
+    },
+    async ({ path: p, recursive, glob, max_entries }) => {
+      const c = clientGet();
+      let snap: HerdrResult;
+      try { snap = await c.snapshot(); } catch (e) {
+        const err = e instanceof HerdrError ? e : new HerdrError("error", String(e));
+        return toResult({ ok: false, code: err.code, message: err.message });
+      }
+      const v = await validateManagedFile(snap, p, true);
+      if (!v.ok) return toResult(v.err);
+      let st;
+      try { st = await stat(v.real); } catch (e) {
+        return toResult({ ok: false, reason: "stat_failed", path: v.resolved, message: String(e) });
+      }
+      if (!st.isDirectory()) {
+        return toResult({ ok: false, reason: "not_a_directory", path: v.resolved });
+      }
+      const budget = max_entries ?? 200;
+      const out: Record<string, unknown>[] = [];
+      let truncated = false;
+      const globRe = glob ? new RegExp("^" + glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$") : null;
+      const walk = async (dir: string, depth: number): Promise<void> => {
+        if (out.length >= budget) { truncated = true; return; }
+        let entries;
+        try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+        for (const ent of entries) {
+          if (out.length >= budget) { truncated = true; return; }
+          const name = ent.name;
+          if (name === ".git") continue;
+          const full = path.join(dir, name);
+          if (deniedSecretPath(full)) continue;
+          const type = ent.isDirectory() ? "dir" : ent.isSymbolicLink() ? "symlink" : "file";
+          if (type === "dir") {
+            if (recursive) await walk(full, depth - 1);
+            if (globRe && !globRe.test(name)) continue; // glob filters files; dirs only filtered when not recursing
+          } else if (globRe && !globRe.test(name)) {
+            continue;
+          }
+          const rec: Record<string, unknown> = { name, type };
+          if (type === "file") {
+            try { const fs = await stat(full); rec.size = fs.size; rec.mtime = fs.mtime.toISOString(); } catch { /* ignore */ }
+          }
+          out.push(rec);
+        }
+      };
+      await walk(v.real, recursive ? 64 : 0);
+      return toResult({ ok: true, path: v.resolved, root: v.root, count: out.length, truncated, entries: out });
+    },
+  );
+
+  server.registerTool(
+    "herdr_fs_grep",
+    {
+      description:
+        "Content-search inside a MANAGED (git) project root on the workstation. " +
+        "Gates: root/path must be inside a git-backed project root from the live snapshot; " +
+        "secret-ish files are excluded. Prefers ripgrep (rg) when available, else falls back " +
+        "to a Node traversal. Returns matching lines with file/line/content; truncated:true " +
+        "when the match budget or byte budget is hit.",
+      inputSchema: {
+        root: z.string().describe("Absolute directory path inside a managed project root to search"),
+        pattern: z.string().describe("Search pattern (literal string, or regex when regex:true)"),
+        regex: z.boolean().default(false).describe("Treat pattern as a regular expression (default false)"),
+        glob: z.string().optional().describe("Optional glob filter on file names (e.g. '*.ts')"),
+        max_matches: z.number().int().positive().max(1000).optional().describe("Max matches returned (default 50)"),
+        max_bytes: z.number().int().positive().max(1048576).optional().describe("Per-file byte ceiling (default 65536)"),
+        case_insensitive: z.boolean().default(false).describe("Case-insensitive match (default false)"),
+      },
+    },
+    async ({ root: p, pattern, regex, glob, max_matches, max_bytes, case_insensitive }) => {
+      const c = clientGet();
+      let snap: HerdrResult;
+      try { snap = await c.snapshot(); } catch (e) {
+        const err = e instanceof HerdrError ? e : new HerdrError("error", String(e));
+        return toResult({ ok: false, code: err.code, message: err.message });
+      }
+      const v = await validateManagedFile(snap, p, true);
+      if (!v.ok) return toResult(v.err);
+      let st;
+      try { st = await stat(v.real); } catch (e) {
+        return toResult({ ok: false, reason: "stat_failed", path: v.resolved, message: String(e) });
+      }
+      if (!st.isDirectory()) {
+        return toResult({ ok: false, reason: "not_a_directory", path: v.resolved });
+      }
+      const matchBudget = max_matches ?? 50;
+      const byteBudget = max_bytes ?? 65536;
+      const out: Record<string, unknown>[] = [];
+      let truncated = false;
+      const globRe = glob ? new RegExp("^" + glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$") : null;
+      const re = regex ? new RegExp(pattern, case_insensitive ? "i" : "") : null;
+      const lit = regex ? null : pattern;
+
+      // Prefer ripgrep (rg) when available; fall back to a Node traversal.
+      const rgArgs = [
+        "--line-number", "--no-heading", "--color", "never",
+        ...(regex ? [] : ["-F"]),
+        ...(case_insensitive ? ["-i"] : []),
+        ...(glob ? ["-g", glob] : []),
+        "--max-count", String(matchBudget),
+        pattern, v.real,
+      ];
+      const rgOut = await new Promise<string | null>((resolve) => {
+        let child;
+        try { child = spawn("rg", rgArgs, { stdio: ["ignore", "pipe", "ignore"] }); }
+        catch { resolve(null); return; }
+        let buf = "";
+        child.stdout.on("data", (d) => { buf += d.toString("utf-8"); });
+        child.on("error", () => resolve(null));
+        child.on("close", () => resolve(buf));
+      });
+      if (rgOut !== null) {
+        for (const line of rgOut.split("\n")) {
+          if (!line.trim()) continue;
+          if (out.length >= matchBudget) { truncated = true; break; }
+          const idx = line.indexOf(":");
+          if (idx < 0) continue;
+          const file = line.slice(0, idx);
+          const rest = line.slice(idx + 1);
+          const idx2 = rest.indexOf(":");
+          if (idx2 < 0) continue;
+          const lineNo = Number(rest.slice(0, idx2));
+          const content = rest.slice(idx2 + 1);
+          if (deniedSecretPath(file)) continue;
+          out.push({ file, line: lineNo, content });
+        }
+        return toResult({ ok: true, root: v.resolved, count: out.length, truncated, matches: out, engine: "rg" });
+      }
+
+      const walk = async (dir: string): Promise<void> => {
+        if (out.length >= matchBudget) { truncated = true; return; }
+        let entries;
+        try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+        for (const ent of entries) {
+          if (out.length >= matchBudget) { truncated = true; return; }
+          const name = ent.name;
+          if (name === ".git") continue;
+          const full = path.join(dir, name);
+          if (deniedSecretPath(full)) continue;
+          if (ent.isDirectory()) { await walk(full); continue; }
+          if (!ent.isFile()) continue;
+          if (globRe && !globRe.test(name)) continue;
+          let data: Buffer;
+          try { data = await readFile(full); } catch { continue; }
+          if (data.length > byteBudget) { truncated = true; continue; }
+          const text = data.toString("utf-8");
+          const lines = text.split("\n");
+          for (let i = 0; i < lines.length; i++) {
+            if (out.length >= matchBudget) { truncated = true; break; }
+            const line = lines[i];
+            const hit = re ? re.test(line) : (case_insensitive ? line.toLowerCase().includes(lit!.toLowerCase()) : line.includes(lit!));
+            if (hit) out.push({ file: full, line: i + 1, content: line });
+          }
+        }
+      };
+      await walk(v.real);
+      return toResult({ ok: true, root: v.resolved, count: out.length, truncated, matches: out, engine: "node" });
+    },
+  );
+
+  server.registerTool(
     "herdr_exec",
     {
       description:
@@ -1538,16 +1714,18 @@ function registerTools(server: McpServer): void {
       description:
         "Edit a file on the workstation by EXACT unique string replacement (never whole-file " +
         "overwrite). Gates: managed-root path validation (same as herdr_fs_read); if any agent " +
-        "in the file's project is working -> refused (listed); if the file has uncommitted git " +
-        "changes -> requires confirm_dirty:true. old_string must match exactly once.",
+        "in the file's project is working -> refused by default (listed); confirm_busy:true forces " +
+        "continue and returns warnings.working. If the file has uncommitted git changes -> " +
+        "requires confirm_dirty:true. old_string must match exactly once.",
       inputSchema: {
         path: z.string().describe("Absolute file path inside a managed project root"),
         old_string: z.string().describe("Exact text to replace (must be unique in the file)"),
         new_string: z.string().describe("Replacement text"),
         confirm_dirty: z.boolean().default(false).describe("Acknowledge editing a git-dirty file"),
+        confirm_busy: z.boolean().default(false).describe("Force edit even when an agent in the project is working (returns warnings.working)"),
       },
     },
-    async ({ path: p, old_string, new_string, confirm_dirty }) => {
+    async ({ path: p, old_string, new_string, confirm_dirty, confirm_busy }) => {
       const c = clientGet();
       let snap: HerdrResult;
       try { snap = await c.snapshot(); } catch (e) {
@@ -1559,9 +1737,9 @@ function registerTools(server: McpServer): void {
       const gate = mutationDenied(v.root, "herdr_fs_edit");
       if (gate) return toResult(gate);
       const working = workingAgentsForRoot(snap, v.root);
-      if (working.length > 0) {
+      if (working.length > 0 && !confirm_busy) {
         return toResult({ ok: false, reason: "agent_working", root: v.root, working,
-          hint: "an agent in this project is working — wait for idle/done before editing" });
+          hint: "an agent in this project is working — pass confirm_busy:true to force, or wait for idle/done" });
       }
       let old: string;
       try { old = await readFile(v.real, "utf-8"); } catch (e) {
@@ -1581,7 +1759,8 @@ function registerTools(server: McpServer): void {
         return toResult({ ok: false, reason: "write_failed", path: v.resolved, message: String(e) });
       }
       return toResult({ ok: true, path: v.resolved, root: v.root, replaced: 1,
-        bytes_before: Buffer.byteLength(old, "utf-8"), bytes_after: Buffer.byteLength(next, "utf-8") });
+        bytes_before: Buffer.byteLength(old, "utf-8"), bytes_after: Buffer.byteLength(next, "utf-8"),
+        ...(working.length > 0 ? { warnings: { working } } : {}) });
     },
   );
 
@@ -1590,15 +1769,18 @@ function registerTools(server: McpServer): void {
     {
       description:
         "Create a new file (or explicitly overwrite a clean tracked one) on the workstation. " +
-        "Same gates as herdr_fs_edit (managed root, no working agent, dirty needs confirm). " +
-        "For surgical changes prefer herdr_fs_edit; this is for new files and full rewrites.",
+        "Same gates as herdr_fs_edit (managed root, no working agent by default, dirty needs " +
+        "confirm). confirm_busy:true forces write even when an agent is working and returns " +
+        "warnings.working. For surgical changes prefer herdr_fs_edit; this is for new files and " +
+        "full rewrites.",
       inputSchema: {
         path: z.string().describe("Absolute target path inside a managed project root"),
         content: z.string().describe("Full file content"),
         confirm_dirty: z.boolean().default(false).describe("Acknowledge overwriting a git-dirty existing file"),
+        confirm_busy: z.boolean().default(false).describe("Force write even when an agent in the project is working (returns warnings.working)"),
       },
     },
-    async ({ path: p, content, confirm_dirty }) => {
+    async ({ path: p, content, confirm_dirty, confirm_busy }) => {
       const c = clientGet();
       let snap: HerdrResult;
       try { snap = await c.snapshot(); } catch (e) {
@@ -1610,9 +1792,9 @@ function registerTools(server: McpServer): void {
       const gate = mutationDenied(v.root, "herdr_fs_write");
       if (gate) return toResult(gate);
       const working = workingAgentsForRoot(snap, v.root);
-      if (working.length > 0) {
+      if (working.length > 0 && !confirm_busy) {
         return toResult({ ok: false, reason: "agent_working", root: v.root, working,
-          hint: "an agent in this project is working — wait for idle/done before writing" });
+          hint: "an agent in this project is working — pass confirm_busy:true to force, or wait for idle/done" });
       }
       let existed = false;
       try { await readFile(v.real); existed = true; } catch { existed = false; }
@@ -1624,7 +1806,8 @@ function registerTools(server: McpServer): void {
         return toResult({ ok: false, reason: "write_failed", path: v.resolved, message: String(e) });
       }
       return toResult({ ok: true, path: v.resolved, root: v.root, created: !existed, overwritten: existed,
-        bytes: Buffer.byteLength(content, "utf-8") });
+        bytes: Buffer.byteLength(content, "utf-8"),
+        ...(working.length > 0 ? { warnings: { working } } : {}) });
     },
   );
   server.registerTool(
@@ -1944,7 +2127,7 @@ function clearStatelessSse(entry: { res: Response; hb: NodeJS.Timeout }): void {
 const SERVER_INSTRUCTIONS =
   "Herdr terminal-multiplexer control plane. Start: herdr_inspect. Resume: herdr_since(cursor). " +
   "Unknown native API: herdr_methods then herdr_call. Agent prompt: herdr_prompt + idempotency_key. " +
-  "Fallback: herdr_fs_read / herdr_fs_write / herdr_fs_edit + herdr_exec. Before dev work require " +
+  "Fallback: herdr_fs_read / herdr_fs_list / herdr_fs_grep / herdr_fs_write / herdr_fs_edit + herdr_exec. Before dev work require " +
   "project_root == pane cwd == foreground cwd; use explicit workspace/pane IDs, never UI focus. " +
   "Roles: main=planning, worker=implementation, verifier=audit. Never blind-retry a mutation after " +
   "a transport failure — delivery is uncertain.";

@@ -1,6 +1,6 @@
 // End-to-end A-1/A-2 through the MCP server on a TEMP port (never 8772/launchd).
 // A-1/A-2 semantics are advanced-surface: herdr_wait is only registered under
-// HERDR_MCP_ALL_TOOLS=1 (the default 9-tool surface drops it), so spawn with it.
+// HERDR_MCP_ALL_TOOLS=1 (the default 11-tool surface drops it), so spawn with it.
 import { execSync, spawn } from "node:child_process";
 
 const PORT = "9799";
