@@ -118,6 +118,10 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 6. 「读不了文件」：确认失败调用是 `herdr_fs_*` / `herdr_exec`，不是 `herdr_call call=agent.*`
 7. 权限卡不停：扩展是否在 chatgpt.com、内容脚本 ≥ 0.1.3
 
-## 验收（真 ChatGPT）
+## ChatGPT 派活后对话停住
 
-不要只靠 curl。连续两轮对话，且没有：Session terminated、session 400/404、`network_error`、`invalid_mcp_response`。每次重连后开新对话。
+Connector 只解决「ChatGPT → herdr」。若工具很快返回「已提交」，而 agent 仍在窗格里跑，网页对话常不再自动 `herdr_since` / 继续。
+
+闭环要靠浏览器扩展：绑定该 chatgpt 会话 ↔ 干活的 pane，agent **settled**（以及将来的进度 tick）时往输入框塞继续提示并提交。见 [extension-wake.md](./extension-wake.md)。
+
+未绑定扩展时，这不是 MCP 故障，是缺回推环。

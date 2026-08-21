@@ -1,53 +1,76 @@
-# 浏览器扩展 — 唤醒网页会话（不是 MCP）
+# 浏览器扩展 — herdr 进度回推网页（唤醒继续）
 
-读者：加载 `extension/` 的人，或以为 z.ai / DeepSeek「装了扩展就有 MCP 工具」的人。
+读者：用 ChatGPT Connector 派活到 herdr 后，发现对话停住、不再 `herdr_since` / 继续推进的人。
 
-## 它是什么
+## 要解决的问题
 
-MV3 扩展 **herdr → 网页唤醒**：绑定的 herdr agent 进入 settled 后，把一段消息写入绑定网页会话的输入框并提交。
+典型断点（ChatGPT + MCP）：
 
-有适配器的站点：`chat.z.ai`、`chat.deepseek.com`、`claude.ai`、`chatgpt.com`。
+1. ChatGPT 经 connector 把任务交给 herdr（常见是 `herdr_prompt` 派到窗格 agent，或长命令）。
+2. 工具调用很快返回「已提交 / 已启动」，**本轮对话结束**。
+3. herdr 里 agent 还在 `working`，或稍后才 `idle/done`。
+4. 网页上的 ChatGPT **没有**主动再调工具去观察；也没有人往输入框塞「请继续看进度」。
+5. 任务看起来中断或停住。
 
-SpeaksJSON（`content/webmcp/speaks-json.js`）在 z.ai / DeepSeek 上解析助手输出，用于投递确认，以及将来的 **页面 → herdr** 反向桥（见 [extension-bridge.md](./extension-bridge.md)）。它 **不会** 在这些站点里注册 herdr-mcp 工具表。
+扩展存在的理由：**把 herdr 侧进度/收工信号写回绑定的网页会话并提交**，逼网页模型再观察或继续推进。  
+这不是给 z.ai/DeepSeek「装 MCP」，也不是替代 connector。
 
-## 它不是什么
+参考对话形态：ChatGPT 已能指挥 herdr，但缺「干完/干到一半时回捅网页」的一环。
 
-| 预期 | 现实 |
+## 它做什么
+
+MV3 扩展 **herdr → 网页唤醒**：
+
+1. 在 popup 把 **当前网页会话** 绑到某个 **herdr pane/agent**
+2. background 对该 pane 挂 `GET /push/events` SSE
+3. 收到 `agent_working` / `agent_settled`（及 hello 错峰补发）后，按策略决定是否唤醒
+4. 向绑定标签页输入框写入模板消息并提交（chatgpt / claude 走 MAIN world 插入）
+
+有适配器的站点：`chatgpt.com`（主场景）、`chat.z.ai`、`chat.deepseek.com`、`claude.ai`。
+
+## 当前策略（已实现）
+
+| 事件 | 行为 |
 |---|---|
-| 装扩展 → DeepSeek/z.ai 拥有和 ChatGPT Connector 一样的 11 个 MCP 工具 | **否。** 那些站点没有本项目里的 ChatGPT 式 MCP OAuth connector |
-| 服务端 OAuth / schema 修复会自动作用到扩展 | **否。** MCP 握手 ≠ 扩展唤醒通路 |
-| 扩展必须依赖公网 Cloudflare URL | **否。** 扩展只打本地 `http://127.0.0.1:8772`（`/push/events`），用静态 token |
+| `agent_working` | 只武装状态，**不**往网页塞字 |
+| `agent_settled`（idle/done/blocked） | 若此前见过 working → **唤醒一次**，带输出摘要 |
+| 重连 `hello` | 若离线期间错过 settle → 补唤醒一次 |
 
-要从 **ChatGPT** 调度 herdr：用 MCP connector（[chatgpt-connector.md](./chatgpt-connector.md)）。  
-要在 herdr agent 收工后 **捅一下** z.ai / DeepSeek：用本扩展。
+默认模板大意：`agent (pane) 已完成 (status)` + 输出片段 + 「请基于以上结果继续」。
+
+**缺口（相对「定时通报 / 执行中提醒」）：**
+
+- 没有 `working` 期间的定时进度通报
+- 必须手动绑定会话 ↔ pane；未绑定则 MCP 派活了也不会回推
+- 纯 `herdr_exec` / 无 agent 的 utility 窗格不走 agent 状态机，不会触发 push（除非以后扩展事件源）
+
+## 安装与绑定（ChatGPT 主路径）
+
+1. `chrome://extensions` → 加载 `extension/`
+2. 选项：`http://127.0.0.1:8772` + `herdr-mcp token`
+3. 打开要用的 **chatgpt.com 对话**（例如已接好 connector 的那条）
+4. 点扩展图标 → 选将要干活的 herdr agent/pane → **绑定**
+5. 再让 ChatGPT 经 MCP `herdr_prompt`（或其它会让该 pane 进入 working 的路径）派活
+
+未绑定 = 扩展不会往这个对话写字，任务仍会在 herdr 里跑完，但网页不会被捅醒。
+
+改过 content 脚本后：扩展管理页「重新加载」；已开标签会因版本握手自动刷新。
 
 ## ChatGPT 工具权限卡
 
-chatgpt.com 上 Connector 每次调工具常弹出「允许 ChatGPT 使用 herdr？」。  
-扩展在 **chatgpt 标签页常驻** 观察页面内 DOM 权限卡并自动点「允许」（内容脚本 ≥ 0.1.3）。详见 connector 文档「工具权限卡」一节。
+Connector 每次 tools/call 常弹「允许 ChatGPT 使用 herdr？」。  
+内容脚本 ≥ 0.1.3 在 **chatgpt.com 常驻** 自动点页面内「允许」。详见 [chatgpt-connector.md](./chatgpt-connector.md)。
 
-这解决不了 OpenAI 平台「永远不再询问」——那是客户端策略；扩展只能点已经画在页面上的按钮。
+## 和别的文档的关系
 
-## 安装
-
-1. `chrome://extensions` → 加载已解压的扩展 → 选 `extension/`
-2. 选项：URL `http://127.0.0.1:8772`，token 用 `herdr-mcp token`
-3. 打开目标聊天标签；在 popup 里绑定 agent ↔ 会话
-4. herdr-mcp 需在跑（LaunchAgent）
-
-改过 content 脚本后：扩展管理页点一次「重新加载」；已打开的目标站标签会因版本握手自动刷新。
-
-## 若要在 z.ai / DeepSeek 里用 MCP
-
-需要其一：
-
-1. 站点自己长出 MCP/connector（再复用 herdr-mcp OAuth），或  
-2. 扩展桥：页面 tool-call JSON → `POST /mcp`（路线见 [extension-bridge.md](./extension-bridge.md)）
-
-不要把唤醒当成 MCP。
+| 文档 | 关系 |
+|---|---|
+| [chatgpt-connector.md](./chatgpt-connector.md) | MCP 怎么连上、工具怎么调 |
+| 本文 | 调完之后如何 **回推网页继续** |
+| [extension-bridge.md](./extension-bridge.md) | 另一条线：网页 JSON → 本地 MCP（z.ai/DeepSeek 无 connector 时）；**不是**本问题的主解法 |
 
 ## 测试
 
-- 静态 / 单元：`node tests/manual/extension_smoke.mjs`
-- 绑定逻辑：`node tests/manual/background_bind_test.mjs`
-- 推送通路：`node tests/manual/push_sse.mjs`
+- `node tests/manual/extension_smoke.mjs`
+- `node tests/manual/background_bind_test.mjs`
+- `node tests/manual/push_sse.mjs`

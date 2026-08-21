@@ -41,7 +41,7 @@ Quick Tunnel 每次重启 `cloudflared` 子域会变。要稳定主机名可用 
 
 ChatGPT 踩坑与硬性要求见 [docs/chatgpt-connector.md](docs/chatgpt-connector.md)（含「允许使用 herdr」权限卡说明）。
 
-浏览器扩展：唤醒见 [docs/extension-wake.md](docs/extension-wake.md)；z.ai / DeepSeek 接到本机 MCP 的路线见 [docs/extension-bridge.md](docs/extension-bridge.md)。
+浏览器扩展（**主用途**：herdr 收工/进度回推 ChatGPT 网页，避免派活后对话停住）见 [docs/extension-wake.md](docs/extension-wake.md)。z.ai / DeepSeek 无 connector 时的 JSON→MCP 路线见 [docs/extension-bridge.md](docs/extension-bridge.md)。
 
 ### 3. Cursor（本机）
 

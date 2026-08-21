@@ -4,11 +4,13 @@
 
 相关：`extension/`、[extension-wake.md](./extension-wake.md)、[architecture.md](./architecture.md)。
 
-## 目标
+## 目标（次要线）
 
-在 **没有** ChatGPT 式 MCP Connector 的站点上，让网页里的模型用约定 JSON 调用本机 `http://127.0.0.1:8772/mcp`，拿到 herdr 工作站能力。
+在 **没有** ChatGPT 式 MCP Connector 的站点（z.ai / DeepSeek）上，让网页模型用约定 JSON 调本机 MCP。
 
-首批页面：`chat.z.ai`、`chat.deepseek.com`。
+**主问题「ChatGPT 派活后停住」不靠本路线**，靠 [extension-wake.md](./extension-wake.md) 的 herdr→网页回推。
+
+首批若做桥：`chat.z.ai`、`chat.deepseek.com`。
 
 ## 现状（已有）
 
