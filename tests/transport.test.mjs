@@ -669,16 +669,24 @@ test("stateful client (non-openai UA): initialize still returns Mcp-Session-Id; 
   }
 });
 
-test("openai-mcp UA: server/discover is -32601 on both / and /mcp (forces legacy handshake)", async () => {
+test("openai-mcp UA: server/discover returns 2026-07-28 so post-OAuth handshake continues", async () => {
   for (const p of ["/", "/mcp"]) {
     const r = await fetch(`${BASE}${p}`, {
       method: "POST",
-      headers: headers({ "User-Agent": OPENAI_UA }),
+      headers: headers({
+        "User-Agent": OPENAI_UA,
+        "Mcp-Protocol-Version": "2026-07-28",
+      }),
       body: JSON.stringify({ jsonrpc: "2.0", id: 7, method: "server/discover", params: {} }),
     });
     assert.equal(r.status, 200, `discover on ${p}`);
     const msg = await parseRpc(r);
-    assert.equal(msg.error?.code, -32601, `openai-mcp discover on ${p} must be -32601`);
+    assert.equal(msg.error, undefined, `openai-mcp discover on ${p} must not be an error`);
+    assert.ok(Array.isArray(msg.result?.supportedVersions), `supportedVersions on ${p}`);
+    assert.ok(
+      msg.result.supportedVersions.includes("2026-07-28"),
+      `openai-mcp discover on ${p} must advertise 2026-07-28`,
+    );
   }
 });
 

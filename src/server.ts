@@ -2205,30 +2205,26 @@ async function handleMcpRequest(req: Request, res: Response): Promise<void> {
   // bootstrap method "server/discover" before any initialize. The SDK (which
   // speaks <= 2025-11-25) rejects pre-initialize requests with HTTP 400 and the
   // connector then reports "no MCP server was found".
-  //  - Claude: answer with a DiscoverResult advertising only SDK-supported
-  //    versions; it negotiates down to the legacy initialize handshake.
-  //  - ChatGPT/openai-mcp: a SUCCESSFUL discover response locks it into the
-  //    2026 negotiation path, and with no 2026-07-28 in supportedVersions it
-  //    never falls back to initialize (observed loop: discover 200 -> setup
-  //    restart). Reply with a protocol-correct -32601 so it falls back to the
-  //    legacy handshake, which its earlier traffic proves it can do.
+  //  - Claude: answer with a DiscoverResult advertising SDK-supported versions;
+  //    it negotiates down to the legacy initialize handshake.
+  //  - ChatGPT/openai-mcp (post-OAuth): sends discover with Mcp-Protocol-Version
+  //    2026-07-28 and a Bearer token. Returning -32601 used to force a legacy
+  //    initialize fallback for unauthenticated probes, but after OAuth the
+  //    client stops with "连接出现问题" and never calls initialize. Advertise
+  //    2026-07-28 plus legacy versions so discovery completes; subsequent
+  //    initialize still runs on the SDK-supported wire format.
   const discoverBody = (req.body ?? {}) as Record<string, unknown>;
   if (!Array.isArray(req.body) && discoverBody["method"] === "server/discover") {
     const ua = (req.get("user-agent") ?? "").toLowerCase();
-    if (ua.startsWith("openai-mcp")) {
-      res.status(200).json({
-        jsonrpc: "2.0",
-        id: discoverBody["id"] ?? null,
-        error: { code: -32601, message: "Method not found" },
-      });
-      return;
-    }
+    const versions = ua.startsWith("openai-mcp")
+      ? ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"]
+      : ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
     res.status(200).json({
       jsonrpc: "2.0",
       id: discoverBody["id"] ?? null,
       result: {
         resultType: "complete",
-        supportedVersions: ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"],
+        supportedVersions: versions,
         capabilities: { tools: { listChanged: true } },
         instructions: SERVER_INSTRUCTIONS,
         ttlMs: 3600000,
