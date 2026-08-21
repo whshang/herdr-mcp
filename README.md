@@ -99,18 +99,22 @@ Optional: `HERDR_MCP_ALL_TOOLS=1` adds advanced/deprecated lifecycle tools. Muta
 
 Folder: `extension/` (MV3). Load unpacked in `chrome://extensions`.
 
-**Wake only** — when a herdr agent settles, write into a bound web chat (`/push/events`). Sites: z.ai, deepseek, claude.ai, chatgpt.com.
+Two equal jobs ([docs/extension.md](docs/extension.md), 中文):
 
-This is **not** the ChatGPT MCP connector. z.ai / DeepSeek do not receive the 11 MCP tools via the extension. Details: [docs/extension-wake.md](docs/extension-wake.md).
+1. **Progress nudge** — herdr working/settled → inject continue/progress into the bound web chat (chatgpt / deepseek / z.ai / claude)
+2. **JSON → MCP** — on DeepSeek / z.ai (no connector), parse assistant `{"tool":...}` → local `/mcp`
+
+Same local `127.0.0.1:8772` token. Not a substitute for ChatGPT’s OAuth connector.
 
 ## Docs
 
 | Doc | Topic |
 |---|---|
+| [docs/extension.md](docs/extension.md) | Extension dual tracks（中文） |
 | [docs/architecture.md](docs/architecture.md) | herdr vs MCP tool layers（中文） |
 | [docs/chatgpt-connector.md](docs/chatgpt-connector.md) | ChatGPT OAuth / 线路 / schema / 权限卡（中文） |
-| [docs/extension-wake.md](docs/extension-wake.md) | 浏览器唤醒扩展（中文） |
-| [docs/extension-bridge.md](docs/extension-bridge.md) | z.ai / DeepSeek → 本地 MCP 路线（中文） |
+| [docs/extension-wake.md](docs/extension-wake.md) | Track A: progress nudge（中文） |
+| [docs/extension-bridge.md](docs/extension-bridge.md) | Track B: JSON→MCP（中文） |
 | [tests/README.md](tests/README.md) | Default vs manual tests |
 
 Process notes live in `docs/_wip/` (gitignored).
