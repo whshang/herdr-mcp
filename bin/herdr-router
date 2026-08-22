@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """
-herdr-mcp path router — 单一公网入口, 按路径前缀转发到各项目 MCP server。
+herdr-mcp path router — one public entry point that routes project MCP servers by path prefix.
 
-URL 形态:
+URL forms:
   https://herdr-mcp.<domain>/<project>/mcp
   https://herdr-mcp.<domain>/<project>/oauth/...
   https://herdr-mcp.<domain>/<project>/.well-known/...
 
-OAuth (RFC 8414) 兼容:
-  Claude 等 OAuth 客户端在「源根」发现 /.well-known/oauth-authorization-server。
-  单项目时把这些根级路径转发给唯一项目 (后端返回带 /<project> 前缀的绝对 URL, 客户端随后走前缀路径, 一切自洽)。
-  多项目时根级发现无法消歧 → 返回 404 + 提示。
+OAuth (RFC 8414) compatibility:
+  OAuth clients such as Claude discover /.well-known/oauth-authorization-server at the origin root.
+  With one project, route root-level discovery to that project. With multiple
+  projects, root-level discovery is ambiguous and returns 404 with guidance.
 
 
-本机:
-  GET  /            → 状态页 (项目列表 + 健康)
-  GET  /projects    → JSON 项目列表 (浏览器扩展用)
-  *    /<project>/* → 剥前缀后反代到 127.0.0.1:<port>/*
+Local endpoints:
+  GET  /            → status page with projects and health
+  GET  /projects    → JSON project list for the browser extension
+  *    /<project>/* → strip the prefix and proxy to 127.0.0.1:<port>/*
 
-路由表: $HERDR_MCP_ROUTER_STATE_DIR/routes.json
+Route table: $HERDR_MCP_ROUTER_STATE_DIR/routes.json
   {"project": {"port": 8772, "token": "...", "path": "/path/to/project"}, ...}
 
-环境:
-  HERDR_MCP_ROUTER_STATE_DIR  默认 ~/.config/herdr-mcp/router
-  HERDR_MCP_ROUTER_HOST       默认 127.0.0.1
-  HERDR_MCP_ROUTER_PORT       默认 8773 (独立于 MCP origin 8772)
+Environment:
+  HERDR_MCP_ROUTER_STATE_DIR  defaults to ~/.config/herdr-mcp/router
+  HERDR_MCP_ROUTER_HOST       defaults to 127.0.0.1
+  HERDR_MCP_ROUTER_PORT       defaults to 8773, separate from MCP origin 8772
 """
 from __future__ import annotations
 
@@ -39,8 +39,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 
-# 不跟随重定向: 302 (OAuth authorize 回跳 redirect_uri) 必须原样透传给浏览器,
-# 由浏览器带自己的 cookie/session 去访问回调 (urlopen 默认跟随会丢会话 → 卡在授权页)
+# Do not follow redirects: OAuth 302 responses must pass through to the browser,
+# which carries its own cookie and session to the callback.
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -52,11 +52,11 @@ _OPENER = urllib.request.build_opener(_NoRedirectHandler)
 STATE_DIR = os.path.expanduser(os.environ.get("HERDR_MCP_ROUTER_STATE_DIR", "~/.config/herdr-mcp/router"))
 HOST = os.environ.get("HERDR_MCP_ROUTER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("HERDR_MCP_ROUTER_PORT", "8773"))
-# 子域路由后缀, 如 ".herdr-mcp.<你的域名>": Host=<proj><后缀> 时按子域路由,
-# 路径原样转发 (无路径 issuer, Claude OAuth 兼容)
+# Optional subdomain-routing suffix. Host=<project><suffix> routes by subdomain
+# and forwards paths unchanged for pathless issuer compatibility.
 HOST_SUFFIX = os.environ.get("HERDR_MCP_HOST_SUFFIX", "")
 ROUTES_FILE = os.path.join(STATE_DIR, "routes.json")
-# 请求转发给上游时跳过的头 (Content-Length 由 urllib 按 body 自己设)
+# Headers omitted when forwarding upstream; urllib sets Content-Length.
 HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -69,7 +69,7 @@ HOP_BY_HOP = {
     "content-length",
     "host",
 }
-# 响应回给客户端时跳过的头: 保留 Content-Length (分帧关键), 仅跳其余逐跳头
+# Response headers omitted downstream, preserving framing-critical Content-Length.
 RESPONSE_SKIP = HOP_BY_HOP - {"content-length"}
 
 
@@ -134,7 +134,7 @@ def get_routes() -> dict[str, dict[str, Any]]:
         return _routes_cache
 
 
-# 根级 OAuth / well-known 发现路径 (RFC 8414 / RFC 7591): 无项目前缀, 单项目时转发给唯一项目
+# Root OAuth and well-known discovery paths route to the sole project when unambiguous.
 def _root_oauth_path(path: str) -> bool:
     return (
         path.startswith("/.well-known/")
@@ -143,11 +143,11 @@ def _root_oauth_path(path: str) -> bool:
     )
 
 
-# Claude.ai (MCP auth spec) 用「路径插入」构造发现 URL:
+# Claude.ai constructs discovery URLs by inserting the server path:
 #   https://herdr-mcp.<d>/novo/mcp → /.well-known/oauth-authorization-server/novo[/mcp]
-# 或 serverUrl 尾缀带 /mcp (Claude.ai 新版):
+# Newer clients may append /mcp to serverUrl:
 #   https://<proj>.<d>/mcp     → /.well-known/oauth-protected-resource/mcp
-# 识别并剥掉项目段 (或 /mcp 尾缀), 转发规范路径给后端。
+# Strip the project segment or /mcp suffix and forward the canonical path.
 def _split_discovery_insertion(path: str) -> tuple[str | None, str | None]:
     parts = [p for p in path.split("/") if p]
     routes = get_routes()
@@ -156,7 +156,7 @@ def _split_discovery_insertion(path: str) -> tuple[str | None, str | None]:
     if parts[0] == ".well-known":
         if parts[2] in routes:
             return parts[2], "/.well-known/" + parts[1]
-        if parts[2] == "mcp":  # serverUrl 尾缀: /<kind>/mcp → /<kind>
+        if parts[2] == "mcp":  # serverUrl suffix: /<kind>/mcp → /<kind>
             return None, "/.well-known/" + parts[1]
     elif parts[0] == "oauth":
         if parts[2] in routes:
@@ -165,8 +165,7 @@ def _split_discovery_insertion(path: str) -> tuple[str | None, str | None]:
 
 
 def _strip_well_known_mcp_suffix(path: str) -> str:
-    """Claude.ai 把 serverUrl 的 /mcp 尾缀带到 well-known 发现路径上,
-    /.well-known/<kind>/mcp → /.well-known/<kind>, 其余路径原样。"""
+    """Strip a serverUrl /mcp suffix copied into a well-known discovery path."""
     if not path.startswith("/.well-known/"):
         return path
     if path.endswith("/mcp"):
@@ -179,9 +178,9 @@ def _strip_well_known_mcp_suffix(path: str) -> str:
 def resolve_route(path: str, host: str = "") -> tuple[str | None, dict[str, Any] | None, str]:
     """Return (project, route, remainder_path). remainder always starts with /.
 
-    host 匹配 HERDR_MCP_HOST_SUFFIX 时按子域路由 (如 novo.herdr-mcp.<域名> → novo, 路径原样转发)。
+    Route by subdomain when host matches HERDR_MCP_HOST_SUFFIX, preserving the path.
     """
-    # ---- 子域路由: <proj><HOST_SUFFIX>, 无路径 issuer (Claude OAuth 兼容) ----
+    # ---- Subdomain routing with a pathless issuer ----
     if HOST_SUFFIX and host:
         h = host.split(":", 1)[0].lower()
         if h.endswith(HOST_SUFFIX):
@@ -192,7 +191,7 @@ def resolve_route(path: str, host: str = "") -> tuple[str | None, dict[str, Any]
                     return prefix, routes[prefix], _strip_well_known_mcp_suffix(
                         path.split("?", 1)[0] or "/"
                     )
-    # ---- 路径路由 ----
+    # ---- Path routing ----
     clean = path.split("?", 1)[0]
     if clean.startswith("/"):
         clean = clean[1:]
@@ -205,9 +204,9 @@ def resolve_route(path: str, host: str = "") -> tuple[str | None, dict[str, Any]
     route = routes.get(project)
     if route is not None:
         return project, route, rest if rest != "/" else "/mcp"
-    # 根级 OAuth/well-known 发现: 无项目前缀, 单项目时消歧到唯一项目
+    # Resolve root OAuth and well-known discovery to a sole project.
     if _root_oauth_path("/" + clean):
-        # 先试「插入式」(kind + 项目段): /.well-known/oauth-authorization-server/novo
+        # First try inserted project paths such as .../oauth-authorization-server/novo.
         ins_proj, canonical = _split_discovery_insertion("/" + clean)
         if ins_proj and ins_proj in routes:
             return ins_proj, routes[ins_proj], canonical
@@ -216,10 +215,10 @@ def resolve_route(path: str, host: str = "") -> tuple[str | None, dict[str, Any]
             return only, routes[only], canonical
         if len(routes) == 1:
             only = next(iter(routes))
-            # Claude 发现失败后的兜底: POST /register → 后端 /oauth/register
+            # Fallback after Claude discovery failure: POST /register → /oauth/register.
             target = "/oauth/register" if clean == "register" else "/" + clean
             return only, routes[only], target
-        return None, None, "/" + clean  # 多项目: 由调用方给出明确 404 提示
+        return None, None, "/" + clean  # Caller returns explicit guidance for ambiguity.
     return project, None, rest
 
 
@@ -229,7 +228,7 @@ class RouterHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write(f"[herdr-mcp-router] {self.address_string()} {fmt % args}\n")
 
-    # ---- 请求体读取: 兼容 Content-Length 与 chunked + Expect: 100-continue ----
+    # ---- Request-body reading for Content-Length, chunked, and Expect ----
     def _read_body(self) -> bytes:
         te = self.headers.get("Transfer-Encoding", "").lower()
         if "chunked" in te:
@@ -241,7 +240,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     break
                 if size == 0:
-                    self.rfile.readline()  # trailing CRLF (忽略 trailers)
+                    self.rfile.readline()  # Trailing CRLF; trailers are ignored.
                     break
                 chunks.append(self.rfile.read(size))
                 self.rfile.read(2)  # CRLF
@@ -252,13 +251,12 @@ class RouterHandler(BaseHTTPRequestHandler):
     def _drain_body(self) -> None:
         """HTTP/1.1 keep-alive desync guard (herdr-mcp P0).
 
-        任何不消费请求体的响应路径 (404 unknown project / 405 / 根级 OAuth 404
-        等) 必须先把 body 从 rfile 读干净, 否则残余字节会被 BaseHTTPRequestHandler
-        当作下一个请求的 request-line 解析, 产生:
+        Any response path that does not otherwise consume the request body must
+        drain rfile first. Residual bytes would be parsed as the next request line:
             code 400, message Bad request syntax ('{"jsonrpc":...}POST / HTTP/1.1')
-        客户端表现为 'Session terminated' / network_error / 502。
-        Expect: 100-continue 时先回 100 再读 (否则客户端死等)。
-        读失败 (客户端已断开) 则关闭连接 — close 比半开连接安全。
+        Clients surface this as Session terminated, network_error, or 502.
+        Reply 100 before reading Expect: 100-continue bodies. Close the connection
+        if reading fails because closing is safer than leaving it half-open.
         """
         if self.headers.get("Expect", "").lower() == "100-continue":
             try:
@@ -412,9 +410,9 @@ class RouterHandler(BaseHTTPRequestHandler):
             if _root_oauth_path(path_only) and project is None and len(get_routes()) > 1:
                 self._send_error(
                     404,
-                    "herdr-mcp-router: 根级 OAuth/.well-known 发现需要唯一项目。"
-                    "多项目共享同一 hostname 时无法消歧,请用完整前缀 URL: "
-                    "https://herdr-mcp.<域名>/<项目>/.well-known/oauth-authorization-server\n",
+                    "herdr-mcp-router: root OAuth/.well-known discovery requires exactly one project. "
+                    "Multiple projects on one hostname are ambiguous; use a fully prefixed URL: "
+                    "https://herdr-mcp.<domain>/<project>/.well-known/oauth-authorization-server\n",
                 )
             else:
                 self._send_error(404, f"herdr-mcp-router: unknown project '{project}'\n")
@@ -424,7 +422,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         target_path = rest + (f"?{qs}" if qs else "")
         url = f"http://127.0.0.1:{port}{target_path}"
 
-        # Expect: 100-continue — 先回 100 再读 body, 否则客户端会干等
+        # Reply 100 before reading an Expect: 100-continue body.
         if self.headers.get("Expect", "").lower() == "100-continue":
             self.send_response_only(100)
             self.end_headers()
@@ -455,19 +453,18 @@ class RouterHandler(BaseHTTPRequestHandler):
                 if self.command == "HEAD":
                     return
                 if upstream_chunked:
-                    # 上游是 chunked (SSE/流式): 重新按 chunked 分帧, 客户端能读到 0-chunk 结束
+                    # Reframe chunked upstream streams so clients receive the terminating chunk.
                     while True:
                         chunk = resp.read(65536)
                         if not chunk:
                             break
                         self._write_chunked(chunk)
-                        self.wfile.flush()  # SSE/长流: 必须即时刷出, 否则堵在缓冲
+                        self.wfile.flush()  # Flush SSE and long streams immediately.
                     self.wfile.write(b"0\r\n\r\n")
                 else:
                     while True:
                         if resp.length is None and not resp.chunked:
-                            # close-delimited 流 (HTTP/1.0 无 Content-Length, 如 SSE):
-                            # resp.read() 会阻塞等满, 改用 fp.read1 读可用数据
+                            # For close-delimited streams, read available data without blocking for a full buffer.
                             chunk = resp.fp.read1(65536)
                         else:
                             chunk = resp.read(65536)
@@ -475,7 +472,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                             break
                         self.wfile.write(chunk)
                         if len(chunk) < 65536 or self.command == "GET":
-                            # SSE/长流 (无 Content-Length 边界的 GET) 必须逐块 flush
+                            # Flush each chunk for SSE and unbounded GET streams.
                             self.wfile.flush()
         except urllib.error.HTTPError as exc:
             self.send_response(exc.code)
@@ -497,7 +494,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                     else:
                         self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
-            pass  # 客户端 (如 Claude SSE) 断开, 无需回写
+            pass  # The client disconnected; no response can be written.
         except Exception as exc:
             try:
                 self._send_error(502, f"herdr-mcp-router: upstream error: {exc}\n")

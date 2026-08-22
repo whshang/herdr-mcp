@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 /**
- * extension_smoke.mjs — 扩展静态检查 + 纯逻辑单测 (不依赖 Chrome)
+ * Extension static checks and pure-logic tests without Chrome.
  *
- * 1. manifest 引用的每个文件存在 + manifest 是合法 JSON
- * 2. 所有 JS 文件通过 node --check
- * 3. binding-core 状态机: 初始 settled 基线不唤醒 / working→settled 唤醒一次 /
- *    同 seq 不去重 / 重连 hello 补唤醒 / 过期剪枝 / 模板渲染
- * 4. speaks-json.js (vm 加载, 假 window): 嵌套括号 / 转义字符串的 tool-call 解析
+ * 1. Manifest references exist and the manifest is valid JSON.
+ * 2. All extension JavaScript passes node --check.
+ * 3. binding-core state transitions, pruning, and template rendering.
+ * 4. speaks-json.js tool-call parsing in a VM with a stub window.
  *
  * Usage: node tests/manual/extension_smoke.mjs
  */
@@ -16,8 +15,11 @@ import vm from "node:vm";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  decideWake, pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
+  decideWake, decideWorkspaceWake, agentsInWorkspace, formatWorkspaceRoster, workspaceTitleWithId, pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
   progressOutputFingerprint,
+  isIdleNudgeText, looksLikeSubstantiveReply,
+  interpretLlmJudgeReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage,
+  parseLlmSkipKeywords, llmReplyMatchesSkipKeyword, assistantNudgeFingerprint,
 } from "../../extension/binding-core.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -28,7 +30,7 @@ function ok(cond, label, detail = "") {
   else { failures++; console.error(`  ❌ ${label} ${detail}`); }
 }
 
-// ---- 1. manifest 引用完整性 ----
+// ---- 1. Manifest reference integrity ----
 const manifest = JSON.parse(readFileSync(path.join(EXT, "manifest.json"), "utf8"));
 const referenced = [];
 for (const cs of manifest.content_scripts || []) for (const js of cs.js || []) referenced.push(js);
@@ -39,12 +41,24 @@ for (const [k, v] of Object.entries(manifest.icons || {})) referenced.push(v);
 for (const [k, v] of Object.entries(manifest.action?.default_icon || {})) referenced.push(v);
 for (const r of referenced) {
   if (!r) continue;
-  ok(existsSync(path.join(EXT, r)), `manifest 引用文件存在: ${r}`);
+  ok(existsSync(path.join(EXT, r)), `manifest reference exists: ${r}`);
 }
-ok(manifest.background?.type === "module", "background 是 module worker (import binding-core)");
-ok(manifest.content_scripts.length === 4, "4 个站点 content_scripts");
+ok(manifest.background?.type === "module", "background is a module worker");
+ok(manifest.content_scripts.length === 4, "manifest contains four site content scripts");
 
-// ---- 2. JS 语法 (固定清单) ----
+const localeCodes = ["en", "zh", "ja"];
+const localeHud = {};
+for (const code of localeCodes) {
+  const locPath = path.join(EXT, "locales", `${code}.json`);
+  ok(existsSync(locPath), `locale file exists: ${code}`);
+  const loc = JSON.parse(readFileSync(locPath, "utf8"));
+  localeHud[code] = Object.keys(loc).filter((k) => k.startsWith("hud_")).sort();
+}
+ok(localeHud.en.length > 0, "en has hud keys");
+ok(localeHud.zh.join(",") === localeHud.en.join(","), "zh hud keys match en");
+ok(localeHud.ja.join(",") === localeHud.en.join(","), "ja hud keys match en");
+
+// ---- 2. JavaScript syntax for the fixed file list ----
 const fixed = ["background.js", "options.js", "popup.js", "content/base.js",
   "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/claude.js",
   "content/injector/chatgpt.js", "content/webmcp/speaks-json.js", "content/wake.js", "binding-core.js"];
@@ -54,36 +68,68 @@ for (const f of fixed) {
   ok(r.status === 0, `node --check ${f}`, r.stderr?.slice(0, 200));
 }
 
-// ---- 3. binding-core 状态机 ----
+// ---- 3. binding-core state machine ----
 console.log("\n[decideWake]");
 const none = { status: null, lastSettle: null };
-// 初始 hello 已 settled → 基线记录, 不唤醒
+// Initial settled hello records a baseline without waking.
 let d = decideWake(none, "hello", { agent: { status: "idle", seq: 10 } });
-ok(!d.wake && d.status === "idle" && d.lastSettle === null, "初始 hello settled → 基线, 不唤醒");
+ok(!d.wake && d.status === "idle" && d.lastSettle === null, "initial settled hello records baseline without waking");
 // working → armed
 d = decideWake({ status: "idle", lastSettle: null }, "working", { status: "working" });
-ok(!d.wake && d.status === "working", "working → armed, 不唤醒");
-// settled after working → 唤醒一次
+ok(!d.wake && d.status === "working", "working arms without waking");
+// Settled after working wakes once.
 d = decideWake({ status: "working", lastSettle: null }, "settled", { status: "done", seq: 11 });
-ok(d.wake && d.status === "done" && d.lastSettle.seq === 11, "working→settled → 唤醒一次");
-// 同 seq 重复 → 不唤醒
+ok(d.wake && d.status === "done" && d.lastSettle.seq === 11, "working to settled wakes once");
+// Duplicate sequence does not wake.
 d = decideWake({ status: "done", lastSettle: { seq: 11, at: 1 } }, "settled", { status: "done", seq: 11 });
-ok(!d.wake, "同 seq settle 重复 → 不唤醒");
-// 新 seq settle (再次工作) → 唤醒
+ok(!d.wake, "duplicate settle sequence does not wake");
+// A new settle sequence after more work wakes.
 d = decideWake({ status: "working", lastSettle: { seq: 11, at: 1 } }, "settled", { status: "idle", seq: 12 });
-ok(d.wake, "新 seq settle → 唤醒");
-// 绑定后从未见 working 的 settle → 不唤醒 (未 armed)
+ok(d.wake, "new settle sequence wakes");
+// Settle without an observed working state does not wake.
 d = decideWake({ status: "idle", lastSettle: null }, "settled", { status: "done", seq: 13 });
-ok(!d.wake, "未 armed 的 settle → 不唤醒");
-// 重连 hello: persisted working + 快照 settled + 新 seq → 补唤醒
+ok(!d.wake, "unarmed settle does not wake");
+// Reconnecting hello recovers a missed working-to-settled transition.
 d = decideWake({ status: "working", lastSettle: { seq: 11, at: 1 } }, "hello", { agent: { status: "done", seq: 14 } });
-ok(d.wake, "重连 hello (working→settled, 新 seq) → 补唤醒");
-// 重连 hello: 同 seq → 不补
+ok(d.wake, "reconnecting hello recovers a new settled sequence");
+// Reconnecting hello with the same sequence does not wake.
 d = decideWake({ status: "done", lastSettle: { seq: 14, at: 2 } }, "hello", { agent: { status: "done", seq: 14 } });
-ok(!d.wake, "重连 hello 同 seq → 不补");
-// 重连 hello: snapshot 仍 working → 保持 armed
+ok(!d.wake, "reconnecting hello deduplicates the same sequence");
+// A still-working reconnect remains armed.
 d = decideWake({ status: "working", lastSettle: null }, "hello", { agent: { status: "working", seq: 15 } });
-ok(!d.wake && d.status === "working", "hello 仍 working → 保持 armed");
+ok(!d.wake && d.status === "working", "working hello remains armed");
+
+console.log("\n[decideWorkspaceWake]");
+{
+  const scopeBusy = [
+    { pane: "wH:p1", status: "working", workspace: "wH", seq: 1 },
+    { pane: "wH:p2", status: "idle", workspace: "wH", seq: 2 },
+  ];
+  let w = decideWorkspaceWake(none, "hello", {}, scopeBusy);
+  ok(!w.wake && w.status === "working" && w.working_count === 1, "workspace hello with working agent arms");
+  w = decideWorkspaceWake({ status: "working", lastSettle: null }, "settled", { status: "done", seq: 3, pane: "wH:p1" }, [
+    { pane: "wH:p2", status: "working", workspace: "wH" },
+  ]);
+  ok(w.wake && w.kind === "partial" && w.status === "working" && w.working_count === 1, "workspace partial settle emits partial wake");
+  w = decideWorkspaceWake({ status: "working", lastSettle: null }, "settled", { status: "done", seq: 4, pane: "wH:p2" }, []);
+  ok(w.wake && w.kind === "round" && w.working_count === 0, "fully settled workspace emits round wake");
+  ok(agentsInWorkspace([{ workspace: "wH" }, { workspace: "wX" }], "wH").length === 1, "agentsInWorkspace filters by workspace");
+  const pack = formatWorkspaceRoster([
+    { pane: "wH:p1", name: "pi", status: "done", terminal_title: "fix tests", cwd: "/tmp/a", workspace: "wH" },
+    { pane: "wH:p2", name: "cline", status: "working", terminal_title: "edit server", cwd: "/tmp/a", workspace: "wH" },
+    { pane: "wH:p3", name: "anti", status: "idle", terminal_title: "", cwd: "/tmp/b", workspace: "wH" },
+  ], "wH:p1", { id: "wH", label: "herdr-mcp", roots: ["/Users/x/Documents/herdr-mcp"] });
+  ok(pack.working_count === 1 && pack.idle_count === 2, "roster counts working and idle agents");
+  ok(pack.workspace_label.includes("herdr-mcp") && pack.workspace_label.includes("wH"), "roster uses label rather than bare id");
+  ok(pack.roster.includes("← focus") && pack.roster.includes("fix tests") && pack.roster.includes("cline"), "roster includes focus marker and titles");
+  ok(pack.idle_hint.includes("keep for the next task") && pack.idle_hint.includes("reclaim"), "idle_hint includes the available decisions");
+  ok(
+    buildWakeTemplate("ws:{workspace_label}\nout:{output}\n{roster}\n{idle_hint}", {
+      workspace_label: pack.workspace_label, output: "DONE", roster: pack.roster, idle_hint: pack.idle_hint,
+    }).includes("herdr-mcp"),
+    "template renders workspace_label and roster",
+  );
+}
 
 console.log("\n[pruneExpired / revision / template]");
 const now = Date.now();
@@ -92,48 +138,46 @@ const { kept, prunedKeys } = pruneExpired({
   stale: { expires_at: now - 1 },
   noexp: { pane: "x" },
 }, now);
-ok(Object.keys(kept).length === 2 && prunedKeys.length === 1 && prunedKeys[0] === "stale", "过期剪枝 (含无 expires_at 保留)");
-ok(/^h2w:[0-9a-f]+$/.test(bindingRevision({ pane: "wH:p1", convKey: "https://chat.z.ai/chat/s/1", created_at: 1 })), "bindingRevision 格式");
-ok(buildWakeTemplate("a {agent} {pane} {status} {output}", { agent: "pi", pane: "wH:p1", status: "done", output: "hello\nworld" }).includes("hello\nworld"), "模板渲染保留 output 换行");
+ok(Object.keys(kept).length === 2 && prunedKeys.length === 1 && prunedKeys[0] === "stale", "pruning retains unexpired and timeless bindings");
+ok(/^h2w:[0-9a-f]+$/.test(bindingRevision({ pane: "wH:p1", convKey: "https://chat.z.ai/chat/s/1", created_at: 1 })), "bindingRevision format");
+ok(buildWakeTemplate("a {agent} {pane} {status} {output}", { agent: "pi", pane: "wH:p1", status: "done", output: "hello\nworld" }).includes("hello\nworld"), "template rendering preserves output newlines");
 ok(
-  buildWakeTemplate("herdr {status}。\n\n{output}\n\n请继续。", { agent: "omp", pane: "w5A:p1", status: "working", output: "" }) === "herdr working。\n\n请继续。",
-  "空 output 压掉多余空行",
+  buildWakeTemplate("herdr {status}.\n\n{output}\n\nPlease continue.", { agent: "omp", pane: "w5A:p1", status: "working", output: "" }) === "herdr working.\n\nPlease continue.",
+  "empty output removes excess blank lines",
 );
 
 console.log("\n[shouldProgressTick]");
-// 关闭 (<=0 / 非数字) → 永不 tick
-ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 100000, { progressTickSec: 0 }), "progressTickSec=0 → 关闭, 不 tick");
-ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 100000, { progressTickSec: -5 }), "progressTickSec<0 → 不 tick");
-ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 100000, { progressTickSec: "abc" }), "非数字 → 不 tick");
-ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 100000, {}), "缺 cfg.progressTickSec → 不 tick");
-// 非 working → 不 tick
-ok(!shouldProgressTick({ status: "idle", lastTickAt: 0 }, 100000, { progressTickSec: 120 }), "非 working → 不 tick");
-ok(!shouldProgressTick({ status: null, lastTickAt: 0 }, 100000, { progressTickSec: 120 }), "status=null → 不 tick");
-ok(!shouldProgressTick(null, 100000, { progressTickSec: 120 }), "无 prev → 不 tick");
-// 未到期 / 无基线
-ok(!shouldProgressTick({ status: "working", lastTickAt: null }, 100000, { progressTickSec: 120 }), "无 lastTickAt 基线 → 不 tick");
-ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 119999, { progressTickSec: 120 }), "未满间隔 (119999 < 120000) → 不 tick");
-// 恰好到期 / 超过
-ok(shouldProgressTick({ status: "working", lastTickAt: 0 }, 120000, { progressTickSec: 120 }), "恰满间隔 (120000) → tick");
-ok(shouldProgressTick({ status: "working", lastTickAt: 0 }, 240001, { progressTickSec: 120 }), "超间隔 → tick");
-// 小数秒/1s 间隔边界
-ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 999, { progressTickSec: 1 }), "1s 未满 (999) → 不 tick");
-ok(shouldProgressTick({ status: "working", lastTickAt: 0 }, 1000, { progressTickSec: 1 }), "1s 恰满 (1000) → tick");
+// Non-positive or nonnumeric intervals disable ticks.
+ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 100000, { progressTickSec: 0 }), "progressTickSec=0 disables ticks");
+ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 100000, { progressTickSec: -5 }), "negative progressTickSec disables ticks");
+ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 100000, { progressTickSec: "abc" }), "nonnumeric progressTickSec disables ticks");
+ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 100000, {}), "missing progressTickSec disables ticks");
+// Only working state can tick.
+ok(!shouldProgressTick({ status: "idle", lastTickAt: 0 }, 100000, { progressTickSec: 120 }), "idle state does not tick");
+ok(!shouldProgressTick({ status: null, lastTickAt: 0 }, 100000, { progressTickSec: 120 }), "null status does not tick");
+ok(!shouldProgressTick(null, 100000, { progressTickSec: 120 }), "missing previous state does not tick");
+// Baseline and interval boundaries.
+ok(!shouldProgressTick({ status: "working", lastTickAt: null }, 100000, { progressTickSec: 120 }), "missing lastTickAt does not tick");
+ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 119999, { progressTickSec: 120 }), "tick waits for full interval");
+ok(shouldProgressTick({ status: "working", lastTickAt: 0 }, 120000, { progressTickSec: 120 }), "tick fires exactly at interval");
+ok(shouldProgressTick({ status: "working", lastTickAt: 0 }, 240001, { progressTickSec: 120 }), "tick fires after interval");
+ok(!shouldProgressTick({ status: "working", lastTickAt: 0 }, 999, { progressTickSec: 1 }), "one-second tick waits through 999ms");
+ok(shouldProgressTick({ status: "working", lastTickAt: 0 }, 1000, { progressTickSec: 1 }), "one-second tick fires at 1000ms");
 
 console.log("\n[shouldSendProgress]");
 const base = { lastSentAt: 0, lastOutputSent: "", hasProgressSent: false };
-ok(shouldSendProgress(base, 1000, "hello", { progressFallbackSec: 600 }).reason === "new_output", "首次非空新摘要 → new_output");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 1000, "hello", { progressFallbackSec: 600 }).reason === "skip", "已实发且未满底线 → skip");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 1000, "hello world", { progressFallbackSec: 600 }).reason === "skip", "已实发未满底线即使摘要变了也不发");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 600_000, "hello world", { progressFallbackSec: 600 }).reason === "new_output", "满底线且指纹变 → new_output");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 600_000, "hello", { progressFallbackSec: 600 }).reason === "fallback", "满底线指纹未变 → fallback");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 599_999, "hello", { progressFallbackSec: 600 }).reason === "skip", "差 1ms 未满底线 → skip");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "", hasProgressSent: false }, 600_000, "", { progressFallbackSec: 0 }).reason === "skip", "fallback=0 关闭兜底 → skip");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "a", hasProgressSent: false }, 1000, "  a  ", { progressFallbackSec: 600 }).reason === "skip", "未实发但指纹相同 → skip");
-ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "build ok", hasProgressSent: true }, 1000, "⠋ build ok 12:34", { progressFallbackSec: 600 }).reason === "skip", "已实发未满底线 → skip");
-ok(progressOutputFingerprint("⠋ x 1s") === progressOutputFingerprint("⠙ x 2s"), "指纹忽略 spinner 与短时标");
+ok(shouldSendProgress(base, 1000, "hello", { progressFallbackSec: 600 }).reason === "new_output", "first nonempty summary is new_output");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 1000, "hello", { progressFallbackSec: 600 }).reason === "skip", "sent progress inside cooldown is skipped");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 1000, "hello world", { progressFallbackSec: 600 }).reason === "skip", "changed summary inside cooldown is skipped");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 600_000, "hello world", { progressFallbackSec: 600 }).reason === "new_output", "changed fingerprint after cooldown is new_output");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 600_000, "hello", { progressFallbackSec: 600 }).reason === "fallback", "unchanged fingerprint at boundary is fallback");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "hello", hasProgressSent: true }, 599_999, "hello", { progressFallbackSec: 600 }).reason === "skip", "one millisecond before boundary is skipped");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "", hasProgressSent: false }, 600_000, "", { progressFallbackSec: 0 }).reason === "skip", "fallback=0 disables fallback");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "a", hasProgressSent: false }, 1000, "  a  ", { progressFallbackSec: 600 }).reason === "skip", "equivalent unsent fingerprint is skipped");
+ok(shouldSendProgress({ lastSentAt: 0, lastOutputSent: "build ok", hasProgressSent: true }, 1000, "⠋ build ok 12:34", { progressFallbackSec: 600 }).reason === "skip", "spinner and clock noise inside cooldown is skipped");
+ok(progressOutputFingerprint("⠋ x 1s") === progressOutputFingerprint("⠙ x 2s"), "fingerprint ignores spinner and short elapsed time");
 
-// ---- 4. speaks-json.js 解析 (vm + 假 window) ----
+// ---- 4. speaks-json.js parsing in a VM with a stub window ----
 console.log("\n[speaks-json extractToolCalls]");
 {
   const code = readFileSync(path.join(EXT, "content/webmcp/speaks-json.js"), "utf8");
@@ -142,44 +186,42 @@ console.log("\n[speaks-json extractToolCalls]");
   const ctx = vm.createContext({ window, document: { querySelectorAll: () => [] }, console });
   vm.runInContext(code, ctx);
   const sj = window.__H2W_SPEAKS_JSON__;
-  ok(!!sj && sj.enabled === true, "vm 加载 speaks-json, z.ai 启用");
-  // 嵌套括号 (apply_patch 含 {}) + 转义字符串
+  ok(!!sj && sj.enabled === true, "VM loads speaks-json for z.ai");
+  // Nested braces and escaped strings.
   const calls = sj.extractToolCalls(
-    `前置文字 {"tool":"apply_patch","args":{"patch":"diff --git a/x b/x\\n@@ -1 +1 @@\\n-{\\"a\\":1}"}} 后置文字 {"tool":"exec_command","args":{"cmd":"echo hi"}}`,
+    `prefix text {"tool":"apply_patch","args":{"patch":"diff --git a/x b/x\\n@@ -1 +1 @@\\n-{\\"a\\":1}"}} suffix text {"tool":"exec_command","args":{"cmd":"echo hi"}}`,
   );
-  ok(calls.length === 2, `解析出 2 个 tool call`, JSON.stringify(calls));
-  ok(calls[0].tool === "apply_patch" && calls[0].args.patch.includes("{\"a\":1}"), "嵌套括号 + 转义还原正确");
-  ok(calls[1].tool === "exec_command", "第二个调用正确");
-  // 非工具对象跳过 / 未闭合停止
+  ok(calls.length === 2, "extracts two tool calls", JSON.stringify(calls));
+  ok(calls[0].tool === "apply_patch" && calls[0].args.patch.includes("{\"a\":1}"), "restores nested braces and escapes");
+  ok(calls[1].tool === "exec_command", "extracts the second call");
+  // Skip non-tool objects and stop at incomplete JSON.
   const mixed = sj.extractToolCalls(`{"tool":"read_file","args":{"path":"a"}} {"not_a_tool":1} {"tool":"list_dir","args":`);
-  ok(mixed.length === 1 && mixed[0].tool === "read_file", "跳过非工具对象, 未闭合停止");
-  ok(sj.extractToolCalls(null).length === 0 && sj.extractToolCalls("").length === 0, "空输入安全");
+  ok(mixed.length === 1 && mixed[0].tool === "read_file", "skips non-tool objects and stops at incomplete JSON");
+  ok(sj.extractToolCalls(null).length === 0 && sj.extractToolCalls("").length === 0, "empty input is safe");
 }
 
-console.log("\n[permission auto-allow 判定]");
+console.log("\n[permission auto-allow decisions]");
 {
-  // vm 加载 base.js (classic script, 定义 isPermissionDialogText/isAllowButtonText)
+  // Load base.js as a classic script in the VM.
   const code = readFileSync(path.join(EXT, "content/base.js"), "utf8");
   const window = {};
   const ctx = vm.createContext({ window, document: { querySelectorAll: () => [] }, console });
   vm.runInContext(code, ctx);
   const fn = (name) => vm.runInContext(name, ctx);
-  ok(fn("isPermissionDialogText('ChatGPT 请求权限以使用工具')") === true, "权限弹窗文本识别 (中文)");
-  ok(fn("isPermissionDialogText('ChatGPT needs your permission to use tools')") === true, "权限弹窗文本识别 (英文)");  ok(fn("isPermissionDialogText('这是一个普通对话框')") === false, "无权限字样不识别");
-  ok(fn("isAllowButtonText('允许')") === true, "肯定按钮: 允许");
-  ok(fn("isAllowButtonText('Allow')") === true, "肯定按钮: Allow");
-  ok(fn("isAllowButtonText('同意并继续')") === true, "肯定按钮: 同意并继续");
-  ok(fn("isAllowButtonText('拒绝')") === false, "拒绝按钮不点");
-  ok(fn("isAllowButtonText('取消')") === false, "取消按钮不点");
-  ok(fn("isAllowButtonText('Deny')") === false, "Deny 不点");
-  ok(fn("isAllowButtonText('不要允许')") === false, "否定句不点");
+  ok(fn("isPermissionDialogText('ChatGPT 请求权限以使用工具')") === true, "recognizes Chinese permission text");
+  ok(fn("isPermissionDialogText('ChatGPT needs your permission to use tools')") === true, "recognizes English permission text");  ok(fn("isPermissionDialogText('这是一个普通对话框')") === false, "rejects text without permission terms");
+  ok(fn("isAllowButtonText('允许')") === true, "accepts Chinese Allow");
+  ok(fn("isAllowButtonText('Allow')") === true, "accepts English Allow");
+  ok(fn("isAllowButtonText('同意并继续')") === true, "accepts Chinese Agree and continue");
+  ok(fn("isAllowButtonText('拒绝')") === false, "rejects Chinese Deny");
+  ok(fn("isAllowButtonText('取消')") === false, "rejects Chinese Cancel");
+  ok(fn("isAllowButtonText('Deny')") === false, "rejects English Deny");
+  ok(fn("isAllowButtonText('不要允许')") === false, "rejects negated Allow");
 }
 
-console.log("\n[tool-action 权限卡片 DOM 自动允许]");
+console.log("\n[tool-action permission-card auto-allow]");
 {
-  // 轻量自建 DOM fixture (不新增依赖): 支持 base.js __H2W_PERMISSION__ 用到的 API。
-  // 仅实现 helper 实际使用的子集: parentElement / childNodes / querySelectorAll /
-  // hasAttribute/getAttribute / matches / innerText / click 计数。
+  // Lightweight dependency-free DOM fixture implementing only the APIs used by the helper.
   class MockEl {
     constructor(tag, attrs = {}) {
       this.tagName = tag.toUpperCase();
@@ -203,7 +245,7 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
     }
     click() { this.clickCount++; }
     get innerText() {
-      // 与浏览器一致的近似: 拼接文本子树 (跳过 aria-hidden 区不计, 此处简化为全部文本)
+      // Approximate browser innerText by concatenating the text subtree.
       let out = "";
       for (const c of this.childNodes) {
         if (c.nodeType === 3) out += c.data;
@@ -240,7 +282,7 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
     b.hidden = !!attrs.hidden;
     return b;
   }
-  // 文档根: body 作为 cardForButton 向上遍历的终点 (真实 DOM: btn.ownerDocument.body)
+  // Use body as the upward traversal boundary, matching the browser DOM.
   function buildDoc(card) {
     const docEl = el("html", {});
     const body = el("body", {});
@@ -255,14 +297,14 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
     return { document: body, body, documentElement: docEl };
   }
 
-  // 加载 base.js 到 vm, 取得 __H2W_PERMISSION__ 测试 hook
+  // Load base.js and obtain the __H2W_PERMISSION__ test hook.
   const code = readFileSync(path.join(EXT, "content/base.js"), "utf8");
   const window = {};
   const ctx = vm.createContext({ window, document: { querySelectorAll: () => [] }, console });
   vm.runInContext(code, ctx);
   const P = vm.runInContext("window.__H2W_PERMISSION__", ctx);
 
-  // 1) 新 tool-action card: 点主"允许"恰好 1 次
+  // 1) A new tool-action card clicks the primary Allow exactly once.
   {
     const allow = btn("允许");
     const deny = btn("拒绝");
@@ -274,14 +316,14 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
     const { document } = buildDoc(card);
     const clicker = P.createPermissionClicker();
     const r1 = clicker.tryClick(document);
-    ok(r1.handled === true && r1.button === allow, "tool-action card 找到可点允许按钮");
+    ok(r1.handled === true && r1.button === allow, "tool-action card finds the clickable Allow");
     const r2 = clicker.tryClick(document);
-    ok(r2.duplicate === true && r2.handled === false, "重复 mutation 不重复点击 (duplicate)");
-    ok(allow.clickCount === 1, "允许按钮恰好点击 1 次");
-    ok(deny.clickCount === 0, "拒绝按钮不点");
-    ok(drop.clickCount === 0, "aria-haspopup=menu 下拉不点");
+    ok(r2.duplicate === true && r2.handled === false, "repeated mutation does not click twice");
+    ok(allow.clickCount === 1, "Allow is clicked exactly once");
+    ok(deny.clickCount === 0, "Deny is not clicked");
+    ok(drop.clickCount === 0, "aria-haspopup menu is not clicked");
   }
-  // 2) 下拉箭头单独存在时也不点 (卡片含拒绝+允许+下拉: 只点允许)
+  // 2) A separate dropdown arrow remains untouched.
   {
     const allow = btn("允许");
     const deny = btn("拒绝");
@@ -293,10 +335,10 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
     const { document } = buildDoc(card);
     const clicker = P.createPermissionClicker();
     const r = clicker.tryClick(document);
-    ok(r.handled === true && r.button === allow, "允许+下拉(含拒绝): 点允许不点下拉");
-    ok(drop.clickCount === 0, "下拉箭头点击计数 0");
+    ok(r.handled === true && r.button === allow, "clicks Allow rather than the dropdown");
+    ok(drop.clickCount === 0, "dropdown click count remains zero");
   }
-  // 3) 无拒绝按钮 → 不点 (fail-closed)
+  // 3) Missing deny action fails closed.
   {
     const allow = btn("允许");
     const card = el("div", { class: "tool-action-card" },
@@ -306,9 +348,9 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
     const { document } = buildDoc(card);
     const clicker = P.createPermissionClicker();
     const r = clicker.tryClick(document);
-    ok(r.handled === false && allow.clickCount === 0, "无拒绝按钮 → 不点");
+    ok(r.handled === false && allow.clickCount === 0, "missing deny action prevents clicking");
   }
-  // 4) 标题非权限 → 不点 (允许二字只在按钮里, 不把卡片判成权限)
+  // 4) A non-permission title prevents clicking.
   {
     const allow = btn("允许");
     const deny = btn("拒绝");
@@ -318,9 +360,9 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
     const { document } = buildDoc(card);
     const clicker = P.createPermissionClicker();
     const r = clicker.tryClick(document);
-    ok(r.handled === false && allow.clickCount === 0, "标题非权限 → 不点");
+    ok(r.handled === false && allow.clickCount === 0, "non-permission title prevents clicking");
   }
-  // 5) disabled / hidden 允许按钮 → 不点
+  // 5) Disabled or hidden Allow actions are not clicked.
   {
     const allowDis = btn("允许", { disabled: true });
     const allowHid = btn("允许", { hidden: true });
@@ -335,10 +377,10 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
       const { document } = buildDoc(card);
       const clicker = P.createPermissionClicker();
       const r = clicker.tryClick(document);
-      ok(r.handled === false && a.clickCount === 0, `${tag} 允许按钮 → 不点`);
+      ok(r.handled === false && a.clickCount === 0, `${tag} Allow is not clicked`);
     }
   }
-  // 6) 旧 role=dialog 仍可识别
+  // 6) Legacy role=dialog remains supported.
   {
     const allow = btn("Allow");
     const deny = btn("Deny");
@@ -349,10 +391,10 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
     const { document } = buildDoc(card);
     const clicker = P.createPermissionClicker();
     const r = clicker.tryClick(document);
-    ok(r.handled === true && r.button === allow && allow.clickCount === 1, "旧 role=dialog 仍可识别并点 Allow 1 次");
-    ok(deny.clickCount === 0, "dialog 内 Deny 不点");
+    ok(r.handled === true && r.button === allow && allow.clickCount === 1, "legacy role=dialog clicks Allow once");
+    ok(deny.clickCount === 0, "dialog Deny is not clicked");
   }
-  // 7) 无文本按钮 / aria-label=更多 的纯图标按钮不点
+  // 7) Unlabeled and more-actions icon buttons are not clicked.
   {
     const iconBtn = btn("", { "aria-label": "更多操作" });
     const allow = btn("允许");
@@ -363,9 +405,9 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
     const { document } = buildDoc(card);
     const clicker = P.createPermissionClicker();
     const r = clicker.tryClick(document);
-    ok(r.handled === true && r.button === allow && iconBtn.clickCount === 0, "无文本/更多图标按钮不点");
+    ok(r.handled === true && r.button === allow && iconBtn.clickCount === 0, "unlabeled more-actions icon is not clicked");
   }
-  // 8) aria-disabled=true / aria-hidden=true → 不点 (fail-closed)
+  // 8) aria-disabled and aria-hidden actions fail closed.
   {
     const allowArDis = btn("允许", { "aria-disabled": "true" });
     const allowArHid = btn("允许", { "aria-hidden": "true" });
@@ -377,19 +419,19 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
       const { document } = buildDoc(mkCard(allow));
       const clicker = P.createPermissionClicker();
       const r = clicker.tryClick(document);
-      ok(r.handled === false && allow.clickCount === 0, `${tag} 允许按钮 → 不点`);
+      ok(r.handled === false && allow.clickCount === 0, `${tag} Allow is not clicked`);
     }
   }
-  // 9) ChatGPT 卡外另有"允许"按钮: 仍只点 action area 主允许, 不取外部按钮
+  // 9) An external Allow does not override the card's primary action.
   {
     const mainAllow = btn("允许");
     const deny = btn("拒绝");
     const card = el("div", { class: "tool-action-card" },
       el("h3", {}, "ChatGPT 请求使用工具"), el("p", {}, "此工具需要权限"),
       el("div", { class: "btn-area" }, deny, mainAllow));
-    // 外部孤立"允许"按钮 (在同一 body 下, 但其所在 action 区无拒绝 → 精确路径拒绝)
+    // An isolated external Allow has no deny action in its action area.
     const externalAllow = btn("允许");
-    // 注意: 外部按钮 DOM 顺序在前, 确保 findAllowAction 先扫到它也跳过, 再选主允许
+    // Place it first in DOM order to verify it is skipped before the primary action.
     const docEl = el("html", {});
     const body = el("body", {}, externalAllow, card);
     externalAllow.parentElement = body; card.parentElement = body;
@@ -402,10 +444,10 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
     })(body);
     const clicker = P.createPermissionClicker();
     const r = clicker.tryClick(body);
-    ok(r.handled === true && r.button === mainAllow, "卡外另有允许: 仍选 action area 主允许");
-    ok(mainAllow.clickCount === 1 && externalAllow.clickCount === 0, "外部允许按钮不被点");
+    ok(r.handled === true && r.button === mainAllow, "selects the primary action despite an external Allow");
+    ok(mainAllow.clickCount === 1 && externalAllow.clickCount === 0, "external Allow is not clicked");
   }
-  // 10) 初始 disabled 允许按钮 → 移除属性后再次 tryClick (等价 Observer callback) 能补点, 随后去重
+  // 10) An initially disabled Allow can be clicked after being enabled, then deduplicates.
   {
     const allow = btn("允许", { disabled: true });
     const deny = btn("拒绝");
@@ -415,28 +457,26 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
     const { document } = buildDoc(card);
     const clicker = P.createPermissionClicker();
     const r1 = clicker.tryClick(document);
-    ok(r1.handled === false && allow.clickCount === 0, "初始 disabled → 不点");
-    // 模拟站点后挂载 enabled: 移除 disabled 属性 + 清 disabled 标志 (observer callback 会再调 tryClick)
+    ok(r1.handled === false && allow.clickCount === 0, "initially disabled Allow is not clicked");
+    // Simulate a site enabling the action before the observer retries.
     delete allow.attrs.disabled;
     allow.disabled = false;
-    const r2 = clicker.tryClick(document); // 等价 Observer callback 再跑一次
-    ok(r2.handled === true && r2.button === allow && allow.clickCount === 1, "移除 disabled 后补点 1 次");
+    const r2 = clicker.tryClick(document); // Equivalent to another observer callback.
+    ok(r2.handled === true && r2.button === allow && allow.clickCount === 1, "enabled Allow is clicked once");
     const r3 = clicker.tryClick(document);
-    ok(r3.duplicate === true && r3.handled === false && allow.clickCount === 1, "补点后再次 tryClick 去重 (不重复点击)");
+    ok(r3.duplicate === true && r3.handled === false && allow.clickCount === 1, "retry after click is deduplicated");
   }
-  // 11) 嵌套外层含 deny + 卡外 allow 的负例: 仍只点 exact action area 主允许
-  //     卡内 action area 有 data-testid=tool-action-buttons; 外层再包一个含 deny 的容器,
-  //     卡外另有一个孤立 allow。actionAreaFor 必须优先 testid 区, 不扩大到外层 deny。
+  // 11) Nested external deny and Allow controls do not expand the exact action area.
   {
     const mainAllow = btn("允许");
     const innerDeny = btn("拒绝");
     const actionArea = el("div", { class: "btn-area", "data-testid": "tool-action-buttons" }, innerDeny, mainAllow);
     const card = el("div", { class: "tool-action-card" },
       el("h3", {}, "ChatGPT 请求使用工具"), el("p", {}, "此工具需要权限"), actionArea);
-    // 外层更大的 deny 容器 (含卡片): 精确 testid 区应阻止扩大到这层
+    // A larger outer deny container must not expand the exact testid area.
     const outerDeny = btn("拒绝");
     const outerWrap = el("div", { class: "outer" }, outerDeny, card);
-    // 卡外孤立 allow (与卡片无关)
+    // Isolated Allow unrelated to the card.
     const externalAllow = btn("允许");
     const docEl = el("html", {});
     const body = el("body", {}, externalAllow, outerWrap);
@@ -450,22 +490,55 @@ console.log("\n[tool-action 权限卡片 DOM 自动允许]");
     })(body);
     const clicker = P.createPermissionClicker();
     const r = clicker.tryClick(body);
-    ok(r.handled === true && r.button === mainAllow, "嵌套外层含 deny: 仍点真实 testid action area 主允许");
-    ok(mainAllow.clickCount === 1 && externalAllow.clickCount === 0 && outerDeny.clickCount === 0, "仅主允许被点 (外部/外层 deny 均不点)");
+    ok(r.handled === true && r.button === mainAllow, "nested outer deny still selects exact primary action");
+    ok(mainAllow.clickCount === 1 && externalAllow.clickCount === 0 && outerDeny.clickCount === 0, "only the primary Allow is clicked");
   }
-  // 12) 无 data-testid 的语义 fallback: 最小含 deny 祖先仍可识别 (旧 dialog/无 testid 站)
+  // 12) Semantic fallback uses the nearest deny ancestor without a data-testid.
   {
     const allow = btn("允许");
     const deny = btn("拒绝");
     const card = el("div", { class: "tool-action-card" },
       el("h3", {}, "ChatGPT 请求使用工具"), el("p", {}, "此工具需要权限"),
-      el("div", { class: "btn" }, deny, allow)); // 无 data-testid
+      el("div", { class: "btn" }, deny, allow)); // No data-testid.
     const { document } = buildDoc(card);
     const clicker = P.createPermissionClicker();
     const r = clicker.tryClick(document);
-    ok(r.handled === true && r.button === allow && allow.clickCount === 1, "无 data-testid: 语义 fallback 仍点主允许 1 次");
+    ok(r.handled === true && r.button === allow && allow.clickCount === 1, "semantic fallback clicks primary Allow once");
   }
 }
+
+
+console.log("\n[progress / nudge config]");
+ok(shouldProgressTick({ status: "working", lastTickAt: 0 }, 120000, { progressTickSec: 120 }), "progress tick at 120s interval");
+
+console.log("\n[llmJudge]");
+ok(isLlmJudgeConfigured({ llmJudgeBaseUrl: "https://x/v1", llmJudgeApiKey: "k", llmJudgeModel: "m" }), "configured when three set");
+ok(!isLlmJudgeConfigured({ llmJudgeBaseUrl: "", llmJudgeApiKey: "k", llmJudgeModel: "m" }), "empty url = off");
+ok(llmJudgeCompletionsUrl("https://x/v1") === "https://x/v1/chat/completions", "url append completions");
+ok(llmJudgeCompletionsUrl("https://x/v1/chat/completions") === "https://x/v1/chat/completions", "url already full");
+ok(buildLlmJudgeUserMessage("看：{content}", { assistantText: "hello" }).includes("hello"), "prompt fills content");
+ok(interpretLlmJudgeReply("好的").done === true, "好的 → done");
+ok(interpretLlmJudgeReply("继续").cont === true, "继续 → continue");
+ok(interpretLlmJudgeReply("继续").nudgeText === "继续", "bare 继续 sends model text");
+ok(interpretLlmJudgeReply("继续，按你的建议推进").cont === true, "full continue phrase");
+ok(interpretLlmJudgeReply("继续，按你的建议推进").nudgeText.includes("建议推进"), "full phrase kept as model text");
+ok(interpretLlmJudgeReply("好的，没有完成。继续。").cont === true, "messy 好的+继续 → cont");
+ok(interpretLlmJudgeReply("好的，没有完成。继续。").nudgeText.includes("继续"), "messy keeps model text");
+ok(isIdleNudgeText("继续，按你的建议推进"), "continue text is nudge fingerprint");
+ok(isIdleNudgeText("继续"), "bare 继续 is nudge fingerprint");
+ok(!isIdleNudgeText("请继续验证 Convex"), "normal user not fingerprint");
+ok(!looksLikeSubstantiveReply("Running herdr_inspect"), "tool status stub not substantive");
+ok(!looksLikeSubstantiveReply("Called herdr_exec"), "short tool line not substantive");
+ok(looksLikeSubstantiveReply(
+  "I ran herdr_inspect and herdr_exec. The MCP server is healthy and all panes are idle. Next I will run the pytest suite for convex."
+), "long prose reply is substantive");
+ok(assistantNudgeFingerprint("abc") === assistantNudgeFingerprint("abc"), "fp stable");
+ok(assistantNudgeFingerprint("abc") !== assistantNudgeFingerprint("abd"), "fp differs");
+ok(parseLlmSkipKeywords("").includes("好的"), "empty skip → built-in");
+ok(parseLlmSkipKeywords("完成\nPASS").join(",") === "完成,PASS", "custom skip parse");
+ok(llmReplyMatchesSkipKeyword("完成。", "完成\nPASS"), "custom skip match");
+ok(interpretLlmJudgeReply("完成", { skipKeywords: "完成\nPASS" }).done === true, "custom skip → done");
+ok(interpretLlmJudgeReply("好的", { skipKeywords: "完成" }).done === false, "好的 not in custom skip → not done");
 
 console.log(`\n=== ${failures === 0 ? "EXTENSION SMOKE ALL PASS" : failures + " FAILURES"} ===`);
 process.exit(failures === 0 ? 0 : 1);

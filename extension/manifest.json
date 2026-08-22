@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "herdr → Web wake",
-  "version": "0.1.8",
-  "description": "herdr agent 干完活 → 向绑定的网页会话输入框写消息并提交,唤醒网页 AI (z.ai / DeepSeek / Claude / ChatGPT)",
+  "version": "0.1.28",
+  "description": "When herdr agents settle, type into the bound web chat and submit (z.ai / DeepSeek / Claude / ChatGPT). UI: en / zh / ja.",
   "permissions": ["storage", "scripting", "alarms"],
   "host_permissions": [
     "http://127.0.0.1:8772/*",
@@ -26,6 +26,17 @@
     "128": "icons/icon128.png"
   },
   "options_page": "options.html",
+  "web_accessible_resources": [
+    {
+      "resources": ["locales/*.json"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://claude.ai/*",
+        "https://chat.z.ai/*",
+        "https://chat.deepseek.com/*"
+      ]
+    }
+  ],
   "content_scripts": [
     {
       "matches": ["https://chat.z.ai/*"],

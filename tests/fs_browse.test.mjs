@@ -149,13 +149,14 @@ async function tool(name, args = {}, opts = {}) {
   return JSON.parse(r.msg.result.content[0].text);
 }
 
-test("tools/list exposes the 17 lean tools incl. herdr_fs_list + herdr_fs_grep", async () => {
+test("tools/list exposes the 18 lean tools incl. herdr_fs_list + herdr_fs_grep", async () => {
   const saved = sessionId; sessionId = null;
   try {
     await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "fs-t", version: "1" } }, { noSession: true });
     const list = await rpc("tools/list", {}, { noSession: true });
     const names = list.msg.result.tools.map((t) => t.name);
-    assert.equal(names.length, 17, `default tools/list must be 17, got ${names.length}: ${names.join(",")}`);
+    assert.equal(names.length, 18, `default tools/list must be 18, got ${names.length}: ${names.join(",")}`);
+    assert.ok(names.includes("herdr_skill"), "herdr_skill registered");
     assert.ok(names.includes("herdr_fs_list"), "herdr_fs_list missing");
     assert.ok(names.includes("herdr_fs_grep"), "herdr_fs_grep missing");
     assert.ok(names.includes("herdr_fs_write"), "herdr_fs_write missing");

@@ -2,7 +2,8 @@
 
 帮助网页版 SOTA 模型打通本机 [herdr](https://herdr.dev)，进入你的开发项目，调度本地 agent 协助开发。
 
-English: [README.md](README.md).
+**语言（与 herdr 一致）：** [English](README.md)（GitHub 默认）· [简体中文](README.zh.md) · [日本語](README.ja.md)。  
+CLI / 浏览器插件：首次安装跟系统语言（`en` / `zh` / `ja`），未知则英语。可随时改：`herdr-mcp lang`，或插件选项页 → 语言。
 
 ## 架构（用户 ↔ 网页 ↔ MCP ↔ herdr，插件做反向通道）
 
@@ -151,11 +152,14 @@ herdr-mcp connector
 herdr-mcp start | stop | restart
 herdr-mcp logs [-f]
 herdr-mcp token | url
+herdr-mcp lang [en|zh|ja]   # 界面语言（首次跟系统；未知则英语）
+herdr-mcp watchdog install  # 每 120s 自检：MCP 挂了才重启；TaskGroup 只记日志
+herdr-mcp watchdog status
 ```
 
 改代码后：`npx tsc && herdr-mcp restart`。
 
-## 默认工具（为什么是这 17 个）
+## 默认工具（为什么是这 18 个）
 
 herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法）。herdr-mcp **不会**把每个方法都做成 MCP 工具（占上下文、也和 herdr 重复），而是三层：
 
@@ -167,6 +171,7 @@ herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法
 
 | 工具 | 做什么 |
 |---|---|
+| `herdr_skill` | 只读：优先从上游 herdr **master** 拉最新 SKILL.md；网络不可达时用**安装包内置副本**（`assets/herdr-agent-SKILL.md`）。ChatGPT 不访问 GitHub，只有本机 herdr-mcp 进程会拉。`HERDR_SKILL_NETWORK=0` 强制只用内置。 |
 | `herdr_methods` | 列出当前 herdr socket 方法与参数 schema（反射缓存）。陌生调用前先查。 |
 | `herdr_call` | 用 `{ method, params }` 调任意 herdr 方法（pane / workspace / agent 等），避免「一方法一工具」。 |
 | `herdr_inspect` | 一次看清连接 + workspaces / tabs / panes / agents（cwd、状态），以及 `workstation_info`、`boot_id`、`exec_sessions`。通常第一个调用。 |
@@ -191,7 +196,7 @@ herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法
 
 **两条对等主线**（见 [docs/extension.md](docs/extension.md)）：
 
-1. **进度回推**：herdr working（新摘要 / 可配置兜底，默认 10 分钟）与 settled → 往绑定网页写提醒并提交（chatgpt / deepseek / z.ai / claude）
+1. **进度回推**：网页对话绑到 herdr **workspace**；space 内任意 agent 有新输出/停下来可回推；全部停 working 才收工唤醒；ChatGPT 回合结束后可用小模型判定是否催促继续（扩展 ≥0.1.20；Options 预填提示词/不发送词，继续时提交模型原文）
 2. **JSON→MCP**：DeepSeek / z.ai 无 connector 时，助手 JSON → 本机 `/mcp`（路线见 [docs/extension-bridge.md](docs/extension-bridge.md)）
 
 共享本地 `127.0.0.1:8772` 与静态 token。这不是给 DeepSeek「安装」ChatGPT 式 OAuth connector。

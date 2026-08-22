@@ -2,7 +2,8 @@
 
 Help web SOTA models reach local [herdr](https://herdr.dev), enter your project, and schedule on-machine agents to assist development.
 
-中文文档见 [README.zh.md](README.zh.md).
+**Languages (same as herdr):** [English](README.md) (default on GitHub) · [简体中文](README.zh.md) · [日本語](README.ja.md).  
+CLI / browser extension: first install follows system language (`en` / `zh` / `ja`); unknown → English. Change anytime: `herdr-mcp lang`, or extension Options → Language.
 
 ## Architecture (you ↔ web ↔ MCP ↔ herdr; extension as reverse channel)
 
@@ -150,6 +151,9 @@ herdr-mcp connector
 herdr-mcp start | stop | restart
 herdr-mcp logs [-f]
 herdr-mcp token | url
+herdr-mcp lang [en|zh|ja]   # UI language (first run: system; default en)
+herdr-mcp watchdog install  # every 120s: restart MCP if down; TaskGroup = log only
+herdr-mcp watchdog status
 ```
 
 After code changes: `npx tsc && herdr-mcp restart`.
@@ -190,7 +194,7 @@ Folder: `extension/` (MV3). Load unpacked in `chrome://extensions`.
 
 Two equal jobs ([docs/extension.md](docs/extension.md), 中文):
 
-1. **Progress nudge** — herdr working (new summary or configurable fallback, default 10 min) and settled → inject into the bound web chat (chatgpt / deepseek / z.ai / claude)
+1. **Progress nudge** — bind a ChatGPT (etc.) conversation to a herdr **workspace**; any agent in that space with new output / settle can nudge; full settle only when none remain working.
 2. **JSON → MCP** — on DeepSeek / z.ai (no connector), parse assistant `{"tool":...}` → local `/mcp`
 
 Same local `127.0.0.1:8772` token. Not a substitute for ChatGPT’s OAuth connector.

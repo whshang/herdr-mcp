@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * /push endpoint verification (阶段 1).
+ * /push endpoint verification (phase 1).
  *
  * 1. Spawns dist/server.js on a test port with a test token.
  * 2. Checks auth: /push/* → 401 without token, 200 with.

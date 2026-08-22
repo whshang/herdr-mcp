@@ -1,52 +1,62 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <style>
-    body { width: 320px; margin: 0; font: 13px/1.5 -apple-system, sans-serif; color: #1f2937; }
-    header { padding: 10px 12px; background: #111827; color: #f3f4f6; font-weight: 600; }
-    .section { padding: 10px 12px; border-top: 1px solid #e5e7eb; }
-    .section h3 { margin: 0 0 6px; font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: .04em; }
-    .row { display: flex; align-items: center; justify-content: space-between; padding: 5px 0; }
-    .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-    .agent { padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+    body { width: 300px; margin: 0; font: 12px/1.35 -apple-system, sans-serif; color: #1f2937; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; background: #111827; color: #f3f4f6; font-weight: 600; font-size: 12px; }
+    header a { color: #93c5fd; font-weight: 500; font-size: 11px; text-decoration: none; flex-shrink: 0; }
+    header a:hover { color: #bfdbfe; text-decoration: underline; }
+    .section { padding: 6px 10px; border-top: 1px solid #e5e7eb; }
+    .section h3 { margin: 0 0 4px; font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: .04em; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 2px 0; }
+    .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; vertical-align: middle; flex-shrink: 0; }
+    .agent { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 4px 6px; border-radius: 5px; cursor: pointer; }
     .agent:hover { background: #f3f4f6; }
-    .agent .meta { color: #9ca3af; font-size: 11px; }
-    button { border: 1px solid #d1d5db; background: #f9fafb; border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
+    .agent.bound { background: #f0fdf4; }
+    .agent.bound:hover { background: #dcfce7; }
+    .agent-main { min-width: 0; flex: 1; }
+    .agent .meta { color: #9ca3af; font-size: 10px; margin-top: 1px; }
+    .agent .title { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    button { border: 1px solid #d1d5db; background: #f9fafb; border-radius: 5px; padding: 3px 8px; cursor: pointer; font-size: 11px; flex-shrink: 0; }
     button:hover { background: #e5e7eb; }
     button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
     button.primary:hover { background: #1d4ed8; }
-    button.danger { color: #dc2626; }
-    .muted { color: #9ca3af; font-size: 11px; }
-    .err { color: #dc2626; font-size: 12px; white-space: pre-line; }
+    button.danger { color: #dc2626; background: #fff; }
+    button.sm { padding: 2px 6px; font-size: 10px; }
+    .muted { color: #9ca3af; font-size: 10px; }
+    .err { color: #dc2626; font-size: 11px; white-space: pre-line; }
     .ok { color: #16a34a; }
     #toast.err { background: #fef2f2; border-color: #fecaca; color: #b91c1c; }
     #toast.ok { background: #f0fdf4; border-color: #bbf7d0; color: #15803d; }
-    .hintbox { background: #f3f4f6; border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px; font-size: 12px; color: #374151; margin-top: 6px; }
-    #agents { max-height: 180px; overflow: auto; }
+    .hintbox { background: #f3f4f6; border: 1px solid #e5e7eb; border-radius: 5px; padding: 6px; font-size: 11px; color: #374151; margin-top: 4px; }
+    .cfg-grid { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: center; }
+    .cfg-grid label { display: flex; align-items: center; gap: 4px; font-size: 11px; }
+    #progressTickSec { max-width: 56px; font-size: 11px; padding: 2px 4px; }
+    #convInfo { word-break: break-all; line-height: 1.3; }
   </style>
 </head>
 <body>
-  <header>herdr → Web 唤醒</header>
-  <div id="toast" style="display:none;position:sticky;top:0;z-index:10;padding:8px 12px;font-size:12px;line-height:1.4;border-bottom:1px solid"></div>
+  <header>
+    <span data-i18n="popup_title">herdr → Web wake</span>
+    <a href="#" id="openOptions" data-i18n="options_link">Options</a>
+  </header>
+  <div id="toast" style="display:none;position:sticky;top:0;z-index:10;padding:6px 10px;font-size:11px;line-height:1.35;border-bottom:1px solid"></div>
   <div class="section">
-    <div class="row"><span>本地 MCP 服务</span><span id="srvStatus" class="muted">…</span></div>
-    <div class="row"><span>开关</span><label><input type="checkbox" id="enabled"> 启用唤醒</label></div>
-    <div class="row"><span class="muted">配置 → <a href="#" id="openOptions">选项页</a></span></div>
+    <div class="row"><span data-i18n="mcp_service">Local MCP</span><span id="srvStatus" class="muted">…</span></div>
+    <div class="cfg-grid">
+      <label><input type="checkbox" id="enabled"> <span data-i18n="enable_wake">Enable wake</span></label>
+      <label><input type="checkbox" id="idleNudgeEnabled"> <span data-i18n="idle_nudge_short">Nudge</span></label>
+      <span data-i18n="pace_interval">Interval (sec)</span>
+      <input type="number" id="progressTickSec" min="0" step="1">
+    </div>
+    <div id="llmJudgeStatus" class="muted" style="font-size:10px;margin-top:2px"></div>
   </div>
   <div class="section">
-    <h3>当前会话</h3>
-    <div id="convInfo" class="muted">…</div>
-    <div id="convActions" style="margin-top:6px"></div>
+    <h3 data-i18n="workspaces_heading">herdr workspaces</h3>
+    <div id="convInfo" class="muted" style="margin-bottom:4px">…</div>
+    <div id="agents" class="muted">…</div>
   </div>
-  <div class="section">
-    <h3>herdr agents (点击绑定到当前会话)</h3>
-    <div id="agents" class="muted">加载中…</div>
-  </div>
-  <div class="section">
-    <h3>已绑定</h3>
-    <div id="bindings" class="muted">…</div>
-  </div>
-  <script src="popup.js"></script>
+  <script type="module" src="popup.js"></script>
 </body>
 </html>

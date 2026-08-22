@@ -1,38 +1,46 @@
 /**
- * /push — browser-extension push channel (herdr → 网页唤醒).
+ * /push — browser-extension push channel (herdr → web wake-up).
  *
- * 方向: 某个 herdr agent (如 p1) 干完活 (working → idle/done/blocked) 时,
- * 通过 SSE 通知浏览器插件,插件向绑定的网页会话输入框写入消息并提交。
+ * Direction: when a herdr agent (for example, p1) finishes work
+ * (working → idle/done/blocked), notify the browser extension over SSE so it
+ * can write a message into the bound web chat input and submit it.
  *
- * ## 设计决策 (阶段 1)
+ * ## Design decisions (phase 1)
  *
- * 1. **SSE 复用现有事件源**: 服务器已经维护一条活的 events.subscribe 长连接
- *    (SnapshotCache, A-2, 25s chunk + 30s TTL 重快照)。PushHub 给 cache 挂
- *    onEvent 监听 (state.ts 新增钩子),而不是每个客户端再开一条 daemon
- *    订阅 — 零额外 socket,事件已归一化。不做轮询。
+ * 1. **Reuse the existing SSE event source**: the server already maintains a
+ *    live events.subscribe connection (SnapshotCache, A-2, 25s chunks plus a
+ *    30s snapshot TTL). PushHub attaches an onEvent listener to the cache
+ *    (via the hook in state.ts) instead of opening another daemon subscription
+ *    per client. This adds no sockets, uses normalized events, and avoids polling.
  *
- * 2. **鉴权复用 HERDR_MCP_TOKEN**: 不加新 token 机制。理由:
- *    - 威胁模型相同: 持有 token 者本来就能经 herdr_inspect 读全部 agent 状态,
- *      push 通道不外泄更多信息;
- *    - 零新密钥管理 (plist 只存一份 token,扩展配置也只填一份);
- *    - /mcp 未配 token 时本地裸跑, /push 保持一致 (AUTH_TOKEN 为空则开放)。
- *    插件侧从 background fetch 本地 127.0.0.1 端点,可以带 Authorization 头
- *    (EventSource 不能带头,所以不用 EventSource)。
+ * 2. **Reuse HERDR_MCP_TOKEN for authentication**: no separate token mechanism.
+ *    - The threat model is identical: token holders can already read all agent
+ *      state through herdr_inspect, so the push channel exposes nothing extra.
+ *    - This requires no additional secret management: one token in the plist
+ *      and one token in the extension configuration.
+ *    - When /mcp runs locally without a token, /push behaves the same way
+ *      (open when AUTH_TOKEN is empty).
+ *    The extension fetches the local 127.0.0.1 endpoint from its background
+ *    worker and can attach an Authorization header, unlike EventSource.
  *
- * 3. **事件过滤**: 服务端按 ?agent=NAME / ?pane=PANE_ID 可选过滤 (绑定在扩展
- *    侧,服务端保持无状态)。初始 hello 事件带权威 agent 快照,扩展据此恢复
- *    绑定 (阶段 3 的错峰恢复依赖它)。
+ * 3. **Event filtering**: the server optionally filters by ?agent=NAME,
+ *    ?pane=PANE_ID, or ?workspace=WS_ID. Bindings remain extension-side, so
+ *    the server is stateless. The extension binds a **workspace** by default
+ *    and receives working/settled/output events for any agent in that scope.
+ *    The initial hello event contains an authoritative, optionally scoped snapshot.
  *
- * 4. **错峰恢复**: 若扩展连接时 agent 已 settled,hello 快照里就是 settled;
- *    扩展用自己的去重 (记录已通知的 settle seq) 决定是否唤醒,服务端不需要
- *    补发历史。PushHub 内部每 10s 与 cache.agentViews() 对账一次,事件流有
- *    缺口时也能补发转换 (自愈)。
+ * 4. **Recovery after missed events**: if an agent is already settled when
+ *    the extension connects, the hello snapshot reports it as settled. The
+ *    extension deduplicates by the last notified settle sequence, so the server
+ *    does not replay history. PushHub reconciles with cache.agentViews() every
+ *    10 seconds to recover state transitions missed by the event stream.
  */
 import { Router, Request, Response } from "express";
 import type { Express } from "express";
 import { HerdrClient, HerdrEvent } from "./herdr.js";
 import { getSnapshotCache, SnapshotCache, AgentView } from "./state.js";
 import { cleanTerminalOutput } from "./clean.js";
+import { queryMcpActivity } from "./mcp-activity.js";
 
 const SETTLED = new Set(["idle", "done", "blocked"]);
 const RECONCILE_MS = 10_000;   // periodic re-seed vs cache.agentViews() (missed-event recovery)
@@ -57,6 +65,7 @@ function progressSnippetFingerprint(output: string | undefined): string {
 interface PushFilters {
   agent?: string;
   pane?: string;
+  workspace?: string;
 }
 
 interface PushClient {
@@ -189,10 +198,13 @@ class PushHub {
       const output = cleanTerminalOutput(text).slice(0, 2000);
       if (!output.trim()) return;
       const prev = this.lastOutputSnippet.get(ref.pane)?.output;
-      // 指纹级去重: spinner / 时钟跳动不算「新摘要」, 避免扩展每分钟当 new_output
+      // Fingerprint-level deduplication: spinner and clock changes are not new summaries.
       if (progressSnippetFingerprint(prev) === progressSnippetFingerprint(output)) return;
       this.lastOutputSnippet.set(ref.pane, { at: Date.now(), output });
-      this.emit("agent_output", { agent: ref.name, pane: ref.pane, at: new Date().toISOString(), output });
+      this.emit("agent_output", {
+        agent: ref.name, pane: ref.pane, workspace: ref.workspace,
+        at: new Date().toISOString(), output,
+      });
     } catch {
       /* snippet is best-effort */
     }
@@ -205,7 +217,7 @@ class PushHub {
       const prev = this.lastStatusByPane.get(a.pane);
       const next = { status: a.status, name: a.name };
       if (!prev || prev.status === next.status) {
-        // working 期间节流拉摘要, 供扩展「有新 output 才发进度」
+        // Throttle summary reads while working so progress is sent only for new output.
         if (next.status === "working") {
           const last = this.lastWorkingSnippetAt.get(a.pane) ?? 0;
           if (Date.now() - last >= WORKING_SNIPPET_MS) {
@@ -227,7 +239,7 @@ class PushHub {
         this.emit("agent_settled", { agent: a.name, pane: a.pane, workspace: a.workspace, cwd: a.cwd, status: a.status, seq, at: new Date().toISOString() });
         const snippet = this.lastOutputSnippet.get(a.pane);
         if (snippet && Date.now() - snippet.at < 30_000) {
-          this.emit("agent_output", { agent: a.name, pane: a.pane, at: new Date().toISOString(), output: snippet.output });
+          this.emit("agent_output", { agent: a.name, pane: a.pane, workspace: a.workspace, at: new Date().toISOString(), output: snippet.output });
         }
       }
     }
@@ -242,7 +254,34 @@ class PushHub {
       if (name !== c.filters.agent && name !== want) return false;
     }
     if (c.filters.pane && data["pane"] !== c.filters.pane) return false;
+    if (c.filters.workspace && data["workspace"] !== c.filters.workspace) return false;
     return true;
+  }
+
+  private agentsForHello(filters: PushFilters): unknown[] {
+    let agents = this.cache.agentViews();
+    if (filters.workspace) {
+      agents = agents.filter((a) => a.workspace === filters.workspace);
+    } else if (filters.pane) {
+      agents = agents.filter((a) => a.pane === filters.pane);
+    } else if (filters.agent) {
+      const want = filters.agent.split(":")[1] ?? filters.agent;
+      agents = agents.filter((a) => a.name === filters.agent || a.name === want);
+    }
+    return agents.map((a: AgentView) => ({
+      name: a.name, pane: a.pane, status: a.status, workspace: a.workspace,
+      cwd: a.cwd, started_at: a.started_at, last_activity_at: a.last_activity_at,
+      terminal_title: typeof a.terminal_title === "string" ? a.terminal_title : undefined,
+      seq: typeof a.state_change_seq === "number" ? (a.state_change_seq as number) : undefined,
+    }));
+  }
+
+  private workspacePayload(): unknown[] {
+    return this.cache.workspaceViews().map((w) => ({
+      id: w.id,
+      label: w.label,
+      roots: w.roots,
+    }));
   }
 
   private emit(event: string, data: Record<string, unknown>): void {
@@ -269,12 +308,8 @@ class PushHub {
       protocol: "herdr-mcp-push/v1",
       server_time: new Date().toISOString(),
       filters,
-      agents: this.cache.agentViews().map((a: AgentView) => ({
-        name: a.name, pane: a.pane, status: a.status, workspace: a.workspace,
-        cwd: a.cwd, started_at: a.started_at, last_activity_at: a.last_activity_at,
-        terminal_title: typeof a.terminal_title === "string" ? a.terminal_title : undefined,
-        seq: typeof a.state_change_seq === "number" ? (a.state_change_seq as number) : undefined,
-      })),
+      agents: this.agentsForHello(filters),
+      workspaces: this.workspacePayload(),
     });
     const hb = setInterval(() => {
       try { res.write(": keepalive\n\n"); } catch { this.drop(c); }
@@ -289,7 +324,7 @@ class PushHub {
   }
 
   /** Current agent snapshot (for GET /push/state reconciliation). */
-  stateView(): { agents: unknown[]; server_time: string } {
+  stateView(): { agents: unknown[]; workspaces: unknown[]; panes: unknown[]; server_time: string } {
     return {
       server_time: new Date().toISOString(),
       agents: this.cache.agentViews().map((a: AgentView) => ({
@@ -298,6 +333,8 @@ class PushHub {
         terminal_title: typeof a.terminal_title === "string" ? a.terminal_title : undefined,
         seq: typeof a.state_change_seq === "number" ? (a.state_change_seq as number) : undefined,
       })),
+      workspaces: this.workspacePayload(),
+      panes: this.cache.paneViews(),
     };
   }
 
@@ -347,12 +384,37 @@ export function registerPushRoutes(app: Express, getClient: () => HerdrClient): 
     h.addClient(res, {
       agent: typeof req.query.agent === "string" ? req.query.agent : undefined,
       pane: typeof req.query.pane === "string" ? req.query.pane : undefined,
+      workspace: typeof req.query.workspace === "string" ? req.query.workspace : undefined,
     });
   });
 
   router.get("/state", (_req: Request, res: Response) => {
     const h = hub ?? (hub = new PushHub(getClient()));
     res.status(200).json(h.stateView());
+  });
+
+  // Extension idle-nudge: tools/call counts in a wall-clock window (ChatGPT connector UA).
+  router.get("/mcp-activity", (req: Request, res: Response) => {
+    const sinceRaw = req.query.since ?? req.query.since_ms;
+    const untilRaw = req.query.until ?? req.query.until_ms;
+    const since_ms = Number(sinceRaw);
+    const until_ms = untilRaw === undefined || untilRaw === "" ? Date.now() : Number(untilRaw);
+    if (!Number.isFinite(since_ms) || !Number.isFinite(until_ms) || until_ms < since_ms) {
+      res.status(400).json({
+        ok: false,
+        reason: "bad_window",
+        message: "query since (ms) and optional until (ms) required; until >= since",
+      });
+      return;
+    }
+    // Cap lookback at 30 minutes to keep responses small.
+    const minSince = Date.now() - 30 * 60_000;
+    const clippedSince = Math.max(since_ms, minSince);
+    const ua_includes = typeof req.query.ua === "string" ? req.query.ua
+      : typeof req.query.ua_includes === "string" ? req.query.ua_includes
+      : "openai-mcp";
+    const out = queryMcpActivity({ since_ms: clippedSince, until_ms, ua_includes });
+    res.status(200).json({ ok: true, ...out });
   });
 
   app.use("/push", router);

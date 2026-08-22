@@ -1,12 +1,13 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <style>
     body { font: 14px/1.6 -apple-system, sans-serif; max-width: 640px; margin: 24px auto; color: #1f2937; padding: 0 16px; }
     h1 { font-size: 18px; }
     label { display: block; margin: 12px 0 4px; font-weight: 600; font-size: 13px; color: #374151; }
-    input[type=text], textarea { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; font: 13px/1.5 monospace; }
+    input[type=text], input[type=number], textarea, select { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; font: 13px/1.5 monospace; }
+    select { font-family: -apple-system, sans-serif; }
     textarea { height: 120px; }
     button { margin-top: 16px; padding: 8px 18px; border: 1px solid #d1d5db; background: #f9fafb; border-radius: 6px; cursor: pointer; }
     button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
@@ -16,40 +17,75 @@
   </style>
 </head>
 <body>
-  <h1>herdr → Web 唤醒 · 配置</h1>
-  <label>herdr-mcp 地址 (本地)</label>
+  <h1 id="title">herdr → Web wake · Settings</h1>
+
+  <label id="lab_locale">Language</label>
+  <select id="uiLocale">
+    <option value="en">English</option>
+    <option value="zh">简体中文</option>
+    <option value="ja">日本語</option>
+  </select>
+  <div class="hint" id="hint_locale">en / Simplified Chinese / Japanese. First install follows system language; default English.</div>
+
+  <label id="lab_url">herdr-mcp URL (local)</label>
   <input type="text" id="url" placeholder="http://127.0.0.1:8772">
-  <div class="hint">插件从 background 访问本地地址并带 Bearer 头, 不走公网隧道。</div>
+  <div class="hint" id="hint_url">Local Bearer access from the extension background.</div>
 
-  <label>Bearer Token</label>
+  <label id="lab_token">Bearer Token</label>
   <input type="text" id="token" placeholder="HERDR_MCP_TOKEN">
-  <div class="hint">与 /mcp 同一个 token。查看: <code>herdr-mcp token</code></div>
+  <div class="hint" id="hint_token">Same token as /mcp. View: herdr-mcp token</div>
 
-  <label>唤醒消息模板（收工）</label>
-  <textarea id="template">{agent} · {pane} · {status} · {output} 的占位符示例</textarea>
-  <div class="hint">支持占位符: {agent} {pane} {status} {output}</div>
+  <label id="lab_wake">Wake template (settled)</label>
+  <textarea id="template">{agent} · {pane} · {status} · {output}</textarea>
+  <div class="hint" id="hint_wake">Placeholders: {workspace_label} {workspace} {agent} {pane} {status} {output} {working_count} {roster} {idle_hint}</div>
 
-  <label>进度检查间隔（秒）</label>
+  <label id="lab_tick">Wake interval (seconds)</label>
   <input type="number" id="progressTickSec" min="0" step="1">
-  <div class="hint">每隔 N 秒检查一次是否有新摘要可发。默认 60。填 0 = 关闭进度通报（仅保留收工唤醒）。</div>
+  <div class="hint" id="hint_tick">Default 60. Progress check while working + post-turn nudge cooldown. 0 = off both.</div>
 
-  <label>无新摘要时的兜底间隔（秒）</label>
+  <label id="lab_fallback">Fallback interval when summary unchanged (seconds)</label>
   <input type="number" id="progressFallbackSec" min="0" step="1">
-  <div class="hint">摘要无变化时，距上次实发满 N 秒仍发一条心跳。默认 600（10 分钟）。填 0 = 关闭兜底（只在有新摘要时发）。</div>
+  <div class="hint" id="hint_fallback">Default 1200 (20 min). 0 = new summary only.</div>
 
-  <label>进度通报模板（working 期间）</label>
-  <textarea id="progressTemplate">{agent} 仍在执行 {pane} ({status}) 的进度占位示例</textarea>
-  <div class="hint">与上方收工模板分开。占位符: {agent} {pane} {status} {output}</div>
+  <label id="lab_progress">Progress template (while working)</label>
+  <textarea id="progressTemplate">{agent} still running {pane} ({status})</textarea>
+  <div class="hint" id="hint_progress">Separate from settled template.</div>
 
-  <label><input type="checkbox" id="autoAllow"> 唤醒后自动点"允许"权限弹窗</label>
-  <div class="hint">页面内权限弹窗 (允许/同意/Allow) 自动点击; 浏览器原生权限条 (通知/麦克风等) 无法自动点。</div>
+  <label><input type="checkbox" id="idleNudgeEnabled"> <span id="lab_idle">Post-turn LLM nudge</span></label>
+  <div class="hint" id="hint_idle">ChatGPT only (bound). After a reply settles, ask the configured small model whether to continue. Requires Base URL + Key + Model below.</div>
 
-  <label><input type="checkbox" id="enabled"> 启用自动唤醒</label>
+  <h2 id="title_llm" style="font-size:15px;margin:28px 0 8px">Post-turn LLM judge</h2>
+  <div class="hint" id="hint_llm_sec">OpenAI-compatible chat/completions. Leave URL/key/model empty to disable post-turn nudge. Secrets stay on this machine; do not commit them.</div>
 
-  <button class="primary" id="save">保存</button>
-  <button id="test">测试连接</button>
+  <label id="lab_llm_url">Judge API base URL</label>
+  <input type="text" id="llmJudgeBaseUrl" placeholder="https://example.com/v1">
+  <div class="hint" id="hint_llm_url">Accepts …/v1 or …/v1/chat/completions.</div>
+
+  <label id="lab_llm_key">Judge API key (Bearer)</label>
+  <input type="password" id="llmJudgeApiKey" placeholder="(empty = off)" autocomplete="off">
+  <div class="hint" id="hint_llm_key">Stored only in chrome.storage.local on this machine.</div>
+
+  <label id="lab_llm_model">Judge model</label>
+  <input type="text" id="llmJudgeModel" placeholder="e.g. small-fast-model">
+
+  <label id="lab_llm_prompt">Judge prompt template</label>
+  <textarea id="llmJudgePromptTemplate"></textarea>
+  <div class="hint" id="hint_llm_prompt">Placeholders: {content} {user} {assistant}. Done tokens must match the no-send list below. When not done, the model reply is submitted as-is.</div>
+
+  <label id="lab_llm_skip">No-send keywords (done tokens)</label>
+  <textarea id="llmJudgeSkipKeywords" style="height:72px"></textarea>
+  <div class="hint" id="hint_llm_skip">One per line (or comma-separated). If the judge reply is only one of these, do not nudge.</div>
+
+  <label><input type="checkbox" id="autoAllow"> <span id="lab_auto">Auto-click Allow on in-page permission cards</span></label>
+  <div class="hint" id="hint_auto">In-page cards only; native browser bars cannot be clicked.</div>
+
+  <label><input type="checkbox" id="enabled"> <span id="lab_enabled">Enable auto wake</span></label>
+
+  <button class="primary" id="save">Save</button>
+  <button id="test">Test connection</button>
+  <button id="testLlm">Test LLM judge</button>
   <div id="status"></div>
 
-  <script src="options.js"></script>
+  <script type="module" src="options.js"></script>
 </body>
 </html>

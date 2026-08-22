@@ -14,6 +14,7 @@ import * as net from "node:net";
 import * as path from "node:path";
 import { homedir } from "node:os";
 import { isHerdrControlPlaneTaskGroup } from "./prompt-semantics.js";
+import { clampHerdrTimeout, HERDR_RPC_TIMEOUT_DEFAULT_MS, HERDR_SNAPSHOT_TIMEOUT_MS } from "./timeouts.js";
 
 export interface HerdrErrorDetail {
   code: string;
@@ -124,9 +125,9 @@ export class HerdrClient {
   private readonly defaultTimeoutMs: number;
   private nextId = 0;
 
-  constructor(socketPath?: string, defaultTimeoutMs = 30000) {
+  constructor(socketPath?: string, defaultTimeoutMs = HERDR_RPC_TIMEOUT_DEFAULT_MS) {
     this.sockPath = socketPath ?? defaultSocketPath();
-    this.defaultTimeoutMs = defaultTimeoutMs;
+    this.defaultTimeoutMs = clampHerdrTimeout(defaultTimeoutMs);
   }
 
   /** Public lightweight diagnostic — no workspace/session dependency. */
@@ -156,23 +157,30 @@ export class HerdrClient {
     retry?: boolean,
   ): Promise<HerdrResult> {
     const allowRetry = retry === undefined ? !NON_IDEMPOTENT_METHODS.has(method) : retry;
-    const timeout = timeoutMs ?? this.defaultTimeoutMs;
+    const timeout = clampHerdrTimeout(timeoutMs ?? this.defaultTimeoutMs);
     const body = params ?? {};
     try {
       return await this.callOnce(method, body, timeout);
     } catch (e) {
       const err = e instanceof HerdrError ? e : new HerdrError("unknown", String(e), { method });
       if (!(allowRetry && err.retryable)) throw err;
-      // First transparent retry (transport or control-plane TaskGroup).
-      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      // 1) one transparent retry for any retryable (transport / TaskGroup)
+      await new Promise<void>((resolve) => setTimeout(resolve, 150));
       try {
         return await this.callOnce(method, body, timeout);
       } catch (e2) {
         const err2 = e2 instanceof HerdrError ? e2 : new HerdrError("unknown", String(e2), { method });
-        // Control-plane races often need a second beat after snapshot/event reconnect.
-        if (isHerdrControlPlaneTaskGroup(err2.message)) {
-          await new Promise<void>((resolve) => setTimeout(resolve, 250));
-          return this.callOnce(method, body, timeout);
+        // 2–3) extra beats only for control-plane TaskGroup (pane.read / snapshot storms)
+        if (!isHerdrControlPlaneTaskGroup(err2.message)) throw err2;
+        for (const ms of [400, 800]) {
+          await new Promise<void>((resolve) => setTimeout(resolve, ms));
+          try {
+            return await this.callOnce(method, body, timeout);
+          } catch (e3) {
+            const err3 = e3 instanceof HerdrError ? e3 : new HerdrError("unknown", String(e3), { method });
+            if (!isHerdrControlPlaneTaskGroup(err3.message)) throw err3;
+            if (ms === 800) throw err3;
+          }
         }
         throw err2;
       }
@@ -182,6 +190,7 @@ export class HerdrClient {
   private async callOnce(method: string, params: Record<string, unknown>, timeoutMs: number): Promise<HerdrResult> {
     const id = `c${++this.nextId}`;
     const sock = await connect(this.sockPath, timeoutMs, method);
+    sock.setTimeout(timeoutMs);
     const { promise, resolve, reject } = Promise.withResolvers<HerdrResult>();
     let buf = "";
 
@@ -227,7 +236,7 @@ export class HerdrClient {
   }
 
   async snapshot(): Promise<HerdrResult> {
-    const r = await this.call("session.snapshot", {}, 10000);
+    const r = await this.call("session.snapshot", {}, HERDR_SNAPSHOT_TIMEOUT_MS);
     return (r.snapshot ?? {}) as HerdrResult;
   }
 

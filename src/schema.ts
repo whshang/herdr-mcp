@@ -29,6 +29,7 @@ export interface ValidationResult {
 }
 
 const SCHEMA_TTL_MS = 60_000;
+const SCHEMA_LOAD_TIMEOUT_MS = 8_000;
 let schemaCache: { raw: string; loadedAt: number } | null = null;
 
 interface SchemaDoc {
@@ -45,9 +46,27 @@ function loadSchema(force = false): SchemaDoc {
   if (!force && schemaCache && now - schemaCache.loadedAt < SCHEMA_TTL_MS) {
     return JSON.parse(schemaCache.raw) as SchemaDoc;
   }
-  const raw = execSync("herdr api schema --json", { encoding: "utf-8", timeout: 5000 });
-  schemaCache = { raw, loadedAt: now };
-  return JSON.parse(raw) as SchemaDoc;
+  try {
+    const raw = execSync("herdr api schema --json", { encoding: "utf-8", timeout: SCHEMA_LOAD_TIMEOUT_MS });
+    schemaCache = { raw, loadedAt: now };
+    return JSON.parse(raw) as SchemaDoc;
+  } catch (e) {
+    if (schemaCache) {
+      return JSON.parse(schemaCache.raw) as SchemaDoc;
+    }
+    throw e;
+  }
+}
+
+/** Non-blocking warm-up so tools/list never waits on a cold `herdr api schema`. */
+export function warmSchemaCache(): void {
+  void Promise.resolve().then(() => {
+    try {
+      loadSchema(true);
+    } catch {
+      /* first boot without herdr in PATH — herdr_methods returns schema_unavailable */
+    }
+  });
 }
 
 function requestDoc(doc: SchemaDoc): { oneOf: unknown[]; defs: Record<string, unknown> } {

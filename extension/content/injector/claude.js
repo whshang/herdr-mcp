@@ -1,13 +1,11 @@
-// injector/claude.js — claude.ai 适配器 (只做"唤醒": 定位输入框 → 写入 → 提交)
-// ⚠️ 选择器未实测: 本机 claude.ai 未登录 (ego-browser 实测被重定向到 /login)。
-//    使用防御性选择器链, 登录后需实测校准。
-// 依据: claude.ai 输入区为 contenteditable 富文本编辑器 (ProseMirror/Quill 系),
-//    需要 MAIN world execCommand 插入 (同 ChatGPT, content script 隔离世界不提交模型)。
+// injector/claude.js — claude.ai wake-up adapter
+// Selectors are defensive because signed-in behavior has not been verified locally.
+// Claude uses a contenteditable rich-text editor, requiring MAIN-world insertion.
 class ClaudeAdapter extends BaseAdapter {
   get name() { return "claude.ai"; }
   get needsMainWorldInsert() { return true; }
 
-  // 输入框: 防御性链 — ProseMirror / Quill / 通用 contenteditable textbox
+  // Defensive composer chain: ProseMirror, Quill, or generic contenteditable textbox.
   getInputEl() {
     const chains = [
       'div[contenteditable="true"][role="textbox"]',
@@ -18,7 +16,7 @@ class ClaudeAdapter extends BaseAdapter {
       const el = document.querySelector(sel);
       if (el && el.offsetParent !== null) return el;
     }
-    // 兜底: 第一个可见 contenteditable
+    // Fallback to the first visible contenteditable element.
     const all = [...document.querySelectorAll('[contenteditable="true"]')];
     return all.find((el) => el.offsetParent !== null) || all[0] || null;
   }
@@ -26,8 +24,7 @@ class ClaudeAdapter extends BaseAdapter {
   getWatchMainWorldSelector() {
     const el = this.getInputEl();
     if (!el) return null;
-    // 有 id → 精确选择器; 否则返回命中的链选择器 (background 的 MAIN 插入会取
-    // 最后一个可见匹配, 输入框通常是页面上最后一个 contenteditable)
+    // Prefer an exact id; otherwise return the matched chain selector.
     if (el.id) return `#${CSS.escape(el.id)}[contenteditable="true"]`;
     const chains = [
       'div[contenteditable="true"][role="textbox"]',
@@ -40,7 +37,7 @@ class ClaudeAdapter extends BaseAdapter {
     return 'div[contenteditable="true"][role="textbox"]';
   }
 
-  // 发送按钮: data-testid / aria-label (中英) 链; 都找不到时 wake.js 回退 Enter
+  // Send button chain; wake.js falls back to Enter when none matches.
   getSendButton() {
     const chains = [
       'button[data-testid="send-button"]',
@@ -54,7 +51,7 @@ class ClaudeAdapter extends BaseAdapter {
     return null;
   }
 
-  // 会话身份: claude.ai 对话 URL 形如 /chat/<id> 或 /project/<pid>/chat/<id> → host+pathname
+  // Conversation identity uses host plus pathname for chat and project chat URLs.
 }
 
 window.__H2W_ADAPTER__ = new ClaudeAdapter();

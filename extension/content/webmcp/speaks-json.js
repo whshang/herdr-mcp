@@ -1,13 +1,12 @@
-// webmcp/speaks-json.js — SpeaksJSON 层: 解析网页 AI 输出
-// 能力: ① JSON tool call 识别 (平衡括号扫描, 从 ctmc base.js 原样移植)
-//       ② 回复完成判定 (z.ai / deepseek 站点选择器从 ctmc 抄录)
-// 方向: 本插件 v1 只做"唤醒", 本层供唤醒后的投递确认 (replyStarted) 与
-//       未来"网页 AI → herdr"反向打通 (ctmc 方向) 复用。
+// webmcp/speaks-json.js — parse web AI output
+// Capabilities: balanced-brace JSON tool-call extraction and reply completion detection.
+// Version 1 uses this layer for post-wake delivery confirmation; it can later
+// support the reverse web-AI-to-herdr direction.
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { window.__H2W_SPEAKS_JSON__ = null; return; }
 
-  // 站点差异表: 回复区选择器 + 完成判定 (抄自 ctmc content/adapters/{zai,deepseek}.js)
+  // Site-specific reply selectors and completion checks.
   const SITES = {
     "z.ai": {
       replySelector: "[class*=markdown], [class*=answer], [class*=message-content], [class*=prose]",
@@ -36,7 +35,7 @@
     }
     get enabled() { return !!this.site; }
 
-    // 取最新一条助手回复 (textContent 不受 display:none 影响 — ctmc 教训)
+    // Read the latest assistant reply; textContent is stable across display changes.
     getLatestReply() {
       if (!this.enabled) return "";
       const blocks = document.querySelectorAll(this.site.replySelector);
@@ -44,13 +43,13 @@
       return (blocks[blocks.length - 1].textContent || "").trim();
     }
 
-    // 助手回复块数量 (投递确认用: 新回复 = 文本变化或块数增加)
+    // Count reply blocks for delivery confirmation.
     getReplyBlockCount() {
       if (!this.enabled) return 0;
       return document.querySelectorAll(this.site.replySelector).length;
     }
 
-    // 最新一条回复是否已完成 (流式)
+    // Whether the latest streaming reply is complete.
     isReplyDone() {
       if (!this.enabled) return true;
       const blocks = document.querySelectorAll(this.site.replySelector);
@@ -58,7 +57,7 @@
       return this.site.isReplyDone(blocks[blocks.length - 1]);
     }
 
-    // 从文本提取所有 tool call JSON (ctmc 原样移植: 平衡括号扫描, 支持 {} 内嵌)
+    // Extract all tool-call JSON objects with balanced-brace scanning.
     extractToolCalls(text) {
       if (!text) return [];
       const calls = [];
@@ -76,7 +75,7 @@
           if (c === "{") depth++;
           else if (c === "}") { depth--; if (depth === 0) { end = i + 1; break; } }
         }
-        if (end === -1) break;  // 未闭合 (流式半截), 停止
+        if (end === -1) break;  // Stop at an incomplete streaming fragment.
         const jsonStr = text.slice(start, end);
         try {
           const obj = JSON.parse(jsonStr);

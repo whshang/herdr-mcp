@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 /**
- * background_bind_test.mjs — 用 chrome API mock 驱动 extension/background.js,
- * 验证 popup 触发 h2w_bind 的完整链路 (绑定创建/推送流/消息路由)。
- * 不依赖真实 Chrome; 答案在"点击绑定"是否在逻辑层可用。
+ * Drive extension/background.js with a Chrome API mock and verify the full
+ * h2w_bind flow: binding creation, push stream, and message routing.
  *
  * Usage: node tests/manual/background_bind_test.mjs
  */
@@ -11,6 +10,9 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CONV = "https://chatgpt.com/c/abc123";
+const SK_WH = `${CONV}::wH`;
+
 let failures = 0;
 function ok(cond, label, detail = "") {
   if (cond) console.log(`  ✅ ${label}`);
@@ -20,8 +22,8 @@ function ok(cond, label, detail = "") {
 // ---- chrome mock ----
 const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}" };
 const listeners = { onMessage: [], onStartup: [], onInstalled: [] };
-const sentMessages = []; // background -> content 的消息
-const tabs = new Map();   // tabId -> { url, listener } (listener = content script 的 onMessage)
+const sentMessages = []; // Messages from background to content.
+const tabs = new Map();   // tabId -> { url, listener }.
 
 globalThis.chrome = {
   runtime: {
@@ -41,6 +43,7 @@ globalThis.chrome = {
         return out;
       },
       async set(obj) { Object.assign(storage, obj); },
+      async remove() {},
     },
   },
   tabs: {
@@ -56,7 +59,7 @@ globalThis.chrome = {
       let sync = false;
       await new Promise((resolve) => {
         t.listener(msg, { tab: { id: tabId } }, (r) => { resp = r; sync = true; resolve(); });
-        // 内容脚本监听器若是同步 sendResponse, 直接 resolve; 否则超时
+        // Resolve immediately for synchronous sendResponse, otherwise time out.
         setTimeout(resolve, 200);
       });
       return resp;
@@ -64,9 +67,10 @@ globalThis.chrome = {
     reload: () => {},
   },
   scripting: { executeScript: async () => [{ result: { ok: true } }] },
+  alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
 };
 
-// 内容脚本 stub (模拟 wake.js 的 h2w_get_convkey 应答)
+// Content-script stub for wake.js h2w_get_convkey responses.
 function installContentScript(tabId, url, convKey) {
   tabs.set(tabId, {
     url, listener: (msg, _sender, sendResponse) => {
@@ -77,74 +81,95 @@ function installContentScript(tabId, url, convKey) {
   });
 }
 
-// ---- 加载 background.js ----
+// ---- Load background.js ----
 await import(pathToFileURL(path.join(__dirname, "..", "..", "extension", "background.js")).href);
 const onMsg = listeners.onMessage[0];
-ok(!!onMsg, "background onMessage 监听器已注册");
+ok(!!onMsg, "background onMessage listener registered");
 
-// ---- 场景 1: 绑定成功 (active tab 是支持站点) ----
-console.log("\n[绑定链路]");
+// ---- Scenario 1: successful binding on a supported active tab ----
+console.log("\n[binding flow]");
 {
-  installContentScript(101, "https://chatgpt.com/c/abc123", "https://chatgpt.com/c/abc123");
+  installContentScript(101, CONV, CONV);
   let resolveP;
   const p = new Promise((r) => { resolveP = r; });
-  onMsg({ type: "h2w_bind", tabId: 101, pane: "wH:p1", agent: "omp", workspace_id: "wH" }, { tab: { id: 101 } }, (r) => resolveP(r));
+  onMsg({ type: "h2w_bind", tabId: 101, pane: "wH:p1", agent: "omp", workspace_id: "wH", workspace_label: "herdr-mcp (wH)", workspace_label_raw: "herdr-mcp" }, { tab: { id: 101 } }, (r) => resolveP(r));
   const r = await p;
-  ok(r?.ok === true && r.convKey === "https://chatgpt.com/c/abc123", "h2w_bind 成功创建绑定", JSON.stringify(r));
-  ok(!!storage.herdrWakeBindings["https://chatgpt.com/c/abc123"], "绑定已持久化到 storage");
-  const b = storage.herdrWakeBindings["https://chatgpt.com/c/abc123"];
-  ok(b.pane === "wH:p1" && typeof b.expires_at === "number" && !!b.revision, "绑定字段完整 (pane/expires_at/revision)");
+  ok(r?.ok === true && r.convKey === CONV, "h2w_bind creates a binding", JSON.stringify(r));
+  ok(!!storage.herdrWakeBindings[SK_WH], "binding persisted with convKey::workspace_id key");
+  const b = storage.herdrWakeBindings[SK_WH];
+  ok(b.workspace_id === "wH" && b.workspace_label.includes("herdr-mcp") && b.agent == null && typeof b.expires_at === "number" && !!b.revision, "binding fields include workspace scope and metadata", JSON.stringify(b));
   const bound = sentMessages.find((m) => m.msg?.type === "h2w_bound");
-  ok(!!bound, "content script 收到 h2w_bound");
+  ok(!!bound, "content script receives h2w_bound");
 }
 
-// ---- 场景 2: active tab 无内容脚本 → conversation-unavailable ----
+// ---- Scenario 2: active tab without a content script ----
 {
   const before = Object.keys(storage.herdrWakeBindings).length;
   let resolveP;
   const p = new Promise((r) => { resolveP = r; });
   onMsg({ type: "h2w_bind", tabId: 999, pane: "wH:p1", agent: "omp" }, { tab: { id: 999 } }, (r) => resolveP(r));
   const r = await p;
-  ok(r?.ok === false && r.error === "conversation-unavailable", "非支持 tab → conversation-unavailable", JSON.stringify(r));
-  ok(Object.keys(storage.herdrWakeBindings).length === before, "失败不产生绑定");
+  ok(r?.ok === false && r.error === "conversation-unavailable", "unsupported tab returns conversation-unavailable", JSON.stringify(r));
+  ok(Object.keys(storage.herdrWakeBindings).length === before, "failed binding creates no entry");
 }
 
-// ---- 场景 3: 重复绑定 → already-bound ----
+// ---- Scenario 3: duplicate binding same workspace ----
 {
   let resolveP;
   const p = new Promise((r) => { resolveP = r; });
-  onMsg({ type: "h2w_bind", tabId: 101, pane: "w2Y:p1", agent: "omp" }, { tab: { id: 101 } }, (r) => resolveP(r));
+  onMsg({ type: "h2w_bind", tabId: 101, pane: "wH:p1", agent: "omp", workspace_id: "wH" }, { tab: { id: 101 } }, (r) => resolveP(r));
   const r = await p;
-  ok(r?.ok === false && r.error === "already-bound", "重复绑定被拒绝", JSON.stringify(r));
+  ok(r?.ok === false && r.error === "already-bound", "duplicate workspace binding is rejected", JSON.stringify(r));
 }
 
-// ---- 场景 4: register (页面刷新恢复 tabId) ----
+// ---- Scenario 3b: second workspace on same conversation ----
 {
   let resolveP;
   const p = new Promise((r) => { resolveP = r; });
-  onMsg({ type: "h2w_register", convKey: "https://chatgpt.com/c/abc123", url: "https://chatgpt.com/c/abc123", site: "chatgpt" }, { tab: { id: 202 } }, (r) => resolveP(r));
+  onMsg({ type: "h2w_bind", tabId: 101, pane: "w2Y:p1", agent: "omp", workspace_id: "w2Y", workspace_label: "other (w2Y)" }, { tab: { id: 101 } }, (r) => resolveP(r));
   const r = await p;
-  ok(r?.bound === true && r.pane === "wH:p1", "register 恢复绑定 (刷新页面)", JSON.stringify(r));
-  ok(storage.herdrWakeBindings["https://chatgpt.com/c/abc123"].tabId === 202, "tabId 已刷新");
+  ok(r?.ok === true && r.workspace_id === "w2Y", "second workspace on same conversation binds", JSON.stringify(r));
+  ok(!!storage.herdrWakeBindings[`${CONV}::w2Y`], "second binding persisted");
 }
 
-// ---- 场景 5: unbind ----
+// ---- Scenario 4: register restores tabId after refresh ----
 {
   let resolveP;
   const p = new Promise((r) => { resolveP = r; });
-  onMsg({ type: "h2w_unbind", convKey: "https://chatgpt.com/c/abc123" }, {}, (r) => resolveP(r));
+  onMsg({ type: "h2w_register", convKey: CONV, url: CONV, site: "chatgpt" }, { tab: { id: 202 } }, (r) => resolveP(r));
   const r = await p;
-  ok(r?.ok === true && !storage.herdrWakeBindings["https://chatgpt.com/c/abc123"], "unbind 删除绑定", JSON.stringify(r));
+  ok(r?.bound === true && (r.workspace_id === "wH" || r.pane === "wH:p1"), "register restores the binding", JSON.stringify(r));
+  ok(storage.herdrWakeBindings[SK_WH].tabId === 202, "tabId updated on first binding");
+  ok(storage.herdrWakeBindings[`${CONV}::w2Y`].tabId === 202, "tabId updated on second binding");
 }
 
-// ---- 场景 6: state (popup 渲染用) ----
+// ---- Scenario 5: unbind one workspace ----
+{
+  let resolveP;
+  const p = new Promise((r) => { resolveP = r; });
+  onMsg({ type: "h2w_unbind", convKey: CONV, workspace_id: "wH" }, {}, (r) => resolveP(r));
+  const r = await p;
+  ok(r?.ok === true && !storage.herdrWakeBindings[SK_WH], "unbind removes one workspace binding", JSON.stringify(r));
+  ok(!!storage.herdrWakeBindings[`${CONV}::w2Y`], "other workspace binding remains");
+}
+
+// ---- Scenario 5b: unbind remaining ----
+{
+  let resolveP;
+  const p = new Promise((r) => { resolveP = r; });
+  onMsg({ type: "h2w_unbind", convKey: CONV, workspace_id: "w2Y" }, {}, (r) => resolveP(r));
+  const r = await p;
+  ok(r?.ok === true && !Object.keys(storage.herdrWakeBindings).length, "unbind last workspace clears storage", JSON.stringify(r));
+}
+
+// ---- Scenario 6: state for popup rendering ----
 {
   installContentScript(303, "https://chatgpt.com/c/xyz", "https://chatgpt.com/c/xyz");
   let resolveP;
   const p = new Promise((r) => { resolveP = r; });
   onMsg({ type: "h2w_state", tabId: 303 }, { tab: { id: 303 } }, (r) => resolveP(r));
   const r = await p;
-  ok(!!r.convInfo && r.convInfo.convKey === "https://chatgpt.com/c/xyz" && Array.isArray(r.bindings), "h2w_state 返回 convInfo+bindings", JSON.stringify(r).slice(0, 120));
+  ok(!!r.convInfo && r.convInfo.convKey === "https://chatgpt.com/c/xyz" && Array.isArray(r.bindings) && Array.isArray(r.sessionBindings), "h2w_state returns convInfo, bindings, sessionBindings", JSON.stringify(r).slice(0, 120));
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);

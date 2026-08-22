@@ -32,6 +32,9 @@ herdr-mcp **不会** 把每个 herdr 方法都做成 MCP 工具。那会烧上�
 7. **默认 17 工具** — `HERDR_MCP_ALL_TOOLS=1` 时 30；`inspect` 含 `boot_id` + `exec_sessions`；`HERDR_MCP_READONLY=1` 挡住含 `herdr_prompt` 在内的 mutation（`herdr_fs_patch` 的 `dry_run` 除外）。
 8. **工作站稳健性（≥0.3.17）** — `commitAtomic` 失败会删掉本次新增文件；exec journal 仅杀掉仍带 `HERDR_MCP_EXEC_ID` 的孤儿；`exec_read stream=both` 按写入顺序交错；`fs_read` 字节截断只返回完整行。
 9. **`herdr_exec` 控制面降级（≥0.3.18）** — utility 窗格在 `send_text` **之前**若连续撞 TaskGroup，自动改本地 zsh（`backend:local_fallback`）；一旦已投递则绝不重发、也不降级（避免双跑）。
+10. **`herdr_git` 本机降级（≥0.3.20）** — `session.snapshot` / managed-roots 闸门因 TaskGroup 不可用时，对 `$HOME`（或 `HERDR_MCP_WRITE_ROOTS`）下的真实 git 根仍直接跑本地 `git`（带 `warnings`）；`pane.read` 等只读 RPC 对 TaskGroup 透明重试加长到最多 4 次尝试。
+11. **`herdr_inspect` / `liveSnapshot` list 降级（≥0.3.21）** — `session.snapshot` 撞 TaskGroup 且 cache 不够用时，改拼 `workspace.list` + `pane.list` + `agent.list`，`warnings` 含 `snapshot_failed_used_list_apis`；勿把控制面异常当成仓库阻塞。
+12. **Unix socket 读超时 + 60s RPC 上限（≥0.3.23）** — 每条 socket RPC 在连接后 `setTimeout`（不再无限等 `session.snapshot`）；`herdr_exec` / `herdr_wait` / `herdr_prompt` wait 均 **≤60s**；`herdr api schema` 启动预热 + stale 缓存（tools/list 不依赖 live herdr）；SnapshotCache bootstrap 优先 bounded snapshot，失败走 list APIs（对齐 coding-tools-mcp：**固定 MCP 工具面**，live 只作运行时）。
 
 ## 错误语义（`herdr_call` / `herdr_prompt` / 只读聚合）
 
@@ -39,7 +42,8 @@ herdr-mcp **不会** 把每个 herdr 方法都做成 MCP 工具。那会烧上�
 |---|---|---|
 | `herdr_transport` | 真连接/socket 问题 | 视方法；mutation 仍先核对 |
 | `agent_status_wait_timeout` / `post_submission_status_wait` | 投递后等 agent 状态超时（常见于带 `wait` 的 `agent.prompt`） | **否** — 先 inspect/since |
-| `herdr_internal` / `control_plane_taskgroup`（或 `snapshot_refresh`） | daemon 控制面 TaskGroup / ExceptionGroup 偶发；**不是** pane 没了、也不是 prompt 投递超时 | **是**（只读最多透明重试 2 次；inspect/fs 优先用 cache partial） |
+| `herdr_internal` / `control_plane_taskgroup`（或 `snapshot_refresh`） | daemon 控制面 TaskGroup / ExceptionGroup 偶发；**不是** pane 没了、也不是 prompt 投递超时。`herdr_prompt` ≥0.3.22 也归这类（带 `delivery_uncertain`），不再只回裸 `UNKNOWN` | 只读可重试；**`agent.prompt` 不可盲重试** — 先 inspect/since |
+
 | `herdr_error` | 其它 daemon 业务错误 | 视 `retryable` |
 
 ## 控制面瞬时失败（ExceptionGroup / TaskGroup）
@@ -49,15 +53,25 @@ herdr-mcp **不会** 把每个 herdr 方法都做成 MCP 工具。那会烧上�
 
 典型现象：agent 仍在 `working`，但 `inspect` / `since` / `pane.read` / `fs_*` 间歇返回失败；几秒后同样请求又成功。根因在 herdr daemon 的并发聚合（snapshot / events.subscribe / socket 重连），某个 child task 抛错时未隔离，整次 RPC 被包成裸 `ExceptionGroup`。
 
+### 本机 watchdog（A+B，≥0.3.22）
+
+`herdr-mcp watchdog install` 注册 LaunchAgent（默认每 120s）：
+
+- MCP 进程没了或本机 `/mcp` 非 200/401：连续失败达到阈值后 `herdr-mcp restart`（默认冷却 10 分钟，**无每日次数上限**）
+- `agent.list` / `workspace.list` 撞 TaskGroup 或 socket 缺失：**只记日志**，不重启 herdr daemon，也不重发 `herdr_prompt`
+- 状态：`~/.config/herdr-mcp/watchdog.state.json`；日志：`watchdog.log`
+
 herdr-mcp 侧（≥0.3.12，exec 降级 ≥0.3.18）能做的：
 
 - 只读自动重试（控制面毛刺最多 2 次）
 - `failure=herdr_internal` + `code=snapshot_refresh_failed` + `retryable=true`（展开子异常文案，不让裸 ExceptionGroup 当唯一信息）
 - `fs_*` / inspect 在 snapshot 失败时尽量用 SnapshotCache
 - `herdr_exec`：`send_text` **之前** TaskGroup → 重试后 `backend:local_fallback`；已投递则返回结构化错误，禁止降级/重发
+- `herdr_git`（≥0.3.20）：snapshot/managed-roots 失败时对本机 `$HOME` 下 git 根直接 `spawn git`（不经 pane）
+- `herdr_inspect` / `liveSnapshot`（≥0.3.21）：snapshot 失败时拼 `workspace.list`(+pane/agent.list)，带 `warnings`
 - mutation 失败后仍要求先 inspect/since，禁止盲重试
 
-消不掉的：daemon 里 TaskGroup 未隔离 / 未 flatten 的真正根因，需 herdr 上游修。0.3.16+ 现场仍可能在 `inspect` / `since` / `git` / `fs_*` 上偶发失败；`herdr_exec` 在 0.3.18+ 对「投递前」毛刺可降级本地跑。只读侧已重试 + 结构化 `herdr_internal`，模型编排仍应把偶发失败当可重试毛刺，而不是业务结论。
+消不掉的：daemon 里 TaskGroup 未隔离 / 未 flatten 的真正根因，需 herdr 上游修。`pane.read` / 全量 `session.snapshot` 仍可能偶发；编排侧应继续优先 `herdr_fs_*` / `herdr_git` / `herdr_exec`（utility 投递前 TaskGroup → `local_fallback` / 独立本机 session），不要把控制面毛刺当业务阻塞。
 
 `herdr_prompt` 成功时带 `state_observation: { changed: true\|false\|"unknown", fresh }`；无 `wait` 时未变快照为 `"unknown"`（不是「没投递」）。兼容字段 `state_changed` 仍保留。
 

@@ -3,7 +3,7 @@
  * herdr-mcp — Node.js (TypeScript) MCP server.
  *
  * Faithful rewrite of herdr_mcp/server.py on @modelcontextprotocol/sdk + express:
- *  - Default MCP tool surface (17): inspect/call/since/prompt + fs_* + git + exec/exec_*.
+ *  - Default MCP tool surface (18): inspect/skill/call/since/prompt + fs_* + git + exec/exec_*.
  *  - HERDR_MCP_ALL_TOOLS=1 adds advanced/deprecated lifecycle tools (30 total).
  *  - Express on HERDR_MCP_PORT (default 8772).
  *  - OAuth DCR endpoints for Claude.ai / ChatGPT connectors.
@@ -11,6 +11,7 @@
  */
 import express, { Express, Request, Response, NextFunction } from "express";
 import { createHash, randomUUID } from "node:crypto";
+import { recordMcpToolCall } from "./mcp-activity.js";
 import { readFile, writeFile, realpath, readdir, stat, unlink, mkdir } from "node:fs/promises";
 import * as path from "node:path";
 import { exec, execSync, spawn, spawnSync } from "node:child_process";
@@ -20,6 +21,8 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import * as z from "zod/v4";
 
 import { HerdrClient, HerdrError, HerdrResult, NON_IDEMPOTENT_METHODS } from "./herdr.js";
+import { snapFromListApis, fetchSessionSnapshot } from "./snap-fallback.js";
+import { HERDR_RPC_TIMEOUT_MAX_MS, clampHerdrTimeout } from "./timeouts.js";
 import { getSnapshotCache } from "./state.js";
 import {
   filterVisibleAgents,
@@ -27,7 +30,7 @@ import {
   visibilityMeta,
 } from "./agent-visibility.js";
 import { cleanTerminalOutput } from "./clean.js";
-import { validateMethodParams, listMethods } from "./schema.js";
+import { validateMethodParams, listMethods, warmSchemaCache } from "./schema.js";
 import { get as sessionGet, save as sessionSave, type SessionData, type SessionProject } from "./session.js";
 import { waitForAgent } from "./wait.js";
 import { registerPushRoutes } from "./push.js";
@@ -56,6 +59,7 @@ import {
 } from "./exec-sessions.js";
 import { commitAtomic } from "./atomic-files.js";
 import { runLocalShell } from "./local-exec.js";
+import { fetchHerdrSkill, herdrSkillPointer } from "./herdr-skill.js";
 
 /** Process boot id — returned by inspect/since so clients detect cursor reset. */
 const BOOT_ID = randomUUID().slice(0, 12);
@@ -69,7 +73,7 @@ const SDK_WIRE_PROTOCOL = "2025-11-25";
 const PORT = Number(process.env.HERDR_MCP_PORT ?? "8772");
 const BASE_URL = process.env.HERDR_MCP_BASE_URL ?? ""; // e.g. https://xxxx.trycloudflare.com
 const AUTH_TOKEN = process.env.HERDR_MCP_TOKEN ?? "";
-// Tool-surface switch: default exposes the lean 17-tool surface; HERDR_MCP_ALL_TOOLS=1
+// Tool-surface switch: default exposes the lean 18-tool surface; HERDR_MCP_ALL_TOOLS=1
 // additionally registers advanced + deprecated lifecycle tools (wait/task/session/handoff/
 // reap/parallel/read/explain/prompt_status/transcript/diff) — 30 total.
 const ALL_TOOLS = process.env.HERDR_MCP_ALL_TOOLS === "1";
@@ -517,14 +521,26 @@ async function liveSnapshot(
   const cache = getSnapshotCache(c);
   await Promise.race([cache.whenReady(), new Promise<void>((r) => setTimeout(r, 800))]);
   const cached = cache.getSnapshot();
-  const cacheUseful = Array.isArray(cached["workspaces"])
-    || Array.isArray(cached["panes"])
-    || (Array.isArray(cached["agents"]) && (cached["agents"] as unknown[]).length > 0);
+  const ws = cached["workspaces"];
+  const panes = cached["panes"];
+  const agents = cached["agents"];
+  // Prefer any topology that can authorize managed roots — empty agent list is fine.
+  const cacheUseful =
+    (Array.isArray(ws) && ws.length > 0)
+    || (Array.isArray(panes) && panes.length > 0)
+    || (Array.isArray(agents) && agents.length > 0)
+    || (Array.isArray(ws) && Array.isArray(panes)); // even empty arrays beat a hard TaskGroup
   try {
-    return { ok: true, snap: await c.snapshot(), warnings: [] };
+    const { snap, source } = await fetchSessionSnapshot(c);
+    const warnings = source === "lists" ? ["snapshot_failed_used_list_apis"] : [];
+    return { ok: true, snap, warnings };
   } catch (e) {
     if (cacheUseful) {
       return { ok: true, snap: cached, warnings: ["snapshot_refresh_failed_used_cache"] };
+    }
+    const assembled = await snapFromListApis(c);
+    if (assembled) {
+      return { ok: true, snap: assembled, warnings: ["snapshot_failed_used_list_apis"] };
     }
     return { ok: false, result: herdrErrorResult(e, context, "snapshot_refresh") };
   }
@@ -630,13 +646,18 @@ function resolveDiffTargets(
 
 // ---------------------------------------------------------------------------
 function registerTools(server: McpServer): void {
+  /** Remind web clients to read Herdr agent SKILL before pane/agent orchestration. */
+  const SKILL_BEFORE_AGENT =
+    "Before any agent operation (herdr_prompt or agent.* via herdr_call): call herdr_skill once per session first. ";
+
   server.registerTool(
     "herdr_methods",
     {
       description:
+        SKILL_BEFORE_AGENT +
         "Discover herdr socket API methods and parameter schemas. " +
         "LIVE reflection from the installed herdr binary (herdr api schema, 60s cached). " +
-        "Use before herdr_call when you don't know the exact method or argument names.",
+        "Use this when you don't know the exact method or argument names (especially before agent.* calls).",
       inputSchema: {
         query: z.string().default("").describe("Optional case-insensitive filter: agent, pane.read, worktree, etc."),
       },
@@ -656,14 +677,19 @@ function registerTools(server: McpServer): void {
     {
       description:
         "Check herdr connection and list workspaces (with cwd), tabs, panes, and agents in one call. " +
+        "Typical session start: herdr_inspect → herdr_skill (read before any agent op) → work. " +
         "Also returns workstation_info: default_cwd hints, server/build, readonly/write_roots, " +
+        "agent_skill pointer (call herdr_skill for latest upstream SKILL.md), " +
         "and a short exec_environment summary (PATH binaries relevant to local coding). " +
         "Agents come from the shared SnapshotCache (live events + 30s snapshot fallback) and carry " +
-        "started_at + last_activity_at. YOU (web) are the planner/orchestrator. Prefer herdr_fs_* / " +
-        "herdr_exec / herdr_git before any herdr_prompt. Agent lists soft-hide expensive kinds " +
-        "(Claude/OMP/Codex); only allowlisted workers (pi, cline, opencode, anti) and auditors " +
-        "(droid, grok) appear — override with HERDR_MCP_AGENT_ALLOW. herdr_prompt by known " +
-        "name/pane_id is NOT blocked. Prefer explicit pane_id/workspace_id from this view.",
+        "started_at + last_activity_at. If session.snapshot blips (TaskGroup), falls back to " +
+        "workspace.list / pane.list / agent.list and sets warnings[] — do not treat that as a " +
+        "repo blocker; keep using herdr_fs_* / herdr_git / herdr_exec. YOU (web) are the " +
+        "planner/orchestrator. Prefer herdr_fs_* / herdr_exec / herdr_git before any herdr_prompt. " +
+        "Agent lists soft-hide expensive kinds (Claude/OMP/Codex); only allowlisted workers " +
+        "(pi, cline, opencode, anti) and auditors (droid, grok) appear — override with " +
+        "HERDR_MCP_AGENT_ALLOW. herdr_prompt by known name/pane_id is NOT blocked. Prefer " +
+        "explicit pane_id/workspace_id from this view.",
     },
     async () => {
       const c = clientGet();
@@ -680,8 +706,10 @@ function registerTools(server: McpServer): void {
       await Promise.race([cache.whenReady(), new Promise<void>((r) => setTimeout(r, 1500))]);
       const warnings: string[] = [];
       let snap = cache.getSnapshot();
-      const cacheEmpty = !Array.isArray(snap["agents"]) || (snap["agents"] as unknown[]).length === 0;
-      if (cacheEmpty) {
+      const hasAgents = Array.isArray(snap["agents"]) && (snap["agents"] as unknown[]).length > 0;
+      const hasWs = Array.isArray(snap["workspaces"]) && (snap["workspaces"] as unknown[]).length > 0;
+      const cacheThin = !hasAgents && !hasWs;
+      if (cacheThin) {
         try {
           snap = await c.snapshot();
         } catch (e) {
@@ -693,7 +721,13 @@ function registerTools(server: McpServer): void {
             snap = cached;
             warnings.push("snapshot_refresh_failed_used_cache");
           } else {
-            return herdrErrorResult(e, "herdr_inspect", "snapshot_refresh");
+            const assembled = await snapFromListApis(c);
+            if (assembled) {
+              snap = assembled;
+              warnings.push("snapshot_failed_used_list_apis");
+            } else {
+              return herdrErrorResult(e, "herdr_inspect", "snapshot_refresh");
+            }
           }
         }
       }
@@ -730,6 +764,7 @@ function registerTools(server: McpServer): void {
           server_name: SERVER_NAME,
           server_version: SERVER_VERSION,
           boot_id: BOOT_ID,
+          agent_skill: herdrSkillPointer(),
           default_cwd: typeof view["focused_pane"] === "string"
             ? ((view["panes"] as { id?: string; cwd?: string }[] | undefined)?.find((p) => p.id === view["focused_pane"])?.cwd
               ?? (view["workspaces"] as { focused?: boolean; cwd?: string }[] | undefined)?.find((w) => w.focused)?.cwd
@@ -764,13 +799,37 @@ function registerTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "herdr_skill",
+    {
+      description:
+        "Read-only: fetch the latest Herdr agent SKILL.md from upstream (herdr master branch, " +
+        "not version-pinned). Call ONCE per ChatGPT session BEFORE herdr_call or native " +
+        "agent/pane orchestration — learn pane/agent IDs, lifecycle states, and CLI semantics. " +
+        "Returns upstream herdr master when reachable; otherwise the bundled copy shipped " +
+        "with herdr-mcp (origin field: network | cache | bundled). ChatGPT does not fetch " +
+        "GitHub — only this server does. Cached ~1h; refresh=true bypasses cache; " +
+        "HERDR_SKILL_NETWORK=0 skips network.",
+      inputSchema: {
+        refresh: z.boolean().default(false).describe("Bypass cache and re-fetch from upstream"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ refresh }) => {
+      const result = await fetchHerdrSkill({ refresh });
+      return toResult(result);
+    },
+  );
+
+  server.registerTool(
     "herdr_call",
     {
       description:
+        SKILL_BEFORE_AGENT +
         "Generic passthrough to the herdr socket API, VALIDATED against the live schema " +
         "(schema reflected from the installed herdr binary, 60s cache). Params are checked before " +
         "sending: missing required / wrong type / wrong enum -> invalid_params error (no socket " +
-        "call); unknown params -> warnings. Call herdr_methods first when the schema is unknown; " +
+        "call); unknown params -> warnings. For unknown methods use herdr_methods; for agent.* " +
+        "methods (agent.start, agent.prompt, pane.split, …) herdr_skill is mandatory once per session. " +
         "prefer explicit pane_id/workspace_id over bare names. " +
         "For agent.prompt prefer herdr_prompt (fire-and-forget + idempotency_key + delivery " +
         "evidence); do not pass wait on mutations unless you intentionally want submit+wait. " +
@@ -778,7 +837,9 @@ function registerTools(server: McpServer): void {
         "with herdr_inspect / herdr_since first. Status-wait timeouts are failure " +
         "agent_status_wait_timeout (not herdr_transport).",
       inputSchema: {
-        method: z.string().describe("herdr socket method, e.g. pane.split, agent.start"),
+        method: z.string().describe(
+          "herdr socket method, e.g. pane.split, agent.start — read herdr_skill before agent.*",
+        ),
         // ChatGPT/OpenAI rejects Zod's z.record → propertyNames + additionalProperties:{}.
         // Accept object or JSON string; advertise a plain string schema.
         params: z
@@ -828,6 +889,7 @@ function registerTools(server: McpServer): void {
     "herdr_wait",
     {
       description:
+        SKILL_BEFORE_AGENT +
         "Block until a herdr agent reaches a settled lifecycle state, then return a read summary. " +
         "target: pane_id (e.g. wH:p1, unambiguous) or agent name (e.g. omp, must be unique). " +
         "If the bare name is ambiguous across workspaces, returns ambiguous_target with candidates; " +
@@ -835,7 +897,7 @@ function registerTools(server: McpServer): void {
       inputSchema: {
         target: z.string().describe("pane_id (wH:p1, unambiguous) or agent name (must be unique; if ambiguous use pane_id or workspace:name)"),
         until: z.array(z.string()).default(["idle", "blocked", "done"]).describe("Settled states"),
-        timeout_ms: z.number().default(300000).describe("Max time to wait in ms"),
+        timeout_ms: z.number().default(60000).describe("Max time to wait in ms (capped at 60s)"),
       },
     },
     async ({ target, until, timeout_ms }) => {
@@ -844,7 +906,7 @@ function registerTools(server: McpServer): void {
       // so wait and inspect can never disagree about a pane's status.
       const cache = getSnapshotCache(c);
       const result = await waitForAgent(
-        c, target, [...until], timeout_ms / 1000,
+        c, target, [...until], clampHerdrTimeout(timeout_ms) / 1000,
         () => cache.getSnapshot(),
       );
       return toResult(result);
@@ -985,6 +1047,7 @@ function registerTools(server: McpServer): void {
     "herdr_parallel",
     {
       description:
+        SKILL_BEFORE_AGENT +
         "Start N agents in N panes within a session's workspace — true parallelism. Each agent: {kind, name, prompt, cwd?}. cwd defaults to session.default_cwd; pass a different cwd for cross-project work (orchestrator in A, implementer in B). Returns manifest with pane_ids/cwds; call herdr_wait on each.",
       inputSchema: {
         session: z.string().describe("Session label"),
@@ -1296,6 +1359,7 @@ function registerTools(server: McpServer): void {
     "herdr_read",
     {
       description:
+        SKILL_BEFORE_AGENT +
         "Read a herdr agent's recent output WITHOUT waiting for it to settle. " +
         "Wraps the herdr 'agent.read' socket call (recent_unwrapped, last N lines). " +
         "mode='clean' (default) strips ANSI/spinner/status-bar chrome; soft-wrap " +
@@ -1334,6 +1398,7 @@ function registerTools(server: McpServer): void {
     "herdr_explain",
     {
       description:
+        SKILL_BEFORE_AGENT +
         "Wrap agent.explain — structured verdict for WHY an agent shows its current " +
         "state: final status, manifest source/version, matched rules with evidence, " +
         "skip reasons, screen_detection_skip_reason. Use to settle state disagreements " +
@@ -1361,6 +1426,7 @@ function registerTools(server: McpServer): void {
     {
       description:
         "Incremental digest since a cursor — cheap conversation-resume primitive (❺). " +
+        "When polling agents after herdr_prompt, herdr_skill should already have been read this session. " +
         "MCP clients only run when the user sends a message, so polling is not an option; " +
         "pass the cursor from your last call to get only NEW events. Returns: events[] " +
         "(pane/workspace/tab changes with cursor+at), current agents[] (status/started_at/" +
@@ -1523,6 +1589,47 @@ function registerTools(server: McpServer): void {
       return { ok: false, err: { ok: false, reason: "symlink_escape", path: resolved, real } };
     }
     return { ok: true, root, resolved, real };
+  }
+
+  /**
+   * herdr_git only: when snapshot/managed-roots gate is unavailable during a
+   * control-plane TaskGroup storm, still allow local git if the path is a real
+   * repo under $HOME (or HERDR_MCP_WRITE_ROOTS when set).
+   */
+  async function validateGitRootLocalFallback(
+    input: string,
+  ): Promise<{ ok: true; root: string; resolved: string; real: string } | { ok: false; err: Record<string, unknown> }> {
+    const resolved = path.resolve(input);
+    if (deniedSecretPath(resolved)) {
+      return { ok: false, err: { ok: false, reason: "secret_path_denied", path: resolved } };
+    }
+    let real: string;
+    try {
+      real = await realpath(resolved);
+    } catch (e) {
+      return { ok: false, err: { ok: false, reason: "not_found", path: resolved, message: String(e) } };
+    }
+    const top = gitToplevel(real);
+    if (!top) {
+      return { ok: false, err: { ok: false, reason: "not_a_git_repo", path: resolved } };
+    }
+    const home = process.env.HOME;
+    const bases = WRITE_ROOTS.length > 0
+      ? WRITE_ROOTS.map((w) => w.replace(/\/+$/, ""))
+      : (home ? [home] : []);
+    if (bases.length === 0 || !containingRoot(bases, top)) {
+      return {
+        ok: false,
+        err: {
+          ok: false,
+          reason: "git_fallback_outside_home",
+          path: resolved,
+          toplevel: top,
+          hint: "git local fallback only allows repos under $HOME (or HERDR_MCP_WRITE_ROOTS)",
+        },
+      };
+    }
+    return { ok: true, root: top, resolved, real: top };
   }
 
   function workingAgentsForRoot(snap: HerdrResult, root: string): { pane: string; agent: string | null }[] {
@@ -2004,7 +2111,9 @@ function registerTools(server: McpServer): void {
     {
       description:
         "Deterministic git facts for a managed root — prefer this over herdr_prompt to a local agent. " +
-        "action=status|diff|log. Web planner should call this itself to verify changes.",
+        "action=status|diff|log. Runs local git (PAGER=cat); if herdr snapshot/managed-roots gate " +
+        "blips (TaskGroup), still serves repos under $HOME with a warnings[] mark. " +
+        "Web planner should call this itself to verify changes.",
       inputSchema: {
         root: z.string().describe("Managed git project root (absolute)"),
         action: z.enum(["status", "diff", "log"]).describe("Git action"),
@@ -2017,8 +2126,25 @@ function registerTools(server: McpServer): void {
     async ({ root: rootIn, action, path: pathIn, staged, max_count, max_bytes }) => {
       const c = clientGet();
       const live = await liveSnapshot(c, "herdr_git");
-      if (!live.ok) return live.result;
-      const rootV = await validateManagedFile(live.snap, rootIn, true);
+      const warnings: string[] = live.ok ? [...live.warnings] : [];
+      let rootV: { ok: true; root: string; resolved: string; real: string } | { ok: false; err: Record<string, unknown> };
+
+      if (live.ok) {
+        rootV = await validateManagedFile(live.snap, rootIn, true);
+        // Snapshot cache may be empty during control-plane storms — fall back to local git root.
+        if (!rootV.ok && (rootV.err as { reason?: string }).reason === "outside_managed_roots") {
+          const local = await validateGitRootLocalFallback(rootIn);
+          if (local.ok) {
+            rootV = local;
+            warnings.push("git_local_without_managed_roots");
+          }
+        }
+      } else {
+        const local = await validateGitRootLocalFallback(rootIn);
+        if (!local.ok) return live.result;
+        rootV = local;
+        warnings.push("git_local_after_snapshot_failure");
+      }
       if (!rootV.ok) return toResult(rootV.err);
       if (gitToplevel(rootV.real) !== rootV.real && gitToplevel(rootV.real) !== rootV.root) {
         // allow if root is the git toplevel
@@ -2036,6 +2162,7 @@ function registerTools(server: McpServer): void {
         timeout: 15_000,
         maxBuffer: Math.max(budget + 4096, 8_388_608),
         encoding: "utf-8",
+        env: { ...process.env, PAGER: "cat", GIT_PAGER: "cat" },
       });
       if (r.error) {
         return toResult({ ok: false, root: rootV.root, action, message: String(r.error) });
@@ -2055,6 +2182,7 @@ function registerTools(server: McpServer): void {
           exit_code: r.status,
           output: text,
           stderr: String(r.stderr ?? ""),
+          ...(warnings.length ? { warnings } : {}),
         });
       }
       return toResult({
@@ -2065,7 +2193,7 @@ function registerTools(server: McpServer): void {
         truncated,
         output: text,
         ...(r.stderr ? { stderr: String(r.stderr).slice(0, 2000) } : {}),
-        ...(live.warnings.length ? { warnings: live.warnings } : {}),
+        ...(warnings.length ? { warnings } : {}),
       });
     },
   );
@@ -2167,7 +2295,7 @@ function registerTools(server: McpServer): void {
         workspace: z.string().describe("workspace_id or label (from herdr_inspect)"),
         command: z.string().describe("Shell command line to run in the utility pane"),
         project_root: z.string().optional().describe("Explicit project root within this workspace (workspaces[].projects[].root from herdr_inspect). REQUIRED when the workspace has multiple project roots; the command runs with this root as cwd via subshell cd"),
-        timeout_ms: z.number().int().min(1).max(300000).default(30000),
+        timeout_ms: z.number().int().min(1).max(HERDR_RPC_TIMEOUT_MAX_MS).default(30000),
         confirm_busy: z.boolean().default(false).describe("Force exec even when an agent in the project is working (returns warnings.working)"),
       },
     },
@@ -2233,13 +2361,14 @@ function registerTools(server: McpServer): void {
         });
       }
 
+      const execTimeoutMs = clampHerdrTimeout(timeout_ms);
       const busyWarn = working.length > 0 ? { warnings: { working } } : {};
 
       const localFallback = async (reason: string) => {
         const local = await runLocalShell({
           command,
           cwd: execCwd!,
-          timeoutMs: timeout_ms,
+          timeoutMs: execTimeoutMs,
           maxOutputBytes: 8000,
         });
         if (local.timed_out) {
@@ -2432,8 +2561,8 @@ function registerTools(server: McpServer): void {
 
       try {
         await c.call("pane.wait_for_output",
-          { pane_id: paneId, source: "recent_unwrapped", match: { type: "regex", value: `${marker}\\d+__` }, timeout_ms },
-          timeout_ms + 10000);
+          { pane_id: paneId, source: "recent_unwrapped", match: { type: "regex", value: `${marker}\\d+__` }, timeout_ms: execTimeoutMs },
+          clampHerdrTimeout(execTimeoutMs + 10000));
       } catch (e) {
         const err = e instanceof HerdrError ? e : new HerdrError("error", String(e));
         let partial = "";
@@ -2598,6 +2727,7 @@ function registerTools(server: McpServer): void {
     "herdr_prompt",
     {
       description:
+        SKILL_BEFORE_AGENT +
         "Send a prompt to a herdr agent via socket agent.prompt (NEVER pane.send_text). " +
         "Prefer herdr_fs_* / herdr_exec when the work is deterministic file/shell IO (no local API burn). " +
         "Target a cheap/fast worker (pi, flash, …) with a self-contained task; do NOT prompt " +
@@ -2611,7 +2741,7 @@ function registerTools(server: McpServer): void {
         "(not a socket transport failure) — verify before re-sending. Worker invariant: " +
         "project root == pane cwd == foreground cwd.",
       inputSchema: {
-        target: z.string().describe("Agent name or pane_id to prompt"),
+        target: z.string().describe("Agent name or pane_id to prompt (call herdr_skill first if new session)"),
         text: z.string().describe("Prompt text (multi-line/CJK safe; the server owns submission)"),
         idempotency_key: z.string().optional().describe(
           "STRONGLY RECOMMENDED client key; replay returns stored result without re-sending",
@@ -2620,8 +2750,8 @@ function registerTools(server: McpServer): void {
           .object({
             until: z.array(z.enum(["idle", "working", "blocked", "done", "unknown"])).optional()
               .describe("Agent statuses that end the wait"),
-            timeout_ms: z.number().int().min(1).max(3600000).optional()
-              .describe("Wait budget; default 25s when wait is given"),
+            timeout_ms: z.number().int().min(1).max(HERDR_RPC_TIMEOUT_MAX_MS).optional()
+              .describe("Wait budget (max 60s); default 25s when wait is given"),
           })
           .optional()
           .describe("OPTIONAL submit+wait — omit for fire-and-forget (recommended)"),
@@ -2648,7 +2778,7 @@ function registerTools(server: McpServer): void {
         return toResult(result);
       }
       const params: Record<string, unknown> = { target, text, wait: wait ?? null };
-      const callTimeout = wait ? (wait.timeout_ms ?? 25000) + 5000 : 30000;
+      const callTimeout = clampHerdrTimeout(wait ? (wait.timeout_ms ?? 25000) + 5000 : 30000);
       let r: HerdrResult;
       try {
         r = await c.call("agent.prompt", params, callTimeout);
@@ -2688,6 +2818,35 @@ function registerTools(server: McpServer): void {
             });
           }
           return toResult(result);
+        }
+        if (isHerdrControlPlaneTaskGroup(err.message)) {
+          const likelyWorking = afterProbe?.agent_status === "working";
+          const seqMoved = !!(before && afterProbe
+            && before.state_change_seq !== afterProbe.state_change_seq);
+          const submitted = likelyWorking || seqMoved ? true : "unknown";
+          const rootMessage = unwrapControlPlaneMessage(err.message);
+          return toResult({
+            ok: false,
+            target,
+            failure: "herdr_internal",
+            failure_phase: "control_plane_taskgroup",
+            code: "control_plane_taskgroup",
+            submitted,
+            delivery_uncertain: submitted !== true,
+            resolved_pane: afterProbe?.pane_id ?? before?.pane_id ?? null,
+            before: before ? { agent_status: before.agent_status, state_change_seq: before.state_change_seq } : null,
+            after: afterProbe ? { agent_status: afterProbe.agent_status, state_change_seq: afterProbe.state_change_seq } : null,
+            ...buildStateObservation({ before, after: afterProbe, waited: !!wait }),
+            message: rootMessage,
+            error: {
+              type: /ExceptionGroup/i.test(err.message) ? "ExceptionGroup" : "TaskGroup",
+              message: rootMessage,
+              raw: err.message.slice(0, 2000),
+            },
+            // Never blind-retry agent.prompt: delivery may have landed despite TaskGroup.
+            retryable: false,
+            hint: "herdr daemon control-plane TaskGroup blip on agent.prompt — pane/agent usually still fine. Check herdr_since / herdr_inspect (status/seq) before any re-prompt; do not treat this as agent dead or as a novo/repo failure.",
+          });
         }
         const result = {
           ok: false, target, failure_phase: resolveFail ? "resolve" : "submit_or_response_lost",
@@ -2759,6 +2918,7 @@ function registerTools(server: McpServer): void {
     "herdr_transcript",
     {
       description:
+        SKILL_BEFORE_AGENT +
         "Read the last N entries of an agent's session transcript (jsonl file). " +
         "Calls 'agent.get' to find the agent_session.value path, then reads the tail of that file. " +
         "Use to review the full conversation/actions an agent has taken (not just recent scrollback).",
@@ -2945,14 +3105,15 @@ function clearStatelessSse(entry: { res: Response; hb: NodeJS.Timeout }): void {
  * every tool description.
  */
 const SERVER_INSTRUCTIONS =
-  "Herdr control plane for a WEB planner. Ladder: (1) herdr_fs_read/list/grep/patch/image + " +
+  "Herdr control plane for a WEB planner. Session start: herdr_inspect then herdr_skill (once, " +
+  "latest upstream SKILL — tracks herdr master, not pinned). Ladder: (1) herdr_fs_read/list/grep/patch/image + " +
   "herdr_git + herdr_exec (short) / herdr_exec_start|read|kill (long) — zero local-agent API; " +
   "(2) only if agent reasoning is required, herdr_prompt a cheap/fast worker (pi, flash, cline, " +
   "opencode, anti) or auditor (droid, grok) with a self-contained task + idempotency_key; " +
   "inspect/since soft-hide Claude/OMP/Codex (HERDR_MCP_AGENT_ALLOW overrides; prompt by known id still works); " +
   "(3) YOU keep the plan — poll herdr_since / herdr_inspect and re-prompt workers yourself. " +
   "Do NOT herdr_prompt Claude/OMP/main to plan, research, or delegate to other panes. " +
-  "Start: herdr_inspect (includes workstation_info). Unknown native API: herdr_methods then herdr_call. " +
+  "Before herdr_call: herdr_skill + herdr_methods. Unknown native API: herdr_methods then herdr_call. " +
   "Before edits require project_root == pane cwd == foreground cwd; use explicit IDs, never UI focus. " +
   "Never blind-retry mutations after uncertain delivery.";
 
@@ -3108,7 +3269,7 @@ async function handleMcpRequest(req: Request, res: Response): Promise<void> {
   //  - ChatGPT/openai-mcp (post-OAuth): sends discover with Mcp-Protocol-Version
   //    2026-07-28 and a Bearer token. Returning -32601 used to force a legacy
   //    initialize fallback for unauthenticated probes, but after OAuth the
-  //    client stops with "连接出现问题" and never calls initialize. Advertise
+  //    client stops with "Connection problem" and never calls initialize. Advertise
   //    SDK wire versions FIRST, keep 2026-07-28 in the list so discovery still
   //    completes; prefer negotiation onto 2025-11-25 for subsequent POSTs.
   const discoverBody = (req.body ?? {}) as Record<string, unknown>;
@@ -3198,7 +3359,7 @@ function routes(app: Express): void {
   // ChatGPT connector UI discovers OAuth from the browser — needs CORS + OPTIONS.
   app.use(oauthCors);
 
-  // --- Browser-extension push channel (herdr → 网页唤醒) ---
+  // --- Browser-extension push channel (herdr → web wake-up) ---
   // GET /push/events (SSE) + GET /push/state, same Bearer token as /mcp.
   registerPushRoutes(app, clientGet);
 
@@ -3264,6 +3425,16 @@ function routes(app: Express): void {
           ` sid=${sid} stateless=${stateless} lookup=${lookup} route=${route}` +
           ` auth=${auth} resp-sid=${respSid} ct=${ct}`,
       );
+      // Ring-buffer tools/call for extension idle-nudge (talk-without-tools).
+      if (method === "tools/call" && typeof tool === "string" && tool !== "-") {
+        recordMcpToolCall({
+          at: started,
+          tool,
+          call: callMethod || null,
+          ua: uaRaw === "-" ? "-" : uaRaw,
+          status: res.statusCode,
+        });
+      }
     }
     next();
   });
@@ -3341,6 +3512,7 @@ function routes(app: Express): void {
 }
 
 export function start(): void {
+  warmSchemaCache();
   const app = express();
   routes(app);
   app.listen(PORT, "127.0.0.1", () => {

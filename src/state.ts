@@ -14,6 +14,7 @@
  * `data.pane` is a FULL post-change PaneInfo, so any pane event is an upsert.
  */
 import { HerdrClient, HerdrEvent, HerdrResult } from "./herdr.js";
+import { fetchSessionSnapshot } from "./snap-fallback.js";
 
 const RESUBSCRIBE_SEC = 25;   // subscribe chunk (daemon may not send on idle)
 const TTL_MS = 30_000;        // force a full re-snapshot at least this often
@@ -141,7 +142,7 @@ export class SnapshotCache {
 
   /** Full refresh from session.snapshot (bootstrap / reconnect / TTL). */
   private async bootstrap(): Promise<void> {
-    const snap = await this.client.snapshot();
+    const { snap } = await fetchSessionSnapshot(this.client);
     const prevAgents = (this.state["agents"] as unknown[]) ?? [];
     const prevLastAct = new Map(this.lastActivityByPane);
     this.state = snap;
@@ -301,6 +302,83 @@ export class SnapshotCache {
     const arr = (this.state[key] as unknown[]) ?? [];
     if (!Array.isArray(this.state[key])) this.state[key] = arr;
     return arr as Record<string, unknown>[];
+  }
+
+  workspaceViews(): { id: string; label: string | null; roots: string[] }[] {
+    const wss = (this.state["workspaces"] as unknown[]) ?? [];
+    const agents = this.agentViews();
+    const out: { id: string; label: string | null; roots: string[] }[] = [];
+    for (const w of wss) {
+      const rec = (w ?? {}) as Record<string, unknown>;
+      const id = typeof rec["workspace_id"] === "string" ? (rec["workspace_id"] as string)
+        : typeof rec["id"] === "string" ? (rec["id"] as string) : null;
+      if (!id) continue;
+      const label = typeof rec["label"] === "string" && rec["label"] ? (rec["label"] as string) : null;
+      const roots: string[] = [];
+      const projects = (rec["projects"] as unknown[]) ?? [];
+      for (const p of projects) {
+        const pr = (p ?? {}) as Record<string, unknown>;
+        if (typeof pr["root"] === "string" && !roots.includes(pr["root"] as string)) {
+          roots.push(pr["root"] as string);
+        }
+      }
+      if (!roots.length && typeof rec["cwd"] === "string") roots.push(rec["cwd"] as string);
+      if (!roots.length) {
+        for (const a of agents) {
+          if (a.workspace === id && a.cwd && !roots.includes(a.cwd)) roots.push(a.cwd);
+        }
+      }
+      if (!roots.length) {
+        const panesRaw = (this.state["panes"] as unknown[]) ?? [];
+        for (const p of panesRaw) {
+          const pr = (p ?? {}) as Record<string, unknown>;
+          if (pr["workspace_id"] !== id) continue;
+          const cwd = typeof pr["cwd"] === "string" ? (pr["cwd"] as string)
+            : typeof pr["foreground_cwd"] === "string" ? (pr["foreground_cwd"] as string) : null;
+          if (cwd && !roots.includes(cwd)) roots.push(cwd);
+        }
+      }
+      out.push({ id, label, roots });
+    }
+    return out;
+  }
+
+  /** All panes (incl. agentless terminals visible in herdr sidebar). */
+  paneViews(): {
+    id: string;
+    workspace: string | null;
+    cwd: string | null;
+    label: string | null;
+    agent: { name: string | null; status: string | null; terminal_title: string | null } | null;
+  }[] {
+    const panesRaw = (this.state["panes"] as unknown[]) ?? [];
+    const byPane = new Map(this.agentViews().map((a) => [a.pane, a]));
+    const out: {
+      id: string;
+      workspace: string | null;
+      cwd: string | null;
+      label: string | null;
+      agent: { name: string | null; status: string | null; terminal_title: string | null } | null;
+    }[] = [];
+    for (const p of panesRaw) {
+      const rec = (p ?? {}) as Record<string, unknown>;
+      const id = typeof rec["pane_id"] === "string" ? (rec["pane_id"] as string) : null;
+      if (!id) continue;
+      const ag = byPane.get(id);
+      out.push({
+        id,
+        workspace: typeof rec["workspace_id"] === "string" ? (rec["workspace_id"] as string) : null,
+        cwd: typeof rec["cwd"] === "string" ? (rec["cwd"] as string)
+          : typeof rec["foreground_cwd"] === "string" ? (rec["foreground_cwd"] as string) : null,
+        label: typeof rec["label"] === "string" ? (rec["label"] as string) : null,
+        agent: ag ? {
+          name: ag.name,
+          status: ag.status,
+          terminal_title: typeof ag.terminal_title === "string" ? ag.terminal_title : null,
+        } : null,
+      });
+    }
+    return out;
   }
 
   /** Agents[] view with started_at (from session path) + last_activity_at added. */

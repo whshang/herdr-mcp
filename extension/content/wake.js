@@ -1,18 +1,17 @@
-// wake.js — 唤醒核心 (content script)
-// 方向: herdr → 网页。收到 background 的 h2w_wake 时,向本页输入框写入消息并提交。
-// - textarea 站点 (z.ai/deepseek): fillInput (React 原生 setter) + Enter
-// - contenteditable 站点 (claude/chatgpt): 经 background `chrome.scripting` **MAIN world** `execCommand("insertText")`
-//   (隔离世界不提交编辑模型, ctmc 实测教训), 再点发送按钮
-// - 有 SpeaksJSON 的站点: 提交后等回复区出现 (与提交前快照对比), 回报投递确认
-// - 权限弹窗: 页面内「允许/拒绝」卡片自动点允许 (保守 fail-closed)。
-//   ChatGPT Connector 每次 tools/call 都会弹卡 — chatgpt 站点常驻观察;
-//   其它站点仍在唤醒窗口期内观察 (站点常在唤醒后弹权限)。
-// 状态反馈: 页内不再画点 (用户反馈困惑), 改用工具栏图标徽章 (background 驱动)。
-// 版本: 与 background.js 的 H2W_SCRIPT_VERSION 同步 bump (改 content 代码必须)。
-const H2W_CONTENT_VERSION = "0.1.7";
+// wake.js — core wake-up content script
+// Direction: herdr → web. On h2w_wake, fill and submit the current page's composer.
+// - textarea sites (z.ai/deepseek): native React setter plus Enter
+// - contenteditable sites (claude/chatgpt): MAIN-world execCommand("insertText"),
+//   followed by a send-button click because isolated-world insertion does not commit the editor model
+// - SpeaksJSON sites: wait for a changed reply area after submission and report delivery confirmation
+// - permission dialogs: conservatively auto-click Allow on in-page permission cards
+//   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
+// Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
+// Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
+const H2W_CONTENT_VERSION = "0.1.28";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
-  if (!ADAPTER) { console.warn("[h2w] 无适配器, 跳过"); return; }
+  if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
   const SPEAKS = window.__H2W_SPEAKS_JSON__ || null;
 
   function runtimeAlive() {
@@ -31,7 +30,7 @@ const H2W_CONTENT_VERSION = "0.1.7";
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const normText = (s) => String(s || "").replace(/\s+/g, " ").trim();
 
-  // ---- MAIN world 插入 (contenteditable 站点) ----
+  // ---- MAIN-world insertion for contenteditable sites ----
   function insertMainWorld(text, selector) {
     return new Promise((resolve) => {
       try {
@@ -45,13 +44,13 @@ const H2W_CONTENT_VERSION = "0.1.7";
   function mainWorldCommitted(text) {
     const el = ADAPTER.getInputEl();
     if (!el) return false;
-    // ProseMirror 会把 \n 拆成段落, innerText 空白与模板不完全一致 → 归一化再比
+    // ProseMirror splits newlines into paragraphs, so compare normalized text.
     return normText(el.innerText || el.textContent).includes(normText(text));
   }
   async function ensureCommitted(text, maxAttempts = 3) {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (mainWorldCommitted(text)) return true;
-      if (attempt > 0) console.warn(`[h2w] 第 ${attempt + 1} 次尝试插入「${text.slice(0, 30)}…」`);
+      if (attempt > 0) console.warn(`[h2w] insertion attempt ${attempt + 1}: "${text.slice(0, 30)}..."`);
       const selector = ADAPTER.getWatchMainWorldSelector();
       if (!selector) return false;
       const r = await insertMainWorld(text, selector);
@@ -72,12 +71,12 @@ const H2W_CONTENT_VERSION = "0.1.7";
     return true;
   }
 
-  // ---- 发送 ----
-  // contenteditable 站点: 等发送按钮可点再 click; 仅键盘事件常被 ProseMirror 吞掉。
-  // 成功判定: 输入框被清空 (真正发出去了)。假阳性 return true 会导致「框里堆着字却以为发了」。
+  // ---- Submission ----
+  // For contenteditable sites, wait for an enabled send button because ProseMirror
+  // often consumes synthetic keyboard events. Success requires the composer to clear.
   async function submit() {
     if (ADAPTER.needsMainWorldInsert) {
-      await wait(350); // 等编辑模型吃进 insertText, 按钮才从 disabled 变可点
+      await wait(350); // Let the editor model process insertText and enable Send.
       for (let i = 0; i < 20; i++) {
         const btn = ADAPTER.getSendButton();
         if (sendButtonReady(btn)) {
@@ -86,8 +85,8 @@ const H2W_CONTENT_VERSION = "0.1.7";
             await wait(200);
             if (!ADAPTER.inputHasContent()) return true;
           }
-          // 点了但框还在 → 可能没发出, 继续重试 / 换策略
-          console.warn("[h2w] 点了发送但输入框仍有内容, 重试");
+          // The composer still has content, so retry or switch strategy.
+          console.warn("[h2w] composer still has content after Send; retrying");
         }
         await wait(150);
       }
@@ -105,10 +104,10 @@ const H2W_CONTENT_VERSION = "0.1.7";
     return ADAPTER.send();
   }
 
-  // ---- 权限弹窗自动允许 (页面内 DOM 弹窗/工具权限卡片; 浏览器原生权限条无法自动点) ----
-  // 复用 base.js 的 __H2W_PERMISSION__ 纯逻辑 (fail-closed): 只点可见/可用/明确
-  // 文本的"允许"按钮, 且按钮所在最小卡片须含权限类标题说明 + 明确拒绝按钮。
-  // 重复 mutation 不重复点击 (WeakSet 去重, 见 base.js 的 createPermissionClicker)。
+  // ---- Auto-allow in-page permission dialogs and tool cards ----
+  // Reuse fail-closed logic from base.js: click only a visible, enabled, explicit
+  // Allow action whose smallest card has permission text and an explicit deny action.
+  // A WeakSet prevents duplicate clicks across repeated mutations.
   const PERM = window.__H2W_PERMISSION__;
   let permClicker = null;
   let permObs = null;
@@ -117,7 +116,7 @@ const H2W_CONTENT_VERSION = "0.1.7";
     if (!runtimeAlive() || Date.now() > permDeadline) { permissionStop(); return; }
     const r = permClicker.tryClick(document);
     if (r.handled) {
-      console.log(`[h2w] 权限卡片自动点「${(r.button.innerText || r.button.textContent || "?").trim()}」`);
+      console.log(`[h2w] auto-clicked permission action "${(r.button.innerText || r.button.textContent || "?").trim()}"`);
     }
   }
   function permissionStop() {
@@ -125,7 +124,7 @@ const H2W_CONTENT_VERSION = "0.1.7";
   }
   function startPermissionWatch(durationMs = 90000) {
     const persistent = !Number.isFinite(durationMs);
-    // 已有常驻观察时, 有限窗口的二次启动不必打断; 常驻可覆盖有限窗口。
+    // A persistent observer already covers later finite watch requests.
     if (permObs && (persistent || permDeadline === Number.POSITIVE_INFINITY)) {
       if (persistent) permDeadline = Number.POSITIVE_INFINITY;
       permissionTryClick();
@@ -133,12 +132,11 @@ const H2W_CONTENT_VERSION = "0.1.7";
     }
     if (permObs) permissionStop();
     permDeadline = persistent ? Number.POSITIVE_INFINITY : (Date.now() + durationMs);
-    // 卡片先出现/按钮后挂载: 只在 findAllowAction 实际找到并点击后才由 clicker 标记,
-    // 不会因提前标记而漏掉后挂载的按钮。
+    // Mark only after a button is found and clicked so late-mounted buttons are not missed.
     permClicker = PERM.createPermissionClicker();
     permissionTryClick();
     permObs = new MutationObserver(() => permissionTryClick());
-    // childList 覆盖按钮后挂载; attributes 让初始 disabled/hidden 的按钮后来变可用
+    // childList catches late mounts; attributes catches buttons that later become enabled.
     try {
       permObs.observe(document.body, {
         childList: true, subtree: true,
@@ -148,7 +146,7 @@ const H2W_CONTENT_VERSION = "0.1.7";
     if (!persistent) setTimeout(permissionStop, durationMs + 5000);
   }
 
-  // ---- 执行一次唤醒 ----
+  // ---- Perform one wake-up ----
   let wakeInFlight = false;
   let lastWakeNorm = "";
   let lastWakeAt = 0;
@@ -158,12 +156,12 @@ const H2W_CONTENT_VERSION = "0.1.7";
     const text = (data.template || "").trim();
     if (!text) return { ok: false, error: "empty-template" };
     const n = normText(text);
-    // 短窗口去重: 重试/双扩展/双 timer 叠同一条时不反复往框里灌
+    // Short-window deduplication prevents repeated insertion from retries or duplicate timers.
     if (n && n === lastWakeNorm && Date.now() - lastWakeAt < 8000) {
       return { ok: false, blocked: "dedupe" };
     }
-    if (ADAPTER.inputHasContent()) {
-      // 框里已是同文案 → 只补发送, 不再插入
+    if (ADAPTER.inputHasContent() && !data.llmNudge) {
+      // If the composer already contains this message, submit without reinserting.
       if (mainWorldCommitted(text) || normText((ADAPTER.getInputEl()?.innerText || ADAPTER.getInputEl()?.textContent || "")).includes(n.slice(0, 80))) {
         wakeInFlight = true;
         try {
@@ -200,7 +198,7 @@ const H2W_CONTENT_VERSION = "0.1.7";
       const oldOpacity = el.style.opacity;
       el.style.opacity = "0";
       ADAPTER.fillInput(text);
-      await wait(420); // React 受控组件异步提交 value (ctmc 教训)
+      await wait(420); // React-controlled inputs commit value asynchronously.
       const sent = await submit();
       setTimeout(() => { if (el) el.style.opacity = oldOpacity ?? ""; }, 600);
       if (sent) { lastWakeNorm = n; lastWakeAt = Date.now(); }
@@ -210,7 +208,7 @@ const H2W_CONTENT_VERSION = "0.1.7";
     }
   }
 
-  // ---- 投递确认 (SpeaksJSON 站点): 提交后等回复区出现/内容变化 ----
+  // ---- Delivery confirmation on SpeaksJSON sites ----
   async function confirmReplyStarted(timeoutMs = 30000) {
     if (!SPEAKS || !SPEAKS.enabled) return { monitored: false };
     const beforeText = SPEAKS.getLatestReply();
@@ -226,15 +224,108 @@ const H2W_CONTENT_VERSION = "0.1.7";
     return { monitored: true, replyStarted: false };
   }
 
-  // ---- 消息监听 ----
+  // ---- Idle nudge helpers (shared with snapshot + turn watch) ----
+  function lastMessageByRole(role) {
+    const nodes = [...document.querySelectorAll(`[data-message-author-role="${role}"]`)];
+    const el = nodes[nodes.length - 1];
+    return el ? String(el.innerText || "").trim() : "";
+  }
+  function stopButtons() {
+    return [...document.querySelectorAll("button, [role=button]")].filter((b) => {
+      if (!b.offsetParent) return false;
+      const blob = [
+        b.innerText, b.textContent, b.getAttribute("aria-label"),
+        b.getAttribute("data-testid"), b.getAttribute("title"),
+      ].filter(Boolean).join(" ");
+      return /stop|停止|stop generating|停止生成|stop streaming|停止流式/i.test(blob);
+    });
+  }
+  function assistantStreaming() {
+    const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+    const last = nodes[nodes.length - 1];
+    if (!last) return false;
+    if (last.getAttribute("data-is-streaming") === "true") return true;
+    if (last.querySelector('[data-is-streaming="true"]')) return true;
+    return false;
+  }
+  function isComposerGenerating() {
+    if (stopButtons().length > 0) return true;
+    if (assistantStreaming()) return true;
+    const send = ADAPTER.getSendButton?.();
+    if (send) {
+      const blob = [
+        send.getAttribute("aria-label"), send.getAttribute("data-testid"), send.innerText,
+      ].filter(Boolean).join(" ");
+      if (/stop|停止|generating|生成中|streaming/i.test(blob)) return true;
+    }
+    return false;
+  }
+
+  /** Mid-turn: streaming, stop button, or visible tool/MCP invocation still running. */
+  function assistantToolsInProgress() {
+    const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+    const last = nodes[nodes.length - 1];
+    if (!last) return false;
+    if (last.querySelector('[aria-busy="true"]')) return true;
+    for (const el of last.querySelectorAll('[class*="animate-spin"], [class*="animate-pulse"], svg.animate-spin')) {
+      if (el.offsetParent) return true;
+    }
+    for (const el of last.querySelectorAll("[data-testid], [aria-label]")) {
+      if (!el.offsetParent) continue;
+      const blob = [
+        el.getAttribute("data-testid") || "",
+        el.getAttribute("aria-label") || "",
+        String(el.className || "").slice(0, 80),
+        String(el.textContent || "").slice(0, 100),
+      ].join(" ");
+      if (/tool|mcp|connector|plugin|herdr/i.test(blob)
+        && /running|loading|pending|in.?progress|executing|calling|searching|fetching|working/i.test(blob)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function isTurnInProgress() {
+    return isComposerGenerating() || assistantToolsInProgress();
+  }
+
+  // Keep aligned with binding-core.js looksLikeSubstantiveReply
+  function looksLikeSubstantiveReply(text) {
+    const t = String(text || "").replace(/\s+/g, " ").trim();
+    if (t.length < 60) return false;
+    if (/^(?:calling|called|running|searching|fetching|executing|using|invoking|waiting)\b/i.test(t) && t.length < 160) {
+      return false;
+    }
+    if (/^herdr_[a-z_]+\b/i.test(t) && t.length < 140) return false;
+    const stripped = t.replace(/\{"tool"[^}]*\}/gi, "").trim();
+    if (stripped.length < 50) return false;
+    return true;
+  }
+
+  // ---- Message listener ----
   try {
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (msg?.type === "h2w_get_convkey") {
         sendResponse({ convKey: ADAPTER.getConversationKey(), url: location.href, site: ADAPTER.name });
         return;
       }
+      if (msg?.type === "h2w_snapshot_turn") {
+        const assistantText = lastMessageByRole("assistant");
+        sendResponse({
+          convKey: ADAPTER.getConversationKey(),
+          userText: lastMessageByRole("user"),
+          assistantText,
+          generating: isComposerGenerating(),
+          turnInProgress: isTurnInProgress(),
+          substantive: looksLikeSubstantiveReply(assistantText),
+          endedAt: Date.now(),
+        });
+        return;
+      }
       if (msg?.type === "h2w_bound" || msg?.type === "h2w_unbound") {
-        console.log(`[h2w] ${msg.type === "h2w_bound" ? "已绑定 " + msg.pane : "已解绑"} (状态见工具栏图标)`);
+        console.log(`[h2w] ${msg.type === "h2w_bound" ? "bound " + msg.pane : "unbound"}`);
+        if (ADAPTER.name === "chatgpt") void refreshPageHud();
         return;
       }
       if (msg?.type === "h2w_wake") {
@@ -242,19 +333,299 @@ const H2W_CONTENT_VERSION = "0.1.7";
           const result = await performWake(msg.data || {});
           const confirm = result.ok ? await confirmReplyStarted() : { monitored: false };
           sendBg({ type: "h2w_wake_ack", convKey: ADAPTER.getConversationKey(), result, confirm });
+          sendResponse(result);
         })();
-        return;
+        return true;
       }
       sendResponse({});
     });
-  } catch (e) { console.warn("[h2w] onMessage 注册失败:", e.message); }
+  } catch (e) { console.warn("[h2w] failed to register onMessage:", e.message); }
 
-  // ---- 注册: 上报版本 (旧脚本标签页自动刷新机制) + 会话身份 (绑定路由/恢复) ----
+  // ---- Registration: report version and conversation identity ----
   (async () => {
     if (!runtimeAlive()) return;
     try { chrome.runtime.sendMessage({ type: "h2w_hello", version: H2W_CONTENT_VERSION }); } catch (e) {}
     await sendBg({ type: "h2w_register", convKey: ADAPTER.getConversationKey(), url: location.href, site: ADAPTER.name });
-    // ChatGPT Connector 工具权限卡与「唤醒」无关 — 页面加载后即常驻自动允许。
+    // ChatGPT Connector permission cards can appear outside wake-up, so watch continuously.
     if (ADAPTER.name === "chatgpt" && PERM) startPermissionWatch(Number.POSITIVE_INFINITY);
+    // Talk-without-tools: watch turn boundaries and ask background to check MCP activity.
+    if (ADAPTER.name === "chatgpt") {
+      startPageHud();
+      startIdleNudgeWatch();
+    }
   })();
+
+  // ---- Idle nudge: zero openai-mcp tools/call on an action/claim turn ----
+  function startIdleNudgeWatch() {
+    let generating = false;
+    let sawGrowth = false;
+    let startedAt = 0;
+    let userTextAtStart = "";
+    let settleTimer = null;
+    let lastReportedEnd = 0;
+    let lastAsstLen = 0;
+    let stableRounds = 0;
+
+    const reportTurnEnded = (assistantText, endedAt) => {
+      if (endedAt - lastReportedEnd < 3000) return;
+      if (isTurnInProgress()) return;
+      if (!looksLikeSubstantiveReply(assistantText)) return;
+      if (!String(assistantText || "").trim()) return;
+      lastReportedEnd = endedAt;
+      const payload = {
+        type: "h2w_turn_ended",
+        convKey: ADAPTER.getConversationKey(),
+        startedAt,
+        endedAt,
+        userText: userTextAtStart || lastMessageByRole("user"),
+        assistantText,
+      };
+      console.log("[h2w] turn ended; asking idle-nudge check");
+      paintPageHud({ pending: true });
+      sendBg(payload).then((r) => {
+        console.log("[h2w] idle-nudge result:", r);
+        hudPending = false;
+        void refreshPageHud();
+      });
+    };
+
+    const onTick = () => {
+      const stopping = isComposerGenerating();
+      const assistantText = lastMessageByRole("assistant");
+      const curLen = assistantText.length;
+
+      if (stopping || curLen > lastAsstLen) {
+        if (!generating) {
+          generating = true;
+          sawGrowth = curLen > lastAsstLen || stopping;
+          startedAt = Date.now();
+          userTextAtStart = lastMessageByRole("user");
+          if (settleTimer) { clearInterval(settleTimer); settleTimer = null; }
+          stableRounds = 0;
+          console.log("[h2w] turn start (streaming/stop/growth)");
+        }
+        if (curLen > lastAsstLen) sawGrowth = true;
+        stableRounds = 0;
+        lastAsstLen = curLen;
+        return;
+      }
+
+      if (generating && sawGrowth && curLen > 0) {
+        if (curLen === lastAsstLen) stableRounds += 1;
+        else { stableRounds = 0; lastAsstLen = curLen; }
+        if (stableRounds < 2) return; // ~1.6s stable after growth
+        generating = false;
+        sawGrowth = false;
+        stableRounds = 0;
+        const endedAt = Date.now();
+        if (settleTimer) { clearInterval(settleTimer); settleTimer = null; }
+        // Extra debounce for DOM settle
+        settleTimer = setInterval(() => {
+          if (isTurnInProgress()) {
+            clearInterval(settleTimer);
+            settleTimer = null;
+            generating = true;
+            sawGrowth = true;
+            stableRounds = 0;
+            return;
+          }
+          const cur = lastMessageByRole("assistant");
+          if (cur.length === lastAsstLen) stableRounds += 1;
+          else { lastAsstLen = cur.length; stableRounds = 0; }
+          if (stableRounds < 2) return;
+          clearInterval(settleTimer);
+          settleTimer = null;
+          reportTurnEnded(cur, endedAt);
+        }, 800);
+      }
+      lastAsstLen = curLen;
+    };
+
+    setInterval(onTick, 800);
+    try {
+      const mo = new MutationObserver(() => onTick());
+      mo.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+    } catch (e) {}
+  }
+
+  // ---- In-page status bar (ChatGPT): config + last LLM judge, always on ----
+  const HUD_ID = "h2w-page-hud";
+  const HUD_LOCALES = ["en", "zh", "ja"];
+  let hudPending = false;
+  let hudCache = null;
+  let hudEls = null;
+  let hudCat = {};
+  let hudLocale = "en";
+
+  function hudT(key, vars) {
+    let s = hudCat[key];
+    if (s == null) s = key;
+    if (vars && typeof s === "string") {
+      for (const [k, v] of Object.entries(vars)) s = s.replaceAll(`{${k}}`, String(v));
+    }
+    return s;
+  }
+
+  function hudReasonLabel(reason) {
+    const raw = String(reason || "").trim();
+    if (!raw) return "?";
+    const key = `hud_reason_${raw.replace(/[^a-z0-9_]/gi, "_")}`;
+    const mapped = hudCat[key];
+    return mapped != null ? mapped : raw;
+  }
+
+  async function loadHudLocale() {
+    let code = "en";
+    try {
+      const stored = await chrome.storage.local.get(["uiLocale", "uiLocaleInitialized"]);
+      if (stored.uiLocale && HUD_LOCALES.includes(stored.uiLocale)) code = stored.uiLocale;
+      else if (!stored.uiLocaleInitialized) {
+        const raw = (chrome.i18n?.getUILanguage?.() || navigator.language || "en").toLowerCase();
+        if (raw.startsWith("zh")) code = "zh";
+        else if (raw.startsWith("ja")) code = "ja";
+      }
+    } catch (_) { /* keep en */ }
+    try {
+      const resp = await fetch(chrome.runtime.getURL(`locales/${code}.json`));
+      hudCat = await resp.json();
+      hudLocale = code;
+    } catch (_) {
+      try {
+        const resp = await fetch(chrome.runtime.getURL("locales/en.json"));
+        hudCat = await resp.json();
+        hudLocale = "en";
+      } catch (e2) { hudCat = {}; }
+    }
+  }
+
+  function clipHud(s, n = 48) {
+    const t = String(s || "").replace(/\s+/g, " ").trim();
+    if (t.length <= n) return t;
+    return `${t.slice(0, n)}…`;
+  }
+
+  function ensurePageHud() {
+    if (hudEls?.host?.isConnected) return hudEls;
+    let host = document.getElementById(HUD_ID);
+    if (!host) {
+      host = document.createElement("div");
+      host.id = HUD_ID;
+      (document.documentElement || document.body).appendChild(host);
+    }
+    const shadow = host.shadowRoot || host.attachShadow({ mode: "open" });
+    shadow.innerHTML = `
+      <style>
+        :host { all: initial; }
+        .bar {
+          position: fixed; left: 0; right: 0; bottom: 0; z-index: 2147483646;
+          display: flex; align-items: center; gap: 12px;
+          min-height: 32px; padding: 4px 12px;
+          box-sizing: border-box;
+          font: 12px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif;
+          color: #171717; background: #ffffff;
+          border-top: 1px solid #eaeaea;
+        }
+        .cfg { color: #4d4d4d; flex: 1 1 46%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .last { color: #171717; flex: 1 1 54%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
+        .bar.pending .last { color: #aa4d00; }
+        .bar.ok .last { color: #107d32; }
+        .bar.err .last { color: #d8001b; }
+        .bar.off .cfg { color: #8f8f8f; }
+      </style>
+      <div class="bar" part="bar">
+        <div class="cfg"></div>
+        <div class="last"></div>
+      </div>
+    `;
+    hudEls = {
+      host,
+      bar: shadow.querySelector(".bar"),
+      cfg: shadow.querySelector(".cfg"),
+      last: shadow.querySelector(".last"),
+    };
+    return hudEls;
+  }
+
+  function liftComposer(px) {
+    try {
+      const ta = document.querySelector("#prompt-textarea");
+      const form = ta?.closest("form");
+      if (form) form.style.paddingBottom = `${px}px`;
+    } catch (_) { /* ignore */ }
+    try { document.documentElement.style.paddingBottom = `${px}px`; } catch (_) { /* ignore */ }
+  }
+
+  function paintPageHud(view) {
+    const ui = ensurePageHud();
+    liftComposer(36);
+    if (view.hud) hudCache = view.hud;
+    const hud = view.hud || hudCache;
+    if (view.pending === true) hudPending = true;
+    if (view.pending === false) hudPending = false;
+    const pending = hudPending;
+
+    const parts = [`v${(hud && hud.version) || H2W_CONTENT_VERSION}`];
+    if (hud) {
+      parts.push(hud.enabled === false ? hudT("hud_wake_off") : hudT("hud_wake_on"));
+      if (hud.bound) parts.push(hudT("hud_bound", { name: hud.workspace_label || hud.workspace_id || "?" }));
+      else parts.push(hudT("hud_unbound"));
+      if (hud.llmConfigured) {
+        const model = hud.llmModel || "on";
+        parts.push(hudT("hud_llm", { model: hud.llmHost ? `${model} @ ${hud.llmHost}` : model }));
+      } else {
+        parts.push(hudT("hud_llm_off"));
+      }
+      parts.push(hud.idleNudgeEnabled === false ? hudT("hud_nudge_off") : hudT("hud_nudge_on"));
+      parts.push(hudT("hud_cooldown", { sec: String(hud.progressTickSec || 0) }));
+    } else {
+      parts.push(hudT("hud_loading"));
+    }
+    ui.cfg.textContent = parts.join(" · ");
+    ui.cfg.setAttribute("lang", hudLocale);
+
+    let lastText = hudT("hud_last_none");
+    let kind = hud && hud.bound && hud.llmConfigured ? "" : "off";
+    if (pending) {
+      lastText = hudT("hud_last_pending");
+      kind = "pending";
+    } else if (hud?.last) {
+      const ago = Math.max(0, Math.round((Date.now() - (hud.last.at || 0)) / 1000));
+      const bits = [hudT("hud_last", { reason: hudReasonLabel(hud.last.reason), ago: String(ago) })];
+      if (hud.last.raw) bits.push(hudT("hud_raw", { text: clipHud(hud.last.raw) }));
+      if (hud.last.send) bits.push(hudT("hud_send", { text: clipHud(hud.last.send) }));
+      if (hud.last.error) bits.push(clipHud(hud.last.error));
+      lastText = bits.join(" · ");
+      kind = hud.last.nudged ? "ok" : "";
+      if (hud.last.reason === "llm_done") kind = "";
+      else if (String(hud.last.reason || "").includes("timeout") || String(hud.last.reason || "").startsWith("llm_http") || hud.last.reason === "unbound") kind = "err";
+    }
+    ui.last.textContent = lastText;
+    ui.last.setAttribute("lang", hudLocale);
+    ui.bar.className = `bar${kind ? " " + kind : ""}`;
+    ui.bar.setAttribute("lang", hudLocale);
+  }
+
+  async function refreshPageHud() {
+    if (!runtimeAlive()) return;
+    const hud = await sendBg({ type: "h2w_page_hud", convKey: ADAPTER.getConversationKey() });
+    paintPageHud({ hud: hud && hud.ok ? hud : null });
+  }
+
+  function startPageHud() {
+    void (async () => {
+      await loadHudLocale();
+      paintPageHud({ pending: false });
+      void refreshPageHud();
+    })();
+    setInterval(() => { void refreshPageHud(); }, 5000);
+    try {
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== "local" || !changes.uiLocale) return;
+        void (async () => {
+          await loadHudLocale();
+          paintPageHud({});
+        })();
+      });
+    } catch (_) { /* ignore */ }
+  }
 })();

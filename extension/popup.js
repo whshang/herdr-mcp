@@ -1,6 +1,8 @@
-// popup.js — 绑定/状态 UI
+// popup.js — bind UI: workspace label + pane stats (incl. agentless terminals)
+import { detectOrLoadLocale, t, onLocaleReady } from "./i18n.js";
+
 const $ = (id) => document.getElementById(id);
-const STATUS_COLOR = { idle: "#9ca3af", working: "#d97706", done: "#16a34a", blocked: "#dc2626", unknown: "#6b7280" };
+const STATUS_COLOR = { idle: "#9ca3af", working: "#d97706", done: "#16a34a", blocked: "#dc2626", unknown: "#6b7280", terminal: "#6b7280" };
 
 async function bg(msg) {
   return new Promise((resolve) => {
@@ -13,104 +15,240 @@ async function bg(msg) {
 
 async function activeTab() {
   return new Promise((resolve) => {
-    chrome.tabs.query({ active: true, currentWindow: true }, (t) => resolve(t[0] || null));
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => resolve(tabs[0] || null));
   });
 }
 
 let toastTimer = null;
 function showToast(text, kind = "err") {
-  const t = $("toast");
-  t.textContent = text;
-  t.className = kind;
-  t.style.display = "block";
+  const el = $("toast");
+  el.textContent = text;
+  el.className = kind;
+  el.style.display = "block";
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.style.display = "none"; }, 5000);
+  toastTimer = setTimeout(() => { el.style.display = "none"; }, 5000);
+}
+
+/** Seconds from number input: empty → fallback; <=0 → 0 (off). */
+function parseSecInput(v, fallback) {
+  const n = Number(v);
+  if (v === "" || v === undefined || v === null) return fallback;
+  if (!Number.isFinite(n)) return fallback;
+  if (n <= 0) return 0;
+  return Math.min(Math.floor(n), 86400);
+}
+
+function basename(p) {
+  return String(p || "").replace(/\/+$/, "").split("/").filter(Boolean).pop() || "";
+}
+
+function workspaceMetaMap(workspaces) {
+  const m = new Map();
+  for (const w of workspaces || []) {
+    if (w?.id) m.set(w.id, w);
+  }
+  return m;
+}
+
+/** Group panes by workspace (agents alone miss agentless terminals). */
+function groupPanesByWorkspace(panes, agents, workspaces) {
+  const map = new Map();
+  const ensure = (ws) => {
+    if (!map.has(ws)) map.set(ws, { panes: [], agents: [] });
+    return map.get(ws);
+  };
+  for (const w of workspaces || []) {
+    if (w?.id) ensure(w.id);
+  }
+  for (const p of panes || []) {
+    const ws = p.workspace || (typeof p.id === "string" && p.id.includes(":") ? p.id.split(":")[0] : null);
+    if (!ws) continue;
+    ensure(ws).panes.push(p);
+  }
+  for (const a of agents || []) {
+    const ws = a.workspace || (typeof a.pane === "string" && a.pane.includes(":") ? a.pane.split(":")[0] : null);
+    if (!ws) continue;
+    ensure(ws).agents.push(a);
+  }
+  return map;
+}
+
+function titleForWorkspace(wsId, meta) {
+  const label = (meta?.label || "").trim();
+  if (label) return `${label} (${wsId})`;
+  const roots = meta?.roots || [];
+  const folders = [];
+  for (const r of roots) {
+    const b = basename(r);
+    if (b && !folders.includes(b)) folders.push(b);
+  }
+  if (folders.length) return `${folders.slice(0, 2).join("+")} (${wsId})`;
+  return wsId;
+}
+
+function summarize(group) {
+  const panes = group.panes || [];
+  const agents = group.agents || [];
+  const working = agents.filter((a) => a.status === "working").length
+    || panes.filter((p) => p.agent?.status === "working").length;
+  const withAgent = panes.filter((p) => p.agent?.name).length;
+  const terminalOnly = Math.max(0, panes.length - withAgent);
+  return {
+    paneCount: panes.length || agents.length,
+    working,
+    terminalOnly,
+  };
+}
+
+function sessionBindingMap(sessionBindings) {
+  const m = new Map();
+  for (const b of sessionBindings || []) {
+    if (b?.workspace_id) m.set(b.workspace_id, b);
+  }
+  return m;
+}
+
+function applyStaticI18n() {
+  document.title = t("popup_title");
+  document.querySelectorAll("[data-i18n]").forEach((el) => {
+    const key = el.getAttribute("data-i18n");
+    if (key) el.textContent = t(key);
+  });
+  const opts = $("openOptions");
+  if (opts) opts.textContent = t("options_link");
+}
+
+async function bindWorkspace(tab, ws, group, meta, title) {
+  if (!tab?.id) return;
+  const sample = (group.agents || []).find((a) => a.status === "working")
+    || (group.panes || []).find((p) => p.agent?.status === "working")
+    || (group.panes || [])[0]
+    || (group.agents || [])[0];
+  const paneId = sample?.pane || sample?.id || null;
+  const agentName = sample?.name || sample?.agent?.name || null;
+  const r = await bg({
+    type: "h2w_bind",
+    tabId: tab.id,
+    workspace_id: ws,
+    workspace_label: title,
+    workspace_label_raw: meta?.label || null,
+    roots: meta?.roots || [],
+    pane: paneId,
+    agent: agentName,
+  });
+  if (r?.ok) {
+    showToast(`✓ ${t("bound")} ${r.workspace_label || title}`, "ok");
+    refresh();
+  } else if (r?.error === "conversation-unavailable") {
+    showToast(t("bind_need_chat"));
+  } else if (r?.error === "already-bound") {
+    showToast(t("already_bound_ws"));
+  } else {
+    showToast(`${t("bind_failed")}: ${r?.error || "?"}`);
+  }
 }
 
 async function refresh() {
+  applyStaticI18n();
   const tab = await activeTab();
   const st = await bg({ type: "h2w_state", tabId: tab?.id }) || {};
-  const agents = await bg({ type: "h2w_agents" });
+  const agentsResp = await bg({ type: "h2w_agents" });
+  const wsMeta = workspaceMetaMap(agentsResp?.workspaces);
+  const groups = groupPanesByWorkspace(agentsResp?.panes, agentsResp?.agents, agentsResp?.workspaces);
+  const boundByWs = sessionBindingMap(st.sessionBindings);
 
-  // 服务状态
   const srv = $("srvStatus");
-  if (agents?.ok) {
-    srv.innerHTML = `<span class="ok">● 在线</span> <span class="muted">${agents.agents?.length || 0} agents</span>`;
-  } else if (agents?.status === 401) {
-    srv.innerHTML = `<span class="err">● 401 token 不匹配</span>`;
-    $("convActions").innerHTML = `<div class="err">选项页里填的 token 与服务器不符。终端运行 <code>herdr-mcp token</code> 复制后粘贴。</div>
-      <div style="margin-top:6px"><button id="openOptsBtn">打开选项页</button></div>`;
+  if (agentsResp?.ok) {
+    const nWs = groups.size;
+    const nPanes = [...groups.values()].reduce((n, g) => n + (g.panes?.length || 0), 0);
+    srv.innerHTML = `<span class="ok">● ${t("online")}</span> <span class="muted">${nWs} · ${nPanes}p</span>`;
+  } else if (agentsResp?.status === 401) {
+    srv.innerHTML = `<span class="err">● 401</span>`;
+    $("agents").innerHTML = `<div class="err">${t("token_mismatch")}</div>
+      <div style="margin-top:4px"><button id="openOptsBtn">${t("open_options")}</button></div>`;
     $("openOptsBtn")?.addEventListener("click", () => chrome.runtime.openOptionsPage());
+    return;
   } else {
-    srv.innerHTML = `<span class="err">● 不可达${agents?.status ? ` (HTTP ${agents.status})` : agents?.error ? ` (${agents.error})` : ""}</span>`;
+    srv.innerHTML = `<span class="err">● ${t("unreachable")}${agentsResp?.status ? ` (${agentsResp.status})` : ""}</span>`;
   }
   $("enabled").checked = !!st.config?.enabled;
-
-  // 当前会话
-  const conv = $("convInfo"), actions = $("convActions");
-  if (st.convInfo) {
-    conv.textContent = `${st.convInfo.site} · ${st.convInfo.convKey}`;
-    if (st.binding) {
-      actions.innerHTML = `<div class="row"><span>已绑定 <b>${st.binding.pane}</b> <span class="dot" style="background:${STATUS_COLOR[st.binding.status] || "#6b7280"}"></span>${st.binding.status || ""}</span>
-        <button class="danger" id="unbindBtn">解绑</button></div>`;
-      $("unbindBtn").addEventListener("click", async () => {
-        await bg({ type: "h2w_unbind", convKey: st.convInfo.convKey });
-        refresh();
-      });
+  $("idleNudgeEnabled").checked = st.config?.idleNudgeEnabled !== false;
+  $("progressTickSec").value = String(st.config?.progressTickSec ?? 60);
+  const llmEl = $("llmJudgeStatus");
+  if (llmEl) {
+    const cfgOn = !!st.config?.llmJudgeConfigured;
+    const last = st.idleNudgeLast;
+    if (!cfgOn) {
+      llmEl.textContent = t("llm_status_off");
+    } else if (!last) {
+      llmEl.textContent = t("llm_status_ready");
     } else {
-      actions.innerHTML = `<button id="bindBtn" class="primary" disabled>绑定 (先选 agent)</button>`;
+      const ago = Math.max(0, Math.round((Date.now() - (last.at || 0)) / 1000));
+      const raw = last.raw != null ? ` raw=${JSON.stringify(String(last.raw)).slice(0, 32)}` : "";
+      llmEl.textContent = t("llm_status_last", { reason: last.reason || "?", ago: String(ago) }) + raw;
     }
-  } else {
-    conv.textContent = "当前标签页不是支持的会话页";
-    actions.innerHTML = `<div class="hintbox">请先在 <b>z.ai / DeepSeek / Claude / ChatGPT</b> 打开一个对话页,再点扩展图标绑定。
-      当前 tab: ${(tab && tab.url || "?").slice(0, 60)}</div>`;
   }
 
-  // agents 列表
+  const conv = $("convInfo");
+  if (st.convInfo) {
+    const short = st.convInfo.convKey.replace(/^https?:\/\//, "");
+    conv.textContent = `${st.convInfo.site} · ${short}`;
+  } else {
+    conv.innerHTML = `<span class="err">${t("unsupported_tab")}</span>
+      <div class="hintbox">${t("open_supported_chat")}
+      <div class="muted">${(tab && tab.url || "?").slice(0, 72)}</div></div>`;
+  }
+
   const box = $("agents");
-  if (!agents?.ok || !agents.agents?.length) {
-    box.textContent = agents?.error || "无 agent (herdr 没在跑?)";
+  if (!agentsResp?.ok) {
+    box.textContent = agentsResp?.error || t("no_herdr");
+  } else if (!groups.size) {
+    box.textContent = t("no_workspaces");
+  } else if (!st.convInfo) {
+    box.textContent = t("bind_need_chat");
   } else {
     box.innerHTML = "";
-    for (const a of agents.agents) {
+    const entries = [...groups.entries()].sort(([a], [b]) => {
+      const ab = boundByWs.has(a) ? 0 : 1;
+      const bb = boundByWs.has(b) ? 0 : 1;
+      if (ab !== bb) return ab - bb;
+      return titleForWorkspace(a, wsMeta.get(a)).localeCompare(titleForWorkspace(b, wsMeta.get(b)));
+    });
+    for (const [ws, group] of entries) {
+      const meta = wsMeta.get(ws);
+      const title = titleForWorkspace(ws, meta);
+      const sum = summarize(group);
+      const bound = boundByWs.get(ws);
       const row = document.createElement("div");
-      row.className = "agent";
-      const name = a.name || "(unnamed)";
-      row.innerHTML = `<span class="dot" style="background:${STATUS_COLOR[a.status] || "#6b7280"}"></span><b>${name}</b> <span class="muted">${a.pane}</span>
-        <div class="meta">${a.status} · ${(a.cwd || "").split("/").slice(-2).join("/")}</div>`;
-      row.addEventListener("click", async () => {
-        if (!tab?.id) return;
-        const r = await bg({ type: "h2w_bind", tabId: tab.id, pane: a.pane, agent: name, workspace_id: a.workspace });
-        if (r?.ok) {
-          showToast(`✓ 已绑定 ${a.pane} → 当前会话`, "ok");
+      row.className = bound ? "agent bound" : "agent";
+      const dotColor = sum.working > 0 ? STATUS_COLOR.working : STATUS_COLOR.idle;
+      const main = document.createElement("div");
+      main.className = "agent-main";
+      main.innerHTML = `<div class="title"><span class="dot" style="background:${dotColor}" title="${sum.working > 0 ? t("ws_working") : t("ws_idle")}"></span><b>${title}</b></div>
+        <div class="meta">${sum.paneCount} panes · ${sum.working} working${sum.terminalOnly ? ` · ${sum.terminalOnly} terminal` : ""}</div>`;
+      row.appendChild(main);
+      if (bound) {
+        const btn = document.createElement("button");
+        btn.className = "danger sm";
+        btn.textContent = t("unbind");
+        btn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          await bg({ type: "h2w_unbind", convKey: st.convInfo.convKey, workspace_id: ws });
           refresh();
-        } else if (r?.error === "conversation-unavailable") {
-          showToast("绑定失败: 当前标签页不是支持的会话页。\n请先在 z.ai/DeepSeek/Claude/ChatGPT 打开对话再绑定。");
-        } else if (r?.error === "already-bound") {
-          showToast("该会话已绑定其他 agent,先解绑再换");
-        } else {
-          showToast(`绑定失败: ${r?.error || "无响应"}`);
-        }
-      });
+        });
+        row.appendChild(btn);
+      } else {
+        const btn = document.createElement("button");
+        btn.className = "primary sm";
+        btn.textContent = t("bind_action");
+        btn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          await bindWorkspace(tab, ws, group, meta, title);
+        });
+        row.appendChild(btn);
+        row.addEventListener("click", () => { void bindWorkspace(tab, ws, group, meta, title); });
+      }
       box.appendChild(row);
-    }
-  }
-
-  // 已绑定列表
-  const bl = $("bindings");
-  if (!st.bindings?.length) bl.textContent = "无";
-  else {
-    bl.innerHTML = "";
-    for (const b of st.bindings) {
-      const row = document.createElement("div");
-      row.className = "row";
-      row.innerHTML = `<span><span class="dot" style="background:${STATUS_COLOR[b.status] || "#6b7280"}"></span>${b.pane} <span class="muted">→ ${b.site}</span></span>
-        <button class="danger" data-conv="${b.convKey}">解绑</button>`;
-      row.querySelector("button").addEventListener("click", async () => {
-        await bg({ type: "h2w_unbind", convKey: b.convKey });
-        refresh();
-      });
-      bl.appendChild(row);
     }
   }
 }
@@ -118,6 +256,15 @@ async function refresh() {
 $("enabled").addEventListener("change", async (e) => {
   await bg({ type: "h2w_set_config", config: { enabled: e.target.checked } });
 });
+$("idleNudgeEnabled").addEventListener("change", async (e) => {
+  await bg({ type: "h2w_set_config", config: { idleNudgeEnabled: e.target.checked } });
+});
+$("progressTickSec").addEventListener("change", async (e) => {
+  const sec = parseSecInput(e.target.value, 60);
+  e.target.value = String(sec);
+  await bg({ type: "h2w_set_config", config: { progressTickSec: sec } });
+});
 $("openOptions").addEventListener("click", (e) => { e.preventDefault(); chrome.runtime.openOptionsPage(); });
 
-refresh();
+onLocaleReady(() => { void refresh(); });
+void detectOrLoadLocale();
