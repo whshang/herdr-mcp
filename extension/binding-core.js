@@ -339,6 +339,13 @@ export function isIdleNudgeText(text) {
   return false;
 }
 
+/** True when composer text looks like an extension-injected herdr wake template. */
+export function isHerdrWakeComposerText(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+  if (!t) return false;
+  return /^herdr workspace\b/i.test(t);
+}
+
 /**
  * Whether assistant text looks like a finished prose reply (not a mid-turn tool stub).
  * Used to avoid LLM nudge while ChatGPT is still invoking tools or showing short status lines.

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "herdr → Web wake",
-  "version": "0.1.28",
+  "version": "0.1.30",
   "description": "When herdr agents settle, type into the bound web chat and submit (z.ai / DeepSeek / Claude / ChatGPT). UI: en / zh / ja.",
   "permissions": ["storage", "scripting", "alarms"],
   "host_permissions": [

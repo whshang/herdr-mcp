@@ -90,13 +90,13 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 
 改工具面或握手时 bump `SERVER_VERSION` / `package.json`，逼客户端重新 `tools/list`。
 
-当前身份：**0.3.21**。若工具描述仍缺 `herdr_fs_write.overwrite`、或看不到 `inspect.exec_sessions`：
+**不要以本文数字为准。** 以正在跑的进程 `/.well-known/mcp.json` 的 `version` 为准（应等于 `package.json` / `src/version.ts`）。对不上就重启公网进程。若工具描述仍缺 `herdr_fs_write.overwrite`、看不到 `inspect.exec_sessions`、或没有 `herdr_skill`：
 
-1. 确认公网进程已重启且 `/.well-known/mcp.json` 的 `version` 为 `0.3.21`
+1. 确认 `mcp.json` 的 `version` 已是当前构建
 2. ChatGPT 里刷新 / 重连 connector
 3. **开新对话**（旧对话会锁住旧 `tools/list` 快照）
 
-输入字段落后（尤其 `overwrite`）会导致「能建文件、不能按契约覆盖」。
+输入字段落后（尤其 `overwrite`）会导致「能建文件、不能按契约覆盖」。会话开始：`herdr_inspect` → `herdr_skill`（一次）→ 再 `herdr_call` / `herdr_prompt`。
 
 ## 「TaskGroup」/ omp 挂了却说读不了文件
 
@@ -122,6 +122,7 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 
 | 优先级 | 做法 | 本地 agent API |
 |---|---|---|
+| 0 | `herdr_inspect` 然后 `herdr_skill`（每会话一次） | 不消耗 |
 | 1 | `herdr_fs_*` / `herdr_exec` 读改搜跑 | 不消耗 |
 | 2 | `herdr_prompt` → 便宜/高速 worker（pi、flash…），任务自包含 | 只烧便宜模型 |
 | 禁止默认 | `herdr_prompt` → Claude/OMP/main 再让它指挥其他窗格 | 贵模型大头 |
@@ -148,4 +149,4 @@ Connector 只解决「ChatGPT → herdr」。若工具很快返回「已提交�
 
 ## 验收（真 ChatGPT）
 
-不要只靠 curl。连续两轮对话，且没有：Session terminated、session 400/404、`network_error`、`invalid_mcp_response`。每次重连后开新对话。派活长任务时：扩展已绑定该对话 ↔ 干活 pane，settled 后网页应自动出现继续提示。
+不要只靠 curl。连续两轮对话，且没有：Session terminated、session 400/404、`network_error`、`invalid_mcp_response`。每次重连后开新对话。派活长任务时：扩展已绑定该对话 ↔ 干活的 **workspace**，working 中有进度、settled 后网页应自动出现继续提示。

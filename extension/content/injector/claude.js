@@ -38,17 +38,25 @@ class ClaudeAdapter extends BaseAdapter {
   }
 
   // Send button chain; wake.js falls back to Enter when none matches.
-  getSendButton() {
+  getSendButtonCandidates() {
     const chains = [
       'button[data-testid="send-button"]',
       'button[aria-label*="Send" i]',
       'button[aria-label*="发送"]',
+      'button[type="submit"]',
     ];
+    const seen = new Set();
+    const out = [];
     for (const sel of chains) {
-      const el = document.querySelector(sel);
-      if (el && !el.disabled) return el;
+      for (const el of document.querySelectorAll(sel)) {
+        if (!seen.has(el)) { seen.add(el); out.push(el); }
+      }
     }
-    return null;
+    return out;
+  }
+
+  getSendButton() {
+    return this.getSendButtonCandidates()[0] || null;
   }
 
   // Conversation identity uses host plus pathname for chat and project chat URLs.

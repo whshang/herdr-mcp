@@ -1,7 +1,7 @@
 {
   "name": "herdr-mcp",
   "version": "0.3.26",
-  "description": "Expose herdr as a lean MCP tool surface for ChatGPT Connector / Claude / other web LLMs",
+  "description": "Lean MCP HTTP gateway: ChatGPT Connector / Cursor drive local Herdr plus gated fs/git/exec; Chrome extension wakes the web chat",
   "type": "module",
   "main": "dist/server.js",
   "bin": {

@@ -11,15 +11,18 @@
 
 herdr-mcp **不会** 把每个 herdr 方法都做成 MCP 工具。那会烧上下文，也重复原生 schema。
 
-## 默认工具面（17）
+## 默认工具面（18）
+
+MCP 工具面是**固定的**；live herdr schema 只服务 `herdr_methods` / `herdr_call`。0.3.17 起默认 17 个；**0.3.26** 增加只读 `herdr_skill`，现为 18。
 
 | 层 | 工具 | 说明 |
 |---|---|---|
+| 技能 | `herdr_skill` | 本机进程拉上游 Herdr `SKILL.md`（master，非钉版本）；失败用 `assets/herdr-agent-SKILL.md`。ChatGPT 不访问 GitHub。 |
 | 透传 | `herdr_methods`、`herdr_call` | 反射并调用原生 socket 方法 |
 | 远程编排 | `herdr_inspect`、`herdr_since`、`herdr_prompt` | 适合聊天型客户端的一瞥 / 续读 / 投递提示 |
 | 远程工作站 | `herdr_fs_*`、`herdr_exec` / `herdr_exec_*`、`herdr_git` | **不是** herdr 能力 — 远程客户端本身没有磁盘 |
 
-`HERDR_MCP_ALL_TOOLS=1` 会加上高级/废弃生命周期工具（`herdr_wait`、`herdr_reap`、session 等）。给 ChatGPT 时建议关掉以省上下文。
+`HERDR_MCP_ALL_TOOLS=1` 会加上高级/废弃生命周期工具（`herdr_wait`、`herdr_reap`、session 等，共 30）。给 ChatGPT 时建议关掉以省上下文。会话开始：`herdr_inspect` → `herdr_skill`（一次）→ 干活。
 
 ## 设计规则
 
@@ -29,7 +32,7 @@ herdr-mcp **不会** 把每个 herdr 方法都做成 MCP 工具。那会烧上�
 4. **版本是缓存键** — 工具面或握手语义变了就 bump `src/version.ts` + `package.json`。
 5. **网页主编排** — 规划与调度在网页模型；本机优先 `herdr_fs_*` / `herdr_exec`；需要 agent 时直接打便宜 worker，禁止本机 Claude/OMP/main 当中间指挥。
 6. **Agent 软隐藏** — `herdr_inspect` / `herdr_since` 默认只列出执行 agent（`pi`/`cline`/`opencode`/`anti`）与审计（`droid`/`grok`）；Claude/OMP/Codex 不出现在列表。`herdr_prompt` **不拦**。`HERDR_MCP_AGENT_ALLOW=*` 显示全部；逗号名单可覆盖默认。
-7. **默认 17 工具** — `HERDR_MCP_ALL_TOOLS=1` 时 30；`inspect` 含 `boot_id` + `exec_sessions`；`HERDR_MCP_READONLY=1` 挡住含 `herdr_prompt` 在内的 mutation（`herdr_fs_patch` 的 `dry_run` 除外）。
+7. **默认 18 工具** — `HERDR_MCP_ALL_TOOLS=1` 时 30；`inspect` 含 `boot_id` + `exec_sessions` + `agent_skill` 指针；`HERDR_MCP_READONLY=1` 挡住含 `herdr_prompt` 在内的 mutation（`herdr_fs_patch` 的 `dry_run` 除外）。
 8. **工作站稳健性（≥0.3.17）** — `commitAtomic` 失败会删掉本次新增文件；exec journal 仅杀掉仍带 `HERDR_MCP_EXEC_ID` 的孤儿；`exec_read stream=both` 按写入顺序交错；`fs_read` 字节截断只返回完整行。
 9. **`herdr_exec` 控制面降级（≥0.3.18）** — utility 窗格在 `send_text` **之前**若连续撞 TaskGroup，自动改本地 zsh（`backend:local_fallback`）；一旦已投递则绝不重发、也不降级（避免双跑）。
 10. **`herdr_git` 本机降级（≥0.3.20）** — `session.snapshot` / managed-roots 闸门因 TaskGroup 不可用时，对 `$HOME`（或 `HERDR_MCP_WRITE_ROOTS`）下的真实 git 根仍直接跑本地 `git`（带 `warnings`）；`pane.read` 等只读 RPC 对 TaskGroup 透明重试加长到最多 4 次尝试。
@@ -53,9 +56,9 @@ herdr-mcp **不会** 把每个 herdr 方法都做成 MCP 工具。那会烧上�
 
 典型现象：agent 仍在 `working`，但 `inspect` / `since` / `pane.read` / `fs_*` 间歇返回失败；几秒后同样请求又成功。根因在 herdr daemon 的并发聚合（snapshot / events.subscribe / socket 重连），某个 child task 抛错时未隔离，整次 RPC 被包成裸 `ExceptionGroup`。
 
-### 本机 watchdog（A+B，≥0.3.22）
+### 本机 watchdog（macOS LaunchAgent，≥0.3.22，随 0.3.26 发布）
 
-`herdr-mcp watchdog install` 注册 LaunchAgent（默认每 120s）：
+`herdr-mcp watchdog install` 注册 LaunchAgent（默认每 120s）。Linux / Windows 没有等价 CLI。
 
 - MCP 进程没了或本机 `/mcp` 非 200/401：连续失败达到阈值后 `herdr-mcp restart`（默认冷却 10 分钟，**无每日次数上限**）
 - `agent.list` / `workspace.list` 撞 TaskGroup 或 socket 缺失：**只记日志**，不重启 herdr daemon，也不重发 `herdr_prompt`
@@ -87,12 +90,41 @@ herdr-mcp 侧（≥0.3.12，exec 降级 ≥0.3.18）能做的：
 ## 传输
 
 - MCP：`/mcp` 上的 `POST/GET/DELETE`（ChatGPT 探测还会用 issuer 根 `/` 别名）
-- 鉴权：OAuth JWT（connector）或静态 `HERDR_MCP_TOKEN`（Cursor/curl）
-- 推送（扩展）：`GET /push/events` SSE — 与 MCP 同一 Bearer
+- 鉴权：OAuth JWT（connector）或静态 `HERDR_MCP_TOKEN`（Cursor / curl / 扩展）。不要把静态 token 贴进 ChatGPT connector UI。
+- 推送（扩展，同一 Bearer）：
+  - `GET /push/events` SSE（可 `?workspace=`）
+  - `GET /push/state` 当前 agent / workspace / pane 快照
+  - `GET /push/mcp-activity` 最近 `tools/call` 计数（进程内环形缓冲；当前扩展催促走小模型判定，不再用「零工具」启发式）
+
+## Environment variables
+
+环境变量。plist 示例里的 `HERDR_MCP_HOST` **未被** Node 进程读取；服务听在端口上，由隧道/本机回环访问。版本演进见 [CHANGELOG.md](../CHANGELOG.md)。
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `HERDR_MCP_TOKEN` | 空 | `/mcp` 与 `/push` 静态 Bearer |
+| `HERDR_MCP_PORT` | `8772` | 监听端口 |
+| `HERDR_MCP_BASE_URL` | 空 | 公网 origin，**不要** `/mcp` 后缀；OAuth `iss`/`aud` |
+| `HERDR_SOCKET_PATH` | `~/.config/herdr/herdr.sock` | herdr API socket |
+| `HERDR_MCP_READONLY` | 关 | 挡住 mutation（含 `herdr_prompt`；`fs_patch` `dry_run` 除外） |
+| `HERDR_MCP_WRITE_ROOTS` | 全部 managed root | 允许写入的根，CSV |
+| `HERDR_MCP_ALL_TOOLS` | 关 | 18 → 30 工具 |
+| `HERDR_MCP_AGENT_ALLOW` | worker + 审计 | `*` 或逗号名单；影响 inspect/since 列表，不拦 `herdr_prompt` |
+| `HERDR_MCP_STATE_DIR` | `~/.config/herdr-mcp` | exec journal / sessions |
+| `HERDR_MCP_OAUTH_DIR` | `~/.config/herdr-mcp/oauth` | JWT 密钥与 client 登记 |
+| `HERDR_MCP_OAUTH_ACCESS_TTL_S` | `86400` | access token TTL |
+| `HERDR_MCP_OAUTH_REFRESH_TTL_S` | `2592000` | refresh token TTL |
+| `HERDR_MCP_PUSH_DEBUG` | 关 | `/push` 调试日志 |
+| `HERDR_MCP_BUILD_COMMIT` / `HERDR_MCP_BUILT_AT` | `dev` / 启动时刻 | `inspect.workstation_info` |
+| `HERDR_SKILL_URL` | herdr master `SKILL.md` raw URL | `herdr_skill` 上游 |
+| `HERDR_SKILL_CACHE_SEC` | `3600` | skill 缓存 |
+| `HERDR_SKILL_FETCH_TIMEOUT_MS` | `15000` | skill 拉取超时 |
+| `HERDR_SKILL_NETWORK` | 开 | `0` = 只用内置副本 |
 
 ## 相关文档
 
-- [extension.md](./extension.md) — 扩展双主线总览
+- [CHANGELOG.md](../CHANGELOG.md) — 版本与工具面
+- [extension.md](./extension.md) — 扩展总览（A 已可用，B 未完成）
 - [chatgpt-connector.md](./chatgpt-connector.md) — ChatGPT OAuth、schema、权限卡
 - [extension-wake.md](./extension-wake.md) — 主线 A：进度回推（检查间隔 + 新摘要才发 + 可配置兜底）
-- [extension-bridge.md](./extension-bridge.md) — 主线 B：JSON→MCP
+- [extension-bridge.md](./extension-bridge.md) — 主线 B：JSON→MCP（解析有、闭环无）

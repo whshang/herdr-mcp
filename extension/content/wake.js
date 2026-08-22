@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.28";
+const H2W_CONTENT_VERSION = "0.1.30";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -63,45 +63,192 @@ const H2W_CONTENT_VERSION = "0.1.28";
     return mainWorldCommitted(text);
   }
 
+  function isHerdrWakeComposerText(text) {
+    const t = normText(text);
+    return t.length > 0 && /^herdr workspace\b/i.test(t);
+  }
+  function composerTextRaw() {
+    const el = ADAPTER.getInputEl();
+    if (!el) return "";
+    if (el.value != null && el.tagName !== "DIV") return String(el.value);
+    return String(el.innerText || el.textContent || "");
+  }
+  function composerNorm() { return normText(composerTextRaw()); }
+  function composerHasSameWake(text) {
+    const n = normText(text);
+    const cur = composerNorm();
+    if (!cur || !n) return false;
+    if (ADAPTER.needsMainWorldInsert && mainWorldCommitted(text)) return true;
+    return cur.includes(n.slice(0, 80)) || n.includes(cur.slice(0, 80));
+  }
+  function isExtensionStaleComposer(curNorm) {
+    if (!curNorm) return false;
+    if (isHerdrWakeComposerText(curNorm)) return true;
+    if (lastFailedWakeNorm) {
+      const fail = lastFailedWakeNorm.slice(0, 80);
+      const cur = curNorm.slice(0, 80);
+      if (cur.includes(fail) || fail.includes(cur)) return true;
+    }
+    return false;
+  }
+  async function clearComposer() {
+    if (ADAPTER.needsMainWorldInsert) {
+      const selector = ADAPTER.getWatchMainWorldSelector();
+      if (selector) await insertMainWorld("", selector);
+      return;
+    }
+    const el = ADAPTER.getInputEl();
+    if (!el) return;
+    if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
+      const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+      setter.call(el, "");
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  }
+
+  function elementVisible(el) {
+    if (typeof ADAPTER.elementVisible === "function") return ADAPTER.elementVisible(el);
+    return !!(el && el.offsetParent);
+  }
+
   function sendButtonReady(btn) {
-    if (!btn || !btn.offsetParent) return false;
+    if (!btn || !elementVisible(btn)) return false;
     if (btn.disabled) return false;
     if (btn.getAttribute("aria-disabled") === "true") return false;
     if (btn.getAttribute("data-disabled") === "true") return false;
     return true;
   }
 
+  function isSendButton(btn) {
+    if (!sendButtonReady(btn)) return false;
+    const blob = [
+      btn.getAttribute("data-testid") || "",
+      btn.getAttribute("aria-label") || "",
+      btn.innerText || "",
+    ].filter(Boolean).join(" ");
+    if (/stop|停止|generating|生成中|streaming|cancel/i.test(blob)) return false;
+    return /send|发送|submit|prompt/i.test(blob) || /send-button|composer-send/i.test(blob);
+  }
+
+  function findSendButton() {
+    const list = typeof ADAPTER.getSendButtonCandidates === "function"
+      ? ADAPTER.getSendButtonCandidates()
+      : [];
+    if (!list.length && typeof ADAPTER.getSendButton === "function") {
+      const one = ADAPTER.getSendButton();
+      if (one) list.push(one);
+    }
+    for (const btn of list) {
+      if (isSendButton(btn)) return btn;
+    }
+    return null;
+  }
+
+  function dispatchEnterSubmit(el) {
+    if (!el) return;
+    el.focus();
+    for (const type of ["keydown", "keypress", "keyup"]) {
+      el.dispatchEvent(new KeyboardEvent(type, {
+        key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true,
+      }));
+    }
+  }
+
+  async function waitForComposerIdle(maxMs = 12000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < maxMs) {
+      if (!isComposerGenerating()) return true;
+      await wait(300);
+    }
+    return !isComposerGenerating();
+  }
+
   // ---- Submission ----
   // For contenteditable sites, wait for an enabled send button because ProseMirror
   // often consumes synthetic keyboard events. Success requires the composer to clear.
-  async function submit() {
-    if (ADAPTER.needsMainWorldInsert) {
-      await wait(350); // Let the editor model process insertText and enable Send.
-      for (let i = 0; i < 20; i++) {
-        const btn = ADAPTER.getSendButton();
-        if (sendButtonReady(btn)) {
-          btn.click();
-          for (let j = 0; j < 15; j++) {
-            await wait(200);
-            if (!ADAPTER.inputHasContent()) return true;
-          }
-          // The composer still has content, so retry or switch strategy.
-          console.warn("[h2w] composer still has content after Send; retrying");
-        }
-        await wait(150);
-      }
-      const el = ADAPTER.getInputEl();
-      if (!el) return false;
-      el.focus();
-      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true, cancelable: true }));
-      el.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true, cancelable: true }));
-      for (let j = 0; j < 10; j++) {
+  async function submitAfterPermissionClick() {
+    if (!lastPermClickAt || Date.now() - lastPermClickAt > 6000) return false;
+    await wait(1200);
+    await waitForComposerIdle(4000);
+    const btn = findSendButton();
+    if (isSendButton(btn)) {
+      btn.click();
+      for (let j = 0; j < 20; j++) {
         await wait(200);
         if (!ADAPTER.inputHasContent()) return true;
       }
+    }
+    dispatchEnterSubmit(ADAPTER.getInputEl());
+    for (let j = 0; j < 15; j++) {
+      await wait(200);
+      if (!ADAPTER.inputHasContent()) return true;
+    }
+    return false;
+  }
+
+  async function submitTextarea() {
+    await waitForComposerIdle();
+    await wait(420);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const btn = findSendButton();
+      if (isSendButton(btn)) {
+        btn.click();
+        for (let j = 0; j < 20; j++) {
+          await wait(200);
+          if (!ADAPTER.inputHasContent()) return true;
+        }
+      }
+      dispatchEnterSubmit(ADAPTER.getInputEl());
+      for (let j = 0; j < 15; j++) {
+        await wait(200);
+        if (!ADAPTER.inputHasContent()) return true;
+      }
+      if (attempt < 2) {
+        console.warn(`[h2w] textarea submit attempt ${attempt + 1} failed; retrying`);
+        await wait(800);
+        await waitForComposerIdle(4000);
+      }
+    }
+    return submitAfterPermissionClick();
+  }
+
+  async function submit() {
+    if (ADAPTER.needsMainWorldInsert) {
+      await waitForComposerIdle();
+      const postInsertMs = Math.min(1200, 350 + Math.floor((ADAPTER.getInputEl()?.innerText?.length || 0) / 40) * 50);
+      await wait(postInsertMs);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        for (let i = 0; i < 40; i++) {
+          const btn = findSendButton();
+          if (isSendButton(btn)) {
+            btn.click();
+            for (let j = 0; j < 20; j++) {
+              await wait(200);
+              if (!ADAPTER.inputHasContent()) return true;
+            }
+            console.warn("[h2w] composer still has content after Send click; retrying");
+            break;
+          }
+          await wait(150);
+        }
+        const el = ADAPTER.getInputEl();
+        dispatchEnterSubmit(el);
+        for (let j = 0; j < 15; j++) {
+          await wait(200);
+          if (!ADAPTER.inputHasContent()) return true;
+        }
+        if (attempt < 2) {
+          console.warn(`[h2w] submit attempt ${attempt + 1} failed; retrying`);
+          await wait(800);
+          await waitForComposerIdle(4000);
+        }
+      }
+      const afterPerm = await submitAfterPermissionClick();
+      if (afterPerm) return true;
       return false;
     }
-    return ADAPTER.send();
+    return submitTextarea();
   }
 
   // ---- Auto-allow in-page permission dialogs and tool cards ----
@@ -112,10 +259,12 @@ const H2W_CONTENT_VERSION = "0.1.28";
   let permClicker = null;
   let permObs = null;
   let permDeadline = 0;
+  let lastPermClickAt = 0;
   function permissionTryClick() {
     if (!runtimeAlive() || Date.now() > permDeadline) { permissionStop(); return; }
     const r = permClicker.tryClick(document);
     if (r.handled) {
+      lastPermClickAt = Date.now();
       console.log(`[h2w] auto-clicked permission action "${(r.button.innerText || r.button.textContent || "?").trim()}"`);
     }
   }
@@ -150,6 +299,16 @@ const H2W_CONTENT_VERSION = "0.1.28";
   let wakeInFlight = false;
   let lastWakeNorm = "";
   let lastWakeAt = 0;
+  let lastFailedWakeNorm = "";
+  function noteWakeResult(textNorm, sent) {
+    if (sent) {
+      lastWakeNorm = textNorm;
+      lastWakeAt = Date.now();
+      lastFailedWakeNorm = "";
+    } else if (textNorm) {
+      lastFailedWakeNorm = textNorm;
+    }
+  }
   async function performWake(data) {
     if (!runtimeAlive()) return { ok: false, error: "context-invalidated" };
     if (wakeInFlight) return { ok: false, blocked: "wake-in-flight" };
@@ -160,22 +319,35 @@ const H2W_CONTENT_VERSION = "0.1.28";
     if (n && n === lastWakeNorm && Date.now() - lastWakeAt < 8000) {
       return { ok: false, blocked: "dedupe" };
     }
+    let resumeOnly = false;
+    let clearBeforeInsert = false;
     if (ADAPTER.inputHasContent() && !data.llmNudge) {
-      // If the composer already contains this message, submit without reinserting.
-      if (mainWorldCommitted(text) || normText((ADAPTER.getInputEl()?.innerText || ADAPTER.getInputEl()?.textContent || "")).includes(n.slice(0, 80))) {
-        wakeInFlight = true;
-        try {
-          if (data.autoAllow !== false) startPermissionWatch();
-          const sent = await submit();
-          if (sent) { lastWakeNorm = n; lastWakeAt = Date.now(); }
-          return { ok: sent, committed: true, resumed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
-        } finally { wakeInFlight = false; }
+      if (composerHasSameWake(text)) {
+        resumeOnly = true;
+      } else if (isExtensionStaleComposer(composerNorm())) {
+        clearBeforeInsert = true;
+      } else {
+        return { ok: false, blocked: "user-typing" };
       }
-      return { ok: false, blocked: "user-typing" };
     }
     wakeInFlight = true;
     try {
       if (data.autoAllow !== false) startPermissionWatch();
+
+      if (resumeOnly) {
+        const sent = await submit();
+        noteWakeResult(n, sent);
+        return { ok: sent, committed: true, resumed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+      }
+
+      if (clearBeforeInsert) await clearComposer();
+
+      if (ADAPTER.needsMainWorldInsert) {
+        const idle = await waitForComposerIdle(15000);
+        if (!idle) {
+          return { ok: false, error: "composer-busy", blocked: "generating" };
+        }
+      }
 
       let committedOk = false;
       if (ADAPTER.needsMainWorldInsert) {
@@ -189,7 +361,7 @@ const H2W_CONTENT_VERSION = "0.1.28";
           return { ok: false, error: "insert-failed" };
         }
         const sent = await submit();
-        if (sent) { lastWakeNorm = n; lastWakeAt = Date.now(); }
+        noteWakeResult(n, sent);
         return { ok: sent, committed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
       }
 
@@ -201,8 +373,8 @@ const H2W_CONTENT_VERSION = "0.1.28";
       await wait(420); // React-controlled inputs commit value asynchronously.
       const sent = await submit();
       setTimeout(() => { if (el) el.style.opacity = oldOpacity ?? ""; }, 600);
-      if (sent) { lastWakeNorm = n; lastWakeAt = Date.now(); }
-      return { ok: sent, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
+      noteWakeResult(n, sent);
+      return { ok: sent, committed: true, site: ADAPTER.name, error: sent ? undefined : "submit-failed" };
     } finally {
       wakeInFlight = false;
     }
@@ -251,7 +423,7 @@ const H2W_CONTENT_VERSION = "0.1.28";
   function isComposerGenerating() {
     if (stopButtons().length > 0) return true;
     if (assistantStreaming()) return true;
-    const send = ADAPTER.getSendButton?.();
+    const send = findSendButton();
     if (send) {
       const blob = [
         send.getAttribute("aria-label"), send.getAttribute("data-testid"), send.innerText,

@@ -16,7 +16,7 @@ import {
   DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
 } from "./binding-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.28";
+const H2W_SCRIPT_VERSION = "0.1.30";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const tabVersions = new Map();
 const reloadedTabs = new Set();
@@ -432,7 +432,6 @@ async function fetchLlmJudgeOnce(userText, assistantText, cfgOverride = null) {
     model: String(cfg.llmJudgeModel).trim(),
     messages: [{ role: "user", content: prompt }],
     temperature: 0,
-    max_tokens: 64,
     stream: false,
   };
   try {

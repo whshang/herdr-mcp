@@ -25,6 +25,26 @@ class BaseAdapter {
   // MAIN-world insertion selector, overridden by contenteditable sites.
   getWatchMainWorldSelector() { return null; }
 
+  // Visible and interactable: offsetParent or fixed/sticky layout via bounding box.
+  elementVisible(el) {
+    if (!el || el.isConnected === false) return false;
+    if (el.offsetParent !== null) return true;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    try {
+      const st = getComputedStyle(el);
+      if (st.visibility === "hidden" || st.display === "none") return false;
+      if (Number(st.opacity) === 0) return false;
+    } catch (_) { return false; }
+    return true;
+  }
+
+  // Ordered send-button candidates; wake.js picks the first that passes validation.
+  getSendButtonCandidates() {
+    const one = this.getSendButton();
+    return one ? [one] : [];
+  }
+
   // Submit by focusing and dispatching Enter. Delay for React-controlled value commits.
   send() {
     const ta = this.getInputEl();

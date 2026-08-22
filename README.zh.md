@@ -1,6 +1,10 @@
 # herdr-mcp
 
-帮助网页版 SOTA 模型打通本机 [herdr](https://herdr.dev)，进入你的开发项目，调度本地 agent 协助开发。
+MCP HTTP 门面：让 ChatGPT（及其它网页模型）驱动本机 [Herdr](https://herdr.dev)——查看窗格与 agent、在托管 git 项目里读改文件、跑命令，并给便宜的本地 worker 派活。浏览器扩展再把进度 / 收工写回绑定的网页对话。
+
+[Herdr](https://herdr.dev) 是给 coding agent 用的终端复用器。本仓库给**看不到**本机 socket 和磁盘的远程客户端当门。它**不会**把 herdr 约 90 个原生方法逐个做成 MCP 工具。
+
+**本仓库不做：** 替代 herdr；给 DeepSeek 装假的 OAuth connector；让扩展走公网隧道（扩展只连 `127.0.0.1`）。
 
 **语言（与 herdr 一致）：** [English](README.md)（GitHub 默认）· [简体中文](README.zh.md) · [日本語](README.ja.md)。  
 CLI / 浏览器插件：首次安装跟系统语言（`en` / `zh` / `ja`），未知则英语。可随时改：`herdr-mcp lang`，或插件选项页 → 语言。
@@ -8,9 +12,14 @@ CLI / 浏览器插件：首次安装跟系统语言（`en` / `zh` / `ja`），�
 ## 架构（用户 ↔ 网页 ↔ MCP ↔ herdr，插件做反向通道）
 
 自上而下：你 → 网页对话 →（herdr-mcp 与 chrome-extension **同排**）→ Herdr 窗口 → 本地 Agents。  
-Agents 的进度/收工通知到 extension；extension 再 ↻ 代你往网页发「继续」。详见 [docs/extension-wake.md](docs/extension-wake.md)。
+Agents 的进度/收工通知到 extension；extension 再 ↻ 写入网页输入框。详见 [docs/extension-wake.md](docs/extension-wake.md)。
 
-**编排偏向（网页规划，本机省 API）：** 网页模型负责计划与调度。能用 `herdr_fs_*` / `herdr_exec` 就不要开本地 agent。必须推理时，直接 `herdr_prompt` 给便宜/高速 worker（pi、flash 等），不要经本机 Claude/OMP/main 再转派。`inspect`/`since` 默认软隐藏 Claude/OMP/Codex（只列 pi/cline/opencode/anti 与 droid/grok）；知道 pane 仍可 prompt。`HERDR_MCP_AGENT_ALLOW=*` 显示全部。
+**编排（网页规划，本机省 API）：**
+
+- 能用 `herdr_fs_*` / `herdr_git` / `herdr_exec` 就不要开本地 agent。
+- 必须推理时，直接 `herdr_prompt` 给便宜/高速 worker（`pi`、`flash`、`cline`、`opencode`、`anti`）或审计（`droid`、`grok`），不要经本机 Claude/OMP/main 再转派。
+- `inspect`/`since` 默认软隐藏 Claude/OMP/Codex。知道 pane 仍可 prompt。`HERDR_MCP_AGENT_ALLOW=*` 显示全部。
+- 会话开始：`herdr_inspect` → `herdr_skill`（一次）→ 干活。
 
 ```mermaid
 flowchart TB
@@ -27,14 +36,21 @@ flowchart TB
   MCP -->|打通 herdr| Herdr
   Herdr -->|派发任务| Agents
   Agents -.->|进度 / 收工通知| Ext
-  Ext -.->|代发「继续」写回| Web
+  Ext -.->|写入网页对话| Web
 ```
 
 ## 平台与启动
 
-支持系统与 [herdr](https://herdr.dev) 一致：**macOS / Linux / Windows**（Node.js 20+）。本服务不扫 herdr 安装目录，只连 API socket（默认 `~/.config/herdr/herdr.sock`，可用 `HERDR_SOCKET_PATH` 覆盖），并调用 PATH 上的 `herdr api schema`。
+**Node 服务**支持系统与 [herdr](https://herdr.dev) 一致：**macOS / Linux / Windows**（Node.js 20+）。不扫 herdr 安装目录，只连 API socket（默认 `~/.config/herdr/herdr.sock`，可用 `HERDR_SOCKET_PATH` 覆盖），并调用 PATH 上的 `herdr api schema`。
 
-启动（前台即可）：
+两种跑法：
+
+| 方式 | 适用 | 怎么做 |
+|---|---|---|
+| 前台 | 任意 OS | 下面的 `node dist/server.js` |
+| `herdr-mcp` CLI | **仅 macOS** LaunchAgent | `bin/herdr-mcp start` / `status` / `logs` / `watchdog` |
+
+`npm` 的 `bin` 是 `dist/server.js`，不是 bash CLI。macOS 可 `ln -sf …/bin/herdr-mcp ~/.local/bin/herdr-mcp`。systemd / 任务计划不在本项目范围。
 
 ```bash
 export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"   # 或沿用已有 token
@@ -43,8 +59,6 @@ export HERDR_MCP_PORT=8772
 # export HERDR_MCP_BASE_URL=https://xxxx.trycloudflare.com
 node dist/server.js
 ```
-
-自启、systemd、任务计划等由你自行决定，不是本项目范围。macOS 上可选软链 `bin/herdr-mcp` 做 `status` / `logs` 等辅助；核心始终是上面的 Node 进程。
 
 ## 安装（从零到可用）
 
@@ -112,11 +126,11 @@ MCP 服务**不能**在 ChatGPT 桌面/App 的聊天里添加，只能走**网�
 
 #### 模型额度
 
-免费 ChatGPT 只能用 **GPT-5.5-mini**。Plus 或更高档位可在聊天里近乎无限量地用更高等级模型，经 connector 操作本机项目。
+免费 ChatGPT 只能用 **GPT-5.5-mini**。Plus 或更高档位可在聊天里用更高等级模型，经 connector 操作本机项目。
 
-Quick Tunnel 每次重启 `cloudflared` 子域会变，变了就更新 `HERDR_MCP_BASE_URL` 再 `herdr-mcp restart`。稳定主机名可用 Cloudflare 命名隧道或自有域名。
+Quick Tunnel 每次重启 `cloudflared` 子域会变，变了就更新 `HERDR_MCP_BASE_URL` 再重启 MCP。稳定主机名可用 Cloudflare 命名隧道或自有域名。
 
-### 6. Cursor（可选，本机）
+### 4. Cursor（可选，本机）
 
 `~/.cursor/mcp.json` 只挂本地（同一配置里不要再挂公网）：
 
@@ -133,23 +147,28 @@ Quick Tunnel 每次重启 `cloudflared` 子域会变，变了就更新 `HERDR_MC
 }
 ```
 
+### 5. 浏览器插件（可选）
+
+目录 `extension/`（MV3）。Chrome 里显示名称 **herdr → Web wake**。`chrome://extensions` 加载未打包扩展。选项填 `http://127.0.0.1:8772` 与同一静态 token。见 [浏览器插件](#浏览器插件)。
+
 ## 地址速查
 
 | 用途 | URL |
 |---|---|
 | 本机 MCP | `http://127.0.0.1:8772/mcp` |
 | 公网 MCP | `{HERDR_MCP_BASE_URL}/mcp` |
-| 浏览器插件推送 | `http://127.0.0.1:8772/push/events` |
+| 扩展 SSE | `http://127.0.0.1:8772/push/events` |
+| 扩展快照 | `http://127.0.0.1:8772/push/state` |
 
-Connector 认证走 **OAuth（自动注册）**。静态 Bearer 只给本机 curl / Cursor：`herdr-mcp token`。
+Connector 认证走 **OAuth（自动注册）**。静态 Bearer 只给本机 curl / Cursor / 扩展：`herdr-mcp token`。不要把该 token 贴进 ChatGPT connector 表单。
 
-## 命令行
+## 命令行（macOS）
 
 ```bash
 herdr-mcp              # 菜单
 herdr-mcp status
 herdr-mcp connector
-herdr-mcp start | stop | restart
+herdr-mcp start | stop | restart   # LaunchAgent
 herdr-mcp logs [-f]
 herdr-mcp token | url
 herdr-mcp lang [en|zh|ja]   # 界面语言（首次跟系统；未知则英语）
@@ -157,21 +176,22 @@ herdr-mcp watchdog install  # 每 120s 自检：MCP 挂了才重启；TaskGroup 
 herdr-mcp watchdog status
 ```
 
-改代码后：`npx tsc && herdr-mcp restart`。
+改代码后：`npx tsc && herdr-mcp restart`（或重启跑 `node dist/server.js` 的进程）。
 
 ## 默认工具（为什么是这 18 个）
 
-herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法）。herdr-mcp **不会**把每个方法都做成 MCP 工具（占上下文、也和 herdr 重复），而是三层：
+herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法）。herdr-mcp **不会**把每个方法都做成 MCP 工具（占上下文、也和 herdr 重复），而是四层：
 
 | 层 | MCP 工具 | 和 herdr 的关系 |
 |---|---|---|
+| 技能 | `herdr_skill` | 只读：本机进程拉上游 Herdr `SKILL.md`（ChatGPT 自己不访问 GitHub）。 |
 | 透传 | `herdr_methods`、`herdr_call` | 直接打到 **herdr 原生** socket。先 `herdr_methods` 查 schema，再用 `herdr_call` 调任意方法。 |
 | 远程编排 | `herdr_inspect`、`herdr_since`、`herdr_prompt` | 给「只有用户发消息才跑」的网页客户端用的薄封装，基于 snapshot/events/`agent.prompt`，不是另造一套 herdr 能力。 |
-| 远程工作站 | `herdr_fs_*`、`herdr_exec`、`herdr_exec_*`、`herdr_git` | **不是** herdr 能力 — 远程客户端本身没有磁盘 |
+| 远程工作站 | `herdr_fs_*`、`herdr_exec`、`herdr_exec_*`、`herdr_git` | **不是** herdr 能力 — 远程客户端本身没有磁盘。 |
 
 | 工具 | 做什么 |
 |---|---|
-| `herdr_skill` | 只读：优先从上游 herdr **master** 拉最新 SKILL.md；网络不可达时用**安装包内置副本**（`assets/herdr-agent-SKILL.md`）。ChatGPT 不访问 GitHub，只有本机 herdr-mcp 进程会拉。`HERDR_SKILL_NETWORK=0` 强制只用内置。 |
+| `herdr_skill` | 只读：优先从上游 herdr **master** 拉最新 SKILL.md；网络不可达时用**安装包内置副本**（`assets/herdr-agent-SKILL.md`）。每个会话在 `herdr_call` / `herdr_prompt` 前调用一次。`HERDR_SKILL_NETWORK=0` 强制只用内置。 |
 | `herdr_methods` | 列出当前 herdr socket 方法与参数 schema（反射缓存）。陌生调用前先查。 |
 | `herdr_call` | 用 `{ method, params }` 调任意 herdr 方法（pane / workspace / agent 等），避免「一方法一工具」。 |
 | `herdr_inspect` | 一次看清连接 + workspaces / tabs / panes / agents（cwd、状态），以及 `workstation_info`、`boot_id`、`exec_sessions`。通常第一个调用。 |
@@ -188,28 +208,49 @@ herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法
 | `herdr_exec` | 短命令：workspace 可见 `herdr-mcp:utility` pane。若控制面 TaskGroup 在 **投递前** 阻断窗格操作，自动降级本机 zsh（`backend:local_fallback`）；已投递后绝不重发。 |
 | `herdr_exec_start` / `read` / `kill` | 长命令后台会话（本机进程，非 utility pane）。 |
 
-可选：`HERDR_MCP_ALL_TOOLS=1` 打开高级/废弃生命周期工具。写操作限 managed git root；`HERDR_MCP_READONLY=1` / `HERDR_MCP_WRITE_ROOTS=/a,/b` 可再收紧。
+可选：`HERDR_MCP_ALL_TOOLS=1` 打开高级/废弃生命周期工具（共 30 个）。写操作限 managed git root；`HERDR_MCP_READONLY=1` / `HERDR_MCP_WRITE_ROOTS=/a,/b` 可再收紧。
+
+## 环境变量
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `HERDR_MCP_TOKEN` | 空 | `/mcp` 与 `/push` 的静态 Bearer（Cursor / curl / 扩展）。 |
+| `HERDR_MCP_PORT` | `8772` | 监听端口。 |
+| `HERDR_MCP_BASE_URL` | 空 | ChatGPT 用的公网源站，**不要**带 `/mcp`。OAuth 的 `iss`/`aud` 依赖它。 |
+| `HERDR_SOCKET_PATH` | `~/.config/herdr/herdr.sock` | herdr API socket。 |
+| `HERDR_MCP_READONLY` | 关 | 挡住含 `herdr_prompt` 在内的 mutation（`herdr_fs_patch` 的 `dry_run` 除外）。 |
+| `HERDR_MCP_WRITE_ROOTS` | 全部 managed root | 允许写入的根，逗号分隔。 |
+| `HERDR_MCP_ALL_TOOLS` | 关 | 注册 30 个工具而不是 18。 |
+| `HERDR_MCP_AGENT_ALLOW` | worker + 审计 | `*` 让 inspect/since 显示 Claude/OMP/Codex；逗号名单可覆盖。 |
+| `HERDR_SKILL_NETWORK` | 开 | `0` = 只用内置 SKILL.md。 |
+
+OAuth / skill / 状态目录等见 [docs/architecture.md](docs/architecture.md#environment-variables)。
+
+## 权限边界
+
+连上的 ChatGPT 会话可以在托管 git 根里读改文件，并用 `herdr_exec` 跑 shell。扩展用同一静态 token 打本机；不要把该 token 填进 ChatGPT connector。路径密钥检查只约束 `herdr_fs_*`，shell 仍可 `cat .env`。用 `HERDR_MCP_READONLY` / `HERDR_MCP_WRITE_ROOTS` 收紧。
 
 ## 浏览器插件
 
-目录 `extension/`（MV3）。`chrome://extensions` 加载未打包扩展。
+目录 `extension/`（MV3，Chrome 名称 **herdr → Web wake**）。`chrome://extensions` 加载未打包扩展。站点：chatgpt.com、claude.ai、chat.deepseek.com、chat.z.ai。
 
-**两条对等主线**（见 [docs/extension.md](docs/extension.md)）：
+两件工作（见 [docs/extension.md](docs/extension.md)）共享本地 token，**完成度不对等**：
 
-1. **进度回推**：网页对话绑到 herdr **workspace**；space 内任意 agent 有新输出/停下来可回推；全部停 working 才收工唤醒；ChatGPT 回合结束后可用小模型判定是否催促继续（扩展 ≥0.1.20；Options 预填提示词/不发送词，继续时提交模型原文）
-2. **JSON→MCP**：DeepSeek / z.ai 无 connector 时，助手 JSON → 本机 `/mcp`（路线见 [docs/extension-bridge.md](docs/extension-bridge.md)）
+1. **进度回推（已可用）**：网页对话绑到 herdr **workspace**；space 内任意 agent 有新输出/停下来可回推；全部停 working 才收工唤醒。chatgpt.com 页内「允许」卡会自动点。可选：ChatGPT 回合结束后用小模型判定是否催促继续（扩展 ≥0.1.20；Options 预填提示词/不发送词，继续时提交模型原文）。
+2. **JSON→MCP（未完成）**：DeepSeek / z.ai 能从助手回复抠 `{"tool":...}`，**还不会**调本机 `/mcp` 或把结果回填。路线见 [docs/extension-bridge.md](docs/extension-bridge.md)。
 
-共享本地 `127.0.0.1:8772` 与静态 token。这不是给 DeepSeek「安装」ChatGPT 式 OAuth connector。
+共享本地 `127.0.0.1:8772` 与静态 token。这不是给 DeepSeek「安装」ChatGPT 式 OAuth connector。默认：进度检查间隔 **60 秒**，摘要不变时兜底 **20 分钟**（`progressTickSec` / `progressFallbackSec`）。
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
-| [docs/extension.md](docs/extension.md) | 扩展双主线总览（中文） |
-| [docs/architecture.md](docs/architecture.md) | herdr 与 MCP 分层 |
+| [CHANGELOG.md](CHANGELOG.md) | 版本与工具面变化 |
+| [docs/architecture.md](docs/architecture.md) | herdr 与 MCP 分层、闸门、环境变量 |
 | [docs/chatgpt-connector.md](docs/chatgpt-connector.md) | ChatGPT OAuth / 传输 / schema |
+| [docs/extension.md](docs/extension.md) | 扩展总览 |
 | [docs/extension-wake.md](docs/extension-wake.md) | 主线 A：进度回推 |
-| [docs/extension-bridge.md](docs/extension-bridge.md) | 主线 B：JSON→MCP |
+| [docs/extension-bridge.md](docs/extension-bridge.md) | 主线 B：JSON→MCP（未完成） |
 | [tests/README.md](tests/README.md) | 默认测试 vs 手工脚本 |
 
 过程笔记在 `docs/_wip/`（gitignore，不入库）。

@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import {
   decideWake, decideWorkspaceWake, agentsInWorkspace, formatWorkspaceRoster, workspaceTitleWithId, pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
   progressOutputFingerprint,
-  isIdleNudgeText, looksLikeSubstantiveReply,
+  isIdleNudgeText, looksLikeSubstantiveReply, isHerdrWakeComposerText,
   interpretLlmJudgeReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage,
   parseLlmSkipKeywords, llmReplyMatchesSkipKeyword, assistantNudgeFingerprint,
 } from "../../extension/binding-core.js";
@@ -527,6 +527,8 @@ ok(interpretLlmJudgeReply("好的，没有完成。继续。").nudgeText.include
 ok(isIdleNudgeText("继续，按你的建议推进"), "continue text is nudge fingerprint");
 ok(isIdleNudgeText("继续"), "bare 继续 is nudge fingerprint");
 ok(!isIdleNudgeText("请继续验证 Convex"), "normal user not fingerprint");
+ok(isHerdrWakeComposerText("herdr workspace demo: agents stopped"), "herdr wake template detected");
+ok(!isHerdrWakeComposerText("please check herdr workspace layout"), "user mention not wake template");
 ok(!looksLikeSubstantiveReply("Running herdr_inspect"), "tool status stub not substantive");
 ok(!looksLikeSubstantiveReply("Called herdr_exec"), "short tool line not substantive");
 ok(looksLikeSubstantiveReply(

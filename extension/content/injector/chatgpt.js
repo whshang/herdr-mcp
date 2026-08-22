@@ -15,19 +15,29 @@ class ChatGPTAdapter extends BaseAdapter {
     return '#prompt-textarea[contenteditable="true"]';
   }
 
+  getSendButtonCandidates() {
+    const selectors = [
+      'button[data-testid="send-button"]',
+      'button[data-testid="composer-send-button"]',
+      'button[aria-label="发送提示"]',
+      'button[aria-label="Send prompt"]',
+      'button[aria-label*="发送提示"]',
+      'button[aria-label*="Send prompt" i]',
+      'button[aria-label*="发送"]',
+      'button[aria-label*="Send" i]',
+    ];
+    const seen = new Set();
+    const out = [];
+    for (const sel of selectors) {
+      for (const el of document.querySelectorAll(sel)) {
+        if (!seen.has(el)) { seen.add(el); out.push(el); }
+      }
+    }
+    return out;
+  }
+
   getSendButton() {
-    return document.querySelector(
-      [
-        'button[data-testid="send-button"]',
-        'button[data-testid="composer-send-button"]',
-        'button[aria-label="发送提示"]',
-        'button[aria-label="Send prompt"]',
-        'button[aria-label*="发送提示"]',
-        'button[aria-label*="Send prompt" i]',
-        'button[aria-label*="发送"]',
-        'button[aria-label*="Send" i]',
-      ].join(", "),
-    );
+    return this.getSendButtonCandidates()[0] || null;
   }
 
   // Conversation identity uses host plus pathname via the default implementation.

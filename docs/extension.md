@@ -1,12 +1,12 @@
 # 浏览器扩展 — 产品总览（双主线）
 
-读者：扩展作者与使用者。`extension/` 同时承担两件对等的事，不互相替代。  
+读者：扩展作者与使用者。Chrome 显示名称 **herdr → Web wake**。`extension/` 同时承担两件事，共享 token 与 Options，**完成度不对等**：A 已可用，B 只做到 JSON 抽取。  
 语言：产品 UI 为 en / 简体中文 / 日本語（与 herdr 一致）；本页以简体中文写。仓库根 README：[en](../README.md) / [zh](../README.zh.md) / [ja](../README.ja.md)。
 
-| 主线 | 问题 | 方向 | 首批站点 |
-|---|---|---|---|
-| **A. 进度回推** | 网页派活到 herdr 后，对话不再观察/继续 | herdr → 网页（写输入框并提交） | chatgpt / deepseek / z.ai / claude（凡有适配器） |
-| **B. JSON→MCP** | DeepSeek / z.ai 网页没有 MCP Connector | 网页 → 本机 `127.0.0.1:8772/mcp` | `chat.deepseek.com`、`chat.z.ai` |
+| 主线 | 问题 | 方向 | 状态 | 首批站点 |
+|---|---|---|---|---|
+| **A. 进度回推** | 网页派活到 herdr 后，对话不再观察/继续 | herdr → 网页（写输入框并提交） | **已可用**（扩展 0.1.28） | chatgpt / deepseek / z.ai / claude |
+| **B. JSON→MCP** | DeepSeek / z.ai 网页没有 MCP Connector | 网页 → 本机 `127.0.0.1:8772/mcp` | **未完成**（能抠 JSON，未调 MCP） | `chat.deepseek.com`、`chat.z.ai` |
 
 共享：同一扩展、同一静态 token、同一 options。  
 分文档：[extension-wake.md](./extension-wake.md)（A）、[extension-bridge.md](./extension-bridge.md)（B）。
@@ -27,6 +27,8 @@
 - SSE：`/push/events?workspace=...`
 - 策略：见过 `working` 之后；局部 settle 报进展，范围内全空闲才收工；`hello` 可补
 - chatgpt.com 权限卡常驻自动点「允许」
+- ChatGPT 回合结束后可选小模型催促（Options 配 Base URL + Key + Model；`idleNudgeEnabled`；冷却与进度检查共用 `progressTickSec`）
+- UI：en / 简体中文 / 日本語
 
 ### 缺口
 
@@ -58,7 +60,7 @@
 
 1. **协议**：解析 → `tools/call` → 回填（默认只读白名单）
 2. **能力**：按需开 exec / 写文件 / prompt
-3. **完整面**：对齐 ChatGPT 默认 17 工具（仍仅本地）
+3. **完整面**：对齐 ChatGPT 默认 18 工具（仍仅本地）
 
 详见 [extension-bridge.md](./extension-bridge.md)。
 
@@ -71,4 +73,4 @@
 ## 验收口诀
 
 - **A**：ChatGPT（或任意已绑定站）`herdr_prompt` 后，working 中有进度戳、settled 后有继续提示，对话能自己往下走。
-- **B**：DeepSeek 输出一段 `herdr_inspect` JSON，扩展调本机并回填 `ok` 摘要。
+- **B**（尚未实现）：DeepSeek 输出一段 `herdr_inspect` JSON，扩展调本机并回填 `ok` 摘要。当前只能确认助手回复里出现了该 JSON。
