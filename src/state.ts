@@ -66,6 +66,7 @@ export class SnapshotCache {
   private readonly listeners = new Set<(ev: HerdrEvent) => void>();
   private lastActivityByPane = new Map<string, number>();
   private liveWorkspaceIds = new Set<string>();
+  private unknownWorkspaceIds = new Set<string>();
   private lastFullSnapAt = 0;
   private started = false;
   private loopError: Error | null = null;
@@ -156,6 +157,7 @@ export class SnapshotCache {
         })
         .filter((id): id is string => !!id),
     );
+    for (const id of this.liveWorkspaceIds) this.unknownWorkspaceIds.delete(id);
     // Preserve last_activity timestamps for agents that persist across snapshots.
     for (const a of prevAgents) {
       const rec = a as Record<string, unknown>;
@@ -211,15 +213,22 @@ export class SnapshotCache {
     const eventWorkspaceId = typeof ws?.["workspace_id"] === "string" ? (ws["workspace_id"] as string)
       : typeof data["workspace_id"] === "string" ? (data["workspace_id"] as string) : null;
     const tabWorkspaceId = typeof tab?.["workspace_id"] === "string" ? tab["workspace_id"] as string : null;
-    const workspaceCreated = evType === "workspace_created" || evType === "workspace.created" || evType === "workspace_created_event";
     const workspaceClosed = evType === "workspace_closed" || evType === "workspace.closed" || evType === "workspace_closed_event";
 
     // Herdr can continue emitting updates for orphan panes after their workspace
-    // has disappeared from workspace.list. Ignore those stale topology events;
-    // only an explicit workspace-created event can admit a new workspace id.
-    if (paneWorkspaceId && !this.liveWorkspaceIds.has(paneWorkspaceId)) return;
-    if (tabWorkspaceId && !this.liveWorkspaceIds.has(tabWorkspaceId)) return;
-    if (eventWorkspaceId && !workspaceCreated && !workspaceClosed && !this.liveWorkspaceIds.has(eventWorkspaceId)) return;
+    // has disappeared from workspace.list, including contradictory sequences
+    // such as closed -> created for the same stale id. No event can authoritatively
+    // admit an unknown workspace. The first unknown id forces an immediate
+    // snapshot/list reconciliation; only workspace.list can then admit it.
+    const unknownWorkspaceId = [paneWorkspaceId, tabWorkspaceId, eventWorkspaceId]
+      .find((id) => id && !this.liveWorkspaceIds.has(id)) ?? null;
+    if (unknownWorkspaceId && !workspaceClosed) {
+      if (!this.unknownWorkspaceIds.has(unknownWorkspaceId)) {
+        this.unknownWorkspaceIds.add(unknownWorkspaceId);
+        this.lastFullSnapAt = 0;
+      }
+      return;
+    }
     // ❺: append a compact event to the bounded digest history for herdr_since.
     this.digestCursor++;
     const dig: DigestEvent = { cursor: this.digestCursor, at: new Date(this._lastEventAt).toISOString(), type: evType ?? "unknown" };
@@ -279,7 +288,6 @@ export class SnapshotCache {
       this.removeWorkspace(eventWorkspaceId);
     } else if (ws && typeof ws["workspace_id"] === "string") {
       const wid = ws["workspace_id"] as string;
-      if (workspaceCreated) this.liveWorkspaceIds.add(wid);
       {
         const wss = this.ensureArray("workspaces");
         const i = wss.findIndex((w) => (w as Record<string, unknown>)["workspace_id"] === wid);

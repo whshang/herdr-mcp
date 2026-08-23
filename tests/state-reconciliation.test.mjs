@@ -54,6 +54,10 @@ test("workspace_closed direct-id event removes the whole workspace scope", () =>
   cache.liveWorkspaceIds = new Set(["wLive", "wDead"]);
 
   cache.applyEvent({ event: "workspace_closed", data: { type: "workspace_closed", workspace_id: "wDead" } });
+  cache.applyEvent({
+    event: "workspace_created",
+    data: { type: "workspace_created", workspace: { workspace_id: "wDead", label: "stale replay" } },
+  });
   const snap = cache.getSnapshot();
   assert.deepEqual(snap.workspaces, [{ workspace_id: "wLive", label: "live" }]);
   assert.deepEqual(snap.panes, [{ pane_id: "wLive:p1", workspace_id: "wLive" }]);
@@ -90,21 +94,35 @@ test("orphan events cannot resurrect a workspace missing from workspace.list", (
   assert.deepEqual(snap.tabs, [{ tab_id: "wLive:t1", workspace_id: "wLive" }]);
 });
 
-test("workspace_created admits a new workspace and its later pane events", () => {
-  const cache = new SnapshotCache({});
+test("unknown workspace_created waits for workspace.list authority before admission", async () => {
+  const client = {
+    async call(method) {
+      if (method === "session.snapshot") return { snapshot: { workspaces: [], panes: [], agents: [], tabs: [] } };
+      if (method === "workspace.list") return { workspaces: [{ workspace_id: "wNew", label: "new" }] };
+      if (method === "pane.list") return { panes: [{ pane_id: "wNew:p1", workspace_id: "wNew", cwd: "/tmp/new" }] };
+      if (method === "agent.list") return { agents: [] };
+      throw new Error(`unexpected method ${method}`);
+    },
+  };
+  const cache = new SnapshotCache(client);
   cache.state = { workspaces: [], panes: [], agents: [], tabs: [] };
   cache.liveWorkspaceIds = new Set();
+  cache.lastFullSnapAt = 123;
 
   cache.applyEvent({
     event: "workspace_created",
     data: { type: "workspace_created", workspace: { workspace_id: "wNew", label: "new" } },
   });
+  assert.deepEqual(cache.getSnapshot().workspaces, []);
+  assert.equal(cache.lastFullSnapAt, 0);
+
+  await cache.bootstrap();
+  assert.deepEqual(cache.getSnapshot().workspaces, [{ workspace_id: "wNew", label: "new" }]);
   cache.applyEvent({
     event: "pane_updated",
     data: { type: "pane_updated", pane: { pane_id: "wNew:p1", workspace_id: "wNew", cwd: "/tmp/new" } },
   });
 
-  assert.deepEqual(cache.getSnapshot().workspaces, [{ workspace_id: "wNew", label: "new" }]);
   assert.equal(cache.getSnapshot().panes.length, 1);
   assert.equal(cache.getSnapshot().panes[0].workspace_id, "wNew");
 });

@@ -6,6 +6,11 @@ Versions below follow `src/version.ts` / `package.json`. Git has no tags; 0.3.19
 
 ChatGPT can retain a `tools/list` snapshot for a conversation. A runtime version bump does **not** have to change that public catalog: production may run a newer implementation under a frozen contract profile. Only a deliberate contract/tool-surface change requires Connector/tool-snapshot migration and a new chat.
 
+## 0.3.31 — 2026-08-23
+
+- Make `workspace.list` the sole admission authority for unknown workspace IDs. Contradictory daemon event sequences such as `workspace_closed` followed by stale `workspace_created` can no longer resurrect a closed workspace.
+- The first event for an unknown workspace forces an immediate full reconciliation; a genuinely new workspace is admitted as soon as `workspace.list` confirms it, while repeated orphan events are ignored without refresh loops.
+
 ## 0.3.30 — 2026-08-23
 
 - Keep an authoritative live-workspace ID set from `workspace.list` and reject orphan pane/workspace/tab updates for IDs that are no longer live. Herdr may continue emitting pane updates after a workspace is closed; those events can no longer resurrect phantom rows in `herdr_inspect`, `/push/state`, or the browser extension picker.

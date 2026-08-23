@@ -7,5 +7,5 @@
  * (The previous 0.2.0 was constant across the 22->9 tool surface change, so
  * cached clients never refreshed; see MCP tool-registry cache-invalidation.)
  */
-export const SERVER_VERSION = "0.3.30";
+export const SERVER_VERSION = "0.3.31";
 export const SERVER_NAME = "herdr-mcp";
