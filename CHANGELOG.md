@@ -6,6 +6,12 @@ Versions below follow `src/version.ts` / `package.json`. Git has no tags; 0.3.19
 
 ChatGPT can retain a `tools/list` snapshot for a conversation. A runtime version bump does **not** have to change that public catalog: production may run a newer implementation under a frozen contract profile. Only a deliberate contract/tool-surface change requires Connector/tool-snapshot migration and a new chat.
 
+## 0.3.29 — 2026-08-23
+
+- Reconcile `session.snapshot` workspace/pane/agent collections with the dedicated `workspace.list` / `pane.list` / `agent.list` APIs. Recently closed workspaces can no longer be reintroduced into `/push/state` by a stale aggregate snapshot.
+- Handle the daemon's direct-id `workspace_closed` event shape and remove the entire closed workspace scope (workspace, panes, agents, tabs) immediately, preventing stale panes from recreating phantom workspace rows in the browser extension.
+- Browser extension **0.1.38** recovers content scripts after an unpacked-extension reload and recognizes the active ChatGPT conversation from its URL while reinjection completes, including project conversations under `/g/g-p-…/c/…`.
+
 ## 0.3.28 — 2026-08-23
 
 - Fix the real self-update post-reload probe discovered during the 0.3.27 production upgrade: `server/discover` version validation now accepts the current `_meta["io.modelcontextprotocol/serverInfo"]` shape as well as the legacy direct `serverInfo` shape.

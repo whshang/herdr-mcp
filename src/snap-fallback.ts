@@ -27,6 +27,36 @@ export async function snapFromListApis(c: HerdrClient): Promise<HerdrResult | nu
   }
 }
 
+/**
+ * session.snapshot is useful because it carries aggregate fields that the list
+ * APIs do not expose, but on some Herdr builds it can retain recently closed
+ * workspaces/panes longer than workspace.list/pane.list. Treat the dedicated
+ * list APIs as authoritative for those live collections whenever they answer.
+ */
+export async function reconcileSnapshotWithListApis(
+  c: HerdrClient,
+  snap: HerdrResult,
+  timeoutMs = HERDR_SNAPSHOT_TIMEOUT_MS,
+): Promise<HerdrResult> {
+  const out: HerdrResult = { ...snap };
+  const specs: Array<[method: string, key: string]> = [
+    ["workspace.list", "workspaces"],
+    ["pane.list", "panes"],
+    ["agent.list", "agents"],
+  ];
+  const results = await Promise.allSettled(
+    specs.map(([method]) => c.call(method, {}, timeoutMs)),
+  );
+  for (let i = 0; i < specs.length; i++) {
+    const [, key] = specs[i];
+    const result = results[i];
+    if (result.status !== "fulfilled") continue;
+    const value = result.value[key];
+    if (Array.isArray(value)) out[key] = value;
+  }
+  return out;
+}
+
 /** session.snapshot with bounded wait; list-API assembly on failure. */
 export async function fetchSessionSnapshot(
   c: HerdrClient,
@@ -34,7 +64,8 @@ export async function fetchSessionSnapshot(
 ): Promise<{ snap: HerdrResult; source: "snapshot" | "lists" }> {
   try {
     const r = await c.call("session.snapshot", {}, timeoutMs);
-    const snap = ((r["snapshot"] ?? r) as HerdrResult) || {};
+    const raw = ((r["snapshot"] ?? r) as HerdrResult) || {};
+    const snap = await reconcileSnapshotWithListApis(c, raw, timeoutMs);
     return { snap, source: "snapshot" };
   } catch {
     const assembled = await snapFromListApis(c);

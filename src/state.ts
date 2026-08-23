@@ -202,7 +202,10 @@ export class SnapshotCache {
     const dig: DigestEvent = { cursor: this.digestCursor, at: new Date(this._lastEventAt).toISOString(), type: evType ?? "unknown" };
     if (pane && typeof pane["pane_id"] === "string") dig.pane_id = pane["pane_id"] as string;
     if (pane) dig.pane = pane;
-    if (ws && typeof ws["workspace_id"] === "string") { dig.workspace_id = ws["workspace_id"] as string; dig.workspace = ws; }
+    const eventWorkspaceId = typeof ws?.["workspace_id"] === "string" ? (ws["workspace_id"] as string)
+      : typeof data["workspace_id"] === "string" ? (data["workspace_id"] as string) : null;
+    if (eventWorkspaceId) dig.workspace_id = eventWorkspaceId;
+    if (ws) dig.workspace = ws;
     if (tab && typeof tab["tab_id"] === "string") dig.tab = tab;
     this.digestHistory.push(dig);
     if (this.digestHistory.length > DIGEST_HISTORY_MAX) this.digestHistory.splice(0, this.digestHistory.length - DIGEST_HISTORY_MAX);
@@ -247,14 +250,16 @@ export class SnapshotCache {
       }
     }
 
-    // Workspace events.
-    if (ws && typeof ws["workspace_id"] === "string") {
+    // Workspace close events mirror pane close events: the daemon may put only
+    // workspace_id directly on data instead of attaching data.workspace. Remove
+    // the entire workspace scope immediately so stale panes cannot recreate a
+    // phantom workspace in /push/state consumers.
+    const workspaceClosed = evType === "workspace_closed" || evType === "workspace.closed" || evType === "workspace_closed_event";
+    if (eventWorkspaceId && workspaceClosed) {
+      this.removeWorkspace(eventWorkspaceId);
+    } else if (ws && typeof ws["workspace_id"] === "string") {
       const wid = ws["workspace_id"] as string;
-      if (evType === "workspace_closed") {
-        const wss = this.ensureArray("workspaces");
-        const i = wss.findIndex((w) => (w as Record<string, unknown>)["workspace_id"] === wid);
-        if (i >= 0) wss.splice(i, 1);
-      } else {
+      {
         const wss = this.ensureArray("workspaces");
         const i = wss.findIndex((w) => (w as Record<string, unknown>)["workspace_id"] === wid);
         if (i >= 0) wss[i] = ws;
@@ -296,6 +301,28 @@ export class SnapshotCache {
     const a = agents.findIndex((x) => (x as Record<string, unknown>)["pane_id"] === pid);
     if (a >= 0) agents.splice(a, 1);
     this.lastActivityByPane.delete(pid);
+  }
+
+  private removeWorkspace(wid: string): void {
+    const wss = this.ensureArray("workspaces");
+    for (let i = wss.length - 1; i >= 0; i--) {
+      if (wss[i]["workspace_id"] === wid || wss[i]["id"] === wid) wss.splice(i, 1);
+    }
+    const panes = this.ensureArray("panes");
+    for (let i = panes.length - 1; i >= 0; i--) {
+      if (panes[i]["workspace_id"] !== wid) continue;
+      const pid = typeof panes[i]["pane_id"] === "string" ? (panes[i]["pane_id"] as string) : null;
+      if (pid) this.lastActivityByPane.delete(pid);
+      panes.splice(i, 1);
+    }
+    const agents = this.ensureArray("agents");
+    for (let i = agents.length - 1; i >= 0; i--) {
+      if (agents[i]["workspace_id"] === wid) agents.splice(i, 1);
+    }
+    const tabs = this.ensureArray("tabs");
+    for (let i = tabs.length - 1; i >= 0; i--) {
+      if (tabs[i]["workspace_id"] === wid) tabs.splice(i, 1);
+    }
   }
 
   private ensureArray(key: string): Record<string, unknown>[] {
