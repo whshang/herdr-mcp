@@ -32,6 +32,7 @@ import {
   isPidAlive,
   atomicWriteJson,
   parseMcpBody,
+  runtimeVersionFromDiscover,
   mirrorSummary,
   dispatch,
   prepareRelease,
@@ -451,6 +452,36 @@ test("parseMcpBody handles SSE data: framing and plain JSON", () => {
   assert.equal(plain.result.ok, true);
   assert.equal(parseMcpBody(""), null);
   assert.throws(() => parseMcpBody("not json"));
+});
+
+test("runtimeVersionFromDiscover accepts current _meta and legacy direct serverInfo", () => {
+  assert.equal(runtimeVersionFromDiscover({
+    result: { _meta: { "io.modelcontextprotocol/serverInfo": { name: "herdr-mcp", version: "0.3.28" } } },
+  }), "0.3.28");
+  assert.equal(runtimeVersionFromDiscover({
+    result: { serverInfo: { name: "herdr-mcp", version: "0.3.27" } },
+  }), "0.3.27");
+  assert.equal(runtimeVersionFromDiscover({ result: {} }), null);
+});
+
+test("rollback treats a reload attempt as a switched runtime boundary", () => {
+  const steps = buildRollbackPlan({
+    server_reload_attempted: true,
+    server_reloaded: false,
+    candidate_active: true,
+    original_active: "stable-0.3.27",
+    server_plist_backup: "/tmp/original-server.plist",
+    server_plist: "/tmp/server.plist",
+    link_plist_backup: "/tmp/original-link.plist",
+    link_plist: "/tmp/link.plist",
+    candidate_generation: "candidate-0.3.28-test",
+  });
+  assert.deepEqual(steps.slice(0, 4).map((s) => s.action), [
+    "restore_server_plist",
+    "reload_server_from_original",
+    "verify_original_runtime",
+    "activate_original_generation",
+  ]);
 });
 
 test("release gates align with CI (build/root/edge/site/extension), never deploy", () => {

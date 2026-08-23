@@ -27,6 +27,7 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /# herdr-mcp remote planner skill/);
     assert.match(r.content, /Direct workstation operations first/);
     assert.match(r.content, /herdr-self-update apply/);
+    assert.match(r.content, /Do not treat exit code 0 alone as completion evidence/);
     assert.match(r.content, /Live herdr-mcp runtime context/);
     assert.equal(r.runtime.contract_profile, process.env.HERDR_MCP_CONTRACT_PROFILE || "current");
     assert.equal(typeof r.runtime.worker_fallbacks, "object");

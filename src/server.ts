@@ -3167,18 +3167,28 @@ function clearStatelessSse(entry: { res: Response; hb: NodeJS.Timeout }): void {
  * Deliberately terse — points at the right tool per situation, never restates
  * every tool description.
  */
-const SERVER_INSTRUCTIONS =
-  "Herdr control plane for a WEB planner. Session start: herdr_inspect then herdr_skill (once, " +
-  "latest upstream SKILL — tracks herdr master, not pinned). Ladder: (1) herdr_fs_read/list/grep/patch/image + " +
-  "herdr_git + herdr_exec (short) / herdr_exec_start|read|kill (long) — zero local-agent API; " +
-  "(2) only if agent reasoning is required, herdr_prompt a cheap/fast worker (pi, flash, cline, " +
-  "opencode, anti) or auditor (droid, grok) with a self-contained task + idempotency_key; " +
-  "inspect/since soft-hide Claude/OMP/Codex (HERDR_MCP_AGENT_ALLOW overrides; prompt by known id still works); " +
-  "(3) YOU keep the plan — poll herdr_since / herdr_inspect and re-prompt workers yourself. " +
-  "Do NOT herdr_prompt Claude/OMP/main to plan, research, or delegate to other panes. " +
-  "Before herdr_call: herdr_skill + herdr_methods. Unknown native API: herdr_methods then herdr_call. " +
-  "Before edits require project_root == pane cwd == foreground cwd; use explicit IDs, never UI focus. " +
-  "Never blind-retry mutations after uncertain delivery.";
+const SERVER_INSTRUCTIONS = EPOCH1_CONTRACT_PROFILE
+  ? "Herdr control plane for a WEB planner using the frozen epoch1 contract. Session start: herdr_inspect. " +
+    "The herdr_skill tool is intentionally not exposed in this contract; do not try to call it. " +
+    "Ladder: (1) herdr_fs_read/list/grep/patch/image + herdr_git + herdr_exec (short) / " +
+    "herdr_exec_start|read|kill (long) — deterministic direct work first; (2) only if agent reasoning is required, " +
+    "herdr_prompt a cheap/fast Herdr worker (pi, cline, opencode, anti) or auditor (droid, grok) with a self-contained " +
+    "task + idempotency_key; if no suitable Herdr worker is available and dsh exists, run dsh --profile headless via " +
+    "herdr_exec_start and inspect its filesystem/test evidence rather than trusting exit code alone; (3) YOU keep the plan and poll herdr_since / " +
+    "herdr_inspect. Before herdr_call: herdr_methods. Unknown native API: herdr_methods then herdr_call. " +
+    "Before edits require project_root == pane cwd == foreground cwd; use explicit IDs, never UI focus. " +
+    "Never blind-retry mutations after uncertain delivery."
+  : "Herdr control plane for a WEB planner. Session start: herdr_inspect then herdr_skill once for the self-updating " +
+    "herdr-mcp remote-planner policy (with release-matched native Herdr guidance appended). Ladder: (1) " +
+    "herdr_fs_read/list/grep/patch/image + herdr_git + herdr_exec (short) / herdr_exec_start|read|kill (long) — " +
+    "deterministic direct work first; (2) only if agent reasoning is required, herdr_prompt a cheap/fast Herdr worker " +
+    "(pi, cline, opencode, anti) or auditor (droid, grok) with a self-contained task + idempotency_key; if no suitable " +
+    "Herdr worker is available and dsh exists, run dsh --profile headless via herdr_exec_start and verify its filesystem/test " +
+    "evidence rather than trusting exit code alone; (3) YOU keep the plan — poll herdr_since / herdr_inspect and re-prompt workers yourself. " +
+    "Do NOT herdr_prompt Claude/OMP/main to plan, research, or delegate to other panes. Before herdr_call: " +
+    "herdr_skill + herdr_methods. Unknown native API: herdr_methods then herdr_call. Before edits require " +
+    "project_root == pane cwd == foreground cwd; use explicit IDs, never UI focus. Never blind-retry mutations " +
+    "after uncertain delivery.";
 
 function mcpServerForSession(): McpServer {
   const server = new McpServer(

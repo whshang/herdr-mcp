@@ -37,6 +37,33 @@ async function toolsList(base, token) {
   return { response, body: JSON.parse(raw) };
 }
 
+async function initialize(base, token) {
+  const response = await fetch(`${base}/mcp`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+      "User-Agent": "epoch1-runtime-profile-test/1",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "epoch1-init",
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "epoch1-runtime-profile-test", version: "1" },
+      },
+    }),
+  });
+  const text = await response.text();
+  const raw = (response.headers.get("content-type") || "").includes("text/event-stream")
+    ? text.split(/\r?\n/).filter((line) => line.startsWith("data: ")).map((line) => line.slice(6)).join("")
+    : text;
+  return { response, body: JSON.parse(raw) };
+}
+
 test("HERDR_MCP_CONTRACT_PROFILE=epoch1 advertises exact frozen 17-tool hash on newer runtime code", async () => {
   const port = await freePort();
   const token = "epoch1-runtime-profile-token";
@@ -73,6 +100,12 @@ test("HERDR_MCP_CONTRACT_PROFILE=epoch1 advertises exact frozen 17-tool hash on 
     assert.equal(tools.length, 17);
     assert.equal(tools.some((tool) => tool.name === "herdr_skill"), false);
     assert.equal(computeContractHash(tools), EPOCH1_HASH);
+
+    const initialized = await initialize(base, token);
+    assert.equal(initialized.response.status, 200);
+    const instructions = initialized.body?.result?.instructions || "";
+    assert.match(instructions, /herdr_skill tool is intentionally not exposed/i);
+    assert.doesNotMatch(instructions, /then herdr_skill|Before herdr_call: herdr_skill/i);
   } finally {
     child.kill("SIGTERM");
     await new Promise((resolve) => {

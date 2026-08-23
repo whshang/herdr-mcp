@@ -665,6 +665,7 @@ function makeJob(plan, now) {
     server_plist_backup: null,
     link_plist_backup: null,
     server_plist_edited: false,
+    server_reload_attempted: false,
     server_reloaded: false,
     candidate_active: false,
     outcome: null,
@@ -693,7 +694,12 @@ function makeJob(plan, now) {
  */
 export function buildRollbackPlan(job) {
   const steps = [];
-  const serverSwitched = job.server_reloaded === true;
+  // Once a launchd reload has been attempted, the process behind 8772 may
+  // already be the new build even if post-reload verification later fails.
+  // Treat the attempt itself as a switched/unknown runtime boundary and force
+  // a restore + reload + verification of the original runtime before moving
+  // traffic back to the original generation.
+  const serverSwitched = job.server_reload_attempted === true || job.server_reloaded === true;
   if (serverSwitched) {
     steps.push({ action: "restore_server_plist", from: job.server_plist_backup, to: job.server_plist });
     steps.push({ action: "reload_server_from_original" });
@@ -830,11 +836,18 @@ async function cmdWorker(args, env) {
     await setStage(jobPath, job, "reload_server", log);
     await writePlist(job.server_plist, transformServerPlist(serverPlist, join(job.release, "dist", "server.js")));
     await setState(jobPath, job, { server_plist_edited: true });
+    await setState(jobPath, job, { server_reload_attempted: true });
     const reloaded = await reloadServer(job.server_plist);
-    if (!reloaded) throw new Error("server did not come back under launchd (bootstrap retries exhausted)");
+    if (!reloaded.ok) {
+      throw new Error(`server did not come back under launchd (bootstrap retries exhausted): ${reloaded.error || "unknown"}`);
+    }
+    // launchd is already serving the new plist at this point. Persist this
+    // before the HTTP probe so a probe/parser failure still reloads the original
+    // plist during rollback instead of restoring only the file.
+    await setState(jobPath, job, { server_reloaded: true });
     const verified = await verifyRuntimeAt("http://127.0.0.1:8772/mcp", token, job.version);
     if (!verified.ok) throw new Error(`post-reload 8772 verification failed: ${verified.details || "no version"}`);
-    await setState(jobPath, job, { stage: "server_reloaded", server_reloaded: true });
+    await setState(jobPath, job, { stage: "server_reloaded" });
 
     // --- register + activate stable at 8772 ---
     const stable = job.stable_generation;
@@ -972,6 +985,13 @@ export function parseMcpBody(text) {
   return JSON.parse(s);
 }
 
+/** Extract runtime version from supported server/discover response shapes. */
+export function runtimeVersionFromDiscover(body) {
+  return body?.result?.serverInfo?.version
+    ?? body?.result?._meta?.["io.modelcontextprotocol/serverInfo"]?.version
+    ?? null;
+}
+
 async function verifyRuntimeAt(endpoint, token, expectedVersion) {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
@@ -984,13 +1004,13 @@ async function verifyRuntimeAt(endpoint, token, expectedVersion) {
       });
       if (res.ok) {
         const body = parseMcpBody(await res.text());
-        const info = body?.result?.serverInfo;
-        if (info?.version) {
+        const version = runtimeVersionFromDiscover(body);
+        if (version) {
           // expectedVersion == null means "any healthy runtime" (original version unknown).
-          const ok = expectedVersion == null ? true : info.version === expectedVersion;
-          return { ok, version: info.version, details: ok ? null : `version ${info.version} !== ${expectedVersion}` };
+          const ok = expectedVersion == null ? true : version === expectedVersion;
+          return { ok, version, details: ok ? null : `version ${version} !== ${expectedVersion}` };
         }
-        return { ok: false, details: "no serverInfo.version" };
+        return { ok: false, details: "no runtime version in server/discover" };
       }
     } catch { /* keep polling */ }
     await sleep(400);
