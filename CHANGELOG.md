@@ -1,5 +1,7 @@
 # Changelog
 
+- Background `herdr_exec_start` sessions and the `herdr_exec` local-shell fallback now choose an available login shell (`zsh` → `bash` → `sh`) instead of hard-coding `/bin/zsh`, so the same exec/session semantics work on Linux CI and Linux Herdr workstations.
+
 Versions below follow `src/version.ts` / `package.json`. Git has no tags; 0.3.19–0.3.25 were never published as separate commits and landed in **0.3.26**.
 
 ChatGPT can retain a `tools/list` snapshot for a conversation. A runtime version bump does **not** have to change that public catalog: production may run a newer implementation under a frozen contract profile. Only a deliberate contract/tool-surface change requires Connector/tool-snapshot migration and a new chat.

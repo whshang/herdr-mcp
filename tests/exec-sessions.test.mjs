@@ -8,7 +8,13 @@ import {
   readExecSession,
   killExecSession,
   listExecSessions,
+  resolveExecShell,
 } from "../dist/exec-sessions.js";
+
+test("exec shell is available on the current host", () => {
+  const shell = resolveExecShell({});
+  assert.match(shell, /^\//);
+});
 
 test("exec session marks closed after exit (including zero)", async () => {
   const s = startExecSession({ command: "echo hi", cwd: process.cwd() });

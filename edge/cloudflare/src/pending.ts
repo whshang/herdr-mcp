@@ -180,16 +180,34 @@ export class PendingRequestRegistry {
     const p = this.pending.get(requestId);
     if (!p) return undefined;
     p.state = "settled";
-    this.completed.set(requestId, completion);
-    if (p.idempotencyKey !== undefined) {
-      this.idemByKey.set(p.idempotencyKey, {
-        idempotencyKey: p.idempotencyKey,
-        requestId,
-        op: p.op,
+    // `pending` is the capacity-bound registry of active requests, not a
+    // historical ledger. Completed responses live in `completed` (and the
+    // idempotency index) and are persisted separately by WorkstationDO.
+    // Keeping settled entries here leaks one capacity slot per tools/call and
+    // eventually makes every new request fail with edge_capacity_exceeded.
+    this.pending.delete(requestId);
+    this.recordSettlement(p, completion);
+    return p;
+  }
+
+  /**
+   * Record a completion + idempotency entry for an explicit PendingRequest
+   * WITHOUT re-occupying pending capacity. Used by WorkstationDO to close out
+   * a request that was evicted from the capacity-bound pending map (its entry
+   * is already gone from `pending`), so durable storage/completion/idempotency
+   * still settle correctly and the evicted request never resurrects on
+   * rehydrate. Normal `settle()` reuses this after deleting the active slot.
+   */
+  recordSettlement(entry: PendingRequest, completion: Completion): void {
+    this.completed.set(entry.requestId, completion);
+    if (entry.idempotencyKey !== undefined) {
+      this.idemByKey.set(entry.idempotencyKey, {
+        idempotencyKey: entry.idempotencyKey,
+        requestId: entry.requestId,
+        op: entry.op,
         settledAtMs: this.now(),
       });
     }
-    return p;
   }
 
   /** Completion for a request the caller has a requestId for (replay after settle). */

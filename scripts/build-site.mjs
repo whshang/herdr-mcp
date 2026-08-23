@@ -123,7 +123,9 @@ const docsIndex = `<!doctype html>
 await writeFile(join(outDir, "docs", "index.html"), docsIndex);
 
 const pkg = JSON.parse(await readFile(join(rootPath, "package.json"), "utf8"));
-const commit = process.env.GITHUB_SHA || process.env.HERDR_SITE_COMMIT || "working-tree";
+// Explicit HERDR_SITE_COMMIT override wins over the ambient CI SHA; falling back
+// to the working-tree marker only when neither is set.
+const commit = process.env.HERDR_SITE_COMMIT || process.env.GITHUB_SHA || "working-tree";
 const skillSource = join(rootPath, "assets", "herdr-mcp-SKILL.md");
 let skill = null;
 try {

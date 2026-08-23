@@ -304,7 +304,7 @@ export class WorkstationDO {
         evictedOp: add.evicted.op,
         requestId,
       });
-      await this.persistSettlement(add.evicted.requestId, {
+      await this.persistEvictedSettlement(add.evicted, {
         status: "error",
         error: reconnectingResult({ requestId: add.evicted.requestId, workstationId, atMs: now }),
         servedAtMs: now,
@@ -312,6 +312,24 @@ export class WorkstationDO {
     }
     const entry = add.entry;
     await this.state.storage.put(PREFIX_PENDING + entry.requestId, entry);
+
+    // Interleave guard: the storage.put above yielded, so a concurrent invoke may
+    // have evicted this request from the capacity-bound pending map (oldest-queued
+    // eviction). If so, this handler must NOT send to the link — the request is
+    // already settled with a recorded completion. Re-confirm we still own the
+    // active entry before any send.
+    const stillOwned = this.registry.get(entry.requestId) === entry;
+    if (!stillOwned) {
+      const evictedCompletion = this.registry.completedFor(entry.requestId);
+      if (evictedCompletion) {
+        return this.json({ status: "ok", completion: evictedCompletion });
+      }
+      // Evicted but not yet settled (rare): fail closed rather than send.
+      return this.json(
+        { status: "error", error: reconnectingResult({ requestId: entry.requestId, workstationId, atMs: now }) },
+        503,
+      );
+    }
 
     const encoded = encodeWire(wire, this.limits.maxFrameBytes);
     if (!encoded.ok) {
@@ -372,6 +390,36 @@ export class WorkstationDO {
   private async persistSettlement(requestId: string, completion: Completion): Promise<void> {
     const entry = this.registry.settle(requestId, completion);
     if (!entry) return;
+    await this.state.storage.delete(PREFIX_PENDING + requestId);
+    await this.state.storage.put(PREFIX_COMPLETED + requestId, completion as unknown as string);
+    if (entry.idempotencyKey !== undefined) {
+      const record: IdempotencyRecord = {
+        idempotencyKey: entry.idempotencyKey,
+        requestId,
+        op: entry.op,
+        settledAtMs: completion.servedAtMs,
+      };
+      await this.state.storage.put(PREFIX_IDEM + entry.idempotencyKey, record as unknown as string);
+    }
+    const resolve = this.resolvers.get(requestId);
+    if (resolve) {
+      this.resolvers.delete(requestId);
+      resolve(completion);
+    }
+    void this.armAlarm();
+  }
+
+  /**
+   * Close out a request that was evicted from the capacity-bound pending map
+   * (its registry entry no longer exists, so settle() would no-op). Records the
+   * completion + idempotency without re-occupying pending capacity, deletes the
+   * durable pending:<id> key so the evicted request can never resurrect on
+   * rehydrate, and resolves any waiter. Mirrors persistSettlement but takes the
+   * explicit evicted entry.
+   */
+  private async persistEvictedSettlement(entry: PendingRequest, completion: Completion): Promise<void> {
+    const requestId = entry.requestId;
+    this.registry.recordSettlement(entry, completion);
     await this.state.storage.delete(PREFIX_PENDING + requestId);
     await this.state.storage.put(PREFIX_COMPLETED + requestId, completion as unknown as string);
     if (entry.idempotencyKey !== undefined) {

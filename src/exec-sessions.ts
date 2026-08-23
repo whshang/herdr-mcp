@@ -8,7 +8,7 @@
  */
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
+import { accessSync, constants, mkdirSync, readFileSync, statSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { enrichedUserEnv } from "./user-path.js";
@@ -50,6 +50,54 @@ export type ExecSessionView = {
 };
 
 const sessions = new Map<string, ExecSession>();
+
+/** Shell basenames compatible with `-lc` + POSIX-ish script semantics. */
+const COMPATIBLE_SHELLS = new Set(["zsh", "bash", "sh"]);
+
+function isExecutableFile(p: string): boolean {
+  try {
+    const st = statSync(p);
+    if (!st.isFile()) return false;
+    accessSync(p, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** True if the resolved path is an absolute executable whose basename is a compatible shell. */
+function compatibleShellPath(p: string | undefined): string | null {
+  if (!p) return null;
+  const trimmed = p.trim();
+  if (!trimmed || trimmed[0] !== "/") return null;
+  const base = path.basename(trimmed);
+  if (!COMPATIBLE_SHELLS.has(base)) return null;
+  return isExecutableFile(trimmed) ? trimmed : null;
+}
+
+/**
+ * Pick a login shell for background exec sessions without assuming macOS.
+ * Herdr's primary workstation runtime is macOS/zsh, while CI and supported
+ * Linux workstations commonly provide bash/sh but not /bin/zsh.
+ *
+ * Order: HERDR_MCP_EXEC_SHELL (must be an absolute, executable, compatible
+ * shell) → compatible $SHELL → /bin/zsh → /bin/bash → /bin/sh. Any configured
+ * shell whose basename is not zsh/bash/sh is ignored rather than silently
+ * changing `-lc`/POSIX semantics (fish/nushell would break exec commands).
+ */
+export function resolveExecShell(env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = compatibleShellPath(env.HERDR_MCP_EXEC_SHELL);
+  if (explicit) return explicit;
+  const userShell = compatibleShellPath(env.SHELL);
+  if (userShell) return userShell;
+  for (const candidate of ["/bin/zsh", "/bin/bash", "/bin/sh"]) {
+    if (isExecutableFile(candidate)) return candidate;
+  }
+  // POSIX systems should always have /bin/sh; returning it keeps spawn's
+  // failure explicit on an unsupported host rather than silently changing
+  // command semantics.
+  return "/bin/sh";
+}
 
 type JournalEntry = { id: string; pid: number; cwd: string; command: string; startedAt: number };
 
@@ -176,7 +224,7 @@ export function startExecSession(opts: {
   prune();
   const id = `es_${randomUUID().slice(0, 12)}`;
   const childEnv = enrichedUserEnv({ ...process.env, ...opts.env });
-  const proc = spawn("/bin/zsh", ["-lc", opts.command], {
+  const proc = spawn(resolveExecShell(childEnv), ["-lc", opts.command], {
     cwd: opts.cwd,
     env: { ...childEnv, HERDR_MCP_EXEC_ID: id },
     stdio: ["ignore", "pipe", "pipe"],

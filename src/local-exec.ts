@@ -9,6 +9,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { enrichedUserEnv } from "./user-path.js";
+import { resolveExecShell } from "./exec-sessions.js";
 
 export type LocalExecResult = {
   exit_code: number | null;
@@ -23,8 +24,10 @@ function shq(s: string): string {
 }
 
 /**
- * Run `command` under zsh with cwd = `cwd`. stdout and stderr are merged in
- * arrival order into `output` (capped).
+ * Run `command` under an available login shell (zsh → bash → sh) with
+ * cwd = `cwd`. stdout and stderr are merged in arrival order into `output`
+ * (capped). The shell is resolved the same way as background exec sessions so
+ * the fallback backend works on Linux CI and Linux Herdr workstations too.
  */
 export async function runLocalShell(opts: {
   command: string;
@@ -35,10 +38,11 @@ export async function runLocalShell(opts: {
   const maxBytes = opts.maxOutputBytes ?? 8000;
   const nonce = randomUUID().slice(0, 8);
   const scriptPath = path.join(tmpdir(), `herdr-mcp-local-${nonce}.sh`);
+  const shell = resolveExecShell(process.env);
   const body = [
-    "#!/bin/zsh",
+    `#!${shell}`,
     "set +e",
-    // When parent SIGTERMs this zsh, kill the whole process group (incl. sleep children).
+    // When parent SIGTERMs this shell, kill the whole process group (incl. sleep children).
     "trap 'kill 0 2>/dev/null; exit 124' TERM INT",
     `cd -- ${shq(opts.cwd)} || exit 127`,
     opts.command,
@@ -62,7 +66,7 @@ export async function runLocalShell(opts: {
   };
 
   return new Promise((resolve) => {
-    const proc = spawn("/bin/zsh", [scriptPath], {
+    const proc = spawn(shell, [scriptPath], {
       cwd: opts.cwd,
       env: enrichedUserEnv(process.env),
       stdio: ["ignore", "pipe", "pipe"],

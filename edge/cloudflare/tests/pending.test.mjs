@@ -54,7 +54,8 @@ test("registry: add -> markSent -> settle -> completedFor", () => {
   assert.equal(r.get("r1").state, "sent");
   const completion = { status: "ok", result: { x: 1 }, servedAtMs: 200 };
   r.settle("r1", completion);
-  assert.equal(r.get("r1").state, "settled");
+  assert.equal(r.get("r1"), undefined);
+  assert.equal(r.totalPendingSize(), 0);
   assert.deepEqual(r.completedFor("r1"), completion);
 });
 
@@ -81,6 +82,74 @@ test("registry: capacity bounds, evicts oldest queued, keeps sent", () => {
   r.markSent("c3", 2);
   const full = r.add(pendingReq({ requestId: "d4" }));
   assert.equal(full.status, "capacity_full");
+});
+
+test("registry: settled requests immediately release pending capacity", () => {
+  const limits = makeLimits({});
+  limits.maxPendingRequests = 1;
+  const r = new PendingRequestRegistry({ limits });
+
+  for (let i = 0; i < 300; i += 1) {
+    const requestId = `r${i}`;
+    const added = r.add(pendingReq({ requestId }));
+    assert.equal(added.status, "added", `iteration ${i} must not leak a capacity slot`);
+    r.markSent(requestId, i + 1);
+    r.settle(requestId, { status: "ok", result: i, servedAtMs: i + 2 });
+    assert.equal(r.totalPendingSize(), 0, `iteration ${i} must release pending capacity`);
+    assert.equal(r.activeCount(), 0);
+  }
+});
+
+test("registry: queued eviction records completion/idem without re-occupying capacity and survives rehydrate", () => {
+  const limits = makeLimits({});
+  limits.maxPendingRequests = 1;
+  const r = new PendingRequestRegistry({ limits });
+
+  // First request occupies the single active slot and stays QUEUED (unsent) so
+  // it is the evictable oldest-queued candidate. Do NOT markSent it — add() only
+  // evicts a queued request, never a sent one.
+  const first = pendingReq({ requestId: "evicted-1", idempotencyKey: "idem-1" });
+  const a1 = r.add(first);
+  assert.equal(a1.status, "added");
+
+  // Second request evicts the oldest queued (the first, still queued).
+  const second = pendingReq({ requestId: "new-1", idempotencyKey: "idem-2" });
+  const a2 = r.add(second);
+  assert.equal(a2.status, "evicted_oldest");
+  assert.equal(a2.evicted.requestId, "evicted-1");
+  // The evicted entry is no longer in pending; the new one holds the only slot.
+  assert.equal(r.get("evicted-1"), undefined);
+  assert.equal(r.totalPendingSize(), 1);
+  assert.equal(r.get("new-1").requestId, "new-1");
+
+  // Close out the evicted request via recordSettlement (explicit entry, no
+  // capacity re-occupation) — mirrors WorkstationDO.persistEvictedSettlement.
+  const completion = { status: "error", error: { code: "reconnecting" }, servedAtMs: 5 };
+  r.recordSettlement(a2.evicted, completion);
+  assert.equal(r.totalPendingSize(), 1, "recordSettlement must not re-occupy pending capacity");
+  assert.deepEqual(r.completedFor("evicted-1"), completion);
+
+  // Rehydrate from a snapshot: the evicted request must NOT resurrect as pending,
+  // but its completion must be replayable. The idempotency index is NOT part of
+  // RegistrySnapshot — the DO persists IdempotencyRecords separately and restores
+  // them via restoreIdem, exactly like WorkstationDO.persistEvictedSettlement.
+  const snap = r.snapshot();
+  assert.equal(snap.pending.some((p) => p.requestId === "evicted-1"), false);
+  assert.equal(snap.pending.some((p) => p.requestId === "new-1"), true);
+  const r2 = new PendingRequestRegistry({ limits });
+  r2.restore(snap);
+  r2.restoreIdem([
+    { idempotencyKey: "idem-1", requestId: "evicted-1", op: "herdr_inspect", settledAtMs: 5 },
+  ]);
+  assert.equal(r2.get("evicted-1"), undefined);
+  assert.equal(r2.get("new-1").requestId, "new-1");
+  assert.deepEqual(r2.completedFor("evicted-1"), completion);
+  assert.equal(r2.idempotencyKeyFor("evicted-1"), "idem-1");
+
+  // A replay of the evicted request's idempotency key returns the recorded completion.
+  const replay = r2.add(pendingReq({ requestId: "replay-1", op: "herdr_inspect", idempotencyKey: "idem-1" }));
+  assert.equal(replay.status, "idem_hit");
+  assert.deepEqual(replay.completion, completion);
 });
 
 test("registry: expired() returns overdue active requests only", () => {

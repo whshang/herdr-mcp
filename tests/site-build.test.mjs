@@ -10,10 +10,19 @@ const OUT = join(ROOT, "site-dist");
 
 test("documentation site build publishes docs, release metadata and project skill without WIP", async () => {
   await rm(OUT, { recursive: true, force: true });
+  // Hermetic and precedence-locking: pass an ambient-looking GITHUB_SHA AND the
+  // explicit HERDR_SITE_COMMIT override together. The build must honor the
+  // explicit override even when CI has injected a SHA — not merely pass because
+  // the test unset GITHUB_SHA.
+  const env = {
+    ...process.env,
+    GITHUB_SHA: "ambient-ci-sha",
+    HERDR_SITE_COMMIT: "site-build-test",
+  };
   const run = spawnSync(process.execPath, [join(ROOT, "scripts", "build-site.mjs")], {
     cwd: ROOT,
     encoding: "utf8",
-    env: { ...process.env, HERDR_SITE_COMMIT: "site-build-test" },
+    env,
   });
   assert.equal(run.status, 0, run.stderr || run.stdout);
   const result = JSON.parse(run.stdout.trim().split(/\r?\n/).at(-1));

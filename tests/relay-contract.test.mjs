@@ -132,7 +132,14 @@ test("contractHashSource exposes the hash-covered projection", () => {
 });
 
 test("epoch-1 live baseline hash is reproducible", () => {
-  const baseline = JSON.parse(fs.readFileSync("docs/_wip/.contract-epoch1-baseline.json", "utf8"));
+  // The frozen epoch-1 contract is tracked at edge/cloudflare/src/contracts/epoch1.ts
+  // (the docs/_wip baseline is gitignored and absent in a clean checkout). The
+  // file is a pure JSON object wrapped in `export const EPOCH1_CONTRACT = {...} as const;`,
+  // so we extract the object literal directly — no TS loader needed.
+  const epoch1Source = fs.readFileSync("edge/cloudflare/src/contracts/epoch1.ts", "utf8");
+  const start = epoch1Source.indexOf("{");
+  const end = epoch1Source.lastIndexOf("}");
+  const baseline = JSON.parse(epoch1Source.slice(start, end + 1));
   const expected = "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
   assert.equal(baseline.tool_count, 17);
   assert.equal(baseline.contract_hash, expected);

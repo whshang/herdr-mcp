@@ -56,6 +56,7 @@ import {
   killExecSession,
   listExecSessions,
   recoverExecSessionsOnBoot,
+  resolveExecShell,
 } from "./exec-sessions.js";
 import { commitAtomic } from "./atomic-files.js";
 import { runLocalShell } from "./local-exec.js";
@@ -828,7 +829,7 @@ function registerTools(server: McpServer): void {
           agent_visibility: view["agent_visibility"],
           exec_sessions: listExecSessions(),
           exec_environment: {
-            shell: process.env.SHELL ?? "/bin/zsh",
+            shell: resolveExecShell(process.env),
             node: process.version,
             path_has: {
               git: which("git"),
@@ -2532,12 +2533,13 @@ function registerTools(server: McpServer): void {
       const nonce = randomUUID().slice(0, 8);
       const marker = `__HM_EXEC_${nonce}_EXIT_`;
       const shq = (s: string): string => "'" + s.replace(/'/g, `'\\''`) + "'";
+      const execShell = resolveExecShell(process.env);
       const scriptPath = path.join(
         process.env.TMPDIR || "/tmp",
         `herdr-mcp-exec-${nonce}.sh`,
       );
       const scriptBody = [
-        "#!/bin/zsh",
+        `#!${execShell}`,
         "set +e",
         effectiveRoot ? `cd -- ${shq(effectiveRoot)} || exit 127` : "",
         command,
@@ -2547,7 +2549,7 @@ function registerTools(server: McpServer): void {
       } catch (e) {
         return toResult({ ok: false, reason: "script_write_failed", message: String(e) });
       }
-      const cmdline = `zsh ${shq(scriptPath)}; ec=$?; rm -f -- ${shq(scriptPath)}; printf '\\n${marker}%s__' "$ec"`;
+      const cmdline = `${shq(execShell)} ${shq(scriptPath)}; ec=$?; rm -f -- ${shq(scriptPath)}; printf '\\n${marker}%s__' "$ec"`;
       const readText = (rr: HerdrResult): string => {
         const rd = ((rr["read"] as Record<string, unknown>) ?? rr) as Record<string, unknown>;
         return String(rd["content"] ?? rd["text"] ?? rd["output"] ?? "");
