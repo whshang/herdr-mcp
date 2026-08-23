@@ -4,6 +4,7 @@ import test from 'node:test';
 
 const url = new URL('../bin/watchdog.sh', import.meta.url);
 const script = await readFile(url, 'utf8');
+const cli = await readFile(new URL('../bin/herdr-mcp', import.meta.url), 'utf8');
 
 test('watchdog launchd install runs a config-dir copy instead of executing from Documents', async () => {
   assert.match(script, /runtime_bin="\$CFG_DIR\/watchdog\.sh"/);
@@ -19,4 +20,17 @@ test('watchdog launchd install runs a config-dir copy instead of executing from 
 test('watchdog runtime copy can resolve the repository through HERDR_MCP_ROOT', () => {
   assert.match(script, /ROOT="\$\{HERDR_MCP_ROOT:-\$\(cd/);
   assert.match(script, /cli = os\.path\.join\(os\.environ\["ROOT"\], "bin", "herdr-mcp"\)/);
+});
+
+test('watchdog local HTTP probe uses cheap server/discover instead of initialize', () => {
+  assert.match(script, /\"method\":\"server\/discover\"/);
+  assert.doesNotMatch(script, /\"method\":\"initialize\"/);
+  assert.match(script, /curl -s -o \/dev\/null -w \"%\{http_code\}\" -m 3/);
+});
+
+test('watchdog and CLI normalize failed curl to one 000 code and use discover locally', () => {
+  for (const [name, source] of [['watchdog', script], ['cli', cli]]) {
+    assert.match(source, /code="?000"?/, `${name} normalizes failed curl to 000`);
+    assert.match(source, /\"method\":\"server\/discover\"/, `${name} uses sessionless discover`);
+  }
 });

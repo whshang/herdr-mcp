@@ -63,13 +63,16 @@ service_pid() {
 check_local() {
   local token code
   token=$(get_token)
-  code=$(curl -s -o /dev/null -w "%{http_code}" -m 3 \
+  if ! code=$(curl -s -o /dev/null -w "%{http_code}" -m 3 \
     -X POST "$LOCAL_URL" \
     -H "Authorization: Bearer $token" \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"cli-check","version":"0"}}}' \
-    2>/dev/null || echo "000")
+    -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}' \
+    2>/dev/null); then
+    code="000"
+  fi
+  [[ "$code" =~ ^[0-9]{3}$ ]] || code="000"
   echo "$code"
 }
 

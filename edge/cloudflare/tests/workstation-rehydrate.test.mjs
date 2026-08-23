@@ -80,3 +80,28 @@ test("cold start keeps future pending work and re-arms its deadline", async () =
   assert.ok(storage.map.has("pending:future"));
   assert.equal(storage.alarm, deadline);
 });
+
+test("deadline settlement cancels an already-sent Link request exactly once", async () => {
+  const deadline = Date.now() + 60_000;
+  const p = pending("sent-timeout", deadline, "sent", "read");
+  const storage = new FakeStorage([[`pending:${p.requestId}`, p]]);
+  const sent = [];
+  const activeSocket = {
+    deserializeAttachment: () => ({ active: true, registered: true }),
+    send: (frame) => sent.push(JSON.parse(frame)),
+  };
+  const subject = new WorkstationDO(fakeState(storage, [activeSocket]), {});
+
+  await subject.fetch(new Request("https://do/internal/status"));
+  await subject.settleAsTimeout(p.requestId);
+
+  assert.equal(storage.map.has(`pending:${p.requestId}`), false);
+  assert.equal(storage.map.has(`completed:${p.requestId}`), true);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].kind, "cancel");
+  assert.equal(sent[0].request_id, p.requestId);
+  assert.equal(sent[0].reason, "deadline exceeded");
+
+  await subject.settleAsTimeout(p.requestId);
+  assert.equal(sent.length, 1, "settled timeout must not emit duplicate cancel");
+});

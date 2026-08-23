@@ -397,6 +397,7 @@ export class WorkstationDO {
   private async settleAsTimeout(requestId: string): Promise<void> {
     const entry = this.registry.get(requestId);
     if (!entry || entry.state === "settled") return;
+    const wasSent = entry.state === "sent";
     const now = Date.now();
     const err = timeoutResult({
       requestId,
@@ -405,6 +406,20 @@ export class WorkstationDO {
       opClass: entry.opClass,
     });
     await this.persistSettlement(requestId, { status: "error", error: err, servedAtMs: now });
+    // The normal in-memory deadline timer must propagate cancellation too.
+    // Otherwise the Edge waiter is settled while Link/local HTTP work keeps
+    // running until its own longer timeout and continues occupying runtime
+    // generation in-flight capacity.
+    if (wasSent) {
+      const cancel: CancelMessage = {
+        protocol_version: RELAY_PROTOCOL_VERSION,
+        kind: "cancel",
+        workstation_id: entry.workstationId,
+        request_id: entry.requestId,
+        reason: "deadline exceeded",
+      };
+      this.sendToActiveLink(cancel);
+    }
   }
 
   private async persistSettlement(requestId: string, completion: Completion): Promise<void> {
@@ -788,22 +803,7 @@ export class WorkstationDO {
     await this.ensureInit();
     const now = Date.now();
     for (const entry of this.registry.expired(now)) {
-      const err = timeoutResult({
-        requestId: entry.requestId,
-        workstationId: entry.workstationId,
-        atMs: now,
-        opClass: entry.opClass,
-      });
-      await this.persistSettlement(entry.requestId, { status: "error", error: err, servedAtMs: now });
-      // Send cancel to the active link.
-      const cancel: CancelMessage = {
-        protocol_version: RELAY_PROTOCOL_VERSION,
-        kind: "cancel",
-        workstation_id: entry.workstationId,
-        request_id: entry.requestId,
-        reason: "deadline exceeded",
-      };
-      this.sendToActiveLink(cancel);
+      await this.settleAsTimeout(entry.requestId);
     }
     for (const requestId of this.registry.completedExpired(now)) {
       const entry = this.registry.get(requestId);

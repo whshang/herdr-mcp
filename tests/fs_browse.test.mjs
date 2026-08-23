@@ -113,9 +113,14 @@ before(async () => {
   fs.writeFileSync(slowGit, `#!/bin/sh\nif [ "$1" = "rev-parse" ] && [ "$2" = "--show-toplevel" ]; then sleep 2; exit 124; fi\nexec ${JSON.stringify(realGit)} "$@"\n`);
   fs.chmodSync(slowGit, 0o755);
 
+  const serverEnv = { ...process.env };
+  for (const key of [
+    "HERDR_MCP_CONTRACT_PROFILE", "HERDR_MCP_ALL_TOOLS", "HERDR_CONTRACT_HASH",
+    "HERDR_CONTRACT_EPOCH", "HERDR_RUNTIME_VERSION", "HERDR_RUNTIME_GENERATION",
+  ]) delete serverEnv[key];
   server = spawn("node", [path.join(__dirname, "..", "dist", "server.js")], {
     env: {
-      ...process.env,
+      ...serverEnv,
       PATH: `${slowGitBin}:${process.env.PATH ?? ""}`,
       HERDR_MCP_PORT: String(PORT), HERDR_MCP_TOKEN: TOKEN, HERDR_SOCKET_PATH: sockPath,
     },
