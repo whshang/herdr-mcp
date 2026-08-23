@@ -9,6 +9,26 @@
 export const SETTLED_STATUSES = ["idle", "done", "blocked"];
 
 /**
+ * Derive a conservative conversation identity directly from a supported tab URL.
+ * Used only as a recovery path when an MV3 content script is temporarily absent
+ * (for example immediately after reloading the extension while the tab stays open).
+ */
+export function conversationInfoFromSupportedUrl(rawUrl) {
+  try {
+    const u = new URL(String(rawUrl || ""));
+    const host = u.hostname.toLowerCase();
+    const pathname = u.pathname.replace(/\/+$/, "") || "/";
+    if (host === "chatgpt.com" || host === "www.chatgpt.com") {
+      const normal = /^\/c\/[^/]+$/.test(pathname);
+      const project = /^\/g\/g-p-[^/]+\/c\/[^/]+$/.test(pathname);
+      if (!normal && !project) return null;
+      return { convKey: `${u.origin}${pathname}`, url: u.href, site: "chatgpt" };
+    }
+  } catch (_) {}
+  return null;
+}
+
+/**
  * Pure wake-decision function.
  * @param {{status: string|null, lastSettle: {seq: any, at: number}|null}} prev
  * @param {"hello"|"working"|"settled"} kind

@@ -20,6 +20,7 @@ import {
   isIdleNudgeText, looksLikeSubstantiveReply, isHerdrWakeComposerText,
   interpretLlmJudgeReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage,
   parseLlmSkipKeywords, llmReplyMatchesSkipKeyword, assistantNudgeFingerprint,
+  conversationInfoFromSupportedUrl,
 } from "../../extension/binding-core.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -48,9 +49,9 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.37", "manifest version keeps discovery transport alive without bindings");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.37"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.37"'), "content version matches manifest");
+ok(manifest.version === "0.1.38", "manifest version keeps discovery transport alive without bindings");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.38"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.38"'), "content version matches manifest");
 ok(
   backgroundSource.includes("bound_workspace_ids:") && backgroundSource.includes("workspaces: state?.ok"),
   "page HUD response carries live workspaces and bound workspace ids",
@@ -129,6 +130,24 @@ ok(
   const key = vm.runInContext("new BaseAdapter().getConversationKey()", ctx);
   ok(key === projectConversation, "ChatGPT project conversation URL is preserved as the binding key");
 }
+{
+  const normal = "https://chatgpt.com/c/6a89c95e-70bc-83ea-bf3d-fab6b83fc86e";
+  const project = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/c/6a8ae745-a3dc-83ea-91f0-218dd5be7807";
+  ok(conversationInfoFromSupportedUrl(normal)?.convKey === normal,
+    "URL fallback recognizes a normal ChatGPT conversation");
+  ok(conversationInfoFromSupportedUrl(project)?.convKey === project,
+    "URL fallback recognizes the reported ChatGPT project conversation");
+  ok(conversationInfoFromSupportedUrl("https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978") === null,
+    "URL fallback rejects a ChatGPT project page without a conversation");
+  ok(conversationInfoFromSupportedUrl("https://example.com/c/abc") === null,
+    "URL fallback rejects unsupported hosts");
+}
+
+ok(
+  backgroundSource.includes("conversationInfoForTab(msg.tabId)")
+    && backgroundSource.includes('files: ["content/base.js", "content/injector/chatgpt.js", "content/wake.js"]'),
+  "popup/bind recovery reinjects ChatGPT content scripts when an open tab lost its MV3 listener",
+);
 
 const localeCodes = ["en", "zh", "ja"];
 const localeHud = {};

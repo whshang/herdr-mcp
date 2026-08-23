@@ -15,9 +15,10 @@ import {
   isIdleNudgeText, looksLikeSubstantiveReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage, interpretLlmJudgeReply,
   assistantNudgeFingerprint,
   DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
+  conversationInfoFromSupportedUrl,
 } from "./binding-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.37";
+const H2W_SCRIPT_VERSION = "0.1.38";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const PUSH_CONNECT_MS = 5000;
 const STATE_FETCH_MS = 4000;
@@ -99,6 +100,35 @@ function setActionBadge(text, color, clearAfterMs = 0) {
 }
 function clearActionBadge() {
   try { chrome.action.setBadgeText({ text: "" }); } catch (e) {}
+}
+
+async function conversationInfoForTab(tabId) {
+  if (!tabId) return null;
+  try {
+    const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
+    if (live?.convKey) return live;
+  } catch (_) {}
+
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch (_) {}
+  const fallback = conversationInfoFromSupportedUrl(tab?.url);
+  if (!fallback) return null;
+
+  // A manual MV3 extension reload can leave an already-open ChatGPT tab without
+  // a live listener even when the extension version did not change. Recover the
+  // content script in-place, then prefer its canonical adapter identity.
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content/base.js", "content/injector/chatgpt.js", "content/wake.js"],
+    });
+    await sleep(50);
+    const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
+    if (live?.convKey) return live;
+  } catch (e) {
+    callLog(`content-script recovery failed for tab ${tabId}:`, e.message);
+  }
+  return fallback;
 }
 
 // ---- Content-script version synchronization ----
@@ -1138,7 +1168,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       void ensureAlive(bindings);
       let convInfo = null;
       if (msg.tabId) {
-        try { convInfo = await chrome.tabs.sendMessage(msg.tabId, { type: "h2w_get_convkey" }); } catch (e) { convInfo = null; }
+        convInfo = await conversationInfoForTab(msg.tabId);
       }
       const binding = convInfo ? primaryBindingForConv(bindings, convInfo.convKey) : null;
       const sessionBindings = convInfo
@@ -1189,8 +1219,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const bindings = await loadBindings();
       const tabId = msg.tabId || sender.tab?.id;
       if (!tabId) { sendResponse({ ok: false, error: "tab-unavailable" }); return; }
-      let convInfo = null;
-      try { convInfo = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" }); } catch (e) {}
+      const convInfo = await conversationInfoForTab(tabId);
       if (!convInfo?.convKey) { sendResponse({ ok: false, error: "conversation-unavailable" }); return; }
       const workspace_id = msg.workspace_id
         || (typeof msg.pane === "string" && msg.pane.includes(":") ? msg.pane.split(":")[0] : null);
