@@ -216,7 +216,6 @@ async function loadBindings() {
     if (prunedKeys.length) {
       callLog(`pruned ${prunedKeys.length} expired bindings: ${prunedKeys.join(", ")}`);
       for (const k of prunedKeys) clearProgressTimer(k);
-      if (!Object.keys(kept).length) stopPushStream();
     }
     if (migrated) callLog("migrated legacy binding keys to convKey::workspace_id");
     try { await chrome.storage.local.set({ herdrWakeBindings: kept }); } catch (e) {}
@@ -1250,10 +1249,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         lastTurnEndedPayload.delete(convKey);
       }
       if (tabId) { try { chrome.tabs.sendMessage(tabId, { type: "h2w_unbound", workspace_id: wsId || null }); } catch (e) {} }
-      if (!Object.keys(bindings).length) {
-        clearActionBadge();
-        stopPushStream();
-      }
+      if (!Object.keys(bindings).length) clearActionBadge();
       sendResponse({ ok: true });
     })();
     return true;
@@ -1319,6 +1315,10 @@ async function fetchState() {
 async function rebuildStreams() {
   await configReady;
   stopPushStream();
+  // A configured endpoint may have changed; never show a workspace catalog
+  // from the previous server while the new shared stream is reconnecting.
+  pushWorkspaceCatalog = [];
+  pushWorkspaceCatalogAt = 0;
   const bindings = await loadBindings();
   callLog(
     `rebuild streams v${H2W_SCRIPT_VERSION}: ${Object.keys(bindings).length} binding(s),`,
