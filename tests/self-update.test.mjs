@@ -464,18 +464,25 @@ test("release gates align with CI (build/root/edge/site/extension), never deploy
   assert.equal(cmds.some((c) => /deploy|wrangler|publish/.test(c)), false);
 });
 
-test("release gate environment drops production contract-profile overrides", () => {
+test("release gate environment drops production contract and runtime identity overrides", () => {
   const clean = releaseGateEnv({
     PATH: "/bin:/usr/bin",
     HOME: "/tmp/example",
     HERDR_MCP_CONTRACT_PROFILE: "epoch1",
     HERDR_MCP_ALL_TOOLS: "1",
+    HERDR_CONTRACT_HASH: "sha256:prod-contract",
+    HERDR_CONTRACT_EPOCH: "1",
+    HERDR_RUNTIME_VERSION: "0.3.26",
     HERDR_RUNTIME_GENERATION: "stable-026",
   });
   assert.equal(clean.HERDR_MCP_CONTRACT_PROFILE, undefined);
   assert.equal(clean.HERDR_MCP_ALL_TOOLS, undefined);
-  assert.equal(clean.HERDR_RUNTIME_GENERATION, "stable-026");
+  assert.equal(clean.HERDR_CONTRACT_HASH, undefined);
+  assert.equal(clean.HERDR_CONTRACT_EPOCH, undefined);
+  assert.equal(clean.HERDR_RUNTIME_VERSION, undefined);
+  assert.equal(clean.HERDR_RUNTIME_GENERATION, undefined);
   assert.equal(clean.PATH, "/bin:/usr/bin");
+  assert.equal(clean.HOME, "/tmp/example");
 });
 
 test("parseArgs understands the supported CLI surface and rejects unknowns", () => {

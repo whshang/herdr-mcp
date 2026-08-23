@@ -55,6 +55,10 @@ export function releaseGateEnv(env = process.env) {
   const clean = { ...env };
   delete clean.HERDR_MCP_CONTRACT_PROFILE;
   delete clean.HERDR_MCP_ALL_TOOLS;
+  delete clean.HERDR_CONTRACT_HASH;
+  delete clean.HERDR_CONTRACT_EPOCH;
+  delete clean.HERDR_RUNTIME_VERSION;
+  delete clean.HERDR_RUNTIME_GENERATION;
   return clean;
 }
 
