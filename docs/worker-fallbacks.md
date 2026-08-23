@@ -7,7 +7,7 @@ herdr-mcp keeps the web model as the planner. Local agent CLIs are execution wor
 | Priority | Worker | Invocation | Intended use |
 |---|---|---|---|
 | 1 | Herdr-native cheap worker, especially Pi | `herdr_prompt` | Normal coding/investigation when local reasoning is useful |
-| 2 | DeepSeek Harness headless | `herdr_exec_start` running `dsh --profile headless "..."` | Fallback coding worker when Pi/Herdr-native workers are unavailable or a second implementation is useful |
+| 2 | DeepSeek Harness headless | `herdr_exec_start` running `dsh --profile headless "..."` | Bounded fallback for narrow/self-contained coding or review when Pi/Herdr-native workers are unavailable or a second implementation is useful; do not put broad critical-path refactors behind it |
 | 3 | Cline / OpenCode / Anti | `herdr_prompt` when present in a Herdr pane | Alternative Herdr-native coding workers |
 | Human fallback | dsh-tui | interactive terminal | Manual takeover, inspection, resume, approvals; not the default automated worker |
 | Audit | Droid / Grok | `herdr_prompt` | Independent review after implementation, not primary editing by default |
@@ -108,6 +108,39 @@ This is the intended fallback model: DSH is a capable coding worker, but it is
 not allowed to stall the critical path indefinitely. Give it a task-appropriate
 budget; if there is no useful output or diff, inspect process/Git state before
 cancelling, then fall back to direct fs/exec/browser evidence or another worker.
+
+### Headless scheduling lesson from the docs redesign — 2026-08-23
+
+The documentation-site redesign provided a stricter orchestration test than the
+temporary-repository smoke. Several increasingly constrained headless jobs were
+given the same isolated worktree: first the broad redesign, then a fixed file
+scope, then an exact navigation map and execution-only instructions. They spent
+roughly minutes in analysis/tool reads without producing a tracked diff, while
+the deterministic web-planner path implemented and validated the change within
+the same worktree.
+
+A per-invocation headless configuration override was also tested to reduce
+reasoning and to select a faster execution model. That improved trivial no-tool
+smokes but did **not** make the multi-file coding or P0/P1 review tasks reliably
+fast enough for the critical path. The reusable rule is therefore about task
+shape and evidence, not about one provider or model:
+
+- keep architecture, information architecture and cross-file planning with the
+  web planner;
+- give DSH a narrow task with explicit owned files, expected validation and a
+  time/diff checkpoint;
+- if the checkpoint arrives with neither useful output nor a relevant diff,
+  inspect Git/process state once, cancel if appropriate, and continue with
+  deterministic tools or a Herdr-native worker;
+- prompt wording such as “implement now” is not a substitute for orchestration
+  budgets and completion evidence;
+- model/reasoning overrides for automated headless jobs, when useful, should be
+  scoped to the headless invocation/profile (for example through a temporary
+  `--patch`), not written into the operator's global interactive/TUI profile as
+  an automation side effect.
+
+DSH remains useful as an optional fallback and for narrow independent checks;
+it is not the default owner of a broad multi-file implementation.
 
 ## dsh-tui
 
