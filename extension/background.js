@@ -10,13 +10,14 @@
 // Keep H2W_SCRIPT_VERSION here aligned with H2W_CONTENT_VERSION in wake.js.
 import {
   decideWorkspaceWake, agentsInWorkspace, formatWorkspaceRoster, workspaceTitleWithId,
+  reconcileWorkspaceWakeKind,
   pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
   isIdleNudgeText, looksLikeSubstantiveReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage, interpretLlmJudgeReply,
   assistantNudgeFingerprint,
   DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
 } from "./binding-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.34";
+const H2W_SCRIPT_VERSION = "0.1.35";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const PUSH_CONNECT_MS = 5000;
 const STATE_FETCH_MS = 4000;
@@ -424,13 +425,19 @@ async function onPushSettled(storeKey, data) {
     agent: data.agent || b.agent,
     pane: data.pane || b.pane,
   };
-  if (d.kind === "partial") {
-    callLog(`partial settled: ${data.pane} @ ${ws}, still working=${d.working_count}`);
-    await routeWake(b, fields, DEFAULT_PARTIAL_TEMPLATE);
+  const routed = await routeWake(
+    b,
+    fields,
+    d.kind === "partial" ? DEFAULT_PARTIAL_TEMPLATE : (CFG.wakeTemplate || DEFAULT_TEMPLATE),
+    d.kind,
+  );
+  const finalKind = routed?.h2w_wake_kind || d.kind;
+  const finalWorkingCount = routed?.working_count ?? d.working_count;
+  if (finalKind === "partial") {
+    callLog(`partial settled: ${data.pane} @ ${ws}, still working=${finalWorkingCount}`);
     setActionBadge("…", "#d97706");
   } else {
     callLog(`round settled: ws=${ws} last=${data.pane} → ${data.status}`);
-    await routeWake(b, fields, CFG.wakeTemplate || DEFAULT_TEMPLATE);
     setActionBadge("✓", "#16a34a", 4000);
   }
 }
@@ -812,7 +819,7 @@ function reconcileProgressTimers(bindings) {
   }
 }
 
-async function routeWake(b, extra, template = CFG.wakeTemplate || DEFAULT_TEMPLATE) {
+async function routeWake(b, extra, template = CFG.wakeTemplate || DEFAULT_TEMPLATE, wakeKind = null) {
   if (!CFG.enabled) return { ok: false, reason: "disabled" };
   const isLlmNudge = extra.status === "llm_continue_nudge";
   const rawText = String(template || "").trim();
@@ -861,7 +868,13 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || DEFAULT_TEMPLA
       if (!workspace_label) workspace_label = workspaceTitleWithId({ id: ws, label: b.workspace_label });
     }
   }
-  let rendered = buildWakeTemplate(template, {
+  const effectiveWakeKind = wakeKind ? reconcileWorkspaceWakeKind(wakeKind, working_count) : null;
+  const effectiveTemplate = effectiveWakeKind === "partial"
+    ? DEFAULT_PARTIAL_TEMPLATE
+    : effectiveWakeKind === "round"
+      ? (CFG.wakeTemplate || DEFAULT_TEMPLATE)
+      : template;
+  let rendered = buildWakeTemplate(effectiveTemplate, {
     agent: extra.agent ?? b.focus_agent ?? b.agent,
     pane: focusPane,
     status: extra.status,
@@ -873,10 +886,10 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || DEFAULT_TEMPLA
     idle_hint,
   });
   // Append roster and idle_hint when custom templates omit their placeholders.
-  if (roster && !String(template || "").includes("{roster}")) {
+  if (roster && !String(effectiveTemplate || "").includes("{roster}")) {
     rendered = `${rendered}\n\n${roster}`.trim();
   }
-  if (idle_hint && !String(template || "").includes("{idle_hint}") && !rendered.includes(idle_hint)) {
+  if (idle_hint && !String(effectiveTemplate || "").includes("{idle_hint}") && !rendered.includes(idle_hint)) {
     rendered = `${rendered}\n\n${idle_hint}`.trim();
   }
   const payload = {
@@ -896,7 +909,12 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || DEFAULT_TEMPLA
     },
   };
 
-  return deliverWakeToTab(b, payload);
+  const result = await deliverWakeToTab(b, payload);
+  return {
+    ...(result || {}),
+    h2w_wake_kind: effectiveWakeKind,
+    working_count,
+  };
 }
 
 async function deliverWakeToTab(b, payload) {

@@ -6,6 +6,13 @@ Versions below follow `src/version.ts` / `package.json`. Git has no tags; 0.3.19
 
 ChatGPT can retain a `tools/list` snapshot for a conversation. A runtime version bump does **not** have to change that public catalog: production may run a newer implementation under a frozen contract profile. Only a deliberate contract/tool-surface change requires Connector/tool-snapshot migration and a new chat.
 
+## 0.3.28 — 2026-08-23
+
+- Fix the real self-update post-reload probe discovered during the 0.3.27 production upgrade: `server/discover` version validation now accepts the current `_meta["io.modelcontextprotocol/serverInfo"]` shape as well as the legacy direct `serverInfo` shape.
+- Treat a launchd reload attempt as a runtime-switch boundary before verification. Rollback now restores, reloads, and verifies the original 8772 runtime before re-activating the original generation pointer, and bootstrap results are checked through `reloadServer().ok`.
+- Epoch-1 `initialize.instructions` no longer tells a web planner to call the intentionally hidden `herdr_skill`; current-contract sessions still use the project skill, while frozen 17-tool sessions use `herdr_inspect` + live method reflection.
+- Browser extension **0.1.35** reconciles partial-vs-round wake messages against a fresh workspace snapshot immediately before rendering, so stale settle events cannot contradict the latest worker count.
+
 ## 0.3.27 — 2026-08-23
 
 - `herdr_skill` becomes a **herdr-mcp remote-planner operating skill**, not merely a copy of the native Herdr tutorial: project policy covers deterministic tool order, direct code edits, cheap-worker preferences, DSH fallback rules, mutation/idempotency discipline, browser boundary, CI/CD, and supervised self-upgrade. Calls also include live runtime/generation/update context and an explicitly scoped, release-matched `herdr --skill` native reference.
@@ -29,6 +36,7 @@ ChatGPT can retain a `tools/list` snapshot for a conversation. A runtime version
 - Browser extension **0.1.32**: keep conversation registration synchronized across SPA navigation, including ChatGPT project conversation URLs (`/g/g-p-…/c/…`), so the in-page workspace picker follows the currently visible conversation without a full page reload.
 - Browser extension **0.1.33**: replace one-SSE-per-workspace with one shared `/push/events` stream and fan out by workspace in the service worker. This prevents historical bindings from exhausting Chromium's per-origin HTTP connection pool and starving `/push/state`, which previously made the in-page workspace picker appear permanently empty.
 - Browser extension **0.1.34**: bound localhost state requests and SSE connection handshakes, expose Chrome 145+ loopback-network permission failures instead of hanging, and make Options use the same background transport as popup/HUD. The UI now points users to the extension-specific “Apps on device” permission when Chrome gates `127.0.0.1`.
+- Browser extension **0.1.35**: reconcile partial-vs-round wake messages against a fresh `/push/state` snapshot immediately before rendering. A stale settle event can no longer produce the contradictory “0 still working / partial finish” message; badge state and text now follow the same final workspace state.
 
 ## 0.3.18 — 2026-08-21
 

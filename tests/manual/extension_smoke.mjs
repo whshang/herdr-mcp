@@ -15,7 +15,7 @@ import vm from "node:vm";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  decideWake, decideWorkspaceWake, agentsInWorkspace, formatWorkspaceRoster, workspaceTitleWithId, pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
+  decideWake, decideWorkspaceWake, reconcileWorkspaceWakeKind, agentsInWorkspace, formatWorkspaceRoster, workspaceTitleWithId, pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
   progressOutputFingerprint,
   isIdleNudgeText, looksLikeSubstantiveReply, isHerdrWakeComposerText,
   interpretLlmJudgeReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage,
@@ -48,9 +48,9 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.34", "manifest version includes shared SSE + loopback diagnostics release");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.34"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.34"'), "content version matches manifest");
+ok(manifest.version === "0.1.35", "manifest version includes settled-wake reconciliation release");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.35"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.35"'), "content version matches manifest");
 ok(
   backgroundSource.includes("bound_workspace_ids:") && backgroundSource.includes("workspaces: state?.ok"),
   "page HUD response carries live workspaces and bound workspace ids",
@@ -80,6 +80,10 @@ ok(
     && backgroundSource.includes("STATE_FETCH_MS = 4000")
     && backgroundSource.includes("loopback_permission_"),
   "localhost transport is bounded and reports Chrome loopback permission state",
+);
+ok(
+  backgroundSource.includes("reconcileWorkspaceWakeKind(wakeKind, working_count)"),
+  "final wake template is reconciled against the fresh workspace working count",
 );
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 ok(
@@ -170,6 +174,9 @@ console.log("\n[decideWorkspaceWake]");
   ok(w.wake && w.kind === "partial" && w.status === "working" && w.working_count === 1, "workspace partial settle emits partial wake");
   w = decideWorkspaceWake({ status: "working", lastSettle: null }, "settled", { status: "done", seq: 4, pane: "wH:p2" }, []);
   ok(w.wake && w.kind === "round" && w.working_count === 0, "fully settled workspace emits round wake");
+  ok(reconcileWorkspaceWakeKind("partial", 0) === "round", "stale partial wake becomes round when fresh state has zero workers");
+  ok(reconcileWorkspaceWakeKind("partial", 2) === "partial", "partial wake remains partial while peers are still working");
+  ok(reconcileWorkspaceWakeKind("round", 1) === "partial", "stale round wake becomes partial when fresh state still has a worker");
   ok(agentsInWorkspace([{ workspace: "wH" }, { workspace: "wX" }], "wH").length === 1, "agentsInWorkspace filters by workspace");
   const pack = formatWorkspaceRoster([
     { pane: "wH:p1", name: "pi", status: "done", terminal_title: "fix tests", cwd: "/tmp/a", workspace: "wH" },

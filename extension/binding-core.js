@@ -180,6 +180,13 @@ export function buildWakeTemplate(template, fields) {
  * - working: always arm without waking
  * - settled: emit partial while peers remain working, or round when all are settled
  */
+export function reconcileWorkspaceWakeKind(kind, workingCount) {
+  const n = Number.isFinite(Number(workingCount)) ? Math.max(0, Number(workingCount)) : 0;
+  if (kind === "partial" && n === 0) return "round";
+  if (kind === "round" && n > 0) return "partial";
+  return kind;
+}
+
 export function decideWorkspaceWake(prev, kind, data, scopeAgents) {
   const status = prev?.status ?? null;
   const lastSettle = prev?.lastSettle ?? null;
