@@ -5,7 +5,7 @@
 
 | 主线 | 问题 | 方向 | 状态 | 首批站点 |
 |---|---|---|---|---|
-| **A. 进度回推** | 网页派活到 herdr 后，对话不再观察/继续 | herdr → 网页（写输入框并提交） | **已可用**（扩展 0.1.35） | chatgpt / deepseek / z.ai / claude |
+| **A. 进度回推** | 网页派活到 herdr 后，对话不再观察/继续 | herdr → 网页（写输入框并提交） | **已可用**（扩展 0.1.36） | chatgpt / deepseek / z.ai / claude |
 | **B. JSON→MCP** | DeepSeek / z.ai 网页没有 MCP Connector | 网页 → 本机 `127.0.0.1:8772/mcp` | **未完成**（能抠 JSON，未调 MCP） | `chat.deepseek.com`、`chat.z.ai` |
 
 共享：同一扩展、同一静态 token、同一 options。  

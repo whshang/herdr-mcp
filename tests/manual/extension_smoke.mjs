@@ -48,9 +48,9 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.35", "manifest version includes settled-wake reconciliation release");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.35"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.35"'), "content version matches manifest");
+ok(manifest.version === "0.1.36", "manifest version includes cached workspace catalog release");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.36"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.36"'), "content version matches manifest");
 ok(
   backgroundSource.includes("bound_workspace_ids:") && backgroundSource.includes("workspaces: state?.ok"),
   "page HUD response carries live workspaces and bound workspace ids",
@@ -84,6 +84,17 @@ ok(
 ok(
   backgroundSource.includes("reconcileWorkspaceWakeKind(wakeKind, working_count)"),
   "final wake template is reconciled against the fresh workspace working count",
+);
+ok(
+  backgroundSource.includes("cachePushWorkspaceCatalog(data.workspaces)")
+    && backgroundSource.includes('source: "push_hello_cache"')
+    && backgroundSource.includes("cachedPushWorkspaceCatalog()"),
+  "HUD can render workspaces from the shared SSE hello catalog",
+);
+ok(
+  backgroundSource.includes("if (stateFetchInFlight) return stateFetchInFlight")
+    && !backgroundSource.includes("pushStream || !Object.keys(bindings || {}).length"),
+  "workspace discovery keeps one shared SSE and deduplicates state fetches",
 );
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 ok(

@@ -37,6 +37,7 @@ ChatGPT can retain a `tools/list` snapshot for a conversation. A runtime version
 - Browser extension **0.1.33**: replace one-SSE-per-workspace with one shared `/push/events` stream and fan out by workspace in the service worker. This prevents historical bindings from exhausting Chromium's per-origin HTTP connection pool and starving `/push/state`, which previously made the in-page workspace picker appear permanently empty.
 - Browser extension **0.1.34**: bound localhost state requests and SSE connection handshakes, expose Chrome 145+ loopback-network permission failures instead of hanging, and make Options use the same background transport as popup/HUD. The UI now points users to the extension-specific “Apps on device” permission when Chrome gates `127.0.0.1`.
 - Browser extension **0.1.35**: reconcile partial-vs-round wake messages against a fresh `/push/state` snapshot immediately before rendering. A stale settle event can no longer produce the contradictory “0 still working / partial finish” message; badge state and text now follow the same final workspace state.
+- Browser extension **0.1.36**: keep one shared `/push/events` stream whenever wake is enabled and cache its authoritative `hello.workspaces` catalog for the in-page picker. The HUD renders that catalog immediately, while concurrent `/push/state` refreshes are coalesced into one bounded request.
 
 ## 0.3.18 — 2026-08-21
 

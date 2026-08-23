@@ -17,7 +17,7 @@ import {
   DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
 } from "./binding-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.35";
+const H2W_SCRIPT_VERSION = "0.1.36";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const PUSH_CONNECT_MS = 5000;
 const STATE_FETCH_MS = 4000;
@@ -236,6 +236,21 @@ async function saveBindings(b) {
 let pushStream = null; // { ctrl }
 let pushDispatch = Promise.resolve();
 const pendingOutputByPane = new Map(); // `${storeKey}::${pane}` -> output
+let pushWorkspaceCatalog = [];
+let pushWorkspaceCatalogAt = 0;
+let stateFetchInFlight = null;
+
+function cachePushWorkspaceCatalog(workspaces) {
+  if (!Array.isArray(workspaces)) return;
+  pushWorkspaceCatalog = workspaces
+    .filter((w) => w && typeof w === "object" && typeof w.id === "string" && w.id)
+    .map((w) => ({ ...w }));
+  pushWorkspaceCatalogAt = Date.now();
+}
+
+function cachedPushWorkspaceCatalog() {
+  return pushWorkspaceCatalog.map((w) => ({ ...w }));
+}
 
 function pendingKey(storeKey, pane) {
   return `${storeKey}::${pane || "_"}`;
@@ -249,7 +264,10 @@ function stopPushStream() {
 
 async function ensurePushStream(bindings) {
   await configReady;
-  if (pushStream || !Object.keys(bindings || {}).length) return;
+  // Keep exactly one extension-wide stream whenever wake is enabled, even
+  // before the first binding. Its hello snapshot is also the authoritative
+  // workspace catalog used by the in-page picker.
+  if (pushStream || CFG.enabled === false) return;
   const ctrl = new AbortController();
   pushStream = { ctrl };
   void runPushStream(ctrl);
@@ -321,6 +339,7 @@ async function handlePushBlock(block) {
     ? entries.filter(([, b]) => normalizeWorkspaceId(b) === data.workspace)
     : entries;
   if (event === "hello") {
+    cachePushWorkspaceCatalog(data.workspaces);
     for (const [storeKey] of entries) await onPushHello(storeKey, data);
   } else if (event === "agent_working") {
     for (const [storeKey] of scoped) await onPushWorking(storeKey, data);
@@ -1029,7 +1048,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const bindings = await loadBindings();
       const session = convKey ? bindingsForConv(bindings, convKey) : [];
       const labels = session.map((b) => b.workspace_label || b.workspace_id).filter(Boolean);
-      const state = await fetchState();
+      const cachedWorkspaces = cachedPushWorkspaceCatalog();
+      // /push/events hello already carries the authoritative workspace list.
+      // Render that immediately; /push/state becomes an async freshness probe.
+      const state = cachedWorkspaces.length
+        ? { ok: true, workspaces: cachedWorkspaces, source: "push_hello_cache", cached_at: pushWorkspaceCatalogAt }
+        : await fetchState();
+      if (cachedWorkspaces.length) void fetchState();
       let llmHost = "";
       try {
         llmHost = CFG.llmJudgeBaseUrl ? new URL(llmJudgeCompletionsUrl(CFG.llmJudgeBaseUrl)).host : "";
@@ -1050,6 +1075,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         binding_count: session.length,
         bound_workspace_ids: session.map((b) => b.workspace_id || normalizeWorkspaceId(b)).filter(Boolean),
         workspaces: state?.ok && Array.isArray(state.workspaces) ? state.workspaces : [],
+        workspace_source: state?.source || (state?.ok ? "push_state" : null),
         workspace_status: state?.ok ? 200 : (state?.status || 0),
         workspace_error: state?.ok ? null : (state?.error || (state?.status ? `HTTP ${state.status}` : "fetch-failed")),
         last: last ? {
@@ -1249,7 +1275,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   sendResponse({});
 });
 
-async function fetchState() {
+async function fetchStateFresh() {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), STATE_FETCH_MS);
   try {
@@ -1258,7 +1284,9 @@ async function fetchState() {
       signal: ctrl.signal,
     });
     if (!resp.ok) return { ok: false, status: resp.status };
-    return { ok: true, ...(await resp.json()) };
+    const body = await resp.json();
+    if (Array.isArray(body?.workspaces)) cachePushWorkspaceCatalog(body.workspaces);
+    return { ok: true, source: "push_state", ...body };
   } catch (e) {
     let loopback_permission = null;
     try {
@@ -1277,6 +1305,14 @@ async function fetchState() {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchState() {
+  // HUD, popup, progress and wake reconciliation share one bounded localhost
+  // request instead of multiplying sockets when they refresh concurrently.
+  if (stateFetchInFlight) return stateFetchInFlight;
+  stateFetchInFlight = fetchStateFresh().finally(() => { stateFetchInFlight = null; });
+  return stateFetchInFlight;
 }
 
 // Full rebuild: exactly one shared stream regardless of binding count.
