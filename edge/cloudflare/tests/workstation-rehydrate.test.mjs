@@ -61,7 +61,7 @@ test("cold start settles a full stale pending registry without replaying operati
   const response = await subject.fetch(new Request("https://do/internal/status"));
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.equal(body.active_requests, 0);
+  assert.equal(body.activeRequests, 0);
   assert.equal([...storage.map.keys()].filter((key) => key.startsWith("pending:")).length, 0);
   assert.equal([...storage.map.keys()].filter((key) => key.startsWith("completed:")).length, 16);
   assert.equal(sent.length, 0, "rehydration must never replay a stored tool_request");
@@ -76,7 +76,7 @@ test("cold start keeps future pending work and re-arms its deadline", async () =
   const response = await subject.fetch(new Request("https://do/internal/status"));
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.equal(body.active_requests, 1);
+  assert.equal(body.activeRequests, 1);
   assert.ok(storage.map.has("pending:future"));
   assert.equal(storage.alarm, deadline);
 });
