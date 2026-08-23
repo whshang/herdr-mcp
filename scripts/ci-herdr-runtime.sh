@@ -29,6 +29,7 @@ HERDR_BIN="${INSTALL_DIR}/herdr"
 # same path) connect automatically. Overridable for isolated local testing.
 STATE_DIR="${HERDR_STATE_DIR:-$HOME/.config/herdr}"
 SOCKET="${HERDR_SOCKET:-${STATE_DIR}/herdr.sock}"
+PID_FILE="${STATE_DIR}/ci-server.pid"
 
 log() { printf '[ci-herdr] %s\n' "$*" >&2; }
 err() { printf '[ci-herdr] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -69,11 +70,24 @@ start_server() {
   esac
   log "starting headless herdr server (socket=${SOCKET})"
   mkdir -p "${STATE_DIR}"
-  # Detached headless server with interleaved output captured to a log.
-  HERDR_SOCKET_PATH="${SOCKET}" "${HERDR_BIN}" server >"${STATE_DIR}/ci-server.log" 2>&1 || true
+  rm -f "${PID_FILE}"
+  # `herdr server` is intentionally a foreground headless server. Start it as a
+  # real background child for CI; otherwise this script blocks here forever and
+  # the readiness loop below never runs. stdin/stdout/stderr are fully detached
+  # from the Actions step and the PID is persisted for bounded cleanup.
+  HERDR_SOCKET_PATH="${SOCKET}" "${HERDR_BIN}" server \
+    </dev/null >"${STATE_DIR}/ci-server.log" 2>&1 &
+  local server_pid=$!
+  printf '%s\n' "${server_pid}" >"${PID_FILE}"
+  log "herdr server spawned pid=${server_pid}"
   # Wait for the server to report running.
   local i ok=0
   for i in $(seq 1 60); do
+    if ! kill -0 "${server_pid}" 2>/dev/null; then
+      log "server exited before readiness"
+      tail -n 25 "${STATE_DIR}/ci-server.log" >&2 || true
+      err "herdr server process exited before becoming ready"
+    fi
     if HERDR_SOCKET_PATH="${SOCKET}" "${HERDR_BIN}" status server --json 2>/dev/null \
         | grep -q '"running":true'; then
       log "herdr server ready after ${i}s"
@@ -100,10 +114,39 @@ start_server() {
 }
 
 stop_server() {
+  local server_pid=""
+  if [ -f "${PID_FILE}" ]; then
+    server_pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+  fi
   if [ -x "${HERDR_BIN}" ]; then
     log "stopping herdr server (socket=${SOCKET})"
     HERDR_SOCKET_PATH="${SOCKET}" "${HERDR_BIN}" server stop >/dev/null 2>&1 || true
   fi
+  # Validate the pidfile content is a positive integer before acting on it.
+  if printf '%s\n' "${server_pid}" | grep -Eq '^[0-9]+$' && [ "${server_pid}" -gt 0 ] \
+      && kill -0 "${server_pid}" 2>/dev/null; then
+    # Grace period for the socket-level stop, then TERM, then KILL — bounding all
+    # signals to the exact CI child we spawned. Never a broad pkill on shared
+    # runners.
+    local i
+    for i in $(seq 1 20); do
+      kill -0 "${server_pid}" 2>/dev/null || break
+      sleep 0.25
+    done
+    if kill -0 "${server_pid}" 2>/dev/null; then
+      log "pid ${server_pid} still alive; sending TERM"
+      kill -TERM "${server_pid}" 2>/dev/null || true
+      for i in $(seq 1 10); do
+        kill -0 "${server_pid}" 2>/dev/null || break
+        sleep 0.25
+      done
+      if kill -0 "${server_pid}" 2>/dev/null; then
+        log "pid ${server_pid} still alive after TERM; sending KILL"
+        kill -KILL "${server_pid}" 2>/dev/null || true
+      fi
+    fi
+  fi
+  rm -f "${PID_FILE}"
   log "herdr server stopped"
 }
 
