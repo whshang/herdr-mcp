@@ -106,6 +106,8 @@ test("HERDR_MCP_CONTRACT_PROFILE=epoch1 advertises exact frozen 17-tool hash on 
     const instructions = initialized.body?.result?.instructions || "";
     assert.match(instructions, /herdr_skill tool is intentionally not exposed/i);
     assert.doesNotMatch(instructions, /then herdr_skill|Before herdr_call: herdr_skill/i);
+    assert.match(instructions, /dsh --profile headless via herdr_exec_start/i);
+    assert.doesNotMatch(instructions, /herdr_prompt[^.]*dsh/i);
   } finally {
     child.kill("SIGTERM");
     await new Promise((resolve) => {

@@ -130,6 +130,7 @@ test("working-tree plan carries exclusions and never plans Edge/DNS/Worker/Tunne
   const plan = buildPlan({ source: "working-tree", ref: "main" }, fakeEnv(base));
   assert.equal(plan.source, "working-tree");
   assert.equal(plan.version, "0.3.26");
+  assert.equal(plan.version_resolution, "working_tree");
   assert.equal(plan.stable_generation, "stable-0.3.26");
   assert.match(plan.commands.sourcePrep[0], /exclude \.git,node_modules,dist,edge\/cloudflare\/dist/);
   assert.equal(plan.commands.deploy, "none (Edge never deployed)");
@@ -147,8 +148,12 @@ test("working-tree plan carries exclusions and never plans Edge/DNS/Worker/Tunne
 test("remote plan contains git fetch + detached worktree and no deploy", async () => {
   const base = await mkdtemp(join(tmpdir(), "su-plan-"));
   await mkdir(join(base, "repo"), { recursive: true });
-  await writeFile(join(base, "repo", "package.json"), JSON.stringify({ name: "herdr-mcp", version: "0.3.26" }));
+  await writeFile(join(base, "repo", "package.json"), JSON.stringify({ name: "herdr-mcp", version: "9.9.9" }));
   const plan = buildPlan({ source: "remote", ref: "main" }, fakeEnv(base));
+  assert.equal(plan.version, null);
+  assert.equal(plan.version_resolution, "after_fetch");
+  assert.equal(plan.candidate_generation, null);
+  assert.equal(plan.stable_generation, null);
   assert.deepEqual(plan.commands.sourcePrep, ["git fetch origin <ref>", "git worktree add --detach <release> FETCH_HEAD"]);
   assert.equal(plan.noEdgeDeploy, true);
 });

@@ -468,19 +468,24 @@ export function buildPlan(args, env = process.env) {
   if (args.source !== "working-tree" && args.source !== "remote") {
     throw new RangeError(`invalid source: ${args.source}`);
   }
-  const version = readVersionFromRepo(paths.repoPath);
-  const jobId = newJobId(version);
-  const releaseDir = join(paths.releasesDir, `${shortDigest(version)}-${jobId}`);
+  // Remote targets are resolved only after the worker fetches the requested ref.
+  // Never borrow a version from the caller's dirty working tree for a remote plan.
+  const version = args.source === "working-tree" ? readVersionFromRepo(paths.repoPath) : null;
+  const ref = args.ref || "main";
+  const planSeed = version || `remote:${ref}`;
+  const jobId = newJobId(planSeed);
+  const releaseDir = join(paths.releasesDir, `${shortDigest(planSeed)}-${jobId}`);
   return {
     schema_version: 1,
     job_id: jobId,
     source: args.source,
-    ref: args.ref || "main",
+    ref,
     version,
+    version_resolution: args.source === "remote" ? "after_fetch" : "working_tree",
     release: releaseDir,
-    candidate_generation: candidateGenerationId(version, jobId),
+    candidate_generation: version ? candidateGenerationId(version, jobId) : null,
     candidate_endpoint: "",
-    stable_generation: stableGenerationId(version),
+    stable_generation: version ? stableGenerationId(version) : null,
     control_path: paths.controlPath,
     status_path: paths.statusPath,
     server_plist: paths.serverPlist,
