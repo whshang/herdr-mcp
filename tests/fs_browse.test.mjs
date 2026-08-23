@@ -22,6 +22,7 @@ let root;          // temp managed git root
 let sockPath;      // mock herdr socket path
 let sockServer;    // net server
 let server;        // MCP server proc
+let slowGitBin;    // PATH shim that makes git rev-parse unusable for root discovery
 let sessionId = null;
 
 function waitReady(port) {
@@ -103,8 +104,21 @@ before(async () => {
   await new Promise((r) => sockServer.listen(sockPath, r));
   await waitSocket(sockPath);
 
+  // Regression: a normal repo must be recognized from its `.git` marker even
+  // when `git rev-parse --show-toplevel` cannot complete. Paths with neither a
+  // marker nor a successful fallback remain unmanaged/fail-closed.
+  slowGitBin = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-slow-git-"));
+  const realGit = execSync("command -v git", { encoding: "utf8", shell: true }).trim();
+  const slowGit = path.join(slowGitBin, "git");
+  fs.writeFileSync(slowGit, `#!/bin/sh\nif [ "$1" = "rev-parse" ] && [ "$2" = "--show-toplevel" ]; then sleep 2; exit 124; fi\nexec ${JSON.stringify(realGit)} "$@"\n`);
+  fs.chmodSync(slowGit, 0o755);
+
   server = spawn("node", [path.join(__dirname, "..", "dist", "server.js")], {
-    env: { ...process.env, HERDR_MCP_PORT: String(PORT), HERDR_MCP_TOKEN: TOKEN, HERDR_SOCKET_PATH: sockPath },
+    env: {
+      ...process.env,
+      PATH: `${slowGitBin}:${process.env.PATH ?? ""}`,
+      HERDR_MCP_PORT: String(PORT), HERDR_MCP_TOKEN: TOKEN, HERDR_SOCKET_PATH: sockPath,
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   server.stdout.on("data", () => {});
@@ -117,6 +131,7 @@ after(async () => {
   if (sockServer) await new Promise((r) => sockServer.close(r));
   try { fs.rmSync(root, { recursive: true, force: true }); } catch {}
   try { fs.rmSync(sockPath, { force: true }); } catch {}
+  try { if (slowGitBin) fs.rmSync(slowGitBin, { recursive: true, force: true }); } catch {}
 });
 
 function headers(extra = {}) {

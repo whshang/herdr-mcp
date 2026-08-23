@@ -13,6 +13,7 @@ import express, { Express, Request, Response, NextFunction } from "express";
 import { createHash, randomUUID } from "node:crypto";
 import { recordMcpToolCall } from "./mcp-activity.js";
 import { readFile, writeFile, realpath, readdir, stat, unlink, mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { exec, execSync, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
@@ -156,11 +157,24 @@ function isUnmanagedRoot(root: string): boolean {
   return root === "/" || (home !== undefined && root === home);
 }
 
-/** git rev-parse --show-toplevel; null if not a git repo (caller falls back to cwd). */
+/**
+ * Resolve a git toplevel without making managed-root safety depend on process
+ * startup latency. Normal repos, submodules, and linked worktrees expose a
+ * `.git` directory or file at their worktree root, so prefer a deterministic
+ * parent walk. Fall back to git for unusual layouts (for example core.worktree).
+ */
 function gitToplevel(cwd: string): string | null {
+  let current = path.resolve(cwd);
+  while (true) {
+    if (existsSync(path.join(current, ".git"))) return current;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
   try {
     const out = execSync("git rev-parse --show-toplevel", {
-      cwd, timeout: 100, stdio: ["ignore", "pipe", "ignore"],
+      cwd, timeout: 1000, stdio: ["ignore", "pipe", "ignore"],
     });
     return out.toString().trim() || null;
   } catch {
