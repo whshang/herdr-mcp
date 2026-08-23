@@ -674,6 +674,7 @@ test("lock handshake waits for parent->worker pid transfer instead of failing on
   let reads = 0;
   await atomicWriteJson(lockPath, { job_id: jobId, pid: process.pid, started_at_ms: 1 });
   const sleeps = [];
+  let now = 0;
   const sleepFn = async (ms) => {
     reads += 1;
     sleeps.push(ms);
@@ -681,8 +682,11 @@ test("lock handshake waits for parent->worker pid transfer instead of failing on
     if (reads === 1) {
       await atomicWriteJson(lockPath, { job_id: jobId, pid: workerPid, started_at_ms: 1 });
     }
+    now += ms;
   };
-  const owned = await waitForLockOwnership(paths, jobId, { timeoutMs: 50, pollMs: 5, sleep: sleepFn, pid: workerPid });
+  const owned = await waitForLockOwnership(paths, jobId, {
+    timeoutMs: 50, pollMs: 5, sleep: sleepFn, clock: () => now, pid: workerPid,
+  });
   assert.equal(owned.ok, true);
   // at least one failed read + poll happened before the parent's transfer landed
   assert.ok(reads >= 1);

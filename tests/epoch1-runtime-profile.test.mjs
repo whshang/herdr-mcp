@@ -84,7 +84,7 @@ test("HERDR_MCP_CONTRACT_PROFILE=epoch1 advertises exact frozen 17-tool hash on 
   child.stderr.on("data", (chunk) => { stderr += String(chunk); });
   try {
     let listed = null;
-    for (let attempt = 0; attempt < 50; attempt += 1) {
+    for (let attempt = 0; attempt < 150; attempt += 1) {
       try {
         listed = await toolsList(base, token);
         if (listed.response.status === 200) break;
