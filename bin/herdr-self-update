@@ -38,7 +38,7 @@ const MAX_CANDIDATE_PORT = 8799;
 export const RELEASE_GATES = [
   ["npm", ["ci"]],
   ["npm", ["run", "build"]],
-  ["npm", ["test"]],
+  [process.execPath, ["--test", "--test-concurrency=1", "tests/*.test.mjs"]],
   ["npm", ["run", "test:edge"]],
   ["npm", ["run", "build:site"]],
   [process.execPath, ["tests/manual/extension_smoke.mjs"]],
@@ -497,7 +497,7 @@ export function buildPlan(args, env = process.env) {
         : [`copy working-tree -> ${releaseDir} (exclude .git,node_modules,dist,edge/cloudflare/dist)`],
       install: "npm ci",
       build: "npm run build",
-      test: "npm test",
+      test: "node --test --test-concurrency=1 tests/*.test.mjs",
       testEdge: "npm run test:edge",
       site: "npm run build:site",
       extension: "node tests/manual/extension_smoke.mjs",
