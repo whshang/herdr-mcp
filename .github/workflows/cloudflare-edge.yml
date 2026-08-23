@@ -30,10 +30,15 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Start Herdr runtime (pinned, headless)
+        run: scripts/ci-herdr-runtime.sh start
       - name: Frozen Edge/contract gate
         run: npm run test:edge
       - name: Root regression gate
         run: npm test
+      - name: Stop Herdr runtime
+        if: always()
+        run: scripts/ci-herdr-runtime.sh stop
 
   deploy:
     needs: gate
