@@ -4,8 +4,8 @@ import test from 'node:test';
 
 const edgeScript = await readFile(new URL('../bin/herdr-cloudflare-token', import.meta.url), 'utf8');
 const dnsScript = await readFile(new URL('../bin/herdr-cloudflare-dns-token', import.meta.url), 'utf8');
-const tokenDoc = await readFile(new URL('../docs/cloudflare-edge-token.md', import.meta.url), 'utf8');
-const deploymentDoc = await readFile(new URL('../docs/cloudflare-edge-deployment.md', import.meta.url), 'utf8');
+const tokenDoc = await readFile(new URL('../docs/i18n/en/cloudflare-edge-token.md', import.meta.url), 'utf8');
+const deploymentDoc = await readFile(new URL('../docs/i18n/en/cloudflare-edge-deployment.md', import.meta.url), 'utf8');
 
 test('long-lived Cloudflare token keeps Edge permissions separate from DNS migration', () => {
   assert.match(edgeScript, /Workers Routes Write/);
@@ -50,9 +50,9 @@ test('Cloudflare docs describe workers.dev default, optional Custom Domain, and 
   assert.match(tokenDoc, /Workers Routes Write/);
   assert.match(tokenDoc, /Workers Scripts Write/);
   assert.match(tokenDoc, /0600/);
-  assert.match(deploymentDoc, /不要求用户拥有自己的域名/);
+  assert.match(deploymentDoc, /does not require users to own a domain/);
   assert.match(deploymentDoc, /workers\.dev/);
   assert.match(deploymentDoc, /Custom Domain/);
-  assert.match(deploymentDoc, /一次性、仅目标 Zone 的 `DNS Write` Token/);
+  assert.match(deploymentDoc, /one-shot, target-zone-only `DNS Write` token/);
   assert.match(deploymentDoc, /herdr-cloudflare-dns-token --revoke/);
 });

@@ -14,13 +14,13 @@ CLI / ブラウザ拡張: 初回インストールはシステム言語（`en` /
 ## アーキテクチャ（あなた ↔ ウェブ ↔ MCP ↔ herdr、拡張が逆方向チャネル）
 
 上から下へ: あなた → ウェブ会話 →（herdr-mcp と chrome-extension **同列**）→ Herdr panes → ローカル agents。  
-Agents の進捗 / settled が拡張へ届き、拡張がウェブ会話へ書き込む。詳細: [docs/extension-wake.md](docs/extension-wake.md)（中国語）。
+Agents の進捗 / settled が拡張へ届き、拡張がウェブ会話へ書き込む。詳細: [docs/i18n/en/extension-wake.md](docs/i18n/en/extension-wake.md)（英語）。
 
 **オーケストレーション（ウェブが計画、本機は安価）:**
 
 - `herdr_fs_*` / `herdr_git` / `herdr_exec` を優先（ローカル agent API 不要）。
 - 推論が必要なら Herdr-native の安い/高速 worker（`pi` / `flash` / `cline` / `opencode` / `anti`）または監査（`droid` / `grok`）へ直接 `herdr_prompt`。本機 Claude/OMP/main を中間マネージャにしない。
-- Pi/Herdr worker が使えない場合は、実測済みの `dsh --profile headless "task"` を CLI fallback にできる。ただし非自明な coding task は `herdr_exec_start` の長時間 session で実行し、timeout 後は再送前に Git/test の実結果を確認する。`dsh-tui` は人間向け interactive fallback。詳細: [worker fallbacks](docs/worker-fallbacks.md)。
+- Pi/Herdr worker が使えない場合は、実測済みの `dsh --profile headless "task"` を CLI fallback にできる。ただし非自明な coding task は `herdr_exec_start` の長時間 session で実行し、timeout 後は再送前に Git/test の実結果を確認する。`dsh-tui` は人間向け interactive fallback。詳細: [worker fallbacks](docs/i18n/en/worker-fallbacks.md)。
 - `inspect`/`since` は既定で Claude/OMP/Codex をソフト非表示。既知 pane への prompt は可。`HERDR_MCP_AGENT_ALLOW=*` で全表示。
 - standalone/local の既定 18-tool 面では `herdr_inspect` → `herdr_skill`（一度）→ 作業。現在の production ChatGPT Edge は contract epoch 1（17 tools）を固定し、既存 Connector を変えないため `herdr_skill` を意図的に隠します。
 
@@ -106,11 +106,11 @@ MCP URL は次の形式です。
 https://herdr-edge.<your-account-subdomain>.workers.dev/mcp
 ```
 
-Cloudflare に独自 zone がある場合は、`herdr.example.com` のような Custom Domain を後から追加できます。これは**推奨オプションであり必須ではありません**。先に `workers.dev` 上で Worker / WSS Link / MCP / OAuth を検証してください。詳細: [Cloudflare Edge deployment](docs/cloudflare-edge-deployment.md)。
+Cloudflare に独自 zone がある場合は、`herdr.example.com` のような Custom Domain を後から追加できます。これは**推奨オプションであり必須ではありません**。先に `workers.dev` 上で Worker / WSS Link / MCP / OAuth を検証してください。詳細: [Cloudflare Edge deployment](docs/i18n/en/cloudflare-edge-deployment.md)。
 
 ローカル MCP を `cloudflared` / Quick Tunnel で直接公開する方式は、旧構成からの移行・トラブルシューティング用としてのみ残します。
 
-Runtime のリリースは安定した Edge/Link の背後で A/B 切り替えでき、ChatGPT Connector の変更は不要です。詳細: [Runtime A/B self-upgrade](docs/runtime-self-upgrade.md)。
+Runtime のリリースは安定した Edge/Link の背後で A/B 切り替えでき、ChatGPT Connector の変更は不要です。詳細: [Runtime A/B self-upgrade](docs/i18n/en/runtime-self-upgrade.md)。
 
 #### ChatGPT Web で Connector を追加
 
@@ -120,7 +120,7 @@ Runtime のリリースは安定した Edge/Link の背後で A/B 切り替え�
 4. ブラウザで OAuth を完了し、ローカル Herdr token は ChatGPT に貼らない。
 5. 接続後は新しいチャットを開始して新しい tool snapshot を取得。
 
-トラブル時は MCP URL と `OAUTH_ISSUER` が同じ安定 origin を使っていること、Edge health、`herdr-link`、OAuth discovery を確認してください。詳細: [docs/chatgpt-connector.md](docs/chatgpt-connector.md)。
+トラブル時は MCP URL と `OAUTH_ISSUER` が同じ安定 origin を使っていること、Edge health、`herdr-link`、OAuth discovery を確認してください。詳細: [docs/i18n/en/chatgpt-connector.md](docs/i18n/en/chatgpt-connector.md)。
 
 ### 4. Cursor（任意・同一マシン）
 
@@ -197,7 +197,7 @@ herdr のネイティブ面は大きな Unix-socket API（`herdr api schema`）�
 | `HERDR_MCP_ALL_TOOLS` | off | 18 ではなく 30 ツール |
 | `HERDR_SKILL_NETWORK` | on | `0` = 同梱 SKILL.md のみ |
 
-一覧: [docs/architecture.md](docs/architecture.md#environment-variables)。
+一覧: [docs/i18n/en/architecture.md](docs/i18n/en/architecture.md#environment-variables)。
 
 ## ブラウザ拡張
 
@@ -206,16 +206,16 @@ herdr のネイティブ面は大きな Unix-socket API（`herdr api schema`）�
 1. **進捗ナッジ（利用可）** — 会話を herdr **workspace** にバインド。既定チェック間隔 **60 秒**、変化なし時のフォールバック **20 分**。ChatGPT のページ内「許可」カードは自動クリック。任意でターン後に小モデル判定（拡張 ≥0.1.20）。
 2. **JSON → MCP（未完成）** — DeepSeek / z.ai で `{"tool":...}` を抽出できるが、ローカル `/mcp` 呼び出しと結果の書き戻しはまだない。
 
-UI 言語: en / 简体中文 / 日本語。詳細: [docs/extension.md](docs/extension.md)。
+UI 言語: en / 简体中文 / 日本語。詳細: [docs/i18n/en/extension.md](docs/i18n/en/extension.md)。
 
 ## ドキュメント
 
 | Doc | 内容 |
 |---|---|
 | [CHANGELOG.md](CHANGELOG.md) | バージョン |
-| [docs/architecture.md](docs/architecture.md) | herdr vs MCP（中国語） |
-| [docs/chatgpt-connector.md](docs/chatgpt-connector.md) | ChatGPT OAuth（中国語） |
-| [docs/extension.md](docs/extension.md) | 拡張（中国語） |
+| [docs/i18n/en/architecture.md](docs/i18n/en/architecture.md) | herdr vs MCP（英語） |
+| [docs/i18n/en/chatgpt-connector.md](docs/i18n/en/chatgpt-connector.md) | ChatGPT OAuth（英語） |
+| [docs/i18n/en/extension.md](docs/i18n/en/extension.md) | 拡張（英語） |
 | [README.md](README.md) | 英語（GitHub 既定・ツール表フル） |
 
 ## Ops

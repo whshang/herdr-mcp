@@ -78,6 +78,10 @@ button { color: inherit; }
 .theme-toggle, .icon-button { width: 36px; padding: 0; }
 .search-trigger { display: inline-flex; align-items: center; gap: 8px; padding: 0 8px 0 10px; color: var(--muted-strong); }
 .search-trigger kbd { border: 1px solid var(--line); border-radius: 5px; background: var(--surface-soft); padding: 1px 5px; font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--muted); }
+.lang-switcher { display: inline-flex; align-items: stretch; height: 34px; padding: 2px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+.lang-switcher a { display: inline-flex; align-items: center; padding: 0 8px; border-radius: 6px; color: var(--muted-strong); font-size: 12.5px; font-weight: 620; text-decoration: none; white-space: nowrap; }
+.lang-switcher a:hover { color: var(--text); background: var(--surface-hover); }
+.lang-switcher a[aria-current] { background: var(--surface-hover); color: var(--text); box-shadow: inset 0 0 0 1px var(--line-strong); }
 .nav-toggle:hover, .theme-toggle:hover, .icon-button:hover, .search-trigger:hover { background: var(--surface-hover); border-color: var(--line-strong); }
 :where(a, button, input):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
@@ -162,6 +166,15 @@ button { color: inherit; }
 .doc-card h2 a { text-decoration: none; }
 .doc-card p { display: -webkit-box; margin: 0; overflow: hidden; color: var(--muted); font-size: 12.5px; line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 
+/* Neutral /docs/ chooser: locale cards only, never a flattened doc nav. */
+.chooser-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px; padding: 44px 0 30px; }
+.chooser-card { padding: 20px 22px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.chooser-card:hover { border-color: var(--line-strong); background: var(--surface-soft); }
+.chooser-card h2 { margin: 0 0 7px; font-size: 18px; }
+.chooser-card h2 a { text-decoration: none; }
+.chooser-card p { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
+.chooser-divider { margin: 0 0.28em; color: var(--muted); font-weight: 400; }
+
 .search-dialog { width: min(620px, calc(100vw - 28px)); max-height: min(660px, calc(100vh - 40px)); padding: 0; border: 1px solid var(--line-strong); border-radius: 14px; background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
 .search-dialog::backdrop { background: rgb(2 6 23 / .42); backdrop-filter: blur(2px); }
 .search-panel { padding: 18px; }
@@ -211,6 +224,7 @@ body:not(.docs-page):not(.docs-index-page) footer a { text-decoration: none; }
   .topbar.has-drawer { grid-template-columns: auto auto 1fr auto; }
   .nav-toggle { display: inline-grid; place-items: center; }
   .topnav { justify-self: start; }
+  .chooser-grid { grid-template-columns: 1fr; }
   .docs-layout { display: block; width: 100%; padding: 0; }
   .sidebar { position: fixed; z-index: 40; top: var(--topbar-h); left: 0; width: min(310px, 84vw); height: calc(100vh - var(--topbar-h)); padding: 22px 14px 40px; border-right: 1px solid var(--line); background: var(--surface); transform: translateX(-105%); transition: transform 160ms ease; box-shadow: var(--shadow); }
   .nav-open .sidebar { transform: translateX(0); }

@@ -8,7 +8,7 @@ are implemented and exercised by the Edge Gate.
 Routing is deliberately independent from Worker deployment. `workers.dev` is a
 fully supported default and requires no user-owned domain. A Cloudflare Custom
 Domain is recommended only when the operator wants a long-lived stable MCP/OAuth
-origin. See [`../../docs/cloudflare-edge-deployment.md`](../../docs/cloudflare-edge-deployment.md).
+origin. See [`../../docs/i18n/en/cloudflare-edge-deployment.md`](../../docs/i18n/en/cloudflare-edge-deployment.md).
 
 ## Status vs. plan phases
 
@@ -194,7 +194,7 @@ explicitly as above so root `package.json` stays untouched.
   Edge adapter must stay wire-compatible with `src/relay/**`.
 - **Runtime A/B does not launch arbitrary candidate processes.** Candidate process
   creation remains a deployment/upgrade step; `herdr-link` owns validation,
-  activation, drain and rollback. See [`../../docs/runtime-self-upgrade.md`](../../docs/runtime-self-upgrade.md).
+  activation, drain and rollback. See [`../../docs/i18n/en/runtime-self-upgrade.md`](../../docs/i18n/en/runtime-self-upgrade.md).
 
 ## Security posture
 

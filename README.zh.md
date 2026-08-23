@@ -14,13 +14,13 @@ CLI / 浏览器插件：首次安装跟系统语言（`en` / `zh` / `ja`），�
 ## 架构（用户 ↔ 网页 ↔ MCP ↔ herdr，插件做反向通道）
 
 自上而下：你 → 网页对话 →（herdr-mcp 与 chrome-extension **同排**）→ Herdr 窗口 → 本地 Agents。  
-Agents 的进度/收工通知到 extension；extension 再 ↻ 写入网页输入框。详见 [docs/extension-wake.md](docs/extension-wake.md)。
+Agents 的进度/收工通知到 extension；extension 再 ↻ 写入网页输入框。详见 [docs/i18n/zh-CN/extension-wake.md](docs/i18n/zh-CN/extension-wake.md)。
 
 **编排（网页规划，本机省 API）：**
 
 - 能用 `herdr_fs_*` / `herdr_git` / `herdr_exec` 就不要开本地 agent。
 - 必须推理时，优先 `herdr_prompt` 给便宜/高速的 Herdr 原生 worker（`pi`、`flash`、`cline`、`opencode`、`anti`）或审计（`droid`、`grok`），不要经本机 Claude/OMP/main 再转派。
-- Pi/Herdr worker 不可用时，实测可用 `dsh --profile headless "任务"` 作为开发 CLI 备选，但要通过 `herdr_exec_start` 长任务 session 跑；DSH 可能已经改完代码却还没在 60 秒内打印最终回复，超时后必须先看 Git/test 再决定是否重试。`dsh-tui` 只作为人工交互接管。详见 [worker fallbacks](docs/worker-fallbacks.md)。
+- Pi/Herdr worker 不可用时，实测可用 `dsh --profile headless "任务"` 作为开发 CLI 备选，但要通过 `herdr_exec_start` 长任务 session 跑；DSH 可能已经改完代码却还没在 60 秒内打印最终回复，超时后必须先看 Git/test 再决定是否重试。`dsh-tui` 只作为人工交互接管。详见 [worker fallbacks](docs/i18n/zh-CN/worker-fallbacks.md)。
 - `inspect`/`since` 默认软隐藏 Claude/OMP/Codex。知道 pane 仍可 prompt。`HERDR_MCP_AGENT_ALLOW=*` 显示全部。
 - 独立/本地默认 18-tool 模式下，会话开始：`herdr_inspect` → `herdr_skill`（一次）→ 干活。当前生产 ChatGPT Edge 冻结在 contract epoch 1（17 tools），因此故意隐藏 `herdr_skill`，直到显式升级 contract epoch。
 
@@ -107,11 +107,11 @@ npx wrangler deploy --config wrangler.user.toml
 https://herdr-edge.<你的-account-subdomain>.workers.dev/mcp
 ```
 
-如果已经有自己的 Cloudflare zone，可以再绑定 `herdr.example.com` 这样的 Custom Domain。**这是推荐项，不是前置条件。** 必须先在 `workers.dev` 上把 Worker、WSS Link、MCP 和 OAuth 验证通过，再独立绑定生产域名。详见 [Cloudflare Edge 部署](docs/cloudflare-edge-deployment.md) 和 [Cloudflare Edge Token](docs/cloudflare-edge-token.md)。
+如果已经有自己的 Cloudflare zone，可以再绑定 `herdr.example.com` 这样的 Custom Domain。**这是推荐项，不是前置条件。** 必须先在 `workers.dev` 上把 Worker、WSS Link、MCP 和 OAuth 验证通过，再独立绑定生产域名。详见 [Cloudflare Edge 部署](docs/i18n/zh-CN/cloudflare-edge-deployment.md) 和 [Cloudflare Edge Token](docs/i18n/zh-CN/cloudflare-edge-token.md)。
 
 直接用 `cloudflared` / Quick Tunnel 把本机 MCP 暴露公网只作为旧版本迁移和故障排查手段，不再是新安装默认架构。
 
-Runtime 升级可以在稳定的 Edge/Link 后面做 A/B 切代，不需要修改 ChatGPT Connector。详见 [Runtime A/B 自升级](docs/runtime-self-upgrade.md)。
+Runtime 升级可以在稳定的 Edge/Link 后面做 A/B 切代，不需要修改 ChatGPT Connector。详见 [Runtime A/B 自升级](docs/i18n/zh-CN/runtime-self-upgrade.md)。
 
 #### 在 ChatGPT 网页添加 Connector
 
@@ -123,7 +123,7 @@ Runtime 升级可以在稳定的 Edge/Link 后面做 A/B 切代，不需要修�
 
 #### 报错或工具没刷出来
 
-先确认 MCP URL 与 `OAUTH_ISSUER` 使用同一个稳定 origin，再检查 Edge `/health`、`herdr-link` 在线状态和 OAuth discovery。硬性要求与诊断方法见 [docs/chatgpt-connector.md](docs/chatgpt-connector.md)。
+先确认 MCP URL 与 `OAUTH_ISSUER` 使用同一个稳定 origin，再检查 Edge `/health`、`herdr-link` 在线状态和 OAuth discovery。硬性要求与诊断方法见 [docs/i18n/zh-CN/chatgpt-connector.md](docs/i18n/zh-CN/chatgpt-connector.md)。
 
 #### 模型额度
 
@@ -223,7 +223,7 @@ herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法
 | `HERDR_MCP_AGENT_ALLOW` | worker + 审计 | `*` 让 inspect/since 显示 Claude/OMP/Codex；逗号名单可覆盖。 |
 | `HERDR_SKILL_NETWORK` | 开 | `0` = 只用内置 SKILL.md。 |
 
-OAuth / skill / 状态目录等见 [docs/architecture.md](docs/architecture.md#environment-variables)。
+OAuth / skill / 状态目录等见 [docs/i18n/zh-CN/architecture.md](docs/i18n/zh-CN/architecture.md#environment-variables)。
 
 ## 权限边界
 
@@ -233,10 +233,10 @@ OAuth / skill / 状态目录等见 [docs/architecture.md](docs/architecture.md#e
 
 目录 `extension/`（MV3，Chrome 名称 **herdr → Web wake**）。`chrome://extensions` 加载未打包扩展。站点：chatgpt.com、claude.ai、chat.deepseek.com、chat.z.ai。
 
-两件工作（见 [docs/extension.md](docs/extension.md)）共享本地 token，**完成度不对等**：
+两件工作（见 [docs/i18n/zh-CN/extension.md](docs/i18n/zh-CN/extension.md)）共享本地 token，**完成度不对等**：
 
 1. **进度回推（已可用）**：网页对话绑到 herdr **workspace**；space 内任意 agent 有新输出/停下来可回推；全部停 working 才收工唤醒。chatgpt.com 页内「允许」卡会自动点。可选：ChatGPT 回合结束后用小模型判定是否催促继续（扩展 ≥0.1.20；Options 预填提示词/不发送词，继续时提交模型原文）。
-2. **JSON→MCP（未完成）**：DeepSeek / z.ai 能从助手回复抠 `{"tool":...}`，**还不会**调本机 `/mcp` 或把结果回填。路线见 [docs/extension-bridge.md](docs/extension-bridge.md)。
+2. **JSON→MCP（未完成）**：DeepSeek / z.ai 能从助手回复抠 `{"tool":...}`，**还不会**调本机 `/mcp` 或把结果回填。路线见 [docs/i18n/zh-CN/extension-bridge.md](docs/i18n/zh-CN/extension-bridge.md)。
 
 共享本地 `127.0.0.1:8772` 与静态 token。这不是给 DeepSeek「安装」ChatGPT 式 OAuth connector。默认：进度检查间隔 **60 秒**，摘要不变时兜底 **20 分钟**（`progressTickSec` / `progressFallbackSec`）。
 
@@ -245,11 +245,11 @@ OAuth / skill / 状态目录等见 [docs/architecture.md](docs/architecture.md#e
 | 文档 | 内容 |
 |---|---|
 | [CHANGELOG.md](CHANGELOG.md) | 版本与工具面变化 |
-| [docs/architecture.md](docs/architecture.md) | herdr 与 MCP 分层、闸门、环境变量 |
-| [docs/chatgpt-connector.md](docs/chatgpt-connector.md) | ChatGPT OAuth / 传输 / schema |
-| [docs/extension.md](docs/extension.md) | 扩展总览 |
-| [docs/extension-wake.md](docs/extension-wake.md) | 主线 A：进度回推 |
-| [docs/extension-bridge.md](docs/extension-bridge.md) | 主线 B：JSON→MCP（未完成） |
+| [docs/i18n/zh-CN/architecture.md](docs/i18n/zh-CN/architecture.md) | herdr 与 MCP 分层、闸门、环境变量 |
+| [docs/i18n/zh-CN/chatgpt-connector.md](docs/i18n/zh-CN/chatgpt-connector.md) | ChatGPT OAuth / 传输 / schema |
+| [docs/i18n/zh-CN/extension.md](docs/i18n/zh-CN/extension.md) | 扩展总览 |
+| [docs/i18n/zh-CN/extension-wake.md](docs/i18n/zh-CN/extension-wake.md) | 主线 A：进度回推 |
+| [docs/i18n/zh-CN/extension-bridge.md](docs/i18n/zh-CN/extension-bridge.md) | 主线 B：JSON→MCP（未完成） |
 | [tests/README.md](tests/README.md) | 默认测试 vs 手工脚本 |
 
 过程笔记在 `docs/_wip/`（gitignore，不入库）。

@@ -5,6 +5,10 @@
   const themeIcon = document.querySelector("[data-theme-icon]");
   const themeKey = "herdr-docs-theme";
 
+  const uiData = document.querySelector("#search-i18n");
+  const ui = { ...JSON.parse(uiData?.textContent || "null") };
+  const uiString = (key, fallback) => (typeof ui[key] === "string" && ui[key] ? ui[key] : fallback);
+
   const systemTheme = () => window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   const savedTheme = localStorage.getItem(themeKey);
   const initialTheme = savedTheme === "light" || savedTheme === "dark" ? savedTheme : systemTheme();
@@ -12,7 +16,7 @@
   function applyTheme(theme) {
     root.dataset.theme = theme;
     root.style.colorScheme = theme;
-    if (themeButton) themeButton.setAttribute("aria-label", `Switch to ${theme === "dark" ? "light" : "dark"} theme`);
+    if (themeButton) themeButton.setAttribute("aria-label", theme === "dark" ? uiString("themeToLight", "Switch to light theme") : uiString("themeToDark", "Switch to dark theme"));
     if (themeIcon) themeIcon.textContent = theme === "dark" ? "☀" : "◐";
   }
 
@@ -31,7 +35,7 @@
     if (!sidebar || !navToggle) return;
     body.classList.toggle("nav-open", open);
     navToggle.setAttribute("aria-expanded", String(open));
-    navToggle.setAttribute("aria-label", open ? "Close documentation navigation" : "Open documentation navigation");
+    navToggle.setAttribute("aria-label", open ? uiString("closeNav", "Close documentation navigation") : uiString("openNav", "Open documentation navigation"));
     if (overlay) overlay.hidden = !open;
   }
 
@@ -72,7 +76,7 @@
     if (!results) return;
     const normalized = query.trim().toLowerCase();
     if (!normalized) {
-      results.innerHTML = '<p class="search-hint">Type to search the documentation.</p>';
+      results.innerHTML = `<p class="search-hint">${escapeHtml(uiString("hint", "Type to search the documentation."))}</p>`;
       return;
     }
     const matches = index.filter((item) => {
@@ -80,7 +84,7 @@
       return normalized.split(/\s+/).every((part) => haystack.includes(part));
     }).slice(0, 8);
     if (!matches.length) {
-      results.innerHTML = `<p class="search-hint">No results for <strong>${escapeHtml(query)}</strong>.</p>`;
+      results.innerHTML = `<p class="search-hint">${escapeHtml(uiString("noResults", "No results for %s.").replace("%s", query))}</p>`;
       return;
     }
     results.innerHTML = `<ul>${matches.map((item) => `<li><a href="${escapeHtml(item.href)}"><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.description || "")}</span></a></li>`).join("")}</ul>`;

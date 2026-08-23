@@ -1,7 +1,7 @@
 # 浏览器扩展 — 产品总览（双主线）
 
 读者：扩展作者与使用者。Chrome 显示名称 **herdr → Web wake**。`extension/` 同时承担两件事，共享 token 与 Options，**完成度不对等**：A 已可用，B 只做到 JSON 抽取。  
-语言：产品 UI 为 en / 简体中文 / 日本語（与 herdr 一致）；本页以简体中文写。仓库根 README：[en](../README.md) / [zh](../README.zh.md) / [ja](../README.ja.md)。
+语言：产品 UI 为 en / 简体中文 / 日本語（与 herdr 一致）；本页以简体中文写。仓库根 README：[en](../../../README.md) / [zh](../../../README.zh.md) / [ja](../../../README.ja.md)。
 
 | 主线 | 问题 | 方向 | 状态 | 首批站点 |
 |---|---|---|---|---|

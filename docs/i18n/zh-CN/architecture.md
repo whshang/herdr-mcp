@@ -98,7 +98,7 @@ herdr-mcp 侧（≥0.3.12，exec 降级 ≥0.3.18）能做的：
 
 ## Environment variables
 
-环境变量。plist 示例里的 `HERDR_MCP_HOST` **未被** Node 进程读取；服务听在端口上，由隧道/本机回环访问。版本演进见 [CHANGELOG.md](../CHANGELOG.md)。
+环境变量。plist 示例里的 `HERDR_MCP_HOST` **未被** Node 进程读取；服务听在端口上，由隧道/本机回环访问。版本演进见 [CHANGELOG.md](../../../CHANGELOG.md)。
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
@@ -123,7 +123,7 @@ herdr-mcp 侧（≥0.3.12，exec 降级 ≥0.3.18）能做的：
 
 ## 相关文档
 
-- [CHANGELOG.md](../CHANGELOG.md) — 版本与工具面
+- [CHANGELOG.md](../../../CHANGELOG.md) — 版本与工具面
 - [capability-benchmark.md](./capability-benchmark.md) — 官方 Herdr / 其他 Herdr MCP / coding-tools-mcp 能力吸收与“不吸收”决策
 - [extension.md](./extension.md) — 扩展总览（A 已可用，B 未完成）
 - [chatgpt-connector.md](./chatgpt-connector.md) — ChatGPT OAuth、schema、权限卡

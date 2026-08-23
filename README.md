@@ -16,13 +16,13 @@ CLI / browser extension: first install follows system language (`en` / `zh` / `j
 ## Architecture (you ↔ web ↔ MCP ↔ herdr; extension as reverse channel)
 
 Top to bottom: you → web chat → (herdr-mcp and chrome-extension **same row**) → Herdr panes → local agents.  
-Agents’ progress / settled events reach the extension; the extension ↻ types into the web chat. Details: [docs/extension-wake.md](docs/extension-wake.md) (中文).
+Agents’ progress / settled events reach the extension; the extension ↻ types into the web chat. Details: [docs/i18n/en/extension-wake.md](docs/i18n/en/extension-wake.md).
 
 **Orchestration (web plans, local stays cheap):**
 
 - Prefer `herdr_fs_*` / `herdr_git` / `herdr_exec` (no local-agent API).
 - If reasoning is required, prefer `herdr_prompt` to a cheap/fast Herdr worker (`pi`, `flash`, `cline`, `opencode`, `anti`) or auditor (`droid`, `grok`) — do not route through local Claude/OMP/main.
-- If Pi/Herdr workers are unavailable, `dsh --profile headless "job"` is a tested CLI fallback. Run it through a long `herdr_exec_start` session, not a 60s synchronous shell: tool edits may complete before the final headless answer is printed. `dsh-tui` is the human-interactive fallback, not the default automation surface. See [worker fallbacks](docs/worker-fallbacks.md).
+- If Pi/Herdr workers are unavailable, `dsh --profile headless "job"` is a tested CLI fallback. Run it through a long `herdr_exec_start` session, not a 60s synchronous shell: tool edits may complete before the final headless answer is printed. `dsh-tui` is the human-interactive fallback, not the default automation surface. See [worker fallbacks](docs/i18n/en/worker-fallbacks.md).
 - `inspect`/`since` soft-hide Claude/OMP/Codex by default. Prompting by known pane still works. `HERDR_MCP_AGENT_ALLOW=*` shows all.
 - Standalone/local 18-tool sessions: `herdr_inspect` → `herdr_skill` (once) → work. Production ChatGPT currently stays on frozen contract epoch 1 (17 tools), so `herdr_skill` is intentionally hidden there until an explicit epoch upgrade.
 
@@ -109,11 +109,11 @@ Use the resulting stable origin, for example:
 https://herdr-edge.<your-account-subdomain>.workers.dev/mcp
 ```
 
-If you own a Cloudflare zone, a Custom Domain such as `herdr.example.com` is **recommended but optional**. Always validate the Worker on `workers.dev` first; then attach the custom hostname separately. See [Cloudflare Edge deployment](docs/cloudflare-edge-deployment.md) and [Cloudflare Edge token](docs/cloudflare-edge-token.md).
+If you own a Cloudflare zone, a Custom Domain such as `herdr.example.com` is **recommended but optional**. Always validate the Worker on `workers.dev` first; then attach the custom hostname separately. See [Cloudflare Edge deployment](docs/i18n/en/cloudflare-edge-deployment.md) and [Cloudflare Edge token](docs/i18n/en/cloudflare-edge-token.md).
 
 Direct `cloudflared` / Quick Tunnel exposure of the local MCP server is retained only for legacy migration and troubleshooting; it is no longer the recommended new-install architecture.
 
-Runtime releases can switch behind the persistent Edge/Link without changing the ChatGPT Connector. See [Runtime A/B self-upgrade](docs/runtime-self-upgrade.md).
+Runtime releases can switch behind the persistent Edge/Link without changing the ChatGPT Connector. See [Runtime A/B self-upgrade](docs/i18n/en/runtime-self-upgrade.md).
 
 #### Add the Connector in ChatGPT **web**
 
@@ -125,7 +125,7 @@ Runtime releases can switch behind the persistent Edge/Link without changing the
 
 #### Errors or tools missing
 
-Verify the same origin is used consistently for the MCP URL and `OAUTH_ISSUER`, then check Edge health, `herdr-link` connectivity and OAuth discovery. Hard requirements and diagnostics are documented in [docs/chatgpt-connector.md](docs/chatgpt-connector.md).
+Verify the same origin is used consistently for the MCP URL and `OAUTH_ISSUER`, then check Edge health, `herdr-link` connectivity and OAuth discovery. Hard requirements and diagnostics are documented in [docs/i18n/en/chatgpt-connector.md](docs/i18n/en/chatgpt-connector.md).
 
 #### Model access
 
@@ -225,7 +225,7 @@ Optional: `HERDR_MCP_ALL_TOOLS=1` adds advanced/deprecated lifecycle tools (30 t
 | `HERDR_MCP_AGENT_ALLOW` | workers + auditors | `*` shows Claude/OMP/Codex in inspect/since; comma list overrides. |
 | `HERDR_SKILL_NETWORK` | on | `0` = bundled `SKILL.md` only. |
 
-More OAuth / skill / state dirs: [docs/architecture.md](docs/architecture.md#environment-variables).
+More OAuth / skill / state dirs: [docs/i18n/en/architecture.md](docs/i18n/en/architecture.md#environment-variables).
 
 ## Trust
 
@@ -235,10 +235,10 @@ A connected ChatGPT session can read and write files under managed git roots and
 
 Folder: `extension/` (MV3, Chrome name **herdr → Web wake**). Load unpacked in `chrome://extensions`. Sites: chatgpt.com, claude.ai, chat.deepseek.com, chat.z.ai.
 
-Two jobs ([docs/extension.md](docs/extension.md), 中文) — they share the local token; they are **not** equally finished:
+Two jobs ([docs/i18n/en/extension.md](docs/i18n/en/extension.md)) — they share the local token; they are **not** equally finished:
 
 1. **Progress nudge (shipping)** — bind the current chat to a herdr **workspace**; any agent in that space with new output / settle can type into the chat; full settle only when none remain working. ChatGPT in-page “Allow” cards are auto-clicked. Optional: after a ChatGPT turn, a configured small model may submit a continue message (extension ≥0.1.20).
-2. **JSON → MCP (incomplete)** — on DeepSeek / z.ai the content script can parse assistant `{"tool":...}`. It does **not** yet call local `/mcp` or paste results back. Plan: [docs/extension-bridge.md](docs/extension-bridge.md).
+2. **JSON → MCP (incomplete)** — on DeepSeek / z.ai the content script can parse assistant `{"tool":...}`. It does **not** yet call local `/mcp` or paste results back. Plan: [docs/i18n/en/extension-bridge.md](docs/i18n/en/extension-bridge.md).
 
 Same local `127.0.0.1:8772` token. Not a substitute for ChatGPT’s OAuth connector. Defaults: progress check every **60s**, unchanged-summary fallback **20 min** (`progressTickSec` / `progressFallbackSec`).
 
@@ -247,11 +247,11 @@ Same local `127.0.0.1:8772` token. Not a substitute for ChatGPT’s OAuth connec
 | Doc | Topic |
 |---|---|
 | [CHANGELOG.md](CHANGELOG.md) | Version / tool-surface changes |
-| [docs/architecture.md](docs/architecture.md) | herdr vs MCP layers, gates, env (中文) |
-| [docs/chatgpt-connector.md](docs/chatgpt-connector.md) | ChatGPT OAuth / wire / schema / permission cards (中文) |
-| [docs/extension.md](docs/extension.md) | Extension overview (中文) |
-| [docs/extension-wake.md](docs/extension-wake.md) | Track A: progress nudge (中文) |
-| [docs/extension-bridge.md](docs/extension-bridge.md) | Track B: JSON→MCP, not finished (中文) |
+| [docs/i18n/en/architecture.md](docs/i18n/en/architecture.md) | herdr vs MCP layers, gates, env |
+| [docs/i18n/en/chatgpt-connector.md](docs/i18n/en/chatgpt-connector.md) | ChatGPT OAuth / wire / schema / permission cards |
+| [docs/i18n/en/extension.md](docs/i18n/en/extension.md) | Extension overview |
+| [docs/i18n/en/extension-wake.md](docs/i18n/en/extension-wake.md) | Track A: progress nudge |
+| [docs/i18n/en/extension-bridge.md](docs/i18n/en/extension-bridge.md) | Track B: JSON→MCP, not finished |
 | [tests/README.md](tests/README.md) | Default vs manual tests |
 
 Process notes live in `docs/_wip/` (gitignored).

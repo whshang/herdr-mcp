@@ -179,12 +179,12 @@ test("status is read-only and reports custom domain binding", async () => {
 
 test("open-source Worker template defaults to workers.dev and does not require a custom domain", async () => {
   const template = await readFile(new URL("../edge/cloudflare/wrangler.user.example.toml", import.meta.url), "utf8");
-  const docs = await readFile(new URL("../docs/cloudflare-edge-deployment.md", import.meta.url), "utf8");
+  const docs = await readFile(new URL("../docs/i18n/en/cloudflare-edge-deployment.md", import.meta.url), "utf8");
   assert.match(template, /workers_dev = true/);
   assert.match(template, /routes = \[\]/);
   assert.match(template, /YOUR_ACCOUNT_SUBDOMAIN\.workers\.dev/);
   assert.doesNotMatch(template, /agentforme\.cc\.cd/);
-  assert.match(docs, /不要求用户拥有自己的域名/);
-  assert.match(docs, /Custom Domain.*可选/s);
-  assert.match(docs, /workers\.dev.*默认/s);
+  assert.match(docs, /does not require users to own a domain/);
+  assert.match(docs, /Custom Domain.*recommended, optional/s);
+  assert.match(docs, /workers\.dev.*default, fully supported/s);
 });

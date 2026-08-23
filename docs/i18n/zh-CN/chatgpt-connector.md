@@ -2,7 +2,7 @@
 
 读者：给 ChatGPT 接 herdr-mcp 的人，以及改 OAuth / Streamable HTTP 的代理。
 
-相关入口：[README.md](../README.md)、`src/oauth.ts`、`src/server.ts`。
+相关入口：[README.md](../../../README.md)、`src/oauth.ts`、`src/server.ts`。
 
 ## 「已连接」到底指什么
 
