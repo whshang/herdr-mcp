@@ -16,8 +16,10 @@ import {
   DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
 } from "./binding-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.30";
+const H2W_SCRIPT_VERSION = "0.1.34";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
+const PUSH_CONNECT_MS = 5000;
+const STATE_FETCH_MS = 4000;
 const tabVersions = new Map();
 const reloadedTabs = new Set();
 const DEFAULT_TEMPLATE =
@@ -205,12 +207,15 @@ async function loadBindings() {
   let raw = {};
   try { raw = (await chrome.storage.local.get("herdrWakeBindings")).herdrWakeBindings || {}; } catch (e) {}
   const { map: b, migrated } = migrateBindingsMap(raw);
-  // Prune expired bindings, abort their streams, and persist the cleanup.
+  // Prune expired bindings and persist the cleanup. Push transport is shared
+  // across all bindings, so pruning one binding must not tear down transport
+  // for the remaining bindings.
   const { kept, prunedKeys } = pruneExpired(b);
   if (prunedKeys.length || migrated) {
     if (prunedKeys.length) {
       callLog(`pruned ${prunedKeys.length} expired bindings: ${prunedKeys.join(", ")}`);
-      for (const k of prunedKeys) { const s = pushStreams.get(k); if (s) { try { s.ctrl.abort(); } catch {} } pushStreams.delete(k); clearProgressTimer(k); }
+      for (const k of prunedKeys) clearProgressTimer(k);
+      if (!Object.keys(kept).length) stopPushStream();
     }
     if (migrated) callLog("migrated legacy binding keys to convKey::workspace_id");
     try { await chrome.storage.local.set({ herdrWakeBindings: kept }); } catch (e) {}
@@ -221,44 +226,57 @@ async function saveBindings(b) {
   try { await chrome.storage.local.set({ herdrWakeBindings: b }); } catch (e) {}
 }
 
-// ---- SSE push client (one stream per binding, workspace-scoped by default) ----
-const pushStreams = new Map(); // storeKey -> { ctrl, retryTimer }
+// ---- SSE push client (ONE shared stream for every binding) ----
+// Long-lived HTTP/1.1 SSE requests consume Chromium's small per-origin
+// connection pool. One stream per binding can therefore starve /push/state
+// once enough historical bindings exist. The server already includes the
+// workspace id in agent events and an all-workspace snapshot in hello, so a
+// single unfiltered stream is sufficient; fan-out happens in this worker.
+let pushStream = null; // { ctrl }
+let pushDispatch = Promise.resolve();
 const pendingOutputByPane = new Map(); // `${storeKey}::${pane}` -> output
 
 function pendingKey(storeKey, pane) {
   return `${storeKey}::${pane || "_"}`;
 }
 
-async function ensurePushStream(bindings, storeKey) {
-  await configReady;
-  if (pushStreams.has(storeKey)) return;
-  const b = bindings[storeKey];
-  const ws = normalizeWorkspaceId(b);
-  if (!b || !ws) return;
-  if (!b.workspace_id) b.workspace_id = ws;
-  const ctrl = new AbortController();
-  pushStreams.set(storeKey, { ctrl });
-  void runPushStream(storeKey, ws, ctrl);
+function stopPushStream() {
+  const stream = pushStream;
+  pushStream = null;
+  if (stream) { try { stream.ctrl.abort(); } catch {} }
 }
 
-async function runPushStream(storeKey, workspace, ctrl) {
-  const url = `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/push/events?workspace=${encodeURIComponent(workspace)}`;
+async function ensurePushStream(bindings) {
+  await configReady;
+  if (pushStream || !Object.keys(bindings || {}).length) return;
+  const ctrl = new AbortController();
+  pushStream = { ctrl };
+  void runPushStream(ctrl);
+}
+
+async function runPushStream(ctrl) {
+  const url = `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/push/events`;
   let backoff = 2000;
   while (runtimeAlive() && !ctrl.signal.aborted) {
+    const attempt = new AbortController();
+    const relayAbort = () => attempt.abort();
+    ctrl.signal.addEventListener("abort", relayAbort, { once: true });
+    const connectTimer = setTimeout(() => attempt.abort(), PUSH_CONNECT_MS);
     try {
       const resp = await fetch(url, {
-        signal: ctrl.signal,
+        signal: attempt.signal,
         headers: CFG.token ? { Authorization: `Bearer ${CFG.token}` } : {},
       });
+      clearTimeout(connectTimer);
       if (!resp.ok) {
-        callLog(`push ws=${workspace} HTTP ${resp.status}; retrying in ${backoff}ms`);
+        callLog(`push HTTP ${resp.status}; retrying in ${backoff}ms`);
         await sleep(backoff);
         backoff = Math.min(backoff * 2, 15000);
         continue;
       }
       backoff = 2000;
       if (!resp.body) throw new Error("no-body");
-      callLog(`push ws=${workspace} connected`);
+      callLog("push connected (shared stream)");
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buf = "";
@@ -269,33 +287,48 @@ async function runPushStream(storeKey, workspace, ctrl) {
         let idx;
         while ((idx = buf.indexOf("\n\n")) >= 0) {
           const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
-          handlePushBlock(storeKey, block);
+          pushDispatch = pushDispatch
+            .then(() => handlePushBlock(block))
+            .catch((e) => callLog("push dispatch failed:", e?.message || String(e)));
         }
       }
-      callLog(`push ws=${workspace} stream ended; reconnecting in ${backoff}ms`);
+      callLog(`push stream ended; reconnecting in ${backoff}ms`);
     } catch (e) {
       if (ctrl.signal.aborted || !runtimeAlive()) break;
-      callLog(`push ws=${workspace} disconnected (${e.message}); retrying in ${backoff}ms`);
+      callLog(`push disconnected (${e.message}); retrying in ${backoff}ms`);
+    } finally {
+      clearTimeout(connectTimer);
+      ctrl.signal.removeEventListener("abort", relayAbort);
     }
     if (ctrl.signal.aborted) break;
     await sleep(backoff);
     backoff = Math.min(backoff * 2, 15000);
   }
-  pushStreams.delete(storeKey);
+  if (pushStream?.ctrl === ctrl) pushStream = null;
 }
 
-function handlePushBlock(storeKey, block) {
+async function handlePushBlock(block) {
   let event = null, data = null;
   for (const line of block.split("\n")) {
     if (line.startsWith("event:")) event = line.slice(6).trim();
     else if (line.startsWith("data:")) { try { data = JSON.parse(line.slice(5).trim()); } catch {} }
   }
   if (!event || !data) return;
-  if (event === "hello") void onPushHello(storeKey, data);
-  else if (event === "agent_working") void onPushWorking(storeKey, data);
-  else if (event === "agent_settled") void onPushSettled(storeKey, data);
-  else if (event === "agent_output") {
-    if (data.pane) pendingOutputByPane.set(pendingKey(storeKey, data.pane), data.output || "");
+  const bindings = await loadBindings();
+  const entries = Object.entries(bindings);
+  const scoped = data.workspace
+    ? entries.filter(([, b]) => normalizeWorkspaceId(b) === data.workspace)
+    : entries;
+  if (event === "hello") {
+    for (const [storeKey] of entries) await onPushHello(storeKey, data);
+  } else if (event === "agent_working") {
+    for (const [storeKey] of scoped) await onPushWorking(storeKey, data);
+  } else if (event === "agent_settled") {
+    for (const [storeKey] of scoped) await onPushSettled(storeKey, data);
+  } else if (event === "agent_output" && data.pane) {
+    for (const [storeKey] of scoped) {
+      pendingOutputByPane.set(pendingKey(storeKey, data.pane), data.output || "");
+    }
   }
 }
 
@@ -916,8 +949,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const b = bindings[entry.storeKey];
           b.tabId = sender.tab?.id;
           b.tabUrl = msg.url || sender.tab?.url;
-          ensurePushStream(bindings, entry.storeKey);
         }
+        ensurePushStream(bindings);
         await saveBindings(bindings);
         const first = matched[0];
         sendResponse({
@@ -978,6 +1011,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const bindings = await loadBindings();
       const session = convKey ? bindingsForConv(bindings, convKey) : [];
       const labels = session.map((b) => b.workspace_label || b.workspace_id).filter(Boolean);
+      const state = await fetchState();
       let llmHost = "";
       try {
         llmHost = CFG.llmJudgeBaseUrl ? new URL(llmJudgeCompletionsUrl(CFG.llmJudgeBaseUrl)).host : "";
@@ -996,6 +1030,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         workspace_label: labels.length ? labels.join(", ") : null,
         workspace_id: session[0]?.workspace_id || (session[0] ? normalizeWorkspaceId(session[0]) : null),
         binding_count: session.length,
+        bound_workspace_ids: session.map((b) => b.workspace_id || normalizeWorkspaceId(b)).filter(Boolean),
+        workspaces: state?.ok && Array.isArray(state.workspaces) ? state.workspaces : [],
+        workspace_status: state?.ok ? 200 : (state?.status || 0),
+        workspace_error: state?.ok ? null : (state?.error || (state?.status ? `HTTP ${state.status}` : "fetch-failed")),
         last: last ? {
           at: last.at || null,
           reason: last.reason || "",
@@ -1106,7 +1144,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_bind") {
     void (async () => {
       const bindings = await loadBindings();
-      const tabId = msg.tabId;
+      const tabId = msg.tabId || sender.tab?.id;
+      if (!tabId) { sendResponse({ ok: false, error: "tab-unavailable" }); return; }
       let convInfo = null;
       try { convInfo = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" }); } catch (e) {}
       if (!convInfo?.convKey) { sendResponse({ ok: false, error: "conversation-unavailable" }); return; }
@@ -1135,7 +1174,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       b.revision = bindingRevision(b);
       bindings[storeKey] = b;
       await saveBindings(bindings);
-      ensurePushStream(bindings, storeKey);
+      ensurePushStream(bindings);
       try { chrome.tabs.sendMessage(tabId, { type: "h2w_bound", pane: workspace_label, workspace_id, workspace_label }); } catch (e) {}
       sendResponse({ ok: true, convKey: convInfo.convKey, workspace_id, workspace_label });
     })();
@@ -1160,8 +1199,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         tabId = b.tabId || tabId;
         delete bindings[storeKey];
         clearProgressTimer(storeKey);
-        const stream = pushStreams.get(storeKey);
-        if (stream) { stream.ctrl.abort(); pushStreams.delete(storeKey); }
       }
       await saveBindings(bindings);
       if (!bindingsForConv(bindings, convKey).length) {
@@ -1169,7 +1206,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         lastTurnEndedPayload.delete(convKey);
       }
       if (tabId) { try { chrome.tabs.sendMessage(tabId, { type: "h2w_unbound", workspace_id: wsId || null }); } catch (e) {} }
-      if (!Object.keys(bindings).length) clearActionBadge();
+      if (!Object.keys(bindings).length) {
+        clearActionBadge();
+        stopPushStream();
+      }
       sendResponse({ ok: true });
     })();
     return true;
@@ -1192,32 +1232,45 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 async function fetchState() {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), STATE_FETCH_MS);
   try {
     const resp = await fetch(`${CFG.herdrMcpUrl.replace(/\/+$/, "")}/push/state`, {
       headers: CFG.token ? { Authorization: `Bearer ${CFG.token}` } : {},
+      signal: ctrl.signal,
     });
     if (!resp.ok) return { ok: false, status: resp.status };
     return { ok: true, ...(await resp.json()) };
   } catch (e) {
-    return { ok: false, error: e.message };
+    let loopback_permission = null;
+    try {
+      loopback_permission = (await navigator.permissions.query({ name: "loopback-network" })).state;
+    } catch (_) { /* Chrome <145 or browser without split LNA permissions */ }
+    if (e?.name === "AbortError") {
+      return {
+        ok: false,
+        error: loopback_permission && loopback_permission !== "granted"
+          ? `loopback_permission_${loopback_permission}`
+          : "fetch_timeout",
+        loopback_permission,
+      };
+    }
+    return { ok: false, error: e.message, loopback_permission };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-// Full rebuild: abort existing streams before recreating them from persisted bindings.
+// Full rebuild: exactly one shared stream regardless of binding count.
 async function rebuildStreams() {
   await configReady;
-  for (const [storeKey, stream] of pushStreams) {
-    try { stream.ctrl.abort(); } catch (e) {}
-    pushStreams.delete(storeKey);
-  }
+  stopPushStream();
   const bindings = await loadBindings();
   callLog(
     `rebuild streams v${H2W_SCRIPT_VERSION}: ${Object.keys(bindings).length} binding(s),`,
     `token=${CFG.token ? "set" : "empty"}, enabled=${CFG.enabled}`,
   );
-  for (const storeKey of Object.keys(bindings)) {
-    ensurePushStream(bindings, storeKey);
-  }
+  ensurePushStream(bindings);
   reconcileProgressTimers(bindings); // Re-arm or stop working progress timers.
 }
 
@@ -1226,9 +1279,7 @@ async function rebuildStreams() {
 async function ensureAlive(preloaded) {
   await configReady;
   const bindings = preloaded || await loadBindings();
-  for (const storeKey of Object.keys(bindings)) {
-    ensurePushStream(bindings, storeKey);
-  }
+  ensurePushStream(bindings);
   if (!CFG.enabled || progressTickSecMs() <= 0) return;
   for (const [storeKey, b] of Object.entries(bindings)) {
     if (b.status === "working" && !progressTimers.has(storeKey)) armProgressTimer(storeKey);

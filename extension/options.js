@@ -128,18 +128,33 @@ $("save").addEventListener("click", () => {
 
 $("test").addEventListener("click", () => {
   const url = $("url").value.trim().replace(/\/+$/, "");
-  const token = $("token").value.trim();
   if (!url) { setStatus(t("need_url"), "err"); return; }
   setStatus(t("testing"), "");
-  fetch(`${url}/push/state`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
-    .then((r) => {
-      if (r.ok) {
-        return r.json().then((j) => setStatus(`✓ ${t("connect_ok", { n: j.agents?.length || 0 })}`, "ok"));
-      }
-      if (r.status === 401) setStatus(`✖ ${t("http_401")}`, "err");
-      else setStatus(`✖ HTTP ${r.status}`, "err");
-    })
-    .catch((e) => setStatus(`✖ ${t("unreachable_detail", { msg: e.message })}`, "err"));
+  // Exercise the exact same bounded background transport used by popup/HUD.
+  // Direct Options-page fetch can otherwise hang indefinitely on Chrome's
+  // loopback-network permission gate and hide the actual remediation.
+  chrome.runtime.sendMessage({ type: "h2w_agents" }, (resp) => {
+    if (chrome.runtime.lastError) {
+      setStatus(`✖ ${t("unreachable_detail", { msg: chrome.runtime.lastError.message })}`, "err");
+      return;
+    }
+    if (resp?.ok) {
+      setStatus(`✓ ${t("connect_ok", { n: resp.agents?.length || 0 })}`, "ok");
+      return;
+    }
+    if (resp?.status === 401) {
+      setStatus(`✖ ${t("http_401")}`, "err");
+      return;
+    }
+    if (String(resp?.error || "").startsWith("loopback_permission_")) {
+      setStatus(`✖ ${t("loopback_permission_help")}`, "err");
+      return;
+    }
+    const detail = resp?.error === "fetch_timeout"
+      ? t("loopback_timeout_help")
+      : (resp?.error || `HTTP ${resp?.status || "?"}`);
+    setStatus(`✖ ${t("unreachable_detail", { msg: detail })}`, "err");
+  });
 });
 
 $("testLlm").addEventListener("click", () => {

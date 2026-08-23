@@ -46,6 +46,63 @@ for (const r of referenced) {
 ok(manifest.background?.type === "module", "background is a module worker");
 ok(manifest.content_scripts.length === 4, "manifest contains four site content scripts");
 
+const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
+const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
+ok(manifest.version === "0.1.34", "manifest version includes shared SSE + loopback diagnostics release");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.34"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.34"'), "content version matches manifest");
+ok(
+  backgroundSource.includes("bound_workspace_ids:") && backgroundSource.includes("workspaces: state?.ok"),
+  "page HUD response carries live workspaces and bound workspace ids",
+);
+ok(
+  backgroundSource.includes("msg.tabId || sender.tab?.id"),
+  "in-page bind resolves the sender tab without popup-only tabId",
+);
+ok(
+  wakeSource.includes('select class="ws"') && wakeSource.includes("toggleHudWorkspaceBinding") && wakeSource.includes("paintWorkspaceControls"),
+  "in-page HUD renders and operates a workspace picker",
+);
+ok(
+  wakeSource.includes("registerCurrentConversation")
+    && wakeSource.includes("startConversationRouteWatch")
+    && wakeSource.includes("convKey !== registeredConvKey"),
+  "content script re-registers when an SPA conversation route changes",
+);
+ok(
+  backgroundSource.includes("ONE shared stream for every binding")
+    && backgroundSource.includes('const url = `${CFG.herdrMcpUrl.replace(/\\/+$/, "")}/push/events`;')
+    && !backgroundSource.includes("/push/events?workspace="),
+  "extension uses one shared SSE stream instead of one stream per workspace",
+);
+ok(
+  backgroundSource.includes("PUSH_CONNECT_MS = 5000")
+    && backgroundSource.includes("STATE_FETCH_MS = 4000")
+    && backgroundSource.includes("loopback_permission_"),
+  "localhost transport is bounded and reports Chrome loopback permission state",
+);
+const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
+ok(
+  optionsSource.includes('type: "h2w_agents"') && optionsSource.includes("loopback_permission_help"),
+  "Options connection test uses bounded background transport and loopback guidance",
+);
+
+{
+  const code = readFileSync(path.join(EXT, "content/base.js"), "utf8");
+  const projectConversation = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/c/6a89c95e-70bc-83ea-bf3d-fab6b83fc86e";
+  const u = new URL(projectConversation);
+  const window = {};
+  const ctx = vm.createContext({
+    window,
+    location: { origin: u.origin, pathname: u.pathname },
+    document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
+    console,
+  });
+  vm.runInContext(code, ctx);
+  const key = vm.runInContext("new BaseAdapter().getConversationKey()", ctx);
+  ok(key === projectConversation, "ChatGPT project conversation URL is preserved as the binding key");
+}
+
 const localeCodes = ["en", "zh", "ja"];
 const localeHud = {};
 for (const code of localeCodes) {

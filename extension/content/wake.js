@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.30";
+const H2W_CONTENT_VERSION = "0.1.34";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -514,10 +514,47 @@ const H2W_CONTENT_VERSION = "0.1.30";
   } catch (e) { console.warn("[h2w] failed to register onMessage:", e.message); }
 
   // ---- Registration: report version and conversation identity ----
+  // ChatGPT (and the other supported sites) use client-side navigation. Content
+  // scripts survive those route changes, so startup registration alone can leave
+  // background state attached to the previous conversation. Poll the canonical
+  // conversation key instead of monkey-patching history.pushState: content scripts
+  // run in an isolated world and cannot reliably intercept the page's History API.
+  let registeredConvKey = null;
+
+  async function registerCurrentConversation(reason = "startup") {
+    if (!runtimeAlive()) return null;
+    const convKey = ADAPTER.getConversationKey();
+    if (!convKey) return null;
+    const response = await sendBg({ type: "h2w_register", convKey, url: location.href, site: ADAPTER.name });
+    if (response !== null) {
+      const changed = registeredConvKey !== null && registeredConvKey !== convKey;
+      registeredConvKey = convKey;
+      if (changed) {
+        console.log(`[h2w] conversation route changed (${reason}): ${convKey}`);
+        if (ADAPTER.name === "chatgpt") void refreshPageHud();
+      }
+    }
+    return response;
+  }
+
+  function startConversationRouteWatch() {
+    // One second is fast enough for UI binding while keeping route detection
+    // negligible compared with the existing 5s HUD reconciliation interval.
+    setInterval(() => {
+      const convKey = ADAPTER.getConversationKey();
+      if (convKey && convKey !== registeredConvKey) void registerCurrentConversation("poll");
+    }, 1000);
+    try {
+      window.addEventListener("popstate", () => { void registerCurrentConversation("popstate"); });
+      window.addEventListener("hashchange", () => { void registerCurrentConversation("hashchange"); });
+    } catch (_) { /* polling remains authoritative */ }
+  }
+
   (async () => {
     if (!runtimeAlive()) return;
     try { chrome.runtime.sendMessage({ type: "h2w_hello", version: H2W_CONTENT_VERSION }); } catch (e) {}
-    await sendBg({ type: "h2w_register", convKey: ADAPTER.getConversationKey(), url: location.href, site: ADAPTER.name });
+    await registerCurrentConversation("startup");
+    startConversationRouteWatch();
     // ChatGPT Connector permission cards can appear outside wake-up, so watch continuously.
     if (ADAPTER.name === "chatgpt" && PERM) startPermissionWatch(Number.POSITIVE_INFINITY);
     // Talk-without-tools: watch turn boundaries and ask background to check MCP activity.
@@ -697,8 +734,13 @@ const H2W_CONTENT_VERSION = "0.1.30";
           color: #171717; background: #ffffff;
           border-top: 1px solid #eaeaea;
         }
-        .cfg { color: #4d4d4d; flex: 1 1 46%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .last { color: #171717; flex: 1 1 54%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
+        .cfg { color: #4d4d4d; flex: 1 1 38%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ws-controls { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; min-width: 0; }
+        .ws { max-width: 240px; height: 24px; padding: 0 5px; border: 1px solid #d4d4d4; border-radius: 5px; background: #fff; color: #171717; font: inherit; }
+        .ws-action { height: 24px; padding: 0 8px; border: 1px solid #d4d4d4; border-radius: 5px; background: #f7f7f7; color: #171717; font: inherit; cursor: pointer; }
+        .ws-action:hover:not(:disabled) { background: #ededed; }
+        .ws-action:disabled, .ws:disabled { opacity: .55; cursor: default; }
+        .last { color: #171717; flex: 1 1 38%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
         .bar.pending .last { color: #aa4d00; }
         .bar.ok .last { color: #107d32; }
         .bar.err .last { color: #d8001b; }
@@ -706,6 +748,10 @@ const H2W_CONTENT_VERSION = "0.1.30";
       </style>
       <div class="bar" part="bar">
         <div class="cfg"></div>
+        <div class="ws-controls">
+          <select class="ws" aria-label="workspace"></select>
+          <button class="ws-action" type="button"></button>
+        </div>
         <div class="last"></div>
       </div>
     `;
@@ -713,9 +759,99 @@ const H2W_CONTENT_VERSION = "0.1.30";
       host,
       bar: shadow.querySelector(".bar"),
       cfg: shadow.querySelector(".cfg"),
+      ws: shadow.querySelector(".ws"),
+      wsAction: shadow.querySelector(".ws-action"),
       last: shadow.querySelector(".last"),
     };
+    hudEls.ws.addEventListener("change", () => paintWorkspaceControls(hudCache));
+    hudEls.wsAction.addEventListener("click", () => { void toggleHudWorkspaceBinding(); });
     return hudEls;
+  }
+
+  function hudWorkspaceTitle(w) {
+    const id = String(w?.id || "").trim();
+    const label = String(w?.label || "").trim();
+    if (label && id) return `${label} (${id})`;
+    if (label) return label;
+    const roots = Array.isArray(w?.roots) ? w.roots : [];
+    const root = roots[0] ? String(roots[0]).replace(/\/+$/, "").split("/").pop() : "";
+    return root && id ? `${root} (${id})` : (id || root || "?");
+  }
+
+  function hudWorkspaceError(error) {
+    const raw = String(error || "").trim();
+    if (!raw) return "";
+    if (raw.startsWith("loopback_permission_")) return hudT("loopback_permission_short");
+    if (raw === "fetch_timeout") return hudT("loopback_timeout_short");
+    return raw;
+  }
+
+  function paintWorkspaceControls(hud) {
+    const ui = ensurePageHud();
+    const select = ui.ws;
+    const action = ui.wsAction;
+    if (!select || !action) return;
+    const workspaces = Array.isArray(hud?.workspaces) ? hud.workspaces.filter((w) => w?.id) : [];
+    const bound = new Set(Array.isArray(hud?.bound_workspace_ids) ? hud.bound_workspace_ids : []);
+    const prior = select.value;
+    const preferred = prior && workspaces.some((w) => w.id === prior)
+      ? prior
+      : (workspaces.find((w) => bound.has(w.id))?.id || workspaces[0]?.id || "");
+
+    select.textContent = "";
+    if (!workspaces.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = hud?.workspace_error
+        ? `${hudT("no_workspaces")} · ${clipHud(hudWorkspaceError(hud.workspace_error), 40)}`
+        : hudT("no_workspaces");
+      select.appendChild(opt);
+      select.disabled = true;
+      action.disabled = true;
+      action.textContent = hudT("bind_action");
+      return;
+    }
+
+    for (const w of workspaces) {
+      const opt = document.createElement("option");
+      opt.value = w.id;
+      opt.textContent = `${hudWorkspaceTitle(w)}${bound.has(w.id) ? ` · ${hudT("bound")}` : ""}`;
+      select.appendChild(opt);
+    }
+    select.disabled = false;
+    select.value = preferred;
+    action.disabled = !select.value;
+    action.textContent = bound.has(select.value) ? hudT("unbind") : hudT("bind_action");
+  }
+
+  async function toggleHudWorkspaceBinding() {
+    const ui = ensurePageHud();
+    const wsId = String(ui.ws?.value || "").trim();
+    if (!wsId || !runtimeAlive()) return;
+    const hud = hudCache || {};
+    const workspaces = Array.isArray(hud.workspaces) ? hud.workspaces : [];
+    const meta = workspaces.find((w) => w?.id === wsId) || { id: wsId };
+    const bound = new Set(Array.isArray(hud.bound_workspace_ids) ? hud.bound_workspace_ids : []);
+    ui.ws.disabled = true;
+    ui.wsAction.disabled = true;
+    let result = null;
+    if (bound.has(wsId)) {
+      result = await sendBg({ type: "h2w_unbind", convKey: ADAPTER.getConversationKey(), workspace_id: wsId });
+    } else {
+      result = await sendBg({
+        type: "h2w_bind",
+        workspace_id: wsId,
+        workspace_label: hudWorkspaceTitle(meta),
+        workspace_label_raw: meta?.label || null,
+        roots: Array.isArray(meta?.roots) ? meta.roots : [],
+      });
+    }
+    if (!result?.ok && result?.error !== "already-bound") {
+      paintPageHud({
+        hud: { ...hud, last: { at: Date.now(), reason: "workspace_action_failed", error: result?.error || "binding failed" } },
+      });
+    }
+    await refreshPageHud();
   }
 
   function liftComposer(px) {
@@ -754,6 +890,7 @@ const H2W_CONTENT_VERSION = "0.1.30";
     }
     ui.cfg.textContent = parts.join(" · ");
     ui.cfg.setAttribute("lang", hudLocale);
+    paintWorkspaceControls(hud);
 
     let lastText = hudT("hud_last_none");
     let kind = hud && hud.bound && hud.llmConfigured ? "" : "off";

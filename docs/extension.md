@@ -5,10 +5,16 @@
 
 | 主线 | 问题 | 方向 | 状态 | 首批站点 |
 |---|---|---|---|---|
-| **A. 进度回推** | 网页派活到 herdr 后，对话不再观察/继续 | herdr → 网页（写输入框并提交） | **已可用**（扩展 0.1.28） | chatgpt / deepseek / z.ai / claude |
+| **A. 进度回推** | 网页派活到 herdr 后，对话不再观察/继续 | herdr → 网页（写输入框并提交） | **已可用**（扩展 0.1.34） | chatgpt / deepseek / z.ai / claude |
 | **B. JSON→MCP** | DeepSeek / z.ai 网页没有 MCP Connector | 网页 → 本机 `127.0.0.1:8772/mcp` | **未完成**（能抠 JSON，未调 MCP） | `chat.deepseek.com`、`chat.z.ai` |
 
 共享：同一扩展、同一静态 token、同一 options。  
+部署边界：扩展始终只访问本机 `127.0.0.1:8772` 的 `/push/*`（未来 B 才会访问本机 `/mcp`），不经过公网 Worker/Tunnel。因此 Cloudflare Edge、Custom Domain、contract epoch 的变更不要求扩展改 URL/OAuth。0.3.26 production runtime 在 epoch1 兼容模式下已通过 `tests/manual/extension_smoke.mjs`；主线 A 与新版 server 兼容。ChatGPT 的普通 `/c/<id>` 与项目内 `/g/g-p-…/c/<id>` 都使用完整 `origin + pathname` 作为会话绑定键；SPA 路由变化会自动重新注册，不要求刷新整页。
+
+传输层只维持 **1 条全局 `/push/events` SSE**。所有 workspace 事件由 background 根据事件里的 `workspace` 字段分发到对应 binding；不能按 binding 各建一条 SSE，否则多个历史 binding 会耗尽浏览器对 `127.0.0.1:8772` 的 HTTP/1.1 连接池，导致 `/push/state` 与 `/push/mcp-activity` 永久排队。
+
+Chrome 145+ 把本机回环访问拆成 `loopback-network`（界面显示为“设备上的应用”）权限。扩展仍声明 `http://127.0.0.1:8772/*` host permission，但部分 Chrome/Chromium profile 仍可能把 loopback 权限保留为“询问”。Options 的“测试连接”和页面 HUD 都使用 bounded 请求：若本机服务请求被权限门控，会明确提示进入“管理扩展程序 → 网站设置 → 设备上的应用 → 允许”，而不是无限加载。
+
 分文档：[extension-wake.md](./extension-wake.md)（A）、[extension-bridge.md](./extension-bridge.md)（B）。
 
 ```text
