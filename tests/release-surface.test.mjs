@@ -62,6 +62,7 @@ test("Actions build docs and keep Cloudflare deployment on the gated Worker plan
   assert.match(edge, /environment: production/);
   assert.match(edge, /wranglerVersion: "4"/);
   assert.match(edge, /wrangler\.prod\.toml/);
+  assert.match(edge, /!edge\/cloudflare\/\*\*\/\*\.md/, "Edge docs-only changes must not redeploy the production Worker");
   assert.doesNotMatch(edge, /cloudflared|DNS Write|Tunnel/);
 });
 

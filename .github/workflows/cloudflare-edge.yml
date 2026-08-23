@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "edge/cloudflare/**"
+      - "!edge/cloudflare/**/*.md"
       - "src/relay/**"
       - "tests/relay-*.mjs"
       - "package.json"
