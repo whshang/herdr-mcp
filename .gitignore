@@ -1,6 +1,7 @@
 # --- Node.js build / cache ---
 node_modules/
 dist/
+site-dist/
 *.tsbuildinfo
 
 # --- Test / coverage / tooling artifacts ---
@@ -46,6 +47,7 @@ Desktop.ini
 .herdr/
 .omp/
 .hermes/
+edge/cloudflare/.wrangler/
 
 # --- Process / scratch notes (not for publishing) ---
 # Keep durable guides under docs/*.md tracked.

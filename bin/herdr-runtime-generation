@@ -1,0 +1,208 @@
+#!/usr/bin/env node
+import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+
+const DEFAULT_DIR = join(homedir(), ".config", "herdr-mcp");
+const DEFAULT_CONTROL = join(DEFAULT_DIR, "runtime-control.json");
+const DEFAULT_STATUS = join(DEFAULT_DIR, "runtime-status.json");
+const GENERATION_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+
+function parseArgs(argv) {
+  const first = argv[0] || "status";
+  const command = first === "--help" || first === "-h" ? "status" : first;
+  const out = {
+    command,
+    help: first === "--help" || first === "-h",
+    controlPath: process.env.HERDR_RUNTIME_CONTROL_PATH || DEFAULT_CONTROL,
+    statusPath: process.env.HERDR_RUNTIME_STATUS_PATH || DEFAULT_STATUS,
+    generation: "",
+    endpoint: "",
+    runtimeVersion: null,
+    runtimeCommit: null,
+    checks: null,
+    intervalMs: null,
+  };
+  for (let i = 1; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--control-path") out.controlPath = argv[++i] || "";
+    else if (arg === "--status-path") out.statusPath = argv[++i] || "";
+    else if (arg === "--generation") out.generation = argv[++i] || "";
+    else if (arg === "--endpoint") out.endpoint = argv[++i] || "";
+    else if (arg === "--runtime-version") out.runtimeVersion = argv[++i] || null;
+    else if (arg === "--commit") out.runtimeCommit = argv[++i] || null;
+    else if (arg === "--checks") out.checks = Number(argv[++i]);
+    else if (arg === "--interval-ms") out.intervalMs = Number(argv[++i]);
+    else if (arg === "--help" || arg === "-h") out.help = true;
+    else throw new Error(`unknown_argument:${arg}`);
+  }
+  return out;
+}
+
+function usage() {
+  return `Usage: herdr-runtime-generation <status|register|activate|rollback|remove> [options]\n\n` +
+    `Controls which loopback Herdr runtime generation the persistent herdr-link uses.\n` +
+    `No runtime credential is stored in this control file. The link keeps using its\n` +
+    `existing local MCP bearer and validates candidate health + exact tools/list hash\n` +
+    `before switching.\n\n` +
+    `Commands:\n` +
+    `  status\n` +
+    `  register --generation <id> --endpoint http://127.0.0.1:<port>/mcp [--runtime-version <v>] [--commit <sha>]\n` +
+    `  activate --generation <id> [--checks 3] [--interval-ms 500]\n` +
+    `  rollback\n` +
+    `  remove --generation <id>\n\n` +
+    `Files default to ~/.config/herdr-mcp/runtime-{control,status}.json and are mode 0600.\n`;
+}
+
+function emit(value, code = 0) {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+  if (code) process.exitCode = code;
+}
+
+function loopbackEndpoint(endpoint) {
+  let u;
+  try { u = new URL(endpoint); } catch { return false; }
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const local = host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host);
+  return local && (u.protocol === "http:" || u.protocol === "https:");
+}
+
+async function atomicJson(path, value) {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const tmp = `${path}.tmp-${process.pid}`;
+  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  await chmod(tmp, 0o600);
+  await rename(tmp, path);
+  await chmod(path, 0o600);
+}
+
+async function readJson(path) {
+  try {
+    const info = await stat(path);
+    if (info.size > 128 * 1024) throw new Error("file_too_large");
+    return JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function validateGeneration(id) {
+  if (!GENERATION_RE.test(id)) throw new Error("invalid_generation");
+}
+
+function normalizedObservation(checks, intervalMs, previous = {}) {
+  const c = Number.isInteger(checks) && checks >= 1 && checks <= 20 ? checks : (previous.checks ?? 3);
+  const i = Number.isInteger(intervalMs) && intervalMs >= 0 && intervalMs <= 10_000 ? intervalMs : (previous.interval_ms ?? 500);
+  return { checks: c, interval_ms: i };
+}
+
+async function ensureControl(path) {
+  const current = await readJson(path);
+  if (current) return current;
+  const generation = process.env.HERDR_RUNTIME_GENERATION || "local-mcp-active";
+  const endpoint = process.env.HERDR_MCP_ENDPOINT || "http://127.0.0.1:8772/mcp";
+  validateGeneration(generation);
+  if (!loopbackEndpoint(endpoint)) throw new Error("invalid_base_endpoint");
+  const initial = {
+    schema_version: 1,
+    revision: 1,
+    desired_active: generation,
+    generations: [{ generation, endpoint }],
+    observation: { checks: 3, interval_ms: 500 },
+  };
+  await atomicJson(path, initial);
+  return initial;
+}
+
+function nextRevision(doc) {
+  const n = Number(doc?.revision);
+  return Number.isInteger(n) && n >= 1 ? n + 1 : 1;
+}
+
+async function main() {
+  let args;
+  try { args = parseArgs(process.argv.slice(2)); } catch (error) { emit({ ok: false, code: error.message }, 2); return; }
+  if (args.help) { process.stdout.write(usage()); return; }
+
+  if (args.command === "status") {
+    const [control, status] = await Promise.all([readJson(args.controlPath), readJson(args.statusPath)]);
+    emit({
+      ok: !!status,
+      code: status ? "runtime_status" : "runtime_status_not_ready",
+      control_path: args.controlPath,
+      status_path: args.statusPath,
+      desired_active: control?.desired_active ?? null,
+      control_revision: control?.revision ?? null,
+      status,
+    }, status ? 0 : 2);
+    return;
+  }
+
+  const control = await ensureControl(args.controlPath);
+  if (control.schema_version !== 1 || !Array.isArray(control.generations)) {
+    emit({ ok: false, code: "invalid_control_file" }, 2); return;
+  }
+
+  if (args.command === "register") {
+    try { validateGeneration(args.generation); } catch (error) { emit({ ok: false, code: error.message }, 2); return; }
+    if (!loopbackEndpoint(args.endpoint)) { emit({ ok: false, code: "endpoint_must_be_loopback" }, 2); return; }
+    const spec = {
+      generation: args.generation,
+      endpoint: args.endpoint,
+      ...(args.runtimeVersion ? { expected_runtime_version: args.runtimeVersion } : {}),
+      ...(args.runtimeCommit ? { runtime_commit: args.runtimeCommit } : {}),
+    };
+    const existing = control.generations.findIndex((g) => g.generation === args.generation);
+    if (existing >= 0) control.generations[existing] = spec;
+    else control.generations.push(spec);
+    if (control.generations.length > 8) { emit({ ok: false, code: "too_many_generations" }, 2); return; }
+    control.revision = nextRevision(control);
+    await atomicJson(args.controlPath, control);
+    emit({ ok: true, code: "generation_registered", generation: args.generation, endpoint: args.endpoint, revision: control.revision });
+    return;
+  }
+
+  if (args.command === "activate") {
+    try { validateGeneration(args.generation); } catch (error) { emit({ ok: false, code: error.message }, 2); return; }
+    if (!control.generations.some((g) => g.generation === args.generation)) { emit({ ok: false, code: "generation_not_registered" }, 2); return; }
+    control.desired_active = args.generation;
+    control.observation = normalizedObservation(args.checks, args.intervalMs, control.observation || {});
+    control.revision = nextRevision(control);
+    await atomicJson(args.controlPath, control);
+    emit({ ok: true, code: "activation_requested", generation: args.generation, revision: control.revision, observation: control.observation });
+    return;
+  }
+
+  if (args.command === "rollback") {
+    const status = await readJson(args.statusPath);
+    const current = status?.manager?.active_generation ?? control.desired_active;
+    const previous = status?.manager?.previous_generation;
+    const lastGood = status?.manager?.last_good_generation;
+    const target = previous && previous !== current ? previous : (lastGood && lastGood !== current ? lastGood : null);
+    if (!target || !control.generations.some((g) => g.generation === target)) { emit({ ok: false, code: "rollback_generation_unavailable" }, 2); return; }
+    control.desired_active = target;
+    control.revision = nextRevision(control);
+    await atomicJson(args.controlPath, control);
+    emit({ ok: true, code: "rollback_requested", generation: target, revision: control.revision });
+    return;
+  }
+
+  if (args.command === "remove") {
+    try { validateGeneration(args.generation); } catch (error) { emit({ ok: false, code: error.message }, 2); return; }
+    if (control.desired_active === args.generation) { emit({ ok: false, code: "cannot_remove_desired_active" }, 2); return; }
+    const before = control.generations.length;
+    control.generations = control.generations.filter((g) => g.generation !== args.generation);
+    if (control.generations.length === before) { emit({ ok: true, code: "generation_already_absent", generation: args.generation }); return; }
+    control.revision = nextRevision(control);
+    await atomicJson(args.controlPath, control);
+    emit({ ok: true, code: "generation_removed", generation: args.generation, revision: control.revision });
+    return;
+  }
+
+  emit({ ok: false, code: "unknown_command", command: args.command }, 2);
+}
+
+main().catch((error) => {
+  emit({ ok: false, code: "runtime_generation_cli_error", message: String(error?.message || error).slice(0, 160) }, 2);
+});

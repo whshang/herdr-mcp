@@ -2,6 +2,8 @@
 
 MCP HTTP 门面：让 ChatGPT（及其它网页模型）驱动本机 [Herdr](https://herdr.dev)——查看窗格与 agent、在托管 git 项目里读改文件、跑命令，并给便宜的本地 worker 派活。浏览器扩展再把进度 / 收工写回绑定的网页对话。
 
+**文档站：** https://whshang.github.io/herdr-mcp/ · **源码：** https://github.com/whshang/herdr-mcp
+
 [Herdr](https://herdr.dev) 是给 coding agent 用的终端复用器。本仓库给**看不到**本机 socket 和磁盘的远程客户端当门。它**不会**把 herdr 约 90 个原生方法逐个做成 MCP 工具。
 
 **本仓库不做：** 替代 herdr；给 DeepSeek 装假的 OAuth connector；让扩展走公网隧道（扩展只连 `127.0.0.1`）。
@@ -17,9 +19,10 @@ Agents 的进度/收工通知到 extension；extension 再 ↻ 写入网页输�
 **编排（网页规划，本机省 API）：**
 
 - 能用 `herdr_fs_*` / `herdr_git` / `herdr_exec` 就不要开本地 agent。
-- 必须推理时，直接 `herdr_prompt` 给便宜/高速 worker（`pi`、`flash`、`cline`、`opencode`、`anti`）或审计（`droid`、`grok`），不要经本机 Claude/OMP/main 再转派。
+- 必须推理时，优先 `herdr_prompt` 给便宜/高速的 Herdr 原生 worker（`pi`、`flash`、`cline`、`opencode`、`anti`）或审计（`droid`、`grok`），不要经本机 Claude/OMP/main 再转派。
+- Pi/Herdr worker 不可用时，实测可用 `dsh --profile headless "任务"` 作为开发 CLI 备选，但要通过 `herdr_exec_start` 长任务 session 跑；DSH 可能已经改完代码却还没在 60 秒内打印最终回复，超时后必须先看 Git/test 再决定是否重试。`dsh-tui` 只作为人工交互接管。详见 [worker fallbacks](docs/worker-fallbacks.md)。
 - `inspect`/`since` 默认软隐藏 Claude/OMP/Codex。知道 pane 仍可 prompt。`HERDR_MCP_AGENT_ALLOW=*` 显示全部。
-- 会话开始：`herdr_inspect` → `herdr_skill`（一次）→ 干活。
+- 独立/本地默认 18-tool 模式下，会话开始：`herdr_inspect` → `herdr_skill`（一次）→ 干活。当前生产 ChatGPT Edge 冻结在 contract epoch 1（17 tools），因此故意隐藏 `herdr_skill`，直到显式升级 contract epoch。
 
 ```mermaid
 flowchart TB
@@ -56,7 +59,7 @@ flowchart TB
 export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"   # 或沿用已有 token
 export HERDR_MCP_PORT=8772
 # 公网 Connector 时再设（不要带 /mcp）:
-# export HERDR_MCP_BASE_URL=https://xxxx.trycloudflare.com
+# export HERDR_MCP_BASE_URL=https://herdr-edge.<你的-account>.workers.dev
 node dist/server.js
 ```
 
@@ -66,7 +69,7 @@ node dist/server.js
 
 - 已安装并正在运行 [herdr](https://herdr.dev)
 - Node.js 20+（`node -v`）
-- 接 ChatGPT 时需要公网 HTTPS：`cloudflared`（[Quick Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)）或自有域名
+- 接 ChatGPT 推荐使用 Cloudflare Worker 的 `workers.dev` 公网 HTTPS（不要求自有域名）；Custom Domain 只是稳定长期入口的可选增强。直接 `cloudflared` 暴露本机仅保留为旧架构迁移兼容。
 
 ### 1. 下载与构建
 
@@ -87,48 +90,44 @@ node dist/server.js
 # 另开终端自检: curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 ```
 
-### 3. 接到 ChatGPT（推荐：免费 Cloudflare）
+### 3. 通过 Cloudflare Edge 接到 ChatGPT
 
-另开终端：
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:8772
-# 记下 https://xxxx.trycloudflare.com
-```
-
-用该源站重启 MCP（**不要**带 `/mcp`）：
+默认路径**不要求自有域名**。先把 Edge 部署到 Cloudflare 自动提供的 `workers.dev`：
 
 ```bash
-export HERDR_MCP_BASE_URL=https://xxxx.trycloudflare.com
-export HERDR_MCP_TOKEN=...   # 与上次相同
-node dist/server.js
+cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
+# 修改 Worker 名、workstation ID，以及 workers.dev 对应的 OAUTH_ISSUER
+cd edge/cloudflare
+npx wrangler deploy --config wrangler.user.toml
 ```
 
-#### 在 ChatGPT 网页添加 Connector（客户端聊天里加不了）
+部署后使用类似下面的稳定地址：
 
-MCP 服务**不能**在 ChatGPT 桌面/App 的聊天里添加，只能走**网页版**：
+```text
+https://herdr-edge.<你的-account-subdomain>.workers.dev/mcp
+```
 
-1. 打开 [https://chatgpt.com/#settings/Plugins](https://chatgpt.com/#settings/Plugins)，进入 **Developer mode**，打开开关
-2. 打开 [https://chatgpt.com/plugins#settings/Connectors?create-connector=true](https://chatgpt.com/plugins#settings/Connectors?create-connector=true)
-3. 填写名称，以及 MCP 地址 `https://xxxx.trycloudflare.com/mcp`（与 `HERDR_MCP_BASE_URL` + `/mcp` 一致）
-4. 点击登录，等跳转回来即可（本服务默认是免登陆完成的 OAuth 流程，**不要**填 API key / Token）
-5. 配好后**开新对话**（旧对话会持有旧 tool snapshot）
+如果已经有自己的 Cloudflare zone，可以再绑定 `herdr.example.com` 这样的 Custom Domain。**这是推荐项，不是前置条件。** 必须先在 `workers.dev` 上把 Worker、WSS Link、MCP 和 OAuth 验证通过，再独立绑定生产域名。详见 [Cloudflare Edge 部署](docs/cloudflare-edge-deployment.md) 和 [Cloudflare Edge Token](docs/cloudflare-edge-token.md)。
+
+直接用 `cloudflared` / Quick Tunnel 把本机 MCP 暴露公网只作为旧版本迁移和故障排查手段，不再是新安装默认架构。
+
+Runtime 升级可以在稳定的 Edge/Link 后面做 A/B 切代，不需要修改 ChatGPT Connector。详见 [Runtime A/B 自升级](docs/runtime-self-upgrade.md)。
+
+#### 在 ChatGPT 网页添加 Connector
+
+1. 在 ChatGPT 设置里开启 **Developer mode**。
+2. 创建自定义 MCP Connector。
+3. 填写 Edge MCP 地址：`https://<worker>.<account>.workers.dev/mcp`，或者可选 Custom Domain + `/mcp`。
+4. 在浏览器完成 OAuth；不要把本机 Herdr Token 填进 ChatGPT。
+5. 配好后开一个新对话，让它获取新的 tool snapshot。
 
 #### 报错或工具没刷出来
 
-若出现：
-
-- `Error fetching OAuth configuration` / `MCP server https://xxx.trycloudflare.com/mcp does not implement OAuth`
-- `There was a problem connecting xxx. Try again later.`
-- 或添加成功了，但工具没刷出来
-
-先确认本机 `HERDR_MCP_BASE_URL` 与 ChatGPT 填的 HTTPS 源站一致、`cloudflared` 仍在跑、`herdr-mcp status` 公网可达。仍不行就到插件管理里**多手动连接几次**——多数是 ChatGPT 自身缓存或网络问题。更多硬性要求见 [docs/chatgpt-connector.md](docs/chatgpt-connector.md)。
+先确认 MCP URL 与 `OAUTH_ISSUER` 使用同一个稳定 origin，再检查 Edge `/health`、`herdr-link` 在线状态和 OAuth discovery。硬性要求与诊断方法见 [docs/chatgpt-connector.md](docs/chatgpt-connector.md)。
 
 #### 模型额度
 
-免费 ChatGPT 只能用 **GPT-5.5-mini**。Plus 或更高档位可在聊天里用更高等级模型，经 connector 操作本机项目。
-
-Quick Tunnel 每次重启 `cloudflared` 子域会变，变了就更新 `HERDR_MCP_BASE_URL` 再重启 MCP。稳定主机名可用 Cloudflare 命名隧道或自有域名。
+ChatGPT 可用模型取决于当前套餐和产品配置，Herdr 不改变 ChatGPT 自身的额度或模型限制。
 
 ### 4. Cursor（可选，本机）
 
@@ -180,7 +179,7 @@ herdr-mcp watchdog status
 
 ## 默认工具（为什么是这 18 个）
 
-herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法）。herdr-mcp **不会**把每个方法都做成 MCP 工具（占上下文、也和 herdr 重复），而是四层：
+herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法）。herdr-mcp **不会**把每个方法都做成 MCP 工具（占上下文、也和 herdr 重复）。0.3.27 独立/本地默认是 18 tools；当前生产 ChatGPT Edge 为保持现有 Connector/tool snapshot 不变，冻结 contract epoch 1 为 17 tools，仅隐藏 `herdr_skill`。整体仍分四层：
 
 | 层 | MCP 工具 | 和 herdr 的关系 |
 |---|---|---|
@@ -191,7 +190,7 @@ herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法
 
 | 工具 | 做什么 |
 |---|---|
-| `herdr_skill` | 只读：优先从上游 herdr **master** 拉最新 SKILL.md；网络不可达时用**安装包内置副本**（`assets/herdr-agent-SKILL.md`）。每个会话在 `herdr_call` / `herdr_prompt` 前调用一次。`HERDR_SKILL_NETWORK=0` 强制只用内置。 |
+| `herdr_skill` | 只读：优先从上游 herdr **master** 拉最新 SKILL.md；网络不可达时用**安装包内置副本**（`assets/herdr-agent-SKILL.md`）。工具存在时每个会话在 agent 操作前调用一次；生产 contract epoch 1 暂时故意隐藏它。`HERDR_SKILL_NETWORK=0` 强制只用内置。 |
 | `herdr_methods` | 列出当前 herdr socket 方法与参数 schema（反射缓存）。陌生调用前先查。 |
 | `herdr_call` | 用 `{ method, params }` 调任意 herdr 方法（pane / workspace / agent 等），避免「一方法一工具」。 |
 | `herdr_inspect` | 一次看清连接 + workspaces / tabs / panes / agents（cwd、状态），以及 `workstation_info`、`boot_id`、`exec_sessions`。通常第一个调用。 |

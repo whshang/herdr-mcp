@@ -1,0 +1,207 @@
+#!/usr/bin/env node
+import { chmod, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+
+const API = 'https://api.cloudflare.com/client/v4';
+const DEFAULT_ZONE = 'agentforme.cc.cd';
+const DEFAULT_OUTPUT = join(homedir(), '.config', 'herdr-mcp', 'cloudflare-cutover.env');
+const ROUTES_PERMISSION = 'Workers Routes Write';
+const SCRIPTS_PERMISSION = 'Workers Scripts Write';
+
+function parseArgs(argv) {
+  const out = { zone: DEFAULT_ZONE, output: DEFAULT_OUTPUT, name: '', rotate: false, dryRun: false, verifyOnly: false };
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === '--zone') out.zone = argv[++i];
+    else if (a === '--output') out.output = argv[++i];
+    else if (a === '--name') out.name = argv[++i];
+    else if (a === '--rotate') out.rotate = true;
+    else if (a === '--dry-run') out.dryRun = true;
+    else if (a === '--verify-only') out.verifyOnly = true;
+    else if (a === '--help' || a === '-h') out.help = true;
+    else throw new Error(`unknown_argument:${a}`);
+  }
+  if (!out.zone || !out.output) throw new Error('zone_and_output_required');
+  if (!out.name) out.name = `herdr-mcp-${out.zone.replace(/[^a-zA-Z0-9.-]/g, '-')}`;
+  return out;
+}
+
+function usage() {
+  return `Usage: herdr-cloudflare-token [options]\n\n` +
+    `Creates a least-privilege Cloudflare Account API Token for Herdr Edge.\n\n` +
+    `Options:\n` +
+    `  --zone <name>       Zone to authorize (default: ${DEFAULT_ZONE})\n` +
+    `  --name <name>       Token name (default: herdr-mcp-<zone>)\n` +
+    `  --output <path>     Local env file (default: ${DEFAULT_OUTPUT})\n` +
+    `  --dry-run           Resolve IDs and validate bootstrap permissions; create nothing\n` +
+    `  --verify-only       Verify the already-saved token only\n` +
+    `  --rotate            Replace an existing local credential with a newly-created token\n` +
+    `  -h, --help          Show this help\n\n` +
+    `Bootstrap credential: set CLOUDFLARE_API_TOKEN (or CF_API_TOKEN) to an existing\n` +
+    `token that can read the target zone and manage Account API Tokens. The generated\n` +
+    `Herdr token itself receives ONLY Workers Routes Write for the selected zone plus\n` +
+    `Workers Scripts Write for the account. Token values are never printed.\n`;
+}
+
+function emit(value, code = 0) {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+  if (code) process.exitCode = code;
+}
+
+async function cf(token, path, init = {}) {
+  let response;
+  try {
+    response = await fetch(`${API}${path}`, {
+      ...init,
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...(init.headers || {}) },
+    });
+  } catch {
+    return { ok: false, status: 0, code: 'cloudflare_unreachable', result: null };
+  }
+  let body = null;
+  try { body = await response.json(); } catch { /* no-op */ }
+  if (!response.ok || body?.success === false) {
+    return {
+      ok: false,
+      status: response.status,
+      code: response.status === 403 ? 'permission_blocked' : 'cloudflare_api_error',
+      errors: Array.isArray(body?.errors) ? body.errors.map((e) => ({ code: e?.code, message: e?.message })) : [],
+      result: null,
+    };
+  }
+  return { ok: true, status: response.status, result: body?.result ?? null };
+}
+
+function parseEnv(text) {
+  const result = {};
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const pos = line.indexOf('=');
+    if (pos <= 0) continue;
+    result[line.slice(0, pos)] = line.slice(pos + 1);
+  }
+  return result;
+}
+
+async function loadExisting(path) {
+  try { return parseEnv(await readFile(path, 'utf8')); } catch { return null; }
+}
+
+async function verifyGenerated({ token, accountId, zoneId }) {
+  const [verify, routes, scripts] = await Promise.all([
+    cf(token, `/accounts/${encodeURIComponent(accountId)}/tokens/verify`),
+    cf(token, `/zones/${encodeURIComponent(zoneId)}/workers/routes`),
+    cf(token, `/accounts/${encodeURIComponent(accountId)}/workers/scripts`),
+  ]);
+  return {
+    ok: verify.ok && routes.ok && scripts.ok,
+    tokenActive: verify.ok && verify.result?.status === 'active',
+    routesAccess: routes.ok,
+    scriptsAccess: scripts.ok,
+    statuses: { verify: verify.status, routes: routes.status, scripts: scripts.status },
+  };
+}
+
+async function resolveBootstrap(token, zoneName) {
+  const zones = await cf(token, `/zones?name=${encodeURIComponent(zoneName)}`);
+  if (!zones.ok) return { ok: false, stage: 'zone_lookup', ...zones };
+  if (!Array.isArray(zones.result) || zones.result.length !== 1) return { ok: false, stage: 'zone_lookup', code: 'zone_not_unique' };
+  const zone = zones.result[0];
+  const accountId = zone?.account?.id;
+  if (!zone?.id || !accountId) return { ok: false, stage: 'zone_lookup', code: 'zone_identity_missing' };
+
+  const groups = await cf(token, `/accounts/${encodeURIComponent(accountId)}/tokens/permission_groups`);
+  if (!groups.ok) return { ok: false, stage: 'permission_group_lookup', ...groups };
+  const byName = new Map((Array.isArray(groups.result) ? groups.result : []).map((g) => [g?.name, g]));
+  const routes = byName.get(ROUTES_PERMISSION);
+  const scripts = byName.get(SCRIPTS_PERMISSION);
+  if (!routes?.id || !scripts?.id) return { ok: false, stage: 'permission_group_lookup', code: 'required_permission_group_missing' };
+  return { ok: true, zoneId: zone.id, accountId, routesPermissionId: routes.id, scriptsPermissionId: scripts.id };
+}
+
+function tokenPayload({ name, accountId, zoneId, routesPermissionId, scriptsPermissionId }) {
+  return {
+    name,
+    policies: [
+      {
+        effect: 'allow',
+        permission_groups: [{ id: routesPermissionId }],
+        resources: { [`com.cloudflare.api.account.zone.${zoneId}`]: '*' },
+      },
+      {
+        effect: 'allow',
+        permission_groups: [{ id: scriptsPermissionId }],
+        resources: { [`com.cloudflare.api.account.${accountId}`]: '*' },
+      },
+    ],
+    condition: {},
+  };
+}
+
+async function atomicWriteCredential(path, values) {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const content = [
+    `CLOUDFLARE_API_TOKEN=${values.token}`,
+    `CLOUDFLARE_ACCOUNT_ID=${values.accountId}`,
+    `HERDR_CUTOVER_ZONE=${values.zone}`,
+    `HERDR_CUTOVER_ZONE_ID=${values.zoneId}`,
+    `HERDR_CUTOVER_PATTERN=herdr-mcp.${values.zone}/*`,
+    `HERDR_CUTOVER_WORKER=herdr-edge-prod`,
+    '',
+  ].join('\n');
+  const tmp = `${path}.tmp-${process.pid}`;
+  await writeFile(tmp, content, { mode: 0o600 });
+  await chmod(tmp, 0o600);
+  await rename(tmp, path);
+  await chmod(path, 0o600);
+  const s = await stat(path);
+  return (s.mode & 0o777).toString(8).padStart(3, '0');
+}
+
+export async function main(argv = process.argv.slice(2)) {
+  let args;
+  try { args = parseArgs(argv); } catch (error) { emit({ ok: false, code: error.message }, 2); return; }
+  if (args.help) { process.stdout.write(usage()); return; }
+
+  const existing = await loadExisting(args.output);
+  if (args.verifyOnly) {
+    if (!existing?.CLOUDFLARE_API_TOKEN || !existing?.CLOUDFLARE_ACCOUNT_ID || !existing?.HERDR_CUTOVER_ZONE_ID) {
+      emit({ ok: false, code: 'saved_credential_missing_or_incomplete', path: args.output }, 2); return;
+    }
+    const v = await verifyGenerated({ token: existing.CLOUDFLARE_API_TOKEN, accountId: existing.CLOUDFLARE_ACCOUNT_ID, zoneId: existing.HERDR_CUTOVER_ZONE_ID });
+    emit({ ok: v.ok, code: v.ok ? 'credential_ready' : 'credential_verify_failed', path: args.output, ...v }, v.ok ? 0 : 2); return;
+  }
+
+  if (existing?.CLOUDFLARE_API_TOKEN && !args.rotate) {
+    if (existing.CLOUDFLARE_ACCOUNT_ID && existing.HERDR_CUTOVER_ZONE_ID) {
+      const v = await verifyGenerated({ token: existing.CLOUDFLARE_API_TOKEN, accountId: existing.CLOUDFLARE_ACCOUNT_ID, zoneId: existing.HERDR_CUTOVER_ZONE_ID });
+      if (v.ok) { emit({ ok: true, code: 'credential_already_ready', path: args.output, ...v }); return; }
+    }
+    emit({ ok: false, code: 'credential_exists_use_rotate', path: args.output }, 2); return;
+  }
+
+  const bootstrap = process.env.CLOUDFLARE_API_TOKEN || process.env.CF_API_TOKEN || '';
+  if (!bootstrap) { emit({ ok: false, code: 'missing_bootstrap_token' }, 2); return; }
+
+  const resolved = await resolveBootstrap(bootstrap, args.zone);
+  if (!resolved.ok) { emit({ ok: false, code: resolved.code, stage: resolved.stage, status: resolved.status ?? null }, 2); return; }
+  const payload = tokenPayload({ name: args.name, ...resolved });
+  if (args.dryRun) {
+    emit({ ok: true, code: 'dry_run_ready', zone: args.zone, accountId: resolved.accountId, zoneId: resolved.zoneId, permissions: [ROUTES_PERMISSION, SCRIPTS_PERMISSION], output: args.output });
+    return;
+  }
+
+  const created = await cf(bootstrap, `/accounts/${encodeURIComponent(resolved.accountId)}/tokens`, { method: 'POST', body: JSON.stringify(payload) });
+  const token = created.result?.value;
+  if (!created.ok || typeof token !== 'string' || token.length < 20) {
+    emit({ ok: false, code: created.ok ? 'token_value_missing' : created.code, stage: 'token_create', status: created.status ?? null }, 2); return;
+  }
+
+  const mode = await atomicWriteCredential(args.output, { token, accountId: resolved.accountId, zoneId: resolved.zoneId, zone: args.zone });
+  const verify = await verifyGenerated({ token, accountId: resolved.accountId, zoneId: resolved.zoneId });
+  emit({ ok: verify.ok, code: verify.ok ? 'credential_created' : 'credential_created_but_verify_failed', path: args.output, mode, zone: args.zone, permissions: [ROUTES_PERMISSION, SCRIPTS_PERMISSION], ...verify }, verify.ok ? 0 : 2);
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) await main();

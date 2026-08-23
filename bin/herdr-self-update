@@ -1,0 +1,1341 @@
+#!/usr/bin/env node
+// herdr-self-update — self-upgrade CLI that reuses the existing runtime-control
+// (prod) + herdr-runtime-generation machinery, mirroring the manual zero-downtime
+// upgrades performed by operators.
+//
+// Scope contract (this task): only two file surfaces change —
+//   * bin/herdr-self-update
+//   * tests/self-update*.test.mjs
+// It never deploys Edge, never touches DNS/Worker/Tunnel/OAuth, never changes the
+// contract epoch, and never restarts the production link daemon (the live manager
+// handles activation; the link-prod plist generation value is for its next start).
+//
+// Secret safety: the MCP bearer token is read from the server plist and injected
+// into the candidate process environment / HTTP Authorization headers only. It is
+// never written to job JSON, logs, plans, errors, or command strings, and child
+// processes are referenced by numeric pid only (never stringified).
+import { spawn } from "node:child_process";
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmod, copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { createServer } from "node:net";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+
+export const EPOCH1_CONTRACT_HASH =
+  "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
+export const EPOCH1_CONTRACT_PROFILE = "epoch1";
+export const REQUIRED_TOOL_COUNT = 17;
+export const CANDIDATE_LABEL = "candidate";
+// Directories in the working tree excluded from the release snapshot copy.
+export const SOURCE_EXCLUDED_COMPONENTS = [".git", "node_modules", "dist", "edge/cloudflare/dist", "site-dist"];
+const MIN_CANDIDATE_PORT = 8773;
+const MAX_CANDIDATE_PORT = 8799;
+// Success gates aligned with .github/workflows/ci.yml (build/root/edge/site/extension).
+export const RELEASE_GATES = [
+  ["npm", ["ci"]],
+  ["npm", ["run", "build"]],
+  ["npm", ["test"]],
+  ["npm", ["run", "test:edge"]],
+  ["npm", ["run", "build:site"]],
+  [process.execPath, ["tests/manual/extension_smoke.mjs"]],
+];
+
+/**
+ * Release validation must exercise the package's default/current tool surface,
+ * even when self-update was launched through the production epoch-1 runtime.
+ * herdr_exec children inherit the server environment, so without this scrub an
+ * updater invoked by herdr-mcp would accidentally run the root suite under
+ * HERDR_MCP_CONTRACT_PROFILE=epoch1 and report the expected 18-tool tests as 17.
+ */
+export function releaseGateEnv(env = process.env) {
+  const clean = { ...env };
+  delete clean.HERDR_MCP_CONTRACT_PROFILE;
+  delete clean.HERDR_MCP_ALL_TOOLS;
+  return clean;
+}
+
+function envGet(env, name, fallback) {
+  const v = env?.[name];
+  return v && v.trim().length > 0 ? v : fallback;
+}
+
+/**
+ * Resolve every path the CLI may touch. Environment overrides exist strictly so
+ * tests can redirect writes to throwaway directories and fake plists.
+ */
+export function resolvePaths(env = process.env) {
+  const home = envGet(env, "HOME") || homedir();
+  const base = envGet(env, "HERDR_SELF_UPDATE_HOME") || join(home, ".config", "herdr-mcp");
+  const selfUpdateDir = envGet(env, "HERDR_SELF_UPDATE_DIR") || join(base, "self-update");
+  const jobsDir = envGet(env, "HERDR_SELF_UPDATE_JOBS_DIR") || join(selfUpdateDir, "jobs");
+  const logsDir = envGet(env, "HERDR_SELF_UPDATE_LOGS_DIR") || join(selfUpdateDir, "logs");
+  const releasesDir = envGet(env, "HERDR_SELF_UPDATE_RELEASES_DIR") || join(base, "releases");
+  const lockPath = envGet(env, "HERDR_SELF_UPDATE_LOCK_PATH") || join(selfUpdateDir, "lock.json");
+  // Contract with src/herdr-skill.ts runtimeContext(): the live skill reads
+  // HERDR_SELF_UPDATE_STATUS_PATH (default <state-dir>/self-update-status.json)
+  // to expose the last self-update run; we mirror a redacted summary there on
+  // every job state change so `herdr_skill self_update` never returns null.
+  const summaryStatusPath = envGet(env, "HERDR_SELF_UPDATE_STATUS_PATH") || join(base, "self-update-status.json");
+  const controlPath = envGet(env, "HERDR_RUNTIME_CONTROL_PATH") || join(base, "runtime-control-prod.json");
+  const statusPath = envGet(env, "HERDR_RUNTIME_STATUS_PATH") || join(base, "runtime-status-prod.json");
+  const serverPlist = envGet(env, "HERDR_SERVER_PLIST_PATH") || join(home, "Library", "LaunchAgents", "dev.herdr-mcp.server.plist");
+  const linkPlist = envGet(env, "HERDR_LINK_PLIST_PATH") || join(home, "Library", "LaunchAgents", "dev.herdr-mcp.link-prod.plist");
+  const repoPath = envGet(env, "HERDR_REPO_PATH") || join(home, "Documents", "herdr-mcp");
+  const runtimeGenCli = envGet(env, "HERDR_RUNTIME_GENERATION_CLI") || join(repoPath, "bin", "herdr-runtime-generation");
+  const runtimeGenCliAbsolute = isAbsolute(runtimeGenCli) ? runtimeGenCli : join(repoPath, runtimeGenCli);
+  return {
+    home, base, selfUpdateDir, jobsDir, logsDir, releasesDir, lockPath, summaryStatusPath,
+    controlPath, statusPath, serverPlist, linkPlist, repoPath,
+    runtimeGenCli: runtimeGenCliAbsolute,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Versions and generation naming
+// ---------------------------------------------------------------------------
+
+/** Zero-padded patch digits, e.g. 0.3.26 -> 026 (kept for legacy labels/tests). */
+export function versionDigits(version) {
+  if (typeof version !== "string") throw new TypeError("version must be a string");
+  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(version.trim());
+  if (!m) throw new RangeError(`version must be semver like X.Y.Z, got ${version}`);
+  return String(Number(m[3])).padStart(3, "0");
+}
+
+/**
+ * Generation IDs embed the full semver to avoid future 0.3.x/0.4.x patch
+ * collisions (e.g. stable-0.3.27). Matches GENERATION_RE ([A-Za-z0-9_.-]{1,64}).
+ */
+export function stableGenerationId(version) {
+  const v = normalizeSemver(version);
+  return `stable-${v}`;
+}
+
+export function candidateGenerationId(version, jobId) {
+  const v = normalizeSemver(version);
+  const short = String(jobId).replace(/[^a-z0-9]/gi, "").slice(0, 6);
+  return `candidate-${v}-${short}`;
+}
+
+function normalizeSemver(version) {
+  if (typeof version !== "string") throw new TypeError("version must be a string");
+  const m = /^(\d+)\.(\d+)\.(\d+)(?:[-+][A-Za-z0-9._-]+)?$/.exec(version.trim());
+  if (!m) throw new RangeError(`version must be semver like X.Y.Z, got ${version}`);
+  return `${m[1]}.${m[2]}.${m[3]}`;
+}
+
+// --- atomic JSON helpers (same-dir tmp + rename; mode 0600) -----------------
+
+export async function atomicWriteJson(path, value, mode = 0o600) {
+  await mkdir(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode });
+    await chmod(tmp, mode);
+    await rename(tmp, path);
+    await chmod(path, mode);
+  } finally {
+    await rm(tmp, { force: true });
+  }
+}
+
+export async function readJson(path) {
+  return JSON.parse(await readFile(path, "utf8"));
+}
+
+// --- concurrency lock ---------------------------------------------------------
+
+/**
+ * Acquire the self-update lock. Fails closed if another apply is in flight
+ * (lock present and its pid alive). A stale lock (dead pid) is safely reaped.
+ * The initial holder is this (apply) process; cmdApply immediately transfers
+ * ownership to the detached worker pid so a dead apply parent never makes an
+ * in-flight worker's lock look stale.
+ */
+export async function acquireLock(paths, job) {
+  await mkdir(dirname(paths.lockPath), { recursive: true });
+  let existing = null;
+  try { existing = await readJson(paths.lockPath); } catch { /* absent */ }
+  if (existing && existing.pid) {
+    if (isPidAlive(existing.pid)) {
+      return { ok: false, code: "self_update_locked", holder: existing.job_id, holder_pid: existing.pid };
+    }
+    // stale lock: pid no longer alive -> reap below.
+  }
+  const lock = { job_id: job.job_id, pid: process.pid, started_at_ms: Date.now() };
+  await atomicWriteJson(paths.lockPath, lock);
+  return { ok: true, lock, needs_transfer: true };
+}
+
+/**
+ * Atomically hand the lock to the detached worker pid after spawn. Verifies the
+ * lock still belongs to our job before rewriting the owner; a mismatch means we
+ * lost the lock race and must fail closed.
+ */
+export async function transferLockToWorker(paths, jobId, workerPid) {
+  let existing = null;
+  try { existing = await readJson(paths.lockPath); } catch { /* absent */ }
+  if (!existing || existing.job_id !== jobId) {
+    return { ok: false, code: "lock_not_owner" };
+  }
+  if (!Number.isInteger(workerPid) || workerPid <= 0) {
+    return { ok: false, code: "invalid_worker_pid" };
+  }
+  const lock = { job_id: jobId, pid: workerPid, started_at_ms: existing.started_at_ms };
+  await atomicWriteJson(paths.lockPath, lock);
+  return { ok: true, lock };
+}
+
+/** Worker-side ownership check: the lock must name this job and this pid. */
+export async function confirmLockOwnership(paths, jobId) {
+  try {
+    const existing = await readJson(paths.lockPath);
+    return !!(existing && existing.job_id === jobId && existing.pid === process.pid);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Bounded worker-side handshake: wait up to timeoutMs for the apply parent to
+ * transfer lock ownership from its own pid to the worker pid. The worker starts
+ * racing the parent's transfer the moment it is spawned, so a single check is
+ * not enough — the first few reads may still see the parent's pid. Only after
+ * the timeout does the worker fail closed (so apply never returns queued while a
+ * worker aborts immediately on a lock race).
+ */
+export async function waitForLockOwnership(paths, jobId, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 5000;
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 50;
+  const workerPid = Number.isInteger(options.pid) ? options.pid : process.pid;
+  const sleepFn = options.sleep ?? sleep;
+  const clock = options.clock ?? Date.now;
+  const deadline = clock() + timeoutMs;
+  while (clock() < deadline) {
+    const owned = await confirmLockOwnershipWithPid(paths, jobId, workerPid);
+    if (owned) return { ok: true };
+    await sleepFn(pollMs);
+  }
+  return { ok: false, code: "lock_handshake_timeout" };
+}
+
+async function confirmLockOwnershipWithPid(paths, jobId, pid) {
+  try {
+    const existing = await readJson(paths.lockPath);
+    return !!(existing && existing.job_id === jobId && existing.pid === pid);
+  } catch {
+    return false;
+  }
+}
+
+export function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e && e.code === "EPERM";
+  }
+}
+
+export async function releaseLock(paths, jobId) {
+  try {
+    const existing = await readJson(paths.lockPath);
+    if (!existing || (jobId && existing.job_id !== jobId)) return { ok: false, code: "lock_not_owner" };
+    await rm(paths.lockPath, { force: true });
+    return { ok: true };
+  } catch {
+    await rm(paths.lockPath, { force: true });
+    return { ok: true };
+  }
+}
+
+// --- source snapshot -------------------------------------------------------
+
+function isExcludedPath(relParts, exclusions) {
+  let acc = "";
+  for (const p of relParts) {
+    acc = acc ? `${acc}/${p}` : p;
+    if (exclusions.includes(acc)) return true;
+  }
+  return false;
+}
+
+/** Pure predicate for unit tests: does a slash-path hit an exclusion? */
+export function isPathExcluded(relPath, exclusions = SOURCE_EXCLUDED_COMPONENTS) {
+  return isExcludedPath(relPath.split("/").filter(Boolean), exclusions);
+}
+
+/**
+ * Git-aware working-tree snapshot: copy tracked + untracked-but-not-ignored files
+ * (git ls-files -z --cached --others --exclude-standard) from the CURRENT working
+ * tree (so local modifications are included) into releaseDir. Tracked files
+ * deleted from the working tree are skipped. Ignored secrets (.env, docs/_wip,
+ * .herdr, logs) and build dirs (.git/node_modules/dist/site-dist) never land in
+ * the release. Executable bits and symlinks are preserved with mode/symlink
+ * semantics sufficient for this project.
+ */
+export async function snapshotWorkingTree(repoPath, releaseDir, options = {}) {
+  const execFn = options.execFile ?? execFileWrap;
+  await rm(releaseDir, { recursive: true, force: true });
+  await mkdir(releaseDir, { recursive: true });
+  const r = await execFn("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], {
+    cwd: repoPath,
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  if (r.code !== 0) return { ok: false, code: `git_ls_files:${(r.stderr || r.stdout).slice(0, 120)}` };
+  const names = r.stdout.split("\0").filter(Boolean);
+  let copied = 0;
+  let skipped = 0;
+  for (const rel of names) {
+    const src = join(repoPath, rel);
+    const dst = join(releaseDir, rel);
+    const st = await stat(src).catch(() => null);
+    if (!st) { skipped += 1; continue; } // tracked but deleted from working tree
+    if (st.isDirectory()) { await mkdir(dst, { recursive: true }); continue; }
+    await mkdir(dirname(dst), { recursive: true });
+    if (st.isSymbolicLink()) {
+      const { readlink } = await import("node:fs/promises");
+      const target = await readlink(src);
+      await rm(dst, { force: true });
+      await createSymlink(target, dst);
+    } else {
+      await copyFile(src, dst);
+      if (st.mode & 0o111) await chmod(dst, st.mode & 0o7777);
+    }
+    copied += 1;
+  }
+  return { ok: true, copied, skipped };
+}
+
+async function createSymlink(target, path) {
+  const { symlink } = await import("node:fs/promises");
+  await symlink(target, path);
+}
+
+/**
+ * Recursively copy srcDir to dstDir, skipping any directory whose relative
+ * path (or an ancestor path) is in `exclusions` (exact component match). Kept
+ * for unit tests; the production working-tree prepare uses snapshotWorkingTree.
+ */
+export async function copyTree(srcDir, dstDir, exclusions = SOURCE_EXCLUDED_COMPONENTS) {
+  const norm = (exclusions || []).map((e) => e.split("/").filter(Boolean).join("/")).filter(Boolean);
+  async function walk(from, to, relParts) {
+    await mkdir(to, { recursive: true });
+    const entries = await readdir(from, { withFileTypes: true });
+    for (const entry of entries) {
+      const nextParts = relParts.concat(entry.name);
+      if (isExcludedPath(nextParts, norm)) continue;
+      const srcPath = join(from, entry.name);
+      const dstPath = join(to, entry.name);
+      if (entry.isDirectory()) {
+        await walk(srcPath, dstPath, nextParts);
+      } else {
+        await mkdir(dirname(dstPath), { recursive: true });
+        await copyFile(srcPath, dstPath);
+      }
+    }
+  }
+  await walk(srcDir, dstDir, []);
+}
+
+// --- plist helpers ---------------------------------------------------------
+
+/** Replace only ProgramArguments[1]; preserve everything else. */
+export function transformServerPlist(plist, releaseServerPath) {
+  if (!plist || typeof plist !== "object" || !Array.isArray(plist.ProgramArguments) || plist.ProgramArguments.length < 2) {
+    throw new TypeError("server plist must have a ProgramArguments array with a script path");
+  }
+  return {
+    ...plist,
+    ProgramArguments: [plist.ProgramArguments[0], releaseServerPath, ...plist.ProgramArguments.slice(2)],
+  };
+}
+
+/** Replace only EnvironmentVariables.HERDR_RUNTIME_GENERATION. */
+export function transformLinkPlist(plist, generation) {
+  if (!plist || typeof plist !== "object") throw new TypeError("link plist must be an object");
+  const env = plist.EnvironmentVariables ? { ...plist.EnvironmentVariables } : {};
+  env.HERDR_RUNTIME_GENERATION = generation;
+  return { ...plist, EnvironmentVariables: env };
+}
+
+/**
+ * Extract server plist env into (token, redacted-env). The token is removed
+ * from `env`; callers must re-inject it into a child process environment
+ * directly, never into persisted/logged state.
+ */
+export function splitServerEnv(plist) {
+  const env = plist && plist.EnvironmentVariables ? { ...plist.EnvironmentVariables } : {};
+  const token = env.HERDR_MCP_TOKEN || "";
+  const redacted = { ...env };
+  delete redacted.HERDR_MCP_TOKEN;
+  return { token, env: redacted };
+}
+
+export async function readPlist(path) {
+  const r = await execFileWrap("/usr/bin/plutil", ["-convert", "json", "-o", "-", path], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
+  if (r.code !== 0) throw new Error(`plutil read failed: ${(r.stderr || r.stdout).slice(0, 200)}`);
+  return JSON.parse(r.stdout);
+}
+
+export async function writePlist(path, obj) {
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}.json`;
+  await writeFile(tmp, JSON.stringify(obj));
+  const r = await execFileWrap("/usr/bin/plutil", ["-convert", "xml1", "-o", path, tmp], { stdio: "ignore" });
+  await rm(tmp, { force: true });
+  if (r.code !== 0) throw new Error(`plutil write failed: ${(r.stderr || r.stdout).slice(0, 200)}`);
+  await chmod(path, 0o600);
+}
+
+// --- id generation -------------------------------------------------------------
+
+export function newJobId(seed) {
+  const h = createHash("sha256").update(seed).update(String(Date.now())).update(String(process.pid)).digest("hex").slice(0, 12);
+  return h;
+}
+
+function shortDigest(text) {
+  return createHash("sha256").update(text).digest("hex").slice(0, 8);
+}
+
+// --- idle port -------------------------------------------------------------
+
+async function tryBind(port) {
+  return new Promise((resolve) => {
+    const srv = createServer();
+    srv.unref();
+    srv.once("error", () => resolve(false));
+    srv.listen(port, "127.0.0.1", () => srv.close(() => resolve(true)));
+  });
+}
+
+/** Return first free loopback port in [min,max]. */
+export async function findIdlePort(minPort = MIN_CANDIDATE_PORT, maxPort = MAX_CANDIDATE_PORT) {
+  for (let p = minPort; p <= maxPort; p += 1) {
+    if (await tryBind(p)) return p;
+  }
+  throw new Error("self-update: no free loopback candidate port in range");
+}
+
+// --- CLI parsing -------------------------------------------------------------
+
+export function parseArgs(argv) {
+  const out = { command: "", source: "working-tree", ref: "main", dryRun: false, help: false, job: null };
+  const first = argv[0];
+  if (first === "--help" || first === "-h") { out.help = true; return out; }
+  out.command = first;
+  for (let i = 1; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === "--source") out.source = argv[++i] || "working-tree";
+    else if (a === "--ref") out.ref = argv[++i] || "main";
+    else if (a === "--job") out.job = argv[++i] || null;
+    else if (a === "--dry-run") out.dryRun = true;
+    else if (a === "--help" || a === "-h") out.help = true;
+    else throw new Error(`unknown_argument:${a}`);
+  }
+  return out;
+}
+
+export function usage() {
+  return `Usage: herdr-self-update <status|check|plan|apply|worker> [options]
+
+  status [--job <id>]
+  check  --source working-tree|remote [--ref main]
+  plan   --source working-tree|remote [--ref main]
+  apply  --source working-tree|remote [--ref main] [--dry-run]
+  worker --job <id>          (internal; detached update transaction)
+
+Mirrors the manual zero-downtime path by reusing runtime-control-prod.json /
+runtime-status-prod.json + herdr-runtime-generation. Never touches Edge/DNS/Worker/
+Tunnel/OAuth, never changes contract epoch, never restarts the production link.
+`;
+}
+
+// --- plan builder (pure, no side effects, no secrets) ---------------------------
+
+export function buildPlan(args, env = process.env) {
+  const paths = resolvePaths(env);
+  if (args.source !== "working-tree" && args.source !== "remote") {
+    throw new RangeError(`invalid source: ${args.source}`);
+  }
+  const version = readVersionFromRepo(paths.repoPath);
+  const jobId = newJobId(version);
+  const releaseDir = join(paths.releasesDir, `${shortDigest(version)}-${jobId}`);
+  return {
+    schema_version: 1,
+    job_id: jobId,
+    source: args.source,
+    ref: args.ref || "main",
+    version,
+    release: releaseDir,
+    candidate_generation: candidateGenerationId(version, jobId),
+    candidate_endpoint: "",
+    stable_generation: stableGenerationId(version),
+    control_path: paths.controlPath,
+    status_path: paths.statusPath,
+    server_plist: paths.serverPlist,
+    link_plist: paths.linkPlist,
+    summary_status_path: paths.summaryStatusPath,
+    commands: {
+      sourcePrep: args.source === "remote"
+        ? ["git fetch origin <ref>", "git worktree add --detach <release> FETCH_HEAD"]
+        : [`copy working-tree -> ${releaseDir} (exclude .git,node_modules,dist,edge/cloudflare/dist)`],
+      install: "npm ci",
+      build: "npm run build",
+      test: "npm test",
+      testEdge: "npm run test:edge",
+      site: "npm run build:site",
+      extension: "node tests/manual/extension_smoke.mjs",
+      deploy: "none (Edge never deployed)",
+    },
+    noEdgeDeploy: true,
+    noDns: true,
+    noWorker: true,
+    noTunnel: true,
+    noOauth: true,
+    noProdLinkRestart: true,
+  };
+}
+
+function readVersionFromRepo(repoPath) {
+  try {
+    const text = readFileSync(join(repoPath, "package.json"), "utf8");
+    return JSON.parse(text).version;
+  } catch {
+    return "0.0.0";
+  }
+}
+
+// --- status/check/plan/dry-run handlers ----------------------------------------
+
+async function cmdStatus(args, env) {
+  const paths = resolvePaths(env);
+  if (args.job) {
+    const jobPath = join(paths.jobsDir, `${args.job}.json`);
+    let job = null;
+    try { job = await readJson(jobPath); } catch { job = null; }
+    process.stdout.write(JSON.stringify({ ok: !!job, code: job ? "job_status" : "job_not_found", job, job_path: jobPath }) + "\n");
+    return;
+  }
+  const [control, status, selfUpdate] = await Promise.all([
+    readJson(paths.controlPath).catch(() => null),
+    readJson(paths.statusPath).catch(() => null),
+    readJson(paths.summaryStatusPath).catch(() => null),
+  ]);
+  process.stdout.write(JSON.stringify({
+    ok: !!status,
+    code: status ? "runtime_status" : "runtime_status_not_ready",
+    control_path: paths.controlPath,
+    status_path: paths.statusPath,
+    self_update: selfUpdate ?? null,
+    self_update_status_path: paths.summaryStatusPath,
+    desired_active: control?.desired_active ?? null,
+    control_revision: control?.revision ?? null,
+    status,
+  }) + "\n");
+}
+
+async function cmdCheck(args, env) {
+  const paths = resolvePaths(env);
+  const plan = buildPlan(args, env);
+  const status = await readJson(paths.statusPath).catch(() => null);
+  const control = await readJson(paths.controlPath).catch(() => null);
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    code: "check",
+    plan,
+    current_active: status?.manager?.active_generation ?? null,
+    desired_active: control?.desired_active ?? null,
+  }) + "\n");
+}
+
+async function cmdPlan(args, env) {
+  const plan = buildPlan(args, env);
+  process.stdout.write(JSON.stringify({ ok: true, code: "plan", plan }) + "\n");
+}
+
+// --- apply (queued job + detached worker) ---------------------------------------
+
+let __spawnOverride = null;
+export function _setSpawnOverride(fn) { __spawnOverride = fn; }
+
+async function cmdApply(args, env) {
+  const paths = resolvePaths(env);
+  const plan = buildPlan(args, env);
+  if (args.dryRun) {
+    process.stdout.write(JSON.stringify({
+      ok: true,
+      code: "dry_run",
+      note: "no files, plists, git, npm, or launchctl executed",
+      plan,
+    }) + "\n");
+    return;
+  }
+  const now = Date.now();
+  const job = makeJob(plan, now);
+  await mkdir(paths.jobsDir, { recursive: true, mode: 0o700 });
+  const jobPath = join(paths.jobsDir, `${job.job_id}.json`);
+  // Fail closed while another apply is in flight.
+  const lockResult = await acquireLock(paths, job);
+  if (!lockResult.ok) {
+    process.stdout.write(JSON.stringify({
+      ok: false,
+      code: lockResult.code,
+      holder_job_id: lockResult.holder,
+      holder_pid: lockResult.holder_pid,
+    }) + "\n");
+    process.exitCode = 2;
+    return;
+  }
+  await atomicWriteJson(jobPath, job);
+  const logPath = join(paths.logsDir, `${job.job_id}.log`);
+  await mkdir(paths.logsDir, { recursive: true, mode: 0o700 });
+  // Detached worker is spawned with an absolute filesystem path, never a file:// URL.
+  const scriptPath = join(paths.repoPath, "bin", "herdr-self-update");
+  let child = null;
+  let spawnError = null;
+  try {
+    child = __spawnOverride
+      ? __spawnOverride(process.execPath, [scriptPath, "worker", "--job", job.job_id], { detached: true })
+      : spawn(process.execPath, [scriptPath, "worker", "--job", job.job_id], { detached: true, stdio: "ignore" });
+  } catch (error) {
+    spawnError = error;
+  }
+  if (spawnError || child?.pid == null) {
+    // spawn failure: release the lock and fail closed; nothing durable happened.
+    await releaseLock(paths, job.job_id);
+    await rm(jobPath, { force: true });
+    process.stdout.write(JSON.stringify({ ok: false, code: "spawn_failed", message: messageOf(spawnError || new Error("worker spawn produced no pid")) }) + "\n");
+    process.exitCode = 2;
+    return;
+  }
+  job.pid = child.pid;
+  // Hand lock ownership to the detached worker pid atomically so a dead apply
+  // parent never leaves an in-flight worker behind a "stale" lock.
+  const transfer = await transferLockToWorker(paths, job.job_id, child.pid);
+  if (!transfer.ok) {
+    // Lost the lock race (or invalid pid): do not proceed.
+    await releaseLock(paths, job.job_id);
+    await terminateChildHard(child);
+    await rm(jobPath, { force: true });
+    process.stdout.write(JSON.stringify({ ok: false, code: "lock_transfer_failed", message: transfer.code }) + "\n");
+    process.exitCode = 2;
+    return;
+  }
+  await atomicWriteJson(jobPath, job);
+  await mirrorSummary(job); // queued state is visible to the skill immediately
+  child.unref?.();
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    code: "queued",
+    job_id: job.job_id,
+    job_path: jobPath,
+    log_path: logPath,
+    release_dir: job.release,
+    stable_generation: job.stable_generation,
+  }) + "\n");
+}
+
+function makeJob(plan, now) {
+  return {
+    schema_version: 1,
+    job_id: plan.job_id,
+    stage: "queued",
+    source: plan.source,
+    ref: plan.ref,
+    version: plan.version,
+    release: plan.release,
+    candidate_generation: plan.candidate_generation,
+    candidate_endpoint: "",
+    stable_generation: plan.stable_generation,
+    original_active: null,
+    original_generation_spec: null,
+    candidate_pid: null,
+    pid: null,
+    server_plist_backup: null,
+    link_plist_backup: null,
+    server_plist_edited: false,
+    server_reloaded: false,
+    candidate_active: false,
+    outcome: null,
+    error_code: null,
+    error_message: null,
+    rollback_steps: [],
+    rollback_outcome: "",
+    created_at_ms: now,
+    updated_at_ms: now,
+    control_path: plan.control_path,
+    status_path: plan.status_path,
+    server_plist: plan.server_plist,
+    link_plist: plan.link_plist,
+    summary_status_path: plan.summary_status_path,
+  };
+}
+
+// --- rollback ordering (pure; phase-aware) --------------------------------------
+
+/**
+ * Order rollback by phase so the original generation is never re-activated while
+ * it would still point at an already-reloaded 8772:
+ *  - if 8772 was reloaded to the new build, restore the old server plist and
+ *    reload/verify 8772 FIRST, then activate the original generation;
+ *  - if 8772 was not reloaded, switching the manager pointer back first is safe.
+ */
+export function buildRollbackPlan(job) {
+  const steps = [];
+  const serverSwitched = job.server_reloaded === true;
+  if (serverSwitched) {
+    steps.push({ action: "restore_server_plist", from: job.server_plist_backup, to: job.server_plist });
+    steps.push({ action: "reload_server_from_original" });
+    steps.push({ action: "verify_original_runtime" });
+  }
+  if (job.candidate_active || job.original_active) {
+    steps.push({ action: "activate_original_generation", generation: job.original_active });
+  }
+  // plist was edited but the server was never reloaded -> restore file only.
+  if (job.server_plist_edited === true && !serverSwitched) {
+    steps.push({ action: "restore_server_plist", from: job.server_plist_backup, to: job.server_plist });
+  }
+  if (job.link_plist_backup) {
+    steps.push({ action: "restore_link_plist", from: job.link_plist_backup, to: job.link_plist });
+  }
+  if (job.candidate_generation) {
+    steps.push({ action: "remove_candidate_generation", generation: job.candidate_generation });
+  }
+  steps.push({ action: "stop_candidate" });
+  return steps;
+}
+
+// --- worker transaction -------------------------------------------------------------
+
+async function cmdWorker(args, env) {
+  const paths = resolvePaths(env);
+  const jobId = args.job || env.HERDR_SELF_UPDATE_JOB_ID;
+  if (!jobId) throw new Error("worker requires --job <id>");
+  const jobPath = join(paths.jobsDir, `${jobId}.json`);
+  let job;
+  try { job = await readJson(jobPath); } catch { throw new Error(`worker: job not found: ${jobId}`); }
+  const logPath = env.HERDR_SELF_UPDATE_LOG || join(paths.logsDir, `${jobId}.log`);
+  const log = await makeAppender(logPath);
+  await log(`[worker] start job=${jobId} source=${job.source} ref=${job.ref || "main"}`);
+  // Worker-side lock ownership check: wait (bounded) for the apply parent to hand
+  // the lock over to this worker pid — the parent only learns our pid after spawn,
+  // so a single check would race the transfer.
+  const owned = await waitForLockOwnership(paths, jobId, {
+    timeoutMs: 5000,
+    pollMs: 50,
+    pid: process.pid,
+  });
+  if (!owned.ok) {
+    await log(`[worker] fatal lock not owned (job=${jobId}); aborting`);
+    throw new Error("worker: self-update lock not owned by this job/pid");
+  }
+  // Candidate child is held locally only; the job persists numeric pids.
+  let candidate = null;
+  try {
+    // --- prepare release (version target is read from the release package) ---
+    await setStage(jobPath, job, "preparing_release", log);
+    const prepared = await prepareRelease(job, env, paths, log);
+    if (!prepared.ok) throw new Error(`release preparation failed: ${prepared.code}`);
+    // Re-read target version from the release package (both sources).
+    const targetVersion = readVersionFromPath(join(job.release, "package.json"));
+    if (!targetVersion || targetVersion === "0.0.0") throw new Error("release package.json has no usable version");
+    job.version = targetVersion;
+    job.candidate_generation = candidateGenerationId(targetVersion, job.job_id);
+    job.stable_generation = stableGenerationId(targetVersion);
+    await setState(jobPath, job, {
+      version: targetVersion,
+      candidate_generation: job.candidate_generation,
+      stable_generation: job.stable_generation,
+      stage: "release_prepared",
+    });
+    await log(`[worker] target version ${targetVersion}`);
+
+    // --- success gates (build/root/edge/site/extension), CI-aligned ---
+    await setStage(jobPath, job, "building_testing", log);
+    await runGates(job.release, log);
+
+    // --- record original active generation BEFORE mutating anything ---
+    await setStage(jobPath, job, "recording_original", log);
+    const original = await readActiveGeneration(paths.statusPath);
+    // never mutate generation state behind a missing original; fail closed
+    if (!original.generation || !original.endpoint) {
+      throw new Error(`cannot record original active generation from ${paths.statusPath}`);
+    }
+    job.original_active = original.generation;
+    job.original_generation_spec = { generation: original.generation, endpoint: original.endpoint, runtime_version: original.runtime_version };
+    await setState(jobPath, job, { original_active: job.original_active, original_generation_spec: job.original_generation_spec });
+
+    // --- read server config (token isolated from persisted state) ---
+    await setStage(jobPath, job, "reading_config", log);
+    const serverPlist = await readPlist(job.server_plist);
+    const { token, env: serverEnv } = splitServerEnv(serverPlist);
+    if (!token) throw new Error("server plist has no HERDR_MCP_TOKEN");
+    if (serverEnv.HERDR_MCP_CONTRACT_PROFILE !== EPOCH1_CONTRACT_PROFILE) {
+      throw new Error(`contract profile must be ${EPOCH1_CONTRACT_PROFILE}`);
+    }
+
+    // --- backups before any mutation ---
+    job.server_plist_backup = await backupFile(job.server_plist, paths, jobId);
+    job.link_plist_backup = await backupFile(job.link_plist, paths, jobId);
+    await setState(jobPath, job, { server_plist_backup: job.server_plist_backup, link_plist_backup: job.link_plist_backup });
+
+    // --- spawn candidate on idle loopback port (token only in process env) ---
+    const port = await findIdlePort();
+    const candidateEndpoint = `http://127.0.0.1:${port}/mcp`;
+    await setState(jobPath, job, { candidate_endpoint: candidateEndpoint, candidate_port: port });
+    candidate = spawn(process.execPath, [join(job.release, "dist", "server.js")], {
+      detached: true,
+      stdio: "ignore",
+      env: { ...env, ...serverEnv, HERDR_MCP_TOKEN: token, HERDR_MCP_PORT: String(port) },
+    });
+    candidate.unref();
+    if (candidate.pid) await setState(jobPath, job, { candidate_pid: candidate.pid });
+    await setStage(jobPath, job, "candidate_started", log);
+
+    const healthy = await waitForRuntime(candidateEndpoint, token, 60_000);
+    if (!healthy) throw new Error("candidate failed health probe");
+    await setStage(jobPath, job, "register_validate", log);
+
+    // --- register + validate via existing CLI (manager validates real tools/list hash) ---
+    const reg = await execFileWrap(process.execPath, [paths.runtimeGenCli, "register",
+      "--generation", job.candidate_generation,
+      "--endpoint", candidateEndpoint,
+      "--runtime-version", job.version], { env: runtimeEnv(env, paths), encoding: "utf8" });
+    if (reg.code !== 0 || !parseJsonOk(reg.stdout)) throw new Error(`register failed: ${reg.stdout.slice(0, 300)}`);
+
+    const validation = await waitForValidation(job, job.candidate_generation, job.version);
+    if (!validation.ok) throw new Error(`candidate validation failed: ${JSON.stringify(validation)}`);
+    await setStage(jobPath, job, "candidate_validated", log);
+
+    // --- activate candidate (link daemon switches traffic) ---
+    const act = await execFileWrap(process.execPath, [paths.runtimeGenCli, "activate",
+      "--generation", job.candidate_generation, "--checks", "3", "--interval-ms", "500"], { env: runtimeEnv(env, paths), encoding: "utf8" });
+    if (act.code !== 0 || !parseJsonOk(act.stdout)) throw new Error(`activate failed: ${act.stdout.slice(0, 300)}`);
+    const candidateActive = await waitForActiveGeneration(job, job.candidate_generation);
+    if (!candidateActive) throw new Error("candidate did not become active");
+    await setState(jobPath, job, { stage: "candidate_active", candidate_active: true });
+
+    // --- reload server (8772) to release dist/server.js ---
+    await setStage(jobPath, job, "reload_server", log);
+    await writePlist(job.server_plist, transformServerPlist(serverPlist, join(job.release, "dist", "server.js")));
+    await setState(jobPath, job, { server_plist_edited: true });
+    const reloaded = await reloadServer(job.server_plist);
+    if (!reloaded) throw new Error("server did not come back under launchd (bootstrap retries exhausted)");
+    const verified = await verifyRuntimeAt("http://127.0.0.1:8772/mcp", token, job.version);
+    if (!verified.ok) throw new Error(`post-reload 8772 verification failed: ${verified.details || "no version"}`);
+    await setState(jobPath, job, { stage: "server_reloaded", server_reloaded: true });
+
+    // --- register + activate stable at 8772 ---
+    const stable = job.stable_generation;
+    const regStable = await execFileWrap(process.execPath, [paths.runtimeGenCli, "register",
+      "--generation", stable, "--endpoint", "http://127.0.0.1:8772/mcp",
+      "--runtime-version", job.version], { env: runtimeEnv(env, paths), encoding: "utf8" });
+    if (regStable.code !== 0 || !parseJsonOk(regStable.stdout)) throw new Error("register stable failed");
+    const stableVal = await waitForValidation(job, stable, job.version);
+    if (!stableVal.ok) throw new Error("stable validation failed");
+    const actStable = await execFileWrap(process.execPath, [paths.runtimeGenCli, "activate",
+      "--generation", stable, "--checks", "3", "--interval-ms", "500"], { env: runtimeEnv(env, paths), encoding: "utf8" });
+    if (actStable.code !== 0 || !parseJsonOk(actStable.stdout)) throw new Error("activate stable failed");
+    const stableActive = await waitForActiveGeneration(job, stable);
+    if (!stableActive) throw new Error("stable did not become active");
+    await setState(jobPath, job, { stage: "stable_active" });
+
+    // --- update link-prod plist generation (do NOT restart the link) ---
+    const linkPlist = await readPlist(job.link_plist);
+    await writePlist(job.link_plist, transformLinkPlist(linkPlist, stable));
+    await setState(jobPath, job, { stage: "link_plist_updated" });
+
+    // --- cleanup old generations (safe order) ---
+    // 1) remove the candidate (traffic already moved to stable).
+    await execFileWrap(process.execPath, [paths.runtimeGenCli, "remove", "--generation", job.candidate_generation],
+      { env: runtimeEnv(env, paths), encoding: "utf8" }).catch(() => {});
+    // 2) drop generations that are not the new stable and whose endpoint is the
+    //    now-upgraded 8772 (stale pointers to the new build are misleading).
+    const stale = await findStaleGenerations(paths.statusPath, job);
+    for (const gen of stale) {
+      await execFileWrap(process.execPath, [paths.runtimeGenCli, "remove", "--generation", gen],
+        { env: runtimeEnv(env, paths), encoding: "utf8" }).catch(() => {});
+    }
+    // 3) stop the candidate last.
+    await terminateChild(candidate);
+    candidate = null;
+    await setState(jobPath, job, { candidate_pid: null });
+    await setState(jobPath, job, { stage: "succeeded", outcome: "succeeded" });
+    await log("[worker] done success");
+    await releaseLock(paths, jobId);
+  } catch (error) {
+    await runRollback(jobPath, job, paths, env, log, messageOf(error));
+    await releaseLock(paths, jobId);
+  }
+}
+
+// --- worker sub-steps -----------------------------------------------------------
+
+/** Production-path release prep (exported for tests; never run in plan/dry-run). */
+export async function prepareRelease(job, env, paths, log) {
+  if (job.source === "working-tree") {
+    // Git-aware snapshot: tracked + untracked-but-not-ignored files from the
+    // current working tree; ignores .git/node_modules/dist/site-dist and
+    // gitignored secrets (.env, docs/_wip, .herdr, logs).
+    const snap = await snapshotWorkingTree(paths.repoPath, job.release);
+    if (!snap.ok) return snap;
+    await log(`[worker] working-tree snapshot copied=${snap.copied} skipped=${snap.skipped}`);
+    return snap;
+  }
+  // remote: git fetch + detached worktree; do NOT pre-create the target dir
+  // (git worktree add fails on an existing directory).
+  const git = (argv) => execFileWrap("git", argv, { cwd: paths.repoPath, encoding: "utf8" });
+  const f = await git(["fetch", "origin", job.ref || "main"]);
+  if (f.code !== 0) return { ok: false, code: `git_fetch:${(f.stderr || f.stdout).slice(0, 120)}` };
+  await rm(job.release, { recursive: true, force: true }); // remove any stale placeholder
+  const w = await git(["worktree", "add", "--detach", job.release, "FETCH_HEAD"]);
+  if (w.code !== 0) return { ok: false, code: `git_worktree:${(w.stderr || w.stdout).slice(0, 120)}` };
+  return { ok: true };
+}
+
+async function runGates(cwd, log) {
+  const env = releaseGateEnv(process.env);
+  for (const [cmd, args] of RELEASE_GATES) {
+    const r = await execFileWrap(cmd, args, { cwd, env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    if (r.code !== 0) throw new Error(`${cmd} ${args.join(" ")} failed: ${(r.stderr || r.stdout).slice(0, 400)}`);
+    await log(`[worker] gate ok: ${cmd} ${args.join(" ")}`);
+  }
+}
+
+async function waitForValidation(job, generation, version) {
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    const st = await readJson(job.status_path).catch(() => null);
+    const gen = st?.manager?.generations?.find((g) => g.generation === generation);
+    if (validationOk(gen?.validation, version)) return gen.validation;
+    await sleep(400);
+  }
+  return { ok: false, code: "validation_timeout" };
+}
+
+/** Pure guard used by the worker; exported for tests. */
+export function validationOk(validation, version) {
+  return !!(
+    validation &&
+    validation.ok === true &&
+    validation.runtime_version === version &&
+    validation.contract_hash === EPOCH1_CONTRACT_HASH &&
+    validation.tool_count === REQUIRED_TOOL_COUNT
+  );
+}
+
+async function waitForActiveGeneration(job, generation) {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    const st = await readJson(job.status_path).catch(() => null);
+    if (st?.manager?.active_generation === generation) return true;
+    await sleep(400);
+  }
+  return false;
+}
+
+async function waitForRuntime(endpoint, token, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await globalThis.fetch(endpoint, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: "candidate-probe", method: "server/discover", params: {} }),
+        signal: AbortSignal.timeout(2000),
+      });
+      if (res.ok) return true;
+    } catch { /* keep polling */ }
+    await sleep(300);
+  }
+  return false;
+}
+
+/** Parse an MCP body that may be framed as SSE `data:` lines or plain JSON. */
+export function parseMcpBody(text) {
+  const s = String(text || "").trim();
+  if (!s) return null;
+  const lines = s.split(/\r?\n/);
+  const dataLines = lines.filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim().replace(/^ +/, ""));
+  if (dataLines.length > 0) return JSON.parse(dataLines.join(""));
+  return JSON.parse(s);
+}
+
+async function verifyRuntimeAt(endpoint, token, expectedVersion) {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await globalThis.fetch(endpoint, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: "verify", method: "server/discover", params: {} }),
+        signal: AbortSignal.timeout(2000),
+      });
+      if (res.ok) {
+        const body = parseMcpBody(await res.text());
+        const info = body?.result?.serverInfo;
+        if (info?.version) {
+          // expectedVersion == null means "any healthy runtime" (original version unknown).
+          const ok = expectedVersion == null ? true : info.version === expectedVersion;
+          return { ok, version: info.version, details: ok ? null : `version ${info.version} !== ${expectedVersion}` };
+        }
+        return { ok: false, details: "no serverInfo.version" };
+      }
+    } catch { /* keep polling */ }
+    await sleep(400);
+  }
+  return { ok: false, details: "timeout" };
+}
+
+async function readActiveGeneration(statusPath) {
+  const st = await readJson(statusPath).catch(() => null);
+  const active = st?.manager?.active_generation ?? null;
+  const gen = st?.manager?.generations?.find((g) => g.generation === active) ?? null;
+  return {
+    generation: active,
+    endpoint: gen?.endpoint ?? null,
+    runtime_version: gen?.validation?.runtime_version ?? gen?.spec?.expected_runtime_version ?? null,
+  };
+}
+
+async function findStaleGenerations(statusPath, job) {
+  const st = await readJson(statusPath).catch(() => null);
+  const gens = st?.manager?.generations ?? [];
+  const out = [];
+  for (const g of gens) {
+    if (g.generation === job.stable_generation) continue;
+    if (g.generation === job.candidate_generation) continue;
+    // drop every generation pointing at the now-upgraded 8772 — including the
+    // original_active generation, because it no longer describes an online
+    // rollback target once the new stable is validated and active. (Rollback
+    // runs BEFORE this success cleanup and uses the backed-up plist, so the
+    // online rollback path is unaffected.)
+    if ((g.endpoint || "").includes(":8772/mcp")) out.push(g.generation);
+  }
+  return out;
+}
+
+async function backupFile(src, paths, jobId) {
+  const dir = join(paths.selfUpdateDir, "backup");
+  await mkdir(dir, { recursive: true });
+  const dst = join(dir, `${jobId}-${basename(src)}`);
+  await copyFile(src, dst);
+  await chmod(dst, 0o600);
+  return dst;
+}
+
+async function terminateChild(child) {
+  if (!child) return;
+  if (child.exitCode !== null && child.signalCode === null) return;
+  try { child.kill("SIGTERM"); } catch { /* already gone */ }
+  await new Promise((resolve) => {
+    const t = setTimeout(resolve, 5000);
+    child.once("exit", () => { clearTimeout(t); resolve(); });
+  });
+}
+
+async function terminateChildHard(child) {
+  if (!child || child.pid == null) return;
+  try { child.kill("SIGKILL"); } catch { /* already gone */ }
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function messageOf(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function parseJsonOk(stdout) {
+  try {
+    const lines = String(stdout || "").trim().split(/\r?\n/).filter(Boolean);
+    const last = lines.at(-1) || "{}";
+    return JSON.parse(last)?.ok === true;
+  } catch { return false; }
+}
+
+// --- launchctl plumbing ----------------------------------------------------------
+
+function uid() { return process.getuid?.() ?? Number(process.env.UID ?? 501); }
+const SERVER_LABEL = "dev.herdr-mcp.server";
+
+async function launchctlRun(args) {
+  return execFileWrap("/bin/launchctl", args, { stdio: "pipe" });
+}
+
+async function waitLaunchdAbsent(label) {
+  for (let i = 0; i < 30; i += 1) {
+    const r = await execFileWrap("/bin/launchctl", ["print", `gui/${uid()}/${label}`], { stdio: "pipe" });
+    if (r.code !== 0) return true;
+    await sleep(300);
+  }
+  return false;
+}
+
+async function waitLaunchdRunning(label) {
+  for (let i = 0; i < 30; i += 1) {
+    const r = await execFileWrap("/bin/launchctl", ["print", `gui/${uid()}/${label}`], { stdio: "pipe", encoding: "utf8" });
+    if (r.code === 0 && /state = running/.test(r.stdout || "")) return true;
+    await sleep(400);
+  }
+  return false;
+}
+
+// Default bootstrap retry backoff (ms). macOS launchd can return "Bootstrap
+// failed: 5" / "I/O error" right after a bootout because the domain is still
+// settling; a bounded retry absorbs that race. Overridable for tests.
+export function defaultBootstrapDelays() {
+  return [250, 500, 1000, 2000];
+}
+
+/**
+ * bootout + wait-absent + bounded bootstrap retry + wait-running, in one place.
+ * Both the production reload and the rollback reload go through this helper so
+ * they share the same race handling. Each retry first confirms the service is
+ * absent before bootstrapping again.
+ */
+export async function reloadServer(plistPath, options = {}) {
+  const label = options.label ?? SERVER_LABEL;
+  const delays = options.delays ?? defaultBootstrapDelays();
+  const uidValue = options.uid ?? uid();
+  const sleepFn = options.sleep ?? sleep;
+  await launchctlRun(["bootout", `gui/${uidValue}/${label}`]);
+  await waitLaunchdAbsent(label);
+  let lastError = null;
+  for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+    // confirm the service is absent before (re)bootstrapping
+    await waitLaunchdAbsent(label);
+    const r = await launchctlRun(["bootstrap", `gui/${uidValue}`, plistPath]);
+    if (r.code === 0) {
+      const running = await waitLaunchdRunning(label);
+      if (running) return { ok: true, attempts: attempt + 1 };
+      lastError = "bootstrap ok but service not running";
+    } else {
+      lastError = (r.stderr || r.stdout || `exit_${r.code}`).slice(0, 160);
+    }
+    if (attempt < delays.length) await sleepFn(delays[attempt]);
+  }
+  return { ok: false, attempts: delays.length + 1, error: lastError };
+}
+
+// --- rollback execution -----------------------------------------------------------
+
+async function runRollback(jobPath, job, paths, env, log, errorMessage) {
+  await log(`[worker] rollback triggered: ${errorMessage}`);
+  const steps = buildRollbackPlan(job);
+  job.rollback_steps = steps.map((s) => ({ ...s, result: "pending" }));
+  job.error_message = errorMessage;
+  job.outcome = "rolled_back";
+  job.stage = "failed";
+  await atomicWriteJson(jobPath, job);
+  await mirrorSummary(job); // visible immediately: rollback started
+  let incomplete = false;
+  for (const step of steps) {
+    try {
+      const result = await runRollbackStep(step, job, env, paths);
+      const rec = job.rollback_steps.find((x) => x.action === step.action);
+      if (rec) rec.result = result.ok ? "done" : "failed";
+      if (!result.ok) incomplete = true;
+    } catch (e) {
+      const rec = job.rollback_steps.find((x) => x.action === step.action);
+      if (rec) rec.result = `error:${messageOf(e)}`;
+      incomplete = true;
+    }
+  }
+  job.rollback_outcome = incomplete ? "rollback_incomplete" : "rolled_back";
+  job.updated_at_ms = Date.now();
+  await atomicWriteJson(jobPath, job);
+  await mirrorSummary(job); // keep the terminal rollback state visible to the skill
+  await log(`[rollback] done outcome=${job.rollback_outcome}`);
+}
+
+async function runRollbackStep(step, job, env, paths) {
+  const rtEnv = runtimeEnv(env, paths);
+  switch (step.action) {
+    case "activate_original_generation": {
+      if (!step.generation) return { ok: true };
+      const r = await execFileWrap(process.execPath, [paths.runtimeGenCli, "activate", "--generation", step.generation], { env: rtEnv, encoding: "utf8" });
+      return { ok: r.code === 0 || parseJsonOk(r.stdout) };
+    }
+    case "restore_server_plist": {
+      await copyFile(step.from, step.to);
+      await chmod(step.to, 0o600);
+      return { ok: true };
+    }
+    case "reload_server_from_original": {
+      const reloaded = await reloadServer(job.server_plist);
+      return { ok: reloaded.ok, attempts: reloaded.attempts, error: reloaded.error ?? null };
+    }
+    case "verify_original_runtime": {
+      // Real verification, not a no-op: re-read the token from the RESTORED server
+      // plist (never persisted/logged) and require server/discover to answer on
+      // 8772 — version-exact when the original runtime version is known.
+      let token = "";
+      try {
+        const restored = await readPlist(job.server_plist);
+        token = splitServerEnv(restored).token ?? "";
+      } catch { /* token stays empty -> probe will fail closed */ }
+      if (!token) return { ok: false, error: "restored server plist has no token" };
+      const expected = job.original_generation_spec?.runtime_version ?? null;
+      const verified = await verifyRuntimeAt("http://127.0.0.1:8772/mcp", token, expected);
+      if (verified.ok) return { ok: true, version: verified.version };
+      return { ok: false, error: verified.details ?? "original runtime not healthy" };
+    }
+    case "restore_link_plist": {
+      await copyFile(step.from, step.to);
+      await chmod(step.to, 0o600);
+      return { ok: true };
+    }
+    case "remove_candidate_generation": {
+      if (!step.generation) return { ok: true };
+      const r = await execFileWrap(process.execPath, [paths.runtimeGenCli, "remove", "--generation", step.generation], { env: rtEnv, encoding: "utf8" });
+      return { ok: r.code === 0 };
+    }
+    case "stop_candidate": {
+      const pid = Number(job.candidate_pid ?? 0);
+      if (Number.isInteger(pid) && pid > 0 && isPidAlive(pid)) {
+        try { process.kill(pid, "SIGTERM"); } catch { /* ignore */ }
+      }
+      return { ok: true };
+    }
+    default:
+      return { ok: true };
+  }
+}
+
+// --- misc ----------------------------------------------------------------------
+
+function runtimeEnv(env, paths) {
+  return { ...env, HERDR_RUNTIME_CONTROL_PATH: paths.controlPath, HERDR_RUNTIME_STATUS_PATH: paths.statusPath };
+}
+
+async function makeAppender(logPath) {
+  await mkdir(dirname(logPath), { recursive: true });
+  const { createWriteStream } = await import("node:fs");
+  const out = createWriteStream(logPath, { flags: "a" });
+  const write = (line) => new Promise((resolve) => out.write(line + "\n", resolve));
+  return write;
+}
+
+async function setStage(jobPath, job, stage, log) {
+  await setState(jobPath, job, { stage });
+  if (log) await log(`[worker] stage=${stage}`);
+}
+
+async function setState(jobPath, job, patch) {
+  Object.assign(job, patch);
+  job.updated_at_ms = Date.now();
+  await atomicWriteJson(jobPath, job);
+  await mirrorSummary(job);
+}
+
+/**
+ * Mirror a redacted, token-free summary to the skill-visible status path on
+ * every job state change (contract with src/herdr-skill.ts). Never contains the
+ * MCP token; keeps the terminal state on success/rollback. Paths are derived
+ * from the job's own control_path so tests with a redirected env never write to
+ * the real ~/.config/herdr-mcp/self-update-status.json.
+ */
+export async function mirrorSummary(job) {
+  // Strictly job-owned paths only: never re-read process.env (a dispatch()
+  // invoked with a redirected env, e.g. tests/canary, must not touch the real
+  // HOME). summary_status_path is persisted by makeJob from resolvePaths().
+  const summaryPath = job.summary_status_path;
+  if (!summaryPath) return null;
+  const base = dirname(summaryPath);
+  const jobsDir = join(base, "self-update", "jobs");
+  const logsDir = join(base, "self-update", "logs");
+  const updatedIso = Number.isFinite(job.updated_at_ms) && job.updated_at_ms > 0 ? new Date(job.updated_at_ms).toISOString() : null;
+  const summary = {
+    schema_version: 1,
+    job_id: job.job_id ?? null,
+    state: job.stage ?? job.outcome ?? "queued",
+    status: job.stage ?? null,
+    outcome: job.outcome ?? null,
+    source: job.source ?? null,
+    ref: job.ref ?? null,
+    target_version: job.version ?? null,
+    version: job.version ?? null,
+    stable_generation: job.stable_generation ?? null,
+    candidate_generation: job.candidate_generation ?? null,
+    error_code: job.error_code ?? null,
+    rollback_outcome: job.rollback_outcome ?? null,
+    rollback_steps: Array.isArray(job.rollback_steps) ? job.rollback_steps.length : 0,
+    updated_at: updatedIso,
+    updated_at_ms: job.updated_at_ms ?? null,
+    job_path: job.job_id ? join(jobsDir, `${job.job_id}.json`) : null,
+    log_path: job.job_id ? join(logsDir, `${job.job_id}.log`) : null,
+  };
+  await atomicWriteJson(summaryPath, summary);
+  return summary;
+}
+
+function readVersionFromPath(packageJsonPath) {
+  try {
+    if (!existsSync(packageJsonPath)) return null;
+    return JSON.parse(readFileSync(packageJsonPath, "utf8")).version ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// --- command runner ----------------------------------------------------------
+
+const execFileP = promisify(execFile);
+let execFileOverride = null;
+
+async function execFileWrap(cmd, args, opts) {
+  if (execFileOverride) return execFileOverride(cmd, args, opts);
+  try {
+    const r = await execFileP(cmd, args, opts);
+    return { code: 0, stdout: r.stdout || "", stderr: r.stderr || "" };
+  } catch (e) {
+    return { code: e.code ?? 1, stdout: e.stdout || "", stderr: e.stderr || "" };
+  }
+}
+
+/** Replace the runtime command runner (tests only). Returns prior runner. */
+export function _setExecFileWrap(fn) {
+  const prev = execFileOverride;
+  execFileOverride = fn;
+  return prev;
+}
+
+// --- dispatch / main ----------------------------------------------------------
+
+export async function dispatch(args, env = process.env) {
+  if (args.help) { process.stdout.write(usage()); return; }
+  if (args.command === "status") await cmdStatus(args, env);
+  else if (args.command === "check") await cmdCheck(args, env);
+  else if (args.command === "plan") await cmdPlan(args, env);
+  else if (args.command === "apply") await cmdApply(args, env);
+  else if (args.command === "worker") await cmdWorker(args, env);
+  else { process.stdout.write(JSON.stringify({ ok: false, code: "unknown_command", command: args.command }) + "\n"); process.exitCode = 2; }
+}
+
+export async function main() {
+  const argv = process.argv.slice(2);
+  let args;
+  try { args = parseArgs(argv); } catch (e) { process.stdout.write(JSON.stringify({ ok: false, code: "bad_args", error: messageOf(e) }) + "\n"); process.exitCode = 2; return; }
+  try {
+    await dispatch(args, process.env);
+  } catch (error) {
+    process.stdout.write(JSON.stringify({ ok: false, code: "internal_error", message: messageOf(error) }) + "\n");
+    process.exitCode = 2;
+  }
+}
+
+// --- install guard -----------------------------------------------------------
+
+if (import.meta.url === pathToFileURL(process.argv[1] || "").href) {
+  await main().catch((e) => {
+    process.stdout.write(JSON.stringify({ ok: false, code: "fatal", message: messageOf(e) }) + "\n");
+    process.exitCode = 2;
+  });
+}

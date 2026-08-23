@@ -8,6 +8,7 @@ import { writeFile, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
+import { enrichedUserEnv } from "./user-path.js";
 
 export type LocalExecResult = {
   exit_code: number | null;
@@ -63,7 +64,7 @@ export async function runLocalShell(opts: {
   return new Promise((resolve) => {
     const proc = spawn("/bin/zsh", [scriptPath], {
       cwd: opts.cwd,
-      env: process.env,
+      env: enrichedUserEnv(process.env),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let timedOut = false;

@@ -1,0 +1,179 @@
+#!/usr/bin/env node
+import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+
+const API = "https://api.cloudflare.com/client/v4";
+const DNS_WRITE = "DNS Write";
+const DEFAULT_OUTPUT = join(homedir(), ".config", "herdr-mcp", "cloudflare-dns-cutover.env");
+
+function parseArgs(argv) {
+  const out = { zone: process.env.HERDR_CUTOVER_ZONE || "", output: DEFAULT_OUTPUT, name: "", dryRun: false, verifyOnly: false, revoke: false };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--zone") out.zone = argv[++i] || "";
+    else if (arg === "--output") out.output = argv[++i] || "";
+    else if (arg === "--name") out.name = argv[++i] || "";
+    else if (arg === "--dry-run") out.dryRun = true;
+    else if (arg === "--verify-only") out.verifyOnly = true;
+    else if (arg === "--revoke") out.revoke = true;
+    else if (arg === "--help" || arg === "-h") out.help = true;
+    else throw new Error(`unknown_argument:${arg}`);
+  }
+  if (!out.output) throw new Error("output_required");
+  if (!out.name && out.zone) out.name = `herdr-mcp-dns-cutover-${out.zone.replace(/[^a-zA-Z0-9.-]/g, "-")}`;
+  return out;
+}
+
+function usage() {
+  return `Usage: herdr-cloudflare-dns-token --zone <zone> [options]\n\n` +
+    `Creates an EPHEMERAL zone-scoped DNS Write token only for legacy CNAME ->\n` +
+    `Worker Custom Domain migration/rollback. It is not a normal Herdr runtime token.\n\n` +
+    `Options:\n` +
+    `  --zone <name>       Required target Cloudflare zone\n` +
+    `  --name <name>       Account API Token name\n` +
+    `  --output <path>     Local credential file (default: ${DEFAULT_OUTPUT})\n` +
+    `  --dry-run           Resolve zone/account/permission; create nothing\n` +
+    `  --verify-only       Verify the locally saved DNS token without revealing it\n` +
+    `  --revoke            Revoke the saved token and remove the local file\n` +
+    `  -h, --help          Show help\n\n` +
+    `Creation/revocation requires a bootstrap CLOUDFLARE_API_TOKEN (or CF_API_TOKEN)\n` +
+    `that can manage Account API Tokens. Generated token values are never printed.\n`;
+}
+
+function emit(value, code = 0) {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+  if (code) process.exitCode = code;
+}
+
+async function cf(token, path, init = {}) {
+  let response;
+  try {
+    response = await fetch(`${API}${path}`, {
+      ...init,
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...(init.headers || {}) },
+    });
+  } catch {
+    return { ok: false, status: 0, code: "cloudflare_unreachable", result: null };
+  }
+  let body = null;
+  try { body = await response.json(); } catch { /* optional */ }
+  if (!response.ok || body?.success === false) {
+    return { ok: false, status: response.status, code: response.status === 403 ? "permission_blocked" : "cloudflare_api_error", result: null };
+  }
+  return { ok: true, status: response.status, result: body?.result ?? null };
+}
+
+function parseEnv(text) {
+  const out = {};
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const pos = line.indexOf("=");
+    if (pos > 0) out[line.slice(0, pos)] = line.slice(pos + 1);
+  }
+  return out;
+}
+
+async function load(path) {
+  try { return parseEnv(await readFile(path, "utf8")); } catch { return null; }
+}
+
+export async function verifyDnsToken(values) {
+  if (!values?.CLOUDFLARE_DNS_CUTOVER_TOKEN || !values?.HERDR_CUTOVER_ZONE_ID) return { ok: false, code: "saved_credential_missing_or_incomplete" };
+  const r = await cf(values.CLOUDFLARE_DNS_CUTOVER_TOKEN, `/zones/${encodeURIComponent(values.HERDR_CUTOVER_ZONE_ID)}/dns_records?per_page=1`);
+  return { ok: r.ok, code: r.ok ? "dns_cutover_credential_ready" : "dns_cutover_credential_verify_failed", status: r.status };
+}
+
+async function resolveBootstrap(token, zoneName) {
+  const zones = await cf(token, `/zones?name=${encodeURIComponent(zoneName)}`);
+  if (!zones.ok) return { ok: false, stage: "zone_lookup", code: zones.code, status: zones.status };
+  if (!Array.isArray(zones.result) || zones.result.length !== 1) return { ok: false, stage: "zone_lookup", code: "zone_not_unique" };
+  const zone = zones.result[0];
+  if (!zone?.id || !zone?.account?.id) return { ok: false, stage: "zone_lookup", code: "zone_identity_missing" };
+  const groups = await cf(token, `/accounts/${encodeURIComponent(zone.account.id)}/tokens/permission_groups`);
+  if (!groups.ok) return { ok: false, stage: "permission_group_lookup", code: groups.code, status: groups.status };
+  const dnsWrite = (Array.isArray(groups.result) ? groups.result : []).find((g) => g?.name === DNS_WRITE);
+  if (!dnsWrite?.id) return { ok: false, stage: "permission_group_lookup", code: "dns_write_permission_missing" };
+  return { ok: true, accountId: zone.account.id, zoneId: zone.id, permissionId: dnsWrite.id };
+}
+
+async function atomicWrite(path, values) {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const tmp = `${path}.tmp-${process.pid}`;
+  const content = [
+    `CLOUDFLARE_DNS_CUTOVER_TOKEN=${values.token}`,
+    `CLOUDFLARE_DNS_CUTOVER_TOKEN_ID=${values.tokenId}`,
+    `CLOUDFLARE_ACCOUNT_ID=${values.accountId}`,
+    `HERDR_CUTOVER_ZONE=${values.zone}`,
+    `HERDR_CUTOVER_ZONE_ID=${values.zoneId}`,
+    "",
+  ].join("\n");
+  await writeFile(tmp, content, { mode: 0o600 });
+  await chmod(tmp, 0o600);
+  await rename(tmp, path);
+  await chmod(path, 0o600);
+  return ((await stat(path)).mode & 0o777).toString(8).padStart(3, "0");
+}
+
+export async function main(argv = process.argv.slice(2)) {
+  let args;
+  try { args = parseArgs(argv); } catch (error) { emit({ ok: false, code: error.message }, 2); return; }
+  if (args.help) { process.stdout.write(usage()); return; }
+
+  const existing = await load(args.output);
+  if (args.verifyOnly) {
+    const v = await verifyDnsToken(existing);
+    emit({ ...v, path: args.output }, v.ok ? 0 : 2);
+    return;
+  }
+
+  const bootstrap = process.env.CLOUDFLARE_API_TOKEN || process.env.CF_API_TOKEN || "";
+  if (args.revoke) {
+    if (!existing?.CLOUDFLARE_DNS_CUTOVER_TOKEN_ID || !existing?.CLOUDFLARE_ACCOUNT_ID) {
+      emit({ ok: false, code: "saved_credential_missing_or_incomplete", path: args.output }, 2); return;
+    }
+    if (!bootstrap) { emit({ ok: false, code: "missing_bootstrap_token" }, 2); return; }
+    const r = await cf(bootstrap, `/accounts/${encodeURIComponent(existing.CLOUDFLARE_ACCOUNT_ID)}/tokens/${encodeURIComponent(existing.CLOUDFLARE_DNS_CUTOVER_TOKEN_ID)}`, { method: "DELETE" });
+    if (!r.ok) { emit({ ok: false, code: r.code, status: r.status }, 2); return; }
+    await unlink(args.output).catch(() => {});
+    emit({ ok: true, code: "dns_cutover_credential_revoked", path: args.output });
+    return;
+  }
+
+  if (existing?.CLOUDFLARE_DNS_CUTOVER_TOKEN) {
+    const v = await verifyDnsToken(existing);
+    if (v.ok) { emit({ ok: true, code: "dns_cutover_credential_already_ready", path: args.output, status: v.status }); return; }
+    emit({ ok: false, code: "credential_exists_but_invalid", path: args.output }, 2); return;
+  }
+  if (!args.zone) { emit({ ok: false, code: "zone_required" }, 2); return; }
+  if (!bootstrap) { emit({ ok: false, code: "missing_bootstrap_token" }, 2); return; }
+
+  const resolved = await resolveBootstrap(bootstrap, args.zone);
+  if (!resolved.ok) { emit({ ok: false, code: resolved.code, stage: resolved.stage, status: resolved.status ?? null }, 2); return; }
+  if (args.dryRun) {
+    emit({ ok: true, code: "dry_run_ready", zone: args.zone, accountId: resolved.accountId, zoneId: resolved.zoneId, permission: DNS_WRITE, output: args.output });
+    return;
+  }
+
+  const payload = {
+    name: args.name,
+    policies: [{
+      effect: "allow",
+      permission_groups: [{ id: resolved.permissionId }],
+      resources: { [`com.cloudflare.api.account.zone.${resolved.zoneId}`]: "*" },
+    }],
+    condition: {},
+  };
+  const created = await cf(bootstrap, `/accounts/${encodeURIComponent(resolved.accountId)}/tokens`, { method: "POST", body: JSON.stringify(payload) });
+  const token = created.result?.value;
+  const tokenId = created.result?.id;
+  if (!created.ok || typeof token !== "string" || !tokenId) {
+    emit({ ok: false, code: created.ok ? "token_value_missing" : created.code, status: created.status ?? null }, 2); return;
+  }
+  const mode = await atomicWrite(args.output, { token, tokenId, accountId: resolved.accountId, zoneId: resolved.zoneId, zone: args.zone });
+  const verify = await verifyDnsToken({ CLOUDFLARE_DNS_CUTOVER_TOKEN: token, HERDR_CUTOVER_ZONE_ID: resolved.zoneId });
+  emit({ ok: verify.ok, code: verify.ok ? "dns_cutover_credential_created" : "dns_cutover_credential_created_but_verify_failed", path: args.output, mode, zone: args.zone, permission: DNS_WRITE, status: verify.status }, verify.ok ? 0 : 2);
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) await main();

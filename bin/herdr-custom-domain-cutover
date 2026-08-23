@@ -1,0 +1,360 @@
+#!/usr/bin/env node
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import {
+  attach as attachDomain,
+  config as domainConfig,
+  detach as detachDomain,
+  edgeProbe,
+  status as domainStatus,
+  watch as watchDomain,
+} from "./herdr-cloudflare-domain";
+
+const CF_API = "https://api.cloudflare.com/client/v4";
+const DEFAULT_CUTOVER_ENV = join(homedir(), ".config", "herdr-mcp", "cloudflare-cutover.env");
+const DEFAULT_DNS_ENV = join(homedir(), ".config", "herdr-mcp", "cloudflare-dns-cutover.env");
+const DEFAULT_ROLLBACK = join(homedir(), ".config", "herdr-mcp", "custom-domain-rollback.json");
+const DEFAULT_STATE = join(homedir(), ".config", "herdr-mcp", "custom-domain-cutover-transaction.json");
+
+function parseEnv(text) {
+  const out = {};
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const pos = line.indexOf("=");
+    if (pos <= 0) continue;
+    out[line.slice(0, pos)] = line.slice(pos + 1);
+  }
+  return out;
+}
+
+async function readEnvFile(path) {
+  return parseEnv(await readFile(path, "utf8"));
+}
+
+async function atomicJson(path, value) {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const tmp = `${path}.tmp-${process.pid}`;
+  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  await chmod(tmp, 0o600);
+  await rename(tmp, path);
+  await chmod(path, 0o600);
+}
+
+async function cfDns(token, zoneId, suffix, init = {}) {
+  let response;
+  try {
+    response = await fetch(`${CF_API}/zones/${encodeURIComponent(zoneId)}/dns_records${suffix}`, {
+      ...init,
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        ...(init.headers || {}),
+      },
+    });
+  } catch {
+    return { ok: false, status: 0, code: "dns_api_unreachable", result: null };
+  }
+  let body = null;
+  try { body = await response.json(); } catch { /* Cloudflare error bodies are optional */ }
+  return {
+    ok: response.ok && body?.success !== false,
+    status: response.status,
+    code: response.ok && body?.success !== false ? null : (response.status === 403 ? "dns_permission_blocked" : "dns_api_error"),
+    result: body?.result ?? null,
+  };
+}
+
+function normalizedExpected(rollback) {
+  const r = rollback?.legacy_record || {};
+  const ttl = r.ttl === "auto" || r.ttl === "Auto" ? 1 : Number(r.ttl || 1);
+  return {
+    type: String(r.type || "").toUpperCase(),
+    name: rollback?.hostname || r.name || "",
+    content: r.target || r.content || "",
+    proxied: r.proxied === true,
+    ttl,
+  };
+}
+
+function recordMatches(record, expected) {
+  return !!record &&
+    String(record.type || "").toUpperCase() === expected.type &&
+    String(record.name || "").toLowerCase() === String(expected.name).toLowerCase() &&
+    String(record.content || "").replace(/\.$/, "") === String(expected.content).replace(/\.$/, "") &&
+    record.proxied === expected.proxied &&
+    Number(record.ttl) === Number(expected.ttl);
+}
+
+async function exactDnsRecord(dnsToken, zoneId, hostname) {
+  const r = await cfDns(dnsToken, zoneId, `?name=${encodeURIComponent(hostname)}`);
+  if (!r.ok) return { ok: false, code: r.code, status: r.status };
+  const rows = Array.isArray(r.result) ? r.result : [];
+  if (rows.length === 0) return { ok: true, present: false, record: null };
+  if (rows.length !== 1) return { ok: false, code: "dns_record_not_unique", count: rows.length };
+  return { ok: true, present: true, record: rows[0] };
+}
+
+function legacyTunnelAlive(label) {
+  if (!label) return true;
+  if (process.platform !== "darwin") return true;
+  try {
+    const text = execFileSync("/bin/launchctl", ["list"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const line = text.split(/\r?\n/).find((x) => x.trim().endsWith(`\t${label}`) || x.trim().endsWith(` ${label}`));
+    if (!line) return false;
+    const pid = line.trim().split(/\s+/)[0];
+    return /^\d+$/.test(pid) && Number(pid) > 0;
+  } catch {
+    return false;
+  }
+}
+
+function keychainSecret(service) {
+  if (!service || process.platform !== "darwin") return "";
+  try {
+    return execFileSync("/usr/bin/security", ["find-generic-password", "-s", service, "-w"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+async function responseJson(response) {
+  const text = await response.text();
+  if (!text) return null;
+  try {
+    if ((response.headers.get("content-type") || "").includes("text/event-stream")) {
+      const data = text.split(/\r?\n/).filter((line) => line.startsWith("data: ")).map((line) => line.slice(6)).join("");
+      return data ? JSON.parse(data) : null;
+    }
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+async function verifyIdentity(base, expectedOrigin, bearer, workstationId) {
+  try {
+    const [oauthResp, cardResp] = await Promise.all([
+      fetch(`${base}/.well-known/oauth-authorization-server`),
+      fetch(`${base}/.well-known/mcp.json`),
+    ]);
+    const oauth = await responseJson(oauthResp);
+    const card = await responseJson(cardResp);
+    const identityOk = oauthResp.status === 200 && cardResp.status === 200 &&
+      oauth?.issuer === expectedOrigin &&
+      String(oauth?.authorization_endpoint || "").startsWith(`${expectedOrigin}/`) &&
+      String(oauth?.token_endpoint || "").startsWith(`${expectedOrigin}/`) &&
+      String(oauth?.registration_endpoint || "").startsWith(`${expectedOrigin}/`) &&
+      card?.serverUrl === `${expectedOrigin}/mcp`;
+    if (!identityOk) return { ok: false, code: "public_identity_drift", oauthStatus: oauthResp.status, cardStatus: cardResp.status };
+
+    const callResp = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bearer}`,
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "user-agent": "herdr-cutover-transaction/1",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "cutover-inspect", method: "tools/call", params: { name: "herdr_inspect", arguments: {} } }),
+    });
+    const call = await responseJson(callResp);
+    const callOk = callResp.status === 200 && !!call?.result && !call?.error && call?.result?.isError !== true;
+    return {
+      ok: callOk,
+      code: callOk ? "public_identity_and_tool_ok" : "public_tool_call_failed",
+      oauthStatus: oauthResp.status,
+      cardStatus: cardResp.status,
+      toolCallStatus: callResp.status,
+      workstationId,
+    };
+  } catch {
+    return { ok: false, code: "public_verify_unreachable" };
+  }
+}
+
+async function deleteDnsWithRecovery(dnsToken, zoneId, recordId, hostname) {
+  const r = await cfDns(dnsToken, zoneId, `/${encodeURIComponent(recordId)}`, { method: "DELETE" });
+  if (r.ok) return { ok: true, recovered: false };
+  if (r.status !== 0 && r.status < 500) return { ok: false, code: r.code, status: r.status };
+  const observed = await exactDnsRecord(dnsToken, zoneId, hostname);
+  if (observed.ok && observed.present === false) return { ok: true, recovered: true };
+  return { ok: false, code: "dns_delete_ambiguous", status: r.status };
+}
+
+async function restoreDnsWithRecovery(dnsToken, zoneId, expected) {
+  const before = await exactDnsRecord(dnsToken, zoneId, expected.name);
+  if (before.ok && before.present && recordMatches(before.record, expected)) return { ok: true, alreadyPresent: true };
+  if (!before.ok || before.present) return { ok: false, code: before.code || "dns_restore_conflict" };
+
+  const body = {
+    type: expected.type,
+    name: expected.name,
+    content: expected.content,
+    ttl: expected.ttl,
+    proxied: expected.proxied,
+  };
+  const r = await cfDns(dnsToken, zoneId, "", { method: "POST", body: JSON.stringify(body) });
+  if (r.ok) return { ok: true, recovered: false };
+  if (r.status !== 0 && r.status < 500) return { ok: false, code: r.code, status: r.status };
+  const observed = await exactDnsRecord(dnsToken, zoneId, expected.name);
+  if (observed.ok && observed.present && recordMatches(observed.record, expected)) return { ok: true, recovered: true };
+  return { ok: false, code: "dns_restore_ambiguous", status: r.status };
+}
+
+export async function executeTransaction(c, dnsToken, rollback, options = {}) {
+  const statePath = options.statePath || DEFAULT_STATE;
+  const tunnelLabel = options.tunnelLabel ?? "dev.herdr-mcp.tunnel";
+  const tunnelAlive = options.tunnelAlive || legacyTunnelAlive;
+  const expected = normalizedExpected(rollback);
+  const hostname = c.hostname;
+  const zoneId = c.zoneId;
+  const expectedOrigin = `https://${hostname}`;
+  const state = { version: 1, hostname, worker: c.worker, startedAt: new Date().toISOString(), stage: "preflight" };
+  await atomicJson(statePath, state);
+
+  if (!tunnelAlive(tunnelLabel)) return { ok: false, code: "legacy_tunnel_not_alive" };
+  const prod = await edgeProbe(c, c.prodEdgeBase);
+  if (!prod.ok) return { ok: false, code: "prod_edge_not_ready", prod };
+  const domainBefore = await domainStatus(c);
+  if (!domainBefore.ok || domainBefore.attached) return { ok: false, code: "custom_domain_not_absent", domain: domainBefore };
+  const dnsBefore = await exactDnsRecord(dnsToken, zoneId, hostname);
+  if (!dnsBefore.ok || !dnsBefore.present || !recordMatches(dnsBefore.record, expected)) {
+    return { ok: false, code: "legacy_dns_mismatch", dnsStatus: dnsBefore.ok ? "mismatch" : dnsBefore.code };
+  }
+
+  const bearer = options.probeBearer || keychainSecret(c.probeKeychainService || "herdr-edge-prod-mcp-bearer");
+  if (!bearer) return { ok: false, code: "missing_probe_bearer" };
+  const candidateIdentity = await verifyIdentity(c.prodEdgeBase, expectedOrigin, bearer, c.workstationId);
+  if (!candidateIdentity.ok) return { ok: false, code: "candidate_identity_not_ready", detail: candidateIdentity.code };
+
+  state.stage = "deleting_legacy_dns";
+  state.legacyRecordId = dnsBefore.record.id;
+  await atomicJson(statePath, state);
+  const deleted = await deleteDnsWithRecovery(dnsToken, zoneId, dnsBefore.record.id, hostname);
+  if (!deleted.ok) return { ok: false, code: deleted.code, status: deleted.status ?? null };
+
+  const rollbackNow = async (reason) => {
+    state.stage = "rollback";
+    state.rollbackReason = reason;
+    await atomicJson(statePath, state);
+    const detached = await detachDomain(c, "rollback");
+    const domainAfterDetach = await domainStatus(c);
+    if (!detached.ok || !domainAfterDetach.ok || domainAfterDetach.attached) {
+      state.stage = "rollback_failed_domain_detach";
+      await atomicJson(statePath, state);
+      return { ok: false, code: "rollback_domain_detach_failed", reason };
+    }
+    const restored = await restoreDnsWithRecovery(dnsToken, zoneId, expected);
+    if (!restored.ok) {
+      state.stage = "rollback_failed_dns_restore";
+      await atomicJson(statePath, state);
+      return { ok: false, code: "rollback_dns_restore_failed", reason, restoreCode: restored.code };
+    }
+    if (!tunnelAlive(tunnelLabel)) {
+      state.stage = "rollback_failed_tunnel";
+      await atomicJson(statePath, state);
+      return { ok: false, code: "rollback_tunnel_not_alive", reason };
+    }
+    state.stage = "rollback_complete";
+    state.rolledBackAt = new Date().toISOString();
+    await atomicJson(statePath, state);
+    return { ok: false, code: "ROLLBACK_COMPLETE", reason };
+  };
+
+  state.stage = "attaching_custom_domain";
+  await atomicJson(statePath, state);
+  const attached = await attachDomain(c);
+  if (!attached.ok) {
+    const observed = await domainStatus(c);
+    if (!observed.ok || !observed.attached || observed.service !== c.worker) return rollbackNow(`attach:${attached.code}`);
+  }
+
+  state.stage = "watching_custom_domain";
+  await atomicJson(statePath, state);
+  const watched = await watchDomain(c);
+  if (!watched.ok) return rollbackNow(`watch:${watched.code}`);
+
+  const publicProbe = await edgeProbe(c, expectedOrigin);
+  if (!publicProbe.ok) return rollbackNow("public_edge_probe_failed");
+  const publicIdentity = await verifyIdentity(expectedOrigin, expectedOrigin, bearer, c.workstationId);
+  if (!publicIdentity.ok) return rollbackNow(`public_identity:${publicIdentity.code}`);
+  if (!tunnelAlive(tunnelLabel)) return rollbackNow("legacy_tunnel_stopped_during_observation");
+
+  const dnsAfter = await exactDnsRecord(dnsToken, zoneId, hostname);
+  if (!dnsAfter.ok || dnsAfter.present) return rollbackNow("legacy_dns_reappeared");
+  const domainAfter = await domainStatus(c);
+  if (!domainAfter.ok || !domainAfter.attached || domainAfter.service !== c.worker) return rollbackNow("custom_domain_binding_missing");
+
+  state.stage = "cutover_green";
+  state.completedAt = new Date().toISOString();
+  state.domainId = domainAfter.domainId || null;
+  await atomicJson(statePath, state);
+  return {
+    ok: true,
+    code: "CUTOVER_GREEN",
+    hostname,
+    worker: c.worker,
+    tunnelAlive: true,
+    runtimeVersion: publicProbe.runtimeVersion,
+    contractEpoch: publicProbe.contractEpoch,
+    contractHash: publicProbe.contractHash,
+    toolCount: publicProbe.toolCount,
+    identity: publicIdentity.code,
+  };
+}
+
+async function loadDefaults() {
+  const cutoverEnvPath = process.env.HERDR_CUTOVER_ENV_PATH || DEFAULT_CUTOVER_ENV;
+  const dnsEnvPath = process.env.HERDR_DNS_CUTOVER_ENV_PATH || DEFAULT_DNS_ENV;
+  const rollbackPath = process.env.HERDR_CUSTOM_DOMAIN_ROLLBACK_PATH || DEFAULT_ROLLBACK;
+  const [cutoverEnv, dnsEnv, rollbackText] = await Promise.all([
+    readEnvFile(cutoverEnvPath),
+    readEnvFile(dnsEnvPath),
+    readFile(rollbackPath, "utf8"),
+  ]);
+  const c = domainConfig({ ...process.env, ...cutoverEnv });
+  const dnsToken = dnsEnv.CLOUDFLARE_DNS_CUTOVER_TOKEN || "";
+  if (!dnsToken) throw new Error("missing_dns_cutover_token");
+  return { c, dnsToken, rollback: JSON.parse(rollbackText) };
+}
+
+async function main() {
+  const command = process.argv[2] || "run";
+  if (command === "--help" || command === "-h") {
+    process.stdout.write("Usage: herdr-custom-domain-cutover [preflight|run]\n");
+    return;
+  }
+  const { c, dnsToken, rollback } = await loadDefaults();
+  if (command === "preflight") {
+    const expected = normalizedExpected(rollback);
+    const dns = await exactDnsRecord(dnsToken, c.zoneId, c.hostname);
+    const domain = await domainStatus(c);
+    const prod = await edgeProbe(c, c.prodEdgeBase);
+    const tunnelAlive = legacyTunnelAlive("dev.herdr-mcp.tunnel");
+    const ok = dns.ok && dns.present && recordMatches(dns.record, expected) && domain.ok && !domain.attached && prod.ok && tunnelAlive;
+    process.stdout.write(`${JSON.stringify({ ok, code: ok ? "transaction_ready" : "transaction_blocked", dnsExact: dns.ok && dns.present && recordMatches(dns.record, expected), customDomainAbsent: domain.ok && !domain.attached, prodReady: prod.ok, tunnelAlive })}\n`);
+    process.exitCode = ok ? 0 : 2;
+    return;
+  }
+  if (command !== "run") {
+    process.stdout.write(`${JSON.stringify({ ok: false, code: "unknown_command", command })}\n`);
+    process.exitCode = 2;
+    return;
+  }
+  const result = await executeTransaction(c, dnsToken, rollback);
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  process.exitCode = result.ok ? 0 : (result.code === "ROLLBACK_COMPLETE" ? 3 : 2);
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((error) => {
+    process.stdout.write(`${JSON.stringify({ ok: false, code: "cutover_exception", message: String(error?.message || error).slice(0, 160) })}\n`);
+    process.exitCode = 2;
+  });
+}

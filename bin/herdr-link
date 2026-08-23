@@ -1,0 +1,158 @@
+#!/bin/zsh
+set -euo pipefail
+
+SELF_DIR="${0:A:h}"
+ROOT="${SELF_DIR:h}"
+LABEL="${HERDR_LINK_LABEL:-dev.herdr-mcp.link}"
+PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+SERVER_PLIST="$HOME/Library/LaunchAgents/dev.herdr-mcp.server.plist"
+STATE_DIR="$HOME/.config/herdr-mcp"
+LINK_KEYCHAIN_SERVICE="${HERDR_LINK_KEYCHAIN_SERVICE:-herdr-edge-dev-link-secret}"
+DEFAULT_EDGE_URL="${HERDR_EDGE_URL:-wss://herdr-edge-dev.whshang.workers.dev/ws}"
+DEFAULT_WORKSTATION_ID="${HERDR_WORKSTATION_ID:-dev-real-runtime}"
+LOG_BASENAME="${HERDR_LINK_LOG_BASENAME:-link}"
+NODE_BIN="/usr/local/bin/node"
+
+current_user() { id -un; }
+
+load_link_secret() {
+  security find-generic-password -a "$(current_user)" -s "$LINK_KEYCHAIN_SERVICE" -w
+}
+
+load_runtime_token() {
+  /usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:HERDR_MCP_TOKEN' "$SERVER_PLIST"
+}
+
+bootstrap_with_retry() {
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if launchctl bootstrap "gui/$UID" "$PLIST" 2>/tmp/herdr-link-bootstrap.err; then
+      return 0
+    fi
+    sleep 1
+  done
+  cat /tmp/herdr-link-bootstrap.err >&2 || true
+  return 1
+}
+
+cmd_run() {
+  [[ -x "$NODE_BIN" ]] || { echo "herdr-link: node missing at $NODE_BIN" >&2; exit 2; }
+  [[ -f "$ROOT/dist/link/macos-daemon.js" ]] || { echo "herdr-link: build missing; run npm run build" >&2; exit 2; }
+  [[ -f "$SERVER_PLIST" ]] || { echo "herdr-link: server launchd plist missing" >&2; exit 2; }
+  export HERDR_EDGE_URL="${HERDR_EDGE_URL:-$DEFAULT_EDGE_URL}"
+  export HERDR_WORKSTATION_ID="${HERDR_WORKSTATION_ID:-$DEFAULT_WORKSTATION_ID}"
+  export HERDR_MCP_ENDPOINT="${HERDR_MCP_ENDPOINT:-http://127.0.0.1:8772/mcp}"
+  exec "$NODE_BIN" "$ROOT/dist/link/macos-daemon.js"
+}
+
+write_plist() {
+  mkdir -p "$HOME/Library/LaunchAgents" "$STATE_DIR"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${NODE_BIN}</string>
+    <string>${ROOT}/dist/link/macos-daemon.js</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERDR_EDGE_URL</key>
+    <string>${DEFAULT_EDGE_URL}</string>
+    <key>HERDR_WORKSTATION_ID</key>
+    <string>${DEFAULT_WORKSTATION_ID}</string>
+    <key>HERDR_LINK_KEYCHAIN_SERVICE</key>
+    <string>${LINK_KEYCHAIN_SERVICE}</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>${STATE_DIR}/${LOG_BASENAME}.launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>${STATE_DIR}/${LOG_BASENAME}.launchd.err.log</string>
+</dict>
+</plist>
+EOF
+  plutil -lint "$PLIST" >/dev/null
+}
+
+cmd_install() {
+  [[ -n "$(load_link_secret)" ]] || { echo "herdr-link: Keychain link secret missing" >&2; exit 2; }
+  [[ -n "$(load_runtime_token)" ]] || { echo "herdr-link: local MCP token missing" >&2; exit 2; }
+  write_plist
+  launchctl bootout "gui/$UID/$LABEL" >/dev/null 2>&1 || true
+  sleep 1
+  bootstrap_with_retry
+  launchctl enable "gui/$UID/$LABEL"
+  echo "herdr-link: installed $LABEL"
+}
+
+cmd_uninstall() {
+  launchctl bootout "gui/$UID/$LABEL" >/dev/null 2>&1 || true
+  rm -f "$PLIST"
+  echo "herdr-link: uninstalled $LABEL"
+}
+
+cmd_start() {
+  [[ -f "$PLIST" ]] || { echo "herdr-link: not installed" >&2; exit 2; }
+  if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
+    launchctl kickstart -k "gui/$UID/$LABEL"
+  else
+    bootstrap_with_retry
+  fi
+}
+
+cmd_stop() {
+  launchctl bootout "gui/$UID/$LABEL" >/dev/null 2>&1 || true
+}
+
+cmd_restart() {
+  cmd_stop
+  sleep 1
+  bootstrap_with_retry
+}
+
+cmd_status() {
+  if launchctl print "gui/$UID/$LABEL" >/tmp/herdr-link-launchctl.txt 2>/dev/null; then
+    grep -E '^\s*(state|pid|last exit code) =' /tmp/herdr-link-launchctl.txt || true
+  else
+    echo "herdr-link: not loaded"
+    return 1
+  fi
+  if [[ -f "$STATE_DIR/${LOG_BASENAME}.launchd.err.log" ]]; then
+    echo "--- recent link log"
+    tail -n 12 "$STATE_DIR/${LOG_BASENAME}.launchd.err.log"
+  fi
+}
+
+cmd_logs() {
+  touch "$STATE_DIR/${LOG_BASENAME}.launchd.err.log"
+  tail -n 80 "$STATE_DIR/${LOG_BASENAME}.launchd.err.log"
+}
+
+case "${1:-status}" in
+  run) cmd_run ;;
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_restart ;;
+  status) cmd_status ;;
+  logs) cmd_logs ;;
+  *) echo "usage: bin/herdr-link {install|uninstall|start|stop|restart|status|logs|run}" >&2; exit 2 ;;
+esac

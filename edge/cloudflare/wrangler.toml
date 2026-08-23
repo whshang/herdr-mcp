@@ -1,0 +1,38 @@
+# herdr-edge-dev — LOCAL/DEV ONLY wrangler config.
+#
+# This is a development scaffold. It deliberately:
+#   - uses a NON-PRODUCTION worker name (herdr-edge-dev);
+#   - runs only on workers_dev (workers.dev preview subdomain), NO routes;
+#   - binds no production DNS, custom domain, or tunnel.
+# Do NOT add `routes`, change `name`, or deploy to production here.
+#
+# Production hostname/herdr-mcp.agentforme.cc.cd and DNS are owned by the
+# deployment pipeline and MUST NOT be configured in this file.
+
+name = "herdr-edge-dev"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+workers_dev = true
+# Explicitly empty: no production routes, no custom domains.
+routes = []
+
+[vars]
+EDGE_ENV = "dev"
+EDGE_PROJECT = "herdr-edge-dev"
+EDGE_VERSION = "0.1.0-dev"
+DEMO_WORKSTATION_ID = "dev-real-runtime"
+OAUTH_ISSUER = "https://herdr-mcp.agentforme.cc.cd"
+
+[durable_objects]
+bindings = [
+  { name = "WORKSTATION_DO", class_name = "WorkstationDO" },
+  { name = "OAUTH_STORE_DO", class_name = "OAuthStoreDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkstationDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["OAuthStoreDO"]

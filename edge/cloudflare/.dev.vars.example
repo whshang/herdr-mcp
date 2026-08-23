@@ -1,0 +1,12 @@
+# Local (dev-only) secrets for `wrangler dev`.
+# Copy to `.dev.vars` and CHANGE the placeholder before running dev.
+# `wrangler dev` reads .dev.vars from the config directory automatically.
+# The edge FAILS CLOSED when this secret is missing/empty.
+# NEVER commit a real value in this repo.
+LINK_SHARED_SECRET="dev-only-link-secret-change-me"
+
+# Optional dev overrides (see src/env.ts + src/limits.ts)
+# EDGE_MAX_FRAME_BYTES="1048576"
+# DEFAULT_REQUEST_TIMEOUT_MS="30000"
+# LINK_STALE_AFTER_MS="45000"
+# DEMO_WORKSTATION_ID="dev-ws1"

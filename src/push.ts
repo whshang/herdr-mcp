@@ -44,7 +44,7 @@ import { queryMcpActivity } from "./mcp-activity.js";
 
 const SETTLED = new Set(["idle", "done", "blocked"]);
 const RECONCILE_MS = 10_000;   // periodic re-seed vs cache.agentViews() (missed-event recovery)
-const HEARTBEAT_MS = 15_000;   // SSE keepalive comment (cloudflared-safe)
+const HEARTBEAT_MS = 15_000;   // SSE keepalive comment (proxy-safe)
 const OUTPUT_READ_MS = 2000;   // bounded best-effort agent.read for settled output snippet
 const OUTPUT_LINES = 40;
 const WORKING_SNIPPET_MS = 60_000; // while working, refresh output snippet at most once/min

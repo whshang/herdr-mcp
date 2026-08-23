@@ -24,7 +24,7 @@
     <key>HERDR_MCP_TOKEN</key>
     <string>REPLACE_ME_TOKEN</string>
     <key>HERDR_MCP_BASE_URL</key>
-    <string>https://xxxx.trycloudflare.com</string>
+    <string>https://herdr-edge.<your-account>.workers.dev</string>
     <key>HERDR_SOCKET_PATH</key>
     <string>REPLACE_ME_HOME/.config/herdr/herdr.sock</string>
     <key>PATH</key>

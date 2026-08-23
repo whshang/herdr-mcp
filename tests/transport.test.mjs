@@ -551,7 +551,7 @@ test("openai-mcp UA: initialize returns NO Mcp-Session-Id on / and /mcp (statele
       assert.equal(init.res.headers.get("mcp-session-id"), null,
         `openai-mcp initialize on ${p} must NOT return Mcp-Session-Id — issuing one is what goes stale after restart`);
       assert.ok(init.msg.result?.serverInfo?.name, `initialize result missing serverInfo on ${p}`);
-      assert.equal(init.msg.result?.serverInfo?.version, "0.3.26", `initialize serverInfo.version on ${p} must be 0.3.26`);
+      assert.equal(init.msg.result?.serverInfo?.version, "0.3.27", `initialize serverInfo.version on ${p} must be 0.3.27`);
       assert.equal(typeof init.msg.result?.instructions, "string",
         `initialize must carry the instructions field on ${p}`);
     }
@@ -749,7 +749,7 @@ test("openai-mcp UA: initialize/tools.list stay SSE; tools/call uses JSON", asyn
 });
 
 // Non-OpenAI discover advertises the serverInfo identity (version).
-test("server/discover (non-openai) result _meta serverInfo.version is 0.3.26", async () => {
+test("server/discover (non-openai) result _meta serverInfo.version is 0.3.27", async () => {
   for (const p of ["/", "/mcp"]) {
     const r = await fetch(`${BASE}${p}`, {
       method: "POST",
@@ -761,24 +761,24 @@ test("server/discover (non-openai) result _meta serverInfo.version is 0.3.26", a
     const si = msg.result?._meta?.["io.modelcontextprotocol/serverInfo"];
     assert.ok(si, `discover _meta serverInfo missing on ${p}`);
     assert.equal(si.name, "herdr-mcp", `discover serverInfo.name on ${p}`);
-    assert.equal(si.version, "0.3.26", `discover serverInfo.version on ${p} must be 0.3.26, got ${si.version}`);
+    assert.equal(si.version, "0.3.27", `discover serverInfo.version on ${p} must be 0.3.27, got ${si.version}`);
   }
 });
 
 // Cache-key regression: an OpenAI client that previously cached a 0.2.0
-// catalog MUST, upon seeing the new 0.3.26 identity (initialize serverInfo +
+// catalog MUST, upon seeing the new 0.3.27 identity (initialize serverInfo +
 // mcp.json + discover), re-run tools/list and obtain the current 18 tools.
-// We assert all identity surfaces agree on 0.3.26 and that a fresh tools/list
+// We assert all identity surfaces agree on 0.3.27 and that a fresh tools/list
 // returns exactly the 18 default tools (i.e. a re-fetch after a version bump
 // does NOT resurrect the old 22-tool surface).
-test("cache-key regression: 0.3.26 identity consistent, fresh tools/list = 18 (no stale 22)", async () => {
+test("cache-key regression: 0.3.27 identity consistent, fresh tools/list = 18 (no stale 22)", async () => {
   const savedSid = sessionId;
   sessionId = null;
   try {
     // initialize -> serverInfo.version
     for (const p of ["/", "/mcp"]) {
       const init = await rpc("initialize", openaiInit, { noSession: true, ua: OPENAI_UA, path: p });
-      assert.equal(init.msg.result?.serverInfo?.version, "0.3.26", `initialize ${p} version`);
+      assert.equal(init.msg.result?.serverInfo?.version, "0.3.27", `initialize ${p} version`);
       const list = await rpc("tools/list", {}, { noSession: true, ua: OPENAI_UA, path: p });
       const names = list.msg.result.tools.map((t) => t.name);
       assert.equal(names.length, 18, `fresh tools/list on ${p} must be 18 after version bump, got ${names.length}`);
@@ -789,7 +789,7 @@ test("cache-key regression: 0.3.26 identity consistent, fresh tools/list = 18 (n
     const card = await fetch(`${BASE}/.well-known/mcp.json`, { headers: { Authorization: `Bearer ${TOKEN}` } });
     assert.equal(card.status, 200);
     const cardJson = await card.json();
-    assert.equal(cardJson.version, "0.3.26", `mcp.json version must be 0.3.26, got ${cardJson.version}`);
+    assert.equal(cardJson.version, "0.3.27", `mcp.json version must be 0.3.27, got ${cardJson.version}`);
   } finally {
     sessionId = savedSid;
   }

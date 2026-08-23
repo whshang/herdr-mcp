@@ -2,6 +2,8 @@
 
 ウェブ LLM（とくに ChatGPT Connector）が本機の [Herdr](https://herdr.dev) を駆動するための MCP HTTP ゲートウェイ。ペイン / agent の確認、git 管理下のプロジェクト編集、シェル実行、安価なローカル worker への投入。Chrome 拡張が進捗 / 続行を、紐づけたウェブ会話へ打ち返す。
 
+**Docs:** https://whshang.github.io/herdr-mcp/ · **Source:** https://github.com/whshang/herdr-mcp
+
 [Herdr](https://herdr.dev) はコーディング agent 向けの端末マルチプレクサ。このリポジトリはソケットもディスクも見えない**遠隔**クライアントの入口。Herdr の約 90 個のネイティブメソッドを MCP ツールに再包装しない。
 
 **しないこと:** Herdr の代替。DeepSeek に偽の OAuth connector を付ける。拡張を公開トンネルへ出す（拡張は `127.0.0.1` のみ）。
@@ -17,9 +19,10 @@ Agents の進捗 / settled が拡張へ届き、拡張がウェブ会話へ書�
 **オーケストレーション（ウェブが計画、本機は安価）:**
 
 - `herdr_fs_*` / `herdr_git` / `herdr_exec` を優先（ローカル agent API 不要）。
-- 推論が必要なら安い/高速 worker（`pi` / `flash` / `cline` / `opencode` / `anti`）または監査（`droid` / `grok`）へ直接 `herdr_prompt`。本機 Claude/OMP/main を中間マネージャにしない。
+- 推論が必要なら Herdr-native の安い/高速 worker（`pi` / `flash` / `cline` / `opencode` / `anti`）または監査（`droid` / `grok`）へ直接 `herdr_prompt`。本機 Claude/OMP/main を中間マネージャにしない。
+- Pi/Herdr worker が使えない場合は、実測済みの `dsh --profile headless "task"` を CLI fallback にできる。ただし非自明な coding task は `herdr_exec_start` の長時間 session で実行し、timeout 後は再送前に Git/test の実結果を確認する。`dsh-tui` は人間向け interactive fallback。詳細: [worker fallbacks](docs/worker-fallbacks.md)。
 - `inspect`/`since` は既定で Claude/OMP/Codex をソフト非表示。既知 pane への prompt は可。`HERDR_MCP_AGENT_ALLOW=*` で全表示。
-- セッション開始: `herdr_inspect` → `herdr_skill`（一度）→ 作業。
+- standalone/local の既定 18-tool 面では `herdr_inspect` → `herdr_skill`（一度）→ 作業。現在の production ChatGPT Edge は contract epoch 1（17 tools）を固定し、既存 Connector を変えないため `herdr_skill` を意図的に隠します。
 
 ```mermaid
 flowchart TB
@@ -56,7 +59,7 @@ flowchart TB
 export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
 export HERDR_MCP_PORT=8772
 # 公開 Connector 用（/mcp サフィックスなし）:
-# export HERDR_MCP_BASE_URL=https://xxxx.trycloudflare.com
+# export HERDR_MCP_BASE_URL=https://herdr-edge.<your-account>.workers.dev
 node dist/server.js
 ```
 
@@ -66,7 +69,7 @@ node dist/server.js
 
 - [herdr](https://herdr.dev) がインストール済みかつ起動中
 - Node.js 20+（`node -v`）
-- ChatGPT 向け: `cloudflared` による公開 HTTPS（[Quick Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)）または自前ドメイン
+- ChatGPT 向け: Cloudflare Worker の `workers.dev` 公開 HTTPS（独自ドメインは不要）。Custom Domain は長期的に安定した URL が必要な場合のみ推奨。
 
 ### 1. 取得とビルド
 
@@ -86,33 +89,38 @@ echo "token=$HERDR_MCP_TOKEN"
 node dist/server.js
 ```
 
-### 3. ChatGPT 接続（推奨: 無料 Cloudflare）
+### 3. Cloudflare Edge 経由で ChatGPT に接続
 
-別ターミナル:
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:8772
-```
-
-その origin（**`/mcp` なし**）で MCP を再起動:
+標準構成では独自ドメインは不要です。まず Worker を `workers.dev` にデプロイします。
 
 ```bash
-export HERDR_MCP_BASE_URL=https://xxxx.trycloudflare.com
-export HERDR_MCP_TOKEN=...
-node dist/server.js
+cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
+# Worker 名、workstation ID、workers.dev origin の OAUTH_ISSUER を設定
+cd edge/cloudflare
+npx wrangler deploy --config wrangler.user.toml
 ```
 
-#### ChatGPT **Web** で Connector を追加（チャット UI / デスクトップからは不可）
+MCP URL は次の形式です。
 
-1. [Plugins 設定](https://chatgpt.com/#settings/Plugins) で Developer mode をオン
-2. [Create connector](https://chatgpt.com/plugins#settings/Connectors?create-connector=true)
-3. MCP URL は `https://xxxx.trycloudflare.com/mcp`
-4. ログインしてリダイレクトを待つ（API key / token は貼らない）
-5. 接続後は**新しい**チャットを開始
+```text
+https://herdr-edge.<your-account-subdomain>.workers.dev/mcp
+```
 
-トラブル時は `HERDR_MCP_BASE_URL` と tunnel 稼働、`herdr-mcp status` を確認。詳細: [docs/chatgpt-connector.md](docs/chatgpt-connector.md)。
+Cloudflare に独自 zone がある場合は、`herdr.example.com` のような Custom Domain を後から追加できます。これは**推奨オプションであり必須ではありません**。先に `workers.dev` 上で Worker / WSS Link / MCP / OAuth を検証してください。詳細: [Cloudflare Edge deployment](docs/cloudflare-edge-deployment.md)。
 
-Quick Tunnel は `cloudflared` 再起動でホスト名が変わる。変わったら `HERDR_MCP_BASE_URL` を更新して MCP を再起動。
+ローカル MCP を `cloudflared` / Quick Tunnel で直接公開する方式は、旧構成からの移行・トラブルシューティング用としてのみ残します。
+
+Runtime のリリースは安定した Edge/Link の背後で A/B 切り替えでき、ChatGPT Connector の変更は不要です。詳細: [Runtime A/B self-upgrade](docs/runtime-self-upgrade.md)。
+
+#### ChatGPT Web で Connector を追加
+
+1. ChatGPT 設定で Developer mode を有効化。
+2. Custom MCP Connector を作成。
+3. `workers.dev` の MCP URL、または任意の Custom Domain + `/mcp` を入力。
+4. ブラウザで OAuth を完了し、ローカル Herdr token は ChatGPT に貼らない。
+5. 接続後は新しいチャットを開始して新しい tool snapshot を取得。
+
+トラブル時は MCP URL と `OAUTH_ISSUER` が同じ安定 origin を使っていること、Edge health、`herdr-link`、OAuth discovery を確認してください。詳細: [docs/chatgpt-connector.md](docs/chatgpt-connector.md)。
 
 ### 4. Cursor（任意・同一マシン）
 
@@ -164,11 +172,11 @@ herdr-mcp watchdog status
 
 ## 既定ツール（なぜこの 18）
 
-herdr のネイティブ面は大きな Unix-socket API（`herdr api schema`）。herdr-mcp は全メソッドを MCP ツールに再包装しない。代わりに:
+herdr のネイティブ面は大きな Unix-socket API（`herdr api schema`）。herdr-mcp は全メソッドを MCP ツールに再包装しない。0.3.27 の standalone/local 既定面は 18 tools。現在の production ChatGPT Edge は既存 Connector/tool snapshot を変えないため contract epoch 1 の 17 tools を固定し、`herdr_skill` だけを隠す。代わりに:
 
 | 層 | MCP ツール | herdr との関係 |
 |---|---|---|
-| Skill | `herdr_skill` | 上流 Herdr `SKILL.md` の読み取り（このプロセスが GitHub を取る。ChatGPT は取らない） |
+| Skill | `herdr_skill` | 上流 Herdr `SKILL.md` の読み取り。ツールが catalog にある時だけ各 session で使用する。production contract epoch 1 では意図的に非表示。 |
 | Passthrough | `herdr_methods`, `herdr_call` | ネイティブ socket API への薄いゲート |
 | リモート編成 | `herdr_inspect`, `herdr_since`, `herdr_prompt` | ウェブ向け小さなヘルパ |
 | リモート workstation | `herdr_fs_*`, `herdr_exec` / `herdr_exec_*`, `herdr_git` | オフマシンクライアント向けのディスク/シェル面 |

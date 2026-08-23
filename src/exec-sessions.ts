@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { enrichedUserEnv } from "./user-path.js";
 
 const MAX_BUFFER = 512 * 1024;
 const SESSION_TTL_MS = 60 * 60_000;
@@ -174,9 +175,10 @@ export function startExecSession(opts: {
 }): ExecSession {
   prune();
   const id = `es_${randomUUID().slice(0, 12)}`;
+  const childEnv = enrichedUserEnv({ ...process.env, ...opts.env });
   const proc = spawn("/bin/zsh", ["-lc", opts.command], {
     cwd: opts.cwd,
-    env: { ...process.env, ...opts.env, HERDR_MCP_EXEC_ID: id },
+    env: { ...childEnv, HERDR_MCP_EXEC_ID: id },
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
   });

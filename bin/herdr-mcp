@@ -45,7 +45,7 @@ get_public_url() {
   if [[ -n "$base" ]]; then
     echo "${base%/}/mcp"
   else
-    # No hardcoded personal domain — README recommends free *.trycloudflare.com
+    # No hardcoded personal domain — README recommends the user's own workers.dev Edge.
     echo ""
   fi
 }
@@ -168,9 +168,9 @@ cmd_connector() {
     echo "  Claude  : $pub              (OAuth / DCR)"
   else
     echo "  $(T public_unset_line)"
-    echo "  $(T recommend_tunnel)"
-    echo "            → https://xxxx.trycloudflare.com"
-    echo "            HERDR_MCP_BASE_URL + restart; MCP URL = …/mcp"
+    echo "  $(T recommend_edge)"
+    echo "            → https://<worker>.<account>.workers.dev/mcp"
+    echo "            set HERDR_MCP_BASE_URL to the Worker origin; Custom Domain is optional"
   fi
   echo "  Local   : $LOCAL_URL"
   echo "  Token   : $token"

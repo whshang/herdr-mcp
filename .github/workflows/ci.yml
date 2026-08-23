@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Build documentation site
+        run: npm run build:site
+      - run: npm test
+      - run: npm run test:edge
+      - name: Browser extension smoke
+        run: node tests/manual/extension_smoke.mjs
+      - name: Shell syntax
+        run: bash -n bin/herdr-mcp bin/watchdog.sh bin/lib/i18n.sh
+      - name: Package surface
+        run: npm pack --dry-run
+      - name: Diff hygiene
+        run: git diff --check

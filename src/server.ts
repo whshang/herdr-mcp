@@ -60,6 +60,8 @@ import {
 import { commitAtomic } from "./atomic-files.js";
 import { runLocalShell } from "./local-exec.js";
 import { fetchHerdrSkill, herdrSkillPointer } from "./herdr-skill.js";
+import { EPOCH1_TOOL_OVERRIDES } from "./epoch1-tool-overrides.js";
+import { enrichedUserEnv } from "./user-path.js";
 
 /** Process boot id — returned by inspect/since so clients detect cursor reset. */
 const BOOT_ID = randomUUID().slice(0, 12);
@@ -71,12 +73,21 @@ const SDK_WIRE_PROTOCOL = "2025-11-25";
 // Config from environment (mirrors server.py)
 // ---------------------------------------------------------------------------
 const PORT = Number(process.env.HERDR_MCP_PORT ?? "8772");
-const BASE_URL = process.env.HERDR_MCP_BASE_URL ?? ""; // e.g. https://xxxx.trycloudflare.com
+const BASE_URL = process.env.HERDR_MCP_BASE_URL ?? ""; // e.g. https://herdr-edge.<account>.workers.dev or a Custom Domain
 const AUTH_TOKEN = process.env.HERDR_MCP_TOKEN ?? "";
 // Tool-surface switch: default exposes the lean 18-tool surface; HERDR_MCP_ALL_TOOLS=1
 // additionally registers advanced + deprecated lifecycle tools (wait/task/session/handoff/
 // reap/parallel/read/explain/prompt_status/transcript/diff) — 30 total.
 const ALL_TOOLS = process.env.HERDR_MCP_ALL_TOOLS === "1";
+// Public ABI compatibility profile. `epoch1` keeps the exact 0.3.23/17-tool
+// ChatGPT-visible metadata while allowing newer runtime implementation code.
+// It is mutually exclusive with ALL_TOOLS because advanced tools necessarily
+// change the public contract.
+const CONTRACT_PROFILE = process.env.HERDR_MCP_CONTRACT_PROFILE?.trim() || "current";
+const EPOCH1_CONTRACT_PROFILE = CONTRACT_PROFILE === "epoch1";
+if (EPOCH1_CONTRACT_PROFILE && ALL_TOOLS) {
+  throw new Error("HERDR_MCP_CONTRACT_PROFILE=epoch1 cannot be combined with HERDR_MCP_ALL_TOOLS=1");
+}
 // E: authorization switches. READONLY blocks every mutating operation;
 // WRITE_ROOTS (csv) limits mutations to listed roots (unset = all managed roots).
 // P0-2: idempotency records for herdr_prompt — a replay with the same key
@@ -646,11 +657,42 @@ function resolveDiffTargets(
 
 // ---------------------------------------------------------------------------
 function registerTools(server: McpServer): void {
+  // Keep one implementation while allowing the production runtime to advertise
+  // the exact frozen epoch-1 metadata. The shim only changes registration
+  // metadata; handlers and runtime behavior remain current.
+  const registerToolCompat = ((name: string, config: any, handler: any) => {
+    if (EPOCH1_CONTRACT_PROFILE && name === "herdr_skill") return undefined;
+    let next = config;
+    if (EPOCH1_CONTRACT_PROFILE) {
+      const override = (EPOCH1_TOOL_OVERRIDES as Record<string, any>)[name];
+      if (override?.description) next = { ...next, description: override.description };
+      if (name === "herdr_call" && override?.methodDescription && next?.inputSchema?.method?.describe) {
+        next = {
+          ...next,
+          inputSchema: {
+            ...next.inputSchema,
+            method: next.inputSchema.method.describe(override.methodDescription),
+          },
+        };
+      }
+      if (name === "herdr_prompt" && override?.targetDescription && next?.inputSchema?.target?.describe) {
+        next = {
+          ...next,
+          inputSchema: {
+            ...next.inputSchema,
+            target: next.inputSchema.target.describe(override.targetDescription),
+          },
+        };
+      }
+    }
+    return (server.registerTool as any)(name, next, handler);
+  }) as typeof server.registerTool;
+
   /** Remind web clients to read Herdr agent SKILL before pane/agent orchestration. */
   const SKILL_BEFORE_AGENT =
     "Before any agent operation (herdr_prompt or agent.* via herdr_call): call herdr_skill once per session first. ";
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_methods",
     {
       description:
@@ -672,7 +714,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_inspect",
     {
       description:
@@ -756,15 +798,25 @@ function registerTools(server: McpServer): void {
         const managed = managedRoots(snap);
         const which = (bin: string): string | null => {
           try {
-            return execSync(`command -v ${bin}`, { timeout: 500, stdio: ["ignore", "pipe", "ignore"] })
-              .toString().trim() || null;
+            return execSync(`command -v ${bin}`, {
+              timeout: 500,
+              stdio: ["ignore", "pipe", "ignore"],
+              env: enrichedUserEnv(process.env),
+            }).toString().trim() || null;
           } catch { return null; }
         };
         view["workstation_info"] = {
           server_name: SERVER_NAME,
           server_version: SERVER_VERSION,
           boot_id: BOOT_ID,
-          agent_skill: herdrSkillPointer(),
+          agent_skill: EPOCH1_CONTRACT_PROFILE
+            ? {
+                available: "false",
+                deferred_tool: "herdr_skill",
+                contract_profile: "epoch1",
+                hint: "Runtime includes herdr_skill, but the current ChatGPT contract epoch intentionally hides it to preserve the existing 17-tool ABI.",
+              }
+            : herdrSkillPointer(),
           default_cwd: typeof view["focused_pane"] === "string"
             ? ((view["panes"] as { id?: string; cwd?: string }[] | undefined)?.find((p) => p.id === view["focused_pane"])?.cwd
               ?? (view["workspaces"] as { focused?: boolean; cwd?: string }[] | undefined)?.find((w) => w.focused)?.cwd
@@ -783,8 +835,10 @@ function registerTools(server: McpServer): void {
               rg: which("rg"),
               npm: which("npm"),
               python3: which("python3"),
+              dsh: which("dsh"),
+              dsh_tui: which("dsh-tui"),
             },
-            hint: "Short sync shell: herdr_exec. Long jobs: herdr_exec_start → herdr_exec_read → herdr_exec_kill. Git facts: herdr_git. Patches: herdr_fs_patch.",
+            hint: "Short sync shell: herdr_exec. Long jobs: herdr_exec_start → herdr_exec_read → herdr_exec_kill. Git facts: herdr_git. Patches: herdr_fs_patch. Agent order: Pi/Herdr-native worker first; if unavailable and dsh exists, run dsh --profile headless via a long exec session; dsh-tui is for human-interactive takeover.",
           },
         };
         if (warnings.length) view["warnings"] = warnings;
@@ -798,29 +852,36 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_skill",
     {
       description:
-        "Read-only: fetch the latest Herdr agent SKILL.md from upstream (herdr master branch, " +
-        "not version-pinned). Call ONCE per ChatGPT session BEFORE herdr_call or native " +
-        "agent/pane orchestration — learn pane/agent IDs, lifecycle states, and CLI semantics. " +
-        "Returns upstream herdr master when reachable; otherwise the bundled copy shipped " +
-        "with herdr-mcp (origin field: network | cache | bundled). ChatGPT does not fetch " +
-        "GitHub — only this server does. Cached ~1h; refresh=true bypasses cache; " +
-        "HERDR_SKILL_NETWORK=0 skips network.",
+        "Read-only dynamic operating skill for a remote/web herdr-mcp planner. It combines: " +
+        "(1) the herdr-mcp project policy for tool order, direct fs/git/exec edits, cheap-agent " +
+        "dispatch, mutation/idempotency rules and self-upgrade; (2) live runtime / generation / " +
+        "self-update status; and, by default, (3) the installed release-matched `herdr --skill` " +
+        "as explicitly scoped native reference. The project policy has precedence because a web " +
+        "planner is outside HERDR_ENV. Project policy can refresh from the herdr-mcp repository " +
+        "with a bundled release fallback. Call once near session start and refresh after a " +
+        "herdr-mcp upgrade or when operating rules may have changed.",
       inputSchema: {
-        refresh: z.boolean().default(false).describe("Bypass cache and re-fetch from upstream"),
+        refresh: z.boolean().default(false).describe("Bypass the project-skill cache and re-check the configured upstream policy"),
+        include_native_reference: z.boolean().default(true).describe(
+          "Append release-matched `herdr --skill` output as scoped native reference; disable to save context",
+        ),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ refresh }) => {
-      const result = await fetchHerdrSkill({ refresh });
+    async ({ refresh, include_native_reference }) => {
+      const result = await fetchHerdrSkill({
+        refresh,
+        includeNativeReference: include_native_reference,
+      });
       return toResult(result);
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_call",
     {
       description:
@@ -885,7 +946,7 @@ function registerTools(server: McpServer): void {
   );
 
   if (ALL_TOOLS) {
-  server.registerTool(
+  registerToolCompat(
     "herdr_wait",
     {
       description:
@@ -970,7 +1031,7 @@ function registerTools(server: McpServer): void {
         return toResult({ ok: false, code: err.code, message: err.message });
       }
   };
-  server.registerTool(
+  registerToolCompat(
     "herdr_task",
     {
       description:
@@ -983,7 +1044,7 @@ function registerTools(server: McpServer): void {
     },
     taskSessionHandler,
   );
-  server.registerTool(
+  registerToolCompat(
     "herdr_session",
     {
       description: "DEPRECATED alias of herdr_task (removed next version) — use herdr_task.",
@@ -1023,7 +1084,7 @@ function registerTools(server: McpServer): void {
       hint: `new conversation: call herdr_task("${session}", resume=true)`,
     });
   };
-  server.registerTool(
+  registerToolCompat(
     "herdr_task_handoff",
     {
       description:
@@ -1034,7 +1095,7 @@ function registerTools(server: McpServer): void {
     },
     taskHandoffHandler,
   );
-  server.registerTool(
+  registerToolCompat(
     "herdr_handoff",
     {
       description: "DEPRECATED alias of herdr_task_handoff (removed next version) — use herdr_task_handoff.",
@@ -1043,7 +1104,7 @@ function registerTools(server: McpServer): void {
     taskHandoffHandler,
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_parallel",
     {
       description:
@@ -1333,7 +1394,7 @@ function registerTools(server: McpServer): void {
         ...(closeError ? { close_error: closeError } : {}),
       });
   };
-  server.registerTool(
+  registerToolCompat(
     "herdr_task_reap",
     {
       description:
@@ -1346,7 +1407,7 @@ function registerTools(server: McpServer): void {
     },
     taskReapHandler,
   );
-  server.registerTool(
+  registerToolCompat(
     "herdr_reap",
     {
       description: "DEPRECATED alias of herdr_task_reap (removed next version) — use herdr_task_reap.",
@@ -1355,7 +1416,7 @@ function registerTools(server: McpServer): void {
     taskReapHandler,
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_read",
     {
       description:
@@ -1394,7 +1455,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_explain",
     {
       description:
@@ -1421,7 +1482,7 @@ function registerTools(server: McpServer): void {
   );
   }
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_since",
     {
       description:
@@ -1657,7 +1718,7 @@ function registerTools(server: McpServer): void {
     }
   }
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_fs_read",
     {
       description:
@@ -1720,7 +1781,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_fs_list",
     {
       description:
@@ -1789,7 +1850,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_fs_grep",
     {
       description:
@@ -1913,7 +1974,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_fs_patch",
     {
       description:
@@ -2055,7 +2116,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_fs_image",
     {
       description:
@@ -2106,7 +2167,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_git",
     {
       description:
@@ -2198,7 +2259,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_exec_start",
     {
       description:
@@ -2236,7 +2297,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_exec_read",
     {
       description:
@@ -2256,7 +2317,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_exec_kill",
     {
       description: "Terminate a herdr_exec_start session (SIGTERM then SIGKILL).",
@@ -2271,7 +2332,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_exec",
     {
       description:
@@ -2620,7 +2681,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_fs_edit",
     {
       description:
@@ -2674,7 +2735,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_fs_write",
     {
       description:
@@ -2723,7 +2784,7 @@ function registerTools(server: McpServer): void {
         ...(working.length > 0 ? { warnings: { working } } : {}) });
     },
   );
-  server.registerTool(
+  registerToolCompat(
     "herdr_prompt",
     {
       description:
@@ -2887,7 +2948,7 @@ function registerTools(server: McpServer): void {
   );
 
   if (ALL_TOOLS) {
-  server.registerTool(
+  registerToolCompat(
     "herdr_prompt_status",
     {
       description:
@@ -2914,7 +2975,7 @@ function registerTools(server: McpServer): void {
   );
 
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_transcript",
     {
       description:
@@ -2963,7 +3024,7 @@ function registerTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
+  registerToolCompat(
     "herdr_diff",
     {
       description:

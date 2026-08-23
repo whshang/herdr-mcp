@@ -40,6 +40,7 @@
 
 1. 加载 `extension/`
 2. 选项填 `http://127.0.0.1:8772` 与 `herdr-mcp token`（扩展只连本机，用 `/push/events` 与 `/push/state`，不走 Cloudflare）
+   - 这与公网 Worker 使用 17-tool epoch1 或未来新 contract epoch 无关；扩展不读取 ChatGPT `tools/list`。
 3. 打开目标对话（chatgpt / deepseek / z.ai / claude）
 4. popup：**绑定**将要干活的 **workspace**（列表显示 herdr **label**，如 `novo (w5A)`；含仅开终端、无 agent 的窗格；space 内任意 agent 有进展都会回推）
 5. 再派活

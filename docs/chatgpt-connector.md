@@ -17,8 +17,10 @@ ChatGPT 有两层：
 
 - ChatGPT 用的资源地址：`{HERDR_MCP_BASE_URL}/mcp`
 - Issuer / OAuth 发现：`{HERDR_MCP_BASE_URL}`（环境变量不要带 `/mcp` 后缀）
-- 默认免费公网：Cloudflare Quick Tunnel `*.trycloudflare.com`
-- 改公网源后要重启 herdr-mcp，让 JWT 的 `iss` / `aud` 对齐
+- 默认公网：Cloudflare Worker 的 `workers.dev`，不要求自有域名
+- 已有 Cloudflare zone 时建议绑定 Custom Domain 作为长期稳定 origin，但不是前置条件
+- Quick Tunnel / 直接 `cloudflared` 只作为旧架构迁移或故障排查，不再是新安装默认路径
+- 改公网 origin 时必须同步 OAuth issuer/resource；正常 runtime 升级不应改变这个稳定地址
 
 ## 工具权限卡：「允许 ChatGPT 使用 herdr？」
 
@@ -90,13 +92,13 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 
 改工具面或握手时 bump `SERVER_VERSION` / `package.json`，逼客户端重新 `tools/list`。
 
-**不要以本文数字为准。** 以正在跑的进程 `/.well-known/mcp.json` 的 `version` 为准（应等于 `package.json` / `src/version.ts`）。对不上就重启公网进程。若工具描述仍缺 `herdr_fs_write.overwrite`、看不到 `inspect.exec_sessions`、或没有 `herdr_skill`：
+**不要只以本文数字为准。** runtime 版本以 `/.well-known/mcp.json` / `initialize.serverInfo.version` 为准；工具目录还要看当前 contract profile。0.3.27 独立/本地默认是 18 tools，但当前 production ChatGPT Edge 明确冻结 contract epoch 1 为 17 tools，所以**看不到 `herdr_skill` 是预期行为，不代表 runtime 没升级**。若其它字段仍落后（例如缺 `herdr_fs_write.overwrite`、看不到 `inspect.exec_sessions`）：
 
 1. 确认 `mcp.json` 的 `version` 已是当前构建
 2. ChatGPT 里刷新 / 重连 connector
 3. **开新对话**（旧对话会锁住旧 `tools/list` 快照）
 
-输入字段落后（尤其 `overwrite`）会导致「能建文件、不能按契约覆盖」。会话开始：`herdr_inspect` → `herdr_skill`（一次）→ 再 `herdr_call` / `herdr_prompt`。
+输入字段落后（尤其 `overwrite`）会导致「能建文件、不能按契约覆盖」。会话开始先 `herdr_inspect`；若当前 catalog 暴露 `herdr_skill`，再读一次 skill；production epoch 1 没有该工具时直接继续 `herdr_call` / `herdr_prompt`。
 
 ## 「TaskGroup」/ omp 挂了却说读不了文件
 
@@ -122,7 +124,7 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 
 | 优先级 | 做法 | 本地 agent API |
 |---|---|---|
-| 0 | `herdr_inspect` 然后 `herdr_skill`（每会话一次） | 不消耗 |
+| 0 | `herdr_inspect`；若当前 catalog 有 `herdr_skill`，每会话再调用一次 | 不消耗 |
 | 1 | `herdr_fs_*` / `herdr_exec` 读改搜跑 | 不消耗 |
 | 2 | `herdr_prompt` → 便宜/高速 worker（pi、flash…），任务自包含 | 只烧便宜模型 |
 | 禁止默认 | `herdr_prompt` → Claude/OMP/main 再让它指挥其他窗格 | 贵模型大头 |

@@ -1,0 +1,584 @@
+/** Frozen ChatGPT-visible MCP contract epoch 1, captured from live herdr-mcp 0.3.23. */
+export const EPOCH1_CONTRACT = {
+  "contract_epoch": 1,
+  "contract_hash": "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d",
+  "tool_count": 17,
+  "tools": [
+    {
+      "description": "Generic passthrough to the herdr socket API, VALIDATED against the live schema (schema reflected from the installed herdr binary, 60s cache). Params are checked before sending: missing required / wrong type / wrong enum -> invalid_params error (no socket call); unknown params -> warnings. Call herdr_methods first when the schema is unknown; prefer explicit pane_id/workspace_id over bare names. For agent.prompt prefer herdr_prompt (fire-and-forget + idempotency_key + delivery evidence); do not pass wait on mutations unless you intentionally want submit+wait. Never blind-retry a mutating call after failure — delivery may be uncertain; verify with herdr_inspect / herdr_since first. Status-wait timeouts are failure agent_status_wait_timeout (not herdr_transport).",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "method": {
+            "description": "herdr socket method, e.g. pane.split, agent.start",
+            "type": "string"
+          },
+          "params": {
+            "description": "Method arguments as a JSON object string; omit for {}",
+            "type": "string"
+          }
+        },
+        "required": [
+          "method"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_call"
+    },
+    {
+      "description": "Run a shell command on the workstation inside the target workspace's persistent, VISIBLE utility pane (label 'herdr-mcp:utility'; created once, reused — not headless, observable in herdr). The command always runs inside a selected project root — explicit project_root, or the workspace's single current project root — via an explicit subshell cd; it never depends on the pane's current foreground_cwd. When the workspace has MULTIPLE project roots and project_root is omitted, the call is REFUSED and returns candidates (one of them is the exact value to pass next). Gated by HERDR_MCP_READONLY / HERDR_MCP_WRITE_ROOTS. If any agent in that project is working, refused unless confirm_busy:true (returns warnings.working). Freeform shell is NOT secret-path gated (unlike herdr_fs_* — a command can still read .env); prefer fs tools for file IO. Returns exit_code + effective_cwd/project_root + stripped output. On timeout the command may still be running in the pane; partial output is returned with ok:false code:exec_timeout. If herdr control-plane TaskGroup/ExceptionGroup blocks pane ops BEFORE the command is delivered, automatically falls back to a local zsh process (backend:local_fallback) — same cwd/gates, no double-run. After send_text, never re-sends or falls back.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "command": {
+            "description": "Shell command line to run in the utility pane",
+            "type": "string"
+          },
+          "confirm_busy": {
+            "default": false,
+            "description": "Force exec even when an agent in the project is working (returns warnings.working)",
+            "type": "boolean"
+          },
+          "project_root": {
+            "description": "Explicit project root within this workspace (workspaces[].projects[].root from herdr_inspect). REQUIRED when the workspace has multiple project roots; the command runs with this root as cwd via subshell cd",
+            "type": "string"
+          },
+          "timeout_ms": {
+            "default": 30000,
+            "maximum": 60000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "workspace": {
+            "description": "workspace_id or label (from herdr_inspect)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace",
+          "command"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_exec"
+    },
+    {
+      "description": "Terminate a herdr_exec_start session (SIGTERM then SIGKILL).",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_exec_kill"
+    },
+    {
+      "description": "Read stdout/stderr from a herdr_exec_start session. Pass offset=next_offset to continue. running=false when the process has exited.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "limit": {
+            "maximum": 262144,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "stream": {
+            "default": "both",
+            "enum": [
+              "stdout",
+              "stderr",
+              "both"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_exec_read"
+    },
+    {
+      "description": "Start a long-running shell command in a managed project root as a background session (local process, not the herdr utility pane). Returns session_id. Then poll with herdr_exec_read and finish with herdr_exec_kill. For short commands prefer herdr_exec.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "command": {
+            "description": "Shell command line",
+            "type": "string"
+          },
+          "confirm_busy": {
+            "default": false,
+            "type": "boolean"
+          },
+          "root": {
+            "description": "Managed git project root used as cwd",
+            "type": "string"
+          }
+        },
+        "required": [
+          "root",
+          "command"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_exec_start"
+    },
+    {
+      "description": "Edit a file on the workstation by EXACT unique string replacement (never whole-file overwrite). Gates: managed-root path validation (same as herdr_fs_read); if any agent in the file's project is working -> refused by default (listed); confirm_busy:true forces continue and returns warnings.working. If the file has uncommitted git changes -> requires confirm_dirty:true. old_string must match exactly once.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "confirm_busy": {
+            "default": false,
+            "description": "Force edit even when an agent in the project is working (returns warnings.working)",
+            "type": "boolean"
+          },
+          "confirm_dirty": {
+            "default": false,
+            "description": "Acknowledge editing a git-dirty file",
+            "type": "boolean"
+          },
+          "new_string": {
+            "description": "Replacement text",
+            "type": "string"
+          },
+          "old_string": {
+            "description": "Exact text to replace (must be unique in the file)",
+            "type": "string"
+          },
+          "path": {
+            "description": "Absolute file path inside a managed project root",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "old_string",
+          "new_string"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_fs_edit"
+    },
+    {
+      "description": "Content-search inside a MANAGED (git) project root on the workstation. Gates: root/path must be inside a git-backed project root from the live snapshot; secret-ish files are excluded. Prefers ripgrep (rg) when available, else falls back to a Node traversal. Returns matching lines with file/line/content; truncated:true when the match budget or byte budget is hit.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "case_insensitive": {
+            "default": false,
+            "description": "Case-insensitive match (default false)",
+            "type": "boolean"
+          },
+          "glob": {
+            "description": "Optional glob filter on file names (e.g. '*.ts')",
+            "type": "string"
+          },
+          "max_bytes": {
+            "description": "Per-file byte ceiling (default 65536)",
+            "maximum": 1048576,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_matches": {
+            "description": "Max matches returned (default 50)",
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "pattern": {
+            "description": "Search pattern (literal string, or regex when regex:true)",
+            "type": "string"
+          },
+          "regex": {
+            "default": false,
+            "description": "Treat pattern as a regular expression (default false)",
+            "type": "boolean"
+          },
+          "root": {
+            "description": "Absolute directory path inside a managed project root to search",
+            "type": "string"
+          }
+        },
+        "required": [
+          "root",
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_fs_grep"
+    },
+    {
+      "description": "Read an image under a managed git root and return it as an MCP image (plus JSON metadata). Use for screenshots/UI assets so the web model can see pixels without a local agent.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "max_bytes": {
+            "description": "Byte ceiling (default 2097152)",
+            "maximum": 8000000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Absolute image path inside a managed project root",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_fs_image"
+    },
+    {
+      "description": "List a directory inside a MANAGED (git) project root on the workstation. Gates: path must be an existing directory inside a git-backed project root from the live snapshot (same validation as herdr_fs_read); secret-ish files (.env*, *.pem, id_rsa*, *.key, .git/config, *secret*/*token*/*credential*) are skipped; .git is always skipped. Returns name/type(file|dir|symlink)/size?/mtime? per entry. recursive:true walks subdirectories (bounded by max_entries).",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "glob": {
+            "description": "Optional glob filter on entry names (e.g. '*.ts')",
+            "type": "string"
+          },
+          "max_entries": {
+            "description": "Max entries returned (default 200)",
+            "maximum": 2000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Absolute directory path inside a managed project root",
+            "type": "string"
+          },
+          "recursive": {
+            "default": false,
+            "description": "Recursively list subdirectories (default false)",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_fs_list"
+    },
+    {
+      "description": "Apply a coding-tools/Codex-style patch (*** Begin Patch / *** End Patch) inside a managed git root. Prefer this over herdr_fs_edit for multi-hunk / multi-file edits. Paths in the patch may be absolute or relative to root. dry_run:true validates without writing. Same dirty/busy gates as herdr_fs_edit when applying.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "confirm_busy": {
+            "default": false,
+            "type": "boolean"
+          },
+          "confirm_dirty": {
+            "default": false,
+            "type": "boolean"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "patch": {
+            "description": "Full *** Begin Patch ... *** End Patch text",
+            "type": "string"
+          },
+          "root": {
+            "description": "Managed git project root (absolute)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "root",
+          "patch"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_fs_patch"
+    },
+    {
+      "description": "PREFERRED way to read project source on the workstation. Reads a file from a MANAGED (git) project root (remote-workstation layer — the client cannot reach these files otherwise). Do not use herdr_prompt / omp / agent.read for ordinary file IO. Gates: path must sit inside a git-backed project root from the live snapshot ($HOME / non-git roots refused); secret-ish files (.env*, *.pem, id_rsa*, *.key, .git/config, *secret*/*token*/*credential*) denied; budget defaults to 200 lines / 16KB — raise explicitly (cap 256KB). Diff-sized reads are cheap; whole-source reads are not.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "end_line": {
+            "description": "1-based last line (default start+199)",
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_bytes": {
+            "description": "Byte ceiling (default 16384, cap 262144)",
+            "maximum": 262144,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Absolute file path inside a managed project root",
+            "type": "string"
+          },
+          "start_line": {
+            "description": "1-based first line (default 1)",
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_fs_read"
+    },
+    {
+      "description": "Create a new file (or explicitly overwrite a clean tracked one) on the workstation. Same gates as herdr_fs_edit (managed root, no working agent by default, dirty needs confirm). confirm_busy:true forces write even when an agent is working and returns warnings.working. For surgical changes prefer herdr_fs_edit; this is for new files and full rewrites.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "confirm_busy": {
+            "default": false,
+            "description": "Force write even when an agent in the project is working (returns warnings.working)",
+            "type": "boolean"
+          },
+          "confirm_dirty": {
+            "default": false,
+            "description": "Acknowledge overwriting a git-dirty existing file",
+            "type": "boolean"
+          },
+          "content": {
+            "description": "Full file content",
+            "type": "string"
+          },
+          "overwrite": {
+            "default": false,
+            "description": "Required true when overwriting an existing file",
+            "type": "boolean"
+          },
+          "path": {
+            "description": "Absolute target path inside a managed project root",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_fs_write"
+    },
+    {
+      "description": "Deterministic git facts for a managed root — prefer this over herdr_prompt to a local agent. action=status|diff|log. Runs local git (PAGER=cat); if herdr snapshot/managed-roots gate blips (TaskGroup), still serves repos under $HOME with a warnings[] mark. Web planner should call this itself to verify changes.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "action": {
+            "description": "Git action",
+            "enum": [
+              "status",
+              "diff",
+              "log"
+            ],
+            "type": "string"
+          },
+          "max_bytes": {
+            "description": "Output byte ceiling (default 65536)",
+            "maximum": 512000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_count": {
+            "description": "log -n (default 20)",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Optional path for diff (repo-relative or absolute under root)",
+            "type": "string"
+          },
+          "root": {
+            "description": "Managed git project root (absolute)",
+            "type": "string"
+          },
+          "staged": {
+            "default": false,
+            "description": "diff --staged when action=diff",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "root",
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_git"
+    },
+    {
+      "description": "Check herdr connection and list workspaces (with cwd), tabs, panes, and agents in one call. Also returns workstation_info: default_cwd hints, server/build, readonly/write_roots, and a short exec_environment summary (PATH binaries relevant to local coding). Agents come from the shared SnapshotCache (live events + 30s snapshot fallback) and carry started_at + last_activity_at. If session.snapshot blips (TaskGroup), falls back to workspace.list / pane.list / agent.list and sets warnings[] — do not treat that as a repo blocker; keep using herdr_fs_* / herdr_git / herdr_exec. YOU (web) are the planner/orchestrator. Prefer herdr_fs_* / herdr_exec / herdr_git before any herdr_prompt. Agent lists soft-hide expensive kinds (Claude/OMP/Codex); only allowlisted workers (pi, cline, opencode, anti) and auditors (droid, grok) appear — override with HERDR_MCP_AGENT_ALLOW. herdr_prompt by known name/pane_id is NOT blocked. Prefer explicit pane_id/workspace_id from this view.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "herdr_inspect"
+    },
+    {
+      "description": "Discover herdr socket API methods and parameter schemas. LIVE reflection from the installed herdr binary (herdr api schema, 60s cached). Use before herdr_call when you don't know the exact method or argument names.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "query": {
+            "default": "",
+            "description": "Optional case-insensitive filter: agent, pane.read, worktree, etc.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "herdr_methods"
+    },
+    {
+      "description": "Send a prompt to a herdr agent via socket agent.prompt (NEVER pane.send_text). Prefer herdr_fs_* / herdr_exec when the work is deterministic file/shell IO (no local API burn). Target a cheap/fast worker (pi, flash, …) with a self-contained task; do NOT prompt Claude/OMP/main to plan or to command other panes — the web client owns orchestration. DEFAULT: fire-and-forget (omit wait); confirm with herdr_since / herdr_inspect. Strongly prefer idempotency_key (replays return stored result; never auto-retried). Returns delivery evidence: submitted, before/after, state_observation ({changed:true|false|\"unknown\", fresh}), plus legacy state_changed. Blocked target -> status 'agent_blocked', submitted:false. Optional wait {until, timeout_ms} is submit+wait; a status-wait timeout is failure_phase post_submission_status_wait (not a socket transport failure) — verify before re-sending. Worker invariant: project root == pane cwd == foreground cwd.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "idempotency_key": {
+            "description": "STRONGLY RECOMMENDED client key; replay returns stored result without re-sending",
+            "type": "string"
+          },
+          "target": {
+            "description": "Agent name or pane_id to prompt",
+            "type": "string"
+          },
+          "text": {
+            "description": "Prompt text (multi-line/CJK safe; the server owns submission)",
+            "type": "string"
+          },
+          "wait": {
+            "description": "OPTIONAL submit+wait — omit for fire-and-forget (recommended)",
+            "properties": {
+              "timeout_ms": {
+                "description": "Wait budget (max 60s); default 25s when wait is given",
+                "maximum": 60000,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "until": {
+                "description": "Agent statuses that end the wait",
+                "items": {
+                  "enum": [
+                    "idle",
+                    "working",
+                    "blocked",
+                    "done",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "target",
+          "text"
+        ],
+        "type": "object"
+      },
+      "name": "herdr_prompt"
+    },
+    {
+      "description": "Incremental digest since a cursor — cheap conversation-resume primitive (❺). MCP clients only run when the user sends a message, so polling is not an option; pass the cursor from your last call to get only NEW events. Returns: events[] (pane/workspace/tab changes with cursor+at), current agents[] (status/started_at/last_activity_at/cwd), workspaces[], and a new cursor. First call (cursor=0) returns the recent tail. The server keeps a live events.subscribe stream (A-2) so this is a single round-trip instead of inspect+read+explain. Events/agents carry explicit pane_id/workspace_id — prefer those IDs over labels when addressing targets later.",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "cursor": {
+            "default": 0,
+            "description": "Cursor from a previous herdr_since (0 = first call)",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "workspace": {
+            "description": "Optional: filter events + agents to this workspace_id or label",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "herdr_since"
+    }
+  ]
+} as const;

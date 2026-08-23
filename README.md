@@ -2,6 +2,10 @@
 
 MCP HTTP gateway so ChatGPT (and other web LLMs) can drive local [Herdr](https://herdr.dev): inspect panes and agents, edit git-managed projects, run shells, and prompt cheap on-machine workers. A Chrome extension types progress / continue back into the bound web chat.
 
+**Docs:** https://whshang.github.io/herdr-mcp/ · **Source:** https://github.com/whshang/herdr-mcp
+
+[![CI](https://github.com/whshang/herdr-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/whshang/herdr-mcp/actions/workflows/ci.yml) [![GitHub Pages](https://github.com/whshang/herdr-mcp/actions/workflows/pages.yml/badge.svg)](https://github.com/whshang/herdr-mcp/actions/workflows/pages.yml) [![Cloudflare Edge](https://github.com/whshang/herdr-mcp/actions/workflows/cloudflare-edge.yml/badge.svg)](https://github.com/whshang/herdr-mcp/actions/workflows/cloudflare-edge.yml)
+
 [Herdr](https://herdr.dev) is a terminal multiplexer for coding agents. This repo is the door for **remote** clients that cannot see your socket or disk. It does **not** re-wrap Herdr’s ~90 native methods as MCP tools.
 
 **This repo does not:** replace Herdr; give DeepSeek a fake OAuth connector; send the extension over the public tunnel (it talks to `127.0.0.1` only).
@@ -17,9 +21,10 @@ Agents’ progress / settled events reach the extension; the extension ↻ types
 **Orchestration (web plans, local stays cheap):**
 
 - Prefer `herdr_fs_*` / `herdr_git` / `herdr_exec` (no local-agent API).
-- If reasoning is required, `herdr_prompt` a cheap/fast worker (`pi`, `flash`, `cline`, `opencode`, `anti`) or auditor (`droid`, `grok`) — do not route through local Claude/OMP/main.
+- If reasoning is required, prefer `herdr_prompt` to a cheap/fast Herdr worker (`pi`, `flash`, `cline`, `opencode`, `anti`) or auditor (`droid`, `grok`) — do not route through local Claude/OMP/main.
+- If Pi/Herdr workers are unavailable, `dsh --profile headless "job"` is a tested CLI fallback. Run it through a long `herdr_exec_start` session, not a 60s synchronous shell: tool edits may complete before the final headless answer is printed. `dsh-tui` is the human-interactive fallback, not the default automation surface. See [worker fallbacks](docs/worker-fallbacks.md).
 - `inspect`/`since` soft-hide Claude/OMP/Codex by default. Prompting by known pane still works. `HERDR_MCP_AGENT_ALLOW=*` shows all.
-- Session start: `herdr_inspect` → `herdr_skill` (once) → work.
+- Standalone/local 18-tool sessions: `herdr_inspect` → `herdr_skill` (once) → work. Production ChatGPT currently stays on frozen contract epoch 1 (17 tools), so `herdr_skill` is intentionally hidden there until an explicit epoch upgrade.
 
 ```mermaid
 flowchart TB
@@ -56,7 +61,7 @@ Two ways to run:
 export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"   # or reuse an existing token
 export HERDR_MCP_PORT=8772
 # for a public Connector (no /mcp suffix):
-# export HERDR_MCP_BASE_URL=https://xxxx.trycloudflare.com
+# export HERDR_MCP_BASE_URL=https://herdr-edge.<your-account>.workers.dev
 node dist/server.js
 ```
 
@@ -66,7 +71,7 @@ node dist/server.js
 
 - [herdr](https://herdr.dev) installed and running
 - Node.js 20+ (`node -v`)
-- For ChatGPT: public HTTPS via `cloudflared` ([Quick Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)) or your own domain
+- For ChatGPT: a Cloudflare Worker endpoint on `workers.dev` (default, no custom domain required); a Custom Domain is optional for a stable long-lived origin. Direct `cloudflared` exposure is kept only as a legacy migration path.
 
 ### 1. Download and build
 
@@ -87,48 +92,44 @@ node dist/server.js
 # optional check: curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 ```
 
-### 3. Connect ChatGPT (recommended: free Cloudflare)
+### 3. Connect ChatGPT through Cloudflare Edge
 
-In another terminal:
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:8772
-# note https://xxxx.trycloudflare.com
-```
-
-Restart MCP with that origin (**no** `/mcp`):
+The supported default does **not** require your own domain. Deploy the Edge to your Cloudflare account's `workers.dev` hostname first:
 
 ```bash
-export HERDR_MCP_BASE_URL=https://xxxx.trycloudflare.com
-export HERDR_MCP_TOKEN=...   # same as before
-node dist/server.js
+cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
+# edit worker name, workstation id and OAUTH_ISSUER for your workers.dev origin
+cd edge/cloudflare
+npx wrangler deploy --config wrangler.user.toml
 ```
 
-#### Add the Connector in ChatGPT **web** (not the chat UI / desktop app)
+Use the resulting stable origin, for example:
 
-You **cannot** add an MCP server from inside a ChatGPT client chat. Use the website:
+```text
+https://herdr-edge.<your-account-subdomain>.workers.dev/mcp
+```
 
-1. Open [https://chatgpt.com/#settings/Plugins](https://chatgpt.com/#settings/Plugins), turn on **Developer mode**
-2. Open [https://chatgpt.com/plugins#settings/Connectors?create-connector=true](https://chatgpt.com/plugins#settings/Connectors?create-connector=true)
-3. Enter a name and the MCP URL `https://xxxx.trycloudflare.com/mcp` (same as `HERDR_MCP_BASE_URL` + `/mcp`)
-4. Click login and wait for the redirect back (this server’s OAuth flow is effectively login-free — **do not** paste an API key / token)
-5. Start a **new** chat after connecting (old chats keep a stale tool snapshot)
+If you own a Cloudflare zone, a Custom Domain such as `herdr.example.com` is **recommended but optional**. Always validate the Worker on `workers.dev` first; then attach the custom hostname separately. See [Cloudflare Edge deployment](docs/cloudflare-edge-deployment.md) and [Cloudflare Edge token](docs/cloudflare-edge-token.md).
+
+Direct `cloudflared` / Quick Tunnel exposure of the local MCP server is retained only for legacy migration and troubleshooting; it is no longer the recommended new-install architecture.
+
+Runtime releases can switch behind the persistent Edge/Link without changing the ChatGPT Connector. See [Runtime A/B self-upgrade](docs/runtime-self-upgrade.md).
+
+#### Add the Connector in ChatGPT **web**
+
+1. Open ChatGPT settings and enable **Developer mode**.
+2. Create a custom MCP connector.
+3. Enter the Edge MCP URL (`https://<worker>.<account>.workers.dev/mcp` or your optional Custom Domain + `/mcp`).
+4. Complete OAuth in the browser; do not paste the local Herdr token into ChatGPT.
+5. Start a new chat after connecting so it receives a fresh tool snapshot.
 
 #### Errors or tools missing
 
-If you see:
-
-- `Error fetching OAuth configuration` / `MCP server https://xxx.trycloudflare.com/mcp does not implement OAuth`
-- `There was a problem connecting xxx. Try again later.`
-- Or the connector shows as added but tools never appear
-
-First confirm `HERDR_MCP_BASE_URL` matches the HTTPS origin ChatGPT uses, `cloudflared` is still running, and `herdr-mcp status` shows the public URL reachable. If that looks fine, **reconnect a few times** in the plugins / connectors UI — usually ChatGPT cache or network. Hard requirements: [docs/chatgpt-connector.md](docs/chatgpt-connector.md) (中文).
+Verify the same origin is used consistently for the MCP URL and `OAUTH_ISSUER`, then check Edge health, `herdr-link` connectivity and OAuth discovery. Hard requirements and diagnostics are documented in [docs/chatgpt-connector.md](docs/chatgpt-connector.md).
 
 #### Model access
 
-Free ChatGPT is limited to **GPT-5.5-mini**. Plus (or higher) lets you use stronger models in chat to drive projects on your machine via the connector.
-
-Quick Tunnel hostnames change when you restart `cloudflared` — update `HERDR_MCP_BASE_URL` and restart MCP. For a stable hostname, use a named Cloudflare tunnel or your own domain.
+Available ChatGPT models depend on your ChatGPT plan and current product configuration; Herdr does not alter those limits.
 
 ### 4. Cursor (optional, this machine)
 
@@ -180,7 +181,7 @@ After code changes: `npx tsc && herdr-mcp restart` (or restart the `node dist/se
 
 ## Default tools (why these 18)
 
-Herdr’s native surface is a large Unix-socket API (`herdr api schema`, ~90 methods). herdr-mcp does **not** re-wrap every method as an MCP tool (that burns context and duplicates herdr). Instead:
+Herdr’s native surface is a large Unix-socket API (`herdr api schema`, ~90 methods). herdr-mcp does **not** re-wrap every method as an MCP tool (that burns context and duplicates herdr). Standalone/local 0.3.27 exposes 18 tools. Production ChatGPT deliberately freezes contract epoch 1 at 17 tools so runtime upgrades do not force the existing Connector/tool snapshot to change; that profile hides only `herdr_skill`. Instead:
 
 | Layer | MCP tools | Relation to herdr |
 |---|---|---|
@@ -191,7 +192,7 @@ Herdr’s native surface is a large Unix-socket API (`herdr api schema`, ~90 met
 
 | Tool | What it does |
 |---|---|
-| `herdr_skill` | Read-only: prefer latest `SKILL.md` from herdr **master**; if the network fails, use the bundled copy (`assets/herdr-agent-SKILL.md`). Call once per session before `herdr_call` / `herdr_prompt`. `HERDR_SKILL_NETWORK=0` forces bundled. |
+| `herdr_skill` | Read-only: prefer latest `SKILL.md` from herdr **master**; if the network fails, use the bundled copy (`assets/herdr-agent-SKILL.md`). When this tool is present, call it once per session before agent operations. Production contract epoch 1 deliberately hides it; `HERDR_SKILL_NETWORK=0` forces bundled. |
 | `herdr_methods` | List live herdr socket methods + parameter schemas (cached reflection). Use before unknown `herdr_call`s. |
 | `herdr_call` | Call any herdr method with validated params (`{ method, params }`). Covers panes, workspaces, agents, etc. without one MCP tool per method. |
 | `herdr_inspect` | One-shot: connection health + workspaces / tabs / panes / agents (cwd, status), plus `workstation_info`, `boot_id`, and `exec_sessions`. Usual first call. |

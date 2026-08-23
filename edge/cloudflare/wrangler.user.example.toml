@@ -1,0 +1,40 @@
+# Generic Herdr Cloudflare Edge config.
+# Copy to wrangler.user.toml (keep that local) and replace the placeholders.
+# A custom domain is OPTIONAL: workers.dev is the default supported endpoint.
+
+name = "herdr-edge"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+workers_dev = true
+routes = []
+
+[vars]
+EDGE_ENV = "prod"
+EDGE_PROJECT = "herdr-edge"
+EDGE_VERSION = "0.1.0"
+DEMO_WORKSTATION_ID = "my-workstation"
+# For workers.dev, set this to the exact stable Worker origin:
+OAUTH_ISSUER = "https://herdr-edge.YOUR_ACCOUNT_SUBDOMAIN.workers.dev"
+
+[durable_objects]
+bindings = [
+  { name = "WORKSTATION_DO", class_name = "WorkstationDO" },
+  { name = "OAUTH_STORE_DO", class_name = "OAuthStoreDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkstationDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["OAuthStoreDO"]
+
+# Optional after workers.dev validation:
+# [[routes]]
+# pattern = "herdr.example.com"
+# custom_domain = true
+#
+# If you switch to a Custom Domain, OAUTH_ISSUER should use that same stable origin
+# BEFORE you register/connect a new ChatGPT connector. Existing OAuth identities
+# should not be casually changed after clients are attached.

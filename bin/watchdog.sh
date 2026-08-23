@@ -13,7 +13,7 @@
 #   - never auto-retry herdr_prompt
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="${HERDR_MCP_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 CFG_DIR="${HERDR_MCP_CONFIG_DIR:-$HOME/.config/herdr-mcp}"
 STATE_FILE="$CFG_DIR/watchdog.state.json"
 LOG_FILE="$CFG_DIR/watchdog.log"
@@ -246,9 +246,12 @@ cmd_status() {
 }
 
 cmd_install() {
-  local bin
-  bin="$ROOT/bin/watchdog.sh"
-  chmod +x "$bin"
+  local source_bin runtime_bin
+  source_bin="$ROOT/bin/watchdog.sh"
+  runtime_bin="$CFG_DIR/watchdog.sh"
+  mkdir -p "$CFG_DIR"
+  cp "$source_bin" "$runtime_bin"
+  chmod 700 "$runtime_bin"
   cat >"$PLIST_WATCH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -259,15 +262,13 @@ cmd_install() {
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>${bin}</string>
+    <string>${runtime_bin}</string>
     <string>once</string>
   </array>
   <key>StartInterval</key>
   <integer>${INTERVAL_SEC}</integer>
   <key>RunAtLoad</key>
   <true/>
-  <key>WorkingDirectory</key>
-  <string>${ROOT}</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
@@ -276,6 +277,8 @@ cmd_install() {
     <string>${HOME}</string>
     <key>HERDR_SOCKET_PATH</key>
     <string>${SOCK}</string>
+    <key>HERDR_MCP_ROOT</key>
+    <string>${ROOT}</string>
   </dict>
   <key>StandardOutPath</key>
   <string>${CFG_DIR}/watchdog.launchd.out.log</string>
@@ -292,7 +295,7 @@ EOF
 
 cmd_uninstall() {
   launchctl unload "$PLIST_WATCH" 2>/dev/null || true
-  rm -f "$PLIST_WATCH"
+  rm -f "$PLIST_WATCH" "$CFG_DIR/watchdog.sh"
   log_line "watchdog uninstalled"
   echo "uninstalled"
 }

@@ -1,0 +1,313 @@
+#!/usr/bin/env node
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+
+export const CONTRACT_HASH = "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
+export const CONTRACT_EPOCH = 1;
+
+function intEnv(raw, fallback, min, max) {
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= min && n <= max ? n : fallback;
+}
+
+export function config(env = process.env) {
+  const zone = env.HERDR_CUTOVER_ZONE || "agentforme.cc.cd";
+  return {
+    apiBase: (env.CF_API_BASE || "https://api.cloudflare.com/client/v4").replace(/\/$/, ""),
+    token: env.CLOUDFLARE_API_TOKEN || env.CF_API_TOKEN || "",
+    accountId: env.CLOUDFLARE_ACCOUNT_ID || "",
+    zoneId: env.HERDR_CUTOVER_ZONE_ID || "",
+    zoneName: zone,
+    hostname: env.HERDR_CUSTOM_DOMAIN || `herdr-mcp.${zone}`,
+    worker: env.HERDR_CUTOVER_WORKER || "herdr-edge-prod",
+    prodEdgeBase: (env.HERDR_CUTOVER_PROD_EDGE || "https://herdr-edge-prod.whshang.workers.dev").replace(/\/$/, ""),
+    workstationId: env.HERDR_CUTOVER_WORKSTATION || "prod-real-runtime",
+    probeBearer: env.HERDR_CUTOVER_PROBE_BEARER || "",
+    probeKeychainService: env.HERDR_CUTOVER_PROBE_KEYCHAIN_SERVICE || "herdr-edge-prod-mcp-bearer",
+    statePath: env.HERDR_CUSTOM_DOMAIN_STATE_PATH || join(homedir(), ".config", "herdr-mcp", "custom-domain-state.json"),
+    watchAttempts: intEnv(env.HERDR_CUTOVER_WATCH_ATTEMPTS, 12, 1, 360),
+    watchFailures: intEnv(env.HERDR_CUTOVER_FAILURE_THRESHOLD, 3, 1, 20),
+    watchIntervalMs: intEnv(env.HERDR_CUTOVER_WATCH_INTERVAL_MS, 5000, 0, 60000),
+  };
+}
+
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function output(payload, code = 0) {
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
+  if (code) process.exitCode = code;
+}
+
+function probeSecret(c) {
+  if (c.probeBearer) return c.probeBearer;
+  if (process.platform !== "darwin" || !c.probeKeychainService) return "";
+  try {
+    return execFileSync("/usr/bin/security", ["find-generic-password", "-s", c.probeKeychainService, "-w"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+async function cf(c, path, init = {}) {
+  if (!c.token) return { ok: false, status: 0, code: "missing_cloudflare_token", result: null };
+  let response;
+  try {
+    response = await fetch(`${c.apiBase}${path}`, {
+      ...init,
+      headers: { authorization: `Bearer ${c.token}`, "content-type": "application/json", ...(init.headers || {}) },
+    });
+  } catch {
+    return { ok: false, status: 0, code: "cloudflare_unreachable", result: null };
+  }
+  let body = null;
+  try { body = await response.json(); } catch { /* bounded Cloudflare response */ }
+  if (!response.ok || body?.success === false) {
+    const errorCodes = Array.isArray(body?.errors) ? body.errors.map((x) => x?.code).filter(Boolean) : [];
+    return {
+      ok: false,
+      status: response.status,
+      code: response.status === 403 || errorCodes.includes(10000) ? "permission_blocked" : "cloudflare_api_error",
+      errorCodes,
+      result: null,
+    };
+  }
+  return { ok: true, status: response.status, result: body?.result ?? null };
+}
+
+async function workerDomains(c) {
+  const r = await cf(c, `/accounts/${encodeURIComponent(c.accountId)}/workers/domains?hostname=${encodeURIComponent(c.hostname)}`);
+  if (!r.ok) return r;
+  const rows = Array.isArray(r.result) ? r.result : [];
+  return { ok: true, rows };
+}
+
+async function expectedDomain(c) {
+  const domains = await workerDomains(c);
+  if (!domains.ok) return domains;
+  const exact = domains.rows.filter((row) => row?.hostname === c.hostname);
+  const expected = exact.filter((row) => row?.service === c.worker && row?.id);
+  if (expected.length === 1 && exact.length === 1) return { ok: true, domain: expected[0] };
+  if (exact.length > 0) return { ok: false, code: "domain_conflict" };
+  return { ok: false, code: "domain_not_found" };
+}
+
+async function bearerJson(url, bearer, init = {}) {
+  const headers = { ...(init.headers || {}) };
+  if (bearer) headers.authorization = `Bearer ${bearer}`;
+  try {
+    const response = await fetch(url, { ...init, headers });
+    const text = await response.text();
+    let body = null;
+    try {
+      if ((response.headers.get("content-type") || "").includes("text/event-stream")) {
+        const data = text.split(/\r?\n/).filter((line) => line.startsWith("data: ")).map((line) => line.slice(6)).join("");
+        body = data ? JSON.parse(data) : null;
+      } else body = text ? JSON.parse(text) : null;
+    } catch { /* caller validates shape */ }
+    return { ok: response.ok, status: response.status, body };
+  } catch {
+    return { ok: false, status: 0, body: null };
+  }
+}
+
+async function toolsProbe(base, bearer) {
+  if (!bearer) return { ok: false, status: 0, code: "missing_probe_bearer", toolCount: null };
+  const r = await bearerJson(`${base}/mcp`, bearer, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "user-agent": "herdr-domain-probe/1" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: "domain-probe", method: "tools/list", params: {} }),
+  });
+  const tools = r.body?.result?.tools;
+  const meta = r.body?.result?._meta?.herdr;
+  const names = Array.isArray(tools) ? tools.map((tool) => tool?.name) : [];
+  return {
+    ok: r.status === 200 && names.length === 17 && !names.includes("herdr_skill") && (!meta?.contract_hash || meta.contract_hash === CONTRACT_HASH),
+    status: r.status,
+    toolCount: names.length,
+    contractHash: meta?.contract_hash || null,
+  };
+}
+
+export async function edgeProbe(c, base = c.prodEdgeBase) {
+  const bearer = probeSecret(c);
+  if (!bearer) return { ok: false, code: "missing_probe_bearer", healthStatus: 0, statusStatus: 0, toolCount: null };
+  const [health, status, tools] = await Promise.all([
+    bearerJson(`${base}/health`, bearer),
+    bearerJson(`${base}/status/${encodeURIComponent(c.workstationId)}`, bearer),
+    toolsProbe(base, bearer),
+  ]);
+  const h = health.body || {};
+  const s = status.body || {};
+  return {
+    ok: health.status === 200 && h.ok === true && h.contractEpoch === CONTRACT_EPOCH && h.contractHash === CONTRACT_HASH &&
+      status.status === 200 && s.online === true && s.runtimeVersion === "0.3.23" &&
+      s.contractEpoch === CONTRACT_EPOCH && s.contractHash === CONTRACT_HASH && tools.ok,
+    healthStatus: health.status,
+    statusStatus: status.status,
+    online: s.online === true,
+    runtimeVersion: s.runtimeVersion || null,
+    contractEpoch: h.contractEpoch ?? null,
+    contractHash: h.contractHash ?? null,
+    toolCount: tools.toolCount,
+  };
+}
+
+export async function preflight(c) {
+  if (!c.accountId || !c.zoneId || !c.hostname || !c.worker) return { ok: false, code: "missing_identity_config" };
+  const prod = await edgeProbe(c, c.prodEdgeBase);
+  if (!prod.ok) return { ok: false, code: "prod_edge_not_ready", prod };
+  const domains = await workerDomains(c);
+  if (!domains.ok) return { ok: false, code: domains.code, status: domains.status };
+  const exact = domains.rows.filter((row) => row?.hostname === c.hostname);
+  if (exact.length > 1) return { ok: false, code: "domain_not_unique", count: exact.length };
+  if (exact.length === 1) {
+    const domain = exact[0];
+    if (domain?.service !== c.worker) return { ok: false, code: "domain_conflict", service: domain?.service || null };
+    return { ok: true, code: "domain_already_attached", domainId: domain.id || null, prod };
+  }
+  return { ok: true, code: "ready_to_attach", prod };
+}
+
+async function writeState(c, state) {
+  await mkdir(dirname(c.statePath), { recursive: true, mode: 0o700 });
+  const tmp = `${c.statePath}.tmp-${process.pid}`;
+  await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  await chmod(tmp, 0o600);
+  await rename(tmp, c.statePath);
+  await chmod(c.statePath, 0o600);
+}
+
+async function readState(c) {
+  try { return JSON.parse(await readFile(c.statePath, "utf8")); } catch { return null; }
+}
+
+export async function attach(c) {
+  const pf = await preflight(c);
+  if (!pf.ok) return pf;
+  if (pf.code === "domain_already_attached") return pf;
+  const r = await cf(c, `/accounts/${encodeURIComponent(c.accountId)}/workers/domains`, {
+    method: "PUT",
+    body: JSON.stringify({ hostname: c.hostname, service: c.worker, zone_id: c.zoneId, zone_name: c.zoneName }),
+  });
+
+  let domain = r.result || {};
+  let recovered = false;
+  if (!r.ok) {
+    if (r.status !== 0 && r.status < 500) {
+      return { ok: false, code: r.code, status: r.status, errorCodes: r.errorCodes || [] };
+    }
+    const recovery = await expectedDomain(c);
+    if (!recovery.ok) {
+      if (recovery.code === "domain_conflict") return recovery;
+      return { ok: false, code: "domain_attach_ambiguous", cause: r.code, recovery: recovery.code };
+    }
+    domain = recovery.domain;
+    recovered = true;
+  } else if (!domain.id || domain.hostname !== c.hostname || domain.service !== c.worker) {
+    const recovery = await expectedDomain(c);
+    if (!recovery.ok) return { ok: false, code: "domain_attach_ambiguous", recovery: recovery.code };
+    domain = recovery.domain;
+    recovered = true;
+  }
+
+  await writeState(c, {
+    version: 1,
+    status: "attached_unverified",
+    domainId: domain.id,
+    hostname: c.hostname,
+    worker: c.worker,
+    zoneId: c.zoneId,
+    attachedAt: new Date().toISOString(),
+    ...(recovered ? { recoveredFromAmbiguousAttach: true } : {}),
+  });
+  return { ok: true, code: "domain_attached", domainId: domain.id, ...(recovered ? { recovered: true } : {}) };
+}
+
+export async function watch(c) {
+  let consecutiveFailures = 0;
+  const observations = [];
+  const base = `https://${c.hostname}`;
+  for (let i = 0; i < c.watchAttempts; i += 1) {
+    const probe = await edgeProbe(c, base);
+    observations.push({ attempt: i + 1, ok: probe.ok, healthStatus: probe.healthStatus, statusStatus: probe.statusStatus, toolCount: probe.toolCount });
+    if (probe.ok) {
+      consecutiveFailures = 0;
+      const state = await readState(c);
+      if (state?.domainId) await writeState(c, { ...state, status: "observed_healthy", observedAt: new Date().toISOString() });
+      return { ok: true, code: "custom_domain_healthy", observations };
+    }
+    consecutiveFailures += 1;
+    if (consecutiveFailures >= c.watchFailures) return { ok: false, code: "custom_domain_unhealthy", observations };
+    if (i + 1 < c.watchAttempts) await sleep(c.watchIntervalMs);
+  }
+  return { ok: false, code: "custom_domain_unhealthy", observations };
+}
+
+export async function detach(c, reason = "manual") {
+  const domains = await workerDomains(c);
+  if (!domains.ok) return { ok: false, code: domains.code, status: domains.status };
+  const exact = domains.rows.filter((row) => row?.hostname === c.hostname);
+  if (exact.length === 0) return { ok: true, code: "domain_already_absent" };
+  if (exact.length !== 1 || exact[0]?.service !== c.worker || !exact[0]?.id) return { ok: false, code: "domain_identity_mismatch" };
+  const r = await cf(c, `/accounts/${encodeURIComponent(c.accountId)}/workers/domains/${encodeURIComponent(exact[0].id)}`, { method: "DELETE" });
+  let recovered = false;
+  if (!r.ok) {
+    if (r.status !== 0 && r.status < 500) return { ok: false, code: r.code, status: r.status };
+    const recovery = await expectedDomain(c);
+    if (recovery.ok) return { ok: false, code: "domain_detach_ambiguous", domainStillAttached: true };
+    if (recovery.code !== "domain_not_found") return { ok: false, code: recovery.code || "domain_detach_ambiguous" };
+    recovered = true;
+  }
+  const state = await readState(c);
+  if (state) await writeState(c, {
+    ...state,
+    status: "detached",
+    detachReason: reason,
+    detachedAt: new Date().toISOString(),
+    ...(recovered ? { recoveredFromAmbiguousDetach: true } : {}),
+  });
+  return { ok: true, code: "domain_detached", ...(recovered ? { recovered: true } : {}) };
+}
+
+export async function status(c) {
+  const domains = await workerDomains(c);
+  if (!domains.ok) return { ok: false, code: domains.code, status: domains.status };
+  const exact = domains.rows.filter((row) => row?.hostname === c.hostname);
+  return {
+    ok: true,
+    hostname: c.hostname,
+    attached: exact.length === 1,
+    service: exact.length === 1 ? exact[0]?.service || null : null,
+    domainId: exact.length === 1 ? exact[0]?.id || null : null,
+    count: exact.length,
+  };
+}
+
+function usage() {
+  return `Usage: herdr-cloudflare-domain <preflight|status|attach|watch|detach>\n\n` +
+    `Custom Domain controller for a pre-validated Herdr Cloudflare Worker.\n` +
+    `It never edits DNS records and never stops a Tunnel. If the hostname still has\n` +
+    `a CNAME, Cloudflare will refuse attach; remove that legacy CNAME only inside a\n` +
+    `separately guarded cutover with an explicit rollback path.\n`;
+}
+
+async function main() {
+  const command = process.argv[2];
+  if (!command || command === "--help" || command === "-h") { process.stdout.write(usage()); return; }
+  const c = config();
+  let result;
+  if (command === "preflight") result = await preflight(c);
+  else if (command === "status") result = await status(c);
+  else if (command === "attach") result = await attach(c);
+  else if (command === "watch") result = await watch(c);
+  else if (command === "detach") result = await detach(c);
+  else { output({ ok: false, code: "unknown_command", command }, 2); return; }
+  output(result, result.ok ? 0 : 2);
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) await main();

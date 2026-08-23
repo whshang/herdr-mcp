@@ -1,0 +1,34 @@
+# herdr-edge-prod — production candidate config.
+#
+# Deployment/routing are intentionally decoupled:
+#   - workers_dev stays enabled so every release is validated independently first;
+#   - routes stays empty: this file never mutates production DNS or a Tunnel;
+#   - an optional stable hostname is attached later with bin/herdr-cloudflare-domain;
+#   - open-source users may stay on workers.dev permanently; Custom Domain is optional.
+
+name = "herdr-edge-prod"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+workers_dev = true
+routes = []
+
+[vars]
+EDGE_ENV = "prod"
+EDGE_PROJECT = "herdr-edge-prod"
+EDGE_VERSION = "0.1.0-prod"
+DEMO_WORKSTATION_ID = "prod-real-runtime"
+OAUTH_ISSUER = "https://herdr-mcp.agentforme.cc.cd"
+
+[durable_objects]
+bindings = [
+  { name = "WORKSTATION_DO", class_name = "WorkstationDO" },
+  { name = "OAUTH_STORE_DO", class_name = "OAuthStoreDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkstationDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["OAuthStoreDO"]

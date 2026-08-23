@@ -2,11 +2,20 @@
 
 Versions below follow `src/version.ts` / `package.json`. Git has no tags; 0.3.19–0.3.25 were never published as separate commits and landed in **0.3.26**.
 
-ChatGPT caches `tools/list` by this version. After a bump: restart the public process, reconnect the connector, **open a new chat**.
+ChatGPT can retain a `tools/list` snapshot for a conversation. A runtime version bump does **not** have to change that public catalog: production may run a newer implementation under a frozen contract profile. Only a deliberate contract/tool-surface change requires Connector/tool-snapshot migration and a new chat.
+
+## 0.3.27 — 2026-08-23
+
+- `herdr_skill` becomes a **herdr-mcp remote-planner operating skill**, not merely a copy of the native Herdr tutorial: project policy covers deterministic tool order, direct code edits, cheap-worker preferences, DSH fallback rules, mutation/idempotency discipline, browser boundary, CI/CD, and supervised self-upgrade. Calls also include live runtime/generation/update context and an explicitly scoped, release-matched `herdr --skill` native reference.
+- Add `herdr-self-update`: a detached, structured-status runtime updater that builds/tests an isolated release, validates the exact frozen contract through the persistent generation manager, A/B switches traffic, reloads the stable 8772 service, promotes the new stable generation, and rolls back on failure without changing Edge/DNS/OAuth/contract epoch.
+- Add GitHub Actions for root/Edge/extension CI, native GitHub Pages, and gated Cloudflare production Worker deployment. The documentation site at `https://whshang.github.io/herdr-mcp/` is generated from tracked `docs/*.md` by `npm run build:site` and also publishes the refreshable project skill plus `release.json`.
+- Repository is public with the documentation site as its GitHub homepage. `workers.dev` remains the default public deployment for users; Custom Domain remains optional.
+- Validate DeepSeek Harness as an optional worker fallback: `dsh --profile headless` can perform real code edits but must run as a long exec session because mutations may complete before the final answer is printed. `dsh-tui` is reserved for human-interactive takeover. Pi/Herdr-native workers remain preferred.
+- Production ChatGPT remains on frozen contract epoch 1 (exact 17-tool hash); the runtime implementation can advance to 0.3.27 without forcing an existing Connector tool-snapshot change.
 
 ## 0.3.26 — 2026-08-22
 
-- Default MCP surface is **18 tools**: add read-only `herdr_skill` (fetch Herdr `SKILL.md` from upstream master; bundled fallback `assets/herdr-agent-SKILL.md`). Session start is `herdr_inspect` then `herdr_skill` once.
+- Standalone/local default MCP surface is **18 tools**: add read-only `herdr_skill` (fetch Herdr `SKILL.md` from upstream master; bundled fallback `assets/herdr-agent-SKILL.md`). When the tool is present, session start is `herdr_inspect` then `herdr_skill` once. At the 0.3.26 release, production ChatGPT ran under frozen contract epoch 1, exposing the prior exact 17-tool ABI and intentionally hiding `herdr_skill` until an explicit epoch upgrade.
 - CLI/extension UI: `en` / `zh` / `ja` (`herdr-mcp lang`, extension Options → Language).
 - `herdr-mcp watchdog` (macOS LaunchAgent): restart MCP if the process is down; TaskGroup / missing socket is log-only.
 - Socket RPC timeout cap (60s); `herdr api schema` warm + stale cache so `tools/list` does not wait on a live herdr.
@@ -14,6 +23,10 @@ ChatGPT caches `tools/list` by this version. After a bump: restart the public pr
 - `GET /push/state`, `GET /push/mcp-activity` (recent `tools/call` ring buffer).
 - Browser extension **0.1.28**: bind a web chat to a herdr **workspace** (not a single pane); progress tick + optional ChatGPT post-turn LLM nudge; i18n; compact popup.
 - Browser extension **0.1.30**: harden wake submit (stale composer, send-button scan, fixed footer visibility, textarea clear check); drop LLM judge `max_tokens` cap so reasoning models return `content`.
+- Browser extension **0.1.31**: the in-page HUD now fetches the live `/push/state` workspace catalog, shows a workspace picker, and can bind/unbind directly from the page. The popup and in-page HUD now use the same workspace source instead of leaving workspace discovery popup-only.
+- Browser extension **0.1.32**: keep conversation registration synchronized across SPA navigation, including ChatGPT project conversation URLs (`/g/g-p-…/c/…`), so the in-page workspace picker follows the currently visible conversation without a full page reload.
+- Browser extension **0.1.33**: replace one-SSE-per-workspace with one shared `/push/events` stream and fan out by workspace in the service worker. This prevents historical bindings from exhausting Chromium's per-origin HTTP connection pool and starving `/push/state`, which previously made the in-page workspace picker appear permanently empty.
+- Browser extension **0.1.34**: bound localhost state requests and SSE connection handshakes, expose Chrome 145+ loopback-network permission failures instead of hanging, and make Options use the same background transport as popup/HUD. The UI now points users to the extension-specific “Apps on device” permission when Chrome gates `127.0.0.1`.
 
 ## 0.3.18 — 2026-08-21
 

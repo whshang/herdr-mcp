@@ -34,10 +34,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Install documentation renderer
-        run: npm install --no-save --ignore-scripts marked@18.0.10
+          cache: npm
+      - run: npm ci
       - name: Build documentation site and dynamic skill artifact
-        run: node scripts/build-site.mjs
+        run: npm run build:site
       - name: Configure Pages
         uses: actions/configure-pages@v5
       - name: Upload Pages artifact

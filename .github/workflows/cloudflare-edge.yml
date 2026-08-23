@@ -1,0 +1,56 @@
+name: Cloudflare Edge production
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "edge/cloudflare/**"
+      - "src/relay/**"
+      - "tests/relay-*.mjs"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/cloudflare-edge.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-edge-production
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Frozen Edge/contract gate
+        run: npm run test:edge
+      - name: Root regression gate
+        run: npm test
+
+  deploy:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy production Worker
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: edge/cloudflare
+          wranglerVersion: "4"
+          command: deploy --config wrangler.prod.toml
+      - name: Verify workers.dev health
+        run: |
+          curl --fail --silent --show-error --retry 5 --retry-all-errors \
+            https://herdr-edge-prod.whshang.workers.dev/health

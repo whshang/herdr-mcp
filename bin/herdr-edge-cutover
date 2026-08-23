@@ -1,0 +1,367 @@
+#!/usr/bin/env node
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+
+export const CONTRACT_HASH = "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
+export const CONTRACT_EPOCH = 1;
+
+function cfg(env = process.env) {
+  const probeKeychainService = env.HERDR_CUTOVER_PROBE_KEYCHAIN_SERVICE || "herdr-edge-prod-mcp-bearer";
+  return {
+    apiBase: (env.CF_API_BASE || "https://api.cloudflare.com/client/v4").replace(/\/$/, ""),
+    token: env.CLOUDFLARE_API_TOKEN || env.CF_API_TOKEN || "",
+    zoneName: env.HERDR_CUTOVER_ZONE || "agentforme.cc.cd",
+    zoneId: env.HERDR_CUTOVER_ZONE_ID || "",
+    pattern: env.HERDR_CUTOVER_PATTERN || "herdr-mcp.agentforme.cc.cd/*",
+    worker: env.HERDR_CUTOVER_WORKER || "herdr-edge-prod",
+    publicBase: (env.HERDR_CUTOVER_PUBLIC_BASE || "https://herdr-mcp.agentforme.cc.cd").replace(/\/$/, ""),
+    prodEdgeBase: (env.HERDR_CUTOVER_PROD_EDGE || "https://herdr-edge-prod.whshang.workers.dev").replace(/\/$/, ""),
+    workstationId: env.HERDR_CUTOVER_WORKSTATION || "prod-real-runtime",
+    probeBearer: env.HERDR_CUTOVER_PROBE_BEARER || keychainSecret(probeKeychainService),
+    probeKeychainService,
+    statePath: env.HERDR_CUTOVER_STATE_PATH || join(homedir(), ".config", "herdr-mcp", "cutover-state.json"),
+    watchAttempts: intEnv(env.HERDR_CUTOVER_WATCH_ATTEMPTS, 12, 1, 360),
+    watchFailures: intEnv(env.HERDR_CUTOVER_FAILURE_THRESHOLD, 3, 1, 20),
+    watchIntervalMs: intEnv(env.HERDR_CUTOVER_WATCH_INTERVAL_MS, 5000, 0, 60000),
+  };
+}
+
+function keychainSecret(service) {
+  if (process.platform !== "darwin" || !service) return "";
+  try {
+    return execFileSync("/usr/bin/security", ["find-generic-password", "-s", service, "-w"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+function intEnv(raw, fallback, min, max) {
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= min && n <= max ? n : fallback;
+}
+
+function out(payload, exitCode = 0) {
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
+  if (exitCode) process.exitCode = exitCode;
+}
+
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function headers(c, extra = {}) {
+  return { authorization: `Bearer ${c.token}`, "content-type": "application/json", ...extra };
+}
+
+async function cf(c, path, init = {}) {
+  if (!c.token) return { ok: false, status: 0, code: "missing_cloudflare_token", body: null };
+  let response;
+  try {
+    response = await fetch(`${c.apiBase}${path}`, { ...init, headers: headers(c, init.headers || {}) });
+  } catch {
+    return { ok: false, status: 0, code: "cloudflare_unreachable", body: null };
+  }
+  let body = null;
+  try { body = await response.json(); } catch { /* bounded API shape only */ }
+  if (!response.ok || body?.success === false) {
+    const codes = Array.isArray(body?.errors) ? body.errors.map((e) => e?.code).filter(Boolean) : [];
+    return {
+      ok: false,
+      status: response.status,
+      code: response.status === 403 || codes.includes(10000) ? "permission_blocked" : "cloudflare_api_error",
+      errorCodes: codes,
+      body: null,
+    };
+  }
+  return { ok: true, status: response.status, body };
+}
+
+async function zoneId(c) {
+  if (c.zoneId) return { ok: true, id: c.zoneId };
+  const r = await cf(c, `/zones?name=${encodeURIComponent(c.zoneName)}`);
+  if (!r.ok) return r;
+  const zones = r.body?.result;
+  if (!Array.isArray(zones) || zones.length !== 1 || !zones[0]?.id) return { ok: false, code: "zone_not_unique", status: 409 };
+  return { ok: true, id: zones[0].id };
+}
+
+async function routes(c, zid) {
+  const r = await cf(c, `/zones/${encodeURIComponent(zid)}/workers/routes`);
+  if (!r.ok) return r;
+  return { ok: true, routes: Array.isArray(r.body?.result) ? r.body.result : [] };
+}
+
+async function bearerJson(url, c, init = {}) {
+  const hdr = { ...(init.headers || {}) };
+  if (c.probeBearer) hdr.authorization = `Bearer ${c.probeBearer}`;
+  try {
+    const r = await fetch(url, { ...init, headers: hdr });
+    const text = await r.text();
+    let body = null;
+    try {
+      if ((r.headers.get("content-type") || "").includes("text/event-stream")) {
+        const data = text.split(/\r?\n/).filter((line) => line.startsWith("data: ")).map((line) => line.slice(6)).join("");
+        body = data ? JSON.parse(data) : null;
+      } else body = text ? JSON.parse(text) : null;
+    } catch { /* shape handled by caller */ }
+    return { ok: r.ok, status: r.status, body };
+  } catch {
+    return { ok: false, status: 0, body: null };
+  }
+}
+
+async function mcpTools(c, base) {
+  if (!c.probeBearer) return { ok: false, code: "missing_probe_bearer" };
+  const r = await bearerJson(`${base}/mcp`, c, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "user-agent": "herdr-cutover-probe/1" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: "cutover-probe", method: "tools/list", params: {} }),
+  });
+  const tools = r.body?.result?.tools;
+  const meta = r.body?.result?._meta?.herdr;
+  const names = Array.isArray(tools) ? tools.map((t) => t?.name) : [];
+  return {
+    ok: r.status === 200 && names.length === 17 && !names.includes("herdr_skill") && (!meta?.contract_hash || meta.contract_hash === CONTRACT_HASH),
+    status: r.status,
+    toolCount: names.length,
+    hasHerdrSkill: names.includes("herdr_skill"),
+    contractHash: meta?.contract_hash || null,
+  };
+}
+
+async function prodEdgeProbe(c) {
+  const health = await bearerJson(`${c.prodEdgeBase}/health`, c);
+  const status = await bearerJson(`${c.prodEdgeBase}/status/${encodeURIComponent(c.workstationId)}`, c);
+  const tools = await mcpTools(c, c.prodEdgeBase);
+  const h = health.body || {};
+  const s = status.body || {};
+  return {
+    ok: health.status === 200 && h.ok === true && h.contractEpoch === CONTRACT_EPOCH && h.contractHash === CONTRACT_HASH &&
+      status.status === 200 && s.online === true && s.runtimeVersion === "0.3.23" && s.contractEpoch === CONTRACT_EPOCH && s.contractHash === CONTRACT_HASH && tools.ok,
+    healthStatus: health.status,
+    linkStatus: status.status,
+    online: s.online === true,
+    runtimeVersion: s.runtimeVersion || null,
+    contractEpoch: h.contractEpoch ?? null,
+    contractHash: h.contractHash ?? null,
+    toolCount: tools.toolCount ?? null,
+  };
+}
+
+async function publicEdgeProbe(c) {
+  const health = await bearerJson(`${c.publicBase}/health`, c);
+  const tools = await mcpTools(c, c.publicBase);
+  const h = health.body || {};
+  return {
+    ok: health.status === 200 && h.ok === true && h.contractEpoch === CONTRACT_EPOCH && h.contractHash === CONTRACT_HASH && tools.ok,
+    healthStatus: health.status,
+    contractEpoch: h.contractEpoch ?? null,
+    contractHash: h.contractHash ?? null,
+    toolCount: tools.toolCount ?? null,
+  };
+}
+
+async function legacyProbe(c) {
+  if (!c.probeBearer) return { ok: false, code: "missing_probe_bearer" };
+  const r = await bearerJson(`${c.publicBase}/mcp`, c, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "user-agent": "herdr-cutover-probe/1" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: "legacy-probe", method: "server/discover", params: {} }),
+  });
+  const version = r.body?.result?._meta?.["io.modelcontextprotocol/serverInfo"]?.version || null;
+  return { ok: r.status === 200 && version === "0.3.23", status: r.status, version };
+}
+
+async function readState(c) {
+  try { return JSON.parse(await readFile(c.statePath, "utf8")); } catch { return null; }
+}
+
+async function writeState(c, state) {
+  await mkdir(dirname(c.statePath), { recursive: true });
+  const tmp = `${c.statePath}.tmp-${process.pid}`;
+  await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  await chmod(tmp, 0o600);
+  await rename(tmp, c.statePath);
+  await chmod(c.statePath, 0o600);
+}
+
+async function current(c) {
+  const z = await zoneId(c);
+  if (!z.ok) return { ok: false, code: z.code, status: z.status };
+  const rr = await routes(c, z.id);
+  if (!rr.ok) return { ok: false, code: rr.code, status: rr.status };
+  const exact = rr.routes.filter((r) => r?.pattern === c.pattern);
+  return { ok: true, zoneId: z.id, routes: rr.routes, exact };
+}
+
+export async function preflight(c) {
+  const cur = await current(c);
+  if (!cur.ok) return cur;
+  if (cur.exact.length > 0) {
+    const expectedOnly = cur.exact.length === 1 && cur.exact[0]?.script === c.worker;
+    return { ok: false, code: expectedOnly ? "route_already_present" : "route_conflict", exactCount: cur.exact.length };
+  }
+  const prod = await prodEdgeProbe(c);
+  if (!prod.ok) return { ok: false, code: "prod_edge_not_ready", prod };
+  const legacy = await legacyProbe(c);
+  if (!legacy.ok) return { ok: false, code: "legacy_origin_not_ready", legacy };
+  return { ok: true, zoneId: cur.zoneId, prod, legacy, routeCount: cur.routes.length };
+}
+
+async function createRoute(c, zid) {
+  const r = await cf(c, `/zones/${encodeURIComponent(zid)}/workers/routes`, {
+    method: "POST",
+    body: JSON.stringify({ pattern: c.pattern, script: c.worker }),
+  });
+  if (!r.ok) {
+    // A transport/5xx failure after POST is ambiguous: Cloudflare may have
+    // committed the route before the response was lost. Never blind-retry.
+    if (r.code !== "permission_blocked" && (r.status === 0 || r.status >= 500)) {
+      const recovered = await findExpectedRoute(c, zid);
+      if (recovered.ok) return { ok: true, route: recovered.route, recovered: true };
+      if (recovered.code === "route_conflict") return recovered;
+      return { ok: false, code: "route_create_ambiguous", cause: r.code, recovery: recovered.code };
+    }
+    return r;
+  }
+  const route = r.body?.result;
+  if (!route?.id) {
+    const recovered = await findExpectedRoute(c, zid);
+    if (recovered.ok) return { ok: true, route: recovered.route, recovered: true };
+    return { ok: false, code: "route_create_ambiguous", cause: "route_create_missing_id", recovery: recovered.code };
+  }
+  return { ok: true, route };
+}
+
+async function findExpectedRoute(c, zid) {
+  const rr = await routes(c, zid);
+  if (!rr.ok) return { ok: false, code: rr.code };
+  const exact = rr.routes.filter((route) => route?.pattern === c.pattern);
+  const expected = exact.filter((route) => route?.script === c.worker && route?.id);
+  if (expected.length === 1 && exact.length === 1) return { ok: true, route: expected[0] };
+  if (exact.length > 0) return { ok: false, code: "route_conflict" };
+  return { ok: false, code: "route_not_found_after_create" };
+}
+
+async function deleteKnownRoute(c, zid, routeId) {
+  const rr = await routes(c, zid);
+  if (!rr.ok) return rr;
+  const route = rr.routes.find((candidate) => candidate?.id === routeId);
+  if (!route) return { ok: true, rolledBack: false, alreadyAbsent: true };
+  if (route.pattern !== c.pattern || route.script !== c.worker) {
+    return { ok: false, code: "route_identity_mismatch" };
+  }
+  const del = await cf(c, `/zones/${encodeURIComponent(zid)}/workers/routes/${encodeURIComponent(routeId)}`, { method: "DELETE" });
+  if (!del.ok) return del;
+  return { ok: true, rolledBack: true };
+}
+
+export async function rollback(c, reason = "manual") {
+  const state = await readState(c);
+  if (!state?.routeId) return { ok: false, code: "no_cutover_state" };
+  if (state.pattern !== c.pattern || state.worker !== c.worker) return { ok: false, code: "state_mismatch" };
+  const z = await zoneId(c);
+  if (!z.ok) return z;
+  const del = await deleteKnownRoute(c, z.id, state.routeId);
+  if (!del.ok) return del;
+  const next = { ...state, status: "rolled_back", rollbackReason: reason, rolledBackAt: new Date().toISOString() };
+  await writeState(c, next);
+  return { ok: true, rolledBack: del.rolledBack === true, alreadyAbsent: del.alreadyAbsent === true };
+}
+
+export async function watch(c) {
+  let consecutiveFailures = 0;
+  const observations = [];
+  for (let i = 0; i < c.watchAttempts; i++) {
+    const probe = await publicEdgeProbe(c);
+    observations.push({ ok: probe.ok, status: probe.healthStatus, at: Date.now() });
+    if (probe.ok) consecutiveFailures = 0;
+    else consecutiveFailures += 1;
+    if (consecutiveFailures >= c.watchFailures) {
+      const rb = await rollback(c, "automatic_probe_failure");
+      return {
+        ok: false,
+        code: rb.ok ? "watch_failed_rolled_back" : "watch_failed_rollback_failed",
+        rollback: rb,
+        attempts: i + 1,
+      };
+    }
+    if (i + 1 < c.watchAttempts) await sleep(c.watchIntervalMs);
+  }
+  const state = await readState(c);
+  if (state) {
+    try {
+      await writeState(c, { ...state, status: "observed_healthy", observedAt: new Date().toISOString() });
+    } catch {
+      return { ok: false, code: "observation_state_update_failed", attempts: c.watchAttempts };
+    }
+  }
+  return { ok: true, attempts: c.watchAttempts };
+}
+
+export async function apply(c) {
+  const pre = await preflight(c);
+  if (!pre.ok) return pre;
+  const snapshot = {
+    schemaVersion: 1,
+    status: "preflight_passed",
+    zoneId: pre.zoneId,
+    zoneName: c.zoneName,
+    pattern: c.pattern,
+    worker: c.worker,
+    contractEpoch: CONTRACT_EPOCH,
+    contractHash: CONTRACT_HASH,
+    startedAt: new Date().toISOString(),
+    priorRouteCount: pre.routeCount,
+  };
+  try {
+    await writeState(c, snapshot);
+  } catch {
+    return { ok: false, code: "state_persist_failed_before_mutation" };
+  }
+  const created = await createRoute(c, pre.zoneId);
+  if (!created.ok) return created;
+  try {
+    await writeState(c, { ...snapshot, status: "route_active", routeId: created.route.id, routeCreatedAt: new Date().toISOString() });
+  } catch {
+    const rb = await deleteKnownRoute(c, pre.zoneId, created.route.id);
+    return {
+      ok: false,
+      code: rb.ok ? "state_persist_failed_rolled_back" : "state_persist_failed_rollback_failed",
+      rollback: rb,
+    };
+  }
+  return watch(c);
+}
+
+async function status(c) {
+  const cur = await current(c);
+  const prod = await prodEdgeProbe(c);
+  const legacy = await legacyProbe(c);
+  const state = await readState(c);
+  return {
+    ok: cur.ok,
+    cloudflare: cur.ok ? { zoneId: cur.zoneId, exact: cur.exact.map((r) => ({ id: r.id, pattern: r.pattern, script: r.script })) } : { code: cur.code, status: cur.status },
+    prod,
+    legacy,
+    state: state ? { status: state.status, routeId: state.routeId || null, pattern: state.pattern, worker: state.worker, contractHash: state.contractHash } : null,
+  };
+}
+
+async function main() {
+  const c = cfg();
+  const cmd = process.argv[2] || "status";
+  if (cmd === "status") return out(await status(c));
+  if (cmd === "preflight") { const r = await preflight(c); return out(r, r.ok ? 0 : 2); }
+  if (cmd === "apply") { const r = await apply(c); return out(r, r.ok ? 0 : 3); }
+  if (cmd === "watch") { const r = await watch(c); return out(r, r.ok ? 0 : 4); }
+  if (cmd === "rollback") { const r = await rollback(c); return out(r, r.ok ? 0 : 5); }
+  return out({ ok: false, code: "unknown_command", command: cmd }, 64);
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch(() => out({ ok: false, code: "internal_error" }, 70));
+}

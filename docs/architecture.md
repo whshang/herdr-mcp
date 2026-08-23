@@ -11,9 +11,9 @@
 
 herdr-mcp **不会** 把每个 herdr 方法都做成 MCP 工具。那会烧上下文，也重复原生 schema。
 
-## 默认工具面（18）
+## 工具面：本地默认 18，生产 ChatGPT epoch 1 为 17
 
-MCP 工具面是**固定的**；live herdr schema 只服务 `herdr_methods` / `herdr_call`。0.3.17 起默认 17 个；**0.3.26** 增加只读 `herdr_skill`，现为 18。
+MCP 工具面是**固定的**；live herdr schema 只服务 `herdr_methods` / `herdr_call`。0.3.17 起默认 17 个；**0.3.26** 增加只读 `herdr_skill`，独立/本地默认现为 18。当前生产 ChatGPT Edge 仍冻结 contract epoch 1，因此通过 `HERDR_MCP_CONTRACT_PROFILE=epoch1` 广告精确的 17-tool 0.3.23 ABI；runtime 实现已经是 0.3.26，但不强迫现有 Connector/tool snapshot 改变。
 
 | 层 | 工具 | 说明 |
 |---|---|---|
@@ -22,7 +22,7 @@ MCP 工具面是**固定的**；live herdr schema 只服务 `herdr_methods` / `h
 | 远程编排 | `herdr_inspect`、`herdr_since`、`herdr_prompt` | 适合聊天型客户端的一瞥 / 续读 / 投递提示 |
 | 远程工作站 | `herdr_fs_*`、`herdr_exec` / `herdr_exec_*`、`herdr_git` | **不是** herdr 能力 — 远程客户端本身没有磁盘 |
 
-`HERDR_MCP_ALL_TOOLS=1` 会加上高级/废弃生命周期工具（`herdr_wait`、`herdr_reap`、session 等，共 30）。给 ChatGPT 时建议关掉以省上下文。会话开始：`herdr_inspect` → `herdr_skill`（一次）→ 干活。
+`HERDR_MCP_ALL_TOOLS=1` 会加上高级/废弃生命周期工具（`herdr_wait`、`herdr_reap`、session 等，共 30）。给 ChatGPT 时建议关掉以省上下文。若当前 catalog 含 `herdr_skill`，会话开始可用 `herdr_inspect` → `herdr_skill`（一次）→ 干活；production epoch 1 不含该工具时直接从 `herdr_inspect` 开始。
 
 ## 设计规则
 
@@ -32,7 +32,7 @@ MCP 工具面是**固定的**；live herdr schema 只服务 `herdr_methods` / `h
 4. **版本是缓存键** — 工具面或握手语义变了就 bump `src/version.ts` + `package.json`。
 5. **网页主编排** — 规划与调度在网页模型；本机优先 `herdr_fs_*` / `herdr_exec`；需要 agent 时直接打便宜 worker，禁止本机 Claude/OMP/main 当中间指挥。
 6. **Agent 软隐藏** — `herdr_inspect` / `herdr_since` 默认只列出执行 agent（`pi`/`cline`/`opencode`/`anti`）与审计（`droid`/`grok`）；Claude/OMP/Codex 不出现在列表。`herdr_prompt` **不拦**。`HERDR_MCP_AGENT_ALLOW=*` 显示全部；逗号名单可覆盖默认。
-7. **默认 18 工具** — `HERDR_MCP_ALL_TOOLS=1` 时 30；`inspect` 含 `boot_id` + `exec_sessions` + `agent_skill` 指针；`HERDR_MCP_READONLY=1` 挡住含 `herdr_prompt` 在内的 mutation（`herdr_fs_patch` 的 `dry_run` 除外）。
+7. **本地默认 18 / production epoch1 17** — `HERDR_MCP_ALL_TOOLS=1` 时 30；`inspect` 含 `boot_id` + `exec_sessions` + `agent_skill` 状态。epoch1 下会明确标记 `herdr_skill` 已由 contract 隐藏，而不是提示调用一个不存在的工具。`HERDR_MCP_READONLY=1` 挡住含 `herdr_prompt` 在内的 mutation（`herdr_fs_patch` 的 `dry_run` 除外）。
 8. **工作站稳健性（≥0.3.17）** — `commitAtomic` 失败会删掉本次新增文件；exec journal 仅杀掉仍带 `HERDR_MCP_EXEC_ID` 的孤儿；`exec_read stream=both` 按写入顺序交错；`fs_read` 字节截断只返回完整行。
 9. **`herdr_exec` 控制面降级（≥0.3.18）** — utility 窗格在 `send_text` **之前**若连续撞 TaskGroup，自动改本地 zsh（`backend:local_fallback`）；一旦已投递则绝不重发、也不降级（避免双跑）。
 10. **`herdr_git` 本机降级（≥0.3.20）** — `session.snapshot` / managed-roots 闸门因 TaskGroup 不可用时，对 `$HOME`（或 `HERDR_MCP_WRITE_ROOTS`）下的真实 git 根仍直接跑本地 `git`（带 `warnings`）；`pane.read` 等只读 RPC 对 TaskGroup 透明重试加长到最多 4 次尝试。
@@ -124,6 +124,7 @@ herdr-mcp 侧（≥0.3.12，exec 降级 ≥0.3.18）能做的：
 ## 相关文档
 
 - [CHANGELOG.md](../CHANGELOG.md) — 版本与工具面
+- [capability-benchmark.md](./capability-benchmark.md) — 官方 Herdr / 其他 Herdr MCP / coding-tools-mcp 能力吸收与“不吸收”决策
 - [extension.md](./extension.md) — 扩展总览（A 已可用，B 未完成）
 - [chatgpt-connector.md](./chatgpt-connector.md) — ChatGPT OAuth、schema、权限卡
 - [extension-wake.md](./extension-wake.md) — 主线 A：进度回推（检查间隔 + 新摘要才发 + 可配置兜底）
