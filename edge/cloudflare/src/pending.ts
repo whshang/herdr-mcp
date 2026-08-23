@@ -112,7 +112,14 @@ export class PendingRequestRegistry {
     this.pending.clear();
     this.completed.clear();
     this.idemByKey.clear();
-    for (const p of snapshot.pending.slice(0, this.limits.maxPendingRequests)) this.pending.set(p.requestId, p);
+    // Pre-fix WorkstationDO versions persisted `state=settled` rows under the
+    // pending prefix. They are historical completions, never active capacity.
+    // Ignore them defensively even if an old DO snapshot still contains them.
+    for (const p of snapshot.pending) {
+      if (p.state === "settled") continue;
+      if (this.pending.size >= this.limits.maxPendingRequests) break;
+      this.pending.set(p.requestId, p);
+    }
     for (const c of snapshot.completed.slice(0, this.limits.maxCompletedRecords)) {
       this.completed.set(c.requestId, c.completion);
     }

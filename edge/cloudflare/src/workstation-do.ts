@@ -147,7 +147,27 @@ export class WorkstationDO {
       const idem = await this.loadIdem();
       this.registry.restore({ pending, completed });
       this.registry.restoreIdem(idem);
+      // Storage is authoritative across hibernation/deploy restarts, but the
+      // old in-memory deadline timers/resolvers are gone. Reconcile persisted
+      // requests before serving any new forward call so expired historical
+      // entries cannot permanently consume the bounded pending capacity.
+      // This is settlement only: never replay/re-send the original operation
+      // (especially a mutation) during cold-start recovery.
+      const now = Date.now();
+      for (const entry of this.registry.expired(now)) {
+        const err = timeoutResult({
+          requestId: entry.requestId,
+          workstationId: entry.workstationId,
+          atMs: now,
+          opClass: entry.opClass,
+        });
+        await this.persistSettlement(entry.requestId, { status: "error", error: err, servedAtMs: now });
+      }
       this.initialized = true;
+      // Re-establish the Durable Object alarm from restored storage. Future
+      // pending deadlines (and completion TTL expiry) must survive hibernation
+      // without relying on process-local setTimeout callbacks.
+      await this.armAlarm();
     });
     return this.initPromise;
   }

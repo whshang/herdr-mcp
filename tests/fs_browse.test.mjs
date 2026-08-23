@@ -13,7 +13,8 @@ import * as fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = 9831;
+// Keep concurrent self-update/root suites from sharing a fixed test listener.
+const PORT = Number(process.env.HERDR_TEST_FS_PORT ?? (50_000 + (process.pid % 10_000)));
 const TOKEN = "fs-browse-token";
 const BASE = `http://127.0.0.1:${PORT}`;
 
