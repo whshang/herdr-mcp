@@ -17,7 +17,7 @@ import {
   DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
 } from "./binding-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.36";
+const H2W_SCRIPT_VERSION = "0.1.37";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const PUSH_CONNECT_MS = 5000;
 const STATE_FETCH_MS = 4000;
@@ -1288,12 +1288,20 @@ async function fetchStateFresh() {
     try {
       loopback_permission = (await navigator.permissions.query({ name: "loopback-network" })).state;
     } catch (_) { /* Chrome <145 or browser without split LNA permissions */ }
+    // Chrome can reject loopback access immediately with TypeError("Failed to fetch")
+    // instead of waiting for our AbortController deadline. Permission state is
+    // authoritative for every network exception, not only AbortError.
+    if (loopback_permission && loopback_permission !== "granted") {
+      return {
+        ok: false,
+        error: `loopback_permission_${loopback_permission}`,
+        loopback_permission,
+      };
+    }
     if (e?.name === "AbortError") {
       return {
         ok: false,
-        error: loopback_permission && loopback_permission !== "granted"
-          ? `loopback_permission_${loopback_permission}`
-          : "fetch_timeout",
+        error: "fetch_timeout",
         loopback_permission,
       };
     }

@@ -48,9 +48,9 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.36", "manifest version includes cached workspace catalog release");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.36"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.36"'), "content version matches manifest");
+ok(manifest.version === "0.1.37", "manifest version keeps discovery transport alive without bindings");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.37"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.37"'), "content version matches manifest");
 ok(
   backgroundSource.includes("bound_workspace_ids:") && backgroundSource.includes("workspaces: state?.ok"),
   "page HUD response carries live workspaces and bound workspace ids",
@@ -95,6 +95,18 @@ ok(
   backgroundSource.includes("if (stateFetchInFlight) return stateFetchInFlight")
     && !backgroundSource.includes("pushStream || !Object.keys(bindings || {}).length"),
   "workspace discovery keeps one shared SSE and deduplicates state fetches",
+);
+ok(
+  !backgroundSource.includes("if (!Object.keys(kept).length) stopPushStream()")
+    && backgroundSource.includes("if (!Object.keys(bindings).length) clearActionBadge()")
+    && backgroundSource.includes("pushWorkspaceCatalog = []")
+    && backgroundSource.includes("pushWorkspaceCatalogAt = 0"),
+  "workspace discovery stream survives zero bindings and endpoint rebuilds clear stale catalog data",
+);
+ok(
+  backgroundSource.includes('if (loopback_permission && loopback_permission !== "granted")')
+    && backgroundSource.includes('error: `loopback_permission_${loopback_permission}`'),
+  "immediate loopback fetch failures surface Chrome local-network permission state",
 );
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 ok(
