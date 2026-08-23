@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.38";
+const H2W_CONTENT_VERSION = "0.1.39";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -402,6 +402,35 @@ const H2W_CONTENT_VERSION = "0.1.38";
     const el = nodes[nodes.length - 1];
     return el ? String(el.innerText || "").trim() : "";
   }
+
+  function hasHandoffTransferMarker(text, transferId) {
+    const id = String(transferId || "").trim();
+    return Boolean(id && String(text || "").includes(`[HERDR_CONTINUITY_TRANSFER id=${id}]`));
+  }
+
+  async function waitForHandoffTarget(transferId, timeoutMs = 25000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!runtimeAlive()) return { ok: false, error: "context-invalidated" };
+      const targetConvKey = ADAPTER.getConversationKey();
+      const lastUser = lastMessageByRole("user");
+      if (targetConvKey && hasHandoffTransferMarker(lastUser, transferId)) {
+        return {
+          ok: true,
+          targetConvKey,
+          targetUrl: location.href,
+          seedConfirmed: true,
+        };
+      }
+      await wait(250);
+    }
+    return {
+      ok: true,
+      targetConvKey: ADAPTER.getConversationKey(),
+      targetUrl: location.href,
+      seedConfirmed: hasHandoffTransferMarker(lastMessageByRole("user"), transferId),
+    };
+  }
   function stopButtons() {
     return [...document.querySelectorAll("button, [role=button]")].filter((b) => {
       if (!b.offsetParent) return false;
@@ -493,6 +522,44 @@ const H2W_CONTENT_VERSION = "0.1.38";
           substantive: looksLikeSubstantiveReply(assistantText),
           endedAt: Date.now(),
         });
+        return;
+      }
+      if (msg?.type === "h2w_handoff_prompt") {
+        (async () => {
+          const result = await performWake({
+            template: msg.template || "",
+            autoAllow: false,
+            handoff: true,
+          });
+          sendResponse(result);
+        })();
+        return true;
+      }
+      if (msg?.type === "h2w_handoff_seed") {
+        (async () => {
+          const result = await performWake({
+            template: msg.template || "",
+            autoAllow: false,
+            handoff: true,
+          });
+          if (!result?.ok) { sendResponse(result); return; }
+          const confirmed = await waitForHandoffTarget(msg.transferId);
+          sendResponse({ ...result, ...confirmed });
+        })();
+        return true;
+      }
+      if (msg?.type === "h2w_handoff_probe") {
+        sendResponse({
+          ok: true,
+          targetConvKey: ADAPTER.getConversationKey(),
+          targetUrl: location.href,
+          seedConfirmed: hasHandoffTransferMarker(lastMessageByRole("user"), msg.transferId),
+        });
+        return;
+      }
+      if (msg?.type === "h2w_handoff_committed" || msg?.type === "h2w_handoff_moved") {
+        if (ADAPTER.name === "chatgpt") void refreshPageHud();
+        sendResponse({ ok: true });
         return;
       }
       if (msg?.type === "h2w_bound" || msg?.type === "h2w_unbound") {
@@ -738,8 +805,9 @@ const H2W_CONTENT_VERSION = "0.1.38";
         .ws-controls { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; min-width: 0; }
         .ws { max-width: 240px; height: 24px; padding: 0 5px; border: 1px solid #d4d4d4; border-radius: 5px; background: #fff; color: #171717; font: inherit; }
         .ws-action { height: 24px; padding: 0 8px; border: 1px solid #d4d4d4; border-radius: 5px; background: #f7f7f7; color: #171717; font: inherit; cursor: pointer; }
-        .ws-action:hover:not(:disabled) { background: #ededed; }
-        .ws-action:disabled, .ws:disabled { opacity: .55; cursor: default; }
+        .handoff-action { height: 24px; padding: 0 8px; border: 1px solid #d4d4d4; border-radius: 5px; background: #f7f7f7; color: #171717; font: inherit; cursor: pointer; white-space: nowrap; }
+        .ws-action:hover:not(:disabled), .handoff-action:hover:not(:disabled) { background: #ededed; }
+        .ws-action:disabled, .handoff-action:disabled, .ws:disabled { opacity: .55; cursor: default; }
         .last { color: #171717; flex: 1 1 38%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
         .bar.pending .last { color: #aa4d00; }
         .bar.ok .last { color: #107d32; }
@@ -751,6 +819,7 @@ const H2W_CONTENT_VERSION = "0.1.38";
         <div class="ws-controls">
           <select class="ws" aria-label="workspace"></select>
           <button class="ws-action" type="button"></button>
+          <button class="handoff-action" type="button"></button>
         </div>
         <div class="last"></div>
       </div>
@@ -761,10 +830,12 @@ const H2W_CONTENT_VERSION = "0.1.38";
       cfg: shadow.querySelector(".cfg"),
       ws: shadow.querySelector(".ws"),
       wsAction: shadow.querySelector(".ws-action"),
+      handoffAction: shadow.querySelector(".handoff-action"),
       last: shadow.querySelector(".last"),
     };
     hudEls.ws.addEventListener("change", () => paintWorkspaceControls(hudCache));
     hudEls.wsAction.addEventListener("click", () => { void toggleHudWorkspaceBinding(); });
+    hudEls.handoffAction.addEventListener("click", () => { void startHudHandoff(); });
     return hudEls;
   }
 
@@ -822,6 +893,58 @@ const H2W_CONTENT_VERSION = "0.1.38";
     select.value = preferred;
     action.disabled = !select.value;
     action.textContent = bound.has(select.value) ? hudT("unbind") : hudT("bind_action");
+    paintHandoffControl(hud);
+  }
+
+  function paintHandoffControl(hud) {
+    const ui = ensurePageHud();
+    const action = ui.handoffAction;
+    if (!action) return;
+    const state = String(hud?.handoff?.status || "");
+    let label = hudT("handoff_action");
+    let disabled = !hud?.can_handoff;
+    if (hud?.handoff?.can_resume === true) {
+      label = hudT("handoff_resume");
+      disabled = false;
+    } else if (["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(state)) {
+      label = state === "summary_requested" ? hudT("handoff_compressing") : hudT("handoff_moving");
+      disabled = true;
+    } else if (state === "failed" && hud?.bound) {
+      label = hudT("handoff_retry");
+      disabled = false;
+    } else if (state === "committed" && !hud?.bound) {
+      label = hudT("handoff_done");
+      disabled = true;
+    }
+    action.textContent = label;
+    action.disabled = disabled;
+    action.title = hud?.handoff?.error
+      ? `${hudT("handoff_error")}: ${hud.handoff.error}`
+      : (!hud?.can_handoff && !state ? hudT("handoff_project_only") : "");
+  }
+
+  async function startHudHandoff() {
+    const ui = ensurePageHud();
+    if (!runtimeAlive() || ui.handoffAction?.disabled) return;
+    ui.handoffAction.disabled = true;
+    ui.handoffAction.textContent = hudT("handoff_starting");
+    const result = await sendBg({ type: "h2w_handoff_start" });
+    if (!result?.ok) {
+      const hud = hudCache || {};
+      paintPageHud({
+        hud: {
+          ...hud,
+          handoff: {
+            ...(hud.handoff || {}),
+            status: "failed",
+            error: result?.error || "handoff_start_failed",
+          },
+          can_handoff: true,
+        },
+      });
+      return;
+    }
+    await refreshPageHud();
   }
 
   async function toggleHudWorkspaceBinding() {
@@ -891,6 +1014,7 @@ const H2W_CONTENT_VERSION = "0.1.38";
     ui.cfg.textContent = parts.join(" · ");
     ui.cfg.setAttribute("lang", hudLocale);
     paintWorkspaceControls(hud);
+    paintHandoffControl(hud);
 
     let lastText = hudT("hud_last_none");
     let kind = hud && hud.bound && hud.llmConfigured ? "" : "off";

@@ -17,11 +17,18 @@ import {
   DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
   conversationInfoFromSupportedUrl,
 } from "./binding-core.js";
+import {
+  buildHandoffRequest, buildHandoffSeed, chatGptConversationInfo,
+  extractHandoffPacket, handoffSeedContainsTransfer, handoffStatusIsActive,
+  newContinuityId, newTransferId,
+} from "./continuity-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.38";
+const H2W_SCRIPT_VERSION = "0.1.39";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const PUSH_CONNECT_MS = 5000;
 const STATE_FETCH_MS = 4000;
+const HANDOFF_STORAGE_KEY = "herdrConversationTransfers";
+const HANDOFF_RETENTION_MS = 7 * 86400000;
 const tabVersions = new Map();
 const reloadedTabs = new Set();
 const DEFAULT_TEMPLATE =
@@ -106,7 +113,10 @@ async function conversationInfoForTab(tabId) {
   if (!tabId) return null;
   try {
     const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
-    if (live?.convKey) return live;
+    if (live?.convKey) {
+      const parsed = conversationInfoFromSupportedUrl(live.url || live.convKey);
+      return parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
+    }
   } catch (_) {}
 
   let tab = null;
@@ -124,7 +134,10 @@ async function conversationInfoForTab(tabId) {
     });
     await sleep(50);
     const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
-    if (live?.convKey) return live;
+    if (live?.convKey) {
+      const parsed = conversationInfoFromSupportedUrl(live.url || live.convKey);
+      return parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
+    }
   } catch (e) {
     callLog(`content-script recovery failed for tab ${tabId}:`, e.message);
   }
@@ -184,20 +197,35 @@ function bindingStoreKeyFromBinding(b) {
 }
 
 /** Migrate legacy convKey-only keys to `${convKey}::${workspace_id}`. */
-function migrateBindingsMap(raw) {
+function migrateBindingsMap(raw, now = Date.now()) {
   const out = {};
   let migrated = false;
   for (const [k, b] of Object.entries(raw || {})) {
     if (!b || typeof b !== "object") continue;
-    const convKey = b.convKey || (k.includes("::") ? parseBindingStoreKey(k).convKey : k);
+    const rawConvKey = b.convKey || (k.includes("::") ? parseBindingStoreKey(k).convKey : k);
+    const convKey = conversationInfoFromSupportedUrl(rawConvKey)?.convKey || rawConvKey;
     const ws = b.workspace_id || normalizeWorkspaceId(b);
     if (!ws) {
       out[k] = { ...b, convKey };
       continue;
     }
-    const sk = k.includes("::") ? k : bindingStoreKey(convKey, ws);
+    const sk = bindingStoreKey(convKey, ws);
     if (sk !== k) migrated = true;
-    out[sk] = { ...b, convKey, workspace_id: ws };
+    const next = { ...b, convKey, workspace_id: ws };
+    // Workspace bindings are explicit user choices. Older builds imposed a
+    // 24-hour expiry, which is hostile to long-running Project conversations.
+    // Preserve already-expired rows so pruneExpired can remove them, but promote
+    // every still-live legacy row to explicit persistence.
+    if (next.persistence !== "explicit"
+      && !(typeof next.expires_at === "number" && next.expires_at <= now)) {
+      next.persistence = "explicit";
+      delete next.expires_at;
+      migrated = true;
+    }
+    const prev = out[sk];
+    if (!prev || Number(next.last_seen_at || next.created_at || 0) >= Number(prev.last_seen_at || prev.created_at || 0)) {
+      out[sk] = next;
+    }
   }
   return { map: out, migrated };
 }
@@ -254,6 +282,132 @@ async function loadBindings() {
 }
 async function saveBindings(b) {
   try { await chrome.storage.local.set({ herdrWakeBindings: b }); } catch (e) {}
+}
+
+// ---- Conversation continuity / handoff storage ----
+async function loadHandoffTransfers() {
+  let raw = {};
+  try { raw = (await chrome.storage.local.get(HANDOFF_STORAGE_KEY))[HANDOFF_STORAGE_KEY] || {}; } catch (_) {}
+  const now = Date.now();
+  const kept = {};
+  let changed = false;
+  for (const [id, row] of Object.entries(raw || {})) {
+    if (!row || typeof row !== "object") { changed = true; continue; }
+    const at = Number(row.updated_at || row.created_at || 0);
+    if (at > 0 && now - at > HANDOFF_RETENTION_MS && !handoffStatusIsActive(row.status)) {
+      changed = true;
+      continue;
+    }
+    kept[id] = row;
+  }
+  if (changed) {
+    try { await chrome.storage.local.set({ [HANDOFF_STORAGE_KEY]: kept }); } catch (_) {}
+  }
+  return kept;
+}
+
+async function saveHandoffTransfers(transfers) {
+  await chrome.storage.local.set({ [HANDOFF_STORAGE_KEY]: transfers || {} });
+}
+
+function latestTransferForConversation(transfers, convKey) {
+  let best = null;
+  for (const row of Object.values(transfers || {})) {
+    if (!row || (row.source_conv_key !== convKey && row.target_conv_key !== convKey)) continue;
+    if (!best || Number(row.updated_at || row.created_at || 0) > Number(best.updated_at || best.created_at || 0)) best = row;
+  }
+  return best;
+}
+
+function activeTransferFromSource(transfers, convKey) {
+  let best = null;
+  for (const row of Object.values(transfers || {})) {
+    if (!row || row.source_conv_key !== convKey || !handoffStatusIsActive(row.status)) continue;
+    if (!best || Number(row.updated_at || row.created_at || 0) > Number(best.updated_at || best.created_at || 0)) best = row;
+  }
+  return best;
+}
+
+function handoffView(row, convKey = null) {
+  if (!row) return null;
+  const ageMs = Math.max(0, Date.now() - Number(row.updated_at || row.created_at || Date.now()));
+  const canResume = row.status === "seed_uncertain"
+    || (ageMs >= 120000 && ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(row.status));
+  return {
+    id: row.id,
+    continuity_id: row.continuity_id || null,
+    status: row.status || "unknown",
+    source_conv_key: row.source_conv_key || null,
+    target_conv_key: row.target_conv_key || null,
+    role: convKey && row.target_conv_key === convKey ? "target" : "source",
+    error: row.error || null,
+    can_resume: canResume,
+    age_ms: ageMs,
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+  };
+}
+
+function sameWorkspaceSet(a, b) {
+  const left = [...new Set((a || []).map((x) => String(x || "")).filter(Boolean))].sort();
+  const right = [...new Set((b || []).map((x) => String(x || "")).filter(Boolean))].sort();
+  return left.length === right.length && left.every((v, i) => v === right[i]);
+}
+
+function transferSourceSnapshot(sessionBindings) {
+  return (sessionBindings || []).map((b) => ({
+    workspace_id: b.workspace_id || normalizeWorkspaceId(b),
+    revision: b.revision || bindingRevision(b),
+  })).filter((b) => b.workspace_id);
+}
+
+async function markTransfer(transferId, patch) {
+  const transfers = await loadHandoffTransfers();
+  const row = transfers[transferId];
+  if (!row) return null;
+  transfers[transferId] = {
+    ...row,
+    ...(patch || {}),
+    updated_at: Date.now(),
+  };
+  await saveHandoffTransfers(transfers);
+  return transfers[transferId];
+}
+
+async function waitForTabComplete(tabId, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab?.status === "complete") return tab;
+    } catch (_) { return null; }
+    await sleep(150);
+  }
+  try { return await chrome.tabs.get(tabId); } catch (_) { return null; }
+}
+
+async function tabStillExists(tabId) {
+  if (!tabId) return false;
+  try { return Boolean(await chrome.tabs.get(tabId)); } catch (_) { return false; }
+}
+
+function missingReceiverError(error) {
+  const text = String(error?.message || error || "");
+  return /receiving end does not exist|could not establish connection/i.test(text);
+}
+
+async function sendChatGptTabMessage(tabId, message) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, message);
+  } catch (first) {
+    if (!missingReceiverError(first)) throw first;
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content/base.js", "content/injector/chatgpt.js", "content/wake.js"],
+    });
+    await sleep(80);
+    return chrome.tabs.sendMessage(tabId, message);
+  }
 }
 
 // ---- SSE push client (ONE shared stream for every binding) ----
@@ -1000,6 +1154,373 @@ async function deliverWakeToTab(b, payload) {
   }
 }
 
+// ---- ChatGPT Project conversation handoff ----
+async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, targetUrl = null) {
+  const transfers = await loadHandoffTransfers();
+  const transfer = transfers[transferId];
+  if (!transfer) return { ok: false, error: "handoff_not_found" };
+  const targetInfo = chatGptConversationInfo(targetConvKey);
+  if (!targetInfo?.project_id || targetInfo.project_id !== transfer.project_id) {
+    await markTransfer(transferId, { status: "seed_uncertain", error: "target_project_mismatch" });
+    return { ok: false, error: "target_project_mismatch" };
+  }
+  if (targetInfo.convKey === transfer.source_conv_key) {
+    await markTransfer(transferId, { status: "seed_uncertain", error: "target_is_source" });
+    return { ok: false, error: "target_is_source" };
+  }
+
+  const bindings = await loadBindings();
+  const expected = transfer.source_bindings || [];
+  const expectedIds = expected.map((b) => b.workspace_id);
+  const source = bindingsForConv(bindings, transfer.source_conv_key);
+  const target = bindingsForConv(bindings, targetInfo.convKey);
+
+  // Idempotent recovery: binding storage may have committed before the transfer
+  // record was updated. In that case, only finalize metadata.
+  if (!source.length
+    && sameWorkspaceSet(target.map((b) => b.workspace_id || normalizeWorkspaceId(b)), expectedIds)
+    && target.every((b) => b.continuity_id === transfer.continuity_id)) {
+    const done = await markTransfer(transferId, {
+      status: "committed",
+      target_conv_key: targetInfo.convKey,
+      target_tab_id: targetTabId || transfer.target_tab_id || null,
+      target_url: targetUrl || targetInfo.url || null,
+      error: null,
+      handoff_text: null,
+    });
+    return { ok: true, recovered: true, transfer: handoffView(done) };
+  }
+
+  if (!sameWorkspaceSet(source.map((b) => b.workspace_id || normalizeWorkspaceId(b)), expectedIds)) {
+    await markTransfer(transferId, { status: "failed", error: "source_binding_set_changed" });
+    return { ok: false, error: "source_binding_set_changed" };
+  }
+  for (const snapshot of expected) {
+    const current = source.find((b) => (b.workspace_id || normalizeWorkspaceId(b)) === snapshot.workspace_id);
+    if (!current || (current.revision || bindingRevision(current)) !== snapshot.revision) {
+      await markTransfer(transferId, { status: "failed", error: "source_binding_revision_changed" });
+      return { ok: false, error: "source_binding_revision_changed" };
+    }
+  }
+  if (target.length) {
+    await markTransfer(transferId, { status: "failed", error: "target_already_bound" });
+    return { ok: false, error: "target_already_bound" };
+  }
+
+  const now = Date.now();
+  for (const current of source) {
+    const ws = current.workspace_id || normalizeWorkspaceId(current);
+    const oldKey = current.storeKey || bindingStoreKey(transfer.source_conv_key, ws);
+    const next = {
+      ...current,
+      convKey: targetInfo.convKey,
+      tabId: targetTabId || null,
+      tabUrl: targetUrl || targetInfo.url || null,
+      continuity_id: transfer.continuity_id,
+      persistence: "explicit",
+      last_seen_at: now,
+      handoff_from: transfer.source_conv_key,
+      handoff_at: now,
+    };
+    delete next.storeKey;
+    delete next.expires_at;
+    next.revision = bindingRevision(next);
+    bindings[bindingStoreKey(targetInfo.convKey, ws)] = next;
+    delete bindings[oldKey];
+    clearProgressTimer(oldKey);
+    if (next.status === "working") armProgressTimer(bindingStoreKey(targetInfo.convKey, ws), next);
+  }
+
+  // Binding cutover is the authoritative commit point. Persist it before marking
+  // the transfer committed so a crash can be recovered idempotently above.
+  try {
+    await chrome.storage.local.set({ herdrWakeBindings: bindings });
+  } catch (e) {
+    await markTransfer(transferId, { status: "seed_uncertain", error: `binding_commit_failed:${e.message}` });
+    return { ok: false, error: "binding_commit_failed" };
+  }
+  ensurePushStream(bindings);
+  const done = await markTransfer(transferId, {
+    status: "committed",
+    target_conv_key: targetInfo.convKey,
+    target_tab_id: targetTabId || transfer.target_tab_id || null,
+    target_url: targetUrl || targetInfo.url || null,
+    error: null,
+    packet_chars: String(transfer.handoff_text || "").length,
+    handoff_text: null,
+  });
+  try {
+    if (transfer.source_tab_id) chrome.tabs.sendMessage(transfer.source_tab_id, { type: "h2w_handoff_moved", transferId, targetConvKey: targetInfo.convKey });
+  } catch (_) {}
+  try {
+    if (targetTabId) chrome.tabs.sendMessage(targetTabId, { type: "h2w_handoff_committed", transferId, sourceConvKey: transfer.source_conv_key });
+  } catch (_) {}
+  return { ok: true, transfer: handoffView(done) };
+}
+
+async function seedHandoffIntoTarget(transferId, targetTabId) {
+  const transfers = await loadHandoffTransfers();
+  const transfer = transfers[transferId];
+  if (!transfer?.handoff_text) return { ok: false, error: "handoff_packet_missing" };
+  const seed = buildHandoffSeed({ transferId, packet: transfer.handoff_text });
+  await markTransfer(transferId, {
+    status: "seed_submitting",
+    target_tab_id: targetTabId,
+    error: null,
+  });
+  let result;
+  try {
+    result = await sendChatGptTabMessage(targetTabId, {
+      type: "h2w_handoff_seed",
+      transferId,
+      template: seed,
+    });
+  } catch (e) {
+    await markTransfer(transferId, { status: "seed_uncertain", error: `seed_delivery_unknown:${e.message}` });
+    return { ok: false, error: "seed_delivery_unknown" };
+  }
+  if (!result?.ok) {
+    // Content-side failures are pre-submit evidence (busy composer, missing input,
+    // etc.). The source binding therefore remains authoritative and a fresh
+    // explicit retry is safe.
+    await markTransfer(transferId, { status: "failed", error: result?.error || result?.blocked || "seed_not_submitted" });
+    return { ok: false, error: result?.error || result?.blocked || "seed_not_submitted" };
+  }
+  if (!result?.targetConvKey || !result?.seedConfirmed) {
+    await markTransfer(transferId, {
+      status: "seed_uncertain",
+      target_conv_key: result?.targetConvKey || null,
+      error: "seed_submit_unconfirmed",
+    });
+    return { ok: false, error: "seed_submit_unconfirmed" };
+  }
+  return commitHandoffTransfer(transferId, result.targetConvKey, targetTabId, result.targetUrl || null);
+}
+
+async function launchHandoffTarget(transferId) {
+  const transfers = await loadHandoffTransfers();
+  const transfer = transfers[transferId];
+  if (!transfer?.handoff_text || !transfer.project_launch_url) return { ok: false, error: "handoff_not_ready" };
+  await markTransfer(transferId, { status: "target_opening", error: null });
+  let tab;
+  try {
+    tab = await chrome.tabs.create({ url: transfer.project_launch_url, active: true });
+  } catch (e) {
+    await markTransfer(transferId, { status: "failed", error: `target_open_failed:${e.message}` });
+    return { ok: false, error: "target_open_failed" };
+  }
+  if (!tab?.id) {
+    await markTransfer(transferId, { status: "failed", error: "target_tab_missing" });
+    return { ok: false, error: "target_tab_missing" };
+  }
+  await markTransfer(transferId, { status: "target_opening", target_tab_id: tab.id });
+  const ready = await waitForTabComplete(tab.id, 20000);
+  if (!ready) {
+    await markTransfer(transferId, { status: "failed", error: "target_load_failed" });
+    return { ok: false, error: "target_load_failed" };
+  }
+  await sleep(350);
+  return seedHandoffIntoTarget(transferId, tab.id);
+}
+
+async function resumeUncertainHandoff(transfer) {
+  if (!transfer?.target_tab_id) {
+    await markTransfer(transfer.id, { status: "summary_ready", error: null });
+    return launchHandoffTarget(transfer.id);
+  }
+  if (!(await tabStillExists(transfer.target_tab_id))) {
+    await markTransfer(transfer.id, {
+      status: "summary_ready",
+      target_tab_id: null,
+      target_conv_key: null,
+      target_url: null,
+      error: null,
+    });
+    return launchHandoffTarget(transfer.id);
+  }
+  let probe = null;
+  try {
+    probe = await sendChatGptTabMessage(transfer.target_tab_id, {
+      type: "h2w_handoff_probe",
+      transferId: transfer.id,
+    });
+  } catch (_) {}
+  if (probe?.seedConfirmed && probe?.targetConvKey) {
+    return commitHandoffTransfer(transfer.id, probe.targetConvKey, transfer.target_tab_id, probe.targetUrl || null);
+  }
+  // The user explicitly asked to resume and the target page does not show our
+  // transfer marker, so retrying the seed is an intentional operation rather
+  // than a blind automatic replay.
+  await markTransfer(transfer.id, { status: "summary_ready", error: null });
+  return seedHandoffIntoTarget(transfer.id, transfer.target_tab_id);
+}
+
+async function resumeSummaryRequested(transfer) {
+  const tabId = transfer?.source_tab_id;
+  if (!tabId || !(await tabStillExists(tabId))) {
+    const failed = await markTransfer(transfer.id, { status: "failed", error: "source_tab_missing" });
+    return { ok: false, error: "source_tab_missing", handoff: handoffView(failed) };
+  }
+
+  let snapshot = null;
+  try { snapshot = await sendChatGptTabMessage(tabId, { type: "h2w_snapshot_turn" }); } catch (_) {}
+  const recoveredPacket = extractHandoffPacket(snapshot?.assistantText, transfer.id);
+  if (recoveredPacket) {
+    const ready = await markTransfer(transfer.id, {
+      status: "summary_ready",
+      handoff_text: recoveredPacket,
+      error: null,
+    });
+    setTimeout(() => { void launchHandoffTarget(transfer.id); }, 0);
+    return { ok: true, pending: true, recovered: true, handoff: handoffView(ready) };
+  }
+  if (snapshot?.turnInProgress || snapshot?.generating) {
+    return { ok: true, pending: true, handoff: handoffView(transfer) };
+  }
+
+  const bindings = await loadBindings();
+  const source = bindingsForConv(bindings, transfer.source_conv_key);
+  const expected = transfer.source_bindings || [];
+  if (!sameWorkspaceSet(
+    source.map((b) => b.workspace_id || normalizeWorkspaceId(b)),
+    expected.map((b) => b.workspace_id),
+  )) {
+    const failed = await markTransfer(transfer.id, { status: "failed", error: "source_binding_set_changed" });
+    return { ok: false, error: "source_binding_set_changed", handoff: handoffView(failed) };
+  }
+
+  const prompt = buildHandoffRequest({ transferId: transfer.id, bindings: source });
+  const retried = await markTransfer(transfer.id, { status: "summary_requested", error: null });
+  try {
+    const result = await sendChatGptTabMessage(tabId, {
+      type: "h2w_handoff_prompt",
+      transferId: transfer.id,
+      template: prompt,
+    });
+    if (!result?.ok) {
+      const failed = await markTransfer(transfer.id, {
+        status: "failed",
+        error: result?.error || result?.blocked || "summary_prompt_not_submitted",
+      });
+      return { ok: false, error: failed.error, handoff: handoffView(failed) };
+    }
+  } catch (e) {
+    const failed = await markTransfer(transfer.id, { status: "failed", error: `summary_prompt_failed:${e.message}` });
+    return { ok: false, error: "summary_prompt_failed", handoff: handoffView(failed) };
+  }
+  return { ok: true, pending: true, handoff: handoffView(retried) };
+}
+
+async function startHandoffForTab(tabId) {
+  const convInfo = await conversationInfoForTab(tabId);
+  if (!convInfo?.project_id || !convInfo?.project_launch_url) {
+    return { ok: false, error: "project_conversation_required" };
+  }
+  const bindings = await loadBindings();
+  const session = bindingsForConv(bindings, convInfo.convKey);
+  if (!session.length) return { ok: false, error: "binding_required" };
+
+  // Roll over only at a quiescent boundary. Moving the wake destination while
+  // a bound workspace is actively working risks racing an agent-settled wake
+  // against the summary/seed messages. Prefer fresh localhost state, with the
+  // persisted binding state as a conservative fallback.
+  const boundWorkspaceIds = session.map((b) => b.workspace_id || normalizeWorkspaceId(b)).filter(Boolean);
+  let working = session.some((b) => b.status === "working" || Object.keys(workingPaneMap(b)).length > 0);
+  try {
+    const state = await fetchState();
+    if (state?.ok && Array.isArray(state.agents)) {
+      working = state.agents.some((a) => boundWorkspaceIds.includes(a?.workspace) && a?.status === "working");
+    }
+  } catch (_) {}
+  if (working) return { ok: false, error: "workspace_busy" };
+
+  const transfers = await loadHandoffTransfers();
+  const active = activeTransferFromSource(transfers, convInfo.convKey);
+  if (active) {
+    if (active.status === "seed_uncertain") return resumeUncertainHandoff(active);
+    const ageMs = Date.now() - Number(active.updated_at || active.created_at || Date.now());
+    if (ageMs >= 120000 && active.status === "summary_requested") return resumeSummaryRequested(active);
+    if (ageMs >= 120000 && ["summary_ready", "target_opening"].includes(active.status)) {
+      if (active.target_tab_id && await tabStillExists(active.target_tab_id)) {
+        return seedHandoffIntoTarget(active.id, active.target_tab_id);
+      }
+      return launchHandoffTarget(active.id);
+    }
+    if (ageMs >= 120000 && active.status === "seed_submitting") {
+      const uncertain = await markTransfer(active.id, { status: "seed_uncertain", error: "stale_seed_submission" });
+      return resumeUncertainHandoff(uncertain);
+    }
+    return { ok: true, pending: true, handoff: handoffView(active) };
+  }
+
+  const chainIds = [...new Set(session.map((b) => b.continuity_id).filter(Boolean))];
+  if (chainIds.length > 1) return { ok: false, error: "binding_continuity_conflict" };
+  const now = Date.now();
+  const transferId = newTransferId(now);
+  const continuityId = chainIds[0] || newContinuityId(now);
+  const row = {
+    version: 1,
+    id: transferId,
+    continuity_id: continuityId,
+    site: "chatgpt",
+    status: "summary_requested",
+    source_conv_key: convInfo.convKey,
+    source_tab_id: tabId,
+    project_id: convInfo.project_id,
+    project_key: convInfo.project_key,
+    project_launch_url: convInfo.project_launch_url,
+    source_bindings: transferSourceSnapshot(session),
+    handoff_text: null,
+    target_tab_id: null,
+    target_conv_key: null,
+    error: null,
+    created_at: now,
+    updated_at: now,
+  };
+  transfers[transferId] = row;
+  await saveHandoffTransfers(transfers);
+  const prompt = buildHandoffRequest({ transferId, bindings: session });
+  let result;
+  try {
+    result = await sendChatGptTabMessage(tabId, {
+      type: "h2w_handoff_prompt",
+      transferId,
+      template: prompt,
+    });
+  } catch (e) {
+    await markTransfer(transferId, { status: "failed", error: `summary_prompt_failed:${e.message}` });
+    return { ok: false, error: "summary_prompt_failed" };
+  }
+  if (!result?.ok) {
+    await markTransfer(transferId, { status: "failed", error: result?.error || result?.blocked || "summary_prompt_not_submitted" });
+    return { ok: false, error: result?.error || result?.blocked || "summary_prompt_not_submitted" };
+  }
+  return { ok: true, pending: true, handoff: handoffView(row) };
+}
+
+async function handleHandoffTurnEnded(msg) {
+  const convKey = String(msg?.convKey || "").trim();
+  if (!convKey) return { handled: false };
+  const transfers = await loadHandoffTransfers();
+  const candidates = Object.values(transfers)
+    .filter((t) => t?.source_conv_key === convKey && t.status === "summary_requested")
+    .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0));
+  const transfer = candidates[0];
+  if (!transfer) return { handled: false };
+  const packet = extractHandoffPacket(msg.assistantText, transfer.id);
+  if (!packet) {
+    const failed = await markTransfer(transfer.id, { status: "failed", error: "handoff_packet_invalid" });
+    return { handled: true, ok: false, error: "handoff_packet_invalid", handoff: handoffView(failed) };
+  }
+  const ready = await markTransfer(transfer.id, {
+    status: "summary_ready",
+    handoff_text: packet,
+    error: null,
+  });
+  setTimeout(() => { void launchHandoffTarget(transfer.id); }, 0);
+  return { handled: true, ok: true, pending: true, handoff: handoffView(ready) };
+}
+
 // ---- Message handling ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_hello") {
@@ -1015,6 +1536,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const b = bindings[entry.storeKey];
           b.tabId = sender.tab?.id;
           b.tabUrl = msg.url || sender.tab?.url;
+          b.last_seen_at = Date.now();
         }
         ensurePushStream(bindings);
         await saveBindings(bindings);
@@ -1076,6 +1598,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const convKey = String(msg.convKey || "").trim();
       const bindings = await loadBindings();
       const session = convKey ? bindingsForConv(bindings, convKey) : [];
+      const transfers = await loadHandoffTransfers();
+      const transfer = convKey ? latestTransferForConversation(transfers, convKey) : null;
+      const transferView = handoffView(transfer, convKey);
+      const convInfo = convKey ? chatGptConversationInfo(convKey) : null;
       const labels = session.map((b) => b.workspace_label || b.workspace_id).filter(Boolean);
       const cachedWorkspaces = cachedPushWorkspaceCatalog();
       // /push/events hello already carries the authoritative workspace list.
@@ -1103,6 +1629,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         workspace_id: session[0]?.workspace_id || (session[0] ? normalizeWorkspaceId(session[0]) : null),
         binding_count: session.length,
         bound_workspace_ids: session.map((b) => b.workspace_id || normalizeWorkspaceId(b)).filter(Boolean),
+        continuity_id: session.map((b) => b.continuity_id).find(Boolean) || transfer?.continuity_id || null,
+        can_handoff: Boolean(
+          convInfo?.project_id
+          && session.length > 0
+          && (!handoffStatusIsActive(transfer?.status) || transferView?.can_resume === true),
+        ),
+        handoff: transferView,
         workspaces: state?.ok && Array.isArray(state.workspaces) ? state.workspaces : [],
         workspace_source: state?.source || (state?.ok ? "push_state" : null),
         workspace_status: state?.ok ? 200 : (state?.status || 0),
@@ -1178,11 +1711,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const idleNudgeLast = convInfo?.convKey
         ? (lastIdleNudgeResult.get(convInfo.convKey) || null)
         : null;
+      const transfers = await loadHandoffTransfers();
+      const transfer = convInfo?.convKey ? latestTransferForConversation(transfers, convInfo.convKey) : null;
       sendResponse({
         convInfo,
         binding: bindingViewOne,
         sessionBindings,
         idleNudgeLast,
+        handoff: handoffView(transfer, convInfo?.convKey || null),
         bindings: Object.entries(bindings).map(([storeKey, b]) => ({
           storeKey,
           convKey: b.convKey,
@@ -1228,6 +1764,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (bindings[storeKey]) { sendResponse({ ok: false, error: "already-bound", convKey: convInfo.convKey, workspace_id }); return; }
       const workspace_label = msg.workspace_label
         || workspaceTitleWithId({ id: workspace_id, label: msg.workspace_label_raw, roots: msg.roots });
+      const continuity_id = bindingsForConv(bindings, convInfo.convKey).map((x) => x.continuity_id).find(Boolean)
+        || newContinuityId();
       const b = {
         workspace_id,
         workspace_label,
@@ -1239,7 +1777,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         site: convInfo.site || "unknown",
         tabId, tabUrl: convInfo.url || null,
         created_at: Date.now(),
-        expires_at: Date.now() + 86400000,
+        last_seen_at: Date.now(),
+        persistence: "explicit",
+        continuity_id,
         status: "unknown",
         lastSettle: null,
       };
@@ -1247,7 +1787,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       bindings[storeKey] = b;
       await saveBindings(bindings);
       ensurePushStream(bindings);
-      try { chrome.tabs.sendMessage(tabId, { type: "h2w_bound", pane: workspace_label, workspace_id, workspace_label }); } catch (e) {}
+      try { void chrome.tabs.sendMessage(tabId, { type: "h2w_bound", pane: workspace_label, workspace_id, workspace_label }).catch(() => {}); } catch (e) {}
       sendResponse({ ok: true, convKey: convInfo.convKey, workspace_id, workspace_label });
     })();
     return true;
@@ -1277,7 +1817,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         clearIdleNudgeRetry(convKey);
         lastTurnEndedPayload.delete(convKey);
       }
-      if (tabId) { try { chrome.tabs.sendMessage(tabId, { type: "h2w_unbound", workspace_id: wsId || null }); } catch (e) {} }
+      if (tabId) { try { void chrome.tabs.sendMessage(tabId, { type: "h2w_unbound", workspace_id: wsId || null }).catch(() => {}); } catch (e) {} }
       if (!Object.keys(bindings).length) clearActionBadge();
       sendResponse({ ok: true });
     })();
@@ -1285,8 +1825,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_turn_ended") {
     void (async () => {
+      const handoff = await handleHandoffTurnEnded(msg);
+      if (handoff.handled) {
+        sendResponse(handoff);
+        return;
+      }
       const r = await maybeIdleNudge(msg);
       sendResponse(r);
+    })();
+    return true;
+  }
+  if (msg?.type === "h2w_handoff_start") {
+    void (async () => {
+      const tabId = msg.tabId || sender.tab?.id;
+      if (!tabId) { sendResponse({ ok: false, error: "tab-unavailable" }); return; }
+      sendResponse(await startHandoffForTab(tabId));
     })();
     return true;
   }

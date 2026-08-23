@@ -6,6 +6,8 @@
 //   - agent_settled wakes only after observed work; lastSettle deduplicates repeats.
 //   - A reconnecting hello wakes once when persisted working became settled offline.
 
+import { chatGptConversationInfo } from "./continuity-core.js";
+
 export const SETTLED_STATUSES = ["idle", "done", "blocked"];
 
 /**
@@ -14,18 +16,7 @@ export const SETTLED_STATUSES = ["idle", "done", "blocked"];
  * (for example immediately after reloading the extension while the tab stays open).
  */
 export function conversationInfoFromSupportedUrl(rawUrl) {
-  try {
-    const u = new URL(String(rawUrl || ""));
-    const host = u.hostname.toLowerCase();
-    const pathname = u.pathname.replace(/\/+$/, "") || "/";
-    if (host === "chatgpt.com" || host === "www.chatgpt.com") {
-      const normal = /^\/c\/[^/]+$/.test(pathname);
-      const project = /^\/g\/g-p-[^/]+\/c\/[^/]+$/.test(pathname);
-      if (!normal && !project) return null;
-      return { convKey: `${u.origin}${pathname}`, url: u.href, site: "chatgpt" };
-    }
-  } catch (_) {}
-  return null;
+  return chatGptConversationInfo(rawUrl);
 }
 
 /**

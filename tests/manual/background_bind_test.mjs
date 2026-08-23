@@ -12,6 +12,11 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONV = "https://chatgpt.com/c/abc123";
 const SK_WH = `${CONV}::wH`;
+const PROJECT_ID = "g-p-6a89c078669481918c8eb70fdfd3d978";
+const PROJECT_SOURCE = `https://chatgpt.com/g/${PROJECT_ID}/c/source123`;
+const PROJECT_SOURCE_URL = `https://chatgpt.com/g/${PROJECT_ID}-herdr-mcp/c/source123`;
+const PROJECT_TARGET = `https://chatgpt.com/g/${PROJECT_ID}/c/target456`;
+const PROJECT_TARGET_URL = `https://chatgpt.com/g/${PROJECT_ID}-herdr-mcp/c/target456`;
 
 let failures = 0;
 function ok(cond, label, detail = "") {
@@ -24,6 +29,48 @@ const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", t
 const listeners = { onMessage: [], onStartup: [], onInstalled: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
+let nextTabId = 500;
+let handoffSeedMode = "uncertain";
+let targetSeeded = false;
+let handoffPrompt = "";
+
+function targetListener(tab) {
+  return (msg, _sender, sendResponse) => {
+    if (msg?.type === "h2w_get_convkey") {
+      sendResponse({
+        convKey: targetSeeded ? PROJECT_TARGET : null,
+        url: tab.url,
+        site: "chatgpt",
+      });
+      return;
+    }
+    if (msg?.type === "h2w_handoff_probe") {
+      sendResponse({
+        ok: true,
+        targetConvKey: targetSeeded ? PROJECT_TARGET : null,
+        targetUrl: tab.url,
+        seedConfirmed: targetSeeded,
+      });
+      return;
+    }
+    if (msg?.type === "h2w_handoff_seed") {
+      if (handoffSeedMode === "confirmed") {
+        targetSeeded = true;
+        tab.url = PROJECT_TARGET_URL;
+        sendResponse({
+          ok: true,
+          targetConvKey: PROJECT_TARGET,
+          targetUrl: PROJECT_TARGET_URL,
+          seedConfirmed: true,
+        });
+      } else {
+        sendResponse({ ok: true, targetConvKey: null, targetUrl: tab.url, seedConfirmed: false });
+      }
+      return;
+    }
+    sendResponse({ ok: true });
+  };
+}
 
 globalThis.chrome = {
   runtime: {
@@ -64,6 +111,18 @@ globalThis.chrome = {
       });
       return resp;
     },
+    async get(tabId) {
+      const t = tabs.get(tabId);
+      if (!t) throw new Error(`tab ${tabId} missing`);
+      return { id: t.id, url: t.url, status: t.status || "complete" };
+    },
+    async create({ url }) {
+      const id = ++nextTabId;
+      const tab = { id, url, status: "complete", listener: null };
+      tab.listener = targetListener(tab);
+      tabs.set(id, tab);
+      return { id, url, status: "complete" };
+    },
     reload: () => {},
   },
   scripting: { executeScript: async () => [{ result: { ok: true } }] },
@@ -76,6 +135,7 @@ function installContentScript(tabId, url, convKey) {
     url, listener: (msg, _sender, sendResponse) => {
       if (msg?.type === "h2w_get_convkey") { sendResponse({ convKey, url, site: "chatgpt" }); return; }
       if (msg?.type === "h2w_wake") { sendResponse({}); return; }
+      if (msg?.type === "h2w_handoff_prompt") { handoffPrompt = msg.template || ""; sendResponse({ ok: true }); return; }
       sendResponse({});
     },
   });
@@ -97,7 +157,19 @@ console.log("\n[binding flow]");
   ok(r?.ok === true && r.convKey === CONV, "h2w_bind creates a binding", JSON.stringify(r));
   ok(!!storage.herdrWakeBindings[SK_WH], "binding persisted with convKey::workspace_id key");
   const b = storage.herdrWakeBindings[SK_WH];
-  ok(b.workspace_id === "wH" && b.workspace_label.includes("herdr-mcp") && b.agent == null && typeof b.expires_at === "number" && !!b.revision, "binding fields include workspace scope and metadata", JSON.stringify(b));
+  ok(
+    b.workspace_id === "wH"
+      && b.workspace_label.includes("herdr-mcp")
+      && b.agent == null
+      && b.persistence === "explicit"
+      && b.expires_at == null
+      && typeof b.last_seen_at === "number"
+      && typeof b.continuity_id === "string"
+      && b.continuity_id.startsWith("hc:")
+      && !!b.revision,
+    "binding is explicit, persistent and carries a continuity id",
+    JSON.stringify(b),
+  );
   const bound = sentMessages.find((m) => m.msg?.type === "h2w_bound");
   ok(!!bound, "content script receives h2w_bound");
 }
@@ -170,6 +242,66 @@ console.log("\n[binding flow]");
   onMsg({ type: "h2w_state", tabId: 303 }, { tab: { id: 303 } }, (r) => resolveP(r));
   const r = await p;
   ok(!!r.convInfo && r.convInfo.convKey === "https://chatgpt.com/c/xyz" && Array.isArray(r.bindings) && Array.isArray(r.sessionBindings), "h2w_state returns convInfo, bindings, sessionBindings", JSON.stringify(r).slice(0, 120));
+}
+
+// ---- Scenario 7: Project handoff keeps source authoritative until target seed is confirmed ----
+console.log("\n[project handoff]");
+{
+  installContentScript(401, PROJECT_SOURCE_URL, PROJECT_SOURCE);
+  let resolveBind;
+  const bindP = new Promise((r) => { resolveBind = r; });
+  onMsg({
+    type: "h2w_bind",
+    tabId: 401,
+    workspace_id: "wH",
+    workspace_label: "herdr-mcp (wH)",
+  }, { tab: { id: 401 } }, (r) => resolveBind(r));
+  const bound = await bindP;
+  ok(bound?.ok === true, "Project source binds before rollover", JSON.stringify(bound));
+  const sourceKey = `${PROJECT_SOURCE}::wH`;
+  ok(!!storage.herdrWakeBindings[sourceKey], "source Project binding is authoritative before rollover");
+  const continuityId = storage.herdrWakeBindings[sourceKey].continuity_id;
+
+  let resolveStart;
+  const startP = new Promise((r) => { resolveStart = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: 401 }, { tab: { id: 401 } }, (r) => resolveStart(r));
+  const started = await startP;
+  ok(started?.ok === true && started.pending === true, "rollover requests a handoff summary", JSON.stringify(started));
+  const transferId = Object.keys(storage.herdrConversationTransfers || {})[0];
+  ok(!!transferId && handoffPrompt.includes(`id=${transferId}`), "source prompt carries the persisted transfer id");
+
+  const assistantText = [
+    `<<<HERDR_HANDOFF_V1 id=${transferId}>>>`,
+    "# Project handoff",
+    "Current objective: verify browser continuity.",
+    "Next: verify live state before mutation.",
+    "<<<END_HERDR_HANDOFF_V1>>>",
+  ].join("\n");
+  let resolveEnded;
+  const endedP = new Promise((r) => { resolveEnded = r; });
+  onMsg({ type: "h2w_turn_ended", convKey: PROJECT_SOURCE, assistantText, userText: "roll over" }, { tab: { id: 401 } }, (r) => resolveEnded(r));
+  const ended = await endedP;
+  ok(ended?.handled === true && ended?.ok === true, "marked assistant packet is accepted", JSON.stringify(ended));
+
+  await new Promise((r) => setTimeout(r, 800));
+  const uncertain = storage.herdrConversationTransfers[transferId];
+  ok(uncertain?.status === "seed_uncertain", "unconfirmed target seed is recorded as delivery-uncertain", JSON.stringify(uncertain));
+  ok(!!storage.herdrWakeBindings[sourceKey], "source binding stays authoritative while target delivery is uncertain");
+  ok(!storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`], "uncertain target never receives the workspace binding");
+
+  handoffSeedMode = "confirmed";
+  let resolveResume;
+  const resumeP = new Promise((r) => { resolveResume = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: 401 }, { tab: { id: 401 } }, (r) => resolveResume(r));
+  const resumed = await resumeP;
+  ok(resumed?.ok === true, "explicit resume completes the target seed and cutover", JSON.stringify(resumed));
+  const targetKey = `${PROJECT_TARGET}::wH`;
+  ok(!storage.herdrWakeBindings[sourceKey], "committed rollover removes the old conversation binding");
+  ok(!!storage.herdrWakeBindings[targetKey], "committed rollover moves binding to the new Project conversation");
+  ok(storage.herdrWakeBindings[targetKey]?.continuity_id === continuityId, "continuity id survives the conversation cutover");
+  ok(storage.herdrWakeBindings[targetKey]?.handoff_from === PROJECT_SOURCE, "target binding records its predecessor conversation");
+  ok(storage.herdrConversationTransfers[transferId]?.status === "committed", "transfer metadata records committed state");
+  ok(storage.herdrConversationTransfers[transferId]?.handoff_text == null, "committed transfer clears the temporary handoff packet");
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);

@@ -22,6 +22,11 @@ import {
   parseLlmSkipKeywords, llmReplyMatchesSkipKeyword, assistantNudgeFingerprint,
   conversationInfoFromSupportedUrl,
 } from "../../extension/binding-core.js";
+import {
+  buildHandoffRequest, buildHandoffSeed, chatGptConversationInfo,
+  extractHandoffPacket, handoffSeedContainsTransfer,
+  newContinuityId, newTransferId,
+} from "../../extension/continuity-core.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const EXT = path.join(__dirname, "..", "..", "extension");
@@ -49,9 +54,9 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.38", "manifest version keeps discovery transport alive without bindings");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.38"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.38"'), "content version matches manifest");
+ok(manifest.version === "0.1.39", "manifest version includes Project conversation rollover");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.39"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.39"'), "content version matches manifest");
 ok(
   backgroundSource.includes("bound_workspace_ids:") && backgroundSource.includes("workspaces: state?.ok"),
   "page HUD response carries live workspaces and bound workspace ids",
@@ -63,6 +68,20 @@ ok(
 ok(
   wakeSource.includes('select class="ws"') && wakeSource.includes("toggleHudWorkspaceBinding") && wakeSource.includes("paintWorkspaceControls"),
   "in-page HUD renders and operates a workspace picker",
+);
+ok(
+  wakeSource.includes('class="handoff-action"')
+    && wakeSource.includes("h2w_handoff_start")
+    && wakeSource.includes("h2w_handoff_seed")
+    && wakeSource.includes("h2w_handoff_probe"),
+  "in-page HUD exposes Project rollover and target confirmation",
+);
+ok(
+  backgroundSource.includes("herdrConversationTransfers")
+    && backgroundSource.includes("source_binding_set_changed")
+    && backgroundSource.includes("seed_uncertain")
+    && backgroundSource.includes("commitHandoffTransfer"),
+  "background persists crash-safe handoff state and fail-closed binding cutover",
 );
 ok(
   wakeSource.includes("registerCurrentConversation")
@@ -116,8 +135,9 @@ ok(
 );
 
 {
-  const code = readFileSync(path.join(EXT, "content/base.js"), "utf8");
-  const projectConversation = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/c/6a89c95e-70bc-83ea-bf3d-fab6b83fc86e";
+  const baseCode = readFileSync(path.join(EXT, "content/base.js"), "utf8");
+  const chatgptCode = readFileSync(path.join(EXT, "content", "injector", "chatgpt.js"), "utf8");
+  const projectConversation = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978-herdr-mcp/c/6a89c95e-70bc-83ea-bf3d-fab6b83fc86e";
   const u = new URL(projectConversation);
   const window = {};
   const ctx = vm.createContext({
@@ -126,21 +146,61 @@ ok(
     document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
     console,
   });
-  vm.runInContext(code, ctx);
-  const key = vm.runInContext("new BaseAdapter().getConversationKey()", ctx);
-  ok(key === projectConversation, "ChatGPT project conversation URL is preserved as the binding key");
+  vm.runInContext(baseCode, ctx);
+  vm.runInContext(chatgptCode, ctx);
+  const key = vm.runInContext("window.__H2W_ADAPTER__.getConversationKey()", ctx);
+  ok(key === "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/c/6a89c95e-70bc-83ea-bf3d-fab6b83fc86e",
+    "ChatGPT Project slug is normalized out of the binding key");
+
+  const projectCtx = vm.createContext({
+    window: {},
+    location: { origin: u.origin, pathname: "/g/g-p-6a89c078669481918c8eb70fdfd3d978-herdr-mcp/project" },
+    document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
+    console,
+  });
+  vm.runInContext(baseCode, projectCtx);
+  vm.runInContext(chatgptCode, projectCtx);
+  ok(vm.runInContext("window.__H2W_ADAPTER__.getConversationKey()", projectCtx) === null,
+    "ChatGPT Project home is not misclassified as a conversation");
 }
 {
   const normal = "https://chatgpt.com/c/6a89c95e-70bc-83ea-bf3d-fab6b83fc86e";
   const project = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/c/6a8ae745-a3dc-83ea-91f0-218dd5be7807";
+  const slugged = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978-herdr-mcp/c/6a8ae745-a3dc-83ea-91f0-218dd5be7807";
   ok(conversationInfoFromSupportedUrl(normal)?.convKey === normal,
     "URL fallback recognizes a normal ChatGPT conversation");
   ok(conversationInfoFromSupportedUrl(project)?.convKey === project,
     "URL fallback recognizes the reported ChatGPT project conversation");
+  ok(conversationInfoFromSupportedUrl(slugged)?.convKey === project,
+    "URL fallback normalizes a slugged ChatGPT Project alias to the resource-id key");
+  ok(chatGptConversationInfo(slugged)?.project_launch_url === "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978",
+    "Project rollover launcher uses stable Project resource id");
   ok(conversationInfoFromSupportedUrl("https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978") === null,
     "URL fallback rejects a ChatGPT project page without a conversation");
   ok(conversationInfoFromSupportedUrl("https://example.com/c/abc") === null,
     "URL fallback rejects unsupported hosts");
+}
+
+console.log("\n[conversation continuity]");
+{
+  const transferId = newTransferId(1700000000000, 0.25);
+  const continuityId = newContinuityId(1700000000000, 0.5);
+  ok(transferId.startsWith("ht:") && continuityId.startsWith("hc:"),
+    "continuity and transfer ids use separate namespaces");
+  const request = buildHandoffRequest({
+    transferId,
+    bindings: [{ workspace_id: "w5W", workspace_label: "herdr-mcp (w5W)" }],
+  });
+  ok(request.includes(`<<<HERDR_HANDOFF_V1 id=${transferId}>>>`) && request.includes("herdr-mcp (w5W)"),
+    "handoff request carries transfer marker and bound workspace context");
+  const assistant = `<<<HERDR_HANDOFF_V1 id=${transferId}>>>\n# Project handoff\nCurrent objective: continue binding work.\nNext: verify live state.\n<<<END_HERDR_HANDOFF_V1>>>`;
+  const packet = extractHandoffPacket(assistant, transferId);
+  ok(!!packet && packet.includes("Current objective"), "handoff packet extracts the marked assistant payload");
+  ok(extractHandoffPacket(assistant, "ht:wrong") === null, "handoff packet rejects a mismatched transfer id");
+  const seed = buildHandoffSeed({ transferId, packet });
+  ok(handoffSeedContainsTransfer(seed, transferId), "new-conversation seed carries the transfer marker");
+  ok(seed.includes("verify the relevant current Herdr/runtime/Git state"),
+    "seed requires live-state verification before mutations");
 }
 
 ok(
@@ -151,20 +211,25 @@ ok(
 
 const localeCodes = ["en", "zh", "ja"];
 const localeHud = {};
+const localeHandoff = {};
 for (const code of localeCodes) {
   const locPath = path.join(EXT, "locales", `${code}.json`);
   ok(existsSync(locPath), `locale file exists: ${code}`);
   const loc = JSON.parse(readFileSync(locPath, "utf8"));
   localeHud[code] = Object.keys(loc).filter((k) => k.startsWith("hud_")).sort();
+  localeHandoff[code] = Object.keys(loc).filter((k) => k.startsWith("handoff_")).sort();
 }
 ok(localeHud.en.length > 0, "en has hud keys");
 ok(localeHud.zh.join(",") === localeHud.en.join(","), "zh hud keys match en");
 ok(localeHud.ja.join(",") === localeHud.en.join(","), "ja hud keys match en");
+ok(localeHandoff.en.length > 0, "en has handoff keys");
+ok(localeHandoff.zh.join(",") === localeHandoff.en.join(","), "zh handoff keys match en");
+ok(localeHandoff.ja.join(",") === localeHandoff.en.join(","), "ja handoff keys match en");
 
 // ---- 2. JavaScript syntax for the fixed file list ----
-const fixed = ["background.js", "options.js", "popup.js", "content/base.js",
+const fixed = ["background.js", "binding-core.js", "continuity-core.js", "options.js", "popup.js", "content/base.js",
   "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/claude.js",
-  "content/injector/chatgpt.js", "content/webmcp/speaks-json.js", "content/wake.js", "binding-core.js"];
+  "content/injector/chatgpt.js", "content/webmcp/speaks-json.js", "content/wake.js"];
 for (const f of fixed) {
   const p = path.join(EXT, f);
   const r = spawnSync(process.execPath, ["--check", p], { encoding: "utf8" });

@@ -10,6 +10,7 @@ ChatGPT can retain a `tools/list` snapshot for a conversation. A runtime version
 
 - Make `workspace.list` the sole admission authority for unknown workspace IDs. Contradictory daemon event sequences such as `workspace_closed` followed by stale `workspace_created` can no longer resurrect a closed workspace.
 - The first event for an unknown workspace forces an immediate full reconciliation; a genuinely new workspace is admitted as soon as `workspace.list` confirms it, while repeated orphan events are ignored without refresh loops.
+- Browser extension **0.1.39** adds fail-closed ChatGPT Project conversation rollover: the current web model produces a marked compact handoff, a fresh chat in the same Project is seeded, and Herdr workspace bindings move only after the target conversation and seed are confirmed. Project URL aliases with cosmetic slugs normalize to the stable Project resource id, and explicit workspace bindings no longer silently expire after 24 hours.
 
 ## 0.3.30 — 2026-08-23
 

@@ -7,6 +7,25 @@ class ChatGPTAdapter extends BaseAdapter {
   get name() { return "chatgpt"; }
   get needsMainWorldInsert() { return true; }
 
+  getConversationKey() {
+    try {
+      const origin = location.origin;
+      const pathname = location.pathname.replace(/\/+$/, "") || "/";
+      const normal = pathname.match(/^\/c\/([^/]+)$/);
+      if (normal) return `${origin}/c/${normal[1]}`;
+
+      const project = pathname.match(/^\/g\/(g-p-[^/]+)\/c\/([^/]+)$/i);
+      if (!project) return null;
+      // ChatGPT may decorate a Project resource id with a human-readable slug.
+      // Bindings intentionally normalize that cosmetic suffix away.
+      const m = project[1].match(/^(g-p-[0-9a-f]{32})(?:-[^/]*)?$/i);
+      const projectId = m ? m[1] : project[1];
+      return `${origin}/g/${projectId}/c/${project[2]}`;
+    } catch (_) {
+      return null;
+    }
+  }
+
   getInputEl() {
     return document.querySelector('#prompt-textarea[contenteditable="true"]');
   }
@@ -39,8 +58,6 @@ class ChatGPTAdapter extends BaseAdapter {
   getSendButton() {
     return this.getSendButtonCandidates()[0] || null;
   }
-
-  // Conversation identity uses host plus pathname via the default implementation.
 }
 
 window.__H2W_ADAPTER__ = new ChatGPTAdapter();
