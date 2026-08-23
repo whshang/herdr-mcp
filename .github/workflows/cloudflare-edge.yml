@@ -10,6 +10,7 @@ on:
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/cloudflare-edge.yml"
+      - "scripts/ci-herdr-runtime.sh"
   workflow_dispatch:
 
 permissions:
