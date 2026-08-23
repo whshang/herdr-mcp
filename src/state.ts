@@ -65,6 +65,7 @@ export class SnapshotCache {
   private digestCursor = 0;
   private readonly listeners = new Set<(ev: HerdrEvent) => void>();
   private lastActivityByPane = new Map<string, number>();
+  private liveWorkspaceIds = new Set<string>();
   private lastFullSnapAt = 0;
   private started = false;
   private loopError: Error | null = null;
@@ -146,6 +147,15 @@ export class SnapshotCache {
     const prevAgents = (this.state["agents"] as unknown[]) ?? [];
     const prevLastAct = new Map(this.lastActivityByPane);
     this.state = snap;
+    this.liveWorkspaceIds = new Set(
+      ((this.state["workspaces"] as unknown[]) ?? [])
+        .map((w) => {
+          const rec = (w ?? {}) as Record<string, unknown>;
+          return typeof rec["workspace_id"] === "string" ? rec["workspace_id"] as string
+            : typeof rec["id"] === "string" ? rec["id"] as string : null;
+        })
+        .filter((id): id is string => !!id),
+    );
     // Preserve last_activity timestamps for agents that persist across snapshots.
     for (const a of prevAgents) {
       const rec = a as Record<string, unknown>;
@@ -197,13 +207,24 @@ export class SnapshotCache {
     const pane = (data["pane"] ?? undefined) as Record<string, unknown> | undefined;
     const ws = (data["workspace"] ?? undefined) as Record<string, unknown> | undefined;
     const tab = (data["tab"] ?? undefined) as Record<string, unknown> | undefined;
+    const paneWorkspaceId = typeof pane?.["workspace_id"] === "string" ? pane["workspace_id"] as string : null;
+    const eventWorkspaceId = typeof ws?.["workspace_id"] === "string" ? (ws["workspace_id"] as string)
+      : typeof data["workspace_id"] === "string" ? (data["workspace_id"] as string) : null;
+    const tabWorkspaceId = typeof tab?.["workspace_id"] === "string" ? tab["workspace_id"] as string : null;
+    const workspaceCreated = evType === "workspace_created" || evType === "workspace.created" || evType === "workspace_created_event";
+    const workspaceClosed = evType === "workspace_closed" || evType === "workspace.closed" || evType === "workspace_closed_event";
+
+    // Herdr can continue emitting updates for orphan panes after their workspace
+    // has disappeared from workspace.list. Ignore those stale topology events;
+    // only an explicit workspace-created event can admit a new workspace id.
+    if (paneWorkspaceId && !this.liveWorkspaceIds.has(paneWorkspaceId)) return;
+    if (tabWorkspaceId && !this.liveWorkspaceIds.has(tabWorkspaceId)) return;
+    if (eventWorkspaceId && !workspaceCreated && !workspaceClosed && !this.liveWorkspaceIds.has(eventWorkspaceId)) return;
     // ❺: append a compact event to the bounded digest history for herdr_since.
     this.digestCursor++;
     const dig: DigestEvent = { cursor: this.digestCursor, at: new Date(this._lastEventAt).toISOString(), type: evType ?? "unknown" };
     if (pane && typeof pane["pane_id"] === "string") dig.pane_id = pane["pane_id"] as string;
     if (pane) dig.pane = pane;
-    const eventWorkspaceId = typeof ws?.["workspace_id"] === "string" ? (ws["workspace_id"] as string)
-      : typeof data["workspace_id"] === "string" ? (data["workspace_id"] as string) : null;
     if (eventWorkspaceId) dig.workspace_id = eventWorkspaceId;
     if (ws) dig.workspace = ws;
     if (tab && typeof tab["tab_id"] === "string") dig.tab = tab;
@@ -254,11 +275,11 @@ export class SnapshotCache {
     // workspace_id directly on data instead of attaching data.workspace. Remove
     // the entire workspace scope immediately so stale panes cannot recreate a
     // phantom workspace in /push/state consumers.
-    const workspaceClosed = evType === "workspace_closed" || evType === "workspace.closed" || evType === "workspace_closed_event";
     if (eventWorkspaceId && workspaceClosed) {
       this.removeWorkspace(eventWorkspaceId);
     } else if (ws && typeof ws["workspace_id"] === "string") {
       const wid = ws["workspace_id"] as string;
+      if (workspaceCreated) this.liveWorkspaceIds.add(wid);
       {
         const wss = this.ensureArray("workspaces");
         const i = wss.findIndex((w) => (w as Record<string, unknown>)["workspace_id"] === wid);
@@ -304,6 +325,7 @@ export class SnapshotCache {
   }
 
   private removeWorkspace(wid: string): void {
+    this.liveWorkspaceIds.delete(wid);
     const wss = this.ensureArray("workspaces");
     for (let i = wss.length - 1; i >= 0; i--) {
       if (wss[i]["workspace_id"] === wid || wss[i]["id"] === wid) wss.splice(i, 1);
