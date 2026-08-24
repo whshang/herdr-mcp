@@ -252,8 +252,8 @@ OAuth / skill / 状态目录等见 [docs/i18n/zh-CN/architecture.md](docs/i18n/z
 
 两件工作（见 [docs/i18n/zh-CN/extension.md](docs/i18n/zh-CN/extension.md)）共享本地 token，**完成度不对等**：
 
-1. **网页连续工作自动化（已可用）**：Options 选择“全局手动 / 项目自动”；底部 HUD 提供「手动继续 / herdr监控 / LLM 分析 / 手动接力」，项目自动时另有 `自动 开/关`。新 Project 默认 `自动 关`，同一 Project 的多个会话与接力后的新会话共享设置。0.1.44 新增 stale-view 恢复；0.1.45 在 `自动 开` 时把整条 HUD 强化为浅绿色；0.1.46 新增独立于自动开关的“手动接力”，可主动总结当前已绑定 Project 对话并安全迁移到同一 Project 的新对话。
-2. **JSON→MCP（未完成）**：DeepSeek / z.ai 能从助手回复抠 `{"tool":...}`，**还不会**调本机 `/mcp` 或把结果回填。路线见 [docs/i18n/zh-CN/extension-bridge.md](docs/i18n/zh-CN/extension-bridge.md)。
+1. **网页连续工作自动化（已可用）**：Options 选择“全局手动 / 项目自动”；底部 HUD 提供「手动继续 / herdr监控 / LLM 分析 / 手动接力」，允许自动化时另有 `自动 开/关`。ChatGPT 按 `project_id` 保存自动设置；z.ai / DeepSeek 按具体会话保存。0.1.47 起，`自动 开` 会锁定全部 HUD 手动操作（包括“手动接力”）；已绑定且已落成 `/c/<chat_id>` 的 z.ai 会话也支持 fail-closed 手动接力。z.ai 新聊天根页 `/` 的 binding/自动偏好会在首次落成 `/c/<chat_id>` 后迁移过去，但切换历史聊天不会跟随迁移。
+2. **JSON→MCP（已可用）**：DeepSeek / z.ai 的本地 JSON bridge 会从网页任务中驱动 `127.0.0.1:8772/mcp` 的 `tools/list` / `tools/call`，在受限轮次内回填工具结果；静态 Herdr token 只留在扩展 service worker，不暴露给页面脚本。路线与安全边界见 [docs/i18n/zh-CN/extension-bridge.md](docs/i18n/zh-CN/extension-bridge.md)。
 
 共享本地 `127.0.0.1:8772` 与静态 token。这不是给 DeepSeek「安装」ChatGPT 式 OAuth connector。默认：进度检查间隔 **60 秒**，摘要不变时兜底 **20 分钟**（`progressTickSec` / `progressFallbackSec`）。
 
@@ -267,7 +267,7 @@ OAuth / skill / 状态目录等见 [docs/i18n/zh-CN/architecture.md](docs/i18n/z
 | [docs/i18n/zh-CN/chatgpt-connector.md](docs/i18n/zh-CN/chatgpt-connector.md) | ChatGPT OAuth / 传输 / schema |
 | [docs/i18n/zh-CN/extension.md](docs/i18n/zh-CN/extension.md) | 扩展总览 |
 | [docs/i18n/zh-CN/extension-wake.md](docs/i18n/zh-CN/extension-wake.md) | 主线 A：进度回推 |
-| [docs/i18n/zh-CN/extension-bridge.md](docs/i18n/zh-CN/extension-bridge.md) | 主线 B：JSON→MCP（未完成） |
+| [docs/i18n/zh-CN/extension-bridge.md](docs/i18n/zh-CN/extension-bridge.md) | 主线 B：本地 JSON→MCP（已可用） |
 | [docs/i18n/zh-CN/cli-reference.md](docs/i18n/zh-CN/cli-reference.md) | herdr-mcp CLI / bin 工具 / 环境变量 |
 | [docs/i18n/zh-CN/best-practices.md](docs/i18n/zh-CN/best-practices.md) | 运行规则与端到端示例 |
 | [docs/i18n/zh-CN/troubleshooting.md](docs/i18n/zh-CN/troubleshooting.md) | 按症状优先的排障清单 |

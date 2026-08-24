@@ -135,7 +135,7 @@ Environment variables. The `HERDR_MCP_HOST` in the plist example is **not** read
 
 - [CHANGELOG.md](../../../CHANGELOG.md) — versions and tool surface
 - [capability-benchmark.md](./capability-benchmark.md) — adoption and "not adopted" decisions vs. official Herdr / other Herdr MCP implementations / coding-tools-mcp
-- [extension.md](./extension.md) — extension overview (A available, B incomplete)
+- [extension.md](./extension.md) — extension overview (A continuity + B local JSON→MCP both available)
 - [chatgpt-connector.md](./chatgpt-connector.md) — ChatGPT OAuth, schema, permission cards
 - [extension-wake.md](./extension-wake.md) — track A: workspace observation + global manual/per-Project mode + Project automation switch + progress/settled push-back + Manual continue/monitor/LLM analysis + independent Manual handoff + timeout recovery / safe Project rollover
 - [extension-bridge.md](./extension-bridge.md) — track B: JSON→MCP (parsing exists, closed loop does not)

@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.46";
+const H2W_CONTENT_VERSION = "0.1.47";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -29,6 +29,9 @@ const H2W_CONTENT_VERSION = "0.1.46";
 
   function runtimeAlive() {
     try { return !!chrome.runtime?.id; } catch { return false; }
+  }
+  function usesOperationalHud() {
+    return ["chatgpt", "z.ai", "deepseek"].includes(ADAPTER.name);
   }
   function sendBg(msg) {
     return new Promise((resolve) => {
@@ -481,6 +484,17 @@ const H2W_CONTENT_VERSION = "0.1.46";
     try {
       if (data.autoAllow !== false) startPermissionWatch();
 
+      // z.ai/DeepSeek JSON bridge intentionally intercepts normal user submits
+      // so it can add the Herdr tool protocol. Handoff prompts and seeds are
+      // continuity-control messages, not agent tasks; send them through the
+      // bridge's raw channel so they are not rewritten into a coding prompt.
+      const jsonBridge = globalThis.__H2W_JSON_BRIDGE__ || null;
+      if (data.handoff === true && typeof jsonBridge?.sendRaw === "function") {
+        const sent = await jsonBridge.sendRaw(text);
+        noteWakeResult(n, sent);
+        return { ok: sent, committed: sent, site: ADAPTER.name, raw: true, error: sent ? undefined : "submit-failed" };
+      }
+
       if (resumeOnly) {
         const sent = await submit();
         noteWakeResult(n, sent);
@@ -545,9 +559,44 @@ const H2W_CONTENT_VERSION = "0.1.46";
 
   // ---- Idle nudge helpers (shared with snapshot + turn watch) ----
   function lastMessageByRole(role) {
+    try {
+      if (typeof ADAPTER.getLastMessageText === "function") {
+        const text = String(ADAPTER.getLastMessageText(role) || "").trim();
+        if (text) return text;
+      }
+    } catch (_) {}
     const nodes = [...document.querySelectorAll(`[data-message-author-role="${role}"]`)];
     const el = nodes[nodes.length - 1];
     return el ? String(el.innerText || "").trim() : "";
+  }
+
+  async function waitForStableAssistantReply(beforeText = "", beforeCount = 0, timeoutMs = 120000) {
+    if (!SPEAKS?.enabled) return { ok: false, error: "reply-monitor-unavailable" };
+    const deadline = Date.now() + timeoutMs;
+    let latest = "";
+    let stableTicks = 0;
+    while (Date.now() < deadline) {
+      if (!runtimeAlive()) return { ok: false, error: "context-invalidated" };
+      const text = String(SPEAKS.getLatestReply() || "").trim();
+      const count = Number(SPEAKS.getReplyBlockCount() || 0);
+      const changed = Boolean(text) && (text !== beforeText || count > beforeCount);
+      if (changed) {
+        if (text !== latest) {
+          latest = text;
+          stableTicks = 0;
+        } else {
+          stableTicks += 1;
+        }
+        if (stableTicks >= 3 && SPEAKS.isReplyDone()) {
+          return { ok: true, assistantText: text };
+        }
+      }
+      await wait(500);
+    }
+    const text = String(SPEAKS.getLatestReply() || "").trim();
+    return text && text !== beforeText
+      ? { ok: true, assistantText: text, timedOut: true }
+      : { ok: false, error: "reply-timeout" };
   }
 
   function hasHandoffTransferMarker(text, transferId) {
@@ -673,12 +722,19 @@ const H2W_CONTENT_VERSION = "0.1.46";
       }
       if (msg?.type === "h2w_handoff_prompt") {
         (async () => {
+          const beforeText = SPEAKS?.enabled ? SPEAKS.getLatestReply() : "";
+          const beforeCount = SPEAKS?.enabled ? SPEAKS.getReplyBlockCount() : 0;
           const result = await performWake({
             template: msg.template || "",
             autoAllow: false,
             handoff: true,
           });
-          sendResponse(result);
+          if (!result?.ok || ADAPTER.name === "chatgpt") {
+            sendResponse(result);
+            return;
+          }
+          const reply = await waitForStableAssistantReply(beforeText, beforeCount);
+          sendResponse({ ...result, ...reply });
         })();
         return true;
       }
@@ -705,13 +761,13 @@ const H2W_CONTENT_VERSION = "0.1.46";
         return;
       }
       if (msg?.type === "h2w_handoff_committed" || msg?.type === "h2w_handoff_moved") {
-        if (ADAPTER.name === "chatgpt") void refreshPageHud();
+        if (usesOperationalHud()) void refreshPageHud();
         sendResponse({ ok: true });
         return;
       }
       if (msg?.type === "h2w_bound" || msg?.type === "h2w_unbound") {
         console.log(`[h2w] ${msg.type === "h2w_bound" ? "bound " + msg.pane : "unbound"}`);
-        if (ADAPTER.name === "chatgpt") void refreshPageHud();
+        if (usesOperationalHud()) void refreshPageHud();
         return;
       }
       if (msg?.type === "h2w_automation_changed") {
@@ -767,7 +823,7 @@ const H2W_CONTENT_VERSION = "0.1.46";
       }
       if (changed) {
         console.log(`[h2w] conversation route changed (${reason}): ${convKey}`);
-        if (ADAPTER.name === "chatgpt") void refreshPageHud();
+        if (usesOperationalHud()) void refreshPageHud();
       }
     }
     return response;
@@ -1306,10 +1362,11 @@ const H2W_CONTENT_VERSION = "0.1.46";
     const status = String(hud?.handoff?.status || "");
     const active = ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(status)
       && hud?.handoff?.can_resume !== true;
-    hudEls.handoff.hidden = !hud?.project_id;
+    hudEls.handoff.hidden = hud?.manual_handoff_available !== true;
     hudEls.handoff.textContent = handoffButtonText(hud);
     hudEls.handoff.title = hudText("manual_handoff_hint");
-    hudEls.handoff.disabled = hudActionBusy || active || hud?.bound !== true;
+    hudEls.handoff.disabled = hudActionBusy || hud?.enabled === true || active || hud?.bound !== true;
+    hudEls.handoff.classList.toggle("locked", hud?.enabled === true);
     hudEls.handoff.setAttribute("aria-disabled", String(hudEls.handoff.disabled));
   }
 
@@ -1335,12 +1392,15 @@ const H2W_CONTENT_VERSION = "0.1.46";
 
   async function setHudProjectAutomation(enabled) {
     if (hudActionBusy) return;
-    if (hudCache?.project_automation_available !== true || !hudCache?.project_id) return;
+    const projectMode = hudCache?.project_automation_available === true && Boolean(hudCache?.project_id);
+    const conversationMode = hudCache?.conversation_automation_available === true;
+    if (!projectMode && !conversationMode) return;
     setHudActionBusy(true);
     const on = Boolean(enabled);
     const result = await sendBg({
       type: "h2w_set_project_automation",
-      project_id: hudCache.project_id,
+      project_id: projectMode ? hudCache.project_id : null,
+      site: ADAPTER.name,
       convKey: ADAPTER.getConversationKey(),
       enabled: on,
     });
@@ -1350,7 +1410,8 @@ const H2W_CONTENT_VERSION = "0.1.46";
         ...(hudCache || {}),
         enabled: on,
         idleNudgeEnabled: on,
-        project_automation_enabled: on,
+        project_automation_enabled: projectMode ? on : hudCache?.project_automation_enabled,
+        conversation_automation_enabled: conversationMode ? on : hudCache?.conversation_automation_enabled,
       };
       syncAutomationPermissionWatch();
       paintPageHud({ hud: hudCache });
@@ -1513,14 +1574,16 @@ const H2W_CONTENT_VERSION = "0.1.46";
 
   function handoffErrorText(error) {
     const code = String(error || "unknown");
-    if (code === "project_conversation_required") return hudText("handoff_project_only");
+    if (["project_conversation_required", "handoff_conversation_required"].includes(code)) return hudText("handoff_project_only");
     if (code === "binding_required") return hudText("handoff_binding_required");
     if (code === "workspace_busy") return hudText("handoff_workspace_busy");
+    if (code === "automation_enabled") return hudText("handoff_automation_enabled");
     return hudText("handoff_failed", { error: code });
   }
 
   async function manualHandoffAction() {
     if (hudActionBusy) return { ok: false, error: "busy" };
+    if (hudCache?.enabled === true) return { ok: false, error: "automation_enabled" };
     setHudActionBusy(true);
     try {
       const result = await sendBg({ type: "h2w_handoff_start", trigger: "manual" });
@@ -1558,7 +1621,8 @@ const H2W_CONTENT_VERSION = "0.1.46";
           box-shadow: 0 -1px 8px rgba(0,0,0,.04);
           pointer-events: auto; user-select: none;
           backdrop-filter: blur(10px);
-          transition: background-color .18s ease, border-color .18s ease, box-shadow .18s ease, color .18s ease;
+          /* Keep the automation cue deterministic. Frequent HUD refreshes can restart CSS transitions and leave the bar visually stuck at the neutral color. */
+          transition: none;
         }
         .bar.automation-on {
           color: #244c35;
@@ -1594,10 +1658,11 @@ const H2W_CONTENT_VERSION = "0.1.46";
         }
         .quick.on { color: #166534; background: #f0fdf4; border-color: #bbf7d0; }
         .quick.off { color: #6b7280; background: #f5f5f5; }
-        .manual.locked { opacity: .45; cursor: not-allowed; }
+        .manual.locked, .handoff.locked { opacity: .45; cursor: not-allowed; }
         .expand { width: 24px; padding: 0; font-size: 13px; }
         button:hover { filter: brightness(.97); }
         button:disabled, input:disabled { opacity: .55; cursor: wait; }
+        .manual.locked:disabled, .handoff.locked:disabled { opacity: .45; cursor: not-allowed; }
         .bar.waiting .status { color: #8a4b00; }
         .bar.working .status { color: #a15c00; }
         .bar.done .status, .bar.idle .status { color: #18794e; }
@@ -1721,7 +1786,7 @@ const H2W_CONTENT_VERSION = "0.1.46";
       setHudExpanded(!hudExpanded);
     });
     hudEls.quick.addEventListener("click", () => {
-      void setHudProjectAutomation(!(hudCache?.project_automation_enabled === true));
+      void setHudProjectAutomation(!(hudCache?.enabled === true));
     });
     hudEls.handoff.addEventListener("click", () => { void manualHandoffAction(); });
     hudEls.manualButtons.forEach((button, index) => {
@@ -1831,13 +1896,17 @@ const H2W_CONTENT_VERSION = "0.1.46";
       ui.manualButtons[i].title = title || "";
     }
     syncHudManualButtons();
-    ui.quick.hidden = hud?.project_automation_available !== true;
+    ui.quick.hidden = hud?.project_automation_available !== true
+      && hud?.conversation_automation_available !== true;
     syncHudHandoffButton();
     ui.quick.textContent = enabled ? hudText("automation_on", null, "Auto on") : hudText("automation_off", null, "Auto off");
     ui.quick.className = `quick ${enabled ? "on" : "off"}`;
     ui.quick.setAttribute("aria-pressed", String(enabled));
     ui.quick.setAttribute("aria-label", hudText("aria_toggle_automation"));
-    ui.quick.title = enabled ? hudText("automation_on_hint") : hudText("automation_off_hint");
+    const conversationAutomation = hud?.conversation_automation_available === true && !hud?.project_id;
+    ui.quick.title = conversationAutomation
+      ? (enabled ? hudText("conversation_automation_on_hint") : hudText("conversation_automation_off_hint"))
+      : (enabled ? hudText("automation_on_hint") : hudText("automation_off_hint"));
     ui.expand.setAttribute("aria-label", hudText("aria_open_controls"));
     ui.expand.title = hudText("aria_open_controls");
     ui.conversation.textContent = ADAPTER.getConversationKey();

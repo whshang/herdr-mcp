@@ -2,6 +2,10 @@
 class DeepSeekAdapter extends BaseAdapter {
   get name() { return "deepseek"; }
 
+  get replySelector() {
+    return ".ds-message .ds-assistant-message-main-content";
+  }
+
   // DeepSeek uses textarea[name=search] as its composer.
   getInputEl() {
     return document.querySelector("textarea[name=search]") || document.querySelector("textarea");

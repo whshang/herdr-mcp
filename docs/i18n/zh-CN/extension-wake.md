@@ -56,7 +56,7 @@
 3. 回复落在「不发送关键词」→ 不催；否则若判定为继续 → **把小模型原文**灌进对话框并提交（提示词 / 不发送词在 Options 预填可见默认文案）
 4. **不再使用**零工具 / 半途启发式；未配置小模型则本回合不催
 5. 用户气泡若是上次催促句，**仍会**对助手新回复做判定（0.1.20 起）；自动判断冷却与进度检查共用 `progressTickSec`，`0` 关闭自动 LLM 判断（默认 60s），不影响手动 **LLM 分析**
-6. ChatGPT 页底部 HUD：运行状态、**手动继续 / herdr监控 / LLM 分析 / 手动接力**、可选的 Project **自动 开|关**、展开；只有 Options 为项目自动时才显示 Project 开关。`手动接力` 只在 ChatGPT Project 出现，绑定 workspace 后可用，即使 `自动 开` 也保留。高频动作都在底栏，展开浮层只放事件设置、会话绑定和高级选项。文案跟 Options 语言（en / 简中 / 日语）
+6. 支持站点页底部 HUD：运行状态、**手动继续 / herdr监控 / LLM 分析 / 手动接力**、可选的 **自动 开|关**、展开。Options 允许自动化时，ChatGPT Project 按 `project_id` 显示 Project 级开关，z.ai / DeepSeek 按具体 conversation 显示会话级开关；全局手动时不显示自动开关。`手动接力` 支持已绑定 ChatGPT Project 和已落成 `/c/<chat_id>` 的 z.ai 会话；`自动 开` 时四个 HUD 手动操作全部锁定。高频动作都在底栏，展开浮层只放事件设置、会话绑定和高级选项。文案跟 Options 语言（en / 简中 / 日语）
 7. herdr working/settled 唤醒仍独立存在
 
 密钥只存本机，仓库默认留空。
@@ -72,16 +72,17 @@ Project `自动 开` 时，人工发送和扩展自动发送的用户消息都�
 
 刷新前记录当前 assistant 指纹。刷新后如果内容变长或重新开始 streaming，就认为页面已经恢复；如果 10 秒后仍是完全相同的半截回复，并且编辑器、工具、权限卡都空闲，则只发送一次浏览器恢复激活消息，让 ChatGPT 重新读取当前会话，从实际停止处继续且不要重复已完成工作。该消息仍失败后才进入 recovery-exhausted rollover。
 
-## 手动接力（0.1.46）
+## 手动接力（0.1.47）
 
-底部 HUD 的 **手动接力**允许用户主动提前换会话，不依赖 `自动 开/关`：
+底部 HUD 的 **手动接力**用于主动提前换会话，但必须先把当前会话切到 `自动 关`：
 
-- 仅 ChatGPT Project 显示；当前 conversation 必须先绑定 Herdr workspace。
-- 点击后调用已有 `h2w_handoff_start(trigger=manual)`，先让当前 ChatGPT 生成带 transfer-id 的紧凑 handoff packet。
-- 绑定 workspace 仍在 `working` 时拒绝开始，避免 settled/wake 与 binding cutover 竞争。
-- packet 完成后在同一个 Project 打开新 conversation 并提交 seed；只有确认新 conversation 和 seed 都真实存在后，才把 workspace binding 从旧 conversation 迁到新 conversation。
+- 支持已绑定的 ChatGPT Project conversation，以及已经落成稳定 `/c/<chat_id>` 的 z.ai conversation；z.ai 根页 `/` 只是新聊天启动页，不显示手动接力。
+- 点击后调用 `h2w_handoff_start(trigger=manual)`，先让当前网页模型生成带 transfer-id 的紧凑 handoff packet。
+- z.ai 的 summary / seed 通过 raw 通道发送，明确绕过 JSON→MCP bridge，避免接力控制消息被改写成 coding-agent task。
+- 绑定 workspace 仍在 `working` 时拒绝开始，避免 settled/wake 与 binding cutover 竞争；`自动 开` 时前端按钮锁定，background 也会再次返回 `automation_enabled`，不能绕过 HUD 并发触发。
+- ChatGPT 在同一个 Project 打开新 conversation；z.ai 从 `/` 启动新聊天。只有确认目标会话已经形成新的 conversation id 且 seed marker 真正存在后，才把 workspace binding 从旧 conversation 迁到新 conversation。
 - 已有接力任务时按钮显示 **压缩中… / 接力中… / 恢复接力**，避免重复创建 transfer；`seed_uncertain` 时可用“恢复接力”继续 fail-closed 恢复。
-- `自动 开` 时前三个手动推进按钮会锁定，但 **手动接力不会被自动模式锁掉**，因为它是用户主动控制对话生命周期的操作。
+- z.ai 从根页 `/` 首次落成 `/c/<chat_id>` 时，临时 binding 与会话自动化偏好只迁移这一次；之后从 `/c/A` 切到 `/c/B` 不会跟随迁移。
 
 ## 多任务语义
 

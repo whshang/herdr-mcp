@@ -254,8 +254,8 @@ Folder: `extension/` (MV3, Chrome name **herdr → Web wake**). Load unpacked in
 
 Two jobs ([docs/i18n/en/extension.md](docs/i18n/en/extension.md)) — they share the local token; they are **not** equally finished:
 
-1. **Web continuity automation (shipping)** — Options selects **Manual globally / Per-Project automation**. The bottom HUD exposes **Manual continue / Herdr monitor / LLM analysis / Manual handoff**, plus `Auto on|off` when per-Project automation is enabled. New Projects default off and share that preference across their conversations and rollover successors. Version 0.1.44 adds stale-view recovery; 0.1.45 gives an active Project a light-green HUD; 0.1.46 adds Manual handoff so a bound Project can be summarized and moved to a fresh same-Project conversation on demand, independent of the automation switch.
-2. **JSON → MCP (incomplete)** — on DeepSeek / z.ai the content script can parse assistant `{"tool":...}`. It does **not** yet call local `/mcp` or paste results back. Plan: [docs/i18n/en/extension-bridge.md](docs/i18n/en/extension-bridge.md).
+1. **Web continuity automation (shipping)** — Options selects **Manual globally / Per-Project automation**. The bottom HUD exposes **Manual continue / Herdr monitor / LLM analysis / Manual handoff**, plus `Auto on|off` when automation is permitted. ChatGPT stores automation by stable `project_id`; z.ai / DeepSeek store it per conversation. Since 0.1.47, `Auto on` locks every HUD manual action, including Manual handoff. Bound persisted z.ai `/c/<chat_id>` conversations also support the fail-closed handoff flow. A z.ai new-chat root binding/preference migrates once to the first `/c/<chat_id>` created in that tab, but never follows navigation between existing histories.
+2. **JSON → MCP (shipping)** — on DeepSeek / z.ai the local JSON bridge drives `tools/list` / `tools/call` against `127.0.0.1:8772/mcp` in bounded rounds and feeds results back into the web chat. The static Herdr token stays in the extension service worker and is not exposed to page JavaScript. See [docs/i18n/en/extension-bridge.md](docs/i18n/en/extension-bridge.md).
 
 Same local `127.0.0.1:8772` token. Not a substitute for ChatGPT’s OAuth connector. Defaults: progress check every **60s**, unchanged-summary fallback **20 min** (`progressTickSec` / `progressFallbackSec`).
 
@@ -269,7 +269,7 @@ Same local `127.0.0.1:8772` token. Not a substitute for ChatGPT’s OAuth connec
 | [docs/i18n/en/chatgpt-connector.md](docs/i18n/en/chatgpt-connector.md) | ChatGPT OAuth / wire / schema / permission cards |
 | [docs/i18n/en/extension.md](docs/i18n/en/extension.md) | Extension overview |
 | [docs/i18n/en/extension-wake.md](docs/i18n/en/extension-wake.md) | Track A: progress nudge |
-| [docs/i18n/en/extension-bridge.md](docs/i18n/en/extension-bridge.md) | Track B: JSON→MCP, not finished |
+| [docs/i18n/en/extension-bridge.md](docs/i18n/en/extension-bridge.md) | Track B: local JSON→MCP (shipping) |
 | [docs/i18n/en/cli-reference.md](docs/i18n/en/cli-reference.md) | herdr-mcp CLI / bin tools / env vars |
 | [docs/i18n/en/best-practices.md](docs/i18n/en/best-practices.md) | Operating rules and an end-to-end example |
 | [docs/i18n/en/troubleshooting.md](docs/i18n/en/troubleshooting.md) | Symptom-first checklist |

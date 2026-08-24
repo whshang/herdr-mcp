@@ -54,14 +54,16 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.46", "manifest version includes manual HUD handoff");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.46"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.46"'), "content version matches manifest");
+ok(manifest.version === "0.1.47", "manifest version includes JSON bridge + cross-site HUD automation");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.47"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.47"'), "content version matches manifest");
 ok(
   wakeSource.includes(".bar.automation-on")
+    && wakeSource.includes(".bar.automation-on .handoff")
     && wakeSource.includes('enabled ? " automation-on" : ""')
-    && wakeSource.includes("rgba(236,253,245,.97)"),
-  "automation-on state emphasizes the whole bottom HUD with a light-green treatment",
+    && wakeSource.includes("rgba(236,253,245,.97)")
+    && wakeSource.includes("transition: none;"),
+  "automation-on state gives the whole HUD a deterministic light-green treatment without refresh-restarted transitions",
 );
 ok(
   manifest.content_scripts.find((cs) => cs.matches?.includes("https://chatgpt.com/*"))?.js?.includes("context-pressure.js"),
@@ -114,21 +116,29 @@ ok(
 );
 ok(
   backgroundSource.includes('const PROJECT_AUTOMATION_STORAGE_KEY = "herdrProjectAutomation"')
+    && backgroundSource.includes('const CONVERSATION_AUTOMATION_STORAGE_KEY = "herdrConversationAutomation"')
     && backgroundSource.includes("automationScopeForConversation")
+    && backgroundSource.includes("validateJsonBridgeSender")
+    && backgroundSource.includes("authorizeConversationAutomation")
     && backgroundSource.includes('msg?.type === "h2w_set_project_automation"')
     && backgroundSource.includes("stored.enabled === true ? AUTOMATION_MODE_PROJECT : AUTOMATION_MODE_MANUAL")
     && wakeSource.includes("hud?.project_automation_available !== true")
-    && wakeSource.includes('type: "h2w_set_project_automation"'),
-  "automation is globally gated, new installs fail closed, and Projects require explicit enablement",
+    && wakeSource.includes("hud?.conversation_automation_available !== true")
+    && wakeSource.includes('site: ADAPTER.name')
+    && wakeSource.includes('type: "h2w_set_project_automation"')
+    && wakeSource.includes('setHudProjectAutomation(!(hudCache?.enabled === true))'),
+  "manual JSON bridge is site/sender scoped while automation uses the effective Project/conversation state",
 );
 ok(
   wakeSource.includes('class="handoff manual-handoff"')
     && wakeSource.includes("manualHandoffAction")
+    && wakeSource.includes("hud?.enabled === true || active")
+    && wakeSource.includes('if (hudCache?.enabled === true) return { ok: false, error: "automation_enabled" }')
     && wakeSource.includes("h2w_handoff_start")
     && wakeSource.includes('trigger: "manual"')
     && wakeSource.includes("h2w_handoff_seed")
     && wakeSource.includes("h2w_handoff_probe"),
-  "Project rollover exposes a manual HUD handoff while reusing the recoverable handoff internals",
+  "manual HUD handoff reuses recoverable internals and is locked while automation is on",
 );
 ok(
   backgroundSource.includes("herdrConversationTransfers")
@@ -287,11 +297,12 @@ ok(zhLocale.hud_manual_continue === "手动继续", "zh HUD manual continue labe
 ok(zhLocale.hud_manual_status === "herdr监控", "zh HUD Herdr monitor label is exact");
 ok(zhLocale.hud_manual_judge === "LLM 分析", "zh HUD LLM analysis label is exact");
 ok(zhLocale.hud_manual_handoff === "手动接力", "zh HUD manual handoff label is exact");
-ok(zhLocale.hud_manual_handoff_hint.includes("同一 ChatGPT")
-    && (zhLocale.hud_manual_handoff_hint.includes("项目") || zhLocale.hud_manual_handoff_hint.includes("Project"))
+ok(zhLocale.hud_manual_handoff_hint.includes("ChatGPT")
+    && zhLocale.hud_manual_handoff_hint.includes("z.ai")
     && zhLocale.hud_manual_handoff_hint.includes("seed")
-    && zhLocale.hud_manual_handoff_hint.includes("binding"),
-  "zh HUD manual handoff tooltip explains safe rollover semantics");
+    && zhLocale.hud_manual_handoff_hint.includes("binding")
+    && zhLocale.hud_manual_handoff_hint.includes("自动"),
+  "zh HUD manual handoff tooltip explains cross-site safe rollover semantics");
 ok(zhLocale.hud_automation_off === "自动 关", "zh HUD automation-off label is localized");
 ok(
   zhLocale.hud_automation_on_hint.includes("进度")
@@ -312,9 +323,9 @@ ok(zhLocale.label_automation_mode === "启用项目自动"
     && zhLocale.hint_automation_mode.includes("底部状态条")
     && zhLocale.hint_automation_mode.includes("默认关闭")
     && zhLocale.hint_automation_mode.includes("权限卡")
-    && zhLocale.hint_automation_mode.includes("自动")
-    && zhLocale.hint_automation_mode.includes("手动接力"),
-  "zh Project automation checkbox explains the two-level policy");
+    && zhLocale.hint_automation_mode.includes("z.ai")
+    && zhLocale.hint_automation_mode.includes("DeepSeek"),
+  "zh automation checkbox explains the global gate and supported HUD scopes");
 for (const obsolete of ["hud_wake_on", "hud_wake_off", "hud_nudge_on", "hud_nudge_off", "hud_llm", "hud_llm_off"]) {
   ok(!(obsolete in zhLocale), `obsolete HUD locale key removed: ${obsolete}`);
 }

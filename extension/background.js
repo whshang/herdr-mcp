@@ -23,8 +23,9 @@ import {
   newContinuityId, newTransferId,
 } from "./continuity-core.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
+import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 
-const H2W_SCRIPT_VERSION = "0.1.46";
+const H2W_SCRIPT_VERSION = "0.1.47";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -43,6 +44,7 @@ const STATE_FETCH_MS = 4000;
 const TAB_RECOVERY_COOLDOWN_MS = 30000;
 const HANDOFF_STORAGE_KEY = "herdrConversationTransfers";
 const PROJECT_AUTOMATION_STORAGE_KEY = "herdrProjectAutomation";
+const CONVERSATION_AUTOMATION_STORAGE_KEY = "herdrConversationAutomation";
 const AUTOMATION_MODE_MANUAL = "manual";
 const AUTOMATION_MODE_PROJECT = "project_auto";
 const HANDOFF_RETENTION_MS = 7 * 86400000;
@@ -55,6 +57,18 @@ const FALLBACK_PROGRESS_TEMPLATE =
   "herdr workspace {workspace_label} progress (focus {agent} @ {pane} · {status}; {working_count} still working in this space).\n\nFocus pane output:\n{output}\n\n{roster}\n\n{idle_hint}\n\nUse herdr_since / inspect to continue; keep orchestrating on the web.";
 const FALLBACK_PARTIAL_TEMPLATE =
   "herdr workspace {workspace_label}: focus {agent} @ {pane} stopped ({status}); {working_count} still working in this space.\n\nFocus pane output:\n{output}\n\n{roster}\n\n{idle_hint}\n\nThis is a partial finish, not a full round settle. Keep watching or schedule the remaining workers.";
+
+// ---- Browser JSON bridge (z.ai / DeepSeek without MCP Connector) ----
+// The page only receives tool schemas and results. The bearer token stays inside
+// the extension service worker.
+async function jsonBridgeRpc(method, params = {}) {
+  return callMcpJsonRpc({
+    baseUrl: CFG.herdrMcpUrl,
+    token: CFG.token,
+    method,
+    params,
+  });
+}
 
 function localizedText(key, vars = null, fallback = "") {
   const value = i18nText(key, vars || undefined);
@@ -77,8 +91,8 @@ function hudLabels() {
   const keys = [
     "automation", "automation_on", "automation_off", "manual_continue", "manual_status", "manual_judge", "manual_handoff",
     "manual_continue_hint", "manual_status_hint", "manual_judge_hint", "manual_handoff_hint", "controls", "advanced_options", "event_settings",
-    "handoff_started", "handoff_failed", "handoff_binding_required", "handoff_workspace_busy",
-    "automation_on_hint", "automation_off_hint", "on", "off", "interval", "fallback", "bindings", "bind", "unbind", "available",
+    "handoff_started", "handoff_failed", "handoff_binding_required", "handoff_workspace_busy", "handoff_automation_enabled",
+    "automation_on_hint", "automation_off_hint", "conversation_automation_on_hint", "conversation_automation_off_hint", "on", "off", "interval", "fallback", "bindings", "bind", "unbind", "available",
     "no_workspaces", "workspaces_unavailable", "active", "bound_count", "aria_toggle_automation",
     "aria_open_controls", "automation_enabled", "automation_disabled", "automation_update_failed",
     "timing_saved", "timing_save_failed", "bound_to", "unbound_from", "binding_failed", "judge_no_continue",
@@ -127,6 +141,7 @@ let CFG = {
   llmJudgeSkipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
 };
 let PROJECT_AUTOMATION = {};
+let CONVERSATION_AUTOMATION = {};
 
 function normalizeAutomationMode(value) {
   return value === AUTOMATION_MODE_PROJECT ? AUTOMATION_MODE_PROJECT : AUTOMATION_MODE_MANUAL;
@@ -141,18 +156,109 @@ function sanitizeProjectAutomation(raw) {
   return out;
 }
 
+function isJsonBridgeConversation(convKey) {
+  try {
+    const url = new URL(String(convKey || ""));
+    return url.origin === "https://chat.z.ai" || url.origin === "https://chat.deepseek.com";
+  } catch (_) {
+    return false;
+  }
+}
+
+function jsonBridgeSiteForConversation(convKey) {
+  try {
+    const origin = new URL(String(convKey || "")).origin;
+    if (origin === "https://chat.z.ai") return "z.ai";
+    if (origin === "https://chat.deepseek.com") return "deepseek";
+  } catch (_) {}
+  return null;
+}
+
+function zAiConversationInfo(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    if (url.origin !== "https://chat.z.ai") return null;
+    const pathname = url.pathname.replace(/\/+$/, "") || "";
+    const match = pathname.match(/^\/c\/([^/]+)$/);
+    return {
+      site: "z.ai",
+      url: url.href,
+      convKey: `${url.origin}${pathname}`,
+      conversation_id: match?.[1] || null,
+      project_id: null,
+      project_key: null,
+      project_launch_url: null,
+      handoff_launch_url: `${url.origin}/`,
+      manual_handoff_available: Boolean(match?.[1]),
+      is_new_chat_root: pathname === "",
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function handoffConversationInfo(rawUrl, siteHint = null) {
+  const chatgpt = chatGptConversationInfo(rawUrl);
+  if (chatgpt) {
+    return {
+      ...chatgpt,
+      handoff_launch_url: chatgpt.project_launch_url,
+      manual_handoff_available: Boolean(chatgpt.project_id),
+    };
+  }
+  if (!siteHint || siteHint === "z.ai") return zAiConversationInfo(rawUrl);
+  return null;
+}
+
+function validateJsonBridgeSender(msg, sender) {
+  const convKey = String(msg?.convKey || "").trim();
+  const site = String(msg?.site || "").trim();
+  const expectedSite = jsonBridgeSiteForConversation(convKey);
+  if (!expectedSite || site !== expectedSite) return { ok: false, error: "json-bridge-site-mismatch" };
+  try {
+    const senderOrigin = new URL(String(sender?.tab?.url || sender?.url || "")).origin;
+    const expectedOrigin = new URL(convKey).origin;
+    if (senderOrigin !== expectedOrigin) return { ok: false, error: "json-bridge-sender-mismatch" };
+  } catch (_) {
+    return { ok: false, error: "json-bridge-sender-mismatch" };
+  }
+  return { ok: true, convKey, site };
+}
+
+async function authorizeConversationAutomation(msg, sender) {
+  const access = validateJsonBridgeSender(msg, sender);
+  if (!access.ok) return access;
+  const bindings = await loadBindings();
+  if (!bindingsForConv(bindings, access.convKey).length) return { ok: false, error: "conversation-unbound" };
+  return access;
+}
+
+function sanitizeConversationAutomation(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [convKey, enabled] of Object.entries(raw)) {
+    if (enabled === true && isJsonBridgeConversation(convKey)) out[convKey] = true;
+  }
+  return out;
+}
+
 function automationScopeForConversation(convKey) {
   const info = chatGptConversationInfo(convKey);
   const projectId = info?.project_id || null;
   const globalMode = normalizeAutomationMode(CFG.automationMode);
   const projectMode = globalMode === AUTOMATION_MODE_PROJECT;
   const projectAutomationAvailable = projectMode && Boolean(projectId);
-  const enabled = projectAutomationAvailable && PROJECT_AUTOMATION[projectId] === true;
+  const projectEnabled = projectAutomationAvailable && PROJECT_AUTOMATION[projectId] === true;
+  const conversationAutomationAvailable = projectMode && !projectId && isJsonBridgeConversation(convKey);
+  const conversationEnabled = conversationAutomationAvailable && CONVERSATION_AUTOMATION[convKey] === true;
+  const enabled = projectId ? projectEnabled : conversationEnabled;
   return {
     global_mode: globalMode,
     project_id: projectId,
     project_automation_available: projectAutomationAvailable,
-    project_automation_enabled: enabled,
+    project_automation_enabled: projectEnabled,
+    conversation_automation_available: conversationAutomationAvailable,
+    conversation_automation_enabled: conversationEnabled,
     enabled,
   };
 }
@@ -176,11 +282,13 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   await detectOrLoadLocale();
   let stored = {};
   try {
-    const keys = [...Object.keys(CFG), "idleNudgeCooldownSec", PROJECT_AUTOMATION_STORAGE_KEY];
+    const keys = [...Object.keys(CFG), "idleNudgeCooldownSec", PROJECT_AUTOMATION_STORAGE_KEY, CONVERSATION_AUTOMATION_STORAGE_KEY];
     stored = await chrome.storage.local.get(keys);
     CFG = { ...CFG, ...stored };
     delete CFG[PROJECT_AUTOMATION_STORAGE_KEY];
+    delete CFG[CONVERSATION_AUTOMATION_STORAGE_KEY];
     PROJECT_AUTOMATION = sanitizeProjectAutomation(stored[PROJECT_AUTOMATION_STORAGE_KEY]);
+    CONVERSATION_AUTOMATION = sanitizeConversationAutomation(stored[CONVERSATION_AUTOMATION_STORAGE_KEY]);
   } catch (e) {}
   if (!String(CFG.wakeTemplate || "").trim()) CFG.wakeTemplate = defaultWakeTemplate();
   if (!String(CFG.progressTemplate || "").trim()) CFG.progressTemplate = defaultProgressTemplate();
@@ -451,6 +559,53 @@ async function saveBindings(b) {
   try { await chrome.storage.local.set({ herdrWakeBindings: b }); } catch (e) {}
 }
 
+async function migrateZaiRootConversationState(bindings, targetConvKey, targetUrl, tabId) {
+  const target = zAiConversationInfo(targetUrl || targetConvKey);
+  if (!target?.conversation_id || !tabId) return { migrated: false, bindings };
+  if (bindingsForConv(bindings, target.convKey).length) return { migrated: false, bindings };
+
+  const rootKey = "https://chat.z.ai";
+  const rootBindings = bindingsForConv(bindings, rootKey).filter((entry) => (
+    Number(entry.tabId || 0) === Number(tabId)
+    || zAiConversationInfo(entry.tabUrl)?.is_new_chat_root === true
+  ));
+  if (!rootBindings.length) return { migrated: false, bindings };
+
+  const now = Date.now();
+  for (const entry of rootBindings) {
+    const ws = entry.workspace_id || normalizeWorkspaceId(entry);
+    if (!ws) continue;
+    const oldKey = entry.storeKey || bindingStoreKey(rootKey, ws);
+    const next = {
+      ...entry,
+      convKey: target.convKey,
+      site: "z.ai",
+      tabId,
+      tabUrl: targetUrl || target.url,
+      last_seen_at: now,
+    };
+    delete next.storeKey;
+    next.revision = bindingRevision(next);
+    const nextKey = bindingStoreKey(target.convKey, ws);
+    bindings[nextKey] = next;
+    delete bindings[oldKey];
+    clearProgressTimer(oldKey);
+    if (next.status === "working") armProgressTimer(nextKey, next);
+  }
+
+  if (CONVERSATION_AUTOMATION[rootKey] === true
+    && CONVERSATION_AUTOMATION[target.convKey] !== true) {
+    CONVERSATION_AUTOMATION[target.convKey] = true;
+  }
+  delete CONVERSATION_AUTOMATION[rootKey];
+  await chrome.storage.local.set({
+    herdrWakeBindings: bindings,
+    [CONVERSATION_AUTOMATION_STORAGE_KEY]: CONVERSATION_AUTOMATION,
+  });
+  callLog(`migrated z.ai root binding to ${target.convKey}`);
+  return { migrated: true, bindings };
+}
+
 function tabExecutionView(tab) {
   if (!tab?.id) {
     return {
@@ -684,6 +839,21 @@ async function sendChatGptTabMessage(tabId, message) {
     await sleep(80);
     return chrome.tabs.sendMessage(tabId, message);
   }
+}
+
+async function sendHandoffTabMessage(tabId, site, message) {
+  if (site === "chatgpt") return sendChatGptTabMessage(tabId, message);
+  let lastError = null;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      return await chrome.tabs.sendMessage(tabId, message);
+    } catch (error) {
+      lastError = error;
+      if (!missingReceiverError(error)) throw error;
+      await sleep(100);
+    }
+  }
+  throw lastError || new Error("handoff-content-script-unavailable");
 }
 
 // ---- SSE push client (ONE shared stream for every binding) ----
@@ -1543,16 +1713,34 @@ async function manualLlmJudgeContinue(tabId, convKey, userText, assistantText) {
   });
 }
 
-// ---- ChatGPT Project conversation handoff ----
+// ---- Conversation handoff (ChatGPT Project + z.ai persisted chat) ----
+function handoffTargetInfoForTransfer(transfer, targetConvKey, targetUrl = null) {
+  const site = transfer?.site || "chatgpt";
+  if (site === "chatgpt") {
+    const info = chatGptConversationInfo(targetConvKey || targetUrl);
+    if (!info?.project_id || info.project_id !== transfer.project_id) {
+      return { ok: false, error: "target_project_mismatch" };
+    }
+    return { ok: true, info };
+  }
+  if (site === "z.ai") {
+    const info = zAiConversationInfo(targetUrl || targetConvKey) || zAiConversationInfo(targetConvKey);
+    if (!info?.conversation_id) return { ok: false, error: "target_conversation_invalid" };
+    return { ok: true, info };
+  }
+  return { ok: false, error: "handoff_site_unsupported" };
+}
+
 async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, targetUrl = null) {
   const transfers = await loadHandoffTransfers();
   const transfer = transfers[transferId];
   if (!transfer) return { ok: false, error: "handoff_not_found" };
-  const targetInfo = chatGptConversationInfo(targetConvKey);
-  if (!targetInfo?.project_id || targetInfo.project_id !== transfer.project_id) {
-    await markTransfer(transferId, { status: "seed_uncertain", error: "target_project_mismatch" });
-    return { ok: false, error: "target_project_mismatch" };
+  const targetCheck = handoffTargetInfoForTransfer(transfer, targetConvKey, targetUrl);
+  if (!targetCheck.ok) {
+    await markTransfer(transferId, { status: "seed_uncertain", error: targetCheck.error });
+    return { ok: false, error: targetCheck.error };
   }
+  const targetInfo = targetCheck.info;
   if (targetInfo.convKey === transfer.source_conv_key) {
     await markTransfer(transferId, { status: "seed_uncertain", error: "target_is_source" });
     return { ok: false, error: "target_is_source" };
@@ -1663,7 +1851,7 @@ async function seedHandoffIntoTarget(transferId, targetTabId) {
   });
   let result;
   try {
-    result = await sendChatGptTabMessage(targetTabId, {
+    result = await sendHandoffTabMessage(targetTabId, transfer.site || "chatgpt", {
       type: "h2w_handoff_seed",
       transferId,
       template: seed,
@@ -1693,11 +1881,12 @@ async function seedHandoffIntoTarget(transferId, targetTabId) {
 async function launchHandoffTarget(transferId) {
   const transfers = await loadHandoffTransfers();
   const transfer = transfers[transferId];
-  if (!transfer?.handoff_text || !transfer.project_launch_url) return { ok: false, error: "handoff_not_ready" };
+  const launchUrl = transfer?.handoff_launch_url || transfer?.project_launch_url || null;
+  if (!transfer?.handoff_text || !launchUrl) return { ok: false, error: "handoff_not_ready" };
   await markTransfer(transferId, { status: "target_opening", error: null });
   let tab;
   try {
-    tab = await chrome.tabs.create({ url: transfer.project_launch_url, active: true });
+    tab = await chrome.tabs.create({ url: launchUrl, active: true });
   } catch (e) {
     await markTransfer(transferId, { status: "failed", error: `target_open_failed:${e.message}` });
     return { ok: false, error: "target_open_failed" };
@@ -1733,7 +1922,7 @@ async function resumeUncertainHandoff(transfer) {
   }
   let probe = null;
   try {
-    probe = await sendChatGptTabMessage(transfer.target_tab_id, {
+    probe = await sendHandoffTabMessage(transfer.target_tab_id, transfer.site || "chatgpt", {
       type: "h2w_handoff_probe",
       transferId: transfer.id,
     });
@@ -1748,6 +1937,30 @@ async function resumeUncertainHandoff(transfer) {
   return seedHandoffIntoTarget(transfer.id, transfer.target_tab_id);
 }
 
+function handoffRequestTemplateForSite(site) {
+  if (site === "z.ai") {
+    return localizedText("handoff_request_template_zai", null, localizedText("handoff_request_template"));
+  }
+  return localizedText("handoff_request_template");
+}
+
+async function acceptImmediateHandoffSummary(transfer, result) {
+  const assistantText = String(result?.assistantText || "").trim();
+  if (!assistantText) return { ok: true, pending: true, handoff: handoffView(transfer) };
+  const packet = extractHandoffPacket(assistantText, transfer.id);
+  if (!packet) {
+    const failed = await markTransfer(transfer.id, { status: "failed", error: "handoff_packet_invalid" });
+    return { ok: false, error: "handoff_packet_invalid", handoff: handoffView(failed) };
+  }
+  const ready = await markTransfer(transfer.id, {
+    status: "summary_ready",
+    handoff_text: packet,
+    error: null,
+  });
+  setTimeout(() => { void launchHandoffTarget(transfer.id); }, 0);
+  return { ok: true, pending: true, handoff: handoffView(ready) };
+}
+
 async function resumeSummaryRequested(transfer) {
   const tabId = transfer?.source_tab_id;
   if (!tabId || !(await tabStillExists(tabId))) {
@@ -1756,7 +1969,7 @@ async function resumeSummaryRequested(transfer) {
   }
 
   let snapshot = null;
-  try { snapshot = await sendChatGptTabMessage(tabId, { type: "h2w_snapshot_turn" }); } catch (_) {}
+  try { snapshot = await sendHandoffTabMessage(tabId, transfer.site || "chatgpt", { type: "h2w_snapshot_turn" }); } catch (_) {}
   const recoveredPacket = extractHandoffPacket(snapshot?.assistantText, transfer.id);
   if (recoveredPacket) {
     const ready = await markTransfer(transfer.id, {
@@ -1785,11 +1998,11 @@ async function resumeSummaryRequested(transfer) {
   const prompt = buildHandoffRequest({
     transferId: transfer.id,
     bindings: source,
-    template: localizedText("handoff_request_template"),
+    template: handoffRequestTemplateForSite(transfer.site || "chatgpt"),
   });
   const retried = await markTransfer(transfer.id, { status: "summary_requested", error: null });
   try {
-    const result = await sendChatGptTabMessage(tabId, {
+    const result = await sendHandoffTabMessage(tabId, transfer.site || "chatgpt", {
       type: "h2w_handoff_prompt",
       transferId: transfer.id,
       template: prompt,
@@ -1801,6 +2014,7 @@ async function resumeSummaryRequested(transfer) {
       });
       return { ok: false, error: failed.error, handoff: handoffView(failed) };
     }
+    return acceptImmediateHandoffSummary(retried, result);
   } catch (e) {
     const failed = await markTransfer(transfer.id, { status: "failed", error: `summary_prompt_failed:${e.message}` });
     return { ok: false, error: "summary_prompt_failed", handoff: handoffView(failed) };
@@ -1809,9 +2023,13 @@ async function resumeSummaryRequested(transfer) {
 }
 
 async function startHandoffForTab(tabId, trigger = "manual") {
-  const convInfo = await conversationInfoForTab(tabId);
-  if (!convInfo?.project_id || !convInfo?.project_launch_url) {
-    return { ok: false, error: "project_conversation_required" };
+  const liveInfo = await conversationInfoForTab(tabId);
+  const convInfo = handoffConversationInfo(liveInfo?.url || liveInfo?.convKey, liveInfo?.site || null);
+  if (!convInfo?.manual_handoff_available || !convInfo?.handoff_launch_url) {
+    return { ok: false, error: "handoff_conversation_required" };
+  }
+  if (trigger === "manual" && automationScopeForConversation(convInfo.convKey).enabled) {
+    return { ok: false, error: "automation_enabled" };
   }
   if (trigger !== "manual" && !automationScopeForConversation(convInfo.convKey).enabled) {
     return { ok: false, error: "automation_disabled" };
@@ -1862,13 +2080,14 @@ async function startHandoffForTab(tabId, trigger = "manual") {
     version: 1,
     id: transferId,
     continuity_id: continuityId,
-    site: "chatgpt",
+    site: convInfo.site,
     status: "summary_requested",
     source_conv_key: convInfo.convKey,
     source_tab_id: tabId,
     project_id: convInfo.project_id,
     project_key: convInfo.project_key,
     project_launch_url: convInfo.project_launch_url,
+    handoff_launch_url: convInfo.handoff_launch_url,
     source_bindings: transferSourceSnapshot(session),
     handoff_text: null,
     target_tab_id: null,
@@ -1883,11 +2102,11 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   const prompt = buildHandoffRequest({
     transferId,
     bindings: session,
-    template: localizedText("handoff_request_template"),
+    template: handoffRequestTemplateForSite(convInfo.site),
   });
   let result;
   try {
-    result = await sendChatGptTabMessage(tabId, {
+    result = await sendHandoffTabMessage(tabId, convInfo.site, {
       type: "h2w_handoff_prompt",
       transferId,
       template: prompt,
@@ -1900,7 +2119,7 @@ async function startHandoffForTab(tabId, trigger = "manual") {
     await markTransfer(transferId, { status: "failed", error: result?.error || result?.blocked || "summary_prompt_not_submitted" });
     return { ok: false, error: result?.error || result?.blocked || "summary_prompt_not_submitted" };
   }
-  return { ok: true, pending: true, handoff: handoffView(row) };
+  return acceptImmediateHandoffSummary(row, result);
 }
 
 async function handleHandoffTurnEnded(msg) {
@@ -1928,6 +2147,37 @@ async function handleHandoffTurnEnded(msg) {
 
 // ---- Message handling ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === "h2w_json_bridge_catalog") {
+    void (async () => {
+      const access = validateJsonBridgeSender(msg, sender);
+      if (!access.ok) {
+        sendResponse(access);
+        return;
+      }
+      const result = await jsonBridgeRpc("tools/list", {});
+      sendResponse(result.ok
+        ? { ok: true, tools: result.result?.tools || [] }
+        : result);
+    })();
+    return true;
+  }
+  if (msg?.type === "h2w_json_bridge_call") {
+    void (async () => {
+      const access = validateJsonBridgeSender(msg, sender);
+      if (!access.ok) {
+        sendResponse(access);
+        return;
+      }
+      const result = await jsonBridgeRpc("tools/call", {
+        name: String(msg.tool || ""),
+        arguments: msg.args || {},
+      });
+      sendResponse(result.ok
+        ? { ok: true, result: result.result }
+        : result);
+    })();
+    return true;
+  }
   if (msg?.type === "h2w_hello") {
     if (sender.tab?.id) tabVersions.set(sender.tab.id, msg.version || "");
     return;
@@ -1935,7 +2185,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_register") {
     void (async () => {
       const bindings = await loadBindings();
-      const matched = bindingsForConv(bindings, msg.convKey);
+      let matched = bindingsForConv(bindings, msg.convKey);
+      if (!matched.length && sender.tab?.id) {
+        const migration = await migrateZaiRootConversationState(
+          bindings,
+          String(msg.convKey || ""),
+          msg.url || sender.tab?.url || null,
+          sender.tab.id,
+        );
+        if (migration.migrated) matched = bindingsForConv(bindings, msg.convKey);
+      }
       if (matched.length) {
         for (const entry of matched) {
           const b = bindings[entry.storeKey];
@@ -2023,7 +2282,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const transfers = await loadHandoffTransfers();
       const transfer = convKey ? latestTransferForConversation(transfers, convKey) : null;
       const transferView = handoffView(transfer, convKey);
-      const convInfo = convKey ? chatGptConversationInfo(convKey) : null;
+      const convInfo = convKey ? handoffConversationInfo(convKey, jsonBridgeSiteForConversation(convKey)) : null;
       const automation = automationScopeForConversation(convKey);
       const cachedWorkspaces = cachedPushWorkspaceCatalog();
       // /push/events hello already carries the authoritative workspace list.
@@ -2050,6 +2309,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         project_id: automation.project_id,
         project_automation_available: automation.project_automation_available,
         project_automation_enabled: automation.project_automation_enabled,
+        conversation_automation_available: automation.conversation_automation_available,
+        conversation_automation_enabled: automation.conversation_automation_enabled,
+        site: convInfo?.site || jsonBridgeSiteForConversation(convKey) || null,
+        manual_handoff_available: Boolean(convInfo?.manual_handoff_available),
         autoAllow: true,
         idleNudgeEnabled: automation.enabled,
         progressTickSec: paceIntervalSec() || Number(CFG.progressTickSec) || 0,
@@ -2068,7 +2331,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }))),
         continuity_id: session.map((b) => b.continuity_id).find(Boolean) || transfer?.continuity_id || null,
         can_handoff: Boolean(
-          convInfo?.project_id
+          convInfo?.manual_handoff_available
           && session.length > 0
           && (!handoffStatusIsActive(transfer?.status) || transferView?.can_resume === true),
         ),
@@ -2125,6 +2388,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_set_project_automation") {
     void (async () => {
       const projectId = String(msg.project_id || "").trim();
+      const convKey = String(msg.convKey || "").trim();
+      if (!projectId && convKey) {
+        const access = await authorizeConversationAutomation(msg, sender);
+        if (!access.ok) {
+          sendResponse(access);
+          return;
+        }
+        if (msg.enabled === true) CONVERSATION_AUTOMATION[convKey] = true;
+        else delete CONVERSATION_AUTOMATION[convKey];
+        await chrome.storage.local.set({ [CONVERSATION_AUTOMATION_STORAGE_KEY]: CONVERSATION_AUTOMATION });
+        await notifyAutomationChanged();
+        sendResponse({ ok: true, ...automationScopeForConversation(convKey) });
+        return;
+      }
       if (!/^g-p-[0-9a-f]{32}$/i.test(projectId)) {
         sendResponse({ ok: false, error: "project_required" });
         return;

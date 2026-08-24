@@ -19,6 +19,12 @@ const PROJECT_SOURCE = `https://chatgpt.com/g/${PROJECT_ID}/c/source123`;
 const PROJECT_SOURCE_URL = `https://chatgpt.com/g/${PROJECT_ID}-herdr-mcp/c/source123`;
 const PROJECT_TARGET = `https://chatgpt.com/g/${PROJECT_ID}/c/target456`;
 const PROJECT_TARGET_URL = `https://chatgpt.com/g/${PROJECT_ID}-herdr-mcp/c/target456`;
+const ZAI_CONV = "https://chat.z.ai/c/json-bridge-test";
+const ZAI_ROOT = "https://chat.z.ai";
+const ZAI_NEW = "https://chat.z.ai/c/new-chat-123";
+const ZAI_OTHER = "https://chat.z.ai/c/history-chat-456";
+const ZAI_SOURCE = "https://chat.z.ai/c/handoff-source";
+const ZAI_TARGET = "https://chat.z.ai/c/handoff-target";
 
 let failures = 0;
 function ok(cond, label, detail = "") {
@@ -34,6 +40,7 @@ const tabs = new Map();   // tabId -> { url, listener }.
 let nextTabId = 500;
 let handoffSeedMode = "uncertain";
 let targetSeeded = false;
+let zaiTargetSeeded = false;
 let handoffPrompt = "";
 let mockStateWorkspaces = [];
 
@@ -53,11 +60,53 @@ globalThis.fetch = async (input, init) => {
       headers: { "content-type": "application/json" },
     });
   }
+  if (url.endsWith("/mcp")) {
+    const body = JSON.parse(init?.body || "{}");
+    const result = body.method === "tools/list"
+      ? { tools: [{ name: "herdr_inspect", description: "inspect", inputSchema: { type: "object" } }] }
+      : { content: [{ type: "text", text: "ok" }] };
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
   return nativeFetch(input, init);
 };
 
 function targetListener(tab) {
   return (msg, _sender, sendResponse) => {
+    if (String(tab.url || "").startsWith("https://chat.z.ai")) {
+      if (msg?.type === "h2w_get_convkey") {
+        sendResponse({
+          convKey: zaiTargetSeeded ? ZAI_TARGET : ZAI_ROOT,
+          url: tab.url,
+          site: "z.ai",
+        });
+        return;
+      }
+      if (msg?.type === "h2w_handoff_probe") {
+        sendResponse({
+          ok: true,
+          targetConvKey: zaiTargetSeeded ? ZAI_TARGET : ZAI_ROOT,
+          targetUrl: tab.url,
+          seedConfirmed: zaiTargetSeeded,
+        });
+        return;
+      }
+      if (msg?.type === "h2w_handoff_seed") {
+        zaiTargetSeeded = true;
+        tab.url = ZAI_TARGET;
+        sendResponse({
+          ok: true,
+          targetConvKey: ZAI_TARGET,
+          targetUrl: ZAI_TARGET,
+          seedConfirmed: true,
+        });
+        return;
+      }
+      sendResponse({ ok: true });
+      return;
+    }
     if (msg?.type === "h2w_get_convkey") {
       sendResponse({
         convKey: targetSeeded ? PROJECT_TARGET : null,
@@ -153,10 +202,10 @@ globalThis.chrome = {
 };
 
 // Content-script stub for wake.js h2w_get_convkey responses.
-function installContentScript(tabId, url, convKey) {
+function installContentScript(tabId, url, convKey, site = "chatgpt") {
   tabs.set(tabId, {
     url, listener: (msg, _sender, sendResponse) => {
-      if (msg?.type === "h2w_get_convkey") { sendResponse({ convKey, url, site: "chatgpt" }); return; }
+      if (msg?.type === "h2w_get_convkey") { sendResponse({ convKey, url, site }); return; }
       if (msg?.type === "h2w_wake") { sendResponse({}); return; }
       if (msg?.type === "h2w_handoff_prompt") { handoffPrompt = msg.template || ""; sendResponse({ ok: true }); return; }
       sendResponse({});
@@ -292,6 +341,218 @@ console.log("\n[binding flow]");
   mockStateWorkspaces = [];
 }
 
+// ---- Scenario 6c: JSON-bridge conversations get isolated automation and bound-only MCP access ----
+console.log("\n[json bridge automation]");
+{
+  installContentScript(350, ZAI_CONV, ZAI_CONV, "z.ai");
+
+  let resolveBootstrapCatalog;
+  const bootstrapCatalogP = new Promise((r) => { resolveBootstrapCatalog = r; });
+  onMsg({ type: "h2w_json_bridge_catalog", site: "z.ai", convKey: ZAI_CONV }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveBootstrapCatalog(r));
+  const bootstrapCatalog = await bootstrapCatalogP;
+  ok(bootstrapCatalog?.ok === true && bootstrapCatalog.tools?.[0]?.name === "herdr_inspect",
+    "unbound z.ai conversation can bootstrap the manual Herdr JSON bridge", JSON.stringify(bootstrapCatalog));
+
+  let resolveUnboundAuto;
+  const unboundAutoP = new Promise((r) => { resolveUnboundAuto = r; });
+  onMsg({
+    type: "h2w_set_project_automation",
+    project_id: null,
+    site: "z.ai",
+    convKey: ZAI_CONV,
+    enabled: true,
+  }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveUnboundAuto(r));
+  const unboundAuto = await unboundAutoP;
+  ok(unboundAuto?.ok === false && unboundAuto?.error === "conversation-unbound",
+    "conversation automation still requires an explicit workspace binding", JSON.stringify(unboundAuto));
+
+  let resolveBind;
+  const bindP = new Promise((r) => { resolveBind = r; });
+  onMsg({
+    type: "h2w_bind",
+    tabId: 350,
+    workspace_id: "w68",
+    workspace_label: "herdr-mcp (w68)",
+  }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveBind(r));
+  const bound = await bindP;
+  ok(bound?.ok === true, "z.ai conversation can bind before JSON tool access", JSON.stringify(bound));
+
+  let resolveHud;
+  const hudP = new Promise((r) => { resolveHud = r; });
+  onMsg({ type: "h2w_page_hud", convKey: ZAI_CONV }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveHud(r));
+  const hud = await hudP;
+  ok(hud?.conversation_automation_available === true
+      && hud?.conversation_automation_enabled === false
+      && hud?.manual_handoff_available === true
+      && hud?.can_handoff === true,
+    "persisted z.ai HUD exposes automation off plus manual handoff when bound", JSON.stringify(hud));
+
+  let resolveAuto;
+  const autoP = new Promise((r) => { resolveAuto = r; });
+  onMsg({
+    type: "h2w_set_project_automation",
+    project_id: null,
+    site: "z.ai",
+    convKey: ZAI_CONV,
+    enabled: true,
+  }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveAuto(r));
+  const auto = await autoP;
+  ok(auto?.ok === true && auto?.conversation_automation_enabled === true && storage.herdrConversationAutomation?.[ZAI_CONV] === true,
+    "z.ai HUD can enable automation for only the current conversation", JSON.stringify(auto));
+
+  let resolveManualMode;
+  const manualModeP = new Promise((r) => { resolveManualMode = r; });
+  onMsg({ type: "h2w_set_config", config: { automationMode: "manual" } }, {}, (r) => resolveManualMode(r));
+  await manualModeP;
+  let resolveManualHud;
+  const manualHudP = new Promise((r) => { resolveManualHud = r; });
+  onMsg({ type: "h2w_page_hud", convKey: ZAI_CONV }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveManualHud(r));
+  const manualHud = await manualHudP;
+  ok(manualHud?.conversation_automation_available === false && manualHud?.enabled === false,
+    "global manual mode hides/disables z.ai conversation automation without deleting its preference", JSON.stringify(manualHud));
+  ok(storage.herdrConversationAutomation?.[ZAI_CONV] === true,
+    "global manual mode preserves the saved z.ai conversation preference");
+
+  let resolveProjectMode;
+  const projectModeP = new Promise((r) => { resolveProjectMode = r; });
+  onMsg({ type: "h2w_set_config", config: { automationMode: "project_auto" } }, {}, (r) => resolveProjectMode(r));
+  await projectModeP;
+  let resolveRestoredHud;
+  const restoredHudP = new Promise((r) => { resolveRestoredHud = r; });
+  onMsg({ type: "h2w_page_hud", convKey: ZAI_CONV }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveRestoredHud(r));
+  const restoredHud = await restoredHudP;
+  ok(restoredHud?.conversation_automation_available === true && restoredHud?.enabled === true,
+    "returning to automation mode restores the saved z.ai conversation preference", JSON.stringify(restoredHud));
+
+  let resolveCatalog;
+  const catalogP = new Promise((r) => { resolveCatalog = r; });
+  onMsg({ type: "h2w_json_bridge_catalog", site: "z.ai", convKey: ZAI_CONV }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveCatalog(r));
+  const catalog = await catalogP;
+  ok(catalog?.ok === true && catalog.tools?.[0]?.name === "herdr_inspect",
+    "bound z.ai conversation keeps access to the Herdr tool catalog", JSON.stringify(catalog));
+
+  let resolveMismatch;
+  const mismatchP = new Promise((r) => { resolveMismatch = r; });
+  onMsg({ type: "h2w_json_bridge_catalog", site: "deepseek", convKey: ZAI_CONV }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveMismatch(r));
+  const mismatch = await mismatchP;
+  ok(mismatch?.ok === false && mismatch?.error === "json-bridge-site-mismatch",
+    "JSON bridge rejects a mismatched site identity", JSON.stringify(mismatch));
+}
+
+// ---- Scenario 6d: z.ai new-chat root state follows the first persisted /c/<chat_id> only ----
+console.log("\n[z.ai root migration]");
+{
+  installContentScript(360, `${ZAI_ROOT}/`, ZAI_ROOT, "z.ai");
+  let resolveBind;
+  const bindP = new Promise((r) => { resolveBind = r; });
+  onMsg({
+    type: "h2w_bind",
+    tabId: 360,
+    workspace_id: "wZ",
+    workspace_label: "zai-work (wZ)",
+  }, { tab: { id: 360, url: `${ZAI_ROOT}/` } }, (r) => resolveBind(r));
+  const bound = await bindP;
+  ok(bound?.ok === true, "z.ai root launcher can hold a temporary workspace binding", JSON.stringify(bound));
+
+  let resolveAuto;
+  const autoP = new Promise((r) => { resolveAuto = r; });
+  onMsg({
+    type: "h2w_set_project_automation",
+    project_id: null,
+    site: "z.ai",
+    convKey: ZAI_ROOT,
+    enabled: true,
+  }, { tab: { id: 360, url: `${ZAI_ROOT}/` } }, (r) => resolveAuto(r));
+  const auto = await autoP;
+  ok(auto?.ok === true && storage.herdrConversationAutomation?.[ZAI_ROOT] === true,
+    "z.ai root launcher can remember temporary automation until a chat id exists", JSON.stringify(auto));
+
+  installContentScript(360, ZAI_NEW, ZAI_NEW, "z.ai");
+  let resolveRegister;
+  const registerP = new Promise((r) => { resolveRegister = r; });
+  onMsg({ type: "h2w_register", convKey: ZAI_NEW, url: ZAI_NEW, site: "z.ai" }, { tab: { id: 360, url: ZAI_NEW } }, (r) => resolveRegister(r));
+  const registered = await registerP;
+  ok(registered?.bound === true, "first z.ai /c/<chat_id> route inherits the temporary root binding", JSON.stringify(registered));
+  ok(!storage.herdrWakeBindings[`${ZAI_ROOT}::wZ`] && !!storage.herdrWakeBindings[`${ZAI_NEW}::wZ`],
+    "z.ai root binding migrates exactly to the persisted chat key");
+  ok(storage.herdrConversationAutomation?.[ZAI_NEW] === true && storage.herdrConversationAutomation?.[ZAI_ROOT] !== true,
+    "z.ai automation preference migrates from root to the persisted chat key");
+
+  installContentScript(360, ZAI_OTHER, ZAI_OTHER, "z.ai");
+  let resolveHistory;
+  const historyP = new Promise((r) => { resolveHistory = r; });
+  onMsg({ type: "h2w_register", convKey: ZAI_OTHER, url: ZAI_OTHER, site: "z.ai" }, { tab: { id: 360, url: ZAI_OTHER } }, (r) => resolveHistory(r));
+  const history = await historyP;
+  ok(history?.bound === false && !!storage.herdrWakeBindings[`${ZAI_NEW}::wZ`] && !storage.herdrWakeBindings[`${ZAI_OTHER}::wZ`],
+    "switching between existing z.ai chats never drags a workspace binding along", JSON.stringify(history));
+}
+
+// ---- Scenario 6e: z.ai manual handoff uses a raw summary/seed and cuts over only after confirmation ----
+console.log("\n[z.ai manual handoff]");
+{
+  tabs.set(370, {
+    url: ZAI_SOURCE,
+    listener: (msg, _sender, sendResponse) => {
+      if (msg?.type === "h2w_get_convkey") {
+        sendResponse({ convKey: ZAI_SOURCE, url: ZAI_SOURCE, site: "z.ai" });
+        return;
+      }
+      if (msg?.type === "h2w_handoff_prompt") {
+        const match = String(msg.template || "").match(/<<<HERDR_HANDOFF_V1 id=([^>]+)>>>/);
+        const id = match?.[1] || "missing";
+        handoffPrompt = msg.template || "";
+        sendResponse({
+          ok: true,
+          assistantText: [
+            `<<<HERDR_HANDOFF_V1 id=${id}>>>`,
+            "# Project handoff",
+            "Current objective: continue the z.ai task in a fresh chat.",
+            "Next: verify live state before mutation.",
+            "<<<END_HERDR_HANDOFF_V1>>>",
+          ].join("\n"),
+        });
+        return;
+      }
+      if (msg?.type === "h2w_snapshot_turn") {
+        sendResponse({ assistantText: "", turnInProgress: false, generating: false });
+        return;
+      }
+      sendResponse({ ok: true });
+    },
+  });
+  let resolveBind;
+  const bindP = new Promise((r) => { resolveBind = r; });
+  onMsg({
+    type: "h2w_bind",
+    tabId: 370,
+    workspace_id: "wY",
+    workspace_label: "zai-handoff (wY)",
+  }, { tab: { id: 370, url: ZAI_SOURCE } }, (r) => resolveBind(r));
+  const bound = await bindP;
+  ok(bound?.ok === true, "persisted z.ai source binds before manual handoff", JSON.stringify(bound));
+  const sourceKey = `${ZAI_SOURCE}::wY`;
+  const continuityId = storage.herdrWakeBindings[sourceKey]?.continuity_id;
+
+  zaiTargetSeeded = false;
+  let resolveStart;
+  const startP = new Promise((r) => { resolveStart = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: 370 }, { tab: { id: 370, url: ZAI_SOURCE } }, (r) => resolveStart(r));
+  const started = await startP;
+  ok(started?.ok === true && started?.pending === true,
+    "z.ai manual handoff accepts the immediate marked summary", JSON.stringify(started));
+  ok(handoffPrompt.includes("z.ai") && handoffPrompt.includes("HERDR_HANDOFF_V1"),
+    "z.ai handoff uses the z.ai-specific raw summary template");
+
+  await new Promise((r) => setTimeout(r, 600));
+  const targetKey = `${ZAI_TARGET}::wY`;
+  ok(!storage.herdrWakeBindings[sourceKey] && !!storage.herdrWakeBindings[targetKey],
+    "z.ai binding moves only after the fresh target confirms its seed");
+  ok(storage.herdrWakeBindings[targetKey]?.continuity_id === continuityId,
+    "z.ai manual handoff preserves continuity id across chat ids");
+  ok(storage.herdrWakeBindings[targetKey]?.handoff_from === ZAI_SOURCE,
+    "z.ai target binding records the predecessor chat");
+}
+
 // ---- Scenario 7: Project handoff keeps source authoritative until target seed is confirmed ----
 console.log("\n[project handoff]");
 {
@@ -357,12 +618,27 @@ console.log("\n[project handoff]");
   ok(hudAllow?.enabled === true && hudAllow?.autoAllow === true,
     "legacy autoAllow=false cannot disable permission handling inside Project automation", JSON.stringify(hudAllow));
 
+  let resolveLockedHandoff;
+  const lockedHandoffP = new Promise((r) => { resolveLockedHandoff = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: 401 }, { tab: { id: 401 } }, (r) => resolveLockedHandoff(r));
+  const lockedHandoff = await lockedHandoffP;
+  ok(lockedHandoff?.ok === false && lockedHandoff?.error === "automation_enabled",
+    "manual handoff is rejected while Project automation is on", JSON.stringify(lockedHandoff));
+
+  let resolveProjectOff;
+  const projectOffP = new Promise((r) => { resolveProjectOff = r; });
+  onMsg({ type: "h2w_set_project_automation", project_id: PROJECT_ID, convKey: PROJECT_SOURCE, enabled: false }, { tab: { id: 401 } }, (r) => resolveProjectOff(r));
+  const projectOff = await projectOffP;
+  ok(projectOff?.ok === true && projectOff?.enabled === false,
+    "Project automation can be turned off before an explicit manual handoff", JSON.stringify(projectOff));
+
   let resolveStart;
   const startP = new Promise((r) => { resolveStart = r; });
   onMsg({ type: "h2w_handoff_start", tabId: 401 }, { tab: { id: 401 } }, (r) => resolveStart(r));
   const started = await startP;
   ok(started?.ok === true && started.pending === true, "rollover requests a handoff summary", JSON.stringify(started));
-  const transferId = Object.keys(storage.herdrConversationTransfers || {})[0];
+  const transferId = Object.values(storage.herdrConversationTransfers || {})
+    .find((transfer) => transfer?.source_conv_key === PROJECT_SOURCE)?.id;
   ok(!!transferId && handoffPrompt.includes(`id=${transferId}`), "source prompt carries the persisted transfer id");
 
   const assistantText = [
@@ -399,8 +675,8 @@ console.log("\n[project handoff]");
   const targetHudP = new Promise((r) => { resolveTargetHud = r; });
   onMsg({ type: "h2w_page_hud", convKey: PROJECT_TARGET }, { tab: { id: storage.herdrWakeBindings[targetKey]?.tabId } }, (r) => resolveTargetHud(r));
   const targetHud = await targetHudP;
-  ok(targetHud?.enabled === true && targetHud?.project_id === PROJECT_ID,
-    "rolled-over conversation inherits automation from the Project id", JSON.stringify(targetHud));
+  ok(targetHud?.enabled === false && targetHud?.project_id === PROJECT_ID,
+    "rolled-over conversation preserves the Project automation-off setting used for manual handoff", JSON.stringify(targetHud));
   ok(storage.herdrConversationTransfers[transferId]?.status === "committed", "transfer metadata records committed state");
   ok(storage.herdrConversationTransfers[transferId]?.handoff_text == null, "committed transfer clears the temporary handoff packet");
 }

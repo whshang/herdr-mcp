@@ -56,7 +56,7 @@ Bound conversation + extension ≥ 0.1.20:
 3. if the reply matches the "do not send" keywords → no nudge; otherwise if judged "continue" → **fill the small model's original text** into the input and submit (prompt / do-not-send words are pre-filled visible defaults in Options)
 4. **no longer** uses zero-tool / halfway heuristics; without a configured small model, no nudge this turn
 5. if the user bubble was the last nudge sentence, the **new assistant reply is still judged** (since 0.1.20); automatic judgment and progress checks share `progressTickSec`; `0` disables automatic LLM judgment (default 60s) but not manual **LLM analysis**
-6. persistent bottom HUD: runtime state, **Manual continue / Herdr monitor / LLM analysis / Manual handoff**, optional Project **Auto on|off**, and expand. Manual handoff appears only on ChatGPT Project conversations, becomes usable once bound to a workspace, and stays available even with `Auto on`. The Project switch is shown only when Options is in Per-Project mode; frequent actions stay on the bar, and the drawer contains only event settings, conversation bindings and advanced options. Copy follows the Options language (en / Simplified Chinese / Japanese)
+6. persistent bottom HUD on supported sites: runtime state, **Manual continue / Herdr monitor / LLM analysis / Manual handoff**, optional **Auto on|off**, and expand. When automation is permitted, ChatGPT uses a Project-scoped switch keyed by `project_id`, while z.ai / DeepSeek use a conversation-scoped switch. Global manual mode hides the automation switch. Manual handoff is available for bound ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations; with `Auto on`, all four HUD manual actions are locked. Frequent actions stay on the bar, and the drawer contains only event settings, conversation bindings and advanced options. Copy follows the Options language (en / Simplified Chinese / Japanese)
 7. herdr working/settled wake-ups remain independent
 
 The key is stored locally only; the repo keeps it empty by default.
@@ -72,16 +72,17 @@ With Project `Auto on`, both human-submitted and extension-submitted user messag
 
 The pre-refresh assistant signature is persisted. If reload reveals newer content or streaming resumes, recovery ends. If the identical partial reply remains after 10 seconds and the composer, tools and permission cards are idle, the extension submits exactly one browser-recovery activation message telling ChatGPT to reread the current conversation, continue from the real stop point, and not repeat completed work. Only if that also fails does recovery-exhausted rollover become eligible.
 
-## Manual handoff (0.1.46)
+## Manual handoff (0.1.47)
 
-The bottom-HUD **Manual handoff** action lets the user roll over early and is intentionally independent of `Auto on|off`:
+The bottom-HUD **Manual handoff** action lets the user roll over early, but the current conversation must first be switched to `Auto off`:
 
-- it appears only for ChatGPT Project conversations and requires the current conversation to be bound to a Herdr workspace;
-- clicking it reuses `h2w_handoff_start(trigger=manual)` and first asks the current ChatGPT conversation for a compact transfer-id-marked handoff packet;
-- if a bound workspace is still `working`, the operation is rejected to avoid racing settled/wake delivery against binding cutover;
-- after the packet is ready, the extension opens a fresh conversation in the same Project and submits the seed; workspace bindings move only after both the new conversation and seed are confirmed;
+- it supports bound ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations; z.ai `/` is only the new-chat launcher and does not show Manual handoff;
+- clicking it reuses `h2w_handoff_start(trigger=manual)` and first asks the current web model for a compact transfer-id-marked handoff packet;
+- z.ai summary and seed control messages use the raw send path and explicitly bypass the JSON→MCP bridge, so they cannot be rewritten into coding-agent tasks;
+- if a bound workspace is still `working`, the operation is rejected to avoid racing settled/wake delivery against binding cutover; with `Auto on`, the button is locked and background independently returns `automation_enabled` if the UI is bypassed;
+- ChatGPT opens a fresh conversation in the same Project; z.ai launches from `/`. Workspace bindings move only after a new conversation id exists and the seed marker is confirmed;
 - an in-flight transfer changes the button to **Compressing… / Moving… / Resume handoff** instead of creating a duplicate transfer; `seed_uncertain` can be resumed through the same fail-closed recovery path;
-- with `Auto on`, the three manual continuation actions are locked, but **Manual handoff remains available** because it is an explicit user decision to change conversation lifecycle.
+- when a z.ai root chat first becomes `/c/<chat_id>`, its temporary binding and automation preference migrate once; later navigation from `/c/A` to `/c/B` never drags the binding along.
 
 ## Multi-task semantics
 

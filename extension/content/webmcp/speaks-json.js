@@ -9,7 +9,7 @@
   // Site-specific reply selectors and completion checks.
   const SITES = {
     "z.ai": {
-      replySelector: "[class*=markdown], [class*=answer], [class*=message-content], [class*=prose]",
+      replySelector: ".markdown-prose, [class*=markdown], [class*=answer], [class*=message-content], [class*=prose]",
       isReplyDone(el) {
         const t = (el.innerText || "").toLowerCase();
         return !/thinking\.\.\.|generating|loading\.\.\.|思考中|生成中|加载中/.test(t);
