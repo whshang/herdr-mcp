@@ -1,17 +1,12 @@
 /**
- * mcp-chatgpt-transport.ts — DEV-only ChatGPT/OpenAI MCP transport helpers for
- * the Cloudflare development edge (Phase 3).
+ * mcp-chatgpt-transport.ts — ChatGPT/OpenAI MCP transport helpers for the
+ * Cloudflare Edge.
  *
- * Isolated from existing Edge logic on purpose: dependency-free (no imports —
- * only Web platform primitives), and deliberately NOT wired into index.ts.
- * The dev router composes these helpers; wiring is out of scope for this
- * module.
+ * Isolated from routing/auth logic on purpose: dependency-free (only Web
+ * platform primitives). index.ts composes these helpers after authentication.
  *
- * Scope boundaries (do NOT expand here):
- *  - ChatGPT/openai-mcp detection is User-Agent ONLY. OAuth client-id (CIMD)
- *    detection is Phase 4 — do not add it.
- *  - No OAuth, no DCR, no discovery cards, and NO 2026-07-28 protocol-version
- *    semantics (no header rewrites). Those belong to later phases.
+ * Scope boundaries: this module only decides framing/stateless transport.
+ * OAuth, DCR and discovery are implemented by the dedicated OAuth modules.
  *
  * Session policy — hard guarantee of this module:
  *  - No Mcp-Session-Id is ever ISSUED (no response header) and none is ever
@@ -40,10 +35,10 @@
  *    `enableJsonResponse = method === "tools/call"`).
  *  - Notifications (dev.body === null) keep their status (204) with an empty
  *    body — never a JSON-encoded "null".
- *  - Non-ChatGPT clients may use JSON for every POST in dev.
+ *  - Non-ChatGPT clients may use JSON for every POST.
  */
 
-/** Phase-3 marker used for User-Agent detection (OpenAI MCP connector). */
+/** Marker used for User-Agent detection (OpenAI MCP connector). */
 export const OPENAI_MCP_UA_MARKER = "openai-mcp" as const;
 
 /** Default GET probe heartbeat interval — matches production's 15s and the SDK's DEFAULT_SSE_KEEP_ALIVE_MS. */
@@ -55,7 +50,7 @@ export const DEFAULT_PROBE_HEARTBEAT_MS = 15_000;
  * NOTE on `server/discover`: the task lists it here, but production answers
  * discover with JSON (src/server.ts `res.status(200).json(...)`, before the
  * stateless branch) — proven wire behavior. It therefore deliberately stays
- * out of this set; the dev router gets JSON for discover.
+ * out of this set; the Edge router gets JSON for discover.
  */
 export const SSE_POST_METHODS: ReadonlySet<string> = new Set<string>(["initialize", "tools/list"]);
 
@@ -68,13 +63,13 @@ export interface SessionlessProbeOptions {
   onCleanup?: () => void;
 }
 
-export interface McpDevResult {
+export interface McpResult {
   status: number;
   /** JSON-RPC envelope to serialize, or null for status-only responses (204 notifications). */
   body: Record<string, unknown> | null;
 }
 
-export interface SerializeMcpDevOptions {
+export interface SerializeMcpOptions {
   /** Raw User-Agent header value from the incoming request (may be absent). */
   userAgent: string | null | undefined;
   /** Validated OAuth client_id; ChatGPT CIMD uses an HTTPS chatgpt.com URL. */
@@ -84,9 +79,8 @@ export interface SerializeMcpDevOptions {
 }
 
 /**
- * Phase-3 ChatGPT/openai-mcp detection: case-insensitive substring match on
+ * ChatGPT/openai-mcp detection: case-insensitive substring match on
  * `openai-mcp` in the User-Agent (production-observed UA: `openai-mcp/1.0.0`).
- * OAuth client-id / CIMD detection is Phase 4 and deliberately absent.
  */
 export function isOpenAiMcpUserAgent(userAgent: string | null | undefined): boolean {
   if (typeof userAgent !== "string") return false;
@@ -206,14 +200,14 @@ export function createSessionlessMcpProbeResponse(options: SessionlessProbeOptio
 }
 
 /**
- * Serialize a handleMcpDev result (McpDevResponse is structurally compatible
- * with McpDevResult) into the transport Response:
+ * Serialize a handleMcp result (McpResponse is structurally compatible
+ * with McpResult) into the transport Response:
  *  - body === null            -> status-only (204 notification), empty body
  *  - ChatGPT initialize/list  -> SSE one-event frame
  *  - everything else          -> application/json, Cache-Control: no-store
  * Never emits or echoes Mcp-Session-Id / credentials.
  */
-export function serializeMcpDevResponse(result: McpDevResult, options: SerializeMcpDevOptions): Response {
+export function serializeMcpResponse(result: McpResult, options: SerializeMcpOptions): Response {
   if (result.body === null) {
     return new Response(null, { status: result.status });
   }

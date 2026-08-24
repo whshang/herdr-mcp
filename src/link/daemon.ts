@@ -4,7 +4,10 @@ import { HerdrLink } from "./client.js";
 import { RuntimeControlLoop } from "./runtime-control.js";
 import { RuntimeGenerationManager } from "./runtime-generation.js";
 
-export const EPOCH1_CONTRACT_HASH =
+export const PUBLIC_CONTRACT_EPOCH = 2;
+export const PUBLIC_CONTRACT_HASH =
+  "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8";
+export const LEGACY_EPOCH1_CONTRACT_HASH =
   "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
 
 export interface LinkDaemonConfig {
@@ -14,6 +17,7 @@ export interface LinkDaemonConfig {
   runtimeToken: string;
   runtimeEndpoint: string;
   runtimeGeneration: string;
+  contractEpoch: number;
   contractHash: string;
   runtimeControlPath: string;
   runtimeStatusPath: string;
@@ -33,7 +37,11 @@ export function readLinkDaemonConfig(env: NodeJS.ProcessEnv = process.env): Link
   const runtimeToken = required(env, "HERDR_MCP_TOKEN");
   const runtimeEndpoint = env.HERDR_MCP_ENDPOINT?.trim() || "http://127.0.0.1:8772/mcp";
   const runtimeGeneration = env.HERDR_RUNTIME_GENERATION?.trim() || "local-mcp-active";
-  const contractHash = env.HERDR_CONTRACT_HASH?.trim() || EPOCH1_CONTRACT_HASH;
+  const contractHash = env.HERDR_CONTRACT_HASH?.trim() || PUBLIC_CONTRACT_HASH;
+  const epochRaw = env.HERDR_CONTRACT_EPOCH?.trim();
+  const contractEpoch = epochRaw
+    ? Number(epochRaw)
+    : (contractHash === LEGACY_EPOCH1_CONTRACT_HASH ? 1 : PUBLIC_CONTRACT_EPOCH);
   const runtimeControlDir = env.HERDR_RUNTIME_CONTROL_DIR?.trim() || join(homedir(), ".config", "herdr-mcp");
   const runtimeControlPath = env.HERDR_RUNTIME_CONTROL_PATH?.trim() || join(runtimeControlDir, "runtime-control.json");
   const runtimeStatusPath = env.HERDR_RUNTIME_STATUS_PATH?.trim() || join(runtimeControlDir, "runtime-status.json");
@@ -50,8 +58,11 @@ export function readLinkDaemonConfig(env: NodeJS.ProcessEnv = process.env): Link
   if (!/^[A-Za-z0-9_.-]{1,64}$/.test(runtimeGeneration)) {
     throw new Error("herdr-link daemon: HERDR_RUNTIME_GENERATION is invalid");
   }
-  if (contractHash !== EPOCH1_CONTRACT_HASH) {
-    throw new Error("herdr-link daemon: contract hash differs from frozen epoch 1");
+  const validContract =
+    (contractEpoch === PUBLIC_CONTRACT_EPOCH && contractHash === PUBLIC_CONTRACT_HASH) ||
+    (contractEpoch === 1 && contractHash === LEGACY_EPOCH1_CONTRACT_HASH);
+  if (!validContract) {
+    throw new Error("herdr-link daemon: contract epoch/hash pair is not a supported public or rollback contract");
   }
   return {
     edgeUrl,
@@ -60,6 +71,7 @@ export function readLinkDaemonConfig(env: NodeJS.ProcessEnv = process.env): Link
     runtimeToken,
     runtimeEndpoint,
     runtimeGeneration,
+    contractEpoch,
     contractHash,
     runtimeControlPath,
     runtimeStatusPath,
@@ -89,7 +101,7 @@ export async function runLinkDaemon(config: LinkDaemonConfig): Promise<number> {
     base: baseGeneration,
     bearerToken: config.runtimeToken,
     contractHash: config.contractHash,
-    contractEpoch: 1,
+    contractEpoch: config.contractEpoch,
     defaultTimeoutMs: 30_000,
     maxTimeoutMs: 60_000,
     observationChecks: 3,

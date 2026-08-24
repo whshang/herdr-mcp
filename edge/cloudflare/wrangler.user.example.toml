@@ -12,7 +12,7 @@ routes = []
 EDGE_ENV = "prod"
 EDGE_PROJECT = "herdr-edge"
 EDGE_VERSION = "0.1.0"
-DEMO_WORKSTATION_ID = "my-workstation"
+DEFAULT_WORKSTATION_ID = "my-workstation"
 # For workers.dev, set this to the exact stable Worker origin:
 OAUTH_ISSUER = "https://herdr-edge.YOUR_ACCOUNT_SUBDOMAIN.workers.dev"
 

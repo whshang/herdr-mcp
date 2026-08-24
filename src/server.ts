@@ -62,7 +62,7 @@ import {
 import { commitAtomic } from "./atomic-files.js";
 import { runLocalShell } from "./local-exec.js";
 import { fetchHerdrSkill, herdrSkillPointer } from "./herdr-skill.js";
-import { EPOCH1_TOOL_OVERRIDES } from "./epoch1-tool-overrides.js";
+import { EPOCH1_TOOL_OVERRIDES } from "./legacy-epoch1-tool-overrides.js";
 import { enrichedUserEnv } from "./user-path.js";
 
 /** Process boot id — returned by inspect/since so clients detect cursor reset. */
@@ -81,14 +81,18 @@ const AUTH_TOKEN = process.env.HERDR_MCP_TOKEN ?? "";
 // additionally registers advanced + deprecated lifecycle tools (wait/task/session/handoff/
 // reap/parallel/read/explain/prompt_status/transcript/diff) — 30 total.
 const ALL_TOOLS = process.env.HERDR_MCP_ALL_TOOLS === "1";
-// Public ABI compatibility profile. `epoch1` keeps the exact 0.3.23/17-tool
-// ChatGPT-visible metadata while allowing newer runtime implementation code.
-// It is mutually exclusive with ALL_TOOLS because advanced tools necessarily
-// change the public contract.
+// Public ABI compatibility profiles. `epoch1` preserves the historical
+// 0.3.23/17-tool catalog; `epoch2` freezes the 18-tool catalog that includes
+// herdr_skill. `current` is the development/default surface and may evolve.
 const CONTRACT_PROFILE = process.env.HERDR_MCP_CONTRACT_PROFILE?.trim() || "current";
 const EPOCH1_CONTRACT_PROFILE = CONTRACT_PROFILE === "epoch1";
-if (EPOCH1_CONTRACT_PROFILE && ALL_TOOLS) {
-  throw new Error("HERDR_MCP_CONTRACT_PROFILE=epoch1 cannot be combined with HERDR_MCP_ALL_TOOLS=1");
+const EPOCH2_CONTRACT_PROFILE = CONTRACT_PROFILE === "epoch2";
+const FROZEN_CONTRACT_PROFILE = EPOCH1_CONTRACT_PROFILE || EPOCH2_CONTRACT_PROFILE;
+if (!["current", "epoch1", "epoch2"].includes(CONTRACT_PROFILE)) {
+  throw new Error(`unsupported HERDR_MCP_CONTRACT_PROFILE=${CONTRACT_PROFILE}`);
+}
+if (FROZEN_CONTRACT_PROFILE && ALL_TOOLS) {
+  throw new Error(`HERDR_MCP_CONTRACT_PROFILE=${CONTRACT_PROFILE} cannot be combined with HERDR_MCP_ALL_TOOLS=1`);
 }
 // E: authorization switches. READONLY blocks every mutating operation;
 // WRITE_ROOTS (csv) limits mutations to listed roots (unset = all managed roots).
@@ -672,9 +676,10 @@ function resolveDiffTargets(
 
 // ---------------------------------------------------------------------------
 function registerTools(server: McpServer): void {
-  // Keep one implementation while allowing the production runtime to advertise
-  // the exact frozen epoch-1 metadata. The shim only changes registration
-  // metadata; handlers and runtime behavior remain current.
+  // Keep one implementation while allowing historical frozen profiles to
+  // advertise stable metadata. Epoch 2 intentionally matches the current
+  // 18-tool metadata at capture time; future metadata changes must add an
+  // explicit compatibility override instead of silently drifting the hash.
   const registerToolCompat = ((name: string, config: any, handler: any) => {
     if (EPOCH1_CONTRACT_PROFILE && name === "herdr_skill") return undefined;
     let next = config;
@@ -829,7 +834,7 @@ function registerTools(server: McpServer): void {
                 available: "false",
                 deferred_tool: "herdr_skill",
                 contract_profile: "epoch1",
-                hint: "Runtime includes herdr_skill, but the current ChatGPT contract epoch intentionally hides it to preserve the existing 17-tool ABI.",
+                hint: "Legacy contract epoch 1 hides herdr_skill to preserve the historical 17-tool ABI.",
               }
             : herdrSkillPointer(),
           default_cwd: typeof view["focused_pane"] === "string"

@@ -92,7 +92,7 @@ function abortableFetch(control) {
 test("constructor: defaults to the 8772/mcp endpoint", () => {
   const t = new LocalMcpRuntimeTransport(opts());
   assert.equal(t.name, "local-mcp-http");
-  assert.equal(t.getRuntimeInfo().contract_epoch, 1);
+  assert.equal(t.getRuntimeInfo().contract_epoch, 2);
   assert.equal(t.getRuntimeInfo().contract_hash, CONTRACT_HASH);
   assert.equal(LOCAL_MCP_DEFAULT_ENDPOINT, "http://127.0.0.1:8772/mcp");
   assert.equal(LOCAL_MCP_DEFAULT_MAX_FRAME_BYTES, 2 * 1024 * 1024);
@@ -118,12 +118,12 @@ test("constructor: loopback guard accepts 127.x/localhost/[::1] and rejects LAN"
   new LocalMcpRuntimeTransport(opts({ endpoint: "http://192.168.1.5:8772/mcp", allowNonLoopback: true }));
 });
 
-test("constructor: rejects invalid endpoint schemes and non-1 contract epochs", () => {
+test("constructor: rejects invalid endpoint schemes and non-2 contract epochs", () => {
   assert.throws(() => new LocalMcpRuntimeTransport(opts({ endpoint: "ws://127.0.0.1:8772/mcp" })));
   assert.throws(() => new LocalMcpRuntimeTransport(opts({ endpoint: "not a url" })));
-  assert.throws(() => new LocalMcpRuntimeTransport(opts({ contractEpoch: 2 })));
+  assert.throws(() => new LocalMcpRuntimeTransport(opts({ contractEpoch: 1 })));
   assert.throws(() => new LocalMcpRuntimeTransport(opts({ contractEpoch: "1" })));
-  new LocalMcpRuntimeTransport(opts({ contractEpoch: 1 }));
+  new LocalMcpRuntimeTransport(opts({ contractEpoch: 2 }));
 });
 
 test("constructor: requires bearerToken, contractHash, fetch — errors never embed the token", async () => {

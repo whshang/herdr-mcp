@@ -1,5 +1,5 @@
 import { computeContractHash, type ContractTool } from "../relay/contract.js";
-import { LocalMcpRuntimeTransport } from "./local-mcp-transport.js";
+import { LOCAL_MCP_CONTRACT_EPOCH, LocalMcpRuntimeTransport } from "./local-mcp-transport.js";
 import type {
   LinkRuntimeTransport,
   RequestId,
@@ -183,8 +183,10 @@ export class RuntimeGenerationManager implements LinkRuntimeTransport {
     if (!options.contractHash) throw new TypeError("runtime-generation: contractHash is required");
     this.bearerToken = options.bearerToken;
     this.contractHash = options.contractHash;
-    this.contractEpoch = options.contractEpoch ?? 1;
-    if (this.contractEpoch !== 1) throw new RangeError("runtime-generation: contract epoch must remain 1");
+    this.contractEpoch = options.contractEpoch ?? LOCAL_MCP_CONTRACT_EPOCH;
+    if (this.contractEpoch !== LOCAL_MCP_CONTRACT_EPOCH) {
+      throw new RangeError(`runtime-generation: contract epoch must remain ${LOCAL_MCP_CONTRACT_EPOCH} for this build`);
+    }
     this.fetchFn = options.fetch ?? globalThis.fetch;
     this.defaultTimeoutMs = boundedPositive(options.defaultTimeoutMs, 30_000, 1_000, 60_000);
     this.maxTimeoutMs = boundedPositive(options.maxTimeoutMs, 60_000, this.defaultTimeoutMs, 120_000);

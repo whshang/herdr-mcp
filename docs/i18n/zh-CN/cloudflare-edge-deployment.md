@@ -183,7 +183,7 @@ bin/herdr-custom-domain-cutover run
 2. 确认生产 Worker candidate、OAuth identity 和旧 Tunnel 均健康；
 3. 删除唯一冲突 CNAME；
 4. attach Worker Custom Domain；
-5. 验证 health、workstation、epoch/hash、17-tool catalog、OAuth/MCP identity 和一次只读 `herdr_inspect`；
+5. 验证 health、workstation、epoch/hash、**包含 `herdr_skill` 的 18-tool epoch-2 catalog**、OAuth/MCP identity 和一次只读 `herdr_inspect`；
 6. 任一步失败时自动 detach Custom Domain，并恢复原 CNAME；
 7. 对 DNS DELETE/POST 和 Custom Domain PUT/DELETE 的“服务端已提交但响应丢失”场景重新读取真实状态，不盲重试。
 
@@ -232,7 +232,7 @@ herdr.example.com -> CNAME -> Cloudflare Tunnel
 6. 对 Custom Domain 验证：
    - `/health`；
    - workstation online；
-   - epoch-1 `tools/list`；
+   - epoch-2 `tools/list` 为 18 tools，并包含 `herdr_skill`；
    - OAuth discovery / token；
    - 一次真实 MCP tool call；
 7. 观察通过后，旧 Tunnel 再退出服务；
@@ -296,10 +296,10 @@ bin/herdr-cloudflare-dns-token --revoke
 ## 相关脚本
 
 ```text
-bin/herdr-cloudflare-token   # 创建/验证 Cloudflare 最小权限 Token
-bin/herdr-cloudflare-domain  # Custom Domain attach/watch/detach
-bin/herdr-edge-cutover       # Legacy Worker Route 迁移/回滚工具
-bin/herdr-link               # workstation -> Edge WSS sidecar
+bin/herdr-cloudflare-token       # 创建/验证 Cloudflare 最小权限 Token
+bin/herdr-cloudflare-domain      # Custom Domain attach/watch/detach
+bin/herdr-custom-domain-cutover  # 事务化 CNAME/Tunnel -> Custom Domain 迁移
+bin/herdr-link                   # workstation -> Edge WSS sidecar
 ```
 
 新安装优先使用 `workers.dev`；已有稳定域名的用户再选择 Custom Domain。不要因为文档展示了自定义域名示例，就把它当成安装前置条件。

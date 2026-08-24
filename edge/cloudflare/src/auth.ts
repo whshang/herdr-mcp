@@ -1,16 +1,15 @@
 /**
- * auth.ts — workstation-link authentication interface (dev implementation).
+ * auth.ts — workstation-link and static bearer authentication primitives.
  *
  * Boundary ownership:
  *  - The Worker authenticates the WS *upgrade* before routing to the DO.
  *  - The DO additionally validates the link identity inside the `hello`
  *    message (workstationId binding + protocol version).
- *  - Link credentials are strictly separate from ChatGPT OAuth credentials
- *    (plan §12). OAuth itself is Phase 4 and intentionally NOT here.
+ *  - Link credentials are strictly separate from ChatGPT OAuth credentials.
  *
- * Dev-only: a single shared secret read from LINK_SHARED_SECRET (fail closed
- * when unset). Production will use per-workstation derived credentials with
- * rotation — see README TODO list. Nothing here is production-grade.
+ * The current link uses a shared secret from LINK_SHARED_SECRET and fails
+ * closed when unset. Per-workstation credential rotation remains a separate
+ * hardening path; OAuth is already implemented elsewhere for MCP clients.
  */
 
 import { MAX_WS_ID_LEN, MAX_RESOURCE_TOKEN_LEN } from "./limits.js";
@@ -26,7 +25,7 @@ export type AuthDecision =
   | { ok: true; claims: AuthClaims }
   | { ok: false; code: "link_auth_failed" | "bad_request"; reason: string };
 
-export type DevMcpAuthDecision =
+export type StaticMcpBearerDecision =
   | { ok: true }
   | { ok: false; code: "mcp_auth_failed"; reason: string };
 
@@ -39,7 +38,7 @@ export interface LinkAuthenticator {
   authenticate(request: AuthRequestLike, workstationId: string, atMs: number): AuthDecision | Promise<AuthDecision>;
 }
 
-/** Constant-time byte compare (dev-grade; length leak acceptable). */
+/** Constant-time byte compare for equal-length credentials. */
 export function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
   let diff = 0;
@@ -62,14 +61,14 @@ export function hasLinkApplicationProtocol(request: AuthRequestLike): boolean {
 }
 
 /**
- * Temporary Phase-3 ChatGPT-facing bearer gate for the public dev Worker.
- * OAuth replaces this in Phase 4. It is intentionally separate from the
- * workstation-link secret and fails closed when unset.
+ * Static bearer fallback used for controlled compatibility/admin paths. Public
+ * ChatGPT access normally authenticates through OAuth. This secret is separate
+ * from the workstation-link secret and fails closed when unset.
  */
-export function authenticateDevMcpBearer(
+export function authenticateStaticMcpBearer(
   request: AuthRequestLike,
   secret: string | undefined,
-): DevMcpAuthDecision {
+): StaticMcpBearerDecision {
   if (!secret || secret.length === 0) {
     return { ok: false, code: "mcp_auth_failed", reason: "dev MCP auth not configured; failing closed" };
   }
@@ -103,7 +102,7 @@ export function buildLinkAuthProtocol(secret: string): string {
  *
  * Fail closed when configured secret is missing/empty.
  */
-export class DevSecretLinkAuthenticator implements LinkAuthenticator {
+export class SharedSecretLinkAuthenticator implements LinkAuthenticator {
   private readonly secret: string | undefined;
 
   constructor(config: { secret?: string; secretVersion?: string }) {

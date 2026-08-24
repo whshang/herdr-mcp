@@ -16,7 +16,7 @@ routes = []
 EDGE_ENV = "prod"
 EDGE_PROJECT = "herdr-edge-prod"
 EDGE_VERSION = "0.1.0-prod"
-DEMO_WORKSTATION_ID = "prod-real-runtime"
+DEFAULT_WORKSTATION_ID = "prod-real-runtime"
 OAUTH_ISSUER = "https://herdr-mcp.agentforme.cc.cd"
 
 [durable_objects]

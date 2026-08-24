@@ -2,14 +2,15 @@
 import assert from "node:assert/strict";
 import { HerdrLink } from "../../../../dist/link/client.js";
 import { LocalMcpRuntimeTransport } from "../../../../dist/link/local-mcp-transport.js";
+import { PUBLIC_CONTRACT_EPOCH, PUBLIC_CONTRACT_HASH } from "../../../../dist/link/daemon.js";
+import { SERVER_VERSION } from "../../../../dist/version.js";
 
 const EDGE_HTTP = process.env.EDGE_URL ?? "http://127.0.0.1:8787";
 const EDGE_WS = EDGE_HTTP.replace(/^http/, "ws") + "/ws";
-const WORKSTATION_ID = process.env.DEMO_WORKSTATION_ID ?? "dev-real-runtime";
+const WORKSTATION_ID = process.env.DEFAULT_WORKSTATION_ID ?? "dev-real-runtime";
 const LINK_TOKEN = process.env.LINK_SHARED_SECRET;
 const DEV_MCP_BEARER = process.env.DEV_MCP_BEARER_SECRET;
 const RUNTIME_TOKEN = process.env.HERDR_MCP_TOKEN;
-const CONTRACT_HASH = "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
 
 if (!LINK_TOKEN) throw new Error("LINK_SHARED_SECRET is required");
 if (!DEV_MCP_BEARER) throw new Error("DEV_MCP_BEARER_SECRET is required");
@@ -18,11 +19,11 @@ if (!RUNTIME_TOKEN) throw new Error("HERDR_MCP_TOKEN is required");
 const transport = new LocalMcpRuntimeTransport({
   endpoint: "http://127.0.0.1:8772/mcp",
   bearerToken: RUNTIME_TOKEN,
-  contractHash: CONTRACT_HASH,
-  contractEpoch: 1,
-  runtimeVersion: "0.3.23",
+  contractHash: PUBLIC_CONTRACT_HASH,
+  contractEpoch: PUBLIC_CONTRACT_EPOCH,
+  runtimeVersion: SERVER_VERSION,
   runtimeCommit: "dev",
-  runtimeGeneration: "live-0.3.23",
+  runtimeGeneration: `live-${SERVER_VERSION}`,
   herdrVersion: "0.8.2",
   herdrProtocol: "20",
   defaultTimeoutMs: 15_000,
@@ -74,8 +75,8 @@ const text = call.result.content.find((item) => item?.type === "text")?.text;
 assert.equal(typeof text, "string");
 const inspected = JSON.parse(text);
 const serverVersion = inspected?.workstation_info?.server_version ?? inspected?.build?.server_version;
-assert.equal(serverVersion, "0.3.23");
-assert.equal(inspected?.build?.pid, 93113);
+assert.equal(serverVersion, SERVER_VERSION);
+assert.equal(typeof inspected?.build?.pid, "number");
 
 console.log("real runtime e2e OK", JSON.stringify({
   workstation: WORKSTATION_ID,

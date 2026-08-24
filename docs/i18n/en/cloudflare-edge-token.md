@@ -127,5 +127,3 @@ bin/herdr-cloudflare-domain preflight
 ```
 
 `bin/herdr-cloudflare-domain` only calls the Workers Domains API; it never deletes DNS or stops the Tunnel by itself. If the old architecture already has a same-name CNAME, Cloudflare refuses a direct attach; first record complete rollback evidence, then delete the conflicting CNAME in a controlled switchover, attach the Custom Domain, verify, and only then retire the old Tunnel. On failure, detach the Custom Domain and restore the old CNAME. See [`cloudflare-edge-deployment.md`](cloudflare-edge-deployment.md).
-
-`bin/herdr-edge-cutover` remains a Worker Route / legacy migration tool; it is no longer the default path for new installs.

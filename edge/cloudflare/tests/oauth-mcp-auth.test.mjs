@@ -37,7 +37,7 @@ async function jwt(privateKey, claims, header = { alg: "RS256", typ: "at+jwt" })
   return `${signing}.${b64url(new Uint8Array(signature))}`;
 }
 
-test("dev bearer remains available during Phase-4 transition", async () => {
+test("development bearer remains an explicit local compatibility fallback", async () => {
   const result = await authenticateMcpRequest(request("dev-secret"), { DEV_MCP_BEARER_SECRET: "dev-secret" });
   assert.deepEqual(result, { ok: true, source: "dev_bearer" });
 });

@@ -6,6 +6,13 @@ Versions below follow `src/version.ts` / `package.json`. Git has no tags; 0.3.19
 
 ChatGPT can retain a `tools/list` snapshot for a conversation. A runtime version bump does **not** have to change that public catalog: production may run a newer implementation under a frozen contract profile. Only a deliberate contract/tool-surface change requires Connector/tool-snapshot migration and a new chat.
 
+## 0.3.32 — 2026-08-24
+
+- Promote the public ChatGPT ABI to **contract epoch 2 / 18 tools**, including the read-only `herdr_skill`, frozen at `sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8`. Epoch 1 remains tracked exactly as the historical 17-tool rollback/old-session compatibility baseline.
+- Make the production contract explicit across the Edge, workstation link, runtime profile, self-update gates and Cloudflare domain probes. Same-epoch runtime A/B remains automatic; cross-epoch migration is a supervised server → Edge → link operation and `herdr-self-update` fails closed if asked to cross it.
+- Remove obsolete Edge scaffolding: rename the production MCP handler away from `mcp-dev`, remove the unused `mcp-placeholder` module, rename shared/static auth and `DEFAULT_WORKSTATION_ID` by their actual roles, and remove the orphaned `herdr-edge-cutover` script/test in favor of `herdr-cloudflare-domain` + `herdr-custom-domain-cutover`.
+- Rewrite current architecture, Connector, deployment, capability and runtime-upgrade documentation so epoch 2 is the only current production path; historical epoch-1 claims remain only where they are intentionally documenting or testing compatibility history.
+
 ## 0.3.31 — 2026-08-23
 
 - Make `workspace.list` the sole admission authority for unknown workspace IDs. Contradictory daemon event sequences such as `workspace_closed` followed by stale `workspace_created` can no longer resurrect a closed workspace.

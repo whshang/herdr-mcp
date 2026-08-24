@@ -226,6 +226,5 @@ test("limits: classifyOp only marks known-read ops retryable", () => {
   assert.equal(classifyOp("herdr_exec"), "mutating");
   assert.equal(classifyOp("herdr_prompt"), "mutating");
   assert.equal(classifyOp("some_mystery_tool"), "mutating");
-  // herdr_skill is intentionally absent (not part of epoch-1 baseline).
-  assert.equal(classifyOp("herdr_skill"), "mutating");
+  assert.equal(classifyOp("herdr_skill"), "read");
 });

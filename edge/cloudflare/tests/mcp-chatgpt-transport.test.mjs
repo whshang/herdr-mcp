@@ -5,7 +5,7 @@ import {
   isOpenAiMcpUserAgent,
   isChatgptOAuthClientId,
   createSessionlessMcpProbeResponse,
-  serializeMcpDevResponse,
+  serializeMcpResponse,
   sseFrameEvent,
   OPENAI_MCP_UA_MARKER,
   DEFAULT_PROBE_HEARTBEAT_MS,
@@ -136,9 +136,9 @@ test("SSE frame: event: message + data: json", () => {
   assert.equal(frame.endsWith("\n\n"), true, "frame must end with double newline");
 });
 
-test("serializeMcpDevResponse: ChatGPT initialize -> SSE framing", () => {
+test("serializeMcpResponse: ChatGPT initialize -> SSE framing", () => {
   const result = { status: 200, body: { jsonrpc: "2.0", id: 1, result: { serverInfo: { name: "test", version: "1" } } } };
-  const res = serializeMcpDevResponse(result, { userAgent: "openai-mcp/1.0.0", method: "initialize" });
+  const res = serializeMcpResponse(result, { userAgent: "openai-mcp/1.0.0", method: "initialize" });
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("content-type"), "text/event-stream");
   assert.equal(res.headers.get("cache-control"), "no-cache, no-transform");
@@ -150,9 +150,9 @@ test("serializeMcpDevResponse: ChatGPT initialize -> SSE framing", () => {
   });
 });
 
-test("serializeMcpDevResponse: ChatGPT tools/list -> SSE framing", () => {
+test("serializeMcpResponse: ChatGPT tools/list -> SSE framing", () => {
   const result = { status: 200, body: { jsonrpc: "2.0", id: 2, result: { tools: [] } } };
-  const res = serializeMcpDevResponse(result, { userAgent: "openai-mcp/1.0.0", method: "tools/list" });
+  const res = serializeMcpResponse(result, { userAgent: "openai-mcp/1.0.0", method: "tools/list" });
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("content-type"), "text/event-stream");
   return res.text().then((body) => {
@@ -160,9 +160,9 @@ test("serializeMcpDevResponse: ChatGPT tools/list -> SSE framing", () => {
   });
 });
 
-test("serializeMcpDevResponse: validated ChatGPT OAuth client_id triggers SSE without OpenAI UA", () => {
+test("serializeMcpResponse: validated ChatGPT OAuth client_id triggers SSE without OpenAI UA", () => {
   const result = { status: 200, body: { jsonrpc: "2.0", id: 22, result: { tools: [] } } };
-  const res = serializeMcpDevResponse(result, {
+  const res = serializeMcpResponse(result, {
     userAgent: "generic-mcp-client/1.0",
     oauthClientId: "https://chatgpt.com/client",
     method: "tools/list",
@@ -175,9 +175,9 @@ test("serializeMcpDevResponse: validated ChatGPT OAuth client_id triggers SSE wi
 // 4. POST JSON framing: tools/call, server/discover, errors, non-ChatGPT
 // ---------------------------------------------------------------------------
 
-test("serializeMcpDevResponse: ChatGPT tools/call -> JSON", () => {
+test("serializeMcpResponse: ChatGPT tools/call -> JSON", () => {
   const result = { status: 200, body: { jsonrpc: "2.0", id: 3, result: { content: [{ type: "text", text: "ok" }] } } };
-  const res = serializeMcpDevResponse(result, { userAgent: "openai-mcp/1.0.0", method: "tools/call" });
+  const res = serializeMcpResponse(result, { userAgent: "openai-mcp/1.0.0", method: "tools/call" });
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("content-type"), "application/json");
   assert.equal(res.headers.get("cache-control"), "no-store");
@@ -186,9 +186,9 @@ test("serializeMcpDevResponse: ChatGPT tools/call -> JSON", () => {
   });
 });
 
-test("serializeMcpDevResponse: ChatGPT server/discover -> JSON (follows production)", () => {
+test("serializeMcpResponse: ChatGPT server/discover -> JSON (follows production)", () => {
   const result = { status: 200, body: { jsonrpc: "2.0", id: "d", result: { supportedVersions: ["2025-11-25"], capabilities: {}, instructions: "", ttlMs: 3_600_000, cacheScope: "private" } } };
-  const res = serializeMcpDevResponse(result, { userAgent: "openai-mcp/1.0.0", method: "server/discover" });
+  const res = serializeMcpResponse(result, { userAgent: "openai-mcp/1.0.0", method: "server/discover" });
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("content-type"), "application/json");
   return res.json().then((body) => {
@@ -196,11 +196,11 @@ test("serializeMcpDevResponse: ChatGPT server/discover -> JSON (follows producti
   });
 });
 
-test("serializeMcpDevResponse: non-ChatGPT -> JSON for all methods", () => {
+test("serializeMcpResponse: non-ChatGPT -> JSON for all methods", () => {
   const result = { status: 200, body: { jsonrpc: "2.0", id: 1, result: { ok: true } } };
   const ua = "curl/7.88";
   for (const method of ["initialize", "tools/list", "tools/call", "server/discover"]) {
-    const res = serializeMcpDevResponse(result, { userAgent: ua, method });
+    const res = serializeMcpResponse(result, { userAgent: ua, method });
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("content-type"), "application/json", `method=${method}`);
     assert.equal(res.headers.get("cache-control"), "no-store", `method=${method}`);
@@ -211,8 +211,8 @@ test("serializeMcpDevResponse: non-ChatGPT -> JSON for all methods", () => {
 // 5. 204 notification (body === null)
 // ---------------------------------------------------------------------------
 
-test("serializeMcpDevResponse: notification 204 with null body, no content-type", () => {
-  const res = serializeMcpDevResponse({ status: 204, body: null }, { userAgent: "openai-mcp/1.0.0", method: "notifications/initialized" });
+test("serializeMcpResponse: notification 204 with null body, no content-type", () => {
+  const res = serializeMcpResponse({ status: 204, body: null }, { userAgent: "openai-mcp/1.0.0", method: "notifications/initialized" });
   assert.equal(res.status, 204);
   assert.equal(res.headers.get("content-type"), null, "204 must not carry content-type");
   // Must not be a JSON "null" body
@@ -258,14 +258,14 @@ test("stale Mcp-Session-Id header has no effect on framing or headers", async ()
   await probe.body.cancel();
 
   // POST: router forwards only UA + method.
-  const list = serializeMcpDevResponse(
+  const list = serializeMcpResponse(
     { status: 200, body: { jsonrpc: "2.0", id: 2, result: { tools: [] } } },
     { userAgent: incoming.get("user-agent"), method: "tools/list" },
   );
   assert.match(list.headers.get("content-type") ?? "", /text\/event-stream/i, "SSE framing unchanged despite stale sid");
   assert.equal(list.headers.get("mcp-session-id"), null);
 
-  const call = serializeMcpDevResponse(
+  const call = serializeMcpResponse(
     { status: 200, body: { jsonrpc: "2.0", id: 3, result: { ok: true } } },
     { userAgent: incoming.get("user-agent"), method: "tools/call" },
   );
@@ -273,13 +273,13 @@ test("stale Mcp-Session-Id header has no effect on framing or headers", async ()
   assert.equal(call.headers.get("mcp-session-id"), null);
 });
 
-test("serializeMcpDevResponse never echoes Mcp-Session-Id (no input to channel)", () => {
+test("serializeMcpResponse never echoes Mcp-Session-Id (no input to channel)", () => {
   const result = { status: 200, body: { jsonrpc: "2.0", id: 1, result: { ok: true } } };
   // No session parameter exists on the helpers — stale session is invisible by construction.
-  const res = serializeMcpDevResponse(result, { userAgent: "openai-mcp/1.0.0", method: "initialize" });
+  const res = serializeMcpResponse(result, { userAgent: "openai-mcp/1.0.0", method: "initialize" });
   assert.equal(res.headers.get("mcp-session-id"), null);
 
-  const jsonRes = serializeMcpDevResponse(result, { userAgent: "claude/1.0", method: "initialize" });
+  const jsonRes = serializeMcpResponse(result, { userAgent: "claude/1.0", method: "initialize" });
   assert.equal(jsonRes.headers.get("mcp-session-id"), null);
 });
 
@@ -292,10 +292,10 @@ test("all responses omit Authorization header from response", async () => {
   assert.equal(probe.headers.get("authorization"), null);
   await probe.body.cancel(); // stop the default 15s heartbeat interval
 
-  const sse = serializeMcpDevResponse({ status: 200, body: { jsonrpc: "2.0", id: 1, result: {} } }, { userAgent: "openai-mcp/1.0.0", method: "initialize" });
+  const sse = serializeMcpResponse({ status: 200, body: { jsonrpc: "2.0", id: 1, result: {} } }, { userAgent: "openai-mcp/1.0.0", method: "initialize" });
   assert.equal(sse.headers.get("authorization"), null);
 
-  const json = serializeMcpDevResponse({ status: 200, body: { jsonrpc: "2.0", id: 1, result: {} } }, { userAgent: "curl/1.0", method: "tools/call" });
+  const json = serializeMcpResponse({ status: 200, body: { jsonrpc: "2.0", id: 1, result: {} } }, { userAgent: "curl/1.0", method: "tools/call" });
   assert.equal(json.headers.get("authorization"), null);
 });
 

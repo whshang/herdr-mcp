@@ -127,5 +127,3 @@ bin/herdr-cloudflare-domain preflight
 ```
 
 `bin/herdr-cloudflare-domain` 只调用 Workers Domains API，不会自行删除 DNS 或停止 Tunnel。旧架构如果已有同名 CNAME，Cloudflare 会拒绝直接 attach；必须先记录完整 rollback evidence，再在受控切换中删除冲突 CNAME、attach Custom Domain、验证，然后才退出旧 Tunnel。失败时 detach Custom Domain 并恢复旧 CNAME。详见 [`cloudflare-edge-deployment.md`](cloudflare-edge-deployment.md)。
-
-`bin/herdr-edge-cutover` 保留为 Worker Route / legacy 迁移工具，不再是新安装默认路径。

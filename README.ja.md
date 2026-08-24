@@ -22,7 +22,7 @@ Agents の進捗 / settled が拡張へ届き、拡張がウェブ会話へ書�
 - 推論が必要なら Herdr-native の安い/高速 worker（`pi` / `flash` / `cline` / `opencode` / `anti`）または監査（`droid` / `grok`）へ直接 `herdr_prompt`。本機 Claude/OMP/main を中間マネージャにしない。
 - Pi/Herdr worker が使えない場合は、実測済みの `dsh --profile headless "task"` を CLI fallback にできる。ただし非自明な coding task は `herdr_exec_start` の長時間 session で実行し、timeout 後は再送前に Git/test の実結果を確認する。`dsh-tui` は人間向け interactive fallback。詳細: [worker fallbacks](docs/i18n/en/worker-fallbacks.md)。
 - `inspect`/`since` は既定で Claude/OMP/Codex をソフト非表示。既知 pane への prompt は可。`HERDR_MCP_AGENT_ALLOW=*` で全表示。
-- standalone/local の既定 18-tool 面では `herdr_inspect` → `herdr_skill`（一度）→ 作業。現在の production ChatGPT Edge は contract epoch 1（17 tools）を固定し、既存 Connector を変えないため `herdr_skill` を意図的に隠します。
+- 現在は frozen contract epoch 2 を共通利用します。**18 tools（`herdr_skill` を含む）**で、開始手順は `herdr_inspect` → `herdr_skill`（一度）→ 作業です。epoch 1 は旧 17-tool セッション/rollback 用の互換基線としてのみ残します。
 
 ```mermaid
 flowchart TB
@@ -172,11 +172,11 @@ herdr-mcp watchdog status
 
 ## 既定ツール（なぜこの 18）
 
-herdr のネイティブ面は大きな Unix-socket API（`herdr api schema`）。herdr-mcp は全メソッドを MCP ツールに再包装しない。0.3.27 の standalone/local 既定面は 18 tools。現在の production ChatGPT Edge は既存 Connector/tool snapshot を変えないため contract epoch 1 の 17 tools を固定し、`herdr_skill` だけを隠す。代わりに:
+herdr のネイティブ面は大きな Unix-socket API（`herdr api schema`）。herdr-mcp は全メソッドを MCP ツールに再包装しない。0.3.32 の production ChatGPT ABI は **contract epoch 2 / 18 tools**（`herdr_skill` を含む）で固定します。epoch 1 / 17 tools は管理された rollback と旧セッション互換のためだけに残します。代わりに:
 
 | 層 | MCP ツール | herdr との関係 |
 |---|---|---|
-| Skill | `herdr_skill` | 上流 Herdr `SKILL.md` の読み取り。ツールが catalog にある時だけ各 session で使用する。production contract epoch 1 では意図的に非表示。 |
+| Skill | `herdr_skill` | 上流 Herdr `SKILL.md` の読み取り。各 session で agent 操作の前に一度使用する。 |
 | Passthrough | `herdr_methods`, `herdr_call` | ネイティブ socket API への薄いゲート |
 | リモート編成 | `herdr_inspect`, `herdr_since`, `herdr_prompt` | ウェブ向け小さなヘルパ |
 | リモート workstation | `herdr_fs_*`, `herdr_exec` / `herdr_exec_*`, `herdr_git` | オフマシンクライアント向けのディスク/シェル面 |

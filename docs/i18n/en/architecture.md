@@ -11,9 +11,9 @@ Audience: contributors deciding whether a capability belongs in MCP or in the na
 
 herdr-mcp does **not** turn every herdr method into an MCP tool. That would burn context and duplicate the native schema.
 
-## Tool surface: local default 18, production ChatGPT epoch 1 is 17
+## Tool surface: production contract epoch 2 is 18 tools
 
-The MCP tool surface is **fixed**; the live herdr schema only serves `herdr_methods` / `herdr_call`. The default is 17 since 0.3.17; **0.3.26** adds the read-only `herdr_skill`, making the standalone/local default 18. The current production ChatGPT Edge still freezes contract epoch 1, so it advertises the exact 17-tool 0.3.23 ABI via `HERDR_MCP_CONTRACT_PROFILE=epoch1`; the runtime implementation is already 0.3.26, but existing Connector/tool snapshots are not forced to change.
+The MCP tool surface is **fixed**; the live herdr schema only serves `herdr_methods` / `herdr_call`. Runtime 0.3.32 freezes the public ChatGPT catalog at **contract epoch 2 / 18 tools**, including the read-only `herdr_skill`. The exact epoch-1 / 17-tool 0.3.23 catalog remains tracked only for supervised rollback and old-session compatibility; it is no longer the production target.
 
 | Layer | Tools | Notes |
 |---|---|---|
@@ -22,7 +22,7 @@ The MCP tool surface is **fixed**; the live herdr schema only serves `herdr_meth
 | Remote orchestration | `herdr_inspect`, `herdr_since`, `herdr_prompt` | Glance / incremental read / prompt delivery suited to chat-style clients |
 | Remote workstation | `herdr_fs_*`, `herdr_exec` / `herdr_exec_*`, `herdr_git` | **Not** herdr capabilities — the remote client itself has no disk |
 
-`HERDR_MCP_ALL_TOOLS=1` adds advanced/deprecated lifecycle tools (`herdr_wait`, `herdr_reap`, sessions, etc., 30 total). Turn it off for ChatGPT to save context. If the current catalog includes `herdr_skill`, start a session with `herdr_inspect` → `herdr_skill` (once) → work; when the production epoch 1 does not include that tool, start directly from `herdr_inspect`.
+`HERDR_MCP_ALL_TOOLS=1` adds advanced/deprecated lifecycle tools (`herdr_wait`, `herdr_reap`, sessions, etc., 30 total). Turn it off for ChatGPT to save context. Start a normal epoch-2 session with `herdr_inspect` → `herdr_skill` (once) → work.
 
 ## Design rules
 
@@ -32,7 +32,7 @@ The MCP tool surface is **fixed**; the live herdr schema only serves `herdr_meth
 4. **Version is a cache key** — bump `src/version.ts` + `package.json` when the tool surface or handshake semantics change.
 5. **The web model orchestrates** — planning and scheduling live in the web model; locally prefer `herdr_fs_*` / `herdr_exec`; when an agent is needed, call a cheap worker directly — local Claude/OMP/main must not act as an intermediate conductor.
 6. **Soft agent hiding** — `herdr_inspect` / `herdr_since` list only execution agents (`pi`/`cline`/`opencode`/`anti`) and auditors (`droid`/`grok`) by default; Claude/OMP/Codex do not appear in the list. `herdr_prompt` does **not** block. `HERDR_MCP_AGENT_ALLOW=*` shows everything; a comma list overrides the default.
-7. **Local default 18 / production epoch1 17** — 30 with `HERDR_MCP_ALL_TOOLS=1`; `inspect` includes `boot_id` + `exec_sessions` + `agent_skill` state. Under epoch1, `herdr_skill` is explicitly marked as hidden by the contract, rather than hinting at a tool that does not exist. `HERDR_MCP_READONLY=1` blocks mutations including `herdr_prompt` (except `dry_run` of `herdr_fs_patch`).
+7. **Production epoch2 = 18 tools** — 30 with `HERDR_MCP_ALL_TOOLS=1`; `inspect` includes `boot_id` + `exec_sessions` + `agent_skill` state. Epoch1 is a legacy compatibility profile only and explicitly reports `herdr_skill` as hidden. `HERDR_MCP_READONLY=1` blocks mutations including `herdr_prompt` (except `dry_run` of `herdr_fs_patch`).
 8. **Workstation robustness (≥0.3.17)** — a failed `commitAtomic` deletes files added by that attempt; the exec journal kills only orphans that still carry `HERDR_MCP_EXEC_ID`; `exec_read stream=both` interleaves write order; `fs_read` byte truncation returns only complete lines.
 9. **`herdr_exec` control-plane degradation (≥0.3.18)** — a utility pane that keeps hitting TaskGroup **before** `send_text` automatically switches to local zsh (`backend:local_fallback`); once delivered, it is never re-sent nor degraded (avoids double execution).
 10. **`herdr_git` local degradation (≥0.3.20)** — when `session.snapshot` / managed-roots gates are unavailable due to TaskGroup, real git roots under `$HOME` (or `HERDR_MCP_WRITE_ROOTS`) still run local `git` directly (with `warnings`); read-only RPCs such as `pane.read` transparently retry against TaskGroup, up to 4 attempts.

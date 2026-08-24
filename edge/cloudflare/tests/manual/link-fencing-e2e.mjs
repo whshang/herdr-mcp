@@ -3,12 +3,12 @@
 
 import assert from "node:assert/strict";
 import { HerdrLink } from "../../../../dist/link/client.js";
+import { PUBLIC_CONTRACT_EPOCH, PUBLIC_CONTRACT_HASH } from "../../../../dist/link/daemon.js";
 
 const EDGE_HTTP = process.env.EDGE_URL ?? "http://127.0.0.1:8787";
 const EDGE_WS = EDGE_HTTP.replace(/^http/, "ws") + "/ws";
 const SECRET = process.env.LINK_SHARED_SECRET ?? "dev-only-link-secret-change-me";
-const WORKSTATION_ID = process.env.DEMO_WORKSTATION_ID ?? "dev-fence-link";
-const CONTRACT_HASH = "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
+const WORKSTATION_ID = process.env.DEFAULT_WORKSTATION_ID ?? "dev-fence-link";
 
 async function until(fn, timeoutMs = 5000) {
   const start = Date.now();
@@ -28,11 +28,11 @@ function makeTransport(owner) {
       name: `fence-${owner}`,
       async getRuntimeInfo() {
         return {
-          runtime_version: "0.3.26-e2e",
+          runtime_version: "0.3.32-e2e",
           runtime_commit: owner,
           runtime_generation: `gen-${owner}`,
-          contract_epoch: 1,
-          contract_hash: CONTRACT_HASH,
+          contract_epoch: PUBLIC_CONTRACT_EPOCH,
+          contract_hash: PUBLIC_CONTRACT_HASH,
           herdr_version: "0.8.2",
           herdr_protocol: "20",
         };

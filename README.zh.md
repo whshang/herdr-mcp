@@ -22,7 +22,7 @@ Agents 的进度/收工通知到 extension；extension 再 ↻ 写入网页输�
 - 必须推理时，优先 `herdr_prompt` 给便宜/高速的 Herdr 原生 worker（`pi`、`flash`、`cline`、`opencode`、`anti`）或审计（`droid`、`grok`），不要经本机 Claude/OMP/main 再转派。
 - Pi/Herdr worker 不可用时，实测可用 `dsh --profile headless "任务"` 作为开发 CLI 备选，但要通过 `herdr_exec_start` 长任务 session 跑；DSH 可能已经改完代码却还没在 60 秒内打印最终回复，超时后必须先看 Git/test 再决定是否重试。`dsh-tui` 只作为人工交互接管。详见 [worker fallbacks](docs/i18n/zh-CN/worker-fallbacks.md)。
 - `inspect`/`since` 默认软隐藏 Claude/OMP/Codex。知道 pane 仍可 prompt。`HERDR_MCP_AGENT_ALLOW=*` 显示全部。
-- 独立/本地默认 18-tool 模式下，会话开始：`herdr_inspect` → `herdr_skill`（一次）→ 干活。当前生产 ChatGPT Edge 冻结在 contract epoch 1（17 tools），因此故意隐藏 `herdr_skill`，直到显式升级 contract epoch。
+- 当前统一使用冻结的 contract epoch 2：**18 tools，包含 `herdr_skill`**。会话开始：`herdr_inspect` → `herdr_skill`（一次）→ 干活。epoch 1 只保留为历史 17-tool 回滚/旧会话兼容基线。
 
 ```mermaid
 flowchart TB
@@ -179,7 +179,7 @@ herdr-mcp watchdog status
 
 ## 默认工具（为什么是这 18 个）
 
-herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法）。herdr-mcp **不会**把每个方法都做成 MCP 工具（占上下文、也和 herdr 重复）。0.3.27 独立/本地默认是 18 tools；当前生产 ChatGPT Edge 为保持现有 Connector/tool snapshot 不变，冻结 contract epoch 1 为 17 tools，仅隐藏 `herdr_skill`。整体仍分四层：
+herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法）。herdr-mcp **不会**把每个方法都做成 MCP 工具（占上下文、也和 herdr 重复）。0.3.32 将生产 ChatGPT ABI 冻结为 **contract epoch 2 / 18 tools**，包含 `herdr_skill`；epoch 1 / 17 tools 只保留用于受控回滚和旧会话兼容。整体仍分四层：
 
 | 层 | MCP 工具 | 和 herdr 的关系 |
 |---|---|---|
@@ -190,7 +190,7 @@ herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法
 
 | 工具 | 做什么 |
 |---|---|
-| `herdr_skill` | 只读：优先从上游 herdr **master** 拉最新 SKILL.md；网络不可达时用**安装包内置副本**（`assets/herdr-agent-SKILL.md`）。工具存在时每个会话在 agent 操作前调用一次；生产 contract epoch 1 暂时故意隐藏它。`HERDR_SKILL_NETWORK=0` 强制只用内置。 |
+| `herdr_skill` | 只读：优先从上游 herdr **master** 拉最新 SKILL.md；网络不可达时用**安装包内置副本**（`assets/herdr-agent-SKILL.md`）。每个会话在 agent 操作前调用一次；`HERDR_SKILL_NETWORK=0` 强制只用内置。 |
 | `herdr_methods` | 列出当前 herdr socket 方法与参数 schema（反射缓存）。陌生调用前先查。 |
 | `herdr_call` | 用 `{ method, params }` 调任意 herdr 方法（pane / workspace / agent 等），避免「一方法一工具」。 |
 | `herdr_inspect` | 一次看清连接 + workspaces / tabs / panes / agents（cwd、状态），以及 `workstation_info`、`boot_id`、`exec_sessions`。通常第一个调用。 |

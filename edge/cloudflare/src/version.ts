@@ -1,13 +1,12 @@
 /** version.ts — edge identity shared by dev/prod Worker deployments. */
-import { EPOCH1_CONTRACT } from "./contracts/epoch1.js";
+import { PUBLIC_CONTRACT } from "./contracts/public.js";
 
 export const EDGE_VERSION = "0.1.0-dev";
 export const EDGE_PROJECT = "herdr-edge-dev";
+export const MCP_SERVER_VERSION = "0.3.32";
 
-export const CONTRACT_EPOCH = EPOCH1_CONTRACT.contract_epoch;
-export const CONTRACT_HASH = EPOCH1_CONTRACT.contract_hash;
-/** Temporary compatibility alias until mcp-placeholder.ts is removed. */
-export const CONTRACT_HASH_PLACEHOLDER = CONTRACT_HASH;
+export const CONTRACT_EPOCH = PUBLIC_CONTRACT.contract_epoch;
+export const CONTRACT_HASH = PUBLIC_CONTRACT.contract_hash;
 
 export interface EdgeIdentity {
   edgeProject: string;

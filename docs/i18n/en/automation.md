@@ -41,7 +41,7 @@ Every push to `main` and every pull request runs:
 8. npm package dry-run;
 9. `git diff --check`.
 
-The root runtime version may move independently from the ChatGPT public contract epoch. Epoch-1 compatibility tests ensure a newer runtime can still advertise the exact frozen 17-tool ABI.
+The root runtime version may move independently from the ChatGPT public contract epoch. Production currently freezes epoch 2 at 18 tools; epoch-1 compatibility tests remain only to prove the historical 17-tool rollback/old-session ABI is still reproducible.
 
 ## 3. Cloudflare Edge production deployment
 

@@ -1,39 +1,32 @@
-/**
- * mcp-dev.ts — dependency-free, stateless MCP/JSON-RPC handler for the
- * Cloudflare development edge.
- *
- * Phase 3 intentionally supports only POST-side development semantics:
- * initialize, server/discover, tools/list, tools/call and
- * notifications/initialized. GET/SSE and OAuth remain later phases.
- */
+/** Stateless MCP/JSON-RPC handler used by both development and production Edge. */
 
-import { EPOCH1_CONTRACT } from "./contracts/epoch1.js";
+import { PUBLIC_CONTRACT } from "./contracts/public.js";
+import { MCP_SERVER_VERSION } from "./version.js";
 import type { RelayErrorResult } from "./errors.js";
 import { classifyOp, type EdgeLimits } from "./limits.js";
 import { checkArgsBudget } from "./payload.js";
 import { newRequestId } from "./pending.js";
 import type { InternalForwardRequest } from "./workstation-do.js";
 
-export const MCP_DEV_SERVER_NAME = "herdr-mcp";
-export const MCP_DEV_SERVER_VERSION = "0.3.23-edge-dev";
+export const MCP_SERVER_NAME = "herdr-mcp";
 export const MCP_LEGACY_PROTOCOL = "2025-11-25";
 export const MCP_SUPPORTED_PROTOCOLS = [MCP_LEGACY_PROTOCOL, "2025-06-18"] as const;
 
 export type JsonRpcId = string | number | null;
 
-export interface McpDevRequest {
+export interface McpRequest {
   jsonrpc?: unknown;
   id?: unknown;
   method?: unknown;
   params?: unknown;
 }
 
-export interface McpDevResponse {
+export interface McpResponse {
   status: number;
   body: Record<string, unknown> | null;
 }
 
-export interface McpDevDeps {
+export interface McpDeps {
   limits: EdgeLimits;
   forward(stub: unknown, body: string): Promise<Response>;
   getStub(workstationId: string): unknown;
@@ -49,7 +42,7 @@ interface ForwardEnvelope {
   error?: RelayErrorResult;
 }
 
-const FROZEN_TOOL_NAMES: ReadonlySet<string> = new Set<string>(EPOCH1_CONTRACT.tools.map((tool) => tool.name));
+const PUBLIC_TOOL_NAMES: ReadonlySet<string> = new Set<string>(PUBLIC_CONTRACT.tools.map((tool) => tool.name));
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -59,14 +52,14 @@ function validId(value: unknown): value is JsonRpcId {
   return value === null || typeof value === "string" || (typeof value === "number" && Number.isFinite(value));
 }
 
-function rpcResult(id: JsonRpcId, result: unknown): McpDevResponse {
+function rpcResult(id: JsonRpcId, result: unknown): McpResponse {
   return {
     status: 200,
     body: { jsonrpc: "2.0", id, result },
   };
 }
 
-function rpcError(id: JsonRpcId, code: number, message: string, data?: unknown): McpDevResponse {
+function rpcError(id: JsonRpcId, code: number, message: string, data?: unknown): McpResponse {
   return {
     status: 200,
     body: {
@@ -117,26 +110,26 @@ function relayErrorToolResult(error: RelayErrorResult, requestId: string, workst
   );
 }
 
-export function frozenEpoch1Tools(): readonly unknown[] {
-  return EPOCH1_CONTRACT.tools;
+export function publicContractTools(): readonly unknown[] {
+  return PUBLIC_CONTRACT.tools;
 }
 
-export function frozenEpoch1Identity(): Record<string, unknown> {
+export function publicContractIdentity(): Record<string, unknown> {
   return {
-    contract_epoch: EPOCH1_CONTRACT.contract_epoch,
-    contract_hash: EPOCH1_CONTRACT.contract_hash,
-    tool_count: EPOCH1_CONTRACT.tool_count,
+    contract_epoch: PUBLIC_CONTRACT.contract_epoch,
+    contract_hash: PUBLIC_CONTRACT.contract_hash,
+    tool_count: PUBLIC_CONTRACT.tool_count,
   };
 }
 
-export async function handleMcpDev(
+export async function handleMcp(
   input: unknown,
   workstationId: string,
-  deps: McpDevDeps,
-): Promise<McpDevResponse> {
+  deps: McpDeps,
+): Promise<McpResponse> {
   if (!isRecord(input)) return rpcError(null, -32600, "Invalid Request");
 
-  const request = input as McpDevRequest;
+  const request = input as McpRequest;
   const id: JsonRpcId = validId(request.id) ? request.id : null;
   if (request.jsonrpc !== "2.0" || typeof request.method !== "string") {
     return rpcError(id, -32600, "Invalid Request");
@@ -153,9 +146,9 @@ export async function handleMcpDev(
     return rpcResult(id, {
       protocolVersion: MCP_LEGACY_PROTOCOL,
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: MCP_DEV_SERVER_NAME, version: MCP_DEV_SERVER_VERSION },
-      instructions: "Stable edge MCP contract epoch 1; workstation execution is relayed over authenticated Herdr Link.",
-      _meta: { herdr: frozenEpoch1Identity() },
+      serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
+      instructions: "Stable edge MCP contract epoch 2; workstation execution is relayed over authenticated Herdr Link.",
+      _meta: { herdr: publicContractIdentity() },
     });
   }
 
@@ -164,15 +157,15 @@ export async function handleMcpDev(
       resultType: "complete",
       supportedVersions: [...MCP_SUPPORTED_PROTOCOLS],
       capabilities: { tools: { listChanged: false } },
-      instructions: "Development edge with frozen MCP contract epoch 1.",
+      instructions: "Herdr Edge with frozen MCP contract epoch 2.",
       ttlMs: 3_600_000,
       cacheScope: "private",
       _meta: {
         "io.modelcontextprotocol/serverInfo": {
-          name: MCP_DEV_SERVER_NAME,
-          version: MCP_DEV_SERVER_VERSION,
+          name: MCP_SERVER_NAME,
+          version: MCP_SERVER_VERSION,
         },
-        herdr: frozenEpoch1Identity(),
+        herdr: publicContractIdentity(),
       },
     });
   }
@@ -182,16 +175,16 @@ export async function handleMcpDev(
       return rpcError(id, -32602, "Invalid params");
     }
     return rpcResult(id, {
-      tools: EPOCH1_CONTRACT.tools,
-      _meta: { herdr: frozenEpoch1Identity() },
+      tools: PUBLIC_CONTRACT.tools,
+      _meta: { herdr: publicContractIdentity() },
     });
   }
 
   if (request.method === "tools/call") {
     if (!isRecord(request.params)) return rpcError(id, -32602, "Invalid params");
     const name = request.params.name;
-    if (typeof name !== "string" || !FROZEN_TOOL_NAMES.has(name)) {
-      return rpcError(id, -32602, "Invalid params", { reason: "tool is not in frozen contract epoch 1" });
+    if (typeof name !== "string" || !PUBLIC_TOOL_NAMES.has(name)) {
+      return rpcError(id, -32602, "Invalid params", { reason: "tool is not in public contract epoch 2" });
     }
     const rawArgs = request.params.arguments;
     if (rawArgs !== undefined && rawArgs !== null && !isRecord(rawArgs)) {
@@ -220,8 +213,8 @@ export async function handleMcpDev(
       opClass: classifyOp(name),
       args,
       deadlineMs: now + deps.limits.requestTimeoutMs,
-      contractEpoch: EPOCH1_CONTRACT.contract_epoch,
-      contractHash: EPOCH1_CONTRACT.contract_hash,
+      contractEpoch: PUBLIC_CONTRACT.contract_epoch,
+      contractHash: PUBLIC_CONTRACT.contract_hash,
       idempotencyKey,
     };
 

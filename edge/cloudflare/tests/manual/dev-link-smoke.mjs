@@ -19,8 +19,10 @@
  *   node tests/manual/dev-link-smoke.mjs      # terminal 2
  */
 
+import { EPOCH2_CONTRACT } from "../../dist/contracts/epoch2.js";
+
 const EDGE = process.env.EDGE_URL ?? "http://127.0.0.1:8787";
-const WORKSTATION_ID = process.env.DEMO_WORKSTATION_ID ?? "dev-ws1";
+const WORKSTATION_ID = process.env.DEFAULT_WORKSTATION_ID ?? "dev-ws1";
 const SECRET = process.env.LINK_SHARED_SECRET ?? "dev-only-link-secret-change-me";
 
 function exit(msg) {
@@ -41,7 +43,9 @@ async function main() {
   const healthResp = await fetch(`${EDGE}/health`);
   const health = await healthResp.json();
   console.log("health:", healthResp.status, JSON.stringify(health));
-  if (health.stage !== "dev-scaffold") exit("unexpected health stage");
+  if (health.contractEpoch !== EPOCH2_CONTRACT.contract_epoch || health.contractHash !== EPOCH2_CONTRACT.contract_hash) {
+    exit("unexpected public contract identity");
+  }
 
   // 2) Upgrade to the workstation DO with link auth via Sec-WebSocket-Protocol.
   const wsUrl = EDGE.replace(/^http/, "ws") + `/ws/${WORKSTATION_ID}`;
@@ -58,11 +62,11 @@ async function main() {
           connected_at_ms: Date.now(),
           capabilities: ["herdr", "fs"],
           runtime: {
-            runtime_version: "0.3.26-smoke",
+            runtime_version: "0.3.32-smoke",
             runtime_commit: "smoke",
             runtime_generation: "g-smoke",
-            contract_epoch: 1,
-            contract_hash: "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d",
+            contract_epoch: EPOCH2_CONTRACT.contract_epoch,
+            contract_hash: EPOCH2_CONTRACT.contract_hash,
             herdr_version: null,
             herdr_protocol: null,
           },

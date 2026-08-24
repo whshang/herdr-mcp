@@ -92,13 +92,13 @@ Avoid in `inputSchema`:
 
 Bump `SERVER_VERSION` / `package.json` when the tool surface or handshake changes, forcing clients to re-run `tools/list`.
 
-**Do not trust only the numbers here.** The runtime version comes from `/.well-known/mcp.json` / `initialize.serverInfo.version`; the tool catalog also depends on the current contract profile. 0.3.27 standalone/local default is 18 tools, but the current production ChatGPT Edge explicitly freezes contract epoch 1 at 17 tools, so **not seeing `herdr_skill` is expected behavior, not proof the runtime did not upgrade**. If other fields still lag (e.g. missing `herdr_fs_write.overwrite`, no `inspect.exec_sessions`):
+**Do not trust only a cached tool count.** The runtime version comes from `/.well-known/mcp.json` / `initialize.serverInfo.version`; the current production catalog is contract epoch 2 with **18 tools including `herdr_skill`**. If ChatGPT still shows the old epoch-1 17-tool snapshot, the conversation/Connector cache is stale rather than the server intentionally hiding the skill. If fields lag (e.g. missing `herdr_fs_write.overwrite`, no `inspect.exec_sessions`):
 
 1. confirm `mcp.json`'s `version` is the current build
 2. refresh / reconnect the connector in ChatGPT
 3. **start a new conversation** (old conversations lock the old `tools/list` snapshot)
 
-Stale input fields (especially `overwrite`) cause "can create files, cannot overwrite per contract". Start a session with `herdr_inspect`; if the current catalog exposes `herdr_skill`, read the skill once; when production epoch 1 lacks that tool, continue directly with `herdr_call` / `herdr_prompt`.
+Stale input fields (especially `overwrite`) cause "can create files, cannot overwrite per contract". Start a current session with `herdr_inspect`, read `herdr_skill` once, then continue with direct tools / `herdr_prompt` as needed.
 
 ## "TaskGroup" / omp is down but it says it cannot read files
 

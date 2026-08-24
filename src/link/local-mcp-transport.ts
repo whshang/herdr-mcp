@@ -53,8 +53,8 @@ export const LOCAL_MCP_DEFAULT_MAX_FRAME_BYTES = 2 * 1024 * 1024;
 export const LOCAL_MCP_DEFAULT_TIMEOUT_MS = 10_000;
 /** Hard cap applied on top of any request timeout hint. */
 export const LOCAL_MCP_MAX_TIMEOUT_MS = 120_000;
-/** Frozen contract epoch advertised by this transport. */
-export const LOCAL_MCP_CONTRACT_EPOCH = 1 as const;
+/** Current public contract epoch advertised by this transport. */
+export const LOCAL_MCP_CONTRACT_EPOCH = 2 as const;
 
 /** Stable failure codes emitted by this transport (RuntimeToolResult.code). */
 export const LOCAL_MCP_CODE = {
@@ -81,10 +81,7 @@ export interface LocalMcpRuntimeTransportOptions {
   bearerToken: string;
   /** Required. Contract hash the link advertises in runtime identity. */
   contractHash: string;
-  /**
-   * Contract epoch (frozen at 1). Any value other than 1 is rejected; the
-   * transport always reports contract_epoch === 1.
-   */
+  /** Contract epoch. This build serves the frozen public epoch-2 contract. */
   contractEpoch?: number;
   /** Optional configured runtime version (discovery can add a fallback). */
   runtimeVersion?: string;
@@ -126,7 +123,7 @@ type ParsedBody =
 /**
  * Stateless local MCP HTTP transport implementing `LinkRuntimeTransport`.
  *
- * Identity: contract_epoch is frozen at 1 and contract_hash is caller-supplied;
+ * Identity: contract_epoch is frozen at the public epoch and contract_hash is caller-supplied;
  * runtime_version may be configured and is supplemented by a version cached
  * from the optional health/discover probe.
  */
@@ -168,8 +165,8 @@ export class LocalMcpRuntimeTransport implements LinkRuntimeTransport {
     }
     const epoch = options.contractEpoch ?? LOCAL_MCP_CONTRACT_EPOCH;
     if (epoch !== LOCAL_MCP_CONTRACT_EPOCH) {
-      // Intentionally does not echo caller values; the epoch is frozen.
-      throw new RangeError("local-mcp: contractEpoch must be 1 (frozen contract epoch)");
+      // Intentionally does not echo caller values; the public epoch is frozen.
+      throw new RangeError(`local-mcp: contractEpoch must be ${LOCAL_MCP_CONTRACT_EPOCH} (public contract epoch)`);
     }
 
     let url: URL;

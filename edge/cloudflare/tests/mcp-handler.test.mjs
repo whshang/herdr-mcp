@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { EPOCH1_CONTRACT } from "../dist/contracts/epoch1.js";
+import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
 import { makeLimits } from "../dist/limits.js";
-import { handleMcpDev } from "../dist/mcp-dev.js";
+import { handleMcp } from "../dist/mcp-handler.js";
 
 function deps(over = {}) {
   const calls = [];
@@ -28,45 +28,45 @@ function deps(over = {}) {
 
 const req = (id, method, params = {}) => ({ jsonrpc: "2.0", id, method, params });
 
-test("initialize advertises legacy protocol and frozen epoch-1 identity", async () => {
+test("initialize advertises legacy wire protocol and frozen epoch-2 identity", async () => {
   const d = deps();
-  const r = await handleMcpDev(req(1, "initialize", {}), "w1", d.value);
+  const r = await handleMcp(req(1, "initialize", {}), "w1", d.value);
   assert.equal(r.status, 200);
   assert.equal(r.body.id, 1);
   assert.equal(r.body.result.protocolVersion, "2025-11-25");
   assert.equal(r.body.result.capabilities.tools.listChanged, false);
-  assert.equal(r.body.result._meta.herdr.contract_epoch, 1);
-  assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH1_CONTRACT.contract_hash);
+  assert.equal(r.body.result._meta.herdr.contract_epoch, 2);
+  assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH2_CONTRACT.contract_hash);
 });
 
 test("server/discover advertises supported versions without OAuth claims", async () => {
   const d = deps();
-  const r = await handleMcpDev(req("d", "server/discover", {}), "w1", d.value);
+  const r = await handleMcp(req("d", "server/discover", {}), "w1", d.value);
   assert.equal(r.body.id, "d");
   assert.deepEqual(r.body.result.supportedVersions, ["2025-11-25", "2025-06-18"]);
   assert.equal(r.body.result.capabilities.tools.listChanged, false);
   assert.equal(Object.hasOwn(r.body.result, "authorizationServers"), false);
 });
 
-test("tools/list is exactly the frozen 17-tool epoch-1 catalog", async () => {
+test("tools/list is exactly the frozen 18-tool epoch-2 catalog", async () => {
   const d = deps();
-  const r = await handleMcpDev(req(2, "tools/list", {}), "w1", d.value);
-  assert.equal(r.body.result.tools.length, 17);
-  assert.deepEqual(r.body.result.tools, EPOCH1_CONTRACT.tools);
-  assert.equal(r.body.result.tools.some((tool) => tool.name === "herdr_skill"), false);
-  assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH1_CONTRACT.contract_hash);
+  const r = await handleMcp(req(2, "tools/list", {}), "w1", d.value);
+  assert.equal(r.body.result.tools.length, 18);
+  assert.deepEqual(r.body.result.tools, EPOCH2_CONTRACT.tools);
+  assert.equal(r.body.result.tools.some((tool) => tool.name === "herdr_skill"), true);
+  assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH2_CONTRACT.contract_hash);
 });
 
 test("tools/call forwards only frozen tools with epoch/hash and preserves id", async () => {
   const d = deps();
-  const r = await handleMcpDev(req(7, "tools/call", { name: "herdr_inspect", arguments: {} }), "w1", d.value);
+  const r = await handleMcp(req(7, "tools/call", { name: "herdr_inspect", arguments: {} }), "w1", d.value);
   assert.equal(r.body.id, 7);
   assert.equal(r.body.result.isError, undefined);
   assert.equal(r.body.result.structuredContent.served, true);
   assert.equal(d.calls.length, 1);
   assert.equal(d.calls[0].op, "herdr_inspect");
-  assert.equal(d.calls[0].contractEpoch, 1);
-  assert.equal(d.calls[0].contractHash, EPOCH1_CONTRACT.contract_hash);
+  assert.equal(d.calls[0].contractEpoch, 2);
+  assert.equal(d.calls[0].contractHash, EPOCH2_CONTRACT.contract_hash);
   assert.equal(d.calls[0].deadlineMs, 31_000);
 });
 
@@ -84,7 +84,7 @@ test("tools/call preserves an existing MCP CallToolResult including image conten
       completion: { status: "ok", result: callToolResult },
     })),
   });
-  const r = await handleMcpDev(
+  const r = await handleMcp(
     req(71, "tools/call", { name: "herdr_fs_image", arguments: { path: "/tmp/x.png" } }),
     "w1",
     d.value,
@@ -93,13 +93,15 @@ test("tools/call preserves an existing MCP CallToolResult including image conten
   assert.deepEqual(r.body.result, callToolResult);
 });
 
-test("unknown/herdr_skill tool is rejected before forwarding", async () => {
+test("herdr_skill is public while unknown tools are rejected before forwarding", async () => {
   const d = deps();
-  for (const name of ["herdr_skill", "does_not_exist"]) {
-    const r = await handleMcpDev(req(8, "tools/call", { name, arguments: {} }), "w1", d.value);
-    assert.equal(r.body.error.code, -32602);
-  }
-  assert.equal(d.calls.length, 0);
+  const skill = await handleMcp(req(8, "tools/call", { name: "herdr_skill", arguments: {} }), "w1", d.value);
+  assert.equal(skill.body.error, undefined);
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].op, "herdr_skill");
+  const unknown = await handleMcp(req(81, "tools/call", { name: "does_not_exist", arguments: {} }), "w1", d.value);
+  assert.equal(unknown.body.error.code, -32602);
+  assert.equal(d.calls.length, 1);
 });
 
 test("tools/call maps relay delivery errors to MCP isError tool results", async () => {
@@ -114,7 +116,7 @@ test("tools/call maps relay delivery errors to MCP isError tool results", async 
       },
     })),
   });
-  const r = await handleMcpDev(req(9, "tools/call", { name: "herdr_inspect", arguments: {} }), "w1", d.value);
+  const r = await handleMcp(req(9, "tools/call", { name: "herdr_inspect", arguments: {} }), "w1", d.value);
   assert.equal(r.body.error, undefined);
   assert.equal(r.body.result.isError, true);
   assert.equal(r.body.result.structuredContent.code, "workstation_offline");
@@ -124,19 +126,19 @@ test("tools/call maps relay delivery errors to MCP isError tool results", async 
 
 test("JSON-RPC request validation and method errors preserve ids", async () => {
   const d = deps();
-  const invalid = await handleMcpDev([], "w1", d.value);
+  const invalid = await handleMcp([], "w1", d.value);
   assert.equal(invalid.body.error.code, -32600);
   assert.equal(invalid.body.id, null);
 
-  const badParams = await handleMcpDev(req(10, "tools/call", { name: "herdr_inspect", arguments: [] }), "w1", d.value);
+  const badParams = await handleMcp(req(10, "tools/call", { name: "herdr_inspect", arguments: [] }), "w1", d.value);
   assert.equal(badParams.body.error.code, -32602);
   assert.equal(badParams.body.id, 10);
 
-  const missing = await handleMcpDev(req("x", "unknown/method", {}), "w1", d.value);
+  const missing = await handleMcp(req("x", "unknown/method", {}), "w1", d.value);
   assert.equal(missing.body.error.code, -32601);
   assert.equal(missing.body.id, "x");
 
-  const notification = await handleMcpDev({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }, "w1", d.value);
+  const notification = await handleMcp({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }, "w1", d.value);
   assert.equal(notification.status, 204);
   assert.equal(notification.body, null);
 });

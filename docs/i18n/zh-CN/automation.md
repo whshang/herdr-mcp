@@ -41,7 +41,7 @@ Workflow：`.github/workflows/ci.yml`
 8. npm 包 dry-run；
 9. `git diff --check`。
 
-Root runtime 版本可以与 ChatGPT 公网 contract epoch 独立演进。Epoch-1 兼容测试确保更新的 runtime 仍能广告精确的冻结 17-tool ABI。
+Root runtime 版本可以与 ChatGPT 公网 contract epoch 独立演进。当前 production 冻结 epoch 2 为 18 tools；epoch-1 兼容测试只用于证明历史 17-tool 回滚/旧会话 ABI 仍可精确复现。
 
 ## 3. Cloudflare Edge 生产部署
 

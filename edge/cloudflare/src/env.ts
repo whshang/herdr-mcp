@@ -1,10 +1,8 @@
 /**
- * env.ts — typed Cloudflare bindings for the dev edge.
+ * env.ts — typed Cloudflare bindings for Herdr Edge.
  *
- * Bindings are declared in edge/cloudflare/wrangler.toml; secret overrides
- * come from `.dev.vars` (or `wrangler secret put` for remote dev). These names
- * are dev-only — production bindings will be introduced at cutover and must
- * NOT be added here without updating the README + plan.
+ * Bindings are declared by the dev/prod wrangler configs; local secret
+ * overrides come from `.dev.vars`, while remote deployments use Worker secrets.
  */
 
 export interface Env {
@@ -12,9 +10,9 @@ export interface Env {
   WORKSTATION_DO: DurableObjectNamespace;
   /** Global OAuth state Durable Object binding (class OAuthStoreDO). */
   OAUTH_STORE_DO: DurableObjectNamespace;
-  /** Dev-only shared link secret. Fail closed when absent. */
+  /** Shared workstation-link secret. Fail closed when absent. */
   LINK_SHARED_SECRET?: string;
-  /** Temporary Phase-3 bearer for public dev /mcp + /status. Replaced by OAuth in Phase 4. */
+  /** Optional development-only static MCP bearer fallback. */
   DEV_MCP_BEARER_SECRET?: string;
   /** Optional static bearer compatibility with the current localhost runtime. */
   STATIC_MCP_BEARER_SECRET?: string;
@@ -34,6 +32,6 @@ export interface Env {
   EDGE_MAX_FRAME_BYTES?: string;
   DEFAULT_REQUEST_TIMEOUT_MS?: string;
   LINK_STALE_AFTER_MS?: string;
-  /** Dev-only default workstation id for the tools/call demo route. */
-  DEMO_WORKSTATION_ID?: string;
+  /** Default workstation target when a request does not carry an explicit id. */
+  DEFAULT_WORKSTATION_ID?: string;
 }

@@ -1,32 +1,30 @@
 /**
- * index.ts — Cloudflare Worker entry for the herdr edge dev scaffold.
+ * index.ts — Cloudflare Worker entry for Herdr Edge.
  *
- * Dev-only. Never deploys against production names/routes (see
- * edge/cloudflare/wrangler.toml + README). Routes:
+ * Routes:
  *
  *   GET  /health                          edge health (no DO involved)
  *   GET  /info                            route/stage table for debugging
  *   GET  /status/:workstationId           DO presence snapshot (dev-open)
  *   GET  /ws/:workstationId               workstation link WSS upgrade (auth)
- *   GET  /mcp  POST /mcp  /.well-known/*  MCP placeholder boundaries
+ *   GET  /mcp  POST /mcp                  public MCP transport
+ *   /.well-known/*                        OAuth / MCP discovery
  *
  * The workstation-link bearer check happens HERE (before the DO); the DO then
  * binds hello.workstationId to the route key and enforces protocol version.
  */
 
-import { authenticateDevMcpBearer, DevSecretLinkAuthenticator, hasLinkApplicationProtocol } from "./auth.js";
+import { authenticateStaticMcpBearer, SharedSecretLinkAuthenticator, hasLinkApplicationProtocol } from "./auth.js";
 import type { Env } from "./env.js";
 import { errorResult } from "./errors.js";
-import { edgeIdentity } from "./version.js";
-import { getMcpPlaceholder, notWired, placeholder501 } from "./mcp-placeholder.js";
-import { handleMcpDev } from "./mcp-dev.js";
+import { edgeIdentity, MCP_SERVER_VERSION } from "./version.js";
+import { handleMcp } from "./mcp-handler.js";
 import {
   createSessionlessMcpProbeResponse,
-  serializeMcpDevResponse,
+  serializeMcpResponse,
 } from "./mcp-chatgpt-transport.js";
 import { readBodyBounded } from "./payload.js";
 import { makeLimits } from "./limits.js";
-import { newRequestId } from "./pending.js";
 import { createLogger } from "./logger.js";
 import { WorkstationDO } from "./workstation-do.js";
 import { OAuthStoreDO } from "./oauth-store-do.js";
@@ -65,7 +63,7 @@ export default {
       return jsonResponse({
         ok: true,
         service: identity.edgeProject,
-        stage: "dev-scaffold",
+        stage: identity.edgeEnv,
         edgeVersion: identity.edgeVersion,
         edgeEnv: identity.edgeEnv,
         contractEpoch: identity.contractEpoch,
@@ -79,16 +77,16 @@ export default {
       return jsonResponse({
         ok: true,
         service: identity.edgeProject,
-        stage: "dev-scaffold",
+        stage: identity.edgeEnv,
         edgeVersion: identity.edgeVersion,
         routes: [
           { path: "/health", stage: "stable" },
           { path: "/info", stage: "dev" },
           { path: "/ws/:workstationId", stage: "dev (WS upgrade, link auth)" },
           { path: "/status/:workstationId", stage: "dev (DO presence)" },
-          { path: "/mcp", stage: "dev MCP epoch-1 POST + sessionless ChatGPT SSE active" },
-          { path: "/.well-known/mcp.json", stage: "placeholder boundary (Phase 4)" },
-          { path: "/.well-known/oauth-*", stage: "placeholder boundary (Phase 4)" },
+          { path: "/mcp", stage: `public MCP epoch-${identity.contractEpoch} + sessionless ChatGPT SSE` },
+          { path: "/.well-known/mcp.json", stage: "public MCP discovery" },
+          { path: "/.well-known/oauth-*", stage: "public OAuth discovery" },
         ],
       });
     }
@@ -147,7 +145,7 @@ export default {
       if (!hasLinkApplicationProtocol(request)) {
         return jsonResponse(errorResult("bad_request", { message: "missing herdr-link.v1 websocket subprotocol" }), 400);
       }
-      const authenticator = new DevSecretLinkAuthenticator({ secret: env.LINK_SHARED_SECRET });
+      const authenticator = new SharedSecretLinkAuthenticator({ secret: env.LINK_SHARED_SECRET });
       const decision = authenticator.authenticate(request, workstationId, Date.now());
       if (!decision.ok) {
         logger.warn("ws.upgrade.denied", { workstationId, code: decision.code });
@@ -158,26 +156,19 @@ export default {
       return stub.fetch(request);
     }
 
-    // ---- Public OAuth/discovery routes. These must run before the generic
-    // /mcp + /.well-known fallback below; otherwise ChatGPT discovery hits
-    // the old Phase-4 placeholder instead of the compatibility handler.
-    const oauthPublic = await handleEdgeOAuthPublic(request, env);
-    if (oauthPublic) return oauthPublic;
-
-    // ---- /mcp + well-known: dev epoch-1 MCP + sessionless ChatGPT transport.
+    // ---- /mcp + unknown well-known fallback.
     if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/") || url.pathname.startsWith("/.well-known/")) {
-      return handleMcpPlaceholder(request, env);
+      return handleMcpRouter(request, env);
     }
 
     return jsonResponse({ ok: false, code: "not_found", retryable: false, path: url.pathname }, 404);
   },
 };
 
-/** MCP-facing dev router. OAuth remains Phase 4; MCP transport is sessionless. */
-async function handleMcpPlaceholder(request: Request, env: Env): Promise<Response> {
+/** MCP-facing router. OAuth/discovery is handled before this function. */
+async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const limits = makeLimits(env);
-  const rid = () => newRequestId();
   const isMcpPath = url.pathname === "/mcp" || url.pathname === "/mcp/";
 
   if (request.method === "OPTIONS" && isMcpPath) {
@@ -200,8 +191,8 @@ async function handleMcpPlaceholder(request: Request, env: Env): Promise<Respons
         parsed.code === "payload_too_large" ? 413 : 400,
       ));
     }
-    const workstationId = resolveDevWorkstation(request, env);
-    const dev = await handleMcpDev(parsed.value, workstationId, {
+    const workstationId = resolveWorkstation(request, env);
+    const dev = await handleMcp(parsed.value, workstationId, {
       limits,
       forward: async (stub: unknown, body: string) => {
         const internal = new Request("https://do.internal/internal/forward", {
@@ -221,19 +212,16 @@ async function handleMcpPlaceholder(request: Request, env: Env): Promise<Respons
       typeof (parsed.value as Record<string, unknown>).method === "string"
         ? ((parsed.value as Record<string, unknown>).method as string)
         : "";
-    return withMcpCors(serializeMcpDevResponse(dev, {
+    return withMcpCors(serializeMcpResponse(dev, {
       userAgent: request.headers.get("user-agent"),
       oauthClientId: devAuth.clientId ?? null,
       method,
     }));
   }
   if (url.pathname.startsWith("/.well-known/")) {
-    return jsonResponse(
-      placeholder501(`well-known:${url.pathname}`, rid(), "OAuth/discovery boundary — Phase 4").body,
-      501,
-    );
+    return jsonResponse({ ok: false, code: "not_found", retryable: false, path: url.pathname }, 404);
   }
-  return jsonResponse(notWired(url.pathname, rid()).body, 501);
+  return jsonResponse({ ok: false, code: "method_not_allowed", retryable: false, path: url.pathname }, 405);
 }
 
 async function handleEdgeOAuthPublic(request: Request, env: Env): Promise<Response | null> {
@@ -244,8 +232,7 @@ async function handleEdgeOAuthPublic(request: Request, env: Env): Promise<Respon
     store: createOAuthPublicStore(stub),
     fetchFn: globalThis.fetch,
     serverName: "herdr-mcp",
-    // Contract epoch 1 keeps the currently attached server identity stable.
-    serverVersion: "0.3.23",
+    serverVersion: MCP_SERVER_VERSION,
   });
 }
 
@@ -285,20 +272,20 @@ function mcpUnauthorized(env: Env): Response {
   );
 }
 
-function resolveDevWorkstation(request: Request, env: Env): string {
+function resolveWorkstation(request: Request, env: Env): string {
   const fromHeader = request.headers.get("x-herdr-workstation");
   if (fromHeader && /^[A-Za-z0-9_.-]{1,64}$/.test(fromHeader)) return fromHeader;
   const fromQuery = new URL(request.url).searchParams.get("workstation");
   if (fromQuery && /^[A-Za-z0-9_.-]{1,64}$/.test(fromQuery)) return fromQuery;
-  if (env.DEMO_WORKSTATION_ID && /^[A-Za-z0-9_.-]{1,64}$/.test(env.DEMO_WORKSTATION_ID)) {
-    return env.DEMO_WORKSTATION_ID;
+  if (env.DEFAULT_WORKSTATION_ID && /^[A-Za-z0-9_.-]{1,64}$/.test(env.DEFAULT_WORKSTATION_ID)) {
+    return env.DEFAULT_WORKSTATION_ID;
   }
   return "dev-ws1";
 }
 
 async function handleOAuthAdmin(request: Request, env: Env): Promise<Response> {
   if (!env.OAUTH_IMPORT_SECRET) return jsonResponse({ ok: false, code: "not_found" }, 404);
-  if (!authenticateDevMcpBearer(request, env.OAUTH_IMPORT_SECRET).ok) {
+  if (!authenticateStaticMcpBearer(request, env.OAUTH_IMPORT_SECRET).ok) {
     return jsonResponse({ ok: false, code: "admin_auth_failed" }, 401);
   }
   const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));

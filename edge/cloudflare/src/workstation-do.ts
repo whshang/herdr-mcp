@@ -80,7 +80,7 @@ import {
 } from "./state.js";
 import { createLogger } from "./logger.js";
 import { LINK_APPLICATION_PROTOCOL } from "./auth.js";
-import { EPOCH1_CONTRACT } from "./contracts/epoch1.js";
+import { PUBLIC_CONTRACT, isCompatibleLinkContract } from "./contracts/public.js";
 
 const PREFIX_PENDING = "pending:";
 const PREFIX_COMPLETED = "completed:";
@@ -578,17 +578,14 @@ export class WorkstationDO {
       return;
     }
 
-    if (
-      hello.runtime?.contract_epoch !== EPOCH1_CONTRACT.contract_epoch ||
-      hello.runtime?.contract_hash !== EPOCH1_CONTRACT.contract_hash
-    ) {
+    if (!isCompatibleLinkContract(hello.runtime?.contract_epoch, hello.runtime?.contract_hash)) {
       const ack: HelloAckMessage = {
         protocol_version: RELAY_PROTOCOL_VERSION,
         kind: "hello_ack",
         workstation_id: expected,
         ok: false,
         code: "contract_mismatch",
-        message: `edge requires contract epoch ${EPOCH1_CONTRACT.contract_epoch} hash ${EPOCH1_CONTRACT.contract_hash}`,
+        message: `edge requires public contract epoch ${PUBLIC_CONTRACT.contract_epoch} or the immediately previous rollback baseline`,
       };
       this.sendToSocket(ws, ack);
       this.logger.warn("ws.hello.contract_mismatch", {

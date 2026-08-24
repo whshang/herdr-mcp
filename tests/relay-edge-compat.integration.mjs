@@ -15,6 +15,8 @@ import {
   validateRelayMessage as validateEdge,
 } from "../edge/cloudflare/dist/canonical-imports.js";
 import { EPOCH1_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch1.js";
+import { EPOCH2_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch2.js";
+import { PUBLIC_CONTRACT, isCompatibleLinkContract } from "../edge/cloudflare/dist/contracts/public.js";
 
 const base = { protocol_version: 1, workstation_id: "w1" };
 
@@ -83,4 +85,23 @@ test("tracked Cloudflare epoch-1 catalog stays frozen to the captured 17-tool co
   assert.equal(frozen.tools.length, 17);
   assert.equal(frozen.tools.some((tool) => tool.name === "herdr_skill"), false);
   assert.equal(computeContractHash(frozen.tools), expected);
+});
+
+test("tracked Cloudflare epoch-2 catalog stays frozen to the captured 18-tool contract", () => {
+  const expected = "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8";
+  assert.equal(EPOCH2_CONTRACT.contract_epoch, 2);
+  assert.equal(EPOCH2_CONTRACT.tool_count, 18);
+  assert.equal(EPOCH2_CONTRACT.contract_hash, expected);
+  assert.equal(EPOCH2_CONTRACT.tools.length, 18);
+  assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name === "herdr_skill"), true);
+  assert.equal(computeContractHash(EPOCH2_CONTRACT.tools), expected);
+});
+
+test("public edge contract points at epoch 2 while epoch 1 remains only a compatibility baseline", () => {
+  assert.equal(PUBLIC_CONTRACT, EPOCH2_CONTRACT);
+  assert.notEqual(PUBLIC_CONTRACT.contract_hash, EPOCH1_CONTRACT.contract_hash);
+  assert.equal(isCompatibleLinkContract(2, EPOCH2_CONTRACT.contract_hash), true);
+  assert.equal(isCompatibleLinkContract(1, EPOCH1_CONTRACT.contract_hash), true);
+  assert.equal(isCompatibleLinkContract(2, EPOCH1_CONTRACT.contract_hash), false);
+  assert.equal(isCompatibleLinkContract(1, EPOCH2_CONTRACT.contract_hash), false);
 });

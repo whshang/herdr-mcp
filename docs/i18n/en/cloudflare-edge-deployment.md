@@ -181,7 +181,7 @@ bin/herdr-custom-domain-cutover run
 2. confirms the production Worker candidate, OAuth identity, and old Tunnel are all healthy;
 3. deletes the single conflicting CNAME;
 4. attaches the Worker Custom Domain;
-5. verifies health, workstation, epoch/hash, the 17-tool catalog, OAuth/MCP identity, and one read-only `herdr_inspect`;
+5. verifies health, workstation, epoch/hash, the **18-tool epoch-2 catalog including `herdr_skill`**, OAuth/MCP identity, and one read-only `herdr_inspect`;
 6. on any step failure, automatically detaches the Custom Domain and restores the original CNAME;
 7. for the "server committed but the response was lost" cases of DNS DELETE/POST and Custom Domain PUT/DELETE, re-reads real state instead of blind retries.
 
@@ -230,7 +230,7 @@ The safe migration order:
 6. verify the Custom Domain:
    - `/health`;
    - workstation online;
-   - epoch-1 `tools/list`;
+   - epoch-2 `tools/list` with 18 tools including `herdr_skill`;
    - OAuth discovery / token;
    - one real MCP tool call;
 7. once observation passes, the old Tunnel exits service;
@@ -292,10 +292,10 @@ Whatever domain mode you use, keep these boundaries:
 ## Related scripts
 
 ```text
-bin/herdr-cloudflare-token   # create/verify least-privilege Cloudflare token
-bin/herdr-cloudflare-domain  # Custom Domain attach/watch/detach
-bin/herdr-edge-cutover       # legacy Worker Route migration/rollback tool
-bin/herdr-link               # workstation -> Edge WSS sidecar
+bin/herdr-cloudflare-token       # create/verify least-privilege Cloudflare token
+bin/herdr-cloudflare-domain      # Custom Domain attach/watch/detach
+bin/herdr-custom-domain-cutover  # transactional CNAME/Tunnel -> Custom Domain migration
+bin/herdr-link                   # workstation -> Edge WSS sidecar
 ```
 
 New installs prefer `workers.dev`; users with an existing stable domain can choose Custom Domain. Do not treat the custom-domain examples in the docs as an install prerequisite.

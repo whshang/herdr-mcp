@@ -15,11 +15,12 @@ import {
 } from "../dist/state.js";
 import { makeLimits } from "../dist/limits.js";
 import {
-  DevSecretLinkAuthenticator,
-  authenticateDevMcpBearer,
+  SharedSecretLinkAuthenticator,
+  authenticateStaticMcpBearer,
   buildLinkAuthProtocol,
   hasLinkApplicationProtocol,
 } from "../dist/auth.js";
+import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
 
 function capturedLogger(scope) {
   const lines = [];
@@ -63,10 +64,10 @@ test("state: hello claims round-trip through storage blob", () => {
     bootId: "boot1",
     protocolVersion: "1",
     connectedAtMs: 1000,
-    runtimeVersion: "0.3.26",
+    runtimeVersion: "0.3.32",
     runtimeGeneration: "g1",
-    contractHash: "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d",
-    contractEpoch: 1,
+    contractHash: EPOCH2_CONTRACT.contract_hash,
+    contractEpoch: EPOCH2_CONTRACT.contract_epoch,
     capabilities: ["herdr", "fs"],
   });
   const raw = serializeSession(session);
@@ -76,10 +77,10 @@ test("state: hello claims round-trip through storage blob", () => {
   assert.equal(parsed.session.hello.bootId, "boot1");
   assert.equal(parsed.session.status, "online");
   assert.equal(parsed.session.hello.protocolVersion, "1");
-  assert.equal(parsed.session.hello.runtimeVersion, "0.3.26");
+  assert.equal(parsed.session.hello.runtimeVersion, "0.3.32");
   assert.equal(parsed.session.hello.runtimeGeneration, "g1");
-  assert.equal(parsed.session.hello.contractHash, "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d");
-  assert.equal(parsed.session.hello.contractEpoch, 1);
+  assert.equal(parsed.session.hello.contractHash, EPOCH2_CONTRACT.contract_hash);
+  assert.equal(parsed.session.hello.contractEpoch, EPOCH2_CONTRACT.contract_epoch);
 });
 
 test("state: heartbeat runtime glimpse overrides stale hello identity and survives persistence", () => {
@@ -140,22 +141,22 @@ test("state: status falls back to hello runtime/contract identity across hiberna
     bootId: "boot1",
     protocolVersion: "1",
     connectedAtMs: 1000,
-    runtimeVersion: "0.3.23",
+    runtimeVersion: "0.3.32",
     runtimeCommit: "dev",
-    runtimeGeneration: "live-0.3.23",
+    runtimeGeneration: "live-0.3.32",
     herdProtocolVersion: "20",
-    contractHash: "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d",
-    contractEpoch: 1,
+    contractHash: EPOCH2_CONTRACT.contract_hash,
+    contractEpoch: EPOCH2_CONTRACT.contract_epoch,
   });
   const parsed = parseSession(serializeSession(session));
   assert.equal(parsed.ok, true);
   const summary = sessionSummary(parsed.session, { now: 1100, linkStaleAfterMs: 5000, activeRequests: 0, edgeVersion: "0.1.0-dev" });
-  assert.equal(summary.runtimeVersion, "0.3.23");
+  assert.equal(summary.runtimeVersion, "0.3.32");
   assert.equal(summary.runtimeCommit, "dev");
-  assert.equal(summary.runtimeGeneration, "live-0.3.23");
+  assert.equal(summary.runtimeGeneration, "live-0.3.32");
   assert.equal(summary.herdProtocolVersion, "20");
-  assert.equal(summary.contractEpoch, 1);
-  assert.equal(summary.contractHash, "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d");
+  assert.equal(summary.contractEpoch, EPOCH2_CONTRACT.contract_epoch);
+  assert.equal(summary.contractHash, EPOCH2_CONTRACT.contract_hash);
 });
 
 test("state: makeEmptySession starts offline", () => {
@@ -164,8 +165,8 @@ test("state: makeEmptySession starts offline", () => {
   assert.equal(s.workstationId, "w2");
 });
 
-test("auth: dev secret authenticator matches and rejects", () => {
-  const auth = new DevSecretLinkAuthenticator({ secret: "dev-secret" });
+test("auth: shared-secret link authenticator matches and rejects", () => {
+  const auth = new SharedSecretLinkAuthenticator({ secret: "dev-secret" });
   const okReq = { headers: { get: (name) => name.toLowerCase() === "authorization" ? "Bearer dev-secret" : null } };
   assert.equal(auth.authenticate(okReq, "w1", 1).ok, true);
   const subprotocolReq = {
@@ -192,17 +193,17 @@ test("auth: dev secret authenticator matches and rejects", () => {
 });
 
 test("auth: fails closed when secret unset", () => {
-  const auth = new DevSecretLinkAuthenticator({});
+  const auth = new SharedSecretLinkAuthenticator({});
   const req = { headers: { get: () => "Bearer x" } };
   assert.equal(auth.authenticate(req, "w1", 1).ok, false);
 });
 
-test("auth: dev MCP bearer is separate and fail-closed", () => {
+test("auth: static MCP bearer is separate and fail-closed", () => {
   const bearer = (value) => ({
     headers: { get: (name) => name.toLowerCase() === "authorization" ? value : null },
   });
-  assert.equal(authenticateDevMcpBearer(bearer("Bearer mcp-secret"), "mcp-secret").ok, true);
-  assert.equal(authenticateDevMcpBearer(bearer("Bearer wrong"), "mcp-secret").ok, false);
-  assert.equal(authenticateDevMcpBearer(bearer("Bearer mcp-secret"), undefined).ok, false);
-  assert.equal(authenticateDevMcpBearer({ headers: { get: () => null } }, "mcp-secret").ok, false);
+  assert.equal(authenticateStaticMcpBearer(bearer("Bearer mcp-secret"), "mcp-secret").ok, true);
+  assert.equal(authenticateStaticMcpBearer(bearer("Bearer wrong"), "mcp-secret").ok, false);
+  assert.equal(authenticateStaticMcpBearer(bearer("Bearer mcp-secret"), undefined).ok, false);
+  assert.equal(authenticateStaticMcpBearer({ headers: { get: () => null } }, "mcp-secret").ok, false);
 });

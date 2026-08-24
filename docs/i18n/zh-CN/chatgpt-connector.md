@@ -92,13 +92,13 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 
 改工具面或握手时 bump `SERVER_VERSION` / `package.json`，逼客户端重新 `tools/list`。
 
-**不要只以本文数字为准。** runtime 版本以 `/.well-known/mcp.json` / `initialize.serverInfo.version` 为准；工具目录还要看当前 contract profile。0.3.27 独立/本地默认是 18 tools，但当前 production ChatGPT Edge 明确冻结 contract epoch 1 为 17 tools，所以**看不到 `herdr_skill` 是预期行为，不代表 runtime 没升级**。若其它字段仍落后（例如缺 `herdr_fs_write.overwrite`、看不到 `inspect.exec_sessions`）：
+**不要只看缓存里的工具数量。** runtime 版本以 `/.well-known/mcp.json` / `initialize.serverInfo.version` 为准；当前 production catalog 是 contract epoch 2，**18 tools 且包含 `herdr_skill`**。如果 ChatGPT 仍显示旧 epoch-1 的 17-tool snapshot，说明 conversation/Connector 缓存过期，而不是 server 还在故意隐藏 skill。若其它字段仍落后（例如缺 `herdr_fs_write.overwrite`、看不到 `inspect.exec_sessions`）：
 
 1. 确认 `mcp.json` 的 `version` 已是当前构建
 2. ChatGPT 里刷新 / 重连 connector
 3. **开新对话**（旧对话会锁住旧 `tools/list` 快照）
 
-输入字段落后（尤其 `overwrite`）会导致「能建文件、不能按契约覆盖」。会话开始先 `herdr_inspect`；若当前 catalog 暴露 `herdr_skill`，再读一次 skill；production epoch 1 没有该工具时直接继续 `herdr_call` / `herdr_prompt`。
+输入字段落后（尤其 `overwrite`）会导致「能建文件、不能按契约覆盖」。当前会话先 `herdr_inspect`，再读一次 `herdr_skill`，随后按需要继续 direct tools / `herdr_prompt`。
 
 ## 「TaskGroup」/ omp 挂了却说读不了文件
 

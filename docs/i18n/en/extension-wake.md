@@ -40,7 +40,7 @@ Defaults: `progressTickSec = 60` (progress check + nudge cooldown; `0` disables)
 
 1. Load `extension/`
 2. Options: `http://127.0.0.1:8772` and the `herdr-mcp token` (the extension only connects local, using `/push/events` and `/push/state`, never Cloudflare)
-   - This is unrelated to the public Worker using the 17-tool epoch1 or a future contract epoch; the extension does not read ChatGPT's `tools/list`.
+   - This is independent of the public Worker contract epoch (currently epoch 2 / 18 tools); the extension does not read ChatGPT's `tools/list`.
 3. Open the target conversation (chatgpt / deepseek / z.ai / claude)
 4. popup: **bind** the **workspace** that will do the work (the list shows herdr **labels**, e.g. `novo (w5A)`; includes panes with terminal only and no agent; any agent progress in the space pushes back)
 5. dispatch work

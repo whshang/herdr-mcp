@@ -1,9 +1,10 @@
 # herdr-mcp — Cloudflare stable edge
 
 This subtree implements the Cloudflare Worker + Durable Object edge used between
-ChatGPT and the workstation `herdr-link`. The Edge is no longer a dev-only
-scaffold: Relay v1, frozen contract epoch 1, MCP transport and OAuth compatibility
-are implemented and exercised by the Edge Gate.
+ChatGPT and the workstation `herdr-link`. Relay v1, frozen public contract
+**epoch 2 / 18 tools**, MCP transport and OAuth compatibility are implemented
+and exercised by the Edge Gate. Epoch 1 remains frozen only as the immediately
+previous rollback/old-session compatibility baseline.
 
 Routing is deliberately independent from Worker deployment. `workers.dev` is a
 fully supported default and requires no user-owned domain. A Cloudflare Custom
@@ -14,7 +15,7 @@ origin. See [`../../docs/i18n/en/cloudflare-edge-deployment.md`](../../docs/i18n
 
 | Plan phase | Edge state |
 | --- | --- |
-| Phase 1 relay protocol / contract | Complete for epoch 1: canonical Relay v1 and frozen 17-tool contract hash are enforced. |
+| Phase 1 relay protocol / contract | Complete: canonical Relay v1 plus frozen epoch-2 18-tool public contract; epoch 1 remains a legacy compatibility baseline. |
 | Phase 2 `herdr-link` | Implemented in `src/link/**`; workstation sidecar connects outbound over authenticated WSS. |
 | Phase 3 Cloudflare Edge | Implemented: Worker/DO/Hibernation WSS, MCP transport, correlation, offline semantics, payload bounds and redacted logging. |
 | Phase 4 OAuth Edge | Implemented and migrated for the production issuer, including DCR, PKCE, refresh rotation and signing-key continuity. |
@@ -37,15 +38,17 @@ edge/cloudflare/
 │   ├── relay-adapter.ts      ← ★ SOLE Relay Protocol v1 wire boundary
 │   ├── canonical-imports.ts   ← canonical v1 type/validation port (isolated build)
 │   ├── env.ts                ← typed bindings
-│   ├── version.ts            ← Edge identity / frozen contract epoch + hash
+│   ├── version.ts            ← Edge identity / current public contract epoch + hash
+│   ├── contracts/            ← frozen epoch1/epoch2 catalogs + public contract pointer
 │   ├── limits.ts             ← capacities, timeouts, frame budgets, op classification
 │   ├── errors.ts             ← error taxonomy + retry/ambiguity classification
 │   ├── pending.ts            ← bounded pending-request registry + request ids
 │   ├── payload.ts            ← frame/body size checks
-│   ├── auth.ts               ← Link auth interface + fail-closed shared-secret impl
+│   ├── auth.ts               ← Link/shared-secret + static-bearer auth primitives
 │   ├── state.ts              ← persisted session schema + sanitized summaries
 │   ├── logger.ts             ← redacting structured logger
-│   └── mcp-placeholder.ts    ← historical filename; MCP router/compatibility boundary
+│   ├── mcp-handler.ts        ← public initialize/discover/tools/list/tools/call handler
+│   └── mcp-chatgpt-transport.ts ← ChatGPT/OpenAI stateless framing helpers
 └── tests/
     ├── *.test.mjs            ← pure-logic unit tests (node --test, no wrangler)
     └── manual/dev-link-smoke.mjs ← optional end-to-end smoke (needs wrangler dev)
@@ -61,8 +64,9 @@ edge/cloudflare/
   hibernation-compatible handling (`webSocketMessage/Close/Error/Hibernation` + `alarm`).
 - **hello validation interface** — first message must be `hello` with canonical
   numeric `protocol_version === 1`, non-empty bounded workstation/boot/link identity,
-  and `workstationId` must equal the route key. Rejects with `unsupported_protocol_version`
-  / `workstation_mismatch` before any state is written.
+  and `workstationId` must equal the route key. The current epoch-2 identity is
+  accepted; the immediately previous frozen epoch-1 pair is accepted only to keep
+  supervised migration/rollback continuity. Other contract pairs fail closed.
 - **heartbeat / last_seen** — persisted into DO storage (throttled re-writes); staleness
   (`LINK_STALE_AFTER_MS`) drives online/offline in `/status/:workstationId`.
   Rely on Cloudflare WS auto-response for protocol pings so routine pongs never wake the DO.
@@ -180,9 +184,10 @@ explicitly as above so root `package.json` stays untouched.
 
 ## Deliberate non-goals / next work
 
-- **No contract epoch 2 yet.** Epoch 1 stays frozen at 17 tools; `herdr_skill` is
-  intentionally deferred so routine Edge/runtime upgrades do not change the
-  ChatGPT-facing ABI.
+- **No implicit contract drift.** Epoch 2 is the production public ABI: 18 tools,
+  including `herdr_skill`. Any later public tool/metadata change requires another
+  frozen contract epoch and a supervised migration; routine runtime upgrades stay
+  inside epoch 2.
 - **No public inbound path to the workstation.** The Edge terminates public MCP;
   the workstation still connects outward through `herdr-link` only.
 - **No mandatory custom domain.** `workers.dev` remains a supported installation

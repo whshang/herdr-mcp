@@ -1,4 +1,4 @@
-import { authenticateDevMcpBearer } from "./auth.js";
+import { authenticateStaticMcpBearer } from "./auth.js";
 import {
   createOAuthIdentity,
   createRs256AccessTokenVerifier,
@@ -87,10 +87,10 @@ export async function authenticateMcpRequest(
   env: OAuthMcpAuthEnv,
   deps: OAuthMcpAuthDeps = {},
 ): Promise<McpAuthResult> {
-  const dev = authenticateDevMcpBearer(request, env.DEV_MCP_BEARER_SECRET);
+  const dev = authenticateStaticMcpBearer(request, env.DEV_MCP_BEARER_SECRET);
   if (dev.ok) return { ok: true, source: "dev_bearer" };
 
-  const staticBearer = authenticateDevMcpBearer(request, env.STATIC_MCP_BEARER_SECRET);
+  const staticBearer = authenticateStaticMcpBearer(request, env.STATIC_MCP_BEARER_SECRET);
   if (staticBearer.ok) return { ok: true, source: "static_bearer" };
 
   const token = presentedBearer(request);

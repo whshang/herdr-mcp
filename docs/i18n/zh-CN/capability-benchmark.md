@@ -17,7 +17,7 @@ herdr-mcp 的目标不是重新包装一遍 Herdr，也不是成为通用 coding
 
 | 来源/思路 | 能力 | 当前状态 | herdr-mcp 的实现/决策 |
 |---|---|---|---|
-| coding-tools-mcp | 固定工具目录，不随 runtime/权限模式动态改 tools/list（当前上游固定 20 tools） | **已吸收原则，不照抄目录** | herdr-mcp 默认本地 0.3.27 为 18 tools；ChatGPT production contract epoch 1 固定 17 tools。Herdr 约 90 个原生方法不逐一注册。 |
+| coding-tools-mcp | 固定工具目录，不随 runtime/权限模式动态改 tools/list（当前上游固定 20 tools） | **已吸收原则，不照抄目录** | herdr-mcp production contract epoch 2 固定 18 tools，包含 `herdr_skill`。Herdr 约 90 个原生方法不逐一注册。 |
 | coding-tools-mcp | workspace 原语：read/list/search/patch | **已吸收** | `herdr_fs_read/list/grep/patch`，另保留 `write/edit` 作为 Herdr 场景的精确写入工具。 |
 | coding-tools-mcp | 多文件 patch 的原子性/失败清理 | **已吸收等价保证** | `herdr_fs_patch` + `commitAtomic`；新增文件提交失败会清理，写入受 managed-root/dirty/busy/readonly gates 约束。 |
 | coding-tools-mcp | 长命令使用独立 handle，可 read/kill | **已吸收** | `herdr_exec_start/read/kill`；与短命令 `herdr_exec` 分开。 |
@@ -29,7 +29,7 @@ herdr-mcp 的目标不是重新包装一遍 Herdr，也不是成为通用 coding
 | coding-tools-mcp | safe/trusted/dangerous command permission policy | **未照搬** | 当前采用 `READONLY` / `WRITE_ROOTS` / busy/dirty confirmation；shell 是明确的高能力边界，不伪装成完整 sandbox。 |
 | coding-tools-mcp | root project instructions 自动注入 initialize | **未吸收** | Herdr/Agent 指令归官方 skill 与具体 agent，自行扫描项目指令容易与 AGENTS/agent runtime 重复。 |
 | 官方 Herdr | live socket API 是事实源 | **已吸收** | `herdr_methods` 反射 live schema，`herdr_call` 做 schema-validated passthrough；不复制 90+ 方法。 |
-| 官方 Herdr | Agent Skill | **已实现原型，但 production 不暴露；后续需改为 remote-planner 适配** | 官方 skill 的目标是“运行在 Herdr-managed pane 内的 coding agent”，并要求 `HERDR_ENV=1`；ChatGPT Web 是站外 planner，直接照单执行会作用域错位。因此现有 production epoch 1 隐藏 `herdr_skill`。未来 epoch2 不应原样暴露，而应把 release-matched Herdr guidance 转译成远程 MCP planner 规则。 |
+| 官方 Herdr | Agent Skill | **已吸收并完成 remote-planner 适配** | `herdr_skill` 是 epoch 2 的只读工具，返回项目策略 + 与 release 对齐的上游 Herdr guidance，并明确区分站外 Web planner 与 Herdr-managed pane 内 agent；网络失败时回退内置 skill。 |
 | 官方 Herdr | Plugin v1 / plugin registry / event hooks / link handlers | **原生可达，不新增专用 MCP tools** | 官方 plugin 能力继续由安装中的 Herdr 提供；`herdr_methods` + `herdr_call(plugin.*)` 可发现/调用 live socket surface。herdr-mcp 不复制一套 plugin 管理 API。 |
 | 官方 Herdr | agent prompt 生命周期/blocked/idle/done | **已吸收** | `herdr_prompt` 调原生 `agent.prompt`，默认 fire-and-forget；返回 delivery evidence，wait timeout 与 transport error 分离。 |
 | 官方 Herdr | events / session state / persistent background server | **已吸收适合网页的部分** | `herdr_since` cursor 增量恢复、SnapshotCache、`boot_id`；网页 planner 不需要暴露所有 session/lifecycle 方法。 |
@@ -48,12 +48,12 @@ herdr-mcp 的目标不是重新包装一遍 Herdr，也不是成为通用 coding
 - `herdr_exec`：可见 utility pane；只有在投递前控制面失败时才 local fallback，投递后绝不双跑。
 - SnapshotCache + list-API fallback：Herdr `session.snapshot` 毛刺不再把远程文件/Git工作误判为业务阻塞。
 - Cloudflare stable Edge：OAuth、MCP transport、Durable Object、单 active link fencing、runtime offline 的结构化错误。
-- Runtime generation A/B：Link 不重启时在 0.3.23 / 0.3.26 间原子切代、drain、rollback；Edge heartbeat 同步当前 generation/version。
+- Runtime generation A/B：在**同一 contract epoch** 内原子切代、drain、rollback，不重启 Link；Edge heartbeat 同步当前 generation/version。跨 epoch 迁移单独受控执行。
 - 浏览器扩展反向通道：Herdr → `/push/events` → 浏览器 → 当前网页对话，补足 MCP 只有请求方向、长任务后网页不会自动继续的问题。
 
 ## 暂不加入
 
-1. **不立即开放 contract epoch 2 / `herdr_skill` 给现有 ChatGPT Connector。** 原因有两层：保持 `herdr-mcp.agentforme.cc.cd` 与现有 tool snapshot/ABI 连续；以及官方 skill 本身面向 Herdr pane 内 agent，不能原样当成站外 Web planner 指令。未来先做 remote-planner 适配，再考虑显式 epoch 升级与新对话验证。
+1. **后续 contract epoch 不允许隐式变化。** epoch 2 / `herdr_skill` 已成为 production 目标；以后任何 tool catalog 变化都必须冻结成新 epoch、显式迁移，并在新的 ChatGPT 对话中验证 tool snapshot。
 2. **不复制几十个 pane/agent/workspace MCP 工具。** Live Herdr API 通过两个通用工具可达。
 3. **不建立 recipe DSL / 第二 planner。** Web ChatGPT 是唯一高层 planner。
 4. **不宣称 shell sandbox。** 权限边界保持显式，后续若需要更强隔离单独设计。

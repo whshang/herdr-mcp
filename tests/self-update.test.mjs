@@ -6,7 +6,7 @@ import { join, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
-  EPOCH1_CONTRACT_HASH,
+  PUBLIC_CONTRACT_HASH,
   REQUIRED_TOOL_COUNT,
   RELEASE_GATES,
   releaseGateEnv,
@@ -62,7 +62,7 @@ function serverPlistFixture(overrides = {}) {
     ProgramArguments: ["/usr/local/bin/node", "/Users/qingxian/Documents/herdr-mcp/dist/server.js"],
     EnvironmentVariables: {
       HERDR_MCP_BASE_URL: "https://herdr-mcp.agentforme.cc.cd",
-      HERDR_MCP_CONTRACT_PROFILE: "epoch1",
+      HERDR_MCP_CONTRACT_PROFILE: "epoch2",
       HERDR_MCP_HOST: "127.0.0.1",
       HERDR_MCP_PORT: "8772",
       HERDR_MCP_TOKEN: TOKEN,
@@ -322,7 +322,7 @@ test("server plist transformation changes only ProgramArguments[1] and preserves
   assert.equal(next.ProgramArguments[0], plist.ProgramArguments[0]);
   assert.equal(next.ProgramArguments[1], "/Users/qingxian/.config/herdr-mcp/releases/0.3.27-abcd/dist/server.js");
   assert.deepEqual(next.EnvironmentVariables, plist.EnvironmentVariables);
-  assert.equal(next.EnvironmentVariables.HERDR_MCP_CONTRACT_PROFILE, "epoch1");
+  assert.equal(next.EnvironmentVariables.HERDR_MCP_CONTRACT_PROFILE, "epoch2");
   assert.equal(next.EnvironmentVariables.HERDR_MCP_TOKEN, TOKEN);
   assert.equal(next.EnvironmentVariables.HERDR_MCP_BASE_URL, "https://herdr-mcp.agentforme.cc.cd");
 });
@@ -351,7 +351,7 @@ test("validationOk requires ok + exact hash + tools + version", () => {
     ok: true,
     code: "validated",
     runtime_version: "0.3.26",
-    contract_hash: EPOCH1_CONTRACT_HASH,
+    contract_hash: PUBLIC_CONTRACT_HASH,
     tool_count: REQUIRED_TOOL_COUNT,
   };
   assert.equal(validationOk(good, "0.3.26"), true);
@@ -406,7 +406,7 @@ test("splitServerEnv isolates the token and never leaks it into the redacted env
   const { token, env } = splitServerEnv(plist);
   assert.equal(token, TOKEN);
   assert.equal(env.HERDR_MCP_TOKEN, undefined);
-  assert.equal(env.HERDR_MCP_CONTRACT_PROFILE, "epoch1");
+  assert.equal(env.HERDR_MCP_CONTRACT_PROFILE, "epoch2");
   assert.equal(JSON.stringify(env).includes(TOKEN), false);
   // point 1: re-injection is the caller's job; token is not in env, it IS injectable
   assert.ok(token.length > 0);
@@ -504,7 +504,7 @@ test("release gate environment drops production contract and runtime identity ov
   const clean = releaseGateEnv({
     PATH: "/bin:/usr/bin",
     HOME: "/tmp/example",
-    HERDR_MCP_CONTRACT_PROFILE: "epoch1",
+    HERDR_MCP_CONTRACT_PROFILE: "epoch2",
     HERDR_MCP_ALL_TOOLS: "1",
     HERDR_CONTRACT_HASH: "sha256:prod-contract",
     HERDR_CONTRACT_EPOCH: "1",

@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
-export const CONTRACT_HASH = "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
-export const CONTRACT_EPOCH = 1;
+export const CONTRACT_HASH = "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8";
+export const CONTRACT_EPOCH = 2;
+export const REQUIRED_TOOL_COUNT = 18;
+export const RUNTIME_VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 
 function intEnv(raw, fallback, min, max) {
   const n = Number(raw);
@@ -126,7 +129,7 @@ async function toolsProbe(base, bearer) {
   const meta = r.body?.result?._meta?.herdr;
   const names = Array.isArray(tools) ? tools.map((tool) => tool?.name) : [];
   return {
-    ok: r.status === 200 && names.length === 17 && !names.includes("herdr_skill") && (!meta?.contract_hash || meta.contract_hash === CONTRACT_HASH),
+    ok: r.status === 200 && names.length === REQUIRED_TOOL_COUNT && names.includes("herdr_skill") && (!meta?.contract_hash || meta.contract_hash === CONTRACT_HASH),
     status: r.status,
     toolCount: names.length,
     contractHash: meta?.contract_hash || null,
@@ -145,7 +148,7 @@ export async function edgeProbe(c, base = c.prodEdgeBase) {
   const s = status.body || {};
   return {
     ok: health.status === 200 && h.ok === true && h.contractEpoch === CONTRACT_EPOCH && h.contractHash === CONTRACT_HASH &&
-      status.status === 200 && s.online === true && s.runtimeVersion === "0.3.23" &&
+      status.status === 200 && s.online === true && s.runtimeVersion === RUNTIME_VERSION &&
       s.contractEpoch === CONTRACT_EPOCH && s.contractHash === CONTRACT_HASH && tools.ok,
     healthStatus: health.status,
     statusStatus: status.status,

@@ -17,7 +17,7 @@ herdr-mcp's goal is not to re-wrap Herdr, nor to become a generic coding sandbox
 
 | Source/idea | Capability | Current status | herdr-mcp implementation/decision |
 |---|---|---|---|
-| coding-tools-mcp | fixed tool catalog; tools/list does not change dynamically with runtime/permission mode (upstream currently fixes 20 tools) | **principle adopted, catalog not copied** | herdr-mcp local default at 0.3.27 is 18 tools; the ChatGPT production contract epoch 1 fixes 17 tools. Herdr's ~90 native methods are not registered one by one. |
+| coding-tools-mcp | fixed tool catalog; tools/list does not change dynamically with runtime/permission mode (upstream currently fixes 20 tools) | **principle adopted, catalog not copied** | herdr-mcp production contract epoch 2 fixes 18 tools, including `herdr_skill`. Herdr's ~90 native methods are not registered one by one. |
 | coding-tools-mcp | workspace primitives: read/list/search/patch | **adopted** | `herdr_fs_read/list/grep/patch`; `write/edit` kept as precise write tools for the Herdr scenario. |
 | coding-tools-mcp | atomicity / failure cleanup of multi-file patches | **equivalent guarantee adopted** | `herdr_fs_patch` + `commitAtomic`; failed new-file commits are cleaned up; writes are gated by managed-root/dirty/busy/readonly gates. |
 | coding-tools-mcp | long commands use a separate handle, readable/killable | **adopted** | `herdr_exec_start/read/kill`; separate from the short command `herdr_exec`. |
@@ -29,7 +29,7 @@ herdr-mcp's goal is not to re-wrap Herdr, nor to become a generic coding sandbox
 | coding-tools-mcp | safe/trusted/dangerous command permission policy | **not copied** | currently `READONLY` / `WRITE_ROOTS` / busy/dirty confirmations; shell is an explicitly high-capability boundary, not disguised as a full sandbox. |
 | coding-tools-mcp | root project instructions auto-injected at initialize | **not adopted** | Herdr/Agent directives belong to the official skill and the concrete agent; scanning project directives ourselves would duplicate AGENTS/agent runtime. |
 | official Herdr | live socket API is the source of truth | **adopted** | `herdr_methods` reflects the live schema; `herdr_call` does schema-validated passthrough; the 90+ methods are not duplicated. |
-| official Herdr | Agent Skill | **prototype implemented, not exposed in production; needs remote-planner adaptation later** | the official skill targets "coding agents running inside Herdr-managed panes" and requires `HERDR_ENV=1`; ChatGPT Web is an off-site planner, and applying it verbatim would mis-scope. Hence production epoch 1 hides `herdr_skill`. A future epoch2 should not expose it as-is; it should translate release-matched Herdr guidance into rules for a remote MCP planner. |
+| official Herdr | Agent Skill | **adopted with remote-planner adaptation** | `herdr_skill` is a read-only epoch-2 tool. It returns the project policy plus release-matched upstream Herdr guidance, explicitly distinguishing the off-site web planner from agents running inside Herdr-managed panes; network failure falls back to the bundled skill. |
 | official Herdr | Plugin v1 / plugin registry / event hooks / link handlers | **natively reachable, no dedicated MCP tools added** | official plugin capabilities remain provided by the installed Herdr; `herdr_methods` + `herdr_call(plugin.*)` can discover/call the live socket surface. herdr-mcp does not duplicate a plugin management API. |
 | official Herdr | agent prompt lifecycle / blocked / idle / done | **adopted** | `herdr_prompt` calls native `agent.prompt`, default fire-and-forget; returns delivery evidence; wait timeout and transport error are separated. |
 | official Herdr | events / session state / persistent background server | **web-suited parts adopted** | `herdr_since` cursor incremental recovery, SnapshotCache, `boot_id`; the web planner does not need every session/lifecycle method exposed. |
@@ -48,12 +48,12 @@ herdr-mcp's goal is not to re-wrap Herdr, nor to become a generic coding sandbox
 - `herdr_exec`: visible utility pane; local fallback only when control-plane failure happens before delivery; never double-runs after delivery.
 - SnapshotCache + list-API fallback: Herdr `session.snapshot` blips no longer misjudge remote file/Git work as business blockers.
 - Cloudflare stable Edge: OAuth, MCP transport, Durable Object, single active-link fencing, structured errors for runtime offline.
-- Runtime generation A/B: atomic generation switch between 0.3.23 / 0.3.26, drain, rollback without restarting the Link; Edge heartbeat syncs the current generation/version.
+- Runtime generation A/B: atomic generation switch, drain and rollback within the **same contract epoch** without restarting the Link; Edge heartbeat syncs the current generation/version. Cross-epoch migration is supervised separately.
 - Browser extension reverse channel: Herdr → `/push/events` → browser → the current web conversation, filling the gap that MCP is request-direction-only and a long task does not auto-continue the web conversation.
 
 ## Not added yet
 
-1. **Contract epoch 2 / `herdr_skill` are not immediately exposed to the existing ChatGPT Connector.** Two reasons: keep `herdr-mcp.agentforme.cc.cd` and the existing tool snapshot/ABI continuous; and the official skill itself targets agents inside Herdr panes and cannot be treated verbatim as off-site web-planner instructions. Do the remote-planner adaptation first; only then consider an explicit epoch upgrade and new-conversation verification.
+1. **Do not expose a future contract epoch implicitly.** Epoch 2 / `herdr_skill` is now the production target; any later tool-catalog change must be captured as a new frozen epoch, migrated explicitly, and verified in a fresh ChatGPT conversation.
 2. **Do not copy dozens of pane/agent/workspace MCP tools.** The live Herdr API is reachable through two generic tools.
 3. **No recipe DSL / second planner.** Web ChatGPT is the only high-level planner.
 4. **No shell sandbox claim.** The permission boundary stays explicit; stronger isolation, if ever needed, gets designed separately.

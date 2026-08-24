@@ -4,13 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { attach, config, detach, preflight, status, watch, CONTRACT_HASH } from "../bin/herdr-cloudflare-domain";
+import {
+  attach, config, detach, preflight, status, watch,
+  CONTRACT_EPOCH, CONTRACT_HASH, REQUIRED_TOOL_COUNT, RUNTIME_VERSION,
+} from "../bin/herdr-cloudflare-domain";
 
 function json(body, statusCode = 200) {
   return new Response(JSON.stringify(body), { status: statusCode, headers: { "content-type": "application/json" } });
 }
 
-function tools() { return Array.from({ length: 17 }, (_, i) => ({ name: `tool_${i}` })); }
+function tools() {
+  return [{ name: "herdr_skill" }, ...Array.from({ length: REQUIRED_TOOL_COUNT - 1 }, (_, i) => ({ name: `tool_${i}` }))];
+}
 
 async function statePath() {
   const dir = await mkdtemp(join(tmpdir(), "herdr-domain-test-"));
@@ -58,8 +63,8 @@ function handler({ domains = [], publicHealthy = true, onAttach, onDetach } = {}
     }
     if (u.hostname === "prod.test" || u.hostname === "herdr.example.com") {
       const healthy = u.hostname === "prod.test" || publicHealthy;
-      if (u.pathname === "/health") return healthy ? json({ ok: true, contractEpoch: 1, contractHash: CONTRACT_HASH }) : json({ ok: false }, 503);
-      if (u.pathname === "/status/prod-real-runtime") return healthy ? json({ ok: true, online: true, runtimeVersion: "0.3.23", contractEpoch: 1, contractHash: CONTRACT_HASH }) : json({ ok: false }, 503);
+      if (u.pathname === "/health") return healthy ? json({ ok: true, contractEpoch: CONTRACT_EPOCH, contractHash: CONTRACT_HASH }) : json({ ok: false }, 503);
+      if (u.pathname === "/status/prod-real-runtime") return healthy ? json({ ok: true, online: true, runtimeVersion: RUNTIME_VERSION, contractEpoch: CONTRACT_EPOCH, contractHash: CONTRACT_HASH }) : json({ ok: false }, 503);
       if (u.pathname === "/mcp") return healthy ? json({ jsonrpc: "2.0", id: "domain-probe", result: { tools: tools(), _meta: { herdr: { contract_hash: CONTRACT_HASH } } } }) : json({ ok: false }, 503);
     }
     return json({ error: "unexpected", url: u.href, method }, 500);
@@ -79,7 +84,7 @@ test("preflight validates workers.dev candidate and reports ready_to_attach", as
     assert.equal(r.ok, true);
     assert.equal(r.code, "ready_to_attach");
     assert.equal(r.prod.online, true);
-    assert.equal(r.prod.toolCount, 17);
+    assert.equal(r.prod.toolCount, REQUIRED_TOOL_COUNT);
   });
 });
 

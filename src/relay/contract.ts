@@ -12,9 +12,10 @@
  * CANONICAL REPRESENTATION THE HASH COVERS (documented contract)
  * ─────────────────────────────────────────────────────────────────────────────
  * The hash is computed over the bare sorted TOOL ARRAY directly — no wrapping
- * object. The recorded epoch-1 baseline reproduces exactly:
- * `computeContractHash(baseline.tools)` === `sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d`
- * for the 17 tools of the live `0.3.23` process in `docs/_wip/.contract-epoch1-baseline.json`.
+ * object. Frozen public catalogs are tracked in `edge/cloudflare/src/contracts/`:
+ * epoch 1 preserves the historical 17-tool 0.3.23 ABI, while epoch 2 is the
+ * current 18-tool ABI including `herdr_skill`. Reproducibility is enforced by
+ * relay-contract and relay-edge-compat tests.
  *
  * What the hash covers (the ChatGPT-visible ABI only):
  *

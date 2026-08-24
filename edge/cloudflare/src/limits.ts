@@ -91,15 +91,15 @@ export type OpClass = "read" | "mutating" | "unknown";
 /**
  * Read-only ops may be retried after connection ambiguity; everything else is
  * treated conservatively (mutation-safe). This is a delivery-semantics
- * heuristic only — it is NOT a tool catalog. The canonical epoch-1 baseline
- * lives at docs/_wip/.contract-epoch1-baseline.json (owned by another
- * worker); classify ops against it during Phase 1. Nothing newer (e.g.
- * herdr_skill) is asserted here.
+ * heuristic only — it is NOT a tool catalog. Frozen catalogs live under
+ * edge/cloudflare/src/contracts/. Keep this set aligned with operations whose
+ * handlers are provably read-only; unknown operations stay conservative.
  */
 const READ_OPS: ReadonlySet<string> = new Set([
   "herdr_inspect",
   "herdr_since",
   "herdr_methods",
+  "herdr_skill",
   "herdr_fs_list",
   "herdr_fs_grep",
   "herdr_fs_read",

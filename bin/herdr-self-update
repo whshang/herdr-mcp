@@ -8,7 +8,7 @@
 //   * tests/self-update*.test.mjs
 // It never deploys Edge, never touches DNS/Worker/Tunnel/OAuth, never changes the
 // contract epoch, and never restarts the production link daemon (the live manager
-// handles activation; the link-prod plist generation value is for its next start).
+// handles activation; cross-epoch migration is a separate supervised operation).
 //
 // Secret safety: the MCP bearer token is read from the server plist and injected
 // into the candidate process environment / HTTP Authorization headers only. It is
@@ -25,10 +25,10 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
-export const EPOCH1_CONTRACT_HASH =
-  "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
-export const EPOCH1_CONTRACT_PROFILE = "epoch1";
-export const REQUIRED_TOOL_COUNT = 17;
+export const PUBLIC_CONTRACT_HASH =
+  "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8";
+export const PUBLIC_CONTRACT_PROFILE = "epoch2";
+export const REQUIRED_TOOL_COUNT = 18;
 export const CANDIDATE_LABEL = "candidate";
 // Directories in the working tree excluded from the release snapshot copy.
 export const SOURCE_EXCLUDED_COMPONENTS = [".git", "node_modules", "dist", "edge/cloudflare/dist", "site-dist"];
@@ -46,10 +46,11 @@ export const RELEASE_GATES = [
 
 /**
  * Release validation must exercise the package's default/current tool surface,
- * even when self-update was launched through the production epoch-1 runtime.
+ * even when self-update was launched through the production frozen runtime.
  * herdr_exec children inherit the server environment, so without this scrub an
  * updater invoked by herdr-mcp would accidentally run the root suite under
- * HERDR_MCP_CONTRACT_PROFILE=epoch1 and report the expected 18-tool tests as 17.
+ * HERDR_MCP_CONTRACT_PROFILE=epoch2 and accidentally turn default-surface tests
+ * into contract-profile tests.
  */
 export function releaseGateEnv(env = process.env) {
   const clean = { ...env };
@@ -792,8 +793,8 @@ async function cmdWorker(args, env) {
     const serverPlist = await readPlist(job.server_plist);
     const { token, env: serverEnv } = splitServerEnv(serverPlist);
     if (!token) throw new Error("server plist has no HERDR_MCP_TOKEN");
-    if (serverEnv.HERDR_MCP_CONTRACT_PROFILE !== EPOCH1_CONTRACT_PROFILE) {
-      throw new Error(`contract profile must be ${EPOCH1_CONTRACT_PROFILE}`);
+    if (serverEnv.HERDR_MCP_CONTRACT_PROFILE !== PUBLIC_CONTRACT_PROFILE) {
+      throw new Error(`contract profile must be ${PUBLIC_CONTRACT_PROFILE}; cross-epoch migration is not a self-update`);
     }
 
     // --- backups before any mutation ---
@@ -948,7 +949,7 @@ export function validationOk(validation, version) {
     validation &&
     validation.ok === true &&
     validation.runtime_version === version &&
-    validation.contract_hash === EPOCH1_CONTRACT_HASH &&
+    validation.contract_hash === PUBLIC_CONTRACT_HASH &&
     validation.tool_count === REQUIRED_TOOL_COUNT
   );
 }

@@ -54,6 +54,7 @@ import {
   verifyPkceS256,
 } from "./oauth-token-crypto.js";
 import type { OAuthClientRecord, OAuthCodeRecord } from "./oauth-store-do.js";
+import { MCP_SERVER_VERSION } from "./version.js";
 
 // ---------------------------------------------------------------------------
 // Options / dependency types
@@ -126,7 +127,7 @@ export interface OAuthPublicOptions {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_SERVER_NAME = "herdr-mcp";
-const DEFAULT_SERVER_VERSION = "0.3.27";
+const DEFAULT_SERVER_VERSION = MCP_SERVER_VERSION;
 const DEFAULT_ACCESS_TTL_S = 86400;
 const DEFAULT_REFRESH_TTL_S = 2592000; // 30 days
 const DEFAULT_CODE_TTL_MS = 5 * 60_000;

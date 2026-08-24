@@ -15,7 +15,7 @@ function env() {
   };
 }
 
-test("worker routes OAuth discovery before the legacy /.well-known placeholder", async () => {
+test("worker routes OAuth discovery before the generic /.well-known fallback", async () => {
   const response = await worker.fetch(
     new Request("https://herdr-edge-dev.example/.well-known/oauth-authorization-server"),
     env(),
@@ -28,7 +28,7 @@ test("worker routes OAuth discovery before the legacy /.well-known placeholder",
   assert.equal(body.registration_endpoint, `${issuer}/oauth/register`);
 });
 
-test("worker routes MCP server card before the legacy /.well-known placeholder", async () => {
+test("worker routes MCP server card before the generic /.well-known fallback", async () => {
   const response = await worker.fetch(
     new Request("https://herdr-edge-dev.example/.well-known/mcp.json"),
     env(),
@@ -37,5 +37,5 @@ test("worker routes MCP server card before the legacy /.well-known placeholder",
   const body = await response.json();
   assert.equal(body.serverUrl, `${issuer}/mcp`);
   assert.equal(body.name, "herdr-mcp");
-  assert.equal(body.version, "0.3.23");
+  assert.equal(body.version, "0.3.32");
 });

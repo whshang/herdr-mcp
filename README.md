@@ -24,7 +24,7 @@ Agents’ progress / settled events reach the extension; the extension ↻ types
 - If reasoning is required, prefer `herdr_prompt` to a cheap/fast Herdr worker (`pi`, `flash`, `cline`, `opencode`, `anti`) or auditor (`droid`, `grok`) — do not route through local Claude/OMP/main.
 - If Pi/Herdr workers are unavailable, `dsh --profile headless "job"` is a tested CLI fallback. Run it through a long `herdr_exec_start` session, not a 60s synchronous shell: tool edits may complete before the final headless answer is printed. `dsh-tui` is the human-interactive fallback, not the default automation surface. See [worker fallbacks](docs/i18n/en/worker-fallbacks.md).
 - `inspect`/`since` soft-hide Claude/OMP/Codex by default. Prompting by known pane still works. `HERDR_MCP_AGENT_ALLOW=*` shows all.
-- Standalone/local 18-tool sessions: `herdr_inspect` → `herdr_skill` (once) → work. Production ChatGPT currently stays on frozen contract epoch 1 (17 tools), so `herdr_skill` is intentionally hidden there until an explicit epoch upgrade.
+- Current sessions use the frozen contract epoch 2 surface: **18 tools including `herdr_skill`**. Start with `herdr_inspect` → `herdr_skill` (once) → work. Epoch 1 remains only as the historical 17-tool rollback/old-session compatibility baseline.
 
 ```mermaid
 flowchart TB
@@ -181,7 +181,7 @@ After code changes: `npx tsc && herdr-mcp restart` (or restart the `node dist/se
 
 ## Default tools (why these 18)
 
-Herdr’s native surface is a large Unix-socket API (`herdr api schema`, ~90 methods). herdr-mcp does **not** re-wrap every method as an MCP tool (that burns context and duplicates herdr). Standalone/local 0.3.27 exposes 18 tools. Production ChatGPT deliberately freezes contract epoch 1 at 17 tools so runtime upgrades do not force the existing Connector/tool snapshot to change; that profile hides only `herdr_skill`. Instead:
+Herdr’s native surface is a large Unix-socket API (`herdr api schema`, ~90 methods). herdr-mcp does **not** re-wrap every method as an MCP tool (that burns context and duplicates herdr). Runtime 0.3.32 freezes the production ChatGPT ABI at **contract epoch 2 / 18 tools**, including `herdr_skill`. Epoch 1 / 17 tools is retained only for supervised rollback and old-session compatibility. Instead of registering every native method:
 
 | Layer | MCP tools | Relation to herdr |
 |---|---|---|
@@ -192,7 +192,7 @@ Herdr’s native surface is a large Unix-socket API (`herdr api schema`, ~90 met
 
 | Tool | What it does |
 |---|---|
-| `herdr_skill` | Read-only: prefer latest `SKILL.md` from herdr **master**; if the network fails, use the bundled copy (`assets/herdr-agent-SKILL.md`). When this tool is present, call it once per session before agent operations. Production contract epoch 1 deliberately hides it; `HERDR_SKILL_NETWORK=0` forces bundled. |
+| `herdr_skill` | Read-only: prefer latest `SKILL.md` from herdr **master**; if the network fails, use the bundled copy (`assets/herdr-agent-SKILL.md`). Call it once per session before agent operations. `HERDR_SKILL_NETWORK=0` forces bundled. |
 | `herdr_methods` | List live herdr socket methods + parameter schemas (cached reflection). Use before unknown `herdr_call`s. |
 | `herdr_call` | Call any herdr method with validated params (`{ method, params }`). Covers panes, workspaces, agents, etc. without one MCP tool per method. |
 | `herdr_inspect` | One-shot: connection health + workspaces / tabs / panes / agents (cwd, status), plus `workstation_info`, `boot_id`, and `exec_sessions`. Usual first call. |
