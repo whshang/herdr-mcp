@@ -64,6 +64,7 @@ import { runLocalShell } from "./local-exec.js";
 import { fetchHerdrSkill, herdrSkillPointer } from "./herdr-skill.js";
 import { EPOCH1_TOOL_OVERRIDES } from "./legacy-epoch1-tool-overrides.js";
 import { enrichedUserEnv } from "./user-path.js";
+import { buildUtilityExecScript, utilityPaneReadiness, shellQuote, cleanupStaleUtilityScripts } from "./utility-exec.js";
 
 /** Process boot id — returned by inspect/since so clients detect cursor reset. */
 const BOOT_ID = randomUUID().slice(0, 12);
@@ -2432,6 +2433,7 @@ function registerTools(server: McpServer): void {
         effectiveRoot = roots[0];
       }
       const execCwd = effectiveRoot;
+      await cleanupStaleUtilityScripts();
       const gate = mutationDenied(execCwd, "herdr_exec");
       if (gate) return toResult(gate);
       const working = workingAgentsForRoot(snap, execCwd);
@@ -2549,26 +2551,43 @@ function registerTools(server: McpServer): void {
           : "utility_pane_unavailable");
       }
 
+      try {
+        const info = await c.call("pane.process_info", { pane_id: paneId }, 5000);
+        const readiness = utilityPaneReadiness(info);
+        if (!readiness.ready) {
+          return toResult({
+            ok: false,
+            code: "utility_pane_not_ready",
+            backend: "utility_pane",
+            workspace: wsId,
+            pane_id: paneId,
+            command,
+            foreground: readiness.foreground,
+            hint: "utility pane is owned by an interactive program (for example less/git/gh); exit it and retry herdr_exec",
+          });
+        }
+      } catch {
+        // Best effort: old Herdr control planes may not expose process_info.
+      }
+
       const nonce = randomUUID().slice(0, 8);
       const marker = `__HM_EXEC_${nonce}_EXIT_`;
-      const shq = (s: string): string => "'" + s.replace(/'/g, `'\\''`) + "'";
       const execShell = resolveExecShell(process.env);
       const scriptPath = path.join(
         process.env.TMPDIR || "/tmp",
         `herdr-mcp-exec-${nonce}.sh`,
       );
-      const scriptBody = [
-        `#!${execShell}`,
-        "set +e",
-        effectiveRoot ? `cd -- ${shq(effectiveRoot)} || exit 127` : "",
+      const scriptBody = buildUtilityExecScript({
+        execShell,
+        cwd: effectiveRoot,
         command,
-      ].filter(Boolean).join("\n") + "\n";
+      });
       try {
         await writeFile(scriptPath, scriptBody, { encoding: "utf-8", mode: 0o700 });
       } catch (e) {
         return toResult({ ok: false, reason: "script_write_failed", message: String(e) });
       }
-      const cmdline = `${shq(execShell)} ${shq(scriptPath)}; ec=$?; rm -f -- ${shq(scriptPath)}; printf '\\n${marker}%s__' "$ec"`;
+      const cmdline = `${shellQuote(execShell)} ${shellQuote(scriptPath)}; ec=$?; rm -f -- ${shellQuote(scriptPath)}; printf '\\n${marker}%s__' "$ec"`;
       const readText = (rr: HerdrResult): string => {
         const rd = ((rr["read"] as Record<string, unknown>) ?? rr) as Record<string, unknown>;
         return String(rd["content"] ?? rd["text"] ?? rd["output"] ?? "");
