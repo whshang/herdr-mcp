@@ -116,11 +116,15 @@ node dist/server.js
 The supported default does **not** require your own domain. Deploy the Edge to your Cloudflare account's `workers.dev` hostname first:
 
 ```bash
+WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
+printf '%s\n' "$WORKER_NAME"   # DNS-label safe: no dots/underscores, <=63 chars
 cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
-# edit worker name, workstation id and OAUTH_ISSUER for your workers.dev origin
+# set name to $WORKER_NAME; then set workstation id and OAUTH_ISSUER
 cd edge/cloudflare
 npx wrangler deploy --config wrangler.user.toml
 ```
+
+With `workers.dev` enabled, the **Worker name** is a single DNS label and therefore cannot contain `.`. A Custom Domain such as `herdr.example.com` is a different concept and may contain dots.
 
 Use the resulting stable origin, for example:
 

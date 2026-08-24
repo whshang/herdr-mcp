@@ -9,7 +9,7 @@ You are operating **through herdr-mcp from a remote/web planner**. You are not a
 
 ## 0. Project-local instructions and reusable skills
 
-As soon as a target project root is known, and **before the first mutation or agent dispatch in that project**, inspect the project root for `AGENTS.md`, `CLAUDE.md`, and `README.md`. Read every one that exists; missing files are normal and are not errors. Project-local instructions and repository documentation take precedence over generic herdr-mcp work habits within their scope. Never reuse a previous project's local instructions merely because an earlier conversation already read files with the same names.
+As soon as a target project root is known, and **before substantive project work in that project (including read-only analysis, the first mutation, or agent dispatch)**, inspect the project root for `AGENTS.md`, `CLAUDE.md`, and `README.md`. Read every one that exists; missing files are normal and are not errors. Do this once per target project root before continuing the task. Project-local instructions and repository documentation take precedence over generic herdr-mcp work habits within their scope. Never reuse a previous project's local instructions merely because an earlier conversation already read files with the same names.
 
 For task-specific reusable skills, support both project and user conventions without eagerly loading all skill bodies:
 

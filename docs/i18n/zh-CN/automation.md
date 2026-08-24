@@ -1,5 +1,7 @@
 # 自动化
 
+读者：维护 CI/CD、Pages、生产 Edge 部署和本机 runtime 发布流程的 Maintainer。普通用户第一次安装不需要读本页。
+
 herdr-mcp 有三条刻意分离的自动化平面。它们共享版本控制，但不共享凭据或故障域。
 
 ## 1. GitHub Pages

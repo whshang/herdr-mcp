@@ -34,7 +34,7 @@ Actual-send rules (avoid empty-spin spam):
 - after the floor: fingerprint changed → `new_output`; otherwise → `fallback`
 - the sent baseline is written into the binding (`lastProgressSentAt` / `lastProgressOutput`), so dedupe survives a Service Worker kill
 
-Defaults: `progressTickSec = 60` (progress check + automatic LLM-decision cooldown; `0` disables those two); `progressFallbackSec = 1200` (20-minute fallback; `0` = send only on new summaries). Options chooses **Manual globally / Per-Project automation**. Manual globally hides the Project HUD automation switch and blocks all automatic mutations; Per-Project mode exposes the switch, with each new Project defaulting off. Both timing values are editable in Options. UI languages: en / Simplified Chinese / Japanese (follows system first, manual override possible).
+Defaults: `progressTickSec = 60` (progress check + automatic LLM-decision cooldown; `0` disables those two); `progressFallbackSec = 1200` (20-minute fallback; `0` = send only on new summaries). The Options master gate controls **ChatGPT Project-shared automation only**. With it off, Projects do not run shared automatic mutations; plain ChatGPT `/c/<id>`, z.ai, and DeepSeek can still enable their own conversation-scoped Auto from the HUD. New Projects and new conversations default off. UI languages: en / Simplified Chinese / Japanese (follows system first, manual override possible).
 
 ## Install and bind
 
@@ -56,7 +56,7 @@ Bound conversation + extension ≥ 0.1.20:
 3. if the reply matches the "do not send" keywords → no nudge; otherwise if judged "continue" → **fill the small model's original text** into the input and submit (prompt / do-not-send words are pre-filled visible defaults in Options)
 4. **no longer** uses zero-tool / halfway heuristics; without a configured small model, no nudge this turn
 5. if the user bubble was the last nudge sentence, the **new assistant reply is still judged** (since 0.1.20); automatic judgment and progress checks share `progressTickSec`; `0` disables automatic LLM judgment (default 60s) but not manual **LLM analysis**
-6. persistent bottom HUD on supported sites: runtime state, **Manual continue / Herdr monitor / LLM analysis / Manual handoff**, optional **Auto on|off**, and expand. When automation is permitted, ChatGPT uses a Project-scoped switch keyed by `project_id`, while z.ai / DeepSeek use a conversation-scoped switch. Global manual mode hides the automation switch. Manual handoff is available for bound ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations; with `Auto on`, all four HUD manual actions are locked. Frequent actions stay on the bar, and the drawer contains only event settings, conversation bindings and advanced options. Copy follows the Options language (en / Simplified Chinese / Japanese)
+6. persistent bottom HUD on supported sites: runtime state, **Manual continue / Herdr monitor / LLM analysis / Manual handoff**, optional **Auto on|off**, and expand. ChatGPT Projects expose a `project_id`-scoped switch only when the Options Project gate is enabled; plain ChatGPT `/c/<id>`, z.ai, and DeepSeek always remain eligible for their own conversation-scoped switch. Manual handoff is available for bound ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations; with the current scope `Auto on`, all four HUD manual actions are locked. Frequent actions stay on the bar, and the drawer contains only event settings, conversation bindings and advanced options. Copy follows the Options language (en / Simplified Chinese / Japanese)
 7. herdr working/settled wake-ups remain independent
 
 The key is stored locally only; the repo keeps it empty by default.
@@ -98,7 +98,7 @@ Default templates contain `{roster}` `{idle_hint}` placeholders; the extension f
 
 ## ChatGPT permission cards
 
-The content script keeps observing in-page permission cards on chatgpt.com, but clicks an explicit Allow action only when **per-Project automation is enabled in Options + the current Project is `Auto on`**. Permission handling is part of Project automation and no longer has a separate toggle. Manual globally or Project `Auto off` stops automatic permission clicks. Native browser permission bars are outside this mechanism. See [chatgpt-connector.md](./chatgpt-connector.md).
+The content script keeps observing in-page permission cards on chatgpt.com, but clicks an explicit Allow action only when **ChatGPT Project automation is enabled in Options + the current Project is `Auto on`**. Permission handling is part of Project automation and no longer has a separate toggle. Disabling the Project gate or setting that Project `Auto off` stops automatic permission clicks. Native browser permission bars are outside this mechanism. See [chatgpt-connector.md](./chatgpt-connector.md).
 
 ## Testing
 

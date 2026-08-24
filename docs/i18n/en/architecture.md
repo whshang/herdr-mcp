@@ -2,6 +2,8 @@
 
 Audience: contributors deciding whether a capability belongs in MCP or in the native herdr API.
 
+This is a contributor/reference page, not the first-run guide. For the product boundary and user path, start with [Overview](overview.md). Herdr-native concepts and APIs remain authoritative in the upstream [Herdr docs](https://herdr.dev/docs/) and [Socket API](https://herdr.dev/docs/socket-api/).
+
 ## The remote control plane
 
 <section class="diagram" aria-label="Architecture">

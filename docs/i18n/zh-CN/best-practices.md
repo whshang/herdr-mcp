@@ -1,6 +1,8 @@
-# 最佳实践
+# Remote planner 最佳实践
 
-让系统保持快速、安全、可观测的工作流。这些是项目遵循的运行规则，请当作默认做法，而不是唯一做法。
+读者：把网页模型作为 herdr-mcp planner 的使用者。Herdr 本体内部的 Agent 自动化请直接看官方 [Agent automation](https://herdr.dev/docs/agent-automation/)。
+
+让远程 planner 工作流保持快速、安全、可观测。这些是项目遵循的运行规则，请当作默认做法，而不是唯一做法。
 
 ## Web 规划，本地干活
 
@@ -40,7 +42,7 @@
 1. ChatGPT 连上 Edge MCP 端点并完成 OAuth（见 [安装](install.md)）。
 2. 新开会话；模型先调 `herdr_inspect` 看工作站，再调一次 `herdr_skill`。
 3. 你要求修改某个 git 管理的项目：模型用 `herdr_fs_read` / `herdr_git status` 读、用 `herdr_fs_patch` 改、用 `herdr_exec` 跑测试，并在 managed root 下通过原子 Git 助手提交。
-4. 在 MV3 扩展里把网页会话绑定到实际工作的 workspace。Options 选择**全局手动 / 项目自动**；ChatGPT Project 只有在 HUD 显式开启 `自动 开` 后，才会执行进度/收工、LLM 判断、回复恢复和安全自动接力；z.ai / DeepSeek 则提供更窄的会话级开关，只自动回推 progress/settled。需要主动 **手动接力** 时先切到 `自动 关`；已绑定 ChatGPT Project 和持久 z.ai `/c/<chat_id>` 会话可用。扩展与 Herdr 的通信保持在本机：浏览器通过 Native Messaging 交给 host，再由权限为 `0600` 的 Unix Socket 进入 runtime，浏览器侧不持有 Herdr bearer。见 [extension-wake](extension-wake.md)。
+4. 在 MV3 扩展里把网页会话绑定到实际工作的 workspace。Options 只控制 **ChatGPT Project 共享自动化**；Project 只有在 HUD 显式开启 `自动 开` 后，才会执行进度/收工、LLM 判断、回复恢复和安全自动接力。普通 ChatGPT `/c/<id>`、z.ai、DeepSeek 使用各自的单会话 Auto，不依赖 Project 总许可；其中 z.ai / DeepSeek 只自动回推 progress/settled。需要主动 **手动接力** 时先把当前作用域切到 `自动 关`；已绑定 ChatGPT Project 和持久 z.ai `/c/<chat_id>` 会话可用。扩展与 Herdr 的通信保持在本机：浏览器通过 Native Messaging 交给 host，再由权限为 `0600` 的 Unix Socket 进入 runtime，浏览器侧不持有 Herdr bearer。见 [extension-wake](extension-wake.md)。
 5. 某个 worker 掉线时，模型改走 `dsh --profile headless`（通过 `herdr_exec_start` 长会话）而不是卡住。
 
 结果：一个稳定的公共契约、廉价的本地算力，加上一条让网页会话保持鲜活的回流通道。

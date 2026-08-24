@@ -1,5 +1,7 @@
 # Capability benchmark
 
+Audience: maintainers and contributors making design/ADR decisions. This is not an installation or everyday usage guide.
+
 > Purpose: record herdr-mcp's capability trade-offs against official Herdr, other Herdr MCP implementations and coding-tools-mcp, so research is not repeated, features are not blindly copied, and the tool surface does not bloat.
 
 ## Design principles

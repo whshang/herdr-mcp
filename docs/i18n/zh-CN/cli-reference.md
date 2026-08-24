@@ -1,4 +1,6 @@
-# CLI 参考
+# herdr-mcp CLI 参考
+
+本页只覆盖 **herdr-mcp** 命令。Herdr 本体 CLI 请直接看官方 [Herdr CLI reference](https://herdr.dev/docs/cli-reference/)。
 
 herdr-mcp 提供两套命令面：面向 macOS/LaunchAgent 的 `herdr-mcp` bash CLI，以及一组 Node `bin/` 维护工具。npm 的 `bin` 是 `dist/server.js`——那是服务器本体，不是 CLI。
 

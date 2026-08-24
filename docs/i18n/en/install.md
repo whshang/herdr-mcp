@@ -2,6 +2,8 @@
 
 Get a remote planner (ChatGPT or another web model) talking to your local Herdr workstation through herdr-mcp. The supported flow is: install and start the local MCP server first, then deploy the Cloudflare Edge and connect ChatGPT — the Edge is what ChatGPT actually talks to, so deploy it before creating the Connector.
 
+If Herdr itself is new to you, first use the official [Herdr Install](https://herdr.dev/docs/install/), [Quick start](https://herdr.dev/docs/quick-start/), and [Concepts](https://herdr.dev/docs/concepts/). This page starts at the herdr-mcp web/remote layer. For the shortest herdr-mcp path, see [Overview](overview.md) and [Quick start](quick-start.md).
+
 See [architecture](architecture.md) for the full system boundary, and [chatgpt-connector](chatgpt-connector.md) for the Connector contract in detail.
 
 ## Prerequisites
@@ -47,12 +49,19 @@ herdr-mcp watchdog install   # restart MCP if down, every 120s
 
 The supported default does not require your own domain — the worker runs on your account's `workers.dev` hostname:
 
+Generate a valid Worker name before writing the Wrangler config. **This rule applies to the Worker name, not to a Custom Domain**: with `workers.dev` enabled it is a single DNS label, so it may contain only letters, digits and `-`, must be at most 63 characters, and cannot start or end with `-`. Do not use a raw hostname such as `MacBook.local` as the Worker name.
+
 ```bash
+WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
+printf '%s\n' "$WORKER_NAME"   # e.g. herdr-edge-macbook-local; never contains a dot
+
 cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
-# edit worker name, workstation id and OAUTH_ISSUER for your workers.dev origin
+# set name to $WORKER_NAME; then set workstation id and OAUTH_ISSUER
 cd edge/cloudflare
 npx wrangler deploy --config wrangler.user.toml
 ```
+
+A Custom Domain such as `herdr.example.com` naturally contains dots; the no-dot rule above is specifically for the Worker-name label in a `workers.dev` URL.
 
 The result is a stable origin, for example:
 

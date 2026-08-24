@@ -58,6 +58,11 @@ test("Agent install uses deterministic Cloudflare-safe Worker names and reports 
     assert.match(doc, /Native Messaging/);
     assert.match(doc, /HERDR_MCP_TOKEN/);
   }
+  for (const rel of ["README.md", "README.zh.md", "docs/i18n/en/install.md", "docs/i18n/zh-CN/install.md"]) {
+    const doc = read(rel);
+    assert.match(doc, /scripts\/cloudflare-worker-name\.mjs/);
+    assert.match(doc, /WORKER_NAME/);
+  }
 });
 
 test("herdr-link resolves Node from PATH for fresh Apple Silicon installs", () => {

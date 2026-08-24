@@ -1,5 +1,7 @@
 # Worker fallbacks
 
+Audience: remote-planner maintainers choosing local execution workers. For Herdr-native agent concepts and automation primitives, use the upstream [Agents](https://herdr.dev/docs/agents/) and [Agent automation](https://herdr.dev/docs/agent-automation/) guides instead.
+
 herdr-mcp keeps the web model as the planner. Local agent CLIs are execution workers, not a second orchestration layer.
 
 ## Recommended order

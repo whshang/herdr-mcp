@@ -5,7 +5,7 @@
 
 | 主线 | 问题 | 方向 | 状态 | 首批站点 |
 |---|---|---|---|---|
-| **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + 自动化 gate + 安全接力 | **已可用**（当前 0.1.50 系列） | 绑定/观察：4 站；ChatGPT Project 完整自动化；z.ai / DeepSeek 会话级进度自动化；手动接力：ChatGPT Project + z.ai `/c/<chat_id>` |
+| **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + 自动化 gate + 安全接力 | **已可用**（当前 0.1.51 系列） | 绑定/观察：4 站；ChatGPT Project 共享自动化；普通 ChatGPT / z.ai / DeepSeek 会话级自动化；手动接力：ChatGPT Project + z.ai `/c/<chat_id>` |
 | **B. JSON→MCP** | DeepSeek / z.ai 网页没有 MCP Connector | 网页 → 扩展 service worker → Native Messaging host → 受信任本机 `/mcp` IPC | **已可用**（bounded `tools/list` / `tools/call` loop） | `chat.deepseek.com`、`chat.z.ai` |
 
 共享：同一扩展、同一 Native Messaging + 本机 Unix IPC transport、同一 options。
@@ -39,7 +39,7 @@ Chrome 145+ 把本机回环访问拆成 `loopback-network`（界面显示为“�
 - 绑定：popup 把「当前会话」绑到某个 herdr **workspace**（space 内多 agent 并行可回推）
 - SSE：`/push/events?workspace=...`
 - 策略：见过 `working` 之后；局部 settle 报进展，范围内全空闲才收工；`hello` 可补
-- chatgpt.com 页内权限卡自动处理已并入 Project 自动化：Options 勾选**启用项目自动**且当前 Project HUD 为 **`自动 开`** 时才会自动点明确的「允许」；全局手动或 Project `自动 关` 时只观察，不自动点击
+- chatgpt.com 页内权限卡自动处理已并入 Project 自动化：Options 勾选**启用 ChatGPT 项目自动化**且当前 Project HUD 为 **`自动 开`** 时才会自动点明确的「允许」；关闭 Project 总许可或当前 Project `自动 关` 时只观察，不自动点击
 - ChatGPT 回合结束后可用小模型判断是否继续（Options 配 Base URL + Key + Model；自动模式下执行；冷却与进度检查共用 `progressTickSec`）
 - 回复长时间没有开始时可自动做恢复探测；0.1.44 还会处理“回复已经开始但页面停在半截”的 stale-view：best-effort 比较 ChatGPT 同源 conversation snapshot 与页面最后 assistant message，只有确认服务端领先页面，或服务端未完成消息确实长期停滞，才进入刷新恢复
 - ChatGPT Project 长对话按页面可见用户/助手文本做保守 token 估算；达到自动阈值且 workspace/页面均静止、安全条件满足时，复用同一 fail-closed handoff 状态机自动接力
@@ -54,25 +54,26 @@ Chrome 145+ 把本机回环访问拆成 `loopback-network`（界面显示为“�
 
 ### 已实现（主线 A 定时进度通报）
 
-- Options：全局运行模式为**全局手动 / 项目自动**；`progressTickSec`（默认 `60` 秒：working 进度检查 + 自动 LLM 回合判断冷却；填 `0` 只关闭这两类**间隔驱动**动作，不改变全局模式或 Project 开关）、`progressFallbackSec`（默认 `1200` 秒无新摘要兜底）、进度模板与收工模板分开（`progressTemplate` / `wakeTemplate`）；界面语言 en / 简体中文 / 日本語
+- Options：只保留 **ChatGPT 项目自动化**的总许可；`progressTickSec`（默认 `60` 秒：working 进度检查 + 自动 LLM 回合判断冷却；填 `0` 只关闭这两类**间隔驱动**动作，不改变作用域开关）、`progressFallbackSec`（默认 `1200` 秒无新摘要兜底）、进度模板与收工模板分开（`progressTemplate` / `wakeTemplate`）；界面语言 en / 简体中文 / 日本語。普通 ChatGPT `/c/<id>`、z.ai、DeepSeek 的会话级 Auto 不受这个 Project 总许可限制。
 - 进度实发规则：检查点到了之后，仅当 herdr 侧摘要相对上次实发有**新的非空内容**才往网页灌一条；否则满 `progressFallbackSec` 才兜底一条，避免空转刷屏
 - `working`：每 `progressTickSec` **检查**摘要；仅新非空内容或满 `progressFallbackSec` 才往绑定会话灌进度并提交；同一 convKey 只一个定时器，重复 `working` 不丢已有实发基线
 - popup 列表按 **workspace** 展示（含仅终端、无 running agent 的窗格）；标题一行 + 窗格统计一行，不重复项目名、不列 `agent@pane`
 - `settled`：先取消 tick 定时器，再按收工模板唤醒一次
-- 4 个站点继续共用 workspace 绑定、状态观察和 injector 基础能力。Options 的“项目自动”现在是全局自动化许可：ChatGPT Project 用稳定 `project_id` 保存开关；z.ai / DeepSeek 用具体 conversation key 保存开关。z.ai / DeepSeek 的 `自动 开` 只开放 Herdr progress/settled 自动回推，不启用 ChatGPT 专属 stale-view、回合 LLM 判断或自动 rollover。
+- 4 个站点继续共用 workspace 绑定、状态观察和 injector 基础能力。ChatGPT Project 用稳定 `project_id` 保存共享开关；普通 ChatGPT `/c/<id>`、z.ai、DeepSeek 用具体 conversation key 保存独立开关。z.ai / DeepSeek 的 `自动 开` 只开放 Herdr progress/settled 自动回推，不启用 ChatGPT 专属 stale-view、回合 LLM 判断或自动 rollover。
 
-### 全局运行模式与 Project HUD 自动开关
+### Project 共享自动化与单会话 Auto
 
-Options 只配置全局运行模式：
+Options 的总开关**只控制 ChatGPT Project 共享自动化是否可用**：
 
-- **全局手动**：所有会话只允许手动推进，HUD 不显示自动开关；状态观察、binding 和支持站点的手动操作继续存在。
-- **项目自动**：表示“允许当前支持范围使用自动化”，但不会自动开启任何 Project/会话。ChatGPT Project 默认 `自动 关` 并以稳定 `project_id` 保存；z.ai / DeepSeek 也默认关闭，但按当前 conversation 保存。从 0.1.48 起，z.ai / DeepSeek 即使还没有绑定 workspace 也可以先切换并保存会话自动偏好；依赖 workspace 的 progress/settled 自动回推在绑定后生效。
+- **Project 总许可关闭**：ChatGPT Project 不显示/执行共享 Auto，但状态观察、binding 和手动操作继续存在。普通 ChatGPT `/c/<id>`、z.ai、DeepSeek 的会话级 Auto **仍可在自己的 HUD 独立开关**。
+- **Project 总许可开启**：ChatGPT Project 可以显示 `自动 开/关`，并以稳定 `project_id` 在同一 Project 的多个会话和接力后会话间共享；新 Project 仍默认 `自动 关`。
+- **单会话 Auto**：普通 ChatGPT、z.ai、DeepSeek 始终按 conversation key 保存，默认关闭；无需加入 ChatGPT Project，也不依赖 Project 总许可。z.ai / DeepSeek 从 0.1.48 起还可以在绑定 workspace 前先保存该偏好，依赖 workspace 的 progress/settled 回推会在绑定后生效。
 
-在“项目自动”模式下，支持站点底部 HUD 顺序为：**运行状态 → 手动继续 → herdr监控 → LLM 分析 → 手动接力（若当前会话支持）→ 自动 开/自动 关 → 展开**；全局手动不显示自动开关。ChatGPT Project 与已落成 `/c/<chat_id>` 的 z.ai 会话可显示“手动接力”，z.ai 根页 `/` 与 DeepSeek 不显示。展开浮层只保留低频设置：**事件设置、会话绑定、高级选项**。
+支持单会话/Project Auto 的页面底部 HUD 顺序为：**运行状态 → 手动继续 → herdr监控 → LLM 分析 → 手动接力（若当前会话支持）→ 自动 开/自动 关 → 展开**。ChatGPT Project 与已落成 `/c/<chat_id>` 的 z.ai 会话可显示“手动接力”，z.ai 根页 `/` 与 DeepSeek 不显示。展开浮层只保留低频设置：**事件设置、会话绑定、高级选项**。
 
-从 0.1.45 起，当前 Project 实际处于 **`自动 开`** 时，整条底部 HUD 使用浅绿色背景、绿色顶边与轻微绿色阴影作为常驻视觉提示；`自动 关` 或全局手动仍使用中性色。该绿色只表达“自动化已启用”，不会覆盖 `working / blocked / recovering / failed` 等运行状态的橙色或红色告警语义。深色模式使用低亮度绿色表面，避免长期常驻时刺眼。
+从 0.1.45 起，当前 Project 或单会话作用域实际处于 **`自动 开`** 时，整条底部 HUD 使用浅绿色背景、绿色顶边与轻微绿色阴影作为常驻视觉提示；`自动 关` 时仍使用中性色。该绿色只表达“自动化已启用”，不会覆盖 `working / blocked / recovering / failed` 等运行状态的橙色或红色告警语义。深色模式使用低亮度绿色表面，避免长期常驻时刺眼。
 
-四个人工操作在全局手动或当前作用域 `自动 关` 时按能力可用；一旦 `自动 开`，HUD 手动操作全部锁定，避免手动/自动重复推进：
+四个人工操作在当前作用域 `自动 关` 时按能力可用；一旦该 Project/会话 `自动 开`，HUD 手动操作全部锁定，避免手动/自动重复推进：
 
 - **手动继续**：直接向当前网页会话发送一次“继续”请求，不自动点击权限卡。
 - **herdr监控**：先读取当前绑定 workspace 的 Herdr 窗口、pane、Agent 与运行状态，再把状态带回网页会话继续编排。
@@ -90,7 +91,7 @@ Project `自动 开` 是当前 Project 的执行 gate。只有 Options 已选择
 6. 长对话上下文压力达到自动阈值时，在页面静止、无工具/流式输出、无不确定投递、workspace 已绑定且可接力的前提下自动开同一 Project 的新会话并迁移绑定。
 7. 自动处理 ChatGPT 页面内明确的 Allow/允许权限卡；该能力随当前 Project `自动 开` 一起启停，不再有独立开关。浏览器原生权限条仍不会自动点击。
 
-作用域 `自动 关` 会阻止该 Project/会话的新自动 mutation；“全局手动”在更高一层阻止所有自动 mutation。两种情况下 **Herdr/workspace SSE、HUD 状态、会话绑定和实时 workspace catalog 仍持续观察**。从“全局手动”切回“项目自动”不会删除 ChatGPT Project 或 z.ai / DeepSeek conversation 已保存的开关偏好。
+作用域 `自动 关` 会阻止该 Project/会话的新自动 mutation，但 **Herdr/workspace SSE、HUD 状态、会话绑定和实时 workspace catalog 仍持续观察**。Options 里的 Project 总许可只额外阻止 ChatGPT Project 共享自动化；它不会关闭普通 ChatGPT、z.ai、DeepSeek 的单会话 Auto，也不会删除任何已保存的作用域偏好。
 
 `workspace_id` 是绑定身份，`workspace_label` 只是展示缓存。HUD 和后续 wake 会优先用实时 workspace catalog 的 label；如果历史 binding 里同一个 `workspace_id` 保存了旧/错误名称，background 会自动修正持久化 label，避免浮层与底栏显示不同项目名。
 

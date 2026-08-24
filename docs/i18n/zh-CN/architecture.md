@@ -2,6 +2,8 @@
 
 读者：决定能力该放在 MCP 还是 herdr 原生 API 的贡献者。
 
+这是 Contributor / Reference 文档，不是首次安装入口。产品边界和用户路径先看 [总览](overview.md)；Herdr 本体的概念与 API 直接以官方 [Herdr 文档](https://herdr.dev/docs/) 和 [Socket API](https://herdr.dev/docs/socket-api/) 为准。
+
 ## 远程控制面
 
 <section class="diagram" aria-label="架构">
@@ -137,5 +139,5 @@ herdr-mcp 侧（≥0.3.12，exec 降级 ≥0.3.18）能做的：
 - [capability-benchmark.md](./capability-benchmark.md) — 官方 Herdr / 其他 Herdr MCP / coding-tools-mcp 能力吸收与“不吸收”决策
 - [extension.md](./extension.md) — 扩展总览（A 连续工作 + B 本地 JSON→MCP 均已可用）
 - [chatgpt-connector.md](./chatgpt-connector.md) — ChatGPT OAuth、schema、权限卡
-- [extension-wake.md](./extension-wake.md) — 主线 A：workspace 观察 + 全局手动/项目自动模式 + Project 级自动开关 + 进度/收工回推 + 手动继续/监控/LLM 分析 + 独立手动接力 + 超时恢复 / 安全 Project 接力
+- [extension-wake.md](./extension-wake.md) — 主线 A：workspace 观察 + ChatGPT Project 共享自动化 + 普通 ChatGPT/z.ai/DeepSeek 单会话 Auto + 进度/收工回推 + 手动继续/监控/LLM 分析 + 独立手动接力 + 超时恢复 / 安全 Project 接力
 - [extension-bridge.md](./extension-bridge.md) — 主线 B：JSON→MCP（解析有、闭环无）

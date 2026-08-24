@@ -1,4 +1,6 @@
-# CLI reference
+# herdr-mcp CLI reference
+
+This page covers **herdr-mcp** commands only. For the native Herdr CLI, use the upstream [Herdr CLI reference](https://herdr.dev/docs/cli-reference/).
 
 herdr-mcp ships two command surfaces: the `herdr-mcp` bash CLI (macOS, LaunchAgent-oriented) and a small set of Node `bin/` maintenance tools. The npm `bin` is `dist/server.js` — the server itself, not the CLI.
 

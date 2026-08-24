@@ -52,3 +52,10 @@ test("bridge context treats a final JSON object without a tool as unfinished", (
     { role: "assistant", text: '{"status":"still-working"}' },
   ]), true);
 });
+
+test("bridge prompt bootstraps project instructions before read-only analysis", () => {
+  const prompt = CORE.buildSystemPrompt([], "z.ai");
+  assert.match(prompt, /before substantive project work \(including read-only analysis\)/);
+  assert.match(prompt, /AGENTS\.md, CLAUDE\.md, and README\.md/);
+  assert.match(prompt, /Read every one of those files that exists/);
+});

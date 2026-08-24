@@ -1,5 +1,7 @@
 # Automation
 
+Audience: maintainers operating CI/CD, Pages, production Edge deployment, and local runtime release automation. End users do not need this page for first setup.
+
 herdr-mcp has three intentionally separate automation planes. They share source control, but they do not share credentials or failure domains.
 
 ## 1. GitHub Pages

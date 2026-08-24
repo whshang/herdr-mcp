@@ -17,40 +17,40 @@ export const LOCALE_NAMES = { en: "English", "zh-CN": "简体中文" };
 
 // Logical document order — defines prev/next order in every locale.
 export const DOC_ORDER = [
-  "architecture",
+  "overview",
+  "quick-start",
   "install",
-  "agent-install",
   "chatgpt-connector",
-  "worker-fallbacks",
+  "extension",
+  "extension-bridge",
+  "extension-wake",
   "cloudflare-edge-deployment",
   "cloudflare-edge-token",
+  "agent-install",
+  "cli-reference",
+  "architecture",
   "runtime-self-upgrade",
   "automation",
-  "extension",
-  "extension-wake",
-  "extension-bridge",
-  "capability-benchmark",
-  "cli-reference",
   "best-practices",
+  "capability-benchmark",
+  "worker-fallbacks",
   "troubleshooting",
 ];
 
 // Group membership is keyed by logical slug only; labels are translated in UI.
 export const NAV_GROUPS = [
-  { slugs: ["architecture", "install", "agent-install", "chatgpt-connector"] },
-  { slugs: ["worker-fallbacks"] },
-  {
-    slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade", "automation"],
-  },
-  { slugs: ["extension", "extension-wake", "extension-bridge"] },
-  { slugs: ["capability-benchmark", "cli-reference", "best-practices"] },
+  { slugs: ["overview", "quick-start", "install", "chatgpt-connector"] },
+  { slugs: ["extension", "extension-bridge", "extension-wake"] },
+  { slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "agent-install"] },
+  { slugs: ["cli-reference", "architecture", "runtime-self-upgrade"] },
+  { slugs: ["automation", "best-practices", "capability-benchmark", "worker-fallbacks"] },
   { slugs: ["troubleshooting"] },
 ];
 
 // Per-locale navigation group labels, in NAV_GROUPS order.
 export const NAV_GROUP_LABELS = {
-  "zh-CN": ["从这里开始", "ChatGPT 与 Web", "运维与部署", "浏览器扩展", "参考与开发", "帮助"],
-  en: ["Start here", "ChatGPT & Web", "Operations & Deployment", "Browser Extension", "Reference & Development", "Help"],
+  "zh-CN": ["从这里开始", "使用 herdr-mcp", "部署与管理", "参考", "维护与设计", "帮助"],
+  en: ["Start here", "Use herdr-mcp", "Deploy & Admin", "Reference", "Maintainer & Design", "Help"],
 };
 
 // Per-locale user-visible strings. The build fails fast if a label is missing,
@@ -85,10 +85,10 @@ export const UI = {
     indexEyebrow: "文档",
     indexTitle: "远程规划，本机执行。",
     indexLead:
-      "herdr-mcp 是 ChatGPT 或其它网页模型与本地 Herdr 工作站之间的远程控制面。建议从系统边界开始，连接 ChatGPT，再按需选择部署与浏览器工作流。",
-    indexCtaConnect: "连接 ChatGPT",
-    indexCtaArchitecture: "架构",
-    indexCtaDeploy: "部署 Edge",
+      "herdr-mcp 是网页 AI 与本地 Herdr 工作站之间的远程控制面。第一次使用先看总览与快速开始；Herdr 本体的安装、概念、Agent 自动化和 Socket API 直接以 herdr.dev 官方文档为准。",
+    indexCtaConnect: "快速开始",
+    indexCtaArchitecture: "总览",
+    indexCtaDeploy: "连接 ChatGPT",
     indexHome: "首页",
     indexSource: "源码",
     indexFooterAria: "文档索引底部导航",
@@ -130,10 +130,10 @@ export const UI = {
     indexEyebrow: "Documentation",
     indexTitle: "Remote planning, local execution.",
     indexLead:
-      "herdr-mcp is the remote control plane between ChatGPT or another web planner and a local Herdr workstation. Start with the system boundary, connect ChatGPT, then choose the deployment and browser workflows you need.",
-    indexCtaConnect: "Connect ChatGPT",
-    indexCtaArchitecture: "Architecture",
-    indexCtaDeploy: "Deploy the Edge",
+      "herdr-mcp is the remote control plane between web AI and a local Herdr workstation. Start with Overview and Quick start; use the official herdr.dev docs for Herdr installation, concepts, agent automation, and the socket API.",
+    indexCtaConnect: "Quick start",
+    indexCtaArchitecture: "Overview",
+    indexCtaDeploy: "Connect ChatGPT",
     indexHome: "Home",
     indexSource: "Source",
     indexFooterAria: "Documentation index footer",

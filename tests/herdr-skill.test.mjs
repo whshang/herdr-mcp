@@ -27,6 +27,7 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /# herdr-mcp remote planner skill/);
     assert.match(r.content, /Direct workstation operations first/);
     assert.match(r.content, /AGENTS\.md.*CLAUDE\.md.*README\.md/s);
+    assert.match(r.content, /including read-only analysis/);
     assert.match(r.content, /\.agents\/skills\/\*\/SKILL\.md/);
     assert.match(r.content, /\.claude\/skills\/\*\/SKILL\.md/);
     assert.match(r.content, /Prefer project-scoped skills over same-name user-scoped skills/);

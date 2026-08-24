@@ -1,6 +1,8 @@
-# Best practices
+# Remote planner best practices
 
-Workflows that keep the system fast, safe and observable. These are the operating rules the project follows; treat them as defaults, not as the only way to work.
+Audience: people using a web model as the herdr-mcp planner. For automation inside Herdr itself, use the upstream [Agent automation](https://herdr.dev/docs/agent-automation/) guide.
+
+Workflows that keep the remote-planner system fast, safe and observable. These are the operating rules the project follows; treat them as defaults, not as the only way to work.
 
 ## Web plans, local stays cheap
 
@@ -40,7 +42,7 @@ Runtime releases switch behind the persistent Edge/Link: validate the new genera
 1. ChatGPT connects to the Edge MCP endpoint and completes OAuth (see [install](install.md)).
 2. A new conversation starts; the model calls `herdr_inspect` to see the workstation, then `herdr_skill` once.
 3. You ask for a change in a git-managed project: the model reads with `herdr_fs_read` / `herdr_git status`, edits with `herdr_fs_patch`, runs tests with `herdr_exec`, and commits through atomic Git helpers under the managed root.
-4. Bind the web chat to the working workspace in the MV3 extension. Options chooses **Manual globally / Per-Project automation**. In Per-Project mode, explicitly enable the current ChatGPT Project before automatic progress/settled wakes, LLM continuation, timeout recovery or safe rollover can run; z.ai / DeepSeek expose a narrower conversation-scoped switch for automatic progress/settled push-back. When you want an explicit **Manual handoff**, first switch `Auto off`; it is supported for bound ChatGPT Projects and persisted z.ai `/c/<chat_id>` conversations. Extension-to-Herdr traffic stays local and tokenless in the browser: Native Messaging carries it to the host, then mode-`0600` Unix IPC carries it to the runtime. See [extension-wake](extension-wake.md).
+4. Bind the web chat to the working workspace in the MV3 extension. Options gates **ChatGPT Project-shared automation** only: a Project must be explicitly `Auto on` before progress/settled wakes, LLM continuation, timeout recovery or safe rollover can run. Plain ChatGPT `/c/<id>`, z.ai and DeepSeek keep independent conversation-scoped Auto switches; z.ai / DeepSeek use the narrower automatic progress/settled path. When you want an explicit **Manual handoff**, first switch the current scope `Auto off`; it is supported for bound ChatGPT Projects and persisted z.ai `/c/<chat_id>` conversations. Extension-to-Herdr traffic stays local and tokenless in the browser: Native Messaging carries it to the host, then mode-`0600` Unix IPC carries it to the runtime. See [extension-wake](extension-wake.md).
 5. When a worker is down, the model falls back to `dsh --profile headless` through a long `herdr_exec_start` session instead of stalling.
 
 Result: one stable public contract, cheap local compute, and a reverse channel that keeps the web conversation live.

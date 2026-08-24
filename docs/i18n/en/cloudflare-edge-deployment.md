@@ -65,6 +65,8 @@ cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
 
 `wrangler.user.toml` is gitignored, so personal Worker names, workstation IDs, or OAuth issuers are never accidentally committed.
 
+Generate the Worker name instead of copying a raw machine hostname: `node scripts/cloudflare-worker-name.mjs "$(hostname)"`. With `workers.dev` enabled, the Worker name is one DNS label: no dots or underscores, at most 63 characters, and no leading/trailing dash. A Custom Domain is separate and may contain dots.
+
 Keep the Worker config as:
 
 ```toml

@@ -26,7 +26,7 @@ import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 
-const H2W_SCRIPT_VERSION = "0.1.50";
+const H2W_SCRIPT_VERSION = "0.1.51";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -275,7 +275,10 @@ function automationScopeForConversation(convKey) {
   const projectMode = globalMode === AUTOMATION_MODE_PROJECT;
   const projectAutomationAvailable = projectMode && Boolean(projectId);
   const projectEnabled = projectAutomationAvailable && PROJECT_AUTOMATION[projectId] === true;
-  const conversationAutomationAvailable = projectMode && !projectId && isConversationAutomationConversation(convKey);
+  // Conversation-scoped automation is independent from the global ChatGPT
+  // Project gate. Plain ChatGPT /c/<id>, z.ai and DeepSeek can always opt in
+  // from their own HUD. The global mode only gates Project-shared automation.
+  const conversationAutomationAvailable = !projectId && isConversationAutomationConversation(convKey);
   const conversationEnabled = conversationAutomationAvailable && CONVERSATION_AUTOMATION[convKey] === true;
   const enabled = projectId ? projectEnabled : conversationEnabled;
   return {

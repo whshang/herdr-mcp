@@ -34,7 +34,7 @@
 - 满底线后：指纹有变 → `new_output`；否则 → `fallback`
 - 实发基线写进绑定（`lastProgressSentAt` / `lastProgressOutput`），Service Worker 被杀后仍去重
 
-默认值：`progressTickSec = 60`（进度检查 + 自动 LLM 判断冷却；填 `0` = 关闭这两项）；`progressFallbackSec = 1200`（20 分钟兜底；填 `0` = 只在有新摘要时发）。Options 选择**全局手动 / 项目自动**：全局手动时 Project HUD 不显示自动开关并阻止自动 mutation；项目自动时显示 Project 开关，但新 Project 默认 `自动 关`。均在 options 页可改。界面语言：en / 简体中文 / 日本語（首次跟系统，可选手动）。
+默认值：`progressTickSec = 60`（进度检查 + 自动 LLM 判断冷却；填 `0` = 关闭这两项）；`progressFallbackSec = 1200`（20 分钟兜底；填 `0` = 只在有新摘要时发）。Options 的总开关只控制 **ChatGPT Project 共享自动化**：关闭时 Project 不执行共享自动 mutation；普通 ChatGPT `/c/<id>`、z.ai、DeepSeek 的单会话 Auto 仍可在各自 HUD 独立启用。新 Project/新会话都默认 `自动 关`。界面语言：en / 简体中文 / 日本語（首次跟系统，可选手动）。
 
 ## 安装与绑定
 
@@ -56,7 +56,7 @@
 3. 回复落在「不发送关键词」→ 不催；否则若判定为继续 → **把小模型原文**灌进对话框并提交（提示词 / 不发送词在 Options 预填可见默认文案）
 4. **不再使用**零工具 / 半途启发式；未配置小模型则本回合不催
 5. 用户气泡若是上次催促句，**仍会**对助手新回复做判定（0.1.20 起）；自动判断冷却与进度检查共用 `progressTickSec`，`0` 关闭自动 LLM 判断（默认 60s），不影响手动 **LLM 分析**
-6. 支持站点页底部 HUD：运行状态、**手动继续 / herdr监控 / LLM 分析 / 手动接力**、可选的 **自动 开|关**、展开。Options 允许自动化时，ChatGPT Project 按 `project_id` 显示 Project 级开关，z.ai / DeepSeek 按具体 conversation 显示会话级开关；全局手动时不显示自动开关。`手动接力` 支持已绑定 ChatGPT Project 和已落成 `/c/<chat_id>` 的 z.ai 会话；`自动 开` 时四个 HUD 手动操作全部锁定。高频动作都在底栏，展开浮层只放事件设置、会话绑定和高级选项。文案跟 Options 语言（en / 简中 / 日语）
+6. 支持站点页底部 HUD：运行状态、**手动继续 / herdr监控 / LLM 分析 / 手动接力**、可选的 **自动 开|关**、展开。ChatGPT Project 只有在 Options 允许 Project 自动化时才显示按 `project_id` 共享的开关；普通 ChatGPT `/c/<id>`、z.ai / DeepSeek 始终可以按具体 conversation 显示会话级开关。`手动接力` 支持已绑定 ChatGPT Project 和已落成 `/c/<chat_id>` 的 z.ai 会话；当前作用域 `自动 开` 时四个 HUD 手动操作全部锁定。高频动作都在底栏，展开浮层只放事件设置、会话绑定和高级选项。文案跟 Options 语言（en / 简中 / 日语）
 7. herdr working/settled 唤醒仍独立存在
 
 密钥只存本机，仓库默认留空。
@@ -98,7 +98,7 @@ Project `自动 开` 时，人工发送和扩展自动发送的用户消息都�
 
 ## ChatGPT 权限卡
 
-内容脚本会持续观察 chatgpt.com 的页面内权限卡，但只有 **Options 勾选“启用项目自动” + 当前 Project `自动 开`** 时才会点击明确的「允许」动作；权限卡自动处理已并入 Project 自动化，不再有独立开关。全局手动或 Project `自动 关` 时停止自动点击。浏览器原生权限条不在可点击范围。见 [chatgpt-connector.md](./chatgpt-connector.md)。
+内容脚本会持续观察 chatgpt.com 的页面内权限卡，但只有 **Options 勾选“启用 ChatGPT 项目自动化” + 当前 Project `自动 开`** 时才会点击明确的「允许」动作；权限卡自动处理已并入 Project 自动化，不再有独立开关。关闭 Project 总许可或当前 Project `自动 关` 时停止自动点击。浏览器原生权限条不在可点击范围。见 [chatgpt-connector.md](./chatgpt-connector.md)。
 
 ## 测试
 

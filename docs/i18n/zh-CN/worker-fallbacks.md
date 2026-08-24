@@ -1,5 +1,7 @@
 # Worker 备选
 
+读者：为 remote planner 选择本地执行 worker 的 Maintainer。Herdr 本体的 Agent 概念与自动化原语请直接看官方 [Agents](https://herdr.dev/docs/agents/) 和 [Agent automation](https://herdr.dev/docs/agent-automation/)，不要把本页当作通用 Herdr Agent 教程。
+
 herdr-mcp 始终把网页模型当作 planner。本地 agent CLI 是执行 worker，不是第二层编排。
 
 ## 推荐顺序

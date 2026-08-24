@@ -2,6 +2,8 @@
 
 读者：给 ChatGPT 接 herdr-mcp 的人，以及改 OAuth / Streamable HTTP 的代理。
 
+如果只是想把 ChatGPT 接通，第一次只需要看 **公网 URL → OAuth → 验收**；MCP UA、schema 和代理实现细节属于参考内容，可以后读。如果本机 runtime / Edge 还没跑起来，先看 [快速开始](quick-start.md)。
+
 相关入口：[README.md](../../../README.md)、`src/oauth.ts`、`src/server.ts`。
 
 ## 「已连接」到底指什么
@@ -146,7 +148,7 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 
 Connector 只解决「ChatGPT → herdr」。若工具很快返回「已提交」，而 agent 仍在窗格里跑，网页对话常不再自动 `herdr_since` / 继续。
 
-闭环要靠浏览器扩展：绑定该 chatgpt 会话 ↔ 干活的 workspace。只有 Options 允许项目自动且当前 Project `自动 开` 时，才会在 agent **working** 期间回推进度、**settled** 时自动继续，并启用 LLM 判断、回复超时恢复和安全接力。全局手动或 Project `自动 关` 时仍观察状态，改用 HUD 的手动继续 / herdr监控 / LLM 分析。**手动接力必须先切到 `自动 关`**，避免显式换会话与自动连续工作并发竞争。见 [extension-wake.md](./extension-wake.md)。
+闭环要靠浏览器扩展：绑定该 chatgpt 会话 ↔ 干活的 workspace。对于 ChatGPT Project，只有 Options 允许项目自动且当前 Project `自动 开` 时，才会在 agent **working** 期间回推进度、**settled** 时自动继续，并启用 LLM 判断、回复超时恢复和安全接力。关闭 Project 总许可或当前 Project `自动 关` 时仍观察状态，改用 HUD 的手动继续 / herdr监控 / LLM 分析。普通 ChatGPT `/c/<id>` 使用独立的单会话 Auto，不要求 Project 总许可。**手动接力必须先把当前作用域切到 `自动 关`**，避免显式换会话与自动连续工作并发竞争。见 [extension-wake.md](./extension-wake.md)。
 
 未绑定扩展时，这不是 MCP 故障，是缺回推环。
 

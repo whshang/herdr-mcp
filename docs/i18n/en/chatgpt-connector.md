@@ -2,6 +2,8 @@
 
 Audience: people wiring herdr-mcp to ChatGPT, and proxies changing OAuth / Streamable HTTP.
 
+If you only want to connect ChatGPT, read **Public URL → OAuth → Validation** and skip the transport/schema internals on the first pass. Start with [Quick start](quick-start.md) if the local runtime/Edge is not running yet.
+
 Related entry points: [README.md](../../../README.md), `src/oauth.ts`, `src/server.ts`.
 
 ## What "connected" actually means
@@ -145,7 +147,7 @@ The web model continues scheduling itself with `herdr_since` / `herdr_inspect`; 
 
 The Connector only solves "ChatGPT → herdr". If a tool quickly returns "submitted" while the agent keeps running in its pane, the web conversation usually no longer auto-calls `herdr_since` / continues on its own.
 
-Closing the loop requires the browser extension: bind that chatgpt session ↔ the working workspace. Options must allow Per-Project automation and the current Project must be `Auto on` before progress, **settled** continuation, LLM decisions, reply recovery and safe rollover run automatically. In Manual globally mode or with that Project off, observation stays live and Manual continue / Herdr monitor / LLM analysis take over. **Manual handoff requires `Auto off`**; this avoids racing an explicit rollover against automatic continuity. See [extension-wake.md](./extension-wake.md).
+Closing the loop requires the browser extension: bind that chatgpt session ↔ the working workspace. For a ChatGPT Project, Options must allow Project automation and the current Project must be `Auto on` before progress, **settled** continuation, LLM decisions, reply recovery and safe rollover run automatically. With the Project gate or that Project off, observation stays live and Manual continue / Herdr monitor / LLM analysis take over. Plain ChatGPT `/c/<id>` has its own conversation-scoped Auto and does not require the Project gate. **Manual handoff requires the current scope `Auto off`**; this avoids racing an explicit rollover against automatic continuity. See [extension-wake.md](./extension-wake.md).
 
 Without a bound extension, this is not an MCP fault; the push-back loop is missing.
 

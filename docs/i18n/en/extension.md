@@ -5,7 +5,7 @@ Language: product UI is en / Simplified Chinese / Japanese (same as herdr); this
 
 | Track | Problem | Direction | Status | First sites |
 |---|---|---|---|---|
-| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + automation gates + safe handoff | **usable** (0.1.50 series) | binding/observation: 4 sites; full automation: ChatGPT Project; conversation progress automation: z.ai / DeepSeek; Manual handoff: ChatGPT Project + z.ai `/c/<chat_id>` |
+| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + automation gates + safe handoff | **usable** (0.1.51 series) | binding/observation: 4 sites; shared automation: ChatGPT Project; conversation-scoped automation: plain ChatGPT / z.ai / DeepSeek; Manual handoff: ChatGPT Project + z.ai `/c/<chat_id>` |
 | **B. JSON→MCP** | DeepSeek / z.ai web has no MCP Connector | web → extension service worker → Native Messaging host → trusted local `/mcp` IPC | **usable** (bounded `tools/list` / `tools/call` loop) | `chat.deepseek.com`, `chat.z.ai` |
 
 Shared: same extension, same Native Messaging + local Unix IPC transport, same options.
@@ -53,18 +53,22 @@ This track does not make the extension think on behalf of the web model. It solv
 
 ### Implemented (track A periodic progress announcements)
 
-- Options: global run mode is **Manual globally / Per-Project automation**; `progressTickSec` (default `60` seconds: working progress checks + turn-nudge cooldown; `0` disables only those interval-driven actions), `progressFallbackSec` (default `1200` seconds fallback with no new summary), separate progress and done templates (`progressTemplate` / `wakeTemplate`); UI languages en / Simplified Chinese / Japanese
+- Options gates only **ChatGPT Project automation** globally; `progressTickSec` (default `60` seconds: working progress checks + turn-nudge cooldown; `0` disables only those interval-driven actions), `progressFallbackSec` (default `1200` seconds fallback with no new summary), separate progress and done templates (`progressTemplate` / `wakeTemplate`); UI languages en / Simplified Chinese / Japanese. Plain ChatGPT `/c/<id>`, z.ai, and DeepSeek conversation-scoped Auto remain available independently of that Project gate.
 - actual send rule: at a checkpoint, only push to the web when the herdr summary has **new non-empty content** since the last actual send; otherwise wait until `progressFallbackSec` and send one fallback, avoiding empty-spin spam
 - `working`: check the summary every `progressTickSec`; push progress into the bound conversation and submit only on new non-empty content or when `progressFallbackSec` is reached; one timer per convKey; repeated `working` does not lose the last-sent baseline
 - popup lists by **workspace** (incl. panes with terminal only, no running agent); one title line + one pane-stats line, no repeated project names, no `agent@pane` listing
 - `settled`: cancel the tick timer first, then wake once with the done template
-- all four sites retain workspace binding, state observation and injector foundations. The global Per-Project automation option is now an automation permission gate: ChatGPT Project settings are keyed by stable `project_id`, while z.ai / DeepSeek settings are keyed by the current conversation. z.ai / DeepSeek `Auto on` enables only Herdr progress/settled push-back; ChatGPT-only stale-view recovery, turn LLM decisions and automatic rollover remain Project-scoped.
+- all four sites retain workspace binding, state observation and injector foundations. ChatGPT Project settings are keyed by stable `project_id`; plain ChatGPT `/c/<id>`, z.ai, and DeepSeek use the current conversation key. z.ai / DeepSeek `Auto on` enables only Herdr progress/settled push-back; ChatGPT-only stale-view recovery, turn LLM decisions and automatic rollover remain ChatGPT-scoped.
 
-### Global run mode and Project HUD automation
+### Project-shared automation and conversation Auto
 
-Options owns the global policy. **Manual globally** disables automatic mutations everywhere and hides the automation switch; observation, bindings and supported manual controls remain. **Per-Project automation** permits supported scopes to expose automation without enabling any of them by default: ChatGPT Projects store the switch by `project_id`; z.ai / DeepSeek store it per conversation. Since 0.1.48, z.ai / DeepSeek can save that conversation preference before a workspace is bound; workspace-dependent progress/settled push-back starts after binding exists.
+The Options master switch gates **ChatGPT Project-shared automation only**:
 
-In Per-Project mode, supported sites keep frequent actions on the bottom HUD: **Manual continue / Herdr monitor / LLM analysis / Manual handoff (when supported) / Automation on-off / expand**. Global manual mode hides the automation switch. ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations can show Manual handoff; the z.ai `/` launcher and DeepSeek do not. The drawer only contains low-frequency settings: event timing, conversation bindings, and advanced options.
+- With the Project gate off, ChatGPT Projects do not expose/execute shared Auto, but observation, bindings, and manual controls remain. Plain ChatGPT `/c/<id>`, z.ai, and DeepSeek still expose their own conversation-scoped Auto switch.
+- With the Project gate on, a ChatGPT Project can turn Auto on/off and shares that preference by stable `project_id` across sibling and rollover conversations. A new Project still defaults off.
+- Plain ChatGPT, z.ai, and DeepSeek always store Auto by conversation key, default off, and do not need to belong to a ChatGPT Project. Since 0.1.48, z.ai / DeepSeek may save the preference before binding a workspace; workspace-dependent progress/settled push-back starts after binding exists.
+
+Supported scopes keep frequent actions on the bottom HUD: **Manual continue / Herdr monitor / LLM analysis / Manual handoff (when supported) / Automation on-off / expand**. ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations can show Manual handoff; the z.ai `/` launcher and DeepSeek do not. The drawer only contains low-frequency settings: event timing, conversation bindings, and advanced options.
 
 Starting with 0.1.45, an effectively **`Auto on`** Project gives the entire persistent bottom HUD a restrained light-green surface, green top border, and soft green shadow. `Auto off` and global manual mode keep the neutral treatment. This color is only an automation-state cue: orange/red runtime states such as `working`, `blocked`, `recovering`, and `failed` keep their own semantic colors. Dark mode uses a corresponding low-glare green surface.
 
@@ -76,7 +80,7 @@ Starting with 0.1.45, an effectively **`Auto on`** Project gives the entire pers
 - same-Project fail-closed rollover after recovery exhaustion or high context pressure
 - in-page ChatGPT permission-card handling as part of the current Project automation state; there is no separate permission-card toggle
 
-**Automation off** keeps observation active but stops automatic mutations for that Project/conversation. Manual globally applies the same stop at the global layer without deleting saved ChatGPT Project or z.ai / DeepSeek conversation preferences; switching back restores them. Manual HUD actions are available only while their scope is `Auto off`.
+**Automation off** keeps observation active but stops automatic mutations for that Project/conversation. The Options Project gate adds that stop only to ChatGPT Project-shared automation; it does not disable plain ChatGPT, z.ai, or DeepSeek conversation Auto and does not delete any saved scope preference. Manual HUD actions are available only while their current scope is `Auto off`.
 
 **Manual handoff** supports bound ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations, but the current scope must first be switched to `Auto off`. The HUD locks the button while automation is on, and background independently rejects `automation_enabled` if the UI is bypassed. The same fail-closed state machine asks the current web model for a marked transfer packet, opens a fresh target conversation, seeds it, and moves workspace bindings only after a new conversation id and seed marker are confirmed. z.ai summary/seed control messages use the raw send path so the JSON bridge cannot rewrite them into agent tasks. A bound workspace that is still `working` blocks the operation.
 

@@ -1,5 +1,7 @@
 # 能力对标
 
+读者：做架构取舍和 ADR 决策的 Maintainer / Contributor。本页不是安装教程，也不是普通用户日常使用指南。
+
 > 目的：记录 herdr-mcp 对官方 Herdr、其他 Herdr MCP 实现与 coding-tools-mcp 的能力取舍，避免重复调研、盲目抄功能或扩大工具面。
 
 ## 设计原则

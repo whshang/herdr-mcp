@@ -481,10 +481,10 @@ console.log("\n[json bridge automation]");
   const manualHudP = new Promise((r) => { resolveManualHud = r; });
   onMsg({ type: "h2w_page_hud", convKey: ZAI_CONV }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveManualHud(r));
   const manualHud = await manualHudP;
-  ok(manualHud?.conversation_automation_available === false && manualHud?.enabled === false,
-    "global manual mode hides/disables z.ai conversation automation without deleting its preference", JSON.stringify(manualHud));
+  ok(manualHud?.conversation_automation_available === true && manualHud?.enabled === true,
+    "global Project-manual mode does not disable z.ai conversation automation", JSON.stringify(manualHud));
   ok(storage.herdrConversationAutomation?.[ZAI_CONV] === true,
-    "global manual mode preserves the saved z.ai conversation preference");
+    "z.ai conversation automation remains independently persisted");
 
   let resolveProjectMode;
   const projectModeP = new Promise((r) => { resolveProjectMode = r; });
@@ -495,7 +495,7 @@ console.log("\n[json bridge automation]");
   onMsg({ type: "h2w_page_hud", convKey: ZAI_CONV }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveRestoredHud(r));
   const restoredHud = await restoredHudP;
   ok(restoredHud?.conversation_automation_available === true && restoredHud?.enabled === true,
-    "returning to automation mode restores the saved z.ai conversation preference", JSON.stringify(restoredHud));
+    "enabling Project automation leaves z.ai conversation automation unchanged", JSON.stringify(restoredHud));
 
   let resolveCatalog;
   const catalogP = new Promise((r) => { resolveCatalog = r; });

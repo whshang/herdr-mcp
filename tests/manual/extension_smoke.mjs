@@ -59,9 +59,9 @@ const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
-ok(manifest.version === "0.1.50", "manifest version includes z.ai bridge continuity recovery");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.50"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.50"'), "content version matches manifest");
+ok(manifest.version === "0.1.51", "manifest version includes independent conversation automation");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.51"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.51"'), "content version matches manifest");
 ok(
   backgroundSource.includes('from "./local-auth.js"')
     && localAuthSource.includes("sendNativeMessage")
@@ -366,13 +366,14 @@ ok(
     && zhLocale.hud_automation_off_hint.includes("同一 Project"),
   "zh Auto-off tooltip explains Project scope and manual availability",
 );
-ok(zhLocale.label_automation_mode === "启用自动化"
-    && zhLocale.hint_automation_mode.includes("底部状态条")
-    && zhLocale.hint_automation_mode.includes("默认关闭")
+ok(zhLocale.label_automation_mode === "启用 ChatGPT 项目自动化"
+    && zhLocale.hint_automation_mode.includes("只控制 ChatGPT 项目共享自动化")
+    && zhLocale.hint_automation_mode.includes("普通 ChatGPT")
+    && zhLocale.hint_automation_mode.includes("即使这里关闭也能单独启用")
     && zhLocale.hint_automation_mode.includes("权限卡")
     && zhLocale.hint_automation_mode.includes("z.ai")
     && zhLocale.hint_automation_mode.includes("DeepSeek"),
-  "zh automation checkbox explains the global gate and supported HUD scopes");
+  "zh automation checkbox explains the Project-only gate and independent conversation scopes");
 for (const obsolete of ["hud_wake_on", "hud_wake_off", "hud_nudge_on", "hud_nudge_off", "hud_llm", "hud_llm_off"]) {
   ok(!(obsolete in zhLocale), `obsolete HUD locale key removed: ${obsolete}`);
 }

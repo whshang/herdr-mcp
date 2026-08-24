@@ -66,6 +66,8 @@ cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
 `wrangler.user.toml` 已被忽略，不会误提交个人 Worker 名、workstation ID 或
 OAuth issuer。
 
+Worker name 不要直接复制机器 `hostname`，统一用 `node scripts/cloudflare-worker-name.mjs "$(hostname)"` 生成。启用 `workers.dev` 时，Worker name 是单个 DNS label：不能含点或下划线、最长 63 字符、不能以 `-` 开头/结尾。Custom Domain 是另一类对象，可以包含点。
+
 Worker 配置保持：
 
 ```toml

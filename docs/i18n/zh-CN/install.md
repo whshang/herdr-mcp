@@ -2,6 +2,8 @@
 
 让 ChatGPT（或其它网页模型）通过 herdr-mcp 与本地 Herdr 工作站打通。官方推荐的顺序：先安装并启动本地 MCP 服务器，再部署 Cloudflare Edge，最后连接 ChatGPT —— ChatGPT 实际访问的是 Edge，所以**先部署 Edge，再创建 Connector**。
 
+如果还不熟悉 Herdr 本体，请先按官方 [Herdr 安装](https://herdr.dev/zh-cn/docs/install/)、[快速开始](https://herdr.dev/zh-cn/docs/quick-start/) 和 [核心概念](https://herdr.dev/zh-cn/docs/concepts/) 上手。本页从 herdr-mcp 的 Web/远程层开始；最短路径见 [总览](overview.md) 与 [快速开始](quick-start.md)。
+
 完整的系统边界见 [架构](architecture.md)，Connector 契约详见 [连接 ChatGPT](chatgpt-connector.md)。
 
 ## 前置条件
@@ -47,12 +49,19 @@ herdr-mcp watchdog install   # 每 120s 若 MCP 掉线自动重启
 
 默认方案不需要自有域名——Worker 运行在你账号的 `workers.dev` 主机名下：
 
+先生成合法的 Worker name，再写入 Wrangler 配置。**这里说的是 Worker name，不是 Custom Domain**：启用 `workers.dev` 时它是一个 DNS label，只能包含字母、数字和 `-`，不能含 `.` / `_`，最长 63 字符，且不能以 `-` 开头或结尾。不要直接把 `hostname`（例如 `MacBook.local`）当作 Worker name。
+
 ```bash
+WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
+printf '%s\n' "$WORKER_NAME"   # 例如 herdr-edge-macbook-local；绝不会包含点
+
 cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
-# 编辑 worker name、workstation id 与 OAUTH_ISSUER（填你的 workers.dev 源站）
+# 将 name 设置为 $WORKER_NAME；再填写 workstation id 与 OAUTH_ISSUER。
 cd edge/cloudflare
 npx wrangler deploy --config wrangler.user.toml
 ```
+
+Custom Domain（例如 `herdr.example.com`）当然包含 `.`；上面的无点规则只适用于 `workers.dev` URL 中的 Worker name 这一段。
 
 得到一个稳定源站，例如：
 

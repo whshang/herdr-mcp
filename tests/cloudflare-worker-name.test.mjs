@@ -29,3 +29,12 @@ test("non-ASCII or all-special slugs use deterministic hash fallback", () => {
   assert.match(cloudflareMachineSlug("中文主机名"), /^host-[0-9a-f]{10}$/);
   assert.match(cloudflareMachineSlug("...___..."), /^host-[0-9a-f]{10}$/);
 });
+
+test("workers.dev Worker names are always one DNS label with no dots", () => {
+  for (const input of ["host.local", "a.b.c", "host_name.example", ".leading.trailing."]) {
+    const name = cloudflareWorkerName(input);
+    assert.doesNotMatch(name, /[._]/);
+    assert.match(name, /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/);
+    assert.ok(name.length <= CLOUDFLARE_WORKER_NAME_MAX);
+  }
+});

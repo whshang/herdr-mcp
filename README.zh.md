@@ -114,11 +114,15 @@ node dist/server.js
 默认路径**不要求自有域名**。先把 Edge 部署到 Cloudflare 自动提供的 `workers.dev`：
 
 ```bash
+WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
+printf '%s\n' "$WORKER_NAME"   # DNS label 安全：无点/下划线，且 <=63 字符
 cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
-# 修改 Worker 名、workstation ID，以及 workers.dev 对应的 OAUTH_ISSUER
+# 将 name 设为 $WORKER_NAME，再填写 workstation ID 与 OAUTH_ISSUER
 cd edge/cloudflare
 npx wrangler deploy --config wrangler.user.toml
 ```
+
+启用 `workers.dev` 时，**Worker name** 是一个 DNS label，因此不能包含 `.`；`herdr.example.com` 这种 Custom Domain 是另一类对象，当然可以包含点。
 
 部署后使用类似下面的稳定地址：
 
