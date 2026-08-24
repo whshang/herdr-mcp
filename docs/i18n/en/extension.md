@@ -5,7 +5,7 @@ Language: product UI is en / Simplified Chinese / Japanese (same as herdr); this
 
 | Track | Problem | Direction | Status | First sites |
 |---|---|---|---|---|
-| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + ChatGPT Project automation/freshness recovery/rollover | **usable** (0.1.44 series; global run mode + Project automation switch) | binding/observation: 4 sites; automation/recovery/rollover: ChatGPT Project |
+| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + ChatGPT Project automation/freshness recovery/rollover | **usable** (0.1.45 series; global run mode + Project automation switch) | binding/observation: 4 sites; automation/recovery/rollover: ChatGPT Project |
 | **B. JSON→MCP** | DeepSeek / z.ai web has no MCP Connector | web → local `127.0.0.1:8772/mcp` | **incomplete** (can extract JSON, MCP not called) | `chat.deepseek.com`, `chat.z.ai` |
 
 Shared: same extension, same static token, same options.  
@@ -65,6 +65,8 @@ This track does not make the extension think on behalf of the web model. It solv
 Options owns the global policy. **Manual globally** disables automatic mutations everywhere and hides the automation switch from ChatGPT Project HUDs; the three manual actions remain available. **Per-Project automation** only permits Projects to use automation: every new ChatGPT Project still defaults to off and must be explicitly enabled from that Project's HUD.
 
 In Per-Project mode, the bottom HUD bar owns frequent actions: **Manual continue / Herdr monitor / LLM analysis / Automation on-off / expand**. In Manual globally mode, the automation switch is absent. The drawer only contains low-frequency settings: event timing, conversation bindings, and advanced options.
+
+Starting with 0.1.45, an effectively **`Auto on`** Project gives the entire persistent bottom HUD a restrained light-green surface, green top border, and soft green shadow. `Auto off` and global manual mode keep the neutral treatment. This color is only an automation-state cue: orange/red runtime states such as `working`, `blocked`, `recovering`, and `failed` keep their own semantic colors. Dark mode uses a corresponding low-glare green surface.
 
 **Automation on** is scoped to the current stable ChatGPT `project_id`. All conversations in that Project, including a fresh conversation created by rollover, share the same setting. It enables:
 

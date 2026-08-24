@@ -17,7 +17,7 @@ Verify the extension is loaded, **per-Project automation** is enabled in Options
 
 ## The HUD is bound to w68 but the bottom bar shows another project name
 
-Treat `workspace_id` as identity; the label is display cache only. The current extension prefers the live `/push/events` / `/push/state` workspace catalog over a stale binding label and repairs the persisted binding automatically. If the drawer already shows the correct `herdr-mcp (w68)` while the bar still shows an older project name, make sure the current 0.1.44 extension is loaded and refresh the page; do not unbind/rebind merely to repair a label for the same workspace id.
+Treat `workspace_id` as identity; the label is display cache only. The current extension prefers the live `/push/events` / `/push/state` workspace catalog over a stale binding label and repairs the persisted binding automatically. If the drawer already shows the correct `herdr-mcp (w68)` while the bar still shows an older project name, make sure the current 0.1.45 extension is loaded and refresh the page; do not unbind/rebind merely to repair a label for the same workspace id.
 
 ## ChatGPT replies halfway and then the page appears frozen or stale
 

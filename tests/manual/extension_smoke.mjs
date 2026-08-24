@@ -54,9 +54,15 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.44", "manifest version includes stale-view recovery");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.44"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.44"'), "content version matches manifest");
+ok(manifest.version === "0.1.45", "manifest version includes automation-on HUD emphasis");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.45"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.45"'), "content version matches manifest");
+ok(
+  wakeSource.includes(".bar.automation-on")
+    && wakeSource.includes('enabled ? " automation-on" : ""')
+    && wakeSource.includes("rgba(236,253,245,.97)"),
+  "automation-on state emphasizes the whole bottom HUD with a light-green treatment",
+);
 ok(
   manifest.content_scripts.find((cs) => cs.matches?.includes("https://chatgpt.com/*"))?.js?.includes("context-pressure.js"),
   "ChatGPT loads the classic context-pressure policy before wake.js",

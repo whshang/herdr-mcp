@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.44";
+const H2W_CONTENT_VERSION = "0.1.45";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -1507,6 +1507,26 @@ const H2W_CONTENT_VERSION = "0.1.44";
           box-shadow: 0 -1px 8px rgba(0,0,0,.04);
           pointer-events: auto; user-select: none;
           backdrop-filter: blur(10px);
+          transition: background-color .18s ease, border-color .18s ease, box-shadow .18s ease, color .18s ease;
+        }
+        .bar.automation-on {
+          color: #244c35;
+          background: rgba(236,253,245,.97);
+          border-top-color: #86d9a5;
+          box-shadow: 0 -2px 12px rgba(22,101,52,.10);
+        }
+        .bar.automation-on .workspace { color: #527361; }
+        .bar.automation-on .quick,
+        .bar.automation-on .manual,
+        .bar.automation-on .expand {
+          background: rgba(255,255,255,.72);
+          border-color: #a9dfbb;
+        }
+        .bar.automation-on .quick.on {
+          color: #14532d;
+          background: #dcfce7;
+          border-color: #6fcf8e;
+          font-weight: 650;
         }
         button, input { font: inherit; }
         button { color: inherit; }
@@ -1569,6 +1589,17 @@ const H2W_CONTENT_VERSION = "0.1.44";
         .toast.err { background: #fef2f2; color: #b42318; }
         @media (prefers-color-scheme: dark) {
           .bar { color: #ddd; background: rgba(32,32,32,.96); border-color: #3a3a3a; }
+          .bar.automation-on {
+            color: #d9fbe5;
+            background: rgba(25,57,38,.97);
+            border-color: #397b52;
+            box-shadow: 0 -2px 12px rgba(34,197,94,.12);
+          }
+          .bar.automation-on .workspace { color: #a6d5b7; }
+          .bar.automation-on .quick,
+          .bar.automation-on .manual,
+          .bar.automation-on .expand { background: #23452f; border-color: #477b59; }
+          .bar.automation-on .quick.on { color: #bbf7d0; background: #1d5130; border-color: #5aa773; }
           .workspace { color: #8d8d8d; }
           .quick, .manual, .expand { background: #292929; border-color: #454545; }
           .quick.on { color: #86efac; background: #143020; border-color: #245c36; }
@@ -1761,7 +1792,7 @@ const H2W_CONTENT_VERSION = "0.1.44";
     }
     renderHudWorkspaceBindings();
     const visual = hudVisualClass(state);
-    ui.bar.className = `bar${visual ? ` ${visual}` : ""}`;
+    ui.bar.className = `bar${enabled ? " automation-on" : ""}${visual ? ` ${visual}` : ""}`;
   }
 
   function shadowActiveElement(host) {

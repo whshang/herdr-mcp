@@ -17,7 +17,7 @@
 
 ## HUD 绑定的是 w68，但底栏显示了另一个项目名
 
-以 `workspace_id` 为身份事实，label 只是展示缓存。当前扩展会用实时 `/push/events` / `/push/state` workspace catalog 覆盖历史 binding 里的陈旧 label，并自动修复持久化记录。若浮层已显示正确的 `herdr-mcp (w68)` 而底栏仍显示旧项目名，先确认已经加载当前 0.1.44 扩展并刷新页面；不要通过解绑/重绑来“修”同一个 workspace id。
+以 `workspace_id` 为身份事实，label 只是展示缓存。当前扩展会用实时 `/push/events` / `/push/state` workspace catalog 覆盖历史 binding 里的陈旧 label，并自动修复持久化记录。若浮层已显示正确的 `herdr-mcp (w68)` 而底栏仍显示旧项目名，先确认已经加载当前 0.1.45 扩展并刷新页面；不要通过解绑/重绑来“修”同一个 workspace id。
 
 ## ChatGPT 回复了一半就停住，页面像缓存了旧状态
 
