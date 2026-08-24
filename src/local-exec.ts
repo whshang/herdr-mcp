@@ -42,8 +42,6 @@ export async function runLocalShell(opts: {
   const body = [
     `#!${shell}`,
     "set +e",
-    // When parent SIGTERMs this shell, kill the whole process group (incl. sleep children).
-    "trap 'kill 0 2>/dev/null; exit 124' TERM INT",
     `cd -- ${shq(opts.cwd)} || exit 127`,
     opts.command,
   ].join("\n") + "\n";
@@ -70,15 +68,28 @@ export async function runLocalShell(opts: {
       cwd: opts.cwd,
       env: enrichedUserEnv(process.env),
       stdio: ["ignore", "pipe", "pipe"],
+      // POSIX: make the shell the leader of its own process group so timeout
+      // cleanup can kill only this command tree. Never use `kill 0` from a
+      // non-detached child: it can signal the parent and unrelated siblings.
+      detached: process.platform !== "win32",
     });
     let timedOut = false;
     let exitCode: number | null = null;
     let signal: string | null = null;
+    const killCommandTree = (sig: NodeJS.Signals) => {
+      if (proc.pid && process.platform !== "win32") {
+        try {
+          process.kill(-proc.pid, sig);
+          return;
+        } catch { /* child may already have exited */ }
+      }
+      try { proc.kill(sig); } catch { /* ignore */ }
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      try { proc.kill("SIGTERM"); } catch { /* ignore */ }
+      killCommandTree("SIGTERM");
       setTimeout(() => {
-        try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+        killCommandTree("SIGKILL");
       }, 800);
     }, Math.max(1, opts.timeoutMs));
 

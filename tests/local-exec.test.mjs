@@ -26,12 +26,14 @@ test("runLocalShell captures non-zero exit", async () => {
 });
 
 test("runLocalShell times out long sleep", async () => {
+  const startedAt = Date.now();
   const r = await runLocalShell({
     command: "sleep 30",
     cwd: process.cwd(),
     timeoutMs: 400,
   });
   assert.equal(r.timed_out, true);
+  assert.ok(Date.now() - startedAt < 3000, "timeout must terminate the command tree promptly");
 });
 
 test("runLocalShell runs from requested cwd", async () => {

@@ -30,7 +30,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Self-update validation can run alongside developer/CI-style local gates.
 // Do not let two transport suites attach to the same fixed listener.
 const PORT = Number(process.env.HERDR_TEST_TRANSPORT_PORT ?? (20_000 + (process.pid % 10_000) * 3));
-const ALL_PORT = Number(process.env.HERDR_TEST_TRANSPORT_ALL_PORT ?? (PORT + 1));
+const ALL_PORT_OVERRIDE = process.env.HERDR_TEST_TRANSPORT_ALL_PORT
+  ? Number(process.env.HERDR_TEST_TRANSPORT_ALL_PORT)
+  : null;
 const TOKEN = "transport-test-token";
 const BASE = `http://127.0.0.1:${PORT}`;
 
@@ -42,17 +44,49 @@ let sessionId = null;
 // restart can never surface as -32600 "Session terminated".
 const OPENAI_UA = "openai-mcp/1.0.0";
 
+async function freePort() {
+  return await new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      probe.close((err) => err ? reject(err) : resolve(port));
+    });
+  });
+}
+
 /** Poll a TCP port until a server accepts connections (or reject after 15s). */
-function waitReady(port) {
+function waitReady(port, proc, getDiagnostics = () => "") {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + 15000;
-    const poll = setInterval(() => {
+    let settled = false;
+    let poll = null;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (poll) clearInterval(poll);
+      proc?.off("exit", onExit);
+      fn(value);
+    };
+    const onExit = (code, signal) => {
+      const diagnostics = String(getDiagnostics() || "").trim().slice(-2000);
+      finish(reject, new Error(
+        `server on 127.0.0.1:${port} exited before ready (code=${code}, signal=${signal || "none"})`
+          + (diagnostics ? `: ${diagnostics}` : ""),
+      ));
+    };
+    proc?.once("exit", onExit);
+    poll = setInterval(() => {
       const probe = net.connect(port, "127.0.0.1");
-      probe.on("connect", () => { clearInterval(poll); probe.destroy(); resolve(); });
+      probe.on("connect", () => { probe.destroy(); finish(resolve); });
       probe.on("error", () => {
         if (Date.now() > deadline) {
-          clearInterval(poll);
-          reject(new Error(`server on 127.0.0.1:${port} did not become ready in 15s`));
+          const diagnostics = String(getDiagnostics() || "").trim().slice(-2000);
+          finish(reject, new Error(
+            `server on 127.0.0.1:${port} did not become ready in 15s`
+              + (diagnostics ? `: ${diagnostics}` : ""),
+          ));
           return;
         }
         probe.destroy();
@@ -63,12 +97,26 @@ function waitReady(port) {
 
 async function spawnServer(port, extraEnv = {}) {
   const proc = spawn("node", [path.join(__dirname, "..", "dist", "server.js")], {
-    env: { ...process.env, HERDR_MCP_PORT: String(port), HERDR_MCP_TOKEN: TOKEN, ...extraEnv },
+    env: {
+      ...process.env,
+      // Transport tests exercise the current/default contract unless a case
+      // opts in explicitly. Do not inherit production epoch/all-tools flags
+      // from the developer shell or supervised runtime environment.
+      HERDR_MCP_CONTRACT_PROFILE: "",
+      HERDR_MCP_ALL_TOOLS: "",
+      HERDR_MCP_PORT: String(port),
+      HERDR_MCP_TOKEN: TOKEN,
+      ...extraEnv,
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  proc.stdout.on("data", () => {}); // drain — a full pipe would block the child
-  proc.stderr.on("data", () => {}); // drain
-  await waitReady(port);
+  let diagnostics = "";
+  const capture = (chunk) => {
+    diagnostics = (diagnostics + String(chunk)).slice(-4000);
+  };
+  proc.stdout.on("data", capture); // drain — a full pipe would block the child
+  proc.stderr.on("data", capture); // drain
+  await waitReady(port, proc, () => diagnostics);
   return proc;
 }
 
@@ -503,9 +551,10 @@ test("server/discover (sessionless bootstrap probe) answered, never desyncs", as
 });
 
 test("HERDR_MCP_ALL_TOOLS=1 restores the full 31-tool surface (advanced + deprecated)", async () => {
-  const allSrv = await spawnServer(ALL_PORT, { HERDR_MCP_ALL_TOOLS: "1" });
+  const allPort = ALL_PORT_OVERRIDE ?? await freePort();
+  const allSrv = await spawnServer(allPort, { HERDR_MCP_ALL_TOOLS: "1" });
   try {
-    const list = await rpc("tools/list", {}, { base: `http://127.0.0.1:${ALL_PORT}`, noSession: true });
+    const list = await rpc("tools/list", {}, { base: `http://127.0.0.1:${allPort}`, noSession: true });
     assert.equal(list.status, 200);
     const names = list.msg.result.tools.map((t) => t.name);
     assert.equal(names.length, 31, `all-tools mode must register all 31 tools, got ${names.length}: ${names.join(",")}`);
