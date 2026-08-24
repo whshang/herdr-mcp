@@ -72,6 +72,17 @@ With Project `Auto on`, both human-submitted and extension-submitted user messag
 
 The pre-refresh assistant signature is persisted. If reload reveals newer content or streaming resumes, recovery ends. If the identical partial reply remains after 10 seconds and the composer, tools and permission cards are idle, the extension submits exactly one browser-recovery activation message telling ChatGPT to reread the current conversation, continue from the real stop point, and not repeat completed work. Only if that also fails does recovery-exhausted rollover become eligible.
 
+### Explicit ChatGPT send-timeout card (0.1.53)
+
+When ChatGPT itself renders the thread error card with `data-testid="regenerate-thread-error-button"` (for example, “Message sending timed out, please retry”), Auto does **not** immediately hard-refresh or blindly submit another message. The extension first reads the same-origin conversation snapshot and inspects `current_node`:
+
+- `current_node` is already an assistant message → the request reached the server far enough that retrying may repeat tool work; perform at most one safety-gated reload to reconcile the page;
+- `current_node` is still the user message → use ChatGPT's own Retry button once; if no reply starts within the normal reply timeout, reload once when the existing safety gates allow it;
+- snapshot delivery state is unknown → prefer one safety-gated reload instead of guessing that Retry is safe;
+- after the one Retry / one reload budget is exhausted, keep the explicit error authoritative and suppress generic recovery-message submission rather than creating a second user turn blindly; if the reload produced no new assistant progress after 10 seconds, the HUD moves to `rollover_recommended` instead of silently remaining stuck in `recovering`.
+
+So a hard refresh is a **second-stage recovery**, not the first response to every send-timeout card.
+
 ## Manual handoff (0.1.47)
 
 The bottom-HUD **Manual handoff** action lets the user roll over early, but the current conversation must first be switched to `Auto off`:

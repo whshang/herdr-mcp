@@ -50,6 +50,9 @@ test("conversation health records the persisted recovery lifecycle fields", () =
     "page_message_id",
     "stale_refresh_attempt",
     "stale_activation_attempt",
+    "thread_error_retry_attempt",
+    "thread_error_reload_attempt",
+    "thread_error_last_seen_at",
     "reload_reason",
   ]) assert.ok(Object.hasOwn(record, field), `missing ${field}`);
 
@@ -160,6 +163,12 @@ test("ChatGPT turn watcher wires assistant progress, settled turns, and explicit
   assert.match(wake, /trigger:\s*"recovery_exhausted"/);
   assert.match(wake, /backend-api\/conversation/);
   assert.match(wake, /maybeRefreshStaleView\(\)/);
+  assert.match(wake, /regenerate-thread-error-button/);
+  assert.match(wake, /maybeRecoverExplicitThreadError\(\)/);
+  assert.match(wake, /thread_error_server_ahead/);
+  assert.match(wake, /thread_error_delivery_unknown/);
+  assert.match(wake, /startsWith\("thread_error_"\)/);
+  assert.match(wake, /markRolloverRecommended/);
   assert.match(wake, /stale_view_activation_template/);
 });
 

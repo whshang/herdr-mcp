@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.52";
+const H2W_CONTENT_VERSION = "0.1.53";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -894,6 +894,7 @@ const H2W_CONTENT_VERSION = "0.1.52";
       if (!response.ok) return { ok: false, reason: `http-${response.status}` };
       const body = await response.json();
       const mapping = body?.mapping || {};
+      const currentNodeRole = String(mapping?.[body?.current_node]?.message?.author?.role || "");
       let nodeId = body?.current_node || null;
       let assistant = null;
       for (let i = 0; nodeId && i < 40; i += 1) {
@@ -902,7 +903,7 @@ const H2W_CONTENT_VERSION = "0.1.52";
         if (message?.author?.role === "assistant") { assistant = message; break; }
         nodeId = node?.parent || null;
       }
-      if (!assistant?.id) return { ok: false, reason: "no-assistant-node" };
+      if (!assistant?.id) return { ok: true, currentNodeRole, messageId: null, text: "", finished: null };
       const finishType = String(assistant?.metadata?.finish_details?.type || "");
       const status = String(assistant?.status || "");
       const completed = assistant?.end_turn === true
@@ -913,6 +914,7 @@ const H2W_CONTENT_VERSION = "0.1.52";
       const updateSeconds = Number(assistant?.update_time || assistant?.create_time || body?.update_time || 0);
       return {
         ok: true,
+        currentNodeRole,
         messageId: String(assistant.id),
         text: serverMessageText(assistant),
         status,
@@ -925,6 +927,118 @@ const H2W_CONTENT_VERSION = "0.1.52";
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  function explicitChatGptThreadError() {
+    if (ADAPTER.name !== "chatgpt") return null;
+    const retry = document.querySelector('button[data-testid="regenerate-thread-error-button"]');
+    if (!retry) return null;
+    const container = retry.closest('[class*="text-token-text-error"]') || retry.parentElement;
+    return {
+      retry,
+      text: String(container?.innerText || container?.textContent || "").replace(/\s+/g, " ").trim(),
+    };
+  }
+
+  async function maybeRecoverExplicitThreadError() {
+    if (!automationEnabled || ADAPTER.name !== "chatgpt" || !conversationHealth || !RECOVERY_CONTROLLER || !CONVERSATION_HEALTH) return false;
+    const threadError = explicitChatGptThreadError();
+    if (!threadError) return false;
+    const safety = recoverySafetySnapshot();
+    if (safety.composerBusy || safety.streaming || safety.toolRunning || safety.permissionCardActive) return true;
+
+    const now = Date.now();
+    const retryAttempts = Number(conversationHealth.thread_error_retry_attempt || 0);
+    const refreshAttempts = Number(conversationHealth.thread_error_reload_attempt || 0);
+    const server = await fetchChatGptConversationSnapshot();
+    const serverHasCurrentAssistant = Boolean(server?.ok && server?.currentNodeRole === "assistant");
+    markConversationState({ ...conversationHealth, thread_error_last_seen_at: now });
+
+    // If the server already has assistant work for this turn, retrying can
+    // duplicate tool work. Reload the page to reconcile the local view.
+    if (serverHasCurrentAssistant) {
+      if (refreshAttempts >= 1) return true;
+      if (!RECOVERY_CONTROLLER.canReloadSafely(safety)) return true;
+      markConversationState(CONVERSATION_HEALTH.markReloadPending({
+        ...conversationHealth,
+        thread_error_reload_attempt: refreshAttempts + 1,
+        reload_reason: "thread_error_server_ahead",
+      }));
+      await wait(100);
+      const reloading = RECOVERY_CONTROLLER.markReloaded(conversationHealth);
+      markConversationState({
+        ...reloading,
+        thread_error_reload_attempt: refreshAttempts + 1,
+        reload_reason: "thread_error_server_ahead",
+      });
+      await wait(150);
+      location.reload();
+      return true;
+    }
+
+    // A successful snapshot with no assistant newer than the user submit is
+    // enough evidence to use ChatGPT's own one-shot Retry button.
+    if (server?.ok && retryAttempts < 1 && !threadError.retry.disabled) {
+      markConversationState({
+        ...conversationHealth,
+        thread_error_retry_attempt: retryAttempts + 1,
+        thread_error_last_seen_at: now,
+      });
+      threadError.retry.click();
+      const confirm = await confirmReplyStarted(RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.replyTimeoutMs);
+      if (confirm?.replyStarted) {
+        markConversationState(CONVERSATION_HEALTH.markReplyStarted(conversationHealth));
+        return true;
+      }
+      const afterRetrySafety = recoverySafetySnapshot();
+      if (refreshAttempts < 1 && RECOVERY_CONTROLLER.canReloadSafely(afterRetrySafety)) {
+        markConversationState(CONVERSATION_HEALTH.markReloadPending({
+          ...conversationHealth,
+          thread_error_reload_attempt: refreshAttempts + 1,
+          reload_reason: "thread_error_retry_timeout",
+        }));
+        await wait(100);
+        const reloading = RECOVERY_CONTROLLER.markReloaded(conversationHealth);
+        markConversationState({
+          ...reloading,
+          thread_error_reload_attempt: refreshAttempts + 1,
+          reload_reason: "thread_error_retry_timeout",
+        });
+        await wait(150);
+        location.reload();
+      }
+      return true;
+    }
+
+    // If delivery cannot be verified, or Retry already failed once, a single
+    // safety-gated reload is safer than blindly submitting a second user turn.
+    if (refreshAttempts < 1 && RECOVERY_CONTROLLER.canReloadSafely(safety)) {
+      const reloadReason = server?.ok ? "thread_error_retry_failed" : "thread_error_delivery_unknown";
+      markConversationState(CONVERSATION_HEALTH.markReloadPending({
+        ...conversationHealth,
+        thread_error_reload_attempt: refreshAttempts + 1,
+        reload_reason: reloadReason,
+      }));
+      await wait(100);
+      const reloading = RECOVERY_CONTROLLER.markReloaded(conversationHealth);
+      markConversationState({
+        ...reloading,
+        thread_error_reload_attempt: refreshAttempts + 1,
+        reload_reason: reloadReason,
+      });
+      await wait(150);
+      location.reload();
+      return true;
+    }
+
+    // Keep the explicit error authoritative. Do not fall through to a generic
+    // recovery message that could create a second user turn.
+    if (refreshAttempts >= 1
+      && Date.now() - Number(conversationHealth.last_reload_at || 0) >= 10000) {
+      markConversationState(CONVERSATION_HEALTH.markRolloverRecommended(conversationHealth));
+      paintPageHud({});
+    }
+    return true;
   }
 
   async function maybeRefreshStaleView() {
@@ -1075,6 +1189,11 @@ const H2W_CONTENT_VERSION = "0.1.52";
       paintPageHud({});
       return true;
     }
+    if (String(conversationHealth.reload_reason || "").startsWith("thread_error_")) {
+      markConversationState(CONVERSATION_HEALTH.markRolloverRecommended(conversationHealth));
+      paintPageHud({});
+      return true;
+    }
     if (conversationHealth.reload_reason === "stale_view" && Number(conversationHealth.stale_activation_attempt || 0) < 1) {
       const safety = recoverySafetySnapshot();
       if (safety.composerBusy || safety.streaming || safety.toolRunning || safety.permissionCardActive) return false;
@@ -1129,6 +1248,7 @@ const H2W_CONTENT_VERSION = "0.1.52";
       if (healthCheckInFlight || !conversationHealth || !RECOVERY_CONTROLLER) return;
       healthCheckInFlight = true;
       void (async () => {
+        if (await maybeRecoverExplicitThreadError()) return;
         const next = RECOVERY_CONTROLLER.classifyReplyTimeout(conversationHealth);
         if (next !== conversationHealth) markConversationState(next);
         if (await maybeRefreshStaleView()) return;

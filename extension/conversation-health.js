@@ -35,6 +35,9 @@ function createConversationHealth(convKey, continuityId = null) {
     page_message_id: null,
     stale_refresh_attempt: 0,
     stale_activation_attempt: 0,
+    thread_error_retry_attempt: 0,
+    thread_error_reload_attempt: 0,
+    thread_error_last_seen_at: null,
     reload_reason: null,
   };
 }
@@ -51,6 +54,9 @@ function markReplyWaiting(record, at = Date.now()) {
     reload_attempt: 0,
     stale_refresh_attempt: 0,
     stale_activation_attempt: 0,
+    thread_error_retry_attempt: 0,
+    thread_error_reload_attempt: 0,
+    thread_error_last_seen_at: null,
     reload_reason: null,
   };
 }
@@ -82,6 +88,9 @@ function markTurnEnded(record, at = Date.now()) {
     reload_attempt: 0,
     stale_refresh_attempt: 0,
     stale_activation_attempt: 0,
+    thread_error_retry_attempt: 0,
+    thread_error_reload_attempt: 0,
+    thread_error_last_seen_at: null,
     reload_reason: null,
   };
 }

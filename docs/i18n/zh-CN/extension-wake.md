@@ -72,6 +72,17 @@ Project `自动 开` 时，人工发送和扩展自动发送的用户消息都�
 
 刷新前记录当前 assistant 指纹。刷新后如果内容变长或重新开始 streaming，就认为页面已经恢复；如果 10 秒后仍是完全相同的半截回复，并且编辑器、工具、权限卡都空闲，则只发送一次浏览器恢复激活消息，让 ChatGPT 重新读取当前会话，从实际停止处继续且不要重复已完成工作。该消息仍失败后才进入 recovery-exhausted rollover。
 
+### ChatGPT 显式“消息发送超时”错误卡（0.1.53）
+
+当 ChatGPT 自己渲染带 `data-testid="regenerate-thread-error-button"` 的 thread error 卡（例如“消息发送超时，请重试”）时，Auto **不会立刻强制刷新，也不会盲目再发一条消息**。扩展会先读取同源 conversation snapshot 并检查 `current_node`：
+
+- `current_node` 已经是 assistant message → 说明请求已经在服务端推进到助手回合，盲点“重试”可能重复工具工作；此时只在安全条件满足时刷新一次页面来同步视图；
+- `current_node` 仍是 user message → 才点击 ChatGPT 自带“重试”一次；如果在正常回复超时内仍没有开始回复，再在现有安全 gate 下刷新一次；
+- snapshot 无法确认投递状态 → 优先安全刷新一次，而不是猜测重试一定安全；
+- 一次 Retry / 一次 reload 预算都用完后，保持显式错误为权威状态并抑制通用 recovery message，避免无证据地创建第二个用户回合；如果刷新后 10 秒仍没有新的 assistant 进展，HUD 转成 `rollover_recommended`，而不是静默卡在 `recovering`。
+
+因此，强制刷新属于**第二级恢复手段**，不是遇到“消息发送超时”后的第一动作。
+
 ## 手动接力（0.1.47）
 
 底部 HUD 的 **手动接力**用于主动提前换会话，但必须先把当前会话切到 `自动 关`：
