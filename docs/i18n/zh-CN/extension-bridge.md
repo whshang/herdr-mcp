@@ -17,19 +17,21 @@ B 线与 A 线并列：`chat.deepseek.com` / `chat.z.ai` 中的普通用户任�
   -> 网页模型继续调用工具或正常回答
 ```
 
-## 当前状态（0.1.49）
+## 当前状态（0.1.50）
 
 | 能力 | 状态 |
 |---|---|
 | 从本机 Herdr MCP 读取 `tools/list` | **已可用** |
 | 把 typed tool catalog 注入网页模型协议 | **已可用** |
 | 单次助手回复输出一个或多个 JSON 工具调用 | **已可用** |
-| bounded `tools/call` 轮次 + 结果回填 | **已可用** |
+| 逐轮受控执行 `tools/call` + 回填结果，直到正常答案 | **已可用** |
 | 同批独立工具并行执行 | **已可用** |
 | 工具结果清洗 / 大二进制省略 / 长度上限 | **已可用** |
 | Herdr 凭据不进入网页 JavaScript 或 service worker | **已可用** — 当前版本使用 Native Messaging + 权限 `0600` 的 Unix IPC；旧版本 bearer 兼容仅保留在 native host/server 内部 |
 | z.ai / DeepSeek 会话级 `自动 开/关`，控制 Herdr progress/settled 自动回推 | **已可用**（需全局允许自动化） |
 | 已落成 z.ai `/c/<chat_id>` 的“手动接力” | **已可用**（必须 `自动 关`；接力控制消息绕过 JSON bridge） |
+| 刷新/重载后的未完成工具 JSON 恢复 | **已可用** — 若最后一条真实会话消息仍是 assistant 的 Herdr tool-call JSON，且前文存在 bridge 上下文，会自动继续执行 |
+| 长 JSON→MCP 链路 | **已可用** — 第 12 轮只作为调度让出点；只有 assistant 返回正常非工具答案才算完成 |
 
 Bridge 使用本机实时 `tools/list` catalog，而不是再维护一份手写工具白名单。扩展仍会校验调用站点与 conversation；所有 MCP 流量只走 loopback，本机 Herdr server 仍是最终工具/权限边界。
 
@@ -44,6 +46,8 @@ Content bridge 给网页模型一个 typed catalog，并要求工具调用回复
 互相独立的调用可以同一回复里并列并行执行；有依赖的步骤继续串行。只有 service worker 返回 `TOOL_RESULT` 后，网页模型才能把该工具视为成功。
 
 站点支持时，bridge 的中间协议消息会折叠。工具结果递归清洗，大体积 binary/base64 字段会被省略，整批 TOOL_RESULT 在回填网页模型前也有长度上限。
+
+0.1.50 会在历史加载时重新折叠内部协议消息，不再只在 bridge 正在运行时折叠。折叠条作为站点 message root 的外部兄弟节点，显隐的是整条原消息；展开 z.ai 消息时不会再占满 flex 行宽、把正文挤成细竖条。
 
 ## 安全边界
 

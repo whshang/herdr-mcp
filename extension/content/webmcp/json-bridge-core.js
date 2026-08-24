@@ -3,13 +3,18 @@
 (function (root) {
   const MARKER = "[HERDR_JSON_BRIDGE_V1]";
 
-  function extractToolCalls(text) {
+  function scanToolCalls(text) {
     const source = String(text || "");
     const calls = [];
     let from = 0;
+    let hasPrefix = false;
+    let incomplete = false;
+    let malformed = false;
     while (from < source.length) {
-      const start = source.indexOf('{"tool"', from);
+      const startMatch = /\{\s*"tool"\s*:/.exec(source.slice(from));
+      const start = startMatch ? from + startMatch.index : -1;
       if (start === -1) break;
+      hasPrefix = true;
       let depth = 0;
       let inString = false;
       let escape = false;
@@ -26,7 +31,10 @@
           if (depth === 0) { end = i + 1; break; }
         }
       }
-      if (end === -1) break;
+      if (end === -1) {
+        incomplete = true;
+        break;
+      }
       try {
         const parsed = JSON.parse(source.slice(start, end));
         if (parsed && typeof parsed.tool === "string" && parsed.tool.trim()) {
@@ -34,11 +42,44 @@
             ? parsed.args
             : {};
           calls.push({ tool: parsed.tool.trim(), args });
+        } else {
+          malformed = true;
         }
-      } catch (_) {}
+      } catch (_) { malformed = true; }
       from = end;
     }
-    return calls;
+    return { calls, hasPrefix, incomplete, malformed };
+  }
+
+  function extractToolCalls(text) {
+    return scanToolCalls(text).calls;
+  }
+
+  function toolReplyState(text) {
+    const scan = scanToolCalls(text);
+    if (!scan.hasPrefix) {
+      const trimmed = String(text || "")
+        .replace(/^\s*```(?:json)?\s*/i, "")
+        .trim();
+      return /^[\[{]/.test(trimmed) ? "malformed" : "none";
+    }
+    if (scan.incomplete) return "incomplete";
+    if (scan.malformed) return "malformed";
+    return scan.calls.length ? "complete" : "malformed";
+  }
+
+  function hasPendingToolReply(entries) {
+    const rows = Array.isArray(entries)
+      ? entries.filter((entry) => entry && (entry.role === "user" || entry.role === "assistant"))
+      : [];
+    if (!rows.length) return false;
+    const last = rows[rows.length - 1];
+    if (last.role !== "assistant" || toolReplyState(last.text) === "none") return false;
+    return rows.slice(Math.max(0, rows.length - 40), -1).some((entry) => {
+      if (entry.role !== "user") return false;
+      const text = String(entry.text || "");
+      return text.includes(MARKER) || /^\s*TOOL_RESULT:/m.test(text);
+    });
   }
 
   function schemaType(prop) {
@@ -128,6 +169,8 @@
   root.H2W_JSON_BRIDGE_CORE = {
     MARKER,
     extractToolCalls,
+    toolReplyState,
+    hasPendingToolReply,
     schemaToTypedApi,
     buildSystemPrompt,
     sanitizeToolResult,

@@ -58,9 +58,10 @@ const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
-ok(manifest.version === "0.1.49", "manifest version includes tokenless native IPC transport");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.49"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.49"'), "content version matches manifest");
+const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
+ok(manifest.version === "0.1.50", "manifest version includes z.ai bridge continuity recovery");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.50"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.50"'), "content version matches manifest");
 ok(
   backgroundSource.includes('from "./local-auth.js"')
     && localAuthSource.includes("sendNativeMessage")
@@ -77,6 +78,26 @@ ok(
     && nativeHostSource.includes("EXTENSION_PATH")
     && nativeHostSource.includes('"Citro Labs", "ego lite", "NativeMessagingHosts"'),
   "extension uses tokenless Native Messaging IPC and retains old-session server compatibility",
+);
+ok(
+  jsonBridgeSource.includes("const ROUND_YIELD_INTERVAL = 12")
+    && jsonBridgeSource.includes("while (taskSeq === currentTaskSeq)")
+    && !jsonBridgeSource.includes("MAX_ROUNDS")
+    && jsonBridgeSource.includes("continuing after ${round} tool rounds"),
+  "JSON bridge keeps running past round 12 until the assistant returns a non-tool answer",
+);
+ok(
+  jsonBridgeSource.includes("root.parentElement.insertBefore(bar, root)")
+    && jsonBridgeSource.includes('root.style.display = expanded ? originalDisplay : "none"')
+    && !jsonBridgeSource.includes("root.insertBefore(bar, root.firstChild)"),
+  "JSON folding toggles the whole site message from an external sibling bar instead of squeezing its flex children",
+);
+ok(
+  jsonBridgeSource.includes("CORE.hasPendingToolReply(entries)")
+    && jsonBridgeSource.includes("resuming pending tool JSON after page/script recovery")
+    && jsonBridgeSource.includes("schedulePendingResume();")
+    && jsonBridgeSource.includes("scheduleFold();"),
+  "JSON bridge refolds history and resumes a last pending Herdr tool JSON after recovery",
 );
 ok(
   wakeSource.includes(".bar.automation-on")

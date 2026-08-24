@@ -11,7 +11,7 @@
     return;
   }
 
-  const MAX_ROUNDS = 12;
+  const ROUND_YIELD_INTERVAL = 12;
   const MAX_PARALLEL = 4;
   const REPLY_TIMEOUT_MS = 120000;
   const STABLE_TICKS = 4;
@@ -25,6 +25,8 @@
   let currentTaskSeq = 0;
   let hookTimer = null;
   let foldScheduled = false;
+  let resumeScheduled = false;
+  let lastResumeFingerprint = "";
 
   function runtimeAlive() {
     try { return !!chrome.runtime?.id; } catch (_) { return false; }
@@ -180,36 +182,58 @@
   }
 
   function zAiMessageRoot(el) {
+    const messageRoot = el?.closest?.('[id^="message-"]:not([id$="-start"])');
+    if (messageRoot) return messageRoot;
+    const userRoot = el?.closest?.(".user-message");
+    if (userRoot) return userRoot;
     let node = el;
-    for (let i = 0; i < 6 && node; i++) {
+    for (let i = 0; i < 10 && node; i++) {
       if (node.classList?.contains("user-message")) return node;
-      if (node.id?.startsWith("message-")) return node;
+      if (node.id?.startsWith("message-") && !node.id.endsWith("-start")) return node;
       node = node.parentElement;
     }
     return el?.parentElement || el;
   }
 
   function foldRoot(root, label) {
-    if (!root || root.dataset?.h2wJsonFolded) return;
+    if (!root || root.dataset?.h2wJsonFolded || !root.parentElement) return;
     root.dataset.h2wJsonFolded = "1";
-    const children = [...root.children];
-    if (!children.length) return;
-    for (const child of children) child.style.display = "none";
+    const originalDisplay = root.style.display;
     const bar = document.createElement("div");
     bar.className = "h2w-json-fold";
-    bar.style.cssText = "font-size:12px;color:#9ca3af;cursor:pointer;padding:3px 0;align-self:flex-start;width:100%;text-align:left;";
-    bar.textContent = `▸ ${label}`;
+    bar.style.cssText = "display:block;width:100%;box-sizing:border-box;font-size:12px;color:#9ca3af;cursor:pointer;padding:3px 0;text-align:left;";
+    bar.__h2wFoldRoot = root;
+    bar.__h2wOriginalDisplay = originalDisplay;
+    const setExpanded = (expanded) => {
+      root.style.display = expanded ? originalDisplay : "none";
+      bar.textContent = `${expanded ? "▾" : "▸"} ${label}`;
+      bar.dataset.h2wJsonExpanded = expanded ? "1" : "0";
+    };
     bar.addEventListener("click", (event) => {
       event.stopPropagation();
-      const hidden = children[0]?.style.display === "none";
-      for (const child of children) child.style.display = hidden ? "" : "none";
-      bar.textContent = `${hidden ? "▾" : "▸"} ${label}`;
+      setExpanded(bar.dataset.h2wJsonExpanded !== "1");
     });
-    root.insertBefore(bar, root.firstChild);
+    root.parentElement.insertBefore(bar, root);
+    setExpanded(false);
+  }
+
+  function cleanupFoldArtifacts() {
+    for (const bar of document.querySelectorAll(".h2w-json-fold")) {
+      const root = bar.__h2wFoldRoot;
+      if (!root) continue;
+      if (!root.isConnected) {
+        bar.remove();
+        continue;
+      }
+      if (bar.nextElementSibling !== root && root.parentElement) {
+        root.parentElement.insertBefore(bar, root);
+      }
+    }
   }
 
   function foldInternalMessages() {
     try {
+      cleanupFoldArtifacts();
       if (ADAPTER.name === "deepseek") {
         for (const msg of document.querySelectorAll(".ds-message")) {
           if (msg.dataset?.h2wJsonFolded) continue;
@@ -244,6 +268,115 @@
     });
   }
 
+  function bridgeConversationEntries() {
+    if (ADAPTER.name === "deepseek") {
+      return [...document.querySelectorAll(".ds-message")].map((root) => ({
+        root,
+        role: root.querySelector(".ds-assistant-message-main-content") ? "assistant" : "user",
+        text: String(root.textContent || ""),
+      }));
+    }
+    return [...document.querySelectorAll('[id^="message-"]:not([id$="-start"])')].map((root) => {
+      const isUser = root.classList?.contains("user-message") || !!root.querySelector(".user-message");
+      const isAssistant = !isUser && !!root.querySelector(".markdown-prose, .chat-assistant");
+      return {
+        root,
+        role: isUser ? "user" : (isAssistant ? "assistant" : null),
+        text: String(root.textContent || ""),
+      };
+    }).filter((entry) => entry.role);
+  }
+
+  function pendingBridgeReply() {
+    const entries = bridgeConversationEntries();
+    if (!CORE.hasPendingToolReply(entries)) return null;
+    const last = entries[entries.length - 1];
+    if (!last?.root || !SPEAKS.isReplyDone()) return null;
+    return {
+      text: last.text,
+      fingerprint: `${location.href}\n${last.root.id || "assistant"}\n${last.text}`,
+    };
+  }
+
+  async function continueToolLoop(initialReply, taskSeq) {
+    let reply = initialReply;
+    let round = 0;
+    let protocolRepairs = 0;
+    while (taskSeq === currentTaskSeq) {
+      const replyState = CORE.toolReplyState(reply);
+      const calls = CORE.extractToolCalls(reply);
+      if (replyState === "none") return reply;
+      round++;
+      if (replyState !== "complete") {
+        protocolRepairs++;
+        if (protocolRepairs > 3) throw new Error("repeated-invalid-tool-json");
+        console.log(`[h2w-json] repairing ${replyState} tool JSON`);
+        const before = replySnapshot();
+        const repairMessage = `TOOL_RESULT:\n${JSON.stringify([{
+          index: 1,
+          tool: "bridge_protocol",
+          ok: false,
+          error: `${replyState}-tool-json`,
+          detail: "The previous assistant tool-call JSON was not executable. Re-emit the intended tool call(s) as complete valid JSON objects only, or answer the user normally if no tool is needed.",
+        }])}`;
+        await new Promise((resolve) => setTimeout(resolve, 650));
+        const repairSent = await sendRaw(repairMessage);
+        if (!repairSent) throw new Error("tool-json-repair-submit-failed");
+        scheduleFold();
+        reply = await waitForReply(before);
+        scheduleFold();
+        continue;
+      }
+      protocolRepairs = 0;
+      console.log(`[h2w-json] round ${round}:`, calls.map((call) => call.tool).join(", "));
+      const responses = await runToolBatch(calls);
+      const resultMessage = CORE.formatToolResultBatch(calls, responses);
+      const before = replySnapshot();
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      const resultSent = await sendRaw(resultMessage);
+      if (!resultSent) throw new Error("tool-result-submit-failed");
+      scheduleFold();
+      reply = await waitForReply(before);
+      scheduleFold();
+      if (round % ROUND_YIELD_INTERVAL === 0) {
+        console.log(`[h2w-json] continuing after ${round} tool rounds; latest reply still contains tool JSON`);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+    return reply;
+  }
+
+  async function resumePendingBridge() {
+    resumeScheduled = false;
+    if (running || !runtimeAlive()) return false;
+    const pending = pendingBridgeReply();
+    if (!pending || pending.fingerprint === lastResumeFingerprint) return false;
+    lastResumeFingerprint = pending.fingerprint;
+    const tools = await ensureCatalog();
+    if (!tools?.length) return false;
+    running = true;
+    const taskSeq = ++currentTaskSeq;
+    console.log("[h2w-json] resuming pending tool JSON after page/script recovery");
+    try {
+      await continueToolLoop(pending.text, taskSeq);
+      return true;
+    } catch (e) {
+      console.error("[h2w-json] pending bridge recovery failed:", e);
+      return false;
+    } finally {
+      if (taskSeq === currentTaskSeq) running = false;
+      scheduleFold();
+    }
+  }
+
+  function schedulePendingResume() {
+    if (resumeScheduled || running) return;
+    const pending = pendingBridgeReply();
+    if (!pending || pending.fingerprint === lastResumeFingerprint) return;
+    resumeScheduled = true;
+    setTimeout(() => { void resumePendingBridge(); }, 250);
+  }
+
   async function runAgentLoop(userText, taskSeq, firstSubmitted) {
     let firstResolved = false;
     const resolveFirst = (value) => {
@@ -266,25 +399,9 @@
       if (!sent) throw new Error("submit-failed");
       scheduleFold();
 
-      let reply = await waitForReply(firstBefore);
+      const reply = await waitForReply(firstBefore);
       scheduleFold();
-      for (let round = 0; round < MAX_ROUNDS && taskSeq === currentTaskSeq; round++) {
-        const calls = CORE.extractToolCalls(reply);
-        if (!calls.length) return;
-        console.log(`[h2w-json] round ${round + 1}:`, calls.map((call) => call.tool).join(", "));
-        const responses = await runToolBatch(calls);
-        const resultMessage = CORE.formatToolResultBatch(calls, responses);
-        const before = replySnapshot();
-        await new Promise((resolve) => setTimeout(resolve, 650));
-        const resultSent = await sendRaw(resultMessage);
-        if (!resultSent) throw new Error("tool-result-submit-failed");
-        scheduleFold();
-        reply = await waitForReply(before);
-        scheduleFold();
-      }
-      if (taskSeq === currentTaskSeq && CORE.extractToolCalls(reply).length) {
-        console.log(`[h2w-json] stopped after ${MAX_ROUNDS} tool rounds`);
-      }
+      await continueToolLoop(reply, taskSeq);
     } catch (e) {
       resolveFirst({ ok: false, bridged: true, error: String(e?.message || e) });
       console.error("[h2w-json] agent loop failed:", e);
@@ -351,7 +468,8 @@
 
   const observer = new MutationObserver(() => {
     hookInput();
-    if (running) scheduleFold();
+    scheduleFold();
+    schedulePendingResume();
   });
   try { observer.observe(document.body, { childList: true, subtree: true }); } catch (_) {}
   hookInput();
@@ -362,8 +480,11 @@
       return;
     }
     hookInput();
+    schedulePendingResume();
   }, 1500);
   void ensureCatalog();
+  scheduleFold();
+  schedulePendingResume();
 
   window.__H2W_JSON_BRIDGE__ = {
     enabled: true,

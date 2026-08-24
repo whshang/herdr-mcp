@@ -253,7 +253,7 @@ OAuth / skill / 状态目录等见 [docs/i18n/zh-CN/architecture.md](docs/i18n/z
 两件工作（见 [docs/i18n/zh-CN/extension.md](docs/i18n/zh-CN/extension.md)）共享 Native Messaging + 本机 Unix Socket transport，**完成度不对等**：
 
 1. **网页连续工作自动化（已可用）**：Options 选择“全局手动 / 项目自动”；底部 HUD 提供「手动继续 / herdr监控 / LLM 分析 / 手动接力」，允许自动化时另有 `自动 开/关`。ChatGPT 按 `project_id` 保存自动设置；z.ai / DeepSeek 按具体会话保存。0.1.47 起，`自动 开` 会锁定全部 HUD 手动操作（包括“手动接力”）；0.1.48 起 z.ai / DeepSeek 即使尚未绑定 workspace 也可以先保存会话自动开关，Herdr 进度/settled 自动回推在绑定后自然生效。已绑定且已落成 `/c/<chat_id>` 的 z.ai 会话也支持 fail-closed 手动接力。z.ai 新聊天根页 `/` 的 binding/自动偏好会在首次落成 `/c/<chat_id>` 后迁移过去，但切换历史聊天不会跟随迁移。
-2. **JSON→MCP（已可用）**：DeepSeek / z.ai 的本地 JSON bridge 通过 Native Messaging host 驱动本机 MCP 的 `tools/list` / `tools/call`，在受限轮次内回填工具结果；host 通过受信任 Unix Socket 访问 runtime，service worker 和网页脚本都拿不到 Herdr bearer。路线与安全边界见 [docs/i18n/zh-CN/extension-bridge.md](docs/i18n/zh-CN/extension-bridge.md)。
+2. **JSON→MCP（已可用）**：DeepSeek / z.ai 的本地 JSON bridge 通过 Native Messaging host 驱动本机 MCP 的 `tools/list` / `tools/call`，按受控顺序逐轮执行并回填工具结果，直到 assistant 返回正常非 JSON 答案；host 通过受信任 Unix Socket 访问 runtime，service worker 和网页脚本都拿不到 Herdr bearer。路线与安全边界见 [docs/i18n/zh-CN/extension-bridge.md](docs/i18n/zh-CN/extension-bridge.md)。
 
 共享本机 Herdr runtime 与 Native Messaging IPC；静态 token 仅用于其他本机客户端及 Native host 面向旧 runtime 的兼容 fallback。这不是给 DeepSeek「安装」ChatGPT 式 OAuth connector。默认：进度检查间隔 **60 秒**，摘要不变时兜底 **20 分钟**（`progressTickSec` / `progressFallbackSec`）。
 

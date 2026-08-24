@@ -5,7 +5,7 @@ Language: product UI is en / Simplified Chinese / Japanese (same as herdr); this
 
 | Track | Problem | Direction | Status | First sites |
 |---|---|---|---|---|
-| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + automation gates + safe handoff | **usable** (0.1.49 series) | binding/observation: 4 sites; full automation: ChatGPT Project; conversation progress automation: z.ai / DeepSeek; Manual handoff: ChatGPT Project + z.ai `/c/<chat_id>` |
+| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + automation gates + safe handoff | **usable** (0.1.50 series) | binding/observation: 4 sites; full automation: ChatGPT Project; conversation progress automation: z.ai / DeepSeek; Manual handoff: ChatGPT Project + z.ai `/c/<chat_id>` |
 | **B. JSON→MCP** | DeepSeek / z.ai web has no MCP Connector | web → extension service worker → Native Messaging host → trusted local `/mcp` IPC | **usable** (bounded `tools/list` / `tools/call` loop) | `chat.deepseek.com`, `chat.z.ai` |
 
 Shared: same extension, same Native Messaging + local Unix IPC transport, same options.
@@ -127,7 +127,7 @@ Context pressure is estimated from visible user/assistant text only. It is not t
 ### Implemented
 
 - the extension service worker sends local `/mcp` `tools/list` / `tools/call` through the Native Messaging host; the host uses trusted Unix IPC, so neither the service worker nor page JavaScript receives a Herdr bearer;
-- z.ai / DeepSeek content scripts turn normal user tasks into a Herdr-tool protocol round, extract tool calls, execute them in bounded rounds, and feed results back to the web model;
+- z.ai / DeepSeek content scripts turn normal user tasks into a Herdr-tool protocol round, extract tool calls, execute controlled sequential rounds until a normal non-JSON answer, and feed results back to the web model;
 - intermediate protocol messages are folded; handoff summary/seed messages use a raw channel and bypass the JSON bridge;
 - current z.ai 1.1.88 compatibility uses `.user-message` / `.markdown-prose`, the real `#send-message-button`, and `/c/<chat_id>` as the stable persisted-chat identity.
 

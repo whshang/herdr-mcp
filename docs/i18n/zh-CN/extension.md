@@ -5,7 +5,7 @@
 
 | 主线 | 问题 | 方向 | 状态 | 首批站点 |
 |---|---|---|---|---|
-| **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + 自动化 gate + 安全接力 | **已可用**（当前 0.1.49 系列） | 绑定/观察：4 站；ChatGPT Project 完整自动化；z.ai / DeepSeek 会话级进度自动化；手动接力：ChatGPT Project + z.ai `/c/<chat_id>` |
+| **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + 自动化 gate + 安全接力 | **已可用**（当前 0.1.50 系列） | 绑定/观察：4 站；ChatGPT Project 完整自动化；z.ai / DeepSeek 会话级进度自动化；手动接力：ChatGPT Project + z.ai `/c/<chat_id>` |
 | **B. JSON→MCP** | DeepSeek / z.ai 网页没有 MCP Connector | 网页 → 扩展 service worker → Native Messaging host → 受信任本机 `/mcp` IPC | **已可用**（bounded `tools/list` / `tools/call` loop） | `chat.deepseek.com`、`chat.z.ai` |
 
 共享：同一扩展、同一 Native Messaging + 本机 Unix IPC transport、同一 options。

@@ -26,7 +26,7 @@ import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 
-const H2W_SCRIPT_VERSION = "0.1.49";
+const H2W_SCRIPT_VERSION = "0.1.50";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
