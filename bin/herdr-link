@@ -11,7 +11,7 @@ LINK_KEYCHAIN_SERVICE="${HERDR_LINK_KEYCHAIN_SERVICE:-herdr-edge-dev-link-secret
 DEFAULT_EDGE_URL="${HERDR_EDGE_URL:-wss://herdr-edge-dev.whshang.workers.dev/ws}"
 DEFAULT_WORKSTATION_ID="${HERDR_WORKSTATION_ID:-dev-real-runtime}"
 LOG_BASENAME="${HERDR_LINK_LOG_BASENAME:-link}"
-NODE_BIN="/usr/local/bin/node"
+NODE_BIN="${HERDR_NODE_BIN:-$(command -v node 2>/dev/null || true)}"
 
 current_user() { id -un; }
 
@@ -92,6 +92,7 @@ EOF
 }
 
 cmd_install() {
+  [[ -n "$NODE_BIN" && -x "$NODE_BIN" ]] || { echo "herdr-link: node not found in PATH (or HERDR_NODE_BIN)" >&2; exit 2; }
   [[ -n "$(load_link_secret)" ]] || { echo "herdr-link: Keychain link secret missing" >&2; exit 2; }
   [[ -n "$(load_runtime_token)" ]] || { echo "herdr-link: local MCP token missing" >&2; exit 2; }
   write_plist

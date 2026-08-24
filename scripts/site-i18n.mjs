@@ -19,6 +19,7 @@ export const LOCALE_NAMES = { en: "English", "zh-CN": "简体中文" };
 export const DOC_ORDER = [
   "architecture",
   "install",
+  "agent-install",
   "chatgpt-connector",
   "worker-fallbacks",
   "cloudflare-edge-deployment",
@@ -36,7 +37,7 @@ export const DOC_ORDER = [
 
 // Group membership is keyed by logical slug only; labels are translated in UI.
 export const NAV_GROUPS = [
-  { slugs: ["architecture", "install", "chatgpt-connector"] },
+  { slugs: ["architecture", "install", "agent-install", "chatgpt-connector"] },
   { slugs: ["worker-fallbacks"] },
   {
     slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade", "automation"],

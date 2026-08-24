@@ -63,6 +63,21 @@ export HERDR_MCP_PORT=8772
 node dist/server.js
 ```
 
+## ローカル Agent にインストールを任せる
+
+Codex、Claude Code、Pi、DSH、Cline など、ファイルを読んでコマンドを実行できるローカル Agent には、次のプロンプトをそのまま渡せます。手順の正本は Agent install guide です。
+
+```text
+herdr-mcp をゼロからインストールしてデプロイしてください。このプロンプトから手順を推測せず、最初に正本を読んでください：
+https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md
+
+文書どおりに、環境確認、安全な clone/update、依存関係、build、local MCP、Herdr socket、Cloudflare workers.dev Edge まで実行してください。Cloudflare への本人ログイン/API Token 作成、または複数 Account からの選択だけは私に依頼してください。Token を受け取ったら再表示せず、repo/.env/log/screenshot/shell history に保存せず、一時環境だけで使ってデプロイを続行してください。初回は Custom Domain/DNS/Tunnel を作らず workers.dev のみを使ってください。
+
+最後に local MCP、Herdr Link、Cloudflare Account、Worker、workers.dev origin、/health、/mcp、ChatGPT Connector の次手順を報告してください。失敗時は再実行の前に状態を確認し、成功済みの mutation を繰り返さないでください。
+```
+
+正本：[Local-Agent install and workers.dev deployment](docs/i18n/en/agent-install.md)。
+
 ## インストール（ゼロから動くまで）
 
 ### 0. 前提

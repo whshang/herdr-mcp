@@ -65,6 +65,25 @@ export HERDR_MCP_PORT=8772
 node dist/server.js
 ```
 
+## Install with a local Agent
+
+If you use a local coding Agent such as Codex, Claude Code, Pi, DSH or Cline, paste the prompt below into that Agent. The README intentionally does not duplicate the bootstrap procedure: the Agent must read the single authoritative guide first, then perform the clone, install, local-service setup and default `workers.dev` Edge deployment from that guide.
+
+```text
+Install and deploy herdr-mcp from zero. Do not infer the procedure from this prompt. First read the authoritative install guide:
+https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md
+
+Follow that document exactly. You own environment checks, safe clone/update, dependency installation, build, local MCP startup, Herdr socket verification, and deployment of the default Cloudflare workers.dev Edge.
+
+Do not stop and ask me to run commands unless a human Cloudflare login/API Token creation is required, or my Cloudflare identity exposes multiple Accounts and you need me to choose one. When Cloudflare credentials are required, give me the exact dashboard/API Token page, required permissions and scope, then wait for me to paste the Token back into this local-Agent conversation and continue the deployment automatically.
+
+After receiving the Cloudflare Token, never echo it and never write it to the repository, .env files, logs, screenshots or shell history. Use only a temporary process environment or mode-0600 temporary file and clean it immediately after deployment. Do not create a Custom Domain, DNS records or a Tunnel during first install; use workers.dev only.
+
+At the end report: local MCP status, Herdr Link status, Cloudflare Account, Worker name, workers.dev origin, /health URL, /mcp URL, and the next steps for creating the ChatGPT Connector. Diagnose failures before retrying and never repeat a mutation that already succeeded.
+```
+
+Authoritative workflow: [Local-Agent install and workers.dev deployment](docs/i18n/en/agent-install.md).
+
 ## Install (zero to working)
 
 ### 0. Prerequisites

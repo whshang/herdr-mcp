@@ -63,6 +63,25 @@ export HERDR_MCP_PORT=8772
 node dist/server.js
 ```
 
+## 交给本地 Agent 一键安装
+
+如果你正在使用 Codex、Claude Code、Pi、DSH、Cline 等能读文件和执行命令的**本地 Agent**，可以直接把下面整段提示词发给它。README 不复制安装逻辑；Agent 必须先读取唯一权威的安装指引，再按文档完成 clone、安装、本地服务和默认 `workers.dev` Edge 部署。
+
+```text
+请帮我从零安装并部署 herdr-mcp。不要根据这段提示词自行猜安装步骤；先读取唯一权威安装指引：
+https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md
+
+严格按该文档执行。你负责检查本机环境、clone 或安全更新仓库、安装依赖、构建、启动本地 MCP、验证 Herdr socket，并部署默认的 Cloudflare workers.dev Edge。
+
+除非遇到必须由我本人完成的 Cloudflare 登录/API Token 创建，或者我的 Cloudflare 账号存在多个可选 Account，否则不要停下来让我手动执行命令。需要 Cloudflare 凭据时，请主动给我准确的登录/API Token 页面、所需权限和作用域，引导我创建 Token；我把 Token 贴回这个本地 Agent 对话后，你继续自动部署。
+
+收到 Cloudflare Token 后：不要回显，不要写入仓库、.env、日志、截图或 shell 历史；只通过临时进程环境或 0600 临时文件使用，部署结束立即清理。不要创建 Custom Domain、DNS 记录或 Tunnel；首次安装只使用 workers.dev。
+
+最终请给我：本地 MCP 状态、Herdr Link 状态、Cloudflare Account、Worker 名、workers.dev origin、/health 地址、/mcp 地址，以及下一步在 ChatGPT 创建 Connector 的操作说明。任何一步失败都先诊断并修复，不要重复执行已经成功的 mutation。
+```
+
+权威流程：[本地 Agent 安装与 workers.dev 部署](docs/i18n/zh-CN/agent-install.md)。
+
 ## 安装（从零到可用）
 
 ### 0. 前置
