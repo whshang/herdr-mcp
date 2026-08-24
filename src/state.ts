@@ -14,7 +14,7 @@
  * `data.pane` is a FULL post-change PaneInfo, so any pane event is an upsert.
  */
 import { HerdrClient, HerdrEvent, HerdrResult } from "./herdr.js";
-import { fetchSessionSnapshot } from "./snap-fallback.js";
+import { fetchSessionSnapshot, reconcileSnapshotWithListApis } from "./snap-fallback.js";
 
 const RESUBSCRIBE_SEC = 25;   // subscribe chunk (daemon may not send on idle)
 const TTL_MS = 30_000;        // force a full re-snapshot at least this often
@@ -68,6 +68,7 @@ export class SnapshotCache {
   private liveWorkspaceIds = new Set<string>();
   private unknownWorkspaceIds = new Set<string>();
   private lastFullSnapAt = 0;
+  private refreshPromise: Promise<void> | null = null;
   private started = false;
   private loopError: Error | null = null;
   private _eventCount = 0;
@@ -108,6 +109,35 @@ export class SnapshotCache {
   /** Resolves after the first successful bootstrap snapshot (or stays pending). */
   whenReady(): Promise<void> {
     return this.readyPromise;
+  }
+
+  /**
+   * Refresh the live collections from the dedicated list APIs.
+   *
+   * /push/state is an explicit reconciliation endpoint for the browser
+   * extension, so callers must not be forced to wait for the background TTL
+   * when workspace labels/panes change. Coalesce concurrent callers to avoid
+   * multiplying socket requests when popup + HUD refresh together.
+   */
+  async refreshAuthoritative(): Promise<void> {
+    if (this.refreshPromise) return this.refreshPromise;
+    this.refreshPromise = (async () => {
+      this.state = await reconcileSnapshotWithListApis(this.client, this.state);
+      this.liveWorkspaceIds = new Set(
+        ((this.state["workspaces"] as unknown[]) ?? [])
+          .map((w) => {
+            const rec = (w ?? {}) as Record<string, unknown>;
+            return typeof rec["workspace_id"] === "string" ? rec["workspace_id"] as string
+              : typeof rec["id"] === "string" ? rec["id"] as string : null;
+          })
+          .filter((id): id is string => !!id),
+      );
+      for (const id of this.liveWorkspaceIds) this.unknownWorkspaceIds.delete(id);
+      this.lastFullSnapAt = Date.now();
+    })().finally(() => {
+      this.refreshPromise = null;
+    });
+    return this.refreshPromise;
   }
 
   /**

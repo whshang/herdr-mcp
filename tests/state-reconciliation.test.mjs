@@ -126,3 +126,33 @@ test("unknown workspace_created waits for workspace.list authority before admiss
   assert.equal(cache.getSnapshot().panes.length, 1);
   assert.equal(cache.getSnapshot().panes[0].workspace_id, "wNew");
 });
+
+test("explicit authoritative refresh replaces stale workspace metadata", async () => {
+  const client = {
+    async call(method) {
+      if (method === "workspace.list") {
+        return { workspaces: [{ workspace_id: "w68", label: "herdr-mcp" }] };
+      }
+      if (method === "pane.list") {
+        return { panes: [{ pane_id: "w68:p1", workspace_id: "w68", cwd: "/repo/herdr-mcp" }] };
+      }
+      if (method === "agent.list") return { agents: [] };
+      throw new Error(`unexpected method ${method}`);
+    },
+  };
+  const cache = new SnapshotCache(client);
+  cache.state = {
+    workspaces: [{ workspace_id: "w68", label: "old-session-label" }],
+    panes: [{ pane_id: "w68:p1", workspace_id: "w68", cwd: "/repo/old" }],
+    agents: [],
+  };
+  cache.liveWorkspaceIds = new Set(["w68"]);
+
+  await cache.refreshAuthoritative();
+
+  assert.deepEqual(cache.workspaceViews(), [{
+    id: "w68",
+    label: "herdr-mcp",
+    roots: ["/repo/herdr-mcp"],
+  }]);
+});

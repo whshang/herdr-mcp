@@ -338,6 +338,11 @@ class PushHub {
     };
   }
 
+  async freshStateView(): Promise<{ agents: unknown[]; workspaces: unknown[]; panes: unknown[]; server_time: string }> {
+    await this.cache.refreshAuthoritative();
+    return this.stateView();
+  }
+
   close(): void {
     this.unsub();
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
@@ -388,9 +393,9 @@ export function registerPushRoutes(app: Express, getClient: () => HerdrClient): 
     });
   });
 
-  router.get("/state", (_req: Request, res: Response) => {
+  router.get("/state", async (_req: Request, res: Response) => {
     const h = hub ?? (hub = new PushHub(getClient()));
-    res.status(200).json(h.stateView());
+    res.status(200).json(await h.freshStateView());
   });
 
   // Extension idle-nudge: tools/call counts in a wall-clock window (ChatGPT connector UA).
