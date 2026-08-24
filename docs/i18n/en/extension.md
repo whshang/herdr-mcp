@@ -76,6 +76,17 @@ In Per-Project mode, the bottom HUD bar owns frequent actions: **Manual continue
 
 **Automation off** keeps observation active but stops automatic mutations for that Project. Manual globally applies the same stop at the global layer without deleting saved Project preferences; switching back to Per-Project mode restores those preferences. Use the three manual HUD actions when automatic execution is off.
 
+### Page freshness / stale-view recovery
+
+0.1.44 separates “ChatGPT never replied” from “the server has newer conversation state but this tab is showing stale DOM.” Both human-submitted and extension-submitted user turns enter the health state machine. Once a recent turn has been idle long enough, the content script best-effort fetches the current same-origin conversation snapshot, follows `current_node` to the latest assistant message, and compares its message id, text, completion status and update time with the last assistant message visible in the page.
+
+- **server ahead**: a newer assistant message id exists, or the server copy of the same message is clearly longer than the DOM copy → refresh once when the composer/tool/permission safety gates allow it;
+- **server stalled**: the server explicitly says the assistant message is unfinished and it has not advanced for at least 60 seconds; if the page still claims streaming, wait another 30 seconds before allowing refresh;
+- **synced**: server and DOM agree and the server message is finished → do not refresh;
+- **unknown**: the private same-origin snapshot endpoint is unavailable, times out, or changes shape → fail closed; never refresh just because the probe failed.
+
+Before reload the extension persists the last assistant signature. After reload, newer content or resumed streaming ends recovery immediately. If the same partial answer is still present after 10 seconds and the page is otherwise safe, the extension submits one localized browser-recovery activation message telling ChatGPT to reread the current conversation state, continue from the actual stop point, and not replay completed mutations. Only if that activation also fails does the existing recovery-exhausted rollover path become eligible.
+
 ### A2. Long-conversation compression and rollover (ChatGPT Project)
 
 Extension 0.1.39 adds **Rollover** to the in-page HUD. Version 0.1.43 adds the Project-scoped automation gate; 0.1.44 adds stale-view refresh and post-refresh activation to the same recovery chain. Global manual mode or Project `Auto off` prevents those automatic recovery/rollover actions from starting.
