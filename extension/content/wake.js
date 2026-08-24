@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.40";
+const H2W_CONTENT_VERSION = "0.1.41";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -932,6 +932,22 @@ const H2W_CONTENT_VERSION = "0.1.40";
     return label ? `${label} (${id})` : id;
   }
 
+  function hudBoundRuntimeState(hud) {
+    const bindings = Array.isArray(hud?.bindings) ? hud.bindings : [];
+    if (!hud?.bound || !bindings.length) return hud?.bound ? "bound" : "unbound";
+    if (bindings.some((b) => b?.status === "working" || Number(b?.working_count) > 0)) return "working";
+    if (bindings.some((b) => b?.status === "blocked")) return "blocked";
+    const statuses = bindings.map((b) => String(b?.status || "").trim()).filter(Boolean);
+    if (statuses.includes("done")) return "done";
+    if (statuses.includes("idle")) return "idle";
+    return statuses[0] || "bound";
+  }
+
+  function hudBindingForWorkspace(id) {
+    return (Array.isArray(hudCache?.bindings) ? hudCache.bindings : [])
+      .find((binding) => String(binding?.workspace_id || "") === id) || null;
+  }
+
   function setHudExpanded(expanded) {
     const ui = ensurePageHud();
     hudExpanded = Boolean(expanded);
@@ -1065,7 +1081,14 @@ const H2W_CONTENT_VERSION = "0.1.40";
       const meta = document.createElement("div");
       meta.className = "ws-meta";
       const roots = Array.isArray(workspace?.roots) ? workspace.roots : [];
-      meta.textContent = roots.length ? String(roots[0]) : (bound ? "Bound to this conversation" : "Available");
+      const binding = bound ? hudBindingForWorkspace(id) : null;
+      if (binding) {
+        const state = String(binding.status || "bound");
+        const active = Number(binding.working_count) || 0;
+        meta.textContent = active > 0 ? `${state} · ${active} active` : state;
+      } else {
+        meta.textContent = roots.length ? String(roots[0]) : "Available";
+      }
       copy.append(title, meta);
       const action = document.createElement("button");
       action.type = "button";
@@ -1119,6 +1142,9 @@ const H2W_CONTENT_VERSION = "0.1.40";
         button:hover { filter: brightness(.97); }
         button:disabled, input:disabled { opacity: .55; cursor: wait; }
         .bar.waiting .status { color: #8a4b00; }
+        .bar.working .status { color: #a15c00; }
+        .bar.done .status, .bar.idle .status { color: #18794e; }
+        .bar.blocked .status { color: #b42318; }
         .bar.recovering .status { color: #9a3412; }
         .bar.failed .status { color: #b42318; }
         .panel {
@@ -1227,6 +1253,12 @@ const H2W_CONTENT_VERSION = "0.1.40";
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape" && hudExpanded) setHudExpanded(false);
     });
+    document.addEventListener("pointerdown", (event) => {
+      if (!hudExpanded) return;
+      const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+      if (path.includes(host) || event.target === host) return;
+      setHudExpanded(false);
+    }, true);
     return hudEls;
   }
 
@@ -1248,6 +1280,7 @@ const H2W_CONTENT_VERSION = "0.1.40";
   }
 
   function hudVisualClass(state) {
+    if (["working", "idle", "done", "blocked"].includes(state)) return state;
     if (state === "reply_waiting") return "waiting";
     if (["reply_suspect", "recovery_message_sent", "reload_pending", "recovering", "rollover_recommended", "rollover_required"].includes(state)) {
       return "recovering";
@@ -1264,10 +1297,10 @@ const H2W_CONTENT_VERSION = "0.1.40";
     if (view.pending === true) hudPending = true;
     if (view.pending === false) hudPending = false;
 
-    const state = String(
-      conversationHealth?.state
-      || (hudPending ? "reply_waiting" : (hud?.bound ? "healthy" : "unknown")),
-    );
+    // The bar reports the bound Herdr workspace runtime state independently
+    // from whether automatic wake/nudge is enabled. Recovery remains visible
+    // in the tooltip through the separate recovery field below.
+    const state = hudBoundRuntimeState(hud);
     const lastEvent = hud?.last?.reason
       ? `${hud.last.reason}${hud.last.at ? ` @ ${new Date(hud.last.at).toLocaleTimeString()}` : ""}`
       : null;

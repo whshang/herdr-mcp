@@ -23,7 +23,7 @@ import {
   newContinuityId, newTransferId,
 } from "./continuity-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.40";
+const H2W_SCRIPT_VERSION = "0.1.41";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const PUSH_CONNECT_MS = 5000;
 const STATE_FETCH_MS = 4000;
@@ -454,10 +454,10 @@ function stopPushStream() {
 
 async function ensurePushStream(bindings) {
   await configReady;
-  // Keep exactly one extension-wide stream whenever wake is enabled, even
-  // before the first binding. Its hello snapshot is also the authoritative
-  // workspace catalog used by the in-page picker.
-  if (pushStream || CFG.enabled === false) return;
+  // Keep exactly one extension-wide observation stream even when automatic
+  // wake/nudge is paused. Bound workspace runtime state must stay live in the
+  // HUD; CFG.enabled gates actions, not observability.
+  if (pushStream) return;
   const ctrl = new AbortController();
   pushStream = { ctrl };
   void runPushStream(ctrl);
@@ -563,7 +563,7 @@ async function onPushHello(storeKey, data) {
   b.status = d.status;
   b.lastSettle = d.lastSettle;
   await saveBindings(bindings);
-  if (d.status === "working") armProgressTimer(storeKey, b);
+  if (d.status === "working" && CFG.enabled) armProgressTimer(storeKey, b);
   if (d.wake) {
     callLog(`hello recovery wake: ws=${ws} → ${d.status} (settle missed while offline)`);
     await routeWake(b, { status: d.status, output: "", working_count: d.working_count }, CFG.wakeTemplate || DEFAULT_TEMPLATE);
@@ -582,7 +582,8 @@ async function onPushWorking(storeKey, data) {
   b.status = "working";
   await saveBindings(bindings);
   setActionBadge("…", "#d97706");
-  armProgressTimer(storeKey, b);
+  if (CFG.enabled) armProgressTimer(storeKey, b);
+  else clearProgressTimer(storeKey);
 }
 
 async function onPushSettled(storeKey, data) {
@@ -1643,6 +1644,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         workspace_id: session[0]?.workspace_id || (session[0] ? normalizeWorkspaceId(session[0]) : null),
         binding_count: session.length,
         bound_workspace_ids: session.map((b) => b.workspace_id || normalizeWorkspaceId(b)).filter(Boolean),
+        bindings: session.map((b) => bindingView(b)),
         continuity_id: session.map((b) => b.continuity_id).find(Boolean) || transfer?.continuity_id || null,
         can_handoff: Boolean(
           convInfo?.project_id

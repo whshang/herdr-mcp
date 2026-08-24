@@ -54,12 +54,14 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.40", "manifest version includes HUD controls");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.40"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.40"'), "content version matches manifest");
+ok(manifest.version === "0.1.41", "manifest version includes live HUD runtime state");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.41"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.41"'), "content version matches manifest");
 ok(
-  backgroundSource.includes("bound_workspace_ids:") && backgroundSource.includes("workspaces: state?.ok"),
-  "page HUD response carries live workspaces and bound workspace ids",
+  backgroundSource.includes("bound_workspace_ids:")
+    && backgroundSource.includes("bindings: session.map((b) => bindingView(b))")
+    && backgroundSource.includes("workspaces: state?.ok"),
+  "page HUD response carries live workspace and binding runtime state",
 );
 ok(
   backgroundSource.includes("msg.tabId || sender.tab?.id"),
@@ -71,6 +73,17 @@ ok(
     && wakeSource.includes("h2w_unbind")
     && wakeSource.includes("ws-action"),
   "in-page HUD contains the conversation controls",
+);
+ok(
+  wakeSource.includes("hudBoundRuntimeState")
+    && wakeSource.includes('document.addEventListener("pointerdown"')
+    && wakeSource.includes("path.includes(host)"),
+  "HUD stays runtime-state driven and closes its drawer on outside click",
+);
+ok(
+  backgroundSource.includes("CFG.enabled gates actions, not observability")
+    && !backgroundSource.includes("if (pushStream || CFG.enabled === false) return;"),
+  "push observation remains live while wake and nudge are paused",
 );
 ok(
   !wakeSource.includes('class="handoff-action"')
