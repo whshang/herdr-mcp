@@ -1,4 +1,4 @@
-# Browser extension — product overview
+# Browser extension
 
 Audience: extension authors and users. Chrome display name **herdr → Web wake**. `extension/` keeps one clear boundary: it keeps web conversations connected to local Herdr work over time; it is not another Agent runtime, memory system, or orchestration platform. JSON→MCP is a separate compatibility track.
 Language: product UI is en / Simplified Chinese / Japanese (same as herdr); this page is written in English. Repo-root README: [en](../../../README.md) / [zh](../../../README.zh.md) / [ja](../../../README.ja.md).

@@ -6,7 +6,7 @@
 
 [Herdr](https://herdr.dev) はコーディング agent 向けの端末マルチプレクサ。このリポジトリはソケットもディスクも見えない**遠隔**クライアントの入口。Herdr の約 90 個のネイティブメソッドを MCP ツールに再包装しない。
 
-**しないこと:** Herdr の代替。DeepSeek に偽の OAuth connector を付ける。拡張を公開トンネルへ出す（拡張は `127.0.0.1` のみ）。
+**しないこと:** Herdr の代替。DeepSeek に偽の OAuth connector を付ける。拡張をローカル以外へ出す（拡張は `127.0.0.1` のみ）。
 
 **言語（herdr と同じ）:** [English](README.md)（GitHub 既定）· [简体中文](README.zh.md) · [日本語](README.ja.md)。  
 CLI / ブラウザ拡張: 初回インストールはシステム言語（`en` / `zh` / `ja`）、不明なら英語。変更: `herdr-mcp lang`、または拡張の Options → Language。
@@ -22,7 +22,7 @@ Agents の進捗 / settled が拡張へ届き、拡張がウェブ会話へ書�
 - 推論が必要なら Herdr-native の安い/高速 worker（`pi` / `flash` / `cline` / `opencode` / `anti`）または監査（`droid` / `grok`）へ直接 `herdr_prompt`。本機 Claude/OMP/main を中間マネージャにしない。
 - Pi/Herdr worker が使えない場合は、実測済みの `dsh --profile headless "task"` を CLI fallback にできる。ただし非自明な coding task は `herdr_exec_start` の長時間 session で実行し、timeout 後は再送前に Git/test の実結果を確認する。`dsh-tui` は人間向け interactive fallback。詳細: [worker fallbacks](docs/i18n/en/worker-fallbacks.md)。
 - `inspect`/`since` は既定で Claude/OMP/Codex をソフト非表示。既知 pane への prompt は可。`HERDR_MCP_AGENT_ALLOW=*` で全表示。
-- 現在は frozen contract epoch 2 を共通利用します。**18 tools（`herdr_skill` を含む）**で、開始手順は `herdr_inspect` → `herdr_skill`（一度）→ 作業です。epoch 1 は旧 17-tool セッション/rollback 用の互換基線としてのみ残します。
+- 現在は frozen contract epoch 2 を共通利用します。**18 tools（`herdr_skill` を含む）**で、開始手順は `herdr_inspect` → `herdr_skill`（一度）→ 作業です。
 
 ```mermaid
 flowchart TB
@@ -107,8 +107,6 @@ https://herdr-edge.<your-account-subdomain>.workers.dev/mcp
 ```
 
 Cloudflare に独自 zone がある場合は、`herdr.example.com` のような Custom Domain を後から追加できます。これは**推奨オプションであり必須ではありません**。先に `workers.dev` 上で Worker / WSS Link / MCP / OAuth を検証してください。詳細: [Cloudflare Edge deployment](docs/i18n/en/cloudflare-edge-deployment.md)。
-
-ローカル MCP を `cloudflared` / Quick Tunnel で直接公開する方式は、旧構成からの移行・トラブルシューティング用としてのみ残します。
 
 Runtime のリリースは安定した Edge/Link の背後で A/B 切り替えでき、ChatGPT Connector の変更は不要です。詳細: [Runtime A/B self-upgrade](docs/i18n/en/runtime-self-upgrade.md)。
 

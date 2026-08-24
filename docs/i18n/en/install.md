@@ -1,4 +1,4 @@
-# Install and quick start
+# Install
 
 Get a remote planner (ChatGPT or another web model) talking to your local Herdr workstation through herdr-mcp. The supported flow is: install and start the local MCP server first, then deploy the Cloudflare Edge and connect ChatGPT — the Edge is what ChatGPT actually talks to, so deploy it before creating the Connector.
 

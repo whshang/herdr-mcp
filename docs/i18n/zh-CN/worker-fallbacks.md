@@ -1,4 +1,4 @@
-# Worker fallbacks：Pi、DSH 与 dsh-tui
+# Worker 备选
 
 herdr-mcp 始终把网页模型当作 planner。本地 agent CLI 是执行 worker，不是第二层编排。
 

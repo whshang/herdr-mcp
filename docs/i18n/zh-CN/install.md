@@ -1,4 +1,4 @@
-# 安装与快速开始
+# 安装
 
 让 ChatGPT（或其它网页模型）通过 herdr-mcp 与本地 Herdr 工作站打通。官方推荐的顺序：先安装并启动本地 MCP 服务器，再部署 Cloudflare Edge，最后连接 ChatGPT —— ChatGPT 实际访问的是 Edge，所以**先部署 Edge，再创建 Connector**。
 

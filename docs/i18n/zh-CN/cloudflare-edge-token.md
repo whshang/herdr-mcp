@@ -1,4 +1,4 @@
-# Cloudflare Edge Token：最小权限创建与本地保存
+# Cloudflare Edge Token
 
 Herdr 的 Cloudflare Edge 部署、Worker Route 或 Custom Domain 管理都不应长期复用一个“全能” Cloudflare Token。推荐为 Herdr 单独创建一个 Account API Token，只授予两项权限：
 

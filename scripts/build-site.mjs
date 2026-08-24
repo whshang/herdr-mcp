@@ -243,8 +243,9 @@ function articleShell({ locale, doc, body, toc, docsBySlug, searchIndex, version
     <aside class="sidebar" id="docs-sidebar" data-sidebar>${sidebarNav(docsBySlug, doc.slug, ui, locale)}</aside>
     <main class="article-column">
       <article class="doc-body" data-doc-slug="${esc(doc.slug)}">${bodyWithCopy}</article>
+      ${doc.slug === DOC_ORDER[0] ? agentIntroBlock(ui, pre) : ""}
       ${pageNav(docsBySlug, doc.slug, ui)}
-      <footer class="docs-footer"><a href="./">${esc(ui.docsIndex)}</a><a href="https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/${esc(locale)}/${esc(doc.slug)}.md">${esc(ui.editSource)}</a></footer>
+      <footer class="docs-footer"><a href="https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/${esc(locale)}/${esc(doc.slug)}.md">${esc(ui.editSource)}</a></footer>
     </main>
     <aside class="toc" aria-label="${esc(ui.onThisPage)}"><div class="toc-inner"><h2>${esc(ui.onThisPage)}</h2>${tocMarkup(toc, ui)}</div></aside>
   </div>
@@ -261,57 +262,60 @@ function agentIntroBlock(ui, pre) {
   </section>`;
 }
 
-function docsIndexShell({ locale, docsBySlug, searchIndex, version }) {
-  const pre = "../../";
+// Docs have no landing page: /docs/<locale>/ forwards straight to the first
+// document (DOC_ORDER[0]) so there is one click between entry and content.
+function localeEntryShell({ locale }) {
   const ui = UI[locale];
-  const groups = NAV_GROUPS.map((group, index) => `<section class="index-group" data-nav-group="${esc(NAV_GROUP_LABELS[locale][index])}"><div class="index-group-heading"><span class="eyebrow">${esc(NAV_GROUP_LABELS[locale][index])}</span></div><div class="docs-grid">${group.slugs.map((slug) => {
-    const doc = docsBySlug.get(slug);
-    return `<article class="doc-card" data-doc-slug="${esc(slug)}"><h2><a href="./${esc(slug)}.html">${esc(doc.title)}</a></h2><p>${esc(doc.description)}</p></article>`;
-  }).join("")}</div></section>`).join("");
-  const selfHref = `${origin}/docs/${locale}/index.html`;
-  const alternates = LOCALES.map((lang) => ({ lang, href: `${origin}/docs/${lang}/index.html` }));
-  return `<!doctype html>
-<html lang="${ui.htmlLang}">
-<head>
-  ${headMeta({ pre, locale, canonicalHref: selfHref, alternates, xDefault: `${origin}/docs/index.html`, description: ui.indexLead, title: `${ui.docsNav} · herdr-mcp` })}
-</head>
-<body class="docs-index-page">
-  ${topbar({ pre, locale, localePrefix: "../", version })}
-  <main class="docs-index">
-    <header class="docs-hero">
-      <span class="eyebrow">${esc(ui.indexEyebrow)}</span>
-      <h1>${esc(ui.indexTitle)}</h1>
-      <p>${esc(ui.indexLead)}</p>
-      <div class="hero-actions"><a class="button primary" href="./chatgpt-connector.html">${esc(ui.indexCtaConnect)}</a><a class="button" href="./architecture.html">${esc(ui.indexCtaArchitecture)}</a><a class="button" href="./cloudflare-edge-deployment.html">${esc(ui.indexCtaDeploy)}</a></div>
-    </header>
-    ${agentIntroBlock(ui, pre)}
-    <section class="docs-paths" aria-label="${esc(ui.indexEyebrow)}">${groups}</section>
-    <footer class="docs-footer" aria-label="${esc(ui.indexFooterAria)}"><a href="${pre}">${esc(ui.indexHome)}</a><a href="https://github.com/whshang/herdr-mcp">${esc(ui.indexSource)}</a></footer>
-  </main>
-  ${searchUi({ pre, locale, searchIndex })}
-</body>
-</html>`;
-}
-
-// Neutral /docs/ entry: no language chooser — English is the default locale,
-// so /docs/ forwards straight to the English index. The topbar language
-// switcher on every docs page is how readers reach 简体中文.
-function docsRedirectShell() {
-  const ui = UI[DEFAULT_LOCALE];
-  const enIndex = `${origin}/docs/en/index.html`;
+  const first = DOC_ORDER[0];
   return `<!doctype html>
 <html lang="${ui.htmlLang}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="${esc(ui.indexTitle)}">
+  <meta name="description" content="${esc(ui.indexLead)}">
   <meta name="color-scheme" content="light dark">
-  <title>${esc(ui.docsNav)} · herdr-mcp</title>
-  <link rel="canonical" href="${esc(enIndex)}">
-  <link rel="alternate" hreflang="en" href="${esc(enIndex)}">
-  <link rel="alternate" hreflang="zh-CN" href="${esc(`${origin}/docs/zh-CN/index.html`)}">
-  <link rel="alternate" hreflang="x-default" href="${esc(enIndex)}">
-  <meta http-equiv="refresh" content="0; url=./en/index.html">
+  <title>herdr-mcp ${esc(ui.docsNav)}</title>
+  <link rel="canonical" href="${esc(`${origin}/docs/${locale}/${first}.html`)}">
+  ${LOCALES.map((lang) => `<link rel="alternate" hreflang="${esc(lang)}" href="${esc(`${origin}/docs/${lang}/${first}.html`)}">`).join("\n  ")}
+  <link rel="alternate" hreflang="x-default" href="${esc(`${origin}/docs/${DEFAULT_LOCALE}/${first}.html`)}">
+  <meta http-equiv="refresh" content="0; url=./${first}.html">
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body class="docs-index-page">
+  <main class="docs-index">
+    <div class="redirect-note">
+      <span class="eyebrow">${esc(ui.docsNav)}</span>
+      <h1>herdr-mcp ${esc(ui.docsNav)}</h1>
+      <p>${esc(ui.indexLead)}</p>
+      <p class="redirect-links"><a href="./${first}.html">${esc(ui.indexCtaArchitecture)} →</a></p>
+    </div>
+  </main>
+  <script>location.replace("./${first}.html");</script>
+</body>
+</html>`;
+}
+
+// Neutral /docs/ entry: no language chooser. Default locale is English, but a
+// zh browser (without an explicit language pin) is routed to the Simplified
+// Chinese docs so the neutral entry never dumps Chinese readers into English.
+function docsRedirectShell() {
+  const ui = UI[DEFAULT_LOCALE];
+  const first = DOC_ORDER[0];
+  const enFirst = `${origin}/docs/en/${first}.html`;
+  const zhFirst = `${origin}/docs/zh-CN/${first}.html`;
+  return `<!doctype html>
+<html lang="${ui.htmlLang}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="${esc(ui.indexLead)}">
+  <meta name="color-scheme" content="light dark">
+  <title>herdr-mcp ${esc(ui.docsNav)}</title>
+  <link rel="canonical" href="${esc(enFirst)}">
+  <link rel="alternate" hreflang="en" href="${esc(enFirst)}">
+  <link rel="alternate" hreflang="zh-CN" href="${esc(zhFirst)}">
+  <link rel="alternate" hreflang="x-default" href="${esc(enFirst)}">
+  <meta http-equiv="refresh" content="0; url=./en/${first}.html">
   <link rel="stylesheet" href="../style.css">
 </head>
 <body class="docs-index-page">
@@ -320,10 +324,14 @@ function docsRedirectShell() {
       <span class="eyebrow">${esc(ui.docsNav)}</span>
       <h1>herdr-mcp ${esc(ui.docsNav)}</h1>
       <p>${esc(ui.indexLead)}</p>
-      <p class="redirect-links"><a href="./en/index.html">English →</a><a href="./zh-CN/index.html">简体中文</a></p>
+      <p class="redirect-links"><a href="./en/${first}.html">English →</a><a href="./zh-CN/${first}.html">简体中文</a></p>
     </div>
   </main>
-  <script>location.replace("./en/index.html");</script>
+  <script>
+    var langKey = "herdr-docs-lang";
+    var wantsZh = !localStorage.getItem(langKey) && (navigator.languages || [navigator.language]).some(function (l) { return (l || "").toLowerCase().indexOf("zh") === 0; });
+    location.replace(wantsZh ? "./zh-CN/${first}.html" : "./en/${first}.html");
+  </script>
 </body>
 </html>`;
 }
@@ -374,6 +382,24 @@ for (const locale of LOCALES) {
     };
   });
   byLocale.set(locale, { docsBySlug, rendered, searchIndex });
+}
+
+// Cross-language search: every item also carries the same document's title,
+// headings and blurb from the other locale, so a query typed in either language
+// finds the document from either side of the site.
+for (const locale of LOCALES) {
+  const { docsBySlug, rendered, searchIndex } = byLocale.get(locale);
+  const other = LOCALES.find((lang) => lang !== locale);
+  const otherData = byLocale.get(other);
+  for (const item of searchIndex) {
+    const slug = item.href.replace(/^\.\//, "").replace(/\.html$/, "");
+    const od = otherData.docsBySlug.get(slug);
+    const op = otherData.rendered.get(slug);
+    if (od && op) {
+      item.aliases = [od.title, od.description, ...op.toc.map((heading) => heading.title)].filter((text) => typeof text === "string" && text.length > 0);
+    }
+  }
+  byLocale.set(locale, { ...byLocale.get(locale), searchIndex });
 
   const localeOut = join(outDir, "docs", locale);
   await mkdir(localeOut, { recursive: true });
@@ -385,7 +411,7 @@ for (const locale of LOCALES) {
       articleShell({ locale, doc, body: page.html, toc: page.toc, docsBySlug, searchIndex, version: pkg.version })
     );
   }
-  await writeFile(join(localeOut, "index.html"), docsIndexShell({ locale, docsBySlug, searchIndex, version: pkg.version }));
+  await writeFile(join(localeOut, "index.html"), localeEntryShell({ locale }));
 }
 
 await writeFile(join(outDir, "docs", "index.html"), docsRedirectShell());

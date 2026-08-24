@@ -1,4 +1,4 @@
-# Cloudflare Edge deployment: `workers.dev` by default, Custom Domain optional
+# Cloudflare Edge
 
 Herdr's Cloudflare Edge does not require users to own a domain.
 

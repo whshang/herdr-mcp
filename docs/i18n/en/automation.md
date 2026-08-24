@@ -1,4 +1,4 @@
-# GitHub Pages, CI/CD and self-update
+# Automation
 
 herdr-mcp has three intentionally separate automation planes. They share source control, but they do not share credentials or failure domains.
 

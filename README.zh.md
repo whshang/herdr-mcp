@@ -6,7 +6,7 @@ MCP HTTP 门面：让 ChatGPT（及其它网页模型）驱动本机 [Herdr](htt
 
 [Herdr](https://herdr.dev) 是给 coding agent 用的终端复用器。本仓库给**看不到**本机 socket 和磁盘的远程客户端当门。它**不会**把 herdr 约 90 个原生方法逐个做成 MCP 工具。
 
-**本仓库不做：** 替代 herdr；给 DeepSeek 装假的 OAuth connector；让扩展走公网隧道（扩展只连 `127.0.0.1`）。
+**本仓库不做：** 替代 herdr；给 DeepSeek 装假的 OAuth connector；把扩展暴露到公网（扩展只连 `127.0.0.1`）。
 
 **语言（与 herdr 一致）：** [English](README.md)（GitHub 默认）· [简体中文](README.zh.md) · [日本語](README.ja.md)。  
 CLI / 浏览器插件：首次安装跟系统语言（`en` / `zh` / `ja`），未知则英语。可随时改：`herdr-mcp lang`，或插件选项页 → 语言。
@@ -22,7 +22,7 @@ Agents 的进度/收工通知到 extension；extension 再 ↻ 写入网页输�
 - 必须推理时，优先 `herdr_prompt` 给便宜/高速的 Herdr 原生 worker（`pi`、`flash`、`cline`、`opencode`、`anti`）或审计（`droid`、`grok`），不要经本机 Claude/OMP/main 再转派。
 - Pi/Herdr worker 不可用时，实测可用 `dsh --profile headless "任务"` 作为开发 CLI 备选，但要通过 `herdr_exec_start` 长任务 session 跑；DSH 可能已经改完代码却还没在 60 秒内打印最终回复，超时后必须先看 Git/test 再决定是否重试。`dsh-tui` 只作为人工交互接管。详见 [worker fallbacks](docs/i18n/zh-CN/worker-fallbacks.md)。
 - `inspect`/`since` 默认软隐藏 Claude/OMP/Codex。知道 pane 仍可 prompt。`HERDR_MCP_AGENT_ALLOW=*` 显示全部。
-- 当前统一使用冻结的 contract epoch 2：**18 tools，包含 `herdr_skill`**。会话开始：`herdr_inspect` → `herdr_skill`（一次）→ 干活。epoch 1 只保留为历史 17-tool 回滚/旧会话兼容基线。
+- 当前统一使用冻结的 contract epoch 2：**18 tools，包含 `herdr_skill`**。会话开始：`herdr_inspect` → `herdr_skill`（一次）→ 干活。
 
 ```mermaid
 flowchart TB
@@ -69,7 +69,7 @@ node dist/server.js
 
 - 已安装并正在运行 [herdr](https://herdr.dev)
 - Node.js 20+（`node -v`）
-- 接 ChatGPT 推荐使用 Cloudflare Worker 的 `workers.dev` 公网 HTTPS（不要求自有域名）；Custom Domain 只是稳定长期入口的可选增强。直接 `cloudflared` 暴露本机仅保留为旧架构迁移兼容。
+- 接 ChatGPT 推荐使用 Cloudflare Worker 的 `workers.dev` 公网 HTTPS（不要求自有域名）；Custom Domain 只是稳定长期入口的可选增强。
 
 ### 1. 下载与构建
 
@@ -108,8 +108,6 @@ https://herdr-edge.<你的-account-subdomain>.workers.dev/mcp
 ```
 
 如果已经有自己的 Cloudflare zone，可以再绑定 `herdr.example.com` 这样的 Custom Domain。**这是推荐项，不是前置条件。** 必须先在 `workers.dev` 上把 Worker、WSS Link、MCP 和 OAuth 验证通过，再独立绑定生产域名。详见 [Cloudflare Edge 部署](docs/i18n/zh-CN/cloudflare-edge-deployment.md) 和 [Cloudflare Edge Token](docs/i18n/zh-CN/cloudflare-edge-token.md)。
-
-直接用 `cloudflared` / Quick Tunnel 把本机 MCP 暴露公网只作为旧版本迁移和故障排查手段，不再是新安装默认架构。
 
 Runtime 升级可以在稳定的 Edge/Link 后面做 A/B 切代，不需要修改 ChatGPT Connector。详见 [Runtime A/B 自升级](docs/i18n/zh-CN/runtime-self-upgrade.md)。
 
@@ -207,7 +205,7 @@ herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法
 | `herdr_exec` | 短命令：workspace 可见 `herdr-mcp:utility` pane。若控制面 TaskGroup 在 **投递前** 阻断窗格操作，自动降级本机 zsh（`backend:local_fallback`）；已投递后绝不重发。 |
 | `herdr_exec_start` / `read` / `kill` | 长命令后台会话（本机进程，非 utility pane）。 |
 
-可选：`HERDR_MCP_ALL_TOOLS=1` 打开高级/废弃生命周期工具（共 30 个）。写操作限 managed git root；`HERDR_MCP_READONLY=1` / `HERDR_MCP_WRITE_ROOTS=/a,/b` 可再收紧。
+可选：`HERDR_MCP_ALL_TOOLS=1` 打开生命周期工具（共 30 个）。写操作限 managed git root；`HERDR_MCP_READONLY=1` / `HERDR_MCP_WRITE_ROOTS=/a,/b` 可再收紧。
 
 ## 环境变量
 

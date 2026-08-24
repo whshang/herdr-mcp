@@ -1,4 +1,4 @@
-# Runtime A/B self-upgrade
+# Runtime self-upgrade
 
 Herdr MCP keeps the ChatGPT-facing Edge and the workstation `herdr-link` stable while local MCP runtime generations are replaced behind the link. Runtime A/B is a **same-contract-epoch** mechanism; a public contract-epoch change uses a separate supervised migration.
 

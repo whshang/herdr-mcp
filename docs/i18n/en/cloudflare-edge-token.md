@@ -1,4 +1,4 @@
-# Cloudflare Edge Token: least-privilege creation and local storage
+# Cloudflare Edge Token
 
 Herdr's Cloudflare Edge deployment, Worker Route, or Custom Domain management should not reuse one "all-powerful" Cloudflare Token long-term. Create a dedicated Account API Token for Herdr with exactly two permissions:
 

@@ -1,4 +1,4 @@
-# ChatGPT Connector 经验备忘
+# ChatGPT Connector
 
 读者：给 ChatGPT 接 herdr-mcp 的人，以及改 OAuth / Streamable HTTP 的代理。
 

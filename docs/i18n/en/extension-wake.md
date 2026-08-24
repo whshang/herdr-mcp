@@ -1,4 +1,4 @@
-# Browser extension — pushing herdr progress back to the web (track A)
+# Progress nudge
 
 Audience: anyone whose web AI dispatches work to herdr and then the conversation stalls, needing proactive reminders to continue.
 

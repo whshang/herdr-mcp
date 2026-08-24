@@ -11,6 +11,14 @@
   <link rel="alternate" hreflang="zh-CN" href="https://whshang.github.io/herdr-mcp/zh-CN/index.html">
   <link rel="alternate" hreflang="x-default" href="https://whshang.github.io/herdr-mcp/">
   <link rel="stylesheet" href="./style.css">
+  <script>
+    // Chinese browsers get the Chinese homepage unless they pinned a language.
+    try {
+      if (!localStorage.getItem("herdr-docs-lang") && (navigator.languages || [navigator.language]).some(function (l) { return (l || "").toLowerCase().indexOf("zh") === 0; })) {
+        location.replace("./zh-CN/");
+      }
+    } catch (e) { /* storage blocked: stay on this page */ }
+  </script>
 </head>
 <body>
   <header class="topbar">

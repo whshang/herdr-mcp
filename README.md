@@ -8,7 +8,7 @@ MCP HTTP gateway so ChatGPT (and other web LLMs) can drive local [Herdr](https:/
 
 [Herdr](https://herdr.dev) is a terminal multiplexer for coding agents. This repo is the door for **remote** clients that cannot see your socket or disk. It does **not** re-wrap Herdr’s ~90 native methods as MCP tools.
 
-**This repo does not:** replace Herdr; give DeepSeek a fake OAuth connector; send the extension over the public tunnel (it talks to `127.0.0.1` only).
+**This repo does not:** replace Herdr; give DeepSeek a fake OAuth connector; expose the extension anywhere but localhost (it talks to `127.0.0.1` only).
 
 **Languages (same as herdr):** [English](README.md) (default on GitHub) · [简体中文](README.zh.md) · [日本語](README.ja.md).  
 CLI / browser extension: first install follows system language (`en` / `zh` / `ja`); unknown → English. Change anytime: `herdr-mcp lang`, or extension Options → Language.
@@ -24,7 +24,7 @@ Agents’ progress / settled events reach the extension; the extension ↻ types
 - If reasoning is required, prefer `herdr_prompt` to a cheap/fast Herdr worker (`pi`, `flash`, `cline`, `opencode`, `anti`) or auditor (`droid`, `grok`) — do not route through local Claude/OMP/main.
 - If Pi/Herdr workers are unavailable, `dsh --profile headless "job"` is a tested CLI fallback. Run it through a long `herdr_exec_start` session, not a 60s synchronous shell: tool edits may complete before the final headless answer is printed. `dsh-tui` is the human-interactive fallback, not the default automation surface. See [worker fallbacks](docs/i18n/en/worker-fallbacks.md).
 - `inspect`/`since` soft-hide Claude/OMP/Codex by default. Prompting by known pane still works. `HERDR_MCP_AGENT_ALLOW=*` shows all.
-- Current sessions use the frozen contract epoch 2 surface: **18 tools including `herdr_skill`**. Start with `herdr_inspect` → `herdr_skill` (once) → work. Epoch 1 remains only as the historical 17-tool rollback/old-session compatibility baseline.
+- Current sessions use the frozen contract epoch 2 surface: **18 tools including `herdr_skill`**. Start with `herdr_inspect` → `herdr_skill` (once) → work.
 
 ```mermaid
 flowchart TB
@@ -71,7 +71,7 @@ node dist/server.js
 
 - [herdr](https://herdr.dev) installed and running
 - Node.js 20+ (`node -v`)
-- For ChatGPT: a Cloudflare Worker endpoint on `workers.dev` (default, no custom domain required); a Custom Domain is optional for a stable long-lived origin. Direct `cloudflared` exposure is kept only as a legacy migration path.
+- For ChatGPT: a Cloudflare Worker endpoint on `workers.dev` (default, no custom domain required); a Custom Domain is optional for a stable long-lived origin.
 
 ### 1. Download and build
 
@@ -110,8 +110,6 @@ https://herdr-edge.<your-account-subdomain>.workers.dev/mcp
 ```
 
 If you own a Cloudflare zone, a Custom Domain such as `herdr.example.com` is **recommended but optional**. Always validate the Worker on `workers.dev` first; then attach the custom hostname separately. See [Cloudflare Edge deployment](docs/i18n/en/cloudflare-edge-deployment.md) and [Cloudflare Edge token](docs/i18n/en/cloudflare-edge-token.md).
-
-Direct `cloudflared` / Quick Tunnel exposure of the local MCP server is retained only for legacy migration and troubleshooting; it is no longer the recommended new-install architecture.
 
 Runtime releases can switch behind the persistent Edge/Link without changing the ChatGPT Connector. See [Runtime A/B self-upgrade](docs/i18n/en/runtime-self-upgrade.md).
 
@@ -209,7 +207,7 @@ Herdr’s native surface is a large Unix-socket API (`herdr api schema`, ~90 met
 | `herdr_exec` | Short shell in the workspace’s visible `herdr-mcp:utility` pane. If control-plane TaskGroup blocks pane ops **before** the command is sent, falls back to a local zsh (`backend:local_fallback`) — never double-runs after delivery. |
 | `herdr_exec_start` / `read` / `kill` | Long background shell sessions (local process, not the utility pane). |
 
-Optional: `HERDR_MCP_ALL_TOOLS=1` adds advanced/deprecated lifecycle tools (30 total). Mutations stay in managed git roots; `HERDR_MCP_READONLY=1` / `HERDR_MCP_WRITE_ROOTS=/a,/b` tighten writes.
+Optional: `HERDR_MCP_ALL_TOOLS=1` adds lifecycle tools (30 total). Mutations stay in managed git roots; `HERDR_MCP_READONLY=1` / `HERDR_MCP_WRITE_ROOTS=/a,/b` tighten writes.
 
 ## Environment
 

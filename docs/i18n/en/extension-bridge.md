@@ -1,4 +1,4 @@
-# Browser extension — page JSON → local MCP (track B)
+# JSON → MCP bridge
 
 Audience: people using DeepSeek / z.ai web (which has no MCP Connector) to hit the local herdr-mcp via the agreed JSON.
 

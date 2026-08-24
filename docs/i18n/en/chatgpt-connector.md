@@ -1,4 +1,4 @@
-# ChatGPT Connector field notes
+# ChatGPT Connector
 
 Audience: people wiring herdr-mcp to ChatGPT, and proxies changing OAuth / Streamable HTTP.
 

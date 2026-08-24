@@ -101,7 +101,7 @@ button { color: inherit; }
 .sidebar-nav { display: grid; gap: 22px; }
 .nav-group h2 { margin: 0 0 7px 10px; color: var(--muted); font-size: 10.5px; font-weight: 750; letter-spacing: .095em; text-transform: uppercase; }
 .nav-group ul { list-style: none; margin: 0; padding: 0; }
-.nav-group a { display: block; padding: 6px 10px; border-radius: 7px; color: var(--muted-strong); font-size: 13.5px; line-height: 1.35; text-decoration: none; }
+.nav-group a { display: block; padding: 6px 10px; border-radius: 7px; color: var(--muted-strong); font-size: 13.5px; line-height: 1.35; text-decoration: none; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .nav-group a:hover { color: var(--text); background: var(--surface-soft); }
 .nav-group a.active { color: var(--text); background: var(--surface-hover); font-weight: 620; box-shadow: inset 2px 0 var(--accent); }
 

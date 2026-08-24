@@ -1,6 +1,16 @@
-# 架构 — herdr 与 herdr-mcp
+# 架构
 
 读者：决定能力该放在 MCP 还是 herdr 原生 API 的贡献者。
+
+## 远程控制面
+
+<section class="diagram" aria-label="架构">
+  <div>ChatGPT / Web 模型</div><span>↓ MCP + OAuth</span>
+  <div>Cloudflare Worker / Durable Object</div><span>↓ 认证 WSS</span>
+  <div>持久 herdr-link</div><span>↓ 本地 MCP</span>
+  <div>Runtime 代际 A / B</div><span>↓ Herdr socket + 工作站</span>
+  <div>panes · agents · fs · git · shell</div>
+</section>
 
 ## 两个进程
 

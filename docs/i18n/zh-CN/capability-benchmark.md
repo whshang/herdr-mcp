@@ -1,4 +1,4 @@
-# 能力对标与吸收决策
+# 能力对标
 
 > 目的：记录 herdr-mcp 对官方 Herdr、其他 Herdr MCP 实现与 coding-tools-mcp 的能力取舍，避免重复调研、盲目抄功能或扩大工具面。
 

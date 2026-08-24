@@ -1,6 +1,16 @@
-# Architecture — herdr and herdr-mcp
+# Architecture
 
 Audience: contributors deciding whether a capability belongs in MCP or in the native herdr API.
+
+## The remote control plane
+
+<section class="diagram" aria-label="Architecture">
+  <div>ChatGPT / web model</div><span>↓ MCP + OAuth</span>
+  <div>Cloudflare Worker / Durable Object</div><span>↓ authenticated WSS</span>
+  <div>persistent herdr-link</div><span>↓ local MCP</span>
+  <div>runtime generation A / B</div><span>↓ Herdr socket + workstation</span>
+  <div>panes · agents · fs · git · shell</div>
+</section>
 
 ## Two processes
 

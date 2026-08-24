@@ -45,6 +45,14 @@
     if (event.target instanceof HTMLAnchorElement && window.matchMedia("(max-width: 1023px)").matches) setDrawer(false);
   });
 
+  // Explicit language choice wins over browser-language routing on the entry
+  // pages: remember what the visitor picked in the topbar switcher.
+  document.querySelectorAll("[data-lang-switch] a[data-locale]").forEach((link) => {
+    link.addEventListener("click", () => {
+      try { localStorage.setItem("herdr-docs-lang", link.dataset.locale); } catch { /* storage unavailable */ }
+    });
+  });
+
   const dialog = document.querySelector("[data-search-dialog]");
   const searchInput = document.querySelector("[data-search-input]");
   const results = document.querySelector("[data-search-results]");
@@ -94,7 +102,7 @@
       return;
     }
     const matches = index.filter((item) => {
-      const haystack = [item.title, item.description, ...(item.headings || [])].join(" ").toLowerCase();
+      const haystack = [item.title, item.description, ...(item.headings || []), ...(item.aliases || [])].join(" ").toLowerCase();
       return normalized.split(/\s+/).every((part) => haystack.includes(part));
     }).slice(0, 8);
     if (!matches.length) {

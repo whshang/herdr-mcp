@@ -1,4 +1,4 @@
-# Cloudflare Edge 部署：`workers.dev` 默认，自定义域名可选
+# Cloudflare Edge
 
 Herdr 的 Cloudflare Edge 不要求用户拥有自己的域名。
 

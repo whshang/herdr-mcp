@@ -1,4 +1,4 @@
-# Worker fallbacks: Pi, DSH and dsh-tui
+# Worker fallbacks
 
 herdr-mcp keeps the web model as the planner. Local agent CLIs are execution workers, not a second orchestration layer.
 

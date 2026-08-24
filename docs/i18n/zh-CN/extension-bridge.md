@@ -1,4 +1,4 @@
-# 浏览器扩展 — 页面 JSON → 本地 MCP（主线 B）
+# JSON → MCP 桥
 
 读者：DeepSeek / z.ai 网页没有 MCP Connector，要用约定 JSON 打本机 herdr-mcp 的人。
 

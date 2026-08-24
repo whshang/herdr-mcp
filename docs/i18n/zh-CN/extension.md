@@ -1,4 +1,4 @@
-# 浏览器扩展 — 产品总览
+# 浏览器扩展
 
 读者：扩展作者与使用者。Chrome 显示名称 **herdr → Web wake**。`extension/` 保持一个清楚边界：负责把网页会话与本地 Herdr 工作持续连接起来；它不是新的 Agent runtime、记忆系统或调度平台。JSON→MCP 是独立的兼容支线。
 语言：产品 UI 为 en / 简体中文 / 日本語（与 herdr 一致）；本页以简体中文写。仓库根 README：[en](../../../README.md) / [zh](../../../README.zh.md) / [ja](../../../README.ja.md)。

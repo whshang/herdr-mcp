@@ -1,4 +1,4 @@
-# Runtime A/B 自升级
+# Runtime 自升级
 
 Herdr MCP 在本机 MCP runtime generation 切换时，保持 ChatGPT 面向的 Edge 与工作站 `herdr-link` 稳定。Runtime A/B 是**同一 contract epoch 内**的机制；公开 contract epoch 变化使用独立的受控迁移流程。
 

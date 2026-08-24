@@ -30,9 +30,10 @@ function matches(text, regex) {
   return [...text.matchAll(regex)];
 }
 
-// Distinct title markers proving search/nav isolation between locales.
-const ZN_DISTINCT = "架构 — herdr 与 herdr-mcp";
-const EN_DISTINCT = "Architecture — herdr and herdr-mcp";
+// First document the docs entries land on; short (sidebar-safe) titles.
+const FIRST_SLUG = DOC_ORDER[0];
+const EN_TITLE = "Architecture";
+const ZH_TITLE = "架构";
 
 test("documentation site build publishes every logical doc x 2 locales under locale-aware URLs", async () => {
   await rm(OUT, { recursive: true, force: true });
@@ -71,87 +72,46 @@ test("documentation site build publishes every logical doc x 2 locales under loc
   assert.deepEqual(flat, [], `flat single-language doc pages must not be published: ${flat.join(",")}`);
 });
 
-test("neutral /docs/ entry defaults to English: no chooser, forwards to the en index", async () => {
+test("neutral /docs/ entry routes by browser language straight to the first document", async () => {
   assert.equal(DEFAULT_LOCALE, "en", "English must be the default locale");
   const entry = await readFile(join(OUT, "docs", "index.html"), "utf8");
   assert.match(entry, /<html lang="en">/);
   // No language chooser: no locale cards, no flattened doc nav, no per-locale search.
   assert.doesNotMatch(entry, /chooser|data-doc-slug|class="doc-card"/, "docs entry must not be a language chooser");
   assert.doesNotMatch(entry, /data-search-open|data-search-dialog/, "docs entry is a redirect, not a searchable page");
-  // Forwards to the default (English) index; hreflang/canonical point at real pages.
-  assert.match(entry, /<meta http-equiv="refresh" content="0; url=\.\/en\/index\.html">/);
-  assert.match(entry, /location\.replace\("\.\/en\/index\.html"\)/);
-  assert.match(entry, /href="\.\/en\/index\.html"/, "fallback link to the English index");
-  assert.match(entry, /href="\.\/zh-CN\/index\.html"/, "fallback link to the Chinese index");
-  assert.match(entry, /rel="canonical" href="https:\/\/whshang\.github\.io\/herdr-mcp\/docs\/en\/index\.html"/);
+  const first = DOC_ORDER[0];
+  // Default forwards to the first English document; zh browsers are routed to
+  // the Chinese first document so the entry never dumps them into English.
+  assert.match(entry, new RegExp(`<meta http-equiv="refresh" content="0; url=\\./en/${first}\\.html">`));
+  assert.match(entry, /herdr-docs-lang/, "docs entry must carry the language-routing script");
+  assert.match(entry, new RegExp(`location\\.replace\\(wantsZh \\? "\\./zh-CN/${first}\\.html" : "\\./en/${first}\\.html"\\)`));
+  assert.match(entry, new RegExp(`href="\\./en/${first}\\.html"`), "fallback link to the English first document");
+  assert.match(entry, new RegExp(`href="\\./zh-CN/${first}\\.html"`), "fallback link to the Chinese first document");
+  assert.match(entry, new RegExp(`rel="canonical" href="${ORIGIN}/docs/en/${first}\\.html"`));
   assert.deepEqual(
     matches(entry, /rel="alternate" hreflang="([^"]+)"/g).map((m) => m[1]).filter((lang) => lang !== "x-default"),
     LOCALES,
     "docs entry must advertise one hreflang alternate per locale"
   );
-  assert.match(entry, /rel="alternate" hreflang="x-default" href="https:\/\/whshang\.github\.io\/herdr-mcp\/docs\/en\/index\.html"/);
+  assert.match(entry, new RegExp(`rel="alternate" hreflang="x-default" href="${ORIGIN}/docs/${DEFAULT_LOCALE}/${first}\\.html"`));
   assert.match(entry, /href="\.\.\/style\.css"/);
 });
 
-test("each locale index is translated, grouped in currated order, and stays within its locale", async () => {
-  const pkgVersion = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")).version;
+test("each locale docs entry redirects straight to the first document page", async () => {
   for (const locale of LOCALES) {
     const ui = UI[locale];
-    const index = await readFile(join(OUT, "docs", locale, "index.html"), "utf8");
-    assert.match(index, new RegExp(`<html lang="${ui.htmlLang}">`));
-    assert.match(index, /rel="canonical" href="https:\/\/whshang\.github\.io\/herdr-mcp\/docs\/[^/]+\/index\.html"/);
+    const first = DOC_ORDER[0];
+    const entry = await readFile(join(OUT, "docs", locale, "index.html"), "utf8");
+    assert.match(entry, new RegExp(`<html lang="${ui.htmlLang}">`));
+    assert.match(entry, new RegExp(`rel="canonical" href="${ORIGIN}/docs/${locale}/${first}\\.html"`));
     for (const lang of LOCALES) {
-      assert.match(index, new RegExp(`rel="alternate" hreflang="${lang}" href="https://whshang\\.github\\.io/herdr-mcp/docs/${lang}/index\\.html"`));
+      assert.match(entry, new RegExp(`rel="alternate" hreflang="${lang}" href="${ORIGIN}/docs/${lang}/${first}\\.html"`));
     }
-    assert.match(index, /rel="alternate" hreflang="x-default" href="https:\/\/whshang\.github\.io\/herdr-mcp\/docs\/index\.html"/);
-
-    // Translated hero and UI strings.
-    assert.ok(index.includes(`<h1>${ui.indexTitle}</h1>`), `locale index hero title (${locale})`);
-    assert.ok(index.includes(ui.indexLead), `locale index lead (${locale})`);
-    assert.ok(index.includes(ui.indexCtaConnect), `locale index CTA connect (${locale})`);
-
-    // Per-locale nav group labels in order.
-    let lastGroupOffset = -1;
-    NAV_GROUP_LABELS[locale].forEach((label, groupIndex) => {
-      const offset = index.indexOf(`data-nav-group="${label.replaceAll("&", "&amp;")}"`);
-      assert.ok(offset > lastGroupOffset, `group ${label} (${locale}) must appear in configured order`);
-      lastGroupOffset = offset;
-      assert.ok(NAV_GROUPS[groupIndex].slugs.length > 0, "group must own at least one document");
-    });
-
-    // Every document exactly once, in curated logical order, linked within the locale.
-    const indexSlugs = matches(index, /<article class="doc-card" data-doc-slug="([^"]+)"/g).map((m) => m[1]);
-    assert.deepEqual(indexSlugs, DOC_ORDER, `locale index (${locale}) must list every document exactly once in curated order`);
-    for (const slug of DOC_ORDER) {
-      assert.match(index, new RegExp(`<h2><a href="\\./${slug}\\.html">`), `index card link for ${slug} (${locale})`);
-    }
-    // Language switcher maps locale indexes.
-    const switcher = section(index, '<nav class="lang-switcher"', "</nav>");
-    for (const lang of LOCALES) {
-      const currentAttr = lang === locale ? ' aria-current="true"' : "";
-      assert.ok(
-        switcher.includes(`<a href="../${lang}/index.html" hreflang="${lang}" data-locale="${lang}"${currentAttr}>${LOCALE_NAMES[lang]}</a>`),
-        `locale index switcher must map ${locale} -> ${lang}`
-      );
-    }
-    assert.match(index, /class="brand" href="\.\.\/\.\.\/"/);
-
-    const indexWithoutSwitcher = index.replace(switcher, "");
-    for (const other of LOCALES) {
-      assert.doesNotMatch(indexWithoutSwitcher, new RegExp(`href="\\.\\./${other}/[^"]*\\.html"`), `locale index (${locale}) must not deep-link into ${other}`);
-    }
-
-    // Search is present and serves this locale only.
-    assert.match(index, /data-search-open/);
-    const searchDataMatch = index.match(/<script id="search-index" type="application\/json">([\s\S]*?)<\/script>/);
-    assert.ok(searchDataMatch, "search index must be embedded in the locale index");
-    const searchData = JSON.parse(searchDataMatch[1]);
-    assert.deepEqual(searchData.map((item) => item.href), DOC_ORDER.map((slug) => `./${slug}.html`));
-
-    // Version badge and the agent-intro prompt pointing at the skill file.
-    assert.match(index, new RegExp(`class="version-badge"[^>]*>v${pkgVersion.replaceAll(".", "\\.")}<`), `version badge (${locale})`);
-    assert.match(index, /data-agent-intro/, `agent-intro block (${locale})`);
-    assert.match(index, /href="\.\.\/\.\.\/herdr-mcp-SKILL\.md"/, `skill link from locale index (${locale})`);
+    assert.match(entry, new RegExp(`rel="alternate" hreflang="x-default" href="${ORIGIN}/docs/${DEFAULT_LOCALE}/${first}\\.html"`));
+    assert.match(entry, new RegExp(`<meta http-equiv="refresh" content="0; url=\\./${first}\\.html">`));
+    assert.match(entry, new RegExp(`location\\.replace\\("\\./${first}\\.html"\\)`));
+    // A bare redirect: no landing hero, no cards, no search surface, no agent intro.
+    assert.doesNotMatch(entry, /class="doc-card"|data-nav-group|data-search-open|data-agent-intro/, `locale entry (${locale}) must be a bare redirect`);
   }
 });
 
@@ -202,7 +162,7 @@ test("article pages carry same-slug language switching, per-locale search isolat
       assert.ok(html.includes(ui.onThisPage), `On-this-page label (${locale})`);
       assert.ok(html.includes(ui.searchLabel), `search label (${locale})`);
       assert.ok(html.includes(ui.openNav), `drawer open label (${locale})`);
-      assert.ok(html.includes(ui.docsIndex), `docs index footer label (${locale})`);
+      assert.ok(html.includes(ui.editSource), `edit-source footer label (${locale})`);
 
       // Server-rendered headings: unique ids, matching TOC, # heading-anchor links.
       const articleBody = section(html, '<article class="doc-body"', "</article>");
@@ -216,7 +176,7 @@ test("article pages carry same-slug language switching, per-locale search isolat
 
       // Local markdown links are rewritten to same-locale html; no raw .md leaks.
       assert.doesNotMatch(html, /href="\.\/[^"#?]+\.md(?:#|"|\?)/, `raw local .md link (${locale}/${slug})`);
-      assert.doesNotMatch(html, /href="(?![^"]*github\.com)[^"]*\.md"/, `unrewritten markdown href (${locale}/${slug})`);
+      assert.doesNotMatch(html, /href="(?![^"]*github\.com)(?![^"]*herdr-mcp-SKILL\.md)[^"]*\.md"/, `unrewritten markdown href (${locale}/${slug})`);
       for (const sl of DOC_ORDER) {
         assert.match(html, new RegExp(`href="\\./${sl}\\.html"`), `same-locale doc link for ${sl} (${locale}/${slug})`);
       }
@@ -234,21 +194,33 @@ test("article pages carry same-slug language switching, per-locale search isolat
       }
       else assert.doesNotMatch(html, /data-next/, "last document must not render next");
 
-      // Search index: exactly this locale's 11 documents, isolated from the other locale.
+      // Search index: this locale's documents, own-locale titles, plus
+      // cross-language aliases so the same term finds docs from either side.
       const searchDataMatch = html.match(/<script id="search-index" type="application\/json">([\s\S]*?)<\/script>/);
       assert.ok(searchDataMatch, `search index must be embedded (${locale}/${slug})`);
       const searchData = JSON.parse(searchDataMatch[1]);
       assert.deepEqual(searchData.map((item) => item.href), DOC_ORDER.map((sl) => `./${sl}.html`));
-      const zhTitles = searchData.some((item) => item.title.includes("herdr 与 herdr-mcp"));
-      const enTitles = searchData.some((item) => item.title.includes("herdr and herdr-mcp"));
+      const zhTitles = searchData.some((item) => item.title === ZH_TITLE || item.title.includes("安装"));
+      const enTitles = searchData.some((item) => item.title === EN_TITLE || item.title.includes("Install"));
       if (locale === "zh-CN") {
         assert.ok(zhTitles, "zh-CN search index must contain zh-CN titles");
-        assert.ok(!enTitles, "zh-CN search index must not contain en titles");
+        assert.ok(!enTitles, "zh-CN search index must not contain en titles as item titles");
       } else {
         assert.ok(enTitles, "en search index must contain en titles");
-        assert.ok(!zhTitles, "en search index must not contain zh-CN titles");
+        assert.ok(!zhTitles, "en search index must not contain zh-CN titles as item titles");
       }
       assert.ok(searchData.every((item) => Array.isArray(item.headings)));
+      // Every item exposes the other locale's same document as searchable aliases.
+      assert.ok(
+        searchData.every((item) => Array.isArray(item.aliases) && item.aliases.length > 0),
+        `cross-language search aliases (${locale}/${slug})`
+      );
+      const firstEntry = searchData.find((item) => item.href === `./${FIRST_SLUG}.html`);
+      if (locale === "en") {
+        assert.ok((firstEntry.aliases || []).some((alias) => alias.includes(ZH_TITLE)), "en index aliases the Chinese title");
+      } else {
+        assert.ok((firstEntry.aliases || []).some((alias) => alias.toLowerCase().includes(EN_TITLE.toLowerCase())), "zh-CN index aliases the English title");
+      }
 
       // Translated search UI blob consumed by app.js.
       const i18nMatch = html.match(/<script id="search-i18n" type="application\/json">([\s\S]*?)<\/script>/);
@@ -259,22 +231,32 @@ test("article pages carry same-slug language switching, per-locale search isolat
       assert.equal(i18n.copy, ui.copyCode);
       assert.equal(i18n.copied, ui.copiedCode);
 
-      // Code blocks carry a copy button — every <pre> in the body gets one.
+      // Code blocks carry a copy button — every <pre> in the doc body gets one
+      // (the agent-intro prompt box below the article is exempt by design).
       assert.equal(
-        matches(html, /data-copy-code/g).length,
-        matches(html, /<pre/g).length,
+        matches(articleBody, /data-copy-code/g).length,
+        matches(articleBody, /<pre/g).length,
         `every code block gets a copy button (${locale}/${slug})`
       );
       // Version badge in the topbar.
       assert.match(html, /class="version-badge"/, `version badge (${locale}/${slug})`);
+      // "Let your agent introduce you" lives on the first document page only.
+      if (slug === FIRST_SLUG) {
+        assert.match(html, /data-agent-intro/, `agent-intro block on the first document (${locale})`);
+        assert.match(html, /href="\.\.\/\.\.\/herdr-mcp-SKILL\.md"/, `skill link from the first document (${locale})`);
+      } else {
+        assert.doesNotMatch(html, /data-agent-intro/, `agent-intro must only render on the first document (${locale}/${slug})`);
+      }
     }
   }
 
-  // Distinct locale titles prove crossed documents do not share nav/search.
-  const zn = await readFile(join(OUT, "docs", "zh-CN", "architecture.html"), "utf8");
-  const en = await readFile(join(OUT, "docs", "en", "architecture.html"), "utf8");
-  assert.ok(zn.includes(ZN_DISTINCT) && !zn.includes(EN_DISTINCT));
-  assert.ok(en.includes(EN_DISTINCT) && !en.includes(ZN_DISTINCT));
+  // Sidebar titles stay per-locale; search aliases are cross-locale by design.
+  const zn = await readFile(join(OUT, "docs", "zh-CN", `${FIRST_SLUG}.html`), "utf8");
+  const en = await readFile(join(OUT, "docs", "en", `${FIRST_SLUG}.html`), "utf8");
+  const znSidebar = section(zn, '<nav class="sidebar-nav"', "</nav>");
+  const enSidebar = section(en, '<nav class="sidebar-nav"', "</nav>");
+  assert.ok(znSidebar.includes(ZH_TITLE) && !znSidebar.includes(EN_TITLE), "zh-CN sidebar stays Chinese");
+  assert.ok(enSidebar.includes(EN_TITLE) && !enSidebar.includes(ZH_TITLE), "en sidebar stays English");
 });
 
 test("shared runtime assets keep theme/drawer/search behavior and gain localized strings", async () => {
@@ -289,6 +271,8 @@ test("shared runtime assets keep theme/drawer/search behavior and gain localized
   assert.match(app, /uiString\("hint"/);
   assert.match(app, /noResults/, "app.js must render the localized no-results string");
   assert.match(app, /data-copy-code/, "app.js must wire up code copy buttons");
+  assert.match(app, /item\.aliases/, "app.js must match cross-language search aliases");
+  assert.match(app, /herdr-docs-lang/, "app.js must pin the chosen language on switcher clicks");
 
   const css = await readFile(join(OUT, "style.css"), "utf8");
   assert.match(css, /--sidebar-w:\s*250px/);
@@ -303,6 +287,7 @@ test("shared runtime assets keep theme/drawer/search behavior and gain localized
   assert.match(css, /\.version-badge/, "version badge styling");
   assert.match(css, /\.code-copy/, "code copy button styling");
   assert.match(css, /\.agent-intro/, "agent-intro block styling");
+  assert.match(css, /\.nav-group a \{[\s\S]*?white-space: nowrap/, "sidebar titles must not wrap");
 });
 
 test("release.json, skill artifact and design invariants are preserved", async () => {
@@ -320,6 +305,7 @@ test("release.json, skill artifact and design invariants are preserved", async (
   const home = await readFile(join(OUT, "index.html"), "utf8");
   assert.match(home, /herdr-mcp/);
   assert.match(home, /<html lang="en">/);
+  assert.match(home, /herdr-docs-lang/, "homepage must route zh browsers to the zh mirror");
   assert.match(home, /href="\.\/docs\/"/);
   assert.match(home, /href="\.\/docs\/en\/runtime-self-upgrade\.html"/);
   assert.match(home, /href="\.\/docs\/en\/capability-benchmark\.html"/);
@@ -327,10 +313,12 @@ test("release.json, skill artifact and design invariants are preserved", async (
   // Homepage is bilingual: no hard-coded "Start locally", topbar switch + zh mirror.
   assert.doesNotMatch(home, /Start locally/);
   assert.match(home, /href="\.\/zh-CN\/index\.html"[^>]*hreflang="zh-CN"/);
-  // Chinese homepage mirror mirrors content, paths and the reverse switch.
+  // Chinese homepage mirror mirrors content, paths and the reverse switch; its
+  // documentation links all point at the Chinese docs (never the English ones).
   const homeZh = await readFile(join(OUT, "zh-CN", "index.html"), "utf8");
   assert.match(homeZh, /<html lang="zh-CN">/);
-  assert.match(homeZh, /href="\.\.\/docs\/"/);
+  assert.ok(matches(homeZh, /\.\.\/docs\/zh-CN\//g).length >= 5, "zh homepage docs links all point at zh-CN docs");
+  assert.doesNotMatch(homeZh, /href="\.\.\/docs\/"/, "zh homepage must not link the bare (English) docs entry");
   assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/runtime-self-upgrade\.html"/);
   assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/capability-benchmark\.html"/);
   assert.match(homeZh, /href="\.\.\/" [^>]*hreflang="en"/);

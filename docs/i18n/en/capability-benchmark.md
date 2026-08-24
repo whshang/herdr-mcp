@@ -1,4 +1,4 @@
-# Capability benchmark and adoption decisions
+# Capability benchmark
 
 > Purpose: record herdr-mcp's capability trade-offs against official Herdr, other Herdr MCP implementations and coding-tools-mcp, so research is not repeated, features are not blindly copied, and the tool surface does not bloat.
 
