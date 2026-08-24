@@ -5,6 +5,8 @@
  * A native-messaging host presents that static token to this loopback-only
  * endpoint and receives a short-lived bearer scoped by middleware usage to
  * local /mcp and /push routes.
+ * Current extension 0.1.49+ uses tokenless Native Messaging + Unix IPC and
+ * does not call this compatibility endpoint.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Express, Request, Response } from "express";

@@ -2,14 +2,16 @@
 /**
  * Chrome Native Messaging broker for the herdr-mcp extension.
  *
- * Chrome authenticates the caller against the native-host manifest. This
- * process reads the long-lived local token from the launchd environment,
- * exchanges it for a short-lived loopback bearer, and returns only that
- * ephemeral credential to the extension.
+ * Chrome authenticates the caller against the native-host manifest. Current
+ * extensions proxy Herdr localhost traffic through this process and the
+ * mode-0600 Unix-domain socket exposed by herdr-mcp, so no Herdr bearer ever
+ * enters extension storage or the service worker. The historical short-lived
+ * session exchange remains available only for old extension builds.
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +24,14 @@ const EXTENSION_ID = chromiumIdForPath(EXTENSION_PATH);
 const EXTENSION_ORIGIN = `chrome-extension://${EXTENSION_ID}/`;
 const DEFAULT_BASE_URL = "http://127.0.0.1:8772";
 const SERVER_PLIST = join(homedir(), "Library", "LaunchAgents", "dev.herdr-mcp.server.plist");
+const EXTENSION_IPC_SOCKET = process.env.HERDR_EXTENSION_IPC_SOCKET
+  || join(homedir(), ".config", "herdr-mcp", "extension.sock");
+const MAX_REQUEST_BODY = 1024 * 1024;
+const MAX_RESPONSE_BODY = 8 * 1024 * 1024;
+const ALLOWED_PROXY_PATHS = new Set(["/mcp", "/push/state", "/push/events", "/push/mcp-activity"]);
+const FORWARDED_HEADERS = new Set([
+  "content-type", "accept", "mcp-protocol-version", "mcp-session-id", "x-herdr-client",
+]);
 
 function chromiumIdForPath(extensionPath) {
   const hex = createHash("sha256").update(Buffer.from(extensionPath)).digest("hex").slice(0, 32);
@@ -50,6 +60,173 @@ function validateBaseUrl(value) {
     throw new Error("base_url_must_be_loopback_http");
   }
   return url.origin;
+}
+
+function validateProxyPath(value) {
+  const parsed = new URL(String(value || "/"), DEFAULT_BASE_URL);
+  if (!ALLOWED_PROXY_PATHS.has(parsed.pathname)) throw new Error("proxy_path_not_allowed");
+  return `${parsed.pathname}${parsed.search}`;
+}
+
+function sanitizedHeaders(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [name, value] of Object.entries(raw)) {
+    const lower = String(name).toLowerCase();
+    if (!FORWARDED_HEADERS.has(lower)) continue;
+    out[lower] = String(value);
+  }
+  return out;
+}
+
+function requestOverSocket({ socketPath, path, method, headers, body, timeoutMs }) {
+  return new Promise((resolveRequest, reject) => {
+    const req = httpRequest({ socketPath, path, method, headers }, (res) => {
+      const chunks = [];
+      let total = 0;
+      res.on("data", (chunk) => {
+        total += chunk.length;
+        if (total > MAX_RESPONSE_BODY) {
+          req.destroy(new Error("native_response_too_large"));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on("end", () => {
+        resolveRequest({
+          status: Number(res.statusCode || 0),
+          headers: {
+            "content-type": String(res.headers["content-type"] || ""),
+            "cache-control": String(res.headers["cache-control"] || ""),
+          },
+          body: Buffer.concat(chunks, total).toString("utf8"),
+        });
+      });
+    });
+    req.on("error", reject);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error("native_request_timeout")));
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function requestOverHttp({ baseUrl, path, method, headers, body, timeoutMs }) {
+  const token = readRuntimeToken();
+  const response = await fetch(`${baseUrl}${path}`, {
+    method,
+    headers: { ...headers, ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: body || undefined,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await response.text();
+  if (Buffer.byteLength(text, "utf8") > MAX_RESPONSE_BODY) throw new Error("native_response_too_large");
+  return {
+    status: response.status,
+    headers: {
+      "content-type": response.headers.get("content-type") || "",
+      "cache-control": response.headers.get("cache-control") || "",
+    },
+    body: text,
+  };
+}
+
+async function proxyRequest(message, callerOrigin) {
+  if (callerOrigin !== EXTENSION_ORIGIN) throw new Error("extension_origin_not_allowed");
+  if (message?.type !== "request") throw new Error("unsupported_message");
+  const baseUrl = validateBaseUrl(message?.base_url);
+  const path = validateProxyPath(message?.path);
+  const method = String(message?.method || "GET").toUpperCase();
+  if (!new Set(["GET", "POST", "DELETE"]).has(method)) throw new Error("proxy_method_not_allowed");
+  const body = message?.body == null ? "" : String(message.body);
+  if (Buffer.byteLength(body, "utf8") > MAX_REQUEST_BODY) throw new Error("native_request_too_large");
+  const timeoutMs = Math.max(1000, Math.min(Number(message?.timeout_ms || 10_000), 120_000));
+  const headers = sanitizedHeaders(message?.headers);
+
+  if (existsSync(EXTENSION_IPC_SOCKET)) {
+    try {
+      const result = await requestOverSocket({ socketPath: EXTENSION_IPC_SOCKET, path, method, headers, body, timeoutMs });
+      return { ok: true, transport: "ipc", ...result };
+    } catch (error) {
+      // A stale socket may remain after an unclean server stop. Preserve old
+      // installations by falling back to authenticated loopback HTTP.
+      if (!readRuntimeToken()) throw error;
+    }
+  }
+  const result = await requestOverHttp({ baseUrl, path, method, headers, body, timeoutMs });
+  return { ok: true, transport: "legacy_http", ...result };
+}
+
+function streamOverSocket({ socketPath, path, timeoutMs, onOpen, onChunk, onEnd }) {
+  return new Promise((resolveStream, reject) => {
+    const req = httpRequest({ socketPath, path, method: "GET", headers: { Accept: "text/event-stream" } }, (res) => {
+      req.setTimeout(0);
+      onOpen(Number(res.statusCode || 0), "ipc");
+      if ((res.statusCode || 0) >= 400) {
+        res.resume();
+        res.on("end", () => resolveStream());
+        return;
+      }
+      res.on("data", onChunk);
+      res.on("end", () => { onEnd(); resolveStream(); });
+    });
+    req.on("error", reject);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error("native_stream_connect_timeout")));
+    req.end();
+  });
+}
+
+function streamOverHttp({ baseUrl, path, timeoutMs, onOpen, onChunk, onEnd }) {
+  return new Promise((resolveStream, reject) => {
+    const url = new URL(`${baseUrl}${path}`);
+    const token = readRuntimeToken();
+    const req = httpRequest({
+      hostname: url.hostname,
+      port: url.port,
+      path: `${url.pathname}${url.search}`,
+      method: "GET",
+      headers: { Accept: "text/event-stream", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    }, (res) => {
+      req.setTimeout(0);
+      onOpen(Number(res.statusCode || 0), "legacy_http");
+      if ((res.statusCode || 0) >= 400) {
+        res.resume();
+        res.on("end", () => resolveStream());
+        return;
+      }
+      res.on("data", onChunk);
+      res.on("end", () => { onEnd(); resolveStream(); });
+    });
+    req.on("error", reject);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error("native_stream_connect_timeout")));
+    req.end();
+  });
+}
+
+async function proxyStream(message, callerOrigin) {
+  if (callerOrigin !== EXTENSION_ORIGIN) throw new Error("extension_origin_not_allowed");
+  if (message?.type !== "stream") throw new Error("unsupported_message");
+  const baseUrl = validateBaseUrl(message?.base_url);
+  const path = validateProxyPath(message?.path || "/push/events");
+  if (!path.startsWith("/push/events")) throw new Error("stream_path_not_allowed");
+  const timeoutMs = Math.max(1000, Math.min(Number(message?.timeout_ms || 10_000), 120_000));
+  const writeChunk = (chunk) => {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    for (let offset = 0; offset < buf.length; offset += 64 * 1024) {
+      writeNativeMessage({ type: "stream_chunk", chunk_b64: buf.subarray(offset, offset + 64 * 1024).toString("base64") });
+    }
+  };
+  const onOpen = (status, transport) => writeNativeMessage({ type: "stream_open", status, transport });
+  const onEnd = () => writeNativeMessage({ type: "stream_end" });
+
+  if (existsSync(EXTENSION_IPC_SOCKET)) {
+    try {
+      await streamOverSocket({ socketPath: EXTENSION_IPC_SOCKET, path, timeoutMs, onOpen, onChunk: writeChunk, onEnd });
+      return;
+    } catch (error) {
+      if (!readRuntimeToken()) throw error;
+    }
+  }
+  await streamOverHttp({ baseUrl, path, timeoutMs, onOpen, onChunk: writeChunk, onEnd });
 }
 
 function readNativeMessage() {
@@ -135,7 +312,7 @@ function installNativeHost() {
 
   const manifest = {
     name: HOST_NAME,
-    description: "herdr-mcp local browser-extension credential broker",
+    description: "herdr-mcp local browser-extension IPC bridge",
     path: wrapper,
     type: "stdio",
     allowed_origins: [EXTENSION_ORIGIN],
@@ -180,7 +357,14 @@ if (command === "install") {
   const callerOrigin = String(process.argv[2] || "");
   try {
     const message = await readNativeMessage();
-    writeNativeMessage(await issueSession(message, callerOrigin));
+    if (message?.type === "request") {
+      writeNativeMessage(await proxyRequest(message, callerOrigin));
+    } else if (message?.type === "stream") {
+      await proxyStream(message, callerOrigin);
+    } else {
+      // Compatibility for 0.1.48 and older installed extension builds.
+      writeNativeMessage(await issueSession(message, callerOrigin));
+    }
   } catch (error) {
     writeNativeMessage({ ok: false, error: String(error?.message || error || "native_host_error") });
   }

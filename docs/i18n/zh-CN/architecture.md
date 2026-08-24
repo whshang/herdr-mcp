@@ -100,8 +100,8 @@ herdr-mcp 侧（≥0.3.12，exec 降级 ≥0.3.18）能做的：
 ## 传输
 
 - MCP：`/mcp` 上的 `POST/GET/DELETE`（ChatGPT 探测还会用 issuer 根 `/` 别名）
-- 鉴权：connector 使用 OAuth JWT；静态 `HERDR_MCP_TOKEN` 保留给 Cursor / curl 与本机 Native Messaging broker；浏览器插件使用 broker 签发的短期 native-session bearer。不要把静态 token 贴进 ChatGPT connector UI 或正常插件选项配置。
-- 推送（扩展，同一 Bearer）：
+- 鉴权：connector 使用 OAuth JWT；静态 `HERDR_MCP_TOKEN` 保留给 Cursor / curl，以及 Native Messaging host 面向旧 runtime 的 HTTP 兼容路径；当前浏览器插件通过 Native Messaging + `~/.config/herdr-mcp/extension.sock`（权限 `0600`）通信，浏览器侧不携带 Herdr bearer。不要把静态 token 贴进 ChatGPT connector UI。
+- 推送（扩展：TCP 路径继续鉴权；受信任 Native Messaging Unix IPC 路径免 bearer）：
   - `GET /push/events` SSE（可 `?workspace=`）
   - `GET /push/state` 当前 agent / workspace / pane 快照
   - `GET /push/mcp-activity` 最近 `tools/call` 计数（进程内环形缓冲；当前扩展催促走小模型判定，不再用「零工具」启发式）

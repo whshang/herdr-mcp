@@ -100,7 +100,7 @@ For development of an uncommitted working tree, `herdr-self-update apply --sourc
 
 ## 7. Browser extension boundary
 
-The browser extension is the reverse/wake channel and talks only to localhost (`127.0.0.1:8772`). Current installs prefer a short-lived bearer obtained through the registered Chrome Native Messaging host; the long-lived `HERDR_MCP_TOKEN` stays with the local runtime/native broker. A legacy static-token field remains only for compatibility. The extension does not need the public Worker/OAuth URL. Do not route extension traffic through Cloudflare merely because the Connector uses Cloudflare.
+The browser extension is the reverse/wake channel and stays on the local machine. Current installs send bounded request/stream messages to the registered Chrome Native Messaging host, which reaches herdr-mcp through `~/.config/herdr-mcp/extension.sock` (mode `0600`). The browser receives and stores no Herdr bearer. Static `HERDR_MCP_TOKEN` remains for other local clients and for the native host's old-runtime HTTP fallback only. The extension does not need the public Worker/OAuth URL. Do not route extension traffic through Cloudflare merely because the Connector uses Cloudflare.
 
 ## 8. Native Herdr reference
 

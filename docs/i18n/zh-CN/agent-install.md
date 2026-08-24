@@ -190,7 +190,7 @@ bin/herdr-extension-host install
 bin/herdr-extension-host status
 ```
 
-原生消息主机的 manifest 不保存长期 secret。installer 根据 `<repo>/extension` 的绝对路径计算 Chromium 对 unpacked 扩展使用的稳定 id，并把 host 限定到对应的 `chrome-extension://<id>/` origin；同一路径重新加载时可保持现有扩展身份和存储。macOS 会为 Chrome 以及已检测到的 Chromium 系浏览器配置 host，包括 Chromium、Brave、Edge 和 ego lite。host 在本机读取 LaunchAgent 已有的 `HERDR_MCP_TOKEN`，通过 `POST /extension/session` 换取短期 bearer，插件只拿到这个短期凭据。正常安装不要再把 `HERDR_MCP_TOKEN` 写进插件存储。
+原生消息主机的 manifest 不保存长期 secret。installer 根据 `<repo>/extension` 的绝对路径计算 Chromium 对 unpacked 扩展使用的稳定 id，并把 host 限定到对应的 `chrome-extension://<id>/` origin；同一路径重新加载时可保持现有扩展身份和存储。macOS 会为 Chrome 以及已检测到的 Chromium 系浏览器配置 host，包括 Chromium、Brave、Edge 和 ego lite。当前插件把受限 request/stream 交给 Native Messaging host，host 再通过 `~/.config/herdr-mcp/extension.sock`（权限 `0600`）访问 herdr-mcp；插件不接收、不保存 Herdr bearer。若连接的是没有 IPC socket 的旧 runtime，host 才会在自身进程内使用 LaunchAgent 已有的 `HERDR_MCP_TOKEN` 走兼容 HTTP。正常安装不要把 `HERDR_MCP_TOKEN` 写进插件存储。
 
 ## 8. macOS：安装持久 Herdr Link
 
@@ -253,6 +253,6 @@ Health: https://<worker>.<account-subdomain>.workers.dev/health
 MCP: https://<worker>.<account-subdomain>.workers.dev/mcp
 ```
 
-随后必须给出浏览器插件安装步骤：打开 `chrome://extensions` → 开启“开发者模式” → “加载已解压的扩展程序” → 选择上面报告的 `extension` 绝对目录。已安装的 Native Messaging host 会自动给插件签发短期 loopback bearer，用户不需要手工复制 `HERDR_MCP_TOKEN`。Options 中的“兼容访问令牌（可选）”只保留给旧版 runtime 或 Native Messaging host 未注册的兼容场景。
+随后必须给出浏览器插件安装步骤：打开 `chrome://extensions` → 开启“开发者模式” → “加载已解压的扩展程序” → 选择上面报告的 `extension` 绝对目录。已安装的 Native Messaging host 会通过 runtime 权限为 `0600` 的 Unix Socket 承载当前插件流量；用户不需要手工复制 `HERDR_MCP_TOKEN`，当前 Options 也不再提供 Herdr Token 字段。
 
 最后引导用户在 ChatGPT 网页开启 Developer mode，创建自定义 MCP Connector，填上面的 `/mcp` URL，并通过 OAuth 完成连接。**不要把本机 `HERDR_MCP_TOKEN` 或 Cloudflare Token 填进 ChatGPT。**

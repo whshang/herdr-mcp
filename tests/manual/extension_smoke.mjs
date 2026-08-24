@@ -58,19 +58,25 @@ const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
-ok(manifest.version === "0.1.48", "manifest version includes unbound conversation automation toggle fix");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.48"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.48"'), "content version matches manifest");
+ok(manifest.version === "0.1.49", "manifest version includes tokenless native IPC transport");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.49"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.49"'), "content version matches manifest");
 ok(
   backgroundSource.includes('from "./local-auth.js"')
     && localAuthSource.includes("sendNativeMessage")
-    && localAuthSource.includes('source: legacy ? "legacy" : "none"')
+    && localAuthSource.includes("connectNative")
+    && localAuthSource.includes('type: "request"')
+    && localAuthSource.includes('type: "stream"')
+    && !localAuthSource.includes("expires_at")
+    && !backgroundSource.includes("CFG.token")
+    && nativeHostSource.includes("extension.sock")
+    && nativeHostSource.includes('transport: "ipc"')
     && nativeHostSource.includes("/extension/session")
     && nativeHostSource.includes("allowed_origins")
     && nativeHostSource.includes("chromiumIdForPath")
     && nativeHostSource.includes("EXTENSION_PATH")
     && nativeHostSource.includes('"Citro Labs", "ego lite", "NativeMessagingHosts"'),
-  "extension uses native short-lived local auth with an explicit legacy-token fallback",
+  "extension uses tokenless Native Messaging IPC and retains old-session server compatibility",
 );
 ok(
   wakeSource.includes(".bar.automation-on")
@@ -170,15 +176,17 @@ ok(
 );
 ok(
   backgroundSource.includes("ONE shared stream for every binding")
-    && backgroundSource.includes('const url = `${CFG.herdrMcpUrl.replace(/\\/+$/, "")}/push/events`;')
+    && backgroundSource.includes("openLocalHerdrStream({")
+    && backgroundSource.includes('path: "/push/events"')
     && !backgroundSource.includes("/push/events?workspace="),
   "extension uses one shared SSE stream instead of one stream per workspace",
 );
 ok(
   backgroundSource.includes("PUSH_CONNECT_MS = 5000")
     && backgroundSource.includes("STATE_FETCH_MS = 4000")
-    && backgroundSource.includes("loopback_permission_"),
-  "localhost transport is bounded and reports Chrome loopback permission state",
+    && backgroundSource.includes("nativeTimeoutMs: STATE_FETCH_MS")
+    && localAuthSource.includes("timeout_ms"),
+  "native localhost transport is bounded without browser bearer state",
 );
 ok(
   backgroundSource.includes("reconcileWorkspaceWakeKind(wakeKind, working_count)"),
@@ -203,14 +211,17 @@ ok(
   "workspace discovery stream survives zero bindings and endpoint rebuilds clear stale catalog data",
 );
 ok(
-  backgroundSource.includes('if (loopback_permission && loopback_permission !== "granted")')
-    && backgroundSource.includes('error: `loopback_permission_${loopback_permission}`'),
-  "immediate loopback fetch failures surface Chrome local-network permission state",
+  !backgroundSource.includes('navigator.permissions.query({ name: "loopback-network" })')
+    && localAuthSource.includes("native-messaging-unavailable")
+    && backgroundSource.includes("native-transport-failed"),
+  "local Herdr failures surface Native Messaging errors instead of browser loopback permission state",
 );
 const optionsSource = readFileSync(path.join(EXT, "options.js"), "utf8");
 ok(
-  optionsSource.includes('type: "h2w_agents"') && optionsSource.includes("loopback_permission_help"),
-  "Options connection test uses bounded background transport and loopback guidance",
+  optionsSource.includes('type: "h2w_agents"')
+    && optionsSource.includes("native_host_help")
+    && optionsSource.includes("native_ipc_timeout_help"),
+  "Options connection test uses bounded background transport and Native Messaging guidance",
 );
 
 {

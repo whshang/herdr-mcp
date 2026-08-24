@@ -17,7 +17,7 @@
 
 ## HUD 绑定的是 w68，但底栏显示了另一个项目名
 
-以 `workspace_id` 为身份事实，label 只是展示缓存。当前扩展会用实时 `/push/events` / `/push/state` workspace catalog 覆盖历史 binding 里的陈旧 label，并自动修复持久化记录。若浮层已显示正确的 `herdr-mcp (w68)` 而底栏仍显示旧项目名，先确认已经加载当前 0.1.48 扩展并刷新页面；不要通过解绑/重绑来“修”同一个 workspace id。
+以 `workspace_id` 为身份事实，label 只是展示缓存。当前扩展会用实时 `/push/events` / `/push/state` workspace catalog 覆盖历史 binding 里的陈旧 label，并自动修复持久化记录。若浮层已显示正确的 `herdr-mcp (w68)` 而底栏仍显示旧项目名，先确认已经加载当前 0.1.49 扩展并刷新页面；不要通过解绑/重绑来“修”同一个 workspace id。
 
 ## ChatGPT 回复了一半就停住，页面像缓存了旧状态
 
@@ -29,7 +29,7 @@
 
 0.1.47 的 **手动接力**支持已绑定 ChatGPT Project 和已经落成稳定 `/c/<chat_id>` 的 z.ai 会话；z.ai 根页 `/`、普通 ChatGPT `/c/<id>`、Claude、DeepSeek 不显示该按钮。当前作用域必须先切到 `自动 关`；`自动 开` 时按钮会锁定，background 也会拒绝 `automation_enabled`。绑定 workspace 仍有 agent `working` 时同样拒绝开始，因为接力不能和 settled/wake 的投递目标迁移竞争。
 
-如果 z.ai 已经进入 `/c/<chat_id>` 但 HUD 仍像根页，请确认 0.1.48 已加载并刷新一次。新聊天在 `/` 上临时建立的 binding/自动化偏好会在首次落成 `/c/<chat_id>` 时迁移一次；之后在已有 `/c/A`、`/c/B` 之间切换不会跟着迁移。z.ai 的 handoff summary/seed 使用 raw 通道，不会被 JSON→MCP bridge 改写成 coding-agent task。
+如果 z.ai 已经进入 `/c/<chat_id>` 但 HUD 仍像根页，请确认 0.1.49 已加载并刷新一次。新聊天在 `/` 上临时建立的 binding/自动化偏好会在首次落成 `/c/<chat_id>` 时迁移一次；之后在已有 `/c/A`、`/c/B` 之间切换不会跟着迁移。z.ai 的 handoff summary/seed 使用 raw 通道，不会被 JSON→MCP bridge 改写成 coding-agent task。
 
 若按钮显示 **压缩中… / 接力中…**，说明同一个 source conversation 已有活跃 transfer，扩展会锁住按钮避免创建第二个接力；若 seed 投递不确定则会显示 **恢复接力**，再次点击会先探测目标 conversation 是否已经收到 transfer marker，再决定完成 cutover 还是重试 seed。旧 workspace binding 在新 seed 被确认前始终保持权威，不要为了“解锁按钮”手工解绑。
 

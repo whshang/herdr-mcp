@@ -53,6 +53,7 @@ import {
 } from "jose";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
 import { extensionSessionBearerMatches } from "./extension-auth.js";
+import { isTrustedExtensionIpcRequest } from "./extension-ipc.js";
 
 // ---------------------------------------------------------------------------
 // Config (mirrors server.ts env handling; self-contained on purpose)
@@ -389,6 +390,14 @@ export function mcpBearerAuth(req: Request, res: Response, next: NextFunction): 
   // Never challenge OPTIONS — CORS middleware already answered or will fall through.
   if (req.method === "OPTIONS") {
     res.status(204).end();
+    return;
+  }
+  // The browser extension's Native Messaging host reaches this process over a
+  // mode-0600 Unix-domain socket. That IPC path is authenticated by filesystem
+  // ownership plus Chrome's allowed_origins gate, so it never needs a bearer.
+  // TCP localhost and public Connector traffic still follow the normal auth path.
+  if (isTrustedExtensionIpcRequest(req)) {
+    next();
     return;
   }
   if (!AUTH_TOKEN) {

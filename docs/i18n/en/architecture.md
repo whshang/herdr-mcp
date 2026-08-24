@@ -100,8 +100,8 @@ A successful `herdr_prompt` includes `state_observation: { changed: true\|false\
 ## Transport
 
 - MCP: `POST/GET/DELETE` on `/mcp` (ChatGPT probing also uses an issuer-root `/` alias)
-- Auth: OAuth JWT (connector); static `HERDR_MCP_TOKEN` for Cursor / curl and the local Native Messaging broker; short-lived native-session bearer for the browser extension. Do not paste the static token into the ChatGPT connector UI or normal extension Options.
-- Push (extension, same Bearer):
+- Auth: OAuth JWT (connector); static `HERDR_MCP_TOKEN` for Cursor / curl and the Native Messaging host's old-runtime HTTP fallback; current browser-extension traffic uses Native Messaging plus `~/.config/herdr-mcp/extension.sock` (mode `0600`) and carries no Herdr bearer in the browser. Do not paste the static token into the ChatGPT connector UI.
+- Push (extension: bearer-authenticated on TCP; bearer-free through trusted Native Messaging Unix IPC):
   - `GET /push/events` SSE (supports `?workspace=`)
   - `GET /push/state` current agent / workspace / pane snapshot
   - `GET /push/mcp-activity` recent `tools/call` counts (in-process ring buffer; the current extension nudge uses a small-model decision, not a "zero tools" heuristic)

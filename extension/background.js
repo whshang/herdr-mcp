@@ -24,9 +24,9 @@ import {
 } from "./continuity-core.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
-import { getLocalAuth, localAuthHeaders, resetLocalAuth } from "./local-auth.js";
+import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 
-const H2W_SCRIPT_VERSION = "0.1.48";
+const H2W_SCRIPT_VERSION = "0.1.49";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -63,23 +63,12 @@ const FALLBACK_PARTIAL_TEMPLATE =
 // The page only receives tool schemas and results. The bearer token stays inside
 // the extension service worker.
 async function jsonBridgeRpc(method, params = {}) {
-  const auth = await getLocalAuth({ baseUrl: CFG.herdrMcpUrl, legacyToken: CFG.token });
-  let result = await callMcpJsonRpc({
+  return callMcpJsonRpc({
     baseUrl: CFG.herdrMcpUrl,
-    token: auth.token,
     method,
     params,
+    fetchFn: (url, init) => localHerdrFetch(url, { ...init, nativeTimeoutMs: 90_000 }),
   });
-  if (result?.status === 401 && auth.source === "native") {
-    const refreshed = await getLocalAuth({ baseUrl: CFG.herdrMcpUrl, legacyToken: CFG.token, force: true });
-    result = await callMcpJsonRpc({
-      baseUrl: CFG.herdrMcpUrl,
-      token: refreshed.token,
-      method,
-      params,
-    });
-  }
-  return result;
 }
 
 function localizedText(key, vars = null, fallback = "") {
@@ -138,7 +127,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- Configuration (wait for storage before startup or stream rebuild) ----
 let CFG = {
-  herdrMcpUrl: "http://127.0.0.1:8772", token: "", automationMode: AUTOMATION_MODE_MANUAL,
+  herdrMcpUrl: "http://127.0.0.1:8772", automationMode: AUTOMATION_MODE_MANUAL,
   // Legacy fields stay fail-closed for older content scripts. New code derives
   // automation from global mode + the current ChatGPT Project id.
   enabled: false,
@@ -369,7 +358,10 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
       }
     } catch (e) {}
   }
-  try { await chrome.storage.local.remove("autoAllow"); } catch (e) {}
+  // 0.1.49+: Herdr authentication is owned entirely by Native Messaging + the
+  // mode-0600 local IPC socket. Remove historical browser-stored Herdr tokens
+  // during upgrade; old extension binaries remain server-compatible separately.
+  try { await chrome.storage.local.remove(["autoAllow", "token"]); } catch (e) {}
   resolveConfigReady();
 })();
 
@@ -940,54 +932,63 @@ async function ensurePushStream(bindings) {
 }
 
 async function runPushStream(ctrl) {
-  const url = `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/push/events`;
   let backoff = 2000;
   while (runtimeAlive() && !ctrl.signal.aborted) {
-    const attempt = new AbortController();
-    const relayAbort = () => attempt.abort();
-    ctrl.signal.addEventListener("abort", relayAbort, { once: true });
-    const connectTimer = setTimeout(() => attempt.abort(), PUSH_CONNECT_MS);
+    let stream = null;
+    let connectTimer = null;
+    let relayAbort = null;
     try {
-      const headers = await localAuthHeaders({ baseUrl: CFG.herdrMcpUrl, legacyToken: CFG.token });
-      const resp = await fetch(url, {
-        signal: attempt.signal,
-        headers,
-      });
-      clearTimeout(connectTimer);
-      if (!resp.ok) {
-        if (resp.status === 401) {
-          await getLocalAuth({ baseUrl: CFG.herdrMcpUrl, legacyToken: CFG.token, force: true });
+      const decoder = new TextDecoder();
+      let buf = "";
+      const drainBlocks = () => {
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          pushDispatch = pushDispatch
+            .then(() => handlePushBlock(block))
+            .catch((e) => callLog("push dispatch failed:", e?.message || String(e)));
         }
-        callLog(`push HTTP ${resp.status}; retrying in ${backoff}ms`);
+      };
+      stream = openLocalHerdrStream({
+        baseUrl: CFG.herdrMcpUrl,
+        path: "/push/events",
+        timeoutMs: PUSH_CONNECT_MS,
+        onChunk: (bytes) => {
+          buf += decoder.decode(bytes, { stream: true });
+          drainBlocks();
+        },
+      });
+      relayAbort = () => stream?.close();
+      ctrl.signal.addEventListener("abort", relayAbort, { once: true });
+      const opened = await Promise.race([
+        stream.opened,
+        new Promise((_, reject) => {
+          connectTimer = setTimeout(() => reject(new Error("native-stream-connect-timeout")), PUSH_CONNECT_MS + 500);
+        }),
+      ]);
+      if (connectTimer) clearTimeout(connectTimer);
+      connectTimer = null;
+      if (opened.status < 200 || opened.status >= 300) {
+        callLog(`push native HTTP ${opened.status}; retrying in ${backoff}ms`);
+        stream.close();
         await sleep(backoff);
         backoff = Math.min(backoff * 2, 15000);
         continue;
       }
       backoff = 2000;
-      if (!resp.body) throw new Error("no-body");
-      callLog("push connected (shared stream)");
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf("\n\n")) >= 0) {
-          const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
-          pushDispatch = pushDispatch
-            .then(() => handlePushBlock(block))
-            .catch((e) => callLog("push dispatch failed:", e?.message || String(e)));
-        }
-      }
+      callLog(`push connected (shared native stream via ${opened.transport})`);
+      await stream.done;
+      buf += decoder.decode();
+      drainBlocks();
       callLog(`push stream ended; reconnecting in ${backoff}ms`);
     } catch (e) {
       if (ctrl.signal.aborted || !runtimeAlive()) break;
       callLog(`push disconnected (${e.message}); retrying in ${backoff}ms`);
     } finally {
-      clearTimeout(connectTimer);
-      ctrl.signal.removeEventListener("abort", relayAbort);
+      if (connectTimer) clearTimeout(connectTimer);
+      if (relayAbort) ctrl.signal.removeEventListener("abort", relayAbort);
+      try { stream?.close(); } catch (_) {}
     }
     if (ctrl.signal.aborted) break;
     await sleep(backoff);
@@ -2396,6 +2397,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_set_config") {
     void (async () => {
       const incoming = { ...(msg.config || {}) };
+      // Current extension builds never persist or consume HERDR_MCP_TOKEN.
+      delete incoming.token;
       delete incoming.idleNudgeCooldownSec;
       // Permission-card auto-allow is part of effective Project automation.
       // Ignore the 0.1.43-and-earlier independent preference.
@@ -2419,7 +2422,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       CFG.idleNudgeEnabled = false;
       delete CFG.idleNudgeCooldownSec;
       await chrome.storage.local.set({ ...CFG, enabled: false, idleNudgeEnabled: false });
-      try { await chrome.storage.local.remove(["idleNudgeCooldownSec", "autoAllow"]); } catch (e) {}
+      try { await chrome.storage.local.remove(["idleNudgeCooldownSec", "autoAllow", "token"]); } catch (e) {}
       void rebuildStreams();
       await notifyAutomationChanged();
       sendResponse({ ok: true });
@@ -2538,7 +2541,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           enabled: automation.enabled,
           projectAutomationAvailable: automation.project_automation_available,
           projectAutomationEnabled: automation.project_automation_enabled,
-          tokenSet: !!CFG.token,
           progressTickSec: CFG.progressTickSec,
           progressFallbackSec: CFG.progressFallbackSec,
           idleNudgeEnabled: automation.enabled,
@@ -2691,49 +2693,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 async function fetchStateFresh() {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), STATE_FETCH_MS);
   try {
     const url = `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/push/state`;
-    let headers = await localAuthHeaders({ baseUrl: CFG.herdrMcpUrl, legacyToken: CFG.token });
-    let resp = await fetch(url, {
-      headers,
-      signal: ctrl.signal,
-    });
-    if (resp.status === 401) {
-      const refreshed = await getLocalAuth({ baseUrl: CFG.herdrMcpUrl, legacyToken: CFG.token, force: true });
-      headers = refreshed.token ? { Authorization: `Bearer ${refreshed.token}` } : {};
-      resp = await fetch(url, { headers, signal: ctrl.signal });
-    }
+    const resp = await localHerdrFetch(url, { nativeTimeoutMs: STATE_FETCH_MS });
     if (!resp.ok) return { ok: false, status: resp.status };
     const body = await resp.json();
     if (Array.isArray(body?.workspaces)) cachePushWorkspaceCatalog(body.workspaces);
     return { ok: true, source: "push_state", ...body };
   } catch (e) {
-    let loopback_permission = null;
-    try {
-      loopback_permission = (await navigator.permissions.query({ name: "loopback-network" })).state;
-    } catch (_) { /* Chrome <145 or browser without split LNA permissions */ }
-    // Chrome can reject loopback access immediately with TypeError("Failed to fetch")
-    // instead of waiting for our AbortController deadline. Permission state is
-    // authoritative for every network exception, not only AbortError.
-    if (loopback_permission && loopback_permission !== "granted") {
-      return {
-        ok: false,
-        error: `loopback_permission_${loopback_permission}`,
-        loopback_permission,
-      };
-    }
-    if (e?.name === "AbortError") {
-      return {
-        ok: false,
-        error: "fetch_timeout",
-        loopback_permission,
-      };
-    }
-    return { ok: false, error: e.message, loopback_permission };
-  } finally {
-    clearTimeout(timer);
+    return { ok: false, error: String(e?.message || e || "native-transport-failed") };
   }
 }
 
@@ -2757,7 +2725,7 @@ async function rebuildStreams() {
   const bindings = await loadBindings();
   callLog(
     `rebuild streams v${H2W_SCRIPT_VERSION}: ${Object.keys(bindings).length} binding(s),`,
-    `token=${CFG.token ? "set" : "empty"}, automationMode=${normalizeAutomationMode(CFG.automationMode)}`,
+    `transport=native-ipc, automationMode=${normalizeAutomationMode(CFG.automationMode)}`,
   );
   ensurePushStream(bindings);
   reconcileProgressTimers(bindings); // Re-arm or stop working progress timers.
@@ -2783,7 +2751,6 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.get(["herdrMcpUrl"], (cfg) => {
     if (!cfg.herdrMcpUrl) chrome.storage.local.set({
       herdrMcpUrl: "http://127.0.0.1:8772",
-      token: "",
       automationMode: AUTOMATION_MODE_MANUAL,
       enabled: false,
       wakeTemplate: defaultWakeTemplate(),

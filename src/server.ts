@@ -7,14 +7,15 @@
  *  - HERDR_MCP_ALL_TOOLS=1 adds advanced/deprecated lifecycle tools (30 total).
  *  - Express on HERDR_MCP_PORT (default 8772).
  *  - OAuth DCR endpoints for Claude.ai / ChatGPT connectors.
- *  - Bearer auth on /mcp via HERDR_MCP_TOKEN, short-lived extension sessions,
- *    or connector OAuth.
+ *  - Auth on /mcp via HERDR_MCP_TOKEN / connector OAuth on TCP, trusted
+ *    mode-0600 extension IPC, plus short-lived extension sessions for old clients.
  */
 import express, { Express, Request, Response, NextFunction } from "express";
 import { createHash, randomUUID } from "node:crypto";
+import { createServer as createHttpServer } from "node:http";
 import { recordMcpToolCall } from "./mcp-activity.js";
 import { readFile, writeFile, realpath, readdir, stat, unlink, mkdir } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 import { exec, execSync, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
@@ -37,6 +38,7 @@ import { get as sessionGet, save as sessionSave, type SessionData, type SessionP
 import { waitForAgent } from "./wait.js";
 import { registerPushRoutes } from "./push.js";
 import { registerExtensionAuthRoutes } from "./extension-auth.js";
+import { extensionIpcSocketPath, markExtensionIpcSocket } from "./extension-ipc.js";
 import {
   registerOAuthRoutes,
   mcpBearerAuth,
@@ -3471,13 +3473,14 @@ function routes(app: Express): void {
   // ChatGPT connector UI discovers OAuth from the browser — needs CORS + OPTIONS.
   app.use(oauthCors);
 
-  // Loopback-only short-lived credentials for the official browser extension.
+  // Compatibility endpoint for 0.1.48 and older browser-extension builds.
   // The native host authenticates this endpoint with HERDR_MCP_TOKEN; the
   // extension itself receives only the returned ephemeral bearer.
   registerExtensionAuthRoutes(app);
 
   // --- Browser-extension push channel (herdr → web wake-up) ---
-  // GET /push/events (SSE) + GET /push/state, same Bearer token as /mcp.
+  // GET /push/events (SSE) + GET /push/state. TCP uses the same auth policy as
+  // /mcp; trusted extension IPC is bearer-free on the dedicated Unix socket.
   registerPushRoutes(app, clientGet);
 
   // Access log: diagnose Connector protocol failures without logging prompts/tokens.
@@ -3636,6 +3639,33 @@ export function start(): void {
     const recovered = recoverExecSessionsOnBoot();
     console.log(`[herdr-mcp] listening on 127.0.0.1:${PORT} boot_id=${BOOT_ID}` +
       (recovered.reaped ? ` reaped_orphans=${recovered.reaped}` : ""));
+
+    // Only the production/default listener owns the extension IPC socket.
+    // Self-update candidates run on 8773+ and must never unlink or replace it.
+    const extensionIpcEnabled = PORT === 8772 || process.env.HERDR_EXTENSION_IPC_FORCE === "1";
+    if (!extensionIpcEnabled || process.platform === "win32") return;
+    const socketPath = extensionIpcSocketPath();
+    try {
+      mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
+      if (existsSync(socketPath)) unlinkSync(socketPath);
+      const ipcServer = createHttpServer(app);
+      ipcServer.on("connection", (socket) => markExtensionIpcSocket(socket));
+      ipcServer.on("error", (error) => {
+        console.error(`[herdr-mcp] extension IPC error: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      ipcServer.listen(socketPath, () => {
+        try {
+          chmodSync(socketPath, 0o600);
+          console.log(`[herdr-mcp] extension IPC listening at ${socketPath}`);
+        } catch (error) {
+          console.error(`[herdr-mcp] extension IPC permission failure: ${error instanceof Error ? error.message : String(error)}`);
+          ipcServer.close();
+          try { unlinkSync(socketPath); } catch { /* best effort */ }
+        }
+      });
+    } catch (error) {
+      console.error(`[herdr-mcp] extension IPC setup failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   });
 }
 

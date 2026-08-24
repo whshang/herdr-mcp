@@ -13,12 +13,12 @@
  *    (via the hook in state.ts) instead of opening another daemon subscription
  *    per client. This adds no sockets, uses normalized events, and avoids polling.
  *
- * 2. **Authenticated localhost only**: static HERDR_MCP_TOKEN remains valid;
- *    the browser extension normally uses a short-lived Native Messaging session bearer.
+ * 2. **Authenticated TCP localhost + trusted extension IPC**: static
+ *    HERDR_MCP_TOKEN remains valid on TCP; the current browser extension uses
+ *    the origin-restricted Native Messaging host plus mode-0600 Unix IPC.
  *    - The threat model is identical: token holders can already read all agent
  *      state through herdr_inspect, so the push channel exposes nothing extra.
- *    - This requires no additional secret management: one token in the plist
- *      and one token in the extension configuration.
+ *    - No Herdr bearer is stored in extension configuration or the service worker.
  *    - When /mcp runs locally without a token, /push behaves the same way
  *      (open when AUTH_TOKEN is empty).
  *    The extension fetches the local 127.0.0.1 endpoint from its background
@@ -39,6 +39,7 @@
 import { Router, Request, Response } from "express";
 import type { Express } from "express";
 import { extensionSessionBearerMatches } from "./extension-auth.js";
+import { isTrustedExtensionIpcRequest } from "./extension-ipc.js";
 import { HerdrClient, HerdrEvent } from "./herdr.js";
 import { getSnapshotCache, SnapshotCache, AgentView } from "./state.js";
 import { cleanTerminalOutput } from "./clean.js";
@@ -358,6 +359,10 @@ let hub: PushHub | null = null;
 
 /** Bearer auth for /push (same token as /mcp; 401 plain-text for browser consumers). */
 function pushAuth(req: Request, res: Response, next: () => void): void {
+  if (isTrustedExtensionIpcRequest(req)) {
+    next();
+    return;
+  }
   const token = process.env.HERDR_MCP_TOKEN ?? "";
   if (token) {
     const auth = req.get("authorization") ?? "";

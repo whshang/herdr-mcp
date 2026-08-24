@@ -153,6 +153,59 @@ globalThis.chrome = {
     onStartup: { addListener: (fn) => listeners.onStartup.push(fn) },
     onInstalled: { addListener: (fn) => listeners.onInstalled.push(fn) },
     openOptionsPage: () => {},
+    sendNativeMessage(_host, message, callback) {
+      if (message?.type !== "request") {
+        callback({ ok: false, error: "unsupported-native-test-message" });
+        return;
+      }
+      if (message.path === "/push/state") {
+        callback({
+          ok: true,
+          transport: "ipc",
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ workspaces: mockStateWorkspaces, panes: [], agents: [] }),
+        });
+        return;
+      }
+      if (message.path === "/mcp") {
+        const body = JSON.parse(message.body || "{}");
+        const result = body.method === "tools/list"
+          ? { tools: [{ name: "herdr_inspect", description: "inspect", inputSchema: { type: "object" } }] }
+          : { content: [{ type: "text", text: "ok" }] };
+        callback({
+          ok: true,
+          transport: "ipc",
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: body.id, result }),
+        });
+        return;
+      }
+      callback({ ok: false, error: `unexpected-native-path:${message.path}` });
+    },
+    connectNative() {
+      const messageListeners = [];
+      const disconnectListeners = [];
+      let disconnected = false;
+      return {
+        onMessage: { addListener(fn) { messageListeners.push(fn); } },
+        onDisconnect: { addListener(fn) { disconnectListeners.push(fn); } },
+        postMessage(message) {
+          if (message?.type === "stream" && message.path === "/push/events") {
+            queueMicrotask(() => {
+              if (disconnected) return;
+              for (const fn of messageListeners) fn({ type: "stream_open", status: 200, transport: "ipc" });
+            });
+          }
+        },
+        disconnect() {
+          if (disconnected) return;
+          disconnected = true;
+          for (const fn of disconnectListeners) fn();
+        },
+      };
+    },
   },
   storage: {
     local: {
@@ -163,7 +216,9 @@ globalThis.chrome = {
         return out;
       },
       async set(obj) { Object.assign(storage, obj); },
-      async remove() {},
+      async remove(keys) {
+        for (const key of Array.isArray(keys) ? keys : [keys]) delete storage[key];
+      },
     },
   },
   tabs: {

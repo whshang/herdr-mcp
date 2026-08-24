@@ -122,7 +122,7 @@ bin/herdr-extension-host install
 bin/herdr-extension-host status
 ```
 
-The host manifest contains no long-lived secret. The installer derives Chromium's stable unpacked-extension id from the absolute `<repo>/extension` path and restricts the host to that exact `chrome-extension://<id>/` origin. This preserves the existing unpacked-extension identity when the same directory is reloaded. On macOS it registers the host for Chrome plus detected Chromium-family profiles including Chromium, Brave, Edge, and ego lite. The native host reads the existing LaunchAgent token locally and exchanges it at `POST /extension/session` for a short-lived bearer. The extension receives only that ephemeral bearer. Do not copy `HERDR_MCP_TOKEN` into extension storage during a normal install.
+The host manifest contains no long-lived secret. The installer derives Chromium's stable unpacked-extension id from the absolute `<repo>/extension` path and restricts the host to that exact `chrome-extension://<id>/` origin. This preserves the existing unpacked-extension identity when the same directory is reloaded. On macOS it registers the host for Chrome plus detected Chromium-family profiles including Chromium, Brave, Edge, and ego lite. Current extension builds send bounded request/stream messages to the native host, which reaches herdr-mcp through `~/.config/herdr-mcp/extension.sock` (mode `0600`). No Herdr bearer is returned to or stored by the extension. The host can still use the existing LaunchAgent token internally when talking to an older runtime that has no IPC socket. Do not copy `HERDR_MCP_TOKEN` into extension storage during a normal install.
 
 ## 8. macOS persistent Herdr Link
 
@@ -152,6 +152,6 @@ Unset `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, then delete temporary 
 
 Return only non-sensitive facts: the absolute repository directory, the absolute browser-extension directory (`<repo>/extension`), local MCP status, Herdr Link status, Cloudflare Account name + shortened ID, Worker name, `workers.dev` origin, `/health`, and `/mcp`.
 
-Then give the browser-extension install steps: open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the reported `extension` directory. The installed Native Messaging host gives the extension a short-lived loopback bearer automatically, so the user does not copy `HERDR_MCP_TOKEN` into Options. The **Legacy Bearer Token (optional)** field remains only for older runtimes or a missing native-host registration.
+Then give the browser-extension install steps: open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the reported `extension` directory. The installed Native Messaging host carries current extension traffic over the runtime's mode-`0600` Unix socket; the user does not copy `HERDR_MCP_TOKEN` into Options and current Options has no Herdr Token field.
 
 Finally guide the user to enable ChatGPT Developer mode, create a custom MCP Connector with `/mcp`, and complete OAuth. Never paste the local `HERDR_MCP_TOKEN` or Cloudflare Token into ChatGPT.

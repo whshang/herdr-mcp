@@ -6,7 +6,7 @@ import {
 
 const $ = (id) => document.getElementById(id);
 const KEYS = [
-  "herdrMcpUrl", "token", "wakeTemplate", "progressTickSec", "progressFallbackSec",
+  "herdrMcpUrl", "wakeTemplate", "progressTickSec", "progressFallbackSec",
   "progressTemplate", "automationMode", "enabled",
   "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
   "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
@@ -28,8 +28,6 @@ function applyI18n() {
   $("hint_locale").textContent = t("hint_locale");
   $("lab_url").textContent = t("label_url");
   $("hint_url").textContent = t("hint_url");
-  $("lab_token").textContent = t("label_token");
-  $("hint_token").textContent = t("hint_token");
   $("lab_wake").textContent = t("label_wake_template");
   $("hint_wake").textContent = t("hint_wake_template");
   $("lab_tick").textContent = t("label_tick");
@@ -68,7 +66,6 @@ function setStatus(text, cls) {
 async function loadForm() {
   const cfg = await chrome.storage.local.get(KEYS);
   $("url").value = cfg.herdrMcpUrl || "http://127.0.0.1:8772";
-  $("token").value = cfg.token || "";
   $("template").value = cfg.wakeTemplate || t("default_wake_template");
   $("progressTickSec").value = cfg.progressTickSec ?? 60;
   $("progressFallbackSec").value = cfg.progressFallbackSec ?? 1200;
@@ -97,7 +94,6 @@ $("uiLocale").addEventListener("change", async () => {
 $("save").addEventListener("click", () => {
   const config = {
     herdrMcpUrl: $("url").value.trim(),
-    token: $("token").value.trim(),
     wakeTemplate: $("template").value,
     progressTickSec: parseTickSec($("progressTickSec").value, 60),
     progressFallbackSec: parseTickSec($("progressFallbackSec").value, 1200),
@@ -141,13 +137,14 @@ $("test").addEventListener("click", () => {
       setStatus(`✖ ${t("http_401")}`, "err");
       return;
     }
-    if (String(resp?.error || "").startsWith("loopback_permission_")) {
-      setStatus(`✖ ${t("loopback_permission_help")}`, "err");
+    const localError = String(resp?.error || "");
+    if (/native[- ]messaging|native host|native-host|specified native/i.test(localError)) {
+      setStatus(`✖ ${t("native_host_help")}`, "err");
       return;
     }
-    const detail = resp?.error === "fetch_timeout"
-      ? t("loopback_timeout_help")
-      : (resp?.error || `HTTP ${resp?.status || "?"}`);
+    const detail = /native.*timeout/i.test(localError)
+      ? t("native_ipc_timeout_help")
+      : (localError || `HTTP ${resp?.status || "?"}`);
     setStatus(`✖ ${t("unreachable_detail", { msg: detail })}`, "err");
   });
 });

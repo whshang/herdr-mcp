@@ -57,7 +57,7 @@ herdr-mcp 的目标不是重新包装一遍 Herdr，也不是成为通用 coding
 2. **不复制几十个 pane/agent/workspace MCP 工具。** Live Herdr API 通过两个通用工具可达。
 3. **不建立 recipe DSL / 第二 planner。** Web ChatGPT 是唯一高层 planner。
 4. **不宣称 shell sandbox。** 权限边界保持显式，后续若需要更强隔离单独设计。
-5. **不把浏览器扩展改成走公网 Worker。** 扩展是同机反向通道，继续只访问 `127.0.0.1`；公网 OAuth 与本机静态 runtime 凭据分离，插件正常只通过 Native Messaging 获得短期 bearer。
+5. **不把浏览器扩展改成走公网 Worker。** 扩展是同机反向通道；当前版本通过 Native Messaging + runtime 权限为 `0600` 的 Unix Socket 通信，公网 OAuth 与本机静态 runtime 凭据继续分离，浏览器侧不接收 Herdr bearer。
 
 ## 维护方式
 
