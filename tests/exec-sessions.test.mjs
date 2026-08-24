@@ -3,13 +3,25 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import {
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// exec-sessions persists an orphan-recovery journal. Root tests run in
+// parallel, so sharing ~/.config/herdr-mcp/exec-sessions.json lets another
+// test process mistake this file's short-lived child for its own recovery
+// fixture. Give this test module a private journal before importing the code.
+const stateDir = mkdtempSync(join(tmpdir(), "herdr-exec-sessions-test-"));
+process.env.HERDR_MCP_STATE_DIR = stateDir;
+process.on("exit", () => { try { rmSync(stateDir, { recursive: true, force: true }); } catch {} });
+
+const {
   startExecSession,
   readExecSession,
   killExecSession,
   listExecSessions,
   resolveExecShell,
-} from "../dist/exec-sessions.js";
+} = await import("../dist/exec-sessions.js");
 
 test("exec shell is available on the current host", () => {
   const shell = resolveExecShell({});
