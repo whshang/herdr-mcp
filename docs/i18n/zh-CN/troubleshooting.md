@@ -17,7 +17,13 @@
 
 ## HUD 绑定的是 w68，但底栏显示了另一个项目名
 
-以 `workspace_id` 为身份事实，label 只是展示缓存。当前扩展会用实时 `/push/events` / `/push/state` workspace catalog 覆盖历史 binding 里的陈旧 label，并自动修复持久化记录。若浮层已显示正确的 `herdr-mcp (w68)` 而底栏仍显示旧项目名，先确认已经加载当前 0.1.43 扩展并刷新页面；不要通过解绑/重绑来“修”同一个 workspace id。
+以 `workspace_id` 为身份事实，label 只是展示缓存。当前扩展会用实时 `/push/events` / `/push/state` workspace catalog 覆盖历史 binding 里的陈旧 label，并自动修复持久化记录。若浮层已显示正确的 `herdr-mcp (w68)` 而底栏仍显示旧项目名，先确认已经加载当前 0.1.44 扩展并刷新页面；不要通过解绑/重绑来“修”同一个 workspace id。
+
+## ChatGPT 回复了一半就停住，页面像缓存了旧状态
+
+0.1.44 不再直接把这种现象等同于“模型卡死”。当前 Project 必须 `自动 开`，扩展才会做自动 stale-view 恢复。最近回合无页面进展约 30 秒后，它会 best-effort 比较 ChatGPT 同源 conversation snapshot 与当前 DOM：服务端明确领先页面时刷新一次；服务端自己仍未完成且至少 60 秒无进展时也可进入刷新（页面仍显示 streaming 时再多等 30 秒）。刷新后若页面追上服务端就停止恢复；如果仍是同一半截回复，10 秒后发送一次“浏览器恢复”消息激活当前会话。
+
+如果内部 snapshot 接口不可达、返回错误或结构发生变化，freshness 状态为 `unknown`，扩展会 fail-closed，不凭“时间看起来很久”就盲目刷新。此时可以手动刷新页面，再用 HUD **手动继续** 或 **herdr监控** 激活。为避免重复 mutation，恢复消息会要求从实际停止处继续并重新核对实时 Herdr/runtime/Git 状态。
 
 ## 本地服务器无响应
 

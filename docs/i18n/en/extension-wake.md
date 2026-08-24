@@ -61,6 +61,17 @@ Bound conversation + extension ≥ 0.1.20:
 
 The key is stored locally only; the repo keeps it empty by default.
 
+## Stale ChatGPT page / partial-reply recovery (0.1.44)
+
+With Project `Auto on`, both human-submitted and extension-submitted user messages enter the conversation-health state machine. After roughly 30 seconds without fresh page progress, the extension best-effort fetches the current same-origin ChatGPT conversation snapshot, follows `current_node` to the latest assistant message, and compares it with the last assistant message in the DOM:
+
+- newer server message id, or clearly longer server text for the same message: **server ahead** → refresh the page once when safety gates pass;
+- server explicitly reports an unfinished assistant message with no progress for at least 60 seconds: **server stalled**; if the page still claims streaming, wait another 30 seconds;
+- server and page agree and the message is finished: **synced** → do not refresh;
+- snapshot request fails, times out, or changes shape: **unknown** → fail closed; never refresh on guesswork.
+
+The pre-refresh assistant signature is persisted. If reload reveals newer content or streaming resumes, recovery ends. If the identical partial reply remains after 10 seconds and the composer, tools and permission cards are idle, the extension submits exactly one browser-recovery activation message telling ChatGPT to reread the current conversation, continue from the real stop point, and not repeat completed work. Only if that also fails does recovery-exhausted rollover become eligible.
+
 ## Multi-task semantics
 
 | Event | Behavior |
