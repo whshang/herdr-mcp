@@ -30,18 +30,19 @@ ChatGPT 有两层：
 |---|---|
 | 服务端强制「全部自动允许」 | **做不到。** Connector 网页没有稳定的 `require_approval: never`；那是 Responses API 开发者参数，不是 chatgpt.com 设置项 |
 | 点一次「Always allow」后永久生效 | 社区反馈不稳定，有时会丢会话 / 重走 OAuth |
-| 少点几次「允许」 | 装本仓库浏览器扩展；在 **chatgpt.com** 标签页里对页面内权限卡片自动点「允许」（见下） |
+| 少点几次「允许」 | 装本仓库浏览器扩展，Options 选择**项目自动**，在当前 Project HUD 打开 **`自动 开`**，并启用 Options「自动点击允许」；此时才会对 **chatgpt.com** 页面内明确的权限卡自动点「允许」（见下） |
 
 扩展行为（`extension/`，内容脚本 ≥ 0.1.3）：
 
 - 识别页面内「允许 / 拒绝」工具权限卡（含 `data-testid=tool-action-buttons`）
-- **chatgpt.com 打开后常驻观察**（不再只绑在 herdr→网页「唤醒」的 90 秒窗口）
+- **chatgpt.com 打开后持续观察**，但观察与 mutation 分离：`自动 关` 时仍可识别状态，不点击任何权限动作
+- 只有 **Options 项目自动 + 当前 Project HUD `自动 开` + Options「自动点击允许」** 同时成立时才自动点击
 - 只点可见、可用、文案明确为允许类的按钮；有拒绝按钮同卡才点（fail-closed）
 - **点不了**：浏览器原生权限条、非 DOM 的系统对话框
 
 服务端可做的只是诚实标注（例如 `readOnlyHint`）；ChatGPT 目前常忽略，仍可能把只读工具当成写操作来问。
 
-每次工具调用仍弹卡时：确认扩展已加载、当前标签是 `chatgpt.com`、内容脚本版本 ≥ 0.1.3（扩展重载后旧标签会自动刷新）。
+每次工具调用仍弹卡时：确认扩展已加载、当前标签是 `chatgpt.com`、Options 为**项目自动**、当前 Project HUD 为 **`自动 开`**、Options「自动点击允许」已开启；浏览器原生权限条需要人工处理。
 
 ## OAuth（CIMD）
 
@@ -129,7 +130,7 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 | 2 | `herdr_prompt` → 便宜/高速 worker（pi、flash…），任务自包含 | 只烧便宜模型 |
 | 禁止默认 | `herdr_prompt` → Claude/OMP/main 再让它指挥其他窗格 | 贵模型大头 |
 
-网页模型用 `herdr_since` / `herdr_inspect` 自己续调度；插件「继续」也应推动网页再查状态，而不是把规划丢回本机主 agent。
+网页模型用 `herdr_since` / `herdr_inspect` 自己续调度；HUD 的 **「手动继续」** 直接继续网页回合，**「herdr监控」** 会先读取 Herdr 窗口/Agent 状态再继续，不能把规划丢回本机主 agent。
 
 ## 排障清单
 
@@ -139,13 +140,13 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 4. `tools/list` `200` 但对话 0 工具：schema 拒收或 **旧对话快照** → 开新对话
 5. `/.well-known/mcp.json` 的 `version` 是否等于你以为在跑的构建
 6. 「读不了文件」：确认失败调用是 `herdr_fs_*` / `herdr_exec`，不是 `herdr_call call=agent.*`
-7. 权限卡不停：扩展是否在 chatgpt.com、内容脚本 ≥ 0.1.3
+7. 权限卡不停：扩展是否在 chatgpt.com、Options 是否为项目自动、当前 Project HUD 是否 `自动 开`、Options「自动点击允许」是否开启；浏览器原生权限条不自动处理
 
 ## ChatGPT 派活后对话停住
 
 Connector 只解决「ChatGPT → herdr」。若工具很快返回「已提交」，而 agent 仍在窗格里跑，网页对话常不再自动 `herdr_since` / 继续。
 
-闭环要靠浏览器扩展：绑定该 chatgpt 会话 ↔ 干活的 workspace；agent **working** 期间按「新摘要才发 + 20 分钟兜底」回推进度，**settled** 时再塞继续提示并提交。见 [extension-wake.md](./extension-wake.md)。
+闭环要靠浏览器扩展：绑定该 chatgpt 会话 ↔ 干活的 workspace。只有 Options 允许项目自动且当前 Project `自动 开` 时，才会在 agent **working** 期间回推进度、**settled** 时自动继续，并启用 LLM 判断、回复超时恢复和安全接力。全局手动或 Project `自动 关` 时仍观察状态，但改用 HUD 的三个手动动作。见 [extension-wake.md](./extension-wake.md)。
 
 未绑定扩展时，这不是 MCP 故障，是缺回推环。
 

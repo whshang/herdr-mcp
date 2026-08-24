@@ -40,7 +40,7 @@ Runtime releases switch behind the persistent Edge/Link: validate the new genera
 1. ChatGPT connects to the Edge MCP endpoint and completes OAuth (see [install](install.md)).
 2. A new conversation starts; the model calls `herdr_inspect` to see the workstation, then `herdr_skill` once.
 3. You ask for a change in a git-managed project: the model reads with `herdr_fs_read` / `herdr_git status`, edits with `herdr_fs_patch`, runs tests with `herdr_exec`, and commits through atomic Git helpers under the managed root.
-4. The MV3 extension pushes agent progress/settled events back into the web chat (localhost-only, token never crosses Cloudflare) — you see progress without polling. See [extension-wake](extension-wake.md).
+4. Bind the web chat to the working workspace in the MV3 extension. Options chooses **Manual globally / Per-Project automation**. In Per-Project mode, explicitly enable the current ChatGPT Project from its HUD before automatic progress/settled wakes, LLM continuation, timeout recovery or safe rollover can run; otherwise **Manual continue / Herdr monitor / LLM analysis** take over. All extension traffic stays localhost-only; the static token never crosses Cloudflare. See [extension-wake](extension-wake.md).
 5. When a worker is down, the model falls back to `dsh --profile headless` through a long `herdr_exec_start` session instead of stalling.
 
 Result: one stable public contract, cheap local compute, and a reverse channel that keeps the web conversation live.

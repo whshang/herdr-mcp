@@ -13,7 +13,11 @@ Hard requirements and diagnostics: [chatgpt-connector](chatgpt-connector.md).
 
 ## The MCP Connector card keeps popping up
 
-Verify the extension is loaded, the current tab is `chatgpt.com`, and the content-script version is ≥ 0.1.3 (old tabs refresh after the extension reloads). See [extension](extension.md).
+Verify the extension is loaded, Options is set to **Per-Project automation**, the current ChatGPT Project HUD shows **`Auto on`**, and Options **Auto-click Allow** is enabled. In Manual globally mode or with the Project `Auto off`, the extension still observes the page and Herdr state but does not click permission cards; native browser permission bars always require manual handling. See [extension](extension.md).
+
+## The HUD is bound to w68 but the bottom bar shows another project name
+
+Treat `workspace_id` as identity; the label is display cache only. The current extension prefers the live `/push/events` / `/push/state` workspace catalog over a stale binding label and repairs the persisted binding automatically. If the drawer already shows the correct `herdr-mcp (w68)` while the bar still shows an older project name, make sure the current 0.1.43 extension is loaded and refresh the page; do not unbind/rebind merely to repair a label for the same workspace id.
 
 ## Local server not answering
 

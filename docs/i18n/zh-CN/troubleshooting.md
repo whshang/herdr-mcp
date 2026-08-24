@@ -13,7 +13,11 @@
 
 ## MCP Connector 的授权卡片反复弹
 
-确认扩展已加载、当前标签页是 `chatgpt.com`、content-script 版本 ≥ 0.1.3（扩展重载后旧标签页会自动刷新）。见 [浏览器扩展](extension.md)。
+确认扩展已加载、当前标签页是 `chatgpt.com`、Options 为**项目自动**、当前 Project HUD 显示 **`自动 开`**，并且 Options 的「自动点击允许」已开启。全局手动或 Project `自动 关` 时扩展仍观察页面和 Herdr 状态，但不会点击权限卡；浏览器原生权限条也始终需要人工处理。见 [浏览器扩展](extension.md)。
+
+## HUD 绑定的是 w68，但底栏显示了另一个项目名
+
+以 `workspace_id` 为身份事实，label 只是展示缓存。当前扩展会用实时 `/push/events` / `/push/state` workspace catalog 覆盖历史 binding 里的陈旧 label，并自动修复持久化记录。若浮层已显示正确的 `herdr-mcp (w68)` 而底栏仍显示旧项目名，先确认已经加载当前 0.1.43 扩展并刷新页面；不要通过解绑/重绑来“修”同一个 workspace id。
 
 ## 本地服务器无响应
 

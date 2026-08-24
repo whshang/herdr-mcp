@@ -201,10 +201,10 @@ herdr のネイティブ面は大きな Unix-socket API（`herdr api schema`）�
 
 フォルダ: `extension/`（MV3）。対応サイト: chatgpt.com / claude.ai / chat.deepseek.com / chat.z.ai。
 
-1. **進捗ナッジ（利用可）** — 会話を herdr **workspace** にバインド。既定チェック間隔 **60 秒**、変化なし時のフォールバック **20 分**。ChatGPT のページ内「許可」カードは自動クリック。任意でターン後に小モデル判定（拡張 ≥0.1.20）。
+1. **Web 継続動作（利用可）** — Options で **全体を手動 / Project ごとの自動化**を選ぶ。全体手動では Project HUD に自動化スイッチを表示せず、**手動続行 / Herdr 監視 / LLM 分析**だけで進める。Project ごとの自動化では新しい ChatGPT Project は既定でオフで、HUD から明示的に有効化する。同じ `project_id` の会話と rollover 後の新しい会話は設定を共有する。
 2. **JSON → MCP（未完成）** — DeepSeek / z.ai で `{"tool":...}` を抽出できるが、ローカル `/mcp` 呼び出しと結果の書き戻しはまだない。
 
-UI 言語: en / 简体中文 / 日本語。詳細: [docs/i18n/en/extension.md](docs/i18n/en/extension.md)。
+展開ドロワーは低頻度設定専用（イベント設定 / 会話 binding / 詳細オプション）で、手動ボタンや自動化 switch は置かない。ChatGPT Project の rollover は fail-closed で、新しい会話への seed が確認されるまで元の binding が権威を持つ。UI 言語: en / 简体中文 / 日本語。詳細: [docs/i18n/en/extension.md](docs/i18n/en/extension.md)。
 
 ## ドキュメント
 

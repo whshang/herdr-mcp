@@ -76,8 +76,12 @@
   <label><input type="checkbox" id="autoAllow"> <span id="lab_auto">Auto-click Allow on in-page permission cards</span></label>
   <div class="hint" id="hint_auto">In-page cards only; native browser bars cannot be clicked.</div>
 
-  <label><input type="checkbox" id="enabled"> <span id="lab_enabled">Enable wake + LLM nudge</span></label>
-  <div class="hint" id="hint_enabled"></div>
+  <label id="lab_automation_mode">Automation mode</label>
+  <select id="automationMode">
+    <option value="manual" id="automation_mode_manual">Manual globally</option>
+    <option value="project_auto" id="automation_mode_project">Per-Project automation</option>
+  </select>
+  <div class="hint" id="hint_automation_mode"></div>
 
   <button class="primary" id="save">Save</button>
   <button id="test">Test connection</button>

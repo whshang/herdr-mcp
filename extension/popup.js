@@ -172,7 +172,9 @@ async function refresh() {
   } else {
     srv.innerHTML = `<span class="err">● ${t("unreachable")}${agentsResp?.status ? ` (${agentsResp.status})` : ""}</span>`;
   }
-  $("enabled").checked = !!st.config?.enabled;
+  $("automationModeStatus").textContent = st.config?.automationMode === "project_auto"
+    ? t("automation_mode_project")
+    : t("automation_mode_manual");
   $("progressTickSec").value = String(st.config?.progressTickSec ?? 60);
   const llmEl = $("llmJudgeStatus");
   if (llmEl) {
@@ -257,9 +259,6 @@ async function refresh() {
   }
 }
 
-$("enabled").addEventListener("change", async (e) => {
-  await bg({ type: "h2w_set_config", config: { enabled: e.target.checked } });
-});
 $("progressTickSec").addEventListener("change", async (e) => {
   const sec = parseSecInput(e.target.value, 60);
   e.target.value = String(sec);

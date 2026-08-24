@@ -28,13 +28,13 @@ Extension track A: **periodic progress announcements + done reminder**, written 
 **Same field**: `progressTickSec` is also the cooldown seconds of the ChatGPT turn nudge (one place to fill in popup/options).
 
 Actual-send rules (avoid empty-spin spam):
-- `progressTickSec` only sets the **check/nudge interval** (default 60s), not the send interval; **0 = disable progress announcements and turn nudge**
+- `progressTickSec` only sets the **interval-driven progress check / automatic LLM turn-decision interval** (default 60s), not the send interval; **0 disables only those two interval-driven actions and does not change the Options global mode or the Project HUD automation switch**
 - **first actual send**: non-empty summary with a fingerprint change → `new_output`
 - **already sent**: if less than `progressFallbackSec` (default 1200s / 20 minutes) since **the last send** → **do not send at all** (the floor is counted from the last send, not a fixed cron)
 - after the floor: fingerprint changed → `new_output`; otherwise → `fallback`
 - the sent baseline is written into the binding (`lastProgressSentAt` / `lastProgressOutput`), so dedupe survives a Service Worker kill
 
-Defaults: `progressTickSec = 60` (progress check + nudge cooldown; `0` disables); `progressFallbackSec = 1200` (20-minute fallback; `0` = send only on new summaries). Both editable in the options page. UI languages: en / Simplified Chinese / Japanese (follows system first, manual override possible).
+Defaults: `progressTickSec = 60` (progress check + automatic LLM-decision cooldown; `0` disables those two); `progressFallbackSec = 1200` (20-minute fallback; `0` = send only on new summaries). Options chooses **Manual globally / Per-Project automation**. Manual globally hides the Project HUD automation switch and blocks all automatic mutations; Per-Project mode exposes the switch, with each new Project defaulting off. Both timing values are editable in Options. UI languages: en / Simplified Chinese / Japanese (follows system first, manual override possible).
 
 ## Install and bind
 
@@ -52,11 +52,11 @@ No binding = no push-back. Legacy "single pane" bindings upgrade to workspace by
 Bound conversation + extension ≥ 0.1.20:
 
 1. the content script marks turns by Stop appearing/disappearing
-2. when Options has Base URL + Key + Model: one OpenAI-compatible `chat/completions` call over the user/assistant body
+2. when Options is in Per-Project mode, the current Project is `Auto on`, and Base URL + Key + Model are configured: one OpenAI-compatible `chat/completions` call over the user/assistant body; otherwise use the bottom-bar **LLM analysis** action to trigger it manually
 3. if the reply matches the "do not send" keywords → no nudge; otherwise if judged "continue" → **fill the small model's original text** into the input and submit (prompt / do-not-send words are pre-filled visible defaults in Options)
 4. **no longer** uses zero-tool / halfway heuristics; without a configured small model, no nudge this turn
-5. if the user bubble was the last nudge sentence, the **new assistant reply is still judged** (since 0.1.20); cooldown and progress checks share `progressTickSec`, **0 = nudge off** (default 60s)
-6. persistent status bar at the bottom of the ChatGPT page (≥0.1.22): current config + latest judgment; copy follows the Options language (en / Simplified Chinese / Japanese)
+5. if the user bubble was the last nudge sentence, the **new assistant reply is still judged** (since 0.1.20); automatic judgment and progress checks share `progressTickSec`; `0` disables automatic LLM judgment (default 60s) but not manual **LLM analysis**
+6. persistent bottom HUD: runtime state, **Manual continue / Herdr monitor / LLM analysis**, optional Project **Auto on|off**, and expand. The Project switch is shown only when Options is in Per-Project mode; frequent actions stay on the bar, and the drawer contains only event settings, conversation bindings and advanced options. Copy follows the Options language (en / Simplified Chinese / Japanese)
 7. herdr working/settled wake-ups remain independent
 
 The key is stored locally only; the repo keeps it empty by default.
@@ -75,7 +75,7 @@ Default templates contain `{roster}` `{idle_hint}` placeholders; the extension f
 
 ## ChatGPT permission cards
 
-Content script ≥ 0.1.3 persistently auto-clicks "Allow" on chatgpt.com. See [chatgpt-connector.md](./chatgpt-connector.md).
+The content script keeps observing in-page permission cards on chatgpt.com, but clicks an explicit Allow action only when **Options is Per-Project automation + the current Project is `Auto on` + Options `Auto-click Allow` is enabled**. Manual globally or Project `Auto off` stops automatic permission clicks. Native browser permission bars are outside this mechanism. See [chatgpt-connector.md](./chatgpt-connector.md).
 
 ## Testing
 

@@ -235,7 +235,7 @@ Folder: `extension/` (MV3, Chrome name **herdr → Web wake**). Load unpacked in
 
 Two jobs ([docs/i18n/en/extension.md](docs/i18n/en/extension.md)) — they share the local token; they are **not** equally finished:
 
-1. **Progress nudge (shipping)** — bind the current chat to a herdr **workspace**; any agent in that space with new output / settle can type into the chat; full settle only when none remain working. ChatGPT in-page “Allow” cards are auto-clicked. Optional: after a ChatGPT turn, a configured small model may submit a continue message (extension ≥0.1.20).
+1. **Web continuity automation (shipping)** — Options selects **Manual globally / Per-Project automation**. Manual mode leaves the three HUD actions available and hides the Project automation switch. Per-Project mode keeps every new ChatGPT Project off until explicitly enabled in its HUD; that Project setting is shared across its conversations and rollover successors.
 2. **JSON → MCP (incomplete)** — on DeepSeek / z.ai the content script can parse assistant `{"tool":...}`. It does **not** yet call local `/mcp` or paste results back. Plan: [docs/i18n/en/extension-bridge.md](docs/i18n/en/extension-bridge.md).
 
 Same local `127.0.0.1:8772` token. Not a substitute for ChatGPT’s OAuth connector. Defaults: progress check every **60s**, unchanged-summary fallback **20 min** (`progressTickSec` / `progressFallbackSec`).

@@ -24,7 +24,7 @@ import {
 } from "./continuity-core.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 
-const H2W_SCRIPT_VERSION = "0.1.42";
+const H2W_SCRIPT_VERSION = "0.1.43";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -42,6 +42,9 @@ const PUSH_CONNECT_MS = 5000;
 const STATE_FETCH_MS = 4000;
 const TAB_RECOVERY_COOLDOWN_MS = 30000;
 const HANDOFF_STORAGE_KEY = "herdrConversationTransfers";
+const PROJECT_AUTOMATION_STORAGE_KEY = "herdrProjectAutomation";
+const AUTOMATION_MODE_MANUAL = "manual";
+const AUTOMATION_MODE_PROJECT = "project_auto";
 const HANDOFF_RETENTION_MS = 7 * 86400000;
 const tabVersions = new Map();
 const reloadedTabs = new Set();
@@ -74,7 +77,7 @@ function hudLabels() {
   const keys = [
     "automation", "automation_on", "automation_off", "manual_continue", "manual_status", "manual_judge",
     "manual_continue_hint", "manual_status_hint", "manual_judge_hint", "controls", "advanced_options", "event_settings",
-    "automation_hint", "on", "off", "interval", "fallback", "bindings", "bind", "unbind", "available",
+    "automation_on_hint", "automation_off_hint", "on", "off", "interval", "fallback", "bindings", "bind", "unbind", "available",
     "no_workspaces", "workspaces_unavailable", "active", "bound_count", "aria_toggle_automation",
     "aria_open_controls", "automation_enabled", "automation_disabled", "automation_update_failed",
     "timing_saved", "timing_save_failed", "bound_to", "unbound_from", "binding_failed", "judge_no_continue",
@@ -104,7 +107,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- Configuration (wait for storage before startup or stream rebuild) ----
 let CFG = {
-  herdrMcpUrl: "http://127.0.0.1:8772", token: "", enabled: true, autoAllow: true,
+  herdrMcpUrl: "http://127.0.0.1:8772", token: "", automationMode: AUTOMATION_MODE_MANUAL,
+  // Legacy fields stay fail-closed for older content scripts. New code derives
+  // automation from global mode + the current ChatGPT Project id.
+  enabled: false, autoAllow: true,
   wakeTemplate: "", progressTickSec: 60, progressFallbackSec: 1200,
   progressTemplate: "",
   idleNudgeEnabled: true,
@@ -115,15 +121,61 @@ let CFG = {
   llmJudgePromptTemplate: "",
   llmJudgeSkipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
 };
+let PROJECT_AUTOMATION = {};
+
+function normalizeAutomationMode(value) {
+  return value === AUTOMATION_MODE_PROJECT ? AUTOMATION_MODE_PROJECT : AUTOMATION_MODE_MANUAL;
+}
+
+function sanitizeProjectAutomation(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [projectId, enabled] of Object.entries(raw)) {
+    if (enabled === true && /^g-p-[0-9a-f]{32}$/i.test(projectId)) out[projectId] = true;
+  }
+  return out;
+}
+
+function automationScopeForConversation(convKey) {
+  const info = chatGptConversationInfo(convKey);
+  const projectId = info?.project_id || null;
+  const globalMode = normalizeAutomationMode(CFG.automationMode);
+  const projectMode = globalMode === AUTOMATION_MODE_PROJECT;
+  const projectAutomationAvailable = projectMode && Boolean(projectId);
+  const enabled = projectAutomationAvailable && PROJECT_AUTOMATION[projectId] === true;
+  return {
+    global_mode: globalMode,
+    project_id: projectId,
+    project_automation_available: projectAutomationAvailable,
+    project_automation_enabled: enabled,
+    enabled,
+  };
+}
+
+function automationEnabledForBinding(binding) {
+  return automationScopeForConversation(binding?.convKey || binding?.tabUrl || "").enabled;
+}
+
+async function notifyAutomationChanged() {
+  try {
+    const groups = await Promise.all(H2W_TAB_URLS.map((url) => chrome.tabs.query({ url })));
+    const tabs = [...new Map(groups.flat().filter((tab) => tab?.id).map((tab) => [tab.id, tab])).values()];
+    await Promise.allSettled(tabs.map((tab) => (
+      chrome.tabs.sendMessage(tab.id, { type: "h2w_automation_changed" })
+    )));
+  } catch (_) {}
+}
 let resolveConfigReady;
 const configReady = new Promise((r) => { resolveConfigReady = r; });
 (async () => {
   await detectOrLoadLocale();
   let stored = {};
   try {
-    const keys = [...Object.keys(CFG), "idleNudgeCooldownSec"];
+    const keys = [...Object.keys(CFG), "idleNudgeCooldownSec", PROJECT_AUTOMATION_STORAGE_KEY];
     stored = await chrome.storage.local.get(keys);
     CFG = { ...CFG, ...stored };
+    delete CFG[PROJECT_AUTOMATION_STORAGE_KEY];
+    PROJECT_AUTOMATION = sanitizeProjectAutomation(stored[PROJECT_AUTOMATION_STORAGE_KEY]);
   } catch (e) {}
   if (!String(CFG.wakeTemplate || "").trim()) CFG.wakeTemplate = defaultWakeTemplate();
   if (!String(CFG.progressTemplate || "").trim()) CFG.progressTemplate = defaultProgressTemplate();
@@ -131,6 +183,15 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
     CFG.llmJudgePromptTemplate = localizedText("default_llm_judge_prompt", null, DEFAULT_LLM_JUDGE_PROMPT);
   }
   const patch = {};
+  if (![AUTOMATION_MODE_MANUAL, AUTOMATION_MODE_PROJECT].includes(stored.automationMode)) {
+    // Upgrade compatibility: preserve the old global user's intent only as a
+    // permission to use per-Project automation. No Project is auto-enabled by
+    // migration; the user must explicitly turn it on from that Project HUD.
+    CFG.automationMode = stored.enabled === true ? AUTOMATION_MODE_PROJECT : AUTOMATION_MODE_MANUAL;
+    patch.automationMode = CFG.automationMode;
+  } else {
+    CFG.automationMode = normalizeAutomationMode(CFG.automationMode);
+  }
   // Legacy: idleNudgeCooldownSec merged into progressTickSec (one interval for progress + nudge).
   if (stored.idleNudgeCooldownSec != null) {
     const tick = Number(CFG.progressTickSec);
@@ -146,13 +207,10 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
     CFG.progressFallbackSec = 1200;
     patch.progressFallbackSec = 1200;
   }
-  // `enabled` is the authoritative automation switch. Keep the legacy
-  // idleNudgeEnabled field mirrored for stored-config and older content-script
-  // compatibility.
-  if (CFG.idleNudgeEnabled !== CFG.enabled) {
-    CFG.idleNudgeEnabled = CFG.enabled;
-    patch.idleNudgeEnabled = CFG.enabled;
-  }
+  // Legacy global automation flags must remain off. Otherwise a stale content
+  // script could bypass the new Project-scoped policy after an extension update.
+  if (CFG.enabled !== false) { CFG.enabled = false; patch.enabled = false; }
+  if (CFG.idleNudgeEnabled !== false) { CFG.idleNudgeEnabled = false; patch.idleNudgeEnabled = false; }
   if (Object.keys(patch).length) {
     try {
       await chrome.storage.local.set(patch);
@@ -661,7 +719,7 @@ async function ensurePushStream(bindings) {
   await configReady;
   // Keep exactly one extension-wide observation stream even when automatic
   // wake/nudge is paused. Bound workspace runtime state must stay live in the
-  // HUD; CFG.enabled gates actions, not observability.
+  // HUD and popup stay observable regardless of the global/Project automation policy.
   if (pushStream) return;
   const ctrl = new AbortController();
   pushStream = { ctrl };
@@ -768,7 +826,7 @@ async function onPushHello(storeKey, data) {
   b.status = d.status;
   b.lastSettle = d.lastSettle;
   await saveBindings(bindings);
-  if (d.status === "working" && CFG.enabled) armProgressTimer(storeKey, b);
+  if (d.status === "working" && automationEnabledForBinding(b)) armProgressTimer(storeKey, b);
   if (d.wake) {
     callLog(`hello recovery wake: ws=${ws} → ${d.status} (settle missed while offline)`);
     await routeWake(b, { status: d.status, output: "", working_count: d.working_count }, CFG.wakeTemplate || defaultWakeTemplate());
@@ -787,7 +845,7 @@ async function onPushWorking(storeKey, data) {
   b.status = "working";
   await saveBindings(bindings);
   setActionBadge("…", "#d97706");
-  if (CFG.enabled) armProgressTimer(storeKey, b);
+  if (automationEnabledForBinding(b)) armProgressTimer(storeKey, b);
   else clearProgressTimer(storeKey);
 }
 
@@ -813,6 +871,7 @@ async function onPushSettled(storeKey, data) {
 
   if (d.kind === "round") clearProgressTimer(storeKey);
   if (!d.wake) return;
+  if (!automationEnabledForBinding(b)) return;
 
   let output = "";
   if (data.pane) {
@@ -957,7 +1016,7 @@ function scheduleIdleNudgeRetry(convKey, delayMs) {
 }
 
 async function retryIdleNudge(convKey) {
-  if (!CFG.enabled) return;
+  if (!automationScopeForConversation(convKey).enabled) return;
   const cooldownSec = paceIntervalSec();
   if (cooldownSec <= 0) return;
   const bindings = await loadBindings();
@@ -994,15 +1053,15 @@ async function retryIdleNudge(convKey) {
 
 /** Post-turn nudge: LLM judge only (no zero-tools / mid-stop heuristics). */
 async function maybeIdleNudge(msg) {
-  if (!CFG.enabled) {
-    return rememberIdleNudge(msg.convKey || "", { nudged: false, reason: "disabled" });
+  const convKey = msg.convKey;
+  if (!convKey) return rememberIdleNudge("", { nudged: false, reason: "no_conv" });
+  if (!automationScopeForConversation(convKey).enabled) {
+    return rememberIdleNudge(convKey, { nudged: false, reason: "disabled" });
   }
   const cooldownSec = paceIntervalSec();
   if (cooldownSec <= 0) {
     return rememberIdleNudge(msg.convKey || "", { nudged: false, reason: "disabled" });
   }
-  const convKey = msg.convKey;
-  if (!convKey) return rememberIdleNudge("", { nudged: false, reason: "no_conv" });
   lastTurnEndedPayload.set(convKey, {
     convKey,
     userText: msg.userText || "",
@@ -1157,7 +1216,7 @@ async function tickProgress(storeKey, ts) {
   const bindings = await loadBindings();
   const b = bindings[storeKey];
   if (!b) { clearProgressTimer(storeKey); return; }
-  if (b.status !== "working" || !CFG.enabled) { clearProgressTimer(storeKey); return; }
+  if (b.status !== "working" || !automationEnabledForBinding(b)) { clearProgressTimer(storeKey); return; }
   if (!shouldProgressTick({ status: b.status, lastTickAt: ts.lastTickAt }, Date.now(), CFG)) return;
   ts.inFlight = true;
   try {
@@ -1180,7 +1239,7 @@ async function tickProgress(storeKey, ts) {
       } catch (e) { output = ""; }
     }
     const cur = progressTimers.get(storeKey);
-    if (cur !== ts || !CFG.enabled) return;
+    if (cur !== ts || !automationEnabledForBinding(b)) return;
     const bindingsNow = await loadBindings();
     const curB = bindingsNow[storeKey];
     if (!curB || curB.status !== "working") return;
@@ -1221,21 +1280,21 @@ async function tickProgress(storeKey, ts) {
 
 // Reconcile after configuration or stream rebuilds, preserving send baselines.
 function reconcileProgressTimers(bindings) {
-  if (!CFG.enabled || progressTickSecMs() <= 0) {
+  if (progressTickSecMs() <= 0) {
     for (const storeKey of [...progressTimers.keys()]) clearProgressTimer(storeKey);
     return;
   }
   for (const storeKey of [...progressTimers.keys()]) {
     const b = bindings[storeKey];
-    if (!b || b.status !== "working") clearProgressTimer(storeKey);
+    if (!b || b.status !== "working" || !automationEnabledForBinding(b)) clearProgressTimer(storeKey);
   }
   for (const [storeKey, b] of Object.entries(bindings)) {
-    if (b.status === "working") armProgressTimer(storeKey, b);
+    if (b.status === "working" && automationEnabledForBinding(b)) armProgressTimer(storeKey, b);
   }
 }
 
 async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTemplate(), wakeKind = null) {
-  if (!CFG.enabled) return { ok: false, reason: "disabled" };
+  if (!automationEnabledForBinding(b)) return { ok: false, reason: "disabled" };
   const isLlmNudge = extra.status === "llm_continue_nudge";
   const rawText = String(template || "").trim();
 
@@ -1748,6 +1807,9 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   if (!convInfo?.project_id || !convInfo?.project_launch_url) {
     return { ok: false, error: "project_conversation_required" };
   }
+  if (trigger !== "manual" && !automationScopeForConversation(convInfo.convKey).enabled) {
+    return { ok: false, error: "automation_disabled" };
+  }
   const bindings = await loadBindings();
   const session = bindingsForConv(bindings, convInfo.convKey);
   if (!session.length) return { ok: false, error: "binding_required" };
@@ -1932,10 +1994,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
   if (msg?.type === "h2w_automation_state") {
+    const scope = automationScopeForConversation(String(msg.convKey || "").trim());
     sendResponse({
       ok: true,
-      enabled: CFG.enabled !== false,
+      ...scope,
       autoAllow: CFG.autoAllow !== false,
+      labels: hudLabels(),
     });
     return;
   }
@@ -1954,6 +2018,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const transfer = convKey ? latestTransferForConversation(transfers, convKey) : null;
       const transferView = handoffView(transfer, convKey);
       const convInfo = convKey ? chatGptConversationInfo(convKey) : null;
+      const automation = automationScopeForConversation(convKey);
       const cachedWorkspaces = cachedPushWorkspaceCatalog();
       // /push/events hello already carries the authoritative workspace list.
       // Render that immediately; /push/state becomes an async freshness probe.
@@ -1974,9 +2039,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         version: H2W_SCRIPT_VERSION,
         locale: getLocale(),
         labels: hudLabels(),
-        enabled: CFG.enabled !== false,
+        enabled: automation.enabled,
+        automation_mode: automation.global_mode,
+        project_id: automation.project_id,
+        project_automation_available: automation.project_automation_available,
+        project_automation_enabled: automation.project_automation_enabled,
         autoAllow: CFG.autoAllow !== false,
-        idleNudgeEnabled: CFG.enabled !== false,
+        idleNudgeEnabled: automation.enabled,
         progressTickSec: paceIntervalSec() || Number(CFG.progressTickSec) || 0,
         progressFallbackSec: Number(CFG.progressFallbackSec) || 0,
         llmConfigured: isLlmJudgeConfigured(CFG),
@@ -2021,20 +2090,50 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (Object.prototype.hasOwnProperty.call(incoming, "uiLocale")) {
         await setLocale(String(incoming.uiLocale || "en"));
       }
-      if (Object.prototype.hasOwnProperty.call(incoming, "idleNudgeEnabled")
-        && !Object.prototype.hasOwnProperty.call(incoming, "enabled")) {
-        incoming.enabled = incoming.idleNudgeEnabled !== false;
+      // Compatibility with 0.1.42 UI: the old global boolean now selects only
+      // the global policy mode. It never enables a Project by itself.
+      if (!Object.prototype.hasOwnProperty.call(incoming, "automationMode")
+        && Object.prototype.hasOwnProperty.call(incoming, "enabled")) {
+        incoming.automationMode = incoming.enabled === false ? AUTOMATION_MODE_MANUAL : AUTOMATION_MODE_PROJECT;
       }
-      if (Object.prototype.hasOwnProperty.call(incoming, "enabled")) {
-        incoming.enabled = incoming.enabled !== false;
-        incoming.idleNudgeEnabled = incoming.enabled;
+      if (Object.prototype.hasOwnProperty.call(incoming, "automationMode")) {
+        incoming.automationMode = normalizeAutomationMode(incoming.automationMode);
       }
+      delete incoming.enabled;
+      delete incoming.idleNudgeEnabled;
       CFG = { ...CFG, ...incoming };
+      CFG.enabled = false;
+      CFG.idleNudgeEnabled = false;
       delete CFG.idleNudgeCooldownSec;
-      await chrome.storage.local.set(CFG);
+      await chrome.storage.local.set({ ...CFG, enabled: false, idleNudgeEnabled: false });
       try { await chrome.storage.local.remove("idleNudgeCooldownSec"); } catch (e) {}
       void rebuildStreams();
+      await notifyAutomationChanged();
       sendResponse({ ok: true });
+    })();
+    return true;
+  }
+  if (msg?.type === "h2w_set_project_automation") {
+    void (async () => {
+      const projectId = String(msg.project_id || "").trim();
+      if (!/^g-p-[0-9a-f]{32}$/i.test(projectId)) {
+        sendResponse({ ok: false, error: "project_required" });
+        return;
+      }
+      if (normalizeAutomationMode(CFG.automationMode) !== AUTOMATION_MODE_PROJECT) {
+        sendResponse({ ok: false, error: "global_manual_mode" });
+        return;
+      }
+      if (msg.enabled === true) PROJECT_AUTOMATION[projectId] = true;
+      else delete PROJECT_AUTOMATION[projectId];
+      await chrome.storage.local.set({ [PROJECT_AUTOMATION_STORAGE_KEY]: PROJECT_AUTOMATION });
+      const bindings = await loadBindings();
+      reconcileProgressTimers(bindings);
+      for (const convKey of [...idleNudgeRetryTimers.keys()]) {
+        if (!automationScopeForConversation(convKey).enabled) clearIdleNudgeRetry(convKey);
+      }
+      await notifyAutomationChanged();
+      sendResponse({ ok: true, ...automationScopeForConversation(msg.convKey || msg.url || "") });
     })();
     return true;
   }
@@ -2087,6 +2186,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         : null;
       const transfers = await loadHandoffTransfers();
       const transfer = convInfo?.convKey ? latestTransferForConversation(transfers, convInfo.convKey) : null;
+      const automation = automationScopeForConversation(convInfo?.convKey || "");
       sendResponse({
         convInfo,
         binding: bindingViewOne,
@@ -2107,11 +2207,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         })),
         config: {
           herdrMcpUrl: CFG.herdrMcpUrl,
-          enabled: CFG.enabled,
+          automationMode: normalizeAutomationMode(CFG.automationMode),
+          enabled: automation.enabled,
+          projectAutomationAvailable: automation.project_automation_available,
+          projectAutomationEnabled: automation.project_automation_enabled,
           tokenSet: !!CFG.token,
           progressTickSec: CFG.progressTickSec,
           progressFallbackSec: CFG.progressFallbackSec,
-          idleNudgeEnabled: CFG.enabled !== false,
+          idleNudgeEnabled: automation.enabled,
           llmJudgeConfigured: isLlmJudgeConfigured(CFG),
         },
       });
@@ -2210,6 +2313,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const convInfo = await conversationInfoForTab(tabId);
       const convKey = String(msg.convKey || convInfo?.convKey || "").trim();
       if (!convKey) { sendResponse({ ok: false, error: "conversation-unavailable" }); return; }
+      if (automationScopeForConversation(convKey).enabled) {
+        sendResponse({ ok: false, error: "automation_enabled" });
+        return;
+      }
       if (msg.action === "direct") {
         sendResponse(await manualDirectContinue(tabId, convKey));
         return;
@@ -2315,7 +2422,7 @@ async function rebuildStreams() {
   const bindings = await loadBindings();
   callLog(
     `rebuild streams v${H2W_SCRIPT_VERSION}: ${Object.keys(bindings).length} binding(s),`,
-    `token=${CFG.token ? "set" : "empty"}, enabled=${CFG.enabled}`,
+    `token=${CFG.token ? "set" : "empty"}, automationMode=${normalizeAutomationMode(CFG.automationMode)}`,
   );
   ensurePushStream(bindings);
   reconcileProgressTimers(bindings); // Re-arm or stop working progress timers.
@@ -2327,9 +2434,9 @@ async function ensureAlive(preloaded) {
   await configReady;
   const bindings = preloaded || await loadBindings();
   ensurePushStream(bindings);
-  if (!CFG.enabled || progressTickSecMs() <= 0) return;
+  if (progressTickSecMs() <= 0) return;
   for (const [storeKey, b] of Object.entries(bindings)) {
-    if (b.status === "working" && !progressTimers.has(storeKey)) armProgressTimer(storeKey);
+    if (b.status === "working" && automationEnabledForBinding(b) && !progressTimers.has(storeKey)) armProgressTimer(storeKey);
   }
 }
 
@@ -2342,13 +2449,14 @@ chrome.runtime.onInstalled.addListener(() => {
     if (!cfg.herdrMcpUrl) chrome.storage.local.set({
       herdrMcpUrl: "http://127.0.0.1:8772",
       token: "",
-      enabled: true,
+      automationMode: AUTOMATION_MODE_MANUAL,
+      enabled: false,
       autoAllow: true,
       wakeTemplate: defaultWakeTemplate(),
       progressTickSec: 60,
       progressFallbackSec: 1200,
       progressTemplate: defaultProgressTemplate(),
-      idleNudgeEnabled: true,
+      idleNudgeEnabled: false,
     });
   });
 });

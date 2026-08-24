@@ -5,7 +5,7 @@ Language: product UI is en / Simplified Chinese / Japanese (same as herdr); this
 
 | Track | Problem | Direction | Status | First sites |
 |---|---|---|---|---|
-| **A. Web work continuity** | web work stalls after dispatch; long conversations eventually need a fresh chat | Herdr state push-back + conversation binding + ChatGPT Project rollover | **usable** (extension 0.1.39; rollover is explicitly triggered first) | push-back: 4 sites; rollover: ChatGPT Project |
+| **A. Web work continuity** | web work stalls after dispatch; replies can timeout; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + ChatGPT Project automation/recovery/rollover | **usable** (0.1.43 series; global run mode + Project automation switch) | binding/observation: 4 sites; automation/recovery/rollover: ChatGPT Project |
 | **B. JSON→MCP** | DeepSeek / z.ai web has no MCP Connector | web → local `127.0.0.1:8772/mcp` | **incomplete** (can extract JSON, MCP not called) | `chat.deepseek.com`, `chat.z.ai` |
 
 Shared: same extension, same static token, same options.  
@@ -39,8 +39,9 @@ This track does not make the extension think on behalf of the web model. It solv
 - Binding: the popup binds the "current conversation" to a herdr **workspace** (multiple agents in one space can push back in parallel)
 - SSE: `/push/events?workspace=...`
 - Policy: after seeing `working`; partial settle reports progress, all-idle in scope reports done; `hello` can backfill
-- chatgpt.com permission cards: persistent auto-click "Allow"
-- Optional small-model nudge after a ChatGPT turn ends (Options configures Base URL + Key + Model; `idleNudgeEnabled`; cooldown and progress checks share `progressTickSec`)
+- chatgpt.com in-page permission cards can auto-click "Allow" only when automation is on and the separate Auto-click Allow option is enabled
+- Optional small-model nudge after a ChatGPT turn ends runs in automation mode (Options configures Base URL + Key + Model; cooldown and progress checks share `progressTickSec`)
+- Reply timeout recovery, safe reload, and fail-closed Project rollover can run automatically when automation is enabled and safety gates pass
 - UI: en / Simplified Chinese / Japanese
 
 ### Gaps
@@ -52,16 +53,32 @@ This track does not make the extension think on behalf of the web model. It solv
 
 ### Implemented (track A periodic progress announcements)
 
-- Options: `progressTickSec` (default `60` seconds: working progress checks + turn-nudge cooldown; `0` disables), `progressFallbackSec` (default `1200` seconds fallback with no new summary), separate progress and done templates (`progressTemplate` / `wakeTemplate`); UI languages en / Simplified Chinese / Japanese
+- Options: global run mode is **Manual globally / Per-Project automation**; `progressTickSec` (default `60` seconds: working progress checks + turn-nudge cooldown; `0` disables only those interval-driven actions), `progressFallbackSec` (default `1200` seconds fallback with no new summary), separate progress and done templates (`progressTemplate` / `wakeTemplate`); UI languages en / Simplified Chinese / Japanese
 - actual send rule: at a checkpoint, only push to the web when the herdr summary has **new non-empty content** since the last actual send; otherwise wait until `progressFallbackSec` and send one fallback, avoiding empty-spin spam
 - `working`: check the summary every `progressTickSec`; push progress into the bound conversation and submit only on new non-empty content or when `progressFallbackSec` is reached; one timer per convKey; repeated `working` does not lose the last-sent baseline
 - popup lists by **workspace** (incl. panes with terminal only, no running agent); one title line + one pane-stats line, no repeated project names, no `agent@pane` listing
 - `settled`: cancel the tick timer first, then wake once with the done template
-- same set site-wide; site differences only live in the injector write/send
+- all four sites retain workspace binding, state observation and injector foundations; the new Per-Project automation mode permits automatic mutations only for ChatGPT Project conversations with a stable `project_id`. Plain ChatGPT `/c/<id>`, Claude, DeepSeek and z.ai remain manual and are not auto-enabled merely because the global mode is Per-Project automation
+
+### Global run mode and Project HUD automation
+
+Options owns the global policy. **Manual globally** disables automatic mutations everywhere and hides the automation switch from ChatGPT Project HUDs; the three manual actions remain available. **Per-Project automation** only permits Projects to use automation: every new ChatGPT Project still defaults to off and must be explicitly enabled from that Project's HUD.
+
+In Per-Project mode, the bottom HUD bar owns frequent actions: **Manual continue / Herdr monitor / LLM analysis / Automation on-off / expand**. In Manual globally mode, the automation switch is absent. The drawer only contains low-frequency settings: event timing, conversation bindings, and advanced options.
+
+**Automation on** is scoped to the current stable ChatGPT `project_id`. All conversations in that Project, including a fresh conversation created by rollover, share the same setting. It enables:
+
+- Herdr workspace progress checks and settled wakes
+- post-turn LLM analysis and continue submission
+- stalled reply recovery probes and safe reloads
+- same-Project fail-closed rollover after recovery exhaustion or high context pressure
+- in-page ChatGPT permission-card handling when Auto-click Allow is enabled
+
+**Automation off** keeps observation active but stops automatic mutations for that Project. Manual globally applies the same stop at the global layer without deleting saved Project preferences; switching back to Per-Project mode restores those preferences. Use the three manual HUD actions when automatic execution is off.
 
 ### A2. Long-conversation compression and rollover (ChatGPT Project)
 
-Extension 0.1.39 adds **Rollover** to the in-page HUD. The first version is deliberately explicit: it does not auto-switch conversations based on a guessed token threshold.
+Extension 0.1.39 adds **Rollover** to the in-page HUD. The 0.1.43 series adds conservative context-pressure automation, reply recovery, and the Project-scoped automation gate behind the same fail-closed transfer state machine.
 
 Flow:
 
@@ -88,7 +105,7 @@ Safety boundary:
 - the handoff packet is temporarily stored in `chrome.storage.local`; after successful cutover its body is cleared and only small recovery/diagnostic metadata remains;
 - workspace bindings no longer silently expire after 24 hours. They remain explicit until the user unbinds or a successful rollover moves them.
 
-There is no automatic token counter or automatic new-chat policy yet. First prove explicit rollover is reliable; a future threshold should preferably **suggest** rollover and reuse this same fail-closed transfer state machine rather than creating another path.
+Context pressure is estimated from visible user/assistant text only. It is not the ChatGPT backend token count and it does not persist message bodies. Automatic rollover requires a bound Project conversation, a quiet page, no uncertain delivery, no active tools/streaming, and a valid handoff path.
 
 ## B. JSON→MCP (DeepSeek / z.ai)
 

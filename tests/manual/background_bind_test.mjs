@@ -310,6 +310,42 @@ console.log("\n[project handoff]");
   ok(!!storage.herdrWakeBindings[sourceKey], "source Project binding is authoritative before rollover");
   const continuityId = storage.herdrWakeBindings[sourceKey].continuity_id;
 
+  let resolveHudOff;
+  const hudOffP = new Promise((r) => { resolveHudOff = r; });
+  onMsg({ type: "h2w_page_hud", convKey: PROJECT_SOURCE }, { tab: { id: 401 } }, (r) => resolveHudOff(r));
+  const hudOff = await hudOffP;
+  ok(hudOff?.automation_mode === "project_auto" && hudOff?.project_automation_available === true && hudOff?.enabled === false,
+    "Project-auto global mode keeps a new Project explicitly off", JSON.stringify(hudOff));
+
+  let resolveProjectOn;
+  const projectOnP = new Promise((r) => { resolveProjectOn = r; });
+  onMsg({ type: "h2w_set_project_automation", project_id: PROJECT_ID, convKey: PROJECT_SOURCE, enabled: true }, { tab: { id: 401 } }, (r) => resolveProjectOn(r));
+  const projectOn = await projectOnP;
+  ok(projectOn?.ok === true && storage.herdrProjectAutomation?.[PROJECT_ID] === true,
+    "Project HUD can explicitly enable automation for one Project", JSON.stringify(projectOn));
+
+  let resolveManualMode;
+  const manualModeP = new Promise((r) => { resolveManualMode = r; });
+  onMsg({ type: "h2w_set_config", config: { automationMode: "manual" } }, {}, (r) => resolveManualMode(r));
+  await manualModeP;
+  let resolveHudManual;
+  const hudManualP = new Promise((r) => { resolveHudManual = r; });
+  onMsg({ type: "h2w_page_hud", convKey: PROJECT_SOURCE }, { tab: { id: 401 } }, (r) => resolveHudManual(r));
+  const hudManual = await hudManualP;
+  ok(hudManual?.project_automation_available === false && hudManual?.enabled === false,
+    "global manual mode hides/disables Project automation without deleting the Project preference", JSON.stringify(hudManual));
+
+  let resolveProjectMode;
+  const projectModeP = new Promise((r) => { resolveProjectMode = r; });
+  onMsg({ type: "h2w_set_config", config: { automationMode: "project_auto" } }, {}, (r) => resolveProjectMode(r));
+  await projectModeP;
+  let resolveHudRestored;
+  const hudRestoredP = new Promise((r) => { resolveHudRestored = r; });
+  onMsg({ type: "h2w_page_hud", convKey: PROJECT_SOURCE }, { tab: { id: 401 } }, (r) => resolveHudRestored(r));
+  const hudRestored = await hudRestoredP;
+  ok(hudRestored?.project_automation_available === true && hudRestored?.enabled === true,
+    "returning to Project-auto restores the saved Project preference", JSON.stringify(hudRestored));
+
   let resolveStart;
   const startP = new Promise((r) => { resolveStart = r; });
   onMsg({ type: "h2w_handoff_start", tabId: 401 }, { tab: { id: 401 } }, (r) => resolveStart(r));
@@ -348,6 +384,12 @@ console.log("\n[project handoff]");
   ok(!!storage.herdrWakeBindings[targetKey], "committed rollover moves binding to the new Project conversation");
   ok(storage.herdrWakeBindings[targetKey]?.continuity_id === continuityId, "continuity id survives the conversation cutover");
   ok(storage.herdrWakeBindings[targetKey]?.handoff_from === PROJECT_SOURCE, "target binding records its predecessor conversation");
+  let resolveTargetHud;
+  const targetHudP = new Promise((r) => { resolveTargetHud = r; });
+  onMsg({ type: "h2w_page_hud", convKey: PROJECT_TARGET }, { tab: { id: storage.herdrWakeBindings[targetKey]?.tabId } }, (r) => resolveTargetHud(r));
+  const targetHud = await targetHudP;
+  ok(targetHud?.enabled === true && targetHud?.project_id === PROJECT_ID,
+    "rolled-over conversation inherits automation from the Project id", JSON.stringify(targetHud));
   ok(storage.herdrConversationTransfers[transferId]?.status === "committed", "transfer metadata records committed state");
   ok(storage.herdrConversationTransfers[transferId]?.handoff_text == null, "committed transfer clears the temporary handoff packet");
 }

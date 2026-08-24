@@ -7,7 +7,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const KEYS = [
   "herdrMcpUrl", "token", "wakeTemplate", "progressTickSec", "progressFallbackSec",
-  "progressTemplate", "autoAllow", "enabled",
+  "progressTemplate", "autoAllow", "automationMode", "enabled",
   "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
   "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
 ];
@@ -51,8 +51,10 @@ function applyI18n() {
   $("hint_llm_skip").textContent = t("hint_llm_skip");
   $("lab_auto").textContent = t("label_auto_allow");
   $("hint_auto").textContent = t("hint_auto_allow");
-  $("lab_enabled").textContent = t("label_enabled");
-  $("hint_enabled").textContent = t("hint_enabled");
+  $("lab_automation_mode").textContent = t("label_automation_mode");
+  $("automation_mode_manual").textContent = t("automation_mode_manual");
+  $("automation_mode_project").textContent = t("automation_mode_project");
+  $("hint_automation_mode").textContent = t("hint_automation_mode");
   $("llmJudgeApiKey").placeholder = t("placeholder_llm_key");
   $("llmJudgeModel").placeholder = t("placeholder_llm_model");
   $("save").textContent = t("save");
@@ -84,7 +86,11 @@ async function loadForm() {
     ? cfg.llmJudgeSkipKeywords
     : DEFAULT_LLM_SKIP_KEYWORDS_TEXT;
   $("autoAllow").checked = cfg.autoAllow !== false;
-  $("enabled").checked = cfg.enabled !== false;
+  $("automationMode").value = cfg.automationMode === "project_auto"
+    ? "project_auto"
+    : cfg.automationMode === "manual"
+      ? "manual"
+      : cfg.enabled === true ? "project_auto" : "manual";
 }
 
 $("uiLocale").addEventListener("change", async () => {
@@ -103,16 +109,13 @@ $("save").addEventListener("click", () => {
     progressTickSec: parseTickSec($("progressTickSec").value, 60),
     progressFallbackSec: parseTickSec($("progressFallbackSec").value, 1200),
     progressTemplate: $("progressTemplate").value,
-    // One operational switch controls both workspace wake delivery and the
-    // optional post-turn small-model nudge. Keep the legacy field mirrored.
-    idleNudgeEnabled: $("enabled").checked,
+    automationMode: $("automationMode").value === "project_auto" ? "project_auto" : "manual",
     llmJudgeBaseUrl: $("llmJudgeBaseUrl").value.trim(),
     llmJudgeApiKey: $("llmJudgeApiKey").value.trim(),
     llmJudgeModel: $("llmJudgeModel").value.trim(),
     llmJudgePromptTemplate: $("llmJudgePromptTemplate").value.trim() || t("default_llm_judge_prompt") || DEFAULT_LLM_JUDGE_PROMPT,
     llmJudgeSkipKeywords: $("llmJudgeSkipKeywords").value.trim() || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
     autoAllow: $("autoAllow").checked,
-    enabled: $("enabled").checked,
     uiLocale: getLocale(),
   };
   chrome.runtime.sendMessage({ type: "h2w_set_config", config }, (resp) => {

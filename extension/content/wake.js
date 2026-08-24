@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.42";
+const H2W_CONTENT_VERSION = "0.1.43";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -40,13 +40,13 @@ const H2W_CONTENT_VERSION = "0.1.42";
     });
   }
   async function refreshAutomationState() {
-    const state = await sendBg({ type: "h2w_automation_state" });
+    const state = await sendBg({ type: "h2w_automation_state", convKey: ADAPTER.getConversationKey() });
     if (!state?.ok) {
       automationEnabled = false;
       automationAutoAllow = false;
       return false;
     }
-    automationEnabled = state.enabled !== false;
+    automationEnabled = state.enabled === true;
     automationAutoAllow = state.autoAllow !== false;
     hudLabels = state.labels || hudLabels;
     return automationEnabled;
@@ -711,6 +711,14 @@ const H2W_CONTENT_VERSION = "0.1.42";
         if (ADAPTER.name === "chatgpt") void refreshPageHud();
         return;
       }
+      if (msg?.type === "h2w_automation_changed") {
+        void refreshAutomationState().then(() => {
+          syncAutomationPermissionWatch();
+          if (ADAPTER.name === "chatgpt") void refreshPageHud();
+        });
+        sendResponse({ ok: true });
+        return;
+      }
       if (msg?.type === "h2w_wake") {
         (async () => {
           await ensureConversationHealth();
@@ -1120,7 +1128,7 @@ const H2W_CONTENT_VERSION = "0.1.42";
 
   function syncHudManualButtons() {
     if (!hudEls) return;
-    const locked = hudActionBusy || hudCache?.enabled !== false;
+    const locked = hudActionBusy || hudCache?.enabled === true;
     for (const button of hudEls.manualButtons || []) {
       button.classList.toggle("locked", locked);
       button.disabled = locked;
@@ -1148,17 +1156,25 @@ const H2W_CONTENT_VERSION = "0.1.42";
     return text;
   }
 
-  async function setHudMasterEnabled(enabled) {
+  async function setHudProjectAutomation(enabled) {
     if (hudActionBusy) return;
+    if (hudCache?.project_automation_available !== true || !hudCache?.project_id) return;
     setHudActionBusy(true);
     const on = Boolean(enabled);
     const result = await sendBg({
-      type: "h2w_set_config",
-      config: { enabled: on, idleNudgeEnabled: on },
+      type: "h2w_set_project_automation",
+      project_id: hudCache.project_id,
+      convKey: ADAPTER.getConversationKey(),
+      enabled: on,
     });
     if (result?.ok) {
       automationEnabled = on;
-      hudCache = { ...(hudCache || {}), enabled: on, idleNudgeEnabled: on };
+      hudCache = {
+        ...(hudCache || {}),
+        enabled: on,
+        idleNudgeEnabled: on,
+        project_automation_enabled: on,
+      };
       syncAutomationPermissionWatch();
       paintPageHud({ hud: hudCache });
       showHudToast(on ? hudText("automation_enabled") : hudText("automation_disabled"), "ok");
@@ -1287,7 +1303,7 @@ const H2W_CONTENT_VERSION = "0.1.42";
   }
 
   async function manualContinueAction(action) {
-    if (hudActionBusy || hudCache?.enabled !== false) return { ok: false, error: "automation_enabled" };
+    if (hudActionBusy || hudCache?.enabled === true) return { ok: false, error: "automation_enabled" };
     setHudActionBusy(true);
     try {
       const result = await sendBg({
@@ -1459,11 +1475,13 @@ const H2W_CONTENT_VERSION = "0.1.42";
       event.stopPropagation();
       setHudExpanded(!hudExpanded);
     });
-    hudEls.quick.addEventListener("click", () => { void setHudMasterEnabled(!(hudCache?.enabled !== false)); });
+    hudEls.quick.addEventListener("click", () => {
+      void setHudProjectAutomation(!(hudCache?.project_automation_enabled === true));
+    });
     hudEls.manualButtons.forEach((button, index) => {
       const actions = ["direct", "status", "judge"];
       button.addEventListener("click", () => {
-        if (hudActionBusy || hudCache?.enabled !== false) return;
+        if (hudActionBusy || hudCache?.enabled === true) return;
         void manualContinueAction(actions[index]);
       });
     });
@@ -1543,7 +1561,7 @@ const H2W_CONTENT_VERSION = "0.1.42";
     } else {
       ui.status.textContent = `Herdr ● ${hudLabels?.states?.[state] || state}`;
     }
-    const enabled = hud?.enabled !== false;
+    const enabled = hud?.enabled === true;
     automationEnabled = enabled;
     automationAutoAllow = hud?.autoAllow !== false;
     syncAutomationPermissionWatch();
@@ -1567,11 +1585,12 @@ const H2W_CONTENT_VERSION = "0.1.42";
       ui.manualButtons[i].title = title || "";
     }
     syncHudManualButtons();
+    ui.quick.hidden = hud?.project_automation_available !== true;
     ui.quick.textContent = enabled ? hudText("automation_on", null, "Auto on") : hudText("automation_off", null, "Auto off");
     ui.quick.className = `quick ${enabled ? "on" : "off"}`;
     ui.quick.setAttribute("aria-pressed", String(enabled));
     ui.quick.setAttribute("aria-label", hudText("aria_toggle_automation"));
-    ui.quick.title = hudText("automation_hint");
+    ui.quick.title = enabled ? hudText("automation_on_hint") : hudText("automation_off_hint");
     ui.expand.setAttribute("aria-label", hudText("aria_open_controls"));
     ui.expand.title = hudText("aria_open_controls");
     ui.conversation.textContent = ADAPTER.getConversationKey();

@@ -54,9 +54,9 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.42", "manifest version includes proactive context pressure policy");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.42"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.42"'), "content version matches manifest");
+ok(manifest.version === "0.1.43", "manifest version includes Project-scoped automation policy");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.43"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.43"'), "content version matches manifest");
 ok(
   manifest.content_scripts.find((cs) => cs.matches?.includes("https://chatgpt.com/*"))?.js?.includes("context-pressure.js"),
   "ChatGPT loads the classic context-pressure policy before wake.js",
@@ -101,9 +101,18 @@ ok(
   "HUD stays runtime-state driven and closes its drawer on outside click",
 );
 ok(
-  backgroundSource.includes("CFG.enabled gates actions, not observability")
+  backgroundSource.includes("global/Project automation policy")
     && !backgroundSource.includes("if (pushStream || CFG.enabled === false) return;"),
-  "push observation remains live while wake and nudge are paused",
+  "push observation remains live while Project automation is unavailable or off",
+);
+ok(
+  backgroundSource.includes('const PROJECT_AUTOMATION_STORAGE_KEY = "herdrProjectAutomation"')
+    && backgroundSource.includes("automationScopeForConversation")
+    && backgroundSource.includes('msg?.type === "h2w_set_project_automation"')
+    && backgroundSource.includes("stored.enabled === true ? AUTOMATION_MODE_PROJECT : AUTOMATION_MODE_MANUAL")
+    && wakeSource.includes("hud?.project_automation_available !== true")
+    && wakeSource.includes('type: "h2w_set_project_automation"'),
+  "automation is globally gated, new installs fail closed, and Projects require explicit enablement",
 );
 ok(
   !wakeSource.includes('class="handoff-action"')
@@ -270,10 +279,35 @@ ok(zhLocale.hud_manual_continue === "手动继续", "zh HUD manual continue labe
 ok(zhLocale.hud_manual_status === "herdr监控", "zh HUD Herdr monitor label is exact");
 ok(zhLocale.hud_manual_judge === "LLM 分析", "zh HUD LLM analysis label is exact");
 ok(zhLocale.hud_automation_off === "自动 关", "zh HUD automation-off label is localized");
+ok(
+  zhLocale.hud_automation_on_hint.includes("进度")
+    && (zhLocale.hud_automation_on_hint.includes("LLM") || zhLocale.hud_automation_on_hint.includes("小模型"))
+    && zhLocale.hud_automation_on_hint.includes("恢复")
+    && zhLocale.hud_automation_on_hint.includes("接力")
+    && zhLocale.hud_automation_on_hint.includes("权限卡"),
+  "zh Auto-on tooltip enumerates all automatic continuity behaviors",
+);
+ok(
+  zhLocale.hud_automation_off_hint.includes("当前 ChatGPT Project")
+    && zhLocale.hud_automation_off_hint.includes("三个手动按钮")
+    && zhLocale.hud_automation_off_hint.includes("同一 Project"),
+  "zh Auto-off tooltip explains Project scope and manual availability",
+);
+ok(zhLocale.automation_mode_manual === "全局手动" && zhLocale.automation_mode_project === "项目自动",
+  "zh global automation modes match the product model");
+for (const obsolete of ["hud_wake_on", "hud_wake_off", "hud_nudge_on", "hud_nudge_off", "hud_llm", "hud_llm_off"]) {
+  ok(!(obsolete in zhLocale), `obsolete HUD locale key removed: ${obsolete}`);
+}
 ok(!wakeSource.includes("Wake on") && !wakeSource.includes("Wake off") && !wakeSource.includes("Automation off"),
   "HUD source has no legacy English wake/automation labels");
-ok(!readFileSync(path.join(EXT, "popup.html"), "utf8").includes('id="idleNudgeEnabled"'),
-  "popup exposes one authoritative automation switch");
+ok(!readFileSync(path.join(EXT, "options.html"), "utf8").includes("Enable wake + LLM nudge"),
+  "Options source no longer exposes the legacy wake+nudge switch name");
+const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
+const popupHtml = readFileSync(path.join(EXT, "popup.html"), "utf8");
+ok(optionsHtml.includes('id="automationMode"') && !optionsHtml.includes('id="enabled"'),
+  "Options selects the global manual / per-Project automation mode");
+ok(!popupHtml.includes('id="idleNudgeEnabled"') && !popupHtml.includes('id="enabled"') && popupHtml.includes('id="automationModeStatus"'),
+  "popup reports the global mode without exposing an automation toggle");
 
 // ---- 2. JavaScript syntax for the fixed file list ----
 const fixed = ["background.js", "binding-core.js", "continuity-core.js", "options.js", "popup.js", "content/base.js",

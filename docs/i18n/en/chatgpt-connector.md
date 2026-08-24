@@ -30,18 +30,19 @@ This is **ChatGPT's own web approval UI**, not a herdr-mcp server-side switch.
 |---|---|
 | Server-side "auto-allow everything" | **Not possible.** The Connector web UI has no stable `require_approval: never`; that is a Responses API developer parameter, not a chatgpt.com setting |
 | Click "Always allow" once and it lasts forever | Community feedback is unstable; sometimes sessions get lost / OAuth re-runs |
-| Click "Allow" fewer times | Install this repo's browser extension; on **chatgpt.com** tabs it auto-clicks "Allow" on in-page permission cards (see below) |
+| Click "Allow" fewer times | Install this repo's browser extension, set Options to **Per-Project automation**, enable the current Project in its HUD, and enable Options **Auto-click Allow**; only then will it auto-click explicit in-page Allow cards on **chatgpt.com** (see below) |
 
 Extension behavior (`extension/`, content script ≥ 0.1.3):
 
 - detects in-page "Allow / Deny" tool permission cards (incl. `data-testid=tool-action-buttons`)
-- **stays observing on chatgpt.com** (no longer tied only to the herdr→web "wake" 90-second window)
+- **keeps observing on chatgpt.com**, but observation is separate from mutation: with `Auto off` it can still report state without clicking permission actions
+- automatically clicks only when **Options Per-Project automation + current Project HUD `Auto on` + Options Auto-click Allow** are all enabled
 - clicks only visible, usable buttons whose copy is clearly allow-class; clicks on the same card only when a deny button is present (fail-closed)
 - **cannot click**: native browser permission bars, non-DOM system dialogs
 
 What the server can do is honestly annotate (e.g. `readOnlyHint`); ChatGPT currently often ignores it and may still ask about read-only tools as if they were writes.
 
-When a card still pops on every tool call: verify the extension is loaded, the current tab is `chatgpt.com`, and the content-script version is ≥ 0.1.3 (old tabs refresh automatically after the extension reloads).
+When a card still pops on every tool call: verify the extension is loaded, the current tab is `chatgpt.com`, Options is **Per-Project automation**, the current Project HUD is **`Auto on`**, and Options **Auto-click Allow** is enabled. Native browser permission bars still require manual handling.
 
 ## OAuth (CIMD)
 
@@ -128,7 +129,7 @@ Access logs carry `call=<method>` on `herdr_call` (method name only). Prefer `he
 | 2 | `herdr_prompt` → cheap/fast worker (pi, flash…), self-contained tasks | only cheap models burned |
 | default forbidden | `herdr_prompt` → Claude/OMP/main to then conduct other panes | expensive model at scale |
 
-The web model continues scheduling itself with `herdr_since` / `herdr_inspect`; the plugin's "Continue" should also push the web to re-query state instead of handing planning back to the local main agent.
+The web model continues scheduling itself with `herdr_since` / `herdr_inspect`; HUD **Manual continue** directly advances the web turn, while **Herdr monitor** first reads Herdr window/agent state and then continues. Neither should hand planning back to the local main agent.
 
 ## Troubleshooting checklist
 
@@ -138,13 +139,13 @@ The web model continues scheduling itself with `herdr_since` / `herdr_inspect`; 
 4. `tools/list` `200` but the conversation has 0 tools: schema rejected or **old conversation snapshot** → start a new conversation
 5. is `/.well-known/mcp.json`'s `version` the build you think is running?
 6. "cannot read files": confirm the failing call is `herdr_fs_*` / `herdr_exec`, not `herdr_call call=agent.*`
-7. permission cards keep popping: is the extension on chatgpt.com, content script ≥ 0.1.3?
+7. permission cards keep popping: is the extension on chatgpt.com, Options in Per-Project mode, the current Project HUD `Auto on`, and Options Auto-click Allow enabled? Native browser permission bars are not auto-clicked.
 
 ## The conversation stalls after ChatGPT dispatches work
 
 The Connector only solves "ChatGPT → herdr". If a tool quickly returns "submitted" while the agent keeps running in its pane, the web conversation usually no longer auto-calls `herdr_since` / continues on its own.
 
-Closing the loop requires the browser extension: bind that chatgpt session ↔ the working workspace; while the agent is **working**, push progress on "new summary only + 20-minute fallback"; when **settled**, inject a continue prompt and submit. See [extension-wake.md](./extension-wake.md).
+Closing the loop requires the browser extension: bind that chatgpt session ↔ the working workspace. Options must allow Per-Project automation and the current Project must be `Auto on` before progress, **settled** continuation, LLM decisions, reply recovery and safe rollover run automatically. In Manual globally mode or with that Project off, observation stays live and the three HUD manual actions take over. See [extension-wake.md](./extension-wake.md).
 
 Without a bound extension, this is not an MCP fault; the push-back loop is missing.
 
