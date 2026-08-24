@@ -201,7 +201,7 @@ herdr のネイティブ面は大きな Unix-socket API（`herdr api schema`）�
 
 フォルダ: `extension/`（MV3）。対応サイト: chatgpt.com / claude.ai / chat.deepseek.com / chat.z.ai。
 
-1. **Web 継続動作（利用可）** — Options で **全体を手動 / Project ごとの自動化**を選ぶ。全体手動では Project HUD に自動化スイッチを表示せず、**手動続行 / Herdr 監視 / LLM 分析**だけで進める。Project ごとの自動化では新しい ChatGPT Project は既定でオフで、HUD から明示的に有効化する。同じ `project_id` の会話と rollover 後の新しい会話は設定を共有する。
+1. **Web 継続動作（利用可）** — Options で **全体を手動 / Project ごとの自動化**を選ぶ。全体手動では Project HUD に自動化スイッチを表示せず、**手動続行 / Herdr 監視 / LLM 分析**だけで進める。Project ごとの自動化では新しい ChatGPT Project は既定でオフで、HUD から明示的に有効化する。同じ `project_id` の会話と rollover 後の新しい会話は設定を共有する。0.1.44 では stale-view 復旧を追加し、途中で止まった応答について ChatGPT の同一 origin conversation snapshot と DOM を比較し、ページ遅延またはサーバー側の実停止を確認した場合だけ再読み込みする。再読み込み後も同じ途中応答なら復旧メッセージを1回だけ送信し、snapshot が使えない場合は fail-closed とする。
 2. **JSON → MCP（未完成）** — DeepSeek / z.ai で `{"tool":...}` を抽出できるが、ローカル `/mcp` 呼び出しと結果の書き戻しはまだない。
 
 展開ドロワーは低頻度設定専用（イベント設定 / 会話 binding / 詳細オプション）で、手動ボタンや自動化 switch は置かない。ChatGPT Project の rollover は fail-closed で、新しい会話への seed が確認されるまで元の binding が権威を持つ。UI 言語: en / 简体中文 / 日本語。詳細: [docs/i18n/en/extension.md](docs/i18n/en/extension.md)。
