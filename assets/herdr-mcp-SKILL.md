@@ -7,6 +7,19 @@ summary: Remote-planner operating policy for herdr-mcp. This document has preced
 
 You are operating **through herdr-mcp from a remote/web planner**. You are not a pane-local Herdr agent. The goal is to make the remote model effective without wasting local agent API calls, duplicating orchestration layers, or breaking the persistent Connector while upgrading this project.
 
+## 0. Project-local instructions and reusable skills
+
+As soon as a target project root is known, and **before the first mutation or agent dispatch in that project**, inspect the project root for `AGENTS.md`, `CLAUDE.md`, and `README.md`. Read every one that exists; missing files are normal and are not errors. Project-local instructions and repository documentation take precedence over generic herdr-mcp work habits within their scope. Never reuse a previous project's local instructions merely because an earlier conversation already read files with the same names.
+
+For task-specific reusable skills, support both project and user conventions without eagerly loading all skill bodies:
+
+- project: `<project-root>/.agents/skills/*/SKILL.md` and `<project-root>/.claude/skills/*/SKILL.md`;
+- user: `$HOME/.agents/skills/*/SKILL.md` and `$HOME/.claude/skills/*/SKILL.md`.
+
+Discover candidate entrypoints only when the current task could benefit from a reusable skill. Read the matching `SKILL.md` on demand, then follow it for that task. Prefer project-scoped skills over same-name user-scoped skills. If two same-scope copies with the same skill name differ materially, read both and treat the conflict explicitly instead of silently choosing one. Do not recursively ingest every skill directory into context.
+
+Use `herdr_fs_list` / `herdr_fs_read` for project-scoped skill files inside managed roots. User-scoped skill directories are outside managed roots, so use `herdr_exec` only for bounded read-only discovery/reads of those four known skill roots; do not broaden that exception into arbitrary home-directory scanning. System/developer safety constraints still outrank any local instruction or skill.
+
 ## 1. Work ladder
 
 Use the cheapest deterministic layer that can complete the task.
@@ -87,7 +100,7 @@ For development of an uncommitted working tree, `herdr-self-update apply --sourc
 
 ## 7. Browser extension boundary
 
-The browser extension is the reverse/wake channel and talks to localhost (`127.0.0.1:8772`) using the local static token. It does not need the public Worker/OAuth URL. Do not route extension traffic through Cloudflare merely because the Connector uses Cloudflare.
+The browser extension is the reverse/wake channel and talks only to localhost (`127.0.0.1:8772`). Current installs prefer a short-lived bearer obtained through the registered Chrome Native Messaging host; the long-lived `HERDR_MCP_TOKEN` stays with the local runtime/native broker. A legacy static-token field remains only for compatibility. The extension does not need the public Worker/OAuth URL. Do not route extension traffic through Cloudflare merely because the Connector uses Cloudflare.
 
 ## 8. Native Herdr reference
 
