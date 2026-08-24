@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="herdr-mcp —— 面向 Web 规划器的稳定 MCP/OAuth 边缘与可自升级的本地 Herdr 控制面。">
+  <meta name="color-scheme" content="light dark">
+  <title>herdr-mcp</title>
+  <link rel="canonical" href="https://whshang.github.io/herdr-mcp/zh-CN/index.html">
+  <link rel="alternate" hreflang="en" href="https://whshang.github.io/herdr-mcp/">
+  <link rel="alternate" hreflang="zh-CN" href="https://whshang.github.io/herdr-mcp/zh-CN/index.html">
+  <link rel="alternate" hreflang="x-default" href="https://whshang.github.io/herdr-mcp/">
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="../" aria-label="herdr-mcp 首页">herdr-mcp</a>
+    <nav class="topnav" aria-label="Primary"><a href="../docs/">文档</a><a href="https://github.com/whshang/herdr-mcp">GitHub</a></nav>
+    <div class="topbar-actions">
+      <nav class="lang-switcher" data-lang-switch aria-label="切换语言"><a href="../" hreflang="en" data-locale="en">English</a><a href="../zh-CN/index.html" hreflang="zh-CN" data-locale="zh-CN" aria-current="true">简体中文</a></nav>
+      <button class="theme-toggle" type="button" data-theme-toggle aria-label="切换颜色主题"><span data-theme-icon aria-hidden="true">◐</span></button>
+    </div>
+  </header>
+
+  <main>
+    <header class="hero">
+      <div class="eyebrow">Web 规划器 → 稳定 Edge → 本地 Herdr</div>
+      <h1>herdr-mcp</h1>
+      <p class="lead">一个精简的 MCP 网关，让 ChatGPT 及其它远程规划器能在 Herdr 工作站上检查、编辑、运行与委派任务，而无需直接暴露工作站。</p>
+      <div class="actions">
+        <a class="primary" href="https://github.com/whshang/herdr-mcp">GitHub</a>
+        <a href="../docs/">文档</a>
+        <a href="https://github.com/whshang/herdr-mcp/blob/main/README.zh.md">安装</a>
+        <a href="../docs/zh-CN/runtime-self-upgrade.html">自升级</a>
+      </div>
+    </header>
+
+    <section class="diagram" aria-label="架构">
+      <div>ChatGPT / Web 模型</div><span>↓ MCP + OAuth</span>
+      <div>Cloudflare Worker / Durable Object</div><span>↓ 认证 WSS</span>
+      <div>持久 herdr-link</div><span>↓ 本地 MCP</span>
+      <div>Runtime 代际 A / B</div><span>↓ Herdr socket + 工作站</span>
+      <div>panes · agents · fs · git · shell</div>
+    </section>
+
+    <section class="grid">
+      <article><h2>稳定的公共边界</h2><p>OAuth、MCP 传输与公共契约都位于边缘层。工作站只会发起带认证的出站连接，不存在暴露的公网入站端口。</p></article>
+      <article><h2>直接下手优先</h2><p>远程规划器可获得一等公民的 fs、patch、Git、image 与 shell 工具。只有推理或并行调研值得付出成本时，才使用廉价的本地开发 agent。</p></article>
+      <article><h2>Runtime A/B</h2><p>新的本地 Runtime 代际会针对冻结的工具契约进行验证，原子切换、排空并在同一 Link 与 Connector 后回滚。Runtime 发布与 Edge 发布是相互独立的平面。</p></article>
+      <article><h2>自我维护</h2><p>项目 skill 描述工具顺序、变更纪律、agent 分发偏好与受监督的自升级路径。Runtime 发布与 Edge 发布保持独立。</p></article>
+      <article><h2>浏览器唤醒通道</h2><p>MV3 扩展只与本机 localhost 通信，可把 agent 的进度或完成状态回推到绑定的 Web 会话，而无需把本地令牌经过 Cloudflare。</p></article>
+      <article><h2>开源友好</h2><p><code>workers.dev</code> 是默认的公共源站。如需长期稳定的 OAuth/MCP 身份，可选配 Custom Domain；遗留 Tunnel 仅作迁移用途。</p></article>
+    </section>
+
+    <footer>
+      <span>herdr-mcp</span>
+      <a href="../docs/">文档</a>
+      <a href="../docs/zh-CN/capability-benchmark.html">能力决策</a>
+      <a href="../docs/zh-CN/cloudflare-edge-deployment.html">Cloudflare 部署</a>
+      <a href="../" hreflang="en">English</a>
+    </footer>
+  </main>
+  <script src="../app.js" defer></script>
+</body>
+</html>

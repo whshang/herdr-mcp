@@ -34,7 +34,7 @@ function matches(text, regex) {
 const ZN_DISTINCT = "架构 — herdr 与 herdr-mcp";
 const EN_DISTINCT = "Architecture — herdr and herdr-mcp";
 
-test("documentation site build publishes 11 logical docs x 2 locales under locale-aware URLs", async () => {
+test("documentation site build publishes every logical doc x 2 locales under locale-aware URLs", async () => {
   await rm(OUT, { recursive: true, force: true });
   const env = {
     ...process.env,
@@ -60,7 +60,7 @@ test("documentation site build publishes 11 logical docs x 2 locales under local
     await access(join(OUT, "docs", locale, "index.html"), constants.R_OK);
   }
 
-  for (const rel of ["index.html", "style.css", "app.js", "docs/index.html", "herdr-mcp-SKILL.md", "release.json", ".nojekyll"]) {
+  for (const rel of ["index.html", "style.css", "app.js", "zh-CN/index.html", "docs/index.html", "herdr-mcp-SKILL.md", "release.json", ".nojekyll"]) {
     await access(join(OUT, rel), constants.R_OK);
   }
 
@@ -71,33 +71,30 @@ test("documentation site build publishes 11 logical docs x 2 locales under local
   assert.deepEqual(flat, [], `flat single-language doc pages must not be published: ${flat.join(",")}`);
 });
 
-test("neutral /docs/ entry is a bilingual chooser with no flattened doc nav", async () => {
-  const chooser = await readFile(join(OUT, "docs", "index.html"), "utf8");
-  assert.match(chooser, /<html lang="en">/);
-  assert.doesNotMatch(chooser, /class="sidebar-nav"/, "chooser must not render a document sidebar");
-  assert.doesNotMatch(chooser, /data-doc-slug|class="doc-card"/, "chooser must not flatten documents into one nav");
-  assert.doesNotMatch(chooser, /data-search-open|data-search-dialog/, "chooser is language-neutral and has no per-locale search");
-  assert.match(chooser, /href="\.\/zh-CN\/index\.html"[^>]*hreflang="zh-CN"/);
-  assert.match(chooser, /href="\.\/en\/index\.html"[^>]*hreflang="en"/);
-  assert.match(chooser, /rel="canonical" href="https:\/\/whshang\.github\.io\/herdr-mcp\/docs\/index\.html"/);
+test("neutral /docs/ entry defaults to English: no chooser, forwards to the en index", async () => {
+  assert.equal(DEFAULT_LOCALE, "en", "English must be the default locale");
+  const entry = await readFile(join(OUT, "docs", "index.html"), "utf8");
+  assert.match(entry, /<html lang="en">/);
+  // No language chooser: no locale cards, no flattened doc nav, no per-locale search.
+  assert.doesNotMatch(entry, /chooser|data-doc-slug|class="doc-card"/, "docs entry must not be a language chooser");
+  assert.doesNotMatch(entry, /data-search-open|data-search-dialog/, "docs entry is a redirect, not a searchable page");
+  // Forwards to the default (English) index; hreflang/canonical point at real pages.
+  assert.match(entry, /<meta http-equiv="refresh" content="0; url=\.\/en\/index\.html">/);
+  assert.match(entry, /location\.replace\("\.\/en\/index\.html"\)/);
+  assert.match(entry, /href="\.\/en\/index\.html"/, "fallback link to the English index");
+  assert.match(entry, /href="\.\/zh-CN\/index\.html"/, "fallback link to the Chinese index");
+  assert.match(entry, /rel="canonical" href="https:\/\/whshang\.github\.io\/herdr-mcp\/docs\/en\/index\.html"/);
   assert.deepEqual(
-    matches(chooser, /rel="alternate" hreflang="([^"]+)"/g).map((m) => m[1]).filter((lang) => lang !== "x-default"),
+    matches(entry, /rel="alternate" hreflang="([^"]+)"/g).map((m) => m[1]).filter((lang) => lang !== "x-default"),
     LOCALES,
-    "chooser must advertise one hreflang alternate per locale"
+    "docs entry must advertise one hreflang alternate per locale"
   );
-  assert.match(chooser, /rel="alternate" hreflang="x-default" href="https:\/\/whshang\.github\.io\/herdr-mcp\/docs\/index\.html"/);
-  // both languages visible on the neutral entry
-  assert.match(chooser, /herdr-mcp 文档/);
-  assert.match(chooser, /herdr-mcp documentation/);
-  assert.equal(matches(chooser, /11 篇文档/g).length, 1, "zh-CN chooser card must not duplicate its document count");
-  assert.equal(matches(chooser, /11 articles/g).length, 1, "en chooser card must not duplicate its document count");
-  // chooser carries the shared runtime assets
-  assert.match(chooser, /src="\.\.\/app\.js"/);
-  assert.match(chooser, /href="\.\.\/style\.css"/);
-  assert.match(chooser, /class="brand" href="\.\.\/"/);
+  assert.match(entry, /rel="alternate" hreflang="x-default" href="https:\/\/whshang\.github\.io\/herdr-mcp\/docs\/en\/index\.html"/);
+  assert.match(entry, /href="\.\.\/style\.css"/);
 });
 
 test("each locale index is translated, grouped in currated order, and stays within its locale", async () => {
+  const pkgVersion = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")).version;
   for (const locale of LOCALES) {
     const ui = UI[locale];
     const index = await readFile(join(OUT, "docs", locale, "index.html"), "utf8");
@@ -150,6 +147,11 @@ test("each locale index is translated, grouped in currated order, and stays with
     assert.ok(searchDataMatch, "search index must be embedded in the locale index");
     const searchData = JSON.parse(searchDataMatch[1]);
     assert.deepEqual(searchData.map((item) => item.href), DOC_ORDER.map((slug) => `./${slug}.html`));
+
+    // Version badge and the agent-intro prompt pointing at the skill file.
+    assert.match(index, new RegExp(`class="version-badge"[^>]*>v${pkgVersion.replaceAll(".", "\\.")}<`), `version badge (${locale})`);
+    assert.match(index, /data-agent-intro/, `agent-intro block (${locale})`);
+    assert.match(index, /href="\.\.\/\.\.\/herdr-mcp-SKILL\.md"/, `skill link from locale index (${locale})`);
   }
 });
 
@@ -254,6 +256,17 @@ test("article pages carry same-slug language switching, per-locale search isolat
       const i18n = JSON.parse(i18nMatch[1]);
       assert.equal(i18n.hint, ui.searchHint);
       assert.equal(i18n.noResults, ui.searchNoResults);
+      assert.equal(i18n.copy, ui.copyCode);
+      assert.equal(i18n.copied, ui.copiedCode);
+
+      // Code blocks carry a copy button — every <pre> in the body gets one.
+      assert.equal(
+        matches(html, /data-copy-code/g).length,
+        matches(html, /<pre/g).length,
+        `every code block gets a copy button (${locale}/${slug})`
+      );
+      // Version badge in the topbar.
+      assert.match(html, /class="version-badge"/, `version badge (${locale}/${slug})`);
     }
   }
 
@@ -275,6 +288,7 @@ test("shared runtime assets keep theme/drawer/search behavior and gain localized
   assert.match(app, /#search-i18n/, "app.js must read the per-page localized search UI blob");
   assert.match(app, /uiString\("hint"/);
   assert.match(app, /noResults/, "app.js must render the localized no-results string");
+  assert.match(app, /data-copy-code/, "app.js must wire up code copy buttons");
 
   const css = await readFile(join(OUT, "style.css"), "utf8");
   assert.match(css, /--sidebar-w:\s*250px/);
@@ -284,7 +298,11 @@ test("shared runtime assets keep theme/drawer/search behavior and gain localized
   assert.match(css, /@media \(max-width: 720px\)/);
   assert.match(css, /:root\[data-theme="dark"\]/);
   assert.match(css, /\.lang-switcher/, "language switcher styling");
-  assert.match(css, /\.chooser-grid/, "neutral chooser styling");
+  assert.doesNotMatch(css, /chooser/, "no leftover language-chooser styling");
+  assert.match(css, /\.redirect-note/, "docs entry fallback styling");
+  assert.match(css, /\.version-badge/, "version badge styling");
+  assert.match(css, /\.code-copy/, "code copy button styling");
+  assert.match(css, /\.agent-intro/, "agent-intro block styling");
 });
 
 test("release.json, skill artifact and design invariants are preserved", async () => {
@@ -301,10 +319,21 @@ test("release.json, skill artifact and design invariants are preserved", async (
 
   const home = await readFile(join(OUT, "index.html"), "utf8");
   assert.match(home, /herdr-mcp/);
+  assert.match(home, /<html lang="en">/);
   assert.match(home, /href="\.\/docs\/"/);
   assert.match(home, /href="\.\/docs\/en\/runtime-self-upgrade\.html"/);
   assert.match(home, /href="\.\/docs\/en\/capability-benchmark\.html"/);
   assert.match(home, /href="\.\/docs\/en\/cloudflare-edge-deployment\.html"/);
+  // Homepage is bilingual: no hard-coded "Start locally", topbar switch + zh mirror.
+  assert.doesNotMatch(home, /Start locally/);
+  assert.match(home, /href="\.\/zh-CN\/index\.html"[^>]*hreflang="zh-CN"/);
+  // Chinese homepage mirror mirrors content, paths and the reverse switch.
+  const homeZh = await readFile(join(OUT, "zh-CN", "index.html"), "utf8");
+  assert.match(homeZh, /<html lang="zh-CN">/);
+  assert.match(homeZh, /href="\.\.\/docs\/"/);
+  assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/runtime-self-upgrade\.html"/);
+  assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/capability-benchmark\.html"/);
+  assert.match(homeZh, /href="\.\.\/" [^>]*hreflang="en"/);
 
   const generatedDocs = await readdir(join(OUT, "docs"));
   assert.equal(generatedDocs.some((name) => name.includes("_wip")), false);

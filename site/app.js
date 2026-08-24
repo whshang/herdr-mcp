@@ -54,6 +54,20 @@
     try { index = JSON.parse(searchData.textContent || "[]"); } catch { index = []; }
   }
 
+  // Copy buttons on code blocks (server-rendered per block).
+  document.querySelectorAll("[data-copy-code]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const pre = button.closest("pre");
+      if (!pre) return;
+      const source = (pre.querySelector("code")?.textContent ?? pre.textContent).trim();
+      try {
+        await navigator.clipboard.writeText(source);
+        button.textContent = uiString("copied", "Copied");
+        window.setTimeout(() => { button.textContent = uiString("copy", "Copy"); }, 1400);
+      } catch { /* clipboard unavailable */ }
+    });
+  });
+
   function closeSearch() {
     if (dialog instanceof HTMLDialogElement && dialog.open) dialog.close();
   }

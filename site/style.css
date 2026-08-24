@@ -63,6 +63,9 @@ button { color: inherit; }
   backdrop-filter: blur(14px);
 }
 .brand { font-size: 17px; font-weight: 760; letter-spacing: -0.025em; text-decoration: none; white-space: nowrap; }
+.brand-cell { display: inline-flex; align-items: center; gap: 9px; min-width: 0; }
+.version-badge { border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--muted); text-decoration: none; white-space: nowrap; }
+.version-badge:hover { color: var(--text); border-color: var(--line-strong); }
 .topnav { display: flex; align-items: center; gap: 18px; min-width: 0; }
 .topnav a { color: var(--muted-strong); font-size: 13px; font-weight: 600; text-decoration: none; }
 .topnav a:hover, .topnav a[aria-current] { color: var(--text); }
@@ -121,6 +124,9 @@ button { color: inherit; }
 .doc-body code { padding: .13em .34em; border: 1px solid var(--line); border-radius: 5px; background: var(--code-bg); color: var(--code-text); font: .88em/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
 .doc-body pre { position: relative; overflow: auto; margin: 1.25em 0 1.55em; padding: 16px 18px; border: 1px solid var(--line); border-radius: 10px; background: var(--code-bg); box-shadow: inset 0 1px color-mix(in srgb, var(--surface) 70%, transparent); }
 .doc-body pre code { padding: 0; border: 0; background: transparent; font-size: 12.5px; line-height: 1.65; white-space: pre; }
+.code-copy { position: absolute; top: 9px; right: 9px; z-index: 1; padding: 2px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--muted-strong); font-size: 11px; line-height: 1.6; cursor: pointer; opacity: 0; transition: opacity 120ms ease; }
+.doc-body pre:hover .code-copy, .code-copy:focus-visible { opacity: 1; }
+.code-copy:hover { color: var(--text); border-color: var(--line-strong); }
 .doc-body blockquote { margin: 1.2em 0; padding: 13px 16px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 0 8px 8px 0; background: var(--surface-soft); color: var(--muted-strong); }
 .doc-body blockquote > :last-child { margin-bottom: 0; }
 .doc-body table { display: block; width: 100%; overflow-x: auto; margin: 1.25em 0 1.7em; border-collapse: collapse; font-size: 13px; }
@@ -157,6 +163,16 @@ button { color: inherit; }
 .button { display: inline-flex; align-items: center; min-height: 38px; padding: 0 13px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); font-size: 13px; font-weight: 620; text-decoration: none; }
 .button:hover { background: var(--surface-hover); border-color: var(--line-strong); }
 .button.primary { background: var(--text); color: var(--bg); border-color: var(--text); }
+
+/* "Let your agent introduce you": a paste-ready prompt pointing at the
+   agent-facing skill file, mirroring the reference docs' agent guide. */
+.agent-intro { margin: 34px 0 8px; padding: 20px 20px 17px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.agent-intro-head { max-width: 720px; }
+.agent-intro h2 { margin: 7px 0 6px; font-size: 17px; letter-spacing: -0.01em; }
+.agent-intro p { margin: 0; color: var(--muted-strong); font-size: 13.5px; line-height: 1.55; }
+.agent-prompt { position: relative; margin: 14px 0 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--code-bg); color: var(--code-text); font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.agent-intro-note { margin-top: 10px !important; font-size: 12.5px !important; }
+.agent-intro-note a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
 .docs-paths { display: grid; gap: 42px; padding: 46px 0 30px; }
 .index-group-heading { margin-bottom: 11px; }
 .docs-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px; }
@@ -165,15 +181,6 @@ button { color: inherit; }
 .doc-card h2 { margin: 0 0 6px; font-size: 15px; line-height: 1.4; }
 .doc-card h2 a { text-decoration: none; }
 .doc-card p { display: -webkit-box; margin: 0; overflow: hidden; color: var(--muted); font-size: 12.5px; line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
-
-/* Neutral /docs/ chooser: locale cards only, never a flattened doc nav. */
-.chooser-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px; padding: 44px 0 30px; }
-.chooser-card { padding: 20px 22px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
-.chooser-card:hover { border-color: var(--line-strong); background: var(--surface-soft); }
-.chooser-card h2 { margin: 0 0 7px; font-size: 18px; }
-.chooser-card h2 a { text-decoration: none; }
-.chooser-card p { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
-.chooser-divider { margin: 0 0.28em; color: var(--muted); font-weight: 400; }
 
 .search-dialog { width: min(620px, calc(100vw - 28px)); max-height: min(660px, calc(100vh - 40px)); padding: 0; border: 1px solid var(--line-strong); border-radius: 14px; background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
 .search-dialog::backdrop { background: rgb(2 6 23 / .42); backdrop-filter: blur(2px); }
@@ -207,11 +214,18 @@ body:not(.docs-page):not(.docs-index-page) > main { width: min(1080px, calc(100%
 .diagram div { padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); text-align: center; }
 .diagram span { color: var(--muted); text-align: center; }
 .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 11px; }
-.grid article, .install { padding: 18px; border: 1px solid var(--line); border-radius: 10px; }
-.grid h2, .install h2 { margin: 0 0 8px; font-size: 16px; }
-.grid p, .install p { color: var(--muted-strong); font-size: 13px; }
-.install { margin-top: 12px; }
-.install pre { overflow: auto; padding: 14px; border-radius: 8px; background: var(--code-bg); }
+.grid article { padding: 18px; border: 1px solid var(--line); border-radius: 10px; }
+.grid h2 { margin: 0 0 8px; font-size: 16px; }
+.grid p { color: var(--muted-strong); font-size: 13px; }
+
+/* /docs/ entry: English by default; a 0s redirect to the English index that
+   leaves a readable fallback (with the language links) for no-meta-refresh
+   clients. */
+.redirect-note { max-width: 620px; padding: 22px 24px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.redirect-note h1 { margin: 10px 0; font-size: 30px; letter-spacing: -0.03em; }
+.redirect-note p { margin: 0 0 14px; color: var(--muted-strong); }
+.redirect-links a { color: var(--accent); font-weight: 600; }
+.redirect-links a + a { margin-left: 12px; }
 body:not(.docs-page):not(.docs-index-page) footer { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 32px; padding: 20px 0; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 body:not(.docs-page):not(.docs-index-page) footer a { text-decoration: none; }
 
@@ -224,7 +238,6 @@ body:not(.docs-page):not(.docs-index-page) footer a { text-decoration: none; }
   .topbar.has-drawer { grid-template-columns: auto auto 1fr auto; }
   .nav-toggle { display: inline-grid; place-items: center; }
   .topnav { justify-self: start; }
-  .chooser-grid { grid-template-columns: 1fr; }
   .docs-layout { display: block; width: 100%; padding: 0; }
   .sidebar { position: fixed; z-index: 40; top: var(--topbar-h); left: 0; width: min(310px, 84vw); height: calc(100vh - var(--topbar-h)); padding: 22px 14px 40px; border-right: 1px solid var(--line); background: var(--surface); transform: translateX(-105%); transition: transform 160ms ease; box-shadow: var(--shadow); }
   .nav-open .sidebar { transform: translateX(0); }

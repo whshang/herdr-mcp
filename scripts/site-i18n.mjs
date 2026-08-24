@@ -9,13 +9,16 @@
 export const SITE_ORIGIN_ENV = "HERDR_SITE_ORIGIN";
 export const DEFAULT_ORIGIN = "https://whshang.github.io/herdr-mcp";
 
-export const DEFAULT_LOCALE = "zh-CN";
-export const LOCALES = ["zh-CN", "en"];
-export const LOCALE_NAMES = { "zh-CN": "简体中文", en: "English" };
+// English is the default locale: /docs/ lands on it directly, and the topbar
+// language switcher is how readers reach the Chinese docs.
+export const DEFAULT_LOCALE = "en";
+export const LOCALES = ["en", "zh-CN"];
+export const LOCALE_NAMES = { en: "English", "zh-CN": "简体中文" };
 
 // Logical document order — defines prev/next order in every locale.
 export const DOC_ORDER = [
   "architecture",
+  "install",
   "chatgpt-connector",
   "worker-fallbacks",
   "cloudflare-edge-deployment",
@@ -26,23 +29,27 @@ export const DOC_ORDER = [
   "extension-wake",
   "extension-bridge",
   "capability-benchmark",
+  "cli-reference",
+  "best-practices",
+  "troubleshooting",
 ];
 
 // Group membership is keyed by logical slug only; labels are translated in UI.
 export const NAV_GROUPS = [
-  { slugs: ["architecture", "chatgpt-connector"] },
+  { slugs: ["architecture", "install", "chatgpt-connector"] },
   { slugs: ["worker-fallbacks"] },
   {
     slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade", "automation"],
   },
   { slugs: ["extension", "extension-wake", "extension-bridge"] },
-  { slugs: ["capability-benchmark"] },
+  { slugs: ["capability-benchmark", "cli-reference", "best-practices"] },
+  { slugs: ["troubleshooting"] },
 ];
 
 // Per-locale navigation group labels, in NAV_GROUPS order.
 export const NAV_GROUP_LABELS = {
-  "zh-CN": ["从这里开始", "ChatGPT 与 Web", "运维与部署", "浏览器扩展", "参考与开发"],
-  en: ["Start here", "ChatGPT & Web", "Operations & Deployment", "Browser Extension", "Reference & Development"],
+  "zh-CN": ["从这里开始", "ChatGPT 与 Web", "运维与部署", "浏览器扩展", "参考与开发", "帮助"],
+  en: ["Start here", "ChatGPT & Web", "Operations & Deployment", "Browser Extension", "Reference & Development", "Help"],
 };
 
 // Per-locale user-visible strings. The build fails fast if a label is missing,
@@ -84,14 +91,14 @@ export const UI = {
     indexHome: "首页",
     indexSource: "源码",
     indexFooterAria: "文档索引底部导航",
-    chooserEyebrow: "文档",
-    chooserTitle: "herdr-mcp 文档",
-    chooserLead: "选择语言阅读 herdr-mcp 文档。两种语言覆盖同一套文档。",
-    chooserZh: "简体中文",
-    chooserZhBlurb: "11 篇文档 · 默认语言",
-    chooserEn: "English",
-    chooserEnBlurb: "11 articles · default on GitHub",
-    chooserHome: "首页",
+    versionBadgeAria: "当前版本",
+    agentIntroTitle: "或者，让 agent 带你上手",
+    agentIntroLead: "如果你已经有一个 AI 编码 agent，让它来引导你：把这句提示语粘贴给 agent。",
+    agentPrompt:
+      "请先阅读 https://whshang.github.io/herdr-mcp/herdr-mcp-SKILL.md，然后一步步带我理解并配置 herdr-mcp。",
+    agentSkillLink: "阅读 herdr-mcp-SKILL.md（agent 版项目手册）",
+    copyCode: "复制",
+    copiedCode: "已复制",
   },
   en: {
     htmlLang: "en",
@@ -129,13 +136,14 @@ export const UI = {
     indexHome: "Home",
     indexSource: "Source",
     indexFooterAria: "Documentation index footer",
-    chooserEyebrow: "Documentation",
-    chooserTitle: "herdr-mcp documentation",
-    chooserLead: "Choose a language to read the herdr-mcp documentation. Both languages cover the same set of documents.",
-    chooserZh: "简体中文",
-    chooserZhBlurb: "11 篇文档 · default locale",
-    chooserEn: "English",
-    chooserEnBlurb: "11 articles · default on GitHub",
-    chooserHome: "Home",
+    versionBadgeAria: "Current version",
+    agentIntroTitle: "Or let your agent introduce you",
+    agentIntroLead:
+      "If you already run an AI coding agent, let it handle the onboarding. Paste this prompt to your agent:",
+    agentPrompt:
+      "Help me understand and set up herdr-mcp. Read https://whshang.github.io/herdr-mcp/herdr-mcp-SKILL.md first, then walk me through it step by step.",
+    agentSkillLink: "Read herdr-mcp-SKILL.md (the agent-facing project guide)",
+    copyCode: "Copy",
+    copiedCode: "Copied",
   },
 };

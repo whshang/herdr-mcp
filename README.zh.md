@@ -246,10 +246,14 @@ OAuth / skill / 状态目录等见 [docs/i18n/zh-CN/architecture.md](docs/i18n/z
 |---|---|
 | [CHANGELOG.md](CHANGELOG.md) | 版本与工具面变化 |
 | [docs/i18n/zh-CN/architecture.md](docs/i18n/zh-CN/architecture.md) | herdr 与 MCP 分层、闸门、环境变量 |
+| [docs/i18n/zh-CN/install.md](docs/i18n/zh-CN/install.md) | 安装与快速开始 |
 | [docs/i18n/zh-CN/chatgpt-connector.md](docs/i18n/zh-CN/chatgpt-connector.md) | ChatGPT OAuth / 传输 / schema |
 | [docs/i18n/zh-CN/extension.md](docs/i18n/zh-CN/extension.md) | 扩展总览 |
 | [docs/i18n/zh-CN/extension-wake.md](docs/i18n/zh-CN/extension-wake.md) | 主线 A：进度回推 |
 | [docs/i18n/zh-CN/extension-bridge.md](docs/i18n/zh-CN/extension-bridge.md) | 主线 B：JSON→MCP（未完成） |
+| [docs/i18n/zh-CN/cli-reference.md](docs/i18n/zh-CN/cli-reference.md) | herdr-mcp CLI / bin 工具 / 环境变量 |
+| [docs/i18n/zh-CN/best-practices.md](docs/i18n/zh-CN/best-practices.md) | 运行规则与端到端示例 |
+| [docs/i18n/zh-CN/troubleshooting.md](docs/i18n/zh-CN/troubleshooting.md) | 按症状优先的排障清单 |
 | [tests/README.md](tests/README.md) | 默认测试 vs 手工脚本 |
 
 过程笔记在 `docs/_wip/`（gitignore，不入库）。

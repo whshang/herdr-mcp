@@ -248,10 +248,14 @@ Same local `127.0.0.1:8772` token. Not a substitute for ChatGPT’s OAuth connec
 |---|---|
 | [CHANGELOG.md](CHANGELOG.md) | Version / tool-surface changes |
 | [docs/i18n/en/architecture.md](docs/i18n/en/architecture.md) | herdr vs MCP layers, gates, env |
+| [docs/i18n/en/install.md](docs/i18n/en/install.md) | Install and quick start |
 | [docs/i18n/en/chatgpt-connector.md](docs/i18n/en/chatgpt-connector.md) | ChatGPT OAuth / wire / schema / permission cards |
 | [docs/i18n/en/extension.md](docs/i18n/en/extension.md) | Extension overview |
 | [docs/i18n/en/extension-wake.md](docs/i18n/en/extension-wake.md) | Track A: progress nudge |
 | [docs/i18n/en/extension-bridge.md](docs/i18n/en/extension-bridge.md) | Track B: JSON→MCP, not finished |
+| [docs/i18n/en/cli-reference.md](docs/i18n/en/cli-reference.md) | herdr-mcp CLI / bin tools / env vars |
+| [docs/i18n/en/best-practices.md](docs/i18n/en/best-practices.md) | Operating rules and an end-to-end example |
+| [docs/i18n/en/troubleshooting.md](docs/i18n/en/troubleshooting.md) | Symptom-first checklist |
 | [tests/README.md](tests/README.md) | Default vs manual tests |
 
 Process notes live in `docs/_wip/` (gitignored).

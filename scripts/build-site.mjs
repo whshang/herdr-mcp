@@ -21,6 +21,9 @@ const i18nDocsDir = join(rootPath, "docs", "i18n");
 const outDir = join(rootPath, "site-dist");
 
 const origin = (process.env[SITE_ORIGIN_ENV] || DEFAULT_ORIGIN).replace(/\/+$/, "");
+// Read once up-front: the version badge on every docs page and release.json
+// both come from package.json.
+const pkg = JSON.parse(await readFile(join(rootPath, "package.json"), "utf8"));
 
 // Fail fast when someone adds a locale without translating every string.
 const uiKeys = Object.keys(UI[LOCALES[0]]).slice().sort();
@@ -140,28 +143,30 @@ function headMeta({ pre, locale, canonicalHref, alternates, xDefault, descriptio
 
 // Language switcher: on article pages it maps the current slug to the other
 // locale's same slug; on locale index pages it maps to the other locale's
-// index; on the neutral chooser it maps to both locale indexes.
-// localePrefix is the prefix from the current page directory to the docs
-// root: "../" on /docs/<locale>/ pages, "" on the neutral /docs/ chooser.
-function langSwitcher({ locale, localePrefix, slug = null, current = null, isChooser = false }) {
+// index. localePrefix is the prefix from the current page directory to the
+// docs root: "../" on /docs/<locale>/ pages.
+function langSwitcher({ locale, localePrefix, slug = null, current = null }) {
   const ui = UI[locale];
   const items = LOCALES.map((other) => {
-    const href = isChooser ? `${other}/index.html` : slug ? `${localePrefix}${other}/${slug}.html` : `${localePrefix}${other}/index.html`;
-    const active = isChooser ? false : current ? current === other : locale === other;
+    const href = slug ? `${localePrefix}${other}/${slug}.html` : `${localePrefix}${other}/index.html`;
+    const active = current ? current === other : locale === other;
     return `<a href="${esc(href)}" hreflang="${esc(other)}" data-locale="${esc(other)}"${active ? ' aria-current="true"' : ""}>${esc(LOCALE_NAMES[other])}</a>`;
   });
   return `<nav class="lang-switcher" data-lang-switch aria-label="${esc(ui.langSwitcherAria)}">${items.join("")}</nav>`;
 }
 
-function topbar({ pre, locale, drawer = false, isChooser = false, slug = null, localePrefix }) {
+function topbar({ pre, locale, drawer = false, slug = null, localePrefix, version = null }) {
   const ui = UI[locale];
+  const badge = version
+    ? `<a class="version-badge" href="https://github.com/whshang/herdr-mcp/releases" aria-label="${esc(ui.versionBadgeAria)}: v${esc(version)}">v${esc(version)}</a>`
+    : "";
   return `<header class="topbar${drawer ? " has-drawer" : ""}">
     ${drawer ? `<button class="nav-toggle" type="button" data-nav-toggle aria-label="${esc(ui.openNav)}" aria-controls="docs-sidebar" aria-expanded="false"><span aria-hidden="true">☰</span></button>` : ""}
-    <a class="brand" href="${pre}" aria-label="${esc(ui.brandHomeAria)}">herdr-mcp</a>
-    <nav class="topnav" aria-label="Primary">${isChooser ? "" : `<a href="./" aria-current="location">${esc(ui.docsNav)}</a>`}<a href="https://github.com/whshang/herdr-mcp">GitHub</a></nav>
+    <div class="brand-cell"><a class="brand" href="${pre}" aria-label="${esc(ui.brandHomeAria)}">herdr-mcp</a>${badge}</div>
+    <nav class="topnav" aria-label="Primary"><a href="./" aria-current="location">${esc(ui.docsNav)}</a><a href="https://github.com/whshang/herdr-mcp">GitHub</a></nav>
     <div class="topbar-actions">
-      ${langSwitcher({ locale, localePrefix, slug, current: isChooser ? null : locale, isChooser })}
-      ${isChooser ? "" : `<button class="search-trigger" type="button" data-search-open aria-haspopup="dialog" aria-label="${esc(ui.searchTriggerAria)}"><span aria-hidden="true">⌕</span><span class="search-label">${esc(ui.searchLabel)}</span><kbd>⌘K</kbd></button>`}
+      ${langSwitcher({ locale, localePrefix, slug, current: locale })}
+      <button class="search-trigger" type="button" data-search-open aria-haspopup="dialog" aria-label="${esc(ui.searchTriggerAria)}"><span aria-hidden="true">⌕</span><span class="search-label">${esc(ui.searchLabel)}</span><kbd>⌘K</kbd></button>
       <button class="theme-toggle" type="button" data-theme-toggle aria-label="${esc(ui.themeToggleAria)}"><span data-theme-icon aria-hidden="true">◐</span></button>
     </div>
   </header>`;
@@ -192,6 +197,8 @@ function searchUi({ pre, locale, searchIndex }) {
     closeNav: ui.closeNav,
     themeToLight: ui.themeToLight,
     themeToDark: ui.themeToDark,
+    copy: ui.copyCode,
+    copied: ui.copiedCode,
   };
   return `<dialog class="search-dialog" data-search-dialog aria-labelledby="search-title">
     <div class="search-panel">
@@ -215,24 +222,27 @@ function pageNav(docsBySlug, slug, ui) {
   </nav>`;
 }
 
-function articleShell({ locale, doc, body, toc, docsBySlug, searchIndex }) {
+function articleShell({ locale, doc, body, toc, docsBySlug, searchIndex, version }) {
   const pre = "../../";
   const ui = UI[locale];
   const selfHref = `${origin}/docs/${locale}/${doc.slug}.html`;
   const alternates = LOCALES.map((lang) => ({ lang, href: `${origin}/docs/${lang}/${doc.slug}.html` }));
   const xDefault = `${origin}/docs/${DEFAULT_LOCALE}/${doc.slug}.html`;
+  // Copy button for every code block, matching the reference docs' code UI.
+  const copyButton = `<button type="button" class="code-copy" data-copy-code aria-label="${esc(ui.copyCode)}">${esc(ui.copyCode)}</button>`;
+  const bodyWithCopy = body.replace(/<pre(>|[ >])/g, (m, rest) => `<pre${rest}${copyButton}`);
   return `<!doctype html>
 <html lang="${ui.htmlLang}">
 <head>
   ${headMeta({ pre, locale, canonicalHref: selfHref, alternates, xDefault, description: doc.description, title: `${doc.title} · herdr-mcp` })}
 </head>
 <body class="docs-page">
-  ${topbar({ pre, locale, drawer: true, slug: doc.slug, localePrefix: "../" })}
+  ${topbar({ pre, locale, drawer: true, slug: doc.slug, localePrefix: "../", version })}
   <div class="nav-overlay" data-nav-overlay hidden></div>
   <div class="docs-layout">
     <aside class="sidebar" id="docs-sidebar" data-sidebar>${sidebarNav(docsBySlug, doc.slug, ui, locale)}</aside>
     <main class="article-column">
-      <article class="doc-body" data-doc-slug="${esc(doc.slug)}">${body}</article>
+      <article class="doc-body" data-doc-slug="${esc(doc.slug)}">${bodyWithCopy}</article>
       ${pageNav(docsBySlug, doc.slug, ui)}
       <footer class="docs-footer"><a href="./">${esc(ui.docsIndex)}</a><a href="https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/${esc(locale)}/${esc(doc.slug)}.md">${esc(ui.editSource)}</a></footer>
     </main>
@@ -243,7 +253,15 @@ function articleShell({ locale, doc, body, toc, docsBySlug, searchIndex }) {
 </html>`;
 }
 
-function docsIndexShell({ locale, docsBySlug, searchIndex }) {
+function agentIntroBlock(ui, pre) {
+  return `<section class="agent-intro" data-agent-intro>
+    <div class="agent-intro-head"><span class="eyebrow">👋</span><h2>${esc(ui.agentIntroTitle)}</h2><p>${esc(ui.agentIntroLead)}</p></div>
+    <pre class="agent-prompt" tabindex="0"><code>${esc(ui.agentPrompt)}</code></pre>
+    <p class="agent-intro-note"><a href="${pre}herdr-mcp-SKILL.md">${esc(ui.agentSkillLink)}</a></p>
+  </section>`;
+}
+
+function docsIndexShell({ locale, docsBySlug, searchIndex, version }) {
   const pre = "../../";
   const ui = UI[locale];
   const groups = NAV_GROUPS.map((group, index) => `<section class="index-group" data-nav-group="${esc(NAV_GROUP_LABELS[locale][index])}"><div class="index-group-heading"><span class="eyebrow">${esc(NAV_GROUP_LABELS[locale][index])}</span></div><div class="docs-grid">${group.slugs.map((slug) => {
@@ -258,7 +276,7 @@ function docsIndexShell({ locale, docsBySlug, searchIndex }) {
   ${headMeta({ pre, locale, canonicalHref: selfHref, alternates, xDefault: `${origin}/docs/index.html`, description: ui.indexLead, title: `${ui.docsNav} · herdr-mcp` })}
 </head>
 <body class="docs-index-page">
-  ${topbar({ pre, locale, localePrefix: "../" })}
+  ${topbar({ pre, locale, localePrefix: "../", version })}
   <main class="docs-index">
     <header class="docs-hero">
       <span class="eyebrow">${esc(ui.indexEyebrow)}</span>
@@ -266,6 +284,7 @@ function docsIndexShell({ locale, docsBySlug, searchIndex }) {
       <p>${esc(ui.indexLead)}</p>
       <div class="hero-actions"><a class="button primary" href="./chatgpt-connector.html">${esc(ui.indexCtaConnect)}</a><a class="button" href="./architecture.html">${esc(ui.indexCtaArchitecture)}</a><a class="button" href="./cloudflare-edge-deployment.html">${esc(ui.indexCtaDeploy)}</a></div>
     </header>
+    ${agentIntroBlock(ui, pre)}
     <section class="docs-paths" aria-label="${esc(ui.indexEyebrow)}">${groups}</section>
     <footer class="docs-footer" aria-label="${esc(ui.indexFooterAria)}"><a href="${pre}">${esc(ui.indexHome)}</a><a href="https://github.com/whshang/herdr-mcp">${esc(ui.indexSource)}</a></footer>
   </main>
@@ -274,40 +293,37 @@ function docsIndexShell({ locale, docsBySlug, searchIndex }) {
 </html>`;
 }
 
-// Neutral /docs/ entry: a bilingual chooser that must not flatten both
-// languages into one navigation. It only links to the two locale indexes.
-function docsChooserShell() {
-  const pre = "../";
-  const zh = UI[DEFAULT_LOCALE];
-  const en = UI.en;
+// Neutral /docs/ entry: no language chooser — English is the default locale,
+// so /docs/ forwards straight to the English index. The topbar language
+// switcher on every docs page is how readers reach 简体中文.
+function docsRedirectShell() {
+  const ui = UI[DEFAULT_LOCALE];
+  const enIndex = `${origin}/docs/en/index.html`;
   return `<!doctype html>
-<html lang="en">
+<html lang="${ui.htmlLang}">
 <head>
-  ${headMeta({
-    pre,
-    locale: DEFAULT_LOCALE,
-    canonicalHref: `${origin}/docs/index.html`,
-    alternates: LOCALES.map((lang) => ({ lang, href: `${origin}/docs/${lang}/index.html` })),
-    xDefault: `${origin}/docs/index.html`,
-    description: `${en.chooserLead} ${zh.chooserLead}`,
-    title: `${en.chooserTitle} · herdr-mcp`,
-  })}
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="${esc(ui.indexTitle)}">
+  <meta name="color-scheme" content="light dark">
+  <title>${esc(ui.docsNav)} · herdr-mcp</title>
+  <link rel="canonical" href="${esc(enIndex)}">
+  <link rel="alternate" hreflang="en" href="${esc(enIndex)}">
+  <link rel="alternate" hreflang="zh-CN" href="${esc(`${origin}/docs/zh-CN/index.html`)}">
+  <link rel="alternate" hreflang="x-default" href="${esc(enIndex)}">
+  <meta http-equiv="refresh" content="0; url=./en/index.html">
+  <link rel="stylesheet" href="../style.css">
 </head>
-<body class="docs-index-page docs-chooser-page">
-  ${topbar({ pre, locale: DEFAULT_LOCALE, isChooser: true, localePrefix: "" })}
-  <main class="docs-index docs-chooser">
-    <header class="docs-hero">
-      <span class="eyebrow">${esc(en.chooserEyebrow)} · ${esc(zh.chooserEyebrow)}</span>
-      <h1>${esc(zh.chooserTitle)}<span class="chooser-divider">/</span>${esc(en.chooserTitle)}</h1>
-      <p>${esc(en.chooserLead)} ${esc(zh.chooserLead)}</p>
-    </header>
-    <section class="chooser-grid" aria-label="${esc(en.chooserTitle)}">
-      <article class="chooser-card"><h2><a href="./${DEFAULT_LOCALE}/index.html" hreflang="${DEFAULT_LOCALE}">${esc(zh.chooserZh)}</a></h2><p>${esc(zh.chooserZhBlurb)}</p></article>
-      <article class="chooser-card"><h2><a href="./en/index.html" hreflang="en">${esc(en.chooserEn)}</a></h2><p>${esc(en.chooserEnBlurb)}</p></article>
-    </section>
-    <footer class="docs-footer"><a href="${pre}">${esc(en.chooserHome)}</a><a href="https://github.com/whshang/herdr-mcp">GitHub</a></footer>
+<body class="docs-index-page">
+  <main class="docs-index">
+    <div class="redirect-note">
+      <span class="eyebrow">${esc(ui.docsNav)}</span>
+      <h1>herdr-mcp ${esc(ui.docsNav)}</h1>
+      <p>${esc(ui.indexLead)}</p>
+      <p class="redirect-links"><a href="./en/index.html">English →</a><a href="./zh-CN/index.html">简体中文</a></p>
+    </div>
   </main>
-  <script src="${pre}app.js" defer></script>
+  <script>location.replace("./en/index.html");</script>
 </body>
 </html>`;
 }
@@ -366,15 +382,14 @@ for (const locale of LOCALES) {
     const page = rendered.get(slug);
     await writeFile(
       join(localeOut, `${slug}.html`),
-      articleShell({ locale, doc, body: page.html, toc: page.toc, docsBySlug, searchIndex })
+      articleShell({ locale, doc, body: page.html, toc: page.toc, docsBySlug, searchIndex, version: pkg.version })
     );
   }
-  await writeFile(join(localeOut, "index.html"), docsIndexShell({ locale, docsBySlug, searchIndex }));
+  await writeFile(join(localeOut, "index.html"), docsIndexShell({ locale, docsBySlug, searchIndex, version: pkg.version }));
 }
 
-await writeFile(join(outDir, "docs", "index.html"), docsChooserShell());
+await writeFile(join(outDir, "docs", "index.html"), docsRedirectShell());
 
-const pkg = JSON.parse(await readFile(join(rootPath, "package.json"), "utf8"));
 // Explicit HERDR_SITE_COMMIT override wins over the ambient CI SHA; falling back
 // to the working-tree marker only when neither is set.
 const commit = process.env.HERDR_SITE_COMMIT || process.env.GITHUB_SHA || "working-tree";

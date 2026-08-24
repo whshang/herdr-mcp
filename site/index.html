@@ -4,10 +4,24 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="description" content="herdr-mcp — stable MCP/OAuth edge and self-upgrading local Herdr control plane for web planners.">
+  <meta name="color-scheme" content="light dark">
   <title>herdr-mcp</title>
+  <link rel="canonical" href="https://whshang.github.io/herdr-mcp/">
+  <link rel="alternate" hreflang="en" href="https://whshang.github.io/herdr-mcp/">
+  <link rel="alternate" hreflang="zh-CN" href="https://whshang.github.io/herdr-mcp/zh-CN/index.html">
+  <link rel="alternate" hreflang="x-default" href="https://whshang.github.io/herdr-mcp/">
   <link rel="stylesheet" href="./style.css">
 </head>
 <body>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="herdr-mcp home">herdr-mcp</a>
+    <nav class="topnav" aria-label="Primary"><a href="./docs/">Docs</a><a href="https://github.com/whshang/herdr-mcp">GitHub</a></nav>
+    <div class="topbar-actions">
+      <nav class="lang-switcher" data-lang-switch aria-label="Change language"><a href="./" hreflang="en" data-locale="en" aria-current="true">English</a><a href="./zh-CN/index.html" hreflang="zh-CN" data-locale="zh-CN">简体中文</a></nav>
+      <button class="theme-toggle" type="button" data-theme-toggle aria-label="Toggle color theme"><span data-theme-icon aria-hidden="true">◐</span></button>
+    </div>
+  </header>
+
   <main>
     <header class="hero">
       <div class="eyebrow">Web planner → stable Edge → local Herdr</div>
@@ -38,22 +52,14 @@
       <article><h2>Open-source friendly</h2><p><code>workers.dev</code> is the default public origin. A Custom Domain is optional for a long-lived stable OAuth/MCP identity; legacy Tunnel is migration-only.</p></article>
     </section>
 
-    <section class="install">
-      <h2>Start locally</h2>
-      <pre><code>git clone https://github.com/whshang/herdr-mcp.git
-cd herdr-mcp
-npm install
-npm run build
-node dist/server.js</code></pre>
-      <p>For ChatGPT, deploy the Cloudflare Edge first, then add <code>https://&lt;worker&gt;.&lt;account&gt;.workers.dev/mcp</code> (or an optional Custom Domain) as the MCP Connector.</p>
-    </section>
-
     <footer>
       <span>herdr-mcp</span>
       <a href="./docs/">Documentation</a>
       <a href="./docs/en/capability-benchmark.html">Capability decisions</a>
       <a href="./docs/en/cloudflare-edge-deployment.html">Cloudflare deployment</a>
+      <a href="./zh-CN/index.html" hreflang="zh-CN">简体中文</a>
     </footer>
   </main>
+  <script src="./app.js" defer></script>
 </body>
 </html>
