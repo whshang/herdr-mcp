@@ -183,6 +183,8 @@
   "llm_test_failed": "小モデルテスト失敗：{error}",
   "llm_test_result": "小モデル原文={raw} → 完了={done} 続行={cont}{send}",
   "llm_test_send": " 送信={send}",
+  "boolean_yes": "はい",
+  "boolean_no": "いいえ",
   "placeholder_llm_key": "空欄 = オフ",
   "placeholder_llm_model": "例：small-fast-model",
   "manual_continue_message": "続行",

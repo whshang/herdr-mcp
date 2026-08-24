@@ -183,6 +183,8 @@
   "llm_test_failed": "LLM test failed: {error}",
   "llm_test_result": "LLM raw={raw} → done={done} cont={cont}{send}",
   "llm_test_send": " send={send}",
+  "boolean_yes": "yes",
+  "boolean_no": "no",
   "placeholder_llm_key": "empty = off",
   "placeholder_llm_model": "e.g. small-fast-model",
   "manual_continue_message": "Continue",

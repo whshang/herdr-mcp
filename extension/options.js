@@ -57,6 +57,7 @@ function applyI18n() {
   $("test").textContent = t("test");
   $("testLlm").textContent = t("test_llm");
   $("uiLocale").value = getLocale();
+  document.documentElement.classList.remove("i18n-pending");
 }
 
 function setStatus(text, cls) {
@@ -193,8 +194,8 @@ $("testLlm").addEventListener("click", () => {
     const send = resp.cont ? t("llm_test_send", { send: JSON.stringify(resp.nudgeText) }) : "";
     setStatus(`✓ ${t("llm_test_result", {
       raw: JSON.stringify(resp.content),
-      done: String(resp.done),
-      cont: String(resp.cont),
+      done: t(resp.done ? "boolean_yes" : "boolean_no"),
+      cont: t(resp.cont ? "boolean_yes" : "boolean_no"),
       send,
     })}`, "ok");
   });
