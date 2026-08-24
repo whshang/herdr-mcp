@@ -13,6 +13,7 @@ import { readFileSync } from "node:fs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const EXT = path.join(__dirname, "..", "..", "extension");
 const CONV = "https://chatgpt.com/c/abc123";
+const CHATGPT_AUTO_CONV = "https://chatgpt.com/c/plain-auto-123";
 const SK_WH = `${CONV}::wH`;
 const PROJECT_ID = "g-p-6a89c078669481918c8eb70fdfd3d978";
 const PROJECT_SOURCE = `https://chatgpt.com/g/${PROJECT_ID}/c/source123`;
@@ -454,6 +455,57 @@ console.log("\n[json bridge automation]");
   const mismatch = await mismatchP;
   ok(mismatch?.ok === false && mismatch?.error === "json-bridge-site-mismatch",
     "JSON bridge rejects a mismatched site identity", JSON.stringify(mismatch));
+}
+
+// ---- Scenario 6cc: plain ChatGPT conversations get isolated conversation-scoped automation ----
+console.log("\n[plain ChatGPT conversation automation]");
+{
+  installContentScript(355, CHATGPT_AUTO_CONV, CHATGPT_AUTO_CONV, "chatgpt");
+
+  let resolveHudOff;
+  const hudOffP = new Promise((r) => { resolveHudOff = r; });
+  onMsg({ type: "h2w_page_hud", convKey: CHATGPT_AUTO_CONV }, { tab: { id: 355, url: CHATGPT_AUTO_CONV } }, (r) => resolveHudOff(r));
+  const hudOff = await hudOffP;
+  ok(hudOff?.conversation_automation_available === true
+      && hudOff?.conversation_automation_enabled === false
+      && hudOff?.project_automation_available === false
+      && !hudOff?.project_id,
+    "plain ChatGPT /c/<id> exposes conversation-scoped automation instead of requiring a Project", JSON.stringify(hudOff));
+
+  let resolveAuto;
+  const autoP = new Promise((r) => { resolveAuto = r; });
+  onMsg({
+    type: "h2w_set_project_automation",
+    project_id: null,
+    site: "chatgpt",
+    convKey: CHATGPT_AUTO_CONV,
+    enabled: true,
+  }, { tab: { id: 355, url: CHATGPT_AUTO_CONV } }, (r) => resolveAuto(r));
+  const auto = await autoP;
+  ok(auto?.ok === true
+      && auto?.conversation_automation_enabled === true
+      && storage.herdrConversationAutomation?.[CHATGPT_AUTO_CONV] === true,
+    "plain ChatGPT conversation can save Auto on without joining a Project", JSON.stringify(auto));
+
+  let resolveOtherHud;
+  const otherHudP = new Promise((r) => { resolveOtherHud = r; });
+  onMsg({ type: "h2w_page_hud", convKey: CONV }, { tab: { id: 202, url: CONV } }, (r) => resolveOtherHud(r));
+  const otherHud = await otherHudP;
+  ok(otherHud?.conversation_automation_available === true && otherHud?.conversation_automation_enabled === false,
+    "plain ChatGPT automation preference does not leak into another conversation", JSON.stringify(otherHud));
+
+  let resolveMismatch;
+  const mismatchP = new Promise((r) => { resolveMismatch = r; });
+  onMsg({
+    type: "h2w_set_project_automation",
+    project_id: null,
+    site: "chatgpt",
+    convKey: CHATGPT_AUTO_CONV,
+    enabled: false,
+  }, { tab: { id: 355, url: "https://chatgpt.com/c/different-chat" } }, (r) => resolveMismatch(r));
+  const mismatch = await mismatchP;
+  ok(mismatch?.ok === false && mismatch?.error === "conversation-automation-sender-mismatch",
+    "plain ChatGPT automation rejects a sender from a different conversation", JSON.stringify(mismatch));
 }
 
 // ---- Scenario 6d: z.ai new-chat root state follows the first persisted /c/<chat_id> only ----

@@ -27,7 +27,7 @@ B 线与 A 线并列：`chat.deepseek.com` / `chat.z.ai` 中的普通用户任�
 | bounded `tools/call` 轮次 + 结果回填 | **已可用** |
 | 同批独立工具并行执行 | **已可用** |
 | 工具结果清洗 / 大二进制省略 / 长度上限 | **已可用** |
-| 静态 Herdr token 不进入网页 JavaScript | **已可用** — token 只留在 extension service worker |
+| 本机凭据不进入网页 JavaScript | **已可用** — service worker 正常只持有 Native Messaging 签发的短期 bearer；静态 token 仅为显式兼容 fallback |
 | z.ai / DeepSeek 会话级 `自动 开/关`，控制 Herdr progress/settled 自动回推 | **已可用**（需全局允许自动化） |
 | 已落成 z.ai `/c/<chat_id>` 的“手动接力” | **已可用**（必须 `自动 关`；接力控制消息绕过 JSON bridge） |
 
@@ -47,7 +47,7 @@ Content bridge 给网页模型一个 typed catalog，并要求工具调用回复
 
 ## 安全边界
 
-- 静态 Herdr token 只由 MV3 service worker 读取和使用；网页 JavaScript 只看到工具 schema 与清洗后的结果，看不到 bearer token。
+- MV3 service worker 正常通过 Chrome Native Messaging 获取短期 localhost bearer；长期 `HERDR_MCP_TOKEN` 留在本机 runtime/native broker。只有用户显式配置旧版兼容 token 时，service worker 才使用静态 fallback。网页 JavaScript 只看到工具 schema 与清洗后的结果，看不到任何 bearer。
 - MCP 请求只发送到配置的本机 Herdr endpoint，默认 `http://127.0.0.1:8772/mcp`。
 - Bridge / 自动化动作执行前会校验 site 与 conversation identity。
 - 不假装 DeepSeek / z.ai 原生支持 OAuth MCP Connector。

@@ -8,8 +8,8 @@ Language: product UI is en / Simplified Chinese / Japanese (same as herdr); this
 | **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + automation gates + safe handoff | **usable** (0.1.48 series) | binding/observation: 4 sites; full automation: ChatGPT Project; conversation progress automation: z.ai / DeepSeek; Manual handoff: ChatGPT Project + z.ai `/c/<chat_id>` |
 | **B. JSON→MCP** | DeepSeek / z.ai web has no MCP Connector | web → extension service worker → local `127.0.0.1:8772/mcp` | **usable** (bounded `tools/list` / `tools/call` loop) | `chat.deepseek.com`, `chat.z.ai` |
 
-Shared: same extension, same static token, same options.  
-Deployment boundary: the extension only ever hits local `127.0.0.1:8772` `/push/*` and `/mcp`; it never goes through the public Worker/Tunnel. The static Herdr token used by the JSON bridge remains inside the extension service worker and is never exposed to page JavaScript. A plain ChatGPT `/c/<id>` is identified by its conversation id; a Project conversation is identified by stable `g-p-<resource-id> + conversation id`. Persisted z.ai conversations use `/c/<chat_id>`; the `/` route is only the new-chat launcher. SPA route changes re-register automatically without requiring a full page refresh.
+Shared: same extension, same localhost transport, same short-lived credential broker, same options.
+Deployment boundary: the extension only ever hits local `127.0.0.1:8772` `/push/*` and `/mcp`; it never goes through the public Worker/Tunnel. Current installs obtain a short-lived bearer through the Chrome Native Messaging host, so the long-lived `HERDR_MCP_TOKEN` stays outside extension storage; page JavaScript receives no bearer. The optional legacy Token field remains a compatibility fallback. A plain ChatGPT `/c/<id>` is identified by its conversation id; a Project conversation is identified by stable `g-p-<resource-id> + conversation id`. Persisted z.ai conversations use `/c/<chat_id>`; the `/` route is only the new-chat launcher. SPA route changes re-register automatically without requiring a full page refresh.
 
 The transport layer keeps exactly **1 global `/push/events` SSE** open. All workspace events are dispatched by background to the corresponding binding based on the event's `workspace` field; you must not create one SSE per binding, or many historical bindings would exhaust the browser's HTTP/1.1 connection pool to `127.0.0.1:8772`, leaving `/push/state` and `/push/mcp-activity` permanently queued.
 
@@ -126,7 +126,7 @@ Context pressure is estimated from visible user/assistant text only. It is not t
 
 ### Implemented
 
-- the extension service worker uses the static token for local `/mcp` `tools/list` / `tools/call`; page JavaScript never receives the token;
+- the extension service worker normally uses a short-lived Native Messaging bearer for local `/mcp` `tools/list` / `tools/call`; page JavaScript never receives the bearer, and a legacy static-token fallback is explicit;
 - z.ai / DeepSeek content scripts turn normal user tasks into a Herdr-tool protocol round, extract tool calls, execute them in bounded rounds, and feed results back to the web model;
 - intermediate protocol messages are folded; handoff summary/seed messages use a raw channel and bypass the JSON bridge;
 - current z.ai 1.1.88 compatibility uses `.user-message` / `.markdown-prose`, the real `#send-message-button`, and `/c/<chat_id>` as the stable persisted-chat identity.

@@ -8,7 +8,7 @@ const optionsJs = readFileSync(new URL("../extension/options.js", import.meta.ur
 
 test("Simplified Chinese Options copy avoids legacy mixed-language prose", () => {
   assert.equal(zh.options_title, "herdr → 网页唤醒 · 配置");
-  assert.equal(zh.label_token, "访问令牌");
+  assert.equal(zh.label_token, "兼容访问令牌（可选）");
   assert.equal(zh.label_llm_url, "判定服务地址");
   assert.equal(zh.label_llm_key, "判定接口密钥");
   assert.equal(zh.placeholder_llm_model, "填写模型名称");

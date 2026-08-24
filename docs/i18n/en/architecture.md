@@ -100,7 +100,7 @@ A successful `herdr_prompt` includes `state_observation: { changed: true\|false\
 ## Transport
 
 - MCP: `POST/GET/DELETE` on `/mcp` (ChatGPT probing also uses an issuer-root `/` alias)
-- Auth: OAuth JWT (connector) or a static `HERDR_MCP_TOKEN` (Cursor / curl / extension). Do not paste the static token into the ChatGPT connector UI.
+- Auth: OAuth JWT (connector); static `HERDR_MCP_TOKEN` for Cursor / curl and the local Native Messaging broker; short-lived native-session bearer for the browser extension. Do not paste the static token into the ChatGPT connector UI or normal extension Options.
 - Push (extension, same Bearer):
   - `GET /push/events` SSE (supports `?workspace=`)
   - `GET /push/state` current agent / workspace / pane snapshot

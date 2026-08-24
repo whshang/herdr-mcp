@@ -104,7 +104,7 @@ mkdir -p ~/.config/herdr-mcp
 
 ```bash
 export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
-echo "token=$HERDR_MCP_TOKEN"   # 留给 Cursor / 浏览器插件
+echo "token=$HERDR_MCP_TOKEN"   # 留给 Cursor / 本机管理
 node dist/server.js
 # 另开终端自检: curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 ```
@@ -165,7 +165,7 @@ ChatGPT 可用模型取决于当前套餐和产品配置，Herdr 不改变 ChatG
 
 ### 5. 浏览器插件（可选）
 
-目录 `extension/`（MV3）。Chrome 里显示名称 **herdr → Web wake**。`chrome://extensions` 加载未打包扩展。选项填 `http://127.0.0.1:8772` 与同一静态 token。见 [浏览器插件](#浏览器插件)。
+目录 `extension/`（MV3）。Chrome 里显示名称 **herdr → Web wake**。先运行 `bin/herdr-extension-host install`，再到 `chrome://extensions` 加载未打包扩展。插件通过 Chrome 原生消息自动取得短期 localhost bearer，正常安装无需把 `HERDR_MCP_TOKEN` 复制进选项页；兼容令牌字段仅作为旧版 fallback。见 [浏览器插件](#浏览器插件)。
 
 ## 地址速查
 
@@ -176,7 +176,7 @@ ChatGPT 可用模型取决于当前套餐和产品配置，Herdr 不改变 ChatG
 | 扩展 SSE | `http://127.0.0.1:8772/push/events` |
 | 扩展快照 | `http://127.0.0.1:8772/push/state` |
 
-Connector 认证走 **OAuth（自动注册）**。静态 Bearer 只给本机 curl / Cursor / 扩展：`herdr-mcp token`。不要把该 token 贴进 ChatGPT connector 表单。
+Connector 认证走 **OAuth（自动注册）**。静态 Bearer 保留给本机 curl / Cursor 和 Native Messaging broker；浏览器插件正常只接收 broker 签发的短期 localhost bearer。不要把静态 token 贴进 ChatGPT connector 表单。
 
 ## 命令行（macOS）
 
@@ -230,7 +230,7 @@ herdr 本体是一大套 Unix socket API（`herdr api schema`，约 90 个方法
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `HERDR_MCP_TOKEN` | 空 | `/mcp` 与 `/push` 的静态 Bearer（Cursor / curl / 扩展）。 |
+| `HERDR_MCP_TOKEN` | 空 | `/mcp` 与 `/push` 的静态 Bearer（Cursor / curl），同时作为浏览器插件 Native Messaging broker 的本机源凭据。 |
 | `HERDR_MCP_PORT` | `8772` | 监听端口。 |
 | `HERDR_MCP_BASE_URL` | 空 | ChatGPT 用的公网源站，**不要**带 `/mcp`。OAuth 的 `iss`/`aud` 依赖它。 |
 | `HERDR_SOCKET_PATH` | `~/.config/herdr/herdr.sock` | herdr API socket。 |
@@ -244,18 +244,18 @@ OAuth / skill / 状态目录等见 [docs/i18n/zh-CN/architecture.md](docs/i18n/z
 
 ## 权限边界
 
-连上的 ChatGPT 会话可以在托管 git 根里读改文件，并用 `herdr_exec` 跑 shell。扩展用同一静态 token 打本机；不要把该 token 填进 ChatGPT connector。路径密钥检查只约束 `herdr_fs_*`，shell 仍可 `cat .env`。用 `HERDR_MCP_READONLY` / `HERDR_MCP_WRITE_ROOTS` 收紧。
+连上的 ChatGPT 会话可以在托管 git 根里读改文件，并用 `herdr_exec` 跑 shell。扩展始终只访问本机，正常使用 Native Messaging broker 签发的短期 bearer；长期静态 token 不进入扩展存储。路径密钥检查只约束 `herdr_fs_*`，shell 仍可 `cat .env`。用 `HERDR_MCP_READONLY` / `HERDR_MCP_WRITE_ROOTS` 收紧。
 
 ## 浏览器插件
 
 目录 `extension/`（MV3，Chrome 名称 **herdr → Web wake**）。`chrome://extensions` 加载未打包扩展。站点：chatgpt.com、claude.ai、chat.deepseek.com、chat.z.ai。
 
-两件工作（见 [docs/i18n/zh-CN/extension.md](docs/i18n/zh-CN/extension.md)）共享本地 token，**完成度不对等**：
+两件工作（见 [docs/i18n/zh-CN/extension.md](docs/i18n/zh-CN/extension.md)）共享 localhost transport 与插件短期凭据 broker，**完成度不对等**：
 
 1. **网页连续工作自动化（已可用）**：Options 选择“全局手动 / 项目自动”；底部 HUD 提供「手动继续 / herdr监控 / LLM 分析 / 手动接力」，允许自动化时另有 `自动 开/关`。ChatGPT 按 `project_id` 保存自动设置；z.ai / DeepSeek 按具体会话保存。0.1.47 起，`自动 开` 会锁定全部 HUD 手动操作（包括“手动接力”）；0.1.48 起 z.ai / DeepSeek 即使尚未绑定 workspace 也可以先保存会话自动开关，Herdr 进度/settled 自动回推在绑定后自然生效。已绑定且已落成 `/c/<chat_id>` 的 z.ai 会话也支持 fail-closed 手动接力。z.ai 新聊天根页 `/` 的 binding/自动偏好会在首次落成 `/c/<chat_id>` 后迁移过去，但切换历史聊天不会跟随迁移。
-2. **JSON→MCP（已可用）**：DeepSeek / z.ai 的本地 JSON bridge 会从网页任务中驱动 `127.0.0.1:8772/mcp` 的 `tools/list` / `tools/call`，在受限轮次内回填工具结果；静态 Herdr token 只留在扩展 service worker，不暴露给页面脚本。路线与安全边界见 [docs/i18n/zh-CN/extension-bridge.md](docs/i18n/zh-CN/extension-bridge.md)。
+2. **JSON→MCP（已可用）**：DeepSeek / z.ai 的本地 JSON bridge 会从网页任务中驱动 `127.0.0.1:8772/mcp` 的 `tools/list` / `tools/call`，在受限轮次内回填工具结果；service worker 正常只持有 Native Messaging 签发的短期 bearer（或用户显式配置的旧版兼容 token），网页脚本拿不到任何凭据。路线与安全边界见 [docs/i18n/zh-CN/extension-bridge.md](docs/i18n/zh-CN/extension-bridge.md)。
 
-共享本地 `127.0.0.1:8772` 与静态 token。这不是给 DeepSeek「安装」ChatGPT 式 OAuth connector。默认：进度检查间隔 **60 秒**，摘要不变时兜底 **20 分钟**（`progressTickSec` / `progressFallbackSec`）。
+共享本地 `127.0.0.1:8772` 与插件短期凭据 broker；兼容静态 token 仅用于旧版 fallback。这不是给 DeepSeek「安装」ChatGPT 式 OAuth connector。默认：进度检查间隔 **60 秒**，摘要不变时兜底 **20 分钟**（`progressTickSec` / `progressFallbackSec`）。
 
 ## 文档
 

@@ -11,7 +11,8 @@
     "herdr-cloudflare-domain": "bin/herdr-cloudflare-domain",
     "herdr-custom-domain-cutover": "bin/herdr-custom-domain-cutover",
     "herdr-runtime-generation": "bin/herdr-runtime-generation",
-    "herdr-self-update": "bin/herdr-self-update"
+    "herdr-self-update": "bin/herdr-self-update",
+    "herdr-extension-host": "bin/herdr-extension-host"
   },
   "scripts": {
     "build": "tsc",

@@ -7,7 +7,8 @@
  *  - HERDR_MCP_ALL_TOOLS=1 adds advanced/deprecated lifecycle tools (30 total).
  *  - Express on HERDR_MCP_PORT (default 8772).
  *  - OAuth DCR endpoints for Claude.ai / ChatGPT connectors.
- *  - Bearer auth on /mcp via HERDR_MCP_TOKEN.
+ *  - Bearer auth on /mcp via HERDR_MCP_TOKEN, short-lived extension sessions,
+ *    or connector OAuth.
  */
 import express, { Express, Request, Response, NextFunction } from "express";
 import { createHash, randomUUID } from "node:crypto";
@@ -35,6 +36,7 @@ import { validateMethodParams, listMethods, warmSchemaCache } from "./schema.js"
 import { get as sessionGet, save as sessionSave, type SessionData, type SessionProject } from "./session.js";
 import { waitForAgent } from "./wait.js";
 import { registerPushRoutes } from "./push.js";
+import { registerExtensionAuthRoutes } from "./extension-auth.js";
 import {
   registerOAuthRoutes,
   mcpBearerAuth,
@@ -77,7 +79,6 @@ const SDK_WIRE_PROTOCOL = "2025-11-25";
 // ---------------------------------------------------------------------------
 const PORT = Number(process.env.HERDR_MCP_PORT ?? "8772");
 const BASE_URL = process.env.HERDR_MCP_BASE_URL ?? ""; // e.g. https://herdr-edge.<account>.workers.dev or a Custom Domain
-const AUTH_TOKEN = process.env.HERDR_MCP_TOKEN ?? "";
 // Tool-surface switch: default exposes the lean 18-tool surface; HERDR_MCP_ALL_TOOLS=1
 // additionally registers advanced + deprecated lifecycle tools (wait/task/session/handoff/
 // reap/parallel/read/explain/prompt_status/transcript/diff) — 30 total.
@@ -3469,6 +3470,11 @@ function routes(app: Express): void {
   app.use(express.urlencoded({ extended: true, limit: "10mb" }));
   // ChatGPT connector UI discovers OAuth from the browser — needs CORS + OPTIONS.
   app.use(oauthCors);
+
+  // Loopback-only short-lived credentials for the official browser extension.
+  // The native host authenticates this endpoint with HERDR_MCP_TOKEN; the
+  // extension itself receives only the returned ephemeral bearer.
+  registerExtensionAuthRoutes(app);
 
   // --- Browser-extension push channel (herdr → web wake-up) ---
   // GET /push/events (SSE) + GET /push/state, same Bearer token as /mcp.

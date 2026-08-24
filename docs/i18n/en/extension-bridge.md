@@ -27,7 +27,7 @@ web task
 | bounded `tools/call` rounds + result backfill | **available** |
 | parallel execution of independent calls in one batch | **available** |
 | tool-result sanitization / large binary omission / size bound | **available** |
-| static Herdr token hidden from page JavaScript | **available** — token remains in the extension service worker |
+| local credential hidden from page JavaScript | **available** — the service worker normally holds only a short-lived native-session bearer; legacy static-token fallback is explicit |
 | z.ai / DeepSeek conversation-scoped `Auto on/off` for Herdr progress/settled push-back | **available** when global automation is permitted |
 | persisted z.ai `/c/<chat_id>` Manual handoff | **available** with `Auto off`; handoff control messages bypass this bridge |
 
@@ -47,7 +47,7 @@ Intermediate bridge messages are folded from the visible conversation where the 
 
 ## Security boundary
 
-- The static Herdr token is read and used only by the MV3 service worker. Page JavaScript receives tool schemas and sanitized results, not the bearer token.
+- The MV3 service worker normally obtains a short-lived localhost bearer through Chrome Native Messaging. The long-lived `HERDR_MCP_TOKEN` stays with the local runtime/native broker; an explicitly configured legacy token remains a compatibility fallback. Page JavaScript receives tool schemas and sanitized results, never either bearer.
 - MCP requests go only to the configured local Herdr endpoint, normally `http://127.0.0.1:8772/mcp`.
 - Site identity and conversation identity are checked before bridge/automation operations are accepted.
 - The bridge does not pretend DeepSeek or z.ai has a native OAuth MCP Connector.

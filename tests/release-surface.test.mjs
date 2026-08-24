@@ -14,6 +14,7 @@ const EXPECTED_BINS = {
   "herdr-cloudflare-dns-token": "bin/herdr-cloudflare-dns-token",
   "herdr-cloudflare-domain": "bin/herdr-cloudflare-domain",
   "herdr-custom-domain-cutover": "bin/herdr-custom-domain-cutover",
+  "herdr-extension-host": "bin/herdr-extension-host",
   "herdr-runtime-generation": "bin/herdr-runtime-generation",
   "herdr-self-update": "bin/herdr-self-update",
 };

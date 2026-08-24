@@ -13,7 +13,8 @@
  *    (via the hook in state.ts) instead of opening another daemon subscription
  *    per client. This adds no sockets, uses normalized events, and avoids polling.
  *
- * 2. **Reuse HERDR_MCP_TOKEN for authentication**: no separate token mechanism.
+ * 2. **Authenticated localhost only**: static HERDR_MCP_TOKEN remains valid;
+ *    the browser extension normally uses a short-lived Native Messaging session bearer.
  *    - The threat model is identical: token holders can already read all agent
  *      state through herdr_inspect, so the push channel exposes nothing extra.
  *    - This requires no additional secret management: one token in the plist
@@ -37,6 +38,7 @@
  */
 import { Router, Request, Response } from "express";
 import type { Express } from "express";
+import { extensionSessionBearerMatches } from "./extension-auth.js";
 import { HerdrClient, HerdrEvent } from "./herdr.js";
 import { getSnapshotCache, SnapshotCache, AgentView } from "./state.js";
 import { cleanTerminalOutput } from "./clean.js";
@@ -359,7 +361,7 @@ function pushAuth(req: Request, res: Response, next: () => void): void {
   const token = process.env.HERDR_MCP_TOKEN ?? "";
   if (token) {
     const auth = req.get("authorization") ?? "";
-    if (auth !== `Bearer ${token}`) {
+    if (auth !== `Bearer ${token}` && !extensionSessionBearerMatches(req)) {
       res.status(401).send("unauthorized\n");
       return;
     }

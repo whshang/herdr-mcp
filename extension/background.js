@@ -24,6 +24,7 @@ import {
 } from "./continuity-core.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
+import { getLocalAuth, localAuthHeaders, resetLocalAuth } from "./local-auth.js";
 
 const H2W_SCRIPT_VERSION = "0.1.48";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
@@ -62,12 +63,23 @@ const FALLBACK_PARTIAL_TEMPLATE =
 // The page only receives tool schemas and results. The bearer token stays inside
 // the extension service worker.
 async function jsonBridgeRpc(method, params = {}) {
-  return callMcpJsonRpc({
+  const auth = await getLocalAuth({ baseUrl: CFG.herdrMcpUrl, legacyToken: CFG.token });
+  let result = await callMcpJsonRpc({
     baseUrl: CFG.herdrMcpUrl,
-    token: CFG.token,
+    token: auth.token,
     method,
     params,
   });
+  if (result?.status === 401 && auth.source === "native") {
+    const refreshed = await getLocalAuth({ baseUrl: CFG.herdrMcpUrl, legacyToken: CFG.token, force: true });
+    result = await callMcpJsonRpc({
+      baseUrl: CFG.herdrMcpUrl,
+      token: refreshed.token,
+      method,
+      params,
+    });
+  }
+  return result;
 }
 
 function localizedText(key, vars = null, fallback = "") {
@@ -165,6 +177,16 @@ function isJsonBridgeConversation(convKey) {
   }
 }
 
+function conversationAutomationSiteForConversation(convKey) {
+  const chatgpt = chatGptConversationInfo(convKey);
+  if (chatgpt?.site === "chatgpt" && !chatgpt.project_id && chatgpt.conversation_id) return "chatgpt";
+  return jsonBridgeSiteForConversation(convKey);
+}
+
+function isConversationAutomationConversation(convKey) {
+  return Boolean(conversationAutomationSiteForConversation(convKey));
+}
+
 function jsonBridgeSiteForConversation(convKey) {
   try {
     const origin = new URL(String(convKey || "")).origin;
@@ -226,16 +248,33 @@ function validateJsonBridgeSender(msg, sender) {
 }
 
 async function authorizeConversationAutomation(msg, sender) {
-  const access = validateJsonBridgeSender(msg, sender);
-  if (!access.ok) return access;
-  return access;
+  const convKey = String(msg?.convKey || "").trim();
+  const expectedSite = conversationAutomationSiteForConversation(convKey);
+  const site = String(msg?.site || "").trim();
+  if (!expectedSite || site !== expectedSite) {
+    return { ok: false, error: "conversation-automation-site-mismatch" };
+  }
+  try {
+    const senderUrl = String(sender?.tab?.url || sender?.url || "");
+    if (expectedSite === "chatgpt") {
+      const senderInfo = chatGptConversationInfo(senderUrl);
+      if (!senderInfo || senderInfo.project_id || senderInfo.convKey !== convKey) {
+        return { ok: false, error: "conversation-automation-sender-mismatch" };
+      }
+    } else if (new URL(senderUrl).origin !== new URL(convKey).origin) {
+      return { ok: false, error: "conversation-automation-sender-mismatch" };
+    }
+  } catch (_) {
+    return { ok: false, error: "conversation-automation-sender-mismatch" };
+  }
+  return { ok: true, convKey, site };
 }
 
 function sanitizeConversationAutomation(raw) {
   const out = {};
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
   for (const [convKey, enabled] of Object.entries(raw)) {
-    if (enabled === true && isJsonBridgeConversation(convKey)) out[convKey] = true;
+    if (enabled === true && isConversationAutomationConversation(convKey)) out[convKey] = true;
   }
   return out;
 }
@@ -247,7 +286,7 @@ function automationScopeForConversation(convKey) {
   const projectMode = globalMode === AUTOMATION_MODE_PROJECT;
   const projectAutomationAvailable = projectMode && Boolean(projectId);
   const projectEnabled = projectAutomationAvailable && PROJECT_AUTOMATION[projectId] === true;
-  const conversationAutomationAvailable = projectMode && !projectId && isJsonBridgeConversation(convKey);
+  const conversationAutomationAvailable = projectMode && !projectId && isConversationAutomationConversation(convKey);
   const conversationEnabled = conversationAutomationAvailable && CONVERSATION_AUTOMATION[convKey] === true;
   const enabled = projectId ? projectEnabled : conversationEnabled;
   return {
@@ -909,12 +948,16 @@ async function runPushStream(ctrl) {
     ctrl.signal.addEventListener("abort", relayAbort, { once: true });
     const connectTimer = setTimeout(() => attempt.abort(), PUSH_CONNECT_MS);
     try {
+      const headers = await localAuthHeaders({ baseUrl: CFG.herdrMcpUrl, legacyToken: CFG.token });
       const resp = await fetch(url, {
         signal: attempt.signal,
-        headers: CFG.token ? { Authorization: `Bearer ${CFG.token}` } : {},
+        headers,
       });
       clearTimeout(connectTimer);
       if (!resp.ok) {
+        if (resp.status === 401) {
+          await getLocalAuth({ baseUrl: CFG.herdrMcpUrl, legacyToken: CFG.token, force: true });
+        }
         callLog(`push HTTP ${resp.status}; retrying in ${backoff}ms`);
         await sleep(backoff);
         backoff = Math.min(backoff * 2, 15000);
@@ -2651,10 +2694,17 @@ async function fetchStateFresh() {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), STATE_FETCH_MS);
   try {
-    const resp = await fetch(`${CFG.herdrMcpUrl.replace(/\/+$/, "")}/push/state`, {
-      headers: CFG.token ? { Authorization: `Bearer ${CFG.token}` } : {},
+    const url = `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/push/state`;
+    let headers = await localAuthHeaders({ baseUrl: CFG.herdrMcpUrl, legacyToken: CFG.token });
+    let resp = await fetch(url, {
+      headers,
       signal: ctrl.signal,
     });
+    if (resp.status === 401) {
+      const refreshed = await getLocalAuth({ baseUrl: CFG.herdrMcpUrl, legacyToken: CFG.token, force: true });
+      headers = refreshed.token ? { Authorization: `Bearer ${refreshed.token}` } : {};
+      resp = await fetch(url, { headers, signal: ctrl.signal });
+    }
     if (!resp.ok) return { ok: false, status: resp.status };
     const body = await resp.json();
     if (Array.isArray(body?.workspaces)) cachePushWorkspaceCatalog(body.workspaces);
@@ -2699,6 +2749,7 @@ async function fetchState() {
 async function rebuildStreams() {
   await configReady;
   stopPushStream();
+  resetLocalAuth();
   // A configured endpoint may have changed; never show a workspace catalog
   // from the previous server while the new shared stream is reconnecting.
   pushWorkspaceCatalog = [];

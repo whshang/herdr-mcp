@@ -24,7 +24,7 @@ mkdir -p ~/.config/herdr-mcp
 
 ```bash
 export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
-echo "token=$HERDR_MCP_TOKEN"   # 留给 Cursor / 浏览器扩展
+echo "token=$HERDR_MCP_TOKEN"   # 留给 Cursor / 本机管理
 node dist/server.js
 # 可选检查：curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 ```

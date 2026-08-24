@@ -154,7 +154,7 @@ Runtime のリリースは安定した Edge/Link の背後で A/B 切り替え�
 
 ### 5. ブラウザ拡張（任意）
 
-フォルダ: `extension/`（MV3）。Chrome 上の名前は **herdr → Web wake**。`chrome://extensions` で unpacked 読み込み。Options に `http://127.0.0.1:8772` と同一静的 token。
+フォルダ: `extension/`（MV3）。Chrome 上の名前は **herdr → Web wake**。先に `bin/herdr-extension-host install` を実行し、`chrome://extensions` で unpacked 読み込み。Chrome Native Messaging が短期 localhost bearer を自動取得するため、通常は `HERDR_MCP_TOKEN` の手動コピーは不要です。
 
 ## エンドポイント
 
@@ -165,7 +165,7 @@ Runtime のリリースは安定した Edge/Link の背後で A/B 切り替え�
 | 拡張 SSE | `http://127.0.0.1:8772/push/events` |
 | 拡張スナップショット | `http://127.0.0.1:8772/push/state` |
 
-Connector 認証は **OAuth (DCR / CIMD)**。静的 Bearer はローカル curl / Cursor / 拡張用（`herdr-mcp token`）。ChatGPT の connector フォームに貼らない。
+Connector 認証は **OAuth (DCR / CIMD)**。静的 Bearer はローカル curl / Cursor と Native Messaging broker 用です。ブラウザ拡張は通常、broker が発行する短期 localhost bearer のみを受け取り、`HERDR_MCP_TOKEN` の手動コピーは不要です。ChatGPT の connector フォームに貼らないでください。
 
 ## CLI（macOS）
 

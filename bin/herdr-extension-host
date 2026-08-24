@@ -1,0 +1,187 @@
+#!/usr/bin/env node
+/**
+ * Chrome Native Messaging broker for the herdr-mcp extension.
+ *
+ * Chrome authenticates the caller against the native-host manifest. This
+ * process reads the long-lived local token from the launchd environment,
+ * exchanges it for a short-lived loopback bearer, and returns only that
+ * ephemeral credential to the extension.
+ */
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HOST_NAME = "dev.herdr.mcp";
+const SCRIPT_PATH = fileURLToPath(import.meta.url);
+const REPO_ROOT = resolve(dirname(SCRIPT_PATH), "..");
+const EXTENSION_PATH = resolve(REPO_ROOT, "extension");
+const EXTENSION_ID = chromiumIdForPath(EXTENSION_PATH);
+const EXTENSION_ORIGIN = `chrome-extension://${EXTENSION_ID}/`;
+const DEFAULT_BASE_URL = "http://127.0.0.1:8772";
+const SERVER_PLIST = join(homedir(), "Library", "LaunchAgents", "dev.herdr-mcp.server.plist");
+
+function chromiumIdForPath(extensionPath) {
+  const hex = createHash("sha256").update(Buffer.from(extensionPath)).digest("hex").slice(0, 32);
+  return [...hex].map((char) => "abcdefghijklmnop"[Number.parseInt(char, 16)]).join("");
+}
+
+function readRuntimeToken() {
+  const inherited = String(process.env.HERDR_MCP_TOKEN || "").trim();
+  if (inherited) return inherited;
+  if (process.platform !== "darwin" || !existsSync(SERVER_PLIST)) return "";
+  try {
+    return String(execFileSync(
+      "/usr/libexec/PlistBuddy",
+      ["-c", "Print :EnvironmentVariables:HERDR_MCP_TOKEN", SERVER_PLIST],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    )).trim();
+  } catch {
+    return "";
+  }
+}
+
+function validateBaseUrl(value) {
+  const url = new URL(String(value || DEFAULT_BASE_URL));
+  const host = url.hostname.toLowerCase();
+  if (url.protocol !== "http:" || !(host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]")) {
+    throw new Error("base_url_must_be_loopback_http");
+  }
+  return url.origin;
+}
+
+function readNativeMessage() {
+  return new Promise((resolveMessage, reject) => {
+    const chunks = [];
+    let total = 0;
+    process.stdin.on("data", (chunk) => {
+      chunks.push(chunk);
+      total += chunk.length;
+      const all = Buffer.concat(chunks, total);
+      if (all.length < 4) return;
+      const size = all.readUInt32LE(0);
+      if (size > 1024 * 1024) {
+        reject(new Error("native_message_too_large"));
+        return;
+      }
+      if (all.length < 4 + size) return;
+      try {
+        resolveMessage(JSON.parse(all.subarray(4, 4 + size).toString("utf8")));
+      } catch {
+        reject(new Error("invalid_native_message"));
+      }
+    });
+    process.stdin.on("error", reject);
+    process.stdin.resume();
+  });
+}
+
+function writeNativeMessage(value) {
+  const body = Buffer.from(JSON.stringify(value), "utf8");
+  const header = Buffer.alloc(4);
+  header.writeUInt32LE(body.length, 0);
+  process.stdout.write(Buffer.concat([header, body]));
+}
+
+async function issueSession(message, callerOrigin) {
+  if (callerOrigin !== EXTENSION_ORIGIN) throw new Error("extension_origin_not_allowed");
+  if (message?.type !== "session") throw new Error("unsupported_message");
+  const baseUrl = validateBaseUrl(message?.base_url);
+  const token = readRuntimeToken();
+  const headers = { "Content-Type": "application/json" };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(`${baseUrl}/extension/session`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ extension_id: EXTENSION_ID }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload?.ok !== true) {
+    throw new Error(payload?.error || `session_http_${response.status}`);
+  }
+  return {
+    ok: true,
+    token: String(payload.token || ""),
+    token_type: "Bearer",
+    expires_at: payload.expires_at ?? null,
+    expires_in: Number(payload.expires_in || 0),
+    auth_mode: String(payload.auth_mode || "native_session"),
+  };
+}
+
+function installTargets() {
+  if (process.platform !== "darwin") throw new Error("native_host_install_currently_requires_macos");
+  const appSupport = join(homedir(), "Library", "Application Support");
+  return [
+    join(appSupport, "Google", "Chrome", "NativeMessagingHosts"),
+    join(appSupport, "Google", "Chrome Beta", "NativeMessagingHosts"),
+    join(appSupport, "Google", "Chrome Canary", "NativeMessagingHosts"),
+    join(appSupport, "Chromium", "NativeMessagingHosts"),
+    join(appSupport, "BraveSoftware", "Brave-Browser", "NativeMessagingHosts"),
+    join(appSupport, "Microsoft Edge", "NativeMessagingHosts"),
+    join(appSupport, "Citro Labs", "ego lite", "NativeMessagingHosts"),
+  ];
+}
+
+function installNativeHost() {
+  const nativeDir = join(homedir(), ".config", "herdr-mcp", "native");
+  mkdirSync(nativeDir, { recursive: true, mode: 0o700 });
+  const wrapper = join(nativeDir, "herdr-extension-host");
+  const nodePath = process.execPath;
+  writeFileSync(wrapper, `#!/bin/sh\nexec '${nodePath.replaceAll("'", "'\\''")}' '${SCRIPT_PATH.replaceAll("'", "'\\''")}' "$@"\n`, { mode: 0o700 });
+  chmodSync(wrapper, 0o700);
+
+  const manifest = {
+    name: HOST_NAME,
+    description: "herdr-mcp local browser-extension credential broker",
+    path: wrapper,
+    type: "stdio",
+    allowed_origins: [EXTENSION_ORIGIN],
+  };
+  const installed = [];
+  for (const target of installTargets()) {
+    const browserDir = dirname(target);
+    const isChromeStable = target.includes(join("Google", "Chrome", "NativeMessagingHosts"));
+    if (!isChromeStable && !existsSync(browserDir)) continue;
+    mkdirSync(target, { recursive: true });
+    const manifestPath = join(target, `${HOST_NAME}.json`);
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(manifestPath, 0o600);
+    installed.push(manifestPath);
+  }
+  return { ok: true, host: HOST_NAME, extension_id: EXTENSION_ID, extension_path: EXTENSION_PATH, wrapper, installed };
+}
+
+function hostStatus() {
+  const found = [];
+  for (const target of installTargets()) {
+    const manifestPath = join(target, `${HOST_NAME}.json`);
+    if (!existsSync(manifestPath)) continue;
+    try {
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      found.push({ path: manifestPath, host_path: manifest.path, allowed: manifest.allowed_origins?.includes(EXTENSION_ORIGIN) === true });
+    } catch {
+      found.push({ path: manifestPath, invalid: true });
+    }
+  }
+  return { ok: found.some((item) => item.allowed === true), host: HOST_NAME, extension_id: EXTENSION_ID, extension_path: EXTENSION_PATH, manifests: found };
+}
+
+const command = process.argv[2];
+if (command === "install") {
+  console.log(JSON.stringify(installNativeHost(), null, 2));
+} else if (command === "status") {
+  const status = hostStatus();
+  console.log(JSON.stringify(status, null, 2));
+  process.exitCode = status.ok ? 0 : 1;
+} else {
+  const callerOrigin = String(process.argv[2] || "");
+  try {
+    const message = await readNativeMessage();
+    writeNativeMessage(await issueSession(message, callerOrigin));
+  } catch (error) {
+    writeNativeMessage({ ok: false, error: String(error?.message || error || "native_host_error") });
+  }
+}

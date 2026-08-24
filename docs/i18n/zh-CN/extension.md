@@ -8,8 +8,8 @@
 | **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + 自动化 gate + 安全接力 | **已可用**（当前 0.1.48 系列） | 绑定/观察：4 站；ChatGPT Project 完整自动化；z.ai / DeepSeek 会话级进度自动化；手动接力：ChatGPT Project + z.ai `/c/<chat_id>` |
 | **B. JSON→MCP** | DeepSeek / z.ai 网页没有 MCP Connector | 网页 → 扩展 service worker → 本机 `127.0.0.1:8772/mcp` | **已可用**（bounded `tools/list` / `tools/call` loop） | `chat.deepseek.com`、`chat.z.ai` |
 
-共享：同一扩展、同一静态 token、同一 options。  
-部署边界：扩展始终只访问本机 `127.0.0.1:8772` 的 `/push/*` 与 `/mcp`，不经过公网 Worker/Tunnel；JSON bridge 的静态 Herdr token 只存在于 extension service worker，不进入网页 JavaScript。因此 Cloudflare Edge、Custom Domain、contract epoch 的变更不要求扩展改 URL/OAuth。主线 A 与新版 server 兼容。ChatGPT 普通 `/c/<id>` 以 conversation id 标识；Project 会话以稳定的 `g-p-<resource-id> + conversation id` 标识，忽略 ChatGPT 可能追加的人类可读 Project slug。SPA 路由变化会自动重新注册，不要求刷新整页。
+共享：同一扩展、同一 localhost transport、同一短期凭据 broker、同一 options。
+部署边界：扩展始终只访问本机 `127.0.0.1:8772` 的 `/push/*` 与 `/mcp`，不经过公网 Worker/Tunnel；当前安装通过 Chrome Native Messaging host 获取短期 bearer，长期 `HERDR_MCP_TOKEN` 不进入扩展存储，网页 JavaScript 也拿不到 bearer；可选兼容 token 仅用于旧版 fallback。因此 Cloudflare Edge、Custom Domain、contract epoch 的变更不要求扩展改 URL/OAuth。主线 A 与新版 server 兼容。ChatGPT 普通 `/c/<id>` 以 conversation id 标识；Project 会话以稳定的 `g-p-<resource-id> + conversation id` 标识，忽略 ChatGPT 可能追加的人类可读 Project slug。SPA 路由变化会自动重新注册，不要求刷新整页。
 
 传输层只维持 **1 条全局 `/push/events` SSE**。所有 workspace 事件由 background 根据事件里的 `workspace` 字段分发到对应 binding；不能按 binding 各建一条 SSE，否则多个历史 binding 会耗尽浏览器对 `127.0.0.1:8772` 的 HTTP/1.1 连接池，导致 `/push/state` 与 `/push/mcp-activity` 永久排队。
 
@@ -140,7 +140,7 @@ Project `自动 开` 是当前 Project 的执行 gate。只有 Options 已选择
 
 ### 已实现
 
-- extension service worker 以静态 token 调本机 `/mcp` 的 `tools/list` / `tools/call`；网页脚本拿不到 token。
+- extension service worker 正常使用 Native Messaging 签发的短期 bearer 调本机 `/mcp` 的 `tools/list` / `tools/call`；网页脚本拿不到 bearer，可选静态 token 仅作为旧版兼容 fallback。
 - z.ai / DeepSeek 内容脚本把普通用户任务转换为带 Herdr tool catalog 的协议回合，在 bounded round 内提取工具调用、执行并把结果回填给网页模型。
 - 工具协议中间消息会折叠；handoff summary/seed 使用 raw 发送通道，不会被 JSON bridge 再包装。
 - z.ai 1.1.88 使用 `.user-message` / `.markdown-prose`、真实 `#send-message-button` 和 `/c/<chat_id>` 作为稳定会话身份。

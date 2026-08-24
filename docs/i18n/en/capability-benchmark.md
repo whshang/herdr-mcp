@@ -57,7 +57,7 @@ herdr-mcp's goal is not to re-wrap Herdr, nor to become a generic coding sandbox
 2. **Do not copy dozens of pane/agent/workspace MCP tools.** The live Herdr API is reachable through two generic tools.
 3. **No recipe DSL / second planner.** Web ChatGPT is the only high-level planner.
 4. **No shell sandbox claim.** The permission boundary stays explicit; stronger isolation, if ever needed, gets designed separately.
-5. **The browser extension does not go through the public Worker.** The extension is a same-machine reverse channel and keeps touching only `127.0.0.1`; public Token/OAuth and the local static token stay separate.
+5. **The browser extension does not go through the public Worker.** The extension is a same-machine reverse channel and keeps touching only `127.0.0.1`; public OAuth stays separate from the local static runtime credential, and the extension normally receives only a short-lived bearer through Native Messaging.
 
 ## Maintenance
 

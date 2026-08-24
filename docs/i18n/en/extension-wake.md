@@ -39,7 +39,7 @@ Defaults: `progressTickSec = 60` (progress check + automatic LLM-decision cooldo
 ## Install and bind
 
 1. Load `extension/`
-2. Options: `http://127.0.0.1:8772` and the `herdr-mcp token` (the extension only connects local, using `/push/events` and `/push/state`, never Cloudflare)
+2. Run `bin/herdr-extension-host install`, then keep Options on `http://127.0.0.1:8772`. Chrome Native Messaging obtains the short-lived localhost bearer automatically; the optional legacy Token field is only for older runtimes or a missing native-host registration. The extension uses `/push/events` and `/push/state` locally and never goes through Cloudflare.
    - This is independent of the public Worker contract epoch (currently epoch 2 / 18 tools); the extension does not read ChatGPT's `tools/list`.
 3. Open the target conversation (chatgpt / deepseek / z.ai / claude)
 4. popup: **bind** the **workspace** that will do the work (the list shows herdr **labels**, e.g. `novo (w5A)`; includes panes with terminal only and no agent; any agent progress in the space pushes back)

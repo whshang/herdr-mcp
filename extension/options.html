@@ -30,11 +30,11 @@
 
   <label id="lab_url">herdr-mcp URL (local)</label>
   <input type="text" id="url" placeholder="http://127.0.0.1:8772">
-  <div class="hint" id="hint_url">Local Bearer access from the extension background.</div>
+  <div class="hint" id="hint_url">Local access from the extension background. Native authentication is automatic when the host is installed.</div>
 
-  <label id="lab_token">Bearer Token</label>
+  <label id="lab_token">Legacy Bearer Token (optional)</label>
   <input type="text" id="token" placeholder="HERDR_MCP_TOKEN">
-  <div class="hint" id="hint_token">Same token as /mcp. View: herdr-mcp token</div>
+  <div class="hint" id="hint_token">Compatibility fallback only. New installs use a short-lived native-messaging credential automatically.</div>
 
   <label id="lab_wake">Wake template (settled)</label>
   <textarea id="template">{agent} · {pane} · {status} · {output}</textarea>
@@ -74,7 +74,7 @@
   <textarea id="llmJudgeSkipKeywords" style="height:72px"></textarea>
   <div class="hint" id="hint_llm_skip">One per line (or comma-separated). If the judge reply is only one of these, do not nudge.</div>
 
-  <label><input type="checkbox" id="automationMode"> <span id="lab_automation_mode">Enable per-Project automation</span></label>
+  <label><input type="checkbox" id="automationMode"> <span id="lab_automation_mode">Enable automation</span></label>
   <div class="hint" id="hint_automation_mode"></div>
 
   <button class="primary" id="save">Save</button>

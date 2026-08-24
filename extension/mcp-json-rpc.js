@@ -36,7 +36,6 @@ export async function callMcpJsonRpc({
   const base = String(baseUrl || "").trim().replace(/\/+$/, "");
   const bearer = String(token || "").trim();
   if (!base) return { ok: false, error: "mcp-url-missing" };
-  if (!bearer) return { ok: false, error: "token-not-configured" };
   if (typeof fetchFn !== "function") return { ok: false, error: "fetch-unavailable" };
 
   const controller = new AbortController();
@@ -47,7 +46,7 @@ export async function callMcpJsonRpc({
       response = await fetchFn(`${base}/mcp`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${bearer}`,
+          ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
           "Content-Type": "application/json",
           Accept: "application/json, text/event-stream",
           "Mcp-Protocol-Version": "2025-11-25",

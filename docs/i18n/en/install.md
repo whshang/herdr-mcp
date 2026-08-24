@@ -24,7 +24,7 @@ mkdir -p ~/.config/herdr-mcp
 
 ```bash
 export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
-echo "token=$HERDR_MCP_TOKEN"   # keep for Cursor / the browser extension
+echo "token=$HERDR_MCP_TOKEN"   # keep for Cursor / local administration
 node dist/server.js
 # optional check: curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 ```

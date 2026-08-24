@@ -106,7 +106,7 @@ mkdir -p ~/.config/herdr-mcp
 
 ```bash
 export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
-echo "token=$HERDR_MCP_TOKEN"   # keep for Cursor / the browser extension
+echo "token=$HERDR_MCP_TOKEN"   # keep for Cursor / local administration
 node dist/server.js
 # optional check: curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 ```
@@ -167,7 +167,7 @@ Available ChatGPT models depend on your ChatGPT plan and current product configu
 
 ### 5. Browser extension (optional)
 
-Folder: `extension/` (MV3). Chrome shows the name **herdr → Web wake**. Load unpacked in `chrome://extensions`. Options: `http://127.0.0.1:8772` + the same static token. See [Browser extension](#browser-extension).
+Folder: `extension/` (MV3). Chrome shows the name **herdr → Web wake**. Run `bin/herdr-extension-host install`, then load unpacked in `chrome://extensions`. The extension obtains a short-lived localhost bearer through Chrome Native Messaging; no normal install step copies `HERDR_MCP_TOKEN` into Options. The legacy Token field remains optional compatibility. See [Browser extension](#browser-extension).
 
 ## Endpoints
 
@@ -178,7 +178,7 @@ Folder: `extension/` (MV3). Chrome shows the name **herdr → Web wake**. Load u
 | Extension SSE | `http://127.0.0.1:8772/push/events` |
 | Extension snapshot | `http://127.0.0.1:8772/push/state` |
 
-Auth for connectors: **OAuth (DCR / CIMD)**. Static Bearer is for local curl / Cursor / the extension (`herdr-mcp token`). Never paste that token into the ChatGPT connector UI.
+Auth for connectors: **OAuth (DCR / CIMD)**. Static `HERDR_MCP_TOKEN` remains for local curl / Cursor and for the native credential broker. The browser extension normally receives only a short-lived localhost bearer. Never paste the static token into the ChatGPT connector UI.
 
 ## CLI (macOS)
 
@@ -232,7 +232,7 @@ Optional: `HERDR_MCP_ALL_TOOLS=1` adds lifecycle tools (30 total). Mutations sta
 
 | Variable | Default | Role |
 |---|---|---|
-| `HERDR_MCP_TOKEN` | empty | Static Bearer for `/mcp` and `/push` (Cursor / curl / extension). |
+| `HERDR_MCP_TOKEN` | empty | Static Bearer for `/mcp` and `/push` (Cursor / curl) and local source credential for the extension Native Messaging broker. |
 | `HERDR_MCP_PORT` | `8772` | Listen port. |
 | `HERDR_MCP_BASE_URL` | empty | Public origin for ChatGPT, **no** `/mcp` suffix. Required for OAuth `iss`/`aud`. |
 | `HERDR_SOCKET_PATH` | `~/.config/herdr/herdr.sock` | Herdr API socket. |
@@ -246,16 +246,16 @@ More OAuth / skill / state dirs: [docs/i18n/en/architecture.md](docs/i18n/en/arc
 
 ## Trust
 
-A connected ChatGPT session can read and write files under managed git roots and run shell via `herdr_exec`. The extension uses the same static token on localhost; do not put that token in the ChatGPT connector form. Secret-path checks apply to `herdr_fs_*` only — a shell can still `cat .env`. Use `HERDR_MCP_READONLY` / `HERDR_MCP_WRITE_ROOTS` to tighten.
+A connected ChatGPT session can read and write files under managed git roots and run shell via `herdr_exec`. The extension stays on localhost and normally uses a short-lived bearer minted through its Chrome Native Messaging host; the long-lived static token stays outside extension storage. Secret-path checks apply to `herdr_fs_*` only — a shell can still `cat .env`. Use `HERDR_MCP_READONLY` / `HERDR_MCP_WRITE_ROOTS` to tighten.
 
 ## Browser extension
 
 Folder: `extension/` (MV3, Chrome name **herdr → Web wake**). Load unpacked in `chrome://extensions`. Sites: chatgpt.com, claude.ai, chat.deepseek.com, chat.z.ai.
 
-Two jobs ([docs/i18n/en/extension.md](docs/i18n/en/extension.md)) — they share the local token; they are **not** equally finished:
+Two jobs ([docs/i18n/en/extension.md](docs/i18n/en/extension.md)) — they share the localhost transport and extension credential broker; they are **not** equally finished:
 
 1. **Web continuity automation (shipping)** — Options selects **Manual globally / Per-Project automation**. The bottom HUD exposes **Manual continue / Herdr monitor / LLM analysis / Manual handoff**, plus `Auto on|off` when automation is permitted. ChatGPT stores automation by stable `project_id`; z.ai / DeepSeek store it per conversation. Since 0.1.47, `Auto on` locks every HUD manual action, including Manual handoff. Version 0.1.48 lets z.ai / DeepSeek save the conversation Auto preference even before a workspace is bound; Herdr progress/settled push-back starts once binding exists. Bound persisted z.ai `/c/<chat_id>` conversations also support the fail-closed handoff flow. A z.ai new-chat root binding/preference migrates once to the first `/c/<chat_id>` created in that tab, but never follows navigation between existing histories.
-2. **JSON → MCP (shipping)** — on DeepSeek / z.ai the local JSON bridge drives `tools/list` / `tools/call` against `127.0.0.1:8772/mcp` in bounded rounds and feeds results back into the web chat. The static Herdr token stays in the extension service worker and is not exposed to page JavaScript. See [docs/i18n/en/extension-bridge.md](docs/i18n/en/extension-bridge.md).
+2. **JSON → MCP (shipping)** — on DeepSeek / z.ai the local JSON bridge drives `tools/list` / `tools/call` against `127.0.0.1:8772/mcp` in bounded rounds and feeds results back into the web chat. The service worker holds only the short-lived native-session bearer (or an explicitly configured legacy token fallback); page JavaScript receives neither credential. See [docs/i18n/en/extension-bridge.md](docs/i18n/en/extension-bridge.md).
 
 Same local `127.0.0.1:8772` token. Not a substitute for ChatGPT’s OAuth connector. Defaults: progress check every **60s**, unchanged-summary fallback **20 min** (`progressTickSec` / `progressFallbackSec`).
 

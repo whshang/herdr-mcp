@@ -52,6 +52,7 @@ import {
   type CryptoKey,
 } from "jose";
 import { SERVER_NAME, SERVER_VERSION } from "./version.js";
+import { extensionSessionBearerMatches } from "./extension-auth.js";
 
 // ---------------------------------------------------------------------------
 // Config (mirrors server.ts env handling; self-contained on purpose)
@@ -308,7 +309,7 @@ function protectedResourceMetadata(resource: string): Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------
-// Bearer auth for /mcp (static token + OAuth opaque tokens)
+// Bearer auth for /mcp (static token + short-lived extension session + OAuth tokens)
 // ---------------------------------------------------------------------------
 /** Result of resolving a presented Bearer token (static or OAuth). */
 export type AccessTokenInfo = {
@@ -376,8 +377,9 @@ export function setRequestOAuthClientId(req: Request, clientId: string): void {
 }
 
 /**
- * /mcp authorization: accepts either the static HERDR_MCP_TOKEN (Claude /
- * curl compatibility, unchanged) or a valid OAuth opaque access token. When
+ * /mcp authorization: accepts the static HERDR_MCP_TOKEN (Claude / curl
+ * compatibility), a valid short-lived extension-session bearer on loopback,
+ * or a valid OAuth opaque access token. When
  * HERDR_MCP_TOKEN is unset the server stays open (previous dev behavior).
  * On rejection, challenges per RFC 9728 §5.1 so ChatGPT/OpenAI can discover
  * OAuth from the 401 alone.
@@ -398,8 +400,9 @@ export function mcpBearerAuth(req: Request, res: Response, next: NextFunction): 
     const m = /^Bearer\s+(.+)$/i.exec(auth);
     const presented = m ? m[1].trim() : "";
     const okStatic = presented !== "" && safeEqual(presented, AUTH_TOKEN);
-    const oauth = presented !== "" && !okStatic ? await resolveAccessToken(presented) : { ok: false };
-    if (!okStatic && !oauth.ok) {
+    const okExtension = presented !== "" && !okStatic && extensionSessionBearerMatches(req);
+    const oauth = presented !== "" && !okStatic && !okExtension ? await resolveAccessToken(presented) : { ok: false };
+    if (!okStatic && !okExtension && !oauth.ok) {
       res.set(
         "WWW-Authenticate",
         `Bearer resource_metadata="${protectedResourceMetadataUrl()}", scope="${SCOPE}"`,

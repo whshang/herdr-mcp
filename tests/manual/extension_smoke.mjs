@@ -51,12 +51,27 @@ for (const r of referenced) {
 }
 ok(manifest.background?.type === "module", "background is a module worker");
 ok(manifest.content_scripts.length === 4, "manifest contains four site content scripts");
+ok(manifest.permissions?.includes("nativeMessaging"), "manifest enables Chrome Native Messaging for automatic local authentication");
+ok(!manifest.key, "unpacked extension keeps its existing Chromium path-derived identity");
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
+const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
+const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 ok(manifest.version === "0.1.48", "manifest version includes unbound conversation automation toggle fix");
 ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.48"'), "background version matches manifest");
 ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.48"'), "content version matches manifest");
+ok(
+  backgroundSource.includes('from "./local-auth.js"')
+    && localAuthSource.includes("sendNativeMessage")
+    && localAuthSource.includes('source: legacy ? "legacy" : "none"')
+    && nativeHostSource.includes("/extension/session")
+    && nativeHostSource.includes("allowed_origins")
+    && nativeHostSource.includes("chromiumIdForPath")
+    && nativeHostSource.includes("EXTENSION_PATH")
+    && nativeHostSource.includes('"Citro Labs", "ego lite", "NativeMessagingHosts"'),
+  "extension uses native short-lived local auth with an explicit legacy-token fallback",
+);
 ok(
   wakeSource.includes(".bar.automation-on")
     && wakeSource.includes(".bar.automation-on .handoff")
@@ -319,7 +334,7 @@ ok(
     && zhLocale.hud_automation_off_hint.includes("同一 Project"),
   "zh Auto-off tooltip explains Project scope and manual availability",
 );
-ok(zhLocale.label_automation_mode === "启用项目自动"
+ok(zhLocale.label_automation_mode === "启用自动化"
     && zhLocale.hint_automation_mode.includes("底部状态条")
     && zhLocale.hint_automation_mode.includes("默认关闭")
     && zhLocale.hint_automation_mode.includes("权限卡")

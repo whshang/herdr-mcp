@@ -39,7 +39,7 @@
 ## 安装与绑定
 
 1. 加载 `extension/`
-2. 选项填 `http://127.0.0.1:8772` 与 `herdr-mcp token`（扩展只连本机，用 `/push/events` 与 `/push/state`，不走 Cloudflare）
+2. 先运行 `bin/herdr-extension-host install`，选项页保持 `http://127.0.0.1:8772`。Chrome Native Messaging 会自动取得短期 localhost bearer；可选兼容令牌只用于旧版 runtime 或 Native Messaging host 未注册的场景。扩展只用本机 `/push/events` 与 `/push/state`，不走 Cloudflare。
    - 这与公网 Worker 的 contract epoch 独立（当前为 epoch 2 / 18 tools）；扩展不读取 ChatGPT `tools/list`。
 3. 打开目标对话（chatgpt / deepseek / z.ai / claude）
 4. popup：**绑定**将要干活的 **workspace**（列表显示 herdr **label**，如 `novo (w5A)`；含仅开终端、无 agent 的窗格；space 内任意 agent 有进展都会回推）
