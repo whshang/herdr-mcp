@@ -67,7 +67,7 @@
   "llm_timeout": "Judge request timed out (60s). Check Base URL / network or proxy, then retry.",
   "label_auto_allow": "Auto-click Allow on in-page permission cards",
   "hint_auto_allow": "In-page Allow cards only. Native browser permission bars cannot be clicked.",
-  "label_enabled": "Enable auto wake",
+  "label_enabled": "Enable wake + LLM nudge",
   "save": "Save",
   "test": "Test connection",
   "saved": "Saved",

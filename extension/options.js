@@ -43,8 +43,6 @@ function applyI18n() {
   $("hint_fallback").textContent = t("hint_fallback");
   $("lab_progress").textContent = t("label_progress_template");
   $("hint_progress").textContent = t("hint_progress_template");
-  $("lab_idle").textContent = t("label_idle_nudge");
-  $("hint_idle").textContent = t("hint_idle_nudge");
   $("title_llm").textContent = t("label_llm_section");
   $("hint_llm_sec").textContent = t("hint_llm_section");
   $("lab_llm_url").textContent = t("label_llm_url");
@@ -78,7 +76,6 @@ async function loadForm() {
   $("progressTickSec").value = cfg.progressTickSec ?? 60;
   $("progressFallbackSec").value = cfg.progressFallbackSec ?? 1200;
   $("progressTemplate").value = cfg.progressTemplate || DEFAULT_PROGRESS_TEMPLATE;
-  $("idleNudgeEnabled").checked = cfg.idleNudgeEnabled !== false;
   $("llmJudgeBaseUrl").value = cfg.llmJudgeBaseUrl || "";
   $("llmJudgeApiKey").value = cfg.llmJudgeApiKey || "";
   $("llmJudgeModel").value = cfg.llmJudgeModel || "";
@@ -105,7 +102,9 @@ $("save").addEventListener("click", () => {
     progressTickSec: parseTickSec($("progressTickSec").value, 60),
     progressFallbackSec: parseTickSec($("progressFallbackSec").value, 1200),
     progressTemplate: $("progressTemplate").value,
-    idleNudgeEnabled: $("idleNudgeEnabled").checked,
+    // One operational switch controls both workspace wake delivery and the
+    // optional post-turn small-model nudge. Keep the legacy field mirrored.
+    idleNudgeEnabled: $("enabled").checked,
     llmJudgeBaseUrl: $("llmJudgeBaseUrl").value.trim(),
     llmJudgeApiKey: $("llmJudgeApiKey").value.trim(),
     llmJudgeModel: $("llmJudgeModel").value.trim(),

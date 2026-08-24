@@ -51,9 +51,6 @@
   <textarea id="progressTemplate">{agent} still running {pane} ({status})</textarea>
   <div class="hint" id="hint_progress">Separate from settled template.</div>
 
-  <label><input type="checkbox" id="idleNudgeEnabled"> <span id="lab_idle">Post-turn LLM nudge</span></label>
-  <div class="hint" id="hint_idle">ChatGPT only (bound). After a reply settles, ask the configured small model whether to continue. Requires Base URL + Key + Model below.</div>
-
   <h2 id="title_llm" style="font-size:15px;margin:28px 0 8px">Post-turn LLM judge</h2>
   <div class="hint" id="hint_llm_sec">OpenAI-compatible chat/completions. Leave URL/key/model empty to disable post-turn nudge. Secrets stay on this machine; do not commit them.</div>
 
@@ -79,7 +76,7 @@
   <label><input type="checkbox" id="autoAllow"> <span id="lab_auto">Auto-click Allow on in-page permission cards</span></label>
   <div class="hint" id="hint_auto">In-page cards only; native browser bars cannot be clicked.</div>
 
-  <label><input type="checkbox" id="enabled"> <span id="lab_enabled">Enable auto wake</span></label>
+  <label><input type="checkbox" id="enabled"> <span id="lab_enabled">Enable wake + LLM nudge</span></label>
 
   <button class="primary" id="save">Save</button>
   <button id="test">Test connection</button>

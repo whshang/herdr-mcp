@@ -54,9 +54,9 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.39", "manifest version includes Project conversation rollover");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.39"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.39"'), "content version matches manifest");
+ok(manifest.version === "0.1.40", "manifest version includes HUD controls");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.40"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.40"'), "content version matches manifest");
 ok(
   backgroundSource.includes("bound_workspace_ids:") && backgroundSource.includes("workspaces: state?.ok"),
   "page HUD response carries live workspaces and bound workspace ids",
@@ -66,12 +66,11 @@ ok(
   "in-page bind resolves the sender tab without popup-only tabId",
 );
 ok(
-  wakeSource.includes("Read-only in-page status bar")
-    && wakeSource.includes("H2W_HUD?.updateReadonlyHud")
-    && !wakeSource.includes('select class="ws"')
-    && !wakeSource.includes("toggleHudWorkspaceBinding")
-    && !wakeSource.includes("ws-action"),
-  "in-page HUD is read-only; workspace controls stay out of page content",
+  wakeSource.includes("Compact in-page HUD + operational drawer")
+    && wakeSource.includes("h2w_bind")
+    && wakeSource.includes("h2w_unbind")
+    && wakeSource.includes("ws-action"),
+  "in-page HUD contains the conversation controls",
 );
 ok(
   !wakeSource.includes('class="handoff-action"')
@@ -79,7 +78,7 @@ ok(
     && wakeSource.includes("h2w_handoff_start")
     && wakeSource.includes("h2w_handoff_seed")
     && wakeSource.includes("h2w_handoff_probe"),
-  "Project rollover remains recoverable without exposing an in-page handoff control",
+  "Project rollover remains recoverable with controls separated from handoff internals",
 );
 ok(
   backgroundSource.includes("herdrConversationTransfers")

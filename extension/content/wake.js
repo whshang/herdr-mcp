@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.39";
+const H2W_CONTENT_VERSION = "0.1.40";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -903,12 +903,180 @@ const H2W_CONTENT_VERSION = "0.1.39";
     } catch (e) {}
   }
 
-  // ---- Read-only in-page status bar (ChatGPT) ----
-  // Operational controls live in the popup. The page HUD only reports state.
+  // ---- Compact in-page HUD + operational drawer (ChatGPT) ----
+  // The always-visible bar stays small. Clicking it opens a layered control
+  // drawer for conversation binding and timing; the toolbar icon opens the
+  // full Options page for advanced transport / model configuration.
   const HUD_ID = "h2w-page-hud";
   let hudPending = false;
   let hudCache = null;
   let hudEls = null;
+  let hudExpanded = false;
+  let hudActionBusy = false;
+
+  function parseHudSec(value, fallback) {
+    if (value === "" || value === undefined || value === null) return fallback;
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    if (n <= 0) return 0;
+    return Math.min(Math.floor(n), 86400);
+  }
+
+  function hudWorkspaceId(workspace) {
+    return String(workspace?.id || workspace?.workspace_id || workspace?.workspace || "").trim();
+  }
+
+  function hudWorkspaceTitle(workspace) {
+    const id = hudWorkspaceId(workspace);
+    const label = String(workspace?.label || workspace?.workspace_label || "").trim();
+    return label ? `${label} (${id})` : id;
+  }
+
+  function setHudExpanded(expanded) {
+    const ui = ensurePageHud();
+    hudExpanded = Boolean(expanded);
+    ui.panel.hidden = !hudExpanded;
+    ui.expand.textContent = hudExpanded ? "⌄" : "⌃";
+    ui.expand.setAttribute("aria-expanded", String(hudExpanded));
+    if (hudExpanded) renderHudWorkspaceBindings();
+  }
+
+  function setHudActionBusy(busy) {
+    hudActionBusy = Boolean(busy);
+    if (!hudEls) return;
+    hudEls.quick.disabled = hudActionBusy;
+    hudEls.master.disabled = hudActionBusy;
+    hudEls.tick.disabled = hudActionBusy;
+    hudEls.fallback.disabled = hudActionBusy;
+  }
+
+  function showHudToast(text, kind = "") {
+    const ui = ensurePageHud();
+    ui.toast.textContent = String(text || "");
+    ui.toast.className = `toast${kind ? ` ${kind}` : ""}`;
+    ui.toast.hidden = !text;
+    if (text) setTimeout(() => {
+      if (ui.toast.textContent === String(text)) ui.toast.hidden = true;
+    }, 3500);
+  }
+
+  async function setHudMasterEnabled(enabled) {
+    if (hudActionBusy) return;
+    setHudActionBusy(true);
+    const on = Boolean(enabled);
+    const result = await sendBg({
+      type: "h2w_set_config",
+      config: { enabled: on, idleNudgeEnabled: on },
+    });
+    if (result?.ok) {
+      hudCache = { ...(hudCache || {}), enabled: on, idleNudgeEnabled: on };
+      paintPageHud({ hud: hudCache });
+      showHudToast(on ? "Wake + nudge enabled" : "Wake + nudge paused", "ok");
+    } else {
+      showHudToast("Could not update wake state", "err");
+    }
+    setHudActionBusy(false);
+  }
+
+  async function saveHudTiming() {
+    if (hudActionBusy) return;
+    const ui = ensurePageHud();
+    const tick = parseHudSec(ui.tick.value, Number(hudCache?.progressTickSec) || 60);
+    const fallback = parseHudSec(ui.fallback.value, Number(hudCache?.progressFallbackSec) || 1200);
+    ui.tick.value = String(tick);
+    ui.fallback.value = String(fallback);
+    setHudActionBusy(true);
+    const result = await sendBg({
+      type: "h2w_set_config",
+      config: { progressTickSec: tick, progressFallbackSec: fallback },
+    });
+    if (result?.ok) {
+      hudCache = { ...(hudCache || {}), progressTickSec: tick, progressFallbackSec: fallback };
+      showHudToast("Timing saved", "ok");
+    } else {
+      showHudToast("Could not save timing", "err");
+    }
+    setHudActionBusy(false);
+  }
+
+  async function mutateHudBinding(workspace, shouldBind) {
+    if (hudActionBusy) return;
+    const id = hudWorkspaceId(workspace);
+    if (!id) return;
+    setHudActionBusy(true);
+    let result;
+    if (shouldBind) {
+      result = await sendBg({
+        type: "h2w_bind",
+        workspace_id: id,
+        workspace_label: hudWorkspaceTitle(workspace),
+        workspace_label_raw: workspace?.label || null,
+        roots: workspace?.roots || [],
+      });
+    } else {
+      result = await sendBg({
+        type: "h2w_unbind",
+        convKey: ADAPTER.getConversationKey(),
+        workspace_id: id,
+      });
+    }
+    if (result?.ok) {
+      showHudToast(shouldBind ? `Bound ${hudWorkspaceTitle(workspace)}` : `Unbound ${hudWorkspaceTitle(workspace)}`, "ok");
+      await refreshPageHud();
+    } else {
+      showHudToast(`Binding failed: ${result?.error || "unknown"}`, "err");
+    }
+    setHudActionBusy(false);
+  }
+
+  function renderHudWorkspaceBindings() {
+    if (!hudEls || !hudExpanded) return;
+    const list = hudEls.workspaces;
+    list.textContent = "";
+    const workspaces = Array.isArray(hudCache?.workspaces) ? [...hudCache.workspaces] : [];
+    const boundIds = new Set(hudCache?.bound_workspace_ids || []);
+    workspaces.sort((a, b) => {
+      const ai = boundIds.has(hudWorkspaceId(a)) ? 0 : 1;
+      const bi = boundIds.has(hudWorkspaceId(b)) ? 0 : 1;
+      return ai - bi || hudWorkspaceTitle(a).localeCompare(hudWorkspaceTitle(b));
+    });
+
+    if (!workspaces.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = hudCache?.workspace_error
+        ? `Workspaces unavailable: ${hudCache.workspace_error}`
+        : "No Herdr workspaces discovered";
+      list.appendChild(empty);
+      return;
+    }
+
+    for (const workspace of workspaces) {
+      const id = hudWorkspaceId(workspace);
+      if (!id) continue;
+      const bound = boundIds.has(id);
+      const row = document.createElement("div");
+      row.className = `ws-row${bound ? " bound" : ""}`;
+      const copy = document.createElement("div");
+      copy.className = "ws-copy";
+      const title = document.createElement("div");
+      title.className = "ws-title";
+      title.textContent = hudWorkspaceTitle(workspace);
+      const meta = document.createElement("div");
+      meta.className = "ws-meta";
+      const roots = Array.isArray(workspace?.roots) ? workspace.roots : [];
+      meta.textContent = roots.length ? String(roots[0]) : (bound ? "Bound to this conversation" : "Available");
+      copy.append(title, meta);
+      const action = document.createElement("button");
+      action.type = "button";
+      action.className = `ws-action${bound ? " danger" : ""}`;
+      action.textContent = bound ? "Unbind" : "Bind";
+      action.disabled = hudActionBusy;
+      action.addEventListener("click", () => { void mutateHudBinding(workspace, !bound); });
+      row.append(copy, action);
+      list.appendChild(row);
+    }
+  }
 
   function ensurePageHud() {
     if (hudEls?.host?.isConnected) return hudEls;
@@ -924,25 +1092,141 @@ const H2W_CONTENT_VERSION = "0.1.39";
         :host { all: initial; }
         .bar {
           position: fixed; left: 0; right: 0; bottom: 0; z-index: 2147483646;
-          min-height: 28px; padding: 4px 12px; box-sizing: border-box;
-          display: flex; align-items: center;
+          height: 30px; padding: 3px 8px 3px 12px; box-sizing: border-box;
+          display: flex; align-items: center; gap: 6px;
           font: 12px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif;
-          color: #4d4d4d; background: #ffffff;
+          color: #4d4d4d; background: rgba(255,255,255,.96);
           border-top: 1px solid #eaeaea;
-          pointer-events: none; user-select: none;
+          box-shadow: 0 -1px 8px rgba(0,0,0,.04);
+          pointer-events: auto; user-select: none;
+          backdrop-filter: blur(10px);
         }
-        .status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        button, input { font: inherit; }
+        button { color: inherit; }
+        .summary {
+          min-width: 0; flex: 1; height: 24px; padding: 0; border: 0; background: transparent;
+          display: flex; align-items: center; gap: 7px; cursor: pointer; text-align: left;
+        }
+        .status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+        .workspace { color: #8a8a8a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+        .quick, .expand {
+          height: 22px; border: 1px solid #dedede; background: #fafafa; border-radius: 7px;
+          cursor: pointer; padding: 0 7px; font-size: 11px; white-space: nowrap;
+        }
+        .quick.on { color: #166534; background: #f0fdf4; border-color: #bbf7d0; }
+        .quick.off { color: #6b7280; background: #f5f5f5; }
+        .expand { width: 24px; padding: 0; font-size: 13px; }
+        button:hover { filter: brightness(.97); }
+        button:disabled, input:disabled { opacity: .55; cursor: wait; }
         .bar.waiting .status { color: #8a4b00; }
         .bar.recovering .status { color: #9a3412; }
         .bar.failed .status { color: #b42318; }
+        .panel {
+          position: fixed; right: 8px; bottom: 36px; z-index: 2147483647;
+          width: min(368px, calc(100vw - 16px)); max-height: min(62vh, 560px); overflow: auto;
+          box-sizing: border-box; padding: 0;
+          color: #252525; background: rgba(255,255,255,.985); border: 1px solid #dedede;
+          border-radius: 12px; box-shadow: 0 14px 42px rgba(0,0,0,.18);
+          font: 12px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif;
+          pointer-events: auto; user-select: none; backdrop-filter: blur(14px);
+        }
+        .panel[hidden] { display: none !important; }
+        .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 11px 8px; }
+        .panel-title { font-size: 13px; font-weight: 700; }
+        .conversation { margin-top: 1px; max-width: 260px; color: #909090; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .options { border: 0; background: transparent; color: #6b7280; cursor: pointer; font-size: 11px; padding: 3px 5px; }
+        .section { border-top: 1px solid #efefef; padding: 9px 11px; }
+        .control-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+        .control-title { font-weight: 650; }
+        .control-hint { color: #999; font-size: 10px; margin-top: 1px; }
+        .master {
+          min-width: 52px; height: 24px; border: 1px solid #ddd; border-radius: 999px;
+          background: #f5f5f5; cursor: pointer; padding: 0 8px; font-weight: 650; font-size: 10px;
+        }
+        .master.on { color: #166534; background: #ecfdf3; border-color: #bbf7d0; }
+        .timing { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 9px; }
+        .timing label { display: grid; gap: 3px; color: #777; font-size: 10px; }
+        .timing input { width: 100%; box-sizing: border-box; height: 27px; border: 1px solid #ddd; border-radius: 7px; padding: 2px 7px; color: #333; background: #fff; }
+        .section-title { font-size: 10px; color: #858585; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 5px; }
+        .workspaces { display: grid; gap: 3px; }
+        .ws-row { display: flex; align-items: center; gap: 8px; padding: 6px 7px; border-radius: 8px; }
+        .ws-row:hover { background: #f7f7f7; }
+        .ws-row.bound { background: #f4fbf6; }
+        .ws-copy { flex: 1; min-width: 0; }
+        .ws-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ws-meta { margin-top: 1px; color: #9b9b9b; font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ws-action { border: 1px solid #d5d5d5; background: #fff; border-radius: 7px; padding: 3px 7px; cursor: pointer; font-size: 10px; }
+        .ws-action.danger { color: #b42318; }
+        .empty { color: #999; padding: 7px 3px; }
+        .toast { margin: 0 11px 9px; padding: 6px 8px; border-radius: 7px; background: #f5f5f5; color: #555; font-size: 10px; }
+        .toast.ok { background: #f0fdf4; color: #166534; }
+        .toast.err { background: #fef2f2; color: #b42318; }
+        @media (prefers-color-scheme: dark) {
+          .bar { color: #ddd; background: rgba(32,32,32,.96); border-color: #3a3a3a; }
+          .workspace { color: #8d8d8d; }
+          .quick, .expand { background: #292929; border-color: #454545; }
+          .quick.on { color: #86efac; background: #143020; border-color: #245c36; }
+          .panel { color: #e8e8e8; background: rgba(32,32,32,.985); border-color: #494949; }
+          .section { border-color: #414141; }
+          .timing input { color: #eee; background: #282828; border-color: #4a4a4a; }
+          .master { background: #292929; border-color: #454545; }
+          .master.on { color: #86efac; background: #143020; border-color: #245c36; }
+          .ws-row:hover { background: #292929; }
+          .ws-row.bound { background: #173020; }
+          .ws-action { color: #ddd; background: #272727; border-color: #4a4a4a; }
+        }
       </style>
-      <div class="bar" part="bar"><span class="status"></span></div>
+      <div class="panel" part="panel" hidden>
+        <div class="panel-head">
+          <div><div class="panel-title">Herdr controls</div><div class="conversation"></div></div>
+          <button type="button" class="options">Advanced options ↗</button>
+        </div>
+        <div class="section">
+          <div class="control-row">
+            <div><div class="control-title">Wake + small-model nudge</div><div class="control-hint">One switch controls both behaviors</div></div>
+            <button type="button" class="master">On</button>
+          </div>
+          <div class="timing">
+            <label>Interval (sec)<input class="tick" type="number" min="0" step="1"></label>
+            <label>Fallback (sec)<input class="fallback" type="number" min="0" step="1"></label>
+          </div>
+        </div>
+        <div class="section"><div class="section-title">Conversation bindings</div><div class="workspaces"></div></div>
+        <div class="toast" hidden></div>
+      </div>
+      <div class="bar" part="bar">
+        <button type="button" class="summary"><span class="status"></span><span class="workspace"></span></button>
+        <button type="button" class="quick" aria-label="Toggle Herdr wake and nudge">Wake on</button>
+        <button type="button" class="expand" aria-label="Open Herdr controls" aria-expanded="false">⌃</button>
+      </div>
     `;
     hudEls = {
       host,
       bar: shadow.querySelector(".bar"),
       status: shadow.querySelector(".status"),
+      workspace: shadow.querySelector(".workspace"),
+      summary: shadow.querySelector(".summary"),
+      quick: shadow.querySelector(".quick"),
+      expand: shadow.querySelector(".expand"),
+      panel: shadow.querySelector(".panel"),
+      conversation: shadow.querySelector(".conversation"),
+      options: shadow.querySelector(".options"),
+      master: shadow.querySelector(".master"),
+      tick: shadow.querySelector(".tick"),
+      fallback: shadow.querySelector(".fallback"),
+      workspaces: shadow.querySelector(".workspaces"),
+      toast: shadow.querySelector(".toast"),
     };
+    hudEls.summary.addEventListener("click", () => setHudExpanded(!hudExpanded));
+    hudEls.expand.addEventListener("click", () => setHudExpanded(!hudExpanded));
+    hudEls.quick.addEventListener("click", () => { void setHudMasterEnabled(!(hudCache?.enabled !== false)); });
+    hudEls.master.addEventListener("click", () => { void setHudMasterEnabled(!(hudCache?.enabled !== false)); });
+    hudEls.tick.addEventListener("change", () => { void saveHudTiming(); });
+    hudEls.fallback.addEventListener("change", () => { void saveHudTiming(); });
+    hudEls.options.addEventListener("click", () => { void sendBg({ type: "h2w_open_options" }); });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && hudExpanded) setHudExpanded(false);
+    });
     return hudEls;
   }
 
@@ -1000,8 +1284,28 @@ const H2W_CONTENT_VERSION = "0.1.39";
     } else {
       ui.status.textContent = `Herdr ● ${state}`;
     }
+    const enabled = hud?.enabled !== false;
+    ui.workspace.textContent = hud?.workspace_label || (hud?.bound ? `${hud.binding_count || 1} bound` : "not bound");
+    ui.quick.textContent = enabled ? "Wake on" : "Wake off";
+    ui.quick.className = `quick ${enabled ? "on" : "off"}`;
+    ui.quick.setAttribute("aria-pressed", String(enabled));
+    ui.master.textContent = enabled ? "On" : "Off";
+    ui.master.className = `master ${enabled ? "on" : "off"}`;
+    ui.master.setAttribute("aria-pressed", String(enabled));
+    ui.conversation.textContent = ADAPTER.getConversationKey();
+    if (document.activeElement !== ui.tick && shadowActiveElement(ui.host) !== ui.tick) {
+      ui.tick.value = String(hud?.progressTickSec ?? 60);
+    }
+    if (document.activeElement !== ui.fallback && shadowActiveElement(ui.host) !== ui.fallback) {
+      ui.fallback.value = String(hud?.progressFallbackSec ?? 1200);
+    }
+    renderHudWorkspaceBindings();
     const visual = hudVisualClass(state);
     ui.bar.className = `bar${visual ? ` ${visual}` : ""}`;
+  }
+
+  function shadowActiveElement(host) {
+    try { return host?.shadowRoot?.activeElement || null; } catch (_) { return null; }
   }
 
   async function refreshPageHud() {

@@ -4,7 +4,7 @@
 //  2. Maintain one reconnecting SSE stream per workspace binding.
 //  3. Turn workspace agent events into partial-progress or round-complete wake-ups.
 //  4. Insert text in the MAIN world for contenteditable sites.
-//  5. Handle popup and options messages for listing, binding, unbinding, and status.
+//  5. Handle in-page HUD and options messages for listing, binding, unbinding, and status.
 // Version synchronization: extension reloads do not reinject content scripts into
 // open tabs. Scan target tabs after a version change and reload stale scripts.
 // Keep H2W_SCRIPT_VERSION here aligned with H2W_CONTENT_VERSION in wake.js.
@@ -23,7 +23,7 @@ import {
   newContinuityId, newTransferId,
 } from "./continuity-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.39";
+const H2W_SCRIPT_VERSION = "0.1.40";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const PUSH_CONNECT_MS = 5000;
 const STATE_FETCH_MS = 4000;
@@ -79,6 +79,13 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   if (Number(CFG.progressFallbackSec) === 600) {
     CFG.progressFallbackSec = 1200;
     patch.progressFallbackSec = 1200;
+  }
+  // 0.1.40: wake delivery and the post-turn small-model nudge share one
+  // operational switch. Keep the legacy field mirrored for stored-config and
+  // older content-script compatibility, but `enabled` is authoritative.
+  if (CFG.idleNudgeEnabled !== CFG.enabled) {
+    CFG.idleNudgeEnabled = CFG.enabled;
+    patch.idleNudgeEnabled = CFG.enabled;
   }
   if (Object.keys(patch).length) {
     try {
@@ -744,7 +751,7 @@ function scheduleIdleNudgeRetry(convKey, delayMs) {
 }
 
 async function retryIdleNudge(convKey) {
-  if (!CFG.enabled || CFG.idleNudgeEnabled === false) return;
+  if (!CFG.enabled) return;
   const cooldownSec = paceIntervalSec();
   if (cooldownSec <= 0) return;
   const bindings = await loadBindings();
@@ -781,7 +788,7 @@ async function retryIdleNudge(convKey) {
 
 /** Post-turn nudge: LLM judge only (no zero-tools / mid-stop heuristics). */
 async function maybeIdleNudge(msg) {
-  if (!CFG.enabled || CFG.idleNudgeEnabled === false) {
+  if (!CFG.enabled) {
     return rememberIdleNudge(msg.convKey || "", { nudged: false, reason: "disabled" });
   }
   const cooldownSec = paceIntervalSec();
@@ -1593,6 +1600,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ...CFG, scriptVersion: H2W_SCRIPT_VERSION });
     return;
   }
+  if (msg?.type === "h2w_open_options") {
+    void chrome.runtime.openOptionsPage()
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: String(e) }));
+    return true;
+  }
   if (msg?.type === "h2w_page_hud") {
     void (async () => {
       const convKey = String(msg.convKey || "").trim();
@@ -1619,8 +1632,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ok: true,
         version: H2W_SCRIPT_VERSION,
         enabled: CFG.enabled !== false,
-        idleNudgeEnabled: CFG.idleNudgeEnabled !== false,
+        idleNudgeEnabled: CFG.enabled !== false,
         progressTickSec: paceIntervalSec() || Number(CFG.progressTickSec) || 0,
+        progressFallbackSec: Number(CFG.progressFallbackSec) || 0,
         llmConfigured: isLlmJudgeConfigured(CFG),
         llmModel: String(CFG.llmJudgeModel || "").trim(),
         llmHost,
@@ -1655,6 +1669,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_set_config") {
     const incoming = { ...(msg.config || {}) };
     delete incoming.idleNudgeCooldownSec;
+    if (Object.prototype.hasOwnProperty.call(incoming, "idleNudgeEnabled")
+      && !Object.prototype.hasOwnProperty.call(incoming, "enabled")) {
+      incoming.enabled = incoming.idleNudgeEnabled !== false;
+    }
+    if (Object.prototype.hasOwnProperty.call(incoming, "enabled")) {
+      incoming.enabled = incoming.enabled !== false;
+      incoming.idleNudgeEnabled = incoming.enabled;
+    }
     CFG = { ...CFG, ...incoming };
     delete CFG.idleNudgeCooldownSec;
     chrome.storage.local.set(CFG).then(async () => {
@@ -1737,7 +1759,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           tokenSet: !!CFG.token,
           progressTickSec: CFG.progressTickSec,
           progressFallbackSec: CFG.progressFallbackSec,
-          idleNudgeEnabled: CFG.idleNudgeEnabled !== false,
+          idleNudgeEnabled: CFG.enabled !== false,
           llmJudgeConfigured: isLlmJudgeConfigured(CFG),
         },
       });
@@ -1941,6 +1963,11 @@ chrome.runtime.onInstalled.addListener(() => {
     if (!cfg.herdrMcpUrl) chrome.storage.local.set({ herdrMcpUrl: "http://127.0.0.1:8772", token: "", enabled: true, autoAllow: true, wakeTemplate: DEFAULT_TEMPLATE, progressTickSec: 60, progressFallbackSec: 1200, progressTemplate: DEFAULT_PROGRESS_TEMPLATE, idleNudgeEnabled: true });
   });
 });
+try {
+  chrome.action.onClicked.addListener(() => { void chrome.runtime.openOptionsPage(); });
+} catch (e) {
+  callLog("action click unavailable:", e.message);
+}
 void rebuildStreams();
 
 // Wake the service worker each minute to restore missing SSE streams and timers.

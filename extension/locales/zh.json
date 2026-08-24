@@ -67,7 +67,7 @@
   "llm_timeout": "判定请求超时（60s）。检查 Base URL / 网络或代理后重试。",
   "label_auto_allow": "唤醒后自动点「允许」权限弹窗",
   "hint_auto_allow": "页面内权限弹窗 (允许/同意/Allow) 自动点击; 浏览器原生权限条无法自动点。",
-  "label_enabled": "启用自动唤醒",
+  "label_enabled": "启用唤醒 + 小模型催促",
   "save": "保存",
   "test": "测试连接",
   "saved": "已保存",
