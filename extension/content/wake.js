@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.51";
+const H2W_CONTENT_VERSION = "0.1.52";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -1396,30 +1396,35 @@ const H2W_CONTENT_VERSION = "0.1.51";
     const conversationMode = hudCache?.conversation_automation_available === true;
     if (!projectMode && !conversationMode) return;
     setHudActionBusy(true);
-    const on = Boolean(enabled);
-    const result = await sendBg({
-      type: "h2w_set_project_automation",
-      project_id: projectMode ? hudCache.project_id : null,
-      site: ADAPTER.name,
-      convKey: ADAPTER.getConversationKey(),
-      enabled: on,
-    });
-    if (result?.ok) {
-      automationEnabled = on;
-      hudCache = {
-        ...(hudCache || {}),
+    try {
+      const on = Boolean(enabled);
+      const result = await sendBg({
+        type: "h2w_set_project_automation",
+        project_id: projectMode ? hudCache.project_id : null,
+        site: ADAPTER.name,
+        convKey: ADAPTER.getConversationKey(),
         enabled: on,
-        idleNudgeEnabled: on,
-        project_automation_enabled: projectMode ? on : hudCache?.project_automation_enabled,
-        conversation_automation_enabled: conversationMode ? on : hudCache?.conversation_automation_enabled,
-      };
-      syncAutomationPermissionWatch();
-      paintPageHud({ hud: hudCache });
-      showHudToast(on ? hudText("automation_enabled") : hudText("automation_disabled"), "ok");
-    } else {
+      });
+      if (result?.ok) {
+        automationEnabled = on;
+        hudCache = {
+          ...(hudCache || {}),
+          enabled: on,
+          idleNudgeEnabled: on,
+          project_automation_enabled: projectMode ? on : hudCache?.project_automation_enabled,
+          conversation_automation_enabled: conversationMode ? on : hudCache?.conversation_automation_enabled,
+        };
+        syncAutomationPermissionWatch();
+        paintPageHud({ hud: hudCache });
+        showHudToast(on ? hudText("automation_enabled") : hudText("automation_disabled"), "ok");
+      } else {
+        showHudToast(hudText("automation_update_failed"), "err");
+      }
+    } catch (_) {
       showHudToast(hudText("automation_update_failed"), "err");
+    } finally {
+      setHudActionBusy(false);
     }
-    setHudActionBusy(false);
   }
 
   async function saveHudTiming() {

@@ -26,7 +26,7 @@ import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 
-const H2W_SCRIPT_VERSION = "0.1.51";
+const H2W_SCRIPT_VERSION = "0.1.52";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -2427,8 +2427,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await chrome.storage.local.set({ ...CFG, enabled: false, idleNudgeEnabled: false });
       try { await chrome.storage.local.remove(["idleNudgeCooldownSec", "autoAllow", "token"]); } catch (e) {}
       void rebuildStreams();
-      await notifyAutomationChanged();
       sendResponse({ ok: true });
+      // The initiating Options/content-script request must not wait for every
+      // matching tab to acknowledge the broadcast. A stale or suspended tab
+      // can otherwise leave the caller disabled indefinitely even though the
+      // preference was already persisted successfully.
+      void notifyAutomationChanged();
     })();
     return true;
   }
@@ -2445,8 +2449,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (msg.enabled === true) CONVERSATION_AUTOMATION[convKey] = true;
         else delete CONVERSATION_AUTOMATION[convKey];
         await chrome.storage.local.set({ [CONVERSATION_AUTOMATION_STORAGE_KEY]: CONVERSATION_AUTOMATION });
-        await notifyAutomationChanged();
         sendResponse({ ok: true, ...automationScopeForConversation(convKey) });
+        void notifyAutomationChanged();
         return;
       }
       if (!/^g-p-[0-9a-f]{32}$/i.test(projectId)) {
@@ -2465,8 +2469,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       for (const convKey of [...idleNudgeRetryTimers.keys()]) {
         if (!automationScopeForConversation(convKey).enabled) clearIdleNudgeRetry(convKey);
       }
-      await notifyAutomationChanged();
       sendResponse({ ok: true, ...automationScopeForConversation(msg.convKey || msg.url || "") });
+      void notifyAutomationChanged();
     })();
     return true;
   }

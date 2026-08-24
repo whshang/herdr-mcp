@@ -44,6 +44,7 @@ let targetSeeded = false;
 let zaiTargetSeeded = false;
 let handoffPrompt = "";
 let mockStateWorkspaces = [];
+let hangAutomationNotifications = false;
 
 const nativeFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
@@ -227,6 +228,9 @@ globalThis.chrome = {
       return [...tabs.values()].filter((t) => t.url.startsWith(glob)).map((t) => ({ id: t.id, url: t.url }));
     },
     async sendMessage(tabId, msg) {
+      if (hangAutomationNotifications && msg?.type === "h2w_automation_changed") {
+        return new Promise(() => {});
+      }
       const t = tabs.get(tabId);
       if (!t?.listener) throw new Error(`no content script in tab ${tabId}`);
       sentMessages.push({ tabId, msg });
@@ -485,6 +489,37 @@ console.log("\n[json bridge automation]");
     "global Project-manual mode does not disable z.ai conversation automation", JSON.stringify(manualHud));
   ok(storage.herdrConversationAutomation?.[ZAI_CONV] === true,
     "z.ai conversation automation remains independently persisted");
+
+  hangAutomationNotifications = true;
+  let resolveNonblockingAuto;
+  const nonblockingAutoP = new Promise((r) => { resolveNonblockingAuto = r; });
+  onMsg({
+    type: "h2w_set_project_automation",
+    project_id: null,
+    site: "z.ai",
+    convKey: ZAI_CONV,
+    enabled: false,
+  }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveNonblockingAuto(r));
+  const nonblockingAuto = await Promise.race([
+    nonblockingAutoP,
+    new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), 100)),
+  ]);
+  ok(nonblockingAuto?.ok === true
+      && nonblockingAuto?.conversation_automation_enabled === false
+      && storage.herdrConversationAutomation?.[ZAI_CONV] !== true,
+    "conversation Auto responds after persistence without waiting for stale-tab broadcasts", JSON.stringify(nonblockingAuto));
+  hangAutomationNotifications = false;
+
+  let resolveRestoreConversationAuto;
+  const restoreConversationAutoP = new Promise((r) => { resolveRestoreConversationAuto = r; });
+  onMsg({
+    type: "h2w_set_project_automation",
+    project_id: null,
+    site: "z.ai",
+    convKey: ZAI_CONV,
+    enabled: true,
+  }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveRestoreConversationAuto(r));
+  await restoreConversationAutoP;
 
   let resolveProjectMode;
   const projectModeP = new Promise((r) => { resolveProjectMode = r; });
