@@ -1782,15 +1782,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const tabId = msg.tabId || sender.tab?.id;
       if (!tabId) { sendResponse({ ok: false, error: "tab-unavailable" }); return; }
       const convInfo = await conversationInfoForTab(tabId);
-      if (!convInfo?.convKey) { sendResponse({ ok: false, error: "conversation-unavailable" }); return; }
+      const requestedConvKey = String(msg.convKey || "").trim();
+      if (!convInfo?.convKey && !requestedConvKey) { sendResponse({ ok: false, error: "conversation-unavailable" }); return; }
+      const effectiveConvKey = convInfo?.convKey || requestedConvKey;
       const workspace_id = msg.workspace_id
         || (typeof msg.pane === "string" && msg.pane.includes(":") ? msg.pane.split(":")[0] : null);
       if (!workspace_id) { sendResponse({ ok: false, error: "workspace_required" }); return; }
-      const storeKey = bindingStoreKey(convInfo.convKey, workspace_id);
+      const storeKey = bindingStoreKey(effectiveConvKey, workspace_id);
       if (bindings[storeKey]) { sendResponse({ ok: false, error: "already-bound", convKey: convInfo.convKey, workspace_id }); return; }
       const workspace_label = msg.workspace_label
         || workspaceTitleWithId({ id: workspace_id, label: msg.workspace_label_raw, roots: msg.roots });
-      const continuity_id = bindingsForConv(bindings, convInfo.convKey).map((x) => x.continuity_id).find(Boolean)
+      const continuity_id = bindingsForConv(bindings, effectiveConvKey).map((x) => x.continuity_id).find(Boolean)
         || newContinuityId();
       const b = {
         workspace_id,
@@ -1799,8 +1801,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         focus_agent: msg.agent || null,
         agent: null, // The binding targets a workspace, not an individual agent.
         workingPanes: {},
-        convKey: convInfo.convKey,
-        site: convInfo.site || "unknown",
+        convKey: effectiveConvKey,
+        site: convInfo?.site || "unknown",
         tabId, tabUrl: convInfo.url || null,
         created_at: Date.now(),
         last_seen_at: Date.now(),

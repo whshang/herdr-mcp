@@ -1024,6 +1024,7 @@ const H2W_CONTENT_VERSION = "0.1.41";
     if (shouldBind) {
       result = await sendBg({
         type: "h2w_bind",
+        convKey: ADAPTER.getConversationKey(),
         workspace_id: id,
         workspace_label: hudWorkspaceTitle(workspace),
         workspace_label_raw: workspace?.label || null,
@@ -1095,7 +1096,11 @@ const H2W_CONTENT_VERSION = "0.1.41";
       action.className = `ws-action${bound ? " danger" : ""}`;
       action.textContent = bound ? "Unbind" : "Bind";
       action.disabled = hudActionBusy;
-      action.addEventListener("click", () => { void mutateHudBinding(workspace, !bound); });
+      action.addEventListener("pointerdown", (event) => event.stopPropagation());
+      action.addEventListener("click", (event) => {
+        event.stopPropagation();
+        void mutateHudBinding(workspace, !bound);
+      });
       row.append(copy, action);
       list.appendChild(row);
     }
@@ -1243,8 +1248,14 @@ const H2W_CONTENT_VERSION = "0.1.41";
       workspaces: shadow.querySelector(".workspaces"),
       toast: shadow.querySelector(".toast"),
     };
-    hudEls.summary.addEventListener("click", () => setHudExpanded(!hudExpanded));
-    hudEls.expand.addEventListener("click", () => setHudExpanded(!hudExpanded));
+    hudEls.summary.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setHudExpanded(!hudExpanded);
+    });
+    hudEls.expand.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setHudExpanded(!hudExpanded);
+    });
     hudEls.quick.addEventListener("click", () => { void setHudMasterEnabled(!(hudCache?.enabled !== false)); });
     hudEls.master.addEventListener("click", () => { void setHudMasterEnabled(!(hudCache?.enabled !== false)); });
     hudEls.tick.addEventListener("change", () => { void saveHudTiming(); });
