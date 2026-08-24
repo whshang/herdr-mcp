@@ -25,7 +25,7 @@ import {
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 
-const H2W_SCRIPT_VERSION = "0.1.47";
+const H2W_SCRIPT_VERSION = "0.1.48";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -228,8 +228,6 @@ function validateJsonBridgeSender(msg, sender) {
 async function authorizeConversationAutomation(msg, sender) {
   const access = validateJsonBridgeSender(msg, sender);
   if (!access.ok) return access;
-  const bindings = await loadBindings();
-  if (!bindingsForConv(bindings, access.convKey).length) return { ok: false, error: "conversation-unbound" };
   return access;
 }
 

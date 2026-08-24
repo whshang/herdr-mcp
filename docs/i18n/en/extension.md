@@ -5,7 +5,7 @@ Language: product UI is en / Simplified Chinese / Japanese (same as herdr); this
 
 | Track | Problem | Direction | Status | First sites |
 |---|---|---|---|---|
-| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + automation gates + safe handoff | **usable** (0.1.47 series) | binding/observation: 4 sites; full automation: ChatGPT Project; conversation progress automation: z.ai / DeepSeek; Manual handoff: ChatGPT Project + z.ai `/c/<chat_id>` |
+| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + automation gates + safe handoff | **usable** (0.1.48 series) | binding/observation: 4 sites; full automation: ChatGPT Project; conversation progress automation: z.ai / DeepSeek; Manual handoff: ChatGPT Project + z.ai `/c/<chat_id>` |
 | **B. JSON→MCP** | DeepSeek / z.ai web has no MCP Connector | web → extension service worker → local `127.0.0.1:8772/mcp` | **usable** (bounded `tools/list` / `tools/call` loop) | `chat.deepseek.com`, `chat.z.ai` |
 
 Shared: same extension, same static token, same options.  
@@ -62,7 +62,7 @@ This track does not make the extension think on behalf of the web model. It solv
 
 ### Global run mode and Project HUD automation
 
-Options owns the global policy. **Manual globally** disables automatic mutations everywhere and hides the automation switch; observation, bindings and supported manual controls remain. **Per-Project automation** permits supported scopes to expose automation without enabling any of them by default: ChatGPT Projects store the switch by `project_id`; z.ai / DeepSeek store it per conversation.
+Options owns the global policy. **Manual globally** disables automatic mutations everywhere and hides the automation switch; observation, bindings and supported manual controls remain. **Per-Project automation** permits supported scopes to expose automation without enabling any of them by default: ChatGPT Projects store the switch by `project_id`; z.ai / DeepSeek store it per conversation. Since 0.1.48, z.ai / DeepSeek can save that conversation preference before a workspace is bound; workspace-dependent progress/settled push-back starts after binding exists.
 
 In Per-Project mode, supported sites keep frequent actions on the bottom HUD: **Manual continue / Herdr monitor / LLM analysis / Manual handoff (when supported) / Automation on-off / expand**. Global manual mode hides the automation switch. ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations can show Manual handoff; the z.ai `/` launcher and DeepSeek do not. The drawer only contains low-frequency settings: event timing, conversation bindings, and advanced options.
 

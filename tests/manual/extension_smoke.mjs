@@ -54,9 +54,9 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.47", "manifest version includes JSON bridge + cross-site HUD automation");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.47"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.47"'), "content version matches manifest");
+ok(manifest.version === "0.1.48", "manifest version includes unbound conversation automation toggle fix");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.48"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.48"'), "content version matches manifest");
 ok(
   wakeSource.includes(".bar.automation-on")
     && wakeSource.includes(".bar.automation-on .handoff")

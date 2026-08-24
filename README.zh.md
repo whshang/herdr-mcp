@@ -252,7 +252,7 @@ OAuth / skill / 状态目录等见 [docs/i18n/zh-CN/architecture.md](docs/i18n/z
 
 两件工作（见 [docs/i18n/zh-CN/extension.md](docs/i18n/zh-CN/extension.md)）共享本地 token，**完成度不对等**：
 
-1. **网页连续工作自动化（已可用）**：Options 选择“全局手动 / 项目自动”；底部 HUD 提供「手动继续 / herdr监控 / LLM 分析 / 手动接力」，允许自动化时另有 `自动 开/关`。ChatGPT 按 `project_id` 保存自动设置；z.ai / DeepSeek 按具体会话保存。0.1.47 起，`自动 开` 会锁定全部 HUD 手动操作（包括“手动接力”）；已绑定且已落成 `/c/<chat_id>` 的 z.ai 会话也支持 fail-closed 手动接力。z.ai 新聊天根页 `/` 的 binding/自动偏好会在首次落成 `/c/<chat_id>` 后迁移过去，但切换历史聊天不会跟随迁移。
+1. **网页连续工作自动化（已可用）**：Options 选择“全局手动 / 项目自动”；底部 HUD 提供「手动继续 / herdr监控 / LLM 分析 / 手动接力」，允许自动化时另有 `自动 开/关`。ChatGPT 按 `project_id` 保存自动设置；z.ai / DeepSeek 按具体会话保存。0.1.47 起，`自动 开` 会锁定全部 HUD 手动操作（包括“手动接力”）；0.1.48 起 z.ai / DeepSeek 即使尚未绑定 workspace 也可以先保存会话自动开关，Herdr 进度/settled 自动回推在绑定后自然生效。已绑定且已落成 `/c/<chat_id>` 的 z.ai 会话也支持 fail-closed 手动接力。z.ai 新聊天根页 `/` 的 binding/自动偏好会在首次落成 `/c/<chat_id>` 后迁移过去，但切换历史聊天不会跟随迁移。
 2. **JSON→MCP（已可用）**：DeepSeek / z.ai 的本地 JSON bridge 会从网页任务中驱动 `127.0.0.1:8772/mcp` 的 `tools/list` / `tools/call`，在受限轮次内回填工具结果；静态 Herdr token 只留在扩展 service worker，不暴露给页面脚本。路线与安全边界见 [docs/i18n/zh-CN/extension-bridge.md](docs/i18n/zh-CN/extension-bridge.md)。
 
 共享本地 `127.0.0.1:8772` 与静态 token。这不是给 DeepSeek「安装」ChatGPT 式 OAuth connector。默认：进度检查间隔 **60 秒**，摘要不变时兜底 **20 分钟**（`progressTickSec` / `progressFallbackSec`）。

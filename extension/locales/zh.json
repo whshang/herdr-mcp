@@ -134,7 +134,7 @@
   "hud_automation_on_hint": "当前 ChatGPT Project 自动化已开启。同一 Project 的其他对话与接力后的新对话共享此设置：自动回推 Herdr 进度、settled 后继续、回合结束 LLM 判断、回复超时恢复，以及上下文压力或恢复失败时的自动接力，并处理页内权限卡。自动开启期间所有手动推进操作（包括“手动接力”）都会锁定。",
   "hud_automation_off_hint": "当前 ChatGPT Project 自动化已关闭。手动继续、herdr监控、LLM 分析仍可用；已绑定的 Project 还可使用“手动接力”主动总结当前对话并开启新对话。Herdr/workspace 状态与会话绑定继续观察，该设置对同一 Project 的所有对话生效。",
   "hud_conversation_automation_on_hint": "当前会话自动化已开启。已绑定工作区的 Herdr 进度与 settled 事件会自动回推到这个 z.ai / DeepSeek 会话；设置只对当前会话生效。自动开启期间 HUD 手动操作全部锁定。ChatGPT 专属的回复恢复、回合结束 LLM 判断和自动接力不会在这里启用。",
-  "hud_conversation_automation_off_hint": "当前会话自动化已关闭。Herdr 进度与 settled 事件不会自动回推到这个 z.ai / DeepSeek 会话；手动继续、herdr监控、LLM 分析等 HUD 手动操作可用，已绑定且已落成 /c/<chat_id> 的 z.ai 会话还会显示“手动接力”。开启会话自动化前需要先绑定工作区。",
+  "hud_conversation_automation_off_hint": "当前会话自动化已关闭。即使还没有绑定工作区，也可以先打开自动化并立即保存这个会话偏好；Herdr 进度与 settled 自动回推会在工作区绑定后生效。手动继续、herdr监控、LLM 分析等 HUD 手动操作可用，已绑定且已落成 /c/<chat_id> 的 z.ai 会话还会显示“手动接力”。",
   "hud_on": "开",
   "hud_off": "关",
   "hud_interval": "间隔（秒）",

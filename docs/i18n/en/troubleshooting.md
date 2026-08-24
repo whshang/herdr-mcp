@@ -17,7 +17,7 @@ Verify the extension is loaded, **per-Project automation** is enabled in Options
 
 ## The HUD is bound to w68 but the bottom bar shows another project name
 
-Treat `workspace_id` as identity; the label is display cache only. The current extension prefers the live `/push/events` / `/push/state` workspace catalog over a stale binding label and repairs the persisted binding automatically. If the drawer already shows the correct `herdr-mcp (w68)` while the bar still shows an older project name, make sure the current 0.1.47 extension is loaded and refresh the page; do not unbind/rebind merely to repair a label for the same workspace id.
+Treat `workspace_id` as identity; the label is display cache only. The current extension prefers the live `/push/events` / `/push/state` workspace catalog over a stale binding label and repairs the persisted binding automatically. If the drawer already shows the correct `herdr-mcp (w68)` while the bar still shows an older project name, make sure the current 0.1.48 extension is loaded and refresh the page; do not unbind/rebind merely to repair a label for the same workspace id.
 
 ## ChatGPT replies halfway and then the page appears frozen or stale
 
@@ -29,9 +29,13 @@ After reload, newer content or resumed streaming ends recovery. If the identical
 
 Version 0.1.47 exposes **Manual handoff** for bound ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations. z.ai `/`, plain ChatGPT `/c/<id>`, Claude, and DeepSeek do not show it. Turn `Auto off` first: with automation on the HUD locks the button and background independently rejects `automation_enabled`. If a bound workspace still has an agent `working`, the background also rejects the handoff because binding cutover must not race settled/wake delivery.
 
-If z.ai is already on `/c/<chat_id>` but the HUD still looks like the root launcher, verify that 0.1.47 is loaded and refresh once. A temporary binding/automation preference created on z.ai `/` migrates once when the same tab first becomes `/c/<chat_id>`; later navigation between existing `/c/A` and `/c/B` chats never drags it along. z.ai handoff summary/seed messages use the raw send path and are not rewritten by the JSON→MCP bridge.
+If z.ai is already on `/c/<chat_id>` but the HUD still looks like the root launcher, verify that 0.1.48 is loaded and refresh once. A temporary binding/automation preference created on z.ai `/` migrates once when the same tab first becomes `/c/<chat_id>`; later navigation between existing `/c/A` and `/c/B` chats never drags it along. z.ai handoff summary/seed messages use the raw send path and are not rewritten by the JSON→MCP bridge.
 
 If the button reads **Compressing… / Moving…**, the source conversation already owns an active transfer and the button is locked to prevent a duplicate handoff. A delivery-uncertain seed becomes **Resume handoff**; clicking it probes the target conversation for the transfer marker before deciding whether to finish cutover or retry the seed. The old workspace binding remains authoritative until the new seed is confirmed, so do not manually unbind merely to “unlock” the button.
+
+## z.ai `Auto off` looks clickable but does not switch on
+
+Load extension **0.1.48 or newer**. Earlier 0.1.47 builds incorrectly required an explicit workspace binding before writing a z.ai / DeepSeek conversation automation preference, so an unbound HUD could show a clickable `Auto off` button and then fail with `conversation-unbound`. Since 0.1.48 the conversation preference can be toggled and persisted before binding; Herdr progress/settled push-back becomes effective once a workspace is actually bound.
 
 ## Local server not answering
 

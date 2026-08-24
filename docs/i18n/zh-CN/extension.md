@@ -5,7 +5,7 @@
 
 | 主线 | 问题 | 方向 | 状态 | 首批站点 |
 |---|---|---|---|---|
-| **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + 自动化 gate + 安全接力 | **已可用**（当前 0.1.47 系列） | 绑定/观察：4 站；ChatGPT Project 完整自动化；z.ai / DeepSeek 会话级进度自动化；手动接力：ChatGPT Project + z.ai `/c/<chat_id>` |
+| **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + 自动化 gate + 安全接力 | **已可用**（当前 0.1.48 系列） | 绑定/观察：4 站；ChatGPT Project 完整自动化；z.ai / DeepSeek 会话级进度自动化；手动接力：ChatGPT Project + z.ai `/c/<chat_id>` |
 | **B. JSON→MCP** | DeepSeek / z.ai 网页没有 MCP Connector | 网页 → 扩展 service worker → 本机 `127.0.0.1:8772/mcp` | **已可用**（bounded `tools/list` / `tools/call` loop） | `chat.deepseek.com`、`chat.z.ai` |
 
 共享：同一扩展、同一静态 token、同一 options。  
@@ -66,7 +66,7 @@ Chrome 145+ 把本机回环访问拆成 `loopback-network`（界面显示为“�
 Options 只配置全局运行模式：
 
 - **全局手动**：所有会话只允许手动推进，HUD 不显示自动开关；状态观察、binding 和支持站点的手动操作继续存在。
-- **项目自动**：表示“允许当前支持范围使用自动化”，但不会自动开启任何 Project/会话。ChatGPT Project 默认 `自动 关` 并以稳定 `project_id` 保存；z.ai / DeepSeek 也默认关闭，但按当前 conversation 保存。
+- **项目自动**：表示“允许当前支持范围使用自动化”，但不会自动开启任何 Project/会话。ChatGPT Project 默认 `自动 关` 并以稳定 `project_id` 保存；z.ai / DeepSeek 也默认关闭，但按当前 conversation 保存。从 0.1.48 起，z.ai / DeepSeek 即使还没有绑定 workspace 也可以先切换并保存会话自动偏好；依赖 workspace 的 progress/settled 自动回推在绑定后生效。
 
 在“项目自动”模式下，支持站点底部 HUD 顺序为：**运行状态 → 手动继续 → herdr监控 → LLM 分析 → 手动接力（若当前会话支持）→ 自动 开/自动 关 → 展开**；全局手动不显示自动开关。ChatGPT Project 与已落成 `/c/<chat_id>` 的 z.ai 会话可显示“手动接力”，z.ai 根页 `/` 与 DeepSeek 不显示。展开浮层只保留低频设置：**事件设置、会话绑定、高级选项**。
 

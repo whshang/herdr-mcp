@@ -363,8 +363,25 @@ console.log("\n[json bridge automation]");
     enabled: true,
   }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveUnboundAuto(r));
   const unboundAuto = await unboundAutoP;
-  ok(unboundAuto?.ok === false && unboundAuto?.error === "conversation-unbound",
-    "conversation automation still requires an explicit workspace binding", JSON.stringify(unboundAuto));
+  ok(unboundAuto?.ok === true
+      && unboundAuto?.conversation_automation_enabled === true
+      && storage.herdrConversationAutomation?.[ZAI_CONV] === true,
+    "unbound z.ai conversation can save its automation preference", JSON.stringify(unboundAuto));
+
+  let resolveUnboundAutoOff;
+  const unboundAutoOffP = new Promise((r) => { resolveUnboundAutoOff = r; });
+  onMsg({
+    type: "h2w_set_project_automation",
+    project_id: null,
+    site: "z.ai",
+    convKey: ZAI_CONV,
+    enabled: false,
+  }, { tab: { id: 350, url: ZAI_CONV } }, (r) => resolveUnboundAutoOff(r));
+  const unboundAutoOff = await unboundAutoOffP;
+  ok(unboundAutoOff?.ok === true
+      && unboundAutoOff?.conversation_automation_enabled === false
+      && storage.herdrConversationAutomation?.[ZAI_CONV] !== true,
+    "unbound z.ai conversation can turn automation back off before binding", JSON.stringify(unboundAutoOff));
 
   let resolveBind;
   const bindP = new Promise((r) => { resolveBind = r; });

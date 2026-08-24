@@ -216,7 +216,7 @@ herdr のネイティブ面は大きな Unix-socket API（`herdr api schema`）�
 
 フォルダ: `extension/`（MV3）。対応サイト: chatgpt.com / claude.ai / chat.deepseek.com / chat.z.ai。
 
-1. **Web 継続動作（利用可）** — Options で **全体を手動 / Project ごとの自動化**を選ぶ。下部 HUD には **手動続行 / Herdr 監視 / LLM 分析 / 手動引き継ぎ**があり、自動化を許可した対象には `Auto on|off` も表示する。ChatGPT は `project_id`、z.ai / DeepSeek は会話単位で自動設定を保持する。0.1.47 では `Auto on` 中の HUD 手動操作をすべてロックし、binding 済みの z.ai `/c/<chat_id>` 会話にも fail-closed 手動引き継ぎを追加した。z.ai の `/` から最初の `/c/<chat_id>` への遷移では binding と自動設定を一度だけ移すが、既存履歴間の移動には追従しない。
+1. **Web 継続動作（利用可）** — Options で **全体を手動 / Project ごとの自動化**を選ぶ。下部 HUD には **手動続行 / Herdr 監視 / LLM 分析 / 手動引き継ぎ**があり、自動化を許可した対象には `Auto on|off` も表示する。ChatGPT は `project_id`、z.ai / DeepSeek は会話単位で自動設定を保持する。0.1.47 では `Auto on` 中の HUD 手動操作をすべてロックし、binding 済みの z.ai `/c/<chat_id>` 会話にも fail-closed 手動引き継ぎを追加した。0.1.48 では workspace をまだ binding していない z.ai / DeepSeek 会話でも先に Auto 設定を保存でき、Herdr の progress/settled 自動送信は binding 後に有効になる。z.ai の `/` から最初の `/c/<chat_id>` への遷移では binding と自動設定を一度だけ移すが、既存履歴間の移動には追従しない。
 2. **JSON → MCP（利用可）** — DeepSeek / z.ai のローカル JSON bridge が `127.0.0.1:8772/mcp` の `tools/list` / `tools/call` を bounded round で実行して結果を会話へ戻す。静的 Herdr token は extension service worker 内に残り、ページ JavaScript には公開しない。
 
 展開ドロワーは低頻度設定専用（イベント設定 / 会話 binding / 詳細オプション）で、手動ボタンや自動化 switch は置かない。ChatGPT Project の rollover は fail-closed で、新しい会話への seed が確認されるまで元の binding が権威を持つ。UI 言語: en / 简体中文 / 日本語。詳細: [docs/i18n/en/extension.md](docs/i18n/en/extension.md)。

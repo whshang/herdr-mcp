@@ -134,7 +134,7 @@
   "hud_automation_on_hint": "この ChatGPT Project の自動化はオンです。同じ Project の他の会話と引き継ぎ後の新しい会話もこの設定を共有し、Herdr の進捗/settled ウェイク、ターン後 LLM 判定、応答復旧、文脈圧迫または復旧失敗時の引き継ぎ、ページ内権限カード処理を自動実行します。Auto がオンの間は手動引き継ぎを含む HUD の手動操作をロックします。",
   "hud_automation_off_hint": "この ChatGPT Project の自動化はオフです。手動続行、Herdr 監視、LLM 分析は利用でき、binding 済み Project では「手動引き継ぎ」で現在の会話を要約して新しい会話を開始できます。Herdr/workspace 状態とバインドの監視は継続し、この設定は同じ Project のすべての会話で共有されます。",
   "hud_conversation_automation_on_hint": "この会話の自動化はオンです。binding 済み workspace の Herdr 進捗・settled イベントをこの z.ai / DeepSeek 会話へ自動で戻します。この設定は現在の会話だけに適用され、Auto がオンの間は HUD の手動操作をロックします。ChatGPT 専用の応答復旧、ターン後 LLM 判定、自動引き継ぎはここでは有効になりません。",
-  "hud_conversation_automation_off_hint": "この会話の自動化はオフです。Herdr 進捗・settled イベントはこの z.ai / DeepSeek 会話へ自動送信されません。手動続行、Herdr 監視、LLM 分析などの HUD 手動操作を利用でき、binding 済みで /c/<chat_id> が確定した z.ai 会話では手動引き継ぎも表示されます。会話自動化をオンにする前に workspace を binding してください。",
+  "hud_conversation_automation_off_hint": "この会話の自動化はオフです。workspace をまだ binding していなくても先に自動化をオンにして会話設定を保存できます。Herdr 進捗・settled の自動送信は workspace の binding 後に有効になります。手動続行、Herdr 監視、LLM 分析などの HUD 手動操作を利用でき、binding 済みで /c/<chat_id> が確定した z.ai 会話では手動引き継ぎも表示されます。",
   "hud_on": "オン",
   "hud_off": "オフ",
   "hud_interval": "間隔（秒）",
