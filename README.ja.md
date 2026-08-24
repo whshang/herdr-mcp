@@ -201,7 +201,7 @@ herdr のネイティブ面は大きな Unix-socket API（`herdr api schema`）�
 
 フォルダ: `extension/`（MV3）。対応サイト: chatgpt.com / claude.ai / chat.deepseek.com / chat.z.ai。
 
-1. **Web 継続動作（利用可）** — Options で **全体を手動 / Project ごとの自動化**を選ぶ。全体手動では Project HUD に自動化スイッチを表示せず、**手動続行 / Herdr 監視 / LLM 分析**だけで進める。Project ごとの自動化では新しい ChatGPT Project は既定でオフで、HUD から明示的に有効化する。同じ `project_id` の会話と rollover 後の新しい会話は設定を共有する。0.1.44 では stale-view 復旧を追加し、0.1.45 では現在の Project が `Auto on` の間、下部 HUD 全体を淡い緑色で強調して自動実行状態を明確にする。警告・エラー状態の色は維持する。
+1. **Web 継続動作（利用可）** — Options で **全体を手動 / Project ごとの自動化**を選ぶ。下部 HUD には **手動続行 / Herdr 監視 / LLM 分析 / 手動引き継ぎ**があり、Project ごとの自動化では `Auto on|off` も表示する。新しい ChatGPT Project は既定でオフで、同じ `project_id` の会話と rollover 後の新しい会話は設定を共有する。0.1.44 では stale-view 復旧、0.1.45 では `Auto on` の淡い緑色 HUD、0.1.46 では自動化スイッチに依存しない「手動引き継ぎ」を追加し、binding 済み Project を同じ Project の新しい会話へ安全に移せる。
 2. **JSON → MCP（未完成）** — DeepSeek / z.ai で `{"tool":...}` を抽出できるが、ローカル `/mcp` 呼び出しと結果の書き戻しはまだない。
 
 展開ドロワーは低頻度設定専用（イベント設定 / 会話 binding / 詳細オプション）で、手動ボタンや自動化 switch は置かない。ChatGPT Project の rollover は fail-closed で、新しい会話への seed が確認されるまで元の binding が権威を持つ。UI 言語: en / 简体中文 / 日本語。詳細: [docs/i18n/en/extension.md](docs/i18n/en/extension.md)。

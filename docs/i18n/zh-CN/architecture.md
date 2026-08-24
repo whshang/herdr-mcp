@@ -137,5 +137,5 @@ herdr-mcp 侧（≥0.3.12，exec 降级 ≥0.3.18）能做的：
 - [capability-benchmark.md](./capability-benchmark.md) — 官方 Herdr / 其他 Herdr MCP / coding-tools-mcp 能力吸收与“不吸收”决策
 - [extension.md](./extension.md) — 扩展总览（A 已可用，B 未完成）
 - [chatgpt-connector.md](./chatgpt-connector.md) — ChatGPT OAuth、schema、权限卡
-- [extension-wake.md](./extension-wake.md) — 主线 A：workspace 观察 + 全局手动/项目自动模式 + Project 级自动开关 + 进度/收工回推 + 三个手动动作 + 超时恢复 / 安全 Project 接力
+- [extension-wake.md](./extension-wake.md) — 主线 A：workspace 观察 + 全局手动/项目自动模式 + Project 级自动开关 + 进度/收工回推 + 手动继续/监控/LLM 分析 + 独立手动接力 + 超时恢复 / 安全 Project 接力
 - [extension-bridge.md](./extension-bridge.md) — 主线 B：JSON→MCP（解析有、闭环无）

@@ -146,7 +146,7 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 
 Connector 只解决「ChatGPT → herdr」。若工具很快返回「已提交」，而 agent 仍在窗格里跑，网页对话常不再自动 `herdr_since` / 继续。
 
-闭环要靠浏览器扩展：绑定该 chatgpt 会话 ↔ 干活的 workspace。只有 Options 允许项目自动且当前 Project `自动 开` 时，才会在 agent **working** 期间回推进度、**settled** 时自动继续，并启用 LLM 判断、回复超时恢复和安全接力。全局手动或 Project `自动 关` 时仍观察状态，但改用 HUD 的三个手动动作。见 [extension-wake.md](./extension-wake.md)。
+闭环要靠浏览器扩展：绑定该 chatgpt 会话 ↔ 干活的 workspace。只有 Options 允许项目自动且当前 Project `自动 开` 时，才会在 agent **working** 期间回推进度、**settled** 时自动继续，并启用 LLM 判断、回复超时恢复和安全接力。全局手动或 Project `自动 关` 时仍观察状态，改用 HUD 的手动继续 / herdr监控 / LLM 分析；已绑定 ChatGPT Project 还可随时使用 **手动接力**，即使 `自动 开` 也可以主动提前换会话。见 [extension-wake.md](./extension-wake.md)。
 
 未绑定扩展时，这不是 MCP 故障，是缺回推环。
 

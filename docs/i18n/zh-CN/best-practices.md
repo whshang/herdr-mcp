@@ -40,7 +40,7 @@
 1. ChatGPT 连上 Edge MCP 端点并完成 OAuth（见 [安装](install.md)）。
 2. 新开会话；模型先调 `herdr_inspect` 看工作站，再调一次 `herdr_skill`。
 3. 你要求修改某个 git 管理的项目：模型用 `herdr_fs_read` / `herdr_git status` 读、用 `herdr_fs_patch` 改、用 `herdr_exec` 跑测试，并在 managed root 下通过原子 Git 助手提交。
-4. 在 MV3 扩展里把网页会话绑定到实际工作的 workspace。Options 选择**全局手动 / 项目自动**；项目自动模式下还必须在当前 ChatGPT Project HUD 显式开启 `自动 开`，才会回推进度/收工并执行 LLM 判断、回复超时恢复和安全接力。全局手动或 Project `自动 关` 时仍持续观察，改用 **手动继续 / herdr监控 / LLM 分析**。扩展始终只走 localhost，静态 token 绝不经 Cloudflare。见 [extension-wake](extension-wake.md)。
+4. 在 MV3 扩展里把网页会话绑定到实际工作的 workspace。Options 选择**全局手动 / 项目自动**；项目自动模式下还必须在当前 ChatGPT Project HUD 显式开启 `自动 开`，才会回推进度/收工并执行 LLM 判断、回复超时恢复和安全接力。全局手动或 Project `自动 关` 时仍持续观察，改用 **手动继续 / herdr监控 / LLM 分析**；需要主动提前换会话时，已绑定 Project 可直接点 **手动接力**，即使 `自动 开` 也可用。扩展始终只走 localhost，静态 token 绝不经 Cloudflare。见 [extension-wake](extension-wake.md)。
 5. 某个 worker 掉线时，模型改走 `dsh --profile headless`（通过 `herdr_exec_start` 长会话）而不是卡住。
 
 结果：一个稳定的公共契约、廉价的本地算力，加上一条让网页会话保持鲜活的回流通道。

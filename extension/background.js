@@ -24,7 +24,7 @@ import {
 } from "./continuity-core.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 
-const H2W_SCRIPT_VERSION = "0.1.45";
+const H2W_SCRIPT_VERSION = "0.1.46";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -75,8 +75,9 @@ function defaultPartialTemplate() {
 
 function hudLabels() {
   const keys = [
-    "automation", "automation_on", "automation_off", "manual_continue", "manual_status", "manual_judge",
-    "manual_continue_hint", "manual_status_hint", "manual_judge_hint", "controls", "advanced_options", "event_settings",
+    "automation", "automation_on", "automation_off", "manual_continue", "manual_status", "manual_judge", "manual_handoff",
+    "manual_continue_hint", "manual_status_hint", "manual_judge_hint", "manual_handoff_hint", "controls", "advanced_options", "event_settings",
+    "handoff_started", "handoff_failed", "handoff_binding_required", "handoff_workspace_busy",
     "automation_on_hint", "automation_off_hint", "on", "off", "interval", "fallback", "bindings", "bind", "unbind", "available",
     "no_workspaces", "workspaces_unavailable", "active", "bound_count", "aria_toggle_automation",
     "aria_open_controls", "automation_enabled", "automation_disabled", "automation_update_failed",
@@ -91,6 +92,9 @@ function hudLabels() {
   ];
   const out = {};
   for (const suffix of keys) out[suffix] = localizedText(`hud_${suffix}`);
+  for (const key of ["handoff_resume", "handoff_compressing", "handoff_moving", "handoff_project_only"]) {
+    out[key] = localizedText(key);
+  }
   out.states = {};
   for (const state of [
     "unknown", "ready", "bound", "unbound", "working", "idle", "done", "blocked", "reply_waiting",

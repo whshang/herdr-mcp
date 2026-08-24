@@ -54,9 +54,9 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.45", "manifest version includes automation-on HUD emphasis");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.45"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.45"'), "content version matches manifest");
+ok(manifest.version === "0.1.46", "manifest version includes manual HUD handoff");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.46"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.46"'), "content version matches manifest");
 ok(
   wakeSource.includes(".bar.automation-on")
     && wakeSource.includes('enabled ? " automation-on" : ""')
@@ -96,8 +96,9 @@ ok(
       && barHtml.includes("manual-continue")
       && barHtml.includes("manual-status")
       && barHtml.includes("manual-judge")
+      && barHtml.includes("manual-handoff")
       && barHtml.includes('class="quick"'),
-    "frequent manual actions and automation switch live on the HUD bar, not in the drawer",
+    "frequent manual actions, manual handoff, and automation switch live on the HUD bar, not in the drawer",
   );
 }
 ok(
@@ -121,12 +122,13 @@ ok(
   "automation is globally gated, new installs fail closed, and Projects require explicit enablement",
 );
 ok(
-  !wakeSource.includes('class="handoff-action"')
-    && !wakeSource.includes("startHudHandoff")
+  wakeSource.includes('class="handoff manual-handoff"')
+    && wakeSource.includes("manualHandoffAction")
     && wakeSource.includes("h2w_handoff_start")
+    && wakeSource.includes('trigger: "manual"')
     && wakeSource.includes("h2w_handoff_seed")
     && wakeSource.includes("h2w_handoff_probe"),
-  "Project rollover remains recoverable with controls separated from handoff internals",
+  "Project rollover exposes a manual HUD handoff while reusing the recoverable handoff internals",
 );
 ok(
   backgroundSource.includes("herdrConversationTransfers")
@@ -284,6 +286,12 @@ const zhLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "zh.json"), "
 ok(zhLocale.hud_manual_continue === "手动继续", "zh HUD manual continue label is exact");
 ok(zhLocale.hud_manual_status === "herdr监控", "zh HUD Herdr monitor label is exact");
 ok(zhLocale.hud_manual_judge === "LLM 分析", "zh HUD LLM analysis label is exact");
+ok(zhLocale.hud_manual_handoff === "手动接力", "zh HUD manual handoff label is exact");
+ok(zhLocale.hud_manual_handoff_hint.includes("同一 ChatGPT")
+    && (zhLocale.hud_manual_handoff_hint.includes("项目") || zhLocale.hud_manual_handoff_hint.includes("Project"))
+    && zhLocale.hud_manual_handoff_hint.includes("seed")
+    && zhLocale.hud_manual_handoff_hint.includes("binding"),
+  "zh HUD manual handoff tooltip explains safe rollover semantics");
 ok(zhLocale.hud_automation_off === "自动 关", "zh HUD automation-off label is localized");
 ok(
   zhLocale.hud_automation_on_hint.includes("进度")
@@ -295,14 +303,17 @@ ok(
 );
 ok(
   zhLocale.hud_automation_off_hint.includes("当前 ChatGPT Project")
-    && zhLocale.hud_automation_off_hint.includes("三个手动按钮")
+    && zhLocale.hud_automation_off_hint.includes("手动继续")
+    && zhLocale.hud_automation_off_hint.includes("手动接力")
     && zhLocale.hud_automation_off_hint.includes("同一 Project"),
   "zh Auto-off tooltip explains Project scope and manual availability",
 );
 ok(zhLocale.label_automation_mode === "启用项目自动"
     && zhLocale.hint_automation_mode.includes("底部状态条")
-    && zhLocale.hint_automation_mode.includes("新 Project 默认关闭")
-    && zhLocale.hint_automation_mode.includes("权限卡自动点击"),
+    && zhLocale.hint_automation_mode.includes("默认关闭")
+    && zhLocale.hint_automation_mode.includes("权限卡")
+    && zhLocale.hint_automation_mode.includes("自动")
+    && zhLocale.hint_automation_mode.includes("手动接力"),
   "zh Project automation checkbox explains the two-level policy");
 for (const obsolete of ["hud_wake_on", "hud_wake_off", "hud_nudge_on", "hud_nudge_off", "hud_llm", "hud_llm_off"]) {
   ok(!(obsolete in zhLocale), `obsolete HUD locale key removed: ${obsolete}`);

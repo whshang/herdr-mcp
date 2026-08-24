@@ -145,7 +145,7 @@ The web model continues scheduling itself with `herdr_since` / `herdr_inspect`; 
 
 The Connector only solves "ChatGPT → herdr". If a tool quickly returns "submitted" while the agent keeps running in its pane, the web conversation usually no longer auto-calls `herdr_since` / continues on its own.
 
-Closing the loop requires the browser extension: bind that chatgpt session ↔ the working workspace. Options must allow Per-Project automation and the current Project must be `Auto on` before progress, **settled** continuation, LLM decisions, reply recovery and safe rollover run automatically. In Manual globally mode or with that Project off, observation stays live and the three HUD manual actions take over. See [extension-wake.md](./extension-wake.md).
+Closing the loop requires the browser extension: bind that chatgpt session ↔ the working workspace. Options must allow Per-Project automation and the current Project must be `Auto on` before progress, **settled** continuation, LLM decisions, reply recovery and safe rollover run automatically. In Manual globally mode or with that Project off, observation stays live and Manual continue / Herdr monitor / LLM analysis take over; a bound ChatGPT Project can also use **Manual handoff** at any time, including with `Auto on`, to roll over early. See [extension-wake.md](./extension-wake.md).
 
 Without a bound extension, this is not an MCP fault; the push-back loop is missing.
 

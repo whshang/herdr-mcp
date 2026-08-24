@@ -233,7 +233,7 @@ OAuth / skill / 状态目录等见 [docs/i18n/zh-CN/architecture.md](docs/i18n/z
 
 两件工作（见 [docs/i18n/zh-CN/extension.md](docs/i18n/zh-CN/extension.md)）共享本地 token，**完成度不对等**：
 
-1. **网页连续工作自动化（已可用）**：Options 选择“全局手动 / 项目自动”；全局手动时 Project HUD 只有「手动继续 / herdr监控 / LLM 分析」，不显示自动开关；项目自动时每个 ChatGPT Project 默认「自动 关」，需在 HUD 显式开启，且同一 Project 的多个会话与接力后的新会话共享设置。0.1.44 新增 stale-view 恢复；0.1.45 在当前 Project `自动 开` 时把整条底部 HUD 强化为浅绿色，让自动执行状态一眼可辨，同时保留运行告警色。
+1. **网页连续工作自动化（已可用）**：Options 选择“全局手动 / 项目自动”；底部 HUD 提供「手动继续 / herdr监控 / LLM 分析 / 手动接力」，项目自动时另有 `自动 开/关`。新 Project 默认 `自动 关`，同一 Project 的多个会话与接力后的新会话共享设置。0.1.44 新增 stale-view 恢复；0.1.45 在 `自动 开` 时把整条 HUD 强化为浅绿色；0.1.46 新增独立于自动开关的“手动接力”，可主动总结当前已绑定 Project 对话并安全迁移到同一 Project 的新对话。
 2. **JSON→MCP（未完成）**：DeepSeek / z.ai 能从助手回复抠 `{"tool":...}`，**还不会**调本机 `/mcp` 或把结果回填。路线见 [docs/i18n/zh-CN/extension-bridge.md](docs/i18n/zh-CN/extension-bridge.md)。
 
 共享本地 `127.0.0.1:8772` 与静态 token。这不是给 DeepSeek「安装」ChatGPT 式 OAuth connector。默认：进度检查间隔 **60 秒**，摘要不变时兜底 **20 分钟**（`progressTickSec` / `progressFallbackSec`）。

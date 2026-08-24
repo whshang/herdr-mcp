@@ -56,7 +56,7 @@ Bound conversation + extension ≥ 0.1.20:
 3. if the reply matches the "do not send" keywords → no nudge; otherwise if judged "continue" → **fill the small model's original text** into the input and submit (prompt / do-not-send words are pre-filled visible defaults in Options)
 4. **no longer** uses zero-tool / halfway heuristics; without a configured small model, no nudge this turn
 5. if the user bubble was the last nudge sentence, the **new assistant reply is still judged** (since 0.1.20); automatic judgment and progress checks share `progressTickSec`; `0` disables automatic LLM judgment (default 60s) but not manual **LLM analysis**
-6. persistent bottom HUD: runtime state, **Manual continue / Herdr monitor / LLM analysis**, optional Project **Auto on|off**, and expand. The Project switch is shown only when Options is in Per-Project mode; frequent actions stay on the bar, and the drawer contains only event settings, conversation bindings and advanced options. Copy follows the Options language (en / Simplified Chinese / Japanese)
+6. persistent bottom HUD: runtime state, **Manual continue / Herdr monitor / LLM analysis / Manual handoff**, optional Project **Auto on|off**, and expand. Manual handoff appears only on ChatGPT Project conversations, becomes usable once bound to a workspace, and stays available even with `Auto on`. The Project switch is shown only when Options is in Per-Project mode; frequent actions stay on the bar, and the drawer contains only event settings, conversation bindings and advanced options. Copy follows the Options language (en / Simplified Chinese / Japanese)
 7. herdr working/settled wake-ups remain independent
 
 The key is stored locally only; the repo keeps it empty by default.
@@ -71,6 +71,17 @@ With Project `Auto on`, both human-submitted and extension-submitted user messag
 - snapshot request fails, times out, or changes shape: **unknown** → fail closed; never refresh on guesswork.
 
 The pre-refresh assistant signature is persisted. If reload reveals newer content or streaming resumes, recovery ends. If the identical partial reply remains after 10 seconds and the composer, tools and permission cards are idle, the extension submits exactly one browser-recovery activation message telling ChatGPT to reread the current conversation, continue from the real stop point, and not repeat completed work. Only if that also fails does recovery-exhausted rollover become eligible.
+
+## Manual handoff (0.1.46)
+
+The bottom-HUD **Manual handoff** action lets the user roll over early and is intentionally independent of `Auto on|off`:
+
+- it appears only for ChatGPT Project conversations and requires the current conversation to be bound to a Herdr workspace;
+- clicking it reuses `h2w_handoff_start(trigger=manual)` and first asks the current ChatGPT conversation for a compact transfer-id-marked handoff packet;
+- if a bound workspace is still `working`, the operation is rejected to avoid racing settled/wake delivery against binding cutover;
+- after the packet is ready, the extension opens a fresh conversation in the same Project and submits the seed; workspace bindings move only after both the new conversation and seed are confirmed;
+- an in-flight transfer changes the button to **Compressing… / Moving… / Resume handoff** instead of creating a duplicate transfer; `seed_uncertain` can be resumed through the same fail-closed recovery path;
+- with `Auto on`, the three manual continuation actions are locked, but **Manual handoff remains available** because it is an explicit user decision to change conversation lifecycle.
 
 ## Multi-task semantics
 

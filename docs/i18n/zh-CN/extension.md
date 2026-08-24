@@ -5,7 +5,7 @@
 
 | 主线 | 问题 | 方向 | 状态 | 首批站点 |
 |---|---|---|---|---|
-| **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + ChatGPT Project 自动化/新鲜度恢复/接力 | **已可用**（当前 0.1.45 系列；全局运行模式 + Project 自动开关） | 绑定/观察：4 站；自动化/恢复/接力：ChatGPT Project |
+| **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + ChatGPT Project 自动化/新鲜度恢复/接力 | **已可用**（当前 0.1.46 系列；全局运行模式 + Project 自动开关 + 手动接力） | 绑定/观察：4 站；自动化/恢复/接力：ChatGPT Project |
 | **B. JSON→MCP** | DeepSeek / z.ai 网页没有 MCP Connector | 网页 → 本机 `127.0.0.1:8772/mcp` | **未完成**（能抠 JSON，未调 MCP） | `chat.deepseek.com`、`chat.z.ai` |
 
 共享：同一扩展、同一静态 token、同一 options。  
@@ -65,18 +65,20 @@ Chrome 145+ 把本机回环访问拆成 `loopback-network`（界面显示为“�
 
 Options 只配置全局运行模式：
 
-- **全局手动**：所有会话只允许手动推进。ChatGPT Project HUD 不显示自动开关，只显示三个手动按钮；自动进度/settled 唤醒、LLM 判断、恢复、自动接力和权限卡自动点击均停止，但状态观察和绑定继续。
+- **全局手动**：所有会话只允许手动推进。ChatGPT Project HUD 不显示自动开关；手动继续、herdr监控、LLM 分析仍可用，Project 还显示“手动接力”（绑定后可用）。自动进度/settled 唤醒、LLM 判断、恢复、自动接力和权限卡自动点击均停止，但状态观察和绑定继续。
 - **项目自动**：只表示“允许 Project 使用自动化”，不会自动开启所有 Project。每个 ChatGPT Project 默认 `自动 关`，必须在该 Project 的 HUD 里显式打开。Project 开关以稳定 `project_id` 保存，因此同一 Project 的多个 conversation 以及接力后的新 conversation 共享同一设置。
 
-在“项目自动”模式下，页面底部 HUD 顺序为：**运行状态 → 手动继续 → herdr监控 → LLM 分析 → 自动 开/自动 关 → 展开**；在“全局手动”模式下不显示自动开关。展开浮层只保留低频设置：**事件设置、会话绑定、高级选项**；浮层里不重复放手动按钮或自动化开关。
+在“项目自动”模式下，页面底部 HUD 顺序为：**运行状态 → 手动继续 → herdr监控 → LLM 分析 → 手动接力 → 自动 开/自动 关 → 展开**；在“全局手动”模式下不显示自动开关，但 ChatGPT Project 仍保留“手动接力”。展开浮层只保留低频设置：**事件设置、会话绑定、高级选项**；浮层里不重复放手动按钮或自动化开关。
 
 从 0.1.45 起，当前 Project 实际处于 **`自动 开`** 时，整条底部 HUD 使用浅绿色背景、绿色顶边与轻微绿色阴影作为常驻视觉提示；`自动 关` 或全局手动仍使用中性色。该绿色只表达“自动化已启用”，不会覆盖 `working / blocked / recovering / failed` 等运行状态的橙色或红色告警语义。深色模式使用低亮度绿色表面，避免长期常驻时刺眼。
 
-三个手动按钮在全局手动或当前 Project `自动 关` 时可用；当前 Project `自动 开` 时禁用，避免手动/自动重复推进：
+前三个人工推进按钮在全局手动或当前 Project `自动 关` 时可用；当前 Project `自动 开` 时禁用，避免手动/自动重复推进：
 
 - **手动继续**：直接向当前网页会话发送一次“继续”请求，不自动点击权限卡。
 - **herdr监控**：先读取当前绑定 workspace 的 Herdr 窗口、pane、Agent 与运行状态，再把状态带回网页会话继续编排。
 - **LLM 分析**：用 Options 里配置的小模型判断当前助手回复是否还需要继续；只有判断为继续时才提交继续消息。
+
+**手动接力**是独立于自动开关的人工控制。它只在 ChatGPT Project HUD 出现，当前对话绑定 Herdr workspace 后可用；即使当前 Project 已是 `自动 开`，用户也可以提前主动接力，而不必等到上下文压力阈值或恢复失败。点击后复用同一 fail-closed handoff 状态机：先让当前对话生成带 transfer-id 的紧凑接力包，再在同一 Project 新开会话并提交 seed，只有确认 seed 已存在后才迁移 workspace binding。绑定 workspace 仍在 `working` 时后台拒绝开始接力；已有 transfer 时按钮会显示“压缩中… / 接力中… / 恢复接力”，避免重复创建接力任务。
 
 Project `自动 开` 是当前 Project 的执行 gate。只有 Options 已选择“项目自动”时才显示。开启后允许自动执行：
 
@@ -105,7 +107,7 @@ Project `自动 关` 会阻止该 Project 的新自动 mutation；“全局手�
 
 ### A2. 长对话压缩与接力（ChatGPT Project）
 
-扩展从 0.1.39 起提供 fail-closed **接力 / Rollover**；0.1.43 加入 Project 级自动化 gate，0.1.44 再把 stale-view 刷新与“刷新后激活”接入同一恢复链。全局手动或当前 Project `自动 关` 时不会启动这些自动恢复或接力。
+扩展从 0.1.39 起提供 fail-closed **接力 / Rollover**；0.1.43 加入 Project 级自动化 gate，0.1.44 把 stale-view 刷新与“刷新后激活”接入同一恢复链，0.1.46 再把“手动接力”放到底部 HUD。全局手动或当前 Project `自动 关` 时不会启动自动恢复或自动接力，但用户仍可在已绑定的 ChatGPT Project 上主动点击“手动接力”。
 
 工作流：
 
@@ -160,5 +162,5 @@ Project `自动 关` 会阻止该 Project 的新自动 mutation；“全局手�
 
 ## 验收口诀
 
-- **A**：`自动 开` 时，已绑定会话能从 Herdr working/settled、回合 LLM 判断、回复超时恢复和必要的 Project 接力继续工作；`自动 关` 时仍能实时看到状态，并可用「手动继续 / herdr监控 / LLM 分析」推进。
+- **A**：`自动 开` 时，已绑定会话能从 Herdr working/settled、回合 LLM 判断、回复超时恢复和必要的 Project 接力继续工作；`自动 关` 时仍能实时看到状态，并可用「手动继续 / herdr监控 / LLM 分析」推进。需要主动提前换会话时，不论自动开关状态，已绑定 ChatGPT Project 都可使用「手动接力」安全迁移到同一 Project 的新对话。
 - **B**（尚未实现）：DeepSeek 输出一段 `herdr_inspect` JSON，扩展调本机并回填 `ok` 摘要。当前只能确认助手回复里出现了该 JSON。

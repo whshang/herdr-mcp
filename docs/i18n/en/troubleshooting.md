@@ -17,13 +17,19 @@ Verify the extension is loaded, **per-Project automation** is enabled in Options
 
 ## The HUD is bound to w68 but the bottom bar shows another project name
 
-Treat `workspace_id` as identity; the label is display cache only. The current extension prefers the live `/push/events` / `/push/state` workspace catalog over a stale binding label and repairs the persisted binding automatically. If the drawer already shows the correct `herdr-mcp (w68)` while the bar still shows an older project name, make sure the current 0.1.45 extension is loaded and refresh the page; do not unbind/rebind merely to repair a label for the same workspace id.
+Treat `workspace_id` as identity; the label is display cache only. The current extension prefers the live `/push/events` / `/push/state` workspace catalog over a stale binding label and repairs the persisted binding automatically. If the drawer already shows the correct `herdr-mcp (w68)` while the bar still shows an older project name, make sure the current 0.1.46 extension is loaded and refresh the page; do not unbind/rebind merely to repair a label for the same workspace id.
 
 ## ChatGPT replies halfway and then the page appears frozen or stale
 
 0.1.44 no longer equates this directly with “the model is stuck.” The current Project must be `Auto on` for automatic stale-view recovery. After roughly 30 seconds without fresh page progress on a recent turn, the extension best-effort compares ChatGPT's same-origin conversation snapshot with the current DOM. A proven server-ahead view is refreshed once. If the server itself explicitly reports an unfinished assistant message, it must remain stalled for at least 60 seconds before reload is allowed; if the page still claims streaming, the detector waits another 30 seconds.
 
 After reload, newer content or resumed streaming ends recovery. If the identical partial answer remains, the extension waits 10 seconds and submits one browser-recovery activation message. If the private snapshot endpoint is unavailable, errors, times out, or changes shape, freshness is `unknown` and the detector fails closed rather than refreshing on elapsed time alone. In that case, refresh manually and use HUD **Manual continue** or **Herdr monitor**. The recovery prompt tells ChatGPT to continue from the actual stop point and to re-check live Herdr/runtime/Git state before external mutations, reducing duplicate work.
+
+## Manual handoff is unavailable, or stays on Compressing / Moving
+
+Version 0.1.46 exposes **Manual handoff** only for ChatGPT Project conversations, and the current conversation must first be bound to a Herdr workspace. Plain `/c/<id>`, Claude, DeepSeek, and z.ai do not show the button. If a bound workspace still has an agent `working`, the background rejects the handoff and asks you to wait for a quiescent boundary because binding cutover must not race settled/wake delivery.
+
+If the button reads **Compressing… / Moving…**, the source conversation already owns an active transfer and the button is locked to prevent a duplicate handoff. A delivery-uncertain seed becomes **Resume handoff**; clicking it probes the target conversation for the transfer marker before deciding whether to finish cutover or retry the seed. The old workspace binding remains authoritative until the new seed is confirmed, so do not manually unbind merely to “unlock” the button.
 
 ## Local server not answering
 

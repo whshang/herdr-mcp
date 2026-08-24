@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.45";
+const H2W_CONTENT_VERSION = "0.1.46";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -1093,9 +1093,13 @@ const H2W_CONTENT_VERSION = "0.1.45";
     startConversationRouteWatch();
     // ChatGPT Connector permission cards can appear outside wake-up, so watch continuously.
     syncAutomationPermissionWatch();
+    // The operational HUD is shared by ChatGPT and the JSON-bridge sites.
+    // ChatGPT-only idle/recovery watchers remain scoped to ChatGPT below.
+    if (["chatgpt", "z.ai", "deepseek"].includes(ADAPTER.name)) {
+      startPageHud();
+    }
     // Talk-without-tools: watch turn boundaries and ask background to check MCP activity.
     if (ADAPTER.name === "chatgpt") {
-      startPageHud();
       startIdleNudgeWatch();
       startConversationHealthWatch();
     }
@@ -1283,6 +1287,7 @@ const H2W_CONTENT_VERSION = "0.1.45";
     hudEls.tick.disabled = hudActionBusy;
     hudEls.fallback.disabled = hudActionBusy;
     syncHudManualButtons();
+    syncHudHandoffButton();
   }
 
   function syncHudManualButtons() {
@@ -1293,6 +1298,19 @@ const H2W_CONTENT_VERSION = "0.1.45";
       button.disabled = locked;
       button.setAttribute("aria-disabled", String(locked));
     }
+  }
+
+  function syncHudHandoffButton() {
+    if (!hudEls?.handoff) return;
+    const hud = hudCache || null;
+    const status = String(hud?.handoff?.status || "");
+    const active = ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(status)
+      && hud?.handoff?.can_resume !== true;
+    hudEls.handoff.hidden = !hud?.project_id;
+    hudEls.handoff.textContent = handoffButtonText(hud);
+    hudEls.handoff.title = hudText("manual_handoff_hint");
+    hudEls.handoff.disabled = hudActionBusy || active || hud?.bound !== true;
+    hudEls.handoff.setAttribute("aria-disabled", String(hudEls.handoff.disabled));
   }
 
   function showHudToast(text, kind = "") {
@@ -1485,6 +1503,39 @@ const H2W_CONTENT_VERSION = "0.1.45";
     }
   }
 
+  function handoffButtonText(hud) {
+    const status = String(hud?.handoff?.status || "");
+    if (hud?.handoff?.can_resume === true) return hudText("handoff_resume");
+    if (status === "summary_requested") return hudText("handoff_compressing");
+    if (["summary_ready", "target_opening", "seed_submitting"].includes(status)) return hudText("handoff_moving");
+    return hudText("manual_handoff");
+  }
+
+  function handoffErrorText(error) {
+    const code = String(error || "unknown");
+    if (code === "project_conversation_required") return hudText("handoff_project_only");
+    if (code === "binding_required") return hudText("handoff_binding_required");
+    if (code === "workspace_busy") return hudText("handoff_workspace_busy");
+    return hudText("handoff_failed", { error: code });
+  }
+
+  async function manualHandoffAction() {
+    if (hudActionBusy) return { ok: false, error: "busy" };
+    setHudActionBusy(true);
+    try {
+      const result = await sendBg({ type: "h2w_handoff_start", trigger: "manual" });
+      if (result?.ok) {
+        showHudToast(hudText("handoff_started"), "ok");
+      } else {
+        showHudToast(handoffErrorText(result?.error), "err");
+      }
+      await refreshPageHud();
+      return result;
+    } finally {
+      setHudActionBusy(false);
+    }
+  }
+
   function ensurePageHud() {
     if (hudEls?.host?.isConnected) return hudEls;
     let host = document.getElementById(HUD_ID);
@@ -1518,6 +1569,7 @@ const H2W_CONTENT_VERSION = "0.1.45";
         .bar.automation-on .workspace { color: #527361; }
         .bar.automation-on .quick,
         .bar.automation-on .manual,
+        .bar.automation-on .handoff,
         .bar.automation-on .expand {
           background: rgba(255,255,255,.72);
           border-color: #a9dfbb;
@@ -1536,7 +1588,7 @@ const H2W_CONTENT_VERSION = "0.1.45";
         }
         .status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
         .workspace { color: #8a8a8a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
-        .quick, .manual, .expand {
+        .quick, .manual, .handoff, .expand {
           height: 22px; border: 1px solid #dedede; background: #fafafa; border-radius: 7px;
           cursor: pointer; padding: 0 7px; font-size: 11px; white-space: nowrap;
         }
@@ -1598,10 +1650,11 @@ const H2W_CONTENT_VERSION = "0.1.45";
           .bar.automation-on .workspace { color: #a6d5b7; }
           .bar.automation-on .quick,
           .bar.automation-on .manual,
+          .bar.automation-on .handoff,
           .bar.automation-on .expand { background: #23452f; border-color: #477b59; }
           .bar.automation-on .quick.on { color: #bbf7d0; background: #1d5130; border-color: #5aa773; }
           .workspace { color: #8d8d8d; }
-          .quick, .manual, .expand { background: #292929; border-color: #454545; }
+          .quick, .manual, .handoff, .expand { background: #292929; border-color: #454545; }
           .quick.on { color: #86efac; background: #143020; border-color: #245c36; }
           .panel { color: #e8e8e8; background: rgba(32,32,32,.985); border-color: #494949; }
           .section { border-color: #414141; }
@@ -1631,6 +1684,7 @@ const H2W_CONTENT_VERSION = "0.1.45";
         <button type="button" class="manual manual-continue"></button>
         <button type="button" class="manual manual-status"></button>
         <button type="button" class="manual manual-judge"></button>
+        <button type="button" class="handoff manual-handoff"></button>
         <button type="button" class="quick" aria-label=""></button>
         <button type="button" class="expand" aria-label="" aria-expanded="false">⌃</button>
       </div>
@@ -1642,6 +1696,7 @@ const H2W_CONTENT_VERSION = "0.1.45";
       workspace: shadow.querySelector(".workspace"),
       summary: shadow.querySelector(".summary"),
       quick: shadow.querySelector(".quick"),
+      handoff: shadow.querySelector(".handoff"),
       expand: shadow.querySelector(".expand"),
       panel: shadow.querySelector(".panel"),
       conversation: shadow.querySelector(".conversation"),
@@ -1668,6 +1723,7 @@ const H2W_CONTENT_VERSION = "0.1.45";
     hudEls.quick.addEventListener("click", () => {
       void setHudProjectAutomation(!(hudCache?.project_automation_enabled === true));
     });
+    hudEls.handoff.addEventListener("click", () => { void manualHandoffAction(); });
     hudEls.manualButtons.forEach((button, index) => {
       const actions = ["direct", "status", "judge"];
       button.addEventListener("click", () => {
@@ -1776,6 +1832,7 @@ const H2W_CONTENT_VERSION = "0.1.45";
     }
     syncHudManualButtons();
     ui.quick.hidden = hud?.project_automation_available !== true;
+    syncHudHandoffButton();
     ui.quick.textContent = enabled ? hudText("automation_on", null, "Auto on") : hudText("automation_off", null, "Auto off");
     ui.quick.className = `quick ${enabled ? "on" : "off"}`;
     ui.quick.setAttribute("aria-pressed", String(enabled));

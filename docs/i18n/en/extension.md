@@ -5,7 +5,7 @@ Language: product UI is en / Simplified Chinese / Japanese (same as herdr); this
 
 | Track | Problem | Direction | Status | First sites |
 |---|---|---|---|---|
-| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + ChatGPT Project automation/freshness recovery/rollover | **usable** (0.1.45 series; global run mode + Project automation switch) | binding/observation: 4 sites; automation/recovery/rollover: ChatGPT Project |
+| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + ChatGPT Project automation/freshness recovery/rollover | **usable** (0.1.46 series; global run mode + Project automation switch + Manual handoff) | binding/observation: 4 sites; automation/recovery/rollover: ChatGPT Project |
 | **B. JSON→MCP** | DeepSeek / z.ai web has no MCP Connector | web → local `127.0.0.1:8772/mcp` | **incomplete** (can extract JSON, MCP not called) | `chat.deepseek.com`, `chat.z.ai` |
 
 Shared: same extension, same static token, same options.  
@@ -62,9 +62,9 @@ This track does not make the extension think on behalf of the web model. It solv
 
 ### Global run mode and Project HUD automation
 
-Options owns the global policy. **Manual globally** disables automatic mutations everywhere and hides the automation switch from ChatGPT Project HUDs; the three manual actions remain available. **Per-Project automation** only permits Projects to use automation: every new ChatGPT Project still defaults to off and must be explicitly enabled from that Project's HUD.
+Options owns the global policy. **Manual globally** disables automatic mutations everywhere and hides the automation switch from ChatGPT Project HUDs; Manual continue, Herdr monitor, and LLM analysis remain available, and Project conversations also keep **Manual handoff** (usable once bound). **Per-Project automation** only permits Projects to use automation: every new ChatGPT Project still defaults to off and must be explicitly enabled from that Project's HUD.
 
-In Per-Project mode, the bottom HUD bar owns frequent actions: **Manual continue / Herdr monitor / LLM analysis / Automation on-off / expand**. In Manual globally mode, the automation switch is absent. The drawer only contains low-frequency settings: event timing, conversation bindings, and advanced options.
+In Per-Project mode, the bottom HUD bar owns frequent actions: **Manual continue / Herdr monitor / LLM analysis / Manual handoff / Automation on-off / expand**. In Manual globally mode, the automation switch is absent but Project conversations still keep Manual handoff. The drawer only contains low-frequency settings: event timing, conversation bindings, and advanced options.
 
 Starting with 0.1.45, an effectively **`Auto on`** Project gives the entire persistent bottom HUD a restrained light-green surface, green top border, and soft green shadow. `Auto off` and global manual mode keep the neutral treatment. This color is only an automation-state cue: orange/red runtime states such as `working`, `blocked`, `recovering`, and `failed` keep their own semantic colors. Dark mode uses a corresponding low-glare green surface.
 
@@ -76,7 +76,9 @@ Starting with 0.1.45, an effectively **`Auto on`** Project gives the entire pers
 - same-Project fail-closed rollover after recovery exhaustion or high context pressure
 - in-page ChatGPT permission-card handling as part of the current Project automation state; there is no separate permission-card toggle
 
-**Automation off** keeps observation active but stops automatic mutations for that Project. Manual globally applies the same stop at the global layer without deleting saved Project preferences; switching back to Per-Project mode restores those preferences. Use the three manual HUD actions when automatic execution is off.
+**Automation off** keeps observation active but stops automatic mutations for that Project. Manual globally applies the same stop at the global layer without deleting saved Project preferences; switching back to Per-Project mode restores those preferences. Use Manual continue / Herdr monitor / LLM analysis when automatic execution is off; Manual handoff remains a separate explicit lifecycle control for bound Project conversations.
+
+**Manual handoff** is intentionally independent of the automation switch. It appears only on ChatGPT Project HUDs and becomes usable once the conversation is bound to a Herdr workspace. Even with `Auto on`, a user can roll over early instead of waiting for context-pressure or recovery thresholds. The button reuses the same fail-closed handoff state machine: ask the current conversation for a marked transfer packet, open a fresh conversation in the same Project, seed it, and move workspace bindings only after that seed is confirmed. A bound workspace that is still `working` blocks the operation. Existing transfers surface as `Compressing…`, `Moving…`, or `Resume handoff` so a second transfer is not created accidentally.
 
 ### Page freshness / stale-view recovery
 
@@ -91,7 +93,7 @@ Before reload the extension persists the last assistant signature. After reload,
 
 ### A2. Long-conversation compression and rollover (ChatGPT Project)
 
-Extension 0.1.39 adds **Rollover** to the in-page HUD. Version 0.1.43 adds the Project-scoped automation gate; 0.1.44 adds stale-view refresh and post-refresh activation to the same recovery chain. Global manual mode or Project `Auto off` prevents those automatic recovery/rollover actions from starting.
+Extension 0.1.39 adds **Rollover** to the in-page HUD. Version 0.1.43 adds the Project-scoped automation gate; 0.1.44 adds stale-view refresh and post-refresh activation; 0.1.46 exposes Manual handoff directly on the bottom HUD. Global manual mode or Project `Auto off` prevents automatic recovery/rollover actions from starting, but a user may still trigger Manual handoff explicitly on a bound Project conversation.
 
 Flow:
 
@@ -146,5 +148,5 @@ See [extension-bridge.md](./extension-bridge.md).
 
 ## Acceptance mantra
 
-- **A**: after `herdr_prompt` from ChatGPT (or any bound site), there is a progress stamp while working, and a continue prompt after settled; the conversation keeps moving by itself.
+- **A**: after `herdr_prompt` from ChatGPT (or any bound site), there is a progress stamp while working, and a continue prompt after settled; the conversation keeps moving by itself. A bound ChatGPT Project can also use **Manual handoff** at any time to move safely to a fresh conversation in the same Project without waiting for an automatic threshold.
 - **B** (not yet implemented): DeepSeek outputs a `herdr_inspect` JSON, the extension calls local and backfills an `ok` summary. For now we can only confirm the JSON appears in the assistant reply.
