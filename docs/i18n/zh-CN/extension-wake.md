@@ -61,6 +61,17 @@
 
 密钥只存本机，仓库默认留空。
 
+## ChatGPT 页面陈旧 / 半截回复恢复（0.1.44）
+
+Project `自动 开` 时，人工发送和扩展自动发送的用户消息都会进入会话健康状态机。最近回合约 30 秒没有新的页面进展后，扩展会 best-effort 请求当前 ChatGPT conversation 的同源 snapshot，沿 `current_node` 取最新 assistant message，并与 DOM 中最后一条 assistant message 比较：
+
+- 服务端 message id 更晚，或同一 message 的服务端文本明显更长：判为 **server ahead**，安全时刷新一次页面；
+- 服务端明确显示 assistant message 尚未完成且至少 60 秒没有推进：判为 **server stalled**；如果页面仍显示 streaming，再多等待 30 秒；
+- 服务端和页面一致且已结束：判为 **synced**，不刷新；
+- snapshot 请求失败/超时/结构变化：判为 **unknown**，fail-closed，不盲目刷新。
+
+刷新前记录当前 assistant 指纹。刷新后如果内容变长或重新开始 streaming，就认为页面已经恢复；如果 10 秒后仍是完全相同的半截回复，并且编辑器、工具、权限卡都空闲，则只发送一次浏览器恢复激活消息，让 ChatGPT 重新读取当前会话，从实际停止处继续且不要重复已完成工作。该消息仍失败后才进入 recovery-exhausted rollover。
+
 ## 多任务语义
 
 | 事件 | 行为 |
