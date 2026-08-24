@@ -30,19 +30,19 @@ ChatGPT 有两层：
 |---|---|
 | 服务端强制「全部自动允许」 | **做不到。** Connector 网页没有稳定的 `require_approval: never`；那是 Responses API 开发者参数，不是 chatgpt.com 设置项 |
 | 点一次「Always allow」后永久生效 | 社区反馈不稳定，有时会丢会话 / 重走 OAuth |
-| 少点几次「允许」 | 装本仓库浏览器扩展，Options 选择**项目自动**，在当前 Project HUD 打开 **`自动 开`**，并启用 Options「自动点击允许」；此时才会对 **chatgpt.com** 页面内明确的权限卡自动点「允许」（见下） |
+| 少点几次「允许」 | 装本仓库浏览器扩展，Options 勾选**启用项目自动**，并在当前 Project HUD 打开 **`自动 开`**；权限卡自动处理已包含在 Project 自动化中，此时才会对 **chatgpt.com** 页面内明确的权限卡自动点「允许」（见下） |
 
 扩展行为（`extension/`，内容脚本 ≥ 0.1.3）：
 
 - 识别页面内「允许 / 拒绝」工具权限卡（含 `data-testid=tool-action-buttons`）
 - **chatgpt.com 打开后持续观察**，但观察与 mutation 分离：`自动 关` 时仍可识别状态，不点击任何权限动作
-- 只有 **Options 项目自动 + 当前 Project HUD `自动 开` + Options「自动点击允许」** 同时成立时才自动点击
+- 只有 **Options 勾选启用项目自动 + 当前 Project HUD `自动 开`** 同时成立时才自动点击；不再有独立的权限卡开关
 - 只点可见、可用、文案明确为允许类的按钮；有拒绝按钮同卡才点（fail-closed）
 - **点不了**：浏览器原生权限条、非 DOM 的系统对话框
 
 服务端可做的只是诚实标注（例如 `readOnlyHint`）；ChatGPT 目前常忽略，仍可能把只读工具当成写操作来问。
 
-每次工具调用仍弹卡时：确认扩展已加载、当前标签是 `chatgpt.com`、Options 为**项目自动**、当前 Project HUD 为 **`自动 开`**、Options「自动点击允许」已开启；浏览器原生权限条需要人工处理。
+每次工具调用仍弹卡时：确认扩展已加载、当前标签是 `chatgpt.com`、Options 已勾选**启用项目自动**、当前 Project HUD 为 **`自动 开`**；浏览器原生权限条需要人工处理。
 
 ## OAuth（CIMD）
 
@@ -140,7 +140,7 @@ ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../
 4. `tools/list` `200` 但对话 0 工具：schema 拒收或 **旧对话快照** → 开新对话
 5. `/.well-known/mcp.json` 的 `version` 是否等于你以为在跑的构建
 6. 「读不了文件」：确认失败调用是 `herdr_fs_*` / `herdr_exec`，不是 `herdr_call call=agent.*`
-7. 权限卡不停：扩展是否在 chatgpt.com、Options 是否为项目自动、当前 Project HUD 是否 `自动 开`、Options「自动点击允许」是否开启；浏览器原生权限条不自动处理
+7. 权限卡不停：扩展是否在 chatgpt.com、Options 是否已勾选启用项目自动、当前 Project HUD 是否 `自动 开`；浏览器原生权限条不自动处理
 
 ## ChatGPT 派活后对话停住
 

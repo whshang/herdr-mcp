@@ -75,7 +75,7 @@ Default templates contain `{roster}` `{idle_hint}` placeholders; the extension f
 
 ## ChatGPT permission cards
 
-The content script keeps observing in-page permission cards on chatgpt.com, but clicks an explicit Allow action only when **Options is Per-Project automation + the current Project is `Auto on` + Options `Auto-click Allow` is enabled**. Manual globally or Project `Auto off` stops automatic permission clicks. Native browser permission bars are outside this mechanism. See [chatgpt-connector.md](./chatgpt-connector.md).
+The content script keeps observing in-page permission cards on chatgpt.com, but clicks an explicit Allow action only when **per-Project automation is enabled in Options + the current Project is `Auto on`**. Permission handling is part of Project automation and no longer has a separate toggle. Manual globally or Project `Auto off` stops automatic permission clicks. Native browser permission bars are outside this mechanism. See [chatgpt-connector.md](./chatgpt-connector.md).
 
 ## Testing
 

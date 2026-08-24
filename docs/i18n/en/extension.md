@@ -5,7 +5,7 @@ Language: product UI is en / Simplified Chinese / Japanese (same as herdr); this
 
 | Track | Problem | Direction | Status | First sites |
 |---|---|---|---|---|
-| **A. Web work continuity** | web work stalls after dispatch; replies can timeout; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + ChatGPT Project automation/recovery/rollover | **usable** (0.1.43 series; global run mode + Project automation switch) | binding/observation: 4 sites; automation/recovery/rollover: ChatGPT Project |
+| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + ChatGPT Project automation/freshness recovery/rollover | **usable** (0.1.44 series; global run mode + Project automation switch) | binding/observation: 4 sites; automation/recovery/rollover: ChatGPT Project |
 | **B. JSON→MCP** | DeepSeek / z.ai web has no MCP Connector | web → local `127.0.0.1:8772/mcp` | **incomplete** (can extract JSON, MCP not called) | `chat.deepseek.com`, `chat.z.ai` |
 
 Shared: same extension, same static token, same options.  
@@ -39,9 +39,9 @@ This track does not make the extension think on behalf of the web model. It solv
 - Binding: the popup binds the "current conversation" to a herdr **workspace** (multiple agents in one space can push back in parallel)
 - SSE: `/push/events?workspace=...`
 - Policy: after seeing `working`; partial settle reports progress, all-idle in scope reports done; `hello` can backfill
-- chatgpt.com in-page permission cards can auto-click "Allow" only when automation is on and the separate Auto-click Allow option is enabled
+- chatgpt.com in-page permission-card handling is part of Project automation: it auto-clicks an explicit Allow only when per-Project automation is enabled globally and the current Project HUD is `Auto on`
 - Optional small-model nudge after a ChatGPT turn ends runs in automation mode (Options configures Base URL + Key + Model; cooldown and progress checks share `progressTickSec`)
-- Reply timeout recovery, safe reload, and fail-closed Project rollover can run automatically when automation is enabled and safety gates pass
+- Reply timeout recovery, stale-view freshness checks, safe reload, and fail-closed Project rollover can run automatically when automation is enabled and safety gates pass
 - UI: en / Simplified Chinese / Japanese
 
 ### Gaps
@@ -70,15 +70,15 @@ In Per-Project mode, the bottom HUD bar owns frequent actions: **Manual continue
 
 - Herdr workspace progress checks and settled wakes
 - post-turn LLM analysis and continue submission
-- stalled reply recovery probes and safe reloads
+- stalled reply recovery probes plus stale-view comparison against ChatGPT's same-origin conversation snapshot; a proven server-ahead view is refreshed once, while a server-side unfinished message must remain stalled before reload is allowed
 - same-Project fail-closed rollover after recovery exhaustion or high context pressure
-- in-page ChatGPT permission-card handling when Auto-click Allow is enabled
+- in-page ChatGPT permission-card handling as part of the current Project automation state; there is no separate permission-card toggle
 
 **Automation off** keeps observation active but stops automatic mutations for that Project. Manual globally applies the same stop at the global layer without deleting saved Project preferences; switching back to Per-Project mode restores those preferences. Use the three manual HUD actions when automatic execution is off.
 
 ### A2. Long-conversation compression and rollover (ChatGPT Project)
 
-Extension 0.1.39 adds **Rollover** to the in-page HUD. The 0.1.43 series adds conservative context-pressure automation, reply recovery, and the Project-scoped automation gate behind the same fail-closed transfer state machine.
+Extension 0.1.39 adds **Rollover** to the in-page HUD. Version 0.1.43 adds the Project-scoped automation gate; 0.1.44 adds stale-view refresh and post-refresh activation to the same recovery chain. Global manual mode or Project `Auto off` prevents those automatic recovery/rollover actions from starting.
 
 Flow:
 

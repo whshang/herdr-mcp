@@ -7,7 +7,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const KEYS = [
   "herdrMcpUrl", "token", "wakeTemplate", "progressTickSec", "progressFallbackSec",
-  "progressTemplate", "autoAllow", "automationMode", "enabled",
+  "progressTemplate", "automationMode", "enabled",
   "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
   "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
 ];
@@ -49,11 +49,7 @@ function applyI18n() {
   $("hint_llm_prompt").textContent = t("hint_llm_prompt");
   $("lab_llm_skip").textContent = t("label_llm_skip");
   $("hint_llm_skip").textContent = t("hint_llm_skip");
-  $("lab_auto").textContent = t("label_auto_allow");
-  $("hint_auto").textContent = t("hint_auto_allow");
   $("lab_automation_mode").textContent = t("label_automation_mode");
-  $("automation_mode_manual").textContent = t("automation_mode_manual");
-  $("automation_mode_project").textContent = t("automation_mode_project");
   $("hint_automation_mode").textContent = t("hint_automation_mode");
   $("llmJudgeApiKey").placeholder = t("placeholder_llm_key");
   $("llmJudgeModel").placeholder = t("placeholder_llm_model");
@@ -85,12 +81,8 @@ async function loadForm() {
   $("llmJudgeSkipKeywords").value = (cfg.llmJudgeSkipKeywords && String(cfg.llmJudgeSkipKeywords).trim())
     ? cfg.llmJudgeSkipKeywords
     : DEFAULT_LLM_SKIP_KEYWORDS_TEXT;
-  $("autoAllow").checked = cfg.autoAllow !== false;
-  $("automationMode").value = cfg.automationMode === "project_auto"
-    ? "project_auto"
-    : cfg.automationMode === "manual"
-      ? "manual"
-      : cfg.enabled === true ? "project_auto" : "manual";
+  $("automationMode").checked = cfg.automationMode === "project_auto"
+    || (cfg.automationMode == null && cfg.enabled === true);
 }
 
 $("uiLocale").addEventListener("change", async () => {
@@ -109,13 +101,12 @@ $("save").addEventListener("click", () => {
     progressTickSec: parseTickSec($("progressTickSec").value, 60),
     progressFallbackSec: parseTickSec($("progressFallbackSec").value, 1200),
     progressTemplate: $("progressTemplate").value,
-    automationMode: $("automationMode").value === "project_auto" ? "project_auto" : "manual",
+    automationMode: $("automationMode").checked ? "project_auto" : "manual",
     llmJudgeBaseUrl: $("llmJudgeBaseUrl").value.trim(),
     llmJudgeApiKey: $("llmJudgeApiKey").value.trim(),
     llmJudgeModel: $("llmJudgeModel").value.trim(),
     llmJudgePromptTemplate: $("llmJudgePromptTemplate").value.trim() || t("default_llm_judge_prompt") || DEFAULT_LLM_JUDGE_PROMPT,
     llmJudgeSkipKeywords: $("llmJudgeSkipKeywords").value.trim() || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
-    autoAllow: $("autoAllow").checked,
     uiLocale: getLocale(),
   };
   chrome.runtime.sendMessage({ type: "h2w_set_config", config }, (resp) => {

@@ -346,6 +346,17 @@ console.log("\n[project handoff]");
   ok(hudRestored?.project_automation_available === true && hudRestored?.enabled === true,
     "returning to Project-auto restores the saved Project preference", JSON.stringify(hudRestored));
 
+  let resolveLegacyAllow;
+  const legacyAllowP = new Promise((r) => { resolveLegacyAllow = r; });
+  onMsg({ type: "h2w_set_config", config: { autoAllow: false } }, {}, (r) => resolveLegacyAllow(r));
+  await legacyAllowP;
+  let resolveHudAllow;
+  const hudAllowP = new Promise((r) => { resolveHudAllow = r; });
+  onMsg({ type: "h2w_page_hud", convKey: PROJECT_SOURCE }, { tab: { id: 401 } }, (r) => resolveHudAllow(r));
+  const hudAllow = await hudAllowP;
+  ok(hudAllow?.enabled === true && hudAllow?.autoAllow === true,
+    "legacy autoAllow=false cannot disable permission handling inside Project automation", JSON.stringify(hudAllow));
+
   let resolveStart;
   const startP = new Promise((r) => { resolveStart = r; });
   onMsg({ type: "h2w_handoff_start", tabId: 401 }, { tab: { id: 401 } }, (r) => resolveStart(r));

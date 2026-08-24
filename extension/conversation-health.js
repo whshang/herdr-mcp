@@ -26,6 +26,16 @@ function createConversationHealth(convKey, continuityId = null) {
     reload_attempt: 0,
     last_reload_at: null,
     rollover_hint_at: null,
+    freshness_state: "unknown",
+    freshness_checked_at: null,
+    server_latest_at: null,
+    page_latest_at: null,
+    freshness_delta_ms: null,
+    server_message_id: null,
+    page_message_id: null,
+    stale_refresh_attempt: 0,
+    stale_activation_attempt: 0,
+    reload_reason: null,
   };
 }
 
@@ -39,6 +49,9 @@ function markReplyWaiting(record, at = Date.now()) {
     last_turn_end_at: null,
     recovery_attempt: 0,
     reload_attempt: 0,
+    stale_refresh_attempt: 0,
+    stale_activation_attempt: 0,
+    reload_reason: null,
   };
 }
 
@@ -67,6 +80,22 @@ function markTurnEnded(record, at = Date.now()) {
     last_turn_end_at: at,
     recovery_attempt: 0,
     reload_attempt: 0,
+    stale_refresh_attempt: 0,
+    stale_activation_attempt: 0,
+    reload_reason: null,
+  };
+}
+
+function markFreshness(record, snapshot = {}, at = Date.now()) {
+  return {
+    ...record,
+    freshness_state: snapshot.state || "unknown",
+    freshness_checked_at: at,
+    server_latest_at: snapshot.serverLatestAt ?? null,
+    page_latest_at: snapshot.pageLatestAt ?? null,
+    freshness_delta_ms: snapshot.deltaMs ?? null,
+    server_message_id: snapshot.serverMessageId ?? null,
+    page_message_id: snapshot.pageMessageId ?? null,
   };
 }
 
@@ -95,6 +124,7 @@ globalThis.H2W_CONVERSATION_HEALTH = {
   markReplySuspect,
   markReloadPending,
   markTurnEnded,
+  markFreshness,
   markRolloverRecommended,
   markRolloverRequired,
 };

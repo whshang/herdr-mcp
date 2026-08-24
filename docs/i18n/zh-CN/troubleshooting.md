@@ -13,7 +13,7 @@
 
 ## MCP Connector 的授权卡片反复弹
 
-确认扩展已加载、当前标签页是 `chatgpt.com`、Options 为**项目自动**、当前 Project HUD 显示 **`自动 开`**，并且 Options 的「自动点击允许」已开启。全局手动或 Project `自动 关` 时扩展仍观察页面和 Herdr 状态，但不会点击权限卡；浏览器原生权限条也始终需要人工处理。见 [浏览器扩展](extension.md)。
+确认扩展已加载、当前标签页是 `chatgpt.com`、Options 已勾选**启用项目自动**、当前 Project HUD 显示 **`自动 开`**。权限卡自动处理已并入 Project 自动化；全局手动或 Project `自动 关` 时扩展仍观察页面和 Herdr 状态，但不会点击权限卡。浏览器原生权限条也始终需要人工处理。见 [浏览器扩展](extension.md)。
 
 ## HUD 绑定的是 w68，但底栏显示了另一个项目名
 

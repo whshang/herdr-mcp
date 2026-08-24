@@ -7,10 +7,37 @@ const recoveryMarkReplySuspect = HEALTH.markReplySuspect || ((record) => record)
 
 const DEFAULT_RECOVERY_POLICY = Object.freeze({
   replyTimeoutMs: 30000,
+  assistantStallMs: 30000,
+  serverStallMs: 60000,
+  freshnessProbeIntervalMs: 15000,
   reloadCooldownMs: 60000,
   maxRecoveryAttempts: 1,
   maxReloadAttempts: 1,
 });
+
+function classifyViewFreshness({ dom = {}, server = {}, now = Date.now() } = {}, policy = DEFAULT_RECOVERY_POLICY) {
+  if (!server?.ok || !server?.messageId) return { state: "unknown", deltaMs: null };
+  const serverLatestAt = Number(server.updatedAt || server.createdAt || 0) || null;
+  const pageLatestAt = Number(dom.messageAt || dom.changedAt || 0) || null;
+  const deltaMs = serverLatestAt && pageLatestAt ? serverLatestAt - pageLatestAt : null;
+  const serverId = String(server.messageId || "");
+  const pageId = String(dom.messageId || "");
+  const serverText = String(server.text || "").replace(/\s+/g, " ").trim();
+  const pageText = String(dom.text || "").replace(/\s+/g, " ").trim();
+
+  if (serverId && pageId && serverId !== pageId) {
+    return { state: "server_ahead", deltaMs, serverLatestAt, pageLatestAt };
+  }
+  if (serverText && pageText && serverText.length > pageText.length + 24
+    && serverText.slice(0, Math.min(pageText.length, 160)) === pageText.slice(0, 160)) {
+    return { state: "server_ahead", deltaMs, serverLatestAt, pageLatestAt };
+  }
+  const lastActivityAt = Math.max(Number(serverLatestAt || 0), Number(dom.changedAt || 0));
+  if (server.finished === false && lastActivityAt && now - lastActivityAt >= policy.serverStallMs) {
+    return { state: "server_stalled", deltaMs, serverLatestAt, pageLatestAt };
+  }
+  return { state: "synced", deltaMs, serverLatestAt, pageLatestAt };
+}
 
 function shouldSendRecovery(record, policy = DEFAULT_RECOVERY_POLICY, now = Date.now()) {
   if (!record || record.state !== RECOVERY_STATES.REPLY_SUSPECT) return false;
@@ -117,4 +144,5 @@ globalThis.H2W_RECOVERY_CONTROLLER = {
   canRolloverSafely,
   classifyReplyTimeout,
   canReloadSafely,
+  classifyViewFreshness,
 };

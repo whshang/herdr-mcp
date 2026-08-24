@@ -75,7 +75,7 @@
 
 ## ChatGPT 权限卡
 
-内容脚本会持续观察 chatgpt.com 的页面内权限卡，但只有 **Options 为项目自动 + 当前 Project `自动 开` + Options「自动点击允许」开启** 时才会点击明确的「允许」动作；全局手动或 Project `自动 关` 时停止自动点击。浏览器原生权限条不在可点击范围。见 [chatgpt-connector.md](./chatgpt-connector.md)。
+内容脚本会持续观察 chatgpt.com 的页面内权限卡，但只有 **Options 勾选“启用项目自动” + 当前 Project `自动 开`** 时才会点击明确的「允许」动作；权限卡自动处理已并入 Project 自动化，不再有独立开关。全局手动或 Project `自动 关` 时停止自动点击。浏览器原生权限条不在可点击范围。见 [chatgpt-connector.md](./chatgpt-connector.md)。
 
 ## 测试
 

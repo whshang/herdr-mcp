@@ -41,6 +41,16 @@ test("conversation health records the persisted recovery lifecycle fields", () =
     "last_reload_at",
     "rollover_hint_at",
     "continuity_id",
+    "freshness_state",
+    "freshness_checked_at",
+    "server_latest_at",
+    "page_latest_at",
+    "freshness_delta_ms",
+    "server_message_id",
+    "page_message_id",
+    "stale_refresh_attempt",
+    "stale_activation_attempt",
+    "reload_reason",
   ]) assert.ok(Object.hasOwn(record, field), `missing ${field}`);
 
   record = health.markReplyWaiting(record, 1000);
@@ -117,12 +127,40 @@ test("observed assistant progress cancels a stale ChatGPT reply timeout", () => 
   assert.equal(recovery.classifyReplyTimeout(record, 120000, 1000).state, "healthy");
 });
 
+test("freshness classification distinguishes synced, server-ahead, and server-stalled views", () => {
+  const context = loadClassicExtensionScripts();
+  const recovery = context.H2W_RECOVERY_CONTROLLER;
+  const now = 100000;
+  const baseDom = { messageId: "a1", text: "hello world", changedAt: 90000 };
+  const synced = recovery.classifyViewFreshness({
+    dom: baseDom,
+    server: { ok: true, messageId: "a1", text: "hello world", finished: true, updatedAt: 90000 },
+    now,
+  });
+  assert.equal(synced.state, "synced");
+  const ahead = recovery.classifyViewFreshness({
+    dom: baseDom,
+    server: { ok: true, messageId: "a2", text: "newer answer", finished: true, updatedAt: 95000 },
+    now,
+  });
+  assert.equal(ahead.state, "server_ahead");
+  const stalled = recovery.classifyViewFreshness({
+    dom: { ...baseDom, changedAt: 60000 },
+    server: { ok: true, messageId: "a1", text: "hello world", finished: false, updatedAt: 60000 },
+    now,
+  }, { ...recovery.DEFAULT_RECOVERY_POLICY, assistantStallMs: 30000, serverStallMs: 30000 });
+  assert.equal(stalled.state, "server_stalled");
+});
+
 test("ChatGPT turn watcher wires assistant progress, settled turns, and explicit rollover reasons", () => {
   const wake = fs.readFileSync(new URL("../extension/content/wake.js", import.meta.url), "utf8");
   assert.match(wake, /markAssistantProgressIfActive\(\)/);
   assert.match(wake, /markObservedTurnEnded\(endedAt\)/);
   assert.match(wake, /trigger:\s*"context_pressure"/);
   assert.match(wake, /trigger:\s*"recovery_exhausted"/);
+  assert.match(wake, /backend-api\/conversation/);
+  assert.match(wake, /maybeRefreshStaleView\(\)/);
+  assert.match(wake, /stale_view_activation_template/);
 });
 
 test("context pressure uses measured budget thresholds", () => {

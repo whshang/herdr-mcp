@@ -54,9 +54,9 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.43", "manifest version includes Project-scoped automation policy");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.43"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.43"'), "content version matches manifest");
+ok(manifest.version === "0.1.44", "manifest version includes stale-view recovery");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.44"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.44"'), "content version matches manifest");
 ok(
   manifest.content_scripts.find((cs) => cs.matches?.includes("https://chatgpt.com/*"))?.js?.includes("context-pressure.js"),
   "ChatGPT loads the classic context-pressure policy before wake.js",
@@ -293,8 +293,11 @@ ok(
     && zhLocale.hud_automation_off_hint.includes("同一 Project"),
   "zh Auto-off tooltip explains Project scope and manual availability",
 );
-ok(zhLocale.automation_mode_manual === "全局手动" && zhLocale.automation_mode_project === "项目自动",
-  "zh global automation modes match the product model");
+ok(zhLocale.label_automation_mode === "启用项目自动"
+    && zhLocale.hint_automation_mode.includes("底部状态条")
+    && zhLocale.hint_automation_mode.includes("新 Project 默认关闭")
+    && zhLocale.hint_automation_mode.includes("权限卡自动点击"),
+  "zh Project automation checkbox explains the two-level policy");
 for (const obsolete of ["hud_wake_on", "hud_wake_off", "hud_nudge_on", "hud_nudge_off", "hud_llm", "hud_llm_off"]) {
   ok(!(obsolete in zhLocale), `obsolete HUD locale key removed: ${obsolete}`);
 }
@@ -304,8 +307,14 @@ ok(!readFileSync(path.join(EXT, "options.html"), "utf8").includes("Enable wake +
   "Options source no longer exposes the legacy wake+nudge switch name");
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 const popupHtml = readFileSync(path.join(EXT, "popup.html"), "utf8");
-ok(optionsHtml.includes('id="automationMode"') && !optionsHtml.includes('id="enabled"'),
-  "Options selects the global manual / per-Project automation mode");
+ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
+    && !optionsHtml.includes('id="enabled"')
+    && !optionsHtml.includes('id="autoAllow"')
+    && !optionsHtml.includes('<select id="automationMode">'),
+  "Options exposes one Project-automation checkbox and no independent permission toggle");
+ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")')
+    && !backgroundSource.includes("CFG.autoAllow"),
+  "permission-card automation is folded into effective Project automation");
 ok(!popupHtml.includes('id="idleNudgeEnabled"') && !popupHtml.includes('id="enabled"') && popupHtml.includes('id="automationModeStatus"'),
   "popup reports the global mode without exposing an automation toggle");
 

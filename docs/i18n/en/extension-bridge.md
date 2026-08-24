@@ -17,7 +17,7 @@ First batch: `chat.deepseek.com`, `chat.z.ai`.
 | SpeaksJSON extracts `{"tool":"...","args":{}}` | **done** (DeepSeek / z.ai content scripts) |
 | background `tools/call` + result backfill into the same conversation | **not done** |
 | Options allowlist | **not done** |
-| permission-card auto-allow (chatgpt) | auxiliary capability of the other track; requires Options **Per-Project automation**, current Project HUD `Auto on`, plus Options Auto-click Allow |
+| permission-card auto-allow (chatgpt) | auxiliary capability of the other track; folded into Project automation and requires per-Project automation enabled in Options plus current Project HUD `Auto on` |
 
 ## Three stages
 

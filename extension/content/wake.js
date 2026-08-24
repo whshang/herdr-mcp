@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.43";
+const H2W_CONTENT_VERSION = "0.1.44";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -18,6 +18,7 @@ const H2W_CONTENT_VERSION = "0.1.43";
   const RECOVERY_CONTROLLER = globalThis.H2W_RECOVERY_CONTROLLER || null;
   let conversationHealth = null;
   let contextPressureRecord = null;
+  let lastFreshnessProbeAt = 0;
   // Fail closed until background confirms the master automation state. The
   // read-only HUD/workspace observers do not depend on these flags.
   let automationEnabled = false;
@@ -62,7 +63,9 @@ const H2W_CONTENT_VERSION = "0.1.43";
 
   function markAssistantProgressIfActive(at = Date.now()) {
     if (!conversationHealth || !CONVERSATION_HEALTH) return;
-    if ([
+    const currentTurnOpen = Number(conversationHealth.last_user_submit_at || 0) > 0
+      && Number(conversationHealth.last_turn_end_at || 0) < Number(conversationHealth.last_user_submit_at || 0);
+    if (currentTurnOpen || [
       CONVERSATION_HEALTH.CONVERSATION_STATES.REPLY_WAITING,
       CONVERSATION_HEALTH.CONVERSATION_STATES.REPLY_SUSPECT,
       CONVERSATION_HEALTH.CONVERSATION_STATES.RECOVERY_MESSAGE_SENT,
@@ -793,6 +796,127 @@ const H2W_CONTENT_VERSION = "0.1.43";
     return `${value.length}:${hash >>> 0}`;
   }
 
+  function chatGptConversationId() {
+    const value = String(ADAPTER.getConversationKey() || location.href || "");
+    const match = value.match(/\/c\/([^/?#]+)/);
+    return match ? decodeURIComponent(match[1]) : null;
+  }
+
+  function latestDomAssistantSnapshot() {
+    const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+    const el = nodes[nodes.length - 1] || null;
+    if (!el) return { messageId: null, text: "", messageAt: null, changedAt: null };
+    const container = el.closest("[data-message-id]") || el.closest("[data-turn-id]") || el;
+    const timeNode = container?.querySelector?.("time[datetime]") || null;
+    const parsedTime = timeNode?.getAttribute?.("datetime") ? Date.parse(timeNode.getAttribute("datetime")) : NaN;
+    return {
+      messageId: container?.getAttribute?.("data-message-id") || el.getAttribute("data-message-id") || null,
+      text: String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim(),
+      messageAt: Number.isFinite(parsedTime) ? parsedTime : null,
+      changedAt: Number(conversationHealth?.last_assistant_progress_at || conversationHealth?.last_turn_end_at || 0) || null,
+    };
+  }
+
+  function serverMessageText(message) {
+    const parts = message?.content?.parts;
+    if (!Array.isArray(parts)) return "";
+    return parts.map((part) => typeof part === "string" ? part : (part?.text || "")).join("\n").replace(/\s+/g, " ").trim();
+  }
+
+  async function fetchChatGptConversationSnapshot() {
+    const conversationId = chatGptConversationId();
+    if (!conversationId || ADAPTER.name !== "chatgpt") return { ok: false, reason: "not-chatgpt-conversation" };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      const response = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+        credentials: "include",
+        cache: "no-store",
+        headers: { accept: "application/json" },
+        signal: controller.signal,
+      });
+      if (!response.ok) return { ok: false, reason: `http-${response.status}` };
+      const body = await response.json();
+      const mapping = body?.mapping || {};
+      let nodeId = body?.current_node || null;
+      let assistant = null;
+      for (let i = 0; nodeId && i < 40; i += 1) {
+        const node = mapping?.[nodeId];
+        const message = node?.message;
+        if (message?.author?.role === "assistant") { assistant = message; break; }
+        nodeId = node?.parent || null;
+      }
+      if (!assistant?.id) return { ok: false, reason: "no-assistant-node" };
+      const finishType = String(assistant?.metadata?.finish_details?.type || "");
+      const status = String(assistant?.status || "");
+      const completed = assistant?.end_turn === true
+        || status === "finished_successfully"
+        || ["stop", "max_tokens", "length"].includes(finishType);
+      const explicitlyOpen = assistant?.end_turn === false || ["in_progress", "streaming"].includes(status);
+      const finished = completed ? true : (explicitlyOpen ? false : null);
+      const updateSeconds = Number(assistant?.update_time || assistant?.create_time || body?.update_time || 0);
+      return {
+        ok: true,
+        messageId: String(assistant.id),
+        text: serverMessageText(assistant),
+        status,
+        finished,
+        createdAt: Number(assistant?.create_time || 0) > 0 ? Number(assistant.create_time) * 1000 : null,
+        updatedAt: updateSeconds > 0 ? updateSeconds * 1000 : null,
+      };
+    } catch (error) {
+      return { ok: false, reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function maybeRefreshStaleView() {
+    if (!automationEnabled || ADAPTER.name !== "chatgpt" || !conversationHealth || !RECOVERY_CONTROLLER) return false;
+    const now = Date.now();
+    if (now - lastFreshnessProbeAt < RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.freshnessProbeIntervalMs) return false;
+    const lastConversationActivity = Math.max(
+      Number(conversationHealth.last_user_submit_at || 0),
+      Number(conversationHealth.last_assistant_progress_at || 0),
+      Number(conversationHealth.last_turn_end_at || 0),
+    );
+    if (!lastConversationActivity || now - lastConversationActivity < RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.assistantStallMs) return false;
+    if (!conversationHealth.last_user_submit_at || now - Number(conversationHealth.last_user_submit_at) > 10 * 60 * 1000) return false;
+    lastFreshnessProbeAt = now;
+
+    const dom = latestDomAssistantSnapshot();
+    const server = await fetchChatGptConversationSnapshot();
+    const freshness = RECOVERY_CONTROLLER.classifyViewFreshness({ dom, server, now });
+    if (CONVERSATION_HEALTH?.markFreshness) {
+      markConversationState(CONVERSATION_HEALTH.markFreshness(conversationHealth, {
+        ...freshness,
+        serverMessageId: server?.messageId || null,
+        pageMessageId: dom?.messageId || null,
+      }, now));
+    }
+    if (!["server_ahead", "server_stalled"].includes(freshness.state)) return false;
+    const safety = recoverySafetySnapshot();
+    if (safety.composerBusy || safety.toolRunning || safety.permissionCardActive) return false;
+    if (freshness.state === "server_stalled" && safety.streaming
+      && now - lastConversationActivity < RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.serverStallMs + 30000) return false;
+    if (Number(conversationHealth.stale_refresh_attempt || 0) >= 1) return false;
+    if (!RECOVERY_CONTROLLER.canReloadSafely({ ...safety, streaming: false })) return false;
+
+    const signature = assistantSignature(dom.text);
+    const pending = CONVERSATION_HEALTH.markReloadPending({
+      ...conversationHealth,
+      stale_refresh_attempt: Number(conversationHealth.stale_refresh_attempt || 0) + 1,
+      reload_reason: "stale_view",
+      assistant_signature_before_reload: signature,
+    });
+    markConversationState(pending);
+    const reloading = RECOVERY_CONTROLLER.markReloaded(conversationHealth);
+    markConversationState({ ...reloading, reload_reason: "stale_view", assistant_signature_before_reload: signature });
+    await wait(150);
+    location.reload();
+    return true;
+  }
+
   function recoverySafetySnapshot() {
     const composerText = composerNorm();
     let permissionCardActive = false;
@@ -881,15 +1005,35 @@ const H2W_CONTENT_VERSION = "0.1.43";
   async function maybeEscalateRecoveryRollover() {
     if (!conversationHealth || !RECOVERY_CONTROLLER || !CONVERSATION_HEALTH) return false;
     if (!automationEnabled) return false;
-    if (conversationHealth.state !== CONVERSATION_HEALTH.CONVERSATION_STATES.RECOVERING) return false;
+    const exhaustedSuspect = conversationHealth.state === CONVERSATION_HEALTH.CONVERSATION_STATES.REPLY_SUSPECT
+      && Number(conversationHealth.recovery_attempt || 0) >= RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.maxRecoveryAttempts
+      && Number(conversationHealth.reload_attempt || 0) >= RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.maxReloadAttempts;
+    if (conversationHealth.state !== CONVERSATION_HEALTH.CONVERSATION_STATES.RECOVERING && !exhaustedSuspect) return false;
     if (Date.now() - Number(conversationHealth.last_reload_at || 0) < 10000) return false;
 
     const assistantText = lastMessageByRole("assistant");
     const currentSignature = assistantSignature(assistantText);
-    if (assistantText && looksLikeSubstantiveReply(assistantText)
+    if (!isTurnInProgress() && assistantText && looksLikeSubstantiveReply(assistantText)
       && currentSignature !== conversationHealth.assistant_signature_before_reload) {
       markConversationState(CONVERSATION_HEALTH.markTurnEnded(conversationHealth));
       paintPageHud({});
+      return true;
+    }
+    if (conversationHealth.reload_reason === "stale_view" && Number(conversationHealth.stale_activation_attempt || 0) < 1) {
+      const safety = recoverySafetySnapshot();
+      if (safety.composerBusy || safety.streaming || safety.toolRunning || safety.permissionCardActive) return false;
+      const result = await performWake({ template: hudLabels.stale_view_activation_template, autoAllow: false, recovery: true });
+      if (!result?.ok) return false;
+      markConversationState(RECOVERY_CONTROLLER.markRecoverySent({
+        ...conversationHealth,
+        stale_activation_attempt: 1,
+      }));
+      paintPageHud({});
+      const confirm = await confirmReplyStarted(RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.replyTimeoutMs);
+      if (confirm?.replyStarted) {
+        markConversationState(CONVERSATION_HEALTH.markReplyStarted(conversationHealth));
+        paintPageHud({});
+      }
       return true;
     }
     const safety = recoverySafetySnapshot();
@@ -931,6 +1075,7 @@ const H2W_CONTENT_VERSION = "0.1.43";
       void (async () => {
         const next = RECOVERY_CONTROLLER.classifyReplyTimeout(conversationHealth);
         if (next !== conversationHealth) markConversationState(next);
+        if (await maybeRefreshStaleView()) return;
         if (await maybeSendRecoveryProbe()) return;
         if (await maybeReloadForRecovery()) return;
         if (await maybeEscalateContextRollover()) return;
@@ -962,6 +1107,9 @@ const H2W_CONTENT_VERSION = "0.1.43";
     let sawGrowth = false;
     let startedAt = 0;
     let userTextAtStart = "";
+    const hydrationGraceUntil = Date.now() + 5000;
+    let lastUserSignature = assistantSignature(lastMessageByRole("user"));
+    let lastUserCount = document.querySelectorAll('[data-message-author-role="user"]').length;
     let settleTimer = null;
     let lastReportedEnd = 0;
     let lastAsstLen = 0;
@@ -998,6 +1146,17 @@ const H2W_CONTENT_VERSION = "0.1.43";
 
     const onTick = () => {
       const stopping = isComposerGenerating();
+      const currentUserText = lastMessageByRole("user");
+      const currentUserSignature = assistantSignature(currentUserText);
+      const currentUserCount = document.querySelectorAll('[data-message-author-role="user"]').length;
+      const userChanged = currentUserText && (currentUserSignature !== lastUserSignature || currentUserCount > lastUserCount);
+      if (userChanged) {
+        if (Date.now() >= hydrationGraceUntil && CONVERSATION_HEALTH && conversationHealth) {
+          markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
+        }
+        lastUserSignature = currentUserSignature;
+        lastUserCount = currentUserCount;
+      }
       const assistantText = lastMessageByRole("assistant");
       const curLen = assistantText.length;
       const curSignature = assistantSignature(assistantText);

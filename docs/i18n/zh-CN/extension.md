@@ -5,7 +5,7 @@
 
 | 主线 | 问题 | 方向 | 状态 | 首批站点 |
 |---|---|---|---|---|
-| **A. 网页连续工作** | 网页派活后会停住；回复可能超时；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + ChatGPT Project 自动化/恢复/接力 | **已可用**（当前 0.1.43 系列；全局运行模式 + Project 自动开关） | 绑定/观察：4 站；自动化/恢复/接力：ChatGPT Project |
+| **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + ChatGPT Project 自动化/新鲜度恢复/接力 | **已可用**（当前 0.1.44 系列；全局运行模式 + Project 自动开关） | 绑定/观察：4 站；自动化/恢复/接力：ChatGPT Project |
 | **B. JSON→MCP** | DeepSeek / z.ai 网页没有 MCP Connector | 网页 → 本机 `127.0.0.1:8772/mcp` | **未完成**（能抠 JSON，未调 MCP） | `chat.deepseek.com`、`chat.z.ai` |
 
 共享：同一扩展、同一静态 token、同一 options。  
@@ -39,9 +39,9 @@ Chrome 145+ 把本机回环访问拆成 `loopback-network`（界面显示为“�
 - 绑定：popup 把「当前会话」绑到某个 herdr **workspace**（space 内多 agent 并行可回推）
 - SSE：`/push/events?workspace=...`
 - 策略：见过 `working` 之后；局部 settle 报进展，范围内全空闲才收工；`hello` 可补
-- chatgpt.com 页内权限卡可自动点「允许」，但必须同时满足 Options 为**项目自动**、当前 Project HUD 为 **`自动 开`**、且 Options 的「自动点击允许」已启用；全局手动或 Project `自动 关` 时只观察，不自动点击
+- chatgpt.com 页内权限卡自动处理已并入 Project 自动化：Options 勾选**启用项目自动**且当前 Project HUD 为 **`自动 开`** 时才会自动点明确的「允许」；全局手动或 Project `自动 关` 时只观察，不自动点击
 - ChatGPT 回合结束后可用小模型判断是否继续（Options 配 Base URL + Key + Model；自动模式下执行；冷却与进度检查共用 `progressTickSec`）
-- 回复长时间没有开始时可自动做恢复探测；探测仍失败且页面安全时最多做一次安全刷新，再失败可进入同一 Project 的接力
+- 回复长时间没有开始时可自动做恢复探测；0.1.44 还会处理“回复已经开始但页面停在半截”的 stale-view：best-effort 比较 ChatGPT 同源 conversation snapshot 与页面最后 assistant message，只有确认服务端领先页面，或服务端未完成消息确实长期停滞，才进入刷新恢复
 - ChatGPT Project 长对话按页面可见用户/助手文本做保守 token 估算；达到自动阈值且 workspace/页面均静止、安全条件满足时，复用同一 fail-closed handoff 状态机自动接力
 - UI：en / 简体中文 / 日本語
 
@@ -80,18 +80,30 @@ Project `自动 开` 是当前 Project 的执行 gate。只有 Options 已选择
 
 1. Herdr `working` 期间按事件设置检查并回推进度；局部/全部 `settled` 后自动唤醒网页继续。
 2. ChatGPT 回合结束后执行已配置的小模型判断，并在需要时继续。
-3. 用户消息提交后约 30 秒仍没有可见回复时发送一次只读恢复探测；仍失败且编辑器、流式输出、工具、权限卡与投递状态都安全时，最多执行一次安全刷新。
-4. 恢复探测 + 安全刷新仍失败时，在可接力的已绑定 ChatGPT Project 会话里进入同一 fail-closed handoff/cutover 流程。
-5. 长对话上下文压力达到自动阈值时，在页面静止、无工具/流式输出、无不确定投递、workspace 已绑定且可接力的前提下自动开同一 Project 的新会话并迁移绑定。
-6. 若 Options 的「自动点击允许」也开启，自动处理 ChatGPT 页面内明确的 Allow/允许权限卡；浏览器原生权限条仍不会自动点击。
+3. 用户消息提交后约 30 秒仍没有可见回复时发送一次只读恢复探测；对“已经有回复但 DOM 停在半截”的情况，会 best-effort 读取 ChatGPT 同源 conversation snapshot 的 `current_node / message id / status / update_time`，与页面最后一条 assistant message 对比。服务端明确领先页面时只刷新一次；服务端本身仍未完成则至少持续停滞 60 秒（页面仍声称 streaming 时更保守）才允许刷新。
+4. stale-view 刷新后先重新比较内容：若页面已追上服务端或回复恢复增长，立即停止恢复；若仍是同一半截内容，则只发送一次“浏览器恢复”激活消息，要求重新读取当前会话、从实际停止处继续、不要重复已完成工作。若同源 snapshot 接口不可用，则该探测 fail-closed，不凭时间差盲刷新。
+5. 恢复消息 + 安全刷新仍失败时，在可接力的已绑定 ChatGPT Project 会话里进入同一 fail-closed handoff/cutover 流程。
+6. 长对话上下文压力达到自动阈值时，在页面静止、无工具/流式输出、无不确定投递、workspace 已绑定且可接力的前提下自动开同一 Project 的新会话并迁移绑定。
+7. 自动处理 ChatGPT 页面内明确的 Allow/允许权限卡；该能力随当前 Project `自动 开` 一起启停，不再有独立开关。浏览器原生权限条仍不会自动点击。
 
 Project `自动 关` 会阻止该 Project 的新自动 mutation；“全局手动”则在更高一层阻止所有 Project 的自动 mutation。两种情况下 **Herdr/workspace SSE、HUD 状态、会话绑定和实时 workspace catalog 仍持续观察**。从“全局手动”切回“项目自动”不会删除各 Project 已保存的开关偏好。
 
 `workspace_id` 是绑定身份，`workspace_label` 只是展示缓存。HUD 和后续 wake 会优先用实时 workspace catalog 的 label；如果历史 binding 里同一个 `workspace_id` 保存了旧/错误名称，background 会自动修正持久化 label，避免浮层与底栏显示不同项目名。
 
+### 页面新鲜度 / stale-view 恢复
+
+0.1.44 把“ChatGPT 真没回复”和“服务端已经有更新、当前网页还停在旧 DOM”拆开判断。内容脚本同时记录人工发送和扩展自动发送的用户回合，并持续维护页面最后 assistant message 的 id、文本指纹与最近变化时间。进入恢复窗口后，它会 best-effort 请求当前 conversation 的同源 snapshot，沿 `current_node` 找到最新 assistant message，再比较 message id、文本、完成状态与更新时间。
+
+- **server ahead**：服务端 message id 已更新，或同一消息的服务端文本明显长于页面 → 页面陈旧，安全条件满足时刷新一次。
+- **server stalled**：服务端消息明确仍处于未完成状态，且至少 60 秒没有更新；如果页面仍显示 streaming，再多等 30 秒后才允许刷新。
+- **synced**：服务端和页面一致且服务端已结束 → 不刷新，交给正常的 settled / LLM 判断处理。
+- **unknown**：内部 snapshot 接口返回错误、超时或结构变化 → fail-closed，不因为拿不到证据就刷新。
+
+刷新前会持久记录旧 assistant 指纹。重载后若内容变化或继续流式输出，恢复立即结束；若 10 秒后仍是同一半截内容且编辑器、工具、权限卡都空闲，则发送一次 `stale_view_activation_template`，要求从实际停止处继续且不重复完成过的 mutation。只有这一步也失败后，才进入原有 recovery-exhausted rollover。
+
 ### A2. 长对话压缩与接力（ChatGPT Project）
 
-扩展从 0.1.39 起提供 fail-closed **接力 / Rollover**，当前 0.1.43 系列在同一个状态机上增加了保守的上下文压力自动触发、回复超时恢复触发和 Project 级自动化 gate。全局手动或当前 Project `自动 关` 时不会启动新的自动接力。
+扩展从 0.1.39 起提供 fail-closed **接力 / Rollover**；0.1.43 加入 Project 级自动化 gate，0.1.44 再把 stale-view 刷新与“刷新后激活”接入同一恢复链。全局手动或当前 Project `自动 关` 时不会启动这些自动恢复或接力。
 
 工作流：
 

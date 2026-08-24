@@ -24,7 +24,7 @@ import {
 } from "./continuity-core.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 
-const H2W_SCRIPT_VERSION = "0.1.43";
+const H2W_SCRIPT_VERSION = "0.1.44";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -98,6 +98,7 @@ function hudLabels() {
     "rollover_required", "context_warning", "handoff_prepare", "high_risk",
   ]) out.states[state] = localizedText(`hud_state_${state}`);
   out.recovery_probe_template = localizedText("recovery_probe_template");
+  out.stale_view_activation_template = localizedText("stale_view_activation_template");
   return out;
 }
 
@@ -110,7 +111,7 @@ let CFG = {
   herdrMcpUrl: "http://127.0.0.1:8772", token: "", automationMode: AUTOMATION_MODE_MANUAL,
   // Legacy fields stay fail-closed for older content scripts. New code derives
   // automation from global mode + the current ChatGPT Project id.
-  enabled: false, autoAllow: true,
+  enabled: false,
   wakeTemplate: "", progressTickSec: 60, progressFallbackSec: 1200,
   progressTemplate: "",
   idleNudgeEnabled: true,
@@ -219,6 +220,7 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
       }
     } catch (e) {}
   }
+  try { await chrome.storage.local.remove("autoAllow"); } catch (e) {}
   resolveConfigReady();
 })();
 
@@ -1304,7 +1306,7 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTem
       data: {
         template: rawText,
         llmNudge: true,
-        autoAllow: CFG.autoAllow !== false,
+        autoAllow: true,
       },
     };
     return deliverWakeToTab(b, payload);
@@ -1383,7 +1385,7 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTem
       idle_hint,
       working_count,
       template: rendered,
-      autoAllow: CFG.autoAllow !== false,
+      autoAllow: true,
     },
   };
 
@@ -1998,7 +2000,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({
       ok: true,
       ...scope,
-      autoAllow: CFG.autoAllow !== false,
+      autoAllow: true,
       labels: hudLabels(),
     });
     return;
@@ -2044,7 +2046,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         project_id: automation.project_id,
         project_automation_available: automation.project_automation_available,
         project_automation_enabled: automation.project_automation_enabled,
-        autoAllow: CFG.autoAllow !== false,
+        autoAllow: true,
         idleNudgeEnabled: automation.enabled,
         progressTickSec: paceIntervalSec() || Number(CFG.progressTickSec) || 0,
         progressFallbackSec: Number(CFG.progressFallbackSec) || 0,
@@ -2087,6 +2089,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     void (async () => {
       const incoming = { ...(msg.config || {}) };
       delete incoming.idleNudgeCooldownSec;
+      // Permission-card auto-allow is part of effective Project automation.
+      // Ignore the 0.1.43-and-earlier independent preference.
+      delete incoming.autoAllow;
       if (Object.prototype.hasOwnProperty.call(incoming, "uiLocale")) {
         await setLocale(String(incoming.uiLocale || "en"));
       }
@@ -2106,7 +2111,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       CFG.idleNudgeEnabled = false;
       delete CFG.idleNudgeCooldownSec;
       await chrome.storage.local.set({ ...CFG, enabled: false, idleNudgeEnabled: false });
-      try { await chrome.storage.local.remove("idleNudgeCooldownSec"); } catch (e) {}
+      try { await chrome.storage.local.remove(["idleNudgeCooldownSec", "autoAllow"]); } catch (e) {}
       void rebuildStreams();
       await notifyAutomationChanged();
       sendResponse({ ok: true });
@@ -2451,7 +2456,6 @@ chrome.runtime.onInstalled.addListener(() => {
       token: "",
       automationMode: AUTOMATION_MODE_MANUAL,
       enabled: false,
-      autoAllow: true,
       wakeTemplate: defaultWakeTemplate(),
       progressTickSec: 60,
       progressFallbackSec: 1200,

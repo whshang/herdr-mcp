@@ -13,7 +13,7 @@ Hard requirements and diagnostics: [chatgpt-connector](chatgpt-connector.md).
 
 ## The MCP Connector card keeps popping up
 
-Verify the extension is loaded, Options is set to **Per-Project automation**, the current ChatGPT Project HUD shows **`Auto on`**, and Options **Auto-click Allow** is enabled. In Manual globally mode or with the Project `Auto off`, the extension still observes the page and Herdr state but does not click permission cards; native browser permission bars always require manual handling. See [extension](extension.md).
+Verify the extension is loaded, **per-Project automation** is enabled in Options, and the current ChatGPT Project HUD shows **`Auto on`**. Permission-card handling is part of Project automation; in global manual mode or with the Project `Auto off`, the extension still observes the page and Herdr state but does not click permission cards. Native browser permission bars always require manual handling. See [extension](extension.md).
 
 ## The HUD is bound to w68 but the bottom bar shows another project name
 

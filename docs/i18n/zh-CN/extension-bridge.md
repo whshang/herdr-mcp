@@ -17,7 +17,7 @@
 | SpeaksJSON 抠 `{"tool":"...","args":{}}` | **有**（DeepSeek / z.ai 内容脚本） |
 | background `tools/call` + 结果回填同一会话 | **未做** |
 | Options 白名单 | **未做** |
-| 权限卡自动允许（chatgpt） | 另一主线附属能力；要求 Options 为“项目自动”+ 当前 Project HUD `自动 开` + Options「自动点击允许」开启 |
+| 权限卡自动允许（chatgpt） | 另一主线附属能力；已并入 Project 自动化，要求 Options 勾选“启用项目自动”+ 当前 Project HUD `自动 开` |
 
 ## 三阶段
 
