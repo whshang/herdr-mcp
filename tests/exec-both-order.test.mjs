@@ -8,7 +8,18 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { startExecSession, readExecSession, killExecSession } from "../dist/exec-sessions.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Root tests run in parallel. Give this module a private exec-session journal
+// so another test process cannot mistake this module's real child for an
+// orphan and SIGTERM it during recovery.
+const stateDir = mkdtempSync(join(tmpdir(), "herdr-exec-both-order-test-"));
+process.env.HERDR_MCP_STATE_DIR = stateDir;
+process.on("exit", () => { try { rmSync(stateDir, { recursive: true, force: true }); } catch {} });
+
+const { startExecSession, readExecSession, killExecSession } = await import("../dist/exec-sessions.js");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
