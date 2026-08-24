@@ -51,6 +51,23 @@ function recommendRollover(record, policy = DEFAULT_RECOVERY_POLICY) {
     && record.state !== RECOVERY_STATES.HEALTHY);
 }
 
+function canRolloverSafely(record, {
+  composerBusy = false,
+  composerHasHumanText = false,
+  streaming = false,
+  toolRunning = false,
+  permissionCardActive = false,
+  tabReachable = true,
+} = {}, policy = DEFAULT_RECOVERY_POLICY) {
+  if (!recommendRollover(record, policy)) return false;
+  if (composerBusy || composerHasHumanText || streaming || toolRunning || permissionCardActive) return false;
+  if (!tabReachable) return false;
+  const lastReloadAt = Number(record?.last_reload_at || 0);
+  const lastProgressAt = Number(record?.last_assistant_progress_at || 0);
+  if (lastReloadAt && lastProgressAt > lastReloadAt) return false;
+  return true;
+}
+
 function classifyReplyTimeout(record, now = Date.now(), timeoutMs = DEFAULT_RECOVERY_POLICY.replyTimeoutMs) {
   if (!record) return record;
   let startedAt = null;
@@ -97,6 +114,7 @@ globalThis.H2W_RECOVERY_CONTROLLER = {
   markRecovering,
   markReloaded,
   recommendRollover,
+  canRolloverSafely,
   classifyReplyTimeout,
   canReloadSafely,
 };

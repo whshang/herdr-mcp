@@ -87,24 +87,29 @@ function compactWorkspaceLabels(bindings) {
 }
 
 /** Build the user message sent to the CURRENT conversation to create a handoff. */
-export function buildHandoffRequest({ transferId, bindings = [] } = {}) {
+export function buildHandoffRequest({ transferId, bindings = [], template = null } = {}) {
   const id = String(transferId || "").trim();
   if (!id) throw new Error("transferId is required");
   const workspaces = compactWorkspaceLabels(bindings);
   const workspaceLine = workspaces.length ? workspaces.join(", ") : "(none)";
+  if (template) {
+    return String(template)
+      .replaceAll("{id}", id)
+      .replaceAll("{workspace_line}", workspaceLine);
+  }
   return [
-    "This is a conversation rollover request from the Herdr browser extension.",
-    "Do not continue implementation, do not call tools, and do not ask follow-up questions in this turn.",
-    "Summarize the CURRENT working state so a fresh ChatGPT conversation in the same Project can continue without replaying completed work.",
-    "Use only facts already established in this conversation. Do not invent current runtime/Git state; the next conversation must verify live state before mutations.",
-    `Bound Herdr workspaces: ${workspaceLine}.`,
-    "Include: current objective, completed work, important decisions, active/incomplete work, exact files/branches/commits/runtime facts when known, constraints/safety rules, and the recommended next actions.",
-    "Keep it compact but operationally complete. Preserve literal identifiers, paths, commands, versions, URLs, and task IDs that matter.",
-    "Return exactly one handoff packet between the markers below. No prose before or after the markers.",
+    "这是由 Herdr 浏览器扩展发起的对话接力请求。",
+    "本轮不要继续实现，不要调用工具，也不要追问。",
+    "请总结当前工作状态，让同一 Project 中的新 ChatGPT 对话可以继续推进，同时避免重复已经完成的工作。",
+    "只能使用本对话已经确认的事实。不要虚构当前 runtime/Git 状态；新对话开始 mutation 前必须重新检查实时状态。",
+    `已绑定 Herdr workspace：${workspaceLine}。`,
+    "必须包含：当前目标、已完成工作、重要决定、进行中/未完成工作、已知的准确文件/分支/提交/runtime 事实、安全约束，以及建议下一步。",
+    "保持精炼但可直接继续执行。保留重要的字面标识符、路径、命令、版本、URL 和任务 ID。",
+    "只返回下面标记之间的一份 handoff packet，标记前后不要添加其他文字。",
     "",
     `${HANDOFF_BEGIN} id=${id}>>>`,
-    "# Project handoff",
-    "<!-- write the compact handoff here -->",
+    "# 项目接力",
+    "<!-- 在这里写入精炼的 handoff -->",
     HANDOFF_END,
   ].join("\n");
 }
@@ -126,15 +131,20 @@ export function extractHandoffPacket(text, transferId) {
 }
 
 /** Build the first user message in the NEW conversation. */
-export function buildHandoffSeed({ transferId, packet } = {}) {
+export function buildHandoffSeed({ transferId, packet, template = null } = {}) {
   const id = String(transferId || "").trim();
   const handoff = String(packet || "").trim();
   if (!id || !handoff) throw new Error("transferId and packet are required");
   if (handoff.length > MAX_HANDOFF_PACKET_CHARS) throw new Error("handoff packet too large");
+  if (template) {
+    return String(template)
+      .replaceAll("{id}", id)
+      .replaceAll("{packet}", handoff);
+  }
   return [
-    `Continue the same project from the compact handoff below. This message was transferred by the Herdr browser extension.`,
-    "Treat the handoff as working-state context, not as proof that live state is unchanged.",
-    "Before any mutation, verify the relevant current Herdr/runtime/Git state. Do not rerun completed work merely because it is mentioned in the handoff.",
+    "继续同一个项目。以下内容由 Herdr 浏览器扩展从上一段对话接力而来。",
+    "把 handoff 作为工作状态上下文，不要把它视为实时状态仍未变化的证明。",
+    "开始任何 mutation 前，重新检查相关的 Herdr/runtime/Git 状态。不要因为 handoff 里提到过，就重复执行已经完成的工作。",
     "",
     `${HANDOFF_SEED_PREFIX} id=${id}]`,
     handoff,

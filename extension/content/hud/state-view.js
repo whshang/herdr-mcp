@@ -7,5 +7,6 @@ globalThis.H2W_HUD.buildHudStateView = function buildHudStateView(input = {}) {
     state: input.state || "unknown",
     recovery: input.recovery || "none",
     lastEvent: input.lastEvent || null,
+    labels: input.labels || {},
   };
 };

@@ -54,13 +54,17 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
-ok(manifest.version === "0.1.41", "manifest version includes live HUD runtime state");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.41"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.41"'), "content version matches manifest");
+ok(manifest.version === "0.1.42", "manifest version includes proactive context pressure policy");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.42"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.42"'), "content version matches manifest");
+ok(
+  manifest.content_scripts.find((cs) => cs.matches?.includes("https://chatgpt.com/*"))?.js?.includes("context-pressure.js"),
+  "ChatGPT loads the classic context-pressure policy before wake.js",
+);
 ok(
   backgroundSource.includes("bound_workspace_ids:")
-    && backgroundSource.includes("bindings: session.map((b) => bindingView(b))")
-    && backgroundSource.includes("workspaces: state?.ok"),
+    && backgroundSource.includes("bindingView(b)")
+    && backgroundSource.includes("workspaces: liveWorkspaces"),
   "page HUD response carries live workspace and binding runtime state",
 );
 ok(
@@ -74,6 +78,22 @@ ok(
     && wakeSource.includes("ws-action"),
   "in-page HUD contains the conversation controls",
 );
+{
+  const panelStart = wakeSource.indexOf('<div class="panel" part="panel" hidden>');
+  const barStart = wakeSource.indexOf('<div class="bar" part="bar">');
+  const panelHtml = wakeSource.slice(panelStart, barStart);
+  const barHtml = wakeSource.slice(barStart, wakeSource.indexOf("`;", barStart));
+  ok(
+    panelStart >= 0 && barStart > panelStart
+      && !panelHtml.includes("manual-continue")
+      && !panelHtml.includes('class="quick"')
+      && barHtml.includes("manual-continue")
+      && barHtml.includes("manual-status")
+      && barHtml.includes("manual-judge")
+      && barHtml.includes('class="quick"'),
+    "frequent manual actions and automation switch live on the HUD bar, not in the drawer",
+  );
+}
 ok(
   wakeSource.includes("hudBoundRuntimeState")
     && wakeSource.includes('document.addEventListener("pointerdown"')
@@ -216,14 +236,17 @@ console.log("\n[conversation continuity]");
   ok(extractHandoffPacket(assistant, "ht:wrong") === null, "handoff packet rejects a mismatched transfer id");
   const seed = buildHandoffSeed({ transferId, packet });
   ok(handoffSeedContainsTransfer(seed, transferId), "new-conversation seed carries the transfer marker");
-  ok(seed.includes("verify the relevant current Herdr/runtime/Git state"),
+  ok(seed.includes("开始任何 mutation 前，重新检查相关的 Herdr/runtime/Git 状态"),
     "seed requires live-state verification before mutations");
 }
 
 ok(
   backgroundSource.includes("conversationInfoForTab(msg.tabId)")
-    && backgroundSource.includes('files: ["content/base.js", "content/injector/chatgpt.js", "content/wake.js"]'),
-  "popup/bind recovery reinjects ChatGPT content scripts when an open tab lost its MV3 listener",
+    && backgroundSource.includes("files: CHATGPT_CONTENT_SCRIPT_FILES")
+    && backgroundSource.includes('"context-pressure.js"')
+    && backgroundSource.includes('"conversation-health.js"')
+    && backgroundSource.includes('"recovery-controller.js"'),
+  "popup/bind recovery reinjects the complete ChatGPT content-script stack when an open tab lost its MV3 listener",
 );
 
 const localeCodes = ["en", "zh", "ja"];
@@ -242,6 +265,15 @@ ok(localeHud.ja.join(",") === localeHud.en.join(","), "ja hud keys match en");
 ok(localeHandoff.en.length > 0, "en has handoff keys");
 ok(localeHandoff.zh.join(",") === localeHandoff.en.join(","), "zh handoff keys match en");
 ok(localeHandoff.ja.join(",") === localeHandoff.en.join(","), "ja handoff keys match en");
+const zhLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "zh.json"), "utf8"));
+ok(zhLocale.hud_manual_continue === "手动继续", "zh HUD manual continue label is exact");
+ok(zhLocale.hud_manual_status === "herdr监控", "zh HUD Herdr monitor label is exact");
+ok(zhLocale.hud_manual_judge === "LLM 分析", "zh HUD LLM analysis label is exact");
+ok(zhLocale.hud_automation_off === "自动 关", "zh HUD automation-off label is localized");
+ok(!wakeSource.includes("Wake on") && !wakeSource.includes("Wake off") && !wakeSource.includes("Automation off"),
+  "HUD source has no legacy English wake/automation labels");
+ok(!readFileSync(path.join(EXT, "popup.html"), "utf8").includes('id="idleNudgeEnabled"'),
+  "popup exposes one authoritative automation switch");
 
 // ---- 2. JavaScript syntax for the fixed file list ----
 const fixed = ["background.js", "binding-core.js", "continuity-core.js", "options.js", "popup.js", "content/base.js",

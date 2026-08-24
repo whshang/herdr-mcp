@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "herdr → Web wake",
-  "version": "0.1.41",
+  "version": "0.1.42",
   "description": "Keep web chats connected to Herdr workspaces: wake on local progress and roll long ChatGPT Project conversations into a fresh bound chat. UI: en / zh / ja.",
   "permissions": ["storage", "scripting", "alarms"],
   "host_permissions": [
@@ -54,7 +54,7 @@
     },
     {
       "matches": ["https://chatgpt.com/*"],
-      "js": ["content/base.js", "content/injector/chatgpt.js", "conversation-health.js", "recovery-controller.js", "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js", "content/hud/hud.js", "content/wake.js"],
+      "js": ["content/base.js", "content/injector/chatgpt.js", "context-pressure.js", "conversation-health.js", "recovery-controller.js", "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js", "content/hud/hud.js", "content/wake.js"],
       "run_at": "document_idle"
     }
   ]

@@ -22,21 +22,81 @@ import {
   extractHandoffPacket, handoffSeedContainsTransfer, handoffStatusIsActive,
   newContinuityId, newTransferId,
 } from "./continuity-core.js";
+import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 
-const H2W_SCRIPT_VERSION = "0.1.41";
+const H2W_SCRIPT_VERSION = "0.1.42";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
+const CHATGPT_CONTENT_SCRIPT_FILES = [
+  "content/base.js",
+  "content/injector/chatgpt.js",
+  "context-pressure.js",
+  "conversation-health.js",
+  "recovery-controller.js",
+  "content/hud/state-view.js",
+  "content/hud/tooltip.js",
+  "content/hud/renderer.js",
+  "content/hud/hud.js",
+  "content/wake.js",
+];
 const PUSH_CONNECT_MS = 5000;
 const STATE_FETCH_MS = 4000;
+const TAB_RECOVERY_COOLDOWN_MS = 30000;
 const HANDOFF_STORAGE_KEY = "herdrConversationTransfers";
 const HANDOFF_RETENTION_MS = 7 * 86400000;
 const tabVersions = new Map();
 const reloadedTabs = new Set();
-const DEFAULT_TEMPLATE =
+const tabRecoveryAttemptAt = new Map();
+const FALLBACK_TEMPLATE =
   "herdr workspace {workspace_label}: agents stopped (focus {agent} @ {pane} → {status}).\n\nFocus pane output:\n{output}\n\n{roster}\n\n{idle_hint}\n\nContinue orchestration from these results; prefer fs/exec over expensive models.";
-const DEFAULT_PROGRESS_TEMPLATE =
+const FALLBACK_PROGRESS_TEMPLATE =
   "herdr workspace {workspace_label} progress (focus {agent} @ {pane} · {status}; {working_count} still working in this space).\n\nFocus pane output:\n{output}\n\n{roster}\n\n{idle_hint}\n\nUse herdr_since / inspect to continue; keep orchestrating on the web.";
-const DEFAULT_PARTIAL_TEMPLATE =
+const FALLBACK_PARTIAL_TEMPLATE =
   "herdr workspace {workspace_label}: focus {agent} @ {pane} stopped ({status}); {working_count} still working in this space.\n\nFocus pane output:\n{output}\n\n{roster}\n\n{idle_hint}\n\nThis is a partial finish, not a full round settle. Keep watching or schedule the remaining workers.";
+
+function localizedText(key, vars = null, fallback = "") {
+  const value = i18nText(key, vars || undefined);
+  return value === key ? fallback : value;
+}
+
+function defaultWakeTemplate() {
+  return localizedText("default_wake_template", null, FALLBACK_TEMPLATE);
+}
+
+function defaultProgressTemplate() {
+  return localizedText("default_progress_template", null, FALLBACK_PROGRESS_TEMPLATE);
+}
+
+function defaultPartialTemplate() {
+  return localizedText("default_partial_template", null, FALLBACK_PARTIAL_TEMPLATE);
+}
+
+function hudLabels() {
+  const keys = [
+    "automation", "automation_on", "automation_off", "manual_continue", "manual_status", "manual_judge",
+    "manual_continue_hint", "manual_status_hint", "manual_judge_hint", "controls", "advanced_options", "event_settings",
+    "automation_hint", "on", "off", "interval", "fallback", "bindings", "bind", "unbind", "available",
+    "no_workspaces", "workspaces_unavailable", "active", "bound_count", "aria_toggle_automation",
+    "aria_open_controls", "automation_enabled", "automation_disabled", "automation_update_failed",
+    "timing_saved", "timing_save_failed", "bound_to", "unbound_from", "binding_failed", "judge_no_continue",
+    "continue_sent", "continue_failed", "tip_workspace", "tip_agent", "tip_conversation", "tip_state",
+    "tip_recovery", "tip_last_event", "none",
+    "reason_disabled", "reason_no_conv", "reason_llm_not_configured", "reason_unbound",
+    "reason_still_generating", "reason_not_substantive", "reason_empty_assistant", "reason_nudge_loop",
+    "reason_same_assistant", "reason_cooldown", "reason_llm_done", "reason_llm_ambiguous",
+    "reason_llm_continue", "reason_llm_timeout", "reason_llm_http", "reason_llm_network",
+    "reason_wake_failed", "reason_llm_bad_response",
+  ];
+  const out = {};
+  for (const suffix of keys) out[suffix] = localizedText(`hud_${suffix}`);
+  out.states = {};
+  for (const state of [
+    "unknown", "ready", "bound", "unbound", "working", "idle", "done", "blocked", "reply_waiting",
+    "reply_suspect", "recovery_message_sent", "reload_pending", "recovering", "rollover_recommended",
+    "rollover_required", "context_warning", "handoff_prepare", "high_risk",
+  ]) out.states[state] = localizedText(`hud_state_${state}`);
+  out.recovery_probe_template = localizedText("recovery_probe_template");
+  return out;
+}
 
 function callLog(...args) { console.log("[h2w]", ...args); }
 function runtimeAlive() { try { return !!chrome.runtime?.id; } catch { return false; } }
@@ -45,25 +105,31 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---- Configuration (wait for storage before startup or stream rebuild) ----
 let CFG = {
   herdrMcpUrl: "http://127.0.0.1:8772", token: "", enabled: true, autoAllow: true,
-  wakeTemplate: DEFAULT_TEMPLATE, progressTickSec: 60, progressFallbackSec: 1200,
-  progressTemplate: DEFAULT_PROGRESS_TEMPLATE,
+  wakeTemplate: "", progressTickSec: 60, progressFallbackSec: 1200,
+  progressTemplate: "",
   idleNudgeEnabled: true,
   // Post-turn LLM judge (OpenAI-compatible). Defaults empty — fill in Options.
   llmJudgeBaseUrl: "",
   llmJudgeApiKey: "",
   llmJudgeModel: "",
-  llmJudgePromptTemplate: DEFAULT_LLM_JUDGE_PROMPT,
+  llmJudgePromptTemplate: "",
   llmJudgeSkipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
 };
 let resolveConfigReady;
 const configReady = new Promise((r) => { resolveConfigReady = r; });
 (async () => {
+  await detectOrLoadLocale();
   let stored = {};
   try {
     const keys = [...Object.keys(CFG), "idleNudgeCooldownSec"];
     stored = await chrome.storage.local.get(keys);
     CFG = { ...CFG, ...stored };
   } catch (e) {}
+  if (!String(CFG.wakeTemplate || "").trim()) CFG.wakeTemplate = defaultWakeTemplate();
+  if (!String(CFG.progressTemplate || "").trim()) CFG.progressTemplate = defaultProgressTemplate();
+  if (!String(CFG.llmJudgePromptTemplate || "").trim()) {
+    CFG.llmJudgePromptTemplate = localizedText("default_llm_judge_prompt", null, DEFAULT_LLM_JUDGE_PROMPT);
+  }
   const patch = {};
   // Legacy: idleNudgeCooldownSec merged into progressTickSec (one interval for progress + nudge).
   if (stored.idleNudgeCooldownSec != null) {
@@ -80,9 +146,9 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
     CFG.progressFallbackSec = 1200;
     patch.progressFallbackSec = 1200;
   }
-  // 0.1.40: wake delivery and the post-turn small-model nudge share one
-  // operational switch. Keep the legacy field mirrored for stored-config and
-  // older content-script compatibility, but `enabled` is authoritative.
+  // `enabled` is the authoritative automation switch. Keep the legacy
+  // idleNudgeEnabled field mirrored for stored-config and older content-script
+  // compatibility.
   if (CFG.idleNudgeEnabled !== CFG.enabled) {
     CFG.idleNudgeEnabled = CFG.enabled;
     patch.idleNudgeEnabled = CFG.enabled;
@@ -137,7 +203,7 @@ async function conversationInfoForTab(tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ["content/base.js", "content/injector/chatgpt.js", "content/wake.js"],
+      files: CHATGPT_CONTENT_SCRIPT_FILES,
     });
     await sleep(50);
     const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
@@ -258,6 +324,36 @@ function bindingView(b) {
   };
 }
 
+function workspaceMetaForBinding(b, workspaces = []) {
+  const ws = b?.workspace_id || normalizeWorkspaceId(b);
+  if (!ws) return null;
+  return (Array.isArray(workspaces) ? workspaces : []).find((w) => String(w?.id || "") === ws) || null;
+}
+
+function canonicalWorkspaceLabel(b, workspaces = []) {
+  const ws = b?.workspace_id || normalizeWorkspaceId(b);
+  if (!ws) return b?.workspace_label || null;
+  const meta = workspaceMetaForBinding(b, workspaces);
+  if (!meta) return b?.workspace_label || workspaceTitleWithId({ id: ws });
+  return workspaceTitleWithId({ id: ws, label: meta.label, roots: meta.roots });
+}
+
+async function reconcileBindingWorkspaceLabels(bindings, session, workspaces = []) {
+  let changed = false;
+  for (const b of session || []) {
+    const canonical = canonicalWorkspaceLabel(b, workspaces);
+    if (!canonical || canonical === b.workspace_label) continue;
+    b.workspace_label = canonical;
+    const storeKey = b.storeKey || bindingStoreKey(b.convKey, b.workspace_id || normalizeWorkspaceId(b));
+    if (storeKey && bindings?.[storeKey]) {
+      bindings[storeKey].workspace_label = canonical;
+      changed = true;
+    }
+  }
+  if (changed) await saveBindings(bindings);
+  return session;
+}
+
 function workingPaneMap(b) {
   if (!b.workingPanes || typeof b.workingPanes !== "object") b.workingPanes = {};
   return b.workingPanes;
@@ -289,6 +385,114 @@ async function loadBindings() {
 }
 async function saveBindings(b) {
   try { await chrome.storage.local.set({ herdrWakeBindings: b }); } catch (e) {}
+}
+
+function tabExecutionView(tab) {
+  if (!tab?.id) {
+    return {
+      state: "closed",
+      reachable: false,
+      active: false,
+      frozen: false,
+      discarded: false,
+      protected: false,
+      auto_discardable: null,
+      status: null,
+      tab_id: null,
+    };
+  }
+  const discarded = tab.discarded === true;
+  const frozen = tab.frozen === true;
+  const active = tab.active === true;
+  const state = discarded ? "discarded" : frozen ? "frozen" : active ? "foreground" : "background";
+  return {
+    state,
+    reachable: !discarded && !frozen,
+    active,
+    frozen,
+    discarded,
+    protected: tab.autoDiscardable === false,
+    auto_discardable: typeof tab.autoDiscardable === "boolean" ? tab.autoDiscardable : null,
+    status: tab.status || null,
+    tab_id: tab.id,
+  };
+}
+
+async function getTabExecutionView(tabId) {
+  if (!tabId) return tabExecutionView(null);
+  try { return tabExecutionView(await chrome.tabs.get(tabId)); }
+  catch (_) { return tabExecutionView(null); }
+}
+
+async function protectBoundTab(tabId) {
+  if (!tabId) return tabExecutionView(null);
+  try {
+    const tab = await chrome.tabs.update(tabId, { autoDiscardable: false });
+    return tabExecutionView(tab || await chrome.tabs.get(tabId));
+  } catch (_) {
+    return getTabExecutionView(tabId);
+  }
+}
+
+async function restoreTabDiscardabilityIfUnbound(tabId, bindings) {
+  if (!tabId) return;
+  const stillBound = Object.values(bindings || {}).some((b) => b?.tabId === tabId);
+  if (stillBound) return;
+  try { await chrome.tabs.update(tabId, { autoDiscardable: true }); } catch (_) {}
+}
+
+async function protectAllBoundTabs(bindings) {
+  const tabIds = [...new Set(Object.values(bindings || {}).map((b) => b?.tabId).filter(Boolean))];
+  await Promise.allSettled(tabIds.map((tabId) => protectBoundTab(tabId)));
+}
+
+async function reconcileTabExecutionState(binding) {
+  if (!binding?.tabId) return tabExecutionView(null);
+  // HUD/state reads stay observational. Actual recovery only happens during
+  // delivery, so automation off never reloads or activates a tab.
+  return getTabExecutionView(binding.tabId);
+}
+
+async function waitForTabReachable(tabId, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    try {
+      last = await chrome.tabs.get(tabId);
+      if (last?.status === "complete" && !last.discarded && !last.frozen) return last;
+    } catch (_) { return null; }
+    await sleep(150);
+  }
+  return last;
+}
+
+async function withReachableBoundTab(tabId, operation) {
+  if (!tabId) throw new Error("tab_closed");
+  let previousActiveId = null;
+  try {
+    let tab = await chrome.tabs.get(tabId);
+    await protectBoundTab(tabId);
+    if (tab.discarded === true) {
+      const last = tabRecoveryAttemptAt.get(tabId) || 0;
+      if (Date.now() - last >= TAB_RECOVERY_COOLDOWN_MS) {
+        tabRecoveryAttemptAt.set(tabId, Date.now());
+        await chrome.tabs.reload(tabId);
+      }
+    }
+    tab = await chrome.tabs.get(tabId);
+    if (tab.frozen === true || tab.discarded === true) {
+      const active = await chrome.tabs.query({ windowId: tab.windowId, active: true });
+      previousActiveId = active[0]?.id && active[0].id !== tabId ? active[0].id : null;
+      await chrome.tabs.update(tabId, { active: true, autoDiscardable: false });
+    }
+    const ready = await waitForTabReachable(tabId);
+    if (!ready) throw new Error("tab_unreachable");
+    return await operation(ready);
+  } finally {
+    if (previousActiveId) {
+      try { await chrome.tabs.update(previousActiveId, { active: true }); } catch (_) {}
+    }
+  }
 }
 
 // ---- Conversation continuity / handoff storage ----
@@ -347,6 +551,7 @@ function handoffView(row, convKey = null) {
     source_conv_key: row.source_conv_key || null,
     target_conv_key: row.target_conv_key || null,
     role: convKey && row.target_conv_key === convKey ? "target" : "source",
+    trigger: row.trigger || "manual",
     error: row.error || null,
     can_resume: canResume,
     age_ms: ageMs,
@@ -410,7 +615,7 @@ async function sendChatGptTabMessage(tabId, message) {
     if (!missingReceiverError(first)) throw first;
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: ["content/base.js", "content/injector/chatgpt.js", "content/wake.js"],
+      files: CHATGPT_CONTENT_SCRIPT_FILES,
     });
     await sleep(80);
     return chrome.tabs.sendMessage(tabId, message);
@@ -566,7 +771,7 @@ async function onPushHello(storeKey, data) {
   if (d.status === "working" && CFG.enabled) armProgressTimer(storeKey, b);
   if (d.wake) {
     callLog(`hello recovery wake: ws=${ws} → ${d.status} (settle missed while offline)`);
-    await routeWake(b, { status: d.status, output: "", working_count: d.working_count }, CFG.wakeTemplate || DEFAULT_TEMPLATE);
+    await routeWake(b, { status: d.status, output: "", working_count: d.working_count }, CFG.wakeTemplate || defaultWakeTemplate());
   }
 }
 
@@ -638,7 +843,7 @@ async function onPushSettled(storeKey, data) {
   const routed = await routeWake(
     b,
     fields,
-    d.kind === "partial" ? DEFAULT_PARTIAL_TEMPLATE : (CFG.wakeTemplate || DEFAULT_TEMPLATE),
+    d.kind === "partial" ? defaultPartialTemplate() : (CFG.wakeTemplate || defaultWakeTemplate()),
     d.kind,
   );
   const finalKind = routed?.h2w_wake_kind || d.kind;
@@ -998,7 +1203,7 @@ async function tickProgress(storeKey, ts) {
       status: curB.status,
       output,
       working_count: Object.keys(workingPaneMap(curB)).length,
-    }, CFG.progressTemplate || DEFAULT_PROGRESS_TEMPLATE);
+    }, CFG.progressTemplate || defaultProgressTemplate());
     ts.lastSentAt = Date.now();
     ts.lastOutputSent = String(output || "").trim();
     ts.hasProgressSent = true;
@@ -1029,7 +1234,7 @@ function reconcileProgressTimers(bindings) {
   }
 }
 
-async function routeWake(b, extra, template = CFG.wakeTemplate || DEFAULT_TEMPLATE, wakeKind = null) {
+async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTemplate(), wakeKind = null) {
   if (!CFG.enabled) return { ok: false, reason: "disabled" };
   const isLlmNudge = extra.status === "llm_continue_nudge";
   const rawText = String(template || "").trim();
@@ -1051,20 +1256,24 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || DEFAULT_TEMPLA
   let roster = extra.roster || "";
   let idle_hint = extra.idle_hint || "";
   let working_count = extra.working_count ?? Object.keys(workingPaneMap(b)).length;
-  let workspace_label = b.workspace_label || extra.workspace_label || "";
-  if (!roster || !workspace_label) {
+  const cachedCatalog = cachedPushWorkspaceCatalog();
+  const cachedMeta = workspaceMetaForBinding(b, cachedCatalog);
+  let workspace_label = cachedMeta
+    ? canonicalWorkspaceLabel(b, cachedCatalog)
+    : (extra.workspace_label || b.workspace_label || "");
+  if (cachedMeta && workspace_label && workspace_label !== b.workspace_label) {
+    b.workspace_label = workspace_label;
+  }
+  if (!roster || !cachedMeta) {
     try {
       const st = await fetchState();
       const scope = agentsInWorkspace(st.agents || [], ws);
       const meta = (st.workspaces || []).find((w) => w.id === ws) || null;
-      if (!workspace_label) {
-        workspace_label = workspaceTitleWithId({
-          id: ws,
-          label: meta?.label || b.workspace_label,
-          roots: meta?.roots,
-          agents: scope,
-        });
+      if (meta) {
+        workspace_label = canonicalWorkspaceLabel(b, st.workspaces || []) || workspace_label;
         b.workspace_label = workspace_label;
+      } else if (!workspace_label) {
+        workspace_label = workspaceTitleWithId({ id: ws, label: b.workspace_label, agents: scope });
       }
       const pack = formatWorkspaceRoster(scope, focusPane, {
         id: ws, label: meta?.label || b.workspace_label, roots: meta?.roots,
@@ -1080,9 +1289,9 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || DEFAULT_TEMPLA
   }
   const effectiveWakeKind = wakeKind ? reconcileWorkspaceWakeKind(wakeKind, working_count) : null;
   const effectiveTemplate = effectiveWakeKind === "partial"
-    ? DEFAULT_PARTIAL_TEMPLATE
+    ? defaultPartialTemplate()
     : effectiveWakeKind === "round"
-      ? (CFG.wakeTemplate || DEFAULT_TEMPLATE)
+      ? (CFG.wakeTemplate || defaultWakeTemplate())
       : template;
   let rendered = buildWakeTemplate(effectiveTemplate, {
     agent: extra.agent ?? b.focus_agent ?? b.agent,
@@ -1160,6 +1369,113 @@ async function deliverWakeToTab(b, payload) {
     callLog("route recovery failed:", e.message);
     return { ok: false, reason: "route_failed", error: e.message };
   }
+}
+
+async function manualDirectContinue(tabId, convKey) {
+  return deliverWakeToTab({ tabId, convKey, site: "chatgpt" }, {
+    type: "h2w_wake",
+    data: {
+      template: localizedText("manual_continue_message", null, "Continue"),
+      manual: true,
+      autoAllow: false,
+    },
+  });
+}
+
+async function manualHerdrStatusContinue(tabId, convKey) {
+  const bindings = await loadBindings();
+  const session = bindingsForConv(bindings, convKey);
+  if (!session.length) return { ok: false, error: "binding_required" };
+
+  let state = await fetchStateFresh();
+  if (!state?.ok) state = await fetchState();
+  if (!state?.ok) return { ok: false, error: "herdr_state_unavailable" };
+
+  const blocks = [];
+  for (const b of session) {
+    const ws = b.workspace_id || normalizeWorkspaceId(b);
+    if (!ws) continue;
+    const scope = agentsInWorkspace(state.agents || [], ws);
+    const meta = (state.workspaces || []).find((w) => w.id === ws) || null;
+    const pack = formatWorkspaceRoster(scope, b.pane || null, {
+      id: ws,
+      label: meta?.label || b.workspace_label,
+      roots: meta?.roots,
+    });
+    blocks.push(pack.roster || `workspace ${pack.workspace_label || b.workspace_label || ws}: no active panes`);
+  }
+  if (!blocks.length) return { ok: false, error: "herdr_state_empty" };
+
+  const template = [
+    localizedText("manual_status_continue_intro", null, "Continue from the current Herdr state below."),
+    ...blocks,
+  ].join("\n\n");
+  return deliverWakeToTab({ ...session[0], tabId: tabId || session[0].tabId, convKey }, {
+    type: "h2w_wake",
+    data: {
+      template,
+      manual: true,
+      autoAllow: false,
+    },
+  });
+}
+
+async function manualLlmJudgeContinue(tabId, convKey, userText, assistantText) {
+  if (!isLlmJudgeConfigured(CFG)) {
+    return rememberIdleNudge(convKey, { ok: false, nudged: false, reason: "llm_not_configured", error: "llm_not_configured" });
+  }
+  const assistant = String(assistantText || "").trim();
+  if (!assistant) {
+    return rememberIdleNudge(convKey, { ok: false, nudged: false, reason: "empty_assistant", error: "empty_assistant" });
+  }
+
+  const judged = await fetchLlmJudge(String(userText || ""), assistant);
+  if (!judged.ok) {
+    return rememberIdleNudge(convKey, {
+      ok: false,
+      nudged: false,
+      reason: `llm_${judged.reason}`,
+      error: judged.error || judged.reason || "llm_failed",
+      status: judged.status || null,
+    });
+  }
+  const verdict = interpretLlmJudgeReply(judged.content, {
+    skipKeywords: CFG.llmJudgeSkipKeywords || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
+  });
+  if (verdict.done) {
+    return rememberIdleNudge(convKey, { ok: true, continued: false, nudged: false, reason: "llm_done", raw: verdict.raw });
+  }
+  if (!verdict.cont || !verdict.nudgeText) {
+    return rememberIdleNudge(convKey, { ok: true, continued: false, nudged: false, reason: "llm_ambiguous", raw: verdict.raw });
+  }
+
+  const result = await deliverWakeToTab({ tabId, convKey, site: "chatgpt" }, {
+    type: "h2w_wake",
+    data: {
+      template: verdict.nudgeText,
+      llmNudge: true,
+      manual: true,
+      autoAllow: false,
+    },
+  });
+  if (!result?.ok) {
+    return rememberIdleNudge(convKey, {
+      ok: false,
+      continued: false,
+      nudged: false,
+      reason: "wake_failed",
+      raw: verdict.raw,
+      error: result?.error || result?.blocked || result?.reason || "submit_failed",
+    });
+  }
+  return rememberIdleNudge(convKey, {
+    ok: true,
+    continued: true,
+    nudged: true,
+    reason: "llm_continue",
+    raw: verdict.raw,
+    send: verdict.nudgeText,
+  });
 }
 
 // ---- ChatGPT Project conversation handoff ----
@@ -1270,7 +1586,11 @@ async function seedHandoffIntoTarget(transferId, targetTabId) {
   const transfers = await loadHandoffTransfers();
   const transfer = transfers[transferId];
   if (!transfer?.handoff_text) return { ok: false, error: "handoff_packet_missing" };
-  const seed = buildHandoffSeed({ transferId, packet: transfer.handoff_text });
+  const seed = buildHandoffSeed({
+    transferId,
+    packet: transfer.handoff_text,
+    template: localizedText("handoff_seed_template"),
+  });
   await markTransfer(transferId, {
     status: "seed_submitting",
     target_tab_id: targetTabId,
@@ -1397,7 +1717,11 @@ async function resumeSummaryRequested(transfer) {
     return { ok: false, error: "source_binding_set_changed", handoff: handoffView(failed) };
   }
 
-  const prompt = buildHandoffRequest({ transferId: transfer.id, bindings: source });
+  const prompt = buildHandoffRequest({
+    transferId: transfer.id,
+    bindings: source,
+    template: localizedText("handoff_request_template"),
+  });
   const retried = await markTransfer(transfer.id, { status: "summary_requested", error: null });
   try {
     const result = await sendChatGptTabMessage(tabId, {
@@ -1419,7 +1743,7 @@ async function resumeSummaryRequested(transfer) {
   return { ok: true, pending: true, handoff: handoffView(retried) };
 }
 
-async function startHandoffForTab(tabId) {
+async function startHandoffForTab(tabId, trigger = "manual") {
   const convInfo = await conversationInfoForTab(tabId);
   if (!convInfo?.project_id || !convInfo?.project_launch_url) {
     return { ok: false, error: "project_conversation_required" };
@@ -1482,12 +1806,17 @@ async function startHandoffForTab(tabId) {
     target_tab_id: null,
     target_conv_key: null,
     error: null,
+    trigger,
     created_at: now,
     updated_at: now,
   };
   transfers[transferId] = row;
   await saveHandoffTransfers(transfers);
-  const prompt = buildHandoffRequest({ transferId, bindings: session });
+  const prompt = buildHandoffRequest({
+    transferId,
+    bindings: session,
+    template: localizedText("handoff_request_template"),
+  });
   let result;
   try {
     result = await sendChatGptTabMessage(tabId, {
@@ -1544,6 +1873,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const b = bindings[entry.storeKey];
           b.tabId = sender.tab?.id;
           b.tabUrl = msg.url || sender.tab?.url;
+          b.execution_state = await protectBoundTab(b.tabId);
           b.last_seen_at = Date.now();
         }
         ensurePushStream(bindings);
@@ -1601,6 +1931,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ...CFG, scriptVersion: H2W_SCRIPT_VERSION });
     return;
   }
+  if (msg?.type === "h2w_automation_state") {
+    sendResponse({
+      ok: true,
+      enabled: CFG.enabled !== false,
+      autoAllow: CFG.autoAllow !== false,
+    });
+    return;
+  }
   if (msg?.type === "h2w_open_options") {
     void chrome.runtime.openOptionsPage()
       .then(() => sendResponse({ ok: true }))
@@ -1616,7 +1954,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const transfer = convKey ? latestTransferForConversation(transfers, convKey) : null;
       const transferView = handoffView(transfer, convKey);
       const convInfo = convKey ? chatGptConversationInfo(convKey) : null;
-      const labels = session.map((b) => b.workspace_label || b.workspace_id).filter(Boolean);
       const cachedWorkspaces = cachedPushWorkspaceCatalog();
       // /push/events hello already carries the authoritative workspace list.
       // Render that immediately; /push/state becomes an async freshness probe.
@@ -1624,6 +1961,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ? { ok: true, workspaces: cachedWorkspaces, source: "push_hello_cache", cached_at: pushWorkspaceCatalogAt }
         : await fetchState();
       if (cachedWorkspaces.length) void fetchState();
+      const liveWorkspaces = state?.ok && Array.isArray(state.workspaces) ? state.workspaces : [];
+      await reconcileBindingWorkspaceLabels(bindings, session, liveWorkspaces);
+      const labels = session.map((b) => canonicalWorkspaceLabel(b, liveWorkspaces) || b.workspace_id).filter(Boolean);
       let llmHost = "";
       try {
         llmHost = CFG.llmJudgeBaseUrl ? new URL(llmJudgeCompletionsUrl(CFG.llmJudgeBaseUrl)).host : "";
@@ -1632,7 +1972,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({
         ok: true,
         version: H2W_SCRIPT_VERSION,
+        locale: getLocale(),
+        labels: hudLabels(),
         enabled: CFG.enabled !== false,
+        autoAllow: CFG.autoAllow !== false,
         idleNudgeEnabled: CFG.enabled !== false,
         progressTickSec: paceIntervalSec() || Number(CFG.progressTickSec) || 0,
         progressFallbackSec: Number(CFG.progressFallbackSec) || 0,
@@ -1644,7 +1987,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         workspace_id: session[0]?.workspace_id || (session[0] ? normalizeWorkspaceId(session[0]) : null),
         binding_count: session.length,
         bound_workspace_ids: session.map((b) => b.workspace_id || normalizeWorkspaceId(b)).filter(Boolean),
-        bindings: session.map((b) => bindingView(b)),
+        bindings: await Promise.all(session.map(async (b) => ({
+          ...bindingView(b),
+          execution_state: await reconcileTabExecutionState(b),
+        }))),
         continuity_id: session.map((b) => b.continuity_id).find(Boolean) || transfer?.continuity_id || null,
         can_handoff: Boolean(
           convInfo?.project_id
@@ -1652,7 +1998,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           && (!handoffStatusIsActive(transfer?.status) || transferView?.can_resume === true),
         ),
         handoff: transferView,
-        workspaces: state?.ok && Array.isArray(state.workspaces) ? state.workspaces : [],
+        workspaces: liveWorkspaces,
         workspace_source: state?.source || (state?.ok ? "push_state" : null),
         workspace_status: state?.ok ? 200 : (state?.status || 0),
         workspace_error: state?.ok ? null : (state?.error || (state?.status ? `HTTP ${state.status}` : "fetch-failed")),
@@ -1669,23 +2015,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg?.type === "h2w_set_config") {
-    const incoming = { ...(msg.config || {}) };
-    delete incoming.idleNudgeCooldownSec;
-    if (Object.prototype.hasOwnProperty.call(incoming, "idleNudgeEnabled")
-      && !Object.prototype.hasOwnProperty.call(incoming, "enabled")) {
-      incoming.enabled = incoming.idleNudgeEnabled !== false;
-    }
-    if (Object.prototype.hasOwnProperty.call(incoming, "enabled")) {
-      incoming.enabled = incoming.enabled !== false;
-      incoming.idleNudgeEnabled = incoming.enabled;
-    }
-    CFG = { ...CFG, ...incoming };
-    delete CFG.idleNudgeCooldownSec;
-    chrome.storage.local.set(CFG).then(async () => {
+    void (async () => {
+      const incoming = { ...(msg.config || {}) };
+      delete incoming.idleNudgeCooldownSec;
+      if (Object.prototype.hasOwnProperty.call(incoming, "uiLocale")) {
+        await setLocale(String(incoming.uiLocale || "en"));
+      }
+      if (Object.prototype.hasOwnProperty.call(incoming, "idleNudgeEnabled")
+        && !Object.prototype.hasOwnProperty.call(incoming, "enabled")) {
+        incoming.enabled = incoming.idleNudgeEnabled !== false;
+      }
+      if (Object.prototype.hasOwnProperty.call(incoming, "enabled")) {
+        incoming.enabled = incoming.enabled !== false;
+        incoming.idleNudgeEnabled = incoming.enabled;
+      }
+      CFG = { ...CFG, ...incoming };
+      delete CFG.idleNudgeCooldownSec;
+      await chrome.storage.local.set(CFG);
       try { await chrome.storage.local.remove("idleNudgeCooldownSec"); } catch (e) {}
       void rebuildStreams();
       sendResponse({ ok: true });
-    });
+    })();
     return true;
   }
   if (msg?.type === "h2w_test_llm") {
@@ -1804,6 +2154,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         convKey: effectiveConvKey,
         site: convInfo?.site || "unknown",
         tabId, tabUrl: convInfo.url || null,
+        execution_state: await protectBoundTab(tabId),
         created_at: Date.now(),
         last_seen_at: Date.now(),
         persistence: "explicit",
@@ -1841,6 +2192,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         clearProgressTimer(storeKey);
       }
       await saveBindings(bindings);
+      await restoreTabDiscardabilityIfUnbound(tabId, bindings);
       if (!bindingsForConv(bindings, convKey).length) {
         clearIdleNudgeRetry(convKey);
         lastTurnEndedPayload.delete(convKey);
@@ -1848,6 +2200,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (tabId) { try { void chrome.tabs.sendMessage(tabId, { type: "h2w_unbound", workspace_id: wsId || null }).catch(() => {}); } catch (e) {} }
       if (!Object.keys(bindings).length) clearActionBadge();
       sendResponse({ ok: true });
+    })();
+    return true;
+  }
+  if (msg?.type === "h2w_manual_continue") {
+    void (async () => {
+      const tabId = msg.tabId || sender.tab?.id;
+      if (!tabId) { sendResponse({ ok: false, error: "tab-unavailable" }); return; }
+      const convInfo = await conversationInfoForTab(tabId);
+      const convKey = String(msg.convKey || convInfo?.convKey || "").trim();
+      if (!convKey) { sendResponse({ ok: false, error: "conversation-unavailable" }); return; }
+      if (msg.action === "direct") {
+        sendResponse(await manualDirectContinue(tabId, convKey));
+        return;
+      }
+      if (msg.action === "status") {
+        sendResponse(await manualHerdrStatusContinue(tabId, convKey));
+        return;
+      }
+      if (msg.action === "judge") {
+        sendResponse(await manualLlmJudgeContinue(tabId, convKey, msg.userText || "", msg.assistantText || ""));
+        return;
+      }
+      sendResponse({ ok: false, error: "manual_action_unknown" });
     })();
     return true;
   }
@@ -1867,7 +2242,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     void (async () => {
       const tabId = msg.tabId || sender.tab?.id;
       if (!tabId) { sendResponse({ ok: false, error: "tab-unavailable" }); return; }
-      sendResponse(await startHandoffForTab(tabId));
+      sendResponse(await startHandoffForTab(tabId, msg.trigger || "manual"));
     })();
     return true;
   }
@@ -1964,7 +2339,17 @@ chrome.runtime.onStartup.addListener(() => { void rebuildStreams(); });
 chrome.runtime.onInstalled.addListener(() => {
   void rebuildStreams();
   chrome.storage.local.get(["herdrMcpUrl"], (cfg) => {
-    if (!cfg.herdrMcpUrl) chrome.storage.local.set({ herdrMcpUrl: "http://127.0.0.1:8772", token: "", enabled: true, autoAllow: true, wakeTemplate: DEFAULT_TEMPLATE, progressTickSec: 60, progressFallbackSec: 1200, progressTemplate: DEFAULT_PROGRESS_TEMPLATE, idleNudgeEnabled: true });
+    if (!cfg.herdrMcpUrl) chrome.storage.local.set({
+      herdrMcpUrl: "http://127.0.0.1:8772",
+      token: "",
+      enabled: true,
+      autoAllow: true,
+      wakeTemplate: defaultWakeTemplate(),
+      progressTickSec: 60,
+      progressFallbackSec: 1200,
+      progressTemplate: defaultProgressTemplate(),
+      idleNudgeEnabled: true,
+    });
   });
 });
 try {

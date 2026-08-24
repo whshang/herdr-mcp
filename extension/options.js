@@ -11,11 +11,6 @@ const KEYS = [
   "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
   "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
 ];
-const DEFAULT_TEMPLATE =
-  "herdr workspace {workspace_label}: agents stopped (focus {agent} @ {pane} → {status}).\n\nFocus output:\n{output}\n\n{roster}\n\n{idle_hint}\n\nContinue orchestration; prefer fs/exec over expensive models.";
-const DEFAULT_PROGRESS_TEMPLATE =
-  "herdr workspace {workspace_label} progress (focus {agent} @ {pane} · {status}; {working_count} still working).\n\nFocus output:\n{output}\n\n{roster}\n\n{idle_hint}\n\nUse herdr_since / inspect; keep orchestrating on the web.";
-
 /** Seconds: empty/invalid → fallback; <=0 → 0 (off); cap 86400. */
 function parseTickSec(v, fallback = 120) {
   const n = Number(v);
@@ -57,6 +52,9 @@ function applyI18n() {
   $("lab_auto").textContent = t("label_auto_allow");
   $("hint_auto").textContent = t("hint_auto_allow");
   $("lab_enabled").textContent = t("label_enabled");
+  $("hint_enabled").textContent = t("hint_enabled");
+  $("llmJudgeApiKey").placeholder = t("placeholder_llm_key");
+  $("llmJudgeModel").placeholder = t("placeholder_llm_model");
   $("save").textContent = t("save");
   $("test").textContent = t("test");
   $("testLlm").textContent = t("test_llm");
@@ -72,16 +70,16 @@ async function loadForm() {
   const cfg = await chrome.storage.local.get(KEYS);
   $("url").value = cfg.herdrMcpUrl || "http://127.0.0.1:8772";
   $("token").value = cfg.token || "";
-  $("template").value = cfg.wakeTemplate || DEFAULT_TEMPLATE;
+  $("template").value = cfg.wakeTemplate || t("default_wake_template");
   $("progressTickSec").value = cfg.progressTickSec ?? 60;
   $("progressFallbackSec").value = cfg.progressFallbackSec ?? 1200;
-  $("progressTemplate").value = cfg.progressTemplate || DEFAULT_PROGRESS_TEMPLATE;
+  $("progressTemplate").value = cfg.progressTemplate || t("default_progress_template");
   $("llmJudgeBaseUrl").value = cfg.llmJudgeBaseUrl || "";
   $("llmJudgeApiKey").value = cfg.llmJudgeApiKey || "";
   $("llmJudgeModel").value = cfg.llmJudgeModel || "";
   $("llmJudgePromptTemplate").value = (cfg.llmJudgePromptTemplate && String(cfg.llmJudgePromptTemplate).trim())
     ? cfg.llmJudgePromptTemplate
-    : DEFAULT_LLM_JUDGE_PROMPT;
+    : t("default_llm_judge_prompt") || DEFAULT_LLM_JUDGE_PROMPT;
   $("llmJudgeSkipKeywords").value = (cfg.llmJudgeSkipKeywords && String(cfg.llmJudgeSkipKeywords).trim())
     ? cfg.llmJudgeSkipKeywords
     : DEFAULT_LLM_SKIP_KEYWORDS_TEXT;
@@ -92,6 +90,9 @@ async function loadForm() {
 $("uiLocale").addEventListener("change", async () => {
   await setLocale($("uiLocale").value);
   applyI18n();
+  await new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: "h2w_set_config", config: { uiLocale: getLocale() } }, () => resolve());
+  });
 });
 
 $("save").addEventListener("click", () => {
@@ -108,7 +109,7 @@ $("save").addEventListener("click", () => {
     llmJudgeBaseUrl: $("llmJudgeBaseUrl").value.trim(),
     llmJudgeApiKey: $("llmJudgeApiKey").value.trim(),
     llmJudgeModel: $("llmJudgeModel").value.trim(),
-    llmJudgePromptTemplate: $("llmJudgePromptTemplate").value.trim() || DEFAULT_LLM_JUDGE_PROMPT,
+    llmJudgePromptTemplate: $("llmJudgePromptTemplate").value.trim() || t("default_llm_judge_prompt") || DEFAULT_LLM_JUDGE_PROMPT,
     llmJudgeSkipKeywords: $("llmJudgeSkipKeywords").value.trim() || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
     autoAllow: $("autoAllow").checked,
     enabled: $("enabled").checked,
@@ -174,7 +175,7 @@ $("testLlm").addEventListener("click", () => {
       llmJudgeBaseUrl: base,
       llmJudgeApiKey: key,
       llmJudgeModel: model,
-      llmJudgePromptTemplate: $("llmJudgePromptTemplate").value.trim() || DEFAULT_LLM_JUDGE_PROMPT,
+      llmJudgePromptTemplate: $("llmJudgePromptTemplate").value.trim() || t("default_llm_judge_prompt") || DEFAULT_LLM_JUDGE_PROMPT,
       llmJudgeSkipKeywords: $("llmJudgeSkipKeywords").value.trim() || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
     },
   }, (resp) => {
@@ -185,15 +186,23 @@ $("testLlm").addEventListener("click", () => {
     }
     if (!resp?.ok) {
       if (resp?.reason === "timeout") setStatus(`✖ ${t("llm_timeout")}`, "err");
-      else if (resp?.reason === "http") setStatus(`✖ LLM HTTP ${resp.status}${resp.error ? `: ${resp.error}` : ""}`, "err");
-      else setStatus(`✖ ${resp?.error || resp?.reason || "llm test failed"}`, "err");
+      else if (resp?.reason === "http") {
+        setStatus(`✖ ${t("llm_test_http_error", {
+          status: resp.status || "?",
+          detail: resp.error ? `: ${resp.error}` : "",
+        })}`, "err");
+      } else {
+        setStatus(`✖ ${t("llm_test_failed", { error: resp?.error || resp?.reason || "?" })}`, "err");
+      }
       return;
     }
-    setStatus(
-      `✓ LLM raw=${JSON.stringify(resp.content)} → done=${resp.done} cont=${resp.cont}`
-        + (resp.cont ? ` send=${JSON.stringify(resp.nudgeText)}` : ""),
-      "ok",
-    );
+    const send = resp.cont ? t("llm_test_send", { send: JSON.stringify(resp.nudgeText) }) : "";
+    setStatus(`✓ ${t("llm_test_result", {
+      raw: JSON.stringify(resp.content),
+      done: String(resp.done),
+      cont: String(resp.cont),
+      send,
+    })}`, "ok");
   });
 });
 

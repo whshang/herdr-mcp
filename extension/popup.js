@@ -1,5 +1,5 @@
 // popup.js — bind UI: workspace label + pane stats (incl. agentless terminals)
-import { detectOrLoadLocale, t, onLocaleReady } from "./i18n.js";
+import { detectOrLoadLocale, getLocale, t, onLocaleReady } from "./i18n.js";
 
 const $ = (id) => document.getElementById(id);
 const STATUS_COLOR = { idle: "#9ca3af", working: "#d97706", done: "#16a34a", blocked: "#dc2626", unknown: "#6b7280", terminal: "#6b7280" };
@@ -109,6 +109,7 @@ function sessionBindingMap(sessionBindings) {
 }
 
 function applyStaticI18n() {
+  document.documentElement.lang = getLocale() === "zh" ? "zh-CN" : getLocale();
   document.title = t("popup_title");
   document.querySelectorAll("[data-i18n]").forEach((el) => {
     const key = el.getAttribute("data-i18n");
@@ -161,7 +162,7 @@ async function refresh() {
   if (agentsResp?.ok) {
     const nWs = groups.size;
     const nPanes = [...groups.values()].reduce((n, g) => n + (g.panes?.length || 0), 0);
-    srv.innerHTML = `<span class="ok">● ${t("online")}</span> <span class="muted">${nWs} · ${nPanes}p</span>`;
+    srv.innerHTML = `<span class="ok">● ${t("online")}</span> <span class="muted">${t("popup_service_stats", { workspaces: nWs, panes: nPanes })}</span>`;
   } else if (agentsResp?.status === 401) {
     srv.innerHTML = `<span class="err">● 401</span>`;
     $("agents").innerHTML = `<div class="err">${t("token_mismatch")}</div>
@@ -172,7 +173,6 @@ async function refresh() {
     srv.innerHTML = `<span class="err">● ${t("unreachable")}${agentsResp?.status ? ` (${agentsResp.status})` : ""}</span>`;
   }
   $("enabled").checked = !!st.config?.enabled;
-  $("idleNudgeEnabled").checked = st.config?.idleNudgeEnabled !== false;
   $("progressTickSec").value = String(st.config?.progressTickSec ?? 60);
   const llmEl = $("llmJudgeStatus");
   if (llmEl) {
@@ -184,7 +184,7 @@ async function refresh() {
       llmEl.textContent = t("llm_status_ready");
     } else {
       const ago = Math.max(0, Math.round((Date.now() - (last.at || 0)) / 1000));
-      const raw = last.raw != null ? ` raw=${JSON.stringify(String(last.raw)).slice(0, 32)}` : "";
+      const raw = last.raw != null ? t("llm_status_raw", { raw: JSON.stringify(String(last.raw)).slice(0, 32) }) : "";
       llmEl.textContent = t("llm_status_last", { reason: last.reason || "?", ago: String(ago) }) + raw;
     }
   }
@@ -225,7 +225,11 @@ async function refresh() {
       const main = document.createElement("div");
       main.className = "agent-main";
       main.innerHTML = `<div class="title"><span class="dot" style="background:${dotColor}" title="${sum.working > 0 ? t("ws_working") : t("ws_idle")}"></span><b>${title}</b></div>
-        <div class="meta">${sum.paneCount} panes · ${sum.working} working${sum.terminalOnly ? ` · ${sum.terminalOnly} terminal` : ""}</div>`;
+        <div class="meta">${t("popup_workspace_stats", {
+          panes: sum.paneCount,
+          working: sum.working,
+          terminal: sum.terminalOnly ? t("popup_terminal_suffix", { count: sum.terminalOnly }) : "",
+        })}</div>`;
       row.appendChild(main);
       if (bound) {
         const btn = document.createElement("button");
@@ -255,9 +259,6 @@ async function refresh() {
 
 $("enabled").addEventListener("change", async (e) => {
   await bg({ type: "h2w_set_config", config: { enabled: e.target.checked } });
-});
-$("idleNudgeEnabled").addEventListener("change", async (e) => {
-  await bg({ type: "h2w_set_config", config: { idleNudgeEnabled: e.target.checked } });
 });
 $("progressTickSec").addEventListener("change", async (e) => {
   const sec = parseSecInput(e.target.value, 60);

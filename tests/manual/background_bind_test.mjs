@@ -8,8 +8,10 @@
 import { pathToFileURL } from "node:url";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const EXT = path.join(__dirname, "..", "..", "extension");
 const CONV = "https://chatgpt.com/c/abc123";
 const SK_WH = `${CONV}::wH`;
 const PROJECT_ID = "g-p-6a89c078669481918c8eb70fdfd3d978";
@@ -33,6 +35,26 @@ let nextTabId = 500;
 let handoffSeedMode = "uncertain";
 let targetSeeded = false;
 let handoffPrompt = "";
+let mockStateWorkspaces = [];
+
+const nativeFetch = globalThis.fetch;
+globalThis.fetch = async (input, init) => {
+  const url = String(input || "");
+  if (url.startsWith("chrome-extension://test-ext/")) {
+    const rel = url.slice("chrome-extension://test-ext/".length);
+    return new Response(readFileSync(path.join(EXT, rel), "utf8"), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (url.endsWith("/push/state")) {
+    return new Response(JSON.stringify({ workspaces: mockStateWorkspaces, panes: [], agents: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  return nativeFetch(input, init);
+};
 
 function targetListener(tab) {
   return (msg, _sender, sendResponse) => {
@@ -75,6 +97,7 @@ function targetListener(tab) {
 globalThis.chrome = {
   runtime: {
     id: "test-ext",
+    getURL: (rel) => `chrome-extension://test-ext/${rel}`,
     lastError: null,
     onMessage: { addListener: (fn) => listeners.onMessage.push(fn) },
     onStartup: { addListener: (fn) => listeners.onStartup.push(fn) },
@@ -242,6 +265,31 @@ console.log("\n[binding flow]");
   onMsg({ type: "h2w_state", tabId: 303 }, { tab: { id: 303 } }, (r) => resolveP(r));
   const r = await p;
   ok(!!r.convInfo && r.convInfo.convKey === "https://chatgpt.com/c/xyz" && Array.isArray(r.bindings) && Array.isArray(r.sessionBindings), "h2w_state returns convInfo, bindings, sessionBindings", JSON.stringify(r).slice(0, 120));
+}
+
+// ---- Scenario 6b: stale workspace label is reconciled from live catalog ----
+{
+  const staleKey = `${CONV}::w68`;
+  storage.herdrWakeBindings[staleKey] = {
+    convKey: CONV,
+    workspace_id: "w68",
+    workspace_label: "integrate-dsh-enterprise-agent-20260823 (w68)",
+    persistence: "explicit",
+    created_at: Date.now(),
+    last_seen_at: Date.now(),
+  };
+  mockStateWorkspaces = [{
+    id: "w68",
+    label: "herdr-mcp",
+    roots: ["/Users/qingxian/Documents/herdr-mcp"],
+  }];
+  let resolveP;
+  const p = new Promise((r) => { resolveP = r; });
+  onMsg({ type: "h2w_page_hud", convKey: CONV }, {}, (r) => resolveP(r));
+  const r = await p;
+  ok(r?.workspace_label?.includes("herdr-mcp"), "HUD prefers live workspace label over stale binding label", JSON.stringify(r));
+  ok(storage.herdrWakeBindings[staleKey]?.workspace_label?.includes("herdr-mcp"), "stale binding label is repaired");
+  mockStateWorkspaces = [];
 }
 
 // ---- Scenario 7: Project handoff keeps source authoritative until target seed is confirmed ----

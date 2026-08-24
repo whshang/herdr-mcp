@@ -10,7 +10,7 @@ function loadClassicExtensionScripts() {
     Math,
     crypto: { randomUUID: () => "continuity-test" },
   });
-  for (const file of ["extension/conversation-health.js", "extension/recovery-controller.js"]) {
+  for (const file of ["extension/context-pressure.js", "extension/conversation-health.js", "extension/recovery-controller.js"]) {
     const source = fs.readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
     assert.doesNotMatch(source, /^\s*(?:import|export)\s/m, `${file} must remain a classic content script`);
     new vm.Script(source, { filename: file }).runInContext(context);
@@ -20,6 +20,7 @@ function loadClassicExtensionScripts() {
 
 test("conversation recovery scripts load as classic MV3 content scripts", () => {
   const context = loadClassicExtensionScripts();
+  assert.ok(context.H2W_CONTEXT_PRESSURE);
   assert.ok(context.H2W_CONVERSATION_HEALTH);
   assert.ok(context.H2W_RECOVERY_CONTROLLER);
 });
@@ -97,4 +98,67 @@ test("reply timeout, recovery attempt, reload gate, and rollover remain fail-clo
   record = recovery.markReloaded(record, 3001);
   assert.equal(record.reload_attempt, 1);
   assert.equal(recovery.recommendRollover(record, policy), true);
+  assert.equal(recovery.canRolloverSafely(record, {}, policy), true);
+  assert.equal(recovery.canRolloverSafely(record, { streaming: true }, policy), false);
+  assert.equal(recovery.canRolloverSafely(record, { toolRunning: true }, policy), false);
+  assert.equal(recovery.canRolloverSafely(record, { permissionCardActive: true }, policy), false);
+  assert.equal(recovery.canRolloverSafely(record, { tabReachable: false }, policy), false);
+  assert.equal(recovery.canRolloverSafely({ ...record, last_assistant_progress_at: 3002 }, {}, policy), false);
+});
+
+test("observed assistant progress cancels a stale ChatGPT reply timeout", () => {
+  const context = loadClassicExtensionScripts();
+  const health = context.H2W_CONVERSATION_HEALTH;
+  const recovery = context.H2W_RECOVERY_CONTROLLER;
+  let record = health.markReplyWaiting(health.createConversationHealth("chatgpt-project-conversation"), 1000);
+  record = health.markAssistantProgress(record, 1500);
+  assert.equal(record.state, "healthy");
+  assert.equal(record.last_assistant_progress_at, 1500);
+  assert.equal(recovery.classifyReplyTimeout(record, 120000, 1000).state, "healthy");
+});
+
+test("ChatGPT turn watcher wires assistant progress, settled turns, and explicit rollover reasons", () => {
+  const wake = fs.readFileSync(new URL("../extension/content/wake.js", import.meta.url), "utf8");
+  assert.match(wake, /markAssistantProgressIfActive\(\)/);
+  assert.match(wake, /markObservedTurnEnded\(endedAt\)/);
+  assert.match(wake, /trigger:\s*"context_pressure"/);
+  assert.match(wake, /trigger:\s*"recovery_exhausted"/);
+});
+
+test("context pressure uses measured budget thresholds", () => {
+  const context = loadClassicExtensionScripts();
+  const pressure = context.H2W_CONTEXT_PRESSURE;
+  assert.equal(pressure.EFFECTIVE_CONTEXT_TOKENS, 128000);
+  assert.equal(pressure.USABLE_TEXT_BUDGET_TOKENS, 120000);
+  assert.equal(pressure.evaluateContextPressure({ estimatedTextTokens: 72000 }).state, "context_warning");
+  assert.equal(pressure.evaluateContextPressure({ estimatedTextTokens: 84000 }).state, "handoff_prepare");
+  assert.equal(pressure.evaluateContextPressure({ estimatedTextTokens: 90000 }).state, "rollover_recommended");
+  assert.equal(pressure.evaluateContextPressure({ estimatedTextTokens: 96000 }).state, "rollover_required");
+});
+
+test("context pressure persists metadata only and proactive rollover is fail-closed", () => {
+  const context = loadClassicExtensionScripts();
+  const pressure = context.H2W_CONTEXT_PRESSURE;
+  let record = pressure.emptyContextRecord("c", 1000);
+  record = pressure.mergeObservedTurns(record, [
+    { id: "u1", role: "user", text: "hello world" },
+    { id: "a1", role: "assistant", text: "answer" },
+  ]);
+  assert.equal(JSON.stringify(record).includes("hello world"), false);
+  assert.equal(pressure.summarizeContextRecord(record).message_count, 2);
+
+  const base = {
+    pressure: pressure.evaluateContextPressure({ estimatedTextTokens: 96000 }),
+    runtimeHealth: "healthy",
+    bound: true,
+    canHandoff: true,
+    projectConversation: true,
+    quiescent: true,
+    deliveryUncertain: false,
+    mutationPending: false,
+    handoffStatus: null,
+  };
+  assert.equal(pressure.shouldAutoRollover(base), true);
+  assert.equal(pressure.shouldAutoRollover({ ...base, mutationPending: true }), false);
+  assert.equal(pressure.shouldAutoRollover({ ...base, handoffStatus: "summary_requested" }), false);
 });

@@ -8,20 +8,23 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.41";
+const H2W_CONTENT_VERSION = "0.1.42";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
   const SPEAKS = window.__H2W_SPEAKS_JSON__ || null;
+  const CONTEXT_PRESSURE = globalThis.H2W_CONTEXT_PRESSURE || null;
   const CONVERSATION_HEALTH = globalThis.H2W_CONVERSATION_HEALTH || null;
   const RECOVERY_CONTROLLER = globalThis.H2W_RECOVERY_CONTROLLER || null;
   let conversationHealth = null;
+  let contextPressureRecord = null;
+  // Fail closed until background confirms the master automation state. The
+  // read-only HUD/workspace observers do not depend on these flags.
+  let automationEnabled = false;
+  let automationAutoAllow = false;
+  let hudLabels = {};
   const HEALTH_STORAGE_KEY = "h2wConversationHealthByConv";
-  const RECOVERY_PROBE_TEMPLATE = [
-    "Herdr recovery check: the previous assistant turn did not visibly start.",
-    "Do not call tools, do not repeat or continue any external action, and do not mutate anything.",
-    "Only report whether the previous request appears to have completed in this conversation. If you cannot verify that, reply exactly: recovery needed.",
-  ].join("\n");
+  const CONTEXT_PRESSURE_STORAGE_KEY = "h2wContextPressureByConv";
 
   function runtimeAlive() {
     try { return !!chrome.runtime?.id; } catch { return false; }
@@ -36,6 +39,18 @@ const H2W_CONTENT_VERSION = "0.1.41";
       } catch (e) { resolve(null); }
     });
   }
+  async function refreshAutomationState() {
+    const state = await sendBg({ type: "h2w_automation_state" });
+    if (!state?.ok) {
+      automationEnabled = false;
+      automationAutoAllow = false;
+      return false;
+    }
+    automationEnabled = state.enabled !== false;
+    automationAutoAllow = state.autoAllow !== false;
+    hudLabels = state.labels || hudLabels;
+    return automationEnabled;
+  }
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const normText = (s) => String(s || "").replace(/\s+/g, " ").trim();
 
@@ -43,6 +58,22 @@ const H2W_CONTENT_VERSION = "0.1.41";
     conversationHealth = record;
     if (record?.convKey) void persistConversationHealth(record);
     return record;
+  }
+
+  function markAssistantProgressIfActive(at = Date.now()) {
+    if (!conversationHealth || !CONVERSATION_HEALTH) return;
+    if ([
+      CONVERSATION_HEALTH.CONVERSATION_STATES.REPLY_WAITING,
+      CONVERSATION_HEALTH.CONVERSATION_STATES.REPLY_SUSPECT,
+      CONVERSATION_HEALTH.CONVERSATION_STATES.RECOVERY_MESSAGE_SENT,
+    ].includes(conversationHealth.state)) {
+      markConversationState(CONVERSATION_HEALTH.markAssistantProgress(conversationHealth, at));
+    }
+  }
+
+  function markObservedTurnEnded(at = Date.now()) {
+    if (!conversationHealth || !CONVERSATION_HEALTH) return;
+    markConversationState(CONVERSATION_HEALTH.markTurnEnded(conversationHealth, at));
   }
 
   async function loadConversationHealth(convKey) {
@@ -78,6 +109,62 @@ const H2W_CONTENT_VERSION = "0.1.41";
     if (!CONVERSATION_HEALTH || !convKey) return null;
     if (conversationHealth?.convKey === convKey) return conversationHealth;
     return markConversationState(await loadConversationHealth(convKey));
+  }
+
+  async function loadContextPressure(convKey) {
+    if (!CONTEXT_PRESSURE || !convKey) return null;
+    try {
+      const stored = await chrome.storage.local.get([CONTEXT_PRESSURE_STORAGE_KEY]);
+      const existing = stored?.[CONTEXT_PRESSURE_STORAGE_KEY]?.[convKey];
+      if (existing?.convKey === convKey) return existing;
+    } catch (_) {}
+    return CONTEXT_PRESSURE.emptyContextRecord(convKey);
+  }
+
+  async function persistContextPressure(record) {
+    if (!record?.convKey || !runtimeAlive() || !CONTEXT_PRESSURE) return;
+    try {
+      const stored = await chrome.storage.local.get([CONTEXT_PRESSURE_STORAGE_KEY]);
+      const map = { ...(stored?.[CONTEXT_PRESSURE_STORAGE_KEY] || {}), [record.convKey]: record };
+      const entries = Object.entries(map);
+      if (entries.length > 20) {
+        entries.sort((a, b) => Number(b[1]?.updated_at || 0) - Number(a[1]?.updated_at || 0));
+        for (const [key] of entries.slice(20)) delete map[key];
+      }
+      await chrome.storage.local.set({ [CONTEXT_PRESSURE_STORAGE_KEY]: map });
+    } catch (_) {}
+  }
+
+  function observedConversationTurns() {
+    if (!CONTEXT_PRESSURE) return [];
+    const observations = [];
+    const nodes = [...document.querySelectorAll('[data-message-author-role="user"], [data-message-author-role="assistant"]')];
+    for (const el of nodes) {
+      const role = el.getAttribute("data-message-author-role");
+      const text = String(el.innerText || el.textContent || "").trim();
+      if (!text || (role !== "user" && role !== "assistant")) continue;
+      const turn = el.closest("[data-turn-id]");
+      const message = el.closest("[data-message-id]");
+      const stableId = turn?.getAttribute("data-turn-id")
+        || el.getAttribute("data-turn-id")
+        || message?.getAttribute("data-message-id")
+        || el.getAttribute("data-message-id")
+        || `observed:${CONTEXT_PRESSURE.textFingerprint(text)}`;
+      observations.push({ id: `${stableId}:${role}`, role, text });
+    }
+    return observations;
+  }
+
+  async function updateContextPressure() {
+    if (!CONTEXT_PRESSURE) return null;
+    const convKey = ADAPTER.getConversationKey();
+    if (!convKey) return null;
+    if (contextPressureRecord?.convKey !== convKey) {
+      contextPressureRecord = await loadContextPressure(convKey);
+    }
+    contextPressureRecord = CONTEXT_PRESSURE.mergeObservedTurns(contextPressureRecord, observedConversationTurns());
+    await persistContextPressure(contextPressureRecord);
+    return CONTEXT_PRESSURE.summarizeContextRecord(contextPressureRecord);
   }
 
   // ---- MAIN-world insertion for contenteditable sites ----
@@ -312,6 +399,7 @@ const H2W_CONTENT_VERSION = "0.1.41";
   let lastPermClickAt = 0;
   function permissionTryClick() {
     if (!runtimeAlive() || Date.now() > permDeadline) { permissionStop(); return; }
+    if (!automationEnabled || !automationAutoAllow) return;
     const r = permClicker.tryClick(document);
     if (r.handled) {
       lastPermClickAt = Date.now();
@@ -343,6 +431,12 @@ const H2W_CONTENT_VERSION = "0.1.41";
       });
     } catch (e) {}
     if (!persistent) setTimeout(permissionStop, durationMs + 5000);
+  }
+
+  function syncAutomationPermissionWatch() {
+    if (ADAPTER.name !== "chatgpt" || !PERM) return;
+    if (automationEnabled && automationAutoAllow) startPermissionWatch(Number.POSITIVE_INFINITY);
+    else permissionStop();
   }
 
   // ---- Perform one wake-up ----
@@ -654,6 +748,12 @@ const H2W_CONTENT_VERSION = "0.1.41";
       const changed = registeredConvKey !== null && registeredConvKey !== convKey;
       registeredConvKey = convKey;
       await ensureConversationHealth(convKey);
+      if (CONTEXT_PRESSURE) {
+        contextPressureRecord = await loadContextPressure(convKey);
+        void updateContextPressure().then((pressure) => {
+          if (pressure && ADAPTER.name === "chatgpt") paintPageHud({ continuity: pressure });
+        });
+      }
       if (changed) {
         console.log(`[h2w] conversation route changed (${reason}): ${convKey}`);
         if (ADAPTER.name === "chatgpt") void refreshPageHud();
@@ -705,10 +805,11 @@ const H2W_CONTENT_VERSION = "0.1.41";
 
   async function maybeSendRecoveryProbe() {
     if (!conversationHealth || !RECOVERY_CONTROLLER) return false;
+    if (!automationEnabled) return false;
     if (!RECOVERY_CONTROLLER.shouldSendRecovery(conversationHealth)) return false;
     const safety = recoverySafetySnapshot();
     if (safety.composerBusy || safety.streaming || safety.toolRunning || safety.permissionCardActive) return false;
-    const result = await performWake({ template: RECOVERY_PROBE_TEMPLATE, autoAllow: false, recovery: true });
+    const result = await performWake({ template: hudLabels.recovery_probe_template, autoAllow: false, recovery: true });
     if (!result?.ok) return false;
     markConversationState(RECOVERY_CONTROLLER.markRecoverySent(conversationHealth));
     paintPageHud({});
@@ -722,6 +823,7 @@ const H2W_CONTENT_VERSION = "0.1.41";
 
   async function maybeReloadForRecovery() {
     if (!conversationHealth || !RECOVERY_CONTROLLER || !CONVERSATION_HEALTH) return false;
+    if (!automationEnabled) return false;
     if (conversationHealth.state !== CONVERSATION_HEALTH.CONVERSATION_STATES.REPLY_SUSPECT) return false;
     if ((conversationHealth.recovery_attempt || 0) < RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.maxRecoveryAttempts) return false;
     const safety = recoverySafetySnapshot();
@@ -736,8 +838,41 @@ const H2W_CONTENT_VERSION = "0.1.41";
     return true;
   }
 
+  async function maybeEscalateContextRollover() {
+    if (!CONTEXT_PRESSURE || !contextPressureRecord) return false;
+    if (!automationEnabled) return false;
+    const pressure = CONTEXT_PRESSURE.summarizeContextRecord(contextPressureRecord);
+    const hud = await sendBg({ type: "h2w_page_hud", convKey: ADAPTER.getConversationKey() });
+    if (!hud?.ok) return false;
+    const safety = recoverySafetySnapshot();
+    const should = CONTEXT_PRESSURE.shouldAutoRollover({
+      pressure,
+      runtimeHealth: safety.streaming || safety.toolRunning ? "working" : "healthy",
+      bound: hud.bound,
+      canHandoff: hud.can_handoff,
+      projectConversation: Boolean(hud.can_handoff),
+      quiescent: !safety.composerBusy && !safety.streaming && !safety.toolRunning && !safety.permissionCardActive,
+      deliveryUncertain: hud.handoff?.status === "seed_uncertain",
+      mutationPending: hud.handoff?.status === "seed_submitting",
+      handoffStatus: hud.handoff?.status,
+      lastAutoAttemptAt: contextPressureRecord.last_auto_attempt_at,
+    });
+    if (!should) return false;
+    contextPressureRecord = CONTEXT_PRESSURE.markAutoAttempt(contextPressureRecord, null, "context_pressure");
+    await persistContextPressure(contextPressureRecord);
+    const result = await sendBg({ type: "h2w_handoff_start", trigger: "context_pressure" });
+    if (result?.ok) {
+      contextPressureRecord = CONTEXT_PRESSURE.markRolloverCommitted(contextPressureRecord, result?.handoff?.id || null);
+      await persistContextPressure(contextPressureRecord);
+      paintPageHud({ hud, continuity: pressure });
+      return true;
+    }
+    return false;
+  }
+
   async function maybeEscalateRecoveryRollover() {
     if (!conversationHealth || !RECOVERY_CONTROLLER || !CONVERSATION_HEALTH) return false;
+    if (!automationEnabled) return false;
     if (conversationHealth.state !== CONVERSATION_HEALTH.CONVERSATION_STATES.RECOVERING) return false;
     if (Date.now() - Number(conversationHealth.last_reload_at || 0) < 10000) return false;
 
@@ -749,11 +884,12 @@ const H2W_CONTENT_VERSION = "0.1.41";
       paintPageHud({});
       return true;
     }
-    if (!RECOVERY_CONTROLLER.recommendRollover(conversationHealth)) return false;
-
     const safety = recoverySafetySnapshot();
-    if (safety.composerBusy || safety.streaming || safety.toolRunning || safety.permissionCardActive) return false;
     const hud = await sendBg({ type: "h2w_page_hud", convKey: ADAPTER.getConversationKey() });
+    const tabReachable = Array.isArray(hud?.bindings)
+      ? hud.bindings.every((binding) => binding?.execution_state?.reachable !== false)
+      : true;
+    if (!RECOVERY_CONTROLLER.canRolloverSafely(conversationHealth, { ...safety, tabReachable })) return false;
     if (!hud?.ok || !hud?.can_handoff) {
       markConversationState(CONVERSATION_HEALTH.markRolloverRecommended(conversationHealth));
       paintPageHud({ hud: hud?.ok ? hud : null });
@@ -762,7 +898,7 @@ const H2W_CONTENT_VERSION = "0.1.41";
 
     markConversationState(CONVERSATION_HEALTH.markRolloverRequired(conversationHealth));
     paintPageHud({ hud });
-    const result = await sendBg({ type: "h2w_handoff_start" });
+    const result = await sendBg({ type: "h2w_handoff_start", trigger: "recovery_exhausted" });
     if (!result?.ok) {
       markConversationState(CONVERSATION_HEALTH.markRolloverRecommended(conversationHealth));
       paintPageHud({ hud });
@@ -789,6 +925,7 @@ const H2W_CONTENT_VERSION = "0.1.41";
         if (next !== conversationHealth) markConversationState(next);
         if (await maybeSendRecoveryProbe()) return;
         if (await maybeReloadForRecovery()) return;
+        if (await maybeEscalateContextRollover()) return;
         await maybeEscalateRecoveryRollover();
       })().finally(() => { healthCheckInFlight = false; });
     }, 5000);
@@ -797,11 +934,12 @@ const H2W_CONTENT_VERSION = "0.1.41";
   (async () => {
     if (!runtimeAlive()) return;
     try { chrome.runtime.sendMessage({ type: "h2w_hello", version: H2W_CONTENT_VERSION }); } catch (e) {}
+    await refreshAutomationState();
     await registerCurrentConversation("startup");
     await reconcileConversationHealthAfterLoad();
     startConversationRouteWatch();
     // ChatGPT Connector permission cards can appear outside wake-up, so watch continuously.
-    if (ADAPTER.name === "chatgpt" && PERM) startPermissionWatch(Number.POSITIVE_INFINITY);
+    syncAutomationPermissionWatch();
     // Talk-without-tools: watch turn boundaries and ask background to check MCP activity.
     if (ADAPTER.name === "chatgpt") {
       startPageHud();
@@ -819,6 +957,8 @@ const H2W_CONTENT_VERSION = "0.1.41";
     let settleTimer = null;
     let lastReportedEnd = 0;
     let lastAsstLen = 0;
+    let lastAsstSignature = assistantSignature(lastMessageByRole("assistant"));
+    let lastAsstCount = document.querySelectorAll('[data-message-author-role="assistant"]').length;
     let stableRounds = 0;
 
     const reportTurnEnded = (assistantText, endedAt) => {
@@ -827,6 +967,7 @@ const H2W_CONTENT_VERSION = "0.1.41";
       if (!looksLikeSubstantiveReply(assistantText)) return;
       if (!String(assistantText || "").trim()) return;
       lastReportedEnd = endedAt;
+      markObservedTurnEnded(endedAt);
       const payload = {
         type: "h2w_turn_ended",
         convKey: ADAPTER.getConversationKey(),
@@ -835,7 +976,10 @@ const H2W_CONTENT_VERSION = "0.1.41";
         userText: userTextAtStart || lastMessageByRole("user"),
         assistantText,
       };
-      console.log("[h2w] turn ended; asking idle-nudge check");
+      console.log("[h2w] turn ended; updating continuity pressure and asking idle-nudge check");
+      void updateContextPressure().then((pressure) => {
+        if (pressure) paintPageHud({ continuity: pressure });
+      });
       paintPageHud({ pending: true });
       sendBg(payload).then((r) => {
         console.log("[h2w] idle-nudge result:", r);
@@ -848,11 +992,15 @@ const H2W_CONTENT_VERSION = "0.1.41";
       const stopping = isComposerGenerating();
       const assistantText = lastMessageByRole("assistant");
       const curLen = assistantText.length;
+      const curSignature = assistantSignature(assistantText);
+      const curCount = document.querySelectorAll('[data-message-author-role="assistant"]').length;
+      const assistantChanged = curLen > 0 && (curSignature !== lastAsstSignature || curCount > lastAsstCount);
 
-      if (stopping || curLen > lastAsstLen) {
+      if (stopping || assistantChanged || curLen > lastAsstLen) {
+        if (curLen > 0 && (stopping || assistantChanged)) markAssistantProgressIfActive();
         if (!generating) {
           generating = true;
-          sawGrowth = curLen > lastAsstLen || stopping;
+          sawGrowth = assistantChanged || curLen > lastAsstLen || stopping;
           startedAt = Date.now();
           userTextAtStart = lastMessageByRole("user");
           if (settleTimer) { clearInterval(settleTimer); settleTimer = null; }
@@ -862,6 +1010,8 @@ const H2W_CONTENT_VERSION = "0.1.41";
         if (curLen > lastAsstLen) sawGrowth = true;
         stableRounds = 0;
         lastAsstLen = curLen;
+        lastAsstSignature = curSignature;
+        lastAsstCount = curCount;
         return;
       }
 
@@ -894,6 +1044,8 @@ const H2W_CONTENT_VERSION = "0.1.41";
         }, 800);
       }
       lastAsstLen = curLen;
+      lastAsstSignature = curSignature;
+      lastAsstCount = curCount;
     };
 
     setInterval(onTick, 800);
@@ -961,9 +1113,19 @@ const H2W_CONTENT_VERSION = "0.1.41";
     hudActionBusy = Boolean(busy);
     if (!hudEls) return;
     hudEls.quick.disabled = hudActionBusy;
-    hudEls.master.disabled = hudActionBusy;
     hudEls.tick.disabled = hudActionBusy;
     hudEls.fallback.disabled = hudActionBusy;
+    syncHudManualButtons();
+  }
+
+  function syncHudManualButtons() {
+    if (!hudEls) return;
+    const locked = hudActionBusy || hudCache?.enabled !== false;
+    for (const button of hudEls.manualButtons || []) {
+      button.classList.toggle("locked", locked);
+      button.disabled = locked;
+      button.setAttribute("aria-disabled", String(locked));
+    }
   }
 
   function showHudToast(text, kind = "") {
@@ -976,6 +1138,16 @@ const H2W_CONTENT_VERSION = "0.1.41";
     }, 3500);
   }
 
+  function hudText(key, vars = null, fallback = "") {
+    let text = String(hudLabels?.[key] || fallback || "");
+    if (vars) {
+      for (const [name, value] of Object.entries(vars)) {
+        text = text.replaceAll(`{${name}}`, String(value));
+      }
+    }
+    return text;
+  }
+
   async function setHudMasterEnabled(enabled) {
     if (hudActionBusy) return;
     setHudActionBusy(true);
@@ -985,11 +1157,13 @@ const H2W_CONTENT_VERSION = "0.1.41";
       config: { enabled: on, idleNudgeEnabled: on },
     });
     if (result?.ok) {
+      automationEnabled = on;
       hudCache = { ...(hudCache || {}), enabled: on, idleNudgeEnabled: on };
+      syncAutomationPermissionWatch();
       paintPageHud({ hud: hudCache });
-      showHudToast(on ? "Wake + nudge enabled" : "Wake + nudge paused", "ok");
+      showHudToast(on ? hudText("automation_enabled") : hudText("automation_disabled"), "ok");
     } else {
-      showHudToast("Could not update wake state", "err");
+      showHudToast(hudText("automation_update_failed"), "err");
     }
     setHudActionBusy(false);
   }
@@ -1008,9 +1182,9 @@ const H2W_CONTENT_VERSION = "0.1.41";
     });
     if (result?.ok) {
       hudCache = { ...(hudCache || {}), progressTickSec: tick, progressFallbackSec: fallback };
-      showHudToast("Timing saved", "ok");
+      showHudToast(hudText("timing_saved"), "ok");
     } else {
-      showHudToast("Could not save timing", "err");
+      showHudToast(hudText("timing_save_failed"), "err");
     }
     setHudActionBusy(false);
   }
@@ -1038,10 +1212,15 @@ const H2W_CONTENT_VERSION = "0.1.41";
       });
     }
     if (result?.ok) {
-      showHudToast(shouldBind ? `Bound ${hudWorkspaceTitle(workspace)}` : `Unbound ${hudWorkspaceTitle(workspace)}`, "ok");
+      showHudToast(
+        shouldBind
+          ? hudText("bound_to", { name: hudWorkspaceTitle(workspace) })
+          : hudText("unbound_from", { name: hudWorkspaceTitle(workspace) }),
+        "ok",
+      );
       await refreshPageHud();
     } else {
-      showHudToast(`Binding failed: ${result?.error || "unknown"}`, "err");
+      showHudToast(hudText("binding_failed", { error: result?.error || "unknown" }), "err");
     }
     setHudActionBusy(false);
   }
@@ -1062,8 +1241,8 @@ const H2W_CONTENT_VERSION = "0.1.41";
       const empty = document.createElement("div");
       empty.className = "empty";
       empty.textContent = hudCache?.workspace_error
-        ? `Workspaces unavailable: ${hudCache.workspace_error}`
-        : "No Herdr workspaces discovered";
+        ? hudText("workspaces_unavailable", { error: hudCache.workspace_error })
+        : hudText("no_workspaces");
       list.appendChild(empty);
       return;
     }
@@ -1086,15 +1265,16 @@ const H2W_CONTENT_VERSION = "0.1.41";
       if (binding) {
         const state = String(binding.status || "bound");
         const active = Number(binding.working_count) || 0;
-        meta.textContent = active > 0 ? `${state} · ${active} active` : state;
+        const stateLabel = hudLabels?.states?.[state] || state;
+        meta.textContent = active > 0 ? `${stateLabel} · ${hudText("active", { count: active })}` : stateLabel;
       } else {
-        meta.textContent = roots.length ? String(roots[0]) : "Available";
+        meta.textContent = roots.length ? String(roots[0]) : hudText("available");
       }
       copy.append(title, meta);
       const action = document.createElement("button");
       action.type = "button";
       action.className = `ws-action${bound ? " danger" : ""}`;
-      action.textContent = bound ? "Unbind" : "Bind";
+      action.textContent = bound ? hudText("unbind") : hudText("bind");
       action.disabled = hudActionBusy;
       action.addEventListener("pointerdown", (event) => event.stopPropagation());
       action.addEventListener("click", (event) => {
@@ -1103,6 +1283,30 @@ const H2W_CONTENT_VERSION = "0.1.41";
       });
       row.append(copy, action);
       list.appendChild(row);
+    }
+  }
+
+  async function manualContinueAction(action) {
+    if (hudActionBusy || hudCache?.enabled !== false) return { ok: false, error: "automation_enabled" };
+    setHudActionBusy(true);
+    try {
+      const result = await sendBg({
+        type: "h2w_manual_continue",
+        action,
+        convKey: ADAPTER.getConversationKey(),
+        userText: lastMessageByRole("user"),
+        assistantText: lastMessageByRole("assistant"),
+      });
+      if (result?.ok && result?.nudged === false && result?.continued === false) {
+        showHudToast(hudText("judge_no_continue"), "ok");
+      } else if (result?.ok) {
+        showHudToast(hudText("continue_sent"), "ok");
+      } else {
+        showHudToast(hudText("continue_failed", { error: result?.error || "unknown" }), "err");
+      }
+      return result;
+    } finally {
+      setHudActionBusy(false);
     }
   }
 
@@ -1137,12 +1341,13 @@ const H2W_CONTENT_VERSION = "0.1.41";
         }
         .status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
         .workspace { color: #8a8a8a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
-        .quick, .expand {
+        .quick, .manual, .expand {
           height: 22px; border: 1px solid #dedede; background: #fafafa; border-radius: 7px;
           cursor: pointer; padding: 0 7px; font-size: 11px; white-space: nowrap;
         }
         .quick.on { color: #166534; background: #f0fdf4; border-color: #bbf7d0; }
         .quick.off { color: #6b7280; background: #f5f5f5; }
+        .manual.locked { opacity: .45; cursor: not-allowed; }
         .expand { width: 24px; padding: 0; font-size: 13px; }
         button:hover { filter: brightness(.97); }
         button:disabled, input:disabled { opacity: .55; cursor: wait; }
@@ -1167,26 +1372,21 @@ const H2W_CONTENT_VERSION = "0.1.41";
         .conversation { margin-top: 1px; max-width: 260px; color: #909090; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .options { border: 0; background: transparent; color: #6b7280; cursor: pointer; font-size: 11px; padding: 3px 5px; }
         .section { border-top: 1px solid #efefef; padding: 9px 11px; }
-        .control-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-        .control-title { font-weight: 650; }
-        .control-hint { color: #999; font-size: 10px; margin-top: 1px; }
-        .master {
-          min-width: 52px; height: 24px; border: 1px solid #ddd; border-radius: 999px;
-          background: #f5f5f5; cursor: pointer; padding: 0 8px; font-weight: 650; font-size: 10px;
-        }
-        .master.on { color: #166534; background: #ecfdf3; border-color: #bbf7d0; }
         .timing { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 9px; }
         .timing label { display: grid; gap: 3px; color: #777; font-size: 10px; }
         .timing input { width: 100%; box-sizing: border-box; height: 27px; border: 1px solid #ddd; border-radius: 7px; padding: 2px 7px; color: #333; background: #fff; }
         .section-title { font-size: 10px; color: #858585; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 5px; }
-        .workspaces { display: grid; gap: 3px; }
-        .ws-row { display: flex; align-items: center; gap: 8px; padding: 6px 7px; border-radius: 8px; }
+        .workspaces { display: grid; gap: 3px; min-width: 0; }
+        .ws-row {
+          display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0;
+          box-sizing: border-box; padding: 6px 7px; border-radius: 8px;
+        }
         .ws-row:hover { background: #f7f7f7; }
         .ws-row.bound { background: #f4fbf6; }
         .ws-copy { flex: 1; min-width: 0; }
         .ws-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .ws-meta { margin-top: 1px; color: #9b9b9b; font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .ws-action { border: 1px solid #d5d5d5; background: #fff; border-radius: 7px; padding: 3px 7px; cursor: pointer; font-size: 10px; }
+        .ws-action { flex: 0 0 auto; border: 1px solid #d5d5d5; background: #fff; border-radius: 7px; padding: 3px 7px; cursor: pointer; font-size: 10px; }
         .ws-action.danger { color: #b42318; }
         .empty { color: #999; padding: 7px 3px; }
         .toast { margin: 0 11px 9px; padding: 6px 8px; border-radius: 7px; background: #f5f5f5; color: #555; font-size: 10px; }
@@ -1195,13 +1395,11 @@ const H2W_CONTENT_VERSION = "0.1.41";
         @media (prefers-color-scheme: dark) {
           .bar { color: #ddd; background: rgba(32,32,32,.96); border-color: #3a3a3a; }
           .workspace { color: #8d8d8d; }
-          .quick, .expand { background: #292929; border-color: #454545; }
+          .quick, .manual, .expand { background: #292929; border-color: #454545; }
           .quick.on { color: #86efac; background: #143020; border-color: #245c36; }
           .panel { color: #e8e8e8; background: rgba(32,32,32,.985); border-color: #494949; }
           .section { border-color: #414141; }
           .timing input { color: #eee; background: #282828; border-color: #4a4a4a; }
-          .master { background: #292929; border-color: #454545; }
-          .master.on { color: #86efac; background: #143020; border-color: #245c36; }
           .ws-row:hover { background: #292929; }
           .ws-row.bound { background: #173020; }
           .ws-action { color: #ddd; background: #272727; border-color: #4a4a4a; }
@@ -1209,26 +1407,26 @@ const H2W_CONTENT_VERSION = "0.1.41";
       </style>
       <div class="panel" part="panel" hidden>
         <div class="panel-head">
-          <div><div class="panel-title">Herdr controls</div><div class="conversation"></div></div>
-          <button type="button" class="options">Advanced options ↗</button>
+          <div><div class="panel-title"></div><div class="conversation"></div></div>
+          <button type="button" class="options"></button>
         </div>
         <div class="section">
-          <div class="control-row">
-            <div><div class="control-title">Wake + small-model nudge</div><div class="control-hint">One switch controls both behaviors</div></div>
-            <button type="button" class="master">On</button>
-          </div>
+          <div class="section-title event-title"></div>
           <div class="timing">
-            <label>Interval (sec)<input class="tick" type="number" min="0" step="1"></label>
-            <label>Fallback (sec)<input class="fallback" type="number" min="0" step="1"></label>
+            <label><span class="tick-label"></span><input class="tick" type="number" min="0" step="1"></label>
+            <label><span class="fallback-label"></span><input class="fallback" type="number" min="0" step="1"></label>
           </div>
         </div>
-        <div class="section"><div class="section-title">Conversation bindings</div><div class="workspaces"></div></div>
+        <div class="section"><div class="section-title bindings-title"></div><div class="workspaces"></div></div>
         <div class="toast" hidden></div>
       </div>
       <div class="bar" part="bar">
         <button type="button" class="summary"><span class="status"></span><span class="workspace"></span></button>
-        <button type="button" class="quick" aria-label="Toggle Herdr wake and nudge">Wake on</button>
-        <button type="button" class="expand" aria-label="Open Herdr controls" aria-expanded="false">⌃</button>
+        <button type="button" class="manual manual-continue"></button>
+        <button type="button" class="manual manual-status"></button>
+        <button type="button" class="manual manual-judge"></button>
+        <button type="button" class="quick" aria-label=""></button>
+        <button type="button" class="expand" aria-label="" aria-expanded="false">⌃</button>
       </div>
     `;
     hudEls = {
@@ -1242,7 +1440,12 @@ const H2W_CONTENT_VERSION = "0.1.41";
       panel: shadow.querySelector(".panel"),
       conversation: shadow.querySelector(".conversation"),
       options: shadow.querySelector(".options"),
-      master: shadow.querySelector(".master"),
+      panelTitle: shadow.querySelector(".panel-title"),
+      eventTitle: shadow.querySelector(".event-title"),
+      tickLabel: shadow.querySelector(".tick-label"),
+      fallbackLabel: shadow.querySelector(".fallback-label"),
+      bindingsTitle: shadow.querySelector(".bindings-title"),
+      manualButtons: [...shadow.querySelectorAll(".manual")],
       tick: shadow.querySelector(".tick"),
       fallback: shadow.querySelector(".fallback"),
       workspaces: shadow.querySelector(".workspaces"),
@@ -1257,7 +1460,13 @@ const H2W_CONTENT_VERSION = "0.1.41";
       setHudExpanded(!hudExpanded);
     });
     hudEls.quick.addEventListener("click", () => { void setHudMasterEnabled(!(hudCache?.enabled !== false)); });
-    hudEls.master.addEventListener("click", () => { void setHudMasterEnabled(!(hudCache?.enabled !== false)); });
+    hudEls.manualButtons.forEach((button, index) => {
+      const actions = ["direct", "status", "judge"];
+      button.addEventListener("click", () => {
+        if (hudActionBusy || hudCache?.enabled !== false) return;
+        void manualContinueAction(actions[index]);
+      });
+    });
     hudEls.tick.addEventListener("change", () => { void saveHudTiming(); });
     hudEls.fallback.addEventListener("change", () => { void saveHudTiming(); });
     hudEls.options.addEventListener("click", () => { void sendBg({ type: "h2w_open_options" }); });
@@ -1304,16 +1513,22 @@ const H2W_CONTENT_VERSION = "0.1.41";
     const ui = ensurePageHud();
     liftComposer(32);
     if (view.hud) hudCache = view.hud;
+    if (view.continuity) hudCache = { ...(hudCache || {}), continuity: view.continuity };
     const hud = view.hud || hudCache || null;
+    hudLabels = hud?.labels || hudLabels;
     if (view.pending === true) hudPending = true;
     if (view.pending === false) hudPending = false;
 
     // The bar reports the bound Herdr workspace runtime state independently
     // from whether automatic wake/nudge is enabled. Recovery remains visible
     // in the tooltip through the separate recovery field below.
-    const state = hudBoundRuntimeState(hud);
+    const runtimeState = hudBoundRuntimeState(hud);
+    const continuity = hud?.continuity || null;
+    const state = continuity?.state && continuity.state !== "healthy"
+      ? continuity.state
+      : runtimeState;
     const lastEvent = hud?.last?.reason
-      ? `${hud.last.reason}${hud.last.at ? ` @ ${new Date(hud.last.at).toLocaleTimeString()}` : ""}`
+      ? `${hudText(`reason_${hud.last.reason}`, null, hud.last.reason)}${hud.last.at ? ` @ ${new Date(hud.last.at).toLocaleTimeString()}` : ""}`
       : null;
     const input = {
       workspace: hud?.workspace_label || hud?.workspace_id || null,
@@ -1324,18 +1539,41 @@ const H2W_CONTENT_VERSION = "0.1.41";
       lastEvent,
     };
     if (globalThis.H2W_HUD?.updateReadonlyHud) {
-      globalThis.H2W_HUD.updateReadonlyHud(ui.status, input);
+      globalThis.H2W_HUD.updateReadonlyHud(ui.status, { ...input, labels: hudLabels });
     } else {
-      ui.status.textContent = `Herdr ● ${state}`;
+      ui.status.textContent = `Herdr ● ${hudLabels?.states?.[state] || state}`;
     }
     const enabled = hud?.enabled !== false;
-    ui.workspace.textContent = hud?.workspace_label || (hud?.bound ? `${hud.binding_count || 1} bound` : "not bound");
-    ui.quick.textContent = enabled ? "Wake on" : "Wake off";
+    automationEnabled = enabled;
+    automationAutoAllow = hud?.autoAllow !== false;
+    syncAutomationPermissionWatch();
+    ui.workspace.textContent = hud?.workspace_label || (hud?.bound
+      ? hudText("bound_count", { count: hud.binding_count || 1 })
+      : (hudLabels?.states?.unbound || ""));
+    ui.panelTitle.textContent = hudText("controls");
+    ui.options.textContent = hudText("advanced_options");
+    ui.eventTitle.textContent = hudText("event_settings");
+    ui.tickLabel.textContent = hudText("interval");
+    ui.fallbackLabel.textContent = hudText("fallback");
+    ui.bindingsTitle.textContent = hudText("bindings");
+    const manualLabels = [
+      [hudLabels.manual_continue, hudLabels.manual_continue_hint],
+      [hudLabels.manual_status, hudLabels.manual_status_hint],
+      [hudLabels.manual_judge, hudLabels.manual_judge_hint],
+    ];
+    for (let i = 0; i < (ui.manualButtons || []).length; i += 1) {
+      const [text, title] = manualLabels[i] || [];
+      ui.manualButtons[i].textContent = text || "";
+      ui.manualButtons[i].title = title || "";
+    }
+    syncHudManualButtons();
+    ui.quick.textContent = enabled ? hudText("automation_on", null, "Auto on") : hudText("automation_off", null, "Auto off");
     ui.quick.className = `quick ${enabled ? "on" : "off"}`;
     ui.quick.setAttribute("aria-pressed", String(enabled));
-    ui.master.textContent = enabled ? "On" : "Off";
-    ui.master.className = `master ${enabled ? "on" : "off"}`;
-    ui.master.setAttribute("aria-pressed", String(enabled));
+    ui.quick.setAttribute("aria-label", hudText("aria_toggle_automation"));
+    ui.quick.title = hudText("automation_hint");
+    ui.expand.setAttribute("aria-label", hudText("aria_open_controls"));
+    ui.expand.title = hudText("aria_open_controls");
     ui.conversation.textContent = ADAPTER.getConversationKey();
     if (document.activeElement !== ui.tick && shadowActiveElement(ui.host) !== ui.tick) {
       ui.tick.value = String(hud?.progressTickSec ?? 60);
