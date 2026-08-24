@@ -1,54 +1,92 @@
 // Recovery policy coordinator.
 // Decides when to request recovery actions; it does not submit messages or reload tabs.
 
-import { CONVERSATION_STATES, markReplySuspect } from "./conversation-health.js";
+const HEALTH = globalThis.H2W_CONVERSATION_HEALTH || {};
+const RECOVERY_STATES = HEALTH.CONVERSATION_STATES || {};
+const recoveryMarkReplySuspect = HEALTH.markReplySuspect || ((record) => record);
 
-export const DEFAULT_RECOVERY_POLICY = Object.freeze({
+const DEFAULT_RECOVERY_POLICY = Object.freeze({
   replyTimeoutMs: 30000,
+  reloadCooldownMs: 60000,
   maxRecoveryAttempts: 1,
   maxReloadAttempts: 1,
 });
 
-export function shouldSendRecovery(record, policy = DEFAULT_RECOVERY_POLICY, now = Date.now()) {
-  if (!record || record.state !== CONVERSATION_STATES.REPLY_SUSPECT) return false;
-  if (record.recoveryAttempts >= policy.maxRecoveryAttempts) return false;
-  return Boolean(record.lastUserSubmitAt && now - record.lastUserSubmitAt >= policy.replyTimeoutMs);
+function shouldSendRecovery(record, policy = DEFAULT_RECOVERY_POLICY, now = Date.now()) {
+  if (!record || record.state !== RECOVERY_STATES.REPLY_SUSPECT) return false;
+  if ((record.recovery_attempt || 0) >= policy.maxRecoveryAttempts) return false;
+  return Boolean(record.last_user_submit_at && now - record.last_user_submit_at >= policy.replyTimeoutMs);
 }
 
-export function markRecoverySent(record, at = Date.now()) {
+function markRecoverySent(record, at = Date.now()) {
   return {
     ...record,
-    state: CONVERSATION_STATES.RECOVERY_MESSAGE_SENT,
-    recoveryAttempts: (record.recoveryAttempts || 0) + 1,
-    recoverySentAt: at,
+    state: RECOVERY_STATES.RECOVERY_MESSAGE_SENT,
+    recovery_attempt: (record.recovery_attempt || 0) + 1,
+    recovery_sent_at: at,
   };
 }
 
-export function markRecovering(record, at = Date.now()) {
+function markRecovering(record, at = Date.now()) {
   return {
     ...record,
-    state: CONVERSATION_STATES.RECOVERING,
-    recoveringAt: at,
+    state: RECOVERY_STATES.RECOVERING,
+    recovering_at: at,
   };
 }
 
-export function classifyReplyTimeout(record, now = Date.now(), timeoutMs = DEFAULT_RECOVERY_POLICY.replyTimeoutMs) {
-  if (!record?.lastUserSubmitAt) return record;
-  if (now - record.lastUserSubmitAt < timeoutMs) return record;
-  return markReplySuspect(record);
+function markReloaded(record, at = Date.now()) {
+  return {
+    ...record,
+    state: RECOVERY_STATES.RECOVERING,
+    reload_attempt: (record.reload_attempt || 0) + 1,
+    last_reload_at: at,
+  };
 }
 
-export function canReloadSafely({
+function recommendRollover(record, policy = DEFAULT_RECOVERY_POLICY) {
+  return Boolean(record
+    && (record.recovery_attempt || 0) >= policy.maxRecoveryAttempts
+    && (record.reload_attempt || 0) >= policy.maxReloadAttempts
+    && record.state !== RECOVERY_STATES.HEALTHY);
+}
+
+function classifyReplyTimeout(record, now = Date.now(), timeoutMs = DEFAULT_RECOVERY_POLICY.replyTimeoutMs) {
+  if (!record) return record;
+  let startedAt = null;
+  let reason = "reply_timeout";
+  if (record.state === RECOVERY_STATES.REPLY_WAITING) {
+    startedAt = record.last_user_submit_at;
+  } else if (record.state === RECOVERY_STATES.RECOVERY_MESSAGE_SENT) {
+    startedAt = record.recovery_sent_at;
+    reason = "recovery_timeout";
+  } else {
+    return record;
+  }
+  if (!startedAt || now - startedAt < timeoutMs) return record;
+  return recoveryMarkReplySuspect(record, reason);
+}
+
+function canReloadSafely({
   composerBusy = false,
+  composerHasHumanText = false,
   streaming = false,
   toolRunning = false,
+  permissionCardActive = false,
   deliveryUnknown = false,
+  mutationDeliveryUncertain = false,
   reloadAttempts = 0,
+  lastReloadAt = null,
+  now = Date.now(),
 }, policy = DEFAULT_RECOVERY_POLICY) {
   return !composerBusy
+    && !composerHasHumanText
     && !streaming
     && !toolRunning
+    && !permissionCardActive
     && !deliveryUnknown
+    && !mutationDeliveryUncertain
+    && (!lastReloadAt || now - lastReloadAt >= policy.reloadCooldownMs)
     && reloadAttempts < policy.maxReloadAttempts;
 }
 
@@ -57,6 +95,8 @@ globalThis.H2W_RECOVERY_CONTROLLER = {
   shouldSendRecovery,
   markRecoverySent,
   markRecovering,
+  markReloaded,
+  recommendRollover,
   classifyReplyTimeout,
   canReloadSafely,
 };

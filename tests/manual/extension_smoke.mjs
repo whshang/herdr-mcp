@@ -66,15 +66,20 @@ ok(
   "in-page bind resolves the sender tab without popup-only tabId",
 );
 ok(
-  wakeSource.includes('select class="ws"') && wakeSource.includes("toggleHudWorkspaceBinding") && wakeSource.includes("paintWorkspaceControls"),
-  "in-page HUD renders and operates a workspace picker",
+  wakeSource.includes("Read-only in-page status bar")
+    && wakeSource.includes("H2W_HUD?.updateReadonlyHud")
+    && !wakeSource.includes('select class="ws"')
+    && !wakeSource.includes("toggleHudWorkspaceBinding")
+    && !wakeSource.includes("ws-action"),
+  "in-page HUD is read-only; workspace controls stay out of page content",
 );
 ok(
-  wakeSource.includes('class="handoff-action"')
+  !wakeSource.includes('class="handoff-action"')
+    && !wakeSource.includes("startHudHandoff")
     && wakeSource.includes("h2w_handoff_start")
     && wakeSource.includes("h2w_handoff_seed")
     && wakeSource.includes("h2w_handoff_probe"),
-  "in-page HUD exposes Project rollover and target confirmation",
+  "Project rollover remains recoverable without exposing an in-page handoff control",
 );
 ok(
   backgroundSource.includes("herdrConversationTransfers")

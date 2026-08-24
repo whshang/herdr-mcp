@@ -16,6 +16,12 @@ const H2W_CONTENT_VERSION = "0.1.39";
   const CONVERSATION_HEALTH = globalThis.H2W_CONVERSATION_HEALTH || null;
   const RECOVERY_CONTROLLER = globalThis.H2W_RECOVERY_CONTROLLER || null;
   let conversationHealth = null;
+  const HEALTH_STORAGE_KEY = "h2wConversationHealthByConv";
+  const RECOVERY_PROBE_TEMPLATE = [
+    "Herdr recovery check: the previous assistant turn did not visibly start.",
+    "Do not call tools, do not repeat or continue any external action, and do not mutate anything.",
+    "Only report whether the previous request appears to have completed in this conversation. If you cannot verify that, reply exactly: recovery needed.",
+  ].join("\n");
 
   function runtimeAlive() {
     try { return !!chrome.runtime?.id; } catch { return false; }
@@ -35,7 +41,43 @@ const H2W_CONTENT_VERSION = "0.1.39";
 
   function markConversationState(record) {
     conversationHealth = record;
+    if (record?.convKey) void persistConversationHealth(record);
     return record;
+  }
+
+  async function loadConversationHealth(convKey) {
+    if (!CONVERSATION_HEALTH || !convKey) return null;
+    try {
+      const stored = await chrome.storage.local.get([HEALTH_STORAGE_KEY]);
+      const map = stored?.[HEALTH_STORAGE_KEY] || {};
+      const existing = map?.[convKey];
+      if (existing && existing.convKey === convKey) return existing;
+    } catch (_) { /* fresh record below */ }
+    return CONVERSATION_HEALTH.createConversationHealth(convKey);
+  }
+
+  async function persistConversationHealth(record) {
+    if (!record?.convKey || !runtimeAlive()) return;
+    try {
+      const stored = await chrome.storage.local.get([HEALTH_STORAGE_KEY]);
+      const map = { ...(stored?.[HEALTH_STORAGE_KEY] || {}), [record.convKey]: record };
+      const entries = Object.entries(map);
+      if (entries.length > 20) {
+        entries.sort((a, b) => {
+          const at = a[1]?.last_turn_end_at || a[1]?.last_user_submit_at || a[1]?.last_reload_at || 0;
+          const bt = b[1]?.last_turn_end_at || b[1]?.last_user_submit_at || b[1]?.last_reload_at || 0;
+          return bt - at;
+        });
+        for (const [key] of entries.slice(20)) delete map[key];
+      }
+      await chrome.storage.local.set({ [HEALTH_STORAGE_KEY]: map });
+    } catch (_) { /* recovery state is best-effort persistence */ }
+  }
+
+  async function ensureConversationHealth(convKey = ADAPTER.getConversationKey()) {
+    if (!CONVERSATION_HEALTH || !convKey) return null;
+    if (conversationHealth?.convKey === convKey) return conversationHealth;
+    return markConversationState(await loadConversationHealth(convKey));
   }
 
   // ---- MAIN-world insertion for contenteditable sites ----
@@ -577,13 +619,14 @@ const H2W_CONTENT_VERSION = "0.1.39";
       }
       if (msg?.type === "h2w_wake") {
         (async () => {
-          if (!conversationHealth && CONVERSATION_HEALTH) {
-            markConversationState(CONVERSATION_HEALTH.createConversationHealth(ADAPTER.getConversationKey()));
-          }
+          await ensureConversationHealth();
           const result = await performWake(msg.data || {});
-          const confirm = result.ok ? await confirmReplyStarted() : { monitored: false };
           if (result.ok && CONVERSATION_HEALTH) {
             markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
+          }
+          const confirm = result.ok ? await confirmReplyStarted() : { monitored: false };
+          if (confirm?.replyStarted && CONVERSATION_HEALTH && conversationHealth) {
+            markConversationState(CONVERSATION_HEALTH.markReplyStarted(conversationHealth));
           }
           sendBg({ type: "h2w_wake_ack", convKey: ADAPTER.getConversationKey(), result, confirm });
           sendResponse(result);
@@ -610,6 +653,7 @@ const H2W_CONTENT_VERSION = "0.1.39";
     if (response !== null) {
       const changed = registeredConvKey !== null && registeredConvKey !== convKey;
       registeredConvKey = convKey;
+      await ensureConversationHealth(convKey);
       if (changed) {
         console.log(`[h2w] conversation route changed (${reason}): ${convKey}`);
         if (ADAPTER.name === "chatgpt") void refreshPageHud();
@@ -631,10 +675,130 @@ const H2W_CONTENT_VERSION = "0.1.39";
     } catch (_) { /* polling remains authoritative */ }
   }
 
+  function assistantSignature(text) {
+    const value = String(text || "");
+    let hash = 2166136261;
+    for (let i = 0; i < value.length; i += 1) {
+      hash ^= value.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `${value.length}:${hash >>> 0}`;
+  }
+
+  function recoverySafetySnapshot() {
+    const composerText = composerNorm();
+    let permissionCardActive = false;
+    try { permissionCardActive = Boolean(PERM?.findAllowAction?.(document)); } catch (_) {}
+    return {
+      composerBusy: wakeInFlight || Boolean(composerText),
+      composerHasHumanText: Boolean(composerText && !isExtensionStaleComposer(composerText)),
+      streaming: isComposerGenerating(),
+      toolRunning: assistantToolsInProgress(),
+      permissionCardActive,
+      deliveryUnknown: false,
+      mutationDeliveryUncertain: false,
+      reloadAttempts: Number(conversationHealth?.reload_attempt || 0),
+      lastReloadAt: conversationHealth?.last_reload_at || null,
+      now: Date.now(),
+    };
+  }
+
+  async function maybeSendRecoveryProbe() {
+    if (!conversationHealth || !RECOVERY_CONTROLLER) return false;
+    if (!RECOVERY_CONTROLLER.shouldSendRecovery(conversationHealth)) return false;
+    const safety = recoverySafetySnapshot();
+    if (safety.composerBusy || safety.streaming || safety.toolRunning || safety.permissionCardActive) return false;
+    const result = await performWake({ template: RECOVERY_PROBE_TEMPLATE, autoAllow: false, recovery: true });
+    if (!result?.ok) return false;
+    markConversationState(RECOVERY_CONTROLLER.markRecoverySent(conversationHealth));
+    paintPageHud({});
+    const confirm = await confirmReplyStarted(RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.replyTimeoutMs);
+    if (confirm?.replyStarted && CONVERSATION_HEALTH) {
+      markConversationState(CONVERSATION_HEALTH.markReplyStarted(conversationHealth));
+      paintPageHud({});
+    }
+    return true;
+  }
+
+  async function maybeReloadForRecovery() {
+    if (!conversationHealth || !RECOVERY_CONTROLLER || !CONVERSATION_HEALTH) return false;
+    if (conversationHealth.state !== CONVERSATION_HEALTH.CONVERSATION_STATES.REPLY_SUSPECT) return false;
+    if ((conversationHealth.recovery_attempt || 0) < RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.maxRecoveryAttempts) return false;
+    const safety = recoverySafetySnapshot();
+    if (!RECOVERY_CONTROLLER.canReloadSafely(safety)) return false;
+    const signature = assistantSignature(lastMessageByRole("assistant"));
+    markConversationState(CONVERSATION_HEALTH.markReloadPending(conversationHealth));
+    await wait(100);
+    const reloading = RECOVERY_CONTROLLER.markReloaded(conversationHealth);
+    markConversationState({ ...reloading, assistant_signature_before_reload: signature });
+    await wait(150);
+    location.reload();
+    return true;
+  }
+
+  async function maybeEscalateRecoveryRollover() {
+    if (!conversationHealth || !RECOVERY_CONTROLLER || !CONVERSATION_HEALTH) return false;
+    if (conversationHealth.state !== CONVERSATION_HEALTH.CONVERSATION_STATES.RECOVERING) return false;
+    if (Date.now() - Number(conversationHealth.last_reload_at || 0) < 10000) return false;
+
+    const assistantText = lastMessageByRole("assistant");
+    const currentSignature = assistantSignature(assistantText);
+    if (assistantText && looksLikeSubstantiveReply(assistantText)
+      && currentSignature !== conversationHealth.assistant_signature_before_reload) {
+      markConversationState(CONVERSATION_HEALTH.markTurnEnded(conversationHealth));
+      paintPageHud({});
+      return true;
+    }
+    if (!RECOVERY_CONTROLLER.recommendRollover(conversationHealth)) return false;
+
+    const safety = recoverySafetySnapshot();
+    if (safety.composerBusy || safety.streaming || safety.toolRunning || safety.permissionCardActive) return false;
+    const hud = await sendBg({ type: "h2w_page_hud", convKey: ADAPTER.getConversationKey() });
+    if (!hud?.ok || !hud?.can_handoff) {
+      markConversationState(CONVERSATION_HEALTH.markRolloverRecommended(conversationHealth));
+      paintPageHud({ hud: hud?.ok ? hud : null });
+      return false;
+    }
+
+    markConversationState(CONVERSATION_HEALTH.markRolloverRequired(conversationHealth));
+    paintPageHud({ hud });
+    const result = await sendBg({ type: "h2w_handoff_start" });
+    if (!result?.ok) {
+      markConversationState(CONVERSATION_HEALTH.markRolloverRecommended(conversationHealth));
+      paintPageHud({ hud });
+      return false;
+    }
+    return true;
+  }
+
+  async function reconcileConversationHealthAfterLoad() {
+    const record = await ensureConversationHealth();
+    if (!record || !RECOVERY_CONTROLLER) return;
+    const suspect = RECOVERY_CONTROLLER.classifyReplyTimeout(record);
+    if (suspect !== record) markConversationState(suspect);
+    await maybeEscalateRecoveryRollover();
+  }
+
+  function startConversationHealthWatch() {
+    let healthCheckInFlight = false;
+    setInterval(() => {
+      if (healthCheckInFlight || !conversationHealth || !RECOVERY_CONTROLLER) return;
+      healthCheckInFlight = true;
+      void (async () => {
+        const next = RECOVERY_CONTROLLER.classifyReplyTimeout(conversationHealth);
+        if (next !== conversationHealth) markConversationState(next);
+        if (await maybeSendRecoveryProbe()) return;
+        if (await maybeReloadForRecovery()) return;
+        await maybeEscalateRecoveryRollover();
+      })().finally(() => { healthCheckInFlight = false; });
+    }, 5000);
+  }
+
   (async () => {
     if (!runtimeAlive()) return;
     try { chrome.runtime.sendMessage({ type: "h2w_hello", version: H2W_CONTENT_VERSION }); } catch (e) {}
     await registerCurrentConversation("startup");
+    await reconcileConversationHealthAfterLoad();
     startConversationRouteWatch();
     // ChatGPT Connector permission cards can appear outside wake-up, so watch continuously.
     if (ADAPTER.name === "chatgpt" && PERM) startPermissionWatch(Number.POSITIVE_INFINITY);
@@ -642,6 +806,7 @@ const H2W_CONTENT_VERSION = "0.1.39";
     if (ADAPTER.name === "chatgpt") {
       startPageHud();
       startIdleNudgeWatch();
+      startConversationHealthWatch();
     }
   })();
 
@@ -738,61 +903,12 @@ const H2W_CONTENT_VERSION = "0.1.39";
     } catch (e) {}
   }
 
-  // ---- In-page status bar (ChatGPT): config + last LLM judge, always on ----
+  // ---- Read-only in-page status bar (ChatGPT) ----
+  // Operational controls live in the popup. The page HUD only reports state.
   const HUD_ID = "h2w-page-hud";
-  const HUD_LOCALES = ["en", "zh", "ja"];
   let hudPending = false;
   let hudCache = null;
   let hudEls = null;
-  let hudCat = {};
-  let hudLocale = "en";
-
-  function hudT(key, vars) {
-    let s = hudCat[key];
-    if (s == null) s = key;
-    if (vars && typeof s === "string") {
-      for (const [k, v] of Object.entries(vars)) s = s.replaceAll(`{${k}}`, String(v));
-    }
-    return s;
-  }
-
-  function hudReasonLabel(reason) {
-    const raw = String(reason || "").trim();
-    if (!raw) return "?";
-    const key = `hud_reason_${raw.replace(/[^a-z0-9_]/gi, "_")}`;
-    const mapped = hudCat[key];
-    return mapped != null ? mapped : raw;
-  }
-
-  async function loadHudLocale() {
-    let code = "en";
-    try {
-      const stored = await chrome.storage.local.get(["uiLocale", "uiLocaleInitialized"]);
-      if (stored.uiLocale && HUD_LOCALES.includes(stored.uiLocale)) code = stored.uiLocale;
-      else if (!stored.uiLocaleInitialized) {
-        const raw = (chrome.i18n?.getUILanguage?.() || navigator.language || "en").toLowerCase();
-        if (raw.startsWith("zh")) code = "zh";
-        else if (raw.startsWith("ja")) code = "ja";
-      }
-    } catch (_) { /* keep en */ }
-    try {
-      const resp = await fetch(chrome.runtime.getURL(`locales/${code}.json`));
-      hudCat = await resp.json();
-      hudLocale = code;
-    } catch (_) {
-      try {
-        const resp = await fetch(chrome.runtime.getURL("locales/en.json"));
-        hudCat = await resp.json();
-        hudLocale = "en";
-      } catch (e2) { hudCat = {}; }
-    }
-  }
-
-  function clipHud(s, n = 48) {
-    const t = String(s || "").replace(/\s+/g, " ").trim();
-    if (t.length <= n) return t;
-    return `${t.slice(0, n)}…`;
-  }
 
   function ensurePageHud() {
     if (hudEls?.host?.isConnected) return hudEls;
@@ -808,187 +924,26 @@ const H2W_CONTENT_VERSION = "0.1.39";
         :host { all: initial; }
         .bar {
           position: fixed; left: 0; right: 0; bottom: 0; z-index: 2147483646;
-          display: flex; align-items: center; gap: 12px;
-          min-height: 32px; padding: 4px 12px;
-          box-sizing: border-box;
+          min-height: 28px; padding: 4px 12px; box-sizing: border-box;
+          display: flex; align-items: center;
           font: 12px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif;
-          color: #171717; background: #ffffff;
+          color: #4d4d4d; background: #ffffff;
           border-top: 1px solid #eaeaea;
+          pointer-events: none; user-select: none;
         }
-        .cfg { color: #4d4d4d; flex: 1 1 38%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .ws-controls { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; min-width: 0; }
-        .ws { max-width: 240px; height: 24px; padding: 0 5px; border: 1px solid #d4d4d4; border-radius: 5px; background: #fff; color: #171717; font: inherit; }
-        .ws-action { height: 24px; padding: 0 8px; border: 1px solid #d4d4d4; border-radius: 5px; background: #f7f7f7; color: #171717; font: inherit; cursor: pointer; }
-        .handoff-action { height: 24px; padding: 0 8px; border: 1px solid #d4d4d4; border-radius: 5px; background: #f7f7f7; color: #171717; font: inherit; cursor: pointer; white-space: nowrap; }
-        .ws-action:hover:not(:disabled), .handoff-action:hover:not(:disabled) { background: #ededed; }
-        .ws-action:disabled, .handoff-action:disabled, .ws:disabled { opacity: .55; cursor: default; }
-        .last { color: #171717; flex: 1 1 38%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
-        .bar.pending .last { color: #aa4d00; }
-        .bar.ok .last { color: #107d32; }
-        .bar.err .last { color: #d8001b; }
-        .bar.off .cfg { color: #8f8f8f; }
+        .status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .bar.waiting .status { color: #8a4b00; }
+        .bar.recovering .status { color: #9a3412; }
+        .bar.failed .status { color: #b42318; }
       </style>
-      <div class="bar" part="bar">
-        <div class="cfg"></div>
-        <div class="ws-controls">
-          <select class="ws" aria-label="workspace"></select>
-          <button class="ws-action" type="button"></button>
-          <button class="handoff-action" type="button"></button>
-        </div>
-        <div class="last"></div>
-      </div>
+      <div class="bar" part="bar"><span class="status"></span></div>
     `;
     hudEls = {
       host,
       bar: shadow.querySelector(".bar"),
-      cfg: shadow.querySelector(".cfg"),
-      ws: shadow.querySelector(".ws"),
-      wsAction: shadow.querySelector(".ws-action"),
-      handoffAction: shadow.querySelector(".handoff-action"),
-      last: shadow.querySelector(".last"),
+      status: shadow.querySelector(".status"),
     };
-    hudEls.ws.addEventListener("change", () => paintWorkspaceControls(hudCache));
-    hudEls.wsAction.addEventListener("click", () => { void toggleHudWorkspaceBinding(); });
-    hudEls.handoffAction.addEventListener("click", () => { void startHudHandoff(); });
     return hudEls;
-  }
-
-  function hudWorkspaceTitle(w) {
-    const id = String(w?.id || "").trim();
-    const label = String(w?.label || "").trim();
-    if (label && id) return `${label} (${id})`;
-    if (label) return label;
-    const roots = Array.isArray(w?.roots) ? w.roots : [];
-    const root = roots[0] ? String(roots[0]).replace(/\/+$/, "").split("/").pop() : "";
-    return root && id ? `${root} (${id})` : (id || root || "?");
-  }
-
-  function hudWorkspaceError(error) {
-    const raw = String(error || "").trim();
-    if (!raw) return "";
-    if (raw.startsWith("loopback_permission_")) return hudT("loopback_permission_short");
-    if (raw === "fetch_timeout") return hudT("loopback_timeout_short");
-    return raw;
-  }
-
-  function paintWorkspaceControls(hud) {
-    const ui = ensurePageHud();
-    const select = ui.ws;
-    const action = ui.wsAction;
-    if (!select || !action) return;
-    const workspaces = Array.isArray(hud?.workspaces) ? hud.workspaces.filter((w) => w?.id) : [];
-    const bound = new Set(Array.isArray(hud?.bound_workspace_ids) ? hud.bound_workspace_ids : []);
-    const prior = select.value;
-    const preferred = prior && workspaces.some((w) => w.id === prior)
-      ? prior
-      : (workspaces.find((w) => bound.has(w.id))?.id || workspaces[0]?.id || "");
-
-    select.textContent = "";
-    if (!workspaces.length) {
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = hud?.workspace_error
-        ? `${hudT("no_workspaces")} · ${clipHud(hudWorkspaceError(hud.workspace_error), 40)}`
-        : hudT("no_workspaces");
-      select.appendChild(opt);
-      select.disabled = true;
-      action.disabled = true;
-      action.textContent = hudT("bind_action");
-      return;
-    }
-
-    for (const w of workspaces) {
-      const opt = document.createElement("option");
-      opt.value = w.id;
-      opt.textContent = `${hudWorkspaceTitle(w)}${bound.has(w.id) ? ` · ${hudT("bound")}` : ""}`;
-      select.appendChild(opt);
-    }
-    select.disabled = false;
-    select.value = preferred;
-    action.disabled = !select.value;
-    action.textContent = bound.has(select.value) ? hudT("unbind") : hudT("bind_action");
-    paintHandoffControl(hud);
-  }
-
-  function paintHandoffControl(hud) {
-    const ui = ensurePageHud();
-    const action = ui.handoffAction;
-    if (!action) return;
-    const state = String(hud?.handoff?.status || "");
-    let label = hudT("handoff_action");
-    let disabled = !hud?.can_handoff;
-    if (hud?.handoff?.can_resume === true) {
-      label = hudT("handoff_resume");
-      disabled = false;
-    } else if (["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(state)) {
-      label = state === "summary_requested" ? hudT("handoff_compressing") : hudT("handoff_moving");
-      disabled = true;
-    } else if (state === "failed" && hud?.bound) {
-      label = hudT("handoff_retry");
-      disabled = false;
-    } else if (state === "committed" && !hud?.bound) {
-      label = hudT("handoff_done");
-      disabled = true;
-    }
-    action.textContent = label;
-    action.disabled = disabled;
-    action.title = hud?.handoff?.error
-      ? `${hudT("handoff_error")}: ${hud.handoff.error}`
-      : (!hud?.can_handoff && !state ? hudT("handoff_project_only") : "");
-  }
-
-  async function startHudHandoff() {
-    const ui = ensurePageHud();
-    if (!runtimeAlive() || ui.handoffAction?.disabled) return;
-    ui.handoffAction.disabled = true;
-    ui.handoffAction.textContent = hudT("handoff_starting");
-    const result = await sendBg({ type: "h2w_handoff_start" });
-    if (!result?.ok) {
-      const hud = hudCache || {};
-      paintPageHud({
-        hud: {
-          ...hud,
-          handoff: {
-            ...(hud.handoff || {}),
-            status: "failed",
-            error: result?.error || "handoff_start_failed",
-          },
-          can_handoff: true,
-        },
-      });
-      return;
-    }
-    await refreshPageHud();
-  }
-
-  async function toggleHudWorkspaceBinding() {
-    const ui = ensurePageHud();
-    const wsId = String(ui.ws?.value || "").trim();
-    if (!wsId || !runtimeAlive()) return;
-    const hud = hudCache || {};
-    const workspaces = Array.isArray(hud.workspaces) ? hud.workspaces : [];
-    const meta = workspaces.find((w) => w?.id === wsId) || { id: wsId };
-    const bound = new Set(Array.isArray(hud.bound_workspace_ids) ? hud.bound_workspace_ids : []);
-    ui.ws.disabled = true;
-    ui.wsAction.disabled = true;
-    let result = null;
-    if (bound.has(wsId)) {
-      result = await sendBg({ type: "h2w_unbind", convKey: ADAPTER.getConversationKey(), workspace_id: wsId });
-    } else {
-      result = await sendBg({
-        type: "h2w_bind",
-        workspace_id: wsId,
-        workspace_label: hudWorkspaceTitle(meta),
-        workspace_label_raw: meta?.label || null,
-        roots: Array.isArray(meta?.roots) ? meta.roots : [],
-      });
-    }
-    if (!result?.ok && result?.error !== "already-bound") {
-      paintPageHud({
-        hud: { ...hud, last: { at: Date.now(), reason: "workspace_action_failed", error: result?.error || "binding failed" } },
-      });
-    }
-    await refreshPageHud();
   }
 
   function liftComposer(px) {
@@ -1000,56 +955,53 @@ const H2W_CONTENT_VERSION = "0.1.39";
     try { document.documentElement.style.paddingBottom = `${px}px`; } catch (_) { /* ignore */ }
   }
 
-  function paintPageHud(view) {
+  function recoveryLabel(hud) {
+    const healthState = String(conversationHealth?.state || "");
+    if (["reply_suspect", "recovery_message_sent", "reload_pending", "recovering", "rollover_recommended", "rollover_required"].includes(healthState)) {
+      return healthState;
+    }
+    return String(hud?.handoff?.status || "none");
+  }
+
+  function hudVisualClass(state) {
+    if (state === "reply_waiting") return "waiting";
+    if (["reply_suspect", "recovery_message_sent", "reload_pending", "recovering", "rollover_recommended", "rollover_required"].includes(state)) {
+      return "recovering";
+    }
+    if (state === "failed") return "failed";
+    return "";
+  }
+
+  function paintPageHud(view = {}) {
     const ui = ensurePageHud();
-    liftComposer(36);
+    liftComposer(32);
     if (view.hud) hudCache = view.hud;
-    const hud = view.hud || hudCache;
+    const hud = view.hud || hudCache || null;
     if (view.pending === true) hudPending = true;
     if (view.pending === false) hudPending = false;
-    const pending = hudPending;
 
-    const parts = [`v${(hud && hud.version) || H2W_CONTENT_VERSION}`];
-    if (hud) {
-      parts.push(hud.enabled === false ? hudT("hud_wake_off") : hudT("hud_wake_on"));
-      if (hud.bound) parts.push(hudT("hud_bound", { name: hud.workspace_label || hud.workspace_id || "?" }));
-      else parts.push(hudT("hud_unbound"));
-      if (hud.llmConfigured) {
-        const model = hud.llmModel || "on";
-        parts.push(hudT("hud_llm", { model: hud.llmHost ? `${model} @ ${hud.llmHost}` : model }));
-      } else {
-        parts.push(hudT("hud_llm_off"));
-      }
-      parts.push(hud.idleNudgeEnabled === false ? hudT("hud_nudge_off") : hudT("hud_nudge_on"));
-      parts.push(hudT("hud_cooldown", { sec: String(hud.progressTickSec || 0) }));
+    const state = String(
+      conversationHealth?.state
+      || (hudPending ? "reply_waiting" : (hud?.bound ? "healthy" : "unknown")),
+    );
+    const lastEvent = hud?.last?.reason
+      ? `${hud.last.reason}${hud.last.at ? ` @ ${new Date(hud.last.at).toLocaleTimeString()}` : ""}`
+      : null;
+    const input = {
+      workspace: hud?.workspace_label || hud?.workspace_id || null,
+      agent: hud?.focus_agent || hud?.agent || null,
+      conversation: ADAPTER.getConversationKey(),
+      state,
+      recovery: recoveryLabel(hud),
+      lastEvent,
+    };
+    if (globalThis.H2W_HUD?.updateReadonlyHud) {
+      globalThis.H2W_HUD.updateReadonlyHud(ui.status, input);
     } else {
-      parts.push(hudT("hud_loading"));
+      ui.status.textContent = `Herdr ● ${state}`;
     }
-    ui.cfg.textContent = parts.join(" · ");
-    ui.cfg.setAttribute("lang", hudLocale);
-    paintWorkspaceControls(hud);
-    paintHandoffControl(hud);
-
-    let lastText = hudT("hud_last_none");
-    let kind = hud && hud.bound && hud.llmConfigured ? "" : "off";
-    if (pending) {
-      lastText = hudT("hud_last_pending");
-      kind = "pending";
-    } else if (hud?.last) {
-      const ago = Math.max(0, Math.round((Date.now() - (hud.last.at || 0)) / 1000));
-      const bits = [hudT("hud_last", { reason: hudReasonLabel(hud.last.reason), ago: String(ago) })];
-      if (hud.last.raw) bits.push(hudT("hud_raw", { text: clipHud(hud.last.raw) }));
-      if (hud.last.send) bits.push(hudT("hud_send", { text: clipHud(hud.last.send) }));
-      if (hud.last.error) bits.push(clipHud(hud.last.error));
-      lastText = bits.join(" · ");
-      kind = hud.last.nudged ? "ok" : "";
-      if (hud.last.reason === "llm_done") kind = "";
-      else if (String(hud.last.reason || "").includes("timeout") || String(hud.last.reason || "").startsWith("llm_http") || hud.last.reason === "unbound") kind = "err";
-    }
-    ui.last.textContent = lastText;
-    ui.last.setAttribute("lang", hudLocale);
-    ui.bar.className = `bar${kind ? " " + kind : ""}`;
-    ui.bar.setAttribute("lang", hudLocale);
+    const visual = hudVisualClass(state);
+    ui.bar.className = `bar${visual ? ` ${visual}` : ""}`;
   }
 
   async function refreshPageHud() {
@@ -1059,20 +1011,9 @@ const H2W_CONTENT_VERSION = "0.1.39";
   }
 
   function startPageHud() {
-    void (async () => {
-      await loadHudLocale();
-      paintPageHud({ pending: false });
-      void refreshPageHud();
-    })();
+    paintPageHud({ pending: false });
+    void refreshPageHud();
     setInterval(() => { void refreshPageHud(); }, 5000);
-    try {
-      chrome.storage.onChanged.addListener((changes, area) => {
-        if (area !== "local" || !changes.uiLocale) return;
-        void (async () => {
-          await loadHudLocale();
-          paintPageHud({});
-        })();
-      });
-    } catch (_) { /* ignore */ }
   }
+
 })();
