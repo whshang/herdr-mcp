@@ -31,7 +31,13 @@ For an existing checkout, inspect `git status --short` first. A clean checkout m
 
 ## 3. Generate local identities without printing secrets
 
-Generate in Agent memory: `HERDR_MCP_TOKEN`, `LINK_SHARED_SECRET`, a hostname-derived `WORKSTATION_ID` limited to `[A-Za-z0-9_.-]` and 64 chars, and `WORKER_NAME=herdr-edge-<machine-slug>`. Use strong randomness such as `openssl rand -hex 32`; never include secrets in the final report.
+Generate in Agent memory: `HERDR_MCP_TOKEN`, `LINK_SHARED_SECRET`, and a hostname-derived `WORKSTATION_ID` limited to `[A-Za-z0-9_.-]` and 64 chars. Generate `WORKER_NAME` only through the repository helper; the Agent must not invent its own hostname slug:
+
+```bash
+WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
+```
+
+`WORKER_NAME` and `WORKSTATION_ID` intentionally use different grammars. The helper lowercases the hostname, safely handles every character outside `[a-z0-9-]` (including `.`, `_`, whitespace, and non-ASCII input), collapses/trims `-`, and keeps the complete Worker name at or below 63 characters. The result must match `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`; for example `MacBook.local` becomes `herdr-edge-macbook-local`. Use strong randomness such as `openssl rand -hex 32` for secrets; never include secrets in the final report.
 
 ## 4. Only human pause: Cloudflare API Token
 
@@ -61,7 +67,9 @@ export CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID"
 
 Do not write a personal `account_id` into tracked Wrangler config. Subsequent `wrangler deploy` and `wrangler secret put` inherit this temporary environment.
 
-With `ACCOUNT_ID`, fetch `GET /client/v4/accounts/<ACCOUNT_ID>/workers/subdomain`. Reuse an existing account subdomain and **never rename it**. If none exists, create one only because there is no old value; use `herdr-<short-account-id>` plus a random suffix on collision. API reference: <https://developers.cloudflare.com/api/resources/workers/subresources/subdomains/>.
+With `ACCOUNT_ID`, fetch `GET /client/v4/accounts/<ACCOUNT_ID>/workers/subdomain`. Reuse an existing account subdomain and **never rename it**. `ACCOUNT_SUBDOMAIN` is the selected Cloudflare Account's `workers.dev` subdomain returned by the Cloudflare API. It is not the workstation username, hostname, or the Cloudflare Account display name. The Worker origin always combines two independent values as `<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`.
+
+If no account subdomain exists, create one only because there is no old value; use `herdr-<short-account-id>` plus a random suffix on collision. API reference: <https://developers.cloudflare.com/api/resources/workers/subresources/subdomains/>.
 
 Only after GET explicitly confirms that no subdomain exists, create one with:
 
@@ -107,6 +115,15 @@ ln -sf "$PWD/bin/herdr-mcp" ~/.local/bin/herdr-mcp
 
 Verify `127.0.0.1:8772/mcp` and never print `HERDR_MCP_TOKEN` in the final report.
 
+Before asking the user to load the browser extension, install its Chrome Native Messaging host:
+
+```bash
+bin/herdr-extension-host install
+bin/herdr-extension-host status
+```
+
+The host manifest contains no long-lived secret. The installer derives Chromium's stable unpacked-extension id from the absolute `<repo>/extension` path and restricts the host to that exact `chrome-extension://<id>/` origin. This preserves the existing unpacked-extension identity when the same directory is reloaded. On macOS it registers the host for Chrome plus detected Chromium-family profiles including Chromium, Brave, Edge, and ego lite. The native host reads the existing LaunchAgent token locally and exchanges it at `POST /extension/session` for a short-lived bearer. The extension receives only that ephemeral bearer. Do not copy `HERDR_MCP_TOKEN` into extension storage during a normal install.
+
 ## 8. macOS persistent Herdr Link
 
 Store `LINK_SHARED_SECRET` in Keychain under `herdr-edge-link-<WORKSTATION_ID>`. The command text must reference the environment variable rather than a literal secret:
@@ -125,7 +142,7 @@ The script resolves Node from PATH; `HERDR_NODE_BIN` can override it.
 
 ## 9. Verify the closed loop
 
-Verify local `server/discover`, `herdr-mcp status`, `bin/herdr-link status`, Worker `/health`, final `/mcp`, OAuth discovery, and that no Custom Domain/DNS/Tunnel was created.
+Verify local `server/discover`, `herdr-mcp status`, `bin/herdr-extension-host status`, `bin/herdr-link status`, Worker `/health`, final `/mcp`, OAuth discovery, and that no Custom Domain/DNS/Tunnel was created.
 
 ## 10. Clean up the bootstrap Token
 
@@ -133,4 +150,8 @@ Unset `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, then delete temporary 
 
 ## 11. Final report
 
-Return only non-sensitive facts: local MCP status, Herdr Link status, Cloudflare Account name + shortened ID, Worker name, `workers.dev` origin, `/health`, and `/mcp`. Then guide the user to enable ChatGPT Developer mode, create a custom MCP Connector with `/mcp`, and complete OAuth. Never paste the local `HERDR_MCP_TOKEN` or Cloudflare Token into ChatGPT.
+Return only non-sensitive facts: the absolute repository directory, the absolute browser-extension directory (`<repo>/extension`), local MCP status, Herdr Link status, Cloudflare Account name + shortened ID, Worker name, `workers.dev` origin, `/health`, and `/mcp`.
+
+Then give the browser-extension install steps: open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the reported `extension` directory. The installed Native Messaging host gives the extension a short-lived loopback bearer automatically, so the user does not copy `HERDR_MCP_TOKEN` into Options. The **Legacy Bearer Token (optional)** field remains only for older runtimes or a missing native-host registration.
+
+Finally guide the user to enable ChatGPT Developer mode, create a custom MCP Connector with `/mcp`, and complete OAuth. Never paste the local `HERDR_MCP_TOKEN` or Cloudflare Token into ChatGPT.

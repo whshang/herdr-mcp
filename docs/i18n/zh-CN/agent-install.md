@@ -50,7 +50,13 @@ Agent 在内存中生成：
 - `HERDR_MCP_TOKEN`：本机 `127.0.0.1:8772` 的 bearer；
 - `LINK_SHARED_SECRET`：工作站到 Cloudflare Edge 的 WSS 共享 secret；
 - `WORKSTATION_ID`：从 hostname 派生、只含 `[A-Za-z0-9_.-]`、不超过 64 字符；
-- `WORKER_NAME`：默认 `herdr-edge-<machine-slug>`，避免覆盖账号中已有的通用 `herdr-edge` Worker。
+- `WORKER_NAME`：**只能**调用仓库内确定性 helper 生成，禁止 Agent 自己拼接 hostname：
+
+```bash
+WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
+```
+
+Worker name 与 `WORKSTATION_ID` 使用不同字符规则。helper 会把 hostname 转成小写，把所有非 `[a-z0-9-]` 字符（包括 `.`、`_`、空格和非 ASCII 字符）安全处理，合并连续 `-`，清理首尾 `-`，并保证完整 Worker name 不超过 63 字符。最终结果必须匹配 `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`，因此 `MacBook.local` 会得到 `herdr-edge-macbook-local`，绝不能把 `.local` 中的 `.` 带进 Worker name。
 
 推荐使用 `openssl rand -hex 32` 生成随机 secret；不要把这些值放进最终摘要。
 
@@ -103,7 +109,9 @@ export CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID"
 GET /client/v4/accounts/<ACCOUNT_ID>/workers/subdomain
 ```
 
-这个接口接受 `Workers Scripts Read/Write`。如果已经存在 `subdomain`，**必须复用，禁止改名**。如果账号从未设置 `workers.dev` 子域，Agent 可以创建一个新的账号子域；只允许在“不存在旧值”时创建，候选名使用 `herdr-<account-id-short>`，冲突时追加随机后缀。绝不能覆盖一个已存在的 account subdomain。
+这个接口接受 `Workers Scripts Read/Write`。如果已经存在 `subdomain`，**必须复用，禁止改名**。这里的 `ACCOUNT_SUBDOMAIN` 是所选 Cloudflare Account 的 `workers.dev` 账号子域，必须来自 Cloudflare API；它不是本机系统用户名、hostname，也不是 Cloudflare Account 的显示名称。Worker URL 固定由两个独立部分组成：`<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`。
+
+如果账号从未设置 `workers.dev` 子域，Agent 可以创建一个新的账号子域；只允许在“不存在旧值”时创建，候选名使用 `herdr-<account-id-short>`，冲突时追加随机后缀。绝不能覆盖一个已存在的 account subdomain。
 
 仅在 GET 明确确认“当前没有子域”后，才允许创建：
 
@@ -175,6 +183,15 @@ ln -sf "$PWD/bin/herdr-mcp" ~/.local/bin/herdr-mcp
 
 不要在最终回复打印 `HERDR_MCP_TOKEN`。
 
+在让用户加载浏览器插件前，安装 Chrome 原生消息主机：
+
+```bash
+bin/herdr-extension-host install
+bin/herdr-extension-host status
+```
+
+原生消息主机的 manifest 不保存长期 secret。installer 根据 `<repo>/extension` 的绝对路径计算 Chromium 对 unpacked 扩展使用的稳定 id，并把 host 限定到对应的 `chrome-extension://<id>/` origin；同一路径重新加载时可保持现有扩展身份和存储。macOS 会为 Chrome 以及已检测到的 Chromium 系浏览器配置 host，包括 Chromium、Brave、Edge 和 ego lite。host 在本机读取 LaunchAgent 已有的 `HERDR_MCP_TOKEN`，通过 `POST /extension/session` 换取短期 bearer，插件只拿到这个短期凭据。正常安装不要再把 `HERDR_MCP_TOKEN` 写进插件存储。
+
 ## 8. macOS：安装持久 Herdr Link
 
 把 `LINK_SHARED_SECRET` 存入 macOS Keychain，使用独立 service 名，例如 `herdr-edge-link-<WORKSTATION_ID>`。secret 必须通过环境变量传入，命令文本里只能出现变量名：
@@ -209,11 +226,12 @@ bin/herdr-link install
 
 1. 本机 MCP：`server/discover` 可通过 `127.0.0.1:8772/mcp` 返回；
 2. `herdr-mcp status` 显示进程和 Herdr socket 正常；
-3. `bin/herdr-link status` 正常/在线；
-4. `https://<WORKER>.<SUBDOMAIN>.workers.dev/health` 可访问，并能看到工作站 Link 已连接；
-5. `https://<WORKER>.<SUBDOMAIN>.workers.dev/mcp` 是最终 MCP URL；
-6. OAuth discovery 可访问；
-7. 不创建 Custom Domain、DNS 或 Tunnel。
+3. `bin/herdr-extension-host status` 显示 Native Messaging host 已注册；
+4. `bin/herdr-link status` 正常/在线；
+5. `https://<WORKER>.<SUBDOMAIN>.workers.dev/health` 可访问，并能看到工作站 Link 已连接；
+6. `https://<WORKER>.<SUBDOMAIN>.workers.dev/mcp` 是最终 MCP URL；
+7. OAuth discovery 可访问；
+8. 不创建 Custom Domain、DNS 或 Tunnel。
 
 ## 10. 清理 Cloudflare bootstrap Token
 
@@ -224,6 +242,8 @@ bin/herdr-link install
 只报告非敏感信息：
 
 ```text
+仓库目录: <absolute-repo-path>
+浏览器插件目录: <absolute-repo-path>/extension
 本地 MCP: healthy / error
 Herdr Link: connected / error
 Cloudflare Account: <name> (<id-short>)
@@ -233,4 +253,6 @@ Health: https://<worker>.<account-subdomain>.workers.dev/health
 MCP: https://<worker>.<account-subdomain>.workers.dev/mcp
 ```
 
-随后引导用户在 ChatGPT 网页开启 Developer mode，创建自定义 MCP Connector，填上面的 `/mcp` URL，并通过 OAuth 完成连接。**不要把本机 `HERDR_MCP_TOKEN` 或 Cloudflare Token 填进 ChatGPT。**
+随后必须给出浏览器插件安装步骤：打开 `chrome://extensions` → 开启“开发者模式” → “加载已解压的扩展程序” → 选择上面报告的 `extension` 绝对目录。已安装的 Native Messaging host 会自动给插件签发短期 loopback bearer，用户不需要手工复制 `HERDR_MCP_TOKEN`。Options 中的“兼容访问令牌（可选）”只保留给旧版 runtime 或 Native Messaging host 未注册的兼容场景。
+
+最后引导用户在 ChatGPT 网页开启 Developer mode，创建自定义 MCP Connector，填上面的 `/mcp` URL，并通过 OAuth 完成连接。**不要把本机 `HERDR_MCP_TOKEN` 或 Cloudflare Token 填进 ChatGPT。**

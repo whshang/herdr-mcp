@@ -44,6 +44,22 @@ test("Agent install guide makes the bootstrap Token ephemeral and DNS-free", () 
   assert.match(en, /No Zone\/DNS mutation is required/);
 });
 
+test("Agent install uses deterministic Cloudflare-safe Worker names and reports the extension directory", () => {
+  for (const rel of ["docs/i18n/en/agent-install.md", "docs/i18n/zh-CN/agent-install.md"]) {
+    const doc = read(rel);
+    assert.match(doc, /scripts\/cloudflare-worker-name\.mjs/);
+    assert.match(doc, /WORKER_NAME/);
+    assert.match(doc, /ACCOUNT_SUBDOMAIN/);
+    assert.match(doc, /Cloudflare API/);
+    assert.match(doc, /chrome:\/\/extensions/);
+    assert.match(doc, /extension/);
+    assert.match(doc, /herdr-extension-host install/);
+    assert.match(doc, /herdr-extension-host status/);
+    assert.match(doc, /Native Messaging/);
+    assert.match(doc, /HERDR_MCP_TOKEN/);
+  }
+});
+
 test("herdr-link resolves Node from PATH for fresh Apple Silicon installs", () => {
   const src = read("bin/herdr-link");
   assert.match(src, /HERDR_NODE_BIN/);
