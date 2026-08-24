@@ -13,6 +13,9 @@ const H2W_CONTENT_VERSION = "0.1.39";
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
   const SPEAKS = window.__H2W_SPEAKS_JSON__ || null;
+  const CONVERSATION_HEALTH = globalThis.H2W_CONVERSATION_HEALTH || null;
+  const RECOVERY_CONTROLLER = globalThis.H2W_RECOVERY_CONTROLLER || null;
+  let conversationHealth = null;
 
   function runtimeAlive() {
     try { return !!chrome.runtime?.id; } catch { return false; }
@@ -29,6 +32,11 @@ const H2W_CONTENT_VERSION = "0.1.39";
   }
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const normText = (s) => String(s || "").replace(/\s+/g, " ").trim();
+
+  function markConversationState(record) {
+    conversationHealth = record;
+    return record;
+  }
 
   // ---- MAIN-world insertion for contenteditable sites ----
   function insertMainWorld(text, selector) {
@@ -569,8 +577,14 @@ const H2W_CONTENT_VERSION = "0.1.39";
       }
       if (msg?.type === "h2w_wake") {
         (async () => {
+          if (!conversationHealth && CONVERSATION_HEALTH) {
+            markConversationState(CONVERSATION_HEALTH.createConversationHealth(ADAPTER.getConversationKey()));
+          }
           const result = await performWake(msg.data || {});
           const confirm = result.ok ? await confirmReplyStarted() : { monitored: false };
+          if (result.ok && CONVERSATION_HEALTH) {
+            markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
+          }
           sendBg({ type: "h2w_wake_ack", convKey: ADAPTER.getConversationKey(), result, confirm });
           sendResponse(result);
         })();

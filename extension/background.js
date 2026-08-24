@@ -1746,7 +1746,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_agents") {
     void (async () => {
-      sendResponse(await fetchState() || { error: "fetch-failed" });
+      // Popup workspace list must prefer a fresh state read. The push hello cache
+      // is an optimization for HUD rendering, not the authority for discovery.
+      sendResponse(await fetchStateFresh() || { error: "fetch-failed" });
     })();
     return true;
   }
