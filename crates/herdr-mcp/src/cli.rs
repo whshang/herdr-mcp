@@ -7,6 +7,7 @@ pub enum Command {
     Config(ConfigCommand),
     Dev { dry_run: bool },
     Candidate { port: u16 },
+    ExtensionHost { caller_origin: String },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,6 +34,7 @@ where
         "config" => parse_config(&args[1..]),
         "dev" => parse_dev(&args[1..]),
         "candidate" => parse_candidate(&args[1..]),
+        "extension-host" => parse_extension_host(&args[1..]),
         value => Err(format!("unknown command '{value}'\n\n{}", help())),
     }
 }
@@ -89,6 +91,19 @@ fn parse_candidate(args: &[String]) -> Result<Command, String> {
     Ok(Command::Candidate { port })
 }
 
+fn parse_extension_host(args: &[String]) -> Result<Command, String> {
+    match args {
+        [caller_origin] if caller_origin.starts_with("chrome-extension://") => {
+            Ok(Command::ExtensionHost {
+                caller_origin: caller_origin.clone(),
+            })
+        }
+        [] => Err("extension-host requires the Chromium caller origin".to_owned()),
+        [value] => Err(format!("invalid extension-host caller origin '{value}'")),
+        _ => Err("extension-host accepts exactly one Chromium caller origin".to_owned()),
+    }
+}
+
 pub fn help() -> &'static str {
     "Herdr MCP native runtime\n\n\
 Usage:\n\
@@ -97,7 +112,8 @@ Usage:\n\
   herdr-mcp doctor\n\
   herdr-mcp config [path|show|init]\n\
   herdr-mcp dev [--dry-run]\n\
-  herdr-mcp candidate [--port 8873]\n\n\
+  herdr-mcp candidate [--port 8873]\n\
+  herdr-mcp extension-host <chrome-extension://.../>\n\n\
 The Rust binary is the new local product boundary. Service, update, runtime,\n\
 link, and native-host commands are added as their native implementations land.\n"
 }
@@ -128,6 +144,16 @@ mod tests {
             parse(args(&["candidate", "--port", "9000"])).unwrap(),
             Command::Candidate { port: 9000 }
         );
+        assert_eq!(
+            parse(args(&[
+                "extension-host",
+                "chrome-extension://abcdefghijklmnop/"
+            ]))
+            .unwrap(),
+            Command::ExtensionHost {
+                caller_origin: "chrome-extension://abcdefghijklmnop/".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -135,6 +161,8 @@ mod tests {
         assert!(parse(args(&["dev", "--legacy"])).is_err());
         assert!(parse(args(&["config", "legacy"])).is_err());
         assert!(parse(args(&["candidate", "--port", "0"])).is_err());
+        assert!(parse(args(&["extension-host"])).is_err());
+        assert!(parse(args(&["extension-host", "https://example.com/"])).is_err());
         assert!(parse(args(&["status", "extra"])).is_err());
         assert!(parse(args(&["unknown"])).is_err());
     }

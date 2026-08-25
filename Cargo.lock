@@ -321,6 +321,8 @@ dependencies = [
  "base64",
  "futures-util",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "regex",
  "reqwest",
@@ -330,6 +332,7 @@ dependencies = [
  "time",
  "tokio",
  "tower",
+ "url",
 ]
 
 [[package]]
