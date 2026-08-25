@@ -103,6 +103,10 @@ test("Rust GitHub Release provenance is tag-only and fail-closed before publish"
   );
   assert.match(attest, /release-assets\/herdr-mcp-\*/);
   assert.match(attest, /release-assets\/release-manifest\.json/);
+  assert.match(release, /--repository-id \"\$GITHUB_REPOSITORY_ID\"/);
+  assert.match(release, /--source-commit \"\$GITHUB_SHA\"/);
+  assert.match(release, /--source-ref \"\$GITHUB_REF\"/);
+  assert.match(release, /--workflow-name \"\$GITHUB_WORKFLOW\"/);
   assert.match(publish, /needs: attest/, "GitHub Release publishing must fail closed when attestation fails");
   assert.match(publish, /if: startsWith\(github\.ref, 'refs\/tags\/v'\)/);
   assert.match(

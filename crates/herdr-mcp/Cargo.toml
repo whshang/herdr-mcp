@@ -18,15 +18,19 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 plist = "1"
 semver = "1"
 serde_json = "1.0"
 sha2 = "0.10"
+sigstore-trust-root = { version = "0.11.0", default-features = false }
+sigstore-types = "0.11.0"
+sigstore-verify = "0.11.0"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 url = "2"
+x509-cert = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

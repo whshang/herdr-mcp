@@ -115,7 +115,11 @@ jobs:
             --assets-dir "$PWD/release-assets" \
             --output "$PWD/release-assets/release-manifest.json" \
             --repo "$GITHUB_REPOSITORY" \
-            --tag "$TAG"
+            --tag "$TAG" \
+            --repository-id "$GITHUB_REPOSITORY_ID" \
+            --source-commit "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --workflow-name "$GITHUB_WORKFLOW"
       - uses: actions/upload-artifact@v4
         with:
           name: rust-release-bundle

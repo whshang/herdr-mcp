@@ -11,6 +11,7 @@ use crate::cli::ServiceCommand;
 use crate::cli::UpdateCommand;
 use crate::contract;
 use crate::paths::RuntimePaths;
+use crate::release_trust::{self, ReleaseIdentity};
 #[cfg(target_os = "macos")]
 use crate::service_manager;
 use crate::state_store::SCHEMA_VERSION;
@@ -18,7 +19,6 @@ use crate::updater_store::{UpdateJobRecord, UpdateStore};
 use reqwest::blocking::{Client, Response};
 use semver::Version;
 use serde_json::{Value, json};
-#[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
 use std::env;
 #[cfg(target_os = "macos")]
@@ -44,6 +44,7 @@ use std::os::unix::process::CommandExt;
 const DEFAULT_MANIFEST_URL: &str =
     "https://github.com/whshang/herdr-mcp/releases/latest/download/release-manifest.json";
 const MANIFEST_MAX_BYTES: usize = 1024 * 1024;
+const ATTESTATION_MAX_BYTES: usize = 2 * 1024 * 1024;
 const BINARY_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
@@ -61,6 +62,7 @@ struct ReleaseAsset {
 struct ReleasePlan {
     version: Version,
     tag: String,
+    identity: ReleaseIdentity,
     asset: ReleaseAsset,
 }
 
@@ -83,6 +85,9 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
         "available": plan.version > current,
         "release_version": plan.version.to_string(),
         "tag": plan.tag,
+        "source_commit": plan.identity.source_commit,
+        "repository": plan.identity.repository,
+        "provenance_verified": true,
         "target": plan.asset.target,
         "asset": plan.asset.name,
         "sha256": plan.asset.sha256,
@@ -268,14 +273,29 @@ fn fetch_release_plan(manifest_override: Option<&str>) -> Result<ReleasePlan, St
         .unwrap_or_else(|| DEFAULT_MANIFEST_URL.to_owned());
     let manifest_url = parse_update_url(&raw)?;
     let client = update_client()?;
-    let bytes = fetch_bounded(&client, manifest_url, MANIFEST_MAX_BYTES)?;
+    let bytes = fetch_bounded(
+        &client,
+        manifest_url,
+        MANIFEST_MAX_BYTES,
+        "release manifest",
+    )?;
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("release manifest is invalid JSON: {error}"))?;
-    parse_release_plan(&value, current_target()?)
+    let plan = parse_release_plan(&value, current_target()?)?;
+    let manifest_sha256 = sha256_bytes(&bytes);
+    verify_artifact_attestation(
+        &client,
+        "release-manifest.json",
+        &manifest_sha256,
+        &plan.identity,
+    )?;
+    Ok(plan)
 }
 
 fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String> {
-    if value.get("schema_version").and_then(Value::as_u64) != Some(1) {
+    if value.get("schema_version").and_then(Value::as_u64)
+        != Some(release_trust::MANIFEST_SCHEMA_VERSION)
+    {
         return Err("unsupported release manifest schema".to_owned());
     }
     if value.get("product").and_then(Value::as_str) != Some("herdr-mcp") {
@@ -298,6 +318,7 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
         .filter(|tag| *tag == format!("v{version}"))
         .ok_or_else(|| "release manifest tag/version mismatch".to_owned())?
         .to_owned();
+    let identity = release_trust::parse_manifest_identity(value, &tag)?;
 
     let expected = contract::identity()?;
     let contract = value
@@ -348,9 +369,18 @@ fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String
         .and_then(Value::as_str)
         .ok_or_else(|| "release asset URL is missing".to_owned())?;
     let url = parse_update_url(asset_url)?;
+    let expected_url = Url::parse(&format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        identity.repository, tag, name
+    ))
+    .map_err(|_| "cannot construct expected release asset URL".to_owned())?;
+    if url != expected_url {
+        return Err("release asset URL does not match trusted repository/tag/name".to_owned());
+    }
     Ok(ReleasePlan {
         version,
         tag,
+        identity,
         asset: ReleaseAsset {
             target: target.to_owned(),
             name,
@@ -417,6 +447,12 @@ fn stage_release(paths: &RuntimePaths, plan: &ReleasePlan) -> Result<(String, Pa
         "herdr-mcp-candidate"
     });
     let client = update_client()?;
+    verify_artifact_attestation(
+        &client,
+        &plan.asset.name,
+        &plan.asset.sha256,
+        &plan.identity,
+    )?;
     if let Err(error) = download_asset(&client, &plan.asset, &binary) {
         let _ = fs::remove_dir_all(&job_dir);
         return Err(error);
@@ -574,28 +610,66 @@ fn spawn_worker(
         .map_err(|error| format!("cannot spawn detached update worker: {error}"))
 }
 
-fn fetch_bounded(client: &Client, url: Url, max: usize) -> Result<Vec<u8>, String> {
+fn fetch_bounded(client: &Client, url: Url, max: usize, label: &str) -> Result<Vec<u8>, String> {
     let mut response = client
         .get(url)
         .send()
-        .map_err(|error| format!("release manifest download failed: {}", error_kind(&error)))?;
+        .map_err(|error| format!("{label} download failed: {}", error_kind(&error)))?;
     validate_response(&response)?;
     if response
         .content_length()
         .is_some_and(|length| length > max as u64)
     {
-        return Err("release manifest is too large".to_owned());
+        return Err(format!("{label} is too large"));
     }
     let mut bytes = Vec::new();
     response
         .by_ref()
         .take(max as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("cannot read release manifest: {error}"))?;
+        .map_err(|error| format!("cannot read {label}: {error}"))?;
     if bytes.len() > max {
-        return Err("release manifest is too large".to_owned());
+        return Err(format!("{label} is too large"));
     }
     Ok(bytes)
+}
+
+fn verify_artifact_attestation(
+    client: &Client,
+    artifact_name: &str,
+    sha256: &str,
+    identity: &ReleaseIdentity,
+) -> Result<(), String> {
+    let url = release_trust::attestation_api_url(sha256)?;
+    let mut response = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .map_err(|error| format!("GitHub attestation lookup failed: {}", error_kind(&error)))?;
+    validate_response(&response)?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > ATTESTATION_MAX_BYTES as u64)
+    {
+        return Err("GitHub attestation response is too large".to_owned());
+    }
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take(ATTESTATION_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read GitHub attestation response: {error}"))?;
+    if bytes.len() > ATTESTATION_MAX_BYTES {
+        return Err("GitHub attestation response is too large".to_owned());
+    }
+    release_trust::verify_github_attestations(&bytes, artifact_name, sha256, identity)
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
 }
 
 fn update_client() -> Result<Client, String> {
@@ -606,7 +680,7 @@ fn update_client() -> Result<Client, String> {
             if attempt.previous().len() >= MAX_REDIRECTS {
                 return attempt.error("too many update redirects");
             }
-            if update_url_allowed(attempt.url()) {
+            if update_redirect_allowed(attempt.url()) {
                 attempt.follow()
             } else {
                 attempt.stop()
@@ -647,8 +721,29 @@ fn update_url_allowed(url: &Url) -> bool {
     if url.scheme() != "http" {
         return false;
     }
+    loopback_host(url.host_str())
+}
+
+fn update_redirect_allowed(url: &Url) -> bool {
+    if !update_url_allowed(url) {
+        return false;
+    }
+    if loopback_host(url.host_str()) {
+        return true;
+    }
     matches!(
         url.host_str().map(|host| host.to_ascii_lowercase()),
+        Some(host)
+            if host == "github.com"
+                || host == "api.github.com"
+                || host == "objects.githubusercontent.com"
+                || host == "release-assets.githubusercontent.com"
+    )
+}
+
+fn loopback_host(host: Option<&str>) -> bool {
+    matches!(
+        host.map(str::to_ascii_lowercase),
         Some(host) if host == "localhost" || host == "127.0.0.1" || host == "::1"
     )
 }
@@ -672,8 +767,9 @@ fn current_version() -> Result<Version, String> {
 fn valid_asset_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 200
-        && !name.contains('/')
-        && !name.contains('\\')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
         && !name.contains("..")
 }
 
@@ -785,12 +881,32 @@ mod tests {
 
     fn manifest_for(target: &str, version: &str) -> Value {
         let identity = contract::identity().unwrap();
+        let name = format!("herdr-mcp-{version}-{target}");
+        let tag = format!("v{version}");
         json!({
-            "schema_version": 1,
+            "schema_version": release_trust::MANIFEST_SCHEMA_VERSION,
             "product": "herdr-mcp",
             "state_schema": SCHEMA_VERSION,
             "version": version,
-            "tag": format!("v{version}"),
+            "tag": tag,
+            "release_identity": {
+                "tag": tag,
+                "source_commit": "b".repeat(40),
+                "source_ref": format!("refs/tags/v{version}"),
+            },
+            "repository_identity": {
+                "repository": release_trust::RELEASE_REPOSITORY,
+                "repository_id": release_trust::RELEASE_REPOSITORY_ID,
+            },
+            "provenance": {
+                "predicate_type": release_trust::SLSA_PROVENANCE_V1,
+                "attestation": release_trust::GITHUB_ARTIFACT_ATTESTATION,
+                "bundle_media_type": release_trust::SIGSTORE_BUNDLE_V03,
+                "workflow": release_trust::RELEASE_WORKFLOW,
+                "workflow_name": release_trust::RELEASE_WORKFLOW_NAME,
+                "issuer": release_trust::RELEASE_ISSUER,
+                "runner_environment": release_trust::RELEASE_RUNNER_ENVIRONMENT,
+            },
             "contract": {
                 "epoch": identity.epoch,
                 "hash": identity.hash,
@@ -798,10 +914,10 @@ mod tests {
             },
             "assets": [{
                 "target": target,
-                "name": format!("herdr-mcp-{version}-{target}"),
+                "name": name,
                 "size": 1234,
                 "sha256": "a".repeat(64),
-                "url": "https://github.com/whshang/herdr-mcp/releases/download/v9.9.9/herdr-mcp"
+                "url": format!("https://github.com/whshang/herdr-mcp/releases/download/v{version}/herdr-mcp-{version}-{target}")
             }]
         })
     }
@@ -827,6 +943,20 @@ mod tests {
                 .unwrap_err()
                 .contains("rollback-compatible")
         );
+        let mut wrong_repo = manifest_for(target, "9.9.9");
+        wrong_repo["repository_identity"]["repository"] = json!("attacker/fork");
+        assert!(
+            parse_release_plan(&wrong_repo, target)
+                .unwrap_err()
+                .contains("repository")
+        );
+        let mut wrong_url = manifest_for(target, "9.9.9");
+        wrong_url["assets"][0]["url"] = json!("https://example.com/herdr-mcp");
+        assert!(
+            parse_release_plan(&wrong_url, target)
+                .unwrap_err()
+                .contains("trusted repository")
+        );
         assert!(parse_release_plan(&manifest_for(target, "9.9.9"), "other-target").is_err());
     }
 
@@ -838,6 +968,18 @@ mod tests {
         assert!(parse_update_url("http://example.com/manifest.json").is_err());
         assert!(parse_update_url("https://user:pass@example.com/manifest.json").is_err());
         assert!(parse_update_url("file:///tmp/manifest.json").is_err());
+        assert!(update_redirect_allowed(
+            &Url::parse("https://release-assets.githubusercontent.com/a/b").unwrap()
+        ));
+        assert!(update_redirect_allowed(
+            &Url::parse("https://objects.githubusercontent.com/a/b").unwrap()
+        ));
+        assert!(update_redirect_allowed(
+            &Url::parse("http://127.0.0.1:9000/artifact").unwrap()
+        ));
+        assert!(!update_redirect_allowed(
+            &Url::parse("https://example.com/artifact").unwrap()
+        ));
     }
 
     #[test]
