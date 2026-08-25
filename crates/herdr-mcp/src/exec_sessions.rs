@@ -14,7 +14,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 
@@ -777,7 +777,7 @@ fn recover_state_store(store: &StateStore) -> Result<RecoveryResult, String> {
                 }
             });
         }
-        result
+        Ok(result)
     }
     #[cfg(windows)]
     {
@@ -805,7 +805,7 @@ fn recover_state_store(store: &StateStore) -> Result<RecoveryResult, String> {
                 expires_at,
             )?;
         }
-        result
+        Ok(result)
     }
 }
 
@@ -937,31 +937,44 @@ mod tests {
     }
 
     #[test]
-    fn journal_keeps_only_process_fencing_identity() {
+    fn sqlite_keeps_only_process_fencing_identity() {
         let path = env::temp_dir().join(format!(
-            "herdr-mcp-exec-journal-{}-{}",
+            "herdr-mcp-exec-state-{}-{}",
             std::process::id(),
             NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
         ));
         let registry = ExecRegistry::new(path.clone()).unwrap();
         let started = registry.start(Path::new("/tmp"), "sleep 30").unwrap();
         let id = started["session_id"].as_str().unwrap();
-        let journal: Value =
-            serde_json::from_slice(&fs::read(path.join("exec-sessions-rust.json")).unwrap())
-                .unwrap();
-        let entry = &journal["sessions"][0];
-        assert_eq!(entry["id"], id);
-        assert!(entry.get("pid").is_some());
+        let store = StateStore::open_in_dir(&path, "state.db").unwrap();
+        assert_eq!(
+            store
+                .scalar_text("SELECT session_id FROM exec_sessions WHERE state = 'running'")
+                .unwrap()
+                .as_deref(),
+            Some(id)
+        );
+        let pid = store
+            .scalar_i64("SELECT pid FROM exec_sessions WHERE session_id = (SELECT session_id FROM exec_sessions WHERE state = 'running' LIMIT 1)")
+            .unwrap()
+            .unwrap() as u32;
         #[cfg(unix)]
         {
-            let pid = entry["pid"].as_u64().unwrap() as u32;
             assert!(process_has_marker(pid, id));
             assert_eq!(process_group_id(pid), Some(pid));
         }
-        assert!(entry.get("command").is_none());
-        assert!(entry.get("cwd").is_none());
-        assert!(entry.get("started_at_ms").is_none());
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM pragma_table_info('exec_sessions') \
+                     WHERE name IN ('command', 'cwd', 'stdout', 'stderr')",
+                )
+                .unwrap(),
+            Some(0)
+        );
         let _ = registry.kill(id);
+        drop(store);
+        drop(registry);
         let _ = fs::remove_dir_all(path);
     }
 
@@ -973,11 +986,11 @@ mod tests {
             NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
-        fs::write(
-            path.join("exec-sessions-rust.json"),
-            br#"{"sessions":[{"id":"es_previous","pid":4294967295}]}"#,
-        )
-        .unwrap();
+        let store = StateStore::open_in_dir(&path, "state.db").unwrap();
+        store
+            .record_exec_running("es_previous", u32::MAX, Some(u32::MAX), 1)
+            .unwrap();
+        drop(store);
         let registry = ExecRegistry::new(path.clone()).unwrap();
         let recovered = registry.read("es_previous", "both", 0, 64);
         assert_eq!(recovered["reason"], "session_recovered_after_restart");
@@ -989,6 +1002,7 @@ mod tests {
                 .iter()
                 .any(|view| view["session_id"] == "es_previous" && view["recovered"] == true)
         );
+        drop(registry);
         fs::remove_dir_all(path).unwrap();
     }
 }
