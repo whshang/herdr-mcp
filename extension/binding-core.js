@@ -392,10 +392,16 @@ export function assistantNudgeFingerprint(text) {
 }
 
 /** Default judge prompt (shown pre-filled in Options). Placeholder: {content} */
-export const DEFAULT_LLM_JUDGE_PROMPT =
+export const LEGACY_DEFAULT_LLM_JUDGE_PROMPT =
   "判断下面这段对话里助手是否已经做完用户要求的全部任务。"
   + "若已全部做完，只回复：好的"
   + "若还有下一步/未完成/待验证，只回复：继续，按你的建议推进"
+  + "不要解释、不要加其它字。对话：\n{content}";
+
+export const DEFAULT_LLM_JUDGE_PROMPT =
+  "判断下面这段对话里助手是否已经做完用户要求的全部任务。"
+  + "若已全部做完，只回复：好的。"
+  + "若还有下一步/未完成/待验证，只回复：继续，按你的建议推进。"
   + "不要解释、不要加其它字。对话：\n{content}";
 
 /** Default no-send keywords (shown pre-filled in Options, one per line). */
@@ -486,6 +492,22 @@ export function buildLlmJudgeUserMessage(template, parts) {
     .replaceAll("{content}", content)
     .replaceAll("{user}", user)
     .replaceAll("{assistant}", assistant);
+}
+
+/**
+ * Strong self-declared pending-work signals in the assistant's own tail.
+ * Keep this deliberately narrower than generic "next steps" wording so a
+ * completed answer that merely offers optional suggestions is not auto-woken.
+ */
+export function assistantDeclaresPendingWork(text) {
+  const tail = String(text || "").trim().slice(-2400);
+  if (!tail) return false;
+  return /(?:^|\n)\s*(?:下一步|接下来)\s*[:：]?\s*(?:\n\s*)?(?:我会|我将|继续|先(?:查|检查|读取|确认|修复|处理|等待)|需要(?:查|检查|读取|确认|修复|处理|等待))/mu.test(tail)
+    || /(?:^|[。！？\n])\s*我(?:会|将)(?:继续|接着|再)(?:做|查|读取|检查|确认|修复|推进|处理|等待)?/u.test(tail)
+    || /(?:^|[。！？\n])\s*(?:仍需|还需要|尚需|尚未完成|仍未完成|待(?:验证|确认|检查|处理|完成))(?:[：:，,。.!！\s]|$)/u.test(tail)
+    || /(?:^|\n)\s*(?:next|remaining work)\s*[:\-]?\s*(?:i will|i'll|continue|need to)/im.test(tail)
+    || /\bI\s+(?:will|need to)\s+continue\b/i.test(tail)
+    || /\b(?:still need to|not yet complete|pending (?:verification|validation|work|check))\b/i.test(tail);
 }
 
 /**

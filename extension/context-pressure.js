@@ -7,21 +7,32 @@
 (function initContextPressure(global) {
   "use strict";
 
-  const CONTEXT_PRESSURE_VERSION = 1;
+  const CONTEXT_PRESSURE_VERSION = 2;
   const EFFECTIVE_CONTEXT_TOKENS = 128000;
-  const USABLE_TEXT_BUDGET_TOKENS = 120000;
+  // Browser-visible user/assistant text is only part of ChatGPT's effective
+  // context. Project instructions, system messages and MCP/tool payloads are
+  // not reliably visible to the extension, so keep a deliberate reserve.
+  const USABLE_TEXT_BUDGET_TOKENS = 96000;
   const MAX_TRACKED_TURNS = 3000;
 
   const DEFAULT_CONTEXT_POLICY = Object.freeze({
     effectiveContextTokens: EFFECTIVE_CONTEXT_TOKENS,
     usableTextBudgetTokens: USABLE_TEXT_BUDGET_TOKENS,
-    warningTokens: 72000,
-    prepareTokens: 84000,
-    recommendTokens: 90000,
-    autoRolloverTokens: 96000,
-    highRiskTokens: 108000,
-    messageWarningCount: 150,
-    turnWarningCount: 100,
+    warningTokens: 56000,
+    prepareTokens: 64000,
+    recommendTokens: 72000,
+    autoRolloverTokens: 80000,
+    highRiskTokens: 92000,
+    messageWarningCount: 32,
+    messagePrepareCount: 40,
+    messageRecommendCount: 46,
+    messageAutoRolloverCount: 50,
+    messageHighRiskCount: 60,
+    turnWarningCount: 20,
+    turnPrepareCount: 24,
+    turnRecommendCount: 27,
+    turnAutoRolloverCount: 30,
+    turnHighRiskCount: 36,
     ageWarningMs: 12 * 60 * 60 * 1000,
     autoRetryCooldownMs: 60000,
   });
@@ -34,6 +45,19 @@
     ROLLOVER_REQUIRED: "rollover_required",
     HIGH_RISK: "high_risk",
   });
+
+  const STATE_RANK = Object.freeze({
+    [CONTINUITY_STATES.HEALTHY]: 0,
+    [CONTINUITY_STATES.CONTEXT_WARNING]: 1,
+    [CONTINUITY_STATES.HANDOFF_PREPARE]: 2,
+    [CONTINUITY_STATES.ROLLOVER_RECOMMENDED]: 3,
+    [CONTINUITY_STATES.ROLLOVER_REQUIRED]: 4,
+    [CONTINUITY_STATES.HIGH_RISK]: 5,
+  });
+
+  function maxState(left, right) {
+    return (STATE_RANK[right] || 0) > (STATE_RANK[left] || 0) ? right : left;
+  }
 
   function positiveInt(value) {
     const n = Number(value);
@@ -107,9 +131,34 @@
     if (turnCount >= policy.turnWarningCount) reasons.push(`turn_count:${turnCount}`);
     if (firstObservedAt && now - firstObservedAt >= policy.ageWarningMs) reasons.push(`conversation_age_ms:${now - firstObservedAt}`);
 
-    // Non-token signals can raise a healthy conversation to warning, but only
-    // the observed text estimate can recommend or automatically start rollover.
+    // ChatGPT virtualizes old DOM nodes and hides system/tool payloads, so
+    // message/turn counts are first-class pressure signals rather than warning
+    // decoration. The virtual list's absolute conversation-turn index gives us
+    // a monotonic message-count floor even when only a handful of nodes remain
+    // mounted in the page.
+    if (messageCount >= policy.messageHighRiskCount) state = maxState(state, CONTINUITY_STATES.HIGH_RISK);
+    else if (messageCount >= policy.messageAutoRolloverCount) state = maxState(state, CONTINUITY_STATES.ROLLOVER_REQUIRED);
+    else if (messageCount >= policy.messageRecommendCount) state = maxState(state, CONTINUITY_STATES.ROLLOVER_RECOMMENDED);
+    else if (messageCount >= policy.messagePrepareCount) state = maxState(state, CONTINUITY_STATES.HANDOFF_PREPARE);
+    else if (messageCount >= policy.messageWarningCount) state = maxState(state, CONTINUITY_STATES.CONTEXT_WARNING);
+
+    if (turnCount >= policy.turnHighRiskCount) state = maxState(state, CONTINUITY_STATES.HIGH_RISK);
+    else if (turnCount >= policy.turnAutoRolloverCount) state = maxState(state, CONTINUITY_STATES.ROLLOVER_REQUIRED);
+    else if (turnCount >= policy.turnRecommendCount) state = maxState(state, CONTINUITY_STATES.ROLLOVER_RECOMMENDED);
+    else if (turnCount >= policy.turnPrepareCount) state = maxState(state, CONTINUITY_STATES.HANDOFF_PREPARE);
+    else if (turnCount >= policy.turnWarningCount) state = maxState(state, CONTINUITY_STATES.CONTEXT_WARNING);
+
     if (state === CONTINUITY_STATES.HEALTHY && reasons.length) state = CONTINUITY_STATES.CONTEXT_WARNING;
+
+    const recommendation = [CONTINUITY_STATES.ROLLOVER_REQUIRED, CONTINUITY_STATES.HIGH_RISK].includes(state)
+      ? "auto_rollover"
+      : state === CONTINUITY_STATES.ROLLOVER_RECOMMENDED
+        ? "rollover_now"
+        : state === CONTINUITY_STATES.HANDOFF_PREPARE
+          ? "prepare_handoff"
+          : state === CONTINUITY_STATES.CONTEXT_WARNING
+            ? "conversation_long"
+            : "none";
 
     return {
       version: CONTEXT_PRESSURE_VERSION,
@@ -121,15 +170,7 @@
       message_count: messageCount,
       turn_count: turnCount,
       reasons,
-      recommendation: estimatedTextTokens >= policy.autoRolloverTokens
-        ? "auto_rollover"
-        : estimatedTextTokens >= policy.recommendTokens
-          ? "rollover_now"
-          : estimatedTextTokens >= policy.prepareTokens
-            ? "prepare_handoff"
-            : estimatedTextTokens >= policy.warningTokens || reasons.length
-              ? "conversation_long"
-              : "none",
+      recommendation,
     };
   }
 
@@ -140,6 +181,8 @@
       first_observed_at: now,
       updated_at: now,
       turns: {},
+      message_count_floor: 0,
+      message_floor_source: null,
       last_auto_attempt_at: null,
       auto_transfer_id: null,
       last_rollover_at: null,
@@ -166,6 +209,7 @@
     const base = record && typeof record === "object"
       ? { ...record, turns: { ...(record.turns || {}) } }
       : emptyContextRecord("", now);
+    base.version = CONTEXT_PRESSURE_VERSION;
     if (!positiveInt(base.first_observed_at)) base.first_observed_at = now;
 
     let changed = false;
@@ -191,10 +235,25 @@
     return base;
   }
 
+  function mergeMessageCountFloor(record, floor, source = "virtual_turn_index", now = Date.now()) {
+    const base = record && typeof record === "object"
+      ? { ...record, turns: { ...(record.turns || {}) } }
+      : emptyContextRecord("", now);
+    base.version = CONTEXT_PRESSURE_VERSION;
+    const nextFloor = positiveInt(floor);
+    const previousFloor = positiveInt(base.message_count_floor);
+    if (nextFloor <= previousFloor) return base;
+    base.message_count_floor = nextFloor;
+    base.message_floor_source = String(source || "virtual_turn_index");
+    base.updated_at = now;
+    return base;
+  }
+
   function summarizeContextRecord(record, policy = DEFAULT_CONTEXT_POLICY, now = Date.now()) {
     const turns = Object.values(record?.turns || {});
     const estimatedTextTokens = turns.reduce((sum, turn) => sum + positiveInt(turn?.token_estimate), 0);
-    const messageCount = turns.length;
+    const observedMessageCount = turns.length;
+    const messageCount = Math.max(observedMessageCount, positiveInt(record?.message_count_floor));
     const turnCount = turns.filter((turn) => turn?.role === "user").length;
     return {
       ...evaluateContextPressure({
@@ -206,6 +265,9 @@
       }, policy),
       first_observed_at: record?.first_observed_at || null,
       updated_at: record?.updated_at || null,
+      observed_message_count: observedMessageCount,
+      message_count_floor: positiveInt(record?.message_count_floor),
+      message_floor_source: record?.message_floor_source || null,
       last_auto_attempt_at: record?.last_auto_attempt_at || null,
       auto_transfer_id: record?.auto_transfer_id || null,
       last_rollover_at: record?.last_rollover_at || null,
@@ -261,6 +323,7 @@
     evaluateContextPressure,
     emptyContextRecord,
     mergeObservedTurns,
+    mergeMessageCountFloor,
     summarizeContextRecord,
     markAutoAttempt,
     markRolloverCommitted,

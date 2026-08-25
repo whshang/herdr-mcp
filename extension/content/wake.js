@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.53";
+const H2W_CONTENT_VERSION = "0.1.54";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -161,6 +161,18 @@ const H2W_CONTENT_VERSION = "0.1.53";
     return observations;
   }
 
+  function observedConversationMessageFloor() {
+    if (ADAPTER.name !== "chatgpt") return 0;
+    let floor = 0;
+    for (const el of document.querySelectorAll('[data-testid^="conversation-turn-"]')) {
+      const value = String(el.getAttribute("data-testid") || "");
+      const match = /^conversation-turn-(\d+)$/.exec(value);
+      if (!match) continue;
+      floor = Math.max(floor, Number(match[1]) + 1);
+    }
+    return floor;
+  }
+
   async function updateContextPressure() {
     if (!CONTEXT_PRESSURE) return null;
     const convKey = ADAPTER.getConversationKey();
@@ -169,6 +181,14 @@ const H2W_CONTENT_VERSION = "0.1.53";
       contextPressureRecord = await loadContextPressure(convKey);
     }
     contextPressureRecord = CONTEXT_PRESSURE.mergeObservedTurns(contextPressureRecord, observedConversationTurns());
+    const messageFloor = observedConversationMessageFloor();
+    if (messageFloor > 0) {
+      contextPressureRecord = CONTEXT_PRESSURE.mergeMessageCountFloor(
+        contextPressureRecord,
+        messageFloor,
+        "chatgpt_virtual_turn_index",
+      );
+    }
     await persistContextPressure(contextPressureRecord);
     return CONTEXT_PRESSURE.summarizeContextRecord(contextPressureRecord);
   }

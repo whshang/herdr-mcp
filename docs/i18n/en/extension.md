@@ -5,7 +5,7 @@ Language: product UI is en / Simplified Chinese / Japanese (same as herdr); this
 
 | Track | Problem | Direction | Status | First sites |
 |---|---|---|---|---|
-| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + automation gates + safe handoff | **usable** (0.1.53 series) | binding/observation: 4 sites; shared automation: ChatGPT Project; conversation-scoped automation: plain ChatGPT / z.ai / DeepSeek; Manual handoff: ChatGPT Project + z.ai `/c/<chat_id>` |
+| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + automation gates + safe handoff | **usable** (0.1.54 series) | binding/observation: 4 sites; shared automation: ChatGPT Project; conversation-scoped automation: plain ChatGPT / z.ai / DeepSeek; Manual handoff: ChatGPT Project + z.ai `/c/<chat_id>` |
 | **B. JSON→MCP** | DeepSeek / z.ai web has no MCP Connector | web → extension service worker → Native Messaging host → trusted local `/mcp` IPC | **usable** (bounded `tools/list` / `tools/call` loop) | `chat.deepseek.com`, `chat.z.ai` |
 
 Shared: same extension, same Native Messaging + local Unix IPC transport, same options.
@@ -124,7 +124,7 @@ Safety boundary:
 - the handoff packet is temporarily stored in `chrome.storage.local`; after successful cutover its body is cleared and only small recovery/diagnostic metadata remains;
 - workspace bindings no longer silently expire after 24 hours. They remain explicit until the user unbinds or a successful rollover moves them.
 
-Context pressure is estimated from visible user/assistant text only. It is not the ChatGPT backend token count and it does not persist message bodies. Automatic rollover requires a bound Project conversation, a quiet page, no uncertain delivery, no active tools/streaming, and a valid handoff path.
+Context pressure is conservative rather than pretending to know ChatGPT's private backend token count. It persists no message bodies. Visible user/assistant text uses a reserved budget (`56k / 64k / 72k / 80k / 92k` for warning / prepare / recommend / auto-rollover / high-risk), leaving headroom for hidden Project/system/MCP payloads. ChatGPT also virtualizes old message nodes, so 0.1.54 reads the absolute `conversation-turn-N` indices that remain on mounted virtual-list rows and persists the highest index as a monotonic message-count floor. Message counts can therefore prepare/recommend/require rollover at `40 / 46 / 50` even when only a few recent DOM nodes remain. Automatic rollover still requires a bound Project conversation, a quiet page, no uncertain delivery, no active tools/streaming, and a valid handoff path.
 
 ## B. JSON→MCP (DeepSeek / z.ai)
 

@@ -53,8 +53,8 @@
 
 1. 内容脚本看 Stop 出现/消失，划定回合
 2. Options 为项目自动、当前 Project `自动 开` 且已填 Base URL + Key + Model 时：对用户/助手正文做一次 OpenAI 兼容 `chat/completions`；否则可用底栏 **LLM 分析** 手动触发
-3. 回复落在「不发送关键词」→ 不催；否则若判定为继续 → **把小模型原文**灌进对话框并提交（提示词 / 不发送词在 Options 预填可见默认文案）
-4. **不再使用**零工具 / 半途启发式；未配置小模型则本回合不催
+3. 回复落在「不发送关键词」→ 通常不催；否则若判定为继续 → **把小模型原文**灌进对话框并提交（提示词 / 不发送词在 Options 预填可见默认文案）。0.1.54 增加一个更窄的保护：若助手自己在回复尾部明确写出「下一步，我会继续…」「我将继续…」「仍需…」「待验证…」等未完成承诺，即使小模型误回 `好的`，仍按未完成处理；普通「下一步建议用户可以……」不会触发这个覆盖。
+4. 不再使用零工具 / 普通「半途」猜测；未配置小模型则本回合不催。0.1.54 还修正去重时机：只有明确 `done` 或继续消息**确认提交成功**后才封存 assistant fingerprint；ambiguous 判定 30 秒后可重判，发送失败也保留重试资格，同一 conversation 同时只允许一个 judge/send attempt。
 5. 用户气泡若是上次催促句，**仍会**对助手新回复做判定（0.1.20 起）；自动判断冷却与进度检查共用 `progressTickSec`，`0` 关闭自动 LLM 判断（默认 60s），不影响手动 **LLM 分析**
 6. 支持站点页底部 HUD：运行状态、**手动继续 / herdr监控 / LLM 分析 / 手动接力**、可选的 **自动 开|关**、展开。ChatGPT Project 只有在 Options 允许 Project 自动化时才显示按 `project_id` 共享的开关；普通 ChatGPT `/c/<id>`、z.ai / DeepSeek 始终可以按具体 conversation 显示会话级开关。`手动接力` 支持已绑定 ChatGPT Project 和已落成 `/c/<chat_id>` 的 z.ai 会话；当前作用域 `自动 开` 时四个 HUD 手动操作全部锁定。高频动作都在底栏，展开浮层只放事件设置、会话绑定和高级选项。文案跟 Options 语言（en / 简中 / 日语）
 7. herdr working/settled 唤醒仍独立存在
@@ -82,6 +82,18 @@ Project `自动 开` 时，人工发送和扩展自动发送的用户消息都�
 - 一次 Retry / 一次 reload 预算都用完后，保持显式错误为权威状态并抑制通用 recovery message，避免无证据地创建第二个用户回合；如果刷新后 10 秒仍没有新的 assistant 进展，HUD 转成 `rollover_recommended`，而不是静默卡在 `recovering`。
 
 因此，强制刷新属于**第二级恢复手段**，不是遇到“消息发送超时”后的第一动作。
+
+### ChatGPT 长对话虚拟化与自动接力（0.1.54）
+
+ChatGPT 长对话不会把全部历史消息长期留在 DOM。真实 UAT 中，一条已经到 `conversation-turn-50` 的 Project conversation 在刷新后只挂载了 5 条 user/assistant 节点；如果只统计当前 DOM，压力会被错误重置成“短对话”。0.1.54 不再这样判断：
+
+- 读取当前仍挂载的 `[data-testid="conversation-turn-N"]`，取最大绝对序号 `N + 1` 作为 **message-count floor**；
+- floor 持久化在 `chrome.storage.local`，只允许增加，不会因为刷新、懒加载或虚拟列表卸载旧节点而回退；
+- 页面可见正文仍做 token 估算，但 usable text budget 从 120k 收紧为 96k，为 Project/system 指令和 MCP/tool payload 等不可见上下文保留余量；
+- 估算正文约 `56k / 64k / 72k / 80k / 92k` 进入 warning / prepare / recommend / required / high-risk；消息段数约 `40 / 46 / 50` 也会独立进入 prepare / recommend / required；
+- `required/high-risk` **不等于立即切会话**。只有当前 Project `自动 开`、workspace 已绑定且可接力、页面静止、无 streaming/tool/权限卡/未发送人工文本、无不确定投递、无活动 handoff 时，才调用同一套 fail-closed 自动 handoff。
+
+因此自动接力现在对“工具调用很多但可见正文不长”的 Herdr 会话也能提前动作，不再要求可见文本自己先堆到接近整个模型窗口。
 
 ## 手动接力（0.1.47）
 

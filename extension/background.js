@@ -13,8 +13,8 @@ import {
   reconcileWorkspaceWakeKind,
   pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
   isIdleNudgeText, looksLikeSubstantiveReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage, interpretLlmJudgeReply,
-  assistantNudgeFingerprint,
-  DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
+  assistantNudgeFingerprint, assistantDeclaresPendingWork,
+  DEFAULT_LLM_JUDGE_PROMPT, LEGACY_DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
   conversationInfoFromSupportedUrl,
 } from "./binding-core.js";
 import {
@@ -26,7 +26,7 @@ import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 
-const H2W_SCRIPT_VERSION = "0.1.53";
+const H2W_SCRIPT_VERSION = "0.1.54";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -325,6 +325,10 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
     CFG.llmJudgePromptTemplate = localizedText("default_llm_judge_prompt", null, DEFAULT_LLM_JUDGE_PROMPT);
   }
   const patch = {};
+  if (String(CFG.llmJudgePromptTemplate || "").trim() === LEGACY_DEFAULT_LLM_JUDGE_PROMPT) {
+    CFG.llmJudgePromptTemplate = localizedText("default_llm_judge_prompt", null, DEFAULT_LLM_JUDGE_PROMPT);
+    patch.llmJudgePromptTemplate = CFG.llmJudgePromptTemplate;
+  }
   if (![AUTOMATION_MODE_MANUAL, AUTOMATION_MODE_PROJECT].includes(stored.automationMode)) {
     // Upgrade compatibility: preserve the old global user's intent only as a
     // permission to use per-Project automation. No Project is auto-enabled by
@@ -1143,7 +1147,8 @@ async function onPushSettled(storeKey, data) {
 // hasProgressSent records whether this working round has sent progress.
 const progressTimers = new Map(); // convKey -> { id, lastTickAt, lastSentAt, lastOutputSent, hasProgressSent, inFlight }
 const lastIdleNudgeAt = new Map(); // convKey -> ms
-const lastJudgedAssistantFp = new Map(); // convKey -> fingerprint of assistant text already judged
+const lastJudgedAssistantFp = new Map(); // convKey -> terminal assistant fingerprint (done or wake delivered)
+const idleNudgeInFlight = new Set(); // convKey -> one judge/send attempt at a time
 const lastIdleNudgeResult = new Map(); // convKey -> { at, reason, raw?, nudged }
 const idleNudgeRetryTimers = new Map(); // convKey -> timeout id
 const lastTurnEndedPayload = new Map(); // convKey -> last h2w_turn_ended payload (for cooldown retry)
@@ -1272,8 +1277,21 @@ async function retryIdleNudge(convKey) {
   await maybeIdleNudge(payload);
 }
 
-/** Post-turn nudge: LLM judge only (no zero-tools / mid-stop heuristics). */
+/** Post-turn nudge: LLM judge plus strong assistant self-declared pending work. */
 async function maybeIdleNudge(msg) {
+  const convKey = msg?.convKey || "";
+  if (convKey && idleNudgeInFlight.has(convKey)) {
+    return rememberIdleNudge(convKey, { nudged: false, reason: "judge_in_flight" });
+  }
+  if (convKey) idleNudgeInFlight.add(convKey);
+  try {
+    return await maybeIdleNudgeInner(msg);
+  } finally {
+    if (convKey) idleNudgeInFlight.delete(convKey);
+  }
+}
+
+async function maybeIdleNudgeInner(msg) {
   const convKey = msg.convKey;
   if (!convKey) return rememberIdleNudge("", { nudged: false, reason: "no_conv" });
   if (!automationScopeForConversation(convKey).enabled) {
@@ -1352,15 +1370,28 @@ async function maybeIdleNudge(msg) {
       status: judged.status || null,
     });
   }
-  const verdict = interpretLlmJudgeReply(judged.content, {
+  let verdict = interpretLlmJudgeReply(judged.content, {
     skipKeywords: CFG.llmJudgeSkipKeywords || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
   });
-  lastJudgedAssistantFp.set(convKey, fp);
+  if (assistantDeclaresPendingWork(assistantText) && !verdict.cont) {
+    verdict = {
+      done: false,
+      cont: true,
+      nudgeText: localizedText(
+        "default_auto_continue_nudge",
+        null,
+        "Continue with the unfinished work you identified.",
+      ),
+      raw: `${verdict.raw || ""} [assistant_pending_override]`.trim(),
+    };
+  }
   if (verdict.done) {
+    lastJudgedAssistantFp.set(convKey, fp);
     clearIdleNudgeRetry(convKey);
     return rememberIdleNudge(convKey, { nudged: false, reason: "llm_done", raw: verdict.raw });
   }
   if (!verdict.cont || !verdict.nudgeText) {
+    scheduleIdleNudgeRetry(convKey, 30000);
     return rememberIdleNudge(convKey, { nudged: false, reason: "llm_ambiguous", raw: verdict.raw });
   }
 
@@ -1383,6 +1414,7 @@ async function maybeIdleNudge(msg) {
       error: wakeResult?.error || wakeResult?.blocked || wakeResult?.reason || "submit-failed",
     });
   }
+  lastJudgedAssistantFp.set(convKey, fp);
   return rememberIdleNudge(convKey, {
     nudged: true,
     reason: "llm_continue",

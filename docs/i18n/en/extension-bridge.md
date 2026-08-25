@@ -17,7 +17,7 @@ web task
   -> web model either calls another tool or answers normally
 ```
 
-## Current state (0.1.53)
+## Current state (0.1.54)
 
 | Capability | Status |
 |---|---|

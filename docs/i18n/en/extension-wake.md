@@ -53,8 +53,8 @@ Bound conversation + extension ≥ 0.1.20:
 
 1. the content script marks turns by Stop appearing/disappearing
 2. when Options is in Per-Project mode, the current Project is `Auto on`, and Base URL + Key + Model are configured: one OpenAI-compatible `chat/completions` call over the user/assistant body; otherwise use the bottom-bar **LLM analysis** action to trigger it manually
-3. if the reply matches the "do not send" keywords → no nudge; otherwise if judged "continue" → **fill the small model's original text** into the input and submit (prompt / do-not-send words are pre-filled visible defaults in Options)
-4. **no longer** uses zero-tool / halfway heuristics; without a configured small model, no nudge this turn
+3. if the reply matches the "do not send" keywords → normally no nudge; otherwise if judged "continue" → **fill the small model's original text** into the input and submit (prompt / do-not-send words are pre-filled visible defaults in Options). 0.1.54 adds one deliberately narrow guard: if the assistant's own tail explicitly commits to unfinished work such as `Next: I will...`, `I will continue...`, `still need to...`, or the Chinese equivalents, a contradictory `done` verdict is overridden; optional advice like “next you could consider…” does not match this guard.
+4. it no longer uses zero-tool or generic halfway guessing; without a configured small model, no nudge this turn. 0.1.54 also fixes dedup timing: an assistant fingerprint becomes terminal only after explicit `done` or a **confirmed successful** continue submission. Ambiguous results are eligible for a 30-second re-judge, failed sends stay retryable, and only one judge/send attempt per conversation may be in flight at once.
 5. if the user bubble was the last nudge sentence, the **new assistant reply is still judged** (since 0.1.20); automatic judgment and progress checks share `progressTickSec`; `0` disables automatic LLM judgment (default 60s) but not manual **LLM analysis**
 6. persistent bottom HUD on supported sites: runtime state, **Manual continue / Herdr monitor / LLM analysis / Manual handoff**, optional **Auto on|off**, and expand. ChatGPT Projects expose a `project_id`-scoped switch only when the Options Project gate is enabled; plain ChatGPT `/c/<id>`, z.ai, and DeepSeek always remain eligible for their own conversation-scoped switch. Manual handoff is available for bound ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations; with the current scope `Auto on`, all four HUD manual actions are locked. Frequent actions stay on the bar, and the drawer contains only event settings, conversation bindings and advanced options. Copy follows the Options language (en / Simplified Chinese / Japanese)
 7. herdr working/settled wake-ups remain independent
@@ -82,6 +82,18 @@ When ChatGPT itself renders the thread error card with `data-testid="regenerate-
 - after the one Retry / one reload budget is exhausted, keep the explicit error authoritative and suppress generic recovery-message submission rather than creating a second user turn blindly; if the reload produced no new assistant progress after 10 seconds, the HUD moves to `rollover_recommended` instead of silently remaining stuck in `recovering`.
 
 So a hard refresh is a **second-stage recovery**, not the first response to every send-timeout card.
+
+### ChatGPT virtualized long-history rollover (0.1.54)
+
+ChatGPT does not keep an entire long conversation mounted in the DOM. In real UAT, a Project conversation that had reached `conversation-turn-50` exposed only five user/assistant nodes after reload; a DOM-only counter therefore reset a genuinely long conversation to an apparently short one. 0.1.54 fixes that boundary:
+
+- read mounted `[data-testid="conversation-turn-N"]` rows and treat the highest absolute `N + 1` value as a **message-count floor**;
+- persist that floor in `chrome.storage.local` and only allow it to increase, so reload, lazy loading and virtual-list eviction cannot reduce recorded pressure;
+- visible text is still token-estimated, but the usable text budget is reduced from 120k to 96k to reserve context for hidden Project/system instructions and MCP/tool payloads;
+- approximately `56k / 64k / 72k / 80k / 92k` visible-text tokens enter warning / prepare / recommend / required / high-risk, while approximately `40 / 46 / 50` message segments independently enter prepare / recommend / required;
+- `required/high-risk` does **not** mean an unconditional cutover. Auto rollover still requires the current Project to be `Auto on`, a bound handoff-capable workspace, a quiet page, no streaming/tool/permission-card/human draft, no uncertain delivery, and no active handoff.
+
+This lets tool-heavy Herdr conversations roll over before visible prose alone approaches the nominal model window.
 
 ## Manual handoff (0.1.47)
 

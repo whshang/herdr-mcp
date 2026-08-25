@@ -5,7 +5,7 @@
 
 | 主线 | 问题 | 方向 | 状态 | 首批站点 |
 |---|---|---|---|---|
-| **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + 自动化 gate + 安全接力 | **已可用**（当前 0.1.53 系列） | 绑定/观察：4 站；ChatGPT Project 共享自动化；普通 ChatGPT / z.ai / DeepSeek 会话级自动化；手动接力：ChatGPT Project + z.ai `/c/<chat_id>` |
+| **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + 自动化 gate + 安全接力 | **已可用**（当前 0.1.54 系列） | 绑定/观察：4 站；ChatGPT Project 共享自动化；普通 ChatGPT / z.ai / DeepSeek 会话级自动化；手动接力：ChatGPT Project + z.ai `/c/<chat_id>` |
 | **B. JSON→MCP** | DeepSeek / z.ai 网页没有 MCP Connector | 网页 → 扩展 service worker → Native Messaging host → 受信任本机 `/mcp` IPC | **已可用**（bounded `tools/list` / `tools/call` loop） | `chat.deepseek.com`、`chat.z.ai` |
 
 共享：同一扩展、同一 Native Messaging + 本机 Unix IPC transport、同一 options。
@@ -135,7 +135,7 @@ Project `自动 开` 是当前 Project 的执行 gate。只有 Options 已选择
 - handoff packet 临时保存在 `chrome.storage.local`；成功 cutover 后立即从 transfer 记录清掉正文，只保留少量状态元数据用于恢复/诊断。
 - workspace binding 从旧版的 24 小时自动过期改为显式持久绑定；当前只在用户解绑或成功接力时主动改变关系，不再因为时间流逝静默失效。
 
-上下文压力使用页面能观察到的**用户/助手文本估算**，不是 ChatGPT 后端真实 token 计数，也不保存完整消息正文到压力记录。当前策略以约 `72k / 84k / 90k / 96k / 108k` 估算文本 token 依次进入 warning / prepare / recommend / auto-rollover / high-risk；只有达到 `96k` 以上并通过静止、安全、已绑定 Project、无活动 handoff 等闸门时才允许自动接力。消息数、回合数或会话年龄只能把状态提升到 warning，不会单独触发自动新会话。
+上下文压力采取**保守估算**，不会假装拿到了 ChatGPT 后端真实 token 计数，也不在压力记录里保存消息正文。页面可见的用户/助手文本以约 `56k / 64k / 72k / 80k / 92k` 依次进入 warning / prepare / recommend / auto-rollover / high-risk，为 Project 指令、system 内容和 MCP/tool payload 等页面不可见上下文预留空间。ChatGPT 会虚拟化旧消息，0.1.54 因此读取仍保留在虚拟列表节点上的绝对 `conversation-turn-N` 序号，并把最大序号持久化为只增不减的消息数下限；即使刷新后 DOM 只剩几条最近消息，也不会把压力重新算小。消息数达到约 `40 / 46 / 50` 会分别进入 prepare / recommend / required，达到 required 后仍必须通过页面静止、无工具/流式输出、无不确定投递、已绑定 Project、无活动 handoff 等安全闸门才会自动接力。
 
 ## B. JSON→MCP（DeepSeek / z.ai）
 

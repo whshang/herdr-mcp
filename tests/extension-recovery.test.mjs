@@ -169,18 +169,25 @@ test("ChatGPT turn watcher wires assistant progress, settled turns, and explicit
   assert.match(wake, /thread_error_delivery_unknown/);
   assert.match(wake, /startsWith\("thread_error_"\)/);
   assert.match(wake, /markRolloverRecommended/);
+  assert.match(wake, /conversation-turn-/);
+  assert.match(wake, /mergeMessageCountFloor/);
   assert.match(wake, /stale_view_activation_template/);
 });
 
-test("context pressure uses measured budget thresholds", () => {
+test("context pressure uses conservative text and virtual-turn thresholds", () => {
   const context = loadClassicExtensionScripts();
   const pressure = context.H2W_CONTEXT_PRESSURE;
   assert.equal(pressure.EFFECTIVE_CONTEXT_TOKENS, 128000);
-  assert.equal(pressure.USABLE_TEXT_BUDGET_TOKENS, 120000);
-  assert.equal(pressure.evaluateContextPressure({ estimatedTextTokens: 72000 }).state, "context_warning");
-  assert.equal(pressure.evaluateContextPressure({ estimatedTextTokens: 84000 }).state, "handoff_prepare");
-  assert.equal(pressure.evaluateContextPressure({ estimatedTextTokens: 90000 }).state, "rollover_recommended");
-  assert.equal(pressure.evaluateContextPressure({ estimatedTextTokens: 96000 }).state, "rollover_required");
+  assert.equal(pressure.USABLE_TEXT_BUDGET_TOKENS, 96000);
+  assert.equal(pressure.evaluateContextPressure({ estimatedTextTokens: 56000 }).state, "context_warning");
+  assert.equal(pressure.evaluateContextPressure({ estimatedTextTokens: 64000 }).state, "handoff_prepare");
+  assert.equal(pressure.evaluateContextPressure({ estimatedTextTokens: 72000 }).state, "rollover_recommended");
+  assert.equal(pressure.evaluateContextPressure({ estimatedTextTokens: 80000 }).state, "rollover_required");
+  assert.equal(pressure.evaluateContextPressure({ messageCount: 32 }).state, "context_warning");
+  assert.equal(pressure.evaluateContextPressure({ messageCount: 40 }).state, "handoff_prepare");
+  assert.equal(pressure.evaluateContextPressure({ messageCount: 46 }).state, "rollover_recommended");
+  assert.equal(pressure.evaluateContextPressure({ messageCount: 50 }).state, "rollover_required");
+  assert.equal(pressure.evaluateContextPressure({ messageCount: 60 }).state, "high_risk");
 });
 
 test("context pressure persists metadata only and proactive rollover is fail-closed", () => {
@@ -194,8 +201,18 @@ test("context pressure persists metadata only and proactive rollover is fail-clo
   assert.equal(JSON.stringify(record).includes("hello world"), false);
   assert.equal(pressure.summarizeContextRecord(record).message_count, 2);
 
+  record = pressure.mergeMessageCountFloor(record, 51, "chatgpt_virtual_turn_index", 2000);
+  record = pressure.mergeMessageCountFloor(record, 12, "chatgpt_virtual_turn_index", 3000);
+  const summarized = pressure.summarizeContextRecord(record);
+  assert.equal(summarized.observed_message_count, 2);
+  assert.equal(summarized.message_count_floor, 51);
+  assert.equal(summarized.message_count, 51);
+  assert.equal(summarized.message_floor_source, "chatgpt_virtual_turn_index");
+  assert.equal(summarized.state, "rollover_required");
+  assert.equal(summarized.recommendation, "auto_rollover");
+
   const base = {
-    pressure: pressure.evaluateContextPressure({ estimatedTextTokens: 96000 }),
+    pressure: pressure.evaluateContextPressure({ messageCount: 50 }),
     runtimeHealth: "healthy",
     bound: true,
     canHandoff: true,

@@ -19,7 +19,7 @@ import {
   progressOutputFingerprint,
   isIdleNudgeText, looksLikeSubstantiveReply, isHerdrWakeComposerText,
   interpretLlmJudgeReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage,
-  parseLlmSkipKeywords, llmReplyMatchesSkipKeyword, assistantNudgeFingerprint,
+  parseLlmSkipKeywords, llmReplyMatchesSkipKeyword, assistantNudgeFingerprint, assistantDeclaresPendingWork,
   conversationInfoFromSupportedUrl,
 } from "../../extension/binding-core.js";
 import {
@@ -59,9 +59,9 @@ const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
-ok(manifest.version === "0.1.53", "manifest version includes explicit ChatGPT thread-error recovery");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.53"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.53"'), "content version matches manifest");
+ok(manifest.version === "0.1.54", "manifest version includes virtualized-history context-pressure recovery");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.54"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.54"'), "content version matches manifest");
 ok(backgroundSource.includes("sendResponse({ ok: true, ...automationScopeForConversation(convKey) });")
     && backgroundSource.includes("void notifyAutomationChanged();")
     && wakeSource.includes("finally {\n      setHudActionBusy(false);"),
@@ -71,6 +71,16 @@ ok(wakeSource.includes('regenerate-thread-error-button')
     && wakeSource.includes("thread_error_server_ahead")
     && wakeSource.includes("thread_error_delivery_unknown"),
   "ChatGPT explicit send-timeout cards retry once or safely reload before generic recovery");
+ok(backgroundSource.includes("idleNudgeInFlight")
+    && backgroundSource.includes("assistantDeclaresPendingWork")
+    && backgroundSource.includes("scheduleIdleNudgeRetry(convKey, 30000)")
+    && backgroundSource.includes("assistant_pending_override"),
+  "LLM auto-continue retries ambiguous/send-failed turns and honors strong pending-work declarations");
+ok(wakeSource.includes('data-testid^="conversation-turn-"')
+    && wakeSource.includes("observedConversationMessageFloor")
+    && wakeSource.includes("mergeMessageCountFloor")
+    && wakeSource.includes('"chatgpt_virtual_turn_index"'),
+  "ChatGPT context pressure preserves a virtualized conversation-turn count floor across reloads");
 ok(
   backgroundSource.includes('from "./local-auth.js"')
     && localAuthSource.includes("sendNativeMessage")
@@ -882,6 +892,9 @@ ok(!looksLikeSubstantiveReply("Called herdr_exec"), "short tool line not substan
 ok(looksLikeSubstantiveReply(
   "I ran herdr_inspect and herdr_exec. The MCP server is healthy and all panes are idle. Next I will run the pytest suite for convex."
 ), "long prose reply is substantive");
+ok(assistantDeclaresPendingWork("当前已经定位。\n\n下一步\n\n我会继续做两件事：读取 request id，然后修最小范围。"), "explicit Chinese self-declared next work is pending");
+ok(assistantDeclaresPendingWork("Validation is not yet complete.\nNext: I will run the production smoke test."), "explicit English self-declared next work is pending");
+ok(!assistantDeclaresPendingWork("处理已经完成。下一步建议用户可以考虑补充更多监控。"), "optional next-step advice is not forced pending");
 ok(assistantNudgeFingerprint("abc") === assistantNudgeFingerprint("abc"), "fp stable");
 ok(assistantNudgeFingerprint("abc") !== assistantNudgeFingerprint("abd"), "fp differs");
 ok(parseLlmSkipKeywords("").includes("好的"), "empty skip → built-in");
