@@ -8,6 +8,7 @@ use crate::git_tools;
 use crate::herdr::HerdrClient;
 use crate::native_tools;
 use crate::state_cache::EventCache;
+use crate::utility_exec;
 use serde_json::{Value, json};
 
 pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
@@ -187,6 +188,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         }
         "herdr_exec_read" => exec_tools::read(context.exec, &arguments),
         "herdr_exec_kill" => exec_tools::kill(context.exec, &arguments),
+        "herdr_exec" => utility_exec::run(context.client, &context.cache.snapshot(), &arguments),
         pending if contract::tool_names().contains(&pending) => {
             return Ok(tool_result(
                 json!({

@@ -123,7 +123,7 @@ impl ExecRegistry {
         process
             .current_dir(cwd)
             .env("HERDR_MCP_EXEC_ID", &id)
-            .env("PATH", enriched_path())
+            .env("PATH", enriched_exec_path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -502,7 +502,7 @@ fn iso_from_ms(ms: u64) -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
 }
 
-fn enriched_path() -> String {
+pub fn enriched_exec_path() -> String {
     let mut values = Vec::<String>::new();
     if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
         for relative in [
@@ -535,7 +535,7 @@ fn enriched_path() -> String {
 
 #[cfg(unix)]
 fn shell_command(command: &str) -> Command {
-    let shell = resolve_unix_shell();
+    let shell = resolve_exec_shell();
     let mut process = Command::new(shell);
     process.args(["-lc", command]);
     process
@@ -549,7 +549,7 @@ fn shell_command(command: &str) -> Command {
 }
 
 #[cfg(unix)]
-fn resolve_unix_shell() -> PathBuf {
+pub fn resolve_exec_shell() -> PathBuf {
     let mut candidates = Vec::new();
     for key in ["HERDR_MCP_EXEC_SHELL", "SHELL"] {
         if let Some(value) = env::var_os(key) {
@@ -565,6 +565,11 @@ fn resolve_unix_shell() -> PathBuf {
         .into_iter()
         .find(|candidate| is_executable_shell(candidate))
         .unwrap_or_else(|| PathBuf::from("/bin/sh"))
+}
+
+#[cfg(windows)]
+pub fn resolve_exec_shell() -> PathBuf {
+    PathBuf::from("powershell.exe")
 }
 
 #[cfg(unix)]
@@ -820,7 +825,7 @@ mod tests {
     fn shell_resolution_is_compatible() {
         #[cfg(unix)]
         assert!(matches!(
-            resolve_unix_shell()
+            resolve_exec_shell()
                 .file_name()
                 .and_then(|value| value.to_str()),
             Some("zsh" | "bash" | "sh")

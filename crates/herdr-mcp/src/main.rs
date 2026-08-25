@@ -25,6 +25,7 @@ mod schema;
 mod snapshot;
 mod state_cache;
 mod status;
+mod utility_exec;
 mod workstation;
 
 use std::process::ExitCode;

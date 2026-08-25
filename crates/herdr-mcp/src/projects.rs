@@ -99,6 +99,24 @@ pub fn workspaces_for_root(topology: &ProjectTopology, root: &Path) -> Vec<Strin
     workspaces
 }
 
+pub fn projects_for_workspace(topology: &ProjectTopology, workspace_id: &str) -> Vec<ProjectInfo> {
+    let mut projects = topology
+        .projects
+        .values()
+        .filter(|project| {
+            project.pane_ids.iter().any(|pane| {
+                topology
+                    .pane_to_workspace
+                    .get(pane)
+                    .is_some_and(|workspace| workspace == workspace_id)
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    projects.sort_by(|left, right| left.root.cmp(&right.root));
+    projects
+}
+
 fn pane_workspaces(snapshot: &Value) -> HashMap<String, String> {
     let mut result = HashMap::new();
     for key in ["agents", "panes"] {
