@@ -34,3 +34,15 @@ test('watchdog and CLI normalize failed curl to one 000 code and use discover lo
     assert.match(source, /\"method\":\"server\/discover\"/, `${name} uses sessionless discover`);
   }
 });
+
+test('CLI tracks the exact launchd server job and delegates Rust service mutations', () => {
+  assert.match(cli, /RUNTIME_BIN="\$HOME\/\.config\/herdr-mcp\/runtime\/current\/herdr-mcp"/);
+  assert.match(cli, /launchctl list "\$LABEL"/);
+  assert.match(cli, /"\$RUNTIME_BIN" service status/);
+  assert.match(cli, /"\$RUNTIME_BIN" service "\$action"/);
+  assert.match(cli, /run_rust_service start/);
+  assert.match(cli, /run_rust_service stop/);
+  assert.match(cli, /run_rust_service restart/);
+  assert.doesNotMatch(cli, /pgrep -f "dist\/server\.js"/);
+  assert.doesNotMatch(cli, /pkill -f "dist\/server\.js"/);
+});

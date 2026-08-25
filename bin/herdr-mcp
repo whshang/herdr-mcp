@@ -22,6 +22,7 @@ PLIST="$HOME/Library/LaunchAgents/dev.herdr-mcp.server.plist"
 LABEL="dev.herdr-mcp.server"
 LOG_FILE="$HOME/.config/herdr-mcp/server.log"
 LOCAL_URL="http://127.0.0.1:8772/mcp"
+RUNTIME_BIN="$HOME/.config/herdr-mcp/runtime/current/herdr-mcp"
 
 # Colors
 R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; C=$'\033[36m'; B=$'\033[1m'; N=$'\033[0m'
@@ -51,12 +52,34 @@ get_public_url() {
 }
 
 # ---- Service status ----
+service_loaded() {
+  launchctl list "$LABEL" >/dev/null 2>&1
+}
+
 is_running() {
-  pgrep -f "dist/server.js" >/dev/null 2>&1
+  [[ -n "$(service_pid)" ]]
 }
 
 service_pid() {
-  pgrep -f "dist/server.js" 2>/dev/null | head -1 || echo ""
+  launchctl list 2>/dev/null | awk -v label="$LABEL" '
+    $3 == label && $1 ~ /^[0-9]+$/ { print $1; exit }
+  '
+}
+
+uses_rust_service() {
+  local status
+  [[ -x "$RUNTIME_BIN" ]] || return 1
+  status=$("$RUNTIME_BIN" service status 2>/dev/null || true)
+  [[ "$status" == *'"implementation": "rust"'* ]]
+}
+
+run_rust_service() {
+  local action="$1" output
+  if output=$("$RUNTIME_BIN" service "$action" 2>&1); then
+    return 0
+  fi
+  [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+  return 1
 }
 
 # ---- Local MCP health check ----
@@ -111,11 +134,7 @@ cmd_status() {
     err "$(T proc_stopped)"
   fi
 
-  if launchctl list 2>/dev/null | python3 -c "
-import sys
-found = any('dev.herdr-mcp' in l for l in sys.stdin)
-sys.exit(0 if found else 1)
-"; then
+  if service_loaded; then
     log "$(T launchd_loaded)"
   else
     warn "$(T launchd_missing)"
@@ -187,40 +206,64 @@ cmd_start() {
     log "$(T already_running) (PID $(service_pid))"
     return 0
   fi
-  launchctl load "$PLIST" 2>&1
-  sleep 2
+  if uses_rust_service; then
+    if ! run_rust_service start; then
+      err "$(T start_failed)"
+      return 1
+    fi
+  else
+    if service_loaded; then
+      launchctl kickstart "gui/$(id -u)/$LABEL" 2>&1
+    else
+      launchctl load "$PLIST" 2>&1
+    fi
+    sleep 2
+  fi
   if is_running; then
     log "$(T started) (PID $(service_pid))"
   else
     err "$(T start_failed)"
+    return 1
   fi
 }
 
 cmd_stop() {
-  launchctl unload "$PLIST" 2>&1 || true
-  sleep 1
-  if is_running; then
-    pkill -f "dist/server.js" 2>/dev/null || true
+  if uses_rust_service; then
+    if ! run_rust_service stop; then
+      err "$(T stop_failed)"
+      return 1
+    fi
+  else
+    launchctl unload "$PLIST" 2>&1 || true
     sleep 1
   fi
   if is_running; then
     err "$(T stop_failed)"
+    return 1
   else
     log "$(T stopped)"
   fi
 }
 
 cmd_restart() {
-  pkill -f "dist/server.js" 2>/dev/null || true
-  sleep 1
-  if ! is_running; then
-    launchctl load "$PLIST" 2>/dev/null || true
+  if uses_rust_service; then
+    if ! run_rust_service restart; then
+      err "$(T restart_failed)"
+      return 1
+    fi
+  else
+    if service_loaded; then
+      launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    else
+      launchctl load "$PLIST" 2>/dev/null || true
+    fi
     sleep 3
   fi
   if is_running; then
     log "$(T restarted) (PID $(service_pid))"
   else
     err "$(T restart_failed)"
+    return 1
   fi
 }
 
