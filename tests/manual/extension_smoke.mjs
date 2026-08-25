@@ -59,9 +59,17 @@ const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
-ok(manifest.version === "0.1.60", "manifest version stays 0.1.60 for the browser performance budget");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.60"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.60"'), "content version matches manifest");
+ok(manifest.version === "0.1.61", "manifest version stays aligned with the runtime-gated title build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.61"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.61"'), "content version matches manifest");
+ok(backgroundSource.includes("automationRuntimeGate")
+    && backgroundSource.includes('reason: "local_runtime_unavailable"')
+    && wakeSource.includes('blocked: "local-runtime-unavailable"'),
+  "automatic continuation fails closed when the local Herdr runtime is unavailable");
+ok(wakeSource.includes("syncDocumentTitle")
+    && wakeSource.includes('.join("-")')
+    && wakeSource.includes("nativeConversationTitle"),
+  "page title is composed dynamically as status-workspace-conversation");
 ok(backgroundSource.includes("sendResponse({ ok: true, ...automationScopeForConversation(convKey) });")
     && backgroundSource.includes("void notifyAutomationChanged();")
     && wakeSource.includes("finally {\n      setHudActionBusy(false);"),
@@ -128,10 +136,10 @@ ok(
 ok(
   wakeSource.includes(".bar.automation-on")
     && wakeSource.includes(".bar.automation-on .handoff")
-    && wakeSource.includes('enabled ? " automation-on" : ""')
+    && wakeSource.includes('effectiveEnabled ? " automation-on" : ""')
     && wakeSource.includes("rgba(236,253,245,.97)")
     && wakeSource.includes("transition: none;"),
-  "automation-on state gives the whole HUD a deterministic light-green treatment without refresh-restarted transitions",
+  "effective automation gives the whole HUD a deterministic light-green treatment without refresh-restarted transitions",
 );
 ok(
   manifest.content_scripts.find((cs) => cs.matches?.includes("https://chatgpt.com/*"))?.js?.includes("context-pressure.js"),

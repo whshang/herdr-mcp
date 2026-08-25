@@ -171,6 +171,7 @@
   "hud_state_ready": "ready",
   "hud_state_bound": "bound",
   "hud_state_unbound": "unbound",
+  "hud_state_offline": "offline",
   "hud_state_working": "working",
   "hud_state_idle": "idle",
   "hud_state_done": "done",

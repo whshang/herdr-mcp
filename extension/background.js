@@ -26,7 +26,7 @@ import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 
-const H2W_SCRIPT_VERSION = "0.1.60";
+const H2W_SCRIPT_VERSION = "0.1.61";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -113,7 +113,7 @@ function hudLabels() {
   }
   out.states = {};
   for (const state of [
-    "unknown", "ready", "bound", "unbound", "working", "idle", "done", "blocked", "reply_waiting",
+    "unknown", "ready", "bound", "unbound", "offline", "working", "idle", "done", "blocked", "reply_waiting",
     "reply_suspect", "recovery_message_sent", "reload_pending", "recovering", "rollover_recommended",
     "rollover_required", "context_warning", "handoff_prepare", "high_risk",
   ]) out.states[state] = localizedText(`hud_state_${state}`);
@@ -1096,6 +1096,24 @@ const pendingOutputByPane = new Map(); // `${storeKey}::${pane}` -> output
 let pushWorkspaceCatalog = [];
 let pushWorkspaceCatalogAt = 0;
 let stateFetchInFlight = null;
+let localRuntimeReachable = null;
+let localRuntimeCheckedAt = 0;
+
+function noteLocalRuntimeReachability(reachable) {
+  localRuntimeReachable = reachable === true;
+  localRuntimeCheckedAt = Date.now();
+}
+
+async function automationRuntimeGate() {
+  const state = await fetchStateFresh();
+  if (state?.ok === true) return { ok: true, state };
+  return {
+    ok: false,
+    reason: "local_runtime_unavailable",
+    error: state?.error || (state?.status ? `HTTP ${state.status}` : "local-runtime-unavailable"),
+    state,
+  };
+}
 
 function cachePushWorkspaceCatalog(workspaces) {
   if (!Array.isArray(workspaces)) return;
@@ -1169,6 +1187,7 @@ async function runPushStream(ctrl) {
       if (connectTimer) clearTimeout(connectTimer);
       connectTimer = null;
       if (opened.status < 200 || opened.status >= 300) {
+        noteLocalRuntimeReachability(false);
         callLog(`push native HTTP ${opened.status}; retrying in ${backoff}ms`);
         stream.close();
         await sleep(backoff);
@@ -1176,13 +1195,16 @@ async function runPushStream(ctrl) {
         continue;
       }
       backoff = 2000;
+      noteLocalRuntimeReachability(true);
       callLog(`push connected (shared native stream via ${opened.transport})`);
       await stream.done;
       buf += decoder.decode();
       drainBlocks();
+      noteLocalRuntimeReachability(false);
       callLog(`push stream ended; reconnecting in ${backoff}ms`);
     } catch (e) {
       if (ctrl.signal.aborted || !runtimeAlive()) break;
+      noteLocalRuntimeReachability(false);
       callLog(`push disconnected (${e.message}); retrying in ${backoff}ms`);
     } finally {
       if (connectTimer) clearTimeout(connectTimer);
@@ -1703,11 +1725,15 @@ async function tickProgress(storeKey, ts) {
       return;
     }
     callLog(`progress send: ws=${ws} → ${storeKey} (${decision.reason})`);
-    await routeWake(curB, {
+    const routed = await routeWake(curB, {
       status: curB.status,
       output,
       working_count: Object.keys(workingPaneMap(curB)).length,
     }, CFG.progressTemplate || defaultProgressTemplate());
+    if (!routed?.ok) {
+      callLog(`progress blocked: ws=${ws} (${routed?.reason || routed?.error || "wake_failed"})`);
+      return;
+    }
     ts.lastSentAt = Date.now();
     ts.lastOutputSent = String(output || "").trim();
     ts.hasProgressSent = true;
@@ -1740,6 +1766,11 @@ function reconcileProgressTimers(bindings) {
 
 async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTemplate(), wakeKind = null) {
   if (!automationEnabledForBinding(b)) return { ok: false, reason: "disabled" };
+  const runtimeGate = await automationRuntimeGate();
+  if (!runtimeGate.ok) {
+    callLog(`auto wake blocked: local runtime unavailable (${runtimeGate.error})`);
+    return runtimeGate;
+  }
   const handoffs = await loadHandoffTransfers();
   if (activeTransferFromSource(handoffs, bindingDeliveryConvKey(b) || b?.convKey || "")) {
     return { ok: false, reason: "handoff_active" };
@@ -2328,6 +2359,12 @@ async function seedHandoffIntoTarget(transferId, targetTabId) {
   const transfers = await loadHandoffTransfers();
   const transfer = transfers[transferId];
   if (!transfer?.handoff_text) return { ok: false, error: "handoff_packet_missing" };
+  if (transfer.trigger !== "manual") {
+    const runtimeGate = await automationRuntimeGate();
+    if (!runtimeGate.ok) {
+      return { ok: false, error: "local_runtime_unavailable", reason: runtimeGate.reason };
+    }
+  }
   const seed = buildHandoffSeed({
     transferId,
     packet: transfer.handoff_text,
@@ -2392,6 +2429,12 @@ async function launchHandoffTarget(transferId) {
   const transfer = transfers[transferId];
   const launchUrl = transfer?.handoff_launch_url || transfer?.project_launch_url || null;
   if (!transfer?.handoff_text || !launchUrl) return { ok: false, error: "handoff_not_ready" };
+  if (transfer.trigger !== "manual") {
+    const runtimeGate = await automationRuntimeGate();
+    if (!runtimeGate.ok) {
+      return { ok: false, error: "local_runtime_unavailable", reason: runtimeGate.reason };
+    }
+  }
   await markTransfer(transferId, { status: "target_opening", error: null });
   let tab;
   try {
@@ -2565,6 +2608,12 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   if (trigger !== "manual" && !sourceAutomation.enabled) {
     return { ok: false, error: "automation_disabled" };
   }
+  if (trigger !== "manual") {
+    const runtimeGate = await automationRuntimeGate();
+    if (!runtimeGate.ok) {
+      return { ok: false, error: "local_runtime_unavailable", reason: runtimeGate.reason };
+    }
+  }
   const bindings = await loadBindings();
   const session = bindingsForConv(bindings, convInfo.convKey);
   if (!session.length) return { ok: false, error: "binding_required" };
@@ -2713,6 +2762,23 @@ async function handleHandoffTurnEnded(msg) {
     const failed = await markTransfer(transfer.id, { status: "failed", error: "handoff_packet_invalid" });
     return { handled: true, ok: false, error: "handoff_packet_invalid", handoff: handoffView(failed) };
   }
+  if (transfer.trigger !== "manual") {
+    const runtimeGate = await automationRuntimeGate();
+    if (!runtimeGate.ok) {
+      const paused = await markTransfer(transfer.id, {
+        status: "summary_ready",
+        handoff_text: disposition.packet,
+        error: "local_runtime_unavailable",
+      });
+      return {
+        handled: true,
+        ok: false,
+        pending: true,
+        error: "local_runtime_unavailable",
+        handoff: handoffView(paused),
+      };
+    }
+  }
   const ready = await markTransfer(transfer.id, {
     status: "summary_ready",
     handoff_text: disposition.packet,
@@ -2859,14 +2925,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
   if (msg?.type === "h2w_automation_state") {
-    const scope = automationScopeForConversation(String(msg.convKey || "").trim());
-    sendResponse({
-      ok: true,
-      ...scope,
-      autoAllow: true,
-      labels: hudLabels(),
-    });
-    return;
+    void (async () => {
+      const scope = automationScopeForConversation(String(msg.convKey || "").trim());
+      const runtimeGate = await automationRuntimeGate();
+      const runtimeAvailable = runtimeGate.ok === true;
+      sendResponse({
+        ok: true,
+        ...scope,
+        preference_enabled: scope.enabled,
+        enabled: scope.enabled && runtimeAvailable,
+        effective_enabled: scope.enabled && runtimeAvailable,
+        runtime_available: runtimeAvailable,
+        runtime_checked_at: localRuntimeCheckedAt || null,
+        autoAllow: true,
+        labels: hudLabels(),
+      });
+    })();
+    return true;
   }
   if (msg?.type === "h2w_open_options") {
     void chrome.runtime.openOptionsPage()
@@ -2905,6 +2980,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         locale: getLocale(),
         labels: hudLabels(),
         enabled: automation.enabled,
+        effective_enabled: automation.enabled && localRuntimeReachable === true,
+        runtime_available: localRuntimeReachable === true,
+        runtime_checked_at: localRuntimeCheckedAt || null,
         automation_mode: automation.global_mode,
         project_id: automation.project_id,
         project_automation_available: automation.project_automation_available,
@@ -3277,11 +3355,16 @@ async function fetchStateFresh() {
   try {
     const url = `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/push/state`;
     const resp = await localHerdrFetch(url, { nativeTimeoutMs: STATE_FETCH_MS });
-    if (!resp.ok) return { ok: false, status: resp.status };
+    if (!resp.ok) {
+      noteLocalRuntimeReachability(false);
+      return { ok: false, status: resp.status };
+    }
     const body = await resp.json();
+    noteLocalRuntimeReachability(true);
     if (Array.isArray(body?.workspaces)) cachePushWorkspaceCatalog(body.workspaces);
     return { ok: true, source: "push_state", ...body };
   } catch (e) {
+    noteLocalRuntimeReachability(false);
     return { ok: false, error: String(e?.message || e || "native-transport-failed") };
   }
 }

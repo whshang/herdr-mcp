@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.60";
+const H2W_CONTENT_VERSION = "0.1.61";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -916,6 +916,10 @@ const H2W_CONTENT_VERSION = "0.1.60";
       }
       if (msg?.type === "h2w_wake") {
         (async () => {
+          if (!(await refreshAutomationState())) {
+            sendResponse({ ok: false, blocked: "local-runtime-unavailable" });
+            return;
+          }
           await ensureConversationHealth();
           const result = await performWake(msg.data || {});
           if (result.ok && CONVERSATION_HEALTH) {
@@ -1443,6 +1447,10 @@ const H2W_CONTENT_VERSION = "0.1.60";
       if (healthCheckInFlight || !conversationHealth || !RECOVERY_CONTROLLER) return;
       healthCheckInFlight = true;
       void (async () => {
+        // Refresh the effective automation state before every recovery cycle.
+        // A saved Auto-on preference must fail closed as soon as the local
+        // Herdr runtime becomes unreachable.
+        await refreshAutomationState();
         if (await maybeRecoverExplicitThreadError()) return;
         if (await maybeRecoverDisconnectedReply()) return;
         const next = RECOVERY_CONTROLLER.classifyReplyTimeout(conversationHealth);
@@ -1682,6 +1690,51 @@ const H2W_CONTENT_VERSION = "0.1.60";
   let hudEls = null;
   let hudExpanded = false;
   let hudActionBusy = false;
+  let nativeConversationTitle = "";
+  let renderedHerdrTitle = "";
+  let titleSnapshot = null;
+  let titleObserver = null;
+
+  function cleanConversationTitle(value) {
+    return normText(value)
+      .replace(/\s+[-–—|]\s+(ChatGPT|Claude|DeepSeek|Z\.AI)$/i, "")
+      .trim();
+  }
+
+  function captureNativeConversationTitle() {
+    const current = normText(document.title);
+    if (!current || current === renderedHerdrTitle) return;
+    nativeConversationTitle = cleanConversationTitle(current) || current;
+  }
+
+  function syncDocumentTitle(hud, state) {
+    captureNativeConversationTitle();
+    const status = hudLabels?.states?.[state] || state || hudLabels?.states?.unknown || "unknown";
+    const project = hud?.workspace_label || hud?.workspace_id || hudLabels?.states?.unbound || "unbound";
+    const conversation = nativeConversationTitle || ADAPTER.name || "conversation";
+    const next = [status, project, conversation].map((value) => normText(value)).filter(Boolean).join("-");
+    titleSnapshot = { hud, state };
+    if (!next || document.title === next) {
+      renderedHerdrTitle = next;
+      return;
+    }
+    renderedHerdrTitle = next;
+    document.title = next;
+  }
+
+  function startDocumentTitleSync() {
+    captureNativeConversationTitle();
+    if (titleObserver || typeof MutationObserver !== "function") return;
+    const target = document.head || document.documentElement;
+    if (!target) return;
+    titleObserver = new MutationObserver(() => {
+      const current = normText(document.title);
+      if (!current || current === renderedHerdrTitle) return;
+      nativeConversationTitle = cleanConversationTitle(current) || current;
+      if (titleSnapshot) syncDocumentTitle(titleSnapshot.hud, titleSnapshot.state);
+    });
+    titleObserver.observe(target, { subtree: true, childList: true, characterData: true });
+  }
 
   function parseHudSec(value, fallback) {
     if (value === "" || value === undefined || value === null) return fallback;
@@ -1702,6 +1755,7 @@ const H2W_CONTENT_VERSION = "0.1.60";
   }
 
   function hudBoundRuntimeState(hud) {
+    if (hud?.runtime_available === false) return "offline";
     const bindings = Array.isArray(hud?.bindings) ? hud.bindings : [];
     if (!hud?.bound || !bindings.length) return hud?.bound ? "bound" : "unbound";
     if (bindings.some((b) => b?.status === "working" || Number(b?.working_count) > 0)) return "working";
@@ -1798,16 +1852,18 @@ const H2W_CONTENT_VERSION = "0.1.60";
         enabled: on,
       });
       if (result?.ok) {
-        automationEnabled = on;
+        automationEnabled = on && hudCache?.runtime_available === true;
         hudCache = {
           ...(hudCache || {}),
           enabled: on,
-          idleNudgeEnabled: on,
+          effective_enabled: automationEnabled,
+          idleNudgeEnabled: automationEnabled,
           project_automation_enabled: projectMode ? on : hudCache?.project_automation_enabled,
           conversation_automation_enabled: conversationMode ? on : hudCache?.conversation_automation_enabled,
         };
         syncAutomationPermissionWatch();
         paintPageHud({ hud: hudCache });
+        await refreshPageHud();
         showHudToast(on ? hudText("automation_enabled") : hudText("automation_disabled"), "ok");
       } else {
         showHudToast(hudText("automation_update_failed"), "err");
@@ -2226,6 +2282,7 @@ const H2W_CONTENT_VERSION = "0.1.60";
 
   function hudVisualClass(state) {
     if (["working", "idle", "done", "blocked"].includes(state)) return state;
+    if (state === "offline") return "failed";
     if (state === "reply_waiting") return "waiting";
     if (["reply_suspect", "recovery_message_sent", "reload_pending", "recovering", "rollover_recommended", "rollover_required"].includes(state)) {
       return "recovering";
@@ -2249,9 +2306,11 @@ const H2W_CONTENT_VERSION = "0.1.60";
     // in the tooltip through the separate recovery field below.
     const runtimeState = hudBoundRuntimeState(hud);
     const continuity = hud?.continuity || null;
-    const state = continuity?.state && continuity.state !== "healthy"
-      ? continuity.state
-      : runtimeState;
+    const state = hud?.runtime_available === false
+      ? "offline"
+      : continuity?.state && continuity.state !== "healthy"
+        ? continuity.state
+        : runtimeState;
     const lastEvent = hud?.last?.reason
       ? `${hudText(`reason_${hud.last.reason}`, null, hud.last.reason)}${hud.last.at ? ` @ ${new Date(hud.last.at).toLocaleTimeString()}` : ""}`
       : null;
@@ -2268,10 +2327,12 @@ const H2W_CONTENT_VERSION = "0.1.60";
     } else {
       ui.status.textContent = `Herdr ● ${hudLabels?.states?.[state] || state}`;
     }
-    const enabled = hud?.enabled === true;
-    automationEnabled = enabled;
+    const preferenceEnabled = hud?.enabled === true;
+    const effectiveEnabled = hud?.effective_enabled === true;
+    automationEnabled = effectiveEnabled;
     automationAutoAllow = hud?.autoAllow !== false;
     syncAutomationPermissionWatch();
+    syncDocumentTitle(hud, state);
     ui.workspace.textContent = hud?.workspace_label || (hud?.bound
       ? hudText("bound_count", { count: hud.binding_count || 1 })
       : (hudLabels?.states?.unbound || ""));
@@ -2295,14 +2356,14 @@ const H2W_CONTENT_VERSION = "0.1.60";
     ui.quick.hidden = hud?.project_automation_available !== true
       && hud?.conversation_automation_available !== true;
     syncHudHandoffButton();
-    ui.quick.textContent = enabled ? hudText("automation_on", null, "Auto on") : hudText("automation_off", null, "Auto off");
-    ui.quick.className = `quick ${enabled ? "on" : "off"}`;
-    ui.quick.setAttribute("aria-pressed", String(enabled));
+    ui.quick.textContent = preferenceEnabled ? hudText("automation_on", null, "Auto on") : hudText("automation_off", null, "Auto off");
+    ui.quick.className = `quick ${preferenceEnabled ? "on" : "off"}`;
+    ui.quick.setAttribute("aria-pressed", String(preferenceEnabled));
     ui.quick.setAttribute("aria-label", hudText("aria_toggle_automation"));
     const conversationAutomation = hud?.conversation_automation_available === true && !hud?.project_id;
     ui.quick.title = conversationAutomation
-      ? (enabled ? hudText("conversation_automation_on_hint") : hudText("conversation_automation_off_hint"))
-      : (enabled ? hudText("automation_on_hint") : hudText("automation_off_hint"));
+      ? (preferenceEnabled ? hudText("conversation_automation_on_hint") : hudText("conversation_automation_off_hint"))
+      : (preferenceEnabled ? hudText("automation_on_hint") : hudText("automation_off_hint"));
     ui.expand.setAttribute("aria-label", hudText("aria_open_controls"));
     ui.expand.title = hudText("aria_open_controls");
     ui.conversation.textContent = ADAPTER.getConversationKey();
@@ -2314,7 +2375,7 @@ const H2W_CONTENT_VERSION = "0.1.60";
     }
     renderHudWorkspaceBindings();
     const visual = hudVisualClass(state);
-    ui.bar.className = `bar${enabled ? " automation-on" : ""}${visual ? ` ${visual}` : ""}`;
+    ui.bar.className = `bar${effectiveEnabled ? " automation-on" : ""}${visual ? ` ${visual}` : ""}`;
   }
 
   function shadowActiveElement(host) {
@@ -2328,6 +2389,7 @@ const H2W_CONTENT_VERSION = "0.1.60";
   }
 
   function startPageHud() {
+    startDocumentTitleSync();
     paintPageHud({ pending: false });
     void refreshPageHud();
     setInterval(() => {
