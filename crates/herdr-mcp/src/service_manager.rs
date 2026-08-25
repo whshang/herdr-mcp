@@ -48,6 +48,13 @@ mod macos {
     const SERVICE_IMPL: &str = "rust-v1";
     const DEFAULT_PORT: u16 = 8772;
     const HEALTH_BUDGET: Duration = Duration::from_secs(10);
+    const LAUNCHD_ABSENT_BUDGET: Duration = Duration::from_secs(2);
+    const BOOTSTRAP_RETRY_DELAYS: [Duration; 4] = [
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+        Duration::from_millis(1000),
+        Duration::from_millis(2000),
+    ];
 
     #[derive(Debug, Clone)]
     struct ServicePaths {
@@ -294,7 +301,7 @@ mod macos {
             }
             atomic_write(&paths.plist, &new_plist, 0o600)?;
             switch_current(paths, &generation)?;
-            bootstrap(&paths.plist)?;
+            bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
             wait_for_health(DEFAULT_PORT)?;
             store.activate_runtime_generation_with_rollback(
                 &generation.generation_id,
@@ -400,7 +407,7 @@ mod macos {
         if is_loaded(SERVICE_LABEL) {
             kickstart()?;
         } else {
-            bootstrap(&paths.plist)?;
+            bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
         }
         wait_for_health(DEFAULT_PORT)?;
         let evidence_recorded = record_action(paths, "start", "ok", &descriptor, None);
@@ -431,7 +438,7 @@ mod macos {
         if is_loaded(SERVICE_LABEL) {
             kickstart()?;
         } else {
-            bootstrap(&paths.plist)?;
+            bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
         }
         wait_for_health(DEFAULT_PORT)?;
         let evidence_recorded = record_action(paths, "restart", "ok", &descriptor, None);
@@ -577,11 +584,11 @@ mod macos {
                 atomic_write(&paths.watchdog_plist, bytes, 0o600)?;
             }
             if rollback.server_was_loaded {
-                bootstrap(&paths.plist)?;
+                bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
                 wait_for_service_health(&source, DEFAULT_PORT)?;
             }
             if rollback.watchdog_was_loaded {
-                bootstrap(&paths.watchdog_plist)?;
+                bootstrap_with_retry(&paths.watchdog_plist, WATCHDOG_LABEL)?;
             }
             store.complete_service_rollback(
                 &rollback.rollback_id,
@@ -1039,10 +1046,10 @@ mod macos {
             atomic_write(&paths.watchdog_plist, bytes, 0o600)?;
         }
         if rollback.server_was_loaded && rollback.server_plist.is_some() {
-            bootstrap(&paths.plist)?;
+            bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
         }
         if rollback.watchdog_was_loaded && rollback.watchdog_plist.is_some() {
-            bootstrap(&paths.watchdog_plist)?;
+            bootstrap_with_retry(&paths.watchdog_plist, WATCHDOG_LABEL)?;
         }
         Ok(())
     }
@@ -1084,7 +1091,7 @@ mod macos {
         atomic_write(&paths.plist, current_plist, 0o600)?;
         restore_current(paths, Some(current_target))?;
         if current_was_loaded {
-            bootstrap(&paths.plist)?;
+            bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
             wait_for_health(DEFAULT_PORT)?;
         }
         Ok(())
@@ -1241,20 +1248,72 @@ mod macos {
             .is_ok_and(|output| output.status.success())
     }
 
-    fn bootstrap(plist: &Path) -> Result<(), String> {
-        run_launchctl([
-            OsStr::new("bootstrap"),
-            OsStr::new(&domain()),
-            plist.as_os_str(),
-        ])
+    fn wait_launchd_absent(label: &str, budget: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + budget;
+        loop {
+            if !is_loaded(label) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "launchd service {label} remained loaded for {}ms after bootout",
+                    budget.as_millis()
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn bootstrap_with_retry(plist: &Path, label: &str) -> Result<(), String> {
+        bootstrap_retry_with(
+            &BOOTSTRAP_RETRY_DELAYS,
+            || wait_launchd_absent(label, LAUNCHD_ABSENT_BUDGET),
+            || {
+                run_launchctl([
+                    OsStr::new("bootstrap"),
+                    OsStr::new(&domain()),
+                    plist.as_os_str(),
+                ])
+                .map(|_| ())
+            },
+            thread::sleep,
+        )
         .map(|_| ())
+    }
+
+    fn bootstrap_retry_with<Absent, Bootstrap, Sleep>(
+        delays: &[Duration],
+        mut wait_absent: Absent,
+        mut bootstrap: Bootstrap,
+        mut sleep: Sleep,
+    ) -> Result<usize, String>
+    where
+        Absent: FnMut() -> Result<(), String>,
+        Bootstrap: FnMut() -> Result<(), String>,
+        Sleep: FnMut(Duration),
+    {
+        let mut last_error = "launchctl bootstrap did not run".to_owned();
+        for attempt in 0..=delays.len() {
+            match wait_absent().and_then(|_| bootstrap()) {
+                Ok(()) => return Ok(attempt + 1),
+                Err(error) => last_error = error,
+            }
+            if let Some(delay) = delays.get(attempt).copied() {
+                sleep(delay);
+            }
+        }
+        Err(format!(
+            "launchctl bootstrap failed after {} attempts: {last_error}",
+            delays.len() + 1
+        ))
     }
 
     fn bootout(label: &str) -> Result<(), String> {
         if !is_loaded(label) {
             return Ok(());
         }
-        run_launchctl([OsStr::new("bootout"), OsStr::new(&target(label))]).map(|_| ())
+        run_launchctl([OsStr::new("bootout"), OsStr::new(&target(label))])?;
+        wait_launchd_absent(label, LAUNCHD_ABSENT_BUDGET)
     }
 
     fn kickstart() -> Result<(), String> {
@@ -1535,6 +1594,60 @@ mod macos {
                 "rollback must not follow backup symlinks"
             );
             fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn bootstrap_retry_absorbs_transient_launchd_io_errors() {
+            let delays = [
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                Duration::from_millis(3),
+            ];
+            let mut attempts = 0_usize;
+            let mut absent_checks = 0_usize;
+            let mut sleeps = Vec::new();
+            let result = bootstrap_retry_with(
+                &delays,
+                || {
+                    absent_checks += 1;
+                    Ok(())
+                },
+                || {
+                    attempts += 1;
+                    if attempts < 3 {
+                        Err("launchctl failed: Bootstrap failed: 5: Input/output error".to_owned())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |delay| sleeps.push(delay),
+            )
+            .unwrap();
+            assert_eq!(result, 3);
+            assert_eq!(attempts, 3);
+            assert_eq!(absent_checks, 3);
+            assert_eq!(sleeps, delays[..2]);
+        }
+
+        #[test]
+        fn bootstrap_retry_fails_closed_after_bounded_attempts() {
+            let delays = [Duration::from_millis(1), Duration::from_millis(2)];
+            let mut attempts = 0_usize;
+            let mut sleeps = Vec::new();
+            let error = bootstrap_retry_with(
+                &delays,
+                || Ok(()),
+                || {
+                    attempts += 1;
+                    Err(format!("bootstrap-{attempts}"))
+                },
+                |delay| sleeps.push(delay),
+            )
+            .unwrap_err();
+            assert_eq!(attempts, 3);
+            assert_eq!(sleeps, delays);
+            assert!(error.contains("failed after 3 attempts"));
+            assert!(error.contains("bootstrap-3"));
         }
     }
 }
