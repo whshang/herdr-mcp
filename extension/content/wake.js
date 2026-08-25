@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.57";
+const H2W_CONTENT_VERSION = "0.1.58";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -1551,8 +1551,8 @@ const H2W_CONTENT_VERSION = "0.1.57";
     hudEls.handoff.hidden = hud?.manual_handoff_available !== true;
     hudEls.handoff.textContent = handoffButtonText(hud);
     hudEls.handoff.title = hudText("manual_handoff_hint");
-    hudEls.handoff.disabled = hudActionBusy || hud?.enabled === true || active || hud?.bound !== true;
-    hudEls.handoff.classList.toggle("locked", hud?.enabled === true);
+    hudEls.handoff.disabled = hudActionBusy || active || hud?.bound !== true;
+    hudEls.handoff.classList.toggle("locked", active);
     hudEls.handoff.setAttribute("aria-disabled", String(hudEls.handoff.disabled));
   }
 
@@ -1774,7 +1774,6 @@ const H2W_CONTENT_VERSION = "0.1.57";
 
   async function manualHandoffAction() {
     if (hudActionBusy) return { ok: false, error: "busy" };
-    if (hudCache?.enabled === true) return { ok: false, error: "automation_enabled" };
     setHudActionBusy(true);
     try {
       const result = await sendBg({ type: "h2w_handoff_start", trigger: "manual" });

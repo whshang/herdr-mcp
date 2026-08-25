@@ -5,7 +5,7 @@
 
 | 主线 | 问题 | 方向 | 状态 | 首批站点 |
 |---|---|---|---|---|
-| **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + 自动化 gate + 安全接力 | **已可用**（当前 0.1.57 系列） | 绑定/观察：4 站；ChatGPT Project 共享自动化；普通 ChatGPT / z.ai / DeepSeek 会话级自动化；手动接力：ChatGPT Project + z.ai `/c/<chat_id>` |
+| **A. 网页连续工作** | 网页派活后会停住；回复可能超时或只显示半截；长对话最终需要换会话 | Herdr 状态观察 + 网页会话绑定 + 手动继续 + 自动化 gate + 安全接力 | **已可用**（当前 0.1.58 系列） | 绑定/观察：4 站；ChatGPT Project 共享自动化；普通 ChatGPT / z.ai / DeepSeek 会话级自动化；手动接力：ChatGPT Project + z.ai `/c/<chat_id>` |
 | **B. JSON→MCP** | DeepSeek / z.ai 网页没有 MCP Connector | 网页 → 扩展 service worker → Native Messaging host → 受信任本机 `/mcp` IPC | **已可用**（bounded `tools/list` / `tools/call` loop） | `chat.deepseek.com`、`chat.z.ai` |
 
 共享：同一扩展、同一 Native Messaging + 本机 Unix IPC transport、同一 options。
@@ -73,13 +73,13 @@ Options 的总开关**只控制 ChatGPT Project 共享自动化是否可用**：
 
 从 0.1.45 起，当前 Project 或单会话作用域实际处于 **`自动 开`** 时，整条底部 HUD 使用浅绿色背景、绿色顶边与轻微绿色阴影作为常驻视觉提示；`自动 关` 时仍使用中性色。该绿色只表达“自动化已启用”，不会覆盖 `working / blocked / recovering / failed` 等运行状态的橙色或红色告警语义。深色模式使用低亮度绿色表面，避免长期常驻时刺眼。
 
-四个人工操作在当前作用域 `自动 关` 时按能力可用；一旦该 Project/会话 `自动 开`，HUD 手动操作全部锁定，避免手动/自动重复推进：
+手动继续、herdr监控、LLM 分析在当前作用域 `自动 关` 时按能力可用；一旦该 Project/会话 `自动 开`，这三项会锁定，避免手动/自动重复推进。**手动接力是唯一例外**：支持接力的会话在 `自动 开/关` 两种状态下都可启动，并把当前 Auto 状态带到新会话：
 
 - **手动继续**：直接向当前网页会话发送一次“继续”请求，不自动点击权限卡。
 - **herdr监控**：先读取当前绑定 workspace 的 Herdr 窗口、pane、Agent 与运行状态，再把状态带回网页会话继续编排。
 - **LLM 分析**：用 Options 里配置的小模型判断当前助手回复是否还需要继续；只有判断为继续时才提交继续消息。
 
-**手动接力**支持已绑定 ChatGPT Project 与已落成 `/c/<chat_id>` 的 z.ai 会话，且必须先切到 `自动 关`。前端会锁定按钮，background 也会再次拒绝 `automation_enabled`，因此不能绕过 HUD 与自动流程并发接力。点击后仍复用同一 fail-closed handoff 状态机；z.ai 的 summary/seed 走 raw 通道绕过 JSON bridge。只有确认新会话 id 与 seed marker 后才迁移 workspace binding；workspace 仍在 `working` 时同样拒绝开始。已有 transfer 时按钮显示“压缩中… / 接力中… / 恢复接力”。
+**手动接力**支持已绑定 ChatGPT Project 与已落成 `/c/<chat_id>` 的 z.ai 会话，`自动 开/关` 两种状态都可启动。handoff 开始时快照源会话 Auto 状态；确认新会话 id 与 seed marker 后，workspace binding 与 Auto 继承一起提交。handoff 活跃期间会抑制源会话的自动 wake，避免普通连续工作消息与 summary/seed 竞争；z.ai 的 summary/seed 走 raw 通道绕过 JSON bridge。workspace 仍在 `working` 时同样拒绝开始。已有 transfer 时按钮显示“压缩中… / 接力中… / 恢复接力”。
 
 Project `自动 开` 是当前 Project 的执行 gate。只有 Options 已选择“项目自动”时才显示。开启后允许自动执行：
 
@@ -108,7 +108,7 @@ Project `自动 开` 是当前 Project 的执行 gate。只有 Options 已选择
 
 ### A2. 长对话压缩与接力（ChatGPT Project）
 
-扩展从 0.1.39 起提供 fail-closed **接力 / Rollover**；0.1.43 加入 Project 级自动化 gate，0.1.44 接入 stale-view 恢复，0.1.46 把“手动接力”放到底部 HUD，0.1.47 将手动接力扩展到持久 z.ai chat 并要求先 `自动 关`。ChatGPT 的自动恢复/自动 rollover 仍是 Project 专属能力。
+扩展从 0.1.39 起提供 fail-closed **接力 / Rollover**；0.1.43 加入 Project 级自动化 gate，0.1.44 接入 stale-view 恢复，0.1.46 把“手动接力”放到底部 HUD，0.1.47 将手动接力扩展到持久 z.ai chat 且当时要求先 `自动 关`；0.1.58 取消该限制，并让 target 继承 source 的 Auto 状态。ChatGPT 的自动恢复/自动 rollover 仍是 Project 专属能力。
 
 工作流：
 
@@ -156,5 +156,5 @@ Project `自动 开` 是当前 Project 的执行 gate。只有 Options 已选择
 
 ## 验收口诀
 
-- **A**：ChatGPT Project `自动 开` 可执行完整 working/settled、LLM、stale-view、自动 rollover；z.ai / DeepSeek `自动 开` 只自动回推 working/settled。需要手动接力时先 `自动 关`；已绑定 ChatGPT Project 或持久 z.ai `/c/<chat_id>` 才可执行。
+- **A**：ChatGPT Project `自动 开` 可执行完整 working/settled、LLM、stale-view、自动 rollover；z.ai / DeepSeek `自动 开` 只自动回推 working/settled。已绑定 ChatGPT Project 或持久 z.ai `/c/<chat_id>` 在 `自动 开/关` 两种状态都可手动接力，target 会继承当前 Auto 状态。
 - **B**：DeepSeek / z.ai 普通用户任务可以通过 JSON bridge 驱动本机 Herdr MCP 工具，并在 bounded round 内把结果回填给网页模型。

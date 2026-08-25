@@ -17,7 +17,7 @@ B 线与 A 线并列：`chat.deepseek.com` / `chat.z.ai` 中的普通用户任�
   -> 网页模型继续调用工具或正常回答
 ```
 
-## 当前状态（0.1.57）
+## 当前状态（0.1.58）
 
 | 能力 | 状态 |
 |---|---|
@@ -29,7 +29,7 @@ B 线与 A 线并列：`chat.deepseek.com` / `chat.z.ai` 中的普通用户任�
 | 工具结果清洗 / 大二进制省略 / 长度上限 | **已可用** |
 | Herdr 凭据不进入网页 JavaScript 或 service worker | **已可用** — 当前版本使用 Native Messaging + 权限 `0600` 的 Unix IPC；旧版本 bearer 兼容仅保留在 native host/server 内部 |
 | z.ai / DeepSeek 会话级 `自动 开/关`，控制 Herdr progress/settled 自动回推 | **已可用**（需全局允许自动化） |
-| 已落成 z.ai `/c/<chat_id>` 的“手动接力” | **已可用**（必须 `自动 关`；接力控制消息绕过 JSON bridge） |
+| 已落成 z.ai `/c/<chat_id>` 的“手动接力” | **已可用**（`自动 开/关` 均可；新会话继承源会话 Auto 状态；接力控制消息绕过 JSON bridge） |
 | 刷新/重载后的未完成工具 JSON 恢复 | **已可用** — 若最后一条真实会话消息仍是 assistant 的 Herdr tool-call JSON，且前文存在 bridge 上下文，会自动继续执行 |
 | 长 JSON→MCP 链路 | **已可用** — 第 12 轮只作为调度让出点；只有 assistant 返回正常非工具答案才算完成 |
 
@@ -67,4 +67,4 @@ Content bridge 给网页模型一个 typed catalog，并要求工具调用回复
 
 A 线可以同时把 z.ai / DeepSeek conversation 绑定到 Herdr workspace 做 progress/done 回推，B 线负责本机 MCP 工具调用。会话级 `自动 开/关` 只控制自动 progress/settled 回推，不会开启 ChatGPT 专属 stale-view 恢复、回合结束 LLM 判断或自动 rollover。
 
-持久 z.ai conversation 只有在 `自动 关` 时才能使用 **手动接力**。summary / seed 通过 bridge 的 raw 通道发送，因此接力控制文案不会被重新包装成 coding-agent task。只有新 z.ai chat 已形成新的 `/c/<chat_id>` 且 seed marker 得到确认后，workspace binding 才迁移过去。
+持久 z.ai conversation 在 `自动 开/关` 两种状态下都可以使用 **手动接力**。handoff 启动时会快照源会话 Auto 状态，新 chat 会继承该状态；summary / seed 通过 bridge 的 raw 通道发送，因此接力控制文案不会被重新包装成 coding-agent task。只有新 z.ai chat 已形成新的 `/c/<chat_id>` 且 seed marker 得到确认后，workspace binding 才迁移过去。

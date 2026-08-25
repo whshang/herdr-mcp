@@ -107,12 +107,12 @@ ChatGPT 长对话不会把全部历史消息长期留在 DOM。真实 UAT 中，
 
 ## 手动接力（0.1.47）
 
-底部 HUD 的 **手动接力**用于主动提前换会话，但必须先把当前会话切到 `自动 关`：
+底部 HUD 的 **手动接力**用于主动提前换会话，`自动 开/关` 两种状态都可以启动；target 会继承 source 的 Auto 状态：
 
 - 支持已绑定的 ChatGPT Project conversation，以及已经落成稳定 `/c/<chat_id>` 的 z.ai conversation；z.ai 根页 `/` 只是新聊天启动页，不显示手动接力。
 - 点击后调用 `h2w_handoff_start(trigger=manual)`，先让当前网页模型生成带 transfer-id 的紧凑 handoff packet。
 - z.ai 的 summary / seed 通过 raw 通道发送，明确绕过 JSON→MCP bridge，避免接力控制消息被改写成 coding-agent task。
-- 绑定 workspace 仍在 `working` 时拒绝开始，避免 settled/wake 与 binding cutover 竞争；`自动 开` 时前端按钮锁定，background 也会再次返回 `automation_enabled`，不能绕过 HUD 并发触发。
+- 绑定 workspace 仍在 `working` 时拒绝开始，避免 settled/wake 与 binding cutover 竞争；handoff 一旦进入活跃状态，源会话的自动 wake 会暂停，直到 cutover 或恢复流程结束。
 - ChatGPT 在同一个 Project 打开新 conversation；z.ai 从 `/` 启动新聊天。只有确认目标会话已经形成新的 conversation id 且 seed marker 真正存在后，才把 workspace binding 从旧 conversation 迁到新 conversation。
 - 已有接力任务时按钮显示 **压缩中… / 接力中… / 恢复接力**，避免重复创建 transfer；`seed_uncertain` 时可用“恢复接力”继续 fail-closed 恢复。
 - z.ai 从根页 `/` 首次落成 `/c/<chat_id>` 时，临时 binding 与会话自动化偏好只迁移这一次；之后从 `/c/A` 切到 `/c/B` 不会跟随迁移。

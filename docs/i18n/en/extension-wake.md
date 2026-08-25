@@ -107,12 +107,12 @@ Live automatic-rollover UAT exposed a timing race immediately after the 51st obs
 
 ## Manual handoff (0.1.47)
 
-The bottom-HUD **Manual handoff** action lets the user roll over early, but the current conversation must first be switched to `Auto off`:
+The bottom-HUD **Manual handoff** action lets the user roll over early with Auto either on or off. The target inherits the source Auto state:
 
 - it supports bound ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations; z.ai `/` is only the new-chat launcher and does not show Manual handoff;
 - clicking it reuses `h2w_handoff_start(trigger=manual)` and first asks the current web model for a compact transfer-id-marked handoff packet;
 - z.ai summary and seed control messages use the raw send path and explicitly bypass the JSON→MCP bridge, so they cannot be rewritten into coding-agent tasks;
-- if a bound workspace is still `working`, the operation is rejected to avoid racing settled/wake delivery against binding cutover; with `Auto on`, the button is locked and background independently returns `automation_enabled` if the UI is bypassed;
+- if a bound workspace is still `working`, the operation is rejected to avoid racing settled/wake delivery against binding cutover; once a handoff is active, automatic wakes from the source conversation are suppressed until cutover or recovery completes;
 - ChatGPT opens a fresh conversation in the same Project; z.ai launches from `/`. Workspace bindings move only after a new conversation id exists and the seed marker is confirmed;
 - an in-flight transfer changes the button to **Compressing… / Moving… / Resume handoff** instead of creating a duplicate transfer; `seed_uncertain` can be resumed through the same fail-closed recovery path;
 - when a z.ai root chat first becomes `/c/<chat_id>`, its temporary binding and automation preference migrate once; later navigation from `/c/A` to `/c/B` never drags the binding along.

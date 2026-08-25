@@ -17,7 +17,7 @@ web task
   -> web model either calls another tool or answers normally
 ```
 
-## Current state (0.1.57)
+## Current state (0.1.58)
 
 | Capability | Status |
 |---|---|
@@ -29,7 +29,7 @@ web task
 | tool-result sanitization / large binary omission / size bound | **available** |
 | no Herdr credential in page JavaScript or the service worker | **available** — current builds use Native Messaging plus mode-`0600` Unix IPC; bearer compatibility stays inside the native host/server for older versions |
 | z.ai / DeepSeek conversation-scoped `Auto on/off` for Herdr progress/settled push-back | **available** when global automation is permitted |
-| persisted z.ai `/c/<chat_id>` Manual handoff | **available** with `Auto off`; handoff control messages bypass this bridge |
+| persisted z.ai `/c/<chat_id>` Manual handoff | **available** with Auto on or off; the fresh chat inherits the source Auto state and handoff control messages bypass this bridge |
 | unfinished tool JSON recovery after refresh/reload | **available** — if the last real conversation message is assistant Herdr tool-call JSON and bridge context exists, execution resumes automatically |
 | long JSON→MCP chains | **available** — round 12 is only a scheduler-yield checkpoint; completion means a normal non-tool assistant answer |
 
@@ -67,4 +67,4 @@ A temporary binding or conversation-automation preference on the root launcher m
 
 Track A can bind the same z.ai / DeepSeek conversation for Herdr progress/done push-back while Track B handles local MCP tool calls. The conversation-level `Auto on/off` controls automatic progress/settled push-back; it does not enable ChatGPT-only stale-view recovery, post-turn LLM decisions, or automatic rollover.
 
-Persisted z.ai chats can use **Manual handoff** only with `Auto off`. The summary and seed are sent through the bridge's raw channel, so continuity-control text is not rewritten into a coding-agent task. Workspace bindings move only after the fresh z.ai chat has a new `/c/<chat_id>` and the seed marker is confirmed.
+Persisted z.ai chats can use **Manual handoff** with Auto either on or off. The source Auto state is snapshotted when handoff starts and inherited by the fresh chat. The summary and seed are sent through the bridge's raw channel, so continuity-control text is not rewritten into a coding-agent task. Workspace bindings move only after the fresh z.ai chat has a new `/c/<chat_id>` and the seed marker is confirmed.

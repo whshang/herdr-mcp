@@ -26,7 +26,7 @@ import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 
-const H2W_SCRIPT_VERSION = "0.1.57";
+const H2W_SCRIPT_VERSION = "0.1.58";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -294,6 +294,32 @@ function automationScopeForConversation(convKey) {
 
 function automationEnabledForBinding(binding) {
   return automationScopeForConversation(binding?.convKey || binding?.tabUrl || "").enabled;
+}
+
+function inheritedAutomationStorageForTransfer(transfer, targetConvKey) {
+  const enabled = transfer?.source_automation_enabled === true;
+  const scope = String(transfer?.source_automation_scope || "");
+  if (scope === "project" && transfer?.project_id) {
+    const projectAutomation = { ...PROJECT_AUTOMATION };
+    if (enabled) projectAutomation[transfer.project_id] = true;
+    else delete projectAutomation[transfer.project_id];
+    return {
+      updates: { [PROJECT_AUTOMATION_STORAGE_KEY]: projectAutomation },
+      projectAutomation,
+      conversationAutomation: null,
+    };
+  }
+  if (scope === "conversation" && isConversationAutomationConversation(targetConvKey)) {
+    const conversationAutomation = { ...CONVERSATION_AUTOMATION };
+    if (enabled) conversationAutomation[targetConvKey] = true;
+    else delete conversationAutomation[targetConvKey];
+    return {
+      updates: { [CONVERSATION_AUTOMATION_STORAGE_KEY]: conversationAutomation },
+      projectAutomation: null,
+      conversationAutomation,
+    };
+  }
+  return { updates: {}, projectAutomation: null, conversationAutomation: null };
 }
 
 async function notifyAutomationChanged() {
@@ -1582,6 +1608,10 @@ function reconcileProgressTimers(bindings) {
 
 async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTemplate(), wakeKind = null) {
   if (!automationEnabledForBinding(b)) return { ok: false, reason: "disabled" };
+  const handoffs = await loadHandoffTransfers();
+  if (activeTransferFromSource(handoffs, b?.convKey || "")) {
+    return { ok: false, reason: "handoff_active" };
+  }
   const isLlmNudge = extra.status === "llm_continue_nudge";
   const rawText = String(template || "").trim();
 
@@ -1931,15 +1961,23 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
     if (next.status === "working") armProgressTimer(bindingStoreKey(targetInfo.convKey, ws), next);
   }
 
-  // Binding cutover is the authoritative commit point. Persist it before marking
-  // the transfer committed so a crash can be recovered idempotently above.
+  // Binding cutover and Auto inheritance are one logical commit. Persist both
+  // together before marking the transfer committed so a crash cannot leave the
+  // target bound with a different automation state from the source snapshot.
+  const inheritedAutomation = inheritedAutomationStorageForTransfer(transfer, targetInfo.convKey);
   try {
-    await chrome.storage.local.set({ herdrWakeBindings: bindings });
+    await chrome.storage.local.set({
+      herdrWakeBindings: bindings,
+      ...inheritedAutomation.updates,
+    });
   } catch (e) {
     await markTransfer(transferId, { status: "seed_uncertain", error: `binding_commit_failed:${e.message}` });
     return { ok: false, error: "binding_commit_failed" };
   }
+  if (inheritedAutomation.projectAutomation) PROJECT_AUTOMATION = inheritedAutomation.projectAutomation;
+  if (inheritedAutomation.conversationAutomation) CONVERSATION_AUTOMATION = inheritedAutomation.conversationAutomation;
   ensurePushStream(bindings);
+  reconcileProgressTimers(bindings);
   const done = await markTransfer(transferId, {
     status: "committed",
     target_conv_key: targetInfo.convKey,
@@ -1955,6 +1993,7 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
   try {
     if (targetTabId) chrome.tabs.sendMessage(targetTabId, { type: "h2w_handoff_committed", transferId, sourceConvKey: transfer.source_conv_key });
   } catch (_) {}
+  void notifyAutomationChanged();
   return { ok: true, transfer: handoffView(done) };
 }
 
@@ -2221,10 +2260,8 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   if (!convInfo?.manual_handoff_available || !convInfo?.handoff_launch_url) {
     return { ok: false, error: "handoff_conversation_required" };
   }
-  if (trigger === "manual" && automationScopeForConversation(convInfo.convKey).enabled) {
-    return { ok: false, error: "automation_enabled" };
-  }
-  if (trigger !== "manual" && !automationScopeForConversation(convInfo.convKey).enabled) {
+  const sourceAutomation = automationScopeForConversation(convInfo.convKey);
+  if (trigger !== "manual" && !sourceAutomation.enabled) {
     return { ok: false, error: "automation_disabled" };
   }
   const bindings = await loadBindings();
@@ -2311,6 +2348,8 @@ async function startHandoffForTab(tabId, trigger = "manual") {
     handoff_launch_url: convInfo.handoff_launch_url,
     source_bindings: transferSourceSnapshot(session),
     source_assistant_fp: sourceAssistantFp,
+    source_automation_scope: convInfo.project_id ? "project" : "conversation",
+    source_automation_enabled: sourceAutomation.enabled === true,
     handoff_text: null,
     target_tab_id: null,
     target_conv_key: null,

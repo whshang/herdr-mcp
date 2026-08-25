@@ -27,7 +27,7 @@ After reload, newer content or resumed streaming ends recovery. If the identical
 
 ## Manual handoff is unavailable, or stays on Compressing / Moving
 
-Version 0.1.47 exposes **Manual handoff** for bound ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations. z.ai `/`, plain ChatGPT `/c/<id>`, Claude, and DeepSeek do not show it. Turn `Auto off` first: with automation on the HUD locks the button and background independently rejects `automation_enabled`. If a bound workspace still has an agent `working`, the background also rejects the handoff because binding cutover must not race settled/wake delivery.
+Version 0.1.58 allows **Manual handoff** for bound ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations with Auto either on or off; the fresh target inherits the source Auto state. z.ai `/`, plain ChatGPT `/c/<id>`, Claude, and DeepSeek do not show the button. If a bound workspace still has an agent `working`, the background rejects the handoff because binding cutover must not race settled/wake delivery. During an active handoff, source automatic wakes are suppressed.
 
 If z.ai is already on `/c/<chat_id>` but the HUD still looks like the root launcher, verify that 0.1.56 is loaded and refresh once. A temporary binding/automation preference created on z.ai `/` migrates once when the same tab first becomes `/c/<chat_id>`; later navigation between existing `/c/A` and `/c/B` chats never drags it along. z.ai handoff summary/seed messages use the raw send path and are not rewritten by the JSON→MCP bridge.
 

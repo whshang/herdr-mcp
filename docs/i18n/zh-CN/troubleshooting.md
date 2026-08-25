@@ -27,7 +27,7 @@
 
 ## “手动接力”按钮不可用，或一直显示“压缩中/接力中”
 
-0.1.47 的 **手动接力**支持已绑定 ChatGPT Project 和已经落成稳定 `/c/<chat_id>` 的 z.ai 会话；z.ai 根页 `/`、普通 ChatGPT `/c/<id>`、Claude、DeepSeek 不显示该按钮。当前作用域必须先切到 `自动 关`；`自动 开` 时按钮会锁定，background 也会拒绝 `automation_enabled`。绑定 workspace 仍有 agent `working` 时同样拒绝开始，因为接力不能和 settled/wake 的投递目标迁移竞争。
+从 0.1.58 起，**手动接力**支持已绑定 ChatGPT Project 和已经落成稳定 `/c/<chat_id>` 的 z.ai 会话在 `自动 开/关` 两种状态下启动，新 target 会继承 source 的 Auto 状态；z.ai 根页 `/`、普通 ChatGPT `/c/<id>`、Claude、DeepSeek 不显示该按钮。绑定 workspace 仍有 agent `working` 时同样拒绝开始，因为接力不能和 settled/wake 的投递目标迁移竞争；handoff 活跃期间源会话的自动 wake 会暂停。
 
 如果 z.ai 已经进入 `/c/<chat_id>` 但 HUD 仍像根页，请确认 0.1.56 已加载并刷新一次。新聊天在 `/` 上临时建立的 binding/自动化偏好会在首次落成 `/c/<chat_id>` 时迁移一次；之后在已有 `/c/A`、`/c/B` 之间切换不会跟着迁移。z.ai 的 handoff summary/seed 使用 raw 通道，不会被 JSON→MCP bridge 改写成 coding-agent task。
 

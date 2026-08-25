@@ -59,9 +59,9 @@ const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
-ok(manifest.version === "0.1.57", "manifest version includes handoff delivery reconciliation");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.57"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.57"'), "content version matches manifest");
+ok(manifest.version === "0.1.58", "manifest version includes handoff Auto inheritance");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.58"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.58"'), "content version matches manifest");
 ok(backgroundSource.includes("sendResponse({ ok: true, ...automationScopeForConversation(convKey) });")
     && backgroundSource.includes("void notifyAutomationChanged();")
     && wakeSource.includes("finally {\n      setHudActionBusy(false);"),
@@ -200,20 +200,23 @@ ok(
 ok(
   wakeSource.includes('class="handoff manual-handoff"')
     && wakeSource.includes("manualHandoffAction")
-    && wakeSource.includes("hud?.enabled === true || active")
-    && wakeSource.includes('if (hudCache?.enabled === true) return { ok: false, error: "automation_enabled" }')
+    && wakeSource.includes("hudActionBusy || active || hud?.bound !== true")
+    && !wakeSource.includes('if (hudCache?.enabled === true) return { ok: false, error: "automation_enabled" }')
     && wakeSource.includes("h2w_handoff_start")
     && wakeSource.includes('trigger: "manual"')
     && wakeSource.includes("h2w_handoff_seed")
     && wakeSource.includes("h2w_handoff_probe"),
-  "manual HUD handoff reuses recoverable internals and is locked while automation is on",
+  "manual HUD handoff stays available with Auto on and reuses recoverable internals",
 );
 ok(
   backgroundSource.includes("herdrConversationTransfers")
     && backgroundSource.includes("source_binding_set_changed")
     && backgroundSource.includes("seed_uncertain")
-    && backgroundSource.includes("commitHandoffTransfer"),
-  "background persists crash-safe handoff state and fail-closed binding cutover",
+    && backgroundSource.includes("commitHandoffTransfer")
+    && backgroundSource.includes("source_automation_enabled")
+    && backgroundSource.includes("inheritedAutomationStorageForTransfer")
+    && backgroundSource.includes('reason: "handoff_active"'),
+  "background persists crash-safe handoff state, Auto inheritance, and suppresses source wakes during cutover",
 );
 ok(
   wakeSource.includes("registerCurrentConversation")

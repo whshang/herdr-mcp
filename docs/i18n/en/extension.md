@@ -5,7 +5,7 @@ Language: product UI is en / Simplified Chinese / Japanese (same as herdr); this
 
 | Track | Problem | Direction | Status | First sites |
 |---|---|---|---|---|
-| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + automation gates + safe handoff | **usable** (0.1.57 series) | binding/observation: 4 sites; shared automation: ChatGPT Project; conversation-scoped automation: plain ChatGPT / z.ai / DeepSeek; Manual handoff: ChatGPT Project + z.ai `/c/<chat_id>` |
+| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + automation gates + safe handoff | **usable** (0.1.58 series) | binding/observation: 4 sites; shared automation: ChatGPT Project; conversation-scoped automation: plain ChatGPT / z.ai / DeepSeek; Manual handoff: ChatGPT Project + z.ai `/c/<chat_id>` |
 | **B. JSON→MCP** | DeepSeek / z.ai web has no MCP Connector | web → extension service worker → Native Messaging host → trusted local `/mcp` IPC | **usable** (bounded `tools/list` / `tools/call` loop) | `chat.deepseek.com`, `chat.z.ai` |
 
 Shared: same extension, same Native Messaging + local Unix IPC transport, same options.
@@ -80,9 +80,9 @@ Starting with 0.1.45, an effectively **`Auto on`** Project gives the entire pers
 - same-Project fail-closed rollover after recovery exhaustion or high context pressure
 - in-page ChatGPT permission-card handling as part of the current Project automation state; there is no separate permission-card toggle
 
-**Automation off** keeps observation active but stops automatic mutations for that Project/conversation. The Options Project gate adds that stop only to ChatGPT Project-shared automation; it does not disable plain ChatGPT, z.ai, or DeepSeek conversation Auto and does not delete any saved scope preference. Manual HUD actions are available only while their current scope is `Auto off`.
+**Automation off** keeps observation active but stops automatic mutations for that Project/conversation. The Options Project gate adds that stop only to ChatGPT Project-shared automation; it does not disable plain ChatGPT, z.ai, or DeepSeek conversation Auto and does not delete any saved scope preference. Manual continue / Herdr monitor / LLM analysis are available only while their current scope is `Auto off`; supported **Manual handoff** remains available in either Auto state.
 
-**Manual handoff** supports bound ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations, but the current scope must first be switched to `Auto off`. The HUD locks the button while automation is on, and background independently rejects `automation_enabled` if the UI is bypassed. The same fail-closed state machine asks the current web model for a marked transfer packet, opens a fresh target conversation, seeds it, and moves workspace bindings only after a new conversation id and seed marker are confirmed. z.ai summary/seed control messages use the raw send path so the JSON bridge cannot rewrite them into agent tasks. A bound workspace that is still `working` blocks the operation.
+**Manual handoff** supports bound ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations with Auto either on or off. At handoff start the extension snapshots the source Auto state; binding cutover and Auto inheritance are committed together after the target conversation id and seed marker are confirmed. While a handoff is active, automatic wakes from the source are suppressed so summary/seed traffic cannot race normal continuity. z.ai summary/seed control messages use the raw send path so the JSON bridge cannot rewrite them into agent tasks. A bound workspace that is still `working` blocks the operation.
 
 ### Page freshness / stale-view recovery
 
@@ -97,7 +97,7 @@ Before reload the extension persists the last assistant signature. After reload,
 
 ### A2. Long-conversation compression and rollover (ChatGPT Project)
 
-Extension 0.1.39 adds **Rollover**; 0.1.43 adds the Project automation gate; 0.1.44 adds stale-view recovery; 0.1.46 exposes Manual handoff; 0.1.47 extends explicit handoff to persisted z.ai chats and requires `Auto off` before any manual handoff. ChatGPT automatic recovery/rollover remains Project-only.
+Extension 0.1.39 adds **Rollover**; 0.1.43 adds the Project automation gate; 0.1.44 adds stale-view recovery; 0.1.46 exposes Manual handoff; 0.1.47 extends explicit handoff to persisted z.ai chats and initially required `Auto off`; 0.1.58 removes that restriction and carries the source Auto state into the target. ChatGPT automatic recovery/rollover remains Project-only.
 
 Flow:
 
@@ -145,5 +145,5 @@ See [extension-bridge.md](./extension-bridge.md).
 
 ## Acceptance mantra
 
-- **A**: ChatGPT Project `Auto on` enables full working/settled, LLM, stale-view and automatic rollover continuity; z.ai / DeepSeek `Auto on` enables the narrower working/settled push-back path. Manual handoff requires `Auto off` and a bound ChatGPT Project or persisted z.ai `/c/<chat_id>` conversation.
+- **A**: ChatGPT Project `Auto on` enables full working/settled, LLM, stale-view and automatic rollover continuity; z.ai / DeepSeek `Auto on` enables the narrower working/settled push-back path. Manual handoff is available with Auto on or off for a bound ChatGPT Project or persisted z.ai `/c/<chat_id>` conversation, and the target inherits that Auto state.
 - **B**: normal DeepSeek / z.ai tasks can drive local Herdr MCP tools through the JSON bridge, with bounded tool rounds and results fed back to the web model.

@@ -714,6 +714,44 @@ console.log("\n[z.ai manual handoff]");
     "z.ai manual handoff preserves continuity id across chat ids");
   ok(storage.herdrWakeBindings[targetKey]?.handoff_from === ZAI_SOURCE,
     "z.ai target binding records the predecessor chat");
+  ok(storage.herdrConversationAutomation?.[ZAI_TARGET] !== true,
+    "z.ai manual handoff preserves Auto off in the target chat");
+
+  // Repeat from the same source with conversation Auto explicitly on. Manual
+  // handoff must stay available and the fresh target must inherit Auto on.
+  delete storage.herdrWakeBindings[targetKey];
+  zaiTargetSeeded = false;
+  let resolveRebind;
+  const rebindP = new Promise((r) => { resolveRebind = r; });
+  onMsg({
+    type: "h2w_bind",
+    tabId: 370,
+    workspace_id: "wY",
+    workspace_label: "zai-handoff (wY)",
+  }, { tab: { id: 370, url: ZAI_SOURCE } }, (r) => resolveRebind(r));
+  await rebindP;
+  let resolveAutoOn;
+  const autoOnP = new Promise((r) => { resolveAutoOn = r; });
+  onMsg({
+    type: "h2w_set_project_automation",
+    convKey: ZAI_SOURCE,
+    site: "z.ai",
+    enabled: true,
+  }, { tab: { id: 370, url: ZAI_SOURCE } }, (r) => resolveAutoOn(r));
+  const autoOn = await autoOnP;
+  ok(autoOn?.ok === true && autoOn?.enabled === true,
+    "z.ai source can enable conversation Auto before manual handoff", JSON.stringify(autoOn));
+
+  let resolveAutoHandoff;
+  const autoHandoffP = new Promise((r) => { resolveAutoHandoff = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: 370, trigger: "manual" }, { tab: { id: 370, url: ZAI_SOURCE } }, (r) => resolveAutoHandoff(r));
+  const autoHandoff = await autoHandoffP;
+  ok(autoHandoff?.ok === true,
+    "z.ai manual handoff remains available while Auto is on", JSON.stringify(autoHandoff));
+  await new Promise((r) => setTimeout(r, 600));
+  ok(!!storage.herdrWakeBindings[targetKey], "z.ai Auto-on handoff still moves the workspace binding");
+  ok(storage.herdrConversationAutomation?.[ZAI_TARGET] === true,
+    "z.ai manual handoff preserves Auto on in the target chat");
 }
 
 // ---- Scenario 7: Project handoff keeps source authoritative until target seed is confirmed ----
@@ -781,13 +819,6 @@ console.log("\n[project handoff]");
   ok(hudAllow?.enabled === true && hudAllow?.autoAllow === true,
     "legacy autoAllow=false cannot disable permission handling inside Project automation", JSON.stringify(hudAllow));
 
-  let resolveLockedHandoff;
-  const lockedHandoffP = new Promise((r) => { resolveLockedHandoff = r; });
-  onMsg({ type: "h2w_handoff_start", tabId: 401 }, { tab: { id: 401 } }, (r) => resolveLockedHandoff(r));
-  const lockedHandoff = await lockedHandoffP;
-  ok(lockedHandoff?.ok === false && lockedHandoff?.error === "automation_enabled",
-    "manual handoff is rejected while Project automation is on", JSON.stringify(lockedHandoff));
-
   let resolveProjectOff;
   const projectOffP = new Promise((r) => { resolveProjectOff = r; });
   onMsg({ type: "h2w_set_project_automation", project_id: PROJECT_ID, convKey: PROJECT_SOURCE, enabled: false }, { tab: { id: 401 } }, (r) => resolveProjectOff(r));
@@ -842,6 +873,64 @@ console.log("\n[project handoff]");
     "rolled-over conversation preserves the Project automation-off setting used for manual handoff", JSON.stringify(targetHud));
   ok(storage.herdrConversationTransfers[transferId]?.status === "committed", "transfer metadata records committed state");
   ok(storage.herdrConversationTransfers[transferId]?.handoff_text == null, "committed transfer clears the temporary handoff packet");
+
+  // Repeat with Project Auto on. Manual handoff must remain available and the
+  // target must preserve the source Auto-on snapshot.
+  delete storage.herdrWakeBindings[targetKey];
+  targetSeeded = false;
+  handoffSeedMode = "confirmed";
+  handoffPrompt = "";
+  let resolveRebind;
+  const rebindP = new Promise((r) => { resolveRebind = r; });
+  onMsg({ type: "h2w_bind", tabId: 401, workspace_id: "wH", workspace_label: "herdr-mcp (wH)" }, { tab: { id: 401 } }, (r) => resolveRebind(r));
+  await rebindP;
+
+  let resolveAutoOn;
+  const autoOnP = new Promise((r) => { resolveAutoOn = r; });
+  onMsg({ type: "h2w_set_project_automation", project_id: PROJECT_ID, convKey: PROJECT_SOURCE, enabled: true }, { tab: { id: 401 } }, (r) => resolveAutoOn(r));
+  const autoOn = await autoOnP;
+  ok(autoOn?.ok === true && autoOn?.enabled === true,
+    "Project source can enable Auto before manual handoff", JSON.stringify(autoOn));
+
+  let resolveAutoStart;
+  const autoStartP = new Promise((r) => { resolveAutoStart = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: 401, trigger: "manual" }, { tab: { id: 401 } }, (r) => resolveAutoStart(r));
+  const autoStart = await autoStartP;
+  ok(autoStart?.ok === true && autoStart?.pending === true,
+    "manual Project handoff remains available while Auto is on", JSON.stringify(autoStart));
+  const autoTransfer = Object.values(storage.herdrConversationTransfers || {})
+    .filter((transfer) => transfer?.source_conv_key === PROJECT_SOURCE)
+    .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0];
+  ok(autoTransfer?.source_automation_scope === "project" && autoTransfer?.source_automation_enabled === true,
+    "Project handoff snapshots Auto on before cutover", JSON.stringify(autoTransfer));
+  const autoAssistantText = [
+    `<<<HERDR_HANDOFF_V1 id=${autoTransfer?.id}>>>`,
+    "# Project handoff",
+    "Current objective: verify Auto-on inheritance.",
+    "Next: verify the target keeps automation enabled.",
+    "<<<END_HERDR_HANDOFF_V1>>>",
+  ].join("\n");
+  let resolveAutoEnded;
+  const autoEndedP = new Promise((r) => { resolveAutoEnded = r; });
+  onMsg({ type: "h2w_turn_ended", convKey: PROJECT_SOURCE, assistantText: autoAssistantText, userText: "roll over" }, { tab: { id: 401 } }, (r) => resolveAutoEnded(r));
+  await autoEndedP;
+  await new Promise((r) => setTimeout(r, 800));
+  ok(storage.herdrConversationTransfers[autoTransfer?.id]?.status === "committed",
+    "Auto-on Project handoff commits normally");
+  ok(storage.herdrProjectAutomation?.[PROJECT_ID] === true,
+    "Project handoff preserves Auto on in shared Project state");
+  let resolveAutoTargetHud;
+  const autoTargetHudP = new Promise((r) => { resolveAutoTargetHud = r; });
+  onMsg({ type: "h2w_page_hud", convKey: PROJECT_TARGET }, { tab: { id: storage.herdrWakeBindings[targetKey]?.tabId } }, (r) => resolveAutoTargetHud(r));
+  const autoTargetHud = await autoTargetHudP;
+  ok(autoTargetHud?.enabled === true && autoTargetHud?.project_id === PROJECT_ID,
+    "rolled-over Project conversation inherits Auto on", JSON.stringify(autoTargetHud));
+
+  // Restore the shared Project preference for later independent scenarios.
+  let resolveAutoOff;
+  const autoOffP = new Promise((r) => { resolveAutoOff = r; });
+  onMsg({ type: "h2w_set_project_automation", project_id: PROJECT_ID, convKey: PROJECT_TARGET, enabled: false }, { tab: { id: storage.herdrWakeBindings[targetKey]?.tabId } }, (r) => resolveAutoOff(r));
+  await autoOffP;
 }
 
 // ---- Scenario 7b: a false insert failure is reconciled before declaring seed failure ----
