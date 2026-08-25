@@ -82,6 +82,15 @@ test("Rust release verification provisions and always cleans the pinned Herdr ru
   );
 });
 
+test("Rust release defaults to macOS ARM64 and Windows x64 artifacts only", async () => {
+  const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
+  const buildJob = release.slice(release.indexOf("\n  build:\n"), release.indexOf("\n  manifest:\n"));
+  assert.match(buildJob, /runner: macos-15\n\s+target: aarch64-apple-darwin/);
+  assert.match(buildJob, /runner: windows-2025\n\s+target: x86_64-pc-windows-msvc/);
+  assert.doesNotMatch(buildJob, /x86_64-apple-darwin/);
+  assert.doesNotMatch(buildJob, /unknown-linux-gnu/);
+});
+
 test("Rust GitHub Release provenance is tag-only and fail-closed before publish", async () => {
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
   const attestJob = release.indexOf("\n  attest:\n");
