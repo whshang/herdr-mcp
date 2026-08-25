@@ -1,4 +1,6 @@
 use crate::contract;
+use crate::fs_tools;
+use crate::git_tools;
 use crate::herdr::HerdrClient;
 use crate::native_tools;
 use crate::state_cache::EventCache;
@@ -158,6 +160,10 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             };
             native_tools::call(context.client, method, params)
         }
+        "herdr_fs_read" => fs_tools::read(&context.cache.snapshot(), &arguments),
+        "herdr_fs_list" => fs_tools::list(&context.cache.snapshot(), &arguments),
+        "herdr_fs_grep" => fs_tools::grep(&context.cache.snapshot(), &arguments),
+        "herdr_git" => git_tools::run(&context.cache.snapshot(), &arguments),
         pending if contract::tool_names().contains(&pending) => {
             return Ok(tool_result(
                 json!({
@@ -234,7 +240,7 @@ mod tests {
     #[test]
     fn pending_epoch_tool_is_explicit_error_result() {
         let result = tool_result(
-            json!({"ok": false, "code": "native_tool_pending", "tool": "herdr_fs_read"}),
+            json!({"ok": false, "code": "native_tool_pending", "tool": "herdr_fs_image"}),
             true,
         );
         assert_eq!(result["isError"], true);
@@ -244,5 +250,28 @@ mod tests {
                 .unwrap()
                 .contains("native_tool_pending")
         );
+    }
+    #[test]
+    fn runtime_parity_fixture_matches_native_protocol_constants() {
+        let parity: Value =
+            serde_json::from_str(include_str!("../../../contracts/runtime-parity.json")).unwrap();
+        assert_eq!(parity["server_name"], "herdr-mcp");
+        assert_eq!(parity["sdk_wire_protocol"], SDK_WIRE_PROTOCOL);
+        assert_eq!(
+            parity["contract_epoch"],
+            contract::identity().unwrap().epoch
+        );
+        assert_eq!(parity["contract_hash"], contract::identity().unwrap().hash);
+        assert_eq!(
+            parity["tool_count"],
+            contract::identity().unwrap().tool_count
+        );
+        let expected = parity["supported_versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(expected, SUPPORTED_VERSIONS);
     }
 }

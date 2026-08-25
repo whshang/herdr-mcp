@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "server_name": "herdr-mcp",
+  "sdk_wire_protocol": "2025-11-25",
+  "supported_versions": [
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+    "2024-10-07"
+  ],
+  "openai_discover_extra_versions": ["2026-07-28"],
+  "contract_epoch": 2,
+  "contract_hash": "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8",
+  "tool_count": 18,
+  "stateless_handshake_sse_methods": ["initialize", "tools/list"],
+  "stateless_json_methods": ["server/discover", "tools/call"]
+}
