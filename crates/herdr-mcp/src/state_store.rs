@@ -28,8 +28,10 @@ use std::os::unix::fs::OpenOptionsExt;
 /// How long a writer waits on a locked database before erroring.
 pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 
-/// Max migration version the current binary understands.
-pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+/// Max migration version the current binary understands. Keep this numeric so
+/// release manifests can pin rollback-compatible durable-state readers; tests
+/// assert it remains exactly equal to the append-only migration count.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Meta-table key holding the applied schema version. Stored as a string.
 const META_SCHEMA_VERSION: &str = "schema_version";
@@ -1316,6 +1318,7 @@ mod tests {
 
     #[test]
     fn new_db_creates_and_migrates_to_latest() {
+        assert_eq!(SCHEMA_VERSION as usize, MIGRATIONS.len());
         let path = temp_db_path();
         let store = StateStore::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);

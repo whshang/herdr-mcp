@@ -19,6 +19,14 @@ export function parseCargoPackageVersion(text) {
   return version;
 }
 
+export function parseRustStateSchema(text) {
+  const version = String(text).match(/pub const SCHEMA_VERSION:\s*i64\s*=\s*(\d+)\s*;/)?.[1];
+  if (!version) throw new Error("cannot read Rust state schema version");
+  const parsed = Number(version);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error("invalid Rust state schema version");
+  return parsed;
+}
+
 export function releaseAssetName(version, target) {
   if (!RUST_RELEASE_TARGETS.includes(target)) throw new Error(`unsupported Rust release target: ${target}`);
   const suffix = target.includes("windows") ? ".exe" : "";
@@ -34,8 +42,10 @@ export async function buildRustReleaseManifest({ root, assetsDir, repo, tag }) {
   if (!repo || !/^[^/]+\/[^/]+$/.test(repo)) throw new Error("repo must be owner/name");
   if (!tag) throw new Error("tag is required");
   const cargo = await readFile(join(root, "crates", "herdr-mcp", "Cargo.toml"), "utf8");
+  const stateStore = await readFile(join(root, "crates", "herdr-mcp", "src", "state_store.rs"), "utf8");
   const contract = JSON.parse(await readFile(join(root, "contracts", "epoch2.json"), "utf8"));
   const version = parseCargoPackageVersion(cargo);
+  const stateSchema = parseRustStateSchema(stateStore);
   const tagVersion = tag.startsWith("v") ? tag.slice(1) : tag;
   if (tagVersion !== version) throw new Error(`tag ${tag} does not match Cargo version ${version}`);
 
@@ -61,6 +71,7 @@ export async function buildRustReleaseManifest({ root, assetsDir, repo, tag }) {
     product: "herdr-mcp",
     version,
     tag,
+    state_schema: stateSchema,
     contract: {
       epoch: contract.contract_epoch,
       hash: contract.contract_hash,

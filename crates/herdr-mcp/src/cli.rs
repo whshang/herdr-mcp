@@ -8,6 +8,7 @@ pub enum Command {
     Dev { dry_run: bool },
     Candidate { port: u16 },
     Service(ServiceCommand),
+    Update(UpdateCommand),
     NativeHost(NativeHostCommand),
     ExtensionHost { caller_origin: String },
 }
@@ -37,6 +38,14 @@ pub enum ServiceCommand {
     Uninstall,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpdateCommand {
+    Check { manifest_url: Option<String> },
+    Apply { manifest_url: Option<String> },
+    Status,
+    Worker { job_id: String },
+}
+
 pub fn parse<I>(args: I) -> Result<Command, String>
 where
     I: IntoIterator<Item = String>,
@@ -55,6 +64,7 @@ where
         "dev" => parse_dev(&args[1..]),
         "candidate" => parse_candidate(&args[1..]),
         "service" => parse_service(&args[1..]),
+        "update" => parse_update(&args[1..]),
         "native-host" => parse_native_host(&args[1..]),
         "extension-host" => parse_extension_host(&args[1..]),
         value => Err(format!("unknown command '{value}'\n\n{}", help())),
@@ -141,6 +151,37 @@ fn parse_service(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn parse_update(args: &[String]) -> Result<Command, String> {
+    match args {
+        [subcommand] if subcommand == "check" => {
+            Ok(Command::Update(UpdateCommand::Check { manifest_url: None }))
+        }
+        [subcommand, flag, value] if subcommand == "check" && flag == "--manifest" => {
+            Ok(Command::Update(UpdateCommand::Check {
+                manifest_url: Some(value.clone()),
+            }))
+        }
+        [subcommand] if subcommand == "apply" => {
+            Ok(Command::Update(UpdateCommand::Apply { manifest_url: None }))
+        }
+        [subcommand, flag, value] if subcommand == "apply" && flag == "--manifest" => {
+            Ok(Command::Update(UpdateCommand::Apply {
+                manifest_url: Some(value.clone()),
+            }))
+        }
+        [subcommand] if subcommand == "status" => Ok(Command::Update(UpdateCommand::Status)),
+        [subcommand, flag, value] if subcommand == "worker" && flag == "--job" => {
+            Ok(Command::Update(UpdateCommand::Worker {
+                job_id: value.clone(),
+            }))
+        }
+        [] => Err("update requires check, apply, or status".to_owned()),
+        [subcommand, ..] => Err(format!(
+            "invalid update command or arguments for '{subcommand}'"
+        )),
+    }
+}
+
 fn parse_native_host(args: &[String]) -> Result<Command, String> {
     match args {
         [subcommand] if subcommand == "install" => {
@@ -185,6 +226,7 @@ Usage:\n\
   herdr-mcp dev [--dry-run]\n\
   herdr-mcp candidate [--port 8873]\n\
   herdr-mcp service <install [--adopt-node]|status|start|stop|restart|rollback|uninstall>\n\
+  herdr-mcp update <check [--manifest URL]|apply [--manifest URL]|status>\n\
   herdr-mcp native-host <install|status|uninstall>\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\n\
 The Rust binary is the new local product boundary. Service, update, runtime,\n\
@@ -230,6 +272,24 @@ mod tests {
             Command::Service(ServiceCommand::Rollback)
         );
         assert_eq!(
+            parse(args(&[
+                "update",
+                "check",
+                "--manifest",
+                "https://example.com/release.json"
+            ]))
+            .unwrap(),
+            Command::Update(UpdateCommand::Check {
+                manifest_url: Some("https://example.com/release.json".to_owned())
+            })
+        );
+        assert_eq!(
+            parse(args(&["update", "worker", "--job", "upd-12345678"])).unwrap(),
+            Command::Update(UpdateCommand::Worker {
+                job_id: "upd-12345678".to_owned()
+            })
+        );
+        assert_eq!(
             parse(args(&["native-host", "status"])).unwrap(),
             Command::NativeHost(NativeHostCommand::Status)
         );
@@ -258,6 +318,8 @@ mod tests {
         assert!(parse(args(&["candidate", "--port", "0"])).is_err());
         assert!(parse(args(&["service"])).is_err());
         assert!(parse(args(&["service", "install", "--force"])).is_err());
+        assert!(parse(args(&["update"])).is_err());
+        assert!(parse(args(&["update", "apply", "--force"])).is_err());
         assert!(parse(args(&["native-host"])).is_err());
         assert!(parse(args(&["native-host", "legacy"])).is_err());
         assert!(parse(args(&["extension-host", "https://example.com/"])).is_err());

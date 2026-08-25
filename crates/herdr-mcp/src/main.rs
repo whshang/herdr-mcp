@@ -32,6 +32,8 @@ mod snapshot;
 mod state_cache;
 mod state_store;
 mod status;
+mod updater;
+mod updater_store;
 mod utility_exec;
 mod workstation;
 
@@ -60,6 +62,7 @@ fn run() -> Result<ExitCode, String> {
                 "contract epoch {} / {} tools",
                 contract.epoch, contract.tool_count
             );
+            println!("state schema {}", state_store::SCHEMA_VERSION);
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Status => {
@@ -113,6 +116,7 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::Dev { dry_run } => dev::run(dry_run),
         cli::Command::Candidate { port } => mcp_http::serve_candidate(port),
         cli::Command::Service(command) => service_manager::run(command),
+        cli::Command::Update(command) => updater::run(command),
         cli::Command::NativeHost(command) => native_host_install::run(command),
         cli::Command::ExtensionHost { caller_origin } => native_host::run(&caller_origin),
     }
