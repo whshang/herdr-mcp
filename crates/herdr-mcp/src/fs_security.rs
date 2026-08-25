@@ -154,15 +154,19 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static NEXT_REPO_ID: AtomicU64 = AtomicU64::new(0);
+
     fn repo() -> PathBuf {
-        let unique = SystemTime::now()
+        let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = NEXT_REPO_ID.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "herdr-mcp-security-{}-{unique}",
+            "herdr-mcp-security-{}-{timestamp}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
