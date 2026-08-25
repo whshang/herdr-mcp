@@ -59,9 +59,9 @@ const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
-ok(manifest.version === "0.1.56", "manifest version includes ChatGPT disconnected-stream recovery");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.56"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.56"'), "content version matches manifest");
+ok(manifest.version === "0.1.57", "manifest version includes handoff delivery reconciliation");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.57"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.57"'), "content version matches manifest");
 ok(backgroundSource.includes("sendResponse({ ok: true, ...automationScopeForConversation(convKey) });")
     && backgroundSource.includes("void notifyAutomationChanged();")
     && wakeSource.includes("finally {\n      setHudActionBusy(false);"),

@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.56";
+const H2W_CONTENT_VERSION = "0.1.57";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -621,7 +621,11 @@ const H2W_CONTENT_VERSION = "0.1.56";
 
   function hasHandoffTransferMarker(text, transferId) {
     const id = String(transferId || "").trim();
-    return Boolean(id && String(text || "").includes(`[HERDR_CONTINUITY_TRANSFER id=${id}]`));
+    if (!id) return false;
+    const body = String(text || "");
+    if (body.includes(`[HERDR_CONTINUITY_TRANSFER id=${id}]`)) return true;
+    return body.includes(`<<<HERDR_HANDOFF_V1 id=${id}>>>`)
+      && body.includes("<<<END_HERDR_HANDOFF_V1>>>");
   }
 
   async function waitForHandoffTarget(transferId, timeoutMs = 25000) {

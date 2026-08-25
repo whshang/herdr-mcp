@@ -26,7 +26,7 @@ import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 
-const H2W_SCRIPT_VERSION = "0.1.56";
+const H2W_SCRIPT_VERSION = "0.1.57";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -808,10 +808,30 @@ function recoverableFailedTransferFromSource(transfers, convKey) {
   return best;
 }
 
+function recoverableFailedSeedTransferFromSource(transfers, convKey) {
+  let best = null;
+  for (const row of Object.values(transfers || {})) {
+    if (
+      !row
+      || row.source_conv_key !== convKey
+      || row.status !== "failed"
+      || !row.handoff_text
+      || !row.target_tab_id
+      || !["insert-failed", "submit-failed", "seed_not_submitted"].includes(String(row.error || ""))
+    ) continue;
+    if (!best || Number(row.updated_at || row.created_at || 0) > Number(best.updated_at || best.created_at || 0)) best = row;
+  }
+  return best;
+}
+
 function handoffView(row, convKey = null) {
   if (!row) return null;
   const ageMs = Math.max(0, Date.now() - Number(row.updated_at || row.created_at || Date.now()));
   const canResume = row.status === "seed_uncertain"
+    || (row.status === "failed"
+      && Boolean(row.handoff_text)
+      && Boolean(row.target_tab_id)
+      && ["insert-failed", "submit-failed", "seed_not_submitted"].includes(String(row.error || "")))
     || (ageMs >= 120000 && ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(row.status));
   return {
     id: row.id,
@@ -1870,9 +1890,21 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
       return { ok: false, error: "source_binding_revision_changed" };
     }
   }
-  if (target.length) {
+  if (target.length && !sameWorkspaceSet(target.map((b) => b.workspace_id || normalizeWorkspaceId(b)), expectedIds)) {
     await markTransfer(transferId, { status: "failed", error: "target_already_bound" });
     return { ok: false, error: "target_already_bound" };
+  }
+
+  // A target conversation may become visible before the seed-delivery result
+  // returns. If the user then binds the exact same workspace set manually,
+  // those rows are provisional rather than a conflicting continuity chain.
+  // Seed confirmation for this transfer makes it safe to replace them with the
+  // source-authoritative binding snapshot below.
+  for (const current of target) {
+    const ws = current.workspace_id || normalizeWorkspaceId(current);
+    const targetKey = current.storeKey || bindingStoreKey(targetInfo.convKey, ws);
+    delete bindings[targetKey];
+    clearProgressTimer(targetKey);
   }
 
   const now = Date.now();
@@ -1926,6 +1958,32 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
   return { ok: true, transfer: handoffView(done) };
 }
 
+function handoffSeedFailureIsDeliveryUncertain(error) {
+  return [
+    "insert-failed",
+    "submit-failed",
+    "no-response",
+    "context-invalidated",
+  ].includes(String(error || ""));
+}
+
+async function probeHandoffTargetSeed(transfer, targetTabId, timeoutMs = 8000) {
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  do {
+    let probe = null;
+    try {
+      probe = await sendHandoffTabMessage(targetTabId, transfer.site || "chatgpt", {
+        type: "h2w_handoff_probe",
+        transferId: transfer.id,
+      });
+    } catch (_) {}
+    if (probe?.seedConfirmed && probe?.targetConvKey) return probe;
+    if (Date.now() >= deadline) break;
+    await sleep(500);
+  } while (true);
+  return null;
+}
+
 async function seedHandoffIntoTarget(transferId, targetTabId) {
   const transfers = await loadHandoffTransfers();
   const transfer = transfers[transferId];
@@ -1952,11 +2010,31 @@ async function seedHandoffIntoTarget(transferId, targetTabId) {
     return { ok: false, error: "seed_delivery_unknown" };
   }
   if (!result?.ok) {
-    // Content-side failures are pre-submit evidence (busy composer, missing input,
-    // etc.). The source binding therefore remains authoritative and a fresh
-    // explicit retry is safe.
-    await markTransfer(transferId, { status: "failed", error: result?.error || result?.blocked || "seed_not_submitted" });
-    return { ok: false, error: result?.error || result?.blocked || "seed_not_submitted" };
+    const error = result?.error || result?.blocked || "seed_not_submitted";
+    // ChatGPT's controlled editor can report an insertion/submit false-negative
+    // after the user message has already materialized and the route has acquired
+    // a real conversation id. Probe before classifying the delivery as failed.
+    const confirmed = await probeHandoffTargetSeed(transfer, targetTabId);
+    if (confirmed?.seedConfirmed && confirmed?.targetConvKey) {
+      return commitHandoffTransfer(
+        transferId,
+        confirmed.targetConvKey,
+        targetTabId,
+        confirmed.targetUrl || null,
+      );
+    }
+    if (handoffSeedFailureIsDeliveryUncertain(error)) {
+      await markTransfer(transferId, {
+        status: "seed_uncertain",
+        target_tab_id: targetTabId,
+        error: `seed_delivery_uncertain:${error}`,
+      });
+      return { ok: false, error: "seed_delivery_uncertain" };
+    }
+    // Explicit pre-submit evidence (busy composer, missing input, user typing)
+    // remains safe to classify as failed; the source binding stays authoritative.
+    await markTransfer(transferId, { status: "failed", error });
+    return { ok: false, error };
   }
   if (!result?.targetConvKey || !result?.seedConfirmed) {
     await markTransfer(transferId, {
@@ -2184,6 +2262,18 @@ async function startHandoffForTab(tabId, trigger = "manual") {
       return resumeUncertainHandoff(uncertain);
     }
     return { ok: true, pending: true, handoff: handoffView(active) };
+  }
+
+  // Older extension builds could mark ChatGPT editor false-negatives as a hard
+  // seed failure even after the target conversation had materialized. Recover
+  // that exact transfer first instead of opening another target conversation.
+  const recoverableSeedFailure = recoverableFailedSeedTransferFromSource(transfers, convInfo.convKey);
+  if (recoverableSeedFailure) {
+    const uncertain = await markTransfer(recoverableSeedFailure.id, {
+      status: "seed_uncertain",
+      error: `legacy_${recoverableSeedFailure.error || "seed_failure"}`,
+    });
+    return resumeUncertainHandoff(uncertain);
   }
 
   // A valid summary may arrive after an older build prematurely classified the

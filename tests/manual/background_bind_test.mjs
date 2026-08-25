@@ -136,6 +136,10 @@ function targetListener(tab) {
           targetUrl: PROJECT_TARGET_URL,
           seedConfirmed: true,
         });
+      } else if (handoffSeedMode === "insert_failed_but_committed") {
+        targetSeeded = true;
+        tab.url = PROJECT_TARGET_URL;
+        sendResponse({ ok: false, error: "insert-failed" });
       } else {
         sendResponse({ ok: true, targetConvKey: null, targetUrl: tab.url, seedConfirmed: false });
       }
@@ -838,6 +842,116 @@ console.log("\n[project handoff]");
     "rolled-over conversation preserves the Project automation-off setting used for manual handoff", JSON.stringify(targetHud));
   ok(storage.herdrConversationTransfers[transferId]?.status === "committed", "transfer metadata records committed state");
   ok(storage.herdrConversationTransfers[transferId]?.handoff_text == null, "committed transfer clears the temporary handoff packet");
+}
+
+// ---- Scenario 7b: a false insert failure is reconciled before declaring seed failure ----
+console.log("\n[project handoff insert false-negative]");
+{
+  delete storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`];
+  targetSeeded = false;
+  handoffSeedMode = "insert_failed_but_committed";
+  handoffPrompt = "";
+  installContentScript(402, PROJECT_SOURCE_URL, PROJECT_SOURCE);
+
+  let resolveBind;
+  const bindP = new Promise((r) => { resolveBind = r; });
+  onMsg({ type: "h2w_bind", tabId: 402, workspace_id: "wH", workspace_label: "herdr-mcp (wH)" }, { tab: { id: 402 } }, (r) => resolveBind(r));
+  await bindP;
+  const sourceKey = `${PROJECT_SOURCE}::wH`;
+  const continuityId = storage.herdrWakeBindings[sourceKey]?.continuity_id;
+
+  let resolveStart;
+  const startP = new Promise((r) => { resolveStart = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: 402 }, { tab: { id: 402 } }, (r) => resolveStart(r));
+  await startP;
+  const transferId = Object.values(storage.herdrConversationTransfers || {})
+    .filter((transfer) => transfer?.source_conv_key === PROJECT_SOURCE)
+    .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0]?.id;
+  const assistantText = [
+    `<<<HERDR_HANDOFF_V1 id=${transferId}>>>`,
+    "# Project handoff",
+    "Current objective: recover an editor false-negative.",
+    "Next: verify target evidence before cutover.",
+    "<<<END_HERDR_HANDOFF_V1>>>",
+  ].join("\n");
+  let resolveEnded;
+  const endedP = new Promise((r) => { resolveEnded = r; });
+  onMsg({ type: "h2w_turn_ended", convKey: PROJECT_SOURCE, assistantText, userText: "roll over" }, { tab: { id: 402 } }, (r) => resolveEnded(r));
+  await endedP;
+  await new Promise((r) => setTimeout(r, 700));
+  const targetKey = `${PROJECT_TARGET}::wH`;
+  ok(storage.herdrConversationTransfers[transferId]?.status === "committed",
+    "insert-failed with confirmed target evidence commits instead of failing");
+  ok(!storage.herdrWakeBindings[sourceKey] && !!storage.herdrWakeBindings[targetKey],
+    "false-negative reconciliation still cuts over the binding atomically");
+  ok(storage.herdrWakeBindings[targetKey]?.continuity_id === continuityId,
+    "false-negative reconciliation preserves the source continuity id");
+}
+
+// ---- Scenario 7c: recover a legacy failed seed after the user provisionally rebound the target ----
+console.log("\n[project handoff legacy failed-seed recovery]");
+{
+  delete storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`];
+  targetSeeded = false;
+  handoffSeedMode = "uncertain";
+  handoffPrompt = "";
+  installContentScript(403, PROJECT_SOURCE_URL, PROJECT_SOURCE);
+
+  let resolveBind;
+  const bindP = new Promise((r) => { resolveBind = r; });
+  onMsg({ type: "h2w_bind", tabId: 403, workspace_id: "wH", workspace_label: "herdr-mcp (wH)" }, { tab: { id: 403 } }, (r) => resolveBind(r));
+  await bindP;
+  const sourceKey = `${PROJECT_SOURCE}::wH`;
+  const continuityId = storage.herdrWakeBindings[sourceKey]?.continuity_id;
+
+  let resolveStart;
+  const startP = new Promise((r) => { resolveStart = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: 403 }, { tab: { id: 403 } }, (r) => resolveStart(r));
+  await startP;
+  const transferId = Object.values(storage.herdrConversationTransfers || {})
+    .filter((transfer) => transfer?.source_conv_key === PROJECT_SOURCE)
+    .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0]?.id;
+  const assistantText = [
+    `<<<HERDR_HANDOFF_V1 id=${transferId}>>>`,
+    "# Project handoff",
+    "Current objective: recover an already-materialized target.",
+    "Next: adopt the provisional target binding.",
+    "<<<END_HERDR_HANDOFF_V1>>>",
+  ].join("\n");
+  let resolveEnded;
+  const endedP = new Promise((r) => { resolveEnded = r; });
+  onMsg({ type: "h2w_turn_ended", convKey: PROJECT_SOURCE, assistantText, userText: "roll over" }, { tab: { id: 403 } }, (r) => resolveEnded(r));
+  await endedP;
+  await new Promise((r) => setTimeout(r, 700));
+
+  const transfer = storage.herdrConversationTransfers[transferId];
+  transfer.status = "failed";
+  transfer.error = "insert-failed";
+  const targetTabId = transfer.target_tab_id;
+  targetSeeded = true;
+  tabs.get(targetTabId).url = PROJECT_TARGET_URL;
+
+  let resolveTargetBind;
+  const targetBindP = new Promise((r) => { resolveTargetBind = r; });
+  onMsg({ type: "h2w_bind", tabId: targetTabId, workspace_id: "wH", workspace_label: "herdr-mcp (wH)" }, { tab: { id: targetTabId } }, (r) => resolveTargetBind(r));
+  await targetBindP;
+  const targetKey = `${PROJECT_TARGET}::wH`;
+  ok(storage.herdrWakeBindings[targetKey]?.continuity_id !== continuityId,
+    "provisional manual target binding initially has a separate continuity id");
+
+  let resolveResume;
+  const resumeP = new Promise((r) => { resolveResume = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: 403 }, { tab: { id: 403 } }, (r) => resolveResume(r));
+  const resumed = await resumeP;
+  ok(resumed?.ok === true, "legacy failed seed can resume without opening a third conversation", JSON.stringify(resumed));
+  ok(storage.herdrConversationTransfers[transferId]?.status === "committed",
+    "legacy failed seed is finalized as committed after target probe confirmation");
+  ok(!storage.herdrWakeBindings[sourceKey] && !!storage.herdrWakeBindings[targetKey],
+    "legacy recovery removes source binding and keeps the existing target binding slot");
+  ok(storage.herdrWakeBindings[targetKey]?.continuity_id === continuityId,
+    "legacy recovery rewrites the provisional target onto the original continuity chain");
+  ok(storage.herdrWakeBindings[targetKey]?.handoff_from === PROJECT_SOURCE,
+    "legacy recovery records the predecessor conversation on the target binding");
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);
