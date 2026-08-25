@@ -105,6 +105,11 @@ test("Rust GitHub Release provenance is tag-only and fail-closed before publish"
   assert.match(attest, /release-assets\/release-manifest\.json/);
   assert.match(publish, /needs: attest/, "GitHub Release publishing must fail closed when attestation fails");
   assert.match(publish, /if: startsWith\(github\.ref, 'refs\/tags\/v'\)/);
+  assert.match(
+    publish,
+    /GH_REPO: \$\{\{ github\.repository \}\}/,
+    "publish must name the GitHub repository explicitly because the job does not checkout git metadata",
+  );
   assert.doesNotMatch(attest, /workflow_dispatch/);
   assert.doesNotMatch(publish, /workflow_dispatch/);
 });
