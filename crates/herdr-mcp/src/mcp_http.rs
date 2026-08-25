@@ -908,14 +908,32 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         );
     }
 
-    let context = RuntimeContext {
-        client: &state.client,
-        cache: &state.cache,
-        exec: &state.exec,
-        prompt: &state.prompt,
-        skill: &state.skill,
-    };
-    let Some(mut response) = mcp::handle(&request, &context) else {
+    let blocking_state = state.clone();
+    let blocking_request = request.clone();
+    let handled = tokio::task::spawn_blocking(move || {
+        let context = RuntimeContext {
+            client: &blocking_state.client,
+            cache: &blocking_state.cache,
+            exec: &blocking_state.exec,
+            prompt: &blocking_state.prompt,
+            skill: &blocking_state.skill,
+        };
+        mcp::handle(&blocking_request, &context)
+    })
+    .await;
+    let Some(mut response) = (match handled {
+        Ok(response) => response,
+        Err(_) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32603, "message": "Internal error"},
+                    "id": request.get("id").cloned().unwrap_or(Value::Null)
+                }),
+            );
+        }
+    }) else {
         return StatusCode::ACCEPTED.into_response();
     };
     if stateless && request.get("method").and_then(Value::as_str) == Some("server/discover") {
