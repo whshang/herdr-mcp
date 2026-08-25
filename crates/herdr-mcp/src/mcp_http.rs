@@ -1,3 +1,4 @@
+use crate::exec_sessions::ExecRegistry;
 use crate::herdr::HerdrClient;
 use crate::mcp::{self, RuntimeContext};
 use crate::paths::RuntimePaths;
@@ -23,6 +24,7 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 struct AppState {
     client: HerdrClient,
     cache: Arc<EventCache>,
+    exec: ExecRegistry,
     bearer_token: Arc<[u8]>,
 }
 
@@ -40,6 +42,10 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
         .ok_or_else(|| "candidate runtime requires a Herdr local transport".to_owned())?;
     let client = HerdrClient::new(socket);
     let cache = Arc::new(EventCache::start(client.clone()));
+    let exec_state_dir = env::var_os("HERDR_MCP_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| paths.dev_state_dir.join("candidate"));
+    let exec = ExecRegistry::new(exec_state_dir)?;
     if !cache.wait_ready(Duration::from_secs(3)) {
         return Err(format!(
             "candidate event cache did not bootstrap: {}",
@@ -65,6 +71,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
         let state = AppState {
             client,
             cache,
+            exec,
             bearer_token: Arc::<[u8]>::from(token.into_bytes()),
         };
         let app = Router::new()
@@ -93,7 +100,7 @@ async fn shutdown_signal() {
 }
 
 async fn health(State(state): State<AppState>) -> Response {
-    let mut payload = runtime_meta::health_fields(&state.cache);
+    let mut payload = runtime_meta::health_fields(&state.cache, Some(&state.exec));
     payload.insert("ok".to_owned(), json!(true));
     let payload = Value::Object(payload);
     json_response(StatusCode::OK, &payload)
@@ -158,6 +165,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     let context = RuntimeContext {
         client: &state.client,
         cache: &state.cache,
+        exec: &state.exec,
     };
     let Some(response) = mcp::handle(&request, &context) else {
         return StatusCode::ACCEPTED.into_response();

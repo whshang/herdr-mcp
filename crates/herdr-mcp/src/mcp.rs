@@ -1,4 +1,6 @@
 use crate::contract;
+use crate::exec_sessions::ExecRegistry;
+use crate::exec_tools;
 use crate::fs_mutation;
 use crate::fs_patch;
 use crate::fs_tools;
@@ -22,6 +24,7 @@ const SUPPORTED_VERSIONS: [&str; 5] = [
 pub struct RuntimeContext<'a> {
     pub client: &'a HerdrClient,
     pub cache: &'a EventCache,
+    pub exec: &'a ExecRegistry,
 }
 
 pub fn handle(request: &Value, context: &RuntimeContext<'_>) -> Option<Value> {
@@ -130,7 +133,9 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
             native_tools::methods(query)
         }
-        "herdr_inspect" => native_tools::inspect(context.client, Some(context.cache)),
+        "herdr_inspect" => {
+            native_tools::inspect(context.client, Some(context.cache), Some(context.exec))
+        }
         "herdr_since" => {
             let cursor = arguments.get("cursor").and_then(Value::as_u64).unwrap_or(0);
             let workspace = arguments.get("workspace").and_then(Value::as_str);
@@ -177,6 +182,11 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         "herdr_fs_write" => fs_mutation::write(&context.cache.snapshot(), &arguments),
         "herdr_fs_patch" => fs_patch::apply(&context.cache.snapshot(), &arguments),
         "herdr_git" => git_tools::run(&context.cache.snapshot(), &arguments),
+        "herdr_exec_start" => {
+            exec_tools::start(&context.cache.snapshot(), context.exec, &arguments)
+        }
+        "herdr_exec_read" => exec_tools::read(context.exec, &arguments),
+        "herdr_exec_kill" => exec_tools::kill(context.exec, &arguments),
         pending if contract::tool_names().contains(&pending) => {
             return Ok(tool_result(
                 json!({

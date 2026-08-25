@@ -1,4 +1,5 @@
 use crate::agent_visibility::AgentVisibility;
+use crate::exec_sessions::ExecRegistry;
 use crate::herdr::HerdrClient;
 use crate::inspect;
 use crate::runtime_meta;
@@ -9,9 +10,13 @@ use std::collections::HashSet;
 
 const SCHEMA_SOURCE: &str = "herdr api schema --json (live, 60s cache)";
 
-pub fn inspect(client: &HerdrClient, cache: Option<&EventCache>) -> Value {
+pub fn inspect(
+    client: &HerdrClient,
+    cache: Option<&EventCache>,
+    exec: Option<&ExecRegistry>,
+) -> Value {
     let mut view = inspect::inspect_core(client);
-    runtime_meta::augment_inspect(&mut view, cache);
+    runtime_meta::augment_inspect(&mut view, cache, exec);
     view
 }
 

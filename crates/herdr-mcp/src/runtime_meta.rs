@@ -1,4 +1,5 @@
 use crate::contract;
+use crate::exec_sessions::ExecRegistry;
 use crate::state_cache::EventCache;
 use serde_json::{Map, Value, json};
 use std::env;
@@ -6,7 +7,7 @@ use std::sync::OnceLock;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-const MIGRATED_TOOLS: [&str; 12] = [
+const MIGRATED_TOOLS: [&str; 15] = [
     "herdr_methods",
     "herdr_inspect",
     "herdr_call",
@@ -19,6 +20,9 @@ const MIGRATED_TOOLS: [&str; 12] = [
     "herdr_fs_write",
     "herdr_fs_patch",
     "herdr_git",
+    "herdr_exec_start",
+    "herdr_exec_read",
+    "herdr_exec_kill",
 ];
 
 static STARTED_AT: OnceLock<String> = OnceLock::new();
@@ -56,7 +60,7 @@ pub fn migration_status() -> Value {
     })
 }
 
-pub fn augment_inspect(view: &mut Value, cache: Option<&EventCache>) {
+pub fn augment_inspect(view: &mut Value, cache: Option<&EventCache>, exec: Option<&ExecRegistry>) {
     let Some(object) = view.as_object_mut() else {
         return;
     };
@@ -72,20 +76,32 @@ pub fn augment_inspect(view: &mut Value, cache: Option<&EventCache>) {
                 .map(|cache| json!(cache.boot_id()))
                 .unwrap_or(Value::Null),
         );
-        workstation.insert("exec_sessions".to_owned(), Value::Array(vec![]));
+        workstation.insert(
+            "exec_sessions".to_owned(),
+            exec.map(|registry| Value::Array(registry.list_views()))
+                .unwrap_or_else(|| Value::Array(vec![])),
+        );
         workstation.insert("exec_sessions_source".to_owned(), json!("rust-native"));
-        workstation.insert("exec_sessions_ready".to_owned(), json!(false));
+        workstation.insert("exec_sessions_ready".to_owned(), json!(exec.is_some()));
+        workstation.insert(
+            "exec_sessions_diagnostics".to_owned(),
+            exec.map(ExecRegistry::diagnostics).unwrap_or(Value::Null),
+        );
         workstation.insert("native_migration".to_owned(), migration_status());
     }
 }
 
-pub fn health_fields(cache: &EventCache) -> Map<String, Value> {
+pub fn health_fields(cache: &EventCache, exec: Option<&ExecRegistry>) -> Map<String, Value> {
     let diagnostics = cache.diagnostics();
     let mut output = Map::new();
     output.insert("runtime".to_owned(), json!("rust-candidate"));
     output.insert("version".to_owned(), json!(env!("CARGO_PKG_VERSION")));
     output.insert("build".to_owned(), build_info());
     output.insert("native_migration".to_owned(), migration_status());
+    output.insert(
+        "exec_sessions".to_owned(),
+        exec.map(ExecRegistry::diagnostics).unwrap_or(Value::Null),
+    );
     output.insert(
         "event_cache".to_owned(),
         json!({
@@ -116,8 +132,8 @@ mod tests {
     fn migration_status_is_derived_from_epoch2_catalog() {
         let status = migration_status();
         assert_eq!(status["tool_count"], 18);
-        assert_eq!(status["migrated_tool_count"], 12);
-        assert_eq!(status["pending_tool_count"], 6);
+        assert_eq!(status["migrated_tool_count"], 15);
+        assert_eq!(status["pending_tool_count"], 3);
         assert_eq!(status["production_ready"], false);
         assert!(
             status["pending_tools"]
@@ -143,9 +159,9 @@ mod tests {
     #[test]
     fn inspect_augmentation_is_explicit_about_pending_exec_registry() {
         let mut view = json!({"ok": true, "workstation_info": {"server_name": "herdr-mcp"}});
-        augment_inspect(&mut view, None);
+        augment_inspect(&mut view, None, None);
         assert_eq!(view["build"]["runtime"], "rust");
-        assert_eq!(view["native_migration"]["migrated_tool_count"], 12);
+        assert_eq!(view["native_migration"]["migrated_tool_count"], 15);
         assert_eq!(view["workstation_info"]["boot_id"], Value::Null);
         assert_eq!(view["workstation_info"]["exec_sessions"], json!([]));
         assert_eq!(
