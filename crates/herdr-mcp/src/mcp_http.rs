@@ -1,4 +1,6 @@
 use crate::exec_sessions::ExecRegistry;
+#[cfg(unix)]
+use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
 use crate::mcp::{self, RuntimeContext};
 use crate::paths::RuntimePaths;
@@ -117,6 +119,7 @@ struct AppState {
     skill: SkillService,
     sessions: SessionRegistry,
     bearer_token: Arc<[u8]>,
+    trusted_extension_ipc: bool,
 }
 
 pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
@@ -173,20 +176,53 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             skill,
             sessions: SessionRegistry::default(),
             bearer_token: Arc::<[u8]>::from(token.into_bytes()),
+            trusted_extension_ipc: false,
         };
-        let app = candidate_router(state);
+        let app = candidate_router(state.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let listener = tokio::net::TcpListener::bind(address)
             .await
             .map_err(|error| format!("cannot bind candidate runtime to {address}: {error}"))?;
+
+        #[cfg(unix)]
+        let extension_ipc = if let Some(socket_path) = env::var_os("HERDR_EXTENSION_IPC_SOCKET") {
+            let (extension_listener, guard) = ExtensionIpcSocket::bind(socket_path).await?;
+            let mut extension_state = state.clone();
+            extension_state.trusted_extension_ipc = true;
+            let extension_app = candidate_router(extension_state);
+            let task = tokio::spawn(async move {
+                axum::serve(extension_listener, extension_app)
+                    .await
+                    .map_err(|error| format!("candidate extension IPC server failed: {error}"))
+            });
+            Some((task, guard))
+        } else {
+            None
+        };
+
+        #[cfg(not(unix))]
+        if env::var_os("HERDR_EXTENSION_IPC_SOCKET").is_some() {
+            return Err(
+                "HERDR_EXTENSION_IPC_SOCKET is not supported on this platform yet".to_owned(),
+            );
+        }
+
         println!(
             "herdr-mcp candidate {} listening on http://{address}/mcp",
             env!("CARGO_PKG_VERSION")
         );
-        axum::serve(listener, app)
+        let tcp_result = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
-            .await
-            .map_err(|error| format!("candidate HTTP server failed: {error}"))?;
+            .await;
+
+        #[cfg(unix)]
+        if let Some((task, guard)) = extension_ipc {
+            task.abort();
+            let _ = task.await;
+            drop(guard);
+        }
+
+        tcp_result.map_err(|error| format!("candidate HTTP server failed: {error}"))?;
         Ok(ExitCode::SUCCESS)
     })
 }
@@ -201,6 +237,18 @@ fn candidate_router(state: AppState) -> Router {
 }
 
 async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = terminate.recv() => {},
+            }
+            return;
+        }
+    }
     let _ = tokio::signal::ctrl_c().await;
 }
 
@@ -212,7 +260,7 @@ async fn health(State(state): State<AppState>) -> Response {
 }
 
 async fn get_mcp(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !authorized(&headers, &state.bearer_token) {
+    if !request_authorized(&state, &headers) {
         return json_response(
             StatusCode::UNAUTHORIZED,
             &json!({
@@ -241,7 +289,7 @@ async fn get_mcp(State(state): State<AppState>, headers: HeaderMap) -> Response 
 }
 
 async fn delete_mcp(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !authorized(&headers, &state.bearer_token) {
+    if !request_authorized(&state, &headers) {
         return json_response(
             StatusCode::UNAUTHORIZED,
             &json!({
@@ -279,7 +327,7 @@ async fn delete_mcp(State(state): State<AppState>, headers: HeaderMap) -> Respon
 }
 
 async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if !authorized(&headers, &state.bearer_token) {
+    if !request_authorized(&state, &headers) {
         return json_response(
             StatusCode::UNAUTHORIZED,
             &json!({
@@ -427,6 +475,10 @@ fn wants_sse(headers: &HeaderMap, request: &Value) -> bool {
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
 }
 
+fn request_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    state.trusted_extension_ipc || authorized(headers, &state.bearer_token)
+}
+
 fn authorized(headers: &HeaderMap, token: &[u8]) -> bool {
     let Some(value) = headers
         .get(AUTHORIZATION)
@@ -546,6 +598,7 @@ mod tests {
             skill: SkillService::new(),
             sessions: SessionRegistry::default(),
             bearer_token: Arc::<[u8]>::from(b"test-token".to_vec()),
+            trusted_extension_ipc: false,
         }
     }
 
@@ -579,6 +632,40 @@ mod tests {
         assert!(authorized(&headers, b"secret"));
         assert!(!authorized(&headers, b"other"));
         assert!(!authorized(&HeaderMap::new(), b"secret"));
+    }
+
+    #[tokio::test]
+    async fn trusted_extension_ipc_bypasses_bearer_but_tcp_state_does_not() {
+        let root = test_root("extension-ipc-auth");
+        let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(CONTENT_TYPE, "application/json")
+                .header(ACCEPT, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let tcp = candidate_router(test_state(&root.join("tcp")));
+        let tcp_response = tcp.oneshot(request()).await.unwrap();
+        assert_eq!(tcp_response.status(), StatusCode::UNAUTHORIZED);
+
+        let mut extension_state = test_state(&root.join("extension"));
+        extension_state.trusted_extension_ipc = true;
+        let extension = candidate_router(extension_state);
+        let extension_response = extension.oneshot(request()).await.unwrap();
+        assert_eq!(extension_response.status(), StatusCode::OK);
+        let bytes = extension_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["result"]["tools"].as_array().unwrap().len(), 18);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

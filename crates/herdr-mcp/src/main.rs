@@ -6,6 +6,7 @@ mod dev;
 mod events;
 mod exec_sessions;
 mod exec_tools;
+mod extension_ipc;
 mod fs_mutation;
 mod fs_patch;
 mod fs_security;
