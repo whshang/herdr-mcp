@@ -19,7 +19,7 @@ use axum::routing::{get, post};
 use futures_util::stream;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -35,6 +35,9 @@ const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
 const PUSH_CACHE_POLL: Duration = Duration::from_millis(250);
+const MAX_MCP_ACTIVITY_RECORDS: usize = 2000;
+const MAX_MCP_ACTIVITY_RESULTS: usize = 50;
+const MAX_MCP_ACTIVITY_LOOKBACK_MS: u64 = 30 * 60_000;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
 
 const SETTLED_AGENT_STATES: &[&str] = &["idle", "done", "blocked"];
@@ -115,6 +118,72 @@ fn new_session_id(boot_id: &str) -> String {
     format!("ms_{token}")
 }
 
+#[derive(Debug, Clone)]
+struct McpActivityRecord {
+    at_ms: u64,
+    tool: String,
+    call: Option<String>,
+    user_agent: String,
+    status: u16,
+}
+
+#[derive(Clone, Default)]
+struct McpActivityRegistry {
+    inner: Arc<Mutex<VecDeque<McpActivityRecord>>>,
+}
+
+impl McpActivityRegistry {
+    fn record(&self, record: McpActivityRecord) {
+        let Ok(mut records) = self.inner.lock() else {
+            return;
+        };
+        records.push_back(record);
+        while records.len() > MAX_MCP_ACTIVITY_RECORDS {
+            records.pop_front();
+        }
+    }
+
+    fn query(
+        &self,
+        since_ms: u64,
+        until_ms: u64,
+        ua_includes: &str,
+    ) -> (usize, Vec<McpActivityRecord>) {
+        let Ok(records) = self.inner.lock() else {
+            return (0, vec![]);
+        };
+        let needle = ua_includes.to_ascii_lowercase();
+        let hits = records
+            .iter()
+            .filter(|record| {
+                record.at_ms >= since_ms
+                    && record.at_ms <= until_ms
+                    && (needle.is_empty()
+                        || record
+                            .user_agent
+                            .to_ascii_lowercase()
+                            .contains(needle.as_str()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let count = hits.len();
+        let tools = hits
+            .into_iter()
+            .rev()
+            .take(MAX_MCP_ACTIVITY_RESULTS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        (count, tools)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().map(|records| records.len()).unwrap_or(0)
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     client: HerdrClient,
@@ -123,6 +192,7 @@ struct AppState {
     prompt: PromptRegistry,
     skill: SkillService,
     sessions: SessionRegistry,
+    activity: McpActivityRegistry,
     bearer_token: Arc<[u8]>,
     trusted_extension_ipc: bool,
 }
@@ -180,6 +250,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             prompt,
             skill,
             sessions: SessionRegistry::default(),
+            activity: McpActivityRegistry::default(),
             bearer_token: Arc::<[u8]>::from(token.into_bytes()),
             trusted_extension_ipc: false,
         };
@@ -239,6 +310,7 @@ fn candidate_router(state: AppState) -> Router {
         .route("/mcp/", post(post_mcp).get(get_mcp).delete(delete_mcp))
         .route("/push/state", get(push_state))
         .route("/push/events", get(push_events))
+        .route("/push/mcp-activity", get(push_mcp_activity))
         .route("/health", get(health))
         .with_state(state)
 }
@@ -296,6 +368,76 @@ async fn push_events(
         workspace: query.get("workspace").filter(|v| !v.is_empty()).cloned(),
     };
     push_events_response(state.cache, filters)
+}
+
+async fn push_mcp_activity(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    if !request_authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let now_ms = epoch_ms();
+    let since_raw = query.get("since").or_else(|| query.get("since_ms"));
+    let since_ms = since_raw.and_then(|value| value.parse::<u64>().ok());
+    let until_ms = query
+        .get("until")
+        .or_else(|| query.get("until_ms"))
+        .map(|value| value.parse::<u64>().ok())
+        .unwrap_or(Some(now_ms));
+    let (Some(since_ms), Some(until_ms)) = (since_ms, until_ms) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "ok": false,
+                "reason": "bad_window",
+                "message": "query since (ms) and optional until (ms) required; until >= since",
+            }),
+        );
+    };
+    if until_ms < since_ms {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "ok": false,
+                "reason": "bad_window",
+                "message": "query since (ms) and optional until (ms) required; until >= since",
+            }),
+        );
+    }
+    let clipped_since = since_ms.max(now_ms.saturating_sub(MAX_MCP_ACTIVITY_LOOKBACK_MS));
+    let ua_includes = query
+        .get("ua")
+        .or_else(|| query.get("ua_includes"))
+        .map(String::as_str)
+        .unwrap_or("openai-mcp");
+    let (count, records) = state.activity.query(clipped_since, until_ms, ua_includes);
+    let tools = records
+        .into_iter()
+        .map(|record| {
+            json!({
+                "at": iso_from_ms(record.at_ms),
+                "tool": record.tool,
+                "call": record.call,
+                "ua": record.user_agent,
+                "status": record.status,
+            })
+        })
+        .collect::<Vec<_>>();
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "ok": true,
+            "since": iso_from_ms(clipped_since),
+            "until": iso_from_ms(until_ms),
+            "since_ms": clipped_since,
+            "until_ms": until_ms,
+            "ua_includes": if ua_includes.is_empty() { Value::Null } else { json!(ua_includes) },
+            "count": count,
+            "tools": tools,
+        }),
+    )
 }
 
 fn push_state_payload(cache: &EventCache) -> Value {
@@ -614,6 +756,22 @@ fn iso_now() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn iso_from_ms(value: u64) -> String {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(value) * 1_000_000)
+        .ok()
+        .and_then(|time| time.format(&Rfc3339).ok())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
+}
+
 async fn health(State(state): State<AppState>) -> Response {
     let mut payload = runtime_meta::health_fields(&state.cache, Some(&state.exec));
     payload.insert("ok".to_owned(), json!(true));
@@ -689,6 +847,7 @@ async fn delete_mcp(State(state): State<AppState>, headers: HeaderMap) -> Respon
 }
 
 async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let started_at_ms = epoch_ms();
     if !request_authorized(&state, &headers) {
         return json_response(
             StatusCode::UNAUTHORIZED,
@@ -783,11 +942,36 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     } else {
         None
     };
-    if wants_sse(&headers, &request) {
+    let http_response = if wants_sse(&headers, &request) {
         sse_response(&response, issued_session.as_deref())
     } else {
         json_response_with_session(StatusCode::OK, &response, issued_session.as_deref())
+    };
+    if request.get("method").and_then(Value::as_str) == Some("tools/call")
+        && let Some(tool) = request.pointer("/params/name").and_then(Value::as_str)
+    {
+        let call = (tool == "herdr_call")
+            .then(|| {
+                request
+                    .pointer("/params/arguments/method")
+                    .and_then(Value::as_str)
+            })
+            .flatten()
+            .map(str::to_owned);
+        let user_agent = headers
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-")
+            .to_owned();
+        state.activity.record(McpActivityRecord {
+            at_ms: started_at_ms,
+            tool: tool.to_owned(),
+            call,
+            user_agent,
+            status: http_response.status().as_u16(),
+        });
     }
+    http_response
 }
 
 fn is_stateless_client(headers: &HeaderMap, request: Option<&Value>) -> bool {
@@ -966,6 +1150,7 @@ mod tests {
             prompt: PromptRegistry::new(),
             skill: SkillService::new(),
             sessions: SessionRegistry::default(),
+            activity: McpActivityRegistry::default(),
             bearer_token: Arc::<[u8]>::from(b"test-token".to_vec()),
             trusted_extension_ipc: false,
         }
@@ -1165,6 +1350,102 @@ mod tests {
         assert!(text.contains("retry: 2000"));
         assert!(text.contains("event: hello"));
         assert!(text.contains("herdr-mcp-push/v1"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn mcp_activity_registry_is_bounded_and_returns_last_50_matches() {
+        let activity = McpActivityRegistry::default();
+        for index in 0..(MAX_MCP_ACTIVITY_RECORDS + 100) {
+            activity.record(McpActivityRecord {
+                at_ms: index as u64,
+                tool: format!("tool-{index}"),
+                call: None,
+                user_agent: "openai-mcp/1.0".to_owned(),
+                status: 200,
+            });
+        }
+        assert_eq!(activity.len(), MAX_MCP_ACTIVITY_RECORDS);
+        let (count, tools) = activity.query(0, u64::MAX, "openai-mcp");
+        assert_eq!(count, MAX_MCP_ACTIVITY_RECORDS);
+        assert_eq!(tools.len(), MAX_MCP_ACTIVITY_RESULTS);
+        assert_eq!(tools.first().unwrap().tool, "tool-2050");
+        assert_eq!(tools.last().unwrap().tool, "tool-2099");
+        assert_eq!(activity.query(0, u64::MAX, "other-agent").0, 0);
+    }
+
+    #[tokio::test]
+    async fn tools_call_records_mcp_activity_and_query_matches_node_contract() {
+        let root = test_root("mcp-activity");
+        let app = candidate_router(test_state(&root));
+        let request = rpc_request(
+            Method::POST,
+            "/mcp",
+            Some(json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{"name":"herdr_methods","arguments":{}}
+            })),
+            &[("user-agent", "openai-mcp/1.0")],
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let query = Request::builder()
+            .method(Method::GET)
+            .uri("/push/mcp-activity?since=0&ua=openai-mcp")
+            .header(AUTHORIZATION, "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(query).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["count"], 1);
+        assert_eq!(payload["tools"][0]["tool"], "herdr_methods");
+        assert_eq!(payload["tools"][0]["ua"], "openai-mcp/1.0");
+        assert_eq!(payload["tools"][0]["status"], 200);
+        assert!(payload["since_ms"].as_u64().unwrap() > 0);
+        assert_eq!(payload["ua_includes"], "openai-mcp");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn mcp_activity_bad_window_and_trusted_ipc_auth_match_push_contract() {
+        let root = test_root("mcp-activity-auth");
+        let tcp = candidate_router(test_state(&root.join("tcp")));
+        let no_auth = Request::builder()
+            .method(Method::GET)
+            .uri("/push/mcp-activity?since=0")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            tcp.oneshot(no_auth).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut extension_state = test_state(&root.join("extension"));
+        extension_state.trusted_extension_ipc = true;
+        let extension = candidate_router(extension_state);
+        let bad = Request::builder()
+            .method(Method::GET)
+            .uri("/push/mcp-activity?since=20&until=10")
+            .body(Body::empty())
+            .unwrap();
+        let response = extension.clone().oneshot(bad).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let good = Request::builder()
+            .method(Method::GET)
+            .uri("/push/mcp-activity?since=0")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            extension.oneshot(good).await.unwrap().status(),
+            StatusCode::OK
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

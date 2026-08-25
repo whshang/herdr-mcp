@@ -135,9 +135,34 @@ CREATE INDEX IF NOT EXISTS idx_service_events_at
     ON service_events(at DESC);
 "#;
 
+/// Migration 4: post-commit service rollback identity. Sensitive plist bytes
+/// remain in mode-0600 backup files; SQLite stores only owned backup paths and
+/// lifecycle/fencing metadata so a browser-UAT failure can deterministically
+/// return to the exact previous service after install has already committed.
+const MIGRATION_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS service_rollbacks (
+    rollback_id             TEXT PRIMARY KEY NOT NULL,
+    source_kind             TEXT NOT NULL,
+    activated_generation_id TEXT NOT NULL,
+    server_plist_backup     TEXT,
+    watchdog_plist_backup   TEXT,
+    previous_current_target TEXT,
+    server_was_loaded       INTEGER NOT NULL,
+    watchdog_was_loaded     INTEGER NOT NULL,
+    created_at              INTEGER NOT NULL,
+    state                   TEXT NOT NULL,
+    consumed_at             INTEGER
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_service_rollbacks_ready
+    ON service_rollbacks(state) WHERE state = 'ready';
+CREATE INDEX IF NOT EXISTS idx_service_rollbacks_created
+    ON service_rollbacks(created_at DESC);
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
-const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3];
+const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4];
 
 /// Existing durable operation found while reserving an idempotency key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -508,6 +533,20 @@ pub struct RuntimeGenerationRecord {
     pub deactivated_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRollbackRecord {
+    pub rollback_id: String,
+    pub source_kind: String,
+    pub activated_generation_id: String,
+    pub server_plist_backup: Option<String>,
+    pub watchdog_plist_backup: Option<String>,
+    pub previous_current_target: Option<String>,
+    pub server_was_loaded: bool,
+    pub watchdog_was_loaded: bool,
+    pub created_at: i64,
+    pub state: String,
+}
+
 impl StateStore {
     pub fn record_exec_running(
         &self,
@@ -665,6 +704,15 @@ impl StateStore {
         generation_id: &str,
         now_ms: i64,
     ) -> Result<(), String> {
+        self.activate_runtime_generation_with_rollback(generation_id, None, now_ms)
+    }
+
+    pub fn activate_runtime_generation_with_rollback(
+        &mut self,
+        generation_id: &str,
+        rollback_id: Option<&str>,
+        now_ms: i64,
+    ) -> Result<(), String> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -701,6 +749,26 @@ impl StateStore {
             return Err(format!(
                 "runtime generation activation updated {changed} rows"
             ));
+        }
+        if let Some(rollback_id) = rollback_id {
+            tx.execute(
+                "UPDATE service_rollbacks SET state = 'superseded'
+                 WHERE state = 'ready' AND rollback_id <> ?1",
+                [rollback_id],
+            )
+            .map_err(|error| format!("cannot supersede previous service rollback: {error}"))?;
+            let changed = tx
+                .execute(
+                    "UPDATE service_rollbacks SET state = 'ready'
+                     WHERE rollback_id = ?1 AND state = 'prepared'",
+                    [rollback_id],
+                )
+                .map_err(|error| format!("cannot mark service rollback ready: {error}"))?;
+            if changed != 1 {
+                return Err(format!(
+                    "service rollback activation expected one prepared row, updated {changed}"
+                ));
+            }
         }
         tx.commit()
             .map_err(|error| format!("cannot commit generation activation: {error}"))
@@ -754,6 +822,229 @@ impl StateStore {
             .map_err(|error| format!("cannot record service event: {error}"))?;
         Ok(())
     }
+
+    pub fn prepare_service_rollback(&self, record: &ServiceRollbackRecord) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO service_rollbacks (
+                    rollback_id, source_kind, activated_generation_id,
+                    server_plist_backup, watchdog_plist_backup,
+                    previous_current_target, server_was_loaded,
+                    watchdog_was_loaded, created_at, state, consumed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'prepared', NULL)",
+                params![
+                    record.rollback_id,
+                    record.source_kind,
+                    record.activated_generation_id,
+                    record.server_plist_backup,
+                    record.watchdog_plist_backup,
+                    record.previous_current_target,
+                    i64::from(record.server_was_loaded),
+                    i64::from(record.watchdog_was_loaded),
+                    record.created_at,
+                ],
+            )
+            .map_err(|error| format!("cannot prepare service rollback: {error}"))?;
+        Ok(())
+    }
+
+    pub fn mark_service_rollback_ready(&mut self, rollback_id: &str) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin rollback-ready transition: {error}"))?;
+        tx.execute(
+            "UPDATE service_rollbacks SET state = 'superseded'
+             WHERE state = 'ready' AND rollback_id <> ?1",
+            [rollback_id],
+        )
+        .map_err(|error| format!("cannot supersede previous service rollback: {error}"))?;
+        let changed = tx
+            .execute(
+                "UPDATE service_rollbacks SET state = 'ready'
+                 WHERE rollback_id = ?1 AND state = 'prepared'",
+                [rollback_id],
+            )
+            .map_err(|error| format!("cannot mark service rollback ready: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "service rollback ready transition expected one prepared row, updated {changed}"
+            ));
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit rollback-ready transition: {error}"))
+    }
+
+    pub fn mark_prepared_service_rollback(
+        &self,
+        rollback_id: &str,
+        state: &str,
+        at_ms: i64,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE service_rollbacks
+                 SET state = ?2, consumed_at = ?3
+                 WHERE rollback_id = ?1 AND state IN ('prepared', 'ready')",
+                params![rollback_id, state, at_ms],
+            )
+            .map_err(|error| format!("cannot settle prepared service rollback: {error}"))?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "prepared service rollback transition updated {changed} rows"
+            ))
+        }
+    }
+
+    pub fn begin_latest_service_rollback(
+        &mut self,
+    ) -> Result<Option<ServiceRollbackRecord>, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin service rollback claim: {error}"))?;
+        let record = tx
+            .query_row(
+                "SELECT rollback_id, source_kind, activated_generation_id,
+                        server_plist_backup, watchdog_plist_backup,
+                        previous_current_target, server_was_loaded,
+                        watchdog_was_loaded, created_at, state
+                 FROM service_rollbacks
+                 WHERE state = 'ready'
+                 ORDER BY created_at DESC LIMIT 1",
+                [],
+                decode_service_rollback,
+            )
+            .optional()
+            .map_err(|error| format!("cannot read ready service rollback: {error}"))?;
+        let Some(record) = record else {
+            tx.commit()
+                .map_err(|error| format!("cannot commit empty rollback claim: {error}"))?;
+            return Ok(None);
+        };
+        let changed = tx
+            .execute(
+                "UPDATE service_rollbacks SET state = 'consuming'
+                 WHERE rollback_id = ?1 AND state = 'ready'",
+                [&record.rollback_id],
+            )
+            .map_err(|error| format!("cannot claim service rollback: {error}"))?;
+        if changed != 1 {
+            return Err("service rollback claim lost concurrent race".to_owned());
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit service rollback claim: {error}"))?;
+        Ok(Some(ServiceRollbackRecord {
+            state: "consuming".to_owned(),
+            ..record
+        }))
+    }
+
+    pub fn finish_service_rollback(
+        &self,
+        rollback_id: &str,
+        state: &str,
+        at_ms: i64,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE service_rollbacks
+                 SET state = ?2,
+                     consumed_at = CASE WHEN ?2 = 'ready' THEN NULL ELSE ?3 END
+                 WHERE rollback_id = ?1 AND state = 'consuming'",
+                params![rollback_id, state, at_ms],
+            )
+            .map_err(|error| format!("cannot finish service rollback: {error}"))?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(format!("service rollback finish updated {changed} rows"))
+        }
+    }
+
+    pub fn complete_service_rollback(
+        &mut self,
+        rollback_id: &str,
+        activated_generation_id: &str,
+        previous_generation_id: Option<&str>,
+        at_ms: i64,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin completed service rollback: {error}"))?;
+        let active = tx
+            .query_row(
+                "SELECT generation_id FROM runtime_generations WHERE state = 'active'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot read active generation during rollback: {error}"))?;
+        if active.as_deref() != Some(activated_generation_id) {
+            return Err(format!(
+                "active generation changed before rollback completion: expected {activated_generation_id}, got {}",
+                active.as_deref().unwrap_or("none")
+            ));
+        }
+        tx.execute(
+            "UPDATE runtime_generations
+             SET state = 'rolled_back', deactivated_at = ?1
+             WHERE generation_id = ?2 AND state = 'active'",
+            params![at_ms, activated_generation_id],
+        )
+        .map_err(|error| format!("cannot retire rolled-back generation: {error}"))?;
+        if let Some(previous_generation_id) = previous_generation_id {
+            let changed = tx
+                .execute(
+                    "UPDATE runtime_generations
+                     SET state = 'active', deactivated_at = NULL,
+                         activated_at = COALESCE(activated_at, ?1)
+                     WHERE generation_id = ?2",
+                    params![at_ms, previous_generation_id],
+                )
+                .map_err(|error| format!("cannot reactivate previous generation: {error}"))?;
+            if changed != 1 {
+                return Err(format!(
+                    "cannot reactivate previous generation {previous_generation_id}"
+                ));
+            }
+        }
+        let changed = tx
+            .execute(
+                "UPDATE service_rollbacks
+                 SET state = 'consumed', consumed_at = ?2
+                 WHERE rollback_id = ?1 AND state = 'consuming'",
+                params![rollback_id, at_ms],
+            )
+            .map_err(|error| format!("cannot consume service rollback: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "service rollback consume expected one claimed row, updated {changed}"
+            ));
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit completed service rollback: {error}"))
+    }
+}
+
+fn decode_service_rollback(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRollbackRecord> {
+    Ok(ServiceRollbackRecord {
+        rollback_id: row.get(0)?,
+        source_kind: row.get(1)?,
+        activated_generation_id: row.get(2)?,
+        server_plist_backup: row.get(3)?,
+        watchdog_plist_backup: row.get(4)?,
+        previous_current_target: row.get(5)?,
+        server_was_loaded: row.get::<_, i64>(6)? != 0,
+        watchdog_was_loaded: row.get::<_, i64>(7)? != 0,
+        created_at: row.get(8)?,
+        state: row.get(9)?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,6 +1311,7 @@ mod tests {
             "exec_sessions",
             "runtime_generations",
             "service_events",
+            "service_rollbacks",
         ] {
             assert!(tables.contains(&table.to_owned()), "missing table {table}");
         }
@@ -1031,6 +1323,8 @@ mod tests {
             "idx_exec_sessions_expires",
             "idx_runtime_generation_active",
             "idx_service_events_at",
+            "idx_service_rollbacks_ready",
+            "idx_service_rollbacks_created",
         ] {
             assert!(indexes.contains(&index.to_owned()), "missing index {index}");
         }
@@ -1207,6 +1501,171 @@ mod tests {
     }
 
     #[test]
+    fn service_rollback_claim_is_single_use_and_completion_reactivates_previous_generation() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        store
+            .stage_runtime_generation("rust-a", "/runtime/a", "sha-a", "install", 10)
+            .unwrap();
+        store
+            .stage_runtime_generation("rust-b", "/runtime/b", "sha-b", "update", 20)
+            .unwrap();
+        store.activate_runtime_generation("rust-a", 30).unwrap();
+        store
+            .prepare_service_rollback(&ServiceRollbackRecord {
+                rollback_id: "rb-1".to_owned(),
+                source_kind: "rust".to_owned(),
+                activated_generation_id: "rust-b".to_owned(),
+                server_plist_backup: Some("/backups/server.plist".to_owned()),
+                watchdog_plist_backup: None,
+                previous_current_target: Some("generations/rust-a".to_owned()),
+                server_was_loaded: true,
+                watchdog_was_loaded: false,
+                created_at: 35,
+                state: "prepared".to_owned(),
+            })
+            .unwrap();
+        store
+            .activate_runtime_generation_with_rollback("rust-b", Some("rb-1"), 40)
+            .unwrap();
+        assert_eq!(
+            store
+                .active_runtime_generation()
+                .unwrap()
+                .unwrap()
+                .generation_id,
+            "rust-b"
+        );
+
+        let claimed = store
+            .begin_latest_service_rollback()
+            .unwrap()
+            .expect("ready rollback");
+        assert_eq!(claimed.rollback_id, "rb-1");
+        assert_eq!(claimed.state, "consuming");
+        assert!(store.begin_latest_service_rollback().unwrap().is_none());
+
+        store
+            .complete_service_rollback("rb-1", "rust-b", Some("rust-a"), 50)
+            .unwrap();
+        assert_eq!(
+            store
+                .active_runtime_generation()
+                .unwrap()
+                .unwrap()
+                .generation_id,
+            "rust-a"
+        );
+        assert_eq!(
+            store
+                .scalar_text("SELECT state FROM runtime_generations WHERE generation_id = 'rust-b'")
+                .unwrap()
+                .as_deref(),
+            Some("rolled_back")
+        );
+        assert_eq!(
+            store
+                .scalar_text("SELECT state FROM service_rollbacks WHERE rollback_id = 'rb-1'")
+                .unwrap()
+                .as_deref(),
+            Some("consumed")
+        );
+    }
+
+    #[test]
+    fn failed_post_commit_rollback_can_release_claim_without_consuming_it() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        store
+            .stage_runtime_generation("rust-current", "/runtime/current", "sha", "install", 1)
+            .unwrap();
+        store
+            .prepare_service_rollback(&ServiceRollbackRecord {
+                rollback_id: "rb-retry".to_owned(),
+                source_kind: "node".to_owned(),
+                activated_generation_id: "rust-current".to_owned(),
+                server_plist_backup: Some("/backups/node.plist".to_owned()),
+                watchdog_plist_backup: Some("/backups/watchdog.plist".to_owned()),
+                previous_current_target: None,
+                server_was_loaded: true,
+                watchdog_was_loaded: true,
+                created_at: 2,
+                state: "prepared".to_owned(),
+            })
+            .unwrap();
+        store
+            .activate_runtime_generation_with_rollback("rust-current", Some("rb-retry"), 3)
+            .unwrap();
+        let first = store.begin_latest_service_rollback().unwrap().unwrap();
+        assert_eq!(first.state, "consuming");
+        store
+            .finish_service_rollback("rb-retry", "ready", 4)
+            .unwrap();
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM service_rollbacks
+                     WHERE rollback_id = 'rb-retry' AND consumed_at IS NULL"
+                )
+                .unwrap(),
+            Some(1)
+        );
+        let second = store.begin_latest_service_rollback().unwrap().unwrap();
+        assert_eq!(second.rollback_id, "rb-retry");
+    }
+
+    #[test]
+    fn node_service_rollback_consumes_record_and_leaves_no_active_rust_generation() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        store
+            .stage_runtime_generation(
+                "rust-node-cutover",
+                "/runtime/new",
+                "sha",
+                "node-adoption",
+                1,
+            )
+            .unwrap();
+        store
+            .prepare_service_rollback(&ServiceRollbackRecord {
+                rollback_id: "rb-node".to_owned(),
+                source_kind: "node".to_owned(),
+                activated_generation_id: "rust-node-cutover".to_owned(),
+                server_plist_backup: Some("/backups/node.plist".to_owned()),
+                watchdog_plist_backup: Some("/backups/watchdog.plist".to_owned()),
+                previous_current_target: None,
+                server_was_loaded: true,
+                watchdog_was_loaded: true,
+                created_at: 2,
+                state: "prepared".to_owned(),
+            })
+            .unwrap();
+        store
+            .activate_runtime_generation_with_rollback("rust-node-cutover", Some("rb-node"), 3)
+            .unwrap();
+        let claimed = store.begin_latest_service_rollback().unwrap().unwrap();
+        assert_eq!(claimed.source_kind, "node");
+        store
+            .complete_service_rollback("rb-node", "rust-node-cutover", None, 4)
+            .unwrap();
+        assert!(store.active_runtime_generation().unwrap().is_none());
+        assert_eq!(
+            store
+                .scalar_text(
+                    "SELECT state FROM runtime_generations WHERE generation_id = 'rust-node-cutover'"
+                )
+                .unwrap()
+                .as_deref(),
+            Some("rolled_back")
+        );
+        assert_eq!(
+            store
+                .scalar_text("SELECT state FROM service_rollbacks WHERE rollback_id = 'rb-node'")
+                .unwrap()
+                .as_deref(),
+            Some("consumed")
+        );
+    }
+
+    #[test]
     fn schema_v2_upgrades_to_generation_tables_without_losing_existing_rows() {
         let path = temp_db_path();
         {
@@ -1235,7 +1694,7 @@ mod tests {
         }
 
         let store = StateStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(
             store
                 .scalar_i64("SELECT COUNT(*) FROM operations WHERE op_id = 'pre-v3-op'")

@@ -28,7 +28,7 @@ pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
 mod macos {
     use super::*;
     use crate::paths::RuntimePaths;
-    use crate::state_store::StateStore;
+    use crate::state_store::{ServiceRollbackRecord, StateStore};
     use plist::{Dictionary, Value as PlistValue};
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
@@ -74,6 +74,15 @@ mod macos {
         Other,
     }
 
+    fn service_kind_name(kind: &ServiceKind) -> &'static str {
+        match kind {
+            ServiceKind::Missing => "missing",
+            ServiceKind::Rust => "rust",
+            ServiceKind::Node => "node",
+            ServiceKind::Other => "other",
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct ServiceDescriptor {
         kind: ServiceKind,
@@ -104,6 +113,7 @@ mod macos {
             ServiceCommand::Start => start(&paths)?,
             ServiceCommand::Stop => stop(&paths)?,
             ServiceCommand::Restart => restart(&paths)?,
+            ServiceCommand::Rollback => rollback(&paths)?,
             ServiceCommand::Uninstall => uninstall(&paths)?,
         };
         println!(
@@ -224,14 +234,52 @@ mod macos {
             previous_current: current_target(paths)?,
         };
 
+        let source_kind = match existing.kind {
+            ServiceKind::Node => Some("node"),
+            ServiceKind::Rust => Some("rust"),
+            ServiceKind::Missing => None,
+            ServiceKind::Other => unreachable!("unowned services were rejected above"),
+        };
         let mut backups = Vec::new();
-        if existing.kind == ServiceKind::Node {
-            if let Some(bytes) = existing_bytes.as_deref() {
-                backups.push(backup_bytes(paths, "node-server", bytes)?);
+        let server_backup = match (source_kind, existing_bytes.as_deref()) {
+            (Some(kind), Some(bytes)) => {
+                let path = backup_bytes(paths, &format!("{kind}-server"), bytes)?;
+                backups.push(path.clone());
+                Some(path)
             }
-            if let Some(bytes) = watchdog_bytes.as_deref() {
-                backups.push(backup_bytes(paths, "node-watchdog", bytes)?);
+            _ => None,
+        };
+        let watchdog_backup = match watchdog_bytes.as_deref() {
+            Some(bytes) => {
+                let path = backup_bytes(paths, "node-watchdog", bytes)?;
+                backups.push(path.clone());
+                Some(path)
             }
+            None => None,
+        };
+        let rollback_id = source_kind.map(|kind| {
+            format!(
+                "rb-{}-{kind}-{}",
+                now,
+                generation.sha256.get(..8).unwrap_or("generation")
+            )
+        });
+        if let (Some(rollback_id), Some(source_kind)) = (rollback_id.as_deref(), source_kind) {
+            store.prepare_service_rollback(&ServiceRollbackRecord {
+                rollback_id: rollback_id.to_owned(),
+                source_kind: source_kind.to_owned(),
+                activated_generation_id: generation.generation_id.clone(),
+                server_plist_backup: server_backup.clone(),
+                watchdog_plist_backup: watchdog_backup.clone(),
+                previous_current_target: rollback
+                    .previous_current
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                server_was_loaded: rollback.server_was_loaded,
+                watchdog_was_loaded: rollback.watchdog_was_loaded,
+                created_at: now,
+                state: "prepared".to_owned(),
+            })?;
         }
 
         let activation = (|| -> Result<(), String> {
@@ -248,12 +296,27 @@ mod macos {
             switch_current(paths, &generation)?;
             bootstrap(&paths.plist)?;
             wait_for_health(DEFAULT_PORT)?;
-            store.activate_runtime_generation(&generation.generation_id, now_ms_i64())?;
+            store.activate_runtime_generation_with_rollback(
+                &generation.generation_id,
+                rollback_id.as_deref(),
+                now_ms_i64(),
+            )?;
             Ok(())
         })();
 
         if let Err(error) = activation {
             let rollback_error = rollback_install(paths, &rollback).err();
+            if let Some(rollback_id) = rollback_id.as_deref() {
+                let _ = store.mark_prepared_service_rollback(
+                    rollback_id,
+                    if rollback_error.is_some() {
+                        "rollback_failed"
+                    } else {
+                        "auto_rolled_back"
+                    },
+                    now_ms_i64(),
+                );
+            }
             let _ = store.record_service_event(
                 "install",
                 "rolled_back",
@@ -296,6 +359,8 @@ mod macos {
             "adopted_node": existing.kind == ServiceKind::Node,
             "retired_legacy_watchdog": rollback.watchdog_plist.is_some(),
             "backups": backups,
+            "rollback_id": rollback_id,
+            "rollback_ready": rollback_id.is_some(),
             "evidence_recorded": evidence_recorded,
         }))
     }
@@ -374,6 +439,200 @@ mod macos {
             "ok": true,
             "action": "restart",
             "label": SERVICE_LABEL,
+            "evidence_recorded": evidence_recorded,
+        }))
+    }
+
+    fn rollback(paths: &ServicePaths) -> Result<Value, String> {
+        let current_bytes = read_optional_bounded(&paths.plist, 256 * 1024)?
+            .ok_or_else(|| "Rust service plist is missing".to_owned())?;
+        let current = require_rust_service(paths)?;
+        let current_generation = current
+            .env
+            .get("HERDR_MCP_RUNTIME_GENERATION")
+            .cloned()
+            .ok_or_else(|| "Rust service generation identity is missing".to_owned())?;
+        let current_target = current_target(paths)?
+            .ok_or_else(|| "Rust service runtime/current pointer is missing".to_owned())?;
+        if !is_owned_generation_target(&current_target) {
+            return Err("Rust service runtime/current pointer is not managed".to_owned());
+        }
+        let current_was_loaded = is_loaded(SERVICE_LABEL);
+
+        let mut store = StateStore::open_in_dir(&paths.config_dir, "state")?;
+        let rollback = store
+            .begin_latest_service_rollback()?
+            .ok_or_else(|| "no ready service rollback is available".to_owned())?;
+
+        let release_claim = |store: &StateStore, reason: String| -> Result<Value, String> {
+            let release =
+                store.finish_service_rollback(&rollback.rollback_id, "ready", now_ms_i64());
+            Err(match release {
+                Ok(()) => reason,
+                Err(error) => {
+                    format!("{reason}; rollback claim could not be released safely: {error}")
+                }
+            })
+        };
+
+        if rollback.activated_generation_id != current_generation {
+            return release_claim(
+                &store,
+                format!(
+                    "ready rollback {} targets generation {}, but current service is {}",
+                    rollback.rollback_id, rollback.activated_generation_id, current_generation
+                ),
+            );
+        }
+
+        let Some(server_backup) = rollback.server_plist_backup.as_deref() else {
+            return release_claim(
+                &store,
+                format!(
+                    "rollback {} has no server plist backup",
+                    rollback.rollback_id
+                ),
+            );
+        };
+        let source_bytes = match read_owned_backup(paths, server_backup) {
+            Ok(bytes) => bytes,
+            Err(error) => return release_claim(&store, error),
+        };
+        let source = match describe_service(Some(&source_bytes), paths) {
+            Ok(source) => source,
+            Err(error) => return release_claim(&store, error),
+        };
+        let source_kind = service_kind_name(&source.kind);
+        if source_kind != rollback.source_kind {
+            return release_claim(
+                &store,
+                format!(
+                    "rollback source mismatch: ledger={}, backup={source_kind}",
+                    rollback.source_kind
+                ),
+            );
+        }
+        if !matches!(source.kind, ServiceKind::Node | ServiceKind::Rust) {
+            return release_claim(
+                &store,
+                "rollback server backup is not an owned Node/Rust service".to_owned(),
+            );
+        }
+
+        let watchdog_bytes = match rollback.watchdog_plist_backup.as_deref() {
+            Some(path) => match read_owned_backup(paths, path) {
+                Ok(bytes) => {
+                    if !watchdog_is_legacy_owned(Some(&bytes))? {
+                        return release_claim(
+                            &store,
+                            "rollback watchdog backup is not legacy herdr-mcp watchdog".to_owned(),
+                        );
+                    }
+                    Some(bytes)
+                }
+                Err(error) => return release_claim(&store, error),
+            },
+            None => None,
+        };
+        if rollback.watchdog_was_loaded && watchdog_bytes.is_none() {
+            return release_claim(
+                &store,
+                "rollback requires a loaded watchdog but has no watchdog backup".to_owned(),
+            );
+        }
+
+        let previous_target = rollback
+            .previous_current_target
+            .as_deref()
+            .map(PathBuf::from);
+        if previous_target
+            .as_deref()
+            .is_some_and(|target| !is_owned_generation_target(target))
+        {
+            return release_claim(
+                &store,
+                "rollback previous runtime/current target is not managed".to_owned(),
+            );
+        }
+        let previous_generation_id = if source.kind == ServiceKind::Rust {
+            previous_target
+                .as_deref()
+                .and_then(generation_id_from_target)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    "Rust rollback source has no managed previous generation target".to_owned()
+                })?
+                .into()
+        } else {
+            None
+        };
+
+        let apply = (|| -> Result<(), String> {
+            if current_was_loaded {
+                bootout(SERVICE_LABEL)?;
+            }
+            atomic_write(&paths.plist, &source_bytes, 0o600)?;
+            restore_current(paths, previous_target.as_deref())?;
+            if let Some(bytes) = watchdog_bytes.as_deref() {
+                atomic_write(&paths.watchdog_plist, bytes, 0o600)?;
+            }
+            if rollback.server_was_loaded {
+                bootstrap(&paths.plist)?;
+                wait_for_service_health(&source, DEFAULT_PORT)?;
+            }
+            if rollback.watchdog_was_loaded {
+                bootstrap(&paths.watchdog_plist)?;
+            }
+            store.complete_service_rollback(
+                &rollback.rollback_id,
+                &rollback.activated_generation_id,
+                previous_generation_id.as_deref(),
+                now_ms_i64(),
+            )?;
+            Ok(())
+        })();
+
+        if let Err(error) = apply {
+            let restore_error = restore_current_rust_after_failed_rollback(
+                paths,
+                &current_bytes,
+                &current_target,
+                current_was_loaded,
+            )
+            .err();
+            let state = if restore_error.is_some() {
+                "rollback_failed"
+            } else {
+                "ready"
+            };
+            let _ = store.finish_service_rollback(&rollback.rollback_id, state, now_ms_i64());
+            return Err(match restore_error {
+                Some(restore_error) => format!(
+                    "service rollback failed: {error}; restoring current Rust service also failed: {restore_error}"
+                ),
+                None => format!(
+                    "service rollback failed but current Rust service was restored: {error}"
+                ),
+            });
+        }
+
+        let evidence_recorded = store
+            .record_service_event(
+                "rollback",
+                "ok",
+                Some(&rollback.activated_generation_id),
+                now_ms_i64(),
+                Some(&format!("restored-{}", rollback.source_kind)),
+            )
+            .is_ok();
+        Ok(json!({
+            "ok": true,
+            "action": "rollback",
+            "rollback_id": rollback.rollback_id,
+            "from_generation": rollback.activated_generation_id,
+            "restored_implementation": rollback.source_kind,
+            "restored_loaded": rollback.server_was_loaded,
+            "restored_watchdog": rollback.watchdog_was_loaded,
             "evidence_recorded": evidence_recorded,
         }))
     }
@@ -715,6 +974,19 @@ mod macos {
             && components.next().is_none()
     }
 
+    fn generation_id_from_target(target: &Path) -> Option<&str> {
+        let mut components = target.components();
+        if !matches!(components.next(), Some(Component::Normal(value)) if value == OsStr::new("generations"))
+        {
+            return None;
+        }
+        let id = match components.next() {
+            Some(Component::Normal(value)) => value.to_str()?,
+            _ => return None,
+        };
+        (id.starts_with("rust-") && components.next().is_none()).then_some(id)
+    }
+
     fn restore_current(paths: &ServicePaths, previous: Option<&Path>) -> Result<(), String> {
         match previous {
             Some(previous) => {
@@ -782,6 +1054,40 @@ mod macos {
             .join(format!("{SERVICE_LABEL}.{kind}.{}.plist", now_ms_i64()));
         atomic_write(&path, bytes, 0o600)?;
         Ok(path.to_string_lossy().into_owned())
+    }
+
+    fn read_owned_backup(paths: &ServicePaths, value: &str) -> Result<Vec<u8>, String> {
+        let path = PathBuf::from(value);
+        if path.parent() != Some(paths.backups_dir.as_path()) {
+            return Err(format!(
+                "rollback backup is outside managed backup directory: {}",
+                path.display()
+            ));
+        }
+        read_optional_bounded(&path, 256 * 1024)?
+            .ok_or_else(|| format!("rollback backup is missing: {}", path.display()))
+    }
+
+    fn restore_current_rust_after_failed_rollback(
+        paths: &ServicePaths,
+        current_plist: &[u8],
+        current_target: &Path,
+        current_was_loaded: bool,
+    ) -> Result<(), String> {
+        if is_loaded(WATCHDOG_LABEL) {
+            bootout(WATCHDOG_LABEL)?;
+        }
+        remove_regular_file(&paths.watchdog_plist)?;
+        if is_loaded(SERVICE_LABEL) {
+            bootout(SERVICE_LABEL)?;
+        }
+        atomic_write(&paths.plist, current_plist, 0o600)?;
+        restore_current(paths, Some(current_target))?;
+        if current_was_loaded {
+            bootstrap(&paths.plist)?;
+            wait_for_health(DEFAULT_PORT)?;
+        }
+        Ok(())
     }
 
     fn read_optional_bounded(path: &Path, max: usize) -> Result<Option<Vec<u8>>, String> {
@@ -995,6 +1301,57 @@ mod macos {
             .is_some_and(|value| value.get("ok").and_then(Value::as_bool) == Some(true))
     }
 
+    fn mcp_discover_once(descriptor: &ServiceDescriptor, port: u16) -> bool {
+        let Some(token) = descriptor
+            .env
+            .get("HERDR_MCP_TOKEN")
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(900))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => return false,
+        };
+        client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json")
+            .body(
+                r#"{"jsonrpc":"2.0","id":"service-health","method":"server/discover","params":{}}"#,
+            )
+            .send()
+            .ok()
+            .filter(|response| response.status().is_success())
+            .and_then(|response| response.text().ok())
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .is_some_and(|value| value.get("result").is_some())
+    }
+
+    fn wait_for_service_health(descriptor: &ServiceDescriptor, port: u16) -> Result<(), String> {
+        let deadline = Instant::now() + HEALTH_BUDGET;
+        while Instant::now() < deadline {
+            let healthy = match descriptor.kind {
+                ServiceKind::Rust => health_once(port),
+                ServiceKind::Node => mcp_discover_once(descriptor, port),
+                _ => false,
+            };
+            if healthy {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
+        Err(format!(
+            "restored {} service did not become healthy on 127.0.0.1:{port} within {}s",
+            service_kind_name(&descriptor.kind),
+            HEALTH_BUDGET.as_secs()
+        ))
+    }
+
     fn wait_for_health(port: u16) -> Result<(), String> {
         let deadline = Instant::now() + HEALTH_BUDGET;
         while Instant::now() < deadline {
@@ -1154,6 +1511,29 @@ mod macos {
                 ServiceKind::Other
             );
             assert!(!watchdog_is_legacy_owned(Some(&bytes)).unwrap());
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn rollback_backup_reader_is_confined_and_rejects_symlinks() {
+            let (root, paths) = fixture();
+            let backup = backup_bytes(&paths, "node-server", b"owned-backup").unwrap();
+            assert_eq!(read_owned_backup(&paths, &backup).unwrap(), b"owned-backup");
+
+            let outside = root.join("outside.plist");
+            fs::write(&outside, b"outside").unwrap();
+            assert!(
+                read_owned_backup(&paths, outside.to_string_lossy().as_ref()).is_err(),
+                "rollback must not read arbitrary paths"
+            );
+
+            ensure_secure_dir(&paths.backups_dir).unwrap();
+            let link = paths.backups_dir.join("linked.plist");
+            symlink(&outside, &link).unwrap();
+            assert!(
+                read_owned_backup(&paths, link.to_string_lossy().as_ref()).is_err(),
+                "rollback must not follow backup symlinks"
+            );
             fs::remove_dir_all(root).unwrap();
         }
     }

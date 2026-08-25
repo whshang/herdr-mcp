@@ -33,6 +33,7 @@ pub enum ServiceCommand {
     Start,
     Stop,
     Restart,
+    Rollback,
     Uninstall,
 }
 
@@ -126,12 +127,14 @@ fn parse_service(args: &[String]) -> Result<Command, String> {
         [subcommand] if subcommand == "start" => Ok(Command::Service(ServiceCommand::Start)),
         [subcommand] if subcommand == "stop" => Ok(Command::Service(ServiceCommand::Stop)),
         [subcommand] if subcommand == "restart" => Ok(Command::Service(ServiceCommand::Restart)),
+        [subcommand] if subcommand == "rollback" => Ok(Command::Service(ServiceCommand::Rollback)),
         [subcommand] if subcommand == "uninstall" => {
             Ok(Command::Service(ServiceCommand::Uninstall))
         }
-        [] => {
-            Err("service requires install, status, start, stop, restart, or uninstall".to_owned())
-        }
+        [] => Err(
+            "service requires install, status, start, stop, restart, rollback, or uninstall"
+                .to_owned(),
+        ),
         [subcommand, ..] => Err(format!(
             "invalid service command or arguments for '{subcommand}'"
         )),
@@ -179,7 +182,7 @@ Usage:\n\
   herdr-mcp config [path|show|init]\n\
   herdr-mcp dev [--dry-run]\n\
   herdr-mcp candidate [--port 8873]\n\
-  herdr-mcp service <install [--adopt-node]|status|start|stop|restart|uninstall>\n\
+  herdr-mcp service <install [--adopt-node]|status|start|stop|restart|rollback|uninstall>\n\
   herdr-mcp native-host <install|status|uninstall>\n\
   herdr-mcp extension-host <chrome-extension://.../>\n\n\
 The Rust binary is the new local product boundary. Service, update, runtime,\n\
@@ -219,6 +222,10 @@ mod tests {
         assert_eq!(
             parse(args(&["service", "status"])).unwrap(),
             Command::Service(ServiceCommand::Status)
+        );
+        assert_eq!(
+            parse(args(&["service", "rollback"])).unwrap(),
+            Command::Service(ServiceCommand::Rollback)
         );
         assert_eq!(
             parse(args(&["native-host", "status"])).unwrap(),
