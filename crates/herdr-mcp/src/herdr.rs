@@ -204,15 +204,24 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
 
     fn temp_socket() -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("herdr-mcp-rust-{unique}.sock"))
+        let sequence = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "herdr-mcp-rust-{}-{unique}-{sequence}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
     }
 
     #[test]

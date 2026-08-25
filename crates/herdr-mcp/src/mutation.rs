@@ -399,7 +399,10 @@ mod tests {
             "readonly_mode"
         );
 
-        let other = root.parent().unwrap().join("other-root");
+        let other = root.with_file_name(format!(
+            "{}-other",
+            root.file_name().unwrap().to_string_lossy()
+        ));
         fs::create_dir_all(&other).unwrap();
         let restricted = MutationPolicy::new(false, vec![other.clone()]);
         assert_eq!(
