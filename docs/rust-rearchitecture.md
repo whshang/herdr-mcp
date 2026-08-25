@@ -154,15 +154,21 @@ Rust runtime 完成后删除本地 Node runtime。
 5. 实现 Rust Herdr Unix-socket newline-JSON RPC client，包含超时、1 MiB 响应上限和 daemon error 映射；
 6. 实现 `herdr api schema --json` 原生反射、60 秒缓存、8 秒加载上限，以及 required/type/enum/unknown-param 校验；
 7. 建立 Rust `herdr_methods` / `herdr_call` 核心 service，validated call 已通过真实 Herdr daemon smoke；
-8. `doctor` 当前真实验证 MCP runtime、Herdr RPC、live API schema 和 validated RPC；
-9. Rust、root Node、Cloudflare Edge、site build 和 browser extension smoke 已完成整仓回归。
+8. `doctor` 当前真实验证 MCP runtime、Herdr RPC、live API schema、validated RPC、snapshot state 和 Rust inspect projection；
+9. 原生 snapshot 层使用 `session.snapshot`，并发以 `workspace.list` / `pane.list` / `agent.list` 覆盖 live collection；aggregate 失败时回退 list assembly；
+10. Rust `herdr_inspect` 核心投影已覆盖 workspace/tab/pane/agent、Git project、dirty/changed-files、shared project 和 heterogeneous workspace；
+11. Git project discovery 优先父目录 `.git` 确定性扫描，异常布局才回退有超时的 `git rev-parse`；managed project 的 dirty status 并发、有界执行；
+12. Agent soft visibility 已迁移，默认 allowlist 与当前 production 一致，并支持 `HERDR_MCP_AGENT_ALLOW=*`；
+13. `workstation_info` 已由 Rust 提供 default cwd、managed Git roots、read-only/write-root 状态及原生 executable discovery；未来正式产品不把 Node/npm/Python 作为运行依赖；
+14. 第一检查点 `3e93917 feat: bootstrap native Rust runtime` 已提交并推送到 `origin/refactor/rust-supervisor-20260825`；Rust、root Node、Cloudflare Edge、site build 和 browser extension smoke 已完成整仓回归。
 
 下一批开发按以下顺序推进：
 
-1. 将 `herdr_methods` / `herdr_call` 接入 Rust MCP HTTP transport，并建立 TypeScript/Rust tool-result parity fixture；
-2. 迁移 `herdr_inspect` / `herdr_since` 及 snapshot/event state；
-3. 迁移只读 fs/git 工具，再迁 mutation/exec/agent 工具；
-4. 实现 Rust supervisor、service manager、Native Messaging host；
-5. 实现 GitHub Release updater、generation A/B、rollback；
-6. 迁移 relay/link；
-7. Rust 覆盖 18 tools 与 production transport 后删除本地 Node runtime 和旧 lifecycle scripts。
+1. 完成 `herdr_inspect` parity：补 build/runtime metadata、exec-session state，并建立 TypeScript/Rust result fixture；
+2. 建立 Rust 常驻 event cache，使用 Herdr `events.subscribe` 实现 `herdr_since`；不使用轮询替代事件流；
+3. 将 `herdr_methods` / `herdr_call` / `herdr_inspect` 接入 Rust MCP HTTP transport；
+4. 迁移 managed-root/secret-path 安全层和只读 fs/git 工具，再迁 mutation/exec/agent 工具；
+5. 实现 Rust supervisor、service manager、Native Messaging host；
+6. 实现 GitHub Release updater、generation A/B、rollback；
+7. 迁移 relay/link；
+8. Rust 覆盖 18 tools 与 production transport 后删除本地 Node runtime 和旧 lifecycle scripts。

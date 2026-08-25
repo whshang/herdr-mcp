@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_RPC_TIMEOUT: Duration = Duration::from_secs(60);
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -31,7 +34,7 @@ impl HerdrClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
-            timeout: Duration::from_secs(5),
+            timeout: DEFAULT_RPC_TIMEOUT,
         }
     }
 
@@ -44,11 +47,25 @@ impl HerdrClient {
     }
 
     pub fn ping(&self) -> Result<Value, HerdrError> {
-        self.call("ping", json!({}))
+        self.call_with_timeout("ping", json!({}), PING_TIMEOUT)
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value, HerdrError> {
         call_socket(&self.socket_path, self.timeout, method, params)
+    }
+
+    pub fn call_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, HerdrError> {
+        call_socket(
+            &self.socket_path,
+            timeout.min(MAX_RPC_TIMEOUT),
+            method,
+            params,
+        )
     }
 }
 

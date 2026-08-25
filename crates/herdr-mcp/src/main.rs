@@ -1,12 +1,17 @@
+mod agent_visibility;
 mod cli;
 mod config;
 mod contract;
 mod dev;
 mod herdr;
+mod inspect;
 mod native_tools;
 mod paths;
+mod projects;
 mod schema;
+mod snapshot;
 mod status;
+mod workstation;
 
 use std::process::ExitCode;
 

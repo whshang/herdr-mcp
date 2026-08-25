@@ -1,8 +1,13 @@
 use crate::herdr::HerdrClient;
+use crate::inspect;
 use crate::schema::{self, MethodSchema, ValidationIssue};
 use serde_json::{Value, json};
 
 const SCHEMA_SOURCE: &str = "herdr api schema --json (live, 60s cache)";
+
+pub fn inspect(client: &HerdrClient) -> Value {
+    inspect::inspect_core(client)
+}
 
 pub fn methods(query: &str) -> Value {
     match schema::list_methods(query) {

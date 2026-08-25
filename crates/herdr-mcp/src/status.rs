@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::herdr::HerdrClient;
 use crate::native_tools;
 use crate::paths::RuntimePaths;
+use crate::snapshot;
 use serde_json::json;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
@@ -65,11 +66,24 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         .map(|socket| native_tools::call(&HerdrClient::new(socket), "ping", json!({})))
         .unwrap_or_else(|| json!({"ok": false}));
     let native_call_healthy = native_call_result["ok"].as_bool() == Some(true);
+    let snapshot_result = match paths.herdr_socket.as_ref() {
+        Some(socket) => snapshot::fetch(&HerdrClient::new(socket)),
+        None => Err("Herdr local transport is unavailable".to_owned()),
+    };
+    let snapshot_healthy = snapshot_result.is_ok();
+    let inspect_result = paths
+        .herdr_socket
+        .as_ref()
+        .map(|socket| native_tools::inspect(&HerdrClient::new(socket)))
+        .unwrap_or_else(|| json!({"ok": false}));
+    let inspect_healthy = inspect_result["ok"].as_bool() == Some(true);
     println!("Herdr MCP doctor");
     print_check("runtime endpoint", runtime_healthy);
     print_check("Herdr local transport", report.herdr_transport_reachable);
     print_check("Herdr API schema", schema_healthy);
     print_check("validated Herdr RPC", native_call_healthy);
+    print_check("Herdr snapshot state", snapshot_healthy);
+    print_check("Herdr inspect projection", inspect_healthy);
     println!("INFO config {}", paths.config_file.display());
     println!("INFO state {}", paths.config_dir.display());
     println!("INFO dev-state {}", paths.dev_state_dir.display());
@@ -80,8 +94,22 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     if let Some(count) = methods_result["count"].as_u64() {
         println!("INFO herdr-methods {count}");
     }
+    if let Ok(snapshot_result) = &snapshot_result {
+        println!("INFO snapshot-source {}", snapshot_result.source.as_str());
+        println!(
+            "INFO snapshot-counts workspaces={} panes={} agents={}",
+            snapshot::collection_count(&snapshot_result.value, "workspaces"),
+            snapshot::collection_count(&snapshot_result.value, "panes"),
+            snapshot::collection_count(&snapshot_result.value, "agents")
+        );
+    }
 
-    runtime_healthy && report.herdr_transport_reachable && schema_healthy && native_call_healthy
+    runtime_healthy
+        && report.herdr_transport_reachable
+        && schema_healthy
+        && native_call_healthy
+        && snapshot_healthy
+        && inspect_healthy
 }
 
 fn probe_runtime(port: u16) -> RuntimeHealth {
