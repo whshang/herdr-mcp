@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "herdr → Web wake",
-  "version": "0.1.59",
+  "version": "0.1.60",
   "description": "Keep web chats connected to Herdr workspaces with Project-shared or conversation-scoped automation and safe ChatGPT Project rollover. UI: en / zh / ja.",
   "permissions": ["storage", "scripting", "alarms", "nativeMessaging"],
   "host_permissions": [
@@ -39,22 +39,22 @@
   "content_scripts": [
     {
       "matches": ["https://chat.z.ai/*"],
-      "js": ["content/base.js", "content/injector/zai.js", "content/webmcp/speaks-json.js", "content/webmcp/json-bridge-core.js", "content/webmcp/json-bridge.js", "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js", "content/hud/hud.js", "content/wake.js"],
+      "js": ["content/base.js", "content/injector/zai.js", "content/webmcp/speaks-json.js", "content/webmcp/json-bridge-core.js", "content/webmcp/json-bridge.js", "performance-core.js", "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js", "content/hud/hud.js", "content/wake.js"],
       "run_at": "document_idle"
     },
     {
       "matches": ["https://chat.deepseek.com/*"],
-      "js": ["content/base.js", "content/injector/deepseek.js", "content/webmcp/speaks-json.js", "content/webmcp/json-bridge-core.js", "content/webmcp/json-bridge.js", "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js", "content/hud/hud.js", "content/wake.js"],
+      "js": ["content/base.js", "content/injector/deepseek.js", "content/webmcp/speaks-json.js", "content/webmcp/json-bridge-core.js", "content/webmcp/json-bridge.js", "performance-core.js", "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js", "content/hud/hud.js", "content/wake.js"],
       "run_at": "document_idle"
     },
     {
       "matches": ["https://claude.ai/*"],
-      "js": ["content/base.js", "content/injector/claude.js", "content/wake.js"],
+      "js": ["content/base.js", "content/injector/claude.js", "performance-core.js", "content/wake.js"],
       "run_at": "document_idle"
     },
     {
       "matches": ["https://chatgpt.com/*"],
-      "js": ["content/base.js", "content/injector/chatgpt.js", "context-pressure.js", "conversation-health.js", "recovery-controller.js", "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js", "content/hud/hud.js", "content/wake.js"],
+      "js": ["content/base.js", "content/injector/chatgpt.js", "context-pressure.js", "conversation-health.js", "recovery-controller.js", "performance-core.js", "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js", "content/hud/hud.js", "content/wake.js"],
       "run_at": "document_idle"
     }
   ]

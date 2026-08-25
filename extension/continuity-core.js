@@ -217,6 +217,22 @@ export function handoffStatusIsActive(status) {
   ].includes(String(status || ""));
 }
 
+/** Retired source tabs may be discarded only after the handoff commit. */
+export function shouldDiscardRetiredSourceTab({
+  committed = false,
+  sourceTabId = null,
+  targetTabId = null,
+  sourceActive = false,
+} = {}) {
+  if (sourceTabId === null || sourceTabId === undefined || sourceTabId === "") return false;
+  const source = Number(sourceTabId);
+  if (!committed || !Number.isInteger(source) || source < 0 || sourceActive) return false;
+  const hasTarget = targetTabId !== null && targetTabId !== undefined && targetTabId !== "";
+  const target = Number(targetTabId);
+  if (hasTarget && Number.isInteger(target) && target >= 0 && target === source) return false;
+  return true;
+}
+
 export function newContinuityId(now = Date.now(), random = Math.random()) {
   const r = Math.floor(Math.max(0, Math.min(0.999999999, Number(random) || 0)) * 0x100000000)
     .toString(36)

@@ -20,13 +20,13 @@ import {
 import {
   buildHandoffRequest, buildHandoffSeed, chatGptConversationInfo,
   classifyHandoffAssistantReply, extractHandoffPacket, handoffSeedContainsTransfer, handoffStatusIsActive,
-  newContinuityId, newTransferId,
+  newContinuityId, newTransferId, shouldDiscardRetiredSourceTab,
 } from "./continuity-core.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 
-const H2W_SCRIPT_VERSION = "0.1.59";
+const H2W_SCRIPT_VERSION = "0.1.60";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -34,6 +34,7 @@ const CHATGPT_CONTENT_SCRIPT_FILES = [
   "context-pressure.js",
   "conversation-health.js",
   "recovery-controller.js",
+  "performance-core.js",
   "content/hud/state-view.js",
   "content/hud/tooltip.js",
   "content/hud/renderer.js",
@@ -2013,6 +2014,27 @@ function handoffTargetInfoForTransfer(transfer, targetConvKey, targetUrl = null)
   return { ok: false, error: "handoff_site_unsupported" };
 }
 
+async function bestEffortDiscardRetiredSourceTab(transfer, targetTabId = null) {
+  const sourceTabId = transfer?.source_tab_id;
+  if (sourceTabId === null || sourceTabId === undefined || sourceTabId === "") return;
+  if (!Number.isInteger(Number(sourceTabId))) return;
+  try {
+    const tab = await chrome.tabs.get(Number(sourceTabId));
+    if (!shouldDiscardRetiredSourceTab({
+      committed: true,
+      sourceTabId,
+      targetTabId,
+      sourceActive: tab?.active === true,
+    })) return;
+    await chrome.tabs.discard(Number(sourceTabId));
+    callLog(`handoff retired source tab discarded tab=${sourceTabId}`);
+  } catch (e) {
+    // Retirement already committed. Memory reclamation is diagnostics-only and
+    // must never roll back or invalidate a successful continuity cutover.
+    callLog(`handoff source discard skipped tab=${sourceTabId}:`, e?.message || String(e));
+  }
+}
+
 async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, targetUrl = null) {
   const transfers = await loadHandoffTransfers();
   const transfer = transfers[transferId];
@@ -2047,6 +2069,7 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
       error: null,
       handoff_text: null,
     });
+    void bestEffortDiscardRetiredSourceTab(transfer, targetTabId || transfer.target_tab_id || null);
     return { ok: true, recovered: true, transfer: handoffView(done) };
   }
 
@@ -2118,6 +2141,7 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
       if (targetTabId) chrome.tabs.sendMessage(targetTabId, { type: "h2w_handoff_committed", transferId, sourceConvKey: transfer.source_conv_key });
     } catch (_) {}
     void notifyAutomationChanged();
+    void bestEffortDiscardRetiredSourceTab(transfer, targetTabId || transfer.target_tab_id || null);
     return { ok: true, transfer: handoffView(done) };
   }
 
@@ -2192,6 +2216,7 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
       if (targetTabId) chrome.tabs.sendMessage(targetTabId, { type: "h2w_handoff_committed", transferId, sourceConvKey: transfer.source_conv_key });
     } catch (_) {}
     void notifyAutomationChanged();
+    void bestEffortDiscardRetiredSourceTab(transfer, targetTabId || transfer.target_tab_id || null);
     return { ok: true, upgraded: true, transfer: handoffView(done) };
   }
 
@@ -2269,6 +2294,7 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
     if (targetTabId) chrome.tabs.sendMessage(targetTabId, { type: "h2w_handoff_committed", transferId, sourceConvKey: transfer.source_conv_key });
   } catch (_) {}
   void notifyAutomationChanged();
+  void bestEffortDiscardRetiredSourceTab(transfer, targetTabId || transfer.target_tab_id || null);
   return { ok: true, transfer: handoffView(done) };
 }
 

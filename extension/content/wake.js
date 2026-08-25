@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.59";
+const H2W_CONTENT_VERSION = "0.1.60";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -16,6 +16,7 @@ const H2W_CONTENT_VERSION = "0.1.59";
   const CONTEXT_PRESSURE = globalThis.H2W_CONTEXT_PRESSURE || null;
   const CONVERSATION_HEALTH = globalThis.H2W_CONVERSATION_HEALTH || null;
   const RECOVERY_CONTROLLER = globalThis.H2W_RECOVERY_CONTROLLER || null;
+  const BROWSER_PERFORMANCE = globalThis.H2W_BROWSER_PERFORMANCE || null;
   let conversationHealth = null;
   let contextPressureRecord = null;
   let lastFreshnessProbeAt = 0;
@@ -421,6 +422,7 @@ const H2W_CONTENT_VERSION = "0.1.59";
   const PERM = window.__H2W_PERMISSION__;
   let permClicker = null;
   let permObs = null;
+  let permScheduler = null;
   let permDeadline = 0;
   let lastPermClickAt = 0;
   function permissionTryClick() {
@@ -434,6 +436,7 @@ const H2W_CONTENT_VERSION = "0.1.59";
   }
   function permissionStop() {
     if (permObs) { try { permObs.disconnect(); } catch (e) {} permObs = null; }
+    if (permScheduler) { try { permScheduler.cancel(); } catch (_) {} permScheduler = null; }
   }
   function startPermissionWatch(durationMs = 90000) {
     const persistent = !Number.isFinite(durationMs);
@@ -448,12 +451,22 @@ const H2W_CONTENT_VERSION = "0.1.59";
     // Mark only after a button is found and clicked so late-mounted buttons are not missed.
     permClicker = PERM.createPermissionClicker();
     permissionTryClick();
-    permObs = new MutationObserver(() => permissionTryClick());
+    permScheduler = BROWSER_PERFORMANCE?.createCoalescedScheduler
+      ? BROWSER_PERFORMANCE.createCoalescedScheduler(permissionTryClick, {
+          minIntervalMs: BROWSER_PERFORMANCE.DEFAULT_PERMISSION_COALESCE_MS,
+          isSuspended: () => document.hidden,
+        })
+      : null;
+    permObs = new MutationObserver(() => {
+      if (document.hidden) return;
+      if (permScheduler) permScheduler.schedule();
+      else permissionTryClick();
+    });
     // childList catches late mounts; attributes catches buttons that later become enabled.
     try {
       permObs.observe(document.body, {
         childList: true, subtree: true,
-        attributes: true, attributeFilter: ["disabled", "hidden", "aria-disabled", "aria-hidden", "style"],
+        attributes: true, attributeFilter: ["disabled", "hidden", "aria-disabled", "aria-hidden"],
       });
     } catch (e) {}
     if (!persistent) setTimeout(permissionStop, durationMs + 5000);
@@ -863,12 +876,21 @@ const H2W_CONTENT_VERSION = "0.1.59";
     // One second is fast enough for UI binding while keeping route detection
     // negligible compared with the existing 5s HUD reconciliation interval.
     setInterval(() => {
+      if (document.hidden) return;
       const convKey = ADAPTER.getConversationKey();
       if (convKey && convKey !== registeredConvKey) void registerCurrentConversation("poll");
     }, 1000);
     try {
       window.addEventListener("popstate", () => { void registerCurrentConversation("popstate"); });
       window.addEventListener("hashchange", () => { void registerCurrentConversation("hashchange"); });
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) return;
+        void registerCurrentConversation("visible");
+        if (permObs) {
+          if (permScheduler) permScheduler.flush();
+          else permissionTryClick();
+        }
+      });
     } catch (_) { /* polling remains authoritative */ }
   }
 
@@ -1317,6 +1339,7 @@ const H2W_CONTENT_VERSION = "0.1.59";
   function startConversationHealthWatch() {
     let healthCheckInFlight = false;
     setInterval(() => {
+      if (document.hidden) return;
       if (ADAPTER.name === "chatgpt" && !chatGptConversationId()) return;
       if (healthCheckInFlight || !conversationHealth || !RECOVERY_CONTROLLER) return;
       healthCheckInFlight = true;
@@ -1362,13 +1385,23 @@ const H2W_CONTENT_VERSION = "0.1.59";
     let startedAt = 0;
     let userTextAtStart = "";
     const hydrationGraceUntil = Date.now() + 5000;
-    let lastUserSignature = assistantSignature(lastMessageByRole("user"));
-    let lastUserCount = document.querySelectorAll('[data-message-author-role="user"]').length;
+    const roleSnapshot = (role) => {
+      const nodes = document.querySelectorAll(`[data-message-author-role="${role}"]`);
+      const el = nodes[nodes.length - 1] || null;
+      return {
+        count: nodes.length,
+        text: el ? String(el.innerText || el.textContent || "").trim() : "",
+      };
+    };
+    const initialUser = roleSnapshot("user");
+    const initialAssistant = roleSnapshot("assistant");
+    let lastUserSignature = assistantSignature(initialUser.text);
+    let lastUserCount = initialUser.count;
     let settleTimer = null;
     let lastReportedEnd = 0;
     let lastAsstLen = 0;
-    let lastAsstSignature = assistantSignature(lastMessageByRole("assistant"));
-    let lastAsstCount = document.querySelectorAll('[data-message-author-role="assistant"]').length;
+    let lastAsstSignature = assistantSignature(initialAssistant.text);
+    let lastAsstCount = initialAssistant.count;
     let stableRounds = 0;
 
     const reportTurnEnded = (assistantText, endedAt) => {
@@ -1399,6 +1432,7 @@ const H2W_CONTENT_VERSION = "0.1.59";
     };
 
     const onTick = () => {
+      if (document.hidden) return;
       if (!chatGptConversationId()) {
         generating = false;
         sawGrowth = false;
@@ -1407,9 +1441,10 @@ const H2W_CONTENT_VERSION = "0.1.59";
         return;
       }
       const stopping = isComposerGenerating();
-      const currentUserText = lastMessageByRole("user");
+      const currentUser = roleSnapshot("user");
+      const currentUserText = currentUser.text;
       const currentUserSignature = assistantSignature(currentUserText);
-      const currentUserCount = document.querySelectorAll('[data-message-author-role="user"]').length;
+      const currentUserCount = currentUser.count;
       const userChanged = currentUserText && (currentUserSignature !== lastUserSignature || currentUserCount > lastUserCount);
       if (userChanged) {
         if (Date.now() >= hydrationGraceUntil && CONVERSATION_HEALTH && conversationHealth) {
@@ -1418,10 +1453,11 @@ const H2W_CONTENT_VERSION = "0.1.59";
         lastUserSignature = currentUserSignature;
         lastUserCount = currentUserCount;
       }
-      const assistantText = lastMessageByRole("assistant");
+      const currentAssistant = roleSnapshot("assistant");
+      const assistantText = currentAssistant.text;
       const curLen = assistantText.length;
       const curSignature = assistantSignature(assistantText);
-      const curCount = document.querySelectorAll('[data-message-author-role="assistant"]').length;
+      const curCount = currentAssistant.count;
       const assistantChanged = curLen > 0 && (curSignature !== lastAsstSignature || curCount > lastAsstCount);
 
       if (stopping || assistantChanged || curLen > lastAsstLen) {
@@ -1430,7 +1466,7 @@ const H2W_CONTENT_VERSION = "0.1.59";
           generating = true;
           sawGrowth = assistantChanged || curLen > lastAsstLen || stopping;
           startedAt = Date.now();
-          userTextAtStart = lastMessageByRole("user");
+          userTextAtStart = currentUserText;
           if (settleTimer) { clearInterval(settleTimer); settleTimer = null; }
           stableRounds = 0;
           console.log("[h2w] turn start (streaming/stop/growth)");
@@ -1476,10 +1512,32 @@ const H2W_CONTENT_VERSION = "0.1.59";
       lastAsstCount = curCount;
     };
 
-    setInterval(onTick, 800);
+    const tickScheduler = BROWSER_PERFORMANCE?.createCoalescedScheduler
+      ? BROWSER_PERFORMANCE.createCoalescedScheduler(onTick, {
+          minIntervalMs: BROWSER_PERFORMANCE.DEFAULT_MUTATION_COALESCE_MS,
+          isSuspended: () => document.hidden,
+        })
+      : null;
+    setInterval(() => {
+      if (document.hidden) return;
+      if (tickScheduler) tickScheduler.schedule();
+      else onTick();
+    }, 800);
     try {
-      const mo = new MutationObserver(() => onTick());
-      mo.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+      const mo = new MutationObserver(() => {
+        if (document.hidden) return;
+        if (tickScheduler) tickScheduler.schedule();
+        else onTick();
+      });
+      // Structural changes are enough for low-latency turn detection. Streaming
+      // character updates are sampled by the bounded scheduler instead of
+      // synchronously rescanning the full conversation on every token.
+      mo.observe(document.documentElement, { childList: true, subtree: true });
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) return;
+        if (tickScheduler) tickScheduler.flush();
+        else onTick();
+      });
     } catch (e) {}
   }
 
@@ -2141,7 +2199,14 @@ const H2W_CONTENT_VERSION = "0.1.59";
   function startPageHud() {
     paintPageHud({ pending: false });
     void refreshPageHud();
-    setInterval(() => { void refreshPageHud(); }, 5000);
+    setInterval(() => {
+      if (!document.hidden) void refreshPageHud();
+    }, 5000);
+    try {
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) void refreshPageHud();
+      });
+    } catch (_) {}
   }
 
 })();

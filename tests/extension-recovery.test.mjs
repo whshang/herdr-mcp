@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { shouldDiscardRetiredSourceTab } from "../extension/continuity-core.js";
 
 function loadClassicExtensionScripts() {
   const context = vm.createContext({
@@ -10,7 +11,7 @@ function loadClassicExtensionScripts() {
     Math,
     crypto: { randomUUID: () => "continuity-test" },
   });
-  for (const file of ["extension/context-pressure.js", "extension/conversation-health.js", "extension/recovery-controller.js"]) {
+  for (const file of ["extension/context-pressure.js", "extension/conversation-health.js", "extension/recovery-controller.js", "extension/performance-core.js"]) {
     const source = fs.readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
     assert.doesNotMatch(source, /^\s*(?:import|export)\s/m, `${file} must remain a classic content script`);
     new vm.Script(source, { filename: file }).runInContext(context);
@@ -23,6 +24,65 @@ test("conversation recovery scripts load as classic MV3 content scripts", () => 
   assert.ok(context.H2W_CONTEXT_PRESSURE);
   assert.ok(context.H2W_CONVERSATION_HEALTH);
   assert.ok(context.H2W_RECOVERY_CONTROLLER);
+  assert.ok(context.H2W_BROWSER_PERFORMANCE);
+});
+
+test("browser performance scheduler coalesces mutation bursts", () => {
+  const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
+  let now = 1000;
+  let runs = 0;
+  let nextTimerId = 1;
+  const timers = new Map();
+  const scheduler = perf.createCoalescedScheduler(() => { runs += 1; }, {
+    minIntervalMs: 400,
+    now: () => now,
+    setTimer: (fn, delay) => {
+      const id = nextTimerId++;
+      timers.set(id, { fn, delay });
+      return id;
+    },
+    clearTimer: (id) => timers.delete(id),
+  });
+
+  for (let i = 0; i < 100; i += 1) scheduler.schedule();
+  assert.equal(timers.size, 1);
+  const [firstId, first] = timers.entries().next().value;
+  assert.equal(first.delay, 0);
+  timers.delete(firstId);
+  first.fn();
+  assert.equal(runs, 1);
+
+  now += 100;
+  for (let i = 0; i < 100; i += 1) scheduler.schedule();
+  assert.equal(timers.size, 1);
+  const second = timers.values().next().value;
+  assert.equal(second.delay, 300);
+});
+
+test("browser performance scheduler suspends while hidden and flushes on resume", () => {
+  const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
+  let hidden = true;
+  let runs = 0;
+  let timers = 0;
+  const scheduler = perf.createCoalescedScheduler(() => { runs += 1; }, {
+    isSuspended: () => hidden,
+    setTimer: () => { timers += 1; return timers; },
+    clearTimer: () => {},
+  });
+  assert.equal(scheduler.schedule(), false);
+  assert.equal(timers, 0);
+  assert.equal(runs, 0);
+  hidden = false;
+  assert.equal(scheduler.flush(), true);
+  assert.equal(runs, 1);
+});
+
+test("retired source tab discard is gated on committed inactive handoff", () => {
+  assert.equal(shouldDiscardRetiredSourceTab({ committed: true, sourceTabId: null, targetTabId: 2 }), false);
+  assert.equal(shouldDiscardRetiredSourceTab({ committed: false, sourceTabId: 1, targetTabId: 2 }), false);
+  assert.equal(shouldDiscardRetiredSourceTab({ committed: true, sourceTabId: 1, targetTabId: 2, sourceActive: true }), false);
+  assert.equal(shouldDiscardRetiredSourceTab({ committed: true, sourceTabId: 1, targetTabId: 1 }), false);
+  assert.equal(shouldDiscardRetiredSourceTab({ committed: true, sourceTabId: 1, targetTabId: 2, sourceActive: false }), true);
 });
 
 test("conversation health records the persisted recovery lifecycle fields", () => {
