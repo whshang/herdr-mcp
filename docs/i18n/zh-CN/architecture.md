@@ -1,143 +1,254 @@
-# 架构
+# 架构：让网页模型拥有一台可持续工作的开发机
 
-读者：决定能力该放在 MCP 还是 herdr 原生 API 的贡献者。
+herdr-mcp 的目标很直接：让 ChatGPT 这样的 Web AI 获得接近本地 Coding Agent 的工作能力，同时把代码、终端、凭据和实际执行留在自己的机器上。
 
-这是 Contributor / Reference 文档，不是首次安装入口。产品边界和用户路径先看 [总览](overview.md)；Herdr 本体的概念与 API 直接以官方 [Herdr 文档](https://herdr.dev/docs/) 和 [Socket API](https://herdr.dev/docs/socket-api/) 为准。
+理解这套架构，可以先记住三个角色：
 
-## 远程控制面
+- **Web AI 是 planner**：理解目标、拆任务、决定下一步、检查结果。
+- **Herdr 是长期存在的本地工作台**：保存 workspace、pane、终端和 Agent 的真实运行现场。
+- **herdr-mcp 是远程控制面**：把 Web AI 缺少的本地观察和操作能力安全地送到它手里。
 
-<section class="diagram" aria-label="架构">
-  <div>ChatGPT / Web 模型</div><span>↓ MCP + OAuth</span>
-  <div>Cloudflare Worker / Durable Object</div><span>↓ 认证 WSS</span>
-  <div>持久 herdr-link</div><span>↓ 本地 MCP</span>
-  <div>Runtime 代际 A / B</div><span>↓ Herdr socket + 工作站</span>
-  <div>panes · agents · fs · git · shell</div>
-</section>
+这三层组合后，网页聊天从“给建议的窗口”变成了“可以真正操作开发环境的控制台”。
 
-## 两个进程
+## 一次请求是怎样穿过系统的
 
-| 进程 | 角色 |
+```text
+┌──────────────────────────────────────────────┐
+│                ChatGPT / Web AI              │
+│      理解需求 · 规划 · 调工具 · 检查结果      │
+└───────────────────┬──────────────────────────┘
+                    │ MCP + OAuth / HTTPS
+                    ▼
+┌──────────────────────────────────────────────┐
+│              Cloudflare Edge                 │
+│   OAuth · MCP endpoint · workstation routing │
+└───────────────────┬──────────────────────────┘
+                    │ authenticated WSS
+                    ▼
+┌──────────────────────────────────────────────┐
+│             workstation / herdr-link         │
+│       主动出站连接 · 找到当前 runtime         │
+└───────────────────┬──────────────────────────┘
+                    ▼
+┌──────────────────────────────────────────────┐
+│                herdr-mcp                     │
+│ inspect · fs · git · exec · prompt · call    │
+└──────────────┬─────────────────┬─────────────┘
+               │                 │
+               ▼                 ▼
+      managed Git projects     Herdr Socket API
+      files / git / shell      workspace / pane / agent
+                                   │
+                                   ▼
+                            Pi / Grok / other agents
+```
+
+例如你在手机上的 ChatGPT 里说：“看看项目为什么 CI 红了，修好并验证。”
+
+ChatGPT 可以先 `herdr_inspect` 确认有哪些工作区；用 `herdr_git` 看仓库状态；读取失败相关文件；直接 patch；跑测试。如果问题适合并行调查，它可以把一个独立任务交给 Herdr 中的 Agent，同时继续检查另一条线。最终结果仍回到同一个网页会话。
+
+## 为什么需要 Edge
+
+ChatGPT 在公网，本机开发环境通常在 NAT、防火墙和公司网络后面。直接把开发机的 MCP HTTP 端口暴露到公网，会把网络可达性、TLS、认证、固定地址和生命周期问题全部推给工作站。
+
+herdr-mcp 采用反方向连接：**工作站主动连出去**。
+
+```text
+ChatGPT ──HTTPS──► Cloudflare Edge ◄──WSS── workstation
+                                      ↑
+                              connection originates here
+```
+
+Edge 因而成为稳定的公网身份：
+
+- Connector URL 不随本机 IP 变化；
+- ChatGPT 使用 OAuth，不需要知道本机 bearer；
+- workstation 不需要公网入站端口；
+- 一套 Edge 可以依据 workstation identity 把请求送到正确机器；
+- 本地 runtime 更新时，Connector URL 可以保持不变。
+
+Cloudflare Worker / Durable Object 负责公网协议和连接路由，本机 `herdr-link` 维持认证 WSS。它们是传输层，不保存你的 Git 仓库。
+
+## 为什么 Herdr 在最里面
+
+文件和 shell MCP 很容易做成“远程执行器”：给路径，读文件；给命令，跑 shell。软件开发真正麻烦的部分是**时间**。
+
+一个测试可能跑十分钟，一个 Agent 可能工作一小时，一次修复可能跨多个终端、多个仓库和多个网页回合。HTTP 请求结束以后，这些东西仍然需要有稳定身份。
+
+Herdr 提供的正是这层长期状态：
+
+```text
+workspace
+  └─ tab
+      ├─ pane: shell
+      ├─ pane: pi agent
+      └─ pane: test / server / logs
+```
+
+Web AI 每次回来都能重新观察现场。它无需假设“上一次调用结束后世界被冻结了”。机器上真实存在的 pane、cwd、Agent 状态和近期事件才是事实来源。
+
+Herdr 本身拥有大量 Socket API 方法。herdr-mcp 没有把它们逐个包装成 MCP tool，而是保留动态反射入口：`herdr_methods` + `herdr_call`。这样既保留 Herdr 的完整能力，又避免几十上百个工具定义长期占据模型上下文。
+
+## 18 个工具为什么够用
+
+生产公共契约当前固定为 **contract epoch 2 / 18 tools**。设计目标是让模型容易选对工具，而不是让工具列表看起来壮观。
+
+### 1. 观察：我现在在哪
+
+`herdr_inspect` 一次返回连接、workspaces、panes、agents、managed roots 和运行环境。`herdr_since` 只读取某个 cursor 之后的新事件。
+
+这相当于开发者进入办公室先看桌面：哪些项目开着、哪个任务还在跑、谁已经做完。
+
+### 2. 直接操作：能确定的事情直接做
+
+`herdr_fs_read/list/grep/image`、`herdr_fs_edit/write/patch`、`herdr_git`、`herdr_exec` 和长任务 exec session 负责确定性工作。
+
+读一个文件不需要叫 Agent；`git status` 不需要推理；跑一组测试也不需要再消费一次模型调用。Web planner 直接完成这些动作，链路更短，结果也更容易验证。
+
+### 3. 调度 Agent：真正需要另一份推理时再派人
+
+`herdr_prompt` 用于独立调查、并行实现、代码审查等任务。Agent 在 Herdr pane 里工作，所以 planner 可以继续观察它的状态和输出。
+
+这里的核心判断是：**Agent 是计算资源和独立执行者，不是每个 shell 操作的必经中间层。**
+
+### 4. 访问 Herdr 原生能力
+
+`herdr_methods` 动态读取当前 Herdr schema，`herdr_call` 调用原生方法。高级 pane/workspace/session 操作因此无需扩张公共 MCP catalog。
+
+`herdr_skill` 则给 Web planner 提供当前项目策略和与运行版本匹配的 Herdr 使用指导。
+
+## 两条数据路径
+
+系统里有两类通信，理解它们可以解释为什么浏览器扩展和 MCP 都存在。
+
+### 下行：Web AI 操作工作站
+
+```text
+Web AI → MCP → Edge → WSS → runtime → files / shell / Herdr
+```
+
+这是标准工具调用路径。
+
+### 上行：工作站推动网页继续工作
+
+网页模型有一个天然限制：没有用户消息时，它不会永远主动轮询你的电脑。一个本地 Agent 工作了二十分钟后完成，ChatGPT 本身不会突然醒来问“结果怎么样了”。
+
+浏览器扩展负责这条反向通道：
+
+```text
+Herdr events → local runtime → Native Messaging → browser extension
+                                              │
+                                              ├─ progress
+                                              ├─ settled
+                                              ├─ recovery
+                                              └─ conversation rollover
+```
+
+因此，MCP 负责“网页向机器伸手”，扩展负责“机器在必要时敲一下网页”。两者组合后，长任务才具备连续性。
+
+## 浏览器为什么不保存 Herdr bearer
+
+扩展运行在浏览器环境，页面脚本、扩展 storage 和 service worker 都不是保存工作站高权限凭据的理想位置。
+
+当前主链路使用：
+
+```text
+content script
+   ↓
+extension service worker
+   ↓ Chrome Native Messaging
+native host
+   ↓ Unix socket (0600)
+herdr-mcp runtime
+```
+
+浏览器只和 Native Messaging host 说话；host 再通过仅本机用户可访问的 Unix socket 进入 runtime。静态 `HERDR_MCP_TOKEN` 继续服务本地 curl / Cursor 以及旧 runtime 兼容路径，不应复制到 ChatGPT Connector 或网页脚本。
+
+## managed Git root 是远程文件系统的边界
+
+远程模型不应该默认拥有 `$HOME` 的文件浏览器。`herdr_fs_*` 只接受 Herdr 当前识别的 managed Git project root，并过滤常见 secret-like 路径。
+
+写操作还有几层闸门：
+
+| 闸门 | 作用 |
 |---|---|
-| **herdr** | 本机终端复用器 + agent 运行时。Unix socket API 很大（`herdr api schema`，约 90 个方法）。 |
-| **herdr-mcp** | HTTP MCP 门面（Streamable HTTP + OAuth），让 **远程** 客户端驱动 herdr 与工作站。 |
+| managed root | 限制可操作项目范围 |
+| `HERDR_MCP_READONLY` | 全局禁止 mutation |
+| `HERDR_MCP_WRITE_ROOTS` | 进一步缩小允许写的仓库 |
+| dirty confirmation | 防止覆盖未知未提交修改 |
+| busy confirmation | 防止和正在工作的 Agent 同时修改同一项目 |
 
-herdr-mcp **不会** 把每个 herdr 方法都做成 MCP 工具。那会烧上下文，也重复原生 schema。
+`herdr_exec` 是更强的能力。Shell 可以访问当前用户本来能访问的资源，因此它不具备 `fs_*` 的 secret-path 过滤。这是明确的信任边界：允许远程模型使用 shell，等价于允许它以该工作站用户权限执行命令。
 
-## 工具面：生产 contract epoch 2 固定为 18 tools
+## 为什么 mutation 失败后不能立即再来一次
 
-MCP 工具面是**固定的**；live herdr schema 只服务 `herdr_methods` / `herdr_call`。0.3.32 将公开 ChatGPT catalog 冻结为 **contract epoch 2 / 18 tools**，包含只读 `herdr_skill`。精确的 epoch 1 / 17-tool 0.3.23 catalog 只保留用于受控回滚与旧会话兼容，不再是 production 目标。
+分布式系统里，“我没收到成功回复”和“操作没有发生”是两件事。
 
-| 层 | 工具 | 说明 |
+例如 planner 发出 `agent.prompt`，网络恰好在服务器接受任务后断开。客户端看到错误，但 Agent 可能已经开始工作。盲目重试就会生成两个相同任务。
+
+因此 herdr-mcp 把失败阶段尽量结构化：
+
+- `herdr_transport`：连接或 socket 层失败；
+- `post_submission_status_wait` / `agent_status_wait_timeout`：任务已经投递，只是等待状态超时；
+- `herdr_internal` / `control_plane_taskgroup`：Herdr 控制面瞬时异常；
+- 业务错误：根据返回的 `retryable` 和具体语义处理。
+
+mutation 的默认策略始终是：**先重新观察，再决定是否重试。** `herdr_prompt` 支持 `idempotency_key`，同一个客户端意图应复用同一个 key。
+
+## 控制面毛刺为什么不会轻易拖死整个任务
+
+Herdr daemon 的 snapshot / event 聚合偶尔可能出现 TaskGroup / ExceptionGroup 类瞬时错误。herdr-mcp 在几个关键位置采用退化路径：
+
+- `herdr_inspect` 在 snapshot 不可用时可组合 list APIs；
+- `herdr_git` 在安全条件满足时可直接调用本机 Git；
+- `herdr_exec` 在命令**尚未投递**且 utility pane 控制面失败时，可以切换本机执行；
+- 一旦命令已经投递，绝不自动重发，避免双跑；
+- SnapshotCache 和 bounded retry 用于只读观察。
+
+这类退化的原则很统一：**读操作尽量恢复可用性，写操作优先保证不会重复执行。**
+
+## Runtime A/B：升级控制面，不惊动 Connector
+
+公网 Edge 地址应该像办公室门牌一样稳定，本机 runtime 可以像机房里的服务器一样升级。
+
+Runtime A/B 把“ChatGPT 连哪里”和“当前跑哪个本地版本”分开。新 runtime 先构建、验证 contract、健康检查，再切换 active generation；旧 generation 可以排空或回滚。详见 [Runtime A/B 自升级](runtime-self-upgrade.md)。
+
+工具契约发生不兼容变化时使用 contract epoch 管理。当前生产为 epoch 2 / 18 tools；旧 epoch 仅用于明确的兼容和回滚场景。
+
+## 进程与职责
+
+| 组件 | 生命周期 | 主要职责 |
 |---|---|---|
-| 技能 | `herdr_skill` | 本机进程拉上游 Herdr `SKILL.md`（master，非钉版本）；失败用 `assets/herdr-agent-SKILL.md`。ChatGPT 不访问 GitHub。 |
-| 透传 | `herdr_methods`、`herdr_call` | 反射并调用原生 socket 方法 |
-| 远程编排 | `herdr_inspect`、`herdr_since`、`herdr_prompt` | 适合聊天型客户端的一瞥 / 续读 / 投递提示 |
-| 远程工作站 | `herdr_fs_*`、`herdr_exec` / `herdr_exec_*`、`herdr_git` | **不是** herdr 能力 — 远程客户端本身没有磁盘 |
+| ChatGPT / Web AI | 云端会话 | planner、推理、MCP tool use |
+| Cloudflare Worker / DO | 公网常驻 | OAuth、MCP endpoint、workstation routing |
+| `herdr-link` | 工作站常驻 | WSS、workstation identity、runtime routing |
+| `herdr-mcp` runtime | 工作站常驻 | MCP tools、文件/Git/Shell、安全闸门 |
+| Herdr daemon | 工作站常驻 | workspace/pane/PTY/Agent/Socket API |
+| Native Messaging host | 浏览器按需 | extension ↔ local runtime trusted bridge |
+| Browser extension | 浏览器会话 | 状态 HUD、恢复、连续工作、JSON→MCP |
 
-`HERDR_MCP_ALL_TOOLS=1` 会加上高级/废弃生命周期工具（`herdr_wait`、`herdr_reap`、session 等，共 30）。给 ChatGPT 时建议关掉以省上下文。正常 epoch-2 会话从 `herdr_inspect` → `herdr_skill`（一次）→ 干活。
-
-## 设计规则
-
-1. **当前产品只保留一条正确路径** — 不为想象中的第二种客户端预留配置。
-2. **变更** 限制在托管 git 根内；可选 `HERDR_MCP_READONLY` / `HERDR_MCP_WRITE_ROOTS`。
-3. **投递不确定** — 传输失败后不要对非幂等 prompt 盲目重试；先用 inspect/since 核对。mutation 默认走 `herdr_prompt`（省略 `wait`）并带 `idempotency_key`；状态用 `herdr_since` / `herdr_inspect`。
-4. **版本是缓存键** — 工具面或握手语义变了就 bump `src/version.ts` + `package.json`。
-5. **网页主编排** — 规划与调度在网页模型；本机优先 `herdr_fs_*` / `herdr_exec`；需要 agent 时直接打便宜 worker，禁止本机 Claude/OMP/main 当中间指挥。
-6. **Agent 软隐藏** — `herdr_inspect` / `herdr_since` 默认只列出执行 agent（`pi`/`cline`/`opencode`/`anti`）与审计（`droid`/`grok`）；Claude/OMP/Codex 不出现在列表。`herdr_prompt` **不拦**。`HERDR_MCP_AGENT_ALLOW=*` 显示全部；逗号名单可覆盖默认。
-7. **Production epoch2 = 18 tools** — `HERDR_MCP_ALL_TOOLS=1` 时 30；`inspect` 含 `boot_id` + `exec_sessions` + `agent_skill` 状态。epoch1 仅是 legacy compatibility profile，并明确标记 `herdr_skill` 被隐藏。`HERDR_MCP_READONLY=1` 挡住含 `herdr_prompt` 在内的 mutation（`herdr_fs_patch` 的 `dry_run` 除外）。
-8. **工作站稳健性（≥0.3.17）** — `commitAtomic` 失败会删掉本次新增文件；exec journal 仅杀掉仍带 `HERDR_MCP_EXEC_ID` 的孤儿；`exec_read stream=both` 按写入顺序交错；`fs_read` 字节截断只返回完整行。
-9. **`herdr_exec` 控制面降级（≥0.3.18）** — utility 窗格在 `send_text` **之前**若连续撞 TaskGroup，自动改本地 zsh（`backend:local_fallback`）；一旦已投递则绝不重发、也不降级（避免双跑）。
-10. **`herdr_git` 本机降级（≥0.3.20）** — `session.snapshot` / managed-roots 闸门因 TaskGroup 不可用时，对 `$HOME`（或 `HERDR_MCP_WRITE_ROOTS`）下的真实 git 根仍直接跑本地 `git`（带 `warnings`）；`pane.read` 等只读 RPC 对 TaskGroup 透明重试加长到最多 4 次尝试。
-11. **`herdr_inspect` / `liveSnapshot` list 降级（≥0.3.21）** — `session.snapshot` 撞 TaskGroup 且 cache 不够用时，改拼 `workspace.list` + `pane.list` + `agent.list`，`warnings` 含 `snapshot_failed_used_list_apis`；勿把控制面异常当成仓库阻塞。
-12. **Unix socket 读超时 + 60s RPC 上限（≥0.3.23）** — 每条 socket RPC 在连接后 `setTimeout`（不再无限等 `session.snapshot`）；`herdr_exec` / `herdr_wait` / `herdr_prompt` wait 均 **≤60s**；`herdr api schema` 启动预热 + stale 缓存（tools/list 不依赖 live herdr）；SnapshotCache bootstrap 优先 bounded snapshot，失败走 list APIs（对齐 coding-tools-mcp：**固定 MCP 工具面**，live 只作运行时）。
-
-## 错误语义（`herdr_call` / `herdr_prompt` / 只读聚合）
-
-| `failure` / `failure_phase` | 含义 | 可否盲重试 |
-|---|---|---|
-| `herdr_transport` | 真连接/socket 问题 | 视方法；mutation 仍先核对 |
-| `agent_status_wait_timeout` / `post_submission_status_wait` | 投递后等 agent 状态超时（常见于带 `wait` 的 `agent.prompt`） | **否** — 先 inspect/since |
-| `herdr_internal` / `control_plane_taskgroup`（或 `snapshot_refresh`） | daemon 控制面 TaskGroup / ExceptionGroup 偶发；**不是** pane 没了、也不是 prompt 投递超时。`herdr_prompt` ≥0.3.22 也归这类（带 `delivery_uncertain`），不再只回裸 `UNKNOWN` | 只读可重试；**`agent.prompt` 不可盲重试** — 先 inspect/since |
-
-| `herdr_error` | 其它 daemon 业务错误 | 视 `retryable` |
-
-## 控制面瞬时失败（ExceptionGroup / TaskGroup）
-
-范围：ChatGPT ↔ herdr-mcp ↔ herdr daemon/socket ↔ workspace/pane/agent 状态层。  
-**不是** 业务仓库代码，也不是 Claude/OMP runtime。
-
-典型现象：agent 仍在 `working`，但 `inspect` / `since` / `pane.read` / `fs_*` 间歇返回失败；几秒后同样请求又成功。根因在 herdr daemon 的并发聚合（snapshot / events.subscribe / socket 重连），某个 child task 抛错时未隔离，整次 RPC 被包成裸 `ExceptionGroup`。
-
-### 本机 watchdog（macOS LaunchAgent，≥0.3.22，随 0.3.26 发布）
-
-`herdr-mcp watchdog install` 注册 LaunchAgent（默认每 120s）。Linux / Windows 没有等价 CLI。
-
-- MCP 进程没了或本机 `/mcp` 非 200/401：连续失败达到阈值后 `herdr-mcp restart`（默认冷却 10 分钟，**无每日次数上限**）
-- `agent.list` / `workspace.list` 撞 TaskGroup 或 socket 缺失：**只记日志**，不重启 herdr daemon，也不重发 `herdr_prompt`
-- 状态：`~/.config/herdr-mcp/watchdog.state.json`；日志：`watchdog.log`
-
-herdr-mcp 侧（≥0.3.12，exec 降级 ≥0.3.18）能做的：
-
-- 只读自动重试（控制面毛刺最多 2 次）
-- `failure=herdr_internal` + `code=snapshot_refresh_failed` + `retryable=true`（展开子异常文案，不让裸 ExceptionGroup 当唯一信息）
-- `fs_*` / inspect 在 snapshot 失败时尽量用 SnapshotCache
-- `herdr_exec`：`send_text` **之前** TaskGroup → 重试后 `backend:local_fallback`；已投递则返回结构化错误，禁止降级/重发
-- `herdr_git`（≥0.3.20）：snapshot/managed-roots 失败时对本机 `$HOME` 下 git 根直接 `spawn git`（不经 pane）
-- `herdr_inspect` / `liveSnapshot`（≥0.3.21）：snapshot 失败时拼 `workspace.list`(+pane/agent.list)，带 `warnings`
-- mutation 失败后仍要求先 inspect/since，禁止盲重试
-
-消不掉的：daemon 里 TaskGroup 未隔离 / 未 flatten 的真正根因，需 herdr 上游修。`pane.read` / 全量 `session.snapshot` 仍可能偶发；编排侧应继续优先 `herdr_fs_*` / `herdr_git` / `herdr_exec`（utility 投递前 TaskGroup → `local_fallback` / 独立本机 session），不要把控制面毛刺当业务阻塞。
-
-`herdr_prompt` 成功时带 `state_observation: { changed: true\|false\|"unknown", fresh }`；无 `wait` 时未变快照为 `"unknown"`（不是「没投递」）。兼容字段 `state_changed` 仍保留。
-
-## 远程工作站闸门
-
-| 闸门 | `herdr_fs_*` | `herdr_exec` |
-|---|---|---|
-| readonly / write_roots | 有 | 有 |
-| secret-path（路径校验） | 有 | **无**（自由 shell 可 `cat .env`；文件 IO 请用 fs） |
-| working agent | edit/write 默认拒绝，`confirm_busy` 可过 | 默认拒绝，`confirm_busy` 可过 |
-| dirty confirm | edit/write 有 | **无**（脏树上跑命令是常态） |
-
-## 传输
-
-- MCP：`/mcp` 上的 `POST/GET/DELETE`（ChatGPT 探测还会用 issuer 根 `/` 别名）
-- 鉴权：connector 使用 OAuth JWT；静态 `HERDR_MCP_TOKEN` 保留给 Cursor / curl，以及 Native Messaging host 面向旧 runtime 的 HTTP 兼容路径；当前浏览器插件通过 Native Messaging + `~/.config/herdr-mcp/extension.sock`（权限 `0600`）通信，浏览器侧不携带 Herdr bearer。不要把静态 token 贴进 ChatGPT connector UI。
-- 推送（扩展：TCP 路径继续鉴权；受信任 Native Messaging Unix IPC 路径免 bearer）：
-  - `GET /push/events` SSE（可 `?workspace=`）
-  - `GET /push/state` 当前 agent / workspace / pane 快照
-  - `GET /push/mcp-activity` 最近 `tools/call` 计数（进程内环形缓冲；当前扩展催促走小模型判定，不再用「零工具」启发式）
-
-## Environment variables
-
-环境变量。plist 示例里的 `HERDR_MCP_HOST` **未被** Node 进程读取；服务听在端口上，由隧道/本机回环访问。版本演进见 [CHANGELOG.md](../../../CHANGELOG.md)。
+## 关键环境变量
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `HERDR_MCP_TOKEN` | 空 | `/mcp` 与 `/push` 静态 Bearer |
-| `HERDR_MCP_PORT` | `8772` | 监听端口 |
-| `HERDR_MCP_BASE_URL` | 空 | 公网 origin，**不要** `/mcp` 后缀；OAuth `iss`/`aud` |
-| `HERDR_SOCKET_PATH` | `~/.config/herdr/herdr.sock` | herdr API socket |
-| `HERDR_MCP_READONLY` | 关 | 挡住 mutation（含 `herdr_prompt`；`fs_patch` `dry_run` 除外） |
-| `HERDR_MCP_WRITE_ROOTS` | 全部 managed root | 允许写入的根，CSV |
-| `HERDR_MCP_ALL_TOOLS` | 关 | 18 → 30 工具 |
-| `HERDR_MCP_AGENT_ALLOW` | worker + 审计 | `*` 或逗号名单；影响 inspect/since 列表，不拦 `herdr_prompt` |
-| `HERDR_MCP_STATE_DIR` | `~/.config/herdr-mcp` | exec journal / sessions |
-| `HERDR_MCP_OAUTH_DIR` | `~/.config/herdr-mcp/oauth` | JWT 密钥与 client 登记 |
-| `HERDR_MCP_OAUTH_ACCESS_TTL_S` | `86400` | access token TTL |
-| `HERDR_MCP_OAUTH_REFRESH_TTL_S` | `2592000` | refresh token TTL |
-| `HERDR_MCP_PUSH_DEBUG` | 关 | `/push` 调试日志 |
-| `HERDR_MCP_BUILD_COMMIT` / `HERDR_MCP_BUILT_AT` | `dev` / 启动时刻 | `inspect.workstation_info` |
-| `HERDR_SKILL_URL` | herdr master `SKILL.md` raw URL | `herdr_skill` 上游 |
-| `HERDR_SKILL_CACHE_SEC` | `3600` | skill 缓存 |
-| `HERDR_SKILL_FETCH_TIMEOUT_MS` | `15000` | skill 拉取超时 |
-| `HERDR_SKILL_NETWORK` | 开 | `0` = 只用内置副本 |
+| `HERDR_MCP_PORT` | `8772` | 本机 runtime HTTP 端口 |
+| `HERDR_MCP_BASE_URL` | 空 | 公网 origin；OAuth `iss` / `aud`，不要带 `/mcp` |
+| `HERDR_SOCKET_PATH` | `~/.config/herdr/herdr.sock` | Herdr Socket API |
+| `HERDR_MCP_READONLY` | 关 | 禁止 mutation |
+| `HERDR_MCP_WRITE_ROOTS` | managed roots | 限定可写项目 |
+| `HERDR_MCP_ALL_TOOLS` | 关 | 开启高级/兼容工具；正常 ChatGPT 使用保持关闭 |
+| `HERDR_MCP_AGENT_ALLOW` | worker + auditor | 控制 inspect/since 展示的 Agent |
+| `HERDR_MCP_STATE_DIR` | `~/.config/herdr-mcp` | runtime state / exec journal |
+| `HERDR_MCP_OAUTH_DIR` | state dir 下 oauth | OAuth key/client state |
+| `HERDR_SKILL_NETWORK` | 开 | `0` 时仅使用 bundled skill |
 
-## 相关文档
+完整安装变量和 Edge 配置见 [安装](install.md) 与 [Cloudflare Edge 部署](cloudflare-edge-deployment.md)。
 
-- [CHANGELOG.md](../../../CHANGELOG.md) — 版本与工具面
-- [capability-benchmark.md](./capability-benchmark.md) — 官方 Herdr / 其他 Herdr MCP / coding-tools-mcp 能力吸收与“不吸收”决策
-- [extension.md](./extension.md) — 扩展总览（A 连续工作 + B 本地 JSON→MCP 均已可用）
-- [chatgpt-connector.md](./chatgpt-connector.md) — ChatGPT OAuth、schema、权限卡
-- [extension-wake.md](./extension-wake.md) — 主线 A：workspace 观察 + ChatGPT Project 共享自动化 + 普通 ChatGPT/z.ai/DeepSeek 单会话 Auto + 进度/收工回推 + 手动继续/监控/LLM 分析 + 独立手动接力 + 超时恢复 / 安全 Project 接力
-- [extension-bridge.md](./extension-bridge.md) — 主线 B：JSON→MCP（解析有、闭环无）
+## 接着读什么
+
+- 想知道平时怎样用：[最佳实践](best-practices.md)
+- 想理解 ChatGPT 公网连接：[ChatGPT Connector](chatgpt-connector.md)
+- 想理解网页为何能自己继续：[浏览器扩展](extension.md)
+- 想维护本机版本：[Runtime A/B 自升级](runtime-self-upgrade.md)
+- 想看工具能力取舍：[能力基准与设计取舍](capability-benchmark.md)
+- 遇到异常：[故障排查](troubleshooting.md)

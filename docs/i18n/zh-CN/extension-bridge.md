@@ -1,70 +1,191 @@
-# JSON → MCP 桥接
+# JSON → MCP：给没有原生 Connector 的网页 AI 一条本地工具通道
 
-读者：在 DeepSeek / z.ai 网页（没有 ChatGPT 式 MCP Connector）中，通过浏览器扩展安全驱动本机 herdr-mcp 的用户。
+ChatGPT 可以通过自定义 MCP Connector 直接调用 herdr-mcp，但不是所有网页 AI 都提供同类能力。z.ai / DeepSeek 的网页会话可以很好地推理，却没有标准入口把本机 Herdr 工具注册进去。
 
-扩展总览与连续工作主线见 [extension.md](./extension.md)，进度回推与接力见 [extension-wake.md](./extension-wake.md)。
+JSON → MCP bridge 解决的就是这个兼容问题。
 
-## 目标
+它不假装目标网站“原生支持 MCP”，也不把本机凭据交给页面 JavaScript。网页模型只负责输出受约束的 JSON 工具请求，真正的 MCP 调用由扩展和本机 trusted host 完成。
 
-B 线与 A 线并列：`chat.deepseek.com` / `chat.z.ai` 中的普通用户任务可以使用本机 Herdr MCP，同时不把工作站 token 暴露给网页 JavaScript，也不让扩展流量绕到公网 Worker/Tunnel。
+## 完整链路
 
 ```text
-网页用户任务
-  -> extension content bridge 注入 Herdr 工具协议 / catalog
-  -> 网页模型输出 {"tool":"...","args":{...}}
-  -> extension service worker POST tools/call 到 127.0.0.1:8772/mcp
-  -> TOOL_RESULT 回填同一网页会话
-  -> 网页模型继续调用工具或正常回答
+用户任务
+  ↓
+z.ai / DeepSeek Web model
+  │ 输出受约束 JSON tool call
+  ▼
+content bridge
+  ↓
+extension service worker
+  ↓ Chrome Native Messaging
+native host
+  ↓ Unix socket (0600)
+herdr-mcp /mcp
+  ↓
+Herdr + files / Git / shell
+  │
+  └─ TOOL_RESULT 回填网页会话
 ```
 
-## 当前状态（0.1.58）
+整个工具执行仍发生在本机。Cloudflare Edge 不参与这条路径。
 
-| 能力 | 状态 |
-|---|---|
-| 从本机 Herdr MCP 读取 `tools/list` | **已可用** |
-| 把 typed tool catalog 注入网页模型协议 | **已可用** |
-| 单次助手回复输出一个或多个 JSON 工具调用 | **已可用** |
-| 逐轮受控执行 `tools/call` + 回填结果，直到正常答案 | **已可用** |
-| 同批独立工具并行执行 | **已可用** |
-| 工具结果清洗 / 大二进制省略 / 长度上限 | **已可用** |
-| Herdr 凭据不进入网页 JavaScript 或 service worker | **已可用** — 当前版本使用 Native Messaging + 权限 `0600` 的 Unix IPC；旧版本 bearer 兼容仅保留在 native host/server 内部 |
-| z.ai / DeepSeek 会话级 `自动 开/关`，控制 Herdr progress/settled 自动回推 | **已可用**（需全局允许自动化） |
-| 已落成 z.ai `/c/<chat_id>` 的“手动接力” | **已可用**（`自动 开/关` 均可；新会话继承源会话 Auto 状态；接力控制消息绕过 JSON bridge） |
-| 刷新/重载后的未完成工具 JSON 恢复 | **已可用** — 若最后一条真实会话消息仍是 assistant 的 Herdr tool-call JSON，且前文存在 bridge 上下文，会自动继续执行 |
-| 长 JSON→MCP 链路 | **已可用** — 第 12 轮只作为调度让出点；只有 assistant 返回正常非工具答案才算完成 |
+## 为什么不是直接让网页 JavaScript 请求 `127.0.0.1`
 
-Bridge 使用本机实时 `tools/list` catalog，而不是再维护一份手写工具白名单。扩展仍会校验调用站点与 conversation；所有 MCP 流量只走 loopback，本机 Herdr server 仍是最终工具/权限边界。
+直接从网页脚本连接本机 MCP 会带来几类问题：
 
-## 协议
+- 页面 origin 和浏览器权限模型限制；
+- bearer 容易落进页面或扩展存储；
+- 任意页面脚本可能试图复用本机高权限接口；
+- 流式事件和 conversation identity 缺少统一控制层。
 
-Content bridge 给网页模型一个 typed catalog，并要求工具调用回复每行只放一个 JSON 对象：
+当前架构使用 Chrome Native Messaging，把浏览器侧能做的动作限制为明确的 request/stream 消息，再由 native host 通过权限为 `0600` 的 Unix socket 进入 runtime。
+
+因此：
+
+- 网页 JavaScript 看不到 Herdr bearer；
+- extension service worker 也不需要长期保存 bearer；
+- herdr-mcp runtime 仍是最终工具 schema、权限和 managed-root 闸门；
+- local IPC 与公网 OAuth 是两套独立信任边界。
+
+## 网页模型看到什么
+
+Bridge 从本机实时 `tools/list` 获取工具 catalog，然后把必要的 typed schema 转成网页模型能够遵循的协议说明。
+
+模型在需要调用工具时输出 JSON，例如：
 
 ```json
 {"tool":"herdr_inspect","args":{}}
 ```
 
-互相独立的调用可以同一回复里并列并行执行；有依赖的步骤继续串行。只有 service worker 返回 `TOOL_RESULT` 后，网页模型才能把该工具视为成功。
+或：
 
-站点支持时，bridge 的中间协议消息会折叠。工具结果递归清洗，大体积 binary/base64 字段会被省略，整批 TOOL_RESULT 在回填网页模型前也有长度上限。
+```json
+{"tool":"herdr_git","args":{"root":"/path/to/project","action":"status"}}
+```
 
-0.1.50 会在历史加载时重新折叠内部协议消息，不再只在 bridge 正在运行时折叠。折叠条作为站点 message root 的外部兄弟节点，显隐的是整条原消息；展开 z.ai 消息时不会再占满 flex 行宽、把正文挤成细竖条。
+Bridge 解析后执行真实 MCP `tools/call`，再把 `TOOL_RESULT` 回填同一 conversation。网页模型根据结果决定下一步继续调用工具还是给用户正常答案。
+
+## bounded tool loop
+
+Bridge 不是把浏览器变成无限自治 Agent。每次工具循环都受状态、conversation identity 和调度边界约束。
+
+一次逻辑流程是：
+
+```text
+assistant JSON calls
+      ↓
+validate
+      ↓
+execute MCP tools
+      ↓
+return TOOL_RESULT
+      ↓
+assistant reasons again
+      ↓
+JSON calls or normal answer
+```
+
+独立的同批调用可以并行；有依赖关系的步骤应继续串行。只有真实 `tools/call` 返回以后，网页模型才能把该工具视为成功。
+
+## 结果为什么需要清洗
+
+MCP result 可能包含：
+
+- 很长的终端输出；
+- image/binary 内容；
+- structuredContent；
+- 大段 base64 或其它网页模型不适合直接消费的字段。
+
+Bridge 在回填前做长度限制和递归清洗，大型 binary/base64 字段会省略或摘要化。这不是改变工具事实，而是避免一轮结果把网页上下文淹没。
+
+如果任务确实需要图片等富内容，优先让 Web planner选择适合的可见结果表达，而不是把原始二进制塞进文本 JSON。
+
+## 中间协议消息为什么要折叠
+
+JSON tool call / TOOL_RESULT 是机器协作记录，对人类阅读价值低，但长任务可能产生很多轮。
+
+支持的站点会把这些内部消息折叠，让会话主线仍以“用户目标 → 最终解释/进展”为主。折叠只影响显示，不删除真实 conversation 内容。
+
+## conversation identity
+
+Bridge 必须知道“这次工具结果应该回到哪一个聊天”。
+
+### z.ai
+
+稳定 `/c/<chat_id>` URL 作为持久 conversation identity。根路径 `/` 是新聊天启动态，只能暂时保存启动期状态；第一次落成 `/c/<chat_id>` 后，临时 binding / Auto 偏好可以迁移一次。
+
+之后从 `/c/A` 切到 `/c/B` 时，不会把 A 的 workspace binding 或自动化偏好误带到 B。
+
+### DeepSeek
+
+同样按稳定会话身份隔离 bridge state。页面 adapter 负责从当前站点路由/DOM 提取 identity，而不是把 tab id 当成长期会话 id。
+
+## 页面刷新以后怎样继续未完成的 tool call
+
+浏览器刷新不应该自动重跑所有历史 JSON。
+
+恢复只在有充分上下文证据时进行：最后一条真实 conversation message 仍是 assistant 的 Herdr tool-call JSON，并且前文存在 bridge protocol context。这样才能判断“这是刚刚中断的工具步骤”，而不是用户打开了一段旧历史。
+
+对于 mutation，恢复仍遵循 herdr-mcp 本身的 delivery/idempotency 规则。未知投递不能因为网页刷新就盲目执行第二次。
+
+## 与浏览器 continuity 的关系
+
+JSON → MCP 和 continuity 共用扩展与 Native Messaging transport，但解决不同问题。
+
+| 能力 | 方向 | 目的 |
+|---|---|---|
+| JSON → MCP | 网页 → 本机 | 让没有原生 Connector 的 Web AI 调工具 |
+| progress / settled | 本机 → 网页 | Agent 工作完成后推动会话继续 |
+| recovery / handoff | 网页内部 | 恢复卡住的页面或切换长 conversation |
+
+因此 z.ai 可以同时：
+
+1. 用 JSON bridge 调 `herdr_fs_* / git / exec / prompt`；
+2. 绑定同一个 Herdr workspace；
+3. 在 Agent 长任务期间接收 progress / settled；
+4. 必要时执行手动 handoff；`自动 开/关` 均可启动，目标会话继承源会话的 Auto 状态。
+
+z.ai / DeepSeek 的会话 Auto 不意味着启用 ChatGPT 专属 stale-view 或自动 rollover。
+
+## handoff 为什么必须绕过 JSON task wrapper
+
+接力时旧会话需要生成摘要，新会话需要接收 seed。这些是**conversation control message**，不是“请调用 coding tools 完成一个业务任务”。
+
+所以 z.ai handoff summary / seed 走 raw channel，明确绕过 JSON bridge。否则模型可能把“生成接力摘要”误包装成 Herdr coding task，形成错误递归。
 
 ## 安全边界
 
-- MV3 service worker 通过 Chrome Native Messaging 发送受限 request/stream 消息；native host 再经 `~/.config/herdr-mcp/extension.sock`（权限 `0600`）访问 herdr-mcp。因此 service worker 和网页 JavaScript 都拿不到 Herdr bearer。旧版 bearer 兼容只留在 native host/server 内部。
-- MCP 请求只发送到配置的本机 Herdr endpoint，默认 `http://127.0.0.1:8772/mcp`。
-- Bridge / 自动化动作执行前会校验 site 与 conversation identity。
-- 不假装 DeepSeek / z.ai 原生支持 OAuth MCP Connector。
-- ChatGPT 仍按需要使用其 Connector；JSON bridge 只解决缺少原生 Connector 的网页站点。
+Bridge 的边界可以概括成：
 
-## z.ai 1.1.88 兼容
+- 只对明确支持的站点启用；
+- 每次执行检查当前 site + conversation identity；
+- tool catalog 来自本机真实 runtime，不维护另一份偷偷漂移的白名单；
+- MCP 调用只经本机 trusted IPC；
+- 浏览器不持有 Herdr bearer；
+- 最终文件、Git、shell 权限仍由 herdr-mcp runtime gate 决定；
+- 不通过 Cloudflare 把 extension 流量绕一圈公网；
+- 不声称目标网站拥有官方 OAuth MCP 能力。
 
-当前 adapter 把 `/` 视为新聊天启动页，把 `/c/<chat_id>` 视为稳定的持久会话身份。当前 DOM / composer 信号使用 `.user-message`、`.markdown-prose`、`#send-message-button`，同时保留兼容兜底 selector。
+## 当前适用场景
 
-同一 tab 在根页 `/` 上临时建立的 binding 或会话自动化偏好，会在首次落成 `/c/<chat_id>` 时迁移一次；之后用户从已有 `/c/A` 切换到 `/c/B` 时，不会把 workspace binding 或自动化偏好一起拖过去。
+它特别适合：
 
-## 与连续工作 / 接力协作
+- 想使用 z.ai / DeepSeek Web 模型，但仍让它们操作自己的 Herdr 工作站；
+- 不想再为每个网页站点实现一套本地开发 backend；
+- 希望同一套 18-tool contract 和 managed-root 安全边界被多个 Web planner 复用。
 
-A 线可以同时把 z.ai / DeepSeek conversation 绑定到 Herdr workspace 做 progress/done 回推，B 线负责本机 MCP 工具调用。会话级 `自动 开/关` 只控制自动 progress/settled 回推，不会开启 ChatGPT 专属 stale-view 恢复、回合结束 LLM 判断或自动 rollover。
+如果目标客户端已经有可靠的原生 MCP Connector（例如 ChatGPT），优先使用原生 Connector；JSON bridge 是兼容层，不应该为了“统一”而替代更直接的标准路径。
 
-持久 z.ai conversation 在 `自动 开/关` 两种状态下都可以使用 **手动接力**。handoff 启动时会快照源会话 Auto 状态，新 chat 会继承该状态；summary / seed 通过 bridge 的 raw 通道发送，因此接力控制文案不会被重新包装成 coding-agent task。只有新 z.ai chat 已形成新的 `/c/<chat_id>` 且 seed marker 得到确认后，workspace binding 才迁移过去。
+## 验收
+
+一条最小真实链路应该验证：
+
+1. Bridge 能读取本机当前 `tools/list`；
+2. 网页模型能生成合法 `herdr_inspect` JSON；
+3. native host 成功执行 MCP tool；
+4. `TOOL_RESULT` 回填当前 conversation，而不是其它 tab / chat；
+5. 模型能根据结果继续第二个 tool call 或正常回答；
+6. 页面刷新后不会重复执行已经完成的 mutation；
+7. workspace binding / progress continuity 与 JSON tool loop 可以同时工作。
+
+实现级 selector 和版本演进记录放在测试与 [CHANGELOG](../../../CHANGELOG.md)，本页只描述当前协议与安全边界。

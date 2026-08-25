@@ -1,241 +1,218 @@
 # herdr-mcp
 
-ウェブ LLM（とくに ChatGPT Connector）が本機の [Herdr](https://herdr.dev) を駆動するための MCP HTTP ゲートウェイ。ペイン / agent の確認、git 管理下のプロジェクト編集、シェル実行、安価なローカル worker への投入。Chrome 拡張が進捗 / 続行を、紐づけたウェブ会話へ打ち返す。
+**Web AI から Herdr を通じて実際のローカル開発ワークステーションを操作するためのリモート制御プレーンです。**
+
+ChatGPT のような Web モデルは目標の理解や設計判断に強い一方、ブラウザだけではローカルのファイル、Git、Shell、長時間ジョブ、Herdr workspace を直接見ることができません。herdr-mcp は、その間を安全に接続します。
 
 **Docs:** https://whshang.github.io/herdr-mcp/ · **Source:** https://github.com/whshang/herdr-mcp
 
-[Herdr](https://herdr.dev) はコーディング agent 向けの端末マルチプレクサ。このリポジトリはソケットもディスクも見えない**遠隔**クライアントの入口。Herdr の約 90 個のネイティブメソッドを MCP ツールに再包装しない。
+Languages: [English](README.md) · [简体中文](README.zh.md) · **日本語**
 
-**しないこと:** Herdr の代替。DeepSeek に偽の OAuth connector を付ける。拡張をローカル以外へ出す（拡張は `127.0.0.1` のみ）。
+## できること
 
-**言語（herdr と同じ）:** [English](README.md)（GitHub 既定）· [简体中文](README.zh.md) · [日本語](README.ja.md)。  
-CLI / ブラウザ拡張: 初回インストールはシステム言語（`en` / `zh` / `ja`）、不明なら英語。変更: `herdr-mcp lang`、または拡張の Options → Language。
+herdr-mcp は Web planner に次の能力を提供します。
 
-## アーキテクチャ（あなた ↔ ウェブ ↔ MCP ↔ herdr、拡張が逆方向チャネル）
-
-上から下へ: あなた → ウェブ会話 →（herdr-mcp と chrome-extension **同列**）→ Herdr panes → ローカル agents。  
-Agents の進捗 / settled が拡張へ届き、拡張がウェブ会話へ書き込む。詳細: [docs/i18n/en/extension-wake.md](docs/i18n/en/extension-wake.md)（英語）。
-
-**オーケストレーション（ウェブが計画、本機は安価）:**
-
-- `herdr_fs_*` / `herdr_git` / `herdr_exec` を優先（ローカル agent API 不要）。
-- 推論が必要なら Herdr-native の安い/高速 worker（`pi` / `flash` / `cline` / `opencode` / `anti`）または監査（`droid` / `grok`）へ直接 `herdr_prompt`。本機 Claude/OMP/main を中間マネージャにしない。
-- Pi/Herdr worker が使えない場合は、実測済みの `dsh --profile headless "task"` を CLI fallback にできる。ただし非自明な coding task は `herdr_exec_start` の長時間 session で実行し、timeout 後は再送前に Git/test の実結果を確認する。`dsh-tui` は人間向け interactive fallback。詳細: [worker fallbacks](docs/i18n/en/worker-fallbacks.md)。
-- `inspect`/`since` は既定で Claude/OMP/Codex をソフト非表示。既知 pane への prompt は可。`HERDR_MCP_AGENT_ALLOW=*` で全表示。
-- 現在は frozen contract epoch 2 を共通利用します。**18 tools（`herdr_skill` を含む）**で、開始手順は `herdr_inspect` → `herdr_skill`（一度）→ 作業です。
-
-```mermaid
-flowchart TB
-  You[You]
-  Web[Web chat<br/>e.g. ChatGPT]
-  MCP[herdr-mcp]
-  Ext[herdr-mcp-chrome-extension]
-  Herdr[Herdr panes]
-  Agents[Local cheap workers<br/>pi / flash · edit / test]
-
-  You --> Web
-  Web -->|call MCP| MCP
-  MCP --- Ext
-  MCP -->|reach herdr| Herdr
-  Herdr -->|dispatch| Agents
-  Agents -.->|progress / settled| Ext
-  Ext -.->|type into web chat| Web
-```
-
-## 対応 OS と起動
-
-**Node サーバ**は [herdr](https://herdr.dev) と同じく **macOS / Linux / Windows**（Node.js 20+）。インストールディレクトリは走査せず、API socket（既定 `~/.config/herdr/herdr.sock`、`HERDR_SOCKET_PATH` で上書き）と PATH 上の `herdr api schema` を使う。
-
-起動方法は二つ:
-
-| 経路 | 対象 | 方法 |
-|---|---|---|
-| 前景 | 任意 OS | 下記 `node dist/server.js` |
-| `herdr-mcp` CLI | **macOS** LaunchAgent | `bin/herdr-mcp start` / `status` / `logs` / `watchdog` |
-
-`npm` の `bin` は `dist/server.js` であり bash CLI ではない。macOS では `ln -sf …/bin/herdr-mcp ~/.local/bin/herdr-mcp` 可。systemd / Task Scheduler は範囲外。
-
-```bash
-export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
-export HERDR_MCP_PORT=8772
-# 公開 Connector 用（/mcp サフィックスなし）:
-# export HERDR_MCP_BASE_URL=https://herdr-edge.<your-account>.workers.dev
-node dist/server.js
-```
-
-## ローカル Agent にインストールを任せる
-
-Codex、Claude Code、Pi、DSH、Cline など、ファイルを読んでコマンドを実行できるローカル Agent には、次のプロンプトをそのまま渡せます。手順の正本は Agent install guide です。
+- **永続的なローカル作業状態** — Herdr workspace / pane / agent lifecycle
+- **決定的なワークステーション操作** — files / Git / images / shell
+- **必要なときだけ local agent に委譲**
+- **安定したリモート接続** — Cloudflare Edge 上の OAuth/MCP と、workstation からの outbound link
+- **ブラウザ継続性** — ローカル進捗を Web 会話へ戻し、長い会話を安全に新しい会話へ handoff
 
 ```text
-herdr-mcp をゼロからインストールしてデプロイしてください。このプロンプトから手順を推測せず、最初に正本を読んでください：
-https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md
+User
+  ↓
+ChatGPT / Web AI
+  ↓ MCP + OAuth
+Cloudflare Edge
+  ↓ authenticated routing
+herdr-link
+  ↓
+local herdr-mcp runtime
+  ↓
+Herdr workspace
+  ├─ files / Git / shell
+  └─ local agents
 
-文書どおりに、環境確認、安全な clone/update、依存関係、build、local MCP、Herdr socket、Cloudflare workers.dev Edge まで実行してください。Cloudflare への本人ログイン/API Token 作成、または複数 Account からの選択だけは私に依頼してください。Token を受け取ったら再表示せず、repo/.env/log/screenshot/shell history に保存せず、一時環境だけで使ってデプロイを続行してください。初回は Custom Domain/DNS/Tunnel を作らず workers.dev のみを使ってください。
-
-最後に local MCP、Herdr Link、Cloudflare Account、Worker、workers.dev origin、/health、/mcp、ChatGPT Connector の次手順を報告してください。失敗時は再実行の前に状態を確認し、成功済みの mutation を繰り返さないでください。
+Herdr progress
+  ↓
+browser extension
+  ↓
+Web conversation resumes
 ```
 
-正本：[Local-Agent install and workers.dev deployment](docs/i18n/en/agent-install.md)。
+## 何ではないか
 
-## インストール（ゼロから動くまで）
+herdr-mcp は Herdr の代替ではなく、別の Agent runtime でもありません。また、Herdr の全 Socket API を個別 MCP tool に複製しません。
 
-### 0. 前提
+Web モデルが planner、Herdr が永続的なローカル作業環境、local agent が worker です。完了判定の根拠は agent の発言ではなく、Git・test・runtime の実状態です。
 
-- [herdr](https://herdr.dev) がインストール済みかつ起動中
-- Node.js 20+（`node -v`）
-- ChatGPT 向け: Cloudflare Worker の `workers.dev` 公開 HTTPS（独自ドメインは不要）。Custom Domain は長期的に安定した URL が必要な場合のみ推奨。
+## 公開 tool surface
 
-### 1. 取得とビルド
+高頻度の遠隔操作だけを固定 MCP tool とし、Herdr の長尾 API は動的に参照します。
+
+```text
+frequent work
+  → herdr_inspect / herdr_since / herdr_fs_* / herdr_git / herdr_exec* / herdr_prompt
+
+native Herdr long tail
+  → herdr_methods → herdr_call
+```
+
+現在の production public contract は **epoch 2 / 18 tools** で、read-only の `herdr_skill` を含みます。
+
+## 最短セットアップ
+
+前提：
+
+- [Herdr](https://herdr.dev) がインストール済み・起動中
+- Node.js 20+
+- ChatGPT から公開接続する場合は Cloudflare account
+
+ローカル Coding Agent にセットアップを任せる場合は、推測させず英語の正本を先に読ませてください。
+
+```text
+Install and deploy herdr-mcp for me. First read:
+https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md
+
+Follow that guide end to end. Use workers.dev for the first install and do not expose or commit secrets.
+```
+
+手動で構築する場合：
 
 ```bash
 git clone https://github.com/whshang/herdr-mcp.git
 cd herdr-mcp
-npm install
-npx tsc
-mkdir -p ~/.config/herdr-mcp
-```
+npm ci
+npm run build
 
-### 2. ローカル MCP 起動
-
-```bash
 export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
-echo "token=$HERDR_MCP_TOKEN"
 node dist/server.js
 ```
 
-### 3. Cloudflare Edge 経由で ChatGPT に接続
-
-標準構成では独自ドメインは不要です。まず Worker を `workers.dev` にデプロイします。
+ローカル runtime を確認します。
 
 ```bash
-cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
-# Worker 名、workstation ID、workers.dev origin の OAUTH_ISSUER を設定
-cd edge/cloudflare
-npx wrangler deploy --config wrangler.user.toml
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
+herdr --version
+herdr api schema >/dev/null
 ```
 
-MCP URL は次の形式です。
+ChatGPT から使う場合は、まず Cloudflare Worker を `workers.dev` にデプロイし、`herdr-link` を起動して、公開 `/mcp` URL を ChatGPT の custom MCP App/Connector に登録して OAuth を完了します。
+
+`HERDR_MCP_TOKEN` や Cloudflare API Token を ChatGPT に貼らないでください。
+
+詳細手順（英語）：
+
+- [Quick start](docs/i18n/en/quick-start.md)
+- [Installation](docs/i18n/en/install.md)
+- [ChatGPT Connector](docs/i18n/en/chatgpt-connector.md)
+
+## 最初の実タスク
+
+Connector 設定後は、新しい会話で read-only から確認してください。
 
 ```text
-https://herdr-edge.<your-account-subdomain>.workers.dev/mcp
+Inspect the current Herdr workspaces and Git status. Read only; do not modify anything.
 ```
 
-Cloudflare に独自 zone がある場合は、`herdr.example.com` のような Custom Domain を後から追加できます。これは**推奨オプションであり必須ではありません**。先に `workers.dev` 上で Worker / WSS Link / MCP / OAuth を検証してください。詳細: [Cloudflare Edge deployment](docs/i18n/en/cloudflare-edge-deployment.md)。
+正常な流れ：
 
-Runtime のリリースは安定した Edge/Link の背後で A/B 切り替えでき、ChatGPT Connector の変更は不要です。詳細: [Runtime A/B self-upgrade](docs/i18n/en/runtime-self-upgrade.md)。
-
-#### ChatGPT Web で Connector を追加
-
-1. ChatGPT 設定で Developer mode を有効化。
-2. Custom MCP Connector を作成。
-3. `workers.dev` の MCP URL、または任意の Custom Domain + `/mcp` を入力。
-4. ブラウザで OAuth を完了し、ローカル Herdr token は ChatGPT に貼らない。
-5. 接続後は新しいチャットを開始して新しい tool snapshot を取得。
-
-トラブル時は MCP URL と `OAUTH_ISSUER` が同じ安定 origin を使っていること、Edge health、`herdr-link`、OAuth discovery を確認してください。詳細: [docs/i18n/en/chatgpt-connector.md](docs/i18n/en/chatgpt-connector.md)。
-
-### 4. Cursor（任意・同一マシン）
-
-`~/.cursor/mcp.json` — ローカルのみ:
-
-```json
-{
-  "mcpServers": {
-    "herdr-mcp-local": {
-      "url": "http://127.0.0.1:8772/mcp",
-      "headers": {
-        "Authorization": "Bearer <paste: herdr-mcp token>"
-      }
-    }
-  }
-}
+```text
+herdr_inspect
+  ↓
+herdr_skill
+  ↓
+herdr_git status
+  ↓
+herdr_fs_read / grep
+  ↓
+answer
 ```
 
-### 5. ブラウザ拡張（任意）
+その後、小さな edit + test + diff を試します。local agent は独立推論が本当に役立つタスクだけに使います。
 
-フォルダ: `extension/`（MV3）。Chrome 上の名前は **herdr → Web wake**。先に `bin/herdr-extension-host install` を実行し、`chrome://extensions` で unpacked 読み込み。現在の拡張は Chrome Native Messaging から mode `0600` の Unix Socket 経由で runtime に接続し、ブラウザ側に Herdr bearer を受け取ったり保存したりしません。
+## Browser continuity
 
-## エンドポイント
+MCP は基本的に次の方向です。
 
-| 用途 | URL |
-|---|---|
-| ローカル MCP | `http://127.0.0.1:8772/mcp` |
-| 公開 MCP | `{HERDR_MCP_BASE_URL}/mcp` |
-| 拡張 SSE | `http://127.0.0.1:8772/push/events` |
-| 拡張スナップショット | `http://127.0.0.1:8772/push/state` |
+```text
+Web AI → workstation
+```
 
-Connector 認証は **OAuth (DCR / CIMD)**。静的 Bearer はローカル curl / Cursor と、Native Messaging host が旧 runtime に接続する HTTP 互換経路用です。現在のブラウザ拡張は Herdr Token を受け取りません。ChatGPT の connector フォームに貼らないでください。
+ローカル Agent はブラウザの turn が終わった後も作業を続けることがあります。MV3 extension は逆方向を補います。
 
-## CLI（macOS）
+```text
+workstation → Web conversation
+```
+
+主な機能：
+
+- workspace binding
+- progress / settled wake
+- evidence-first recovery
+- long-conversation handoff
+- native custom MCP Connector を持たない z.ai / DeepSeek 向けの bounded JSON→MCP bridge
+
+Native Messaging host をインストールします。
 
 ```bash
-herdr-mcp              # メニュー
-herdr-mcp status
-herdr-mcp connector
-herdr-mcp start | stop | restart   # LaunchAgent
-herdr-mcp logs [-f]
-herdr-mcp token | url
-herdr-mcp lang [en|zh|ja]
-herdr-mcp watchdog install
-herdr-mcp watchdog status
+bin/herdr-extension-host install
+bin/herdr-extension-host status
 ```
 
-コード変更後: `npx tsc && herdr-mcp restart`（または `node dist/server.js` を再起動）。
+その後 `extension/` を Chrome/Chromium の unpacked extension として読み込みます。
 
-## 既定ツール（なぜこの 18）
+詳細：[Browser continuity](docs/i18n/en/browser-continuity.md) · [Browser extension](docs/i18n/en/extension.md)
 
-herdr のネイティブ面は大きな Unix-socket API（`herdr api schema`）。herdr-mcp は全メソッドを MCP ツールに再包装しない。0.3.32 の production ChatGPT ABI は **contract epoch 2 / 18 tools**（`herdr_skill` を含む）で固定します。epoch 1 / 17 tools は管理された rollback と旧セッション互換のためだけに残します。代わりに:
+## セキュリティ境界
 
-| 層 | MCP ツール | herdr との関係 |
-|---|---|---|
-| Skill | `herdr_skill` | 上流 Herdr `SKILL.md` の読み取り。各 session で agent 操作の前に一度使用する。 |
-| Passthrough | `herdr_methods`, `herdr_call` | ネイティブ socket API への薄いゲート |
-| リモート編成 | `herdr_inspect`, `herdr_since`, `herdr_prompt` | ウェブ向け小さなヘルパ |
-| リモート workstation | `herdr_fs_*`, `herdr_exec` / `herdr_exec_*`, `herdr_git` | オフマシンクライアント向けのディスク/シェル面 |
+- local runtime は loopback に bind
+- workstation は Edge へ **outbound** authenticated WSS を作る
+- ChatGPT は public Edge で OAuth を使用
+- browser continuity は Native Messaging + `0600` Unix socket
+- `herdr_fs_*` は managed Git root / write / secret-path gate の対象
+- `herdr_exec` はより強い shell 能力であり、sandbox ではない
+- delivery が不確実な mutation は、再実行前に実状態を確認
 
-ツール表の全文は [README.md](README.md)（英語）または [README.zh.md](README.zh.md)。
+詳細：[Architecture](docs/i18n/en/architecture.md) · [Best practices](docs/i18n/en/best-practices.md)
 
-`HERDR_MCP_ALL_TOOLS=1` でライフサイクルツールを足し 30 個。書き込みは managed git root に限定。`HERDR_MCP_READONLY=1` / `HERDR_MCP_WRITE_ROOTS` でさらに絞れる。
+## Runtime A/B
 
-## 環境変数（主要）
+公開 Edge とローカル runtime は別の release plane です。
 
-| 変数 | 既定 | 役割 |
-|---|---|---|
-| `HERDR_MCP_TOKEN` | 空 | `/mcp` と `/push` の静的 Bearer |
-| `HERDR_MCP_PORT` | `8772` | 待受ポート |
-| `HERDR_MCP_BASE_URL` | 空 | ChatGPT 用公開 origin（`/mcp` なし） |
-| `HERDR_SOCKET_PATH` | `~/.config/herdr/herdr.sock` | herdr API socket |
-| `HERDR_MCP_READONLY` | off | mutation を遮断 |
-| `HERDR_MCP_ALL_TOOLS` | off | 18 ではなく 30 ツール |
-| `HERDR_SKILL_NETWORK` | on | `0` = 同梱 SKILL.md のみ |
+```text
+stable Edge / OAuth / MCP URL
+        ↓
+persistent herdr-link
+        ↓
+runtime generation A / B
+```
 
-一覧: [docs/i18n/en/architecture.md](docs/i18n/en/architecture.md#environment-variables)。
+同じ public contract epoch の中なら、新しい local runtime generation を検証・activate・rollback しても ChatGPT Connector URL を変更する必要はありません。
 
-## ブラウザ拡張
+詳細：[Runtime A/B](docs/i18n/en/runtime-self-upgrade.md)
 
-フォルダ: `extension/`（MV3）。対応サイト: chatgpt.com / claude.ai / chat.deepseek.com / chat.z.ai。
+## Documentation map
 
-1. **Web 継続動作（利用可）** — Options で **全体を手動 / Project ごとの自動化**を選ぶ。下部 HUD には **手動続行 / Herdr 監視 / LLM 分析 / 手動引き継ぎ**があり、自動化を許可した対象には `Auto on|off` も表示する。ChatGPT は `project_id`、z.ai / DeepSeek は会話単位で自動設定を保持する。0.1.47 では `Auto on` 中の HUD 手動操作をすべてロックし、binding 済みの z.ai `/c/<chat_id>` 会話にも fail-closed 手動引き継ぎを追加した。0.1.48 では workspace をまだ binding していない z.ai / DeepSeek 会話でも先に Auto 設定を保存でき、Herdr の progress/settled 自動送信は binding 後に有効になる。z.ai の `/` から最初の `/c/<chat_id>` への遷移では binding と自動設定を一度だけ移すが、既存履歴間の移動には追従しない。
-2. **JSON → MCP（利用可）** — DeepSeek / z.ai のローカル JSON bridge が `127.0.0.1:8772/mcp` の `tools/list` / `tools/call` を bounded round で実行して結果を会話へ戻す。静的 Herdr token は extension service worker 内に残り、ページ JavaScript には公開しない。
+- [Overview](docs/i18n/en/overview.md)
+- [Design philosophy](docs/i18n/en/design-philosophy.md)
+- [Quick start](docs/i18n/en/quick-start.md)
+- [Installation](docs/i18n/en/install.md)
+- [ChatGPT Connector](docs/i18n/en/chatgpt-connector.md)
+- [Browser continuity](docs/i18n/en/browser-continuity.md)
+- [Architecture](docs/i18n/en/architecture.md)
+- [Best practices](docs/i18n/en/best-practices.md)
+- [CLI reference](docs/i18n/en/cli-reference.md)
+- [Cloudflare Edge deployment](docs/i18n/en/cloudflare-edge-deployment.md)
+- [Runtime A/B](docs/i18n/en/runtime-self-upgrade.md)
+- [Troubleshooting](docs/i18n/en/troubleshooting.md)
 
-展開ドロワーは低頻度設定専用（イベント設定 / 会話 binding / 詳細オプション）で、手動ボタンや自動化 switch は置かない。ChatGPT Project の rollover は fail-closed で、新しい会話への seed が確認されるまで元の binding が権威を持つ。UI 言語: en / 简体中文 / 日本語。詳細: [docs/i18n/en/extension.md](docs/i18n/en/extension.md)。
-
-## ドキュメント
-
-| Doc | 内容 |
-|---|---|
-| [CHANGELOG.md](CHANGELOG.md) | バージョン |
-| [docs/i18n/en/architecture.md](docs/i18n/en/architecture.md) | herdr vs MCP（英語） |
-| [docs/i18n/en/chatgpt-connector.md](docs/i18n/en/chatgpt-connector.md) | ChatGPT OAuth（英語） |
-| [docs/i18n/en/extension.md](docs/i18n/en/extension.md) | 拡張（英語） |
-| [README.md](README.md) | 英語（GitHub 既定・ツール表フル） |
-
-## Ops
+## Development checks
 
 ```bash
-npx tsc
-# node dist/server.js を動かしているプロセスを再起動
+npm run build
+npm test
+npm run test:edge
+npm run build:site
+git diff --check
 ```
-
-Sessions: `~/.config/herdr-mcp/sessions/`。

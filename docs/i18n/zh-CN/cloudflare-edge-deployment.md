@@ -1,163 +1,184 @@
-# Cloudflare Edge
+# Cloudflare Edge 部署：给本地工作站一个稳定的公网入口
 
-Herdr 的 Cloudflare Edge 不要求用户拥有自己的域名。
-
-推荐把部署分成两个层次：
-
-1. **默认 / 开箱即用：`workers.dev`** —— 任何 Cloudflare Workers 用户都可以直接部署，不需要购买或托管域名。
-2. **可选 / 长期稳定入口：Custom Domain** —— 已有自己的域名时，建议绑定一个稳定子域名，但这不是 Herdr 的运行前提。
-
-Cloudflare 官方也把 Custom Domain 定义为“Worker 自己就是 origin”的场景；Herdr Edge 正属于这种架构。`workers.dev` 则非常适合首次安装、开发、自用和独立验证。
-
-## 架构
-
-### 默认：不需要自定义域名
+ChatGPT 在公网，本地 Herdr 工作站通常藏在 NAT、防火墙或公司网络之后。herdr-mcp 不要求你给开发机开放入站端口，而是让工作站主动建立一条出站连接到 Cloudflare Edge。
 
 ```text
 ChatGPT
-   |
-https://herdr-edge.<account>.workers.dev/mcp
-   |
+   │ HTTPS / OAuth / MCP
+   ▼
 Cloudflare Worker + Durable Object
-   ^
-authenticated WSS
-   |
+   ▲
+   │ authenticated WSS
+   │
 herdr-link
-   |
-local Herdr runtime
+   │
+   ▼
+local herdr-mcp runtime
+   │
+   ▼
+Herdr / Git / shell
 ```
 
-这种模式下不需要：
+这篇文档讲 Edge 为什么这样部署、第一次怎样跑通、什么时候需要 Custom Domain，以及旧 Tunnel 架构怎样安全迁移。
 
-- 自有域名；
-- DNS 记录；
-- Cloudflare Tunnel；
-- 公网 VPS；
-- 入站端口映射。
+## 先记住三个原则
 
-`herdr-link` 主动向 Cloudflare 建立 WSS 连接，本机保持不可从公网直接访问。
+### 1. 新安装从 `workers.dev` 开始
 
-### 可选：稳定 Custom Domain
+不需要先买域名，也不需要先配置 DNS。
 
-```text
-ChatGPT
-   |
-https://herdr.example.com/mcp
-   |
-Cloudflare Worker Custom Domain
-   |
-Cloudflare Worker + Durable Object
-   ^
-WSS
-   |
-herdr-link
-```
+### 2. 工作站只建立出站连接
 
-Custom Domain 的价值是**稳定命名和所有权**，而不是 Herdr 技术上的必需条件。以后即使 Edge 实现从 Cloudflare 迁移到其他平台，用户仍可保留同一个 MCP/OAuth URL。
+公网不能直接访问本机 `127.0.0.1:8772`。Edge 通过已经认证的 workstation link 把请求送回正确机器。
 
-## 默认部署：`workers.dev`
+### 3. 公网 identity 要稳定
 
-从通用模板开始：
+ChatGPT Connector、OAuth issuer 和 MCP resource 都依赖 public origin。第一次验证成功以后，不要把 Worker 名称或 Custom Domain 当成随手可改的临时变量。
+
+## Edge 负责什么
+
+Cloudflare 层主要承担：
+
+- 稳定 HTTPS MCP endpoint；
+- OAuth discovery / authorization / token；
+- workstation identity 路由；
+- 持久 WSS link 的连接管理；
+- runtime online/offline 与 generation/version 状态；
+- MCP request/response relay。
+
+Edge **不保存你的 Git 仓库**，也不代替本机 Herdr。代码、shell 和 Agent 仍在工作站执行。
+
+## 第一次部署：workers.dev
+
+从用户配置模板开始：
 
 ```bash
 cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
 ```
 
-`wrangler.user.toml` 已被忽略，不会误提交个人 Worker 名、workstation ID 或
-OAuth issuer。
+`wrangler.user.toml` 是个人部署配置，不应提交包含 workstation identity 等本地部署信息的用户文件。
 
-Worker name 不要直接复制机器 `hostname`，统一用 `node scripts/cloudflare-worker-name.mjs "$(hostname)"` 生成。启用 `workers.dev` 时，Worker name 是单个 DNS label：不能含点或下划线、最长 63 字符、不能以 `-` 开头/结尾。Custom Domain 是另一类对象，可以包含点。
+### 生成 Worker name
 
-Worker 配置保持：
+不要直接拿 `hostname` 当 Worker name。机器名里常有点号或其它不适合作为 DNS label 的字符。
 
-```toml
-name = "herdr-edge"
-main = "src/index.ts"
-workers_dev = true
-routes = []
+```bash
+WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
+printf '%s\n' "$WORKER_NAME"
 ```
 
-部署：
+`workers.dev` 的 Worker name 是一个 DNS label；Custom Domain 是完整域名，两者规则不同。
+
+### 配置 public origin
+
+首次部署完成后，Cloudflare 会给出类似：
+
+```text
+https://<worker>.<account-subdomain>.workers.dev
+```
+
+MCP endpoint：
+
+```text
+https://<worker>.<account-subdomain>.workers.dev/mcp
+```
+
+OAuth issuer / `HERDR_MCP_BASE_URL` 应使用同一个 origin：
+
+```text
+https://<worker>.<account-subdomain>.workers.dev
+```
+
+不要给 base URL 加 `/mcp`。
+
+### 部署
 
 ```bash
 cd edge/cloudflare
-npx wrangler deploy
+npx wrangler deploy --config wrangler.user.toml
 ```
 
-部署完成后 Cloudflare 会提供：
+部署 Worker 成功只代表公网代码存在，下一步还要验证 workstation link。
+
+## Workstation Link
+
+`herdr-link` 在工作站主动向 Edge 建立认证 WSS。
 
 ```text
-https://<worker-name>.<account-subdomain>.workers.dev
+workstation ── outbound WSS ──► Edge
 ```
 
-Herdr 的 MCP URL 即：
+它负责：
+
+- 证明 workstation identity；
+- 保持持久连接；
+- 接收发往该工作站的 MCP 请求；
+- 把请求路由给当前 active runtime generation；
+- heartbeat 上报 runtime generation/version。
+
+因此 Edge 可以稳定存在，而本机 runtime 可以单独重启或 A/B 切代。
+
+如果 OAuth 正常、Worker `/health` 也能打开，但工具调用报告 workstation offline，应该查 link，而不是重新安装 Connector。
+
+## 第一次验收顺序
+
+不要一上来就在 ChatGPT 里排所有问题。按层验证：
 
 ```text
-https://<worker-name>.<account-subdomain>.workers.dev/mcp
+1. local runtime
+2. herdr-link
+3. Edge health
+4. OAuth metadata/token
+5. public MCP initialize/tools/list
+6. real herdr_inspect
+7. ChatGPT new conversation
 ```
 
-如果没有自定义域名，OAuth issuer 也应使用同一个稳定 `workers.dev` origin，避免 MCP endpoint 与 OAuth identity 分裂：
+这能快速区分“Edge 代码部署失败”和“工作站没有接上”。
 
-```toml
-[vars]
-OAUTH_ISSUER = "https://<worker-name>.<account-subdomain>.workers.dev"
-```
+完整诊断见 [故障排查](troubleshooting.md)。
 
-> Worker 名称或 Cloudflare account subdomain 变化会改变 URL。已经接入 ChatGPT 后，应把这个 origin 当成稳定 identity，不要随意改名。
+## 为什么不用 Cloudflare Tunnel 直连本机 MCP
 
-## GitHub Actions 自动部署 production Edge
-
-仓库内置：
+早期最直觉的方案是：
 
 ```text
-.github/workflows/cloudflare-edge.yml
+ChatGPT → Tunnel → local MCP
 ```
 
-当 `main` 上的 Edge / Relay / package 部署面发生变化时，workflow 会：
+它能工作，但把公网 endpoint 和某个本机 runtime 进程绑得太紧：
 
-1. `npm ci`；
-2. 跑完整 Edge/frozen-contract Gate；
-3. 跑 root regression tests；
-4. Gate 全绿后进入 GitHub `production` Environment；
-5. 用 `cloudflare/wrangler-action@v4` + Wrangler major 4 部署 `wrangler.prod.toml`；
-6. 对独立的 `workers.dev/health` 做发布后验证。
+- runtime restart 会直接影响公网连接；
+- OAuth identity 和机器生命周期容易耦合；
+- 多 workstation 路由困难；
+- A/B runtime 切换不自然。
 
-Environment secrets：
+现在推荐：
 
 ```text
-CLOUDFLARE_ACCOUNT_ID
-CLOUDFLARE_API_TOKEN
+ChatGPT → stable Edge ← persistent link ← workstation
 ```
 
-自动部署**不会**修改 Custom Domain、DNS、Tunnel 或 OAuth issuer。生产域名继续指向同一个 Worker service，因此普通代码发布不需要重连 ChatGPT Connector。
+Cloudflare Tunnel 直连只保留为遗留迁移场景，不是新安装主路径。
 
-最小权限目标是 `Workers Scripts Write`。当前本项目 GitHub Environment 暂时复用了已有的 Herdr cutover Token（`Workers Scripts Write + Workers Routes Write`，没有 DNS/Tunnel/Admin 权限），可以正常部署但权限仍比理想值多一个 Routes Write；后续拿到可签发 Token 的 bootstrap credential 时应换成 scripts-only。
+## 什么时候使用 Custom Domain
 
-文档站点与 Edge 是两条独立 workflow：Pages 失败不会阻断 Worker，Worker 部署也不会携带 Pages 凭据。详见 [`automation.md`](automation.md)。
-
-## 可选部署：Custom Domain
-
-有自己的 Cloudflare zone 时，可以把例如：
+`workers.dev` 已经能完整运行。如果你有自己的 Cloudflare zone，可以进一步绑定：
 
 ```text
-herdr.example.com
+https://herdr.example.com
 ```
 
-绑定到已经验证通过的 Worker。
+Custom Domain 的价值主要是：
 
-Wrangler 支持：
+- public identity 更容易长期保持；
+- OAuth issuer 归你自己的域名治理；
+- 团队环境名称更清楚；
+- 将来更换 Edge implementation 时，可以尽量保留外部 URL。
 
-```toml
-[[routes]]
-pattern = "herdr.example.com"
-custom_domain = true
-```
+它不是 Herdr 技术前置条件。
 
-但 Herdr 推荐把**代码部署**和**生产域名切换**分开：
-
-1. Worker 始终先通过 `workers.dev` 部署和验证；
-2. 确认 `/health`、WSS Link、MCP tools/list、OAuth 都正常；
-3. 最后才绑定 Custom Domain。
+## Custom Domain 操作
 
 仓库提供独立控制器：
 
@@ -169,139 +190,131 @@ bin/herdr-cloudflare-domain watch
 bin/herdr-cloudflare-domain detach
 ```
 
-它调用 Cloudflare Workers Domains API，**不会删除或修改 DNS，不会停止 Tunnel**。
+推荐流程：
 
-如果是从旧版 `CNAME -> Cloudflare Tunnel` 迁移，而不是新安装，再使用事务化
-迁移器：
+```text
+workers.dev 上先跑通
+        ↓
+preflight Custom Domain
+        ↓
+attach
+        ↓
+验证 health / OAuth / MCP / workstation
+        ↓
+稳定观察
+```
+
+**代码部署和域名切换分开做。** 一个新版本 Worker 是否正确，不应该依赖 DNS cutover 才能验证。
+
+## 从旧 CNAME / Tunnel 迁移
+
+只有已有旧架构时才需要这一节。
+
+旧形态可能是：
+
+```text
+herdr.example.com
+  ↓ CNAME
+Cloudflare Tunnel
+  ↓
+local runtime
+```
+
+同一 hostname 上已有冲突 DNS 记录时，不能简单再 attach Worker Custom Domain。
+
+安全迁移原则：
+
+1. 新 Worker 在独立 `workers.dev` origin 已完全健康；
+2. 记录旧 DNS / Tunnel rollback evidence；
+3. 旧 Tunnel 在 cutover 期间继续在线；
+4. 移除唯一冲突记录；
+5. attach Worker Custom Domain；
+6. 验证 public health、workstation、OAuth、当前 MCP contract 和一次真实只读 tool call；
+7. 稳定后才退出旧 Tunnel；
+8. 任一步失败，恢复旧入口。
+
+仓库提供事务化 helper：
 
 ```bash
 bin/herdr-custom-domain-cutover preflight
 bin/herdr-custom-domain-cutover run
 ```
 
-`run` 只应该执行一次。它把以下步骤作为一个事务处理：
+这里最大的安全要求仍然是：**不对投递状态未知的 DNS/domain mutation 盲重试，而是重新读取 Cloudflare 的真实状态。**
 
-1. 精确比对旧 CNAME 与本地 rollback evidence；
-2. 确认生产 Worker candidate、OAuth identity 和旧 Tunnel 均健康；
-3. 删除唯一冲突 CNAME；
-4. attach Worker Custom Domain；
-5. 验证 health、workstation、epoch/hash、**包含 `herdr_skill` 的 18-tool epoch-2 catalog**、OAuth/MCP identity 和一次只读 `herdr_inspect`；
-6. 任一步失败时自动 detach Custom Domain，并恢复原 CNAME；
-7. 对 DNS DELETE/POST 和 Custom Domain PUT/DELETE 的“服务端已提交但响应丢失”场景重新读取真实状态，不盲重试。
+## Cloudflare API 凭据
 
-事务状态写到用户本地 `~/.config/herdr-mcp/`，权限 `0600`，不进入 Git。
+部署 credential 与 ChatGPT OAuth 完全不同。
 
-对应环境：
-
-```text
-CLOUDFLARE_API_TOKEN
-CLOUDFLARE_ACCOUNT_ID
-HERDR_CUTOVER_ZONE
-HERDR_CUTOVER_ZONE_ID
-HERDR_CUSTOM_DOMAIN
-HERDR_CUTOVER_WORKER
-HERDR_CUTOVER_PROD_EDGE
-HERDR_CUTOVER_WORKSTATION
-```
-
-macOS 上生产 smoke-test bearer 默认从 Keychain service：
-
-```text
-herdr-edge-prod-mcp-bearer
-```
-
-读取，不需要把 bearer 写入仓库或命令行。
-
-## 从 Tunnel/CNAME 迁移到 Custom Domain
-
-这是唯一需要特殊处理的场景。
-
-Cloudflare 不允许在**已有 CNAME** 的同一 hostname 上直接创建 Worker Custom Domain。因此，如果旧架构是：
-
-```text
-herdr.example.com -> CNAME -> Cloudflare Tunnel
-```
-
-不能直接覆盖。
-
-安全迁移顺序应是：
-
-1. `workers.dev` 上的生产 Worker 完整通过 preflight；
-2. 记录旧 DNS CNAME 的完整值和代理状态，作为 rollback evidence；
-3. 保持旧 Tunnel 进程在线；
-4. 删除冲突 CNAME；
-5. 立即通过 Workers Domains API 把同一 hostname 绑定到已经验证的 Worker；
-6. 对 Custom Domain 验证：
-   - `/health`；
-   - workstation online；
-   - epoch-2 `tools/list` 为 18 tools，并包含 `herdr_skill`；
-   - OAuth discovery / token；
-   - 一次真实 MCP tool call；
-7. 观察通过后，旧 Tunnel 再退出服务；
-8. 如果第 5/6 步失败：detach Custom Domain，并恢复第 2 步记录的旧 CNAME；旧 Tunnel 因为一直在线，可以立即重新承接流量。
-
-不要先关闭 Tunnel，也不要在没有 DNS rollback evidence 的情况下删除 CNAME。
-
-### 一次性 DNS 凭据
-
-正常 Herdr Edge 凭据不需要 DNS Edit。迁移旧 CNAME 时，推荐额外创建一个**一次性、仅目标 Zone 的 `DNS Write` Token**，保存在：
-
-```text
-~/.config/herdr-mcp/cloudflare-dns-cutover.env
-```
-
-仓库提供独立的一键工具，避免把 DNS 权限混进长期 Edge Token：
+项目 helper：
 
 ```bash
-# 先用具有 Account API Token 管理权限的 bootstrap credential
-export CLOUDFLARE_API_TOKEN='<bootstrap token>'
-
-# 创建，仅给 example.com 这个 Zone 的 DNS Write
-bin/herdr-cloudflare-dns-token --zone example.com
-
-# 不回显 secret 的验证
-bin/herdr-cloudflare-dns-token --verify-only
-
-# rollback observation window 结束后吊销并删除本地 credential 文件
-bin/herdr-cloudflare-dns-token --revoke
+bin/herdr-cloudflare-token --zone example.com --dry-run
+bin/herdr-cloudflare-token --zone example.com
+bin/herdr-cloudflare-token --zone example.com --verify-only
 ```
 
-脚本动态解析 Account、Zone 和 `DNS Write` permission group，不硬编码用户账户 ID；
-创建出来的 Token 不打印到终端，本地文件强制 `0600`。
+目标是长期只保留最小权限。详见 [Cloudflare Edge 凭据](cloudflare-edge-token.md)。
 
-它只在迁移和 rollback observation window 内保留；Custom Domain 稳定、旧 Tunnel
-正式退出后再吊销。不要为了这次迁移给长期 Herdr Token 增加 DNS 权限。
+旧 DNS cutover 如果确实需要 DNS Write，应使用单独、短生命周期的凭据，不要把 DNS 管理权限永久叠加到日常 Worker deployment token。
 
-## 为什么不开源项目强制 Custom Domain
+## GitHub Actions 与自动部署
 
-强制用户提供域名会给安装流程增加与 Herdr 核心能力无关的门槛：域名购买、Cloudflare zone onboarding、DNS 和证书管理。
+仓库的 production Edge workflow 负责在 `main` 相关部署面变化后：
 
-因此项目约定：
+1. 安装依赖；
+2. 构建并运行 Edge / contract regression；
+3. 通过 production Environment gate；
+4. 用 Wrangler 部署生产 Worker；
+5. 做发布后 health 验证。
 
-| 部署模式 | 支持级别 | 适合场景 |
-| --- | --- | --- |
-| `workers.dev` | **默认、完整支持** | 首次安装、自用、开发、测试、没有域名的用户 |
-| Custom Domain | **推荐、可选** | 长期稳定入口、团队/正式环境、希望固定 OAuth/MCP identity |
-| Cloudflare Tunnel 直连本机 MCP | **Legacy / 迁移兼容** | 从旧版本升级，不再作为新安装默认架构 |
+CI credential 应放在 GitHub Environment/Secrets 中，不写进仓库。
+
+普通 Worker code deploy 不应该修改：
+
+- Custom Domain；
+- OAuth issuer；
+- workstation identity；
+- DNS；
+- ChatGPT Connector URL。
+
+这些边界保持独立，才能让“发布代码”和“切生产入口”分别回滚。
+
+## Edge 与 Runtime A/B 是两层发布
+
+```text
+Public plane
+Cloudflare Edge / OAuth / Connector URL
+
+Local plane
+herdr-link → runtime generation A/B
+```
+
+大部分 runtime 修复只需要在本机 generation 层发布，不应该修改 public Edge identity。
+
+反过来，Edge relay/OAuth 实现更新也不意味着要同时重启本机 Herdr。
+
+详见 [Runtime A/B](runtime-self-upgrade.md)。
 
 ## 安全边界
 
-无论使用哪种域名模式，都保持以下边界：
+- 工作站没有公网入站端口；
+- Link 使用认证 WSS；
+- ChatGPT 使用 OAuth，不获取本机 static bearer；
+- Cloudflare API secret 不进入 Git；
+- OAuth signing material 不进入 Git；
+- deployment credential 使用最小权限；
+- Worker deployment 和 Custom Domain/DNS mutation 分开；
+- Edge 只负责远程控制面，真实代码和执行留在工作站。
 
-- Cloudflare Edge 是公网入口；
-- `herdr-link` 只建立出站 WSS；
-- 本地 Herdr runtime 不直接暴露公网端口；
-- Link secret、OAuth signing material、MCP bearer 不进入 Git；
-- Token 使用最小权限，参见 [`cloudflare-edge-token.md`](cloudflare-edge-token.md)；
-- Custom Domain 切换和 Worker code deployment 是两个独立操作，可以分别回滚。
+## 推荐部署选择
 
-## 相关脚本
+| 场景 | 推荐 |
+|---|---|
+| 第一次安装 / 自用 | `workers.dev` |
+| 长期个人入口 | `workers.dev` 或稳定 Custom Domain |
+| 团队正式环境 | Custom Domain + Environment secrets |
+| 已有旧 Tunnel/CNAME | 先并行验证 Worker，再事务化 cutover |
+| 只是本机 Cursor/curl | 不需要 Cloudflare Edge |
 
-```text
-bin/herdr-cloudflare-token       # 创建/验证 Cloudflare 最小权限 Token
-bin/herdr-cloudflare-domain      # Custom Domain attach/watch/detach
-bin/herdr-custom-domain-cutover  # 事务化 CNAME/Tunnel -> Custom Domain 迁移
-bin/herdr-link                   # workstation -> Edge WSS sidecar
-```
-
-新安装优先使用 `workers.dev`；已有稳定域名的用户再选择 Custom Domain。不要因为文档展示了自定义域名示例，就把它当成安装前置条件。
+如果目标只是尽快让 ChatGPT 开始操作本机项目，请回到 [安装](install.md) 按最短路径跑通；本页主要用于理解和维护公网控制面。

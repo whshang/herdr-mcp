@@ -1,70 +1,286 @@
-# Troubleshooting
+# Troubleshooting: locate the failing layer before restarting everything
 
-A symptom-first checklist for the common failure modes. When in doubt, start a new conversation after reconnecting — a large share of “0 tools” reports are stale snapshots, not a dead service.
+herdr-mcp spans Herdr, the local runtime, workstation link, Cloudflare Edge, OAuth/MCP and browser continuity. The fastest diagnosis is to find the broken layer first.
 
-## ChatGPT shows 0 tools, or an old tool count
+Use this order:
 
-- **Start a new conversation** after reconnecting; an old conversation keeps its old tool snapshot.
-- Verify the same origin is used for the MCP URL **and** `OAUTH_ISSUER` (no `/mcp` suffix in the environment variable).
-- Check Edge health, `herdr-link` connectivity and OAuth discovery (`/.well-known/oauth-authorization-server`).
-- Current production contract is epoch 2 with **18 tools including `herdr_skill`**. If ChatGPT still shows the epoch‑1 17‑tool list, the conversation/Connector cache is stale. The runtime version comes from `/.well-known/mcp.json` / `initialize.serverInfo.version`.
+```text
+Herdr
+  ↓
+local herdr-mcp runtime
+  ↓
+workstation link
+  ↓
+Cloudflare Edge
+  ↓
+OAuth / MCP
+  ↓
+ChatGPT tool snapshot
+  ↓
+browser continuity
+```
 
-Hard requirements and diagnostics: [chatgpt-connector](chatgpt-connector.md).
+If one layer is broken, do not start by reconfiguring a later one.
 
-## The MCP Connector card keeps popping up
+## 30-second triage
 
-Verify the extension is loaded, **per-Project automation** is enabled in Options, and the current ChatGPT Project HUD shows **`Auto on`**. Permission-card handling is part of Project automation; in global manual mode or with the Project `Auto off`, the extension still observes the page and Herdr state but does not click permission cards. Native browser permission bars always require manual handling. See [extension](extension.md).
+### Is the local HTTP runtime listening?
 
-## The HUD is bound to w68 but the bottom bar shows another project name
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
+```
 
-Treat `workspace_id` as identity; the label is display cache only. The current extension prefers the live `/push/events` / `/push/state` workspace catalog over a stale binding label and repairs the persisted binding automatically. If the drawer already shows the correct `herdr-mcp (w68)` while the bar still shows an older project name, make sure the current 0.1.56 extension is loaded and refresh the page; do not unbind/rebind merely to repair a label for the same workspace id.
+`200` or `401` means a process is listening. Connection failure means the runtime is down, on another port or otherwise unreachable.
 
-## ChatGPT replies halfway and then the page appears frozen or stale
+On macOS LaunchAgent installations:
 
-0.1.44 no longer equates this directly with “the model is stuck.” The current Project must be `Auto on` for automatic stale-view recovery. After roughly 30 seconds without fresh page progress on a recent turn, the extension best-effort compares ChatGPT's same-origin conversation snapshot with the current DOM. A proven server-ahead view is refreshed once. If the server itself explicitly reports an unfinished assistant message, it must remain stalled for at least 60 seconds before reload is allowed; if the page still claims streaming, the detector waits another 30 seconds.
+```bash
+herdr-mcp status
+herdr-mcp logs
+```
 
-After reload, newer content or resumed streaming ends recovery. If the identical partial answer remains, the extension waits 10 seconds and submits one browser-recovery activation message. If the private snapshot endpoint is unavailable, errors, times out, or changes shape, freshness is `unknown` and the detector fails closed rather than refreshing on elapsed time alone. In that case, refresh manually and use HUD **Manual continue** or **Herdr monitor**. The recovery prompt tells ChatGPT to continue from the actual stop point and to re-check live Herdr/runtime/Git state before external mutations, reducing duplicate work.
+### Is Herdr itself available?
 
-## Manual handoff is unavailable, or stays on Compressing / Moving
+```bash
+herdr --version
+herdr api schema >/dev/null
+```
 
-Version 0.1.58 allows **Manual handoff** for bound ChatGPT Project conversations and persisted z.ai `/c/<chat_id>` conversations with Auto either on or off; the fresh target inherits the source Auto state. z.ai `/`, plain ChatGPT `/c/<id>`, Claude, and DeepSeek do not show the button. If a bound workspace still has an agent `working`, the background rejects the handoff because binding cutover must not race settled/wake delivery. During an active handoff, source automatic wakes are suppressed.
+If local HTTP works but `herdr_inspect` cannot see real workspaces, investigate the Herdr daemon/socket before touching Cloudflare.
 
-If z.ai is already on `/c/<chat_id>` but the HUD still looks like the root launcher, verify that 0.1.56 is loaded and refresh once. A temporary binding/automation preference created on z.ai `/` migrates once when the same tab first becomes `/c/<chat_id>`; later navigation between existing `/c/A` and `/c/B` chats never drags it along. z.ai handoff summary/seed messages use the raw send path and are not rewritten by the JSON→MCP bridge.
+### Can Edge see the workstation?
 
-If a z.ai / DeepSeek JSON→MCP task appears to stop and the **last real assistant message is still `{"tool": ...}` JSON**, the task is unfinished. Version 0.1.50 no longer treats round 12 as a completion boundary and can resume this pending tool JSON after page/script recovery. Internal protocol rows are also folded again after history reload. If an expanded folded z.ai row turns into a thin vertical strip, the current extension is stale; 0.1.50 moves the fold control outside the site's flex message root.
+OAuth may succeed while the workstation is offline. Public login success does not prove the local development machine is connected.
 
-If the button reads **Compressing… / Moving…**, the source conversation already owns an active transfer and the button is locked to prevent a duplicate handoff. A delivery-uncertain seed becomes **Resume handoff**; clicking it probes the target conversation for the transfer marker before deciding whether to finish cutover or retry the seed. The old workspace binding remains authoritative until the new seed is confirmed, so do not manually unbind merely to “unlock” the button.
+Check Edge health/status and the workstation link.
 
-## z.ai `Auto off` looks clickable but does not switch on
+### Does a new ChatGPT conversation get the current catalog?
 
-Load extension **0.1.48 or newer**. Earlier 0.1.47 builds incorrectly required an explicit workspace binding before writing a z.ai / DeepSeek conversation automation preference, so an unbound HUD could show a clickable `Auto off` button and then fail with `conversation-unbound`. Since 0.1.48 the conversation preference can be toggled and persisted before binding; Herdr progress/settled push-back becomes effective once a workspace is actually bound.
+The current production public contract is **epoch 2 / 18 tools**, including `herdr_skill`.
 
-## Local server not answering
+Old conversations may retain an older `tools/list` snapshot. Before reinstalling anything, verify the server and open a new conversation.
 
-- `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/` should return `200` or `401`, not a connection error.
-- On macOS with the LaunchAgent: `herdr-mcp status`, then `herdr-mcp logs [-f]`; `herdr-mcp watchdog install` restarts a down MCP every 120s.
-- Confirm `HERDR_MCP_PORT` used by the server matches the port you probe.
+## Symptom: Connector cannot be added or OAuth loops
 
-## Tools fail intermittently, agent still shows working
+Check:
 
-Transient control-plane failure (ExceptionGroup / TaskGroup aggregation in the Herdr daemon): a request fails, seconds later the same one succeeds. Do not treat a control-plane blip as a repository blocker; re-check with `herdr_inspect` / `herdr_since`. Some requests degrade to composed list APIs with `warnings` like `snapshot_failed_used_list_apis`. See [architecture](architecture.md).
+- MCP URL is `https://<stable-origin>/mcp`;
+- public base URL / OAuth issuer use the same origin without `/mcp`;
+- protected-resource and authorization-server metadata are reachable;
+- the Worker deployment is the intended one;
+- the ChatGPT Workspace permits Developer/custom MCP apps.
 
-## Local workers unavailable
+If an OAuth token is successfully issued and the next step fails, you are probably past authentication and into MCP discovery/routing.
 
-If Pi/Herdr workers are down, `dsh --profile headless "job"` is a tested CLI fallback — run it through a long `herdr_exec_start` session, because tool edits may complete before the final headless answer prints; check Git/tests before retrying. `dsh-tui` is the human-interactive fallback, not the default automation surface. See [worker-fallbacks](worker-fallbacks.md).
+See [ChatGPT Connector](chatgpt-connector.md).
 
-## I want to roll back a runtime release
+## Symptom: Connector says connected, but the chat has 0 tools
 
-Runtime A/B keeps the previous generation: `herdr-runtime-generation status`, then `rollback` (or `activate --generation <previous>`). Never use `herdr-self-update` to cross a contract epoch. See [runtime-self-upgrade](runtime-self-upgrade.md).
+Connector installation and conversation tool acceptance are different steps.
 
-## Token security mistakes
+Check in this order:
 
-- Never paste the static `HERDR_MCP_TOKEN` into ChatGPT — it authenticates via OAuth at the Edge.
-- Never commit `~/.config/herdr-mcp/*.env` (Cloudflare cutover credentials, mode `0600`).
-- Use a least-privilege Cloudflare token; expand permissions only for the one-shot legacy migration. See [cloudflare-edge-token](cloudflare-edge-token.md).
+1. open a new conversation;
+2. confirm current public contract/version;
+3. verify `tools/list` succeeds;
+4. check whether one incompatible `inputSchema` is causing the catalog to be rejected;
+5. distinguish a stale conversation snapshot from a server problem.
 
-## Still stuck?
+If new conversations see 18 tools and an old one sees 17, the server is usually fine.
 
-- Local: `herdr-mcp logs -f` or the server stdout; the boot line prints `boot_id` and the listening port.
-- Edge: the worker `/health` endpoint and OAuth discovery.
-- Then open the issue with the `boot_id`, the failing tool and its `failure_phase`, and whether a `commitAtomic` / `herdr_exec` delivery happened before the error.
+## Symptom: tools are visible but `herdr_inspect` reports workstation offline
+
+This is no longer a ChatGPT schema problem.
+
+Check:
+
+- local runtime health;
+- `herdr-link` status;
+- workstation identity;
+- active runtime generation health;
+- recent heartbeat on Edge.
+
+Do not delete/recreate the Connector to fix a workstation-link problem.
+
+## Symptom: inspect works, but file operations fail
+
+Common gates:
+
+- path is outside a managed Git root;
+- filename matches a secret-ish path rule;
+- read-only mode is enabled;
+- target root is not in the write allowlist;
+- the file is already dirty and explicit acknowledgement is required;
+- another worker is active in the project and the busy gate rejects concurrent writes.
+
+Read the structured error first. Do not make shell bypass the default answer to every file gate.
+
+`herdr_exec` is intentionally a stronger boundary than `herdr_fs_*` and does not provide the same secret-path filtering.
+
+## Symptom: transient TaskGroup / ExceptionGroup control-plane errors
+
+You may see a failed snapshot/pane operation even though the agent or repository is fine.
+
+herdr-mcp can degrade some read paths to narrower evidence sources such as:
+
+- list APIs instead of one large snapshot;
+- deterministic Git state;
+- direct managed-root file operations.
+
+Re-run `herdr_inspect` / `herdr_since` to obtain current facts. Do not treat one control-plane blip as proof the Git project is unusable.
+
+## Symptom: prompt or exec timed out and you do not know whether it ran
+
+The rule is **do not blindly retry a mutation**.
+
+### `herdr_prompt`
+
+If the failure happened during post-submit status waiting, the agent may already have received the prompt. Inspect agent state/output first. Reuse an `idempotency_key` for a repeated intent.
+
+### `herdr_exec`
+
+If the command was already delivered to a visible pane, a later control-plane timeout is not permission to send the command again. Inspect the pane, Git state, files and tests.
+
+“No success response reached the client” does not mean “nothing happened.”
+
+## Symptom: local agent finished but ChatGPT did not continue
+
+This is often not an MCP failure.
+
+MCP provides:
+
+```text
+ChatGPT → workstation
+```
+
+A local task finishing later does not create a new ChatGPT turn automatically. For:
+
+```text
+workstation → ChatGPT
+```
+
+use browser continuity:
+
+- Native Messaging host is installed;
+- the current conversation is bound to the correct workspace;
+- the relevant Auto scope is enabled, or use a manual HUD action.
+
+See [Browser continuity](browser-continuity.md).
+
+## Symptom: HUD shows the wrong workspace name
+
+Binding identity is the `workspace_id`; the label is display data.
+
+If the ID is correct but the label is stale, the extension should refresh it from the live workspace catalog. Do not remove a correct binding merely to fix display text.
+
+If the ID itself is wrong, bind to the correct workspace.
+
+## Symptom: ChatGPT response is partial, disconnected or shows send timeout
+
+Do not immediately resend the original task. Tool mutations may already have occurred.
+
+Continuity recovery is evidence-first:
+
+1. inspect same-origin conversation state when available;
+2. if server state is ahead of the DOM, refresh/synchronize the view;
+3. retry only when evidence says the request was not accepted;
+4. fail closed on uncertain delivery;
+5. consider handoff only after normal recovery is exhausted.
+
+If automatic recovery cannot obtain trustworthy evidence, refresh manually and use **Herdr monitor** to re-read local state before continuing.
+
+See [Wake, recovery and handoff](extension-wake.md).
+
+## Symptom: Manual handoff is unavailable
+
+Verify:
+
+- the current site/conversation type supports handoff;
+- a workspace is bound;
+- the workspace has no active working agent;
+- no transfer is already active.
+
+The current scope may be **Auto on or Auto off**. Where handoff is supported, the target conversation inherits the source Auto state and source automatic wakes pause during transfer.
+
+Handoff must create the packet, create the new conversation, verify the seed, and only then move the binding. If the transfer is recoverable/uncertain, keep the old binding as the safety anchor instead of manually unbinding it.
+
+## Symptom: z.ai / DeepSeek stops after printing a JSON tool call
+
+That is the JSON→MCP bridge, not the ChatGPT Connector.
+
+Check:
+
+- Native Messaging host;
+- local MCP tool catalog;
+- stable conversation identity;
+- whether the last real assistant message is still a tool-call JSON object;
+- whether a `TOOL_RESULT` was returned;
+- whether enough bridge context survived a page reload to resume safely.
+
+Do not treat internal tool JSON as the final natural-language answer.
+
+See [JSON → MCP bridge](extension-bridge.md).
+
+## Symptom: Chromium asks for local-device / loopback permission
+
+Some Chrome/Chromium profiles apply a separate permission gate to local loopback access.
+
+Check the extension site/local-device permission in the browser's extension settings. Native Messaging is the primary trusted path, but diagnostics/compatibility paths can still surface loopback permissions.
+
+Do not rotate Herdr credentials just because a browser permission is pending.
+
+## Symptom: Cloudflare deployment fails
+
+Separate these cases:
+
+- credential/identity failure;
+- build/test failure;
+- Worker deployed but health/routing failed;
+- workers.dev works but Custom Domain/DNS fails.
+
+Use least-privilege credentials and fix the specific layer. Do not turn a route problem into an account-admin token.
+
+See [Cloudflare Edge credentials](cloudflare-edge-token.md) and [Cloudflare Edge deployment](cloudflare-edge-deployment.md).
+
+## Symptom: runtime upgrade broke local behavior
+
+For an implementation change inside the same contract epoch:
+
+```bash
+bin/herdr-runtime-generation status
+```
+
+Inspect active/previous generations and use the Runtime A/B rollback path when appropriate.
+
+If the tool catalog/schema changed, this is a contract migration, not an ordinary runtime A/B problem. Do not use `herdr-self-update` to sneak across an epoch boundary.
+
+See [Runtime A/B](runtime-self-upgrade.md).
+
+## Useful evidence for an issue
+
+Useful, non-secret diagnostics include:
+
+- `boot_id`;
+- runtime version / contract epoch;
+- workstation id;
+- failing tool;
+- failure phase / delivery state;
+- whether Git/pane/agent state changed around the failure;
+- Edge health/workstation status;
+- whether the ChatGPT conversation was new or old;
+- bound workspace identity.
+
+Remove bearer tokens, OAuth JWTs, Cloudflare secrets and sensitive project content before sharing logs.
+
+## Restart last, not first
+
+Restarting can restore service, but it can also erase the evidence that explains the root cause.
+
+Prefer:
+
+1. capture current state;
+2. identify the failing layer;
+3. restart only the relevant component;
+4. verify that layer and the next layer afterward.
+
+That turns “it started working again” into an actual diagnosis.

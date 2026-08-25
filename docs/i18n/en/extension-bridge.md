@@ -1,70 +1,175 @@
-# JSON → MCP bridge
+# JSON → MCP: local tools for Web AI sites without a native Connector
 
-Audience: people using DeepSeek / z.ai web, which do not expose a ChatGPT-style MCP Connector, to drive the local herdr-mcp runtime safely through the browser extension.
+ChatGPT can call herdr-mcp through a custom MCP Connector. Not every Web AI product exposes an equivalent integration point. z.ai and DeepSeek can reason in the browser, but they do not provide the same standard path for registering a local Herdr tool catalog.
 
-Overview and continuity track: [extension.md](./extension.md). Progress push-back and handoff: [extension-wake.md](./extension-wake.md).
+The JSON → MCP bridge is a compatibility layer for that gap.
 
-## Goal
+It does not pretend the target site natively supports MCP, and it does not expose workstation credentials to page JavaScript. The Web model emits constrained JSON tool requests; the extension and trusted local host perform the actual MCP call.
 
-Track B is a peer of track A: ordinary user tasks in `chat.deepseek.com` / `chat.z.ai` can use the local Herdr MCP without exposing the workstation token to page JavaScript or routing extension traffic through the public Worker/Tunnel.
+## End-to-end path
 
 ```text
-web task
-  -> extension content bridge adds the Herdr tool protocol/catalog
-  -> web model emits {"tool":"...","args":{...}}
-  -> extension service worker POSTs tools/call to 127.0.0.1:8772/mcp
-  -> TOOL_RESULT is returned to the same web conversation
-  -> web model either calls another tool or answers normally
+user task
+  ↓
+z.ai / DeepSeek Web model
+  │ constrained JSON tool call
+  ▼
+content bridge
+  ↓
+extension service worker
+  ↓ Chrome Native Messaging
+native host
+  ↓ local Unix socket (0600)
+herdr-mcp /mcp
+  ↓
+Herdr + files / Git / shell
+  │
+  └─ TOOL_RESULT back to the Web conversation
 ```
 
-## Current state (0.1.58)
+Cloudflare Edge is not part of this path.
 
-| Capability | Status |
-|---|---|
-| `tools/list` from local Herdr MCP | **available** |
-| typed tool catalog injected into the web-model protocol | **available** |
-| one or more JSON tool calls per assistant reply | **available** |
-| controlled `tools/call` rounds + result backfill until a normal answer | **available** |
-| parallel execution of independent calls in one batch | **available** |
-| tool-result sanitization / large binary omission / size bound | **available** |
-| no Herdr credential in page JavaScript or the service worker | **available** — current builds use Native Messaging plus mode-`0600` Unix IPC; bearer compatibility stays inside the native host/server for older versions |
-| z.ai / DeepSeek conversation-scoped `Auto on/off` for Herdr progress/settled push-back | **available** when global automation is permitted |
-| persisted z.ai `/c/<chat_id>` Manual handoff | **available** with Auto on or off; the fresh chat inherits the source Auto state and handoff control messages bypass this bridge |
-| unfinished tool JSON recovery after refresh/reload | **available** — if the last real conversation message is assistant Herdr tool-call JSON and bridge context exists, execution resumes automatically |
-| long JSON→MCP chains | **available** — round 12 is only a scheduler-yield checkpoint; completion means a normal non-tool assistant answer |
+## Why not call localhost directly from page JavaScript
 
-The bridge uses the live local `tools/list` catalog rather than maintaining a second hand-written allowlist. The extension still validates the calling site/conversation and keeps all MCP traffic on loopback. The local Herdr server remains the authoritative tool/permission boundary.
+A direct page → `127.0.0.1` design creates several problems:
 
-## Protocol
+- browser origin and local-network permission boundaries;
+- risk of workstation bearer exposure to page or extension storage;
+- arbitrary page scripts attempting to reuse a privileged local endpoint;
+- no single control layer for conversation identity and event streams.
 
-The content bridge gives the web model a typed catalog and requires tool-call replies to contain one JSON object per line:
+The primary architecture uses Chrome Native Messaging. Browser-side code sends constrained request/stream messages to a native host, which reaches herdr-mcp through a `0600` Unix socket.
+
+This means:
+
+- page JavaScript never sees the Herdr bearer;
+- the extension service worker does not need to persist that bearer;
+- the local runtime remains the authority for tool schemas and permission gates;
+- public OAuth and local IPC remain separate trust boundaries.
+
+## What the Web model sees
+
+The bridge reads the live `tools/list` catalog from the local runtime and translates the relevant typed schemas into a protocol the Web model can follow.
+
+A tool request looks like:
 
 ```json
 {"tool":"herdr_inspect","args":{}}
 ```
 
-Independent calls may be emitted together and run concurrently; dependent calls remain sequential. A tool call is never treated as successful until the service worker returns its `TOOL_RESULT`.
+or:
 
-Intermediate bridge messages are folded from the visible conversation where the site supports that behavior. Tool results are sanitized recursively, very large binary/base64 fields are omitted, and a result batch is capped before it is sent back to the web model.
+```json
+{"tool":"herdr_git","args":{"root":"/path/to/project","action":"status"}}
+```
 
-Version 0.1.50 folds internal protocol messages on history load as well as during active runs. The fold bar is a sibling of the site's message root and toggles the whole message, so expanding a z.ai row cannot consume the flex-row width and squeeze the original content into a narrow vertical column.
+The bridge validates the request, executes the real MCP `tools/call`, and returns a `TOOL_RESULT` to the same conversation. The Web model then either calls another tool or produces a normal answer.
+
+## Bounded tool loop
+
+The bridge does not turn the browser into an unlimited autonomous agent.
+
+```text
+assistant JSON calls
+      ↓
+validate
+      ↓
+execute MCP tools
+      ↓
+return TOOL_RESULT
+      ↓
+assistant reasons again
+      ↓
+JSON calls or normal answer
+```
+
+Independent calls in the same batch may run in parallel. Dependent steps stay sequential. A tool is only considered successful after the real MCP result returns.
+
+## Result sanitization
+
+MCP results can contain long terminal output, images/binary payloads, structured content or large base64 fields.
+
+Before returning tool results to a Web model, the bridge applies recursive sanitization and size limits. Large binary/base64 content is omitted or summarized so one tool result does not consume the entire browser context.
+
+This changes presentation, not the underlying tool truth.
+
+## Folding protocol messages
+
+JSON tool requests and TOOL_RESULT messages are useful machine coordination but noisy for human reading. Supported site adapters fold these internal messages so the conversation remains centered on user goals and meaningful progress.
+
+Folding affects presentation only; it does not erase the underlying conversation messages.
+
+## Conversation identity
+
+The bridge must know exactly which chat owns a tool loop.
+
+### z.ai
+
+A stable `/c/<chat_id>` URL is the persistent conversation identity. Root `/` is a new-chat launch state. Temporary binding/Auto state may migrate once when that new chat first becomes `/c/<chat_id>`.
+
+Switching later from `/c/A` to `/c/B` does not drag workspace bindings or automation preferences across chats.
+
+### DeepSeek
+
+State is likewise isolated by stable conversation identity extracted by the site adapter. Browser tab identity is not treated as a durable chat identifier.
+
+## Recovering an unfinished JSON tool call after reload
+
+A browser reload must not replay all historical JSON.
+
+Recovery is only eligible when the last real conversation message still looks like an unfinished Herdr tool-call turn and prior bridge context proves that the message belongs to an active protocol sequence.
+
+Mutating tools still obey herdr-mcp delivery/idempotency semantics. Unknown delivery is never a reason to execute the same mutation twice after a page refresh.
+
+## Relationship to browser continuity
+
+JSON → MCP and continuity share the extension and Native Messaging transport, but solve different problems.
+
+| Capability | Direction | Purpose |
+|---|---|---|
+| JSON → MCP | browser → workstation | give Web AI without a Connector local tools |
+| progress / settled | workstation → browser | resume after long local work |
+| recovery / handoff | inside browser | recover stalled views or change long conversations |
+
+A z.ai conversation can therefore use the JSON bridge for normal tools while also being bound to a Herdr workspace for progress/settled events.
+
+z.ai / DeepSeek conversation Auto does not enable ChatGPT-specific stale-view recovery or automatic Project rollover.
+
+## Why handoff control messages bypass the JSON task wrapper
+
+Handoff summary and seed messages control the conversation itself; they are not coding tasks.
+
+For z.ai, those messages use a raw path that bypasses the JSON tool wrapper. Otherwise a request such as “produce a handoff packet” could be reinterpreted as another Herdr coding task and create an incorrect recursive loop.
 
 ## Security boundary
 
-- The MV3 service worker sends bounded request/stream messages through Chrome Native Messaging. The native host talks to herdr-mcp over `~/.config/herdr-mcp/extension.sock` (mode `0600`), so neither the service worker nor page JavaScript receives a Herdr bearer. The host/server retain old-version bearer compatibility without exposing that credential surface to current browser code.
-- MCP requests go only to the configured local Herdr endpoint, normally `http://127.0.0.1:8772/mcp`.
-- Site identity and conversation identity are checked before bridge/automation operations are accepted.
-- The bridge does not pretend DeepSeek or z.ai has a native OAuth MCP Connector.
-- ChatGPT continues to use its Connector where appropriate; this JSON bridge is for sites without that integration.
+The bridge follows several explicit rules:
 
-## z.ai 1.1.88 compatibility
+- enabled only for supported sites;
+- site and conversation identity checked before execution;
+- tool catalog comes from the real local runtime rather than a drifting handwritten copy;
+- MCP calls use trusted local IPC;
+- browser code does not hold the Herdr bearer;
+- herdr-mcp remains the final authority for managed roots, readonly and shell capability;
+- extension traffic is not unnecessarily routed through public Cloudflare Edge;
+- target sites are not represented as having official OAuth MCP support when they do not.
 
-The current adapter treats `/` as the new-chat launcher and `/c/<chat_id>` as the stable persisted conversation identity. It uses current DOM/composer signals (`.user-message`, `.markdown-prose`, `#send-message-button`) while retaining compatible fallbacks.
+## When to use it
 
-A temporary binding or conversation-automation preference on the root launcher migrates once when the same tab first becomes `/c/<chat_id>`. Later navigation between existing `/c/A` and `/c/B` chats never drags a workspace binding or automation preference along.
+Use the bridge when you want a Web AI such as z.ai or DeepSeek to operate the same Herdr workstation and public 18-tool contract semantics without building another development backend.
 
-## Cooperation with continuity / handoff
+If the client already provides a reliable native MCP Connector, prefer the native standard path. JSON → MCP is a compatibility layer, not a replacement for direct MCP integration.
 
-Track A can bind the same z.ai / DeepSeek conversation for Herdr progress/done push-back while Track B handles local MCP tool calls. The conversation-level `Auto on/off` controls automatic progress/settled push-back; it does not enable ChatGPT-only stale-view recovery, post-turn LLM decisions, or automatic rollover.
+## Validation
 
-Persisted z.ai chats can use **Manual handoff** with Auto either on or off. The source Auto state is snapshotted when handoff starts and inherited by the fresh chat. The summary and seed are sent through the bridge's raw channel, so continuity-control text is not rewritten into a coding-agent task. Workspace bindings move only after the fresh z.ai chat has a new `/c/<chat_id>` and the seed marker is confirmed.
+A minimal real UAT should prove that:
+
+1. the bridge reads the current local `tools/list`;
+2. the Web model produces a valid `herdr_inspect` request;
+3. the native host executes the MCP tool;
+4. TOOL_RESULT returns to the correct conversation;
+5. the model can continue with another tool or a normal answer;
+6. reload does not duplicate an already-completed mutation;
+7. workspace binding and progress continuity can operate alongside the tool loop.
+
+Selector details and version-by-version implementation history belong in tests and [CHANGELOG](../../../CHANGELOG.md). This page documents current behavior and security boundaries.

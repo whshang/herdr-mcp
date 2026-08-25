@@ -1,129 +1,140 @@
-# Cloudflare Edge Token
+# Cloudflare Edge credentials: least privilege, temporary bootstrap, verifiable state
 
-Herdr's Cloudflare Edge deployment, Worker Route, or Custom Domain management should not reuse one "all-powerful" Cloudflare Token long-term. Create a dedicated Account API Token for Herdr with exactly two permissions:
+Deploying herdr-mcp Edge requires Cloudflare API permissions, but long-lived operation should not depend on an account-wide administrator credential.
 
-- The target Zone (e.g. `agentforme.cc.cd`): **Workers Routes Write**.
-- The owning Account: **Workers Scripts Write**.
+This page explains the project's least-privilege Cloudflare Account API Token workflow.
 
-That is enough to publish Workers, manage Worker Routes, and invoke the Cloudflare Workers Domains API for Custom Domain attach/detach. Normal operation needs no DNS Edit, Tunnel Edit, or Account Admin. Only one-shot migrations — "move an old CNAME/Tunnel that already occupies the same hostname away" — need separate handling of the old DNS records; do not expand the daily token's permissions for that.
+## Keep credential roles separate
 
-## One-shot script
+Two credential roles may appear during deployment:
 
-The repo provides:
+1. **bootstrap credential** — an existing higher-privilege credential used temporarily to create the target token;
+2. **deployment credential** — the least-privilege token used by later herdr-mcp deployment/cutover work.
 
-```bash
+The goal is to remove the bootstrap credential from the normal workflow as soon as possible.
+
+## Target permissions
+
+The project helper creates a token scoped to:
+
+- **Workers Routes Write** for the target zone;
+- **Workers Scripts Write** for the corresponding account.
+
+It does not request broad account administrator access by default.
+
+A pure `workers.dev` deployment may not need a zone route for every operation. Grant only the permissions required by the deployment path you actually use.
+
+## Helper command
+
+```text
 bin/herdr-cloudflare-token
 ```
 
-The script dynamically resolves Account ID, Zone ID, and permission group IDs through the official Cloudflare API; it does not hard-code user account identifiers. The generated token is **never printed to the terminal**; it is atomically written locally to:
+Inspect options:
+
+```bash
+bin/herdr-cloudflare-token --help
+```
+
+Common modes:
+
+```bash
+# Resolve identity and validate bootstrap permissions without creating a token
+bin/herdr-cloudflare-token --zone example.com --dry-run
+
+# Create and save the least-privilege credential
+bin/herdr-cloudflare-token --zone example.com
+
+# Verify the already-saved credential
+bin/herdr-cloudflare-token --zone example.com --verify-only
+
+# Explicitly replace an existing saved credential
+bin/herdr-cloudflare-token --zone example.com --rotate
+```
+
+Provide the bootstrap credential through the process environment:
+
+```bash
+export CLOUDFLARE_API_TOKEN='<temporary-bootstrap-token>'
+# or CF_API_TOKEN
+```
+
+Do not copy the real value into repository files, commits, screenshots or chat transcripts.
+
+## Local credential state
+
+The helper defaults to:
 
 ```text
 ~/.config/herdr-mcp/cloudflare-cutover.env
 ```
 
-The file mode is fixed at `0600`. It contains by default:
+The file is written with restricted local permissions (**mode `0600`**) and the token value is not printed to stdout.
+
+It also records account/zone identity so later verification can test the intended Workers Scripts and Routes access.
+
+This file is local credential state, not project configuration. It must not be committed.
+
+## Why dry-run first
+
+Token creation is a mutation. On a new Cloudflare account or zone, start with:
+
+```bash
+bin/herdr-cloudflare-token --zone <zone> --dry-run
+```
+
+This can catch missing/ambiguous zone identity, insufficient bootstrap permissions and permission-group problems before generating a new credential.
+
+## Why rotation is explicit
+
+If a local credential already exists, the helper does not silently replace it. `--rotate` is required.
+
+Credential rotation can affect active deployments, CI or other scripts still using the previous token, so replacement requires explicit intent.
+
+## What verification means
+
+`--verify-only` checks more than the presence of a token string. The saved credential should be active and usable against the expected Cloudflare account/zone APIs.
+
+A good verification confirms:
+
+- token active state;
+- correct account identity;
+- Workers Scripts access;
+- Workers Routes access for the target zone where required.
+
+When deployment fails, distinguish credential failure from Worker/DO configuration failure.
+
+## ChatGPT never needs this credential
+
+These are separate layers:
 
 ```text
-CLOUDFLARE_API_TOKEN=<secret>
-CLOUDFLARE_ACCOUNT_ID=<account id>
-HERDR_CUTOVER_ZONE=<zone name>
-HERDR_CUTOVER_ZONE_ID=<zone id>
-HERDR_CUTOVER_PATTERN=herdr-mcp.<zone>/*
-HERDR_CUTOVER_WORKER=herdr-edge-prod
-HERDR_CUSTOM_DOMAIN=herdr-mcp.<zone>
-HERDR_CUTOVER_PROBE_KEYCHAIN_SERVICE=herdr-edge-prod-mcp-bearer
+Cloudflare API token
+  purpose: deploy and maintain Edge
+
+ChatGPT OAuth token
+  purpose: ChatGPT accesses the deployed MCP Edge
+
+HERDR_MCP_TOKEN
+  purpose: local curl / Cursor / legacy local compatibility
 ```
 
-Never commit this file to Git, or paste it into an Issue, chat, or CI logs.
+Do not copy one into another layer. In particular, Cloudflare API tokens and `HERDR_MCP_TOKEN` do not belong in the ChatGPT Connector UI.
 
-## First-time preparation: bootstrap credential
+## Credential hygiene
 
-Cloudflare does not let a "credential-less program" create API Tokens out of thin air, so the first automation needs a bootstrap credential. Two recommended ways:
+Recommended practice:
 
-1. **An existing Cloudflare automation token**: it must at least be able to read the target Zone and have `Account API Tokens` management permission. Put it temporarily into `CLOUDFLARE_API_TOKEN` in the current shell.
-2. **Only a web login session**: create a bootstrap token once in the Cloudflare Dashboard under `Account → Account API tokens`; a logged-in `ego-browser` can also do it for you. The bootstrap token is only for creating the Herdr-specific token; daily Herdr operation uses the dedicated token generated by the script.
+- pass bootstrap credentials through temporary process environment;
+- store the least-privilege credential only in a restricted local file or proper Secret Store;
+- do not put secrets in `wrangler.toml`, README files, examples or Git;
+- do not echo secret values into terminal logs;
+- log readiness/status, not credential contents;
+- investigate architecture/configuration before expanding permissions;
+- verify the new token after rotation before removing the old one.
 
-The bootstrap token is never written into Herdr config files by the script.
+## Relationship to Edge deployment
 
-## Creation
+For a new installation, validate Worker, workstation link, OAuth and MCP on `workers.dev` first, then add Custom Domain/routes as a separate step.
 
-```bash
-export CLOUDFLARE_API_TOKEN='<bootstrap token>'
-bin/herdr-cloudflare-token --zone example.com
-unset CLOUDFLARE_API_TOKEN
-```
-
-Successful output contains only non-sensitive status, e.g.:
-
-```json
-{"ok":true,"code":"credential_created","mode":"600","permissions":["Workers Routes Write","Workers Scripts Write"]}
-```
-
-The script then automatically verifies:
-
-- the Account API Token is Active;
-- it can read the target Zone's Workers Routes;
-- it can read the Account's Workers Scripts.
-
-## Dry-run first, recommended
-
-```bash
-bin/herdr-cloudflare-token --zone example.com --dry-run
-```
-
-It completes Zone/Account/permission-group resolution and the bootstrap permission check, but creates no token and writes no file.
-
-## Verifying existing local credentials
-
-```bash
-bin/herdr-cloudflare-token --verify-only
-```
-
-This does not reveal the token; it only reports the three verification results: API, Routes, Scripts.
-
-## Idempotency and rotation
-
-If the default local file already exists and verifies, re-running the script returns `credential_already_ready` and does not create another token.
-
-To actually rotate:
-
-```bash
-bin/herdr-cloudflare-token --zone example.com --rotate
-```
-
-`--rotate` creates a new token and, after successful creation, atomically replaces the local file. The old token is not auto-revoked by the script, avoiding disruption while concurrent deploys or connections still use the old credential; after confirming the new token is in stable use, revoke the old one in the Cloudflare Dashboard.
-
-## Equivalent manual Dashboard steps
-
-For human verification, the configuration should match the script exactly:
-
-1. `Account → Account API tokens → Create Token`.
-2. `Start from scratch`.
-3. First Policy:
-   - Resource scope: `Specified Domains`;
-   - select only the target domain;
-   - `Workers Routes → Edit`.
-4. `Add policy`, second Policy:
-   - Resource scope: `Entire Account`;
-   - `Workers Scripts → Edit`.
-5. Add no DNS, Tunnel, or Account Admin permissions.
-6. The Review page should show only `Workers Routes Write` and `Workers Scripts Write`.
-7. After creation the token is shown once; store it immediately in the local secure file; never echo it in a terminal or chat.
-
-## Combining with deployment / production switchover
-
-New installs default to `workers.dev` first; no personal domain is needed. Choose Custom Domain only when you already have a stable domain.
-
-After creating the local credential:
-
-```bash
-set -a
-source ~/.config/herdr-mcp/cloudflare-cutover.env
-set +a
-
-# Custom Domain read-only status and production-candidate preflight
-bin/herdr-cloudflare-domain status
-bin/herdr-cloudflare-domain preflight
-```
-
-`bin/herdr-cloudflare-domain` only calls the Workers Domains API; it never deletes DNS or stops the Tunnel by itself. If the old architecture already has a same-name CNAME, Cloudflare refuses a direct attach; first record complete rollback evidence, then delete the conflicting CNAME in a controlled switchover, attach the Custom Domain, verify, and only then retire the old Tunnel. On failure, detach the Custom Domain and restore the old CNAME. See [`cloudflare-edge-deployment.md`](cloudflare-edge-deployment.md).
+See [Cloudflare Edge deployment](cloudflare-edge-deployment.md) for architecture and deployment, and [Installation](install.md) for the shortest end-to-end path.

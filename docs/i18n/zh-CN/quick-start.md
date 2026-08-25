@@ -1,19 +1,31 @@
-# 快速开始
+# 快速开始：从零体验第一次远程开发
 
-目标：已经有 Herdr 的前提下，不先读维护者和 runtime 文档，就把一个网页客户端真正跑通。
+目标：在已经安装 Herdr 的情况下，让 ChatGPT 等 Web AI 第一次真正连接自己的开发环境。
 
-## 1. 先确认 Herdr 本体
+整个过程只需要理解一件事：
 
-herdr-mcp 不安装也不替代 Herdr。如果还没装，请先按官方 [Herdr 安装](https://herdr.dev/zh-cn/docs/install/) 和 [快速开始](https://herdr.dev/zh-cn/docs/quick-start/) 完成，然后确认：
+> Herdr 提供本机开发现场，herdr-mcp 把这个现场安全地连接给 Web AI。
+
+## 1. 准备本机开发现场
+
+herdr-mcp 不替代 Herdr。先安装并启动官方 Herdr：
 
 ```bash
 herdr --version
 herdr api schema >/dev/null
 ```
 
-如果还不熟悉 workspace / tab / pane / agent / session，先读官方 [核心概念](https://herdr.dev/zh-cn/docs/concepts/)。
+如果第一次接触 Herdr，先理解这些概念：
 
-## 2. 构建 herdr-mcp
+- workspace：一个长期存在的工作空间；
+- tab：工作区中的标签页；
+- pane：具体终端/Agent 工作面板；
+- agent：正在执行任务的本地智能体；
+- session：可以恢复的长期执行状态。
+
+这些状态会成为 Web AI 后续观察和恢复工作的依据。
+
+## 2. 安装 herdr-mcp
 
 ```bash
 git clone https://github.com/whshang/herdr-mcp.git
@@ -22,31 +34,103 @@ npm install
 npm run build
 ```
 
-如果让本地 coding Agent 安装，可以直接用 [Agent 辅助安装](agent-install.md)。Agent 一旦确定目标项目 root，应先读取该项目存在的 `AGENTS.md`、`CLAUDE.md`、`README.md`，再按安装协议执行，不能自行猜流程。
+启动本地 runtime：
 
-## 3. 只选一条客户端路径先跑通
+```bash
+export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
+export HERDR_MCP_PORT=8772
+node dist/server.js
+```
 
-### ChatGPT
+此时本机已经具备 MCP 服务能力。
 
-ChatGPT 需要经过有认证的公网 Edge。继续看 [安装](install.md)，然后看 [连接 ChatGPT](chatgpt-connector.md)。首次部署默认使用 `workers.dev`，不需要自定义域名。
+## 3. 选择你的第一次连接方式
 
-### z.ai / DeepSeek
+### 路线 A：ChatGPT Connector
 
-这两个站点直接走本机浏览器 bridge，不需要伪造公网 MCP Connector。安装 Chrome 扩展 / Native host，把会话绑定到 workspace，再看 [JSON → MCP 桥接](extension-bridge.md)。
+适合：希望用最强 Web 模型直接开发。
 
-## 4. 理解“自动”的作用域
+链路：
 
-- ChatGPT **项目**自动化按 Project id 共享，并受 Options 里的项目自动化总开关控制。
-- 普通 ChatGPT `/c/<id>`、z.ai、DeepSeek 使用**单会话 Auto**；即使项目自动化总开关关闭，它们仍可以从自己的 HUD 单独打开“自动”。
-- 每个作用域默认都是 Auto 关，需要显式打开。
+```text
+ChatGPT
+ ↓
+Cloudflare Edge + OAuth
+ ↓
+herdr-mcp
+ ↓
+Herdr 工作站
+```
 
-## 5. 验收真正的客户端边界
+继续阅读：
 
-不要只看到“进程启动”就结束。至少从实际要用的客户端确认：
+- [安装](install.md)
+- [连接 ChatGPT](chatgpt-connector.md)
 
-- 本机 runtime 可达；
-- ChatGPT 能看到当前 epoch-2 的 18 个工具，或者 z.ai / DeepSeek bridge 能列出并调用本机 catalog；
-- 浏览器扩展能观察绑定 workspace；
-- 如果打开 Auto，一次真实 progress / settled 事件能回到对应会话。
+首次部署推荐使用 `workers.dev`。自定义域名属于长期生产优化，不是第一次运行的前置条件。
 
-下一步：完整手工流程见 [安装](install.md)；任一边界失败见 [故障排查](troubleshooting.md)。
+### 路线 B：浏览器连续工作
+
+适合：希望网页会话持续观察本地任务。
+
+浏览器扩展提供：
+
+- workspace 绑定；
+- Agent 进度观察；
+- completion 回推；
+- 长任务恢复；
+- 对话接力。
+
+继续阅读：[浏览器扩展](extension.md)。
+
+### 路线 C：本地 CLI / Agent 集成
+
+适合：Cursor、Claude Code、Pi、其它本地 Agent。
+
+它们可以直接使用本机 MCP，不经过公网 Edge。
+
+## 4. 第一次让 ChatGPT 操作项目
+
+推荐从一个小任务开始：
+
+例如：
+
+> 查看这个仓库最近一次测试失败原因，修复后运行相关测试。
+
+一个正常流程应该类似：
+
+1. ChatGPT 调 `herdr_inspect` 查看当前工作现场；
+2. 使用 `herdr_git` 确认仓库状态；
+3. 使用 `herdr_fs_read/grep` 定位代码；
+4. 使用 patch 修改；
+5. 使用 exec 运行测试；
+6. 检查 diff 和测试结果。
+
+需要并行分析时，再调度本地 Agent。
+
+## 5. 验收连接是否真正成功
+
+不要只检查服务有没有启动。真正可用需要验证：
+
+- ChatGPT 能获取当前 MCP tools；
+- 工具调用可以读取真实项目文件；
+- Git 状态来自你的真实仓库；
+- 浏览器扩展可以看到 workspace；
+- 长任务完成后，状态可以回到网页会话。
+
+## 6. 什么时候开启自动继续
+
+自动化用于减少等待，不用于绕过确认。
+
+建议：
+
+- 第一次使用保持手动模式；
+- 熟悉流程后，再针对稳定项目开启自动继续；
+- 高风险操作（部署、权限修改、生产数据变化）保持人工确认。
+
+## 下一步
+
+- 深入理解：[设计思路](design-philosophy.md)
+- 理解系统：[架构](architecture.md)
+- 连接 ChatGPT：[ChatGPT Connector](chatgpt-connector.md)
+- 学习日常流程：[最佳实践](best-practices.md)

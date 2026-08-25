@@ -1,127 +1,312 @@
-# Runtime 自升级
+# Runtime A/B：让本机升级不打断远程开发
 
-Herdr MCP 在本机 MCP runtime generation 切换时，保持 ChatGPT 面向的 Edge 与工作站 `herdr-link` 稳定。Runtime A/B 是**同一 contract epoch 内**的机制；公开 contract epoch 变化使用独立的受控迁移流程。
+herdr-mcp 把公网入口和本机 runtime 拆成两个独立的发布平面。
 
-## 边界
+对 ChatGPT 来说，公网 Edge、OAuth issuer 和 MCP URL 应该长期稳定；对工作站来说，herdr-mcp runtime 可以升级、验证、切换和回滚，而不必让 ChatGPT Connector 跟着重连。
 
 ```text
 ChatGPT
-  -> stable Worker / OAuth / frozen public MCP contract
-  -> persistent herdr-link
-  -> active runtime generation
-       A: http://127.0.0.1:8772/mcp
-       B: http://127.0.0.1:8773/mcp
+  │ stable MCP/OAuth origin
+  ▼
+Cloudflare Edge
+  │ persistent workstation WSS
+  ▼
+herdr-link
+  │ active generation pointer
+  ├───────────────┐
+  ▼               ▼
+runtime A       runtime B
+127.0.0.1:8772 127.0.0.1:8773
 ```
 
-`herdr-link` 持有 active-generation pointer。单个 runtime 进程**不拥有**公网连接，因此切换或停止某个 runtime generation 不会终止 ChatGPT transport。
+这就是 Runtime A/B。
 
-generation manager 不负责启动任意进程。candidate process 的创建属于部署/升级步骤；candidate 在 loopback endpoint 监听后，再由 manager 校验并切流。这样把 process execution 与 traffic activation 分开。
+## 它解决什么问题
 
-## 冻结 contract profile
+如果公网入口直接指向某一个本机 runtime 进程，那么一次普通升级可能同时影响：
 
-Production 0.3.32 使用：
+- HTTP/MCP 连接；
+- OAuth identity；
+- 正在进行的工具调用；
+- ChatGPT Connector；
+- 回滚路径。
 
-```bash
-HERDR_MCP_CONTRACT_PROFILE=epoch2
-```
+A/B 把这些问题分开。
 
-Contract epoch 2：
+一个 candidate runtime 先在新的 loopback endpoint 启动并验证，通过 gate 后才成为 active。旧 generation 在需要时继续 drain 已经进入它的请求，并保留为 rollback 目标。
 
-- 精确暴露 **18 tools**；
-- 包含只读 `herdr_skill`；
-- 冻结哈希为 `sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8`；
-- 与 `HERDR_MCP_ALL_TOOLS=1` 同时出现时 fail closed；
-- candidate 激活前从真实 `tools/list` 计算并验证。
+## Runtime generation 是什么
 
-`epoch1` 只保留为历史 **17-tool 回滚/旧会话兼容 profile**，不再是当前 production 目标。
-
-## 本机控制文件
-
-Production 使用独立的本机文件：
+一个 generation 是本机某一份可独立访问的 herdr-mcp runtime 实例，例如：
 
 ```text
-~/.config/herdr-mcp/runtime-control-prod.json
-~/.config/herdr-mcp/runtime-status-prod.json
+generation A
+  endpoint: http://127.0.0.1:8772/mcp
+  version: current stable
+
+generation B
+  endpoint: http://127.0.0.1:8773/mcp
+  version: candidate
 ```
 
-权限为 `0600`。Runtime bearer credential **不会**写入这两个文件；persistent link 继续持有已有的本机 MCP credential。
+`herdr-link` 持有 active-generation pointer。Edge 并不需要知道端口切换细节；它只和同一个 workstation link 通信。
 
-control document 包含：
+因此：
 
-- 单调递增的 `revision`；
-- `desired_active` generation；
-- 最多 8 个 loopback generation spec；
-- 可选的 activation observation checks。
+```text
+切换 runtime ≠ 切换 Connector
+```
 
-generation boundary 只接受 `http://127.0.0.0/8`、`localhost` 或 `::1` candidate。
+这是整个机制最重要的边界。
+
+## A/B 不是进程管理器
+
+Generation manager 不负责“随便启动任何命令”。
+
+推荐流程是：
+
+1. 构建 candidate；
+2. 独立启动 candidate runtime；
+3. 注册 generation；
+4. 运行 health / contract gate；
+5. activate；
+6. 观察；
+7. 成功后再回收旧 generation。
+
+把 process creation 和 traffic activation 分开，可以让“新程序能不能启动”和“是否应该接生产请求”成为两个不同问题。
 
 ## CLI
 
 ```bash
-herdr-runtime-generation status
-herdr-runtime-generation register --generation candidate-0.3.33-abc123 \
+bin/herdr-runtime-generation status
+
+bin/herdr-runtime-generation register \
+  --generation candidate-<id> \
   --endpoint http://127.0.0.1:8773/mcp \
-  --runtime-version 0.3.33
-herdr-runtime-generation activate --generation candidate-0.3.33-abc123
-herdr-runtime-generation rollback
-herdr-runtime-generation remove --generation candidate-0.3.33-abc123
+  --runtime-version <version>
+
+bin/herdr-runtime-generation activate \
+  --generation candidate-<id>
+
+bin/herdr-runtime-generation rollback
+
+bin/herdr-runtime-generation remove \
+  --generation candidate-<id>
 ```
 
-操作 production/canary 等非默认环境时，通过 `HERDR_RUNTIME_CONTROL_PATH` 和 `HERDR_RUNTIME_STATUS_PATH` 指定对应文件。
+`status` 是第一入口。任何升级/回滚前都应该先知道：
 
-## Activation gate
+- desired active；
+- actual active；
+- previous generation；
+- last known good；
+- candidate health。
 
-active pointer 移动前，`herdr-link` 使用已有 runtime credential 验证 candidate：
+不要根据上一次发布日志猜当前 active generation。
 
-1. loopback endpoint 可达；
-2. health / discovery 成功；
-3. 真实 `tools/list` 成功；
-4. tool count 与 canonical SHA-256 contract hash 匹配**当前冻结 epoch**；
-5. 可选的 expected runtime version 匹配；
-6. 重复 observation check 持续健康。
+## Activation gate 检查什么
 
-失败的 candidate 永远不会成为 active。`bin/herdr-self-update` 使用同样原则：它要求现有 server plist 已经使用当前 public contract profile，并且**拒绝执行跨 epoch 迁移**。
+Candidate 只有在真实 loopback endpoint 上通过验证后才允许切流。
 
-## 切换与 drain 语义
+核心 gate 包括：
 
-Activation 在 generation pointer 上原子完成：
+1. endpoint 可达；
+2. runtime health / discovery 可用；
+3. 真实 `tools/list` 可用；
+4. public tool contract 与当前 contract epoch 匹配；
+5. 如果声明 expected runtime version，则版本一致；
+6. 必要时连续多个 observation window 保持健康。
 
-- 已经派发到 generation A 的请求继续固定在 A 上 drain；
-- 新请求立即使用 generation B；
-- stable WSS link 保持连接；
-- Edge/OAuth/MCP URL 与 ChatGPT Connector 不变化。
+当前 production public contract 是 **epoch 2 / 18 tools**。具体 canonical hash 属于构建/发布事实，不应该作为一篇长期教程里的常量；实际激活以当前运行配置和冻结 contract 定义为准。
 
-Rollback 用相反方向的同一 pointer 机制。
+## 为什么 contract epoch 和 Runtime A/B 必须分开
 
-## Edge runtime 状态
+A/B 适用于：
 
-Heartbeat frame 携带 active runtime identity。Production Edge 消费该 identity，并在 version/generation 变化时持久化，transition 期间绕过普通 heartbeat 写入节流。
+> **同一公开契约下，更换实现。**
 
-因此 `/status/<workstation>` 会在下一次 heartbeat 收敛到新 runtime，不需要重连 workstation link。正常 heartbeat 间隔为 15 秒。
+例如：
 
-## Contract epoch 迁移
+- 修一个 fs bug；
+- 改 snapshot fallback；
+- 提升 exec 稳定性；
+- 修 OAuth relay 内部实现但 public tool surface 不变。
 
-公开 tool surface 的变化**不是** A/B runtime update。epoch 1 → epoch 2 的安全顺序是：
+如果 tools/list 本身发生不兼容变化，就是 contract migration：
 
 ```text
-1. 安装/重启本机 MCP server：0.3.32 + HERDR_MCP_CONTRACT_PROFILE=epoch2
-   -> direct loopback tools/list 必须是 18 tools + epoch-2 hash
-2. 发布 public Edge epoch 2
-   -> public tools/list 变成 18 tools，并包含 herdr_skill
-   -> 为保持回滚连续性，Edge 临时接受紧邻的 epoch-1 workstation link identity
-3. 更新/重启 herdr-link：HERDR_CONTRACT_EPOCH=2 + epoch-2 hash
-   -> /status/<workstation> 必须收敛到 epoch 2 / runtime 0.3.32
-4. 用新的 ChatGPT conversation 验证拿到 18-tool snapshot
+runtime implementation upgrade
+    ≠
+public MCP contract migration
 ```
 
-旧 epoch-1 catalog 继续以冻结源码和测试保留，作为 compatibility evidence；绝不能把它静默修改成 epoch 2 的样子。
+后者会影响 ChatGPT tool snapshot、Edge identity、Link contract 以及新会话验收，需要单独的 epoch 迁移流程。
+
+因此 `herdr-self-update` 不应该被用来偷偷跨 contract epoch。
+
+## 激活发生时会怎样
+
+可以把 active pointer 理解成一个本机路由开关：
+
+```text
+切换前
+new request → A
+
+activate B
+
+切换后
+new request → B
+existing request on A → A 上完成/drain
+```
+
+理想情况下：
+
+- persistent WSS 不断；
+- Edge URL 不变；
+- OAuth issuer 不变；
+- ChatGPT Connector 不变；
+- 已经投递到旧 generation 的请求不会被重复投递到新 generation。
+
+这也是为什么 activation 和 drain 要有明确语义。
+
+## Rollback
+
+如果 B 激活后暴露问题，不需要重新部署公网入口。
+
+```bash
+bin/herdr-runtime-generation status
+bin/herdr-runtime-generation rollback
+```
+
+Rollback 让新请求回到 previous / last-good generation。
+
+回滚前同样要观察真实状态：如果某个 mutation 已经在 B 上发生，回滚 runtime 不会自动回滚 Git、文件、远端服务或 Agent 行为。
+
+Runtime rollback 是**执行环境回滚**，不是业务副作用回滚。
+
+## 本机控制状态
+
+Generation manager 使用本机 control/status state 保存：
+
+- generation specs；
+- desired active；
+- revision；
+- observed active；
+- previous / last-good；
+- activation observations。
+
+这些文件属于 workstation 控制状态，不是仓库源码，也不应该保存 bearer secret。
+
+Candidate endpoint 限制在 loopback，是为了保持“generation 是本机 runtime”的安全边界，不把 A/B 变成任意远端转发器。
+
+## Heartbeat 如何让 Edge 知道版本变化
+
+workstation link 在 heartbeat 中报告当前 active runtime identity，例如 generation / version 等运行信息。
+
+因此 Edge 可以观察：
+
+```text
+workstation online
+active generation changed
+runtime version changed
+```
+
+不需要因为一次本机 A/B 切换重建 WSS。
+
+公网状态可能在下一次 heartbeat 才收敛，所以刚 activate 后短时间内看到旧 version 并不等于切换失败；以本机 generation status + 后续 heartbeat 为准。
+
+## 推荐升级流程
+
+```text
+Inspect current state
+  ↓
+Build candidate
+  ↓
+Start candidate on second loopback endpoint
+  ↓
+Register generation
+  ↓
+Validate health + tools contract
+  ↓
+Activate
+  ↓
+Observe real tool calls / heartbeat
+  ↓
+Keep old generation during observation
+  ↓
+Remove old generation only after confidence
+```
+
+如果任一步骤失败：
+
+- candidate 尚未 activate：修 candidate，不影响 production；
+- candidate 已 activate：先判断是否 rollback；
+- mutation delivery 不确定：先重新观察，不重复执行发布动作。
+
+## `herdr-self-update` 适合做什么
+
+`bin/herdr-self-update` 是受监督升级入口，它复用 generation 机制，而不是原地覆盖当前 active runtime。
+
+适合：
+
+- 同 contract epoch 的代码更新；
+- 可以构建 candidate、跑 gate、切换和回滚的升级。
+
+不适合：
+
+- public tools contract 变化；
+- Edge/OAuth identity 迁移；
+- Custom Domain/DNS cutover；
+- Herdr daemon 本体的任意跨边界升级。
+
+这些是不同 release plane，应单独操作。
+
+## 与 Edge 发布的关系
+
+系统有两个主要 release plane：
+
+```text
+Public Edge plane
+Worker / Durable Object / OAuth / public MCP relay
+
+Local runtime plane
+herdr-link / active runtime generation
+```
+
+它们应该尽量独立发布。
+
+例如本机 `herdr_fs_*` bugfix 通常无需改 Worker；OAuth relay bugfix 通常也无需切本机 runtime generation。
+
+分离 release plane 可以减少一次发布的爆炸半径。
 
 ## 安全规则
 
-- 同一 contract epoch 下，绝不激活 contract hash 不同的 candidate。
-- 绝不用 `herdr-self-update` 跨 contract epoch。
-- 除非重新设计 transport boundary，否则 generation 只能绑定 loopback endpoint。
-- old generation 的 in-flight 请求没有 drain 完前不能 kill。
-- runtime bearer credential 不得进入 control/status file 或命令输出。
-- 公开 tool-surface 变化属于 contract-epoch operation，不属于普通 runtime upgrade。
-- 尽量把 Edge/Link upgrade 与 runtime-generation activation 分开执行。
+- candidate 必须使用 loopback endpoint；
+- 当前 contract epoch 内，contract 不匹配的 candidate 不激活；
+- 已投递请求不因切代而重复执行；
+- 旧 generation drain 前不强杀；
+- credential 不写进 generation control/status；
+- 回滚 runtime 前后都重新观察 Git / Agent / 服务真实状态；
+- contract migration、Edge deployment、Domain/DNS mutation 不混成一次普通 self-update。
+
+## 验收标准
+
+一次成功 A/B 升级至少证明：
+
+- candidate 独立健康；
+- 当前 public contract gate 通过；
+- active generation 已改变；
+- Edge heartbeat 收敛到新 runtime identity；
+- 新请求进入新 generation；
+- Connector/OAuth URL 没有变化；
+- 至少一次真实 MCP tool call 通过；
+- rollback target 仍然存在于观察窗口内。
+
+这时才算“本机 runtime 升级完成”，而不是仅仅“新进程启动成功”。
+
+相关内容：
+
+- [Cloudflare Edge 部署](cloudflare-edge-deployment.md)
+- [CLI 参考](cli-reference.md)
+- [故障排查](troubleshooting.md)
+- [架构](architecture.md)

@@ -3,16 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="herdr-mcp — stable MCP/OAuth edge and self-upgrading local Herdr control plane for web planners.">
+  <meta name="description" content="herdr-mcp connects ChatGPT and other Web AI to a local Herdr workstation for code, Git, shell, local-agent delegation and browser continuity.">
   <meta name="color-scheme" content="light dark">
-  <title>herdr-mcp</title>
+  <title>herdr-mcp · local development control plane for Web AI</title>
   <link rel="canonical" href="https://whshang.github.io/herdr-mcp/">
   <link rel="alternate" hreflang="en" href="https://whshang.github.io/herdr-mcp/">
   <link rel="alternate" hreflang="zh-CN" href="https://whshang.github.io/herdr-mcp/zh-CN/index.html">
   <link rel="alternate" hreflang="x-default" href="https://whshang.github.io/herdr-mcp/">
   <link rel="stylesheet" href="./style.css">
   <script>
-    // Chinese browsers get the Chinese homepage unless they pinned a language.
     try {
       if (!localStorage.getItem("herdr-docs-lang") && (navigator.languages || [navigator.language]).some(function (l) { return (l || "").toLowerCase().indexOf("zh") === 0; })) {
         location.replace("./zh-CN/");
@@ -32,39 +31,48 @@
 
   <main>
     <header class="hero">
-      <div class="eyebrow">Web planner → stable Edge → local Herdr</div>
-      <h1>herdr-mcp</h1>
-      <p class="lead">A lean MCP gateway that lets ChatGPT and other remote planners inspect, edit, run, and delegate on a Herdr workstation without exposing the workstation directly.</p>
+      <div class="eyebrow">Web AI reasons · Herdr keeps the workspace · herdr-mcp connects both sides</div>
+      <h1>Connect ChatGPT to the real development machine.</h1>
+      <p class="lead">herdr-mcp is a remote development control plane between Web AI and a local Herdr workstation. ChatGPT can read and edit code, inspect Git, run shell commands, observe persistent workspaces, and delegate to local agents when independent reasoning is useful—while code and execution stay on your machine.</p>
       <div class="actions">
-        <a class="primary" href="https://github.com/whshang/herdr-mcp">GitHub</a>
-        <a href="./docs/">Docs</a>
-        <a href="https://github.com/whshang/herdr-mcp/blob/main/README.md">Install</a>
-        <a href="./docs/en/runtime-self-upgrade.html">Self-upgrade</a>
+        <a class="primary" href="./docs/en/quick-start.html">Quick start</a>
+        <a href="./docs/en/design-philosophy.html">Why it is designed this way</a>
+        <a href="./docs/en/architecture.html">Architecture</a>
+        <a href="https://github.com/whshang/herdr-mcp">GitHub</a>
       </div>
     </header>
 
     <section class="diagram" aria-label="Architecture">
-      <div>ChatGPT / web model</div><span>↓ MCP + OAuth</span>
-      <div>Cloudflare Worker / Durable Object</div><span>↓ authenticated WSS</span>
-      <div>persistent herdr-link</div><span>↓ local MCP</span>
-      <div>runtime generation A / B</div><span>↓ Herdr socket + workstation</span>
-      <div>panes · agents · fs · git · shell</div>
+      <div>ChatGPT / Web AI</div><span>↓ MCP + OAuth</span>
+      <div>Cloudflare Edge</div><span>↓ authenticated WSS</span>
+      <div>herdr-link + herdr-mcp</div><span>↓ local control</span>
+      <div>Herdr persistent workspaces</div><span>↓</span>
+      <div>files · Git · shell · panes · agents</div>
     </section>
 
     <section class="grid">
-      <article><h2>Stable public boundary</h2><p>OAuth, MCP transport and the public contract live at the Edge. The workstation makes an outbound authenticated connection; there is no public inbound workstation port.</p></article>
-      <article><h2>Direct work first</h2><p>Remote planners get first-class fs, patch, Git, image and shell tools. Cheap local development agents are used only when reasoning or parallel investigation is worth the cost.</p></article>
-      <article><h2>Runtime A/B</h2><p>New local runtime generations are validated against the frozen tool contract, switched atomically, drained and rolled back behind the same Link and Connector.</p></article>
-      <article><h2>Self-maintaining</h2><p>The project skill describes tool order, mutation discipline, agent dispatch preferences and the supervised self-update path. Runtime releases and Edge releases remain separate planes.</p></article>
-      <article><h2>Browser wake channel</h2><p>The MV3 extension talks only to localhost and can push agent progress or completion back into the bound web conversation without sending the local token through Cloudflare.</p></article>
-      <article><h2>Open-source friendly</h2><p><code>workers.dev</code> is the default public origin. A Custom Domain is optional for a long-lived stable OAuth/MCP identity; legacy Tunnel is migration-only.</p></article>
+      <article><h2>Give Web AI local hands and eyes</h2><p>Deterministic work uses first-class file, search, patch, Git and shell tools directly. The Web model can keep ownership of goals, trade-offs and verification instead of routing every action through another agent.</p></article>
+      <article><h2>Herdr keeps the real workspace alive</h2><p>Workspaces, panes, PTYs and agents outlive individual browser requests. Long tests, servers and parallel agents keep stable identities that later turns can inspect again.</p></article>
+      <article><h2>Delegate only when another reasoning process helps</h2><p>Focused investigation, parallel implementation and review can go to Herdr agents such as Pi or Grok. Reading files, checking Git and running tests remain direct operations.</p></article>
+      <article><h2>Browser continuity closes the return path</h2><p>MCP handles Web AI → workstation. The extension adds workstation → browser conversation, supporting progress, settled wakeups, evidence-first recovery and long-conversation handoff.</p></article>
+      <article><h2>No public inbound workstation port</h2><p>Cloudflare Edge provides the stable OAuth/MCP origin while the workstation creates an authenticated outbound WSS link. ChatGPT never needs the local bearer.</p></article>
+      <article><h2>Upgrade the local runtime independently</h2><p>Runtime A/B validates candidates, switches traffic, drains old generations and supports rollback within the same public contract—without changing the Connector URL.</p></article>
+    </section>
+
+    <section class="grid">
+      <article><h2>First setup</h2><p>With Herdr already installed, use Quick Start to bring up the local runtime, a workers.dev Edge, the ChatGPT Connector and a real <code>herdr_inspect</code> validation.</p><p><a href="./docs/en/quick-start.html">Open Quick Start →</a></p></article>
+      <article><h2>Long-running browser development</h2><p>Bind a conversation to a Herdr workspace so progress, settled state, recovery and handoff become part of the workflow.</p><p><a href="./docs/en/browser-continuity.html">Understand browser continuity →</a></p></article>
+      <article><h2>Go deeper</h2><p>Learn why the public MCP contract stays compact, why runtime truth belongs to Herdr, and how Edge, Link, Runtime and the extension divide responsibilities.</p><p><a href="./docs/en/architecture.html">Read the architecture →</a></p></article>
     </section>
 
     <footer>
       <span>herdr-mcp</span>
       <a href="./docs/">Documentation</a>
+      <a href="./docs/en/best-practices.html">Best practices</a>
+      <a href="./docs/en/runtime-self-upgrade.html">Runtime A/B</a>
       <a href="./docs/en/capability-benchmark.html">Capability decisions</a>
-      <a href="./docs/en/cloudflare-edge-deployment.html">Cloudflare deployment</a>
+      <a href="./docs/en/cloudflare-edge-deployment.html">Cloudflare Edge</a>
+      <a href="./docs/en/troubleshooting.html">Troubleshooting</a>
       <a href="./zh-CN/index.html" hreflang="zh-CN">简体中文</a>
     </footer>
   </main>

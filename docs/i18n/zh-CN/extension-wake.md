@@ -1,140 +1,267 @@
-# 进度回推
+# 自动继续、恢复与接力
 
-读者：任意网页版 AI 派活到 herdr 后，对话停住、需要主动提醒继续的人。
+这篇文档解释浏览器连续工作的核心状态机：当 Herdr 里的工作继续发生，而网页会话已经停下来时，扩展如何把正确的会话重新唤醒；当 ChatGPT 页面卡住或上下文过长时，又如何恢复或接力，同时避免重复执行 mutation。
 
-总览与双主线：[extension.md](./extension.md)。JSON→MCP 见 [extension-bridge.md](./extension-bridge.md)。
+先读 [浏览器连续工作](browser-continuity.md) 理解为什么需要反向通道；安装和 HUD 使用见 [浏览器扩展](extension.md)。
 
-## 要解决的问题
+## 基本模型：绑定一个会话到一个 workspace
 
-1. 网页经 MCP 或 JSON 桥把任务交给 herdr。
-2. 工具很快返回「已提交」，**本轮对话结束**。
-3. herdr 里 agent 仍在 `working`，或稍后才 settled。
-4. 网页模型不再自动观察 → 任务像中断。
+扩展把当前网页会话绑定到 Herdr **workspace**，不是某一个 Agent。
 
-扩展主线 A：**进度定时通报 + 收工提醒**，写入绑定会话并提交。
+```text
+ChatGPT Project conversation
+            │
+            │ binding
+            ▼
+Herdr workspace
+  ├─ pane: Pi implementation
+  ├─ pane: tests
+  ├─ pane: server
+  └─ pane: Grok review
+```
 
-## 当前实现
+这样，网页端关注的是完整任务现场，而不是某个单独进程。`workspace_id` 是稳定身份；label 只用于显示，会从实时 catalog 修正。
 
-| 事件 | 行为 |
-|---|---|
-| `agent_working`（绑定 workspace 内任意 pane） | 武装；若检查间隔 >0 则启动定时器 |
-| 进度 tick | 每 `progressTickSec` 检查；有新非空摘要或满 `progressFallbackSec` 才 `routeWake` |
-| `agent_settled` 且同 space 仍有 working | **局部进展**模板唤醒（不是整轮收工） |
-| `agent_settled` 且范围内无 working | **收工**模板唤醒一次，停 tick |
-| 重连 `hello` | 可补一次错过的范围收工；若快照仍有 working → 续 tick |
+## 状态回推：working、progress、settled
 
-**working 定时进度通报（主线 A）**：绑定会话在 agent `working` 期间，每隔 `progressTickSec` 秒**检查**一次是否要向网页提交进度提醒；`settled` 时仍按现逻辑唤醒一次并停止 tick。
+扩展持续观察本机 `/push/events`。同一个 workspace 的多个 pane 会合并成一个任务范围。
 
-**同一字段**：`progressTickSec` 也作为 ChatGPT 回合催促的冷却秒数（popup/options 只填一处）。
+### working
 
-实发规则（避免空转刷屏）：
-- `progressTickSec` 只决定**间隔驱动的进度检查 / 自动 LLM 回合判断**（默认 60s），不是发送间隔；**填 0 只关闭这两类间隔驱动动作，不改变 Options 的全局运行模式或 Project HUD 自动开关**
-- **首次**实发：有指纹变化的非空摘要 → `new_output`
-- **已实发过**：距**上一次发送**未满 `progressFallbackSec`（默认 1200s / 20 分钟）→ **一律不发**（底线从最后一次发送起算，不是固定 cron）
-- 满底线后：指纹有变 → `new_output`；否则 → `fallback`
-- 实发基线写进绑定（`lastProgressSentAt` / `lastProgressOutput`），Service Worker 被杀后仍去重
+一旦范围内出现 working Agent，扩展进入“任务仍在进行”状态，并开始按配置检查是否有值得回推的新摘要。
 
-默认值：`progressTickSec = 60`（进度检查 + 自动 LLM 判断冷却；填 `0` = 关闭这两项）；`progressFallbackSec = 1200`（20 分钟兜底；填 `0` = 只在有新摘要时发）。Options 的总开关只控制 **ChatGPT Project 共享自动化**：关闭时 Project 不执行共享自动 mutation；普通 ChatGPT `/c/<id>`、z.ai、DeepSeek 的单会话 Auto 仍可在各自 HUD 独立启用。新 Project/新会话都默认 `自动 关`。界面语言：en / 简体中文 / 日本語（首次跟系统，可选手动）。
+### progress
 
-## 安装与绑定
+`progressTickSec` 决定**多久检查一次**，不是多久一定发送一次。
 
-1. 加载 `extension/`
-2. 先运行 `bin/herdr-extension-host install`，选项页保持 `http://127.0.0.1:8772`。Chrome Native Messaging 把扩展请求交给本机 host，host 再通过 `~/.config/herdr-mcp/extension.sock`（权限 `0600`）访问 herdr-mcp。当前 Options 不再提供 Herdr Token 字段，也不存在插件凭据过期。扩展通过这条本机 IPC 路径使用 `/push/events` 与 `/push/state`，不走 Cloudflare。
-   - 这与公网 Worker 的 contract epoch 独立（当前为 epoch 2 / 18 tools）；扩展不读取 ChatGPT `tools/list`。
-3. 打开目标对话（chatgpt / deepseek / z.ai / claude）
-4. popup：**绑定**将要干活的 **workspace**（列表显示 herdr **label**，如 `novo (w5A)`；含仅开终端、无 agent 的窗格；space 内任意 agent 有进展都会回推）
-5. 再派活
+发送规则强调低噪音：
 
-未绑定 = 无回推。旧「单 pane」绑定在重连后会按 pane 前缀升成 workspace。唤醒文案以 **workspace_label** 为主角，`{agent}` 只表示焦点窗格。
+- 有新的非空摘要时才优先发送；
+- 没有新内容时，不因为计时器到了就刷屏；
+- 超过 `progressFallbackSec` 可以发送一次兜底状态；
+- 上一次已发送摘要和时间会持久保存，Service Worker 重启后也能去重。
 
-## ChatGPT 回合催促（小模型判定）
+### settled
 
-绑定会话 + 扩展 ≥ 0.1.20：
+某个 pane settled，但同 workspace 还有其他 Agent working，属于**局部进展**；整个 workspace 不再有 working Agent 时，才是范围收工。
 
-1. 内容脚本看 Stop 出现/消失，划定回合
-2. Options 为项目自动、当前 Project `自动 开` 且已填 Base URL + Key + Model 时：对用户/助手正文做一次 OpenAI 兼容 `chat/completions`；否则可用底栏 **LLM 分析** 手动触发
-3. 回复落在「不发送关键词」→ 通常不催；否则若判定为继续 → **把小模型原文**灌进对话框并提交（提示词 / 不发送词在 Options 预填可见默认文案）。0.1.54 增加一个更窄的保护：若助手自己在回复尾部明确写出「下一步，我会继续…」「我将继续…」「仍需…」「待验证…」等未完成承诺，即使小模型误回 `好的`，仍按未完成处理；普通「下一步建议用户可以……」不会触发这个覆盖。
-4. 不再使用零工具 / 普通「半途」猜测；未配置小模型则本回合不催。0.1.54 还修正去重时机：只有明确 `done` 或继续消息**确认提交成功**后才封存 assistant fingerprint；ambiguous 判定 30 秒后可重判，发送失败也保留重试资格，同一 conversation 同时只允许一个 judge/send attempt。
-5. 用户气泡若是上次催促句，**仍会**对助手新回复做判定（0.1.20 起）；自动判断冷却与进度检查共用 `progressTickSec`，`0` 关闭自动 LLM 判断（默认 60s），不影响手动 **LLM 分析**
-6. 支持站点页底部 HUD：运行状态、**手动继续 / herdr监控 / LLM 分析 / 手动接力**、可选的 **自动 开|关**、展开。ChatGPT Project 只有在 Options 允许 Project 自动化时才显示按 `project_id` 共享的开关；普通 ChatGPT `/c/<id>`、z.ai / DeepSeek 始终可以按具体 conversation 显示会话级开关。`手动接力` 支持已绑定 ChatGPT Project 和已落成 `/c/<chat_id>` 的 z.ai 会话；当前作用域 `自动 开` 时四个 HUD 手动操作全部锁定。高频动作都在底栏，展开浮层只放事件设置、会话绑定和高级选项。文案跟 Options 语言（en / 简中 / 日语）
-7. herdr working/settled 唤醒仍独立存在
+收工事件会停止 progress timer，并唤醒网页 planner 重新检查 Git、测试和 Agent 输出。
 
-密钥只存本机，仓库默认留空。
+## 为什么回推不是“直接告诉模型已经成功”
 
-## ChatGPT 页面陈旧 / 半截回复恢复（0.1.44）
+Herdr 事件只证明本地状态变化，不证明任务满足验收标准。
 
-Project `自动 开` 时，人工发送和扩展自动发送的用户消息都会进入会话健康状态机。最近回合约 30 秒没有新的页面进展后，扩展会 best-effort 请求当前 ChatGPT conversation 的同源 snapshot，沿 `current_node` 取最新 assistant message，并与 DOM 中最后一条 assistant message 比较：
+扩展注入的继续消息应该促使 Web planner：
 
-- 服务端 message id 更晚，或同一 message 的服务端文本明显更长：判为 **server ahead**，安全时刷新一次页面；
-- 服务端明确显示 assistant message 尚未完成且至少 60 秒没有推进：判为 **server stalled**；如果页面仍显示 streaming，再多等待 30 秒；
-- 服务端和页面一致且已结束：判为 **synced**，不刷新；
-- snapshot 请求失败/超时/结构变化：判为 **unknown**，fail-closed，不盲目刷新。
+1. 重新读取 live state；
+2. 检查具体输出 / Git / tests；
+3. 决定继续实现、返工、提交还是收尾。
 
-刷新前记录当前 assistant 指纹。刷新后如果内容变长或重新开始 streaming，就认为页面已经恢复；如果 10 秒后仍是完全相同的半截回复，并且编辑器、工具、权限卡都空闲，则只发送一次浏览器恢复激活消息，让 ChatGPT 重新读取当前会话，从实际停止处继续且不要重复已完成工作。该消息仍失败后才进入 recovery-exhausted rollover。
+所以 continuity 是调度信号，不是业务结论。
 
-### ChatGPT 显式“消息发送超时”错误卡（0.1.53）
+## HUD 的人工控制
 
-当 ChatGPT 自己渲染带 `data-testid="regenerate-thread-error-button"` 的 thread error 卡（例如“消息发送超时，请重试”）时，Auto **不会立刻强制刷新，也不会盲目再发一条消息**。扩展会先读取同源 conversation snapshot 并检查 `current_node`：
+HUD 提供几类显式操作：
 
-- `current_node` 已经是 assistant message → 说明请求已经在服务端推进到助手回合，盲点“重试”可能重复工具工作；此时只在安全条件满足时刷新一次页面来同步视图；
-- `current_node` 仍是 user message → 才点击 ChatGPT 自带“重试”一次；如果在正常回复超时内仍没有开始回复，再在现有安全 gate 下刷新一次；
-- snapshot 无法确认投递状态 → 优先安全刷新一次，而不是猜测重试一定安全；
-- 一次 Retry / 一次 reload 预算都用完后，保持显式错误为权威状态并抑制通用 recovery message，避免无证据地创建第二个用户回合；如果刷新后 10 秒仍没有新的 assistant 进展，HUD 转成 `rollover_recommended`，而不是静默卡在 `recovering`。
+- **手动继续**：直接让当前网页会话继续下一轮；
+- **herdr监控**：先读取绑定 workspace 的实时状态，再把结果带回网页；
+- **LLM 分析**：用 Options 中配置的小模型判断当前回复是否仍有明显未完成工作；
+- **手动接力**：在支持的会话中主动压缩并切到新 conversation。
 
-因此，强制刷新属于**第二级恢复手段**，不是遇到“消息发送超时”后的第一动作。
+`手动继续 / herdr监控 / LLM 分析` 属于人工推进动作，当前作用域 `自动 开` 时会锁定，避免和自动状态机同时推进同一会话。**手动接力是例外**：支持的会话在 `自动 开/关` 两种状态都可启动；transfer 期间源会话自动 wake 暂停，target 继承 source 的 Auto 状态。
 
-### ChatGPT 回复流断线恢复（0.1.56）
+## 自动化作用域
 
-如果 ChatGPT 已经开始助手回合，但页面明确显示「连接已中断。正在等待完整回复」或对应英文断线占位，扩展不会把仍然存在的 Stop/生成按钮本身当成“助手持续有进展”。只有 assistant 正文长度增长或签名变化才刷新 `last_assistant_progress_at`。断线占位保持 30 秒且页面没有工具、权限卡或人工草稿时，Auto 最多执行一次安全 reload；reload 只重新同步已经存在的服务端回合，不会重新提交原用户任务。若一次 reload 后仍未恢复，扩展不会盲目再发一个用户回合。
+### ChatGPT Project
 
-### ChatGPT 长对话虚拟化与自动接力（0.1.54）
+Project 自动化需要两层许可：
 
-ChatGPT 长对话不会把全部历史消息长期留在 DOM。真实 UAT 中，一条已经到 `conversation-turn-50` 的 Project conversation 在刷新后只挂载了 5 条 user/assistant 节点；如果只统计当前 DOM，压力会被错误重置成“短对话”。0.1.54 不再这样判断：
+1. Options 允许 ChatGPT Project 自动化；
+2. 当前 Project HUD 为 `自动 开`。
 
-- 读取当前仍挂载的 `[data-testid="conversation-turn-N"]`，取最大绝对序号 `N + 1` 作为 **message-count floor**；
-- floor 持久化在 `chrome.storage.local`，只允许增加，不会因为刷新、懒加载或虚拟列表卸载旧节点而回退；
-- 页面可见正文仍做 token 估算，但 usable text budget 从 120k 收紧为 96k，为 Project/system 指令和 MCP/tool payload 等不可见上下文保留余量；
-- 估算正文约 `56k / 64k / 72k / 80k / 92k` 进入 warning / prepare / recommend / required / high-risk；消息段数约 `40 / 46 / 50` 也会独立进入 prepare / recommend / required；
-- `required/high-risk` **不等于立即切会话**。只有当前 Project `自动 开`、workspace 已绑定且可接力、页面静止、无 streaming/tool/权限卡/未发送人工文本、无不确定投递、无活动 handoff 时，才调用同一套 fail-closed 自动 handoff。
+Project 开关按稳定 `project_id` 共享，因此同一 Project 里的接力后会话可以继承自动化偏好。
 
-因此自动接力现在对“工具调用很多但可见正文不长”的 Herdr 会话也能提前动作，不再要求可见文本自己先堆到接近整个模型窗口。
+### 普通 ChatGPT / z.ai / DeepSeek
 
-### ChatGPT handoff 摘要 race 恢复（0.1.55）
+支持的站点使用会话级 Auto，按 conversation identity 保存。
 
-真实自动接力 UAT 在第 51 条消息触发后暴露出一个时序 race：扩展提交 handoff 请求后，ChatGPT 可能先发出一次 `turn_ended`，但此时页面仍暴露的是**上一条 assistant 正文**；旧版本会立刻把这段没有 transfer marker 的旧正文判成 `handoff_packet_invalid`，而真正的 `<<<HERDR_HANDOFF_V1 ...>>>` 摘要随后才生成。
+z.ai / DeepSeek 的 Auto 只负责 Herdr progress / settled 回推；ChatGPT 专属的 stale-view 恢复、权限卡处理、LLM 回合判断和自动 rollover 不会移植过去假装通用。
 
-0.1.55 在发起 handoff 前只保存旧 assistant 的短 fingerprint，不保存正文；如果 summary pending 期间再次观察到同一 fingerprint，就按 stale source turn 忽略并继续等待。只有出现了新的 assistant 正文且仍缺少指定 transfer marker 时才判 malformed。若旧版本已经提前把 transfer 标为 `handoff_packet_invalid`，但正确 marker 摘要随后已经落到页面，0.1.55 会优先恢复这份现有 packet，进入 `summary_ready`，不会重新要求模型生成摘要，也不会重复前面的业务任务。
+## ChatGPT 回复结束后的 LLM 判断
 
-## 手动接力（0.1.47）
+有些回复从页面上看已经“结束”，但语义上其实停在半途，比如：
 
-底部 HUD 的 **手动接力**用于主动提前换会话，`自动 开/关` 两种状态都可以启动；target 会继承 source 的 Auto 状态：
+- “接下来我会检查测试……”
+- “还需要验证生产环境……”
+- “下一步是查看 Git 状态……”
 
-- 支持已绑定的 ChatGPT Project conversation，以及已经落成稳定 `/c/<chat_id>` 的 z.ai conversation；z.ai 根页 `/` 只是新聊天启动页，不显示手动接力。
-- 点击后调用 `h2w_handoff_start(trigger=manual)`，先让当前网页模型生成带 transfer-id 的紧凑 handoff packet。
-- z.ai 的 summary / seed 通过 raw 通道发送，明确绕过 JSON→MCP bridge，避免接力控制消息被改写成 coding-agent task。
-- 绑定 workspace 仍在 `working` 时拒绝开始，避免 settled/wake 与 binding cutover 竞争；handoff 一旦进入活跃状态，源会话的自动 wake 会暂停，直到 cutover 或恢复流程结束。
-- ChatGPT 在同一个 Project 打开新 conversation；z.ai 从 `/` 启动新聊天。只有确认目标会话已经形成新的 conversation id 且 seed marker 真正存在后，才把 workspace binding 从旧 conversation 迁到新 conversation。
-- 已有接力任务时按钮显示 **压缩中… / 接力中… / 恢复接力**，避免重复创建 transfer；`seed_uncertain` 时可用“恢复接力”继续 fail-closed 恢复。
-- z.ai 从根页 `/` 首次落成 `/c/<chat_id>` 时，临时 binding 与会话自动化偏好只迁移这一次；之后从 `/c/A` 切到 `/c/B` 不会跟随迁移。
+扩展可以使用一个单独配置的小模型，对最近用户/助手正文做轻量判断。
 
-## 多任务语义
+小模型只负责回答一个问题：**这轮是不是明显还需要继续？**
 
-| 事件 | 行为 |
-|---|---|
-| space 内任一 agent → working | 武装；启动进度 tick |
-| 某一 pane settled，同 space 仍有 working | **局部进展**唤醒 |
-| space 内全部停 working | **收工**唤醒 |
-| 每次唤醒（局部/进度/收工） | 焦点窗格输出 + **同 workspace 全窗格一览**（agent / terminal title / 状态 / cwd）；有空闲窗格时附三选一：保留等待下一轮 / 总结收尾 / 回收新开 |
-| working 期间新 output | 仍按指纹 + fallback 间隔发进度 |
+它不是第二 planner，也不决定代码修改方案。判断需要继续时，扩展将受控继续消息提交给当前 ChatGPT 会话。
 
-默认模板占位符含 `{roster}` `{idle_hint}`；自定义模板未写时扩展也会强制附上。
+未配置小模型时，这个自动判断不会偷偷降级为脆弱的关键词猜测；用户仍可手动继续或使用 herdr监控。
 
-## ChatGPT 权限卡
+## 页面卡住：先判断发生了什么
 
-内容脚本会持续观察 chatgpt.com 的页面内权限卡，但只有 **Options 勾选“启用 ChatGPT 项目自动化” + 当前 Project `自动 开`** 时才会点击明确的「允许」动作；权限卡自动处理已并入 Project 自动化，不再有独立开关。关闭 Project 总许可或当前 Project `自动 关` 时停止自动点击。浏览器原生权限条不在可点击范围。见 [chatgpt-connector.md](./chatgpt-connector.md)。
+浏览器恢复最重要的原则是：**不把“页面没动”自动解释成“服务器没有执行”。**
 
-## 测试
+工具调用、用户消息或 assistant 回复可能已经在 ChatGPT 服务端推进，只是当前 DOM 没刷新。
 
-- `node tests/manual/extension_smoke.mjs`
-- `node tests/manual/background_bind_test.mjs`
-- `node tests/manual/push_sse.mjs`
+因此恢复顺序是证据优先。
+
+```text
+页面长时间无进展
+        │
+        ▼
+读取同源 conversation snapshot（best effort）
+        │
+        ├─ server ahead ───────► 安全 reload 同步视图
+        │
+        ├─ request not accepted ► bounded retry
+        │
+        ├─ server stalled ─────► 等待后安全 reload
+        │
+        └─ unknown ────────────► fail closed
+```
+
+拿不到可靠证据时，不因为超时本身就重发原任务。
+
+## stale-view：服务端已经有更多内容，页面只显示半截
+
+扩展会比较：
+
+- 当前页面最后一条 assistant message；
+- 同源 conversation snapshot 的 `current_node` / assistant message；
+- message id、文本长度、状态和更新时间。
+
+### server ahead
+
+服务端 message 更晚，或者同一 message 的服务端文本明显更长，说明浏览器视图陈旧。
+
+安全条件满足时只 reload 一次，目的是同步已经存在的服务端结果，不是重新提交任务。
+
+### server stalled
+
+服务端自己也显示 assistant 尚未完成，而且一段时间没有更新。扩展会更保守地等待，再允许一次 reload。
+
+### synced
+
+服务端和 DOM 一致且回合已结束，不执行恢复，交给正常 LLM 判断 / settled 流程。
+
+### unknown
+
+snapshot 接口失败、超时或结构不确定时 fail closed，不凭时间差猜测。
+
+## ChatGPT 显式“消息发送超时”
+
+如果页面明确出现 thread error / “消息发送超时，请重试”，扩展仍然先检查服务端 conversation state。
+
+- `current_node` 已进入 assistant：说明用户请求实际上已经提交，点击“重试”可能重复工具工作；优先 reload 同步。
+- `current_node` 仍停在 user：才允许点击 ChatGPT 自带 Retry 一次。
+- 无法确认 delivery：宁可做一次安全视图同步，也不盲目创建第二个用户回合。
+
+Retry 和 reload 都是有预算的。恢复预算用尽后进入明确的 `rollover_recommended` / failed 状态，而不是无限刷新。
+
+## 回复流中断
+
+如果 assistant 已经开始输出，但页面明确显示连接中断，占位文本本身不算“持续有进展”。
+
+只有 assistant 正文增长或签名变化才更新真实进度时间。持续断线且页面安全时，可以 reload 一次重新同步既有服务端回合；不会重新提交原用户任务。
+
+## 自动接力：为什么需要新的 conversation
+
+一个长时间 Herdr 项目可能产生几十轮用户/助手消息、MCP tool payload、Project 指令和系统上下文。即使可见正文看起来还不夸张，真实上下文压力也可能已经很高。
+
+ChatGPT 还会虚拟化旧 DOM，所以“当前页面只挂着 5 条消息”不代表对话真的很短。
+
+扩展使用保守的压力估算：
+
+- 可见用户/助手文本的近似 token；
+- `[data-testid="conversation-turn-N"]` 的最大绝对 turn 序号；
+- 持久化的只增不减 message-count floor；
+- 为 Project/system/tool payload 等不可见上下文预留余量。
+
+达到高压力只代表**可以考虑接力**，不代表立即切会话。自动接力还必须满足：
+
+- 当前 ChatGPT Project `自动 开`；
+- 已绑定 workspace；
+- workspace 不在 working；
+- 页面无 streaming / tool / 权限卡；
+- 没有人工未发送草稿；
+- 没有 delivery uncertainty；
+- 没有另一条 handoff 正在进行。
+
+## handoff 的 fail-closed 流程
+
+```text
+旧 Project conversation
+        │
+        │ 生成带 transfer-id 的紧凑 handoff packet
+        ▼
+同一 Project 新 conversation
+        │
+        │ 提交 seed
+        ▼
+确认新 conversation id + seed marker
+        │
+        └── 确认成功后才迁移 workspace binding
+```
+
+关键规则：**旧 binding 在 cutover 前始终是权威。**
+
+打开一个新 tab 不算成功；尝试发送 seed 也不算成功。必须确认新的 conversation identity 和 seed marker 真正存在，才迁移 binding。
+
+如果 seed delivery 不确定，则保留旧 binding，并记录可恢复状态。后续显式“恢复接力”先探测目标 conversation：seed 已存在就完成 cutover，不存在才重新尝试。
+
+## handoff packet 应该包含什么
+
+接力摘要的目的不是复述整段聊天，而是让新 planner 能继续工作。
+
+建议保留：
+
+- 当前目标；
+- 已完成工作；
+- 关键决定；
+- 未完成工作；
+- 已知 workspace / path / branch / commit / task id；
+- 安全约束；
+- 推荐下一步。
+
+不应该把摘要中的 runtime / Git 状态当成永久事实。新 conversation 开始 mutation 前仍需重新 inspect / Git check。
+
+## 手动接力
+
+手动接力适用于：
+
+- 你知道这条 conversation 已经很长；
+- 当前工作已经到自然边界；
+- 想主动在状态还清晰时换到新会话。
+
+当前支持已绑定的 ChatGPT Project，以及稳定 `/c/<chat_id>` 的 z.ai 会话。手动接力在当前作用域 `自动 开` 或 `自动 关` 时都可以启动；新目标会话继承源会话的 Auto 状态。接力期间源会话的自动 wake 暂停，workspace 仍有 working Agent 时则拒绝开始，避免 settled/wake 与 binding cutover 竞争。
+
+z.ai 的 handoff 控制消息走 raw channel，不经过 JSON→MCP task wrapper，避免摘要请求被误解释成 coding task。
+
+## 自动化为什么默认关闭
+
+连续工作能力很强，但它会主动向网页提交消息、处理部分页面动作和切换 conversation。
+
+因此新 Project / 新会话默认 `自动 关`。用户先观察 HUD、确认 binding 和事件流正确，再显式开启。
+
+这是一个有意的设计选择：**先让状态可见，再让状态自动推进。**
+
+## 验收一个 continuity 配置
+
+建议用一条真实长任务验证：
+
+1. 当前网页会话绑定一个 Herdr workspace；
+2. 打开对应作用域 Auto；
+3. 从网页派一个会持续一段时间的 Agent 任务；
+4. 确认 working 后 HUD 状态变化；
+5. 有真实新输出时收到 progress；
+6. workspace settled 后网页重新继续；
+7. 故意关闭/刷新页面后，binding 仍指向正确 conversation；
+8. 需要时测试手动 handoff，确认新会话 seed 存在后 binding 才迁移。
+
+测试命令和实现级细节保留在仓库测试与 [CHANGELOG](../../../CHANGELOG.md)，本页只描述当前产品行为。

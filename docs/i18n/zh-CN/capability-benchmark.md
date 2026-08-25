@@ -1,68 +1,261 @@
-# 能力对标
+# 能力基准与设计取舍：什么该吸收，什么不该复制
 
-读者：做架构取舍和 ADR 决策的 Maintainer / Contributor。本页不是安装教程，也不是普通用户日常使用指南。
+这篇面向 Maintainer / Contributor。它不是“谁功能更多”的产品对比，而是一份长期 ADR：当我们看到 Herdr、coding-tools-mcp、其它 MCP bridge 或新的 Coding Agent 能力时，判断它应该进入 herdr-mcp、复用原生能力，还是明确不做。
 
-> 目的：记录 herdr-mcp 对官方 Herdr、其他 Herdr MCP 实现与 coding-tools-mcp 的能力取舍，避免重复调研、盲目抄功能或扩大工具面。
+核心问题只有一个：
 
-## 设计原则
+> 这个能力是否让 **Web AI 更可靠地控制本机开发现场**，同时不复制 Herdr、Agent runtime 或已有系统已经做好的事情？
 
-herdr-mcp 的目标不是重新包装一遍 Herdr，也不是成为通用 coding sandbox。它服务“网页模型作为 planner，远程驱动本机 Herdr + 工作站”的场景，因此优先：
+## 先定义 herdr-mcp 自己的边界
 
-1. 固定、紧凑、可缓存的 MCP 工具面；
-2. 原生 Herdr socket 能力通过 `herdr_methods` + `herdr_call` 保持可达；
-3. 文件、Git、shell、图片等“远程网页本身拿不到的工作站能力”才做一等 MCP 工具；
-4. mutation 有明确的 delivery / idempotency / rollback 语义；
-5. ChatGPT 公网连接与本地 runtime 生命周期解耦；
-6. 不为了对标而增加重复 agent orchestration 层。
+herdr-mcp 不是：
 
-## 当前吸收矩阵
+- 第二个 Herdr；
+- 第二个 Coding Agent；
+- 通用远程 shell 产品；
+- workflow / recipe DSL；
+- 浏览器自动化框架。
 
-| 来源/思路 | 能力 | 当前状态 | herdr-mcp 的实现/决策 |
-|---|---|---|---|
-| coding-tools-mcp | 固定工具目录，不随 runtime/权限模式动态改 tools/list（当前上游固定 20 tools） | **已吸收原则，不照抄目录** | herdr-mcp production contract epoch 2 固定 18 tools，包含 `herdr_skill`。Herdr 约 90 个原生方法不逐一注册。 |
-| coding-tools-mcp | workspace 原语：read/list/search/patch | **已吸收** | `herdr_fs_read/list/grep/patch`，另保留 `write/edit` 作为 Herdr 场景的精确写入工具。 |
-| coding-tools-mcp | 多文件 patch 的原子性/失败清理 | **已吸收等价保证** | `herdr_fs_patch` + `commitAtomic`；新增文件提交失败会清理，写入受 managed-root/dirty/busy/readonly gates 约束。 |
-| coding-tools-mcp | 长命令使用独立 handle，可 read/kill | **已吸收** | `herdr_exec_start/read/kill`；与短命令 `herdr_exec` 分开。 |
-| coding-tools-mcp | Git 事实工具 | **部分吸收** | `herdr_git status/diff/log`；暂不单独增加 `show/blame`，需要时可走 `herdr_exec git ...`，避免扩大工具面。 |
-| coding-tools-mcp | 图片读取 | **已吸收** | `herdr_fs_image` 直接返回 MCP image。 |
-| coding-tools-mcp | HTTP session 与长命令 session 分层；command handle 可跨多次 tool call 继续交互 | **吸收核心思想，ChatGPT 适配不同** | 当前 coding-tools-mcp 的每个 `Mcp-Session-Id` 拥有独立 Runtime；herdr-mcp 为解决 ChatGPT 重启后复用 stale sid 的实际兼容问题，OpenAI/ChatGPT 路径反而保持无状态，而长命令状态独立归 `herdr_exec_start/read/kill` 管理。 |
-| coding-tools-mcp | structuredContent 作为稳定机器结果 | **已吸收** | 工具结果保留结构化结果；Relay 对完整 `CallToolResult` 透传，图片等非文本内容不丢失。 |
-| coding-tools-mcp | OAuth / PKCE / DCR / protected resource metadata | **已吸收并扩展** | Cloudflare Edge 终止 OAuth；DCR/CIMD、PKCE S256、refresh rotation、private_key_jwt、issuer continuity。 |
-| coding-tools-mcp | safe/trusted/dangerous command permission policy | **未照搬** | 当前采用 `READONLY` / `WRITE_ROOTS` / busy/dirty confirmation；shell 是明确的高能力边界，不伪装成完整 sandbox。 |
-| coding-tools-mcp | root project instructions 自动注入 initialize | **未吸收** | Herdr/Agent 指令归官方 skill 与具体 agent，自行扫描项目指令容易与 AGENTS/agent runtime 重复。 |
-| 官方 Herdr | live socket API 是事实源 | **已吸收** | `herdr_methods` 反射 live schema，`herdr_call` 做 schema-validated passthrough；不复制 90+ 方法。 |
-| 官方 Herdr | Agent Skill | **已吸收并完成 remote-planner 适配** | `herdr_skill` 是 epoch 2 的只读工具，返回项目策略 + 与 release 对齐的上游 Herdr guidance，并明确区分站外 Web planner 与 Herdr-managed pane 内 agent；网络失败时回退内置 skill。 |
-| 官方 Herdr | Plugin v1 / plugin registry / event hooks / link handlers | **原生可达，不新增专用 MCP tools** | 官方 plugin 能力继续由安装中的 Herdr 提供；`herdr_methods` + `herdr_call(plugin.*)` 可发现/调用 live socket surface。herdr-mcp 不复制一套 plugin 管理 API。 |
-| 官方 Herdr | agent prompt 生命周期/blocked/idle/done | **已吸收** | `herdr_prompt` 调原生 `agent.prompt`，默认 fire-and-forget；返回 delivery evidence，wait timeout 与 transport error 分离。 |
-| 官方 Herdr | events / session state / persistent background server | **已吸收适合网页的部分** | `herdr_since` cursor 增量恢复、SnapshotCache、`boot_id`；网页 planner 不需要暴露所有 session/lifecycle 方法。 |
-| herdr-mesh | agent-to-agent relay / handoff / wait/read | **部分吸收，刻意不做一工具一动作** | `herdr_prompt` + `herdr_since` + `herdr_call(agent.*)` 可完成同类流程；web planner 自己编排，不再增加 `handoff` 中间编排器。 |
-| herdr-mesh | 为每种 pane/workspace/session 操作建立独立 MCP tool | **不吸收** | 会造成工具目录膨胀；通过 `herdr_methods` + `herdr_call` 保留完整可达性。 |
-| DeepSeek Harness | `dsh --profile headless "job"` 非交互 coding agent | **已验证为备用 worker** | 本机 0.1.1-rc.2 实测可纯回答，也能在临时 Git repo 完成真实代码修改；最终回复可能晚于 60s，因此必须通过 `herdr_exec_start/read` 当长任务运行，timeout 后先查 Git/test 再决定是否重试。Pi/Herdr-native worker 仍优先。 |
-| dsh-tui | Harness 全屏交互 UI / session 接管 | **人工 fallback** | 本机 `@deepseek-harness-tui/dsh-tui@0.9.0` profile 可成功 compose；适合人类接管、恢复 session、审批和调试，不作为 Web planner 的默认机器调用接口。 |
-| 其他 herdr-mcp | recipe engine / React playground | **不吸收** | recipe 容易形成第二套 workflow DSL；本项目 planner 是网页模型。调试以 tests、CLI、真实 ChatGPT UAT 为准。 |
-| 其他 herdr-mcp | HTTP bridge | **已由产品架构覆盖** | `/mcp` + Cloudflare Worker/DO + WSS Link，且公网端与本机 runtime 生命周期解耦。 |
+它是 Web AI 与本机 Herdr/workstation 之间的控制面，所以最值得一等支持的是：
 
-## 本项目额外形成、不是简单对标复制的能力
+1. Web 模型原本拿不到的本机能力；
+2. 跨长任务、跨会话仍然可靠的运行状态；
+3. 公网到私有工作站之间稳定、安全的传输；
+4. mutation 的可观察性、幂等和失败语义。
 
-- `herdr_inspect`：把 workspace/tab/pane/agent、build、exec environment、managed roots 聚成一次廉价 snapshot。
-- `herdr_since`：面向“用户发消息才运行”的网页模型，用 cursor 只取新变化。
-- `herdr_prompt`：idempotency key、delivery evidence、TaskGroup 与 post-submit wait 的错误分层，禁止 mutation 盲重试。
-- `herdr_exec`：可见 utility pane；只有在投递前控制面失败时才 local fallback，投递后绝不双跑。
-- SnapshotCache + list-API fallback：Herdr `session.snapshot` 毛刺不再把远程文件/Git工作误判为业务阻塞。
-- Cloudflare stable Edge：OAuth、MCP transport、Durable Object、单 active link fencing、runtime offline 的结构化错误。
-- Runtime generation A/B：在**同一 contract epoch** 内原子切代、drain、rollback，不重启 Link；Edge heartbeat 同步当前 generation/version。跨 epoch 迁移单独受控执行。
-- 浏览器扩展反向通道：Herdr → `/push/events` → 浏览器 → 当前网页对话，补足 MCP 只有请求方向、长任务后网页不会自动继续的问题。
+## 一条判断公式
 
-## 暂不加入
+看到一个新功能时，可以按四问过滤：
 
-1. **后续 contract epoch 不允许隐式变化。** epoch 2 / `herdr_skill` 已成为 production 目标；以后任何 tool catalog 变化都必须冻结成新 epoch、显式迁移，并在新的 ChatGPT 对话中验证 tool snapshot。
-2. **不复制几十个 pane/agent/workspace MCP 工具。** Live Herdr API 通过两个通用工具可达。
-3. **不建立 recipe DSL / 第二 planner。** Web ChatGPT 是唯一高层 planner。
-4. **不宣称 shell sandbox。** 权限边界保持显式，后续若需要更强隔离单独设计。
-5. **不把浏览器扩展改成走公网 Worker。** 扩展是同机反向通道；当前版本通过 Native Messaging + runtime 权限为 `0600` 的 Unix Socket 通信，公网 OAuth 与本机静态 runtime 凭据继续分离，浏览器侧不接收 Herdr bearer。
+```text
+Web AI 缺吗？
+  ↓ yes
+Herdr 已原生提供吗？
+  ↓ yes → 透传/发现，不复制
+  ↓ no
+现有 fs/git/exec 原语能表达吗？
+  ↓ yes → 复用已有工具
+  ↓ no
+新增专用能力是否显著提升可靠性？
+  ↓ yes → 考虑进入 public surface
+```
 
-## 维护方式
+这套过滤器比“某个上游项目有，所以我们也要有”更重要。
 
-- 每次准备新增 MCP 工具，先判断是否能由 `herdr_call` 或现有工作站原语表达。
-- 每次对标上游项目，更新本表的“吸收 / 部分吸收 / 不吸收”结论，而不是直接复制 API。
-- production ChatGPT tool catalog 变更必须走新的 contract epoch；runtime 实现升级不等于 ABI 升级。
+## 取舍一：固定 MCP 工具面，而不是映射整个 Herdr API
+
+Herdr 原生 Socket API 很丰富，而且会持续演进。
+
+如果把每个 `workspace.*`、`pane.*`、`agent.*` 方法都注册成 MCP tool，会产生两个问题：
+
+- 每轮会话携带大量 schema；
+- Herdr 一升级，public MCP ABI 就跟着被动变化。
+
+因此 herdr-mcp 采用两层模型：
+
+```text
+高频远程工作
+  → 专用 MCP tools
+
+低频 Herdr 原生能力
+  → herdr_methods + herdr_call
+```
+
+当前 production contract 是 **epoch 2 / 18 tools**。以后 catalog 变化也必须显式进入新的 contract epoch，不能由一次 runtime 重构顺手改变。
+
+## 取舍二：文件 / Git / Shell 必须是一等能力
+
+这些不是 Herdr 的职责，但恰恰是 Web AI 最缺的东西。
+
+因此 herdr-mcp 提供：
+
+- `herdr_fs_read/list/grep/image`；
+- `herdr_fs_edit/write/patch`；
+- `herdr_git`；
+- `herdr_exec`；
+- `herdr_exec_start/read/kill`。
+
+这类操作通常是确定性的，不需要额外启动本地 Agent。
+
+设计目标不是让 Agent “代替终端”，而是让 Web planner 像工程师一样直接使用终端和仓库事实。
+
+## 取舍三：长命令拥有自己的生命周期
+
+HTTP/MCP request 和实际命令生命周期不是一回事。
+
+一个 build、测试或本地服务可能运行数分钟甚至数小时。把它绑死在一次同步 tool call 上会产生 timeout、重复执行和无法取消的问题。
+
+因此：
+
+```text
+短命令
+  → herdr_exec
+
+长命令
+  → herdr_exec_start
+        ↓
+     read / kill
+```
+
+这种 handle 模型值得吸收，因为它解决的是 Web AI 的真实远程执行问题，而不是复制一个 Agent API。
+
+## 取舍四：Git 事实保持确定性
+
+`git status`、`git diff`、`git log` 不需要再让一个模型解释后执行。
+
+`herdr_git` 的价值是：
+
+- 直接；
+- 可验证；
+- 不依赖 Agent；
+- mutation 后能作为完成证据。
+
+暂时没有为每个 Git 子命令新增专用 tool。低频 `show`、`blame` 等可以在安全边界内通过 exec 完成。只有当某个操作频繁到值得稳定 schema 时才考虑升格。
+
+## 取舍五：Mutation 的失败语义比“自动重试”更重要
+
+远程开发最危险的不是一次失败，而是**动作已经发生、客户端却以为没发生**。
+
+因此 herdr-mcp 倾向吸收：
+
+- delivery state；
+- idempotency key；
+- post-submit wait 与 transport failure 分离；
+- uncertain delivery 后先重新观察。
+
+而不是吸收“失败就自动 retry”的简单策略。
+
+这个原则同时作用于：
+
+- Agent prompt；
+- shell command；
+- Runtime activation；
+- Cloudflare/DNS mutation；
+- browser handoff。
+
+## 取舍六：Shell 不伪装成 sandbox
+
+有些工具会把命令分为 safe / dangerous，再让系统看起来像一个强隔离环境。
+
+herdr-mcp 不宣称 shell 已被 sandbox。
+
+真实边界是：
+
+- `herdr_fs_*` 受 managed root / secret-path / write gate 限制；
+- `herdr_exec` 则拥有当前工作站用户可以执行的 shell 权限。
+
+如果未来需要容器级隔离，应作为独立安全架构设计，而不是在一个参数里假装已经解决。
+
+## 取舍七：项目指令不自动重复扫描
+
+本地 Coding Agent 通常已经有自己的 `AGENTS.md`、项目规则、skill 或 runtime instruction 机制。
+
+herdr-mcp 不再额外扫描并注入一套“项目指令汇总”，避免：
+
+- 重复上下文；
+- 指令优先级冲突；
+- Web planner 和本地 Agent 看到不同规则。
+
+远程 planner 自身的操作策略由 `herdr_skill` 提供；具体项目规则由实际项目和 Agent runtime 管理。
+
+## 取舍八：浏览器扩展只补 MCP 缺失的方向
+
+标准 MCP 是请求驱动：
+
+```text
+Web AI → workstation
+```
+
+它无法让一个已结束的浏览器 turn 因为本地 Agent 后来完成而自己重新开始。
+
+所以 extension 增加：
+
+```text
+workstation → browser conversation
+```
+
+这里值得吸收的是：
+
+- workspace binding；
+- progress / settled；
+- evidence-first recovery；
+- fail-closed handoff；
+- 没有原生 MCP 的网页站点 JSON→MCP bridge。
+
+不值得扩张成通用网页自动化平台。
+
+## 取舍九：公网入口与本机 Runtime 解耦
+
+公网 Connector URL 应稳定，本机 runtime 应可升级。
+
+因此：
+
+- Cloudflare Edge 管 OAuth / public MCP / workstation routing；
+- `herdr-link` 维持出站 WSS；
+- Runtime A/B 管本机 generation。
+
+这比“Tunnel 直接打到某一个 Node 进程”复杂一点，但换来了：
+
+- Runtime 升级不改 Connector；
+- 回滚不改公网 URL；
+- workstation 生命周期与 OAuth identity 分离。
+
+## 取舍十：Local Agent 是 worker，不是第二个 planner
+
+任何本地 Agent 都可能成为有用 worker：Pi、Cline、OpenCode、DSH 或未来的新工具。
+
+选择标准不是品牌，而是：
+
+- 能否无头/自动化运行；
+- 是否有稳定的状态或输出边界；
+- 是否能限制工作范围；
+- 是否容易验证结果；
+- 超时后能否判断 mutation 是否已经发生。
+
+herdr-mcp 不再为每种 Agent 建一个专门 MCP tool。Herdr-native Agent 优先走 `herdr_prompt`；非 Herdr CLI 在必要时通过长 exec session 使用。
+
+详见 [Worker 备选](worker-fallbacks.md)。
+
+## 当前能力矩阵
+
+| 能力 | 决策 | 原因 |
+|---|---|---|
+| Herdr workspace/pane/agent 原生 API | 动态透传 | 避免复制 90+ API |
+| 文件 read/search/patch | 一等 MCP | Web AI 原本不可达 |
+| Git status/diff/log | 一等 MCP | 高频确定性事实 |
+| 长命令 session | 一等 MCP | 生命周期跨 tool call |
+| 图片读取 | 一等 MCP | Web AI 需要真实像素上下文 |
+| Agent prompt | 薄封装 | 需要 delivery/idempotency 语义 |
+| recipe/workflow DSL | 不做 | Web AI 已是 planner |
+| 第二套 Agent registry | 不做 | Herdr 已负责 |
+| 自动扫描项目 instructions | 不做 | 避免和 Agent runtime 重复 |
+| shell “安全等级”伪 sandbox | 不做 | 安全边界必须真实 |
+| Browser progress / recovery / handoff | 做 | 补足请求式 MCP 的时间连续性 |
+| JSON→MCP bridge | 有限做 | 只为无原生 MCP Connector 的站点兼容 |
+| Runtime A/B | 做 | 稳定 Connector 与本机升级解耦 |
+| Custom Domain | 可选 | 稳定命名，不是核心能力前置 |
+
+## 新增能力的准入规则
+
+准备新增一个 MCP tool 或一个自动化模块前，至少回答：
+
+1. 现有 `herdr_call` 能不能表达？
+2. 现有 fs/git/exec 能不能表达？
+3. 为什么需要稳定 public schema？
+4. 会不会增加每轮上下文负担？
+5. mutation 怎么判断“是否已经发生”？
+6. 失败怎么恢复？
+7. 能不能真实测试，而不是只写一个 wrapper？
+8. 是否正在复制 Herdr / Agent / Cloudflare 已有能力？
+
+没有清楚答案，就先不扩张。
+
+## 维护这篇文档的方法
+
+这不是历史实验日志。
+
+当上游项目或 Herdr 出现新能力时，更新的是**取舍结论**；具体版本、冒烟日期、某次 UAT 和一次性 bug 证据应进入 CHANGELOG、issue 或实验记录。
+
+这样 capability benchmark 才能长期回答一个有价值的问题：
+
+> herdr-mcp 为什么长成现在这样，以及下一项能力是否真的值得进入它的边界。

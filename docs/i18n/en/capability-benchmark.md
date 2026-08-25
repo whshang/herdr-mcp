@@ -1,68 +1,249 @@
-# Capability benchmark
+# Capability benchmark and design choices: what to absorb, what not to copy
 
-Audience: maintainers and contributors making design/ADR decisions. This is not an installation or everyday usage guide.
+This page is for maintainers and contributors. It is not a feature-count comparison. It is a long-lived ADR for deciding whether a capability from Herdr, another MCP implementation, a coding-agent framework or a browser integration belongs in herdr-mcp.
 
-> Purpose: record herdr-mcp's capability trade-offs against official Herdr, other Herdr MCP implementations and coding-tools-mcp, so research is not repeated, features are not blindly copied, and the tool surface does not bloat.
+The question is:
 
-## Design principles
+> Does this capability make a Web AI more reliable at controlling a local development environment without duplicating Herdr, the agent runtime or another system that already owns the problem?
 
-herdr-mcp's goal is not to re-wrap Herdr, nor to become a generic coding sandbox. It serves "the web model as planner, remotely driving local Herdr + workstation", so it prioritizes:
+## Define the boundary first
 
-1. a fixed, compact, cacheable MCP tool surface;
-2. native Herdr socket capabilities staying reachable through `herdr_methods` + `herdr_call`;
-3. first-class MCP tools only for "workstation capabilities the remote web itself cannot get": files, Git, shell, images;
-4. explicit delivery / idempotency / rollback semantics for mutations;
-5. decoupling the ChatGPT public connection from the local runtime lifecycle;
-6. no duplicate agent-orchestration layer just to match some benchmark.
+herdr-mcp is not:
 
-## Current adoption matrix
+- a second Herdr;
+- another coding agent;
+- a generic remote-shell product;
+- a workflow/recipe DSL;
+- a general browser-automation framework.
 
-| Source/idea | Capability | Current status | herdr-mcp implementation/decision |
-|---|---|---|---|
-| coding-tools-mcp | fixed tool catalog; tools/list does not change dynamically with runtime/permission mode (upstream currently fixes 20 tools) | **principle adopted, catalog not copied** | herdr-mcp production contract epoch 2 fixes 18 tools, including `herdr_skill`. Herdr's ~90 native methods are not registered one by one. |
-| coding-tools-mcp | workspace primitives: read/list/search/patch | **adopted** | `herdr_fs_read/list/grep/patch`; `write/edit` kept as precise write tools for the Herdr scenario. |
-| coding-tools-mcp | atomicity / failure cleanup of multi-file patches | **equivalent guarantee adopted** | `herdr_fs_patch` + `commitAtomic`; failed new-file commits are cleaned up; writes are gated by managed-root/dirty/busy/readonly gates. |
-| coding-tools-mcp | long commands use a separate handle, readable/killable | **adopted** | `herdr_exec_start/read/kill`; separate from the short command `herdr_exec`. |
-| coding-tools-mcp | Git fact tools | **partially adopted** | `herdr_git status/diff/log`; no separate `show/blame` for now; use `herdr_exec git ...` when needed, to avoid widening the surface. |
-| coding-tools-mcp | image reading | **adopted** | `herdr_fs_image` returns an MCP image directly. |
-| coding-tools-mcp | HTTP session layered with long-command session; command handle can continue across tool calls | **core idea adopted, ChatGPT adaptation differs** | each coding-tools-mcp `Mcp-Session-Id` owns an independent Runtime; for ChatGPT's real compatibility problem with reusing stale sids after restart, the OpenAI/ChatGPT path instead stays stateless, and long-command state is managed separately via `herdr_exec_start/read/kill`. |
-| coding-tools-mcp | structuredContent as stable machine results | **adopted** | tool results keep structured results; Relay passes the complete `CallToolResult` through, so non-text content like images is not lost. |
-| coding-tools-mcp | OAuth / PKCE / DCR / protected resource metadata | **adopted and extended** | the Cloudflare Edge terminates OAuth; DCR/CIMD, PKCE S256, refresh rotation, private_key_jwt, issuer continuity. |
-| coding-tools-mcp | safe/trusted/dangerous command permission policy | **not copied** | currently `READONLY` / `WRITE_ROOTS` / busy/dirty confirmations; shell is an explicitly high-capability boundary, not disguised as a full sandbox. |
-| coding-tools-mcp | root project instructions auto-injected at initialize | **not adopted** | Herdr/Agent directives belong to the official skill and the concrete agent; scanning project directives ourselves would duplicate AGENTS/agent runtime. |
-| official Herdr | live socket API is the source of truth | **adopted** | `herdr_methods` reflects the live schema; `herdr_call` does schema-validated passthrough; the 90+ methods are not duplicated. |
-| official Herdr | Agent Skill | **adopted with remote-planner adaptation** | `herdr_skill` is a read-only epoch-2 tool. It returns the project policy plus release-matched upstream Herdr guidance, explicitly distinguishing the off-site web planner from agents running inside Herdr-managed panes; network failure falls back to the bundled skill. |
-| official Herdr | Plugin v1 / plugin registry / event hooks / link handlers | **natively reachable, no dedicated MCP tools added** | official plugin capabilities remain provided by the installed Herdr; `herdr_methods` + `herdr_call(plugin.*)` can discover/call the live socket surface. herdr-mcp does not duplicate a plugin management API. |
-| official Herdr | agent prompt lifecycle / blocked / idle / done | **adopted** | `herdr_prompt` calls native `agent.prompt`, default fire-and-forget; returns delivery evidence; wait timeout and transport error are separated. |
-| official Herdr | events / session state / persistent background server | **web-suited parts adopted** | `herdr_since` cursor incremental recovery, SnapshotCache, `boot_id`; the web planner does not need every session/lifecycle method exposed. |
-| herdr-mesh | agent-to-agent relay / handoff / wait/read | **partially adopted, deliberately not one-tool-per-action** | `herdr_prompt` + `herdr_since` + `herdr_call(agent.*)` can perform the same class of flow; the web planner orchestrates itself, no `handoff` intermediate orchestrator added. |
-| herdr-mesh | a dedicated MCP tool for every pane/workspace/session operation | **not adopted** | would bloat the catalog; full reachability is preserved through `herdr_methods` + `herdr_call`. |
-| DeepSeek Harness | `dsh --profile headless "job"` non-interactive coding agent | **verified as a backup worker** | local 0.1.1-rc.2 can answer pure questions and complete a real code change in a temporary Git repo; the final reply may come later than 60s, so it must run as a long task via `herdr_exec_start/read`; after a timeout check Git/tests before deciding to retry. Pi/Herdr-native workers stay preferred. |
-| dsh-tui | Harness full-screen interactive UI / session takeover | **human fallback** | the local `@deepseek-harness-tui/dsh-tui@0.9.0` profile composable successfully; for humans taking over, resuming sessions, approvals, and debugging — not the default machine-call interface for the web planner. |
-| other herdr-mcp | recipe engine / React playground | **not adopted** | recipes become a second workflow DSL easily; this project's planner is the web model. Debugging is via tests, CLI, and real ChatGPT UAT. |
-| other herdr-mcp | HTTP bridge | **covered by the product architecture** | `/mcp` + Cloudflare Worker/DO + WSS Link, with the public side decoupled from the local runtime lifecycle. |
+It is the control plane between a Web AI and a local Herdr/workstation. The highest-value first-class capabilities are therefore:
 
-## Capabilities this project formed itself, not simple benchmark copies
+1. workstation capabilities the Web model cannot otherwise reach;
+2. persistent state across long tasks and conversations;
+3. a stable and secure path from the public Web to a private workstation;
+4. observable mutation, delivery and recovery semantics.
 
-- `herdr_inspect`: aggregates workspace/tab/pane/agent, build, exec environment, managed roots into one cheap snapshot.
-- `herdr_since`: for the "run only when the user sends a message" web model, a cursor that fetches only new changes.
-- `herdr_prompt`: idempotency key, delivery evidence, error layering for TaskGroup vs post-submit wait; no blind mutation retries.
-- `herdr_exec`: visible utility pane; local fallback only when control-plane failure happens before delivery; never double-runs after delivery.
-- SnapshotCache + list-API fallback: Herdr `session.snapshot` blips no longer misjudge remote file/Git work as business blockers.
-- Cloudflare stable Edge: OAuth, MCP transport, Durable Object, single active-link fencing, structured errors for runtime offline.
-- Runtime generation A/B: atomic generation switch, drain and rollback within the **same contract epoch** without restarting the Link; Edge heartbeat syncs the current generation/version. Cross-epoch migration is supervised separately.
-- Browser extension reverse channel: Herdr → `/push/events` → browser → the current web conversation, filling the gap that MCP is request-direction-only and a long task does not auto-continue the web conversation.
+## A decision filter
 
-## Not added yet
+When evaluating a new capability, ask:
 
-1. **Do not expose a future contract epoch implicitly.** Epoch 2 / `herdr_skill` is now the production target; any later tool-catalog change must be captured as a new frozen epoch, migrated explicitly, and verified in a fresh ChatGPT conversation.
-2. **Do not copy dozens of pane/agent/workspace MCP tools.** The live Herdr API is reachable through two generic tools.
-3. **No recipe DSL / second planner.** Web ChatGPT is the only high-level planner.
-4. **No shell sandbox claim.** The permission boundary stays explicit; stronger isolation, if ever needed, gets designed separately.
-5. **The browser extension does not go through the public Worker.** The extension is a same-machine reverse channel. Current builds use Native Messaging plus the runtime's mode-`0600` Unix socket, so public OAuth and the local static runtime credential remain separate and the browser receives no Herdr bearer.
+```text
+Does the Web planner actually lack it?
+  ↓ yes
+Does Herdr already expose it natively?
+  ↓ yes → discover/passthrough, do not duplicate
+  ↓ no
+Can existing fs/git/exec primitives express it?
+  ↓ yes → reuse them
+  ↓ no
+Would a dedicated capability materially improve reliability?
+  ↓ yes → consider a stable public surface
+```
 
-## Maintenance
+This matters more than “another project has a tool for it.”
 
-- Before adding any new MCP tool, judge whether `herdr_call` or existing workstation primitives can express it.
-- Every time a benchmark project is compared, update this table's "adopted / partially adopted / not adopted" verdicts instead of copying APIs.
-- Production ChatGPT tool-catalog changes must go through a new contract epoch; runtime implementation upgrades are not ABI upgrades.
+## Choice 1: fixed public MCP surface, dynamic Herdr long tail
+
+Herdr's native Socket API is broad and evolving. Registering every `workspace.*`, `pane.*` and `agent.*` method as a public MCP tool would:
+
+- inflate the schema carried into each conversation;
+- couple Herdr upgrades to the ChatGPT public ABI.
+
+So herdr-mcp uses two layers:
+
+```text
+high-frequency remote work
+  → dedicated MCP tools
+
+long-tail native Herdr operations
+  → herdr_methods + herdr_call
+```
+
+The current production contract is **epoch 2 / 18 tools**. Future catalog changes require explicit contract epochs rather than incidental runtime changes.
+
+## Choice 2: files, Git and shell are first-class
+
+These are not Herdr's responsibility, but they are exactly what a remote Web model cannot access by itself.
+
+First-class capabilities include:
+
+- file read/list/search/image;
+- exact edit/write/patch;
+- Git status/diff/log;
+- short shell commands;
+- long-running command sessions.
+
+Deterministic repository work should not require launching another model.
+
+## Choice 3: long commands have their own lifecycle
+
+A build, test or development server may outlive one MCP request. Binding command lifetime to a synchronous HTTP request creates timeout and duplicate-execution risk.
+
+So:
+
+```text
+short command
+  → herdr_exec
+
+long command
+  → herdr_exec_start
+        ↓
+     read / kill
+```
+
+A handle-based command lifecycle solves a real remote-execution problem without inventing another agent abstraction.
+
+## Choice 4: Git facts remain deterministic
+
+`git status`, `git diff` and `git log` do not benefit from an extra model in the loop.
+
+`herdr_git` exists because direct facts are:
+
+- cheaper;
+- faster;
+- easier to verify;
+- useful as mutation-completion evidence.
+
+Low-frequency Git commands can still go through shell. A dedicated public tool is justified only when stable schema and frequent use are worth the added surface.
+
+## Choice 5: mutation semantics matter more than automatic retry
+
+The dangerous remote failure is:
+
+```text
+mutation happened
+  ↓
+response was lost
+```
+
+So herdr-mcp favors:
+
+- delivery evidence;
+- idempotency keys;
+- transport failure separated from post-submit waiting;
+- state inspection before retrying uncertain mutation.
+
+This applies to agent prompts, shell commands, runtime activation, Cloudflare/DNS changes and browser handoff.
+
+“Retry on error” is not a safe generic policy for a development control plane.
+
+## Choice 6: shell is not presented as a sandbox
+
+Some systems classify commands as safe/trusted/dangerous and can give the impression of strong isolation.
+
+herdr-mcp keeps the real boundary explicit:
+
+- `herdr_fs_*` is constrained by managed roots, write gates and secret-ish path filtering;
+- `herdr_exec` runs as the workstation user and is a stronger capability.
+
+If container-grade isolation is needed, it should be designed as an actual security architecture rather than implied by a flag.
+
+## Choice 7: do not duplicate project-instruction systems
+
+Coding agents already have their own project instructions, skills or `AGENTS.md`-style mechanisms.
+
+herdr-mcp does not build another automatic project-instruction scanner because that would create:
+
+- duplicated context;
+- priority conflicts;
+- inconsistent rules between the Web planner and local workers.
+
+Remote-planner operating policy belongs in `herdr_skill`; project-specific rules remain owned by the project and the agent runtime actually executing them.
+
+## Choice 8: the browser extension only fills missing directions
+
+Request-driven MCP provides:
+
+```text
+Web AI → workstation
+```
+
+It does not make a finished local task start a new browser turn later.
+
+The extension therefore provides the missing time/return direction:
+
+```text
+workstation → browser conversation
+```
+
+Worthwhile extension capabilities include:
+
+- workspace binding;
+- progress / settled;
+- evidence-first recovery;
+- fail-closed handoff;
+- a bounded JSON→MCP bridge for sites without a native Connector.
+
+The project intentionally does not expand that into general-purpose browser automation.
+
+## Choice 9: public Edge and local runtime are decoupled
+
+A Connector URL should be stable while a local runtime should be upgradeable.
+
+That leads to:
+
+- Cloudflare Edge for OAuth/public MCP/workstation routing;
+- `herdr-link` for the persistent outbound WSS;
+- Runtime A/B for local generation changes.
+
+This is more structured than tunneling directly to one Node process, but it allows runtime upgrade/rollback without changing the public identity.
+
+## Choice 10: local agents are workers, not another planner
+
+Pi, Cline, OpenCode, DSH or future coding-agent CLIs can all be useful workers.
+
+The durable selection criteria are:
+
+- headless/automatable operation;
+- observable state;
+- bounded task ownership;
+- verifiable results;
+- the ability to determine whether mutation occurred after timeout.
+
+Herdr-native workers use `herdr_prompt`; external CLIs can use long exec sessions when appropriate.
+
+See [Worker fallbacks](worker-fallbacks.md).
+
+## Current decision matrix
+
+| Capability | Decision | Why |
+|---|---|---|
+| Herdr workspace/pane/agent API | dynamic passthrough | avoid copying the native API surface |
+| file read/search/patch | first-class MCP | otherwise unreachable to the Web planner |
+| Git status/diff/log | first-class MCP | frequent deterministic evidence |
+| long command session | first-class MCP | lifecycle crosses tool calls |
+| image read | first-class MCP | real pixel context for the Web model |
+| agent prompt | thin wrapper | delivery/idempotency semantics matter |
+| recipe/workflow DSL | do not build | Web AI is already the planner |
+| second agent registry | do not build | Herdr already owns it |
+| automatic project-instruction scanning | do not build | avoid duplicating agent-runtime policy |
+| shell pseudo-sandbox | do not claim | security boundaries must be real |
+| browser progress/recovery/handoff | build | fills MCP's temporal/return gap |
+| JSON→MCP bridge | bounded compatibility | only for sites without native custom MCP |
+| Runtime A/B | build | decouples Connector identity from local upgrades |
+| Custom Domain | optional | stable naming, not a product prerequisite |
+
+## Admission rules for a new capability
+
+Before adding a public tool or automation module, answer:
+
+1. Can `herdr_call` already express it?
+2. Can existing fs/git/exec primitives express it?
+3. Why does it need a stable public schema?
+4. What is the per-turn context cost?
+5. How do we know whether a mutation already happened?
+6. How does failure recover?
+7. Can it be tested against real behavior rather than only a wrapper unit test?
+8. Are we duplicating Herdr, the agent runtime or Cloudflare?
+
+If those answers are unclear, do not expand the surface yet.
+
+## How to maintain this page
+
+This is not an experiment log.
+
+When an upstream tool or project introduces a new capability, update the **decision** here. Put exact versions, smoke-test dates, one-off UAT results and bug evidence in CHANGELOG, issues or experiment records.
+
+That keeps this page useful for the question that matters over time:
+
+> Why is herdr-mcp shaped this way, and is the next capability actually worth bringing inside its boundary?

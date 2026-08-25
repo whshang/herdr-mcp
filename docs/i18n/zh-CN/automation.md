@@ -1,110 +1,248 @@
-# 自动化
+# 自动化：把文档、Edge 和本机 Runtime 分成三个发布平面
 
-读者：维护 CI/CD、Pages、生产 Edge 部署和本机 runtime 发布流程的 Maintainer。普通用户第一次安装不需要读本页。
+这篇面向维护者。普通用户第一次安装 herdr-mcp 不需要理解全部 CI/CD 细节。
 
-herdr-mcp 有三条刻意分离的自动化平面。它们共享版本控制，但不共享凭据或故障域。
+herdr-mcp 有三类自动化，而且刻意不把它们揉成一个“大部署按钮”：
 
-## 1. GitHub Pages
+```text
+文档平面          公网 Edge 平面          本机 Runtime 平面
+GitHub Pages       Cloudflare Worker       runtime generation A/B
+     │                    │                       │
+给人和 agent 阅读      OAuth / MCP / WSS       fs / git / shell / Herdr
+```
 
-Workflow：`.github/workflows/pages.yml`
+它们共享同一个 Git 仓库，但应该拥有不同的凭据、健康检查、回滚方式和故障域。
 
-发布的站点：
+## 为什么要分三个发布平面
+
+如果一个 commit 同时能：
+
+- 改公开文档；
+- 改 OAuth issuer；
+- 改 Cloudflare 路由；
+- 替换本机 runtime；
+- 修改 ChatGPT tool contract；
+
+那么一次普通修复的爆炸半径会非常大。
+
+herdr-mcp 的发布原则是：**只改变本次任务真正需要改变的平面。**
+
+例如：
+
+- 修文档 → 只发布 Pages；
+- 修 Edge relay → 只发布 Worker；
+- 修 `herdr_fs_*` → 只切本机 runtime generation；
+- 改 public tool catalog → 走独立 contract epoch migration。
+
+## 1. GitHub Pages：人类文档和 Agent 策略
+
+Workflow：
+
+```text
+.github/workflows/pages.yml
+```
+
+站点：
 
 ```text
 https://whshang.github.io/herdr-mcp/
 ```
 
-Pages artifact 包含：
-
-- `site/` — 静态产品/安装页；
-- 每个被跟踪的 `docs/*.md` 页面（排除 `docs/_wip/`）渲染出的 HTML；
-- `herdr-mcp-SKILL.md` — 从 `assets/herdr-mcp-SKILL.md` 拷贝的公网 remote-planner 策略；
-- `release.json` — 当前包版本 + Git commit + docs/skill 位置。
-
-仓库是公开的，Pages 使用仓库原生的 GitHub Pages 部署。`npm run build:site` 是 CI 与 Pages workflow 共用的唯一构建路径，所以文档改动不可能绕过用于发布的同一个静态站点构建。
-
-这让 Pages 既是给人看的文档站，也是 `herdr_skill` 的无凭据更新源。
-
-`herdr_skill` 默认使用 Pages skill URL，缓存它，并在 Pages/网络不可用时回退到 release 内置的 `assets/herdr-mcp-SKILL.md`。设置 `HERDR_SKILL_NETWORK=0` 可完全离线，或用 `HERDR_MCP_SKILL_URL` 覆盖策略 endpoint。
-
-## 2. CI
-
-Workflow：`.github/workflows/ci.yml`
-
-每次推送到 `main` 与每个 pull request 都运行：
-
-1. `npm ci`；
-2. TypeScript 构建；
-3. 文档站构建（`npm run build:site`）；
-4. root 测试套件；
-5. Edge/frozen-contract 套件；
-6. 浏览器扩展冒烟；
-7. shell 语法检查；
-8. npm 包 dry-run；
-9. `git diff --check`。
-
-Root runtime 版本可以与 ChatGPT 公网 contract epoch 独立演进。当前 production 冻结 epoch 2 为 18 tools；epoch-1 兼容测试只用于证明历史 17-tool 回滚/旧会话 ABI 仍可精确复现。
-
-## 3. Cloudflare Edge 生产部署
-
-Workflow：`.github/workflows/cloudflare-edge.yml`
-
-该 workflow 只对影响 Edge/Relay/package 部署面的 `main` 改动运行，或手动触发。它先跑 Edge/contract 与 root 回归闸门，然后用 `cloudflare/wrangler-action@v4` 与 Wrangler major 4 部署 `edge/cloudflare/wrangler.prod.toml`。
-
-部署 job 使用 GitHub Environment：
-
-```text
-production
-```
-
-必需的 Environment secrets：
-
-```text
-CLOUDFLARE_ACCOUNT_ID
-CLOUDFLARE_API_TOKEN
-```
-
-最小权限目标是目标 Account 的 **Workers Scripts Write only**。当前预置的 GitHub Environment secret 复用了已有的 Herdr cutover 凭据，它带 **Workers Scripts Write + Workers Routes Write**，仍然没有 DNS Write、Tunnel Edit 或 Account Admin。这足够部署，但在能签发 API token 的 bootstrap 凭据可用时应换成 scripts-only token。部署 workflow 刻意不改动 Custom Domain 所有权/路由。
-
-部署后 workflow 检查独立的 workers.dev health endpoint。现有 Custom Domain 继续指向同一个 Worker service。
-
-## 4. 本机 runtime 自升级
-
-CLI：`herdr-self-update`
-
-Runtime release 平面刻意与 Cloudflare 部署分开。升级本机 herdr-mcp 不得重启公网 Edge 或持久 `herdr-link`。
-
-典型远程 planner 流程：
+唯一站点构建入口：
 
 ```bash
-herdr-self-update status
-herdr-self-update check
-herdr-self-update apply --source remote --ref main
+npm run build:site
 ```
 
-测试未提交的开发树：
+构建器读取 `docs/i18n/en` 与 `docs/i18n/zh-CN` 的逻辑文档集合，生成双语 HTML、导航、搜索索引和首页资源。
+
+Pages 还发布 Agent 可读的项目 skill 和 release metadata，因此它同时承担两种角色：
+
+```text
+Human docs
+  └─ HTML 文档站
+
+Remote planner policy
+  └─ herdr-mcp-SKILL.md
+```
+
+`herdr_skill` 可以读取上游项目策略；网络不可用时回退到 release 内置副本。设置 `HERDR_SKILL_NETWORK=0` 可强制完全离线。
+
+### 文档发布 gate
+
+文档修改至少要通过：
 
 ```bash
-herdr-self-update apply --source working-tree
+npm run build:site
+git diff --check
 ```
 
-`apply` 启动一个 detached supervisor，在当前 MCP runtime 被重启之前返回。Worker 在 `~/.config/herdr-mcp/` 下记录结构化进度，构建/测试一个隔离 release，启动 loopback candidate，用持久 generation manager 验证并激活它，从新 release 重载稳定 8772 runtime，提升新的 stable generation 并移除临时 candidate。
+站点构建同时检查双语 slug 是否完整，因此新增正式章节不能只创建中文或只创建英文版本。
 
-Updater 继承当前 contract profile。它**不会**自动改变 ChatGPT contract epoch、DNS、OAuth issuer、Custom Domain 或 Edge 部署。
+## 2. CI：证明一个 commit 没破坏其它平面
 
-升级后，从同一个远程 Connector 验证：
+主 CI：
 
-- `herdr_inspect` 报告新 runtime 版本；
-- generation status 报告新的 stable generation；
-- Edge `/status/<workstation>` 收敛到该 version/generation；
-- 除非是有意的 contract 迁移，公网 contract epoch/hash 保持不变。
+```text
+.github/workflows/ci.yml
+```
 
-## 5. `herdr_skill` 职责
+CI 的目的不是“部署一切”，而是给各个平面提供共享证据。
 
-`herdr_skill` 不只是官方 Herdr 使用教程。它组合三层：
+典型 gate 包括：
 
-1. **herdr-mcp 项目策略** — 直接编辑/工具顺序、agent 派发偏好、mutation/幂等规则、浏览器边界与自维护流程；
-2. **live runtime 上下文** — 运行版本、contract profile、generation/self-update 状态；
-3. **与 release 匹配的原生 Herdr 参考** — `herdr --skill`，明确限定为 pane-local 参考，这样它的 `HERDR_ENV=1` 规则不会错误地拦住远程网页 planner。
+- dependency install；
+- TypeScript build；
+- 文档站 build；
+- root runtime tests；
+- Edge / frozen-contract tests；
+- 浏览器扩展 smoke；
+- shell syntax；
+- package dry-run；
+- `git diff --check`。
 
-项目策略对 ChatGPT/Web 用法有优先级。`herdr_methods` 仍是已安装原生 socket 方法名与 schema 的 live 权威。
+### Contract 测试为什么独立重要
+
+Runtime implementation 可以频繁变化，但 ChatGPT 看到的 public MCP catalog 不应该悄悄变化。
+
+当前 production contract 是 **epoch 2 / 18 tools**。兼容测试可以保留历史 epoch 作为 rollback evidence，但普通 runtime commit 不应该因为“顺手改了 schema”就改变公开 ABI。
+
+## 3. Cloudflare Edge：稳定公网入口
+
+Workflow：
+
+```text
+.github/workflows/cloudflare-edge.yml
+```
+
+Edge workflow 只负责公网控制面，例如：
+
+- Worker / Durable Object；
+- OAuth；
+- MCP relay；
+- workstation routing；
+- post-deploy health。
+
+生产部署凭据放在 GitHub Environment / Secrets，不进入仓库。
+
+### Edge workflow 不应该顺手做什么
+
+普通 Worker code deployment 不应该自动：
+
+- 改 Custom Domain；
+- 改 DNS；
+- 停旧 Tunnel；
+- 改 OAuth issuer；
+- 改 workstation identity；
+- 改本机 runtime generation。
+
+Domain/DNS cutover 是另一类 mutation，必须独立验证和独立回滚。
+
+详见 [Cloudflare Edge 部署](cloudflare-edge-deployment.md) 与 [Cloudflare Edge 凭据](cloudflare-edge-token.md)。
+
+## 4. 本机 Runtime：A/B，而不是原地覆盖
+
+本机 runtime 发布使用 generation 机制：
+
+```text
+stable runtime A
+       │
+       ├─ candidate B 启动
+       ├─ health / contract gate
+       ├─ activate B
+       └─ 保留 A 作为 rollback target
+```
+
+常用入口：
+
+```bash
+bin/herdr-runtime-generation status
+bin/herdr-self-update status
+bin/herdr-self-update check
+```
+
+`herdr-self-update` 的目标是把“构建 candidate → 验证 → activate → 观察”自动化，而不是把当前运行目录直接覆盖掉。
+
+它继承当前 contract profile，不负责：
+
+- contract epoch migration；
+- Edge deployment；
+- OAuth issuer 迁移；
+- DNS / Custom Domain mutation。
+
+详见 [Runtime A/B](runtime-self-upgrade.md)。
+
+## 5. Contract epoch：第四种、但不是日常发布平面
+
+公开 MCP tool surface 变化会影响 ChatGPT conversation snapshot，因此不能和普通 runtime upgrade 混在一起。
+
+Contract migration 至少涉及：
+
+```text
+local runtime contract
+  ↓
+workstation link identity
+  ↓
+public Edge contract
+  ↓
+new ChatGPT conversation snapshot
+```
+
+这类变更频率应远低于普通代码发布，并需要明确 migration/rollback evidence。
+
+## 6. 浏览器扩展如何进入发布链
+
+扩展属于客户端连续性层。它和 runtime 共用仓库版本，但不应该因此共享安全边界。
+
+发布/验收重点包括：
+
+- manifest / JavaScript syntax；
+- Native Messaging host compatibility；
+- binding state；
+- Auto gate；
+- progress / settled；
+- recovery / handoff；
+- JSON→MCP bridge。
+
+真实 UI 行为仍需要浏览器 UAT；Node smoke 只能证明状态机和 adapter 的一部分逻辑。
+
+## 7. `herdr_skill` 是运行策略，不是发布脚本
+
+`herdr_skill` 组合：
+
+1. herdr-mcp 项目策略；
+2. 当前 runtime / contract / generation 上下文；
+3. 与 release 匹配的原生 Herdr guidance。
+
+它告诉 Web planner **应该怎样使用当前环境**，而不是代替 CI、部署脚本或 runtime manager。
+
+`herdr_methods` 仍是当前安装的 Herdr Socket API schema 权威。
+
+## 推荐的发布判断
+
+在执行任何发布前先问：
+
+| 变化 | 应该动哪个平面 |
+|---|---|
+| 文档、导航、教程 | Pages |
+| Worker/OAuth/relay | Edge |
+| 本机工具实现 | Runtime A/B |
+| 浏览器 continuity | Extension + runtime compatibility validation |
+| tool catalog/schema ABI | Contract epoch migration |
+| Custom Domain/DNS | 独立 domain cutover |
+
+如果答案是“全部都要一起动”，应该再次检查是不是把几个本可独立验证的问题捆在了一起。
+
+## 一次发布什么时候算完成
+
+完成不等于 workflow 变绿。
+
+根据发布平面，还要有相应的真实证据：
+
+- Pages：目标页面实际生成、链接可达；
+- Edge：health + workstation + OAuth/MCP；
+- Runtime：active generation + real tool call + rollback target；
+- Extension：真实目标站点上的 binding/Auto/recovery smoke；
+- Contract：新会话拿到预期 tools snapshot。
+
+自动化的价值不是少看几个日志，而是把每类变更的**验证边界和回滚边界固定下来**。

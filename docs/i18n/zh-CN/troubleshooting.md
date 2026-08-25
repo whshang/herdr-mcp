@@ -1,70 +1,284 @@
-# 故障排查
+# 故障排查：从本机到网页，一层一层找问题
 
-按症状优先的常见故障清单。拿不准时，重新连接后**新开一个会话**——很多“0 工具”报告其实是快照过期，不是服务挂了。
+herdr-mcp 的链路横跨本机 runtime、Herdr、workstation link、Cloudflare Edge、OAuth、MCP 和浏览器。最快的排障方式不是“把所有东西重启一遍”，而是先确认故障在哪一层。
 
-## ChatGPT 显示 0 工具，或工具数量是旧的
+推荐始终按这个顺序：
 
-- 重新连接后**新开会话**；旧会话持有旧的工具快照。
-- 确认 MCP URL 与 `OAUTH_ISSUER` 使用**同一源站**（环境变量里不要带 `/mcp` 后缀）。
-- 检查 Edge 健康、`herdr-link` 连通性、OAuth discovery（`/.well-known/oauth-authorization-server`）。
-- 当前生产契约是 epoch 2，共 **18 个工具（含 `herdr_skill`）**。如果 ChatGPT 仍显示 epoch-1 的 17 个工具，说明 Connector 缓存过期。运行时版本来自 `/.well-known/mcp.json` / `initialize.serverInfo.version`。
+```text
+Herdr
+  ↓
+local herdr-mcp runtime
+  ↓
+workstation link
+  ↓
+Cloudflare Edge
+  ↓
+OAuth / MCP
+  ↓
+ChatGPT tool snapshot
+  ↓
+browser continuity
+```
 
-硬性要求与诊断方法：见 [连接 ChatGPT](chatgpt-connector.md)。
+前一层不通，就先不要猜后一层。
 
-## MCP Connector 的授权卡片反复弹
+## 30 秒快速定位
 
-确认扩展已加载、当前标签页是 `chatgpt.com`、Options 已勾选**启用 ChatGPT 项目自动化**、当前 Project HUD 显示 **`自动 开`**。权限卡自动处理已并入 Project 自动化；关闭 Project 总许可或当前 Project `自动 关` 时扩展仍观察页面和 Herdr 状态，但不会点击权限卡。浏览器原生权限条也始终需要人工处理。见 [浏览器扩展](extension.md)。
+### 1. 本机 HTTP 在吗
 
-## HUD 绑定的是 w68，但底栏显示了另一个项目名
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
+```
 
-以 `workspace_id` 为身份事实，label 只是展示缓存。当前扩展会用实时 `/push/events` / `/push/state` workspace catalog 覆盖历史 binding 里的陈旧 label，并自动修复持久化记录。若浮层已显示正确的 `herdr-mcp (w68)` 而底栏仍显示旧项目名，先确认已经加载当前 0.1.56 扩展并刷新页面；不要通过解绑/重绑来“修”同一个 workspace id。
+`200` 或 `401` 都说明进程正在监听。连接失败才表示本地 runtime 没起来、端口不对或进程异常。
 
-## ChatGPT 回复了一半就停住，页面像缓存了旧状态
+macOS LaunchAgent：
 
-0.1.44 不再直接把这种现象等同于“模型卡死”。当前 Project 必须 `自动 开`，扩展才会做自动 stale-view 恢复。最近回合无页面进展约 30 秒后，它会 best-effort 比较 ChatGPT 同源 conversation snapshot 与当前 DOM：服务端明确领先页面时刷新一次；服务端自己仍未完成且至少 60 秒无进展时也可进入刷新（页面仍显示 streaming 时再多等 30 秒）。刷新后若页面追上服务端就停止恢复；如果仍是同一半截回复，10 秒后发送一次“浏览器恢复”消息激活当前会话。
+```bash
+herdr-mcp status
+herdr-mcp logs
+```
 
-如果内部 snapshot 接口不可达、返回错误或结构发生变化，freshness 状态为 `unknown`，扩展会 fail-closed，不凭“时间看起来很久”就盲目刷新。此时可以手动刷新页面，再用 HUD **手动继续** 或 **herdr监控** 激活。为避免重复 mutation，恢复消息会要求从实际停止处继续并重新核对实时 Herdr/runtime/Git 状态。
+### 2. Herdr 在吗
 
-## “手动接力”按钮不可用，或一直显示“压缩中/接力中”
+```bash
+herdr --version
+herdr api schema >/dev/null
+```
 
-从 0.1.58 起，**手动接力**支持已绑定 ChatGPT Project 和已经落成稳定 `/c/<chat_id>` 的 z.ai 会话在 `自动 开/关` 两种状态下启动，新 target 会继承 source 的 Auto 状态；z.ai 根页 `/`、普通 ChatGPT `/c/<id>`、Claude、DeepSeek 不显示该按钮。绑定 workspace 仍有 agent `working` 时同样拒绝开始，因为接力不能和 settled/wake 的投递目标迁移竞争；handoff 活跃期间源会话的自动 wake 会暂停。
+如果本地 HTTP 正常但 `herdr_inspect` 看不到任何真实 workspace，继续检查 `HERDR_SOCKET_PATH` 和 Herdr daemon，而不是先重装 ChatGPT Connector。
 
-如果 z.ai 已经进入 `/c/<chat_id>` 但 HUD 仍像根页，请确认 0.1.56 已加载并刷新一次。新聊天在 `/` 上临时建立的 binding/自动化偏好会在首次落成 `/c/<chat_id>` 时迁移一次；之后在已有 `/c/A`、`/c/B` 之间切换不会跟着迁移。z.ai 的 handoff summary/seed 使用 raw 通道，不会被 JSON→MCP bridge 改写成 coding-agent task。
+### 3. Edge 能看到 workstation 吗
 
-如果 z.ai / DeepSeek 的 JSON→MCP 任务停住，而且**最后一条真实 assistant 消息仍然是 `{"tool": ...}` JSON**，就表示任务还没有完成。0.1.50 不再把第 12 轮当成完成边界，并能在页面/脚本恢复后识别这条 pending tool JSON 自动继续；历史重新加载时内部协议消息也会重新折叠。若展开折叠消息后正文变成细竖条，说明插件仍是旧版本；0.1.50 已把折叠控制条移出站点的 flex message root。
+检查 Edge `/health` / workstation status。OAuth 可以在 workstation 离线时仍然成功，所以“登录成功”不能证明本机已经连上。
 
-若按钮显示 **压缩中… / 接力中…**，说明同一个 source conversation 已有活跃 transfer，扩展会锁住按钮避免创建第二个接力；若 seed 投递不确定则会显示 **恢复接力**，再次点击会先探测目标 conversation 是否已经收到 transfer marker，再决定完成 cutover 还是重试 seed。旧 workspace binding 在新 seed 被确认前始终保持权威，不要为了“解锁按钮”手工解绑。
+### 4. 新 ChatGPT 会话有当前工具吗
 
-## z.ai 的“自动 关”看起来能点，但点了没有切换
+当前 production contract 是 **epoch 2 / 18 tools，包含 `herdr_skill`**。
 
-请加载 **0.1.48 或更新版本**。0.1.47 错误地要求 z.ai / DeepSeek 会话必须先绑定 workspace 才允许写入会话自动化偏好，因此未绑定 HUD 虽然显示可点击的“自动 关”，后台却会返回 `conversation-unbound`。从 0.1.48 起可以先切换并保存会话自动偏好；Herdr progress/settled 自动回推等依赖 workspace 的动作会在真正完成绑定后生效。
+旧聊天可能保留旧 `tools/list` 快照。确认服务端版本后，优先刷新 App/Connector actions（如果当前 ChatGPT UI 提供）并**新开会话**，不要先重装本机 runtime。
 
-## 本地服务器无响应
+## 症状：Connector 添加失败或 OAuth 循环
 
-- `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/` 应返回 `200` 或 `401`，而不是连接错误。
-- macOS 用 LaunchAgent 时：`herdr-mcp status`，再 `herdr-mcp logs [-f]`；`herdr-mcp watchdog install` 每 120s 自动重启掉线的 MCP。
-- 确认服务器使用的 `HERDR_MCP_PORT` 与你探测的端口一致。
+优先检查：
 
-## 工具间歇性失败，agent 仍显示 working
+- MCP URL 是否是 `https://<stable-origin>/mcp`；
+- `HERDR_MCP_BASE_URL` / OAuth issuer 是否使用同一个 origin，且不带 `/mcp`；
+- protected-resource / authorization-server / OpenID metadata 是否可访问；
+- Cloudflare Worker 是否真的是你以为的那一份部署；
+- Workspace 是否允许 Developer mode / custom MCP App。
 
-这是瞬时控制面故障（Herdr 守护进程的 ExceptionGroup/TaskGroup 聚合）：一次请求失败，几秒后同样的请求又成功。不要把控制面波动当成仓库阻塞；用 `herdr_inspect` / `herdr_since` 复查。部分请求会降级为组合 list API，并带 `warnings`（如 `snapshot_failed_used_list_apis`）。见 [架构](architecture.md)。
+如果 OAuth token 已成功签发但随后失败，问题通常已经从“认证”进入 MCP discovery / workstation routing，不要继续围绕登录页面打转。
 
-## 本地 worker 不可用
+详见 [ChatGPT Connector](chatgpt-connector.md)。
 
-Pi/Herdr worker 掉线时，`dsh --profile headless "任务"` 是实测可用的 CLI 备选——要通过 `herdr_exec_start` 长任务 session 跑，因为工具可能已改完代码却还没打印最终回复；重试前先看 Git/测试。`dsh-tui` 只作人工交互接管，不是默认自动化面。见 [worker fallbacks](worker-fallbacks.md)。
+## 症状：Connector 显示已连接，但聊天里 0 tools
 
-## 想回滚某个运行时发布
+这说明“安装 Connector”和“当前聊天接受 tool catalog”不是一回事。
 
-Runtime A/B 保留上一代际：`herdr-runtime-generation status`，然后 `rollback`（或 `activate --generation <上一代>`）。绝不用 `herdr-self-update` 跨契约代际。见 [Runtime A/B 自升级](runtime-self-upgrade.md)。
+按顺序检查：
 
-## Token 安全方面的坑
+1. 新会话；
+2. 服务端当前 contract/version；
+3. `tools/list` 是否成功；
+4. 是否有一个不兼容 `inputSchema` 导致整张 catalog 被客户端拒收；
+5. 是否仍是老 conversation 的 tool snapshot。
 
-- 绝不要把静态 `HERDR_MCP_TOKEN` 粘给 ChatGPT——它在 Edge 走 OAuth。
-- 绝不把 `~/.config/herdr-mcp/*.env`（Cloudflare cutover 凭据，权限 `0600`）提交进 Git。
-- Cloudflare token 用最小权限；只有一次性遗留迁移才临时扩容。见 [Cloudflare Edge Token](cloudflare-edge-token.md)。
+如果新会话拿到 18 tools，而旧会话仍是 17 tools，服务端通常没有故障，是会话缓存边界。
 
-## 还是搞不定？
+## 症状：能看到 tools，但 `herdr_inspect` 报 workstation offline
 
-- 本地：`herdr-mcp logs -f` 或服务器 stdout；启动行会打印 `boot_id` 与监听端口。
-- Edge：Worker 的 `/health` 端点与 OAuth discovery。
-- 提 issue 时附上：`boot_id`、失败的工具与 `failure_phase`，以及出错前是否发生过 `commitAtomic` / `herdr_exec` 投递。
+这已经不是 ChatGPT tool schema 问题。
+
+检查：
+
+- 本机 runtime 是否在线；
+- `herdr-link` 是否运行；
+- workstation id 是否和 Edge 配置一致；
+- 当前 active runtime generation 是否健康；
+- Edge status 是否显示最近 heartbeat。
+
+不要通过删除/重建 Connector 来修 workstation link。
+
+## 症状：`herdr_inspect` 正常，但文件读写失败
+
+常见原因：
+
+- 路径不在当前 managed Git root；
+- 文件名被 secret-path gate 拦截；
+- `HERDR_MCP_READONLY=1`；
+- `HERDR_MCP_WRITE_ROOTS` 没包含目标仓库；
+- 文件已经 dirty，写工具要求明确确认；
+- 同一项目有 Agent 正在工作，busy gate 阻止并发写入。
+
+先看错误返回里的 gate/reason，不要换成 shell 绕过保护作为默认解决方案。
+
+`herdr_exec` 是显式的高权限边界，不具备 `herdr_fs_*` 的 secret-path 过滤。
+
+## 症状：Herdr 控制面偶发 TaskGroup / ExceptionGroup
+
+表现通常是：
+
+- Agent 明明仍在工作；
+- 一次 inspect/snapshot/pane 操作失败；
+- 几秒后重新观察又恢复。
+
+这类瞬时控制面错误不等于仓库坏了。
+
+herdr-mcp 对只读路径有若干退化策略：
+
+- snapshot 失败时组合 list APIs；
+- Git 在安全条件下直接读取本机仓库；
+- exec 只有在命令**尚未投递**时才可能 fallback；
+- 已投递 mutation 永远不因为控制面错误自动双跑。
+
+正确处理：重新 `herdr_inspect` / `herdr_since` 获取当前事实。
+
+## 症状：prompt / exec timeout，不知道任务到底有没有执行
+
+最重要的规则：**mutation 不盲重试。**
+
+### `herdr_prompt`
+
+如果失败发生在提交后的状态等待阶段，Agent 很可能已经收到任务。先 inspect/since 看 Agent 状态和输出，再决定是否再次投递。重复意图应复用 `idempotency_key`。
+
+### `herdr_exec`
+
+如果工具明确表示已经向 pane 投递，不能因为响应超时再执行同一命令。先看 pane / Git /产生的文件 / 测试状态。
+
+“客户端没收到成功回复”不等于“服务端没做”。
+
+## 症状：本地 Agent 做完了，ChatGPT 不继续
+
+这是最容易被误判成 MCP 故障的情况。
+
+MCP 完成的是：
+
+```text
+ChatGPT → workstation
+```
+
+Agent 后续完成不会自动创建新的 ChatGPT turn。要实现：
+
+```text
+workstation → ChatGPT
+```
+
+需要浏览器扩展：
+
+1. Native Messaging host 正常；
+2. 当前网页 conversation 已绑定正确 workspace；
+3. 相应 Auto scope 已开启，或用 HUD 手动继续/监控。
+
+详见 [浏览器连续工作](browser-continuity.md)。
+
+## 症状：HUD 显示了错误 workspace 名称
+
+绑定身份以 `workspace_id` 为准，label 只是展示信息。
+
+如果 ID 正确但名称陈旧，扩展应从实时 workspace catalog 更新 label。不要为了改一个展示名称就删除正确 binding；先确认扩展已经加载当前构建并刷新页面。
+
+如果 ID 本身错了，再重新绑定。
+
+## 症状：ChatGPT 回复一半停住、连接中断或显示发送超时
+
+不要第一反应就重新提交原用户任务。工具 mutation 可能已经发生。
+
+当前 continuity recovery 的策略是 evidence-first：
+
+1. 尝试读取同源 conversation state；
+2. 如果服务端已经比 DOM 更靠前，刷新页面同步；
+3. 如果明确是请求未接受，才进行受限重试；
+4. delivery 不确定则 fail closed；
+5. 普通恢复耗尽后，才考虑 handoff/rollover。
+
+如果自动恢复没有证据可用，可以人工刷新后用 HUD 的 **herdr监控** 先重新获取本地状态，再继续。
+
+详见 [自动继续、恢复与接力](extension-wake.md)。
+
+## 症状：手动接力不可用
+
+先确认：
+
+- 当前站点/会话类型支持 handoff；
+- workspace 已绑定；
+- 当前作用域可以是 `自动 开` 或 `自动 关`；目标会话会继承源会话 Auto 状态；
+- workspace 没有仍处于 `working` 的 Agent；
+- 没有已经进行中的 transfer。
+
+接力必须先生成 packet、建立新 conversation、确认 seed 存在，最后才迁移 binding。如果停在“恢复接力”，不要手工解绑旧 conversation；旧 binding 在 cutover 完成前是安全锚点。
+
+## 症状：z.ai / DeepSeek 输出 JSON tool call 后停住
+
+这属于 JSON→MCP bridge，不是 ChatGPT Connector。
+
+检查：
+
+- Native Messaging host；
+- 本机 MCP catalog 是否可取；
+- 当前 conversation identity 是否稳定；
+- assistant 最后一条真实消息是否仍是 tool-call JSON；
+- bridge round 是否有工具结果回填；
+- 页面刷新后是否仍保留足够 bridge context 进行恢复。
+
+不要把内部 tool-call JSON 当作最终自然语言答案。详见 [JSON → MCP Bridge](extension-bridge.md)。
+
+## 症状：Chrome 提示“设备上的应用”/loopback 权限
+
+Chrome/Chromium 对本机 loopback 网络可能要求单独授权。
+
+进入扩展管理页面，检查该扩展的网站/本地设备访问权限。Native Messaging 是主链路，但某些诊断/兼容路径仍可能触发 loopback 权限提示。
+
+如果 Options 的连接测试一直 pending，先排这个权限，而不是轮换 Herdr 凭据。
+
+## 症状：Cloudflare 部署失败
+
+先分清是哪一类：
+
+- **凭据失败**：Cloudflare API 权限/identity；
+- **构建失败**：Edge TypeScript/test；
+- **Worker 部署成功但 health 失败**：配置/runtime link；
+- **workers.dev 正常但 Custom Domain 失败**：domain/route/DNS 层。
+
+最小权限凭据见 [Cloudflare Edge 凭据](cloudflare-edge-token.md)，部署结构见 [Cloudflare Edge 部署](cloudflare-edge-deployment.md)。
+
+不要为了一个 route/DNS 问题扩大长期 Worker token 为账号管理员。
+
+## 症状：Runtime 升级后出问题
+
+如果只是同一 contract epoch 内的新 runtime implementation：
+
+```bash
+bin/herdr-runtime-generation status
+```
+
+确认 active/previous generation，再按 [Runtime A/B](runtime-self-upgrade.md) 回滚。
+
+如果 tool catalog / contract epoch 改了，这不是普通 A/B 问题，必须按 contract migration 单独处理。不要用 `herdr-self-update` 偷跨 epoch。
+
+## 日志和 Issue 最有用的信息
+
+比“不能用了”更有价值的是：
+
+- 当前 `boot_id`；
+- runtime version / contract epoch；
+- workstation id；
+- 出错的具体 tool；
+- `failure` / `failure_phase` / `delivery_state`；
+- mutation 前后是否看到 Git/pane/Agent 状态变化；
+- Edge `/health` 是否看到 workstation；
+- 新会话还是旧会话；
+- 浏览器扩展是否绑定正确 workspace。
+
+注意清理 token、OAuth JWT、Cloudflare secret 和项目敏感内容后再提交日志。
+
+## 最后再考虑重启
+
+有些错误当然可以通过重启恢复，但排障时最好先抓住事实：
+
+1. 记录当前状态；
+2. 确认故障层；
+3. 再只重启相关组件；
+4. 重启后重新验证这一层和下一层。
+
+这样不会把“偶发好了”误认为“根因已经修复”。

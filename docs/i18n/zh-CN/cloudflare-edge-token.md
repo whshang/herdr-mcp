@@ -1,129 +1,157 @@
-# Cloudflare Edge Token
+# Cloudflare Edge 凭据：最小权限、临时引导、可验证
 
-Herdr 的 Cloudflare Edge 部署、Worker Route 或 Custom Domain 管理都不应长期复用一个“全能” Cloudflare Token。推荐为 Herdr 单独创建一个 Account API Token，只授予两项权限：
+部署 herdr-mcp Edge 需要 Cloudflare API 权限，但长期运行不应该依赖一个拥有整个账号权限的万能凭据。
 
-- 目标 Zone（例如 `agentforme.cc.cd`）：**Workers Routes Write**。
-- 所属 Account：**Workers Scripts Write**。
+这篇文档说明项目如何创建和使用 **最小权限的 Cloudflare Account API Token**，以及为什么凭据处理与 Edge 架构本身需要分开理解。
 
-这足以发布 Worker、管理 Worker Route，也足以调用 Cloudflare Workers Domains API attach/detach Custom Domain。正常运行不需要 DNS Edit、Tunnel Edit 或 Account Admin。只有“把已经占用同一 hostname 的旧 CNAME/Tunnel 迁走”这一类一次性迁移，才需要单独处理旧 DNS 记录；不要因此扩大日常 Token 权限。
+## 两类凭据不要混在一起
 
-## 一键脚本
+部署流程里可能出现两类 Cloudflare 凭据：
 
-仓库提供：
+1. **bootstrap credential**：已有的较高权限凭据，只在创建目标最小权限 token 时临时使用；
+2. **runtime/deployment credential**：herdr-mcp 后续部署或切换实际使用的最小权限 token。
 
-```bash
+目标是让第 1 类尽快退出流程，而不是把它长期写进项目配置。
+
+## 项目需要的最小权限
+
+当前 helper 为指定 zone / account 创建：
+
+- **Workers Routes Write**：限定到目标 zone；
+- **Workers Scripts Write**：限定到对应 account。
+
+它不会为了方便默认申请全账号管理员权限。
+
+如果首次部署只使用 `workers.dev`，是否需要 zone route 权限取决于你实际走的部署路径；本 helper 主要服务既有 Edge/cutover 工作流和 Custom Domain/route 场景。不要因为文档列出了权限，就给无关资源扩大作用域。
+
+## 使用项目 helper
+
+脚本：
+
+```text
 bin/herdr-cloudflare-token
 ```
 
-脚本通过 Cloudflare 官方 API 动态解析 Account ID、Zone ID 和权限组 ID，不硬编码用户账户标识。生成的 Token **不会打印到终端**，而是原子写入本地：
+查看参数：
+
+```bash
+bin/herdr-cloudflare-token --help
+```
+
+常用模式：
+
+```bash
+# 只解析 account/zone 并检查 bootstrap 权限，不创建新 token
+bin/herdr-cloudflare-token --zone example.com --dry-run
+
+# 创建并保存目标最小权限凭据
+bin/herdr-cloudflare-token --zone example.com
+
+# 只验证已经保存的凭据
+bin/herdr-cloudflare-token --zone example.com --verify-only
+
+# 明确轮换已经存在的本地凭据
+bin/herdr-cloudflare-token --zone example.com --rotate
+```
+
+bootstrap credential 通过进程环境提供：
+
+```bash
+export CLOUDFLARE_API_TOKEN='<temporary-bootstrap-token>'
+# 或 CF_API_TOKEN
+```
+
+不要把真实值写进仓库文档、commit、截图或聊天记录。
+
+## 本地保存位置
+
+helper 默认写入：
 
 ```text
 ~/.config/herdr-mcp/cloudflare-cutover.env
 ```
 
-文件权限固定为 `0600`。默认包含：
+文件使用受限权限（**mode `0600`**），脚本不会把 token 值打印到标准输出。
+
+保存内容还包含 account / zone identity，用于后续验证目标 token 是否真的能访问预期的 Workers Scripts / Routes API。
+
+这个文件是**本机凭据状态**，不是项目配置，不应该加入 Git。
+
+## 为什么先 dry-run
+
+创建 token 本身也是 mutation。第一次接入一个 Cloudflare 账号时，建议先：
+
+```bash
+bin/herdr-cloudflare-token --zone <zone> --dry-run
+```
+
+它可以提前发现：
+
+- zone 名称不唯一或不存在；
+- bootstrap credential 没有足够权限；
+- account / zone identity 解析异常；
+- 目标权限组不可用。
+
+先验证，再创建，可以避免不断产生废弃 token。
+
+## 为什么不能看到失败就自动 rotate
+
+如果本地已经存在凭据，脚本默认不会悄悄覆盖，而是要求显式 `--rotate`。
+
+这是因为凭据轮换可能影响：
+
+- 正在进行的 Edge 部署；
+- CI / 本机脚本；
+- 其它仍引用旧 token 的流程。
+
+所以 rotation 是一个需要明确意图的 mutation。
+
+## 验证什么
+
+`--verify-only` 不只是检查“token 字符串存在”，而是确认保存的 credential 对预期 Cloudflare API 具备实际可用性。
+
+理想验收包括：
+
+- token active；
+- account identity 正确；
+- Workers Scripts 权限有效；
+- 目标 zone 的 Workers Routes 权限有效。
+
+部署失败时，先区分“凭据不可用”和“Worker/DO 配置错误”，不要把两类问题混在一起。
+
+## ChatGPT 不需要这个 token
+
+Cloudflare deployment credential 和 ChatGPT Connector OAuth 是完全不同的凭据层。
 
 ```text
-CLOUDFLARE_API_TOKEN=<secret>
-CLOUDFLARE_ACCOUNT_ID=<account id>
-HERDR_CUTOVER_ZONE=<zone name>
-HERDR_CUTOVER_ZONE_ID=<zone id>
-HERDR_CUTOVER_PATTERN=herdr-mcp.<zone>/*
-HERDR_CUTOVER_WORKER=herdr-edge-prod
-HERDR_CUSTOM_DOMAIN=herdr-mcp.<zone>
-HERDR_CUTOVER_PROBE_KEYCHAIN_SERVICE=herdr-edge-prod-mcp-bearer
+Cloudflare API token
+  用于：部署/维护 Edge
+
+ChatGPT OAuth token
+  用于：ChatGPT 访问已经部署好的 MCP Edge
+
+HERDR_MCP_TOKEN
+  用于：本机 curl / Cursor / legacy local compatibility
 ```
 
-不要把这个文件提交到 Git、贴到 Issue、聊天或 CI 日志。
+三者不要互相复制。
 
-## 首次准备：bootstrap credential
+尤其不要把 Cloudflare API token 或 `HERDR_MCP_TOKEN` 填进 ChatGPT Connector UI。
 
-Cloudflare 不允许“无凭据的程序”凭空创建 API Token，因此第一次自动化必须有一个 bootstrap credential。推荐两种方式：
+## 凭据卫生
 
-1. **已有 Cloudflare 自动化 Token**：它至少要能读取目标 Zone，并具有 `Account API Tokens` 管理权限。把它临时放到当前 shell 的 `CLOUDFLARE_API_TOKEN`。
-2. **只有网页登录态**：在 Cloudflare Dashboard 的 `Account → Account API tokens` 创建一次 bootstrap Token；也可以让带有用户登录态的 `ego-browser` 代为操作。bootstrap Token 只用于创建 Herdr 专用 Token，后续 Herdr 日常运行使用脚本生成的专用 Token。
+建议遵守：
 
-bootstrap Token 不会被脚本写入 Herdr 配置文件。
+- bootstrap token 只通过临时进程环境传递；
+- 最小权限 token 只保存在本机受限文件或正式 Secret Store；
+- 不放进 `wrangler.toml`、README、`.env` 示例或 Git；
+- 不在 shell 输出中 `echo` 真值；
+- 自动化日志只记录 credential 是否 ready，不记录 secret；
+- 需要扩权时先判断是不是部署路径设计问题，而不是习惯性加管理员权限；
+- rotation 后验证新 token，再清理旧 token。
 
-## 创建
+## 与 Edge 部署的关系
 
-```bash
-export CLOUDFLARE_API_TOKEN='<bootstrap token>'
-bin/herdr-cloudflare-token --zone example.com
-unset CLOUDFLARE_API_TOKEN
-```
+第一次完整安装建议先用 `workers.dev` 把 Worker、workstation link、OAuth 和 MCP 跑通，再处理 Custom Domain / route。
 
-成功输出只包含非敏感状态，例如：
-
-```json
-{"ok":true,"code":"credential_created","mode":"600","permissions":["Workers Routes Write","Workers Scripts Write"]}
-```
-
-脚本随后自动验证：
-
-- Account API Token 是 Active；
-- 可以读取目标 Zone 的 Workers Routes；
-- 可以读取 Account 的 Workers Scripts。
-
-## 建议先 dry-run
-
-```bash
-bin/herdr-cloudflare-token --zone example.com --dry-run
-```
-
-它会完成 Zone/Account/权限组解析与 bootstrap 权限检查，但不会创建 Token，也不会写文件。
-
-## 验证已有本地凭据
-
-```bash
-bin/herdr-cloudflare-token --verify-only
-```
-
-这不会显示 Token，只报告 API、Routes、Scripts 三个验证结果。
-
-## 幂等与轮换
-
-如果默认本地文件已经存在且验证通过，再次执行脚本会返回 `credential_already_ready`，不会重复创建 Token。
-
-确实要轮换时：
-
-```bash
-bin/herdr-cloudflare-token --zone example.com --rotate
-```
-
-`--rotate` 会创建一个新 Token，并在创建成功后原子替换本地文件。旧 Token 不会被脚本自动吊销，避免在并发部署或连接仍使用旧凭据时造成中断；确认新 Token 已稳定使用后，再从 Cloudflare Dashboard 吊销旧 Token。
-
-## 手工 Dashboard 等价步骤
-
-如需人工复核，配置应与脚本完全一致：
-
-1. `Account → Account API tokens → Create Token`。
-2. `Start from scratch`。
-3. 第一条 Policy：
-   - Resource scope：`Specified Domains`；
-   - 只选择目标域名；
-   - `Workers Routes → Edit`。
-4. `Add policy`，第二条 Policy：
-   - Resource scope：`Entire Account`；
-   - `Workers Scripts → Edit`。
-5. 不添加 DNS、Tunnel、Account Admin 权限。
-6. Review 页面应只看到 `Workers Routes Write` 与 `Workers Scripts Write`。
-7. 创建后 Token 只显示一次，立即存入本地安全文件；不要在终端或聊天中回显。
-
-## 与部署 / 生产切换结合
-
-新安装默认先使用 `workers.dev`，不需要自己的域名。已有稳定域名时再选择 Custom Domain。
-
-创建好本地凭据后：
-
-```bash
-set -a
-source ~/.config/herdr-mcp/cloudflare-cutover.env
-set +a
-
-# Custom Domain 只读状态与生产 candidate preflight
-bin/herdr-cloudflare-domain status
-bin/herdr-cloudflare-domain preflight
-```
-
-`bin/herdr-cloudflare-domain` 只调用 Workers Domains API，不会自行删除 DNS 或停止 Tunnel。旧架构如果已有同名 CNAME，Cloudflare 会拒绝直接 attach；必须先记录完整 rollback evidence，再在受控切换中删除冲突 CNAME、attach Custom Domain、验证，然后才退出旧 Tunnel。失败时 detach Custom Domain 并恢复旧 CNAME。详见 [`cloudflare-edge-deployment.md`](cloudflare-edge-deployment.md)。
+Edge 架构和部署步骤见 [Cloudflare Edge 部署](cloudflare-edge-deployment.md)；最短安装路径见 [安装](install.md)。

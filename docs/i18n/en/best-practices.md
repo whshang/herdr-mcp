@@ -1,48 +1,261 @@
-# Remote planner best practices
+# Best practices: let the Web planner decide, let the workstation provide facts
 
-Audience: people using a web model as the herdr-mcp planner. For automation inside Herdr itself, use the upstream [Agent automation](https://herdr.dev/docs/agent-automation/) guide.
+The most reliable herdr-mcp workflow follows one rule:
 
-Workflows that keep the remote-planner system fast, safe and observable. These are the operating rules the project follows; treat them as defaults, not as the only way to work.
+> The Web model owns goals, sequencing and decisions. Deterministic workstation work is done directly. Local agents are used only when independent reasoning or parallel work adds value.
 
-## Web plans, local stays cheap
+This avoids both extremes: turning every action into an agent task, or treating a long-running development environment like a stateless shell API.
 
-Orchestration happens in the web chat; heavy lifting stays on cheap local workers.
+## 1. Inspect live state before mutation
 
-- Prefer `herdr_fs_*` / `herdr_git` / `herdr_exec` — no local-agent API involved.
-- When reasoning is actually required, prefer `herdr_prompt` to a cheap/fast worker (`pi`, `flash`, `cline`, `opencode`, `anti`) or an auditor (`droid`, `grok`). Do not route planning or delegation through local Claude/OMP/main.
-- If Pi/Herdr workers are unavailable, `dsh --profile headless "job"` is a tested CLI fallback — run it through a long `herdr_exec_start` session, not a 60‑second synchronous shell. See [worker-fallbacks](worker-fallbacks.md).
+A handoff packet, prior assistant message or old terminal output is historical context, not proof of current state.
 
-## The per-session ritual
+Start by checking:
 
-1. `herdr_inspect` — connection health, workspaces, panes, agents.
-2. `herdr_skill` — once per session, load the project policy plus release-matched upstream Herdr guidance.
-3. Then work. Resume later with `herdr_since <cursor>` instead of re-dumping full state.
+- current Herdr workspace/panes/agents;
+- target Git root;
+- Git status/diff;
+- relevant runtime/service health when the task depends on it.
 
-Details live in [architecture](architecture.md) (tool surface, epoch 2).
+Typical entry:
 
-## Mutation discipline
+```text
+herdr_inspect
+  ↓
+herdr_git status
+  ↓
+herdr_fs_read / grep
+```
 
-- Prefer fire-and-forget `herdr_prompt` with an `idempotency_key`; track delivery via `herdr_since` / `herdr_inspect`.
-- After any transport failure, check state before retrying — never blind-retry a non-idempotent mutation.
-- `herdr_exec`: if control-plane failure happens before delivery, a local fallback may run; if already delivered, return a structured error — never double-run.
-- Failed `commitAtomic` cleans up files added by that attempt; writes stay gated by managed-root / dirty / busy / readonly gates.
+If the conversation was resumed after a long gap, runtime restart or browser handoff, this rule matters even more.
 
-## Keep the Edge as the only public surface
+## 2. Do deterministic work directly
 
-- The workstation only makes outbound authenticated WSS (`herdr-link`). There is no public inbound port; do not re-expose the local MCP server directly except as a legacy migration path.
-- Keep the MCP URL and `OAUTH_ISSUER` on the **same origin**; do not put a `/mcp` suffix in `OAUTH_ISSUER`. Mismatched origins are the most common connector failure.
-- Use a least-privilege Cloudflare token (Workers Routes Write + Workers Scripts Write) — see [cloudflare-edge-token](cloudflare-edge-token.md) — and never commit `~/.config/herdr-mcp/*.env`.
+Do not ask an agent to perform operations whose result is already mechanically defined.
 
-## Upgrade with A/B, not big-bang
+Prefer:
 
-Runtime releases switch behind the persistent Edge/Link: validate the new generation against the frozen tool contract, activate it atomically, drain and roll back if needed — the ChatGPT Connector never changes. Never use `herdr-self-update` to cross a contract epoch. See [runtime-self-upgrade](runtime-self-upgrade.md).
+```text
+read/search files   → herdr_fs_*
+Git facts           → herdr_git
+exact edits/patch   → herdr_fs_edit / patch
+short command       → herdr_exec
+long tests/build    → herdr_exec_start/read
+```
 
-## Example end-to-end flow
+This saves model context, lowers latency and gives the Web planner direct evidence.
 
-1. ChatGPT connects to the Edge MCP endpoint and completes OAuth (see [install](install.md)).
-2. A new conversation starts; the model calls `herdr_inspect` to see the workstation, then `herdr_skill` once.
-3. You ask for a change in a git-managed project: the model reads with `herdr_fs_read` / `herdr_git status`, edits with `herdr_fs_patch`, runs tests with `herdr_exec`, and commits through atomic Git helpers under the managed root.
-4. Bind the web chat to the working workspace in the MV3 extension. Options gates **ChatGPT Project-shared automation** only: a Project must be explicitly `Auto on` before progress/settled wakes, LLM continuation, timeout recovery or safe rollover can run. Plain ChatGPT `/c/<id>`, z.ai and DeepSeek keep independent conversation-scoped Auto switches; z.ai / DeepSeek use the narrower automatic progress/settled path. When you want an explicit **Manual handoff**, use it directly with Auto either on or off; it is supported for bound ChatGPT Projects and persisted z.ai `/c/<chat_id>` conversations, and the target inherits the source Auto state. Extension-to-Herdr traffic stays local and tokenless in the browser: Native Messaging carries it to the host, then mode-`0600` Unix IPC carries it to the runtime. See [extension-wake](extension-wake.md).
-5. When a worker is down, the model falls back to `dsh --profile headless` through a long `herdr_exec_start` session instead of stalling.
+## 3. Delegate one bounded reasoning task at a time
 
-Result: one stable public contract, cheap local compute, and a reverse channel that keeps the web conversation live.
+Good delegation tasks include:
+
+- investigate one subsystem;
+- implement one narrow feature;
+- compare two approaches;
+- review a completed diff;
+- explore an independent hypothesis in parallel.
+
+A good prompt specifies:
+
+- repository and working area;
+- exact problem boundary;
+- files or interfaces owned by the worker;
+- what not to modify;
+- expected tests/evidence;
+- whether the worker should only analyze or may mutate.
+
+The local worker should not become a hidden “manager of managers.” The Web planner owns integration.
+
+## 4. Use worktrees for real parallel edits
+
+If two workers need to modify code independently, give them isolated worktrees.
+
+```text
+main worktree
+  ├─ worker A worktree
+  └─ worker B worktree
+```
+
+This prevents dirty-file/busy gates from becoming noise and makes it obvious which diff belongs to which task.
+
+Parallel reads/reviews can share a root; parallel overlapping mutations generally should not.
+
+## 5. Treat Git as the source of truth
+
+An agent saying “done” is not completion evidence.
+
+Verify:
+
+- `git status`;
+- `git diff`;
+- target files;
+- tests/build;
+- runtime behavior if relevant.
+
+If an agent times out after it may have mutated the repo, inspect Git before deciding whether to retry.
+
+## 6. Never blindly retry an uncertain mutation
+
+The dangerous remote failure is:
+
+```text
+mutation happened
+  ↓
+response was lost
+```
+
+Examples:
+
+- `herdr_prompt` was delivered but status wait timed out;
+- a shell command was sent to a pane but the control plane then failed;
+- a Cloudflare mutation returned an ambiguous network error;
+- a browser handoff seed may already have been submitted.
+
+Correct response:
+
+1. inspect actual state;
+2. reconcile what already happened;
+3. retry only if evidence shows the mutation did not occur.
+
+Use `idempotency_key` on agent prompts whenever the same intent may be replayed.
+
+## 7. Use `herdr_since` to resume, not to re-read everything
+
+A Web client only runs when the user sends another message. It cannot continuously poll while the conversation is idle.
+
+`herdr_since(cursor)` gives an incremental digest of what changed since the last observation.
+
+Use it for:
+
+- resuming after a long local task;
+- checking whether a delegated worker finished;
+- continuing after the browser wakes the conversation;
+- avoiding a full snapshot on every turn.
+
+If the server restarted and the cursor is no longer valid, use fresh inspect state and continue from there.
+
+## 8. Use browser continuity for time, not for reasoning
+
+MCP sends work from the browser to the workstation. It does not automatically start a new Web turn when a local worker finishes later.
+
+Bind the conversation to the relevant Herdr workspace when the task is expected to outlive the current turn.
+
+Use the extension for:
+
+- progress/settled wakeups;
+- stale-view/send-timeout recovery;
+- long-conversation handoff;
+- JSON→MCP on sites without a native Connector.
+
+Do not treat the extension as another planner.
+
+### Auto and manual handoff
+
+New automation scopes default off. Enable Auto only after you have confirmed the binding and event stream are correct.
+
+Most manual progression actions are mutually exclusive with Auto. **Manual handoff is intentionally different:** where supported, it can start with Auto on or off, pauses source automatic wakes during the transfer, and makes the new conversation inherit the source Auto state.
+
+A handoff packet is historical context; the target conversation still re-checks Herdr/Git/runtime before mutation.
+
+## 9. Keep the public Edge stable while the local runtime evolves
+
+Do not couple a local implementation update to a new public URL.
+
+Preferred split:
+
+```text
+Cloudflare Edge / OAuth / public MCP
+        stable
+
+herdr-link
+        stable connection
+
+local runtime generation
+        A/B upgradeable
+```
+
+Use Runtime A/B for implementation changes inside the same public contract epoch.
+
+A tool-catalog/schema change is a separate contract migration and should be intentionally rare.
+
+## 10. Keep permissions narrow and honest
+
+herdr-mcp has multiple boundaries:
+
+- `herdr_fs_*` is constrained by managed root and secret-path gates;
+- write roots can be restricted;
+- read-only mode can block mutation;
+- busy/dirty confirmation prevents accidental concurrent edits;
+- `herdr_exec` is a stronger shell boundary and is not a sandbox.
+
+Do not weaken all permissions just to solve one path problem. First determine which gate is actually blocking the operation.
+
+## 11. Separate deployment planes
+
+A documentation change should not rotate Cloudflare credentials. A local runtime bugfix should not change the OAuth issuer. A Worker relay update should not replace the Git checkout.
+
+Keep these planes separate:
+
+- documentation / Pages;
+- public Edge;
+- local Runtime A/B;
+- browser extension;
+- contract epoch;
+- DNS / Custom Domain cutover.
+
+Independent planes are easier to test and easier to roll back.
+
+## 12. Prefer evidence-based stopping conditions
+
+A task is complete when the required evidence is present, not when the conversation sounds finished.
+
+Examples:
+
+```text
+code task
+  → expected diff + tests
+
+runtime upgrade
+  → active generation + real tool call + rollback target
+
+Edge deployment
+  → health + workstation + OAuth/MCP
+
+browser continuity fix
+  → real target-site behavior + smoke tests
+```
+
+This keeps long-running work from drifting into “looks probably fine.”
+
+## Recommended orchestration loop
+
+```text
+Inspect
+  ↓
+Narrow read/search
+  ↓
+Check Git
+  ↓
+Do deterministic work
+  ↓
+Delegate only where useful
+  ↓
+Run long work with explicit handles
+  ↓
+Resume incrementally
+  ↓
+Verify Git/tests/runtime
+  ↓
+Review / integrate
+  ↓
+Commit / deploy
+```
+
+That loop is intentionally boring. The value of herdr-mcp is that a powerful Web planner can keep applying it to a persistent local development environment without losing state between turns.
+
+Related reading:
+
+- [Architecture](architecture.md)
+- [Browser continuity](browser-continuity.md)
+- [Worker fallbacks](worker-fallbacks.md)
+- [Troubleshooting](troubleshooting.md)

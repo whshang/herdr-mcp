@@ -1,48 +1,129 @@
-# Remote planner 最佳实践
+# 最佳实践：让 Web AI 长期参与本地开发
 
-读者：把网页模型作为 herdr-mcp planner 的使用者。Herdr 本体内部的 Agent 自动化请直接看官方 [Agent automation](https://herdr.dev/docs/agent-automation/)。
+herdr-mcp 的理想工作方式是：**Web 模型负责理解目标、做决策和持续编排；确定性的本地操作直接执行；只有真正需要独立推理或并行工作时才调度另一个 Agent。**
 
-让远程 planner 工作流保持快速、安全、可观测。这些是项目遵循的运行规则，请当作默认做法，而不是唯一做法。
+这样既利用 ChatGPT 的长上下文和推理能力，也保留 Herdr 对本地工作现场的持久管理。
 
-## Web 规划，本地干活
+## 1. 开始工作前先确认现场
 
-编排发生在网页会话里，重活交给廉价的本地 worker。
+新的 Web 会话不要根据上一段聊天里的旧状态直接修改代码。
 
-- 优先用 `herdr_fs_*` / `herdr_git` / `herdr_exec`——不经过本地 agent API。
-- 确实需要推理时，优先用 `herdr_prompt` 发给廉价/快速 worker（`pi`、`flash`、`cline`、`opencode`、`anti`）或审计者（`droid`、`grok`）。不要把规划或委派交给本地 Claude/OMP/main。
-- Pi/Herdr worker 不可用时，`dsh --profile headless "任务"` 是实测可用的 CLI 备选——要通过 `herdr_exec_start` 长任务 session 跑，不要用 60 秒同步 shell。见 [worker fallbacks](worker-fallbacks.md)。
+推荐顺序：
 
-## 每次会话的固定开场
+1. `herdr_inspect`：确认 Herdr 连接、workspace、pane、Agent、managed project roots 和运行环境。
+2. `herdr_skill`：每个会话读取一次当前操作策略。
+3. `herdr_git status`：准备修改某个仓库前确认 live Git 状态。
+4. 之后用 `herdr_since` 获取增量变化，减少重复读取整个工作区。
 
-1. `herdr_inspect`——连接健康、工作区、窗格、agent。
-2. `herdr_skill`——每个会话一次，加载项目策略与匹配版本的 upstream Herdr 指导。
-3. 然后开始干活。之后用 `herdr_since <cursor>` 续接，而不是重新倾倒全量状态。
+长对话接力后的第一轮同样执行这些检查。接力摘要用于恢复意图和已知事实，live state 决定接下来能不能安全 mutation。
 
-详见 [架构](architecture.md)（工具面、epoch 2）。
+## 2. 确定性工作直接做
 
-## 变更纪律
+读取文件、搜索代码、查看 diff、应用明确补丁、运行测试，这些工作不需要额外启动一个 Coding Agent。
 
-- `herdr_prompt` 默认 fire-and-forget，务必带 `idempotency_key`；用 `herdr_since` / `herdr_inspect` 追踪投递。
-- 任何传输失败后先查状态再重试——绝不对非幂等变更盲目重试。
-- `herdr_exec`：控制面在投递前失败时，本地 fallback 可以运行；已投递则返回结构化错误——绝不重复执行。
-- 失败的 `commitAtomic` 会清理本次尝试新增的文件；写入始终受 managed-root / dirty / busy / readonly 闸门约束。
+优先使用：
 
-## 让 Edge 成为唯一的对外面
+- `herdr_fs_read` / `herdr_fs_list` / `herdr_fs_grep`
+- `herdr_fs_patch` / `herdr_fs_edit`
+- `herdr_git`
+- `herdr_exec`，以及长任务用的 `herdr_exec_start` / `read` / `kill`
 
-- 工作站只建立出站的已认证 WSS（`herdr-link`）。不存在公网入站端口；除遗留迁移外，不要直接把本地 MCP 服务器暴露到公网。
-- MCP URL 与 `OAUTH_ISSUER` 必须在**同一源站**上；`OAUTH_ISSUER` 不要带 `/mcp` 后缀。源站不一致是 Connector 最常见的失败原因。
-- Cloudflare token 用最小权限（Workers Routes Write + Workers Scripts Write）——见 [Cloudflare Edge Token](cloudflare-edge-token.md)——并且绝不把 `~/.config/herdr-mcp/*.env` 提交进 Git。
+这条原则的价值主要是减少等待、减少状态转述，并让 Web planner 直接看到操作结果。Agent 数量应该由任务并行性和推理需要决定。
 
-## 升级用 A/B，不要一刀切
+## 3. 什么时候调度本地 Agent
 
-运行时发布在稳定的 Edge/Link 后面切换：用冻结的工具契约验证新代际、原子激活、排空，需要时回滚——ChatGPT Connector 完全不用改。绝不用 `herdr-self-update` 跨契约代际。见 [Runtime A/B 自升级](runtime-self-upgrade.md)。
+适合 `herdr_prompt` 的任务包括：
 
-## 端到端示例
+- 可以和主线独立并行的实现；
+- 需要第二种思路的故障调查；
+- 独立 code review / audit；
+- 较长、边界明确、结果可以通过 Git 和测试验证的工作。
 
-1. ChatGPT 连上 Edge MCP 端点并完成 OAuth（见 [安装](install.md)）。
-2. 新开会话；模型先调 `herdr_inspect` 看工作站，再调一次 `herdr_skill`。
-3. 你要求修改某个 git 管理的项目：模型用 `herdr_fs_read` / `herdr_git status` 读、用 `herdr_fs_patch` 改、用 `herdr_exec` 跑测试，并在 managed root 下通过原子 Git 助手提交。
-4. 在 MV3 扩展里把网页会话绑定到实际工作的 workspace。Options 只控制 **ChatGPT Project 共享自动化**；Project 只有在 HUD 显式开启 `自动 开` 后，才会执行进度/收工、LLM 判断、回复恢复和安全自动接力。普通 ChatGPT `/c/<id>`、z.ai、DeepSeek 使用各自的单会话 Auto，不依赖 Project 总许可；其中 z.ai / DeepSeek 只自动回推 progress/settled。需要主动 **手动接力** 时无需先改 Auto；已绑定 ChatGPT Project 和持久 z.ai `/c/<chat_id>` 会话在 `自动 开/关` 两种状态都可用，target 会继承 source 的 Auto 状态。扩展与 Herdr 的通信保持在本机：浏览器通过 Native Messaging 交给 host，再由权限为 `0600` 的 Unix Socket 进入 runtime，浏览器侧不持有 Herdr bearer。见 [extension-wake](extension-wake.md)。
-5. 某个 worker 掉线时，模型改走 `dsh --profile headless`（通过 `herdr_exec_start` 长会话）而不是卡住。
+Pi、Cline、OpenCode 等 worker 适合执行实现；Grok、Droid 等可以承担独立审查。具体可见 Agent 由当前 Herdr 配置决定，不应在业务流程里假设某个 Agent 永远存在。
 
-结果：一个稳定的公共契约、廉价的本地算力，加上一条让网页会话保持鲜活的回流通道。
+Web planner 自己保留总体任务拆分、优先级和最终验收权。一个 Agent 完成后，直接检查 Git diff、测试和运行结果，不依赖它的自然语言“已经完成”。
+
+Herdr worker 不可用且本机安装了 DSH 时，可以用 `dsh --profile headless` 作为 CLI fallback。长任务通过 `herdr_exec_start` 运行，避免把正常的长推理误判成同步命令超时。详见 [Worker fallback](worker-fallbacks.md)。
+
+## 4. 并行开发要隔离工作区
+
+多个 Agent 同时改一个 checkout 很容易制造不可解释的 dirty state。较大的并行任务应使用独立 Git worktree，并让 Herdr workspace、pane cwd、Agent cwd 都指向同一个项目根。
+
+每个并行任务应有清晰边界：
+
+- 要解决的问题；
+- 允许修改的范围；
+- 验证命令；
+- 是否允许提交 / push；
+- 完成后如何合并和回收 workspace。
+
+完成的临时 workspace 应及时关闭。存在未提交修改或仍在运行的 Agent 时先检查，再决定保留、合并或回收。
+
+## 5. Mutation 失败后先查事实
+
+远程控制最危险的错误之一，是网络或等待超时后把同一个 mutation 再执行一次。
+
+`herdr_prompt` 建议带 `idempotency_key`。任何提交、push、部署、消息发送、创建资源等操作出现不确定结果时，先用 `herdr_since`、`herdr_inspect`、Git 或目标系统状态确认是否已经生效，再决定是否重试。
+
+`herdr_exec` 也遵循同样原则：命令一旦已经投递，就不能因为返回链路失败而假设它没有运行。
+
+## 6. Git 是开发结果的事实来源
+
+Agent 状态只能说明“谁在工作”，Git 和验证命令说明“工作产生了什么”。
+
+推荐在修改前后检查：
+
+```text
+herdr_git status
+herdr_git diff
+project tests / lint / typecheck / build
+git diff --check
+```
+
+不要为了得到状态而让另一个 Agent 运行 `git status`。这些确定性事实直接读取更快，也更可靠。
+
+## 7. 浏览器扩展负责连续工作
+
+扩展解决的是 Web 会话自身不持续运行的问题。它负责把 Herdr 进度送回网页、恢复超时回复、按作用域自动继续，并在长对话接近容量边界时生成接力摘要并迁移到新会话。
+
+自动化开启后，应该让扩展负责这些机械动作；人工仍通过 HUD 观察状态，并在需要改变方向时介入。手动接力用于主动切换会话，自动接力用于容量和恢复策略触发。
+
+ChatGPT Project、普通 ChatGPT 会话、z.ai 和 DeepSeek 的作用域规则不同，具体以 [浏览器扩展](extension.md) 和 [自动继续与接力](extension-wake.md) 为准。
+
+## 8. Edge 保持稳定，本地 Runtime 可以演进
+
+ChatGPT 保存的是稳定的 MCP/OAuth identity。工作站只建立出站认证连接，不开放公网入站端口。
+
+因此日常升级应保持 Edge origin 和 Connector 不变，在其后升级本地 runtime。跨公共工具契约的变更使用受控的 runtime generation / A-B 切换和回滚流程。详见 [Runtime 自升级](runtime-self-upgrade.md)。
+
+## 9. 权限按工作站风险配置
+
+允许 Shell 意味着远程模型可以执行该用户有权限执行的命令。用于真实开发机器时：
+
+- Cloudflare 和 ChatGPT account 应开启可靠的账号保护；
+- 使用 `HERDR_MCP_WRITE_ROOTS` 限定允许写入的项目；
+- 只需要观察时使用 `HERDR_MCP_READONLY=1`；
+- 不把本机 bearer、`.env` 或其它凭据复制到 Connector 配置和聊天内容；
+- 高风险生产 mutation 继续使用项目自身的审批和权限机制。
+
+## 一个典型工作流
+
+```text
+用户提出目标
+  ↓
+ChatGPT: inspect + skill + git status
+  ↓
+直接读取 / 搜索 / 修改 / 测试
+  ↓
+有独立并行任务？ ── yes ──► Herdr worker
+  │                            ↓
+  no                      since / Git / tests
+  │                            ↓
+  └──────────────► 汇总验证结果
+                       ↓
+                commit / push / deploy
+                       ↓
+                浏览器扩展继续监控
+```
+
+核心判断始终围绕三个问题：当前 live state 是什么；这个动作能否确定性直接完成；完成后用什么事实验证。这样 Web AI 才能稳定地参与几个小时甚至跨多个对话的开发工作。

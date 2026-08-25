@@ -1,170 +1,293 @@
-# Worker fallbacks
+# Worker fallbacks: when to delegate, when not to
 
-Audience: remote-planner maintainers choosing local execution workers. For Herdr-native agent concepts and automation primitives, use the upstream [Agents](https://herdr.dev/docs/agents/) and [Agent automation](https://herdr.dev/docs/agent-automation/) guides instead.
+herdr-mcp treats the Web AI as the high-level planner. Local coding agents are replaceable execution workers, not a second orchestration layer.
 
-herdr-mcp keeps the web model as the planner. Local agent CLIs are execution workers, not a second orchestration layer.
+This page answers two practical questions:
 
-## Recommended order
+1. Which tasks are worth delegating to a local worker?
+2. If the preferred worker is unavailable, stalled or times out, how do you switch without repeating mutations that may already have happened?
 
-| Priority | Worker | Invocation | Intended use |
+## First decide whether the task needs an agent at all
+
+Many development actions are deterministic:
+
+```text
+read a file       → herdr_fs_read
+search code       → herdr_fs_grep
+inspect Git       → herdr_git
+make exact edits  → herdr_fs_edit / patch
+run a command     → herdr_exec
+run long tests    → herdr_exec_start/read
+```
+
+Delegate only when independent reasoning adds real value, for example:
+
+- understanding an unfamiliar subsystem and proposing an implementation;
+- implementing a narrow, self-contained feature;
+- investigating a separate hypothesis in parallel;
+- independently reviewing a completed diff;
+- comparing multiple technical approaches.
+
+The rule is simple:
+
+> Do deterministic work directly. Delegate work that benefits from independent reasoning.
+
+## Recommended worker order
+
+| Priority | Worker type | Typical entry | Good fit |
 |---|---|---|---|
-| 1 | Herdr-native cheap worker, especially Pi | `herdr_prompt` | Normal coding/investigation when local reasoning is useful |
-| 2 | DeepSeek Harness headless | `herdr_exec_start` running `dsh --profile headless "..."` | Bounded fallback for narrow/self-contained coding or review when Pi/Herdr-native workers are unavailable or a second implementation is useful; do not put broad critical-path refactors behind it |
-| 3 | Cline / OpenCode / Anti | `herdr_prompt` when present in a Herdr pane | Alternative Herdr-native coding workers |
-| Human fallback | dsh-tui | interactive terminal | Manual takeover, inspection, resume, approvals; not the default automated worker |
-| Audit | Droid / Grok | `herdr_prompt` | Independent review after implementation, not primary editing by default |
+| 1 | Herdr-native coding worker | `herdr_prompt` | narrow implementation, research, review |
+| 2 | another available Herdr-managed worker | `herdr_prompt` | alternative implementation, parallel validation |
+| 3 | external headless coding-agent CLI | `herdr_exec_start` | bounded fallback work when native workers are unavailable |
+| Human | interactive TUI / shell | manual takeover | approvals, recovery, complex diagnosis |
 
-Deterministic file, Git and shell work should still use `herdr_fs_*`, `herdr_git`, and `herdr_exec` before any agent.
+Brand or model name is not the durable rule. A worker is a good default when it can:
 
-## DSH smoke evidence — 2026-08-23
+- run headlessly and predictably;
+- accept a narrow task boundary;
+- expose observable state;
+- produce verifiable results;
+- allow the planner to determine whether code changed after a timeout.
 
-Tested locally with:
+## Why Herdr-native workers come first
 
-```text
-@deepseek-ai/dsh 0.1.1-rc.2
-@deepseek-harness-tui/dsh-tui 0.9.0
-Node v24.16.0
-```
+A Herdr-managed worker already lives inside a visible workspace/pane lifecycle, so the Web planner can observe:
 
-The installed `dsh-tui` profile composes DeepSeek Harness rc.8 plugin packages. Because DeepSeek Harness is still a developer preview, the launcher/profile/plugin versions may move independently and compatibility should be rechecked after upgrades.
+- working / idle / done state;
+- pane output;
+- cwd;
+- workspace ownership;
+- prompt delivery evidence;
+- `idempotency_key` behavior.
 
-### Headless answer
-
-The non-interactive interface is suitable for automation:
-
-```bash
-dsh --profile headless "Reply exactly DSH_OK and do not use tools."
-```
-
-It returned:
+Typical flow:
 
 ```text
-DSH_OK
+herdr_prompt
+  ↓
+herdr_since / herdr_inspect
+  ↓
+Git / tests verification
 ```
 
-### Controlled code edit
+That is easier to orchestrate over long periods than a completely independent CLI process.
 
-A temporary Git repository was created outside the herdr-mcp working tree with this deliberate bug:
+## Where external CLI workers fit
 
-```js
-export function add(a,b){ return a-b; }
-```
+Some coding agents expose a headless CLI and can serve as fallback workers.
 
-DSH received one task asking it to change only that file so `add(a,b)` returns `a+b`.
-
-Observed result:
-
-- the edit completed successfully;
-- `add(2,3)` evaluated to `5`;
-- the file was the only changed file;
-- the process did not print its final assistant summary within the remote synchronous 60-second budget.
-
-This matters for orchestration: **DSH can edit code successfully, but it should be treated as a long-running worker.** Do not conclude failure merely because no final answer arrived inside 60 seconds, and do not blindly retry after a timeout because the mutation may already have happened.
-
-## Correct DSH invocation from herdr-mcp
-
-Prefer a background exec session:
+Use this model:
 
 ```text
-resolve dsh first (the background exec PATH may be smaller than the visible utility-pane PATH)
-  -> command -v dsh
-  -> otherwise check $HOME/.npm-global/bin/dsh or the installation-specific bin path
-herdr_exec_start(root=<project>, command='<resolved-dsh> --profile headless "<task>"')
-  -> herdr_exec_read(...)
-  -> inspect Git/tests before retrying if the worker exceeds the expected budget
-  -> herdr_exec_kill(...) only when cancellation is actually required
+Web planner
+  ↓
+herdr_exec_start
+  ↓
+external coding CLI
+  ↓
+Git / tests
 ```
 
-Do not assume that a command visible in the persistent utility pane is also on
-the `herdr_exec_start` background PATH. In the 2026-08-23 production smoke,
-plain `dsh` exited 127 from a background session while the same installation
-was available at `$HOME/.npm-global/bin/dsh`. Resolve the executable before
-dispatch rather than treating 127 as an agent/model failure.
+Do not turn the external CLI into another planner and ask it to decide how to delegate further. The Web planner should narrow the job first.
 
-Recommended task contract:
+A good task contract states:
 
-- identify the exact repository and file/feature boundary;
-- tell DSH not to modify unrelated files;
-- require tests or a deterministic verification command;
-- do not ask DSH to dispatch other agents;
-- after a timeout, inspect `git status` / `git diff` before re-submitting.
+- exact repository;
+- file or feature boundary;
+- no unrelated edits;
+- completion criteria;
+- verification command;
+- no further agent delegation.
 
-Unlike `herdr_prompt`, this path does not yet provide Herdr-native agent lifecycle events or idempotency keys. That is why Pi remains the default worker when available.
+## Why external coding agents should use long-running exec sessions
 
-### Orchestration evidence from real herdr-mcp work
+A coding agent may finish the code change well before it prints its final natural-language summary.
 
-Two independent headless DSH jobs were used against real herdr-mcp bugs:
+With a synchronous command, the failure mode can look like this:
 
-- **GitHub Pages deployment:** DSH completed and correctly determined that the
-  static-site/workflow files themselves were sufficient and that the workflow
-  commit had not reached remote `main`. The web planner then resolved the
-  machine-specific SSH host-key issue and completed the deployment.
-- **Browser workspace/HUD failure:** DSH remained active for roughly seven
-  minutes with no stdout and no target-file diff. It was cancelled at the
-  orchestration budget and the web planner fell back to deterministic browser,
-  socket and network evidence. That investigation found the actual root cause:
-  one long-lived `/push/events` SSE per historical binding exhausted Chromium's
-  per-origin HTTP connection pool and starved `/push/state`.
+```text
+CLI already changed the code
+      ↓
+wait for final model summary
+      ↓
+client timeout
+      ↓
+assume failure
+      ↓
+submit the same task again  ← dangerous
+```
 
-This is the intended fallback model: DSH is a capable coding worker, but it is
-not allowed to stall the critical path indefinitely. Give it a task-appropriate
-budget; if there is no useful output or diff, inspect process/Git state before
-cancelling, then fall back to direct fs/exec/browser evidence or another worker.
+Prefer:
 
-### Headless scheduling lesson from the docs redesign — 2026-08-23
+```text
+herdr_exec_start
+  ↓
+herdr_exec_read
+  ↓
+inspect Git / tests
+  ↓
+herdr_exec_kill only when cancellation is actually needed
+```
 
-The documentation-site redesign provided a stricter orchestration test than the
-temporary-repository smoke. Several increasingly constrained headless jobs were
-given the same isolated worktree: first the broad redesign, then a fixed file
-scope, then an exact navigation map and execution-only instructions. They spent
-roughly minutes in analysis/tool reads without producing a tracked diff, while
-the deterministic web-planner path implemented and validated the change within
-the same worktree.
+A process timeout and a failed coding task are not the same thing.
 
-A per-invocation headless configuration override was also tested to reduce
-reasoning and to select a faster execution model. That improved trivial no-tool
-smokes but did **not** make the multi-file coding or P0/P1 review tasks reliably
-fast enough for the critical path. The reusable rule is therefore about task
-shape and evidence, not about one provider or model:
+## After a timeout, inspect facts before retrying
 
-- keep architecture, information architecture and cross-file planning with the
-  web planner;
-- give DSH a narrow task with explicit owned files, expected validation and a
-  time/diff checkpoint;
-- if the checkpoint arrives with neither useful output nor a relevant diff,
-  inspect Git/process state once, cancel if appropriate, and continue with
-  deterministic tools or a Herdr-native worker;
-- prompt wording such as “implement now” is not a substitute for orchestration
-  budgets and completion evidence;
-- model/reasoning overrides for automated headless jobs, when useful, should be
-  scoped to the headless invocation/profile (for example through a temporary
-  `--patch`), not written into the operator's global interactive/TUI profile as
-  an automation side effect.
+For any coding worker timeout:
 
-DSH remains useful as an optional fallback and for narrow independent checks;
-it is not the default owner of a broad multi-file implementation.
+```text
+1. inspect worker/pane/process state
+2. git status
+3. git diff
+4. inspect target files
+5. run relevant tests
+6. only then choose continue / fix / cancel / retry
+```
 
-## dsh-tui
+If a relevant diff already exists, a mutation has at least partially happened.
 
-The installed TUI profile successfully composes after bringing the local credential document to the current version-1 schema (`version: 1` plus the `refs:` mapping). `dsh --profile dsh-tui --dump-config` then completes successfully.
+The right next action is usually to verify, ask the existing worker to finish, or let the Web planner fix a small remainder — not to resend the whole original task.
 
-Use dsh-tui for:
+## How to recognize a genuinely stalled worker
 
-- a human operator taking over an ongoing task;
-- browsing/resuming Harness sessions;
-- interactive approvals and questions;
-- inspecting model/reasoning/profile configuration.
+Do not use “no final answer for a few minutes” as the only signal. Better evidence includes:
 
-Do **not** use dsh-tui as the normal automated fallback from ChatGPT. A full-screen or interactive terminal has no clean machine-level “final result” contract, while the headless profile does.
+- process or pane remains active but output stops changing;
+- no relevant Git diff appears;
+- process activity no longer advances;
+- the worker repeats the same reads without producing new evidence;
+- the task has exceeded a reasonable budget for its scope;
+- the critical path is blocked with no new information.
 
-## Upgrade rule
+Then:
 
-Because DSH is a fast-moving developer preview, never hard-code assumptions from one release. Before promoting it in the worker order after an upgrade, verify:
+1. read state one more time;
+2. if there is no mutation evidence, cancel;
+3. continue with deterministic tools or another worker.
 
-1. `dsh --version`;
-2. `dsh --profile headless --help`;
-3. one no-tool answer smoke;
-4. one temporary-repo edit smoke;
-5. `dsh --profile dsh-tui --dump-config` if the TUI is installed.
+Do not keep waiting indefinitely just because time has already been spent.
 
-The herdr-mcp project skill should advertise DSH as an optional installed fallback only when its binary is actually present; the web planner remains responsible for choosing it.
+## When parallel workers help
+
+Good parallelism:
+
+```text
+worker A → implementation
+worker B → independent review
+```
+
+or:
+
+```text
+worker A → investigate browser layer
+worker B → investigate server layer
+```
+
+Bad parallelism:
+
+```text
+worker A, B and C all edit the same file
+```
+
+unless each works in an isolated worktree and the Web planner explicitly owns the final integration.
+
+## Isolate real parallel development with worktrees
+
+When multiple workers need to edit code:
+
+```text
+main worktree
+    │
+    ├─ worktree A → implementation
+    └─ worktree B → alternative / review fix
+```
+
+This avoids:
+
+- dirty-file gate conflicts;
+- workers overwriting each other;
+- uncertainty about which worker produced which diff;
+- one worker's reset/format operation affecting another.
+
+The Web planner compares diffs and test evidence before choosing merge, cherry-pick or manual integration.
+
+## Review workers should not become the default primary editor
+
+Independent review is valuable because it is independent.
+
+Recommended sequence:
+
+1. implement through the primary path;
+2. run deterministic tests;
+3. give the diff to an independent review worker;
+4. let the Web planner judge whether findings are valid;
+5. fix small issues directly, delegate larger corrections only when useful.
+
+If the reviewer owns the whole implementation from the beginning, much of that independence disappears.
+
+## Revalidate external workers after upgrades
+
+External agent CLIs evolve quickly, so long-lived docs should not freeze version-specific assumptions.
+
+After an upgrade, recheck:
+
+1. `--version`;
+2. headless/non-interactive help;
+3. a no-tool answer smoke test;
+4. a tiny edit in a temporary Git repository;
+5. whether Git evidence reveals mutations after timeout;
+6. profile/plugin loading if the worker depends on them.
+
+Only then put that worker back on an automated critical path.
+
+## Human takeover is a first-class capability
+
+Some tasks are better handled by a person:
+
+- OAuth or login;
+- security approval;
+- interactive TUI workflows;
+- visually complex state;
+- high-risk external mutation;
+- a worker whose behavior has become unpredictable.
+
+Herdr's visible workspace/pane model makes manual observation and takeover part of the architecture rather than an emergency escape hatch.
+
+## Recommended delegation flow
+
+```text
+Inspect
+  ↓
+Can deterministic tools do it?
+  ├─ yes → fs/git/exec
+  └─ no
+       ↓
+   define one narrow worker task
+       ↓
+   dispatch
+       ↓
+   since / process read
+       ↓
+   Git + tests
+       ↓
+   independent review when useful
+       ↓
+   Web planner decides the next move
+```
+
+## Final rule
+
+Workers are replaceable execution resources. Project state is the source of truth.
+
+Completion is never merely:
+
+> “The agent says it finished.”
+
+Completion means:
+
+- the diff is correct;
+- tests pass;
+- runtime state matches expectations;
+- important side effects are accounted for.
+
+That lets herdr-mcp work with different agents without binding the orchestration architecture to one model or CLI.

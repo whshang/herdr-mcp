@@ -1,110 +1,209 @@
-# Automation
+# Automation: separate documentation, Edge, and runtime release planes
 
-Audience: maintainers operating CI/CD, Pages, production Edge deployment, and local runtime release automation. End users do not need this page for first setup.
+This page is for maintainers. New users do not need to understand all CI/CD details to install herdr-mcp.
 
-herdr-mcp has three intentionally separate automation planes. They share source control, but they do not share credentials or failure domains.
+herdr-mcp intentionally separates automation into independent planes:
 
-## 1. GitHub Pages
+```text
+Documentation       Public Edge          Local Runtime
+GitHub Pages         Cloudflare Worker    runtime generation A/B
+     │                    │                     │
+Human + agent docs    OAuth/MCP/WSS       fs/git/shell/Herdr
+```
 
-Workflow: `.github/workflows/pages.yml`
+They share a repository, but not credentials, rollback boundaries, or failure domains.
 
-Published site:
+## Why separate release planes
+
+A normal fix should not accidentally change:
+
+- public documentation;
+- OAuth identity;
+- Cloudflare routing;
+- local runtime generation;
+- ChatGPT tool contract.
+
+The rule is simple: change the smallest plane required by the task.
+
+## GitHub Pages
+
+Workflow:
+
+```text
+.github/workflows/pages.yml
+```
+
+Site:
 
 ```text
 https://whshang.github.io/herdr-mcp/
 ```
 
-The Pages artifact contains:
-
-- `site/` — static product/install page;
-- rendered HTML for every tracked `docs/*.md` page (excluding `docs/_wip/`);
-- `herdr-mcp-SKILL.md` — public remote-planner policy copied from `assets/herdr-mcp-SKILL.md`;
-- `release.json` — current package version + Git commit + docs/skill locations.
-
-The repository is public, and Pages uses the repository's native GitHub Pages deployment. `npm run build:site` is the single build path used by both CI and the Pages workflow, so a documentation change cannot bypass the same static-site build used for publication.
-
-This makes Pages both the human-facing documentation site and a credential-free update source for `herdr_skill`.
-
-`herdr_skill` uses the Pages skill URL by default, caches it, and falls back to the release-bundled `assets/herdr-mcp-SKILL.md` if Pages/network is unavailable. Set `HERDR_SKILL_NETWORK=0` for fully offline behavior or `HERDR_MCP_SKILL_URL` to override the policy endpoint.
-
-## 2. CI
-
-Workflow: `.github/workflows/ci.yml`
-
-Every push to `main` and every pull request runs:
-
-1. `npm ci`;
-2. TypeScript build;
-3. documentation site build (`npm run build:site`);
-4. root test suite;
-5. Edge/frozen-contract suite;
-6. browser-extension smoke;
-7. shell syntax checks;
-8. npm package dry-run;
-9. `git diff --check`.
-
-The root runtime version may move independently from the ChatGPT public contract epoch. Production currently freezes epoch 2 at 18 tools; epoch-1 compatibility tests remain only to prove the historical 17-tool rollback/old-session ABI is still reproducible.
-
-## 3. Cloudflare Edge production deployment
-
-Workflow: `.github/workflows/cloudflare-edge.yml`
-
-The workflow runs only for `main` changes that affect the Edge/Relay/package deployment surface, or by manual dispatch. It first runs the Edge/contract and root regression gates, then deploys `edge/cloudflare/wrangler.prod.toml` with `cloudflare/wrangler-action@v4` and Wrangler major 4.
-
-The deploy job uses the GitHub Environment:
-
-```text
-production
-```
-
-Required Environment secrets:
-
-```text
-CLOUDFLARE_ACCOUNT_ID
-CLOUDFLARE_API_TOKEN
-```
-
-The least-privilege target is **Workers Scripts Write only** for the target account. The currently provisioned GitHub Environment secret reuses the existing Herdr cutover credential, which has **Workers Scripts Write + Workers Routes Write** and still has no DNS Write, Tunnel Edit or Account Admin. This is sufficient for deployment but should be replaced by a scripts-only token when a bootstrap credential capable of minting API tokens is available. Custom Domain ownership/routing is intentionally not mutated by the deploy workflow.
-
-After deployment the workflow checks the independent workers.dev health endpoint. The existing Custom Domain continues to target the same Worker service.
-
-## 4. Local runtime self-update
-
-CLI: `herdr-self-update`
-
-The runtime release plane is intentionally separate from Cloudflare deployment. Updating local herdr-mcp must not restart the public Edge or persistent `herdr-link`.
-
-Typical remote-planner flow:
+Build entry:
 
 ```bash
-herdr-self-update status
-herdr-self-update check
-herdr-self-update apply --source remote --ref main
+npm run build:site
 ```
 
-For testing an uncommitted development tree:
+The site generator validates the logical document model, locale completeness, navigation and generated pages.
+
+Pages serves both:
+
+```text
+Human documentation
+
+Remote planner policy
+```
+
+`herdr_skill` can use the published skill source and fall back to the bundled release copy when network access is unavailable. `HERDR_SKILL_NETWORK=0` forces offline behavior.
+
+## CI
+
+Workflow:
+
+```text
+.github/workflows/ci.yml
+```
+
+CI proves that a commit does not break other planes. Typical gates include:
+
+- dependency install;
+- TypeScript build;
+- documentation site build;
+- runtime tests;
+- Edge/frozen-contract tests;
+- extension smoke tests;
+- shell syntax checks;
+- package dry-run;
+- `git diff --check`.
+
+The public MCP contract is intentionally more stable than runtime implementation. Production currently uses **contract epoch 2 / 18 tools**. Historical compatibility tests may exist, but normal runtime changes should not silently change the public catalog.
+
+## Cloudflare Edge deployment
+
+Workflow:
+
+```text
+.github/workflows/cloudflare-edge.yml
+```
+
+Edge automation manages the public control plane:
+
+- Worker / Durable Object;
+- OAuth;
+- MCP relay;
+- workstation routing;
+- post-deploy health checks.
+
+Deployment secrets belong in GitHub Environment/Secrets.
+
+A normal Worker deployment should not automatically modify:
+
+- Custom Domain;
+- DNS;
+- legacy Tunnel state;
+- OAuth issuer;
+- workstation identity;
+- local runtime generation.
+
+Domain and DNS mutations are separate operations with separate rollback evidence.
+
+See [Cloudflare Edge deployment](cloudflare-edge-deployment.md) and [Cloudflare Edge credentials](cloudflare-edge-token.md).
+
+## Local runtime automation
+
+Local releases use runtime generations instead of replacing the active process in place:
+
+```text
+stable A
+  ↓
+candidate B
+  ↓
+health + contract gate
+  ↓
+activate
+  ↓
+keep rollback target
+```
+
+Common entry points:
 
 ```bash
-herdr-self-update apply --source working-tree
+bin/herdr-runtime-generation status
+bin/herdr-self-update status
+bin/herdr-self-update check
 ```
 
-`apply` starts a detached supervisor and returns before the current MCP runtime is restarted. The worker records structured progress under `~/.config/herdr-mcp/`, builds/tests an isolated release, starts a loopback candidate, uses the persistent generation manager to validate and activate it, reloads the stable 8772 runtime from the new release, promotes the new stable generation and removes the temporary candidate.
+`herdr-self-update` automates candidate build, validation, activation and observation. It does not own:
 
-The updater inherits the current contract profile. It **does not** automatically change the ChatGPT contract epoch, DNS, OAuth issuer, Custom Domain or Edge deployment.
+- contract epoch migration;
+- Edge deployment;
+- OAuth issuer migration;
+- DNS / Custom Domain changes.
 
-After an update, verify from the same remote Connector:
+See [Runtime A/B](runtime-self-upgrade.md).
 
-- `herdr_inspect` reports the new runtime version;
-- generation status reports the new stable generation;
-- Edge `/status/<workstation>` converges to that version/generation;
-- the public contract epoch/hash remain unchanged unless an explicit contract migration was intended.
+## Contract epoch migration
 
-## 5. `herdr_skill` responsibility
+A public MCP tool surface change is different from a runtime implementation update.
 
-`herdr_skill` is not merely the official Herdr usage tutorial. It composes three layers:
+```text
+runtime implementation upgrade
+        ≠
+public MCP contract migration
+```
 
-1. **herdr-mcp project policy** — direct edit/tool order, agent dispatch preferences, mutation/idempotency rules, browser boundary and self-maintenance procedure;
-2. **live runtime context** — running version, contract profile, generation/self-update state;
-3. **release-matched native Herdr reference** — `herdr --skill`, clearly scoped as pane-local reference so its `HERDR_ENV=1` rule does not incorrectly stop a remote web planner.
+A contract migration affects ChatGPT tool snapshots and requires explicit evidence across local runtime, Link identity, public Edge and new conversation validation.
 
-Project policy has precedence for ChatGPT/Web usage. `herdr_methods` remains the live authority for installed native socket method names and schemas.
+## Browser extension release
+
+The extension is the continuity layer. It shares repository versioning but keeps separate trust boundaries.
+
+Validation includes:
+
+- manifest and JavaScript compatibility;
+- Native Messaging host;
+- workspace binding;
+- Auto gates;
+- progress/settled behavior;
+- recovery/handoff;
+- JSON → MCP bridge.
+
+Real browser UAT is still required because Node tests cannot prove page behavior.
+
+## `herdr_skill`
+
+`herdr_skill` combines:
+
+1. herdr-mcp project policy;
+2. runtime / contract / generation context;
+3. matching Herdr guidance.
+
+It guides Web planner behavior. It does not replace CI, deployment scripts or runtime management.
+
+`herdr_methods` remains the authority for the installed Herdr Socket API schema.
+
+## Release decision table
+
+| Change | Release plane |
+|---|---|
+| Docs, navigation, tutorials | Pages |
+| Worker/OAuth/relay | Edge |
+| Local implementation | Runtime A/B |
+| Browser continuity | Extension + compatibility validation |
+| Tool catalog/schema ABI | Contract epoch migration |
+| Custom Domain/DNS | Domain cutover |
+
+## What completion means
+
+A green workflow is not the final proof.
+
+The corresponding runtime evidence is required:
+
+- Pages: generated pages and links work;
+- Edge: health + workstation + OAuth/MCP work;
+- Runtime: active generation + real tool call + rollback target;
+- Extension: real site binding/Auto/recovery smoke;
+- Contract: a new conversation receives the expected tool snapshot.
+
+Automation is valuable because it fixes verification and rollback boundaries, not because it removes every human decision.

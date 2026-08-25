@@ -1,157 +1,260 @@
-# ChatGPT Connector
+# ChatGPT Connector：让网页里的 ChatGPT 真正接到本地工作站
 
-读者：给 ChatGPT 接 herdr-mcp 的人，以及改 OAuth / Streamable HTTP 的代理。
+ChatGPT 不能直接访问 `127.0.0.1`。herdr-mcp 因此把本机开发环境放在一个稳定的远程 MCP 入口后面：ChatGPT 连接 Cloudflare Edge，工作站再通过出站 WSS 主动连到 Edge。
 
-如果只是想把 ChatGPT 接通，第一次只需要看 **公网 URL → OAuth → 验收**；MCP UA、schema 和代理实现细节属于参考内容，可以后读。如果本机 runtime / Edge 还没跑起来，先看 [快速开始](quick-start.md)。
+```text
+ChatGPT
+  │ OAuth + MCP
+  ▼
+Cloudflare Edge
+  │ authenticated WSS
+  ▼
+herdr-link / herdr-mcp
+  │
+  ├─ files / Git / shell
+  └─ Herdr workspaces / panes / agents
+```
 
-相关入口：[README.md](../../../README.md)、`src/oauth.ts`、`src/server.ts`。
+如果本地 runtime 和 Edge 还没有部署，先看 [安装](install.md)。本页集中解释 ChatGPT 这一侧：怎样连接、为什么需要 OAuth、什么叫“连接成功”、工具快照为什么会陈旧，以及出现问题时应该查哪一层。
 
-## 「已连接」到底指什么
+> ChatGPT 的 Developer mode、Apps / custom MCP UI 和套餐权限仍在持续演进。项目文档描述 herdr-mcp 需要满足的协议边界；具体菜单名称和账户可用范围以 OpenAI 当前官方文档为准。
 
-ChatGPT 有两层：
+## 连接前先理解三个不同的“成功”
 
-1. **OAuth / 安装 connector** — 设置里能看到插件。
-2. **工具 schema 注册** — `tools/list` 成功，且 ChatGPT 接受每一份 `inputSchema`。
+### 1. OAuth 成功
 
-可能出现：设置里已安装，但当前对话 **0 个工具**。常见原因是 (2) 失败，或旧对话还握着旧工具快照。重连后请 **开新对话**。反复装 2～3 次多半是缓存，不一定是服务挂了。
+ChatGPT 知道这个 MCP 服务是谁，也拿到了访问授权。
 
-## 公网 URL
+### 2. MCP 握手成功
 
-- ChatGPT 用的资源地址：`{HERDR_MCP_BASE_URL}/mcp`
-- Issuer / OAuth 发现：`{HERDR_MCP_BASE_URL}`（环境变量不要带 `/mcp` 后缀）
-- 默认公网：Cloudflare Worker 的 `workers.dev`，不要求自有域名
-- 已有 Cloudflare zone 时建议绑定 Custom Domain 作为长期稳定 origin，但不是前置条件
-- Quick Tunnel / 直接 `cloudflared` 只作为旧架构迁移或故障排查，不再是新安装默认路径
-- 改公网 origin 时必须同步 OAuth issuer/resource；正常 runtime 升级不应改变这个稳定地址
+ChatGPT 能完成 initialize / discovery / `tools/list`。
 
-## 工具权限卡：「允许 ChatGPT 使用 herdr？」
+### 3. 工作站真的可达
 
-这是 **ChatGPT 网页自己的审批 UI**，不是 herdr-mcp 服务端开关。
+工具调用能穿过 Edge 和 workstation link，最终看到本机 Herdr / Git / shell。
 
-| 你想做的事 | 现实 |
+这三层可以独立失败。所以“设置页面显示已连接”并不等于“当前聊天已经能改代码”。
+
+最可靠的验收不是看一个绿色连接状态，而是在**新会话**里执行一次真实 `herdr_inspect`。
+
+## 创建 Connector / Custom MCP App
+
+当前 ChatGPT Web 的开发者模式可以添加自定义 MCP 应用。界面和套餐权限可能变化，整体流程保持一致：
+
+1. 在 ChatGPT Workspace / Apps 设置中启用 Developer mode；
+2. 创建或添加自定义 MCP App / Connector；
+3. MCP URL 填写：
+
+   ```text
+   https://<your-edge-origin>/mcp
+   ```
+
+4. 完成浏览器 OAuth；
+5. 保存后新建一个聊天进行验收。
+
+**不要填写本机 `HERDR_MCP_TOKEN`。** ChatGPT 公网入口使用 OAuth；静态 bearer 只用于本机 curl / Cursor 和兼容路径。
+
+如果组织对自定义 MCP 应用有管理员审批、Action control 或 RBAC，先满足 Workspace 侧策略。herdr-mcp 无法绕过 ChatGPT 自己的组织治理。
+
+## 为什么 OAuth issuer 不能随便换
+
+一个 Connector 不只是记住 `/mcp` 地址。OAuth metadata、issuer、resource audience 和 MCP origin 必须互相一致。
+
+推荐配置：
+
+```text
+HERDR_MCP_BASE_URL=https://herdr-edge.example.workers.dev
+MCP URL=https://herdr-edge.example.workers.dev/mcp
+```
+
+`HERDR_MCP_BASE_URL` 不带 `/mcp`。
+
+Edge origin 应当稳定。本地 runtime 可以升级、A/B 切代甚至回滚；只要 contract 和 Edge identity 不变，ChatGPT Connector 不需要跟着重新配置。
+
+这也是项目把 Edge 生命周期和本机 runtime 生命周期分开的原因。
+
+## OAuth 链路
+
+ChatGPT 会探索远程服务器的 OAuth / protected-resource metadata。herdr-mcp Edge 对这条链路负责：
+
+```text
+ChatGPT
+  │ discover protected resource
+  │ discover authorization server / OpenID metadata
+  │ authorize + PKCE
+  │ token
+  ▼
+OAuth access token
+  │
+  ▼
+/mcp
+```
+
+实现兼容 Client ID Metadata Document、PKCE、JWT access token 和当前 ChatGPT MCP 客户端行为。
+
+排查时重点关注：
+
+- public origin 是否一致；
+- `OAUTH_ISSUER` 是否与用户实际访问的 origin 一致；
+- redirect/token 请求是否成功；
+- token 的 audience 是否对应 MCP resource；
+- Edge 是否能继续把工具调用路由到在线 workstation。
+
+OAuth 成功以后 workstation 仍可能离线，所以不要把 OAuth 当作完整健康检查。
+
+## 为什么新会话很重要：tool snapshot
+
+ChatGPT 会缓存一个会话看到的 MCP 工具定义。服务器升级以后，已经存在的对话不一定立刻刷新工具 schema。
+
+herdr-mcp 当前 production contract 是：
+
+**contract epoch 2 / 18 tools，包含 `herdr_skill`。**
+
+典型现象：
+
+```text
+服务器已经 epoch 2 / 18 tools
+        │
+        ├─ 新会话：18 tools ✓
+        │
+        └─ 老会话：仍看到 epoch 1 / 17 tools
+```
+
+这时不要马上重装服务器。先：
+
+1. 确认 Edge / runtime 暴露的是当前版本；
+2. 在 ChatGPT 刷新自定义 App/Connector actions（如果当前 Workspace UI 提供此动作）；
+3. 新建会话重新获取 tool snapshot。
+
+工具 catalog 真正发生不兼容变化时，项目使用 contract epoch 管理；普通 runtime bugfix 不应该随意改变 catalog。
+
+## 为什么工具少反而更适合 ChatGPT
+
+Herdr 原生 Socket API 有大量方法。把每个方法都变成 MCP tool，会让 ChatGPT 每轮携带大量 schema，也让工具选择变得困难。
+
+ChatGPT 常用的是：
+
+```text
+herdr_inspect
+herdr_since
+herdr_fs_*
+herdr_git
+herdr_exec*
+herdr_prompt
+```
+
+低频 Herdr 原生能力再由 `herdr_methods` → `herdr_call` 动态发现。
+
+所以 `tools/list` 很短，但能力并没有被裁掉。
+
+## 一次真实会话应该怎样开始
+
+推荐的第一条任务可以很简单：
+
+```text
+检查当前 Herdr 工作区和 Git 状态。只读，不要修改。
+```
+
+理想流程：
+
+1. ChatGPT 调 `herdr_inspect`；
+2. 读取一次 `herdr_skill` 获取当前操作策略；
+3. 选定目标 managed Git root；
+4. 用 `herdr_git status` / `herdr_fs_read` 获取事实；
+5. 回答用户。
+
+之后真正开发时再进入 patch / exec / agent delegation。
+
+这比用“工具数量显示正确”作为唯一验收更可靠。
+
+## 权限确认卡是谁控制的
+
+ChatGPT 对写入或有风险的 App action 可能显示确认 UI。这个行为属于 ChatGPT 产品安全层，herdr-mcp 服务端无法保证“永远不询问”。
+
+项目浏览器扩展可以在满足严格条件时自动处理**页面 DOM 内明确的 Allow/允许卡片**，但它不会绕过 Workspace 权限，也不会处理浏览器/系统原生权限对话框。
+
+当前 ChatGPT Project 自动化只有在：
+
+- Options 允许 Project 自动化；
+- 当前 Project HUD 为 `自动 开`；
+- 页面出现可识别、可见、可用的允许动作；
+
+时才进行自动点击。`自动 关` 时只观察。
+
+详见 [浏览器连续工作](browser-continuity.md) 与 [自动继续、恢复和接力](extension-wake.md)。
+
+## Streamable HTTP 与 ChatGPT 兼容层
+
+下面属于维护者参考，普通用户不需要为了连接成功理解全部细节。
+
+### ChatGPT 路径保持无状态
+
+herdr-mcp 对 ChatGPT 的 MCP HTTP 路径不依赖长期 `Mcp-Session-Id`。实践中，runtime 重启后客户端继续复用 stale session id 会产生 `Session terminated` 一类假故障。
+
+长命令状态由 `herdr_exec_start/read/kill` 独立管理，不需要绑定 MCP HTTP session 生命周期。
+
+### initialize / tools/list
+
+ChatGPT MCP 客户端对协议版本和响应形态有明确兼容需求。项目的兼容层负责：
+
+- discovery / initialize；
+- protocol-version negotiation；
+- SSE / JSON 响应形态；
+- CallToolResult 的结构化内容和 image 透传；
+- OAuth 错误与 JSON-RPC 错误语义分离。
+
+不要为了修一个客户端兼容问题把公共 tool schema 随意改掉。
+
+### schema 是一个整体
+
+一个不兼容的 `inputSchema` 可能导致 ChatGPT 拒绝整份 tool catalog。历史上需要特别谨慎的 JSON Schema 结构包括自由对象、某些 `additionalProperties` 形态以及客户端不接受的约束关键字。
+
+因此改工具输入时必须跑真实 ChatGPT UAT，不能只验证本地 MCP inspector。
+
+## 长任务为什么还需要浏览器扩展
+
+MCP 是请求驱动的。ChatGPT 把任务成功交给一个 Herdr Agent 后，工具调用可能已经返回，而 Agent 仍在本机工作。
+
+```text
+ChatGPT: “已提交任务”
+        ↓
+本轮网页回合结束
+
+Herdr Agent: working ... working ... done
+```
+
+没有额外通道，Agent done 并不会自动让 ChatGPT 开始下一轮。
+
+浏览器扩展负责把本地 progress / settled 事件送回绑定会话，并处理回复卡住和长对话 handoff。因此：
+
+- Connector 解决 **ChatGPT → workstation**；
+- 浏览器 continuity 解决 **workstation → ChatGPT**。
+
+两条方向合起来才适合持续数小时的网页开发工作。
+
+## 从症状定位故障层
+
+| 症状 | 优先检查 |
 |---|---|
-| 服务端强制「全部自动允许」 | **做不到。** Connector 网页没有稳定的 `require_approval: never`；那是 Responses API 开发者参数，不是 chatgpt.com 设置项 |
-| 点一次「Always allow」后永久生效 | 社区反馈不稳定，有时会丢会话 / 重走 OAuth |
-| 少点几次「允许」 | 装本仓库浏览器扩展，Options 勾选**启用项目自动**，并在当前 Project HUD 打开 **`自动 开`**；权限卡自动处理已包含在 Project 自动化中，此时才会对 **chatgpt.com** 页面内明确的权限卡自动点「允许」（见下） |
+| Connector 根本添加不了 | public URL / OAuth metadata / Workspace developer permissions |
+| OAuth 成功，聊天里没有工具 | tools/list / schema / App action refresh / 旧会话 snapshot |
+| 能看到工具，但 `herdr_inspect` 报 workstation offline | herdr-link / workstation identity / runtime health |
+| `herdr_inspect` 正常，文件工具失败 | managed Git root / readonly / path gate |
+| shell/Agent 工作了但网页不继续 | browser extension binding / Auto / progress channel |
+| 显示 Session terminated | MCP compatibility / stale session semantics，不要先怀疑 Git 仓库 |
 
-扩展行为（`extension/`，内容脚本 ≥ 0.1.3）：
+完整排查顺序见 [故障排查](troubleshooting.md)。
 
-- 识别页面内「允许 / 拒绝」工具权限卡（含 `data-testid=tool-action-buttons`）
-- **chatgpt.com 打开后持续观察**，但观察与 mutation 分离：`自动 关` 时仍可识别状态，不点击任何权限动作
-- 只有 **Options 勾选启用项目自动 + 当前 Project HUD `自动 开`** 同时成立时才自动点击；不再有独立的权限卡开关
-- 只点可见、可用、文案明确为允许类的按钮；有拒绝按钮同卡才点（fail-closed）
-- **点不了**：浏览器原生权限条、非 DOM 的系统对话框
+## 最低验收标准
 
-服务端可做的只是诚实标注（例如 `readOnlyHint`）；ChatGPT 目前常忽略，仍可能把只读工具当成写操作来问。
+一次真正成功的 ChatGPT 接入至少满足：
 
-每次工具调用仍弹卡时：确认扩展已加载、当前标签是 `chatgpt.com`、Options 已勾选**启用项目自动**、当前 Project HUD 为 **`自动 开`**；浏览器原生权限条需要人工处理。
+- OAuth 完成；
+- 新会话能看到当前 contract；
+- `herdr_inspect` 返回真实 workstation；
+- 能读一个 managed Git 项目；
+- 能执行一条安全测试命令；
+- 写操作的确认和权限行为符合预期；
+- 长任务场景下，安装扩展后能收到 progress / settled 回推。
 
-## OAuth（CIMD）
-
-ChatGPT 偏好 **Client ID Metadata Document**（`https://chatgpt.com/oauth/.../client.json`），不是经典 DCR 密钥。
-
-必须通：
-
-| 步骤 | 期望 |
-|---|---|
-| Protected-resource 元数据 | `/.well-known/oauth-protected-resource` 与 `.../mcp` |
-| AS 元数据 | `/.well-known/oauth-authorization-server`（含 `/mcp` 下变体） |
-| OpenID | `/.well-known/openid-configuration`（ChatGPT 会探；404 曾直接中断连接） |
-| Authorize | PKCE 自动批准跳转 |
-| Token | `authorization_code` + 可选 `private_key_jwt`；拉取 ChatGPT JWKS |
-| Access token | JWT，`aud` = 资源 URL |
-
-不要把静态 Bearer 贴进 ChatGPT connector UI。静态 token 给 Cursor / curl。
-
-线上见过：`client_assertion` 拉 JWKS 超时 → token `400`；重试通常好。
-
-## MCP 线路（UA `openai-mcp`）
-
-| 规则 | 原因 |
-|---|---|
-| 完全 **无状态** — 不发 `Mcp-Session-Id` | 重启后陈旧 sid → 客户端 `-32600 Session terminated` |
-| 忽略未知 sid | 同上 |
-| OAuth 后 `server/discover` 必须成功 | 回 `-32601` 会卡在 `initialize` 前 |
-| discover 列表：**SDK 版本在前**，保留 `2026-07-28` | 发现能完成；线上仍偏好 `2025-11-25` |
-| 请求头 `Mcp-Protocol-Version: 2026-*` → 改写为 `2025-11-25`（`req.headers` **和** `rawHeaders`） | Hono 用 `rawHeaders` 建 Web Request；只改 headers 等于没改 → SDK `400 Unsupported protocol version` |
-| `initialize` / `tools/list` → **SSE** | 全改 JSON（0.3.6）曾出现 OAuth OK、initialize OK、却不再跟 `tools/list` |
-| `tools/call` → JSON 可以 | 隧道下大载荷更稳 |
-| 一次性 transport 只在 `res` finish/close 时关 | `finally` 里抢关会和 SDK `_closed` 竞态 → `404/-32001` |
-| 鉴权失败 JSON-RPC 不要用 `-32600` | ChatGPT 会显示成「Session terminated」 |
-
-识别 ChatGPT：UA `openai-mcp`，或 OAuth JWT 的 `client_id` / `sub` 落在 `chatgpt.com`。
-
-## ChatGPT 会整表丢弃的 schema
-
-一个坏工具就能让 **整张工具表** 消失，connector 看起来仍已安装。
-
-`inputSchema` 里避免：
-
-- `propertyNames`
-- `additionalProperties: {}`（空对象；Zod `z.record` 常长这样 — 要用布尔 `true`、有类型的 schema，或别用自由对象）
-- `exclusiveMinimum`（Zod `.positive()` → 改 `.min(1)`）
-
-`herdr_call.params` 对外标成 **string**（JSON 对象文本）。运行时仍用 preprocess 接受真对象。
-
-改工具面或握手时 bump `SERVER_VERSION` / `package.json`，逼客户端重新 `tools/list`。
-
-**不要只看缓存里的工具数量。** runtime 版本以 `/.well-known/mcp.json` / `initialize.serverInfo.version` 为准；当前 production catalog 是 contract epoch 2，**18 tools 且包含 `herdr_skill`**。如果 ChatGPT 仍显示旧 epoch-1 的 17-tool snapshot，说明 conversation/Connector 缓存过期，而不是 server 还在故意隐藏 skill。若其它字段仍落后（例如缺 `herdr_fs_write.overwrite`、看不到 `inspect.exec_sessions`）：
-
-1. 确认 `mcp.json` 的 `version` 已是当前构建
-2. ChatGPT 里刷新 / 重连 connector
-3. **开新对话**（旧对话会锁住旧 `tools/list` 快照）
-
-输入字段落后（尤其 `overwrite`）会导致「能建文件、不能按契约覆盖」。当前会话先 `herdr_inspect`，再读一次 `herdr_skill`，随后按需要继续 direct tools / `herdr_prompt`。
-
-## 「TaskGroup」/ omp 挂了却说读不了文件
-
-交叉验证（健康的 0.3.10+；控制面毛刺在 0.3.16+ 现场仍可能偶发）：
-
-| 工具 | 期望 |
-|---|---|
-| `herdr_fs_list` / `herdr_fs_read` / `herdr_fs_grep` | 托管 git 根下 `ok: true` |
-| `herdr_exec` | 优先 utility 窗格拿 `exit_code` + `output`（`backend:utility_pane`）；投递前撞 TaskGroup 时可为 `backend:local_fallback`；同项目 working 时需 `confirm_busy`。若 `delivery_uncertain`：**不要**重发同一命令，先看窗格 |
-| `herdr_call` `agent.start` | 同一窗格二次启动可能 `error` — 这是 herdr，不是 fs |
-| `herdr_prompt` / `herdr_call` `agent.prompt` | 控制面 TaskGroup → `failure: herdr_internal` + `failure_phase: control_plane_taskgroup`（≥0.3.22，不再只剩裸 `UNKNOWN`）；等状态超时 → `agent_status_wait_timeout`。默认省略 `wait`，带 `idempotency_key`；先 `herdr_since` 再决定是否重投 |
-
-
-上述都通，则 TaskGroup **不是** herdr-mcp 文件通道故障。常见情况：
-
-1. 把「读项目」走成了 `herdr_prompt` / agent 工具，而不是 `herdr_fs_*`
-2. 窗格 agent 崩了；日志是 `call=agent.*`，不是 `tool=herdr_fs_*`
-3. 占用中的窗格又 `agent.start` 一次
-
-访问日志在 `herdr_call` 上会带 `call=<method>`（只记方法名）。读内容优先 `herdr_fs_*` + `herdr_exec`。
-
-## 编排：网页规划，本机省 API
-
-| 优先级 | 做法 | 本地 agent API |
-|---|---|---|
-| 0 | `herdr_inspect`；若当前 catalog 有 `herdr_skill`，每会话再调用一次 | 不消耗 |
-| 1 | `herdr_fs_*` / `herdr_exec` 读改搜跑 | 不消耗 |
-| 2 | `herdr_prompt` → 便宜/高速 worker（pi、flash…），任务自包含 | 只烧便宜模型 |
-| 禁止默认 | `herdr_prompt` → Claude/OMP/main 再让它指挥其他窗格 | 贵模型大头 |
-
-网页模型用 `herdr_since` / `herdr_inspect` 自己续调度；HUD 的 **「手动继续」** 直接继续网页回合，**「herdr监控」** 会先读取 Herdr 窗口/Agent 状态再继续，不能把规划丢回本机主 agent。
-
-## 排障清单
-
-1. 连接时 `herdr-mcp logs -f`
-2. 期望：authorize → token `200` →（可选 discover）→ initialize → `notifications/initialized` → **`tools/list`**
-3. token `200` 但无 initialize：发现端 / token 形态 / 客户端中止
-4. `tools/list` `200` 但对话 0 工具：schema 拒收或 **旧对话快照** → 开新对话
-5. `/.well-known/mcp.json` 的 `version` 是否等于你以为在跑的构建
-6. 「读不了文件」：确认失败调用是 `herdr_fs_*` / `herdr_exec`，不是 `herdr_call call=agent.*`
-7. 权限卡不停：扩展是否在 chatgpt.com、Options 是否已勾选启用项目自动、当前 Project HUD 是否 `自动 开`；浏览器原生权限条不自动处理
-
-## ChatGPT 派活后对话停住
-
-Connector 只解决「ChatGPT → herdr」。若工具很快返回「已提交」，而 agent 仍在窗格里跑，网页对话常不再自动 `herdr_since` / 继续。
-
-闭环要靠浏览器扩展：绑定该 chatgpt 会话 ↔ 干活的 workspace。对于 ChatGPT Project，只有 Options 允许项目自动且当前 Project `自动 开` 时，才会在 agent **working** 期间回推进度、**settled** 时自动继续，并启用 LLM 判断、回复超时恢复和安全接力。关闭 Project 总许可或当前 Project `自动 关` 时仍观察状态，改用 HUD 的手动继续 / herdr监控 / LLM 分析。普通 ChatGPT `/c/<id>` 使用独立的单会话 Auto，不要求 Project 总许可。**手动接力在 `自动 开/关` 两种状态下都可用**；handoff 会快照 source 的 Auto 状态给 target，并在接力活跃期间暂停 source 的自动 wake，避免显式换会话与普通连续工作并发竞争。见 [extension-wake.md](./extension-wake.md)。
-
-未绑定扩展时，这不是 MCP 故障，是缺回推环。
-
-## 验收（真 ChatGPT）
-
-不要只靠 curl。连续两轮对话，且没有：Session terminated、session 400/404、`network_error`、`invalid_mcp_response`。每次重连后开新对话。派活长任务时：扩展已绑定该对话 ↔ 干活的 **workspace**，working 中有进度、settled 后网页应自动出现继续提示。
+当这些都成立时，ChatGPT 才真正从“远程聊天窗口”变成连接到本机 Herdr 的开发 planner。
