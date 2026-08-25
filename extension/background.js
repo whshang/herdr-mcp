@@ -26,7 +26,7 @@ import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 
-const H2W_SCRIPT_VERSION = "0.1.61";
+const H2W_SCRIPT_VERSION = "0.1.62";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -2968,7 +2968,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (cachedWorkspaces.length) void fetchState();
       const liveWorkspaces = state?.ok && Array.isArray(state.workspaces) ? state.workspaces : [];
       await reconcileBindingWorkspaceLabels(bindings, session, liveWorkspaces);
-      const labels = session.map((b) => canonicalWorkspaceLabel(b, liveWorkspaces) || b.workspace_id).filter(Boolean);
+      const liveWorkspaceIds = new Set(liveWorkspaces.map((workspace) => String(workspace?.id || "")).filter(Boolean));
+      const liveSession = state?.ok
+        ? session.filter((binding) => liveWorkspaceIds.has(String(binding.workspace_id || normalizeWorkspaceId(binding) || "")))
+        : session;
+      const labels = liveSession.map((b) => canonicalWorkspaceLabel(b, liveWorkspaces) || b.workspace_id).filter(Boolean);
       let llmHost = "";
       try {
         llmHost = CFG.llmJudgeBaseUrl ? new URL(llmJudgeCompletionsUrl(CFG.llmJudgeBaseUrl)).host : "";
@@ -3000,6 +3004,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         llmHost,
         bound: session.length > 0,
         workspace_label: labels.length ? labels.join(", ") : null,
+        active_workspace_label: labels[0] || null,
         workspace_id: session[0]?.workspace_id || (session[0] ? normalizeWorkspaceId(session[0]) : null),
         binding_count: session.length,
         bound_workspace_ids: session.map((b) => b.workspace_id || normalizeWorkspaceId(b)).filter(Boolean),

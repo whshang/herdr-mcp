@@ -1,5 +1,7 @@
 # Changelog
 
+- Browser extension **0.1.62** fixes the real ChatGPT title UAT path: the conversation name is read from the current `/c/<id>` navigation item instead of relying on ChatGPT's generic document title, the Project name is recovered from the same structured navigation label when available, and stale/closed Herdr workspace bindings are excluded from the title's active-workspace value.
+
 - Background `herdr_exec_start` sessions and the `herdr_exec` local-shell fallback now choose an available login shell (`zsh` → `bash` → `sh`) instead of hard-coding `/bin/zsh`, so the same exec/session semantics work on Linux CI and Linux Herdr workstations.
 
 Versions below follow `src/version.ts` / `package.json`. Git has no tags; 0.3.19–0.3.25 were never published as separate commits and landed in **0.3.26**.
