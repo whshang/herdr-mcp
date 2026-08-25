@@ -1,4 +1,4 @@
-use crate::mutation;
+use crate::state_store::{ExecSessionFence, StateStore};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,7 +21,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 const MAX_BUFFER_PER_STREAM: usize = 512 * 1024;
 const SESSION_TTL_MS: u64 = 60 * 60_000;
 const KILL_GRACE: Duration = Duration::from_millis(1500);
-const JOURNAL_MAX_ENTRIES: usize = 64;
+const RECOVERY_MAX_ENTRIES: usize = 64;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -70,8 +70,8 @@ struct Session {
 struct RegistryInner {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     recovered: Mutex<HashMap<String, String>>,
-    journal_lock: Mutex<()>,
-    journal_path: PathBuf,
+    state_store: Mutex<StateStore>,
+    persistence_failures: AtomicUsize,
     reaped_on_boot: usize,
     detached_on_boot: usize,
     closed_on_boot: usize,
@@ -97,15 +97,15 @@ impl ExecRegistry {
         #[cfg(unix)]
         fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))
             .map_err(|error| format!("cannot secure exec state directory: {error}"))?;
-        let journal_path = state_dir.join("exec-sessions-rust.json");
-        let recovery = recover_journal(&journal_path);
-        write_journal_value(&journal_path, &json!({"sessions": []}))?;
+        let state_store = StateStore::open_in_dir(&state_dir, "state.db")?;
+        state_store.prune_exec_sessions(now_ms())?;
+        let recovery = recover_state_store(&state_store)?;
         Ok(Self {
             inner: Arc::new(RegistryInner {
                 sessions: Mutex::new(HashMap::new()),
                 recovered: Mutex::new(recovery.states),
-                journal_lock: Mutex::new(()),
-                journal_path,
+                state_store: Mutex::new(state_store),
+                persistence_failures: AtomicUsize::new(0),
                 reaped_on_boot: recovery.reaped,
                 detached_on_boot: recovery.detached,
                 closed_on_boot: recovery.closed,
@@ -151,12 +151,30 @@ impl ExecRegistry {
         if let Some(stderr) = stderr {
             spawn_reader(Arc::clone(&session), StreamKind::Stderr, stderr);
         }
-        self.inner
-            .sessions
+        let mut sessions = match self.inner.sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(_) => {
+                terminate_and_wait(&session);
+                return Err("exec registry lock poisoned".to_owned());
+            }
+        };
+        let process_group = process_group_for_session(pid);
+        let persist_result = self
+            .inner
+            .state_store
             .lock()
-            .map_err(|_| "exec registry lock poisoned".to_owned())?
-            .insert(id.clone(), Arc::clone(&session));
-        self.save_journal();
+            .map_err(|_| "exec state store lock poisoned".to_owned())
+            .and_then(|store| {
+                store.record_exec_running(&id, pid, process_group, session.started_at_ms)
+            });
+        if let Err(error) = persist_result {
+            terminate_and_wait(&session);
+            return Err(format!(
+                "cannot durably register exec session; process terminated before return: {error}"
+            ));
+        }
+        sessions.insert(id.clone(), Arc::clone(&session));
+        drop(sessions);
         spawn_monitor(Arc::clone(&session), Arc::downgrade(&self.inner));
         Ok(json!({
             "ok": true,
@@ -284,6 +302,13 @@ impl ExecRegistry {
             .iter()
             .filter(|view| view.get("running").and_then(Value::as_bool) == Some(true))
             .count();
+        let (state_store_ready, state_store_schema) = self
+            .inner
+            .state_store
+            .lock()
+            .ok()
+            .and_then(|store| store.schema_version().ok().map(|version| (true, version)))
+            .unwrap_or((false, 0));
         json!({
             "ready": true,
             "count": views.len(),
@@ -291,6 +316,9 @@ impl ExecRegistry {
             "reaped_on_boot": self.inner.reaped_on_boot,
             "detached_on_boot": self.inner.detached_on_boot,
             "closed_on_boot": self.inner.closed_on_boot,
+            "state_store_ready": state_store_ready,
+            "state_store_schema": state_store_schema,
+            "persistence_failures": self.inner.persistence_failures.load(Ordering::Relaxed),
         })
     }
 
@@ -323,25 +351,21 @@ impl ExecRegistry {
 
     fn prune(&self) {
         let now = now_ms();
-        let changed = if let Ok(mut sessions) = self.inner.sessions.lock() {
-            let before = sessions.len();
+        if let Ok(mut sessions) = self.inner.sessions.lock() {
             sessions.retain(|_, session| {
                 let status = session_status(session);
                 status
                     .ended_at_ms
                     .is_none_or(|ended| now.saturating_sub(ended) <= SESSION_TTL_MS)
             });
-            sessions.len() != before
-        } else {
-            false
-        };
-        if changed {
-            self.save_journal();
         }
-    }
-
-    fn save_journal(&self) {
-        save_journal_inner(&self.inner);
+        if let Ok(store) = self.inner.state_store.lock()
+            && store.prune_exec_sessions(now).is_err()
+        {
+            self.inner
+                .persistence_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -444,7 +468,7 @@ fn spawn_monitor(session: Arc<Session>, registry: Weak<RegistryInner>) {
                 Ok(Some(exit)) => {
                     mark_closed(&session, &exit);
                     if let Some(registry) = registry.upgrade() {
-                        save_journal_inner(&registry);
+                        persist_closed_session(&registry, &session);
                     }
                     break;
                 }
@@ -455,7 +479,7 @@ fn spawn_monitor(session: Arc<Session>, registry: Weak<RegistryInner>) {
                         status.ended_at_ms = Some(now_ms());
                     }
                     if let Some(registry) = registry.upgrade() {
-                        save_journal_inner(&registry);
+                        persist_closed_session(&registry, &session);
                     }
                     break;
                 }
@@ -635,101 +659,93 @@ fn terminate_session(session: &Arc<Session>, force: bool) {
     }
 }
 
-fn save_journal_inner(inner: &RegistryInner) {
-    let Ok(_journal_guard) = inner.journal_lock.lock() else {
-        return;
-    };
-    let entries = inner
-        .sessions
-        .lock()
-        .map(|sessions| {
-            sessions
-                .values()
-                .filter(|session| !session_status(session).closed)
-                .take(JOURNAL_MAX_ENTRIES)
-                .map(|session| {
-                    json!({
-                        "id": session.id,
-                        "pid": session.pid,
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let _ = write_journal_value(&inner.journal_path, &json!({"sessions": entries}));
+fn terminate_and_wait(session: &Arc<Session>) {
+    terminate_session(session, true);
+    if let Ok(mut child) = session.child.lock() {
+        let _ = child.wait();
+    }
 }
 
-fn write_journal_value(path: &Path, value: &Value) -> Result<(), String> {
-    if !path.exists() {
-        #[cfg(unix)]
-        {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)
-                .map_err(|error| format!("cannot create secure exec journal: {error}"))?;
-        }
-        #[cfg(windows)]
-        {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map_err(|error| format!("cannot create exec journal: {error}"))?;
-        }
-    }
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|error| format!("cannot encode exec journal: {error}"))?;
-    mutation::atomic_write(path, &bytes)?;
+fn process_group_for_session(pid: u32) -> Option<u32> {
     #[cfg(unix)]
     {
-        let permissions = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(path, permissions)
-            .map_err(|error| format!("cannot secure exec journal: {error}"))?;
+        Some(pid)
     }
-    Ok(())
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        None
+    }
 }
 
-fn recover_journal(path: &Path) -> RecoveryResult {
-    let Ok(data) = fs::read(path) else {
-        return RecoveryResult::default();
-    };
-    let Ok(value) = serde_json::from_slice::<Value>(&data) else {
-        return RecoveryResult::default();
-    };
-    let entries = value
-        .get("sessions")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+fn persist_closed_session(inner: &RegistryInner, session: &Arc<Session>) {
+    let status = session_status(session);
+    let ended_at = status.ended_at_ms.unwrap_or_else(now_ms);
+    let result = inner
+        .state_store
+        .lock()
+        .map_err(|_| "exec state store lock poisoned".to_owned())
+        .and_then(|store| {
+            store.settle_exec_session(
+                &session.id,
+                "closed",
+                Some(ended_at),
+                status.exit_code,
+                status.signal.as_deref(),
+                ended_at.saturating_add(SESSION_TTL_MS),
+            )
+        });
+    if result.is_err() {
+        inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn recover_state_store(store: &StateStore) -> Result<RecoveryResult, String> {
+    let entries = store.recoverable_exec_sessions(RECOVERY_MAX_ENTRIES)?;
+    let now = now_ms();
+    let expires_at = now.saturating_add(SESSION_TTL_MS);
     #[cfg(unix)]
     {
         let mut result = RecoveryResult::default();
         let mut kill_later = Vec::new();
-        for entry in entries.into_iter().take(JOURNAL_MAX_ENTRIES) {
-            let Some(id) = entry.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(pid) = entry
-                .get("pid")
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-            else {
-                continue;
-            };
+        for ExecSessionFence {
+            session_id: id,
+            pid,
+            process_group,
+            ..
+        } in entries
+        {
             if !process_alive(pid) {
                 result
                     .states
-                    .insert(id.to_owned(), "closed_before_restart".to_owned());
+                    .insert(id.clone(), "closed_before_restart".to_owned());
                 result.closed += 1;
+                store.settle_exec_session(
+                    &id,
+                    "closed_before_restart",
+                    Some(now),
+                    None,
+                    None,
+                    expires_at,
+                )?;
                 continue;
             }
-            if !process_has_marker(pid, id) || process_group_id(pid) != Some(pid) {
+            if process_group != Some(pid)
+                || !process_has_marker(pid, &id)
+                || process_group_id(pid) != Some(pid)
+            {
                 result
                     .states
-                    .insert(id.to_owned(), "detached_unverified".to_owned());
+                    .insert(id.clone(), "detached_unverified".to_owned());
                 result.detached += 1;
+                store.settle_exec_session(
+                    &id,
+                    "detached_unverified",
+                    None,
+                    None,
+                    None,
+                    expires_at,
+                )?;
                 continue;
             }
             unsafe {
@@ -737,9 +753,17 @@ fn recover_journal(path: &Path) -> RecoveryResult {
             }
             result
                 .states
-                .insert(id.to_owned(), "reaped_on_restart".to_owned());
+                .insert(id.clone(), "reaped_on_restart".to_owned());
             result.reaped += 1;
-            kill_later.push((pid, id.to_owned()));
+            store.settle_exec_session(
+                &id,
+                "reaped_on_restart",
+                Some(now),
+                None,
+                Some("SIGTERM"),
+                expires_at,
+            )?;
+            kill_later.push((pid, id));
         }
         if !kill_later.is_empty() {
             thread::spawn(move || {
@@ -758,17 +782,12 @@ fn recover_journal(path: &Path) -> RecoveryResult {
     #[cfg(windows)]
     {
         let mut result = RecoveryResult::default();
-        for entry in entries.into_iter().take(JOURNAL_MAX_ENTRIES) {
-            let Some(id) = entry.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(pid) = entry
-                .get("pid")
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-            else {
-                continue;
-            };
+        for ExecSessionFence {
+            session_id: id,
+            pid,
+            ..
+        } in entries
+        {
             let state = if process_alive(pid) {
                 result.detached += 1;
                 "detached_unverified"
@@ -776,7 +795,15 @@ fn recover_journal(path: &Path) -> RecoveryResult {
                 result.closed += 1;
                 "closed_before_restart"
             };
-            result.states.insert(id.to_owned(), state.to_owned());
+            result.states.insert(id.clone(), state.to_owned());
+            store.settle_exec_session(
+                &id,
+                state,
+                (!process_alive(pid)).then_some(now),
+                None,
+                None,
+                expires_at,
+            )?;
         }
         result
     }

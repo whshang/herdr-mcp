@@ -310,6 +310,147 @@ pub struct StateStoreDiagnostics {
     pub busy_timeout_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecSessionFence {
+    pub session_id: String,
+    pub pid: u32,
+    pub process_group: Option<u32>,
+    pub started_at_ms: u64,
+}
+
+impl StateStore {
+    pub fn record_exec_running(
+        &self,
+        session_id: &str,
+        pid: u32,
+        process_group: Option<u32>,
+        started_at_ms: u64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO exec_sessions (
+                    session_id, pid, process_group, started_at, ended_at,
+                    exit_code, signal, state, expires_at
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, 'running', NULL)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    pid = excluded.pid,
+                    process_group = excluded.process_group,
+                    started_at = excluded.started_at,
+                    ended_at = NULL,
+                    exit_code = NULL,
+                    signal = NULL,
+                    state = 'running',
+                    expires_at = NULL",
+                rusqlite::params![
+                    session_id,
+                    i64::from(pid),
+                    process_group.map(i64::from),
+                    i64::try_from(started_at_ms).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|error| format!("cannot persist running exec session: {error}"))?;
+        Ok(())
+    }
+
+    pub fn settle_exec_session(
+        &self,
+        session_id: &str,
+        state: &str,
+        ended_at_ms: Option<u64>,
+        exit_code: Option<i32>,
+        signal: Option<&str>,
+        expires_at_ms: u64,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE exec_sessions SET
+                    ended_at = ?2,
+                    exit_code = ?3,
+                    signal = ?4,
+                    state = ?5,
+                    expires_at = ?6
+                 WHERE session_id = ?1",
+                rusqlite::params![
+                    session_id,
+                    ended_at_ms.map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+                    exit_code,
+                    signal,
+                    state,
+                    i64::try_from(expires_at_ms).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|error| format!("cannot settle exec session: {error}"))?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "cannot settle exec session {session_id}: durable row is missing"
+            ))
+        }
+    }
+
+    pub fn recoverable_exec_sessions(&self, limit: usize) -> Result<Vec<ExecSessionFence>, String> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, pid, process_group, started_at
+                 FROM exec_sessions
+                 WHERE state = 'running' AND pid IS NOT NULL
+                 ORDER BY started_at ASC
+                 LIMIT ?1",
+            )
+            .map_err(|error| format!("cannot prepare exec recovery query: {error}"))?;
+        let rows = stmt
+            .query_map([limit], |row| {
+                let pid = row.get::<_, i64>(1)?;
+                let process_group = row.get::<_, Option<i64>>(2)?;
+                let started_at = row.get::<_, i64>(3)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    pid,
+                    process_group,
+                    started_at,
+                ))
+            })
+            .map_err(|error| format!("cannot query exec recovery rows: {error}"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (session_id, pid, process_group, started_at) =
+                row.map_err(|error| format!("cannot decode exec recovery row: {error}"))?;
+            let pid = u32::try_from(pid)
+                .map_err(|_| format!("invalid durable exec pid for {session_id}: {pid}"))?;
+            let process_group = process_group
+                .map(|value| {
+                    u32::try_from(value).map_err(|_| {
+                        format!("invalid durable exec process group for {session_id}: {value}")
+                    })
+                })
+                .transpose()?;
+            let started_at_ms = u64::try_from(started_at).map_err(|_| {
+                format!("invalid durable exec start time for {session_id}: {started_at}")
+            })?;
+            result.push(ExecSessionFence {
+                session_id,
+                pid,
+                process_group,
+                started_at_ms,
+            });
+        }
+        Ok(result)
+    }
+
+    pub fn prune_exec_sessions(&self, now_ms: u64) -> Result<usize, String> {
+        self.conn
+            .execute(
+                "DELETE FROM exec_sessions WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+                [i64::try_from(now_ms).unwrap_or(i64::MAX)],
+            )
+            .map_err(|error| format!("cannot prune expired exec sessions: {error}"))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Transaction handle
 // ---------------------------------------------------------------------------
