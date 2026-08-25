@@ -1,13 +1,22 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const RUST_RELEASE_TARGETS = [
-  "aarch64-apple-darwin",
-  "x86_64-pc-windows-msvc",
-];
+const targetContractPath = fileURLToPath(new URL("../.github/rust-release-targets.json", import.meta.url));
+const targetContract = JSON.parse(readFileSync(targetContractPath, "utf8"));
+if (targetContract.schema_version !== 1 || !Array.isArray(targetContract.targets) || targetContract.targets.length === 0) {
+  throw new Error("invalid Rust release target contract");
+}
+if (targetContract.targets.some((entry) => !entry || typeof entry.runner !== "string" || !entry.runner || typeof entry.target !== "string" || !entry.target)) {
+  throw new Error("invalid Rust release target entry");
+}
+const targetNames = targetContract.targets.map((entry) => entry.target);
+if (new Set(targetNames).size !== targetNames.length) throw new Error("duplicate Rust release target");
+export const RUST_RELEASE_MATRIX = Object.freeze(targetContract.targets.map((entry) => Object.freeze({ ...entry })));
+export const RUST_RELEASE_TARGETS = Object.freeze(RUST_RELEASE_MATRIX.map((entry) => entry.target));
 
 export const RUST_RELEASE_PROVENANCE = Object.freeze({
   predicateType: "https://slsa.dev/provenance/v1",
