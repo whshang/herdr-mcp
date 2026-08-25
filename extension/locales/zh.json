@@ -171,6 +171,7 @@
   "hud_state_ready": "就绪",
   "hud_state_bound": "已绑定",
   "hud_state_unbound": "未绑定",
+  "hud_state_offline": "离线",
   "hud_state_working": "运行中",
   "hud_state_idle": "空闲",
   "hud_state_done": "已完成",

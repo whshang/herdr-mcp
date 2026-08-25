@@ -249,6 +249,19 @@
     return base;
   }
 
+  /**
+   * Minimal incremental turn-end update for the browser turn watcher: merge
+   * just the settled user/assistant observations (already read at settle time)
+   * plus the settled turn's own monotonic virtual floor, instead of rescanning
+   * the full conversation DOM. Public contract of this module is unchanged; the
+   * full-history merge remains available through mergeObservedTurns.
+   */
+  function mergeSettledTurns(record, settledTurns = [], floor = 0, source = "chatgpt_virtual_turn_index", now = Date.now()) {
+    let next = mergeObservedTurns(record, settledTurns, now);
+    if (positiveInt(floor) > 0) next = mergeMessageCountFloor(next, floor, source, now);
+    return next;
+  }
+
   function summarizeContextRecord(record, policy = DEFAULT_CONTEXT_POLICY, now = Date.now()) {
     const turns = Object.values(record?.turns || {});
     const estimatedTextTokens = turns.reduce((sum, turn) => sum + positiveInt(turn?.token_estimate), 0);
@@ -324,6 +337,7 @@
     emptyContextRecord,
     mergeObservedTurns,
     mergeMessageCountFloor,
+    mergeSettledTurns,
     summarizeContextRecord,
     markAutoAttempt,
     markRolloverCommitted,

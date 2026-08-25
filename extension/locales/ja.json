@@ -171,6 +171,7 @@
   "hud_state_ready": "準備完了",
   "hud_state_bound": "バインド済み",
   "hud_state_unbound": "未バインド",
+  "hud_state_offline": "オフライン",
   "hud_state_working": "稼働中",
   "hud_state_idle": "アイドル",
   "hud_state_done": "完了",

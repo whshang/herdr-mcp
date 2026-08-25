@@ -46,6 +46,7 @@ let targetSeeded = false;
 let zaiTargetSeeded = false;
 let handoffPrompt = "";
 let mockStateWorkspaces = [];
+let mockLocalRuntimeAvailable = true;
 let hangAutomationNotifications = false;
 
 const nativeFetch = globalThis.fetch;
@@ -166,6 +167,10 @@ globalThis.chrome = {
         return;
       }
       if (message.path === "/push/state") {
+        if (!mockLocalRuntimeAvailable) {
+          callback({ ok: false, error: "connect ECONNREFUSED 127.0.0.1:8772" });
+          return;
+        }
         callback({
           ok: true,
           transport: "ipc",
@@ -584,6 +589,38 @@ console.log("\n[plain ChatGPT conversation automation]");
       && storage.herdrConversationAutomation?.[CHATGPT_AUTO_CONV] === true,
     "plain ChatGPT conversation can save Auto on without joining a Project", JSON.stringify(auto));
 
+  mockLocalRuntimeAvailable = false;
+  let resolveOfflineState;
+  const offlineStateP = new Promise((r) => { resolveOfflineState = r; });
+  onMsg({ type: "h2w_automation_state", convKey: CHATGPT_AUTO_CONV },
+    { tab: { id: 355, url: CHATGPT_AUTO_CONV } }, (r) => resolveOfflineState(r));
+  const offlineState = await offlineStateP;
+  ok(offlineState?.preference_enabled === true
+      && offlineState?.enabled === false
+      && offlineState?.effective_enabled === false
+      && offlineState?.runtime_available === false,
+    "Auto preference stays saved but effective automation fails closed when 127.0.0.1:8772 is unavailable",
+    JSON.stringify(offlineState));
+
+  let resolveOfflineHud;
+  const offlineHudP = new Promise((r) => { resolveOfflineHud = r; });
+  onMsg({ type: "h2w_page_hud", convKey: CHATGPT_AUTO_CONV },
+    { tab: { id: 355, url: CHATGPT_AUTO_CONV } }, (r) => resolveOfflineHud(r));
+  const offlineHud = await offlineHudP;
+  ok(offlineHud?.enabled === true
+      && offlineHud?.effective_enabled === false
+      && offlineHud?.runtime_available === false,
+    "HUD distinguishes saved Auto-on from an offline local runtime", JSON.stringify(offlineHud));
+
+  mockLocalRuntimeAvailable = true;
+  let resolveOnlineState;
+  const onlineStateP = new Promise((r) => { resolveOnlineState = r; });
+  onMsg({ type: "h2w_automation_state", convKey: CHATGPT_AUTO_CONV },
+    { tab: { id: 355, url: CHATGPT_AUTO_CONV } }, (r) => resolveOnlineState(r));
+  const onlineState = await onlineStateP;
+  ok(onlineState?.enabled === true && onlineState?.runtime_available === true,
+    "effective automation resumes after the local runtime is reachable again", JSON.stringify(onlineState));
+
   let resolveOtherHud;
   const otherHudP = new Promise((r) => { resolveOtherHud = r; });
   onMsg({ type: "h2w_page_hud", convKey: CONV }, { tab: { id: 202, url: CONV } }, (r) => resolveOtherHud(r));
@@ -993,6 +1030,20 @@ console.log("\n[project handoff]");
   const autoOn = await autoOnP;
   ok(autoOn?.ok === true && autoOn?.enabled === true,
     "Project source can enable Auto before manual handoff", JSON.stringify(autoOn));
+
+  const transferCountBeforeOfflineAuto = Object.keys(storage.herdrConversationTransfers || {}).length;
+  mockLocalRuntimeAvailable = false;
+  let resolveOfflineAutoStart;
+  const offlineAutoStartP = new Promise((r) => { resolveOfflineAutoStart = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: 401, trigger: "context_pressure" },
+    { tab: { id: 401, url: PROJECT_SOURCE_URL } }, (r) => resolveOfflineAutoStart(r));
+  const offlineAutoStart = await offlineAutoStartP;
+  ok(offlineAutoStart?.ok === false
+      && offlineAutoStart?.error === "local_runtime_unavailable"
+      && Object.keys(storage.herdrConversationTransfers || {}).length === transferCountBeforeOfflineAuto,
+    "automatic Project handoff does not begin while the local 8772 runtime is unavailable",
+    JSON.stringify(offlineAutoStart));
+  mockLocalRuntimeAvailable = true;
 
   let resolveAutoStart;
   const autoStartP = new Promise((r) => { resolveAutoStart = r; });
