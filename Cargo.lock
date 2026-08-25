@@ -308,6 +308,7 @@ dependencies = [
  "axum",
  "base64",
  "futures-util",
+ "http-body-util",
  "libc",
  "regex",
  "reqwest",
@@ -315,6 +316,7 @@ dependencies = [
  "sha2",
  "time",
  "tokio",
+ "tower",
 ]
 
 [[package]]

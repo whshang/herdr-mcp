@@ -168,12 +168,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             sessions: SessionRegistry::default(),
             bearer_token: Arc::<[u8]>::from(token.into_bytes()),
         };
-        let app = Router::new()
-            .route("/", post(post_mcp).get(get_mcp).delete(delete_mcp))
-            .route("/mcp", post(post_mcp).get(get_mcp).delete(delete_mcp))
-            .route("/mcp/", post(post_mcp).get(get_mcp).delete(delete_mcp))
-            .route("/health", get(health))
-            .with_state(state);
+        let app = candidate_router(state);
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let listener = tokio::net::TcpListener::bind(address)
             .await
@@ -188,6 +183,15 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             .map_err(|error| format!("candidate HTTP server failed: {error}"))?;
         Ok(ExitCode::SUCCESS)
     })
+}
+
+fn candidate_router(state: AppState) -> Router {
+    Router::new()
+        .route("/", post(post_mcp).get(get_mcp).delete(delete_mcp))
+        .route("/mcp", post(post_mcp).get(get_mcp).delete(delete_mcp))
+        .route("/mcp/", post(post_mcp).get(get_mcp).delete(delete_mcp))
+        .route("/health", get(health))
+        .with_state(state)
 }
 
 async fn shutdown_signal() {
@@ -495,6 +499,60 @@ fn persistent_sse_response() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{Method, Request};
+    use http_body_util::BodyExt;
+    use std::path::PathBuf;
+    use tower::ServiceExt;
+
+    fn test_root(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "herdr-mcp-http-{label}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    fn test_state(root: &std::path::Path) -> AppState {
+        AppState {
+            client: HerdrClient::new(root.join("missing-herdr.sock")),
+            cache: Arc::new(EventCache::from_snapshot_for_test(json!({
+                "workspaces": [],
+                "panes": [],
+                "agents": []
+            }))),
+            exec: ExecRegistry::new(root.join("exec")).unwrap(),
+            prompt: PromptRegistry::new(),
+            skill: SkillService::new(),
+            sessions: SessionRegistry::default(),
+            bearer_token: Arc::<[u8]>::from(b"test-token".to_vec()),
+        }
+    }
+
+    fn rpc_request(
+        method: Method,
+        uri: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, "Bearer test-token")
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder
+            .body(match body {
+                Some(body) => Body::from(body.to_string()),
+                None => Body::empty(),
+            })
+            .unwrap()
+    }
 
     #[test]
     fn bearer_check_is_exact() {
@@ -567,6 +625,165 @@ mod tests {
                 .iter()
                 .any(|value| value == "2026-07-28")
         );
+    }
+
+    #[tokio::test]
+    async fn router_matches_stateful_and_openai_session_contract() {
+        let root = test_root("sessions");
+        let app = candidate_router(test_state(&root));
+
+        let response = app
+            .clone()
+            .oneshot(rpc_request(Method::GET, "/mcp", None, &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "stateful-test", "version": "1"}
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(rpc_request(Method::POST, "/mcp", Some(initialize), &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        assert!(!session.is_empty());
+
+        let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(list.clone()),
+                &[("mcp-session-id", session.as_str())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(list.clone()),
+                &[
+                    ("mcp-session-id", "stale"),
+                    ("user-agent", "claude-connector/1.0"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], -32001);
+
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::GET,
+                "/mcp",
+                None,
+                &[
+                    ("mcp-session-id", "poison"),
+                    ("user-agent", "openai-mcp/1.0.0"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        assert!(response.headers().get("mcp-session-id").is_none());
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "no-cache, no-transform"
+        );
+        let mut body = response.into_body();
+        let frame = tokio::time::timeout(Duration::from_millis(100), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frame.into_data().unwrap(),
+            Bytes::from_static(b": connected\n\n")
+        );
+
+        let openai_initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "ChatGPT", "version": "1"}
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(openai_initialize),
+                &[
+                    ("mcp-session-id", "poison"),
+                    ("user-agent", "openai-mcp/1.0.0"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("mcp-session-id").is_none());
+
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(list),
+                &[
+                    ("mcp-session-id", "poison"),
+                    ("user-agent", "openai-mcp/1.0.0"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("mcp-session-id").is_none());
+
+        let response = app
+            .clone()
+            .oneshot(rpc_request(
+                Method::DELETE,
+                "/mcp",
+                None,
+                &[("mcp-session-id", session.as_str())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

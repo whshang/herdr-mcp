@@ -485,6 +485,24 @@ impl EventCache {
         }
     }
 
+    #[cfg(test)]
+    pub fn from_snapshot_for_test(snapshot: Value) -> Self {
+        let mut state = CacheState::default();
+        state.bootstrap(snapshot);
+        Self {
+            shared: Arc::new(SharedCache {
+                state: RwLock::new(state),
+                ready: Mutex::new(true),
+                ready_condvar: Condvar::new(),
+                stop: AtomicBool::new(false),
+                stream_live: AtomicBool::new(true),
+                last_error: Mutex::new(None),
+            }),
+            worker: None,
+            boot_id: "test-boot".to_owned(),
+        }
+    }
+
     pub fn boot_id(&self) -> &str {
         &self.boot_id
     }
