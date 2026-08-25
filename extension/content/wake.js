@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.58";
+const H2W_CONTENT_VERSION = "0.1.59";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -838,12 +838,18 @@ const H2W_CONTENT_VERSION = "0.1.58";
     if (response !== null) {
       const changed = registeredConvKey !== null && registeredConvKey !== convKey;
       registeredConvKey = convKey;
-      await ensureConversationHealth(convKey);
-      if (CONTEXT_PRESSURE) {
-        contextPressureRecord = await loadContextPressure(convKey);
-        void updateContextPressure().then((pressure) => {
-          if (pressure && ADAPTER.name === "chatgpt") paintPageHud({ continuity: pressure });
-        });
+      const concreteChat = ADAPTER.name !== "chatgpt" || Boolean(chatGptConversationId());
+      if (concreteChat) {
+        await ensureConversationHealth(convKey);
+        if (CONTEXT_PRESSURE) {
+          contextPressureRecord = await loadContextPressure(convKey);
+          void updateContextPressure().then((pressure) => {
+            if (pressure && ADAPTER.name === "chatgpt") paintPageHud({ continuity: pressure });
+          });
+        }
+      } else {
+        conversationHealth = null;
+        contextPressureRecord = null;
       }
       if (changed) {
         console.log(`[h2w] conversation route changed (${reason}): ${convKey}`);
@@ -1300,6 +1306,7 @@ const H2W_CONTENT_VERSION = "0.1.58";
   }
 
   async function reconcileConversationHealthAfterLoad() {
+    if (ADAPTER.name === "chatgpt" && !chatGptConversationId()) return;
     const record = await ensureConversationHealth();
     if (!record || !RECOVERY_CONTROLLER) return;
     const suspect = RECOVERY_CONTROLLER.classifyReplyTimeout(record);
@@ -1310,6 +1317,7 @@ const H2W_CONTENT_VERSION = "0.1.58";
   function startConversationHealthWatch() {
     let healthCheckInFlight = false;
     setInterval(() => {
+      if (ADAPTER.name === "chatgpt" && !chatGptConversationId()) return;
       if (healthCheckInFlight || !conversationHealth || !RECOVERY_CONTROLLER) return;
       healthCheckInFlight = true;
       void (async () => {
@@ -1391,6 +1399,13 @@ const H2W_CONTENT_VERSION = "0.1.58";
     };
 
     const onTick = () => {
+      if (!chatGptConversationId()) {
+        generating = false;
+        sawGrowth = false;
+        stableRounds = 0;
+        if (settleTimer) { clearInterval(settleTimer); settleTimer = null; }
+        return;
+      }
       const stopping = isComposerGenerating();
       const currentUserText = lastMessageByRole("user");
       const currentUserSignature = assistantSignature(currentUserText);
@@ -1534,8 +1549,10 @@ const H2W_CONTENT_VERSION = "0.1.58";
 
   function syncHudManualButtons() {
     if (!hudEls) return;
-    const locked = hudActionBusy || hudCache?.enabled === true;
+    const chatGptConversationActionsAvailable = ADAPTER.name !== "chatgpt" || Boolean(chatGptConversationId());
+    const locked = hudActionBusy || hudCache?.enabled === true || !chatGptConversationActionsAvailable;
     for (const button of hudEls.manualButtons || []) {
+      button.hidden = !chatGptConversationActionsAvailable;
       button.classList.toggle("locked", locked);
       button.disabled = locked;
       button.setAttribute("aria-disabled", String(locked));

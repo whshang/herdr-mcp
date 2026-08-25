@@ -11,16 +11,20 @@ class ChatGPTAdapter extends BaseAdapter {
     try {
       const origin = location.origin;
       const pathname = location.pathname.replace(/\/+$/, "") || "/";
+      if (pathname === "/") return origin;
       const normal = pathname.match(/^\/c\/([^/]+)$/);
       if (normal) return `${origin}/c/${normal[1]}`;
 
-      const project = pathname.match(/^\/g\/(g-p-[^/]+)\/c\/([^/]+)$/i);
-      if (!project) return null;
+      const projectConversation = pathname.match(/^\/g\/(g-p-[^/]+)\/c\/([^/]+)$/i);
+      const projectHome = pathname.match(/^\/g\/(g-p-[^/]+)(?:\/project)?$/i);
+      const projectSegment = projectConversation?.[1] || projectHome?.[1] || null;
+      if (!projectSegment) return null;
       // ChatGPT may decorate a Project resource id with a human-readable slug.
       // Bindings intentionally normalize that cosmetic suffix away.
-      const m = project[1].match(/^(g-p-[0-9a-f]{32})(?:-[^/]*)?$/i);
-      const projectId = m ? m[1] : project[1];
-      return `${origin}/g/${projectId}/c/${project[2]}`;
+      const m = projectSegment.match(/^(g-p-[0-9a-f]{32})(?:-[^/]*)?$/i);
+      const projectId = m ? m[1] : projectSegment;
+      const projectKey = `${origin}/g/${projectId}`;
+      return projectConversation ? `${projectKey}/c/${projectConversation[2]}` : projectKey;
     } catch (_) {
       return null;
     }
