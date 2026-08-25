@@ -96,6 +96,29 @@ pub fn run(snapshot: &Value, args: &Value) -> Value {
     Value::Object(output)
 }
 
+pub fn file_dirty(root: &Path, file: &Path) -> Result<bool, String> {
+    let root_real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let file_real = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    let relative = file_real
+        .strip_prefix(&root_real)
+        .map_err(|_| "file is outside git root".to_owned())?;
+    let args = vec![
+        "status".to_owned(),
+        "--porcelain".to_owned(),
+        "--".to_owned(),
+        relative.to_string_lossy().into_owned(),
+    ];
+    let result = run_git(&root_real, &args, 4096, Duration::from_secs(2))?;
+    if result.exit_code != 0 {
+        return Err(if result.stderr.is_empty() {
+            format!("git status exited {}", result.exit_code)
+        } else {
+            result.stderr
+        });
+    }
+    Ok(!result.stdout.trim().is_empty())
+}
+
 struct GitResult {
     exit_code: i32,
     stdout: String,

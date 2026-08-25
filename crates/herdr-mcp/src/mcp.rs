@@ -1,4 +1,5 @@
 use crate::contract;
+use crate::fs_mutation;
 use crate::fs_tools;
 use crate::git_tools;
 use crate::herdr::HerdrClient;
@@ -171,6 +172,8 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 },
             );
         }
+        "herdr_fs_edit" => fs_mutation::edit(&context.cache.snapshot(), &arguments),
+        "herdr_fs_write" => fs_mutation::write(&context.cache.snapshot(), &arguments),
         "herdr_git" => git_tools::run(&context.cache.snapshot(), &arguments),
         pending if contract::tool_names().contains(&pending) => {
             return Ok(tool_result(

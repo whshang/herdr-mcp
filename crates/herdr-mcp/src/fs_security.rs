@@ -78,6 +78,86 @@ pub fn validate_existing(snapshot: &Value, input: &str) -> Result<ManagedPath, V
     })
 }
 
+pub fn validate_target(snapshot: &Value, input: &str) -> Result<ManagedPath, Value> {
+    let resolved = resolve_input(input)?;
+    let roots = managed_roots(snapshot);
+    let Some(root) = containing_root(&roots, &resolved).cloned() else {
+        return Err(json!({
+            "ok": false,
+            "reason": "outside_managed_roots",
+            "path": resolved.to_string_lossy(),
+            "managed_roots": roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
+            "hint": "only paths inside git-backed project roots visible in the live snapshot are accessible",
+        }));
+    };
+    if denied_secret_path(&resolved) {
+        return Err(
+            json!({"ok": false, "reason": "secret_path_denied", "path": resolved.to_string_lossy()}),
+        );
+    }
+    let root_real = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    let real = if resolved.exists() {
+        std::fs::canonicalize(&resolved).map_err(|error| {
+            json!({
+                "ok": false,
+                "reason": "target_unresolvable",
+                "path": resolved.to_string_lossy(),
+                "message": error.to_string(),
+            })
+        })?
+    } else {
+        let parent = resolved.parent().ok_or_else(|| {
+            json!({
+                "ok": false,
+                "reason": "parent_not_found",
+                "path": resolved.to_string_lossy(),
+            })
+        })?;
+        let parent_real = std::fs::canonicalize(parent).map_err(|error| {
+            json!({
+                "ok": false,
+                "reason": "parent_not_found",
+                "path": resolved.to_string_lossy(),
+                "message": error.to_string(),
+            })
+        })?;
+        if !parent_real.is_dir() {
+            return Err(
+                json!({"ok": false, "reason": "parent_not_directory", "path": resolved.to_string_lossy()}),
+            );
+        }
+        let name = resolved.file_name().ok_or_else(|| {
+            json!({
+                "ok": false,
+                "reason": "invalid_target",
+                "path": resolved.to_string_lossy(),
+            })
+        })?;
+        parent_real.join(name)
+    };
+    if !path_within(&root_real, &real) {
+        return Err(json!({
+            "ok": false,
+            "reason": "symlink_escape",
+            "path": resolved.to_string_lossy(),
+            "real": real.to_string_lossy(),
+        }));
+    }
+    if denied_secret_path(&real) {
+        return Err(json!({
+            "ok": false,
+            "reason": "secret_path_denied",
+            "path": resolved.to_string_lossy(),
+            "real": real.to_string_lossy(),
+        }));
+    }
+    Ok(ManagedPath {
+        root,
+        resolved,
+        real,
+    })
+}
+
 pub fn denied_secret_path(path: &Path) -> bool {
     let normalized = path.to_string_lossy().replace('\\', "/");
     let lower = normalized.to_ascii_lowercase();
@@ -200,6 +280,26 @@ mod tests {
         let validated = validate_existing(&snapshot(&root), file.to_str().unwrap()).unwrap();
         assert_eq!(validated.root, root);
         assert_eq!(validated.real, fs::canonicalize(&file).unwrap());
+        fs::remove_dir_all(validated.root).unwrap();
+    }
+
+    #[test]
+    fn accepts_new_target_only_when_parent_is_managed_and_real() {
+        let root = repo();
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let target = src.join("new.rs");
+        let validated = validate_target(&snapshot(&root), target.to_str().unwrap()).unwrap();
+        assert_eq!(validated.root, root);
+        assert_eq!(
+            validated.real,
+            fs::canonicalize(&src).unwrap().join("new.rs")
+        );
+
+        let missing_parent = root.join("missing/new.rs");
+        let error =
+            validate_target(&snapshot(&root), missing_parent.to_str().unwrap()).unwrap_err();
+        assert_eq!(error["reason"], "parent_not_found");
         fs::remove_dir_all(validated.root).unwrap();
     }
 
