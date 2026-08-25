@@ -119,15 +119,33 @@ fn prepare_socket_path(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
     fn temp_path() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         std::env::temp_dir().join(format!(
-            "herdr-mcp-extension-ipc-{}-{}.sock",
+            "hmi-{:x}-{:x}-{nonce:x}.sock",
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    async fn wait_until_socket_stale(path: &Path) {
+        for _ in 0..200 {
+            if std::os::unix::net::UnixStream::connect(path).is_err() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!(
+            "socket remained connectable after listener drop: {}",
+            path.display()
+        );
     }
 
     #[tokio::test]
@@ -161,6 +179,7 @@ mod tests {
         let path = temp_path();
         let stale = tokio::net::UnixListener::bind(&path).unwrap();
         drop(stale);
+        wait_until_socket_stale(&path).await;
         let (replacement, guard) = ExtensionIpcSocket::bind(&path).await.unwrap();
         drop(replacement);
         drop(guard);
