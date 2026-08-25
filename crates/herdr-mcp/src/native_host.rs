@@ -168,14 +168,19 @@ fn expected_extension_origin() -> Result<String, String> {
         return validate_extension_origin(origin.trim()).map(str::to_owned);
     }
 
+    let path = extension_path_for_install()?;
+    let id = chromium_id_for_path(&path)?;
+    Ok(format!("chrome-extension://{id}/"))
+}
+
+#[cfg(unix)]
+pub(crate) fn extension_path_for_install() -> Result<PathBuf, String> {
     let path = env::var_os("HERDR_EXTENSION_PATH")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HERDR_MCP_ROOT").map(|root| PathBuf::from(root).join("extension")))
         .or_else(development_extension_path)
-        .ok_or_else(|| "extension_origin_unconfigured".to_owned())?;
-    let absolute = lexical_absolute(&path)?;
-    let id = chromium_id_for_path(&absolute)?;
-    Ok(format!("chrome-extension://{id}/"))
+        .ok_or_else(|| "extension_path_unconfigured".to_owned())?;
+    lexical_absolute(&path)
 }
 
 #[cfg(unix)]
@@ -223,7 +228,7 @@ fn lexical_absolute(path: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(unix)]
-fn chromium_id_for_path(path: &Path) -> Result<String, String> {
+pub(crate) fn chromium_id_for_path(path: &Path) -> Result<String, String> {
     let text = path
         .to_str()
         .ok_or_else(|| "extension_path_not_utf8".to_owned())?;

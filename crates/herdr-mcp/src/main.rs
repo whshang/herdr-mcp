@@ -18,6 +18,7 @@ mod mcp;
 mod mcp_http;
 mod mutation;
 mod native_host;
+mod native_host_install;
 mod native_tools;
 mod patch;
 mod paths;
@@ -110,6 +111,7 @@ fn run() -> Result<ExitCode, String> {
         }
         cli::Command::Dev { dry_run } => dev::run(dry_run),
         cli::Command::Candidate { port } => mcp_http::serve_candidate(port),
+        cli::Command::NativeHost(command) => native_host_install::run(command),
         cli::Command::ExtensionHost { caller_origin } => native_host::run(&caller_origin),
     }
 }

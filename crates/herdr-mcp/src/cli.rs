@@ -7,6 +7,7 @@ pub enum Command {
     Config(ConfigCommand),
     Dev { dry_run: bool },
     Candidate { port: u16 },
+    NativeHost(NativeHostCommand),
     ExtensionHost { caller_origin: String },
 }
 
@@ -15,6 +16,13 @@ pub enum ConfigCommand {
     Path,
     Show,
     Init,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NativeHostCommand {
+    Install,
+    Status,
+    Uninstall,
 }
 
 pub fn parse<I>(args: I) -> Result<Command, String>
@@ -34,6 +42,7 @@ where
         "config" => parse_config(&args[1..]),
         "dev" => parse_dev(&args[1..]),
         "candidate" => parse_candidate(&args[1..]),
+        "native-host" => parse_native_host(&args[1..]),
         "extension-host" => parse_extension_host(&args[1..]),
         value => Err(format!("unknown command '{value}'\n\n{}", help())),
     }
@@ -91,6 +100,25 @@ fn parse_candidate(args: &[String]) -> Result<Command, String> {
     Ok(Command::Candidate { port })
 }
 
+fn parse_native_host(args: &[String]) -> Result<Command, String> {
+    match args {
+        [subcommand] if subcommand == "install" => {
+            Ok(Command::NativeHost(NativeHostCommand::Install))
+        }
+        [subcommand] if subcommand == "status" => {
+            Ok(Command::NativeHost(NativeHostCommand::Status))
+        }
+        [subcommand] if subcommand == "uninstall" => {
+            Ok(Command::NativeHost(NativeHostCommand::Uninstall))
+        }
+        [] => Err("native-host requires install, status, or uninstall".to_owned()),
+        [subcommand] => Err(format!("unknown native-host command '{subcommand}'")),
+        _ => Err(
+            "native-host accepts exactly one subcommand: install, status, or uninstall".to_owned(),
+        ),
+    }
+}
+
 fn parse_extension_host(args: &[String]) -> Result<Command, String> {
     match args {
         [caller_origin] if caller_origin.starts_with("chrome-extension://") => {
@@ -113,6 +141,7 @@ Usage:\n\
   herdr-mcp config [path|show|init]\n\
   herdr-mcp dev [--dry-run]\n\
   herdr-mcp candidate [--port 8873]\n\
+  herdr-mcp native-host <install|status|uninstall>\n\
   herdr-mcp extension-host <chrome-extension://.../>\n\n\
 The Rust binary is the new local product boundary. Service, update, runtime,\n\
 link, and native-host commands are added as their native implementations land.\n"
@@ -145,6 +174,10 @@ mod tests {
             Command::Candidate { port: 9000 }
         );
         assert_eq!(
+            parse(args(&["native-host", "status"])).unwrap(),
+            Command::NativeHost(NativeHostCommand::Status)
+        );
+        assert_eq!(
             parse(args(&[
                 "extension-host",
                 "chrome-extension://abcdefghijklmnop/"
@@ -161,6 +194,8 @@ mod tests {
         assert!(parse(args(&["dev", "--legacy"])).is_err());
         assert!(parse(args(&["config", "legacy"])).is_err());
         assert!(parse(args(&["candidate", "--port", "0"])).is_err());
+        assert!(parse(args(&["native-host"])).is_err());
+        assert!(parse(args(&["native-host", "legacy"])).is_err());
         assert!(parse(args(&["extension-host"])).is_err());
         assert!(parse(args(&["extension-host", "https://example.com/"])).is_err());
         assert!(parse(args(&["status", "extra"])).is_err());
