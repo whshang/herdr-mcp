@@ -1,3 +1,5 @@
+use serde_json::Value;
+
 const EPOCH2_JSON: &str = include_str!("../../../contracts/epoch2.json");
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -32,6 +34,16 @@ pub fn tool_names() -> Vec<&'static str> {
             value.strip_suffix("\",")
         })
         .collect()
+}
+
+pub fn tool_catalog() -> Result<Vec<Value>, String> {
+    let document: Value = serde_json::from_str(EPOCH2_JSON)
+        .map_err(|error| format!("cannot parse embedded epoch2 contract: {error}"))?;
+    document
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "embedded epoch2 contract is missing tools[]".to_owned())
 }
 
 fn parse_u32_field(field: &str) -> Result<u32, String> {
@@ -83,5 +95,6 @@ mod tests {
         assert!(names.contains(&"herdr_inspect"));
         assert!(names.contains(&"herdr_skill"));
         assert!(names.contains(&"herdr_prompt"));
+        assert_eq!(tool_catalog().unwrap().len(), 18);
     }
 }

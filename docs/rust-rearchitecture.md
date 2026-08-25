@@ -167,13 +167,22 @@ Rust runtime 完成后删除本地 Node runtime。
 18. Rust `herdr_since` service 已实现 boot id、cursor reset、workspace id/label filter 和 Agent visibility；它直接读取 EventCache，不在 MCP 调用时轮询 daemon；
 19. `doctor` 已真实启动/停止 EventCache，并验证 background `events.subscribe` 已进入 live 状态；当前 Rust 测试为 39/39；
 20. 第二检查点 `e39ecf7 feat: migrate native inspect state` 已提交并推送。
+21. 第三检查点 `367fa84 feat: add native event state cache` 已提交并推送；
+22. Rust candidate MCP HTTP transport 已建立，使用 Axum/Tokio，仅绑定 `127.0.0.1`，启动时强制要求 `HERDR_MCP_TOKEN`，不会启动匿名 MCP endpoint；
+23. candidate 已支持 `initialize`、`server/discover`、`tools/list`、`tools/call`、`ping` 和 initialized notification；initialize/tools-list 在客户端声明 `text/event-stream` 时保持 SSE handshake framing；
+24. `tools/list` 直接读取 `contracts/epoch2.json`，真实 HTTP smoke 确认精确暴露 epoch 2 的 18 tools；
+25. 已迁的 `herdr_methods`、`herdr_inspect`、`herdr_since`、`herdr_call` 已通过 candidate HTTP 调用真实 Herdr daemon；未迁工具统一返回 `native_tool_pending` + `isError=true`，因此 candidate 不会伪装成完成态；
+26. candidate 使用迁移期命令 `herdr-mcp candidate --port 8873`。它不是最终 CLI contract；生产切换前还需完成 persistent GET/SSE、完整 18-tool implementation、auth/session compatibility 和 Edge parity；
+27. 当前 Rust 单测已增至 46/46；真实 candidate smoke 验证了 unauthorized=401、health、SSE initialize、18-tool catalog、4 个 native tool call 和 pending-tool rejection。
 
 下一批开发按以下顺序推进：
 
-1. 将 `herdr_methods` / `herdr_call` / `herdr_inspect` / `herdr_since` 接入 Rust candidate MCP HTTP transport，并建立 TypeScript/Rust result parity fixture；
-2. 完成 `herdr_inspect` parity：补 build/runtime metadata、exec-session state；
-3. 迁移 managed-root/secret-path 安全层和只读 fs/git 工具，再迁 mutation/exec/agent 工具；
-4. 实现 Rust supervisor、service manager、Native Messaging host；
-5. 实现 GitHub Release updater、generation A/B、rollback；
-6. 迁移 relay/link；
-7. Rust 覆盖 18 tools 与 production transport 后删除本地 Node runtime 和旧 lifecycle scripts。
+1. 建立 TypeScript/Rust protocol/result parity fixture，覆盖 initialize/discover/tools-list 与 4 个已迁工具；
+2. 迁移 managed-root、secret-path 与 read budget 安全层，然后优先实现 `herdr_fs_read/list/grep` 和 `herdr_git`；
+3. 完成 `herdr_inspect` parity：补 build/runtime metadata、exec-session state；
+4. 继续迁 mutation/exec/agent 工具，并逐个移除 `native_tool_pending`；
+5. 补齐 persistent GET/SSE、session/auth compatibility，使 Rust HTTP transport 通过现有 Edge/Connector transport tests；
+6. 实现 Rust supervisor、service manager、Native Messaging host；
+7. 实现 GitHub Release updater、generation A/B、rollback；
+8. 迁移 relay/link；
+9. Rust 覆盖 18 tools 与 production transport 后删除本地 Node runtime 和旧 lifecycle scripts。

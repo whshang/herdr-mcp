@@ -6,6 +6,7 @@ pub enum Command {
     Doctor,
     Config(ConfigCommand),
     Dev { dry_run: bool },
+    Candidate { port: u16 },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -31,6 +32,7 @@ where
         "doctor" => no_extra(&args, Command::Doctor),
         "config" => parse_config(&args[1..]),
         "dev" => parse_dev(&args[1..]),
+        "candidate" => parse_candidate(&args[1..]),
         value => Err(format!("unknown command '{value}'\n\n{}", help())),
     }
 }
@@ -65,6 +67,28 @@ fn parse_dev(args: &[String]) -> Result<Command, String> {
     Ok(Command::Dev { dry_run })
 }
 
+fn parse_candidate(args: &[String]) -> Result<Command, String> {
+    let mut port = 8873_u16;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--port" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "candidate --port requires a value".to_owned())?;
+                port = value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| "candidate --port must be 1..65535".to_owned())?;
+                index += 2;
+            }
+            value => return Err(format!("unknown candidate argument '{value}'")),
+        }
+    }
+    Ok(Command::Candidate { port })
+}
+
 pub fn help() -> &'static str {
     "Herdr MCP native runtime\n\n\
 Usage:\n\
@@ -72,7 +96,8 @@ Usage:\n\
   herdr-mcp status\n\
   herdr-mcp doctor\n\
   herdr-mcp config [path|show|init]\n\
-  herdr-mcp dev [--dry-run]\n\n\
+  herdr-mcp dev [--dry-run]\n\
+  herdr-mcp candidate [--port 8873]\n\n\
 The Rust binary is the new local product boundary. Service, update, runtime,\n\
 link, and native-host commands are added as their native implementations land.\n"
 }
@@ -99,12 +124,17 @@ mod tests {
             parse(args(&["dev", "--dry-run"])).unwrap(),
             Command::Dev { dry_run: true }
         );
+        assert_eq!(
+            parse(args(&["candidate", "--port", "9000"])).unwrap(),
+            Command::Candidate { port: 9000 }
+        );
     }
 
     #[test]
     fn rejects_unknown_arguments() {
         assert!(parse(args(&["dev", "--legacy"])).is_err());
         assert!(parse(args(&["config", "legacy"])).is_err());
+        assert!(parse(args(&["candidate", "--port", "0"])).is_err());
         assert!(parse(args(&["status", "extra"])).is_err());
         assert!(parse(args(&["unknown"])).is_err());
     }

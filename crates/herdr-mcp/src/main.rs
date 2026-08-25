@@ -6,6 +6,8 @@ mod dev;
 mod events;
 mod herdr;
 mod inspect;
+mod mcp;
+mod mcp_http;
 mod native_tools;
 mod paths;
 mod projects;
@@ -91,5 +93,6 @@ fn run() -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Dev { dry_run } => dev::run(dry_run),
+        cli::Command::Candidate { port } => mcp_http::serve_candidate(port),
     }
 }
