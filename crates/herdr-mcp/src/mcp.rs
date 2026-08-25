@@ -163,6 +163,14 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         "herdr_fs_read" => fs_tools::read(&context.cache.snapshot(), &arguments),
         "herdr_fs_list" => fs_tools::list(&context.cache.snapshot(), &arguments),
         "herdr_fs_grep" => fs_tools::grep(&context.cache.snapshot(), &arguments),
+        "herdr_fs_image" => {
+            return Ok(
+                match fs_tools::image(&context.cache.snapshot(), &arguments) {
+                    Ok(image) => image_tool_result(image),
+                    Err(error) => tool_result(error, false),
+                },
+            );
+        }
         "herdr_git" => git_tools::run(&context.cache.snapshot(), &arguments),
         pending if contract::tool_names().contains(&pending) => {
             return Ok(tool_result(
@@ -184,6 +192,16 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     };
 
     Ok(tool_result(output, false))
+}
+
+fn image_tool_result(image: fs_tools::ImageData) -> Value {
+    let text = serde_json::to_string(&image.meta).unwrap_or_else(|_| "{}".to_owned());
+    json!({
+        "content": [
+            {"type": "text", "text": text},
+            {"type": "image", "data": image.data, "mimeType": image.mime_type}
+        ]
+    })
 }
 
 fn tool_result(value: Value, is_error: bool) -> Value {
@@ -240,7 +258,7 @@ mod tests {
     #[test]
     fn pending_epoch_tool_is_explicit_error_result() {
         let result = tool_result(
-            json!({"ok": false, "code": "native_tool_pending", "tool": "herdr_fs_image"}),
+            json!({"ok": false, "code": "native_tool_pending", "tool": "herdr_fs_patch"}),
             true,
         );
         assert_eq!(result["isError"], true);

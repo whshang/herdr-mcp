@@ -1,4 +1,5 @@
 use crate::fs_security;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value, json};
 use std::fs;
@@ -98,6 +99,79 @@ pub fn read(snapshot: &Value, args: &Value) -> Value {
         "truncated": truncated,
         "content": if byte_truncated { content } else { full_content },
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageData {
+    pub meta: Value,
+    pub data: String,
+    pub mime_type: &'static str,
+}
+
+pub fn image(snapshot: &Value, args: &Value) -> Result<ImageData, Value> {
+    let path = required_str(args, "path")?;
+    let managed = fs_security::validate_existing(snapshot, path)?;
+    let max_bytes = optional_usize(args, "max_bytes", 1, 8_000_000)?.unwrap_or(2_097_152);
+    let metadata = fs::metadata(&managed.real)
+        .map_err(|error| fail("stat_failed", &managed.resolved, Some(error.to_string())))?;
+    if !metadata.is_file() {
+        return Err(fail("not_a_file", &managed.resolved, None));
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(json!({
+            "ok": false,
+            "reason": "image_too_large",
+            "path": managed.resolved.to_string_lossy(),
+            "bytes": metadata.len(),
+            "max_bytes": max_bytes,
+        }));
+    }
+    let mime_type = image_mime(&managed.real).ok_or_else(|| {
+        json!({
+            "ok": false,
+            "reason": "unsupported_image",
+            "path": managed.resolved.to_string_lossy(),
+            "hint": "png/jpeg/gif/webp only",
+        })
+    })?;
+    let data = fs::read(&managed.real)
+        .map_err(|error| fail("read_failed", &managed.resolved, Some(error.to_string())))?;
+    if data.len() > max_bytes {
+        return Err(json!({
+            "ok": false,
+            "reason": "image_too_large",
+            "path": managed.resolved.to_string_lossy(),
+            "bytes": data.len(),
+            "max_bytes": max_bytes,
+        }));
+    }
+    let meta = json!({
+        "ok": true,
+        "path": managed.resolved.to_string_lossy(),
+        "root": managed.root.to_string_lossy(),
+        "mime_type": mime_type,
+        "bytes": data.len(),
+    });
+    Ok(ImageData {
+        meta,
+        data: STANDARD.encode(data),
+        mime_type,
+    })
+}
+
+fn image_mime(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()?
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
 }
 
 pub fn list(snapshot: &Value, args: &Value) -> Value {
@@ -510,6 +584,15 @@ mod tests {
         let regex = glob_regex("*.rs").unwrap();
         assert!(regex.is_match("main.rs"));
         assert!(!regex.is_match("main.ts"));
+    }
+
+    #[test]
+    fn image_mime_accepts_only_supported_types() {
+        assert_eq!(image_mime(Path::new("shot.PNG")), Some("image/png"));
+        assert_eq!(image_mime(Path::new("photo.jpeg")), Some("image/jpeg"));
+        assert_eq!(image_mime(Path::new("anim.gif")), Some("image/gif"));
+        assert_eq!(image_mime(Path::new("screen.webp")), Some("image/webp"));
+        assert_eq!(image_mime(Path::new("vector.svg")), None);
     }
 
     #[test]
