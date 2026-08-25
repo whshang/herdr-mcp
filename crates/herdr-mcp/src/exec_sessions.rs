@@ -119,7 +119,7 @@ impl ExecRegistry {
             return Err("command must not be empty".to_owned());
         }
         let id = new_session_id();
-        let mut process = shell_command(command);
+        let mut process = shell_command(command, &id);
         process
             .current_dir(cwd)
             .env("HERDR_MCP_EXEC_ID", &id)
@@ -534,18 +534,30 @@ pub fn enriched_exec_path() -> String {
 }
 
 #[cfg(unix)]
-fn shell_command(command: &str) -> Command {
+fn shell_command(command: &str, id: &str) -> Command {
     let shell = resolve_exec_shell();
-    let mut process = Command::new(shell);
-    process.args(["-lc", command]);
+    let shell_arg = shell.to_string_lossy().into_owned();
+    let marker = process_marker(id);
+    let mut process = Command::new(&shell);
+    process.arg0(&marker).args([
+        "-c",
+        "\"$1\" -lc \"$2\"; __herdr_mcp_status=$?; exit \"$__herdr_mcp_status\"",
+        marker.as_str(),
+        shell_arg.as_str(),
+        command,
+    ]);
     process
 }
 
 #[cfg(windows)]
-fn shell_command(command: &str) -> Command {
+fn shell_command(command: &str, _id: &str) -> Command {
     let mut process = Command::new("powershell.exe");
     process.args(["-NoProfile", "-Command", command]);
     process
+}
+
+fn process_marker(id: &str) -> String {
+    format!("herdr-mcp-exec:{id}")
 }
 
 #[cfg(unix)]
@@ -713,7 +725,7 @@ fn recover_journal(path: &Path) -> RecoveryResult {
                 result.closed += 1;
                 continue;
             }
-            if !process_has_marker(pid, id) {
+            if !process_has_marker(pid, id) || process_group_id(pid) != Some(pid) {
                 result
                     .states
                     .insert(id.to_owned(), "detached_unverified".to_owned());
@@ -733,7 +745,7 @@ fn recover_journal(path: &Path) -> RecoveryResult {
             thread::spawn(move || {
                 thread::sleep(Duration::from_secs(2));
                 for (pid, id) in kill_later {
-                    if process_has_marker(pid, &id) {
+                    if process_has_marker(pid, &id) && process_group_id(pid) == Some(pid) {
                         unsafe {
                             libc::kill(-(pid as i32), libc::SIGKILL);
                         }
@@ -781,6 +793,23 @@ fn process_alive(pid: u32) -> bool {
         .is_some_and(|output| output.status.success() && !output.stdout.is_empty())
 }
 
+#[cfg(unix)]
+fn process_group_id(pid: u32) -> Option<u32> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pgid="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
     Command::new("tasklist")
@@ -797,12 +826,23 @@ fn process_alive(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn process_has_marker(pid: u32, id: &str) -> bool {
-    let output = Command::new("ps")
+    let marker = process_marker(id);
+    let command_line = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    if command_line.ok().is_some_and(|output| {
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains(&marker)
+    }) {
+        return true;
+    }
+    let environment = Command::new("ps")
         .args(["eww", "-p", &pid.to_string()])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output();
-    output.ok().is_some_and(|output| {
+    environment.ok().is_some_and(|output| {
         output.status.success()
             && String::from_utf8_lossy(&output.stdout).contains(&format!("HERDR_MCP_EXEC_ID={id}"))
     })
@@ -885,6 +925,12 @@ mod tests {
         let entry = &journal["sessions"][0];
         assert_eq!(entry["id"], id);
         assert!(entry.get("pid").is_some());
+        #[cfg(unix)]
+        {
+            let pid = entry["pid"].as_u64().unwrap() as u32;
+            assert!(process_has_marker(pid, id));
+            assert_eq!(process_group_id(pid), Some(pid));
+        }
         assert!(entry.get("command").is_none());
         assert!(entry.get("cwd").is_none());
         assert!(entry.get("started_at_ms").is_none());
