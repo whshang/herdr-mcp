@@ -194,6 +194,7 @@ impl ExecRegistry {
         let Some(stream_filter) = parse_stream(stream) else {
             return json!({"ok": false, "code": "invalid_params", "message": "stream must be stdout, stderr, or both"});
         };
+        refresh_session_status(&session, Some(&self.inner));
         let (bytes, truncated) = {
             let Ok(buffers) = session.buffers.lock() else {
                 return json!({"ok": false, "reason": "session_state_unavailable"});
@@ -459,42 +460,59 @@ fn push_chunk(session: &Arc<Session>, stream: StreamKind, chunk: &[u8]) {
 fn spawn_monitor(session: Arc<Session>, registry: Weak<RegistryInner>) {
     thread::spawn(move || {
         loop {
-            let result = session
-                .child
-                .lock()
-                .map_err(|_| "child lock poisoned".to_owned())
-                .and_then(|mut child| child.try_wait().map_err(|error| error.to_string()));
-            match result {
-                Ok(Some(exit)) => {
-                    mark_closed(&session, &exit);
-                    if let Some(registry) = registry.upgrade() {
-                        persist_closed_session(&registry, &session);
-                    }
-                    break;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(25)),
-                Err(_) => {
-                    if let Ok(mut status) = session.status.lock() {
-                        status.closed = true;
-                        status.ended_at_ms = Some(now_ms());
-                    }
-                    if let Some(registry) = registry.upgrade() {
-                        persist_closed_session(&registry, &session);
-                    }
-                    break;
-                }
+            let registry = registry.upgrade();
+            if refresh_session_status(&session, registry.as_deref()) {
+                break;
             }
+            thread::sleep(Duration::from_millis(25));
         }
     });
 }
 
-fn mark_closed(session: &Arc<Session>, exit: &ExitStatus) {
-    if let Ok(mut status) = session.status.lock() {
-        status.closed = true;
-        status.exit_code = exit.code();
-        status.signal = exit_signal(exit);
-        status.ended_at_ms = Some(now_ms());
+fn refresh_session_status(session: &Arc<Session>, registry: Option<&RegistryInner>) -> bool {
+    if session_status(session).closed {
+        return true;
     }
+    let result = session
+        .child
+        .lock()
+        .map_err(|_| "child lock poisoned".to_owned())
+        .and_then(|mut child| child.try_wait().map_err(|error| error.to_string()));
+    let transitioned = match result {
+        Ok(Some(exit)) => mark_closed(session, &exit),
+        Ok(None) => return false,
+        Err(_) => mark_closed_unknown(session),
+    };
+    if transitioned && let Some(registry) = registry {
+        persist_closed_session(registry, session);
+    }
+    true
+}
+
+fn mark_closed(session: &Arc<Session>, exit: &ExitStatus) -> bool {
+    let Ok(mut status) = session.status.lock() else {
+        return false;
+    };
+    if status.closed {
+        return false;
+    }
+    status.closed = true;
+    status.exit_code = exit.code();
+    status.signal = exit_signal(exit);
+    status.ended_at_ms = Some(now_ms());
+    true
+}
+
+fn mark_closed_unknown(session: &Arc<Session>) -> bool {
+    let Ok(mut status) = session.status.lock() else {
+        return false;
+    };
+    if status.closed {
+        return false;
+    }
+    status.closed = true;
+    status.ended_at_ms = Some(now_ms());
+    true
 }
 
 fn parse_stream(stream: &str) -> Option<Option<StreamKind>> {
@@ -918,6 +936,70 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("session did not exit");
+    }
+
+    #[test]
+    fn read_reaps_completed_session_without_monitor_thread() {
+        let registry = registry();
+        let id = new_session_id();
+        let mut process = shell_command("exit 9", &id);
+        process
+            .current_dir("/tmp")
+            .env("HERDR_MCP_EXEC_ID", &id)
+            .env("PATH", enriched_exec_path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        process.process_group(0);
+        let mut child = process.spawn().unwrap();
+        let pid = child.id();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let session = Arc::new(Session {
+            id: id.clone(),
+            cwd: PathBuf::from("/tmp"),
+            command: "exit 9".to_owned(),
+            started_at_ms: now_ms(),
+            pid,
+            child: Mutex::new(child),
+            buffers: Mutex::new(Buffers::default()),
+            status: Mutex::new(SessionStatus::default()),
+        });
+        if let Some(stdout) = stdout {
+            spawn_reader(Arc::clone(&session), StreamKind::Stdout, stdout);
+        }
+        if let Some(stderr) = stderr {
+            spawn_reader(Arc::clone(&session), StreamKind::Stderr, stderr);
+        }
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .record_exec_running(
+                &id,
+                pid,
+                process_group_for_session(pid),
+                session.started_at_ms,
+            )
+            .unwrap();
+        registry
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(id.clone(), session);
+
+        for _ in 0..100 {
+            let view = registry.read(&id, "both", 0, 64);
+            if view["running"] == false {
+                assert_eq!(view["exit_code"], 9);
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("read did not reap completed session without monitor thread");
     }
 
     #[test]
