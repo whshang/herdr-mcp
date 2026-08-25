@@ -20,6 +20,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,6 +36,7 @@ const ALL_PORT_OVERRIDE = process.env.HERDR_TEST_TRANSPORT_ALL_PORT
   : null;
 const TOKEN = "transport-test-token";
 const BASE = `http://127.0.0.1:${PORT}`;
+const RUNTIME_PARITY = JSON.parse(readFileSync(new URL("../contracts/runtime-parity.json", import.meta.url), "utf8"));
 
 let server;
 let sessionId = null;
@@ -737,12 +739,12 @@ test("openai-mcp UA: server/discover advertises SDK wire first and keeps 2026-07
     assert.equal(msg.error, undefined, `openai-mcp discover on ${p} must not be an error`);
     assert.ok(Array.isArray(msg.result?.supportedVersions), `supportedVersions on ${p}`);
     assert.ok(
-      msg.result.supportedVersions.includes("2026-07-28"),
+      msg.result.supportedVersions.includes(RUNTIME_PARITY.openai_discover_extra_versions[0]),
       `openai-mcp discover on ${p} must advertise 2026-07-28`,
     );
     assert.equal(
       msg.result.supportedVersions[0],
-      "2025-11-25",
+      RUNTIME_PARITY.sdk_wire_protocol,
       `openai-mcp discover on ${p} must prefer SDK wire version first`,
     );
   }
@@ -766,7 +768,7 @@ test("openai-mcp UA: initialize/tools.list stay SSE; tools/call uses JSON", asyn
       headers: headers({
         "User-Agent": OPENAI_UA,
         Accept: "application/json, text/event-stream",
-        "Mcp-Protocol-Version": "2025-11-25",
+        "Mcp-Protocol-Version": RUNTIME_PARITY.sdk_wire_protocol,
       }),
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
     });
@@ -774,7 +776,7 @@ test("openai-mcp UA: initialize/tools.list stay SSE; tools/call uses JSON", asyn
     assert.match(list.headers.get("content-type") ?? "", /text\/event-stream/i,
       "tools/list must stay SSE for schema registration");
     const listMsg = await parseRpc(list);
-    assert.equal(listMsg.result.tools.length, 18);
+    assert.equal(listMsg.result.tools.length, RUNTIME_PARITY.tool_count);
     assert.ok(listMsg.result.tools.every((t) => t.inputSchema), "every tool needs inputSchema");
     const call = await fetch(`${BASE}/mcp`, {
       method: "POST",

@@ -1,0 +1,134 @@
+name: Rust Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: npm run test:edge
+      - run: npm run build:site
+      - run: node tests/manual/extension_smoke.mjs
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: rustup toolchain install 1.97.1 --profile minimal --target "${{ matrix.target }}"
+      - name: Build release binary
+        shell: bash
+        run: cargo build --locked --release -p herdr-mcp --target "${{ matrix.target }}"
+      - name: Stage raw release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(awk -F'\"' '/^version = / { print $2; exit }' crates/herdr-mcp/Cargo.toml)"
+          mkdir -p release-assets
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/herdr-mcp.exe" "release-assets/herdr-mcp-${VERSION}-${{ matrix.target }}.exe"
+          else
+            cp "target/${{ matrix.target }}/release/herdr-mcp" "release-assets/herdr-mcp-${VERSION}-${{ matrix.target }}"
+            chmod 755 "release-assets/herdr-mcp-${VERSION}-${{ matrix.target }}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-${{ matrix.target }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rust-*
+          path: release-assets
+          merge-multiple: true
+      - name: Build release manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF_TYPE:-}" != "tag" ]]; then
+            VERSION="$(awk -F'\"' '/^version = / { print $2; exit }' crates/herdr-mcp/Cargo.toml)"
+            TAG="v${VERSION}"
+          fi
+          node scripts/build-rust-release-manifest.mjs \
+            --root "$PWD" \
+            --assets-dir "$PWD/release-assets" \
+            --output "$PWD/release-assets/release-manifest.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$TAG"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-release-bundle
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    needs: manifest
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-release-bundle
+          path: release-assets
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* --verify-tag --generate-notes
+          fi

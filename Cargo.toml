@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/herdr-mcp"]
+resolver = "3"

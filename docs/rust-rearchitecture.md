@@ -1,0 +1,662 @@
+# Herdr MCP Rust 原生化重构计划
+
+状态：Accepted / In progress
+目标分支：`refactor/rust-supervisor-20260825`
+
+## 核心决策
+
+Herdr MCP 本地产品重构为 Rust 原生单一运行时。Rust 不只是 supervisor，而是最终本机产品边界。
+
+正式安装只提供 `herdr-mcp` 二进制，负责：
+
+- CLI
+- MCP runtime
+- Herdr transport
+- relay/link
+- supervisor
+- watchdog
+- update
+- generation
+- Native Messaging host
+- diagnostics
+- macOS/Linux/Windows service integration
+
+Cloudflare Worker 和浏览器扩展继续使用 TypeScript/JavaScript，因为它们属于不同运行环境。
+
+## 不采用长期双 runtime
+
+不保留长期架构：
+
+```text
+Rust supervisor -> Node MCP runtime
+```
+
+迁移期间 TypeScript runtime 作为行为参考实现。Rust 完成 parity test 后，删除对应旧实现。
+
+不维护：
+
+```text
+Rust MCP server
+TypeScript MCP server
+```
+
+两套生产实现。
+
+## 为什么现在重构
+
+当前项目已经进入产品化阶段，需要解决：
+
+- 用户无需安装 Node/npm/Python；
+- 单二进制分发；
+- 跨平台服务管理；
+- 自升级和回滚；
+- 本机权限和 IPC 管理；
+- Native Messaging 集成；
+- 明确的 runtime 状态机。
+
+Rust 的主要收益来自系统工程能力。MCP HTTP 解析性能不是主要目标。
+
+## 开发模式
+
+开发和生产使用同一 Rust 产品。
+
+开发模式：
+
+```bash
+cargo run -p herdr-mcp -- dev
+```
+
+允许迁移早期启动 TypeScript reference runtime，但最终 dev 和 production 都运行 Rust runtime。
+
+隔离：
+
+```text
+production ~/.config/herdr-mcp
+
+development ~/.config/herdr-mcp-dev
+```
+
+## 迁移阶段
+
+### Phase 1
+
+- Cargo workspace
+- CLI
+- status
+- doctor
+- dev bootstrap
+- Rust CI
+
+### Phase 2
+
+- supervisor
+- watchdog
+- service manager
+- structured state
+
+### Phase 3
+
+- Native Messaging
+- local IPC
+
+### Phase 4
+
+- GitHub Release manifest
+- update
+- checksum/signature
+- generation activation
+- rollback
+
+### Phase 5
+
+迁移 Herdr transport 和 MCP tools。
+
+迁移锚点保持：
+
+```text
+contract epoch 2
+18 tools
+```
+
+### Phase 6
+
+Rust runtime 完成后删除本地 Node runtime。
+
+## 分发目标
+
+支持：
+
+- macOS arm64
+- macOS x86_64
+- Linux x86_64
+- Linux aarch64
+- Windows x86_64
+
+安装方式参考 Herdr：
+
+- 官方 installer
+- GitHub Release
+- Homebrew
+- mise
+- Nix
+- Docker
+
+包管理器安装由包管理器负责升级，direct install 使用 `herdr-mcp update`。
+
+## 当前实施
+
+截至 2026-08-25，本分支已经完成第一批原生化基础：
+
+1. 创建 Cargo workspace，固定 Rust 1.97.1，并把 `fmt`、`clippy -D warnings`、workspace tests 接入 CI；
+2. 实现 `version`、`status`、`doctor`、`config` 和隔离的 `dev` bootstrap；
+3. production/dev 默认分别使用 `:8772` 与 `:8872`，状态目录分别为 `~/.config/herdr-mcp` 与 `~/.config/herdr-mcp-dev`；
+4. 将 epoch 2 / 18 tools 固化为语言无关的 `contracts/epoch2.json`，Rust 与现有 Edge contract 共同受测试约束；
+5. 实现 Rust Herdr Unix-socket newline-JSON RPC client，包含超时、1 MiB 响应上限和 daemon error 映射；
+6. 实现 `herdr api schema --json` 原生反射、60 秒缓存、8 秒加载上限，以及 required/type/enum/unknown-param 校验；
+7. 建立 Rust `herdr_methods` / `herdr_call` 核心 service，validated call 已通过真实 Herdr daemon smoke；
+8. `doctor` 当前真实验证 MCP runtime、Herdr RPC、live API schema、validated RPC、snapshot state 和 Rust inspect projection；
+9. 原生 snapshot 层使用 `session.snapshot`，并发以 `workspace.list` / `pane.list` / `agent.list` 覆盖 live collection；aggregate 失败时回退 list assembly；
+10. Rust `herdr_inspect` 核心投影已覆盖 workspace/tab/pane/agent、Git project、dirty/changed-files、shared project 和 heterogeneous workspace；
+11. Git project discovery 优先父目录 `.git` 确定性扫描，异常布局才回退有超时的 `git rev-parse`；managed project 的 dirty status 并发、有界执行；
+12. Agent soft visibility 已迁移，默认 allowlist 与当前 production 一致，并支持 `HERDR_MCP_AGENT_ALLOW=*`；
+13. `workstation_info` 已由 Rust 提供 default cwd、managed Git roots、read-only/write-root 状态及原生 executable discovery；未来正式产品不把 Node/npm/Python 作为运行依赖；
+14. 第一检查点 `3e93917 feat: bootstrap native Rust runtime` 已提交并推送到 `origin/refactor/rust-supervisor-20260825`；Rust、root Node、Cloudflare Edge、site build 和 browser extension smoke 已完成整仓回归。
+15. Rust 已实现 `events.subscribe` 长连接 wire protocol，支持字符串/对象两类 event envelope、1 MiB frame 上限、有界 read tick、订阅 deadline 和 daemon error 映射；
+16. `EventCache` 已成为原生常驻状态层：snapshot bootstrap、25 秒重订阅、30 秒 full-snapshot TTL、250ms 可中断 poll、断线重连、unknown-workspace admission gate、workspace/pane/tab/agent 增量归并；
+17. Event cache 保存最多 2048 条 cursor history；`cursor=0` 返回最近 64 条，并维护 Agent `last_activity_at` 与从 session filename 推导的 `started_at`；
+18. Rust `herdr_since` service 已实现 boot id、cursor reset、workspace id/label filter 和 Agent visibility；它直接读取 EventCache，不在 MCP 调用时轮询 daemon；
+19. `doctor` 已真实启动/停止 EventCache，并验证 background `events.subscribe` 已进入 live 状态；当前 Rust 测试为 39/39；
+20. 第二检查点 `e39ecf7 feat: migrate native inspect state` 已提交并推送。
+21. 第三检查点 `367fa84 feat: add native event state cache` 已提交并推送；
+22. Rust candidate MCP HTTP transport 已建立，使用 Axum/Tokio，仅绑定 `127.0.0.1`，启动时强制要求 `HERDR_MCP_TOKEN`，不会启动匿名 MCP endpoint；
+23. candidate 已支持 `initialize`、`server/discover`、`tools/list`、`tools/call`、`ping` 和 initialized notification；initialize/tools-list 在客户端声明 `text/event-stream` 时保持 SSE handshake framing；
+24. `tools/list` 直接读取 `contracts/epoch2.json`，真实 HTTP smoke 确认精确暴露 epoch 2 的 18 tools；
+25. 已迁的 `herdr_methods`、`herdr_inspect`、`herdr_since`、`herdr_call` 已通过 candidate HTTP 调用真实 Herdr daemon；未迁工具统一返回 `native_tool_pending` + `isError=true`，因此 candidate 不会伪装成完成态；
+26. candidate 使用迁移期命令 `herdr-mcp candidate --port 8873`。它不是最终 CLI contract；生产切换前还需完成 persistent GET/SSE、完整 18-tool implementation、auth/session compatibility 和 Edge parity；
+27. 第四检查点 `0beef01 feat: add Rust MCP candidate transport` 已提交并推送；当时 Rust 单测为 46/46，真实 candidate smoke 验证了 unauthorized=401、health、SSE initialize、18-tool catalog、4 个 native tool call 和 pending-tool rejection；
+28. 新增 `contracts/runtime-parity.json`，固定 Node reference 与 Rust candidate 共享的 server name、SDK wire protocol、supported versions、epoch/hash/tool count 和 stateless SSE/JSON framing 分类；Rust 与 Node fixture tests 同时消费该文件；
+29. managed-root 安全层已经迁入 Rust：managed roots 只来自实时 snapshot 的 Git project，existing path 必须 canonicalize 后仍位于同一 root；secret-ish path 和 `.git/config` 直接拒绝，symlink escape fail-closed；
+30. Rust 已原生实现 `herdr_fs_read`、`herdr_fs_list`、`herdr_fs_grep`：read 保持完整行 byte budget，list/grep 不跟随目录 symlink、跳过 `.git` 和 secret path，grep 使用 Rust regex/目录遍历，不把 `rg` 作为正式运行依赖；
+31. Rust 已原生实现只读 `herdr_git` 的 `status/diff/log`，参数不经 shell；diff path 不能逃逸 managed root，Git stdout/stderr 边 drain 边限额，15 秒超时后强制终止；
+32. 真实 candidate HTTP smoke 已验证 read/list/grep/git 正常工作，并验证 `/etc/hosts`、`.git/config`、`git diff ../...` 分别被 managed-root/secret/escape gate 拒绝；当时 Rust 单测为 56/56。
+33. 第五检查点 `975273f feat: expose native runtime diagnostics` 已提交并推送；Rust candidate 的 health/inspect 已统一暴露 build metadata、EventCache boot id、native migration 进度与 exec-session readiness，迁移状态不再依赖人工对照源码。
+34. 第六检查点 `b13b5e9 feat: migrate native image tool` 已提交并推送；`herdr_fs_image` 复用 managed-root/secret/symlink 安全边界，支持 PNG/JPEG/GIF/WebP、2 MiB 默认/8 MB 上限和 MCP `text + image` content；真实 candidate HTTP smoke 已验证图片成功返回、`image_too_large` 与 `unsupported_image`，当时 Rust 单测为 60/60。
+35. `10beb44 test: make Rust fs fixtures collision-safe` 已修复 Rust 并行测试临时 Git repo 的低概率命名碰撞；连续 5 轮 workspace tests 均通过，避免把时间粒度碰撞误判成 fs/security 回归。
+36. 第七检查点 `18f4a0a feat: add native mutation safety and fs writes` 已提交并推送；统一 mutation policy 覆盖 readonly、write-root、working-Agent、dirty confirmation、managed target、secret/symlink 与 atomic single-file write；`herdr_fs_edit` / `herdr_fs_write` 已通过真实 candidate smoke，验证新建、overwrite 拒绝、dirty 拒绝、`confirm_dirty` 放行和 secret-path fail-closed；当时 Rust 单测为 65/65，整仓 Rust/Node/Edge/site/extension 回归通过。
+37. 第八检查点 `958711f feat: migrate native patch transactions` 已提交并推送；Rust 已原生实现 Codex/coding-tools 风格 patch parser、unique-context hunk、CRLF/BOM 保持、multi-file preflight、dirty/busy gate 与同目录 temp/backup 原子事务回滚；`herdr_fs_patch` 真实 candidate smoke 已验证 dry-run 不写、dirty fail-closed、`confirm_dirty` 下 add/update/delete 同事务成功、`../` path escape 拒绝。当前 native migration 为 12/18，Rust 单测 72/72；完整 gate 为 Node 314/314、Edge 212/212、双语站点 21 篇/语言并全部通过。
+38. `17e50ad feat: migrate native exec sessions` 已提交并推送；Rust 原生 `herdr_exec_start/read/kill` 使用单一 `ExecRegistry`，每流 512 KiB bounded output、跨 stdout/stderr sequence、独立 Unix process group、SIGTERM → grace → SIGKILL、兼容 shell/PATH，并把 restart journal 限定为 `session_id + pid` fencing identity，不长期保存 command/cwd。
+39. `d32495d feat: migrate visible utility exec` 已提交并推送；短命令 `herdr_exec` 保持 workspace/project-root 选择、可见 `herdr-mcp:utility` pane、busy-agent gate、pager 抑制、超时后 observation 提示，以及“发送前可 fallback、发送后 outcome unknown 时禁止自动重发”的安全边界。
+40. `88d7b7a feat: migrate native agent prompt` 已提交并推送；`herdr_prompt` 已迁入 Rust，保留 idempotency key、parallel/conflicting reuse gate、socket `agent.prompt`、wait 状态与 post-submit observation，native migration 达到 17/18。
+41. `af7ea63 test: harden Rust temp fixtures` 修复 mutation policy 与 Unix-socket 测试的并发临时资源命名碰撞；`34cd115 fix: fence recovered exec process groups` 进一步把 restart fencing 从仅检查环境 marker 升级为受控 shell `argv[0]` session marker + `PGID == journal PID` 双重验证，并保留环境 marker 兼容路径。
+42. live-orphan restart smoke 已在 macOS 真进程上闭环：candidate 启动 `sleep 300` 后终止 runtime，确认 session shell 以 PPID 1、独立 PGID 继续存活；使用同一 state dir 重启后旧 session 返回 `recovery_state=reaped_on_restart`，`herdr_inspect.workstation_info.exec_sessions_diagnostics.reaped_on_boot=1`，原 PID 随后消失。PID reuse/marker 无法验证时继续返回 `detached_unverified`，不会盲杀不明进程。
+43. `45ea1b8 feat: complete native tool parity` 完成最后一个 `herdr_skill`：project policy 支持 upstream fetch + TTL cache + stale fallback + bundled policy，native Herdr reference 使用有界 `herdr --skill` + bundled fallback，runtime/self-update/worker fallback context 只投影白名单字段；`workstation_info.agent_skill` 与 production pointer 对齐。
+44. 当前 Rust candidate 已达到 epoch 2 **18/18 native tool parity**，`native_parity_ready=true`、`pending_tool_count=0`；此时仍保持 `production_ready=false`。该里程碑整仓 gate：Rust 94/94、Node 314/314、Edge 212/212、双语站点 21 篇/语言，全部通过。
+45. `68b0e8d feat: add Rust transport sessions and SSE` 已完成本机 MCP transport 的核心 production parity：bounded in-memory stateful session registry、`Mcp-Session-Id`、`/mcp/` alias、session DELETE、valid-session persistent GET SSE，以及 ChatGPT/OpenAI stateless 分类；persistent SSE 首帧为 `: connected`，15 秒 heartbeat 为 `: keepalive`，并保持 `no-cache, no-transform` / keep-alive / no-buffering 响应头。
+46. OpenAI/ChatGPT transport 明确采用 stateless 语义：`openai-mcp` UA 或 initialize `clientInfo` 为 OpenAI/ChatGPT 时忽略 stale/poisoned `Mcp-Session-Id`，initialize/tools-list 继续按 Accept 使用 SSE，tools/call 与 server/discover 使用 JSON，不返回新的 session id；`server/discover` 保持 SDK wire `2025-11-25` 排第一，同时兼容探测版本 `2026-07-28`。普通 stateful 客户端的 stale session 继续 fail-closed 为 HTTP 404 / JSON-RPC `-32001`。
+47. `756def9 test: lock Rust transport session parity` 已把上述行为固化为真实 Axum router regression；`21e2ba8 test: lock Rust transport restart semantics` 进一步验证 runtime restart 后旧 stateful SID 被 fencing 为 404，而相同 stale SID 在 `openai-mcp` 客户端仍按 stateless 语义成功，不产生“Session terminated”式污染。
+48. `53c2030 fix: harden Rust transport session state` 把 session registry 锁异常改为 HTTP 500 / JSON-RPC `-32603` fail-closed，不再返回无法验证的 SID；新增 100 次 OpenAI poisoned-session stress，确认全部请求成功且 registry 始终为 0，不把 stateless 客户端偷偷转成 stateful。
+49. production transport 真实 smoke 已覆盖：同一 TCP 连接连续 `initialize → tools/list → tools/call → notifications/initialized`，18-tool catalog 与 202 notification framing 均正常；OpenAI poisoned-session 在同一 TCP 上连续 100 次 tools/list 全部 200、无 SID；同端口 runtime restart 后旧 stateful SID 为 404，而 OpenAI stale SID 为 200/18 tools；persistent GET 实测连接保持开放并收到 15 秒 heartbeat。Rust transport regression 当前为 100/100 单测通过。
+50. 本阶段的 auth 边界按目标架构收紧：Rust runtime 继续只绑定 loopback，并强制要求本机 bearer；Web Connector 的 OAuth 仍由 Edge 负责（`Web AI → MCP/OAuth → Edge → link → Rust runtime`），extension/Native Messaging 的本机信任通道留到后续 supervisor/Native Messaging 阶段，不复制旧 Node runtime 的 OAuth/extension-session 逻辑到 Rust HTTP transport。
+51. 至此 **local production transport parity 核心闭环完成**：persistent SSE、stateful/stateless session、OpenAI UA、restart/reconnect framing、raw keep-alive、stale-session reverse guard 与 loopback bearer 均已有自动测试和真实 smoke。
+52. `1b59f8e feat: add secure Rust local state store foundation` 已建立 Shared Local State Store：嵌入式 SQLite、WAL、foreign keys、busy timeout、显式 schema migration、事务、0600 database / 0700 parent directory、安全路径与 future-schema fail-closed；它属于内部 runtime state，不改变 epoch 2 / 18-tool contract。
+53. `03c1148 feat: persist Rust exec session fences in SQLite`、`592f0c7 feat: persist prompt idempotency across restart`、`751331e fix: align exec restart recovery with SQLite` 已把首批可靠性状态迁入统一数据库：exec 只持久化 process fencing identity，command/cwd 继续不进入 durable state；prompt idempotency 可跨 runtime restart replay/conflict-check；旧 exec restart recovery 继续保留 `reaped_on_restart` / `closed_before_restart` / `detached_unverified` 的真实语义。
+54. 浏览器侧 `cd567cd` / `3314c63` 已把 ChatGPT binding 收敛到稳定 Project scope；`475d537` / `c98211c` 已为长对话增加 bounded scheduler、latest-turn cache 与 UI pressure meter，减少 MutationObserver/DOM 全量扫描和重复 `/push/state` 压力。
+55. `ea3a064 feat: add opt-in Rust extension IPC socket` 已加入迁移期 Rust extension IPC：仅在显式配置 `HERDR_EXTENSION_IPC_SOCKET` 时启用 Unix socket，socket mode 为 0600；live socket 二次 bind fail-closed，stale socket 可安全替换，guard 只删除自己持有的 inode。TCP MCP endpoint 继续要求 bearer，trusted extension IPC 才使用本机 socket 信任边界。
+56. `7f9ee15 feat: add Rust extension push channel` 已把 `/push/state` 与共享 `/push/events` SSE 接入同一个 Rust `EventCache`，支持 `hello`、`agent_working`、`agent_settled`、15 秒 keepalive 和 agent/pane/workspace filter；不会为每个浏览器绑定再开 Herdr daemon subscription。workspace catalog 已对齐 Node 的 Project root fallback（projects → workspace cwd → agent cwd → pane cwd），避免 Rust 切换后 HUD/Project binding 丢失 roots。
+57. 该上行通道真实 smoke 已验证：trusted Unix socket 无 bearer 可读取 `/push/state`/`/push/events`，同一路由从 TCP 无 bearer 返回 401；SSE 首帧包含 `retry: 2000`、`event: hello`、`herdr-mcp-push/v1`，w77 的真实 worktree root 可在 state 与 hello 中一致恢复。该 checkpoint gate 为 Rust **125/125**、Node **321/321**、Edge **212/212**、双语站点 **21 篇/语言**，extension smoke 全通过。
+58. `1d79963 test: stabilize extension IPC stale-socket fixture` 修复 macOS Unix listener 刚关闭后短时间仍可能成功 `connect()` 的测试竞态：production `prepare_socket_path` 继续把可连接 socket 视为 live 并 fail-closed，测试等待内核确认 stale 后才验证替换；同时临时 socket 名加入高熵 nonce。该针对性测试已连续运行 20 次通过。
+59. `edd8c89 feat: add Rust Native Messaging host data plane` 新增 `herdr-mcp extension-host <chrome-extension://.../>`：实现 Chromium 4-byte little-endian Native Messaging framing，严格校验 caller origin、loopback HTTP base URL、既有 proxy path/method/header allowlist，并把 `request` / persistent `stream` 直接转发到 mode-0600 Rust Unix IPC。browser bearer 不进入 host；`Authorization` 不在 forwarded-header allowlist；request/native frame/response 分别有 1 MiB / 1 MiB / 8 MiB 边界，普通 request 的连接与 response body 都受 timeout 约束。`stream` 使用 64 KiB base64 frame 持续转发 SSE，不缓存完整长连接。
+60. Rust Native Messaging host 当前只实现现代 extension 的 `request` / `stream` 数据面；旧 `session` 消息明确返回 `legacy_session_requires_compat_host`。现有 `bin/herdr-extension-host install/status` 与浏览器 manifest 仍保持 Node compatibility host，尚未切换 production host path，因此不会让旧 extension build 或仍运行 Node runtime 的安装失效。
+61. 真实 native-framing smoke 已闭环：Rust candidate 在 `8892` 暴露 `/tmp/herdr-mcp-native-host-smoke/extension.sock` 后，Rust `extension-host` 以当前 unpacked extension 的路径派生 origin `chrome-extension://ciggfiookaelnpaaocdapmohgmaghgge/`，`request /push/state` 返回 `transport=ipc/status=200` 并恢复 w77 worktree root；`stream /push/events` 返回 `stream_open → stream_chunk`，chunk 内含 `event: hello` 与 `herdr-mcp-push/v1`。candidate 停止后 8892 与 socket 均清理。最新整仓 gate 为 Rust **130/130**、Node **321/321**、Edge **212/212**、双语站点 **21 篇/语言**，extension smoke 全通过。
+62. `a2438ec feat: add Rust Native Messaging host lifecycle` 新增 `herdr-mcp native-host install|status|uninstall` candidate 管理面。`install` 把当前 Rust 单二进制原子复制到稳定 `~/.config/herdr-mcp/native/herdr-mcp`，Chrome manifest 永远指向同目录稳定 wrapper `herdr-extension-host`；wrapper 只注入 exact extension origin 并执行 colocated Rust binary，不携带 bearer。native dir / binary / wrapper / manifest 分别收紧为 0700 / 0700 / 0700 / 0600，并拒绝 symlink target。
+63. Native Messaging 安装身份不进入 `state.db`：`status/uninstall` 优先从已注册、指向稳定 wrapper 的 Chromium manifest 恢复 exact origin，因此源码 worktree 不存在、`state.db` 损坏或 runtime generation 切换时仍可识别安装。多个已注册 manifest 若 origin 冲突则 fail-closed。`uninstall` 只有在 manifest 精确匹配 host/type/path/origin 且 wrapper 含 Rust ownership marker 时才删除；现有 Node compatibility wrapper、被篡改 manifest 与 symlink 均保留并报告非 owned，避免迁移工具误删当前生产桥。
+64. lifecycle 真实 smoke 全部使用临时 HOME，未修改真实浏览器安装：`install → status → uninstall` 验证 manifest 0600、wrapper/binary 0700；故意设置 `HERDR_MCP_ROOT=/definitely/missing` 时 `status` 仍从 manifest 恢复 `ciggfiookaelnpaaocdapmohgmaghgge`，`extension_path=null` 但 `ok=true`。更完整链路还验证了临时 Chrome manifest → stable wrapper → copied Rust binary → mode-0600 Unix IPC → copied Rust candidate（8893），`request /push/state` 与 persistent `/push/events` SSE 均成功，随后 candidate/socket/manifest/wrapper/binary 全部清理。
+65. 最新整仓 gate 为 Rust **134/134**、Node **321/321**、Edge **212/212**、双语站点 **21 篇/语言**，extension smoke 全通过。`production_ready` 继续保持 `false`：Native Messaging data plane 与 candidate install/status/uninstall 已完成，但真实用户 HOME 的 manifest 仍由 Node compatibility installer 管理；在 Rust supervisor/service manager 能持续拥有 production `extension.sock` 之前不做 live cutover。尚未完成 supervisor/service manager、actual manifest cutover/UAT、updater/generation production cutover、relay/link Rust production path 和 Node runtime removal。
+66. Rust service manager 第一阶段已经完成代码闭环：新增 `herdr-mcp service install [--adopt-node]|status|start|stop|restart|uninstall`，生产 label 继续使用 `dev.herdr-mcp.server`；runtime 复制到内容寻址的 `~/.config/herdr-mcp/runtime/generations/rust-<sha16>/herdr-mcp`，launchd 只指向稳定的 `runtime/current/herdr-mcp`，`current` 使用受管 symlink 原子切换。默认 `install` 遇到现有 Node service fail-closed；只有显式 `--adopt-node` 才允许接管已识别的 herdr-mcp Node plist，并保留现有 token、Edge base URL、contract profile、Herdr socket、skill-network 与 PATH 配置，不把 bearer 写入 state DB 或 CLI 输出。
+67. service manager 同时收口旧 watchdog 的双 supervisor 风险：`dev.herdr-mcp.watchdog` 只有在精确识别为旧 `watchdog.sh once` 后才允许随 Node adoption 退休；接管前备份原 server/watchdog plist，记录其 loaded 状态。Rust service 启动后必须在 10 秒内通过 `127.0.0.1:8772/health`；任一步失败会 bootout 新 service、恢复旧 plist、恢复上一 generation pointer，并按原 loaded 状态重新 bootstrap Node server/watchdog。`start/stop/restart/uninstall` 若发现 legacy watchdog 仍存在则拒绝，避免两个 supervisor 同时拥有 production runtime。
+68. Shared Local State Store schema 升到 v4：v3 新增 `runtime_generations` 与 bounded `service_events`，v4 再新增 `service_rollbacks`。generation staging/activation 使用事务保证同一时刻最多一个 `active`，上一 generation 进入 `previous`；service event detail 最多 512 字符。已有 v2 `operations` / `exec_sessions` 数据升级到最新 schema 的回归已验证不丢行。generation activation 是 cutover 强一致门；纯 evidence 记录是 best-effort，并通过 `evidence_recorded` 显式暴露，避免 service mutation 已成功却因日志写入失败而向调用方制造 outcome-unknown。
+69. 新 Rust `service status` 已在真实用户 HOME 做**只读**生产分类 smoke：正确识别当前仍为 `implementation=node`、`dev.herdr-mcp.server` loaded、legacy watchdog present+loaded、`runtime/current` 尚不存在；该检查没有修改真实 launchd/plist。最新整仓 gate 为 Rust **139/139**、Node **321/321**、Edge **212/212**、双语站点 **21 篇/语言**，extension smoke 全通过。`production_ready` 继续保持 `false`，本轮没有执行 `service install --adopt-node`，真实生产仍运行 Node runtime + legacy watchdog。
+70. `herdr-mcp service rollback` 已补齐 post-commit rollback：`install` 对旧 Node 或上一 Rust service 创建 mode-0600 plist backup，并把 backup path、source kind、原 loaded 状态、previous generation target 与本次 activated generation 写入 `service_rollbacks`，不把 plist/token 正文写入 SQLite。generation activation 与 rollback `prepared → ready` 在同一个 SQLite transaction 内提交；rollback 先把唯一 `ready` 记录原子 claim 为 `consuming`，严格校验当前 generation、backup confinement 与 symlink 边界，恢复旧 server/watchdog/current pointer 后再把 rolled-back Rust generation 与 rollback consumption 同事务结算。rollback 本身失败时会尝试恢复当前 Rust plist/current/loaded 状态，并把 claim 释放回 `ready`；若二级恢复也失败则标记 `rollback_failed`，不允许盲目重复 mutation。
+71. rollback health verification 同时覆盖两类 source：上一 Rust generation 使用 `/health`，旧 Node 使用带原 bearer 的 sessionless `server/discover`，token 只存在于进程内请求头。真实生产只读 smoke 已确认当前 Node `server/discover` 返回成功；在仍运行 Node+watchdog 的现网上调用新 `service rollback` 会在任何 state/launchd mutation 前拒绝为 `service is not installed as an owned Rust service`，且 server/watchdog plist 的 mtime/size/inode 前后完全一致。Rust gate 当前为 **143/143**；真实 production 仍未执行 `--adopt-node`。
+72. Rust 已补齐 Node Native Messaging compatibility host allowlist 中最后一条本机路由 `/push/mcp-activity`。实现保持 Node 契约：仅在内存保存最多 2000 条 finished `tools/call` 元数据，字段限于 timestamp、tool、`herdr_call.method`、User-Agent 与 HTTP status，不保存 prompt/arguments/result；查询默认 `ua=openai-mcp`、最大回看 30 分钟、`count` 统计全部命中而 `tools` 最多返回最后 50 条，trusted extension IPC 无 bearer 可读、TCP 无 bearer 仍为 401。真实 smoke 已验证 `openai-mcp` 的 `herdr_methods` 经 Rust TCP 入 ring 后，现有 Node Native Messaging host 通过 Rust `extension.sock` 查询得到 `transport=ipc/status=200/count=1/tool=herdr_methods`；candidate 停止后 socket 正常清理。Rust gate 当前为 **146/146**。
+73. post-commit rollback + MCP activity 完成后的整仓 gate 已再次全绿：Rust **146/146**、Node **321/321**、Edge **212/212**、双语站点 **21 篇/语言**，extension smoke 全通过。至此第一轮 production service-manager UAT 的四条 compatibility-host proxy path（`/mcp`、`/push/state`、`/push/events`、`/push/mcp-activity`）均有 Rust 实现与真实 Unix-IPC smoke，且 runtime health 失败有 install-time auto rollback、browser/UAT 后置失败有显式 `service rollback`；真实 production 仍未发生 cutover。
+74. 第一轮真实 `service install --adopt-node` UAT 已执行并安全回滚：preflight 确认 installed Node compatibility host 的 main-checkout extension id 为 `dklcamincneeijhcelpkdbcekfemldii`、5/5 Native Messaging manifest allowed，且 `/push/state` 基线经现有 host 走 `transport=ipc`。cutover mutation 在旧 Node `bootout` 后首次 Rust `launchctl bootstrap` 返回 macOS `Bootstrap failed: 5: Input/output error`；install transaction 随即恢复原 Node server plist、loaded 状态和 legacy watchdog。真实 state v4 证据为 Rust generation `staged`、rollback `auto_rolled_back`、service event `install/rolled_back`，production 8772 随后仍由原 Node runtime 正常提供服务。
+75. 上述 failure 与仓库既有 `herdr-self-update` launchd 经验一致：macOS 在 `bootout` 后 domain 尚未 settle 时会短暂返回 error 5。Rust service manager 现已统一采用 `wait-launchd-absent + 250/500/1000/2000ms bounded bootstrap retry`，总计最多 5 次；`bootout` 也等待 label 真正消失。install、start/restart、显式 rollback、install-time auto rollback、rollback 失败后的 Rust 恢复全部复用同一 helper，不再各自承担 race。新增单测验证两次 I/O error 后第三次成功，以及耗尽 bounded attempts 必须 fail-closed。修复后的完整 gate：Rust **148/148**、Node **321/321**、Edge **212/212**、双语站点 **21 篇/语言**，extension smoke 全通过；第二轮 production cutover 仍需重新构建 release 后再执行。
+76. 第二轮 production service-manager cutover 已成功提交。由 `4081d6a` 重新构建 release，SHA-256 为 `8b80ab11e3cd9e5e619d708a311804350418c5862b8b9f661c37628ca8ca4c01`；执行一次 `service install --adopt-node` 后返回 `rc=0`，active generation 为 `rust-8b80ab11e3cd9e5e`，launchd `dev.herdr-mcp.server` 已指向 `~/.config/herdr-mcp/runtime/current/herdr-mcp candidate --port 8772`，`HERDR_MCP_SERVICE_IMPL=rust-v1`，legacy watchdog plist 已删除且 label unloaded。state v4 保留唯一 `ready` Node rollback `rb-1787662450010-node-8b80ab11`，原 Node server/watchdog plist 已备份；因此当前 production runtime 是 Rust，但仍保留确定性的 Node 回退能力。
+77. cutover 后健康验证区分了“同一 MCP handler 内同步 self-probe”和真实外部客户端。若在正在处理 `herdr_exec` 的 Rust runtime 内同步 `curl 127.0.0.1:8772` 或运行 `service status`，会因为 handler 嵌套等待自身而制造 5 秒 timeout/`healthy=false` 假象；改用独立 `herdr_exec_start` 让 MCP 请求先返回，再延迟 500ms 外部探测后，`/health` 约 2.3ms 返回 200、`runtime=rust-candidate`、`native_parity_ready=true`，`tools/list=18`，外部 `service status` 也稳定为 `implementation=rust/healthy=true`。后续 doctor/UAT 不应使用同步 nested self-probe 判断同进程 runtime 健康。
+78. production Native Messaging compatibility UAT 已覆盖 allowlist 四条路径。真实 installed origin 仍为 main-checkout extension id `dklcamincneeijhcelpkdbcekfemldii`，5/5 browser manifest allowed，wrapper 仍为 `~/.config/herdr-mcp/native/herdr-extension-host`。经该现有 Node compatibility host：`/mcp` 命中 Rust Unix IPC、HTTP 200、18 tools；`/push/state` 为 `ipc/200` 并返回当前 workspace/agent catalog；`/push/events` 为 `ipc/200` 且收到 `event: hello`；`/push/mcp-activity` 为 `ipc/200`。为避免 runtime restart 后空 ring 造成假失败，另由外部 `User-Agent: openai-mcp/1.0.0` 发起只读 `herdr_methods`，随后通过 installed host 查询 activity 得到 `count=1/tool=herdr_methods/ua=openai-mcp/1.0.0`。
+79. 真实 ChatGPT Project 页面 `https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/project` 已完成只读浏览器 HUD UAT：页面登录态与 title 正常，DOM 中存在 `#h2w-page-hud`，shadow DOM 已渲染 `Herdr ● 已完成` 并读到 `w68/w74/w77/w7G`；`自动 开` 正常，Project 首页按设计锁定“手动继续 / herdr监控 / LLM 分析”，同时“手动接力”保持可用。两次 cutover 后 Rust PID 变化进一步通过 `state.db service_events + w77:p2 utility pane history` 归因到另一网页编排会话显式执行的两次 `service restart`，不是 Rust crash、link daemon 或 launchd 自发重启。该 UAT 发生在 Node compatibility Native Messaging host 仍作为浏览器入口的阶段。
+80. production Native Messaging manifest/wrapper 随后已切到 Rust host。切换后发现 Chromium 正常启动 Native Messaging host 时不会追加 caller-origin positional argv，而稳定 wrapper 只通过 `HERDR_EXTENSION_ORIGIN` 注入已注册身份；旧 CLI 因要求 positional origin 会在 Chrome 正常调用前提前退出。`818a7d1 fix: make Rust native host launchable by Chromium` 修复为“无 positional arg 时使用受管环境中的 exact origin，显式 arg 仅保留测试/兼容调用”，并让 `native-host install` 优先继承已有 registered origin，避免从当前 build/worktree 的 extension path 重新派生 ID 导致身份漂移。热修前已把 binary/wrapper/5 个 manifest 保存到 `~/.config/herdr-mcp/backups/native-host-pre-cli-fix-20260825-214417`；热修后 stable production wrapper 无参数启动真实 framing smoke 已验证 `/mcp=ipc/200/18 tools`、`/push/state=ipc/200`、`/push/events` 收到 `event: hello` + `herdr-mcp-push/v1`。第一类 native-host binary/manifest 自动 rollback 仍需单独产品化，不能把这份人工 backup 当长期 rollback 机制。
+81. `dcb35d4 feat: add Rust release artifact manifest` 建立 Rust release 供应契约：GitHub Actions 先执行 Rust/root/Edge/site/extension release gate，再分别在 hosted runner 原生编译 `aarch64-apple-darwin`、`x86_64-apple-darwin`、`aarch64-unknown-linux-gnu`、`x86_64-unknown-linux-gnu`、`x86_64-pc-windows-msvc` 五个 raw binary；`release-manifest.json` 固定 product/version/tag、epoch2 contract identity、target/name/size/SHA-256/asset URL。workflow 默认 `contents: read`，只有 tag publish job 提升到 `contents: write`。
+82. `6b279bf feat: add rollback-safe Rust updater` 新增 `herdr-mcp update check|apply|status` 与内部 detached `update worker`。manifest 最大 1 MiB、binary 最大 64 MiB；默认只从 GitHub latest manifest 检查，显式 override 也只允许 HTTPS 或 loopback HTTP，URL credentials 拒绝；下载必须同时满足 exact target、semver、epoch2 hash/tool-count、declared size、lowercase SHA-256，并在 staging 后再次 hash + 执行 `version` 验证 `herdr-mcp <version>`、`contract epoch 2 / 18 tools` 与 `state schema`。同版本/降级在 staging 前拒绝。`apply` 不直接拥有 launchd，而是启动下载到的候选 binary 作为独立 process group worker，由该 worker复用现有 `service install` 的 content-addressed generation、health gate、auto rollback 和 evidence；worker spawn 时显式移除 `HERDR_MCP_EXEC_ID`，不放宽 service manager 的 managed-exec 自重启防护。
+83. updater 的事务状态故意**不进入 runtime `state.db`**。普通 A/B 更新必须能够回到上一 runtime generation；如果候选先把 runtime DB 从 schema 4 升到 5，旧 generation 会按 future-schema fail-closed 而无法回滚。因此 main `SCHEMA_VERSION` 保持显式 4，release manifest 携带 `state_schema=4`，普通 update 只接受与本机完全相同的 runtime state schema；将来 schema 升级必须走专门的 expand/contract migration handoff。Updater 自己使用独立 rollback control domain `~/.config/herdr-mcp/update/state.db`（schema 1、WAL、0700 dir/0600 DB、future-schema fail-closed），只保存 job/version/target/asset/hash/confined staging path/state/PID/512-byte detail，不保存 release URL/token；partial unique index 保证最多一个 `queued|installing` job。真实无副作用 fake-candidate smoke 已验证：父调用显式设置 `HERDR_MCP_EXEC_ID` 时 detached worker 仍看到 `unset`；只创建 `update/state.db` 而不创建/升级 runtime `state.db`；live worker 阻止第二次 apply；dead worker 可被标记 failed、清理 confined staging 后恢复。由于当前 production binary 已使用 `0.4.0-alpha.1`，rollback-safe updater 首个可发布候选明确提升为 `0.4.0-alpha.2`，避免同版本对应不同 binary，也确保 semver updater 能把 production alpha.1 识别为可升级来源。最新整仓 gate 为 Rust **157/157**、Node **323/323**、Edge **212/212**、双语站点 **21 篇/语言**，extension smoke 全通过。
+
+下一批开发按以下顺序推进：
+
+1. 对 `rust-release.yml` 做真实 `workflow_dispatch` 五平台构建，先验证 runner/toolchain/asset/manifest 聚合链路；随后补 release manifest / artifact 的签名或 GitHub attestation 校验。目前 SHA-256 + HTTPS 已完成，但**签名验证尚未完成**，因此不能把 updater 宣称为最终 production release trust chain；
+2. 在有真实已签名/可验证的新版本 artifact 后做一次完整 updater production UAT：`check → apply queued → detached worker → service generation activation → health → status`，同时验证坏 checksum、坏 identity、active-job 冲突和 service health failure 的 rollback；普通 updater 继续强制 same `state_schema`，schema migration 单独设计；
+3. 给 production Rust Native Messaging host 增加 first-class A/B 或 `native-host rollback`，并在真实浏览器页面重做 Rust-host-only 的 service-worker restart/reconnect、Project binding/Auto 恢复 UAT；runtime `service rollback` 与 native-host rollback 保持两个独立故障域；
+4. 迁移 relay/link，使 Edge → 本机 transport 与 runtime generation fencing 进入 Rust production path；
+5. 只有在 18-tool parity、transport、state store、supervisor/Native Messaging、signed updater、link 均通过生产回归后，删除本地 Node runtime 和旧 lifecycle scripts；
+6. 再进入 Reliability Kernel → Continuity 2.0 → Work Context & Evidence → Product Completion，保持 Web Chat 是 planner，herdr-mcp 是控制面。
+
+## Rust 完成后的产品演进 Roadmap
+
+Rust 原生化完成后，重点继续打磨 Web AI 到本机开发现场的完整闭环。保持 herdr-mcp 是控制面，不扩展成新的 Agent runtime，也不强制绑定 Claude、Codex、Pi、OpenCode、Grok、Droid 等具体执行器。
+
+最终闭环保持两条方向同时成立：
+
+```text
+下行：Web AI → MCP/OAuth → Edge → link → Rust runtime → files/Git/exec/Herdr
+上行：Herdr/runtime event → Native Messaging → browser → 当前 Web conversation
+```
+
+核心原则：
+
+- Web Chat 继续负责理解目标、讨论方案、任务取舍和验收；
+- herdr-mcp 负责提供真实本机状态、确定性工具、可靠传输和恢复证据；
+- Herdr 负责持久工作现场，workspace/pane/Agent/runtime state 以 live state 为准；
+- 本地 Agent 是可替换 worker，用于并行调查、边界明确的实现和第二视角审查；
+- 小任务、调研任务、讨论任务保持轻量路径，不要求先创建 task/workflow；
+- 复杂开发可以携带 work context，但它只是恢复与观察元数据，不接管 Web Chat 的任务管理；
+- public MCP contract 继续保持小而稳定，新增能力优先进入内部 runtime/state，而不是增加模型每轮 schema 负担。
+
+### Shared Local State Store：统一 Rust 本机持久状态层
+
+目标：在继续迁移 supervisor、Native Messaging、updater、link 与浏览器连续工作之前，建立统一的本机 durable state 层，避免每个模块各自维护 JSON journal、lock/status 文件和恢复逻辑。
+
+默认实现采用嵌入式 SQLite：
+
+```text
+production ~/.config/herdr-mcp/state.db
+development ~/.config/herdr-mcp-dev/state.db
+```
+
+基础要求：
+
+- SQLite 由 Rust runtime 独占管理，不引入外部数据库服务；
+- 启用 WAL、foreign keys、busy timeout 与显式 schema migration；
+- 所有 mutation/recovery 状态更新优先使用事务，跨对象 cutover 不依赖多个 JSON 文件的先后写入；
+- public MCP epoch 2 / 18 tools 不因数据库引入而扩张；数据库属于内部 runtime/state implementation；
+- runtime live state、Herdr workspace/pane/agent state 和 Git working tree 仍从真实来源读取，数据库不成为第二套事实源；
+- API key、OAuth secret 等敏感凭据进入 OS Keychain/平台安全存储，不写入通用 state.db；
+- 大段 stdout/stderr、附件、图片、release binary 和完整 MCP payload 不写入数据库；需要保留的 command output 使用有界 spool file，数据库只保存 identity、offset、hash、状态和 TTL metadata。
+
+首批统一对象：
+
+```text
+meta
+operations
+exec_sessions
+runtime_generations
+browser_bindings
+continuity_transfers
+work_contexts
+evidence
+```
+
+后续 Continuity 2.0 再增加：
+
+```text
+conversation_checkpoints
+conversation_turns
+```
+
+主要消费者：
+
+1. Reliability Kernel：`op_id`、idempotency key、request hash、delivery phase、uncertain/reconcile result；
+2. `herdr_exec*`：session identity、PID/process group、start/end、exit/signal、restart 后 detached/reaped/closed 状态；完整 command/cwd 默认只存在于当前 runtime 内存与有界即时返回中，不进入 durable state；
+3. Browser Continuity：Project/conversation binding、Auto 状态、continuity chain、handoff ticket、ACK、checkpoint 与有界 raw tail；
+4. runtime generation/update：installed/candidate/active/previous generation、activation transaction、checksum/signature、rollback evidence；
+5. Work Context 与 Evidence：`work_id`、scope、acceptance、operation relation、Git/test/artifact evidence；
+6. diagnostics/link：最近失败阶段、restart/disconnect reason、generation/boot identity、有限历史观测和 TTL 数据。
+
+保留边界：
+
+- `EventCache` 继续保存实时 Herdr snapshot 和短期 cursor history，不把 workspace/pane/agent live state 长期写入数据库；
+- Git HEAD、dirty、diff 等实时状态由 Git 提供，数据库只保存特定 operation 的 before/after evidence；
+- exec stdout/stderr 默认使用有界文件 spool，session 完成并超过 TTL 后清理；
+- diagnostics、operation evidence、failed transfer 和 conversation raw text 都必须有数量/时间/体积上限；
+- runtime generation 仍保留极小、可独立恢复的启动指针或 atomic symlink，使 state.db 损坏时当前 generation 仍可启动并进入 doctor/recovery。
+
+Shared Local State Store foundation 已由 `1b59f8e` 建立；`03c1148` 已把 `ExecRegistry` process fencing identity 从临时 JSON journal 迁入 SQLite，`592f0c7` 又把 prompt idempotency 迁入同一 store。后续 supervisor/updater/Native Messaging/continuity 继续复用这套 schema migration、transaction 和权限边界，避免再新增各自独立的 durable JSON 状态格式。
+
+### Phase 7：Reliability Kernel
+
+目标：让有副作用的远程操作具有可追踪生命周期，并能在 transport timeout、runtime restart、Edge reconnect 后回答“动作到底发生了没有”。
+
+建设：
+
+- 稳定 `work_id`：可选；只有复杂/长任务需要，临时操作可以没有；
+- 每次 mutation 都有 `op_id`，贯穿 request、delivery、执行和 evidence；
+- mutation delivery phase 至少区分 `not_submitted`、`submitted`、`observed`、`settled`、`uncertain`；
+- idempotency key 与 `op_id` 关联，重复请求返回已有事实，不能默默再次执行；
+- uncertain result recovery 统一走“重新观察事实 → 判断 → 再决定是否执行”；
+- operation evidence 记录足够的 hash/id/state，不把大段命令输出或代码复制成第二份日志系统；
+- `runtime_generation + boot_id + event_cursor` 共同形成恢复边界。
+
+首批覆盖：
+
+1. `herdr_prompt`：提交证据、Agent state observation、idempotency；
+2. `herdr_exec*`：process/session identity、退出状态、cancel evidence；
+3. runtime activation：candidate、generation switch、rollback；
+4. browser handoff：source/target conversation、binding 与 ACK。
+
+验收门：
+
+- 注入 timeout / disconnect 后 mutation 不出现重复执行；
+- runtime 重启后能区分旧 operation 与新 generation；
+- 所有 `uncertain` 都给 planner 一个确定的下一步观察动作；
+- 不增加新的 task/workflow public tool。
+
+### Phase 8：Continuity 2.0
+
+目标：让长任务跨网页回合、conversation rollover、扩展重启和本机 runtime 重启保持连续。
+
+建设：
+
+- handoff ticket state machine：`prepared → target_created → summary_delivered → target_ack → source_retired`；
+- Project/workspace binding 与 Auto 开关由 durable local state 持有，浏览器刷新后可以恢复；
+- source conversation 只有在 target ACK 后才完成 retirement，防止“新会话开了但摘要/绑定丢了”；
+- browser extension service worker 重启后从 Rust runtime 重新读取 authoritative binding/handoff state；
+- progress / settled 基于 event cursor 和 live evidence，不基于页面里最后一句文字；
+- stale generation、重复 wake、正在生成、未确认 mutation 等场景 fail closed；
+- ChatGPT、z.ai、DeepSeek 等网页只实现薄 site adapter，不扩张成通用网页自动化系统。
+
+#### Sidecar Compactor：接力压缩不再依赖故障中的 Web 模型
+
+当前兼容实现由 source conversation 自己生成 `HERDR_HANDOFF_V1`。Continuity 2.0 将此路径降为 legacy fallback；正常接力由用户已配置的 OpenAI-compatible 小模型作为 Sidecar Compactor 完成，使 source ChatGPT 已达到上下文上限、持续无回复或恢复耗尽时仍可创建新 conversation。
+
+Sidecar LLM 配置复用现有浏览器“小模型判定”连接信息：
+
+```text
+base_url
+api_key
+model
+```
+
+逻辑任务拆分为独立 prompt/profile：
+
+```text
+judge            # 回合结束后判断是否继续
+handoff_compact  # Continuity checkpoint/raw tail -> handoff packet
+```
+
+连接配置共用，prompt、输出 schema、timeout/retry 和失败策略独立。后续 UI 可以把“小模型判定”提升为 Sidecar LLM/辅助模型，但不要求新增第二套 provider 凭据。目标架构下 API key 通过 Native Messaging 交给 OS Keychain/平台安全存储，state.db 只保存 secret reference；迁移期间继续兼容当前 extension 本机配置。
+
+核心原则：任何用于恢复 Web conversation 的机制，都不能要求故障中的同一个 Web conversation 再成功完成一次恢复操作。
+
+#### Continuity Journal 与 rolling checkpoint
+
+浏览器在每个已经完成的 user/assistant turn 结束后，把可见正文增量提交给 Rust Local State Store。Rust 保存当前 continuity chain 的有界 journal，不依赖 ChatGPT 长页面始终保留完整 DOM。
+
+逻辑数据：
+
+```text
+conversation_turns
+  continuity_id
+  conversation_id
+  turn_id
+  role
+  text
+  token_estimate
+  fingerprint
+  observed_at
+
+conversation_checkpoints
+  continuity_id
+  checkpoint_id
+  through_turn
+  summary
+  anchors
+  created_at
+```
+
+checkpoint 至少覆盖：
+
+```text
+objective
+completed[]
+decisions[]
+active[]
+pending[]
+constraints[]
+files[]
+branches[]
+commits[]
+urls[]
+task_ids[]
+next_actions[]
+```
+
+其中 `continuity_id`、workspace/project/conversation identity、Auto 状态、binding、transfer id 等控制信息由 Rust/extension 确定性生成，不交给模型自由改写。路径、commit hash、URL、task id 等 literal anchor 单独提取/保留，减少压缩遗漏。
+
+默认增量策略：
+
+- 正常工作只追加新完成的 raw turn；
+- Auto 开时每约 8 个 user turn 或新增约 12k estimated tokens 生成一次 rolling checkpoint；
+- 进入 `HANDOFF_PREPARE` 时强制刷新 checkpoint；
+- Auto 关时仍记录有界 journal，但不主动调用外部 Sidecar LLM；手动 handoff 时再按 checkpoint + raw tail 压缩；
+- Sidecar 调用只处理 `previous checkpoint + new raw tail`，不在每次 handoff 时重新发送完整 80k+ conversation；
+- target ACK 前保留 source 所需 raw journal 作为恢复依据；ACK 后保留 compact checkpoint/handoff/anchors，回收旧 source raw body。
+
+建议的有界 retention 初始值：
+
+```text
+per-conversation raw cap: 16 MiB
+global continuity raw/checkpoint budget: 128 MiB
+checkpoint history: latest 3
+failed/uncertain transfer TTL: 7 days
+```
+
+达到单 conversation raw cap 时必须先生成并验证新 checkpoint，再 prune 最早 raw turns；禁止直接无摘要截断。具体阈值允许后续依据 dogfood metrics 调整。
+
+#### Browser Performance Budget：内存与主线程压力也是 rollover 信号
+
+Continuity 2.0 不只解决模型上下文长度，也要避免长 conversation 把浏览器页面拖入高内存、滚动卡顿和输入延迟。这里区分两类问题：
+
+- **memory pressure**：Web 应用自身 React/DOM/history、旧 conversation tab、扩展缓存的正文；
+- **main-thread/render pressure**：MutationObserver、全 DOM 查询、`innerText` 强制布局、长页面 style/layout/paint 与流式更新。
+
+扩展不能安全删除 ChatGPT/z.ai/DeepSeek 自己管理的历史 DOM，也不能依赖主动 GC；因此降低实际页面内存的主要手段是“更早 rollover + retire 后 discard source tab”，降低卡顿的主要手段是“事件增量化 + 限频 + 不扫描整页”。
+
+当前实现迁移时优先消除以下热点：
+
+1. ChatGPT turn watcher 不再在 `document.documentElement` 上以 `childList + subtree + characterData` 监听所有流式字符并立即执行完整 `onTick()`；
+2. persistent permission watcher 不再对整个 `document.body` 的广泛 attributes/style 变化触发全页面 permission button 扫描；
+3. `lastMessageByRole`、assistant streaming/tool checks、turn count 不在每个 800ms tick/每个 mutation 上重复 `querySelectorAll` 全部历史节点；
+4. conversation pressure 不在每回合结束时重新扫描全部 mounted user/assistant 正文，而是复用 Continuity Journal 的当前完成 turn 做增量统计；
+5. monitoring/fingerprint 优先读 `textContent` 与稳定 identity，只有确实需要视觉文本语义时才使用可能触发布局的 `innerText`。
+
+目标 watcher 结构：
+
+```text
+conversation structural observer
+  childList only
+  narrow conversation root
+  inspect added/removed nodes only
+        ↓
+cache latest user/assistant element + stable turn identity
+        ↓
+active generation sampler (bounded, e.g. 500-1000ms)
+  read latest cached assistant only
+        ↓
+turn settled
+  append one completed turn to Rust journal
+  update context/performance pressure once
+```
+
+permission watcher 同样采用候选驱动：全局只观察新增节点；发现可能的 permission card/button 后，只对该候选的 enabled/hidden 属性做短期局部观察。禁止因为任意页面 `style` 变化而重新扫描所有按钮和祖先文本。
+
+后台/隐藏标签页策略：
+
+- `document.hidden` 时暂停高频 DOM sampling、HUD reconciliation 和非关键页面 health polling；
+- Herdr live event、binding、operation state 继续由 service worker/Rust runtime 保持；
+- wake/handoff 到达隐藏页时只临时恢复完成该动作所需的观察，页面重新 visible 时立即 rehydrate latest-turn cache；
+- service worker 与 content script 都只保留有界 metadata/待发送 tail，不在 JS heap 长期复制完整 conversation journal。
+
+增加独立的 `ui_pressure`，不与模型 token pressure 混为一个数。优先使用低成本指标：
+
+```text
+visible/mounted conversation turn count
+recent long-task count / duration when Long Tasks API is supported
+bounded event-loop timer drift fallback
+turn-settle latency
+DOM-monitor callback rate
+optional Chromium memory signal only as advisory, never as correctness input
+```
+
+Long Tasks API 仅作为 Chromium 优化信号，不作为跨浏览器硬依赖。指标只保存 rolling window/聚合值，不持久化完整 performance timeline。
+
+rollover 触发改为双通道：
+
+```text
+semantic/context pressure ─┐
+                           ├─> HANDOFF_PREPARE -> safe-boundary handoff
+browser ui pressure ───────┘
+```
+
+也就是说，即使模型上下文尚未达到固定 token/message 阈值，只要页面已经持续出现明显主线程压力，也可以提前 prepare；真正自动 cutover 仍必须满足当前 fail-closed 的 workspace quiescent、无 streaming/tool/permission、无人工草稿、无 uncertain mutation 等安全条件。
+
+handoff target ACK 后：
+
+- target conversation 成为 continuity/binding authoritative page；
+- source tab 不自动关闭，保留用户可回看能力；
+- 当 source tab 已非 active 时，extension service worker 主动请求浏览器 discard 退休 source tab，使其 Web 页面从内存卸载；用户之后点击旧 tab 时由浏览器正常 reload；
+- 同一 continuity chain 更早的 retired tabs 也可按 bounded policy discard，不长期保留多份完整 Web runtime；
+- discard 失败只记录 diagnostics，不影响已经完成的 binding cutover。
+
+可选的第二阶段渲染优化是对确认稳定的旧 turn container 试验 `content-visibility: auto` / containment，减少屏幕外 subtree 的 layout/paint；它只能降低渲染成本，不能替代 rollover/discard 来释放页面 heap。由于第三方 Web App 可能已有虚拟列表、滚动锚点和自身测量逻辑，此能力必须 site-specific、可关闭、经过真实滚动/搜索/复制/回到旧消息 UAT 后才能默认启用。禁止直接 `remove()`、替换或重建页面拥有的历史消息 DOM。
+
+初始性能验收门：
+
+- assistant 流式输出期间，扩展 callback 数量不随 token/character mutation 线性增长；
+- 长 conversation 下 watcher 不在固定短周期扫描全部历史 user/assistant/buttons；
+- hidden tab 的扩展 DOM 工作接近静止，但 Herdr binding/continuity state 不丢失；
+- rollover ACK 后退休 source tab 可被 discard，重新激活时能够 reload 且不会恢复旧 authoritative binding；
+- 连续 rollover 多次后，只保留当前 target Web runtime 常驻，retired tabs 不造成线性浏览器内存增长；
+- performance-pressure rollover 与 context-pressure rollover 共用同一安全 cutover，不产生双重 handoff 或重复 mutation。
+
+handoff 生成顺序：
+
+```text
+latest valid checkpoint
+  + raw tail
+  + deterministic binding/work/evidence metadata
+        ↓
+Sidecar handoff_compact
+        ↓
+validated HERDR_HANDOFF_V1
+        ↓
+fresh target conversation
+        ↓
+seed confirmed / target ACK
+        ↓
+atomic binding + Auto cutover
+        ↓
+source retirement + raw prune
+```
+
+降级顺序：
+
+1. Sidecar Compactor 成功：使用最新结构化 handoff；
+2. Sidecar 超时/HTTP/网络失败：使用最后一个有效 checkpoint + raw tail + deterministic metadata 生成 degraded handoff，仍允许新 conversation 恢复；
+3. 旧 conversation 没有 Continuity Journal 且 source Web model 仍能回复：兼容现有 source-model summary；
+4. source Web model 已无回复时，不因无法生成新摘要而阻塞已有 checkpoint 的接力。
+
+Sidecar Compactor 只负责历史语义压缩。Git/runtime/Herdr 当前事实仍由 target conversation 在任何 mutation 前重新读取 live state，handoff packet 不作为实时状态证明。
+
+验收门：
+
+- conversation rollover 过程中任一点刷新浏览器都能恢复；
+- Auto 开/关、Project binding、workspace binding 在手动/自动接力后按规则继承；
+- 同一个 settled event 不会导致重复继续；
+- handoff 失败时旧 conversation 仍可继续，不出现双活控制。
+- source Web model 已持续无回复时，存在有效 checkpoint 的 conversation 仍能由 Sidecar Compactor 或 degraded checkpoint 完成 handoff；
+- browser extension service worker 和 Rust runtime 分别重启后，journal/checkpoint/handoff ticket 可以恢复且不重复迁移 binding；
+- checkpoint/prune 后数据库体积受 retention policy 约束，不永久保存所有历史 conversation raw text；
+- Sidecar 失败不会丢失最后一个已验证 checkpoint，也不会触发重复 mutation。
+
+### Phase 9：Work Context 与 Evidence
+
+目标：让复杂任务更容易观察、恢复和验收，同时保持“直接工具优先、Agent 按需使用”的灵活工作方式。
+
+轻量 work context：
+
+```text
+work_id?              # optional
+objective?            # brief human-readable goal
+scope?                # repo/path/worktree hints, not a lock
+acceptance?           # concise exit criteria
+parent_work_id?       # optional delegation relation
+```
+
+建设：
+
+- work context 可以附着到 exec session、Agent prompt、browser binding，不要求独立 Task Center；
+- Git evidence：before/after head、dirty state、diff summary；
+- test/build evidence：command identity、exit code、bounded summary、artifact/hash when useful；
+- Agent progress projection：只投影 Herdr 已有 live status/metadata，不建立第二套 Agent registry；
+- handoff summary 引用 work/evidence identity，下一 conversation 仍必须重新读取 live state；
+- 为 end-to-end dogfood 建立指标：tool calls、result bytes、p50/p95、重复 mutation、handoff 成功率、人工介入次数。
+
+验收门：
+
+- 没有 `work_id` 时临时 `read/grep/git/exec` 仍保持当前轻量体验；
+- 有 `work_id` 时可以从 inspect/diagnostics 找到相关 operation 与证据；
+- work context 不自动拆任务、不决定 Agent、不替 Web planner 做调度。
+
+### Phase 10：Product Completion
+
+目标：形成用户无需理解 Node/npm/Python、Cloudflare 内部结构或 launchd/systemd 细节的稳定产品。
+
+建设：
+
+- `herdr-mcp install/status/doctor/update/rollback` 形成完整 CLI 生命周期；
+- 单二进制正式覆盖 macOS/Linux/Windows，Native Messaging host 与 service manager 同源；
+- signed release manifest、checksum/signature verification；
+- stable/beta/dev release channel；
+- generation A/B：新版本先 candidate health + contract check，再 activate，旧 generation 可快速 rollback；
+- relay/link 断线自动恢复，公网 Connector URL 与本机 generation 解耦；
+- doctor 输出 Edge/link/runtime/Herdr/Native Messaging/browser binding 的分层诊断；
+- 安装流程尽量自动完成本机凭据与浏览器 Native Messaging 配置，不要求用户复制长期 bearer token；
+- 发布 gate 包含 Rust、Edge、extension、site、真实 candidate smoke 和 rollback smoke。
+
+验收门：
+
+- 新机器安装后不需要 Node/npm/Python 即可完成本地 runtime + browser continuity；
+- 升级失败可以在不修改公网 Connector URL 的情况下恢复上一 generation；
+- `doctor` 能区分公网、link、本机 runtime、Herdr daemon、browser bridge 五类故障；
+- production 不再包含本地 Node runtime 和旧 lifecycle scripts。
+
+### 实施顺序
+
+Roadmap 不与当前 Rust parity 并行扩张 public surface。顺序固定为：
+
+```text
+18-tool native parity
+  → production transport parity
+  → Shared Local State Store foundation
+  → supervisor / Native Messaging / updater / link
+  → 删除 Node runtime
+  → Reliability Kernel
+  → Continuity 2.0
+  → Work Context & Evidence
+  → Product Completion hardening
+```
+
+当前已完成 `18-tool native parity → production transport parity → Shared Local State Store foundation`，实施游标进入 `supervisor / Native Messaging / updater / link`。Shared Local State Store foundation 保持 SQLite、schema migration、transaction/retention 与首批 exec/prompt durable identity 的范围，不提前扩张 Reliability/Continuity 的产品行为。Reliability/Continuity 所需的基础 identity、diagnostics、event cache 可以在 Rust 迁移阶段提前建设，但不能因此修改 epoch 2 / 18 tools 的行为契约。
+
+### 暂不进入主线
+
+以下能力保持观察，不进入当前 Roadmap：
+
+- 自建新的 Agent Team runtime；
+- 强制引入 ACP 作为内部主协议；
+- 复制 Luvus Task/Lease/merge gate 系统；
+- 绑定单一 Coding Agent 或要求本机必须安装某个 Agent；
+- 第二套 Web Agent 编排系统；
+- 为所有操作强制引入 Task/Project/Workflow 对象；
+- 通用浏览器自动化平台。
+
+未来只有在真实使用数据证明现有 Herdr + fs/Git/exec + 可替换 worker 无法表达需求时，再通过 adapter/plugin 或新的 contract epoch 评估。
