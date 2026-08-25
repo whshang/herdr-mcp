@@ -20,6 +20,7 @@ mod native_tools;
 mod patch;
 mod paths;
 mod projects;
+mod prompt;
 mod runtime_meta;
 mod schema;
 mod snapshot;

@@ -45,6 +45,22 @@ pub fn check(snapshot: &Value, root: &Path, confirm_busy: bool) -> Result<Vec<Va
     check_with_policy(snapshot, root, confirm_busy, &MutationPolicy::from_env())
 }
 
+pub fn check_global(action: &str) -> Result<(), Value> {
+    check_global_with_policy(action, &MutationPolicy::from_env())
+}
+
+fn check_global_with_policy(action: &str, policy: &MutationPolicy) -> Result<(), Value> {
+    if policy.readonly {
+        return Err(json!({
+            "ok": false,
+            "reason": "readonly_mode",
+            "action": action,
+            "hint": "HERDR_MCP_READONLY=1 — all mutating operations are disabled",
+        }));
+    }
+    Ok(())
+}
+
 pub fn working_agents(snapshot: &Value, root: &Path) -> Vec<Value> {
     let topology = projects::derive(snapshot);
     let pane_ids = topology
@@ -400,6 +416,17 @@ mod tests {
         assert_eq!(forced.len(), 1);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn global_gate_only_applies_readonly_not_write_roots() {
+        let readonly = MutationPolicy::new(true, vec![PathBuf::from("/tmp/only")]);
+        let denied = check_global_with_policy("herdr_prompt", &readonly).unwrap_err();
+        assert_eq!(denied["reason"], "readonly_mode");
+        assert_eq!(denied["action"], "herdr_prompt");
+
+        let writable = MutationPolicy::new(false, vec![PathBuf::from("/tmp/only")]);
+        assert!(check_global_with_policy("herdr_prompt", &writable).is_ok());
     }
 
     #[test]

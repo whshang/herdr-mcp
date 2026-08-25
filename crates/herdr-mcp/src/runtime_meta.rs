@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-const MIGRATED_TOOLS: [&str; 16] = [
+const MIGRATED_TOOLS: [&str; 17] = [
     "herdr_methods",
     "herdr_inspect",
     "herdr_call",
@@ -24,6 +24,7 @@ const MIGRATED_TOOLS: [&str; 16] = [
     "herdr_exec_read",
     "herdr_exec_kill",
     "herdr_exec",
+    "herdr_prompt",
 ];
 
 static STARTED_AT: OnceLock<String> = OnceLock::new();
@@ -133,15 +134,15 @@ mod tests {
     fn migration_status_is_derived_from_epoch2_catalog() {
         let status = migration_status();
         assert_eq!(status["tool_count"], 18);
-        assert_eq!(status["migrated_tool_count"], 16);
-        assert_eq!(status["pending_tool_count"], 2);
+        assert_eq!(status["migrated_tool_count"], 17);
+        assert_eq!(status["pending_tool_count"], 1);
         assert_eq!(status["production_ready"], false);
         assert!(
             status["pending_tools"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|value| value == "herdr_prompt")
+                .any(|value| value == "herdr_skill")
         );
         for name in MIGRATED_TOOLS {
             assert!(contract::tool_names().contains(&name));
@@ -162,7 +163,7 @@ mod tests {
         let mut view = json!({"ok": true, "workstation_info": {"server_name": "herdr-mcp"}});
         augment_inspect(&mut view, None, None);
         assert_eq!(view["build"]["runtime"], "rust");
-        assert_eq!(view["native_migration"]["migrated_tool_count"], 16);
+        assert_eq!(view["native_migration"]["migrated_tool_count"], 17);
         assert_eq!(view["workstation_info"]["boot_id"], Value::Null);
         assert_eq!(view["workstation_info"]["exec_sessions"], json!([]));
         assert_eq!(

@@ -2,6 +2,7 @@ use crate::exec_sessions::ExecRegistry;
 use crate::herdr::HerdrClient;
 use crate::mcp::{self, RuntimeContext};
 use crate::paths::RuntimePaths;
+use crate::prompt::PromptRegistry;
 use crate::runtime_meta;
 use crate::state_cache::EventCache;
 use axum::Router;
@@ -25,6 +26,7 @@ struct AppState {
     client: HerdrClient,
     cache: Arc<EventCache>,
     exec: ExecRegistry,
+    prompt: PromptRegistry,
     bearer_token: Arc<[u8]>,
 }
 
@@ -46,6 +48,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| paths.dev_state_dir.join("candidate"));
     let exec = ExecRegistry::new(exec_state_dir)?;
+    let prompt = PromptRegistry::new();
     if !cache.wait_ready(Duration::from_secs(3)) {
         return Err(format!(
             "candidate event cache did not bootstrap: {}",
@@ -72,6 +75,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             client,
             cache,
             exec,
+            prompt,
             bearer_token: Arc::<[u8]>::from(token.into_bytes()),
         };
         let app = Router::new()
@@ -166,6 +170,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         client: &state.client,
         cache: &state.cache,
         exec: &state.exec,
+        prompt: &state.prompt,
     };
     let Some(response) = mcp::handle(&request, &context) else {
         return StatusCode::ACCEPTED.into_response();
