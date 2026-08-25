@@ -1,6 +1,7 @@
 use crate::herdr::HerdrClient;
 use crate::mcp::{self, RuntimeContext};
 use crate::paths::RuntimePaths;
+use crate::runtime_meta;
 use crate::state_cache::EventCache;
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -92,17 +93,9 @@ async fn shutdown_signal() {
 }
 
 async fn health(State(state): State<AppState>) -> Response {
-    let diagnostics = state.cache.diagnostics();
-    let payload = json!({
-        "ok": true,
-        "runtime": "rust-candidate",
-        "version": env!("CARGO_PKG_VERSION"),
-        "event_cache": {
-            "event_count": diagnostics.event_count,
-            "last_event_at": diagnostics.last_event_at,
-            "needs_reconcile": diagnostics.needs_reconcile,
-        }
-    });
+    let mut payload = runtime_meta::health_fields(&state.cache);
+    payload.insert("ok".to_owned(), json!(true));
+    let payload = Value::Object(payload);
     json_response(StatusCode::OK, &payload)
 }
 

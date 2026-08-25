@@ -14,6 +14,7 @@ mod mcp_http;
 mod native_tools;
 mod paths;
 mod projects;
+mod runtime_meta;
 mod schema;
 mod snapshot;
 mod state_cache;

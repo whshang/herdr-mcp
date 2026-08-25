@@ -89,7 +89,7 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     let inspect_result = paths
         .herdr_socket
         .as_ref()
-        .map(|socket| native_tools::inspect(&HerdrClient::new(socket)))
+        .map(|socket| native_tools::inspect(&HerdrClient::new(socket), None))
         .unwrap_or_else(|| json!({"ok": false}));
     let inspect_healthy = inspect_result["ok"].as_bool() == Some(true);
     let event_cache = probe_event_cache(paths);

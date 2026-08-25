@@ -128,7 +128,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
             native_tools::methods(query)
         }
-        "herdr_inspect" => native_tools::inspect(context.client),
+        "herdr_inspect" => native_tools::inspect(context.client, Some(context.cache)),
         "herdr_since" => {
             let cursor = arguments.get("cursor").and_then(Value::as_u64).unwrap_or(0);
             let workspace = arguments.get("workspace").and_then(Value::as_str);

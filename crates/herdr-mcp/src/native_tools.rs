@@ -1,6 +1,7 @@
 use crate::agent_visibility::AgentVisibility;
 use crate::herdr::HerdrClient;
 use crate::inspect;
+use crate::runtime_meta;
 use crate::schema::{self, MethodSchema, ValidationIssue};
 use crate::state_cache::{DigestSnapshot, EventCache};
 use serde_json::{Value, json};
@@ -8,8 +9,10 @@ use std::collections::HashSet;
 
 const SCHEMA_SOURCE: &str = "herdr api schema --json (live, 60s cache)";
 
-pub fn inspect(client: &HerdrClient) -> Value {
-    inspect::inspect_core(client)
+pub fn inspect(client: &HerdrClient, cache: Option<&EventCache>) -> Value {
+    let mut view = inspect::inspect_core(client);
+    runtime_meta::augment_inspect(&mut view, cache);
+    view
 }
 
 pub fn since(cache: &EventCache, cursor: u64, workspace: Option<&str>) -> Value {
