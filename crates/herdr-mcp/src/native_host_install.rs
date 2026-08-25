@@ -73,6 +73,26 @@ impl InstallPaths {
         let targets = install_targets(&home);
 
         if matches!(command, NativeHostCommand::Install) {
+            if let Some(extension_origin) = find_registered_origin(&targets, &wrapper)? {
+                let extension_id = extension_id_from_origin(&extension_origin)
+                    .ok_or_else(|| "registered native-host origin is invalid".to_owned())?;
+                let extension_path = crate::native_host::extension_path_for_install()
+                    .ok()
+                    .filter(|path| {
+                        crate::native_host::chromium_id_for_path(path)
+                            .ok()
+                            .is_some_and(|id| id == extension_id)
+                    });
+                return Ok(Self {
+                    source_binary,
+                    runtime_binary: native_dir.join("herdr-mcp"),
+                    wrapper,
+                    extension_path,
+                    extension_id,
+                    extension_origin,
+                    targets,
+                });
+            }
             let extension_path = crate::native_host::extension_path_for_install()?;
             return Self::for_layout(
                 &extension_path,

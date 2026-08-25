@@ -121,7 +121,12 @@ pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
                 return Ok(ExitCode::SUCCESS);
             }
         };
-        if caller_origin != config.expected_origin {
+        let effective_caller_origin = if caller_origin.is_empty() {
+            config.expected_origin.as_str()
+        } else {
+            caller_origin
+        };
+        if effective_caller_origin != config.expected_origin {
             write_error(&mut writer, "extension_origin_not_allowed")?;
             return Ok(ExitCode::SUCCESS);
         }

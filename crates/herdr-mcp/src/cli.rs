@@ -162,14 +162,16 @@ fn parse_native_host(args: &[String]) -> Result<Command, String> {
 
 fn parse_extension_host(args: &[String]) -> Result<Command, String> {
     match args {
+        [] => Ok(Command::ExtensionHost {
+            caller_origin: String::new(),
+        }),
         [caller_origin] if caller_origin.starts_with("chrome-extension://") => {
             Ok(Command::ExtensionHost {
                 caller_origin: caller_origin.clone(),
             })
         }
-        [] => Err("extension-host requires the Chromium caller origin".to_owned()),
         [value] => Err(format!("invalid extension-host caller origin '{value}'")),
-        _ => Err("extension-host accepts exactly one Chromium caller origin".to_owned()),
+        _ => Err("extension-host accepts at most one Chromium caller origin".to_owned()),
     }
 }
 
@@ -184,7 +186,7 @@ Usage:\n\
   herdr-mcp candidate [--port 8873]\n\
   herdr-mcp service <install [--adopt-node]|status|start|stop|restart|rollback|uninstall>\n\
   herdr-mcp native-host <install|status|uninstall>\n\
-  herdr-mcp extension-host <chrome-extension://.../>\n\n\
+  herdr-mcp extension-host [chrome-extension://.../]\n\n\
 The Rust binary is the new local product boundary. Service, update, runtime,\n\
 link, and native-host commands are added as their native implementations land.\n"
 }
@@ -232,6 +234,12 @@ mod tests {
             Command::NativeHost(NativeHostCommand::Status)
         );
         assert_eq!(
+            parse(args(&["extension-host"])).unwrap(),
+            Command::ExtensionHost {
+                caller_origin: String::new()
+            }
+        );
+        assert_eq!(
             parse(args(&[
                 "extension-host",
                 "chrome-extension://abcdefghijklmnop/"
@@ -252,7 +260,6 @@ mod tests {
         assert!(parse(args(&["service", "install", "--force"])).is_err());
         assert!(parse(args(&["native-host"])).is_err());
         assert!(parse(args(&["native-host", "legacy"])).is_err());
-        assert!(parse(args(&["extension-host"])).is_err());
         assert!(parse(args(&["extension-host", "https://example.com/"])).is_err());
         assert!(parse(args(&["status", "extra"])).is_err());
         assert!(parse(args(&["unknown"])).is_err());
