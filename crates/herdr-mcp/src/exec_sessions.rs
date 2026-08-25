@@ -578,16 +578,9 @@ pub fn enriched_exec_path() -> String {
 #[cfg(unix)]
 fn shell_command(command: &str, id: &str) -> Command {
     let shell = resolve_exec_shell();
-    let shell_arg = shell.to_string_lossy().into_owned();
     let marker = process_marker(id);
     let mut process = Command::new(&shell);
-    process.arg0(&marker).args([
-        "-c",
-        "\"$1\" -lc \"$2\"; __herdr_mcp_status=$?; exit \"$__herdr_mcp_status\"",
-        marker.as_str(),
-        shell_arg.as_str(),
-        command,
-    ]);
+    process.arg0(&marker).args(["-lc", command]);
     process
 }
 
@@ -924,7 +917,7 @@ mod tests {
             .start(Path::new("/tmp"), "printf out; printf err >&2; exit 7")
             .unwrap();
         let id = started["session_id"].as_str().unwrap().to_owned();
-        for _ in 0..100 {
+        for _ in 0..500 {
             let view = registry.read(&id, "both", 0, 65536);
             if view["running"] == false {
                 assert_eq!(view["exit_code"], 7);
@@ -991,7 +984,7 @@ mod tests {
             .unwrap()
             .insert(id.clone(), session);
 
-        for _ in 0..100 {
+        for _ in 0..500 {
             let view = registry.read(&id, "both", 0, 64);
             if view["running"] == false {
                 assert_eq!(view["exit_code"], 9);
