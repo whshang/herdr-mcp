@@ -8,6 +8,7 @@ use crate::git_tools;
 use crate::herdr::HerdrClient;
 use crate::native_tools;
 use crate::prompt::{self, PromptRegistry};
+use crate::skill::SkillService;
 use crate::state_cache::EventCache;
 use crate::utility_exec;
 use serde_json::{Value, json};
@@ -28,6 +29,7 @@ pub struct RuntimeContext<'a> {
     pub cache: &'a EventCache,
     pub exec: &'a ExecRegistry,
     pub prompt: &'a PromptRegistry,
+    pub skill: &'a SkillService,
 }
 
 pub fn handle(request: &Value, context: &RuntimeContext<'_>) -> Option<Value> {
@@ -192,6 +194,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         "herdr_exec_kill" => exec_tools::kill(context.exec, &arguments),
         "herdr_exec" => utility_exec::run(context.client, &context.cache.snapshot(), &arguments),
         "herdr_prompt" => prompt::run(context.client, context.prompt, &arguments),
+        "herdr_skill" => context.skill.fetch(&arguments),
         pending if contract::tool_names().contains(&pending) => {
             return Ok(tool_result(
                 json!({
@@ -276,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_epoch_tool_is_explicit_error_result() {
+    fn explicit_tool_errors_preserve_mcp_is_error() {
         let result = tool_result(
             json!({"ok": false, "code": "native_tool_pending", "tool": "herdr_exec"}),
             true,

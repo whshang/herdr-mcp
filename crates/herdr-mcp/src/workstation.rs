@@ -1,4 +1,5 @@
 use crate::projects::ProjectTopology;
+use crate::skill;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::env;
@@ -25,6 +26,7 @@ pub fn info(view: &Value, topology: &ProjectTopology) -> Value {
         "readonly_mode": env::var("HERDR_MCP_READONLY").ok().as_deref() == Some("1"),
         "write_roots": if write_roots.is_empty() { Value::Null } else { json!(write_roots) },
         "agent_visibility": view.get("agent_visibility").cloned().unwrap_or(Value::Null),
+        "agent_skill": skill::pointer(),
         "exec_environment": {
             "shell": execution_shell(),
             "path_has": {

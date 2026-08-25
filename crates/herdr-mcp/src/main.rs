@@ -23,6 +23,7 @@ mod projects;
 mod prompt;
 mod runtime_meta;
 mod schema;
+mod skill;
 mod snapshot;
 mod state_cache;
 mod status;

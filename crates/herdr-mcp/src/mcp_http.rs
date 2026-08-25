@@ -4,6 +4,7 @@ use crate::mcp::{self, RuntimeContext};
 use crate::paths::RuntimePaths;
 use crate::prompt::PromptRegistry;
 use crate::runtime_meta;
+use crate::skill::SkillService;
 use crate::state_cache::EventCache;
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -27,6 +28,7 @@ struct AppState {
     cache: Arc<EventCache>,
     exec: ExecRegistry,
     prompt: PromptRegistry,
+    skill: SkillService,
     bearer_token: Arc<[u8]>,
 }
 
@@ -49,6 +51,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
         .unwrap_or_else(|| paths.dev_state_dir.join("candidate"));
     let exec = ExecRegistry::new(exec_state_dir)?;
     let prompt = PromptRegistry::new();
+    let skill = SkillService::new();
     if !cache.wait_ready(Duration::from_secs(3)) {
         return Err(format!(
             "candidate event cache did not bootstrap: {}",
@@ -76,6 +79,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             cache,
             exec,
             prompt,
+            skill,
             bearer_token: Arc::<[u8]>::from(token.into_bytes()),
         };
         let app = Router::new()
@@ -171,6 +175,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         cache: &state.cache,
         exec: &state.exec,
         prompt: &state.prompt,
+        skill: &state.skill,
     };
     let Some(response) = mcp::handle(&request, &context) else {
         return StatusCode::ACCEPTED.into_response();
