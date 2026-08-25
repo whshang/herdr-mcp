@@ -67,6 +67,21 @@ test("Actions build docs and keep Cloudflare deployment on the gated Worker plan
   assert.doesNotMatch(edge, /cloudflared|DNS Write|Tunnel/);
 });
 
+test("Rust release verification provisions and always cleans the pinned Herdr runtime", async () => {
+  const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
+  const start = release.indexOf("scripts/ci-herdr-runtime.sh start");
+  const rootTests = release.indexOf("npm test");
+  const stop = release.indexOf("scripts/ci-herdr-runtime.sh stop");
+  assert.ok(start >= 0, "release verify must start the pinned Herdr runtime");
+  assert.ok(rootTests > start, "runtime must be ready before root transport tests");
+  assert.ok(stop > rootTests, "runtime cleanup must run after root transport tests");
+  assert.match(
+    release,
+    /- name: Stop Herdr runtime\n\s+if: always\(\)\n\s+run: scripts\/ci-herdr-runtime\.sh stop/,
+    "release verify must clean the pinned Herdr runtime even after a failed gate",
+  );
+});
+
 test("local Cloudflare/Pages build state is excluded from the published package", async () => {
   const rootIgnore = await readFile(join(ROOT, ".gitignore"), "utf8");
   const edgeIgnore = await readFile(join(ROOT, "edge/cloudflare/.gitignore"), "utf8");
