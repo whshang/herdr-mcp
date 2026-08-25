@@ -223,6 +223,7 @@ Maintainer reference:
 
 - [Automation](docs/i18n/en/automation.md)
 - [Capability benchmark](docs/i18n/en/capability-benchmark.md)
+- [Why Herdr + herdr-mcp](docs/i18n/en/herdr-vs-ecosystem.md)
 - [Worker fallbacks](docs/i18n/en/worker-fallbacks.md)
 - [Local-agent installation protocol](docs/i18n/en/agent-install.md)
 

@@ -231,6 +231,7 @@ runtime generation A / B
 
 - [自动化](docs/i18n/zh-CN/automation.md)
 - [能力基准与设计取舍](docs/i18n/zh-CN/capability-benchmark.md)
+- [为什么选择 Herdr + herdr-mcp](docs/i18n/zh-CN/herdr-vs-ecosystem.md)
 - [Worker 备选](docs/i18n/zh-CN/worker-fallbacks.md)
 - [本地 Agent 安装协议](docs/i18n/zh-CN/agent-install.md)
 
