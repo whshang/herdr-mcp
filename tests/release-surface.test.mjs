@@ -110,8 +110,33 @@ test("Rust GitHub Release provenance is tag-only and fail-closed before publish"
     /GH_REPO: \$\{\{ github\.repository \}\}/,
     "publish must name the GitHub repository explicitly because the job does not checkout git metadata",
   );
+  assert.match(publish, /release_flags=\(--verify-tag --generate-notes\)/);
+  assert.match(publish, /release_flags\+=\(--prerelease\)/, "semver prereleases must be marked as GitHub prereleases");
   assert.doesNotMatch(attest, /workflow_dispatch/);
   assert.doesNotMatch(publish, /workflow_dispatch/);
+});
+
+test("Rust Release recovery republishes only a previously attested GitHub run", async () => {
+  const recovery = await readFile(join(ROOT, ".github/workflows/rust-release-recover.yml"), "utf8");
+  assert.match(recovery, /workflow_dispatch:/);
+  assert.match(recovery, /source_run_id:/);
+  assert.match(recovery, /tag:/);
+  assert.match(recovery, /actions: read/);
+  assert.match(recovery, /contents: write/);
+  assert.match(recovery, /attestations: read/);
+  assert.match(recovery, /run-id: \$\{\{ inputs\.source_run_id \}\}/);
+  assert.match(recovery, /name: rust-release-bundle/);
+  assert.match(recovery, /\.github\/workflows\/rust-release\.yml/);
+  assert.match(recovery, /head_sha/);
+  assert.match(recovery, /conclusion==\"success\"/);
+  assert.match(recovery, /gh attestation verify/);
+  assert.match(recovery, /--signer-workflow/);
+  assert.match(recovery, /--source-ref/);
+  assert.match(recovery, /--source-digest/);
+  assert.match(recovery, /--deny-self-hosted-runners/);
+  assert.match(recovery, /gh release create/);
+  assert.match(recovery, /--verify-tag/);
+  assert.match(recovery, /--prerelease/);
 });
 
 test("local Cloudflare/Pages build state is excluded from the published package", async () => {
