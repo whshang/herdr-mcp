@@ -16,7 +16,9 @@ const CONV = "https://chatgpt.com/c/abc123";
 const CHATGPT_AUTO_CONV = "https://chatgpt.com/c/plain-auto-123";
 const SK_WH = `${CONV}::wH`;
 const PROJECT_ID = "g-p-6a89c078669481918c8eb70fdfd3d978";
-const PROJECT_SOURCE = `https://chatgpt.com/g/${PROJECT_ID}/c/source123`;
+const PROJECT_KEY = `https://chatgpt.com/g/${PROJECT_ID}`;
+const PROJECT_HOME_URL = `https://chatgpt.com/g/${PROJECT_ID}-herdr-mcp/project`;
+const PROJECT_SOURCE = `${PROJECT_KEY}/c/source123`;
 const PROJECT_SOURCE_URL = `https://chatgpt.com/g/${PROJECT_ID}-herdr-mcp/c/source123`;
 const PROJECT_TARGET = `https://chatgpt.com/g/${PROJECT_ID}/c/target456`;
 const PROJECT_TARGET_URL = `https://chatgpt.com/g/${PROJECT_ID}-herdr-mcp/c/target456`;
@@ -35,7 +37,7 @@ function ok(cond, label, detail = "") {
 
 // ---- chrome mock ----
 const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}" };
-const listeners = { onMessage: [], onStartup: [], onInstalled: [] };
+const listeners = { onMessage: [], onStartup: [], onInstalled: [], onActivated: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
 let nextTabId = 500;
@@ -250,16 +252,17 @@ globalThis.chrome = {
     async get(tabId) {
       const t = tabs.get(tabId);
       if (!t) throw new Error(`tab ${tabId} missing`);
-      return { id: t.id, url: t.url, status: t.status || "complete" };
+      return { id: t.id, url: t.url, status: t.status || "complete", active: t.active === true, windowId: 1 };
     },
     async create({ url }) {
       const id = ++nextTabId;
-      const tab = { id, url, status: "complete", listener: null };
+      const tab = { id, url, status: "complete", active: true, listener: null };
       tab.listener = targetListener(tab);
       tabs.set(id, tab);
       return { id, url, status: "complete" };
     },
     reload: () => {},
+    onActivated: { addListener: (fn) => listeners.onActivated.push(fn) },
   },
   scripting: { executeScript: async () => [{ result: { ok: true } }] },
   alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
@@ -650,7 +653,97 @@ console.log("\n[z.ai root migration]");
     "switching between existing z.ai chats never drags a workspace binding along", JSON.stringify(history));
 }
 
-// ---- Scenario 6e: z.ai manual handoff uses a raw summary/seed and cuts over only after confirmation ----
+// ---- Scenario 6e: ChatGPT can bind before a conversation exists ----
+console.log("\n[ChatGPT pre-conversation Project binding]");
+{
+  installContentScript(365, PROJECT_HOME_URL, PROJECT_KEY);
+  tabs.get(365).active = true;
+  let resolveProjectBind;
+  const projectBindP = new Promise((r) => { resolveProjectBind = r; });
+  onMsg({
+    type: "h2w_bind",
+    tabId: 365,
+    workspace_id: "wP",
+    workspace_label: "project-home (wP)",
+  }, { tab: { id: 365, url: PROJECT_HOME_URL } }, (r) => resolveProjectBind(r));
+  const projectBound = await projectBindP;
+  const projectStoreKey = `${PROJECT_KEY}::wP`;
+  ok(projectBound?.ok === true && projectBound?.binding_scope === "project"
+      && !!storage.herdrWakeBindings[projectStoreKey],
+    "Project home binds the workspace directly to the stable project key", JSON.stringify(projectBound));
+  ok(storage.herdrWakeBindings[projectStoreKey]?.active_conv_key == null
+      && storage.herdrWakeBindings[projectStoreKey]?.tabId == null,
+    "Project-home binding has no delivery target before a conversation exists");
+
+  let resolveProjectHud;
+  const projectHudP = new Promise((r) => { resolveProjectHud = r; });
+  onMsg({ type: "h2w_page_hud", convKey: PROJECT_KEY }, { tab: { id: 365, url: PROJECT_HOME_URL } }, (r) => resolveProjectHud(r));
+  const projectHud = await projectHudP;
+  ok(projectHud?.bound === true && projectHud?.project_id === PROJECT_ID && projectHud?.manual_handoff_available === false,
+    "Project home HUD sees the persistent binding without pretending a conversation exists", JSON.stringify(projectHud));
+
+  installContentScript(365, PROJECT_SOURCE_URL, PROJECT_SOURCE);
+  tabs.get(365).active = true;
+  let resolveProjectRegister;
+  const projectRegisterP = new Promise((r) => { resolveProjectRegister = r; });
+  onMsg({ type: "h2w_register", convKey: PROJECT_SOURCE, url: PROJECT_SOURCE_URL, site: "chatgpt" }, { tab: { id: 365, url: PROJECT_SOURCE_URL } }, (r) => resolveProjectRegister(r));
+  const projectRegistered = await projectRegisterP;
+  ok(projectRegistered?.bound === true
+      && storage.herdrWakeBindings[projectStoreKey]?.active_conv_key === PROJECT_SOURCE
+      && storage.herdrWakeBindings[projectStoreKey]?.tabId === 365,
+    "first Project conversation automatically becomes the delivery target", JSON.stringify(projectRegistered));
+
+  installContentScript(366, PROJECT_TARGET_URL, PROJECT_TARGET);
+  tabs.get(366).active = false;
+  let resolveBackgroundRegister;
+  const backgroundRegisterP = new Promise((r) => { resolveBackgroundRegister = r; });
+  onMsg({ type: "h2w_register", convKey: PROJECT_TARGET, url: PROJECT_TARGET_URL, site: "chatgpt" }, { tab: { id: 366, url: PROJECT_TARGET_URL } }, (r) => resolveBackgroundRegister(r));
+  await backgroundRegisterP;
+  ok(storage.herdrWakeBindings[projectStoreKey]?.active_conv_key === PROJECT_SOURCE,
+    "an inactive Project conversation does not steal the delivery target");
+  tabs.get(365).active = false;
+  tabs.get(366).active = true;
+  for (const fn of listeners.onActivated) fn({ tabId: 366, windowId: 1 });
+  await new Promise((r) => setTimeout(r, 20));
+  ok(storage.herdrWakeBindings[projectStoreKey]?.active_conv_key === PROJECT_TARGET
+      && storage.herdrWakeBindings[projectStoreKey]?.tabId === 366,
+    "activating another Project conversation switches only the delivery target");
+
+  let resolveProjectUnbind;
+  const projectUnbindP = new Promise((r) => { resolveProjectUnbind = r; });
+  onMsg({ type: "h2w_unbind", convKey: PROJECT_TARGET, workspace_id: "wP" }, { tab: { id: 366, url: PROJECT_TARGET_URL } }, (r) => resolveProjectUnbind(r));
+  await projectUnbindP;
+  ok(!storage.herdrWakeBindings[projectStoreKey], "Project binding can be removed from any conversation in that Project");
+
+  const rootKey = "https://chatgpt.com";
+  installContentScript(367, `${rootKey}/`, rootKey);
+  tabs.get(367).active = true;
+  let resolveRootBind;
+  const rootBindP = new Promise((r) => { resolveRootBind = r; });
+  onMsg({ type: "h2w_bind", tabId: 367, workspace_id: "wR", workspace_label: "root-pending (wR)" }, { tab: { id: 367, url: `${rootKey}/` } }, (r) => resolveRootBind(r));
+  const rootBound = await rootBindP;
+  ok(rootBound?.ok === true && rootBound?.binding_scope === "pending"
+      && storage.herdrWakeBindings[`${rootKey}::wR`]?.tabId === 367,
+    "ChatGPT root can hold a tab-scoped pending binding", JSON.stringify(rootBound));
+
+  installContentScript(367, PROJECT_HOME_URL, PROJECT_KEY);
+  tabs.get(367).active = true;
+  let resolveRootMigration;
+  const rootMigrationP = new Promise((r) => { resolveRootMigration = r; });
+  onMsg({ type: "h2w_register", convKey: PROJECT_KEY, url: PROJECT_HOME_URL, site: "chatgpt" }, { tab: { id: 367, url: PROJECT_HOME_URL } }, (r) => resolveRootMigration(r));
+  const rootMigrated = await rootMigrationP;
+  ok(rootMigrated?.bound === true
+      && !storage.herdrWakeBindings[`${rootKey}::wR`]
+      && storage.herdrWakeBindings[`${PROJECT_KEY}::wR`]?.binding_scope === "project",
+    "root pending binding migrates once into the Project when that tab enters Project scope", JSON.stringify(rootMigrated));
+
+  let resolveRootCleanup;
+  const rootCleanupP = new Promise((r) => { resolveRootCleanup = r; });
+  onMsg({ type: "h2w_unbind", convKey: PROJECT_KEY, workspace_id: "wR" }, { tab: { id: 367, url: PROJECT_HOME_URL } }, (r) => resolveRootCleanup(r));
+  await rootCleanupP;
+}
+
+// ---- Scenario 6f: z.ai manual handoff uses a raw summary/seed and cuts over only after confirmation ----
 console.log("\n[z.ai manual handoff]");
 {
   tabs.set(370, {
@@ -768,8 +861,11 @@ console.log("\n[project handoff]");
   }, { tab: { id: 401 } }, (r) => resolveBind(r));
   const bound = await bindP;
   ok(bound?.ok === true, "Project source binds before rollover", JSON.stringify(bound));
-  const sourceKey = `${PROJECT_SOURCE}::wH`;
-  ok(!!storage.herdrWakeBindings[sourceKey], "source Project binding is authoritative before rollover");
+  const sourceKey = `${PROJECT_KEY}::wH`;
+  ok(!!storage.herdrWakeBindings[sourceKey]
+      && storage.herdrWakeBindings[sourceKey]?.binding_scope === "project"
+      && storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_SOURCE,
+    "Project binding is stable while the source conversation is the active target");
   const continuityId = storage.herdrWakeBindings[sourceKey].continuity_id;
 
   let resolveHudOff;
@@ -851,8 +947,11 @@ console.log("\n[project handoff]");
   await new Promise((r) => setTimeout(r, 800));
   const uncertain = storage.herdrConversationTransfers[transferId];
   ok(uncertain?.status === "seed_uncertain", "unconfirmed target seed is recorded as delivery-uncertain", JSON.stringify(uncertain));
-  ok(!!storage.herdrWakeBindings[sourceKey], "source binding stays authoritative while target delivery is uncertain");
-  ok(!storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`], "uncertain target never receives the workspace binding");
+  ok(!!storage.herdrWakeBindings[sourceKey]
+      && storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_SOURCE,
+    "Project binding stays on the source target while target delivery is uncertain");
+  ok(!storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`],
+    "Project handoff never creates a conversation-scoped target binding");
 
   handoffSeedMode = "confirmed";
   let resolveResume;
@@ -860,11 +959,14 @@ console.log("\n[project handoff]");
   onMsg({ type: "h2w_handoff_start", tabId: 401 }, { tab: { id: 401 } }, (r) => resolveResume(r));
   const resumed = await resumeP;
   ok(resumed?.ok === true, "explicit resume completes the target seed and cutover", JSON.stringify(resumed));
-  const targetKey = `${PROJECT_TARGET}::wH`;
-  ok(!storage.herdrWakeBindings[sourceKey], "committed rollover removes the old conversation binding");
-  ok(!!storage.herdrWakeBindings[targetKey], "committed rollover moves binding to the new Project conversation");
-  ok(storage.herdrWakeBindings[targetKey]?.continuity_id === continuityId, "continuity id survives the conversation cutover");
-  ok(storage.herdrWakeBindings[targetKey]?.handoff_from === PROJECT_SOURCE, "target binding records its predecessor conversation");
+  const targetKey = sourceKey;
+  ok(!!storage.herdrWakeBindings[targetKey]
+      && storage.herdrWakeBindings[targetKey]?.active_conv_key === PROJECT_TARGET,
+    "committed rollover keeps the Project binding and switches only its active conversation target");
+  ok(storage.herdrWakeBindings[targetKey]?.continuity_id === continuityId,
+    "continuity id survives the Project target switch");
+  ok(storage.herdrWakeBindings[targetKey]?.handoff_from === PROJECT_SOURCE,
+    "Project binding records its predecessor conversation");
   let resolveTargetHud;
   const targetHudP = new Promise((r) => { resolveTargetHud = r; });
   onMsg({ type: "h2w_page_hud", convKey: PROJECT_TARGET }, { tab: { id: storage.herdrWakeBindings[targetKey]?.tabId } }, (r) => resolveTargetHud(r));
@@ -919,6 +1021,8 @@ console.log("\n[project handoff]");
     "Auto-on Project handoff commits normally");
   ok(storage.herdrProjectAutomation?.[PROJECT_ID] === true,
     "Project handoff preserves Auto on in shared Project state");
+  ok(storage.herdrWakeBindings[targetKey]?.active_conv_key === PROJECT_TARGET,
+    "Auto-on Project handoff switches only the active conversation target");
   let resolveAutoTargetHud;
   const autoTargetHudP = new Promise((r) => { resolveAutoTargetHud = r; });
   onMsg({ type: "h2w_page_hud", convKey: PROJECT_TARGET }, { tab: { id: storage.herdrWakeBindings[targetKey]?.tabId } }, (r) => resolveAutoTargetHud(r));
@@ -936,6 +1040,7 @@ console.log("\n[project handoff]");
 // ---- Scenario 7b: a false insert failure is reconciled before declaring seed failure ----
 console.log("\n[project handoff insert false-negative]");
 {
+  delete storage.herdrWakeBindings[`${PROJECT_KEY}::wH`];
   delete storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`];
   targetSeeded = false;
   handoffSeedMode = "insert_failed_but_committed";
@@ -946,7 +1051,7 @@ console.log("\n[project handoff insert false-negative]");
   const bindP = new Promise((r) => { resolveBind = r; });
   onMsg({ type: "h2w_bind", tabId: 402, workspace_id: "wH", workspace_label: "herdr-mcp (wH)" }, { tab: { id: 402 } }, (r) => resolveBind(r));
   await bindP;
-  const sourceKey = `${PROJECT_SOURCE}::wH`;
+  const sourceKey = `${PROJECT_KEY}::wH`;
   const continuityId = storage.herdrWakeBindings[sourceKey]?.continuity_id;
 
   let resolveStart;
@@ -968,11 +1073,12 @@ console.log("\n[project handoff insert false-negative]");
   onMsg({ type: "h2w_turn_ended", convKey: PROJECT_SOURCE, assistantText, userText: "roll over" }, { tab: { id: 402 } }, (r) => resolveEnded(r));
   await endedP;
   await new Promise((r) => setTimeout(r, 700));
-  const targetKey = `${PROJECT_TARGET}::wH`;
+  const targetKey = sourceKey;
   ok(storage.herdrConversationTransfers[transferId]?.status === "committed",
     "insert-failed with confirmed target evidence commits instead of failing");
-  ok(!storage.herdrWakeBindings[sourceKey] && !!storage.herdrWakeBindings[targetKey],
-    "false-negative reconciliation still cuts over the binding atomically");
+  ok(!!storage.herdrWakeBindings[targetKey]
+      && storage.herdrWakeBindings[targetKey]?.active_conv_key === PROJECT_TARGET,
+    "false-negative reconciliation switches the Project binding target atomically");
   ok(storage.herdrWakeBindings[targetKey]?.continuity_id === continuityId,
     "false-negative reconciliation preserves the source continuity id");
 }
@@ -980,6 +1086,7 @@ console.log("\n[project handoff insert false-negative]");
 // ---- Scenario 7c: recover a legacy failed seed after the user provisionally rebound the target ----
 console.log("\n[project handoff legacy failed-seed recovery]");
 {
+  delete storage.herdrWakeBindings[`${PROJECT_KEY}::wH`];
   delete storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`];
   targetSeeded = false;
   handoffSeedMode = "uncertain";
@@ -990,7 +1097,18 @@ console.log("\n[project handoff legacy failed-seed recovery]");
   const bindP = new Promise((r) => { resolveBind = r; });
   onMsg({ type: "h2w_bind", tabId: 403, workspace_id: "wH", workspace_label: "herdr-mcp (wH)" }, { tab: { id: 403 } }, (r) => resolveBind(r));
   await bindP;
+  const projectSourceKey = `${PROJECT_KEY}::wH`;
   const sourceKey = `${PROJECT_SOURCE}::wH`;
+  const seededProjectBinding = storage.herdrWakeBindings[projectSourceKey];
+  delete storage.herdrWakeBindings[projectSourceKey];
+  storage.herdrWakeBindings[sourceKey] = {
+    ...seededProjectBinding,
+    convKey: PROJECT_SOURCE,
+    binding_scope: "conversation",
+    active_conv_key: null,
+    tabId: 403,
+    tabUrl: PROJECT_SOURCE_URL,
+  };
   const continuityId = storage.herdrWakeBindings[sourceKey]?.continuity_id;
 
   let resolveStart;
@@ -1024,7 +1142,7 @@ console.log("\n[project handoff legacy failed-seed recovery]");
   const targetBindP = new Promise((r) => { resolveTargetBind = r; });
   onMsg({ type: "h2w_bind", tabId: targetTabId, workspace_id: "wH", workspace_label: "herdr-mcp (wH)" }, { tab: { id: targetTabId } }, (r) => resolveTargetBind(r));
   await targetBindP;
-  const targetKey = `${PROJECT_TARGET}::wH`;
+  const targetKey = `${PROJECT_KEY}::wH`;
   ok(storage.herdrWakeBindings[targetKey]?.continuity_id !== continuityId,
     "provisional manual target binding initially has a separate continuity id");
 
@@ -1036,11 +1154,13 @@ console.log("\n[project handoff legacy failed-seed recovery]");
   ok(storage.herdrConversationTransfers[transferId]?.status === "committed",
     "legacy failed seed is finalized as committed after target probe confirmation");
   ok(!storage.herdrWakeBindings[sourceKey] && !!storage.herdrWakeBindings[targetKey],
-    "legacy recovery removes source binding and keeps the existing target binding slot");
+    "legacy recovery removes the old conversation binding and keeps the Project binding slot");
   ok(storage.herdrWakeBindings[targetKey]?.continuity_id === continuityId,
     "legacy recovery rewrites the provisional target onto the original continuity chain");
   ok(storage.herdrWakeBindings[targetKey]?.handoff_from === PROJECT_SOURCE,
     "legacy recovery records the predecessor conversation on the target binding");
+  ok(storage.herdrWakeBindings[targetKey]?.active_conv_key === PROJECT_TARGET,
+    "legacy recovery upgrades the target to a Project binding with the confirmed active conversation");
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);

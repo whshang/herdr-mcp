@@ -26,7 +26,7 @@ import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 
-const H2W_SCRIPT_VERSION = "0.1.58";
+const H2W_SCRIPT_VERSION = "0.1.59";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -214,7 +214,7 @@ function handoffConversationInfo(rawUrl, siteHint = null) {
     return {
       ...chatgpt,
       handoff_launch_url: chatgpt.project_launch_url,
-      manual_handoff_available: Boolean(chatgpt.project_id),
+      manual_handoff_available: Boolean(chatgpt.project_id && chatgpt.conversation_id),
     };
   }
   if (!siteHint || siteHint === "z.ai") return zAiConversationInfo(rawUrl);
@@ -490,6 +490,11 @@ function bindingStoreKey(convKey, workspaceId) {
   return `${convKey}::${workspaceId}`;
 }
 
+function bindingKeyForConversationInfo(info, fallback = null) {
+  if (info?.project_id && info?.project_key) return info.project_key;
+  return info?.convKey || fallback || null;
+}
+
 function parseBindingStoreKey(storeKey) {
   const i = storeKey.lastIndexOf("::");
   if (i <= 0) return { convKey: storeKey, workspaceId: null };
@@ -537,12 +542,33 @@ function migrateBindingsMap(raw, now = Date.now()) {
   return { map: out, migrated };
 }
 
-function bindingsForConv(bindings, convKey) {
+function directBindingsForConv(bindings, convKey) {
   const out = [];
   for (const [storeKey, b] of Object.entries(bindings)) {
     if (b?.convKey === convKey) out.push({ storeKey, ...b });
   }
   return out;
+}
+
+function bindingsForConv(bindings, convKey) {
+  const info = chatGptConversationInfo(convKey);
+  if (info?.project_id && info.project_key) {
+    const projectScoped = directBindingsForConv(bindings, info.project_key);
+    if (projectScoped.length) return projectScoped;
+  }
+  return directBindingsForConv(bindings, convKey);
+}
+
+function isProjectScopedBinding(binding) {
+  if (!binding) return false;
+  if (binding.binding_scope === "project" && binding.project_id) return true;
+  const info = chatGptConversationInfo(binding.convKey);
+  return Boolean(info?.project_id && !info?.conversation_id);
+}
+
+function bindingDeliveryConvKey(binding) {
+  if (isProjectScopedBinding(binding)) return binding.active_conv_key || null;
+  return binding?.convKey || null;
 }
 
 function primaryBindingForConv(bindings, convKey) {
@@ -667,6 +693,101 @@ async function migrateZaiRootConversationState(bindings, targetConvKey, targetUr
   callLog(`migrated z.ai root binding to ${target.convKey}`);
   return { migrated: true, bindings };
 }
+
+async function migrateChatGptRootBindingState(bindings, targetConvKey, targetUrl, tabId) {
+  const target = chatGptConversationInfo(targetUrl || targetConvKey);
+  if (!target || target.is_new_chat_root || !tabId) return { migrated: false, bindings };
+  const rootKey = new URL(target.url || targetConvKey).origin;
+  const rootBindings = directBindingsForConv(bindings, rootKey).filter((entry) => (
+    entry.binding_scope === "pending"
+    && Number(entry.tabId || 0) === Number(tabId)
+  ));
+  if (!rootBindings.length) return { migrated: false, bindings };
+
+  const targetBindingKey = bindingKeyForConversationInfo(target, targetConvKey);
+  const now = Date.now();
+  for (const entry of rootBindings) {
+    const ws = entry.workspace_id || normalizeWorkspaceId(entry);
+    if (!ws) continue;
+    const oldKey = entry.storeKey || bindingStoreKey(rootKey, ws);
+    const nextKey = bindingStoreKey(targetBindingKey, ws);
+    const existing = bindings[nextKey];
+    if (existing) {
+      if (target.project_id && target.conversation_id && !existing.active_conv_key) {
+        existing.active_conv_key = target.convKey;
+        existing.tabId = tabId;
+        existing.tabUrl = targetUrl || target.url;
+        existing.last_seen_at = now;
+      }
+      delete bindings[oldKey];
+      clearProgressTimer(oldKey);
+      continue;
+    }
+    const projectScoped = Boolean(target.project_id);
+    const next = {
+      ...entry,
+      convKey: targetBindingKey,
+      site: "chatgpt",
+      binding_scope: projectScoped ? "project" : "conversation",
+      project_id: target.project_id || null,
+      project_key: target.project_key || null,
+      active_conv_key: projectScoped && target.conversation_id ? target.convKey : null,
+      tabId: projectScoped && !target.conversation_id ? null : tabId,
+      tabUrl: projectScoped && !target.conversation_id ? null : (targetUrl || target.url),
+      last_seen_at: now,
+    };
+    delete next.storeKey;
+    next.revision = bindingRevision(next);
+    bindings[nextKey] = next;
+    delete bindings[oldKey];
+    clearProgressTimer(oldKey);
+    if (next.status === "working" && bindingDeliveryConvKey(next)) armProgressTimer(nextKey, next);
+  }
+
+  await chrome.storage.local.set({ herdrWakeBindings: bindings });
+  callLog(`migrated ChatGPT root binding to ${targetBindingKey}`);
+  return { migrated: true, bindings };
+}
+
+async function adoptProjectConversationTarget(bindings, session, info, tabId, tabUrl, force = false) {
+  if (!info?.project_id || !info?.conversation_id || !tabId) return false;
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch (_) {}
+  let changed = false;
+  const now = Date.now();
+  for (const entry of session || []) {
+    if (!isProjectScopedBinding(entry)) continue;
+    const storeKey = entry.storeKey || bindingStoreKey(entry.convKey, entry.workspace_id || normalizeWorkspaceId(entry));
+    const current = bindings[storeKey];
+    if (!current) continue;
+    const shouldAdopt = force
+      || tab?.active === true
+      || !current.active_conv_key
+      || Number(current.tabId || 0) === Number(tabId);
+    if (!shouldAdopt) continue;
+    current.active_conv_key = info.convKey;
+    current.tabId = tabId;
+    current.tabUrl = tabUrl || info.url || null;
+    current.last_seen_at = now;
+    current.execution_state = await protectBoundTab(tabId);
+    changed = true;
+  }
+  if (changed) await saveBindings(bindings);
+  return changed;
+}
+
+try {
+  chrome.tabs.onActivated?.addListener(({ tabId }) => {
+    void (async () => {
+      const info = await conversationInfoForTab(tabId);
+      if (!info?.project_id || !info?.conversation_id) return;
+      const bindings = await loadBindings();
+      const session = bindingsForConv(bindings, info.convKey);
+      if (!session.some((b) => isProjectScopedBinding(b))) return;
+      await adoptProjectConversationTarget(bindings, session, info, tabId, info.url || null, true);
+    })();
+  });
+} catch (_) {}
 
 function tabExecutionView(tab) {
   if (!tab?.id) {
@@ -886,6 +1007,16 @@ function transferSourceSnapshot(sessionBindings) {
     workspace_id: b.workspace_id || normalizeWorkspaceId(b),
     revision: b.revision || bindingRevision(b),
   })).filter((b) => b.workspace_id);
+}
+
+function bindingsForTransferSource(bindings, transfer) {
+  const expectedIds = (transfer?.source_bindings || []).map((b) => b.workspace_id).filter(Boolean);
+  const direct = directBindingsForConv(bindings, transfer?.source_conv_key || "");
+  if (sameWorkspaceSet(
+    direct.map((b) => b.workspace_id || normalizeWorkspaceId(b)),
+    expectedIds,
+  )) return direct;
+  return bindingsForConv(bindings, transfer?.source_conv_key || "");
 }
 
 async function markTransfer(transferId, patch) {
@@ -1609,7 +1740,7 @@ function reconcileProgressTimers(bindings) {
 async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTemplate(), wakeKind = null) {
   if (!automationEnabledForBinding(b)) return { ok: false, reason: "disabled" };
   const handoffs = await loadHandoffTransfers();
-  if (activeTransferFromSource(handoffs, b?.convKey || "")) {
+  if (activeTransferFromSource(handoffs, bindingDeliveryConvKey(b) || b?.convKey || "")) {
     return { ok: false, reason: "handoff_active" };
   }
   const isLlmNudge = extra.status === "llm_continue_nudge";
@@ -1713,9 +1844,19 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTem
 }
 
 async function deliverWakeToTab(b, payload) {
+  const deliveryConvKey = bindingDeliveryConvKey(b);
+  if (!deliveryConvKey) {
+    callLog(`binding ${b?.convKey || "unknown"} has no active conversation target yet`);
+    return { ok: false, reason: "no_target" };
+  }
   // 1) Send directly to the latest registered tabId.
   if (b.tabId) {
     try {
+      if (isProjectScopedBinding(b)) {
+        const tab = await chrome.tabs.get(b.tabId);
+        const live = chatGptConversationInfo(tab?.url);
+        if (!live?.conversation_id || live.convKey !== deliveryConvKey) throw new Error("project-target-moved");
+      }
       const result = await chrome.tabs.sendMessage(b.tabId, payload);
       callLog(`wake sent to tab ${b.tabId}`, JSON.stringify(result || {}));
       return result || { ok: true };
@@ -1723,7 +1864,7 @@ async function deliverWakeToTab(b, payload) {
   }
   // 2) Recover by conversation URL after page refresh or browser restart.
   try {
-    const url = new URL(b.convKey);
+    const url = new URL(deliveryConvKey);
     const glob = `${url.origin}${url.pathname}*`;
     const tabs = await chrome.tabs.query({ url: glob });
     for (const t of tabs) {
@@ -1739,7 +1880,7 @@ async function deliverWakeToTab(b, payload) {
         return result || { ok: true };
       } catch (e) { /* No content script in this tab; try the next match. */ }
     }
-    callLog(`no reachable tab for convKey=${b.convKey}; retaining binding for registration recovery`);
+    callLog(`no reachable tab for convKey=${deliveryConvKey}; retaining binding for registration recovery`);
     return { ok: false, reason: "no_tab" };
   } catch (e) {
     callLog("route recovery failed:", e.message);
@@ -1890,7 +2031,7 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
   const bindings = await loadBindings();
   const expected = transfer.source_bindings || [];
   const expectedIds = expected.map((b) => b.workspace_id);
-  const source = bindingsForConv(bindings, transfer.source_conv_key);
+  const source = bindingsForTransferSource(bindings, transfer);
   const target = bindingsForConv(bindings, targetInfo.convKey);
 
   // Idempotent recovery: binding storage may have committed before the transfer
@@ -1920,6 +2061,140 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
       return { ok: false, error: "source_binding_revision_changed" };
     }
   }
+
+  // A ChatGPT Project binding is stable across conversations. Handoff switches
+  // only the active delivery target; it must not delete/recreate the Project
+  // binding itself or mint a new continuity chain.
+  if (source.length && source.every((b) => isProjectScopedBinding(b))) {
+    if (!source.every((b) => b.project_id === transfer.project_id)) {
+      await markTransfer(transferId, { status: "failed", error: "source_project_binding_mismatch" });
+      return { ok: false, error: "source_project_binding_mismatch" };
+    }
+    const now = Date.now();
+    for (const current of source) {
+      const ws = current.workspace_id || normalizeWorkspaceId(current);
+      const storeKey = current.storeKey || bindingStoreKey(current.convKey, ws);
+      const next = bindings[storeKey];
+      if (!next) continue;
+      next.active_conv_key = targetInfo.convKey;
+      next.tabId = targetTabId || null;
+      next.tabUrl = targetUrl || targetInfo.url || null;
+      next.execution_state = targetTabId ? await protectBoundTab(targetTabId) : null;
+      next.continuity_id = transfer.continuity_id;
+      next.persistence = "explicit";
+      next.last_seen_at = now;
+      next.handoff_from = transfer.source_conv_key;
+      next.handoff_at = now;
+      delete next.expires_at;
+      if (next.status === "working" && targetTabId) armProgressTimer(storeKey, next);
+    }
+    const inheritedAutomation = inheritedAutomationStorageForTransfer(transfer, targetInfo.convKey);
+    try {
+      await chrome.storage.local.set({
+        herdrWakeBindings: bindings,
+        ...inheritedAutomation.updates,
+      });
+    } catch (e) {
+      await markTransfer(transferId, { status: "seed_uncertain", error: `binding_commit_failed:${e.message}` });
+      return { ok: false, error: "binding_commit_failed" };
+    }
+    if (inheritedAutomation.projectAutomation) PROJECT_AUTOMATION = inheritedAutomation.projectAutomation;
+    if (inheritedAutomation.conversationAutomation) CONVERSATION_AUTOMATION = inheritedAutomation.conversationAutomation;
+    ensurePushStream(bindings);
+    reconcileProgressTimers(bindings);
+    const done = await markTransfer(transferId, {
+      status: "committed",
+      target_conv_key: targetInfo.convKey,
+      target_tab_id: targetTabId || transfer.target_tab_id || null,
+      target_url: targetUrl || targetInfo.url || null,
+      error: null,
+      packet_chars: String(transfer.handoff_text || "").length,
+      handoff_text: null,
+    });
+    try {
+      if (transfer.source_tab_id) chrome.tabs.sendMessage(transfer.source_tab_id, { type: "h2w_handoff_moved", transferId, targetConvKey: targetInfo.convKey });
+    } catch (_) {}
+    try {
+      if (targetTabId) chrome.tabs.sendMessage(targetTabId, { type: "h2w_handoff_committed", transferId, sourceConvKey: transfer.source_conv_key });
+    } catch (_) {}
+    void notifyAutomationChanged();
+    return { ok: true, transfer: handoffView(done) };
+  }
+
+  // Upgrade a legacy conversation-scoped Project handoff in place when the
+  // target was already rebound by a newer build as a Project-scoped binding.
+  // The source remains authoritative for continuity/runtime fields, while the
+  // target contributes only the stable Project identity and confirmed tab.
+  if (source.length
+    && source.every((b) => !isProjectScopedBinding(b))
+    && target.length
+    && target.every((b) => isProjectScopedBinding(b))
+    && sameWorkspaceSet(target.map((b) => b.workspace_id || normalizeWorkspaceId(b)), expectedIds)) {
+    const now = Date.now();
+    for (const sourceBinding of source) {
+      const ws = sourceBinding.workspace_id || normalizeWorkspaceId(sourceBinding);
+      const targetBinding = target.find((b) => (b.workspace_id || normalizeWorkspaceId(b)) === ws);
+      if (!targetBinding) continue;
+      const sourceKey = sourceBinding.storeKey || bindingStoreKey(transfer.source_conv_key, ws);
+      const targetKey = targetBinding.storeKey || bindingStoreKey(targetBinding.convKey, ws);
+      const targetRow = bindings[targetKey];
+      if (!targetRow) continue;
+      targetRow.workspace_label = sourceBinding.workspace_label || targetRow.workspace_label;
+      targetRow.pane = sourceBinding.pane || null;
+      targetRow.focus_agent = sourceBinding.focus_agent || sourceBinding.agent || null;
+      targetRow.agent = null;
+      targetRow.workingPanes = { ...(sourceBinding.workingPanes || {}) };
+      targetRow.status = sourceBinding.status || "unknown";
+      targetRow.lastSettle = sourceBinding.lastSettle || null;
+      targetRow.created_at = sourceBinding.created_at || targetRow.created_at || now;
+      targetRow.continuity_id = transfer.continuity_id;
+      targetRow.active_conv_key = targetInfo.convKey;
+      targetRow.tabId = targetTabId || null;
+      targetRow.tabUrl = targetUrl || targetInfo.url || null;
+      targetRow.execution_state = targetTabId ? await protectBoundTab(targetTabId) : null;
+      targetRow.persistence = "explicit";
+      targetRow.last_seen_at = now;
+      targetRow.handoff_from = transfer.source_conv_key;
+      targetRow.handoff_at = now;
+      delete targetRow.expires_at;
+      targetRow.revision = bindingRevision(targetRow);
+      delete bindings[sourceKey];
+      clearProgressTimer(sourceKey);
+      if (targetRow.status === "working" && targetTabId) armProgressTimer(targetKey, targetRow);
+    }
+    const inheritedAutomation = inheritedAutomationStorageForTransfer(transfer, targetInfo.convKey);
+    try {
+      await chrome.storage.local.set({
+        herdrWakeBindings: bindings,
+        ...inheritedAutomation.updates,
+      });
+    } catch (e) {
+      await markTransfer(transferId, { status: "seed_uncertain", error: `binding_commit_failed:${e.message}` });
+      return { ok: false, error: "binding_commit_failed" };
+    }
+    if (inheritedAutomation.projectAutomation) PROJECT_AUTOMATION = inheritedAutomation.projectAutomation;
+    if (inheritedAutomation.conversationAutomation) CONVERSATION_AUTOMATION = inheritedAutomation.conversationAutomation;
+    ensurePushStream(bindings);
+    reconcileProgressTimers(bindings);
+    const done = await markTransfer(transferId, {
+      status: "committed",
+      target_conv_key: targetInfo.convKey,
+      target_tab_id: targetTabId || transfer.target_tab_id || null,
+      target_url: targetUrl || targetInfo.url || null,
+      error: null,
+      packet_chars: String(transfer.handoff_text || "").length,
+      handoff_text: null,
+    });
+    try {
+      if (transfer.source_tab_id) chrome.tabs.sendMessage(transfer.source_tab_id, { type: "h2w_handoff_moved", transferId, targetConvKey: targetInfo.convKey });
+    } catch (_) {}
+    try {
+      if (targetTabId) chrome.tabs.sendMessage(targetTabId, { type: "h2w_handoff_committed", transferId, sourceConvKey: transfer.source_conv_key });
+    } catch (_) {}
+    void notifyAutomationChanged();
+    return { ok: true, upgraded: true, transfer: handoffView(done) };
+  }
+
   if (target.length && !sameWorkspaceSet(target.map((b) => b.workspace_id || normalizeWorkspaceId(b)), expectedIds)) {
     await markTransfer(transferId, { status: "failed", error: "target_already_bound" });
     return { ok: false, error: "target_already_bound" };
@@ -2217,7 +2492,7 @@ async function resumeSummaryRequested(transfer) {
   }
 
   const bindings = await loadBindings();
-  const source = bindingsForConv(bindings, transfer.source_conv_key);
+  const source = bindingsForTransferSource(bindings, transfer);
   const expected = transfer.source_bindings || [];
   if (!sameWorkspaceSet(
     source.map((b) => b.workspace_id || normalizeWorkspaceId(b)),
@@ -2461,22 +2736,45 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_register") {
     void (async () => {
       const bindings = await loadBindings();
+      const pageInfo = conversationInfoFromSupportedUrl(msg.url || msg.convKey);
       let matched = bindingsForConv(bindings, msg.convKey);
       if (!matched.length && sender.tab?.id) {
-        const migration = await migrateZaiRootConversationState(
-          bindings,
-          String(msg.convKey || ""),
-          msg.url || sender.tab?.url || null,
-          sender.tab.id,
-        );
-        if (migration.migrated) matched = bindingsForConv(bindings, msg.convKey);
+        if (pageInfo?.site === "chatgpt") {
+          const migration = await migrateChatGptRootBindingState(
+            bindings,
+            String(msg.convKey || ""),
+            msg.url || sender.tab?.url || null,
+            sender.tab.id,
+          );
+          if (migration.migrated) matched = bindingsForConv(bindings, msg.convKey);
+        } else {
+          const migration = await migrateZaiRootConversationState(
+            bindings,
+            String(msg.convKey || ""),
+            msg.url || sender.tab?.url || null,
+            sender.tab.id,
+          );
+          if (migration.migrated) matched = bindingsForConv(bindings, msg.convKey);
+        }
       }
       if (matched.length) {
+        if (pageInfo?.project_id && pageInfo?.conversation_id && sender.tab?.id) {
+          await adoptProjectConversationTarget(
+            bindings,
+            matched,
+            pageInfo,
+            sender.tab.id,
+            msg.url || sender.tab?.url || null,
+          );
+        }
         for (const entry of matched) {
           const b = bindings[entry.storeKey];
-          b.tabId = sender.tab?.id;
-          b.tabUrl = msg.url || sender.tab?.url;
-          b.execution_state = await protectBoundTab(b.tabId);
+          if (!b) continue;
+          if (!isProjectScopedBinding(b)) {
+            b.tabId = sender.tab?.id;
+            b.tabUrl = msg.url || sender.tab?.url;
+            b.execution_state = await protectBoundTab(b.tabId);
+          }
           b.last_seen_at = Date.now();
         }
         ensurePushStream(bindings);
@@ -2804,16 +3102,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const convInfo = await conversationInfoForTab(tabId);
       const requestedConvKey = String(msg.convKey || "").trim();
       if (!convInfo?.convKey && !requestedConvKey) { sendResponse({ ok: false, error: "conversation-unavailable" }); return; }
-      const effectiveConvKey = convInfo?.convKey || requestedConvKey;
+      const pageInfo = convInfo || conversationInfoFromSupportedUrl(requestedConvKey);
+      const effectiveConvKey = bindingKeyForConversationInfo(pageInfo, convInfo?.convKey || requestedConvKey);
+      if (!effectiveConvKey) { sendResponse({ ok: false, error: "conversation-unavailable" }); return; }
       const workspace_id = msg.workspace_id
         || (typeof msg.pane === "string" && msg.pane.includes(":") ? msg.pane.split(":")[0] : null);
       if (!workspace_id) { sendResponse({ ok: false, error: "workspace_required" }); return; }
       const storeKey = bindingStoreKey(effectiveConvKey, workspace_id);
-      if (bindings[storeKey]) { sendResponse({ ok: false, error: "already-bound", convKey: convInfo.convKey, workspace_id }); return; }
+      if (bindings[storeKey]) { sendResponse({ ok: false, error: "already-bound", convKey: effectiveConvKey, workspace_id }); return; }
       const workspace_label = msg.workspace_label
         || workspaceTitleWithId({ id: workspace_id, label: msg.workspace_label_raw, roots: msg.roots });
       const continuity_id = bindingsForConv(bindings, effectiveConvKey).map((x) => x.continuity_id).find(Boolean)
         || newContinuityId();
+      const projectScoped = Boolean(pageInfo?.project_id);
+      const pendingRoot = pageInfo?.site === "chatgpt" && pageInfo?.is_new_chat_root === true;
+      const hasConversationTarget = Boolean(pageInfo?.conversation_id);
+      const deliveryTabId = projectScoped && !hasConversationTarget ? null : tabId;
       const b = {
         workspace_id,
         workspace_label,
@@ -2822,9 +3126,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         agent: null, // The binding targets a workspace, not an individual agent.
         workingPanes: {},
         convKey: effectiveConvKey,
-        site: convInfo?.site || "unknown",
-        tabId, tabUrl: convInfo.url || null,
-        execution_state: await protectBoundTab(tabId),
+        site: pageInfo?.site || "unknown",
+        binding_scope: projectScoped ? "project" : (pendingRoot ? "pending" : "conversation"),
+        project_id: pageInfo?.project_id || null,
+        project_key: pageInfo?.project_key || null,
+        active_conv_key: projectScoped && hasConversationTarget ? pageInfo.convKey : null,
+        tabId: deliveryTabId,
+        tabUrl: deliveryTabId ? (pageInfo?.url || sender.tab?.url || null) : null,
+        execution_state: deliveryTabId ? await protectBoundTab(deliveryTabId) : null,
         created_at: Date.now(),
         last_seen_at: Date.now(),
         persistence: "explicit",
@@ -2837,7 +3146,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       await saveBindings(bindings);
       ensurePushStream(bindings);
       try { void chrome.tabs.sendMessage(tabId, { type: "h2w_bound", pane: workspace_label, workspace_id, workspace_label }).catch(() => {}); } catch (e) {}
-      sendResponse({ ok: true, convKey: convInfo.convKey, workspace_id, workspace_label });
+      sendResponse({
+        ok: true,
+        convKey: effectiveConvKey,
+        binding_scope: b.binding_scope,
+        project_id: b.project_id,
+        workspace_id,
+        workspace_label,
+      });
     })();
     return true;
   }
@@ -2846,9 +3162,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const bindings = await loadBindings();
       const convKey = msg.convKey;
       const wsId = msg.workspace_id || null;
+      const session = bindingsForConv(bindings, convKey);
       const targets = wsId
-        ? [{ storeKey: bindingStoreKey(convKey, wsId) }]
-        : bindingsForConv(bindings, convKey).map((b) => ({ storeKey: b.storeKey }));
+        ? session.filter((b) => (b.workspace_id || normalizeWorkspaceId(b)) === wsId).map((b) => ({ storeKey: b.storeKey }))
+        : session.map((b) => ({ storeKey: b.storeKey }));
       if (!targets.length || targets.every((t) => !bindings[t.storeKey])) {
         sendResponse({ ok: false, error: "not-found" });
         return;

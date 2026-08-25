@@ -59,9 +59,9 @@ const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
-ok(manifest.version === "0.1.58", "manifest version includes handoff Auto inheritance");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.58"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.58"'), "content version matches manifest");
+ok(manifest.version === "0.1.59", "manifest version includes pre-conversation Project binding");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.59"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.59"'), "content version matches manifest");
 ok(backgroundSource.includes("sendResponse({ ok: true, ...automationScopeForConversation(convKey) });")
     && backgroundSource.includes("void notifyAutomationChanged();")
     && wakeSource.includes("finally {\n      setHudActionBusy(false);"),
@@ -209,6 +209,11 @@ ok(
   "manual HUD handoff stays available with Auto on and reuses recoverable internals",
 );
 ok(
+  backgroundSource.includes('manual_handoff_available: Boolean(chatgpt.project_id && chatgpt.conversation_id)')
+    && wakeSource.includes('button.hidden = !chatGptConversationActionsAvailable'),
+  "ChatGPT root/Project-home pages keep binding controls but hide conversation-only manual actions",
+);
+ok(
   backgroundSource.includes("herdrConversationTransfers")
     && backgroundSource.includes("source_binding_set_changed")
     && backgroundSource.includes("seed_uncertain")
@@ -300,13 +305,26 @@ ok(
   });
   vm.runInContext(baseCode, projectCtx);
   vm.runInContext(chatgptCode, projectCtx);
-  ok(vm.runInContext("window.__H2W_ADAPTER__.getConversationKey()", projectCtx) === null,
-    "ChatGPT Project home is not misclassified as a conversation");
+  ok(vm.runInContext("window.__H2W_ADAPTER__.getConversationKey()", projectCtx)
+      === "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978",
+    "ChatGPT Project home exposes the stable Project binding key");
+
+  const rootCtx = vm.createContext({
+    window: {},
+    location: { origin: u.origin, pathname: "/" },
+    document: { querySelector: () => null, querySelectorAll: () => [], body: null, documentElement: null },
+    console,
+  });
+  vm.runInContext(baseCode, rootCtx);
+  vm.runInContext(chatgptCode, rootCtx);
+  ok(vm.runInContext("window.__H2W_ADAPTER__.getConversationKey()", rootCtx) === "https://chatgpt.com",
+    "ChatGPT root exposes a pending binding key before a conversation exists");
 }
 {
   const normal = "https://chatgpt.com/c/6a89c95e-70bc-83ea-bf3d-fab6b83fc86e";
   const project = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978/c/6a8ae745-a3dc-83ea-91f0-218dd5be7807";
   const slugged = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978-herdr-mcp/c/6a8ae745-a3dc-83ea-91f0-218dd5be7807";
+  const projectHome = "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978-herdr-mcp/project";
   ok(conversationInfoFromSupportedUrl(normal)?.convKey === normal,
     "URL fallback recognizes a normal ChatGPT conversation");
   ok(conversationInfoFromSupportedUrl(project)?.convKey === project,
@@ -315,8 +333,12 @@ ok(
     "URL fallback normalizes a slugged ChatGPT Project alias to the resource-id key");
   ok(chatGptConversationInfo(slugged)?.project_launch_url === "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978",
     "Project rollover launcher uses stable Project resource id");
-  ok(conversationInfoFromSupportedUrl("https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978") === null,
-    "URL fallback rejects a ChatGPT project page without a conversation");
+  ok(conversationInfoFromSupportedUrl(projectHome)?.convKey
+      === "https://chatgpt.com/g/g-p-6a89c078669481918c8eb70fdfd3d978"
+      && conversationInfoFromSupportedUrl(projectHome)?.binding_scope === "project",
+    "URL fallback recognizes a ChatGPT Project home as a stable binding scope");
+  ok(conversationInfoFromSupportedUrl("https://chatgpt.com/")?.binding_scope === "pending",
+    "URL fallback recognizes ChatGPT root as a pending binding scope");
   ok(conversationInfoFromSupportedUrl("https://example.com/c/abc") === null,
     "URL fallback rejects unsupported hosts");
 }

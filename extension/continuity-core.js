@@ -37,6 +37,21 @@ export function chatGptConversationInfo(rawUrl) {
     if (!CHATGPT_HOSTS.has(u.hostname.toLowerCase())) return null;
     const pathname = normalizedPathname(u.pathname);
 
+    if (pathname === "/") {
+      return {
+        site: "chatgpt",
+        convKey: u.origin,
+        url: u.href,
+        conversation_id: null,
+        project_id: null,
+        project_key: null,
+        project_launch_url: null,
+        binding_scope: "pending",
+        is_new_chat_root: true,
+        is_project_home: false,
+      };
+    }
+
     const normal = pathname.match(/^\/c\/([^/]+)$/);
     if (normal) {
       const conversationId = normal[1];
@@ -48,17 +63,22 @@ export function chatGptConversationInfo(rawUrl) {
         project_id: null,
         project_key: null,
         project_launch_url: null,
+        binding_scope: "conversation",
+        is_new_chat_root: false,
+        is_project_home: false,
       };
     }
 
-    const project = pathname.match(/^\/g\/(g-p-[^/]+)\/c\/([^/]+)$/i);
-    if (!project) return null;
-    const projectId = stableProjectId(project[1]);
-    const conversationId = project[2];
+    const projectConversation = pathname.match(/^\/g\/(g-p-[^/]+)\/c\/([^/]+)$/i);
+    const projectHome = pathname.match(/^\/g\/(g-p-[^/]+)(?:\/project)?$/i);
+    const projectSegment = projectConversation?.[1] || projectHome?.[1] || null;
+    if (!projectSegment) return null;
+    const projectId = stableProjectId(projectSegment);
     const projectKey = `${u.origin}/g/${projectId}`;
+    const conversationId = projectConversation?.[2] || null;
     return {
       site: "chatgpt",
-      convKey: `${projectKey}/c/${conversationId}`,
+      convKey: conversationId ? `${projectKey}/c/${conversationId}` : projectKey,
       url: u.href,
       conversation_id: conversationId,
       project_id: projectId,
@@ -67,6 +87,9 @@ export function chatGptConversationInfo(rawUrl) {
       // currently redirects it to the user-facing `/project` route, including
       // any cosmetic Project slug.
       project_launch_url: projectKey,
+      binding_scope: "project",
+      is_new_chat_root: false,
+      is_project_home: !conversationId,
     };
   } catch (_) {
     return null;
@@ -74,7 +97,8 @@ export function chatGptConversationInfo(rawUrl) {
 }
 
 export function isProjectConversation(rawUrl) {
-  return Boolean(chatGptConversationInfo(rawUrl)?.project_id);
+  const info = chatGptConversationInfo(rawUrl);
+  return Boolean(info?.project_id && info?.conversation_id);
 }
 
 function compactWorkspaceLabels(bindings) {
