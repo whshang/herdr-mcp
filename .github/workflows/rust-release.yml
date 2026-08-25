@@ -43,16 +43,27 @@ jobs:
         if: always()
         run: scripts/ci-herdr-runtime.sh stop
 
+  targets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load authoritative Rust release targets
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e '.schema_version == 1 and (.targets | length > 0) and ([.targets[].runner, .targets[].target] | all(type == "string" and length > 0))' .github/rust-release-targets.json >/dev/null
+          matrix="$(jq -c '{include: .targets}' .github/rust-release-targets.json)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   build:
-    needs: verify
+    needs: [verify, targets]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            target: aarch64-apple-darwin
-          - runner: windows-2025
-            target: x86_64-pc-windows-msvc
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:

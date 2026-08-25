@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  RUST_RELEASE_MATRIX,
   RUST_RELEASE_PROVENANCE,
   RUST_RELEASE_TARGETS,
   buildRustReleaseManifest,
@@ -60,6 +61,10 @@ test("Rust release manifest is target-complete, hashed, and contract-pinned", as
       runner_environment: RUST_RELEASE_PROVENANCE.runnerEnvironment,
     });
     assert.deepEqual(manifest.contract, { epoch: 2, hash: "sha256:test", tool_count: 18 });
+    assert.deepEqual(RUST_RELEASE_MATRIX, [
+      { runner: "macos-15", target: "aarch64-apple-darwin" },
+      { runner: "windows-2025", target: "x86_64-pc-windows-msvc" },
+    ]);
     assert.deepEqual(RUST_RELEASE_TARGETS, [
       "aarch64-apple-darwin",
       "x86_64-pc-windows-msvc",

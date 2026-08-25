@@ -82,13 +82,22 @@ test("Rust release verification provisions and always cleans the pinned Herdr ru
   );
 });
 
-test("Rust release defaults to macOS ARM64 and Windows x64 artifacts only", async () => {
+test("Rust release defaults to one authoritative macOS ARM64 + Windows x64 target contract", async () => {
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
-  const buildJob = release.slice(release.indexOf("\n  build:\n"), release.indexOf("\n  manifest:\n"));
-  assert.match(buildJob, /runner: macos-15\n\s+target: aarch64-apple-darwin/);
-  assert.match(buildJob, /runner: windows-2025\n\s+target: x86_64-pc-windows-msvc/);
-  assert.doesNotMatch(buildJob, /x86_64-apple-darwin/);
-  assert.doesNotMatch(buildJob, /unknown-linux-gnu/);
+  const targetContract = JSON.parse(await readFile(join(ROOT, ".github/rust-release-targets.json"), "utf8"));
+  assert.deepEqual(targetContract, {
+    schema_version: 1,
+    targets: [
+      { runner: "macos-15", target: "aarch64-apple-darwin" },
+      { runner: "windows-2025", target: "x86_64-pc-windows-msvc" },
+    ],
+  });
+  assert.match(release, /Load authoritative Rust release targets/);
+  assert.match(release, /\.github\/rust-release-targets\.json/);
+  assert.match(release, /needs: \[verify, targets\]/);
+  assert.match(release, /matrix: \$\{\{ fromJSON\(needs\.targets\.outputs\.matrix\) \}\}/);
+  assert.doesNotMatch(release, /x86_64-apple-darwin/);
+  assert.doesNotMatch(release, /unknown-linux-gnu/);
 });
 
 test("Rust GitHub Release provenance is tag-only and fail-closed before publish", async () => {
@@ -140,6 +149,16 @@ test("Rust Release recovery republishes only a previously attested GitHub run", 
   assert.match(recovery, /run-id: \$\{\{ inputs\.source_run_id \}\}/);
   assert.match(recovery, /name: rust-release-bundle/);
   assert.match(recovery, /\.github\/workflows\/rust-release\.yml/);
+  assert.match(recovery, /\.github\/rust-release-targets\.json/);
+  assert.match(recovery, /source_target_matrix/);
+  assert.match(recovery, /source run build matrix does not match tagged target contract/);
+  assert.match(recovery, /manifest\.get\(\"schema_version\"\) != 2/);
+  assert.match(recovery, /release manifest source identity mismatch/);
+  assert.match(recovery, /release manifest repository identity mismatch/);
+  assert.match(recovery, /release manifest provenance identity mismatch/);
+  assert.match(recovery, /release manifest targets do not match tagged target contract/);
+  assert.doesNotMatch(recovery, /length == 5/);
+  assert.doesNotMatch(recovery, /== \"6\"/);
   assert.match(recovery, /head_sha/);
   assert.match(recovery, /conclusion==\"success\"/);
   assert.match(recovery, /gh attestation verify/);

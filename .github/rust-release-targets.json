@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "targets": [
+    {
+      "runner": "macos-15",
+      "target": "aarch64-apple-darwin"
+    },
+    {
+      "runner": "windows-2025",
+      "target": "x86_64-pc-windows-msvc"
+    }
+  ]
+}
