@@ -197,15 +197,22 @@ Rust runtime 完成后删除本地 Node runtime。
 48. `53c2030 fix: harden Rust transport session state` 把 session registry 锁异常改为 HTTP 500 / JSON-RPC `-32603` fail-closed，不再返回无法验证的 SID；新增 100 次 OpenAI poisoned-session stress，确认全部请求成功且 registry 始终为 0，不把 stateless 客户端偷偷转成 stateful。
 49. production transport 真实 smoke 已覆盖：同一 TCP 连接连续 `initialize → tools/list → tools/call → notifications/initialized`，18-tool catalog 与 202 notification framing 均正常；OpenAI poisoned-session 在同一 TCP 上连续 100 次 tools/list 全部 200、无 SID；同端口 runtime restart 后旧 stateful SID 为 404，而 OpenAI stale SID 为 200/18 tools；persistent GET 实测连接保持开放并收到 15 秒 heartbeat。Rust transport regression 当前为 100/100 单测通过。
 50. 本阶段的 auth 边界按目标架构收紧：Rust runtime 继续只绑定 loopback，并强制要求本机 bearer；Web Connector 的 OAuth 仍由 Edge 负责（`Web AI → MCP/OAuth → Edge → link → Rust runtime`），extension/Native Messaging 的本机信任通道留到后续 supervisor/Native Messaging 阶段，不复制旧 Node runtime 的 OAuth/extension-session 逻辑到 Rust HTTP transport。
-51. 至此 **local production transport parity 核心闭环完成**：persistent SSE、stateful/stateless session、OpenAI UA、restart/reconnect framing、raw keep-alive、stale-session reverse guard 与 loopback bearer 均已有自动测试和真实 smoke。`production_ready` 仍保持 `false`，因为 Shared Local State Store、supervisor/service manager、Native Messaging、updater、relay/link 和最终 Node runtime removal 尚未完成。
+51. 至此 **local production transport parity 核心闭环完成**：persistent SSE、stateful/stateless session、OpenAI UA、restart/reconnect framing、raw keep-alive、stale-session reverse guard 与 loopback bearer 均已有自动测试和真实 smoke。
+52. `1b59f8e feat: add secure Rust local state store foundation` 已建立 Shared Local State Store：嵌入式 SQLite、WAL、foreign keys、busy timeout、显式 schema migration、事务、0600 database / 0700 parent directory、安全路径与 future-schema fail-closed；它属于内部 runtime state，不改变 epoch 2 / 18-tool contract。
+53. `03c1148 feat: persist Rust exec session fences in SQLite`、`592f0c7 feat: persist prompt idempotency across restart`、`751331e fix: align exec restart recovery with SQLite` 已把首批可靠性状态迁入统一数据库：exec 只持久化 process fencing identity，command/cwd 继续不进入 durable state；prompt idempotency 可跨 runtime restart replay/conflict-check；旧 exec restart recovery 继续保留 `reaped_on_restart` / `closed_before_restart` / `detached_unverified` 的真实语义。
+54. 浏览器侧 `cd567cd` / `3314c63` 已把 ChatGPT binding 收敛到稳定 Project scope；`475d537` / `c98211c` 已为长对话增加 bounded scheduler、latest-turn cache 与 UI pressure meter，减少 MutationObserver/DOM 全量扫描和重复 `/push/state` 压力。
+55. `ea3a064 feat: add opt-in Rust extension IPC socket` 已加入迁移期 Rust extension IPC：仅在显式配置 `HERDR_EXTENSION_IPC_SOCKET` 时启用 Unix socket，socket mode 为 0600；live socket 二次 bind fail-closed，stale socket 可安全替换，guard 只删除自己持有的 inode。TCP MCP endpoint 继续要求 bearer，trusted extension IPC 才使用本机 socket 信任边界。
+56. `7f9ee15 feat: add Rust extension push channel` 已把 `/push/state` 与共享 `/push/events` SSE 接入同一个 Rust `EventCache`，支持 `hello`、`agent_working`、`agent_settled`、15 秒 keepalive 和 agent/pane/workspace filter；不会为每个浏览器绑定再开 Herdr daemon subscription。workspace catalog 已对齐 Node 的 Project root fallback（projects → workspace cwd → agent cwd → pane cwd），避免 Rust 切换后 HUD/Project binding 丢失 roots。
+57. 当前该上行通道真实 smoke 已验证：trusted Unix socket 无 bearer 可读取 `/push/state`/`/push/events`，同一路由从 TCP 无 bearer 返回 401；SSE 首帧包含 `retry: 2000`、`event: hello`、`herdr-mcp-push/v1`，w77 的真实 worktree root 可在 state 与 hello 中一致恢复。当前 gate 为 Rust **125/125**、Node **321/321**、Edge **212/212**、双语站点 **21 篇/语言**，extension smoke 全通过。
+58. `production_ready` 继续保持 `false`。已完成 18/18 native parity、local transport parity、Shared Local State Store foundation 与 opt-in extension IPC/push 基础；尚未完成 Rust supervisor/service manager、正式 Native Messaging host 生命周期、updater/generation production cutover、relay/link Rust production path 和 Node runtime removal。Rust push 当前只承担浏览器唤醒所需的核心 state/working/settled 路径；Node `agent_output` enrichment 与旧 `/push/mcp-activity` 兼容能力按实际依赖逐项迁移，不为追求表面接口数量提前扩张。
 
 下一批开发按以下顺序推进：
 
-1. 建立 Shared Local State Store foundation：Rust SQLite、schema migration、transaction/retention，并优先迁移 exec session recovery metadata；完整 command/cwd 继续保持 runtime memory-only，不进入 durable state；不因此扩展 epoch 2 / 18 tools；
-2. 实现 Rust supervisor、service manager、Native Messaging host，并把 production/dev generation、health、restart evidence 纳入统一生命周期；
-3. 实现 GitHub Release updater、generation A/B、atomic activation 与 rollback；
+1. 完成 Rust supervisor / service manager 与 Native Messaging host 生命周期，把 production/dev generation、extension IPC ownership、health、restart evidence 和安装/卸载纳入同一管理面；
+2. 补齐浏览器上行 production parity：优先验证真实 extension 经 Native Messaging → Rust Unix IPC 的 shared SSE 长连接、service-worker restart/reconnect 与 Project binding 恢复；`agent_output` 等 enrichment 只有在现有浏览器行为确实依赖时迁移；
+3. 实现 GitHub Release updater、generation A/B、atomic activation 与 rollback，并把 generation evidence 写入统一 state store；
 4. 迁移 relay/link，使 Edge → 本机 transport 与 runtime generation fencing 进入 Rust production path；
-5. 只有在 18-tool parity、local production transport parity、supervisor/link/updater 均通过生产回归后，删除本地 Node runtime 和旧 lifecycle scripts；
+5. 只有在 18-tool parity、transport、state store、supervisor/Native Messaging、updater、link 均通过生产回归后，删除本地 Node runtime 和旧 lifecycle scripts；
 6. 再进入 Reliability Kernel → Continuity 2.0 → Work Context & Evidence → Product Completion，保持 Web Chat 是 planner，herdr-mcp 是控制面。
 
 ## Rust 完成后的产品演进 Roadmap
@@ -287,7 +294,7 @@ conversation_turns
 - diagnostics、operation evidence、failed transfer 和 conversation raw text 都必须有数量/时间/体积上限；
 - runtime generation 仍保留极小、可独立恢复的启动指针或 atomic symlink，使 state.db 损坏时当前 generation 仍可启动并进入 doctor/recovery。
 
-当前 Rust `ExecRegistry` 已经出现 `exec-sessions-rust.json` journal。Shared Local State Store 建立后优先把 exec session metadata 迁入 SQLite，避免 supervisor/updater/Native Messaging/continuity 后续继续产生新的临时 JSON 状态格式。
+Shared Local State Store foundation 已由 `1b59f8e` 建立；`03c1148` 已把 `ExecRegistry` process fencing identity 从临时 JSON journal 迁入 SQLite，`592f0c7` 又把 prompt idempotency 迁入同一 store。后续 supervisor/updater/Native Messaging/continuity 继续复用这套 schema migration、transaction 和权限边界，避免再新增各自独立的 durable JSON 状态格式。
 
 ### Phase 7：Reliability Kernel
 
@@ -613,7 +620,7 @@ Roadmap 不与当前 Rust parity 并行扩张 public surface。顺序固定为�
   → Product Completion hardening
 ```
 
-Shared Local State Store foundation 只建立 SQLite、schema migration、transaction/retention 基础，并优先迁移 exec session metadata；不提前扩张 Reliability/Continuity 的产品行为。Reliability/Continuity 所需的基础 identity、diagnostics、event cache 可以在 Rust 迁移阶段提前建设，但不能因此修改 epoch 2 / 18 tools 的行为契约。
+当前已完成 `18-tool native parity → production transport parity → Shared Local State Store foundation`，实施游标进入 `supervisor / Native Messaging / updater / link`。Shared Local State Store foundation 保持 SQLite、schema migration、transaction/retention 与首批 exec/prompt durable identity 的范围，不提前扩张 Reliability/Continuity 的产品行为。Reliability/Continuity 所需的基础 identity、diagnostics、event cache 可以在 Rust 迁移阶段提前建设，但不能因此修改 epoch 2 / 18 tools 的行为契约。
 
 ### 暂不进入主线
 
