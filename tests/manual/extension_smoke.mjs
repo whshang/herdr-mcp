@@ -59,7 +59,7 @@ const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
-ok(manifest.version === "0.1.60", "manifest version includes browser performance budget support");
+ok(manifest.version === "0.1.60", "manifest version stays 0.1.60 for the browser performance budget");
 ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.60"'), "background version matches manifest");
 ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.60"'), "content version matches manifest");
 ok(backgroundSource.includes("sendResponse({ ok: true, ...automationScopeForConversation(convKey) });")
@@ -472,13 +472,35 @@ ok(!popupHtml.includes('id="idleNudgeEnabled"') && !popupHtml.includes('id="enab
   "popup reports the global mode without exposing an automation toggle");
 
 // ---- 2. JavaScript syntax for the fixed file list ----
-const fixed = ["background.js", "binding-core.js", "continuity-core.js", "options.js", "popup.js", "content/base.js",
+const fixed = ["background.js", "binding-core.js", "continuity-core.js", "options.js", "popup.js", "context-pressure.js", "performance-core.js", "content/base.js",
   "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/claude.js",
   "content/injector/chatgpt.js", "content/webmcp/speaks-json.js", "content/wake.js"];
 for (const f of fixed) {
   const p = path.join(EXT, f);
   const r = spawnSync(process.execPath, ["--check", p], { encoding: "utf8" });
   ok(r.status === 0, `node --check ${f}`, r.stderr?.slice(0, 200));
+}
+
+console.log("\n[ui pressure meter]");
+{
+  const pcore = readFileSync(path.join(EXT, "performance-core.js"), "utf8");
+  const ctx = vm.createContext({ console });
+  vm.runInContext(pcore, ctx);
+  const perf = vm.runInContext("H2W_BROWSER_PERFORMANCE", ctx);
+  ok(typeof perf.createCoalescedScheduler === "function", "performance-core exports createCoalescedScheduler");
+  ok(typeof perf.createUiPressureMeter === "function"
+      && typeof perf.classifyUiPressure === "function",
+    "performance-core exports the bounded ui pressure meter and classifier");
+  const meter = perf.createUiPressureMeter();
+  for (let i = 0; i < 10; i++) meter.recordMutation();
+  const evaluated = meter.evaluate();
+  ok(typeof evaluated.level === "string"
+      && ["healthy", "warning", "high"].includes(evaluated.level),
+    "meter evaluate returns a three-band level");
+  ok(typeof evaluated.mutation_rate_per_min === "number"
+      && evaluated.mutation_rate_per_min > 0,
+    "meter aggregates the mutation callback rate");
+  ok(evaluated.reasons.every((r) => typeof r === "string"), "classifier reasons are strings");
 }
 
 // ---- 3. binding-core state machine ----

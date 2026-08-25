@@ -77,6 +77,62 @@ test("browser performance scheduler suspends while hidden and flushes on resume"
   assert.equal(runs, 1);
 });
 
+test("ui pressure classifier bands healthy, warning, high from bounded inputs", () => {
+  const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
+  const classify = perf.classifyUiPressure;
+  const policy = perf.DEFAULT_UI_PRESSURE_POLICY;
+  assert.equal(classify({}).level, "healthy");
+  assert.equal(classify({ mutationRatePerMin: 10, ticksPerMin: 10, maxTimerDriftMs: 100 }).level, "healthy");
+  assert.equal(classify({ mutationRatePerMin: policy.warningMutationRatePerMin }).level, "warning");
+  assert.equal(classify({ mutationRatePerMin: policy.highMutationRatePerMin }).level, "high");
+  assert.equal(classify({ ticksPerMin: policy.warningTickRatePerMin }).level, "warning");
+  assert.equal(classify({ ticksPerMin: policy.highTickRatePerMin }).level, "high");
+  // Timer drift is the sampler-fidelity fallback signal.
+  assert.equal(classify({ maxTimerDriftMs: policy.warningMaxTimerDriftMs }).level, "warning");
+  assert.equal(classify({ maxTimerDriftMs: policy.highMaxTimerDriftMs }).level, "high");
+  // A warning plus a high signal stays high.
+  assert.equal(classify({
+    mutationRatePerMin: policy.warningMutationRatePerMin,
+    maxTimerDriftMs: policy.highMaxTimerDriftMs,
+  }).level, "high");
+  const result = classify({ mutationRatePerMin: policy.highMutationRatePerMin });
+  assert.ok(result.reasons.some((r) => r.startsWith("mutation_rate_min:")));
+});
+
+test("ui pressure meter aggregates bounded counters and resets per fixed window", () => {
+  const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
+  const now = 1000;
+  const meter = perf.createUiPressureMeter({ windowMs: 60000, now: () => now });
+  for (let i = 0; i < 100; i += 1) meter.recordMutation(1, now);
+  meter.recordTick(1, now);
+  meter.recordTimerDrift(120, now);
+  meter.recordTimerDrift(6000, now);
+  let metrics = meter.evaluate(now);
+  assert.equal(metrics.drift_samples, 2);
+  assert.equal(metrics.max_timer_drift_ms, 6000);
+  assert.equal(metrics.level, "high");
+  assert.ok(metrics.mutation_rate_per_min > 0 && metrics.ticks_per_min > 0);
+
+  // Same-window rates normalize to per-minute scale.
+  const early = meter.evaluate(now + 15000);
+  assert.ok(Math.abs(early.mutation_rate_per_min - 100 * 4) < 1);
+
+  // New window resets counters while keeping the meter usable.
+  const later = meter.evaluate(now + 60000);
+  assert.equal(later.sampled_at, 61000);
+  assert.equal(later.mutation_rate_per_min, 0);
+  assert.equal(later.level, "healthy");
+
+  // Long Task samples are informational: recorded but never raise the level.
+  const fresh = perf.createUiPressureMeter({ windowMs: 60000, now: () => now });
+  fresh.recordLongTask(250, now);
+  const withLongTask = fresh.evaluate(now);
+  assert.equal(withLongTask.long_task_count, 1);
+  assert.equal(withLongTask.long_task_max_ms, 250);
+  assert.equal(withLongTask.level, "healthy");
+  assert.equal(withLongTask.max_timer_drift_ms, 0);
+});
+
 test("retired source tab discard is gated on committed inactive handoff", () => {
   assert.equal(shouldDiscardRetiredSourceTab({ committed: true, sourceTabId: null, targetTabId: 2 }), false);
   assert.equal(shouldDiscardRetiredSourceTab({ committed: false, sourceTabId: 1, targetTabId: 2 }), false);
@@ -232,6 +288,40 @@ test("ChatGPT turn watcher wires assistant progress, settled turns, and explicit
   assert.match(wake, /conversation-turn-/);
   assert.match(wake, /mergeMessageCountFloor/);
   assert.match(wake, /stale_view_activation_template/);
+});
+
+test("ChatGPT turn watcher caches latest turns and reuses settled turns for pressure", () => {
+  const wake = fs.readFileSync(new URL("../extension/content/wake.js", import.meta.url), "utf8");
+  assert.match(wake, /rediscoverLatestTurns\(\)/);
+  assert.match(wake, /\[data-message-author-role=\"user\"\], \[data-message-author-role=\"assistant\"\]/);
+  assert.match(wake, /virtualTurn\?\.getAttribute\(\"data-testid\"\)/);
+  assert.match(wake, /markLatestTurnsDirty\(\)/);
+  assert.match(wake, /latestTurnForRole\(role\)/);
+  assert.match(wake, /updateContextPressureFromSettledTurns\(/);
+  assert.match(wake, /CONTEXT_PRESSURE\.mergeSettledTurns\(/);
+  assert.match(wake, /uiPressure\?\.recordMutation\(\)/);
+  assert.match(wake, /uiPressure\?\.recordTick\(\)/);
+  assert.match(wake, /recordTimerDrift\(driftMs\)/);
+  assert.match(wake, /rehydrate the latest-turn cache/);
+});
+
+test("context pressure reuses settled turns for turn-end updates", () => {
+  const context = loadClassicExtensionScripts();
+  const pressure = context.H2W_CONTEXT_PRESSURE;
+  let record = pressure.emptyContextRecord("c", 1000);
+  record = pressure.mergeSettledTurns(record, [
+    { id: "u1:user", role: "user", text: "hello world" },
+    { id: "a1:assistant", role: "assistant", text: "a substantive answer" },
+  ], 12, "chatgpt_virtual_turn_index", 1500);
+  const summary = pressure.summarizeContextRecord(record);
+  assert.equal(summary.observed_message_count, 2);
+  assert.equal(summary.message_count_floor, 12);
+  assert.equal(summary.message_floor_source, "chatgpt_virtual_turn_index");
+  assert.equal(record.updated_at, 1500);
+  // Monotonic floor: a lower floor is ignored and no empty merge bumps the age.
+  record = pressure.mergeSettledTurns(record, [], 8, "chatgpt_virtual_turn_index", 2000);
+  assert.equal(pressure.summarizeContextRecord(record).message_count_floor, 12);
+  assert.equal(record.updated_at, 1500);
 });
 
 test("context pressure uses conservative text and virtual-turn thresholds", () => {
