@@ -5,23 +5,33 @@
 //! code can atomically replace that binary without rewriting browser manifests.
 
 use crate::cli::NativeHostCommand;
+#[cfg(target_os = "macos")]
 use serde_json::{Value, json};
+#[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
+#[cfg(target_os = "macos")]
 use std::env;
+#[cfg(target_os = "macos")]
 use std::fs::{self, OpenOptions};
+#[cfg(target_os = "macos")]
 use std::io::{Read, Write};
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+#[cfg(target_os = "macos")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+#[cfg(target_os = "macos")]
 const HOST_NAME: &str = "dev.herdr.mcp";
+#[cfg(target_os = "macos")]
 const WRAPPER_MARKER: &str = "# herdr-mcp rust native host v1";
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 struct InstallPaths {
     source_binary: PathBuf,
@@ -37,7 +47,7 @@ pub fn run(command: NativeHostCommand) -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = command;
-        return Err("native_host_install_currently_requires_macos".to_owned());
+        Err("native_host_install_currently_requires_macos".to_owned())
     }
 
     #[cfg(target_os = "macos")]
@@ -61,7 +71,7 @@ pub fn run(command: NativeHostCommand) -> Result<ExitCode, String> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 impl InstallPaths {
     fn discover(command: &NativeHostCommand) -> Result<Self, String> {
         let home = home_dir()?;
@@ -175,7 +185,7 @@ impl InstallPaths {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn install(paths: &InstallPaths) -> Result<Value, String> {
     let native_dir = paths
         .runtime_binary
@@ -225,7 +235,7 @@ fn install(paths: &InstallPaths) -> Result<Value, String> {
     }))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn status(paths: &InstallPaths) -> Value {
     let runtime_binary_ok = is_regular_executable(&paths.runtime_binary);
     let wrapper_ok = wrapper_is_rust(&paths.wrapper);
@@ -265,7 +275,7 @@ fn status(paths: &InstallPaths) -> Value {
     })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn uninstall(paths: &InstallPaths) -> Result<Value, String> {
     let mut removed = Vec::new();
     let mut skipped = Vec::new();
@@ -317,7 +327,7 @@ fn uninstall(paths: &InstallPaths) -> Result<Value, String> {
     }))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn home_dir() -> Result<PathBuf, String> {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
@@ -325,7 +335,7 @@ fn home_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "cannot determine user home directory".to_owned())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn install_targets(home: &Path) -> Vec<(PathBuf, bool)> {
     let app_support = home.join("Library").join("Application Support");
     [
@@ -349,7 +359,7 @@ fn install_targets(home: &Path) -> Vec<(PathBuf, bool)> {
     .collect()
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn find_registered_origin(
     targets: &[(PathBuf, bool)],
     wrapper: &Path,
@@ -387,7 +397,7 @@ fn find_registered_origin(
     Ok(origins.into_iter().next())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn extension_id_from_origin(origin: &str) -> Option<String> {
     let id = origin
         .strip_prefix("chrome-extension://")?
@@ -395,7 +405,7 @@ fn extension_id_from_origin(origin: &str) -> Option<String> {
     (id.len() == 32 && id.bytes().all(|byte| (b'a'..=b'p').contains(&byte))).then(|| id.to_owned())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn wrapper_body(paths: &InstallPaths) -> String {
     format!(
         "#!/bin/sh\n{WRAPPER_MARKER}\nexport HERDR_EXTENSION_ORIGIN={}\nexec {} extension-host \"$@\"\n",
@@ -404,7 +414,7 @@ fn wrapper_body(paths: &InstallPaths) -> String {
     )
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn manifest_value(paths: &InstallPaths) -> Value {
     json!({
         "name": HOST_NAME,
@@ -415,7 +425,7 @@ fn manifest_value(paths: &InstallPaths) -> Value {
     })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn manifest_status(path: &Path, paths: &InstallPaths) -> Value {
     let raw = match fs::read(path) {
         Ok(raw) if raw.len() <= 64 * 1024 => raw,
@@ -453,7 +463,7 @@ fn manifest_status(path: &Path, paths: &InstallPaths) -> Value {
     })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn ensure_secure_dir(path: &Path) -> Result<(), String> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -478,7 +488,7 @@ fn ensure_secure_dir(path: &Path) -> Result<(), String> {
     })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn atomic_copy_executable(source: &Path, target: &Path) -> Result<(), String> {
     if source == target
         || (source.canonicalize().ok().is_some()
@@ -527,7 +537,7 @@ fn atomic_copy_executable(source: &Path, target: &Path) -> Result<(), String> {
     result
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     reject_symlink_target(path)?;
     let temp = temporary_sibling(path);
@@ -552,7 +562,7 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     result
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn reject_symlink_target(path: &Path) -> Result<(), String> {
     if let Ok(metadata) = fs::symlink_metadata(path)
         && metadata.file_type().is_symlink()
@@ -565,7 +575,7 @@ fn reject_symlink_target(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn temporary_sibling(path: &Path) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -578,12 +588,12 @@ fn temporary_sibling(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.tmp-{:x}-{nonce:x}", std::process::id()))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn is_regular_executable(path: &Path) -> bool {
     fs::symlink_metadata(path).ok().is_some_and(|metadata| {
         !metadata.file_type().is_symlink()
@@ -592,7 +602,7 @@ fn is_regular_executable(path: &Path) -> bool {
     })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn wrapper_is_rust(path: &Path) -> bool {
     if fs::symlink_metadata(path)
         .ok()
@@ -606,12 +616,12 @@ fn wrapper_is_rust(path: &Path) -> bool {
         .is_some_and(|content| content.contains(WRAPPER_MARKER))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn path_present(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn file_sha256(path: &Path) -> Result<String, String> {
     let mut file =
         fs::File::open(path).map_err(|error| format!("cannot hash {}: {error}", path.display()))?;
@@ -629,7 +639,7 @@ fn file_sha256(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};

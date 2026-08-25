@@ -1,5 +1,7 @@
 use crate::paths::RuntimePaths;
-use rusqlite::{Connection, OptionalExtension, params};
+#[cfg(any(target_os = "macos", test))]
+use rusqlite::params;
+use rusqlite::{Connection, OptionalExtension};
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 use std::time::Duration;
@@ -73,6 +75,7 @@ impl UpdateStore {
         read_schema_version(&self.conn)
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn create_update_job(&self, record: &UpdateJobRecord) -> Result<(), String> {
         self.conn
             .execute(
@@ -98,6 +101,7 @@ impl UpdateStore {
         Ok(())
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn update_update_job(
         &self,
         job_id: &str,
@@ -129,6 +133,7 @@ impl UpdateStore {
         }
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn set_update_worker_pid(
         &self,
         job_id: &str,
@@ -151,6 +156,7 @@ impl UpdateStore {
         }
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub fn update_job(&self, job_id: &str) -> Result<Option<UpdateJobRecord>, String> {
         self.conn
             .query_row(
@@ -177,6 +183,7 @@ impl UpdateStore {
             .map_err(|error| format!("cannot read latest update job: {error}"))
     }
 
+    #[cfg(target_os = "macos")]
     pub fn active_update_job(&self) -> Result<Option<UpdateJobRecord>, String> {
         self.conn
             .query_row(
@@ -307,6 +314,7 @@ fn decode_update_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<UpdateJobRecor
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn bounded_detail(value: Option<&str>) -> Option<String> {
     value.map(|value| {
         let mut text = value.to_owned();

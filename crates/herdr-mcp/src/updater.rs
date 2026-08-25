@@ -6,27 +6,39 @@
 //! worker. The worker reuses `service install`, which already owns generation
 //! staging, health verification, automatic rollback, and service evidence.
 
-use crate::cli::{ServiceCommand, UpdateCommand};
+#[cfg(target_os = "macos")]
+use crate::cli::ServiceCommand;
+use crate::cli::UpdateCommand;
 use crate::contract;
 use crate::paths::RuntimePaths;
+#[cfg(target_os = "macos")]
 use crate::service_manager;
 use crate::state_store::SCHEMA_VERSION;
 use crate::updater_store::{UpdateJobRecord, UpdateStore};
 use reqwest::blocking::{Client, Response};
 use semver::Version;
 use serde_json::{Value, json};
+#[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
 use std::env;
+#[cfg(target_os = "macos")]
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(target_os = "macos")]
+use std::io::Write;
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::ExitCode;
+#[cfg(target_os = "macos")]
+use std::process::{Command, Stdio};
+use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use std::os::unix::process::CommandExt;
 
 const DEFAULT_MANIFEST_URL: &str =
@@ -83,7 +95,7 @@ fn apply(manifest_override: Option<&str>) -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = manifest_override;
-        return Err("native update apply currently requires macOS service manager".to_owned());
+        Err("native update apply currently requires macOS service manager".to_owned())
     }
 
     #[cfg(target_os = "macos")]
@@ -181,7 +193,7 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = job_id;
-        return Err("native update worker currently requires macOS service manager".to_owned());
+        Err("native update worker currently requires macOS service manager".to_owned())
     }
 
     #[cfg(target_os = "macos")]
@@ -381,6 +393,7 @@ fn recover_or_reject_active_update(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn stage_release(paths: &RuntimePaths, plan: &ReleasePlan) -> Result<(String, PathBuf), String> {
     let root = paths.config_dir.join("update").join("jobs");
     ensure_real_dir(&paths.config_dir)?;
@@ -411,6 +424,7 @@ fn stage_release(paths: &RuntimePaths, plan: &ReleasePlan) -> Result<(String, Pa
     Ok((job_id, binary))
 }
 
+#[cfg(target_os = "macos")]
 fn download_asset(client: &Client, asset: &ReleaseAsset, target: &Path) -> Result<(), String> {
     let mut response = client
         .get(asset.url.clone())
@@ -477,6 +491,7 @@ fn download_asset(client: &Client, asset: &ReleaseAsset, target: &Path) -> Resul
     result
 }
 
+#[cfg(target_os = "macos")]
 fn verify_staged_file(path: &Path, expected_sha256: &str) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect staged update binary: {error}"))?;
@@ -508,6 +523,7 @@ fn verify_staged_file(path: &Path, expected_sha256: &str) -> Result<(), String> 
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn probe_candidate_binary(path: &Path, expected: &Version) -> Result<(), String> {
     let output = Command::new(path)
         .arg("version")
@@ -668,6 +684,7 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn valid_job_id(value: &str) -> bool {
     (8..=96).contains(&value.len())
         && value
@@ -675,12 +692,14 @@ fn valid_job_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
+#[cfg(target_os = "macos")]
 fn binary_is_confined(paths: &RuntimePaths, binary: &Path, job_id: &str) -> bool {
     binary
         .parent()
         .is_some_and(|parent| parent == paths.config_dir.join("update").join("jobs").join(job_id))
 }
 
+#[cfg(target_os = "macos")]
 fn ensure_real_dir(path: &Path) -> Result<(), String> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -696,6 +715,7 @@ fn ensure_real_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn cleanup_staging(binary: &Path) {
     let parent = binary.parent().map(Path::to_path_buf);
     let _ = fs::remove_file(binary);
@@ -713,6 +733,7 @@ fn process_alive(pid: u32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+#[cfg(target_os = "macos")]
 fn now_ms_i64() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
