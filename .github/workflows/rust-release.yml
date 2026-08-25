@@ -122,8 +122,30 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
-  publish:
+  attest:
     needs: manifest
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-release-bundle
+          path: release-assets
+      - name: Attest GitHub Release assets
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            release-assets/herdr-mcp-*
+            release-assets/release-manifest.json
+
+  publish:
+    needs: attest
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
