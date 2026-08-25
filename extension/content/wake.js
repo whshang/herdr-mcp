@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.61";
+const H2W_CONTENT_VERSION = "0.1.62";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -1013,6 +1013,41 @@ const H2W_CONTENT_VERSION = "0.1.61";
     return match ? decodeURIComponent(match[1]) : null;
   }
 
+  function chatGptCurrentConversationAnchor() {
+    const conversationId = chatGptConversationId();
+    if (!conversationId || ADAPTER.name !== "chatgpt") return null;
+    const anchors = [...document.querySelectorAll('a[href*="/c/"]')];
+    const matchesConversation = (anchor) => {
+      try {
+        const url = new URL(anchor.href, location.href);
+        const match = url.pathname.match(/\/c\/([^/?#]+)/);
+        return match && decodeURIComponent(match[1]) === conversationId;
+      } catch (_) {
+        return false;
+      }
+    };
+    return anchors.find((anchor) => matchesConversation(anchor) && anchor.getAttribute("aria-label"))
+      || anchors.find((anchor) => matchesConversation(anchor))
+      || null;
+  }
+
+  function chatGptDomConversationTitle() {
+    const anchor = chatGptCurrentConversationAnchor();
+    if (!anchor) return "";
+    const title = normText(anchor.innerText || anchor.textContent || "");
+    if (!title || title.length > 160) return "";
+    if (/^(跳至内容|skip to content|コンテンツへスキップ)$/i.test(title)) return "";
+    return title;
+  }
+
+  function chatGptDomProjectTitle() {
+    const anchor = chatGptCurrentConversationAnchor();
+    const aria = normText(anchor?.getAttribute?.("aria-label") || "");
+    const zh = aria.match(/[—–-]\s*项目\s+(.+?)\s+中的聊天\s*$/);
+    if (zh?.[1]) return normText(zh[1]);
+    return "";
+  }
+
   function latestDomAssistantSnapshot() {
     const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
     const el = nodes[nodes.length - 1] || null;
@@ -1710,8 +1745,13 @@ const H2W_CONTENT_VERSION = "0.1.61";
   function syncDocumentTitle(hud, state) {
     captureNativeConversationTitle();
     const status = hudLabels?.states?.[state] || state || hudLabels?.states?.unknown || "unknown";
-    const project = hud?.workspace_label || hud?.workspace_id || hudLabels?.states?.unbound || "unbound";
-    const conversation = nativeConversationTitle || ADAPTER.name || "conversation";
+    const project = chatGptDomProjectTitle()
+      || hud?.active_workspace_label
+      || hud?.workspace_label
+      || hud?.workspace_id
+      || hudLabels?.states?.unbound
+      || "unbound";
+    const conversation = chatGptDomConversationTitle() || nativeConversationTitle || ADAPTER.name || "conversation";
     const next = [status, project, conversation].map((value) => normText(value)).filter(Boolean).join("-");
     titleSnapshot = { hud, state };
     if (!next || document.title === next) {
