@@ -35,7 +35,7 @@ The browser extension does not replace ChatGPT, Herdr or the local worker. It do
 
 Its job is narrower:
 
-- bind a browser conversation to a Herdr workspace;
+- bind a browser scope to a Herdr workspace — a stable ChatGPT Project where available, otherwise a concrete conversation;
 - observe local progress and settled state;
 - feed useful progress back into the right conversation;
 - recover a browser view that stalled or lost part of a response;
@@ -58,7 +58,7 @@ workspace: my-project
 
 Binding the browser to one agent would lose the rest of the project state. A workspace is the better unit of continuity because it represents the complete local work area.
 
-The binding stores the stable workspace identity; the label is only presentation data and can be refreshed from the live workspace catalog.
+The binding stores the stable workspace identity; the label is only presentation data and can be refreshed from the live workspace catalog. ChatGPT adds one more level: a Project binding is keyed by stable `project_id`, while `active_conv_key` points at the concrete conversation that should receive messages. This lets the user bind from the Project home before creating a chat and lets rollover keep the binding itself stable.
 
 ## Progress and settled events
 
@@ -103,7 +103,7 @@ The extension therefore supports semantic handoff:
 2. a fresh conversation is opened in the same Project where supported;
 3. the packet is submitted as the seed message;
 4. the extension verifies that the new conversation really exists and contains the seed;
-5. only then is the workspace binding moved to the new conversation.
+5. only then is the delivery target switched to the new conversation. On ChatGPT Projects the Project/workspace binding and continuity id stay in place; conversation-scoped sites still migrate their binding after confirmation.
 
 The handoff packet describes established work state. It is not proof that runtime state is still unchanged. The new conversation must re-inspect Herdr, Git and relevant services before mutation.
 

@@ -66,7 +66,7 @@ bin/herdr-extension-host install
 
 3. 在 Chrome 加载 `extension/`。
 4. 打开 ChatGPT、z.ai、DeepSeek 等支持站点。
-5. 在 popup 中绑定一个 Herdr workspace。
+5. 在 popup/HUD 中绑定一个 Herdr workspace。ChatGPT 可以直接在根首页、Project 首页或具体 conversation 上绑定；Project 不需要先创建 `/c/<id>`。
 
 绑定单位是 workspace，不是单个 agent。
 
@@ -81,6 +81,8 @@ workspace
 ```
 
 整个工作现场才是连续性的对象。
+
+对于 ChatGPT Project，持久 binding 以稳定 `project_id` 为身份，而不是绑定某一个 conversation id。因此可以在 Project 首页先完成绑定。当前真正激活的 Project `/c/<id>` 只是 progress/continue 的**投递目标**（`active_conv_key`）；后台打开 sibling conversation 不会迁移 binding，只有实际激活对应 tab 才切换 delivery target。在 `https://chatgpt.com/` 根首页建立的 binding 则是当前 tab 的 provisional 状态，等该 tab 第一次进入具体 Project 或 conversation 后再一次性归位。
 
 ## HUD 操作
 
@@ -157,10 +159,10 @@ workspace
  ↓
 确认 seed 成功
  ↓
-迁移 workspace binding
+切换 active delivery target
 ```
 
-接力摘要记录的是历史工作状态，不是实时运行证明。新会话仍需要重新检查 Herdr、Git 和运行环境。
+对 ChatGPT Project 来说，Project/workspace binding 与 `continuity_id` 在接力期间始终不变。旧 `active_conv_key` 一直是权威，直到新 conversation 与 seed 都确认成功；此后只切换投递目标。z.ai 等会话级站点仍在确认后迁移具体 conversation binding。接力摘要记录的是历史工作状态，不是实时运行证明。新会话仍需要重新检查 Herdr、Git 和运行环境。
 
 ## B：JSON → MCP bridge
 

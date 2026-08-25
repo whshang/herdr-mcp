@@ -4,9 +4,9 @@
 
 先读 [浏览器连续工作](browser-continuity.md) 理解为什么需要反向通道；安装和 HUD 使用见 [浏览器扩展](extension.md)。
 
-## 基本模型：绑定一个会话到一个 workspace
+## 基本模型：绑定 Project / 会话到一个 workspace
 
-扩展把当前网页会话绑定到 Herdr **workspace**，不是某一个 Agent。
+扩展把网页作用域绑定到 Herdr **workspace**，不是某一个 Agent。普通站点以具体 conversation 为作用域；ChatGPT Project 则以稳定 `project_id` 为作用域。
 
 ```text
 ChatGPT Project conversation
@@ -21,6 +21,8 @@ Herdr workspace
 ```
 
 这样，网页端关注的是完整任务现场，而不是某个单独进程。`workspace_id` 是稳定身份；label 只用于显示，会从实时 catalog 修正。
+
+0.1.59 起，ChatGPT 可以直接在 `https://chatgpt.com/g/<project>/project` 上建立 Project binding，不需要先有 conversation；具体激活的 `/c/<id>` 只记录为 `active_conv_key` 投递目标。`https://chatgpt.com/` 根首页还可以保存当前 tab 的 pending binding，等这个 tab 首次进入具体 Project/conversation 后再一次性迁移。根首页与 Project 首页只提供绑定/Auto 等作用域控制，不运行需要 conversation composer 的手动继续、LLM、恢复或 rollover。
 
 ## 状态回推：working、progress、settled
 
@@ -206,14 +208,14 @@ ChatGPT 还会虚拟化旧 DOM，所以“当前页面只挂着 5 条消息”�
         ▼
 确认新 conversation id + seed marker
         │
-        └── 确认成功后才迁移 workspace binding
+        └── 确认成功后才切换 Project active_conv_key
 ```
 
-关键规则：**旧 binding 在 cutover 前始终是权威。**
+关键规则：**Project/workspace binding 与 `continuity_id` 始终不变，旧 active conversation 在 cutover 前始终是权威。** z.ai 仍是 conversation-scoped，只有 seed 确认后才迁移它的具体 binding。
 
-打开一个新 tab 不算成功；尝试发送 seed 也不算成功。必须确认新的 conversation identity 和 seed marker 真正存在，才迁移 binding。
+打开一个新 tab 不算成功；尝试发送 seed 也不算成功。必须确认新的 conversation identity 和 seed marker 真正存在，ChatGPT 才切换 `active_conv_key`；会话级站点才迁移 binding。
 
-如果 seed delivery 不确定，则保留旧 binding，并记录可恢复状态。后续显式“恢复接力”先探测目标 conversation：seed 已存在就完成 cutover，不存在才重新尝试。
+如果 seed delivery 不确定，则保留旧 active target，并记录可恢复状态。后续显式“恢复接力”先探测目标 conversation：seed 已存在就完成 cutover，不存在才重新尝试。
 
 ## handoff packet 应该包含什么
 
@@ -239,7 +241,7 @@ ChatGPT 还会虚拟化旧 DOM，所以“当前页面只挂着 5 条消息”�
 - 当前工作已经到自然边界；
 - 想主动在状态还清晰时换到新会话。
 
-当前支持已绑定的 ChatGPT Project，以及稳定 `/c/<chat_id>` 的 z.ai 会话。手动接力在当前作用域 `自动 开` 或 `自动 关` 时都可以启动；新目标会话继承源会话的 Auto 状态。接力期间源会话的自动 wake 暂停，workspace 仍有 working Agent 时则拒绝开始，避免 settled/wake 与 binding cutover 竞争。
+当前支持已绑定的 ChatGPT Project，以及稳定 `/c/<chat_id>` 的 z.ai 会话。手动接力在当前作用域 `自动 开` 或 `自动 关` 时都可以启动；新目标会话继承源会话的 Auto 状态。ChatGPT 接力只切换 Project binding 的 active target；z.ai 才迁移会话级 binding。接力期间源会话的自动 wake 暂停，workspace 仍有 working Agent 时则拒绝开始，避免 settled/wake 与 cutover 竞争。
 
 z.ai 的 handoff 控制消息走 raw channel，不经过 JSON→MCP task wrapper，避免摘要请求被误解释成 coding task。
 
@@ -255,13 +257,13 @@ z.ai 的 handoff 控制消息走 raw channel，不经过 JSON→MCP task wrapper
 
 建议用一条真实长任务验证：
 
-1. 当前网页会话绑定一个 Herdr workspace；
+1. 当前网页作用域绑定一个 Herdr workspace；ChatGPT Project 要分别确认稳定 Project binding 与当前 active conversation target；
 2. 打开对应作用域 Auto；
 3. 从网页派一个会持续一段时间的 Agent 任务；
 4. 确认 working 后 HUD 状态变化；
 5. 有真实新输出时收到 progress；
 6. workspace settled 后网页重新继续；
-7. 故意关闭/刷新页面后，binding 仍指向正确 conversation；
-8. 需要时测试手动 handoff，确认新会话 seed 存在后 binding 才迁移。
+7. 故意关闭/刷新页面后，binding 仍指向正确作用域，active target 仍是预期 conversation；
+8. 需要时测试手动 handoff：确认新会话 seed 存在后，ChatGPT Project 才切换 active target；conversation-scoped 站点才迁移 binding。
 
 测试命令和实现级细节保留在仓库测试与 [CHANGELOG](../../../CHANGELOG.md)，本页只描述当前产品行为。

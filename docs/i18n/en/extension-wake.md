@@ -4,9 +4,9 @@ This page describes the browser continuity state machine: how the extension wake
 
 Read [Browser Continuity](browser-continuity.md) first for the architectural motivation. Installation and HUD usage are covered in [Browser Extension](extension.md).
 
-## Bind a conversation to a workspace
+## Bind a Project or conversation to a workspace
 
-Continuity binds a browser conversation to a Herdr **workspace**, not to a single agent.
+Continuity binds a browser scope to a Herdr **workspace**, not to a single agent. For normal conversations that scope is the conversation itself. For ChatGPT Projects it is the stable `project_id`.
 
 ```text
 ChatGPT conversation
@@ -20,6 +20,8 @@ Herdr workspace
 ```
 
 `workspace_id` is the stable identity. The label is presentation metadata and is refreshed from the live catalog.
+
+Since 0.1.59, a ChatGPT workspace can be bound directly from `https://chatgpt.com/g/<project>/project` before any conversation exists. The Project binding persists independently; a concrete active `/c/<id>` becomes only its `active_conv_key` delivery target. `https://chatgpt.com/` can also hold a tab-scoped pending binding which migrates once when that tab first enters a Project or conversation. Root and Project-home pages expose binding controls but do not run conversation-only Continue/LLM/recovery/rollover actions.
 
 ## working, progress and settled
 
@@ -152,10 +154,10 @@ new conversation in the same Project
         ▼
 verify new conversation id + seed marker
         │
-        └── only then move workspace binding
+        └── only then switch Project active_conv_key
 ```
 
-The old binding remains authoritative until the new conversation is verified.
+The Project/workspace binding and `continuity_id` remain stable. The old active conversation remains authoritative until the new conversation is verified. z.ai is still conversation-scoped, so its binding moves only after the target seed is confirmed.
 
 Opening a new tab is not enough. Attempting to send the seed is not enough. If seed delivery is uncertain, the old binding stays in place and the transfer remains recoverable.
 
@@ -177,7 +179,7 @@ It does **not** certify that runtime or Git state is still current. The fresh co
 
 Manual handoff is useful at a natural work boundary before the current conversation becomes difficult to manage.
 
-It is supported for bound ChatGPT Project conversations and stable z.ai `/c/<chat_id>` conversations. Manual handoff can start with Auto on or off; the target conversation inherits the source Auto state. Automatic wakes from the source pause while the transfer is active. The workspace must not have active working agents, so settled/wake delivery cannot race the binding cutover.
+It is supported for bound ChatGPT Project conversations and stable z.ai `/c/<chat_id>` conversations. Manual handoff can start with Auto on or off; the target conversation inherits the source Auto state. Automatic wakes from the source pause while the transfer is active. For ChatGPT, cutover changes only the Project binding's active conversation target; for z.ai it migrates the conversation-scoped binding. The workspace must not have active working agents, so settled/wake delivery cannot race the cutover.
 
 z.ai summary/seed control messages use a raw channel so they are not wrapped again as JSON→MCP coding tasks.
 
@@ -191,12 +193,12 @@ The intended progression is: **observe first, then automate.**
 
 A meaningful UAT should verify:
 
-1. the browser conversation is bound to the intended workspace;
+1. the intended browser scope is bound to the intended workspace; for ChatGPT Projects, verify the stable Project binding and its active conversation target separately;
 2. Auto is enabled for the right scope;
 3. a real agent task enters working;
 4. new output produces a progress wake without spam;
 5. workspace settle wakes the Web planner;
 6. reload/browser restart preserves the correct binding;
-7. an explicit manual handoff moves the binding only after the new seed is verified.
+7. an explicit manual handoff changes the ChatGPT Project active target only after the new seed is verified (or migrates the binding after confirmation on conversation-scoped sites).
 
 Implementation history belongs in [CHANGELOG](../../../CHANGELOG.md). This page describes current behavior.
