@@ -130,6 +130,31 @@ export function extractHandoffPacket(text, transferId) {
   return packet;
 }
 
+/**
+ * Classify an assistant body observed while a handoff summary is pending.
+ * ChatGPT can report the previous settled assistant body again immediately
+ * after the handoff user message is submitted but before the new turn starts.
+ */
+export function classifyHandoffAssistantReply({
+  text,
+  transferId,
+  sourceAssistantFingerprint = null,
+  currentAssistantFingerprint = null,
+} = {}) {
+  const body = String(text || "").trim();
+  const packet = extractHandoffPacket(body, transferId);
+  if (packet) return { kind: "packet", packet };
+  if (!body) return { kind: "pending", packet: null };
+  if (
+    sourceAssistantFingerprint
+    && currentAssistantFingerprint
+    && sourceAssistantFingerprint === currentAssistantFingerprint
+  ) {
+    return { kind: "stale_source", packet: null };
+  }
+  return { kind: "invalid", packet: null };
+}
+
 /** Build the first user message in the NEW conversation. */
 export function buildHandoffSeed({ transferId, packet, template = null } = {}) {
   const id = String(transferId || "").trim();

@@ -24,7 +24,7 @@ import {
 } from "../../extension/binding-core.js";
 import {
   buildHandoffRequest, buildHandoffSeed, chatGptConversationInfo,
-  extractHandoffPacket, handoffSeedContainsTransfer,
+  classifyHandoffAssistantReply, extractHandoffPacket, handoffSeedContainsTransfer,
   newContinuityId, newTransferId,
 } from "../../extension/continuity-core.js";
 
@@ -59,9 +59,9 @@ const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
-ok(manifest.version === "0.1.54", "manifest version includes virtualized-history context-pressure recovery");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.54"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.54"'), "content version matches manifest");
+ok(manifest.version === "0.1.55", "manifest version includes recoverable ChatGPT handoff-summary race handling");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.55"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.55"'), "content version matches manifest");
 ok(backgroundSource.includes("sendResponse({ ok: true, ...automationScopeForConversation(convKey) });")
     && backgroundSource.includes("void notifyAutomationChanged();")
     && wakeSource.includes("finally {\n      setHudActionBusy(false);"),
@@ -327,11 +327,37 @@ console.log("\n[conversation continuity]");
   const packet = extractHandoffPacket(assistant, transferId);
   ok(!!packet && packet.includes("Current objective"), "handoff packet extracts the marked assistant payload");
   ok(extractHandoffPacket(assistant, "ht:wrong") === null, "handoff packet rejects a mismatched transfer id");
+  ok(classifyHandoffAssistantReply({
+    text: "the previous assistant reply",
+    transferId,
+    sourceAssistantFingerprint: "fp-old",
+    currentAssistantFingerprint: "fp-old",
+  }).kind === "stale_source", "handoff ignores the pre-summary assistant body instead of failing the transfer");
+  ok(classifyHandoffAssistantReply({
+    text: assistant,
+    transferId,
+    sourceAssistantFingerprint: "fp-old",
+    currentAssistantFingerprint: "fp-new",
+  }).kind === "packet", "handoff accepts the first new assistant body when it contains the transfer packet");
+  ok(classifyHandoffAssistantReply({
+    text: "a genuinely new reply without the requested transfer marker",
+    transferId,
+    sourceAssistantFingerprint: "fp-old",
+    currentAssistantFingerprint: "fp-new",
+  }).kind === "invalid", "handoff still rejects a genuinely new malformed summary reply");
   const seed = buildHandoffSeed({ transferId, packet });
   ok(handoffSeedContainsTransfer(seed, transferId), "new-conversation seed carries the transfer marker");
   ok(seed.includes("开始任何 mutation 前，重新检查相关的 Herdr/runtime/Git 状态"),
     "seed requires live-state verification before mutations");
 }
+
+ok(
+  backgroundSource.includes("source_assistant_fp")
+    && backgroundSource.includes("recoverableFailedTransferFromSource")
+    && backgroundSource.includes("recoverExistingHandoffPacket")
+    && backgroundSource.includes("classifyHandoffAssistantReply"),
+  "handoff summary race is guarded and a late valid packet can recover a failed transfer",
+);
 
 ok(
   backgroundSource.includes("conversationInfoForTab(msg.tabId)")

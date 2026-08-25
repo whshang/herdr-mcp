@@ -95,6 +95,12 @@ ChatGPT 长对话不会把全部历史消息长期留在 DOM。真实 UAT 中，
 
 因此自动接力现在对“工具调用很多但可见正文不长”的 Herdr 会话也能提前动作，不再要求可见文本自己先堆到接近整个模型窗口。
 
+### ChatGPT handoff 摘要 race 恢复（0.1.55）
+
+真实自动接力 UAT 在第 51 条消息触发后暴露出一个时序 race：扩展提交 handoff 请求后，ChatGPT 可能先发出一次 `turn_ended`，但此时页面仍暴露的是**上一条 assistant 正文**；旧版本会立刻把这段没有 transfer marker 的旧正文判成 `handoff_packet_invalid`，而真正的 `<<<HERDR_HANDOFF_V1 ...>>>` 摘要随后才生成。
+
+0.1.55 在发起 handoff 前只保存旧 assistant 的短 fingerprint，不保存正文；如果 summary pending 期间再次观察到同一 fingerprint，就按 stale source turn 忽略并继续等待。只有出现了新的 assistant 正文且仍缺少指定 transfer marker 时才判 malformed。若旧版本已经提前把 transfer 标为 `handoff_packet_invalid`，但正确 marker 摘要随后已经落到页面，0.1.55 会优先恢复这份现有 packet，进入 `summary_ready`，不会重新要求模型生成摘要，也不会重复前面的业务任务。
+
 ## 手动接力（0.1.47）
 
 底部 HUD 的 **手动接力**用于主动提前换会话，但必须先把当前会话切到 `自动 关`：

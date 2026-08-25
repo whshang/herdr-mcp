@@ -19,14 +19,14 @@ import {
 } from "./binding-core.js";
 import {
   buildHandoffRequest, buildHandoffSeed, chatGptConversationInfo,
-  extractHandoffPacket, handoffSeedContainsTransfer, handoffStatusIsActive,
+  classifyHandoffAssistantReply, extractHandoffPacket, handoffSeedContainsTransfer, handoffStatusIsActive,
   newContinuityId, newTransferId,
 } from "./continuity-core.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 
-const H2W_SCRIPT_VERSION = "0.1.54";
+const H2W_SCRIPT_VERSION = "0.1.55";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -789,6 +789,20 @@ function activeTransferFromSource(transfers, convKey) {
   let best = null;
   for (const row of Object.values(transfers || {})) {
     if (!row || row.source_conv_key !== convKey || !handoffStatusIsActive(row.status)) continue;
+    if (!best || Number(row.updated_at || row.created_at || 0) > Number(best.updated_at || best.created_at || 0)) best = row;
+  }
+  return best;
+}
+
+function recoverableFailedTransferFromSource(transfers, convKey) {
+  let best = null;
+  for (const row of Object.values(transfers || {})) {
+    if (
+      !row
+      || row.source_conv_key !== convKey
+      || row.status !== "failed"
+      || row.error !== "handoff_packet_invalid"
+    ) continue;
     if (!best || Number(row.updated_at || row.created_at || 0) > Number(best.updated_at || best.created_at || 0)) best = row;
   }
   return best;
@@ -2024,18 +2038,42 @@ function handoffRequestTemplateForSite(site) {
 async function acceptImmediateHandoffSummary(transfer, result) {
   const assistantText = String(result?.assistantText || "").trim();
   if (!assistantText) return { ok: true, pending: true, handoff: handoffView(transfer) };
-  const packet = extractHandoffPacket(assistantText, transfer.id);
-  if (!packet) {
+  const disposition = classifyHandoffAssistantReply({
+    text: assistantText,
+    transferId: transfer.id,
+    sourceAssistantFingerprint: transfer.source_assistant_fp || null,
+    currentAssistantFingerprint: assistantNudgeFingerprint(assistantText),
+  });
+  if (disposition.kind === "pending" || disposition.kind === "stale_source") {
+    return { ok: true, pending: true, handoff: handoffView(transfer) };
+  }
+  if (disposition.kind !== "packet") {
     const failed = await markTransfer(transfer.id, { status: "failed", error: "handoff_packet_invalid" });
     return { ok: false, error: "handoff_packet_invalid", handoff: handoffView(failed) };
   }
+  const ready = await markTransfer(transfer.id, {
+    status: "summary_ready",
+    handoff_text: disposition.packet,
+    error: null,
+  });
+  setTimeout(() => { void launchHandoffTarget(transfer.id); }, 0);
+  return { ok: true, pending: true, handoff: handoffView(ready) };
+}
+
+async function recoverExistingHandoffPacket(transfer) {
+  const tabId = transfer?.source_tab_id;
+  if (!tabId || !(await tabStillExists(tabId))) return null;
+  let snapshot = null;
+  try { snapshot = await sendHandoffTabMessage(tabId, transfer.site || "chatgpt", { type: "h2w_snapshot_turn" }); } catch (_) {}
+  const packet = extractHandoffPacket(snapshot?.assistantText, transfer.id);
+  if (!packet) return null;
   const ready = await markTransfer(transfer.id, {
     status: "summary_ready",
     handoff_text: packet,
     error: null,
   });
   setTimeout(() => { void launchHandoffTarget(transfer.id); }, 0);
-  return { ok: true, pending: true, handoff: handoffView(ready) };
+  return { ok: true, pending: true, recovered: true, handoff: handoffView(ready) };
 }
 
 async function resumeSummaryRequested(transfer) {
@@ -2148,11 +2186,27 @@ async function startHandoffForTab(tabId, trigger = "manual") {
     return { ok: true, pending: true, handoff: handoffView(active) };
   }
 
+  // A valid summary may arrive after an older build prematurely classified the
+  // pre-handoff assistant body as malformed. Recover that exact packet before
+  // creating another transfer or submitting another summary request.
+  const recoverableFailed = recoverableFailedTransferFromSource(transfers, convInfo.convKey);
+  if (recoverableFailed) {
+    const recovered = await recoverExistingHandoffPacket(recoverableFailed);
+    if (recovered) return recovered;
+  }
+
   const chainIds = [...new Set(session.map((b) => b.continuity_id).filter(Boolean))];
   if (chainIds.length > 1) return { ok: false, error: "binding_continuity_conflict" };
   const now = Date.now();
   const transferId = newTransferId(now);
   const continuityId = chainIds[0] || newContinuityId(now);
+  let sourceAssistantFp = null;
+  try {
+    const snapshot = await sendHandoffTabMessage(tabId, convInfo.site, { type: "h2w_snapshot_turn" });
+    if (String(snapshot?.assistantText || "").trim()) {
+      sourceAssistantFp = assistantNudgeFingerprint(snapshot.assistantText);
+    }
+  } catch (_) {}
   const row = {
     version: 1,
     id: transferId,
@@ -2166,6 +2220,7 @@ async function startHandoffForTab(tabId, trigger = "manual") {
     project_launch_url: convInfo.project_launch_url,
     handoff_launch_url: convInfo.handoff_launch_url,
     source_bindings: transferSourceSnapshot(session),
+    source_assistant_fp: sourceAssistantFp,
     handoff_text: null,
     target_tab_id: null,
     target_conv_key: null,
@@ -2208,14 +2263,29 @@ async function handleHandoffTurnEnded(msg) {
     .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0));
   const transfer = candidates[0];
   if (!transfer) return { handled: false };
-  const packet = extractHandoffPacket(msg.assistantText, transfer.id);
-  if (!packet) {
+  const assistantText = String(msg.assistantText || "").trim();
+  const disposition = classifyHandoffAssistantReply({
+    text: assistantText,
+    transferId: transfer.id,
+    sourceAssistantFingerprint: transfer.source_assistant_fp || null,
+    currentAssistantFingerprint: assistantNudgeFingerprint(assistantText),
+  });
+  if (disposition.kind === "pending" || disposition.kind === "stale_source") {
+    return {
+      handled: true,
+      ok: true,
+      pending: true,
+      stale: disposition.kind === "stale_source",
+      handoff: handoffView(transfer),
+    };
+  }
+  if (disposition.kind !== "packet") {
     const failed = await markTransfer(transfer.id, { status: "failed", error: "handoff_packet_invalid" });
     return { handled: true, ok: false, error: "handoff_packet_invalid", handoff: handoffView(failed) };
   }
   const ready = await markTransfer(transfer.id, {
     status: "summary_ready",
-    handoff_text: packet,
+    handoff_text: disposition.packet,
     error: null,
   });
   setTimeout(() => { void launchHandoffTarget(transfer.id); }, 0);

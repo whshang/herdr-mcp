@@ -95,6 +95,12 @@ ChatGPT does not keep an entire long conversation mounted in the DOM. In real UA
 
 This lets tool-heavy Herdr conversations roll over before visible prose alone approaches the nominal model window.
 
+### ChatGPT handoff-summary race recovery (0.1.55)
+
+Live automatic-rollover UAT exposed a timing race immediately after the 51st observed message. After the extension submits the handoff request, ChatGPT can emit a `turn_ended` notification while the page still exposes the **previous assistant body**. Older builds treated that stale body, which naturally had no transfer marker, as the new summary and failed the transfer with `handoff_packet_invalid`; the real `<<<HERDR_HANDOFF_V1 ...>>>` packet arrived afterward.
+
+0.1.55 stores only a short fingerprint of the pre-handoff assistant body, never that body itself. While the summary is pending, the same fingerprint is treated as a stale source turn and ignored. A genuinely new assistant body without the requested transfer marker is still rejected as malformed. If an older build already marked the transfer `handoff_packet_invalid` but the correctly marked packet later appeared on the source page, 0.1.55 recovers that existing packet into `summary_ready` before creating another transfer, so it does not ask the model to summarize twice or replay the preceding business work.
+
 ## Manual handoff (0.1.47)
 
 The bottom-HUD **Manual handoff** action lets the user roll over early, but the current conversation must first be switched to `Auto off`:
