@@ -25,10 +25,23 @@ jobs:
       - run: cargo test --workspace
       - run: npm ci
       - run: npm run build
+      - name: Build documentation site
+        run: npm run build:site
+      - name: Start Herdr runtime (pinned, headless)
+        run: scripts/ci-herdr-runtime.sh start
       - run: npm test
       - run: npm run test:edge
-      - run: npm run build:site
-      - run: node tests/manual/extension_smoke.mjs
+      - name: Browser extension smoke
+        run: node tests/manual/extension_smoke.mjs
+      - name: Shell syntax
+        run: bash -n bin/herdr-mcp bin/watchdog.sh bin/lib/i18n.sh scripts/ci-herdr-runtime.sh
+      - name: Package surface
+        run: npm pack --dry-run
+      - name: Diff hygiene
+        run: git diff --check
+      - name: Stop Herdr runtime
+        if: always()
+        run: scripts/ci-herdr-runtime.sh stop
 
   build:
     needs: verify
