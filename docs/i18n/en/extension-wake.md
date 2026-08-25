@@ -83,6 +83,10 @@ When ChatGPT itself renders the thread error card with `data-testid="regenerate-
 
 So a hard refresh is a **second-stage recovery**, not the first response to every send-timeout card.
 
+### ChatGPT response-stream disconnect recovery (0.1.56)
+
+If an assistant turn has already started but ChatGPT explicitly shows a disconnected-stream placeholder such as `连接已中断。正在等待完整回复` or the equivalent English `connection interrupted / waiting for full response`, the extension no longer treats the still-visible Stop/generating control itself as assistant progress. Only assistant text growth or a changed text signature refreshes `last_assistant_progress_at`. When that disconnect placeholder remains unchanged for 30 seconds and there is no active tool, permission card, or human draft, Auto may perform one safety-gated reload. Reload only reconciles the existing server-side turn; it never resubmits the original user task. If that single reload does not recover the stream, the extension does not blindly create another user turn.
+
 ### ChatGPT virtualized long-history rollover (0.1.54)
 
 ChatGPT does not keep an entire long conversation mounted in the DOM. In real UAT, a Project conversation that had reached `conversation-turn-50` exposed only five user/assistant nodes after reload; a DOM-only counter therefore reset a genuinely long conversation to an apparently short one. 0.1.54 fixes that boundary:

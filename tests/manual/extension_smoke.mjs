@@ -59,9 +59,9 @@ const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
-ok(manifest.version === "0.1.55", "manifest version includes recoverable ChatGPT handoff-summary race handling");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.55"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.55"'), "content version matches manifest");
+ok(manifest.version === "0.1.56", "manifest version includes ChatGPT disconnected-stream recovery");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.56"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.56"'), "content version matches manifest");
 ok(backgroundSource.includes("sendResponse({ ok: true, ...automationScopeForConversation(convKey) });")
     && backgroundSource.includes("void notifyAutomationChanged();")
     && wakeSource.includes("finally {\n      setHudActionBusy(false);"),
@@ -71,6 +71,13 @@ ok(wakeSource.includes('regenerate-thread-error-button')
     && wakeSource.includes("thread_error_server_ahead")
     && wakeSource.includes("thread_error_delivery_unknown"),
   "ChatGPT explicit send-timeout cards retry once or safely reload before generic recovery");
+ok(wakeSource.includes("maybeRecoverDisconnectedReply")
+    && wakeSource.includes("连接已中断")
+    && wakeSource.includes("waiting for (?:the )?full response")
+    && wakeSource.includes("chatgpt_disconnected")
+    && wakeSource.includes("{ ...safety, streaming: false }")
+    && wakeSource.includes("(assistantChanged || curLen > lastAsstLen)"),
+  "ChatGPT disconnected-stream placeholders stop faking progress and allow one bounded reload without resubmitting the user task");
 ok(backgroundSource.includes("idleNudgeInFlight")
     && backgroundSource.includes("assistantDeclaresPendingWork")
     && backgroundSource.includes("scheduleIdleNudgeRetry(convKey, 30000)")

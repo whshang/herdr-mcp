@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.55";
+const H2W_CONTENT_VERSION = "0.1.56";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -960,6 +960,47 @@ const H2W_CONTENT_VERSION = "0.1.55";
     };
   }
 
+  function explicitChatGptDisconnectedReply() {
+    if (ADAPTER.name !== "chatgpt") return null;
+    const text = String(lastMessageByRole("assistant") || "").replace(/\s+/g, " ").trim();
+    if (!text) return null;
+    if (!/(?:连接已中断|正在等待完整回复|connection (?:was )?(?:interrupted|lost)|waiting for (?:the )?full response)/i.test(text)) {
+      return null;
+    }
+    return { text };
+  }
+
+  async function maybeRecoverDisconnectedReply() {
+    if (!automationEnabled || ADAPTER.name !== "chatgpt" || !conversationHealth || !RECOVERY_CONTROLLER || !CONVERSATION_HEALTH) return false;
+    if (!explicitChatGptDisconnectedReply()) return false;
+    const now = Date.now();
+    const lastProgressAt = Number(
+      conversationHealth.last_assistant_progress_at
+      || conversationHealth.reply_started_at
+      || conversationHealth.last_user_submit_at
+      || 0,
+    );
+    if (!lastProgressAt || now - lastProgressAt < RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.assistantStallMs) {
+      return true;
+    }
+    const safety = recoverySafetySnapshot();
+    if (safety.composerBusy || safety.toolRunning || safety.permissionCardActive) return true;
+    if (Number(conversationHealth.reload_attempt || 0) >= 1) return true;
+    // ChatGPT already reports that this response stream is disconnected. One
+    // reload reconciles the existing server-side turn; it never resubmits the
+    // user's potentially side-effecting request, so the stale Stop button must
+    // not block this bounded refresh.
+    if (!RECOVERY_CONTROLLER.canReloadSafely({ ...safety, streaming: false })) return true;
+    markConversationState(CONVERSATION_HEALTH.markReplySuspect(conversationHealth, "chatgpt_disconnected"));
+    markConversationState(CONVERSATION_HEALTH.markReloadPending(conversationHealth));
+    await wait(100);
+    const reloading = RECOVERY_CONTROLLER.markReloaded(conversationHealth);
+    markConversationState({ ...reloading, reload_reason: "chatgpt_disconnected" });
+    await wait(150);
+    location.reload();
+    return true;
+  }
+
   async function maybeRecoverExplicitThreadError() {
     if (!automationEnabled || ADAPTER.name !== "chatgpt" || !conversationHealth || !RECOVERY_CONTROLLER || !CONVERSATION_HEALTH) return false;
     const threadError = explicitChatGptThreadError();
@@ -1269,6 +1310,7 @@ const H2W_CONTENT_VERSION = "0.1.55";
       healthCheckInFlight = true;
       void (async () => {
         if (await maybeRecoverExplicitThreadError()) return;
+        if (await maybeRecoverDisconnectedReply()) return;
         const next = RECOVERY_CONTROLLER.classifyReplyTimeout(conversationHealth);
         if (next !== conversationHealth) markConversationState(next);
         if (await maybeRefreshStaleView()) return;
@@ -1364,7 +1406,7 @@ const H2W_CONTENT_VERSION = "0.1.55";
       const assistantChanged = curLen > 0 && (curSignature !== lastAsstSignature || curCount > lastAsstCount);
 
       if (stopping || assistantChanged || curLen > lastAsstLen) {
-        if (curLen > 0 && (stopping || assistantChanged)) markAssistantProgressIfActive();
+        if (curLen > 0 && (assistantChanged || curLen > lastAsstLen)) markAssistantProgressIfActive();
         if (!generating) {
           generating = true;
           sawGrowth = assistantChanged || curLen > lastAsstLen || stopping;

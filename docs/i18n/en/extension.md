@@ -5,7 +5,7 @@ Language: product UI is en / Simplified Chinese / Japanese (same as herdr); this
 
 | Track | Problem | Direction | Status | First sites |
 |---|---|---|---|---|
-| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + automation gates + safe handoff | **usable** (0.1.55 series) | binding/observation: 4 sites; shared automation: ChatGPT Project; conversation-scoped automation: plain ChatGPT / z.ai / DeepSeek; Manual handoff: ChatGPT Project + z.ai `/c/<chat_id>` |
+| **A. Web work continuity** | web work stalls after dispatch; replies can timeout or freeze halfway; long conversations need a fresh chat | Herdr observation + conversation binding + manual continue + automation gates + safe handoff | **usable** (0.1.56 series) | binding/observation: 4 sites; shared automation: ChatGPT Project; conversation-scoped automation: plain ChatGPT / z.ai / DeepSeek; Manual handoff: ChatGPT Project + z.ai `/c/<chat_id>` |
 | **B. JSON→MCP** | DeepSeek / z.ai web has no MCP Connector | web → extension service worker → Native Messaging host → trusted local `/mcp` IPC | **usable** (bounded `tools/list` / `tools/call` loop) | `chat.deepseek.com`, `chat.z.ai` |
 
 Shared: same extension, same Native Messaging + local Unix IPC transport, same options.
