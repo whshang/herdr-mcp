@@ -20,6 +20,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

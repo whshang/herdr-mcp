@@ -26,6 +26,7 @@ mod schema;
 mod skill;
 mod snapshot;
 mod state_cache;
+mod state_store;
 mod status;
 mod utility_exec;
 mod workstation;
