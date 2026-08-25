@@ -37,21 +37,22 @@ struct SessionRegistry {
 }
 
 impl SessionRegistry {
-    fn issue(&self, boot_id: &str) -> String {
+    fn issue(&self, boot_id: &str) -> Option<String> {
         let id = new_session_id(boot_id);
-        if let Ok(mut sessions) = self.inner.lock() {
-            prune_sessions(&mut sessions);
-            if sessions.len() >= MAX_SESSIONS
-                && let Some(oldest) = sessions
-                    .iter()
-                    .min_by_key(|(_, seen)| **seen)
-                    .map(|(id, _)| id.clone())
-            {
-                sessions.remove(&oldest);
-            }
-            sessions.insert(id.clone(), Instant::now());
+        let Ok(mut sessions) = self.inner.lock() else {
+            return None;
+        };
+        prune_sessions(&mut sessions);
+        if sessions.len() >= MAX_SESSIONS
+            && let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, seen)| **seen)
+                .map(|(id, _)| id.clone())
+        {
+            sessions.remove(&oldest);
         }
-        id
+        sessions.insert(id.clone(), Instant::now());
+        Some(id)
     }
 
     fn contains_touch(&self, id: &str) -> bool {
@@ -351,7 +352,19 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         && request.get("method").and_then(Value::as_str) == Some("initialize")
         && response.get("result").is_some()
     {
-        Some(state.sessions.issue(state.cache.boot_id()))
+        match state.sessions.issue(state.cache.boot_id()) {
+            Some(session) => Some(session),
+            None => {
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32603, "message": "transport session registry unavailable"},
+                        "id": request.get("id").cloned().unwrap_or(Value::Null)
+                    }),
+                );
+            }
+        }
     } else {
         None
     };
@@ -597,13 +610,13 @@ mod tests {
     #[test]
     fn session_registry_is_bounded_and_removable() {
         let sessions = SessionRegistry::default();
-        let first = sessions.issue("boot-test");
+        let first = sessions.issue("boot-test").unwrap();
         assert!(sessions.contains_touch(&first));
         assert!(sessions.remove(&first));
         assert!(!sessions.contains_touch(&first));
 
         for _ in 0..=MAX_SESSIONS {
-            sessions.issue("boot-test");
+            sessions.issue("boot-test").unwrap();
         }
         assert!(sessions.len() <= MAX_SESSIONS);
     }
@@ -850,6 +863,41 @@ mod tests {
 
         drop(second);
         let _ = std::fs::remove_dir_all(second_root);
+    }
+
+    #[tokio::test]
+    async fn openai_sessionless_stress_does_not_allocate_transport_sessions() {
+        let root = test_root("openai-stress");
+        let state = test_state(&root);
+        let sessions = state.sessions.clone();
+        let app = candidate_router(state);
+        for id in 0..100 {
+            let list = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/list",
+                "params": {}
+            });
+            let response = app
+                .clone()
+                .oneshot(rpc_request(
+                    Method::POST,
+                    "/mcp",
+                    Some(list),
+                    &[
+                        ("mcp-session-id", "poison"),
+                        ("user-agent", "openai-mcp/1.0.0"),
+                    ],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().get("mcp-session-id").is_none());
+        }
+        assert_eq!(sessions.len(), 0);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
