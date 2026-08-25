@@ -786,6 +786,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn router_restart_fences_stateful_sid_but_openai_stays_stateless() {
+        let first_root = test_root("restart-first");
+        let first = candidate_router(test_state(&first_root));
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "stateful-restart-test", "version": "1"}
+            }
+        });
+        let response = first
+            .clone()
+            .oneshot(rpc_request(Method::POST, "/mcp", Some(initialize), &[]))
+            .await
+            .unwrap();
+        let stale_session = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        drop(first);
+        let _ = std::fs::remove_dir_all(first_root);
+
+        let second_root = test_root("restart-second");
+        let second = candidate_router(test_state(&second_root));
+        let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
+        let response = second
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(list.clone()),
+                &[
+                    ("mcp-session-id", stale_session.as_str()),
+                    ("user-agent", "claude-connector/1.0"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = second
+            .clone()
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(list),
+                &[
+                    ("mcp-session-id", stale_session.as_str()),
+                    ("user-agent", "openai-mcp/1.0.0"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("mcp-session-id").is_none());
+
+        drop(second);
+        let _ = std::fs::remove_dir_all(second_root);
+    }
+
     #[test]
     fn constant_time_compare_requires_equal_content_and_length() {
         assert!(constant_time_eq(b"abc", b"abc"));
