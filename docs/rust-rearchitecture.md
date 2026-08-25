@@ -184,18 +184,23 @@ Rust runtime 完成后删除本地 Node runtime。
 35. `10beb44 test: make Rust fs fixtures collision-safe` 已修复 Rust 并行测试临时 Git repo 的低概率命名碰撞；连续 5 轮 workspace tests 均通过，避免把时间粒度碰撞误判成 fs/security 回归。
 36. 第七检查点 `18f4a0a feat: add native mutation safety and fs writes` 已提交并推送；统一 mutation policy 覆盖 readonly、write-root、working-Agent、dirty confirmation、managed target、secret/symlink 与 atomic single-file write；`herdr_fs_edit` / `herdr_fs_write` 已通过真实 candidate smoke，验证新建、overwrite 拒绝、dirty 拒绝、`confirm_dirty` 放行和 secret-path fail-closed；当时 Rust 单测为 65/65，整仓 Rust/Node/Edge/site/extension 回归通过。
 37. 第八检查点 `958711f feat: migrate native patch transactions` 已提交并推送；Rust 已原生实现 Codex/coding-tools 风格 patch parser、unique-context hunk、CRLF/BOM 保持、multi-file preflight、dirty/busy gate 与同目录 temp/backup 原子事务回滚；`herdr_fs_patch` 真实 candidate smoke 已验证 dry-run 不写、dirty fail-closed、`confirm_dirty` 下 add/update/delete 同事务成功、`../` path escape 拒绝。当前 native migration 为 12/18，Rust 单测 72/72；完整 gate 为 Node 314/314、Edge 212/212、双语站点 21 篇/语言并全部通过。
+38. `17e50ad feat: migrate native exec sessions` 已提交并推送；Rust 原生 `herdr_exec_start/read/kill` 使用单一 `ExecRegistry`，每流 512 KiB bounded output、跨 stdout/stderr sequence、独立 Unix process group、SIGTERM → grace → SIGKILL、兼容 shell/PATH，并把 restart journal 限定为 `session_id + pid` fencing identity，不长期保存 command/cwd。
+39. `d32495d feat: migrate visible utility exec` 已提交并推送；短命令 `herdr_exec` 保持 workspace/project-root 选择、可见 `herdr-mcp:utility` pane、busy-agent gate、pager 抑制、超时后 observation 提示，以及“发送前可 fallback、发送后 outcome unknown 时禁止自动重发”的安全边界。
+40. `88d7b7a feat: migrate native agent prompt` 已提交并推送；`herdr_prompt` 已迁入 Rust，保留 idempotency key、parallel/conflicting reuse gate、socket `agent.prompt`、wait 状态与 post-submit observation，native migration 达到 17/18。
+41. `af7ea63 test: harden Rust temp fixtures` 修复 mutation policy 与 Unix-socket 测试的并发临时资源命名碰撞；`34cd115 fix: fence recovered exec process groups` 进一步把 restart fencing 从仅检查环境 marker 升级为受控 shell `argv[0]` session marker + `PGID == journal PID` 双重验证，并保留环境 marker 兼容路径。
+42. live-orphan restart smoke 已在 macOS 真进程上闭环：candidate 启动 `sleep 300` 后终止 runtime，确认 session shell 以 PPID 1、独立 PGID 继续存活；使用同一 state dir 重启后旧 session 返回 `recovery_state=reaped_on_restart`，`herdr_inspect.workstation_info.exec_sessions_diagnostics.reaped_on_boot=1`，原 PID 随后消失。PID reuse/marker 无法验证时继续返回 `detached_unverified`，不会盲杀不明进程。
+43. `45ea1b8 feat: complete native tool parity` 完成最后一个 `herdr_skill`：project policy 支持 upstream fetch + TTL cache + stale fallback + bundled policy，native Herdr reference 使用有界 `herdr --skill` + bundled fallback，runtime/self-update/worker fallback context 只投影白名单字段；`workstation_info.agent_skill` 与 production pointer 对齐。
+44. 当前 Rust candidate 已达到 epoch 2 **18/18 native tool parity**，`native_parity_ready=true`、`pending_tool_count=0`；仍保持 `production_ready=false`，因为 persistent GET/SSE、stateful session/auth compatibility、supervisor/link 等 production transport/lifecycle 仍未完成。最终整仓 gate：Rust 94/94、Node 314/314、Edge 212/212、双语站点 21 篇/语言，全部通过。
 
 下一批开发按以下顺序推进：
 
-1. 迁移 `herdr_exec_start/read/kill`：先建立 Rust 原生 exec-session registry、稳定 session identity、bounded ordered output、process-tree cancel 和 restart 后的 truthful closed/detached 状态；
-2. 在同一 registry 上迁移短命令 `herdr_exec`，保持 workspace/project-root 选择、visible utility-pane 语义、busy-agent gate 与 uncertain-delivery 分类；
-3. 用真实 exec-session registry 补齐 `herdr_inspect`，替换当前显式 `exec_sessions_ready=false` 占位；
-4. 迁移 `herdr_prompt` 与 `herdr_skill`，逐个消除剩余 `native_tool_pending`，其中 prompt 必须保留 idempotency、delivery evidence 和 post-submit observation；
-5. 补齐 persistent GET/SSE、stateful session/auth compatibility，使 Rust HTTP transport 通过现有 Connector transport parity tests；
-6. 实现 Rust supervisor、service manager、Native Messaging host；
-7. 实现 GitHub Release updater、generation A/B、rollback；
-8. 迁移 relay/link；
-9. Rust 覆盖 18 tools 与 production transport 后删除本地 Node runtime 和旧 lifecycle scripts。
+1. 完成 production transport parity：persistent GET/SSE、stateful/stateless session 兼容、OpenAI MCP UA 行为、auth、restart/reconnect framing 与现有 Connector transport regression 全量对齐；
+2. 建立 Shared Local State Store foundation：Rust SQLite、schema migration、transaction/retention，并优先迁移 exec session metadata；不因此扩展 epoch 2 / 18 tools；
+3. 实现 Rust supervisor、service manager、Native Messaging host，并把 production/dev generation、health、restart evidence 纳入统一生命周期；
+4. 实现 GitHub Release updater、generation A/B、atomic activation 与 rollback；
+5. 迁移 relay/link，使 Edge → 本机 transport 与 runtime generation fencing 进入 Rust production path；
+6. 只有在 18-tool parity、production transport parity、supervisor/link/updater 均通过生产回归后，删除本地 Node runtime 和旧 lifecycle scripts；
+7. 再进入 Reliability Kernel → Continuity 2.0 → Work Context & Evidence → Product Completion，保持 Web Chat 是 planner，herdr-mcp 是控制面。
 
 ## Rust 完成后的产品演进 Roadmap
 
@@ -217,6 +222,66 @@ Rust 原生化完成后，重点继续打磨 Web AI 到本机开发现场的完�
 - 小任务、调研任务、讨论任务保持轻量路径，不要求先创建 task/workflow；
 - 复杂开发可以携带 work context，但它只是恢复与观察元数据，不接管 Web Chat 的任务管理；
 - public MCP contract 继续保持小而稳定，新增能力优先进入内部 runtime/state，而不是增加模型每轮 schema 负担。
+
+### Shared Local State Store：统一 Rust 本机持久状态层
+
+目标：在继续迁移 supervisor、Native Messaging、updater、link 与浏览器连续工作之前，建立统一的本机 durable state 层，避免每个模块各自维护 JSON journal、lock/status 文件和恢复逻辑。
+
+默认实现采用嵌入式 SQLite：
+
+```text
+production ~/.config/herdr-mcp/state.db
+development ~/.config/herdr-mcp-dev/state.db
+```
+
+基础要求：
+
+- SQLite 由 Rust runtime 独占管理，不引入外部数据库服务；
+- 启用 WAL、foreign keys、busy timeout 与显式 schema migration；
+- 所有 mutation/recovery 状态更新优先使用事务，跨对象 cutover 不依赖多个 JSON 文件的先后写入；
+- public MCP epoch 2 / 18 tools 不因数据库引入而扩张；数据库属于内部 runtime/state implementation；
+- runtime live state、Herdr workspace/pane/agent state 和 Git working tree 仍从真实来源读取，数据库不成为第二套事实源；
+- API key、OAuth secret 等敏感凭据进入 OS Keychain/平台安全存储，不写入通用 state.db；
+- 大段 stdout/stderr、附件、图片、release binary 和完整 MCP payload 不写入数据库；需要保留的 command output 使用有界 spool file，数据库只保存 identity、offset、hash、状态和 TTL metadata。
+
+首批统一对象：
+
+```text
+meta
+operations
+exec_sessions
+runtime_generations
+browser_bindings
+continuity_transfers
+work_contexts
+evidence
+```
+
+后续 Continuity 2.0 再增加：
+
+```text
+conversation_checkpoints
+conversation_turns
+```
+
+主要消费者：
+
+1. Reliability Kernel：`op_id`、idempotency key、request hash、delivery phase、uncertain/reconcile result；
+2. `herdr_exec*`：session identity、PID/process group、start/end、exit/signal、restart 后 detached/reaped/closed 状态；完整 command/cwd 默认只存在于当前 runtime 内存与有界即时返回中，不进入 durable state；
+3. Browser Continuity：Project/conversation binding、Auto 状态、continuity chain、handoff ticket、ACK、checkpoint 与有界 raw tail；
+4. runtime generation/update：installed/candidate/active/previous generation、activation transaction、checksum/signature、rollback evidence；
+5. Work Context 与 Evidence：`work_id`、scope、acceptance、operation relation、Git/test/artifact evidence；
+6. diagnostics/link：最近失败阶段、restart/disconnect reason、generation/boot identity、有限历史观测和 TTL 数据。
+
+保留边界：
+
+- `EventCache` 继续保存实时 Herdr snapshot 和短期 cursor history，不把 workspace/pane/agent live state 长期写入数据库；
+- Git HEAD、dirty、diff 等实时状态由 Git 提供，数据库只保存特定 operation 的 before/after evidence；
+- exec stdout/stderr 默认使用有界文件 spool，session 完成并超过 TTL 后清理；
+- diagnostics、operation evidence、failed transfer 和 conversation raw text 都必须有数量/时间/体积上限；
+- runtime generation 仍保留极小、可独立恢复的启动指针或 atomic symlink，使 state.db 损坏时当前 generation 仍可启动并进入 doctor/recovery。
+
+当前 Rust `ExecRegistry` 已经出现 `exec-sessions-rust.json` journal。Shared Local State Store 建立后优先把 exec session metadata 迁入 SQLite，避免 supervisor/updater/Native Messaging/continuity 后续继续产生新的临时 JSON 状态格式。
 
 ### Phase 7：Reliability Kernel
 
@@ -260,12 +325,219 @@ Rust 原生化完成后，重点继续打磨 Web AI 到本机开发现场的完�
 - stale generation、重复 wake、正在生成、未确认 mutation 等场景 fail closed；
 - ChatGPT、z.ai、DeepSeek 等网页只实现薄 site adapter，不扩张成通用网页自动化系统。
 
+#### Sidecar Compactor：接力压缩不再依赖故障中的 Web 模型
+
+当前兼容实现由 source conversation 自己生成 `HERDR_HANDOFF_V1`。Continuity 2.0 将此路径降为 legacy fallback；正常接力由用户已配置的 OpenAI-compatible 小模型作为 Sidecar Compactor 完成，使 source ChatGPT 已达到上下文上限、持续无回复或恢复耗尽时仍可创建新 conversation。
+
+Sidecar LLM 配置复用现有浏览器“小模型判定”连接信息：
+
+```text
+base_url
+api_key
+model
+```
+
+逻辑任务拆分为独立 prompt/profile：
+
+```text
+judge            # 回合结束后判断是否继续
+handoff_compact  # Continuity checkpoint/raw tail -> handoff packet
+```
+
+连接配置共用，prompt、输出 schema、timeout/retry 和失败策略独立。后续 UI 可以把“小模型判定”提升为 Sidecar LLM/辅助模型，但不要求新增第二套 provider 凭据。目标架构下 API key 通过 Native Messaging 交给 OS Keychain/平台安全存储，state.db 只保存 secret reference；迁移期间继续兼容当前 extension 本机配置。
+
+核心原则：任何用于恢复 Web conversation 的机制，都不能要求故障中的同一个 Web conversation 再成功完成一次恢复操作。
+
+#### Continuity Journal 与 rolling checkpoint
+
+浏览器在每个已经完成的 user/assistant turn 结束后，把可见正文增量提交给 Rust Local State Store。Rust 保存当前 continuity chain 的有界 journal，不依赖 ChatGPT 长页面始终保留完整 DOM。
+
+逻辑数据：
+
+```text
+conversation_turns
+  continuity_id
+  conversation_id
+  turn_id
+  role
+  text
+  token_estimate
+  fingerprint
+  observed_at
+
+conversation_checkpoints
+  continuity_id
+  checkpoint_id
+  through_turn
+  summary
+  anchors
+  created_at
+```
+
+checkpoint 至少覆盖：
+
+```text
+objective
+completed[]
+decisions[]
+active[]
+pending[]
+constraints[]
+files[]
+branches[]
+commits[]
+urls[]
+task_ids[]
+next_actions[]
+```
+
+其中 `continuity_id`、workspace/project/conversation identity、Auto 状态、binding、transfer id 等控制信息由 Rust/extension 确定性生成，不交给模型自由改写。路径、commit hash、URL、task id 等 literal anchor 单独提取/保留，减少压缩遗漏。
+
+默认增量策略：
+
+- 正常工作只追加新完成的 raw turn；
+- Auto 开时每约 8 个 user turn 或新增约 12k estimated tokens 生成一次 rolling checkpoint；
+- 进入 `HANDOFF_PREPARE` 时强制刷新 checkpoint；
+- Auto 关时仍记录有界 journal，但不主动调用外部 Sidecar LLM；手动 handoff 时再按 checkpoint + raw tail 压缩；
+- Sidecar 调用只处理 `previous checkpoint + new raw tail`，不在每次 handoff 时重新发送完整 80k+ conversation；
+- target ACK 前保留 source 所需 raw journal 作为恢复依据；ACK 后保留 compact checkpoint/handoff/anchors，回收旧 source raw body。
+
+建议的有界 retention 初始值：
+
+```text
+per-conversation raw cap: 16 MiB
+global continuity raw/checkpoint budget: 128 MiB
+checkpoint history: latest 3
+failed/uncertain transfer TTL: 7 days
+```
+
+达到单 conversation raw cap 时必须先生成并验证新 checkpoint，再 prune 最早 raw turns；禁止直接无摘要截断。具体阈值允许后续依据 dogfood metrics 调整。
+
+#### Browser Performance Budget：内存与主线程压力也是 rollover 信号
+
+Continuity 2.0 不只解决模型上下文长度，也要避免长 conversation 把浏览器页面拖入高内存、滚动卡顿和输入延迟。这里区分两类问题：
+
+- **memory pressure**：Web 应用自身 React/DOM/history、旧 conversation tab、扩展缓存的正文；
+- **main-thread/render pressure**：MutationObserver、全 DOM 查询、`innerText` 强制布局、长页面 style/layout/paint 与流式更新。
+
+扩展不能安全删除 ChatGPT/z.ai/DeepSeek 自己管理的历史 DOM，也不能依赖主动 GC；因此降低实际页面内存的主要手段是“更早 rollover + retire 后 discard source tab”，降低卡顿的主要手段是“事件增量化 + 限频 + 不扫描整页”。
+
+当前实现迁移时优先消除以下热点：
+
+1. ChatGPT turn watcher 不再在 `document.documentElement` 上以 `childList + subtree + characterData` 监听所有流式字符并立即执行完整 `onTick()`；
+2. persistent permission watcher 不再对整个 `document.body` 的广泛 attributes/style 变化触发全页面 permission button 扫描；
+3. `lastMessageByRole`、assistant streaming/tool checks、turn count 不在每个 800ms tick/每个 mutation 上重复 `querySelectorAll` 全部历史节点；
+4. conversation pressure 不在每回合结束时重新扫描全部 mounted user/assistant 正文，而是复用 Continuity Journal 的当前完成 turn 做增量统计；
+5. monitoring/fingerprint 优先读 `textContent` 与稳定 identity，只有确实需要视觉文本语义时才使用可能触发布局的 `innerText`。
+
+目标 watcher 结构：
+
+```text
+conversation structural observer
+  childList only
+  narrow conversation root
+  inspect added/removed nodes only
+        ↓
+cache latest user/assistant element + stable turn identity
+        ↓
+active generation sampler (bounded, e.g. 500-1000ms)
+  read latest cached assistant only
+        ↓
+turn settled
+  append one completed turn to Rust journal
+  update context/performance pressure once
+```
+
+permission watcher 同样采用候选驱动：全局只观察新增节点；发现可能的 permission card/button 后，只对该候选的 enabled/hidden 属性做短期局部观察。禁止因为任意页面 `style` 变化而重新扫描所有按钮和祖先文本。
+
+后台/隐藏标签页策略：
+
+- `document.hidden` 时暂停高频 DOM sampling、HUD reconciliation 和非关键页面 health polling；
+- Herdr live event、binding、operation state 继续由 service worker/Rust runtime 保持；
+- wake/handoff 到达隐藏页时只临时恢复完成该动作所需的观察，页面重新 visible 时立即 rehydrate latest-turn cache；
+- service worker 与 content script 都只保留有界 metadata/待发送 tail，不在 JS heap 长期复制完整 conversation journal。
+
+增加独立的 `ui_pressure`，不与模型 token pressure 混为一个数。优先使用低成本指标：
+
+```text
+visible/mounted conversation turn count
+recent long-task count / duration when Long Tasks API is supported
+bounded event-loop timer drift fallback
+turn-settle latency
+DOM-monitor callback rate
+optional Chromium memory signal only as advisory, never as correctness input
+```
+
+Long Tasks API 仅作为 Chromium 优化信号，不作为跨浏览器硬依赖。指标只保存 rolling window/聚合值，不持久化完整 performance timeline。
+
+rollover 触发改为双通道：
+
+```text
+semantic/context pressure ─┐
+                           ├─> HANDOFF_PREPARE -> safe-boundary handoff
+browser ui pressure ───────┘
+```
+
+也就是说，即使模型上下文尚未达到固定 token/message 阈值，只要页面已经持续出现明显主线程压力，也可以提前 prepare；真正自动 cutover 仍必须满足当前 fail-closed 的 workspace quiescent、无 streaming/tool/permission、无人工草稿、无 uncertain mutation 等安全条件。
+
+handoff target ACK 后：
+
+- target conversation 成为 continuity/binding authoritative page；
+- source tab 不自动关闭，保留用户可回看能力；
+- 当 source tab 已非 active 时，extension service worker 主动请求浏览器 discard 退休 source tab，使其 Web 页面从内存卸载；用户之后点击旧 tab 时由浏览器正常 reload；
+- 同一 continuity chain 更早的 retired tabs 也可按 bounded policy discard，不长期保留多份完整 Web runtime；
+- discard 失败只记录 diagnostics，不影响已经完成的 binding cutover。
+
+可选的第二阶段渲染优化是对确认稳定的旧 turn container 试验 `content-visibility: auto` / containment，减少屏幕外 subtree 的 layout/paint；它只能降低渲染成本，不能替代 rollover/discard 来释放页面 heap。由于第三方 Web App 可能已有虚拟列表、滚动锚点和自身测量逻辑，此能力必须 site-specific、可关闭、经过真实滚动/搜索/复制/回到旧消息 UAT 后才能默认启用。禁止直接 `remove()`、替换或重建页面拥有的历史消息 DOM。
+
+初始性能验收门：
+
+- assistant 流式输出期间，扩展 callback 数量不随 token/character mutation 线性增长；
+- 长 conversation 下 watcher 不在固定短周期扫描全部历史 user/assistant/buttons；
+- hidden tab 的扩展 DOM 工作接近静止，但 Herdr binding/continuity state 不丢失；
+- rollover ACK 后退休 source tab 可被 discard，重新激活时能够 reload 且不会恢复旧 authoritative binding；
+- 连续 rollover 多次后，只保留当前 target Web runtime 常驻，retired tabs 不造成线性浏览器内存增长；
+- performance-pressure rollover 与 context-pressure rollover 共用同一安全 cutover，不产生双重 handoff 或重复 mutation。
+
+handoff 生成顺序：
+
+```text
+latest valid checkpoint
+  + raw tail
+  + deterministic binding/work/evidence metadata
+        ↓
+Sidecar handoff_compact
+        ↓
+validated HERDR_HANDOFF_V1
+        ↓
+fresh target conversation
+        ↓
+seed confirmed / target ACK
+        ↓
+atomic binding + Auto cutover
+        ↓
+source retirement + raw prune
+```
+
+降级顺序：
+
+1. Sidecar Compactor 成功：使用最新结构化 handoff；
+2. Sidecar 超时/HTTP/网络失败：使用最后一个有效 checkpoint + raw tail + deterministic metadata 生成 degraded handoff，仍允许新 conversation 恢复；
+3. 旧 conversation 没有 Continuity Journal 且 source Web model 仍能回复：兼容现有 source-model summary；
+4. source Web model 已无回复时，不因无法生成新摘要而阻塞已有 checkpoint 的接力。
+
+Sidecar Compactor 只负责历史语义压缩。Git/runtime/Herdr 当前事实仍由 target conversation 在任何 mutation 前重新读取 live state，handoff packet 不作为实时状态证明。
+
 验收门：
 
 - conversation rollover 过程中任一点刷新浏览器都能恢复；
 - Auto 开/关、Project binding、workspace binding 在手动/自动接力后按规则继承；
 - 同一个 settled event 不会导致重复继续；
 - handoff 失败时旧 conversation 仍可继续，不出现双活控制。
+- source Web model 已持续无回复时，存在有效 checkpoint 的 conversation 仍能由 Sidecar Compactor 或 degraded checkpoint 完成 handoff；
+- browser extension service worker 和 Rust runtime 分别重启后，journal/checkpoint/handoff ticket 可以恢复且不重复迁移 binding；
+- checkpoint/prune 后数据库体积受 retention policy 约束，不永久保存所有历史 conversation raw text；
+- Sidecar 失败不会丢失最后一个已验证 checkpoint，也不会触发重复 mutation。
 
 ### Phase 9：Work Context 与 Evidence
 
@@ -326,6 +598,7 @@ Roadmap 不与当前 Rust parity 并行扩张 public surface。顺序固定为�
 ```text
 18-tool native parity
   → production transport parity
+  → Shared Local State Store foundation
   → supervisor / Native Messaging / updater / link
   → 删除 Node runtime
   → Reliability Kernel
@@ -334,7 +607,7 @@ Roadmap 不与当前 Rust parity 并行扩张 public surface。顺序固定为�
   → Product Completion hardening
 ```
 
-其中 Reliability/Continuity 所需的基础 identity、diagnostics、event cache 可以在 Rust 迁移阶段提前建设，但不能因此修改 epoch 2 / 18 tools 的行为契约。
+Shared Local State Store foundation 只建立 SQLite、schema migration、transaction/retention 基础，并优先迁移 exec session metadata；不提前扩张 Reliability/Continuity 的产品行为。Reliability/Continuity 所需的基础 identity、diagnostics、event cache 可以在 Rust 迁移阶段提前建设，但不能因此修改 epoch 2 / 18 tools 的行为契约。
 
 ### 暂不进入主线
 
