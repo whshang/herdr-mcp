@@ -82,6 +82,33 @@ test("Rust release verification provisions and always cleans the pinned Herdr ru
   );
 });
 
+test("Rust GitHub Release provenance is tag-only and fail-closed before publish", async () => {
+  const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
+  const attestJob = release.indexOf("\n  attest:\n");
+  const publishJob = release.indexOf("\n  publish:\n");
+  assert.ok(attestJob >= 0, "release workflow must have a dedicated attestation job");
+  assert.ok(publishJob > attestJob, "attestation must be declared before GitHub Release publishing");
+  const attest = release.slice(attestJob, publishJob);
+  const publish = release.slice(publishJob);
+  assert.match(attest, /needs: manifest/);
+  assert.match(attest, /if: startsWith\(github\.ref, 'refs\/tags\/v'\)/);
+  assert.match(attest, /contents: read/);
+  assert.match(attest, /id-token: write/);
+  assert.match(attest, /attestations: write/);
+  assert.match(attest, /artifact-metadata: write/);
+  assert.match(
+    attest,
+    /uses: actions\/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4\.2\.2/,
+    "release provenance action must be pinned to the reviewed v4.2.2 commit",
+  );
+  assert.match(attest, /release-assets\/herdr-mcp-\*/);
+  assert.match(attest, /release-assets\/release-manifest\.json/);
+  assert.match(publish, /needs: attest/, "GitHub Release publishing must fail closed when attestation fails");
+  assert.match(publish, /if: startsWith\(github\.ref, 'refs\/tags\/v'\)/);
+  assert.doesNotMatch(attest, /workflow_dispatch/);
+  assert.doesNotMatch(publish, /workflow_dispatch/);
+});
+
 test("local Cloudflare/Pages build state is excluded from the published package", async () => {
   const rootIgnore = await readFile(join(ROOT, ".gitignore"), "utf8");
   const edgeIgnore = await readFile(join(ROOT, "edge/cloudflare/.gitignore"), "utf8");
