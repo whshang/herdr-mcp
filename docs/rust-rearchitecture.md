@@ -161,14 +161,19 @@ Rust runtime 完成后删除本地 Node runtime。
 12. Agent soft visibility 已迁移，默认 allowlist 与当前 production 一致，并支持 `HERDR_MCP_AGENT_ALLOW=*`；
 13. `workstation_info` 已由 Rust 提供 default cwd、managed Git roots、read-only/write-root 状态及原生 executable discovery；未来正式产品不把 Node/npm/Python 作为运行依赖；
 14. 第一检查点 `3e93917 feat: bootstrap native Rust runtime` 已提交并推送到 `origin/refactor/rust-supervisor-20260825`；Rust、root Node、Cloudflare Edge、site build 和 browser extension smoke 已完成整仓回归。
+15. Rust 已实现 `events.subscribe` 长连接 wire protocol，支持字符串/对象两类 event envelope、1 MiB frame 上限、有界 read tick、订阅 deadline 和 daemon error 映射；
+16. `EventCache` 已成为原生常驻状态层：snapshot bootstrap、25 秒重订阅、30 秒 full-snapshot TTL、250ms 可中断 poll、断线重连、unknown-workspace admission gate、workspace/pane/tab/agent 增量归并；
+17. Event cache 保存最多 2048 条 cursor history；`cursor=0` 返回最近 64 条，并维护 Agent `last_activity_at` 与从 session filename 推导的 `started_at`；
+18. Rust `herdr_since` service 已实现 boot id、cursor reset、workspace id/label filter 和 Agent visibility；它直接读取 EventCache，不在 MCP 调用时轮询 daemon；
+19. `doctor` 已真实启动/停止 EventCache，并验证 background `events.subscribe` 已进入 live 状态；当前 Rust 测试为 39/39；
+20. 第二检查点 `e39ecf7 feat: migrate native inspect state` 已提交并推送。
 
 下一批开发按以下顺序推进：
 
-1. 完成 `herdr_inspect` parity：补 build/runtime metadata、exec-session state，并建立 TypeScript/Rust result fixture；
-2. 建立 Rust 常驻 event cache，使用 Herdr `events.subscribe` 实现 `herdr_since`；不使用轮询替代事件流；
-3. 将 `herdr_methods` / `herdr_call` / `herdr_inspect` 接入 Rust MCP HTTP transport；
-4. 迁移 managed-root/secret-path 安全层和只读 fs/git 工具，再迁 mutation/exec/agent 工具；
-5. 实现 Rust supervisor、service manager、Native Messaging host；
-6. 实现 GitHub Release updater、generation A/B、rollback；
-7. 迁移 relay/link；
-8. Rust 覆盖 18 tools 与 production transport 后删除本地 Node runtime 和旧 lifecycle scripts。
+1. 将 `herdr_methods` / `herdr_call` / `herdr_inspect` / `herdr_since` 接入 Rust candidate MCP HTTP transport，并建立 TypeScript/Rust result parity fixture；
+2. 完成 `herdr_inspect` parity：补 build/runtime metadata、exec-session state；
+3. 迁移 managed-root/secret-path 安全层和只读 fs/git 工具，再迁 mutation/exec/agent 工具；
+4. 实现 Rust supervisor、service manager、Native Messaging host；
+5. 实现 GitHub Release updater、generation A/B、rollback；
+6. 迁移 relay/link；
+7. Rust 覆盖 18 tools 与 production transport 后删除本地 Node runtime 和旧 lifecycle scripts。

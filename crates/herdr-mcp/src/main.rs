@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod contract;
 mod dev;
+mod events;
 mod herdr;
 mod inspect;
 mod native_tools;
@@ -10,6 +11,7 @@ mod paths;
 mod projects;
 mod schema;
 mod snapshot;
+mod state_cache;
 mod status;
 mod workstation;
 

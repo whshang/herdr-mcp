@@ -67,6 +67,10 @@ impl HerdrClient {
             params,
         )
     }
+
+    pub(crate) fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
 }
 
 #[cfg(unix)]

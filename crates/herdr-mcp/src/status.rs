@@ -3,6 +3,7 @@ use crate::herdr::HerdrClient;
 use crate::native_tools;
 use crate::paths::RuntimePaths;
 use crate::snapshot;
+use crate::state_cache::EventCache;
 use serde_json::json;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
@@ -19,6 +20,20 @@ enum RuntimeHealth {
 struct StatusReport {
     runtime: RuntimeHealth,
     herdr_transport_reachable: bool,
+}
+
+#[derive(Debug)]
+struct EventCacheProbe {
+    healthy: bool,
+    cursor: u64,
+    digest_events: usize,
+    agents: usize,
+    workspaces: usize,
+    snapshot_panes: usize,
+    stream_events: u64,
+    last_event_at: Option<String>,
+    needs_reconcile: bool,
+    error: Option<String>,
 }
 
 fn collect(paths: &RuntimePaths, config: &Config) -> StatusReport {
@@ -77,6 +92,7 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         .map(|socket| native_tools::inspect(&HerdrClient::new(socket)))
         .unwrap_or_else(|| json!({"ok": false}));
     let inspect_healthy = inspect_result["ok"].as_bool() == Some(true);
+    let event_cache = probe_event_cache(paths);
     println!("Herdr MCP doctor");
     print_check("runtime endpoint", runtime_healthy);
     print_check("Herdr local transport", report.herdr_transport_reachable);
@@ -84,6 +100,7 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     print_check("validated Herdr RPC", native_call_healthy);
     print_check("Herdr snapshot state", snapshot_healthy);
     print_check("Herdr inspect projection", inspect_healthy);
+    print_check("Herdr event cache", event_cache.healthy);
     println!("INFO config {}", paths.config_file.display());
     println!("INFO state {}", paths.config_dir.display());
     println!("INFO dev-state {}", paths.dev_state_dir.display());
@@ -103,6 +120,22 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
             snapshot::collection_count(&snapshot_result.value, "agents")
         );
     }
+    println!(
+        "INFO event-cache cursor={} events={} agents={} workspaces={} panes={} stream-events={} reconcile={}",
+        event_cache.cursor,
+        event_cache.digest_events,
+        event_cache.agents,
+        event_cache.workspaces,
+        event_cache.snapshot_panes,
+        event_cache.stream_events,
+        event_cache.needs_reconcile
+    );
+    if let Some(last_event_at) = &event_cache.last_event_at {
+        println!("INFO event-cache-last-event {last_event_at}");
+    }
+    if let Some(error) = &event_cache.error {
+        println!("WARN event-cache {error}");
+    }
 
     runtime_healthy
         && report.herdr_transport_reachable
@@ -110,6 +143,57 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         && native_call_healthy
         && snapshot_healthy
         && inspect_healthy
+        && event_cache.healthy
+}
+
+fn probe_event_cache(paths: &RuntimePaths) -> EventCacheProbe {
+    let Some(socket) = paths.herdr_socket.as_ref() else {
+        return EventCacheProbe {
+            healthy: false,
+            cursor: 0,
+            digest_events: 0,
+            agents: 0,
+            workspaces: 0,
+            snapshot_panes: 0,
+            stream_events: 0,
+            last_event_at: None,
+            needs_reconcile: false,
+            error: Some("Herdr local transport is unavailable".to_owned()),
+        };
+    };
+
+    let mut cache = EventCache::start(HerdrClient::new(socket));
+    let ready = cache.wait_ready(Duration::from_secs(2));
+    let stream_live = cache.wait_stream_live(Duration::from_secs(1));
+    let since_result = native_tools::since(&cache, 0, None);
+    let snapshot_state = cache.snapshot();
+    let diagnostics = cache.diagnostics();
+    let error = cache.last_error();
+    cache.shutdown();
+
+    let cursor = since_result["cursor"].as_u64().unwrap_or(0);
+    let digest_events = since_result["events"].as_array().map(Vec::len).unwrap_or(0);
+    let agents = since_result["agents"].as_array().map(Vec::len).unwrap_or(0);
+    let workspaces = since_result["workspaces"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0);
+
+    EventCacheProbe {
+        healthy: ready
+            && stream_live
+            && since_result["ok"].as_bool() == Some(true)
+            && error.is_none(),
+        cursor,
+        digest_events,
+        agents,
+        workspaces,
+        snapshot_panes: snapshot::collection_count(&snapshot_state, "panes"),
+        stream_events: diagnostics.event_count,
+        last_event_at: diagnostics.last_event_at,
+        needs_reconcile: diagnostics.needs_reconcile,
+        error,
+    }
 }
 
 fn probe_runtime(port: u16) -> RuntimeHealth {
