@@ -7,6 +7,7 @@ pub enum Command {
     Config(ConfigCommand),
     Dev { dry_run: bool },
     Candidate { port: u16 },
+    Service(ServiceCommand),
     NativeHost(NativeHostCommand),
     ExtensionHost { caller_origin: String },
 }
@@ -22,6 +23,16 @@ pub enum ConfigCommand {
 pub enum NativeHostCommand {
     Install,
     Status,
+    Uninstall,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServiceCommand {
+    Install { adopt_node: bool },
+    Status,
+    Start,
+    Stop,
+    Restart,
     Uninstall,
 }
 
@@ -42,6 +53,7 @@ where
         "config" => parse_config(&args[1..]),
         "dev" => parse_dev(&args[1..]),
         "candidate" => parse_candidate(&args[1..]),
+        "service" => parse_service(&args[1..]),
         "native-host" => parse_native_host(&args[1..]),
         "extension-host" => parse_extension_host(&args[1..]),
         value => Err(format!("unknown command '{value}'\n\n{}", help())),
@@ -100,6 +112,32 @@ fn parse_candidate(args: &[String]) -> Result<Command, String> {
     Ok(Command::Candidate { port })
 }
 
+fn parse_service(args: &[String]) -> Result<Command, String> {
+    match args {
+        [subcommand] if subcommand == "install" => Ok(Command::Service(ServiceCommand::Install {
+            adopt_node: false,
+        })),
+        [subcommand, flag] if subcommand == "install" && flag == "--adopt-node" => {
+            Ok(Command::Service(ServiceCommand::Install {
+                adopt_node: true,
+            }))
+        }
+        [subcommand] if subcommand == "status" => Ok(Command::Service(ServiceCommand::Status)),
+        [subcommand] if subcommand == "start" => Ok(Command::Service(ServiceCommand::Start)),
+        [subcommand] if subcommand == "stop" => Ok(Command::Service(ServiceCommand::Stop)),
+        [subcommand] if subcommand == "restart" => Ok(Command::Service(ServiceCommand::Restart)),
+        [subcommand] if subcommand == "uninstall" => {
+            Ok(Command::Service(ServiceCommand::Uninstall))
+        }
+        [] => {
+            Err("service requires install, status, start, stop, restart, or uninstall".to_owned())
+        }
+        [subcommand, ..] => Err(format!(
+            "invalid service command or arguments for '{subcommand}'"
+        )),
+    }
+}
+
 fn parse_native_host(args: &[String]) -> Result<Command, String> {
     match args {
         [subcommand] if subcommand == "install" => {
@@ -141,6 +179,7 @@ Usage:\n\
   herdr-mcp config [path|show|init]\n\
   herdr-mcp dev [--dry-run]\n\
   herdr-mcp candidate [--port 8873]\n\
+  herdr-mcp service <install [--adopt-node]|status|start|stop|restart|uninstall>\n\
   herdr-mcp native-host <install|status|uninstall>\n\
   herdr-mcp extension-host <chrome-extension://.../>\n\n\
 The Rust binary is the new local product boundary. Service, update, runtime,\n\
@@ -174,6 +213,14 @@ mod tests {
             Command::Candidate { port: 9000 }
         );
         assert_eq!(
+            parse(args(&["service", "install", "--adopt-node"])).unwrap(),
+            Command::Service(ServiceCommand::Install { adopt_node: true })
+        );
+        assert_eq!(
+            parse(args(&["service", "status"])).unwrap(),
+            Command::Service(ServiceCommand::Status)
+        );
+        assert_eq!(
             parse(args(&["native-host", "status"])).unwrap(),
             Command::NativeHost(NativeHostCommand::Status)
         );
@@ -194,6 +241,8 @@ mod tests {
         assert!(parse(args(&["dev", "--legacy"])).is_err());
         assert!(parse(args(&["config", "legacy"])).is_err());
         assert!(parse(args(&["candidate", "--port", "0"])).is_err());
+        assert!(parse(args(&["service"])).is_err());
+        assert!(parse(args(&["service", "install", "--force"])).is_err());
         assert!(parse(args(&["native-host"])).is_err());
         assert!(parse(args(&["native-host", "legacy"])).is_err());
         assert!(parse(args(&["extension-host"])).is_err());

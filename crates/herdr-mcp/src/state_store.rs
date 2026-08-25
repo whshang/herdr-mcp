@@ -104,9 +104,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_operations_kind_idempotency
     WHERE idempotency_key IS NOT NULL;
 "#;
 
+/// Migration 3: durable runtime-generation identity and bounded service
+/// lifecycle evidence. Secrets and full launchd plists are deliberately not
+/// stored here; the database only owns control-plane identity/status facts.
+const MIGRATION_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS runtime_generations (
+    generation_id TEXT PRIMARY KEY NOT NULL,
+    runtime_path   TEXT NOT NULL,
+    sha256         TEXT NOT NULL,
+    source         TEXT NOT NULL,
+    state          TEXT NOT NULL,
+    installed_at   INTEGER NOT NULL,
+    activated_at   INTEGER,
+    deactivated_at INTEGER
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_generation_active
+    ON runtime_generations(state) WHERE state = 'active';
+
+CREATE TABLE IF NOT EXISTS service_events (
+    event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    action        TEXT NOT NULL,
+    outcome       TEXT NOT NULL,
+    generation_id TEXT,
+    at            INTEGER NOT NULL,
+    detail        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_service_events_at
+    ON service_events(at DESC);
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
-const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2];
+const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3];
 
 /// Existing durable operation found while reserving an idempotency key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,6 +496,18 @@ pub struct ExecSessionFence {
     pub started_at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeGenerationRecord {
+    pub generation_id: String,
+    pub runtime_path: String,
+    pub sha256: String,
+    pub source: String,
+    pub state: String,
+    pub installed_at: i64,
+    pub activated_at: Option<i64>,
+    pub deactivated_at: Option<i64>,
+}
+
 impl StateStore {
     pub fn record_exec_running(
         &self,
@@ -590,6 +633,126 @@ impl StateStore {
                 [i64::try_from(now_ms).unwrap_or(i64::MAX)],
             )
             .map_err(|error| format!("cannot prune expired exec sessions: {error}"))
+    }
+
+    pub fn stage_runtime_generation(
+        &self,
+        generation_id: &str,
+        runtime_path: &str,
+        sha256: &str,
+        source: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO runtime_generations (
+                    generation_id, runtime_path, sha256, source, state,
+                    installed_at, activated_at, deactivated_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'staged', ?5, NULL, NULL)
+                 ON CONFLICT(generation_id) DO UPDATE SET
+                    runtime_path = excluded.runtime_path,
+                    sha256 = excluded.sha256,
+                    source = excluded.source,
+                    installed_at = MIN(runtime_generations.installed_at, excluded.installed_at)",
+                params![generation_id, runtime_path, sha256, source, now_ms],
+            )
+            .map_err(|error| format!("cannot stage runtime generation: {error}"))?;
+        Ok(())
+    }
+
+    pub fn activate_runtime_generation(
+        &mut self,
+        generation_id: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin generation activation: {error}"))?;
+        let exists = tx
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_generations WHERE generation_id = ?1",
+                [generation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("cannot verify staged generation: {error}"))?;
+        if exists != 1 {
+            return Err(format!(
+                "cannot activate unknown runtime generation {generation_id}"
+            ));
+        }
+        tx.execute(
+            "UPDATE runtime_generations
+             SET state = 'previous', deactivated_at = ?1
+             WHERE state = 'active' AND generation_id <> ?2",
+            params![now_ms, generation_id],
+        )
+        .map_err(|error| format!("cannot demote active runtime generation: {error}"))?;
+        let changed = tx
+            .execute(
+                "UPDATE runtime_generations
+                 SET state = 'active', activated_at = COALESCE(activated_at, ?1),
+                     deactivated_at = NULL
+                 WHERE generation_id = ?2",
+                params![now_ms, generation_id],
+            )
+            .map_err(|error| format!("cannot activate runtime generation: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "runtime generation activation updated {changed} rows"
+            ));
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit generation activation: {error}"))
+    }
+
+    pub fn active_runtime_generation(&self) -> Result<Option<RuntimeGenerationRecord>, String> {
+        self.conn
+            .query_row(
+                "SELECT generation_id, runtime_path, sha256, source, state,
+                        installed_at, activated_at, deactivated_at
+                 FROM runtime_generations WHERE state = 'active'",
+                [],
+                |row| {
+                    Ok(RuntimeGenerationRecord {
+                        generation_id: row.get(0)?,
+                        runtime_path: row.get(1)?,
+                        sha256: row.get(2)?,
+                        source: row.get(3)?,
+                        state: row.get(4)?,
+                        installed_at: row.get(5)?,
+                        activated_at: row.get(6)?,
+                        deactivated_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read active runtime generation: {error}"))
+    }
+
+    pub fn record_service_event(
+        &self,
+        action: &str,
+        outcome: &str,
+        generation_id: Option<&str>,
+        at_ms: i64,
+        detail: Option<&str>,
+    ) -> Result<(), String> {
+        let detail = detail.map(|value| {
+            let mut text = value.to_owned();
+            if text.len() > 512 {
+                text.truncate(512);
+            }
+            text
+        });
+        self.conn
+            .execute(
+                "INSERT INTO service_events (action, outcome, generation_id, at, detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![action, outcome, generation_id, at_ms, detail],
+            )
+            .map_err(|error| format!("cannot record service event: {error}"))?;
+        Ok(())
     }
 }
 
@@ -851,7 +1014,13 @@ mod tests {
         let store = StateStore::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let tables = store.table_names().unwrap();
-        for table in ["meta", "operations", "exec_sessions"] {
+        for table in [
+            "meta",
+            "operations",
+            "exec_sessions",
+            "runtime_generations",
+            "service_events",
+        ] {
             assert!(tables.contains(&table.to_owned()), "missing table {table}");
         }
         let indexes = store.index_names().unwrap();
@@ -860,6 +1029,8 @@ mod tests {
             "idx_operations_kind_idempotency",
             "idx_operations_expires",
             "idx_exec_sessions_expires",
+            "idx_runtime_generation_active",
+            "idx_service_events_at",
         ] {
             assert!(indexes.contains(&index.to_owned()), "missing index {index}");
         }
@@ -975,6 +1146,112 @@ mod tests {
                 Some(r#"{"ok":true,"value":7}"#)
             );
         }
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn runtime_generation_activation_is_single_active_and_service_evidence_is_bounded() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        store
+            .stage_runtime_generation("rust-a", "/runtime/a", "sha-a", "install", 10)
+            .unwrap();
+        store
+            .stage_runtime_generation("rust-b", "/runtime/b", "sha-b", "update", 20)
+            .unwrap();
+        store.activate_runtime_generation("rust-a", 30).unwrap();
+        assert_eq!(
+            store.active_runtime_generation().unwrap().unwrap(),
+            RuntimeGenerationRecord {
+                generation_id: "rust-a".to_owned(),
+                runtime_path: "/runtime/a".to_owned(),
+                sha256: "sha-a".to_owned(),
+                source: "install".to_owned(),
+                state: "active".to_owned(),
+                installed_at: 10,
+                activated_at: Some(30),
+                deactivated_at: None,
+            }
+        );
+        store.activate_runtime_generation("rust-b", 40).unwrap();
+        let active = store.active_runtime_generation().unwrap().unwrap();
+        assert_eq!(active.generation_id, "rust-b");
+        assert_eq!(
+            store
+                .scalar_text("SELECT state FROM runtime_generations WHERE generation_id = 'rust-a'")
+                .unwrap()
+                .as_deref(),
+            Some("previous")
+        );
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT deactivated_at FROM runtime_generations WHERE generation_id = 'rust-a'"
+                )
+                .unwrap(),
+            Some(40)
+        );
+        let long_detail = "x".repeat(900);
+        store
+            .record_service_event("restart", "ok", Some("rust-b"), 50, Some(&long_detail))
+            .unwrap();
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT length(detail) FROM service_events ORDER BY event_id DESC LIMIT 1"
+                )
+                .unwrap(),
+            Some(512)
+        );
+    }
+
+    #[test]
+    fn schema_v2_upgrades_to_generation_tables_without_losing_existing_rows() {
+        let path = temp_db_path();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '2')",
+                [META_SCHEMA_VERSION],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO operations (op_id, kind, created_at, updated_at)
+                 VALUES ('pre-v3-op', 'test', 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO exec_sessions (session_id, pid, started_at, state)
+                 VALUES ('pre-v3-exec', 123, 1, 'closed')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(
+            store
+                .scalar_i64("SELECT COUNT(*) FROM operations WHERE op_id = 'pre-v3-op'")
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .scalar_i64("SELECT COUNT(*) FROM exec_sessions WHERE session_id = 'pre-v3-exec'")
+                .unwrap(),
+            Some(1)
+        );
+        let tables = store.table_names().unwrap();
+        assert!(tables.contains(&"runtime_generations".to_owned()));
+        assert!(tables.contains(&"service_events".to_owned()));
+        drop(store);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();

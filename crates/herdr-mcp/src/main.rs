@@ -26,6 +26,7 @@ mod projects;
 mod prompt;
 mod runtime_meta;
 mod schema;
+mod service_manager;
 mod skill;
 mod snapshot;
 mod state_cache;
@@ -111,6 +112,7 @@ fn run() -> Result<ExitCode, String> {
         }
         cli::Command::Dev { dry_run } => dev::run(dry_run),
         cli::Command::Candidate { port } => mcp_http::serve_candidate(port),
+        cli::Command::Service(command) => service_manager::run(command),
         cli::Command::NativeHost(command) => native_host_install::run(command),
         cli::Command::ExtensionHost { caller_origin } => native_host::run(&caller_origin),
     }
