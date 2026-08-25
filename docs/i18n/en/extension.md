@@ -60,7 +60,7 @@ bin/herdr-extension-host install
 
 3. Load `extension/` as an unpacked Chrome extension.
 4. Open a supported Web AI site.
-5. Use the popup/HUD to bind the current conversation to a Herdr workspace.
+5. Use the popup/HUD to bind a Herdr workspace. On ChatGPT this can be done from the root page, a Project home, or a concrete conversation; a Project does not need a `/c/<id>` first.
 
 The binding unit is a workspace, not a single agent, because real development commonly looks like:
 
@@ -73,6 +73,8 @@ workspace
 ```
 
 Continuity should represent the whole work area.
+
+For ChatGPT Projects, the persistent binding is keyed by stable `project_id`, not by one conversation id. A Project-home binding can therefore exist before any chat is created. The currently active Project `/c/<id>` is only the **delivery target** (`active_conv_key`) for progress/continue messages. Opening a sibling conversation in the background does not move the binding; activating that tab changes only the delivery target. A binding created on `https://chatgpt.com/` is provisional and tab-scoped until that tab first enters a concrete Project or conversation.
 
 ## HUD controls
 
@@ -136,10 +138,10 @@ new conversation
  ↓
 verify seed
  ↓
-move workspace binding
+switch active delivery target
 ```
 
-The old binding remains authoritative until the new conversation and seed are verified. The handoff records established work history; the new conversation still re-checks live Herdr, Git and runtime state before mutation.
+For ChatGPT Projects, the Project/workspace binding and `continuity_id` remain stable throughout rollover. The old `active_conv_key` remains authoritative until the new conversation and seed are verified; only then does the extension switch the delivery target. Conversation-scoped sites such as z.ai still move their binding after confirmation. The handoff records established work history; the new conversation still re-checks live Herdr, Git and runtime state before mutation.
 
 See [Auto-continue, recovery and handoff](extension-wake.md) for the current state machine.
 

@@ -95,6 +95,8 @@ Browser extension
 
 真正的推理仍然由 Web AI 或本地 Agent 完成。
 
+ChatGPT Project 里，连续性的 binding 不再依赖某一个 conversation。workspace 直接绑定稳定 `project_id`，所以可以在 Project 首页先绑定；具体 `/c/<id>` 只作为当前 `active_conv_key`，决定 progress/continue 应投递到哪里。接力时 Project binding 与 continuity id 都不搬家，只在新 seed 确认后切换 active target。
+
 ## 为什么不用公网回推
 
 扩展和本机 runtime 在同一台机器上。
