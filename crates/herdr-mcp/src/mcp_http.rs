@@ -11,7 +11,7 @@ use crate::state_cache::EventCache;
 use crate::state_store::StateStore;
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -27,12 +27,17 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
+const PUSH_CACHE_POLL: Duration = Duration::from_millis(250);
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
+
+const SETTLED_AGENT_STATES: &[&str] = &["idle", "done", "blocked"];
 
 #[derive(Clone, Default)]
 struct SessionRegistry {
@@ -232,6 +237,8 @@ fn candidate_router(state: AppState) -> Router {
         .route("/", post(post_mcp).get(get_mcp).delete(delete_mcp))
         .route("/mcp", post(post_mcp).get(get_mcp).delete(delete_mcp))
         .route("/mcp/", post(post_mcp).get(get_mcp).delete(delete_mcp))
+        .route("/push/state", get(push_state))
+        .route("/push/events", get(push_events))
         .route("/health", get(health))
         .with_state(state)
 }
@@ -250,6 +257,361 @@ async fn shutdown_signal() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[derive(Debug, Clone, Default)]
+struct PushFilters {
+    agent: Option<String>,
+    pane: Option<String>,
+    workspace: Option<String>,
+}
+
+struct PushStreamState {
+    cache: Arc<EventCache>,
+    cursor: u64,
+    filters: PushFilters,
+    statuses: HashMap<String, String>,
+    first: bool,
+    last_heartbeat: Instant,
+}
+
+async fn push_state(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !request_authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    json_response(StatusCode::OK, &push_state_payload(&state.cache))
+}
+
+async fn push_events(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    if !request_authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let filters = PushFilters {
+        agent: query.get("agent").filter(|v| !v.is_empty()).cloned(),
+        pane: query.get("pane").filter(|v| !v.is_empty()).cloned(),
+        workspace: query.get("workspace").filter(|v| !v.is_empty()).cloned(),
+    };
+    push_events_response(state.cache, filters)
+}
+
+fn push_state_payload(cache: &EventCache) -> Value {
+    let digest = cache.digest_since(u64::MAX);
+    let snapshot = cache.snapshot();
+    let agents = push_agent_views(&digest.agents);
+    let panes = snapshot
+        .get("panes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    json!({
+        "server_time": iso_now(),
+        "agents": agents,
+        "workspaces": push_workspace_views(&digest.workspaces, &agents, &panes),
+        "panes": panes,
+    })
+}
+
+fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Response {
+    let digest = cache.digest_since(u64::MAX);
+    let agents = push_agent_views(&digest.agents);
+    let statuses = agents
+        .iter()
+        .filter_map(|agent| {
+            Some((
+                agent.get("pane")?.as_str()?.to_owned(),
+                agent.get("status")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    let state = PushStreamState {
+        cache,
+        cursor: digest.cursor,
+        filters,
+        statuses,
+        first: true,
+        last_heartbeat: Instant::now(),
+    };
+    let events = stream::unfold(state, |mut state| async move {
+        if state.first {
+            state.first = false;
+            let digest = state.cache.digest_since(u64::MAX);
+            let all_agents = push_agent_views(&digest.agents);
+            let panes = state
+                .cache
+                .snapshot()
+                .get("panes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let workspaces = push_workspace_views(&digest.workspaces, &all_agents, &panes);
+            let agents = all_agents
+                .into_iter()
+                .filter(|agent| push_filter_matches(&state.filters, agent))
+                .collect::<Vec<_>>();
+            let hello = json!({
+                "protocol": "herdr-mcp-push/v1",
+                "server_time": iso_now(),
+                "filters": push_filters_value(&state.filters),
+                "agents": agents,
+                "workspaces": workspaces,
+            });
+            let body = format!("retry: 2000\n\n{}", sse_event("hello", &hello));
+            return Some((Ok::<Bytes, Infallible>(Bytes::from(body)), state));
+        }
+
+        loop {
+            tokio::time::sleep(PUSH_CACHE_POLL).await;
+            let digest = state.cache.digest_since(state.cursor);
+            state.cursor = digest.cursor;
+            let current_agents = push_agent_views(&digest.agents);
+            let mut body = String::new();
+
+            for event in &digest.events {
+                let Some(agent) = push_agent_from_event(event, &digest.agents) else {
+                    continue;
+                };
+                append_push_transition(&mut state, &agent, &mut body);
+            }
+
+            // Reconcile against the current cache view after every cursor read.
+            // This heals an event-ring gap without opening a second daemon
+            // subscription and without replaying settled history.
+            for agent in &current_agents {
+                append_push_transition(&mut state, agent, &mut body);
+            }
+
+            if state.last_heartbeat.elapsed() >= SSE_HEARTBEAT {
+                body.push_str(": keepalive\n\n");
+                state.last_heartbeat = Instant::now();
+            }
+            if !body.is_empty() {
+                return Some((Ok::<Bytes, Infallible>(Bytes::from(body)), state));
+            }
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))
+        .header(
+            "cache-control",
+            HeaderValue::from_static("no-cache, no-transform"),
+        )
+        .header("connection", HeaderValue::from_static("keep-alive"))
+        .header("x-accel-buffering", HeaderValue::from_static("no"))
+        .body(Body::from_stream(events))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn append_push_transition(state: &mut PushStreamState, agent: &Value, body: &mut String) {
+    let Some(pane) = agent.get("pane").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(status) = agent.get("status").and_then(Value::as_str) else {
+        return;
+    };
+    let previous = state.statuses.get(pane).cloned();
+    state.statuses.insert(pane.to_owned(), status.to_owned());
+    if !push_filter_matches(&state.filters, agent) {
+        return;
+    }
+    if status == "working" && previous.as_deref() != Some("working") {
+        body.push_str(&sse_event("agent_working", agent));
+    } else if SETTLED_AGENT_STATES.contains(&status) && previous.as_deref() == Some("working") {
+        body.push_str(&sse_event("agent_settled", agent));
+    }
+}
+
+fn push_agent_from_event(event: &Value, current_agents: &[Value]) -> Option<Value> {
+    let pane_id = event.get("pane_id").and_then(Value::as_str).or_else(|| {
+        event
+            .get("pane")
+            .and_then(|pane| pane.get("pane_id"))
+            .and_then(Value::as_str)
+    })?;
+    let pane = event.get("pane").and_then(Value::as_object);
+    let current = current_agents.iter().find(|agent| {
+        agent.get("pane").and_then(Value::as_str) == Some(pane_id)
+            || agent.get("pane_id").and_then(Value::as_str) == Some(pane_id)
+    });
+    let current_push = current.map(push_agent_view);
+    let status = pane
+        .and_then(|pane| pane.get("agent_status").or_else(|| pane.get("status")))
+        .and_then(normalized_status)
+        .or_else(|| {
+            current_push
+                .as_ref()
+                .and_then(|agent| agent.get("status"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })?;
+    let field = |name: &str| {
+        pane.and_then(|pane| pane.get(name).cloned())
+            .or_else(|| {
+                current_push
+                    .as_ref()
+                    .and_then(|agent| agent.get(name).cloned())
+            })
+            .unwrap_or(Value::Null)
+    };
+    let workspace = event
+        .get("workspace_id")
+        .cloned()
+        .or_else(|| pane.and_then(|pane| pane.get("workspace_id").cloned()))
+        .or_else(|| {
+            current_push
+                .as_ref()
+                .and_then(|agent| agent.get("workspace").cloned())
+        })
+        .unwrap_or(Value::Null);
+    Some(json!({
+        "agent": pane.and_then(|pane| pane.get("agent").cloned()).or_else(|| current_push.as_ref().and_then(|agent| agent.get("agent").cloned())).unwrap_or(Value::Null),
+        "pane": pane_id,
+        "status": status,
+        "workspace": workspace,
+        "cwd": field("cwd"),
+        "terminal_title": pane.and_then(|pane| pane.get("terminal_title").cloned()).or_else(|| current_push.as_ref().and_then(|agent| agent.get("terminal_title").cloned())).unwrap_or(Value::Null),
+        "seq": pane.and_then(|pane| pane.get("state_change_seq").cloned()).or_else(|| current_push.as_ref().and_then(|agent| agent.get("seq").cloned())).unwrap_or(Value::Null),
+        "at": event.get("at").cloned().unwrap_or_else(|| json!(iso_now())),
+    }))
+}
+
+fn push_agent_views(agents: &[Value]) -> Vec<Value> {
+    agents.iter().map(push_agent_view).collect()
+}
+
+fn push_agent_view(agent: &Value) -> Value {
+    json!({
+        "name": agent.get("name").cloned().or_else(|| agent.get("agent").cloned()).unwrap_or(Value::Null),
+        "agent": agent.get("name").cloned().or_else(|| agent.get("agent").cloned()).unwrap_or(Value::Null),
+        "pane": agent.get("pane").cloned().or_else(|| agent.get("pane_id").cloned()).unwrap_or(Value::Null),
+        "status": agent.get("status").and_then(normalized_status).map(Value::String).unwrap_or(Value::Null),
+        "workspace": agent.get("workspace").cloned().or_else(|| agent.get("workspace_id").cloned()).unwrap_or(Value::Null),
+        "cwd": agent.get("cwd").cloned().or_else(|| agent.get("foreground_cwd").cloned()).unwrap_or(Value::Null),
+        "started_at": agent.get("started_at").cloned().unwrap_or(Value::Null),
+        "last_activity_at": agent.get("last_activity_at").cloned().unwrap_or(Value::Null),
+        "terminal_title": agent.get("terminal_title").cloned().unwrap_or(Value::Null),
+        "seq": agent.get("seq").cloned().or_else(|| agent.get("state_change_seq").cloned()).unwrap_or(Value::Null),
+    })
+}
+
+fn normalized_status(value: &Value) -> Option<String> {
+    value.as_str().map(str::to_owned).or_else(|| {
+        value
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+fn push_workspace_views(workspaces: &[Value], agents: &[Value], panes: &[Value]) -> Vec<Value> {
+    workspaces
+        .iter()
+        .filter_map(|workspace| {
+            let id = workspace
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| workspace.get("workspace_id").and_then(Value::as_str))?;
+            let mut roots = Vec::<String>::new();
+            if let Some(projects) = workspace.get("projects").and_then(Value::as_array) {
+                for project in projects {
+                    if let Some(root) = project.get("root").and_then(Value::as_str)
+                        && !roots.iter().any(|known| known == root)
+                    {
+                        roots.push(root.to_owned());
+                    }
+                }
+            }
+            if roots.is_empty()
+                && let Some(cwd) = workspace.get("cwd").and_then(Value::as_str)
+            {
+                roots.push(cwd.to_owned());
+            }
+            if roots.is_empty() {
+                for agent in agents {
+                    if agent.get("workspace").and_then(Value::as_str) != Some(id) {
+                        continue;
+                    }
+                    if let Some(cwd) = agent.get("cwd").and_then(Value::as_str)
+                        && !roots.iter().any(|known| known == cwd)
+                    {
+                        roots.push(cwd.to_owned());
+                    }
+                }
+            }
+            if roots.is_empty() {
+                for pane in panes {
+                    if pane.get("workspace_id").and_then(Value::as_str) != Some(id) {
+                        continue;
+                    }
+                    let cwd = pane
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .or_else(|| pane.get("foreground_cwd").and_then(Value::as_str));
+                    if let Some(cwd) = cwd
+                        && !roots.iter().any(|known| known == cwd)
+                    {
+                        roots.push(cwd.to_owned());
+                    }
+                }
+            }
+            Some(json!({
+                "id": id,
+                "label": workspace.get("label").cloned().unwrap_or(Value::Null),
+                "roots": roots,
+            }))
+        })
+        .collect()
+}
+
+fn push_filter_matches(filters: &PushFilters, data: &Value) -> bool {
+    if let Some(workspace) = &filters.workspace
+        && data.get("workspace").and_then(Value::as_str) != Some(workspace.as_str())
+    {
+        return false;
+    }
+    if let Some(pane) = &filters.pane
+        && data.get("pane").and_then(Value::as_str) != Some(pane.as_str())
+    {
+        return false;
+    }
+    if let Some(agent) = &filters.agent {
+        let want = agent
+            .split_once(':')
+            .map(|(_, suffix)| suffix)
+            .unwrap_or(agent);
+        let actual = data
+            .get("agent")
+            .or_else(|| data.get("name"))
+            .and_then(Value::as_str);
+        if actual != Some(agent.as_str()) && actual != Some(want) {
+            return false;
+        }
+    }
+    true
+}
+
+fn push_filters_value(filters: &PushFilters) -> Value {
+    json!({
+        "agent": filters.agent,
+        "pane": filters.pane,
+        "workspace": filters.workspace,
+    })
+}
+
+fn sse_event(event: &str, data: &Value) -> String {
+    let data = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_owned());
+    format!("event: {event}\ndata: {data}\n\n")
+}
+
+fn iso_now() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
 async fn health(State(state): State<AppState>) -> Response {
@@ -586,13 +948,20 @@ mod tests {
     }
 
     fn test_state(root: &std::path::Path) -> AppState {
-        AppState {
-            client: HerdrClient::new(root.join("missing-herdr.sock")),
-            cache: Arc::new(EventCache::from_snapshot_for_test(json!({
+        test_state_with_snapshot(
+            root,
+            json!({
                 "workspaces": [],
                 "panes": [],
                 "agents": []
-            }))),
+            }),
+        )
+    }
+
+    fn test_state_with_snapshot(root: &std::path::Path, snapshot: Value) -> AppState {
+        AppState {
+            client: HerdrClient::new(root.join("missing-herdr.sock")),
+            cache: Arc::new(EventCache::from_snapshot_for_test(snapshot)),
             exec: ExecRegistry::new(root.join("exec")).unwrap(),
             prompt: PromptRegistry::new(),
             skill: SkillService::new(),
@@ -665,6 +1034,137 @@ mod tests {
             .to_bytes();
         let payload: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(payload["result"]["tools"].as_array().unwrap().len(), 18);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn push_state_projects_cache_into_legacy_extension_shape() {
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [{"workspace_id":"w1","label":"alpha","roots":["/tmp/alpha"]}],
+            "panes": [{"pane_id":"w1:p1","workspace_id":"w1"}],
+            "agents": [{
+                "agent":"pi","pane_id":"w1:p1","agent_status":"working",
+                "workspace_id":"w1","cwd":"/tmp/alpha","state_change_seq":7
+            }]
+        }));
+        let payload = push_state_payload(&cache);
+        assert_eq!(payload["agents"][0]["name"], "pi");
+        assert_eq!(payload["agents"][0]["pane"], "w1:p1");
+        assert_eq!(payload["agents"][0]["status"], "working");
+        assert_eq!(payload["agents"][0]["workspace"], "w1");
+        assert_eq!(payload["agents"][0]["seq"], 7);
+        assert_eq!(payload["workspaces"][0]["id"], "w1");
+        assert_eq!(payload["workspaces"][0]["label"], "alpha");
+        assert_eq!(payload["workspaces"][0]["roots"], json!(["/tmp/alpha"]));
+        assert_eq!(payload["panes"][0]["pane_id"], "w1:p1");
+    }
+
+    #[test]
+    fn push_transition_emits_only_new_work_and_working_to_settled() {
+        let cache = Arc::new(EventCache::from_snapshot_for_test(json!({})));
+        let mut state = PushStreamState {
+            cache,
+            cursor: 0,
+            filters: PushFilters::default(),
+            statuses: HashMap::new(),
+            first: false,
+            last_heartbeat: Instant::now(),
+        };
+        let working = json!({
+            "agent":"pi","pane":"w1:p1","status":"working","workspace":"w1"
+        });
+        let settled = json!({
+            "agent":"pi","pane":"w1:p1","status":"done","workspace":"w1"
+        });
+        let mut body = String::new();
+        append_push_transition(&mut state, &working, &mut body);
+        assert!(body.contains("event: agent_working"));
+        body.clear();
+        append_push_transition(&mut state, &working, &mut body);
+        assert!(
+            body.is_empty(),
+            "duplicate working state must not wake again"
+        );
+        append_push_transition(&mut state, &settled, &mut body);
+        assert!(body.contains("event: agent_settled"));
+        body.clear();
+        append_push_transition(&mut state, &settled, &mut body);
+        assert!(
+            body.is_empty(),
+            "duplicate settled state must not wake again"
+        );
+    }
+
+    #[test]
+    fn push_event_uses_event_specific_status_before_current_final_state() {
+        let current = vec![json!({
+            "name":"pi","pane":"w1:p1","status":"done","workspace":"w1"
+        })];
+        let event = json!({
+            "at":"2026-08-25T10:00:00Z",
+            "workspace_id":"w1",
+            "pane_id":"w1:p1",
+            "pane":{
+                "agent":"pi","pane_id":"w1:p1","agent_status":"working",
+                "workspace_id":"w1","state_change_seq":10
+            }
+        });
+        let projected = push_agent_from_event(&event, &current).unwrap();
+        assert_eq!(projected["status"], "working");
+        assert_eq!(projected["seq"], 10);
+    }
+
+    #[tokio::test]
+    async fn trusted_extension_push_routes_are_tokenless_but_tcp_remains_protected() {
+        let root = test_root("push-auth");
+        let snapshot = json!({
+            "workspaces": [{"workspace_id":"w1","label":"alpha"}],
+            "panes": [],
+            "agents": []
+        });
+        let tcp = candidate_router(test_state_with_snapshot(
+            &root.join("tcp"),
+            snapshot.clone(),
+        ));
+        let tcp_request = Request::builder()
+            .method(Method::GET)
+            .uri("/push/state")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            tcp.oneshot(tcp_request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut extension_state = test_state_with_snapshot(&root.join("extension"), snapshot);
+        extension_state.trusted_extension_ipc = true;
+        let extension = candidate_router(extension_state);
+        let state_request = Request::builder()
+            .method(Method::GET)
+            .uri("/push/state")
+            .body(Body::empty())
+            .unwrap();
+        let response = extension.clone().oneshot(state_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let events_request = Request::builder()
+            .method(Method::GET)
+            .uri("/push/events")
+            .body(Body::empty())
+            .unwrap();
+        let response = extension.oneshot(events_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        let mut body = response.into_body();
+        let frame = body.frame().await.unwrap().unwrap();
+        let bytes = frame.into_data().unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("retry: 2000"));
+        assert!(text.contains("event: hello"));
+        assert!(text.contains("herdr-mcp-push/v1"));
         std::fs::remove_dir_all(root).ok();
     }
 
