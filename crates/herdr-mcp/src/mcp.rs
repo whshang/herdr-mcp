@@ -1,5 +1,6 @@
 use crate::contract;
 use crate::fs_mutation;
+use crate::fs_patch;
 use crate::fs_tools;
 use crate::git_tools;
 use crate::herdr::HerdrClient;
@@ -174,6 +175,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         }
         "herdr_fs_edit" => fs_mutation::edit(&context.cache.snapshot(), &arguments),
         "herdr_fs_write" => fs_mutation::write(&context.cache.snapshot(), &arguments),
+        "herdr_fs_patch" => fs_patch::apply(&context.cache.snapshot(), &arguments),
         "herdr_git" => git_tools::run(&context.cache.snapshot(), &arguments),
         pending if contract::tool_names().contains(&pending) => {
             return Ok(tool_result(
@@ -261,7 +263,7 @@ mod tests {
     #[test]
     fn pending_epoch_tool_is_explicit_error_result() {
         let result = tool_result(
-            json!({"ok": false, "code": "native_tool_pending", "tool": "herdr_fs_patch"}),
+            json!({"ok": false, "code": "native_tool_pending", "tool": "herdr_exec"}),
             true,
         );
         assert_eq!(result["isError"], true);
