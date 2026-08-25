@@ -1,14 +1,17 @@
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
+use crate::state_store::{OperationReservation, StateStore};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const RECORD_TTL_MS: u64 = 10 * 60_000;
 const RECORD_LIMIT: usize = 512;
+const PROMPT_OPERATION_KIND: &str = "herdr_prompt";
+const MAX_REPLAY_JSON_BYTES: usize = 128 * 1024;
 const STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WAIT_MS: u64 = 25_000;
 const MAX_WAIT_MS: u64 = 60_000;
@@ -30,13 +33,14 @@ enum RecordState {
 #[derive(Debug, Clone)]
 struct PromptRecord {
     at_ms: u64,
-    fingerprint: u64,
+    fingerprint: String,
     state: RecordState,
 }
 
 #[derive(Debug, Default)]
 struct PromptRegistryInner {
     records: Mutex<HashMap<String, PromptRecord>>,
+    store: Option<Arc<Mutex<StateStore>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -46,16 +50,33 @@ pub struct PromptRegistry {
 
 #[derive(Debug)]
 enum BeginPrompt {
-    Reserved,
+    Reserved(Option<String>),
     Replay(Value),
 }
 
 impl PromptRegistry {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn begin(&self, key: &str, fingerprint: u64) -> Result<BeginPrompt, Value> {
+    pub fn with_store(store: Arc<Mutex<StateStore>>) -> Self {
+        Self {
+            inner: Arc::new(PromptRegistryInner {
+                records: Mutex::new(HashMap::new()),
+                store: Some(store),
+            }),
+        }
+    }
+
+    fn begin(&self, key: &str, fingerprint: &str) -> Result<BeginPrompt, Value> {
+        if let Some(store) = &self.inner.store {
+            return begin_persisted(store, key, fingerprint);
+        }
+        self.begin_memory(key, fingerprint)
+    }
+
+    fn begin_memory(&self, key: &str, fingerprint: &str) -> Result<BeginPrompt, Value> {
         let now = now_ms();
         let mut records = self
             .inner
@@ -94,7 +115,7 @@ impl PromptRegistry {
             key.to_owned(),
             PromptRecord {
                 at_ms: now,
-                fingerprint,
+                fingerprint: fingerprint.to_owned(),
                 state: RecordState::Pending,
             },
         );
@@ -109,21 +130,195 @@ impl PromptRegistry {
                 records.remove(&candidate);
             }
         }
-        Ok(BeginPrompt::Reserved)
+        Ok(BeginPrompt::Reserved(None))
     }
 
-    fn complete(&self, key: &str, fingerprint: u64, result: &Value) {
+    fn complete(&self, key: &str, fingerprint: &str, result: &Value) -> Result<(), Value> {
+        if let Some(store) = &self.inner.store {
+            return complete_persisted(store, key, fingerprint, result);
+        }
         if let Ok(mut records) = self.inner.records.lock() {
             records.insert(
                 key.to_owned(),
                 PromptRecord {
                     at_ms: now_ms(),
-                    fingerprint,
+                    fingerprint: fingerprint.to_owned(),
                     state: RecordState::Complete(result.clone()),
                 },
             );
         }
+        Ok(())
     }
+}
+
+fn begin_persisted(
+    store: &Arc<Mutex<StateStore>>,
+    key: &str,
+    fingerprint: &str,
+) -> Result<BeginPrompt, Value> {
+    let now = now_ms();
+    let expires_at = now.saturating_add(RECORD_TTL_MS);
+    let key_hash = stable_digest(&[b"herdr_prompt/idempotency", key.as_bytes()]);
+    let op_id = format!("op:prompt:{}", &key_hash[..32]);
+    let mut store = store.lock().map_err(|_| {
+        json!({
+            "ok": false,
+            "code": "idempotency_store_unavailable",
+            "message": "durable idempotency store lock is unavailable; prompt was not submitted",
+            "retryable": false,
+        })
+    })?;
+    let reservation = store
+        .reserve_operation(
+            PROMPT_OPERATION_KIND,
+            &key_hash,
+            fingerprint,
+            &op_id,
+            i64::try_from(now).unwrap_or(i64::MAX),
+            i64::try_from(expires_at).unwrap_or(i64::MAX),
+        )
+        .map_err(|error| {
+            json!({
+                "ok": false,
+                "code": "idempotency_store_unavailable",
+                "message": format!("durable idempotency reservation failed: {error}"),
+                "retryable": false,
+                "hint": "prompt was not submitted; repair the local state store before retrying",
+            })
+        })?;
+
+    match reservation {
+        OperationReservation::Reserved => Ok(BeginPrompt::Reserved(Some(op_id))),
+        OperationReservation::Existing(record) => {
+            if record.request_hash != fingerprint {
+                return Err(json!({
+                    "ok": false,
+                    "code": "idempotency_key_conflict",
+                    "message": "idempotency_key is already bound to a different prompt request",
+                    "retryable": false,
+                    "op_id": record.op_id,
+                }));
+            }
+            match record.state.as_deref() {
+                Some("pending") => Err(json!({
+                    "ok": false,
+                    "code": "idempotency_in_flight",
+                    "message": "a prompt with this idempotency_key is already reserved or may have been submitted",
+                    "submitted": "unknown",
+                    "retryable": false,
+                    "op_id": record.op_id,
+                    "hint": "inspect agent/live state before any retry; a runtime restart does not clear this reservation",
+                })),
+                Some("complete") => {
+                    let result_json = record.result_json.ok_or_else(|| {
+                        json!({
+                            "ok": false,
+                            "code": "idempotency_record_corrupt",
+                            "message": "completed idempotency record has no replay payload",
+                            "retryable": false,
+                            "op_id": record.op_id,
+                        })
+                    })?;
+                    let mut replay: Value = serde_json::from_str(&result_json).map_err(|error| {
+                        json!({
+                            "ok": false,
+                            "code": "idempotency_record_corrupt",
+                            "message": format!("completed idempotency replay payload is invalid: {error}"),
+                            "retryable": false,
+                            "op_id": record.op_id,
+                        })
+                    })?;
+                    let object = replay.as_object_mut().ok_or_else(|| {
+                        json!({
+                            "ok": false,
+                            "code": "idempotency_record_corrupt",
+                            "message": "completed idempotency replay payload is not an object",
+                            "retryable": false,
+                            "op_id": record.op_id,
+                        })
+                    })?;
+                    object.insert("idempotent_replay".to_owned(), json!(true));
+                    object.insert("idempotency_persisted".to_owned(), json!(true));
+                    object.insert("op_id".to_owned(), json!(record.op_id));
+                    Ok(BeginPrompt::Replay(replay))
+                }
+                other => Err(json!({
+                    "ok": false,
+                    "code": "idempotency_record_corrupt",
+                    "message": format!("idempotency record has unsupported state {other:?}"),
+                    "retryable": false,
+                    "op_id": record.op_id,
+                })),
+            }
+        }
+    }
+}
+
+fn complete_persisted(
+    store: &Arc<Mutex<StateStore>>,
+    key: &str,
+    fingerprint: &str,
+    result: &Value,
+) -> Result<(), Value> {
+    let result_json = serde_json::to_string(result).map_err(|error| {
+        json!({
+            "ok": false,
+            "code": "idempotency_completion_persist_failed",
+            "message": format!("cannot encode prompt replay payload: {error}"),
+            "retryable": false,
+        })
+    })?;
+    if result_json.len() > MAX_REPLAY_JSON_BYTES {
+        return Err(json!({
+            "ok": false,
+            "code": "idempotency_completion_persist_failed",
+            "message": format!("prompt replay payload exceeds {} bytes", MAX_REPLAY_JSON_BYTES),
+            "retryable": false,
+            "hint": "the prompt may already have been submitted; inspect live state and do not blindly retry",
+        }));
+    }
+    let now = now_ms();
+    let expires_at = now.saturating_add(RECORD_TTL_MS);
+    let key_hash = stable_digest(&[b"herdr_prompt/idempotency", key.as_bytes()]);
+    let mut store = store.lock().map_err(|_| {
+        json!({
+            "ok": false,
+            "code": "idempotency_completion_persist_failed",
+            "message": "durable idempotency store lock is unavailable after prompt execution",
+            "retryable": false,
+            "hint": "the prompt may already have been submitted; inspect live state and do not blindly retry",
+        })
+    })?;
+    store
+        .complete_operation(
+            PROMPT_OPERATION_KIND,
+            &key_hash,
+            fingerprint,
+            &result_json,
+            i64::try_from(now).unwrap_or(i64::MAX),
+            i64::try_from(expires_at).unwrap_or(i64::MAX),
+        )
+        .map_err(|error| {
+            json!({
+                "ok": false,
+                "code": "idempotency_completion_persist_failed",
+                "message": format!("durable idempotency completion failed: {error}"),
+                "retryable": false,
+                "hint": "the prompt may already have been submitted; inspect live state and do not blindly retry",
+            })
+        })
+}
+
+fn annotate_idempotency_persistence(mut result: Value, persistence_error: Value) -> Value {
+    if let Some(object) = result.as_object_mut() {
+        object.insert("idempotency_persistence".to_owned(), persistence_error);
+        object.insert("idempotency_persisted".to_owned(), json!(false));
+        object.insert(
+            "idempotency_hint".to_owned(),
+            json!("prompt outcome may already be committed while durable replay metadata is incomplete; inspect live state before retrying"),
+        );
+    }
+    result
 }
 
 pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Value {
@@ -148,10 +343,11 @@ pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Val
         Err(error) => return error,
     };
     let fingerprint = request_fingerprint(target, text, wait.as_ref());
+    let mut operation_id = None;
 
     if let Some(key) = idempotency_key {
-        match registry.begin(key, fingerprint) {
-            Ok(BeginPrompt::Reserved) => {}
+        match registry.begin(key, &fingerprint) {
+            Ok(BeginPrompt::Reserved(op_id)) => operation_id = op_id,
             Ok(BeginPrompt::Replay(result)) => return result,
             Err(error) => return error,
         }
@@ -174,7 +370,7 @@ pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Val
         DEFAULT_CALL_TIMEOUT_MS
     };
 
-    let result = match client.call_with_timeout(
+    let mut result = match client.call_with_timeout(
         "agent.prompt",
         params,
         Duration::from_millis(call_timeout_ms),
@@ -190,8 +386,21 @@ pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Val
         Err(error) => prompt_failure(client, target, before.as_ref(), wait.is_some(), error),
     };
 
+    if let Some(op_id) = operation_id
+        && let Some(object) = result.as_object_mut()
+    {
+        object.insert("op_id".to_owned(), json!(op_id));
+    }
+
     if let Some(key) = idempotency_key {
-        registry.complete(key, fingerprint, &result);
+        if let Err(persist_error) = registry.complete(key, &fingerprint, &result) {
+            return annotate_idempotency_persistence(result, persist_error);
+        }
+        if registry.inner.store.is_some()
+            && let Some(object) = result.as_object_mut()
+        {
+            object.insert("idempotency_persisted".to_owned(), json!(true));
+        }
     }
     result
 }
@@ -504,12 +713,27 @@ fn parse_wait(value: Option<&Value>) -> Result<Option<Value>, Value> {
     Ok(Some(Value::Object(normalized)))
 }
 
-fn request_fingerprint(target: &str, text: &str, wait: Option<&Value>) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    target.hash(&mut hasher);
-    text.hash(&mut hasher);
-    wait.map(Value::to_string).hash(&mut hasher);
-    hasher.finish()
+fn request_fingerprint(target: &str, text: &str, wait: Option<&Value>) -> String {
+    let wait_json = wait.map(Value::to_string).unwrap_or_default();
+    stable_digest(&[
+        b"herdr_prompt/request",
+        target.as_bytes(),
+        text.as_bytes(),
+        wait_json.as_bytes(),
+    ])
+}
+
+fn stable_digest(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn definitely_not_delivered(error: &HerdrError) -> bool {
@@ -585,12 +809,16 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
     fn temp_socket() -> PathBuf {
         env::temp_dir().join(format!(
-            "herdr-mcp-prompt-test-{}-{}.sock",
+            "herdr-mcp-prompt-test-{}-{}-{}.sock",
             std::process::id(),
-            now_ms()
+            now_ms(),
+            NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed)
         ))
     }
 
@@ -598,19 +826,21 @@ mod tests {
     fn idempotency_registry_prevents_parallel_and_conflicting_reuse() {
         let registry = PromptRegistry::new();
         assert!(matches!(
-            registry.begin("k", 1).unwrap(),
-            BeginPrompt::Reserved
+            registry.begin("k", "fp-1").unwrap(),
+            BeginPrompt::Reserved(None)
         ));
         assert_eq!(
-            registry.begin("k", 1).unwrap_err()["code"],
+            registry.begin("k", "fp-1").unwrap_err()["code"],
             "idempotency_in_flight"
         );
         assert_eq!(
-            registry.begin("k", 2).unwrap_err()["code"],
+            registry.begin("k", "fp-2").unwrap_err()["code"],
             "idempotency_key_conflict"
         );
-        registry.complete("k", 1, &json!({"ok": true, "target": "pi"}));
-        let BeginPrompt::Replay(replay) = registry.begin("k", 1).unwrap() else {
+        registry
+            .complete("k", "fp-1", &json!({"ok": true, "target": "pi"}))
+            .unwrap();
+        let BeginPrompt::Replay(replay) = registry.begin("k", "fp-1").unwrap() else {
             panic!("expected replay");
         };
         assert_eq!(replay["ok"], true);
@@ -707,5 +937,85 @@ mod tests {
         assert_eq!(replay["idempotent_replay"], true);
         server.join().unwrap();
         fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn persisted_idempotency_replays_and_conflicts_after_registry_restart() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            for (index, expected) in ["agent.get", "agent.prompt", "agent.get"]
+                .into_iter()
+                .enumerate()
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], expected);
+                let result = match (index, expected) {
+                    (_, "agent.prompt") => json!({"prompt": {"status": "submitted"}}),
+                    (0, "agent.get") => json!({
+                        "agent": {"pane_id": "w9:p1", "agent_status": "idle", "state_change_seq": 10}
+                    }),
+                    _ => json!({
+                        "agent": {"pane_id": "w9:p1", "agent_status": "working", "state_change_seq": 11}
+                    }),
+                };
+                writeln!(stream, "{}", json!({"id": request["id"], "result": result})).unwrap();
+            }
+        });
+
+        let db_path = env::temp_dir().join(format!(
+            "herdr-mcp-prompt-ledger-{}-{}.sqlite",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let args = json!({
+            "target": "pi",
+            "text": "durable work",
+            "idempotency_key": "prompt-persisted-1"
+        });
+        let client = HerdrClient::new(&socket);
+        let first_registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(&db_path).unwrap())));
+        let first = run(&client, &first_registry, &args);
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["idempotency_persisted"], true);
+        assert!(first["op_id"].as_str().unwrap().starts_with("op:prompt:"));
+        server.join().unwrap();
+        fs::remove_file(&socket).unwrap();
+        drop(first_registry);
+
+        let second_registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(&db_path).unwrap())));
+        let unreachable = HerdrClient::new(&socket);
+        let replay = run(&unreachable, &second_registry, &args);
+        assert_eq!(replay["ok"], true);
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["idempotency_persisted"], true);
+        assert!(replay["op_id"].as_str().unwrap().starts_with("op:prompt:"));
+
+        let conflict = run(
+            &unreachable,
+            &second_registry,
+            &json!({
+                "target": "pi",
+                "text": "different durable work",
+                "idempotency_key": "prompt-persisted-1"
+            }),
+        );
+        assert_eq!(conflict["code"], "idempotency_key_conflict");
+        assert_eq!(conflict["retryable"], false);
+
+        drop(second_registry);
+        fs::remove_file(&db_path).ok();
+        fs::remove_file(db_path.with_extension("sqlite-wal")).ok();
+        fs::remove_file(db_path.with_extension("sqlite-shm")).ok();
     }
 }

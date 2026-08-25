@@ -9,16 +9,16 @@
 //! - hold Git live state, stdout/stderr blobs, or API keys/secrets;
 //! - know anything about `prompt`, `exec_sessions` runtime behavior, or `runtime`.
 //!
-//! The store only guarantees a well-formed, versioned SQLite file plus a small
-//! transactional API. Consumers wire real records in later migrations.
+//! The store guarantees a well-formed, versioned SQLite file plus a small
+//! transactional API. `herdr_prompt` is the first live consumer through the
+//! durable operations ledger; exec-session and continuity consumers remain
+//! incremental follow-ups.
 
-// Foundation layer with no live consumer yet: nothing in the binary wires it up
-// until a specific feature (operation ledger / exec-session persistence) is
-// built on top. It is fully exercised by unit tests, so dead_code here is
-// expected and intentional, not a leak.
+// Some foundation APIs are intentionally ahead of their consumers. Keep them
+// available while Reliability Kernel features migrate onto this shared store.
 #![allow(dead_code)]
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
@@ -91,9 +91,42 @@ CREATE INDEX IF NOT EXISTS idx_exec_sessions_expires
     ON exec_sessions(expires_at) WHERE expires_at IS NOT NULL;
 "#;
 
+/// Migration 2: make operation idempotency durable and replayable.
+///
+/// The stored idempotency value is an application-provided digest rather than
+/// the raw public key. Uniqueness is scoped by operation kind so unrelated
+/// mutation families can intentionally reuse the same external key.
+const MIGRATION_V2: &str = r#"
+ALTER TABLE operations ADD COLUMN result_json TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_operations_kind_idempotency
+    ON operations(kind, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
-const MIGRATIONS: &[&str] = &[MIGRATION_V1];
+const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2];
+
+/// Existing durable operation found while reserving an idempotency key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationRecord {
+    pub op_id: String,
+    pub request_hash: String,
+    pub phase: Option<String>,
+    pub state: Option<String>,
+    pub result_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub expires_at: Option<i64>,
+}
+
+/// Result of atomically reserving an operation idempotency slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationReservation {
+    Reserved,
+    Existing(OperationRecord),
+}
 
 // ---------------------------------------------------------------------------
 // Store
@@ -298,6 +331,120 @@ impl StateStore {
             busy_timeout_ms: self.busy_timeout()?,
         })
     }
+
+    /// Atomically reserve `(kind, idempotency_key)` for one mutation request.
+    ///
+    /// Expired rows are removed first. `INSERT OR IGNORE` plus the scoped
+    /// unique index makes concurrent processes converge on one authoritative
+    /// row without a read-then-write race.
+    pub fn reserve_operation(
+        &mut self,
+        kind: &str,
+        idempotency_key: &str,
+        request_hash: &str,
+        op_id: &str,
+        now_ms: i64,
+        expires_at: i64,
+    ) -> Result<OperationReservation, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin operation reservation: {error}"))?;
+        tx.execute(
+            "DELETE FROM operations WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            params![now_ms],
+        )
+        .map_err(|error| format!("cannot prune expired operations: {error}"))?;
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO operations (
+                    op_id, kind, idempotency_key, request_hash, phase, state,
+                    created_at, updated_at, expires_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'reserved', 'pending', ?5, ?5, ?6)",
+                params![
+                    op_id,
+                    kind,
+                    idempotency_key,
+                    request_hash,
+                    now_ms,
+                    expires_at
+                ],
+            )
+            .map_err(|error| format!("cannot reserve operation: {error}"))?;
+        if inserted == 1 {
+            tx.commit()
+                .map_err(|error| format!("cannot commit operation reservation: {error}"))?;
+            return Ok(OperationReservation::Reserved);
+        }
+
+        let existing = tx
+            .query_row(
+                "SELECT op_id, request_hash, phase, state, result_json,
+                        created_at, updated_at, expires_at
+                 FROM operations
+                 WHERE kind = ?1 AND idempotency_key = ?2",
+                params![kind, idempotency_key],
+                |row| {
+                    Ok(OperationRecord {
+                        op_id: row.get(0)?,
+                        request_hash: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        phase: row.get(2)?,
+                        state: row.get(3)?,
+                        result_json: row.get(4)?,
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                        expires_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read reserved operation: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit operation lookup: {error}"))?;
+        existing.map(OperationReservation::Existing).ok_or_else(|| {
+            "operation reservation was ignored without an authoritative existing row".to_owned()
+        })
+    }
+
+    /// Mark one reserved operation complete and persist the bounded replay
+    /// payload. A missing/mismatched row is an integrity error, not an upsert.
+    pub fn complete_operation(
+        &mut self,
+        kind: &str,
+        idempotency_key: &str,
+        request_hash: &str,
+        result_json: &str,
+        now_ms: i64,
+        expires_at: i64,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin operation completion: {error}"))?;
+        let changed = tx
+            .execute(
+                "UPDATE operations
+                 SET phase = 'settled', state = 'complete', result_json = ?1,
+                     updated_at = ?2, expires_at = ?3
+                 WHERE kind = ?4 AND idempotency_key = ?5 AND request_hash = ?6",
+                params![
+                    result_json,
+                    now_ms,
+                    expires_at,
+                    kind,
+                    idempotency_key,
+                    request_hash
+                ],
+            )
+            .map_err(|error| format!("cannot complete operation: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "operation completion expected one matching row, updated {changed}"
+            ));
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit operation completion: {error}"))
+    }
 }
 
 /// Human/ops-facing summary of an open store.
@@ -407,12 +554,7 @@ impl StateStore {
                 let pid = row.get::<_, i64>(1)?;
                 let process_group = row.get::<_, Option<i64>>(2)?;
                 let started_at = row.get::<_, i64>(3)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    pid,
-                    process_group,
-                    started_at,
-                ))
+                Ok((row.get::<_, String>(0)?, pid, process_group, started_at))
             })
             .map_err(|error| format!("cannot query exec recovery rows: {error}"))?;
         let mut result = Vec::new();
@@ -715,6 +857,7 @@ mod tests {
         let indexes = store.index_names().unwrap();
         for index in [
             "idx_operations_idempotency",
+            "idx_operations_kind_idempotency",
             "idx_operations_expires",
             "idx_exec_sessions_expires",
         ] {
@@ -732,6 +875,109 @@ mod tests {
             "durable exec schema must not store command/cwd"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn operation_reservation_is_scoped_atomic_and_replayable() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        assert_eq!(
+            store
+                .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 10, 1_000)
+                .unwrap(),
+            OperationReservation::Reserved
+        );
+        let OperationReservation::Existing(existing) = store
+            .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 11, 1_000)
+            .unwrap()
+        else {
+            panic!("expected existing reservation");
+        };
+        assert_eq!(existing.op_id, "op-a");
+        assert_eq!(existing.request_hash, "req-a");
+        assert_eq!(existing.state.as_deref(), Some("pending"));
+
+        assert_eq!(
+            store
+                .reserve_operation("other_mutation", "key-hash", "req-b", "op-b", 12, 1_000)
+                .unwrap(),
+            OperationReservation::Reserved,
+            "the same digest may be reused by a different operation kind"
+        );
+
+        store
+            .complete_operation(
+                "herdr_prompt",
+                "key-hash",
+                "req-a",
+                r#"{"ok":true}"#,
+                20,
+                2_000,
+            )
+            .unwrap();
+        let OperationReservation::Existing(completed) = store
+            .reserve_operation("herdr_prompt", "key-hash", "req-a", "op-a", 21, 2_000)
+            .unwrap()
+        else {
+            panic!("expected completed operation");
+        };
+        assert_eq!(completed.state.as_deref(), Some("complete"));
+        assert_eq!(completed.phase.as_deref(), Some("settled"));
+        assert_eq!(completed.result_json.as_deref(), Some(r#"{"ok":true}"#));
+    }
+
+    #[test]
+    fn operation_replay_survives_database_reopen() {
+        let path = temp_db_path();
+        {
+            let mut store = StateStore::open(&path).unwrap();
+            assert_eq!(
+                store
+                    .reserve_operation(
+                        "herdr_prompt",
+                        "persisted-key",
+                        "persisted-request",
+                        "persisted-op",
+                        100,
+                        10_000,
+                    )
+                    .unwrap(),
+                OperationReservation::Reserved
+            );
+            store
+                .complete_operation(
+                    "herdr_prompt",
+                    "persisted-key",
+                    "persisted-request",
+                    r#"{"ok":true,"value":7}"#,
+                    110,
+                    10_000,
+                )
+                .unwrap();
+        }
+        {
+            let mut reopened = StateStore::open(&path).unwrap();
+            let OperationReservation::Existing(record) = reopened
+                .reserve_operation(
+                    "herdr_prompt",
+                    "persisted-key",
+                    "persisted-request",
+                    "persisted-op",
+                    120,
+                    10_000,
+                )
+                .unwrap()
+            else {
+                panic!("expected persisted replay row");
+            };
+            assert_eq!(record.state.as_deref(), Some("complete"));
+            assert_eq!(
+                record.result_json.as_deref(),
+                Some(r#"{"ok":true,"value":7}"#)
+            );
+        }
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
     }
 
     #[test]

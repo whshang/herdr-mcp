@@ -6,6 +6,7 @@ use crate::prompt::PromptRegistry;
 use crate::runtime_meta;
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
+use crate::state_store::StateStore;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -135,8 +136,12 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
     let exec_state_dir = env::var_os("HERDR_MCP_STATE_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| paths.dev_state_dir.join("candidate"));
+    let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(
+        &exec_state_dir,
+        "state",
+    )?));
     let exec = ExecRegistry::new(exec_state_dir)?;
-    let prompt = PromptRegistry::new();
+    let prompt = PromptRegistry::with_store(state_store);
     let skill = SkillService::new();
     if !cache.wait_ready(Duration::from_secs(3)) {
         return Err(format!(
