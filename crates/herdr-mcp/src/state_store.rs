@@ -1013,6 +1013,21 @@ impl StateStore {
                     "cannot reactivate previous generation {previous_generation_id}"
                 ));
             }
+            tx.execute(
+                "UPDATE service_rollbacks
+                 SET state = 'ready', consumed_at = NULL
+                 WHERE rollback_id = (
+                     SELECT rollback_id FROM service_rollbacks
+                     WHERE activated_generation_id = ?1 AND state = 'superseded'
+                     ORDER BY created_at DESC LIMIT 1
+                 )",
+                [previous_generation_id],
+            )
+            .map_err(|error| {
+                format!(
+                    "cannot reactivate rollback chain for previous generation {previous_generation_id}: {error}"
+                )
+            })?;
         }
         let changed = tx
             .execute(
@@ -1569,6 +1584,77 @@ mod tests {
                 .as_deref(),
             Some("consumed")
         );
+    }
+
+    #[test]
+    fn layered_rust_rollback_reactivates_the_previous_generation_fallback() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        store
+            .stage_runtime_generation("rust-a", "/runtime/a", "sha-a", "node-adoption", 10)
+            .unwrap();
+        store
+            .prepare_service_rollback(&ServiceRollbackRecord {
+                rollback_id: "rb-node-a".to_owned(),
+                source_kind: "node".to_owned(),
+                activated_generation_id: "rust-a".to_owned(),
+                server_plist_backup: Some("/backups/node.plist".to_owned()),
+                watchdog_plist_backup: Some("/backups/watchdog.plist".to_owned()),
+                previous_current_target: None,
+                server_was_loaded: true,
+                watchdog_was_loaded: true,
+                created_at: 20,
+                state: "prepared".to_owned(),
+            })
+            .unwrap();
+        store
+            .activate_runtime_generation_with_rollback("rust-a", Some("rb-node-a"), 30)
+            .unwrap();
+
+        store
+            .stage_runtime_generation("rust-b", "/runtime/b", "sha-b", "service-install", 40)
+            .unwrap();
+        store
+            .prepare_service_rollback(&ServiceRollbackRecord {
+                rollback_id: "rb-rust-b".to_owned(),
+                source_kind: "rust".to_owned(),
+                activated_generation_id: "rust-b".to_owned(),
+                server_plist_backup: Some("/backups/rust-a.plist".to_owned()),
+                watchdog_plist_backup: None,
+                previous_current_target: Some("generations/rust-a".to_owned()),
+                server_was_loaded: true,
+                watchdog_was_loaded: false,
+                created_at: 50,
+                state: "prepared".to_owned(),
+            })
+            .unwrap();
+        store
+            .activate_runtime_generation_with_rollback("rust-b", Some("rb-rust-b"), 60)
+            .unwrap();
+        assert_eq!(
+            store
+                .scalar_text("SELECT state FROM service_rollbacks WHERE rollback_id = 'rb-node-a'")
+                .unwrap()
+                .as_deref(),
+            Some("superseded")
+        );
+
+        let rust_rollback = store.begin_latest_service_rollback().unwrap().unwrap();
+        assert_eq!(rust_rollback.rollback_id, "rb-rust-b");
+        store
+            .complete_service_rollback("rb-rust-b", "rust-b", Some("rust-a"), 70)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .scalar_text("SELECT state FROM service_rollbacks WHERE rollback_id = 'rb-node-a'")
+                .unwrap()
+                .as_deref(),
+            Some("ready")
+        );
+        let node_rollback = store.begin_latest_service_rollback().unwrap().unwrap();
+        assert_eq!(node_rollback.rollback_id, "rb-node-a");
+        assert_eq!(node_rollback.source_kind, "node");
+        assert_eq!(node_rollback.activated_generation_id, "rust-a");
     }
 
     #[test]

@@ -113,6 +113,14 @@ mod macos {
     }
 
     pub(super) fn run(command: ServiceCommand) -> Result<ExitCode, String> {
+        if service_command_requires_independent_process(&command)
+            && env::var_os("HERDR_MCP_EXEC_ID").is_some()
+        {
+            return Err(
+                "service mutations cannot run inside a managed herdr_exec session; run the command from an independent terminal so restarting dev.herdr-mcp.server cannot terminate its own upgrade transaction"
+                    .to_owned(),
+            );
+        }
         let paths = ServicePaths::discover()?;
         let result = match command {
             ServiceCommand::Install { adopt_node } => install(&paths, adopt_node)?,
@@ -133,6 +141,10 @@ mod macos {
         } else {
             ExitCode::from(1)
         })
+    }
+
+    fn service_command_requires_independent_process(command: &ServiceCommand) -> bool {
+        !matches!(command, ServiceCommand::Status)
     }
 
     impl ServicePaths {
@@ -1431,6 +1443,34 @@ mod macos {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        #[test]
+        fn service_status_is_the_only_command_safe_inside_managed_exec() {
+            assert!(!service_command_requires_independent_process(
+                &ServiceCommand::Status
+            ));
+            assert!(service_command_requires_independent_process(
+                &ServiceCommand::Install { adopt_node: false }
+            ));
+            assert!(service_command_requires_independent_process(
+                &ServiceCommand::Install { adopt_node: true }
+            ));
+            assert!(service_command_requires_independent_process(
+                &ServiceCommand::Start
+            ));
+            assert!(service_command_requires_independent_process(
+                &ServiceCommand::Stop
+            ));
+            assert!(service_command_requires_independent_process(
+                &ServiceCommand::Restart
+            ));
+            assert!(service_command_requires_independent_process(
+                &ServiceCommand::Rollback
+            ));
+            assert!(service_command_requires_independent_process(
+                &ServiceCommand::Uninstall
+            ));
+        }
 
         fn root(label: &str) -> PathBuf {
             env::temp_dir().join(format!(
