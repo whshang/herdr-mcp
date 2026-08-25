@@ -4,6 +4,9 @@ dist/
 site-dist/
 *.tsbuildinfo
 
+# --- Rust build / cache ---
+target/
+
 # --- Test / coverage / tooling artifacts ---
 coverage/
 .pytest_cache/

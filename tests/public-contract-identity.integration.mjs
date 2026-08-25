@@ -23,13 +23,17 @@ import {
 } from "../edge/cloudflare/dist/version.js";
 
 const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+const contractFixture = JSON.parse(
+  await readFile(new URL("../contracts/epoch2.json", import.meta.url), "utf8"),
+);
 
 test("epoch-2 public contract identity is identical across runtime, link, edge and operational CLIs", () => {
-  const expectedHash = EPOCH2_CONTRACT.contract_hash;
-  const expectedEpoch = EPOCH2_CONTRACT.contract_epoch;
-  const expectedCount = EPOCH2_CONTRACT.tool_count;
+  const expectedHash = contractFixture.contract_hash;
+  const expectedEpoch = contractFixture.contract_epoch;
+  const expectedCount = contractFixture.tool_count;
 
   assert.equal(PUBLIC_CONTRACT, EPOCH2_CONTRACT);
+  assert.deepEqual(EPOCH2_CONTRACT, contractFixture);
   assert.equal(expectedEpoch, 2);
   assert.equal(expectedCount, 18);
   assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name === "herdr_skill"), true);
