@@ -569,6 +569,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rusqlite",
+ "ryu-js",
  "semver",
  "serde_json",
  "sha2",

@@ -13,9 +13,9 @@
 //!   3. Strings are emitted with JSON escaping (UTF-8 bytes, no
 //!      ASCII-minifying), matching `JSON.stringify` and `serde_json` default
 //!      string serialization.
-//!   4. Numbers are emitted in their JSON numeric form. NaN / Infinity /
-//!      -Infinity have no canonical form and are rejected at the `Value` type
-//!      boundary (serde_json's `Number` cannot represent them).
+//!   4. Numbers are projected through the JavaScript `Number` model and emitted
+//!      with ECMAScript `Number::toString` formatting, matching `JSON.stringify`.
+//!      NaN / Infinity / -Infinity have no canonical form.
 //!   5. `null` and booleans are supported.
 //!   6. Cyclic and sparse structures cannot occur for an owned `serde_json::Value`
 //!      tree; nesting depth is enforced via `max_depth`.
@@ -56,6 +56,22 @@ pub fn canonical_bytes(value: &Value, max_depth: usize) -> Result<Vec<u8>, Canon
     Ok(canonical_json(value, max_depth)?.into_bytes())
 }
 
+fn js_number_to_string(n: &serde_json::Number) -> Result<String, CanonicalJsonError> {
+    // The TypeScript oracle canonicalizes parsed JSON numbers as JavaScript
+    // Numbers. Project every serde_json numeric representation through f64 so
+    // integer precision and notation follow the same semantics before dtoa.
+    let value = n.as_f64().ok_or_else(|| {
+        CanonicalJsonError("number is not representable as a JavaScript Number".to_owned())
+    })?;
+    if !value.is_finite() {
+        return Err(CanonicalJsonError(
+            "non-finite number is not canonical".to_owned(),
+        ));
+    }
+    let mut buffer = ryu_js::Buffer::new();
+    Ok(buffer.format(value).to_owned())
+}
+
 fn write_value(
     v: &Value,
     depth: usize,
@@ -71,7 +87,7 @@ fn write_value(
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
         Value::Bool(false) => out.push_str("false"),
-        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::Number(n) => out.push_str(&js_number_to_string(n)?),
         Value::String(s) => {
             out.push_str(&serde_json::to_string(s).map_err(|e| CanonicalJsonError(e.to_string()))?);
         }
@@ -139,5 +155,28 @@ mod tests {
         let text = canonical_json(&obj, usize::MAX).unwrap();
         let bytes = canonical_bytes(&obj, usize::MAX).unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), text);
+    }
+
+    #[test]
+    fn numbers_match_javascript_json_stringify_golden_vectors() {
+        // Expected strings are from JSON.stringify(JSON.parse(source)) in Node.
+        let cases = [
+            ("1.0", "1"),
+            ("-0.0", "0"),
+            ("0.000001", "0.000001"),
+            ("0.0000001", "1e-7"),
+            ("1e20", "100000000000000000000"),
+            ("1e21", "1e+21"),
+            ("9007199254740993", "9007199254740992"),
+        ];
+
+        for (source, expected) in cases {
+            let value: Value = serde_json::from_str(source).unwrap();
+            assert_eq!(
+                canonical_json(&value, usize::MAX).unwrap(),
+                expected,
+                "source={source}"
+            );
+        }
     }
 }
