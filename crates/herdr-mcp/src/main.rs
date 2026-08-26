@@ -24,6 +24,7 @@ mod patch;
 mod paths;
 mod projects;
 mod prompt;
+mod relay;
 mod release_trust;
 mod runtime_meta;
 mod schema;
