@@ -100,22 +100,47 @@ const H2W_CONTENT_VERSION = "0.1.62";
     return CONVERSATION_HEALTH.createConversationHealth(convKey);
   }
 
+  let conversationHealthPersistChain = Promise.resolve();
+
   async function persistConversationHealth(record) {
-    if (!record?.convKey || !runtimeAlive()) return;
-    try {
-      const stored = await chrome.storage.local.get([HEALTH_STORAGE_KEY]);
-      const map = { ...(stored?.[HEALTH_STORAGE_KEY] || {}), [record.convKey]: record };
-      const entries = Object.entries(map);
-      if (entries.length > 20) {
-        entries.sort((a, b) => {
-          const at = a[1]?.last_turn_end_at || a[1]?.last_user_submit_at || a[1]?.last_reload_at || 0;
-          const bt = b[1]?.last_turn_end_at || b[1]?.last_user_submit_at || b[1]?.last_reload_at || 0;
-          return bt - at;
-        });
-        for (const [key] of entries.slice(20)) delete map[key];
+    if (!record?.convKey || !runtimeAlive()) return false;
+    const snapshot = { ...record };
+    const write = async () => {
+      try {
+        const stored = await chrome.storage.local.get([HEALTH_STORAGE_KEY]);
+        const map = { ...(stored?.[HEALTH_STORAGE_KEY] || {}), [snapshot.convKey]: snapshot };
+        const entries = Object.entries(map);
+        if (entries.length > 20) {
+          entries.sort((a, b) => {
+            const at = a[1]?.last_turn_end_at || a[1]?.last_user_submit_at || a[1]?.last_reload_at || 0;
+            const bt = b[1]?.last_turn_end_at || b[1]?.last_user_submit_at || b[1]?.last_reload_at || 0;
+            return bt - at;
+          });
+          for (const [key] of entries.slice(20)) delete map[key];
+        }
+        await chrome.storage.local.set({ [HEALTH_STORAGE_KEY]: map });
+        return true;
+      } catch (_) {
+        return false;
       }
-      await chrome.storage.local.set({ [HEALTH_STORAGE_KEY]: map });
-    } catch (_) { /* recovery state is best-effort persistence */ }
+    };
+    const queued = conversationHealthPersistChain.then(write, write);
+    conversationHealthPersistChain = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  async function reloadAfterPersistingConversationState() {
+    // Recovery budgets must survive the reload that consumes them. The normal
+    // state writer remains fire-and-forget for hot-path updates, but its writes
+    // are serialized so this final barrier cannot be overwritten by an older
+    // record after navigation starts.
+    if (!conversationHealth?.convKey || !RECOVERY_CONTROLLER?.runAfterDurablePersistence) return false;
+    return RECOVERY_CONTROLLER.runAfterDurablePersistence({
+      persist: () => persistConversationHealth(conversationHealth),
+      action: () => location.reload(),
+      waitMs: 150,
+      waitFn: wait,
+    });
   }
 
   async function ensureConversationHealth(convKey = ADAPTER.getConversationKey()) {
@@ -1173,8 +1198,7 @@ const H2W_CONTENT_VERSION = "0.1.62";
     await wait(100);
     const reloading = RECOVERY_CONTROLLER.markReloaded(conversationHealth);
     markConversationState({ ...reloading, reload_reason: "chatgpt_disconnected" });
-    await wait(150);
-    location.reload();
+    await reloadAfterPersistingConversationState();
     return true;
   }
 
@@ -1209,8 +1233,7 @@ const H2W_CONTENT_VERSION = "0.1.62";
         thread_error_reload_attempt: refreshAttempts + 1,
         reload_reason: "thread_error_server_ahead",
       });
-      await wait(150);
-      location.reload();
+      await reloadAfterPersistingConversationState();
       return true;
     }
 
@@ -1222,7 +1245,15 @@ const H2W_CONTENT_VERSION = "0.1.62";
         thread_error_retry_attempt: retryAttempts + 1,
         thread_error_last_seen_at: now,
       });
-      threadError.retry.click();
+      // Persist the consumed Retry budget before invoking ChatGPT's native
+      // action. A storage failure leaves the explicit error authoritative and
+      // prevents a crash/reload from making a second Retry eligible.
+      const retryStarted = await RECOVERY_CONTROLLER.runAfterDurablePersistence({
+        persist: () => persistConversationHealth(conversationHealth),
+        action: () => threadError.retry.click(),
+        waitMs: 0,
+      });
+      if (!retryStarted) return true;
       const confirm = await confirmReplyStarted(RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.replyTimeoutMs);
       if (confirm?.replyStarted) {
         markConversationState(CONVERSATION_HEALTH.markReplyStarted(conversationHealth));
@@ -1242,8 +1273,7 @@ const H2W_CONTENT_VERSION = "0.1.62";
           thread_error_reload_attempt: refreshAttempts + 1,
           reload_reason: "thread_error_retry_timeout",
         });
-        await wait(150);
-        location.reload();
+        await reloadAfterPersistingConversationState();
       }
       return true;
     }
@@ -1264,8 +1294,7 @@ const H2W_CONTENT_VERSION = "0.1.62";
         thread_error_reload_attempt: refreshAttempts + 1,
         reload_reason: reloadReason,
       });
-      await wait(150);
-      location.reload();
+      await reloadAfterPersistingConversationState();
       return true;
     }
 
@@ -1320,8 +1349,7 @@ const H2W_CONTENT_VERSION = "0.1.62";
     markConversationState(pending);
     const reloading = RECOVERY_CONTROLLER.markReloaded(conversationHealth);
     markConversationState({ ...reloading, reload_reason: "stale_view", assistant_signature_before_reload: signature });
-    await wait(150);
-    location.reload();
+    await reloadAfterPersistingConversationState();
     return true;
   }
 
@@ -1373,8 +1401,7 @@ const H2W_CONTENT_VERSION = "0.1.62";
     await wait(100);
     const reloading = RECOVERY_CONTROLLER.markReloaded(conversationHealth);
     markConversationState({ ...reloading, assistant_signature_before_reload: signature });
-    await wait(150);
-    location.reload();
+    await reloadAfterPersistingConversationState();
     return true;
   }
 

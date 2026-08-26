@@ -147,6 +147,35 @@ function canReloadSafely({
     && reloadAttempts < policy.maxReloadAttempts;
 }
 
+async function runAfterDurablePersistence({
+  persist,
+  action,
+  waitMs = 0,
+  waitFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+} = {}) {
+  if (typeof persist !== "function" || typeof action !== "function") return false;
+  let persisted = false;
+  try {
+    persisted = (await persist()) === true;
+  } catch (_) {
+    persisted = false;
+  }
+  if (!persisted) return false;
+  if (waitMs > 0) {
+    try {
+      await waitFn(waitMs);
+    } catch (_) {
+      return false;
+    }
+  }
+  try {
+    action();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 globalThis.H2W_RECOVERY_CONTROLLER = {
   DEFAULT_RECOVERY_POLICY,
   shouldSendRecovery,
@@ -158,4 +187,5 @@ globalThis.H2W_RECOVERY_CONTROLLER = {
   classifyReplyTimeout,
   canReloadSafely,
   classifyViewFreshness,
+  runAfterDurablePersistence,
 };
