@@ -1622,10 +1622,41 @@ mod macos {
             return Ok(None);
         }
 
+        // Verify the generation directory itself is a real directory, not a
+        // symlink; a symlinked generation dir is an unsafe path and must fail
+        // closed. A missing generation dir falls through to repair like a
+        // missing binary.
+        let generation_dir = paths.generations_dir.join(&generation_id);
+        match fs::symlink_metadata(&generation_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "installed generation directory must not be a symlink: {}",
+                    generation_dir.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!(
+                    "installed generation directory is not a directory: {}",
+                    generation_dir.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect installed generation directory {}: {}",
+                    generation_dir.display(),
+                    error
+                ));
+            }
+        }
+
         // Verify the installed generation binary is a regular non-symlink file
         // whose full SHA equals the source SHA. Missing or hash-mismatched
         // binaries fall through to repair; symlink/unsafe paths fail closed.
-        let installed_binary = paths.generations_dir.join(&generation_id).join("herdr-mcp");
+        let installed_binary = generation_dir.join("herdr-mcp");
         let installed_sha = match fs::symlink_metadata(&installed_binary) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(format!(
@@ -3197,6 +3228,16 @@ mod macos {
             fs::write(&generation.binary, b"rust-binary-fixture").unwrap();
             fs::set_permissions(&generation.binary, fs::Permissions::from_mode(0o700)).unwrap();
 
+            // Installed generation directory symlink fails closed.
+            let generation_dir = paths.generations_dir.join(&generation.generation_id);
+            fs::remove_dir_all(&generation_dir).unwrap();
+            symlink("outside", &generation_dir).unwrap();
+            assert!(same_active_install_noop_with(&paths, &matching, || true, || true,).is_err());
+            fs::remove_file(&generation_dir).unwrap();
+            fs::create_dir_all(&generation_dir).unwrap();
+            fs::write(&generation.binary, b"rust-binary-fixture").unwrap();
+            fs::set_permissions(&generation.binary, fs::Permissions::from_mode(0o700)).unwrap();
+
             // Plist generation env mismatch falls through.
             let mismatched = rust_descriptor("rust-other");
             assert!(
@@ -3299,6 +3340,62 @@ mod macos {
                     .file_type()
                     .is_symlink(),
                 current_kind_before
+            );
+            assert_eq!(paths.backups_dir.exists(), backups_before);
+            assert_eq!(paths.guardians_dir.exists(), guardians_before);
+            let mut config_entries_after = fs::read_dir(&paths.config_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            config_entries_after.sort();
+            assert_eq!(config_entries_after, config_entries_before);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn same_active_install_full_path_fails_closed_on_symlinked_generation_dir_without_side_effects()
+         {
+            let (root, paths) = fixture();
+            let generation = prepare_generation(&paths).unwrap();
+            switch_current(&paths, &generation).unwrap();
+            let env = service_environment(&paths, &BTreeMap::new(), &generation).unwrap();
+            let plist = encode_service_plist(&paths, &env).unwrap();
+            fs::create_dir_all(paths.plist.parent().unwrap()).unwrap();
+            fs::write(&paths.plist, &plist).unwrap();
+
+            let lock = ServiceMutationLock::acquire(&paths).unwrap();
+
+            // Replace the generation directory with a symlink so the full
+            // preflight fails closed before any mutation. Take the baseline only
+            // after this intentional fixture mutation.
+            let generation_dir = paths.generations_dir.join(&generation.generation_id);
+            fs::remove_dir_all(&generation_dir).unwrap();
+            symlink("outside", &generation_dir).unwrap();
+
+            let plist_before = fs::read(&paths.plist).unwrap();
+            let current_before = fs::read_link(&paths.current_link).unwrap();
+            let generation_dir_kind_before = fs::symlink_metadata(&generation_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink();
+            let backups_before = paths.backups_dir.exists();
+            let guardians_before = paths.guardians_dir.exists();
+            let mut config_entries_before = fs::read_dir(&paths.config_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            config_entries_before.sort();
+
+            assert!(install_with_noop_checks(&paths, false, &lock, || true, || true).is_err());
+
+            assert_eq!(fs::read(&paths.plist).unwrap(), plist_before);
+            assert_eq!(fs::read_link(&paths.current_link).unwrap(), current_before);
+            assert_eq!(
+                fs::symlink_metadata(&generation_dir)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                generation_dir_kind_before
             );
             assert_eq!(paths.backups_dir.exists(), backups_before);
             assert_eq!(paths.guardians_dir.exists(), guardians_before);
