@@ -1,0 +1,203 @@
+{
+  "runtime_identity": {
+    "runtime_version": "0.3.26",
+    "runtime_commit": "abc123",
+    "runtime_generation": "gen-7",
+    "contract_epoch": 1,
+    "contract_hash": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    "herdr_version": "0.3.32",
+    "herdr_protocol": "relay.v1"
+  },
+  "builder_cases": [
+    {
+      "name": "hello",
+      "builder": "encodeHelloMessage",
+      "args": ["w1", "boot-01", "0.1.0", ["relay.request", "relay.cancel"], "__RUNTIME__", 1700000000000],
+      "expected": {
+        "protocol_version": 1,
+        "kind": "hello",
+        "workstation_id": "w1",
+        "boot_id": "boot-01",
+        "link_version": "0.1.0",
+        "connected_at_ms": 1700000000000,
+        "capabilities": ["relay.request", "relay.cancel"],
+        "runtime": {
+          "runtime_version": "0.3.26",
+          "runtime_commit": "abc123",
+          "runtime_generation": "gen-7",
+          "contract_epoch": 1,
+          "contract_hash": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "herdr_version": "0.3.32",
+          "herdr_protocol": "relay.v1"
+        }
+      }
+    },
+    {
+      "name": "heartbeat",
+      "builder": "encodeHeartbeatMessage",
+      "args": ["w1", "boot-01", 2, "__RUNTIME__", 120000, 1700000000000],
+      "expected": {
+        "protocol_version": 1,
+        "kind": "heartbeat",
+        "workstation_id": "w1",
+        "boot_id": "boot-01",
+        "sent_at_ms": 1700000000000,
+        "link_uptime_ms": 120000,
+        "active_requests": 2,
+        "runtime": {
+          "runtime_version": "0.3.26",
+          "runtime_commit": "abc123",
+          "runtime_generation": "gen-7",
+          "contract_epoch": 1,
+          "contract_hash": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "herdr_version": "0.3.32",
+          "herdr_protocol": "relay.v1"
+        }
+      }
+    },
+    {
+      "name": "status report",
+      "builder": "encodeStatusReport",
+      "args": ["w1", "__RUNTIME__", true, null, 1, 300000, null, 1700000000000],
+      "expected": {
+        "protocol_version": 1,
+        "kind": "status",
+        "workstation_id": "w1",
+        "query": false,
+        "runtime": {
+          "runtime_version": "0.3.26",
+          "runtime_commit": "abc123",
+          "runtime_generation": "gen-7",
+          "contract_epoch": 1,
+          "contract_hash": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "herdr_version": "0.3.32",
+          "herdr_protocol": "relay.v1"
+        },
+        "runtime_generation": "gen-7",
+        "healthy": true,
+        "health_details": null,
+        "active_requests": 1,
+        "link_uptime_ms": 300000,
+        "last_error": null,
+        "sent_at_ms": 1700000000000
+      }
+    },
+    {
+      "name": "tool_result",
+      "builder": "encodeToolResultMessage",
+      "args": ["w1", "req_01", { "ok": true, "entries": 3 }, 1700000000000, "gen-7", "herdr"],
+      "expected": {
+        "protocol_version": 1,
+        "kind": "tool_result",
+        "workstation_id": "w1",
+        "request_id": "req_01",
+        "result": { "ok": true, "entries": 3 },
+        "served_at_ms": 1700000000000,
+        "runtime_generation": "gen-7",
+        "transport_name": "herdr"
+      }
+    },
+    {
+      "name": "tool_result with undefined result omitted on wire",
+      "builder": "encodeToolResultMessage",
+      "args": ["w1", "req_02", "__UNDEFINED__", 1700000000000, null, null],
+      "expected": {
+        "protocol_version": 1,
+        "kind": "tool_result",
+        "workstation_id": "w1",
+        "request_id": "req_02",
+        "served_at_ms": 1700000000000,
+        "runtime_generation": null,
+        "transport_name": null
+      }
+    },
+    {
+      "name": "tool_error with explicit served_at_ms",
+      "builder": "encodeToolErrorMessage",
+      "args": ["w1", "req_03", "request_timeout", true, "timed out", { "attempts": 2 }, "delivery_unknown", 1700000000000, "gen-7"],
+      "expected": {
+        "protocol_version": 1,
+        "kind": "tool_error",
+        "workstation_id": "w1",
+        "request_id": "req_03",
+        "code": "request_timeout",
+        "message": "timed out",
+        "details": { "attempts": 2 },
+        "retryable": true,
+        "delivery_state": "delivery_unknown",
+        "served_at_ms": 1700000000000,
+        "runtime_generation": "gen-7"
+      }
+    },
+    {
+      "name": "cancel_ack",
+      "builder": "encodeCancelAckMessage",
+      "args": ["w1", "req_01", true, 1700000000000, "user abort"],
+      "expected": {
+        "protocol_version": 1,
+        "kind": "cancel_ack",
+        "workstation_id": "w1",
+        "request_id": "req_01",
+        "accepted": true,
+        "cancelled_at_ms": 1700000000000,
+        "reason": "user abort"
+      }
+    }
+  ],
+  "inbound_cases": [
+    {
+      "name": "tool_request full",
+      "message": {
+        "protocol_version": 1,
+        "kind": "tool_request",
+        "workstation_id": "w1",
+        "request_id": "req_01",
+        "operation": "herdr_inspect",
+        "arguments": { "workspace": "w5C", "depth": 2 },
+        "timeout_ms": 30000,
+        "contract_epoch": 1,
+        "contract_hash": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "idempotency_key": "idem-1",
+        "trace": { "span_id": "abc" }
+      },
+      "internal": {
+        "v": 1,
+        "type": "request",
+        "workstation_id": "w1",
+        "request_id": "req_01",
+        "operation": "herdr_inspect",
+        "arguments": { "workspace": "w5C", "depth": 2 },
+        "timeout_ms": 30000,
+        "contract_epoch": 1,
+        "contract_hash": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "idempotency_key": "idem-1",
+        "trace": { "span_id": "abc" }
+      }
+    },
+    {
+      "name": "cancel with reason",
+      "message": {
+        "protocol_version": 1,
+        "kind": "cancel",
+        "workstation_id": "w1",
+        "request_id": "req_01",
+        "reason": "user abort"
+      },
+      "internal": {
+        "v": 1,
+        "type": "cancel",
+        "workstation_id": "w1",
+        "request_id": "req_01",
+        "reason": "user abort"
+      }
+    }
+  ],
+  "compact_oversized": {
+    "stable_fields": {
+      "code": "response_too_large",
+      "retryable": false,
+      "delivery_state": "delivered",
+      "message": "response exceeds maxFrameBytes; paginate the result"
+    }
+  }
+}
