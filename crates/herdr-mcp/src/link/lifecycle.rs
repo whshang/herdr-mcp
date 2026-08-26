@@ -179,6 +179,22 @@ impl LinkLifecycle {
         Ok(self.apply_directive(classify_hello_ack_refusal(code), now_ms, rng_sample))
     }
 
+    /// A socket that drops after opening but before hello_ack is the same
+    /// retryable dropped attempt as the Node `#attemptConnect()` path.
+    pub fn socket_failed_during_handshake(
+        &mut self,
+        now_ms: f64,
+        rng_sample: f64,
+    ) -> Result<LifecycleAction, LifecycleError> {
+        if self.phase != ConnectionPhase::Handshake {
+            return Err(LifecycleError::invalid(
+                self.phase,
+                "socket_failed_during_handshake",
+            ));
+        }
+        Ok(self.retry_after_drop(now_ms, rng_sample))
+    }
+
     pub fn handshake_timed_out(
         &mut self,
         now_ms: f64,
