@@ -35,12 +35,33 @@ async function makeHarness({
   await mkdir(cfg, { recursive: true });
   await writeExecutable(
     launchctl,
-    `#!/bin/bash\nset -eu\necho "$*" >> ${JSON.stringify(log)}\nif [[ "$1" == "print" ]]; then\n  count=0\n  [[ -f ${JSON.stringify(printCount)} ]] && count="$(cat ${JSON.stringify(printCount)})"\n  count=$((count + 1))\n  echo "$count" > ${JSON.stringify(printCount)}\n  ${loaded ? ':' : 'exit 1'}\n  ${unloadAfterPrints === null ? ':' : `[[ "$count" -le ${unloadAfterPrints} ]] || exit 1`}\n  exit 0\nfi\nexit 0\n`,
+    `#!/bin/bash
+set -eu
+echo "$*" >> ${JSON.stringify(log)}
+if [[ "$1" == "print" ]]; then
+  count=0
+  [[ -f ${JSON.stringify(printCount)} ]] && count="$(cat ${JSON.stringify(printCount)})"
+  count=$((count + 1))
+  echo "$count" > ${JSON.stringify(printCount)}
+  ${loaded ? ':' : 'exit 1'}
+  ${unloadAfterPrints === null ? ':' : `[[ "$count" -le ${unloadAfterPrints} ]] || exit 1`}
+  exit 0
+fi
+exit 0
+`,
   );
-  await writeExecutable(curl, `#!/bin/bash\nprintf '%s' ${JSON.stringify(healthCode)}\n`);
-  await writeExecutable(lsof, `#!/bin/bash\nexit ${mutationActive ? 0 : 1}\n`);
+  await writeExecutable(curl, `#!/bin/bash
+printf '%s' ${JSON.stringify(healthCode)}
+`);
+  await writeExecutable(lsof, `#!/bin/bash
+exit ${mutationActive ? 0 : 1}
+`);
   const updateStatus = JSON.stringify({ job: { state: updateState } });
-  await writeExecutable(runtime, `#!/bin/bash\ncat <<'JSON'\n${updateStatus}\nJSON\n`);
+  await writeExecutable(runtime, `#!/bin/bash
+cat <<'JSON'
+${updateStatus}
+JSON
+`);
   if (mutationActive) await writeFile(join(cfg, 'service-mutation.lock'), '');
   if (guardianState) {
     const guardianDir = join(cfg, 'guardians', 'gtx-test-123456');
@@ -53,6 +74,7 @@ async function makeHarness({
 function runOnce(harness, extraEnv = {}) {
   return spawnSync('/bin/bash', [new URL('../bin/watchdog.sh', import.meta.url).pathname, 'once'], {
     encoding: 'utf8',
+    timeout: 5000,
     env: {
       ...process.env,
       HOME: harness.home,
@@ -127,7 +149,6 @@ test('loaded unhealthy server requires two failures then kickstarts the same job
   assert.equal(first.status, 0, first.stderr);
   let launchctlLog = await readFile(harness.log, 'utf8');
   assert.doesNotMatch(launchctlLog, /kickstart/);
-
   const second = runOnce(harness);
   assert.equal(second.status, 0, second.stderr);
   launchctlLog = await readFile(harness.log, 'utf8');
