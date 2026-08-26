@@ -27,6 +27,36 @@ test("conversation recovery scripts load as classic MV3 content scripts", () => 
   assert.ok(context.H2W_BROWSER_PERFORMANCE);
 });
 
+test("durable recovery barrier waits for persistence and fails closed", async () => {
+  const recovery = loadClassicExtensionScripts().H2W_RECOVERY_CONTROLLER;
+  let resolvePersist;
+  let actions = 0;
+  const pending = recovery.runAfterDurablePersistence({
+    persist: () => new Promise((resolve) => { resolvePersist = resolve; }),
+    action: () => { actions += 1; },
+    waitMs: 0,
+  });
+  await Promise.resolve();
+  assert.equal(actions, 0);
+  resolvePersist(true);
+  assert.equal(await pending, true);
+  assert.equal(actions, 1);
+
+  assert.equal(await recovery.runAfterDurablePersistence({
+    persist: async () => false,
+    action: () => { actions += 1; },
+    waitMs: 0,
+  }), false);
+  assert.equal(actions, 1);
+
+  assert.equal(await recovery.runAfterDurablePersistence({
+    persist: async () => { throw new Error("storage unavailable"); },
+    action: () => { actions += 1; },
+    waitMs: 0,
+  }), false);
+  assert.equal(actions, 1);
+});
+
 test("browser performance scheduler coalesces mutation bursts", () => {
   const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
   let now = 1000;
@@ -302,6 +332,14 @@ test("ChatGPT turn watcher wires assistant progress, settled turns, and explicit
   assert.match(wake, /thread_error_server_ahead/);
   assert.match(wake, /thread_error_delivery_unknown/);
   assert.match(wake, /startsWith\("thread_error_"\)/);
+  assert.match(wake, /async function reloadAfterPersistingConversationState\(\)/);
+  assert.match(wake, /conversationHealthPersistChain/);
+  assert.match(wake, /runAfterDurablePersistence/);
+  assert.match(wake, /const retryStarted = await RECOVERY_CONTROLLER\.runAfterDurablePersistence/);
+  assert.match(wake, /action: \(\) => threadError\.retry\.click\(\)/);
+  assert.match(wake, /if \(!retryStarted\) return true/);
+  assert.equal((wake.match(/location\.reload\(\)/g) || []).length, 1);
+  assert.ok((wake.match(/await reloadAfterPersistingConversationState\(\)/g) || []).length >= 6);
   assert.match(wake, /markRolloverRecommended/);
   assert.match(wake, /conversation-turn-/);
   assert.match(wake, /mergeMessageCountFloor/);
