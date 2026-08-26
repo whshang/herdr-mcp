@@ -58,6 +58,7 @@ let targetComposerReady = true;
 let targetComposerReadyAfter = 0;
 let targetProbeCount = 0;
 let targetSeedCount = 0;
+let seedTemplateCaptures = [];
 let tabCreateCount = 0;
 let tabUpdateCount = 0;
 let lastTabUpdate = null;
@@ -159,6 +160,7 @@ function targetListener(tab) {
     }
     if (msg?.type === "h2w_handoff_seed") {
       targetSeedCount += 1;
+      seedTemplateCaptures.push(msg.template || "");
       if (handoffSeedMode === "confirmed") {
         targetSeeded = true;
         tab.url = PROJECT_TARGET_URL;
@@ -960,9 +962,10 @@ console.log("\n[z.ai manual handoff]");
 console.log("\n[project handoff]");
 {
   targetComposerReady = true;
-  targetComposerReadyAfter = 2;
+  targetComposerReadyAfter = 3;
   targetProbeCount = 0;
   targetSeedCount = 0;
+  seedTemplateCaptures = [];
   projectNavigationReadyAfter = 2;
   projectNavigationPollCount = 0;
   sourceProbeLooksSeeded = true;
@@ -1077,8 +1080,12 @@ console.log("\n[project handoff]");
     JSON.stringify(lastTabUpdate));
   ok(projectNavigationPollCount >= 3,
     "current-tab handoff waits until the current tab really reaches Project home");
-  ok(targetProbeCount >= 3, "current-tab handoff waits for the Project composer before seeding");
-  ok(targetSeedCount === 1, "source-page probe cannot count as the target seed");
+  ok(targetProbeCount >= 4, "current-tab handoff waits for the delayed Project composer (>=4 probes) before seeding");
+  ok(targetSeedCount === 1, "delayed-composer Project handoff seeds the target exactly once");
+  ok(seedTemplateCaptures.length === 1
+      && seedTemplateCaptures[0].includes(`[HERDR_CONTINUITY_TRANSFER id=${transferId}]`),
+    "ChatGPT target seed template carries the exact continuity transfer marker",
+    JSON.stringify(seedTemplateCaptures).slice(0, 200));
   ok(!!storage.herdrWakeBindings[sourceKey]
       && storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_SOURCE,
     "Project binding stays on the source target while target delivery is uncertain");
@@ -1119,6 +1126,7 @@ console.log("\n[project handoff]");
   handoffPrompt = "";
   targetProbeCount = 0;
   targetSeedCount = 0;
+  seedTemplateCaptures = [];
   installContentScript(401, PROJECT_SOURCE_URL, PROJECT_SOURCE);
   tabs.get(401).active = true;
   let resolveRebind;
@@ -1203,8 +1211,26 @@ console.log("\n[project handoff composer timeout]");
 {
   const timeoutTabId = 430;
   const timeoutTransferId = "ht:test-current-tab-composer-timeout";
+  // Isolate from scenario 7's committed Project binding so the source binding
+  // continuity can be observed independently.
+  delete storage.herdrWakeBindings[`${PROJECT_KEY}::wH`];
+  delete storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`];
   installContentScript(timeoutTabId, PROJECT_SOURCE_URL, PROJECT_SOURCE);
   tabs.get(timeoutTabId).active = true;
+  let resolveBindTimeout;
+  const bindTimeoutP = new Promise((r) => { resolveBindTimeout = r; });
+  onMsg({ type: "h2w_bind", tabId: timeoutTabId, workspace_id: "wH", workspace_label: "herdr-mcp (wH)" }, { tab: { id: timeoutTabId, url: PROJECT_SOURCE_URL } }, (r) => resolveBindTimeout(r));
+  const boundTimeout = await bindTimeoutP;
+  ok(boundTimeout?.ok === true, "timeout source binds before rollover", JSON.stringify(boundTimeout));
+  const timeoutSourceKey = `${PROJECT_KEY}::wH`;
+  const timeoutContinuityId = storage.herdrWakeBindings[timeoutSourceKey]?.continuity_id;
+  const timeoutSourceBinding = storage.herdrWakeBindings[timeoutSourceKey];
+  const timeoutHandoffText = [
+    `<<<HERDR_HANDOFF_V1 id=${timeoutTransferId}>>>`,
+    "# Project handoff",
+    "Timeout fixture.",
+    "<<<END_HERDR_HANDOFF_V1>>>",
+  ].join("\n");
   storage.herdrConversationTransfers = {
     ...(storage.herdrConversationTransfers || {}),
     [timeoutTransferId]: {
@@ -1215,12 +1241,12 @@ console.log("\n[project handoff composer timeout]");
       source_tab_id: timeoutTabId,
       source_conv_key: PROJECT_SOURCE,
       handoff_launch_url: PROJECT_KEY,
-      handoff_text: [
-        `<<<HERDR_HANDOFF_V1 id=${timeoutTransferId}>>>`,
-        "# Project handoff",
-        "Timeout fixture.",
-        "<<<END_HERDR_HANDOFF_V1>>>",
-      ].join("\n"),
+      handoff_text: timeoutHandoffText,
+      continuity_id: timeoutContinuityId,
+      source_bindings: [{
+        workspace_id: timeoutSourceBinding?.workspace_id || "wH",
+        revision: timeoutSourceBinding?.revision || "h2w:fixture",
+      }],
       status: "summary_ready",
       created_at: Date.now() - 121000,
       updated_at: Date.now() - 121000,
@@ -1228,6 +1254,8 @@ console.log("\n[project handoff composer timeout]");
   };
   targetComposerReady = false;
   forceComposerTimeout = true;
+  targetSeedCount = 0;
+  seedTemplateCaptures = [];
   let resolveTimeout;
   const timeoutP = new Promise((r) => { resolveTimeout = r; });
   onMsg({ type: "h2w_handoff_start", tabId: timeoutTabId, trigger: "manual" },
@@ -1235,13 +1263,49 @@ console.log("\n[project handoff composer timeout]");
   const timedOut = await timeoutP;
   ok(timedOut?.ok === false && timedOut?.error === "target_composer_timeout",
     "Project composer timeout fails closed", JSON.stringify(timedOut));
-  ok(storage.herdrConversationTransfers?.[timeoutTransferId]?.status === "seed_uncertain"
-      && storage.herdrConversationTransfers?.[timeoutTransferId]?.target_tab_id === timeoutTabId,
+  const timedOutTransfer = storage.herdrConversationTransfers?.[timeoutTransferId];
+  ok(timedOutTransfer?.status === "seed_uncertain"
+      && timedOutTransfer?.target_tab_id === timeoutTabId,
     "Project composer timeout remains resumable in the same tab");
+  ok(targetSeedCount === 0 && seedTemplateCaptures.length === 0,
+    "composer timeout sends zero seeds");
+  ok(typeof timedOutTransfer?.handoff_text === "string"
+      && timedOutTransfer.handoff_text === timeoutHandoffText
+      && timedOutTransfer.handoff_text.includes(`<<<HERDR_HANDOFF_V1 id=${timeoutTransferId}>>>`),
+    "composer timeout preserves the handoff packet text");
+  ok(timedOutTransfer?.target_tab_id === timeoutTabId,
+    "composer timeout preserves the target tab binding");
+  ok(!!storage.herdrWakeBindings[timeoutSourceKey]
+      && storage.herdrWakeBindings[timeoutSourceKey]?.active_conv_key === PROJECT_SOURCE
+      && storage.herdrWakeBindings[timeoutSourceKey]?.continuity_id === timeoutContinuityId,
+    "composer timeout preserves the source binding and its continuity id");
+  // Explicit same-tab resume must deliver exactly one seed and reach committed.
+  targetComposerReady = true;
+  forceComposerTimeout = false;
+  testClockOffsetMs = 0;
+  // The timeout never seeded the target, so a resume must actually deliver the
+  // seed exactly once rather than early-commit off a stale seeded flag.
+  targetSeeded = false;
+  handoffSeedMode = "confirmed";
+  let resolveTimeoutResume;
+  const timeoutResumeP = new Promise((r) => { resolveTimeoutResume = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: timeoutTabId, trigger: "manual" },
+    { tab: { id: timeoutTabId, url: PROJECT_SOURCE_URL } }, (r) => resolveTimeoutResume(r));
+  const timeoutResumed = await timeoutResumeP;
+  ok(timeoutResumed?.ok === true, "explicit same-tab resume after composer timeout succeeds", JSON.stringify(timeoutResumed));
+  await waitForTest(() => storage.herdrConversationTransfers?.[timeoutTransferId]?.status === "committed");
+  ok(storage.herdrConversationTransfers[timeoutTransferId]?.status === "committed",
+    "composer-timeout resume commits the transfer");
+  ok(targetSeedCount === 1 && seedTemplateCaptures.length === 1,
+    "total seed count becomes exactly 1 after resume");
+  ok(storage.herdrWakeBindings[timeoutSourceKey]?.active_conv_key === PROJECT_TARGET
+      && storage.herdrWakeBindings[timeoutSourceKey]?.continuity_id === timeoutContinuityId,
+    "resumed binding keeps continuity and switches only the active conversation target");
   delete storage.herdrConversationTransfers[timeoutTransferId];
   targetComposerReady = true;
   forceComposerTimeout = false;
   testClockOffsetMs = 0;
+  handoffSeedMode = "uncertain";
 }
 
 // ---- Scenario 7b: a false insert failure is reconciled before declaring seed failure ----
@@ -1371,6 +1435,267 @@ console.log("\n[project handoff legacy failed-seed recovery]");
     "legacy recovery records the predecessor conversation on the target binding");
   ok(storage.herdrWakeBindings[targetKey]?.active_conv_key === PROJECT_TARGET,
     "legacy recovery upgrades the target to a Project binding with the confirmed active conversation");
+}
+
+// ---- Scenario 3: immediate-ready Project handoff commits with exactly one seed ----------------
+console.log("\n[project handoff immediate-ready]");
+{
+  delete storage.herdrWakeBindings[`${PROJECT_KEY}::wH`];
+  delete storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`];
+  targetSeeded = false;
+  handoffSeedMode = "confirmed";
+  targetComposerReadyAfter = 0;
+  targetComposerReady = true;
+  targetProbeCount = 0;
+  targetSeedCount = 0;
+  seedTemplateCaptures = [];
+  const tabId = 440;
+  installContentScript(tabId, PROJECT_SOURCE_URL, PROJECT_SOURCE);
+  tabs.get(tabId).active = true;
+  let resolveBind;
+  const bindP = new Promise((r) => { resolveBind = r; });
+  onMsg({ type: "h2w_bind", tabId, workspace_id: "wH", workspace_label: "herdr-mcp (wH)" }, { tab: { id: tabId } }, (r) => resolveBind(r));
+  await bindP;
+  const sourceKey = `${PROJECT_KEY}::wH`;
+  const continuityId = storage.herdrWakeBindings[sourceKey]?.continuity_id;
+  let resolveStart;
+  const startP = new Promise((r) => { resolveStart = r; });
+  onMsg({ type: "h2w_handoff_start", tabId, trigger: "manual" }, { tab: { id: tabId } }, (r) => resolveStart(r));
+  const started = await startP;
+  ok(started?.ok === true && started?.pending === true, "immediate-ready handoff starts", JSON.stringify(started));
+  const transferId = Object.values(storage.herdrConversationTransfers || {})
+    .filter((transfer) => transfer?.source_conv_key === PROJECT_SOURCE)
+    .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0]?.id;
+  const assistantText = [
+    `<<<HERDR_HANDOFF_V1 id=${transferId}>>>`,
+    "# Project handoff",
+    "Immediate-ready fixture.",
+    "<<<END_HERDR_HANDOFF_V1>>>",
+  ].join("\n");
+  let resolveEnded;
+  const endedP = new Promise((r) => { resolveEnded = r; });
+  onMsg({ type: "h2w_turn_ended", convKey: PROJECT_SOURCE, assistantText, userText: "roll over" }, { tab: { id: tabId } }, (r) => resolveEnded(r));
+  await endedP;
+  await waitForTest(() => storage.herdrConversationTransfers?.[transferId]?.status === "committed");
+  ok(storage.herdrConversationTransfers[transferId]?.status === "committed",
+    "immediate-ready Project handoff commits", JSON.stringify(storage.herdrConversationTransfers[transferId]));
+  ok(targetSeedCount === 1 && seedTemplateCaptures.length === 1,
+    "immediate-ready Project handoff commits with exactly one seed");
+  ok(seedTemplateCaptures[0]?.includes(`[HERDR_CONTINUITY_TRANSFER id=${transferId}]`),
+    "immediate-ready seed carries the exact continuity marker");
+  ok(storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_TARGET
+      && storage.herdrWakeBindings[sourceKey]?.continuity_id === continuityId,
+    "immediate-ready commit switches the conversation target and preserves continuity");
+}
+
+// ---- Scenario 4: already-seeded same-project recovery sends no second seed ----------------
+// Keeps the REAL Project-scoped source binding, its source_bindings snapshot and
+// the original continuity chain, and uses the same already-navigated current tab
+// (source_tab_id === target_tab_id) already on the /g/{project}/c/{target} route.
+// Recovery must commit by switching only active_conv_key with zero extra seeds and
+// never mint a conversation-scoped binding.
+console.log("\n[project handoff already-seeded same-project recovery]");
+{
+  const tabId = 456;
+  const trId = "ht:test-already-seeded-recovery";
+  const originalContinuityId = "hc:test-already-seeded-original";
+  const sourceProjectBinding = {
+    convKey: PROJECT_KEY,
+    workspace_id: "wH",
+    workspace_label: "herdr-mcp (wH)",
+    binding_scope: "project",
+    project_id: PROJECT_ID,
+    active_conv_key: PROJECT_SOURCE,
+    continuity_id: originalContinuityId,
+    persistence: "explicit",
+    revision: "h2w:fixture-already-seeded",
+    created_at: Date.now() - 5000,
+    last_seen_at: Date.now() - 5000,
+  };
+  // Isolate: no leftover conversation-scoped bindings from prior scenarios.
+  delete storage.herdrWakeBindings[`${PROJECT_KEY}::wH`];
+  delete storage.herdrWakeBindings[`${PROJECT_SOURCE}::wH`];
+  delete storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`];
+  storage.herdrWakeBindings[`${PROJECT_KEY}::wH`] = sourceProjectBinding;
+
+  // The current tab has already been navigated to the materialized /g/.../c/{target}
+  // route and reports its seed confirmed. The target listener still counts any
+  // accidental re-seed so an over-eager replay is observable.
+  tabs.set(tabId, {
+    id: tabId,
+    url: PROJECT_TARGET_URL,
+    active: true,
+    listener: targetListener({ id: tabId, url: PROJECT_TARGET_URL }),
+  });
+  tabs.get(tabId).active = true;
+  targetSeeded = true;
+  targetSeedCount = 0;
+  seedTemplateCaptures = [];
+  sourceProbeLooksSeeded = true;
+
+  storage.herdrConversationTransfers = {
+    ...(storage.herdrConversationTransfers || {}),
+    [trId]: {
+      id: trId,
+      version: 1,
+      trigger: "manual",
+      site: "chatgpt",
+      project_id: PROJECT_ID,
+      source_tab_id: tabId,
+      target_tab_id: tabId, // current-tab handoff: target IS the source tab
+      source_conv_key: PROJECT_SOURCE,
+      handoff_launch_url: PROJECT_KEY,
+      handoff_text: [
+        `<<<HERDR_HANDOFF_V1 id=${trId}>>>`,
+        "Already-seeded same-project fixture.",
+        "<<<END_HERDR_HANDOFF_V1>>>",
+      ].join("\n"),
+      continuity_id: originalContinuityId,
+      source_bindings: [{
+        workspace_id: "wH",
+        revision: sourceProjectBinding.revision,
+      }],
+      status: "seed_uncertain",
+      created_at: Date.now() - 1000,
+      updated_at: Date.now() - 1000,
+    },
+  };
+
+  let resolveStart;
+  const startP = new Promise((r) => { resolveStart = r; });
+  onMsg({ type: "h2w_handoff_start", tabId, trigger: "manual" }, { tab: { id: tabId, url: PROJECT_TARGET_URL } }, (r) => resolveStart(r));
+  const started = await startP;
+  ok(started?.ok === true, "already-seeded same-project recovery resumes", JSON.stringify(started));
+  await waitForTest(() => storage.herdrConversationTransfers[trId]?.status === "committed");
+  ok(storage.herdrConversationTransfers[trId]?.status === "committed",
+    "already-seeded same-project recovery commits without another seed");
+  ok(targetSeedCount === 0 && seedTemplateCaptures.length === 0,
+    "already-seeded same-project recovery sends zero additional seeds");
+  ok(storage.herdrConversationTransfers[trId]?.target_conv_key === PROJECT_TARGET
+      && storage.herdrConversationTransfers[trId]?.target_tab_id === tabId,
+    "already-seeded same-project recovery adopts the already-materialized target");
+  ok(storage.herdrWakeBindings[`${PROJECT_KEY}::wH`]?.active_conv_key === PROJECT_TARGET,
+    "commit switches only the active conversation target");
+  ok(storage.herdrWakeBindings[`${PROJECT_KEY}::wH`]?.continuity_id === originalContinuityId,
+    "commit preserves the original Project continuity chain");
+  ok(!storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`]
+      && !storage.herdrWakeBindings[`${PROJECT_SOURCE}::wH`],
+    "commit never creates a conversation-scoped binding");
+  sourceProbeLooksSeeded = false;
+
+  // ---- Negative guard: a target that still reports the source conversation must NOT commit ----
+  const negTabId = 457;
+  const negTrId = "ht:test-target-is-source-neg";
+  delete storage.herdrWakeBindings[`${PROJECT_KEY}::wH`];
+  delete storage.herdrWakeBindings[`${PROJECT_SOURCE}::wH`];
+  delete storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`];
+  storage.herdrWakeBindings[`${PROJECT_KEY}::wH`] = { ...sourceProjectBinding };
+  // The tab claims its seed is confirmed but only for the SOURCE conversation.
+  installContentScript(negTabId, PROJECT_TARGET_URL, PROJECT_SOURCE);
+  tabs.get(negTabId).active = true;
+  sourceProbeLooksSeeded = true;
+  targetSeedCount = 0;
+  seedTemplateCaptures = [];
+  storage.herdrConversationTransfers = {
+    ...(storage.herdrConversationTransfers || {}),
+    [negTrId]: {
+      id: negTrId,
+      version: 1,
+      trigger: "manual",
+      site: "chatgpt",
+      project_id: PROJECT_ID,
+      source_tab_id: negTabId,
+      target_tab_id: negTabId,
+      source_conv_key: PROJECT_SOURCE,
+      handoff_launch_url: PROJECT_KEY,
+      handoff_text: [
+        `<<<HERDR_HANDOFF_V1 id=${negTrId}>>>`,
+        "target-is-source negative fixture.",
+        "<<<END_HERDR_HANDOFF_V1>>>",
+      ].join("\n"),
+      continuity_id: originalContinuityId,
+      source_bindings: [{
+        workspace_id: "wH",
+        revision: sourceProjectBinding.revision,
+      }],
+      status: "seed_uncertain",
+      created_at: Date.now() - 1000,
+      updated_at: Date.now() - 1000,
+    },
+  };
+  let resolveNeg;
+  const negP = new Promise((r) => { resolveNeg = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: negTabId, trigger: "manual" }, { tab: { id: negTabId, url: PROJECT_TARGET_URL } }, (r) => resolveNeg(r));
+  const neg = await negP;
+  ok(neg?.ok === false && neg?.error === "target_is_source",
+    "recovery refuses a target that equals the source", JSON.stringify(neg));
+  ok(storage.herdrConversationTransfers[negTrId]?.status !== "committed",
+    "target-is-source transfer is never committed");
+  ok(storage.herdrWakeBindings[`${PROJECT_KEY}::wH`]?.active_conv_key === PROJECT_SOURCE,
+    "target-is-source leaves the active conversation target unchanged");
+  ok(targetSeedCount === 0 && seedTemplateCaptures.length === 0,
+    "target-is-source sends zero seeds");
+  delete storage.herdrConversationTransfers[negTrId];
+  delete storage.herdrWakeBindings[`${PROJECT_KEY}::wH`];
+  sourceProbeLooksSeeded = false;
+}
+
+// ---- Scenario 5: z.ai manual handoff opens exactly one separate target tab ---------------------
+console.log("\n[z.ai manual handoff separate tab]");
+{
+  // Scenario 6f left a committed ZAI_TARGET binding; isolate this run so the
+  // separate-tab creation and continuity chain are observable fresh.
+  delete storage.herdrWakeBindings[`${ZAI_SOURCE}::wY`];
+  delete storage.herdrWakeBindings[`${ZAI_TARGET}::wY`];
+  zaiTargetSeeded = false;
+  const zTabId = 460;
+  tabs.set(zTabId, {
+    url: ZAI_SOURCE,
+    listener: (msg, _sender, sendResponse) => {
+      if (msg?.type === "h2w_get_convkey") { sendResponse({ convKey: ZAI_SOURCE, url: ZAI_SOURCE, site: "z.ai" }); return; }
+      if (msg?.type === "h2w_handoff_prompt") {
+        const match = String(msg.template || "").match(/<<<HERDR_HANDOFF_V1 id=([^>]+)>>>/);
+        const id = match?.[1] || "missing";
+        sendResponse({ ok: true, assistantText: [
+          `<<<HERDR_HANDOFF_V1 id=${id}>>>`,
+          "# Project handoff",
+          "z.ai separate-tab fixture.",
+          "<<<END_HERDR_HANDOFF_V1>>>",
+        ].join("\n") });
+        return;
+      }
+      if (msg?.type === "h2w_snapshot_turn") { sendResponse({ assistantText: "", turnInProgress: false, generating: false }); return; }
+      sendResponse({ ok: true });
+    },
+  });
+  tabs.get(zTabId).active = true;
+  let resolveBind;
+  const bindP = new Promise((r) => { resolveBind = r; });
+  onMsg({ type: "h2w_bind", tabId: zTabId, workspace_id: "wY", workspace_label: "zai-handoff (wY)" }, { tab: { id: zTabId, url: ZAI_SOURCE } }, (r) => resolveBind(r));
+  const bound = await bindP;
+  ok(bound?.ok === true, "z.ai source binds before separate-tab handoff");
+  const sourceKey = `${ZAI_SOURCE}::wY`;
+  const continuityId = storage.herdrWakeBindings[sourceKey]?.continuity_id;
+  zaiTargetSeeded = false;
+  targetSeedCount = 0;
+  seedTemplateCaptures = [];
+  const createBefore = tabCreateCount;
+  const tabIdsBefore = tabs.size;
+  let resolveStart;
+  const startP = new Promise((r) => { resolveStart = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: zTabId }, { tab: { id: zTabId, url: ZAI_SOURCE } }, (r) => resolveStart(r));
+  await startP;
+  const targetKey = `${ZAI_TARGET}::wY`;
+  await waitForTest(() => !!storage.herdrWakeBindings[targetKey]);
+  ok(tabCreateCount === createBefore + 1 && tabs.size === tabIdsBefore + 1,
+    "z.ai manual handoff creates exactly one separate target tab",
+    `creates=${tabCreateCount - createBefore} tabsGrowth=${tabs.size - tabIdsBefore}`);
+  const newZaiTab = [...tabs.values()].find((t) => t.url === ZAI_TARGET);
+  ok(!!newZaiTab, "the new separate tab reaches the z.ai target conversation");
+  ok(storage.herdrWakeBindings[targetKey]?.continuity_id === continuityId
+      && storage.herdrWakeBindings[targetKey]?.handoff_from === ZAI_SOURCE,
+    "z.ai separate-tab handoff preserves continuity and predecessor",
+    JSON.stringify(storage.herdrWakeBindings[targetKey]));
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);
