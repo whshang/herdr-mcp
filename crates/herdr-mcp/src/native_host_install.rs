@@ -1254,8 +1254,10 @@ fn failpoint_after_restore_mutation() -> Result<(), String> {
 // if a test has armed an injection for a specific mutation count, the restore
 // aborts. This models a mid-loop failure (e.g. Chrome manifest restored but an
 // Edge write failing) so a retry can be proven to resume from the same durable
-// snapshot. It is cfg(test) only and has no production effect.
-#[cfg(test)]
+// snapshot. It is macOS-test-only and has no production effect. Keeping the
+// helpers out of non-macOS test builds also prevents Linux CI from compiling
+// unused failpoint symbols after the macOS-only mutation paths are cfg'd out.
+#[cfg(all(test, target_os = "macos"))]
 thread_local! {
     static MUTATION_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static FAIL_AT_MUTATION: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
@@ -1263,25 +1265,25 @@ thread_local! {
     static FAIL_AT_INSTALL_MUTATION: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn arm_failpoint_after_n_mutations(n: u32) {
     MUTATION_COUNT.with(|slot| slot.set(0));
     FAIL_AT_MUTATION.with(|slot| slot.set(Some(n)));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn disarm_failpoint() {
     FAIL_AT_MUTATION.with(|slot| slot.set(None));
     FAIL_AT_INSTALL_MUTATION.with(|slot| slot.set(None));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn arm_install_failpoint_after_n_mutations(n: u32) {
     INSTALL_MUTATION_COUNT.with(|slot| slot.set(0));
     FAIL_AT_INSTALL_MUTATION.with(|slot| slot.set(Some(n)));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn failpoint_after_install_mutation() -> Result<(), String> {
     let count = INSTALL_MUTATION_COUNT.with(|slot| {
         let current = slot.get();
@@ -1300,7 +1302,7 @@ fn failpoint_after_install_mutation() -> Result<(), String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn failpoint_after_restore_mutation() -> Result<(), String> {
     let count = MUTATION_COUNT.with(|slot| {
         let current = slot.get();
