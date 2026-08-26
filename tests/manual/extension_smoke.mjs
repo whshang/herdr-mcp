@@ -70,9 +70,41 @@ ok(wakeSource.includes("syncDocumentTitle")
     && wakeSource.includes('.join("-")')
     && wakeSource.includes("chatGptDomConversationTitle")
     && wakeSource.includes("chatGptDomProjectTitle")
+    && wakeSource.includes("titleStatusIcon")
     && backgroundSource.includes("active_workspace_label: labels[0] || null")
     && backgroundSource.includes("liveSession = state?.ok"),
-  "page title is composed dynamically as status-workspace-conversation");
+  "page title is composed dynamically as emoji-workspace-conversation");
+ok(wakeSource.includes('if (isComposerGenerating() || health === "reply_waiting") return "⏳"')
+    && wakeSource.includes('if (state === "offline" || state === "failed" || health === "failed" || handoff === "failed") return "🔴"')
+    && wakeSource.includes('if (workspaceWorking) return "⚙️"')
+    && wakeSource.includes('return "🔄"')
+    && wakeSource.includes('return "🚨"')
+    && wakeSource.includes('return "🧠"')
+    && wakeSource.includes('["reply_suspect", "rollover_recommended"].includes(health)')
+    && wakeSource.includes('handoff === "seed_uncertain") return "⚠️"')
+    && wakeSource.includes('if (state === "done") return "👀"')
+    && wakeSource.includes('if (state === "idle") return "💤"')
+    && wakeSource.includes('return "⚪"'),
+  "title status icon covers generating/working/transition/context/risk/attention/offline/review/idle/unknown");
+const titleStatusSource = wakeSource.slice(
+  wakeSource.indexOf("function titleStatusIcon"),
+  wakeSource.indexOf("function syncDocumentTitle"),
+);
+const titlePriorityPositions = [
+  'isComposerGenerating() || health === "reply_waiting"',
+  'state === "offline"',
+  "if (workspaceWorking)",
+  '"summary_requested"',
+  'health === "rollover_required"',
+  'continuity === "context_warning"',
+  'handoff === "seed_uncertain"',
+  'state === "done"',
+  'state === "idle"',
+  'return "⚪"',
+].map((marker) => titleStatusSource.indexOf(marker));
+ok(titlePriorityPositions.every((position) => position >= 0)
+    && titlePriorityPositions.every((position, index) => index === 0 || position > titlePriorityPositions[index - 1]),
+  "title status priority keeps page activity and hard failures ahead of stale workspace/terminal states");
 ok(backgroundSource.includes("sendResponse({ ok: true, ...automationScopeForConversation(convKey) });")
     && backgroundSource.includes("void notifyAutomationChanged();")
     && wakeSource.includes("finally {\n      setHudActionBusy(false);"),

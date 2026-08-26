@@ -1742,9 +1742,34 @@ const H2W_CONTENT_VERSION = "0.1.62";
     nativeConversationTitle = cleanConversationTitle(current) || current;
   }
 
+  function titleStatusIcon(hud, state) {
+    const health = String(conversationHealth?.state || "");
+    const continuity = String(hud?.continuity?.state || "");
+    const handoff = String(hud?.handoff?.status || "");
+    const bindings = Array.isArray(hud?.bindings) ? hud.bindings : [];
+    const workspaceWorking = state === "working"
+      || bindings.some((binding) => binding?.status === "working" || Number(binding?.working_count) > 0);
+
+    // The tab title answers a human question: "what needs my attention here?"
+    // It deliberately does not expose the internal state-machine labels.
+    if (isComposerGenerating() || health === "reply_waiting") return "⏳";
+    if (state === "offline" || state === "failed" || health === "failed" || handoff === "failed") return "🔴";
+    if (workspaceWorking) return "⚙️";
+    if (["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(handoff)
+      || ["recovery_message_sent", "reload_pending", "recovering"].includes(health)
+      || continuity === "handoff_prepare") return "🔄";
+    if (health === "rollover_required" || ["high_risk", "rollover_required"].includes(continuity)) return "🚨";
+    if (continuity === "context_warning") return "🧠";
+    if (state === "blocked" || ["reply_suspect", "rollover_recommended"].includes(health)
+      || continuity === "rollover_recommended" || handoff === "seed_uncertain") return "⚠️";
+    if (state === "done") return "👀";
+    if (state === "idle") return "💤";
+    return "⚪";
+  }
+
   function syncDocumentTitle(hud, state) {
     captureNativeConversationTitle();
-    const status = hudLabels?.states?.[state] || state || hudLabels?.states?.unknown || "unknown";
+    const status = titleStatusIcon(hud, state);
     const project = chatGptDomProjectTitle()
       || hud?.active_workspace_label
       || hud?.workspace_label
