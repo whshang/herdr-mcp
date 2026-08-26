@@ -1,8 +1,9 @@
-//! Staged workstation-link reliability foundation.
+//! Staged workstation-link reliability and transport foundation.
 //!
-//! This module ports only transport-independent reliability state from the
-//! existing Node `src/link/**` implementation. It intentionally owns no socket,
-//! credential, timer, HTTP, launchd, runtime install, or production cutover.
+//! The reliability kernels are transport-independent. `transport` adds the
+//! first socket-event reactor above them while still owning no credential,
+//! concrete WebSocket implementation, runtime dispatch, launchd, runtime
+//! install, or production cutover.
 //!
 //! `backoff` mirrors the deterministic reconnect-delay policy.
 //! `generation_fence` tracks which runtime generation actually owns each
@@ -19,3 +20,5 @@ pub mod generation_fence;
 pub mod heartbeat;
 pub mod lifecycle;
 pub mod policy;
+pub mod request_core;
+pub mod transport;
