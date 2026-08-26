@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "_notes": {
+    "purpose": "Shared deterministic vectors for herdr-mcp Relay/link Batch 4: (A) backoff option sanitization + peek/next/reset, (B) runtime-generation ownership/fencing state scenarios.",
+    "rng_convention": "In backoff cases, `options.rng` is a constant value meaning a constant rng function returning that value (e.g. 0.5 => () => 0.5).",
+    "oracle_convention": "`oracle: node_parity` means the case is directly executable against the existing TypeScript/Node implementation and must match it exactly. `oracle: rust_safety_strengthening` means the case is a desired fail-closed Rust invariant that the current Node implementation does NOT yet enforce; it is asserted for schema/intent only and must not change Node production.",
+    "no_secrets": "All tokens/endpoints are synthetic test values; no real credentials."
+  },
+  "backoff": {
+    "sanitization_cases": [
+      {
+        "name": "defaults when options omitted",
+        "oracle": "node_parity",
+        "options": { "rng": 0.5 },
+        "expected": {
+          "sanitized": { "baseMs": 1000, "maxMs": 60000, "factor": 2, "jitter": 1 },
+          "peek": [
+            { "attempt": 0, "delay": 500 },
+            { "attempt": 5, "delay": 16000 }
+          ]
+        }
+      },
+      {
+        "name": "negative and oversized inputs clamp to safe bounds",
+        "oracle": "node_parity",
+        "options": { "baseMs": -5, "maxMs": 10, "factor": 0, "jitter": 3, "rng": 1 },
+        "expected": {
+          "sanitized": { "baseMs": 1000, "maxMs": 1000, "factor": 1, "jitter": 1 },
+          "peek": [
+            { "attempt": 0, "delay": 1000 }
+          ]
+        }
+      },
+      {
+        "name": "non-finite and fractional inputs fall back and floor",
+        "oracle": "node_parity",
+        "options": { "baseMs": "NaN", "maxMs": 9.9, "factor": 2.7, "jitter": 0.4, "rng": 0.5 },
+        "expected": {
+          "sanitized": { "baseMs": 1000, "maxMs": 1000, "factor": 2, "jitter": 0 },
+          "peek": [
+            { "attempt": 0, "delay": 1000 }
+          ]
+        }
+      }
+    ],
+    "peek_cases": [
+      {
+        "name": "full jitter rng 0.5",
+        "oracle": "node_parity",
+        "options": { "baseMs": 1000, "maxMs": 60000, "factor": 2, "jitter": 1, "rng": 0.5 },
+        "peek": [
+          { "attempt": 0, "delay": 500 },
+          { "attempt": 1, "delay": 1000 },
+          { "attempt": 10, "delay": 30000 }
+        ]
+      },
+      {
+        "name": "jitter 0 deterministic exact cap",
+        "oracle": "node_parity",
+        "options": { "baseMs": 1000, "maxMs": 60000, "factor": 2, "jitter": 0, "rng": 0.25 },
+        "peek": [
+          { "attempt": 0, "delay": 1000 },
+          { "attempt": 1, "delay": 2000 },
+          { "attempt": 5, "delay": 32000 }
+        ]
+      },
+      {
+        "name": "rng 1 always hits the cap",
+        "oracle": "node_parity",
+        "options": { "baseMs": 1000, "maxMs": 60000, "factor": 2, "jitter": 1, "rng": 1 },
+        "peek": [
+          { "attempt": 0, "delay": 1000 },
+          { "attempt": 6, "delay": 60000 }
+        ]
+      }
+    ],
+    "sequence_cases": [
+      {
+        "name": "next advances attempt; reset restores",
+        "oracle": "node_parity",
+        "options": { "baseMs": 1000, "factor": 2, "rng": 0.5 },
+        "steps": [
+          { "op": "assert_attempt", "value": 0 },
+          { "op": "next", "expected": 500 },
+          { "op": "assert_attempt", "value": 1 },
+          { "op": "next", "expected": 1000 },
+          { "op": "assert_attempt", "value": 2 },
+          { "op": "reset" },
+          { "op": "assert_attempt", "value": 0 },
+          { "op": "next", "expected": 500 }
+        ]
+      }
+    ]
+  },
+  "runtime_generation": {
+    "scenarios": [
+      {
+        "name": "active generation baseline",
+        "oracle": "node_parity",
+        "description": "A freshly constructed manager has the base generation active with no previous generation and no transitions.",
+        "setup": {
+          "base": { "generation": "stable", "endpoint": "http://127.0.0.1:8772/mcp", "expected_runtime_version": "0.3.23" },
+          "candidates": []
+        },
+        "steps": [
+          {
+            "op": "assert_status",
+            "active_generation": "stable",
+            "previous_generation": null,
+            "last_good_generation": "stable",
+            "transition_seq": 0,
+            "generation_phase": { "stable": "active" },
+            "generation_in_flight": { "stable": 0 }
+          }
+        ]
+      },
+      {
+        "name": "old in-flight drains on old generation after activation",
+        "oracle": "node_parity",
+        "description": "A request dispatched to the old generation before activation keeps draining on the old generation while new requests bind the new active.",
+        "setup": {
+          "base": { "generation": "stable", "endpoint": "http://127.0.0.1:8772/mcp", "expected_runtime_version": "0.3.23" },
+          "candidates": [ { "generation": "candidate", "endpoint": "http://127.0.0.1:8773/mcp", "expected_runtime_version": "0.3.26" } ]
+        },
+        "steps": [
+          { "op": "register", "generation": "candidate" },
+          { "op": "dispatch", "request_id": "old-r1", "defer": true },
+          { "op": "activate", "generation": "candidate", "checks": 1 },
+          {
+            "op": "assert_status",
+            "active_generation": "candidate",
+            "previous_generation": "stable",
+            "generation_phase": { "stable": "draining", "candidate": "active" },
+            "generation_in_flight": { "stable": 1, "candidate": 0 }
+          },
+          { "op": "dispatch", "request_id": "new-r1", "expect_port": "8773" },
+          { "op": "release", "request_id": "old-r1", "expect_port": "8772" },
+          {
+            "op": "assert_status",
+            "generation_phase": { "stable": "standby" },
+            "generation_in_flight": { "stable": 0 }
+          }
+        ]
+      },
+      {
+        "name": "new requests bind the new active generation",
+        "oracle": "node_parity",
+        "description": "After activation, a fresh request is served by the candidate generation, not the old one.",
+        "setup": {
+          "base": { "generation": "stable", "endpoint": "http://127.0.0.1:8772/mcp", "expected_runtime_version": "0.3.23" },
+          "candidates": [ { "generation": "candidate", "endpoint": "http://127.0.0.1:8773/mcp", "expected_runtime_version": "0.3.26" } ]
+        },
+        "steps": [
+          { "op": "register", "generation": "candidate" },
+          { "op": "activate", "generation": "candidate", "checks": 1 },
+          { "op": "dispatch", "request_id": "new-r1", "expect_port": "8773" }
+        ]
+      },
+      {
+        "name": "cancel routes to the request owner generation",
+        "oracle": "node_parity",
+        "description": "Cancelling a request dispatched to the old generation routes to the old generation's transport (the owner), even after activation moved the active pointer.",
+        "setup": {
+          "base": { "generation": "stable", "endpoint": "http://127.0.0.1:8772/mcp", "expected_runtime_version": "0.3.23" },
+          "candidates": [ { "generation": "candidate", "endpoint": "http://127.0.0.1:8773/mcp", "expected_runtime_version": "0.3.26" } ]
+        },
+        "steps": [
+          { "op": "register", "generation": "candidate" },
+          { "op": "dispatch", "request_id": "old-r1", "defer": true },
+          { "op": "activate", "generation": "candidate", "checks": 1 },
+          { "op": "cancel", "request_id": "old-r1", "expect_code": "local_mcp_jsonrpc_error" },
+          { "op": "assert_status", "generation_in_flight": { "stable": 0 } }
+        ]
+      },
+      {
+        "name": "duplicate request-id is fail-closed in Rust",
+        "oracle": "rust_safety_strengthening",
+        "description": "A second dispatch with the same request_id while the first is in flight must be rejected at the manager boundary before touching any transport. Node currently relies on the transport's duplicateRequest guard; Rust should enforce it fail-closed at the manager.",
+        "intent": "reject_duplicate_request_id",
+        "desired_invariant": "dispatchRequest must return a duplicate-request failure without forwarding to any transport when the request_id is already in flight on any generation."
+      },
+      {
+        "name": "completion with wrong/stale serving generation is fail-closed in Rust",
+        "oracle": "rust_safety_strengthening",
+        "description": "If a request owned by generation G is completed with a claimed serving generation G' != G, the manager must fence/reject the mismatched result rather than relabel or forward it. A correct completion from the old owner G remains valid while G is draining after activation.",
+        "intent": "fence_mismatched_serving_generation",
+        "desired_invariant": "A completion is accepted only when its claimed serving generation exactly matches the request ownership lease; mismatch must fail closed without consuming the lease."
+      }
+    ]
+  }
+}
