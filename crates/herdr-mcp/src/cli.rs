@@ -29,13 +29,19 @@ pub enum NativeHostCommand {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ServiceCommand {
-    Install { adopt_node: bool },
+    Install {
+        adopt_node: bool,
+    },
     Status,
     Start,
     Stop,
     Restart,
     Rollback,
     Uninstall,
+    Guardian {
+        transaction_id: String,
+        parent_pid: u32,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -140,6 +146,28 @@ fn parse_service(args: &[String]) -> Result<Command, String> {
         [subcommand] if subcommand == "rollback" => Ok(Command::Service(ServiceCommand::Rollback)),
         [subcommand] if subcommand == "uninstall" => {
             Ok(Command::Service(ServiceCommand::Uninstall))
+        }
+        [
+            subcommand,
+            transaction_flag,
+            transaction_id,
+            parent_flag,
+            parent_pid,
+        ] if subcommand == "__guardian"
+            && transaction_flag == "--transaction"
+            && parent_flag == "--parent-pid" =>
+        {
+            let parent_pid = parent_pid
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    "service __guardian --parent-pid must be a positive integer".to_owned()
+                })?;
+            Ok(Command::Service(ServiceCommand::Guardian {
+                transaction_id: transaction_id.clone(),
+                parent_pid,
+            }))
         }
         [] => Err(
             "service requires install, status, start, stop, restart, rollback, or uninstall"
@@ -270,6 +298,21 @@ mod tests {
         assert_eq!(
             parse(args(&["service", "rollback"])).unwrap(),
             Command::Service(ServiceCommand::Rollback)
+        );
+        assert_eq!(
+            parse(args(&[
+                "service",
+                "__guardian",
+                "--transaction",
+                "gtx-1234-abcd",
+                "--parent-pid",
+                "1234"
+            ]))
+            .unwrap(),
+            Command::Service(ServiceCommand::Guardian {
+                transaction_id: "gtx-1234-abcd".to_owned(),
+                parent_pid: 1234,
+            })
         );
         assert_eq!(
             parse(args(&[
