@@ -14,6 +14,7 @@ mod fs_tools;
 mod git_tools;
 mod herdr;
 mod inspect;
+mod link;
 mod mcp;
 mod mcp_http;
 mod mutation;
