@@ -41,8 +41,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(target_os = "macos")]
 use std::os::unix::process::CommandExt;
 
-const DEFAULT_MANIFEST_URL: &str =
-    "https://github.com/whshang/herdr-mcp/releases/latest/download/release-manifest.json";
+const DEFAULT_RELEASES_API_URL: &str =
+    "https://api.github.com/repos/whshang/herdr-mcp/releases?per_page=20";
+const RELEASES_MAX_BYTES: usize = 1024 * 1024;
 const MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 const ATTESTATION_MAX_BYTES: usize = 2 * 1024 * 1024;
 const BINARY_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -267,12 +268,14 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
 }
 
 fn fetch_release_plan(manifest_override: Option<&str>) -> Result<ReleasePlan, String> {
-    let raw = manifest_override
+    let client = update_client()?;
+    let manifest_url = match manifest_override
         .map(str::to_owned)
         .or_else(|| env::var("HERDR_MCP_UPDATE_MANIFEST_URL").ok())
-        .unwrap_or_else(|| DEFAULT_MANIFEST_URL.to_owned());
-    let manifest_url = parse_update_url(&raw)?;
-    let client = update_client()?;
+    {
+        Some(raw) => parse_update_url(&raw)?,
+        None => discover_default_manifest_url(&client)?,
+    };
     let bytes = fetch_bounded(
         &client,
         manifest_url,
@@ -290,6 +293,73 @@ fn fetch_release_plan(manifest_override: Option<&str>) -> Result<ReleasePlan, St
         &plan.identity,
     )?;
     Ok(plan)
+}
+
+fn discover_default_manifest_url(client: &Client) -> Result<Url, String> {
+    let releases_url = Url::parse(DEFAULT_RELEASES_API_URL)
+        .map_err(|_| "default GitHub releases API URL is invalid".to_owned())?;
+    let bytes = fetch_bounded(
+        client,
+        releases_url,
+        RELEASES_MAX_BYTES,
+        "GitHub releases index",
+    )?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("GitHub releases index is invalid JSON: {error}"))?;
+    let tag = select_release_tag(&value)?;
+    Url::parse(&format!(
+        "https://github.com/{}/releases/download/{tag}/release-manifest.json",
+        release_trust::RELEASE_REPOSITORY
+    ))
+    .map_err(|_| "cannot construct discovered release manifest URL".to_owned())
+}
+
+fn select_release_tag(value: &Value) -> Result<String, String> {
+    let releases = value
+        .as_array()
+        .ok_or_else(|| "GitHub releases index must be a JSON array".to_owned())?;
+    let mut best: Option<(Version, String)> = None;
+    for release in releases {
+        let Some(object) = release.as_object() else {
+            continue;
+        };
+        if object.get("draft").and_then(Value::as_bool) != Some(false) {
+            continue;
+        }
+        let Some(tag) = object.get("tag_name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(version_text) = tag.strip_prefix('v') else {
+            continue;
+        };
+        let Ok(version) = Version::parse(version_text) else {
+            continue;
+        };
+        if tag != format!("v{version}") {
+            continue;
+        }
+        let has_manifest = object
+            .get("assets")
+            .and_then(Value::as_array)
+            .is_some_and(|assets| {
+                assets.iter().any(|asset| {
+                    asset.get("name").and_then(Value::as_str) == Some("release-manifest.json")
+                })
+            });
+        if !has_manifest {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(best_version, _)| version > *best_version)
+        {
+            best = Some((version, tag.to_owned()));
+        }
+    }
+    best.map(|(_, tag)| tag).ok_or_else(|| {
+        "GitHub releases index contains no non-draft semver release with release-manifest.json"
+            .to_owned()
+    })
 }
 
 fn parse_release_plan(value: &Value, target: &str) -> Result<ReleasePlan, String> {
@@ -958,6 +1028,54 @@ mod tests {
                 .contains("trusted repository")
         );
         assert!(parse_release_plan(&manifest_for(target, "9.9.9"), "other-target").is_err());
+    }
+
+    #[test]
+    fn release_discovery_includes_prereleases_and_fails_closed_on_invalid_entries() {
+        let releases = json!([
+            {
+                "draft": false,
+                "prerelease": true,
+                "tag_name": "v0.4.0-alpha.5",
+                "assets": [{"name": "release-manifest.json"}]
+            },
+            {
+                "draft": false,
+                "prerelease": true,
+                "tag_name": "v0.4.0-alpha.6",
+                "assets": [{"name": "release-manifest.json"}]
+            },
+            {
+                "draft": true,
+                "prerelease": true,
+                "tag_name": "v9.0.0-alpha.1",
+                "assets": [{"name": "release-manifest.json"}]
+            },
+            {
+                "draft": false,
+                "prerelease": false,
+                "tag_name": "v8.0.0",
+                "assets": [{"name": "other.bin"}]
+            },
+            {
+                "draft": false,
+                "prerelease": true,
+                "tag_name": "not-semver",
+                "assets": [{"name": "release-manifest.json"}]
+            }
+        ]);
+        assert_eq!(select_release_tag(&releases).unwrap(), "v0.4.0-alpha.6");
+
+        assert!(select_release_tag(&json!({"tag_name": "v1.0.0"})).is_err());
+        assert!(
+            select_release_tag(&json!([{
+                "draft": false,
+                "tag_name": "v1.0.0",
+                "assets": []
+            }]))
+            .unwrap_err()
+            .contains("no non-draft semver release")
+        );
     }
 
     #[test]
