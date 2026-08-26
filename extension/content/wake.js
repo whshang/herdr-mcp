@@ -735,9 +735,11 @@ const H2W_CONTENT_VERSION = "0.1.62";
     const id = String(transferId || "").trim();
     if (!id) return false;
     const body = String(text || "");
-    if (body.includes(`[HERDR_CONTINUITY_TRANSFER id=${id}]`)) return true;
-    return body.includes(`<<<HERDR_HANDOFF_V1 id=${id}>>>`)
-      && body.includes("<<<END_HERDR_HANDOFF_V1>>>");
+    // Only the NEW-conversation seed wrapper proves target delivery. The
+    // source handoff request itself contains the raw HERDR_HANDOFF_V1 packet,
+    // so accepting that marker here can misclassify the source conversation as
+    // an already-seeded target during same-tab navigation.
+    return body.includes(`[HERDR_CONTINUITY_TRANSFER id=${id}]`);
   }
 
   async function waitForHandoffTarget(transferId, timeoutMs = 25000) {

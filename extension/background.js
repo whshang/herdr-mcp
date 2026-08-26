@@ -1045,6 +1045,23 @@ async function waitForTabComplete(tabId, timeoutMs = 15000) {
   try { return await chrome.tabs.get(tabId); } catch (_) { return null; }
 }
 
+async function waitForManualProjectHome(tabId, transfer, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const info = chatGptConversationInfo(tab?.url);
+      if (
+        tab?.status === "complete"
+        && info?.project_id === transfer?.project_id
+        && info?.is_project_home === true
+      ) return tab;
+    } catch (_) { return null; }
+    await sleep(150);
+  }
+  return null;
+}
+
 async function tabStillExists(tabId) {
   if (!tabId) return false;
   try { return Boolean(await chrome.tabs.get(tabId)); } catch (_) { return false; }
@@ -2373,10 +2390,20 @@ async function waitForHandoffTargetComposer(transfer, targetTabId, timeoutMs = H
         transferId: transfer.id,
       });
     } catch (_) {}
-    if (probe?.seedConfirmed && probe?.targetConvKey) {
+    const targetInfo = chatGptConversationInfo(probe?.targetUrl || probe?.targetConvKey || "");
+    const sameProject = targetInfo?.project_id === transfer?.project_id;
+    const freshTargetConversation = Boolean(
+      sameProject
+      && targetInfo?.conversation_id
+      && targetInfo?.convKey
+      && targetInfo.convKey !== transfer?.source_conv_key
+    );
+    if (probe?.seedConfirmed && probe?.targetConvKey && freshTargetConversation) {
       return { ready: true, already: true, probe };
     }
-    if (probe?.composerReady) return { ready: true, already: false, probe };
+    if (probe?.composerReady && sameProject && targetInfo?.is_project_home === true) {
+      return { ready: true, already: false, probe };
+    }
     if (Date.now() >= deadline) break;
     await sleep(HANDOFF_COMPOSER_READY_POLL_MS);
   } while (true);
@@ -2527,12 +2554,20 @@ async function launchHandoffTarget(transferId) {
     return { ok: false, error: "target_tab_missing" };
   }
   await markTransfer(transferId, { status: "target_opening", target_tab_id: tab.id });
-  const ready = await waitForTabComplete(tab.id, 20000);
+  const manualProject = manualChatGptProjectHandoff(transfer);
+  const ready = manualProject
+    ? await waitForManualProjectHome(tab.id, transfer, 20000)
+    : await waitForTabComplete(tab.id, 20000);
   if (!ready) {
-    await markTransfer(transferId, { status: "failed", error: "target_load_failed" });
-    return { ok: false, error: "target_load_failed" };
+    const error = manualProject ? "target_project_home_timeout" : "target_load_failed";
+    await markTransfer(transferId, {
+      status: manualProject ? "seed_uncertain" : "failed",
+      target_tab_id: tab.id,
+      error,
+    });
+    return { ok: false, error };
   }
-  if (!manualChatGptProjectHandoff(transfer)) await sleep(350);
+  if (!manualProject) await sleep(350);
   return seedHandoffIntoTarget(transferId, tab.id);
 }
 

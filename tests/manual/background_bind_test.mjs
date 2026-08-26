@@ -61,6 +61,13 @@ let targetSeedCount = 0;
 let tabCreateCount = 0;
 let tabUpdateCount = 0;
 let lastTabUpdate = null;
+let projectNavigationReadyAfter = 0;
+let projectNavigationPollCount = 0;
+let sourceProbeLooksSeeded = false;
+let forceComposerTimeout = false;
+const realDateNow = Date.now.bind(Date);
+let testClockOffsetMs = 0;
+Date.now = () => realDateNow() + testClockOffsetMs;
 let mockStateWorkspaces = [];
 let mockLocalRuntimeAvailable = true;
 let hangAutomationNotifications = false;
@@ -139,6 +146,7 @@ function targetListener(tab) {
     }
     if (msg?.type === "h2w_handoff_probe") {
       targetProbeCount += 1;
+      if (forceComposerTimeout) testClockOffsetMs += 30000;
       const composerReady = targetComposerReady && targetProbeCount > targetComposerReadyAfter;
       sendResponse({
         ok: true,
@@ -278,6 +286,15 @@ globalThis.chrome = {
     async get(tabId) {
       const t = tabs.get(tabId);
       if (!t) throw new Error(`tab ${tabId} missing`);
+      if (t.pendingUrl) {
+        projectNavigationPollCount += 1;
+        if (projectNavigationPollCount > projectNavigationReadyAfter) {
+          t.url = t.pendingUrl;
+          t.pendingUrl = null;
+          t.status = "complete";
+          t.listener = targetListener(t);
+        }
+      }
       return { id: t.id, url: t.url, status: t.status || "complete", active: t.active === true, windowId: 1 };
     },
     async create({ url }) {
@@ -294,10 +311,17 @@ globalThis.chrome = {
       if (props.url) {
         tabUpdateCount += 1;
         lastTabUpdate = { tabId, ...props };
-        tab.url = props.url;
-        // Navigation destroys the source content script and loads the target
-        // page in the same tab. Attribute-only updates must preserve it.
-        tab.listener = targetListener(tab);
+        projectNavigationPollCount = 0;
+        if (projectNavigationReadyAfter > 0) {
+          // Model Chrome's real race: tabs.update can resolve before the old
+          // complete source document is replaced by the Project-home SPA.
+          tab.pendingUrl = props.url;
+        } else {
+          tab.url = props.url;
+          // Navigation destroys the source content script and loads the target
+          // page in the same tab. Attribute-only updates must preserve it.
+          tab.listener = targetListener(tab);
+        }
       }
       if (Object.prototype.hasOwnProperty.call(props, "active")) tab.active = props.active === true;
       tab.status = "complete";
@@ -317,6 +341,16 @@ function installContentScript(tabId, url, convKey, site = "chatgpt") {
       if (msg?.type === "h2w_get_convkey") { sendResponse({ convKey, url, site }); return; }
       if (msg?.type === "h2w_wake") { sendResponse({}); return; }
       if (msg?.type === "h2w_handoff_prompt") { handoffPrompt = msg.template || ""; sendResponse({ ok: true }); return; }
+      if (msg?.type === "h2w_handoff_probe") {
+        sendResponse({
+          ok: true,
+          targetConvKey: convKey,
+          targetUrl: url,
+          seedConfirmed: sourceProbeLooksSeeded,
+          composerReady: true,
+        });
+        return;
+      }
       sendResponse({});
     },
   });
@@ -926,9 +960,12 @@ console.log("\n[z.ai manual handoff]");
 console.log("\n[project handoff]");
 {
   targetComposerReady = true;
-  targetComposerReadyAfter = 0;
+  targetComposerReadyAfter = 2;
   targetProbeCount = 0;
   targetSeedCount = 0;
+  projectNavigationReadyAfter = 2;
+  projectNavigationPollCount = 0;
+  sourceProbeLooksSeeded = true;
   const manualCreateBefore = tabCreateCount;
   const manualUpdateBefore = tabUpdateCount;
   installContentScript(401, PROJECT_SOURCE_URL, PROJECT_SOURCE);
@@ -1038,7 +1075,10 @@ console.log("\n[project handoff]");
       && lastTabUpdate?.url === PROJECT_KEY,
     "manual ChatGPT Project handoff navigates the current tab to the stable Project entry",
     JSON.stringify(lastTabUpdate));
-  ok(targetProbeCount >= 1, "current-tab handoff waits for the Project composer before seeding");
+  ok(projectNavigationPollCount >= 3,
+    "current-tab handoff waits until the current tab really reaches Project home");
+  ok(targetProbeCount >= 3, "current-tab handoff waits for the Project composer before seeding");
+  ok(targetSeedCount === 1, "source-page probe cannot count as the target seed");
   ok(!!storage.herdrWakeBindings[sourceKey]
       && storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_SOURCE,
     "Project binding stays on the source target while target delivery is uncertain");
@@ -1152,6 +1192,56 @@ console.log("\n[project handoff]");
   const autoOffP = new Promise((r) => { resolveAutoOff = r; });
   onMsg({ type: "h2w_set_project_automation", project_id: PROJECT_ID, convKey: PROJECT_TARGET, enabled: false }, { tab: { id: storage.herdrWakeBindings[targetKey]?.tabId } }, (r) => resolveAutoOff(r));
   await autoOffP;
+  projectNavigationReadyAfter = 0;
+  projectNavigationPollCount = 0;
+  sourceProbeLooksSeeded = false;
+  targetComposerReadyAfter = 0;
+}
+
+// ---- Scenario 7a: current-tab Project composer timeout stays fail-closed and resumable ----
+console.log("\n[project handoff composer timeout]");
+{
+  const timeoutTabId = 430;
+  const timeoutTransferId = "ht:test-current-tab-composer-timeout";
+  installContentScript(timeoutTabId, PROJECT_SOURCE_URL, PROJECT_SOURCE);
+  tabs.get(timeoutTabId).active = true;
+  storage.herdrConversationTransfers = {
+    ...(storage.herdrConversationTransfers || {}),
+    [timeoutTransferId]: {
+      id: timeoutTransferId,
+      trigger: "manual",
+      site: "chatgpt",
+      project_id: PROJECT_ID,
+      source_tab_id: timeoutTabId,
+      source_conv_key: PROJECT_SOURCE,
+      handoff_launch_url: PROJECT_KEY,
+      handoff_text: [
+        `<<<HERDR_HANDOFF_V1 id=${timeoutTransferId}>>>`,
+        "# Project handoff",
+        "Timeout fixture.",
+        "<<<END_HERDR_HANDOFF_V1>>>",
+      ].join("\n"),
+      status: "summary_ready",
+      created_at: Date.now() - 121000,
+      updated_at: Date.now() - 121000,
+    },
+  };
+  targetComposerReady = false;
+  forceComposerTimeout = true;
+  let resolveTimeout;
+  const timeoutP = new Promise((r) => { resolveTimeout = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: timeoutTabId, trigger: "manual" },
+    { tab: { id: timeoutTabId, url: PROJECT_SOURCE_URL } }, (r) => resolveTimeout(r));
+  const timedOut = await timeoutP;
+  ok(timedOut?.ok === false && timedOut?.error === "target_composer_timeout",
+    "Project composer timeout fails closed", JSON.stringify(timedOut));
+  ok(storage.herdrConversationTransfers?.[timeoutTransferId]?.status === "seed_uncertain"
+      && storage.herdrConversationTransfers?.[timeoutTransferId]?.target_tab_id === timeoutTabId,
+    "Project composer timeout remains resumable in the same tab");
+  delete storage.herdrConversationTransfers[timeoutTransferId];
+  targetComposerReady = true;
+  forceComposerTimeout = false;
+  testClockOffsetMs = 0;
 }
 
 // ---- Scenario 7b: a false insert failure is reconciled before declaring seed failure ----
