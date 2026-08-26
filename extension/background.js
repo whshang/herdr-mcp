@@ -26,7 +26,7 @@ import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 
-const H2W_SCRIPT_VERSION = "0.1.62";
+const H2W_SCRIPT_VERSION = "0.1.63";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -44,6 +44,9 @@ const CHATGPT_CONTENT_SCRIPT_FILES = [
 const PUSH_CONNECT_MS = 5000;
 const STATE_FETCH_MS = 4000;
 const TAB_RECOVERY_COOLDOWN_MS = 30000;
+const PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS = 180000;
+const PAGE_HEALTH_FORCE_RELOAD_REQUEST_MAX_AGE_MS = 15000;
+const PAGE_HEALTH_STORAGE_KEY = "h2wConversationHealthByConv";
 const HANDOFF_STORAGE_KEY = "herdrConversationTransfers";
 const PROJECT_AUTOMATION_STORAGE_KEY = "herdrProjectAutomation";
 const CONVERSATION_AUTOMATION_STORAGE_KEY = "herdrConversationAutomation";
@@ -53,6 +56,7 @@ const HANDOFF_RETENTION_MS = 7 * 86400000;
 const tabVersions = new Map();
 const reloadedTabs = new Set();
 const tabRecoveryAttemptAt = new Map();
+const pageHealthForceReloadAt = new Map();
 const FALLBACK_TEMPLATE =
   "herdr workspace {workspace_label}: agents stopped (focus {agent} @ {pane} → {status}).\n\nFocus pane output:\n{output}\n\n{roster}\n\n{idle_hint}\n\nContinue orchestration from these results; prefer fs/exec over expensive models.";
 const FALLBACK_PROGRESS_TEMPLATE =
@@ -3108,6 +3112,78 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         labels: hudLabels(),
       });
     })();
+    return true;
+  }
+  if (msg?.type === "h2w_force_tab_reload") {
+    void (async () => {
+      await configReady;
+      const tabId = sender.tab?.id;
+      const senderInfo = chatGptConversationInfo(sender.tab?.url || "");
+      const requestedInfo = chatGptConversationInfo(String(msg.convKey || ""));
+      const reason = String(msg.reason || "");
+      if (!tabId || !senderInfo?.conversation_id || senderInfo.site !== "chatgpt") {
+        sendResponse({ ok: false, error: "page_health_tab_unavailable" });
+        return;
+      }
+      if (!requestedInfo?.conversation_id || requestedInfo.convKey !== senderInfo.convKey) {
+        sendResponse({ ok: false, error: "page_health_conversation_mismatch" });
+        return;
+      }
+      if (!reason.startsWith("page_health_")) {
+        sendResponse({ ok: false, error: "page_health_reason_required" });
+        return;
+      }
+      if (!automationScopeForConversation(senderInfo.convKey).enabled) {
+        sendResponse({ ok: false, error: "automation_disabled" });
+        return;
+      }
+
+      const now = Date.now();
+      const stored = await chrome.storage.local.get([PAGE_HEALTH_STORAGE_KEY]);
+      const healthMap = { ...(stored?.[PAGE_HEALTH_STORAGE_KEY] || {}) };
+      const health = healthMap?.[senderInfo.convKey];
+      const requestedAt = Number(health?.page_health_last_background_reload_at || 0);
+      const executedAt = Number(health?.page_health_background_reload_executed_at || 0);
+      if (!health
+        || health.page_health_state !== "background_reload_pending"
+        || Number(health.page_health_background_reload_attempt || 0) !== 1
+        || health.reload_reason !== reason
+        || !requestedAt
+        || now - requestedAt > PAGE_HEALTH_FORCE_RELOAD_REQUEST_MAX_AGE_MS) {
+        sendResponse({ ok: false, error: "page_health_reload_not_durable" });
+        return;
+      }
+      const reloadKey = senderInfo.convKey;
+      const lastExecutedAt = Math.max(executedAt, Number(pageHealthForceReloadAt.get(reloadKey) || 0));
+      if (lastExecutedAt && now - lastExecutedAt < PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS) {
+        sendResponse({ ok: false, error: "page_health_reload_cooldown" });
+        return;
+      }
+
+      // Persist execution before navigation. This survives MV3 worker suspension
+      // and makes a duplicate message unable to create a reload loop. Reserve
+      // the conversation synchronously before the async storage write so two
+      // tabs on the same conversation cannot both pass the first durable read.
+      pageHealthForceReloadAt.set(reloadKey, now);
+      healthMap[senderInfo.convKey] = {
+        ...health,
+        page_health_background_reload_executed_at: now,
+      };
+      try {
+        await chrome.storage.local.set({ [PAGE_HEALTH_STORAGE_KEY]: healthMap });
+      } catch (error) {
+        if (pageHealthForceReloadAt.get(reloadKey) === now) pageHealthForceReloadAt.delete(reloadKey);
+        throw error;
+      }
+      // Hand the navigation command to Chrome before acknowledging the sender.
+      // A MV3 service worker may be suspended after sendResponse; a delayed
+      // setTimeout here could therefore lose the escalation entirely.
+      const reloadPromise = chrome.tabs.reload(tabId);
+      sendResponse({ ok: true, scheduled: true, tabId });
+      await reloadPromise.catch((error) => {
+        callLog(`page-health forced reload failed for tab ${tabId}:`, error?.message || String(error));
+      });
+    })().catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
     return true;
   }
   if (msg?.type === "h2w_open_options") {

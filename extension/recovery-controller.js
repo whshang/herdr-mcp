@@ -11,8 +11,10 @@ const DEFAULT_RECOVERY_POLICY = Object.freeze({
   serverStallMs: 60000,
   freshnessProbeIntervalMs: 15000,
   reloadCooldownMs: 60000,
+  backgroundReloadCooldownMs: 180000,
   maxRecoveryAttempts: 1,
   maxReloadAttempts: 1,
+  maxBackgroundReloadAttempts: 1,
 });
 
 function classifyViewFreshness({ dom = {}, server = {}, now = Date.now() } = {}, policy = DEFAULT_RECOVERY_POLICY) {
@@ -147,6 +149,29 @@ function canReloadSafely({
     && reloadAttempts < policy.maxReloadAttempts;
 }
 
+function canForceTabReloadSafely({
+  composerBusy = false,
+  composerHasHumanText = false,
+  streaming = false,
+  toolRunning = false,
+  permissionCardActive = false,
+  deliveryUnknown = false,
+  mutationDeliveryUncertain = false,
+  backgroundReloadAttempts = 0,
+  lastBackgroundReloadAt = null,
+  now = Date.now(),
+}, policy = DEFAULT_RECOVERY_POLICY) {
+  return !composerBusy
+    && !composerHasHumanText
+    && !streaming
+    && !toolRunning
+    && !permissionCardActive
+    && !deliveryUnknown
+    && !mutationDeliveryUncertain
+    && (!lastBackgroundReloadAt || now - lastBackgroundReloadAt >= policy.backgroundReloadCooldownMs)
+    && backgroundReloadAttempts < policy.maxBackgroundReloadAttempts;
+}
+
 async function runAfterDurablePersistence({
   persist,
   action,
@@ -186,6 +211,7 @@ globalThis.H2W_RECOVERY_CONTROLLER = {
   canRolloverSafely,
   classifyReplyTimeout,
   canReloadSafely,
+  canForceTabReloadSafely,
   classifyViewFreshness,
   runAfterDurablePersistence,
 };

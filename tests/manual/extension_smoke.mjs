@@ -59,9 +59,19 @@ const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
-ok(manifest.version === "0.1.62", "manifest version stays aligned with the runtime-gated title build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.62"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.62"'), "content version matches manifest");
+ok(manifest.version === "0.1.63", "manifest version stays aligned with the page self-healing build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.63"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.63"'), "content version matches manifest");
+ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
+    && backgroundSource.includes("const tabId = sender.tab?.id")
+    && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")
+    && backgroundSource.includes('health.page_health_state !== "background_reload_pending"')
+    && backgroundSource.includes("page_health_background_reload_executed_at")
+    && wakeSource.includes("maybeRecoverPageHealth()")
+    && wakeSource.includes('type: "h2w_force_tab_reload"')
+    && wakeSource.includes("recordHttpStatus(429")
+    && wakeSource.includes("network_backoff_until"),
+  "bounded page self-healing keeps forced reload sender-scoped and 429 backoff-only");
 ok(backgroundSource.includes("automationRuntimeGate")
     && backgroundSource.includes('reason: "local_runtime_unavailable"')
     && wakeSource.includes('blocked: "local-runtime-unavailable"'),

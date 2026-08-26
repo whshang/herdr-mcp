@@ -172,6 +172,19 @@ Retry 和 reload 都是有预算的。恢复预算用尽后进入明确的 `roll
 
 只有 assistant 正文增长或签名变化才更新真实进度时间。持续断线且页面安全时，可以 reload 一次重新同步既有服务端回合；不会重新提交原用户任务。
 
+## 页面健康自恢复：卡顿、内存与 429
+
+0.1.63 把原本只用于诊断的 UI-pressure meter 接入了一个有严格预算的页面健康恢复层。它不会直接删除 ChatGPT/React 管理的历史 DOM；直接删节点可能让 React 内部树、事件绑定、虚拟列表和真实 DOM 失配。需要回收整页运行时内存时，优先通过受控 reload 重建 document / React tree / JS heap。
+
+自动恢复使用固定窗口、O(1) 的聚合信号：MutationObserver callback rate、采样 tick rate、timer drift、Long Task，以及 Chromium 可提供时的 JS heap 使用量。单次尖峰只记录，不刷新。
+
+- 活跃回合只有在页面持续高压且一段时间没有 assistant 进展，并且同源 conversation snapshot 明确证明 `current_node` 已是 **finished assistant** 时，才允许把 stale streaming UI 视为渲染问题并刷新。
+- critical heap 只在页面至少静止一段时间后才允许维护刷新；人工输入、tool 运行、权限卡、未确认 delivery 都会阻断刷新。
+- 第一级最多一次 durable `location.reload()`；如果刷新后页面仍持续处于同一健康故障，第二级最多一次 sender-scoped `chrome.tabs.reload(tabId)`。background 只接受当前 `sender.tab`、同一 conversation、Auto 已开启且 durable pending 状态匹配的请求，并在导航前记录 executed-at，避免 MV3 worker 重启后形成 reload loop。
+- 两级预算都耗尽后不继续刷新，转为 `rollover_recommended`，让长会话走受控接力。
+
+HTTP 429 是单独的反向信号：**429 只退避，不触发 Retry 或 reload。** 可见错误或 Resource Timing 中的 429 会进入 `30s → 60s → 120s`（封顶）的 cooldown；退避期间自动恢复不制造新的页面/API/附件请求，从而避免把服务端限流放大成刷新风暴。
+
 ## 自动接力：为什么需要新的 conversation
 
 一个长时间 Herdr 项目可能产生几十轮用户/助手消息、MCP tool payload、Project 指令和系统上下文。即使可见正文看起来还不夸张，真实上下文压力也可能已经很高。

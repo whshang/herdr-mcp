@@ -6,8 +6,8 @@
 //  - createUiPressureMeter / classifyUiPressure: bounded, fixed-window rolling
 //    aggregation of UI pressure signals (mutation callback rate, sampling/tick
 //    rate, timer drift). Only per-window counters are kept — never a timeline.
-//    Long Task samples are optional and informational only: they never affect
-//    the healthy/warning/high classification, which stays purely aggregate.
+//    Long Task and HTTP 429 samples stay bounded and informational; page-health
+//    recovery consumes them conservatively and never treats 429 as a reload cue.
 (function initBrowserPerformance(global) {
   "use strict";
 
@@ -26,6 +26,22 @@
     // Max observed setTimeout drift in ms (throttling/contention fallback).
     warningMaxTimerDriftMs: 1500,
     highMaxTimerDriftMs: 5000,
+  });
+
+  const DEFAULT_PAGE_HEALTH_POLICY = Object.freeze({
+    minSampleWindowMs: 15000,
+    sustainedPressureMs: 30000,
+    activeTurnStallMs: 30000,
+    memoryQuiescentMs: 30000,
+    memoryWarningBytes: 1024 * 1024 * 1024,
+    memoryCriticalBytes: 1536 * 1024 * 1024,
+    memoryWarningRatio: 0.60,
+    memoryCriticalRatio: 0.78,
+    severeLongTaskMs: 2000,
+    severeLongTaskCount: 4,
+    rateLimitBackoffBaseMs: 30000,
+    rateLimitBackoffMaxMs: 120000,
+    backgroundEscalationDelayMs: 30000,
   });
 
   function createCoalescedScheduler(run, {
@@ -107,8 +123,6 @@
   /**
    * Fixed-window rolling meter. Counters accumulate within windowMs and reset
    * when the window elapses, so memory stays O(1) — no timeline is retained.
-   * Long-task samples are recorded but are informational only: they appear in
-   * evaluate() output without affecting the classification level.
    */
   function createUiPressureMeter({
     windowMs = UI_PRESSURE_WINDOW_MS,
@@ -122,6 +136,8 @@
     let maxTimerDriftMs = 0;
     let longTaskCount = 0;
     let maxLongTaskMs = 0;
+    let http429Count = 0;
+    let lastHttp429At = 0;
 
     const openWindow = (current) => {
       if (!windowStart || current - windowStart >= interval) {
@@ -132,6 +148,8 @@
         maxTimerDriftMs = 0;
         longTaskCount = 0;
         maxLongTaskMs = 0;
+        http429Count = 0;
+        lastHttp429At = 0;
       }
     };
 
@@ -152,6 +170,8 @@
         drift_samples: driftCount,
         long_task_count: longTaskCount,
         long_task_max_ms: Math.round(maxLongTaskMs),
+        http_429_count: http429Count,
+        last_http_429_at: lastHttp429At || null,
         sampled_at: current,
       };
     };
@@ -181,6 +201,13 @@
         longTaskCount += 1;
         if (value > maxLongTaskMs) maxLongTaskMs = value;
       },
+      recordHttpStatus(status, at) {
+        if (Number(status) !== 429) return;
+        const current = Number(at) || now();
+        openWindow(current);
+        http429Count += 1;
+        lastHttp429At = current;
+      },
       evaluate,
       reset() {
         windowStart = 0;
@@ -190,8 +217,118 @@
         maxTimerDriftMs = 0;
         longTaskCount = 0;
         maxLongTaskMs = 0;
+        http429Count = 0;
+        lastHttp429At = 0;
       },
     });
+  }
+
+  function classifyMemoryPressure(memory = {}, policy = DEFAULT_PAGE_HEALTH_POLICY) {
+    const usedBytes = Math.max(0, Number(memory?.usedJSHeapSize || memory?.used_bytes || 0) || 0);
+    const limitBytes = Math.max(0, Number(memory?.jsHeapSizeLimit || memory?.limit_bytes || 0) || 0);
+    const ratio = limitBytes > 0 ? usedBytes / limitBytes : null;
+    let level = "healthy";
+    const reasons = [];
+    if (usedBytes >= policy.memoryCriticalBytes
+      || (ratio != null && ratio >= policy.memoryCriticalRatio)) {
+      level = "critical";
+      reasons.push(`heap_bytes:${Math.round(usedBytes)}`);
+      if (ratio != null) reasons.push(`heap_ratio:${Math.round(ratio * 1000) / 1000}`);
+    } else if (usedBytes >= policy.memoryWarningBytes
+      || (ratio != null && ratio >= policy.memoryWarningRatio)) {
+      level = "warning";
+      reasons.push(`heap_bytes:${Math.round(usedBytes)}`);
+      if (ratio != null) reasons.push(`heap_ratio:${Math.round(ratio * 1000) / 1000}`);
+    }
+    return {
+      level,
+      reasons,
+      used_bytes: Math.round(usedBytes),
+      limit_bytes: Math.round(limitBytes),
+      ratio: ratio == null ? null : Math.round(ratio * 10000) / 10000,
+    };
+  }
+
+  function rateLimitBackoffMs(attempt, policy = DEFAULT_PAGE_HEALTH_POLICY) {
+    const n = Math.max(1, Math.floor(Number(attempt) || 1));
+    return Math.min(
+      policy.rateLimitBackoffMaxMs,
+      policy.rateLimitBackoffBaseMs * (2 ** Math.min(8, n - 1)),
+    );
+  }
+
+  /**
+   * Pure page-health decision. HTTP 429 is always backoff-only: it never
+   * recommends reload/retry. Render-pressure reloads require an active stalled
+   * turn, a mature high-pressure sample, and server confirmation that the
+   * assistant turn has already settled. Critical JS heap pressure can request
+   * an idle maintenance reload only after a quiescent interval.
+   */
+  function classifyPageHealth(input = {}, policy = DEFAULT_PAGE_HEALTH_POLICY) {
+    const now = Number(input?.now) || Date.now();
+    const backoffUntil = Math.max(0, Number(input?.backoffUntil || 0) || 0);
+    const memory = classifyMemoryPressure(input?.memory || {}, policy);
+    const ui = input?.ui || {};
+    const uiReady = Number(ui?.window_elapsed_ms || 0) >= policy.minSampleWindowMs;
+    const uiHigh = uiReady && ui?.level === "high";
+    const longTaskSevere = Number(ui?.long_task_max_ms || 0) >= policy.severeLongTaskMs
+      || Number(ui?.long_task_count || 0) >= policy.severeLongTaskCount;
+    const activeTurn = input?.activeTurn === true;
+    const serverSettled = input?.serverSettled === true;
+    const stallMs = Math.max(0, Number(input?.stallMs || 0) || 0);
+    const quiescentMs = Math.max(0, Number(input?.quiescentMs || 0) || 0);
+    const highSince = Math.max(0, Number(input?.highSince || 0) || 0);
+
+    if (backoffUntil > now) {
+      return {
+        state: "rate_limited",
+        action: "backoff",
+        reason: "http_429_backoff",
+        candidate: false,
+        sustained: false,
+        backoff_until: backoffUntil,
+        memory,
+        ui_high: uiHigh,
+        long_task_severe: longTaskSevere,
+      };
+    }
+
+    const renderCandidate = activeTurn
+      && serverSettled
+      && stallMs >= policy.activeTurnStallMs
+      && uiHigh;
+    const memoryCandidate = memory.level === "critical"
+      && quiescentMs >= policy.memoryQuiescentMs;
+    const candidate = renderCandidate || memoryCandidate;
+    const sustained = Boolean(candidate && highSince && now - highSince >= policy.sustainedPressureMs);
+    const warning = uiHigh || longTaskSevere || memory.level !== "healthy";
+    const reason = renderCandidate
+      ? "render_stall"
+      : memoryCandidate
+        ? "memory_pressure"
+        : longTaskSevere
+          ? "long_task_pressure"
+          : memory.level !== "healthy"
+            ? "memory_warning"
+            : uiHigh
+              ? "ui_pressure"
+              : null;
+
+    return {
+      state: sustained ? "reload_recommended" : candidate ? "degraded" : warning ? "warning" : "healthy",
+      action: sustained ? "reload" : candidate ? "observe" : "none",
+      reason,
+      candidate,
+      sustained,
+      backoff_until: null,
+      memory,
+      ui_high: uiHigh,
+      long_task_severe: longTaskSevere,
+      active_turn: activeTurn,
+      server_settled: serverSettled,
+      stall_ms: Math.round(stallMs),
+      quiescent_ms: Math.round(quiescentMs),
+    };
   }
 
   global.H2W_BROWSER_PERFORMANCE = Object.freeze({
@@ -199,8 +336,12 @@
     DEFAULT_PERMISSION_COALESCE_MS,
     UI_PRESSURE_WINDOW_MS,
     DEFAULT_UI_PRESSURE_POLICY,
+    DEFAULT_PAGE_HEALTH_POLICY,
     createCoalescedScheduler,
     createUiPressureMeter,
     classifyUiPressure,
+    classifyMemoryPressure,
+    classifyPageHealth,
+    rateLimitBackoffMs,
   });
 })(typeof globalThis !== "undefined" ? globalThis : window);

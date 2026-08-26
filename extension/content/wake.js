@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.62";
+const H2W_CONTENT_VERSION = "0.1.63";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -26,6 +26,8 @@ const H2W_CONTENT_VERSION = "0.1.62";
   let conversationHealth = null;
   let contextPressureRecord = null;
   let lastFreshnessProbeAt = 0;
+  let lastPageHealthProbeAt = 0;
+  const pageHealthStartedAt = Date.now();
   // Fail closed until background confirms the master automation state. The
   // read-only HUD/workspace observers do not depend on these flags.
   let automationEnabled = false;
@@ -1172,6 +1174,209 @@ const H2W_CONTENT_VERSION = "0.1.62";
     return { text };
   }
 
+  function browserMemorySnapshot() {
+    try {
+      const memory = globalThis.performance?.memory;
+      if (!memory) return {};
+      return {
+        usedJSHeapSize: Number(memory.usedJSHeapSize || 0) || 0,
+        totalJSHeapSize: Number(memory.totalJSHeapSize || 0) || 0,
+        jsHeapSizeLimit: Number(memory.jsHeapSizeLimit || 0) || 0,
+      };
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function explicitChatGptRateLimitError() {
+    if (ADAPTER.name !== "chatgpt") return false;
+    const selectors = '[role="alert"], [class*="text-token-text-error"], [data-testid*="error"], [data-testid*="attachment"]';
+    let nodes = [];
+    try { nodes = [...document.querySelectorAll(selectors)].slice(-20); } catch (_) { return false; }
+    return nodes.some((node) => {
+      const text = String(node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
+      return /(?:\b429\b|too many requests|rate[ -]?limit|请求过多|请求过于频繁|请求频率|速率限制)/i.test(text);
+    });
+  }
+
+  function noteChatGptRateLimit(at = Date.now(), source = "resource") {
+    if (!conversationHealth || !BROWSER_PERFORMANCE?.rateLimitBackoffMs) return false;
+    const lastSeenAt = Number(conversationHealth.network_429_last_seen_at || 0);
+    // A persistent error card can be sampled many times. Count one event per
+    // ten seconds so a single 429 cannot instantly run the backoff to its cap.
+    if (lastSeenAt && at - lastSeenAt < 10000) return false;
+    const previousCount = lastSeenAt && at - lastSeenAt < 5 * 60 * 1000
+      ? Number(conversationHealth.network_429_count || 0)
+      : 0;
+    const count = Math.min(8, previousCount + 1);
+    const backoffMs = BROWSER_PERFORMANCE.rateLimitBackoffMs(count);
+    markConversationState({
+      ...conversationHealth,
+      page_health_state: "rate_limited",
+      page_health_checked_at: at,
+      page_health_high_since: null,
+      page_health_reason: "http_429_backoff",
+      network_429_count: count,
+      network_429_last_seen_at: at,
+      network_429_source: source,
+      network_backoff_until: at + backoffMs,
+    });
+    return true;
+  }
+
+  async function maybeRecoverPageHealth() {
+    if (!automationEnabled || ADAPTER.name !== "chatgpt" || !conversationHealth
+      || !BROWSER_PERFORMANCE?.classifyPageHealth || !RECOVERY_CONTROLLER) return false;
+    const now = Date.now();
+    const ui = uiPressure?.evaluate?.(now) || {};
+    const resource429At = Number(ui.last_http_429_at || 0);
+    if (resource429At > Number(conversationHealth.network_429_last_seen_at || 0)) {
+      noteChatGptRateLimit(resource429At, "resource_timing");
+    } else if (explicitChatGptRateLimitError()) {
+      noteChatGptRateLimit(now, "visible_error");
+    }
+    if (Number(conversationHealth.network_backoff_until || 0) > now) {
+      if (conversationHealth.page_health_state !== "rate_limited") {
+        markConversationState({
+          ...conversationHealth,
+          page_health_state: "rate_limited",
+          page_health_checked_at: now,
+          page_health_high_since: null,
+          page_health_reason: "http_429_backoff",
+        });
+      }
+      // 429 never causes a retry/reload. Suppress the rest of this automatic
+      // recovery cycle until the bounded backoff expires.
+      return true;
+    }
+
+    const policy = BROWSER_PERFORMANCE.DEFAULT_PAGE_HEALTH_POLICY;
+    if (!policy || now - lastPageHealthProbeAt < policy.minSampleWindowMs) return false;
+    lastPageHealthProbeAt = now;
+
+    const lastUserSubmitAt = Number(conversationHealth.last_user_submit_at || 0);
+    const lastTurnEndAt = Number(conversationHealth.last_turn_end_at || 0);
+    const lastAssistantProgressAt = Number(conversationHealth.last_assistant_progress_at || 0);
+    const activeTurn = lastUserSubmitAt > 0 && lastTurnEndAt < lastUserSubmitAt;
+    const lastActivityAt = Math.max(lastUserSubmitAt, lastTurnEndAt, lastAssistantProgressAt);
+    const quiescentMs = Math.max(0, now - (lastActivityAt || pageHealthStartedAt));
+    const stallBase = Math.max(lastAssistantProgressAt, lastUserSubmitAt);
+    const stallMs = activeTurn && stallBase ? Math.max(0, now - stallBase) : 0;
+    const uiReadyHigh = ui?.level === "high"
+      && Number(ui.window_elapsed_ms || 0) >= policy.minSampleWindowMs;
+
+    let serverSettled = false;
+    if (activeTurn && stallMs >= policy.activeTurnStallMs && uiReadyHigh) {
+      const server = await fetchChatGptConversationSnapshot();
+      serverSettled = Boolean(server?.ok
+        && server?.currentNodeRole === "assistant"
+        && server?.finished === true);
+    }
+
+    const input = {
+      ui,
+      memory: browserMemorySnapshot(),
+      activeTurn,
+      serverSettled,
+      stallMs,
+      quiescentMs,
+      highSince: Number(conversationHealth.page_health_high_since || 0),
+      backoffUntil: Number(conversationHealth.network_backoff_until || 0),
+      now,
+    };
+    let health = BROWSER_PERFORMANCE.classifyPageHealth(input, policy);
+    let highSince = Number(conversationHealth.page_health_high_since || 0) || null;
+    if (health.candidate && !highSince) {
+      highSince = now;
+      health = BROWSER_PERFORMANCE.classifyPageHealth({ ...input, highSince }, policy);
+    } else if (!health.candidate) {
+      highSince = null;
+    }
+    markConversationState({
+      ...conversationHealth,
+      page_health_state: health.state,
+      page_health_checked_at: now,
+      page_health_high_since: highSince,
+      page_health_reason: health.reason || null,
+    });
+    if (health.action !== "reload") return false;
+
+    const safety = recoverySafetySnapshot();
+    // A server-settled assistant can leave a stale Stop button in the page.
+    // Ignore that stale streaming bit only after the same-origin server probe
+    // proves the assistant turn is already finished.
+    const effectiveSafety = serverSettled ? { ...safety, streaming: false } : safety;
+    const reloadReason = `page_health_${health.reason || "pressure"}`;
+    if (RECOVERY_CONTROLLER.canReloadSafely(effectiveSafety)) {
+      markConversationState({
+        ...conversationHealth,
+        reload_attempt: Number(conversationHealth.reload_attempt || 0) + 1,
+        last_reload_at: now,
+        reload_reason: reloadReason,
+        page_health_state: "reload_pending",
+        page_health_checked_at: now,
+      });
+      await reloadAfterPersistingConversationState();
+      return true;
+    }
+
+    const lastReloadAt = Number(conversationHealth.last_reload_at || 0);
+    const primaryReloadSpent = Number(conversationHealth.reload_attempt || 0)
+      >= RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.maxReloadAttempts;
+    // Level two is an escalation, never an alternative first action. If level
+    // one was blocked for a live-safety reason, stay put rather than asking the
+    // background worker to bypass that decision.
+    if (!primaryReloadSpent || !lastReloadAt) return false;
+    if (lastReloadAt && now - lastReloadAt < policy.backgroundEscalationDelayMs) return true;
+    if (RECOVERY_CONTROLLER.canForceTabReloadSafely?.({
+      ...effectiveSafety,
+      backgroundReloadAttempts: Number(conversationHealth.page_health_background_reload_attempt || 0),
+      lastBackgroundReloadAt: conversationHealth.page_health_last_background_reload_at || null,
+      now,
+    })) {
+      markConversationState({
+        ...conversationHealth,
+        page_health_background_reload_attempt: Number(conversationHealth.page_health_background_reload_attempt || 0) + 1,
+        page_health_last_background_reload_at: now,
+        page_health_state: "background_reload_pending",
+        page_health_checked_at: now,
+        reload_reason: reloadReason,
+      });
+      // Consume the second-level reload budget durably before asking the MV3
+      // service worker to reload this exact sender tab.
+      if (!(await persistConversationHealth(conversationHealth))) return true;
+      const forced = await sendBg({
+        type: "h2w_force_tab_reload",
+        convKey: ADAPTER.getConversationKey(),
+        reason: reloadReason,
+      });
+      if (!forced?.ok) {
+        markConversationState({
+          ...conversationHealth,
+          page_health_state: "background_reload_failed",
+          page_health_checked_at: Date.now(),
+        });
+      }
+      return true;
+    }
+
+    if (Number(conversationHealth.reload_attempt || 0) >= RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.maxReloadAttempts
+      && Number(conversationHealth.page_health_background_reload_attempt || 0)
+        >= RECOVERY_CONTROLLER.DEFAULT_RECOVERY_POLICY.maxBackgroundReloadAttempts) {
+      let exhausted = {
+        ...conversationHealth,
+        page_health_state: "exhausted",
+        page_health_checked_at: now,
+      };
+      if (CONVERSATION_HEALTH?.markRolloverRecommended) {
+        exhausted = CONVERSATION_HEALTH.markRolloverRecommended(exhausted, now);
+      }
+      markConversationState(exhausted);
+      paintPageHud({});
+    }
+    return false;
+  }
+
   async function maybeRecoverDisconnectedReply() {
     if (!automationEnabled || ADAPTER.name !== "chatgpt" || !conversationHealth || !RECOVERY_CONTROLLER || !CONVERSATION_HEALTH) return false;
     if (!explicitChatGptDisconnectedReply()) return false;
@@ -1520,6 +1725,7 @@ const H2W_CONTENT_VERSION = "0.1.62";
         // A saved Auto-on preference must fail closed as soon as the local
         // Herdr runtime becomes unreachable.
         await refreshAutomationState();
+        if (await maybeRecoverPageHealth()) return;
         if (await maybeRecoverExplicitThreadError()) return;
         if (await maybeRecoverDisconnectedReply()) return;
         const next = RECOVERY_CONTROLLER.classifyReplyTimeout(conversationHealth);
@@ -1745,6 +1951,15 @@ const H2W_CONTENT_VERSION = "0.1.62";
           for (const entry of list.getEntries()) uiPressure.recordLongTask(entry.duration);
         });
         longTasks.observe({ type: "longtask", buffered: false });
+        const resources = new PerformanceObserver((list) => {
+          if (document.hidden) return;
+          for (const entry of list.getEntries()) {
+            if (Number(entry?.responseStatus || 0) === 429) {
+              uiPressure.recordHttpStatus(429, Date.now());
+            }
+          }
+        });
+        resources.observe({ type: "resource", buffered: false });
       }
     } catch (e) {}
   }
