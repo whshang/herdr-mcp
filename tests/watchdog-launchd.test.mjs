@@ -95,6 +95,10 @@ test('watchdog pins the managed Rust service and removes Node process heuristics
   assert.ok(script.includes('LABEL_WATCH="dev.herdr-mcp.health-watchdog"'));
   assert.ok(script.includes('dev.herdr-mcp.health-watchdog.plist'));
   assert.doesNotMatch(script, /LABEL_WATCH="dev\.herdr-mcp\.watchdog"/);
+  assert.ok(script.includes('STATE_FILE="$CFG_DIR/health-watchdog.state.json"'));
+  assert.ok(script.includes('LOG_FILE="$CFG_DIR/health-watchdog.log"'));
+  assert.doesNotMatch(script, /STATE_FILE="\$CFG_DIR\/watchdog\.state\.json"/);
+  assert.doesNotMatch(script, /LOG_FILE="\$CFG_DIR\/watchdog\.log"/);
   assert.ok(script.includes('HERDR_MCP_RUNTIME_BIN:-$HOME/.config/herdr-mcp/runtime/current/herdr-mcp'));
   assert.ok(script.includes('HEALTH_URL="http://127.0.0.1:8772/health"'));
   assert.doesNotMatch(script, /dist\/server\.js/);
@@ -116,7 +120,10 @@ test('watchdog defaults are bounded for in-turn recovery', () => {
 });
 
 test('watchdog launchd install is periodic one-shot and does not KeepAlive-loop itself', () => {
-  assert.ok(script.includes('runtime_bin="$CFG_DIR/watchdog.sh"'));
+  assert.ok(script.includes('runtime_bin="$CFG_DIR/health-watchdog.sh"'));
+  assert.ok(script.includes('health-watchdog.launchd.out.log'));
+  assert.ok(script.includes('health-watchdog.launchd.err.log'));
+  assert.doesNotMatch(script, /runtime_bin="\$CFG_DIR\/watchdog\.sh"/);
   assert.match(script, /source_bin="\$\(cd .*BASH_SOURCE\[0\].*basename .*BASH_SOURCE\[0\]/s);
   assert.ok(script.includes('cp "$source_bin" "$runtime_bin"'));
   assert.ok(script.includes('chmod 700 "$runtime_bin"'));
@@ -140,7 +147,7 @@ test('explicitly stopped server is never bootstrapped or kickstarted', async () 
   const launchctlLog = await readFile(harness.log, 'utf8');
   assert.match(launchctlLog, /^print /m);
   assert.doesNotMatch(launchctlLog, /kickstart|bootstrap/);
-  const state = JSON.parse(await readFile(join(harness.cfg, 'watchdog.state.json'), 'utf8'));
+  const state = JSON.parse(await readFile(join(harness.cfg, 'health-watchdog.state.json'), 'utf8'));
   assert.equal(state.server_loaded, false);
   assert.equal(state.consecutive_fail, 0);
   assert.equal(state.last_action, 'stopped');
@@ -156,7 +163,7 @@ test('loaded unhealthy server requires two failures then kickstarts the same job
   assert.equal(second.status, 0, second.stderr);
   launchctlLog = await readFile(harness.log, 'utf8');
   assert.match(launchctlLog, /kickstart -k gui\/[0-9]+\/dev\.herdr-mcp\.server/);
-  const state = JSON.parse(await readFile(join(harness.cfg, 'watchdog.state.json'), 'utf8'));
+  const state = JSON.parse(await readFile(join(harness.cfg, 'health-watchdog.state.json'), 'utf8'));
   assert.equal(state.last_action, 'kickstart');
   assert.equal(state.restarts_total, 1);
 });
@@ -168,7 +175,7 @@ test('explicit stop racing the final health decision wins before kickstart', asy
   const launchctlLog = await readFile(harness.log, 'utf8');
   assert.equal((launchctlLog.match(/^print /gm) || []).length, 2);
   assert.doesNotMatch(launchctlLog, /kickstart/);
-  const state = JSON.parse(await readFile(join(harness.cfg, 'watchdog.state.json'), 'utf8'));
+  const state = JSON.parse(await readFile(join(harness.cfg, 'health-watchdog.state.json'), 'utf8'));
   assert.equal(state.server_loaded, false);
   assert.equal(state.last_action, 'stopped');
 });
@@ -188,7 +195,7 @@ test('legitimate lifecycle activity suppresses health recovery', async () => {
     assert.equal(result.status, 0, `${reason}: ${result.stderr}`);
     const launchctlLog = await readFile(harness.log, 'utf8');
     assert.doesNotMatch(launchctlLog, /kickstart/, reason);
-    const state = JSON.parse(await readFile(join(harness.cfg, 'watchdog.state.json'), 'utf8'));
+    const state = JSON.parse(await readFile(join(harness.cfg, 'health-watchdog.state.json'), 'utf8'));
     assert.equal(state.consecutive_fail, 0, reason);
     assert.equal(state.last_action, `suppressed_${reason}`, reason);
   }
@@ -203,7 +210,7 @@ test('restart cooldown prevents repeated kickstarts', async () => {
   }
   const launchctlLog = await readFile(harness.log, 'utf8');
   assert.equal((launchctlLog.match(/kickstart -k/g) || []).length, 1);
-  const state = JSON.parse(await readFile(join(harness.cfg, 'watchdog.state.json'), 'utf8'));
+  const state = JSON.parse(await readFile(join(harness.cfg, 'health-watchdog.state.json'), 'utf8'));
   assert.equal(state.restarts_total, 1);
   assert.equal(state.last_action, 'cooldown');
 });

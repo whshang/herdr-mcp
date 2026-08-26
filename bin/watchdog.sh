@@ -8,8 +8,8 @@
 set -euo pipefail
 
 CFG_DIR="${HERDR_MCP_CONFIG_DIR:-$HOME/.config/herdr-mcp}"
-STATE_FILE="$CFG_DIR/watchdog.state.json"
-LOG_FILE="$CFG_DIR/watchdog.log"
+STATE_FILE="$CFG_DIR/health-watchdog.state.json"
+LOG_FILE="$CFG_DIR/health-watchdog.log"
 PLIST_WATCH="$HOME/Library/LaunchAgents/dev.herdr-mcp.health-watchdog.plist"
 LABEL_SERVER="dev.herdr-mcp.server"
 LABEL_WATCH="dev.herdr-mcp.health-watchdog"
@@ -262,7 +262,7 @@ cmd_status() {
 cmd_install() {
   local source_bin runtime_bin
   source_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-  runtime_bin="$CFG_DIR/watchdog.sh"
+  runtime_bin="$CFG_DIR/health-watchdog.sh"
   mkdir -p "$CFG_DIR"
   mkdir -p "$HOME/Library/LaunchAgents"
   if [[ "$source_bin" != "$runtime_bin" ]]; then
@@ -284,8 +284,8 @@ cmd_install() {
     <key>PATH</key><string>${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>${HOME}</string>
   </dict>
-  <key>StandardOutPath</key><string>${CFG_DIR}/watchdog.launchd.out.log</string>
-  <key>StandardErrorPath</key><string>${CFG_DIR}/watchdog.launchd.err.log</string>
+  <key>StandardOutPath</key><string>${CFG_DIR}/health-watchdog.launchd.out.log</string>
+  <key>StandardErrorPath</key><string>${CFG_DIR}/health-watchdog.launchd.err.log</string>
 </dict>
 </plist>
 EOF
@@ -299,7 +299,7 @@ EOF
 cmd_uninstall() {
   "$LAUNCHCTL_BIN" bootout "$(watchdog_target)" >/dev/null 2>&1 || true
   "$LAUNCHCTL_BIN" disable "$(watchdog_target)" >/dev/null 2>&1 || true
-  rm -f "$PLIST_WATCH" "$CFG_DIR/watchdog.sh" "$STATE_FILE"
+  rm -f "$PLIST_WATCH" "$CFG_DIR/health-watchdog.sh" "$STATE_FILE"
   log_line "watchdog uninstalled"
   echo "uninstalled"
 }
