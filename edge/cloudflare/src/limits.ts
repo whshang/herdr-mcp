@@ -34,8 +34,12 @@ export const MAX_REQUEST_TIMEOUT_MS = 60_000;
 /** Link presence: after this long with no hello/heartbeat the link is stale. */
 export const DEFAULT_LINK_STALE_AFTER_MS = 45_000;
 
-/** Persist `last_seen` at most this often to avoid hot re-writes. */
-export const HEARTBEAT_PERSIST_THROTTLE_MS = 5_000;
+/**
+ * Persist `last_seen` only as a low-frequency recovery checkpoint. Live
+ * presence is derived from the Hibernation WebSocket attachment, so heartbeat
+ * traffic does not need to rewrite Durable Object storage every few seconds.
+ */
+export const HEARTBEAT_PERSIST_THROTTLE_MS = 300_000; // 5 min
 
 /** Frame payload bound — well below the 32 MiB DO limit. */
 export const DEFAULT_MAX_FRAME_BYTES = 1_048_576; // 1 MiB

@@ -142,6 +142,7 @@ export class WorkstationDO {
       }
       const workstationId = this.workstationId();
       if (this.session === undefined) this.session = makeEmptySession(workstationId, Date.now());
+      this.lastSeenPersistedAtMs = this.session.lastSeenAtMs ?? 0;
       const pending = await this.loadPending();
       const completed = await this.loadCompleted();
       const idem = await this.loadIdem();
@@ -237,7 +238,8 @@ export class WorkstationDO {
 
   private async handleStatus(): Promise<Response> {
     const now = Date.now();
-    const online = this.session !== undefined && !isStale(this.limits, this.session, now);
+    const hasActiveLink = this.state.getWebSockets("link").some((ws) => this.isActiveLink(ws));
+    const online = hasActiveLink || (this.session !== undefined && !isStale(this.limits, this.session, now));
     const payload = sessionSummary(this.session, {
       now,
       linkStaleAfterMs: this.limits.linkStaleAfterMs,
@@ -621,6 +623,7 @@ export class WorkstationDO {
       capabilities: hello.capabilities,
     });
     await this.state.storage.put(KEY_SESSION, serializeSession(this.session));
+    this.lastSeenPersistedAtMs = now;
 
     const resume = this.registry.resumeSummaries(now).map((p) => ({
       request_id: p.requestId,
@@ -670,6 +673,11 @@ export class WorkstationDO {
 
   private async handleLinkStatus(msg: StatusMessage): Promise<void> {
     if (!this.session) return;
+    const previous = this.session.runtimeStatus;
+    const previousRuntimeVersion = previous?.runtimeVersion;
+    const previousRuntimeGeneration = previous?.runtimeGeneration;
+    const previousHerdProtocolVersion = previous?.herdProtocolVersion;
+    const previousHealth = previous?.health;
     // Workstation status report: update runtime info from the link.
     if (msg.runtime) {
       this.session.runtimeStatus = {
@@ -685,7 +693,13 @@ export class WorkstationDO {
         runtimeGeneration: msg.runtime_generation ?? undefined,
       };
     }
-    if (this.session.runtimeStatus) {
+    const current = this.session.runtimeStatus;
+    const runtimeChanged =
+      previousRuntimeVersion !== current?.runtimeVersion ||
+      previousRuntimeGeneration !== current?.runtimeGeneration ||
+      previousHerdProtocolVersion !== current?.herdProtocolVersion ||
+      previousHealth !== current?.health;
+    if (runtimeChanged) {
       await this.state.storage.put(KEY_SESSION, serializeSession(this.session));
     }
     this.logger.info("ws.status", {
