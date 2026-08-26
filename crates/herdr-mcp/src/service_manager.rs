@@ -3760,10 +3760,21 @@ mod macos {
         }
 
         fn wait_for_guardian_test_marker(path: &Path, marker: &str, budget: Duration) {
+            let complete = format!("{marker}\n");
             let deadline = Instant::now() + budget;
             loop {
                 let text = fs::read_to_string(path).unwrap_or_default();
-                if text.lines().any(|line| line == marker) {
+                // Only a newline-terminated complete record counts. str::lines()
+                // would treat a trailing partial "READY" (newline not yet
+                // written by the watcher) as a full marker, letting the parent
+                // start its mutation while the watcher is still finishing the
+                // READY write; the interleaved appends then merge into a line
+                // like "READYMUTATION". Inspect only segments that end in the
+                // newline so the observed record is complete.
+                if text
+                    .split_inclusive('\n')
+                    .any(|segment| segment == complete)
+                {
                     return;
                 }
                 assert!(
