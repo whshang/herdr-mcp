@@ -28,7 +28,7 @@ pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
 mod macos {
     use super::*;
     use crate::paths::RuntimePaths;
-    use crate::state_store::{ServiceRollbackRecord, StateStore};
+    use crate::state_store::{RuntimeGenerationRecord, ServiceRollbackRecord, StateStore};
     use plist::{Dictionary, Value as PlistValue};
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
@@ -37,9 +37,11 @@ mod macos {
     use std::ffi::OsStr;
     use std::fs::{self, File, OpenOptions};
     use std::io::{Cursor, Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+    use std::os::unix::process::CommandExt;
     use std::path::{Component, Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::{Child, Command, Output, Stdio};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,6 +53,11 @@ mod macos {
     const LAUNCHD_ABSENT_BUDGET: Duration = Duration::from_secs(2);
     const LAUNCHD_BOOTOUT_BUDGET: Duration = Duration::from_secs(10);
     const LAUNCHD_RECOVERY_BUDGET: Duration = Duration::from_secs(15);
+    const GUARDIAN_HANDSHAKE_BUDGET: Duration = Duration::from_secs(2);
+    const GUARDIAN_EXIT_BUDGET: Duration = Duration::from_secs(2);
+    const GUARDIAN_MAX_LIFETIME: Duration = Duration::from_secs(300);
+    const GUARDIAN_PARENT_FD: i32 = 198;
+    const GUARDIAN_LOCK_FD: i32 = 199;
     const BOOTSTRAP_RETRY_DELAYS: [Duration; 4] = [
         Duration::from_millis(250),
         Duration::from_millis(500),
@@ -70,6 +77,8 @@ mod macos {
         plist: PathBuf,
         watchdog_plist: PathBuf,
         backups_dir: PathBuf,
+        guardians_dir: PathBuf,
+        mutation_lock: PathBuf,
         extension_socket: PathBuf,
         herdr_socket: PathBuf,
         log_path: PathBuf,
@@ -114,6 +123,64 @@ mod macos {
         previous_current: Option<PathBuf>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum GuardianMode {
+        Install,
+        Rollback,
+    }
+
+    impl GuardianMode {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Install => "install",
+                Self::Rollback => "rollback",
+            }
+        }
+
+        fn parse(value: &str) -> Result<Self, String> {
+            match value {
+                "install" => Ok(Self::Install),
+                "rollback" => Ok(Self::Rollback),
+                _ => Err(format!("invalid guardian mode {value}")),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct GuardianRecord {
+        transaction_id: String,
+        mode: GuardianMode,
+        state: String,
+        parent_pid: u32,
+        created_at: i64,
+        rollback_id: Option<String>,
+        candidate_generation_id: Option<String>,
+        server_plist_backup: Option<String>,
+        watchdog_plist_backup: Option<String>,
+        previous_current_target: Option<String>,
+        server_was_loaded: bool,
+        watchdog_was_loaded: bool,
+        detail: Option<String>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum GuardianDecision {
+        Exit(&'static str),
+        Recover,
+        Refuse(String),
+    }
+
+    struct ServiceMutationLock {
+        file: File,
+    }
+
+    struct GuardianHandle {
+        paths: ServicePaths,
+        transaction_id: String,
+        signal: Option<File>,
+        child: Child,
+    }
+
     pub(super) fn run(command: ServiceCommand) -> Result<ExitCode, String> {
         if service_command_requires_independent_process(&command)
             && env::var_os("HERDR_MCP_EXEC_ID").is_some()
@@ -124,14 +191,34 @@ mod macos {
             );
         }
         let paths = ServicePaths::discover()?;
+        let mutation_lock = if service_command_requires_mutation_lock(&command) {
+            Some(ServiceMutationLock::acquire(&paths)?)
+        } else {
+            None
+        };
         let result = match command {
-            ServiceCommand::Install { adopt_node } => install(&paths, adopt_node)?,
+            ServiceCommand::Install { adopt_node } => install(
+                &paths,
+                adopt_node,
+                mutation_lock
+                    .as_ref()
+                    .expect("install must hold the service mutation lock"),
+            )?,
             ServiceCommand::Status => status(&paths)?,
             ServiceCommand::Start => start(&paths)?,
             ServiceCommand::Stop => stop(&paths)?,
             ServiceCommand::Restart => restart(&paths)?,
-            ServiceCommand::Rollback => rollback(&paths)?,
+            ServiceCommand::Rollback => rollback(
+                &paths,
+                mutation_lock
+                    .as_ref()
+                    .expect("rollback must hold the service mutation lock"),
+            )?,
             ServiceCommand::Uninstall => uninstall(&paths)?,
+            ServiceCommand::Guardian {
+                transaction_id,
+                parent_pid,
+            } => guardian(&paths, &transaction_id, parent_pid)?,
         };
         println!(
             "{}",
@@ -147,6 +234,13 @@ mod macos {
 
     fn service_command_requires_independent_process(command: &ServiceCommand) -> bool {
         !matches!(command, ServiceCommand::Status)
+    }
+
+    fn service_command_requires_mutation_lock(command: &ServiceCommand) -> bool {
+        !matches!(
+            command,
+            ServiceCommand::Status | ServiceCommand::Guardian { .. }
+        )
     }
 
     impl ServicePaths {
@@ -188,6 +282,8 @@ mod macos {
                     .join("LaunchAgents")
                     .join(format!("{WATCHDOG_LABEL}.plist")),
                 backups_dir: config_dir.join("backups"),
+                guardians_dir: config_dir.join("guardians"),
+                mutation_lock: config_dir.join("service-mutation.lock"),
                 extension_socket: config_dir.join("extension.sock"),
                 log_path: config_dir.join("server.log"),
                 home,
@@ -202,7 +298,1033 @@ mod macos {
         }
     }
 
-    fn install(paths: &ServicePaths, adopt_node: bool) -> Result<Value, String> {
+    impl ServiceMutationLock {
+        fn acquire(paths: &ServicePaths) -> Result<Self, String> {
+            ensure_secure_dir(&paths.config_dir)?;
+            if let Ok(metadata) = fs::symlink_metadata(&paths.mutation_lock)
+                && metadata.file_type().is_symlink()
+            {
+                return Err("service mutation lock must not be a symlink".to_owned());
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&paths.mutation_lock)
+                .map_err(|error| format!("cannot open service mutation lock: {error}"))?;
+            fs::set_permissions(&paths.mutation_lock, fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("cannot secure service mutation lock: {error}"))?;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(format!(
+                    "another service mutation is in progress: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(Self { file })
+        }
+
+        fn fd(&self) -> i32 {
+            self.file.as_raw_fd()
+        }
+    }
+
+    impl GuardianHandle {
+        fn finish(&mut self, state: &str, detail: &str) -> Result<(), String> {
+            if !transition_guardian_state(
+                &self.paths,
+                &self.transaction_id,
+                &["watching"],
+                state,
+                Some(detail),
+            )? {
+                return Err(format!(
+                    "guardian transaction {} was no longer watching during settlement",
+                    self.transaction_id
+                ));
+            }
+            self.signal.take();
+            let deadline = Instant::now() + GUARDIAN_EXIT_BUDGET;
+            loop {
+                if self
+                    .child
+                    .try_wait()
+                    .map_err(|error| format!("cannot inspect guardian child: {error}"))?
+                    .is_some()
+                {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    terminate_guardian_child(&mut self.child)?;
+                    return Err(
+                        "guardian child required forced termination after transaction settlement"
+                            .to_owned(),
+                    );
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+
+    fn valid_guardian_transaction_id(value: &str) -> bool {
+        (12..=96).contains(&value.len())
+            && value.starts_with("gtx-")
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    }
+
+    fn new_guardian_transaction_id() -> Result<String, String> {
+        let random = secure_token_hex()?;
+        Ok(format!(
+            "gtx-{}-{}-{}",
+            now_ms_i64(),
+            std::process::id(),
+            &random[..12]
+        ))
+    }
+
+    fn guardian_dir(paths: &ServicePaths, transaction_id: &str) -> Result<PathBuf, String> {
+        if !valid_guardian_transaction_id(transaction_id) {
+            return Err("invalid guardian transaction id".to_owned());
+        }
+        Ok(paths.guardians_dir.join(transaction_id))
+    }
+
+    fn guardian_record_path(paths: &ServicePaths, transaction_id: &str) -> Result<PathBuf, String> {
+        Ok(guardian_dir(paths, transaction_id)?.join("transaction.json"))
+    }
+
+    fn guardian_binary_path(paths: &ServicePaths, transaction_id: &str) -> Result<PathBuf, String> {
+        Ok(guardian_dir(paths, transaction_id)?.join("guardian-herdr-mcp"))
+    }
+
+    fn guardian_log_path(paths: &ServicePaths, transaction_id: &str) -> Result<PathBuf, String> {
+        Ok(guardian_dir(paths, transaction_id)?.join("guardian.log"))
+    }
+
+    fn guardian_state_lock_path(
+        paths: &ServicePaths,
+        transaction_id: &str,
+    ) -> Result<PathBuf, String> {
+        Ok(guardian_dir(paths, transaction_id)?.join("transaction.lock"))
+    }
+
+    fn guardian_record_value(record: &GuardianRecord) -> Value {
+        json!({
+            "schema_version": 1,
+            "transaction_id": record.transaction_id,
+            "mode": record.mode.as_str(),
+            "state": record.state,
+            "parent_pid": record.parent_pid,
+            "created_at": record.created_at,
+            "rollback_id": record.rollback_id,
+            "candidate_generation_id": record.candidate_generation_id,
+            "server_plist_backup": record.server_plist_backup,
+            "watchdog_plist_backup": record.watchdog_plist_backup,
+            "previous_current_target": record.previous_current_target,
+            "server_was_loaded": record.server_was_loaded,
+            "watchdog_was_loaded": record.watchdog_was_loaded,
+            "detail": record.detail,
+        })
+    }
+
+    fn decode_guardian_record(value: &Value) -> Result<GuardianRecord, String> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "guardian transaction must be a JSON object".to_owned())?;
+        let allowed = [
+            "schema_version",
+            "transaction_id",
+            "mode",
+            "state",
+            "parent_pid",
+            "created_at",
+            "rollback_id",
+            "candidate_generation_id",
+            "server_plist_backup",
+            "watchdog_plist_backup",
+            "previous_current_target",
+            "server_was_loaded",
+            "watchdog_was_loaded",
+            "detail",
+        ];
+        if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+            return Err(format!("guardian transaction contains unknown field {key}"));
+        }
+        if object.get("schema_version").and_then(Value::as_u64) != Some(1) {
+            return Err("guardian transaction schema_version must be 1".to_owned());
+        }
+        let required_string = |key: &str| -> Result<String, String> {
+            let value = object
+                .get(key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("guardian transaction {key} must be a string"))?;
+            if value.len() > 4096 {
+                return Err(format!("guardian transaction {key} is too long"));
+            }
+            Ok(value.to_owned())
+        };
+        let optional_string = |key: &str| -> Result<Option<String>, String> {
+            match object.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(value)) if value.len() <= 4096 => Ok(Some(value.clone())),
+                _ => Err(format!(
+                    "guardian transaction {key} must be null or a bounded string"
+                )),
+            }
+        };
+        let transaction_id = required_string("transaction_id")?;
+        if !valid_guardian_transaction_id(&transaction_id) {
+            return Err("guardian transaction id is invalid".to_owned());
+        }
+        let mode = GuardianMode::parse(&required_string("mode")?)?;
+        let state = required_string("state")?;
+        if !matches!(
+            state.as_str(),
+            "armed"
+                | "watching"
+                | "committed"
+                | "parent_recovered"
+                | "aborted"
+                | "recovering"
+                | "recovered"
+                | "recovery_failed"
+                | "expired_parent_alive"
+                | "observed_committed"
+                | "observed_parent_recovered"
+        ) {
+            return Err(format!("guardian transaction state {state} is invalid"));
+        }
+        let parent_pid = object
+            .get("parent_pid")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "guardian transaction parent_pid is invalid".to_owned())?;
+        let created_at = object
+            .get("created_at")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| "guardian transaction created_at is invalid".to_owned())?;
+        let server_was_loaded = object
+            .get("server_was_loaded")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| "guardian transaction server_was_loaded is invalid".to_owned())?;
+        let watchdog_was_loaded = object
+            .get("watchdog_was_loaded")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| "guardian transaction watchdog_was_loaded is invalid".to_owned())?;
+        Ok(GuardianRecord {
+            transaction_id,
+            mode,
+            state,
+            parent_pid,
+            created_at,
+            rollback_id: optional_string("rollback_id")?,
+            candidate_generation_id: optional_string("candidate_generation_id")?,
+            server_plist_backup: optional_string("server_plist_backup")?,
+            watchdog_plist_backup: optional_string("watchdog_plist_backup")?,
+            previous_current_target: optional_string("previous_current_target")?,
+            server_was_loaded,
+            watchdog_was_loaded,
+            detail: optional_string("detail")?,
+        })
+    }
+
+    fn write_guardian_record(paths: &ServicePaths, record: &GuardianRecord) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(&guardian_record_value(record))
+            .map_err(|error| format!("cannot encode guardian transaction: {error}"))?;
+        atomic_write(
+            &guardian_record_path(paths, &record.transaction_id)?,
+            &bytes,
+            0o600,
+        )
+    }
+
+    fn read_guardian_record(
+        paths: &ServicePaths,
+        transaction_id: &str,
+    ) -> Result<GuardianRecord, String> {
+        let bytes =
+            read_optional_bounded(&guardian_record_path(paths, transaction_id)?, 64 * 1024)?
+                .ok_or_else(|| format!("guardian transaction {transaction_id} is missing"))?;
+        let value = serde_json::from_slice::<Value>(&bytes)
+            .map_err(|error| format!("cannot parse guardian transaction: {error}"))?;
+        decode_guardian_record(&value)
+    }
+
+    fn with_guardian_state_lock<T, F>(
+        paths: &ServicePaths,
+        transaction_id: &str,
+        operation: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce() -> Result<T, String>,
+    {
+        let lock_path = guardian_state_lock_path(paths, transaction_id)?;
+        if let Ok(metadata) = fs::symlink_metadata(&lock_path)
+            && metadata.file_type().is_symlink()
+        {
+            return Err("guardian transaction lock must not be a symlink".to_owned());
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|error| format!("cannot open guardian transaction lock: {error}"))?;
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("cannot secure guardian transaction lock: {error}"))?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!(
+                "cannot lock guardian transaction: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let result = operation();
+        let unlock = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+        if unlock != 0 && result.is_ok() {
+            return Err(format!(
+                "cannot unlock guardian transaction: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        result
+    }
+
+    fn transition_guardian_state(
+        paths: &ServicePaths,
+        transaction_id: &str,
+        expected: &[&str],
+        state: &str,
+        detail: Option<&str>,
+    ) -> Result<bool, String> {
+        with_guardian_state_lock(paths, transaction_id, || {
+            let mut record = read_guardian_record(paths, transaction_id)?;
+            if !expected.contains(&record.state.as_str()) {
+                return Ok(false);
+            }
+            record.state = state.to_owned();
+            record.detail = detail.map(|value| value.chars().take(512).collect());
+            write_guardian_record(paths, &record)?;
+            Ok(true)
+        })
+    }
+
+    fn update_guardian_state(
+        paths: &ServicePaths,
+        transaction_id: &str,
+        state: &str,
+        detail: Option<&str>,
+    ) -> Result<(), String> {
+        with_guardian_state_lock(paths, transaction_id, || {
+            let mut record = read_guardian_record(paths, transaction_id)?;
+            record.state = state.to_owned();
+            record.detail = detail.map(|value| value.chars().take(512).collect());
+            write_guardian_record(paths, &record)
+        })
+    }
+
+    fn terminate_guardian_child(child: &mut Child) -> Result<(), String> {
+        if child
+            .try_wait()
+            .map_err(|error| format!("cannot inspect guardian child: {error}"))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if let Err(error) = child.kill() {
+            if child
+                .try_wait()
+                .map_err(|wait_error| {
+                    format!(
+                        "cannot terminate guardian child: {error}; cannot inspect raced exit: {wait_error}"
+                    )
+                })?
+                .is_some()
+            {
+                return Ok(());
+            }
+            return Err(format!("cannot terminate guardian child: {error}"));
+        }
+        child
+            .wait()
+            .map_err(|error| format!("cannot reap terminated guardian child: {error}"))?;
+        Ok(())
+    }
+
+    fn abort_guardian_startup(
+        paths: &ServicePaths,
+        transaction_id: &str,
+        child: &mut Child,
+        write_signal: &mut Option<File>,
+        detail: &str,
+    ) -> Result<(), String> {
+        let state_fence = match transition_guardian_state(
+            paths,
+            transaction_id,
+            &["armed", "watching"],
+            "aborted",
+            Some(detail),
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => match read_guardian_record(paths, transaction_id) {
+                Ok(current) if current.state == "aborted" => Ok(()),
+                Ok(current) => Err(format!(
+                    "guardian startup abort found unexpected transaction state {}",
+                    current.state
+                )),
+                Err(error) => Err(format!(
+                    "guardian startup abort could not read transaction after lost state race: {error}"
+                )),
+            },
+            Err(error) => Err(format!(
+                "guardian startup abort could not fence transaction state: {error}"
+            )),
+        };
+        let child_termination = terminate_guardian_child(child);
+        if child_termination.is_ok() {
+            write_signal.take();
+        } else if let Some(signal) = write_signal.take() {
+            // Do not deliver POLLHUP while a child that could not be reaped may
+            // still be running. The CLI error path exits shortly afterward.
+            std::mem::forget(signal);
+        }
+        match (state_fence, child_termination) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(state_error), Ok(())) => Err(state_error),
+            (Ok(()), Err(child_error)) => Err(child_error),
+            (Err(state_error), Err(child_error)) => Err(format!(
+                "{state_error}; guardian child termination also failed: {child_error}"
+            )),
+        }
+    }
+
+    fn guardian_pipe() -> Result<(File, File), String> {
+        let mut fds = [0_i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(format!(
+                "cannot create guardian parent pipe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let read = unsafe { File::from_raw_fd(fds[0]) };
+        let write = unsafe { File::from_raw_fd(fds[1]) };
+        Ok((read, write))
+    }
+
+    fn arm_guardian(
+        paths: &ServicePaths,
+        mutation_lock: &ServiceMutationLock,
+        mut record: GuardianRecord,
+    ) -> Result<GuardianHandle, String> {
+        ensure_secure_dir(&paths.guardians_dir)?;
+        let directory = guardian_dir(paths, &record.transaction_id)?;
+        fs::create_dir(&directory).map_err(|error| {
+            format!(
+                "cannot create guardian transaction directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("cannot secure guardian transaction directory: {error}"))?;
+        record.state = "armed".to_owned();
+        record.detail = Some("guardian snapshot persisted before service mutation".to_owned());
+        write_guardian_record(paths, &record)?;
+
+        let binary = guardian_binary_path(paths, &record.transaction_id)?;
+        atomic_copy_executable(&paths.source_binary, &binary)?;
+        let log_path = guardian_log_path(paths, &record.transaction_id)?;
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log_path)
+            .map_err(|error| format!("cannot open guardian log: {error}"))?;
+        fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("cannot secure guardian log: {error}"))?;
+        let stderr = log
+            .try_clone()
+            .map_err(|error| format!("cannot clone guardian log handle: {error}"))?;
+        let (read_signal, write_signal) = guardian_pipe()?;
+        let read_fd = read_signal.as_raw_fd();
+        let write_fd = write_signal.as_raw_fd();
+        let lock_fd = mutation_lock.fd();
+        if [read_fd, write_fd, lock_fd]
+            .iter()
+            .any(|fd| matches!(*fd, GUARDIAN_PARENT_FD | GUARDIAN_LOCK_FD))
+        {
+            return Err("guardian reserved file descriptor collision".to_owned());
+        }
+
+        let mut command = Command::new(&binary);
+        command
+            .args([
+                "service",
+                "__guardian",
+                "--transaction",
+                &record.transaction_id,
+                "--parent-pid",
+                &record.parent_pid.to_string(),
+            ])
+            .env_clear()
+            .env("HOME", &paths.home)
+            .env("HERDR_MCP_CONFIG_DIR", &paths.config_dir)
+            .env("HERDR_SOCKET_PATH", &paths.herdr_socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(stderr));
+        if let Some(path) = env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(read_fd, GUARDIAN_PARENT_FD) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(lock_fd, GUARDIAN_LOCK_FD) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(write_fd);
+                libc::close(read_fd);
+                libc::close(lock_fd);
+                Ok(())
+            });
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = transition_guardian_state(
+                    paths,
+                    &record.transaction_id,
+                    &["armed"],
+                    "aborted",
+                    Some("guardian child could not start"),
+                );
+                return Err(format!("cannot start service guardian: {error}"));
+            }
+        };
+        drop(read_signal);
+
+        let mut write_signal = Some(write_signal);
+        let deadline = Instant::now() + GUARDIAN_HANDSHAKE_BUDGET;
+        loop {
+            let current = match read_guardian_record(paths, &record.transaction_id) {
+                Ok(current) => current,
+                Err(error) => {
+                    let cleanup = abort_guardian_startup(
+                        paths,
+                        &record.transaction_id,
+                        &mut child,
+                        &mut write_signal,
+                        "guardian transaction became unreadable during handshake",
+                    );
+                    return Err(match cleanup {
+                        Ok(()) => format!("cannot read guardian handshake state: {error}"),
+                        Err(cleanup_error) => format!(
+                            "cannot read guardian handshake state: {error}; startup cleanup failed: {cleanup_error}"
+                        ),
+                    });
+                }
+            };
+            if current.state == "watching" {
+                return Ok(GuardianHandle {
+                    paths: paths.clone(),
+                    transaction_id: record.transaction_id,
+                    signal: write_signal.take(),
+                    child,
+                });
+            }
+            let child_status = match child.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    let cleanup = abort_guardian_startup(
+                        paths,
+                        &record.transaction_id,
+                        &mut child,
+                        &mut write_signal,
+                        "guardian child status became unreadable during handshake",
+                    );
+                    return Err(match cleanup {
+                        Ok(()) => format!("cannot inspect guardian startup: {error}"),
+                        Err(cleanup_error) => format!(
+                            "cannot inspect guardian startup: {error}; startup cleanup failed: {cleanup_error}"
+                        ),
+                    });
+                }
+            };
+            if let Some(status) = child_status {
+                let cleanup = abort_guardian_startup(
+                    paths,
+                    &record.transaction_id,
+                    &mut child,
+                    &mut write_signal,
+                    "guardian child exited before handshake",
+                );
+                return Err(match cleanup {
+                    Ok(()) => format!("service guardian exited before handshake with {status}"),
+                    Err(cleanup_error) => format!(
+                        "service guardian exited before handshake with {status}; startup cleanup failed: {cleanup_error}"
+                    ),
+                });
+            }
+            if Instant::now() >= deadline {
+                let cleanup = abort_guardian_startup(
+                    paths,
+                    &record.transaction_id,
+                    &mut child,
+                    &mut write_signal,
+                    "guardian child handshake timed out",
+                );
+                return Err(match cleanup {
+                    Ok(()) => {
+                        "service guardian did not confirm watching state within 2s".to_owned()
+                    }
+                    Err(cleanup_error) => format!(
+                        "service guardian did not confirm watching state within 2s; startup cleanup failed: {cleanup_error}"
+                    ),
+                });
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn guardian_fd_is_open(fd: i32) -> bool {
+        (unsafe { libc::fcntl(fd, libc::F_GETFD) }) != -1
+    }
+
+    fn set_guardian_fd_cloexec(fd: i32) -> Result<(), String> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags == -1 {
+            return Err(format!(
+                "cannot read guardian fd {fd} flags: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+            return Err(format!(
+                "cannot mark guardian fd {fd} close-on-exec: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    fn wait_for_guardian_parent_signal(fd: i32, budget: Duration) -> Result<bool, String> {
+        let deadline = Instant::now() + budget;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let timeout = remaining.min(Duration::from_millis(250)).as_millis() as i32;
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(format!("guardian parent pipe poll failed: {error}"));
+            }
+            if result == 0 {
+                continue;
+            }
+            if pollfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                return Ok(true);
+            }
+            if pollfd.revents & libc::POLLIN != 0 {
+                let mut byte = [0_u8; 1];
+                let read = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+                if read == 0 {
+                    return Ok(true);
+                }
+                if read < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(format!("guardian parent pipe read failed: {error}"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn guardian_decision(
+        record: &GuardianRecord,
+        rollback: Option<&ServiceRollbackRecord>,
+        active: Option<&RuntimeGenerationRecord>,
+    ) -> GuardianDecision {
+        match record.state.as_str() {
+            "committed" | "observed_committed" => return GuardianDecision::Exit("committed"),
+            "parent_recovered" | "observed_parent_recovered" | "recovered" => {
+                return GuardianDecision::Exit("parent_recovered");
+            }
+            "aborted" => return GuardianDecision::Exit("aborted"),
+            "armed" | "watching" => {}
+            other => {
+                return GuardianDecision::Refuse(format!(
+                    "guardian refuses parent-exit recovery from transaction state {other}"
+                ));
+            }
+        }
+        match record.mode {
+            GuardianMode::Install => {
+                let candidate_active = active.map(|generation| generation.generation_id.as_str())
+                    == record.candidate_generation_id.as_deref();
+                if let Some(rollback_id) = record.rollback_id.as_deref() {
+                    let Some(rollback) = rollback else {
+                        return GuardianDecision::Refuse(format!(
+                            "guardian install rollback {rollback_id} is missing"
+                        ));
+                    };
+                    if rollback.rollback_id != rollback_id {
+                        return GuardianDecision::Refuse(
+                            "guardian install rollback identity mismatch".to_owned(),
+                        );
+                    }
+                    match rollback.state.as_str() {
+                        "ready" if candidate_active => GuardianDecision::Exit("committed"),
+                        "ready" => GuardianDecision::Refuse(
+                            "guardian install found ready rollback without active candidate generation"
+                                .to_owned(),
+                        ),
+                        "auto_rolled_back" | "aborted" if !candidate_active => {
+                            GuardianDecision::Exit("parent_recovered")
+                        }
+                        "auto_rolled_back" | "aborted" => GuardianDecision::Refuse(
+                            "guardian install found recovered rollback while candidate is still active"
+                                .to_owned(),
+                        ),
+                        "prepared" | "rollback_failed" if !candidate_active => {
+                            GuardianDecision::Recover
+                        }
+                        "prepared" | "rollback_failed" => GuardianDecision::Refuse(
+                            "guardian install found uncommitted rollback state with active candidate generation"
+                                .to_owned(),
+                        ),
+                        other => GuardianDecision::Refuse(format!(
+                            "guardian install refuses rollback state {other}"
+                        )),
+                    }
+                } else if candidate_active {
+                    GuardianDecision::Exit("committed")
+                } else {
+                    GuardianDecision::Recover
+                }
+            }
+            GuardianMode::Rollback => {
+                let Some(rollback_id) = record.rollback_id.as_deref() else {
+                    return GuardianDecision::Refuse(
+                        "guardian rollback transaction is missing rollback identity".to_owned(),
+                    );
+                };
+                let Some(rollback) = rollback else {
+                    return GuardianDecision::Refuse(format!(
+                        "guardian rollback {rollback_id} is missing"
+                    ));
+                };
+                if rollback.rollback_id != rollback_id {
+                    return GuardianDecision::Refuse(
+                        "guardian rollback identity mismatch".to_owned(),
+                    );
+                }
+                let candidate_active = active.map(|generation| generation.generation_id.as_str())
+                    == record.candidate_generation_id.as_deref();
+                match rollback.state.as_str() {
+                    "consumed" => {
+                        let committed_active = if rollback.source_kind == "rust" {
+                            let expected = rollback
+                                .previous_current_target
+                                .as_deref()
+                                .and_then(|target| generation_id_from_target(Path::new(target)));
+                            active.map(|generation| generation.generation_id.as_str()) == expected
+                        } else {
+                            active.is_none()
+                        };
+                        if committed_active {
+                            GuardianDecision::Exit("committed")
+                        } else {
+                            GuardianDecision::Refuse(
+                                "guardian rollback found consumed ledger with unexpected active generation"
+                                    .to_owned(),
+                            )
+                        }
+                    }
+                    "ready" if candidate_active => GuardianDecision::Exit("parent_recovered"),
+                    "ready" => GuardianDecision::Refuse(
+                        "guardian rollback found ready ledger without the original active generation"
+                            .to_owned(),
+                    ),
+                    "consuming" | "rollback_failed" if candidate_active => {
+                        GuardianDecision::Recover
+                    }
+                    "consuming" | "rollback_failed" => GuardianDecision::Refuse(
+                        "guardian rollback found unfinished ledger after active generation changed"
+                            .to_owned(),
+                    ),
+                    other => GuardianDecision::Refuse(format!(
+                        "guardian rollback refuses ledger state {other}"
+                    )),
+                }
+            }
+        }
+    }
+
+    fn guardian_quiesce_label(label: &str) -> Result<(), String> {
+        guardian_quiesce_with(
+            || is_loaded(label),
+            || wait_launchd_absent(label, LAUNCHD_RECOVERY_BUDGET),
+            || request_bootout(label),
+        )
+    }
+
+    fn guardian_quiesce_with<Loaded, Wait, Stop>(
+        mut loaded: Loaded,
+        mut wait: Wait,
+        mut stop: Stop,
+    ) -> Result<(), String>
+    where
+        Loaded: FnMut() -> bool,
+        Wait: FnMut() -> Result<(), String>,
+        Stop: FnMut() -> Result<bool, String>,
+    {
+        if !loaded() {
+            return Ok(());
+        }
+        if wait().is_ok() {
+            return Ok(());
+        }
+        if stop()? {
+            wait()?;
+        }
+        Ok(())
+    }
+
+    fn guardian_restore_known_good(
+        paths: &ServicePaths,
+        record: &GuardianRecord,
+    ) -> Result<(), String> {
+        let server_bytes = record
+            .server_plist_backup
+            .as_deref()
+            .map(|path| read_owned_backup(paths, path))
+            .transpose()?;
+        let server = describe_service(server_bytes.as_deref(), paths)?;
+        if server_bytes.is_some() && !matches!(server.kind, ServiceKind::Rust | ServiceKind::Node) {
+            return Err("guardian server backup is not an owned Rust/Node service".to_owned());
+        }
+        if record.server_was_loaded && server_bytes.is_none() {
+            return Err("guardian expected a loaded server but has no server backup".to_owned());
+        }
+        let watchdog_bytes = record
+            .watchdog_plist_backup
+            .as_deref()
+            .map(|path| read_owned_backup(paths, path))
+            .transpose()?;
+        if watchdog_bytes.is_some() && !watchdog_is_legacy_owned(watchdog_bytes.as_deref())? {
+            return Err("guardian watchdog backup is not legacy herdr-mcp watchdog".to_owned());
+        }
+        if record.watchdog_was_loaded && watchdog_bytes.is_none() {
+            return Err(
+                "guardian expected a loaded watchdog but has no watchdog backup".to_owned(),
+            );
+        }
+        let previous_target = record.previous_current_target.as_deref().map(PathBuf::from);
+        if previous_target
+            .as_deref()
+            .is_some_and(|target| !is_owned_generation_target(target))
+        {
+            return Err("guardian previous runtime/current target is not managed".to_owned());
+        }
+
+        guardian_quiesce_label(WATCHDOG_LABEL)?;
+        guardian_quiesce_label(SERVICE_LABEL)?;
+        match server_bytes.as_deref() {
+            Some(bytes) => atomic_write(&paths.plist, bytes, 0o600)?,
+            None => remove_regular_file(&paths.plist)?,
+        }
+        restore_current(paths, previous_target.as_deref())?;
+        match watchdog_bytes.as_deref() {
+            Some(bytes) => atomic_write(&paths.watchdog_plist, bytes, 0o600)?,
+            None => remove_regular_file(&paths.watchdog_plist)?,
+        }
+        if record.server_was_loaded {
+            bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
+            wait_for_service_health(&server, DEFAULT_PORT)?;
+        }
+        if record.watchdog_was_loaded {
+            bootstrap_with_retry(&paths.watchdog_plist, WATCHDOG_LABEL)?;
+        }
+        Ok(())
+    }
+
+    fn guardian_after_parent_exit(
+        paths: &ServicePaths,
+        transaction_id: &str,
+    ) -> Result<Value, String> {
+        let record = read_guardian_record(paths, transaction_id)?;
+        let store = StateStore::open_in_dir(&paths.config_dir, "state")?;
+        let rollback = record
+            .rollback_id
+            .as_deref()
+            .map(|id| store.service_rollback_by_id(id))
+            .transpose()?
+            .flatten();
+        let active = store.active_runtime_generation()?;
+        match guardian_decision(&record, rollback.as_ref(), active.as_ref()) {
+            GuardianDecision::Exit(reason) => {
+                let state = if reason == "committed" {
+                    "observed_committed"
+                } else if reason == "parent_recovered" {
+                    "observed_parent_recovered"
+                } else {
+                    "aborted"
+                };
+                update_guardian_state(paths, transaction_id, state, Some(reason))?;
+                Ok(json!({"ok": true, "guardian": state, "transaction_id": transaction_id}))
+            }
+            GuardianDecision::Refuse(reason) => Err(reason),
+            GuardianDecision::Recover => {
+                update_guardian_state(
+                    paths,
+                    transaction_id,
+                    "recovering",
+                    Some("parent signal closed before transaction settlement"),
+                )?;
+                guardian_restore_known_good(paths, &record)?;
+                if let Some(rollback_id) = record.rollback_id.as_deref() {
+                    store.recover_service_rollback_after_guardian(
+                        rollback_id,
+                        record.mode.as_str(),
+                        now_ms_i64(),
+                    )?;
+                }
+                store.record_service_event(
+                    "guardian",
+                    "recovered",
+                    record.candidate_generation_id.as_deref(),
+                    now_ms_i64(),
+                    Some(record.mode.as_str()),
+                )?;
+                update_guardian_state(
+                    paths,
+                    transaction_id,
+                    "recovered",
+                    Some("known-good service snapshot restored"),
+                )?;
+                Ok(json!({"ok": true, "guardian": "recovered", "transaction_id": transaction_id}))
+            }
+        }
+    }
+
+    fn guardian(
+        paths: &ServicePaths,
+        transaction_id: &str,
+        parent_pid: u32,
+    ) -> Result<Value, String> {
+        if !guardian_fd_is_open(GUARDIAN_PARENT_FD) || !guardian_fd_is_open(GUARDIAN_LOCK_FD) {
+            return Err(
+                "guardian requires inherited parent-signal and mutation-lock descriptors"
+                    .to_owned(),
+            );
+        }
+        set_guardian_fd_cloexec(GUARDIAN_PARENT_FD)?;
+        set_guardian_fd_cloexec(GUARDIAN_LOCK_FD)?;
+        let record = read_guardian_record(paths, transaction_id)?;
+        if record.transaction_id != transaction_id || record.parent_pid != parent_pid {
+            return Err("guardian transaction identity does not match invocation".to_owned());
+        }
+        if record.state == "aborted" {
+            return Ok(
+                json!({"ok": true, "guardian": "aborted", "transaction_id": transaction_id}),
+            );
+        }
+        if record.state != "armed" {
+            return Err(format!(
+                "guardian expected armed transaction, found {}",
+                record.state
+            ));
+        }
+        if !transition_guardian_state(
+            paths,
+            transaction_id,
+            &["armed"],
+            "watching",
+            Some("guardian handshake complete; waiting for parent settlement"),
+        )? {
+            let current = read_guardian_record(paths, transaction_id)?;
+            if current.state == "aborted" {
+                return Ok(json!({
+                    "ok": true,
+                    "guardian": "aborted",
+                    "transaction_id": transaction_id
+                }));
+            }
+            return Err(format!(
+                "guardian could not transition transaction from armed to watching; state is {}",
+                current.state
+            ));
+        }
+        let parent_closed =
+            wait_for_guardian_parent_signal(GUARDIAN_PARENT_FD, GUARDIAN_MAX_LIFETIME)?;
+        let result = if parent_closed {
+            guardian_after_parent_exit(paths, transaction_id)
+        } else {
+            let _ = update_guardian_state(
+                paths,
+                transaction_id,
+                "expired_parent_alive",
+                Some(
+                    "guardian lifetime expired while parent signal remained open; no recovery attempted",
+                ),
+            );
+            let _ = StateStore::open_in_dir(&paths.config_dir, "state").and_then(|store| {
+                store.record_service_event(
+                    "guardian",
+                    "expired_parent_alive",
+                    record.candidate_generation_id.as_deref(),
+                    now_ms_i64(),
+                    Some(record.mode.as_str()),
+                )
+            });
+            Ok(json!({
+                "ok": true,
+                "guardian": "expired_parent_alive",
+                "transaction_id": transaction_id
+            }))
+        };
+        if let Err(error) = &result {
+            let _ = update_guardian_state(paths, transaction_id, "recovery_failed", Some(error));
+            let _ = StateStore::open_in_dir(&paths.config_dir, "state").and_then(|store| {
+                store.record_service_event(
+                    "guardian",
+                    "recovery_failed",
+                    record.candidate_generation_id.as_deref(),
+                    now_ms_i64(),
+                    Some(error),
+                )
+            });
+        }
+        let _ = remove_regular_file(&guardian_binary_path(paths, transaction_id)?);
+        result
+    }
+
+    fn install(
+        paths: &ServicePaths,
+        adopt_node: bool,
+        mutation_lock: &ServiceMutationLock,
+    ) -> Result<Value, String> {
         let existing_bytes = read_optional_bounded(&paths.plist, 256 * 1024)?;
         let existing = describe_service(existing_bytes.as_deref(), paths)?;
         match existing.kind {
@@ -303,6 +1425,41 @@ mod macos {
             })?;
         }
 
+        let transaction_id = new_guardian_transaction_id()?;
+        let mut guardian = match arm_guardian(
+            paths,
+            mutation_lock,
+            GuardianRecord {
+                transaction_id: transaction_id.clone(),
+                mode: GuardianMode::Install,
+                state: "armed".to_owned(),
+                parent_pid: std::process::id(),
+                created_at: now_ms_i64(),
+                rollback_id: rollback_id.clone(),
+                candidate_generation_id: Some(generation.generation_id.clone()),
+                server_plist_backup: server_backup.clone(),
+                watchdog_plist_backup: watchdog_backup.clone(),
+                previous_current_target: rollback
+                    .previous_current
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                server_was_loaded: rollback.server_was_loaded,
+                watchdog_was_loaded: rollback.watchdog_was_loaded,
+                detail: None,
+            },
+        ) {
+            Ok(guardian) => guardian,
+            Err(error) => {
+                if let Some(rollback_id) = rollback_id.as_deref() {
+                    let _ =
+                        store.mark_prepared_service_rollback(rollback_id, "aborted", now_ms_i64());
+                }
+                return Err(format!(
+                    "service guardian could not arm before install mutation: {error}"
+                ));
+            }
+        };
+
         let mut server_bootout_pending = false;
         let activation = (|| -> Result<(), String> {
             if rollback.watchdog_was_loaded {
@@ -350,9 +1507,15 @@ mod macos {
                 now_ms_i64(),
                 Some(&error),
             );
+            if rollback_error.is_none() {
+                let _ = guardian.finish(
+                    "parent_recovered",
+                    "service manager synchronous rollback restored the pre-install service",
+                );
+            }
             return Err(match rollback_error {
                 Some(rollback_error) => format!(
-                    "Rust service activation failed: {error}; rollback also failed: {rollback_error}"
+                    "Rust service activation failed: {error}; rollback also failed: {rollback_error}; one-shot guardian remains armed for known-good recovery"
                 ),
                 None => format!("Rust service activation failed and was rolled back: {error}"),
             });
@@ -372,6 +1535,13 @@ mod macos {
             )
             .is_ok();
 
+        let guardian_settled = guardian
+            .finish(
+                "committed",
+                "service generation activation and health gate committed",
+            )
+            .is_ok();
+
         Ok(json!({
             "ok": true,
             "implementation": "rust",
@@ -387,6 +1557,8 @@ mod macos {
             "backups": backups,
             "rollback_id": rollback_id,
             "rollback_ready": rollback_id.is_some(),
+            "guardian_transaction": transaction_id,
+            "guardian_settled": guardian_settled,
             "evidence_recorded": evidence_recorded,
         }))
     }
@@ -469,7 +1641,10 @@ mod macos {
         }))
     }
 
-    fn rollback(paths: &ServicePaths) -> Result<Value, String> {
+    fn rollback(
+        paths: &ServicePaths,
+        mutation_lock: &ServiceMutationLock,
+    ) -> Result<Value, String> {
         let current_bytes = read_optional_bounded(&paths.plist, 256 * 1024)?
             .ok_or_else(|| "Rust service plist is missing".to_owned())?;
         let current = require_rust_service(paths)?;
@@ -487,60 +1662,51 @@ mod macos {
 
         let mut store = StateStore::open_in_dir(&paths.config_dir, "state")?;
         let rollback = store
-            .begin_latest_service_rollback()?
+            .latest_ready_service_rollback()?
             .ok_or_else(|| "no ready service rollback is available".to_owned())?;
 
-        let release_claim = |store: &StateStore, reason: String| -> Result<Value, String> {
-            let release =
-                store.finish_service_rollback(&rollback.rollback_id, "ready", now_ms_i64());
-            Err(match release {
-                Ok(()) => reason,
-                Err(error) => {
-                    format!("{reason}; rollback claim could not be released safely: {error}")
-                }
-            })
-        };
+        let reject_ready = |reason: String| -> Result<Value, String> { Err(reason) };
 
         if rollback.activated_generation_id != current_generation {
-            return release_claim(
-                &store,
-                format!(
-                    "ready rollback {} targets generation {}, but current service is {}",
-                    rollback.rollback_id, rollback.activated_generation_id, current_generation
-                ),
-            );
+            return reject_ready(format!(
+                "ready rollback {} targets generation {}, but current service is {}",
+                rollback.rollback_id, rollback.activated_generation_id, current_generation
+            ));
+        }
+        let active_generation = store.active_runtime_generation()?;
+        if active_generation
+            .as_ref()
+            .map(|generation| generation.generation_id.as_str())
+            != Some(current_generation.as_str())
+        {
+            return reject_ready(format!(
+                "runtime generation ledger is not aligned with current service generation {current_generation}"
+            ));
         }
 
         let Some(server_backup) = rollback.server_plist_backup.as_deref() else {
-            return release_claim(
-                &store,
-                format!(
-                    "rollback {} has no server plist backup",
-                    rollback.rollback_id
-                ),
-            );
+            return reject_ready(format!(
+                "rollback {} has no server plist backup",
+                rollback.rollback_id
+            ));
         };
         let source_bytes = match read_owned_backup(paths, server_backup) {
             Ok(bytes) => bytes,
-            Err(error) => return release_claim(&store, error),
+            Err(error) => return reject_ready(error),
         };
         let source = match describe_service(Some(&source_bytes), paths) {
             Ok(source) => source,
-            Err(error) => return release_claim(&store, error),
+            Err(error) => return reject_ready(error),
         };
         let source_kind = service_kind_name(&source.kind);
         if source_kind != rollback.source_kind {
-            return release_claim(
-                &store,
-                format!(
-                    "rollback source mismatch: ledger={}, backup={source_kind}",
-                    rollback.source_kind
-                ),
-            );
+            return reject_ready(format!(
+                "rollback source mismatch: ledger={}, backup={source_kind}",
+                rollback.source_kind
+            ));
         }
         if !matches!(source.kind, ServiceKind::Node | ServiceKind::Rust) {
-            return release_claim(
-                &store,
+            return reject_ready(
                 "rollback server backup is not an owned Node/Rust service".to_owned(),
             );
         }
@@ -549,20 +1715,18 @@ mod macos {
             Some(path) => match read_owned_backup(paths, path) {
                 Ok(bytes) => {
                     if !watchdog_is_legacy_owned(Some(&bytes))? {
-                        return release_claim(
-                            &store,
+                        return reject_ready(
                             "rollback watchdog backup is not legacy herdr-mcp watchdog".to_owned(),
                         );
                     }
                     Some(bytes)
                 }
-                Err(error) => return release_claim(&store, error),
+                Err(error) => return reject_ready(error),
             },
             None => None,
         };
         if rollback.watchdog_was_loaded && watchdog_bytes.is_none() {
-            return release_claim(
-                &store,
+            return reject_ready(
                 "rollback requires a loaded watchdog but has no watchdog backup".to_owned(),
             );
         }
@@ -575,8 +1739,7 @@ mod macos {
             .as_deref()
             .is_some_and(|target| !is_owned_generation_target(target))
         {
-            return release_claim(
-                &store,
+            return reject_ready(
                 "rollback previous runtime/current target is not managed".to_owned(),
             );
         }
@@ -592,6 +1755,81 @@ mod macos {
         } else {
             None
         };
+
+        let current_backup = match backup_bytes(paths, "guardian-current-server", &current_bytes) {
+            Ok(path) => path,
+            Err(error) => return reject_ready(error),
+        };
+        let transaction_id = new_guardian_transaction_id()?;
+        let mut guardian = match arm_guardian(
+            paths,
+            mutation_lock,
+            GuardianRecord {
+                transaction_id: transaction_id.clone(),
+                mode: GuardianMode::Rollback,
+                state: "armed".to_owned(),
+                parent_pid: std::process::id(),
+                created_at: now_ms_i64(),
+                rollback_id: Some(rollback.rollback_id.clone()),
+                candidate_generation_id: Some(current_generation.clone()),
+                server_plist_backup: Some(current_backup),
+                watchdog_plist_backup: None,
+                previous_current_target: Some(current_target.to_string_lossy().into_owned()),
+                server_was_loaded: current_was_loaded,
+                watchdog_was_loaded: false,
+                detail: None,
+            },
+        ) {
+            Ok(guardian) => guardian,
+            Err(error) => {
+                return Err(format!(
+                    "service guardian could not arm before rollback mutation: {error}"
+                ));
+            }
+        };
+
+        let rollback_snapshot = rollback.clone();
+        let rollback = match store.claim_service_rollback(&rollback.rollback_id) {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                let settlement = guardian.finish(
+                    "parent_recovered",
+                    "rollback claim was not acquired; current service remained unchanged",
+                );
+                return Err(match settlement {
+                    Ok(()) => format!(
+                        "service rollback could not be claimed after guardian handshake: {error}"
+                    ),
+                    Err(settlement_error) => format!(
+                        "service rollback could not be claimed after guardian handshake: {error}; guardian settlement also failed: {settlement_error}"
+                    ),
+                });
+            }
+        };
+        let mut expected_claimed = rollback_snapshot;
+        expected_claimed.state = "consuming".to_owned();
+        if rollback != expected_claimed {
+            let release =
+                store.finish_service_rollback(&rollback.rollback_id, "ready", now_ms_i64());
+            let settlement = guardian.finish(
+                "parent_recovered",
+                "rollback ledger changed after preflight; current service remained unchanged",
+            );
+            return Err(match (release, settlement) {
+                (Ok(()), Ok(())) => {
+                    "service rollback ledger changed between preflight and claim".to_owned()
+                }
+                (Err(release_error), Ok(())) => format!(
+                    "service rollback ledger changed between preflight and claim; rollback claim could not be released: {release_error}"
+                ),
+                (Ok(()), Err(settlement_error)) => format!(
+                    "service rollback ledger changed between preflight and claim; guardian settlement also failed: {settlement_error}"
+                ),
+                (Err(release_error), Err(settlement_error)) => format!(
+                    "service rollback ledger changed between preflight and claim; rollback claim could not be released: {release_error}; guardian settlement also failed: {settlement_error}"
+                ),
+            });
+        }
 
         let mut current_bootout_pending = false;
         let apply = (|| -> Result<(), String> {
@@ -638,9 +1876,15 @@ mod macos {
                 "ready"
             };
             let _ = store.finish_service_rollback(&rollback.rollback_id, state, now_ms_i64());
+            if restore_error.is_none() {
+                let _ = guardian.finish(
+                    "parent_recovered",
+                    "service manager restored the current Rust service after rollback failure",
+                );
+            }
             return Err(match restore_error {
                 Some(restore_error) => format!(
-                    "service rollback failed: {error}; restoring current Rust service also failed: {restore_error}"
+                    "service rollback failed: {error}; restoring current Rust service also failed: {restore_error}; one-shot guardian remains armed for known-good recovery"
                 ),
                 None => format!(
                     "service rollback failed but current Rust service was restored: {error}"
@@ -657,6 +1901,12 @@ mod macos {
                 Some(&format!("restored-{}", rollback.source_kind)),
             )
             .is_ok();
+        let guardian_settled = guardian
+            .finish(
+                "committed",
+                "service rollback committed and previous implementation passed its health gate",
+            )
+            .is_ok();
         Ok(json!({
             "ok": true,
             "action": "rollback",
@@ -665,6 +1915,8 @@ mod macos {
             "restored_implementation": rollback.source_kind,
             "restored_loaded": rollback.server_was_loaded,
             "restored_watchdog": rollback.watchdog_was_loaded,
+            "guardian_transaction": transaction_id,
+            "guardian_settled": guardian_settled,
             "evidence_recorded": evidence_recorded,
         }))
     }
@@ -1525,6 +2777,27 @@ mod macos {
             assert!(service_command_requires_independent_process(
                 &ServiceCommand::Uninstall
             ));
+            assert!(service_command_requires_independent_process(
+                &ServiceCommand::Guardian {
+                    transaction_id: "gtx-1234-guardian".to_owned(),
+                    parent_pid: 1234,
+                }
+            ));
+            assert!(!service_command_requires_mutation_lock(
+                &ServiceCommand::Status
+            ));
+            assert!(!service_command_requires_mutation_lock(
+                &ServiceCommand::Guardian {
+                    transaction_id: "gtx-1234-guardian".to_owned(),
+                    parent_pid: 1234,
+                }
+            ));
+            assert!(service_command_requires_mutation_lock(
+                &ServiceCommand::Install { adopt_node: false }
+            ));
+            assert!(service_command_requires_mutation_lock(
+                &ServiceCommand::Rollback
+            ));
         }
 
         fn root(label: &str) -> PathBuf {
@@ -1816,6 +3089,504 @@ mod macos {
             .unwrap();
             assert_eq!(stops, 0);
             assert_eq!(waits, 0);
+        }
+
+        fn guardian_record(mode: GuardianMode, rollback_id: Option<&str>) -> GuardianRecord {
+            GuardianRecord {
+                transaction_id: "gtx-12345678-guardian".to_owned(),
+                mode,
+                state: "watching".to_owned(),
+                parent_pid: 1234,
+                created_at: 1,
+                rollback_id: rollback_id.map(str::to_owned),
+                candidate_generation_id: Some("rust-candidate".to_owned()),
+                server_plist_backup: Some("/backups/server.plist".to_owned()),
+                watchdog_plist_backup: None,
+                previous_current_target: Some("generations/rust-known-good".to_owned()),
+                server_was_loaded: true,
+                watchdog_was_loaded: false,
+                detail: None,
+            }
+        }
+
+        fn guardian_rollback(rollback_id: &str, state: &str) -> ServiceRollbackRecord {
+            ServiceRollbackRecord {
+                rollback_id: rollback_id.to_owned(),
+                source_kind: "rust".to_owned(),
+                activated_generation_id: "rust-candidate".to_owned(),
+                server_plist_backup: Some("/backups/server.plist".to_owned()),
+                watchdog_plist_backup: None,
+                previous_current_target: Some("generations/rust-known-good".to_owned()),
+                server_was_loaded: true,
+                watchdog_was_loaded: false,
+                created_at: 1,
+                state: state.to_owned(),
+            }
+        }
+
+        fn active_generation(id: &str) -> RuntimeGenerationRecord {
+            RuntimeGenerationRecord {
+                generation_id: id.to_owned(),
+                runtime_path: format!("/runtime/{id}"),
+                sha256: "sha".to_owned(),
+                source: "service-install".to_owned(),
+                state: "active".to_owned(),
+                installed_at: 1,
+                activated_at: Some(2),
+                deactivated_at: None,
+            }
+        }
+
+        #[test]
+        fn guardian_transaction_ids_and_records_are_strict_and_round_trip() {
+            assert!(valid_guardian_transaction_id("gtx-12345678-guardian"));
+            assert!(!valid_guardian_transaction_id("../guardian"));
+            assert!(!valid_guardian_transaction_id("gtx-bad/slash"));
+
+            let record = guardian_record(GuardianMode::Install, Some("rb-1"));
+            let decoded = decode_guardian_record(&guardian_record_value(&record)).unwrap();
+            assert_eq!(decoded, record);
+            let mut invalid = guardian_record_value(&record);
+            invalid
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".to_owned(), json!(true));
+            assert!(decode_guardian_record(&invalid).is_err());
+        }
+
+        #[test]
+        fn guardian_decision_never_rolls_back_a_durably_committed_transaction() {
+            let install = guardian_record(GuardianMode::Install, Some("rb-1"));
+            let ready = guardian_rollback("rb-1", "ready");
+            let candidate = active_generation("rust-candidate");
+            assert_eq!(
+                guardian_decision(&install, Some(&ready), Some(&candidate)),
+                GuardianDecision::Exit("committed")
+            );
+            let prepared = guardian_rollback("rb-1", "prepared");
+            let old = active_generation("rust-old");
+            assert_eq!(
+                guardian_decision(&install, Some(&prepared), Some(&old)),
+                GuardianDecision::Recover
+            );
+            let auto = guardian_rollback("rb-1", "auto_rolled_back");
+            assert_eq!(
+                guardian_decision(&install, Some(&auto), Some(&old)),
+                GuardianDecision::Exit("parent_recovered")
+            );
+
+            let fresh_install = guardian_record(GuardianMode::Install, None);
+            assert_eq!(
+                guardian_decision(&fresh_install, None, Some(&candidate)),
+                GuardianDecision::Exit("committed")
+            );
+            assert_eq!(
+                guardian_decision(&fresh_install, None, Some(&old)),
+                GuardianDecision::Recover
+            );
+
+            let rollback = guardian_record(GuardianMode::Rollback, Some("rb-2"));
+            assert_eq!(
+                guardian_decision(
+                    &rollback,
+                    Some(&guardian_rollback("rb-2", "consumed")),
+                    Some(&active_generation("rust-known-good"))
+                ),
+                GuardianDecision::Exit("committed")
+            );
+            assert_eq!(
+                guardian_decision(
+                    &rollback,
+                    Some(&guardian_rollback("rb-2", "ready")),
+                    Some(&candidate)
+                ),
+                GuardianDecision::Exit("parent_recovered")
+            );
+            assert_eq!(
+                guardian_decision(
+                    &rollback,
+                    Some(&guardian_rollback("rb-2", "consuming")),
+                    Some(&candidate)
+                ),
+                GuardianDecision::Recover
+            );
+            assert!(matches!(
+                guardian_decision(&install, Some(&ready), Some(&old)),
+                GuardianDecision::Refuse(_)
+            ));
+        }
+
+        #[test]
+        fn guardian_quiesce_absorbs_inflight_bootout_before_sending_one_stop() {
+            let mut waits = 0_usize;
+            let mut stops = 0_usize;
+            guardian_quiesce_with(
+                || true,
+                || {
+                    waits += 1;
+                    if waits == 1 {
+                        Err("still loaded".to_owned())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    stops += 1;
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert_eq!(waits, 2);
+            assert_eq!(stops, 1);
+
+            let mut immediate_waits = 0_usize;
+            let mut immediate_stops = 0_usize;
+            guardian_quiesce_with(
+                || true,
+                || {
+                    immediate_waits += 1;
+                    Ok(())
+                },
+                || {
+                    immediate_stops += 1;
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert_eq!(immediate_waits, 1);
+            assert_eq!(immediate_stops, 0);
+        }
+
+        fn append_guardian_test_marker(path: &Path, marker: &str) {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            writeln!(file, "{marker}").unwrap();
+            file.sync_all().unwrap();
+        }
+
+        fn wait_for_guardian_test_marker(path: &Path, marker: &str, budget: Duration) {
+            let deadline = Instant::now() + budget;
+            loop {
+                let text = fs::read_to_string(path).unwrap_or_default();
+                if text.lines().any(|line| line == marker) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "guardian subprocess did not emit {marker}; observed: {text:?}"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn guardian_test_lock(path: &Path) -> File {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            file
+        }
+
+        fn spawn_guardian_test_watcher(
+            result_path: &Path,
+            read_signal: &File,
+            write_signal: &File,
+            lock: &File,
+            mode: &str,
+        ) -> Child {
+            let read_fd = read_signal.as_raw_fd();
+            let write_fd = write_signal.as_raw_fd();
+            let lock_fd = lock.as_raw_fd();
+            assert!(
+                [read_fd, write_fd, lock_fd]
+                    .iter()
+                    .all(|fd| !matches!(*fd, GUARDIAN_PARENT_FD | GUARDIAN_LOCK_FD))
+            );
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "service_manager::macos::tests::guardian_subprocess_helper",
+                    "--nocapture",
+                ])
+                .env("HERDR_MCP_GUARDIAN_TEST_HELPER", mode)
+                .env("HERDR_MCP_GUARDIAN_TEST_RESULT", result_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(read_fd, GUARDIAN_PARENT_FD) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(lock_fd, GUARDIAN_LOCK_FD) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    libc::close(write_fd);
+                    libc::close(read_fd);
+                    libc::close(lock_fd);
+                    Ok(())
+                });
+            }
+            command.spawn().unwrap()
+        }
+
+        fn assert_guardian_test_child_exits(child: &mut Child, budget: Duration) {
+            let deadline = Instant::now() + budget;
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "guardian subprocess failed with {status}");
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("guardian subprocess did not exit within {budget:?}");
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        #[test]
+        fn guardian_subprocess_helper() {
+            let Ok(mode) = env::var("HERDR_MCP_GUARDIAN_TEST_HELPER") else {
+                return;
+            };
+            let result_path = PathBuf::from(
+                env::var_os("HERDR_MCP_GUARDIAN_TEST_RESULT").expect("guardian helper result path"),
+            );
+            match mode.as_str() {
+                "watcher" | "silent-watcher" => {
+                    assert!(guardian_fd_is_open(GUARDIAN_PARENT_FD));
+                    assert!(guardian_fd_is_open(GUARDIAN_LOCK_FD));
+                    set_guardian_fd_cloexec(GUARDIAN_PARENT_FD).unwrap();
+                    set_guardian_fd_cloexec(GUARDIAN_LOCK_FD).unwrap();
+                    if mode == "watcher" {
+                        append_guardian_test_marker(&result_path, "READY");
+                    }
+                    let closed =
+                        wait_for_guardian_parent_signal(GUARDIAN_PARENT_FD, Duration::from_secs(5))
+                            .unwrap();
+                    assert!(closed, "guardian helper never observed parent POLLHUP");
+                    append_guardian_test_marker(&result_path, "HUP");
+                }
+                "parent-exit" => {
+                    let lock = guardian_test_lock(&result_path.with_extension("lock"));
+                    let (read_signal, write_signal) = guardian_pipe().unwrap();
+                    let _watcher = spawn_guardian_test_watcher(
+                        &result_path,
+                        &read_signal,
+                        &write_signal,
+                        &lock,
+                        "watcher",
+                    );
+                    drop(read_signal);
+                    wait_for_guardian_test_marker(&result_path, "READY", Duration::from_secs(3));
+                    // Keep the writer open until the OS tears down this process.
+                    // The orphaned watcher must observe POLLHUP from process exit,
+                    // not from an explicit close in the helper.
+                    std::mem::forget(write_signal);
+                    std::mem::forget(lock);
+                    std::process::exit(0);
+                }
+                other => panic!("unknown guardian subprocess helper mode {other}"),
+            }
+        }
+
+        #[test]
+        fn guardian_subprocess_handshake_precedes_mutation_and_finish_delivers_hup() {
+            let root = root("guardian-subprocess-finish");
+            fs::create_dir_all(&root).unwrap();
+            let result_path = root.join("events.txt");
+            let lock = guardian_test_lock(&root.join("mutation.lock"));
+            let (read_signal, write_signal) = guardian_pipe().unwrap();
+            let mut child = spawn_guardian_test_watcher(
+                &result_path,
+                &read_signal,
+                &write_signal,
+                &lock,
+                "watcher",
+            );
+            drop(read_signal);
+
+            wait_for_guardian_test_marker(&result_path, "READY", Duration::from_secs(3));
+            append_guardian_test_marker(&result_path, "MUTATION");
+            drop(write_signal);
+            assert_guardian_test_child_exits(&mut child, Duration::from_secs(3));
+
+            let events = fs::read_to_string(&result_path).unwrap();
+            assert_eq!(
+                events.lines().collect::<Vec<_>>(),
+                vec!["READY", "MUTATION", "HUP"],
+                "mutation must start only after handshake and parent close must not leave a writer inherited in the guardian"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn guardian_subprocess_parent_exit_delivers_hup_without_pid_liveness_polling() {
+            let root = root("guardian-subprocess-parent-exit");
+            fs::create_dir_all(&root).unwrap();
+            let result_path = root.join("events.txt");
+            let mut parent = Command::new(std::env::current_exe().unwrap());
+            parent
+                .args([
+                    "--exact",
+                    "service_manager::macos::tests::guardian_subprocess_helper",
+                    "--nocapture",
+                ])
+                .env("HERDR_MCP_GUARDIAN_TEST_HELPER", "parent-exit")
+                .env("HERDR_MCP_GUARDIAN_TEST_RESULT", &result_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut parent = parent.spawn().unwrap();
+            assert_guardian_test_child_exits(&mut parent, Duration::from_secs(4));
+            wait_for_guardian_test_marker(&result_path, "HUP", Duration::from_secs(4));
+            let events = fs::read_to_string(&result_path).unwrap();
+            assert_eq!(events.lines().collect::<Vec<_>>(), vec!["READY", "HUP"]);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn guardian_startup_timeout_aborts_and_reaps_before_parent_signal_closes() {
+            let (root, paths) = fixture();
+            ensure_secure_dir(&paths.guardians_dir).unwrap();
+            let transaction_id = "gtx-12345678-timeout";
+            let directory = guardian_dir(&paths, transaction_id).unwrap();
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut record = guardian_record(GuardianMode::Rollback, Some("rb-timeout"));
+            record.transaction_id = transaction_id.to_owned();
+            record.state = "armed".to_owned();
+            write_guardian_record(&paths, &record).unwrap();
+
+            let result_path = root.join("timeout-events.txt");
+            let lock = guardian_test_lock(&root.join("timeout-mutation.lock"));
+            let (read_signal, write_signal) = guardian_pipe().unwrap();
+            let mut child = spawn_guardian_test_watcher(
+                &result_path,
+                &read_signal,
+                &write_signal,
+                &lock,
+                "silent-watcher",
+            );
+            drop(read_signal);
+            let mut write_signal = Some(write_signal);
+
+            abort_guardian_startup(
+                &paths,
+                transaction_id,
+                &mut child,
+                &mut write_signal,
+                "fault-injected handshake timeout",
+            )
+            .unwrap();
+            assert!(write_signal.is_none());
+            assert!(
+                child.try_wait().unwrap().is_some(),
+                "guardian child must be reaped"
+            );
+            let aborted = read_guardian_record(&paths, transaction_id).unwrap();
+            assert_eq!(aborted.state, "aborted");
+            assert_eq!(
+                guardian_decision(&aborted, None, None),
+                GuardianDecision::Exit("aborted"),
+                "startup timeout must never enter recovery"
+            );
+            assert!(
+                !fs::read_to_string(&result_path)
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|line| line == "HUP"),
+                "the child must be killed before the parent-signal writer is closed"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn guardian_startup_state_fence_failure_still_reaps_before_parent_signal_closes() {
+            let (root, paths) = fixture();
+            ensure_secure_dir(&paths.guardians_dir).unwrap();
+            let transaction_id = "gtx-12345678-fence-failure";
+            let directory = guardian_dir(&paths, transaction_id).unwrap();
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut record = guardian_record(GuardianMode::Rollback, Some("rb-fence"));
+            record.transaction_id = transaction_id.to_owned();
+            record.state = "armed".to_owned();
+            write_guardian_record(&paths, &record).unwrap();
+
+            let outside_lock = root.join("outside-transaction.lock");
+            fs::write(&outside_lock, b"outside").unwrap();
+            symlink(
+                &outside_lock,
+                guardian_state_lock_path(&paths, transaction_id).unwrap(),
+            )
+            .unwrap();
+
+            let result_path = root.join("fence-events.txt");
+            let lock = guardian_test_lock(&root.join("fence-mutation.lock"));
+            let (read_signal, write_signal) = guardian_pipe().unwrap();
+            let mut child = spawn_guardian_test_watcher(
+                &result_path,
+                &read_signal,
+                &write_signal,
+                &lock,
+                "silent-watcher",
+            );
+            drop(read_signal);
+            let mut write_signal = Some(write_signal);
+
+            let error = abort_guardian_startup(
+                &paths,
+                transaction_id,
+                &mut child,
+                &mut write_signal,
+                "fault-injected transaction-lock failure",
+            )
+            .unwrap_err();
+            assert!(error.contains("must not be a symlink"));
+            assert!(write_signal.is_none());
+            assert!(
+                child.try_wait().unwrap().is_some(),
+                "guardian child must be reaped"
+            );
+            assert_eq!(
+                read_guardian_record(&paths, transaction_id).unwrap().state,
+                "armed"
+            );
+            assert!(
+                !fs::read_to_string(&result_path)
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|line| line == "HUP"),
+                "state-fence failure must still kill the child before the signal writer closes"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn service_mutation_lock_is_single_writer_and_released_on_close() {
+            let (root, paths) = fixture();
+            let first = ServiceMutationLock::acquire(&paths).unwrap();
+            assert!(ServiceMutationLock::acquire(&paths).is_err());
+            drop(first);
+            let second = ServiceMutationLock::acquire(&paths).unwrap();
+            drop(second);
+            fs::remove_dir_all(root).unwrap();
         }
     }
 }
