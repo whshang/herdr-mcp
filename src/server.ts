@@ -1911,7 +1911,51 @@ function registerTools(server: McpServer): void {
       const byteBudget = max_bytes ?? 65536;
       const out: Record<string, unknown>[] = [];
       let truncated = false;
-      const globRe = glob ? new RegExp("^" + glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$") : null;
+      const normalizedGlob = glob?.replaceAll("\\", "/") || null;
+      if (normalizedGlob?.startsWith("/")) {
+        return toResult({ ok: false, code: "invalid_params", message: "glob must be root-relative" });
+      }
+      const globPathAware = Boolean(normalizedGlob?.includes("/"));
+      const globRe = normalizedGlob ? (() => {
+        let source = "^";
+        for (let i = 0; i < normalizedGlob.length; i += 1) {
+          const ch = normalizedGlob[i];
+          if (ch === "*" && normalizedGlob[i + 1] === "*") {
+            i += 1;
+            if (normalizedGlob[i + 1] === "/") {
+              source += "(?:.*/)?";
+              i += 1;
+            } else {
+              source += ".*";
+            }
+          } else if (ch === "*") {
+            source += "[^/]*";
+          } else if (ch === "?") {
+            source += "[^/]";
+          } else {
+            source += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          }
+        }
+        return new RegExp(source + "$");
+      })() : null;
+      const fallbackCandidate = normalizedGlob && globPathAware ? (() => {
+        const wildcard = [...normalizedGlob].findIndex((ch) => ch === "*" || ch === "?");
+        const literalPrefix = normalizedGlob.slice(0, wildcard < 0 ? normalizedGlob.length : wildcard);
+        if (literalPrefix.split("/").includes("..")) return v.real;
+        const directoryPrefix = literalPrefix.endsWith("/")
+          ? literalPrefix.replace(/\/+$/, "")
+          : literalPrefix.slice(0, Math.max(0, literalPrefix.lastIndexOf("/")));
+        return directoryPrefix ? path.join(v.real, directoryPrefix) : v.real;
+      })() : v.real;
+      let fallbackRoot = v.real;
+      if (fallbackCandidate !== v.real) {
+        try {
+          const candidateReal = await realpath(fallbackCandidate);
+          const candidateStat = await stat(candidateReal);
+          const insideSearchRoot = candidateReal === v.real || candidateReal.startsWith(v.real + path.sep);
+          if (candidateStat.isDirectory() && insideSearchRoot) fallbackRoot = candidateReal;
+        } catch { /* Missing or unsafe literal prefixes fall back to the validated search root. */ }
+      }
       const re = regex ? new RegExp(pattern, case_insensitive ? "i" : "") : null;
       const lit = regex ? null : pattern;
 
@@ -1961,7 +2005,7 @@ function registerTools(server: McpServer): void {
           }
         });
         child.on("error", () => resolve(false));
-        child.on("close", () => resolve(true));
+        child.on("close", (code) => resolve(code === 0 || code === 1));
       });
       if (rgOk) {
         return toResult({ ok: true, root: v.resolved, count: out.length, truncated, matches: out, engine: "rg" });
@@ -1979,7 +2023,10 @@ function registerTools(server: McpServer): void {
           if (deniedSecretPath(full)) continue;
           if (ent.isDirectory()) { await walk(full); continue; }
           if (!ent.isFile()) continue;
-          if (globRe && !globRe.test(name)) continue;
+          const globCandidate = globPathAware
+            ? path.relative(v.real, full).split(path.sep).join("/")
+            : name;
+          if (globRe && !globRe.test(globCandidate)) continue;
           let data: Buffer;
           try { data = await readFile(full); } catch { continue; }
           if (data.length > byteBudget) { truncated = true; continue; }
@@ -1993,7 +2040,7 @@ function registerTools(server: McpServer): void {
           }
         }
       };
-      await walk(v.real);
+      await walk(fallbackRoot);
       return toResult({ ok: true, root: v.resolved, count: out.length, truncated, matches: out, engine: "node" });
     },
   );

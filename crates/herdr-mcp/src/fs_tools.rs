@@ -3,7 +3,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value, json};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -260,7 +260,7 @@ pub fn grep(snapshot: &Value, args: &Value) -> Value {
         Ok(value) => value,
         Err(error) => return error,
     };
-    let glob_re = match glob.map(glob_regex).transpose() {
+    let glob_matcher = match glob.map(grep_glob_matcher).transpose() {
         Ok(value) => value,
         Err(message) => return json!({"ok": false, "code": "invalid_params", "message": message}),
     };
@@ -282,15 +282,17 @@ pub fn grep(snapshot: &Value, args: &Value) -> Value {
 
     let mut matches = Vec::new();
     let mut truncated = false;
-    walk_grep(
-        &managed.real,
-        glob_re.as_ref(),
-        &matcher,
+    let search_root = glob
+        .map(|value| resolve_grep_search_root(&managed.real, value))
+        .unwrap_or_else(|| managed.real.clone());
+    let walk = GrepWalkOptions {
+        base: &managed.real,
+        glob: glob_matcher.as_ref(),
+        matcher: &matcher,
         max_matches,
         max_bytes,
-        &mut matches,
-        &mut truncated,
-    );
+    };
+    walk_grep(&search_root, &walk, &mut matches, &mut truncated);
     json!({
         "ok": true,
         "root": managed.resolved.to_string_lossy(),
@@ -373,16 +375,21 @@ fn walk_list(
     }
 }
 
-fn walk_grep(
-    dir: &Path,
-    glob: Option<&Regex>,
-    matcher: &LineMatcher,
+struct GrepWalkOptions<'a> {
+    base: &'a Path,
+    glob: Option<&'a GlobMatcher>,
+    matcher: &'a LineMatcher,
     max_matches: usize,
     max_bytes: u64,
+}
+
+fn walk_grep(
+    dir: &Path,
+    options: &GrepWalkOptions<'_>,
     output: &mut Vec<Value>,
     truncated: &mut bool,
 ) {
-    if output.len() >= max_matches {
+    if output.len() >= options.max_matches {
         *truncated = true;
         return;
     }
@@ -392,7 +399,7 @@ fn walk_grep(
     };
     children.sort_by_key(|entry| entry.file_name());
     for entry in children {
-        if output.len() >= max_matches {
+        if output.len() >= options.max_matches {
             *truncated = true;
             return;
         }
@@ -408,24 +415,20 @@ fn walk_grep(
             continue;
         };
         if file_type.is_dir() {
-            walk_grep(
-                &full,
-                glob,
-                matcher,
-                max_matches,
-                max_bytes,
-                output,
-                truncated,
-            );
+            walk_grep(&full, options, output, truncated);
             continue;
         }
-        if !file_type.is_file() || glob.is_some_and(|pattern| !pattern.is_match(&name)) {
+        if !file_type.is_file()
+            || options
+                .glob
+                .is_some_and(|pattern| !pattern.matches(options.base, &full, &name))
+        {
             continue;
         }
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        if metadata.len() > max_bytes {
+        if metadata.len() > options.max_bytes {
             *truncated = true;
             continue;
         }
@@ -434,11 +437,11 @@ fn walk_grep(
         };
         let text = String::from_utf8_lossy(&data);
         for (index, line) in text.split('\n').enumerate() {
-            if output.len() >= max_matches {
+            if output.len() >= options.max_matches {
                 *truncated = true;
                 return;
             }
-            if matcher.matches(line) {
+            if options.matcher.matches(line) {
                 output.push(json!({
                     "file": full.to_string_lossy(),
                     "line": index + 1,
@@ -476,6 +479,118 @@ fn glob_regex(glob: &str) -> Result<Regex, String> {
     }
     pattern.push('$');
     Regex::new(&pattern).map_err(|error| format!("invalid glob: {error}"))
+}
+
+struct GlobMatcher {
+    regex: Regex,
+    path_aware: bool,
+}
+
+impl GlobMatcher {
+    fn matches(&self, base: &Path, full: &Path, name: &str) -> bool {
+        if !self.path_aware {
+            return self.regex.is_match(name);
+        }
+        let relative = full
+            .strip_prefix(base)
+            .unwrap_or(full)
+            .to_string_lossy()
+            .replace('\\', "/");
+        self.regex.is_match(&relative)
+    }
+}
+
+fn grep_glob_matcher(glob: &str) -> Result<GlobMatcher, String> {
+    let normalized = glob.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return Err("glob must be root-relative".to_owned());
+    }
+    let path_aware = normalized.contains('/');
+    if !path_aware {
+        return glob_regex(&normalized).map(|regex| GlobMatcher { regex, path_aware });
+    }
+
+    let chars = normalized.chars().collect::<Vec<_>>();
+    let mut pattern = String::from("^");
+    let mut index = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '*' if chars.get(index + 1) == Some(&'*') => {
+                index += 2;
+                if chars.get(index) == Some(&'/') {
+                    pattern.push_str("(?:.*/)?");
+                    index += 1;
+                } else {
+                    pattern.push_str(".*");
+                }
+            }
+            '*' => {
+                pattern.push_str("[^/]*");
+                index += 1;
+            }
+            '?' => {
+                pattern.push_str("[^/]");
+                index += 1;
+            }
+            other => {
+                pattern.push_str(&regex::escape(&other.to_string()));
+                index += 1;
+            }
+        }
+    }
+    pattern.push('$');
+    Regex::new(&pattern)
+        .map(|regex| GlobMatcher { regex, path_aware })
+        .map_err(|error| format!("invalid glob: {error}"))
+}
+
+fn grep_search_root(base: &Path, glob: &str) -> PathBuf {
+    let normalized = glob.replace('\\', "/");
+    if !normalized.contains('/') || normalized.starts_with('/') {
+        return base.to_path_buf();
+    }
+    let wildcard = normalized
+        .char_indices()
+        .find_map(|(index, ch)| matches!(ch, '*' | '?').then_some(index))
+        .unwrap_or(normalized.len());
+    let literal_prefix = &normalized[..wildcard];
+    if literal_prefix.split('/').any(|part| part == "..") {
+        return base.to_path_buf();
+    }
+    let directory_prefix = if literal_prefix.ends_with('/') {
+        literal_prefix.trim_end_matches('/')
+    } else {
+        literal_prefix
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or("")
+    };
+    if directory_prefix.is_empty() {
+        base.to_path_buf()
+    } else {
+        base.join(directory_prefix)
+    }
+}
+
+fn resolve_grep_search_root(base: &Path, glob: &str) -> PathBuf {
+    let candidate = grep_search_root(base, glob);
+    if candidate == base {
+        return base.to_path_buf();
+    }
+    let Ok(metadata) = fs::symlink_metadata(&candidate) else {
+        return base.to_path_buf();
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return base.to_path_buf();
+    }
+    let Ok(real) = fs::canonicalize(&candidate) else {
+        return base.to_path_buf();
+    };
+    if fs_security::path_within(base, &real) {
+        real
+    } else {
+        base.to_path_buf()
+    }
 }
 
 fn truncate_complete_lines(lines: &[&str], budget: usize) -> (String, usize, bool) {
@@ -587,6 +702,28 @@ mod tests {
     }
 
     #[test]
+    fn grep_glob_matches_root_relative_paths_and_prunes_literal_prefix() {
+        let matcher = grep_glob_matcher("extension/**/*.js").unwrap();
+        let base = Path::new("/repo");
+        assert!(matcher.matches(
+            base,
+            Path::new("/repo/extension/background.js"),
+            "background.js"
+        ));
+        assert!(matcher.matches(
+            base,
+            Path::new("/repo/extension/content/wake.js"),
+            "wake.js"
+        ));
+        assert!(!matcher.matches(base, Path::new("/repo/src/server.js"), "server.js"));
+        assert_eq!(
+            grep_search_root(base, "extension/**/*.js"),
+            Path::new("/repo/extension")
+        );
+        assert_eq!(grep_search_root(base, "*.js"), base);
+    }
+
+    #[test]
     fn image_mime_accepts_only_supported_types() {
         assert_eq!(image_mime(Path::new("shot.PNG")), Some("image/png"));
         assert_eq!(image_mime(Path::new("photo.jpeg")), Some("image/jpeg"));
@@ -608,6 +745,7 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("extension/content")).unwrap();
         assert!(
             Command::new("git")
                 .args(["init", "-q"])
@@ -617,6 +755,11 @@ mod tests {
                 .success()
         );
         fs::write(root.join("src/lib.rs"), "alpha\nbeta\nalpha two\n").unwrap();
+        fs::write(
+            root.join("extension/content/wake.js"),
+            "const autoContinue = 'SCROLL independent';\n",
+        )
+        .unwrap();
         fs::write(root.join(".env"), "DO_NOT_READ=1\n").unwrap();
         let snapshot = json!({"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}], "agents": []});
 
@@ -642,6 +785,52 @@ mod tests {
         assert_eq!(grep_result["ok"], true);
         assert_eq!(grep_result["count"], 2);
         assert_eq!(grep_result["engine"], "rust");
+
+        let path_glob_result = grep(
+            &snapshot,
+            &json!({
+                "root": root,
+                "pattern": "scroll",
+                "case_insensitive": true,
+                "glob": "extension/**/*.js",
+                "max_matches": 200,
+            }),
+        );
+        assert_eq!(path_glob_result["ok"], true);
+        assert_eq!(path_glob_result["count"], 1);
+        assert!(
+            path_glob_result["matches"][0]["file"]
+                .as_str()
+                .unwrap()
+                .ends_with("extension/content/wake.js")
+        );
+        assert_eq!(resolve_grep_search_root(&root, "missing/**/*.js"), root);
+        let absolute_glob = grep(
+            &snapshot,
+            &json!({"root": root, "pattern": "scroll", "glob": "/extension/**/*.js"}),
+        );
+        assert_eq!(absolute_glob["ok"], false);
+        assert_eq!(absolute_glob["code"], "invalid_params");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = std::env::temp_dir().join(format!(
+                "herdr-mcp-fs-tools-outside-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(outside.join("escaped.js"), "scroll\n").unwrap();
+            symlink(&outside, root.join("escape")).unwrap();
+            assert_eq!(resolve_grep_search_root(&root, "escape/**/*.js"), root);
+            let escaped = grep(
+                &snapshot,
+                &json!({"root": root, "pattern": "scroll", "glob": "escape/**/*.js"}),
+            );
+            assert_eq!(escaped["ok"], true);
+            assert_eq!(escaped["count"], 0);
+            fs::remove_dir_all(outside).unwrap();
+        }
 
         let secret_result = read(&snapshot, &json!({"path": root.join(".env")}));
         assert_eq!(secret_result["reason"], "secret_path_denied");
