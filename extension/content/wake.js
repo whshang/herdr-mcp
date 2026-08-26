@@ -416,26 +416,62 @@ const H2W_CONTENT_VERSION = "0.1.63";
     return !isComposerGenerating();
   }
 
+  function captureSubmitAckBaseline(sendButton = null) {
+    return {
+      composer: composerNorm(),
+      sendButton,
+      userTurn: ADAPTER.name === "chatgpt" ? latestTurnForRole("user") : null,
+    };
+  }
+
+  function submitWasAccepted(baseline) {
+    if (!ADAPTER.inputHasContent()) return true;
+    if (ADAPTER.name !== "chatgpt") return false;
+    // An accepted ChatGPT send normally replaces or repurposes the exact Send
+    // button before ProseMirror clears. Checking that captured node is O(1) and
+    // avoids repeatedly scanning a long conversation while the page is hot.
+    if (baseline?.sendButton
+      && (!baseline.sendButton.isConnected || !isSendButton(baseline.sendButton))) {
+      return true;
+    }
+    const latestUser = latestTurnForRole("user");
+    if (latestUser && latestUser !== baseline?.userTurn) {
+      const latestText = normText(latestUser.innerText || latestUser.textContent || "");
+      const sentText = String(baseline?.composer || "");
+      if (latestText && sentText
+        && (latestText.includes(sentText.slice(0, 120)) || sentText.includes(latestText.slice(0, 120)))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async function waitForSubmitAck(baseline, timeoutMs) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      await wait(200);
+      if (submitWasAccepted(baseline)) return true;
+    }
+    return submitWasAccepted(baseline);
+  }
+
   // ---- Submission ----
   // For contenteditable sites, wait for an enabled send button because ProseMirror
-  // often consumes synthetic keyboard events. Success requires the composer to clear.
+  // often consumes synthetic keyboard events. ChatGPT can accept a send before
+  // ProseMirror clears, so success also observes the Send-button transition or new user turn.
   async function submitAfterPermissionClick() {
     if (!lastPermClickAt || Date.now() - lastPermClickAt > 6000) return false;
     await wait(1200);
     await waitForComposerIdle(4000);
     const btn = findSendButton();
     if (isSendButton(btn)) {
+      const baseline = captureSubmitAckBaseline(btn);
       btn.click();
-      for (let j = 0; j < 20; j++) {
-        await wait(200);
-        if (!ADAPTER.inputHasContent()) return true;
-      }
+      if (await waitForSubmitAck(baseline, ADAPTER.name === "chatgpt" ? 8000 : 4000)) return true;
     }
+    const enterBaseline = captureSubmitAckBaseline(findSendButton());
     dispatchEnterSubmit(ADAPTER.getInputEl());
-    for (let j = 0; j < 15; j++) {
-      await wait(200);
-      if (!ADAPTER.inputHasContent()) return true;
-    }
+    if (await waitForSubmitAck(enterBaseline, 3000)) return true;
     return false;
   }
 
@@ -445,17 +481,13 @@ const H2W_CONTENT_VERSION = "0.1.63";
     for (let attempt = 0; attempt < 3; attempt++) {
       const btn = findSendButton();
       if (isSendButton(btn)) {
+        const baseline = captureSubmitAckBaseline(btn);
         btn.click();
-        for (let j = 0; j < 20; j++) {
-          await wait(200);
-          if (!ADAPTER.inputHasContent()) return true;
-        }
+        if (await waitForSubmitAck(baseline, ADAPTER.name === "chatgpt" ? 8000 : 4000)) return true;
       }
+      const enterBaseline = captureSubmitAckBaseline(findSendButton());
       dispatchEnterSubmit(ADAPTER.getInputEl());
-      for (let j = 0; j < 15; j++) {
-        await wait(200);
-        if (!ADAPTER.inputHasContent()) return true;
-      }
+      if (await waitForSubmitAck(enterBaseline, 3000)) return true;
       if (attempt < 2) {
         console.warn(`[h2w] textarea submit attempt ${attempt + 1} failed; retrying`);
         await wait(800);
@@ -474,22 +506,18 @@ const H2W_CONTENT_VERSION = "0.1.63";
         for (let i = 0; i < 40; i++) {
           const btn = findSendButton();
           if (isSendButton(btn)) {
+            const baseline = captureSubmitAckBaseline(btn);
             btn.click();
-            for (let j = 0; j < 20; j++) {
-              await wait(200);
-              if (!ADAPTER.inputHasContent()) return true;
-            }
+            if (await waitForSubmitAck(baseline, ADAPTER.name === "chatgpt" ? 8000 : 4000)) return true;
             console.warn("[h2w] composer still has content after Send click; retrying");
             break;
           }
           await wait(150);
         }
         const el = ADAPTER.getInputEl();
+        const enterBaseline = captureSubmitAckBaseline(findSendButton());
         dispatchEnterSubmit(el);
-        for (let j = 0; j < 15; j++) {
-          await wait(200);
-          if (!ADAPTER.inputHasContent()) return true;
-        }
+        if (await waitForSubmitAck(enterBaseline, 3000)) return true;
         if (attempt < 2) {
           console.warn(`[h2w] submit attempt ${attempt + 1} failed; retrying`);
           await wait(800);
