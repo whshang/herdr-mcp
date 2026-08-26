@@ -23,6 +23,10 @@ Herdr MCP 本地产品重构为 Rust 原生单一运行时。Rust 不只是 supe
 
 Cloudflare Worker 和浏览器扩展继续使用 TypeScript/JavaScript，因为它们属于不同运行环境。
 
+### Lifecycle one-shot 安全约束
+
+service / update / native-host 的破坏性 lifecycle mutation **禁止使用 `launchctl submit`**。inferred launchd job 可能在命令退出后继续 replay，从而重复消费 rollback 或重复执行其他非幂等 mutation。独立执行时使用受管 lifecycle 路径；确需 launchd one-shot job 时，必须使用显式 plist，并设置 `RunAtLoad=true`、`KeepAlive=false`。
+
 ## 不采用长期双 runtime
 
 不保留长期架构：

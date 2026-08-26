@@ -83,6 +83,8 @@ bin/herdr-runtime-generation remove --generation candidate-<id>
 
 Start with `status` before any upgrade or rollback. Do not infer the active runtime from an old deployment log.
 
+Lifecycle mutations must never use `launchctl submit`. An inferred launchd job may replay after the command exits, so a destructive rollback/update can run more than once. Use the managed lifecycle command directly from an independent process, or an explicit one-shot plist with `RunAtLoad=true` and `KeepAlive=false`.
+
 ## Activation gate
 
 A candidate becomes active only after validation:

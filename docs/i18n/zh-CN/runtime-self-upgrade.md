@@ -94,6 +94,8 @@ bin/herdr-runtime-generation remove \
   --generation candidate-<id>
 ```
 
+生命周期 mutation 禁止使用 `launchctl submit`。launchd 的 inferred job 可能在命令退出后继续 replay，导致 rollback/update 等破坏性操作重复执行。需要独立进程时使用受管 lifecycle 命令；确需 launchd one-shot job 时，必须使用显式 plist，并设置 `RunAtLoad=true`、`KeepAlive=false`。
+
 `status` 是第一入口。任何升级/回滚前都应该先知道：
 
 - desired active；
