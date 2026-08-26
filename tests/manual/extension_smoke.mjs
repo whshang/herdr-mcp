@@ -124,6 +124,13 @@ ok(wakeSource.includes('regenerate-thread-error-button')
     && wakeSource.includes("thread_error_server_ahead")
     && wakeSource.includes("thread_error_delivery_unknown"),
   "ChatGPT explicit send-timeout cards retry once or safely reload before generic recovery");
+ok(wakeSource.includes("captureSubmitAckBaseline")
+    && wakeSource.includes("waitForSubmitAck")
+    && wakeSource.includes("!baseline.sendButton.isConnected || !isSendButton(baseline.sendButton)")
+    && wakeSource.includes('latestTurnForRole("user")')
+    && wakeSource.includes("latestUser !== baseline?.userTurn")
+    && wakeSource.includes('ADAPTER.name === "chatgpt" ? 8000 : 4000'),
+  "ChatGPT submit acknowledgement accepts the Send-button transition or matching new user turn before ProseMirror clears");
 ok(wakeSource.includes("maybeRecoverDisconnectedReply")
     && wakeSource.includes("连接已中断")
     && wakeSource.includes("waiting for (?:the )?full response")
