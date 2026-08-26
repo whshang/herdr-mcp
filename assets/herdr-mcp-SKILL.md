@@ -97,14 +97,14 @@ The production Rust server is supervised by macOS launchd as `dev.herdr-mcp.serv
 
 `agent_status_wait_timeout` and snapshot `TaskGroup`/`ExceptionGroup` failures are bounded wait/snapshot transients; they are **not** evidence that the workstation is offline and are not permission to replay a mutation. Use the reconnect sequence below for actual control-plane connectivity failures such as `workstation_offline`, `herdr_transport`, connection refused, or a missing/unreachable Herdr socket.
 
-When a real control-plane connectivity failure occurs during the current web-model turn, assume launchd/watchdog supervision may recover it and perform at most three **read-only** recovery checks. Do not replay the failed mutation while waiting:
+When a real control-plane connectivity failure occurs during the current web-model turn, assume launchd/watchdog supervision may recover it and perform exactly three **read-only** reconnect attempts. Do not replay the failed mutation while waiting:
 
-1. Perform one **immediate** read-only recovery check with `herdr_inspect` (or `herdr_since` when a saved cursor is appropriate).
-2. If still unavailable, wait about **3 seconds**, then perform the second read-only recovery check.
-3. If still unavailable, wait about **7 seconds**, then perform the third and final read-only recovery check. Tool/network timeout spent on these checks counts toward the same bounded window; the intended current-turn recovery budget is roughly **15–20 seconds total**, not an unbounded poll loop.
+1. Wait about **5 seconds**, then call `herdr_inspect` (or another read-only connection check).
+2. If still unavailable, wait about **10 seconds**, then perform the second read-only check.
+3. If still unavailable, wait about **20 seconds**, then perform the third and final read-only check. Stop after these three retries; the intended current-turn recovery window is roughly **35 seconds**, long enough to span the health watchdog's default two 15-second observations without becoming an unbounded poll loop.
 4. Compare the recovered `workstation_info.boot_id`, runtime PID/start time, and runtime generation with the identities saved before the outage. If `boot_id` changed or `cursor_reset=true`, discard the old incremental cursor and resynchronize from `herdr_since(cursor=0)` plus live workspace/agent/Git/runtime state before making another mutation.
 5. If a mutating call returned a transport/control-plane timeout or otherwise has uncertain delivery/outcome, **never blindly resend it**. After connectivity returns, inspect relevant evidence first: `herdr_inspect`/`herdr_since`, Git status/log/diff, runtime/service status, agent state, or the target resource. Reissue only when that evidence proves the mutation was not applied; reuse the same `idempotency_key` for `herdr_prompt` when replay is justified.
-6. After the bounded three-check recovery window still fails, stop Herdr mutations for this turn and report the outage. The operator recovery command for the managed Rust runtime is:
+6. After the bounded three-retry recovery window still fails, stop Herdr mutations for this turn and report the outage. The operator recovery command for the managed Rust runtime is:
 
 ```bash
 "$HOME/.config/herdr-mcp/runtime/current/herdr-mcp" service restart && \

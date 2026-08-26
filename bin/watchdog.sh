@@ -10,21 +10,21 @@ set -euo pipefail
 CFG_DIR="${HERDR_MCP_CONFIG_DIR:-$HOME/.config/herdr-mcp}"
 STATE_FILE="$CFG_DIR/watchdog.state.json"
 LOG_FILE="$CFG_DIR/watchdog.log"
-PLIST_WATCH="$HOME/Library/LaunchAgents/dev.herdr-mcp.watchdog.plist"
+PLIST_WATCH="$HOME/Library/LaunchAgents/dev.herdr-mcp.health-watchdog.plist"
 LABEL_SERVER="dev.herdr-mcp.server"
-LABEL_WATCH="dev.herdr-mcp.watchdog"
+LABEL_WATCH="dev.herdr-mcp.health-watchdog"
 RUNTIME_BIN="${HERDR_MCP_RUNTIME_BIN:-$HOME/.config/herdr-mcp/runtime/current/herdr-mcp}"
 HEALTH_URL="http://127.0.0.1:8772/health"
 LAUNCHCTL_BIN="${HERDR_MCP_LAUNCHCTL_BIN:-/bin/launchctl}"
-CURL_BIN="${HERDR_MCP_CURL_BIN:-curl}"
-LSOF_BIN="${HERDR_MCP_LSOF_BIN:-lsof}"
+CURL_BIN="${HERDR_MCP_CURL_BIN:-/usr/bin/curl}"
+LSOF_BIN="${HERDR_MCP_LSOF_BIN:-/usr/sbin/lsof}"
 
-# Two failed probes at five-second cadence lets the health-recovery path act
-# inside the remote planner's bounded ~15-20s reconnect window while ensuring
-# one transient probe can never trigger a restart.
+# Two failed probes at 15-second cadence fit inside the remote planner's
+# bounded ~35s reconnect window while ensuring one transient probe can never
+# trigger a restart.
 FAIL_THRESHOLD="${HERDR_MCP_WATCHDOG_FAIL_THRESHOLD:-2}"
 RESTART_COOLDOWN_SEC="${HERDR_MCP_WATCHDOG_COOLDOWN_SEC:-60}"
-INTERVAL_SEC="${HERDR_MCP_WATCHDOG_INTERVAL_SEC:-5}"
+INTERVAL_SEC="${HERDR_MCP_WATCHDOG_INTERVAL_SEC:-15}"
 HEALTH_TIMEOUT_SEC="${HERDR_MCP_WATCHDOG_HEALTH_TIMEOUT_SEC:-2}"
 
 mkdir -p "$CFG_DIR"
@@ -56,7 +56,11 @@ health_code() {
 service_mutation_active() {
   local lock="$CFG_DIR/service-mutation.lock"
   [[ -e "$lock" ]] || return 1
-  "$LSOF_BIN" "$lock" >/dev/null 2>&1
+  # The lock file is persistent. Normally lsof distinguishes an active holder
+  # from an idle file; if the probe itself is unavailable, suppress recovery
+  # rather than risking a kickstart during a legitimate service mutation.
+  [[ -x "$LSOF_BIN" ]] || return 0
+  "$LSOF_BIN" -t "$lock" >/dev/null 2>&1
 }
 
 update_active() {
@@ -69,7 +73,7 @@ try:
  d=json.load(sys.stdin); print(((d.get("job") or {}).get("state") or "").lower())
 except Exception: print("")' 2>/dev/null)"
   case "$state" in
-    installing|applying|activating|restarting|rolling_back|recovering|running|pending) return 0 ;;
+    queued|installing) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -88,7 +92,7 @@ except Exception:
 PY
 )"
     case "$state" in
-      watching|ready|mutating|restoring|recovering|pending) return 0 ;;
+      armed|watching|recovering) return 0 ;;
     esac
   done < <(find "$CFG_DIR/guardians" -mindepth 2 -maxdepth 2 -name transaction.json -type f 2>/dev/null || true)
   return 1
@@ -168,12 +172,13 @@ if os.path.exists(path):
     except Exception: state = {}
 now = int(time.time())
 state["updated_at"] = now
+state["last_restart_at"] = now
 if result == "ok":
-    state["last_restart_at"] = now
     state["restarts_total"] = int(state.get("restarts_total") or 0) + 1
     state["consecutive_fail"] = 0
     state["last_action"] = "kickstart"
 else:
+    state["consecutive_fail"] = 0
     state["last_action"] = "kickstart_failed"
 with open(path, "w") as fh:
     json.dump(state, fh, indent=2); fh.write("\n")
@@ -185,15 +190,26 @@ run_once() {
   if server_loaded; then
     loaded=1
     code="$(health_code)"
-    suppression="$(lifecycle_suppression_reason)"
   fi
 
-  decision="$(update_state_and_decide "$loaded" "$code" "$suppression")"
-
   if [[ "$loaded" != "1" ]]; then
+    update_state_and_decide "0" "000" "none" >/dev/null
     log_line "server stopped/unloaded; watchdog will not start it"
     return 0
   fi
+
+  if [[ "$code" == "200" ]]; then
+    update_state_and_decide "1" "$code" "none" >/dev/null
+    log_line "check server=loaded health=200"
+    return 0
+  fi
+
+  # Only an unhealthy observation needs lifecycle suppression probes. This
+  # keeps the healthy 15-second path cheap and prevents a legitimate update,
+  # rollback, or service mutation from contributing to the failure counter.
+  suppression="$(lifecycle_suppression_reason)"
+  decision="$(update_state_and_decide "$loaded" "$code" "$suppression")"
+
   if [[ "$suppression" != "none" ]]; then
     log_line "health recovery suppressed: $suppression"
     return 0
@@ -245,10 +261,13 @@ cmd_status() {
 
 cmd_install() {
   local source_bin runtime_bin
-  source_bin="${BASH_SOURCE[0]}"
+  source_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   runtime_bin="$CFG_DIR/watchdog.sh"
   mkdir -p "$CFG_DIR"
-  cp "$source_bin" "$runtime_bin"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  if [[ "$source_bin" != "$runtime_bin" ]]; then
+    cp "$source_bin" "$runtime_bin"
+  fi
   chmod 700 "$runtime_bin"
   cat >"$PLIST_WATCH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -271,16 +290,16 @@ cmd_install() {
 </plist>
 EOF
   "$LAUNCHCTL_BIN" bootout "$(watchdog_target)" >/dev/null 2>&1 || true
-  "$LAUNCHCTL_BIN" bootstrap "gui/$(id -u)" "$PLIST_WATCH"
   "$LAUNCHCTL_BIN" enable "$(watchdog_target)"
+  "$LAUNCHCTL_BIN" bootstrap "gui/$(id -u)" "$PLIST_WATCH"
   log_line "watchdog installed: every ${INTERVAL_SEC}s -> $PLIST_WATCH"
   echo "installed: $PLIST_WATCH (interval ${INTERVAL_SEC}s)"
 }
 
 cmd_uninstall() {
-  "$LAUNCHCTL_BIN" disable "$(watchdog_target)" >/dev/null 2>&1 || true
   "$LAUNCHCTL_BIN" bootout "$(watchdog_target)" >/dev/null 2>&1 || true
-  rm -f "$PLIST_WATCH" "$CFG_DIR/watchdog.sh"
+  "$LAUNCHCTL_BIN" disable "$(watchdog_target)" >/dev/null 2>&1 || true
+  rm -f "$PLIST_WATCH" "$CFG_DIR/watchdog.sh" "$STATE_FILE"
   log_line "watchdog uninstalled"
   echo "uninstalled"
 }

@@ -92,7 +92,9 @@ function runOnce(harness, extraEnv = {}) {
 
 test('watchdog pins the managed Rust service and removes Node process heuristics', async () => {
   assert.ok(script.includes('LABEL_SERVER="dev.herdr-mcp.server"'));
-  assert.ok(script.includes('LABEL_WATCH="dev.herdr-mcp.watchdog"'));
+  assert.ok(script.includes('LABEL_WATCH="dev.herdr-mcp.health-watchdog"'));
+  assert.ok(script.includes('dev.herdr-mcp.health-watchdog.plist'));
+  assert.doesNotMatch(script, /LABEL_WATCH="dev\.herdr-mcp\.watchdog"/);
   assert.ok(script.includes('HERDR_MCP_RUNTIME_BIN:-$HOME/.config/herdr-mcp/runtime/current/herdr-mcp'));
   assert.ok(script.includes('HEALTH_URL="http://127.0.0.1:8772/health"'));
   assert.doesNotMatch(script, /dist\/server\.js/);
@@ -107,14 +109,15 @@ test('watchdog pins the managed Rust service and removes Node process heuristics
 test('watchdog defaults are bounded for in-turn recovery', () => {
   assert.ok(script.includes('HERDR_MCP_WATCHDOG_FAIL_THRESHOLD:-2'));
   assert.ok(script.includes('HERDR_MCP_WATCHDOG_COOLDOWN_SEC:-60'));
-  assert.ok(script.includes('HERDR_MCP_WATCHDOG_INTERVAL_SEC:-5'));
+  assert.ok(script.includes('HERDR_MCP_WATCHDOG_INTERVAL_SEC:-15'));
   assert.ok(script.includes('HERDR_MCP_WATCHDOG_HEALTH_TIMEOUT_SEC:-2'));
   assert.ok(script.includes('--connect-timeout 1'));
+  assert.ok(script.includes('HERDR_MCP_LSOF_BIN:-/usr/sbin/lsof'));
 });
 
 test('watchdog launchd install is periodic one-shot and does not KeepAlive-loop itself', () => {
   assert.ok(script.includes('runtime_bin="$CFG_DIR/watchdog.sh"'));
-  assert.ok(script.includes('source_bin="${BASH_SOURCE[0]}"'));
+  assert.match(script, /source_bin="\$\(cd .*BASH_SOURCE\[0\].*basename .*BASH_SOURCE\[0\]/s);
   assert.ok(script.includes('cp "$source_bin" "$runtime_bin"'));
   assert.ok(script.includes('chmod 700 "$runtime_bin"'));
   assert.ok(script.includes('<key>StartInterval</key>'));
@@ -173,8 +176,11 @@ test('explicit stop racing the final health decision wins before kickstart', asy
 test('legitimate lifecycle activity suppresses health recovery', async () => {
   const cases = [
     [{ mutationActive: true }, 'mutation_active'],
+    [{ updateState: 'queued' }, 'update_active'],
     [{ updateState: 'installing' }, 'update_active'],
+    [{ guardianState: 'armed' }, 'guardian_active'],
     [{ guardianState: 'watching' }, 'guardian_active'],
+    [{ guardianState: 'recovering' }, 'guardian_active'],
   ];
   for (const [options, reason] of cases) {
     const harness = await makeHarness({ loaded: true, healthCode: '503', ...options });
@@ -205,17 +211,17 @@ test('restart cooldown prevents repeated kickstarts', async () => {
 test('herdr_skill policy pins bounded outage recovery and uncertain-mutation safety', () => {
   assert.match(plannerSkill, /RunAtLoad=true/);
   assert.match(plannerSkill, /KeepAlive=true/);
-  assert.match(plannerSkill, /dev\.herdr-mcp\.watchdog/);
-  assert.match(plannerSkill, /\*\*immediate\*\*.*read-only recovery check/s);
-  assert.match(plannerSkill, /about \*\*3 seconds\*\*/);
-  assert.match(plannerSkill, /about \*\*7 seconds\*\*/);
-  assert.match(plannerSkill, /roughly \*\*15–20 seconds total\*\*/);
-  assert.match(plannerSkill, /at most three \*\*read-only\*\* recovery checks/);
+  assert.match(plannerSkill, /dev\.herdr-mcp\.health-watchdog/);
+  assert.match(plannerSkill, /historical `dev\.herdr-mcp\.watchdog` identity/);
+  assert.match(plannerSkill, /about \*\*5 seconds\*\*/);
+  assert.match(plannerSkill, /about \*\*10 seconds\*\*/);
+  assert.match(plannerSkill, /about \*\*20 seconds\*\*/);
+  assert.match(plannerSkill, /roughly \*\*35 seconds\*\*/);
+  assert.match(plannerSkill, /exactly three \*\*read-only\*\* reconnect attempts/);
   assert.match(plannerSkill, /agent_status_wait_timeout.*not.*offline/s);
   assert.match(plannerSkill, /\*\*never blindly resend it\*\*/);
   assert.match(plannerSkill, /workstation_info\.boot_id.*herdr_since\(cursor=0\)/s);
   assert.match(plannerSkill, /service restart/);
-  assert.doesNotMatch(plannerSkill, /5 seconds.*10 seconds.*20 seconds|35 seconds|~35s/s);
 });
 
 test('CLI still delegates Rust service lifecycle to the active runtime', () => {
