@@ -91,21 +91,43 @@ Preferred release flow:
 
 For development of an uncommitted working tree, `herdr-self-update apply --source working-tree` may stage the current tree into an isolated release directory. For normal unattended upgrades use the committed remote source (`--source remote --ref main` or a release/tag).
 
-## 6. CI/CD boundaries
+## 6. Control-plane outage recovery
+
+The production Rust server is supervised by macOS launchd as `dev.herdr-mcp.server` with `RunAtLoad=true` and `KeepAlive=true`, so a crashed process is normally relaunched automatically. The periodic `dev.herdr-mcp.health-watchdog` covers a separate case: the server job remains loaded but repeated loopback `/health` checks fail. This health sidecar deliberately does **not** reuse the historical `dev.herdr-mcp.watchdog` identity, which the Rust service manager reserves for legacy Node-watchdog adoption/rollback. The health watchdog only `kickstart -k`s that already-loaded job after consecutive failures and a cooldown; if the server job has been explicitly unloaded by `service stop`/uninstall, the health watchdog resets its failure state and **must not** bootstrap or restart it.
+
+`agent_status_wait_timeout` and snapshot `TaskGroup`/`ExceptionGroup` failures are bounded wait/snapshot transients; they are **not** evidence that the workstation is offline and are not permission to replay a mutation. Use the reconnect sequence below for actual control-plane connectivity failures such as `workstation_offline`, `herdr_transport`, connection refused, or a missing/unreachable Herdr socket.
+
+When a real control-plane connectivity failure occurs during the current web-model turn, assume launchd/watchdog supervision may recover it and perform at most three **read-only** recovery checks. Do not replay the failed mutation while waiting:
+
+1. Perform one **immediate** read-only recovery check with `herdr_inspect` (or `herdr_since` when a saved cursor is appropriate).
+2. If still unavailable, wait about **3 seconds**, then perform the second read-only recovery check.
+3. If still unavailable, wait about **7 seconds**, then perform the third and final read-only recovery check. Tool/network timeout spent on these checks counts toward the same bounded window; the intended current-turn recovery budget is roughly **15–20 seconds total**, not an unbounded poll loop.
+4. Compare the recovered `workstation_info.boot_id`, runtime PID/start time, and runtime generation with the identities saved before the outage. If `boot_id` changed or `cursor_reset=true`, discard the old incremental cursor and resynchronize from `herdr_since(cursor=0)` plus live workspace/agent/Git/runtime state before making another mutation.
+5. If a mutating call returned a transport/control-plane timeout or otherwise has uncertain delivery/outcome, **never blindly resend it**. After connectivity returns, inspect relevant evidence first: `herdr_inspect`/`herdr_since`, Git status/log/diff, runtime/service status, agent state, or the target resource. Reissue only when that evidence proves the mutation was not applied; reuse the same `idempotency_key` for `herdr_prompt` when replay is justified.
+6. After the bounded three-check recovery window still fails, stop Herdr mutations for this turn and report the outage. The operator recovery command for the managed Rust runtime is:
+
+```bash
+"$HOME/.config/herdr-mcp/runtime/current/herdr-mcp" service restart && \
+"$HOME/.config/herdr-mcp/runtime/current/herdr-mcp" service status
+```
+
+Do not silently substitute local container/shell work for an unavailable Herdr workstation when the task depends on that workstation.
+
+## 7. CI/CD boundaries
 
 - Pull requests and pushes must run build, root tests, Edge/contract tests and extension smoke.
 - GitHub Pages is static documentation/product surface only; it does not carry credentials.
 - Cloudflare production deployment runs only after the Edge/contract gate and uses a GitHub `production` Environment with a least-privilege Workers token. The workflow must never require DNS/Tunnel/Admin permission.
 - Runtime self-update and Cloudflare Edge deploy are intentionally separate release planes.
 
-## 7. Browser extension boundary
+## 8. Browser extension boundary
 
 The browser extension is the reverse/wake channel and stays on the local machine. Current installs send bounded request/stream messages to the registered Chrome Native Messaging host, which reaches herdr-mcp through `~/.config/herdr-mcp/extension.sock` (mode `0600`). The browser receives and stores no Herdr bearer. Static `HERDR_MCP_TOKEN` remains for other local clients and for the native host's old-runtime HTTP fallback only. The extension does not need the public Worker/OAuth URL. Do not route extension traffic through Cloudflare merely because the Connector uses Cloudflare.
 
-## 8. Native Herdr reference
+## 9. Native Herdr reference
 
 The installed `herdr --skill` is useful as **release-matched native Herdr reference material** for pane/workspace/agent concepts and CLI semantics. Its `HERDR_ENV=1` / "stop when outside Herdr" rule applies to pane-local agents, not to this remote MCP planner. For remote calls, the installed socket schema returned by `herdr_methods` is authoritative.
 
-## 9. Completion discipline
+## 10. Completion discipline
 
 For operational changes, do not declare success from code or unit tests alone. Verify the relevant real boundary: local runtime, persistent Link, Edge status, browser extension smoke, GitHub workflow syntax, or public endpoint as appropriate. Keep rollback evidence until the replacement path has been proven from the same client that matters.
