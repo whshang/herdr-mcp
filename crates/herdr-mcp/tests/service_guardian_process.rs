@@ -177,7 +177,9 @@ fn guardian_real_exec_inherits_pipe_and_lock_until_committed_hup() {
     drop(read_signal);
     drop(lock);
 
-    wait_for_state(&transaction, "watching", Duration::from_secs(3));
+    // Production waits up to 5s before any destructive service mutation.
+    // Keep one extra second here for test-runner scheduling and process startup.
+    wait_for_state(&transaction, "watching", Duration::from_secs(6));
     assert!(
         child.try_wait().unwrap().is_none(),
         "guardian exited before parent settlement"
