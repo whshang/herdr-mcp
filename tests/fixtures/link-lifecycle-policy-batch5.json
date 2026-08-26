@@ -1,0 +1,226 @@
+{
+  "schema_version": 1,
+  "_notes": {
+    "purpose": "Shared deterministic vectors for herdr-mcp Relay/link Batch 5: pure lifecycle/policy parity for the workstation-side herdr-link client. Covers (1) ConnectionPhase set/order/representative high-level transitions, (2) hello_ack refusal classification, (3) socket-close policy, (4) reconnect-cap vectors, and (5) heartbeat/silence pure vectors.",
+    "oracle_convention": "`oracle: node_parity` means the case is directly executable against the existing TypeScript/Node implementation (src/link/client.ts) and must match it exactly. All cases here are node_parity.",
+    "fatal_convention": "`fatal` is the boolean the client uses to decide reconnect vs stop. For hello_ack refusals it is `classifyFatalCode(code) !== \"fatal_error\"`; handshake_timeout is emitted directly with fatal:false. `reconnect` is the inverse of fatal for these vectors.",
+    "no_secrets": "All tokens/endpoints are synthetic test values; no real credentials."
+  },
+  "connection_phases": {
+    "set": ["idle", "connecting", "handshake", "online", "reconnecting", "closing", "closed"],
+    "order": ["idle", "connecting", "handshake", "online", "reconnecting", "closing", "closed"],
+    "transitions": [
+      { "from": "idle", "to": "connecting", "via": "start() begins the run loop" },
+      { "from": "connecting", "to": "handshake", "via": "socket open event" },
+      { "from": "handshake", "to": "online", "via": "hello_ack ok:true" },
+      { "from": "online", "to": "reconnecting", "via": "socket dropped (non-fatal close)" },
+      { "from": "reconnecting", "to": "connecting", "via": "backoff delay elapses, next attempt" },
+      { "from": "reconnecting", "to": "closing", "via": "close() during backoff wait" },
+      { "from": "online", "to": "closing", "via": "graceful close()" },
+      { "from": "closing", "to": "closed", "via": "socket closed after drain" },
+      { "from": "handshake", "to": "closed", "via": "fatal hello_ack refusal (auth/contract)" },
+      { "from": "connecting", "to": "reconnecting", "via": "socket closes before open (retryable drop)" },
+      { "from": "online", "to": "closed", "via": "fatal close (superseded/auth)" }
+    ]
+  },
+  "hello_ack_classification": [
+    {
+      "name": "auth_rejected is fatal auth_rejected, no reconnect",
+      "oracle": "node_parity",
+      "code": "auth_rejected",
+      "classify": "auth_rejected",
+      "fatal": true,
+      "reconnect": false
+    },
+    {
+      "name": "auth_expired is fatal auth_rejected, no reconnect",
+      "oracle": "node_parity",
+      "code": "auth_expired",
+      "classify": "auth_rejected",
+      "fatal": true,
+      "reconnect": false
+    },
+    {
+      "name": "session_invalid is fatal auth_rejected, no reconnect",
+      "oracle": "node_parity",
+      "code": "session_invalid",
+      "classify": "auth_rejected",
+      "fatal": true,
+      "reconnect": false
+    },
+    {
+      "name": "contract_mismatch is fatal contract_rejected, no reconnect",
+      "oracle": "node_parity",
+      "code": "contract_mismatch",
+      "classify": "contract_rejected",
+      "fatal": true,
+      "reconnect": false
+    },
+    {
+      "name": "contract_rejected is fatal contract_rejected, no reconnect",
+      "oracle": "node_parity",
+      "code": "contract_rejected",
+      "classify": "contract_rejected",
+      "fatal": true,
+      "reconnect": false
+    },
+    {
+      "name": "protocol_incompatible is fatal contract_rejected, no reconnect",
+      "oracle": "node_parity",
+      "code": "protocol_incompatible",
+      "classify": "contract_rejected",
+      "fatal": true,
+      "reconnect": false
+    },
+    {
+      "name": "internal_error classifies fatal_error but is treated non-fatal (retryable drop)",
+      "oracle": "node_parity",
+      "code": "internal_error",
+      "classify": "fatal_error",
+      "fatal": false,
+      "reconnect": true
+    },
+    {
+      "name": "unknown code classifies fatal_error but is treated non-fatal (retryable drop)",
+      "oracle": "node_parity",
+      "code": "edge_hiccup",
+      "classify": "fatal_error",
+      "fatal": false,
+      "reconnect": true
+    },
+    {
+      "name": "handshake_timeout is retryable (emitted fatal:false directly)",
+      "oracle": "node_parity",
+      "code": "handshake_timeout",
+      "classify": "fatal_error",
+      "fatal": false,
+      "reconnect": true
+    }
+  ],
+  "socket_close_policy": [
+    {
+      "name": "4409 superseded is fatal, no reconnect",
+      "oracle": "node_parity",
+      "code": 4409,
+      "exit_kind": "superseded",
+      "fatal": true,
+      "reconnect": false
+    },
+    {
+      "name": "1008 auth_rejected is fatal, no reconnect",
+      "oracle": "node_parity",
+      "code": 1008,
+      "exit_kind": "auth_rejected",
+      "fatal": true,
+      "reconnect": false
+    },
+    {
+      "name": "4401 auth_rejected is fatal, no reconnect",
+      "oracle": "node_parity",
+      "code": 4401,
+      "exit_kind": "auth_rejected",
+      "fatal": true,
+      "reconnect": false
+    },
+    {
+      "name": "4403 auth_rejected is fatal, no reconnect",
+      "oracle": "node_parity",
+      "code": 4403,
+      "exit_kind": "auth_rejected",
+      "fatal": true,
+      "reconnect": false
+    },
+    {
+      "name": "1000 normal close is dropped, reconnect",
+      "oracle": "node_parity",
+      "code": 1000,
+      "exit_kind": null,
+      "fatal": false,
+      "reconnect": true
+    },
+    {
+      "name": "1001 going away is dropped, reconnect",
+      "oracle": "node_parity",
+      "code": 1001,
+      "exit_kind": null,
+      "fatal": false,
+      "reconnect": true
+    },
+    {
+      "name": "1006 abnormal is dropped, reconnect",
+      "oracle": "node_parity",
+      "code": 1006,
+      "exit_kind": null,
+      "fatal": false,
+      "reconnect": true
+    },
+    {
+      "name": "4000 app close is dropped, reconnect",
+      "oracle": "node_parity",
+      "code": 4000,
+      "exit_kind": null,
+      "fatal": false,
+      "reconnect": true
+    }
+  ],
+  "reconnect_cap": [
+    {
+      "name": "null maxReconnectAttempts is unlimited",
+      "oracle": "node_parity",
+      "maxReconnectAttempts": null,
+      "expected_exit": null,
+      "observe_attempts": 3,
+      "note": "loop retries indefinitely; observe three reconnect attempts, then stop the test harness explicitly"
+    },
+    {
+      "name": "max=0 means no retry (max_reconnect after first attempt)",
+      "oracle": "node_parity",
+      "maxReconnectAttempts": 0,
+      "expected_exit": "max_reconnect",
+      "factory_calls": 1,
+      "note": "plannedAttempt=1 > 0 stops the loop before any retry"
+    },
+    {
+      "name": "max=1 allows exactly one retry",
+      "oracle": "node_parity",
+      "maxReconnectAttempts": 1,
+      "expected_exit": "max_reconnect",
+      "factory_calls": 2,
+      "note": "attempt 1 allowed; attempt 2 > 1 stops the loop"
+    },
+    {
+      "name": "attempt value after backoff.next()",
+      "oracle": "node_parity",
+      "maxReconnectAttempts": 3,
+      "expected_exit": "max_reconnect",
+      "factory_calls": 4,
+      "note": "attempts 1,2,3 allowed; attempt 4 > 3 stops; reconnect_attempt equals backoff.attempt"
+    }
+  ],
+  "heartbeat_silence": {
+    "heartbeat_gate": {
+      "note": "heartbeatTick sends only when phase=online AND not stopped AND socket open",
+      "conditions": [
+        { "phase": "online", "stopped": false, "socket_open": true, "should_heartbeat": true },
+        { "phase": "reconnecting", "stopped": false, "socket_open": true, "should_heartbeat": false },
+        { "phase": "handshake", "stopped": false, "socket_open": true, "should_heartbeat": false },
+        { "phase": "online", "stopped": true, "socket_open": true, "should_heartbeat": false },
+        { "phase": "online", "stopped": false, "socket_open": false, "should_heartbeat": false }
+      ]
+    },
+    "silence_interval": [
+      { "name": "heartbeatMs dominates when small", "heartbeatMs": 1000, "maxSilenceMs": 90000, "expected": 1000 },
+      { "name": "maxSilenceMs/3 dominates when smaller", "heartbeatMs": 30000, "maxSilenceMs": 90000, "expected": 30000 },
+      { "name": "maxSilenceMs/3 floor when heartbeat large", "heartbeatMs": 300000, "maxSilenceMs": 90000, "expected": 30000 },
+      { "name": "250ms floor when both tiny", "heartbeatMs": 100, "maxSilenceMs": 300, "expected": 250 },
+      { "name": "250ms floor when maxSilenceMs/3 below floor", "heartbeatMs": 1000, "maxSilenceMs": 300, "expected": 250 }
+    ],
+    "silence_expiry": [
+      { "name": "not expired within maxSilenceMs", "lastEdgeSeenMs": 1000, "connectedAtMs": 500, "now": 1000, "maxSilenceMs": 90000, "expired": false },
+      { "name": "not expired exactly at maxSilenceMs boundary (strict >)", "lastEdgeSeenMs": 1000, "connectedAtMs": 500, "now": 91000, "maxSilenceMs": 90000, "expired": false },
+      { "name": "expired just past maxSilenceMs", "lastEdgeSeenMs": 1000, "connectedAtMs": 500, "now": 91001, "maxSilenceMs": 90000, "expired": true },
+      { "name": "base falls back to connectedAtMs when lastEdgeSeenMs null", "lastEdgeSeenMs": null, "connectedAtMs": 5000, "now": 95001, "maxSilenceMs": 90000, "expired": true },
+      { "name": "base falls back to 0 when both null", "lastEdgeSeenMs": null, "connectedAtMs": null, "now": 90001, "maxSilenceMs": 90000, "expired": true }
+    ]
+  }
+}

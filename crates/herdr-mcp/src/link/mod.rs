@@ -16,3 +16,6 @@
 
 pub mod backoff;
 pub mod generation_fence;
+pub mod heartbeat;
+pub mod lifecycle;
+pub mod policy;
