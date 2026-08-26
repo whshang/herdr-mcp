@@ -1488,55 +1488,155 @@ console.log("\n[project handoff immediate-ready]");
     "immediate-ready commit switches the conversation target and preserves continuity");
 }
 
-// ---- Scenario 4: already-seeded fresh same-project recovery sends no second seed ---------------
-console.log("\n[project handoff already-seeded recovery]");
+// ---- Scenario 4: already-seeded same-project recovery sends no second seed ----------------
+// Keeps the REAL Project-scoped source binding, its source_bindings snapshot and
+// the original continuity chain, and uses the same already-navigated current tab
+// (source_tab_id === target_tab_id) already on the /g/{project}/c/{target} route.
+// Recovery must commit by switching only active_conv_key with zero extra seeds and
+// never mint a conversation-scoped binding.
+console.log("\n[project handoff already-seeded same-project recovery]");
 {
-  delete storage.herdrWakeBindings[`${PROJECT_KEY}::wH`];
-  delete storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`];
-  const tabId = 450;
+  const tabId = 456;
   const trId = "ht:test-already-seeded-recovery";
-  installContentScript(tabId, PROJECT_TARGET_URL, PROJECT_TARGET);
+  const originalContinuityId = "hc:test-already-seeded-original";
+  const sourceProjectBinding = {
+    convKey: PROJECT_KEY,
+    workspace_id: "wH",
+    workspace_label: "herdr-mcp (wH)",
+    binding_scope: "project",
+    project_id: PROJECT_ID,
+    active_conv_key: PROJECT_SOURCE,
+    continuity_id: originalContinuityId,
+    persistence: "explicit",
+    revision: "h2w:fixture-already-seeded",
+    created_at: Date.now() - 5000,
+    last_seen_at: Date.now() - 5000,
+  };
+  // Isolate: no leftover conversation-scoped bindings from prior scenarios.
+  delete storage.herdrWakeBindings[`${PROJECT_KEY}::wH`];
+  delete storage.herdrWakeBindings[`${PROJECT_SOURCE}::wH`];
+  delete storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`];
+  storage.herdrWakeBindings[`${PROJECT_KEY}::wH`] = sourceProjectBinding;
+
+  // The current tab has already been navigated to the materialized /g/.../c/{target}
+  // route and reports its seed confirmed. The target listener still counts any
+  // accidental re-seed so an over-eager replay is observable.
+  tabs.set(tabId, {
+    id: tabId,
+    url: PROJECT_TARGET_URL,
+    active: true,
+    listener: targetListener({ id: tabId, url: PROJECT_TARGET_URL }),
+  });
   tabs.get(tabId).active = true;
+  targetSeeded = true;
+  targetSeedCount = 0;
+  seedTemplateCaptures = [];
+  sourceProbeLooksSeeded = true;
+
   storage.herdrConversationTransfers = {
     ...(storage.herdrConversationTransfers || {}),
     [trId]: {
       id: trId,
+      version: 1,
       trigger: "manual",
       site: "chatgpt",
       project_id: PROJECT_ID,
-      source_tab_id: 448,
-      target_tab_id: tabId,
+      source_tab_id: tabId,
+      target_tab_id: tabId, // current-tab handoff: target IS the source tab
       source_conv_key: PROJECT_SOURCE,
       handoff_launch_url: PROJECT_KEY,
       handoff_text: [
         `<<<HERDR_HANDOFF_V1 id=${trId}>>>`,
-        "Already-seeded fixture.",
+        "Already-seeded same-project fixture.",
         "<<<END_HERDR_HANDOFF_V1>>>",
       ].join("\n"),
+      continuity_id: originalContinuityId,
+      source_bindings: [{
+        workspace_id: "wH",
+        revision: sourceProjectBinding.revision,
+      }],
       status: "seed_uncertain",
       created_at: Date.now() - 1000,
       updated_at: Date.now() - 1000,
     },
   };
-  targetSeeded = true;
-  handoffSeedMode = "confirmed";
-  sourceProbeLooksSeeded = true;
-  targetSeedCount = 0;
-  seedTemplateCaptures = [];
-  // Recover by opening exactly the already-seeded conversation path.
+
   let resolveStart;
   const startP = new Promise((r) => { resolveStart = r; });
   onMsg({ type: "h2w_handoff_start", tabId, trigger: "manual" }, { tab: { id: tabId, url: PROJECT_TARGET_URL } }, (r) => resolveStart(r));
   const started = await startP;
-  ok(started?.ok === true, "already-seeded recovery resumes", JSON.stringify(started));
+  ok(started?.ok === true, "already-seeded same-project recovery resumes", JSON.stringify(started));
   await waitForTest(() => storage.herdrConversationTransfers[trId]?.status === "committed");
   ok(storage.herdrConversationTransfers[trId]?.status === "committed",
-    "already-seeded recovery commits without another seed");
+    "already-seeded same-project recovery commits without another seed");
   ok(targetSeedCount === 0 && seedTemplateCaptures.length === 0,
-    "already-seeded recovery sends zero additional seeds");
+    "already-seeded same-project recovery sends zero additional seeds");
   ok(storage.herdrConversationTransfers[trId]?.target_conv_key === PROJECT_TARGET
       && storage.herdrConversationTransfers[trId]?.target_tab_id === tabId,
-    "already-seeded recovery adopts the already-materialized target conversation");
+    "already-seeded same-project recovery adopts the already-materialized target");
+  ok(storage.herdrWakeBindings[`${PROJECT_KEY}::wH`]?.active_conv_key === PROJECT_TARGET,
+    "commit switches only the active conversation target");
+  ok(storage.herdrWakeBindings[`${PROJECT_KEY}::wH`]?.continuity_id === originalContinuityId,
+    "commit preserves the original Project continuity chain");
+  ok(!storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`]
+      && !storage.herdrWakeBindings[`${PROJECT_SOURCE}::wH`],
+    "commit never creates a conversation-scoped binding");
+  sourceProbeLooksSeeded = false;
+
+  // ---- Negative guard: a target that still reports the source conversation must NOT commit ----
+  const negTabId = 457;
+  const negTrId = "ht:test-target-is-source-neg";
+  delete storage.herdrWakeBindings[`${PROJECT_KEY}::wH`];
+  delete storage.herdrWakeBindings[`${PROJECT_SOURCE}::wH`];
+  delete storage.herdrWakeBindings[`${PROJECT_TARGET}::wH`];
+  storage.herdrWakeBindings[`${PROJECT_KEY}::wH`] = { ...sourceProjectBinding };
+  // The tab claims its seed is confirmed but only for the SOURCE conversation.
+  installContentScript(negTabId, PROJECT_TARGET_URL, PROJECT_SOURCE);
+  tabs.get(negTabId).active = true;
+  sourceProbeLooksSeeded = true;
+  targetSeedCount = 0;
+  seedTemplateCaptures = [];
+  storage.herdrConversationTransfers = {
+    ...(storage.herdrConversationTransfers || {}),
+    [negTrId]: {
+      id: negTrId,
+      version: 1,
+      trigger: "manual",
+      site: "chatgpt",
+      project_id: PROJECT_ID,
+      source_tab_id: negTabId,
+      target_tab_id: negTabId,
+      source_conv_key: PROJECT_SOURCE,
+      handoff_launch_url: PROJECT_KEY,
+      handoff_text: [
+        `<<<HERDR_HANDOFF_V1 id=${negTrId}>>>`,
+        "target-is-source negative fixture.",
+        "<<<END_HERDR_HANDOFF_V1>>>",
+      ].join("\n"),
+      continuity_id: originalContinuityId,
+      source_bindings: [{
+        workspace_id: "wH",
+        revision: sourceProjectBinding.revision,
+      }],
+      status: "seed_uncertain",
+      created_at: Date.now() - 1000,
+      updated_at: Date.now() - 1000,
+    },
+  };
+  let resolveNeg;
+  const negP = new Promise((r) => { resolveNeg = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: negTabId, trigger: "manual" }, { tab: { id: negTabId, url: PROJECT_TARGET_URL } }, (r) => resolveNeg(r));
+  const neg = await negP;
+  ok(neg?.ok === false && neg?.error === "target_is_source",
+    "recovery refuses a target that equals the source", JSON.stringify(neg));
+  ok(storage.herdrConversationTransfers[negTrId]?.status !== "committed",
+    "target-is-source transfer is never committed");
+  ok(storage.herdrWakeBindings[`${PROJECT_KEY}::wH`]?.active_conv_key === PROJECT_SOURCE,
+    "target-is-source leaves the active conversation target unchanged");
+  ok(targetSeedCount === 0 && seedTemplateCaptures.length === 0,
+    "target-is-source sends zero seeds");
+  delete storage.herdrConversationTransfers[negTrId];
+  delete storage.herdrWakeBindings[`${PROJECT_KEY}::wH`];
   sourceProbeLooksSeeded = false;
 }
 

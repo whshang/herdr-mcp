@@ -19,7 +19,7 @@
     "build:site": "node scripts/build-site.mjs",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
-    "test": "node --test \"tests/*.test.mjs\"",
+    "test": "node --test \"tests/*.test.mjs\" && node tests/manual/background_bind_test.mjs",
     "test:edge": "npm run build && tsc -p edge/cloudflare/tsconfig.json && node --test \"edge/cloudflare/tests/*.test.mjs\" tests/relay-edge-compat.integration.mjs tests/public-contract-identity.integration.mjs",
     "cloudflare:token": "bin/herdr-cloudflare-token",
     "cloudflare:dns-token": "bin/herdr-cloudflare-dns-token",
