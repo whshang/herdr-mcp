@@ -24,6 +24,19 @@ function classifyViewFreshness({ dom = {}, server = {}, now = Date.now() } = {},
   const pageId = String(dom.messageId || "");
   const serverText = String(server.text || "").replace(/\s+/g, " ").trim();
   const pageText = String(dom.text || "").replace(/\s+/g, " ").trim();
+  const serverCurrentAssistant = String(server.currentNodeRole || "") === "assistant";
+
+  // ChatGPT can leave an empty/missing assistant DOM after the server has
+  // already accepted and rendered the assistant turn. Treat that as a stale
+  // local view only when the server confirms the current node is assistant;
+  // otherwise the latest server assistant may simply belong to an older turn.
+  if (serverCurrentAssistant && serverText) {
+    const pageAssistantMissing = !pageId && !pageText;
+    const pageAssistantEmpty = pageId === serverId && !pageText;
+    if (pageAssistantMissing || pageAssistantEmpty) {
+      return { state: "server_ahead", deltaMs, serverLatestAt, pageLatestAt };
+    }
+  }
 
   if (serverId && pageId && serverId !== pageId) {
     return { state: "server_ahead", deltaMs, serverLatestAt, pageLatestAt };
