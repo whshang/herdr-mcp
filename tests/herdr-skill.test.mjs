@@ -33,6 +33,17 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /Prefer project-scoped skills over same-name user-scoped skills/);
     assert.match(r.content, /herdr-self-update apply/);
     assert.match(r.content, /Do not treat exit code 0 alone as completion evidence/);
+    assert.match(r.content, /Control-plane outage recovery/);
+    assert.match(r.content, /RunAtLoad=true.*KeepAlive=true/s);
+    assert.match(r.content, /dev\.herdr-mcp\.health-watchdog/);
+    assert.match(r.content, /historical `dev\.herdr-mcp\.watchdog` identity/);
+    assert.match(r.content, /5 seconds.*10 seconds.*20 seconds/s);
+    assert.match(r.content, /roughly.*35 seconds/s);
+    assert.match(r.content, /exactly three.*read-only.*reconnect attempts/s);
+    assert.match(r.content, /bounded three-retry recovery window/s);
+    assert.match(r.content, /agent_status_wait_timeout.*not.*offline/s);
+    assert.match(r.content, /boot_id.*herdr_since\(cursor=0\)/s);
+    assert.match(r.content, /never blindly resend it/s);
     assert.match(r.content, /Live herdr-mcp runtime context/);
     assert.equal(r.runtime.contract_profile, process.env.HERDR_MCP_CONTRACT_PROFILE || "current");
     assert.equal(typeof r.runtime.worker_fallbacks, "object");
