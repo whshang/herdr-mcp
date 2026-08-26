@@ -13,12 +13,13 @@ path = "src/main.rs"
 libc = "0.2"
 base64 = "0.22"
 axum = "0.8"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 plist = "1"
 semver = "1"
 serde_json = "1.0"
@@ -28,7 +29,8 @@ sigstore-trust-root = { version = "0.11.0", default-features = false }
 sigstore-types = "0.11.0"
 sigstore-verify = "0.11.0"
 time = { version = "0.3", features = ["formatting"] }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 url = "2"
 x509-cert = "0.2"
