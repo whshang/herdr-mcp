@@ -257,7 +257,10 @@ pub fn build_edge_url(base_url: &str, workstation_id: &str) -> Result<String, So
     let base_path = url.path().trim_end_matches('/');
     let encoded = encode_uri_component(workstation_id);
     if !base_path.ends_with(&format!("/{encoded}")) {
-        let prefix = if base_path.is_empty() {
+        // `Url::path()` reports the origin root as `/`; after trimming it is
+        // empty, but keep the root case explicit so the default `/ws` mapping
+        // remains obvious and regression-proof.
+        let prefix = if base_path.is_empty() || base_path == "/" {
             "/ws"
         } else {
             base_path
@@ -597,6 +600,10 @@ async fn run_connected_socket<S>(
                         let (code, reason) = frame
                             .map(|frame| (u16::from(frame.code), frame.reason.to_string()))
                             .unwrap_or((ABNORMAL_CLOSE_CODE, String::new()));
+                        // Tungstenite queues the RFC close reply when the peer
+                        // close is read. Flush that automatic acknowledgement
+                        // before publishing Closed and dropping the stream.
+                        let _ = socket.flush().await;
                         let _ = send_event(
                             &event_tx,
                             WebSocketEvent::Closed { attempt_id, code, reason },
@@ -709,6 +716,10 @@ mod tests {
         );
         assert_eq!(
             build_edge_url("wss://edge.test", "a b:c").unwrap(),
+            "wss://edge.test/ws/a%20b%3Ac"
+        );
+        assert_eq!(
+            build_edge_url("wss://edge.test/", "a b:c").unwrap(),
             "wss://edge.test/ws/a%20b%3Ac"
         );
     }
@@ -905,6 +916,13 @@ mod tests {
                 reason: "bye".to_owned(),
             }
         );
+        match server.next().await.unwrap().unwrap() {
+            Message::Close(Some(frame)) => {
+                assert_eq!(u16::from(frame.code), 1001);
+                assert_eq!(frame.reason, "bye");
+            }
+            other => panic!("expected close acknowledgement, got {other:?}"),
+        }
         task.await.unwrap();
     }
 
