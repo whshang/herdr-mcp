@@ -35,6 +35,15 @@ function ok(cond, label, detail = "") {
   else { failures++; console.error(`  ❌ ${label} ${detail}`); }
 }
 
+async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  } while (Date.now() < deadline);
+  return Boolean(predicate());
+}
+
 // ---- chrome mock ----
 const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}" };
 const listeners = { onMessage: [], onStartup: [], onInstalled: [], onActivated: [] };
@@ -45,6 +54,13 @@ let handoffSeedMode = "uncertain";
 let targetSeeded = false;
 let zaiTargetSeeded = false;
 let handoffPrompt = "";
+let targetComposerReady = true;
+let targetComposerReadyAfter = 0;
+let targetProbeCount = 0;
+let targetSeedCount = 0;
+let tabCreateCount = 0;
+let tabUpdateCount = 0;
+let lastTabUpdate = null;
 let mockStateWorkspaces = [];
 let mockLocalRuntimeAvailable = true;
 let hangAutomationNotifications = false;
@@ -95,6 +111,7 @@ function targetListener(tab) {
           targetConvKey: zaiTargetSeeded ? ZAI_TARGET : ZAI_ROOT,
           targetUrl: tab.url,
           seedConfirmed: zaiTargetSeeded,
+          composerReady: true,
         });
         return;
       }
@@ -121,15 +138,19 @@ function targetListener(tab) {
       return;
     }
     if (msg?.type === "h2w_handoff_probe") {
+      targetProbeCount += 1;
+      const composerReady = targetComposerReady && targetProbeCount > targetComposerReadyAfter;
       sendResponse({
         ok: true,
         targetConvKey: targetSeeded ? PROJECT_TARGET : null,
         targetUrl: tab.url,
         seedConfirmed: targetSeeded,
+        composerReady,
       });
       return;
     }
     if (msg?.type === "h2w_handoff_seed") {
+      targetSeedCount += 1;
       if (handoffSeedMode === "confirmed") {
         targetSeeded = true;
         tab.url = PROJECT_TARGET_URL;
@@ -260,11 +281,27 @@ globalThis.chrome = {
       return { id: t.id, url: t.url, status: t.status || "complete", active: t.active === true, windowId: 1 };
     },
     async create({ url }) {
+      tabCreateCount += 1;
       const id = ++nextTabId;
       const tab = { id, url, status: "complete", active: true, listener: null };
       tab.listener = targetListener(tab);
       tabs.set(id, tab);
       return { id, url, status: "complete" };
+    },
+    async update(tabId, props = {}) {
+      const tab = tabs.get(tabId);
+      if (!tab) throw new Error(`tab ${tabId} missing`);
+      if (props.url) {
+        tabUpdateCount += 1;
+        lastTabUpdate = { tabId, ...props };
+        tab.url = props.url;
+        // Navigation destroys the source content script and loads the target
+        // page in the same tab. Attribute-only updates must preserve it.
+        tab.listener = targetListener(tab);
+      }
+      if (Object.prototype.hasOwnProperty.call(props, "active")) tab.active = props.active === true;
+      tab.status = "complete";
+      return { id: tab.id, url: tab.url, status: tab.status, active: tab.active };
     },
     reload: () => {},
     onActivated: { addListener: (fn) => listeners.onActivated.push(fn) },
@@ -834,10 +871,10 @@ console.log("\n[z.ai manual handoff]");
   ok(started?.ok === true && started?.pending === true,
     "z.ai manual handoff accepts the immediate marked summary", JSON.stringify(started));
   ok(handoffPrompt.includes("z.ai") && handoffPrompt.includes("HERDR_HANDOFF_V1"),
-    "z.ai handoff uses the z.ai-specific raw summary template");
+    "z.ai handoff uses the z.ai-specific raw summary template", JSON.stringify({ handoffPrompt }));
 
-  await new Promise((r) => setTimeout(r, 600));
   const targetKey = `${ZAI_TARGET}::wY`;
+  await waitForTest(() => !storage.herdrWakeBindings[sourceKey] && !!storage.herdrWakeBindings[targetKey]);
   ok(!storage.herdrWakeBindings[sourceKey] && !!storage.herdrWakeBindings[targetKey],
     "z.ai binding moves only after the fresh target confirms its seed");
   ok(storage.herdrWakeBindings[targetKey]?.continuity_id === continuityId,
@@ -878,7 +915,8 @@ console.log("\n[z.ai manual handoff]");
   const autoHandoff = await autoHandoffP;
   ok(autoHandoff?.ok === true,
     "z.ai manual handoff remains available while Auto is on", JSON.stringify(autoHandoff));
-  await new Promise((r) => setTimeout(r, 600));
+  await waitForTest(() => !!storage.herdrWakeBindings[targetKey]
+    && storage.herdrConversationAutomation?.[ZAI_TARGET] === true);
   ok(!!storage.herdrWakeBindings[targetKey], "z.ai Auto-on handoff still moves the workspace binding");
   ok(storage.herdrConversationAutomation?.[ZAI_TARGET] === true,
     "z.ai manual handoff preserves Auto on in the target chat");
@@ -887,6 +925,12 @@ console.log("\n[z.ai manual handoff]");
 // ---- Scenario 7: Project handoff keeps source authoritative until target seed is confirmed ----
 console.log("\n[project handoff]");
 {
+  targetComposerReady = true;
+  targetComposerReadyAfter = 0;
+  targetProbeCount = 0;
+  targetSeedCount = 0;
+  const manualCreateBefore = tabCreateCount;
+  const manualUpdateBefore = tabUpdateCount;
   installContentScript(401, PROJECT_SOURCE_URL, PROJECT_SOURCE);
   let resolveBind;
   const bindP = new Promise((r) => { resolveBind = r; });
@@ -965,7 +1009,8 @@ console.log("\n[project handoff]");
   const started = await startP;
   ok(started?.ok === true && started.pending === true, "rollover requests a handoff summary", JSON.stringify(started));
   const transferId = Object.values(storage.herdrConversationTransfers || {})
-    .find((transfer) => transfer?.source_conv_key === PROJECT_SOURCE)?.id;
+    .filter((transfer) => transfer?.source_conv_key === PROJECT_SOURCE)
+    .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0]?.id;
   ok(!!transferId && handoffPrompt.includes(`id=${transferId}`), "source prompt carries the persisted transfer id");
 
   const assistantText = [
@@ -981,9 +1026,19 @@ console.log("\n[project handoff]");
   const ended = await endedP;
   ok(ended?.handled === true && ended?.ok === true, "marked assistant packet is accepted", JSON.stringify(ended));
 
-  await new Promise((r) => setTimeout(r, 800));
+  await waitForTest(() => storage.herdrConversationTransfers?.[transferId]?.status === "seed_uncertain");
   const uncertain = storage.herdrConversationTransfers[transferId];
   ok(uncertain?.status === "seed_uncertain", "unconfirmed target seed is recorded as delivery-uncertain", JSON.stringify(uncertain));
+  ok(uncertain?.target_tab_id === 401,
+    "manual ChatGPT Project handoff reuses the source tab as the target", JSON.stringify(uncertain));
+  ok(tabCreateCount === manualCreateBefore,
+    "manual ChatGPT Project handoff does not create a new tab", `creates=${tabCreateCount - manualCreateBefore}`);
+  ok(tabUpdateCount === manualUpdateBefore + 1
+      && lastTabUpdate?.tabId === 401
+      && lastTabUpdate?.url === PROJECT_KEY,
+    "manual ChatGPT Project handoff navigates the current tab to the stable Project entry",
+    JSON.stringify(lastTabUpdate));
+  ok(targetProbeCount >= 1, "current-tab handoff waits for the Project composer before seeding");
   ok(!!storage.herdrWakeBindings[sourceKey]
       && storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_SOURCE,
     "Project binding stays on the source target while target delivery is uncertain");
@@ -996,6 +1051,9 @@ console.log("\n[project handoff]");
   onMsg({ type: "h2w_handoff_start", tabId: 401 }, { tab: { id: 401 } }, (r) => resolveResume(r));
   const resumed = await resumeP;
   ok(resumed?.ok === true, "explicit resume completes the target seed and cutover", JSON.stringify(resumed));
+  ok(tabCreateCount === manualCreateBefore && tabUpdateCount === manualUpdateBefore + 1,
+    "uncertain resume reuses the already-navigated current tab");
+  ok(tabs.has(401), "committing a same-tab handoff does not retire the current tab");
   const targetKey = sourceKey;
   ok(!!storage.herdrWakeBindings[targetKey]
       && storage.herdrWakeBindings[targetKey]?.active_conv_key === PROJECT_TARGET,
@@ -1019,6 +1077,10 @@ console.log("\n[project handoff]");
   targetSeeded = false;
   handoffSeedMode = "confirmed";
   handoffPrompt = "";
+  targetProbeCount = 0;
+  targetSeedCount = 0;
+  installContentScript(401, PROJECT_SOURCE_URL, PROJECT_SOURCE);
+  tabs.get(401).active = true;
   let resolveRebind;
   const rebindP = new Promise((r) => { resolveRebind = r; });
   onMsg({ type: "h2w_bind", tabId: 401, workspace_id: "wH", workspace_label: "herdr-mcp (wH)" }, { tab: { id: 401 } }, (r) => resolveRebind(r));
@@ -1045,6 +1107,8 @@ console.log("\n[project handoff]");
     JSON.stringify(offlineAutoStart));
   mockLocalRuntimeAvailable = true;
 
+  const autoCreateBefore = tabCreateCount;
+  const autoUpdateBefore = tabUpdateCount;
   let resolveAutoStart;
   const autoStartP = new Promise((r) => { resolveAutoStart = r; });
   onMsg({ type: "h2w_handoff_start", tabId: 401, trigger: "manual" }, { tab: { id: 401 } }, (r) => resolveAutoStart(r));
@@ -1067,9 +1131,11 @@ console.log("\n[project handoff]");
   const autoEndedP = new Promise((r) => { resolveAutoEnded = r; });
   onMsg({ type: "h2w_turn_ended", convKey: PROJECT_SOURCE, assistantText: autoAssistantText, userText: "roll over" }, { tab: { id: 401 } }, (r) => resolveAutoEnded(r));
   await autoEndedP;
-  await new Promise((r) => setTimeout(r, 800));
+  await waitForTest(() => storage.herdrConversationTransfers?.[autoTransfer?.id]?.status === "committed");
   ok(storage.herdrConversationTransfers[autoTransfer?.id]?.status === "committed",
     "Auto-on Project handoff commits normally");
+  ok(tabCreateCount === autoCreateBefore && tabUpdateCount === autoUpdateBefore + 1,
+    "Auto-on manual Project handoff still reuses the current tab");
   ok(storage.herdrProjectAutomation?.[PROJECT_ID] === true,
     "Project handoff preserves Auto on in shared Project state");
   ok(storage.herdrWakeBindings[targetKey]?.active_conv_key === PROJECT_TARGET,
@@ -1123,7 +1189,7 @@ console.log("\n[project handoff insert false-negative]");
   const endedP = new Promise((r) => { resolveEnded = r; });
   onMsg({ type: "h2w_turn_ended", convKey: PROJECT_SOURCE, assistantText, userText: "roll over" }, { tab: { id: 402 } }, (r) => resolveEnded(r));
   await endedP;
-  await new Promise((r) => setTimeout(r, 700));
+  await waitForTest(() => storage.herdrConversationTransfers?.[transferId]?.status === "committed");
   const targetKey = sourceKey;
   ok(storage.herdrConversationTransfers[transferId]?.status === "committed",
     "insert-failed with confirmed target evidence commits instead of failing");
@@ -1169,6 +1235,9 @@ console.log("\n[project handoff legacy failed-seed recovery]");
   const transferId = Object.values(storage.herdrConversationTransfers || {})
     .filter((transfer) => transfer?.source_conv_key === PROJECT_SOURCE)
     .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0]?.id;
+  // This scenario exercises recovery of a transfer created by an older build,
+  // where manual Project handoff opened a separate target tab.
+  storage.herdrConversationTransfers[transferId].trigger = "legacy_manual";
   const assistantText = [
     `<<<HERDR_HANDOFF_V1 id=${transferId}>>>`,
     "# Project handoff",
@@ -1180,7 +1249,7 @@ console.log("\n[project handoff legacy failed-seed recovery]");
   const endedP = new Promise((r) => { resolveEnded = r; });
   onMsg({ type: "h2w_turn_ended", convKey: PROJECT_SOURCE, assistantText, userText: "roll over" }, { tab: { id: 403 } }, (r) => resolveEnded(r));
   await endedP;
-  await new Promise((r) => setTimeout(r, 700));
+  await waitForTest(() => storage.herdrConversationTransfers?.[transferId]?.status === "seed_uncertain");
 
   const transfer = storage.herdrConversationTransfers[transferId];
   transfer.status = "failed";

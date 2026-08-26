@@ -888,11 +888,16 @@ const H2W_CONTENT_VERSION = "0.1.62";
         return true;
       }
       if (msg?.type === "h2w_handoff_probe") {
+        const inputEl = ADAPTER.getInputEl();
         sendResponse({
           ok: true,
           targetConvKey: ADAPTER.getConversationKey(),
           targetUrl: location.href,
           seedConfirmed: hasHandoffTransferMarker(lastMessageByRole("user"), msg.transferId),
+          // A ChatGPT Project-home navigation can report tab load complete before
+          // the SPA mounts its composer. Background waits on this bounded signal
+          // before it injects a handoff seed.
+          composerReady: Boolean(inputEl && elementVisible(inputEl)),
         });
         return;
       }
