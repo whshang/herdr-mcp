@@ -25,6 +25,7 @@ pub enum NativeHostCommand {
     Install,
     Status,
     Uninstall,
+    Rollback,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -221,10 +222,14 @@ fn parse_native_host(args: &[String]) -> Result<Command, String> {
         [subcommand] if subcommand == "uninstall" => {
             Ok(Command::NativeHost(NativeHostCommand::Uninstall))
         }
-        [] => Err("native-host requires install, status, or uninstall".to_owned()),
+        [subcommand] if subcommand == "rollback" => {
+            Ok(Command::NativeHost(NativeHostCommand::Rollback))
+        }
+        [] => Err("native-host requires install, status, uninstall, or rollback".to_owned()),
         [subcommand] => Err(format!("unknown native-host command '{subcommand}'")),
         _ => Err(
-            "native-host accepts exactly one subcommand: install, status, or uninstall".to_owned(),
+            "native-host accepts exactly one subcommand: install, status, uninstall, or rollback"
+                .to_owned(),
         ),
     }
 }
@@ -255,7 +260,7 @@ Usage:\n\
   herdr-mcp candidate [--port 8873]\n\
   herdr-mcp service <install [--adopt-node]|status|start|stop|restart|rollback|uninstall>\n\
   herdr-mcp update <check [--manifest URL]|apply [--manifest URL]|status>\n\
-  herdr-mcp native-host <install|status|uninstall>\n\
+  herdr-mcp native-host <install|status|uninstall|rollback>\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\n\
 The Rust binary is the new local product boundary. Service, update, runtime,\n\
 link, and native-host commands are added as their native implementations land.\n"
@@ -335,6 +340,14 @@ mod tests {
         assert_eq!(
             parse(args(&["native-host", "status"])).unwrap(),
             Command::NativeHost(NativeHostCommand::Status)
+        );
+        assert_eq!(
+            parse(args(&["native-host", "uninstall"])).unwrap(),
+            Command::NativeHost(NativeHostCommand::Uninstall)
+        );
+        assert_eq!(
+            parse(args(&["native-host", "rollback"])).unwrap(),
+            Command::NativeHost(NativeHostCommand::Rollback)
         );
         assert_eq!(
             parse(args(&["extension-host"])).unwrap(),
