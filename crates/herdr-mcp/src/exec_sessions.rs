@@ -9,7 +9,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -21,6 +21,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 const MAX_BUFFER_PER_STREAM: usize = 512 * 1024;
 const SESSION_TTL_MS: u64 = 60 * 60_000;
 const KILL_GRACE: Duration = Duration::from_millis(1500);
+const OUTPUT_DRAIN_BUDGET: Duration = Duration::from_millis(500);
 const RECOVERY_MAX_ENTRIES: usize = 64;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
 
@@ -63,6 +64,7 @@ struct Session {
     pid: u32,
     child: Mutex<Child>,
     buffers: Mutex<Buffers>,
+    output_readers: AtomicUsize,
     status: Mutex<SessionStatus>,
 }
 
@@ -135,6 +137,7 @@ impl ExecRegistry {
         let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        let output_readers = usize::from(stdout.is_some()) + usize::from(stderr.is_some());
         let session = Arc::new(Session {
             id: id.clone(),
             cwd: cwd.to_path_buf(),
@@ -143,6 +146,7 @@ impl ExecRegistry {
             pid,
             child: Mutex::new(child),
             buffers: Mutex::new(Buffers::default()),
+            output_readers: AtomicUsize::new(output_readers),
             status: Mutex::new(SessionStatus::default()),
         });
         if let Some(stdout) = stdout {
@@ -424,7 +428,15 @@ where
             };
             push_chunk(&session, stream, &buffer[..read]);
         }
+        session.output_readers.fetch_sub(1, Ordering::Release);
     });
+}
+
+fn wait_for_output_readers(session: &Arc<Session>) {
+    let deadline = Instant::now() + OUTPUT_DRAIN_BUDGET;
+    while session.output_readers.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn push_chunk(session: &Arc<Session>, stream: StreamKind, chunk: &[u8]) {
@@ -479,7 +491,10 @@ fn refresh_session_status(session: &Arc<Session>, registry: Option<&RegistryInne
         .map_err(|_| "child lock poisoned".to_owned())
         .and_then(|mut child| child.try_wait().map_err(|error| error.to_string()));
     let transitioned = match result {
-        Ok(Some(exit)) => mark_closed(session, &exit),
+        Ok(Some(exit)) => {
+            wait_for_output_readers(session);
+            mark_closed(session, &exit)
+        }
         Ok(None) => return false,
         Err(_) => mark_closed_unknown(session),
     };
@@ -949,6 +964,7 @@ mod tests {
         let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        let output_readers = usize::from(stdout.is_some()) + usize::from(stderr.is_some());
         let session = Arc::new(Session {
             id: id.clone(),
             cwd: PathBuf::from("/tmp"),
@@ -957,6 +973,7 @@ mod tests {
             pid,
             child: Mutex::new(child),
             buffers: Mutex::new(Buffers::default()),
+            output_readers: AtomicUsize::new(output_readers),
             status: Mutex::new(SessionStatus::default()),
         });
         if let Some(stdout) = stdout {
