@@ -7,27 +7,8 @@
 //! structural/per-kind validation with stable rejection codes.
 
 use crate::relay::canonical_json::canonical_json;
+use crate::relay::protocol::{CORRELATED_KINDS, MESSAGE_KINDS, RELAY_PROTOCOL_VERSION};
 use serde_json::{Map, Value};
-
-pub const RELAY_PROTOCOL_VERSION: u64 = 1;
-pub const MESSAGE_KINDS: [&str; 9] = [
-    "hello",
-    "hello_ack",
-    "heartbeat",
-    "status",
-    "tool_request",
-    "tool_result",
-    "tool_error",
-    "cancel",
-    "cancel_ack",
-];
-pub const CORRELATED_KINDS: [&str; 5] = [
-    "tool_request",
-    "tool_result",
-    "tool_error",
-    "cancel",
-    "cancel_ack",
-];
 
 pub const MAX_WORKSTATION_ID_LEN: usize = 64;
 pub const MAX_REQUEST_ID_LEN: usize = 128;

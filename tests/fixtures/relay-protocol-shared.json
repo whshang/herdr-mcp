@@ -1,0 +1,294 @@
+{
+  "protocol_version": {
+    "numeric": 1,
+    "string": "1"
+  },
+  "message_kinds": [
+    "hello",
+    "hello_ack",
+    "heartbeat",
+    "status",
+    "tool_request",
+    "tool_result",
+    "tool_error",
+    "cancel",
+    "cancel_ack"
+  ],
+  "correlated_kinds": [
+    "tool_request",
+    "tool_result",
+    "tool_error",
+    "cancel",
+    "cancel_ack"
+  ],
+  "delivery_states": [
+    "not_delivered",
+    "delivery_unknown",
+    "delivered"
+  ],
+  "relay_validation_codes": [
+    "not_json",
+    "not_object",
+    "missing_protocol_version",
+    "unsupported_protocol_version",
+    "missing_kind",
+    "unknown_kind",
+    "missing_workstation_id",
+    "invalid_workstation_id",
+    "missing_request_id",
+    "invalid_request_id",
+    "unexpected_request_id",
+    "invalid_boot_id",
+    "invalid_id",
+    "invalid_string",
+    "invalid_number",
+    "invalid_boolean",
+    "invalid_enum",
+    "unknown_field",
+    "frame_too_large",
+    "too_deep",
+    "too_many_keys",
+    "too_many_items",
+    "string_too_long",
+    "payload_too_large",
+    "invalid_arguments",
+    "invalid_result",
+    "invalid_details",
+    "invalid_capabilities",
+    "invalid_runtime",
+    "invalid_operation"
+  ],
+  "hello_ack_failure_codes": [
+    "auth_rejected",
+    "auth_expired",
+    "session_invalid",
+    "protocol_incompatible",
+    "contract_mismatch",
+    "workstation_mismatch",
+    "internal_error"
+  ],
+  "resume_states": [
+    "queued",
+    "sent",
+    "settled"
+  ],
+  "representative_messages": [
+    {
+      "name": "hello (full, with runtime)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "hello",
+        "workstation_id": "w1",
+        "boot_id": "boot-01",
+        "link_version": "0.1.0",
+        "connected_at_ms": 1700000000000,
+        "capabilities": ["relay.request", "relay.cancel"],
+        "runtime": {
+          "runtime_version": "0.3.26",
+          "runtime_commit": "abc123",
+          "runtime_generation": null,
+          "contract_epoch": 1,
+          "contract_hash": "sha256:abababababababababababababababababababababababababababababababab",
+          "herdr_version": null,
+          "herdr_protocol": null
+        }
+      }
+    },
+    {
+      "name": "hello (minimal, no runtime)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "hello",
+        "workstation_id": "w1",
+        "boot_id": "boot-02",
+        "link_version": "0.1.0",
+        "capabilities": []
+      }
+    },
+    {
+      "name": "hello_ack ok:true (reconnect with resume + completed)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "hello_ack",
+        "workstation_id": "w1",
+        "ok": true,
+        "server_version": "0.1.0-dev",
+        "edge_deployment_id": "dep-1",
+        "capabilities": ["relay.request"],
+        "reconnect": true,
+        "resume": [
+          { "request_id": "req_01", "operation": "herdr_inspect", "state": "sent", "deadline_ms": 1700000005000 }
+        ],
+        "completed": ["req_00"]
+      }
+    },
+    {
+      "name": "hello_ack ok:false (failure code)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "hello_ack",
+        "workstation_id": "w1",
+        "ok": false,
+        "code": "auth_rejected",
+        "message": "credential expired"
+      }
+    },
+    {
+      "name": "heartbeat (with runtime)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "heartbeat",
+        "workstation_id": "w1",
+        "boot_id": "boot-01",
+        "sent_at_ms": 1700000000000,
+        "link_uptime_ms": 120000,
+        "active_requests": 2,
+        "runtime": {
+          "runtime_version": "0.3.26",
+          "runtime_commit": "abc123",
+          "runtime_generation": "gen-7",
+          "contract_epoch": 1,
+          "contract_hash": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+          "herdr_version": "0.3.32",
+          "herdr_protocol": "relay.v1"
+        }
+      }
+    },
+    {
+      "name": "status (edge query form)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "status",
+        "workstation_id": "w1",
+        "query": true
+      }
+    },
+    {
+      "name": "status (full report form)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "status",
+        "workstation_id": "w1",
+        "boot_id": "boot-01",
+        "runtime": {
+          "runtime_version": "0.3.26",
+          "runtime_commit": "abc123",
+          "runtime_generation": "gen-7",
+          "contract_epoch": 1,
+          "contract_hash": "sha256:efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+          "herdr_version": "0.3.32",
+          "herdr_protocol": "relay.v1"
+        },
+        "runtime_generation": "gen-7",
+        "healthy": true,
+        "health_details": null,
+        "active_requests": 1,
+        "link_uptime_ms": 300000,
+        "last_error": null,
+        "sent_at_ms": 1700000000000
+      }
+    },
+    {
+      "name": "tool_request (full)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "tool_request",
+        "workstation_id": "w1",
+        "request_id": "req_01",
+        "operation": "herdr_inspect",
+        "arguments": { "workspace": "w5C", "depth": 2 },
+        "timeout_ms": 30000,
+        "contract_epoch": 1,
+        "contract_hash": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "idempotency_key": "idem-1",
+        "trace": { "span_id": "abc" }
+      }
+    },
+    {
+      "name": "tool_request (minimal, no optional fields)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "tool_request",
+        "workstation_id": "w1",
+        "request_id": "req_02",
+        "operation": "herdr_inspect"
+      }
+    },
+    {
+      "name": "tool_result (with runtime_generation + transport)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "tool_result",
+        "workstation_id": "w1",
+        "request_id": "req_01",
+        "result": { "ok": true, "entries": 3 },
+        "served_at_ms": 1700000000000,
+        "runtime_generation": "gen-7",
+        "transport_name": "herdr"
+      }
+    },
+    {
+      "name": "tool_result (null result + null transport)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "tool_result",
+        "workstation_id": "w1",
+        "request_id": "req_02",
+        "result": null,
+        "served_at_ms": 1700000000000,
+        "runtime_generation": null,
+        "transport_name": null
+      }
+    },
+    {
+      "name": "tool_error (with delivery_state + details)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "tool_error",
+        "workstation_id": "w1",
+        "request_id": "req_03",
+        "code": "request_timeout",
+        "message": "timed out",
+        "details": { "attempts": 2 },
+        "retryable": true,
+        "delivery_state": "delivery_unknown",
+        "served_at_ms": 1700000000000,
+        "runtime_generation": "gen-7"
+      }
+    },
+    {
+      "name": "tool_error (minimal, confirmed delivered)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "tool_error",
+        "workstation_id": "w1",
+        "request_id": "req_04",
+        "code": "internal_error",
+        "retryable": false,
+        "delivery_state": "delivered"
+      }
+    },
+    {
+      "name": "cancel (with reason)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "cancel",
+        "workstation_id": "w1",
+        "request_id": "req_01",
+        "reason": "user abort"
+      }
+    },
+    {
+      "name": "cancel_ack (accepted, null reason)",
+      "value": {
+        "protocol_version": 1,
+        "kind": "cancel_ack",
+        "workstation_id": "w1",
+        "request_id": "req_01",
+        "accepted": true,
+        "cancelled_at_ms": 1700000000000,
+        "reason": null
+      }
+    }
+  ]
+}

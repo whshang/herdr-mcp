@@ -11,6 +11,7 @@
 //!   canonical_json — deterministic canonical JSON (contract-hash input).
 //!   contract       — contract manifest normalization, SHA-256 hash, shape check.
 //!   errors         — delivery-state & retryability taxonomy + error codes.
+//!   protocol       — canonical constants + typed Relay v1 wire message model.
 //!   validation     — strict per-kind frame validation (unknown-field + bounds),
 //!                    including the raw byte gate and canonical payload budgets.
 //!
@@ -30,4 +31,5 @@
 pub mod canonical_json;
 pub mod contract;
 pub mod errors;
+pub mod protocol;
 pub mod validation;
