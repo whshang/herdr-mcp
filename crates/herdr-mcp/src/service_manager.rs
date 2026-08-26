@@ -49,6 +49,8 @@ mod macos {
     const DEFAULT_PORT: u16 = 8772;
     const HEALTH_BUDGET: Duration = Duration::from_secs(10);
     const LAUNCHD_ABSENT_BUDGET: Duration = Duration::from_secs(2);
+    const LAUNCHD_BOOTOUT_BUDGET: Duration = Duration::from_secs(10);
+    const LAUNCHD_RECOVERY_BUDGET: Duration = Duration::from_secs(15);
     const BOOTSTRAP_RETRY_DELAYS: [Duration; 4] = [
         Duration::from_millis(250),
         Duration::from_millis(500),
@@ -301,6 +303,7 @@ mod macos {
             })?;
         }
 
+        let mut server_bootout_pending = false;
         let activation = (|| -> Result<(), String> {
             if rollback.watchdog_was_loaded {
                 bootout(WATCHDOG_LABEL)?;
@@ -309,7 +312,11 @@ mod macos {
                 remove_regular_file(&paths.watchdog_plist)?;
             }
             if rollback.server_was_loaded {
-                bootout(SERVICE_LABEL)?;
+                server_bootout_pending = request_bootout(SERVICE_LABEL)?;
+                if server_bootout_pending {
+                    wait_launchd_absent(SERVICE_LABEL, LAUNCHD_BOOTOUT_BUDGET)?;
+                    server_bootout_pending = false;
+                }
             }
             atomic_write(&paths.plist, &new_plist, 0o600)?;
             switch_current(paths, &generation)?;
@@ -324,7 +331,7 @@ mod macos {
         })();
 
         if let Err(error) = activation {
-            let rollback_error = rollback_install(paths, &rollback).err();
+            let rollback_error = rollback_install(paths, &rollback, server_bootout_pending).err();
             if let Some(rollback_id) = rollback_id.as_deref() {
                 let _ = store.mark_prepared_service_rollback(
                     rollback_id,
@@ -586,9 +593,14 @@ mod macos {
             None
         };
 
+        let mut current_bootout_pending = false;
         let apply = (|| -> Result<(), String> {
             if current_was_loaded {
-                bootout(SERVICE_LABEL)?;
+                current_bootout_pending = request_bootout(SERVICE_LABEL)?;
+                if current_bootout_pending {
+                    wait_launchd_absent(SERVICE_LABEL, LAUNCHD_BOOTOUT_BUDGET)?;
+                    current_bootout_pending = false;
+                }
             }
             atomic_write(&paths.plist, &source_bytes, 0o600)?;
             restore_current(paths, previous_target.as_deref())?;
@@ -617,6 +629,7 @@ mod macos {
                 &current_bytes,
                 &current_target,
                 current_was_loaded,
+                current_bootout_pending,
             )
             .err();
             let state = if restore_error.is_some() {
@@ -1045,10 +1058,12 @@ mod macos {
             .map_err(|error| format!("cannot remove runtime/current: {error}"))
     }
 
-    fn rollback_install(paths: &ServicePaths, rollback: &RollbackState) -> Result<(), String> {
-        if is_loaded(SERVICE_LABEL) {
-            bootout(SERVICE_LABEL)?;
-        }
+    fn rollback_install(
+        paths: &ServicePaths,
+        rollback: &RollbackState,
+        server_bootout_pending: bool,
+    ) -> Result<(), String> {
+        settle_service_for_restore(SERVICE_LABEL, server_bootout_pending)?;
         match rollback.server_plist.as_deref() {
             Some(bytes) => atomic_write(&paths.plist, bytes, 0o600)?,
             None => remove_regular_file(&paths.plist)?,
@@ -1092,14 +1107,13 @@ mod macos {
         current_plist: &[u8],
         current_target: &Path,
         current_was_loaded: bool,
+        current_bootout_pending: bool,
     ) -> Result<(), String> {
         if is_loaded(WATCHDOG_LABEL) {
             bootout(WATCHDOG_LABEL)?;
         }
         remove_regular_file(&paths.watchdog_plist)?;
-        if is_loaded(SERVICE_LABEL) {
-            bootout(SERVICE_LABEL)?;
-        }
+        settle_service_for_restore(SERVICE_LABEL, current_bootout_pending)?;
         atomic_write(&paths.plist, current_plist, 0o600)?;
         restore_current(paths, Some(current_target))?;
         if current_was_loaded {
@@ -1276,6 +1290,48 @@ mod macos {
         }
     }
 
+    fn request_bootout(label: &str) -> Result<bool, String> {
+        if !is_loaded(label) {
+            return Ok(false);
+        }
+        run_launchctl([OsStr::new("bootout"), OsStr::new(&target(label))])?;
+        Ok(true)
+    }
+
+    fn settle_service_for_restore(label: &str, bootout_pending: bool) -> Result<(), String> {
+        settle_service_for_restore_with(
+            bootout_pending,
+            || is_loaded(label),
+            || {
+                if request_bootout(label)? {
+                    wait_launchd_absent(label, LAUNCHD_RECOVERY_BUDGET)?;
+                }
+                Ok(())
+            },
+            || wait_launchd_absent(label, LAUNCHD_RECOVERY_BUDGET),
+        )
+    }
+
+    fn settle_service_for_restore_with<Loaded, Stop, AwaitPending>(
+        bootout_pending: bool,
+        mut is_loaded: Loaded,
+        mut stop: Stop,
+        mut await_pending: AwaitPending,
+    ) -> Result<(), String>
+    where
+        Loaded: FnMut() -> bool,
+        Stop: FnMut() -> Result<(), String>,
+        AwaitPending: FnMut() -> Result<(), String>,
+    {
+        if bootout_pending {
+            return await_pending();
+        }
+        if is_loaded() {
+            stop()?;
+        }
+        Ok(())
+    }
+
     fn bootstrap_with_retry(plist: &Path, label: &str) -> Result<(), String> {
         bootstrap_retry_with(
             &BOOTSTRAP_RETRY_DELAYS,
@@ -1321,11 +1377,10 @@ mod macos {
     }
 
     fn bootout(label: &str) -> Result<(), String> {
-        if !is_loaded(label) {
-            return Ok(());
+        if request_bootout(label)? {
+            wait_launchd_absent(label, LAUNCHD_BOOTOUT_BUDGET)?;
         }
-        run_launchctl([OsStr::new("bootout"), OsStr::new(&target(label))])?;
-        wait_launchd_absent(label, LAUNCHD_ABSENT_BUDGET)
+        Ok(())
     }
 
     fn kickstart() -> Result<(), String> {
@@ -1688,6 +1743,79 @@ mod macos {
             assert_eq!(sleeps, delays);
             assert!(error.contains("failed after 3 attempts"));
             assert!(error.contains("bootstrap-3"));
+        }
+
+        #[test]
+        fn rollback_waits_for_an_inflight_bootout_without_sending_a_second_stop() {
+            let mut loaded_checks = 0_usize;
+            let mut stops = 0_usize;
+            let mut waits = 0_usize;
+            settle_service_for_restore_with(
+                true,
+                || {
+                    loaded_checks += 1;
+                    true
+                },
+                || {
+                    stops += 1;
+                    Ok(())
+                },
+                || {
+                    waits += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(loaded_checks, 0);
+            assert_eq!(stops, 0, "rollback must not issue a second bootout");
+            assert_eq!(waits, 1);
+        }
+
+        #[test]
+        fn rollback_stops_a_loaded_service_when_no_bootout_is_inflight() {
+            let mut loaded_checks = 0_usize;
+            let mut stops = 0_usize;
+            let mut waits = 0_usize;
+            settle_service_for_restore_with(
+                false,
+                || {
+                    loaded_checks += 1;
+                    true
+                },
+                || {
+                    stops += 1;
+                    Ok(())
+                },
+                || {
+                    waits += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(loaded_checks, 1);
+            assert_eq!(stops, 1);
+            assert_eq!(waits, 0);
+        }
+
+        #[test]
+        fn rollback_leaves_an_already_absent_service_alone() {
+            let mut stops = 0_usize;
+            let mut waits = 0_usize;
+            settle_service_for_restore_with(
+                false,
+                || false,
+                || {
+                    stops += 1;
+                    Ok(())
+                },
+                || {
+                    waits += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(stops, 0);
+            assert_eq!(waits, 0);
         }
     }
 }
