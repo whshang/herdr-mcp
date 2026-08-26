@@ -23,6 +23,7 @@ let sockPath;      // mock herdr socket path
 let sockServer;    // net server
 let server;        // MCP server proc
 let slowGitBin;    // PATH shim that makes git rev-parse unusable for root discovery
+let outsideRoot;   // symlink target used to verify grep prefix containment
 let sessionId = null;
 
 function waitReady(port) {
@@ -63,10 +64,12 @@ before(async () => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-fs-"));
   root = fs.realpathSync(root); // /var -> /private/var so realpath containment matches
   fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.mkdirSync(path.join(root, "extension", "content"), { recursive: true });
   fs.mkdirSync(path.join(root, ".git"), { recursive: true });
   fs.writeFileSync(path.join(root, "README.md"), "hello world\nsecond line\n");
   fs.writeFileSync(path.join(root, "src", "a.ts"), "export const x = 1;\n// TODO fix\n");
   fs.writeFileSync(path.join(root, "src", "b.ts"), "export const y = 2;\n// TODO fix\n");
+  fs.writeFileSync(path.join(root, "extension", "content", "wake.js"), "const mode = 'SCROLL independent';\n");
   fs.writeFileSync(path.join(root, ".env"), "SECRET=abc\n"); // secret — must be skipped
   fs.writeFileSync(path.join(root, "notes.txt"), "plain text\n");
   // make it a real git repo so deriveProjects marks it managed (vcs=git)
@@ -74,6 +77,11 @@ before(async () => {
   execSync("git init -q", { cwd: root });
   execSync("git add -A", { cwd: root });
   execSync("git -c user.email=t@t -c user.name=t commit -qm init", { cwd: root });
+  if (process.platform !== "win32") {
+    outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-fs-outside-"));
+    fs.writeFileSync(path.join(outsideRoot, "escaped.js"), "scroll outside root\n");
+    fs.symlinkSync(outsideRoot, path.join(root, "escape"), "dir");
+  }
 
   // mock herdr socket: answer session.snapshot with a managed git root
   sockPath = path.join(os.tmpdir(), `herdr-fs-${process.pid}.sock`);
@@ -112,6 +120,9 @@ before(async () => {
   const slowGit = path.join(slowGitBin, "git");
   fs.writeFileSync(slowGit, `#!/bin/sh\nif [ "$1" = "rev-parse" ] && [ "$2" = "--show-toplevel" ]; then sleep 2; exit 124; fi\nexec ${JSON.stringify(realGit)} "$@"\n`);
   fs.chmodSync(slowGit, 0o755);
+  const disabledRg = path.join(slowGitBin, "rg");
+  fs.writeFileSync(disabledRg, "#!/bin/sh\nexit 127\n");
+  fs.chmodSync(disabledRg, 0o755);
 
   const serverEnv = { ...process.env };
   for (const key of [
@@ -135,6 +146,7 @@ after(async () => {
   await stopServer(server);
   if (sockServer) await new Promise((r) => sockServer.close(r));
   try { fs.rmSync(root, { recursive: true, force: true }); } catch {}
+  try { if (outsideRoot) fs.rmSync(outsideRoot, { recursive: true, force: true }); } catch {}
   try { fs.rmSync(sockPath, { force: true }); } catch {}
   try { if (slowGitBin) fs.rmSync(slowGitBin, { recursive: true, force: true }); } catch {}
 });
@@ -227,6 +239,52 @@ test("herdr_fs_grep: regex + case_insensitive", async () => {
   const r = await tool("herdr_fs_grep", { root, pattern: "TODO", regex: true, case_insensitive: true });
   assert.equal(r.ok, true);
   assert.equal(r.count, 2);
+});
+
+test("herdr_fs_grep: root-relative glob works in node fallback", async () => {
+  const r = await tool("herdr_fs_grep", {
+    root,
+    pattern: "scroll",
+    case_insensitive: true,
+    glob: "extension/**/*.js",
+    max_matches: 200,
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.engine, "node");
+  assert.equal(r.count, 1);
+  assert.ok(r.matches[0].file.endsWith(path.join("extension", "content", "wake.js")));
+});
+
+test("herdr_fs_grep: path glob prefix stays inside the validated root", async () => {
+  const missing = await tool("herdr_fs_grep", {
+    root,
+    pattern: "scroll",
+    case_insensitive: true,
+    glob: "missing/**/*.js",
+  });
+  assert.equal(missing.ok, true);
+  assert.equal(missing.count, 0);
+  assert.equal(missing.engine, "node");
+
+  if (outsideRoot) {
+    const escaped = await tool("herdr_fs_grep", {
+      root,
+      pattern: "scroll",
+      case_insensitive: true,
+      glob: "escape/**/*.js",
+    });
+    assert.equal(escaped.ok, true);
+    assert.equal(escaped.count, 0);
+    assert.equal(escaped.engine, "node");
+  }
+
+  const absolute = await tool("herdr_fs_grep", {
+    root,
+    pattern: "scroll",
+    glob: "/extension/**/*.js",
+  });
+  assert.equal(absolute.ok, false);
+  assert.equal(absolute.code, "invalid_params");
 });
 
 test("herdr_fs_grep: budget truncation sets truncated", async () => {
