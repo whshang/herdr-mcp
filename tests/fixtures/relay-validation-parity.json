@@ -1,0 +1,183 @@
+{
+  "frame_cases": [
+    {
+      "name": "valid hello frame",
+      "raw": "{\"protocol_version\":1,\"kind\":\"hello\",\"workstation_id\":\"w1\",\"boot_id\":\"b1\",\"link_version\":\"1\",\"capabilities\":[]}",
+      "ok": true
+    },
+    {
+      "name": "malformed json",
+      "raw": "{nope",
+      "ok": false,
+      "code": "not_json"
+    },
+    {
+      "name": "utf8 byte gate precedes json parse",
+      "raw": "é{",
+      "options": { "max_frame_bytes": 1 },
+      "ok": false,
+      "code": "frame_too_large"
+    },
+    {
+      "name": "unsupported protocol version",
+      "raw": "{\"protocol_version\":2,\"kind\":\"hello\",\"workstation_id\":\"w1\"}",
+      "ok": false,
+      "code": "unsupported_protocol_version"
+    },
+    {
+      "name": "unknown kind",
+      "raw": "{\"protocol_version\":1,\"kind\":\"teleport\",\"workstation_id\":\"w1\"}",
+      "ok": false,
+      "code": "unknown_kind"
+    }
+  ],
+  "message_cases": [
+    {
+      "name": "hello valid",
+      "value": { "protocol_version": 1, "kind": "hello", "workstation_id": "w1", "boot_id": "b1", "link_version": "1", "capabilities": ["relay.request"] },
+      "ok": true
+    },
+    {
+      "name": "hello ack success valid",
+      "value": { "protocol_version": 1, "kind": "hello_ack", "workstation_id": "w1", "ok": true, "reconnect": false },
+      "ok": true
+    },
+    {
+      "name": "hello ack failure valid",
+      "value": { "protocol_version": 1, "kind": "hello_ack", "workstation_id": "w1", "ok": false, "code": "auth_rejected", "message": "nope" },
+      "ok": true
+    },
+    {
+      "name": "heartbeat valid",
+      "value": { "protocol_version": 1, "kind": "heartbeat", "workstation_id": "w1", "boot_id": "b1", "sent_at_ms": 1, "active_requests": 0 },
+      "ok": true
+    },
+    {
+      "name": "status valid",
+      "value": { "protocol_version": 1, "kind": "status", "workstation_id": "w1", "query": true },
+      "ok": true
+    },
+    {
+      "name": "tool request valid",
+      "value": { "protocol_version": 1, "kind": "tool_request", "workstation_id": "w1", "request_id": "r1", "operation": "herdr_inspect", "arguments": { "workspace": "w1" }, "timeout_ms": 30000, "idempotency_key": "idem-1" },
+      "ok": true
+    },
+    {
+      "name": "tool result valid",
+      "value": { "protocol_version": 1, "kind": "tool_result", "workstation_id": "w1", "request_id": "r1", "result": { "ok": true }, "served_at_ms": 1, "runtime_generation": "gen-1", "transport_name": "herdr" },
+      "ok": true
+    },
+    {
+      "name": "tool error valid",
+      "value": { "protocol_version": 1, "kind": "tool_error", "workstation_id": "w1", "request_id": "r1", "code": "request_timeout", "retryable": false, "delivery_state": "delivery_unknown" },
+      "ok": true
+    },
+    {
+      "name": "cancel valid",
+      "value": { "protocol_version": 1, "kind": "cancel", "workstation_id": "w1", "request_id": "r1", "reason": "user abort" },
+      "ok": true
+    },
+    {
+      "name": "cancel ack valid",
+      "value": { "protocol_version": 1, "kind": "cancel_ack", "workstation_id": "w1", "request_id": "r1", "accepted": true, "cancelled_at_ms": 1, "reason": null },
+      "ok": true
+    },
+    {
+      "name": "invalid workstation grammar",
+      "value": { "protocol_version": 1, "kind": "hello", "workstation_id": "bad id!", "boot_id": "b1", "link_version": "1", "capabilities": [] },
+      "ok": false,
+      "code": "invalid_workstation_id"
+    },
+    {
+      "name": "correlated kind missing request id",
+      "value": { "protocol_version": 1, "kind": "tool_request", "workstation_id": "w1", "operation": "x" },
+      "ok": false,
+      "code": "missing_request_id"
+    },
+    {
+      "name": "control kind rejects request id",
+      "value": { "protocol_version": 1, "kind": "heartbeat", "workstation_id": "w1", "request_id": "r1", "boot_id": "b1", "sent_at_ms": 1, "active_requests": 0 },
+      "ok": false,
+      "code": "unexpected_request_id"
+    },
+    {
+      "name": "strict unknown field",
+      "value": { "protocol_version": 1, "kind": "heartbeat", "workstation_id": "w1", "boot_id": "b1", "sent_at_ms": 1, "active_requests": 0, "hack": 1 },
+      "ok": false,
+      "code": "unknown_field"
+    },
+    {
+      "name": "unknown field allowed by option",
+      "value": { "protocol_version": 1, "kind": "heartbeat", "workstation_id": "w1", "boot_id": "b1", "sent_at_ms": 1, "active_requests": 0, "hack": 1 },
+      "options": { "strict_unknown_fields": false },
+      "ok": true
+    },
+    {
+      "name": "timeout below minimum",
+      "value": { "protocol_version": 1, "kind": "tool_request", "workstation_id": "w1", "request_id": "r1", "operation": "x", "timeout_ms": 999 },
+      "ok": false,
+      "code": "invalid_number"
+    },
+    {
+      "name": "invalid idempotency key",
+      "value": { "protocol_version": 1, "kind": "tool_request", "workstation_id": "w1", "request_id": "r1", "operation": "x", "idempotency_key": "bad id" },
+      "ok": false,
+      "code": "invalid_id"
+    },
+    {
+      "name": "arguments must be object",
+      "value": { "protocol_version": 1, "kind": "tool_request", "workstation_id": "w1", "request_id": "r1", "operation": "x", "arguments": [] },
+      "ok": false,
+      "code": "invalid_arguments"
+    },
+    {
+      "name": "trace must be object",
+      "value": { "protocol_version": 1, "kind": "tool_request", "workstation_id": "w1", "request_id": "r1", "operation": "x", "trace": [] },
+      "ok": false,
+      "code": "invalid_result"
+    },
+    {
+      "name": "argument byte budget override",
+      "value": { "protocol_version": 1, "kind": "tool_request", "workstation_id": "w1", "request_id": "r1", "operation": "x", "arguments": { "blob": "0123456789" } },
+      "options": { "max_args_bytes": 4 },
+      "ok": false,
+      "code": "payload_too_large"
+    },
+    {
+      "name": "delivery state enum",
+      "value": { "protocol_version": 1, "kind": "tool_error", "workstation_id": "w1", "request_id": "r1", "code": "x", "retryable": false, "delivery_state": "maybe" },
+      "ok": false,
+      "code": "invalid_enum"
+    },
+    {
+      "name": "resume state enum",
+      "value": { "protocol_version": 1, "kind": "hello_ack", "workstation_id": "w1", "ok": true, "resume": [{ "request_id": "r1", "operation": "x", "state": "maybe", "deadline_ms": 1 }] },
+      "ok": false,
+      "code": "invalid_enum"
+    },
+    {
+      "name": "runtime must be object",
+      "value": { "protocol_version": 1, "kind": "hello", "workstation_id": "w1", "boot_id": "b1", "link_version": "1", "capabilities": [], "runtime": [] },
+      "ok": false,
+      "code": "invalid_runtime"
+    },
+    {
+      "name": "capabilities must be strings",
+      "value": { "protocol_version": 1, "kind": "hello", "workstation_id": "w1", "boot_id": "b1", "link_version": "1", "capabilities": [1] },
+      "ok": false,
+      "code": "invalid_capabilities"
+    },
+    {
+      "name": "hello ack failure requires message",
+      "value": { "protocol_version": 1, "kind": "hello_ack", "workstation_id": "w1", "ok": false, "code": "auth_rejected" },
+      "ok": false,
+      "code": "invalid_string"
+    },
+    {
+      "name": "cancel ack requires boolean accepted",
+      "value": { "protocol_version": 1, "kind": "cancel_ack", "workstation_id": "w1", "request_id": "r1", "accepted": "yes", "cancelled_at_ms": 1 },
+      "ok": false,
+      "code": "invalid_boolean"
+    }
+  ]
+}
