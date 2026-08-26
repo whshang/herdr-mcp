@@ -14,6 +14,7 @@
 //!   protocol       — canonical constants + typed Relay v1 wire message model.
 //!   validation     — strict per-kind frame validation (unknown-field + bounds),
 //!                    including the raw byte gate and canonical payload budgets.
+//!   wire           — validated typed frame encode/decode + pure message builders.
 //!
 //! # Scoping note
 //!
@@ -33,3 +34,4 @@ pub mod contract;
 pub mod errors;
 pub mod protocol;
 pub mod validation;
+pub mod wire;
