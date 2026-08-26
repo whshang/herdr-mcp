@@ -48,10 +48,25 @@ jobs:
           source_contract_epoch="$(jq -r '.contract_epoch' <<<"$source_contract")"
           source_contract_hash="$(jq -r '.contract_hash' <<<"$source_contract")"
           source_tool_count="$(jq -r '.tool_count' <<<"$source_contract")"
-          source_targets="$(git show "${source_digest}:.github/rust-release-targets.json")"
-          jq -e '.schema_version == 1 and (.targets | length > 0) and ([.targets[].runner, .targets[].target] | all(type == "string" and length > 0))' <<<"$source_targets" >/dev/null
-          source_target_matrix="$(jq -c '.targets' <<<"$source_targets")"
-          source_target_count="$(jq '.targets | length' <<<"$source_targets")"
+
+          if git cat-file -e "${source_digest}:.github/rust-release-targets.json" 2>/dev/null; then
+            source_target_contract="$RUNNER_TEMP/rust-release-targets-${SOURCE_RUN_ID}.json"
+            git show "${source_digest}:.github/rust-release-targets.json" > "$source_target_contract"
+            source_resolution="$(node scripts/resolve-rust-release-recovery-targets.mjs \
+              --contract-file "$source_target_contract")"
+          else
+            source_release_workflow="$RUNNER_TEMP/rust-release-${SOURCE_RUN_ID}.yml"
+            source_manifest_builder="$RUNNER_TEMP/build-rust-release-manifest-${SOURCE_RUN_ID}.mjs"
+            git show "${source_digest}:.github/workflows/rust-release.yml" > "$source_release_workflow"
+            git show "${source_digest}:scripts/build-rust-release-manifest.mjs" > "$source_manifest_builder"
+            source_resolution="$(node scripts/resolve-rust-release-recovery-targets.mjs \
+              --legacy-workflow-file "$source_release_workflow" \
+              --legacy-manifest-builder-file "$source_manifest_builder")"
+          fi
+          source_target_mode="$(jq -r '.mode' <<<"$source_resolution")"
+          source_manifest_schema="$(jq -r '.manifest_schema' <<<"$source_resolution")"
+          source_target_matrix="$(jq -c '.targets' <<<"$source_resolution")"
+          source_target_count="$(jq '.targets | length' <<<"$source_resolution")"
           source_release_asset_count="$((source_target_count + 1))"
 
           run_json="$(gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID")"
@@ -62,12 +77,18 @@ jobs:
 
           jobs_json="$(gh api --paginate "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID/jobs?per_page=100")"
           jq -e '[.jobs[] | select(.name=="verify" and .conclusion=="success")] | length == 1' <<<"$jobs_json" >/dev/null
-          jq -e '[.jobs[] | select(.name=="targets" and .conclusion=="success")] | length == 1' <<<"$jobs_json" >/dev/null
+          if [[ "$source_target_mode" == "contract-v1" ]]; then
+            jq -e '[.jobs[] | select(.name=="targets" and .conclusion=="success")] | length == 1' <<<"$jobs_json" >/dev/null
+          else
+            jq -e '[.jobs[] | select(.name=="targets")] | length == 0' <<<"$jobs_json" >/dev/null
+          fi
           jq -e '[.jobs[] | select(.name=="manifest" and .conclusion=="success")] | length == 1' <<<"$jobs_json" >/dev/null
           jq -e '[.jobs[] | select(.name=="attest" and .conclusion=="success")] | length == 1' <<<"$jobs_json" >/dev/null
-          expected_build_jobs="$(jq -c '[.targets[] | "build (\(.runner), \(.target))"] | sort' <<<"$source_targets")"
-          actual_build_jobs="$(jq -c '[.jobs[] | select((.name | startswith("build (")) and .conclusion=="success") | .name] | sort' <<<"$jobs_json")"
-          [[ "$actual_build_jobs" == "$expected_build_jobs" ]] || { echo "source run build matrix does not match tagged target contract" >&2; exit 1; }
+          expected_build_jobs="$(jq -c '[.[] | "build (\(.runner), \(.target))"] | sort' <<<"$source_target_matrix")"
+          actual_build_jobs="$(jq -c '[.jobs[] | select(.name | startswith("build (")) | .name] | sort' <<<"$jobs_json")"
+          successful_build_jobs="$(jq -c '[.jobs[] | select((.name | startswith("build (")) and .conclusion=="success") | .name] | sort' <<<"$jobs_json")"
+          [[ "$actual_build_jobs" == "$expected_build_jobs" ]] || { echo "source run build matrix does not match tagged source targets" >&2; exit 1; }
+          [[ "$successful_build_jobs" == "$expected_build_jobs" ]] || { echo "not every tagged source build job completed successfully" >&2; exit 1; }
 
           artifacts_json="$(gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100")"
           jq -e '[.artifacts[] | select(.name=="rust-release-bundle" and .expired==false)] | length == 1' <<<"$artifacts_json" >/dev/null
@@ -78,6 +99,8 @@ jobs:
           echo "source_contract_epoch=$source_contract_epoch" >> "$GITHUB_OUTPUT"
           echo "source_contract_hash=$source_contract_hash" >> "$GITHUB_OUTPUT"
           echo "source_tool_count=$source_tool_count" >> "$GITHUB_OUTPUT"
+          echo "source_target_mode=$source_target_mode" >> "$GITHUB_OUTPUT"
+          echo "source_manifest_schema=$source_manifest_schema" >> "$GITHUB_OUTPUT"
           echo "source_target_matrix=$source_target_matrix" >> "$GITHUB_OUTPUT"
           echo "source_release_asset_count=$source_release_asset_count" >> "$GITHUB_OUTPUT"
 
@@ -99,6 +122,7 @@ jobs:
           SOURCE_CONTRACT_EPOCH: ${{ steps.source.outputs.source_contract_epoch }}
           SOURCE_CONTRACT_HASH: ${{ steps.source.outputs.source_contract_hash }}
           SOURCE_TOOL_COUNT: ${{ steps.source.outputs.source_tool_count }}
+          SOURCE_MANIFEST_SCHEMA: ${{ steps.source.outputs.source_manifest_schema }}
           SOURCE_TARGET_MATRIX: ${{ steps.source.outputs.source_target_matrix }}
           SOURCE_DIGEST: ${{ steps.source.outputs.source_digest }}
           GH_REPOSITORY_ID: ${{ github.repository_id }}
@@ -122,37 +146,39 @@ jobs:
           source_contract_epoch = int(os.environ["SOURCE_CONTRACT_EPOCH"])
           source_contract_hash = os.environ["SOURCE_CONTRACT_HASH"]
           source_tool_count = int(os.environ["SOURCE_TOOL_COUNT"])
+          source_manifest_schema = int(os.environ["SOURCE_MANIFEST_SCHEMA"])
           source_digest = os.environ["SOURCE_DIGEST"]
           repository_id = int(os.environ["GH_REPOSITORY_ID"])
           target_matrix = json.loads(os.environ["SOURCE_TARGET_MATRIX"])
           targets = [entry["target"] for entry in target_matrix]
-          if manifest.get("schema_version") != 2 or manifest.get("product") != "herdr-mcp":
+          if manifest.get("schema_version") != source_manifest_schema or manifest.get("product") != "herdr-mcp":
               raise SystemExit("invalid release manifest identity")
           if manifest.get("tag") != tag or manifest.get("version") != source_version:
               raise SystemExit("release manifest version/tag mismatch")
           if manifest.get("state_schema") != source_state_schema:
               raise SystemExit("release manifest state schema mismatch")
-          if manifest.get("release_identity") != {
-              "tag": tag,
-              "source_commit": source_digest,
-              "source_ref": f"refs/tags/{tag}",
-          }:
-              raise SystemExit("release manifest source identity mismatch")
-          if manifest.get("repository_identity") != {
-              "repository": repo,
-              "repository_id": repository_id,
-          }:
-              raise SystemExit("release manifest repository identity mismatch")
-          if manifest.get("provenance") != {
-              "predicate_type": "https://slsa.dev/provenance/v1",
-              "attestation": "github-artifact-attestation",
-              "bundle_media_type": "application/vnd.dev.sigstore.bundle.v0.3+json",
-              "workflow": ".github/workflows/rust-release.yml",
-              "workflow_name": "Rust Release",
-              "issuer": "https://token.actions.githubusercontent.com",
-              "runner_environment": "github-hosted",
-          }:
-              raise SystemExit("release manifest provenance identity mismatch")
+          if source_manifest_schema == 2:
+              if manifest.get("release_identity") != {
+                  "tag": tag,
+                  "source_commit": source_digest,
+                  "source_ref": f"refs/tags/{tag}",
+              }:
+                  raise SystemExit("release manifest source identity mismatch")
+              if manifest.get("repository_identity") != {
+                  "repository": repo,
+                  "repository_id": repository_id,
+              }:
+                  raise SystemExit("release manifest repository identity mismatch")
+              if manifest.get("provenance") != {
+                  "predicate_type": "https://slsa.dev/provenance/v1",
+                  "attestation": "github-artifact-attestation",
+                  "bundle_media_type": "application/vnd.dev.sigstore.bundle.v0.3+json",
+                  "workflow": ".github/workflows/rust-release.yml",
+                  "workflow_name": "Rust Release",
+                  "issuer": "https://token.actions.githubusercontent.com",
+                  "runner_environment": "github-hosted",
+              }:
+                  raise SystemExit("release manifest provenance identity mismatch")
           contract = manifest.get("contract") or {}
           if contract != {
               "epoch": source_contract_epoch,

@@ -150,9 +150,16 @@ test("Rust Release recovery republishes only a previously attested GitHub run", 
   assert.match(recovery, /name: rust-release-bundle/);
   assert.match(recovery, /\.github\/workflows\/rust-release\.yml/);
   assert.match(recovery, /\.github\/rust-release-targets\.json/);
+  assert.match(recovery, /resolve-rust-release-recovery-targets\.mjs/);
+  assert.match(recovery, /git cat-file -e "\$\{source_digest\}:\.github\/rust-release-targets\.json"/);
+  assert.match(recovery, /git show "\$\{source_digest\}:\.github\/workflows\/rust-release\.yml"/);
+  assert.match(recovery, /git show "\$\{source_digest\}:scripts\/build-rust-release-manifest\.mjs"/);
+  assert.match(recovery, /source_target_mode/);
+  assert.match(recovery, /source_manifest_schema/);
   assert.match(recovery, /source_target_matrix/);
-  assert.match(recovery, /source run build matrix does not match tagged target contract/);
-  assert.match(recovery, /manifest\.get\(\"schema_version\"\) != 2/);
+  assert.match(recovery, /source run build matrix does not match tagged source targets/);
+  assert.match(recovery, /manifest\.get\(\"schema_version\"\) != source_manifest_schema/);
+  assert.match(recovery, /source_manifest_schema == 2/);
   assert.match(recovery, /release manifest source identity mismatch/);
   assert.match(recovery, /release manifest repository identity mismatch/);
   assert.match(recovery, /release manifest provenance identity mismatch/);
