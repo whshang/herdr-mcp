@@ -28,6 +28,8 @@
 
 Rust service mutations (`service install`, `start`, `stop`, `restart`, `rollback`, `uninstall`, and update activation) must run from an independent process/terminal. Do not run them from a managed `herdr_exec` session: restarting `dev.herdr-mcp.server` can terminate the process carrying its own control transaction. Read-only `service status` is safe from managed execution.
 
+Destructive service/update/native-host lifecycle mutations must never use `launchctl submit`. Inferred launchd jobs may replay after the command exits and can consume rollback or repeat another non-idempotent mutation. Use the managed lifecycle path or an explicit one-shot plist with `RunAtLoad=true` and `KeepAlive=false` when an independent launchd job is required.
+
 Before a lifecycle mutation, capture live state instead of trusting a handoff or previous message:
 
 ```bash
