@@ -12,7 +12,7 @@
 //!   contract       — contract manifest normalization, SHA-256 hash, shape check.
 //!   errors         — delivery-state & retryability taxonomy + error codes.
 //!   validation     — strict per-kind frame validation (unknown-field + bounds),
-//!                    deferred to a later batch after this foundation is green.
+//!                    including the raw byte gate and canonical payload budgets.
 //!
 //! # Scoping note
 //!
@@ -30,3 +30,4 @@
 pub mod canonical_json;
 pub mod contract;
 pub mod errors;
+pub mod validation;
