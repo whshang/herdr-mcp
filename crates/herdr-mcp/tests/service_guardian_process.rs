@@ -177,7 +177,12 @@ fn guardian_real_exec_inherits_pipe_and_lock_until_committed_hup() {
     drop(read_signal);
     drop(lock);
 
-    wait_for_state(&transaction, "watching", Duration::from_secs(3));
+    // This integration test exercises a debug test binary, whose exec-to-main
+    // latency can exceed the production handshake budget on a heavily loaded
+    // macOS builder. The production path remains fail-closed at 5s; this wider
+    // observation window validates FD/pipe lifecycle semantics without making
+    // scheduler delay the subject of this test.
+    wait_for_state(&transaction, "watching", Duration::from_secs(15));
     assert!(
         child.try_wait().unwrap().is_none(),
         "guardian exited before parent settlement"

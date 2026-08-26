@@ -53,7 +53,7 @@ mod macos {
     const LAUNCHD_ABSENT_BUDGET: Duration = Duration::from_secs(2);
     const LAUNCHD_BOOTOUT_BUDGET: Duration = Duration::from_secs(10);
     const LAUNCHD_RECOVERY_BUDGET: Duration = Duration::from_secs(15);
-    const GUARDIAN_HANDSHAKE_BUDGET: Duration = Duration::from_secs(2);
+    const GUARDIAN_HANDSHAKE_BUDGET: Duration = Duration::from_secs(5);
     const GUARDIAN_EXIT_BUDGET: Duration = Duration::from_secs(2);
     const GUARDIAN_MAX_LIFETIME: Duration = Duration::from_secs(300);
     const GUARDIAN_PARENT_FD: i32 = 198;
@@ -883,11 +883,11 @@ mod macos {
                     "guardian child handshake timed out",
                 );
                 return Err(match cleanup {
-                    Ok(()) => {
-                        "service guardian did not confirm watching state within 2s".to_owned()
-                    }
+                    Ok(()) => format!(
+                        "service guardian did not confirm watching state within {GUARDIAN_HANDSHAKE_BUDGET:?}"
+                    ),
                     Err(cleanup_error) => format!(
-                        "service guardian did not confirm watching state within 2s; startup cleanup failed: {cleanup_error}"
+                        "service guardian did not confirm watching state within {GUARDIAN_HANDSHAKE_BUDGET:?}; startup cleanup failed: {cleanup_error}"
                     ),
                 });
             }
@@ -3584,7 +3584,24 @@ mod macos {
             let first = ServiceMutationLock::acquire(&paths).unwrap();
             assert!(ServiceMutationLock::acquire(&paths).is_err());
             drop(first);
-            let second = ServiceMutationLock::acquire(&paths).unwrap();
+            // On macOS flock state follows the open file description across fork(2).
+            // Parallel tests can therefore inherit this unique fixture lock for the
+            // short fork-to-exec window even after the parent File has been dropped.
+            // Wait only for that bounded CLOEXEC handoff; a persistent lock leak must
+            // still fail this test.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let second = loop {
+                match ServiceMutationLock::acquire(&paths) {
+                    Ok(lock) => break lock,
+                    Err(error)
+                        if error.starts_with("another service mutation is in progress:")
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("service mutation lock was not released: {error}"),
+                }
+            };
             drop(second);
             fs::remove_dir_all(root).unwrap();
         }
