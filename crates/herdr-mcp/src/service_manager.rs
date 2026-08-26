@@ -1325,6 +1325,26 @@ mod macos {
         adopt_node: bool,
         mutation_lock: &ServiceMutationLock,
     ) -> Result<Value, String> {
+        install_with_noop_checks(
+            paths,
+            adopt_node,
+            mutation_lock,
+            || is_loaded(SERVICE_LABEL),
+            || health_once(DEFAULT_PORT),
+        )
+    }
+
+    fn install_with_noop_checks<Loaded, Healthy>(
+        paths: &ServicePaths,
+        adopt_node: bool,
+        mutation_lock: &ServiceMutationLock,
+        loaded: Loaded,
+        healthy: Healthy,
+    ) -> Result<Value, String>
+    where
+        Loaded: FnOnce() -> bool,
+        Healthy: FnOnce() -> bool,
+    {
         let existing_bytes = read_optional_bounded(&paths.plist, 256 * 1024)?;
         let existing = describe_service(existing_bytes.as_deref(), paths)?;
         match existing.kind {
@@ -1350,6 +1370,10 @@ mod macos {
                 "legacy watchdog is still installed; only explicit Node adoption may retire it"
                     .to_owned(),
             );
+        }
+
+        if let Some(result) = same_active_install_noop_with(paths, &existing, loaded, healthy)? {
+            return Ok(result);
         }
 
         let generation = prepare_generation(paths)?;
@@ -1561,6 +1585,142 @@ mod macos {
             "guardian_settled": guardian_settled,
             "evidence_recorded": evidence_recorded,
         }))
+    }
+
+    fn same_active_install_noop_with<Loaded, Healthy>(
+        paths: &ServicePaths,
+        existing: &ServiceDescriptor,
+        loaded: Loaded,
+        healthy: Healthy,
+    ) -> Result<Option<Value>, String>
+    where
+        Loaded: FnOnce() -> bool,
+        Healthy: FnOnce() -> bool,
+    {
+        if existing.kind != ServiceKind::Rust {
+            return Ok(None);
+        }
+
+        let sha256 = file_sha256(&paths.source_binary)?;
+        let generation_id = format!("rust-{}", &sha256[..16]);
+
+        // Resolve the active generation; propagate errors rather than swallowing
+        // them so a malformed or non-symlink runtime/current fails closed.
+        let Some(target) = current_target(paths)? else {
+            return Ok(None);
+        };
+        if !is_owned_generation_target(&target) {
+            return Err(format!(
+                "runtime/current points outside managed generations: {}",
+                target.display()
+            ));
+        }
+        let Some(current_generation) = generation_id_from_target(&target) else {
+            return Err("runtime/current target is not a managed generation".to_owned());
+        };
+        if current_generation != generation_id {
+            return Ok(None);
+        }
+
+        // Verify the generation directory itself is a real directory, not a
+        // symlink; a symlinked generation dir is an unsafe path and must fail
+        // closed. A missing generation dir falls through to repair like a
+        // missing binary.
+        let generation_dir = paths.generations_dir.join(&generation_id);
+        match fs::symlink_metadata(&generation_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "installed generation directory must not be a symlink: {}",
+                    generation_dir.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!(
+                    "installed generation directory is not a directory: {}",
+                    generation_dir.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect installed generation directory {}: {}",
+                    generation_dir.display(),
+                    error
+                ));
+            }
+        }
+
+        // Verify the installed generation binary is a regular non-symlink file
+        // whose full SHA equals the source SHA. Missing or hash-mismatched
+        // binaries fall through to repair; symlink/unsafe paths fail closed.
+        let installed_binary = generation_dir.join("herdr-mcp");
+        let installed_sha = match fs::symlink_metadata(&installed_binary) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "installed generation binary must not be a symlink: {}",
+                    installed_binary.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(format!(
+                    "installed generation binary is not a regular file: {}",
+                    installed_binary.display()
+                ));
+            }
+            Ok(_) => file_sha256(&installed_binary)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect installed generation binary {}: {}",
+                    installed_binary.display(),
+                    error
+                ));
+            }
+        };
+        if installed_sha != sha256 {
+            return Ok(None);
+        }
+
+        // The service plist descriptor must name the active generation.
+        if existing
+            .env
+            .get("HERDR_MCP_RUNTIME_GENERATION")
+            .map(String::as_str)
+            != Some(generation_id.as_str())
+        {
+            return Ok(None);
+        }
+
+        if !loaded() || !healthy() {
+            return Ok(None);
+        }
+
+        Ok(Some(json!({
+            "ok": true,
+            "implementation": "rust",
+            "label": SERVICE_LABEL,
+            "already_active": true,
+            "changed": false,
+            "generation": generation_id,
+            "sha256": sha256,
+            "runtime_binary": paths.generations_dir.join(&generation_id).join("herdr-mcp"),
+            "current_binary": paths.current_binary,
+            "plist": paths.plist,
+            "extension_socket": paths.extension_socket,
+            "adopted_node": false,
+            "retired_legacy_watchdog": false,
+            "backups": [],
+            "rollback_id": Value::Null,
+            "rollback_ready": false,
+            "guardian_transaction": Value::Null,
+            "guardian_settled": Value::Null,
+            "evidence_recorded": false,
+        })))
     }
 
     fn status(paths: &ServicePaths) -> Result<Value, String> {
@@ -2914,6 +3074,337 @@ mod macos {
             );
             remove_current_if_owned(&paths).unwrap();
             assert!(current_target(&paths).unwrap().is_none());
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn same_active_install_preflight_is_a_true_noop() {
+            let (root, paths) = fixture();
+            let generation = prepare_generation(&paths).unwrap();
+            switch_current(&paths, &generation).unwrap();
+            let env = service_environment(&paths, &BTreeMap::new(), &generation).unwrap();
+            let plist = encode_service_plist(&paths, &env).unwrap();
+            fs::create_dir_all(paths.plist.parent().unwrap()).unwrap();
+            fs::write(&paths.plist, &plist).unwrap();
+
+            let lock = ServiceMutationLock::acquire(&paths).unwrap();
+
+            let binary_before = fs::read(&generation.binary).unwrap();
+            let plist_before = fs::read(&paths.plist).unwrap();
+            let current_before = fs::read_link(&paths.current_link).unwrap();
+            let backups_before = paths.backups_dir.exists();
+            let guardians_before = paths.guardians_dir.exists();
+            let mut config_entries_before = fs::read_dir(&paths.config_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            config_entries_before.sort();
+
+            let result = install_with_noop_checks(&paths, false, &lock, || true, || true).unwrap();
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["already_active"], true);
+            assert_eq!(result["changed"], false);
+            assert_eq!(result["generation"], generation.generation_id);
+            assert_eq!(result["sha256"], generation.sha256);
+            assert_eq!(fs::read(&generation.binary).unwrap(), binary_before);
+            assert_eq!(fs::read(&paths.plist).unwrap(), plist_before);
+            assert_eq!(fs::read_link(&paths.current_link).unwrap(), current_before);
+            assert_eq!(paths.backups_dir.exists(), backups_before);
+            assert_eq!(paths.guardians_dir.exists(), guardians_before);
+            let mut config_entries_after = fs::read_dir(&paths.config_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            config_entries_after.sort();
+            assert_eq!(config_entries_after, config_entries_before);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        fn rust_descriptor(generation_id: &str) -> ServiceDescriptor {
+            ServiceDescriptor {
+                kind: ServiceKind::Rust,
+                env: BTreeMap::from([(
+                    "HERDR_MCP_RUNTIME_GENERATION".to_owned(),
+                    generation_id.to_owned(),
+                )]),
+            }
+        }
+
+        #[test]
+        fn same_active_install_preflight_falls_through_when_any_gate_fails() {
+            let (root, paths) = fixture();
+            let generation = prepare_generation(&paths).unwrap();
+            switch_current(&paths, &generation).unwrap();
+            let matching = rust_descriptor(&generation.generation_id);
+
+            // Non-Rust service kind is never a no-op.
+            assert!(
+                same_active_install_noop_with(
+                    &paths,
+                    &ServiceDescriptor {
+                        kind: ServiceKind::Node,
+                        env: BTreeMap::new(),
+                    },
+                    || true,
+                    || true,
+                )
+                .unwrap()
+                .is_none()
+            );
+
+            // Missing runtime/current falls through.
+            fs::remove_file(&paths.current_link).unwrap();
+            assert!(
+                same_active_install_noop_with(&paths, &matching, || true, || true,)
+                    .unwrap()
+                    .is_none()
+            );
+            switch_current(&paths, &generation).unwrap();
+
+            // Non-symlink runtime/current fails closed.
+            fs::remove_file(&paths.current_link).unwrap();
+            fs::write(&paths.current_link, b"not-a-symlink").unwrap();
+            assert!(same_active_install_noop_with(&paths, &matching, || true, || true,).is_err());
+            fs::remove_file(&paths.current_link).unwrap();
+            switch_current(&paths, &generation).unwrap();
+
+            // Unowned runtime/current target fails closed.
+            fs::remove_file(&paths.current_link).unwrap();
+            symlink("generations/other", &paths.current_link).unwrap();
+            assert!(same_active_install_noop_with(&paths, &matching, || true, || true,).is_err());
+            fs::remove_file(&paths.current_link).unwrap();
+            switch_current(&paths, &generation).unwrap();
+
+            // Mismatched generation id falls through.
+            fs::remove_file(&paths.current_link).unwrap();
+            symlink("generations/rust-other", &paths.current_link).unwrap();
+            let mut loaded_called = false;
+            assert!(
+                same_active_install_noop_with(
+                    &paths,
+                    &matching,
+                    || {
+                        loaded_called = true;
+                        true
+                    },
+                    || true,
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                !loaded_called,
+                "launchd probe must not run for a mismatched generation"
+            );
+            fs::remove_file(&paths.current_link).unwrap();
+            switch_current(&paths, &generation).unwrap();
+
+            // Missing installed generation binary falls through.
+            fs::remove_file(&generation.binary).unwrap();
+            assert!(
+                same_active_install_noop_with(&paths, &matching, || true, || true,)
+                    .unwrap()
+                    .is_none()
+            );
+            fs::write(&generation.binary, b"rust-binary-fixture").unwrap();
+            fs::set_permissions(&generation.binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+            // Installed generation binary hash mismatch falls through.
+            fs::write(&generation.binary, b"tampered-binary").unwrap();
+            fs::set_permissions(&generation.binary, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                same_active_install_noop_with(&paths, &matching, || true, || true,)
+                    .unwrap()
+                    .is_none()
+            );
+            fs::write(&generation.binary, b"rust-binary-fixture").unwrap();
+            fs::set_permissions(&generation.binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+            // Installed generation binary symlink fails closed.
+            fs::remove_file(&generation.binary).unwrap();
+            symlink("../../herdr-mcp-source", &generation.binary).unwrap();
+            assert!(same_active_install_noop_with(&paths, &matching, || true, || true,).is_err());
+            fs::remove_file(&generation.binary).unwrap();
+            fs::write(&generation.binary, b"rust-binary-fixture").unwrap();
+            fs::set_permissions(&generation.binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+            // Installed generation directory symlink fails closed.
+            let generation_dir = paths.generations_dir.join(&generation.generation_id);
+            fs::remove_dir_all(&generation_dir).unwrap();
+            symlink("outside", &generation_dir).unwrap();
+            assert!(same_active_install_noop_with(&paths, &matching, || true, || true,).is_err());
+            fs::remove_file(&generation_dir).unwrap();
+            fs::create_dir_all(&generation_dir).unwrap();
+            fs::write(&generation.binary, b"rust-binary-fixture").unwrap();
+            fs::set_permissions(&generation.binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+            // Plist generation env mismatch falls through.
+            let mismatched = rust_descriptor("rust-other");
+            assert!(
+                same_active_install_noop_with(&paths, &mismatched, || true, || true,)
+                    .unwrap()
+                    .is_none()
+            );
+
+            // Unloaded service falls through; health must not run.
+            let mut health_called = false;
+            assert!(
+                same_active_install_noop_with(
+                    &paths,
+                    &matching,
+                    || false,
+                    || {
+                        health_called = true;
+                        true
+                    },
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                !health_called,
+                "health must not run for an unloaded service"
+            );
+
+            // Loaded but unhealthy service falls through.
+            assert!(
+                same_active_install_noop_with(&paths, &matching, || true, || false,)
+                    .unwrap()
+                    .is_none()
+            );
+
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn same_active_install_noops_even_with_adopt_node_when_rust_owned() {
+            let (root, paths) = fixture();
+            let generation = prepare_generation(&paths).unwrap();
+            switch_current(&paths, &generation).unwrap();
+            let env = service_environment(&paths, &BTreeMap::new(), &generation).unwrap();
+            let plist = encode_service_plist(&paths, &env).unwrap();
+            fs::create_dir_all(paths.plist.parent().unwrap()).unwrap();
+            fs::write(&paths.plist, &plist).unwrap();
+
+            let lock = ServiceMutationLock::acquire(&paths).unwrap();
+            let result = install_with_noop_checks(&paths, true, &lock, || true, || true).unwrap();
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["already_active"], true);
+            assert_eq!(result["changed"], false);
+            assert_eq!(result["generation"], generation.generation_id);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn same_active_install_full_path_fails_closed_on_non_symlink_current_without_side_effects()
+        {
+            let (root, paths) = fixture();
+            let generation = prepare_generation(&paths).unwrap();
+            switch_current(&paths, &generation).unwrap();
+            let env = service_environment(&paths, &BTreeMap::new(), &generation).unwrap();
+            let plist = encode_service_plist(&paths, &env).unwrap();
+            fs::create_dir_all(paths.plist.parent().unwrap()).unwrap();
+            fs::write(&paths.plist, &plist).unwrap();
+
+            let lock = ServiceMutationLock::acquire(&paths).unwrap();
+
+            // Replace runtime/current with a regular file so the full preflight
+            // fails closed before any mutation. Take the baseline only after this
+            // intentional fixture mutation, so the regular file itself is pinned.
+            fs::remove_file(&paths.current_link).unwrap();
+            fs::write(&paths.current_link, b"not-a-symlink").unwrap();
+
+            let binary_before = fs::read(&generation.binary).unwrap();
+            let plist_before = fs::read(&paths.plist).unwrap();
+            let current_before = fs::read(&paths.current_link).unwrap();
+            let current_kind_before = fs::symlink_metadata(&paths.current_link)
+                .unwrap()
+                .file_type()
+                .is_symlink();
+            let backups_before = paths.backups_dir.exists();
+            let guardians_before = paths.guardians_dir.exists();
+            let mut config_entries_before = fs::read_dir(&paths.config_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            config_entries_before.sort();
+
+            assert!(install_with_noop_checks(&paths, false, &lock, || true, || true).is_err());
+
+            assert_eq!(fs::read(&generation.binary).unwrap(), binary_before);
+            assert_eq!(fs::read(&paths.plist).unwrap(), plist_before);
+            assert_eq!(fs::read(&paths.current_link).unwrap(), current_before);
+            assert_eq!(
+                fs::symlink_metadata(&paths.current_link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                current_kind_before
+            );
+            assert_eq!(paths.backups_dir.exists(), backups_before);
+            assert_eq!(paths.guardians_dir.exists(), guardians_before);
+            let mut config_entries_after = fs::read_dir(&paths.config_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            config_entries_after.sort();
+            assert_eq!(config_entries_after, config_entries_before);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn same_active_install_full_path_fails_closed_on_symlinked_generation_dir_without_side_effects()
+         {
+            let (root, paths) = fixture();
+            let generation = prepare_generation(&paths).unwrap();
+            switch_current(&paths, &generation).unwrap();
+            let env = service_environment(&paths, &BTreeMap::new(), &generation).unwrap();
+            let plist = encode_service_plist(&paths, &env).unwrap();
+            fs::create_dir_all(paths.plist.parent().unwrap()).unwrap();
+            fs::write(&paths.plist, &plist).unwrap();
+
+            let lock = ServiceMutationLock::acquire(&paths).unwrap();
+
+            // Replace the generation directory with a symlink so the full
+            // preflight fails closed before any mutation. Take the baseline only
+            // after this intentional fixture mutation.
+            let generation_dir = paths.generations_dir.join(&generation.generation_id);
+            fs::remove_dir_all(&generation_dir).unwrap();
+            symlink("outside", &generation_dir).unwrap();
+
+            let plist_before = fs::read(&paths.plist).unwrap();
+            let current_before = fs::read_link(&paths.current_link).unwrap();
+            let generation_dir_kind_before = fs::symlink_metadata(&generation_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink();
+            let backups_before = paths.backups_dir.exists();
+            let guardians_before = paths.guardians_dir.exists();
+            let mut config_entries_before = fs::read_dir(&paths.config_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            config_entries_before.sort();
+
+            assert!(install_with_noop_checks(&paths, false, &lock, || true, || true).is_err());
+
+            assert_eq!(fs::read(&paths.plist).unwrap(), plist_before);
+            assert_eq!(fs::read_link(&paths.current_link).unwrap(), current_before);
+            assert_eq!(
+                fs::symlink_metadata(&generation_dir)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                generation_dir_kind_before
+            );
+            assert_eq!(paths.backups_dir.exists(), backups_before);
+            assert_eq!(paths.guardians_dir.exists(), guardians_before);
+            let mut config_entries_after = fs::read_dir(&paths.config_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            config_entries_after.sort();
+            assert_eq!(config_entries_after, config_entries_before);
             fs::remove_dir_all(root).unwrap();
         }
 
