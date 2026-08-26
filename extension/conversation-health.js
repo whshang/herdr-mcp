@@ -38,6 +38,17 @@ function createConversationHealth(convKey, continuityId = null) {
     thread_error_retry_attempt: 0,
     thread_error_reload_attempt: 0,
     thread_error_last_seen_at: null,
+    page_health_state: "healthy",
+    page_health_checked_at: null,
+    page_health_high_since: null,
+    page_health_reason: null,
+    page_health_background_reload_attempt: 0,
+    page_health_last_background_reload_at: null,
+    page_health_background_reload_executed_at: null,
+    network_429_count: 0,
+    network_429_last_seen_at: null,
+    network_429_source: null,
+    network_backoff_until: null,
     reload_reason: null,
   };
 }
@@ -57,6 +68,11 @@ function markReplyWaiting(record, at = Date.now()) {
     thread_error_retry_attempt: 0,
     thread_error_reload_attempt: 0,
     thread_error_last_seen_at: null,
+    page_health_state: "healthy",
+    page_health_checked_at: null,
+    page_health_high_since: null,
+    page_health_reason: null,
+    page_health_background_reload_attempt: 0,
     reload_reason: null,
   };
 }
@@ -91,6 +107,11 @@ function markTurnEnded(record, at = Date.now()) {
     thread_error_retry_attempt: 0,
     thread_error_reload_attempt: 0,
     thread_error_last_seen_at: null,
+    page_health_state: "healthy",
+    page_health_checked_at: at,
+    page_health_high_since: null,
+    page_health_reason: null,
+    page_health_background_reload_attempt: 0,
     reload_reason: null,
   };
 }

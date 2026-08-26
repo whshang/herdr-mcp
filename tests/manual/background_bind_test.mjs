@@ -45,7 +45,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}" };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.63" };
 const listeners = { onMessage: [], onStartup: [], onInstalled: [], onActivated: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
@@ -62,6 +62,7 @@ let seedTemplateCaptures = [];
 let tabCreateCount = 0;
 let tabUpdateCount = 0;
 let lastTabUpdate = null;
+const reloadCalls = [];
 let projectNavigationReadyAfter = 0;
 let projectNavigationPollCount = 0;
 let sourceProbeLooksSeeded = false;
@@ -329,7 +330,7 @@ globalThis.chrome = {
       tab.status = "complete";
       return { id: tab.id, url: tab.url, status: tab.status, active: tab.active };
     },
-    reload: () => {},
+    async reload(tabId, options) { reloadCalls.push({ tabId, options }); },
     onActivated: { addListener: (fn) => listeners.onActivated.push(fn) },
   },
   scripting: { executeScript: async () => [{ result: { ok: true } }] },
@@ -362,6 +363,157 @@ function installContentScript(tabId, url, convKey, site = "chatgpt") {
 await import(pathToFileURL(path.join(__dirname, "..", "..", "extension", "background.js")).href);
 const onMsg = listeners.onMessage[0];
 ok(!!onMsg, "background onMessage listener registered");
+
+function dispatchMessage(msg, sender = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    onMsg(msg, sender, done);
+    setTimeout(() => done(undefined), 1000);
+  });
+}
+
+// ---- Page-health forced reload is sender-scoped, durable, and bounded ----
+console.log("\n[page-health forced reload]");
+{
+  const tabId = 99;
+  installContentScript(tabId, CHATGPT_AUTO_CONV, CHATGPT_AUTO_CONV);
+  const sender = { tab: { id: tabId, url: CHATGPT_AUTO_CONV } };
+  const enabled = await dispatchMessage({
+    type: "h2w_set_project_automation",
+    convKey: CHATGPT_AUTO_CONV,
+    site: "chatgpt",
+    enabled: true,
+  }, sender);
+  ok(enabled?.ok === true && enabled.conversation_automation_enabled === true,
+    "plain ChatGPT conversation can opt in to page-health automation", JSON.stringify(enabled));
+
+  const now = Date.now();
+  storage.h2wConversationHealthByConv = {
+    [CHATGPT_AUTO_CONV]: {
+      convKey: CHATGPT_AUTO_CONV,
+      page_health_state: "background_reload_pending",
+      page_health_background_reload_attempt: 1,
+      page_health_last_background_reload_at: now,
+      page_health_background_reload_executed_at: null,
+      reload_reason: "page_health_render_stall",
+    },
+  };
+  const forced = await dispatchMessage({
+    type: "h2w_force_tab_reload",
+    // Deliberately include a fake tabId: production must ignore it and use the
+    // authenticated sender tab only.
+    tabId: 123456,
+    convKey: CHATGPT_AUTO_CONV,
+    reason: "page_health_render_stall",
+  }, sender);
+  ok(forced?.ok === true && forced?.scheduled === true && forced?.tabId === tabId,
+    "forced page-health reload accepts one durable sender-scoped request", JSON.stringify(forced));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  ok(reloadCalls.filter((call) => call.tabId === tabId).length === 1
+      && reloadCalls.every((call) => call.tabId !== 123456),
+    "forced reload targets sender.tab only and ignores message tabId");
+  ok(Number(storage.h2wConversationHealthByConv[CHATGPT_AUTO_CONV]?.page_health_background_reload_executed_at || 0) >= now,
+    "background persists execution before navigating the tab");
+
+  const duplicate = await dispatchMessage({
+    type: "h2w_force_tab_reload",
+    convKey: CHATGPT_AUTO_CONV,
+    reason: "page_health_render_stall",
+  }, sender);
+  ok(duplicate?.ok === false && duplicate?.error === "page_health_reload_cooldown",
+    "duplicate forced reload is blocked by durable cooldown", JSON.stringify(duplicate));
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  ok(reloadCalls.filter((call) => call.tabId === tabId).length === 1,
+    "cooldown rejection cannot create a second tab reload");
+
+  const raceConv = "https://chatgpt.com/c/page-health-race";
+  const raceTabA = 96;
+  const raceTabB = 97;
+  installContentScript(raceTabA, raceConv, raceConv);
+  installContentScript(raceTabB, raceConv, raceConv);
+  const raceSenderA = { tab: { id: raceTabA, url: raceConv } };
+  const raceSenderB = { tab: { id: raceTabB, url: raceConv } };
+  await dispatchMessage({
+    type: "h2w_set_project_automation",
+    convKey: raceConv,
+    site: "chatgpt",
+    enabled: true,
+  }, raceSenderA);
+  storage.h2wConversationHealthByConv[raceConv] = {
+    convKey: raceConv,
+    page_health_state: "background_reload_pending",
+    page_health_background_reload_attempt: 1,
+    page_health_last_background_reload_at: Date.now(),
+    page_health_background_reload_executed_at: null,
+    reload_reason: "page_health_render_stall",
+  };
+  const raceBefore = reloadCalls.length;
+  const race = await Promise.all([
+    dispatchMessage({ type: "h2w_force_tab_reload", convKey: raceConv, reason: "page_health_render_stall" }, raceSenderA),
+    dispatchMessage({ type: "h2w_force_tab_reload", convKey: raceConv, reason: "page_health_render_stall" }, raceSenderB),
+  ]);
+  ok(race.filter((result) => result?.ok === true).length === 1
+      && race.filter((result) => result?.error === "page_health_reload_cooldown").length === 1,
+    "concurrent same-conversation reload requests elect exactly one winner", JSON.stringify(race));
+  ok(reloadCalls.length === raceBefore + 1,
+    "concurrent same-conversation requests issue exactly one Chrome reload");
+  await dispatchMessage({
+    type: "h2w_set_project_automation",
+    convKey: raceConv,
+    site: "chatgpt",
+    enabled: false,
+  }, raceSenderA);
+
+  const wrongReason = await dispatchMessage({
+    type: "h2w_force_tab_reload",
+    convKey: CHATGPT_AUTO_CONV,
+    reason: "manual_reload",
+  }, sender);
+  ok(wrongReason?.ok === false && wrongReason?.error === "page_health_reason_required",
+    "background rejects non-page-health forced reload reasons");
+
+  const otherConv = "https://chatgpt.com/c/not-the-sender-conversation";
+  const mismatch = await dispatchMessage({
+    type: "h2w_force_tab_reload",
+    convKey: otherConv,
+    reason: "page_health_render_stall",
+  }, sender);
+  ok(mismatch?.ok === false && mismatch?.error === "page_health_conversation_mismatch",
+    "background rejects cross-conversation forced reload requests");
+
+  const disabledTabId = 98;
+  const disabledConv = "https://chatgpt.com/c/page-health-disabled";
+  installContentScript(disabledTabId, disabledConv, disabledConv);
+  storage.h2wConversationHealthByConv[disabledConv] = {
+    convKey: disabledConv,
+    page_health_state: "background_reload_pending",
+    page_health_background_reload_attempt: 1,
+    page_health_last_background_reload_at: Date.now(),
+    page_health_background_reload_executed_at: null,
+    reload_reason: "page_health_render_stall",
+  };
+  const disabled = await dispatchMessage({
+    type: "h2w_force_tab_reload",
+    convKey: disabledConv,
+    reason: "page_health_render_stall",
+  }, { tab: { id: disabledTabId, url: disabledConv } });
+  ok(disabled?.ok === false && disabled?.error === "automation_disabled",
+    "automation-off conversation cannot force a background reload");
+
+  const restored = await dispatchMessage({
+    type: "h2w_set_project_automation",
+    convKey: CHATGPT_AUTO_CONV,
+    site: "chatgpt",
+    enabled: false,
+  }, sender);
+  ok(restored?.ok === true && restored.conversation_automation_enabled === false,
+    "page-health scenario restores the plain ChatGPT Auto preference to off");
+}
 
 // ---- Scenario 1: successful binding on a supported active tab ----
 console.log("\n[binding flow]");

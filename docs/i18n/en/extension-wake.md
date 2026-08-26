@@ -130,6 +130,19 @@ If the assistant started responding but the page reports a disconnected stream, 
 
 After a conservative stall window and only when the page is otherwise safe, the extension may reload once to resynchronize the existing server-side turn. It does not resend the original task.
 
+## Page-health self-recovery: stalls, memory and 429
+
+Version 0.1.63 connects the previously diagnostic-only UI-pressure meter to a strictly bounded page-health recovery layer. It does not delete ChatGPT/React-owned history DOM. Removing those nodes behind React can desynchronize the framework tree, event handlers, virtualization state and the real DOM; when the whole page runtime needs reclamation, a controlled reload is safer because it rebuilds the document, React tree and JS heap together.
+
+The fixed-window O(1) signals are MutationObserver callback rate, watcher tick rate, timer drift, Long Tasks and, when Chromium exposes it, JS heap usage. A single spike is observational only.
+
+- An active turn becomes reload-eligible only after sustained page pressure plus a real assistant stall, and only when the same-origin conversation snapshot proves `current_node` is a **finished assistant**. That proof is what allows a stale Stop/streaming UI bit to be ignored as a renderer problem rather than live work.
+- Critical heap pressure is eligible only after a quiescent interval. Manual composer text, tool execution, permission cards and uncertain delivery always block reload.
+- Level one is at most one durable `location.reload()`. If the same health failure survives that refresh, level two is at most one sender-scoped `chrome.tabs.reload(tabId)`. The background worker accepts only its actual `sender.tab`, the same conversation, Auto enabled and a matching durable pending record, then persists executed-at before navigation so MV3 worker restart cannot create a reload loop.
+- Exhausting both levels stops further reloads and recommends controlled conversation rollover instead.
+
+HTTP 429 is the opposite kind of signal: **429 is backoff-only and never a Retry/reload trigger.** A visible rate-limit error or a Resource Timing 429 enters a `30s → 60s → 120s` capped cooldown. Automatic recovery does not create additional page/API/attachment traffic during that cooldown, avoiding a rate-limit amplification loop.
+
 ## Context pressure and automatic rollover
 
 Long Herdr sessions can accumulate visible text, MCP payloads, Project instructions and hidden system context. ChatGPT may also virtualize old DOM nodes, so a short current DOM is not evidence of a short conversation.

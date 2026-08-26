@@ -137,9 +137,13 @@ test("ui pressure meter aggregates bounded counters and resets per fixed window"
   meter.recordTick(1, now);
   meter.recordTimerDrift(120, now);
   meter.recordTimerDrift(6000, now);
+  meter.recordHttpStatus(200, now);
+  meter.recordHttpStatus(429, now);
   let metrics = meter.evaluate(now);
   assert.equal(metrics.drift_samples, 2);
   assert.equal(metrics.max_timer_drift_ms, 6000);
+  assert.equal(metrics.http_429_count, 1);
+  assert.equal(metrics.last_http_429_at, now);
   assert.equal(metrics.level, "high");
   assert.ok(metrics.mutation_rate_per_min > 0 && metrics.ticks_per_min > 0);
 
@@ -161,6 +165,109 @@ test("ui pressure meter aggregates bounded counters and resets per fixed window"
   assert.equal(withLongTask.long_task_max_ms, 250);
   assert.equal(withLongTask.level, "healthy");
   assert.equal(withLongTask.max_timer_drift_ms, 0);
+});
+
+test("page health requires sustained server-confirmed pressure and treats 429 as backoff-only", () => {
+  const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
+  const policy = {
+    ...perf.DEFAULT_PAGE_HEALTH_POLICY,
+    minSampleWindowMs: 15000,
+    sustainedPressureMs: 30000,
+    activeTurnStallMs: 30000,
+    memoryQuiescentMs: 30000,
+  };
+  const now = 100000;
+  const highUi = {
+    level: "high",
+    window_elapsed_ms: 20000,
+    long_task_count: 5,
+    long_task_max_ms: 2500,
+  };
+
+  // A hot page is not enough: an active turn must be stalled and the server
+  // must prove the assistant turn already settled before render recovery.
+  let health = perf.classifyPageHealth({
+    ui: highUi,
+    activeTurn: true,
+    serverSettled: false,
+    stallMs: 60000,
+    highSince: 60000,
+    now,
+  }, policy);
+  assert.notEqual(health.action, "reload");
+
+  // The first confirmed sample merely arms the sustained-pressure timer.
+  health = perf.classifyPageHealth({
+    ui: highUi,
+    activeTurn: true,
+    serverSettled: true,
+    stallMs: 60000,
+    highSince: 90000,
+    now,
+  }, policy);
+  assert.equal(health.state, "degraded");
+  assert.equal(health.action, "observe");
+
+  health = perf.classifyPageHealth({
+    ui: highUi,
+    activeTurn: true,
+    serverSettled: true,
+    stallMs: 60000,
+    highSince: 60000,
+    now,
+  }, policy);
+  assert.equal(health.state, "reload_recommended");
+  assert.equal(health.action, "reload");
+  assert.equal(health.reason, "render_stall");
+
+  // Early-window rates are deliberately observational because rate scaling can
+  // exaggerate the first few seconds of a new window.
+  health = perf.classifyPageHealth({
+    ui: { ...highUi, window_elapsed_ms: 5000 },
+    activeTurn: true,
+    serverSettled: true,
+    stallMs: 60000,
+    highSince: 60000,
+    now,
+  }, policy);
+  assert.notEqual(health.action, "reload");
+
+  // Critical heap pressure is eligible only while the page is quiescent and
+  // only after the same sustained-pressure budget.
+  health = perf.classifyPageHealth({
+    ui: {},
+    memory: { usedJSHeapSize: 1600 * 1024 * 1024, jsHeapSizeLimit: 2 * 1024 * 1024 * 1024 },
+    quiescentMs: 60000,
+    highSince: 60000,
+    now,
+  }, policy);
+  assert.equal(health.action, "reload");
+  assert.equal(health.reason, "memory_pressure");
+
+  // Rate limiting wins over every pressure signal: never retry/reload while
+  // the bounded 429 backoff is active.
+  health = perf.classifyPageHealth({
+    ui: highUi,
+    memory: { usedJSHeapSize: 1600 * 1024 * 1024, jsHeapSizeLimit: 2 * 1024 * 1024 * 1024 },
+    activeTurn: true,
+    serverSettled: true,
+    stallMs: 60000,
+    quiescentMs: 60000,
+    highSince: 60000,
+    backoffUntil: now + 30000,
+    now,
+  }, policy);
+  assert.equal(health.state, "rate_limited");
+  assert.equal(health.action, "backoff");
+  assert.equal(health.candidate, false);
+});
+
+test("429 backoff grows 30s to 60s and caps at 120s", () => {
+  const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
+  assert.equal(perf.rateLimitBackoffMs(1), 30000);
+  assert.equal(perf.rateLimitBackoffMs(2), 60000);
+  assert.equal(perf.rateLimitBackoffMs(3), 120000);
+  assert.equal(perf.rateLimitBackoffMs(8), 120000);
 });
 
 test("retired source tab discard is gated on committed inactive handoff", () => {
@@ -199,6 +306,17 @@ test("conversation health records the persisted recovery lifecycle fields", () =
     "thread_error_retry_attempt",
     "thread_error_reload_attempt",
     "thread_error_last_seen_at",
+    "page_health_state",
+    "page_health_checked_at",
+    "page_health_high_since",
+    "page_health_reason",
+    "page_health_background_reload_attempt",
+    "page_health_last_background_reload_at",
+    "page_health_background_reload_executed_at",
+    "network_429_count",
+    "network_429_last_seen_at",
+    "network_429_source",
+    "network_backoff_until",
     "reload_reason",
   ]) assert.ok(Object.hasOwn(record, field), `missing ${field}`);
 
@@ -253,6 +371,29 @@ test("reply timeout, recovery attempt, reload gate, and rollover remain fail-clo
   ]) assert.equal(recovery.canReloadSafely({ ...safe, [key]: true }, policy), false, key);
   assert.equal(recovery.canReloadSafely({ ...safe, reloadAttempts: 1 }, policy), false);
   assert.equal(recovery.canReloadSafely({ ...safe, lastReloadAt: 7000 }, policy), false);
+
+  const forcePolicy = {
+    ...policy,
+    backgroundReloadCooldownMs: 5000,
+    maxBackgroundReloadAttempts: 1,
+  };
+  const forceSafe = {
+    ...safe,
+    backgroundReloadAttempts: 0,
+    lastBackgroundReloadAt: null,
+  };
+  assert.equal(recovery.canForceTabReloadSafely(forceSafe, forcePolicy), true);
+  for (const key of [
+    "composerBusy",
+    "composerHasHumanText",
+    "streaming",
+    "toolRunning",
+    "permissionCardActive",
+    "deliveryUnknown",
+    "mutationDeliveryUncertain",
+  ]) assert.equal(recovery.canForceTabReloadSafely({ ...forceSafe, [key]: true }, forcePolicy), false, `forced:${key}`);
+  assert.equal(recovery.canForceTabReloadSafely({ ...forceSafe, backgroundReloadAttempts: 1 }, forcePolicy), false);
+  assert.equal(recovery.canForceTabReloadSafely({ ...forceSafe, lastBackgroundReloadAt: 7000 }, forcePolicy), false);
 
   record = recovery.markReloaded(record, 3001);
   assert.equal(record.reload_attempt, 1);
@@ -338,6 +479,13 @@ test("ChatGPT turn watcher wires assistant progress, settled turns, and explicit
   assert.match(wake, /const retryStarted = await RECOVERY_CONTROLLER\.runAfterDurablePersistence/);
   assert.match(wake, /action: \(\) => threadError\.retry\.click\(\)/);
   assert.match(wake, /if \(!retryStarted\) return true/);
+  assert.match(wake, /maybeRecoverPageHealth\(\)/);
+  assert.match(wake, /recordHttpStatus\(429/);
+  assert.match(wake, /h2w_force_tab_reload/);
+  assert.match(wake, /page_health_background_reload_attempt/);
+  assert.match(wake, /network_backoff_until/);
+  assert.match(wake, /const primaryReloadSpent = Number\(conversationHealth\.reload_attempt \|\| 0\)/);
+  assert.match(wake, /if \(!primaryReloadSpent \|\| !lastReloadAt\) return false/);
   assert.equal((wake.match(/location\.reload\(\)/g) || []).length, 1);
   assert.ok((wake.match(/await reloadAfterPersistingConversationState\(\)/g) || []).length >= 6);
   assert.match(wake, /markRolloverRecommended/);
