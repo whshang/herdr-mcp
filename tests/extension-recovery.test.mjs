@@ -253,19 +253,37 @@ test("freshness classification distinguishes synced, server-ahead, and server-st
   const baseDom = { messageId: "a1", text: "hello world", changedAt: 90000 };
   const synced = recovery.classifyViewFreshness({
     dom: baseDom,
-    server: { ok: true, messageId: "a1", text: "hello world", finished: true, updatedAt: 90000 },
+    server: { ok: true, currentNodeRole: "assistant", messageId: "a1", text: "hello world", finished: true, updatedAt: 90000 },
     now,
   });
   assert.equal(synced.state, "synced");
   const ahead = recovery.classifyViewFreshness({
     dom: baseDom,
-    server: { ok: true, messageId: "a2", text: "newer answer", finished: true, updatedAt: 95000 },
+    server: { ok: true, currentNodeRole: "assistant", messageId: "a2", text: "newer answer", finished: true, updatedAt: 95000 },
     now,
   });
   assert.equal(ahead.state, "server_ahead");
+  const missingAssistantDom = recovery.classifyViewFreshness({
+    dom: { messageId: null, text: "", changedAt: 90000 },
+    server: { ok: true, currentNodeRole: "assistant", messageId: "a2", text: "server-rendered answer", finished: true, updatedAt: 95000 },
+    now,
+  });
+  assert.equal(missingAssistantDom.state, "server_ahead");
+  const emptyAssistantDom = recovery.classifyViewFreshness({
+    dom: { messageId: "a2", text: "", changedAt: 90000 },
+    server: { ok: true, currentNodeRole: "assistant", messageId: "a2", text: "server-rendered answer", finished: true, updatedAt: 95000 },
+    now,
+  });
+  assert.equal(emptyAssistantDom.state, "server_ahead");
+  const previousAssistantWhileUserIsCurrent = recovery.classifyViewFreshness({
+    dom: { messageId: null, text: "", changedAt: 90000 },
+    server: { ok: true, currentNodeRole: "user", messageId: "a1", text: "previous answer", finished: true, updatedAt: 95000 },
+    now,
+  });
+  assert.equal(previousAssistantWhileUserIsCurrent.state, "synced");
   const stalled = recovery.classifyViewFreshness({
     dom: { ...baseDom, changedAt: 60000 },
-    server: { ok: true, messageId: "a1", text: "hello world", finished: false, updatedAt: 60000 },
+    server: { ok: true, currentNodeRole: "assistant", messageId: "a1", text: "hello world", finished: false, updatedAt: 60000 },
     now,
   }, { ...recovery.DEFAULT_RECOVERY_POLICY, assistantStallMs: 30000, serverStallMs: 30000 });
   assert.equal(stalled.state, "server_stalled");
