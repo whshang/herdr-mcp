@@ -16,27 +16,10 @@
 //!   `idempotent`— mutating but carries an idempotency key / safe to dedupe.
 //!   `unsafe`    — mutating without idempotency guarantees; never blind-retry.
 
-/// Delivery evidence a transport observed for one request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DeliveryState {
-    NotDelivered,
-    DeliveryUnknown,
-    Delivered,
-}
-
-impl DeliveryState {
-    /// Stable machine code surfaced on tool_error frames.
-    pub fn code(self) -> &'static str {
-        match self {
-            DeliveryState::NotDelivered => "not_delivered",
-            DeliveryState::DeliveryUnknown => "delivery_unknown",
-            DeliveryState::Delivered => "delivered",
-        }
-    }
-}
-
-/// Stable delivery-state codes surfaced on tool_error frames.
-pub const DELIVERY_CODES: [&str; 3] = ["not_delivered", "delivery_unknown", "delivered"];
+/// Delivery evidence and stable wire codes are owned by the protocol module;
+/// preserve the staged error-taxonomy API without duplicating wire literals.
+pub use crate::relay::protocol::DeliveryState;
+pub const DELIVERY_CODES: [&str; 3] = crate::relay::protocol::DELIVERY_CODES;
 
 /// Retry safety class of an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
