@@ -37,6 +37,7 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /RunAtLoad=true.*KeepAlive=true/s);
     assert.match(r.content, /dev\.herdr-mcp\.health-watchdog/);
     assert.match(r.content, /historical `dev\.herdr-mcp\.watchdog` identity/);
+    assert.match(r.content, /health-watchdog\.\*/);
     assert.match(r.content, /5 seconds.*10 seconds.*20 seconds/s);
     assert.match(r.content, /roughly.*35 seconds/s);
     assert.match(r.content, /exactly three.*read-only.*reconnect attempts/s);
