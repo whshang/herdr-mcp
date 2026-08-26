@@ -901,20 +901,43 @@ const H2W_CONTENT_VERSION = "0.1.63";
         return;
       }
       if (msg?.type === "h2w_snapshot_turn") {
-        const assistantText = lastMessageByRole("assistant");
-        sendResponse({
-          convKey: ADAPTER.getConversationKey(),
-          userText: lastMessageByRole("user"),
-          assistantText,
-          generating: isComposerGenerating(),
-          turnInProgress: isTurnInProgress(),
-          substantive: looksLikeSubstantiveReply(assistantText),
-          endedAt: Date.now(),
-        });
-        return;
+        void (async () => {
+          const domAssistantText = lastMessageByRole("assistant");
+          const domUserText = lastMessageByRole("user");
+          const domGenerating = isComposerGenerating();
+          const domTurnInProgress = isTurnInProgress();
+          const server = ADAPTER.name === "chatgpt"
+            ? await fetchChatGptConversationSnapshot()
+            : { ok: false };
+          const serverAssistantCurrent = Boolean(server?.ok && server.currentNodeRole === "assistant");
+          const serverUserCurrent = Boolean(server?.ok && server.currentNodeRole === "user");
+          const serverSettled = serverAssistantCurrent && server.finished === true;
+          const serverOpen = serverAssistantCurrent && server.finished === false;
+          const assistantText = serverAssistantCurrent && server.text
+            ? String(server.text)
+            : (serverUserCurrent ? "" : domAssistantText);
+          const userText = server?.ok && server.userText
+            ? String(server.userText)
+            : domUserText;
+          sendResponse({
+            convKey: ADAPTER.getConversationKey(),
+            userText,
+            assistantText,
+            generating: serverSettled ? false : (serverOpen ? true : domGenerating),
+            turnInProgress: serverSettled ? false : (serverOpen ? true : domTurnInProgress),
+            substantive: looksLikeSubstantiveReply(assistantText),
+            endedAt: Date.now(),
+            serverOk: server?.ok === true,
+            serverFinished: serverAssistantCurrent ? server.finished : null,
+            serverMessageId: serverAssistantCurrent ? server.messageId || null : null,
+            serverCurrentNodeRole: server?.ok ? server.currentNodeRole || "" : "",
+          });
+        })();
+        return true;
       }
       if (msg?.type === "h2w_handoff_prompt") {
         (async () => {
+          await ensureConversationHealth();
           const beforeText = SPEAKS?.enabled ? SPEAKS.getLatestReply() : "";
           const beforeCount = SPEAKS?.enabled ? SPEAKS.getReplyBlockCount() : 0;
           const result = await performWake({
@@ -922,6 +945,9 @@ const H2W_CONTENT_VERSION = "0.1.63";
             autoAllow: false,
             handoff: true,
           });
+          if (result?.ok && ADAPTER.name === "chatgpt" && CONVERSATION_HEALTH && conversationHealth) {
+            markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
+          }
           if (!result?.ok || ADAPTER.name === "chatgpt") {
             sendResponse(result);
             return;
@@ -933,12 +959,16 @@ const H2W_CONTENT_VERSION = "0.1.63";
       }
       if (msg?.type === "h2w_handoff_seed") {
         (async () => {
+          await ensureConversationHealth();
           const result = await performWake({
             template: msg.template || "",
             autoAllow: false,
             handoff: true,
           });
           if (!result?.ok) { sendResponse(result); return; }
+          if (ADAPTER.name === "chatgpt" && CONVERSATION_HEALTH && conversationHealth) {
+            markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
+          }
           const confirmed = await waitForHandoffTarget(msg.transferId);
           sendResponse({ ...result, ...confirmed });
         })();
@@ -1146,16 +1176,43 @@ const H2W_CONTENT_VERSION = "0.1.63";
       if (!response.ok) return { ok: false, reason: `http-${response.status}` };
       const body = await response.json();
       const mapping = body?.mapping || {};
-      const currentNodeRole = String(mapping?.[body?.current_node]?.message?.author?.role || "");
+      const currentMessage = mapping?.[body?.current_node]?.message || null;
+      const currentNodeRole = String(currentMessage?.author?.role || "");
       let nodeId = body?.current_node || null;
       let assistant = null;
+      let assistantNodeId = null;
       for (let i = 0; nodeId && i < 40; i += 1) {
         const node = mapping?.[nodeId];
         const message = node?.message;
-        if (message?.author?.role === "assistant") { assistant = message; break; }
+        if (message?.author?.role === "assistant") {
+          assistant = message;
+          assistantNodeId = nodeId;
+          break;
+        }
         nodeId = node?.parent || null;
       }
-      if (!assistant?.id) return { ok: true, currentNodeRole, messageId: null, text: "", finished: null };
+      let user = currentNodeRole === "user" ? currentMessage : null;
+      if (!user) {
+        nodeId = assistantNodeId ? mapping?.[assistantNodeId]?.parent || null : null;
+        for (let i = 0; nodeId && i < 40; i += 1) {
+          const node = mapping?.[nodeId];
+          const message = node?.message;
+          if (message?.author?.role === "user") { user = message; break; }
+          nodeId = node?.parent || null;
+        }
+      }
+      if (!assistant?.id) {
+        return {
+          ok: true,
+          currentNodeRole,
+          messageId: null,
+          text: "",
+          finished: null,
+          userMessageId: user?.id ? String(user.id) : null,
+          userText: serverMessageText(user),
+          userCreatedAt: Number(user?.create_time || 0) > 0 ? Number(user.create_time) * 1000 : null,
+        };
+      }
       const finishType = String(assistant?.metadata?.finish_details?.type || "");
       const status = String(assistant?.status || "");
       const completed = assistant?.end_turn === true
@@ -1173,6 +1230,9 @@ const H2W_CONTENT_VERSION = "0.1.63";
         finished,
         createdAt: Number(assistant?.create_time || 0) > 0 ? Number(assistant.create_time) * 1000 : null,
         updatedAt: updateSeconds > 0 ? updateSeconds * 1000 : null,
+        userMessageId: user?.id ? String(user.id) : null,
+        userText: serverMessageText(user),
+        userCreatedAt: Number(user?.create_time || 0) > 0 ? Number(user.create_time) * 1000 : null,
       };
     } catch (error) {
       return { ok: false, reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
@@ -1794,7 +1854,6 @@ const H2W_CONTENT_VERSION = "0.1.63";
     let sawGrowth = false;
     let startedAt = 0;
     let userTextAtStart = "";
-    const hydrationGraceUntil = Date.now() + 5000;
     // Module-level latest-turn cache is authoritative while this watcher runs.
     latestTurnCacheActive = true;
     const roleSnapshot = (role) => {
@@ -1810,33 +1869,100 @@ const H2W_CONTENT_VERSION = "0.1.63";
     let lastUserCount = initialUser.count;
     let settleTimer = null;
     let lastReportedEnd = 0;
-    let lastAsstLen = 0;
+    let lastReportedTurnKey = "";
+    let lastAsstLen = initialAssistant.text.length;
     let lastAsstSignature = assistantSignature(initialAssistant.text);
     let lastAsstCount = initialAssistant.count;
     let stableRounds = 0;
+    let observedSubmitAt = Number(conversationHealth?.last_user_submit_at || 0);
+    let serverSettleInFlight = false;
+    let lastServerSettleProbeAt = 0;
+    let wasStopping = false;
+    const serverSettleFallbackMs = Number(
+      RECOVERY_CONTROLLER?.DEFAULT_RECOVERY_POLICY?.freshnessProbeIntervalMs || 15000,
+    );
 
-    const reportTurnEnded = (assistantText, endedAt) => {
-      if (endedAt - lastReportedEnd < 3000) return;
-      if (isTurnInProgress()) return;
-      if (!looksLikeSubstantiveReply(assistantText)) return;
-      if (!String(assistantText || "").trim()) return;
+    const hasPendingReply = () => {
+      const submitAt = Number(conversationHealth?.last_user_submit_at || 0);
+      const endedAt = Number(conversationHealth?.last_turn_end_at || 0);
+      return submitAt > 0 && submitAt > endedAt;
+    };
+
+    const syncPendingSubmitAnchor = () => {
+      const submitAt = Number(conversationHealth?.last_user_submit_at || 0);
+      if (submitAt > observedSubmitAt) {
+        observedSubmitAt = submitAt;
+        startedAt = submitAt;
+        userTextAtStart = "";
+        lastReportedTurnKey = "";
+      }
+      return submitAt;
+    };
+
+    const pendingUserTextHint = () => {
+      const submitAt = syncPendingSubmitAnchor();
+      if (userTextAtStart) return normText(userTextAtStart);
+      if (lastWakeNorm && submitAt > 0 && Math.abs(Number(lastWakeAt || 0) - submitAt) <= 10000) {
+        return normText(lastWakeNorm);
+      }
+      return "";
+    };
+
+    const noteTrustedManualSubmit = () => {
+      const text = composerNorm();
+      if (!text || !CONVERSATION_HEALTH || !conversationHealth) return;
+      const at = Date.now();
+      markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth, at));
+      observedSubmitAt = at;
+      startedAt = at;
+      userTextAtStart = text;
+      lastReportedTurnKey = "";
+    };
+
+    document.addEventListener("click", (event) => {
+      if (!event.isTrusted) return;
+      const button = event.target?.closest?.("button, [role=button]");
+      if (button && isSendButton(button)) noteTrustedManualSubmit();
+    }, true);
+    document.addEventListener("keydown", (event) => {
+      if (!event.isTrusted || event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+      const input = ADAPTER.getInputEl();
+      if (!input) return;
+      const target = event.target;
+      if (target !== input && !input.contains?.(target)) return;
+      noteTrustedManualSubmit();
+    }, true);
+
+    const reportTurnEnded = (assistantText, endedAt, { userText = "", serverConfirmed = false } = {}) => {
+      const normalizedAssistant = String(assistantText || "").trim();
+      if (!hasPendingReply()) return false;
+      const submitAt = syncPendingSubmitAnchor();
+      if (!normalizedAssistant || !looksLikeSubstantiveReply(normalizedAssistant)) return false;
+      const turnKey = `${submitAt || startedAt || 0}:${assistantSignature(normalizedAssistant)}`;
+      if (turnKey === lastReportedTurnKey) return false;
+      if (!serverConfirmed && endedAt - lastReportedEnd < 3000) return false;
+      if (!serverConfirmed && isTurnInProgress()) return false;
       lastReportedEnd = endedAt;
+      lastReportedTurnKey = turnKey;
       markObservedTurnEnded(endedAt);
+      const effectiveUserText = normText(userText || pendingUserTextHint() || lastMessageByRole("user"));
       const payload = {
         type: "h2w_turn_ended",
         convKey: ADAPTER.getConversationKey(),
-        startedAt,
+        startedAt: startedAt || submitAt,
         endedAt,
-        userText: userTextAtStart || lastMessageByRole("user"),
-        assistantText,
+        userText: effectiveUserText,
+        assistantText: normalizedAssistant,
       };
       console.log("[h2w] turn ended; updating continuity pressure and asking idle-nudge check");
       // Reuse the just-settled user/assistant turn instead of rescanning the
       // full conversation DOM; the full-history scan still runs on route change.
       void updateContextPressureFromSettledTurns(
-        userTextAtStart || lastMessageByRole("user"),
-        assistantText,
-        { userEl: latestTurnForRole("user"), assistantEl: latestTurnForRole("assistant") },
+        effectiveUserText,
+        normalizedAssistant,
+        serverConfirmed
+          ? { userEl: null, assistantEl: null }
+          : { userEl: latestTurnForRole("user"), assistantEl: latestTurnForRole("assistant") },
       ).then((pressure) => {
         if (pressure) paintPageHud({ continuity: pressure });
       });
@@ -1846,6 +1972,55 @@ const H2W_CONTENT_VERSION = "0.1.63";
         hudPending = false;
         void refreshPageHud();
       });
+      return true;
+    };
+
+    const serverSnapshotMatchesPendingTurn = (server) => {
+      if (!hasPendingReply() || !server?.ok) return false;
+      if (server.currentNodeRole !== "assistant" || server.finished !== true) return false;
+      if (!String(server.text || "").trim()) return false;
+      const submitAt = syncPendingSubmitAnchor();
+      const expectedUser = pendingUserTextHint();
+      const serverUser = normText(server.userText || "");
+      if (expectedUser && serverUser) {
+        const expectedPrefix = expectedUser.slice(0, 160);
+        const serverPrefix = serverUser.slice(0, 160);
+        if (!serverUser.includes(expectedPrefix) && !expectedUser.includes(serverPrefix)) return false;
+      }
+      const userCreatedAt = Number(server.userCreatedAt || 0);
+      const assistantCreatedAt = Number(server.createdAt || server.updatedAt || 0);
+      const clockSkewMs = 15000;
+      if (userCreatedAt > 0 && userCreatedAt < submitAt - clockSkewMs) return false;
+      if (!expectedUser && userCreatedAt <= 0 && assistantCreatedAt > 0
+        && assistantCreatedAt < submitAt - clockSkewMs) return false;
+      if (!expectedUser && !serverUser && userCreatedAt <= 0 && assistantCreatedAt <= 0) return false;
+      return true;
+    };
+
+    const maybeReportServerSettledTurn = async (reason, { force = false } = {}) => {
+      if (!automationEnabled || document.hidden || !hasPendingReply()) {
+        return { checked: false, reported: false };
+      }
+      const now = Date.now();
+      if (serverSettleInFlight) return { checked: false, reported: false };
+      if (!force && now - lastServerSettleProbeAt < serverSettleFallbackMs) {
+        return { checked: false, reported: false };
+      }
+      serverSettleInFlight = true;
+      lastServerSettleProbeAt = now;
+      try {
+        const server = await fetchChatGptConversationSnapshot();
+        if (!server?.ok) return { checked: false, reported: false };
+        if (!serverSnapshotMatchesPendingTurn(server)) return { checked: true, reported: false };
+        const reported = reportTurnEnded(server.text, Date.now(), {
+          userText: server.userText || "",
+          serverConfirmed: true,
+        });
+        if (reported) console.log(`[h2w] turn ended from ChatGPT server snapshot (${reason})`);
+        return { checked: true, reported };
+      } finally {
+        serverSettleInFlight = false;
+      }
     };
 
     const onTick = () => {
@@ -1860,16 +2035,20 @@ const H2W_CONTENT_VERSION = "0.1.63";
         if (settleTimer) { clearInterval(settleTimer); settleTimer = null; }
         return;
       }
+      syncPendingSubmitAnchor();
       const stopping = isComposerGenerating();
+      const stoppingEnded = wasStopping && !stopping;
+      wasStopping = stopping;
       const currentUser = roleSnapshot("user");
       const currentUserText = currentUser.text;
       const currentUserSignature = assistantSignature(currentUserText);
       const currentUserCount = currentUser.count;
       const userChanged = currentUserText && (currentUserSignature !== lastUserSignature || currentUserCount > lastUserCount);
       if (userChanged) {
-        if (Date.now() >= hydrationGraceUntil && CONVERSATION_HEALTH && conversationHealth) {
-          markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
-        }
+        // ChatGPT virtualizes old turns while scrolling. A mounted user node
+        // changing is never sufficient evidence of a new submit, nor trusted
+        // as the pending turn text. Real submits are captured at the composer
+        // and extension-originated submits are already known through lastWake.
         lastUserSignature = currentUserSignature;
         lastUserCount = currentUserCount;
       }
@@ -1879,14 +2058,23 @@ const H2W_CONTENT_VERSION = "0.1.63";
       const curSignature = assistantSignature(assistantText);
       const curCount = currentAssistant.count;
       const assistantChanged = curLen > 0 && (curSignature !== lastAsstSignature || curCount > lastAsstCount);
+      const pendingReply = hasPendingReply();
 
-      if (stopping || assistantChanged || curLen > lastAsstLen) {
-        if (curLen > 0 && (assistantChanged || curLen > lastAsstLen)) markAssistantProgressIfActive();
+      if (stoppingEnded && pendingReply) {
+        void maybeReportServerSettledTurn("composer_stopped", { force: true });
+      } else if (pendingReply && !stopping
+        && Date.now() - lastServerSettleProbeAt >= serverSettleFallbackMs) {
+        // This bounded fallback covers virtualized/off-viewport latest turns
+        // even when ChatGPT's Stop button transition was missed.
+        void maybeReportServerSettledTurn("pending_fallback");
+      }
+
+      if (stopping || (pendingReply && (assistantChanged || curLen > lastAsstLen))) {
+        if (pendingReply && curLen > 0 && (assistantChanged || curLen > lastAsstLen)) markAssistantProgressIfActive();
         if (!generating) {
           generating = true;
           sawGrowth = assistantChanged || curLen > lastAsstLen || stopping;
-          startedAt = Date.now();
-          userTextAtStart = currentUserText;
+          if (!startedAt) startedAt = Number(conversationHealth?.last_user_submit_at || Date.now());
           if (settleTimer) { clearInterval(settleTimer); settleTimer = null; }
           stableRounds = 0;
           console.log("[h2w] turn start (streaming/stop/growth)");
@@ -1906,7 +2094,6 @@ const H2W_CONTENT_VERSION = "0.1.63";
         generating = false;
         sawGrowth = false;
         stableRounds = 0;
-        const endedAt = Date.now();
         if (settleTimer) { clearInterval(settleTimer); settleTimer = null; }
         // Extra debounce for DOM settle
         settleTimer = setInterval(() => {
@@ -1924,7 +2111,7 @@ const H2W_CONTENT_VERSION = "0.1.63";
           if (stableRounds < 2) return;
           clearInterval(settleTimer);
           settleTimer = null;
-          reportTurnEnded(cur, endedAt);
+          void maybeReportServerSettledTurn("dom_stable", { force: true });
         }, 800);
       }
       lastAsstLen = curLen;

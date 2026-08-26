@@ -507,6 +507,21 @@ test("ChatGPT turn watcher caches latest turns and reuses settled turns for pres
   assert.match(wake, /uiPressure\?\.recordTick\(\)/);
   assert.match(wake, /recordTimerDrift\(driftMs\)/);
   assert.match(wake, /rehydrate the latest-turn cache/);
+  assert.match(wake, /let lastAsstLen = initialAssistant\.text\.length/);
+  assert.match(wake, /const hasPendingReply = \(\) =>/);
+  assert.match(wake, /event\.isTrusted/);
+  assert.match(wake, /markReplyWaiting\(conversationHealth, at\)/);
+  assert.match(wake, /serverSnapshotMatchesPendingTurn/);
+  assert.match(wake, /maybeReportServerSettledTurn/);
+  assert.match(wake, /"composer_stopped"/);
+  assert.match(wake, /"pending_fallback"/);
+  assert.match(wake, /userCreatedAt/);
+  assert.match(wake, /serverConfirmed:\s*true/);
+  assert.match(wake, /serverConfirmed\s*\?\s*\{ userEl: null, assistantEl: null \}/);
+  assert.match(wake, /serverAssistantCurrent/);
+  assert.match(wake, /serverSettled\s*\?\s*false\s*:\s*\(serverOpen\s*\?\s*true\s*:\s*domGenerating\)/);
+  assert.match(wake, /serverCurrentNodeRole/);
+  assert.doesNotMatch(wake, /hydrationGraceUntil/);
 });
 
 test("context pressure reuses settled turns for turn-end updates", () => {
