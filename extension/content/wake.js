@@ -735,9 +735,11 @@ const H2W_CONTENT_VERSION = "0.1.62";
     const id = String(transferId || "").trim();
     if (!id) return false;
     const body = String(text || "");
-    if (body.includes(`[HERDR_CONTINUITY_TRANSFER id=${id}]`)) return true;
-    return body.includes(`<<<HERDR_HANDOFF_V1 id=${id}>>>`)
-      && body.includes("<<<END_HERDR_HANDOFF_V1>>>");
+    // Only the NEW-conversation seed wrapper proves target delivery. The
+    // source handoff request itself contains the raw HERDR_HANDOFF_V1 packet,
+    // so accepting that marker here can misclassify the source conversation as
+    // an already-seeded target during same-tab navigation.
+    return body.includes(`[HERDR_CONTINUITY_TRANSFER id=${id}]`);
   }
 
   async function waitForHandoffTarget(transferId, timeoutMs = 25000) {
@@ -888,11 +890,16 @@ const H2W_CONTENT_VERSION = "0.1.62";
         return true;
       }
       if (msg?.type === "h2w_handoff_probe") {
+        const inputEl = ADAPTER.getInputEl();
         sendResponse({
           ok: true,
           targetConvKey: ADAPTER.getConversationKey(),
           targetUrl: location.href,
           seedConfirmed: hasHandoffTransferMarker(lastMessageByRole("user"), msg.transferId),
+          // A ChatGPT Project-home navigation can report tab load complete before
+          // the SPA mounts its composer. Background waits on this bounded signal
+          // before it injects a handoff seed.
+          composerReady: Boolean(inputEl && elementVisible(inputEl)),
         });
         return;
       }

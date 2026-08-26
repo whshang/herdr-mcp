@@ -1045,6 +1045,23 @@ async function waitForTabComplete(tabId, timeoutMs = 15000) {
   try { return await chrome.tabs.get(tabId); } catch (_) { return null; }
 }
 
+async function waitForManualProjectHome(tabId, transfer, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const info = chatGptConversationInfo(tab?.url);
+      if (
+        tab?.status === "complete"
+        && info?.project_id === transfer?.project_id
+        && info?.is_project_home === true
+      ) return tab;
+    } catch (_) { return null; }
+    await sleep(150);
+  }
+  return null;
+}
+
 async function tabStillExists(tabId) {
   if (!tabId) return false;
   try { return Boolean(await chrome.tabs.get(tabId)); } catch (_) { return false; }
@@ -2355,6 +2372,44 @@ async function probeHandoffTargetSeed(transfer, targetTabId, timeoutMs = 8000) {
   return null;
 }
 
+// ChatGPT is an SPA: a freshly opened Project-home tab reaches tab.status
+// "complete" before the React app mounts the composer. A fixed short sleep
+// after tab load is a race that leaves the seed unwritten (composer missing,
+// h2w_insert_main returns "no-input"). Wait bounded instead: poll the target
+// content script until the composer is mounted, and if the seed already
+// materialized (uncertain resume), commit immediately without resubmitting.
+const HANDOFF_COMPOSER_READY_TIMEOUT_MS = 20000;
+const HANDOFF_COMPOSER_READY_POLL_MS = 300;
+async function waitForHandoffTargetComposer(transfer, targetTabId, timeoutMs = HANDOFF_COMPOSER_READY_TIMEOUT_MS) {
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  do {
+    let probe = null;
+    try {
+      probe = await sendHandoffTabMessage(targetTabId, transfer.site || "chatgpt", {
+        type: "h2w_handoff_probe",
+        transferId: transfer.id,
+      });
+    } catch (_) {}
+    const targetInfo = chatGptConversationInfo(probe?.targetUrl || probe?.targetConvKey || "");
+    const sameProject = targetInfo?.project_id === transfer?.project_id;
+    const freshTargetConversation = Boolean(
+      sameProject
+      && targetInfo?.conversation_id
+      && targetInfo?.convKey
+      && targetInfo.convKey !== transfer?.source_conv_key
+    );
+    if (probe?.seedConfirmed && probe?.targetConvKey && freshTargetConversation) {
+      return { ready: true, already: true, probe };
+    }
+    if (probe?.composerReady && sameProject && targetInfo?.is_project_home === true) {
+      return { ready: true, already: false, probe };
+    }
+    if (Date.now() >= deadline) break;
+    await sleep(HANDOFF_COMPOSER_READY_POLL_MS);
+  } while (true);
+  return { ready: false, already: false, probe: null };
+}
+
 async function seedHandoffIntoTarget(transferId, targetTabId) {
   const transfers = await loadHandoffTransfers();
   const transfer = transfers[transferId];
@@ -2375,6 +2430,28 @@ async function seedHandoffIntoTarget(transferId, targetTabId) {
     target_tab_id: targetTabId,
     error: null,
   });
+  if (manualChatGptProjectHandoff(transfer)) {
+    // Current-tab Project navigation destroys the source content script before
+    // ChatGPT mounts the new composer. Wait only on this manual Project path;
+    // z.ai and automatic handoff retain their existing delivery timing.
+    const ready = await waitForHandoffTargetComposer(transfer, targetTabId);
+    if (ready.already && ready.probe?.seedConfirmed && ready.probe?.targetConvKey) {
+      return commitHandoffTransfer(
+        transferId,
+        ready.probe.targetConvKey,
+        targetTabId,
+        ready.probe.targetUrl || null,
+      );
+    }
+    if (!ready.ready) {
+      await markTransfer(transferId, {
+        status: "seed_uncertain",
+        target_tab_id: targetTabId,
+        error: "target_composer_timeout",
+      });
+      return { ok: false, error: "target_composer_timeout" };
+    }
+  }
   let result;
   try {
     result = await sendHandoffTabMessage(targetTabId, transfer.site || "chatgpt", {
@@ -2424,6 +2501,16 @@ async function seedHandoffIntoTarget(transferId, targetTabId) {
   return commitHandoffTransfer(transferId, result.targetConvKey, targetTabId, result.targetUrl || null);
 }
 
+function manualChatGptProjectHandoff(transfer) {
+  // ChatGPT Project manual handoff reuses the current source tab instead of
+  // opening a new one: navigate it to the Project home, wait for SPA hydration
+  // + composer readiness, then seed in place. Other sites (z.ai) and automatic
+  // handoff keep their existing tab-creation semantics.
+  return transfer?.trigger === "manual"
+    && transfer?.site === "chatgpt"
+    && Boolean(transfer?.project_id);
+}
+
 async function launchHandoffTarget(transferId) {
   const transfers = await loadHandoffTransfers();
   const transfer = transfers[transferId];
@@ -2437,32 +2524,71 @@ async function launchHandoffTarget(transferId) {
   }
   await markTransfer(transferId, { status: "target_opening", error: null });
   let tab;
-  try {
-    tab = await chrome.tabs.create({ url: launchUrl, active: true });
-  } catch (e) {
-    await markTransfer(transferId, { status: "failed", error: `target_open_failed:${e.message}` });
-    return { ok: false, error: "target_open_failed" };
+  if (manualChatGptProjectHandoff(transfer)) {
+    // Manual handoff reuses the current source tab: navigate it to the Project
+    // home instead of opening a new tab. The source content script is destroyed
+    // by navigation (expected); the handoff packet is already persisted in
+    // background storage and the new page's content script restores readiness.
+    const sourceTabId = transfer.source_tab_id;
+    if (!sourceTabId || !(await tabStillExists(sourceTabId))) {
+      await markTransfer(transferId, { status: "seed_uncertain", error: "target_tab_gone" });
+      return { ok: false, error: "target_tab_gone" };
+    }
+    try {
+      await chrome.tabs.update(sourceTabId, { url: launchUrl, active: true });
+    } catch (e) {
+      await markTransfer(transferId, { status: "seed_uncertain", error: `target_open_failed:${e.message}` });
+      return { ok: false, error: "target_open_failed" };
+    }
+    tab = { id: sourceTabId };
+  } else {
+    try {
+      tab = await chrome.tabs.create({ url: launchUrl, active: true });
+    } catch (e) {
+      await markTransfer(transferId, { status: "failed", error: `target_open_failed:${e.message}` });
+      return { ok: false, error: "target_open_failed" };
+    }
   }
   if (!tab?.id) {
     await markTransfer(transferId, { status: "failed", error: "target_tab_missing" });
     return { ok: false, error: "target_tab_missing" };
   }
   await markTransfer(transferId, { status: "target_opening", target_tab_id: tab.id });
-  const ready = await waitForTabComplete(tab.id, 20000);
+  const manualProject = manualChatGptProjectHandoff(transfer);
+  const ready = manualProject
+    ? await waitForManualProjectHome(tab.id, transfer, 20000)
+    : await waitForTabComplete(tab.id, 20000);
   if (!ready) {
-    await markTransfer(transferId, { status: "failed", error: "target_load_failed" });
-    return { ok: false, error: "target_load_failed" };
+    const error = manualProject ? "target_project_home_timeout" : "target_load_failed";
+    await markTransfer(transferId, {
+      status: manualProject ? "seed_uncertain" : "failed",
+      target_tab_id: tab.id,
+      error,
+    });
+    return { ok: false, error };
   }
-  await sleep(350);
+  if (!manualProject) await sleep(350);
   return seedHandoffIntoTarget(transferId, tab.id);
 }
 
 async function resumeUncertainHandoff(transfer) {
   if (!transfer?.target_tab_id) {
+    // For manual ChatGPT Project handoff the target IS the source tab: resume
+    // by navigating that same tab, never by silently opening a new one.
+    if (manualChatGptProjectHandoff(transfer)) {
+      await markTransfer(transfer.id, { status: "summary_ready", error: null });
+      return launchHandoffTarget(transfer.id);
+    }
     await markTransfer(transfer.id, { status: "summary_ready", error: null });
     return launchHandoffTarget(transfer.id);
   }
   if (!(await tabStillExists(transfer.target_tab_id))) {
+    // For manual handoff the target IS the source tab. If it is gone, do not
+    // silently open a new tab; keep the transfer resumable with a clear error.
+    if (manualChatGptProjectHandoff(transfer)) {
+      await markTransfer(transfer.id, { status: "seed_uncertain", error: "target_tab_gone" });
+      return { ok: false, error: "target_tab_gone" };
+    }
     await markTransfer(transfer.id, {
       status: "summary_ready",
       target_tab_id: null,
@@ -2598,7 +2724,48 @@ async function resumeSummaryRequested(transfer) {
   return { ok: true, pending: true, handoff: handoffView(retried) };
 }
 
+async function resumeHandoffForCurrentTab(tabId) {
+  // Manual current-tab handoff: after the source tab was navigated to the
+  // Project home, the live URL no longer resolves to the old source
+  // conversation. Before requiring conversationInfo/convKey for a NEW transfer,
+  // resume the unique non-terminal transfer already owned by this exact tab.
+  const tid = Number(tabId);
+  if (!Number.isInteger(tid)) return null;
+  const transfers = await loadHandoffTransfers();
+  const matches = Object.values(transfers || {}).filter((row) => (
+    row
+    && manualChatGptProjectHandoff(row)
+    && handoffStatusIsActive(row.status)
+    && (Number(row.source_tab_id || -1) === tid || Number(row.target_tab_id || -1) === tid)
+  ));
+  if (!matches.length) return null;
+  if (matches.length > 1) return { ok: false, error: "handoff_ambiguous_for_tab" };
+  const transfer = matches[0];
+  if (transfer.status === "seed_uncertain") return resumeUncertainHandoff(transfer);
+  const ageMs = Date.now() - Number(transfer.updated_at || transfer.created_at || Date.now());
+  if (ageMs >= 120000 && transfer.status === "summary_requested") return resumeSummaryRequested(transfer);
+  if (ageMs >= 120000 && ["summary_ready", "target_opening"].includes(transfer.status)) {
+    if (transfer.target_tab_id && await tabStillExists(transfer.target_tab_id)) {
+      return seedHandoffIntoTarget(transfer.id, transfer.target_tab_id);
+    }
+    return launchHandoffTarget(transfer.id);
+  }
+  if (ageMs >= 120000 && transfer.status === "seed_submitting") {
+    const uncertain = await markTransfer(transfer.id, { status: "seed_uncertain", error: "stale_seed_submission" });
+    return resumeUncertainHandoff(uncertain);
+  }
+  return { ok: true, pending: true, handoff: handoffView(transfer) };
+}
+
 async function startHandoffForTab(tabId, trigger = "manual") {
+  if (trigger === "manual") {
+    let currentTab = null;
+    try { currentTab = await chrome.tabs.get(tabId); } catch (_) {}
+    if (chatGptConversationInfo(currentTab?.url)?.project_id) {
+      const tabResume = await resumeHandoffForCurrentTab(tabId);
+      if (tabResume) return tabResume;
+    }
+  }
   const liveInfo = await conversationInfoForTab(tabId);
   const convInfo = handoffConversationInfo(liveInfo?.url || liveInfo?.convKey, liveInfo?.site || null);
   if (!convInfo?.manual_handoff_available || !convInfo?.handoff_launch_url) {
