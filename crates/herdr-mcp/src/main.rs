@@ -111,13 +111,16 @@ fn run() -> Result<ExitCode, String> {
                             paths.config_dir.display()
                         )
                     })?;
-                    std::fs::write(&paths.config_file, config::Config::default().render())
-                        .map_err(|error| {
-                            format!(
-                                "cannot write config {}: {error}",
-                                paths.config_file.display()
-                            )
-                        })?;
+                    std::fs::write(
+                        &paths.config_file,
+                        config::Config::missing_file_default().render(),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "cannot write config {}: {error}",
+                            paths.config_file.display()
+                        )
+                    })?;
                     println!("created {}", paths.config_file.display());
                 }
             }

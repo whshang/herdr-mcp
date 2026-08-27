@@ -1,3 +1,4 @@
+use semver::Version;
 use std::fs;
 use std::path::Path;
 
@@ -15,6 +16,15 @@ impl UpdateChannel {
         match self {
             Self::Stable => "stable",
             Self::Preview => "preview",
+        }
+    }
+
+    /// Stable discovers non-prerelease tags only. Preview discovers prerelease
+    /// and stable tags, then selects the highest semver.
+    pub fn accepts_version(self, version: &Version) -> bool {
+        match self {
+            Self::Stable => version.pre.is_empty(),
+            Self::Preview => true,
         }
     }
 }
@@ -39,11 +49,21 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Defaults used when config.toml is absent. Alpha/prerelease binaries keep
+    /// dogfood on `preview` so discovery still sees current GitHub alphas.
+    pub fn missing_file_default() -> Self {
+        let mut config = Self::default();
+        if binary_is_prerelease() {
+            config.update_channel = UpdateChannel::Preview;
+        }
+        config
+    }
+
     pub fn load(path: &Path) -> Result<Self, String> {
         let content = match fs::read_to_string(path) {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
+                return Ok(Self::missing_file_default());
             }
             Err(error) => return Err(format!("cannot read config {}: {error}", path.display())),
         };
@@ -149,6 +169,12 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
+fn binary_is_prerelease() -> bool {
+    Version::parse(env!("CARGO_PKG_VERSION"))
+        .map(|version| !version.pre.is_empty())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +185,26 @@ mod tests {
         assert_eq!(Config::default().dev_port, 8872);
         assert_eq!(Config::default().update_channel, UpdateChannel::Stable);
         assert!(Config::default().update_check);
+    }
+
+    #[test]
+    fn channel_accepts_versions_per_policy() {
+        let stable = Version::parse("1.0.0").unwrap();
+        let alpha = Version::parse("1.0.0-alpha.1").unwrap();
+        assert!(UpdateChannel::Stable.accepts_version(&stable));
+        assert!(!UpdateChannel::Stable.accepts_version(&alpha));
+        assert!(UpdateChannel::Preview.accepts_version(&stable));
+        assert!(UpdateChannel::Preview.accepts_version(&alpha));
+    }
+
+    #[test]
+    fn missing_file_default_follows_binary_prerelease() {
+        let missing = Config::missing_file_default();
+        if binary_is_prerelease() {
+            assert_eq!(missing.update_channel, UpdateChannel::Preview);
+        } else {
+            assert_eq!(missing.update_channel, UpdateChannel::Stable);
+        }
     }
 
     #[test]

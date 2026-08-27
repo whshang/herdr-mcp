@@ -9,6 +9,7 @@
 #[cfg(target_os = "macos")]
 use crate::cli::ServiceCommand;
 use crate::cli::UpdateCommand;
+use crate::config::{Config, UpdateChannel};
 use crate::contract;
 use crate::paths::RuntimePaths;
 use crate::release_trust::{self, ReleaseIdentity};
@@ -77,11 +78,13 @@ pub fn run(command: UpdateCommand) -> Result<ExitCode, String> {
 }
 
 fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
-    let plan = fetch_release_plan(manifest_override)?;
+    let channel = load_update_channel()?;
+    let plan = fetch_release_plan(manifest_override, channel)?;
     let current = current_version()?;
     print_json(&json!({
         "ok": true,
         "code": "update_check",
+        "update_channel": channel.as_str(),
         "current_version": current.to_string(),
         "available": plan.version > current,
         "release_version": plan.version.to_string(),
@@ -106,7 +109,8 @@ fn apply(manifest_override: Option<&str>) -> Result<ExitCode, String> {
 
     #[cfg(target_os = "macos")]
     {
-        let plan = fetch_release_plan(manifest_override)?;
+        let channel = load_update_channel()?;
+        let plan = fetch_release_plan(manifest_override, channel)?;
         let current = current_version()?;
         if plan.version <= current {
             return Err(format!(
@@ -267,14 +271,22 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
     }
 }
 
-fn fetch_release_plan(manifest_override: Option<&str>) -> Result<ReleasePlan, String> {
+fn load_update_channel() -> Result<UpdateChannel, String> {
+    let paths = RuntimePaths::discover()?;
+    Ok(Config::load(&paths.config_file)?.update_channel)
+}
+
+fn fetch_release_plan(
+    manifest_override: Option<&str>,
+    channel: UpdateChannel,
+) -> Result<ReleasePlan, String> {
     let client = update_client()?;
     let manifest_url = match manifest_override
         .map(str::to_owned)
         .or_else(|| env::var("HERDR_MCP_UPDATE_MANIFEST_URL").ok())
     {
         Some(raw) => parse_update_url(&raw)?,
-        None => discover_default_manifest_url(&client)?,
+        None => discover_default_manifest_url(&client, channel)?,
     };
     let bytes = fetch_bounded(
         &client,
@@ -285,6 +297,16 @@ fn fetch_release_plan(manifest_override: Option<&str>) -> Result<ReleasePlan, St
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("release manifest is invalid JSON: {error}"))?;
     let plan = parse_release_plan(&value, current_target()?)?;
+    if manifest_override.is_none()
+        && env::var("HERDR_MCP_UPDATE_MANIFEST_URL").is_err()
+        && !channel.accepts_version(&plan.version)
+    {
+        return Err(format!(
+            "discovered release {} is outside update channel {}",
+            plan.version,
+            channel.as_str()
+        ));
+    }
     let manifest_sha256 = sha256_bytes(&bytes);
     verify_artifact_attestation(
         &client,
@@ -295,7 +317,7 @@ fn fetch_release_plan(manifest_override: Option<&str>) -> Result<ReleasePlan, St
     Ok(plan)
 }
 
-fn discover_default_manifest_url(client: &Client) -> Result<Url, String> {
+fn discover_default_manifest_url(client: &Client, channel: UpdateChannel) -> Result<Url, String> {
     let releases_url = Url::parse(DEFAULT_RELEASES_API_URL)
         .map_err(|_| "default GitHub releases API URL is invalid".to_owned())?;
     let bytes = fetch_bounded(
@@ -306,7 +328,7 @@ fn discover_default_manifest_url(client: &Client) -> Result<Url, String> {
     )?;
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("GitHub releases index is invalid JSON: {error}"))?;
-    let tag = select_release_tag(&value)?;
+    let tag = select_release_tag(&value, channel)?;
     Url::parse(&format!(
         "https://github.com/{}/releases/download/{tag}/release-manifest.json",
         release_trust::RELEASE_REPOSITORY
@@ -314,7 +336,7 @@ fn discover_default_manifest_url(client: &Client) -> Result<Url, String> {
     .map_err(|_| "cannot construct discovered release manifest URL".to_owned())
 }
 
-fn select_release_tag(value: &Value) -> Result<String, String> {
+fn select_release_tag(value: &Value, channel: UpdateChannel) -> Result<String, String> {
     let releases = value
         .as_array()
         .ok_or_else(|| "GitHub releases index must be a JSON array".to_owned())?;
@@ -338,6 +360,9 @@ fn select_release_tag(value: &Value) -> Result<String, String> {
         if tag != format!("v{version}") {
             continue;
         }
+        if !channel.accepts_version(&version) {
+            continue;
+        }
         let has_manifest = object
             .get("assets")
             .and_then(Value::as_array)
@@ -357,8 +382,10 @@ fn select_release_tag(value: &Value) -> Result<String, String> {
         }
     }
     best.map(|(_, tag)| tag).ok_or_else(|| {
-        "GitHub releases index contains no non-draft semver release with release-manifest.json"
-            .to_owned()
+        format!(
+            "GitHub releases index contains no non-draft semver release with release-manifest.json for update channel {}",
+            channel.as_str()
+        )
     })
 }
 
@@ -1031,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn release_discovery_includes_prereleases_and_fails_closed_on_invalid_entries() {
+    fn release_discovery_respects_update_channel() {
         let releases = json!([
             {
                 "draft": false,
@@ -1054,6 +1081,12 @@ mod tests {
             {
                 "draft": false,
                 "prerelease": false,
+                "tag_name": "v0.3.0",
+                "assets": [{"name": "release-manifest.json"}]
+            },
+            {
+                "draft": false,
+                "prerelease": false,
                 "tag_name": "v8.0.0",
                 "assets": [{"name": "other.bin"}]
             },
@@ -1064,17 +1097,41 @@ mod tests {
                 "assets": [{"name": "release-manifest.json"}]
             }
         ]);
-        assert_eq!(select_release_tag(&releases).unwrap(), "v0.4.0-alpha.6");
+        assert_eq!(
+            select_release_tag(&releases, UpdateChannel::Preview).unwrap(),
+            "v0.4.0-alpha.6"
+        );
+        assert_eq!(
+            select_release_tag(&releases, UpdateChannel::Stable).unwrap(),
+            "v0.3.0"
+        );
 
-        assert!(select_release_tag(&json!({"tag_name": "v1.0.0"})).is_err());
         assert!(
-            select_release_tag(&json!([{
-                "draft": false,
-                "tag_name": "v1.0.0",
-                "assets": []
-            }]))
+            select_release_tag(&json!({"tag_name": "v1.0.0"}), UpdateChannel::Preview).is_err()
+        );
+        assert!(
+            select_release_tag(
+                &json!([{
+                    "draft": false,
+                    "tag_name": "v1.0.0-alpha.1",
+                    "assets": [{"name": "release-manifest.json"}]
+                }]),
+                UpdateChannel::Stable
+            )
             .unwrap_err()
-            .contains("no non-draft semver release")
+            .contains("update channel stable")
+        );
+        assert!(
+            select_release_tag(
+                &json!([{
+                    "draft": false,
+                    "tag_name": "v1.0.0",
+                    "assets": []
+                }]),
+                UpdateChannel::Preview
+            )
+            .unwrap_err()
+            .contains("update channel preview")
         );
     }
 
