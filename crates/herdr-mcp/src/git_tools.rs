@@ -119,6 +119,66 @@ pub fn file_dirty(root: &Path, file: &Path) -> Result<bool, String> {
     Ok(!result.stdout.trim().is_empty())
 }
 
+/// Return the first dirty path among a set using one `git status` process.
+pub fn first_dirty_file(root: &Path, files: &[PathBuf]) -> Result<Option<PathBuf>, String> {
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let root_real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut relatives = Vec::<PathBuf>::new();
+    for file in files {
+        let file_real = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+        let relative = file_real
+            .strip_prefix(&root_real)
+            .map_err(|_| "file is outside git root".to_owned())?
+            .to_path_buf();
+        if !relatives.contains(&relative) {
+            relatives.push(relative);
+        }
+    }
+    if relatives.is_empty() {
+        return Ok(None);
+    }
+
+    let mut args = vec![
+        "status".to_owned(),
+        "--porcelain=v1".to_owned(),
+        "-z".to_owned(),
+        "--no-renames".to_owned(),
+        "--untracked-files=normal".to_owned(),
+        "--".to_owned(),
+    ];
+    args.extend(
+        relatives
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned()),
+    );
+    let budget = 4096usize
+        .saturating_add(relatives.len().saturating_mul(4096))
+        .min(256 * 1024);
+    let result = run_git(&root_real, &args, budget, Duration::from_secs(2))?;
+    if result.exit_code != 0 {
+        return Err(if result.stderr.is_empty() {
+            format!("git status exited {}", result.exit_code)
+        } else {
+            result.stderr
+        });
+    }
+    let Some(entry) = result.stdout.split('\0').find(|entry| !entry.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(reported) = entry.get(3..).filter(|path| !path.is_empty()) else {
+        return Err("git status returned malformed porcelain output".to_owned());
+    };
+    let reported = PathBuf::from(reported);
+    let matched = relatives
+        .iter()
+        .find(|relative| **relative == reported)
+        .cloned()
+        .unwrap_or(reported);
+    Ok(Some(root_real.join(matched)))
+}
+
 struct GitResult {
     exit_code: i32,
     stdout: String,
@@ -292,6 +352,7 @@ fn invalid(message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn diff_path_cannot_escape_root() {
@@ -304,7 +365,6 @@ mod tests {
     }
     #[test]
     fn status_runs_only_inside_managed_git_root() {
-        use std::fs;
         use std::time::{SystemTime, UNIX_EPOCH};
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -331,6 +391,117 @@ mod tests {
         );
         assert_eq!(result["ok"], true);
         assert!(result["output"].as_str().unwrap().contains("new.txt"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn first_dirty_file_checks_multiple_paths_with_one_status_result() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-git-dirty-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&second, "second\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Herdr Test",
+                    "-c",
+                    "user.email=herdr@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "baseline"
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(&second, "dirty\n").unwrap();
+
+        let dirty = first_dirty_file(&root, &[first.clone(), second.clone()]).unwrap();
+        assert_eq!(dirty, Some(fs::canonicalize(second).unwrap()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn first_dirty_file_handles_renamed_path_with_no_rename_detection() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-git-rename-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let original = root.join("original.txt");
+        let renamed = root.join("renamed.txt");
+        fs::write(&original, "tracked\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Herdr Test",
+                    "-c",
+                    "user.email=herdr@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "baseline"
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::rename(&original, &renamed).unwrap();
+
+        let dirty = first_dirty_file(&root, std::slice::from_ref(&renamed)).unwrap();
+        assert_eq!(dirty, Some(fs::canonicalize(renamed).unwrap()));
         fs::remove_dir_all(root).unwrap();
     }
 }

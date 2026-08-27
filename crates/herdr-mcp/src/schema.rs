@@ -1,6 +1,7 @@
 use serde_json::{Map, Value};
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,6 +11,7 @@ const SCHEMA_LOAD_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_SCHEMA_BYTES: usize = 8 * 1024 * 1024;
 
 static CACHE: OnceLock<Mutex<Option<CachedSchema>>> = OnceLock::new();
+static REFRESHING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 struct CachedSchema {
@@ -58,6 +60,19 @@ pub fn list_methods(query: &str) -> Result<Vec<MethodSchema>, String> {
 pub fn validate_method_params(method: &str, params: &Value) -> Result<ValidationResult, String> {
     let registry = load_registry(false)?;
     Ok(validate_with_registry(&registry, method, params))
+}
+
+/// Warm the live Herdr schema without delaying server startup.
+pub fn prewarm_async() {
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if cache
+        .lock()
+        .ok()
+        .is_some_and(|guard| guard.as_ref().is_some())
+    {
+        return;
+    }
+    start_background_refresh();
 }
 
 fn validate_with_registry(
@@ -242,11 +257,14 @@ fn load_registry(force: bool) -> Result<Arc<SchemaRegistry>, String> {
         let guard = cache
             .lock()
             .map_err(|_| "schema cache lock poisoned".to_owned())?;
-        if !force
-            && let Some(cached) = guard.as_ref()
-            && cached.loaded_at.elapsed() < SCHEMA_TTL
-        {
-            return Ok(Arc::clone(&cached.registry));
+        if !force && let Some(cached) = guard.as_ref() {
+            let registry = Arc::clone(&cached.registry);
+            if cached.loaded_at.elapsed() < SCHEMA_TTL {
+                return Ok(registry);
+            }
+            drop(guard);
+            start_background_refresh();
+            return Ok(registry);
         }
     }
 
@@ -273,6 +291,26 @@ fn load_registry(force: bool) -> Result<Arc<SchemaRegistry>, String> {
             }
         }
     }
+}
+
+fn start_background_refresh() {
+    if REFRESHING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    thread::spawn(|| {
+        if let Ok(registry) = load_live_registry()
+            && let Ok(mut guard) = CACHE.get_or_init(|| Mutex::new(None)).lock()
+        {
+            *guard = Some(CachedSchema {
+                loaded_at: Instant::now(),
+                registry: Arc::new(registry),
+            });
+        }
+        REFRESHING.store(false, Ordering::Release);
+    });
 }
 
 fn load_live_registry() -> Result<SchemaRegistry, String> {

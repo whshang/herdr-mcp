@@ -62,7 +62,7 @@ fn check_global_with_policy(action: &str, policy: &MutationPolicy) -> Result<(),
 }
 
 pub fn working_agents(snapshot: &Value, root: &Path) -> Vec<Value> {
-    let topology = projects::derive(snapshot);
+    let topology = projects::derive_routing(snapshot);
     let pane_ids = topology
         .projects
         .get(root)

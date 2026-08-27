@@ -199,24 +199,12 @@ impl ExecRegistry {
             return json!({"ok": false, "code": "invalid_params", "message": "stream must be stdout, stderr, or both"});
         };
         refresh_session_status(&session, Some(&self.inner));
-        let (bytes, truncated) = {
+        let (bytes, bytes_total, truncated) = {
             let Ok(buffers) = session.buffers.lock() else {
                 return json!({"ok": false, "reason": "session_state_unavailable"});
             };
-            let mut chunks = buffers.chunks.clone();
-            chunks.sort_by_key(|chunk| chunk.seq);
-            let bytes = chunks
-                .into_iter()
-                .filter(|chunk| stream_filter.is_none_or(|wanted| chunk.stream == wanted))
-                .flat_map(|chunk| chunk.data)
-                .collect::<Vec<_>>();
-            (bytes, buffers.truncated)
-        };
-        let end = offset.saturating_add(limit).min(bytes.len());
-        let slice = if offset >= bytes.len() {
-            &[][..]
-        } else {
-            &bytes[offset..end]
+            let (bytes, bytes_total) = read_buffer_slice(&buffers, stream_filter, offset, limit);
+            (bytes, bytes_total, buffers.truncated)
         };
         let status = session_status(&session);
         json!({
@@ -228,9 +216,9 @@ impl ExecRegistry {
             "truncated": truncated,
             "stream": stream,
             "offset": offset,
-            "text": String::from_utf8_lossy(slice),
-            "next_offset": offset.saturating_add(slice.len()),
-            "bytes_total": bytes.len(),
+            "text": String::from_utf8_lossy(&bytes),
+            "next_offset": offset.saturating_add(bytes.len()),
+            "bytes_total": bytes_total,
         })
     }
 
@@ -467,6 +455,54 @@ fn push_chunk(session: &Arc<Session>, stream: StreamKind, chunk: &[u8]) {
     if take < chunk.len() {
         buffers.truncated = true;
     }
+}
+
+fn read_buffer_slice(
+    buffers: &Buffers,
+    stream_filter: Option<StreamKind>,
+    offset: usize,
+    limit: usize,
+) -> (Vec<u8>, usize) {
+    debug_assert!(
+        buffers
+            .chunks
+            .windows(2)
+            .all(|pair| pair[0].seq <= pair[1].seq)
+    );
+    let bytes_total = match stream_filter {
+        Some(StreamKind::Stdout) => buffers.stdout_bytes,
+        Some(StreamKind::Stderr) => buffers.stderr_bytes,
+        None => buffers.stdout_bytes.saturating_add(buffers.stderr_bytes),
+    };
+    if limit == 0 || offset >= bytes_total {
+        return (Vec::new(), bytes_total);
+    }
+
+    let requested_end = offset.saturating_add(limit).min(bytes_total);
+    let mut logical_offset = 0usize;
+    let mut output = Vec::with_capacity(requested_end.saturating_sub(offset));
+    for chunk in &buffers.chunks {
+        if stream_filter.is_some_and(|wanted| chunk.stream != wanted) {
+            continue;
+        }
+        let chunk_start = logical_offset;
+        let chunk_end = chunk_start.saturating_add(chunk.data.len());
+        logical_offset = chunk_end;
+        if chunk_end <= offset {
+            continue;
+        }
+        if chunk_start >= requested_end {
+            break;
+        }
+        let start = offset.saturating_sub(chunk_start).min(chunk.data.len());
+        let end = requested_end
+            .saturating_sub(chunk_start)
+            .min(chunk.data.len());
+        if start < end {
+            output.extend_from_slice(&chunk.data[start..end]);
+        }
+    }
+    (output, bytes_total)
 }
 
 fn spawn_monitor(session: Arc<Session>, registry: Weak<RegistryInner>) {
@@ -923,6 +959,43 @@ mod tests {
                 .and_then(|value| value.to_str()),
             Some("zsh" | "bash" | "sh")
         ));
+    }
+
+    #[test]
+    fn buffer_slice_reads_only_requested_delta_across_chunks() {
+        let buffers = Buffers {
+            chunks: vec![
+                Chunk {
+                    seq: 0,
+                    stream: StreamKind::Stdout,
+                    data: b"abcd".to_vec(),
+                },
+                Chunk {
+                    seq: 1,
+                    stream: StreamKind::Stderr,
+                    data: b"12".to_vec(),
+                },
+                Chunk {
+                    seq: 2,
+                    stream: StreamKind::Stdout,
+                    data: b"efgh".to_vec(),
+                },
+            ],
+            next_seq: 3,
+            stdout_bytes: 8,
+            stderr_bytes: 2,
+            truncated: false,
+        };
+
+        let (both, both_total) = read_buffer_slice(&buffers, None, 3, 5);
+        assert_eq!(both, b"d12ef");
+        assert_eq!(both_total, 10);
+        let (stdout, stdout_total) = read_buffer_slice(&buffers, Some(StreamKind::Stdout), 3, 3);
+        assert_eq!(stdout, b"def");
+        assert_eq!(stdout_total, 8);
+        let (past_end, total) = read_buffer_slice(&buffers, None, 20, 10);
+        assert!(past_end.is_empty());
+        assert_eq!(total, 10);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::workstation;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
-pub fn inspect_core(client: &HerdrClient) -> Value {
+pub fn inspect_core(client: &HerdrClient, cached_snapshot: Option<Value>) -> Value {
     let pong = match client.ping() {
         Ok(value) => value,
         Err(error) => {
@@ -20,16 +20,23 @@ pub fn inspect_core(client: &HerdrClient) -> Value {
         }
     };
 
-    let snapshot_result = match snapshot::fetch(client) {
-        Ok(result) => result,
-        Err(error) => {
-            return json!({
-                "ok": false,
-                "code": "snapshot_unavailable",
-                "message": error,
-                "context": "herdr_inspect",
-                "failure_phase": "snapshot",
-            });
+    let snapshot_result = if let Some(value) = cached_snapshot {
+        snapshot::SnapshotResult {
+            value,
+            source: SnapshotSource::Cache,
+        }
+    } else {
+        match snapshot::fetch(client) {
+            Ok(result) => result,
+            Err(error) => {
+                return json!({
+                    "ok": false,
+                    "code": "snapshot_unavailable",
+                    "message": error,
+                    "context": "herdr_inspect",
+                    "failure_phase": "snapshot",
+                });
+            }
         }
     };
 

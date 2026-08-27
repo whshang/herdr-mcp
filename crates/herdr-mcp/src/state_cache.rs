@@ -413,7 +413,7 @@ impl CacheState {
         };
         DigestSnapshot {
             cursor: self.digest_cursor,
-            events,
+            events: coalesce_digest_updates(events),
             agents: self.agent_views(),
             workspaces: array(&self.state, "workspaces").to_vec(),
         }
@@ -449,6 +449,67 @@ impl CacheState {
             })
             .collect()
     }
+}
+
+fn coalesce_digest_updates(events: Vec<Value>) -> Vec<Value> {
+    let mut coalesced = Vec::<Value>::with_capacity(events.len());
+    for event in events {
+        let replace_last = coalesced
+            .last()
+            .is_some_and(|last| same_duplicate_update(last, &event));
+        if replace_last {
+            if let Some(last) = coalesced.last_mut() {
+                *last = event;
+            }
+        } else {
+            coalesced.push(event);
+        }
+    }
+    coalesced
+}
+
+fn same_duplicate_update(left: &Value, right: &Value) -> bool {
+    if digest_update_key(left) != digest_update_key(right) || digest_update_key(left).is_none() {
+        return false;
+    }
+    digest_payload(left) == digest_payload(right)
+}
+
+fn digest_payload(event: &Value) -> Value {
+    let mut payload = event.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("cursor");
+        object.remove("at");
+        if let Some(kind) = object
+            .get("type")
+            .and_then(Value::as_str)
+            .map(normalize_event_type)
+        {
+            object.insert("type".to_owned(), json!(kind));
+        }
+    }
+    payload
+}
+
+fn digest_update_key(event: &Value) -> Option<(String, String)> {
+    let kind = normalize_event_type(event.get("type").and_then(Value::as_str)?);
+    let id = match kind.as_str() {
+        "workspace_updated" | "workspace_metadata_updated" => event
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        "pane_updated" | "pane_agent_status_changed" => event
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        "tab_updated" => event
+            .get("tab")
+            .and_then(|tab| tab.get("tab_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }?;
+    Some((kind, id))
 }
 
 struct SharedCache {
@@ -550,6 +611,22 @@ impl EventCache {
             .read()
             .map(|state| state.state.clone())
             .unwrap_or_else(|_| json!({}))
+    }
+
+    /// Return a live event-backed snapshot only while the cache is ready,
+    /// subscribed, and not waiting for a reconciliation refresh.
+    pub fn fresh_snapshot(&self) -> Option<Value> {
+        if !self.shared.stream_live.load(Ordering::Acquire) {
+            return None;
+        }
+        if !self.shared.ready.lock().ok().is_some_and(|ready| *ready) {
+            return None;
+        }
+        self.shared
+            .state
+            .read()
+            .ok()
+            .and_then(|state| (!state.needs_reconcile).then(|| state.state.clone()))
     }
 
     pub fn last_error(&self) -> Option<String> {
@@ -832,6 +909,17 @@ mod tests {
     }
 
     #[test]
+    fn fresh_snapshot_requires_live_non_reconciling_cache() {
+        let cache = EventCache::from_snapshot_for_test(fixture());
+        assert_eq!(
+            cache.fresh_snapshot().unwrap()["focused_workspace_id"],
+            "w1"
+        );
+        cache.shared.state.write().unwrap().needs_reconcile = true;
+        assert!(cache.fresh_snapshot().is_none());
+    }
+
+    #[test]
     fn pane_event_upserts_state_agent_activity_and_digest() {
         let mut state = CacheState::default();
         state.bootstrap(fixture());
@@ -920,6 +1008,33 @@ mod tests {
         assert_eq!(digest.events.len(), 64);
         assert_eq!(digest.events[0]["cursor"], 7);
         assert_eq!(state.digest_since(69).events.len(), 1);
+    }
+
+    #[test]
+    fn digest_only_coalesces_adjacent_state_updates() {
+        let events = vec![
+            json!({"cursor": 1, "at": "a", "type": "workspace_updated", "workspace_id": "w1", "workspace": {"workspace_id": "w1", "label": "same"}}),
+            json!({"cursor": 2, "at": "b", "type": "workspace.updated", "workspace_id": "w1", "workspace": {"workspace_id": "w1", "label": "same"}}),
+            json!({"cursor": 3, "type": "workspace.closed", "workspace_id": "w1"}),
+            json!({"cursor": 4, "type": "workspace_updated", "workspace_id": "w1", "workspace": {"workspace_id": "w1", "label": "changed"}}),
+        ];
+        let coalesced = coalesce_digest_updates(events);
+        assert_eq!(coalesced.len(), 3);
+        assert_eq!(coalesced[0]["cursor"], 2);
+        assert_eq!(coalesced[1]["cursor"], 3);
+        assert_eq!(coalesced[2]["cursor"], 4);
+    }
+
+    #[test]
+    fn digest_preserves_distinct_state_transitions_for_same_object() {
+        let events = vec![
+            json!({"cursor": 1, "type": "workspace_updated", "workspace_id": "w1", "workspace": {"workspace_id": "w1", "label": "one"}}),
+            json!({"cursor": 2, "type": "workspace_updated", "workspace_id": "w1", "workspace": {"workspace_id": "w1", "label": "two"}}),
+        ];
+        let coalesced = coalesce_digest_updates(events);
+        assert_eq!(coalesced.len(), 2);
+        assert_eq!(coalesced[0]["workspace"]["label"], "one");
+        assert_eq!(coalesced[1]["workspace"]["label"], "two");
     }
 
     #[test]

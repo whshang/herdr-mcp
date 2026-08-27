@@ -6,6 +6,7 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SnapshotSource {
+    Cache,
     Snapshot,
     Lists,
 }
@@ -13,6 +14,7 @@ pub enum SnapshotSource {
 impl SnapshotSource {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Cache => "cache",
             Self::Snapshot => "snapshot",
             Self::Lists => "lists",
         }

@@ -5,8 +5,10 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+use std::thread;
 
 const RECORD_TTL_MS: u64 = 10 * 60_000;
 const RECORD_LIMIT: usize = 512;
@@ -419,14 +421,13 @@ fn prompt_success(
         .and_then(Value::as_str)
         .unwrap_or("submitted")
         .to_owned();
-    let mut after = agent_state_of(client, target);
-    if !waited
-        && before.is_some()
-        && after.as_ref().is_some_and(|after| {
-            before.and_then(|before| before.state_change_seq) == after.state_change_seq
-        })
-    {
-        thread::sleep(Duration::from_millis(250));
+    // The native agent.prompt success response normally includes current agent
+    // state. Reuse that delivery evidence instead of forcing an additional
+    // agent.get round trip. Legacy responses that omit agent state keep one
+    // bounded fallback probe so the existing before/after evidence remains
+    // available, but the historical 250ms sleep + second probe is removed.
+    let mut after = agent_state_from_value(&prompt);
+    if after.is_none() {
         after = agent_state_of(client, target);
     }
     let observation = build_state_observation(before, after.as_ref(), waited);
@@ -588,8 +589,12 @@ fn agent_state_of(client: &HerdrClient, target: &str) -> Option<AgentState> {
     let result = client
         .call_with_timeout("agent.get", json!({"target": target}), STATE_PROBE_TIMEOUT)
         .ok()?;
-    let agent = result.get("agent").unwrap_or(&result);
-    Some(AgentState {
+    agent_state_from_value(&result)
+}
+
+fn agent_state_from_value(value: &Value) -> Option<AgentState> {
+    let agent = value.get("agent").unwrap_or(value);
+    let state = AgentState {
         pane_id: agent
             .get("pane_id")
             .and_then(Value::as_str)
@@ -600,7 +605,9 @@ fn agent_state_of(client: &HerdrClient, target: &str) -> Option<AgentState> {
             .or_else(|| agent.get("status").and_then(Value::as_str))
             .map(str::to_owned),
         state_change_seq: agent.get("state_change_seq").and_then(Value::as_u64),
-    })
+    };
+    (state.pane_id.is_some() || state.agent_status.is_some() || state.state_change_seq.is_some())
+        .then_some(state)
 }
 
 #[derive(Debug, Clone)]
@@ -899,10 +906,7 @@ mod tests {
         let socket = temp_socket();
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            for (index, expected) in ["agent.get", "agent.prompt", "agent.get"]
-                .into_iter()
-                .enumerate()
-            {
+            for (index, expected) in ["agent.get", "agent.prompt"].into_iter().enumerate() {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
                 BufReader::new(stream.try_clone().unwrap())
@@ -911,13 +915,14 @@ mod tests {
                 let request: Value = serde_json::from_str(&line).unwrap();
                 assert_eq!(request["method"], expected);
                 let result = match (index, expected) {
-                    (_, "agent.prompt") => json!({"prompt": {"status": "submitted"}}),
+                    (_, "agent.prompt") => json!({"prompt": {
+                        "status": "submitted",
+                        "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}
+                    }}),
                     (0, "agent.get") => json!({
                         "agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}
                     }),
-                    _ => json!({
-                        "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}
-                    }),
+                    _ => unreachable!(),
                 };
                 writeln!(stream, "{}", json!({"id": request["id"], "result": result})).unwrap();
             }
@@ -944,10 +949,7 @@ mod tests {
         let socket = temp_socket();
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            for (index, expected) in ["agent.get", "agent.prompt", "agent.get"]
-                .into_iter()
-                .enumerate()
-            {
+            for (index, expected) in ["agent.get", "agent.prompt"].into_iter().enumerate() {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
                 BufReader::new(stream.try_clone().unwrap())
@@ -956,13 +958,14 @@ mod tests {
                 let request: Value = serde_json::from_str(&line).unwrap();
                 assert_eq!(request["method"], expected);
                 let result = match (index, expected) {
-                    (_, "agent.prompt") => json!({"prompt": {"status": "submitted"}}),
+                    (_, "agent.prompt") => json!({"prompt": {
+                        "status": "submitted",
+                        "agent": {"pane_id": "w9:p1", "agent_status": "working", "state_change_seq": 11}
+                    }}),
                     (0, "agent.get") => json!({
                         "agent": {"pane_id": "w9:p1", "agent_status": "idle", "state_change_seq": 10}
                     }),
-                    _ => json!({
-                        "agent": {"pane_id": "w9:p1", "agent_status": "working", "state_change_seq": 11}
-                    }),
+                    _ => unreachable!(),
                 };
                 writeln!(stream, "{}", json!({"id": request["id"], "result": result})).unwrap();
             }

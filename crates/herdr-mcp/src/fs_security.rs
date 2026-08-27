@@ -10,7 +10,7 @@ pub struct ManagedPath {
 }
 
 pub fn managed_roots(snapshot: &Value) -> Vec<PathBuf> {
-    let mut roots = projects::derive(snapshot)
+    let mut roots = projects::derive_routing(snapshot)
         .projects
         .into_values()
         .filter(|project| project.managed && project.vcs == Some("git"))
@@ -28,9 +28,19 @@ pub fn managed_roots(snapshot: &Value) -> Vec<PathBuf> {
 }
 
 pub fn validate_existing(snapshot: &Value, input: &str) -> Result<ManagedPath, Value> {
-    let resolved = resolve_input(input)?;
     let roots = managed_roots(snapshot);
-    let Some(root) = containing_root(&roots, &resolved).cloned() else {
+    validate_existing_with_roots(&roots, input)
+}
+
+/// Validate an existing path against one project root that was already
+/// validated as managed by the caller.
+pub fn validate_existing_in_root(project_root: &Path, input: &str) -> Result<ManagedPath, Value> {
+    validate_existing_with_roots(&[project_root.to_path_buf()], input)
+}
+
+fn validate_existing_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedPath, Value> {
+    let resolved = resolve_input(input)?;
+    let Some(root) = containing_root(roots, &resolved).cloned() else {
         return Err(json!({
             "ok": false,
             "reason": "outside_managed_roots",
@@ -79,9 +89,19 @@ pub fn validate_existing(snapshot: &Value, input: &str) -> Result<ManagedPath, V
 }
 
 pub fn validate_target(snapshot: &Value, input: &str) -> Result<ManagedPath, Value> {
-    let resolved = resolve_input(input)?;
     let roots = managed_roots(snapshot);
-    let Some(root) = containing_root(&roots, &resolved).cloned() else {
+    validate_target_with_roots(&roots, input)
+}
+
+/// Validate a writable target against one project root that was already
+/// validated as managed by the caller.
+pub fn validate_target_in_root(project_root: &Path, input: &str) -> Result<ManagedPath, Value> {
+    validate_target_with_roots(&[project_root.to_path_buf()], input)
+}
+
+fn validate_target_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedPath, Value> {
+    let resolved = resolve_input(input)?;
+    let Some(root) = containing_root(roots, &resolved).cloned() else {
         return Err(json!({
             "ok": false,
             "reason": "outside_managed_roots",

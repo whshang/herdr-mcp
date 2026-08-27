@@ -80,7 +80,7 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
     for operation in operations {
         match operation {
             PatchOp::Add { path, content } => {
-                let target = match resolve_target(snapshot, &root_path.root, &path, false) {
+                let target = match resolve_target(&root_path.root, &path, false) {
                     Ok(value) => value,
                     Err(error) => return error,
                 };
@@ -101,7 +101,7 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
                 });
             }
             PatchOp::Delete { path } => {
-                let target = match resolve_target(snapshot, &root_path.root, &path, true) {
+                let target = match resolve_target(&root_path.root, &path, true) {
                     Ok(value) => value,
                     Err(error) => return error,
                 };
@@ -129,7 +129,7 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
                 hunks,
                 move_to,
             } => {
-                let source = match resolve_target(snapshot, &root_path.root, &path, true) {
+                let source = match resolve_target(&root_path.root, &path, true) {
                     Ok(value) => value,
                     Err(error) => return error,
                 };
@@ -162,7 +162,7 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
                 }
                 if let Some(destination_path) = move_to {
                     let destination =
-                        match resolve_target(snapshot, &root_path.root, &destination_path, false) {
+                        match resolve_target(&root_path.root, &destination_path, false) {
                             Ok(value) => value,
                             Err(error) => return error,
                         };
@@ -207,27 +207,31 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
         return error;
     }
     if !dry_run && !confirm_dirty {
-        for item in &staged {
-            let Some(source) = &item.dirty_source else {
-                continue;
-            };
-            match git_tools::file_dirty(&root_path.root, source) {
-                Ok(true) => {
-                    return json!({
-                        "ok": false,
-                        "reason": "file_dirty_confirmation_required",
-                        "path": item.display.to_string_lossy(),
-                        "hint": "re-send with confirm_dirty:true",
-                    });
-                }
-                Ok(false) => {}
-                Err(message) => {
-                    return fail(
-                        "git_status_failed",
-                        item.display.to_string_lossy().as_ref(),
-                        Some(message),
-                    );
-                }
+        let dirty_sources = staged
+            .iter()
+            .filter_map(|item| item.dirty_source.clone())
+            .collect::<Vec<_>>();
+        match git_tools::first_dirty_file(&root_path.root, &dirty_sources) {
+            Ok(Some(dirty)) => {
+                let display = staged
+                    .iter()
+                    .find(|item| item.dirty_source.as_ref() == Some(&dirty))
+                    .map(|item| item.display.as_path())
+                    .unwrap_or(dirty.as_path());
+                return json!({
+                    "ok": false,
+                    "reason": "file_dirty_confirmation_required",
+                    "path": display.to_string_lossy(),
+                    "hint": "re-send with confirm_dirty:true",
+                });
+            }
+            Ok(None) => {}
+            Err(message) => {
+                return fail(
+                    "git_status_failed",
+                    root_path.resolved.to_string_lossy().as_ref(),
+                    Some(message),
+                );
             }
         }
     }
@@ -275,7 +279,6 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
 }
 
 fn resolve_target(
-    snapshot: &Value,
     project_root: &Path,
     raw: &str,
     must_exist: bool,
@@ -288,9 +291,9 @@ fn resolve_target(
     };
     let absolute = absolute.to_string_lossy();
     let target = if must_exist {
-        fs_security::validate_existing(snapshot, &absolute)?
+        fs_security::validate_existing_in_root(project_root, &absolute)?
     } else {
-        fs_security::validate_target(snapshot, &absolute)?
+        fs_security::validate_target_in_root(project_root, &absolute)?
     };
     let expected_root =
         fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
