@@ -1,3 +1,4 @@
+use crate::instance::InstanceId;
 use semver::Version;
 use std::fs;
 use std::path::Path;
@@ -51,8 +52,16 @@ impl Default for Config {
 impl Config {
     /// Defaults used when config.toml is absent. Alpha/prerelease binaries keep
     /// dogfood on `preview` so discovery still sees current GitHub alphas.
+    #[allow(dead_code)]
     pub fn missing_file_default() -> Self {
-        let mut config = Self::default();
+        Self::missing_file_default_for_instance(&InstanceId::default_instance())
+    }
+
+    pub fn missing_file_default_for_instance(instance: &InstanceId) -> Self {
+        let mut config = Self {
+            runtime_port: instance.default_port(),
+            ..Self::default()
+        };
         if binary_is_prerelease() {
             config.update_channel = UpdateChannel::Preview;
         }
@@ -60,10 +69,14 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
+        Self::load_for_instance(path, &InstanceId::default_instance())
+    }
+
+    pub fn load_for_instance(path: &Path, instance: &InstanceId) -> Result<Self, String> {
         let content = match fs::read_to_string(path) {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::missing_file_default());
+                return Ok(Self::missing_file_default_for_instance(instance));
             }
             Err(error) => return Err(format!("cannot read config {}: {error}", path.display())),
         };

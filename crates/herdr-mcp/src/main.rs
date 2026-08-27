@@ -16,6 +16,7 @@ mod fs_tools;
 mod git_tools;
 mod herdr;
 mod inspect;
+mod instance;
 mod link;
 mod mcp;
 mod mcp_http;
@@ -60,7 +61,12 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<ExitCode, String> {
-    match cli::parse(std::env::args().skip(1))? {
+    let parsed = cli::parse(std::env::args().skip(1))?;
+    if let Some(name) = parsed.instance.as_deref() {
+        // SSOT for path/label/port discovery in this process.
+        unsafe { std::env::set_var("HERDR_MCP_INSTANCE", name) };
+    }
+    match parsed.command {
         cli::Command::Help => {
             print!("{}", cli::help());
             Ok(ExitCode::SUCCESS)
@@ -77,13 +83,13 @@ fn run() -> Result<ExitCode, String> {
         }
         cli::Command::Status => {
             let paths = paths::RuntimePaths::discover()?;
-            let config = config::Config::load(&paths.config_file)?;
+            let config = config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
             status::print_status(&paths, &config);
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Doctor => {
             let paths = paths::RuntimePaths::discover()?;
-            let config = config::Config::load(&paths.config_file)?;
+            let config = config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
             Ok(if status::print_doctor(&paths, &config) {
                 ExitCode::SUCCESS
             } else {
@@ -95,7 +101,8 @@ fn run() -> Result<ExitCode, String> {
             match command {
                 cli::ConfigCommand::Path => println!("{}", paths.config_file.display()),
                 cli::ConfigCommand::Show => {
-                    let config = config::Config::load(&paths.config_file)?;
+                    let config =
+                        config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
                     print!("{}", config.render());
                 }
                 cli::ConfigCommand::Init => {
@@ -113,7 +120,7 @@ fn run() -> Result<ExitCode, String> {
                     })?;
                     std::fs::write(
                         &paths.config_file,
-                        config::Config::missing_file_default().render(),
+                        config::Config::missing_file_default_for_instance(&paths.instance).render(),
                     )
                     .map_err(|error| {
                         format!(

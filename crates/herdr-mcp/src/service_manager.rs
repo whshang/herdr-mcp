@@ -1,7 +1,9 @@
 //! macOS service manager for the Rust local runtime.
 //!
-//! The production launchd label intentionally stays `dev.herdr-mcp.server` so
-//! callers and the browser extension do not learn a second service identity.
+//! The default (production) launchd label stays `dev.herdr-mcp.server` so
+//! callers and the browser extension keep a single primary service identity.
+//! Named instances (`HERDR_MCP_INSTANCE` / `--instance`) suffix labels and ports
+//! for same-uid UAT and never rewrite `~/.local/bin/herdr-mcp`.
 //! A Rust install is content-addressed under `runtime/generations/` and launchd
 //! points at the stable `runtime/current/herdr-mcp` path. Replacing an existing
 //! Node service is explicit (`service install --adopt-node`) and transactional:
@@ -44,6 +46,7 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
+    use crate::instance::InstanceId;
     use crate::paths::RuntimePaths;
     use crate::state_store::{RuntimeGenerationRecord, ServiceRollbackRecord, StateStore};
     use crate::user_cli;
@@ -63,13 +66,18 @@ mod macos {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    const SERVICE_LABEL: &str = "dev.herdr-mcp.server";
-    const WATCHDOG_LABEL: &str = "dev.herdr-mcp.watchdog";
+    // Kept as named aliases so adoption/rollback and tests keep a single spelling
+    // for the default production identities.
+    #[allow(dead_code)]
+    const SERVICE_LABEL: &str = crate::instance::DEFAULT_SERVICE_LABEL;
+    const WATCHDOG_LABEL: &str = crate::instance::DEFAULT_WATCHDOG_LABEL;
     /// Periodic Rust-era health sidecar. Deliberately distinct from the legacy
     /// Node `dev.herdr-mcp.watchdog` identity reserved for adoption/rollback.
-    const HEALTH_WATCHDOG_LABEL: &str = "dev.herdr-mcp.health-watchdog";
+    #[allow(dead_code)]
+    const HEALTH_WATCHDOG_LABEL: &str = crate::instance::DEFAULT_HEALTH_WATCHDOG_LABEL;
     const SERVICE_IMPL: &str = "rust-v1";
-    const DEFAULT_PORT: u16 = 8772;
+    #[allow(dead_code)]
+    const DEFAULT_PORT: u16 = crate::instance::DEFAULT_RUNTIME_PORT;
     const HEALTH_BUDGET: Duration = Duration::from_secs(10);
     const LAUNCHD_ABSENT_BUDGET: Duration = Duration::from_secs(2);
     const LAUNCHD_BOOTOUT_BUDGET: Duration = Duration::from_secs(10);
@@ -88,6 +96,7 @@ mod macos {
 
     #[derive(Debug, Clone)]
     struct ServicePaths {
+        instance: InstanceId,
         home: PathBuf,
         config_dir: PathBuf,
         source_binary: PathBuf,
@@ -95,6 +104,10 @@ mod macos {
         generations_dir: PathBuf,
         current_link: PathBuf,
         current_binary: PathBuf,
+        service_label: String,
+        watchdog_label: String,
+        health_watchdog_label: String,
+        port: u16,
         plist: PathBuf,
         watchdog_plist: PathBuf,
         health_watchdog_plist: PathBuf,
@@ -277,6 +290,7 @@ mod macos {
                 .herdr_socket
                 .ok_or_else(|| "service manager requires a Herdr Unix socket path".to_owned())?;
             Ok(Self::for_values(
+                runtime.instance,
                 home,
                 runtime.config_dir,
                 source_binary,
@@ -285,6 +299,7 @@ mod macos {
         }
 
         fn for_values(
+            instance: InstanceId,
             home: PathBuf,
             config_dir: PathBuf,
             source_binary: PathBuf,
@@ -294,24 +309,29 @@ mod macos {
             let generations_dir = runtime_root.join("generations");
             let current_link = runtime_root.join("current");
             let current_binary = current_link.join("herdr-mcp");
+            let service_label = instance.service_label();
+            let watchdog_label = instance.watchdog_label();
+            let health_watchdog_label = instance.health_watchdog_label();
+            let port = instance.default_port();
             Self {
                 plist: home
                     .join("Library")
                     .join("LaunchAgents")
-                    .join(format!("{SERVICE_LABEL}.plist")),
+                    .join(format!("{service_label}.plist")),
                 watchdog_plist: home
                     .join("Library")
                     .join("LaunchAgents")
-                    .join(format!("{WATCHDOG_LABEL}.plist")),
+                    .join(format!("{watchdog_label}.plist")),
                 health_watchdog_plist: home
                     .join("Library")
                     .join("LaunchAgents")
-                    .join(format!("{HEALTH_WATCHDOG_LABEL}.plist")),
+                    .join(format!("{health_watchdog_label}.plist")),
                 backups_dir: config_dir.join("backups"),
                 guardians_dir: config_dir.join("guardians"),
                 mutation_lock: config_dir.join("service-mutation.lock"),
                 extension_socket: config_dir.join("extension.sock"),
                 log_path: config_dir.join("server.log"),
+                instance,
                 home,
                 config_dir,
                 source_binary,
@@ -319,6 +339,10 @@ mod macos {
                 generations_dir,
                 current_link,
                 current_binary,
+                service_label,
+                watchdog_label,
+                health_watchdog_label,
+                port,
                 herdr_socket,
             }
         }
@@ -803,6 +827,9 @@ mod macos {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
+        if let Some(name) = paths.instance.name() {
+            command.env("HERDR_MCP_INSTANCE", name);
+        }
         if let Some(path) = env::var_os("PATH") {
             command.env("PATH", path);
         }
@@ -1175,7 +1202,7 @@ mod macos {
         }
 
         guardian_quiesce_label(WATCHDOG_LABEL)?;
-        guardian_quiesce_label(SERVICE_LABEL)?;
+        guardian_quiesce_label(&paths.service_label)?;
         match server_bytes.as_deref() {
             Some(bytes) => atomic_write(&paths.plist, bytes, 0o600)?,
             None => remove_regular_file(&paths.plist)?,
@@ -1186,11 +1213,11 @@ mod macos {
             None => remove_regular_file(&paths.watchdog_plist)?,
         }
         if record.server_was_loaded {
-            bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
-            wait_for_service_health(&server, DEFAULT_PORT)?;
+            bootstrap_with_retry(&paths.plist, &paths.service_label)?;
+            wait_for_service_health(&server, paths.port)?;
         }
         if record.watchdog_was_loaded {
-            bootstrap_with_retry(&paths.watchdog_plist, WATCHDOG_LABEL)?;
+            bootstrap_with_retry(&paths.watchdog_plist, &paths.watchdog_label)?;
         }
         Ok(())
     }
@@ -1355,8 +1382,8 @@ mod macos {
             paths,
             adopt_node,
             mutation_lock,
-            || is_loaded(SERVICE_LABEL),
-            || health_once(DEFAULT_PORT),
+            || is_loaded(&paths.service_label),
+            || health_once(paths.port),
         )
     }
 
@@ -1371,6 +1398,12 @@ mod macos {
         Loaded: FnOnce() -> bool,
         Healthy: FnOnce() -> bool,
     {
+        if paths.instance.is_named() && adopt_node {
+            return Err(
+                "service install --adopt-node is only valid for the default production instance"
+                    .to_owned(),
+            );
+        }
         let existing_bytes = read_optional_bounded(&paths.plist, 256 * 1024)?;
         let existing = describe_service(existing_bytes.as_deref(), paths)?;
         match existing.kind {
@@ -1400,17 +1433,8 @@ mod macos {
 
         if let Some(mut result) = same_active_install_noop_with(paths, &existing, loaded, healthy)?
         {
-            let user_cli = user_cli::ensure_link(&paths.home, &paths.current_binary)?;
             if let Some(object) = result.as_object_mut() {
-                object.insert(
-                    "user_cli".to_owned(),
-                    json!(user_cli.path.to_string_lossy()),
-                );
-                object.insert(
-                    "user_cli_target".to_owned(),
-                    json!(user_cli.target.to_string_lossy()),
-                );
-                object.insert("user_cli_changed".to_owned(), json!(user_cli.changed));
+                insert_user_cli_fields(object, paths)?;
             }
             return Ok(result);
         }
@@ -1434,9 +1458,9 @@ mod macos {
         let new_plist = encode_service_plist(paths, &env)?;
         let rollback = RollbackState {
             server_plist: existing_bytes.clone(),
-            server_was_loaded: is_loaded(SERVICE_LABEL),
+            server_was_loaded: is_loaded(&paths.service_label),
             watchdog_plist: watchdog_bytes.clone(),
-            watchdog_was_loaded: is_loaded(WATCHDOG_LABEL),
+            watchdog_was_loaded: is_loaded(&paths.watchdog_label),
             previous_current: current_target(paths)?,
         };
 
@@ -1524,7 +1548,7 @@ mod macos {
         };
 
         let mut server_bootout_pending = false;
-        let mut user_cli_link = None;
+        let mut user_cli_link: Option<UserCliReport> = None;
         let activation = (|| -> Result<(), String> {
             if rollback.watchdog_was_loaded {
                 bootout(WATCHDOG_LABEL)?;
@@ -1533,9 +1557,9 @@ mod macos {
                 remove_regular_file(&paths.watchdog_plist)?;
             }
             if rollback.server_was_loaded {
-                server_bootout_pending = request_bootout(SERVICE_LABEL)?;
+                server_bootout_pending = request_bootout(&paths.service_label)?;
                 if server_bootout_pending {
-                    wait_launchd_absent(SERVICE_LABEL, LAUNCHD_BOOTOUT_BUDGET)?;
+                    wait_launchd_absent(&paths.service_label, LAUNCHD_BOOTOUT_BUDGET)?;
                     server_bootout_pending = false;
                 }
             }
@@ -1544,9 +1568,9 @@ mod macos {
             // Point PATH entry at runtime/current before bootstrap so a failed
             // link rolls back with the rest of activation. The link always
             // resolves through `current`, so generation rollback stays valid.
-            user_cli_link = Some(user_cli::ensure_link(&paths.home, &paths.current_binary)?);
-            bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
-            wait_for_health(DEFAULT_PORT)?;
+            user_cli_link = Some(maybe_ensure_user_cli(paths)?);
+            bootstrap_with_retry(&paths.plist, &paths.service_label)?;
+            wait_for_health(paths.port)?;
             store.activate_runtime_generation_with_rollback(
                 &generation.generation_id,
                 rollback_id.as_deref(),
@@ -1617,7 +1641,7 @@ mod macos {
         Ok(json!({
             "ok": true,
             "implementation": "rust",
-            "label": SERVICE_LABEL,
+            "label": paths.service_label,
             "generation": generation.generation_id,
             "sha256": generation.sha256,
             "runtime_binary": generation.binary,
@@ -1625,6 +1649,7 @@ mod macos {
             "user_cli": user_cli.path,
             "user_cli_target": user_cli.target,
             "user_cli_changed": user_cli.changed,
+            "user_cli_skipped": user_cli.skipped,
             "plist": paths.plist,
             "extension_socket": paths.extension_socket,
             "adopted_node": existing.kind == ServiceKind::Node,
@@ -1754,7 +1779,7 @@ mod macos {
         Ok(Some(json!({
             "ok": true,
             "implementation": "rust",
-            "label": SERVICE_LABEL,
+            "label": paths.service_label,
             "already_active": true,
             "changed": false,
             "generation": generation_id,
@@ -1782,12 +1807,12 @@ mod macos {
     fn status(paths: &ServicePaths) -> Result<Value, String> {
         status_with(
             paths,
-            || is_loaded(SERVICE_LABEL),
-            || is_loaded(WATCHDOG_LABEL),
-            || is_loaded(HEALTH_WATCHDOG_LABEL),
+            || is_loaded(&paths.service_label),
+            || is_loaded(&paths.watchdog_label),
+            || is_loaded(&paths.health_watchdog_label),
             |kind, loaded| {
                 if kind == ServiceKind::Rust && loaded {
-                    health_once(DEFAULT_PORT)
+                    health_once(paths.port)
                 } else {
                     false
                 }
@@ -1821,7 +1846,7 @@ mod macos {
         };
         Ok(json!({
             "ok": descriptor.kind == ServiceKind::Rust && loaded && health,
-            "label": SERVICE_LABEL,
+            "label": paths.service_label,
             "implementation": implementation,
             "loaded": loaded,
             "healthy": health,
@@ -1831,7 +1856,7 @@ mod macos {
             "extension_socket": paths.extension_socket,
             "legacy_watchdog_present": paths.watchdog_plist.exists(),
             "legacy_watchdog_loaded": legacy_watchdog_loaded(),
-            "health_watchdog_label": HEALTH_WATCHDOG_LABEL,
+            "health_watchdog_label": paths.health_watchdog_label,
             "health_watchdog_present": paths.health_watchdog_plist.exists(),
             "health_watchdog_loaded": health_watchdog_loaded(),
         }))
@@ -1839,48 +1864,48 @@ mod macos {
 
     fn start(paths: &ServicePaths) -> Result<Value, String> {
         let descriptor = require_rust_service(paths)?;
-        if is_loaded(SERVICE_LABEL) {
-            kickstart()?;
+        if is_loaded(&paths.service_label) {
+            kickstart(&paths.service_label)?;
         } else {
-            bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
+            bootstrap_with_retry(&paths.plist, &paths.service_label)?;
         }
-        wait_for_health(DEFAULT_PORT)?;
+        wait_for_health(paths.port)?;
         let evidence_recorded = record_action(paths, "start", "ok", &descriptor, None);
         Ok(json!({
             "ok": true,
             "action": "start",
-            "label": SERVICE_LABEL,
+            "label": paths.service_label,
             "evidence_recorded": evidence_recorded,
         }))
     }
 
     fn stop(paths: &ServicePaths) -> Result<Value, String> {
         let descriptor = require_rust_service(paths)?;
-        if is_loaded(SERVICE_LABEL) {
-            bootout(SERVICE_LABEL)?;
+        if is_loaded(&paths.service_label) {
+            bootout(&paths.service_label)?;
         }
         let evidence_recorded = record_action(paths, "stop", "ok", &descriptor, None);
         Ok(json!({
             "ok": true,
             "action": "stop",
-            "label": SERVICE_LABEL,
+            "label": paths.service_label,
             "evidence_recorded": evidence_recorded,
         }))
     }
 
     fn restart(paths: &ServicePaths) -> Result<Value, String> {
         let descriptor = require_rust_service(paths)?;
-        if is_loaded(SERVICE_LABEL) {
-            kickstart()?;
+        if is_loaded(&paths.service_label) {
+            kickstart(&paths.service_label)?;
         } else {
-            bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
+            bootstrap_with_retry(&paths.plist, &paths.service_label)?;
         }
-        wait_for_health(DEFAULT_PORT)?;
+        wait_for_health(paths.port)?;
         let evidence_recorded = record_action(paths, "restart", "ok", &descriptor, None);
         Ok(json!({
             "ok": true,
             "action": "restart",
-            "label": SERVICE_LABEL,
+            "label": paths.service_label,
             "evidence_recorded": evidence_recorded,
         }))
     }
@@ -1902,7 +1927,7 @@ mod macos {
         if !is_owned_generation_target(&current_target) {
             return Err("Rust service runtime/current pointer is not managed".to_owned());
         }
-        let current_was_loaded = is_loaded(SERVICE_LABEL);
+        let current_was_loaded = is_loaded(&paths.service_label);
 
         let mut store = StateStore::open_in_dir(&paths.config_dir, "state")?;
         let rollback = store
@@ -2078,9 +2103,9 @@ mod macos {
         let mut current_bootout_pending = false;
         let apply = (|| -> Result<(), String> {
             if current_was_loaded {
-                current_bootout_pending = request_bootout(SERVICE_LABEL)?;
+                current_bootout_pending = request_bootout(&paths.service_label)?;
                 if current_bootout_pending {
-                    wait_launchd_absent(SERVICE_LABEL, LAUNCHD_BOOTOUT_BUDGET)?;
+                    wait_launchd_absent(&paths.service_label, LAUNCHD_BOOTOUT_BUDGET)?;
                     current_bootout_pending = false;
                 }
             }
@@ -2090,11 +2115,11 @@ mod macos {
                 atomic_write(&paths.watchdog_plist, bytes, 0o600)?;
             }
             if rollback.server_was_loaded {
-                bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
-                wait_for_service_health(&source, DEFAULT_PORT)?;
+                bootstrap_with_retry(&paths.plist, &paths.service_label)?;
+                wait_for_service_health(&source, paths.port)?;
             }
             if rollback.watchdog_was_loaded {
-                bootstrap_with_retry(&paths.watchdog_plist, WATCHDOG_LABEL)?;
+                bootstrap_with_retry(&paths.watchdog_plist, &paths.watchdog_label)?;
             }
             store.complete_service_rollback(
                 &rollback.rollback_id,
@@ -2167,17 +2192,17 @@ mod macos {
 
     fn uninstall(paths: &ServicePaths) -> Result<Value, String> {
         let descriptor = require_rust_service(paths)?;
-        if is_loaded(SERVICE_LABEL) {
-            bootout(SERVICE_LABEL)?;
+        if is_loaded(&paths.service_label) {
+            bootout(&paths.service_label)?;
         }
         remove_regular_file(&paths.plist)?;
-        let user_cli_removed = user_cli::remove_link_if_owned(&paths.home, &paths.current_binary)?;
+        let user_cli_removed = maybe_remove_user_cli(paths)?;
         remove_current_if_owned(paths)?;
         let evidence_recorded = record_action(paths, "uninstall", "ok", &descriptor, None);
         Ok(json!({
             "ok": true,
             "action": "uninstall",
-            "label": SERVICE_LABEL,
+            "label": paths.service_label,
             "generations_preserved": true,
             "user_cli_removed": user_cli_removed,
             "evidence_recorded": evidence_recorded,
@@ -2190,7 +2215,7 @@ mod macos {
         if descriptor.kind != ServiceKind::Rust {
             return Err("service is not installed as an owned Rust service".to_owned());
         }
-        if paths.watchdog_plist.exists() || is_loaded(WATCHDOG_LABEL) {
+        if paths.watchdog_plist.exists() || is_loaded(&paths.watchdog_label) {
             return Err(
                 "legacy watchdog is present; refusing dual supervisor ownership".to_owned(),
             );
@@ -2221,6 +2246,74 @@ mod macos {
             .is_ok()
     }
 
+    #[derive(Debug, Clone)]
+    struct UserCliReport {
+        path: Option<PathBuf>,
+        target: Option<PathBuf>,
+        changed: bool,
+        skipped: bool,
+    }
+
+    fn maybe_ensure_user_cli(paths: &ServicePaths) -> Result<UserCliReport, String> {
+        if paths.instance.is_named() {
+            return Ok(UserCliReport {
+                path: None,
+                target: None,
+                changed: false,
+                skipped: true,
+            });
+        }
+        let link = user_cli::ensure_link(&paths.home, &paths.current_binary)?;
+        Ok(UserCliReport {
+            path: Some(link.path),
+            target: Some(link.target),
+            changed: link.changed,
+            skipped: false,
+        })
+    }
+
+    fn maybe_remove_user_cli(paths: &ServicePaths) -> Result<bool, String> {
+        if paths.instance.is_named() {
+            return Ok(false);
+        }
+        user_cli::remove_link_if_owned(&paths.home, &paths.current_binary)
+    }
+
+    fn insert_user_cli_fields(
+        object: &mut serde_json::Map<String, Value>,
+        paths: &ServicePaths,
+    ) -> Result<(), String> {
+        let report = maybe_ensure_user_cli(paths)?;
+        if report.skipped {
+            object.insert("user_cli_skipped".to_owned(), json!(true));
+            object.insert(
+                "user_cli_skip_reason".to_owned(),
+                json!("named_instance_keeps_default_user_cli"),
+            );
+        } else {
+            object.insert(
+                "user_cli".to_owned(),
+                json!(
+                    report
+                        .path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                ),
+            );
+            object.insert(
+                "user_cli_target".to_owned(),
+                json!(
+                    report
+                        .target
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                ),
+            );
+            object.insert("user_cli_changed".to_owned(), json!(report.changed));
+        }
+        Ok(())
+    }
+
     fn service_environment(
         paths: &ServicePaths,
         inherited: &BTreeMap<String, String>,
@@ -2246,7 +2339,7 @@ mod macos {
             .unwrap_or(secure_token_hex()?);
         out.insert("HERDR_MCP_TOKEN".to_owned(), token);
         out.insert("HERDR_MCP_HOST".to_owned(), "127.0.0.1".to_owned());
-        out.insert("HERDR_MCP_PORT".to_owned(), DEFAULT_PORT.to_string());
+        out.insert("HERDR_MCP_PORT".to_owned(), paths.port.to_string());
         out.insert(
             "HERDR_MCP_CONTRACT_PROFILE".to_owned(),
             out.get("HERDR_MCP_CONTRACT_PROFILE")
@@ -2280,6 +2373,13 @@ mod macos {
             paths.config_dir.to_string_lossy().into_owned(),
         );
         out.insert(
+            "HERDR_MCP_CONFIG_DIR".to_owned(),
+            paths.config_dir.to_string_lossy().into_owned(),
+        );
+        if let Some(name) = paths.instance.name() {
+            out.insert("HERDR_MCP_INSTANCE".to_owned(), name.to_owned());
+        }
+        out.insert(
             "HERDR_EXTENSION_IPC_SOCKET".to_owned(),
             paths.extension_socket.to_string_lossy().into_owned(),
         );
@@ -2298,7 +2398,7 @@ mod macos {
         let mut root = Dictionary::new();
         root.insert(
             "Label".to_owned(),
-            PlistValue::String(SERVICE_LABEL.to_owned()),
+            PlistValue::String(paths.service_label.clone()),
         );
         root.insert(
             "ProgramArguments".to_owned(),
@@ -2306,7 +2406,7 @@ mod macos {
                 PlistValue::String(paths.current_binary.to_string_lossy().into_owned()),
                 PlistValue::String("candidate".to_owned()),
                 PlistValue::String("--port".to_owned()),
-                PlistValue::String(DEFAULT_PORT.to_string()),
+                PlistValue::String(paths.port.to_string()),
             ]),
         );
         root.insert(
@@ -2383,12 +2483,12 @@ mod macos {
                     .collect::<BTreeMap<_, _>>()
             })
             .unwrap_or_default();
-        let rust_owned = label == Some(SERVICE_LABEL)
+        let rust_owned = label == Some(paths.service_label.as_str())
             && program_arguments.first().map(String::as_str)
                 == Some(paths.current_binary.to_string_lossy().as_ref())
             && program_arguments.get(1).map(String::as_str) == Some("candidate")
             && env.get("HERDR_MCP_SERVICE_IMPL").map(String::as_str) == Some(SERVICE_IMPL);
-        let node_owned = label == Some(SERVICE_LABEL)
+        let node_owned = label == Some(paths.service_label.as_str())
             && program_arguments
                 .first()
                 .and_then(|value| Path::new(value).file_name())
@@ -2569,7 +2669,7 @@ mod macos {
         rollback: &RollbackState,
         server_bootout_pending: bool,
     ) -> Result<(), String> {
-        settle_service_for_restore(SERVICE_LABEL, server_bootout_pending)?;
+        settle_service_for_restore(&paths.service_label, server_bootout_pending)?;
         match rollback.server_plist.as_deref() {
             Some(bytes) => atomic_write(&paths.plist, bytes, 0o600)?,
             None => remove_regular_file(&paths.plist)?,
@@ -2579,19 +2679,21 @@ mod macos {
             atomic_write(&paths.watchdog_plist, bytes, 0o600)?;
         }
         if rollback.server_was_loaded && rollback.server_plist.is_some() {
-            bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
+            bootstrap_with_retry(&paths.plist, &paths.service_label)?;
         }
         if rollback.watchdog_was_loaded && rollback.watchdog_plist.is_some() {
-            bootstrap_with_retry(&paths.watchdog_plist, WATCHDOG_LABEL)?;
+            bootstrap_with_retry(&paths.watchdog_plist, &paths.watchdog_label)?;
         }
         Ok(())
     }
 
     fn backup_bytes(paths: &ServicePaths, kind: &str, bytes: &[u8]) -> Result<String, String> {
         ensure_secure_dir(&paths.backups_dir)?;
-        let path = paths
-            .backups_dir
-            .join(format!("{SERVICE_LABEL}.{kind}.{}.plist", now_ms_i64()));
+        let path = paths.backups_dir.join(format!(
+            "{}.{kind}.{}.plist",
+            paths.service_label,
+            now_ms_i64()
+        ));
         atomic_write(&path, bytes, 0o600)?;
         Ok(path.to_string_lossy().into_owned())
     }
@@ -2615,16 +2717,16 @@ mod macos {
         current_was_loaded: bool,
         current_bootout_pending: bool,
     ) -> Result<(), String> {
-        if is_loaded(WATCHDOG_LABEL) {
+        if is_loaded(&paths.watchdog_label) {
             bootout(WATCHDOG_LABEL)?;
         }
         remove_regular_file(&paths.watchdog_plist)?;
-        settle_service_for_restore(SERVICE_LABEL, current_bootout_pending)?;
+        settle_service_for_restore(&paths.service_label, current_bootout_pending)?;
         atomic_write(&paths.plist, current_plist, 0o600)?;
         restore_current(paths, Some(current_target))?;
         if current_was_loaded {
-            bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
-            wait_for_health(DEFAULT_PORT)?;
+            bootstrap_with_retry(&paths.plist, &paths.service_label)?;
+            wait_for_health(paths.port)?;
         }
         Ok(())
     }
@@ -2889,11 +2991,11 @@ mod macos {
         Ok(())
     }
 
-    fn kickstart() -> Result<(), String> {
+    fn kickstart(label: &str) -> Result<(), String> {
         run_launchctl([
             OsStr::new("kickstart"),
             OsStr::new("-k"),
-            OsStr::new(&target(SERVICE_LABEL)),
+            OsStr::new(&target(label)),
         ])
         .map(|_| ())
     }
@@ -3006,6 +3108,60 @@ mod macos {
         static NEXT: AtomicU64 = AtomicU64::new(0);
 
         #[test]
+        fn named_instance_never_writes_default_plist_or_port() {
+            let root = root("instance-a");
+            let home = root.join("home");
+            let config_a = home.join(".config/herdr-mcp-uat");
+            let config_b = home.join(".config/herdr-mcp");
+            fs::create_dir_all(&config_a).unwrap();
+            fs::create_dir_all(&config_b).unwrap();
+            let source = root.join("herdr-mcp-source");
+            fs::write(&source, b"rust-binary-fixture").unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+            let socket = home.join(".config/herdr/herdr.sock");
+            let a = ServicePaths::for_values(
+                InstanceId::parse("uat").unwrap(),
+                home.clone(),
+                config_a,
+                source.clone(),
+                socket.clone(),
+            );
+            let b = ServicePaths::for_values(
+                InstanceId::default_instance(),
+                home,
+                config_b,
+                source,
+                socket,
+            );
+            assert_ne!(a.plist, b.plist);
+            assert_ne!(a.service_label, b.service_label);
+            assert_ne!(a.port, b.port);
+            assert_eq!(b.service_label, SERVICE_LABEL);
+            assert_eq!(b.port, DEFAULT_PORT);
+            assert_ne!(a.port, 8772);
+            assert!(
+                a.plist
+                    .to_string_lossy()
+                    .contains("dev.herdr-mcp.uat.server")
+            );
+            assert_ne!(a.plist.file_name(), b.plist.file_name());
+            let generation = prepare_generation(&a).unwrap();
+            let env = service_environment(&a, &BTreeMap::new(), &generation).unwrap();
+            let plist = encode_service_plist(&a, &env).unwrap();
+            let value = PlistValue::from_reader(Cursor::new(&plist)).unwrap();
+            let dict = value.as_dictionary().unwrap();
+            assert_eq!(
+                dict.get("Label").and_then(PlistValue::as_string),
+                Some(a.service_label.as_str())
+            );
+            assert_ne!(
+                dict.get("Label").and_then(PlistValue::as_string),
+                Some(SERVICE_LABEL)
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
         fn service_status_is_the_only_command_safe_inside_managed_exec() {
             assert!(!service_command_requires_independent_process(
                 &ServiceCommand::Status
@@ -3086,6 +3242,7 @@ mod macos {
             fs::write(&source, b"rust-binary-fixture").unwrap();
             fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
             let paths = ServicePaths::for_values(
+                InstanceId::default_instance(),
                 home.clone(),
                 config,
                 source,
@@ -3098,7 +3255,7 @@ mod macos {
             let mut root = Dictionary::new();
             root.insert(
                 "Label".to_owned(),
-                PlistValue::String(SERVICE_LABEL.to_owned()),
+                PlistValue::String(paths.service_label.clone()),
             );
             root.insert(
                 "ProgramArguments".to_owned(),
@@ -3523,7 +3680,7 @@ mod macos {
             let mut other = Dictionary::new();
             other.insert(
                 "Label".to_owned(),
-                PlistValue::String(SERVICE_LABEL.to_owned()),
+                PlistValue::String(paths.service_label.clone()),
             );
             other.insert(
                 "ProgramArguments".to_owned(),
