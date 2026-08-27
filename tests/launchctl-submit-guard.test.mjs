@@ -32,7 +32,7 @@ const PROHIBITION = /must never|prohibited|禁止/;
 const EXEC_SURFACES = ['bin', 'crates', 'src', 'scripts', '.github', 'extension', 'tests'];
 // Landmarks allowed to *document* the pattern — but only with the prohibition.
 const DOC_LANDMARKS = [
-  'docs/rust-rearchitecture.md',
+  'docs/herdr-architecture-roadmap.md',
   'docs/i18n/en/runtime-self-upgrade.md',
   'docs/i18n/zh-CN/runtime-self-upgrade.md',
   'AGENTS.md',
