@@ -12,8 +12,10 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
+
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
