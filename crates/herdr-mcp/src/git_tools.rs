@@ -92,6 +92,7 @@ pub fn run(snapshot: &Value, args: &Value) -> Value {
     output.insert("truncated".to_owned(), json!(result.truncated));
     output.insert("output".to_owned(), json!(result.stdout));
     if action == "status"
+        && !result.truncated
         && let Some(compact) = compact_git_status(&result.stdout)
     {
         output.insert("counts".to_owned(), compact.counts);
@@ -548,6 +549,16 @@ mod tests {
         assert!(output.contains("docs (10)"));
         assert!(output.contains("f0.txt"));
         assert!(!output.contains("?? src/f0.txt"));
+
+        let truncated = run(
+            &snapshot,
+            &json!({"root": root, "action": "status", "max_bytes": 64}),
+        );
+        assert_eq!(truncated["ok"], true);
+        assert_eq!(truncated["truncated"], true);
+        assert!(truncated.get("compacted").is_none());
+        assert!(truncated.get("counts").is_none());
+        assert!(!truncated["output"].as_str().unwrap().contains("src (20)"));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -25,7 +25,7 @@ Herdr 性能优化不以单点 benchmark 为目标，目标是建立长期可演
 
 更新时间：2026-08-27
 
-```
+```text
 Herdr Architecture Roadmap
 ├── 当前路线状态
 ├── 已完成并验收
@@ -168,7 +168,7 @@ Herdr Architecture Roadmap
 
 ### Result Optimization Layer（P0）
 
-```
+```text
 MCP Tool
   ↓
 Execution Layer
@@ -1218,7 +1218,7 @@ inspect -> 4 independent reads/grep/git facts -> patch -> validation -> since
 
 `docs/benchmarks/tool-performance-batch-a-20260827.json`
 
-方法：baseline 与 candidate 同时连接同一个本机 Herdr socket、操作同一个 `/Users/qingxian/Documents/herdr-mcp` 数据集，分别监听 `127.0.0.1:18871/18872`，每个 spec 交替 baseline/candidate 顺序采样，避免把调用顺序和瞬时机器负载固定偏向一侧。baseline 为生产 `main` merge `69fb04e`；candidate 为 `perf/tool-latency-batch-a-20260827` working tree。
+方法：baseline 与 candidate 同时连接同一个本机 Herdr socket、操作同一个仓库数据集，分别监听 `127.0.0.1:18871/18872`，每个 spec 交替 baseline/candidate 顺序采样，避免把调用顺序和瞬时机器负载固定偏向一侧。baseline 为生产 `main` merge `69fb04e`；candidate 为 `perf/tool-latency-batch-a-20260827` working tree。
 
 | Tool | baseline p50 / p95 | candidate p50 / p95 | p50 变化 | p95 变化 | 结论 |
 |---|---:|---:|---:|---:|---|
@@ -1431,8 +1431,6 @@ provider quota / bandwidth / storage cost
 6. 最后增加 read-only automatic failover；mutation cross-ingress failover 只有 shared idempotency/delivery evidence 完成后才开放。
 
 这条路线与 Batch B 的 model-visible batch contract 独立：IngressProfile 属于 transport/deployment capability，原则上不新增 MCP tool、不改变 epoch2 tool schema。
-
-## 11. 完成定义
 
 ## 11. Long Task Progress Observability（Batch C 规划）
 
