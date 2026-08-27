@@ -16,6 +16,7 @@
 #![allow(dead_code)] // staged until the Rust link transport consumes it
 
 pub mod backoff;
+pub mod cutover;
 pub mod daemon;
 pub mod generation_fence;
 pub mod heartbeat;
@@ -33,6 +34,7 @@ pub mod runtime_generation;
 pub mod socket_driver;
 pub mod transport;
 
+pub use cutover::{CutoverMode, run as run_link_cutover};
 pub use install::{
     LINK_RUST_CANDIDATE_LABEL, install as run_link_install, uninstall as run_link_uninstall,
 };

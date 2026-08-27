@@ -131,6 +131,7 @@ fn run() -> Result<ExitCode, String> {
             cli::LinkCommand::Run => link::run_link(),
             cli::LinkCommand::Install => link::run_link_install(),
             cli::LinkCommand::Uninstall => link::run_link_uninstall(),
+            cli::LinkCommand::Cutover { mode } => link::run_link_cutover(mode),
         },
     }
 }
