@@ -1,6 +1,7 @@
 use crate::exec_sessions::ExecRegistry;
 use crate::fs_security;
 use crate::mutation;
+use crate::projects;
 use serde_json::{Value, json};
 use std::fs;
 
@@ -18,7 +19,8 @@ pub fn start(snapshot: &Value, registry: &ExecRegistry, args: &Value) -> Value {
         Ok(value) => value.unwrap_or(false),
         Err(error) => return error,
     };
-    let managed = match fs_security::validate_existing(snapshot, root) {
+    let topology = projects::derive_routing(snapshot);
+    let managed = match fs_security::validate_existing_with_topology(&topology, root) {
         Ok(value) => value,
         Err(error) => return error,
     };
@@ -34,10 +36,11 @@ pub fn start(snapshot: &Value, registry: &ExecRegistry, args: &Value) -> Value {
             "project_root": managed.root.to_string_lossy(),
         });
     }
-    let working = match mutation::check(snapshot, &managed.root, confirm_busy) {
-        Ok(value) => value,
-        Err(error) => return error,
-    };
+    let working =
+        match mutation::check_with_topology(snapshot, &topology, &managed.root, confirm_busy) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
     match registry.start(&managed.real, command) {
         Ok(mut result) => {
             if let Some(object) = result.as_object_mut() {

@@ -138,10 +138,11 @@ pub fn run(client: &HerdrClient, snapshot: &Value, args: &Value) -> Value {
         }
     };
 
-    let working = match mutation::check(snapshot, &effective_root, confirm_busy) {
-        Ok(working) => working,
-        Err(error) => return error,
-    };
+    let working =
+        match mutation::check_with_topology(snapshot, &topology, &effective_root, confirm_busy) {
+            Ok(working) => working,
+            Err(error) => return error,
+        };
     let _ = cleanup_stale_scripts();
 
     #[cfg(windows)]

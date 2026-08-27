@@ -1,6 +1,7 @@
 use crate::fs_security;
 use crate::git_tools;
 use crate::mutation;
+use crate::projects;
 use serde_json::{Map, Value, json};
 use std::fs;
 
@@ -26,14 +27,16 @@ pub fn edit(snapshot: &Value, args: &Value) -> Value {
         Ok(value) => value.unwrap_or(false),
         Err(error) => return error,
     };
-    let target = match fs_security::validate_existing(snapshot, path) {
+    let topology = projects::derive_routing(snapshot);
+    let target = match fs_security::validate_existing_with_topology(&topology, path) {
         Ok(value) => value,
         Err(error) => return error,
     };
-    let working = match mutation::check(snapshot, &target.root, confirm_busy) {
-        Ok(value) => value,
-        Err(error) => return error,
-    };
+    let working =
+        match mutation::check_with_topology(snapshot, &topology, &target.root, confirm_busy) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
     let old = match fs::read_to_string(&target.real) {
         Ok(value) => value,
         Err(error) => return fail("read_failed", path, Some(error.to_string())),
@@ -99,14 +102,16 @@ pub fn write(snapshot: &Value, args: &Value) -> Value {
         Ok(value) => value.unwrap_or(false),
         Err(error) => return error,
     };
-    let target = match fs_security::validate_target(snapshot, path) {
+    let topology = projects::derive_routing(snapshot);
+    let target = match fs_security::validate_target_with_topology(&topology, path) {
         Ok(value) => value,
         Err(error) => return error,
     };
-    let working = match mutation::check(snapshot, &target.root, confirm_busy) {
-        Ok(value) => value,
-        Err(error) => return error,
-    };
+    let working =
+        match mutation::check_with_topology(snapshot, &topology, &target.root, confirm_busy) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
     let existed = target.real.exists();
     if existed && !overwrite {
         return json!({
