@@ -1,0 +1,264 @@
+//! Foreground `herdr-mcp link run` entry for a staged Rust Link candidate.
+//!
+//! Loads credentials with Node `macos-daemon.ts` parity (env override, then
+//! macOS Keychain for the link secret, then the MCP server LaunchAgent plist
+//! for `HERDR_MCP_TOKEN`). This path never mutates launchd, plists,
+//! `runtime/current`, or production Link ownership.
+
+use std::collections::HashMap;
+use std::env;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+
+use super::daemon::{
+    DaemonConfigError, LinkDaemonConfig, read_link_daemon_config, run_link_daemon,
+};
+
+/// Default Keychain service matching Node `MACOS_LINK_KEYCHAIN_SERVICE`.
+pub const MACOS_LINK_KEYCHAIN_SERVICE: &str = "herdr-edge-dev-link-secret";
+/// Default Edge WSS URL matching Node `MACOS_DEFAULT_EDGE_URL`.
+pub const MACOS_DEFAULT_EDGE_URL: &str = "wss://herdr-edge-dev.whshang.workers.dev/ws";
+/// Default workstation id matching Node `MACOS_DEFAULT_WORKSTATION_ID`.
+pub const MACOS_DEFAULT_WORKSTATION_ID: &str = "dev-real-runtime";
+
+const SERVER_PLIST_REL: &str = "Library/LaunchAgents/dev.herdr-mcp.server.plist";
+
+/// CLI entry: load config and run the staged daemon in the foreground.
+pub fn run() -> Result<ExitCode, String> {
+    let config = load_link_run_config().map_err(|error| error.to_string())?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("herdr-mcp link run: tokio runtime: {error}"))?;
+    let code = runtime
+        .block_on(run_link_daemon(config))
+        .map_err(|error| format!("herdr-mcp link run: {error}"))?;
+    Ok(ExitCode::from(code as u8))
+}
+
+/// Build daemon config from process environment (+ macOS credential fallbacks).
+pub fn load_link_run_config() -> Result<LinkDaemonConfig, DaemonConfigError> {
+    let mut env_map = env_map_from_process();
+    enrich_macos_credentials(&mut env_map)?;
+    read_link_daemon_config(&env_map)
+}
+
+fn env_map_from_process() -> HashMap<String, String> {
+    env::vars().collect()
+}
+
+/// Fill Edge/workstation defaults and resolve link/MCP secrets without printing them.
+fn enrich_macos_credentials(
+    env_map: &mut HashMap<String, String>,
+) -> Result<(), DaemonConfigError> {
+    if optional_trimmed(env_map, "HERDR_EDGE_URL").is_none() {
+        env_map.insert(
+            "HERDR_EDGE_URL".to_owned(),
+            MACOS_DEFAULT_EDGE_URL.to_owned(),
+        );
+    }
+    if optional_trimmed(env_map, "HERDR_WORKSTATION_ID").is_none() {
+        env_map.insert(
+            "HERDR_WORKSTATION_ID".to_owned(),
+            MACOS_DEFAULT_WORKSTATION_ID.to_owned(),
+        );
+    }
+
+    if optional_trimmed(env_map, "HERDR_LINK_TOKEN").is_none() {
+        let token = load_link_token_from_keychain(env_map)?;
+        env_map.insert("HERDR_LINK_TOKEN".to_owned(), token);
+    }
+
+    if optional_trimmed(env_map, "HERDR_MCP_TOKEN").is_none() {
+        let token = load_runtime_token_from_server_plist(env_map)?;
+        env_map.insert("HERDR_MCP_TOKEN".to_owned(), token);
+    }
+
+    Ok(())
+}
+
+fn load_link_token_from_keychain(
+    env_map: &HashMap<String, String>,
+) -> Result<String, DaemonConfigError> {
+    #[cfg(target_os = "macos")]
+    {
+        let username = optional_trimmed(env_map, "USER").unwrap_or_else(current_username);
+        let service = optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE")
+            .unwrap_or_else(|| MACOS_LINK_KEYCHAIN_SERVICE.to_owned());
+        command_text(
+            "/usr/bin/security",
+            &[
+                "find-generic-password",
+                "-a",
+                &username,
+                "-s",
+                &service,
+                "-w",
+            ],
+            "workstation link credential",
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = env_map;
+        Err(DaemonConfigError::Message(
+            "HERDR_LINK_TOKEN is required (Keychain load is macOS-only)".to_owned(),
+        ))
+    }
+}
+
+fn load_runtime_token_from_server_plist(
+    env_map: &HashMap<String, String>,
+) -> Result<String, DaemonConfigError> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = optional_trimmed(env_map, "HOME")
+            .map(PathBuf::from)
+            .or_else(home_dir)
+            .ok_or_else(|| {
+                DaemonConfigError::Message(
+                    "HOME is required to load local MCP credential".to_owned(),
+                )
+            })?;
+        let plist = server_plist_path(&home);
+        command_text(
+            "/usr/libexec/PlistBuddy",
+            &[
+                "-c",
+                "Print :EnvironmentVariables:HERDR_MCP_TOKEN",
+                plist.to_str().ok_or_else(|| {
+                    DaemonConfigError::Message("server plist path is not valid UTF-8".to_owned())
+                })?,
+            ],
+            "local MCP credential",
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = env_map;
+        Err(DaemonConfigError::Message(
+            "HERDR_MCP_TOKEN is required (LaunchAgent plist load is macOS-only)".to_owned(),
+        ))
+    }
+}
+
+fn server_plist_path(home: &Path) -> PathBuf {
+    home.join(SERVER_PLIST_REL)
+}
+
+fn command_text(file: &str, args: &[&str], label: &str) -> Result<String, DaemonConfigError> {
+    let output = Command::new(file).args(args).output().map_err(|_| {
+        DaemonConfigError::Message(format!("herdr-link macOS: unable to load {label}"))
+    })?;
+    if !output.status.success() {
+        return Err(DaemonConfigError::Message(format!(
+            "herdr-link macOS: unable to load {label}"
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if text.is_empty() {
+        return Err(DaemonConfigError::Message(format!(
+            "herdr-link macOS: unable to load {label}"
+        )));
+    }
+    Ok(text)
+}
+
+fn optional_trimmed(env_map: &HashMap<String, String>, name: &str) -> Option<String> {
+    env_map
+        .get(name)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME").map(PathBuf::from)
+}
+
+fn current_username() -> String {
+    Command::new("id")
+        .arg("-un")
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                let name = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if name.is_empty() { None } else { Some(name) }
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// True when this binary exposes `herdr-mcp link run` (G5 gate `rust_cli_link_run`).
+pub const LINK_RUN_WIRED: bool = true;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::link::daemon::{PUBLIC_CONTRACT_EPOCH, PUBLIC_CONTRACT_HASH};
+
+    fn base_env() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "HERDR_EDGE_URL".to_owned(),
+                "wss://herdr-edge-dev.example/ws".to_owned(),
+            ),
+            ("HERDR_WORKSTATION_ID".to_owned(), "dev-w1".to_owned()),
+            ("HERDR_LINK_TOKEN".to_owned(), "link-secret".to_owned()),
+            ("HERDR_MCP_TOKEN".to_owned(), "runtime-secret".to_owned()),
+        ])
+    }
+
+    #[test]
+    fn env_credentials_build_daemon_config_without_keychain() {
+        let cfg = read_link_daemon_config(&base_env()).expect("config");
+        assert_eq!(cfg.edge_url, "wss://herdr-edge-dev.example/ws");
+        assert_eq!(cfg.workstation_id, "dev-w1");
+        assert_eq!(cfg.link_token, "link-secret");
+        assert_eq!(cfg.runtime_token, "runtime-secret");
+        assert_eq!(cfg.contract_epoch, PUBLIC_CONTRACT_EPOCH);
+        assert_eq!(cfg.contract_hash, PUBLIC_CONTRACT_HASH);
+    }
+
+    #[test]
+    fn enrich_applies_macos_defaults_when_env_tokens_present() {
+        let mut env_map = HashMap::from([
+            ("HERDR_LINK_TOKEN".to_owned(), "link-secret".to_owned()),
+            ("HERDR_MCP_TOKEN".to_owned(), "runtime-secret".to_owned()),
+        ]);
+        enrich_macos_credentials(&mut env_map).expect("enrich");
+        assert_eq!(
+            env_map.get("HERDR_EDGE_URL").map(String::as_str),
+            Some(MACOS_DEFAULT_EDGE_URL)
+        );
+        assert_eq!(
+            env_map.get("HERDR_WORKSTATION_ID").map(String::as_str),
+            Some(MACOS_DEFAULT_WORKSTATION_ID)
+        );
+        let cfg = read_link_daemon_config(&env_map).expect("config");
+        assert_eq!(cfg.edge_url, MACOS_DEFAULT_EDGE_URL);
+        assert_eq!(cfg.workstation_id, MACOS_DEFAULT_WORKSTATION_ID);
+    }
+
+    #[test]
+    fn credential_errors_never_embed_secret_values() {
+        let error = DaemonConfigError::Message(
+            "herdr-link macOS: unable to load workstation link credential".to_owned(),
+        );
+        let text = error.to_string();
+        assert!(text.contains("unable to load workstation link credential"));
+        assert!(!text.contains("link-secret"));
+        assert!(!text.contains("runtime-secret"));
+    }
+
+    #[test]
+    fn server_plist_path_is_under_launch_agents() {
+        let path = server_plist_path(Path::new("/Users/example"));
+        assert_eq!(
+            path,
+            PathBuf::from("/Users/example/Library/LaunchAgents/dev.herdr-mcp.server.plist")
+        );
+    }
+}

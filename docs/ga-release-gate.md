@@ -291,7 +291,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G2 | **PARTIAL** | Rust Release + attestation/manifest 链已存在；但 README / `docs/i18n/en/install.md` 主路径仍是 `git clone` + `npm ci` + Node.js 20+ |
 | G3 | **PARTIAL** | 顶层 CLI + entrypoint 已合入（[#74](https://github.com/whshang/herdr-mcp/pull/74)、[#81](https://github.com/whshang/herdr-mcp/pull/81)）；**本机 live symlink 已迁到 `runtime/current`**（alpha.10 apply）。仍 PARTIAL：缺干净机 / 正式多机 seal，不能宣称 GA 级入口封板 |
 | G4 | **PARTIAL** | `service install` + generation/health/rollback 代码存在；正式文档未给出 binary → `herdr-mcp install` 干净机路径 |
-| G5 | **FAIL** | **关键 blocker**：production Link 仍走 Node；Rust 仅为 candidate；health `production_ready=false` / rust-candidate。本片仅交付只读 `herdr-mcp link status` + gate catalog + [`docs/_wip/g5-link-production-cutover.md`](./_wip/g5-link-production-cutover.md)；**未**做 live cutover |
+| G5 | **FAIL** | **关键 blocker**：production Link 仍走 Node（desired=active=stable-0.3.32）；Rust 仅为 candidate；health `production_ready=false` / rust-candidate。alpha.10 上 `link status` 已 live；源码另有前台 `link run`（Keychain/plist）；候选/生产 LaunchAgent 与 live cutover 仍未做 |
 | G6 | **PARTIAL** | 嵌入契约 epoch 2 / 18 tools（hash 冻结）；真实 ChatGPT 与全路径 production smoke 仍属 alpha 验收，未做 GA 冻结声明 |
 | G7 | **PARTIAL** | Edge→Link→runtime 在 alpha 上有过真实 UAT 记录；当前 Link 生产所有者仍是 Node，非「全 Rust」闭环 |
 | G8 | **PARTIAL** | Live alpha.10 `doctor` 已打印 8 行 `LAYER`（[#73](https://github.com/whshang/herdr-mcp/pull/73)）；非完整 remote 闭环（`remote-probe=skipped`） |
@@ -321,7 +321,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 按 2026-08-27 live alpha.10 证据排序（先解关键生产 blocker，再封版本与入口，再干净机与扩展宣称）：
 
-1. **G5 — Rust production Link 切流 + `production_ready`**（#1 critical）：候选 Link 完成生产所有权切换；去掉用户路径对 Node link 的依赖；health 不再停在 rust-candidate / `production_ready=false`。切流清单与门闩见 [`docs/_wip/g5-link-production-cutover.md`](./_wip/g5-link-production-cutover.md)；当前源码仅有只读 `link status`，live cutover 需独立 Shell 双人验收。
+1. **G5 — Rust production Link 切流 + `production_ready`**（#1 critical）：候选 Link 完成生产所有权切换；去掉用户路径对 Node link 的依赖；health 不再停在 rust-candidate / `production_ready=false`。切流清单与门闩见 [`docs/_wip/g5-link-production-cutover.md`](./_wip/g5-link-production-cutover.md)；alpha.10 上 `link status` 已 live，源码另有前台 `link run`（Keychain/plist），下一步是候选 LaunchAgent install（仍不切 live Node prod），live cutover 需独立 Shell 双人验收。
 2. **G1 — 单一正式产品版本（退出 alpha）**：Cargo / GitHub Release / `--version` / README 对齐为同一 stable 口径；去掉用户可见 `alpha`。
 3. **G3 formal seal — 干净机 / 多机确认**：本机已迁 `~/.local/bin/herdr-mcp` → `runtime/current`（alpha.10）；仍需干净机与正式文档路径对齐后才能把 G3 升到 PASS。
 4. **G18 — 干净机 install UAT**：不使用开发仓库，按正式文档从零安装并跑通用户闭环。

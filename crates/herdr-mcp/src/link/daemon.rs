@@ -1,8 +1,9 @@
 //! Staged candidate-only workstation Link daemon assembly.
 //!
 //! This layer mirrors Node `src/link/daemon.ts`: env config, runtime-generation
-//! manager, runtime-control loop, and the staged I/O loop. It does not own CLI
-//! `link run`, launchd, `runtime/current`, or production cutover. Production
+//! manager, runtime-control loop, and the staged I/O loop. CLI `link run` loads
+//! credentials via `link::run` and calls `run_link_daemon`. This module still
+//! does not own launchd, `runtime/current`, or production cutover. Production
 //! Link remains on the Node path until later cutover gates are complete.
 
 use std::collections::HashMap;
