@@ -2246,7 +2246,6 @@ mod macos {
             .is_ok()
     }
 
-
     #[derive(Debug, Clone)]
     struct UserCliReport {
         path: Option<PathBuf>,
@@ -2294,14 +2293,21 @@ mod macos {
         } else {
             object.insert(
                 "user_cli".to_owned(),
-                json!(report.path.as_ref().map(|p| p.to_string_lossy().into_owned())),
+                json!(
+                    report
+                        .path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                ),
             );
             object.insert(
                 "user_cli_target".to_owned(),
-                json!(report
-                    .target
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())),
+                json!(
+                    report
+                        .target
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                ),
             );
             object.insert("user_cli_changed".to_owned(), json!(report.changed));
         }
@@ -2683,9 +2689,11 @@ mod macos {
 
     fn backup_bytes(paths: &ServicePaths, kind: &str, bytes: &[u8]) -> Result<String, String> {
         ensure_secure_dir(&paths.backups_dir)?;
-        let path = paths
-            .backups_dir
-            .join(format!("{}.{kind}.{}.plist", paths.service_label, now_ms_i64()));
+        let path = paths.backups_dir.join(format!(
+            "{}.{kind}.{}.plist",
+            paths.service_label,
+            now_ms_i64()
+        ));
         atomic_write(&path, bytes, 0o600)?;
         Ok(path.to_string_lossy().into_owned())
     }
@@ -3131,7 +3139,11 @@ mod macos {
             assert_eq!(b.service_label, SERVICE_LABEL);
             assert_eq!(b.port, DEFAULT_PORT);
             assert_ne!(a.port, 8772);
-            assert!(a.plist.to_string_lossy().contains("dev.herdr-mcp.uat.server"));
+            assert!(
+                a.plist
+                    .to_string_lossy()
+                    .contains("dev.herdr-mcp.uat.server")
+            );
             assert_ne!(a.plist.file_name(), b.plist.file_name());
             let generation = prepare_generation(&a).unwrap();
             let env = service_environment(&a, &BTreeMap::new(), &generation).unwrap();

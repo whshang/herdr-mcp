@@ -550,11 +550,15 @@ mod tests {
             Command::Dev { dry_run: true }
         );
         assert_eq!(
-            parse(args(&["candidate", "--port", "9000"])).unwrap().command,
+            parse(args(&["candidate", "--port", "9000"]))
+                .unwrap()
+                .command,
             Command::Candidate { port: 9000 }
         );
         assert_eq!(
-            parse(args(&["service", "install", "--adopt-node"])).unwrap().command,
+            parse(args(&["service", "install", "--adopt-node"]))
+                .unwrap()
+                .command,
             Command::Service(ServiceCommand::Install { adopt_node: true })
         );
         assert_eq!(
@@ -574,7 +578,8 @@ mod tests {
                 "--parent-pid",
                 "1234"
             ]))
-            .unwrap().command,
+            .unwrap()
+            .command,
             Command::Service(ServiceCommand::Guardian {
                 transaction_id: "gtx-1234-abcd".to_owned(),
                 parent_pid: 1234,
@@ -587,13 +592,16 @@ mod tests {
                 "--manifest",
                 "https://example.com/release.json"
             ]))
-            .unwrap().command,
+            .unwrap()
+            .command,
             Command::Update(UpdateCommand::Check {
                 manifest_url: Some("https://example.com/release.json".to_owned())
             })
         );
         assert_eq!(
-            parse(args(&["update", "worker", "--job", "upd-12345678"])).unwrap().command,
+            parse(args(&["update", "worker", "--job", "upd-12345678"]))
+                .unwrap()
+                .command,
             Command::Update(UpdateCommand::Worker {
                 job_id: "upd-12345678".to_owned()
             })
@@ -621,19 +629,25 @@ mod tests {
             })
         );
         assert_eq!(
-            parse(args(&["link", "cutover", "--dry-run"])).unwrap().command,
+            parse(args(&["link", "cutover", "--dry-run"]))
+                .unwrap()
+                .command,
             Command::Link(LinkCommand::Cutover {
                 mode: crate::link::CutoverMode::DryRun
             })
         );
         assert_eq!(
-            parse(args(&["link", "cutover", "--execute"])).unwrap().command,
+            parse(args(&["link", "cutover", "--execute"]))
+                .unwrap()
+                .command,
             Command::Link(LinkCommand::Cutover {
                 mode: crate::link::CutoverMode::Execute
             })
         );
         assert_eq!(
-            parse(args(&["link", "migrate-runtime-control"])).unwrap().command,
+            parse(args(&["link", "migrate-runtime-control"]))
+                .unwrap()
+                .command,
             Command::Link(LinkCommand::MigrateRuntimeControl {
                 mode: crate::link::MigrateMode::DryRun
             })
@@ -644,13 +658,16 @@ mod tests {
                 "migrate-runtime-control",
                 "--write-staging"
             ]))
-            .unwrap().command,
+            .unwrap()
+            .command,
             Command::Link(LinkCommand::MigrateRuntimeControl {
                 mode: crate::link::MigrateMode::WriteStaging
             })
         );
         assert_eq!(
-            parse(args(&["link", "migrate-runtime-control", "--apply"])).unwrap().command,
+            parse(args(&["link", "migrate-runtime-control", "--apply"]))
+                .unwrap()
+                .command,
             Command::Link(LinkCommand::MigrateRuntimeControl {
                 mode: crate::link::MigrateMode::Apply
             })
@@ -678,7 +695,8 @@ mod tests {
                 "extension-host",
                 "chrome-extension://abcdefghijklmnop/"
             ]))
-            .unwrap().command,
+            .unwrap()
+            .command,
             Command::ExtensionHost {
                 caller_origin: "chrome-extension://abcdefghijklmnop/".to_owned()
             }
@@ -725,7 +743,16 @@ mod tests {
         assert_eq!(parsed.instance.as_deref(), Some("clean"));
         assert_eq!(parsed.command, Command::Doctor);
         assert!(parse(args(&["--instance", "server", "status"])).is_err());
-        assert!(parse(args(&["--instance", "uat", "--instance", "clean", "status"])).is_err());
+        assert!(
+            parse(args(&[
+                "--instance",
+                "uat",
+                "--instance",
+                "clean",
+                "status"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

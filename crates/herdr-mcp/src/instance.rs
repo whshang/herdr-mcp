@@ -167,7 +167,10 @@ mod tests {
         assert_eq!(id.watchdog_label(), DEFAULT_WATCHDOG_LABEL);
         assert_eq!(id.health_watchdog_label(), DEFAULT_HEALTH_WATCHDOG_LABEL);
         assert_eq!(id.config_leaf(), DEFAULT_CONFIG_LEAF);
-        assert_eq!(named_instance_port("never-default"), named_instance_port("never-default"));
+        assert_eq!(
+            named_instance_port("never-default"),
+            named_instance_port("never-default")
+        );
         // Hash path for named instances never lands on production 8772.
         assert_ne!(named_instance_port("uat"), DEFAULT_RUNTIME_PORT);
     }
