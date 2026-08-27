@@ -109,8 +109,8 @@ Render `deploy/dev.herdr-mcp.server.plist.example` to `~/Library/LaunchAgents/de
 launchctl bootout "gui/$UID/dev.herdr-mcp.server" >/dev/null 2>&1 || true
 launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.herdr-mcp.server.plist"
 launchctl enable "gui/$UID/dev.herdr-mcp.server"
-mkdir -p ~/.local/bin
-ln -sf "$PWD/bin/herdr-mcp" ~/.local/bin/herdr-mcp
+# Prefer: herdr-mcp install (retargets ~/.local/bin/herdr-mcp -> runtime/current)
+# Do not recreate a repo-linked ~/.local/bin/herdr-mcp bridge.
 ```
 
 Verify `127.0.0.1:8772/mcp` and never print `HERDR_MCP_TOKEN` in the final report.
