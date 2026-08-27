@@ -1,7 +1,8 @@
 //! Production Link cutover execute transaction (PREPARE / ACTIVATE / VERIFY / ROLLBACK).
 //!
 //! Mutates **only** `dev.herdr-mcp.link-prod`. Never touches `dev.herdr-mcp.link`
-//! or `dev.herdr-mcp.link-rust-candidate`. Never uses `launchctl submit`. Never
+//! or `dev.herdr-mcp.link-rust-candidate`. Never uses inferred launchd
+//! submission jobs. Never
 //! flips `production_ready`. Credentials stay in Keychain / server plist env —
 //! this module never prints or embeds secret values.
 
@@ -690,7 +691,10 @@ where
         .first()
         .is_some_and(|value| value == "submit" || value == "load" || value == "unload")
     {
-        return Err("cutover execute refuses launchctl submit/load/unload".to_owned());
+        return Err(
+            "cutover execute refuses inferred launchd submission and legacy load/unload paths"
+                .to_owned(),
+        );
     }
     let output = std::process::Command::new("/bin/launchctl")
         .args(&collected)

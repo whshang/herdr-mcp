@@ -56,7 +56,7 @@ herdr-mcp doctor           # LAYER link shows production_owner=node|rust|...
 `herdr-mcp link cutover --execute` with `HERDR_LINK_CUTOVER_I_UNDERSTAND=1`:
 
 - PREPARE: backup Node prod plist → `~/.config/herdr-mcp/backups/link-prod.plist.pre-rust-cutover`
-- ACTIVATE: rewrite **only** `dev.herdr-mcp.link-prod` to `runtime/current/herdr-mcp link run`, bootout/bootstrap (never `launchctl submit`)
+- ACTIVATE: rewrite **only** `dev.herdr-mcp.link-prod` to `runtime/current/herdr-mcp link run`, bootout/bootstrap (never inferred launchd submission jobs)
 - VERIFY: ProgramArguments + loaded; on failure ROLLBACK restores Node backup
 - Leaves `dev.herdr-mcp.link` and `dev.herdr-mcp.link-rust-candidate` untouched
 - Never flips `production_ready` / health seal

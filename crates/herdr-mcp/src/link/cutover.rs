@@ -11,7 +11,7 @@
 //! `dev.herdr-mcp.link-prod` to `runtime/current/herdr-mcp link run`, with
 //! automatic ROLLBACK to the Node plist backup on failure. It never flips
 //! `production_ready`, never touches `link` / `link-rust-candidate`, and never
-//! uses `launchctl submit`.
+//! schedules inferred launchd submission jobs.
 
 use serde_json::{Value, json};
 use std::env;
