@@ -1,5 +1,6 @@
+use crate::exec_compact;
 use crate::state_store::{ExecSessionFence, StateStore};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -207,19 +208,31 @@ impl ExecRegistry {
             (bytes, bytes_total, buffers.truncated)
         };
         let status = session_status(&session);
-        json!({
-            "ok": true,
-            "session_id": id,
-            "running": !status.closed,
-            "exit_code": status.exit_code,
-            "signal": status.signal,
-            "truncated": truncated,
-            "stream": stream,
-            "offset": offset,
-            "text": String::from_utf8_lossy(&bytes),
-            "next_offset": offset.saturating_add(bytes.len()),
-            "bytes_total": bytes_total,
-        })
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let next_offset = offset.saturating_add(bytes.len());
+        let finished_success_snapshot = status.closed
+            && status.exit_code == Some(0)
+            && !truncated
+            && offset == 0
+            && bytes.len() == bytes_total;
+        let mut result = Map::new();
+        result.insert("ok".to_owned(), json!(true));
+        result.insert("session_id".to_owned(), json!(id));
+        result.insert("running".to_owned(), json!(!status.closed));
+        result.insert("exit_code".to_owned(), json!(status.exit_code));
+        result.insert("signal".to_owned(), json!(status.signal));
+        result.insert("truncated".to_owned(), json!(truncated));
+        result.insert("stream".to_owned(), json!(stream));
+        result.insert("offset".to_owned(), json!(offset));
+        result.insert("next_offset".to_owned(), json!(next_offset));
+        result.insert("bytes_total".to_owned(), json!(bytes_total));
+        exec_compact::insert_compacted_or_raw(
+            &mut result,
+            "text",
+            &text,
+            finished_success_snapshot,
+        );
+        Value::Object(result)
     }
 
     pub fn kill(&self, id: &str) -> Value {
@@ -998,6 +1011,17 @@ mod tests {
         assert_eq!(total, 10);
     }
 
+    fn wait_until_closed(registry: &ExecRegistry, id: &str, stream: &str, limit: usize) -> Value {
+        for _ in 0..2_000 {
+            let view = registry.read(id, stream, 0, limit);
+            if view["running"] == false {
+                return view;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("session did not exit");
+    }
+
     #[test]
     fn session_captures_output_and_exit() {
         let registry = registry();
@@ -1005,18 +1029,135 @@ mod tests {
             .start(Path::new("/tmp"), "printf out; printf err >&2; exit 7")
             .unwrap();
         let id = started["session_id"].as_str().unwrap().to_owned();
-        for _ in 0..500 {
-            let view = registry.read(&id, "both", 0, 65536);
-            if view["running"] == false {
-                assert_eq!(view["exit_code"], 7);
-                let text = view["text"].as_str().unwrap();
-                assert!(text.contains("out"));
-                assert!(text.contains("err"));
+        let view = wait_until_closed(&registry, &id, "both", 65536);
+        assert_eq!(view["exit_code"], 7);
+        let text = view["text"].as_str().unwrap();
+        assert!(text.contains("out"));
+        assert!(text.contains("err"));
+        assert!(view.get("compacted").is_none());
+    }
+
+    #[test]
+    fn small_success_stays_verbatim() {
+        let registry = registry();
+        let started = registry
+            .start(Path::new("/tmp"), "printf 'hello-exec\\n'")
+            .unwrap();
+        let id = started["session_id"].as_str().unwrap().to_owned();
+        let view = wait_until_closed(&registry, &id, "stdout", 65536);
+        assert_eq!(view["ok"], true);
+        assert_eq!(view["exit_code"], 0);
+        assert_eq!(view["session_id"], id);
+        assert_eq!(view["text"], "hello-exec\n");
+        assert!(view.get("compacted").is_none());
+        assert!(view.get("counts").is_none());
+    }
+
+    #[test]
+    fn large_success_compacts_head_and_tail() {
+        let registry = registry();
+        let started = registry
+            .start(
+                Path::new("/tmp"),
+                "awk 'BEGIN{for(i=0;i<90;i++) print \"line-\" i}'",
+            )
+            .unwrap();
+        let id = started["session_id"].as_str().unwrap().to_owned();
+        let view = wait_until_closed(&registry, &id, "stdout", 65536);
+        assert_eq!(view["ok"], true);
+        assert_eq!(view["exit_code"], 0);
+        assert_eq!(view["session_id"], id);
+        assert_eq!(view["truncated"], false);
+        assert_eq!(view["compacted"], true);
+        assert_eq!(view["counts"]["lines"], 90);
+        assert_eq!(view["counts"]["omitted_lines"], 30);
+        let text = view["text"].as_str().unwrap();
+        assert!(text.contains("line-0\n"));
+        assert!(text.contains("line-19\n"));
+        assert!(text.contains("…[omitted 30 lines]…"));
+        assert!(text.contains("line-89\n"));
+        assert!(!text.contains("line-40\n"));
+        assert_eq!(view["next_offset"], view["bytes_total"]);
+        assert!(view["bytes_total"].as_u64().unwrap() > text.len() as u64);
+
+        let chunk = registry.read(&id, "stdout", 0, 35);
+        assert!(chunk.get("compacted").is_none());
+        assert_eq!(
+            chunk["text"].as_str().unwrap(),
+            "line-0\nline-1\nline-2\nline-3\nline-4\n"
+        );
+    }
+
+    #[test]
+    fn failure_keeps_full_diagnostic_output() {
+        let registry = registry();
+        let started = registry
+            .start(
+                Path::new("/tmp"),
+                "awk 'BEGIN{for(i=0;i<90;i++) print \"fail-\" i}'; exit 3",
+            )
+            .unwrap();
+        let id = started["session_id"].as_str().unwrap().to_owned();
+        let view = wait_until_closed(&registry, &id, "stdout", 65536);
+        assert_eq!(view["exit_code"], 3);
+        assert!(view.get("compacted").is_none());
+        let text = view["text"].as_str().unwrap();
+        assert!(text.contains("fail-0\n"));
+        assert!(text.contains("fail-40\n"));
+        assert!(text.contains("fail-89\n"));
+        assert!(!text.contains("…[omitted"));
+    }
+
+    #[test]
+    fn truncated_success_stays_raw() {
+        let registry = registry();
+        let started = registry
+            .start(
+                Path::new("/tmp"),
+                "awk 'BEGIN{for(i=0;i<25000;i++) print i, \"xxxxxxxxxxxxxxxxxxxx\"}'",
+            )
+            .unwrap();
+        let id = started["session_id"].as_str().unwrap().to_owned();
+        let view = wait_until_closed(&registry, &id, "stdout", MAX_BUFFER_PER_STREAM);
+        assert_eq!(view["exit_code"], 0);
+        assert_eq!(view["truncated"], true);
+        assert_eq!(view["session_id"], id);
+        assert!(view.get("compacted").is_none());
+        let text = view["text"].as_str().unwrap();
+        assert!(!text.contains("…[omitted"));
+        assert_eq!(
+            view["bytes_total"].as_u64(),
+            Some(MAX_BUFFER_PER_STREAM as u64)
+        );
+        assert_eq!(text.len(), MAX_BUFFER_PER_STREAM);
+    }
+
+    #[test]
+    fn in_progress_read_does_not_compact() {
+        let registry = registry();
+        let started = registry
+            .start(
+                Path::new("/tmp"),
+                "awk 'BEGIN{for(i=0;i<90;i++) print \"line-\" i}'; sleep 30",
+            )
+            .unwrap();
+        let id = started["session_id"].as_str().unwrap().to_owned();
+        for _ in 0..800 {
+            let view = registry.read(&id, "stdout", 0, 65536);
+            let text = view["text"].as_str().unwrap_or("");
+            if view["running"] == true && text.contains("line-89") {
+                assert!(view.get("compacted").is_none());
+                assert!(text.contains("line-40\n"));
+                assert_eq!(registry.kill(&id)["killed"], true);
                 return;
+            }
+            if view["running"] == false {
+                panic!("session exited before in-progress assertion");
             }
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("session did not exit");
+        let _ = registry.kill(&id);
+        panic!("did not observe in-progress output");
     }
 
     #[test]
