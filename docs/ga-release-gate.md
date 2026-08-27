@@ -291,7 +291,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G2 | **PARTIAL** | Rust Release + attestation/manifest 链已存在；但 README / `docs/i18n/en/install.md` 主路径仍是 `git clone` + `npm ci` + Node.js 20+ |
 | G3 | **PARTIAL** | Live `runtime/current` 已识别顶层 `install` / `rollback` / `uninstall`（[#74](https://github.com/whshang/herdr-mcp/pull/74) 已带出）；正式 seal 残留：把 `~/.local/bin/herdr-mcp` 从仓库 Bash bridge 迁到 `runtime/current` |
 | G4 | **PARTIAL** | `service install` + generation/health/rollback 代码存在；正式文档未给出 binary → `herdr-mcp install` 干净机路径 |
-| G5 | **FAIL** | **关键 blocker**：production Link 仍走 Node；Rust 仅为 candidate；health `production_ready=false` / rust-candidate；未完成 Rust production ownership 切流 |
+| G5 | **FAIL** | **关键 blocker**：production Link 仍走 Node；Rust 仅为 candidate；health `production_ready=false` / rust-candidate。本片仅交付只读 `herdr-mcp link status` + gate catalog + [`docs/_wip/g5-link-production-cutover.md`](./_wip/g5-link-production-cutover.md)；**未**做 live cutover |
 | G6 | **PARTIAL** | 嵌入契约 epoch 2 / 18 tools（hash 冻结）；真实 ChatGPT 与全路径 production smoke 仍属 alpha 验收，未做 GA 冻结声明 |
 | G7 | **PARTIAL** | Edge→Link→runtime 在 alpha 上有过真实 UAT 记录；当前 Link 生产所有者仍是 Node，非「全 Rust」闭环 |
 | G8 | **PARTIAL** | Live alpha.9 `doctor` 已打印 8 行 `LAYER`（[#73](https://github.com/whshang/herdr-mcp/pull/73)）；非完整 remote 闭环（`remote-probe=skipped`） |
@@ -321,7 +321,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 按 2026-08-27 live alpha.9 证据排序（先解关键生产 blocker，再封版本与入口，再干净机与扩展宣称）：
 
-1. **G5 — Rust production Link 切流 + `production_ready`**：候选 Link 完成生产所有权切换；去掉用户路径对 Node link 的依赖；health 不再停在 rust-candidate / `production_ready=false`。
+1. **G5 — Rust production Link 切流 + `production_ready`**：候选 Link 完成生产所有权切换；去掉用户路径对 Node link 的依赖；health 不再停在 rust-candidate / `production_ready=false`。切流清单与门闩见 [`docs/_wip/g5-link-production-cutover.md`](./_wip/g5-link-production-cutover.md)；当前源码仅有只读 `link status`，live cutover 需独立 Shell 双人验收。
 2. **G1 — 单一正式产品版本（退出 alpha）**：Cargo / GitHub Release / `--version` / README 对齐为同一 stable 口径；去掉用户可见 `alpha`。
 3. **G3 seal — 用户 CLI symlink 迁到 `runtime/current`**：live runtime 已带出顶层 `install` / `rollback` / `uninstall`；残留仅把 `~/.local/bin/herdr-mcp` 从仓库 Bash bridge 迁到 installed `runtime/current`。
 4. **G18 — 干净机 install UAT**：不使用开发仓库，按正式文档从零安装并跑通用户闭环。

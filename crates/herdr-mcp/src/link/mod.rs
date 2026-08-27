@@ -22,6 +22,7 @@ pub mod heartbeat;
 pub mod io_loop;
 pub mod lifecycle;
 pub mod local_mcp;
+pub mod ownership;
 pub mod policy;
 pub mod request_core;
 pub mod runner;
@@ -29,3 +30,7 @@ pub mod runtime_control;
 pub mod runtime_generation;
 pub mod socket_driver;
 pub mod transport;
+
+pub use ownership::{
+    doctor_layer_summary, production_ready_gate_catalog, run_status as run_link_status,
+};

@@ -123,5 +123,8 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::Update(command) => updater::run(command),
         cli::Command::NativeHost(command) => native_host_install::run(command),
         cli::Command::ExtensionHost { caller_origin } => native_host::run(&caller_origin),
+        cli::Command::Link(command) => match command {
+            cli::LinkCommand::Status => link::run_link_status(),
+        },
     }
 }

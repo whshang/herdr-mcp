@@ -14,9 +14,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[cfg(target_os = "macos")]
-use std::process::Command;
-
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
@@ -297,53 +294,8 @@ fn format_native_messaging_layer() -> String {
 }
 
 fn format_link_layer(paths: &RuntimePaths) -> String {
-    let control_path = prefer_existing(&[
-        paths.config_dir.join("runtime-control-prod.json"),
-        paths.config_dir.join("runtime-control.json"),
-    ]);
-    let status_path = prefer_existing(&[
-        paths.config_dir.join("runtime-status-prod.json"),
-        paths.config_dir.join("runtime-status.json"),
-    ]);
-    let control = control_path
-        .as_ref()
-        .and_then(|path| read_json_object(path).ok());
-    let status = status_path
-        .as_ref()
-        .and_then(|path| read_json_object(path).ok());
-    let desired = control
-        .as_ref()
-        .and_then(|value| value.get("desired_active"))
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    let outcome = status
-        .as_ref()
-        .and_then(|value| value.get("outcome"))
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    let active = status
-        .as_ref()
-        .and_then(|value| value.pointer("/manager/active_generation"))
-        .and_then(Value::as_str)
-        .unwrap_or("-");
-    let link_prod_loaded = launchd_label_loaded("dev.herdr-mcp.link-prod");
-    let link_loaded = launchd_label_loaded("dev.herdr-mcp.link");
-    let ownership = if control.is_some() || link_prod_loaded || link_loaded {
-        "owned-local"
-    } else {
-        "absent"
-    };
-    format!(
-        "{ownership} control={} status={} desired={desired} active={active} outcome={outcome} link-prod-loaded={link_prod_loaded} link-loaded={link_loaded} remote-probe=skipped",
-        control_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "missing".to_owned()),
-        status_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "missing".to_owned()),
-    )
+    let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
+    crate::link::doctor_layer_summary(&home, &paths.config_dir)
 }
 
 fn format_edge_layer(_paths: &RuntimePaths) -> String {
@@ -451,24 +403,6 @@ fn inspect_unix_socket(path: &Path) -> SocketView {
     }
 }
 
-fn prefer_existing(paths: &[PathBuf]) -> Option<PathBuf> {
-    paths.iter().find(|path| path.is_file()).cloned()
-}
-
-fn read_json_object(path: &Path) -> Result<Value, String> {
-    let bytes =
-        fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    if bytes.len() > 64 * 1024 {
-        return Err(format!("{} exceeds doctor read budget", path.display()));
-    }
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("invalid json {}: {error}", path.display()))?;
-    if !value.is_object() {
-        return Err(format!("{} is not a json object", path.display()));
-    }
-    Ok(value)
-}
-
 fn edge_host_from_plist(path: &Path) -> Option<String> {
     let value = plist::Value::from_file(path).ok()?;
     let env = value
@@ -493,27 +427,6 @@ fn edge_host(url: &str) -> Option<String> {
         None
     } else {
         Some(host.to_owned())
-    }
-}
-
-fn launchd_label_loaded(label: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        let output = Command::new("launchctl").arg("list").output();
-        let Ok(output) = output else {
-            return false;
-        };
-        if !output.status.success() {
-            return false;
-        }
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.split_whitespace().nth(2) == Some(label))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = label;
-        false
     }
 }
 
