@@ -392,7 +392,7 @@ herdr-mcp --instance uat uninstall
 
 1. **G18 — 默认实例干净机完整路径**（第二台 macOS Apple Silicon / VM；runbook：`docs/i18n/en/clean-machine-uat.md`）。同机 `--instance uat` 已证明 runtime install/doctor/status，**不能**替代此项。
 2. **G17 / G7 / G6 — 公网 ChatGPT OAuth + tools UAT**（owner-only；清单见上方 Owner ChatGPT UAT pack + clean-machine-uat §B + chatgpt-connector）。
-3. **G1 — 退出 alpha**（G18 默认实例 + 公网 UAT 全绿后再评估 `0.4.0` stable；**现在不要打 stable tag**）。
+3. **G1 — 退出 alpha**（G18 默认实例 + 公网 UAT 全绿后再评估 `0.4.0` stable；**现在不要打 stable tag**；版本统一步骤见 [`docs/exit-alpha-checklist.md`](./exit-alpha-checklist.md)）。
 4. **G15 residual** — 第二台 Mac 或 owner 维护窗：Chrome Load unpacked + `native-host install` + 绑定 smoke（同机 uat 仅静态 smoke + zip 解压）。
 5. **G22 seal** — 第二台 Mac 验证文档主路径后升 PASS。
 6. **G16 — 保持 DEFERRED**（browser terminal / true-steer / mutation 不进第一 GA）。
