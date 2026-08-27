@@ -10,18 +10,18 @@ generation + control, [`docs/ga-release-gate.md`](../ga-release-gate.md) G5 (P0 
 
 ## Current ownership (read-only truth)
 
-As of alpha.10 on developer workstations (G3 user CLI sealed to
-`runtime/current`; Link ownership unchanged — do not cut live Node Link):
+As of alpha.11 on developer workstations (G3 user CLI sealed to
+`runtime/current`; production Link ownership unchanged — do not cut live Node Link):
 
 | Layer | Owner today | Evidence |
 | --- | --- | --- |
-| MCP runtime service `dev.herdr-mcp.server` | Rust generation under `runtime/current` (alpha.10) | `herdr-mcp service status` / `--version` |
+| MCP runtime service `dev.herdr-mcp.server` | Rust generation under `runtime/current` (alpha.11 / `rust-30c3db71f6fa5a21`) | `herdr-mcp service status` / `--version` |
 | User CLI `~/.local/bin/herdr-mcp` | Symlink → `runtime/current/herdr-mcp` (G3 sealed) | `ls -l` / `readlink` |
-| Production Link `dev.herdr-mcp.link-prod` | **Node** `node` + checkout `dist/link/macos-daemon.js` (desired=active=stable-0.3.32) | LaunchAgent ProgramArguments |
-| Dev/canary Link `dev.herdr-mcp.link` | **Node** same daemon path | LaunchAgent ProgramArguments |
-| Rust candidate LaunchAgent `dev.herdr-mcp.link-rust-candidate` | Source supports `link install` → `runtime/current/herdr-mcp link run` (not live yet on alpha.10 binary) | Distinct from Node `link` / `link-prod`; never cuts them |
-| Rust `link::daemon` | Staged; CLI `link run` + candidate install/uninstall in source | No production LaunchAgent cutover |
-| Health | `runtime=rust-candidate`, `production_ready=false` | `/health` + `native_migration` |
+| Production Link `dev.herdr-mcp.link-prod` | **Node** `node` + checkout `dist/link/macos-daemon.js` (desired=active=stable-0.3.32) | LaunchAgent ProgramArguments unchanged through alpha.11 apply |
+| Dev/canary Link `dev.herdr-mcp.link` | **Node** same daemon path | LaunchAgent ProgramArguments unchanged |
+| Rust candidate LaunchAgent `dev.herdr-mcp.link-rust-candidate` | **Live soak** via `link install` → `runtime/current/herdr-mcp link run` (workstation `dev-rust-link-candidate`) | Distinct from Node `link` / `link-prod`; never cuts them |
+| Rust `link::daemon` | Staged; CLI `link run` + candidate install/uninstall live on alpha.11 | No production LaunchAgent cutover |
+| Health | `runtime=rust-candidate`, `production_ready=false` | `/health` + `native_migration`; `link status` `production_ready_eligible=false` |
 
 Read-only / candidate commands:
 
@@ -35,13 +35,21 @@ herdr-mcp doctor           # LAYER link shows production_owner=node|rust|...
 
 ## Blockers (ordered)
 
-1. **Candidate LaunchAgent not yet on installed alpha.10 binary** — source now has `link install|uninstall` for `dev.herdr-mcp.link-rust-candidate` → `runtime/current/herdr-mcp link run` (never Node `link`/`link-prod`). Needs a later installed generation to soak; production cutover still blocked.
-2. **Production LaunchAgent still Node + repo checkout** — both `link` and `link-prod` ProgramArguments point at `/usr/local/bin/node` and `.../herdr-mcp/dist/link/macos-daemon.js`, violating AGENTS.md (no launchd-to-checkout).
-3. **Runtime-control generation still Node-era** — prod control/status commonly keep `desired_active` / `active_generation` like `stable-0.3.32` even while MCP service is Rust alpha.
-4. **Health seal** — `production_ready` and `runtime=rust-candidate` must not flip until ownership + UAT gates pass.
+1. **Production LaunchAgent still Node + repo checkout** — both `link` and `link-prod` ProgramArguments point at `/usr/local/bin/node` and `.../herdr-mcp/dist/link/macos-daemon.js`, violating AGENTS.md (no launchd-to-checkout). Candidate soak on alpha.11 does **not** clear this.
+2. **Runtime-control generation still Node-era** — prod control/status commonly keep `desired_active` / `active_generation` like `stable-0.3.32` even while MCP service is Rust alpha.
+3. **Health seal** — `production_ready` and `runtime=rust-candidate` must not flip until ownership + UAT gates pass. Live `link status` still has six gates false (`launchd_prod_program_is_rust_runtime`, `launchd_not_repo_checkout`, `runtime_control_generation_rust_compatible`, `health_runtime_not_candidate`, `node_link_not_required`, `dual_verification_uat`).
+4. **Production cutover helper missing** — no one-command swap that bootouts Node prod, bootstraps Rust prod on `runtime/current`, and can restore Node plist backup.
 5. **User CLI** — G3 sealed on this machine (`~/.local/bin/herdr-mcp` → `runtime/current`); cutover tooling must still use `runtime/current/herdr-mcp`, never a checkout/`target/` binary. Clean-machine seal remains a separate G3/G18 gap.
 6. **Credentials** — Link secret stays in Keychain; MCP token stays in server plist env. `link run` loads both; cutover must preserve both; never commit secrets.
-7. **Dual verification UAT** — Edge → Link → Rust runtime → Herdr smoke after cutover, plus rollback to Node Link if needed, from an **independent** Shell (not a managed `herdr_exec` session). Required before any production cutover; not part of this slice.
+7. **Dual verification UAT** — Edge → Link → Rust runtime → Herdr smoke after cutover, plus rollback to Node Link if needed, from an **independent** Shell (not a managed `herdr_exec` session). Required before any production cutover; not part of candidate soak.
+
+### Alpha.11 candidate soak evidence (developer workstation)
+
+- Release: `v0.4.0-alpha.11` / source `0ae559b` / generation `rust-30c3db71f6fa5a21`.
+- Managed `update apply` from alpha.10 succeeded; Node `dev.herdr-mcp.link` / `link-prod` PIDs and ProgramArguments unchanged.
+- `herdr-mcp link install` → label `dev.herdr-mcp.link-rust-candidate`, ProgramArguments `[runtime/current/herdr-mcp, link, run]`, loaded=true, workstation `dev-rust-link-candidate`.
+- `link status`: `production_owner=node`, `production_ready_eligible=false`, `cutover_performed=false`; gates true only for `rust_cli_link_run` and `user_cli_not_repo_bash_bridge`.
+- `doctor` LAYER link: `production_owner=node` / `production_ready_eligible=false`.
 
 ## Gates that must all be true before `production_ready=true`
 
@@ -85,20 +93,22 @@ Stop if Link prod is already Rust, or if service is unhealthy.
 
 Prerequisites still to implement after status + `link run`:
 
-1. ~~`herdr-mcp link install|uninstall` for candidate~~ landed as `dev.herdr-mcp.link-rust-candidate` → `runtime/current/herdr-mcp link run` (never checkout/`target/`; never mutates Node `link`/`link-prod`). Still needs installed generation + soak.
+1. ~~`herdr-mcp link install|uninstall` for candidate~~ landed and **soaked on alpha.11** as `dev.herdr-mcp.link-rust-candidate` → `runtime/current/herdr-mcp link run` (never checkout/`target/`; never mutates Node `link`/`link-prod`).
 2. Generation fencing: prod control file generations must address Rust MCP endpoint/version, not `stable-0.3.32`.
 3. One-command cutover helper that: writes new plist beside old, bootouts Node prod, bootstraps Rust prod, verifies health/gates, and can revert to Node plist backup. Still requires human dual verification.
 
 ### 2. Candidate soak (safe)
 
 ```bash
-# After an installed generation includes link install:
+# alpha.11 installed generation includes link install:
 # 1) herdr-mcp link install   # bootstraps dev.herdr-mcp.link-rust-candidate only
 # 2) Keep Node link + link-prod untouched
 # 3) Soak reconnect / tool_result / cancel / generation activate on workstation id
 #    dev-rust-link-candidate (distinct from Node canary)
 # 4) herdr-mcp link uninstall when done
 ```
+
+Developer workstation (2026-08-27): steps 1–2 completed on alpha.11; longer Edge soak / tool_result matrix still open before any prod cut.
 
 ### 3. Production cutover (explicit dual verification)
 
@@ -127,10 +137,11 @@ Only when `herdr-mcp link status` shows all gates except `dual_verification_uat`
 
 ## Remaining G5 gaps after this slice
 
-- [x] `herdr-mcp link status` + 8 `production_ready` gates (live on alpha.10)
+- [x] `herdr-mcp link status` + 8 `production_ready` gates (live on alpha.10+)
 - [x] `herdr-mcp link run` (foreground) with Keychain/plist credential load
-- [x] Candidate `herdr-mcp link install|uninstall` for `dev.herdr-mcp.link-rust-candidate` → `runtime/current` only (this slice; does not touch Node jobs)
-- [ ] Install this slice into a managed generation and soak the candidate agent
+- [x] Candidate `herdr-mcp link install|uninstall` for `dev.herdr-mcp.link-rust-candidate` → `runtime/current` only (does not touch Node jobs)
+- [x] Install into managed alpha.11 generation and start candidate LaunchAgent soak (developer workstation)
+- [ ] Longer candidate Edge soak (reconnect / tool_result / cancel / generation activate)
 - [ ] Production LaunchAgent cutover helper for `link-prod` on `runtime/current`
 - [ ] Rust-compatible runtime-control generation cutover for prod control files
 - [ ] Health seal commit (`production_ready` / runtime label) after UAT
