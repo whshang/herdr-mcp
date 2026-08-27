@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -182,6 +184,7 @@ fn run_unix(
     timeout_ms: u64,
     working: &[Value],
 ) -> Value {
+    let started_at_ms = now_ms();
     let (mut pane_id, mut created) =
         match prepare_utility_pane(client, snapshot, workspace_id, effective_root) {
             Ok(value) => value,
@@ -194,6 +197,7 @@ fn run_unix(
                     "control_plane_taskgroup_before_send",
                     working,
                     Some(message),
+                    started_at_ms,
                 );
             }
             Err(PrepareError::Other { code, message }) => {
@@ -279,6 +283,7 @@ fn run_unix(
                                 &format!("pane_recover_failed:{}", second.code),
                                 working,
                                 None,
+                                started_at_ms,
                             );
                         }
                         Err(second) => {
@@ -303,6 +308,7 @@ fn run_unix(
                         "control_plane_taskgroup_pane_recover",
                         working,
                         Some(message),
+                        started_at_ms,
                     );
                 }
                 Err(PrepareError::Other { code, .. }) => {
@@ -315,6 +321,7 @@ fn run_unix(
                         &format!("pane_recover_failed:{code}"),
                         working,
                         None,
+                        started_at_ms,
                     );
                 }
             }
@@ -450,6 +457,7 @@ fn run_unix(
         &output,
         exit_code == Some(0) && !truncated,
     );
+    insert_sync_completion(&mut result, started_at_ms, output.as_bytes().len());
     add_working_warning(&mut result, working);
     Value::Object(result)
 }
@@ -939,6 +947,7 @@ fn local_fallback(
     reason: &str,
     working: &[Value],
     detail: Option<String>,
+    started_at_ms: u64,
 ) -> Value {
     let local = run_local_shell(command, cwd, timeout_ms, OUTPUT_LIMIT);
     let mut result = Map::new();
@@ -970,6 +979,7 @@ fn local_fallback(
         &local.output,
         !local.timed_out && local.exit_code == Some(0) && !local.truncated,
     );
+    insert_sync_completion(&mut result, started_at_ms, local.output.as_bytes().len());
     if local.timed_out {
         result.insert(
             "hint".to_owned(),
@@ -1206,6 +1216,36 @@ fn optional_u64(args: &Value, key: &str, min: u64, max: u64) -> Result<Option<u6
     }
 }
 
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn iso_from_ms(ms: u64) -> String {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+        .ok()
+        .and_then(|value| value.format(&Rfc3339).ok())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
+}
+
+fn insert_sync_completion(result: &mut Map<String, Value>, started_at_ms: u64, bytes_total: usize) {
+    let elapsed_ms = now_ms().saturating_sub(started_at_ms);
+    result.insert("started_at".to_owned(), json!(iso_from_ms(started_at_ms)));
+    result.insert("phase".to_owned(), json!("completed"));
+    result.insert(
+        "progress".to_owned(),
+        json!({
+            "bytes_read": bytes_total,
+            "bytes_total": bytes_total,
+            "elapsed_ms": elapsed_ms,
+        }),
+    );
+}
+
 fn invalid(message: &str) -> Value {
     json!({"ok": false, "code": "invalid_params", "message": message})
 }
@@ -1305,8 +1345,16 @@ mod tests {
             "test",
             &[],
             None,
+            now_ms(),
         );
         assert_eq!(large["ok"], true);
+        assert_eq!(large["phase"], "completed");
+        assert!(large["started_at"].as_str().is_some());
+        assert_eq!(
+            large["progress"]["bytes_read"],
+            large["progress"]["bytes_total"]
+        );
+        assert!(large["progress"]["elapsed_ms"].as_u64().is_some());
         assert_eq!(large["exit_code"], 0);
         assert_eq!(
             large["command"],
@@ -1329,6 +1377,7 @@ mod tests {
             "test",
             &[],
             None,
+            now_ms(),
         );
         assert_eq!(small["ok"], true);
         assert!(small["output"].as_str().unwrap().contains("hello-local"));
@@ -1342,6 +1391,7 @@ mod tests {
             "test",
             &[],
             None,
+            now_ms(),
         );
         assert_eq!(failed["ok"], false);
         assert_eq!(failed["exit_code"], 3);
@@ -1359,6 +1409,7 @@ mod tests {
             "test",
             &[],
             None,
+            now_ms(),
         );
         assert_eq!(truncated["ok"], true);
         assert_eq!(truncated["truncated"], true);

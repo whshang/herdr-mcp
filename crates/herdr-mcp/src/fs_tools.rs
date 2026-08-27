@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -232,6 +233,8 @@ pub fn grep(snapshot: &Value, args: &Value) -> Value {
 }
 
 fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Value {
+    let started = Instant::now();
+    let started_at_ms = now_ms();
     let root = match required_str(args, "root") {
         Ok(value) => value,
         Err(error) => return error,
@@ -299,7 +302,14 @@ fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Val
             max_bytes,
         })
     {
-        return finish_grep_result(&managed.resolved, matches, truncated, "rg");
+        return finish_grep_result(
+            &managed.resolved,
+            matches,
+            truncated,
+            "rg",
+            started_at_ms,
+            started.elapsed().as_millis() as u64,
+        );
     }
 
     let mut matches = Vec::new();
@@ -315,7 +325,14 @@ fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Val
         max_bytes,
     };
     walk_grep(&search_root, &walk, &mut matches, &mut truncated);
-    finish_grep_result(&managed.resolved, matches, truncated, "rust")
+    finish_grep_result(
+        &managed.resolved,
+        matches,
+        truncated,
+        "rust",
+        started_at_ms,
+        started.elapsed().as_millis() as u64,
+    )
 }
 
 fn finish_grep_result(
@@ -323,18 +340,43 @@ fn finish_grep_result(
     matches: Vec<Value>,
     truncated: bool,
     engine: &str,
+    started_at_ms: u64,
+    elapsed_ms: u64,
 ) -> Value {
     let compact = if truncated {
         None
     } else {
         compact_grep_matches(&matches)
     };
+    let files = match &compact {
+        Some(compact) => compact
+            .counts
+            .get("files")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        None => matches
+            .iter()
+            .filter_map(|item| item.get("file").and_then(Value::as_str))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u64,
+    };
+    let match_count = matches.len() as u64;
     let mut output = Map::new();
     output.insert("ok".to_owned(), json!(true));
     output.insert("root".to_owned(), json!(resolved_root.to_string_lossy()));
-    output.insert("count".to_owned(), json!(matches.len()));
+    output.insert("count".to_owned(), json!(match_count));
     output.insert("truncated".to_owned(), json!(truncated));
     output.insert("engine".to_owned(), json!(engine));
+    output.insert("started_at".to_owned(), json!(iso_from_ms(started_at_ms)));
+    output.insert("phase".to_owned(), json!("completed"));
+    output.insert(
+        "progress".to_owned(),
+        json!({
+            "matches": match_count,
+            "files": files,
+            "elapsed_ms": elapsed_ms,
+        }),
+    );
     match compact {
         Some(compact) if compact.match_count > GREP_COMPACT_AFTER => {
             output.insert("matches".to_owned(), json!(compact.grouped));
@@ -350,6 +392,21 @@ fn finish_grep_result(
         }
     }
     Value::Object(output)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn iso_from_ms(ms: u64) -> String {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+        .ok()
+        .and_then(|value| value.format(&Rfc3339).ok())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
 }
 
 struct GrepCompact {
@@ -1016,6 +1073,11 @@ mod tests {
             &json!({"root": root, "pattern": "alpha", "glob": "*.rs"}),
         );
         assert_eq!(grep_result["ok"], true);
+        assert_eq!(grep_result["phase"], "completed");
+        assert!(grep_result["started_at"].as_str().is_some());
+        assert_eq!(grep_result["progress"]["matches"], 2);
+        assert_eq!(grep_result["progress"]["files"], 1);
+        assert!(grep_result["progress"]["elapsed_ms"].as_u64().is_some());
         assert_eq!(grep_result["count"], 2);
         let engine = grep_result["engine"].as_str().unwrap();
         if discover_rg().is_some() {
