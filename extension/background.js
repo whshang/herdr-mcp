@@ -1120,9 +1120,19 @@ let stateFetchInFlight = null;
 let localRuntimeReachable = null;
 let localRuntimeCheckedAt = 0;
 
+function broadcastControlMessage(message) {
+  try {
+    const pending = chrome.runtime.sendMessage(message);
+    if (pending && typeof pending.catch === "function") pending.catch(() => {});
+  } catch (_) {}
+}
+
 function noteLocalRuntimeReachability(reachable) {
-  localRuntimeReachable = reachable === true;
+  const next = reachable === true;
+  const changed = localRuntimeReachable !== next;
+  localRuntimeReachable = next;
   localRuntimeCheckedAt = Date.now();
+  if (changed) broadcastControlMessage({ type: "herdr_control_runtime", healthy: next });
 }
 
 async function automationRuntimeGate() {
@@ -1246,6 +1256,15 @@ async function handlePushBlock(block) {
     else if (line.startsWith("data:")) { try { data = JSON.parse(line.slice(5).trim()); } catch {} }
   }
   if (!event || !data) return;
+  if (event === "hello") {
+    // A reconnect is the reconciliation boundary for the Control Center.
+    // Fetch exactly one authoritative snapshot; steady-state changes remain
+    // incremental through the shared event stream below.
+    const state = await fetchState();
+    if (state?.ok) broadcastControlMessage({ type: "herdr_control_state", state });
+  } else if (["agent_working", "agent_settled", "agent_output", "agent_gone"].includes(event)) {
+    broadcastControlMessage({ type: "herdr_control_event", event: { type: event, ...data } });
+  }
   const bindings = await loadBindings();
   const entries = Object.entries(bindings);
   const scoped = data.workspace
@@ -2961,6 +2980,46 @@ async function handleHandoffTurnEnded(msg) {
 
 // ---- Message handling ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === "herdr_control_center_subscribe") {
+    void (async () => {
+      const state = await fetchState();
+      if (state?.ok) sendResponse({ ok: true, state });
+      else sendResponse(state || { ok: false });
+    })();
+    return true;
+  }
+  if (msg?.type === "herdr_control_read_tail") {
+    void (async () => {
+      const paneId = String(msg.pane_id || "").trim();
+      if (!paneId) {
+        sendResponse({ ok: false, error: "pane-required" });
+        return;
+      }
+      const lines = Math.max(1, Math.min(80, Number(msg.lines) || 40));
+      const maxChars = Math.max(256, Math.min(8192, Number(msg.max_chars) || 4096));
+      const call = await jsonBridgeRpc("tools/call", {
+        name: "herdr_call",
+        arguments: {
+          method: "pane.read",
+          params: JSON.stringify({ pane_id: paneId, source: "recent_unwrapped", lines, strip_ansi: true }),
+        },
+      });
+      if (!call.ok) {
+        sendResponse({ ok: false, error: call.error || "read-tail-failed", detail: call.detail || null });
+        return;
+      }
+      const content = Array.isArray(call.result?.content) ? call.result.content : [];
+      const text = content.filter((item) => item?.type === "text").map((item) => String(item.text || "")).join("\n");
+      let parsed = null;
+      try { parsed = JSON.parse(text); } catch (_) {}
+      const read = parsed?.read || parsed?.result || parsed || {};
+      const raw = typeof read === "string"
+        ? read
+        : String(read.content ?? read.text ?? read.output ?? text ?? "");
+      sendResponse({ ok: true, pane_id: paneId, tail: raw.slice(-maxChars), truncated: raw.length > maxChars });
+    })();
+    return true;
+  }
   if (msg?.type === "h2w_json_bridge_catalog") {
     void (async () => {
       const access = validateJsonBridgeSender(msg, sender);
@@ -3313,6 +3372,62 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // matching tab to acknowledge the broadcast. A stale or suspended tab
       // can otherwise leave the caller disabled indefinitely even though the
       // preference was already persisted successfully.
+      void notifyAutomationChanged();
+    })();
+    return true;
+  }
+  if (msg?.type === "h2w_popup_set_automation") {
+    void (async () => {
+      const tabId = Number(msg.tabId);
+      if (!Number.isInteger(tabId) || tabId <= 0) {
+        sendResponse({ ok: false, error: "tab-unavailable" });
+        return;
+      }
+      const convInfo = await conversationInfoForTab(tabId);
+      const convKey = String(convInfo?.convKey || "").trim();
+      if (!convKey) {
+        sendResponse({ ok: false, error: "conversation-unavailable" });
+        return;
+      }
+      const enabled = msg.enabled === true;
+      const projectId = String(convInfo?.project_id || "").trim();
+      if (projectId) {
+        if (!/^g-p-[0-9a-f]{32}$/i.test(projectId)) {
+          sendResponse({ ok: false, error: "project_required" });
+          return;
+        }
+        if (enabled && normalizeAutomationMode(CFG.automationMode) !== AUTOMATION_MODE_PROJECT) {
+          CFG = {
+            ...CFG,
+            automationMode: AUTOMATION_MODE_PROJECT,
+            enabled: false,
+            idleNudgeEnabled: false,
+          };
+          await chrome.storage.local.set({
+            automationMode: AUTOMATION_MODE_PROJECT,
+            enabled: false,
+            idleNudgeEnabled: false,
+          });
+        }
+        if (enabled) PROJECT_AUTOMATION[projectId] = true;
+        else delete PROJECT_AUTOMATION[projectId];
+        await chrome.storage.local.set({ [PROJECT_AUTOMATION_STORAGE_KEY]: PROJECT_AUTOMATION });
+      } else {
+        const site = conversationAutomationSiteForConversation(convKey);
+        if (!site) {
+          sendResponse({ ok: false, error: "conversation-automation-unavailable" });
+          return;
+        }
+        if (enabled) CONVERSATION_AUTOMATION[convKey] = true;
+        else delete CONVERSATION_AUTOMATION[convKey];
+        await chrome.storage.local.set({ [CONVERSATION_AUTOMATION_STORAGE_KEY]: CONVERSATION_AUTOMATION });
+      }
+      const bindings = await loadBindings();
+      reconcileProgressTimers(bindings);
+      for (const key of [...idleNudgeRetryTimers.keys()]) {
+        if (!automationScopeForConversation(key).enabled) clearIdleNudgeRetry(key);
+      }
+      sendResponse({ ok: true, ...automationScopeForConversation(convKey) });
       void notifyAutomationChanged();
     })();
     return true;

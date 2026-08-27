@@ -20,6 +20,8 @@ async function activeTab() {
 }
 
 let toastTimer = null;
+let popupState = null;
+let popupTab = null;
 function showToast(text, kind = "err") {
   const el = $("toast");
   el.textContent = text;
@@ -153,6 +155,8 @@ async function refresh() {
   applyStaticI18n();
   const tab = await activeTab();
   const st = await bg({ type: "h2w_state", tabId: tab?.id }) || {};
+  popupTab = tab;
+  popupState = st;
   const agentsResp = await bg({ type: "h2w_agents" });
   const wsMeta = workspaceMetaMap(agentsResp?.workspaces);
   const groups = groupPanesByWorkspace(agentsResp?.panes, agentsResp?.agents, agentsResp?.workspaces);
@@ -175,6 +179,14 @@ async function refresh() {
   $("automationModeStatus").textContent = st.config?.automationMode === "project_auto"
     ? t("automation_mode_project")
     : t("automation_mode_manual");
+  const quickAutomation = $("automationQuickToggle");
+  if (quickAutomation) {
+    const active = st.config?.enabled === true;
+    quickAutomation.disabled = !tab?.id || !st.convInfo;
+    quickAutomation.dataset.enabled = active ? "1" : "0";
+    quickAutomation.textContent = t(active ? "hud_automation_on" : "hud_automation_off");
+    quickAutomation.classList.toggle("primary", active);
+  }
   $("progressTickSec").value = String(st.config?.progressTickSec ?? 60);
   const llmEl = $("llmJudgeStatus");
   if (llmEl) {
@@ -265,6 +277,27 @@ $("progressTickSec").addEventListener("change", async (e) => {
   await bg({ type: "h2w_set_config", config: { progressTickSec: sec } });
 });
 $("openOptions").addEventListener("click", (e) => { e.preventDefault(); chrome.runtime.openOptionsPage(); });
+$("automationQuickToggle").addEventListener("click", async (event) => {
+  if (!popupTab?.id || !popupState?.convInfo) return;
+  const button = event.currentTarget;
+  const enabled = button.dataset.enabled !== "1";
+  button.disabled = true;
+  const response = await bg({ type: "h2w_popup_set_automation", tabId: popupTab.id, enabled });
+  if (!response?.ok) {
+    showToast(`${t("hud_automation_update_failed")}: ${response?.error || "?"}`);
+  }
+  await refresh();
+});
+$("openControlCenter").addEventListener("click", () => {
+  if (!chrome.sidePanel?.open) {
+    showToast("Control Center is unavailable in this browser.");
+    return;
+  }
+  // Keep the call in the direct click handler so Chrome preserves the user
+  // gesture required by sidePanel.open().
+  chrome.sidePanel.open({ windowId: chrome.windows.WINDOW_ID_CURRENT })
+    .catch((error) => showToast(String(error?.message || error)));
+});
 
 onLocaleReady(() => { void refresh(); });
 void detectOrLoadLocale();
