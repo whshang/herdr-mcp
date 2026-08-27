@@ -62,6 +62,25 @@ class ChatGPTAdapter extends BaseAdapter {
   getSendButton() {
     return this.getSendButtonCandidates()[0] || null;
   }
+
+  getComposerActionAnchor() {
+    const input = this.getInputEl();
+    const scope = input?.closest?.("form") || input?.parentElement?.parentElement || document;
+    const selectors = [
+      'button[data-testid="send-button"]',
+      'button[data-testid="composer-send-button"]',
+      'button[data-testid="stop-button"]',
+      'button[aria-label*="Stop" i]',
+      'button[aria-label*="停止"]',
+      'button.composer-submit-button-color',
+    ];
+    for (const selector of selectors) {
+      const button = scope.querySelector?.(selector);
+      if (button) return button.closest?.("div.inline-flex") || button;
+    }
+    const button = this.getSendButton();
+    return button?.closest?.("div.inline-flex") || button;
+  }
 }
 
 window.__H2W_ADAPTER__ = new ChatGPTAdapter();

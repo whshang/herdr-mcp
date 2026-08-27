@@ -61,12 +61,14 @@ ok(!manifest.key, "unpacked extension keeps its existing Chromium path-derived i
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
+const chatGptAdapterSource = readFileSync(path.join(EXT, "content", "injector", "chatgpt.js"), "utf8");
+const queuedInsertCoreSource = readFileSync(path.join(EXT, "queued-insert-core.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
-ok(manifest.version === "0.1.63", "manifest version stays aligned with the page self-healing build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.63"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.63"'), "content version matches manifest");
+ok(manifest.version === "0.1.64", "manifest version stays aligned with the queued-insert build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.64"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.64"'), "content version matches manifest");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")
@@ -550,9 +552,33 @@ ok(backgroundSource.includes('event === "hello"')
     && controlCenterSource.includes('type: "herdr_control_center_subscribe"')
     && !controlCenterSource.includes("setInterval("),
   "Control Center uses one initial/reconnect snapshot plus incremental events without fixed polling");
+const queueTurnEndedStart = backgroundSource.indexOf('if (msg?.type === "h2w_turn_ended")');
+const queueTurnEndedEnd = queueTurnEndedStart >= 0 ? backgroundSource.indexOf('if (msg?.type === "h2w_handoff_start")', queueTurnEndedStart) : -1;
+const queueTurnEndedBlock = queueTurnEndedStart >= 0 && queueTurnEndedEnd > queueTurnEndedStart
+  ? backgroundSource.slice(queueTurnEndedStart, queueTurnEndedEnd)
+  : "";
+ok(backgroundSource.includes('msg?.type === "h2w_queue_insert"')
+    && backgroundSource.includes('msg?.type === "h2w_queue_flush"')
+    && backgroundSource.includes('msg?.type === "h2w_queue_clear"')
+    && backgroundSource.includes('type: "h2w_queue_deliver"')
+    && wakeSource.includes('id = QUEUED_INSERT_BUTTON_ID')
+    && wakeSource.includes('blocked: "turn-in-progress"')
+    && wakeSource.includes('queueInsert: true')
+    && chatGptAdapterSource.includes("getComposerActionAnchor()")
+    && chatGptAdapterSource.includes('button.composer-submit-button-color')
+    && chatGptAdapterSource.includes('closest?.("div.inline-flex")')
+    && queuedInsertCoreSource.includes('join("\\n\\n")'),
+  "ChatGPT queued insert persists messages, stays beside Send/Stop, and never interrupts a live turn");
+ok(queueTurnEndedBlock.includes("queuedInsertStateForConversation")
+    && queueTurnEndedBlock.includes("flushQueuedInsert")
+    && queueTurnEndedBlock.indexOf("flushQueuedInsert") < queueTurnEndedBlock.indexOf("maybeIdleNudge"),
+  "settled-turn queued content is delivered before the generic LLM continue path");
+ok((backgroundSource.match(/await moveQueuedInsertForHandoff\(/g) || []).length === 4
+    && queuedInsertCoreSource.includes("export function moveQueuedInserts"),
+  "handoff commit migrates queued user messages to every supported target cutover path");
 
 // ---- 2. JavaScript syntax for the fixed file list ----
-const fixed = ["background.js", "binding-core.js", "continuity-core.js", "options.js", "popup.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js",
+const fixed = ["background.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "popup.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js",
   "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/claude.js",
   "content/injector/chatgpt.js", "content/webmcp/speaks-json.js", "content/wake.js"];
 for (const f of fixed) {
