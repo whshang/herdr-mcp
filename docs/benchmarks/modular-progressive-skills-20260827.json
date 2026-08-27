@@ -40,13 +40,14 @@
       "percent_of_giant_asset": 8.5
     },
     "bootstrap": {
-      "tool_text_bytes": 5599,
+      "tool_text_bytes": 5577,
       "content_bytes": 2231,
-      "approx_tokens_chars4": 1400,
-      "percent_of_giant_asset": 26.5,
+      "approx_tokens_chars4": 1395,
+      "percent_of_giant_asset": 26.4,
       "catalog_count": 7,
       "catalog_bytes": 2442,
       "capability_summary_bytes": 222,
+      "worker_count": 11,
       "capability_detail_refresh": "herdr_inspect/herdr_since"
     },
     "profiles": {
@@ -54,40 +55,40 @@
         "skills": ["files-search"],
         "load_tool_text_bytes": 1547,
         "skill_body_bytes": 1140,
-        "total_context_bytes": 7146,
-        "approx_tokens_chars4": 1787,
-        "percent_of_giant_asset": 33.8,
-        "reduction_vs_giant_asset_percent": 66.2,
+        "total_context_bytes": 7124,
+        "approx_tokens_chars4": 1781,
+        "percent_of_giant_asset": 33.7,
+        "reduction_vs_giant_asset_percent": 66.3,
         "initial_skill_load_round_trips": 1
       },
       "exec-only": {
         "skills": ["execution"],
         "load_tool_text_bytes": 1604,
         "skill_body_bytes": 1203,
-        "total_context_bytes": 7203,
-        "approx_tokens_chars4": 1801,
-        "percent_of_giant_asset": 34.0,
-        "reduction_vs_giant_asset_percent": 66.0,
+        "total_context_bytes": 7181,
+        "approx_tokens_chars4": 1796,
+        "percent_of_giant_asset": 33.9,
+        "reduction_vs_giant_asset_percent": 66.1,
         "initial_skill_load_round_trips": 1
       },
       "agent-delegation": {
         "skills": ["workstation-control", "agent-dispatch"],
         "load_tool_text_bytes": 3914,
         "skill_body_bytes": 3157,
-        "total_context_bytes": 9513,
-        "approx_tokens_chars4": 2379,
-        "percent_of_giant_asset": 45.0,
-        "reduction_vs_giant_asset_percent": 55.0,
+        "total_context_bytes": 9491,
+        "approx_tokens_chars4": 2373,
+        "percent_of_giant_asset": 44.9,
+        "reduction_vs_giant_asset_percent": 55.1,
         "initial_skill_load_round_trips": 1
       },
       "multi-line-development": {
         "skills": ["workstation-control", "agent-dispatch", "development-orchestration", "git-repository", "files-mutation"],
         "load_tool_text_bytes": 9185,
         "skill_body_bytes": 7440,
-        "total_context_bytes": 14784,
-        "approx_tokens_chars4": 3696,
-        "percent_of_giant_asset": 69.9,
-        "reduction_vs_giant_asset_percent": 30.1,
+        "total_context_bytes": 14762,
+        "approx_tokens_chars4": 3691,
+        "percent_of_giant_asset": 69.8,
+        "reduction_vs_giant_asset_percent": 30.2,
         "initial_skill_load_round_trips": 1
       }
     }
