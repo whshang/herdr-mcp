@@ -24,6 +24,23 @@ pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
     }
 }
 
+/// Read-only service ownership snapshot for `doctor`. Never mutates launchd.
+pub fn doctor_status() -> Result<serde_json::Value, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(serde_json::json!({
+            "ok": false,
+            "implementation": "unsupported",
+            "detail": "service manager currently requires macOS",
+        }))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos::doctor_status()
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
@@ -1729,6 +1746,11 @@ mod macos {
             "guardian_settled": Value::Null,
             "evidence_recorded": false,
         })))
+    }
+
+    pub(super) fn doctor_status() -> Result<Value, String> {
+        let paths = ServicePaths::discover()?;
+        status(&paths)
     }
 
     fn status(paths: &ServicePaths) -> Result<Value, String> {

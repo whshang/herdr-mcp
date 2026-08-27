@@ -97,6 +97,24 @@ pub fn run(command: NativeHostCommand) -> Result<ExitCode, String> {
     }
 }
 
+/// Read-only Native Messaging ownership snapshot for `doctor`.
+pub fn doctor_status() -> Result<serde_json::Value, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(serde_json::json!({
+            "ok": false,
+            "implementation": "unsupported",
+            "detail": "native host install currently requires macOS",
+        }))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
+        Ok(status(&paths))
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl InstallPaths {
     fn discover(command: &NativeHostCommand) -> Result<Self, String> {
