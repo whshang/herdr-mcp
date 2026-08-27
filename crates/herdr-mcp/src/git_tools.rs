@@ -232,6 +232,7 @@ struct DiffCompact {
 fn compact_git_diff(stdout: &str) -> Option<DiffCompact> {
     let mut files = Vec::<DiffFile>::new();
     let mut current: Option<DiffFile> = None;
+    let mut in_hunk = false;
     for line in stdout.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             if let Some(file) = current.take() {
@@ -244,6 +245,7 @@ fn compact_git_diff(stdout: &str) -> Option<DiffCompact> {
                 deletions: 0,
                 binary: false,
             });
+            in_hunk = false;
             continue;
         }
         let Some(file) = current.as_mut() else {
@@ -251,18 +253,20 @@ fn compact_git_diff(stdout: &str) -> Option<DiffCompact> {
         };
         if line.starts_with("@@ ") {
             file.hunks += 1;
+            in_hunk = true;
             continue;
         }
-        if let Some(path) = line.strip_prefix("+++ ") {
-            let path = path.split('\t').next().unwrap_or(path).trim();
-            if path != "/dev/null" {
-                let path = path.strip_prefix("b/").unwrap_or(path);
-                file.path = path.trim_matches('"').replace('\\', "/");
+        if !in_hunk {
+            if let Some(path) = line.strip_prefix("+++ ") {
+                let path = path.split('\t').next().unwrap_or(path).trim();
+                if path != "/dev/null" {
+                    file.path = strip_diff_prefix(&decode_git_path(path));
+                }
+                continue;
             }
-            continue;
-        }
-        if line.starts_with("--- ") {
-            continue;
+            if line.starts_with("--- ") {
+                continue;
+            }
         }
         if line.starts_with("Binary files ") {
             file.binary = true;
@@ -327,14 +331,54 @@ fn compact_git_diff(stdout: &str) -> Option<DiffCompact> {
 }
 
 fn parse_diff_git_b_path(rest: &str) -> String {
-    let raw = if let Some(idx) = rest.rfind(" b/") {
-        &rest[idx + 3..]
-    } else if let Some(idx) = rest.rfind(" \"b/") {
-        &rest[idx + 4..]
+    let token = if let Some(idx) = rest.rfind(" \"b/") {
+        rest[idx + 1..].trim()
+    } else if let Some(idx) = rest.rfind(" b/") {
+        rest[idx + 1..].trim()
     } else {
-        rest
+        rest.trim()
     };
-    raw.trim().trim_matches('"').replace('\\', "/")
+    strip_diff_prefix(&decode_git_path(token))
+}
+
+fn decode_git_path(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        unescape_c_quoted(&raw[1..raw.len() - 1])
+    } else {
+        raw.to_owned()
+    }
+}
+
+fn unescape_c_quoted(input: &str) -> String {
+    let mut output = String::new();
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => output.push('\n'),
+            Some('t') => output.push('\t'),
+            Some('r') => output.push('\r'),
+            Some('"') => output.push('"'),
+            Some('\\') => output.push('\\'),
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+    output
+}
+
+fn strip_diff_prefix(path: &str) -> String {
+    path.strip_prefix("b/")
+        .or_else(|| path.strip_prefix("a/"))
+        .unwrap_or(path)
+        .to_owned()
 }
 
 struct LogCompact {
@@ -382,15 +426,29 @@ fn parse_oneline_log(line: &str) -> Option<(String, String)> {
     if sha.len() < 4 || !sha.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return None;
     }
-    let subject = if rest.starts_with('(') {
-        match rest.find(')') {
-            Some(end) => rest[end + 1..].trim().to_owned(),
-            None => rest.to_owned(),
-        }
+    let subject = if let Some(inner) = decoration_inner(rest) {
+        rest[inner.len() + 2..].trim().to_owned()
     } else {
         rest.to_owned()
     };
     Some((sha.to_owned(), subject))
+}
+
+fn decoration_inner(rest: &str) -> Option<&str> {
+    let rest = rest.strip_prefix('(')?;
+    let end = rest.find(')')?;
+    let inner = &rest[..end];
+    if inner.contains("HEAD")
+        || inner.contains(" -> ")
+        || inner.contains("tag:")
+        || inner.contains("refs/")
+        || inner.contains(", ")
+        || inner.starts_with("origin/")
+    {
+        Some(inner)
+    } else {
+        None
+    }
 }
 
 pub fn file_dirty(root: &Path, file: &Path) -> Result<bool, String> {
@@ -972,18 +1030,60 @@ index 3333333..4444444 100644
     }
 
     #[test]
+    fn compact_git_diff_counts_hunk_lines_that_look_like_headers() {
+        let diff = "\
+diff --git a/sample.txt b/sample.txt
+index 1111111..2222222 100644
+--- a/sample.txt
++++ b/sample.txt
+@@ -1,2 +1,2 @@
+ context
+--- removed
++++ generated
+";
+        let compact = compact_git_diff(diff).unwrap();
+        assert_eq!(compact.counts["insertions"], 1);
+        assert_eq!(compact.counts["deletions"], 1);
+        assert_eq!(compact.counts["hunks"], 1);
+        assert!(compact.grouped.contains("sample.txt"));
+        assert!(compact.grouped.contains("+1/-1"));
+    }
+
+    #[test]
+    fn compact_git_diff_decodes_c_quoted_paths() {
+        let diff = r#"diff --git "a/src/a\tb.txt" "b/src/a\tb.txt"
+index 1111111..2222222 100644
+--- "a/src/a\tb.txt"
++++ "b/src/a\tb.txt"
+@@ -1 +1 @@
+-old
++new
+"#;
+        let compact = compact_git_diff(diff).unwrap();
+        assert_eq!(compact.files, 1);
+        assert!(compact.grouped.contains("src (1)"));
+        assert!(compact.grouped.contains("a\tb.txt"));
+        assert!(!compact.grouped.contains("a/tb.txt"));
+        assert!(!compact.grouped.contains("b/src"));
+    }
+
+    #[test]
     fn compact_git_log_strips_decorations() {
         let log = "\
 abc1234 (HEAD -> main, origin/main) Fix the thing
 def5678 (tag: v1.0.0) Release
-aaa1111 no decorations here
+aaa1111 (api) preserve this prefix
 ";
         let compact = compact_git_log(log).unwrap();
         assert_eq!(compact.commits, 3);
         assert_eq!(compact.counts["commits"], 3);
         assert!(compact.grouped.contains("abc1234 Fix the thing"));
         assert!(compact.grouped.contains("def5678 Release"));
-        assert!(compact.grouped.contains("aaa1111 no decorations here"));
+        assert!(
+            compact
+                .grouped
+                .contains("aaa1111 (api) preserve this prefix")
+        );
         assert!(!compact.grouped.contains("HEAD"));
         assert!(!compact.grouped.contains("tag:"));
     }
@@ -1153,7 +1253,8 @@ aaa1111 no decorations here
     fn git_log_compacts_when_many_commits() {
         let root = unique_temp_dir("git-log-large");
         git_init(&root);
-        for index in 0..50 {
+        git_commit(&root, "(api) preserve this prefix");
+        for index in 0..49 {
             git_commit(&root, &format!("commit-{index}"));
         }
         let result = run(
@@ -1165,7 +1266,8 @@ aaa1111 no decorations here
         assert_eq!(result["counts"]["commits"], 50);
         let output = result["output"].as_str().unwrap();
         assert!(output.contains("commit-0"));
-        assert!(output.contains("commit-49"));
+        assert!(output.contains("commit-48"));
+        assert!(output.contains("(api) preserve this prefix"));
         assert!(!output.contains("(HEAD"));
         let first = output.lines().next().unwrap();
         let sha = first.split_whitespace().next().unwrap();
