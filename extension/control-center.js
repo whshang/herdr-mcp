@@ -145,10 +145,13 @@ function renderWorkspaceTree(state) {
         const agent = document.createElement("span");
         agent.className = "pane-agent";
         agent.textContent = pane.agent?.name || pane.agent?.kind || "terminal";
+        const focus = document.createElement("span");
+        focus.className = "focus-badge";
+        focus.textContent = pane.focused ? "focused" : "";
         const status = document.createElement("span");
         status.className = "status";
         status.textContent = pane.status;
-        first.append(dot, paneId, agent, status);
+        first.append(dot, paneId, agent, focus, status);
 
         const meta = document.createElement("div");
         meta.className = "pane-meta";
@@ -216,12 +219,15 @@ const coalescer = createRenderCoalescer(renderAll, {
 store.subscribe(() => coalescer.schedule());
 
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) coalescer.flush();
+  if (!document.hidden) {
+    if (!controlPort) connectControlPort(true);
+    coalescer.flush();
+  }
 });
 
-async function refreshSnapshot() {
+async function refreshSnapshot(force = false) {
   runtimeText.textContent = "Runtime connecting…";
-  const response = await bg({ type: "herdr_control_center_subscribe" });
+  const response = await bg({ type: "herdr_control_center_subscribe", force });
   if (!response?.ok || !response.state) {
     runtimeHealthy = false;
     result.textContent = response?.error || `Runtime request failed${response?.status ? ` (${response.status})` : ""}`;
@@ -235,7 +241,7 @@ async function refreshSnapshot() {
   return true;
 }
 
-chrome.runtime.onMessage.addListener((message) => {
+function handleControlMessage(message) {
   if (message?.type === "herdr_control_state" && message.state) {
     runtimeHealthy = true;
     hasSnapshot = true;
@@ -250,7 +256,29 @@ chrome.runtime.onMessage.addListener((message) => {
     else if (!hasSnapshot) runtimeHealthy = false;
     coalescer.schedule();
   }
-});
+}
+
+let controlPort = null;
+function connectControlPort(reconcile = false) {
+  if (controlPort) return;
+  try {
+    const port = chrome.runtime.connect({ name: "herdr-control-center" });
+    controlPort = port;
+    port.onMessage.addListener(handleControlMessage);
+    port.onDisconnect.addListener(() => {
+      if (controlPort !== port) return;
+      controlPort = null;
+      eventStreamHealthy = false;
+      coalescer.schedule();
+      setTimeout(() => {
+        if (!document.hidden) connectControlPort(true);
+      }, 250);
+    });
+    if (reconcile) void refreshSnapshot(true);
+  } catch (_) {
+    controlPort = null;
+  }
+}
 
 workspaceList.addEventListener("click", async (event) => {
   const toggle = event.target.closest?.("[data-workspace-toggle]");
@@ -271,7 +299,7 @@ workspaceList.addEventListener("click", async (event) => {
   renderAll();
 });
 
-$("refreshButton").addEventListener("click", () => { void refreshSnapshot(); });
+$("refreshButton").addEventListener("click", () => { void refreshSnapshot(true); });
 $("collapseButton").addEventListener("click", () => {
   expandedWorkspaces.clear();
   expansionSeeded = true;
@@ -323,6 +351,7 @@ sendButton.addEventListener("click", () => {
 async function start() {
   const stored = await chrome.storage.local.get(TARGET_KEY);
   pinnedTarget = stored[TARGET_KEY] || null;
+  connectControlPort(false);
   renderAll();
   await refreshSnapshot();
 }

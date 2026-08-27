@@ -55,6 +55,7 @@ button.ghost { background: transparent; }
 .pane-line { display: flex; gap: 7px; align-items: center; min-width: 0; }
 .pane-id { font-weight: 600; white-space: nowrap; }
 .pane-agent { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.focus-badge { color: var(--accent); font-size: 10px; font-weight: 700; white-space: nowrap; }
 .status { margin-left: auto; color: var(--muted); white-space: nowrap; }
 .pane-meta, .pane-summary { margin-top: 3px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pane-summary { color: #b9c5d1; }

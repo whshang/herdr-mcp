@@ -46,7 +46,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 
 // ---- chrome mock ----
 const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.64" };
-const listeners = { onMessage: [], onStartup: [], onInstalled: [], onActivated: [] };
+const listeners = { onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
 let nextTabId = 500;
@@ -192,6 +192,7 @@ globalThis.chrome = {
     getURL: (rel) => `chrome-extension://test-ext/${rel}`,
     lastError: null,
     onMessage: { addListener: (fn) => listeners.onMessage.push(fn) },
+    onConnect: { addListener: (fn) => listeners.onConnect.push(fn) },
     onStartup: { addListener: (fn) => listeners.onStartup.push(fn) },
     onInstalled: { addListener: (fn) => listeners.onInstalled.push(fn) },
     openOptionsPage: () => {},

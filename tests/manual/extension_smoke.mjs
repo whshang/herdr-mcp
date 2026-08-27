@@ -60,6 +60,7 @@ ok(manifest.permissions?.includes("sidePanel")
 ok(!manifest.key, "unpacked extension keeps its existing Chromium path-derived identity");
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
+const pushSource = readFileSync(path.join(EXT, "..", "src", "push.ts"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(EXT, "content", "injector", "chatgpt.js"), "utf8");
 const queuedInsertCoreSource = readFileSync(path.join(EXT, "queued-insert-core.js"), "utf8");
@@ -548,10 +549,19 @@ ok(popupHtml.includes('id="openControlCenter"')
 ok(backgroundSource.includes('event === "hello"')
     && backgroundSource.includes('type: "herdr_control_state"')
     && backgroundSource.includes('type: "herdr_control_event"')
+    && backgroundSource.includes('"pane_upsert", "pane_removed", "workspace_upsert", "workspace_removed"')
+    && backgroundSource.includes('chrome.runtime.onConnect.addListener')
+    && backgroundSource.includes('controlCenterPorts.size > 0')
+    && backgroundSource.includes('controlCenterLastState')
+    && backgroundSource.includes('msg.force !== true')
+    && pushSource.includes('event: "pane_upsert"')
+    && pushSource.includes('event: "pane_removed"')
     && backgroundSource.includes('msg?.type === "herdr_control_read_tail"')
     && controlCenterSource.includes('type: "herdr_control_center_subscribe"')
+    && controlCenterSource.includes('chrome.runtime.connect({ name: "herdr-control-center" })')
+    && controlCenterSource.includes('refreshSnapshot(true)')
     && !controlCenterSource.includes("setInterval("),
-  "Control Center uses one initial/reconnect snapshot plus incremental events without fixed polling");
+  "Control Center uses a live side-panel port, one initial/reconnect snapshot, and incremental lifecycle events without fixed polling");
 const queueTurnEndedStart = backgroundSource.indexOf('if (msg?.type === "h2w_turn_ended")');
 const queueTurnEndedEnd = queueTurnEndedStart >= 0 ? backgroundSource.indexOf('if (msg?.type === "h2w_handoff_start")', queueTurnEndedStart) : -1;
 const queueTurnEndedBlock = queueTurnEndedStart >= 0 && queueTurnEndedEnd > queueTurnEndedStart

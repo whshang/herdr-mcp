@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-const RESUBSCRIBE: Duration = Duration::from_secs(25);
+const EVENT_STREAM_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
 const FULL_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
 const EVENT_POLL: Duration = Duration::from_millis(250);
@@ -122,8 +122,23 @@ impl CacheState {
         self.needs_reconcile = false;
     }
 
-    fn build_subscriptions(&self) -> Vec<Value> {
-        let mut subscriptions = [
+    fn reconcile_snapshot(&mut self, state: Value, at: String) {
+        let next = if state.is_object() { state } else { json!({}) };
+        let events = snapshot_topology_diff(&self.state, &next);
+        self.bootstrap(next);
+        for event in events {
+            self.apply_event(event, at.clone());
+        }
+        self.needs_reconcile = false;
+    }
+
+    fn build_topology_subscriptions(&self) -> Vec<Value> {
+        // Intentionally omit global `pane.updated`: Herdr replays retained
+        // history on every subscription and this high-frequency event can
+        // keep a reconnect in replay for seconds. Topology/focus/status use
+        // dedicated events; bounded snapshots reconcile the remaining pane
+        // metadata without turning terminal-title churn into cache traffic.
+        [
             "workspace.created",
             "workspace.updated",
             "workspace.metadata_updated",
@@ -142,7 +157,6 @@ impl CacheState {
             "tab.moved",
             "pane.created",
             "pane.closed",
-            "pane.updated",
             "pane.focused",
             "pane.moved",
             "pane.exited",
@@ -150,8 +164,10 @@ impl CacheState {
         ]
         .into_iter()
         .map(|kind| json!({"type": kind}))
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+    }
 
+    fn build_status_subscriptions(&self) -> Vec<Value> {
         let mut pane_ids = array(&self.state, "panes")
             .iter()
             .filter_map(|pane| pane.get("pane_id").and_then(Value::as_str))
@@ -165,13 +181,15 @@ impl CacheState {
         );
         let mut pane_ids = pane_ids.into_iter().collect::<Vec<_>>();
         pane_ids.sort();
-        for pane_id in pane_ids {
-            subscriptions.push(json!({
-                "type": "pane.agent_status_changed",
-                "pane_id": pane_id,
-            }));
-        }
-        subscriptions
+        pane_ids
+            .into_iter()
+            .map(|pane_id| {
+                json!({
+                    "type": "pane.agent_status_changed",
+                    "pane_id": pane_id,
+                })
+            })
+            .collect()
     }
 
     fn apply_event(&mut self, event: Value, at: String) {
@@ -209,9 +227,13 @@ impl CacheState {
             .map(str::to_owned);
         let workspace_closed = kind == "workspace_closed";
 
+        let safe_missing_scope = matches!(
+            kind.as_str(),
+            "workspace_closed" | "pane_closed" | "pane_exited" | "tab_closed" | "worktree_removed"
+        );
         if let Some(workspace_id) = resolved_workspace_id.as_deref()
             && !self.live_workspace_ids.contains(workspace_id)
-            && !workspace_closed
+            && !safe_missing_scope
         {
             self.needs_reconcile = true;
             return;
@@ -487,6 +509,105 @@ impl CacheState {
     }
 }
 
+fn snapshot_topology_diff(before: &Value, after: &Value) -> Vec<Value> {
+    let mut events = Vec::new();
+    let before_workspaces = array(before, "workspaces")
+        .iter()
+        .filter_map(|item| workspace_id(item).map(|id| (id.to_owned(), item)))
+        .collect::<HashMap<_, _>>();
+    let after_workspaces = array(after, "workspaces")
+        .iter()
+        .filter_map(|item| workspace_id(item).map(|id| (id.to_owned(), item)))
+        .collect::<HashMap<_, _>>();
+
+    let mut workspace_ids = after_workspaces.keys().cloned().collect::<Vec<_>>();
+    workspace_ids.sort();
+    for workspace_id in workspace_ids {
+        let current = after_workspaces[&workspace_id];
+        match before_workspaces.get(&workspace_id) {
+            None => events.push(json!({
+                "event": "workspace_created",
+                "workspace_id": workspace_id,
+                "workspace": current,
+            })),
+            Some(previous) if *previous != current => events.push(json!({
+                "event": "workspace_updated",
+                "workspace_id": workspace_id,
+                "workspace": current,
+            })),
+            _ => {}
+        }
+    }
+
+    let before_panes = array(before, "panes")
+        .iter()
+        .filter_map(|item| {
+            item.get("pane_id")
+                .and_then(Value::as_str)
+                .map(|id| (id.to_owned(), item))
+        })
+        .collect::<HashMap<_, _>>();
+    let after_panes = array(after, "panes")
+        .iter()
+        .filter_map(|item| {
+            item.get("pane_id")
+                .and_then(Value::as_str)
+                .map(|id| (id.to_owned(), item))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut pane_ids = after_panes.keys().cloned().collect::<Vec<_>>();
+    pane_ids.sort();
+    for pane_id in pane_ids {
+        let current = after_panes[&pane_id];
+        let workspace_id = current.get("workspace_id").cloned().unwrap_or(Value::Null);
+        match before_panes.get(&pane_id) {
+            None => events.push(json!({
+                "event": "pane_created",
+                "pane_id": pane_id,
+                "workspace_id": workspace_id,
+                "pane": current,
+            })),
+            Some(previous) if *previous != current => events.push(json!({
+                "event": "pane_updated",
+                "pane_id": pane_id,
+                "workspace_id": workspace_id,
+                "pane": current,
+            })),
+            _ => {}
+        }
+    }
+
+    let mut removed_panes = before_panes
+        .keys()
+        .filter(|pane_id| !after_panes.contains_key(*pane_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    removed_panes.sort();
+    for pane_id in removed_panes {
+        let previous = before_panes[&pane_id];
+        events.push(json!({
+            "event": "pane_closed",
+            "pane_id": pane_id,
+            "workspace_id": previous.get("workspace_id").cloned().unwrap_or(Value::Null),
+        }));
+    }
+
+    let mut removed_workspaces = before_workspaces
+        .keys()
+        .filter(|workspace_id| !after_workspaces.contains_key(*workspace_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    removed_workspaces.sort();
+    for workspace_id in removed_workspaces {
+        events.push(json!({
+            "event": "workspace_closed",
+            "workspace_id": workspace_id,
+        }));
+    }
+    events
+}
+
 fn coalesce_digest_updates(events: Vec<Value>) -> Vec<Value> {
     let mut coalesced = Vec::<Value>::with_capacity(events.len());
     for event in events {
@@ -553,6 +674,7 @@ struct SharedCache {
     ready: Mutex<bool>,
     ready_condvar: Condvar,
     stop: AtomicBool,
+    stream_connected: AtomicBool,
     stream_live: AtomicBool,
     last_error: Mutex<Option<String>>,
 }
@@ -570,6 +692,7 @@ impl EventCache {
             ready: Mutex::new(false),
             ready_condvar: Condvar::new(),
             stop: AtomicBool::new(false),
+            stream_connected: AtomicBool::new(false),
             stream_live: AtomicBool::new(false),
             last_error: Mutex::new(None),
         });
@@ -592,6 +715,7 @@ impl EventCache {
                 ready: Mutex::new(true),
                 ready_condvar: Condvar::new(),
                 stop: AtomicBool::new(false),
+                stream_connected: AtomicBool::new(true),
                 stream_live: AtomicBool::new(true),
                 last_error: Mutex::new(None),
             }),
@@ -626,6 +750,17 @@ impl EventCache {
             thread::sleep(Duration::from_millis(10));
         }
         self.shared.stream_live.load(Ordering::Acquire)
+    }
+
+    pub fn wait_stream_connected(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.shared.stream_connected.load(Ordering::Acquire) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.shared.stream_connected.load(Ordering::Acquire)
     }
 
     /// Classify cache health without waiting.
@@ -764,6 +899,7 @@ impl EventCache {
 
     pub fn shutdown(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
+        self.shared.stream_connected.store(false, Ordering::Release);
         self.shared.stream_live.store(false, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -779,6 +915,8 @@ impl Drop for EventCache {
 
 fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
     while !shared.stop.load(Ordering::Acquire) {
+        shared.stream_connected.store(false, Ordering::Release);
+        shared.stream_live.store(false, Ordering::Release);
         match snapshot::fetch(&client) {
             Ok(snapshot) => {
                 if let Ok(mut state) = shared.state.write() {
@@ -799,12 +937,30 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
             }
         }
 
-        let subscriptions = shared
+        let topology_subscriptions = shared
             .state
             .read()
-            .map(|state| state.build_subscriptions())
+            .map(|state| state.build_topology_subscriptions())
             .unwrap_or_default();
-        let mut stream = match EventStream::subscribe(&client, subscriptions, RESUBSCRIBE) {
+        let mut topology_stream =
+            match EventStream::subscribe(&client, topology_subscriptions, EVENT_STREAM_LIFETIME) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    set_last_error(&shared, error.to_string());
+                    sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+                    continue;
+                }
+            };
+        let mut status_subscriptions = shared
+            .state
+            .read()
+            .map(|state| state.build_status_subscriptions())
+            .unwrap_or_default();
+        let mut status_stream = match EventStream::subscribe(
+            &client,
+            status_subscriptions.clone(),
+            EVENT_STREAM_LIFETIME,
+        ) {
             Ok(stream) => stream,
             Err(error) => {
                 set_last_error(&shared, error.to_string());
@@ -812,33 +968,126 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
                 continue;
             }
         };
+        shared.stream_connected.store(true, Ordering::Release);
+        clear_last_error(&shared);
+
+        if let Err(error) = discard_initial_replay(&mut topology_stream, &shared.stop) {
+            shared.stream_connected.store(false, Ordering::Release);
+            set_last_error(&shared, error);
+            sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+            continue;
+        }
+        if let Err(error) = discard_initial_replay(&mut status_stream, &shared.stop) {
+            shared.stream_connected.store(false, Ordering::Release);
+            set_last_error(&shared, error);
+            sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+            continue;
+        }
+        if shared.stop.load(Ordering::Acquire) {
+            shared.stream_connected.store(false, Ordering::Release);
+            return;
+        }
+
+        // `events.subscribe` replays retained history before becoming live.
+        // Reconcile once after that replay fence so stale focus/topology events
+        // never enter the cache or browser digest. Keep this exact stream open:
+        // re-subscribing here would replay the same history again.
+        match snapshot::fetch(&client) {
+            Ok(snapshot) => {
+                if let Ok(mut state) = shared.state.write() {
+                    state.reconcile_snapshot(snapshot.value, now_iso());
+                }
+            }
+            Err(error) => {
+                shared.stream_connected.store(false, Ordering::Release);
+                set_last_error(&shared, error);
+                sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+                continue;
+            }
+        }
+
+        // Topology replay can span several seconds. If the post-fence snapshot
+        // contains a different pane set, refresh only the cheap per-pane status
+        // stream; never replay the global topology stream for this reason.
+        let desired_status_subscriptions = shared
+            .state
+            .read()
+            .map(|state| state.build_status_subscriptions())
+            .unwrap_or_default();
+        if desired_status_subscriptions != status_subscriptions {
+            match replace_status_stream(
+                &client,
+                &shared,
+                desired_status_subscriptions,
+                &mut status_stream,
+                &mut status_subscriptions,
+            ) {
+                Ok(()) => {}
+                Err(error) => {
+                    shared.stream_connected.store(false, Ordering::Release);
+                    set_last_error(&shared, error);
+                    sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+                    continue;
+                }
+            }
+        }
         clear_last_error(&shared);
         shared.stream_live.store(true, Ordering::Release);
-        let full_snapshot_started = Instant::now();
+        let mut full_snapshot_started = Instant::now();
 
         loop {
             if shared.stop.load(Ordering::Acquire) {
+                shared.stream_connected.store(false, Ordering::Release);
                 shared.stream_live.store(false, Ordering::Release);
                 return;
             }
-            if full_snapshot_started.elapsed() >= FULL_SNAPSHOT_TTL || stream.is_expired() {
-                // Planned resubscribe / TTL refresh: drop live flag without recording
-                // a transport failure so the gap classifies as Reconciling.
+            if topology_stream.is_expired() {
                 break;
             }
-            match stream.poll_event(EVENT_POLL) {
-                Ok(Some(event)) => {
-                    if let Ok(mut state) = shared.state.write() {
-                        state.apply_event(event, now_iso());
-                        if state.needs_reconcile {
-                            // Unknown-workspace / admission gate: request a fresh
-                            // snapshot without treating the gap as a hard failure.
-                            break;
+            if full_snapshot_started.elapsed() >= FULL_SNAPSHOT_TTL {
+                match snapshot::fetch(&client) {
+                    Ok(snapshot) => {
+                        if let Ok(mut state) = shared.state.write() {
+                            state.reconcile_snapshot(snapshot.value, now_iso());
                         }
+                    }
+                    Err(error) => {
+                        set_last_error(&shared, error);
+                        break;
+                    }
+                }
+                full_snapshot_started = Instant::now();
+            }
+
+            let desired_status_subscriptions = shared
+                .state
+                .read()
+                .map(|state| state.build_status_subscriptions())
+                .unwrap_or_default();
+            if (status_stream.is_expired() || desired_status_subscriptions != status_subscriptions)
+                && let Err(error) = replace_status_stream(
+                    &client,
+                    &shared,
+                    desired_status_subscriptions,
+                    &mut status_stream,
+                    &mut status_subscriptions,
+                )
+            {
+                // Keep the old status stream and global topology stream alive
+                // on a transient status-subscription failure. A later loop
+                // iteration retries the desired status subscription.
+                set_last_error(&shared, error);
+            }
+
+            match topology_stream.poll_event(EVENT_POLL) {
+                Ok(Some(event)) => {
+                    if let Err(error) = apply_live_event(&client, &shared, event) {
+                        set_last_error(&shared, error);
+                        break;
                     }
                 }
                 Ok(None) => {
-                    if stream.is_expired() {
+                    if topology_stream.is_expired() {
                         break;
                     }
                 }
@@ -847,10 +1096,85 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
                     break;
                 }
             }
+
+            match status_stream.poll_event(EVENT_POLL) {
+                Ok(Some(event)) => {
+                    if let Err(error) = apply_live_event(&client, &shared, event) {
+                        set_last_error(&shared, error);
+                        break;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    set_last_error(&shared, error.to_string());
+                    // Force a status-only replacement on the next iteration.
+                    status_subscriptions.clear();
+                }
+            }
         }
+        shared.stream_connected.store(false, Ordering::Release);
         shared.stream_live.store(false, Ordering::Release);
 
         sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+    }
+}
+
+fn replace_status_stream(
+    client: &HerdrClient,
+    shared: &SharedCache,
+    desired: Vec<Value>,
+    stream: &mut EventStream,
+    subscriptions: &mut Vec<Value>,
+) -> Result<(), String> {
+    let mut next = EventStream::subscribe(client, desired.clone(), EVENT_STREAM_LIFETIME)
+        .map_err(|error| error.to_string())?;
+    discard_initial_replay(&mut next, &shared.stop)?;
+    if shared.stop.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let snapshot = snapshot::fetch(client)?;
+    if let Ok(mut state) = shared.state.write() {
+        state.reconcile_snapshot(snapshot.value, now_iso());
+    }
+    *stream = next;
+    *subscriptions = desired;
+    clear_last_error(shared);
+    Ok(())
+}
+
+fn apply_live_event(
+    client: &HerdrClient,
+    shared: &SharedCache,
+    event: Value,
+) -> Result<(), String> {
+    let needs_reconcile = if let Ok(mut state) = shared.state.write() {
+        state.apply_event(event, now_iso());
+        state.needs_reconcile
+    } else {
+        false
+    };
+    if needs_reconcile {
+        let snapshot = snapshot::fetch(client)?;
+        if let Ok(mut state) = shared.state.write() {
+            state.reconcile_snapshot(snapshot.value, now_iso());
+        }
+    }
+    Ok(())
+}
+
+fn discard_initial_replay(stream: &mut EventStream, stop: &AtomicBool) -> Result<usize, String> {
+    let mut discarded = 0usize;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(discarded);
+        }
+        match stream.poll_event(EVENT_POLL) {
+            Ok(Some(_)) => {
+                discarded = discarded.saturating_add(1);
+            }
+            Ok(None) => return Ok(discarded),
+            Err(error) => return Err(error.to_string()),
+        }
     }
 }
 
@@ -1020,15 +1344,21 @@ mod tests {
     }
 
     #[test]
-    fn subscriptions_include_global_events_and_per_pane_agent_status() {
+    fn topology_and_status_subscriptions_have_separate_ownership() {
         let mut state = CacheState::default();
         state.bootstrap(fixture());
-        let subscriptions = state.build_subscriptions();
-        assert!(subscriptions.contains(&json!({"type": "workspace.updated"})));
-        assert!(subscriptions.contains(&json!({
+        let topology = state.build_topology_subscriptions();
+        let status = state.build_status_subscriptions();
+        assert!(topology.contains(&json!({"type": "workspace.updated"})));
+        assert!(!topology.contains(&json!({"type": "pane.updated"})));
+        assert!(!topology.iter().any(|subscription| {
+            subscription.get("type").and_then(Value::as_str) == Some("pane.agent_status_changed")
+        }));
+        assert!(status.contains(&json!({
             "type": "pane.agent_status_changed",
             "pane_id": "w1:p1"
         })));
+        assert!(!status.contains(&json!({"type": "workspace.updated"})));
     }
 
     #[test]
@@ -1173,6 +1503,77 @@ mod tests {
         assert!(state.needs_reconcile);
         assert_eq!(state.digest_cursor, 0);
         assert_eq!(array(&state.state, "workspaces").len(), 1);
+    }
+
+    #[test]
+    fn snapshot_reconcile_emits_authoritative_workspace_and_pane_diff() {
+        let mut state = CacheState::default();
+        state.bootstrap(fixture());
+        let next = json!({
+            "focused_workspace_id": "w2",
+            "workspaces": [
+                {"workspace_id": "w1", "label": "demo", "pane_count": 1, "tab_count": 1},
+                {"workspace_id": "w2", "label": "second", "pane_count": 1, "tab_count": 1}
+            ],
+            "tabs": [
+                {"tab_id": "w1:t1", "workspace_id": "w1"},
+                {"tab_id": "w2:t1", "workspace_id": "w2"}
+            ],
+            "panes": [
+                {"pane_id": "w1:p2", "workspace_id": "w1", "cwd": "/tmp/demo"},
+                {"pane_id": "w2:p1", "workspace_id": "w2", "cwd": "/tmp/second"}
+            ],
+            "agents": []
+        });
+
+        state.reconcile_snapshot(next, "2026-08-27T13:00:00Z".to_owned());
+
+        assert!(!state.needs_reconcile);
+        let digest = state.digest_since(0);
+        let kinds = digest
+            .events
+            .iter()
+            .filter_map(|event| event.get("type").and_then(Value::as_str))
+            .map(normalize_event_type)
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"workspace_created".to_owned()));
+        assert!(kinds.contains(&"pane_created".to_owned()));
+        assert!(kinds.contains(&"pane_closed".to_owned()));
+        assert!(digest.events.iter().any(|event| {
+            normalize_event_type(event.get("type").and_then(Value::as_str).unwrap_or(""))
+                == "pane_created"
+                && event.get("pane_id").and_then(Value::as_str) == Some("w2:p1")
+        }));
+        assert!(digest.events.iter().any(|event| {
+            normalize_event_type(event.get("type").and_then(Value::as_str).unwrap_or(""))
+                == "pane_closed"
+                && event.get("pane_id").and_then(Value::as_str) == Some("w1:p1")
+        }));
+        assert!(
+            array(&state.state, "panes")
+                .iter()
+                .any(|pane| pane.get("pane_id").and_then(Value::as_str) == Some("w2:p1"))
+        );
+    }
+
+    #[test]
+    fn snapshot_reconcile_can_remove_entire_workspace_without_reconcile_loop() {
+        let mut state = CacheState::default();
+        state.bootstrap(fixture());
+        state.reconcile_snapshot(
+            json!({"workspaces": [], "tabs": [], "panes": [], "agents": []}),
+            "2026-08-27T13:01:00Z".to_owned(),
+        );
+        assert!(!state.needs_reconcile);
+        let digest = state.digest_since(0);
+        assert!(digest.events.iter().any(|event| {
+            normalize_event_type(event.get("type").and_then(Value::as_str).unwrap_or(""))
+                == "pane_closed"
+        }));
+        assert!(digest.events.iter().any(|event| {
+            normalize_event_type(event.get("type").and_then(Value::as_str).unwrap_or(""))
+                == "workspace_closed"
+        }));
     }
 
     #[test]

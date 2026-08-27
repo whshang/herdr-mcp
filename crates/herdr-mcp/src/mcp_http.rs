@@ -230,9 +230,9 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
                 .unwrap_or_else(|| "unknown error".to_owned())
         ));
     }
-    if !cache.wait_stream_live(Duration::from_secs(2)) {
+    if !cache.wait_stream_connected(Duration::from_secs(2)) {
         return Err(format!(
-            "candidate event cache did not establish events.subscribe: {}",
+            "candidate event cache did not connect events.subscribe: {}",
             cache
                 .last_error()
                 .unwrap_or_else(|| "unknown error".to_owned())
@@ -514,10 +514,14 @@ fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Respons
             let mut body = String::new();
 
             for event in &digest.events {
-                let Some(agent) = push_agent_from_event(event, &digest.agents) else {
-                    continue;
-                };
-                append_push_transition(&mut state, &agent, &mut body);
+                if let Some((name, data)) = push_browser_lifecycle_event(event)
+                    && push_filter_matches(&state.filters, &data)
+                {
+                    body.push_str(&sse_event(name, &data));
+                }
+                if let Some(agent) = push_agent_from_event(event, &digest.agents) {
+                    append_push_transition(&mut state, &agent, &mut body);
+                }
             }
 
             // Reconcile against the current cache view after every cursor read.
@@ -548,6 +552,85 @@ fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Respons
         .header("x-accel-buffering", HeaderValue::from_static("no"))
         .body(Body::from_stream(events))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn push_browser_lifecycle_event(event: &Value) -> Option<(&'static str, Value)> {
+    let raw = event.get("type").and_then(Value::as_str)?;
+    let normalized = raw.replace('.', "_");
+    let kind = normalized.strip_suffix("_event").unwrap_or(&normalized);
+    let at = event.get("at").cloned().unwrap_or_else(|| json!(iso_now()));
+
+    match kind {
+        "pane_created"
+        | "pane_updated"
+        | "pane_focused"
+        | "pane_moved"
+        | "pane_agent_detected"
+        | "pane_agent_status_changed" => {
+            let pane_data = event.get("pane")?.clone();
+            let pane_id = event
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .or_else(|| pane_data.get("pane_id").and_then(Value::as_str))?;
+            let workspace = event
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .or_else(|| pane_data.get("workspace_id").and_then(Value::as_str));
+            Some((
+                "pane_upsert",
+                json!({
+                    "pane": pane_id,
+                    "pane_id": pane_id,
+                    "workspace": workspace,
+                    "pane_data": pane_data,
+                    "at": at,
+                }),
+            ))
+        }
+        "pane_closed" | "pane_exited" => {
+            let pane_id = event.get("pane_id").and_then(Value::as_str)?;
+            Some((
+                "pane_removed",
+                json!({
+                    "pane": pane_id,
+                    "pane_id": pane_id,
+                    "workspace": event.get("workspace_id").and_then(Value::as_str),
+                    "at": at,
+                }),
+            ))
+        }
+        "workspace_created"
+        | "workspace_updated"
+        | "workspace_metadata_updated"
+        | "workspace_renamed"
+        | "workspace_moved"
+        | "workspace_reordered" => {
+            let workspace_data = event.get("workspace")?.clone();
+            let workspace_id = event
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .or_else(|| workspace_data.get("workspace_id").and_then(Value::as_str))?;
+            Some((
+                "workspace_upsert",
+                json!({
+                    "workspace": workspace_id,
+                    "workspace_data": workspace_data,
+                    "at": at,
+                }),
+            ))
+        }
+        "workspace_closed" => {
+            let workspace_id = event.get("workspace_id").and_then(Value::as_str)?;
+            Some((
+                "workspace_removed",
+                json!({
+                    "workspace": workspace_id,
+                    "at": at,
+                }),
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn append_push_transition(state: &mut PushStreamState, agent: &Value, body: &mut String) {
@@ -1148,6 +1231,64 @@ mod tests {
             "herdr-mcp-http-{label}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn browser_lifecycle_maps_pane_create_and_remove() {
+        let created = json!({
+            "type": "pane.created",
+            "at": "2026-08-27T10:00:00Z",
+            "workspace_id": "w1",
+            "pane_id": "w1:p2",
+            "pane": {
+                "pane_id": "w1:p2",
+                "workspace_id": "w1",
+                "cwd": "/repo",
+                "agent": null
+            }
+        });
+        let (name, data) = push_browser_lifecycle_event(&created).expect("pane create");
+        assert_eq!(name, "pane_upsert");
+        assert_eq!(data["pane"], "w1:p2");
+        assert_eq!(data["workspace"], "w1");
+        assert_eq!(data["pane_data"]["cwd"], "/repo");
+
+        let removed = json!({
+            "type": "pane.closed",
+            "at": "2026-08-27T10:00:01Z",
+            "workspace_id": "w1",
+            "pane_id": "w1:p2"
+        });
+        let (name, data) = push_browser_lifecycle_event(&removed).expect("pane remove");
+        assert_eq!(name, "pane_removed");
+        assert_eq!(data["pane_id"], "w1:p2");
+        assert_eq!(data["workspace"], "w1");
+    }
+
+    #[test]
+    fn browser_lifecycle_maps_workspace_create_and_remove() {
+        let created = json!({
+            "type": "workspace_created_event",
+            "at": "2026-08-27T10:01:00Z",
+            "workspace_id": "w2",
+            "workspace": {
+                "workspace_id": "w2",
+                "label": "repo-two"
+            }
+        });
+        let (name, data) = push_browser_lifecycle_event(&created).expect("workspace create");
+        assert_eq!(name, "workspace_upsert");
+        assert_eq!(data["workspace"], "w2");
+        assert_eq!(data["workspace_data"]["label"], "repo-two");
+
+        let removed = json!({
+            "type": "workspace.closed",
+            "at": "2026-08-27T10:01:01Z",
+            "workspace_id": "w2"
+        });
+        let (name, data) = push_browser_lifecycle_event(&removed).expect("workspace remove");
+        assert_eq!(name, "workspace_removed");
+        assert_eq!(data["workspace"], "w2");
     }
 
     fn test_state(root: &std::path::Path) -> AppState {

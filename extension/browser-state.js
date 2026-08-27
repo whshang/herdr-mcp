@@ -42,7 +42,10 @@ function normalizeAgent(agent) {
 function normalizePane(pane, agent, workspace) {
   const paneId = paneIdOf(pane);
   const workspaceId = workspaceIdOf(pane) || workspaceIdOf(agent) || workspaceIdOf(workspace);
-  const normalizedAgent = normalizeAgent(agent || pane?.agent || null);
+  const embeddedAgent = typeof pane?.agent === "string"
+    ? { name: pane.agent, agent: pane.agent, kind: pane.agent, status: pane.agent_status }
+    : pane?.agent;
+  const normalizedAgent = normalizeAgent(agent || embeddedAgent || null);
   const cwd = stringOrNull(pane?.cwd) || stringOrNull(pane?.foreground_cwd) || stringOrNull(agent?.cwd);
   const roots = Array.isArray(workspace?.roots) ? workspace.roots : [];
   return {
@@ -134,13 +137,22 @@ export function applyBrowserEvent(view = {}, event = {}) {
   }
 
   if ((type === "pane_upsert" || type === "pane_updated" || type === "pane_created") && id) {
-    const raw = event.pane && typeof event.pane === "object" ? event.pane : event;
+    const raw = event.pane_data && typeof event.pane_data === "object"
+      ? event.pane_data
+      : event.pane && typeof event.pane === "object" ? event.pane : event;
     const previous = index >= 0 ? panes[index] : null;
     const workspaceId = workspaceIdOf(raw) || previous?.workspace_id || workspaceIdOf(event);
     const row = (view.workspace_rows || []).find((workspace) => workspaceIdOf(workspace) === workspaceId) || null;
+    const previousAgent = Object.prototype.hasOwnProperty.call(raw, "agent") ? null : previous?.agent || null;
+    if (raw.focused === true) {
+      for (let paneIndex = 0; paneIndex < panes.length; paneIndex += 1) {
+        if (panes[paneIndex].workspace_id !== workspaceId || panes[paneIndex].pane_id === id) continue;
+        panes[paneIndex] = { ...panes[paneIndex], focused: false };
+      }
+    }
     const next = {
       ...(previous || normalizePane({ pane_id: id, workspace_id: workspaceId }, null, row)),
-      ...normalizePane({ ...(previous || {}), ...raw, pane_id: id, workspace_id: workspaceId }, previous?.agent || null, row),
+      ...normalizePane({ ...(previous || {}), ...raw, pane_id: id, workspace_id: workspaceId }, previousAgent, row),
       last_output: previous?.last_output || null,
       current_summary: previous?.current_summary || null,
       last_event_at: event.at || previous?.last_event_at || null,
@@ -195,7 +207,9 @@ export function applyBrowserEvent(view = {}, event = {}) {
     const workspaceId = workspaceIdOf(event);
     const workspaceRows = [...(view.workspace_rows || [])];
     const at = workspaceRows.findIndex((workspace) => workspaceIdOf(workspace) === workspaceId);
-    const row = event.workspace && typeof event.workspace === "object" ? event.workspace : event;
+    const row = event.workspace_data && typeof event.workspace_data === "object"
+      ? event.workspace_data
+      : event.workspace && typeof event.workspace === "object" ? event.workspace : event;
     if (at >= 0) workspaceRows[at] = { ...workspaceRows[at], ...row, id: workspaceId };
     else workspaceRows.push({ ...row, id: workspaceId });
     return rebuildWorkspaceViews({ ...view, workspace_rows: workspaceRows });
