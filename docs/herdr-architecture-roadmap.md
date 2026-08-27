@@ -84,6 +84,7 @@ Herdr Architecture Roadmap
 **Tool Wave Scheduler** 仍仅 skill 层策略，无 runtime 调度器。**Batch B** 仍等 Layer 3 Connector UAT，不是当前片。
 
 下一唯一实现片：**更深 Streaming（同步 exec/grep 路径）**，让长阻塞工具也能先回 progress。
+
 ## 已完成并验收
 
 ### Rust Native Runtime
