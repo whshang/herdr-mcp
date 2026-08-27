@@ -106,6 +106,14 @@ jobs:
           pattern: rust-*
           path: release-assets
           merge-multiple: true
+      - name: Pack browser extension release zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Deterministic extension zip + sha256 sidecar. Uploaded as Release
+          # assets alongside Rust binaries; intentionally NOT listed in
+          # release-manifest.json so the updater schema stays platform binaries only.
+          node scripts/pack-extension.mjs --root "$PWD" --out-dir "$PWD/release-assets"
       - name: Build release manifest
         shell: bash
         run: |

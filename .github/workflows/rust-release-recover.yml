@@ -67,6 +67,8 @@ jobs:
           source_manifest_schema="$(jq -r '.manifest_schema' <<<"$source_resolution")"
           source_target_matrix="$(jq -c '.targets' <<<"$source_resolution")"
           source_target_count="$(jq '.targets | length' <<<"$source_resolution")"
+          # targets + release-manifest.json; optional extension zip + sha256 are
+          # counted after the bundle is downloaded (not part of updater manifest).
           source_release_asset_count="$((source_target_count + 1))"
 
           run_json="$(gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID")"
@@ -114,6 +116,7 @@ jobs:
           path: release-assets
 
       - name: Verify release manifest and file digests
+        id: verify
         env:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
@@ -207,8 +210,34 @@ jobs:
               if asset.get("url") != expected_url:
                   raise SystemExit(f"non-GitHub or mismatched release URL: {name}")
           actual = {p.name for p in root.iterdir() if p.is_file()}
-          if actual != expected:
-              raise SystemExit(f"unexpected release bundle files: {sorted(actual ^ expected)}")
+          # Extension packaging is Release-asset-only (not in release-manifest.json).
+          extension_files = {
+              name for name in actual
+              if name.startswith("herdr-mcp-extension-") and (
+                  name.endswith(".zip") or name.endswith(".zip.sha256")
+              )
+          }
+          unexpected = actual - expected - extension_files
+          if not expected.issubset(actual):
+              raise SystemExit(f"missing required release bundle files: {sorted(expected - actual)}")
+          if unexpected:
+              raise SystemExit(f"unexpected release bundle files: {sorted(unexpected)}")
+          for name in sorted(extension_files):
+              if name.endswith(".zip"):
+                  zip_path = root / name
+                  if zip_path.stat().st_size <= 0:
+                      raise SystemExit(f"empty extension zip: {name}")
+                  sidecar = root / f"{name}.sha256"
+                  if sidecar.name in extension_files:
+                      text = sidecar.read_text().strip()
+                      digest, _, filename = text.partition("  ")
+                      if len(digest) != 64 or filename != name:
+                          raise SystemExit(f"invalid extension sha256 sidecar: {sidecar.name}")
+                      if hashlib.sha256(zip_path.read_bytes()).hexdigest() != digest:
+                          raise SystemExit(f"extension zip sha256 mismatch: {name}")
+          print(f"bundle_ok files={len(actual)} extension_files={len(extension_files)}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"release_asset_count={len(actual)}\n")
           PY
 
       - name: Verify GitHub/Sigstore provenance
@@ -235,7 +264,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
-          EXPECTED_RELEASE_ASSET_COUNT: ${{ steps.source.outputs.source_release_asset_count }}
+          EXPECTED_RELEASE_ASSET_COUNT: ${{ steps.verify.outputs.release_asset_count }}
         shell: bash
         run: |
           set -euo pipefail
