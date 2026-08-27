@@ -124,6 +124,11 @@ start_server() {
 }
 
 stop_server() {
+  if [ "${GITHUB_ACTIONS:-}" != "true" ] \
+      && [ -z "${HERDR_STATE_DIR+x}" ] \
+      && [ -z "${HERDR_SOCKET+x}" ]; then
+    err "local stop requires isolated HERDR_STATE_DIR or HERDR_SOCKET; refusing the default developer Herdr session"
+  fi
   local server_pid=""
   if [ -f "${PID_FILE}" ]; then
     server_pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
