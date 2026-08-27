@@ -32,12 +32,24 @@ Destructive service/update/native-host/Link lifecycle mutations must never use `
 
 ### Link ownership (G5)
 
-Production Link (`dev.herdr-mcp.link-prod`) remains Node until an explicit dual-verified cutover. Do not bootout, rewrite, or retarget live Node Link LaunchAgents as part of ordinary development, install, update, or `link run` work.
+Production Link (`dev.herdr-mcp.link-prod`) and the existing Node canary
+(`dev.herdr-mcp.link`) remain Node until an explicit dual-verified cutover. Do
+not bootout, rewrite, or retarget those live Node Link LaunchAgents as part of
+ordinary development, install, update, `link run`, or candidate soak work.
 
-1. `herdr-mcp link run` is a foreground **candidate** only. It must not install LaunchAgents, mutate `runtime/current`, or change production Link ownership.
-2. Any future candidate or production Link LaunchAgent must execute `~/.config/herdr-mcp/runtime/current/herdr-mcp link run` (or equivalent argv through that symlink). Never point Link launchd at a checkout, worktree, `target/`, or a fixed generation path.
-3. Link install/uninstall/cutover/rollback mutations follow the same independent-Shell rule as service mutations: never from a managed `herdr_exec` session; never via `launchctl submit`.
-4. Before any production Link cutover, dual verification from independent Shells is mandatory. Code must keep health `production_ready=false` until every gate is true and operators explicitly seal.
+1. `herdr-mcp link run` is a foreground **candidate** only. It must not mutate
+   `runtime/current` or change production Link ownership by itself.
+2. `herdr-mcp link install` / `link uninstall` manage **only**
+   `dev.herdr-mcp.link-rust-candidate`, with ProgramArguments =
+   `~/.config/herdr-mcp/runtime/current/herdr-mcp link run`. Never point Link
+   launchd at a checkout, worktree, `target/`, or a fixed generation path. Never
+   unload or replace `dev.herdr-mcp.link` / `dev.herdr-mcp.link-prod`.
+3. Link install/uninstall/cutover/rollback mutations follow the same
+   independent-Shell rule as service mutations: never from a managed
+   `herdr_exec` session; never via `launchctl submit`.
+4. Before any production Link cutover, dual verification from independent Shells
+   is mandatory. Code must keep health `production_ready=false` until every gate
+   is true and operators explicitly seal.
 
 Before a lifecycle mutation, capture live state instead of trusting a handoff or previous message:
 

@@ -129,6 +129,8 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::Link(command) => match command {
             cli::LinkCommand::Status => link::run_link_status(),
             cli::LinkCommand::Run => link::run_link(),
+            cli::LinkCommand::Install => link::run_link_install(),
+            cli::LinkCommand::Uninstall => link::run_link_uninstall(),
         },
     }
 }

@@ -19,6 +19,10 @@ pub enum LinkCommand {
     Status,
     /// Foreground staged Rust Link candidate. Does not cut over production LaunchAgents.
     Run,
+    /// Install candidate LaunchAgent `dev.herdr-mcp.link-rust-candidate` → runtime/current link run.
+    Install,
+    /// Remove only the Rust Link candidate LaunchAgent. Never touches live Node link/link-prod.
+    Uninstall,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -97,11 +101,15 @@ fn parse_link(args: &[String]) -> Result<Command, String> {
     match args {
         [subcommand] if subcommand == "status" => Ok(Command::Link(LinkCommand::Status)),
         [subcommand] if subcommand == "run" => Ok(Command::Link(LinkCommand::Run)),
-        [] => Err("link requires status or run".to_owned()),
+        [subcommand] if subcommand == "install" => Ok(Command::Link(LinkCommand::Install)),
+        [subcommand] if subcommand == "uninstall" => Ok(Command::Link(LinkCommand::Uninstall)),
+        [] => Err("link requires status, run, install, or uninstall".to_owned()),
         [subcommand] => Err(format!(
-            "unknown link command '{subcommand}' (status|run; install/cutover land in a later G5 slice)"
+            "unknown link command '{subcommand}' (status|run|install|uninstall; production cutover lands in a later G5 slice)"
         )),
-        _ => Err("link accepts exactly one subcommand: status or run".to_owned()),
+        _ => Err(
+            "link accepts exactly one subcommand: status, run, install, or uninstall".to_owned(),
+        ),
     }
 }
 
@@ -291,6 +299,8 @@ Advanced / internal:\n\
   herdr-mcp service <install [--adopt-node]|status|start|stop|restart|rollback|uninstall>\n\
   herdr-mcp link status\n\
   herdr-mcp link run\n\
+  herdr-mcp link install\n\
+  herdr-mcp link uninstall\n\
   herdr-mcp native-host <install|status|uninstall|rollback>\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\
   herdr-mcp dev [--dry-run]\n\
@@ -299,7 +309,9 @@ Prefer the top-level install/status/doctor/update/rollback/uninstall commands\n\
 for normal lifecycle. Use service ... only for advanced service control\n\
 (for example service install --adopt-node). link status is read-only G5\n\
 ownership/gates reporting. link run starts a foreground Rust Link candidate\n\
-(Keychain/plist credentials); it does not install or cut over production Link.\n"
+(Keychain/plist credentials). link install/uninstall manage only the candidate\n\
+LaunchAgent dev.herdr-mcp.link-rust-candidate → runtime/current link run; they\n\
+never unload or replace live Node link/link-prod.\n"
 }
 
 #[cfg(test)]
@@ -394,6 +406,14 @@ mod tests {
             Command::Link(LinkCommand::Run)
         );
         assert_eq!(
+            parse(args(&["link", "install"])).unwrap(),
+            Command::Link(LinkCommand::Install)
+        );
+        assert_eq!(
+            parse(args(&["link", "uninstall"])).unwrap(),
+            Command::Link(LinkCommand::Uninstall)
+        );
+        assert_eq!(
             parse(args(&["native-host", "status"])).unwrap(),
             Command::NativeHost(NativeHostCommand::Status)
         );
@@ -436,7 +456,7 @@ mod tests {
         assert!(parse(args(&["native-host"])).is_err());
         assert!(parse(args(&["native-host", "legacy"])).is_err());
         assert!(parse(args(&["link"])).is_err());
-        assert!(parse(args(&["link", "install"])).is_err());
+        assert!(parse(args(&["link", "cutover"])).is_err());
         assert!(parse(args(&["link", "status", "extra"])).is_err());
         assert!(parse(args(&["extension-host", "https://example.com/"])).is_err());
         assert!(parse(args(&["status", "extra"])).is_err());
@@ -463,6 +483,9 @@ mod tests {
         assert!(text.contains("Advanced / internal:"));
         assert!(text.contains("herdr-mcp link status"));
         assert!(text.contains("herdr-mcp link run"));
+        assert!(text.contains("herdr-mcp link install"));
+        assert!(text.contains("herdr-mcp link uninstall"));
+        assert!(text.contains("dev.herdr-mcp.link-rust-candidate"));
         let install = text.find("herdr-mcp install").expect("install");
         let service = text.find("herdr-mcp service").expect("service");
         assert!(
