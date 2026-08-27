@@ -40,7 +40,7 @@ import {
   type RelayErrorCode,
   type RelayErrorResult,
 } from "./errors.js";
-import { makeLimits, HEARTBEAT_PERSIST_THROTTLE_MS } from "./limits.js";
+import { classifyOp, makeLimits, HEARTBEAT_PERSIST_THROTTLE_MS } from "./limits.js";
 import { checkArgsBudget, parseJsonFrame, readBodyBounded } from "./payload.js";
 import {
   PendingRequestRegistry,
@@ -109,6 +109,17 @@ interface LinkAttachment {
   bootId?: string;
 }
 
+interface EphemeralReadRequest {
+  requestId: string;
+  workstationId: string;
+  op: string;
+  state: "queued" | "sent";
+  createdAtMs: number;
+  sentAtMs?: number;
+  deadlineMs: number;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
 export class WorkstationDO {
   private readonly state: DurableObjectState;
   private readonly env: Env;
@@ -119,6 +130,8 @@ export class WorkstationDO {
   private initialized = false;
   private initPromise: Promise<void> | undefined;
   private lastSeenPersistedAtMs = 0;
+  /** Known-safe reads are correlated only in memory and never enter DO storage. */
+  private readonly ephemeralReads = new Map<string, EphemeralReadRequest>();
   /** In-memory resolver cache only; storage remains authoritative. */
   private readonly resolvers = new Map<string, (completion: Completion) => void>();
 
@@ -148,27 +161,11 @@ export class WorkstationDO {
       const idem = await this.loadIdem();
       this.registry.restore({ pending, completed });
       this.registry.restoreIdem(idem);
-      // Storage is authoritative across hibernation/deploy restarts, but the
-      // old in-memory deadline timers/resolvers are gone. Reconcile persisted
-      // requests before serving any new forward call so expired historical
-      // entries cannot permanently consume the bounded pending capacity.
-      // This is settlement only: never replay/re-send the original operation
-      // (especially a mutation) during cold-start recovery.
-      const now = Date.now();
-      for (const entry of this.registry.expired(now)) {
-        const err = timeoutResult({
-          requestId: entry.requestId,
-          workstationId: entry.workstationId,
-          atMs: now,
-          opClass: entry.opClass,
-        });
-        await this.persistSettlement(entry.requestId, { status: "error", error: err, servedAtMs: now });
-      }
+      // Initialization is deliberately read-only. A storage write quota must
+      // never make inspect/fs-read/etc unavailable before business logic runs.
+      // Durable mutation reconciliation is performed lazily before the next
+      // mutation is admitted; known reads are never restored at all.
       this.initialized = true;
-      // Re-establish the Durable Object alarm from restored storage. Future
-      // pending deadlines (and completion TTL expiry) must survive hibernation
-      // without relying on process-local setTimeout callbacks.
-      await this.armAlarm();
     });
     return this.initPromise;
   }
@@ -178,7 +175,15 @@ export class WorkstationDO {
     const out: PendingRequest[] = [];
     for (const value of map.values()) {
       const decoded = decodeStoredPendingRequest(value);
-      if (decoded) out.push(decoded);
+      if (!decoded) continue;
+      // Pre-fix releases persisted safe reads. Never rehydrate or resume them:
+      // after a restart their caller no longer has an in-memory waiter and a
+      // read is safe to retry. Leave historical rows untouched for now rather
+      // than spending scarce write quota cleaning them up.
+      const opClass = classifyOp(decoded.op);
+      if (opClass === "read") continue;
+      decoded.opClass = opClass;
+      out.push(decoded);
     }
     return out;
   }
@@ -243,7 +248,7 @@ export class WorkstationDO {
     const payload = sessionSummary(this.session, {
       now,
       linkStaleAfterMs: this.limits.linkStaleAfterMs,
-      activeRequests: this.registry.activeCount(),
+      activeRequests: this.registry.activeCount() + this.ephemeralReads.size,
       edgeVersion: this.env.EDGE_VERSION ?? "0.1.0-dev",
     });
     return this.json({ ...payload, online });
@@ -302,11 +307,43 @@ export class WorkstationDO {
     }
 
     const deadlineMs = now + (wire.timeout_ms ?? this.limits.requestTimeoutMs);
+    const opClass = classifyOp(req.op);
+
+    // Known reads are safe to retry after ambiguity. Keep their request
+    // lifecycle process-local so read-heavy traffic consumes zero Durable
+    // Storage rows and zero Durable Object alarm writes.
+    if (opClass === "read") {
+      return this.forwardEphemeralRead({ requestId, workstationId, op: req.op, deadlineMs, wire, now });
+    }
+
+    // Reconcile any durable mutation left past deadline by a previous isolate
+    // before admitting a new mutation. If storage is over quota this fails
+    // before the new mutation is sent, preserving fail-closed semantics.
+    for (const expired of this.registry.expired(now)) {
+      const err = timeoutResult({
+        requestId: expired.requestId,
+        workstationId: expired.workstationId,
+        atMs: now,
+        opClass: expired.opClass,
+      });
+      await this.persistSettlement(expired.requestId, { status: "error", error: err, servedAtMs: now });
+    }
+
+    // Preserve the original global in-flight bound when ephemeral reads are
+    // present. With no reads, registry.add keeps its existing queued-eviction
+    // behavior at the durable capacity limit.
+    if (
+      this.ephemeralReads.size > 0 &&
+      this.registry.activeCount() + this.ephemeralReads.size >= this.limits.maxPendingRequests
+    ) {
+      return this.json({ status: "error", error: capacityResult({ requestId, workstationId, atMs: now }) }, 429);
+    }
+
     const add = this.registry.add({
       requestId,
       workstationId,
       op: req.op,
-      opClass: req.opClass ?? "mutating",
+      opClass,
       argsSummary: { argKeys: Object.keys((req.args ?? {}) as Record<string, unknown>).slice(0, 32) },
       deadlineMs,
       idempotencyKey: req.idempotencyKey,
@@ -333,36 +370,35 @@ export class WorkstationDO {
       });
     }
     const entry = add.entry;
-    await this.state.storage.put(PREFIX_PENDING + entry.requestId, entry);
-
-    // Interleave guard: the storage.put above yielded, so a concurrent invoke may
-    // have evicted this request from the capacity-bound pending map (oldest-queued
-    // eviction). If so, this handler must NOT send to the link — the request is
-    // already settled with a recorded completion. Re-confirm we still own the
-    // active entry before any send.
-    const stillOwned = this.registry.get(entry.requestId) === entry;
-    if (!stillOwned) {
-      const evictedCompletion = this.registry.completedFor(entry.requestId);
-      if (evictedCompletion) {
-        return this.json({ status: "ok", completion: evictedCompletion });
-      }
-      // Evicted but not yet settled (rare): fail closed rather than send.
-      return this.json(
-        { status: "error", error: reconnectingResult({ requestId: entry.requestId, workstationId, atMs: now }) },
-        503,
-      );
-    }
 
     const encoded = encodeWire(wire, this.limits.maxFrameBytes);
     if (!encoded.ok) {
-      await this.persistSettlement(entry.requestId, {
-        status: "error",
-        error: errorResult("payload_too_large", { requestId: entry.requestId, workstationId, atMs: now }),
-        servedAtMs: now,
-      });
+      this.registry.removeActive(entry.requestId);
       return this.json(
         { status: "error", error: errorResult("payload_too_large", { requestId: entry.requestId, workstationId, atMs: now }) },
         413,
+      );
+    }
+
+    // Pre-send durability fence: persist the request conservatively as "sent"
+    // and arm its deadline before any Link delivery is attempted. If Durable
+    // Storage is at quota, the mutation fails closed here and is never sent.
+    // This also removes the former second pending-row write after socket send.
+    this.registry.markSent(entry.requestId, now);
+    await this.state.storage.put(PREFIX_PENDING + entry.requestId, entry);
+    await this.armAlarm();
+
+    // Storage/alarm awaits may yield. Re-confirm the durable request is still
+    // active before sending; if another event already settled it, do not send.
+    const stillOwned = this.registry.get(entry.requestId) === entry;
+    if (!stillOwned) {
+      const settledCompletion = this.registry.completedFor(entry.requestId);
+      if (settledCompletion) {
+        return this.json({ status: "ok", completion: settledCompletion });
+      }
+      return this.json(
+        { status: "error", error: reconnectingResult({ requestId: entry.requestId, workstationId, atMs: now }) },
+        503,
       );
     }
 
@@ -371,12 +407,88 @@ export class WorkstationDO {
       await this.handleLinkGone("ws.send.race", { requestId: entry.requestId });
       return this.json({ status: "error", error: offlineResult({ requestId: entry.requestId, workstationId, atMs: now }) }, 503);
     }
-    this.registry.markSent(entry.requestId, now);
-    await this.state.storage.put(PREFIX_PENDING + entry.requestId, entry);
-
-    await this.armAlarm();
     const completion = await this.awaitCompletion(entry.requestId, deadlineMs);
     return this.json({ status: "ok", completion });
+  }
+
+  private async forwardEphemeralRead(opts: {
+    requestId: string;
+    workstationId: string;
+    op: string;
+    deadlineMs: number;
+    wire: ToolRequestMessage;
+    now: number;
+  }): Promise<Response> {
+    const { requestId, workstationId, op, deadlineMs, wire, now } = opts;
+    // Preserve one coherent live-request capacity bound, but exclude expired
+    // durable rows so historical mutation backlog cannot starve fresh reads.
+    if (this.registry.liveCount(now) + this.ephemeralReads.size >= this.limits.maxPendingRequests) {
+      return this.json({ status: "error", error: capacityResult({ requestId, workstationId, atMs: now }) }, 429);
+    }
+    if (this.ephemeralReads.has(requestId) || this.registry.get(requestId)) {
+      return this.json(
+        { status: "error", error: errorResult("bad_request", { requestId, workstationId, atMs: now }) },
+        400,
+      );
+    }
+
+    const entry: EphemeralReadRequest = {
+      requestId,
+      workstationId,
+      op,
+      state: "queued",
+      createdAtMs: now,
+      deadlineMs,
+    };
+    this.ephemeralReads.set(requestId, entry);
+
+    const encoded = encodeWire(wire, this.limits.maxFrameBytes);
+    if (!encoded.ok) {
+      this.ephemeralReads.delete(requestId);
+      return this.json(
+        { status: "error", error: errorResult("payload_too_large", { requestId, workstationId, atMs: now }) },
+        413,
+      );
+    }
+
+    if (!this.sendToActiveLink(wire)) {
+      this.ephemeralReads.delete(requestId);
+      await this.handleLinkGone("ws.send.race", { requestId });
+      return this.json({ status: "error", error: offlineResult({ requestId, workstationId, atMs: now }) }, 503);
+    }
+    entry.state = "sent";
+    entry.sentAtMs = now;
+    const completion = await this.awaitEphemeralRead(requestId, deadlineMs);
+    return this.json({ status: "ok", completion });
+  }
+
+  private awaitEphemeralRead(requestId: string, deadlineMs: number): Promise<Completion> {
+    return new Promise<Completion>((resolve) => {
+      this.resolvers.set(requestId, resolve);
+      const entry = this.ephemeralReads.get(requestId);
+      const remaining = deadlineMs - Date.now();
+      if (remaining <= 0) {
+        void this.settleAsTimeout(requestId);
+        return;
+      }
+      const timer = setTimeout(() => {
+        if (this.ephemeralReads.has(requestId)) void this.settleAsTimeout(requestId);
+      }, remaining);
+      if (entry) entry.timer = timer;
+    });
+  }
+
+  private settleEphemeralRead(requestId: string, completion: Completion): EphemeralReadRequest | undefined {
+    const entry = this.ephemeralReads.get(requestId);
+    if (!entry) return undefined;
+    this.ephemeralReads.delete(requestId);
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
+    const resolve = this.resolvers.get(requestId);
+    if (resolve) {
+      this.resolvers.delete(requestId);
+      resolve(completion);
+    }
+    return entry;
   }
 
   /** Wait for a settled completion or timeout classification. */
@@ -397,6 +509,29 @@ export class WorkstationDO {
   }
 
   private async settleAsTimeout(requestId: string): Promise<void> {
+    const read = this.ephemeralReads.get(requestId);
+    if (read) {
+      const now = Date.now();
+      const err = timeoutResult({
+        requestId,
+        workstationId: read.workstationId,
+        atMs: now,
+        opClass: "read",
+      });
+      const wasSent = read.state === "sent";
+      this.settleEphemeralRead(requestId, { status: "error", error: err, servedAtMs: now });
+      if (wasSent) {
+        const cancel: CancelMessage = {
+          protocol_version: RELAY_PROTOCOL_VERSION,
+          kind: "cancel",
+          workstation_id: read.workstationId,
+          request_id: read.requestId,
+          reason: "deadline exceeded",
+        };
+        this.sendToActiveLink(cancel);
+      }
+      return;
+    }
     const entry = this.registry.get(requestId);
     if (!entry || entry.state === "settled") return;
     const wasSent = entry.state === "sent";
@@ -425,6 +560,17 @@ export class WorkstationDO {
   }
 
   private async persistSettlement(requestId: string, completion: Completion): Promise<void> {
+    const candidate = this.registry.get(requestId);
+    if (candidate && classifyOp(candidate.op) === "read") {
+      this.logger.warn("pending.read_rejected_from_durable_settlement", { requestId, op: candidate.op });
+      this.registry.removeActive(requestId);
+      const resolve = this.resolvers.get(requestId);
+      if (resolve) {
+        this.resolvers.delete(requestId);
+        resolve(completion);
+      }
+      return;
+    }
     const entry = this.registry.settle(requestId, completion);
     if (!entry) return;
     await this.state.storage.delete(PREFIX_PENDING + requestId);
@@ -456,6 +602,15 @@ export class WorkstationDO {
    */
   private async persistEvictedSettlement(entry: PendingRequest, completion: Completion): Promise<void> {
     const requestId = entry.requestId;
+    if (classifyOp(entry.op) === "read") {
+      this.logger.warn("pending.read_rejected_from_durable_eviction", { requestId, op: entry.op });
+      const resolve = this.resolvers.get(requestId);
+      if (resolve) {
+        this.resolvers.delete(requestId);
+        resolve(completion);
+      }
+      return;
+    }
     this.registry.recordSettlement(entry, completion);
     await this.state.storage.delete(PREFIX_PENDING + requestId);
     await this.state.storage.put(PREFIX_COMPLETED + requestId, completion as unknown as string);
@@ -711,6 +866,22 @@ export class WorkstationDO {
 
   private async handleToolResult(msg: ToolResultMessage): Promise<void> {
     const requestId = msg.request_id;
+    const read = this.ephemeralReads.get(requestId);
+    if (read) {
+      const completion: Completion = {
+        status: "ok",
+        result: msg.result ?? null,
+        servedAtMs: msg.served_at_ms,
+        runtimeGeneration: msg.runtime_generation ?? undefined,
+      };
+      this.settleEphemeralRead(requestId, completion);
+      this.logger.info("ws.tool_result.read_settled", {
+        requestId,
+        workstationId: read.workstationId,
+        op: read.op,
+      });
+      return;
+    }
     const entry = this.registry.get(requestId);
     if (!entry) {
       this.logger.warn("ws.tool_result.orphan", { requestId });
@@ -732,6 +903,28 @@ export class WorkstationDO {
 
   private async handleToolError(msg: ToolErrorMessage): Promise<void> {
     const requestId = msg.request_id;
+    const read = this.ephemeralReads.get(requestId);
+    if (read) {
+      const err: RelayErrorResult = {
+        ok: false,
+        code: mapLinkErrorCode(msg.code),
+        retryable: msg.retryable,
+        message: msg.message,
+        details: msg.details,
+        delivery_state: msg.delivery_state,
+        requestId,
+        workstationId: read.workstationId,
+        atMs: msg.served_at_ms ?? Date.now(),
+      };
+      this.settleEphemeralRead(requestId, { status: "error", error: err, servedAtMs: Date.now() });
+      this.logger.info("ws.tool_error.read_settled", {
+        requestId,
+        code: msg.code,
+        retryable: msg.retryable,
+        deliveryState: msg.delivery_state,
+      });
+      return;
+    }
     const entry = this.registry.get(requestId);
     if (!entry || entry.state === "settled") {
       this.logger.warn("ws.tool_error.orphan_or_stale", { requestId });
@@ -792,10 +985,27 @@ export class WorkstationDO {
   /** Unified drop path: mark offline, classify in-flight, resolve caches. */
   private async handleLinkGone(event: string, fields: Record<string, unknown>): Promise<void> {
     const now = Date.now();
-    if (this.session) {
+    if (this.session && this.session.status !== "offline") {
       this.session.status = "offline";
       this.session.disconnectedAtMs = now;
       await this.state.storage.put(KEY_SESSION, serializeSession(this.session));
+    }
+    let ephemeralSettled = 0;
+    for (const read of [...this.ephemeralReads.values()]) {
+      const classification = classifyAmbiguousDelivery(read.state, "read");
+      const err: RelayErrorResult = {
+        ok: false,
+        code: classification.code,
+        retryable: classification.retryable,
+        message: classification.retryable
+          ? "connection lost before a confirmed read result; safe to retry"
+          : "connection lost; delivery outcome unknown",
+        requestId: read.requestId,
+        workstationId: read.workstationId,
+        atMs: now,
+      };
+      this.settleEphemeralRead(read.requestId, { status: "error", error: err, servedAtMs: now });
+      ephemeralSettled += 1;
     }
     const classifications = this.registry.classifyAllOnClose(now);
     for (const [requestId, err] of classifications) {
@@ -804,6 +1014,7 @@ export class WorkstationDO {
     this.logger.warn(event, {
       workstationId: this.session?.workstationId,
       pendingSettled: classifications.size,
+      ephemeralSettled,
       ...fields,
     });
   }

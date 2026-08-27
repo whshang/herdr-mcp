@@ -104,9 +104,12 @@ const READ_OPS: ReadonlySet<string> = new Set([
   "herdr_since",
   "herdr_methods",
   "herdr_skill",
+  "herdr_fs_image",
   "herdr_fs_list",
   "herdr_fs_grep",
   "herdr_fs_read",
+  "herdr_git",
+  "herdr_exec_read",
 ]);
 
 export function classifyOp(op: string): OpClass {
