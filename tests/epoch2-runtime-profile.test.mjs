@@ -79,6 +79,7 @@ test("HERDR_MCP_CONTRACT_PROFILE=epoch2 advertises the exact frozen 18-tool cont
     assert.ok(Array.isArray(tools));
     assert.equal(tools.length, 18);
     assert.equal(tools.some((tool) => tool.name === "herdr_skill"), true);
+    assert.equal(tools.some((tool) => tool.name.startsWith("herdr_mcp.")), false);
     assert.equal(computeContractHash(tools), EPOCH2_HASH);
 
     const initialized = await rpc(base, token, "initialize", "epoch2-init");

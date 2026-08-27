@@ -37,6 +37,7 @@ test("epoch-2 public contract identity is identical across runtime, link, edge a
   assert.equal(expectedEpoch, 2);
   assert.equal(expectedCount, 18);
   assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name === "herdr_skill"), true);
+  assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name.startsWith("herdr_mcp.")), false);
 
   assert.equal(PUBLIC_CONTRACT_EPOCH, expectedEpoch);
   assert.equal(PUBLIC_CONTRACT_HASH, expectedHash);

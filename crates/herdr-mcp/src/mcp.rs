@@ -170,7 +170,13 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     ));
                 }
             };
-            native_tools::call(context.client, method, params)
+            native_tools::call_with_local(
+                context.client,
+                context.skill,
+                &context.cache.snapshot(),
+                method,
+                params,
+            )
         }
         "herdr_fs_read" => fs_tools::read(&context.cache.snapshot(), &arguments),
         "herdr_fs_list" => fs_tools::list(&context.cache.snapshot(), &arguments),
@@ -194,7 +200,9 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         "herdr_exec_kill" => exec_tools::kill(context.exec, &arguments),
         "herdr_exec" => utility_exec::run(context.client, &context.cache.snapshot(), &arguments),
         "herdr_prompt" => prompt::run(context.client, context.prompt, &arguments),
-        "herdr_skill" => context.skill.fetch(&arguments),
+        "herdr_skill" => context
+            .skill
+            .fetch_for_runtime(&arguments, &context.cache.snapshot()),
         pending if contract::tool_names().contains(&pending) => {
             return Ok(tool_result(
                 json!({

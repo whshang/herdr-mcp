@@ -941,6 +941,14 @@ function registerTools(server: McpServer): void {
         return toResult({ ok: false, reason: "readonly_mode", method,
           hint: "HERDR_MCP_READONLY=1 blocks side-effecting methods; read-only methods still pass" });
       }
+      if (method.startsWith("herdr_mcp.")) {
+        return toResult({
+          ok: false,
+          code: "local_method_unavailable",
+          method,
+          message: "herdr_mcp.* local methods are owned by the Rust runtime and are never forwarded to the Herdr socket",
+        });
+      }
       const c = clientGet();
       let given: Record<string, unknown> = {};
       if (typeof params === "string" && params.trim() !== "") {

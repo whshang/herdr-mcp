@@ -1,0 +1,437 @@
+use crate::agent_visibility::AgentVisibility;
+use serde_json::Value;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WorkerCapability {
+    pub agent_id: String,
+    pub kind: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub profile: Option<String>,
+    pub supports_code_edit: Option<bool>,
+    pub supports_shell: Option<bool>,
+    pub supports_vision: Option<bool>,
+    pub reasoning_tier: Option<u8>,
+    pub latency_tier: Option<u8>,
+    pub cost_tier: Option<u8>,
+    pub context_tier: Option<u8>,
+    pub interactive_only: Option<bool>,
+    pub can_run_headless: Option<bool>,
+    pub allowed_for_auto_dispatch: bool,
+    pub current_status: String,
+    pub current_project: Option<String>,
+    pub cwd: Option<String>,
+    pub pane_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub interactive_ready: Option<bool>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CapabilitySnapshot {
+    pub source: String,
+    pub revision: Option<u64>,
+    pub workers: Vec<WorkerCapability>,
+    pub hidden_workers: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub struct TaskProfile {
+    pub deterministic_tool: Option<String>,
+    pub project_root: Option<String>,
+    pub explicit_target: Option<String>,
+    pub requires_code_edit: bool,
+    pub requires_shell: bool,
+    pub requires_vision: bool,
+    pub minimum_reasoning_tier: Option<u8>,
+    pub destructive_production_mutation: bool,
+    pub delegates_other_workers: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum DispatchAction {
+    DirectTool(String),
+    Worker(String),
+    NoDispatch,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DispatchDecision {
+    pub action: DispatchAction,
+    pub reason: String,
+    pub rejected: Vec<String>,
+}
+
+pub fn project_capabilities(snapshot: &Value, visibility: &AgentVisibility) -> CapabilitySnapshot {
+    let agents = snapshot
+        .get("agents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let total_agents = agents.len();
+    let agents = agents
+        .into_iter()
+        .filter(|agent| {
+            visibility.is_visible(
+                agent.get("name").and_then(Value::as_str),
+                agent
+                    .get("agent")
+                    .or_else(|| agent.get("kind"))
+                    .and_then(Value::as_str),
+            )
+        })
+        .collect::<Vec<_>>();
+    let hidden_workers = total_agents.saturating_sub(agents.len());
+    let revision = agents
+        .iter()
+        .filter_map(|agent| agent.get("state_change_seq").and_then(Value::as_u64))
+        .max();
+    let workers = agents
+        .iter()
+        .filter_map(|agent| worker_from_agent(agent, visibility))
+        .collect();
+    CapabilitySnapshot {
+        source: "herdr:event-cache".to_owned(),
+        revision,
+        workers,
+        hidden_workers,
+    }
+}
+
+pub fn decide_dispatch(task: &TaskProfile, snapshot: &CapabilitySnapshot) -> DispatchDecision {
+    if let Some(tool) = &task.deterministic_tool {
+        return DispatchDecision {
+            action: DispatchAction::DirectTool(tool.clone()),
+            reason: "deterministic_native_tool_available".to_owned(),
+            rejected: vec![],
+        };
+    }
+    if task.destructive_production_mutation {
+        return no_dispatch("destructive_production_mutation_not_auto_delegated", vec![]);
+    }
+    if task.delegates_other_workers {
+        return no_dispatch("middle_manager_delegation_forbidden", vec![]);
+    }
+
+    if let Some(explicit) = task.explicit_target.as_deref() {
+        let Some(worker) = snapshot
+            .workers
+            .iter()
+            .find(|worker| matches_target(worker, explicit))
+        else {
+            return no_dispatch("explicit_target_not_found", vec![explicit.to_owned()]);
+        };
+        return match reject_reason(worker, task) {
+            Some(reason) => no_dispatch(
+                "explicit_target_unavailable_or_incompatible",
+                vec![format!("{}:{reason}", worker.agent_id)],
+            ),
+            None => DispatchDecision {
+                action: DispatchAction::Worker(worker.agent_id.clone()),
+                reason: "explicit_user_target_preserved".to_owned(),
+                rejected: vec![],
+            },
+        };
+    }
+
+    let mut rejected = Vec::new();
+    let mut eligible = Vec::new();
+    for worker in &snapshot.workers {
+        if let Some(reason) = reject_reason(worker, task) {
+            rejected.push(format!("{}:{reason}", worker.agent_id));
+        } else {
+            eligible.push(worker);
+        }
+    }
+    eligible.sort_by_key(|worker| {
+        (
+            worker.cost_tier.unwrap_or(u8::MAX),
+            worker.latency_tier.unwrap_or(u8::MAX),
+            worker.agent_id.clone(),
+        )
+    });
+    match eligible.first() {
+        Some(worker) => DispatchDecision {
+            action: DispatchAction::Worker(worker.agent_id.clone()),
+            reason: "compatible_live_worker_selected".to_owned(),
+            rejected,
+        },
+        None => no_dispatch("no_compatible_live_worker", rejected),
+    }
+}
+
+fn worker_from_agent(agent: &Value, visibility: &AgentVisibility) -> Option<WorkerCapability> {
+    let kind = agent
+        .get("agent")
+        .or_else(|| agent.get("kind"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let name = agent.get("name").and_then(Value::as_str).map(str::to_owned);
+    let agent_id = name.clone().or_else(|| kind.clone())?;
+    let status = agent
+        .get("agent_status")
+        .or_else(|| agent.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let cwd = agent.get("cwd").and_then(Value::as_str).map(str::to_owned);
+    Some(WorkerCapability {
+        agent_id,
+        kind: kind.clone(),
+        provider: None,
+        model: None,
+        profile: None,
+        supports_code_edit: None,
+        supports_shell: None,
+        supports_vision: None,
+        reasoning_tier: None,
+        latency_tier: None,
+        cost_tier: None,
+        context_tier: None,
+        interactive_only: None,
+        can_run_headless: None,
+        allowed_for_auto_dispatch: visibility.is_visible(name.as_deref(), kind.as_deref()),
+        current_status: status,
+        current_project: cwd.clone(),
+        cwd,
+        pane_id: agent
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        workspace_id: agent
+            .get("workspace_id")
+            .or_else(|| agent.get("workspace"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        interactive_ready: agent.get("interactive_ready").and_then(Value::as_bool),
+    })
+}
+
+fn matches_target(worker: &WorkerCapability, target: &str) -> bool {
+    worker.agent_id == target
+        || worker.kind.as_deref() == Some(target)
+        || worker.pane_id.as_deref() == Some(target)
+}
+
+fn reject_reason(worker: &WorkerCapability, task: &TaskProfile) -> Option<&'static str> {
+    if !worker.allowed_for_auto_dispatch {
+        return Some("auto_dispatch_not_allowed");
+    }
+    if matches!(
+        worker.current_status.as_str(),
+        "working" | "blocked" | "unknown"
+    ) {
+        return Some("worker_busy_or_blocked");
+    }
+    if let Some(project_root) = task.project_root.as_deref()
+        && worker.current_project.as_deref() != Some(project_root)
+    {
+        return Some("project_mismatch");
+    }
+    if task.requires_code_edit && worker.supports_code_edit != Some(true) {
+        return Some("code_edit_capability_not_verified");
+    }
+    if task.requires_shell && worker.supports_shell != Some(true) {
+        return Some("shell_capability_not_verified");
+    }
+    if task.requires_vision && worker.supports_vision != Some(true) {
+        return Some("vision_capability_not_verified");
+    }
+    if let Some(minimum) = task.minimum_reasoning_tier
+        && worker.reasoning_tier.is_none_or(|actual| actual < minimum)
+    {
+        return Some("reasoning_quality_below_or_unknown");
+    }
+    None
+}
+
+fn no_dispatch(reason: &str, rejected: Vec<String>) -> DispatchDecision {
+    DispatchDecision {
+        action: DispatchAction::NoDispatch,
+        reason: reason.to_owned(),
+        rejected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn worker(id: &str, status: &str) -> WorkerCapability {
+        WorkerCapability {
+            agent_id: id.to_owned(),
+            kind: Some("synthetic".to_owned()),
+            provider: None,
+            model: None,
+            profile: None,
+            supports_code_edit: Some(true),
+            supports_shell: Some(true),
+            supports_vision: Some(false),
+            reasoning_tier: Some(2),
+            latency_tier: Some(2),
+            cost_tier: Some(2),
+            context_tier: None,
+            interactive_only: None,
+            can_run_headless: None,
+            allowed_for_auto_dispatch: true,
+            current_status: status.to_owned(),
+            current_project: Some("/repo".to_owned()),
+            cwd: Some("/repo".to_owned()),
+            pane_id: Some(format!("pane-{id}")),
+            workspace_id: Some("w1".to_owned()),
+            interactive_ready: Some(true),
+        }
+    }
+
+    fn snapshot(workers: Vec<WorkerCapability>) -> CapabilitySnapshot {
+        CapabilitySnapshot {
+            source: "synthetic".to_owned(),
+            revision: Some(1),
+            workers,
+            hidden_workers: 0,
+        }
+    }
+
+    #[test]
+    fn deterministic_task_chooses_direct_tool() {
+        let task = TaskProfile {
+            deterministic_tool: Some("herdr_git".to_owned()),
+            ..TaskProfile::default()
+        };
+        assert_eq!(
+            decide_dispatch(&task, &snapshot(vec![worker("a", "idle")])).action,
+            DispatchAction::DirectTool("herdr_git".to_owned())
+        );
+    }
+
+    #[test]
+    fn suitable_task_selects_compatible_worker() {
+        let task = TaskProfile {
+            project_root: Some("/repo".to_owned()),
+            requires_code_edit: true,
+            ..TaskProfile::default()
+        };
+        assert_eq!(
+            decide_dispatch(&task, &snapshot(vec![worker("a", "idle")])).action,
+            DispatchAction::Worker("a".to_owned())
+        );
+    }
+
+    #[test]
+    fn unknown_optional_traits_still_allow_generic_same_project_reasoning() {
+        let visibility = AgentVisibility::Allow(["pi".to_owned()].into_iter().collect());
+        let live = project_capabilities(
+            &serde_json::json!({
+                "agents": [{
+                    "agent": "pi",
+                    "name": "reviewer",
+                    "agent_status": "idle",
+                    "cwd": "/repo",
+                    "pane_id": "w1:p9",
+                    "workspace_id": "w1",
+                    "state_change_seq": 42
+                }]
+            }),
+            &visibility,
+        );
+        assert_eq!(live.workers[0].supports_code_edit, None);
+        assert_eq!(live.workers[0].model, None);
+
+        let task = TaskProfile {
+            project_root: Some("/repo".to_owned()),
+            ..TaskProfile::default()
+        };
+        let decision = decide_dispatch(&task, &live);
+        assert_eq!(
+            decision.action,
+            DispatchAction::Worker("reviewer".to_owned())
+        );
+    }
+
+    #[test]
+    fn explicit_target_is_preserved_and_never_silently_replaced() {
+        let task = TaskProfile {
+            project_root: Some("/repo".to_owned()),
+            explicit_target: Some("b".to_owned()),
+            ..TaskProfile::default()
+        };
+        let decision = decide_dispatch(
+            &task,
+            &snapshot(vec![worker("a", "idle"), worker("b", "idle")]),
+        );
+        assert_eq!(decision.action, DispatchAction::Worker("b".to_owned()));
+    }
+
+    #[test]
+    fn busy_and_blocked_workers_are_rejected() {
+        let task = TaskProfile {
+            project_root: Some("/repo".to_owned()),
+            ..TaskProfile::default()
+        };
+        let decision = decide_dispatch(
+            &task,
+            &snapshot(vec![worker("a", "working"), worker("b", "blocked")]),
+        );
+        assert_eq!(decision.action, DispatchAction::NoDispatch);
+        assert_eq!(decision.rejected.len(), 2);
+    }
+
+    #[test]
+    fn capability_mismatch_is_rejected() {
+        let task = TaskProfile {
+            project_root: Some("/repo".to_owned()),
+            requires_vision: true,
+            ..TaskProfile::default()
+        };
+        let decision = decide_dispatch(&task, &snapshot(vec![worker("a", "idle")]));
+        assert_eq!(decision.action, DispatchAction::NoDispatch);
+    }
+
+    #[test]
+    fn equivalent_idle_worker_is_used_when_another_worker_is_busy() {
+        let task = TaskProfile {
+            project_root: Some("/repo".to_owned()),
+            requires_code_edit: true,
+            ..TaskProfile::default()
+        };
+        let decision = decide_dispatch(
+            &task,
+            &snapshot(vec![worker("a", "working"), worker("b", "idle")]),
+        );
+        assert_eq!(decision.action, DispatchAction::Worker("b".to_owned()));
+    }
+
+    #[test]
+    fn lower_quality_fallback_is_not_selected() {
+        let mut strong = worker("strong", "working");
+        strong.reasoning_tier = Some(3);
+        let mut weak = worker("weak", "idle");
+        weak.reasoning_tier = Some(1);
+        let task = TaskProfile {
+            project_root: Some("/repo".to_owned()),
+            minimum_reasoning_tier: Some(3),
+            ..TaskProfile::default()
+        };
+        let decision = decide_dispatch(&task, &snapshot(vec![strong, weak]));
+        assert_eq!(decision.action, DispatchAction::NoDispatch);
+    }
+
+    #[test]
+    fn destructive_production_and_middle_manager_tasks_are_not_auto_dispatched() {
+        let production = TaskProfile {
+            destructive_production_mutation: true,
+            ..TaskProfile::default()
+        };
+        assert_eq!(
+            decide_dispatch(&production, &snapshot(vec![worker("a", "idle")])).action,
+            DispatchAction::NoDispatch
+        );
+        let manager = TaskProfile {
+            delegates_other_workers: true,
+            ..TaskProfile::default()
+        };
+        assert_eq!(
+            decide_dispatch(&manager, &snapshot(vec![worker("a", "idle")])).action,
+            DispatchAction::NoDispatch
+        );
+    }
+}

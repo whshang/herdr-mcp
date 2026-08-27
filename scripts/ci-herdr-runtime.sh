@@ -58,6 +58,16 @@ install_herdr() {
 }
 
 start_server() {
+  # GitHub-hosted CI intentionally uses the default state/socket path because
+  # the job starts without a developer Herdr session. Local runs must opt into
+  # an isolated state directory or socket explicitly. Otherwise `stop` would
+  # target the developer's live default session and terminate its pane
+  # processes when the test trap exits.
+  if [ "${GITHUB_ACTIONS:-}" != "true" ] \
+      && [ -z "${HERDR_STATE_DIR+x}" ] \
+      && [ -z "${HERDR_SOCKET+x}" ]; then
+    err "local start requires isolated HERDR_STATE_DIR or HERDR_SOCKET; refusing the default developer Herdr session"
+  fi
   install_herdr
   # Export the install dir for this and all later runner steps (GITHUB_PATH
   # persists for the whole job).
@@ -114,6 +124,11 @@ start_server() {
 }
 
 stop_server() {
+  if [ "${GITHUB_ACTIONS:-}" != "true" ] \
+      && [ -z "${HERDR_STATE_DIR+x}" ] \
+      && [ -z "${HERDR_SOCKET+x}" ]; then
+    err "local stop requires isolated HERDR_STATE_DIR or HERDR_SOCKET; refusing the default developer Herdr session"
+  fi
   local server_pid=""
   if [ -f "${PID_FILE}" ]; then
     server_pid="$(cat "${PID_FILE}" 2>/dev/null || true)"

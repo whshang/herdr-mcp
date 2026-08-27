@@ -1573,6 +1573,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn herdr_call_local_skill_load_round_trips_through_rust_http_without_socket() {
+        let root = test_root("local-skill-load");
+        let app = candidate_router(test_state(&root));
+        let request = rpc_request(
+            Method::POST,
+            "/mcp",
+            Some(json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{
+                    "name":"herdr_call",
+                    "arguments":{
+                        "method":"herdr_mcp.skill.load",
+                        "params":"{\"ids\":[\"files-search\"]}"
+                    }
+                }
+            })),
+            &[("user-agent", "openai-mcp/1.0")],
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = payload["result"]["content"][0]["text"].as_str().unwrap();
+        let local: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(local["ok"], true);
+        assert_eq!(local["count"], 1);
+        assert_eq!(local["skills"][0]["id"], "files-search");
+        assert_eq!(local["skills"][0]["cache_hit"], false);
+        assert_eq!(local["authorization"], "none");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
     async fn mcp_activity_bad_window_and_trusted_ipc_auth_match_push_contract() {
         let root = test_root("mcp-activity-auth");
         let tcp = candidate_router(test_state(&root.join("tcp")));
