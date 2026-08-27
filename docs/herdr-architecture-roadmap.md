@@ -90,7 +90,7 @@ Herdr Architecture Roadmap
 
 **Tool Wave Scheduler** 仍仅 skill 层策略。**Batch B** 仍等 Layer 3 Connector UAT，不是当前片。
 
-下一唯一实现片：**生产装新 generation 验证 Streaming 字段**。
+下一唯一实现片：**G5 Link cutover seal**（`production_ready` 可审计封印 + 故意 rollback UAT）；Streaming First 已合入，不再作为当前主游标。
 
 ## 已完成并验收
 

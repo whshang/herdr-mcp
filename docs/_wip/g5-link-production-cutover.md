@@ -1,29 +1,53 @@
 # G5 Link production cutover (WIP)
 
 Status: alpha in progress. This folder is excluded from the docs site build.
-Live production cutover is **not** performed by this document alone. Independent
-Shell dual verification is mandatory before flipping LaunchAgents.
+Developer-workstation **LaunchAgent cutover for `link-prod` landed 2026-08-27**
+(alpha.13). `production_ready` remains **false** until an auditable seal exists.
+"Dual verification" here means two independent observation passes by the same
+operator session (not a second human).
 
 Related: [#65](https://github.com/whshang/herdr-mcp/pull/65) staged Rust daemon,
-[#50](https://github.com/whshang/herdr-mcp/pull/50) / [#51](https://github.com/whshang/herdr-mcp/pull/51)
-generation + control, [`docs/ga-release-gate.md`](../ga-release-gate.md) G5 (P0 #1).
+[#96](https://github.com/whshang/herdr-mcp/pull/96) cutover execute,
+[#97](https://github.com/whshang/herdr-mcp/pull/97) cutover harden + alpha.13,
+[`docs/ga-release-gate.md`](../ga-release-gate.md) G5.
 
 ## Current ownership (read-only truth)
 
-As of alpha.12 on developer workstations (G3 user CLI sealed to
-`runtime/current`; production Link **LaunchAgent** ownership unchanged — do not
-cut live Node Link):
+As of **alpha.13** on this developer workstation after live `link cutover --execute`
+(2026-08-27T15:18:47Z UTC, independent Shell only):
 
 | Layer | Owner today | Evidence |
 | --- | --- | --- |
-| MCP runtime service `dev.herdr-mcp.server` | Rust generation under `runtime/current` (alpha.12 / `rust-6e3f0b8685b89e66`) | `herdr-mcp service status` / `--version` |
+| MCP runtime service `dev.herdr-mcp.server` | Rust generation under `runtime/current` (**alpha.13** / `rust-5c7799b56a426855`) | `herdr-mcp service status` / `--version` |
 | User CLI `~/.local/bin/herdr-mcp` | Symlink → `runtime/current/herdr-mcp` (G3 sealed) | `ls -l` / `readlink` |
-| Production Link `dev.herdr-mcp.link-prod` | **Node** `node` + checkout `dist/link/macos-daemon.js` | LaunchAgent ProgramArguments unchanged through alpha.12 apply + control migrate |
-| Prod runtime-control / status | **Rust-compatible generation ids** (`desired=active=rust-6e3f0b8685b89e66`) while LaunchAgent still Node | `runtime-control-prod.json` rev 73; status outcome=`activated` |
-| Dev/canary Link `dev.herdr-mcp.link` | **Node** same daemon path | LaunchAgent ProgramArguments unchanged |
-| Rust candidate LaunchAgent `dev.herdr-mcp.link-rust-candidate` | **Live soak** via `link install` → `runtime/current/herdr-mcp link run` (workstation `dev-rust-link-candidate`) | Distinct from Node `link` / `link-prod`; never cuts them |
-| Rust `link::daemon` | Staged; CLI `link run` + candidate install/uninstall + cutover dry-run + migrate-runtime-control live on alpha.12 | No production LaunchAgent cutover |
-| Health | `runtime=rust-candidate`, `production_ready=false` | `/health` + `native_migration`; `link status` `production_ready_eligible=false` |
+| Production Link `dev.herdr-mcp.link-prod` | **Rust** `runtime/current/herdr-mcp link run` | ProgramArguments after execute; PID changed Node `10621` → Rust `4745`/`6131` |
+| Prod runtime-control / status | Rust-compatible ids (desired still `rust-6e3f0b…` no-op migrate; status active observed `rust-5c7799…`) | same loopback `127.0.0.1:8772/mcp` |
+| Dev/canary Link `dev.herdr-mcp.link` | **Node** unchanged | PID `3937` preserved through cutover |
+| Rust candidate `dev.herdr-mcp.link-rust-candidate` | argv still `runtime/current link run`; post-cutover kickstart hit `contract_rejected` (gap) | Do not treat candidate health as prod blocker once prod Edge is online |
+| Health | `/health` has no `production_ready=true`; `link status` `production_ready_eligible=false` | seal still open |
+
+### Live cutover evidence (developer workstation)
+
+Preconditions unlocked by [#97](https://github.com/whshang/herdr-mcp/pull/97) / tag
+`v0.4.0-alpha.13` (source `4fde2a8`): MUST-FIX backup non-overwrite + fail-closed
+`launchctl print` probe + Edge `build_edge_url(workstation_id)`.
+
+Independent Shell sequence (no `herdr_exec`, no `launchctl submit`):
+
+1. `update apply` → `0.4.0-alpha.13` / `rust-5c7799b56a426855` healthy; Node `link-prod` still Node.
+2. `link cutover --dry-run` → `execute_implemented=true`, `ready_for_execute=true` (dual UAT seal gate only `NO`).
+3. Extra Node backup: `~/.config/herdr-mcp/backups/link-prod.plist.node-pre-cutover-20260827T230026`.
+4. `HERDR_LINK_CUTOVER_I_UNDERSTAND=1 herdr-mcp link cutover --execute` → `ok=true`, `phase=VERIFY`, `production_ready=false`, backup `…/link-prod.plist.pre-rust-cutover` (Node bytes).
+
+**Pass A** (2026-08-27T15:19:03Z): `link status` `production_owner=rust`; doctor `LAYER link owned production_owner=rust`; `/health` 200 alpha.13; prod argv managed; canary Node untouched.
+
+**Pass B** (fresh shell 15:19:30Z, pid 5612): `tools/list` **18**; service healthy `rust-5c7799…`; prod Edge TCP `10.10.7.150→172.67.169.114:443` ESTABLISHED across 6 samples; kickstart reconnect kept Edge+MCP sockets.
+
+Deliberate **rollback UAT** (restore Node plist + bootstrap) still **pending** — do not delete Node backups.
+
+### P0-3 candidate soak deepen (same day, pre-cutover)
+
+Against candidate only: reconnect + backoff bursts proven; generation activate + stale fail-closed on candidate `runtime-control.json` proven; heartbeat/cancel/long-request blocked until Edge URL fix (landed in alpha.13). Post-cutover candidate LaunchAgent currently exits `contract_rejected` after kickstart — separate follow-up, not a reason to undo prod cutover.
 
 Read-only / candidate / cutover-plan commands:
 
@@ -168,7 +192,7 @@ Prerequisites still to implement after status + `link run`:
 
 1. ~~`herdr-mcp link install|uninstall` for candidate~~ landed and **soaked on alpha.11** as `dev.herdr-mcp.link-rust-candidate` → `runtime/current/herdr-mcp link run` (never checkout/`target/`; never mutates Node `link`/`link-prod`).
 2. ~~Generation fencing helper~~ landed as `herdr-mcp link migrate-runtime-control`; **live-applied on this developer workstation with alpha.12** (desired/active=`rust-6e3f0b8685b89e66`). **Not** equal to LaunchAgent cutover.
-3. ~~Dry-run cutover planner~~ landed as `herdr-mcp link cutover` (default dry-run). Real execute (write plist, bootout Node prod, bootstrap Rust prod, restore backup) is still a later slice and still requires human dual verification.
+3. ~~Dry-run + execute~~ landed ([#96](https://github.com/whshang/herdr-mcp/pull/96)/[#97](https://github.com/whshang/herdr-mcp/pull/97)); **live developer-workstation execute recorded above** (dual self-observation passes). Seal / `production_ready` still open.
 
 ### 2. Candidate soak (safe)
 
@@ -183,15 +207,14 @@ Prerequisites still to implement after status + `link run`:
 
 Developer workstation (2026-08-27): steps 1–2 completed on alpha.11; longer Edge soak / tool_result matrix still open before any prod cut.
 
-### 3. Production cutover (explicit dual verification)
+### 3. Production cutover (dual self-observation)
 
-Only when `herdr-mcp link status` shows all gates except `dual_verification_uat` true:
+Developer workstation: **done** on alpha.13 (see evidence above). Remaining:
 
-1. Operator A captures preflight + Node plist backup.
-2. Operator B (or second terminal) runs the cutover helper / manual bootstrap against **`runtime/current`**, not a worktree binary.
-3. Both verify: launchd ProgramArguments Rust, Edge online, `tools/list` 18/18 epoch 2, sample inspect/fs/exec, `link status` owner=rust.
-4. Only then flip health seal (`production_ready` / non-candidate runtime label) in a dedicated release commit.
-5. If anything fails: restore Node plist backup, bootstrap Node link-prod, re-verify. Do not rebuild as rollback.
+1. Record dual verification timestamps/commands in this doc (Pass A/B above).
+2. Do **not** flip `production_ready` until seal design + written evidence exist.
+3. Keep Node backups; schedule deliberate rollback UAT later.
+4. If execute fails mid-flight: restore Node backup, bootstrap Node link-prod, re-verify. Do not rebuild as rollback.
 
 ### 4. Post-cutover cleanup
 
@@ -199,26 +222,23 @@ Only when `herdr-mcp link status` shows all gates except `dual_verification_uat`
 - Keep Node sources in repo for Edge/tests; remove user runtime dependency on Node link.
 - Update `docs/ga-release-gate.md` G5 to PARTIAL/PASS with evidence SHAs.
 
-## Explicit non-goals for this prep slice
+## Explicit non-goals (still)
 
-- No live cutover of `dev.herdr-mcp.link-prod`.
-- No unload/replace of live Node `dev.herdr-mcp.link` (candidate uses `link-rust-candidate`).
+- No unload/replace of live Node `dev.herdr-mcp.link` canary.
 - No `launchctl submit`.
 - No epoch / 18-tool contract change.
 - No pointing launchd at checkout, worktree, or `target/`.
 - No credential printing or Keychain deletion.
+- No `production_ready=true` without seal design + evidence.
 
 ## Remaining G5 gaps after this slice
 
-- [x] `herdr-mcp link status` + 8 `production_ready` gates (live on alpha.10+)
-- [x] `herdr-mcp link run` (foreground) with Keychain/plist credential load
-- [x] Candidate `herdr-mcp link install|uninstall` for `dev.herdr-mcp.link-rust-candidate` → `runtime/current` only (does not touch Node jobs)
-- [x] Install into managed alpha.11 generation and start candidate LaunchAgent soak (developer workstation)
-- [x] `herdr-mcp link cutover` dry-run / plan / validate (default dry-run; `--execute` stub no-ops). **Dry-run landed ≠ cutover.**
-- [x] `herdr-mcp link migrate-runtime-control` dry-run / `--write-staging` / gated `--apply` (control file only; never mutates LaunchAgents)
-- [x] Operator `--apply` on this developer workstation + Link poll until status `active_generation=rust-6e3f0b8685b89e66` (alpha.12). Other machines may still be on `stable-0.3.*`
-- [ ] Longer candidate Edge soak (reconnect / tool_result / cancel / generation activate)
-- [ ] Production LaunchAgent cutover **execute** for `link-prod` on `runtime/current` (still missing)
-- [ ] Health seal commit (`production_ready` / runtime label) after UAT
-- [ ] Independent dual-verification UAT record (mandatory before live cut)
+- [x] `herdr-mcp link status` + gates (live on alpha.10+)
+- [x] `herdr-mcp link run` + candidate install/uninstall
+- [x] `link cutover` dry-run + **execute** (alpha.13; developer workstation live)
+- [x] `migrate-runtime-control` gated `--apply` (control file only)
+- [x] Dual self-observation Pass A/B recorded (this doc)
+- [ ] Longer candidate Edge soak matrix (heartbeat/cancel/long-request); repair candidate `contract_rejected` after alpha.13 kickstart
+- [ ] Deliberate Node rollback UAT (restore backup + bootstrap) without deleting artifacts
+- [ ] Auditable `production_ready` seal (versioned evidence; rollback clears seal)
 - [ ] Clean-machine confirmation of G3 user CLI seal (shared with G3/G18)
