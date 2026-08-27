@@ -5,7 +5,7 @@ use crate::native_tools;
 use crate::paths::RuntimePaths;
 use crate::service_manager;
 use crate::snapshot;
-use crate::state_cache::EventCache;
+use crate::state_cache::{EventCache, EventCacheHealth};
 use crate::updater_store::UpdateStore;
 use serde_json::{Value, json};
 use std::fs;
@@ -33,6 +33,7 @@ struct StatusReport {
 #[derive(Debug)]
 struct EventCacheProbe {
     healthy: bool,
+    mode: &'static str,
     cursor: u64,
     digest_events: usize,
     agents: usize,
@@ -130,14 +131,15 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         );
     }
     println!(
-        "INFO event-cache cursor={} events={} agents={} workspaces={} panes={} stream-events={} reconcile={}",
+        "INFO event-cache cursor={} events={} agents={} workspaces={} panes={} stream-events={} reconcile={} mode={}",
         event_cache.cursor,
         event_cache.digest_events,
         event_cache.agents,
         event_cache.workspaces,
         event_cache.snapshot_panes,
         event_cache.stream_events,
-        event_cache.needs_reconcile
+        event_cache.needs_reconcile,
+        event_cache.mode
     );
     if let Some(last_event_at) = &event_cache.last_event_at {
         println!("INFO event-cache-last-event {last_event_at}");
@@ -446,6 +448,7 @@ fn probe_event_cache(paths: &RuntimePaths) -> EventCacheProbe {
     let Some(socket) = paths.herdr_socket.as_ref() else {
         return EventCacheProbe {
             healthy: false,
+            mode: "failed",
             cursor: 0,
             digest_events: 0,
             agents: 0,
@@ -459,12 +462,22 @@ fn probe_event_cache(paths: &RuntimePaths) -> EventCacheProbe {
     };
 
     let mut cache = EventCache::start(HerdrClient::new(socket));
-    let ready = cache.wait_ready(Duration::from_secs(2));
-    let stream_live = cache.wait_stream_live(Duration::from_secs(1));
+    // Keep the initial ready/live waits unchanged. The extra reconcile budget only
+    // covers an already-observed resubscribe / needs_reconcile window so doctor
+    // does not randomly FAIL while the cache is mid-cycle.
+    let health = cache.wait_for_doctor_probe(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+    );
     let since_result = native_tools::since(&cache, 0, None);
     let snapshot_state = cache.snapshot();
     let diagnostics = cache.diagnostics();
-    let error = cache.last_error();
+    let since_ok = since_result["ok"].as_bool() == Some(true);
+    let error = health
+        .error_message()
+        .map(str::to_owned)
+        .or_else(|| cache.last_error());
     cache.shutdown();
 
     let cursor = since_result["cursor"].as_u64().unwrap_or(0);
@@ -476,10 +489,8 @@ fn probe_event_cache(paths: &RuntimePaths) -> EventCacheProbe {
         .unwrap_or(0);
 
     EventCacheProbe {
-        healthy: ready
-            && stream_live
-            && since_result["ok"].as_bool() == Some(true)
-            && error.is_none(),
+        healthy: event_cache_doctor_pass(&health, since_ok),
+        mode: health.mode(),
         cursor,
         digest_events,
         agents,
@@ -490,6 +501,10 @@ fn probe_event_cache(paths: &RuntimePaths) -> EventCacheProbe {
         needs_reconcile: diagnostics.needs_reconcile,
         error,
     }
+}
+
+fn event_cache_doctor_pass(health: &EventCacheHealth, since_ok: bool) -> bool {
+    health.doctor_pass() && since_ok
 }
 
 fn probe_runtime(port: u16) -> RuntimeHealth {
@@ -603,5 +618,23 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn event_cache_doctor_pass_accepts_healthy_and_reconciling() {
+        assert!(event_cache_doctor_pass(&EventCacheHealth::Healthy, true));
+        assert!(event_cache_doctor_pass(
+            &EventCacheHealth::Reconciling,
+            true
+        ));
+        assert!(!event_cache_doctor_pass(
+            &EventCacheHealth::Failed("boom".to_owned()),
+            true
+        ));
+        assert!(!event_cache_doctor_pass(&EventCacheHealth::Healthy, false));
+        assert!(!event_cache_doctor_pass(
+            &EventCacheHealth::Reconciling,
+            false
+        ));
     }
 }
