@@ -279,9 +279,11 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ## Current Scorecard（2026-08-27）
 
-评分：`PASS` / `PARTIAL` / `FAIL` / `UNKNOWN`。证据来自当日 `origin/main` 工作树、本机只读 runtime，以及本机 **managed `update apply`** 成功记录。产品仍处 **alpha**，多数项为 PARTIAL/FAIL 属预期。
+评分：`PASS` / `PARTIAL` / `FAIL` / `UNKNOWN`。证据来自当日 `origin/main` 工作树、本机只读 runtime，以及本机 **managed `update apply` / `service rollback`** 成功记录。产品仍处 **alpha**，多数项为 PARTIAL/FAIL 属预期。
 
 本机 update 证据（开发者工作站，非干净机）：`0.4.0-alpha.6` / `rust-c7ba28e4f499c16b` → `0.4.0-alpha.8` / `rust-7ef4a3f7b328c3d2`；service healthy；launchd 指向 `runtime/current`；epoch 2 / 18 tools。Streaming smoke：`herdr_exec_start`→`herdr_exec_read` 见 `phase` started/running/completed + progress。残留：health 仍 `production_ready=false` / rust-candidate；`~/.local/bin/herdr-mcp` 仍指向仓库 Bash bridge；部分 sync `herdr_exec` 路径可能缺少 phase/progress。
+
+本机受控 rollback 证据（同日，开发者工作站）：`0.4.0-alpha.8` / `rust-7ef4a3f7…` → `service rollback` → `0.4.0-alpha.6` / `rust-c7ba28e4…` healthy → `update apply` → `0.4.0-alpha.8` / `rust-7ef4a3f7…` healthy；epoch 2 / 18 tools；oauth/connector 文件保留；回退后 Streaming MCP smoke 通过。GAP：顶层 `rollback` 不存在（正确命令是 `service rollback`）；非干净机。
 
 | ID | 评分 | 一行证据 |
 | --- | --- | --- |
@@ -294,7 +296,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G7 | **PARTIAL** | Edge→Link→runtime 在 alpha 上有过真实 UAT 记录；当前 Link 生产所有者仍是 Node，非「全 Rust」闭环 |
 | G8 | **PARTIAL** | `doctor` 覆盖本机 runtime / Herdr / snapshot / event-cache；未报告 Edge、Link、OAuth、Native Messaging、update 分层 |
 | G9 | **PARTIAL** | 本机 managed update apply 已成功 alpha.6→alpha.8（generation 切换 + healthy + epoch2/18）；**尚未**干净机 / 多平台 / 正式 stable N→N+1 用户向 UAT，故未 PASS |
-| G10 | **PARTIAL** | `service rollback` + guardian / single-writer 已有；顶层 `rollback` 与干净机回退 UAT 未完成 |
+| G10 | **PARTIAL** | 本机受控回退 UAT（2026-08-27）：alpha.8 / `rust-7ef4a3f7…` → `service rollback` → alpha.6 / `rust-c7ba28e4…` healthy → `update apply` → alpha.8 / `rust-7ef4a3f7…` healthy；epoch 2 / 18；oauth/connector 保留；回退后 Streaming MCP smoke 通过。经 `service.rollback` 在本机可用，但非干净机、顶层 CLI 未冻结（无顶层 `rollback`），故未 PASS |
 | G11 | **PARTIAL** | service mutation guardian、Link reconnect 组件 staged；完整崩溃/重启矩阵未做 GA UAT |
 | G12 | **PARTIAL** | 本机 Streaming smoke：`herdr_exec_start`→read 已见 phase started/running/completed + progress；sync `herdr_exec` 部分路径仍可能缺 phase/progress；跨网页回合正式 UAT 未封板 |
 | G13 | **PARTIAL** | Batch A + Result Optimization first wave 已合入；无独立 GA「无退化」回归门禁记录 |
@@ -320,7 +322,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 按「最先解锁干净机用户闭环」排序的下一批具体任务（已纳入本机 update 残留）：
 
 1. **冻结单一产品版本口径**：Cargo / GitHub Release / `--version` / README 对齐；去掉用户可见 `alpha`；明确 `package.json` 仅网站/扩展构建，不代表 runtime（G1 仍 FAIL）。
-2. **用户 CLI + 文档主路径**：实现顶层 `herdr-mcp install|rollback|uninstall`；把 `~/.local/bin/herdr-mcp` 从仓库 Bash bridge 迁到 installed `runtime/current`；README/`install.md` 改为 binary 下载安装。
+2. **用户 CLI + 文档主路径**：实现顶层 `herdr-mcp install|rollback|uninstall`（顶层 `rollback` 别名是 G3/G10 用户路径硬依赖；当前仅有 `service rollback`）；把 `~/.local/bin/herdr-mcp` 从仓库 Bash bridge 迁到 installed `runtime/current`；README/`install.md` 改为 binary 下载安装。
 3. **Rust production Link 切流 + `production_ready`**：candidate Link 完成生产所有权切换；去掉用户路径对 Node link 的依赖；health 不再长期停在 rust-candidate / `production_ready=false`。
 4. **产品级 `doctor` + sync exec 语义对齐**：分层报告 Herdr / runtime / service / Native Messaging / Link / Edge / OAuth·MCP / update；补齐 sync `herdr_exec` 与 streaming 路径在 phase/progress 上的一致性（G8/G12 残留）。
 5. **干净机 + 支持平台 UAT（含 update/rollback）**：按 G18/G19 跑通 install→doctor→Edge→ChatGPT→mutation→长任务→扩展→update→rollback；本机 alpha.6→alpha.8 只算开发者证据，不能替代干净机 / 多平台。
