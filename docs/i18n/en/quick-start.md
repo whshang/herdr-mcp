@@ -33,26 +33,20 @@ current Web conversation
 You need:
 
 - a working Herdr installation;
-- Node.js 20+;
-- this repository;
+- the native `herdr-mcp` binary from [GitHub Releases](https://github.com/whshang/herdr-mcp/releases);
 - a Cloudflare account if ChatGPT will connect over the Internet.
 
 A custom domain is not required. Start with `workers.dev`.
 
-## 1. Build the local runtime
+Node.js is **not** required to run the local MCP runtime. You may still need Node when deploying Edge with Wrangler.
+
+## 1. Install the local runtime
+
+Download the current release binary for your platform, place `herdr-mcp` on your `PATH`, then verify:
 
 ```bash
-git clone https://github.com/whshang/herdr-mcp.git
-cd herdr-mcp
-npm ci
-npm run build
-```
-
-Start the runtime with a local bearer for local-only clients:
-
-```bash
-export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
-node dist/server.js
+herdr-mcp doctor
+herdr-mcp status
 ```
 
 Check that something is listening:
@@ -61,7 +55,7 @@ Check that something is listening:
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 ```
 
-`200` or `401` proves the local HTTP process is alive.
+`200` or `401` proves the local HTTP process is alive. Prefer top-level `doctor` / `status` / `update ...` commands; do not use `herdr-mcp service install` as the normal install path.
 
 ## 2. Verify Herdr before adding the Internet
 

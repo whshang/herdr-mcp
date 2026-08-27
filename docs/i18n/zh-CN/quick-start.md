@@ -27,22 +27,22 @@ herdr api schema >/dev/null
 
 ## 2. 安装 herdr-mcp
 
-```bash
-git clone https://github.com/whshang/herdr-mcp.git
-cd herdr-mcp
-npm install
-npm run build
-```
-
-启动本地 runtime：
+从 [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) 下载当前平台的原生 `herdr-mcp` 二进制，放到 `PATH` 上，然后验证：
 
 ```bash
-export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
-export HERDR_MCP_PORT=8772
-node dist/server.js
+herdr-mcp doctor
+herdr-mcp status
 ```
 
-此时本机已经具备 MCP 服务能力。
+本机 MCP runtime **不需要** Node.js / npm。优先使用顶层 `doctor` / `status` / `update ...`；不要把 `herdr-mcp service install` 当成普通安装主路径。
+
+确认本机 HTTP 在听：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
+```
+
+`200` 或 `401` 都说明本机 HTTP 进程已起来。
 
 ## 3. 选择你的第一次连接方式
 

@@ -69,8 +69,42 @@ Current production contract: **epoch 2 / 18 tools**, including read-only `herdr_
 Prerequisites:
 
 - [Herdr](https://herdr.dev) installed and running;
-- Node.js 20+;
 - a Cloudflare account if ChatGPT will connect over the Internet.
+
+The **local MCP runtime** is a native binary. You do **not** need Node.js or npm to run it. Node remains useful for Cloudflare Edge deploys, the browser extension toolchain, and contributor builds from this repository.
+
+### Install the native runtime (primary)
+
+1. Download the current `herdr-mcp` binary for your platform from [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) (prerelease tags are expected while the product is still alpha).
+2. Place it on your `PATH` (for example `~/.local/bin/herdr-mcp`) and make it executable.
+3. Verify the binary:
+
+```bash
+herdr-mcp doctor
+herdr-mcp status
+herdr-mcp update check
+```
+
+Day-to-day lifecycle after the binary is installed:
+
+```bash
+herdr-mcp update apply
+herdr-mcp update status
+```
+
+Prefer these top-level commands. Do **not** treat `herdr-mcp service install` as the normal user install path; `service ...` stays advanced/internal.
+
+Verify Herdr before adding Edge:
+
+```bash
+herdr --version
+herdr api schema >/dev/null
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
+```
+
+For ChatGPT, deploy the Cloudflare Worker on the default `workers.dev` origin, start `herdr-link`, then add the public `/mcp` URL as a custom MCP App/Connector and complete OAuth.
+
+Do **not** paste `HERDR_MCP_TOKEN` or a Cloudflare API token into ChatGPT.
 
 ### Let a local coding agent install it
 
@@ -83,37 +117,15 @@ https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-inst
 Follow it end to end. Do not create a Custom Domain, DNS records or a Tunnel for the first installation; use workers.dev. Do not expose or commit any token. Verify each mutation before continuing.
 ```
 
-The deterministic Worker-name helper used by that flow is:
+The deterministic Worker-name helper used by that Edge flow is:
 
 ```bash
 WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 ```
 
-### Build it yourself
+### Contributor build from source (optional)
 
-Build the local runtime:
-
-```bash
-git clone https://github.com/whshang/herdr-mcp.git
-cd herdr-mcp
-npm ci
-npm run build
-
-export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
-node dist/server.js
-```
-
-Verify the local process before adding Edge:
-
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
-herdr --version
-herdr api schema >/dev/null
-```
-
-For ChatGPT, deploy the Cloudflare Worker on the default `workers.dev` origin, start `herdr-link`, then add the public `/mcp` URL as a custom MCP App/Connector and complete OAuth.
-
-Do **not** paste `HERDR_MCP_TOKEN` or a Cloudflare API token into ChatGPT.
+Clone this repository only when you are developing herdr-mcp itself. Source builds may still use the Node toolchain for site/extension/Edge packages; that path is not the primary way end users run the MCP runtime.
 
 Full walkthrough: [Quick start](docs/i18n/en/quick-start.md) · [Installation](docs/i18n/en/install.md) · [ChatGPT Connector](docs/i18n/en/chatgpt-connector.md)
 
