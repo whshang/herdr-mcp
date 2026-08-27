@@ -30,18 +30,21 @@ Herdr Architecture Roadmap
 ├── 当前路线状态
 ├── 已完成并验收
 │   ├── Rust Native Runtime
-│   └── Batch A Performance
+│   ├── Batch A Performance
+│   ├── Result Optimization first wave
+│   └── Project Context Cache first slice
 ├── 已完成待验收
 │   ├── Cloudflare Edge read fast path
-│   └── Long Task Progress Observability
+│   ├── Long Task Progress Observability
+│   └── Search Execution first slice
 ├── 规划中
-│   ├── Search Execution Architecture
+│   ├── Search Execution Architecture (remaining)
 │   ├── Batch B Tool Batch Architecture
 │   └── IngressProfile
 ├── AI Tool Runtime Optimization Architecture
-│   ├── Result Optimization Layer
-│   ├── Tool Wave Scheduler
-│   ├── Project Context Cache
+│   ├── Result Optimization Layer (first wave landed)
+│   ├── Tool Wave Scheduler (skill-level only)
+│   ├── Project Context Cache (first slice landed; deeper waits on benchmarks)
 │   └── Streaming First
 ├── Appendix A
 │   └── Rust architecture history
@@ -60,16 +63,22 @@ Herdr Architecture Roadmap
 
 | 状态 | 含义 | 当前重点 |
 |---|---|---|
-| 已完成并验收 | 代码、测试、smoke/benchmark 已通过 | Rust runtime、Batch A |
-| 已完成待验收 | 实现完成或设计完成，需要生产数据或后续落地 | Edge read path、observability |
-| 进行中 | 已进入实现阶段 | Result Optimization 第一片 |
-| 规划中 | 架构确定，等待前置条件 | Search、Batch B、Ingress、Wave Scheduler runtime |
+| 已完成并验收 | 代码、测试、smoke/benchmark 已通过 | Rust runtime、Batch A、Result Optimization first wave、Project Context Cache first slice |
+| 已完成待验收 | 实现完成或设计完成，需要生产数据或后续落地 | Edge read path、observability、Search first slice |
+| 进行中 | 已进入实现阶段 | （无独立实现片；下一片见下） |
+| 规划中 | 架构确定，等待前置条件 | Search remaining、Batch B、Ingress、Wave Scheduler runtime、PCC deeper cache、Streaming First |
 
 ## 当前执行重点
 
-当前唯一实现片是 **Result Optimization Layer**：在不改 epoch 2 / 18 tools inputSchema 的前提下，压缩进入模型的工具结果。第一片先做 `herdr_git status` 按目录分组与计数，原始 porcelain 在文件数较少时原样保留。
+**Result Optimization first wave 已合入 main**（epoch 2 / 18 tools 不变）：`herdr_git status` compact（#53）、exec 成功输出 head/tail（#54）、`herdr_git` diff/log compact（#55）、`herdr_fs_grep` group-by-file（#56）。Evidence Store 仍等真实恢复需求，不为本波预留抽象。
 
-不并行切生产 Link，不把 Search / Batch B 当作本片范围。
+**Search Execution first slice 已合入，待生产验收**：`herdr_fs_grep` 优先 rg、Rust walker 回退（#52），与 grep compact 共用 finish path。IndexBackend 等其余 Search 架构仍属规划中。
+
+**Project Context Cache first slice 已合入**（#58）：mutation 路径单次 `derive_routing` 复用；整体仍为 P1，更深 cache 等待基准再加深。
+
+**Tool Wave Scheduler** 仍仅 skill 层策略，无 runtime 调度器。
+
+下一唯一实现片：**Streaming First（P1）**。更深 Project Context Cache 等基准后再加深。不把 Evidence Store、Wave runtime、Batch B 当作当前片。
 
 ## 已完成并验收
 
@@ -110,6 +119,29 @@ Herdr Architecture Roadmap
 - Rust/Node/Edge gate 通过。
 - epoch2/18 tools identity 不变。
 
+### Result Optimization first wave
+
+状态：已完成，已验收（#53–#56）。
+
+范围：不改 epoch 2 / 18 tools inputSchema；在结果进入模型前压缩展示。
+
+已合入：
+
+- `herdr_git status` 按目录分组与 counts（#53）；
+- exec 成功大输出 head/tail（#54）；
+- `herdr_git` diff/log compact（#55）；
+- `herdr_fs_grep` group-by-file（#56）。
+
+Evidence Store 未做，等真实恢复需求。
+
+### Project Context Cache first slice
+
+状态：已完成，已验收（#58）。整体 Project Context Cache 仍为 P1。
+
+内容：mutation 工具（`fs_edit` / `fs_write` / `fs_patch` / `exec_start` / `herdr_exec`）在同一请求内复用一次 `projects::derive_routing`，经 `validate_*_with_topology` / `check_with_topology` / `working_agents_from` 传递；不改 epoch/schema，不新增 tool。
+
+后续：更深 cache 需基准证明后再加深；不产生第二事实源。
+
 ## 已完成待验收
 
 ### Cloudflare Edge read fast path
@@ -138,11 +170,19 @@ Herdr Architecture Roadmap
 
 验收：CI/release/deploy/self-upgrade 全程有阶段状态；新 conversation 可恢复任务阶段；不增加短任务噪声。
 
+### Search Execution first slice
+
+状态：已完成实现，待生产验收（#52）。
+
+内容：`herdr_fs_grep` 优先 rg（含常见 PATH），Rust walker 回退；与 Result Optimization grep compact 共用 finish path；`engine` 为 `rg` 或 `rust`；不新增第 19 个 tool。
+
+后续验收：大仓库延迟与回退行为；IndexBackend 等其余 Search 架构仍属规划中。
+
 ## 规划中
 
 ### Search Execution Architecture
 
-状态：P2，未实现。大仓库 `fs_grep` 走 Security Layer → Query Planner → RgBackend / RustFallback，IndexBackend 更后。不新增第 19 个 tool。独立 ripgrep fast path 若已有候选 PR，按 P2 合入，不打断 P0。
+状态：P2，first slice 已合入（见上）；其余（Query Planner、IndexBackend 等）未实现。大仓库 `fs_grep` 目标路径仍为 Security Layer → Query Planner → RgBackend / RustFallback，IndexBackend 更后。不新增第 19 个 tool。
 
 ### Batch B Tool Batch Architecture
 
@@ -154,16 +194,16 @@ Herdr Architecture Roadmap
 
 ## AI Tool Runtime Optimization Architecture
 
-状态：P0 第一片实施中。
+状态：Result Optimization first wave 与 Project Context Cache first slice 已合入；下一实现片为 Streaming First（P1）。更深 PCC 等待基准。
 
 参考 rtk-ai/rtk：核心不是改工具执行本身，而是在输出进入模型上下文前过滤、分组、截断、去重。Herdr 不复制 CLI proxy，在 Rust MCP runtime 内压缩展示，raw 事实仍可从同一次结果或后续 evidence 恢复。不改变 epoch 2 / 18 tools inputSchema。
 
 优先级：
 
 1. 工具执行速度（Batch A 已验收）
-2. 工具结果进入模型的效率（当前 P0）
+2. 工具结果进入模型的效率（Result Optimization first wave 已合入）
 3. 多工具协同调度
-4. 长任务持续运行与反馈
+4. 长任务持续运行与反馈（Streaming First 为下一片）
 5. 资源生命周期管理
 
 ### Result Optimization Layer（P0）
@@ -178,28 +218,28 @@ Result Optimization Layer
 LLM Context
 ```
 
-第一片：`herdr_git status`
+First wave（已合入 #53–#56）：
 
-- 解析 porcelain `-b`；
-- 增加 `counts`（branch、files、modified、untracked、deleted、renamed）；
-- 文件数超过阈值时，`output` 改为按目录分组的紧凑文本，文件名仍保留；
-- 小仓库保持原始 porcelain，现有测试继续有效。
+- `herdr_git status`：解析 porcelain `-b`；`counts`；超阈值按目录分组，小仓库保留原始 porcelain；
+- exec 成功大输出 head/tail；
+- `herdr_git` diff/log compact；
+- `herdr_fs_grep` group-by-file（与 Search rg/rust finish path 共用）。
 
-后续片：git diff/log、exec 成功摘要、fs_grep 分组。Evidence Store 在有真实恢复需求后再做，不为第一片预留抽象接口。
+Evidence Store 在有真实恢复需求后再做，不预留抽象接口。
 
 验收：response bytes 下降；失败诊断完整；inputSchema 不变。
 
 ### Tool Wave Scheduler（P0 设计 / skill 已有策略）
 
-`herdr_skill` 已要求独立 read 并行、mutation 有序。Runtime 级 dependency graph 调度等 Batch B 证明 round-trip 仍是瓶颈后再做，不在本片实现第二套调度器。
+`herdr_skill` 已要求独立 read 并行、mutation 有序。Runtime 级 dependency graph 调度等 Batch B 证明 round-trip 仍是瓶颈后再做；当前仍仅 skill 层，无 runtime scheduler。
 
-### Project Context Cache（P1）
+### Project Context Cache（P1；first slice 已合入）
 
-高频工具减少重复 git root / dirty derive，失效策略正确，不产生第二事实源。Batch A 已拆掉 routing 上的全仓库 status；更深 cache 需基准证明。
+First slice（#58）：mutation 路径单次 `derive_routing` 复用。Batch A 已拆掉 routing 上的全仓库 status。更深 cache（跨请求/高频 read 侧）需基准证明后再加深；失效策略正确，不产生第二事实源。
 
-### Streaming First（P1）
+### Streaming First（P1，下一实现片）
 
-长 grep/exec/test/build 先给 started/progress，再给完整 evidence。需要 progress 通道，不并入本片。
+长 grep/exec/test/build 先给 started/progress，再给完整 evidence。需要 progress 通道；尚无已合并实现。
 
 ## 不纳入当前路线
 
