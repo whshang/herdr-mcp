@@ -19,6 +19,7 @@ pub mod backoff;
 pub mod daemon;
 pub mod generation_fence;
 pub mod heartbeat;
+pub mod install;
 pub mod io_loop;
 pub mod lifecycle;
 pub mod local_mcp;
@@ -32,6 +33,9 @@ pub mod runtime_generation;
 pub mod socket_driver;
 pub mod transport;
 
+pub use install::{
+    LINK_RUST_CANDIDATE_LABEL, install as run_link_install, uninstall as run_link_uninstall,
+};
 pub use ownership::{
     doctor_layer_summary, production_ready_gate_catalog, run_status as run_link_status,
 };
