@@ -291,7 +291,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G2 | **PARTIAL** | Rust Release + attestation/manifest 链已存在；但 README / `docs/i18n/en/install.md` 主路径仍是 `git clone` + `npm ci` + Node.js 20+ |
 | G3 | **PARTIAL** | 顶层 CLI + entrypoint 已合入（[#74](https://github.com/whshang/herdr-mcp/pull/74)、[#81](https://github.com/whshang/herdr-mcp/pull/81)）；**本机 live symlink 已迁到 `runtime/current`**（alpha.10+）。仍 PARTIAL：缺干净机 / 正式多机 seal，不能宣称 GA 级入口封板 |
 | G4 | **PARTIAL** | `service install` + generation/health/rollback 代码存在；正式文档未给出 binary → `herdr-mcp install` 干净机路径 |
-| G5 | **FAIL** | **关键 blocker / #1**：production Link 仍走 Node（desired=active=stable-0.3.32）；health `production_ready=false` / rust-candidate。alpha.11 已 live 安装候选 LaunchAgent `dev.herdr-mcp.link-rust-candidate`（`runtime/current`，不碰 Node jobs）；`link cutover` dry-run / plan 已合入 **不等于** 切流；生产 LaunchAgent execute / live cutover / dual UAT 仍未做 |
+| G5 | **FAIL** | **关键 blocker / #1**：production Link 仍走 Node（desired=active=stable-0.3.32）；health `production_ready=false` / rust-candidate。alpha.11 candidate soak + `link cutover` dry-run 已合入；本片再加 `link migrate-runtime-control`（plan/staging/gated apply，只动 control 文件）**不等于** 切流 / **未**对本机 live apply。生产 LaunchAgent execute / dual UAT / health seal 仍未做 |
 | G6 | **PARTIAL** | 嵌入契约 epoch 2 / 18 tools（hash 冻结）；真实 ChatGPT 与全路径 production smoke 仍属 alpha 验收，未做 GA 冻结声明 |
 | G7 | **PARTIAL** | Edge→Link→runtime 在 alpha 上有过真实 UAT 记录；当前 Link 生产所有者仍是 Node，非「全 Rust」闭环 |
 | G8 | **PARTIAL** | Live alpha.11 `doctor` 已打印 8 行 `LAYER`（[#73](https://github.com/whshang/herdr-mcp/pull/73)）；`LAYER link` 仍 `production_owner=node` / `production_ready_eligible=false`；非完整 remote 闭环（`remote-probe=skipped`） |
@@ -321,7 +321,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 按 2026-08-27 live alpha.11 证据排序（先解关键生产 blocker，再封版本与入口，再干净机与扩展宣称）：
 
-1. **G5 — Rust production Link 切流 + `production_ready`**（#1 critical）：候选 LaunchAgent 已在 alpha.11 本机 soak（`dev.herdr-mcp.link-rust-candidate`）；`herdr-mcp link cutover --dry-run` 已落地（plan/validate only）。**dry-run helper landed ≠ cutover**；G5 仍为 FAIL。仍须：runtime-control 代际切到 Rust、真实 execute 切 `link-prod` 到 `runtime/current`、独立 Shell 双人验收、health seal。仍禁止切 Node `link`/`link-prod` 直到明确 execute。清单见 [`docs/_wip/g5-link-production-cutover.md`](./_wip/g5-link-production-cutover.md)。
+1. **G5 — Rust production Link 切流 + `production_ready`**（#1 critical）：候选 LaunchAgent 已在 alpha.11 本机 soak；`link cutover --dry-run` 与 `link migrate-runtime-control`（control 代际准备/gated apply）已落地。**helper landed ≠ cutover / ≠ 本机已 apply**；G5 仍为 FAIL。仍须：工作站对 prod control `--apply` 并等 status 激活、真实 execute 切 `link-prod` 到 `runtime/current`、独立 Shell 双人验收、health seal。仍禁止切 Node `link`/`link-prod` 直到明确 execute。清单见 [`docs/_wip/g5-link-production-cutover.md`](./_wip/g5-link-production-cutover.md)。
 2. **G1 — 单一正式产品版本（退出 alpha）**：Cargo / GitHub Release / `--version` / README 对齐为同一 stable 口径；去掉用户可见 `alpha`。
 3. **G3 formal seal — 干净机 / 多机确认**：本机已迁 `~/.local/bin/herdr-mcp` → `runtime/current`（alpha.10+）；仍需干净机与正式文档路径对齐后才能把 G3 升到 PASS。
 4. **G18 — 干净机 install UAT**：不使用开发仓库，按正式文档从零安装并跑通用户闭环。

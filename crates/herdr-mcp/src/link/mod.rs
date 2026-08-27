@@ -24,6 +24,7 @@ pub mod install;
 pub mod io_loop;
 pub mod lifecycle;
 pub mod local_mcp;
+pub mod migrate_runtime_control;
 pub mod ownership;
 pub mod policy;
 pub mod request_core;
@@ -38,6 +39,7 @@ pub use cutover::{CutoverMode, run as run_link_cutover};
 pub use install::{
     LINK_RUST_CANDIDATE_LABEL, install as run_link_install, uninstall as run_link_uninstall,
 };
+pub use migrate_runtime_control::{MigrateMode, run as run_link_migrate_runtime_control};
 pub use ownership::{
     doctor_layer_summary, production_ready_gate_catalog, run_status as run_link_status,
 };
