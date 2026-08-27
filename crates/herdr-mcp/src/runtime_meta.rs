@@ -55,6 +55,7 @@ pub fn migration_status() -> Value {
         "phase": "candidate",
         "native_parity_ready": pending.is_empty(),
         "production_ready": false,
+        "link_cutover": crate::link::production_ready_gate_catalog(),
         "contract_epoch": contract::identity().ok().map(|identity| identity.epoch),
         "tool_count": all.len(),
         "migrated_tool_count": MIGRATED_TOOLS.len(),
@@ -140,6 +141,12 @@ mod tests {
         assert_eq!(status["pending_tool_count"], 0);
         assert_eq!(status["native_parity_ready"], true);
         assert_eq!(status["production_ready"], false);
+        assert_eq!(status["link_cutover"]["production_ready"], false);
+        assert!(
+            status["link_cutover"]["requires_all"]
+                .as_array()
+                .is_some_and(|gates| !gates.is_empty())
+        );
         assert_eq!(status["pending_tools"], json!([]));
         for name in MIGRATED_TOOLS {
             assert!(contract::tool_names().contains(&name));
