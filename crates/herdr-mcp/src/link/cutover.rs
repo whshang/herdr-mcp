@@ -103,7 +103,7 @@ fn run_rollback(home: &Path, config_dir: &Path) -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (home, config_dir);
-        return Err("link cutover --rollback is macOS-only".to_owned());
+        Err("link cutover --rollback is macOS-only".to_owned())
     }
     #[cfg(target_os = "macos")]
     {
@@ -138,7 +138,7 @@ fn run_rollback(home: &Path, config_dir: &Path) -> Result<ExitCode, String> {
             "production_ready": false,
             "protected_labels_untouched": [LINK_LABEL, LINK_RUST_CANDIDATE_LABEL],
             "notes": [
-                "Restored Node link-prod from backup via bootout/bootstrap (never launchctl submit).",
+                "Restored Node link-prod from backup via bootout/bootstrap (never the forbidden launchd submission path).",
                 "Active production_ready seal cleared if present.",
                 "Re-cut to Rust with HERDR_LINK_CUTOVER_I_UNDERSTAND=1 link cutover --execute after Node verify.",
             ],

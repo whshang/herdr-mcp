@@ -451,7 +451,7 @@ never unload or replace live Node link/link-prod. Candidate defaults to an\n\
 epoch-2 Edge (edge-prod) and refuses install when Edge /health is still epoch 1.\n\
 link cutover defaults to dry-run plan/validate only; --execute / --rollback\n\
 require HERDR_LINK_CUTOVER_I_UNDERSTAND=1, mutate only link-prod via\n\
-bootout/bootstrap (never launchctl submit), and --rollback clears any active\n\
+bootout/bootstrap (never the forbidden launchd submission path), and --rollback clears any active\n\
 production_ready seal. link seal writes an auditable evidence artifact; it never\n\
 auto-flips from LaunchAgent ownership alone (HERDR_LINK_SEAL_I_UNDERSTAND=1 for\n\
 --execute). link migrate-runtime-control prepares a\n\
