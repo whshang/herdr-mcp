@@ -39,9 +39,10 @@ Node.js is **not** required to run the local MCP runtime. You may still need Nod
 
 ## Step 1: install the native runtime (primary)
 
-Download the current `herdr-mcp` binary for your platform from [GitHub Releases](https://github.com/whshang/herdr-mcp/releases), place it on your `PATH` (for example `~/.local/bin/herdr-mcp`), and make it executable.
+Download the current `herdr-mcp` binary for your platform from [GitHub Releases](https://github.com/whshang/herdr-mcp/releases), place it on your `PATH` (for example `~/.local/bin/herdr-mcp`), and make it executable. Then run `herdr-mcp install`: the installer stages an immutable generation under `~/.config/herdr-mcp/runtime/` and retargets `~/.local/bin/herdr-mcp` to `runtime/current/herdr-mcp` so the PATH entry no longer depends on a git checkout.
 
 ```bash
+herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
 herdr-mcp update check

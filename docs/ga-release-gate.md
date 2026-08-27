@@ -289,7 +289,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | --- | --- | --- |
 | G1 | **FAIL** | 仍处 alpha：Cargo / `--version` / tag 为 `0.4.0-alpha.8`；`package.json` / `src/version.ts` = `0.3.32`；无单一正式 stable 口径 |
 | G2 | **PARTIAL** | Rust Release + attestation/manifest 链已存在；但 README / `docs/i18n/en/install.md` 主路径仍是 `git clone` + `npm ci` + Node.js 20+ |
-| G3 | **PARTIAL** | 核心别名已合入 [#74](https://github.com/whshang/herdr-mcp/pull/74)（`2033168`：顶层 `install` / `rollback` / `uninstall`）；正式 seal 未完成：live runtime 未带出、`~/.local/bin/herdr-mcp` 仍指向仓库 Bash bridge |
+| G3 | **PARTIAL** | 顶层别名 [#74](https://github.com/whshang/herdr-mcp/pull/74)；源码侧 `install`/`update` 会把 `~/.local/bin/herdr-mcp` 链到 `runtime/current`（G3 CLI entrypoint PR）。正式 seal 仍待 live 代际带出后跑一次 `install`/`update apply` |
 | G4 | **PARTIAL** | `service install` + generation/health/rollback 代码存在；正式文档未给出 binary → `herdr-mcp install` 干净机路径 |
 | G5 | **FAIL** | **关键 blocker**：production Link 仍走 Node；Rust 仅为 candidate；health `production_ready=false` / rust-candidate；未完成 Rust production ownership 切流 |
 | G6 | **PARTIAL** | 嵌入契约 epoch 2 / 18 tools（hash 冻结）；真实 ChatGPT 与全路径 production smoke 仍属 alpha 验收，未做 GA 冻结声明 |
@@ -323,7 +323,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 1. **G5 — Rust production Link 切流 + `production_ready`**：候选 Link 完成生产所有权切换；去掉用户路径对 Node link 的依赖；health 不再停在 rust-candidate / `production_ready=false`。
 2. **G1 — 单一正式产品版本（退出 alpha）**：Cargo / GitHub Release / `--version` / README 对齐为同一 stable 口径；去掉用户可见 `alpha`。
-3. **G3 seal — 用户 CLI 与 live runtime 封板**：把 `~/.local/bin/herdr-mcp` 从仓库 Bash bridge 迁到 `runtime/current`；live runtime 带上顶层 `install` / `rollback` / `uninstall`（#74 已合入源码，待生产代际带出）。
+3. **G3 seal — 用户 CLI 与 live runtime 封板**：源码已让 `install`/`update` 维护 `~/.local/bin/herdr-mcp` → `runtime/current`；live 代际带出后对现有机器跑一次 `install` 或 `update apply` 完成 symlink 迁移（#74 顶层别名已合入）。
 4. **G18 — 干净机 install UAT**：不使用开发仓库，按正式文档从零安装并跑通用户闭环。
 5. **G15 — 扩展正式分发，或从 GA 宣称中移除**：商店级 / 文档级分发封板；否则不得在 GA 口径中承诺浏览器扩展。
 

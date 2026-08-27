@@ -39,9 +39,10 @@ herdr api schema >/dev/null
 
 ## 第一步：安装原生 runtime（主路径）
 
-从 [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) 下载当前平台的 `herdr-mcp` 二进制，放到 `PATH`（例如 `~/.local/bin/herdr-mcp`）并赋予可执行权限。
+从 [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) 下载当前平台的 `herdr-mcp` 二进制，放到 `PATH`（例如 `~/.local/bin/herdr-mcp`）并赋予可执行权限。然后执行 `herdr-mcp install`：安装器会在 `~/.config/herdr-mcp/runtime/` 下写入不可变 generation，并把 `~/.local/bin/herdr-mcp` 重定向到 `runtime/current/herdr-mcp`，使 PATH 入口不再依赖 git checkout。
 
 ```bash
+herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
 herdr-mcp update check
