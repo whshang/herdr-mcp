@@ -73,32 +73,35 @@ native Herdr long tail
 
 1. [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) から、対象プラットフォームの `herdr-mcp` バイナリをダウンロードします（alpha 期間中は prerelease タグが想定されます）。
 2. `PATH` 上に置き（例: `~/.local/bin/herdr-mcp`）、実行権限を付与します。
-3. バイナリを確認します:
+3. マネージドなローカルサービスをインストールして確認します:
 
 ```bash
+herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
 herdr-mcp update check
 ```
 
-インストール後の日常操作:
+`install` は `~/.config/herdr-mcp/runtime/` に immutable generation を書き、`~/.local/bin/herdr-mcp` を `runtime/current/herdr-mcp` に向けます。その後の日常操作:
 
 ```bash
 herdr-mcp update apply
 herdr-mcp update status
+herdr-mcp rollback
 ```
 
-上記のトップレベルコマンドを優先してください。`herdr-mcp service install` を通常のユーザー向けインストール経路にしないでください。`service ...` は advanced / internal のままです。
+上記のトップレベルコマンドを優先してください。`herdr-mcp service install` を通常のユーザー向けインストール経路にしないでください。ローカル MCP runtime のインストールに git clone / `npm` / `cargo` を使わないでください。
+
+alpha 期間中は `update.channel = "preview"`（または alpha バイナリで config 未作成）を保ち、prerelease を発見できるようにします。`stable` は non-prerelease のみです。
 
 Edge を足す前に Herdr を確認します。
 
 ```bash
 herdr --version
 herdr api schema >/dev/null
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 ```
 
-ChatGPT から使う場合は、まず Cloudflare Worker を `workers.dev` にデプロイし、`herdr-link` を起動して、公開 `/mcp` URL を ChatGPT の custom MCP App/Connector に登録して OAuth を完了します。
+ChatGPT から使う場合は、まず Cloudflare Worker を `workers.dev` にデプロイし、マネージド Link を起動して、公開 `/mcp` URL を ChatGPT の custom MCP App/Connector に登録して OAuth を完了します。詳細は [Installation](docs/i18n/en/install.md)。
 
 `HERDR_MCP_TOKEN` や Cloudflare API Token を ChatGPT に貼らないでください。
 
@@ -110,16 +113,10 @@ ChatGPT から使う場合は、まず Cloudflare Worker を `workers.dev` に�
 Install and deploy herdr-mcp for me. First read:
 https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md
 
-Follow that guide end to end. Use workers.dev for the first install and do not expose or commit secrets.
+Follow that guide end to end. Install the local runtime from GitHub Releases (not git clone/npm). Use workers.dev for the first install and do not expose or commit secrets.
 ```
 
-Edge 用の Cloudflare-safe Worker 名 helper:
-
-```bash
-WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
-```
-
-### 貢献者向けソースビルド（任意）
+### 付録: 貢献者向けソースビルド
 
 herdr-mcp 自体を開発するときだけリポジトリを clone してください。ソースビルドではサイト/拡張/Edge のために Node ツールチェーンを使うことがありますが、それはエンドユーザーが MCP runtime を動かす主経路ではありません。
 

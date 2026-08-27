@@ -35,7 +35,13 @@ If this fails, fix Herdr first using the [official installation guide](https://h
 
 This guide follows the ChatGPT path because it covers the complete architecture.
 
-Node.js is **not** required to run the local MCP runtime. You may still need Node temporarily when deploying the Cloudflare Worker (`npx wrangler`) or building the browser extension from source.
+Node.js is **not** required to run the local MCP runtime. You may still need Node temporarily when deploying the Cloudflare Worker (`npx wrangler`). Building the browser extension from source is an advanced/developer path, not the primary install.
+
+## Supported platforms (first GA recommendation)
+
+- **Officially supported for first GA:** macOS Apple Silicon (managed install / service / update / rollback).
+- **Preview artifact:** Windows x64 may still be published as a Release asset; do not claim full managed lifecycle parity until G19 seals it.
+- **Not claimed for first GA:** Linux service lifecycle. Presence of a Linux binary in CI matrices does not make Linux a GA platform.
 
 ## Step 1: install the native runtime (primary)
 
@@ -48,7 +54,9 @@ herdr-mcp status
 herdr-mcp update check
 ```
 
-Prefer these top-level commands. Do **not** use `herdr-mcp service install` as the normal user install instruction; `service ...` remains advanced/internal.
+Prefer these top-level commands. Do **not** use `herdr-mcp service install` as the normal user install instruction; `service ...` remains advanced/internal. Do **not** clone this repository or run `npm`/`cargo` to install the local MCP runtime.
+
+While the product is still alpha, keep `update.channel = "preview"` (or leave config absent on an alpha binary) so discovery sees prerelease tags. The `stable` channel discovers non-prerelease releases only.
 
 ## Step 2: validate the local runtime first
 
@@ -73,7 +81,7 @@ herdr-mcp update status
 
 On macOS, the native binary owns the managed LaunchAgent lifecycle once installed. Use `herdr-mcp status` / `herdr-mcp doctor` for health, and `herdr-mcp update ...` for upgrades. Avoid pointing launchd at a git checkout or `target/*/herdr-mcp`.
 
-Linux / Windows service packaging is narrower today; keep the release binary on `PATH` and follow platform-specific notes in the current Release assets when a one-command service manager is not yet published for that OS.
+Linux / Windows service packaging is narrower today. First-GA recommendation: officially support macOS Apple Silicon only; treat a published Windows binary as preview until G19 seals it. Do not advertise an unsupported Linux lifecycle. Keep the release binary on `PATH` and follow platform-specific notes in the current Release assets.
 
 ## Step 4: deploy a stable public Edge
 
@@ -197,7 +205,7 @@ http://127.0.0.1:8772/mcp
 
 using the local static bearer. This path is also useful for separating runtime failures from Edge failures.
 
-## Contributor note: building from this repository
+## Appendix: developer from source
 
 Clone + `npm`/`cargo` workflows remain available for people developing herdr-mcp itself. That contributor path is not the primary end-user install path and must not be required to run the local MCP runtime.
 

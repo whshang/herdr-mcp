@@ -25,7 +25,7 @@ Herdr 性能优化不以单点 benchmark 为目标，目标是建立长期可演
 
 ## 当前路线状态
 
-更新时间：2026-08-27
+更新时间：2026-08-28
 
 ```text
 Herdr Architecture Roadmap
@@ -86,11 +86,11 @@ Herdr Architecture Roadmap
 
 **Edge read path harden 已合入**（#60）：ephemeral read 在 DO write quota 压力下继续观察；见下「已完成待验收」。
 
-**Skill wave guidance**（#61）：skill 层收紧 compact 结果与长 exec 的 wave 指引；仍无 runtime Wave Scheduler。**health_watchdog**（#63）：`service status` 已单独暴露 `dev.herdr-mcp.health-watchdog`。**Link candidate daemon**（#65）：Rust daemon 组装仅 staged；生产 Link 仍走 Node，切流不是当前片。
+**Skill wave guidance**（#61）：skill 层收紧 compact 结果与长 exec 的 wave 指引；仍无 runtime Wave Scheduler。**health_watchdog**（#63）：`service status` 已单独暴露 `dev.herdr-mcp.health-watchdog`。**Link candidate daemon**（#65）：Rust daemon 已可用于 production cutover；本机 G5 sealed（alpha.14）后 production Link 为 Rust；干净机 / 多机仍属 G18/G19。
 
 **Tool Wave Scheduler** 仍仅 skill 层策略。**Batch B** 仍等 Layer 3 Connector UAT，不是当前片。
 
-下一唯一实现片：**G5 Link cutover seal apply**（alpha.14 `link seal` + 故意 `cutover --rollback` UAT → re-cut → seal）；candidate edge-prod soak 已修复。Streaming First 已合入，不再作为当前主游标。
+下一产品焦点（GA gate SSOT）：**G5 已 PASS** → **干净机 UAT（G18）/ 退出 alpha（G1）/ G22 seal**。Streaming First 已合入，不是当前主游标。Browser Control Plane / true-steer 为 post-GA boundary（G16），本轮不实现。
 
 ## 已完成并验收
 

@@ -77,32 +77,35 @@ The **local MCP runtime** is a native binary. You do **not** need Node.js or npm
 
 1. Download the current `herdr-mcp` binary for your platform from [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) (prerelease tags are expected while the product is still alpha).
 2. Place it on your `PATH` (for example `~/.local/bin/herdr-mcp`) and make it executable.
-3. Verify the binary:
+3. Install the managed local service, then verify:
 
 ```bash
+herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
 herdr-mcp update check
 ```
 
-Day-to-day lifecycle after the binary is installed:
+`install` stages an immutable generation under `~/.config/herdr-mcp/runtime/` and retargets `~/.local/bin/herdr-mcp` to `runtime/current/herdr-mcp`. Day-to-day lifecycle after that:
 
 ```bash
 herdr-mcp update apply
 herdr-mcp update status
+herdr-mcp rollback
 ```
 
-Prefer these top-level commands. Do **not** treat `herdr-mcp service install` as the normal user install path; `service ...` stays advanced/internal.
+Prefer these top-level commands. Do **not** treat `herdr-mcp service install` as the normal user install path; `service ...` stays advanced/internal. Do **not** clone this repository or run `npm`/`cargo` to install the local MCP runtime.
+
+While the product is still alpha, keep `update.channel = "preview"` (or leave config absent on an alpha binary) so discovery sees prerelease tags. `stable` only discovers non-prerelease releases.
 
 Verify Herdr before adding Edge:
 
 ```bash
 herdr --version
 herdr api schema >/dev/null
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 ```
 
-For ChatGPT, deploy the Cloudflare Worker on the default `workers.dev` origin, start `herdr-link`, then add the public `/mcp` URL as a custom MCP App/Connector and complete OAuth.
+For ChatGPT, deploy the Cloudflare Worker on the default `workers.dev` origin, start the managed Link, then add the public `/mcp` URL as a custom MCP App/Connector and complete OAuth. See [Installation](docs/i18n/en/install.md).
 
 Do **not** paste `HERDR_MCP_TOKEN` or a Cloudflare API token into ChatGPT.
 
@@ -114,18 +117,12 @@ If you already use Codex, Claude Code, Pi, DSH, Cline or another local coding ag
 Install and deploy herdr-mcp for me. First read the authoritative guide:
 https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md
 
-Follow it end to end. Do not create a Custom Domain, DNS records or a Tunnel for the first installation; use workers.dev. Do not expose or commit any token. Verify each mutation before continuing.
+Follow it end to end. Install the local runtime from GitHub Releases (not git clone/npm). Do not create a Custom Domain, DNS records or a Tunnel for the first installation; use workers.dev. Do not expose or commit any token. Verify each mutation before continuing.
 ```
 
-The deterministic Worker-name helper used by that Edge flow is:
+### Appendix: contributor build from source
 
-```bash
-WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
-```
-
-### Contributor build from source (optional)
-
-Clone this repository only when you are developing herdr-mcp itself. Source builds may still use the Node toolchain for site/extension/Edge packages; that path is not the primary way end users run the MCP runtime.
+Clone this repository only when you are developing herdr-mcp itself. Source builds may still use the Node toolchain for site/extension/Edge packages; that path is not the primary way end users run the MCP runtime. Details live under [Installation](docs/i18n/en/install.md#appendix-developer-from-source).
 
 Full walkthrough: [Quick start](docs/i18n/en/quick-start.md) · [Installation](docs/i18n/en/install.md) · [ChatGPT Connector](docs/i18n/en/chatgpt-connector.md)
 
@@ -169,16 +166,7 @@ workstation → Web conversation
 
 It supports workspace binding, progress/settled wakeups, evidence-first recovery, long-conversation handoff, and a bounded JSON→MCP compatibility bridge for sites such as z.ai / DeepSeek that do not expose the same native custom MCP connector.
 
-Install the local Native Messaging host:
-
-```bash
-bin/herdr-extension-host install
-bin/herdr-extension-host status
-```
-
-Then load `extension/` as an unpacked Chrome/Chromium extension.
-
-See [Browser continuity](docs/i18n/en/browser-continuity.md) and [Browser extension](docs/i18n/en/extension.md).
+Browser continuity is optional and not part of the first-GA platform claim until extension distribution is sealed (see GA gate G15/G16). When you need it on a developer workstation, use the managed Native Messaging installer from the installed runtime and follow [Browser continuity](docs/i18n/en/browser-continuity.md) / [Browser extension](docs/i18n/en/extension.md). Do not treat unpacking `extension/` from a git checkout as the primary end-user path.
 
 ## Security model
 
@@ -237,6 +225,8 @@ Start here:
 - [Design philosophy](docs/i18n/en/design-philosophy.md)
 - [Quick start](docs/i18n/en/quick-start.md)
 - [Installation](docs/i18n/en/install.md)
+- [Clean-machine UAT (G18)](docs/i18n/en/clean-machine-uat.md)
+- [GA release gate](docs/ga-release-gate.md)
 - [ChatGPT Connector](docs/i18n/en/chatgpt-connector.md)
 
 Operate the system:

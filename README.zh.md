@@ -77,32 +77,35 @@ Herdr 原生长尾能力
 
 1. 从 [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) 下载当前平台的 `herdr-mcp` 二进制（产品仍处 alpha 时会出现 prerelease 标签）。
 2. 放到 `PATH` 上（例如 `~/.local/bin/herdr-mcp`）并赋予可执行权限。
-3. 先验证二进制：
+3. 安装托管本机服务并验证：
 
 ```bash
+herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
 herdr-mcp update check
 ```
 
-安装后的日常生命周期：
+`install` 会在 `~/.config/herdr-mcp/runtime/` 写入不可变 generation，并把 `~/.local/bin/herdr-mcp` 指到 `runtime/current/herdr-mcp`。之后的日常生命周期：
 
 ```bash
 herdr-mcp update apply
 herdr-mcp update status
+herdr-mcp rollback
 ```
 
-优先使用以上顶层命令。**不要**把 `herdr-mcp service install` 当成普通用户安装主路径；`service ...` 仍是高级/内部接口。
+优先使用以上顶层命令。**不要**把 `herdr-mcp service install` 当成普通用户安装主路径；`service ...` 仍是高级/内部接口。**不要**用 clone 仓库或 `npm`/`cargo` 安装本机 MCP runtime。
+
+产品仍处 alpha 时，保持 `update.channel = "preview"`（或在 alpha 二进制上不写 config），才能发现 prerelease；`stable` 只发现非 prerelease。
 
 加 Edge 之前先确认 Herdr：
 
 ```bash
 herdr --version
 herdr api schema >/dev/null
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 ```
 
-接 ChatGPT 时，推荐先把 Cloudflare Worker 部署到默认的 `workers.dev`，启动 `herdr-link`，然后在 ChatGPT 添加公网 `/mcp` 地址并完成 OAuth。
+接 ChatGPT 时，先把 Cloudflare Worker 部署到默认 `workers.dev`，启动托管 Link，再在 ChatGPT 添加公网 `/mcp` 并完成 OAuth。详见 [安装](docs/i18n/zh-CN/install.md)。
 
 **不要**把 `HERDR_MCP_TOKEN` 或 Cloudflare API Token 填进 ChatGPT。
 
@@ -114,18 +117,12 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 请帮我安装并部署 herdr-mcp。先读取唯一权威安装协议：
 https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md
 
-严格按文档完成。首次安装不要创建 Custom Domain、DNS 记录或 Tunnel，只使用 workers.dev。不要回显或提交任何 Token。每个 mutation 后先验证状态再继续。
+严格按文档完成。本机 runtime 从 GitHub Releases 安装，不要 git clone/npm。首次安装不要创建 Custom Domain、DNS 记录或 Tunnel，只使用 workers.dev。不要回显或提交任何 Token。每个 mutation 后先验证状态再继续。
 ```
 
-该 Edge 流程生成 Cloudflare-safe Worker 名时使用仓库内的确定性 helper：
+### 附录：贡献者从源码构建
 
-```bash
-WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
-```
-
-### 贡献者从源码构建（可选）
-
-只有在开发 herdr-mcp 本身时才需要 clone 本仓库。源码构建仍可能使用 Node 工具链处理站点/扩展/Edge 包；那不是最终用户运行 MCP runtime 的主路径。
+只有在开发 herdr-mcp 本身时才需要 clone 本仓库。源码构建仍可能使用 Node 工具链处理站点/扩展/Edge 包；那不是最终用户运行 MCP runtime 的主路径。细节见 [安装](docs/i18n/zh-CN/install.md#附录开发者从源码构建)。
 
 完整流程：[快速开始](docs/i18n/zh-CN/quick-start.md) · [安装](docs/i18n/zh-CN/install.md) · [ChatGPT Connector](docs/i18n/zh-CN/chatgpt-connector.md)
 
@@ -245,6 +242,8 @@ runtime generation A / B
 - [设计思路](docs/i18n/zh-CN/design-philosophy.md)
 - [快速开始](docs/i18n/zh-CN/quick-start.md)
 - [安装](docs/i18n/zh-CN/install.md)
+- [干净机 UAT（G18）](docs/i18n/zh-CN/clean-machine-uat.md)
+- [GA 发布门禁](docs/ga-release-gate.md)
 - [ChatGPT Connector](docs/i18n/zh-CN/chatgpt-connector.md)
 
 日常使用与运维：
