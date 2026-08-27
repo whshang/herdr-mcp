@@ -121,6 +121,60 @@ function eventNameOf(ev: HerdrEvent): string {
   return typeof e === "string" ? e : "unknown";
 }
 
+function browserLifecycleEvent(ev: HerdrEvent): { event: string; data: Record<string, unknown> } | null {
+  const raw = (ev["data"] ?? ev) as Record<string, unknown>;
+  const kind = eventNameOf(ev).replace(/\./g, "_").replace(/_event$/, "");
+  const at = typeof ev["at"] === "string" ? ev["at"]
+    : typeof raw["at"] === "string" ? raw["at"] : new Date().toISOString();
+  const paneData = raw["pane"] && typeof raw["pane"] === "object"
+    ? raw["pane"] as Record<string, unknown> : null;
+  const workspaceData = raw["workspace"] && typeof raw["workspace"] === "object"
+    ? raw["workspace"] as Record<string, unknown> : null;
+
+  if ([
+    "pane_created", "pane_updated", "pane_focused", "pane_moved",
+    "pane_agent_detected", "pane_agent_status_changed",
+  ].includes(kind)) {
+    const paneId = typeof paneData?.["pane_id"] === "string" ? paneData["pane_id"] as string
+      : typeof raw["pane_id"] === "string" ? raw["pane_id"] as string : null;
+    if (!paneId || !paneData) return null;
+    const workspace = typeof paneData["workspace_id"] === "string" ? paneData["workspace_id"] as string
+      : typeof raw["workspace_id"] === "string" ? raw["workspace_id"] as string : null;
+    return {
+      event: "pane_upsert",
+      data: { pane: paneId, pane_id: paneId, workspace, pane_data: paneData, at },
+    };
+  }
+
+  if (kind === "pane_closed" || kind === "pane_exited") {
+    const paneId = typeof raw["pane_id"] === "string" ? raw["pane_id"] as string
+      : typeof paneData?.["pane_id"] === "string" ? paneData["pane_id"] as string : null;
+    if (!paneId) return null;
+    const workspace = typeof raw["workspace_id"] === "string" ? raw["workspace_id"] as string
+      : typeof paneData?.["workspace_id"] === "string" ? paneData["workspace_id"] as string : null;
+    return { event: "pane_removed", data: { pane: paneId, pane_id: paneId, workspace, at } };
+  }
+
+  if (["workspace_created", "workspace_updated", "workspace_metadata_updated", "workspace_renamed", "workspace_moved", "workspace_reordered"].includes(kind)) {
+    const workspaceId = typeof workspaceData?.["workspace_id"] === "string" ? workspaceData["workspace_id"] as string
+      : typeof raw["workspace_id"] === "string" ? raw["workspace_id"] as string : null;
+    if (!workspaceId || !workspaceData) return null;
+    return {
+      event: "workspace_upsert",
+      data: { workspace: workspaceId, workspace_data: workspaceData, at },
+    };
+  }
+
+  if (kind === "workspace_closed") {
+    const workspaceId = typeof raw["workspace_id"] === "string" ? raw["workspace_id"] as string
+      : typeof workspaceData?.["workspace_id"] === "string" ? workspaceData["workspace_id"] as string : null;
+    if (!workspaceId) return null;
+    return { event: "workspace_removed", data: { workspace: workspaceId, at } };
+  }
+
+  return null;
+}
+
 function sseWrite(res: Response, event: string, data: unknown): void {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
@@ -153,6 +207,8 @@ class PushHub {
     const name = eventNameOf(ev);
     const ref = agentRefOf(ev);
     if (DEBUG) console.log(`[push] event=${name} pane=${ref.pane} status=${ref.status} agent=${ref.name}`);
+    const lifecycle = browserLifecycleEvent(ev);
+    if (lifecycle) this.emit(lifecycle.event, lifecycle.data);
     if (!ref.pane) return;
 
     // Pane removed — notify so clients can clear busy state.

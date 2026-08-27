@@ -93,11 +93,85 @@ test("pane create adds a row and workspace projection", () => {
   assert.equal(view.panes.at(-1).status, "terminal-only");
 });
 
+test("push pane_upsert payload creates terminal-only and agent panes", () => {
+  let view = normalizeBrowserState(baseSnapshot());
+  view = applyBrowserEvent(view, {
+    type: "pane_upsert",
+    pane: "w1:p3",
+    pane_id: "w1:p3",
+    workspace: "w1",
+    pane_data: { pane_id: "w1:p3", workspace_id: "w1", cwd: "/repo/terminal", agent: null },
+  });
+  assert.equal(view.panes.find((pane) => pane.pane_id === "w1:p3").status, "terminal-only");
+
+  view = applyBrowserEvent(view, {
+    type: "pane_upsert",
+    pane: "w1:p4",
+    pane_id: "w1:p4",
+    workspace: "w1",
+    pane_data: {
+      pane_id: "w1:p4",
+      workspace_id: "w1",
+      cwd: "/repo/agent",
+      agent: "pi",
+      agent_status: "working",
+    },
+  });
+  const agentPane = view.panes.find((pane) => pane.pane_id === "w1:p4");
+  assert.equal(agentPane.agent.name, "pi");
+  assert.equal(agentPane.status, "working");
+});
+
+test("push pane_upsert clears an exited agent while retaining the terminal pane", () => {
+  let view = normalizeBrowserState(baseSnapshot());
+  view = applyBrowserEvent(view, {
+    type: "pane_upsert",
+    pane: "w1:p1",
+    pane_id: "w1:p1",
+    workspace: "w1",
+    pane_data: { pane_id: "w1:p1", workspace_id: "w1", cwd: "/repo", agent: null },
+  });
+  const pane = view.panes.find((item) => item.pane_id === "w1:p1");
+  assert.equal(pane.agent, null);
+  assert.equal(pane.status, "terminal-only");
+});
+
+test("focused pane upsert clears stale focus from its workspace peers", () => {
+  let view = normalizeBrowserState(baseSnapshot());
+  view = applyBrowserEvent(view, {
+    type: "pane_upsert",
+    pane: "w1:p1",
+    workspace: "w1",
+    pane_data: { pane_id: "w1:p1", workspace_id: "w1", cwd: "/repo", focused: true },
+  });
+  assert.equal(view.panes.find((pane) => pane.pane_id === "w1:p1").focused, true);
+  view = applyBrowserEvent(view, {
+    type: "pane_upsert",
+    pane: "w1:p2",
+    workspace: "w1",
+    pane_data: { pane_id: "w1:p2", workspace_id: "w1", cwd: "/repo/tools", focused: true },
+  });
+  assert.equal(view.panes.find((pane) => pane.pane_id === "w1:p1").focused, false);
+  assert.equal(view.panes.find((pane) => pane.pane_id === "w1:p2").focused, true);
+});
+
 test("pane remove removes a row", () => {
   let view = normalizeBrowserState(baseSnapshot());
   view = applyBrowserEvent(view, { type: "pane_removed", pane_id: "w1:p2" });
   assert.equal(view.panes.length, 1);
   assert.equal(view.panes.some((pane) => pane.pane_id === "w1:p2"), false);
+});
+
+test("push workspace lifecycle updates and removes workspace projection", () => {
+  let view = normalizeBrowserState(baseSnapshot());
+  view = applyBrowserEvent(view, {
+    type: "workspace_upsert",
+    workspace: "w2",
+    workspace_data: { workspace_id: "w2", label: "repo-two" },
+  });
+  assert.equal(view.workspaces.find((workspace) => workspace.workspace_id === "w2").label, "repo-two");
+  view = applyBrowserEvent(view, { type: "workspace_removed", workspace: "w2" });
+  assert.equal(view.workspaces.some((workspace) => workspace.workspace_id === "w2"), false);
 });
 
 test("working -> done preserves agent identity", () => {

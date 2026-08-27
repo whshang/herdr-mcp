@@ -1273,12 +1273,21 @@ let pushWorkspaceCatalogAt = 0;
 let stateFetchInFlight = null;
 let localRuntimeReachable = null;
 let localRuntimeCheckedAt = 0;
+const controlCenterPorts = new Set();
+let controlCenterSnapshotAt = 0;
+let controlCenterLastState = null;
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port?.name !== "herdr-control-center") return;
+  controlCenterPorts.add(port);
+  port.onDisconnect.addListener(() => controlCenterPorts.delete(port));
+});
 
 function broadcastControlMessage(message) {
-  try {
-    const pending = chrome.runtime.sendMessage(message);
-    if (pending && typeof pending.catch === "function") pending.catch(() => {});
-  } catch (_) {}
+  for (const port of [...controlCenterPorts]) {
+    try { port.postMessage(message); }
+    catch (_) { controlCenterPorts.delete(port); }
+  }
 }
 
 function noteLocalRuntimeReachability(reachable) {
@@ -1414,9 +1423,18 @@ async function handlePushBlock(block) {
     // A reconnect is the reconciliation boundary for the Control Center.
     // Fetch exactly one authoritative snapshot; steady-state changes remain
     // incremental through the shared event stream below.
-    const state = await fetchState();
-    if (state?.ok) broadcastControlMessage({ type: "herdr_control_state", state });
-  } else if (["agent_working", "agent_settled", "agent_output", "agent_gone"].includes(event)) {
+    if (controlCenterPorts.size > 0 && Date.now() - controlCenterSnapshotAt > 1500) {
+      const state = await fetchState();
+      if (state?.ok) {
+        controlCenterSnapshotAt = Date.now();
+        controlCenterLastState = state;
+        broadcastControlMessage({ type: "herdr_control_state", state });
+      }
+    }
+  } else if ([
+    "agent_working", "agent_settled", "agent_output", "agent_gone",
+    "pane_upsert", "pane_removed", "workspace_upsert", "workspace_removed",
+  ].includes(event)) {
     broadcastControlMessage({ type: "herdr_control_event", event: { type: event, ...data } });
   }
   const bindings = await loadBindings();
@@ -3164,8 +3182,16 @@ async function handleHandoffTurnEnded(msg) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "herdr_control_center_subscribe") {
     void (async () => {
+      if (msg.force !== true && controlCenterLastState && Date.now() - controlCenterSnapshotAt <= 1500) {
+        sendResponse({ ok: true, state: controlCenterLastState });
+        return;
+      }
       const state = await fetchState();
-      if (state?.ok) sendResponse({ ok: true, state });
+      if (state?.ok) {
+        controlCenterSnapshotAt = Date.now();
+        controlCenterLastState = state;
+        sendResponse({ ok: true, state });
+      }
       else sendResponse(state || { ok: false });
     })();
     return true;
