@@ -30,7 +30,7 @@ Use the cheapest deterministic layer that can complete the task.
    - multi-file edits: prefer `herdr_fs_patch`; exact single replacement: `herdr_fs_edit`; new/full file: `herdr_fs_write`;
    - deterministic Git facts: `herdr_git`;
    - short shell/build/probe: `herdr_exec`;
-   - long build/test/process: `herdr_exec_start` -> `herdr_exec_read` -> `herdr_exec_kill` only when needed;
+   - long build/test/process: prefer `herdr_exec_start` -> `herdr_exec_read` (delta) over a blocking `herdr_exec`; `herdr_exec_kill` only when needed;
    - images inside managed repos: `herdr_fs_image`.
 3. **Use a development agent only when reasoning or parallel investigation is genuinely useful**. Prefer cheap/fast Herdr-native workers (`pi`, `cline`, `opencode`, `anti`) for implementation/investigation. Use `droid`/`grok` as independent auditors, not as the primary author by default.
 4. **If Herdr-native workers are unavailable, DeepSeek Harness headless is an optional CLI fallback when installed**. Use it for narrow, self-contained implementation or review tasks; do not put a broad critical-path refactor behind it. Resolve the executable before dispatch: `herdr_exec_start` can have a smaller PATH than the visible utility pane (for example, a user npm-global install may live at `$HOME/.npm-global/bin/dsh`). Run the resolved binary as `dsh --profile headless "<task>"` through `herdr_exec_start`, then poll with `herdr_exec_read`. Do not use a synchronous 60-second `herdr_exec` for non-trivial DSH coding work: a tool mutation can finish before DSH prints its final answer. **Do not treat exit code 0 alone as completion evidence**: require a non-empty final answer or an explicit task completion marker, and for mutation tasks also verify the expected Git/files/test state. Give each DSH job an explicit time/output/diff checkpoint; if it produces neither useful output nor a relevant diff, inspect process/Git state once, cancel if appropriate, and fall back rather than waiting indefinitely. Prompt wording such as “implement now” is not a substitute for that budget. If an automated headless job needs a different model/reasoning profile, scope the override to that headless invocation/profile (for example with a temporary `--patch`) and never mutate the operator's global interactive/TUI configuration as an automation side effect. `dsh-tui` is a human-interactive fallback, not the normal automated worker.
@@ -39,24 +39,25 @@ Use the cheapest deterministic layer that can complete the task.
 
 ## 1A. Latency-aware tool scheduling
 
-Treat MCP round trips and model re-entry as real costs. Before issuing a sequence of tools, group the next operations into a small dependency-aware **wave** instead of mechanically calling one tool and replanning after every result.
+Group the next tools into a small dependency-aware **wave** instead of calling one tool and replanning after every result. Round trips and model re-entry are real costs.
 
 - After one `herdr_inspect` establishes workspace/pane/root identities, reuse those exact IDs and paths. Do not rediscover state that has not become stale.
 - Independent read-only operations should be issued concurrently when the client supports parallel tool calls. Examples: project-instruction reads, independent greps, Git facts, and unrelated file reads. Only serialize when one result determines the next call's arguments or safety decision.
+- Large `herdr_git status`/`diff`/`log`, successful large `herdr_exec` output, and `herdr_fs_grep` are already compacted (counts, directory or file grouping, exec head/tail). Plan from `counts`/`compacted` and the summarized `output`; do not re-call the same scope hoping for a full dump unless a specific path still needs detail.
+- Long build/test/process work belongs in `herdr_exec_start`, then later waves poll `herdr_exec_read(offset=next_offset)`. Do not hold a long job behind one blocking `herdr_exec`.
 - After the first state baseline, prefer `herdr_since(cursor)` for incremental workspace/agent changes instead of repeatedly calling full `herdr_inspect`.
 - Use `herdr_exec_read(offset=next_offset)` as a delta read. Never restart at offset 0 unless earlier output is actually needed again. While `phase=running`, use `progress.bytes_total` / `progress.elapsed_ms` as live progress; stop when `phase=completed` (same moment as `running=false`).
 - Prefer one `herdr_fs_patch` for a coherent multi-file mutation instead of a chain of tiny edits. Mutations in the same project remain ordered by default; independent isolated mutation lanes may proceed in parallel.
 - Do not call `herdr_methods` before every `herdr_call`; discover only the method/schema that is unknown, then reuse the known schema during the task.
-- The generated **Live herdr-mcp runtime context** is authoritative for current execution capabilities such as server-side concurrency, JSON-RPC batch, and multi-operation tool arguments. Do not assume a capability is permanently forbidden merely because an older implementation lacked it.
-- When no batch form exists, prefer fewer high-value bounded calls over many tiny calls. When a future runtime advertises a safe batch form, prefer server-side batch over N sequential model round trips.
+- The generated **Live herdr-mcp runtime context** is authoritative for current execution capabilities such as server-side concurrency, JSON-RPC batch, and multi-operation tool arguments. Prefer fewer high-value bounded calls when no batch form exists; prefer an advertised server-side batch over N sequential model round trips.
 
 Target shape:
 
 ```text
 inspect once
   -> independent read-only wave
-  -> ordered mutation(s)
-  -> validation wave
+  -> ordered mutation(s) / long exec_start sessions
+  -> validation wave (exec_read deltas, git/grep compact views)
   -> since(cursor) for incremental follow-up
 ```
 

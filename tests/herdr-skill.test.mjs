@@ -46,6 +46,13 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /boot_id.*herdr_since\(cursor=0\)/s);
     assert.match(r.content, /never blindly resend it/s);
     assert.match(r.content, /Live herdr-mcp runtime context/);
+    assert.match(r.content, /Latency-aware tool scheduling/);
+    assert.match(r.content, /dependency-aware \*\*wave\*\*/);
+    assert.match(r.content, /herdr_git status.*diff.*log.*herdr_exec.*herdr_fs_grep.*compacted/s);
+    assert.match(r.content, /counts.*compacted.*summarized `output`/s);
+    assert.match(r.content, /Long build\/test\/process work belongs in `herdr_exec_start`/);
+    assert.match(r.content, /herdr_exec_read\(offset=next_offset\)/);
+    assert.match(r.content, /prefer `herdr_exec_start` -> `herdr_exec_read` \(delta\) over a blocking `herdr_exec`/);
     assert.equal(r.runtime.contract_profile, process.env.HERDR_MCP_CONTRACT_PROFILE || "current");
     assert.equal(typeof r.runtime.worker_fallbacks, "object");
     assert.equal(r.runtime.worker_fallbacks.dsh_headless.invocation, "herdr_exec_start -> dsh --profile headless <task>");
