@@ -277,40 +277,40 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ---
 
-## Current Scorecard（2026-08-28 · post #104/#105/#106 · live alpha.14）
+## Current Scorecard（2026-08-28 · live alpha.15）
 
-评分：`PASS` / `PARTIAL` / `FAIL` / `DEFERRED` / `UNKNOWN`。本表对齐 live `0.4.0-alpha.14`（generation `rust-7c0ac0b73060aae0`）+ main 已含 doctor remote probe / update.channel / G22 docs / extension pack (#109) / G18 TMPHOME sim (#108)。产品仍处 **alpha**，**未达 GA**。
+评分：`PASS` / `PARTIAL` / `FAIL` / `DEFERRED` / `UNKNOWN`。本表对齐 live `0.4.0-alpha.15`（generation `rust-f117b90f9e8e5b7f`；Release <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0-alpha.15>）。产品仍处 **alpha**，**未达 GA**。**未打 stable `0.4.0` tag**。
 
-本机：`production_ready=true`；production Link=Rust；epoch 2 / 18 tools；用户 CLI → `runtime/current`。**G5 保持 PASS**。
+本机：`production_ready=true`（seal 仍在；update apply 后未要求重 seal）；production Link=Rust；epoch 2 / 18 tools；用户 CLI → `runtime/current`。**G5 保持 PASS**。dogfood `update apply` alpha.14→alpha.15 成功；`doctor` Edge reachable / OAuth metadata / MCP endpoint（401 auth=not-sent）绿。
 
 **第一 GA 平台冻结：** macOS Apple Silicon 正式支持；Windows Release artifact 为 preview/experimental；不宣称完整 Linux/Windows service lifecycle。
 
 | ID | 评分 | 一行证据 |
 | --- | --- | --- |
-| G1 | **FAIL** | 仍处 alpha：live `0.4.0-alpha.14`；`package.json` 不得冒充 runtime 产品版本 |
-| G2 | **PARTIAL** | Release + attestation/manifest 存在；文档主路径已是 binary → `herdr-mcp install`；干净机下载 UAT 仍属 G18 |
+| G1 | **FAIL** | 仍处 alpha：live `0.4.0-alpha.15`；`package.json` 不得冒充 runtime 产品版本 |
+| G2 | **PARTIAL** | Release + attestation/manifest + extension zip 齐；文档主路径 binary → install；干净机完整 UAT 仍属 G18 |
 | G3 | **PARTIAL** | 顶层 CLI + live symlink → `runtime/current`；缺干净机 seal |
 | G4 | **PARTIAL** | 文档已给出 binary → install → doctor/status/update；干净机 UAT 仍属 G18 |
-| G5 | **PASS** | 本机 production owner=rust；link-prod Rust；health/`doctor`/`link status` `production_ready` |
-| G6 | **PARTIAL** | epoch 2 / 18 tools 冻结；公网 ChatGPT GA UAT 未封 |
-| G7 | **PARTIAL** | 本机 sealed Rust `link-prod`；公网完整 GA UAT 未封 |
-| G8 | **PARTIAL** | doctor 区分 Herdr/runtime/service/NM/Link/Edge configured + 有界 HTTPS Edge reachable / OAuth metadata / MCP endpoint（不发 token）；WSS dial skipped；干净机 UAT 未封 |
-| G9 | **PARTIAL** | alpha N→N+1 已过；`update.channel` stable/preview 语义已合入；无 stable N→N+1 / 干净机 UAT |
+| G5 | **PASS** | 本机 production owner=rust；link-prod Rust；health/`doctor`/`link seal status` `production_ready` |
+| G6 | **PARTIAL** | epoch 2 / 18 tools 冻结；公网 ChatGPT GA UAT 未封（需 owner 会话） |
+| G7 | **PARTIAL** | 本机 sealed Rust `link-prod`；公网完整 GA UAT 未封（需 owner 会话） |
+| G8 | **PARTIAL** | alpha.15 doctor：Herdr/runtime/service/NM/Link + Edge reachable / OAuth metadata / MCP endpoint；WSS dial skipped；干净机 UAT 未封 |
+| G9 | **PARTIAL** | alpha.14→alpha.15 `update apply` 已过（provenance + health gate）；无 stable N→N+1 / 干净机 UAT |
 | G10 | **PARTIAL** | 受控 rollback 有证据；非 stable、非干净机 |
 | G11 | **PARTIAL** | service guardian / Link reconnect 有证据；完整矩阵未做 |
 | G12 | **PARTIAL** | Streaming basics 已落地；跨网页回合 GA UAT 未封 |
 | G13 | **PASS** | Batch A + Result Optimization 已合入 |
 | G14 | **PARTIAL** | fs/service mutation fencing 已有；Agent/terminal/browser mutation 不进第一 GA 宣称 |
-| G15 | **PARTIAL** | #109：deterministic `herdr-mcp-extension-<ver>.zip` + `.sha256` + managed `~/.config/herdr-mcp/extension` + native-host 优先托管路径；`<all_urls>` 保留（LLM judge / 自定义 herdrMcpUrl）；**尚未作为 GitHub Release asset 发布**（alpha.14 仅 binary/manifest） |
+| G15 | **PARTIAL** | `v0.4.0-alpha.15` 已附 `herdr-mcp-extension-0.1.64.zip` + `.sha256`（确定性 sha 与本地 pack 一致）；managed path + `native-host install` smoke OK；Chrome Load unpacked / 站点绑定未在本轮代操作；`<all_urls>` 保留 |
 | G16 | **DEFERRED** | **post-GA / 非第一 GA blocker**：browser terminal / interrupt / true-steer / Browser mutation 明确不宣称；不阻塞 stable |
 | G17 | **PARTIAL** | 边界多已实现；缺干净机 + 公网完整安全验收 |
-| G18 | **PARTIAL** | TMPHOME sim PASS（`docs/_wip/g18-clean-machine-sim-20260828.md`）；完整 install 仍需第二台 Mac |
+| G18 | **PARTIAL** | alpha.15 TMPHOME 再测：Release 下载/`--version`/config/doctor/update-check OK，dogfood launchd/plist 未变；**禁止**同机 `install`（label `dev.herdr-mcp.server` + `:8772` 写死，TMPHOME 会误读狗粮 daemon）；完整 install 仍需第二台 Mac/VM（见 `docs/i18n/en/clean-machine-uat.md`） |
 | G19 | **FAIL** | 第二台/多平台 UAT 未做；第一 GA 仅承诺 macOS Apple Silicon |
-| G20 | **PARTIAL** | README/install/agent-install 已去 clone/npm 主路径；extension.md 已写 Release zip → Load unpacked → native-host；缺干净机端到端证明 |
+| G20 | **PARTIAL** | README/install/agent-install/extension.md Release 主路径已写；缺干净机端到端证明 |
 | G21 | **PARTIAL** | 站点 CI 可绿；无 stable tag 封板 |
 | G22 | **PARTIAL** | docs PASS（#104）；**docs ≠ clean-machine UAT**（G18） |
 | G23 | **PARTIAL** | main CI 可绿；GA tag 全绿验收未跑 |
-| G24 | **FAIL** | 剩余 GA blocker：G1 alpha、G18 完整干净机 install、G15 Release 发布、G17/G7 公网验收；G16 已 DEFERRED 不挡 |
+| G24 | **FAIL** | 剩余 GA blocker：G1 alpha、G18 完整干净机 install、G17/G7 公网 ChatGPT UAT；G15 artifact 已发布但仍 PARTIAL；G16 DEFERRED 不挡 |
 | G25 | **FAIL** | 未达 GA：不得打 stable |
 
 **合计（诚实快照）**：PASS 2 · PARTIAL 17 · FAIL 5 · DEFERRED 1 · UNKNOWN 0
@@ -319,12 +319,12 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ## Current P0 work queue
 
-按 2026-08-28 post-#109 证据排序：
+按 2026-08-28 post-alpha.15 证据排序：
 
-1. **G18 — 干净机完整 install UAT**（第二台 macOS Apple Silicon / 独立用户域；禁止 repo checkout 当 runtime 源；TMPHOME sim 见 `docs/_wip/g18-clean-machine-sim-20260828.md`）。
-2. **G15 seal — 把 extension zip 打进下一份 GitHub Release**（打包管线已在 main；alpha.14 尚无该 asset）。
-3. **G17 / 公网安全与 ChatGPT 闭环验收**。
-4. **G1 — 退出 alpha**（干净机 candidate 全绿后再评估 `0.4.0` stable）。
+1. **G18 — 干净机完整 install UAT**（第二台 macOS Apple Silicon / VM；禁止在狗粮机同 uid 上 `install`；runbook：`docs/i18n/en/clean-machine-uat.md`）。
+2. **G17 / G7 — 公网 ChatGPT OAuth + tools UAT**（需 owner 在 ChatGPT 新会话完成；清单见 clean-machine-uat §B + chatgpt-connector）。
+3. **G1 — 退出 alpha**（干净机 + 公网 candidate 全绿后再评估 `0.4.0` stable；**现在不要打 stable tag**）。
+4. **G15 residual** — Chrome Load unpacked 对 managed zip 的真人验收（本轮只做 zip 下载 + native-host smoke）。
 5. **G22 seal** — 干净机验证文档主路径后升 PASS。
 6. **G16 — 保持 DEFERRED**（browser terminal / true-steer / mutation 不进第一 GA）。
 
