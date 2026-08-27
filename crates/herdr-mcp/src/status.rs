@@ -1,13 +1,22 @@
 use crate::config::Config;
 use crate::herdr::HerdrClient;
+use crate::native_host_install;
 use crate::native_tools;
 use crate::paths::RuntimePaths;
+use crate::service_manager;
 use crate::snapshot;
 use crate::state_cache::EventCache;
-use serde_json::json;
+use crate::updater_store::UpdateStore;
+use serde_json::{Value, json};
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum RuntimeHealth {
@@ -101,6 +110,7 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     print_check("Herdr snapshot state", snapshot_healthy);
     print_check("Herdr inspect projection", inspect_healthy);
     print_check("Herdr event cache", event_cache.healthy);
+    print_layer_ownership(paths, config, &report);
     println!("INFO config {}", paths.config_file.display());
     println!("INFO state {}", paths.config_dir.display());
     println!("INFO dev-state {}", paths.dev_state_dir.display());
@@ -144,6 +154,376 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         && snapshot_healthy
         && inspect_healthy
         && event_cache.healthy
+}
+
+/// Product-layer ownership map. Local probes only; never opens Edge/WSS.
+fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusReport) {
+    println!("LAYER herdr {}", format_herdr_layer(paths, report));
+    println!(
+        "LAYER local-runtime {}",
+        format_local_runtime_layer(paths, config, report.runtime)
+    );
+    println!("LAYER service {}", format_service_layer());
+    println!("LAYER local-ipc {}", format_local_ipc_layer(paths));
+    println!(
+        "LAYER native-messaging {}",
+        format_native_messaging_layer()
+    );
+    println!("LAYER link {}", format_link_layer(paths));
+    println!("LAYER edge {}", format_edge_layer(paths));
+    println!("LAYER update-state {}", format_update_state_layer(paths));
+}
+
+fn format_herdr_layer(paths: &RuntimePaths, report: &StatusReport) -> String {
+    let sock = paths
+        .herdr_socket
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "unset".to_owned());
+    if report.herdr_transport_reachable {
+        format!("owned reachable sock={sock}")
+    } else {
+        format!("unowned unreachable sock={sock}")
+    }
+}
+
+fn format_local_runtime_layer(
+    paths: &RuntimePaths,
+    config: &Config,
+    health: RuntimeHealth,
+) -> String {
+    let current = paths.config_dir.join("runtime").join("current");
+    let generation = read_runtime_generation(&current);
+    let health_label = match health {
+        RuntimeHealth::Healthy(code) => format!("healthy http={code}"),
+        RuntimeHealth::UnexpectedHttp(code) => format!("unexpected http={code}"),
+        RuntimeHealth::Unreachable => "unreachable".to_owned(),
+    };
+    match generation {
+        Ok(Some(generation)) => format!(
+            "owned {health_label} port={} generation={generation}",
+            config.runtime_port
+        ),
+        Ok(None) => format!(
+            "unowned {health_label} port={} generation=missing",
+            config.runtime_port
+        ),
+        Err(detail) => format!(
+            "unowned {health_label} port={} generation=invalid detail={detail}",
+            config.runtime_port
+        ),
+    }
+}
+
+fn format_service_layer() -> String {
+    match service_manager::doctor_status() {
+        Ok(value) => {
+            let implementation = value
+                .get("implementation")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let loaded = value.get("loaded").and_then(Value::as_bool).unwrap_or(false);
+            let healthy = value
+                .get("healthy")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let label = value
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("dev.herdr-mcp.server");
+            let generation = value
+                .get("generation")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let ownership = if implementation == "rust" && loaded {
+                "owned"
+            } else if implementation == "missing" {
+                "absent"
+            } else {
+                "unowned"
+            };
+            format!(
+                "{ownership} implementation={implementation} loaded={loaded} healthy={healthy} label={label} generation={generation}"
+            )
+        }
+        Err(error) => format!("error detail={}", compact_detail(&error)),
+    }
+}
+
+fn format_local_ipc_layer(paths: &RuntimePaths) -> String {
+    let path = paths.config_dir.join("extension.sock");
+    match inspect_unix_socket(&path) {
+        SocketView::Present { mode } => {
+            format!("owned present mode={mode:04o} path={}", path.display())
+        }
+        SocketView::Absent => format!("absent path={}", path.display()),
+        SocketView::Invalid { detail } => {
+            format!("unowned invalid path={} detail={detail}", path.display())
+        }
+    }
+}
+
+fn format_native_messaging_layer() -> String {
+    match native_host_install::doctor_status() {
+        Ok(value) => {
+            let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            let owned = value
+                .get("owned_manifest_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let wrapper_ok = value
+                .get("wrapper_ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let runtime_ok = value
+                .get("runtime_binary_ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let ownership = if ok {
+                "owned"
+            } else if owned == 0 && !wrapper_ok && !runtime_ok {
+                "absent"
+            } else {
+                "unowned"
+            };
+            format!(
+                "{ownership} manifests={owned} wrapper_ok={wrapper_ok} runtime_binary_ok={runtime_ok}"
+            )
+        }
+        Err(error) => format!("error detail={}", compact_detail(&error)),
+    }
+}
+
+fn format_link_layer(paths: &RuntimePaths) -> String {
+    let control_path = prefer_existing(&[
+        paths.config_dir.join("runtime-control-prod.json"),
+        paths.config_dir.join("runtime-control.json"),
+    ]);
+    let status_path = prefer_existing(&[
+        paths.config_dir.join("runtime-status-prod.json"),
+        paths.config_dir.join("runtime-status.json"),
+    ]);
+    let control = control_path
+        .as_ref()
+        .and_then(|path| read_json_object(path).ok());
+    let status = status_path
+        .as_ref()
+        .and_then(|path| read_json_object(path).ok());
+    let desired = control
+        .as_ref()
+        .and_then(|value| value.get("desired_active"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let outcome = status
+        .as_ref()
+        .and_then(|value| value.get("outcome"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let active = status
+        .as_ref()
+        .and_then(|value| value.pointer("/manager/active_generation"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let link_prod_loaded = launchd_label_loaded("dev.herdr-mcp.link-prod");
+    let link_loaded = launchd_label_loaded("dev.herdr-mcp.link");
+    let ownership = if control.is_some() || link_prod_loaded || link_loaded {
+        "owned-local"
+    } else {
+        "absent"
+    };
+    format!(
+        "{ownership} control={} status={} desired={desired} active={active} outcome={outcome} link-prod-loaded={link_prod_loaded} link-loaded={link_loaded} remote-probe=skipped",
+        control_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "missing".to_owned()),
+        status_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "missing".to_owned()),
+    )
+}
+
+fn format_edge_layer(_paths: &RuntimePaths) -> String {
+    // Honest local view only: Edge host from link LaunchAgent env, never WSS dial.
+    let Some(home) = home_dir() else {
+        return "absent remote-probe=skipped".to_owned();
+    };
+    let candidates = [
+        home.join("Library")
+            .join("LaunchAgents")
+            .join("dev.herdr-mcp.link-prod.plist"),
+        home.join("Library")
+            .join("LaunchAgents")
+            .join("dev.herdr-mcp.link.plist"),
+    ];
+    for path in candidates {
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(host) = edge_host_from_plist(&path) {
+            return format!(
+                "configured-local host={host} plist={} remote-probe=skipped",
+                path.display()
+            );
+        }
+    }
+    "absent remote-probe=skipped".to_owned()
+}
+
+fn format_update_state_layer(paths: &RuntimePaths) -> String {
+    let db = paths.config_dir.join("update").join("state.db");
+    if !db.is_file() {
+        return "absent db=missing".to_owned();
+    }
+    match UpdateStore::open(paths).and_then(|store| store.latest_update_job()) {
+        Ok(Some(job)) => format!(
+            "owned job={} version={} state={}",
+            job.job_id, job.version, job.state
+        ),
+        Ok(None) => "owned job=none".to_owned(),
+        Err(error) => format!("error detail={}", compact_detail(&error)),
+    }
+}
+
+fn read_runtime_generation(current: &Path) -> Result<Option<String>, String> {
+    match fs::symlink_metadata(current) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot stat runtime/current: {error}")),
+        Ok(metadata) => {
+            if !metadata.file_type().is_symlink() {
+                return Err("runtime/current is not a symlink".to_owned());
+            }
+            let target = fs::read_link(current)
+                .map_err(|error| format!("cannot read runtime/current: {error}"))?;
+            let name = target
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| "runtime/current target is not a generation id".to_owned())?;
+            if !name.starts_with("rust-") {
+                return Err(format!("unmanaged generation target {name}"));
+            }
+            Ok(Some(name.to_owned()))
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SocketView {
+    Present { mode: u32 },
+    Absent,
+    Invalid { detail: String },
+}
+
+fn inspect_unix_socket(path: &Path) -> SocketView {
+    #[cfg(unix)]
+    {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => SocketView::Absent,
+            Err(error) => SocketView::Invalid {
+                detail: format!("stat-failed:{error}"),
+            },
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return SocketView::Invalid {
+                        detail: "symlink-refused".to_owned(),
+                    };
+                }
+                if !metadata.file_type().is_socket() {
+                    return SocketView::Invalid {
+                        detail: "not-a-socket".to_owned(),
+                    };
+                }
+                SocketView::Present {
+                    mode: metadata.permissions().mode() & 0o777,
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        SocketView::Invalid {
+            detail: "unix-socket-unsupported".to_owned(),
+        }
+    }
+}
+
+fn prefer_existing(paths: &[PathBuf]) -> Option<PathBuf> {
+    paths.iter().find(|path| path.is_file()).cloned()
+}
+
+fn read_json_object(path: &Path) -> Result<Value, String> {
+    let bytes = fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() > 64 * 1024 {
+        return Err(format!("{} exceeds doctor read budget", path.display()));
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid json {}: {error}", path.display()))?;
+    if !value.is_object() {
+        return Err(format!("{} is not a json object", path.display()));
+    }
+    Ok(value)
+}
+
+fn edge_host_from_plist(path: &Path) -> Option<String> {
+    let value = plist::Value::from_file(path).ok()?;
+    let env = value
+        .as_dictionary()?
+        .get("EnvironmentVariables")?
+        .as_dictionary()?;
+    let edge_url = env.get("HERDR_EDGE_URL")?.as_string()?;
+    edge_host(edge_url)
+}
+
+fn edge_host(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("wss://") || trimmed.starts_with("ws://")) {
+        return None;
+    }
+    let rest = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let host = rest.split(['/', '?', '#']).next()?.trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_owned())
+    }
+}
+
+fn launchd_label_loaded(label: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("launchctl").arg("list").output();
+        let Ok(output) = output else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.split_whitespace().nth(2) == Some(label))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = label;
+        false
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn compact_detail(detail: &str) -> String {
+    detail
+        .chars()
+        .map(|ch| if ch.is_whitespace() { '-' } else { ch })
+        .take(120)
+        .collect()
 }
 
 fn probe_event_cache(paths: &RuntimePaths) -> EventCacheProbe {
@@ -274,5 +654,38 @@ mod tests {
     fn labels_runtime_state() {
         assert!(runtime_label(RuntimeHealth::Healthy(401), 8772).contains("healthy"));
         assert!(runtime_label(RuntimeHealth::Unreachable, 8772).contains("unreachable"));
+    }
+
+    #[test]
+    fn extracts_edge_host_without_credentials() {
+        assert_eq!(
+            edge_host("wss://herdr-edge-prod.example/ws?link_token=secret"),
+            Some("herdr-edge-prod.example".to_owned())
+        );
+        assert_eq!(edge_host("https://example"), None);
+    }
+
+    #[test]
+    fn reads_managed_runtime_generation_symlink() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-doctor-gen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("generations").join("rust-abc123")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink("generations/rust-abc123", root.join("current")).unwrap();
+            assert_eq!(
+                read_runtime_generation(&root.join("current")).unwrap(),
+                Some("rust-abc123".to_owned())
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }
