@@ -109,6 +109,32 @@ ls -l "$HOME/.local/bin/herdr-mcp"
 launchctl list | awk -v label='dev.herdr-mcp.server' '$3 == label { print $1, $2, $3 }'
 ```
 
+### Named-instance extension (same Mac, static only)
+
+Extract the Release extension zip into the **uat** config root (not dogfood `~/.config/herdr-mcp/extension`):
+
+```bash
+export HERDR_MCP_INSTANCE=uat
+gh release download "$TAG" -R "$REPO" -D "$WORKDIR/dl" \
+  -p "herdr-mcp-extension-*.zip" \
+  -p "herdr-mcp-extension-*.zip.sha256"
+shasum -a 256 -c "$WORKDIR/dl"/herdr-mcp-extension-*.zip.sha256
+mkdir -p "$HOME/.config/herdr-mcp-uat/extension"
+unzip -o "$WORKDIR/dl"/herdr-mcp-extension-*.zip -d "$HOME/.config/herdr-mcp-uat/extension"
+herdr-mcp --instance uat doctor
+# expect: local-ipc PASS; native-messaging absent (Chrome host name dev.herdr.mcp is singleton)
+```
+
+Static smoke (no Chrome required; run from a checkout):
+
+```bash
+node tests/manual/extension_smoke.mjs
+node tests/manual/background_bind_test.mjs
+node --test tests/queued-insert.test.mjs
+```
+
+**Do not** run `herdr-mcp --instance uat native-host install` on the dogfood Mac: it would overwrite the production Chrome manifest at `NativeMessagingHosts/dev.herdr.mcp.json`. Full G15 native-host + Load unpacked seal requires a second Mac default instance or an owner maintenance window on dogfood default instance.
+
 Cleanup when finished (does not touch dogfood):
 
 ```bash

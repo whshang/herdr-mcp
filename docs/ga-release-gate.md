@@ -277,55 +277,124 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ---
 
-## Current Scorecard（2026-08-28 · live alpha.15）
+## Current Scorecard（2026-08-28 · live alpha.16）
 
-评分：`PASS` / `PARTIAL` / `FAIL` / `DEFERRED` / `UNKNOWN`。本表对齐 live `0.4.0-alpha.15`（generation `rust-f117b90f9e8e5b7f`；Release <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0-alpha.15>）。产品仍处 **alpha**，**未达 GA**。**未打 stable `0.4.0` tag**。
+评分：`PASS` / `PARTIAL` / `FAIL` / `DEFERRED` / `UNKNOWN`。本表对齐 live `0.4.0-alpha.16`（generation `rust-a3a09e936235c6b8`；Release <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0-alpha.16>）。产品仍处 **alpha**，**未达 GA**。**未打 stable `0.4.0` tag**。
 
-本机：`production_ready=true`（seal 仍在；update apply 后未要求重 seal）；production Link=Rust；epoch 2 / 18 tools；用户 CLI → `runtime/current`。**G5 保持 PASS**。dogfood `update apply` alpha.14→alpha.15 成功；`doctor` Edge reachable / OAuth metadata / MCP endpoint（401 auth=not-sent）绿。
+本机 dogfood（默认实例）：`production_ready=true`；`dev.herdr-mcp.server` `:8772` healthy；production Link=Rust；epoch 2 / 18 tools；用户 CLI → `runtime/current`。**G5 保持 PASS**。
+
+同机命名实例 UAT（`HERDR_MCP_INSTANCE=uat`，PR #113/#114）：`dev.herdr-mcp.uat.server` `:8885` healthy；config `~/.config/herdr-mcp-uat`；`~/.local/bin/herdr-mcp` 仍指向 dogfood；Release 二进制路径 `install` / `doctor` / `status` / `update check` 全绿。此为 **G18 本机 runtime 路径进展**，**不是**完整 G18 PASS。
 
 **第一 GA 平台冻结：** macOS Apple Silicon 正式支持；Windows Release artifact 为 preview/experimental；不宣称完整 Linux/Windows service lifecycle。
 
 | ID | 评分 | 一行证据 |
 | --- | --- | --- |
-| G1 | **FAIL** | 仍处 alpha：live `0.4.0-alpha.15`；`package.json` 不得冒充 runtime 产品版本 |
-| G2 | **PARTIAL** | Release + attestation/manifest + extension zip 齐；文档主路径 binary → install；干净机完整 UAT 仍属 G18 |
-| G3 | **PARTIAL** | 顶层 CLI + live symlink → `runtime/current`；缺干净机 seal |
-| G4 | **PARTIAL** | 文档已给出 binary → install → doctor/status/update；干净机 UAT 仍属 G18 |
+| G1 | **FAIL** | 仍处 alpha：live `0.4.0-alpha.16`；`package.json` 不得冒充 runtime 产品版本 |
+| G2 | **PARTIAL** | Release + attestation/manifest + extension zip 齐；文档主路径 binary → install；完整干净机 UAT 仍属 G18 |
+| G3 | **PARTIAL** | 顶层 CLI + live symlink → `runtime/current`；缺第二台 Mac 默认实例 seal |
+| G4 | **PARTIAL** | 文档已给出 binary → install → doctor/status/update；命名实例同机 install 已过；默认实例干净机 UAT 未封 |
 | G5 | **PASS** | 本机 production owner=rust；link-prod Rust；health/`doctor`/`link seal status` `production_ready` |
-| G6 | **PARTIAL** | epoch 2 / 18 tools 冻结；公网 ChatGPT GA UAT 未封（需 owner 会话） |
+| G6 | **PARTIAL** | epoch 2 / 18 tools 冻结；公网 ChatGPT GA UAT 未封（需 owner 会话；见下方 Owner ChatGPT UAT pack） |
 | G7 | **PARTIAL** | 本机 sealed Rust `link-prod`；公网完整 GA UAT 未封（需 owner 会话） |
-| G8 | **PARTIAL** | alpha.15 doctor：Herdr/runtime/service/NM/Link + Edge reachable / OAuth metadata / MCP endpoint；WSS dial skipped；干净机 UAT 未封 |
-| G9 | **PARTIAL** | alpha.14→alpha.15 `update apply` 已过（provenance + health gate）；无 stable N→N+1 / 干净机 UAT |
+| G8 | **PARTIAL** | alpha.16 dogfood `doctor`：Herdr/runtime/service/NM/Link + Edge/OAuth/MCP endpoint 绿；uat `doctor` 本机四层绿但 `native-messaging absent`（同机 Chrome 不能双注册 `dev.herdr.mcp`）；WSS dial skipped；完整干净机 doctor 未封 |
+| G9 | **PARTIAL** | alpha.14→alpha.15 `update apply` 有证据；alpha.16 当前代；无 stable N→N+1 / 干净机 update/rollback UAT |
 | G10 | **PARTIAL** | 受控 rollback 有证据；非 stable、非干净机 |
 | G11 | **PARTIAL** | service guardian / Link reconnect 有证据；完整矩阵未做 |
 | G12 | **PARTIAL** | Streaming basics 已落地；跨网页回合 GA UAT 未封 |
 | G13 | **PASS** | Batch A + Result Optimization 已合入 |
 | G14 | **PARTIAL** | fs/service mutation fencing 已有；Agent/terminal/browser mutation 不进第一 GA 宣称 |
-| G15 | **PARTIAL** | `v0.4.0-alpha.15` 已附 `herdr-mcp-extension-0.1.64.zip` + `.sha256`（确定性 sha 与本地 pack 一致）；managed path + `native-host install` smoke OK；Chrome Load unpacked / 站点绑定未在本轮代操作；`<all_urls>` 保留 |
+| G15 | **PARTIAL** | alpha.16 附 `herdr-mcp-extension-0.1.64.zip` + sha256；uat 已解压至 `~/.config/herdr-mcp-uat/extension`；`extension_smoke` / `background_bind_test` / `queued-insert.test.mjs` 全绿；dogfood `native-host` 仍 owned；**同机 uat 禁止 `native-host install`**（会覆盖 Chrome `dev.herdr.mcp.json`）；Chrome Load unpacked + 绑定未封 |
 | G16 | **DEFERRED** | **post-GA / 非第一 GA blocker**：browser terminal / interrupt / true-steer / Browser mutation 明确不宣称；不阻塞 stable |
 | G17 | **PARTIAL** | 边界多已实现；缺干净机 + 公网完整安全验收 |
-| G18 | **PARTIAL** | alpha.15 TMPHOME 再测：Release 下载/`--version`/config/doctor/update-check OK，dogfood launchd/plist 未变；**禁止**同机 `install`（label `dev.herdr-mcp.server` + `:8772` 写死，TMPHOME 会误读狗粮 daemon）；完整 install 仍需第二台 Mac/VM（见 `docs/i18n/en/clean-machine-uat.md`） |
+| G18 | **PARTIAL** | alpha.16 命名实例同机：Release 下载 → `--instance uat install` → doctor/status/update-check PASS；dogfood `:8772` / `dev.herdr-mcp.server` 未变；extension zip → uat config + 静态 smoke 绿；**非 PASS**：uat native-host、公网 ChatGPT OAuth/tools/mutation/long-task、update/rollback、第二台 Mac 默认实例完整路径 |
 | G19 | **FAIL** | 第二台/多平台 UAT 未做；第一 GA 仅承诺 macOS Apple Silicon |
-| G20 | **PARTIAL** | README/install/agent-install/extension.md Release 主路径已写；缺干净机端到端证明 |
+| G20 | **PARTIAL** | README/install/agent-install/extension.md + clean-machine-uat 已写命名实例；缺第二台 Mac 端到端证明 |
 | G21 | **PARTIAL** | 站点 CI 可绿；无 stable tag 封板 |
 | G22 | **PARTIAL** | docs PASS（#104）；**docs ≠ clean-machine UAT**（G18） |
 | G23 | **PARTIAL** | main CI 可绿；GA tag 全绿验收未跑 |
-| G24 | **FAIL** | 剩余 GA blocker：G1 alpha、G18 完整干净机 install、G17/G7 公网 ChatGPT UAT；G15 artifact 已发布但仍 PARTIAL；G16 DEFERRED 不挡 |
+| G24 | **FAIL** | 剩余 GA blocker：G1 alpha、G18 完整默认实例干净机路径、G17/G7 公网 ChatGPT UAT；G15 仍 PARTIAL；G16 DEFERRED 不挡 |
 | G25 | **FAIL** | 未达 GA：不得打 stable |
 
 **合计（诚实快照）**：PASS 2 · PARTIAL 17 · FAIL 5 · DEFERRED 1 · UNKNOWN 0
+
+### G18 same-machine named-instance evidence（2026-08-28 · alpha.16）
+
+Re-checked live after PR #113/#114 merge. Commands used Release binary only (`v0.4.0-alpha.16`); dogfood untouched.
+
+| Step | Result | Notes |
+| --- | --- | --- |
+| Release download + `--version` | PASS | `0.4.0-alpha.16` / `rust-a3a09e936235c6b8` |
+| `--instance uat install` | PASS | label `dev.herdr-mcp.uat.server`, port `:8885`, config `~/.config/herdr-mcp-uat` |
+| `--instance uat doctor` | PASS (local) | Herdr / runtime / service / local-ipc green; `native-messaging absent` expected on dogfood Mac |
+| `--instance uat status` | PASS | runtime `:8885` healthy |
+| `--instance uat update check` | PASS | `available=false`, provenance verified |
+| dogfood isolation | PASS | `dev.herdr-mcp.server` `:8772` still loaded; `~/.local/bin/herdr-mcp` still dogfood |
+| extension zip → uat config | PASS | `herdr-mcp-extension-0.1.64.zip` sha256 OK; extracted to `~/.config/herdr-mcp-uat/extension` |
+| extension static smoke | PASS | `extension_smoke.mjs`, `background_bind_test.mjs`, `queued-insert.test.mjs` all green |
+| uat `native-host install` | **BLOCKED (by design)** | Chrome host name `dev.herdr.mcp` is singleton per profile; would overwrite dogfood manifest |
+| public ChatGPT OAuth/tools | **OPEN (owner)** | not attempted on uat instance; see Owner ChatGPT UAT pack below |
+| update/rollback on clean instance | **OPEN** | needs second Mac default instance or post-uat cleanup cycle |
+
+Score as **PARTIAL**, not PASS: advances honest same-Mac runtime install path; canonical full G18 remains second-Mac default instance.
+
+### Owner ChatGPT UAT pack（封 G6/G7/G18 公网段 · owner-only）
+
+**Who:** product owner with ChatGPT Developer mode + org approval if required.
+
+**Where (pick one — do not break dogfood):**
+
+| Path | When to use | Risk to dogfood |
+| --- | --- | --- |
+| **A. Second Mac / VM, default instance** | Canonical G18 + G7 seal | None |
+| **B. Dogfood Mac, default instance, maintenance window** | Owner accepts brief prod Link/Edge coupling | OAuth/tools exercise uses live `link-prod`; follow rollback runbook if anything regresses |
+
+**Do not** run ChatGPT OAuth UAT through `--instance uat` on the dogfood Mac: uat has no owned Link/Edge identity and must not cut over `link-prod`.
+
+**Preflight (read-only):**
+
+```bash
+herdr-mcp --version
+herdr-mcp doctor
+herdr-mcp link seal status
+# expect: production_ready=true, edge-reachable, oauth-metadata, mcp-endpoint (401 auth=not-sent)
+```
+
+**Owner steps (new ChatGPT conversation each validation):**
+
+1. **Connectors → Add MCP App** with public MCP URL from install docs (`https://<edge-origin>/mcp`). Never paste `HERDR_MCP_TOKEN`.
+2. **Complete OAuth** in browser; confirm connector shows authorized (not merely "added").
+3. **Start a new chat** (fresh `tools/list`).
+4. **Verify epoch 2 / 18 tools** in developer tooling or first tool call metadata.
+5. **Read-only smoke:** `herdr_inspect` (or `herdr_fs_list` on a safe path).
+6. **Bounded mutation:** one explicit fs/git mutation the owner chooses; confirm single delivery (no duplicate).
+7. **Long exec smoke:** `herdr_exec_start` → poll `herdr_exec_read` with `next_offset` until `completed`; confirm no duplicate start on "continue".
+8. **Record evidence** (non-secret): tool names count, mutation target, exec task id, `doctor` layer summary. If blocked, record exact step (connector add / authorize / tools/list / tool call / long exec).
+
+**Pass criteria for G6/G7 public segment:** steps 1–7 complete on a **default-instance clean or owner-approved dogfood** machine without credential leakage and without duplicate mutation.
+
+**Fail / defer honestly:** partial OAuth, stale tools list, or owner unavailable → leave G6/G7/G18 public rows **PARTIAL**; do not mark PASS.
+
+### UAT instance cleanup（optional, after tests）
+
+Does not touch dogfood:
+
+```bash
+export HERDR_MCP_INSTANCE=uat
+herdr-mcp --instance uat uninstall
+# removes dev.herdr-mcp.uat.* LaunchAgents, ~/.config/herdr-mcp-uat (including extension/)
+```
 
 ---
 
 ## Current P0 work queue
 
-按 2026-08-28 post-alpha.15 证据排序：
+按 2026-08-28 post-alpha.16 证据排序：
 
-1. **G18 — 干净机完整 install UAT**（第二台 macOS Apple Silicon / VM；禁止在狗粮机同 uid 上 `install`；runbook：`docs/i18n/en/clean-machine-uat.md`）。
-2. **G17 / G7 — 公网 ChatGPT OAuth + tools UAT**（需 owner 在 ChatGPT 新会话完成；清单见 clean-machine-uat §B + chatgpt-connector）。
-3. **G1 — 退出 alpha**（干净机 + 公网 candidate 全绿后再评估 `0.4.0` stable；**现在不要打 stable tag**）。
-4. **G15 residual** — Chrome Load unpacked 对 managed zip 的真人验收（本轮只做 zip 下载 + native-host smoke）。
-5. **G22 seal** — 干净机验证文档主路径后升 PASS。
+1. **G18 — 默认实例干净机完整路径**（第二台 macOS Apple Silicon / VM；runbook：`docs/i18n/en/clean-machine-uat.md`）。同机 `--instance uat` 已证明 runtime install/doctor/status，**不能**替代此项。
+2. **G17 / G7 / G6 — 公网 ChatGPT OAuth + tools UAT**（owner-only；清单见上方 Owner ChatGPT UAT pack + clean-machine-uat §B + chatgpt-connector）。
+3. **G1 — 退出 alpha**（G18 默认实例 + 公网 UAT 全绿后再评估 `0.4.0` stable；**现在不要打 stable tag**）。
+4. **G15 residual** — 第二台 Mac 或 owner 维护窗：Chrome Load unpacked + `native-host install` + 绑定 smoke（同机 uat 仅静态 smoke + zip 解压）。
+5. **G22 seal** — 第二台 Mac 验证文档主路径后升 PASS。
 6. **G16 — 保持 DEFERRED**（browser terminal / true-steer / mutation 不进第一 GA）。
 
 ---

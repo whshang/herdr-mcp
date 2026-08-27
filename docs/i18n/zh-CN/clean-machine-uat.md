@@ -109,6 +109,32 @@ ls -l "$HOME/.local/bin/herdr-mcp"
 launchctl list | awk -v label='dev.herdr-mcp.server' '$3 == label { print $1, $2, $3 }'
 ```
 
+### 命名实例扩展 (同机, 仅静态)
+
+将 Release 扩展 zip 解压到 **uat** 配置根 (不要写入狗粮 `~/.config/herdr-mcp/extension`):
+
+```bash
+export HERDR_MCP_INSTANCE=uat
+gh release download "$TAG" -R "$REPO" -D "$WORKDIR/dl" \
+  -p "herdr-mcp-extension-*.zip" \
+  -p "herdr-mcp-extension-*.zip.sha256"
+shasum -a 256 -c "$WORKDIR/dl"/herdr-mcp-extension-*.zip.sha256
+mkdir -p "$HOME/.config/herdr-mcp-uat/extension"
+unzip -o "$WORKDIR/dl"/herdr-mcp-extension-*.zip -d "$HOME/.config/herdr-mcp-uat/extension"
+herdr-mcp --instance uat doctor
+# 预期: local-ipc PASS; native-messaging absent (Chrome 主机名 dev.herdr.mcp 单例)
+```
+
+静态 smoke (无需 Chrome; 在 checkout 中运行):
+
+```bash
+node tests/manual/extension_smoke.mjs
+node tests/manual/background_bind_test.mjs
+node --test tests/queued-insert.test.mjs
+```
+
+**不要**在狗粮机上跑 `herdr-mcp --instance uat native-host install`: 会覆盖生产 Chrome 清单 `NativeMessagingHosts/dev.herdr.mcp.json`。完整 G15 native-host + Load unpacked 封板需第二台 Mac 默认实例, 或在狗粮默认实例的 owner 维护窗进行。
+
 结束后清理（不动狗粮）：
 
 ```bash
