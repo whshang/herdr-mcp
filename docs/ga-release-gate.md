@@ -304,7 +304,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G15 | **PARTIAL** | 决策 A：versioned extension zip + checksum + managed native-host；artifact 尚未进 Release |
 | G16 | **DEFERRED** | **post-GA / 非第一 GA blocker**：browser terminal / interrupt / true-steer / Browser mutation 明确不宣称；不阻塞 stable |
 | G17 | **PARTIAL** | 边界多已实现；缺干净机 + 公网完整安全验收 |
-| G18 | **FAIL** | 干净机 install UAT 未做（清单：`docs/i18n/en/clean-machine-uat.md`） |
+| G18 | **PARTIAL** | TMPHOME sim PASS（`docs/_wip/g18-clean-machine-sim-20260828.md`）；完整 install 仍需第二台 Mac |
 | G19 | **FAIL** | 第二台/多平台 UAT 未做；第一 GA 仅承诺 macOS Apple Silicon |
 | G20 | **PARTIAL** | README/install/agent-install 已去 clone/npm 主路径；扩展正式 artifact 文档待齐 |
 | G21 | **PARTIAL** | 站点 CI 可绿；无 stable tag 封板 |
@@ -313,7 +313,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G24 | **FAIL** | 剩余 GA blocker：G1 alpha、G18 干净机、G15 artifact、G17/G7 公网验收；G16 已 DEFERRED 不挡 |
 | G25 | **FAIL** | 未达 GA：不得打 stable |
 
-**合计（诚实快照）**：PASS 2 · PARTIAL 16 · FAIL 6 · DEFERRED 1 · UNKNOWN 0
+**合计（诚实快照）**：PASS 2 · PARTIAL 17 · FAIL 5 · DEFERRED 1 · UNKNOWN 0
 
 ---
 
