@@ -1,6 +1,7 @@
 use crate::contract;
 use crate::exec_sessions::enriched_exec_path;
 use crate::paths::RuntimePaths;
+use crate::progressive_skills::ProgressiveSkillService;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde_json::{Map, Value, json};
@@ -101,14 +102,48 @@ struct NativeSkill {
     sha256: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SkillService {
     cache: Arc<Mutex<Option<ProjectCache>>>,
+    progressive: Arc<ProgressiveSkillService>,
+}
+
+impl Default for SkillService {
+    fn default() -> Self {
+        Self {
+            cache: Arc::new(Mutex::new(None)),
+            progressive: Arc::new(ProgressiveSkillService::new()),
+        }
+    }
 }
 
 impl SkillService {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn fetch_for_runtime(&self, args: &Value, snapshot: &Value) -> Value {
+        self.fetch_for_runtime_mode(args, snapshot, ProgressiveSkillService::enabled_from_env())
+    }
+
+    fn fetch_for_runtime_mode(
+        &self,
+        args: &Value,
+        snapshot: &Value,
+        progressive_enabled: bool,
+    ) -> Value {
+        if progressive_enabled {
+            match progressive_mode_requested(args) {
+                Ok(true) => return self.progressive.bootstrap(snapshot),
+                Ok(false) => return self.fetch(args),
+                Err(error) => return error,
+            }
+        }
+        self.fetch(args)
+    }
+
+    pub fn local_call(&self, method: &str, params: &Value, snapshot: &Value) -> Option<Value> {
+        self.progressive.local_call(method, params, snapshot)
     }
 
     pub fn fetch(&self, args: &Value) -> Value {
@@ -592,6 +627,13 @@ fn sha256(content: &str) -> String {
     format!("{digest:x}")
 }
 
+fn progressive_mode_requested(args: &Value) -> Result<bool, Value> {
+    optional_bool(args, "refresh")?;
+    optional_bool(args, "include_native_reference")?;
+    let legacy_full = optional_bool(args, "legacy_full")?.unwrap_or(false);
+    Ok(!legacy_full)
+}
+
 fn optional_bool(args: &Value, key: &str) -> Result<Option<bool>, Value> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -770,6 +812,41 @@ mod tests {
         assert_eq!(value["tool"], "herdr_skill");
         assert_eq!(value["project_bundled"], PROJECT_BUNDLED_SOURCE);
         assert_eq!(value["native_reference"], NATIVE_LOCAL_SOURCE);
+    }
+
+    #[test]
+    fn legacy_full_is_an_internal_progressive_compatibility_escape_hatch() {
+        assert!(progressive_mode_requested(&json!({})).unwrap());
+        assert!(!progressive_mode_requested(&json!({"legacy_full": true})).unwrap());
+        let error = progressive_mode_requested(&json!({"legacy_full": "yes"})).unwrap_err();
+        assert_eq!(error["code"], "invalid_params");
+    }
+
+    #[test]
+    fn progressive_runtime_preserves_explicit_legacy_full_response_shape() {
+        let service = SkillService::new();
+        let snapshot = json!({"agents": []});
+        let progressive = service.fetch_for_runtime_mode(&json!({}), &snapshot, true);
+        assert_eq!(progressive["mode"], "progressive");
+        assert!(progressive.get("catalog").is_some());
+
+        let legacy = service.fetch_for_runtime_mode(
+            &json!({
+                "legacy_full": true,
+                "include_native_reference": false
+            }),
+            &snapshot,
+            true,
+        );
+        assert_eq!(legacy["ok"], true);
+        assert!(legacy.get("mode").is_none());
+        assert!(legacy.get("project_skill").is_some());
+        assert!(legacy.get("runtime").is_some());
+        assert!(
+            legacy["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("# herdr-mcp remote planner skill"))
+        );
     }
 
     #[test]
