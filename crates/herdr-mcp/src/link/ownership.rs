@@ -7,7 +7,9 @@
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+#[cfg(target_os = "macos")]
+use std::process::Command;
+use std::process::ExitCode;
 
 /// LaunchAgent labels used by workstation Link today.
 pub const LINK_LABEL: &str = "dev.herdr-mcp.link";
