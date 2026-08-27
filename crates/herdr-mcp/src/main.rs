@@ -38,6 +38,7 @@ mod state_store;
 mod status;
 mod updater;
 mod updater_store;
+#[cfg(target_os = "macos")]
 mod user_cli;
 mod utility_exec;
 mod workstation;
