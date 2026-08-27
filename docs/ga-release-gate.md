@@ -279,7 +279,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ## Current Scorecard（2026-08-28 · post #104/#105/#106 · live alpha.14）
 
-评分：`PASS` / `PARTIAL` / `FAIL` / `DEFERRED` / `UNKNOWN`。本表对齐 live `0.4.0-alpha.14`（generation `rust-7c0ac0b73060aae0`）+ 已合入 main 的 doctor remote probe / update.channel / G22 docs。产品仍处 **alpha**，**未达 GA**。
+评分：`PASS` / `PARTIAL` / `FAIL` / `DEFERRED` / `UNKNOWN`。本表对齐 live `0.4.0-alpha.14`（generation `rust-7c0ac0b73060aae0`）+ main 已含 doctor remote probe / update.channel / G22 docs / extension pack (#109) / G18 TMPHOME sim (#108)。产品仍处 **alpha**，**未达 GA**。
 
 本机：`production_ready=true`；production Link=Rust；epoch 2 / 18 tools；用户 CLI → `runtime/current`。**G5 保持 PASS**。
 
@@ -301,16 +301,16 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G12 | **PARTIAL** | Streaming basics 已落地；跨网页回合 GA UAT 未封 |
 | G13 | **PASS** | Batch A + Result Optimization 已合入 |
 | G14 | **PARTIAL** | fs/service mutation fencing 已有；Agent/terminal/browser mutation 不进第一 GA 宣称 |
-| G15 | **PARTIAL** | 决策 A：versioned extension zip + checksum + managed native-host；artifact 尚未进 Release |
+| G15 | **PARTIAL** | #109：deterministic `herdr-mcp-extension-<ver>.zip` + `.sha256` + managed `~/.config/herdr-mcp/extension` + native-host 优先托管路径；`<all_urls>` 保留（LLM judge / 自定义 herdrMcpUrl）；**尚未作为 GitHub Release asset 发布**（alpha.14 仅 binary/manifest） |
 | G16 | **DEFERRED** | **post-GA / 非第一 GA blocker**：browser terminal / interrupt / true-steer / Browser mutation 明确不宣称；不阻塞 stable |
 | G17 | **PARTIAL** | 边界多已实现；缺干净机 + 公网完整安全验收 |
 | G18 | **PARTIAL** | TMPHOME sim PASS（`docs/_wip/g18-clean-machine-sim-20260828.md`）；完整 install 仍需第二台 Mac |
 | G19 | **FAIL** | 第二台/多平台 UAT 未做；第一 GA 仅承诺 macOS Apple Silicon |
-| G20 | **PARTIAL** | README/install/agent-install 已去 clone/npm 主路径；扩展正式 artifact 文档待齐 |
+| G20 | **PARTIAL** | README/install/agent-install 已去 clone/npm 主路径；extension.md 已写 Release zip → Load unpacked → native-host；缺干净机端到端证明 |
 | G21 | **PARTIAL** | 站点 CI 可绿；无 stable tag 封板 |
 | G22 | **PARTIAL** | docs PASS（#104）；**docs ≠ clean-machine UAT**（G18） |
 | G23 | **PARTIAL** | main CI 可绿；GA tag 全绿验收未跑 |
-| G24 | **FAIL** | 剩余 GA blocker：G1 alpha、G18 干净机、G15 artifact、G17/G7 公网验收；G16 已 DEFERRED 不挡 |
+| G24 | **FAIL** | 剩余 GA blocker：G1 alpha、G18 完整干净机 install、G15 Release 发布、G17/G7 公网验收；G16 已 DEFERRED 不挡 |
 | G25 | **FAIL** | 未达 GA：不得打 stable |
 
 **合计（诚实快照）**：PASS 2 · PARTIAL 17 · FAIL 5 · DEFERRED 1 · UNKNOWN 0
@@ -319,12 +319,12 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ## Current P0 work queue
 
-按 2026-08-28 post-merge 证据排序：
+按 2026-08-28 post-#109 证据排序：
 
-1. **G15 — versioned extension zip/artifact + managed native-host 路径**（无需 Chrome Web Store）。
-2. **G18 — 干净机 install UAT**（macOS Apple Silicon；禁止 repo checkout 当 runtime 源）。
+1. **G18 — 干净机完整 install UAT**（第二台 macOS Apple Silicon / 独立用户域；禁止 repo checkout 当 runtime 源；TMPHOME sim 见 `docs/_wip/g18-clean-machine-sim-20260828.md`）。
+2. **G15 seal — 把 extension zip 打进下一份 GitHub Release**（打包管线已在 main；alpha.14 尚无该 asset）。
 3. **G17 / 公网安全与 ChatGPT 闭环验收**。
-4. **G1 — 退出 alpha**（版本口径统一后才评估 `0.4.0` stable）。
+4. **G1 — 退出 alpha**（干净机 candidate 全绿后再评估 `0.4.0` stable）。
 5. **G22 seal** — 干净机验证文档主路径后升 PASS。
 6. **G16 — 保持 DEFERRED**（browser terminal / true-steer / mutation 不进第一 GA）。
 
