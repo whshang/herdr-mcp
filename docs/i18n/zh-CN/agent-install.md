@@ -170,15 +170,13 @@ macOS 上使用 `deploy/dev.herdr-mcp.server.plist.example`，复制到 `~/Libra
 HERDR_MCP_BASE_URL=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev
 ```
 
-然后以 launchd 启动/重启并验证 `http://127.0.0.1:8772/mcp`。可把 CLI 链接到 PATH：
+然后以 launchd 启动/重启并验证 `http://127.0.0.1:8772/mcp`。PATH 入口由 `herdr-mcp install` 维护（指向 `runtime/current`），不要再建仓库 Bash bridge：
 
 ```bash
 launchctl bootout "gui/$UID/dev.herdr-mcp.server" >/dev/null 2>&1 || true
 launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.herdr-mcp.server.plist"
 launchctl enable "gui/$UID/dev.herdr-mcp.server"
-
-mkdir -p ~/.local/bin
-ln -sf "$PWD/bin/herdr-mcp" ~/.local/bin/herdr-mcp
+# Prefer: herdr-mcp install (retargets ~/.local/bin/herdr-mcp -> runtime/current)
 ```
 
 不要在最终回复打印 `HERDR_MCP_TOKEN`。

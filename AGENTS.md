@@ -48,8 +48,12 @@ After any lifecycle mutation, verify the active generation, exact launchd job, l
 
 The historical Bash entrypoint `bin/herdr-mcp` may exist as a compatibility wrapper during the Rust migration. When it is used, Rust lifecycle operations must delegate to `~/.config/herdr-mcp/runtime/current/herdr-mcp`.
 
-A user-level symlink such as `~/.local/bin/herdr-mcp -> <repo>/bin/herdr-mcp` is a migration exception, not the target architecture. Do not create new repository-linked user entrypoints or rely on that link as evidence of the installed runtime version. Once the Rust CLI owns the required user-facing commands, migrate the stable user entrypoint to the installed runtime and remove the repository dependency.
+Target architecture: `herdr-mcp install` / update activation maintains `~/.local/bin/herdr-mcp` → `~/.config/herdr-mcp/runtime/current/herdr-mcp` (stable PATH entry resolves the active generation through `runtime/current`, never a git checkout).
+
+Operator note for machines still on the repo Bash bridge: run one `herdr-mcp install` or `herdr-mcp update apply` after a release that includes this linking logic; that retargets the symlink without requiring a manual `ln`.
+
+A user-level symlink such as `~/.local/bin/herdr-mcp -> <repo>/bin/herdr-mcp` is a migration exception, not the target architecture. Do not create new repository-linked user entrypoints or rely on that link as evidence of the installed runtime version.
 
 ### Current-state note
 
-At the time this policy was introduced, production service ownership had already moved to the Rust generation model, while the user CLI still used the repository Bash wrapper as a compatibility bridge. This note is historical context only. Always re-run the read-only preflight above before acting on live runtime state.
+Always re-run the read-only preflight above before acting on live runtime state. Do not infer CLI ownership from a checkout symlink alone.

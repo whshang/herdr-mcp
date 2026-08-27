@@ -46,6 +46,7 @@ mod macos {
     use super::*;
     use crate::paths::RuntimePaths;
     use crate::state_store::{RuntimeGenerationRecord, ServiceRollbackRecord, StateStore};
+    use crate::user_cli;
     use plist::{Dictionary, Value as PlistValue};
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
@@ -1397,7 +1398,20 @@ mod macos {
             );
         }
 
-        if let Some(result) = same_active_install_noop_with(paths, &existing, loaded, healthy)? {
+        if let Some(mut result) = same_active_install_noop_with(paths, &existing, loaded, healthy)?
+        {
+            let user_cli = user_cli::ensure_link(&paths.home, &paths.current_binary)?;
+            if let Some(object) = result.as_object_mut() {
+                object.insert(
+                    "user_cli".to_owned(),
+                    json!(user_cli.path.to_string_lossy()),
+                );
+                object.insert(
+                    "user_cli_target".to_owned(),
+                    json!(user_cli.target.to_string_lossy()),
+                );
+                object.insert("user_cli_changed".to_owned(), json!(user_cli.changed));
+            }
             return Ok(result);
         }
 
@@ -1510,6 +1524,7 @@ mod macos {
         };
 
         let mut server_bootout_pending = false;
+        let mut user_cli_link = None;
         let activation = (|| -> Result<(), String> {
             if rollback.watchdog_was_loaded {
                 bootout(WATCHDOG_LABEL)?;
@@ -1526,6 +1541,10 @@ mod macos {
             }
             atomic_write(&paths.plist, &new_plist, 0o600)?;
             switch_current(paths, &generation)?;
+            // Point PATH entry at runtime/current before bootstrap so a failed
+            // link rolls back with the rest of activation. The link always
+            // resolves through `current`, so generation rollback stays valid.
+            user_cli_link = Some(user_cli::ensure_link(&paths.home, &paths.current_binary)?);
             bootstrap_with_retry(&paths.plist, SERVICE_LABEL)?;
             wait_for_health(DEFAULT_PORT)?;
             store.activate_runtime_generation_with_rollback(
@@ -1591,6 +1610,10 @@ mod macos {
             )
             .is_ok();
 
+        let user_cli = user_cli_link.ok_or_else(|| {
+            "user CLI link missing after successful service activation".to_owned()
+        })?;
+
         Ok(json!({
             "ok": true,
             "implementation": "rust",
@@ -1599,6 +1622,9 @@ mod macos {
             "sha256": generation.sha256,
             "runtime_binary": generation.binary,
             "current_binary": paths.current_binary,
+            "user_cli": user_cli.path,
+            "user_cli_target": user_cli.target,
+            "user_cli_changed": user_cli.changed,
             "plist": paths.plist,
             "extension_socket": paths.extension_socket,
             "adopted_node": existing.kind == ServiceKind::Node,
@@ -2145,6 +2171,7 @@ mod macos {
             bootout(SERVICE_LABEL)?;
         }
         remove_regular_file(&paths.plist)?;
+        let user_cli_removed = user_cli::remove_link_if_owned(&paths.home, &paths.current_binary)?;
         remove_current_if_owned(paths)?;
         let evidence_recorded = record_action(paths, "uninstall", "ok", &descriptor, None);
         Ok(json!({
@@ -2152,6 +2179,7 @@ mod macos {
             "action": "uninstall",
             "label": SERVICE_LABEL,
             "generations_preserved": true,
+            "user_cli_removed": user_cli_removed,
             "evidence_recorded": evidence_recorded,
         }))
     }
