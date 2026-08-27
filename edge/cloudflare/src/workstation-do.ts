@@ -985,11 +985,9 @@ export class WorkstationDO {
   /** Unified drop path: mark offline, classify in-flight, resolve caches. */
   private async handleLinkGone(event: string, fields: Record<string, unknown>): Promise<void> {
     const now = Date.now();
-    if (this.session && this.session.status !== "offline") {
-      this.session.status = "offline";
-      this.session.disconnectedAtMs = now;
-      await this.state.storage.put(KEY_SESSION, serializeSession(this.session));
-    }
+    // Settle ephemeral reads before any Durable Storage write. Under a
+    // rows_written quota breach, session/mutation persistence may throw;
+    // known reads must still resolve with zero request-ledger writes.
     let ephemeralSettled = 0;
     for (const read of [...this.ephemeralReads.values()]) {
       const classification = classifyAmbiguousDelivery(read.state, "read");
@@ -1006,6 +1004,18 @@ export class WorkstationDO {
       };
       this.settleEphemeralRead(read.requestId, { status: "error", error: err, servedAtMs: now });
       ephemeralSettled += 1;
+    }
+    if (this.session && this.session.status !== "offline") {
+      this.session.status = "offline";
+      this.session.disconnectedAtMs = now;
+      try {
+        await this.state.storage.put(KEY_SESSION, serializeSession(this.session));
+      } catch (persistErr) {
+        this.logger.warn("ws.link_gone.session_persist_failed", {
+          workstationId: this.session.workstationId,
+          reason: persistErr instanceof Error ? persistErr.message : "storage_put_failed",
+        });
+      }
     }
     const classifications = this.registry.classifyAllOnClose(now);
     for (const [requestId, err] of classifications) {
