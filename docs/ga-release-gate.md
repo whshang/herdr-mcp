@@ -306,14 +306,14 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G17 | **PARTIAL** | bearer/socket/managed-root/fail-closed 等边界多已实现；缺干净机 + 公网的完整安全验收清单勾选 |
 | G18 | **FAIL** | 正式 install 文档仍要求 clone 仓库与 Node；不满足「不使用开发仓库」UAT |
 | G19 | **FAIL** | Release 矩阵含 macOS ARM 等目标，但缺少「每正式支持平台」干净安装 UAT 记录；文档未收敛为单一 Supported 声明 |
-| G20 | **FAIL** | README 主安装路径与 Rust CLI/runtime 现实不对账；过程术语与 Node 构建步骤仍在用户文档 |
+| G20 | **PARTIAL** | README / `install` / `quick-start` 主路径已在 [#71](https://github.com/whshang/herdr-mcp/pull/71)（`3700723`）对齐 Release binary + `doctor`/`status`/`update`；残留 FAIL 见 [`docs/_wip/g20-command-contract.md`](./_wip/g20-command-contract.md)（Bash-only `start`/`stop`/`watchdog`/`lang`/`connector`；Rust help 缺顶层 `install`/`rollback`/`uninstall`；alpha 标签归 G1） |
 | G21 | **PARTIAL** | 站点 21/21 等 CI gate 在 alpha 主线上维护；尚无 stable tag「同 commit 源站」封板 |
 | G22 | **FAIL** | Fastest path / install 仍引导 `git clone`、`npm ci`、`node dist/server.js`；`~/.local/bin/herdr-mcp` 仍链到仓库 Bash |
 | G23 | **PARTIAL** | main CI（Rust/Node/Edge/site/extension）在 alpha 迭代中可绿；GA tag 专用全绿验收未跑 |
 | G24 | **FAIL** | G1、G3、G5（Link/Node）、G18、G20、G22 等仍是明确 GA blocker；`production_ready=false` |
 | G25 | **FAIL** | 八个 veto 当前多数仍依赖仓库路径、内部 `service` 概念或 Node Link；不能打 stable |
 
-**合计（诚实快照）**：PASS 0 · PARTIAL 15 · FAIL 10 · UNKNOWN 0
+**合计（诚实快照）**：PASS 0 · PARTIAL 16 · FAIL 9 · UNKNOWN 0
 
 ---
 
@@ -322,7 +322,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 按「最先解锁干净机用户闭环」排序的下一批具体任务（已纳入本机 update 残留）：
 
 1. **冻结单一产品版本口径**：Cargo / GitHub Release / `--version` / README 对齐；去掉用户可见 `alpha`；明确 `package.json` 仅网站/扩展构建，不代表 runtime（G1 仍 FAIL）。
-2. **用户 CLI + 文档主路径**：实现顶层 `herdr-mcp install|rollback|uninstall`（顶层 `rollback` 别名是 G3/G10 用户路径硬依赖；当前仅有 `service rollback`）；把 `~/.local/bin/herdr-mcp` 从仓库 Bash bridge 迁到 installed `runtime/current`；README/`install.md` 改为 binary 下载安装。
+2. **用户 CLI + 文档主路径**：README/`install`/`quick-start` 主路径已在 #71 对齐 Release binary（G20 → PARTIAL）；仍需实现顶层 `herdr-mcp install|rollback|uninstall`（顶层 `rollback` 是 G3/G10 硬依赖；当前仅有 `service rollback`）；把 `~/.local/bin/herdr-mcp` 从仓库 Bash bridge 迁到 installed `runtime/current`；清掉 [`docs/_wip/g20-command-contract.md`](./_wip/g20-command-contract.md) 所列 Bash-only 命令与 cli-reference 残留。
 3. **Rust production Link 切流 + `production_ready`**：candidate Link 完成生产所有权切换；去掉用户路径对 Node link 的依赖；health 不再长期停在 rust-candidate / `production_ready=false`。
 4. **产品级 `doctor` + sync exec 语义对齐**：分层报告 Herdr / runtime / service / Native Messaging / Link / Edge / OAuth·MCP / update；补齐 sync `herdr_exec` 与 streaming 路径在 phase/progress 上的一致性（G8/G12 残留）。
 5. **干净机 + 支持平台 UAT（含 update/rollback）**：按 G18/G19 跑通 install→doctor→Edge→ChatGPT→mutation→长任务→扩展→update→rollback；本机 alpha.6→alpha.8 只算开发者证据，不能替代干净机 / 多平台。
