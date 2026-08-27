@@ -26,7 +26,7 @@ use super::runtime_control::{RuntimeControlLoop, RuntimeControlLoopOptions};
 use super::runtime_generation::{
     RuntimeGenerationManager, RuntimeGenerationManagerOptions, RuntimeGenerationSpec,
 };
-use super::socket_driver::LINK_SUBPROTOCOL;
+use super::socket_driver::{LINK_SUBPROTOCOL, build_edge_url};
 use super::transport::{
     LINK_DEFAULT_HANDSHAKE_TIMEOUT_MS, LINK_DEFAULT_MAX_FRAME_BYTES, LinkTransportCore,
     TransportConfig,
@@ -244,8 +244,12 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
             max_silence_ms: DAEMON_MAX_SILENCE_MS,
         },
     );
+    // Node-parity: Edge routes by `/ws/{workstation_id}`. Bare `/ws` never stays online.
+    let edge_url = build_edge_url(&config.edge_url, &config.workstation_id).map_err(|error| {
+        format!("herdr-link daemon: cannot build edge url with workstation id: {error:?}")
+    })?;
     let io_config = LinkIoConfig {
-        edge_url: config.edge_url.clone(),
+        edge_url,
         application_protocol: LINK_SUBPROTOCOL.to_owned(),
         link_token: config.link_token.clone(),
         socket: Default::default(),
@@ -381,6 +385,15 @@ mod tests {
             map.insert((*key).to_owned(), (*value).to_owned());
         }
         map
+    }
+
+    #[test]
+    fn daemon_connect_edge_url_appends_workstation_id() {
+        let cfg = read_link_daemon_config(&env(&[])).expect("config");
+        let built = build_edge_url(&cfg.edge_url, &cfg.workstation_id).unwrap();
+        assert_eq!(built, "wss://herdr-edge-dev.example/ws/dev-w1");
+        // Bare /ws must not be used for production connect (Node parity).
+        assert_ne!(built, cfg.edge_url);
     }
 
     #[test]

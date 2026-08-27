@@ -23,7 +23,7 @@ use super::install::{
     LINK_RUST_CANDIDATE_LABEL, assert_safe_candidate_program, candidate_program_arguments,
 };
 use super::ownership::{
-    LINK_LABEL, LINK_PROD_LABEL, LinkAgentView, LinkImplementation,
+    LINK_LABEL, LINK_PROD_LABEL, LinkAgentView, LinkImplementation, classify_program_arguments,
     program_points_at_managed_runtime, program_points_at_repo_checkout,
 };
 
@@ -42,7 +42,9 @@ const BOOTSTRAP_RETRY_DELAYS: [Duration; 3] = [
 pub trait LaunchdOps {
     fn bootout_prod(&self, label: &str) -> Result<(), String>;
     fn bootstrap_prod(&self, plist: &Path, label: &str) -> Result<(), String>;
-    fn is_loaded(&self, label: &str) -> bool;
+    /// Probe whether `label` is loaded. Probe failures must be `Err` (never
+    /// silently treated as absent).
+    fn is_loaded(&self, label: &str) -> Result<bool, String>;
 }
 
 /// Real macOS launchctl backend. Refuses any label other than link-prod.
@@ -54,7 +56,7 @@ impl LaunchdOps for RealLaunchd {
         assert_prod_only_label(label)?;
         #[cfg(target_os = "macos")]
         {
-            if !launchd_is_loaded(label) {
+            if !launchd_probe_loaded(label)? {
                 return Ok(());
             }
             run_launchctl([
@@ -108,15 +110,15 @@ impl LaunchdOps for RealLaunchd {
         }
     }
 
-    fn is_loaded(&self, label: &str) -> bool {
+    fn is_loaded(&self, label: &str) -> Result<bool, String> {
         #[cfg(target_os = "macos")]
         {
-            launchd_is_loaded(label)
+            launchd_probe_loaded(label)
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = label;
-            false
+            Err("link cutover --execute is macOS-only".to_owned())
         }
     }
 }
@@ -186,8 +188,8 @@ impl LaunchdOps for FakeLaunchd {
         Ok(())
     }
 
-    fn is_loaded(&self, label: &str) -> bool {
-        self.inner.lock().unwrap().loaded.contains_key(label)
+    fn is_loaded(&self, label: &str) -> Result<bool, String> {
+        Ok(self.inner.lock().unwrap().loaded.contains_key(label))
     }
 }
 
@@ -220,6 +222,20 @@ pub fn execute_transaction<L: LaunchdOps>(
     let phase = "PREPARE";
     let backup_path = prod_plist_backup_path(home);
     let prod_plist = prod.plist_path.clone();
+
+    if prod.implementation != LinkImplementation::Node {
+        return Ok(failure_report(
+            phase,
+            false,
+            &backup_path,
+            None,
+            format!(
+                "cutover execute requires Node link-prod source (got {})",
+                prod.implementation.as_str()
+            ),
+            &[],
+        ));
+    }
 
     let prepared = match prepare_cutover(home, &prod_plist, &backup_path) {
         Ok(value) => value,
@@ -275,6 +291,7 @@ pub fn execute_transaction<L: LaunchdOps>(
     }
 }
 
+#[derive(Debug)]
 struct PreparedCutover {
     program: Vec<String>,
     rust_plist_bytes: Vec<u8>,
@@ -292,12 +309,32 @@ fn prepare_cutover(
     let original = fs::read(prod_plist)
         .map_err(|error| format!("cannot read {}: {error}", prod_plist.display()))?;
     refuse_if_not_prod_label(&original, prod_plist)?;
+    require_node_program_arguments(
+        &original,
+        &format!("current prod plist {}", prod_plist.display()),
+    )?;
 
     if let Some(parent) = backup_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
-    atomic_write(backup_path, &original, 0o600)?;
+    // Authoritative Node rollback source must never be overwritten by a re-entry
+    // that already sees Rust (or corrupt) prod bytes on disk.
+    if backup_path.is_file() {
+        let existing = fs::read(backup_path).map_err(|error| {
+            format!(
+                "cannot read existing backup {}: {error}",
+                backup_path.display()
+            )
+        })?;
+        refuse_if_not_prod_label(&existing, backup_path)?;
+        require_node_program_arguments(
+            &existing,
+            &format!("existing Node rollback backup {}", backup_path.display()),
+        )?;
+    } else {
+        atomic_write(backup_path, &original, 0o600)?;
+    }
 
     let program = candidate_program_arguments(home)?;
     assert_safe_candidate_program(home, &program)?;
@@ -337,7 +374,7 @@ fn verify_cutover<L: LaunchdOps>(
     if program_points_at_repo_checkout(&program) {
         return Err("verify failed: prod ProgramArguments still point at a checkout".to_owned());
     }
-    if !launchd.is_loaded(LINK_PROD_LABEL) {
+    if !launchd.is_loaded(LINK_PROD_LABEL)? {
         return Err(format!(
             "verify failed: {LINK_PROD_LABEL} is not loaded after bootstrap"
         ));
@@ -552,6 +589,17 @@ pub fn encode_prod_rust_plist(
     Ok((bytes, env_keys))
 }
 
+fn require_node_program_arguments(bytes: &[u8], context: &str) -> Result<Vec<String>, String> {
+    let program = read_program_arguments(bytes)?;
+    match classify_program_arguments(&program) {
+        LinkImplementation::Node => Ok(program),
+        other => Err(format!(
+            "{context}: expected Node link-prod ProgramArguments, got {}",
+            other.as_str()
+        )),
+    }
+}
+
 fn refuse_if_not_prod_label(bytes: &[u8], path: &Path) -> Result<(), String> {
     let value = PlistValue::from_reader(std::io::Cursor::new(bytes))
         .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
@@ -642,31 +690,45 @@ fn users_uid() -> u32 {
 }
 
 #[cfg(target_os = "macos")]
-fn launchd_is_loaded(label: &str) -> bool {
+fn launchd_probe_loaded(label: &str) -> Result<bool, String> {
+    let target = format!("{}/{}", launchd_domain(), label);
     let output = std::process::Command::new("/bin/launchctl")
-        .arg("list")
-        .output();
-    let Ok(output) = output else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
+        .args(["print", &target])
+        .output()
+        .map_err(|error| format!("cannot execute launchctl print {target}: {error}"))?;
+    if output.status.success() {
+        return Ok(true);
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|line| line.split_whitespace().nth(2) == Some(label))
+    let detail = format!(
+        "{}
+{}",
+        String::from_utf8_lossy(&output.stderr).trim(),
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("could not find")
+        || lower.contains("not found")
+        || lower.contains("no such process")
+        || lower.contains("no such service")
+    {
+        return Ok(false);
+    }
+    Err(format!(
+        "launchctl print {target} failed (refusing to treat as absent): {}",
+        detail.trim()
+    ))
 }
 
 #[cfg(target_os = "macos")]
 fn wait_launchd_absent(label: &str, budget: Duration) -> Result<(), String> {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
-        if !launchd_is_loaded(label) {
+        if !launchd_probe_loaded(label)? {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    if launchd_is_loaded(label) {
+    if launchd_probe_loaded(label)? {
         Err(format!(
             "{label} still loaded after bootout budget {}ms",
             budget.as_millis()
@@ -915,5 +977,84 @@ mod tests {
             detail: "missing".to_owned(),
         }];
         assert!(!technical_preconditions_ready(&blocked));
+    }
+
+    #[test]
+    fn prepare_refuses_rust_prod_and_keeps_existing_node_backup() {
+        let home = test_home();
+        setup_managed_runtime(&home);
+        let agents = home.join("Library/LaunchAgents");
+        fs::create_dir_all(&agents).unwrap();
+        let prod_plist = agents.join(format!("{LINK_PROD_LABEL}.plist"));
+        let node_bytes = node_prod_plist_xml(&home);
+        let backup = prod_plist_backup_path(&home);
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        fs::write(&backup, &node_bytes).unwrap();
+
+        let rust_program = candidate_program_arguments(&home).unwrap();
+        let (rust_bytes, _) = encode_prod_rust_plist(&home, &node_bytes, &rust_program).unwrap();
+        fs::write(&prod_plist, &rust_bytes).unwrap();
+
+        let err = prepare_cutover(&home, &prod_plist, &backup).unwrap_err();
+        assert!(
+            err.contains("expected Node"),
+            "prepare must refuse Rust prod: {err}"
+        );
+        let preserved = fs::read(&backup).unwrap();
+        assert_eq!(
+            preserved, node_bytes,
+            "existing Node backup must not be overwritten"
+        );
+
+        let launchd = FakeLaunchd::with_loaded(LINK_PROD_LABEL, &prod_plist);
+        let prod = LinkAgentView {
+            label: LINK_PROD_LABEL.to_owned(),
+            plist_path: prod_plist,
+            present: true,
+            loaded: true,
+            implementation: LinkImplementation::Rust,
+            program_arguments: rust_program,
+            edge_url: None,
+            workstation_id: None,
+            runtime_generation: None,
+            control_path: None,
+            status_path: None,
+        };
+        let report = execute_transaction(&home, &prod, &launchd).unwrap();
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["cutover_performed"], false);
+        assert_eq!(report["phase"], "PREPARE");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn prepare_reuses_existing_node_backup_without_overwrite() {
+        let home = test_home();
+        setup_managed_runtime(&home);
+        let agents = home.join("Library/LaunchAgents");
+        fs::create_dir_all(&agents).unwrap();
+        let prod_plist = agents.join(format!("{LINK_PROD_LABEL}.plist"));
+        let original = node_prod_plist_xml(&home);
+        fs::write(&prod_plist, &original).unwrap();
+        let backup = prod_plist_backup_path(&home);
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        let marker_backup = {
+            // Distinct but still Node: tweak Keychain service name.
+            let xml = String::from_utf8(original.clone()).unwrap().replace(
+                "herdr-edge-prod-link-secret",
+                "herdr-edge-prod-link-secret-preserved",
+            );
+            xml.into_bytes()
+        };
+        fs::write(&backup, &marker_backup).unwrap();
+
+        let prepared = prepare_cutover(&home, &prod_plist, &backup).unwrap();
+        assert!(!prepared.program.is_empty());
+        let preserved = fs::read(&backup).unwrap();
+        assert_eq!(
+            preserved, marker_backup,
+            "prepare must reuse existing Node backup bytes"
+        );
+        let _ = fs::remove_dir_all(&home);
     }
 }
