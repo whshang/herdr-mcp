@@ -202,6 +202,25 @@ herdr-mcp 明确区分不同权限面：
 
 详见 [架构](docs/i18n/zh-CN/architecture.md) 和 [最佳实践](docs/i18n/zh-CN/best-practices.md)。
 
+## 本机 runtime CLI
+
+原生 runtime 安装完成后，日常生命周期使用这些顶层命令：
+
+```bash
+herdr-mcp install
+herdr-mcp status
+herdr-mcp doctor
+herdr-mcp update check
+herdr-mcp update apply
+herdr-mcp update status
+herdr-mcp rollback
+herdr-mcp uninstall
+```
+
+`herdr-mcp service ...` 仍可用于高级/内部服务控制（例如 `service install --adopt-node`）。正常安装、健康检查、升级和回滚请优先使用上面的顶层命令。
+
+详见 [CLI 参考](docs/i18n/zh-CN/cli-reference.md) 和 [Runtime A/B](docs/i18n/zh-CN/runtime-self-upgrade.md)。
+
 ## Runtime 升级不需要换 Connector
 
 公网 Edge 和本机 runtime 是两个发布平面：

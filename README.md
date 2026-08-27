@@ -194,6 +194,25 @@ Key boundaries are explicit:
 
 See [Architecture](docs/i18n/en/architecture.md) and [Best practices](docs/i18n/en/best-practices.md).
 
+## Local runtime CLI
+
+Once the native runtime is installed, day-to-day lifecycle uses these top-level commands:
+
+```bash
+herdr-mcp install
+herdr-mcp status
+herdr-mcp doctor
+herdr-mcp update check
+herdr-mcp update apply
+herdr-mcp update status
+herdr-mcp rollback
+herdr-mcp uninstall
+```
+
+`herdr-mcp service ...` remains available for advanced/internal service control (for example `service install --adopt-node`). Prefer the top-level commands above for normal install, health, update, and rollback.
+
+See [CLI reference](docs/i18n/en/cli-reference.md) and [Runtime A/B](docs/i18n/en/runtime-self-upgrade.md).
+
 ## Runtime upgrades without changing the Connector
 
 The public Edge identity and the local runtime are separate release planes.
