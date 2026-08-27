@@ -21,6 +21,7 @@ export const DOC_ORDER = [
   "design-philosophy",
   "quick-start",
   "install",
+  "clean-machine-uat",
   "chatgpt-connector",
   "browser-continuity",
   "extension",
@@ -42,7 +43,7 @@ export const DOC_ORDER = [
 
 // Group membership is keyed by logical slug only; labels are translated in UI.
 export const NAV_GROUPS = [
-  { slugs: ["overview", "design-philosophy", "quick-start", "install", "chatgpt-connector"] },
+  { slugs: ["overview", "design-philosophy", "quick-start", "install", "clean-machine-uat", "chatgpt-connector"] },
   { slugs: ["browser-continuity", "extension", "extension-wake", "extension-bridge"] },
   { slugs: ["architecture", "best-practices", "cli-reference"] },
   { slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade"] },
