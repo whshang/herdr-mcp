@@ -214,3 +214,79 @@ test("mutation storage failure is fail-closed before Link delivery", async () =>
   );
   assert.equal(events.filter((event) => event[0] === "send" && event[1].kind === "tool_request").length, 0);
 });
+
+test("ephemeral reads still succeed when Durable Storage writes are exhausted", async () => {
+  const { subject, storage, events } = makeSubject();
+  await init(subject, events);
+  storage.failWrites = true;
+  const requestId = "read-under-quota";
+  const pending = subject.forwardInternal({
+    kind: "request",
+    requestId,
+    op: "herdr_fs_read",
+    deadlineMs: Date.now() + 30_000,
+  });
+  assert.equal(events.filter((event) => event[0] === "send" && event[1].kind === "tool_request").length, 1);
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: requestId,
+    result: { ok: true, path: "README.md" },
+    served_at_ms: Date.now(),
+  });
+  const response = await pending;
+  assert.equal(response.status, 200);
+  assert.deepEqual(events.filter((event) => event[0] !== "send"), []);
+});
+
+test("online link drop settles ephemeral reads even when session persist hits write quota", async () => {
+  const { serializeSession } = await import("../dist/state.js");
+  const events = [];
+  const storage = new FakeStorage(events);
+  storage.map.set(
+    "session",
+    serializeSession({
+      schemaVersion: 1,
+      workstationId: "prod-real-runtime",
+      status: "online",
+      connectedAtMs: Date.now() - 1_000,
+      lastSeenAtMs: Date.now() - 1_000,
+    }),
+  );
+  const socket = {
+    deserializeAttachment: () => ({ active: true, registered: true }),
+    send: (frame) => events.push(["send", JSON.parse(frame)]),
+    serializeAttachment: () => {},
+    close: () => {},
+  };
+  const state = {
+    id: { name: "prod-real-runtime" },
+    storage,
+    blockConcurrencyWhile: async (fn) => fn(),
+    getWebSockets: () => [socket],
+    acceptWebSocket: () => {},
+  };
+  const subject = new WorkstationDO(state, {});
+  await init(subject, events);
+  storage.failWrites = true;
+
+  const requestId = "read-link-drop-under-quota";
+  const pending = subject.forwardInternal({
+    kind: "request",
+    requestId,
+    op: "herdr_inspect",
+    deadlineMs: Date.now() + 30_000,
+  });
+  await subject.handleLinkGone("test.link_drop_quota", {});
+  const response = await pending;
+  const body = await response.json();
+  assert.equal(body.completion?.status, "error");
+  assert.equal(body.completion?.error?.retryable, true);
+  assert.deepEqual(
+    events.filter((event) => event[0] !== "send"),
+    [["put", "session"]],
+    "only the offline session checkpoint may attempt a write; reads must still settle",
+  );
+  assert.equal(storage.map.get("session") !== undefined, true, "failed put must not clear the prior online session row");
+});
