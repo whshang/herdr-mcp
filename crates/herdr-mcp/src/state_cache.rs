@@ -32,6 +32,42 @@ pub struct CacheDiagnostics {
     pub needs_reconcile: bool,
 }
 
+/// Doctor/runtime health for the event-backed snapshot cache.
+///
+/// - `Healthy`: ready, subscribed, and not waiting on a snapshot reconcile.
+/// - `Reconciling`: ready with no transport error, but between subscription
+///   cycles or mid snapshot refresh (`needs_reconcile` / temporary
+///   `!stream_live`). Bounded and expected; doctor must PASS.
+/// - `Failed`: bootstrap never became ready, or a real transport/stream error
+///   left the cache without a live subscription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventCacheHealth {
+    Healthy,
+    Reconciling,
+    Failed(String),
+}
+
+impl EventCacheHealth {
+    pub fn doctor_pass(&self) -> bool {
+        matches!(self, Self::Healthy | Self::Reconciling)
+    }
+
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Reconciling => "reconciling",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    pub fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::Failed(error) => Some(error.as_str()),
+            _ => None,
+        }
+    }
+}
+
 struct DigestInput<'a> {
     at: &'a str,
     raw_type: &'a str,
@@ -592,6 +628,79 @@ impl EventCache {
         self.shared.stream_live.load(Ordering::Acquire)
     }
 
+    /// Classify cache health without waiting.
+    ///
+    /// Temporary `!stream_live` / `needs_reconcile` without a transport error is
+    /// `Reconciling`, not `Failed`. Sticky `last_error` while the stream is down
+    /// remains a hard failure.
+    pub fn classify_health(&self) -> EventCacheHealth {
+        let ready = self.shared.ready.lock().ok().is_some_and(|ready| *ready);
+        let stream_live = self.shared.stream_live.load(Ordering::Acquire);
+        let needs_reconcile = self.diagnostics().needs_reconcile;
+        let error = self.last_error();
+
+        if !ready {
+            return EventCacheHealth::Failed(
+                error.unwrap_or_else(|| "event cache bootstrap timed out".to_owned()),
+            );
+        }
+
+        if let Some(error) = error {
+            if !stream_live {
+                return EventCacheHealth::Failed(error);
+            }
+            // Stream recovered but a prior error was not cleared: treat as failed
+            // so sticky errors cannot silently PASS.
+            return EventCacheHealth::Failed(error);
+        }
+
+        if needs_reconcile || !stream_live {
+            return EventCacheHealth::Reconciling;
+        }
+
+        EventCacheHealth::Healthy
+    }
+
+    /// Wait for bootstrap + initial subscribe, then optionally finish one bounded
+    /// reconcile/resubscribe cycle before classifying.
+    ///
+    /// Does not widen the initial ready/live waits; `reconcile_budget` only covers
+    /// an already-observed reconcile/resubscribe window so doctor does not sample
+    /// mid-cycle as a hard FAIL.
+    pub fn wait_for_doctor_probe(
+        &self,
+        ready_timeout: Duration,
+        live_timeout: Duration,
+        reconcile_budget: Duration,
+    ) -> EventCacheHealth {
+        if !self.wait_ready(ready_timeout) {
+            return EventCacheHealth::Failed(
+                self.last_error()
+                    .unwrap_or_else(|| "event cache bootstrap timed out".to_owned()),
+            );
+        }
+
+        let _ = self.wait_stream_live(live_timeout);
+        match self.classify_health() {
+            EventCacheHealth::Reconciling => {
+                let deadline = Instant::now() + reconcile_budget;
+                while Instant::now() < deadline {
+                    match self.classify_health() {
+                        EventCacheHealth::Healthy => return EventCacheHealth::Healthy,
+                        EventCacheHealth::Failed(error) => {
+                            return EventCacheHealth::Failed(error);
+                        }
+                        EventCacheHealth::Reconciling => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
+                self.classify_health()
+            }
+            other => other,
+        }
+    }
+
     pub fn digest_since(&self, cursor: u64) -> DigestSnapshot {
         self.shared
             .state
@@ -679,6 +788,9 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
                     *ready = true;
                     shared.ready_condvar.notify_all();
                 }
+                // Snapshot bootstrap succeeded; clear stale transport errors from a
+                // prior cycle so doctor does not FAIL on recovered streams.
+                clear_last_error(&shared);
             }
             Err(error) => {
                 set_last_error(&shared, error);
@@ -700,6 +812,7 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
                 continue;
             }
         };
+        clear_last_error(&shared);
         shared.stream_live.store(true, Ordering::Release);
         let full_snapshot_started = Instant::now();
 
@@ -709,6 +822,8 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
                 return;
             }
             if full_snapshot_started.elapsed() >= FULL_SNAPSHOT_TTL || stream.is_expired() {
+                // Planned resubscribe / TTL refresh: drop live flag without recording
+                // a transport failure so the gap classifies as Reconciling.
                 break;
             }
             match stream.poll_event(EVENT_POLL) {
@@ -716,6 +831,8 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
                     if let Ok(mut state) = shared.state.write() {
                         state.apply_event(event, now_iso());
                         if state.needs_reconcile {
+                            // Unknown-workspace / admission gate: request a fresh
+                            // snapshot without treating the gap as a hard failure.
                             break;
                         }
                     }
@@ -740,6 +857,12 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
 fn set_last_error(shared: &SharedCache, error: String) {
     if let Ok(mut value) = shared.last_error.lock() {
         *value = Some(error);
+    }
+}
+
+fn clear_last_error(shared: &SharedCache) {
+    if let Ok(mut value) = shared.last_error.lock() {
+        *value = None;
     }
 }
 
@@ -917,6 +1040,82 @@ mod tests {
         );
         cache.shared.state.write().unwrap().needs_reconcile = true;
         assert!(cache.fresh_snapshot().is_none());
+    }
+
+    #[test]
+    fn health_classifies_healthy_when_live_and_settled() {
+        let cache = EventCache::from_snapshot_for_test(fixture());
+        assert_eq!(cache.classify_health(), EventCacheHealth::Healthy);
+        assert!(cache.classify_health().doctor_pass());
+    }
+
+    #[test]
+    fn health_classifies_reconciling_when_stream_drops_without_error() {
+        let cache = EventCache::from_snapshot_for_test(fixture());
+        cache.shared.stream_live.store(false, Ordering::Release);
+        assert_eq!(cache.classify_health(), EventCacheHealth::Reconciling);
+        assert!(cache.classify_health().doctor_pass());
+        // Repeated classification stays stable (no PASS/FAIL jitter).
+        assert_eq!(cache.classify_health(), EventCacheHealth::Reconciling);
+        assert_eq!(cache.classify_health(), EventCacheHealth::Reconciling);
+    }
+
+    #[test]
+    fn health_classifies_reconciling_when_needs_reconcile() {
+        let cache = EventCache::from_snapshot_for_test(fixture());
+        cache.shared.state.write().unwrap().needs_reconcile = true;
+        assert_eq!(cache.classify_health(), EventCacheHealth::Reconciling);
+        assert_eq!(cache.classify_health().mode(), "reconciling");
+        assert!(cache.classify_health().doctor_pass());
+    }
+
+    #[test]
+    fn health_classifies_failed_on_transport_error_without_live_stream() {
+        let cache = EventCache::from_snapshot_for_test(fixture());
+        cache.shared.stream_live.store(false, Ordering::Release);
+        set_last_error(&cache.shared, "stream reset".to_owned());
+        match cache.classify_health() {
+            EventCacheHealth::Failed(error) => assert_eq!(error, "stream reset"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(!cache.classify_health().doctor_pass());
+    }
+
+    #[test]
+    fn health_keeps_failed_when_sticky_error_survives_live_stream() {
+        let cache = EventCache::from_snapshot_for_test(fixture());
+        set_last_error(&cache.shared, "stale subscribe error".to_owned());
+        assert!(matches!(
+            cache.classify_health(),
+            EventCacheHealth::Failed(_)
+        ));
+        clear_last_error(&cache.shared);
+        assert_eq!(cache.classify_health(), EventCacheHealth::Healthy);
+    }
+
+    #[test]
+    fn health_classifies_failed_when_not_ready() {
+        let cache = EventCache::from_snapshot_for_test(fixture());
+        *cache.shared.ready.lock().unwrap() = false;
+        cache.shared.stream_live.store(false, Ordering::Release);
+        assert!(matches!(
+            cache.classify_health(),
+            EventCacheHealth::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn doctor_probe_wait_leaves_reconciling_as_pass_when_budget_expires() {
+        let cache = EventCache::from_snapshot_for_test(fixture());
+        cache.shared.stream_live.store(false, Ordering::Release);
+        cache.shared.state.write().unwrap().needs_reconcile = true;
+        let health = cache.wait_for_doctor_probe(
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(30),
+        );
+        assert_eq!(health, EventCacheHealth::Reconciling);
+        assert!(health.doctor_pass());
     }
 
     #[test]
