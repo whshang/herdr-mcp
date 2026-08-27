@@ -16,6 +16,7 @@ const GREP_DEFAULT_MATCHES: usize = 50;
 const GREP_MAX_MATCHES: usize = 1000;
 const GREP_DEFAULT_FILE_BYTES: u64 = 64 * 1024;
 const GREP_MAX_FILE_BYTES: u64 = 1024 * 1024;
+const GREP_COMPACT_AFTER: usize = 24;
 
 pub fn read(snapshot: &Value, args: &Value) -> Value {
     let path = match required_str(args, "path") {
@@ -293,13 +294,72 @@ pub fn grep(snapshot: &Value, args: &Value) -> Value {
         max_bytes,
     };
     walk_grep(&search_root, &walk, &mut matches, &mut truncated);
-    json!({
-        "ok": true,
-        "root": managed.resolved.to_string_lossy(),
-        "count": matches.len(),
-        "truncated": truncated,
-        "matches": matches,
-        "engine": "rust",
+    let compact = if truncated {
+        None
+    } else {
+        compact_grep_matches(&matches)
+    };
+    let mut output = Map::new();
+    output.insert("ok".to_owned(), json!(true));
+    output.insert("root".to_owned(), json!(managed.resolved.to_string_lossy()));
+    output.insert("count".to_owned(), json!(matches.len()));
+    output.insert("truncated".to_owned(), json!(truncated));
+    output.insert("engine".to_owned(), json!("rust"));
+    match compact {
+        Some(compact) if compact.match_count > GREP_COMPACT_AFTER => {
+            output.insert("matches".to_owned(), json!(compact.grouped));
+            output.insert("counts".to_owned(), compact.counts);
+            output.insert("compacted".to_owned(), json!(true));
+        }
+        Some(compact) => {
+            output.insert("matches".to_owned(), json!(matches));
+            output.insert("counts".to_owned(), compact.counts);
+        }
+        None => {
+            output.insert("matches".to_owned(), json!(matches));
+        }
+    }
+    Value::Object(output)
+}
+
+struct GrepCompact {
+    counts: Value,
+    grouped: String,
+    match_count: usize,
+}
+
+fn compact_grep_matches(matches: &[Value]) -> Option<GrepCompact> {
+    let mut order = Vec::<String>::new();
+    let mut groups = std::collections::HashMap::<String, Vec<(u64, String)>>::new();
+    for item in matches {
+        let file = item.get("file")?.as_str()?.replace('\\', "/");
+        let line = item.get("line")?.as_u64()?;
+        let content = item.get("content")?.as_str()?.to_owned();
+        groups
+            .entry(file.clone())
+            .or_insert_with(|| {
+                order.push(file);
+                Vec::new()
+            })
+            .push((line, content));
+    }
+
+    let mut grouped = String::new();
+    for file in &order {
+        let hits = groups.get(file)?;
+        grouped.push_str(&format!("{file} ({})\n", hits.len()));
+        for (line, content) in hits {
+            grouped.push_str(&format!(" {line}: {content}\n"));
+        }
+    }
+
+    Some(GrepCompact {
+        counts: json!({
+            "files": order.len(),
+            "matches": matches.len(),
+        }),
+        grouped,
+        match_count: matches.len(),
     })
 }
 
@@ -785,6 +845,30 @@ mod tests {
         assert_eq!(grep_result["ok"], true);
         assert_eq!(grep_result["count"], 2);
         assert_eq!(grep_result["engine"], "rust");
+        assert_eq!(grep_result["counts"]["files"], 1);
+        assert_eq!(grep_result["counts"]["matches"], 2);
+        assert!(grep_result.get("compacted").is_none());
+        assert!(grep_result["matches"].as_array().is_some());
+        assert!(
+            grep_result["matches"][0]["file"]
+                .as_str()
+                .unwrap()
+                .contains("lib.rs")
+        );
+
+        let secret_grep = grep(&snapshot, &json!({"root": root, "pattern": "DO_NOT_READ"}));
+        assert_eq!(secret_grep["ok"], true);
+        assert_eq!(secret_grep["count"], 0);
+        assert_eq!(secret_grep["counts"]["files"], 0);
+        assert_eq!(secret_grep["counts"]["matches"], 0);
+        assert!(secret_grep.get("compacted").is_none());
+        let secret_matches = secret_grep["matches"].as_array().unwrap();
+        assert!(secret_matches.is_empty());
+        assert!(
+            !serde_json::to_string(&secret_grep)
+                .unwrap()
+                .contains(".env")
+        );
 
         let path_glob_result = grep(
             &snapshot,
@@ -834,6 +918,132 @@ mod tests {
 
         let secret_result = read(&snapshot, &json!({"path": root.join(".env")}));
         assert_eq!(secret_result["reason"], "secret_path_denied");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compact_grep_matches_groups_by_file() {
+        let matches = vec![
+            json!({"file": "src/lib.rs", "line": 10, "content": "fn foo"}),
+            json!({"file": "src/lib.rs", "line": 20, "content": "fn bar"}),
+            json!({"file": "src/lib.rs", "line": 30, "content": "fn baz"}),
+            json!({"file": "docs/x.md", "line": 1, "content": "note"}),
+        ];
+        let compact = compact_grep_matches(&matches).unwrap();
+        assert_eq!(compact.match_count, 4);
+        assert_eq!(compact.counts["files"], 2);
+        assert_eq!(compact.counts["matches"], 4);
+        assert!(compact.grouped.contains("src/lib.rs (3)"));
+        assert!(compact.grouped.contains(" 10: fn foo"));
+        assert!(compact.grouped.contains(" 20: fn bar"));
+        assert!(compact.grouped.contains("docs/x.md (1)"));
+        assert!(compact.grouped.contains(" 1: note"));
+    }
+
+    #[test]
+    fn grep_compacts_matches_when_many_hits_across_dirs() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-fs-grep-compact-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut src_lib = String::new();
+        for index in 0..15 {
+            src_lib.push_str(&format!("fn hit_{index}()\n"));
+        }
+        fs::write(root.join("src/lib.rs"), src_lib).unwrap();
+        let mut src_util = String::new();
+        for index in 0..10 {
+            src_util.push_str(&format!("fn hit_util_{index}()\n"));
+        }
+        fs::write(root.join("src/util.rs"), src_util).unwrap();
+        let mut docs = String::new();
+        for index in 0..5 {
+            docs.push_str(&format!("hit doc {index}\n"));
+        }
+        fs::write(root.join("docs/notes.md"), docs).unwrap();
+        fs::write(root.join(".env"), "hit DO_NOT_READ=1\n").unwrap();
+        fs::write(
+            root.join("src/big.txt"),
+            format!("{}\nhit huge\n", "x".repeat(400)),
+        )
+        .unwrap();
+
+        let snapshot = json!({"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}], "agents": []});
+        let result = grep(
+            &snapshot,
+            &json!({"root": root, "pattern": "hit", "max_matches": 200}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["truncated"], false);
+        assert_eq!(result["compacted"], true);
+        assert_eq!(result["counts"]["files"], 4);
+        assert_eq!(result["counts"]["matches"], 31);
+        assert_eq!(result["count"], 31);
+        assert_eq!(result["engine"], "rust");
+        let listing = result["matches"].as_str().unwrap();
+        assert!(listing.contains("lib.rs (15)"));
+        assert!(listing.contains("util.rs (10)"));
+        assert!(listing.contains("notes.md (5)"));
+        assert!(listing.contains("big.txt (1)"));
+        assert!(listing.contains(" 1: fn hit_0()"));
+        assert!(listing.contains(" 15: fn hit_14()"));
+        assert!(listing.contains(" 1: fn hit_util_0()"));
+        assert!(listing.contains(" 1: hit doc 0"));
+        assert!(listing.contains("hit huge"));
+        assert!(!listing.contains(".env"));
+        assert!(!listing.contains("DO_NOT_READ"));
+
+        let truncated_count = grep(
+            &snapshot,
+            &json!({"root": root, "pattern": "hit", "max_matches": 10}),
+        );
+        assert_eq!(truncated_count["ok"], true);
+        assert_eq!(truncated_count["truncated"], true);
+        assert_eq!(truncated_count["count"], 10);
+        assert!(truncated_count.get("compacted").is_none());
+        assert!(truncated_count.get("counts").is_none());
+        assert!(truncated_count["matches"].as_array().is_some());
+        assert!(
+            !truncated_count["matches"][0]["file"]
+                .as_str()
+                .unwrap()
+                .contains(".env")
+        );
+
+        let truncated_bytes = grep(
+            &snapshot,
+            &json!({
+                "root": root,
+                "pattern": "hit",
+                "max_matches": 200,
+                "max_bytes": 200,
+            }),
+        );
+        assert_eq!(truncated_bytes["ok"], true);
+        assert_eq!(truncated_bytes["truncated"], true);
+        assert!(truncated_bytes.get("compacted").is_none());
+        assert!(truncated_bytes.get("counts").is_none());
+        assert!(truncated_bytes["matches"].as_array().is_some());
+        let listing = serde_json::to_string(&truncated_bytes["matches"]).unwrap();
+        assert!(!listing.contains("lib.rs (15)"));
+        assert!(!listing.contains(".env"));
+
         fs::remove_dir_all(root).unwrap();
     }
 }
