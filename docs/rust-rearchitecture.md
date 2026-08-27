@@ -683,6 +683,8 @@ Roadmap 不与当前 Rust parity 并行扩张 public surface。顺序固定为�
 
 工具性能作为独立并行 lane 推进，详细计划见 [`tool-performance-optimization.md`](tool-performance-optimization.md)。Batch A 只做不改变 epoch 2 / 18-tool visible contract 的内部优化、输出压缩与 `herdr_skill` 编排/Worktree 生命周期规则；当前 Rust link runner 继续独立推进 `crates/herdr-mcp/src/link/**`。只有性能基准证明固定 MCP/model round-trip 仍是主要瓶颈后，才在 Batch B 明确评估 multi-operation tool schema / JSON-RPC batch 与 contract epoch 演进，禁止把 model-visible schema 变化混入普通 Rust 重构。
 
+长任务可观察性作为性能与可靠性并行 lane 纳入 `tool-performance-optimization.md`。该 lane 通过 Task Journal、phase event 和 checkpoint 提供长 release/CI/deploy/self-upgrade 过程的阶段反馈，不替代 Git/runtime live state，也不改变 epoch 2 / 18 tools contract。
+
 ### 暂不进入主线
 
 以下能力保持观察，不进入当前 Roadmap：

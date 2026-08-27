@@ -505,6 +505,108 @@ provider quota / bandwidth / storage cost
 
 ## 11. 完成定义
 
+## 11. Long Task Progress Observability（Batch C 规划）
+
+目标：让长任务在执行过程中自动产生可恢复的阶段状态，避免依赖模型临时记忆或用户主动询问。
+
+适用场景：
+
+- CI、release、deploy、self-upgrade；
+- 长测试和 benchmark；
+- 多 worktree / 多 Agent 协作任务。
+
+设计：
+
+```text
+task run
+  ↓
+phase state
+  ↓
+task events
+  ↓
+checkpoint/evidence
+  ↓
+progress report
+```
+
+状态阶段：
+
+```text
+TASK_CREATED
+STATE_VERIFIED
+PLAN_LOCKED
+IMPLEMENTING
+VALIDATING
+WAITING_EXTERNAL
+RELEASE_READY
+DEPLOYING
+VERIFYING
+COMPLETED
+```
+
+利用 Rust Shared Local State Store 扩展 Task Journal，不新增第二套任务系统：
+
+```text
+task_runs
+  task_id
+  objective
+  workspace_id
+  phase
+  status
+
+task_events
+  task_id
+  event_type
+  evidence
+  created_at
+
+checkpoints
+  task_id
+  phase
+  commit
+  tests
+  next_action
+```
+
+自动产生 progress event：
+
+- 任务预计超过 3 分钟；
+- 工具调用超过 5 次；
+- 创建/关闭/reclaim worktree；
+- CI 开始或完成；
+- 等待外部系统；
+- release/deploy/self-upgrade；
+- blocker 或 failure。
+
+保持低噪声：单次 read、grep、小 patch、普通 git status 不产生用户级汇报。
+
+`herdr_skill` 在开发阶段增加长任务汇报策略：
+
+```text
+announce phase start
+report major milestone
+report external wait
+report blocker immediately
+complete with evidence
+```
+
+稳定版冻结前精简该规则，只保留运行原则。
+
+实施顺序：
+
+1. checkpoint/event schema；
+2. tool lifecycle event emission；
+3. `herdr_since` task cursor；
+4. progress rendering；
+5. handoff 恢复读取 checkpoint。
+
+验收：
+
+- 长任务不会出现无解释静默等待；
+- 新 conversation 可从 checkpoint 恢复阶段；
+- progress event 不增加短任务噪声；
+- checkpoint 不替代 Git/runtime live state。
+
 Batch A 完成：
 
 - 18 个工具均有明确优化结论；
