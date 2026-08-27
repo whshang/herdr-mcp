@@ -11,10 +11,14 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitCode, Output};
+use std::process::ExitCode;
+#[cfg(target_os = "macos")]
+use std::process::{Command, Output};
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
 use plist::{Dictionary, Value as PlistValue};
+#[cfg(target_os = "macos")]
 use serde_json::{Value, json};
 
 use super::ownership::{LINK_LABEL, LINK_PROD_LABEL};
@@ -27,8 +31,11 @@ pub const LINK_RUST_CANDIDATE_LABEL: &str = "dev.herdr-mcp.link-rust-candidate";
 /// live Node `dev-real-runtime` on the same Edge).
 pub const CANDIDATE_WORKSTATION_ID: &str = "dev-rust-link-candidate";
 
+#[cfg(target_os = "macos")]
 const LAUNCHD_BOOTOUT_BUDGET: Duration = Duration::from_secs(8);
+#[cfg(target_os = "macos")]
 const LAUNCHD_ABSENT_BUDGET: Duration = Duration::from_secs(4);
+#[cfg(target_os = "macos")]
 const BOOTSTRAP_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(200),
     Duration::from_millis(500),
@@ -44,7 +51,7 @@ pub fn protected_live_link_labels() -> &'static [&'static str] {
 pub fn install() -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     {
-        return Err("herdr-mcp link install is macOS-only (LaunchAgent candidate soak)".to_owned());
+        Err("herdr-mcp link install is macOS-only (LaunchAgent candidate soak)".to_owned())
     }
     #[cfg(target_os = "macos")]
     {
@@ -59,9 +66,7 @@ pub fn install() -> Result<ExitCode, String> {
 pub fn uninstall() -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     {
-        return Err(
-            "herdr-mcp link uninstall is macOS-only (LaunchAgent candidate soak)".to_owned(),
-        );
+        Err("herdr-mcp link uninstall is macOS-only (LaunchAgent candidate soak)".to_owned())
     }
     #[cfg(target_os = "macos")]
     {
@@ -360,6 +365,7 @@ fn candidate_paths(home: &Path) -> CandidatePaths {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -458,6 +464,7 @@ fn refuse_if_plist_is_protected_label(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     let parent = path
         .parent()
@@ -475,7 +482,10 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
             .and_then(OsStr::to_str)
             .unwrap_or("herdr-mcp-link"),
         std::process::id(),
-        Instant::now().elapsed().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
     ));
     {
         let mut file = fs::File::create(&temp)
