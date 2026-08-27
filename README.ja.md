@@ -198,6 +198,25 @@ bin/herdr-extension-host status
 
 詳細：[Architecture](docs/i18n/en/architecture.md) · [Best practices](docs/i18n/en/best-practices.md)
 
+## Local runtime CLI
+
+ネイティブ runtime をインストールしたあとの日常ライフサイクルは、次のトップレベルコマンドを使います:
+
+```bash
+herdr-mcp install
+herdr-mcp status
+herdr-mcp doctor
+herdr-mcp update check
+herdr-mcp update apply
+herdr-mcp update status
+herdr-mcp rollback
+herdr-mcp uninstall
+```
+
+`herdr-mcp service ...` は advanced / internal なサービス制御用に残しています（例: `service install --adopt-node`）。通常の install / health / update / rollback では上のトップレベルコマンドを優先してください。
+
+詳細：[CLI reference](docs/i18n/en/cli-reference.md) · [Runtime A/B](docs/i18n/en/runtime-self-upgrade.md)
+
 ## Runtime A/B
 
 公開 Edge とローカル runtime は別の release plane です。

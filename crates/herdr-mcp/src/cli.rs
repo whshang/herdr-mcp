@@ -65,8 +65,14 @@ where
     match command {
         "help" | "-h" | "--help" => no_extra(&args, Command::Help),
         "version" | "-V" | "--version" => no_extra(&args, Command::Version),
+        "install" => no_extra(
+            &args,
+            Command::Service(ServiceCommand::Install { adopt_node: false }),
+        ),
         "status" => no_extra(&args, Command::Status),
         "doctor" => no_extra(&args, Command::Doctor),
+        "rollback" => no_extra(&args, Command::Service(ServiceCommand::Rollback)),
+        "uninstall" => no_extra(&args, Command::Service(ServiceCommand::Uninstall)),
         "config" => parse_config(&args[1..]),
         "dev" => parse_dev(&args[1..]),
         "candidate" => parse_candidate(&args[1..]),
@@ -251,19 +257,24 @@ fn parse_extension_host(args: &[String]) -> Result<Command, String> {
 
 pub fn help() -> &'static str {
     "Herdr MCP native runtime\n\n\
-Usage:\n\
-  herdr-mcp version\n\
+User path:\n\
+  herdr-mcp install\n\
   herdr-mcp status\n\
   herdr-mcp doctor\n\
-  herdr-mcp config [path|show|init]\n\
-  herdr-mcp dev [--dry-run]\n\
-  herdr-mcp candidate [--port 8873]\n\
-  herdr-mcp service <install [--adopt-node]|status|start|stop|restart|rollback|uninstall>\n\
   herdr-mcp update <check [--manifest URL]|apply [--manifest URL]|status>\n\
+  herdr-mcp rollback\n\
+  herdr-mcp uninstall\n\n\
+Advanced / internal:\n\
+  herdr-mcp version\n\
+  herdr-mcp config [path|show|init]\n\
+  herdr-mcp service <install [--adopt-node]|status|start|stop|restart|rollback|uninstall>\n\
   herdr-mcp native-host <install|status|uninstall|rollback>\n\
-  herdr-mcp extension-host [chrome-extension://.../]\n\n\
-The Rust binary is the new local product boundary. Service, update, runtime,\n\
-link, and native-host commands are added as their native implementations land.\n"
+  herdr-mcp extension-host [chrome-extension://.../]\n\
+  herdr-mcp dev [--dry-run]\n\
+  herdr-mcp candidate [--port 8873]\n\n\
+Prefer the top-level install/status/doctor/update/rollback/uninstall commands\n\
+for normal lifecycle. Use service ... only for advanced service control\n\
+(for example service install --adopt-node).\n"
 }
 
 #[cfg(test)]
@@ -278,8 +289,20 @@ mod tests {
     fn parses_core_commands() {
         assert_eq!(parse(args(&[])).unwrap(), Command::Help);
         assert_eq!(parse(args(&["version"])).unwrap(), Command::Version);
+        assert_eq!(
+            parse(args(&["install"])).unwrap(),
+            Command::Service(ServiceCommand::Install { adopt_node: false })
+        );
         assert_eq!(parse(args(&["status"])).unwrap(), Command::Status);
         assert_eq!(parse(args(&["doctor"])).unwrap(), Command::Doctor);
+        assert_eq!(
+            parse(args(&["rollback"])).unwrap(),
+            Command::Service(ServiceCommand::Rollback)
+        );
+        assert_eq!(
+            parse(args(&["uninstall"])).unwrap(),
+            Command::Service(ServiceCommand::Uninstall)
+        );
         assert_eq!(
             parse(args(&["config", "show"])).unwrap(),
             Command::Config(ConfigCommand::Show)
@@ -374,6 +397,7 @@ mod tests {
         assert!(parse(args(&["candidate", "--port", "0"])).is_err());
         assert!(parse(args(&["service"])).is_err());
         assert!(parse(args(&["service", "install", "--force"])).is_err());
+        assert!(parse(args(&["install", "--adopt-node"])).is_err());
         assert!(parse(args(&["update"])).is_err());
         assert!(parse(args(&["update", "apply", "--force"])).is_err());
         assert!(parse(args(&["native-host"])).is_err());
@@ -381,5 +405,36 @@ mod tests {
         assert!(parse(args(&["extension-host", "https://example.com/"])).is_err());
         assert!(parse(args(&["status", "extra"])).is_err());
         assert!(parse(args(&["unknown"])).is_err());
+    }
+
+    #[test]
+    fn help_documents_user_path_ahead_of_service() {
+        let text = help();
+        for needle in [
+            "herdr-mcp install",
+            "herdr-mcp status",
+            "herdr-mcp doctor",
+            "herdr-mcp update",
+            "herdr-mcp rollback",
+            "herdr-mcp uninstall",
+        ] {
+            assert!(
+                text.contains(needle),
+                "help missing user-path command: {needle}"
+            );
+        }
+        assert!(text.contains("User path:"));
+        assert!(text.contains("Advanced / internal:"));
+        let install = text.find("herdr-mcp install").expect("install");
+        let service = text.find("herdr-mcp service").expect("service");
+        assert!(
+            install < service,
+            "user-path install must appear before advanced service"
+        );
+        let user_slice = &text[..service];
+        assert!(
+            !user_slice.contains("herdr-mcp service install"),
+            "user path must not require service install"
+        );
     }
 }
