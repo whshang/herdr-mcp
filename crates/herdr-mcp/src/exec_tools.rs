@@ -47,7 +47,7 @@ pub fn start(snapshot: &Value, registry: &ExecRegistry, args: &Value) -> Value {
                 object.insert("root".to_owned(), json!(managed.root.to_string_lossy()));
                 object.insert(
                     "hint".to_owned(),
-                    json!("poll herdr_exec_read with session_id; herdr_exec_kill when done"),
+                    json!("poll herdr_exec_read with session_id until phase=completed; herdr_exec_kill when done"),
                 );
                 if !working.is_empty() {
                     object.insert("warnings".to_owned(), json!({"working": working}));

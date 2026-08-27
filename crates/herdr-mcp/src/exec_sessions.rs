@@ -188,6 +188,12 @@ impl ExecRegistry {
             "command": command,
             "started_at": iso_from_ms(session.started_at_ms),
             "pid": pid,
+            "phase": "started",
+            "progress": {
+                "bytes_read": 0,
+                "bytes_total": 0,
+                "elapsed_ms": 0,
+            },
         }))
     }
 
@@ -215,10 +221,17 @@ impl ExecRegistry {
             && !truncated
             && offset == 0
             && bytes.len() == bytes_total;
+        let phase = if status.closed {
+            "completed"
+        } else {
+            "running"
+        };
+        let elapsed_ms = session_elapsed_ms(&session, &status);
         let mut result = Map::new();
         result.insert("ok".to_owned(), json!(true));
         result.insert("session_id".to_owned(), json!(id));
         result.insert("running".to_owned(), json!(!status.closed));
+        result.insert("phase".to_owned(), json!(phase));
         result.insert("exit_code".to_owned(), json!(status.exit_code));
         result.insert("signal".to_owned(), json!(status.signal));
         result.insert("truncated".to_owned(), json!(truncated));
@@ -226,6 +239,14 @@ impl ExecRegistry {
         result.insert("offset".to_owned(), json!(offset));
         result.insert("next_offset".to_owned(), json!(next_offset));
         result.insert("bytes_total".to_owned(), json!(bytes_total));
+        result.insert(
+            "progress".to_owned(),
+            json!({
+                "bytes_read": next_offset,
+                "bytes_total": bytes_total,
+                "elapsed_ms": elapsed_ms,
+            }),
+        );
         exec_compact::insert_compacted_or_raw(
             &mut result,
             "text",
@@ -414,6 +435,15 @@ fn session_status(session: &Arc<Session>) -> SessionStatus {
             ended_at_ms: status.ended_at_ms,
         },
     )
+}
+
+fn session_elapsed_ms(session: &Session, status: &SessionStatus) -> u64 {
+    let end_ms = if status.closed {
+        status.ended_at_ms.unwrap_or_else(now_ms)
+    } else {
+        now_ms()
+    };
+    end_ms.saturating_sub(session.started_at_ms)
 }
 
 fn spawn_reader<R>(session: Arc<Session>, stream: StreamKind, mut reader: R)
@@ -1028,9 +1058,17 @@ mod tests {
         let started = registry
             .start(Path::new("/tmp"), "printf out; printf err >&2; exit 7")
             .unwrap();
+        assert_eq!(started["phase"], "started");
+        assert_eq!(started["progress"]["bytes_read"], 0);
+        assert_eq!(started["progress"]["bytes_total"], 0);
+        assert_eq!(started["progress"]["elapsed_ms"], 0);
         let id = started["session_id"].as_str().unwrap().to_owned();
         let view = wait_until_closed(&registry, &id, "both", 65536);
         assert_eq!(view["exit_code"], 7);
+        assert_eq!(view["phase"], "completed");
+        assert_eq!(view["progress"]["bytes_read"], view["next_offset"]);
+        assert_eq!(view["progress"]["bytes_total"], view["bytes_total"]);
+        assert!(view["progress"]["elapsed_ms"].as_u64().is_some());
         let text = view["text"].as_str().unwrap();
         assert!(text.contains("out"));
         assert!(text.contains("err"));
@@ -1146,8 +1184,13 @@ mod tests {
             let view = registry.read(&id, "stdout", 0, 65536);
             let text = view["text"].as_str().unwrap_or("");
             if view["running"] == true && text.contains("line-89") {
+                assert_eq!(view["phase"], "running");
                 assert!(view.get("compacted").is_none());
                 assert!(text.contains("line-40\n"));
+                assert_eq!(view["progress"]["bytes_read"], view["next_offset"]);
+                assert_eq!(view["progress"]["bytes_total"], view["bytes_total"]);
+                assert!(view["progress"]["bytes_total"].as_u64().unwrap() > 0);
+                assert!(view["progress"]["elapsed_ms"].as_u64().unwrap() > 0);
                 assert_eq!(registry.kill(&id)["killed"], true);
                 return;
             }
@@ -1158,6 +1201,49 @@ mod tests {
         }
         let _ = registry.kill(&id);
         panic!("did not observe in-progress output");
+    }
+
+    #[test]
+    fn in_progress_read_exposes_streaming_progress() {
+        let registry = registry();
+        let started = registry
+            .start(
+                Path::new("/tmp"),
+                "awk 'BEGIN{for(i=0;i<40;i++) print \"prog-\" i}'; sleep 30",
+            )
+            .unwrap();
+        assert_eq!(started["phase"], "started");
+        let id = started["session_id"].as_str().unwrap().to_owned();
+        for _ in 0..800 {
+            let view = registry.read(&id, "stdout", 0, 65536);
+            if view["phase"] == "running"
+                && view["progress"]["bytes_total"].as_u64().unwrap_or(0) > 0
+            {
+                assert_eq!(view["running"], true);
+                assert_eq!(view["progress"]["bytes_read"], view["next_offset"]);
+                assert_eq!(view["progress"]["bytes_total"], view["bytes_total"]);
+                let mid = registry.read(
+                    &id,
+                    "stdout",
+                    view["next_offset"].as_u64().unwrap() as usize / 2,
+                    16,
+                );
+                assert_eq!(mid["phase"], "running");
+                assert!(mid["progress"]["bytes_read"].as_u64().unwrap() > 0);
+                assert_eq!(mid["progress"]["bytes_total"], view["bytes_total"]);
+                assert_eq!(registry.kill(&id)["killed"], true);
+                let done = wait_until_closed(&registry, &id, "stdout", 65536);
+                assert_eq!(done["phase"], "completed");
+                assert_eq!(done["running"], false);
+                return;
+            }
+            if view["running"] == false {
+                panic!("session exited before progress assertion");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = registry.kill(&id);
+        panic!("did not observe running progress");
     }
 
     #[test]
