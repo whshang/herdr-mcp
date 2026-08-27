@@ -1,0 +1,115 @@
+{
+  "date": "2026-08-27",
+  "contract": {
+    "epoch": 2,
+    "tool_count": 18,
+    "hash": "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8"
+  },
+  "token_estimate_note": "approx_tokens_chars4 uses ceil(bytes/4); it is a context-size heuristic, not a tokenizer measurement",
+  "baseline_giant": {
+    "bytes": 21158,
+    "approx_tokens_chars4": 5290,
+    "percent_of_giant": 100.0
+  },
+  "progressive": {
+    "global_agents": {
+      "bytes": 2651,
+      "approx_tokens_chars4": 663,
+      "percent_of_giant": 12.5
+    },
+    "measured_bootstrap": {
+      "bytes": 3775,
+      "approx_tokens_chars4": 944,
+      "percent_of_giant": 17.8,
+      "measurement": "alternate local Rust candidate on 127.0.0.1:19084 with HERDR_MCP_PROGRESSIVE_SKILLS=1; includes compact catalog and live capability projection"
+    },
+    "modules": {
+      "workstation-control": { "bytes": 2115, "approx_tokens_chars4": 529, "percent_of_giant": 10.0 },
+      "files-search": { "bytes": 1817, "approx_tokens_chars4": 455, "percent_of_giant": 8.6 },
+      "files-mutation": { "bytes": 1962, "approx_tokens_chars4": 491, "percent_of_giant": 9.3 },
+      "git-repository": { "bytes": 1677, "approx_tokens_chars4": 420, "percent_of_giant": 7.9 },
+      "execution": { "bytes": 2075, "approx_tokens_chars4": 519, "percent_of_giant": 9.8 },
+      "agent-dispatch": { "bytes": 2557, "approx_tokens_chars4": 640, "percent_of_giant": 12.1 },
+      "development-orchestration": { "bytes": 2575, "approx_tokens_chars4": 644, "percent_of_giant": 12.2 }
+    },
+    "profiles": {
+      "fs-only": {
+        "skills": ["files-search"],
+        "loaded_bytes": 5592,
+        "approx_tokens_chars4": 1398,
+        "percent_of_giant": 26.4,
+        "initial_skill_load_round_trips": 1,
+        "steady_state_skill_load_round_trips_per_tool_call": 0
+      },
+      "exec-only": {
+        "skills": ["execution"],
+        "loaded_bytes": 5850,
+        "approx_tokens_chars4": 1463,
+        "percent_of_giant": 27.6,
+        "initial_skill_load_round_trips": 1,
+        "steady_state_skill_load_round_trips_per_tool_call": 0
+      },
+      "agent-delegation": {
+        "skills": ["workstation-control", "agent-dispatch"],
+        "loaded_bytes": 8447,
+        "approx_tokens_chars4": 2112,
+        "percent_of_giant": 39.9,
+        "initial_skill_load_round_trips": 1,
+        "steady_state_skill_load_round_trips_per_tool_call": 0
+      },
+      "multi-line-development": {
+        "skills": ["workstation-control", "agent-dispatch", "development-orchestration", "git-repository", "files-mutation"],
+        "loaded_bytes": 14661,
+        "approx_tokens_chars4": 3666,
+        "percent_of_giant": 69.3,
+        "initial_skill_load_round_trips": 1,
+        "steady_state_skill_load_round_trips_per_tool_call": 0
+      }
+    },
+    "round_trip_model": {
+      "bootstrap_calls_per_new_context": 1,
+      "initial_domain_load_calls": "0-1 batched call per classified task profile",
+      "new_capability_domain_calls": "0-1 additional batched call",
+      "reload_on_new_user_turn": false,
+      "reload_on_live_capability_refresh": false
+    }
+  },
+  "candidate_smoke": {
+    "alternate_port": 19084,
+    "production_runtime_replaced": false,
+    "catalog_count": 7,
+    "batched_load": {
+      "ids": ["files-search", "git-repository"],
+      "first_cache_hit": [false, false],
+      "second_cache_hit": [true, true],
+      "authorization": "none"
+    },
+    "unknown_local_method": {
+      "ok": false,
+      "code": "unknown_local_method",
+      "forwarded_to_herdr": false
+    },
+    "normal_passthrough": {
+      "method": "workspace.list",
+      "ok": true,
+      "result_type": "workspace_list"
+    },
+    "legacy_full": {
+      "ok": true,
+      "mode_present": false,
+      "project_skill_present": true,
+      "runtime_present": true
+    },
+    "automatic_dispatch": {
+      "task": "independent read-only compatibility and namespace audit",
+      "selected_worker": "pi-skill-node-oracle",
+      "pane": "wD1:p3",
+      "project_match": true,
+      "submitted": true,
+      "state_sequence": ["done", "working", "done"],
+      "duplicate_submission": false,
+      "audit_result": "PASS",
+      "must_fix": []
+    }
+  }
+}
