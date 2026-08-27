@@ -277,25 +277,25 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ---
 
-## Current Scorecard（2026-08-27 · live alpha.13 / candidate edge-prod soak）
+## Current Scorecard（2026-08-27 · live alpha.14 / G5 sealed）
 
-评分：`PASS` / `PARTIAL` / `FAIL` / `UNKNOWN`。本表对齐 **2026-08-27 live `0.4.0-alpha.13`** runtime（generation `rust-5c7799b56a426855`）+ candidate Edge retarget 证据；alpha.14 源码含 `link cutover --rollback` / `link seal`，**未**自动 seal。产品仍处 **alpha**，**未达 GA**；`production_ready` 仍 false until seal execute after rollback UAT。
+评分：`PASS` / `PARTIAL` / `FAIL` / `UNKNOWN`。本表对齐 **2026-08-27 live `0.4.0-alpha.14`** runtime（generation `rust-7c0ac0b73060aae0`，merge `7efd30c` / Release [v0.4.0-alpha.14](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0-alpha.14)）+ G5 seal 证据。产品仍处 **alpha**，**未达 GA**；干净机 / 多机 / 退出 alpha 仍未完成。
 
-本机 update 证据：managed update `0.4.0-alpha.12` / `rust-6e3f0b8685b89e66` → `0.4.0-alpha.13` / `rust-5c7799b56a426855`；service healthy；epoch 2 / 18 tools；用户 CLI → `runtime/current`。
+本机 update 证据：managed update `0.4.0-alpha.13` / `rust-5c7799b56a426855` → `0.4.0-alpha.14` / `rust-7c0ac0b73060aae0`；service healthy；epoch 2 / 18 tools；用户 CLI → `runtime/current`。
 
-本机 G5：`link-prod` = Rust `runtime/current link run`；candidate 已在 **edge-prod epoch 2** 上线（原 `contract_rejected` 因 edge-dev 仍为 epoch 1）。双次自验收 Pass A/B 已记。仍缺：故意 Node rollback UAT、`link seal --execute`、干净机。G5 保持 **PARTIAL**（切流+candidate 修复已做；seal 未做则不得 PASS）。
+本机 G5：`link-prod` = Rust `runtime/current link run`；candidate 留在 edge-prod；canary Node 未动。Rollback UAT PASS 后 `HERDR_LINK_SEAL_I_UNDERSTAND=1 link seal --execute` → active seal；`/health` `runtime=rust`，`native_migration.production_ready=true` / `link_cutover.production_ready=true`；`doctor` `production_ready_eligible=true`；`link status` 全 gate true。干净机仍属 G3/G18，不挡本机 G5 PASS。
 
 | ID | 评分 | 一行证据 |
 | --- | --- | --- |
-| G1 | **FAIL** | 仍处 alpha：Cargo 下一发 `0.4.0-alpha.14`；live 仍 alpha.13；`package.json` = `0.3.32` |
+| G1 | **FAIL** | 仍处 alpha：live `0.4.0-alpha.14`；`package.json` = `0.3.32` |
 | G2 | **PARTIAL** | Rust Release + attestation/manifest 链已存在；但 README / `docs/i18n/en/install.md` 主路径仍是 `git clone` + `npm ci` + Node.js 20+ |
 | G3 | **PARTIAL** | 顶层 CLI + entrypoint 已合入；**本机 live symlink 已迁到 `runtime/current`**。仍 PARTIAL：缺干净机 / 正式多机 seal |
 | G4 | **PARTIAL** | `service install` + generation/health/rollback 代码存在；正式文档未给出 binary → `herdr-mcp install` 干净机路径 |
-| G5 | **PARTIAL** | `link-prod` Rust；candidate edge-prod soak 在线；rollback UAT PASS；仍缺 alpha.14 apply + `link seal --execute` + 干净机（seal 前不得标 PASS） |
+| G5 | **PASS** | 本机 production owner=rust：link-prod Rust；alpha.14 seal execute；health/`doctor`/`link status` 一致 `production_ready`；rollback UAT 证据在 `seals/evidence/`（干净机另计 G18） |
 | G6 | **PARTIAL** | 嵌入契约 epoch 2 / 18 tools（hash 冻结）；真实 ChatGPT 与全路径 production smoke 仍属 alpha 验收 |
-| G7 | **PARTIAL** | Edge→Link→runtime 在本机已走 Rust `link-prod`；canary 仍 Node；缺 seal 与多机 |
-| G8 | **PARTIAL** | Live alpha.13 `doctor` 8 行 `LAYER`；`LAYER link owned production_owner=rust` / `production_ready_eligible=false`；`remote-probe=skipped` |
-| G9 | **PARTIAL** | 又一次 alpha N→N+1 通过（alpha.12→alpha.13）；**无** stable N→N+1 / 干净机用户向 UAT |
+| G7 | **PARTIAL** | Edge→Link→runtime 在本机已走 sealed Rust `link-prod`；canary 仍 Node；缺多机 / 公网完整 GA UAT |
+| G8 | **PARTIAL** | Live alpha.14 `doctor` 8 行 `LAYER`；`LAYER link owned production_owner=rust` / `production_ready_eligible=true`；`remote-probe=skipped` |
+| G9 | **PARTIAL** | 又一次 alpha N→N+1 通过（alpha.13→alpha.14）；**无** stable N→N+1 / 干净机用户向 UAT |
 | G10 | **PARTIAL** | alpha.8↔alpha.6 真实受控回退已通过；非 stable、非干净机 |
 | G11 | **PARTIAL** | service mutation guardian、Link reconnect 有现场证据；完整崩溃/重启矩阵未做 GA UAT |
 | G12 | **PARTIAL** | Streaming basics 已落地；跨网页回合正式 GA UAT 未封板 |
@@ -310,23 +310,23 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G21 | **PARTIAL** | 站点 CI gate 在 alpha 主线上维护；尚无 stable tag 封板 |
 | G22 | **FAIL** | Fastest path / install 仍引导 `git clone`、`npm ci`；本机 PATH 已不依赖仓库 Bash |
 | G23 | **PARTIAL** | main CI 在 alpha 迭代中可绿；GA tag 专用全绿验收未跑 |
-| G24 | **FAIL** | P0/P1 blocker 仍在：G5 seal、G1 alpha、G18；`production_ready` 仍 false |
+| G24 | **FAIL** | P0/P1 blocker 仍在：G1 alpha、G18 干净机、G22 安装文档；本机 G5 seal 已完成仍不足 GA |
 | G25 | **FAIL** | 未达 GA：不得打 stable |
 
-**合计（诚实快照）**：PASS 1 · PARTIAL 16 · FAIL 8 · UNKNOWN 0
+**合计（诚实快照）**：PASS 2 · PARTIAL 15 · FAIL 8 · UNKNOWN 0
 
 ---
 
 ## Current P0 work queue
 
-按 2026-08-27 live alpha.13 / candidate edge-prod soak 证据排序：
+按 2026-08-27 live alpha.14 / G5 sealed 证据排序：
 
-1. **G5 seal — `production_ready` 可审计封印**（alpha.14 `link seal`）：rollback UAT 后再 `--execute`；在此之前保持 `production_ready=false`。
-2. **G5 follow-ups**：alpha.14 apply → `link seal --execute`；candidate edge-prod soak 加深。
-3. **G1 — 单一正式产品版本（退出 alpha）**。
-4. **G3 formal seal — 干净机 / 多机确认**。
-5. **G18 — 干净机 install UAT**。
-6. **G15 — 扩展正式分发，或从 GA 宣称中移除（倾向 A：GA artifact 路径草图，不绑 browser-control worktree）**。
+1. **G1 — 单一正式产品版本（退出 alpha）**。
+2. **G18 — 干净机 install UAT**。
+3. **G3 formal seal — 干净机 / 多机确认**。
+4. **G22 — 正式文档最快路径改为 binary install（去掉 clone/npm 主路径）**。
+5. **G15 — 扩展正式分发，或从 GA 宣称中移除（倾向 A：GA artifact 路径草图，不绑 browser-control worktree）**。
+6. **G5 follow-ups（非 blocker）**：candidate edge-prod soak 加深；长心跳 / cancel / long-request 矩阵。
 
 ---
 
