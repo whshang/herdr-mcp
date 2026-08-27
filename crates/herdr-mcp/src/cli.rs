@@ -23,6 +23,10 @@ pub enum LinkCommand {
     Install,
     /// Remove only the Rust Link candidate LaunchAgent. Never touches live Node link/link-prod.
     Uninstall,
+    /// Production Link cutover planner. Default is dry-run; execute is a gated no-op stub.
+    Cutover {
+        mode: crate::link::CutoverMode,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -103,14 +107,47 @@ fn parse_link(args: &[String]) -> Result<Command, String> {
         [subcommand] if subcommand == "run" => Ok(Command::Link(LinkCommand::Run)),
         [subcommand] if subcommand == "install" => Ok(Command::Link(LinkCommand::Install)),
         [subcommand] if subcommand == "uninstall" => Ok(Command::Link(LinkCommand::Uninstall)),
-        [] => Err("link requires status, run, install, or uninstall".to_owned()),
+        [subcommand, ..] if subcommand == "cutover" => parse_link_cutover(&args[1..]),
+        [] => Err("link requires status, run, install, uninstall, or cutover".to_owned()),
         [subcommand] => Err(format!(
-            "unknown link command '{subcommand}' (status|run|install|uninstall; production cutover lands in a later G5 slice)"
+            "unknown link command '{subcommand}' (status|run|install|uninstall|cutover)"
         )),
         _ => Err(
-            "link accepts exactly one subcommand: status, run, install, or uninstall".to_owned(),
+            "link accepts status, run, install, uninstall, or cutover [--dry-run|--execute]"
+                .to_owned(),
         ),
     }
+}
+
+fn parse_link_cutover(args: &[String]) -> Result<Command, String> {
+    use crate::link::CutoverMode;
+
+    let mut dry_run = false;
+    let mut execute = false;
+    for arg in args {
+        match arg.as_str() {
+            "--dry-run" => dry_run = true,
+            "--execute" => execute = true,
+            value => {
+                return Err(format!(
+                    "unknown link cutover argument '{value}' (expected --dry-run or --execute)"
+                ));
+            }
+        }
+    }
+    if dry_run && execute {
+        return Err(
+            "link cutover accepts only one of --dry-run or --execute (default is dry-run)"
+                .to_owned(),
+        );
+    }
+    // Bare `link cutover` defaults to dry-run.
+    let mode = if execute {
+        CutoverMode::Execute
+    } else {
+        CutoverMode::DryRun
+    };
+    Ok(Command::Link(LinkCommand::Cutover { mode }))
 }
 
 fn parse_config(args: &[String]) -> Result<Command, String> {
@@ -301,6 +338,7 @@ Advanced / internal:\n\
   herdr-mcp link run\n\
   herdr-mcp link install\n\
   herdr-mcp link uninstall\n\
+  herdr-mcp link cutover [--dry-run|--execute]\n\
   herdr-mcp native-host <install|status|uninstall|rollback>\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\
   herdr-mcp dev [--dry-run]\n\
@@ -311,7 +349,9 @@ for normal lifecycle. Use service ... only for advanced service control\n\
 ownership/gates reporting. link run starts a foreground Rust Link candidate\n\
 (Keychain/plist credentials). link install/uninstall manage only the candidate\n\
 LaunchAgent dev.herdr-mcp.link-rust-candidate → runtime/current link run; they\n\
-never unload or replace live Node link/link-prod.\n"
+never unload or replace live Node link/link-prod. link cutover defaults to\n\
+dry-run plan/validate only; --execute is a gated no-op stub and never cuts\n\
+production Link in this release.\n"
 }
 
 #[cfg(test)]
@@ -414,6 +454,24 @@ mod tests {
             Command::Link(LinkCommand::Uninstall)
         );
         assert_eq!(
+            parse(args(&["link", "cutover"])).unwrap(),
+            Command::Link(LinkCommand::Cutover {
+                mode: crate::link::CutoverMode::DryRun
+            })
+        );
+        assert_eq!(
+            parse(args(&["link", "cutover", "--dry-run"])).unwrap(),
+            Command::Link(LinkCommand::Cutover {
+                mode: crate::link::CutoverMode::DryRun
+            })
+        );
+        assert_eq!(
+            parse(args(&["link", "cutover", "--execute"])).unwrap(),
+            Command::Link(LinkCommand::Cutover {
+                mode: crate::link::CutoverMode::Execute
+            })
+        );
+        assert_eq!(
             parse(args(&["native-host", "status"])).unwrap(),
             Command::NativeHost(NativeHostCommand::Status)
         );
@@ -456,7 +514,8 @@ mod tests {
         assert!(parse(args(&["native-host"])).is_err());
         assert!(parse(args(&["native-host", "legacy"])).is_err());
         assert!(parse(args(&["link"])).is_err());
-        assert!(parse(args(&["link", "cutover"])).is_err());
+        assert!(parse(args(&["link", "cutover", "--force"])).is_err());
+        assert!(parse(args(&["link", "cutover", "--dry-run", "--execute"])).is_err());
         assert!(parse(args(&["link", "status", "extra"])).is_err());
         assert!(parse(args(&["extension-host", "https://example.com/"])).is_err());
         assert!(parse(args(&["status", "extra"])).is_err());
@@ -485,7 +544,9 @@ mod tests {
         assert!(text.contains("herdr-mcp link run"));
         assert!(text.contains("herdr-mcp link install"));
         assert!(text.contains("herdr-mcp link uninstall"));
+        assert!(text.contains("herdr-mcp link cutover"));
         assert!(text.contains("dev.herdr-mcp.link-rust-candidate"));
+        assert!(text.contains("dry-run plan/validate only"));
         let install = text.find("herdr-mcp install").expect("install");
         let service = text.find("herdr-mcp service").expect("service");
         assert!(

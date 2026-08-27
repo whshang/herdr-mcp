@@ -23,14 +23,38 @@ As of alpha.11 on developer workstations (G3 user CLI sealed to
 | Rust `link::daemon` | Staged; CLI `link run` + candidate install/uninstall live on alpha.11 | No production LaunchAgent cutover |
 | Health | `runtime=rust-candidate`, `production_ready=false` | `/health` + `native_migration`; `link status` `production_ready_eligible=false` |
 
-Read-only / candidate commands:
+Read-only / candidate / cutover-plan commands:
 
 ```bash
 herdr-mcp link status
 herdr-mcp link run         # foreground candidate only; does not cut production
 herdr-mcp link install     # candidate LaunchAgent only (dev.herdr-mcp.link-rust-candidate)
 herdr-mcp link uninstall   # removes candidate LaunchAgent only; never Node link/link-prod
+herdr-mcp link cutover     # default dry-run: plan + validate only (exit 2 if not ready)
+herdr-mcp link cutover --dry-run
+# herdr-mcp link cutover --execute  # gated stub; requires HERDR_LINK_CUTOVER_I_UNDERSTAND=1 and still no-ops
 herdr-mcp doctor           # LAYER link shows production_owner=node|rust|...
+```
+
+### Dry-run cutover helper (landed; not a live cut)
+
+`herdr-mcp link cutover` (default `--dry-run`) is the production cutover **planner**:
+
+- Reads Node `dev.herdr-mcp.link-prod` + candidate `dev.herdr-mcp.link-rust-candidate`.
+- Validates planned ProgramArguments must be `runtime/current/herdr-mcp link run` (never checkout / `target/`).
+- Prints the exact cutover steps and Node-plist rollback steps that **would** run.
+- Sets `ready_for_execute=false` and exits non-zero when preconditions fail (missing managed runtime, unhealthy candidate, Node-era runtime-control generation, missing dual UAT record, etc.).
+- **Never** bootouts/bootstraps launchd, never writes prod plists, never unloads Node `link` / `link-prod`.
+- `--execute` is intentionally not implemented: even with `HERDR_LINK_CUTOVER_I_UNDERSTAND=1` it no-ops and reports `cutover_performed=false`.
+
+**Hard rule:** landing this dry-run helper does **not** equal production cutover, does **not** flip G5 to PASS, and does **not** set `production_ready=true`.
+
+From a worktree (does not write prod plists):
+
+```bash
+cargo run -p herdr-mcp -- link cutover --dry-run
+# or, once installed into a generation that includes this CLI:
+"$HOME/.config/herdr-mcp/runtime/current/herdr-mcp" link cutover --dry-run
 ```
 
 ## Blockers (ordered)
@@ -38,7 +62,7 @@ herdr-mcp doctor           # LAYER link shows production_owner=node|rust|...
 1. **Production LaunchAgent still Node + repo checkout** — both `link` and `link-prod` ProgramArguments point at `/usr/local/bin/node` and `.../herdr-mcp/dist/link/macos-daemon.js`, violating AGENTS.md (no launchd-to-checkout). Candidate soak on alpha.11 does **not** clear this.
 2. **Runtime-control generation still Node-era** — prod control/status commonly keep `desired_active` / `active_generation` like `stable-0.3.32` even while MCP service is Rust alpha.
 3. **Health seal** — `production_ready` and `runtime=rust-candidate` must not flip until ownership + UAT gates pass. Live `link status` still has six gates false (`launchd_prod_program_is_rust_runtime`, `launchd_not_repo_checkout`, `runtime_control_generation_rust_compatible`, `health_runtime_not_candidate`, `node_link_not_required`, `dual_verification_uat`).
-4. **Production cutover helper missing** — no one-command swap that bootouts Node prod, bootstraps Rust prod on `runtime/current`, and can restore Node plist backup.
+4. **Production cutover execute missing** — dry-run / plan / validate helper landed (`herdr-mcp link cutover [--dry-run]`); real execute that bootouts Node prod, bootstraps Rust prod on `runtime/current`, and restores Node plist backup is **not implemented**. Dry-run ≠ cutover.
 5. **User CLI** — G3 sealed on this machine (`~/.local/bin/herdr-mcp` → `runtime/current`); cutover tooling must still use `runtime/current/herdr-mcp`, never a checkout/`target/` binary. Clean-machine seal remains a separate G3/G18 gap.
 6. **Credentials** — Link secret stays in Keychain; MCP token stays in server plist env. `link run` loads both; cutover must preserve both; never commit secrets.
 7. **Dual verification UAT** — Edge → Link → Rust runtime → Herdr smoke after cutover, plus rollback to Node Link if needed, from an **independent** Shell (not a managed `herdr_exec` session). Required before any production cutover; not part of candidate soak.
@@ -95,7 +119,7 @@ Prerequisites still to implement after status + `link run`:
 
 1. ~~`herdr-mcp link install|uninstall` for candidate~~ landed and **soaked on alpha.11** as `dev.herdr-mcp.link-rust-candidate` → `runtime/current/herdr-mcp link run` (never checkout/`target/`; never mutates Node `link`/`link-prod`).
 2. Generation fencing: prod control file generations must address Rust MCP endpoint/version, not `stable-0.3.32`.
-3. One-command cutover helper that: writes new plist beside old, bootouts Node prod, bootstraps Rust prod, verifies health/gates, and can revert to Node plist backup. Still requires human dual verification.
+3. ~~Dry-run cutover planner~~ landed as `herdr-mcp link cutover` (default dry-run). Real execute (write plist, bootout Node prod, bootstrap Rust prod, restore backup) is still a later slice and still requires human dual verification.
 
 ### 2. Candidate soak (safe)
 
@@ -141,8 +165,9 @@ Only when `herdr-mcp link status` shows all gates except `dual_verification_uat`
 - [x] `herdr-mcp link run` (foreground) with Keychain/plist credential load
 - [x] Candidate `herdr-mcp link install|uninstall` for `dev.herdr-mcp.link-rust-candidate` → `runtime/current` only (does not touch Node jobs)
 - [x] Install into managed alpha.11 generation and start candidate LaunchAgent soak (developer workstation)
+- [x] `herdr-mcp link cutover` dry-run / plan / validate (default dry-run; `--execute` stub no-ops). **Dry-run landed ≠ cutover.**
 - [ ] Longer candidate Edge soak (reconnect / tool_result / cancel / generation activate)
-- [ ] Production LaunchAgent cutover helper for `link-prod` on `runtime/current`
+- [ ] Production LaunchAgent cutover **execute** for `link-prod` on `runtime/current` (still missing)
 - [ ] Rust-compatible runtime-control generation cutover for prod control files
 - [ ] Health seal commit (`production_ready` / runtime label) after UAT
 - [ ] Independent dual-verification UAT record (mandatory before live cut)
