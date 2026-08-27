@@ -77,26 +77,76 @@ pub enum UpdateCommand {
     Worker { job_id: String },
 }
 
-pub fn parse<I>(args: I) -> Result<Command, String>
+#[derive(Debug, PartialEq, Eq)]
+pub struct Parsed {
+    /// Optional `--instance NAME` / `-i NAME` (sugar for `HERDR_MCP_INSTANCE`).
+    pub instance: Option<String>,
+    pub command: Command,
+}
+
+pub fn parse<I>(args: I) -> Result<Parsed, String>
 where
     I: IntoIterator<Item = String>,
 {
     let args = args.into_iter().collect::<Vec<_>>();
+    let (instance, args) = strip_instance_flag(&args)?;
+    let command = parse_command(&args)?;
+    Ok(Parsed { instance, command })
+}
+
+fn strip_instance_flag(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut instance = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--instance" | "-i" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--instance requires a name".to_owned())?;
+                crate::instance::InstanceId::parse(value)?;
+                if instance.is_some() {
+                    return Err("duplicate --instance flag".to_owned());
+                }
+                instance = Some(value.clone());
+                index += 2;
+            }
+            value if value.starts_with("--instance=") => {
+                let value = value
+                    .strip_prefix("--instance=")
+                    .ok_or_else(|| "invalid --instance value".to_owned())?;
+                crate::instance::InstanceId::parse(value)?;
+                if instance.is_some() {
+                    return Err("duplicate --instance flag".to_owned());
+                }
+                instance = Some(value.to_owned());
+                index += 1;
+            }
+            _ => {
+                rest.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    Ok((instance, rest))
+}
+
+fn parse_command(args: &[String]) -> Result<Command, String> {
     let Some(command) = args.first().map(String::as_str) else {
         return Ok(Command::Help);
     };
 
     match command {
-        "help" | "-h" | "--help" => no_extra(&args, Command::Help),
-        "version" | "-V" | "--version" => no_extra(&args, Command::Version),
+        "help" | "-h" | "--help" => no_extra(args, Command::Help),
+        "version" | "-V" | "--version" => no_extra(args, Command::Version),
         "install" => no_extra(
-            &args,
+            args,
             Command::Service(ServiceCommand::Install { adopt_node: false }),
         ),
-        "status" => no_extra(&args, Command::Status),
-        "doctor" => no_extra(&args, Command::Doctor),
-        "rollback" => no_extra(&args, Command::Service(ServiceCommand::Rollback)),
-        "uninstall" => no_extra(&args, Command::Service(ServiceCommand::Uninstall)),
+        "status" => no_extra(args, Command::Status),
+        "doctor" => no_extra(args, Command::Doctor),
+        "rollback" => no_extra(args, Command::Service(ServiceCommand::Rollback)),
+        "uninstall" => no_extra(args, Command::Service(ServiceCommand::Uninstall)),
         "config" => parse_config(&args[1..]),
         "dev" => parse_dev(&args[1..]),
         "candidate" => parse_candidate(&args[1..]),
@@ -426,6 +476,11 @@ User path:\n\
   herdr-mcp update <check [--manifest URL]|apply [--manifest URL]|status>\n\
   herdr-mcp rollback\n\
   herdr-mcp uninstall\n\n\
+Same-machine UAT isolation (optional):\n\
+  herdr-mcp --instance uat install\n\
+  HERDR_MCP_INSTANCE=uat herdr-mcp doctor\n\
+  Named instances use distinct LaunchAgent labels, a non-8772 port, and\n\
+  ~/.config/herdr-mcp-<name>. They never rewrite ~/.local/bin/herdr-mcp.\n\n\
 Advanced / internal:\n\
   herdr-mcp version\n\
   herdr-mcp config [path|show|init]\n\
@@ -470,44 +525,44 @@ mod tests {
 
     #[test]
     fn parses_core_commands() {
-        assert_eq!(parse(args(&[])).unwrap(), Command::Help);
-        assert_eq!(parse(args(&["version"])).unwrap(), Command::Version);
+        assert_eq!(parse(args(&[])).unwrap().command, Command::Help);
+        assert_eq!(parse(args(&["version"])).unwrap().command, Command::Version);
         assert_eq!(
-            parse(args(&["install"])).unwrap(),
+            parse(args(&["install"])).unwrap().command,
             Command::Service(ServiceCommand::Install { adopt_node: false })
         );
-        assert_eq!(parse(args(&["status"])).unwrap(), Command::Status);
-        assert_eq!(parse(args(&["doctor"])).unwrap(), Command::Doctor);
+        assert_eq!(parse(args(&["status"])).unwrap().command, Command::Status);
+        assert_eq!(parse(args(&["doctor"])).unwrap().command, Command::Doctor);
         assert_eq!(
-            parse(args(&["rollback"])).unwrap(),
+            parse(args(&["rollback"])).unwrap().command,
             Command::Service(ServiceCommand::Rollback)
         );
         assert_eq!(
-            parse(args(&["uninstall"])).unwrap(),
+            parse(args(&["uninstall"])).unwrap().command,
             Command::Service(ServiceCommand::Uninstall)
         );
         assert_eq!(
-            parse(args(&["config", "show"])).unwrap(),
+            parse(args(&["config", "show"])).unwrap().command,
             Command::Config(ConfigCommand::Show)
         );
         assert_eq!(
-            parse(args(&["dev", "--dry-run"])).unwrap(),
+            parse(args(&["dev", "--dry-run"])).unwrap().command,
             Command::Dev { dry_run: true }
         );
         assert_eq!(
-            parse(args(&["candidate", "--port", "9000"])).unwrap(),
+            parse(args(&["candidate", "--port", "9000"])).unwrap().command,
             Command::Candidate { port: 9000 }
         );
         assert_eq!(
-            parse(args(&["service", "install", "--adopt-node"])).unwrap(),
+            parse(args(&["service", "install", "--adopt-node"])).unwrap().command,
             Command::Service(ServiceCommand::Install { adopt_node: true })
         );
         assert_eq!(
-            parse(args(&["service", "status"])).unwrap(),
+            parse(args(&["service", "status"])).unwrap().command,
             Command::Service(ServiceCommand::Status)
         );
         assert_eq!(
-            parse(args(&["service", "rollback"])).unwrap(),
+            parse(args(&["service", "rollback"])).unwrap().command,
             Command::Service(ServiceCommand::Rollback)
         );
         assert_eq!(
@@ -519,7 +574,7 @@ mod tests {
                 "--parent-pid",
                 "1234"
             ]))
-            .unwrap(),
+            .unwrap().command,
             Command::Service(ServiceCommand::Guardian {
                 transaction_id: "gtx-1234-abcd".to_owned(),
                 parent_pid: 1234,
@@ -532,53 +587,53 @@ mod tests {
                 "--manifest",
                 "https://example.com/release.json"
             ]))
-            .unwrap(),
+            .unwrap().command,
             Command::Update(UpdateCommand::Check {
                 manifest_url: Some("https://example.com/release.json".to_owned())
             })
         );
         assert_eq!(
-            parse(args(&["update", "worker", "--job", "upd-12345678"])).unwrap(),
+            parse(args(&["update", "worker", "--job", "upd-12345678"])).unwrap().command,
             Command::Update(UpdateCommand::Worker {
                 job_id: "upd-12345678".to_owned()
             })
         );
         assert_eq!(
-            parse(args(&["link", "status"])).unwrap(),
+            parse(args(&["link", "status"])).unwrap().command,
             Command::Link(LinkCommand::Status)
         );
         assert_eq!(
-            parse(args(&["link", "run"])).unwrap(),
+            parse(args(&["link", "run"])).unwrap().command,
             Command::Link(LinkCommand::Run)
         );
         assert_eq!(
-            parse(args(&["link", "install"])).unwrap(),
+            parse(args(&["link", "install"])).unwrap().command,
             Command::Link(LinkCommand::Install)
         );
         assert_eq!(
-            parse(args(&["link", "uninstall"])).unwrap(),
+            parse(args(&["link", "uninstall"])).unwrap().command,
             Command::Link(LinkCommand::Uninstall)
         );
         assert_eq!(
-            parse(args(&["link", "cutover"])).unwrap(),
+            parse(args(&["link", "cutover"])).unwrap().command,
             Command::Link(LinkCommand::Cutover {
                 mode: crate::link::CutoverMode::DryRun
             })
         );
         assert_eq!(
-            parse(args(&["link", "cutover", "--dry-run"])).unwrap(),
+            parse(args(&["link", "cutover", "--dry-run"])).unwrap().command,
             Command::Link(LinkCommand::Cutover {
                 mode: crate::link::CutoverMode::DryRun
             })
         );
         assert_eq!(
-            parse(args(&["link", "cutover", "--execute"])).unwrap(),
+            parse(args(&["link", "cutover", "--execute"])).unwrap().command,
             Command::Link(LinkCommand::Cutover {
                 mode: crate::link::CutoverMode::Execute
             })
         );
         assert_eq!(
-            parse(args(&["link", "migrate-runtime-control"])).unwrap(),
+            parse(args(&["link", "migrate-runtime-control"])).unwrap().command,
             Command::Link(LinkCommand::MigrateRuntimeControl {
                 mode: crate::link::MigrateMode::DryRun
             })
@@ -589,31 +644,31 @@ mod tests {
                 "migrate-runtime-control",
                 "--write-staging"
             ]))
-            .unwrap(),
+            .unwrap().command,
             Command::Link(LinkCommand::MigrateRuntimeControl {
                 mode: crate::link::MigrateMode::WriteStaging
             })
         );
         assert_eq!(
-            parse(args(&["link", "migrate-runtime-control", "--apply"])).unwrap(),
+            parse(args(&["link", "migrate-runtime-control", "--apply"])).unwrap().command,
             Command::Link(LinkCommand::MigrateRuntimeControl {
                 mode: crate::link::MigrateMode::Apply
             })
         );
         assert_eq!(
-            parse(args(&["native-host", "status"])).unwrap(),
+            parse(args(&["native-host", "status"])).unwrap().command,
             Command::NativeHost(NativeHostCommand::Status)
         );
         assert_eq!(
-            parse(args(&["native-host", "uninstall"])).unwrap(),
+            parse(args(&["native-host", "uninstall"])).unwrap().command,
             Command::NativeHost(NativeHostCommand::Uninstall)
         );
         assert_eq!(
-            parse(args(&["native-host", "rollback"])).unwrap(),
+            parse(args(&["native-host", "rollback"])).unwrap().command,
             Command::NativeHost(NativeHostCommand::Rollback)
         );
         assert_eq!(
-            parse(args(&["extension-host"])).unwrap(),
+            parse(args(&["extension-host"])).unwrap().command,
             Command::ExtensionHost {
                 caller_origin: String::new()
             }
@@ -623,7 +678,7 @@ mod tests {
                 "extension-host",
                 "chrome-extension://abcdefghijklmnop/"
             ]))
-            .unwrap(),
+            .unwrap().command,
             Command::ExtensionHost {
                 caller_origin: "chrome-extension://abcdefghijklmnop/".to_owned()
             }
@@ -659,6 +714,18 @@ mod tests {
         assert!(parse(args(&["extension-host", "https://example.com/"])).is_err());
         assert!(parse(args(&["status", "extra"])).is_err());
         assert!(parse(args(&["unknown"])).is_err());
+    }
+
+    #[test]
+    fn parses_instance_flag_before_command() {
+        let parsed = parse(args(&["--instance", "uat", "status"])).unwrap();
+        assert_eq!(parsed.instance.as_deref(), Some("uat"));
+        assert_eq!(parsed.command, Command::Status);
+        let parsed = parse(args(&["-i", "clean", "doctor"])).unwrap();
+        assert_eq!(parsed.instance.as_deref(), Some("clean"));
+        assert_eq!(parsed.command, Command::Doctor);
+        assert!(parse(args(&["--instance", "server", "status"])).is_err());
+        assert!(parse(args(&["--instance", "uat", "--instance", "clean", "status"])).is_err());
     }
 
     #[test]

@@ -694,6 +694,11 @@ fn spawn_worker(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(name) = paths.instance.name() {
+        command.env("HERDR_MCP_INSTANCE", name);
+    } else {
+        command.env_remove("HERDR_MCP_INSTANCE");
+    }
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -1178,6 +1183,7 @@ mod tests {
             now_ms_i64()
         ));
         let paths = RuntimePaths {
+            instance: crate::instance::InstanceId::default_instance(),
             config_dir: root.clone(),
             config_file: root.join("config.toml"),
             dev_state_dir: root.join("dev"),

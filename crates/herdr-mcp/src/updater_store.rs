@@ -340,6 +340,7 @@ mod tests {
         ));
         let config_dir = root.join("config");
         let paths = RuntimePaths {
+            instance: crate::instance::InstanceId::default_instance(),
             config_file: config_dir.join("config.toml"),
             dev_state_dir: root.join("dev"),
             herdr_socket: Some(root.join("herdr.sock")),
