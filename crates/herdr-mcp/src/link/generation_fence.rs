@@ -20,6 +20,17 @@ pub enum GenerationPhase {
     Rejected,
 }
 
+impl GenerationPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Standby => "standby",
+            Self::Draining => "draining",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationStatus {
     pub generation: String,
@@ -353,6 +364,52 @@ impl GenerationFence {
                 in_flight: record.in_flight,
             })
             .collect()
+    }
+
+    pub fn phase_of(&self, generation: &str) -> Option<GenerationPhase> {
+        self.generations.get(generation).map(|record| record.phase)
+    }
+
+    pub fn in_flight_count(&self, generation: &str) -> usize {
+        self.generations
+            .get(generation)
+            .map(|record| record.in_flight)
+            .unwrap_or(0)
+    }
+
+    /// Insert `generation` as standby when absent; leave an existing phase alone.
+    pub fn ensure_generation(&mut self, generation: impl Into<String>) {
+        let generation = generation.into();
+        self.generations
+            .entry(generation)
+            .or_insert(GenerationRecord {
+                phase: GenerationPhase::Standby,
+                in_flight: 0,
+            });
+    }
+
+    /// Reject an idle generation. Active and draining owners keep their phase so
+    /// in-flight work is not relabelled by a failed candidate probe.
+    pub fn mark_rejected_if_idle(&mut self, generation: &str) -> Result<(), FenceError> {
+        let record = self
+            .generations
+            .get_mut(generation)
+            .ok_or_else(|| FenceError::UnknownGeneration(generation.to_owned()))?;
+        if record.phase != GenerationPhase::Active && record.phase != GenerationPhase::Draining {
+            record.phase = GenerationPhase::Rejected;
+        }
+        Ok(())
+    }
+
+    pub fn restore_standby_if_rejected(&mut self, generation: &str) -> Result<(), FenceError> {
+        let record = self
+            .generations
+            .get_mut(generation)
+            .ok_or_else(|| FenceError::UnknownGeneration(generation.to_owned()))?;
+        if record.phase == GenerationPhase::Rejected {
+            record.phase = GenerationPhase::Standby;
+        }
+        Ok(())
     }
 }
 
