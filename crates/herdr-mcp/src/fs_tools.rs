@@ -3,7 +3,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value, json};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -226,6 +228,10 @@ pub fn list(snapshot: &Value, args: &Value) -> Value {
 }
 
 pub fn grep(snapshot: &Value, args: &Value) -> Value {
+    grep_with_backend(snapshot, args, discover_rg())
+}
+
+fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Value {
     let root = match required_str(args, "root") {
         Ok(value) => value,
         Err(error) => return error,
@@ -281,6 +287,21 @@ pub fn grep(snapshot: &Value, args: &Value) -> Value {
         LineMatcher::Literal(pattern.to_owned())
     };
 
+    if let Some(rg_path) = rg.as_deref()
+        && let Some((matches, truncated)) = try_grep_rg(&GrepRgOptions {
+            rg: rg_path,
+            search_root: &managed.real,
+            pattern,
+            regex_mode,
+            case_insensitive,
+            glob,
+            max_matches,
+            max_bytes,
+        })
+    {
+        return finish_grep_result(&managed.resolved, matches, truncated, "rg");
+    }
+
     let mut matches = Vec::new();
     let mut truncated = false;
     let search_root = glob
@@ -294,6 +315,15 @@ pub fn grep(snapshot: &Value, args: &Value) -> Value {
         max_bytes,
     };
     walk_grep(&search_root, &walk, &mut matches, &mut truncated);
+    finish_grep_result(&managed.resolved, matches, truncated, "rust")
+}
+
+fn finish_grep_result(
+    resolved_root: &Path,
+    matches: Vec<Value>,
+    truncated: bool,
+    engine: &str,
+) -> Value {
     let compact = if truncated {
         None
     } else {
@@ -301,10 +331,10 @@ pub fn grep(snapshot: &Value, args: &Value) -> Value {
     };
     let mut output = Map::new();
     output.insert("ok".to_owned(), json!(true));
-    output.insert("root".to_owned(), json!(managed.resolved.to_string_lossy()));
+    output.insert("root".to_owned(), json!(resolved_root.to_string_lossy()));
     output.insert("count".to_owned(), json!(matches.len()));
     output.insert("truncated".to_owned(), json!(truncated));
-    output.insert("engine".to_owned(), json!("rust"));
+    output.insert("engine".to_owned(), json!(engine));
     match compact {
         Some(compact) if compact.match_count > GREP_COMPACT_AFTER => {
             output.insert("matches".to_owned(), json!(compact.grouped));
@@ -361,6 +391,140 @@ fn compact_grep_matches(matches: &[Value]) -> Option<GrepCompact> {
         grouped,
         match_count: matches.len(),
     })
+}
+
+fn discover_rg() -> Option<PathBuf> {
+    let path = crate::exec_sessions::enriched_exec_path();
+    for directory in std::env::split_paths(std::ffi::OsStr::new(&path)) {
+        let candidate = directory.join(if cfg!(windows) { "rg.exe" } else { "rg" });
+        if rg_is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn rg_is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn rg_is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+struct GrepRgOptions<'a> {
+    rg: &'a Path,
+    search_root: &'a Path,
+    pattern: &'a str,
+    regex_mode: bool,
+    case_insensitive: bool,
+    glob: Option<&'a str>,
+    max_matches: usize,
+    max_bytes: u64,
+}
+
+fn try_grep_rg(options: &GrepRgOptions<'_>) -> Option<(Vec<Value>, bool)> {
+    let mut args = vec![
+        "--line-number".to_owned(),
+        "--no-heading".to_owned(),
+        "--color".to_owned(),
+        "never".to_owned(),
+    ];
+    if !options.regex_mode {
+        args.push("-F".to_owned());
+    }
+    if options.case_insensitive {
+        args.push("-i".to_owned());
+    }
+    if let Some(glob) = options.glob {
+        args.push("-g".to_owned());
+        args.push(glob.to_owned());
+    }
+    args.push("--max-count".to_owned());
+    args.push(options.max_matches.to_string());
+    args.push(options.pattern.to_owned());
+    args.push(".".to_owned());
+
+    let mut child = Command::new(options.rg)
+        .args(&args)
+        .current_dir(options.search_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    let mut total_bytes = 0u64;
+    let stdout_ceiling = options.max_bytes.saturating_mul(8);
+    {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            total_bytes = total_bytes
+                .saturating_add(line.len() as u64)
+                .saturating_add(1);
+            if total_bytes > stdout_ceiling {
+                truncated = true;
+                let _ = child.kill();
+                break;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            if matches.len() >= options.max_matches {
+                truncated = true;
+                let _ = child.kill();
+                break;
+            }
+            let Some((file, line_no, content)) = parse_rg_line(&line) else {
+                continue;
+            };
+            if content.len() as u64 > options.max_bytes {
+                truncated = true;
+                continue;
+            }
+            let file_path = PathBuf::from(&file);
+            let abs = if file_path.is_absolute() {
+                file_path
+            } else {
+                options.search_root.join(file_path)
+            };
+            if !fs_security::path_within(options.search_root, &abs)
+                || fs_security::denied_secret_path(&abs)
+            {
+                continue;
+            }
+            if fs::metadata(&abs).is_ok_and(|metadata| metadata.len() > options.max_bytes) {
+                truncated = true;
+                continue;
+            }
+            matches.push(json!({
+                "file": abs.to_string_lossy(),
+                "line": line_no,
+                "content": content,
+            }));
+        }
+    }
+    let status = child.wait().ok()?;
+    if truncated || status.code() == Some(0) || status.code() == Some(1) {
+        Some((matches, truncated))
+    } else {
+        None
+    }
+}
+
+fn parse_rg_line(line: &str) -> Option<(String, usize, String)> {
+    let (file, rest) = line.split_once(':')?;
+    let (line_no, content) = rest.split_once(':')?;
+    Some((file.to_owned(), line_no.parse().ok()?, content.to_owned()))
 }
 
 fn walk_list(
@@ -762,6 +926,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_rg_line_splits_file_line_content() {
+        let (file, line, content) = parse_rg_line("/repo/src/lib.rs:3:alpha two").unwrap();
+        assert_eq!(file, "/repo/src/lib.rs");
+        assert_eq!(line, 3);
+        assert_eq!(content, "alpha two");
+        assert!(parse_rg_line("not a match").is_none());
+    }
+
+    #[test]
     fn grep_glob_matches_root_relative_paths_and_prunes_literal_prefix() {
         let matcher = grep_glob_matcher("extension/**/*.js").unwrap();
         let base = Path::new("/repo");
@@ -844,7 +1017,12 @@ mod tests {
         );
         assert_eq!(grep_result["ok"], true);
         assert_eq!(grep_result["count"], 2);
-        assert_eq!(grep_result["engine"], "rust");
+        let engine = grep_result["engine"].as_str().unwrap();
+        if discover_rg().is_some() {
+            assert_eq!(engine, "rg");
+        } else {
+            assert_eq!(engine, "rust");
+        }
         assert_eq!(grep_result["counts"]["files"], 1);
         assert_eq!(grep_result["counts"]["matches"], 2);
         assert!(grep_result.get("compacted").is_none());
@@ -856,9 +1034,23 @@ mod tests {
                 .contains("lib.rs")
         );
 
+        let rust_only = grep_with_backend(
+            &snapshot,
+            &json!({"root": root, "pattern": "alpha", "glob": "*.rs"}),
+            None,
+        );
+        assert_eq!(rust_only["ok"], true);
+        assert_eq!(rust_only["engine"], "rust");
+        assert_eq!(rust_only["count"], 2);
+        assert_eq!(rust_only["counts"]["files"], 1);
+        assert_eq!(rust_only["counts"]["matches"], 2);
+        assert!(rust_only.get("compacted").is_none());
+
         let secret_grep = grep(&snapshot, &json!({"root": root, "pattern": "DO_NOT_READ"}));
         assert_eq!(secret_grep["ok"], true);
         assert_eq!(secret_grep["count"], 0);
+        let secret_engine = secret_grep["engine"].as_str().unwrap();
+        assert!(secret_engine == "rg" || secret_engine == "rust");
         assert_eq!(secret_grep["counts"]["files"], 0);
         assert_eq!(secret_grep["counts"]["matches"], 0);
         assert!(secret_grep.get("compacted").is_none());
@@ -882,6 +1074,8 @@ mod tests {
         );
         assert_eq!(path_glob_result["ok"], true);
         assert_eq!(path_glob_result["count"], 1);
+        let path_engine = path_glob_result["engine"].as_str().unwrap();
+        assert!(path_engine == "rg" || path_engine == "rust");
         assert!(
             path_glob_result["matches"][0]["file"]
                 .as_str()
@@ -995,7 +1189,8 @@ mod tests {
         assert_eq!(result["counts"]["files"], 4);
         assert_eq!(result["counts"]["matches"], 31);
         assert_eq!(result["count"], 31);
-        assert_eq!(result["engine"], "rust");
+        let engine = result["engine"].as_str().unwrap();
+        assert!(engine == "rg" || engine == "rust");
         let listing = result["matches"].as_str().unwrap();
         assert!(listing.contains("lib.rs (15)"));
         assert!(listing.contains("util.rs (10)"));
