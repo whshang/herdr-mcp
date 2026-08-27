@@ -4,6 +4,7 @@ use crate::herdr::HerdrClient;
 use crate::inspect;
 use crate::runtime_meta;
 use crate::schema::{self, MethodSchema, ValidationIssue};
+use crate::skill::SkillService;
 use crate::state_cache::{DigestSnapshot, EventCache};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -95,6 +96,26 @@ pub fn call(client: &HerdrClient, method: &str, params: Value) -> Value {
             "method": method,
         }),
     }
+}
+
+pub fn call_with_local(
+    client: &HerdrClient,
+    skill: &SkillService,
+    snapshot: &Value,
+    method: &str,
+    params: Value,
+) -> Value {
+    if method.starts_with("herdr_mcp.") {
+        return skill.local_call(method, &params, snapshot).unwrap_or_else(|| {
+            json!({
+                "ok": false,
+                "code": "unknown_local_method",
+                "method": method,
+                "message": "unknown herdr-mcp local method; request was not forwarded to the Herdr socket",
+            })
+        });
+    }
+    call(client, method, params)
 }
 
 fn method_json(method: &MethodSchema) -> Value {
@@ -211,6 +232,27 @@ mod tests {
         let result = call(&client, "ping", json!([1, 2, 3]));
         assert_eq!(result["ok"], false);
         assert_eq!(result["code"], "invalid_params");
+    }
+
+    #[test]
+    fn unknown_local_method_never_reaches_herdr_socket() {
+        let client = HerdrClient::new("/path/that/does/not/exist");
+        let skill = SkillService::new();
+        let result = call_with_local(
+            &client,
+            &skill,
+            &json!({}),
+            "herdr_mcp.skill.unknown",
+            json!({}),
+        );
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["code"], "unknown_local_method");
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("not forwarded")
+        );
     }
 
     #[test]

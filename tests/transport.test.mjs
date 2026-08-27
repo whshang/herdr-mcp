@@ -205,6 +205,21 @@ test("stateless: initialize then calls WITHOUT session id (ChatGPT pattern)", as
   }
 });
 
+test("Node compatibility: herdr_mcp.* local namespace fails closed instead of reaching Herdr", async () => {
+  const result = await tool(
+    "herdr_call",
+    {
+      method: "herdr_mcp.skill.load",
+      params: JSON.stringify({ ids: ["files-search"] }),
+    },
+    { noSession: true },
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "local_method_unavailable");
+  assert.equal(result.method, "herdr_mcp.skill.load");
+  assert.match(result.message, /never forwarded to the Herdr socket/);
+});
+
 test("stateful: initialize -> session id honored on consecutive calls", async () => {
   const savedSid = sessionId;
   sessionId = null;

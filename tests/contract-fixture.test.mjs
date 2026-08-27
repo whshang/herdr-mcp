@@ -22,6 +22,7 @@ test("epoch2 JSON fixture is the language-independent public contract source", a
   assert.equal(fixture.tool_count, 18);
   assert.equal(fixture.tools.length, 18);
   assert.equal(new Set(fixture.tools.map((tool) => tool.name)).size, 18);
+  assert.equal(fixture.tools.some((tool) => tool.name.startsWith("herdr_mcp.")), false);
 });
 
 test("runtime parity fixture pins the shared Node/Rust wire invariants", async () => {
