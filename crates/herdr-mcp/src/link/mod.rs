@@ -19,6 +19,7 @@ pub mod backoff;
 pub mod cutover;
 pub mod cutover_execute;
 pub mod daemon;
+pub mod edge_contract;
 pub mod generation_fence;
 pub mod heartbeat;
 pub mod install;
@@ -33,6 +34,7 @@ pub mod run;
 pub mod runner;
 pub mod runtime_control;
 pub mod runtime_generation;
+pub mod seal;
 pub mod socket_driver;
 pub mod transport;
 
@@ -45,3 +47,4 @@ pub use ownership::{
     doctor_layer_summary, production_ready_gate_catalog, run_status as run_link_status,
 };
 pub use run::{LINK_RUN_WIRED, run as run_link};
+pub use seal::{SealMode, run as run_link_seal};

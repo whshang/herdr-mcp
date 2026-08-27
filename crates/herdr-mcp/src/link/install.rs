@@ -28,7 +28,7 @@ use super::run::{MACOS_DEFAULT_EDGE_URL, MACOS_LINK_KEYCHAIN_SERVICE};
 pub const LINK_RUST_CANDIDATE_LABEL: &str = "dev.herdr-mcp.link-rust-candidate";
 
 /// Default canary workstation id for the Rust candidate (avoids colliding with
-/// live Node `dev-real-runtime` on the same Edge).
+/// live Node `dev-real-runtime` and prod `prod-real-runtime`).
 pub const CANDIDATE_WORKSTATION_ID: &str = "dev-rust-link-candidate";
 
 #[cfg(target_os = "macos")]
@@ -375,6 +375,12 @@ fn install_candidate(home: &Path) -> Result<Value, String> {
     assert_not_protected_mutation(LINK_RUST_CANDIDATE_LABEL)?;
     let program = candidate_program_arguments(home)?;
     let env = default_candidate_env();
+    let edge_url = env
+        .get("HERDR_EDGE_URL")
+        .cloned()
+        .unwrap_or_else(|| MACOS_DEFAULT_EDGE_URL.to_owned());
+    let edge_contract = super::edge_contract::probe_edge_contract_for_rust_link(&edge_url)
+        .map_err(|error| format!("link install refused: {error}"))?;
     let bytes = encode_candidate_plist(home, &program, &env)?;
     let paths = candidate_paths(home);
     fs::create_dir_all(&paths.config_dir)
@@ -392,11 +398,16 @@ fn install_candidate(home: &Path) -> Result<Value, String> {
         "label": LINK_RUST_CANDIDATE_LABEL,
         "plist": paths.plist.display().to_string(),
         "program_arguments": program,
+        "edge_url": edge_url,
+        "edge_contract_epoch": edge_contract.contract_epoch,
+        "edge_contract_hash": edge_contract.contract_hash,
+        "edge_service": edge_contract.service,
         "protected_labels_untouched": protected_live_link_labels(),
         "cutover_performed": false,
         "notes": [
             "Candidate LaunchAgent only. Does not unload or replace live Node link/link-prod.",
             "Credentials still load via link run (Keychain + server plist); not embedded here.",
+            "Edge /health must publish public contract epoch 2 before install bootstraps.",
         ],
     }))
 }
@@ -734,6 +745,9 @@ mod tests {
         assert!(!xml.contains("dist/link"));
         assert!(!xml.contains("/target/"));
         assert!(xml.contains(CANDIDATE_WORKSTATION_ID));
+        assert!(xml.contains("herdr-edge-prod"));
+        assert!(xml.contains("herdr-edge-prod-link-secret"));
+        assert!(!xml.contains("herdr-edge-dev.whshang"));
         let _ = fs::remove_dir_all(&home);
     }
 

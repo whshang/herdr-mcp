@@ -314,9 +314,10 @@ pub fn evaluate_production_ready_gates(
     let user_cli = home.join(".local").join("bin").join("herdr-mcp");
     let user_cli_ok = user_cli_points_at_managed_runtime(&user_cli, home);
 
-    let node_not_required = prod_is_rust
-        && link.implementation != LinkImplementation::Node
-        && !program_points_at_repo_checkout(&prod.program_arguments);
+    let node_not_required =
+        prod_is_rust && !program_points_at_repo_checkout(&prod.program_arguments);
+    let sealed = crate::link::seal::production_ready_from_seal(config_dir);
+    let dual_uat = crate::link::seal::dual_uat_evidence_present(config_dir);
 
     vec![
         GateStatus {
@@ -361,9 +362,13 @@ pub fn evaluate_production_ready_gates(
         },
         GateStatus {
             id: "health_runtime_not_candidate".to_owned(),
-            ok: false,
-            detail: "health still reports runtime=rust-candidate / production_ready=false until cutover seal"
-                .to_owned(),
+            ok: sealed,
+            detail: if sealed {
+                "active link-production-ready seal present".to_owned()
+            } else {
+                "health keeps runtime=rust-candidate / production_ready=false until link seal --execute"
+                    .to_owned()
+            },
         },
         GateStatus {
             id: "user_cli_not_repo_bash_bridge".to_owned(),
@@ -374,7 +379,7 @@ pub fn evaluate_production_ready_gates(
             id: "node_link_not_required".to_owned(),
             ok: node_not_required,
             detail: format!(
-                "prod={} canary/dev={} checkout_refused={}",
+                "prod={} canary/dev={} checkout_refused={} (canary Node soak is allowed)",
                 prod.implementation.as_str(),
                 link.implementation.as_str(),
                 checkout_refused
@@ -382,9 +387,13 @@ pub fn evaluate_production_ready_gates(
         },
         GateStatus {
             id: "dual_verification_uat".to_owned(),
-            ok: false,
-            detail: "requires independent Shell dual verification after cutover tooling; never auto-flipped"
-                .to_owned(),
+            ok: dual_uat,
+            detail: if dual_uat {
+                "dual-uat evidence recorded under seals/evidence/dual-uat.json".to_owned()
+            } else {
+                "requires herdr-mcp link seal record --dual-uat after independent Shell dual verification"
+                    .to_owned()
+            },
         },
     ]
 }
@@ -562,13 +571,22 @@ pub fn doctor_layer_summary(home: &Path, config_dir: &Path) -> String {
     )
 }
 
-/// Static gate catalog embedded in health/migration metadata (never auto-true).
+/// Static gate catalog embedded in health/migration metadata.
+///
+/// `production_ready` follows the auditable seal file when present; LaunchAgent
+/// ownership alone never flips it.
 pub fn production_ready_gate_catalog() -> Value {
+    let sealed = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| {
+            crate::link::seal::production_ready_from_seal(&home.join(".config").join("herdr-mcp"))
+        })
+        .unwrap_or(false);
     json!({
-        "production_ready": false,
+        "production_ready": sealed,
         "requires_all": PRODUCTION_READY_GATE_IDS,
         "cutover_doc": "docs/_wip/g5-link-production-cutover.md",
-        "note": "Gates are evaluated by herdr-mcp link status; health keeps production_ready=false until seal + dual verification",
+        "note": "Gates are evaluated by herdr-mcp link status; production_ready follows link seal --execute (cleared by cutover --rollback)",
     })
 }
 

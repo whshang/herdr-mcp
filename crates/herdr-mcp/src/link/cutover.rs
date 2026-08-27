@@ -40,6 +40,8 @@ pub const CUTOVER_EXECUTE_ENV: &str = "HERDR_LINK_CUTOVER_I_UNDERSTAND";
 pub enum CutoverMode {
     DryRun,
     Execute,
+    /// Deliberate restore of Node link-prod from the preserved backup.
+    Rollback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +74,84 @@ pub fn run(mode: CutoverMode) -> Result<ExitCode, String> {
             }
         }
         CutoverMode::Execute => run_execute(&home, &config_dir),
+        CutoverMode::Rollback => run_rollback(&home, &config_dir),
+    }
+}
+
+fn run_rollback(home: &Path, config_dir: &Path) -> Result<ExitCode, String> {
+    let understood = env::var_os(CUTOVER_EXECUTE_ENV)
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    if !understood {
+        let report = json!({
+            "ok": false,
+            "mode": "rollback",
+            "error": format!(
+                "link cutover --rollback is refused without {CUTOVER_EXECUTE_ENV}=1"
+            ),
+            "notes": [
+                "No launchd/plist mutation occurred.",
+                "Independent Shell only: HERDR_LINK_CUTOVER_I_UNDERSTAND=1 herdr-mcp link cutover --rollback",
+            ],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+        );
+        return Ok(ExitCode::from(2));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (home, config_dir);
+        return Err("link cutover --rollback is macOS-only".to_owned());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use super::cutover_execute::{RealLaunchd, rollback_cutover};
+        let prod_plist = home
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{LINK_PROD_LABEL}.plist"));
+        let backup_path = prod_plist_backup_path(home);
+        // Prefer the authoritative pre-rust-cutover backup; fall back to the
+        // timestamped Node backup if the primary is missing.
+        let backup = if backup_path.is_file() {
+            backup_path.clone()
+        } else {
+            let alt = config_dir
+                .join("backups")
+                .join("link-prod.plist.node-pre-cutover-20260827T230026");
+            if alt.is_file() {
+                alt
+            } else {
+                backup_path.clone()
+            }
+        };
+        let rollback = rollback_cutover(&RealLaunchd, &prod_plist, &backup);
+        let seal_clear = super::seal::clear_active_seal(config_dir)?;
+        let report = json!({
+            "ok": rollback.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            "mode": "rollback",
+            "backup_plist": backup.display().to_string(),
+            "rollback": rollback,
+            "seal_cleared": seal_clear,
+            "production_ready": false,
+            "protected_labels_untouched": [LINK_LABEL, LINK_RUST_CANDIDATE_LABEL],
+            "notes": [
+                "Restored Node link-prod from backup via bootout/bootstrap (never launchctl submit).",
+                "Active production_ready seal cleared if present.",
+                "Re-cut to Rust with HERDR_LINK_CUTOVER_I_UNDERSTAND=1 link cutover --execute after Node verify.",
+            ],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+        );
+        if report.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            Ok(ExitCode::SUCCESS)
+        } else {
+            Ok(ExitCode::from(2))
+        }
     }
 }
 

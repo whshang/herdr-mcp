@@ -22,6 +22,7 @@ use crate::relay::wire::{
     RelayWireError, build_compact_oversized_error, decode_relay_frame, encode_relay_message,
 };
 use serde_json::Value;
+use std::io::{self, Write};
 
 pub const LINK_DEFAULT_HEARTBEAT_MS: i64 = 30_000;
 pub const LINK_DEFAULT_HANDSHAKE_TIMEOUT_MS: i64 = 10_000;
@@ -304,7 +305,13 @@ impl LinkTransportCore {
                             },
                         ])
                     }
-                    HelloAckOutcome::Failure { code, .. } => {
+                    HelloAckOutcome::Failure { code, message } => {
+                        let _ = writeln!(
+                            io::stderr(),
+                            "[herdr-link-daemon] warn hello_ack refused code={} message={}",
+                            code,
+                            message
+                        );
                         let action = self.lifecycle.hello_ack_refused(
                             Some(&code),
                             now_ms as f64,

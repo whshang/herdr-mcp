@@ -389,7 +389,11 @@ fn verify_cutover<L: LaunchdOps>(
     }))
 }
 
-fn rollback_cutover<L: LaunchdOps>(launchd: &L, prod_plist: &Path, backup_path: &Path) -> Value {
+pub fn rollback_cutover<L: LaunchdOps>(
+    launchd: &L,
+    prod_plist: &Path,
+    backup_path: &Path,
+) -> Value {
     let mut steps = Vec::new();
     match fs::read(backup_path) {
         Ok(bytes) => match atomic_write(prod_plist, &bytes, 0o600) {
