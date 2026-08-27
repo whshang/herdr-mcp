@@ -11,6 +11,7 @@ const MAX_BYTES: usize = 512_000;
 const DEFAULT_LOG_COUNT: u64 = 20;
 const MAX_LOG_COUNT: u64 = 100;
 const TIMEOUT: Duration = Duration::from_secs(15);
+const STATUS_COMPACT_AFTER: usize = 24;
 
 pub fn run(snapshot: &Value, args: &Value) -> Value {
     let root_input = match required_str(args, "root") {
@@ -90,10 +91,100 @@ pub fn run(snapshot: &Value, args: &Value) -> Value {
     output.insert("exit_code".to_owned(), json!(result.exit_code));
     output.insert("truncated".to_owned(), json!(result.truncated));
     output.insert("output".to_owned(), json!(result.stdout));
+    if action == "status"
+        && let Some(compact) = compact_git_status(&result.stdout)
+    {
+        output.insert("counts".to_owned(), compact.counts);
+        if compact.files > STATUS_COMPACT_AFTER {
+            output.insert("output".to_owned(), json!(compact.grouped));
+            output.insert("compacted".to_owned(), json!(true));
+        }
+    }
     if !result.stderr.is_empty() {
         output.insert("stderr".to_owned(), json!(result.stderr));
     }
     Value::Object(output)
+}
+
+struct StatusCompact {
+    counts: Value,
+    grouped: String,
+    files: usize,
+}
+
+fn compact_git_status(stdout: &str) -> Option<StatusCompact> {
+    let mut branch = String::new();
+    let mut entries = Vec::<(String, String)>::new();
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("## ") {
+            branch = rest.to_owned();
+            continue;
+        }
+        if line.len() < 4 {
+            continue;
+        }
+        let xy = line[..2].to_owned();
+        let rest = line[3..].trim();
+        if rest.is_empty() {
+            continue;
+        }
+        let path = rest.rsplit(" -> ").next().unwrap_or(rest);
+        entries.push((xy, path.replace('\\', "/")));
+    }
+    if branch.is_empty() && entries.is_empty() {
+        return None;
+    }
+
+    let mut modified = 0usize;
+    let mut untracked = 0usize;
+    let mut deleted = 0usize;
+    let mut renamed = 0usize;
+    for (xy, _) in &entries {
+        if xy == "??" {
+            untracked += 1;
+        } else if xy.contains('R') {
+            renamed += 1;
+        } else if xy.contains('D') {
+            deleted += 1;
+        } else {
+            modified += 1;
+        }
+    }
+
+    let mut groups = std::collections::BTreeMap::<String, Vec<(String, String)>>::new();
+    for (xy, path) in &entries {
+        let (dir, name) = match path.rsplit_once('/') {
+            Some((dir, name)) => (dir.to_owned(), name.to_owned()),
+            None => (".".to_owned(), path.clone()),
+        };
+        groups.entry(dir).or_default().push((xy.clone(), name));
+    }
+
+    let mut grouped = String::new();
+    if !branch.is_empty() {
+        grouped.push_str("## ");
+        grouped.push_str(&branch);
+        grouped.push('\n');
+    }
+    for (dir, files) in &groups {
+        grouped.push_str(&format!("{dir} ({})\n", files.len()));
+        for (xy, name) in files {
+            grouped.push_str(&format!(" {xy} {name}\n"));
+        }
+    }
+
+    Some(StatusCompact {
+        counts: json!({
+            "branch": branch,
+            "files": entries.len(),
+            "modified": modified,
+            "untracked": untracked,
+            "deleted": deleted,
+            "renamed": renamed,
+        }),
+        grouped,
+        files: entries.len(),
+    })
 }
 
 pub fn file_dirty(root: &Path, file: &Path) -> Result<bool, String> {
@@ -391,6 +482,72 @@ mod tests {
         );
         assert_eq!(result["ok"], true);
         assert!(result["output"].as_str().unwrap().contains("new.txt"));
+        assert_eq!(result["counts"]["untracked"], 1);
+        assert!(result.get("compacted").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compact_git_status_groups_by_directory() {
+        let porcelain = "## main\n M src/a.rs\n M src/b.rs\n?? docs/x.md\n D gone.txt\n";
+        let compact = compact_git_status(porcelain).unwrap();
+        assert_eq!(compact.files, 4);
+        assert_eq!(compact.counts["modified"], 2);
+        assert_eq!(compact.counts["untracked"], 1);
+        assert_eq!(compact.counts["deleted"], 1);
+        assert!(compact.grouped.contains("src (2)"));
+        assert!(compact.grouped.contains("a.rs"));
+    }
+
+    #[test]
+    fn status_compacts_output_when_many_files() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-git-compact-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for index in 0..20 {
+            fs::write(root.join("src").join(format!("f{index}.txt")), "x\n").unwrap();
+        }
+        for index in 0..10 {
+            fs::write(root.join("docs").join(format!("d{index}.txt")), "x\n").unwrap();
+        }
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let snapshot = json!({"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}], "agents": []});
+        let result = run(
+            &snapshot,
+            &json!({"root": root, "action": "status", "max_bytes": 65536}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["compacted"], true);
+        assert_eq!(result["counts"]["files"], 30);
+        assert_eq!(result["counts"]["modified"], 30);
+        let output = result["output"].as_str().unwrap();
+        assert!(output.contains("src (20)"));
+        assert!(output.contains("docs (10)"));
+        assert!(output.contains("f0.txt"));
+        assert!(!output.contains("?? src/f0.txt"));
         fs::remove_dir_all(root).unwrap();
     }
 
