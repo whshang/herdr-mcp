@@ -94,12 +94,8 @@ pub fn run(client: &HerdrClient, snapshot: &Value, args: &Value) -> Value {
         });
     };
 
-    let topology = projects::derive(snapshot);
+    let topology = projects::derive_routing(snapshot);
     let current_projects = projects::projects_for_workspace(&topology, &workspace.id);
-    let project_views = current_projects
-        .iter()
-        .map(project_view)
-        .collect::<Vec<_>>();
     let roots = current_projects
         .iter()
         .map(|project| project.root.clone())
@@ -113,7 +109,7 @@ pub fn run(client: &HerdrClient, snapshot: &Value, args: &Value) -> Value {
                 "reason": "project_root_required",
                 "workspace": workspace.id,
                 "candidates": [],
-                "current_projects": project_views,
+                "current_projects": detailed_project_views(snapshot, &workspace.id),
                 "hint": "workspace has no current project root — create or attach a project, then re-call with project_root set to the returned root",
             });
         }
@@ -123,7 +119,7 @@ pub fn run(client: &HerdrClient, snapshot: &Value, args: &Value) -> Value {
                 "reason": "project_root_required",
                 "workspace": workspace.id,
                 "candidates": roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
-                "current_projects": project_views,
+                "current_projects": detailed_project_views(snapshot, &workspace.id),
                 "hint": "workspace has multiple project roots — re-call with project_root set to one of candidates",
             });
         }
@@ -134,7 +130,7 @@ pub fn run(client: &HerdrClient, snapshot: &Value, args: &Value) -> Value {
                 "workspace": workspace.id,
                 "project_root": wanted.to_string_lossy(),
                 "candidates": roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
-                "current_projects": project_views,
+                "current_projects": detailed_project_views(snapshot, &workspace.id),
                 "hint": "project_root must be one of this workspace's current project roots — re-call with project_root set to one of candidates",
             });
         }
@@ -471,6 +467,14 @@ fn project_view(project: &projects::ProjectInfo) -> Value {
         "vcs": project.vcs,
         "managed": project.managed,
     })
+}
+
+fn detailed_project_views(snapshot: &Value, workspace_id: &str) -> Vec<Value> {
+    let topology = projects::derive(snapshot);
+    projects::projects_for_workspace(&topology, workspace_id)
+        .iter()
+        .map(project_view)
+        .collect()
 }
 
 fn select_project_root(

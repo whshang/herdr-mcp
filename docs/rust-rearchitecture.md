@@ -681,6 +681,8 @@ Roadmap 不与当前 Rust parity 并行扩张 public surface。顺序固定为�
 
 当前已完成 `18-tool native parity → production transport parity → Shared Local State Store foundation`，实施游标进入 `supervisor / Native Messaging / updater / link`。Shared Local State Store foundation 保持 SQLite、schema migration、transaction/retention 与首批 exec/prompt durable identity 的范围，不提前扩张 Reliability/Continuity 的产品行为。Reliability/Continuity 所需的基础 identity、diagnostics、event cache 可以在 Rust 迁移阶段提前建设，但不能因此修改 epoch 2 / 18 tools 的行为契约。
 
+工具性能作为独立并行 lane 推进，详细计划见 [`tool-performance-optimization.md`](tool-performance-optimization.md)。Batch A 只做不改变 epoch 2 / 18-tool visible contract 的内部优化、输出压缩与 `herdr_skill` 编排/Worktree 生命周期规则；当前 Rust link runner 继续独立推进 `crates/herdr-mcp/src/link/**`。只有性能基准证明固定 MCP/model round-trip 仍是主要瓶颈后，才在 Batch B 明确评估 multi-operation tool schema / JSON-RPC batch 与 contract epoch 演进，禁止把 model-visible schema 变化混入普通 Rust 重构。
+
 ### 暂不进入主线
 
 以下能力保持观察，不进入当前 Roadmap：

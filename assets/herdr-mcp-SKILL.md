@@ -37,6 +37,54 @@ Use the cheapest deterministic layer that can complete the task.
 5. **The web model remains the planner**. Do not ask a local Claude/OMP/main agent, Pi, or DSH to become a middle manager or to dispatch other agents for you.
 6. **Native Herdr methods are the escape hatch, not the default tool catalog**: use `herdr_methods` to discover the installed socket schema, then `herdr_call` for methods that do not deserve a dedicated MCP tool.
 
+## 1A. Latency-aware tool scheduling
+
+Treat MCP round trips and model re-entry as real costs. Before issuing a sequence of tools, group the next operations into a small dependency-aware **wave** instead of mechanically calling one tool and replanning after every result.
+
+- After one `herdr_inspect` establishes workspace/pane/root identities, reuse those exact IDs and paths. Do not rediscover state that has not become stale.
+- Independent read-only operations should be issued concurrently when the client supports parallel tool calls. Examples: project-instruction reads, independent greps, Git facts, and unrelated file reads. Only serialize when one result determines the next call's arguments or safety decision.
+- After the first state baseline, prefer `herdr_since(cursor)` for incremental workspace/agent changes instead of repeatedly calling full `herdr_inspect`.
+- Use `herdr_exec_read(offset=next_offset)` as a delta read. Never restart at offset 0 unless earlier output is actually needed again.
+- Prefer one `herdr_fs_patch` for a coherent multi-file mutation instead of a chain of tiny edits. Mutations in the same project remain ordered by default; independent isolated mutation lanes may proceed in parallel.
+- Do not call `herdr_methods` before every `herdr_call`; discover only the method/schema that is unknown, then reuse the known schema during the task.
+- The generated **Live herdr-mcp runtime context** is authoritative for current execution capabilities such as server-side concurrency, JSON-RPC batch, and multi-operation tool arguments. Do not assume a capability is permanently forbidden merely because an older implementation lacked it.
+- When no batch form exists, prefer fewer high-value bounded calls over many tiny calls. When a future runtime advertises a safe batch form, prefer server-side batch over N sequential model round trips.
+
+Target shape:
+
+```text
+inspect once
+  -> independent read-only wave
+  -> ordered mutation(s)
+  -> validation wave
+  -> since(cursor) for incremental follow-up
+```
+
+## 1B. Workspace and worktree lifecycle
+
+Herdr workspaces and Git worktrees are resources, not task history. A new worktree can duplicate dependency trees, build caches, watchers and initialization cost, so its lifetime should approximate an **active independent mutation lane**.
+
+- Default to the current project/workspace and a sibling pane. Read-only analysis, grep, Git status/log/diff, review, architecture discussion and ordinary test execution do **not** justify a new worktree.
+- Before creating a worktree, inspect current workspace/project state and query the repo's existing Herdr worktrees (`worktree.list` through the live native schema when needed). Reuse an existing suitable worktree before creating another one.
+- Create a new worktree only for an independent mutating branch/lane, for isolation from unrelated dirty work, or when the user explicitly requests that topology.
+- Creating/opening a worktree does not authorize dependency installation. Run `npm ci`, `pnpm install`, virtualenv creation or equivalent bootstrap only when the task actually requires those dependencies.
+- Do not create a second worktree merely because an existing worker is read-only or reviewing. Prefer another pane in the same safe checkout for non-mutating parallelism.
+- At the end of a lane, reconcile **both** Herdr workspace state and Git worktree state. They can diverge: a workspace may survive after its underlying checkout has disappeared, or a checkout may remain after the workspace is closed.
+- Reclaim only with deterministic evidence: no working agent, no uncertain mutation, changes are clean or safely preserved, and the branch is merged or explicitly abandoned. Close the Herdr workspace and remove the development worktree through native lifecycle APIs; never blindly `rm -rf` a checkout.
+- Dirty, unmerged, actively used, outcome-unknown, or ownership-unclear worktrees are preserved and reported instead of force-cleaned.
+- `~/.herdr/worktrees/**` is the development-worktree domain. `~/.config/herdr-mcp/releases/**` is the immutable runtime-generation domain and is **never** subject to development worktree cleanup.
+- Before opening another mutation worktree, reconcile completed lanes first. The number of long-lived development worktrees should stay close to the number of currently active independent mutation lanes, not the number of historical tasks.
+
+## 1C. DEVELOPMENT-ONLY herdr-mcp retrospective
+
+While `herdr-mcp` is still under active development, every task about developing, debugging, testing, releasing, or operating **herdr-mcp** ends with one bounded self-review **after the user's primary plan and validation are complete**. Remove or sharply reduce this section before the stable production Skill is frozen.
+
+- Review only the tool calls actually made in this task: avoidable MCP/model round trips, serial reads that could have formed one wave, repeated inspect/Git/topology work, oversized outputs, unnecessary agent prompts, or unnecessary workspace/worktree creation.
+- Separate observed evidence from speculation. Prefer concrete evidence such as repeated calls, subprocess/RPC counts, timeouts, payload size, or bootstrap/worktree cost.
+- Report at most three actionable herdr-mcp improvement suggestions, ordered by expected user-visible latency/reliability benefit.
+- Do not interrupt the current plan, mutate code, open another worktree, or start another optimization lane merely to pursue a retrospective suggestion unless the user already authorized that lane.
+- If an issue is already covered by the active optimization plan, reference that item instead of creating a duplicate task.
+
 ## 2. Modification rules
 
 - Prefer direct edits over prompting an agent to make trivial deterministic changes.

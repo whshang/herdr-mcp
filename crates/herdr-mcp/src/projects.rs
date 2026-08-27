@@ -28,6 +28,19 @@ pub struct ProjectTopology {
 }
 
 pub fn derive(snapshot: &Value) -> ProjectTopology {
+    derive_inner(snapshot, true)
+}
+
+/// Derive project routing without running `git status` for dirty enrichment.
+///
+/// Security gates and busy-agent routing only need the managed Git root and
+/// pane/workspace ownership. Keeping that path separate avoids paying for a
+/// full repository status scan on every file read, write, grep, or exec gate.
+pub fn derive_routing(snapshot: &Value) -> ProjectTopology {
+    derive_inner(snapshot, false)
+}
+
+fn derive_inner(snapshot: &Value, include_git_status: bool) -> ProjectTopology {
     let pane_to_workspace = pane_workspaces(snapshot);
     let pane_cwds = pane_cwds(snapshot);
     let home = home_dir();
@@ -47,14 +60,18 @@ pub fn derive(snapshot: &Value) -> ProjectTopology {
         entry.2.insert(cwd);
     }
 
-    let status_roots = grouped
-        .iter()
-        .filter_map(|(root, (vcs, _, _))| {
-            let managed = vcs.is_some() && !is_unmanaged_root(root, home.as_deref());
-            managed.then_some(root.clone())
-        })
-        .collect::<Vec<_>>();
-    let statuses = git_statuses(&status_roots);
+    let statuses = if include_git_status {
+        let status_roots = grouped
+            .iter()
+            .filter_map(|(root, (vcs, _, _))| {
+                let managed = vcs.is_some() && !is_unmanaged_root(root, home.as_deref());
+                managed.then_some(root.clone())
+            })
+            .collect::<Vec<_>>();
+        git_statuses(&status_roots)
+    } else {
+        HashMap::new()
+    };
 
     let projects = grouped
         .into_iter()
@@ -350,6 +367,15 @@ mod tests {
         assert_eq!(project.changed_files, 1);
         assert_eq!(project.pane_ids, vec!["w1:p1"]);
         assert_eq!(topology.pane_to_workspace["w1:p1"], "w1");
+
+        let routing = derive_routing(&snapshot);
+        let routed_project = routing.projects.get(&root).unwrap();
+        assert_eq!(routed_project.vcs, Some("git"));
+        assert!(routed_project.managed);
+        assert!(!routed_project.dirty);
+        assert_eq!(routed_project.changed_files, 0);
+        assert_eq!(routed_project.pane_ids, vec!["w1:p1"]);
+        assert_eq!(routing.pane_to_workspace["w1:p1"], "w1");
 
         fs::remove_dir_all(root).unwrap();
     }

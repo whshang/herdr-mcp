@@ -15,7 +15,8 @@ pub fn inspect(
     cache: Option<&EventCache>,
     exec: Option<&ExecRegistry>,
 ) -> Value {
-    let mut view = inspect::inspect_core(client);
+    let cached_snapshot = cache.and_then(EventCache::fresh_snapshot);
+    let mut view = inspect::inspect_core(client, cached_snapshot);
     runtime_meta::augment_inspect(&mut view, cache, exec);
     view
 }
@@ -123,7 +124,7 @@ fn since_result(
 ) -> Value {
     let mut events = digest.events;
     let mut agents = digest.agents;
-    let workspaces = digest.workspaces;
+    let mut workspaces = digest.workspaces;
 
     if let Some(workspace) = workspace {
         let mut ids = workspaces
@@ -147,6 +148,11 @@ fn since_result(
         agents.retain(|agent| {
             agent
                 .get("workspace")
+                .and_then(Value::as_str)
+                .is_some_and(|workspace_id| ids.contains(workspace_id))
+        });
+        workspaces.retain(|item| {
+            item.get("workspace_id")
                 .and_then(Value::as_str)
                 .is_some_and(|workspace_id| ids.contains(workspace_id))
         });
@@ -234,6 +240,8 @@ mod tests {
         assert_eq!(result["events"][0]["workspace_id"], "w1");
         assert_eq!(result["agents"].as_array().unwrap().len(), 1);
         assert_eq!(result["agents"][0]["name"], "pi");
+        assert_eq!(result["workspaces"].as_array().unwrap().len(), 1);
+        assert_eq!(result["workspaces"][0]["workspace_id"], "w1");
         assert_eq!(result["agents_hidden"], 1);
         assert_eq!(result["warnings"], json!(["cursor_reset_boot_or_rollover"]));
     }

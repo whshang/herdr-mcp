@@ -1,3 +1,4 @@
+use crate::contract;
 use crate::exec_sessions::enriched_exec_path;
 use crate::paths::RuntimePaths;
 use reqwest::blocking::Client;
@@ -396,10 +397,20 @@ fn runtime_context(config: &SkillConfig) -> Value {
     let runtime_status = read_optional_json(&config.runtime_status_path);
     let update_status = read_optional_json(&config.self_update_path);
     let worker_fallbacks = worker_fallback_context(config);
+    let contract = contract::identity().ok();
     json!({
         "server_version": env!("CARGO_PKG_VERSION"),
         "build_commit": env::var("HERDR_MCP_BUILD_COMMIT").unwrap_or_else(|_| "dev".to_owned()),
         "contract_profile": env::var("HERDR_MCP_CONTRACT_PROFILE").unwrap_or_else(|_| "current".to_owned()),
+        "tool_execution": {
+            "contract_epoch": contract.as_ref().map(|value| value.epoch),
+            "tool_count": contract.as_ref().map(|value| value.tool_count),
+            "server_concurrent_requests": true,
+            "jsonrpc_batch": false,
+            "multi_operation_tool_args": false,
+            "read_policy": "parallel independent reads when the MCP client supports concurrent calls",
+            "mutation_policy": "ordered by default within one project",
+        },
         "network_skill_refresh": config.network,
         "worker_fallbacks": worker_fallbacks,
         "runtime_generation": compact_runtime_status(runtime_status.as_ref()),
@@ -722,6 +733,17 @@ mod tests {
         let runtime = runtime_context(&config);
         assert_eq!(runtime["runtime_generation"]["active_generation"], "g2");
         assert_eq!(runtime["self_update"]["state"], "idle");
+        assert_eq!(runtime["tool_execution"]["contract_epoch"], 2);
+        assert_eq!(runtime["tool_execution"]["tool_count"], 18);
+        assert_eq!(
+            runtime["tool_execution"]["server_concurrent_requests"],
+            true
+        );
+        assert_eq!(runtime["tool_execution"]["jsonrpc_batch"], false);
+        assert_eq!(
+            runtime["tool_execution"]["multi_operation_tool_args"],
+            false
+        );
         let encoded = runtime.to_string();
         assert!(!encoded.contains("secret"));
         assert!(!encoded.contains("token"));

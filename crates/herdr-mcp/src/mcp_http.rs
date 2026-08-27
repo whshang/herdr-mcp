@@ -221,6 +221,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
     let exec = ExecRegistry::new(exec_state_dir)?;
     let prompt = PromptRegistry::with_store(state_store);
     let skill = SkillService::new();
+    crate::schema::prewarm_async();
     if !cache.wait_ready(Duration::from_secs(3)) {
         return Err(format!(
             "candidate event cache did not bootstrap: {}",
