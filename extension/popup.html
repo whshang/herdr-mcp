@@ -44,9 +44,16 @@
   <div id="toast" style="display:none;position:sticky;top:0;z-index:10;padding:6px 10px;font-size:11px;line-height:1.35;border-bottom:1px solid"></div>
   <div class="section">
     <div class="row"><span data-i18n="mcp_service">Local MCP</span><span id="srvStatus" class="muted">…</span></div>
+    <div class="row" style="margin-top:4px">
+      <span class="muted">Browser Control Plane</span>
+      <button id="openControlCenter" class="primary">Open Control Center</button>
+    </div>
     <div class="cfg-grid">
       <span data-i18n="label_automation_mode">Automation mode</span>
-      <strong id="automationModeStatus" class="muted">…</strong>
+      <span style="display:flex;align-items:center;gap:4px;justify-content:flex-end">
+        <strong id="automationModeStatus" class="muted">…</strong>
+        <button id="automationQuickToggle" class="sm" disabled>…</button>
+      </span>
       <span data-i18n="pace_interval">Interval (sec)</span>
       <input type="number" id="progressTickSec" min="0" step="1">
     </div>

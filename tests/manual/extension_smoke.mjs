@@ -43,6 +43,7 @@ for (const cs of manifest.content_scripts || []) for (const js of cs.js || []) r
 referenced.push(manifest.background?.service_worker);
 referenced.push(manifest.options_page);
 referenced.push(manifest.action?.default_popup);
+referenced.push(manifest.side_panel?.default_path);
 for (const [k, v] of Object.entries(manifest.icons || {})) referenced.push(v);
 for (const [k, v] of Object.entries(manifest.action?.default_icon || {})) referenced.push(v);
 for (const r of referenced) {
@@ -52,6 +53,10 @@ for (const r of referenced) {
 ok(manifest.background?.type === "module", "background is a module worker");
 ok(manifest.content_scripts.length === 4, "manifest contains four site content scripts");
 ok(manifest.permissions?.includes("nativeMessaging"), "manifest enables Chrome Native Messaging for automatic local authentication");
+ok(manifest.permissions?.includes("sidePanel")
+    && manifest.side_panel?.default_path === "control-center.html"
+    && manifest.action?.default_popup === "popup.html",
+  "popup remains the quick surface and Chrome Side Panel hosts the Control Center");
 ok(!manifest.key, "unpacked extension keeps its existing Chromium path-derived identity");
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
@@ -520,6 +525,7 @@ ok(!readFileSync(path.join(EXT, "options.html"), "utf8").includes("Enable wake +
   "Options source no longer exposes the legacy wake+nudge switch name");
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 const popupHtml = readFileSync(path.join(EXT, "popup.html"), "utf8");
+const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
 ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
     && !optionsHtml.includes('id="enabled"')
     && !optionsHtml.includes('id="autoAllow"')
@@ -528,11 +534,25 @@ ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
 ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")')
     && !backgroundSource.includes("CFG.autoAllow"),
   "permission-card automation is folded into effective Project automation");
-ok(!popupHtml.includes('id="idleNudgeEnabled"') && !popupHtml.includes('id="enabled"') && popupHtml.includes('id="automationModeStatus"'),
-  "popup reports the global mode without exposing an automation toggle");
+ok(!popupHtml.includes('id="idleNudgeEnabled"') && !popupHtml.includes('id="enabled"')
+    && popupHtml.includes('id="automationModeStatus"')
+    && popupHtml.includes('id="automationQuickToggle"')
+    && readFileSync(path.join(EXT, "popup.js"), "utf8").includes('type: "h2w_popup_set_automation"')
+    && backgroundSource.includes('msg?.type === "h2w_popup_set_automation"'),
+  "popup keeps the effective automation status plus a scope-aware quick toggle");
+ok(popupHtml.includes('id="openControlCenter"')
+    && readFileSync(path.join(EXT, "popup.js"), "utf8").includes("chrome.sidePanel.open"),
+  "popup exposes an explicit Control Center entry point");
+ok(backgroundSource.includes('event === "hello"')
+    && backgroundSource.includes('type: "herdr_control_state"')
+    && backgroundSource.includes('type: "herdr_control_event"')
+    && backgroundSource.includes('msg?.type === "herdr_control_read_tail"')
+    && controlCenterSource.includes('type: "herdr_control_center_subscribe"')
+    && !controlCenterSource.includes("setInterval("),
+  "Control Center uses one initial/reconnect snapshot plus incremental events without fixed polling");
 
 // ---- 2. JavaScript syntax for the fixed file list ----
-const fixed = ["background.js", "binding-core.js", "continuity-core.js", "options.js", "popup.js", "context-pressure.js", "performance-core.js", "content/base.js",
+const fixed = ["background.js", "binding-core.js", "continuity-core.js", "options.js", "popup.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js",
   "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/claude.js",
   "content/injector/chatgpt.js", "content/webmcp/speaks-json.js", "content/wake.js"];
 for (const f of fixed) {

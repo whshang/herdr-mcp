@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Herdr Control Center</title>
+  <link rel="stylesheet" href="control-center.css">
+</head>
+<body>
+  <main class="control-center">
+    <header class="topbar">
+      <div class="title-row">
+        <h1>Herdr Control Center</h1>
+      </div>
+      <div class="runtime-line">
+        <span id="runtimeDot" class="dot offline"></span>
+        <span id="runtimeText">Runtime connecting…</span>
+        <span id="runtimeStats" class="stats">0 workspaces · 0 panes · 0 working</span>
+      </div>
+      <div class="toolbar">
+        <button id="refreshButton" type="button">Refresh</button>
+        <button id="collapseButton" type="button" class="ghost">Collapse all</button>
+      </div>
+    </header>
+
+    <section id="workspaceList" class="workspace-list" aria-label="Herdr workspaces">
+      <div class="empty">Loading local Herdr state…</div>
+    </section>
+
+    <section class="control-dock" aria-label="Pinned control target">
+      <div id="targetCard" class="target-card">
+        <div class="target-heading">
+          <span>📌</span>
+          <strong id="targetTitle">No pinned target</strong>
+          <span class="spacer"></span>
+          <button id="unpinButton" type="button" class="ghost" disabled>Unpin</button>
+        </div>
+        <div id="targetDetails" class="target-details">Click a pane above to pin it. Herdr focus changes will not retarget this control.</div>
+        <div class="read-actions">
+          <button id="inspectButton" type="button" disabled>Inspect</button>
+          <button id="readTailButton" type="button" disabled>Read bounded tail</button>
+        </div>
+      </div>
+
+      <div id="modeTabs" class="mode-tabs" role="tablist" aria-label="Control mode">
+        <button type="button" data-mode="agent_prompt" class="active">Prompt</button>
+        <button type="button" data-mode="steer">Steer</button>
+        <button type="button" data-mode="herdr_method">Herdr</button>
+        <button type="button" data-mode="terminal_text">Terminal</button>
+      </div>
+
+      <textarea id="composer" placeholder="Describe the intended action. Phase A validates mutation actions as dry-run only."></textarea>
+      <div class="composer-footer">
+        <span id="riskBadge" class="risk">MUTATION</span>
+        <span id="blockedReason" class="blocked-reason">Waiting for Rust control plane reliability</span>
+        <button id="sendButton" type="button" class="primary">Dry run</button>
+      </div>
+      <pre id="result" class="result" aria-live="polite"></pre>
+    </section>
+  </main>
+  <script type="module" src="control-center.js"></script>
+</body>
+</html>

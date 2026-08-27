@@ -3,7 +3,7 @@
   "name": "herdr → Web wake",
   "version": "0.1.63",
   "description": "Keep web chats connected to Herdr workspaces with Project-shared or conversation-scoped automation and safe ChatGPT Project rollover. UI: en / zh / ja.",
-  "permissions": ["storage", "scripting", "alarms", "nativeMessaging"],
+  "permissions": ["storage", "scripting", "alarms", "nativeMessaging", "sidePanel"],
   "host_permissions": [
     "http://127.0.0.1:8772/*",
     "<all_urls>"
@@ -12,7 +12,11 @@
     "service_worker": "background.js",
     "type": "module"
   },
+  "side_panel": {
+    "default_path": "control-center.html"
+  },
   "action": {
+    "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
