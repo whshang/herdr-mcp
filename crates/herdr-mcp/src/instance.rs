@@ -8,10 +8,13 @@
 use std::env;
 
 /// Production LaunchAgent label (default instance).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const DEFAULT_SERVICE_LABEL: &str = "dev.herdr-mcp.server";
 /// Legacy Node watchdog label (default instance only; adoption path).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const DEFAULT_WATCHDOG_LABEL: &str = "dev.herdr-mcp.watchdog";
 /// Rust-era health sidecar label (default instance).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const DEFAULT_HEALTH_WATCHDOG_LABEL: &str = "dev.herdr-mcp.health-watchdog";
 pub const DEFAULT_RUNTIME_PORT: u16 = 8772;
 pub const DEFAULT_CONFIG_LEAF: &str = "herdr-mcp";
@@ -85,6 +88,7 @@ impl InstanceId {
         })
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
@@ -94,6 +98,7 @@ impl InstanceId {
         self.name.is_none()
     }
 
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     pub fn is_named(&self) -> bool {
         self.name.is_some()
     }
@@ -105,6 +110,7 @@ impl InstanceId {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn service_label(&self) -> String {
         match &self.name {
             None => DEFAULT_SERVICE_LABEL.to_owned(),
@@ -112,6 +118,7 @@ impl InstanceId {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn watchdog_label(&self) -> String {
         match &self.name {
             None => DEFAULT_WATCHDOG_LABEL.to_owned(),
@@ -119,6 +126,7 @@ impl InstanceId {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn health_watchdog_label(&self) -> String {
         match &self.name {
             None => DEFAULT_HEALTH_WATCHDOG_LABEL.to_owned(),

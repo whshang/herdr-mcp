@@ -58,8 +58,10 @@ impl Config {
     }
 
     pub fn missing_file_default_for_instance(instance: &InstanceId) -> Self {
-        let mut config = Self::default();
-        config.runtime_port = instance.default_port();
+        let mut config = Self {
+            runtime_port: instance.default_port(),
+            ..Self::default()
+        };
         if binary_is_prerelease() {
             config.update_channel = UpdateChannel::Preview;
         }
