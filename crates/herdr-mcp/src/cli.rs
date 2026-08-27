@@ -27,6 +27,10 @@ pub enum LinkCommand {
     Cutover {
         mode: crate::link::CutoverMode,
     },
+    /// Prepare / apply Rust-compatible prod runtime-control generation (no LaunchAgent cut).
+    MigrateRuntimeControl {
+        mode: crate::link::MigrateMode,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -108,12 +112,18 @@ fn parse_link(args: &[String]) -> Result<Command, String> {
         [subcommand] if subcommand == "install" => Ok(Command::Link(LinkCommand::Install)),
         [subcommand] if subcommand == "uninstall" => Ok(Command::Link(LinkCommand::Uninstall)),
         [subcommand, ..] if subcommand == "cutover" => parse_link_cutover(&args[1..]),
-        [] => Err("link requires status, run, install, uninstall, or cutover".to_owned()),
+        [subcommand, ..] if subcommand == "migrate-runtime-control" => {
+            parse_link_migrate_runtime_control(&args[1..])
+        }
+        [] => Err(
+            "link requires status, run, install, uninstall, cutover, or migrate-runtime-control"
+                .to_owned(),
+        ),
         [subcommand] => Err(format!(
-            "unknown link command '{subcommand}' (status|run|install|uninstall|cutover)"
+            "unknown link command '{subcommand}' (status|run|install|uninstall|cutover|migrate-runtime-control)"
         )),
         _ => Err(
-            "link accepts status, run, install, uninstall, or cutover [--dry-run|--execute]"
+            "link accepts status, run, install, uninstall, cutover [--dry-run|--execute], or migrate-runtime-control [--dry-run|--write-staging|--apply]"
                 .to_owned(),
         ),
     }
@@ -148,6 +158,44 @@ fn parse_link_cutover(args: &[String]) -> Result<Command, String> {
         CutoverMode::DryRun
     };
     Ok(Command::Link(LinkCommand::Cutover { mode }))
+}
+
+fn parse_link_migrate_runtime_control(args: &[String]) -> Result<Command, String> {
+    use crate::link::MigrateMode;
+
+    let mut dry_run = false;
+    let mut write_staging = false;
+    let mut apply = false;
+    for arg in args {
+        match arg.as_str() {
+            "--dry-run" => dry_run = true,
+            "--write-staging" => write_staging = true,
+            "--apply" => apply = true,
+            value => {
+                return Err(format!(
+                    "unknown link migrate-runtime-control argument '{value}' (expected --dry-run, --write-staging, or --apply)"
+                ));
+            }
+        }
+    }
+    let selected = [dry_run, write_staging, apply]
+        .into_iter()
+        .filter(|value| *value)
+        .count();
+    if selected > 1 {
+        return Err(
+            "link migrate-runtime-control accepts only one of --dry-run, --write-staging, or --apply (default is dry-run)"
+                .to_owned(),
+        );
+    }
+    let mode = if apply {
+        MigrateMode::Apply
+    } else if write_staging {
+        MigrateMode::WriteStaging
+    } else {
+        MigrateMode::DryRun
+    };
+    Ok(Command::Link(LinkCommand::MigrateRuntimeControl { mode }))
 }
 
 fn parse_config(args: &[String]) -> Result<Command, String> {
@@ -339,6 +387,7 @@ Advanced / internal:\n\
   herdr-mcp link install\n\
   herdr-mcp link uninstall\n\
   herdr-mcp link cutover [--dry-run|--execute]\n\
+  herdr-mcp link migrate-runtime-control [--dry-run|--write-staging|--apply]\n\
   herdr-mcp native-host <install|status|uninstall|rollback>\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\
   herdr-mcp dev [--dry-run]\n\
@@ -351,7 +400,10 @@ ownership/gates reporting. link run starts a foreground Rust Link candidate\n\
 LaunchAgent dev.herdr-mcp.link-rust-candidate → runtime/current link run; they\n\
 never unload or replace live Node link/link-prod. link cutover defaults to\n\
 dry-run plan/validate only; --execute is a gated no-op stub and never cuts\n\
-production Link in this release.\n"
+production Link in this release. link migrate-runtime-control prepares a\n\
+Rust-compatible runtime-control-prod generation (default dry-run; --write-staging\n\
+writes a pending sibling; --apply rewrites the live control file only with\n\
+HERDR_LINK_MIGRATE_RUNTIME_CONTROL=1) and never mutates LaunchAgents.\n"
 }
 
 #[cfg(test)]
@@ -472,6 +524,29 @@ mod tests {
             })
         );
         assert_eq!(
+            parse(args(&["link", "migrate-runtime-control"])).unwrap(),
+            Command::Link(LinkCommand::MigrateRuntimeControl {
+                mode: crate::link::MigrateMode::DryRun
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "link",
+                "migrate-runtime-control",
+                "--write-staging"
+            ]))
+            .unwrap(),
+            Command::Link(LinkCommand::MigrateRuntimeControl {
+                mode: crate::link::MigrateMode::WriteStaging
+            })
+        );
+        assert_eq!(
+            parse(args(&["link", "migrate-runtime-control", "--apply"])).unwrap(),
+            Command::Link(LinkCommand::MigrateRuntimeControl {
+                mode: crate::link::MigrateMode::Apply
+            })
+        );
+        assert_eq!(
             parse(args(&["native-host", "status"])).unwrap(),
             Command::NativeHost(NativeHostCommand::Status)
         );
@@ -516,6 +591,16 @@ mod tests {
         assert!(parse(args(&["link"])).is_err());
         assert!(parse(args(&["link", "cutover", "--force"])).is_err());
         assert!(parse(args(&["link", "cutover", "--dry-run", "--execute"])).is_err());
+        assert!(
+            parse(args(&[
+                "link",
+                "migrate-runtime-control",
+                "--dry-run",
+                "--apply"
+            ]))
+            .is_err()
+        );
+        assert!(parse(args(&["link", "migrate-runtime-control", "--force"])).is_err());
         assert!(parse(args(&["link", "status", "extra"])).is_err());
         assert!(parse(args(&["extension-host", "https://example.com/"])).is_err());
         assert!(parse(args(&["status", "extra"])).is_err());
@@ -545,8 +630,10 @@ mod tests {
         assert!(text.contains("herdr-mcp link install"));
         assert!(text.contains("herdr-mcp link uninstall"));
         assert!(text.contains("herdr-mcp link cutover"));
+        assert!(text.contains("herdr-mcp link migrate-runtime-control"));
         assert!(text.contains("dev.herdr-mcp.link-rust-candidate"));
         assert!(text.contains("dry-run plan/validate only"));
+        assert!(text.contains("HERDR_LINK_MIGRATE_RUNTIME_CONTROL=1"));
         let install = text.find("herdr-mcp install").expect("install");
         let service = text.find("herdr-mcp service").expect("service");
         assert!(
