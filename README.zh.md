@@ -69,8 +69,42 @@ Herdr 原生长尾能力
 前置：
 
 - 已安装并运行 [Herdr](https://herdr.dev)；
-- Node.js 20+；
 - 如果要从 ChatGPT 公网连接，需要一个 Cloudflare 账号。
+
+**本机 MCP runtime** 是原生二进制，运行它**不需要** Node.js / npm。Node 仍可用于 Cloudflare Edge 部署、浏览器扩展工具链，以及从本仓库做贡献者构建。
+
+### 安装原生 runtime（主路径）
+
+1. 从 [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) 下载当前平台的 `herdr-mcp` 二进制（产品仍处 alpha 时会出现 prerelease 标签）。
+2. 放到 `PATH` 上（例如 `~/.local/bin/herdr-mcp`）并赋予可执行权限。
+3. 先验证二进制：
+
+```bash
+herdr-mcp doctor
+herdr-mcp status
+herdr-mcp update check
+```
+
+安装后的日常生命周期：
+
+```bash
+herdr-mcp update apply
+herdr-mcp update status
+```
+
+优先使用以上顶层命令。**不要**把 `herdr-mcp service install` 当成普通用户安装主路径；`service ...` 仍是高级/内部接口。
+
+加 Edge 之前先确认 Herdr：
+
+```bash
+herdr --version
+herdr api schema >/dev/null
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
+```
+
+接 ChatGPT 时，推荐先把 Cloudflare Worker 部署到默认的 `workers.dev`，启动 `herdr-link`，然后在 ChatGPT 添加公网 `/mcp` 地址并完成 OAuth。
+
+**不要**把 `HERDR_MCP_TOKEN` 或 Cloudflare API Token 填进 ChatGPT。
 
 ### 让本地 Coding Agent 自动安装
 
@@ -83,37 +117,15 @@ https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-i
 严格按文档完成。首次安装不要创建 Custom Domain、DNS 记录或 Tunnel，只使用 workers.dev。不要回显或提交任何 Token。每个 mutation 后先验证状态再继续。
 ```
 
-该流程生成 Cloudflare-safe Worker 名时使用仓库内的确定性 helper：
+该 Edge 流程生成 Cloudflare-safe Worker 名时使用仓库内的确定性 helper：
 
 ```bash
 WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 ```
 
-### 手动构建
+### 贡献者从源码构建（可选）
 
-构建本机 runtime：
-
-```bash
-git clone https://github.com/whshang/herdr-mcp.git
-cd herdr-mcp
-npm ci
-npm run build
-
-export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
-node dist/server.js
-```
-
-先验证本机，再加公网层：
-
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
-herdr --version
-herdr api schema >/dev/null
-```
-
-接 ChatGPT 时，推荐先把 Cloudflare Worker 部署到默认的 `workers.dev`，启动 `herdr-link`，然后在 ChatGPT 添加公网 `/mcp` 地址并完成 OAuth。
-
-**不要**把 `HERDR_MCP_TOKEN` 或 Cloudflare API Token 填进 ChatGPT。
+只有在开发 herdr-mcp 本身时才需要 clone 本仓库。源码构建仍可能使用 Node 工具链处理站点/扩展/Edge 包；那不是最终用户运行 MCP runtime 的主路径。
 
 完整流程：[快速开始](docs/i18n/zh-CN/quick-start.md) · [安装](docs/i18n/zh-CN/install.md) · [ChatGPT Connector](docs/i18n/zh-CN/chatgpt-connector.md)
 

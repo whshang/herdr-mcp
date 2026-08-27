@@ -65,8 +65,44 @@ native Herdr long tail
 前提：
 
 - [Herdr](https://herdr.dev) がインストール済み・起動中
-- Node.js 20+
 - ChatGPT から公開接続する場合は Cloudflare account
+
+**ローカル MCP runtime** はネイティブバイナリです。実行に Node.js / npm は**不要**です。Node は Cloudflare Edge デプロイ、ブラウザ拡張ツールチェーン、およびこのリポジトリからの貢献者ビルド向けに残ります。
+
+### ネイティブ runtime のインストール（主経路）
+
+1. [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) から、対象プラットフォームの `herdr-mcp` バイナリをダウンロードします（alpha 期間中は prerelease タグが想定されます）。
+2. `PATH` 上に置き（例: `~/.local/bin/herdr-mcp`）、実行権限を付与します。
+3. バイナリを確認します:
+
+```bash
+herdr-mcp doctor
+herdr-mcp status
+herdr-mcp update check
+```
+
+インストール後の日常操作:
+
+```bash
+herdr-mcp update apply
+herdr-mcp update status
+```
+
+上記のトップレベルコマンドを優先してください。`herdr-mcp service install` を通常のユーザー向けインストール経路にしないでください。`service ...` は advanced / internal のままです。
+
+Edge を足す前に Herdr を確認します。
+
+```bash
+herdr --version
+herdr api schema >/dev/null
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
+```
+
+ChatGPT から使う場合は、まず Cloudflare Worker を `workers.dev` にデプロイし、`herdr-link` を起動して、公開 `/mcp` URL を ChatGPT の custom MCP App/Connector に登録して OAuth を完了します。
+
+`HERDR_MCP_TOKEN` や Cloudflare API Token を ChatGPT に貼らないでください。
+
+### ローカル Coding Agent に任せる
 
 ローカル Coding Agent にセットアップを任せる場合は、推測させず英語の正本を先に読ませてください。
 
@@ -77,29 +113,15 @@ https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-inst
 Follow that guide end to end. Use workers.dev for the first install and do not expose or commit secrets.
 ```
 
-手動で構築する場合：
+Edge 用の Cloudflare-safe Worker 名 helper:
 
 ```bash
-git clone https://github.com/whshang/herdr-mcp.git
-cd herdr-mcp
-npm ci
-npm run build
-
-export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
-node dist/server.js
+WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 ```
 
-ローカル runtime を確認します。
+### 貢献者向けソースビルド（任意）
 
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
-herdr --version
-herdr api schema >/dev/null
-```
-
-ChatGPT から使う場合は、まず Cloudflare Worker を `workers.dev` にデプロイし、`herdr-link` を起動して、公開 `/mcp` URL を ChatGPT の custom MCP App/Connector に登録して OAuth を完了します。
-
-`HERDR_MCP_TOKEN` や Cloudflare API Token を ChatGPT に貼らないでください。
+herdr-mcp 自体を開発するときだけリポジトリを clone してください。ソースビルドではサイト/拡張/Edge のために Node ツールチェーンを使うことがありますが、それはエンドユーザーが MCP runtime を動かす主経路ではありません。
 
 詳細手順（英語）：
 

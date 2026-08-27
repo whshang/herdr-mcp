@@ -1,6 +1,6 @@
 # Installation: from a Herdr workstation to a usable Web AI development environment
 
-This guide installs the complete path, not just a Node process:
+This guide installs the complete path, not just a local process:
 
 ```text
 ChatGPT
@@ -27,13 +27,7 @@ herdr api schema >/dev/null
 
 If this fails, fix Herdr first using the [official installation guide](https://herdr.dev/docs/install/).
 
-### 2. Node.js 20+
-
-```bash
-node -v
-```
-
-### 3. Know which client path you need
+### 2. Know which client path you need
 
 - **ChatGPT** requires a stable public Edge and OAuth.
 - **Local Cursor / curl** can connect directly to `127.0.0.1`.
@@ -41,29 +35,23 @@ node -v
 
 This guide follows the ChatGPT path because it covers the complete architecture.
 
-## Step 1: clone and build
+Node.js is **not** required to run the local MCP runtime. You may still need Node temporarily when deploying the Cloudflare Worker (`npx wrangler`) or building the browser extension from source.
+
+## Step 1: install the native runtime (primary)
+
+Download the current `herdr-mcp` binary for your platform from [GitHub Releases](https://github.com/whshang/herdr-mcp/releases), place it on your `PATH` (for example `~/.local/bin/herdr-mcp`), and make it executable.
 
 ```bash
-git clone https://github.com/whshang/herdr-mcp.git
-cd herdr-mcp
-npm install
-npm run build
-mkdir -p ~/.config/herdr-mcp
+herdr-mcp doctor
+herdr-mcp status
+herdr-mcp update check
 ```
 
-For an existing checkout, inspect Git state before updating. Do not overwrite unknown local changes.
+Prefer these top-level commands. Do **not** use `herdr-mcp service install` as the normal user install instruction; `service ...` remains advanced/internal.
 
 ## Step 2: validate the local runtime first
 
-The runtime listens on `127.0.0.1:8772` by default. The static token is for local clients and administration; it is not a ChatGPT credential.
-
-```bash
-export HERDR_MCP_TOKEN="$(openssl rand -hex 16)"
-export HERDR_MCP_PORT=8772
-node dist/server.js
-```
-
-In another terminal:
+The managed runtime listens on `127.0.0.1:8772` by default. After the binary is installed and the local service is healthy:
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
@@ -73,31 +61,18 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 
 The runtime must also reach the Herdr socket. After connecting, `herdr_inspect` should report real workspaces, panes and managed roots.
 
+Day-to-day upgrades:
+
+```bash
+herdr-mcp update apply
+herdr-mcp update status
+```
+
 ## Step 3: keep the runtime alive
 
-### macOS
+On macOS, the native binary owns the managed LaunchAgent lifecycle once installed. Use `herdr-mcp status` / `herdr-mcp doctor` for health, and `herdr-mcp update ...` for upgrades. Avoid pointing launchd at a git checkout or `target/*/herdr-mcp`.
 
-The project provides a LaunchAgent-oriented CLI:
-
-```bash
-ln -sf "$PWD/bin/herdr-mcp" ~/.local/bin/herdr-mcp
-herdr-mcp start
-herdr-mcp status
-herdr-mcp logs
-```
-
-Optional watchdog:
-
-```bash
-herdr-mcp watchdog install
-herdr-mcp watchdog status
-```
-
-The watchdog checks the herdr-mcp runtime. Transient Herdr control-plane errors do not cause aggressive daemon restarts.
-
-### Linux / Windows
-
-The Node runtime supports these platforms, but the repository currently does not provide an equivalent one-command service manager. Keep `node dist/server.js` alive with your normal service mechanism.
+Linux / Windows service packaging is narrower today; keep the release binary on `PATH` and follow platform-specific notes in the current Release assets when a one-command service manager is not yet published for that OS.
 
 ## Step 4: deploy a stable public Edge
 
@@ -220,6 +195,10 @@ http://127.0.0.1:8772/mcp
 ```
 
 using the local static bearer. This path is also useful for separating runtime failures from Edge failures.
+
+## Contributor note: building from this repository
+
+Clone + `npm`/`cargo` workflows remain available for people developing herdr-mcp itself. That contributor path is not the primary end-user install path and must not be required to run the local MCP runtime.
 
 ## What "installed" means
 
