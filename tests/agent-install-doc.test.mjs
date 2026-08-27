@@ -47,6 +47,9 @@ test("Agent install guide makes the bootstrap Token ephemeral and DNS-free", () 
 test("Agent install uses deterministic Cloudflare-safe Worker names and reports the extension directory", () => {
   for (const rel of ["docs/i18n/en/agent-install.md", "docs/i18n/zh-CN/agent-install.md"]) {
     const doc = read(rel);
+    assert.match(doc, /GitHub Releases/);
+    assert.match(doc, /herdr-mcp install/);
+    assert.doesNotMatch(doc, /## 2\.[^\n]*\n[\s\S]*?git clone https:\/\/github\.com\/whshang\/herdr-mcp/);
     assert.match(doc, /scripts\/cloudflare-worker-name\.mjs/);
     assert.match(doc, /WORKER_NAME/);
     assert.match(doc, /ACCOUNT_SUBDOMAIN/);
@@ -62,6 +65,7 @@ test("Agent install uses deterministic Cloudflare-safe Worker names and reports 
     const doc = read(rel);
     assert.match(doc, /scripts\/cloudflare-worker-name\.mjs/);
     assert.match(doc, /WORKER_NAME/);
+    assert.match(doc, /herdr-mcp install/);
   }
 });
 

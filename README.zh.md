@@ -120,6 +120,12 @@ https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-i
 严格按文档完成。本机 runtime 从 GitHub Releases 安装，不要 git clone/npm。首次安装不要创建 Custom Domain、DNS 记录或 Tunnel，只使用 workers.dev。不要回显或提交任何 Token。每个 mutation 后先验证状态再继续。
 ```
 
+该 Edge 流程生成 Cloudflare-safe Worker 名时使用仓库内的确定性 helper：
+
+```bash
+WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
+```
+
 ### 附录：贡献者从源码构建
 
 只有在开发 herdr-mcp 本身时才需要 clone 本仓库。源码构建仍可能使用 Node 工具链处理站点/扩展/Edge 包；那不是最终用户运行 MCP runtime 的主路径。细节见 [安装](docs/i18n/zh-CN/install.md#附录开发者从源码构建)。

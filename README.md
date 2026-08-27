@@ -120,6 +120,12 @@ https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-inst
 Follow it end to end. Install the local runtime from GitHub Releases (not git clone/npm). Do not create a Custom Domain, DNS records or a Tunnel for the first installation; use workers.dev. Do not expose or commit any token. Verify each mutation before continuing.
 ```
 
+The deterministic Worker-name helper used by that Edge flow is:
+
+```bash
+WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
+```
+
 ### Appendix: contributor build from source
 
 Clone this repository only when you are developing herdr-mcp itself. Source builds may still use the Node toolchain for site/extension/Edge packages; that path is not the primary way end users run the MCP runtime. Details live under [Installation](docs/i18n/en/install.md#appendix-developer-from-source).

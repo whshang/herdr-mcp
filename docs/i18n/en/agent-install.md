@@ -38,7 +38,13 @@ While the product is still alpha, keep `update.channel = "preview"` (or leave co
 
 ## 3. Generate local identities without printing secrets
 
-Generate in Agent memory: `HERDR_MCP_TOKEN`, `LINK_SHARED_SECRET`, and a hostname-derived `WORKSTATION_ID` limited to `[A-Za-z0-9_.-]` and 64 chars. Generate `WORKER_NAME` only through a Cloudflare-safe hostname slug: lowercase the hostname, replace every character outside `[a-z0-9-]` with `-`, collapse/trim `-`, prefix `herdr-edge-`, and keep the complete Worker name at or below 63 characters matching `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`. For example `MacBook.local` becomes `herdr-edge-macbook-local`. Use strong randomness such as `openssl rand -hex 32` for secrets; never include secrets in the final report.
+Generate in Agent memory: `HERDR_MCP_TOKEN`, `LINK_SHARED_SECRET`, and a hostname-derived `WORKSTATION_ID` limited to `[A-Za-z0-9_.-]` and 64 chars. Generate `WORKER_NAME` only through the repository helper when a temporary Edge checkout is available; the Agent must not invent its own hostname slug:
+
+```bash
+WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
+```
+
+`WORKER_NAME` and `WORKSTATION_ID` intentionally use different grammars. The helper lowercases the hostname, safely handles every character outside `[a-z0-9-]` (including `.`, `_`, whitespace, and non-ASCII input), collapses/trims `-`, and keeps the complete Worker name at or below 63 characters. The result must match `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`; for example `MacBook.local` becomes `herdr-edge-macbook-local`. Use strong randomness such as `openssl rand -hex 32` for secrets; never include secrets in the final report.
 
 ## 4. Only human pause: Cloudflare API Token
 
@@ -109,7 +115,17 @@ herdr-mcp doctor
 
 Do not recreate a repo-linked `~/.local/bin/herdr-mcp` bridge. Do not point LaunchAgent at a git checkout or `target/*/herdr-mcp`.
 
-Browser extension / Native Messaging remains optional and is not required for the first ChatGPT closed loop. If the human asks for continuity later, follow [Browser continuity](browser-continuity.md) after the runtime doctor is healthy.
+Browser extension / Native Messaging remains optional and is not required for the first ChatGPT closed loop. If the human asks for continuity later, after `herdr-mcp doctor` is healthy:
+
+```bash
+herdr-mcp native-host install
+herdr-mcp native-host status
+# compatibility wrappers still accepted where published:
+bin/herdr-extension-host install
+bin/herdr-extension-host status
+```
+
+Then guide Chrome: open `chrome://extensions`, enable Developer mode, **Load unpacked** only when following the sealed G15 package path or an explicitly requested developer session. Do not treat unpacking `extension/` from a random git checkout as the primary end-user path. See [Browser continuity](browser-continuity.md).
 
 ## 8. macOS persistent Herdr Link
 

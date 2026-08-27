@@ -38,7 +38,13 @@ herdr-mcp update check
 
 ## 3. 在内存中生成身份，不要打印秘密
 
-在 Agent 内存中生成：`HERDR_MCP_TOKEN`、`LINK_SHARED_SECRET`，以及限制在 `[A-Za-z0-9_.-]`、最长 64 字符的 `WORKSTATION_ID`。`WORKER_NAME` 只能用 Cloudflare-safe hostname slug：hostname 小写，`[a-z0-9-]` 以外全部替换为 `-`，压缩/修剪 `-`，前缀 `herdr-edge-`，完整 Worker 名不超过 63 且匹配 `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`。例如 `MacBook.local` → `herdr-edge-macbook-local`。秘密用 `openssl rand -hex 32` 一类强随机；最终报告不得包含秘密。
+在 Agent 内存中生成：`HERDR_MCP_TOKEN`、`LINK_SHARED_SECRET`，以及限制在 `[A-Za-z0-9_.-]`、最长 64 字符的 `WORKSTATION_ID`。有临时 Edge checkout 时，`WORKER_NAME` 只能通过仓库 helper 生成，Agent 不得自造 hostname slug：
+
+```bash
+WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
+```
+
+`WORKER_NAME` 与 `WORKSTATION_ID` 故意使用不同语法。helper 会把 hostname 小写，把 `[a-z0-9-]` 以外字符安全替换，压缩/修剪 `-`，并保证完整 Worker 名不超过 63 且匹配 `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`。例如 `MacBook.local` → `herdr-edge-macbook-local`。秘密用 `openssl rand -hex 32` 一类强随机；最终报告不得包含秘密。
 
 ## 4. 唯一需要人暂停：Cloudflare API Token
 
@@ -109,7 +115,17 @@ herdr-mcp doctor
 
 不要重建指向仓库的 `~/.local/bin/herdr-mcp` bridge。不要把 LaunchAgent 指到 git checkout 或 `target/*/herdr-mcp`。
 
-浏览器扩展 / Native Messaging 仍是可选项，不是第一条 ChatGPT 闭环的必需。若用户之后要连续性，在 runtime doctor 健康后再按 [浏览器连续性](browser-continuity.md) 处理。
+浏览器扩展 / Native Messaging 仍是可选项，不是第一条 ChatGPT 闭环的必需。若用户之后要连续性，在 `herdr-mcp doctor` 健康后：
+
+```bash
+herdr-mcp native-host install
+herdr-mcp native-host status
+# 兼容包装仍可用时：
+bin/herdr-extension-host install
+bin/herdr-extension-host status
+```
+
+再引导 Chrome：打开 `chrome://extensions`，开启开发者模式；仅在已封板的 G15 包路径或用户明确要求的开发者会话里 **Load unpacked**。不要把随便一个 git checkout 里的 `extension/` 当成最终用户主路径。详见 [浏览器连续性](browser-continuity.md)。
 
 ## 8. macOS 持久 Herdr Link
 
