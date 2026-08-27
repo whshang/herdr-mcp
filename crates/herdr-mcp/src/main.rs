@@ -38,6 +38,8 @@ mod state_store;
 mod status;
 mod updater;
 mod updater_store;
+// Wired only from the macOS service manager; keep unit tests compiling on Linux CI.
+#[cfg(any(target_os = "macos", test))]
 mod user_cli;
 mod utility_exec;
 mod workstation;
