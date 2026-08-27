@@ -1,39 +1,16 @@
 ---
 name: files-search
-description: Perform bounded project file reads, directory listing, native text search, and repository image reads with herdr_fs_read, herdr_fs_list, herdr_fs_grep, and herdr_fs_image.
+description: Perform bounded project reads, directory listing, native text search, and image inspection with herdr_fs_read/list/grep/image.
 ---
 
 # Files Search
 
-Own these public tools:
+Own: `herdr_fs_read`, `herdr_fs_list`, `herdr_fs_grep`, `herdr_fs_image`.
 
-```text
-herdr_fs_read
-herdr_fs_list
-herdr_fs_grep
-herdr_fs_image
-```
+Use the smallest scope that answers the question. Prefer targeted grep/list/read over whole-tree or whole-file ingestion; group independent reads into one wave and reuse known roots/paths.
 
-## Read strategy
+Use bounded line/byte windows and narrow subsequent reads from compact results. Treat search truncation as a signal to reduce scope, not to repeat the same broad query. Use literal search unless regex is required; add file globs/match limits when they materially narrow work.
 
-- Use the smallest scope that can answer the question. Prefer targeted grep/list/read over whole-tree or whole-file ingestion.
-- Form a small independent read wave when several facts can be gathered without depending on each other.
-- Reuse known project roots and paths. Do not repeat project discovery for each read.
-- Use bounded line/byte windows, then continue from the next relevant range only when needed.
-- When a compact search result identifies the right files, narrow subsequent reads to those files instead of repeating a broad search.
+`herdr_fs_grep` may use an `rg` fast path or safe fallback; depend on the behavior contract, not a fixed backend. Use `herdr_fs_image` only for targeted visual inspection of images already inside a managed Git root.
 
-## Search
-
-`herdr_fs_grep` owns native project search. The runtime may use an `rg` fast path or a safe fallback; the Skill depends on the behavior contract rather than a fixed backend.
-
-Choose a literal pattern unless regex semantics are required. Use a filename glob and bounded match count when they materially narrow work. Treat truncation as evidence to narrow scope, not as a reason to rerun the same broad search unchanged.
-
-## Images
-
-Use `herdr_fs_image` for images already inside a managed Git root when visual inspection is required. Keep image reads bounded and targeted.
-
-## Safety and evidence
-
-Managed-root, secret-path, symlink, and byte-limit boundaries are runtime-enforced. Reading a Skill does not weaken them.
-
-A read-only investigation is complete when the required facts are supported by specific file/search evidence. It does not require a new worktree or coding-agent delegation solely to perform reads.
+Managed-root, secret-path, symlink, and byte-limit boundaries remain runtime-enforced. Read-only investigation needs specific evidence, not a new worktree or coding-agent merely to perform file IO.

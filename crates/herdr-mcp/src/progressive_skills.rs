@@ -1,6 +1,6 @@
 use crate::agent_visibility::AgentVisibility;
-use crate::skill_dispatch::{CapabilitySnapshot, project_capabilities};
-use serde_json::{Value, json};
+use crate::skill_dispatch::project_capabilities;
+use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -246,14 +246,9 @@ impl ProgressiveSkillService {
         let global_content = GLOBAL_AGENTS.trim();
         let global_digest = Digest::from_content(global_content);
         let catalog = self.catalog();
-        let compact_catalog = catalog
-            .iter()
-            .map(|item| format!("- {}: {}", item.id, item.description))
-            .collect::<Vec<_>>()
-            .join("\n");
         let content = format!(
-            "{}\n\n## Available policy modules\n\n{}\n\n## Load contract\n\nLoad the required capability domains in one call:\n\n```text\nherdr_call(method=\"{}\", params={{\"ids\":[\"files-search\",\"git-repository\"]}})\n```\n\nLoaded Skill text is sticky for the current conversation/context while source identity and digest remain unchanged. A new user turn does not reload it. Refresh live worker/pane/runtime state through inspect/since rather than reloading policy text.",
-            global_content, compact_catalog, LOCAL_LOAD_METHOD
+            "{}\n\n## Progressive load contract\n\nUse the compact `catalog` field to select policy modules. Load all required domains in one call:\n\n```text\nherdr_call(method=\"{}\", params={{\"ids\":[\"files-search\",\"git-repository\"]}})\n```\n\nLoaded text is sticky in the current context while source identity and digest are unchanged. A new user turn does not reload it. Refresh live worker/pane/runtime facts through inspect/since.",
+            global_content, LOCAL_LOAD_METHOD
         );
         json!({
             "ok": true,
@@ -266,7 +261,7 @@ impl ProgressiveSkillService {
                 "digest": global_digest.as_str(),
                 "bytes": global_content.len(),
             },
-            "catalog": catalog.iter().map(descriptor_json).collect::<Vec<_>>(),
+            "catalog": catalog.iter().map(bootstrap_descriptor_json).collect::<Vec<_>>(),
             "load": {
                 "method": LOCAL_LOAD_METHOD,
                 "params": {
@@ -276,7 +271,7 @@ impl ProgressiveSkillService {
                 "sticky": "conversation/task-context until source identity or digest changes, new capability domain, handoff, or explicit refresh",
                 "authorization": "none"
             },
-            "capability_snapshot": capability_snapshot(snapshot),
+            "capability_snapshot": capability_summary(snapshot),
             "bytes": content.len(),
         })
     }
@@ -487,6 +482,18 @@ fn descriptor_json(item: &SkillDescriptor) -> Value {
     })
 }
 
+fn bootstrap_descriptor_json(item: &SkillDescriptor) -> Value {
+    json!({
+        "id": item.id,
+        "description": item.description,
+        "source_identity": item.identity.source_identity,
+        "uri": item.identity.uri,
+        "digest": item.identity.digest.as_str(),
+        "bytes": item.size,
+        "owned_tools": item.owned_tools,
+    })
+}
+
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
@@ -504,47 +511,25 @@ fn load_evidence_json(evidence: &LoadEvidence) -> Value {
     })
 }
 
-fn capability_snapshot(snapshot: &Value) -> Value {
+fn capability_summary(snapshot: &Value) -> Value {
     let visibility = AgentVisibility::from_env();
-    capability_snapshot_json(&project_capabilities(snapshot, &visibility))
-}
-
-fn capability_snapshot_json(snapshot: &CapabilitySnapshot) -> Value {
-    let workers = snapshot
-        .workers
-        .iter()
-        .map(|worker| {
-            json!({
-                "agent_id": worker.agent_id,
-                "kind": worker.kind,
-                "provider": worker.provider,
-                "model": worker.model,
-                "profile": worker.profile,
-                "supports_code_edit": worker.supports_code_edit,
-                "supports_shell": worker.supports_shell,
-                "supports_vision": worker.supports_vision,
-                "reasoning_tier": worker.reasoning_tier,
-                "latency_tier": worker.latency_tier,
-                "cost_tier": worker.cost_tier,
-                "context_tier": worker.context_tier,
-                "interactive_only": worker.interactive_only,
-                "can_run_headless": worker.can_run_headless,
-                "allowed_for_auto_dispatch": worker.allowed_for_auto_dispatch,
-                "current_status": worker.current_status,
-                "current_project": worker.current_project,
-                "cwd": worker.cwd,
-                "pane_id": worker.pane_id,
-                "workspace_id": worker.workspace_id,
-                "interactive_ready": worker.interactive_ready,
-            })
-        })
-        .collect::<Vec<_>>();
+    let snapshot = project_capabilities(snapshot, &visibility);
+    let mut status_counts = Map::new();
+    for worker in &snapshot.workers {
+        let count = status_counts
+            .get(&worker.current_status)
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        status_counts.insert(worker.current_status.clone(), json!(count + 1));
+    }
     json!({
         "source": snapshot.source,
         "revision": snapshot.revision,
-        "workers": workers,
+        "worker_count": snapshot.workers.len(),
         "hidden_workers": snapshot.hidden_workers,
-        "unknown_fields_are_null": true,
+        "status_counts": status_counts,
+        "detail_refresh": "herdr_inspect/herdr_since",
+        "unverified_traits": "unknown; never inferred",
     })
 }
 
@@ -778,21 +763,27 @@ mod tests {
         assert_eq!(result["load"]["method"], LOCAL_LOAD_METHOD);
         let content = result["content"].as_str().unwrap();
         assert!(content.contains("# Herdr Global AGENTS.md"));
-        assert!(content.contains("Available policy modules"));
+        assert!(content.contains("compact `catalog` field"));
         assert!(content.contains("A new user turn does not reload it"));
         assert!(!content.contains("# Files Mutation"));
         assert!(!content.contains("# Agent Dispatch"));
+        assert_eq!(result["capability_snapshot"]["worker_count"], 1);
+        assert_eq!(
+            result["capability_snapshot"]["detail_refresh"],
+            "herdr_inspect/herdr_since"
+        );
     }
 
     #[test]
     fn capability_projection_keeps_unverified_traits_unknown() {
-        let result = capability_snapshot(&snapshot());
-        let worker = &result["workers"][0];
-        assert_eq!(worker["kind"], "pi");
-        assert!(worker["provider"].is_null());
-        assert!(worker["model"].is_null());
-        assert!(worker["supports_vision"].is_null());
-        assert_eq!(worker["current_status"], "idle");
+        let visibility = AgentVisibility::Allow(["pi".to_owned()].into_iter().collect());
+        let result = project_capabilities(&snapshot(), &visibility);
+        let worker = &result.workers[0];
+        assert_eq!(worker.kind.as_deref(), Some("pi"));
+        assert!(worker.provider.is_none());
+        assert!(worker.model.is_none());
+        assert!(worker.supports_vision.is_none());
+        assert_eq!(worker.current_status, "idle");
     }
 
     #[test]

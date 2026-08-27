@@ -850,6 +850,16 @@ mod tests {
     }
 
     #[test]
+    fn progressive_disabled_preserves_legacy_shape_without_new_arguments() {
+        let service = SkillService::new();
+        let result = service.fetch_for_runtime_mode(&json!({}), &json!({"agents": []}), false);
+        assert_eq!(result["ok"], true);
+        assert!(result.get("mode").is_none());
+        assert!(result.get("project_skill").is_some());
+        assert!(result.get("runtime").is_some());
+    }
+
+    #[test]
     fn sha256_is_stable() {
         assert_eq!(
             sha256("abc"),

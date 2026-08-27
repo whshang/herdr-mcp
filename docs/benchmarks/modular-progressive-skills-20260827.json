@@ -5,84 +5,100 @@
     "tool_count": 18,
     "hash": "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8"
   },
-  "token_estimate_note": "approx_tokens_chars4 uses ceil(bytes/4); it is a context-size heuristic, not a tokenizer measurement",
-  "baseline_giant": {
-    "bytes": 21158,
-    "approx_tokens_chars4": 5290,
-    "percent_of_giant": 100.0
-  },
-  "progressive": {
-    "global_agents": {
-      "bytes": 2651,
-      "approx_tokens_chars4": 663,
-      "percent_of_giant": 12.5
-    },
-    "measured_bootstrap": {
-      "bytes": 3775,
-      "approx_tokens_chars4": 944,
-      "percent_of_giant": 17.8,
-      "measurement": "alternate local Rust candidate on 127.0.0.1:19084 with HERDR_MCP_PROGRESSIVE_SKILLS=1; includes compact catalog and live capability projection"
-    },
-    "modules": {
-      "workstation-control": { "bytes": 2115, "approx_tokens_chars4": 529, "percent_of_giant": 10.0 },
-      "files-search": { "bytes": 1817, "approx_tokens_chars4": 455, "percent_of_giant": 8.6 },
-      "files-mutation": { "bytes": 1962, "approx_tokens_chars4": 491, "percent_of_giant": 9.3 },
-      "git-repository": { "bytes": 1677, "approx_tokens_chars4": 420, "percent_of_giant": 7.9 },
-      "execution": { "bytes": 2075, "approx_tokens_chars4": 519, "percent_of_giant": 9.8 },
-      "agent-dispatch": { "bytes": 2557, "approx_tokens_chars4": 640, "percent_of_giant": 12.1 },
-      "development-orchestration": { "bytes": 2575, "approx_tokens_chars4": 644, "percent_of_giant": 12.2 }
-    },
-    "profiles": {
-      "fs-only": {
-        "skills": ["files-search"],
-        "loaded_bytes": 5592,
-        "approx_tokens_chars4": 1398,
-        "percent_of_giant": 26.4,
-        "initial_skill_load_round_trips": 1,
-        "steady_state_skill_load_round_trips_per_tool_call": 0
-      },
-      "exec-only": {
-        "skills": ["execution"],
-        "loaded_bytes": 5850,
-        "approx_tokens_chars4": 1463,
-        "percent_of_giant": 27.6,
-        "initial_skill_load_round_trips": 1,
-        "steady_state_skill_load_round_trips_per_tool_call": 0
-      },
-      "agent-delegation": {
-        "skills": ["workstation-control", "agent-dispatch"],
-        "loaded_bytes": 8447,
-        "approx_tokens_chars4": 2112,
-        "percent_of_giant": 39.9,
-        "initial_skill_load_round_trips": 1,
-        "steady_state_skill_load_round_trips_per_tool_call": 0
-      },
-      "multi-line-development": {
-        "skills": ["workstation-control", "agent-dispatch", "development-orchestration", "git-repository", "files-mutation"],
-        "loaded_bytes": 14661,
-        "approx_tokens_chars4": 3666,
-        "percent_of_giant": 69.3,
-        "initial_skill_load_round_trips": 1,
-        "steady_state_skill_load_round_trips_per_tool_call": 0
-      }
-    },
+  "method": {
+    "candidate": "Rust alternate local candidate on 127.0.0.1:19084",
+    "production_runtime_replaced": false,
+    "progressive_flag": "HERDR_MCP_PROGRESSIVE_SKILLS=1",
+    "network_skill_refresh": false,
+    "metric": "model-visible tools/call content[0].text UTF-8 bytes",
+    "token_estimate": "ceil(bytes/4); heuristic only, not a tokenizer measurement",
     "round_trip_model": {
       "bootstrap_calls_per_new_context": 1,
-      "initial_domain_load_calls": "0-1 batched call per classified task profile",
+      "initial_domain_load_calls": "1 batched call for the classified profile",
       "new_capability_domain_calls": "0-1 additional batched call",
+      "steady_state_skill_load_round_trips_per_tool_call": 0,
       "reload_on_new_user_turn": false,
       "reload_on_live_capability_refresh": false
     }
   },
+  "baseline": {
+    "giant_policy_asset": {
+      "bytes": 21158,
+      "approx_tokens_chars4": 5290
+    },
+    "legacy_full_candidate_without_native_appendix": {
+      "tool_text_bytes": 23511,
+      "content_bytes": 22200,
+      "project_skill_present": true,
+      "runtime_present": true
+    }
+  },
+  "progressive": {
+    "global_agents": {
+      "bytes": 1806,
+      "approx_tokens_chars4": 452,
+      "percent_of_giant_asset": 8.5
+    },
+    "bootstrap": {
+      "tool_text_bytes": 5599,
+      "content_bytes": 2231,
+      "approx_tokens_chars4": 1400,
+      "percent_of_giant_asset": 26.5,
+      "catalog_count": 7,
+      "catalog_bytes": 2442,
+      "capability_summary_bytes": 222,
+      "capability_detail_refresh": "herdr_inspect/herdr_since"
+    },
+    "profiles": {
+      "fs-only": {
+        "skills": ["files-search"],
+        "load_tool_text_bytes": 1547,
+        "skill_body_bytes": 1140,
+        "total_context_bytes": 7146,
+        "approx_tokens_chars4": 1787,
+        "percent_of_giant_asset": 33.8,
+        "reduction_vs_giant_asset_percent": 66.2,
+        "initial_skill_load_round_trips": 1
+      },
+      "exec-only": {
+        "skills": ["execution"],
+        "load_tool_text_bytes": 1604,
+        "skill_body_bytes": 1203,
+        "total_context_bytes": 7203,
+        "approx_tokens_chars4": 1801,
+        "percent_of_giant_asset": 34.0,
+        "reduction_vs_giant_asset_percent": 66.0,
+        "initial_skill_load_round_trips": 1
+      },
+      "agent-delegation": {
+        "skills": ["workstation-control", "agent-dispatch"],
+        "load_tool_text_bytes": 3914,
+        "skill_body_bytes": 3157,
+        "total_context_bytes": 9513,
+        "approx_tokens_chars4": 2379,
+        "percent_of_giant_asset": 45.0,
+        "reduction_vs_giant_asset_percent": 55.0,
+        "initial_skill_load_round_trips": 1
+      },
+      "multi-line-development": {
+        "skills": ["workstation-control", "agent-dispatch", "development-orchestration", "git-repository", "files-mutation"],
+        "load_tool_text_bytes": 9185,
+        "skill_body_bytes": 7440,
+        "total_context_bytes": 14784,
+        "approx_tokens_chars4": 3696,
+        "percent_of_giant_asset": 69.9,
+        "reduction_vs_giant_asset_percent": 30.1,
+        "initial_skill_load_round_trips": 1
+      }
+    }
+  },
   "candidate_smoke": {
-    "alternate_port": 19084,
-    "production_runtime_replaced": false,
-    "catalog_count": 7,
     "batched_load": {
-      "ids": ["files-search", "git-repository"],
-      "first_cache_hit": [false, false],
-      "second_cache_hit": [true, true],
-      "authorization": "none"
+      "supported": true,
+      "stable_request_order": true,
+      "authorization": "none",
+      "first_files_search_cache_hit": false,
+      "repeat_files_search_cache_hit": true
     },
     "unknown_local_method": {
       "ok": false,
@@ -109,7 +125,8 @@
       "state_sequence": ["done", "working", "done"],
       "duplicate_submission": false,
       "audit_result": "PASS",
-      "must_fix": []
+      "must_fix": [],
+      "scope_note": "optional model/edit/vision traits were unknown; the task required none of them"
     }
   }
 }

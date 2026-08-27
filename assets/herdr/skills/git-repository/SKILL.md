@@ -1,39 +1,18 @@
 ---
 name: git-repository
-description: Read and reason about deterministic repository status, diff, log, branch, and worktree facts through herdr_git and native Git lifecycle methods when needed.
+description: Read deterministic Git facts and manage branch/worktree lifecycle evidence through herdr_git plus exact native lifecycle methods when required.
 ---
 
 # Git Repository
 
-Own this public tool:
+Own: `herdr_git`.
 
-```text
-herdr_git
-```
+Use `herdr_git` directly for status, diff, and log; do not delegate simple Git queries. Prefer bounded facts: branch/HEAD, dirty counts, changed paths, focused diff, and relevant history.
 
-## Deterministic Git facts
+For branch/worktree lifecycle beyond `herdr_git`, discover the exact native method once with `herdr_methods`, then call it with explicit repository/worktree identity.
 
-Use `herdr_git` directly for status, diff, and log. Do not delegate simple Git queries to a coding agent.
+A development worktree represents an active mutation lane. Before create/rebase/merge/remove/reclaim, verify repository root, branch/HEAD, dirty state, active ownership, and branch disposition. Preserve dirty, unmerged, active, or ownership-unclear worktrees.
 
-Prefer compact facts first: branch/HEAD, dirty counts, changed paths, focused diff, and bounded history. Narrow to a specific path when a repository-wide diff is larger than the decision requires.
+Capture enough before/after facts to prove integration affected the intended branch without discarding unrelated changes. Verify final HEAD/status and relevant diff/log relation.
 
-## Branch and worktree lifecycle
-
-When branch/worktree operations are required beyond `herdr_git`, discover the exact live native method once through `herdr_methods`, then use `herdr_call` with explicit repository/worktree identity.
-
-A worktree represents an active independent mutation lane. Read-only investigation, review, grep, and ordinary tests do not require a new worktree.
-
-Before creating, rebasing, merging, removing, or reclaiming a worktree, verify:
-
-- repository root and current branch/HEAD;
-- dirty state;
-- active agent/lane ownership;
-- whether the branch is merged, still active, or explicitly abandoned.
-
-Preserve dirty, unmerged, active, or ownership-unclear worktrees.
-
-## Merge/rebase evidence
-
-Capture enough before/after Git facts to prove the operation affected the intended branch and did not discard unrelated changes. After integration, verify HEAD, status, and the relevant diff/log relationship.
-
-Runtime release generations under `~/.config/herdr-mcp/releases/**` are not development worktrees and never participate in development worktree cleanup.
+`~/.config/herdr-mcp/releases/**` is runtime-generation state and never participates in development-worktree cleanup.

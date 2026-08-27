@@ -8,6 +8,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 
 function parseArgs(argv) {
   let bootstrapBytes = null;
+  let loadBytes = null;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--bootstrap-bytes") {
@@ -19,9 +20,30 @@ function parseArgs(argv) {
       index += 1;
       continue;
     }
+    if (arg === "--load-bytes-json") {
+      const raw = argv[index + 1];
+      if (!raw) throw new Error("--load-bytes-json requires a JSON object");
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (error) {
+        throw new Error(`--load-bytes-json must be valid JSON: ${error.message}`);
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("--load-bytes-json requires a JSON object");
+      }
+      for (const [name, value] of Object.entries(parsed)) {
+        if (!Number.isSafeInteger(value) || value < 0) {
+          throw new Error(`--load-bytes-json ${name} must be a non-negative integer`);
+        }
+      }
+      loadBytes = parsed;
+      index += 1;
+      continue;
+    }
     throw new Error(`unknown argument: ${arg}`);
   }
-  return { bootstrapBytes };
+  return { bootstrapBytes, loadBytes };
 }
 
 async function text(relativePath) {
@@ -44,7 +66,10 @@ function metric(byteCount, giantBytes) {
   };
 }
 
-const { bootstrapBytes: measuredBootstrapBytes } = parseArgs(process.argv.slice(2));
+const {
+  bootstrapBytes: measuredBootstrapBytes,
+  loadBytes: measuredLoadBytes,
+} = parseArgs(process.argv.slice(2));
 const giant = await text("assets/herdr-mcp-SKILL.md");
 const globalAgents = (await text("assets/herdr/AGENTS.md")).trim();
 
@@ -83,10 +108,17 @@ const profileMetrics = {};
 
 for (const [name, ids] of Object.entries(profiles)) {
   const skillBytes = ids.reduce((total, id) => total + moduleBytes[id], 0);
+  const loadToolTextBytes = measuredLoadBytes?.[name] ?? skillBytes;
   profileMetrics[name] = {
     skills: ids,
-    skill_bytes: skillBytes,
-    loaded: metric(bootstrapBytes + skillBytes, giantBytes),
+    skill_body: metric(skillBytes, giantBytes),
+    load_tool_text: {
+      source: measuredLoadBytes?.[name] === undefined
+        ? "skill-body fallback; wrapper metadata excluded"
+        : "measured candidate model-visible tool text",
+      ...metric(loadToolTextBytes, giantBytes),
+    },
+    total_context: metric(bootstrapBytes + loadToolTextBytes, giantBytes),
     initial_skill_load_round_trips: ids.length > 0 ? 1 : 0,
     steady_state_skill_load_round_trips_per_tool_call: 0,
   };
@@ -97,7 +129,9 @@ const report = {
   baseline_giant: metric(giantBytes, giantBytes),
   global_agents: metric(globalBytes, giantBytes),
   bootstrap: {
-    source: measuredBootstrapBytes === null ? "global-only fallback" : "measured candidate value",
+    source: measuredBootstrapBytes === null
+      ? "global-only fallback; bootstrap wrapper metadata excluded"
+      : "measured candidate model-visible tool text",
     ...metric(bootstrapBytes, giantBytes),
   },
   modules: Object.fromEntries(
