@@ -12,6 +12,9 @@ const DEFAULT_LOG_COUNT: u64 = 20;
 const MAX_LOG_COUNT: u64 = 100;
 const TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_COMPACT_AFTER: usize = 24;
+const DIFF_COMPACT_AFTER_FILES: usize = 8;
+const DIFF_COMPACT_AFTER_BYTES: usize = 8192;
+const LOG_COMPACT_AFTER: usize = 40;
 
 pub fn run(snapshot: &Value, args: &Value) -> Value {
     let root_input = match required_str(args, "root") {
@@ -101,6 +104,30 @@ pub fn run(snapshot: &Value, args: &Value) -> Value {
             output.insert("compacted".to_owned(), json!(true));
         }
     }
+    if action == "diff"
+        && result.exit_code == 0
+        && !result.truncated
+        && let Some(compact) = compact_git_diff(&result.stdout)
+    {
+        output.insert("counts".to_owned(), compact.counts);
+        if compact.files > DIFF_COMPACT_AFTER_FILES
+            || result.stdout.len() > DIFF_COMPACT_AFTER_BYTES
+        {
+            output.insert("output".to_owned(), json!(compact.grouped));
+            output.insert("compacted".to_owned(), json!(true));
+        }
+    }
+    if action == "log"
+        && result.exit_code == 0
+        && !result.truncated
+        && let Some(compact) = compact_git_log(&result.stdout)
+    {
+        output.insert("counts".to_owned(), compact.counts);
+        if compact.commits > LOG_COMPACT_AFTER {
+            output.insert("output".to_owned(), json!(compact.grouped));
+            output.insert("compacted".to_owned(), json!(true));
+        }
+    }
     if !result.stderr.is_empty() {
         output.insert("stderr".to_owned(), json!(result.stderr));
     }
@@ -186,6 +213,242 @@ fn compact_git_status(stdout: &str) -> Option<StatusCompact> {
         grouped,
         files: entries.len(),
     })
+}
+
+struct DiffFile {
+    path: String,
+    hunks: usize,
+    insertions: usize,
+    deletions: usize,
+    binary: bool,
+}
+
+struct DiffCompact {
+    counts: Value,
+    grouped: String,
+    files: usize,
+}
+
+fn compact_git_diff(stdout: &str) -> Option<DiffCompact> {
+    let mut files = Vec::<DiffFile>::new();
+    let mut current: Option<DiffFile> = None;
+    let mut in_hunk = false;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some(file) = current.take() {
+                files.push(file);
+            }
+            current = Some(DiffFile {
+                path: parse_diff_git_b_path(rest),
+                hunks: 0,
+                insertions: 0,
+                deletions: 0,
+                binary: false,
+            });
+            in_hunk = false;
+            continue;
+        }
+        let Some(file) = current.as_mut() else {
+            continue;
+        };
+        if line.starts_with("@@ ") {
+            file.hunks += 1;
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk {
+            if let Some(path) = line.strip_prefix("+++ ") {
+                let path = path.split('\t').next().unwrap_or(path).trim();
+                if path != "/dev/null" {
+                    file.path = strip_diff_prefix(&decode_git_path(path));
+                }
+                continue;
+            }
+            if line.starts_with("--- ") {
+                continue;
+            }
+        }
+        if line.starts_with("Binary files ") {
+            file.binary = true;
+            continue;
+        }
+        if line.starts_with('+') {
+            file.insertions += 1;
+        } else if line.starts_with('-') {
+            file.deletions += 1;
+        }
+    }
+    if let Some(file) = current {
+        files.push(file);
+    }
+    if files.is_empty() {
+        return None;
+    }
+
+    let insertions: usize = files.iter().map(|file| file.insertions).sum();
+    let deletions: usize = files.iter().map(|file| file.deletions).sum();
+    let hunks: usize = files.iter().map(|file| file.hunks).sum();
+
+    let mut groups = std::collections::BTreeMap::<String, Vec<&DiffFile>>::new();
+    for file in &files {
+        let dir = match file.path.rsplit_once('/') {
+            Some((dir, _)) => dir.to_owned(),
+            None => ".".to_owned(),
+        };
+        groups.entry(dir).or_default().push(file);
+    }
+
+    let mut grouped = String::new();
+    for (dir, dir_files) in &groups {
+        grouped.push_str(&format!("{dir} ({})\n", dir_files.len()));
+        for file in dir_files {
+            let name = file
+                .path
+                .rsplit_once('/')
+                .map(|(_, name)| name)
+                .unwrap_or(file.path.as_str());
+            if file.binary {
+                grouped.push_str(&format!(" {name}  binary\n"));
+            } else {
+                grouped.push_str(&format!(
+                    " {name}  +{}/-{}  {} hunks\n",
+                    file.insertions, file.deletions, file.hunks
+                ));
+            }
+        }
+    }
+
+    Some(DiffCompact {
+        counts: json!({
+            "files": files.len(),
+            "insertions": insertions,
+            "deletions": deletions,
+            "hunks": hunks,
+        }),
+        grouped,
+        files: files.len(),
+    })
+}
+
+fn parse_diff_git_b_path(rest: &str) -> String {
+    let token = if let Some(idx) = rest.rfind(" \"b/") {
+        rest[idx + 1..].trim()
+    } else if let Some(idx) = rest.rfind(" b/") {
+        rest[idx + 1..].trim()
+    } else {
+        rest.trim()
+    };
+    strip_diff_prefix(&decode_git_path(token))
+}
+
+fn decode_git_path(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        unescape_c_quoted(&raw[1..raw.len() - 1])
+    } else {
+        raw.to_owned()
+    }
+}
+
+fn unescape_c_quoted(input: &str) -> String {
+    let mut output = String::new();
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => output.push('\n'),
+            Some('t') => output.push('\t'),
+            Some('r') => output.push('\r'),
+            Some('"') => output.push('"'),
+            Some('\\') => output.push('\\'),
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+    output
+}
+
+fn strip_diff_prefix(path: &str) -> String {
+    path.strip_prefix("b/")
+        .or_else(|| path.strip_prefix("a/"))
+        .unwrap_or(path)
+        .to_owned()
+}
+
+struct LogCompact {
+    counts: Value,
+    grouped: String,
+    commits: usize,
+}
+
+fn compact_git_log(stdout: &str) -> Option<LogCompact> {
+    let mut commits = Vec::<(String, String)>::new();
+    for line in stdout.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let (sha, subject) = parse_oneline_log(line)?;
+        commits.push((sha, subject));
+    }
+    if commits.is_empty() {
+        return None;
+    }
+
+    let mut grouped = String::new();
+    for (sha, subject) in &commits {
+        grouped.push_str(sha);
+        if !subject.is_empty() {
+            grouped.push(' ');
+            grouped.push_str(subject);
+        }
+        grouped.push('\n');
+    }
+
+    Some(LogCompact {
+        counts: json!({ "commits": commits.len() }),
+        grouped,
+        commits: commits.len(),
+    })
+}
+
+fn parse_oneline_log(line: &str) -> Option<(String, String)> {
+    let (sha, rest) = match line.split_once(' ') {
+        Some((sha, rest)) => (sha, rest.trim()),
+        None => (line, ""),
+    };
+    if sha.len() < 4 || !sha.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let subject = if let Some(inner) = decoration_inner(rest) {
+        rest[inner.len() + 2..].trim().to_owned()
+    } else {
+        rest.to_owned()
+    };
+    Some((sha.to_owned(), subject))
+}
+
+fn decoration_inner(rest: &str) -> Option<&str> {
+    let rest = rest.strip_prefix('(')?;
+    let end = rest.find(')')?;
+    let inner = &rest[..end];
+    if inner.contains("HEAD")
+        || inner.contains(" -> ")
+        || inner.contains("tag:")
+        || inner.contains("refs/")
+        || inner.contains(", ")
+        || inner.starts_with("origin/")
+    {
+        Some(inner)
+    } else {
+        None
+    }
 }
 
 pub fn file_dirty(root: &Path, file: &Path) -> Result<bool, String> {
@@ -670,6 +933,363 @@ mod tests {
 
         let dirty = first_dirty_file(&root, std::slice::from_ref(&renamed)).unwrap();
         assert_eq!(dirty, Some(fs::canonicalize(renamed).unwrap()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("herdr-mcp-{label}-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn git_init(root: &Path) {
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", "user.name", "Herdr Test"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", "user.email", "herdr@example.invalid"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn git_commit(root: &Path, message: &str) {
+        assert!(
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-q", "--allow-empty", "-m", message])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn snapshot_for(root: &Path) -> Value {
+        json!({"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}], "agents": []})
+    }
+
+    #[test]
+    fn compact_git_diff_counts_files_and_hunks() {
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
+index 1111111..2222222 100644
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,3 +1,4 @@
+ context
+-removed
++added
++also
+diff --git a/docs/x.md b/docs/x.md
+index 3333333..4444444 100644
+--- a/docs/x.md
++++ b/docs/x.md
+@@ -1 +1 @@
+-old
++new
+";
+        let compact = compact_git_diff(diff).unwrap();
+        assert_eq!(compact.files, 2);
+        assert_eq!(compact.counts["insertions"], 3);
+        assert_eq!(compact.counts["deletions"], 2);
+        assert_eq!(compact.counts["hunks"], 2);
+        assert!(compact.grouped.contains("src (1)"));
+        assert!(compact.grouped.contains("a.rs"));
+        assert!(compact.grouped.contains("+2/-1"));
+        assert!(!compact.grouped.contains("context"));
+    }
+
+    #[test]
+    fn compact_git_diff_counts_hunk_lines_that_look_like_headers() {
+        let diff = "\
+diff --git a/sample.txt b/sample.txt
+index 1111111..2222222 100644
+--- a/sample.txt
++++ b/sample.txt
+@@ -1,2 +1,2 @@
+ context
+--- removed
++++ generated
+";
+        let compact = compact_git_diff(diff).unwrap();
+        assert_eq!(compact.counts["insertions"], 1);
+        assert_eq!(compact.counts["deletions"], 1);
+        assert_eq!(compact.counts["hunks"], 1);
+        assert!(compact.grouped.contains("sample.txt"));
+        assert!(compact.grouped.contains("+1/-1"));
+    }
+
+    #[test]
+    fn compact_git_diff_decodes_c_quoted_paths() {
+        let diff = r#"diff --git "a/src/a\tb.txt" "b/src/a\tb.txt"
+index 1111111..2222222 100644
+--- "a/src/a\tb.txt"
++++ "b/src/a\tb.txt"
+@@ -1 +1 @@
+-old
++new
+"#;
+        let compact = compact_git_diff(diff).unwrap();
+        assert_eq!(compact.files, 1);
+        assert!(compact.grouped.contains("src (1)"));
+        assert!(compact.grouped.contains("a\tb.txt"));
+        assert!(!compact.grouped.contains("a/tb.txt"));
+        assert!(!compact.grouped.contains("b/src"));
+    }
+
+    #[test]
+    fn compact_git_log_strips_decorations() {
+        let log = "\
+abc1234 (HEAD -> main, origin/main) Fix the thing
+def5678 (tag: v1.0.0) Release
+aaa1111 (api) preserve this prefix
+";
+        let compact = compact_git_log(log).unwrap();
+        assert_eq!(compact.commits, 3);
+        assert_eq!(compact.counts["commits"], 3);
+        assert!(compact.grouped.contains("abc1234 Fix the thing"));
+        assert!(compact.grouped.contains("def5678 Release"));
+        assert!(
+            compact
+                .grouped
+                .contains("aaa1111 (api) preserve this prefix")
+        );
+        assert!(!compact.grouped.contains("HEAD"));
+        assert!(!compact.grouped.contains("tag:"));
+    }
+
+    #[test]
+    fn small_git_diff_keeps_raw_hunk_body() {
+        let root = unique_temp_dir("git-diff-small");
+        git_init(&root);
+        fs::write(
+            root.join("keep.txt"),
+            "line one\nKEEP_HUNK_BODY\nline three\n",
+        )
+        .unwrap();
+        git_commit(&root, "baseline");
+        fs::write(
+            root.join("keep.txt"),
+            "line one\nKEEP_HUNK_BODY\nline three\nadded line\n",
+        )
+        .unwrap();
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "diff", "max_bytes": 65536}),
+        );
+        assert_eq!(result["ok"], true);
+        assert!(result.get("compacted").is_none());
+        assert_eq!(result["counts"]["files"], 1);
+        let output = result["output"].as_str().unwrap();
+        assert!(output.contains("KEEP_HUNK_BODY"));
+        assert!(output.contains("@@"));
+        assert!(output.contains("+added line"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn large_git_diff_compacts_to_grouped_listing() {
+        let root = unique_temp_dir("git-diff-large");
+        git_init(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        for index in 0..6 {
+            fs::write(
+                root.join("src").join(format!("f{index}.txt")),
+                format!("base-{index}\n"),
+            )
+            .unwrap();
+        }
+        for index in 0..4 {
+            fs::write(
+                root.join("docs").join(format!("d{index}.txt")),
+                format!("doc-{index}\n"),
+            )
+            .unwrap();
+        }
+        git_commit(&root, "baseline");
+        for index in 0..6 {
+            fs::write(
+                root.join("src").join(format!("f{index}.txt")),
+                format!("changed-{index}\nCONTEXT_SHOULD_DROP\n"),
+            )
+            .unwrap();
+        }
+        for index in 0..4 {
+            fs::write(
+                root.join("docs").join(format!("d{index}.txt")),
+                format!("updated-{index}\n"),
+            )
+            .unwrap();
+        }
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "diff", "max_bytes": 65536}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["compacted"], true);
+        assert_eq!(result["counts"]["files"], 10);
+        let output = result["output"].as_str().unwrap();
+        assert!(output.contains("src (6)"));
+        assert!(output.contains("docs (4)"));
+        assert!(output.contains("f0.txt"));
+        assert!(output.contains("d0.txt"));
+        assert!(!output.contains("CONTEXT_SHOULD_DROP"));
+        assert!(!output.contains("@@"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn large_single_file_git_diff_compacts_by_size() {
+        let root = unique_temp_dir("git-diff-bytes");
+        git_init(&root);
+        let mut original = String::new();
+        let mut changed = String::new();
+        for index in 0..400 {
+            original.push_str(&format!("line {index}\n"));
+            changed.push_str(&format!("changed {index}\n"));
+        }
+        fs::write(root.join("big.txt"), original).unwrap();
+        git_commit(&root, "baseline");
+        fs::write(root.join("big.txt"), changed).unwrap();
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "diff", "max_bytes": 65536}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["compacted"], true);
+        assert_eq!(result["counts"]["files"], 1);
+        assert!(result["counts"]["insertions"].as_u64().unwrap() > 0);
+        let output = result["output"].as_str().unwrap();
+        assert!(output.contains("big.txt"));
+        assert!(!output.contains("changed 0"));
+        assert!(!output.contains("@@"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn truncated_git_diff_skips_compact() {
+        let root = unique_temp_dir("git-diff-trunc");
+        git_init(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        for index in 0..10 {
+            fs::write(
+                root.join("src").join(format!("f{index}.txt")),
+                format!("base-{index}\n"),
+            )
+            .unwrap();
+        }
+        git_commit(&root, "baseline");
+        for index in 0..10 {
+            fs::write(
+                root.join("src").join(format!("f{index}.txt")),
+                format!("changed-{index}\n"),
+            )
+            .unwrap();
+        }
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "diff", "max_bytes": 64}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["truncated"], true);
+        assert!(result.get("compacted").is_none());
+        assert!(result.get("counts").is_none());
+        assert!(!result["output"].as_str().unwrap().contains("src ("));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_log_attaches_counts_without_compacting_default() {
+        let root = unique_temp_dir("git-log-small");
+        git_init(&root);
+        for index in 0..25 {
+            git_commit(&root, &format!("commit-{index}"));
+        }
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "log", "max_bytes": 65536}),
+        );
+        assert_eq!(result["ok"], true);
+        assert!(result.get("compacted").is_none());
+        assert_eq!(result["counts"]["commits"], 20);
+        let output = result["output"].as_str().unwrap();
+        assert!(output.contains("commit-24"));
+        assert!(!output.contains("commit-0"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_log_compacts_when_many_commits() {
+        let root = unique_temp_dir("git-log-large");
+        git_init(&root);
+        git_commit(&root, "(api) preserve this prefix");
+        for index in 0..49 {
+            git_commit(&root, &format!("commit-{index}"));
+        }
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "log", "max_count": 50, "max_bytes": 65536}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["compacted"], true);
+        assert_eq!(result["counts"]["commits"], 50);
+        let output = result["output"].as_str().unwrap();
+        assert!(output.contains("commit-0"));
+        assert!(output.contains("commit-48"));
+        assert!(output.contains("(api) preserve this prefix"));
+        assert!(!output.contains("(HEAD"));
+        let first = output.lines().next().unwrap();
+        let sha = first.split_whitespace().next().unwrap();
+        assert!(sha.chars().all(|ch| ch.is_ascii_hexdigit()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn truncated_git_log_skips_compact() {
+        let root = unique_temp_dir("git-log-trunc");
+        git_init(&root);
+        for index in 0..50 {
+            git_commit(&root, &format!("commit-{index}"));
+        }
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "log", "max_count": 50, "max_bytes": 64}),
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["truncated"], true);
+        assert!(result.get("compacted").is_none());
+        assert!(result.get("counts").is_none());
         fs::remove_dir_all(root).unwrap();
     }
 }
