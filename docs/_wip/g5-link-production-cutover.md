@@ -244,6 +244,19 @@ Developer workstation: **done** on alpha.13 (see evidence above). Remaining:
 - [ ] Longer candidate Edge soak matrix (heartbeat/cancel/long-request) on edge-prod
 - [ ] Clean-machine confirmation of G3 user CLI seal (shared with G3/G18)
 
+
+### Deliberate Node rollback UAT (2026-08-27T15:52Z)
+
+Independent Shell, alpha.14 release binary for `--rollback`, then alpha.13 `runtime/current` for re-cut:
+
+1. Pre: `production_owner=rust`, link-prod PID 6131, backups present (Node ProgramArguments).
+2. `HERDR_LINK_CUTOVER_I_UNDERSTAND=1 <alpha.14-bin> link cutover --rollback` → `ok=true` (restore+bootout+bootstrap).
+3. Node window: PID 80435 `node .../macos-daemon.js`; MCP `8772` + Edge HTTPS ESTABLISHED; log `link online`.
+4. Immediate re-cut: `HERDR_LINK_CUTOVER_I_UNDERSTAND=1 runtime/current link cutover --execute` → `ok=true` VERIFY.
+5. Rust again: PID 80664 `runtime/current/herdr-mcp link run`; MCP+Edge TCP; `tools/list` **18**; health alpha.13 `production_ready=false`.
+6. Backups retained. Seal evidence recorded under `~/.config/herdr-mcp/seals/evidence/{dual,rollback}-uat.json`.
+7. `link seal --execute` deferred until alpha.14 is the installed runtime (health/seal readers live in binary).
+
 ### Candidate contract fix evidence (2026-08-27)
 
 Diagnosis (independent Shell):

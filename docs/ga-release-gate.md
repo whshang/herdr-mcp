@@ -291,7 +291,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G2 | **PARTIAL** | Rust Release + attestation/manifest 链已存在；但 README / `docs/i18n/en/install.md` 主路径仍是 `git clone` + `npm ci` + Node.js 20+ |
 | G3 | **PARTIAL** | 顶层 CLI + entrypoint 已合入；**本机 live symlink 已迁到 `runtime/current`**。仍 PARTIAL：缺干净机 / 正式多机 seal |
 | G4 | **PARTIAL** | `service install` + generation/health/rollback 代码存在；正式文档未给出 binary → `herdr-mcp install` 干净机路径 |
-| G5 | **PARTIAL** | `link-prod` Rust；candidate edge-prod soak 在线；仍缺 seal + 故意 rollback UAT + 干净机（seal 前不得标 PASS） |
+| G5 | **PARTIAL** | `link-prod` Rust；candidate edge-prod soak 在线；rollback UAT PASS；仍缺 alpha.14 apply + `link seal --execute` + 干净机（seal 前不得标 PASS） |
 | G6 | **PARTIAL** | 嵌入契约 epoch 2 / 18 tools（hash 冻结）；真实 ChatGPT 与全路径 production smoke 仍属 alpha 验收 |
 | G7 | **PARTIAL** | Edge→Link→runtime 在本机已走 Rust `link-prod`；canary 仍 Node；缺 seal 与多机 |
 | G8 | **PARTIAL** | Live alpha.13 `doctor` 8 行 `LAYER`；`LAYER link owned production_owner=rust` / `production_ready_eligible=false`；`remote-probe=skipped` |
@@ -322,7 +322,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 按 2026-08-27 live alpha.13 / candidate edge-prod soak 证据排序：
 
 1. **G5 seal — `production_ready` 可审计封印**（alpha.14 `link seal`）：rollback UAT 后再 `--execute`；在此之前保持 `production_ready=false`。
-2. **G5 follow-ups**：故意 Node `link cutover --rollback` UAT → 立即 re-cut Rust；candidate edge-prod soak 加深。
+2. **G5 follow-ups**：alpha.14 apply → `link seal --execute`；candidate edge-prod soak 加深。
 3. **G1 — 单一正式产品版本（退出 alpha）**。
 4. **G3 formal seal — 干净机 / 多机确认**。
 5. **G18 — 干净机 install UAT**。
