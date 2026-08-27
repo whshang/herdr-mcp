@@ -175,6 +175,14 @@ export class PendingRequestRegistry {
     return this.pending.get(requestId);
   }
 
+  /** Remove an active entry without recording a completion. Defensive escape
+   * hatch for entries that must never enter the durable completion ledger. */
+  removeActive(requestId: string): PendingRequest | undefined {
+    const entry = this.pending.get(requestId);
+    if (entry) this.pending.delete(requestId);
+    return entry;
+  }
+
   markSent(requestId: string, atMs: number): PendingRequest | undefined {
     const p = this.pending.get(requestId);
     if (!p) return undefined;
@@ -307,6 +315,16 @@ export class PendingRequestRegistry {
   activeCount(): number {
     let n = 0;
     for (const p of this.pending.values()) if (p.state !== "settled") n++;
+    return n;
+  }
+
+  /** Active durable work that has not already passed its deadline. Useful for
+   * admission control where stale persisted rows must not starve fresh reads. */
+  liveCount(now: number): number {
+    let n = 0;
+    for (const p of this.pending.values()) {
+      if (p.state !== "settled" && p.deadlineMs > now) n++;
+    }
     return n;
   }
 

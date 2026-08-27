@@ -209,6 +209,18 @@ test("registry: completed TTL expiry + drop", () => {
   assert.equal(r.completedFor("x1"), undefined);
 });
 
+test("registry: liveCount excludes expired durable backlog", () => {
+  const limits = makeLimits();
+  let now = 1000;
+  const r = new PendingRequestRegistry({ limits, now: () => now });
+  r.add(pendingReq({ requestId: "expired", deadlineMs: 900 }));
+  r.add(pendingReq({ requestId: "live", deadlineMs: 1100 }));
+  assert.equal(r.activeCount(), 2);
+  assert.equal(r.liveCount(now), 1);
+  now = 1200;
+  assert.equal(r.liveCount(now), 0);
+});
+
 test("limits: defaults + request timeout clamp", () => {
   const l = makeLimits();
   assert.equal(l.maxPendingRequests, 256);
@@ -223,6 +235,9 @@ test("limits: defaults + request timeout clamp", () => {
 test("limits: classifyOp only marks known-read ops retryable", () => {
   assert.equal(classifyOp("herdr_inspect"), "read");
   assert.equal(classifyOp("herdr_fs_list"), "read");
+  assert.equal(classifyOp("herdr_fs_image"), "read");
+  assert.equal(classifyOp("herdr_git"), "read");
+  assert.equal(classifyOp("herdr_exec_read"), "read");
   assert.equal(classifyOp("herdr_exec"), "mutating");
   assert.equal(classifyOp("herdr_prompt"), "mutating");
   assert.equal(classifyOp("some_mystery_tool"), "mutating");
