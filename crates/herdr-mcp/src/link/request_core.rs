@@ -245,6 +245,17 @@ impl PendingRequests {
     /// Claim and remove a timeout if it is still the active pending slot.
     pub fn timeout(&mut self, request_id: &str) -> Option<PendingSlot> {
         let slot = self.slots.get(request_id)?.clone();
+        self.timeout_if_same(&slot)
+    }
+
+    /// Claim and remove a timeout only when the timer belongs to this exact
+    /// slot. A stale timer from an earlier request-id incarnation must never
+    /// settle a newer request that reused the same opaque id.
+    pub fn timeout_if_same(&mut self, expected: &PendingSlot) -> Option<PendingSlot> {
+        let slot = self.slots.get(&expected.request.request_id)?.clone();
+        if !slot.same_identity(expected) {
+            return None;
+        }
         if !slot.claim_settle() {
             return None;
         }
@@ -433,5 +444,18 @@ mod tests {
             "already-settled late result is not settled twice"
         );
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn stale_timeout_cannot_settle_reused_request_id() {
+        let mut pending = PendingRequests::new(2);
+        let stale_timer = pending.try_insert(request("reused"), 1_000, 10).unwrap();
+        assert!(stale_timer.claim_settle());
+        assert!(pending.drop_if_same(&stale_timer));
+
+        let replacement = pending.try_insert(request("reused"), 1_000, 20).unwrap();
+        assert!(pending.timeout_if_same(&stale_timer).is_none());
+        assert!(!replacement.is_settled());
+        assert_eq!(pending.len(), 1);
     }
 }
