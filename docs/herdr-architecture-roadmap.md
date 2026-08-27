@@ -90,7 +90,7 @@ Herdr Architecture Roadmap
 
 **Tool Wave Scheduler** 仍仅 skill 层策略。**Batch B** 仍等 Layer 3 Connector UAT，不是当前片。
 
-下一唯一实现片：**生产装新 generation 验证 Streaming 字段**。
+下一唯一实现片：**G5 Link cutover seal**（`production_ready` 可审计封印 + 故意 rollback UAT）；Streaming First 已合入，不再作为当前主游标。
 
 ## 已完成并验收
 
@@ -231,7 +231,7 @@ Evidence Store 未做，等真实恢复需求。
 
 ## AI Tool Runtime Optimization Architecture
 
-状态：Result Optimization first wave、Project Context Cache first slice、Streaming First（#62+#66）已合入；下一片为生产装新 generation 验证 Streaming 字段。更深 PCC 等待基准。Batch B 仍等 Layer 3。
+状态：Result Optimization first wave、Project Context Cache first slice、Streaming First（#62+#66）已合入；当前主游标为 **G5 Link cutover seal**（LaunchAgent 已切，seal / rollback UAT 未完）。更深 PCC 等待基准。Batch B 仍等 Layer 3。
 
 参考 rtk-ai/rtk：核心不是改工具执行本身，而是在输出进入模型上下文前过滤、分组、截断、去重。Herdr 不复制 CLI proxy，在 Rust MCP runtime 内压缩展示，raw 事实仍可从同一次结果或后续 evidence 恢复。不改变 epoch 2 / 18 tools inputSchema。
 
