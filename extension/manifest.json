@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "herdr → Web wake",
-  "version": "0.1.63",
+  "version": "0.1.64",
   "description": "Keep web chats connected to Herdr workspaces with Project-shared or conversation-scoped automation and safe ChatGPT Project rollover. UI: en / zh / ja.",
   "permissions": ["storage", "scripting", "alarms", "nativeMessaging", "sidePanel"],
   "host_permissions": [

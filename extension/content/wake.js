@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.63";
+const H2W_CONTENT_VERSION = "0.1.64";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -33,6 +33,12 @@ const H2W_CONTENT_VERSION = "0.1.63";
   let automationEnabled = false;
   let automationAutoAllow = false;
   let hudLabels = {};
+  let queuedInsertCount = 0;
+  let queuedInsertActionBusy = false;
+  let queuedInsertButton = null;
+  const QUEUED_INSERT_BUTTON_ID = "h2w-queued-insert-button";
+  const QUEUED_INSERT_STYLE_ID = "h2w-queued-insert-style";
+  const QUEUED_INSERT_LAST_BATCH_KEY = "h2wQueuedInsertLastBatchV1";
   const HEALTH_STORAGE_KEY = "h2wConversationHealthByConv";
   const CONTEXT_PRESSURE_STORAGE_KEY = "h2wContextPressureByConv";
 
@@ -62,6 +68,7 @@ const H2W_CONTENT_VERSION = "0.1.63";
     automationEnabled = state.enabled === true;
     automationAutoAllow = state.autoAllow !== false;
     hudLabels = state.labels || hudLabels;
+    updateQueuedInsertButton();
     return automationEnabled;
   }
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -359,6 +366,219 @@ const H2W_CONTENT_VERSION = "0.1.63";
     }
   }
 
+  function removeQueuedInsertButton() {
+    if (queuedInsertButton?.isConnected) queuedInsertButton.remove();
+    queuedInsertButton = null;
+  }
+
+  function ensureQueuedInsertStyle() {
+    if (document.getElementById(QUEUED_INSERT_STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = QUEUED_INSERT_STYLE_ID;
+    style.textContent = `
+      #${QUEUED_INSERT_BUTTON_ID} {
+        align-items: center;
+        background: color-mix(in srgb, currentColor 8%, transparent);
+        border: 0;
+        border-radius: 999px;
+        color: inherit;
+        cursor: pointer;
+        display: inline-flex;
+        flex: 0 0 auto;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 600;
+        height: 32px;
+        justify-content: center;
+        line-height: 1;
+        margin-inline-end: 6px;
+        min-width: 42px;
+        opacity: .78;
+        padding: 0 9px;
+        white-space: nowrap;
+      }
+      #${QUEUED_INSERT_BUTTON_ID}:hover { opacity: 1; }
+      #${QUEUED_INSERT_BUTTON_ID}[data-count]:not([data-count="0"]) {
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, currentColor 22%, transparent);
+        opacity: 1;
+      }
+      #${QUEUED_INSERT_BUTTON_ID}[aria-disabled="true"] { cursor: wait; opacity: .45; }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function updateQueuedInsertButton() {
+    const button = queuedInsertButton;
+    if (!button) return;
+    const base = hudText("queue_insert", null, "Queue");
+    button.textContent = queuedInsertCount > 0
+      ? hudText("queue_insert_count", { count: queuedInsertCount }, `${base} · ${queuedInsertCount}`)
+      : base;
+    button.dataset.count = String(queuedInsertCount);
+    button.disabled = queuedInsertActionBusy;
+    button.setAttribute("aria-disabled", String(queuedInsertActionBusy));
+    button.setAttribute("aria-label", hudText("queue_insert_hint", null,
+      "Queue this message without interrupting the current reply."));
+    button.title = hudText("queue_insert_hint", null,
+      "Queue this message without interrupting the current reply. Right-click to clear the queue.");
+  }
+
+  async function refreshQueuedInsertStatus() {
+    if (ADAPTER.name !== "chatgpt" || !chatGptConversationId()) {
+      queuedInsertCount = 0;
+      removeQueuedInsertButton();
+      return null;
+    }
+    const convKey = ADAPTER.getConversationKey();
+    const response = await sendBg({ type: "h2w_queue_status", convKey });
+    if (convKey !== ADAPTER.getConversationKey()) return response;
+    if (response?.ok) queuedInsertCount = Math.max(0, Number(response.status?.count) || 0);
+    ensureQueuedInsertButton();
+    updateQueuedInsertButton();
+    return response;
+  }
+
+  async function queueCurrentComposerMessage() {
+    if (queuedInsertActionBusy || ADAPTER.name !== "chatgpt") return;
+    const convKey = ADAPTER.getConversationKey();
+    if (!chatGptConversationId() || !convKey) return;
+    const text = String(composerTextRaw() || "").trim();
+    if (!text) {
+      if (queuedInsertCount <= 0) {
+        showHudToast(hudText("queue_need_message", null, "Type a message before queueing it."));
+        return;
+      }
+      queuedInsertActionBusy = true;
+      updateQueuedInsertButton();
+      try {
+        const result = await sendBg({ type: "h2w_queue_flush", convKey, reason: "button-retry" });
+        if (result?.delivered) {
+          queuedInsertCount = Math.max(0, Number(result.status?.count) || 0);
+          showHudToast(hudText("queue_sent", null, "Queued message sent."), "ok");
+        } else {
+          showHudToast(hudText("queue_waiting", { count: queuedInsertCount }, `Queued: ${queuedInsertCount}`));
+        }
+      } finally {
+        queuedInsertActionBusy = false;
+        updateQueuedInsertButton();
+      }
+      return;
+    }
+
+    queuedInsertActionBusy = true;
+    updateQueuedInsertButton();
+    try {
+      const queued = await sendBg({ type: "h2w_queue_insert", convKey, text });
+      if (!queued?.ok) {
+        const key = queued?.error === "queue-full" ? "queue_full" : "queue_failed";
+        showHudToast(hudText(key, { error: queued?.error || "unknown" }, queued?.error || "Queue failed"), "err");
+        return;
+      }
+      queuedInsertCount = Math.max(0, Number(queued.status?.count) || queuedInsertCount + 1);
+      updateQueuedInsertButton();
+
+      // Persistence succeeds before clearing the composer. If the user changed
+      // the draft while storage was in flight, keep the new draft untouched.
+      if (composerNorm() !== normText(text)) {
+        showHudToast(hudText("queue_added_draft_changed", { count: queuedInsertCount },
+          `Queued (${queuedInsertCount}); the composer changed, so it was left untouched.`), "ok");
+        return;
+      }
+      await clearComposer();
+      for (let i = 0; i < 8 && composerNorm(); i += 1) await wait(75);
+      if (composerNorm()) {
+        showHudToast(hudText("queue_added_clear_failed", { count: queuedInsertCount },
+          `Queued (${queuedInsertCount}), but the composer could not be cleared.`), "err");
+        return;
+      }
+
+      if (isTurnInProgress()) {
+        showHudToast(hudText("queue_added", { count: queuedInsertCount }, `Queued: ${queuedInsertCount}`), "ok");
+        return;
+      }
+      const flushed = await sendBg({ type: "h2w_queue_flush", convKey, reason: "enqueue-idle" });
+      if (flushed?.delivered) {
+        queuedInsertCount = Math.max(0, Number(flushed.status?.count) || 0);
+        showHudToast(hudText("queue_sent", null, "Queued message sent."), "ok");
+      } else {
+        showHudToast(hudText("queue_added", { count: queuedInsertCount }, `Queued: ${queuedInsertCount}`), "ok");
+      }
+    } finally {
+      queuedInsertActionBusy = false;
+      updateQueuedInsertButton();
+    }
+  }
+
+  async function clearQueuedInsertMessages() {
+    if (queuedInsertActionBusy || queuedInsertCount <= 0) return;
+    const convKey = ADAPTER.getConversationKey();
+    const question = hudText("queue_clear_confirm", { count: queuedInsertCount },
+      `Clear ${queuedInsertCount} queued message(s)?`);
+    if (!globalThis.confirm(question)) return;
+    queuedInsertActionBusy = true;
+    updateQueuedInsertButton();
+    try {
+      const response = await sendBg({ type: "h2w_queue_clear", convKey });
+      if (response?.ok) {
+        queuedInsertCount = 0;
+        showHudToast(hudText("queue_cleared", null, "Queue cleared."), "ok");
+      } else {
+        showHudToast(hudText("queue_failed", { error: response?.error || "unknown" }, "Queue update failed."), "err");
+      }
+    } finally {
+      queuedInsertActionBusy = false;
+      updateQueuedInsertButton();
+    }
+  }
+
+  function ensureQueuedInsertButton() {
+    if (ADAPTER.name !== "chatgpt" || !chatGptConversationId()) {
+      removeQueuedInsertButton();
+      return null;
+    }
+    ensureQueuedInsertStyle();
+    const anchor = typeof ADAPTER.getComposerActionAnchor === "function"
+      ? ADAPTER.getComposerActionAnchor()
+      : findSendButton();
+    const parent = anchor?.parentElement;
+    if (!anchor || !parent) return queuedInsertButton;
+    if (!queuedInsertButton || !queuedInsertButton.isConnected) {
+      queuedInsertButton = document.createElement("button");
+      queuedInsertButton.id = QUEUED_INSERT_BUTTON_ID;
+      queuedInsertButton.type = "button";
+      queuedInsertButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void queueCurrentComposerMessage();
+      });
+      queuedInsertButton.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void clearQueuedInsertMessages();
+      });
+    }
+    if (queuedInsertButton.parentElement !== parent || queuedInsertButton.nextSibling !== anchor) {
+      parent.insertBefore(queuedInsertButton, anchor);
+    }
+    updateQueuedInsertButton();
+    return queuedInsertButton;
+  }
+
+  function queuedInsertBatchWasDelivered(convKey, batchId) {
+    try {
+      const row = JSON.parse(sessionStorage.getItem(QUEUED_INSERT_LAST_BATCH_KEY) || "null");
+      return row?.convKey === convKey && row?.batch_id === batchId;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function rememberQueuedInsertBatch(convKey, batchId) {
+    try {
+      sessionStorage.setItem(QUEUED_INSERT_LAST_BATCH_KEY, JSON.stringify({ convKey, batch_id: batchId, at: Date.now() }));
+    } catch (_) {}
+  }
+
   function elementVisible(el) {
     if (typeof ADAPTER.elementVisible === "function") return ADAPTER.elementVisible(el);
     return !!(el && el.offsetParent);
@@ -616,7 +836,7 @@ const H2W_CONTENT_VERSION = "0.1.63";
     if (!text) return { ok: false, error: "empty-template" };
     const n = normText(text);
     // Short-window deduplication prevents repeated insertion from retries or duplicate timers.
-    if (n && n === lastWakeNorm && Date.now() - lastWakeAt < 8000) {
+    if (!data.queueInsert && n && n === lastWakeNorm && Date.now() - lastWakeAt < 8000) {
       return { ok: false, blocked: "dedupe" };
     }
     let resumeOnly = false;
@@ -1006,6 +1226,62 @@ const H2W_CONTENT_VERSION = "0.1.63";
         sendResponse({ ok: true });
         return;
       }
+      if (msg?.type === "h2w_queue_state") {
+        if (ADAPTER.name === "chatgpt" && msg.convKey === ADAPTER.getConversationKey()) {
+          queuedInsertCount = Math.max(0, Number(msg.status?.count) || 0);
+          ensureQueuedInsertButton();
+          updateQueuedInsertButton();
+        }
+        sendResponse({ ok: true });
+        return;
+      }
+      if (msg?.type === "h2w_queue_deliver") {
+        (async () => {
+          if (ADAPTER.name !== "chatgpt") {
+            sendResponse({ ok: false, error: "unsupported-site" });
+            return;
+          }
+          const convKey = String(msg.convKey || "");
+          const batchId = String(msg.batch_id || "");
+          const text = String(msg.text || "").trim();
+          if (!convKey || convKey !== ADAPTER.getConversationKey()) {
+            sendResponse({ ok: false, blocked: "conversation-changed" });
+            return;
+          }
+          if (!batchId || !text) {
+            sendResponse({ ok: false, error: "queue-payload-invalid" });
+            return;
+          }
+          if (queuedInsertBatchWasDelivered(convKey, batchId)) {
+            sendResponse({ ok: true, deduped: true, queued_insert: true });
+            return;
+          }
+          // The queued path never interrupts a live assistant turn and never
+          // overwrites a draft the user started after queueing the message.
+          if (isTurnInProgress()) {
+            sendResponse({ ok: false, blocked: "turn-in-progress" });
+            return;
+          }
+          if (ADAPTER.inputHasContent()) {
+            sendResponse({ ok: false, blocked: "user-typing" });
+            return;
+          }
+          await ensureConversationHealth();
+          const result = await performWake({
+            template: text,
+            autoAllow: false,
+            queueInsert: true,
+          });
+          if (result.ok) {
+            rememberQueuedInsertBatch(convKey, batchId);
+            if (CONVERSATION_HEALTH) {
+              markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
+            }
+          }
+          sendResponse({ ...result, queued_insert: true, batch_id: batchId });
+        })();
+        return true;
+      }
       if (msg?.type === "h2w_wake") {
         (async () => {
           if (!(await refreshAutomationState())) {
@@ -1049,6 +1325,7 @@ const H2W_CONTENT_VERSION = "0.1.63";
       const concreteChat = ADAPTER.name !== "chatgpt" || Boolean(chatGptConversationId());
       if (concreteChat) {
         await ensureConversationHealth(convKey);
+        if (ADAPTER.name === "chatgpt") void refreshQueuedInsertStatus();
         if (CONTEXT_PRESSURE) {
           contextPressureRecord = await loadContextPressure(convKey);
           void updateContextPressure().then((pressure) => {
@@ -1058,6 +1335,10 @@ const H2W_CONTENT_VERSION = "0.1.63";
       } else {
         conversationHealth = null;
         contextPressureRecord = null;
+        if (ADAPTER.name === "chatgpt") {
+          queuedInsertCount = 0;
+          removeQueuedInsertButton();
+        }
       }
       if (changed) {
         console.log(`[h2w] conversation route changed (${reason}): ${convKey}`);
@@ -1074,6 +1355,7 @@ const H2W_CONTENT_VERSION = "0.1.63";
       if (document.hidden) return;
       const convKey = ADAPTER.getConversationKey();
       if (convKey && convKey !== registeredConvKey) void registerCurrentConversation("poll");
+      if (ADAPTER.name === "chatgpt") ensureQueuedInsertButton();
     }, 1000);
     try {
       window.addEventListener("popstate", () => { void registerCurrentConversation("popstate"); });
@@ -1081,6 +1363,7 @@ const H2W_CONTENT_VERSION = "0.1.63";
       document.addEventListener("visibilitychange", () => {
         if (document.hidden) return;
         void registerCurrentConversation("visible");
+        if (ADAPTER.name === "chatgpt") ensureQueuedInsertButton();
         if (permObs) {
           if (permScheduler) permScheduler.flush();
           else permissionTryClick();
@@ -2827,6 +3110,7 @@ const H2W_CONTENT_VERSION = "0.1.63";
     if (view.continuity) hudCache = { ...(hudCache || {}), continuity: view.continuity };
     const hud = view.hud || hudCache || null;
     hudLabels = hud?.labels || hudLabels;
+    updateQueuedInsertButton();
     if (view.pending === true) hudPending = true;
     if (view.pending === false) hudPending = false;
 

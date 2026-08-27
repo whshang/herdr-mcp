@@ -45,7 +45,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.63" };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.64" };
 const listeners = { onMessage: [], onStartup: [], onInstalled: [], onActivated: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
@@ -73,6 +73,8 @@ Date.now = () => realDateNow() + testClockOffsetMs;
 let mockStateWorkspaces = [];
 let mockLocalRuntimeAvailable = true;
 let hangAutomationNotifications = false;
+const queuedInsertDeliveries = [];
+let blockQueuedInsertDelivery = false;
 
 const nativeFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
@@ -343,6 +345,13 @@ function installContentScript(tabId, url, convKey, site = "chatgpt") {
     url, listener: (msg, _sender, sendResponse) => {
       if (msg?.type === "h2w_get_convkey") { sendResponse({ convKey, url, site }); return; }
       if (msg?.type === "h2w_wake") { sendResponse({}); return; }
+      if (msg?.type === "h2w_queue_deliver") {
+        queuedInsertDeliveries.push({ tabId, ...msg });
+        if (blockQueuedInsertDelivery) sendResponse({ ok: false, blocked: "turn-in-progress" });
+        else sendResponse({ ok: true, queued_insert: true, batch_id: msg.batch_id });
+        return;
+      }
+      if (msg?.type === "h2w_queue_state") { sendResponse({ ok: true }); return; }
       if (msg?.type === "h2w_handoff_prompt") { handoffPrompt = msg.template || ""; sendResponse({ ok: true }); return; }
       if (msg?.type === "h2w_handoff_probe") {
         sendResponse({
@@ -375,6 +384,53 @@ function dispatchMessage(msg, sender = {}) {
     onMsg(msg, sender, done);
     setTimeout(() => done(undefined), 1000);
   });
+}
+
+// ---- Queued insert is durable, ordered, and wins over generic post-turn continue ----
+console.log("\n[queued insert]");
+{
+  const tabId = 98;
+  installContentScript(tabId, CONV, CONV);
+  const sender = { tab: { id: tabId, url: CONV } };
+  const first = await dispatchMessage({ type: "h2w_queue_insert", convKey: CONV, text: "check the API" }, sender);
+  const second = await dispatchMessage({ type: "h2w_queue_insert", convKey: CONV, text: "then run the smoke test" }, sender);
+  ok(first?.ok === true && first.status?.count === 1, "first queued insert persists without sending", JSON.stringify(first));
+  ok(second?.ok === true && second.status?.count === 2, "second queued insert appends in order", JSON.stringify(second));
+  ok(queuedInsertDeliveries.length === 0, "enqueue alone never interrupts the active turn");
+
+  const ended = await dispatchMessage({
+    type: "h2w_turn_ended",
+    convKey: CONV,
+    userText: "original question",
+    assistantText: "The current reply is complete and contains enough substantive text for the normal post-turn path.",
+    endedAt: Date.now(),
+  }, sender);
+  const delivered = queuedInsertDeliveries.at(-1);
+  ok(ended?.ok === true && ended?.queued_insert === true && ended?.delivered_count === 2,
+    "turn end flushes queued content before the generic continue path", JSON.stringify(ended));
+  ok(delivered?.text === "check the API\n\nthen run the smoke test" && delivered?.count === 2,
+    "queued messages merge into one ordered next-turn payload", JSON.stringify(delivered));
+  ok(!storage.h2wQueuedInsertV1?.conversations?.[CONV], "successful delivery ACK removes the delivered batch");
+
+  await dispatchMessage({ type: "h2w_queue_insert", convKey: CONV, text: "do not interrupt this turn" }, sender);
+  blockQueuedInsertDelivery = true;
+  const blocked = await dispatchMessage({
+    type: "h2w_turn_ended",
+    convKey: CONV,
+    userText: "another question",
+    assistantText: "This is another complete assistant turn used to exercise the fail-closed queued delivery path.",
+    endedAt: Date.now(),
+  }, sender);
+  ok(blocked?.ok === false && blocked?.blocked === "turn-in-progress",
+    "content-side turn-in-progress guard keeps a failed delivery queued", JSON.stringify(blocked));
+  ok(storage.h2wQueuedInsertV1?.conversations?.[CONV]?.length === 1,
+    "blocked delivery is not ACKed or dropped");
+
+  blockQueuedInsertDelivery = false;
+  const retried = await dispatchMessage({ type: "h2w_queue_flush", convKey: CONV, reason: "test-retry" }, sender);
+  ok(retried?.ok === true && retried?.delivered === true && retried?.delivered_count === 1,
+    "pending queue can retry safely after the turn becomes idle", JSON.stringify(retried));
+  ok(!storage.h2wQueuedInsertV1?.conversations?.[CONV], "retry ACK clears only the delivered pending entry");
 }
 
 // ---- Page-health forced reload is sender-scoped, durable, and bounded ----

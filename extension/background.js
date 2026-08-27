@@ -25,8 +25,18 @@ import {
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
+import {
+  QUEUED_INSERT_STORAGE_KEY,
+  ackQueuedInsertBatch,
+  clearQueuedInserts,
+  enqueueQueuedInsert,
+  moveQueuedInserts,
+  normalizeQueuedInsertState,
+  queuedInsertBatch,
+  queuedInsertStatus,
+} from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.63";
+const H2W_SCRIPT_VERSION = "0.1.64";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -96,7 +106,10 @@ function defaultPartialTemplate() {
 function hudLabels() {
   const keys = [
     "automation", "automation_on", "automation_off", "manual_continue", "manual_status", "manual_judge", "manual_handoff",
-    "manual_continue_hint", "manual_status_hint", "manual_judge_hint", "manual_handoff_hint", "controls", "advanced_options", "event_settings",
+    "manual_continue_hint", "manual_status_hint", "manual_judge_hint", "manual_handoff_hint",
+    "queue_insert", "queue_insert_count", "queue_insert_hint", "queue_need_message", "queue_added", "queue_sent", "queue_waiting",
+    "queue_full", "queue_failed", "queue_added_draft_changed", "queue_added_clear_failed", "queue_clear_confirm", "queue_cleared",
+    "controls", "advanced_options", "event_settings",
     "handoff_started", "handoff_failed", "handoff_binding_required", "handoff_workspace_busy", "handoff_automation_enabled",
     "automation_on_hint", "automation_off_hint", "conversation_automation_on_hint", "conversation_automation_off_hint", "on", "off", "interval", "fallback", "bindings", "bind", "unbind", "available",
     "no_workspaces", "workspaces_unavailable", "active", "bound_count", "aria_toggle_automation",
@@ -108,7 +121,7 @@ function hudLabels() {
     "reason_still_generating", "reason_not_substantive", "reason_empty_assistant", "reason_nudge_loop",
     "reason_same_assistant", "reason_cooldown", "reason_llm_done", "reason_llm_ambiguous",
     "reason_llm_continue", "reason_llm_timeout", "reason_llm_http", "reason_llm_network",
-    "reason_wake_failed", "reason_llm_bad_response",
+    "reason_wake_failed", "reason_llm_bad_response", "reason_queued_insert_pending",
   ];
   const out = {};
   for (const suffix of keys) out[suffix] = localizedText(`hud_${suffix}`);
@@ -650,6 +663,147 @@ async function loadBindings() {
 }
 async function saveBindings(b) {
   try { await chrome.storage.local.set({ herdrWakeBindings: b }); } catch (e) {}
+}
+
+let queuedInsertMutationTail = Promise.resolve();
+const queuedInsertInFlight = new Set();
+
+async function readQueuedInsertState() {
+  try {
+    const raw = (await chrome.storage.local.get(QUEUED_INSERT_STORAGE_KEY))[QUEUED_INSERT_STORAGE_KEY];
+    return normalizeQueuedInsertState(raw || {});
+  } catch (_) {
+    return normalizeQueuedInsertState({});
+  }
+}
+
+function mutateQueuedInsertState(mutator) {
+  const run = queuedInsertMutationTail.then(async () => {
+    const current = await readQueuedInsertState();
+    const result = await mutator(current);
+    const next = normalizeQueuedInsertState(result?.state || current);
+    await chrome.storage.local.set({ [QUEUED_INSERT_STORAGE_KEY]: next });
+    return { ...result, state: next };
+  });
+  queuedInsertMutationTail = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+async function queuedInsertStateForConversation(convKey) {
+  return queuedInsertStatus(await readQueuedInsertState(), convKey);
+}
+
+async function enqueueQueuedInsertForConversation(convKey, text) {
+  const id = typeof crypto?.randomUUID === "function"
+    ? `qi:${crypto.randomUUID()}`
+    : `qi:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`;
+  return mutateQueuedInsertState((state) => enqueueQueuedInsert(state, convKey, text, { id }));
+}
+
+async function ackQueuedInsertForConversation(convKey, entryIds) {
+  return mutateQueuedInsertState((state) => ({
+    ok: true,
+    state: ackQueuedInsertBatch(state, convKey, entryIds),
+  }));
+}
+
+async function clearQueuedInsertForConversation(convKey) {
+  return mutateQueuedInsertState((state) => ({
+    ok: true,
+    state: clearQueuedInserts(state, convKey),
+  }));
+}
+
+async function moveQueuedInsertForHandoff(sourceConvKey, targetConvKey, targetTabId = null) {
+  const result = await mutateQueuedInsertState((state) => moveQueuedInserts(state, sourceConvKey, targetConvKey));
+  if (!result.ok) {
+    callLog(`queued insert handoff migration skipped ${sourceConvKey} -> ${targetConvKey}: ${result.error}`);
+    return result;
+  }
+  if (result.moved_count > 0) {
+    const status = queuedInsertStatus(result.state, targetConvKey);
+    notifyQueuedInsertState(targetTabId, targetConvKey, status, { migrated: result.moved_count });
+    callLog(`moved ${result.moved_count} queued insert(s) to handoff target ${targetConvKey}`);
+  }
+  return result;
+}
+
+function notifyQueuedInsertState(tabId, convKey, status, extra = {}) {
+  if (!tabId) return;
+  try {
+    const pending = chrome.tabs.sendMessage(tabId, {
+      type: "h2w_queue_state",
+      convKey,
+      status,
+      ...extra,
+    });
+    if (pending && typeof pending.catch === "function") pending.catch(() => {});
+  } catch (_) {}
+}
+
+async function flushQueuedInsert(convKey, tabId, reason = "manual") {
+  if (!convKey) return { ok: false, error: "conversation-required" };
+  if (!tabId) return { ok: false, error: "tab-unavailable" };
+  if (queuedInsertInFlight.has(convKey)) {
+    return {
+      ok: false,
+      queued: true,
+      blocked: "queue-in-flight",
+      status: await queuedInsertStateForConversation(convKey),
+    };
+  }
+  queuedInsertInFlight.add(convKey);
+  try {
+    const state = await readQueuedInsertState();
+    const batch = queuedInsertBatch(state, convKey);
+    if (!batch) {
+      const status = queuedInsertStatus(state, convKey);
+      notifyQueuedInsertState(tabId, convKey, status);
+      return { ok: true, queued: false, delivered: false, reason: "queue-empty", status };
+    }
+    let delivery;
+    try {
+      delivery = await chrome.tabs.sendMessage(tabId, {
+        type: "h2w_queue_deliver",
+        convKey,
+        batch_id: batch.batch_id,
+        text: batch.text,
+        count: batch.count,
+        reason,
+      });
+    } catch (e) {
+      return {
+        ok: false,
+        queued: true,
+        error: e?.message || "queue-delivery-failed",
+        status: queuedInsertStatus(state, convKey),
+      };
+    }
+    if (!delivery?.ok) {
+      const status = queuedInsertStatus(state, convKey);
+      notifyQueuedInsertState(tabId, convKey, status, { blocked: delivery?.blocked || delivery?.error || null });
+      return {
+        ok: false,
+        queued: true,
+        blocked: delivery?.blocked || null,
+        error: delivery?.error || "queue-delivery-failed",
+        status,
+      };
+    }
+    await ackQueuedInsertForConversation(convKey, batch.entry_ids);
+    const status = await queuedInsertStateForConversation(convKey);
+    notifyQueuedInsertState(tabId, convKey, status, { delivered: batch.count, batch_id: batch.batch_id });
+    return {
+      ok: true,
+      queued: status.count > 0,
+      delivered: true,
+      delivered_count: batch.count,
+      batch_id: batch.batch_id,
+      status,
+    };
+  } finally {
+    queuedInsertInFlight.delete(convKey);
+  }
 }
 
 async function migrateZaiRootConversationState(bindings, targetConvKey, targetUrl, tabId) {
@@ -1548,6 +1702,14 @@ async function maybeIdleNudge(msg) {
 async function maybeIdleNudgeInner(msg) {
   const convKey = msg.convKey;
   if (!convKey) return rememberIdleNudge("", { nudged: false, reason: "no_conv" });
+  const queued = await queuedInsertStateForConversation(convKey);
+  if (queued.count > 0) {
+    return rememberIdleNudge(convKey, {
+      nudged: false,
+      reason: "queued_insert_pending",
+      queued_count: queued.count,
+    });
+  }
   if (!automationScopeForConversation(convKey).enabled) {
     return rememberIdleNudge(convKey, { nudged: false, reason: "disabled" });
   }
@@ -2140,6 +2302,11 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
       error: null,
       handoff_text: null,
     });
+    await moveQueuedInsertForHandoff(
+      transfer.source_conv_key,
+      targetInfo.convKey,
+      targetTabId || transfer.target_tab_id || null,
+    );
     void bestEffortDiscardRetiredSourceTab(transfer, targetTabId || transfer.target_tab_id || null);
     return { ok: true, recovered: true, transfer: handoffView(done) };
   }
@@ -2205,6 +2372,11 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
       packet_chars: String(transfer.handoff_text || "").length,
       handoff_text: null,
     });
+    await moveQueuedInsertForHandoff(
+      transfer.source_conv_key,
+      targetInfo.convKey,
+      targetTabId || transfer.target_tab_id || null,
+    );
     try {
       if (transfer.source_tab_id) chrome.tabs.sendMessage(transfer.source_tab_id, { type: "h2w_handoff_moved", transferId, targetConvKey: targetInfo.convKey });
     } catch (_) {}
@@ -2280,6 +2452,11 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
       packet_chars: String(transfer.handoff_text || "").length,
       handoff_text: null,
     });
+    await moveQueuedInsertForHandoff(
+      transfer.source_conv_key,
+      targetInfo.convKey,
+      targetTabId || transfer.target_tab_id || null,
+    );
     try {
       if (transfer.source_tab_id) chrome.tabs.sendMessage(transfer.source_tab_id, { type: "h2w_handoff_moved", transferId, targetConvKey: targetInfo.convKey });
     } catch (_) {}
@@ -2358,6 +2535,11 @@ async function commitHandoffTransfer(transferId, targetConvKey, targetTabId, tar
     packet_chars: String(transfer.handoff_text || "").length,
     handoff_text: null,
   });
+  await moveQueuedInsertForHandoff(
+    transfer.source_conv_key,
+    targetInfo.convKey,
+    targetTabId || transfer.target_tab_id || null,
+  );
   try {
     if (transfer.source_tab_id) chrome.tabs.sendMessage(transfer.source_tab_id, { type: "h2w_handoff_moved", transferId, targetConvKey: targetInfo.convKey });
   } catch (_) {}
@@ -3684,11 +3866,72 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })();
     return true;
   }
+  if (msg?.type === "h2w_queue_status") {
+    void (async () => {
+      const convKey = String(msg.convKey || "").trim();
+      const info = chatGptConversationInfo(convKey);
+      if (!convKey || !info?.conversation_id) {
+        sendResponse({ ok: false, error: "conversation-required", status: { count: 0, chars: 0, oldest_at: null } });
+        return;
+      }
+      sendResponse({ ok: true, status: await queuedInsertStateForConversation(convKey) });
+    })();
+    return true;
+  }
+  if (msg?.type === "h2w_queue_insert") {
+    void (async () => {
+      const convKey = String(msg.convKey || "").trim();
+      const info = chatGptConversationInfo(convKey);
+      if (!convKey || !info?.conversation_id) {
+        sendResponse({ ok: false, error: "conversation-required" });
+        return;
+      }
+      const result = await enqueueQueuedInsertForConversation(convKey, msg.text || "");
+      const status = result.status || queuedInsertStatus(result.state, convKey);
+      notifyQueuedInsertState(sender.tab?.id, convKey, status);
+      sendResponse({ ok: result.ok === true, error: result.error || null, status });
+    })();
+    return true;
+  }
+  if (msg?.type === "h2w_queue_flush") {
+    void (async () => {
+      const convKey = String(msg.convKey || "").trim();
+      const info = chatGptConversationInfo(convKey);
+      const tabId = msg.tabId || sender.tab?.id;
+      if (!convKey || !info?.conversation_id) {
+        sendResponse({ ok: false, error: "conversation-required" });
+        return;
+      }
+      sendResponse(await flushQueuedInsert(convKey, tabId, msg.reason || "manual"));
+    })();
+    return true;
+  }
+  if (msg?.type === "h2w_queue_clear") {
+    void (async () => {
+      const convKey = String(msg.convKey || "").trim();
+      const info = chatGptConversationInfo(convKey);
+      if (!convKey || !info?.conversation_id) {
+        sendResponse({ ok: false, error: "conversation-required" });
+        return;
+      }
+      await clearQueuedInsertForConversation(convKey);
+      const status = await queuedInsertStateForConversation(convKey);
+      notifyQueuedInsertState(sender.tab?.id, convKey, status, { cleared: true });
+      sendResponse({ ok: true, status });
+    })();
+    return true;
+  }
   if (msg?.type === "h2w_turn_ended") {
     void (async () => {
       const handoff = await handleHandoffTurnEnded(msg);
       if (handoff.handled) {
         sendResponse(handoff);
+        return;
+      }
+      const queued = await queuedInsertStateForConversation(msg.convKey || "");
+      if (queued.count > 0) {
+        const delivery = await flushQueuedInsert(msg.convKey || "", sender.tab?.id, "turn-ended");
+        sendResponse({ ...delivery, queued_insert: true });
         return;
       }
       const r = await maybeIdleNudge(msg);
