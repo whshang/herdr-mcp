@@ -165,10 +165,7 @@ fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusR
     );
     println!("LAYER service {}", format_service_layer());
     println!("LAYER local-ipc {}", format_local_ipc_layer(paths));
-    println!(
-        "LAYER native-messaging {}",
-        format_native_messaging_layer()
-    );
+    println!("LAYER native-messaging {}", format_native_messaging_layer());
     println!("LAYER link {}", format_link_layer(paths));
     println!("LAYER edge {}", format_edge_layer(paths));
     println!("LAYER update-state {}", format_update_state_layer(paths));
@@ -222,7 +219,10 @@ fn format_service_layer() -> String {
                 .get("implementation")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            let loaded = value.get("loaded").and_then(Value::as_bool).unwrap_or(false);
+            let loaded = value
+                .get("loaded")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let healthy = value
                 .get("healthy")
                 .and_then(Value::as_bool)
@@ -454,7 +454,8 @@ fn prefer_existing(paths: &[PathBuf]) -> Option<PathBuf> {
 }
 
 fn read_json_object(path: &Path) -> Result<Value, String> {
-    let bytes = fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let bytes =
+        fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if bytes.len() > 64 * 1024 {
         return Err(format!("{} exceeds doctor read budget", path.display()));
     }
