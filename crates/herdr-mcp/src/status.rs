@@ -157,7 +157,8 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         && event_cache.healthy
 }
 
-/// Product-layer ownership map. Local probes only; never opens Edge/WSS.
+/// Product-layer ownership map. Local probes always run. When Edge is
+/// configured locally, doctor also runs bounded credential-free HTTPS probes.
 fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusReport) {
     println!("LAYER herdr {}", format_herdr_layer(paths, report));
     println!(
@@ -168,7 +169,15 @@ fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusR
     println!("LAYER local-ipc {}", format_local_ipc_layer(paths));
     println!("LAYER native-messaging {}", format_native_messaging_layer());
     println!("LAYER link {}", format_link_layer(paths));
-    println!("LAYER edge {}", format_edge_layer(paths));
+    let edge = resolve_edge_config();
+    println!("LAYER edge {}", format_edge_configured_layer(&edge));
+    let remote = edge
+        .as_ref()
+        .map(probe_edge_remote)
+        .unwrap_or(RemoteProbeReport::absent());
+    println!("LAYER edge-reachable {}", remote.edge_reachable);
+    println!("LAYER oauth-metadata {}", remote.oauth_metadata);
+    println!("LAYER mcp-endpoint {}", remote.mcp_endpoint);
     println!("LAYER update-state {}", format_update_state_layer(paths));
 }
 
@@ -300,11 +309,47 @@ fn format_link_layer(paths: &RuntimePaths) -> String {
     crate::link::doctor_layer_summary(&home, &paths.config_dir)
 }
 
-fn format_edge_layer(_paths: &RuntimePaths) -> String {
-    // Honest local view only: Edge host from link LaunchAgent env, never WSS dial.
-    let Some(home) = home_dir() else {
-        return "absent remote-probe=skipped".to_owned();
-    };
+fn format_edge_configured_layer(edge: &Option<EdgeConfigView>) -> String {
+    match edge {
+        Some(edge) => format!(
+            "configured-local host={} origin={} plist={}",
+            edge.host,
+            edge.origin,
+            edge.plist
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unset".to_owned())
+        ),
+        None => "absent".to_owned(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EdgeConfigView {
+    host: String,
+    origin: String,
+    plist: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteProbeReport {
+    edge_reachable: String,
+    oauth_metadata: String,
+    mcp_endpoint: String,
+}
+
+impl RemoteProbeReport {
+    fn absent() -> Self {
+        Self {
+            edge_reachable: "skipped reason=edge-unconfigured".to_owned(),
+            oauth_metadata: "skipped reason=edge-unconfigured".to_owned(),
+            mcp_endpoint: "skipped reason=edge-unconfigured".to_owned(),
+        }
+    }
+}
+
+fn resolve_edge_config() -> Option<EdgeConfigView> {
+    let home = home_dir()?;
     let candidates = [
         home.join("Library")
             .join("LaunchAgents")
@@ -318,13 +363,203 @@ fn format_edge_layer(_paths: &RuntimePaths) -> String {
             continue;
         }
         if let Some(host) = edge_host_from_plist(&path) {
-            return format!(
-                "configured-local host={host} plist={} remote-probe=skipped",
-                path.display()
-            );
+            let origin = https_origin_for_host(&host)?;
+            return Some(EdgeConfigView {
+                host,
+                origin,
+                plist: Some(path),
+            });
         }
     }
-    "absent remote-probe=skipped".to_owned()
+    None
+}
+
+fn https_origin_for_host(host: &str) -> Option<String> {
+    let host = host.trim();
+    if host.is_empty() || host.contains('/') || host.contains('@') || host.contains(' ') {
+        return None;
+    }
+    // Refuse credential-shaped hosts and keep output host-only.
+    if host.contains(':') && !host.starts_with('[') {
+        // allow host:port
+        let (name, port) = host.split_once(':')?;
+        if name.is_empty() || port.parse::<u16>().is_err() {
+            return None;
+        }
+    }
+    Some(format!("https://{host}"))
+}
+
+fn probe_edge_remote(edge: &EdgeConfigView) -> RemoteProbeReport {
+    let client = match remote_probe_client() {
+        Ok(client) => client,
+        Err(detail) => {
+            let failed = format!("error detail={}", compact_detail(&detail));
+            return RemoteProbeReport {
+                edge_reachable: failed.clone(),
+                oauth_metadata: failed.clone(),
+                mcp_endpoint: failed,
+            };
+        }
+    };
+
+    let health_url = format!("{}/health", edge.origin);
+    let oauth_url = format!("{}/.well-known/oauth-authorization-server", edge.origin);
+    let mcp_url = format!("{}/mcp", edge.origin);
+
+    let edge_reachable = match probe_https_get(&client, &health_url, RemoteExpect::Health) {
+        Ok(summary) => format!("reachable {summary}"),
+        Err(detail) => format!("unreachable detail={}", compact_detail(&detail)),
+    };
+    let oauth_metadata = match probe_https_get(&client, &oauth_url, RemoteExpect::OauthMetadata) {
+        Ok(summary) => format!("reachable {summary}"),
+        Err(detail) => format!("unreachable detail={}", compact_detail(&detail)),
+    };
+    let mcp_endpoint = match probe_https_get(&client, &mcp_url, RemoteExpect::McpEndpoint) {
+        Ok(summary) => format!("reachable {summary}"),
+        Err(detail) => format!("unreachable detail={}", compact_detail(&detail)),
+    };
+
+    RemoteProbeReport {
+        edge_reachable,
+        oauth_metadata,
+        mcp_endpoint,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RemoteExpect {
+    Health,
+    OauthMetadata,
+    McpEndpoint,
+}
+
+const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const REMOTE_PROBE_MAX_BYTES: usize = 64 * 1024;
+
+fn remote_probe_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(REMOTE_PROBE_TIMEOUT)
+        .connect_timeout(Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|error| format!("cannot build remote probe client: {error}"))
+}
+
+fn probe_https_get(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    expect: RemoteExpect,
+) -> Result<String, String> {
+    let parsed = url::Url::parse(url).map_err(|_| "invalid probe URL".to_owned())?;
+    if parsed.scheme() != "https" {
+        return Err("remote probe requires https".to_owned());
+    }
+    if parsed.username() != "" || parsed.password().is_some() {
+        return Err("probe URL must not carry credentials".to_owned());
+    }
+    if parsed.query().is_some() {
+        return Err("probe URL must not carry query credentials".to_owned());
+    }
+
+    let response = client
+        .get(parsed)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .map_err(|error| format!("request failed: {error}"))?;
+    let status = response.status().as_u16();
+    let bytes = response
+        .bytes()
+        .map_err(|error| format!("read failed: {error}"))?;
+    if bytes.len() > REMOTE_PROBE_MAX_BYTES {
+        return Err("response exceeds probe byte budget".to_owned());
+    }
+    let body = String::from_utf8_lossy(&bytes);
+
+    match expect {
+        RemoteExpect::Health => {
+            if status != 200 {
+                return Err(format!("unexpected http={status}"));
+            }
+            let service =
+                json_string_field(&body, "service").unwrap_or_else(|| "unknown".to_owned());
+            let epoch = json_u64_field(&body, "contractEpoch")
+                .map(|epoch| epoch.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            Ok(format!(
+                "http={status} service={} contract_epoch={}",
+                sanitize_probe_token(&service),
+                sanitize_probe_token(&epoch)
+            ))
+        }
+        RemoteExpect::OauthMetadata => {
+            if status != 200 {
+                return Err(format!("unexpected http={status}"));
+            }
+            let issuer = json_string_field(&body, "issuer")
+                .and_then(|issuer| issuer_host(&issuer))
+                .unwrap_or_else(|| "unknown".to_owned());
+            Ok(format!(
+                "http={status} issuer_host={}",
+                sanitize_probe_token(&issuer)
+            ))
+        }
+        RemoteExpect::McpEndpoint => {
+            // Never send Authorization. 401 proves the public MCP surface exists.
+            if matches!(status, 200 | 401) {
+                Ok(format!("http={status} auth=not-sent"))
+            } else {
+                Err(format!("unexpected http={status}"))
+            }
+        }
+    }
+}
+
+fn json_string_field(body: &str, key: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn json_u64_field(body: &str, key: &str) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value.get(key).and_then(Value::as_u64)
+}
+
+fn issuer_host(issuer: &str) -> Option<String> {
+    let parsed = url::Url::parse(issuer).ok()?;
+    if parsed.username() != "" || parsed.password().is_some() || parsed.query().is_some() {
+        return None;
+    }
+    parsed.host_str().map(str::to_owned)
+}
+
+fn sanitize_probe_token(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("bearer")
+        || lower.contains("authorization")
+        || value.contains('=')
+        || value.len() > 96
+    {
+        return "redacted".to_owned();
+    }
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect()
 }
 
 fn format_update_state_layer(paths: &RuntimePaths) -> String {
@@ -594,6 +829,40 @@ mod tests {
             Some("herdr-edge-prod.example".to_owned())
         );
         assert_eq!(edge_host("https://example"), None);
+    }
+
+    #[test]
+    fn remote_probe_helpers_never_echo_secrets() {
+        assert_eq!(
+            https_origin_for_host("herdr-edge-prod.example").as_deref(),
+            Some("https://herdr-edge-prod.example")
+        );
+        assert_eq!(https_origin_for_host("user:pass@host"), None);
+        assert_eq!(
+            issuer_host("https://issuer.example/oauth").as_deref(),
+            Some("issuer.example".to_owned()).as_deref()
+        );
+        assert_eq!(
+            issuer_host("https://issuer.example/oauth?token=secret"),
+            None
+        );
+        assert_eq!(sanitize_probe_token("herdr-edge-prod"), "herdr-edge-prod");
+        assert_eq!(sanitize_probe_token("Bearer abc"), "redacted");
+        assert_eq!(sanitize_probe_token("link_token=secret"), "redacted");
+    }
+
+    #[test]
+    fn mcp_endpoint_accepts_unauthorized_without_sending_auth() {
+        assert!(matches!(
+            RemoteExpect::McpEndpoint,
+            RemoteExpect::McpEndpoint
+        ));
+        let body = r#"{"service":"herdr-edge-prod","contractEpoch":2}"#;
+        assert_eq!(
+            json_string_field(body, "service").as_deref(),
+            Some("herdr-edge-prod")
+        );
+        assert_eq!(json_u64_field(body, "contractEpoch"), Some(2));
     }
 
     #[test]
