@@ -34,7 +34,7 @@ herdr-mcp link install     # candidate LaunchAgent only (dev.herdr-mcp.link-rust
 herdr-mcp link uninstall   # removes candidate LaunchAgent only; never Node link/link-prod
 herdr-mcp link cutover     # default dry-run: plan + validate only (exit 2 if not ready)
 herdr-mcp link cutover --dry-run
-# herdr-mcp link cutover --execute  # gated stub; requires HERDR_LINK_CUTOVER_I_UNDERSTAND=1 and still no-ops
+# herdr-mcp link cutover --execute  # requires HERDR_LINK_CUTOVER_I_UNDERSTAND=1; PREPARE/ACTIVATE/VERIFY + ROLLBACK for link-prod only; never auto-seals production_ready; independent Shell only
 herdr-mcp link migrate-runtime-control           # default dry-run: plan Rust-compatible prod control
 herdr-mcp link migrate-runtime-control --write-staging
 # HERDR_LINK_MIGRATE_RUNTIME_CONTROL=1 herdr-mcp link migrate-runtime-control --apply
@@ -48,9 +48,19 @@ herdr-mcp doctor           # LAYER link shows production_owner=node|rust|...
 - Reads Node `dev.herdr-mcp.link-prod` + candidate `dev.herdr-mcp.link-rust-candidate`.
 - Validates planned ProgramArguments must be `runtime/current/herdr-mcp link run` (never checkout / `target/`).
 - Prints the exact cutover steps and Node-plist rollback steps that **would** run.
-- Sets `ready_for_execute=false` and exits non-zero when preconditions fail (missing managed runtime, unhealthy candidate, Node-era runtime-control generation, missing dual UAT record, etc.).
+- Sets `ready_for_execute` from technical preconditions (managed runtime, candidate, ownership, rust control generation). `dual_verification_uat_recorded` is a **seal** blocker, not an execute blocker.
 - **Never** bootouts/bootstraps launchd, never writes prod plists, never unloads Node `link` / `link-prod`.
-- `--execute` is intentionally not implemented: even with `HERDR_LINK_CUTOVER_I_UNDERSTAND=1` it no-ops and reports `cutover_performed=false`.
+
+### Execute cutover transaction (landed; do not run casually)
+
+`herdr-mcp link cutover --execute` with `HERDR_LINK_CUTOVER_I_UNDERSTAND=1`:
+
+- PREPARE: backup Node prod plist → `~/.config/herdr-mcp/backups/link-prod.plist.pre-rust-cutover`
+- ACTIVATE: rewrite **only** `dev.herdr-mcp.link-prod` to `runtime/current/herdr-mcp link run`, bootout/bootstrap (never inferred launchd submission jobs)
+- VERIFY: ProgramArguments + loaded; on failure ROLLBACK restores Node backup
+- Leaves `dev.herdr-mcp.link` and `dev.herdr-mcp.link-rust-candidate` untouched
+- Never flips `production_ready` / health seal
+- Must run from an **independent Shell** (not managed `herdr_exec`)
 
 ### Runtime-control migration helper (landed; not a LaunchAgent cut)
 
