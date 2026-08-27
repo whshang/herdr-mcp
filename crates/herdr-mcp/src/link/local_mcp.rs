@@ -258,6 +258,10 @@ impl LocalMcpTransport {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(value);
     }
 
+    pub(crate) fn observed_runtime_version(&self) -> Option<String> {
+        self.discovered_version()
+    }
+
     fn runtime_snapshot(&self) -> RuntimeContractInfo {
         RuntimeContractInfo {
             runtime_version: self
@@ -608,7 +612,7 @@ enum HealthHttp {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum ParsedBody {
+pub(crate) enum ParsedBody {
     Result { result: Option<Value> },
     RpcError { code: Option<i64> },
     IdMismatch { parsed: usize },
@@ -655,7 +659,7 @@ pub fn clamp_request_timeout(hint: Option<f64>, fallback: u64, max: u64) -> u64 
     base.max(1).min(max.max(1))
 }
 
-fn parse_mcp_body(text: &str, expected_id: &Value) -> ParsedBody {
+pub(crate) fn parse_mcp_body(text: &str, expected_id: &Value) -> ParsedBody {
     let messages = match scan_rpc_messages(text) {
         ScanOutcome::Messages(messages) => messages,
         ScanOutcome::Malformed => return ParsedBody::Malformed,
