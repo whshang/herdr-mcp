@@ -23,7 +23,7 @@ As of **alpha.13** on this developer workstation after live `link cutover --exec
 | Production Link `dev.herdr-mcp.link-prod` | **Rust** `runtime/current/herdr-mcp link run` | ProgramArguments after execute; PID changed Node `10621` → Rust `4745`/`6131` |
 | Prod runtime-control / status | Rust-compatible ids (desired still `rust-6e3f0b…` no-op migrate; status active observed `rust-5c7799…`) | same loopback `127.0.0.1:8772/mcp` |
 | Dev/canary Link `dev.herdr-mcp.link` | **Node** unchanged | PID `3937` preserved through cutover |
-| Rust candidate `dev.herdr-mcp.link-rust-candidate` | argv still `runtime/current link run`; post-cutover kickstart hit `contract_rejected` (gap) | Do not treat candidate health as prod blocker once prod Edge is online |
+| Rust candidate `dev.herdr-mcp.link-rust-candidate` | argv `runtime/current link run`; **Edge retargeted to edge-prod (epoch 2)**; soak PID online with MCP+Edge TCP | Do not treat candidate health as prod blocker once prod Edge is online |
 | Health | `/health` has no `production_ready=true`; `link status` `production_ready_eligible=false` | seal still open |
 
 ### Live cutover evidence (developer workstation)
@@ -238,7 +238,42 @@ Developer workstation: **done** on alpha.13 (see evidence above). Remaining:
 - [x] `link cutover` dry-run + **execute** (alpha.13; developer workstation live)
 - [x] `migrate-runtime-control` gated `--apply` (control file only)
 - [x] Dual self-observation Pass A/B recorded (this doc)
-- [ ] Longer candidate Edge soak matrix (heartbeat/cancel/long-request); repair candidate `contract_rejected` after alpha.13 kickstart
-- [ ] Deliberate Node rollback UAT (restore backup + bootstrap) without deleting artifacts
-- [ ] Auditable `production_ready` seal (versioned evidence; rollback clears seal)
+- [x] Candidate `contract_rejected` root-caused: edge-dev `/health` still publishes epoch 1 while Rust hello is epoch 2; candidate defaults + install probe retarget to edge-prod (epoch 2). Live soak: PID online, MCP `8772` + Edge TCP ESTABLISHED; link-prod untouched
+- [ ] Deliberate Node rollback UAT via `link cutover --rollback` (alpha.14+) without deleting artifacts
+- [ ] Auditable `production_ready` seal via `link seal` (alpha.14+; rollback clears seal)
+- [ ] Longer candidate Edge soak matrix (heartbeat/cancel/long-request) on edge-prod
 - [ ] Clean-machine confirmation of G3 user CLI seal (shared with G3/G18)
+
+
+### Deliberate Node rollback UAT (2026-08-27T15:52Z)
+
+Independent Shell, alpha.14 release binary for `--rollback`, then alpha.13 `runtime/current` for re-cut:
+
+1. Pre: `production_owner=rust`, link-prod PID 6131, backups present (Node ProgramArguments).
+2. `HERDR_LINK_CUTOVER_I_UNDERSTAND=1 <alpha.14-bin> link cutover --rollback` → `ok=true` (restore+bootout+bootstrap).
+3. Node window: PID 80435 `node .../macos-daemon.js`; MCP `8772` + Edge HTTPS ESTABLISHED; log `link online`.
+4. Immediate re-cut: `HERDR_LINK_CUTOVER_I_UNDERSTAND=1 runtime/current link cutover --execute` → `ok=true` VERIFY.
+5. Rust again: PID 80664 `runtime/current/herdr-mcp link run`; MCP+Edge TCP; `tools/list` **18**; health alpha.13 `production_ready=false`.
+6. Backups retained. Seal evidence recorded under `~/.config/herdr-mcp/seals/evidence/{dual,rollback}-uat.json`.
+7. `link seal --execute` deferred until alpha.14 is the installed runtime (health/seal readers live in binary).
+
+### Candidate contract fix evidence (2026-08-27)
+
+Diagnosis (independent Shell):
+
+- `herdr-edge-dev` `/health` → `contractEpoch:1` / epoch1 hash
+- `herdr-edge-prod` `/health` → `contractEpoch:2` / public epoch2 hash
+- Rust hello with epoch2 against edge-dev → `hello_ack` `contract_mismatch` → exit `contract_rejected`
+- Same binary against edge-prod + prod Keychain + `dev-rust-link-candidate` → stays running with Edge+MCP TCP
+
+Fix (alpha.14 source):
+
+- Candidate / `link run` defaults: `wss://herdr-edge-prod.../ws` + `herdr-edge-prod-link-secret`
+- `link install` and `link run` probe Edge `/health` and refuse epoch-1 Edges before bootstrap/connect
+- hello_ack refusal logs `code` + `message` on stderr
+
+Live reinstall (candidate only; ProgramArguments still `runtime/current`):
+
+- `edge_contract_epoch=2`, `edge_service=herdr-edge-prod`
+- LaunchAgent PID running; `localhost:8772` + Cloudflare HTTPS ESTABLISHED
+- `dev.herdr-mcp.link-prod` PID unchanged through reinstall

@@ -277,21 +277,21 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ---
 
-## Current Scorecard（2026-08-27 · live alpha.13 / link-prod cutover）
+## Current Scorecard（2026-08-27 · live alpha.13 / candidate edge-prod soak）
 
-评分：`PASS` / `PARTIAL` / `FAIL` / `UNKNOWN`。本表对齐 **2026-08-27 live `0.4.0-alpha.13`** 证据（tag `v0.4.0-alpha.13` / source `4fde2a8`，generation `rust-5c7799b56a426855`），并保留 [#95](https://github.com/whshang/herdr-mcp/pull/95) EventCache doctor、[#96](https://github.com/whshang/herdr-mcp/pull/96) cutover execute、[#97](https://github.com/whshang/herdr-mcp/pull/97) harden+alpha.13。产品仍处 **alpha**，**未达 GA**；**未**将 `production_ready` 置 true。
+评分：`PASS` / `PARTIAL` / `FAIL` / `UNKNOWN`。本表对齐 **2026-08-27 live `0.4.0-alpha.13`** runtime（generation `rust-5c7799b56a426855`）+ candidate Edge retarget 证据；alpha.14 源码含 `link cutover --rollback` / `link seal`，**未**自动 seal。产品仍处 **alpha**，**未达 GA**；`production_ready` 仍 false until seal execute after rollback UAT。
 
 本机 update 证据：managed update `0.4.0-alpha.12` / `rust-6e3f0b8685b89e66` → `0.4.0-alpha.13` / `rust-5c7799b56a426855`；service healthy；epoch 2 / 18 tools；用户 CLI → `runtime/current`。
 
-本机 G5 LaunchAgent 切流证据（独立 Shell，非 `herdr_exec`）：`HERDR_LINK_CUTOVER_I_UNDERSTAND=1 link cutover --execute` 成功；`link-prod` ProgramArguments = `runtime/current/herdr-mcp link run`；Node canary `dev.herdr-mcp.link` PID 未变；Node 备份保留。双次自验收 Pass A/B 见 [`docs/_wip/g5-link-production-cutover.md`](./_wip/g5-link-production-cutover.md)。`production_ready_eligible=false`；health 无 `production_ready=true`。G5 从 FAIL 升为 **PARTIAL**（切流已做，seal / 干净机 / 故意 rollback UAT 仍缺）。
+本机 G5：`link-prod` = Rust `runtime/current link run`；candidate 已在 **edge-prod epoch 2** 上线（原 `contract_rejected` 因 edge-dev 仍为 epoch 1）。双次自验收 Pass A/B 已记。仍缺：故意 Node rollback UAT、`link seal --execute`、干净机。G5 保持 **PARTIAL**（切流+candidate 修复已做；seal 未做则不得 PASS）。
 
 | ID | 评分 | 一行证据 |
 | --- | --- | --- |
-| G1 | **FAIL** | 仍处 alpha：Cargo / `--version` / tag 为 `0.4.0-alpha.13`；`package.json` / `src/version.ts` = `0.3.32`；无单一正式 stable 口径 |
+| G1 | **FAIL** | 仍处 alpha：Cargo 下一发 `0.4.0-alpha.14`；live 仍 alpha.13；`package.json` = `0.3.32` |
 | G2 | **PARTIAL** | Rust Release + attestation/manifest 链已存在；但 README / `docs/i18n/en/install.md` 主路径仍是 `git clone` + `npm ci` + Node.js 20+ |
 | G3 | **PARTIAL** | 顶层 CLI + entrypoint 已合入；**本机 live symlink 已迁到 `runtime/current`**。仍 PARTIAL：缺干净机 / 正式多机 seal |
 | G4 | **PARTIAL** | `service install` + generation/health/rollback 代码存在；正式文档未给出 binary → `herdr-mcp install` 干净机路径 |
-| G5 | **PARTIAL** | 本机 `link-prod` 已切到 Rust `runtime/current link run`（alpha.13）；Edge TCP 稳定；`production_owner=rust`。仍缺：`production_ready` seal、故意 Node rollback UAT、候选 soak 矩阵 / candidate `contract_rejected` 修复、干净机复验 |
+| G5 | **PARTIAL** | `link-prod` Rust；candidate edge-prod soak 在线；rollback UAT PASS；仍缺 alpha.14 apply + `link seal --execute` + 干净机（seal 前不得标 PASS） |
 | G6 | **PARTIAL** | 嵌入契约 epoch 2 / 18 tools（hash 冻结）；真实 ChatGPT 与全路径 production smoke 仍属 alpha 验收 |
 | G7 | **PARTIAL** | Edge→Link→runtime 在本机已走 Rust `link-prod`；canary 仍 Node；缺 seal 与多机 |
 | G8 | **PARTIAL** | Live alpha.13 `doctor` 8 行 `LAYER`；`LAYER link owned production_owner=rust` / `production_ready_eligible=false`；`remote-probe=skipped` |
@@ -319,10 +319,10 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ## Current P0 work queue
 
-按 2026-08-27 live alpha.13 / link-prod cutover 证据排序：
+按 2026-08-27 live alpha.13 / candidate edge-prod soak 证据排序：
 
-1. **G5 seal — `production_ready` 可审计封印**（切流已完成，seal 未做）：versioned evidence + 双次自验收写入 + rollback 清 seal；在此之前保持 `production_ready=false`。清单见 [`docs/_wip/g5-link-production-cutover.md`](./_wip/g5-link-production-cutover.md)。
-2. **G5 follow-ups**：故意 Node rollback UAT；修复 candidate `contract_rejected`；补 heartbeat/cancel/long-request soak。
+1. **G5 seal — `production_ready` 可审计封印**（alpha.14 `link seal`）：rollback UAT 后再 `--execute`；在此之前保持 `production_ready=false`。
+2. **G5 follow-ups**：alpha.14 apply → `link seal --execute`；candidate edge-prod soak 加深。
 3. **G1 — 单一正式产品版本（退出 alpha）**。
 4. **G3 formal seal — 干净机 / 多机确认**。
 5. **G18 — 干净机 install UAT**。

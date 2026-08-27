@@ -23,9 +23,13 @@ pub enum LinkCommand {
     Install,
     /// Remove only the Rust Link candidate LaunchAgent. Never touches live Node link/link-prod.
     Uninstall,
-    /// Production Link cutover planner/executor. Default is dry-run; execute is env-gated.
+    /// Production Link cutover planner/executor/rollback. Default is dry-run.
     Cutover {
         mode: crate::link::CutoverMode,
+    },
+    /// Auditable production_ready seal (P0-6). Never auto-flipped from LaunchAgent alone.
+    Seal {
+        mode: crate::link::SealMode,
     },
     /// Prepare / apply Rust-compatible prod runtime-control generation (no LaunchAgent cut).
     MigrateRuntimeControl {
@@ -112,18 +116,19 @@ fn parse_link(args: &[String]) -> Result<Command, String> {
         [subcommand] if subcommand == "install" => Ok(Command::Link(LinkCommand::Install)),
         [subcommand] if subcommand == "uninstall" => Ok(Command::Link(LinkCommand::Uninstall)),
         [subcommand, ..] if subcommand == "cutover" => parse_link_cutover(&args[1..]),
+        [subcommand, ..] if subcommand == "seal" => parse_link_seal(&args[1..]),
         [subcommand, ..] if subcommand == "migrate-runtime-control" => {
             parse_link_migrate_runtime_control(&args[1..])
         }
         [] => Err(
-            "link requires status, run, install, uninstall, cutover, or migrate-runtime-control"
+            "link requires status, run, install, uninstall, cutover, seal, or migrate-runtime-control"
                 .to_owned(),
         ),
         [subcommand] => Err(format!(
-            "unknown link command '{subcommand}' (status|run|install|uninstall|cutover|migrate-runtime-control)"
+            "unknown link command '{subcommand}' (status|run|install|uninstall|cutover|seal|migrate-runtime-control)"
         )),
         _ => Err(
-            "link accepts status, run, install, uninstall, cutover [--dry-run|--execute], or migrate-runtime-control [--dry-run|--write-staging|--apply]"
+            "link accepts status, run, install, uninstall, cutover [--dry-run|--execute|--rollback], seal [...], or migrate-runtime-control [--dry-run|--write-staging|--apply]"
                 .to_owned(),
         ),
     }
@@ -134,30 +139,73 @@ fn parse_link_cutover(args: &[String]) -> Result<Command, String> {
 
     let mut dry_run = false;
     let mut execute = false;
+    let mut rollback = false;
     for arg in args {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
             "--execute" => execute = true,
+            "--rollback" => rollback = true,
             value => {
                 return Err(format!(
-                    "unknown link cutover argument '{value}' (expected --dry-run or --execute)"
+                    "unknown link cutover argument '{value}' (expected --dry-run, --execute, or --rollback)"
                 ));
             }
         }
     }
-    if dry_run && execute {
+    let selected = [dry_run, execute, rollback]
+        .into_iter()
+        .filter(|value| *value)
+        .count();
+    if selected > 1 {
         return Err(
-            "link cutover accepts only one of --dry-run or --execute (default is dry-run)"
+            "link cutover accepts only one of --dry-run, --execute, or --rollback (default is dry-run)"
                 .to_owned(),
         );
     }
-    // Bare `link cutover` defaults to dry-run.
     let mode = if execute {
         CutoverMode::Execute
+    } else if rollback {
+        CutoverMode::Rollback
     } else {
         CutoverMode::DryRun
     };
     Ok(Command::Link(LinkCommand::Cutover { mode }))
+}
+
+fn parse_link_seal(args: &[String]) -> Result<Command, String> {
+    use crate::link::SealMode;
+
+    if args.is_empty() {
+        return Ok(Command::Link(LinkCommand::Seal {
+            mode: SealMode::Status,
+        }));
+    }
+    match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["status"] => Ok(Command::Link(LinkCommand::Seal {
+            mode: SealMode::Status,
+        })),
+        ["record", "--dual-uat"] => Ok(Command::Link(LinkCommand::Seal {
+            mode: SealMode::RecordDualUat,
+        })),
+        ["record", "--rollback-uat"] => Ok(Command::Link(LinkCommand::Seal {
+            mode: SealMode::RecordRollbackUat,
+        })),
+        ["--dry-run"] => Ok(Command::Link(LinkCommand::Seal {
+            mode: SealMode::DryRun,
+        })),
+        ["--execute"] => Ok(Command::Link(LinkCommand::Seal {
+            mode: SealMode::Execute,
+        })),
+        _ => Err(
+            "link seal accepts status | record --dual-uat | record --rollback-uat | --dry-run | --execute"
+                .to_owned(),
+        ),
+    }
 }
 
 fn parse_link_migrate_runtime_control(args: &[String]) -> Result<Command, String> {
@@ -386,7 +434,8 @@ Advanced / internal:\n\
   herdr-mcp link run\n\
   herdr-mcp link install\n\
   herdr-mcp link uninstall\n\
-  herdr-mcp link cutover [--dry-run|--execute]\n\
+  herdr-mcp link cutover [--dry-run|--execute|--rollback]\n\
+  herdr-mcp link seal [status|record --dual-uat|record --rollback-uat|--dry-run|--execute]\n\
   herdr-mcp link migrate-runtime-control [--dry-run|--write-staging|--apply]\n\
   herdr-mcp native-host <install|status|uninstall|rollback>\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\
@@ -398,11 +447,14 @@ for normal lifecycle. Use service ... only for advanced service control\n\
 ownership/gates reporting. link run starts a foreground Rust Link candidate\n\
 (Keychain/plist credentials). link install/uninstall manage only the candidate\n\
 LaunchAgent dev.herdr-mcp.link-rust-candidate → runtime/current link run; they\n\
-never unload or replace live Node link/link-prod. link cutover defaults to\n\
-dry-run plan/validate only; --execute requires HERDR_LINK_CUTOVER_I_UNDERSTAND=1\n\
-and runs a PREPARE/ACTIVATE/VERIFY transaction for link-prod only (with ROLLBACK),\n\
-never flips production_ready, and must be run from an independent Shell. link\n\
-migrate-runtime-control prepares a\n\
+never unload or replace live Node link/link-prod. Candidate defaults to an\n\
+epoch-2 Edge (edge-prod) and refuses install when Edge /health is still epoch 1.\n\
+link cutover defaults to dry-run plan/validate only; --execute / --rollback\n\
+require HERDR_LINK_CUTOVER_I_UNDERSTAND=1, mutate only link-prod via\n\
+bootout/bootstrap (never the forbidden launchd submission path), and --rollback clears any active\n\
+production_ready seal. link seal writes an auditable evidence artifact; it never\n\
+auto-flips from LaunchAgent ownership alone (HERDR_LINK_SEAL_I_UNDERSTAND=1 for\n\
+--execute). link migrate-runtime-control prepares a\n\
 Rust-compatible runtime-control-prod generation (default dry-run; --write-staging\n\
 writes a pending sibling; --apply rewrites the live control file only with\n\
 HERDR_LINK_MIGRATE_RUNTIME_CONTROL=1) and never mutates LaunchAgents.\n"

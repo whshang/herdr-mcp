@@ -51,10 +51,19 @@ pub fn migration_status() -> Value {
         .copied()
         .filter(|name| !MIGRATED_TOOLS.contains(name))
         .collect::<Vec<_>>();
+    let sealed = env::var_os("HOME")
+        .map(|home| {
+            crate::link::seal::production_ready_from_seal(
+                &std::path::PathBuf::from(home)
+                    .join(".config")
+                    .join("herdr-mcp"),
+            )
+        })
+        .unwrap_or(false);
     json!({
-        "phase": "candidate",
+        "phase": if sealed { "production" } else { "candidate" },
         "native_parity_ready": pending.is_empty(),
-        "production_ready": false,
+        "production_ready": sealed,
         "link_cutover": crate::link::production_ready_gate_catalog(),
         "contract_epoch": contract::identity().ok().map(|identity| identity.epoch),
         "tool_count": all.len(),
@@ -98,8 +107,20 @@ pub fn augment_inspect(view: &mut Value, cache: Option<&EventCache>, exec: Optio
 
 pub fn health_fields(cache: &EventCache, exec: Option<&ExecRegistry>) -> Map<String, Value> {
     let diagnostics = cache.diagnostics();
+    let sealed = env::var_os("HOME")
+        .map(|home| {
+            crate::link::seal::production_ready_from_seal(
+                &std::path::PathBuf::from(home)
+                    .join(".config")
+                    .join("herdr-mcp"),
+            )
+        })
+        .unwrap_or(false);
     let mut output = Map::new();
-    output.insert("runtime".to_owned(), json!("rust-candidate"));
+    output.insert(
+        "runtime".to_owned(),
+        json!(if sealed { "rust" } else { "rust-candidate" }),
+    );
     output.insert("version".to_owned(), json!(env!("CARGO_PKG_VERSION")));
     output.insert("build".to_owned(), build_info());
     output.insert("native_migration".to_owned(), migration_status());

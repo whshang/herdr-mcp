@@ -14,18 +14,24 @@ use super::daemon::{
     DaemonConfigError, LinkDaemonConfig, read_link_daemon_config, run_link_daemon,
 };
 
-/// Default Keychain service matching Node `MACOS_LINK_KEYCHAIN_SERVICE`.
-pub const MACOS_LINK_KEYCHAIN_SERVICE: &str = "herdr-edge-dev-link-secret";
-/// Default Edge WSS URL matching Node `MACOS_DEFAULT_EDGE_URL`.
-pub const MACOS_DEFAULT_EDGE_URL: &str = "wss://herdr-edge-dev.whshang.workers.dev/ws";
-/// Default workstation id matching Node `MACOS_DEFAULT_WORKSTATION_ID`.
-pub const MACOS_DEFAULT_WORKSTATION_ID: &str = "dev-real-runtime";
+/// Default Keychain service for Rust Link soak/candidate (epoch-2 Edge).
+///
+/// Node canary still uses `herdr-edge-dev-link-secret` against edge-dev. Rust
+/// `link run` requires public contract epoch 2, so defaults follow edge-prod.
+pub const MACOS_LINK_KEYCHAIN_SERVICE: &str = "herdr-edge-prod-link-secret";
+/// Default Edge WSS URL for Rust Link (must publish contract epoch 2).
+pub const MACOS_DEFAULT_EDGE_URL: &str = "wss://herdr-edge-prod.whshang.workers.dev/ws";
+/// Default workstation id for foreground `link run` without env overrides.
+pub const MACOS_DEFAULT_WORKSTATION_ID: &str = "dev-rust-link-candidate";
 
 const SERVER_PLIST_REL: &str = "Library/LaunchAgents/dev.herdr-mcp.server.plist";
 
 /// CLI entry: load config and run the staged daemon in the foreground.
 pub fn run() -> Result<ExitCode, String> {
     let config = load_link_run_config().map_err(|error| error.to_string())?;
+    // Fail closed before opening a WebSocket when Edge still publishes epoch 1.
+    let _edge = super::edge_contract::probe_edge_contract_for_rust_link(&config.edge_url)
+        .map_err(|error| format!("herdr-mcp link run: {error}"))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
