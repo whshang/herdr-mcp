@@ -277,25 +277,25 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ---
 
-## Current Scorecard（2026-08-27 evening · owner judgment）
+## Current Scorecard（2026-08-27 · live alpha.9 evidence）
 
-评分：`PASS` / `PARTIAL` / `FAIL` / `UNKNOWN`。本表对齐 **2026-08-27 晚间 owner 判断表**；证据来自当日 `origin/main`、本机只读 runtime，以及本机 managed update/rollback。产品仍处 **alpha**，**未达 GA**。
+评分：`PASS` / `PARTIAL` / `FAIL` / `UNKNOWN`。本表对齐 **2026-08-27 live `0.4.0-alpha.9` 证据**；来源为当日 released+applied runtime、本机 managed update，以及只读 `runtime/current` / doctor。产品仍处 **alpha**，**未达 GA**。
 
-本机 update 证据（开发者工作站，非干净机）：`0.4.0-alpha.6` / `rust-c7ba28e4f499c16b` → `0.4.0-alpha.8` / `rust-7ef4a3f7b328c3d2`；service healthy；launchd 指向 `runtime/current`；epoch 2 / 18 tools。Streaming basics：`herdr_exec_start`→`herdr_exec_read` 见 `phase` started/running/completed + progress。关键 blocker：production Link 仍为 Node、health `production_ready=false` / rust-candidate；`~/.local/bin/herdr-mcp` 仍指向仓库 Bash bridge。源码侧：[#74](https://github.com/whshang/herdr-mcp/pull/74) 顶层 CLI 别名与 [#73](https://github.com/whshang/herdr-mcp/pull/73) doctor `LAYER` map 已在 `origin/main`；正式 seal 仍待 live runtime 带出 + Bash bridge 迁移。
+本机 update 证据（开发者工作站，非干净机）：released+applied `0.4.0-alpha.9`（`ca8fee9`，generation `rust-1c1e1fde1330480e`）；managed update `0.4.0-alpha.8` → `0.4.0-alpha.9`；service healthy；epoch 2 / 18 tools。Live `runtime/current`：顶层 `install` / `rollback` / `uninstall` 已识别；`doctor` 打印 8 行 `LAYER`。关键 blocker：production Link 仍为 Node、health `production_ready=false` / rust-candidate；`~/.local/bin/herdr-mcp` 仍指向仓库 Bash bridge（G3 seal 残留仅此）。Streaming basics（先前 alpha）：`herdr_exec_start`→`herdr_exec_read` 见 `phase` started/running/completed + progress。
 
-本机受控 rollback 证据（同日，开发者工作站）：`0.4.0-alpha.8` / `rust-7ef4a3f7…` → `service rollback` → `0.4.0-alpha.6` / `rust-c7ba28e4…` healthy → `update apply` → `0.4.0-alpha.8` / `rust-7ef4a3f7…` healthy；epoch 2 / 18；oauth/connector 保留；回退后 Streaming MCP smoke 通过。算 alpha 真实闭环，**不算** stable / 干净机 UAT。
+本机受控 rollback 证据（同日较早，开发者工作站）：`0.4.0-alpha.8` / `rust-7ef4a3f7…` → `service rollback` → `0.4.0-alpha.6` / `rust-c7ba28e4…` healthy → `update apply` → `0.4.0-alpha.8` / `rust-7ef4a3f7…` healthy；epoch 2 / 18；oauth/connector 保留；回退后 Streaming MCP smoke 通过。算 alpha 真实闭环，**不算** stable / 干净机 UAT。当前 live 代际为 alpha.9。
 
 | ID | 评分 | 一行证据 |
 | --- | --- | --- |
-| G1 | **FAIL** | 仍处 alpha：Cargo / `--version` / tag 为 `0.4.0-alpha.8`；`package.json` / `src/version.ts` = `0.3.32`；无单一正式 stable 口径 |
+| G1 | **FAIL** | 仍处 alpha：Cargo / `--version` / tag 为 `0.4.0-alpha.9`；`package.json` / `src/version.ts` = `0.3.32`；无单一正式 stable 口径 |
 | G2 | **PARTIAL** | Rust Release + attestation/manifest 链已存在；但 README / `docs/i18n/en/install.md` 主路径仍是 `git clone` + `npm ci` + Node.js 20+ |
-| G3 | **PARTIAL** | 核心别名已合入 [#74](https://github.com/whshang/herdr-mcp/pull/74)（`2033168`：顶层 `install` / `rollback` / `uninstall`）；正式 seal 未完成：live runtime 未带出、`~/.local/bin/herdr-mcp` 仍指向仓库 Bash bridge |
+| G3 | **PARTIAL** | Live `runtime/current` 已识别顶层 `install` / `rollback` / `uninstall`（[#74](https://github.com/whshang/herdr-mcp/pull/74) 已带出）；正式 seal 残留：把 `~/.local/bin/herdr-mcp` 从仓库 Bash bridge 迁到 `runtime/current` |
 | G4 | **PARTIAL** | `service install` + generation/health/rollback 代码存在；正式文档未给出 binary → `herdr-mcp install` 干净机路径 |
 | G5 | **FAIL** | **关键 blocker**：production Link 仍走 Node；Rust 仅为 candidate；health `production_ready=false` / rust-candidate；未完成 Rust production ownership 切流 |
 | G6 | **PARTIAL** | 嵌入契约 epoch 2 / 18 tools（hash 冻结）；真实 ChatGPT 与全路径 production smoke 仍属 alpha 验收，未做 GA 冻结声明 |
 | G7 | **PARTIAL** | Edge→Link→runtime 在 alpha 上有过真实 UAT 记录；当前 Link 生产所有者仍是 Node，非「全 Rust」闭环 |
-| G8 | **PARTIAL** | [#73](https://github.com/whshang/herdr-mcp/pull/73)（`9faa14c`）已交付本机 `LAYER` ownership map；非完整 remote 闭环（`remote-probe=skipped`）；live alpha.8 尚未带出 |
-| G9 | **PARTIAL** | alpha 向 UAT 已通过（本机 managed update alpha.6→alpha.8）；**无** stable N→N+1 / 干净机用户向 UAT |
+| G8 | **PARTIAL** | Live alpha.9 `doctor` 已打印 8 行 `LAYER`（[#73](https://github.com/whshang/herdr-mcp/pull/73)）；非完整 remote 闭环（`remote-probe=skipped`） |
+| G9 | **PARTIAL** | 又一次 alpha N→N+1 通过（本机 managed update alpha.8→alpha.9）；**无** stable N→N+1 / 干净机用户向 UAT |
 | G10 | **PARTIAL** | alpha.8↔alpha.6 真实受控回退已通过（同日开发者工作站）；非 stable、非干净机，故未 PASS |
 | G11 | **PARTIAL** | service mutation guardian、Link reconnect 组件 staged；完整崩溃/重启矩阵未做 GA UAT |
 | G12 | **PARTIAL** | Streaming basics 已落地（phase + progress smoke）；跨网页回合正式 GA UAT 未封板 |
@@ -310,7 +310,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G21 | **PARTIAL** | 站点 21/21 等 CI gate 在 alpha 主线上维护；尚无 stable tag「同 commit 源站」封板 |
 | G22 | **FAIL** | Fastest path / install 仍引导 `git clone`、`npm ci`、`node dist/server.js`；`~/.local/bin/herdr-mcp` 仍链到仓库 Bash |
 | G23 | **PARTIAL** | main CI（Rust/Node/Edge/site/extension）在 alpha 迭代中可绿；GA tag 专用全绿验收未跑 |
-| G24 | **FAIL** | P0/P1 blocker 仍在：尤其 G5（Node Link）、G1（alpha）、G3 seal、G18；`production_ready=false` |
+| G24 | **FAIL** | P0/P1 blocker 仍在：尤其 G5（Node Link）、G1（alpha）、G3 seal（用户 CLI symlink→`runtime/current`）、G18；`production_ready=false` |
 | G25 | **FAIL** | 未达 GA：八个 veto 多数仍依赖仓库路径、内部 `service` 概念或 Node Link；不能打 stable |
 
 **合计（诚实快照）**：PASS 1 · PARTIAL 15 · FAIL 9 · UNKNOWN 0
@@ -319,11 +319,11 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ## Current P0 work queue
 
-按 owner 2026-08-27 晚间判断排序（先解关键生产 blocker，再封版本与入口，再干净机与扩展宣称）：
+按 2026-08-27 live alpha.9 证据排序（先解关键生产 blocker，再封版本与入口，再干净机与扩展宣称）：
 
 1. **G5 — Rust production Link 切流 + `production_ready`**：候选 Link 完成生产所有权切换；去掉用户路径对 Node link 的依赖；health 不再停在 rust-candidate / `production_ready=false`。
 2. **G1 — 单一正式产品版本（退出 alpha）**：Cargo / GitHub Release / `--version` / README 对齐为同一 stable 口径；去掉用户可见 `alpha`。
-3. **G3 seal — 用户 CLI 与 live runtime 封板**：把 `~/.local/bin/herdr-mcp` 从仓库 Bash bridge 迁到 `runtime/current`；live runtime 带上顶层 `install` / `rollback` / `uninstall`（#74 已合入源码，待生产代际带出）。
+3. **G3 seal — 用户 CLI symlink 迁到 `runtime/current`**：live runtime 已带出顶层 `install` / `rollback` / `uninstall`；残留仅把 `~/.local/bin/herdr-mcp` 从仓库 Bash bridge 迁到 installed `runtime/current`。
 4. **G18 — 干净机 install UAT**：不使用开发仓库，按正式文档从零安装并跑通用户闭环。
 5. **G15 — 扩展正式分发，或从 GA 宣称中移除**：商店级 / 文档级分发封板；否则不得在 GA 口径中承诺浏览器扩展。
 
