@@ -679,7 +679,9 @@ mod tests {
         assert!(content.contains("dependency-aware **wave**"));
         assert!(content.contains("are already compacted"));
         assert!(content.contains("Long build/test/process work belongs in `herdr_exec_start`"));
-        assert!(content.contains("prefer `herdr_exec_start` -> `herdr_exec_read` (delta) over a blocking `herdr_exec`"));
+        assert!(content.contains(
+            "prefer `herdr_exec_start` -> `herdr_exec_read` (delta) over a blocking `herdr_exec`"
+        ));
         fs::remove_dir_all(config.runtime_status_path.parent().unwrap()).unwrap();
     }
 
