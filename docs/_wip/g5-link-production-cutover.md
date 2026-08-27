@@ -10,33 +10,35 @@ generation + control, [`docs/ga-release-gate.md`](../ga-release-gate.md) G5 (P0 
 
 ## Current ownership (read-only truth)
 
-As of the G5 prep slice on developer workstations (runtime already on
-`0.4.0-alpha.9` with CLI aliases + doctor LAYER; Link ownership unchanged):
+As of alpha.10 on developer workstations (G3 user CLI sealed to
+`runtime/current`; Link ownership unchanged — do not cut live Node Link):
 
 | Layer | Owner today | Evidence |
 | --- | --- | --- |
-| MCP runtime service `dev.herdr-mcp.server` | Rust generation under `runtime/current` (alpha.9) | `herdr-mcp service status` / `--version` |
-| Production Link `dev.herdr-mcp.link-prod` | **Node** `node` + checkout `dist/link/macos-daemon.js` | LaunchAgent ProgramArguments |
+| MCP runtime service `dev.herdr-mcp.server` | Rust generation under `runtime/current` (alpha.10) | `herdr-mcp service status` / `--version` |
+| User CLI `~/.local/bin/herdr-mcp` | Symlink → `runtime/current/herdr-mcp` (G3 sealed) | `ls -l` / `readlink` |
+| Production Link `dev.herdr-mcp.link-prod` | **Node** `node` + checkout `dist/link/macos-daemon.js` (desired=active=stable-0.3.32) | LaunchAgent ProgramArguments |
 | Dev/canary Link `dev.herdr-mcp.link` | **Node** same daemon path | LaunchAgent ProgramArguments |
-| Rust `link::daemon` | Staged candidate assembly only | No production LaunchAgent; no `link run` yet |
+| Rust `link::daemon` | Staged candidate; CLI `link run` available in source (Keychain/plist load) | No production LaunchAgent cutover |
 | Health | `runtime=rust-candidate`, `production_ready=false` | `/health` + `native_migration` |
 
-Read-only command (this PR):
+Read-only / candidate commands:
 
 ```bash
 herdr-mcp link status
+herdr-mcp link run    # foreground candidate only; does not cut production
 herdr-mcp doctor   # LAYER link shows production_owner=node|rust|...
 ```
 
 ## Blockers (ordered)
 
-1. **No Rust CLI `link run` / install lifecycle** — binary help previously promised link commands "as implementations land"; this slice adds **status only**. Foreground `link run` + managed LaunchAgent install still missing.
+1. **No managed LaunchAgent install for Rust Link candidate** — `herdr-mcp link run` exists for foreground soak; `link install|uninstall` for candidate label (`dev.herdr-mcp.link` → `runtime/current/herdr-mcp link run`) still missing.
 2. **Production LaunchAgent still Node + repo checkout** — both `link` and `link-prod` ProgramArguments point at `/usr/local/bin/node` and `.../herdr-mcp/dist/link/macos-daemon.js`, violating AGENTS.md (no launchd-to-checkout).
 3. **Runtime-control generation still Node-era** — prod control/status commonly keep `desired_active` / `active_generation` like `stable-0.3.32` even while MCP service is Rust alpha.
 4. **Health seal** — `production_ready` and `runtime=rust-candidate` must not flip until ownership + UAT gates pass.
-5. **User CLI bridge** — `~/.local/bin/herdr-mcp` may still symlink to repo Bash wrapper (G3); cutover tooling must use `runtime/current/herdr-mcp`, not the checkout.
-6. **Credentials** — Link secret stays in Keychain; MCP token stays in server plist env. Cutover must preserve both; never commit secrets.
-7. **Dual verification UAT** — Edge → Link → Rust runtime → Herdr smoke after cutover, plus rollback to Node Link if needed, from an **independent** Shell (not a managed `herdr_exec` session).
+5. **User CLI** — G3 sealed on this machine (`~/.local/bin/herdr-mcp` → `runtime/current`); cutover tooling must still use `runtime/current/herdr-mcp`, never a checkout/`target/` binary. Clean-machine seal remains a separate G3/G18 gap.
+6. **Credentials** — Link secret stays in Keychain; MCP token stays in server plist env. `link run` loads both; cutover must preserve both; never commit secrets.
+7. **Dual verification UAT** — Edge → Link → Rust runtime → Herdr smoke after cutover, plus rollback to Node Link if needed, from an **independent** Shell (not a managed `herdr_exec` session). Required before any production cutover; not part of this slice.
 
 ## Gates that must all be true before `production_ready=true`
 
@@ -78,12 +80,11 @@ Stop if Link prod is already Rust, or if service is unhealthy.
 
 ### 1. Land remaining code (not tonight if unsafe)
 
-Prerequisites still to implement after this status/gates slice:
+Prerequisites still to implement after status + `link run`:
 
-1. `herdr-mcp link run` — foreground staged daemon; macOS Keychain + server-plist token load parity with Node `macos-daemon.ts`.
-2. `herdr-mcp link install|status|uninstall` for **candidate** label first (`dev.herdr-mcp.link`), ProgramArguments = `runtime/current/herdr-mcp link run`, never checkout/`target/`.
-3. Generation fencing: prod control file generations must address Rust MCP endpoint/version, not `stable-0.3.32`.
-4. One-command cutover helper that: writes new plist beside old, bootouts Node prod, bootstraps Rust prod, verifies health/gates, and can revert to Node plist backup. Still requires human dual verification.
+1. `herdr-mcp link install|status|uninstall` for **candidate** label first (`dev.herdr-mcp.link`), ProgramArguments = `runtime/current/herdr-mcp link run`, never checkout/`target/`.
+2. Generation fencing: prod control file generations must address Rust MCP endpoint/version, not `stable-0.3.32`.
+3. One-command cutover helper that: writes new plist beside old, bootouts Node prod, bootstraps Rust prod, verifies health/gates, and can revert to Node plist backup. Still requires human dual verification.
 
 ### 2. Candidate soak (safe)
 
@@ -120,9 +121,10 @@ Only when `herdr-mcp link status` shows all gates except `dual_verification_uat`
 
 ## Remaining G5 gaps after this slice
 
-- [ ] `herdr-mcp link run` (foreground) with Keychain/plist credential load
-- [ ] Candidate then production LaunchAgent install/uninstall on `runtime/current`
+- [x] `herdr-mcp link status` + 8 `production_ready` gates (live on alpha.10)
+- [x] `herdr-mcp link run` (foreground) with Keychain/plist credential load (this slice; needs installed generation to soak against runtime)
+- [ ] Candidate then production LaunchAgent install/uninstall on `runtime/current` only
 - [ ] Rust-compatible runtime-control generation cutover for prod control files
 - [ ] Health seal commit (`production_ready` / runtime label) after UAT
-- [ ] Independent dual-verification UAT record
-- [ ] User CLI migration off Bash bridge (shared with G3)
+- [ ] Independent dual-verification UAT record (mandatory before live cut)
+- [ ] Clean-machine confirmation of G3 user CLI seal (shared with G3/G18)

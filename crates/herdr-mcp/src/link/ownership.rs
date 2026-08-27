@@ -448,9 +448,9 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
     let link_loaded = launchd_label_loaded(LINK_LABEL);
     let prod = assess_agent(home, LINK_PROD_LABEL, prod_loaded);
     let link = assess_agent(home, LINK_LABEL, link_loaded);
-    // This slice lands status + gate reporting. `link run` remains a later
-    // prerequisite before production cutover; gate stays honest.
-    let rust_cli_has_link_run = false;
+    // Foreground `link run` is wired in this binary. LaunchAgent install and
+    // production cutover remain later G5 slices; gate stays honest.
+    let rust_cli_has_link_run = crate::link::LINK_RUN_WIRED;
     let gates =
         evaluate_production_ready_gates(home, config_dir, &prod, &link, rust_cli_has_link_run);
     let all_ok = gates.iter().all(|gate| gate.ok);

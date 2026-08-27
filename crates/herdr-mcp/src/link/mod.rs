@@ -25,6 +25,7 @@ pub mod local_mcp;
 pub mod ownership;
 pub mod policy;
 pub mod request_core;
+pub mod run;
 pub mod runner;
 pub mod runtime_control;
 pub mod runtime_generation;
@@ -34,3 +35,4 @@ pub mod transport;
 pub use ownership::{
     doctor_layer_summary, production_ready_gate_catalog, run_status as run_link_status,
 };
+pub use run::{LINK_RUN_WIRED, run as run_link};

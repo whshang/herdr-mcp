@@ -17,6 +17,8 @@ pub enum Command {
 #[derive(Debug, PartialEq, Eq)]
 pub enum LinkCommand {
     Status,
+    /// Foreground staged Rust Link candidate. Does not cut over production LaunchAgents.
+    Run,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -94,11 +96,12 @@ where
 fn parse_link(args: &[String]) -> Result<Command, String> {
     match args {
         [subcommand] if subcommand == "status" => Ok(Command::Link(LinkCommand::Status)),
-        [] => Err("link requires status (cutover install/run land in a later G5 slice)".to_owned()),
+        [subcommand] if subcommand == "run" => Ok(Command::Link(LinkCommand::Run)),
+        [] => Err("link requires status or run".to_owned()),
         [subcommand] => Err(format!(
-            "unknown link command '{subcommand}' (only status is available; no live cutover from this CLI)"
+            "unknown link command '{subcommand}' (status|run; install/cutover land in a later G5 slice)"
         )),
-        _ => Err("link accepts exactly one subcommand: status".to_owned()),
+        _ => Err("link accepts exactly one subcommand: status or run".to_owned()),
     }
 }
 
@@ -287,6 +290,7 @@ Advanced / internal:\n\
   herdr-mcp config [path|show|init]\n\
   herdr-mcp service <install [--adopt-node]|status|start|stop|restart|rollback|uninstall>\n\
   herdr-mcp link status\n\
+  herdr-mcp link run\n\
   herdr-mcp native-host <install|status|uninstall|rollback>\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\
   herdr-mcp dev [--dry-run]\n\
@@ -294,7 +298,8 @@ Advanced / internal:\n\
 Prefer the top-level install/status/doctor/update/rollback/uninstall commands\n\
 for normal lifecycle. Use service ... only for advanced service control\n\
 (for example service install --adopt-node). link status is read-only G5\n\
-ownership/gates reporting; it does not cut over production Link.\n"
+ownership/gates reporting. link run starts a foreground Rust Link candidate\n\
+(Keychain/plist credentials); it does not install or cut over production Link.\n"
 }
 
 #[cfg(test)]
@@ -385,6 +390,10 @@ mod tests {
             Command::Link(LinkCommand::Status)
         );
         assert_eq!(
+            parse(args(&["link", "run"])).unwrap(),
+            Command::Link(LinkCommand::Run)
+        );
+        assert_eq!(
             parse(args(&["native-host", "status"])).unwrap(),
             Command::NativeHost(NativeHostCommand::Status)
         );
@@ -427,8 +436,8 @@ mod tests {
         assert!(parse(args(&["native-host"])).is_err());
         assert!(parse(args(&["native-host", "legacy"])).is_err());
         assert!(parse(args(&["link"])).is_err());
-        assert!(parse(args(&["link", "run"])).is_err());
         assert!(parse(args(&["link", "install"])).is_err());
+        assert!(parse(args(&["link", "status", "extra"])).is_err());
         assert!(parse(args(&["extension-host", "https://example.com/"])).is_err());
         assert!(parse(args(&["status", "extra"])).is_err());
         assert!(parse(args(&["unknown"])).is_err());
@@ -453,6 +462,7 @@ mod tests {
         assert!(text.contains("User path:"));
         assert!(text.contains("Advanced / internal:"));
         assert!(text.contains("herdr-mcp link status"));
+        assert!(text.contains("herdr-mcp link run"));
         let install = text.find("herdr-mcp install").expect("install");
         let service = text.find("herdr-mcp service").expect("service");
         assert!(

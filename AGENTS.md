@@ -28,7 +28,16 @@
 
 Rust service mutations (`service install`, `start`, `stop`, `restart`, `rollback`, `uninstall`, and update activation) must run from an independent process/terminal. Do not run them from a managed `herdr_exec` session: restarting `dev.herdr-mcp.server` can terminate the process carrying its own control transaction. Read-only `service status` is safe from managed execution.
 
-Destructive service/update/native-host lifecycle mutations must never use `launchctl submit`. Inferred launchd jobs may replay after the command exits and can consume rollback or repeat another non-idempotent mutation. Use the managed lifecycle path or an explicit one-shot plist with `RunAtLoad=true` and `KeepAlive=false` when an independent launchd job is required.
+Destructive service/update/native-host/Link lifecycle mutations must never use `launchctl submit`. Inferred launchd jobs may replay after the command exits and can consume rollback or repeat another non-idempotent mutation. Use the managed lifecycle path or an explicit one-shot plist with `RunAtLoad=true` and `KeepAlive=false` when an independent launchd job is required.
+
+### Link ownership (G5)
+
+Production Link (`dev.herdr-mcp.link-prod`) remains Node until an explicit dual-verified cutover. Do not bootout, rewrite, or retarget live Node Link LaunchAgents as part of ordinary development, install, update, or `link run` work.
+
+1. `herdr-mcp link run` is a foreground **candidate** only. It must not install LaunchAgents, mutate `runtime/current`, or change production Link ownership.
+2. Any future candidate or production Link LaunchAgent must execute `~/.config/herdr-mcp/runtime/current/herdr-mcp link run` (or equivalent argv through that symlink). Never point Link launchd at a checkout, worktree, `target/`, or a fixed generation path.
+3. Link install/uninstall/cutover/rollback mutations follow the same independent-Shell rule as service mutations: never from a managed `herdr_exec` session; never via `launchctl submit`.
+4. Before any production Link cutover, dual verification from independent Shells is mandatory. Code must keep health `production_ready=false` until every gate is true and operators explicitly seal.
 
 Before a lifecycle mutation, capture live state instead of trusting a handoff or previous message:
 
