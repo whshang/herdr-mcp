@@ -180,12 +180,60 @@ fn expected_extension_origin() -> Result<String, String> {
 
 #[cfg(unix)]
 pub(crate) fn extension_path_for_install() -> Result<PathBuf, String> {
-    let path = env::var_os("HERDR_EXTENSION_PATH")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HERDR_MCP_ROOT").map(|root| PathBuf::from(root).join("extension")))
-        .or_else(development_extension_path)
-        .ok_or_else(|| "extension_path_unconfigured".to_owned())?;
-    lexical_absolute(&path)
+    // Precedence for first install / origin derivation:
+    // 1. HERDR_EXTENSION_PATH (explicit override; fail closed if set but invalid)
+    // 2. managed ~/.config/herdr-mcp/extension (Release zip extract path)
+    // 3. HERDR_MCP_ROOT/extension (compat)
+    // 4. checkout extension/ via CARGO_MANIFEST_DIR (developer only)
+    if let Some(raw) = env::var_os("HERDR_EXTENSION_PATH") {
+        let path = lexical_absolute(&PathBuf::from(raw))?;
+        return require_extension_dir(
+            &path,
+            "HERDR_EXTENSION_PATH points to a missing or incomplete extension directory",
+        );
+    }
+
+    if let Ok(runtime) = crate::paths::RuntimePaths::discover() {
+        let managed = runtime.config_dir.join("extension");
+        if is_extension_dir(&managed) {
+            return lexical_absolute(&managed);
+        }
+    }
+
+    if let Some(root) = env::var_os("HERDR_MCP_ROOT") {
+        let path = PathBuf::from(root).join("extension");
+        if is_extension_dir(&path) {
+            return lexical_absolute(&path);
+        }
+    }
+
+    if let Some(path) = development_extension_path() {
+        return lexical_absolute(&path);
+    }
+
+    Err(
+        "extension directory not found: extract the Release zip herdr-mcp-extension-<version>.zip \
+to ~/.config/herdr-mcp/extension (so that path contains manifest.json), or set \
+HERDR_EXTENSION_PATH to that unpacked directory, then re-run herdr-mcp native-host install"
+            .to_owned(),
+    )
+}
+
+#[cfg(unix)]
+fn is_extension_dir(path: &Path) -> bool {
+    path.is_dir() && path.join("manifest.json").is_file()
+}
+
+#[cfg(unix)]
+fn require_extension_dir(path: &Path, context: &str) -> Result<PathBuf, String> {
+    if is_extension_dir(path) {
+        Ok(path.to_path_buf())
+    } else {
+        Err(format!(
+            "{context}: expected a directory containing manifest.json at {}",
+            path.display()
+        ))
+    }
 }
 
 #[cfg(unix)]
@@ -193,7 +241,7 @@ fn development_extension_path() -> Option<PathBuf> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = manifest_dir.parent()?.parent()?;
     let extension = root.join("extension");
-    extension.is_dir().then_some(extension)
+    is_extension_dir(&extension).then_some(extension)
 }
 
 #[cfg(unix)]
@@ -625,6 +673,32 @@ mod tests {
         );
         assert!(validate_extension_origin(&format!("chrome-extension://{id}/")).is_ok());
         assert!(validate_extension_origin("https://example.com/").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_dir_helpers_require_manifest_json() {
+        let root = env::temp_dir().join(format!(
+            "herdr-ext-dir-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        let good = root.join("good");
+        let empty = root.join("empty");
+        fs::create_dir_all(&good).unwrap();
+        fs::create_dir_all(&empty).unwrap();
+        fs::write(good.join("manifest.json"), b"{\"version\":\"1\"}").unwrap();
+        assert!(is_extension_dir(&good));
+        assert!(!is_extension_dir(&empty));
+        assert_eq!(require_extension_dir(&good, "ok").unwrap(), good);
+        let err = require_extension_dir(
+            &empty,
+            "HERDR_EXTENSION_PATH points to a missing or incomplete extension directory",
+        )
+        .unwrap_err();
+        assert!(err.contains("HERDR_EXTENSION_PATH"));
+        assert!(err.contains("manifest.json"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

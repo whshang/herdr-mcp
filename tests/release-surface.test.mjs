@@ -121,6 +121,8 @@ test("Rust GitHub Release provenance is tag-only and fail-closed before publish"
   );
   assert.match(attest, /release-assets\/herdr-mcp-\*/);
   assert.match(attest, /release-assets\/release-manifest\.json/);
+  assert.match(release, /pack-extension\.mjs/);
+  assert.match(release, /Pack browser extension release zip/);
   assert.match(release, /--repository-id \"\$GITHUB_REPOSITORY_ID\"/);
   assert.match(release, /--source-commit \"\$GITHUB_SHA\"/);
   assert.match(release, /--source-ref \"\$GITHUB_REF\"/);
@@ -164,6 +166,9 @@ test("Rust Release recovery republishes only a previously attested GitHub run", 
   assert.match(recovery, /release manifest repository identity mismatch/);
   assert.match(recovery, /release manifest provenance identity mismatch/);
   assert.match(recovery, /release manifest targets do not match tagged target contract/);
+  assert.match(recovery, /herdr-mcp-extension-/);
+  assert.match(recovery, /release_asset_count=/);
+  assert.match(recovery, /steps\.verify\.outputs\.release_asset_count/);
   assert.doesNotMatch(recovery, /length == 5/);
   assert.doesNotMatch(recovery, /== \"6\"/);
   assert.match(recovery, /head_sha/);

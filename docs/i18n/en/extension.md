@@ -51,16 +51,30 @@ Extension traffic does not need to traverse Cloudflare Edge. Public OAuth identi
 
 ## Install and use it for the first time
 
-1. Build the project.
-2. Install the Native Messaging host:
+Primary path (no git clone required):
+
+1. Download `herdr-mcp-extension-<version>.zip` (and the matching `.sha256` sidecar) from the same GitHub Release that published the Rust binaries. The zip is a Release asset only; it is **not** listed in `release-manifest.json`, so the binary updater schema stays unchanged.
+2. Verify the sidecar, then extract into the managed directory:
 
 ```bash
-bin/herdr-extension-host install
+mkdir -p ~/.config/herdr-mcp/extension
+unzip herdr-mcp-extension-<version>.zip -d ~/.config/herdr-mcp/extension
+# top-level files such as manifest.json must land directly under that directory
 ```
 
-3. Load `extension/` as an unpacked Chrome extension.
-4. Open a supported Web AI site.
-5. Use the popup/HUD to bind a Herdr workspace. On ChatGPT this can be done from the root page, a Project home, or a concrete conversation; a Project does not need a `/c/<id>` first.
+3. In Chrome: `chrome://extensions` → enable Developer mode → **Load unpacked** → select `~/.config/herdr-mcp/extension`.
+4. Install the Native Messaging host (resolves the managed path, or `HERDR_EXTENSION_PATH` if set):
+
+```bash
+herdr-mcp native-host install
+# equivalent during migration:
+# bin/herdr-extension-host install
+```
+
+5. Open a supported Web AI site.
+6. Use the popup/HUD to bind a Herdr workspace. On ChatGPT this can be done from the root page, a Project home, or a concrete conversation; a Project does not need a `/c/<id>` first.
+
+Developer checkout of `extension/` remains available for local work, but it is not the primary end-user path. Do not treat cloning this repository as the install method.
 
 The binding unit is a workspace, not a single agent, because real development commonly looks like:
 
@@ -184,6 +198,8 @@ Site adapters intentionally expose only capabilities that can be implemented saf
 Modern Chrome versions can gate loopback/local-application access separately from normal host permissions. If the Options connection test or HUD reports that local access is blocked, allow the extension to access applications on the device in Chrome's extension site settings.
 
 The extension uses bounded connection attempts and reports this condition instead of loading forever.
+
+`host_permissions` still includes `<all_urls>` for GA. Narrowing to the four content-script origins plus loopback would cover ChatGPT / Claude / z.ai / DeepSeek scripting and tab reload recovery, but the optional LLM-judge feature fetches a user-configured OpenAI-compatible base URL from the service worker, and Options also allow a non-default `herdrMcpUrl`. Those hosts are not known at install time, so `<all_urls>` remains until an optional-permissions UX can replace it. This is not a Chrome Web Store distribution claim.
 
 ## What the extension does not do
 

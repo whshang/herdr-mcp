@@ -57,16 +57,30 @@ herdr-mcp runtime
 
 ## 安装与第一次使用
 
-1. 构建项目。
-2. 安装 Native Messaging host：
+主路径（不需要 clone 仓库）：
+
+1. 从发布该 Rust binary 的同一 GitHub Release 下载 `herdr-mcp-extension-<version>.zip`（以及对应的 `.sha256` sidecar）。该 zip 只作为 Release asset；**不会**写入 `release-manifest.json`，因此 binary updater 契约保持不变。
+2. 校验 sidecar 后解压到托管目录：
 
 ```bash
-bin/herdr-extension-host install
+mkdir -p ~/.config/herdr-mcp/extension
+unzip herdr-mcp-extension-<version>.zip -d ~/.config/herdr-mcp/extension
+# manifest.json 等文件必须直接位于该目录下
 ```
 
-3. 在 Chrome 加载 `extension/`。
-4. 打开 ChatGPT、z.ai、DeepSeek 等支持站点。
-5. 在 popup/HUD 中绑定一个 Herdr workspace。ChatGPT 可以直接在根首页、Project 首页或具体 conversation 上绑定；Project 不需要先创建 `/c/<id>`。
+3. 在 Chrome 打开 `chrome://extensions` → 打开开发者模式 → **Load unpacked** → 选择 `~/.config/herdr-mcp/extension`。
+4. 安装 Native Messaging host（优先解析托管路径，或使用 `HERDR_EXTENSION_PATH`）：
+
+```bash
+herdr-mcp native-host install
+# 迁移期等价命令：
+# bin/herdr-extension-host install
+```
+
+5. 打开 ChatGPT、z.ai、DeepSeek 等支持站点。
+6. 在 popup/HUD 中绑定一个 Herdr workspace。ChatGPT 可以直接在根首页、Project 首页或具体 conversation 上绑定；Project 不需要先创建 `/c/<id>`。
+
+开发者仍可用仓库内 `extension/` 做本地调试，但这不是终端用户主路径。不要把 clone 本仓库当成安装方式。
 
 绑定单位是 workspace，不是单个 agent。
 
@@ -207,6 +221,14 @@ Herdr tools
 - 安全 gate；
 
 共同约束。
+
+## 本机网络与 host 权限
+
+较新的 Chrome 可能把 loopback / 本机应用访问与普通 host 权限分开管控。若 Options 连接测试或 HUD 提示本机访问被拦截，请在扩展站点设置中允许访问本机应用。
+
+扩展使用有界连接尝试，并报告该状态，而不是一直转圈。
+
+GA 阶段 `host_permissions` 仍保留 `<all_urls>`。收窄到四个 content_script 源站加 loopback 足以覆盖 ChatGPT / Claude / z.ai / DeepSeek 的 scripting 与已绑定 tab 的 reload 恢复，但可选的 LLM judge 会从 service worker 请求用户配置的 OpenAI 兼容 base URL，Options 也允许非默认的 `herdrMcpUrl`。这些主机在安装时未知，因此在可选权限 UX 就绪前继续保留 `<all_urls>`。这不是 Chrome Web Store 上架声明。
 
 ## 不做什么
 
