@@ -197,3 +197,21 @@ Same-hardware TMPHOME sim is valid for download → CLI → path isolation → d
 | This report | `docs/_wip/g18-clean-machine-sim-20260828.md` |
 
 Recorded UTC: 2026-08-27T17:29:06Z
+
+---
+
+## Addendum — alpha.15 re-probe (2026-08-28)
+
+Re-ran the same-Mac TMPHOME probe against GitHub Release `v0.4.0-alpha.15` only (no repo checkout, no `herdr-mcp install`).
+
+| Check | Result |
+| --- | --- |
+| Download `herdr-mcp-0.4.0-alpha.15-aarch64-apple-darwin` + extension zip | OK |
+| `--version` | `0.4.0-alpha.15` / epoch 2 / 18 tools |
+| Config/state under TMPHOME | OK |
+| `update check` provenance | OK (`available=false` at alpha.15) |
+| Dogfood `launchctl` label set | unchanged |
+| Dogfood `~/Library/LaunchAgents/dev.herdr-mcp.*.plist` SHA-256 | unchanged |
+| Full `install` | **not run** (hardcoded label + `:8772`; TMPHOME `status`/`doctor` still saw dogfood `:8772` HTTP 401) |
+
+**Verdict unchanged: PARTIAL.** Operator runbook for a second Mac: `docs/i18n/en/clean-machine-uat.md` (zh-CN twin updated). Dedicated second macOS user on the **same** host is **not** sufficient because port `8772` is machine-wide.
