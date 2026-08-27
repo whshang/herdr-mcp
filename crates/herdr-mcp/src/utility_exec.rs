@@ -197,7 +197,6 @@ fn run_unix(
                     "control_plane_taskgroup_before_send",
                     working,
                     Some(message),
-                    started_at_ms,
                 );
             }
             Err(PrepareError::Other { code, message }) => {
@@ -283,7 +282,6 @@ fn run_unix(
                                 &format!("pane_recover_failed:{}", second.code),
                                 working,
                                 None,
-                                started_at_ms,
                             );
                         }
                         Err(second) => {
@@ -308,7 +306,6 @@ fn run_unix(
                         "control_plane_taskgroup_pane_recover",
                         working,
                         Some(message),
-                        started_at_ms,
                     );
                 }
                 Err(PrepareError::Other { code, .. }) => {
@@ -321,7 +318,6 @@ fn run_unix(
                         &format!("pane_recover_failed:{code}"),
                         working,
                         None,
-                        started_at_ms,
                     );
                 }
             }
@@ -457,7 +453,7 @@ fn run_unix(
         &output,
         exit_code == Some(0) && !truncated,
     );
-    insert_sync_completion(&mut result, started_at_ms, output.as_bytes().len());
+    insert_sync_completion(&mut result, started_at_ms, output.len());
     add_working_warning(&mut result, working);
     Value::Object(result)
 }
@@ -947,8 +943,8 @@ fn local_fallback(
     reason: &str,
     working: &[Value],
     detail: Option<String>,
-    started_at_ms: u64,
 ) -> Value {
+    let started_at_ms = now_ms();
     let local = run_local_shell(command, cwd, timeout_ms, OUTPUT_LIMIT);
     let mut result = Map::new();
     result.insert(
@@ -979,7 +975,7 @@ fn local_fallback(
         &local.output,
         !local.timed_out && local.exit_code == Some(0) && !local.truncated,
     );
-    insert_sync_completion(&mut result, started_at_ms, local.output.as_bytes().len());
+    insert_sync_completion(&mut result, started_at_ms, local.output.len());
     if local.timed_out {
         result.insert(
             "hint".to_owned(),
@@ -1216,7 +1212,6 @@ fn optional_u64(args: &Value, key: &str, min: u64, max: u64) -> Result<Option<u6
     }
 }
 
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1345,7 +1340,6 @@ mod tests {
             "test",
             &[],
             None,
-            now_ms(),
         );
         assert_eq!(large["ok"], true);
         assert_eq!(large["phase"], "completed");
@@ -1377,7 +1371,6 @@ mod tests {
             "test",
             &[],
             None,
-            now_ms(),
         );
         assert_eq!(small["ok"], true);
         assert!(small["output"].as_str().unwrap().contains("hello-local"));
@@ -1391,7 +1384,6 @@ mod tests {
             "test",
             &[],
             None,
-            now_ms(),
         );
         assert_eq!(failed["ok"], false);
         assert_eq!(failed["exit_code"], 3);
@@ -1409,7 +1401,6 @@ mod tests {
             "test",
             &[],
             None,
-            now_ms(),
         );
         assert_eq!(truncated["ok"], true);
         assert_eq!(truncated["truncated"], true);
