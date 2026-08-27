@@ -44,7 +44,7 @@ Treat MCP round trips and model re-entry as real costs. Before issuing a sequenc
 - After one `herdr_inspect` establishes workspace/pane/root identities, reuse those exact IDs and paths. Do not rediscover state that has not become stale.
 - Independent read-only operations should be issued concurrently when the client supports parallel tool calls. Examples: project-instruction reads, independent greps, Git facts, and unrelated file reads. Only serialize when one result determines the next call's arguments or safety decision.
 - After the first state baseline, prefer `herdr_since(cursor)` for incremental workspace/agent changes instead of repeatedly calling full `herdr_inspect`.
-- Use `herdr_exec_read(offset=next_offset)` as a delta read. Never restart at offset 0 unless earlier output is actually needed again.
+- Use `herdr_exec_read(offset=next_offset)` as a delta read. Never restart at offset 0 unless earlier output is actually needed again. While `phase=running`, use `progress.bytes_total` / `progress.elapsed_ms` as live progress; stop when `phase=completed` (same moment as `running=false`).
 - Prefer one `herdr_fs_patch` for a coherent multi-file mutation instead of a chain of tiny edits. Mutations in the same project remain ordered by default; independent isolated mutation lanes may proceed in parallel.
 - Do not call `herdr_methods` before every `herdr_call`; discover only the method/schema that is unknown, then reuse the known schema during the task.
 - The generated **Live herdr-mcp runtime context** is authoritative for current execution capabilities such as server-side concurrency, JSON-RPC batch, and multi-operation tool arguments. Do not assume a capability is permanently forbidden merely because an older implementation lacked it.
