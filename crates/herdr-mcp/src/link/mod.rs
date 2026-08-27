@@ -18,6 +18,7 @@
 pub mod backoff;
 pub mod generation_fence;
 pub mod heartbeat;
+pub mod io_loop;
 pub mod lifecycle;
 pub mod local_mcp;
 pub mod policy;

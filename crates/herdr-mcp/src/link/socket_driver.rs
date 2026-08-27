@@ -103,6 +103,7 @@ pub enum SocketDriverError {
     NegotiatedProtocolMissing,
     NegotiatedProtocolMismatch,
     CommandChannelClosed,
+    CommandChannelFull,
     MissingHello,
     Transport(TransportError),
 }
@@ -179,6 +180,10 @@ impl SocketAttemptHandle {
     ///
     /// Returns `false` for timer/reconnect/higher-layer actions so the caller
     /// can route those elsewhere without duplicating socket policy here.
+    ///
+    /// Command delivery is non-blocking: a full or closed bounded channel fails
+    /// closed immediately so the outer I/O loop can recycle the socket instead of
+    /// parking on `send().await`.
     pub async fn execute_action(
         &self,
         action: &TransportAction,
@@ -189,11 +194,27 @@ impl SocketAttemptHandle {
         if command.attempt_id() != self.attempt_id {
             return Ok(false);
         }
-        self.command_tx
-            .send(command)
-            .await
-            .map_err(|_| SocketDriverError::CommandChannelClosed)?;
-        Ok(true)
+        match self.command_tx.try_send(command) {
+            Ok(()) => Ok(true),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(SocketDriverError::CommandChannelFull),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(SocketDriverError::CommandChannelClosed)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        attempt_id: SocketAttemptId,
+        command_tx: mpsc::Sender<WebSocketCommand>,
+        event_rx: mpsc::Receiver<WebSocketEvent>,
+    ) -> Self {
+        Self {
+            attempt_id,
+            command_tx,
+            event_rx,
+            task: tokio::spawn(async {}),
+        }
     }
 
     pub fn abort(&self) {
@@ -997,5 +1018,32 @@ mod tests {
             }
         );
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_action_fails_closed_on_full_or_closed_command_channel() {
+        let attempt_id = SocketAttemptId(21);
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let handle = SocketAttemptHandle::for_test(attempt_id, command_tx, event_rx);
+        let send = TransportAction::SendFrame {
+            attempt_id,
+            frame: "one".to_owned(),
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(handle.execute_action(&send).await, Ok(true));
+        assert_eq!(
+            handle.execute_action(&send).await,
+            Err(SocketDriverError::CommandChannelFull)
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "full command queue must not park the caller"
+        );
+        drop(command_rx);
+        assert_eq!(
+            handle.execute_action(&send).await,
+            Err(SocketDriverError::CommandChannelClosed)
+        );
     }
 }

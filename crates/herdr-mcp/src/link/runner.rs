@@ -16,7 +16,7 @@ use serde_json::{Number, Value, json};
 use tokio::sync::mpsc;
 
 use super::generation_fence::{FenceError, GenerationFence};
-use super::local_mcp::{LinkRuntimeTransport, RuntimeToolResult};
+use super::local_mcp::{LinkRuntimeTransport, RuntimeHealth, RuntimeToolResult};
 use super::request_core::{
     CODE_DUPLICATE_REQUEST, CODE_LINK_STOPPING, CODE_QUEUE_FULL, CODE_REQUEST_TIMEOUT,
     LINK_DEFAULT_MAX_PENDING, LINK_DEFAULT_REQUEST_TIMEOUT_MS, PendingInsertError, PendingRequests,
@@ -93,6 +93,9 @@ enum RuntimeEvent {
     RequestTimeout {
         slot: PendingSlot,
     },
+    StatusCompleted {
+        health: RuntimeHealth,
+    },
 }
 
 pub struct LinkRunnerCore<T: LinkRuntimeTransport> {
@@ -162,18 +165,31 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
         ))
     }
 
-    pub async fn status_message(&self, now_ms: i64) -> RelayMessage {
-        let health = self.runtime.get_health().await;
+    fn status_report(&self, health: &RuntimeHealth, now_ms: i64) -> RelayMessage {
         RelayMessage::Status(build_status_report(
             self.config.workstation_id.clone(),
             self.runtime.runtime_info(),
             health.healthy,
-            health.details,
+            health.details.clone(),
             Number::from(self.pending.len() as u64),
             number(now_ms.saturating_sub(self.config.started_at_ms).max(0)),
             None,
             number(now_ms),
         ))
+    }
+
+    /// Probe runtime health off the outer I/O loop. The reply is delivered as
+    /// [`RuntimeEvent::StatusCompleted`] so a slow `get_health()` cannot stall
+    /// socket, timer, or stop handling.
+    fn spawn_status_probe(&self) {
+        let event_tx = self.event_tx.clone();
+        let runtime = Arc::clone(&self.runtime);
+        tokio::spawn(async move {
+            let health = runtime.get_health().await;
+            let _ = event_tx
+                .send(RuntimeEvent::StatusCompleted { health })
+                .await;
+        });
     }
 
     pub async fn handle_inbound(
@@ -197,7 +213,8 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
                 self.handle_cancel(cancel.request_id, cancel.reason, now_ms)
             }
             RelayMessage::Status(status) if status.fields.query == Some(true) => {
-                Ok(vec![self.status_message(now_ms).await])
+                self.spawn_status_probe();
+                Ok(Vec::new())
             }
             _ => Ok(Vec::new()),
         }
@@ -326,12 +343,25 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
         &mut self,
         now_ms: i64,
     ) -> Result<Vec<RelayMessage>, RunnerError> {
+        self.next_runtime_output_with_now(|| now_ms).await
+    }
+
+    /// Await one runtime event and timestamp its settlement only after it is
+    /// actually observed. The outer I/O loop uses this form so a future that
+    /// waits across multiple socket/timer turns never reuses a stale timestamp.
+    pub async fn next_runtime_output_with_now<F>(
+        &mut self,
+        now_ms: F,
+    ) -> Result<Vec<RelayMessage>, RunnerError>
+    where
+        F: FnOnce() -> i64,
+    {
         let event = self
             .event_rx
             .recv()
             .await
             .ok_or(RunnerError::RuntimeEventChannelClosed)?;
-        self.handle_runtime_event(event, now_ms)
+        self.handle_runtime_event(event, now_ms())
     }
 
     fn handle_runtime_event(
@@ -406,11 +436,20 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
                     now_ms,
                 )])
             }
+            RuntimeEvent::StatusCompleted { health } => {
+                Ok(vec![self.status_report(&health, now_ms)])
+            }
         }
     }
 
-    pub fn begin_stopping(&mut self, now_ms: i64) -> Result<Vec<RelayMessage>, RunnerError> {
+    /// Reject new requests without disturbing work that is already in flight.
+    /// The outer loop uses this before its bounded graceful-drain window.
+    pub fn mark_stopping(&mut self) {
         self.stopping = true;
+    }
+
+    /// Settle every still-pending request after a hard stop/drain deadline.
+    pub fn reject_pending(&mut self, now_ms: i64) -> Result<Vec<RelayMessage>, RunnerError> {
         let mut outbound = Vec::new();
         for slot in self.pending.reject_all() {
             let request_id = slot.request.request_id.clone();
@@ -431,6 +470,35 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
             ));
         }
         Ok(outbound)
+    }
+
+    /// Backward-compatible immediate-stop helper for callers that do not own a
+    /// graceful drain window.
+    pub fn begin_stopping(&mut self, now_ms: i64) -> Result<Vec<RelayMessage>, RunnerError> {
+        self.mark_stopping();
+        self.reject_pending(now_ms)
+    }
+
+    /// Canonical Node-parity reply for a bounded inbound frame whose
+    /// correlation id was recoverable before the byte gate rejected it.
+    pub fn oversized_inbound_error(
+        &self,
+        request_id: impl Into<String>,
+        size_bytes: usize,
+        max_bytes: usize,
+        now_ms: i64,
+    ) -> RelayMessage {
+        RelayMessage::ToolError(build_tool_error_message(
+            self.config.workstation_id.clone(),
+            request_id,
+            "payload_too_large",
+            false,
+            "inbound frame exceeds maxFrameBytes",
+            Some(json!({"size_bytes": size_bytes, "max": max_bytes})),
+            Some(DeliveryState::NotDelivered),
+            number(now_ms),
+            None,
+        ))
     }
 
     pub async fn route_transport_actions(
@@ -462,7 +530,18 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
         core: &LinkTransportCore,
         now_ms: i64,
     ) -> Result<Vec<TransportAction>, RunnerError> {
-        let messages = self.next_runtime_output(now_ms).await?;
+        self.next_runtime_actions_with_now(core, || now_ms).await
+    }
+
+    pub async fn next_runtime_actions_with_now<F>(
+        &mut self,
+        core: &LinkTransportCore,
+        now_ms: F,
+    ) -> Result<Vec<TransportAction>, RunnerError>
+    where
+        F: FnOnce() -> i64,
+    {
+        let messages = self.next_runtime_output_with_now(now_ms).await?;
         self.messages_to_actions(core, messages)
     }
 
@@ -561,6 +640,7 @@ mod tests {
     struct MockRuntime {
         generation: Option<String>,
         delay_ms: u64,
+        health_delay_ms: u64,
         result: RuntimeToolResult,
         cancels: Mutex<Vec<String>>,
         health: RuntimeHealth,
@@ -571,6 +651,7 @@ mod tests {
             Self {
                 generation: Some(generation.to_owned()),
                 delay_ms,
+                health_delay_ms: 0,
                 result,
                 cancels: Mutex::new(Vec::new()),
                 health: RuntimeHealth {
@@ -578,6 +659,11 @@ mod tests {
                     details: None,
                 },
             }
+        }
+
+        fn with_health_delay(mut self, health_delay_ms: u64) -> Self {
+            self.health_delay_ms = health_delay_ms;
+            self
         }
     }
 
@@ -614,6 +700,9 @@ mod tests {
         }
 
         async fn get_health(&self) -> RuntimeHealth {
+            if self.health_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.health_delay_ms)).await;
+            }
             self.health.clone()
         }
     }
@@ -905,7 +994,7 @@ mod tests {
             heartbeat,
             RelayMessage::Heartbeat(message) if message.active_requests == Number::from(1)
         ));
-        let status = runner
+        let inbound = runner
             .handle_inbound(
                 RelayMessage::Status(StatusMessage {
                     envelope: RelayEnvelope::new("ws1"),
@@ -918,17 +1007,23 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            inbound.is_empty(),
+            "status query must spawn a probe instead of awaiting health"
+        );
+        let status = runner.next_runtime_output(1_200).await.unwrap();
         assert!(matches!(
             status.as_slice(),
             [RelayMessage::Status(message)] if message.fields.healthy == Some(true)
         ));
 
-        let stopping = runner.begin_stopping(1_210).unwrap();
-        assert_eq!(runner.active_requests(), 0);
-        assert!(matches!(
-            stopping.as_slice(),
-            [RelayMessage::ToolError(error)] if error.code == "link_stopping"
-        ));
+        runner.mark_stopping();
+        assert!(runner.stopping());
+        assert_eq!(
+            runner.active_requests(),
+            1,
+            "graceful drain keeps in-flight work"
+        );
         let rejected = runner
             .handle_inbound(request_message("new", 500), 1_220)
             .await
@@ -937,5 +1032,81 @@ mod tests {
             rejected.as_slice(),
             [RelayMessage::ToolError(error)] if error.code == "link_stopping"
         ));
+        let stopping = runner.reject_pending(1_230).unwrap();
+        assert_eq!(runner.active_requests(), 0);
+        assert!(matches!(
+            stopping.as_slice(),
+            [RelayMessage::ToolError(error)] if error.code == "link_stopping"
+        ));
+    }
+
+    #[test]
+    fn oversized_inbound_error_matches_node_correlation_contract() {
+        let runtime = Arc::new(MockRuntime::new(
+            "gen-a",
+            0,
+            RuntimeToolResult::Success { result: None },
+        ));
+        let runner = runner(runtime, 1_000);
+        let message = runner.oversized_inbound_error("too-big", 300_000, 262_144, 1_250);
+        assert!(matches!(
+            message,
+            RelayMessage::ToolError(error)
+                if error.request_id == "too-big"
+                    && error.code == "payload_too_large"
+                    && !error.retryable
+                    && error.delivery_state == Some(DeliveryState::NotDelivered)
+                    && error.details == Some(json!({"size_bytes": 300_000, "max": 262_144}))
+                    && error.served_at_ms == Some(Number::from(1_250))
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_settlement_clock_is_sampled_after_the_wait() {
+        let runtime = Arc::new(MockRuntime::new(
+            "gen-a",
+            20,
+            RuntimeToolResult::Success {
+                result: Some(json!({"ok": true})),
+            },
+        ));
+        let mut runner = runner(runtime, 1_000);
+        runner
+            .handle_inbound(request_message("clocked", 500), 1_100)
+            .await
+            .unwrap();
+        let outbound = runner.next_runtime_output_with_now(|| 9_999).await.unwrap();
+        assert!(matches!(
+            outbound.as_slice(),
+            [RelayMessage::ToolResult(result)]
+                if result.request_id == "clocked"
+                    && result.served_at_ms == Number::from(9_999)
+        ));
+    }
+
+    fn status_query() -> RelayMessage {
+        RelayMessage::Status(StatusMessage {
+            envelope: RelayEnvelope::new("ws1"),
+            fields: StatusFields {
+                query: Some(true),
+                ..StatusFields::default()
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn slow_status_health_does_not_block_inbound_handling() {
+        let runtime = Arc::new(
+            MockRuntime::new("gen-a", 0, RuntimeToolResult::Success { result: None })
+                .with_health_delay(5_000),
+        );
+        let mut runner = runner(runtime, 1_000);
+        let started = std::time::Instant::now();
+        let inbound = runner.handle_inbound(status_query(), 1_200).await.unwrap();
+        assert!(inbound.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "status query must not await a slow get_health on the inbound path"
+        );
     }
 }
