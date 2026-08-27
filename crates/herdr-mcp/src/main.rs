@@ -4,6 +4,7 @@ mod config;
 mod contract;
 mod dev;
 mod events;
+mod exec_compact;
 mod exec_sessions;
 mod exec_tools;
 mod extension_ipc;

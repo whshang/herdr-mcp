@@ -1,3 +1,4 @@
+use crate::exec_compact;
 use crate::exec_sessions::{enriched_exec_path, resolve_exec_shell};
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::mutation;
@@ -61,6 +62,7 @@ struct LocalResult {
     signal: Option<String>,
     output: String,
     timed_out: bool,
+    truncated: bool,
 }
 
 pub fn run(client: &HerdrClient, snapshot: &Value, args: &Value) -> Value {
@@ -420,7 +422,10 @@ fn run_unix(
     };
 
     let (exit_code, segment) = extract_command_result(&raw, &cmdline, &marker);
-    let output = tail_chars(clean_terminal_output(&segment).trim(), OUTPUT_LIMIT);
+    let cleaned = clean_terminal_output(&segment);
+    let trimmed = cleaned.trim();
+    let truncated = trimmed.chars().count() > OUTPUT_LIMIT;
+    let output = tail_chars(trimmed, OUTPUT_LIMIT);
     let mut result = Map::new();
     result.insert("ok".to_owned(), json!(exit_code == Some(0)));
     result.insert("backend".to_owned(), json!("utility_pane"));
@@ -437,7 +442,13 @@ fn run_unix(
         "project_root".to_owned(),
         json!(effective_root.to_string_lossy()),
     );
-    result.insert("output".to_owned(), json!(output));
+    result.insert("truncated".to_owned(), json!(truncated));
+    exec_compact::insert_compacted_or_raw(
+        &mut result,
+        "output",
+        &output,
+        exit_code == Some(0) && !truncated,
+    );
     add_working_warning(&mut result, working);
     Value::Object(result)
 }
@@ -951,7 +962,13 @@ fn local_fallback(
     result.insert("signal".to_owned(), json!(local.signal));
     result.insert("effective_cwd".to_owned(), json!(cwd.to_string_lossy()));
     result.insert("project_root".to_owned(), json!(cwd.to_string_lossy()));
-    result.insert("output".to_owned(), json!(local.output));
+    result.insert("truncated".to_owned(), json!(local.truncated));
+    exec_compact::insert_compacted_or_raw(
+        &mut result,
+        "output",
+        &local.output,
+        !local.timed_out && local.exit_code == Some(0) && !local.truncated,
+    );
     if local.timed_out {
         result.insert(
             "hint".to_owned(),
@@ -977,6 +994,7 @@ fn run_local_shell(command: &str, cwd: &Path, timeout_ms: u64, max_bytes: usize)
             signal: None,
             output: String::new(),
             timed_out: false,
+            truncated: false,
         };
     }
 
@@ -998,6 +1016,7 @@ fn run_local_shell(command: &str, cwd: &Path, timeout_ms: u64, max_bytes: usize)
                 signal: None,
                 output: String::new(),
                 timed_out: false,
+                truncated: false,
             };
         }
     };
@@ -1072,6 +1091,7 @@ fn run_local_shell(command: &str, cwd: &Path, timeout_ms: u64, max_bytes: usize)
             .map(signal_name),
         output,
         timed_out,
+        truncated,
     }
 }
 
@@ -1271,6 +1291,83 @@ mod tests {
         ));
         assert!(is_control_plane_taskgroup("ExceptionGroup: boom"));
         assert!(!is_control_plane_taskgroup("ordinary command timeout"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_fallback_compacts_large_success_only() {
+        let large = local_fallback(
+            "awk 'BEGIN{for(i=0;i<90;i++) print \"line-\" i}'",
+            Path::new("/tmp"),
+            "w1",
+            5_000,
+            "test",
+            &[],
+            None,
+        );
+        assert_eq!(large["ok"], true);
+        assert_eq!(large["exit_code"], 0);
+        assert_eq!(
+            large["command"],
+            "awk 'BEGIN{for(i=0;i<90;i++) print \"line-\" i}'"
+        );
+        assert_eq!(large["effective_cwd"], "/tmp");
+        assert_eq!(large["truncated"], false);
+        assert_eq!(large["compacted"], true);
+        assert_eq!(large["counts"]["lines"], 90);
+        let output = large["output"].as_str().unwrap();
+        assert!(output.contains("line-0\n"));
+        assert!(output.contains("…[omitted 30 lines]…"));
+        assert!(!output.contains("line-40\n"));
+
+        let small = local_fallback(
+            "printf 'hello-local\\n'",
+            Path::new("/tmp"),
+            "w1",
+            5_000,
+            "test",
+            &[],
+            None,
+        );
+        assert_eq!(small["ok"], true);
+        assert!(small["output"].as_str().unwrap().contains("hello-local"));
+        assert!(small.get("compacted").is_none());
+
+        let failed = local_fallback(
+            "awk 'BEGIN{for(i=0;i<90;i++) print \"fail-\" i}'; exit 3",
+            Path::new("/tmp"),
+            "w1",
+            5_000,
+            "test",
+            &[],
+            None,
+        );
+        assert_eq!(failed["ok"], false);
+        assert_eq!(failed["exit_code"], 3);
+        assert!(failed.get("compacted").is_none());
+        let fail_output = failed["output"].as_str().unwrap();
+        assert!(fail_output.contains("fail-0\n"));
+        assert!(fail_output.contains("fail-40\n"));
+        assert!(fail_output.contains("fail-89\n"));
+
+        let truncated = local_fallback(
+            "awk 'BEGIN{for(i=0;i<200;i++) print i, \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}'",
+            Path::new("/tmp"),
+            "w1",
+            5_000,
+            "test",
+            &[],
+            None,
+        );
+        assert_eq!(truncated["ok"], true);
+        assert_eq!(truncated["truncated"], true);
+        assert!(truncated.get("compacted").is_none());
+        assert!(
+            truncated["output"]
+                .as_str()
+                .unwrap()
+                .contains("…[truncated]")
+        );
     }
 
     #[test]
