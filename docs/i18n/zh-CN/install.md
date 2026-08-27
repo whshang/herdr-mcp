@@ -35,7 +35,13 @@ herdr api schema >/dev/null
 
 本页主线以 ChatGPT 为例，因为它覆盖了完整安装链路。
 
-运行本机 MCP runtime **不需要** Node.js。部署 Cloudflare Worker（`npx wrangler`）或从源码构建浏览器扩展时，仍可能临时用到 Node。
+运行本机 MCP runtime **不需要** Node.js。部署 Cloudflare Worker（`npx wrangler`）时仍可能临时用到 Node。从源码构建浏览器扩展属于高级/开发者路径，不是主安装路径。
+
+## 支持平台（第一版 GA 建议）
+
+- **第一版 GA 正式支持：** macOS Apple Silicon（托管 install / service / update / rollback）。
+- **Preview artifact：** Windows x64 仍可能作为 Release 资产发布；在 G19 封板前不要宣称完整托管生命周期对等。
+- **第一版 GA 不宣称：** Linux service lifecycle。CI 矩阵里出现 Linux 二进制不等于 Linux 已是 GA 平台。
 
 ## 第一步：安装原生 runtime（主路径）
 
@@ -48,7 +54,9 @@ herdr-mcp status
 herdr-mcp update check
 ```
 
-优先使用以上顶层命令。**不要**把 `herdr-mcp service install` 写成普通用户安装主路径；`service ...` 仍是高级/内部接口。
+优先使用以上顶层命令。**不要**把 `herdr-mcp service install` 写成普通用户安装主路径；`service ...` 仍是高级/内部接口。**不要**用 clone 仓库或 `npm`/`cargo` 安装本机 MCP runtime。
+
+产品仍处 alpha 时，保持 `update.channel = "preview"`（或在 alpha 二进制上不写 config），才能发现 prerelease；`stable` 只发现非 prerelease。
 
 ## 第二步：先把本地 runtime 跑通
 
@@ -73,7 +81,7 @@ herdr-mcp update status
 
 在 macOS 上，安装完成后由原生二进制管理 LaunchAgent 生命周期。健康检查用 `herdr-mcp status` / `herdr-mcp doctor`，升级用 `herdr-mcp update ...`。不要把 launchd 指到 git checkout 或 `target/*/herdr-mcp`。
 
-Linux / Windows 的服务封装目前更窄；把 Release 二进制放在 `PATH` 上，并按当前 Release 资产中的平台说明处理；若该平台尚未提供一键 service manager，就按文档给出的平台方式保活。
+Linux / Windows 的服务封装目前更窄。第一版 GA 建议只正式支持 macOS Apple Silicon；Windows 若发布二进制仅作 preview。不要把未封板的 Linux lifecycle 写成正式支持。把 Release 二进制放在 `PATH` 上，并按当前 Release 资产中的平台说明处理。
 
 ## 第四步：部署稳定公网 Edge
 
@@ -197,7 +205,7 @@ http://127.0.0.1:8772/mcp
 
 并使用本机静态 bearer。这条路径也便于把 runtime 故障与 Edge 故障分开。
 
-## 贡献者说明：从本仓库构建
+## 附录：开发者从源码构建
 
 clone + `npm`/`cargo` 工作流仍留给开发 herdr-mcp 本身的人。那不是最终用户安装主路径，也不应被要求用来运行本机 MCP runtime。
 

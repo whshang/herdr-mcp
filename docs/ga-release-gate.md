@@ -1,6 +1,6 @@
 # herdr-mcp GA Release Gate
 
-状态：alpha 进行中（截至 2026-08-27 **未达 GA**）  
+状态：alpha 进行中（截至 2026-08-28 **未达 GA**）
 本文件是 **GA 判定的唯一事实源（SSOT）**。架构演进细节见 [`herdr-architecture-roadmap.md`](./herdr-architecture-roadmap.md)。
 
 ## GA 定义
@@ -277,7 +277,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ---
 
-## Current Scorecard（2026-08-27 · live alpha.14 / G5 sealed）
+## Current Scorecard（2026-08-28 · live alpha.14 / G5 sealed · docs G22 refresh）
 
 评分：`PASS` / `PARTIAL` / `FAIL` / `UNKNOWN`。本表对齐 **2026-08-27 live `0.4.0-alpha.14`** runtime（generation `rust-7c0ac0b73060aae0`，merge `7efd30c` / Release [v0.4.0-alpha.14](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0-alpha.14)）+ G5 seal 证据。产品仍处 **alpha**，**未达 GA**；干净机 / 多机 / 退出 alpha 仍未完成。
 
@@ -288,45 +288,50 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | ID | 评分 | 一行证据 |
 | --- | --- | --- |
 | G1 | **FAIL** | 仍处 alpha：live `0.4.0-alpha.14`；`package.json` = `0.3.32` |
-| G2 | **PARTIAL** | Rust Release + attestation/manifest 链已存在；但 README / `docs/i18n/en/install.md` 主路径仍是 `git clone` + `npm ci` + Node.js 20+ |
+| G2 | **PARTIAL** | Rust Release + attestation/manifest 链已存在；正式文档主路径已改为 Release binary → `herdr-mcp install`；干净机下载 UAT 仍属 G18 |
 | G3 | **PARTIAL** | 顶层 CLI + entrypoint 已合入；**本机 live symlink 已迁到 `runtime/current`**。仍 PARTIAL：缺干净机 / 正式多机 seal |
-| G4 | **PARTIAL** | `service install` + generation/health/rollback 代码存在；正式文档未给出 binary → `herdr-mcp install` 干净机路径 |
+| G4 | **PARTIAL** | 正式文档已给出 binary → `herdr-mcp install` → doctor/status/update；干净机 UAT 仍属 G18 |
 | G5 | **PASS** | 本机 production owner=rust：link-prod Rust；alpha.14 seal execute；health/`doctor`/`link status` 一致 `production_ready`；rollback UAT 证据在 `seals/evidence/`（干净机另计 G18） |
 | G6 | **PARTIAL** | 嵌入契约 epoch 2 / 18 tools（hash 冻结）；真实 ChatGPT 与全路径 production smoke 仍属 alpha 验收 |
 | G7 | **PARTIAL** | Edge→Link→runtime 在本机已走 sealed Rust `link-prod`；canary 仍 Node；缺多机 / 公网完整 GA UAT |
+<<<<<<< HEAD
 | G8 | **PARTIAL** | doctor 区分 Herdr/runtime/service/NM/Link/Edge configured + 有界 HTTPS Edge reachable / OAuth metadata / MCP endpoint（不发 token）；WSS dial 仍 skipped；干净机/公网完整 UAT 未封 |
+=======
+| G8 | **PARTIAL** | Live alpha.14 `doctor` 本地 LAYER 完整；远端 HTTPS probe 另跟 P1-1 PR；WSS dial 仍不在 doctor 内 |
+>>>>>>> 4c88413 (docs(ga): make Release binary the primary install path)
 | G9 | **PARTIAL** | 又一次 alpha N→N+1 通过（alpha.13→alpha.14）；**无** stable N→N+1 / 干净机用户向 UAT |
 | G10 | **PARTIAL** | alpha.8↔alpha.6 真实受控回退已通过；非 stable、非干净机 |
 | G11 | **PARTIAL** | service mutation guardian、Link reconnect 有现场证据；完整崩溃/重启矩阵未做 GA UAT |
 | G12 | **PARTIAL** | Streaming basics 已落地；跨网页回合正式 GA UAT 未封板 |
 | G13 | **PASS** | Batch A + Result Optimization 已合入 |
 | G14 | **PARTIAL** | fs mutation policy / service mutation fencing 已有；Agent/terminal/browser mutation 未达「全部正式开放」 |
-| G15 | **PARTIAL** | 扩展 + `native-host` 存在但未正式封板分发；或从 GA 宣称中移除 |
-| G16 | **FAIL** | post-foundation：browser mutation 控制面未完成，不得当 GA 卖点 |
+| G15 | **PARTIAL** | **决策 A（草图）**：第一 GA 走 versioned package 路径（Release/docs 给出可重复安装包 + managed native-host），不绑 browser-control worktree 实现；未封板前不作为正式卖点 |
+| G16 | **FAIL** | **post-GA boundary**：browser terminal / true-steer / Browser Control Plane mutation **不**进入第一 GA 宣称；完成前保持 FAIL，不实现本轮 |
 | G17 | **PARTIAL** | bearer/socket/managed-root/fail-closed 等边界多已实现；缺干净机 + 公网完整安全验收 |
 | G18 | **FAIL** | 干净机 install UAT 未做 |
-| G19 | **FAIL** | 多平台 / 第二台环境干净安装 UAT 未做；建议第一 GA 平台收敛为 macOS Apple Silicon |
+| G19 | **FAIL** | 多平台 / 第二台环境干净安装 UAT 未做；**第一 GA 平台收敛为 macOS Apple Silicon**；Windows 仅 preview artifact；不宣称 Linux lifecycle |
 | G20 | **PARTIAL** | 文档与 CLI 合同在收敛中 |
 | G21 | **PARTIAL** | 站点 CI gate 在 alpha 主线上维护；尚无 stable tag 封板 |
-| G22 | **FAIL** | Fastest path / install 仍引导 `git clone`、`npm ci`；本机 PATH 已不依赖仓库 Bash |
+| G22 | **PARTIAL** | 正式 README/install/agent-install 主路径已改为 Release binary → `install`/`doctor`/`status`/`update`；clone/npm 降为 appendix。**docs PASS ≠ clean-machine UAT**（后者仍 G18） |
 | G23 | **PARTIAL** | main CI 在 alpha 迭代中可绿；GA tag 专用全绿验收未跑 |
-| G24 | **FAIL** | P0/P1 blocker 仍在：G1 alpha、G18 干净机、G22 安装文档；本机 G5 seal 已完成仍不足 GA |
+| G24 | **FAIL** | P0/P1 blocker 仍在：G1 alpha、G18/G19 干净机、G16 post-GA boundary、G15 封板、G22 干净机验证；本机 G5 seal + docs G22 仍不足 GA |
 | G25 | **FAIL** | 未达 GA：不得打 stable |
 
-**合计（诚实快照）**：PASS 2 · PARTIAL 15 · FAIL 8 · UNKNOWN 0
+**合计（诚实快照）**：PASS 2 · PARTIAL 16 · FAIL 7 · UNKNOWN 0
 
 ---
 
 ## Current P0 work queue
 
-按 2026-08-27 live alpha.14 / G5 sealed 证据排序：
+按 2026-08-28 live alpha.14 / G5 sealed / docs G22 refresh 证据排序：
 
-1. **G1 — 单一正式产品版本（退出 alpha）**。
-2. **G18 — 干净机 install UAT**。
+1. **G18 — 干净机 install UAT**（命令清单见 `docs/i18n/en/clean-machine-uat.md`；本机开发环境不能代替）。
+2. **G1 — 单一正式产品版本（退出 alpha）**。
 3. **G3 formal seal — 干净机 / 多机确认**。
-4. **G22 — 正式文档最快路径改为 binary install（去掉 clone/npm 主路径）**。
-5. **G15 — 扩展正式分发，或从 GA 宣称中移除（倾向 A：GA artifact 路径草图，不绑 browser-control worktree）**。
-6. **G5 follow-ups（非 blocker）**：candidate edge-prod soak 加深；长心跳 / cancel / long-request 矩阵。
+4. **G22 seal — 干净机验证文档主路径**（文档已 PARTIAL；需 G18 证据才能升 PASS）。
+5. **G15 — 决策 A：versioned package 路径落地**（不绑 browser-control worktree）。
+6. **G16 — 保持 post-GA boundary**（browser terminal / true-steer 不进第一 GA 宣称）。
+7. **G5 follow-ups（非 blocker）**：candidate edge-prod soak 加深；长心跳 / cancel / long-request 矩阵。
 
 ---
 

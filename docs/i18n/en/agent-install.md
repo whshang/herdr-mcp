@@ -1,37 +1,44 @@
 # Local-Agent install and `workers.dev` deployment
 
-This is an execution contract for a **local coding Agent**, not a list of commands for the human to copy. The human should only need to perform Cloudflare interactive login/API-Token creation; the Agent owns environment checks, clone, build, local service setup, Cloudflare Worker deployment, the outbound WSS Link, and verification.
+This is an execution contract for a **local coding Agent**, not a list of commands for the human to copy. The human should only need to perform Cloudflare interactive login/API-Token creation; the Agent owns environment checks, Release-binary install, Cloudflare Worker deployment, the outbound WSS Link, and verification.
 
-> Current boundary: fully automated background-service setup is macOS-first. The Node server itself supports macOS / Linux / Windows. On Linux/Windows the Agent may clone/build/deploy the Edge, but should integrate long-running local processes with the user's existing process manager instead of inventing unsupported systemd/Task Scheduler files.
+> Current boundary: fully automated background-service setup is **macOS Apple Silicon first**. Windows may receive Release artifacts as preview. Do not invent unsupported Linux lifecycle packaging. Edge deploy may use Node/`wrangler` temporarily; the local MCP runtime itself must come from GitHub Releases, not `git clone` + `npm ci`.
 
 ## 0. Agent contract
 
 1. Execute work directly; do not offload automatable shell steps to the human. Pause only for Cloudflare interactive login/API-Token creation or selection among multiple Cloudflare Accounts.
-2. Preserve existing work. If an existing checkout is dirty, never `reset --hard`, `clean -fd`, or overwrite user changes; use the safe current checkout or clone a side directory.
+2. Preserve existing work. Never `reset --hard`, `clean -fd`, or overwrite user changes in an unrelated checkout.
 3. First install uses `workers.dev` only. Do not create a Custom Domain, DNS record, Cloudflare Tunnel, or mutate an existing zone.
 4. Treat the Cloudflare Token as a high-sensitivity credential. Never echo it or write it to the repo, `.env`, ordinary logs, screenshots, or shell history. Prefer process-environment injection; if a temporary file is unavoidable, use mode `0600` and delete it immediately after deployment.
 5. Verify every mutation before continuing. On an error, determine whether the mutation already committed before retrying.
+6. Do **not** install the local MCP runtime by cloning this repository or running `npm`/`cargo` unless the human explicitly asked for a contributor/from-source session.
 
 ## 1. Prerequisites
 
-Run `git --version`, `node --version`, `npm --version`, `herdr --version`, and `herdr api schema >/dev/null`. Require Node.js `>=20`, a working `herdr` binary, and the Herdr socket (default `~/.config/herdr/herdr.sock`, or an explicit `HERDR_SOCKET_PATH`). If Herdr itself is not installed/running, stop and direct the user to <https://herdr.dev>; herdr-mcp does not replace Herdr.
+Run `herdr --version` and `herdr api schema >/dev/null`. Require a working `herdr` binary and the Herdr socket (default `~/.config/herdr/herdr.sock`, or an explicit `HERDR_SOCKET_PATH`). If Herdr itself is not installed/running, stop and direct the user to <https://herdr.dev>; herdr-mcp does not replace Herdr.
 
-## 2. Clone/update and build
+Node.js is required only for temporary Cloudflare Worker bootstrap (`npx wrangler`) and optional contributor tooling. It is **not** required to run the local MCP runtime.
 
-For a new install:
+## 2. Install the native runtime from GitHub Releases (primary)
+
+1. Download the current platform binary from <https://github.com/whshang/herdr-mcp/releases> (prerelease tags are expected while the product is still alpha).
+2. Place it on `PATH` (for example `~/.local/bin/herdr-mcp`) and make it executable.
+3. Run:
 
 ```bash
-git clone https://github.com/whshang/herdr-mcp.git ~/herdr-mcp
-cd ~/herdr-mcp
-npm ci
-npm run build
+herdr-mcp install
+herdr-mcp doctor
+herdr-mcp status
+herdr-mcp update check
 ```
 
-For an existing checkout, inspect `git status --short` first. A clean checkout may `git fetch origin main` + `git pull --ff-only`; preserve a dirty checkout.
+`install` stages an immutable generation under `~/.config/herdr-mcp/runtime/` and retargets `~/.local/bin/herdr-mcp` to `runtime/current/herdr-mcp`. Prefer these top-level commands. Do **not** use `herdr-mcp service install` as the normal install path.
+
+While the product is still alpha, keep `update.channel = "preview"` (or leave config absent on an alpha binary) so discovery sees prerelease tags.
 
 ## 3. Generate local identities without printing secrets
 
-Generate in Agent memory: `HERDR_MCP_TOKEN`, `LINK_SHARED_SECRET`, and a hostname-derived `WORKSTATION_ID` limited to `[A-Za-z0-9_.-]` and 64 chars. Generate `WORKER_NAME` only through the repository helper; the Agent must not invent its own hostname slug:
+Generate in Agent memory: `HERDR_MCP_TOKEN`, `LINK_SHARED_SECRET`, and a hostname-derived `WORKSTATION_ID` limited to `[A-Za-z0-9_.-]` and 64 chars. Generate `WORKER_NAME` only through the repository helper when a temporary Edge checkout is available; the Agent must not invent its own hostname slug:
 
 ```bash
 WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
@@ -43,17 +50,15 @@ WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 
 Open <https://dash.cloudflare.com/profile/api-tokens> when browser control is available; otherwise give the user that URL.
 
-The simplest supported path is Cloudflare's current **Edit Cloudflare Workers** template, scoped to the single Account used for this install. Cloudflare's Wrangler CI/CD documentation uses this template. Do **not** add DNS Write.
+The simplest supported path is Cloudflare's current **Edit Cloudflare Workers** template, scoped to the single Account used for this install. Do **not** add DNS Write.
 
 For a tighter custom token, retain at least Account → **Workers Scripts → Write/Edit**, Account → **Account Settings → Read**, User → **Memberships → Read**, and User → **User Details → Read**. `workers.dev` bootstrap does not need Zone/DNS permissions.
-
-References: <https://developers.cloudflare.com/fundamentals/api/get-started/create-token/>, <https://developers.cloudflare.com/fundamentals/api/reference/template/>, <https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/>.
 
 Tell the user the secret is shown once and ask them to paste it only into the current local-Agent session; prefer a dedicated secret-input channel when available.
 
 ## 5. Cloudflare preflight after the Token arrives
 
-Inject it only as temporary `CLOUDFLARE_API_TOKEN`, never as a literal command-line argument. Verify `GET https://api.cloudflare.com/client/v4/user/tokens/verify`, then run `npx wrangler whoami` under `edge/cloudflare`.
+Inject it only as temporary `CLOUDFLARE_API_TOKEN`, never as a literal command-line argument. Verify `GET https://api.cloudflare.com/client/v4/user/tokens/verify`, then run `npx wrangler whoami` against a temporary Edge working directory.
 
 - one Account → select automatically;
 - multiple Accounts → ask only which Account name to use;
@@ -67,11 +72,9 @@ export CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID"
 
 Do not write a personal `account_id` into tracked Wrangler config. Subsequent `wrangler deploy` and `wrangler secret put` inherit this temporary environment.
 
-With `ACCOUNT_ID`, fetch `GET /client/v4/accounts/<ACCOUNT_ID>/workers/subdomain`. Reuse an existing account subdomain and **never rename it**. `ACCOUNT_SUBDOMAIN` is the selected Cloudflare Account's `workers.dev` subdomain returned by the Cloudflare API. It is not the workstation username, hostname, or the Cloudflare Account display name. The Worker origin always combines two independent values as `<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`.
+With `ACCOUNT_ID`, fetch `GET /client/v4/accounts/<ACCOUNT_ID>/workers/subdomain`. Reuse an existing account subdomain and **never rename it**. `ACCOUNT_SUBDOMAIN` is the selected Cloudflare Account's `workers.dev` subdomain returned by the Cloudflare API. The Worker origin always combines two independent values as `<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`.
 
-If no account subdomain exists, create one only because there is no old value; use `herdr-<short-account-id>` plus a random suffix on collision. API reference: <https://developers.cloudflare.com/api/resources/workers/subresources/subdomains/>.
-
-Only after GET explicitly confirms that no subdomain exists, create one with:
+If no account subdomain exists, create one only because there is no old value; use `herdr-<short-account-id>` plus a random suffix on collision. Only after GET explicitly confirms that no subdomain exists, create one with:
 
 ```text
 PUT /client/v4/accounts/<ACCOUNT_ID>/workers/subdomain
@@ -82,14 +85,13 @@ Content-Type: application/json
 
 GET it again afterward and require the returned value to match before deploying the Worker.
 
-## 6. Generate Wrangler config and create the Worker
+## 6. Deploy Edge without requiring a permanent repo checkout
 
-Copy `edge/cloudflare/wrangler.user.example.toml` to ignored `wrangler.user.toml`, then set `name`, `DEFAULT_WORKSTATION_ID`, and `OAUTH_ISSUER=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`. Keep `workers_dev = true` and `routes = []`.
+Obtain the Edge Worker sources needed for deploy (temporary shallow clone or Release-adjacent docs package is acceptable for this Edge step only). Generate ignored `wrangler.user.toml` from the published user example, then set `name`, `DEFAULT_WORKSTATION_ID`, and `OAUTH_ISSUER=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`. Keep `workers_dev = true` and `routes = []`.
 
 Deploy:
 
 ```bash
-cd edge/cloudflare
 npx wrangler deploy --config wrangler.user.toml
 ```
 
@@ -99,59 +101,50 @@ Never overwrite a pre-existing Worker unless this install can prove it owns it; 
 printf '%s' "$LINK_SHARED_SECRET" | npx wrangler secret put LINK_SHARED_SECRET --config wrangler.user.toml
 ```
 
-No Zone/DNS mutation is required.
+No Zone/DNS mutation is required. A temporary checkout used only for Edge deploy must not become the production PATH for `herdr-mcp`.
 
-## 7. macOS local MCP LaunchAgent
+## 7. macOS local MCP service ownership
 
-Render `deploy/dev.herdr-mcp.server.plist.example` to `~/Library/LaunchAgents/dev.herdr-mcp.server.plist`, replacing its placeholders with the current Node path, repo path, HOME, `HERDR_MCP_TOKEN`, Herdr socket, and `HERDR_MCP_BASE_URL=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`. Then:
+Prefer the already-installed Release binary path:
 
 ```bash
-launchctl bootout "gui/$UID/dev.herdr-mcp.server" >/dev/null 2>&1 || true
-launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/dev.herdr-mcp.server.plist"
-launchctl enable "gui/$UID/dev.herdr-mcp.server"
-# Prefer: herdr-mcp install (retargets ~/.local/bin/herdr-mcp -> runtime/current)
-# Do not recreate a repo-linked ~/.local/bin/herdr-mcp bridge.
+herdr-mcp install
+herdr-mcp status
+herdr-mcp doctor
 ```
 
-Verify `127.0.0.1:8772/mcp` and never print `HERDR_MCP_TOKEN` in the final report.
+Do not recreate a repo-linked `~/.local/bin/herdr-mcp` bridge. Do not point LaunchAgent at a git checkout or `target/*/herdr-mcp`.
 
-Before asking the user to load the browser extension, install its Chrome Native Messaging host:
+Browser extension / Native Messaging remains optional and is not required for the first ChatGPT closed loop. If the human asks for continuity later, after `herdr-mcp doctor` is healthy:
 
 ```bash
+herdr-mcp native-host install
+herdr-mcp native-host status
+# compatibility wrappers still accepted where published:
 bin/herdr-extension-host install
 bin/herdr-extension-host status
 ```
 
-The host manifest contains no long-lived secret. The installer derives Chromium's stable unpacked-extension id from the absolute `<repo>/extension` path and restricts the host to that exact `chrome-extension://<id>/` origin. This preserves the existing unpacked-extension identity when the same directory is reloaded. On macOS it registers the host for Chrome plus detected Chromium-family profiles including Chromium, Brave, Edge, and ego lite. Current extension builds send bounded request/stream messages to the native host, which reaches herdr-mcp through `~/.config/herdr-mcp/extension.sock` (mode `0600`). No Herdr bearer is returned to or stored by the extension. The host can still use the existing LaunchAgent token internally when talking to an older runtime that has no IPC socket. Do not copy `HERDR_MCP_TOKEN` into extension storage during a normal install.
+Then guide Chrome: open `chrome://extensions`, enable Developer mode, **Load unpacked** only when following the sealed G15 package path or an explicitly requested developer session. Do not treat unpacking `extension/` from a random git checkout as the primary end-user path. See [Browser continuity](browser-continuity.md).
 
 ## 8. macOS persistent Herdr Link
 
-Store `LINK_SHARED_SECRET` in Keychain under `herdr-edge-link-<WORKSTATION_ID>`. The command text must reference the environment variable rather than a literal secret:
-
-```bash
-export HERDR_LINK_KEYCHAIN_SERVICE="herdr-edge-link-$WORKSTATION_ID"
-security add-generic-password -U -a "$(id -un)" -s "$HERDR_LINK_KEYCHAIN_SERVICE" -w "$LINK_SHARED_SECRET"
-
-HERDR_EDGE_URL="wss://$WORKER_NAME.$ACCOUNT_SUBDOMAIN.workers.dev/ws" \
-HERDR_WORKSTATION_ID="$WORKSTATION_ID" \
-HERDR_LINK_KEYCHAIN_SERVICE="$HERDR_LINK_KEYCHAIN_SERVICE" \
-bin/herdr-link install
-```
-
-The script resolves Node from PATH; `HERDR_NODE_BIN` can override it.
+Store `LINK_SHARED_SECRET` in Keychain under `herdr-edge-link-<WORKSTATION_ID>`. The command text must reference the environment variable rather than a literal secret. Prefer the managed Link install path exposed by the installed `herdr-mcp` binary (`herdr-mcp link ...` / product docs for the current alpha). Do not leave production Link ownership on a repository Bash wrapper.
 
 ## 9. Verify the closed loop
 
-Verify local `server/discover`, `herdr-mcp status`, `bin/herdr-extension-host status`, `bin/herdr-link status`, Worker `/health`, final `/mcp`, OAuth discovery, and that no Custom Domain/DNS/Tunnel was created.
+Verify local `server/discover`, `herdr-mcp status`, `herdr-mcp doctor`, Link status, Worker `/health`, public `/mcp`, OAuth discovery, and that no Custom Domain/DNS/Tunnel was created. Doctor may probe Edge `/health`, OAuth metadata, and `/mcp` without sending tokens; never print tokens.
 
 ## 10. Clean up the bootstrap Token
 
-Unset `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, then delete temporary credential files. Do not copy the Token into project config. Recommend revocation if it was one-time; otherwise move it to a dedicated secret manager/CI secret.
+Unset `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, then delete temporary credential files and any temporary Edge checkout that is no longer needed. Do not copy the Token into project config. Recommend revocation if it was one-time; otherwise move it to a dedicated secret manager/CI secret.
 
 ## 11. Final report
 
-Return only non-sensitive facts: the absolute repository directory, the absolute browser-extension directory (`<repo>/extension`), local MCP status, Herdr Link status, Cloudflare Account name + shortened ID, Worker name, `workers.dev` origin, `/health`, and `/mcp`.
-
-Then give the browser-extension install steps: open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the reported `extension` directory. The installed Native Messaging host carries current extension traffic over the runtime's mode-`0600` Unix socket; the user does not copy `HERDR_MCP_TOKEN` into Options and current Options has no Herdr Token field.
+Return only non-sensitive facts: installed runtime generation/version, local MCP status, Herdr Link status, Cloudflare Account name + shortened ID, Worker name, `workers.dev` origin, `/health`, and `/mcp`.
 
 Finally guide the user to enable ChatGPT Developer mode, create a custom MCP Connector with `/mcp`, and complete OAuth. Never paste the local `HERDR_MCP_TOKEN` or Cloudflare Token into ChatGPT.
+
+## Appendix: developer-from-source only
+
+Clone + `npm`/`cargo` is allowed only when the human explicitly asked to develop herdr-mcp itself. That path must not be used as the primary runtime install for an ordinary workstation.
