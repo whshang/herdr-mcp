@@ -47,6 +47,9 @@ mod macos {
 
     const SERVICE_LABEL: &str = "dev.herdr-mcp.server";
     const WATCHDOG_LABEL: &str = "dev.herdr-mcp.watchdog";
+    /// Periodic Rust-era health sidecar. Deliberately distinct from the legacy
+    /// Node `dev.herdr-mcp.watchdog` identity reserved for adoption/rollback.
+    const HEALTH_WATCHDOG_LABEL: &str = "dev.herdr-mcp.health-watchdog";
     const SERVICE_IMPL: &str = "rust-v1";
     const DEFAULT_PORT: u16 = 8772;
     const HEALTH_BUDGET: Duration = Duration::from_secs(10);
@@ -76,6 +79,7 @@ mod macos {
         current_binary: PathBuf,
         plist: PathBuf,
         watchdog_plist: PathBuf,
+        health_watchdog_plist: PathBuf,
         backups_dir: PathBuf,
         guardians_dir: PathBuf,
         mutation_lock: PathBuf,
@@ -84,7 +88,7 @@ mod macos {
         log_path: PathBuf,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ServiceKind {
         Missing,
         Rust,
@@ -281,6 +285,10 @@ mod macos {
                     .join("Library")
                     .join("LaunchAgents")
                     .join(format!("{WATCHDOG_LABEL}.plist")),
+                health_watchdog_plist: home
+                    .join("Library")
+                    .join("LaunchAgents")
+                    .join(format!("{HEALTH_WATCHDOG_LABEL}.plist")),
                 backups_dir: config_dir.join("backups"),
                 guardians_dir: config_dir.join("guardians"),
                 mutation_lock: config_dir.join("service-mutation.lock"),
@@ -1724,24 +1732,49 @@ mod macos {
     }
 
     fn status(paths: &ServicePaths) -> Result<Value, String> {
+        status_with(
+            paths,
+            || is_loaded(SERVICE_LABEL),
+            || is_loaded(WATCHDOG_LABEL),
+            || is_loaded(HEALTH_WATCHDOG_LABEL),
+            |kind, loaded| {
+                if kind == ServiceKind::Rust && loaded {
+                    health_once(DEFAULT_PORT)
+                } else {
+                    false
+                }
+            },
+        )
+    }
+
+    fn status_with<ServiceLoaded, LegacyLoaded, HealthLoaded, Healthy>(
+        paths: &ServicePaths,
+        service_loaded: ServiceLoaded,
+        legacy_watchdog_loaded: LegacyLoaded,
+        health_watchdog_loaded: HealthLoaded,
+        healthy: Healthy,
+    ) -> Result<Value, String>
+    where
+        ServiceLoaded: FnOnce() -> bool,
+        LegacyLoaded: FnOnce() -> bool,
+        HealthLoaded: FnOnce() -> bool,
+        Healthy: FnOnce(ServiceKind, bool) -> bool,
+    {
         let bytes = read_optional_bounded(&paths.plist, 256 * 1024)?;
         let descriptor = describe_service(bytes.as_deref(), paths)?;
-        let loaded = is_loaded(SERVICE_LABEL);
-        let health = if descriptor.kind == ServiceKind::Rust && loaded {
-            health_once(DEFAULT_PORT)
-        } else {
-            false
-        };
+        let loaded = service_loaded();
+        let health = healthy(descriptor.kind, loaded);
         let generation = descriptor.env.get("HERDR_MCP_RUNTIME_GENERATION").cloned();
+        let implementation = match descriptor.kind {
+            ServiceKind::Missing => "missing",
+            ServiceKind::Rust => "rust",
+            ServiceKind::Node => "node",
+            ServiceKind::Other => "other",
+        };
         Ok(json!({
             "ok": descriptor.kind == ServiceKind::Rust && loaded && health,
             "label": SERVICE_LABEL,
-            "implementation": match descriptor.kind {
-                ServiceKind::Missing => "missing",
-                ServiceKind::Rust => "rust",
-                ServiceKind::Node => "node",
-                ServiceKind::Other => "other",
-            },
+            "implementation": implementation,
             "loaded": loaded,
             "healthy": health,
             "generation": generation,
@@ -1749,7 +1782,10 @@ mod macos {
             "plist": paths.plist,
             "extension_socket": paths.extension_socket,
             "legacy_watchdog_present": paths.watchdog_plist.exists(),
-            "legacy_watchdog_loaded": is_loaded(WATCHDOG_LABEL),
+            "legacy_watchdog_loaded": legacy_watchdog_loaded(),
+            "health_watchdog_label": HEALTH_WATCHDOG_LABEL,
+            "health_watchdog_present": paths.health_watchdog_plist.exists(),
+            "health_watchdog_loaded": health_watchdog_loaded(),
         }))
     }
 
@@ -2347,7 +2383,15 @@ mod macos {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        Ok(args.iter().any(|value| value.ends_with("watchdog.sh")) && args.contains(&"once"))
+        // Basename must be exactly `watchdog.sh`. A trailing `ends_with("watchdog.sh")`
+        // would also match the Rust-era `health-watchdog.sh` sidecar and falsely
+        // treat it as the legacy Node supervisor reserved for adoption/rollback.
+        let runs_legacy_script = args.iter().any(|value| {
+            Path::new(value)
+                .file_name()
+                .is_some_and(|name| name == OsStr::new("watchdog.sh"))
+        });
+        Ok(runs_legacy_script && args.contains(&"once"))
     }
 
     fn prepare_generation(paths: &ServicePaths) -> Result<PreparedGeneration, String> {
@@ -2956,7 +3000,22 @@ mod macos {
                 &ServiceCommand::Install { adopt_node: false }
             ));
             assert!(service_command_requires_mutation_lock(
+                &ServiceCommand::Install { adopt_node: true }
+            ));
+            assert!(service_command_requires_mutation_lock(
+                &ServiceCommand::Start
+            ));
+            assert!(service_command_requires_mutation_lock(
+                &ServiceCommand::Stop
+            ));
+            assert!(service_command_requires_mutation_lock(
+                &ServiceCommand::Restart
+            ));
+            assert!(service_command_requires_mutation_lock(
                 &ServiceCommand::Rollback
+            ));
+            assert!(service_command_requires_mutation_lock(
+                &ServiceCommand::Uninstall
             ));
         }
 
@@ -3429,6 +3488,94 @@ mod macos {
                 ServiceKind::Other
             );
             assert!(!watchdog_is_legacy_owned(Some(&bytes)).unwrap());
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        fn watchdog_plist_bytes(label: &str, script: &str) -> Vec<u8> {
+            let mut root = Dictionary::new();
+            root.insert("Label".to_owned(), PlistValue::String(label.to_owned()));
+            root.insert(
+                "ProgramArguments".to_owned(),
+                PlistValue::Array(vec![
+                    PlistValue::String("/bin/bash".to_owned()),
+                    PlistValue::String(script.to_owned()),
+                    PlistValue::String("once".to_owned()),
+                ]),
+            );
+            let mut bytes = Vec::new();
+            PlistValue::Dictionary(root)
+                .to_writer_xml(&mut bytes)
+                .unwrap();
+            bytes
+        }
+
+        #[test]
+        fn legacy_watchdog_identity_rejects_health_watchdog_script_basename() {
+            let legacy = watchdog_plist_bytes(
+                WATCHDOG_LABEL,
+                "/Users/example/.config/herdr-mcp/watchdog.sh",
+            );
+            assert!(watchdog_is_legacy_owned(Some(&legacy)).unwrap());
+
+            let health_under_legacy_label = watchdog_plist_bytes(
+                WATCHDOG_LABEL,
+                "/Users/example/.config/herdr-mcp/health-watchdog.sh",
+            );
+            assert!(
+                !watchdog_is_legacy_owned(Some(&health_under_legacy_label)).unwrap(),
+                "health-watchdog.sh must not satisfy the legacy watchdog.sh basename gate"
+            );
+
+            let health_label = watchdog_plist_bytes(
+                HEALTH_WATCHDOG_LABEL,
+                "/Users/example/.config/herdr-mcp/health-watchdog.sh",
+            );
+            assert!(!watchdog_is_legacy_owned(Some(&health_label)).unwrap());
+        }
+
+        #[test]
+        fn service_status_reports_health_watchdog_separately_from_legacy() {
+            let (root, paths) = fixture();
+            assert_eq!(
+                paths
+                    .health_watchdog_plist
+                    .file_name()
+                    .and_then(|value| value.to_str()),
+                Some("dev.herdr-mcp.health-watchdog.plist")
+            );
+            assert_eq!(
+                paths
+                    .watchdog_plist
+                    .file_name()
+                    .and_then(|value| value.to_str()),
+                Some("dev.herdr-mcp.watchdog.plist")
+            );
+            assert_ne!(paths.health_watchdog_plist, paths.watchdog_plist);
+
+            fs::create_dir_all(paths.health_watchdog_plist.parent().unwrap()).unwrap();
+            fs::write(
+                &paths.health_watchdog_plist,
+                watchdog_plist_bytes(
+                    HEALTH_WATCHDOG_LABEL,
+                    paths
+                        .config_dir
+                        .join("health-watchdog.sh")
+                        .to_string_lossy()
+                        .as_ref(),
+                ),
+            )
+            .unwrap();
+
+            let status =
+                status_with(&paths, || false, || false, || true, |_kind, _loaded| false).unwrap();
+            assert_eq!(status["legacy_watchdog_present"], false);
+            assert_eq!(status["legacy_watchdog_loaded"], false);
+            assert_eq!(status["health_watchdog_label"], HEALTH_WATCHDOG_LABEL);
+            assert_eq!(status["health_watchdog_present"], true);
+            assert_eq!(status["health_watchdog_loaded"], true);
+            assert_eq!(status["implementation"], "missing");
+            assert_eq!(status["ok"], false);
+
             fs::remove_dir_all(root).unwrap();
         }
 
