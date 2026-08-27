@@ -294,7 +294,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G5 | **PASS** | 本机 production owner=rust：link-prod Rust；alpha.14 seal execute；health/`doctor`/`link status` 一致 `production_ready`；rollback UAT 证据在 `seals/evidence/`（干净机另计 G18） |
 | G6 | **PARTIAL** | 嵌入契约 epoch 2 / 18 tools（hash 冻结）；真实 ChatGPT 与全路径 production smoke 仍属 alpha 验收 |
 | G7 | **PARTIAL** | Edge→Link→runtime 在本机已走 sealed Rust `link-prod`；canary 仍 Node；缺多机 / 公网完整 GA UAT |
-| G8 | **PARTIAL** | Live alpha.14 `doctor` 8 行 `LAYER`；`LAYER link owned production_owner=rust` / `production_ready_eligible=true`；`remote-probe=skipped` |
+| G8 | **PARTIAL** | doctor 区分 Herdr/runtime/service/NM/Link/Edge configured + 有界 HTTPS Edge reachable / OAuth metadata / MCP endpoint（不发 token）；WSS dial 仍 skipped；干净机/公网完整 UAT 未封 |
 | G9 | **PARTIAL** | 又一次 alpha N→N+1 通过（alpha.13→alpha.14）；**无** stable N→N+1 / 干净机用户向 UAT |
 | G10 | **PARTIAL** | alpha.8↔alpha.6 真实受控回退已通过；非 stable、非干净机 |
 | G11 | **PARTIAL** | service mutation guardian、Link reconnect 有现场证据；完整崩溃/重启矩阵未做 GA UAT |
