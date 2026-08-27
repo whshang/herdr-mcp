@@ -212,6 +212,7 @@ Evidence Store 未做，等真实恢复需求。
 ### Link candidate daemon staged (#65)
 
 状态：已完成实现，未生产切流（#65）。Rust `link::daemon` 组装仅 candidate/staged；生产 Link 继续走 Node。
+
 ## 规划中
 
 ### Search Execution Architecture
@@ -239,6 +240,7 @@ Evidence Store 未做，等真实恢复需求。
 3. 多工具协同调度
 4. 长任务持续运行与反馈（Streaming First #62+#66 已合入；同步工具仍无 mid-call stream）
 5. 资源生命周期管理
+
 ### Result Optimization Layer（P0）
 
 ```text
