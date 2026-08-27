@@ -30,67 +30,29 @@ Herdr 性能优化不以单点 benchmark 为目标，目标是建立长期可演
 ```text
 Herdr Architecture Roadmap
 ├── 当前路线状态
-├── 已完成并验收
-│   ├── Rust Native Runtime
-│   ├── Batch A Performance
-│   ├── Result Optimization first wave
-│   ├── Project Context Cache first slice
-│   ├── Streaming First (#62 start/read + #66 sync completion parity)
-│   ├── Skill wave guidance tighten (#61)
-│   └── health_watchdog in service status (#63)
+├── 已完成并验收（含 G5 Link seal、Streaming First、Batch A…）
 ├── 已完成待验收
-│   ├── Cloudflare Edge read fast path (#60 harden)
-│   ├── Long Task Progress Observability
-│   ├── Search Execution first slice
-│   └── Link candidate daemon staged (#65; production still Node)
-├── 规划中
-│   ├── Search Execution Architecture (remaining)
-│   ├── Batch B Tool Batch Architecture
-│   └── IngressProfile
-├── AI Tool Runtime Optimization Architecture
-│   ├── Result Optimization Layer (first wave landed)
-│   ├── Tool Wave Scheduler (skill-level only; #61 guidance)
-│   ├── Project Context Cache (first slice landed; deeper waits on benchmarks)
-│   └── Streaming First (#62+#66 landed; no mid-call stream for sync tools)
-├── Appendix A
-│   └── Rust architecture history
-└── Appendix B
-    └── Performance implementation history
+├── 规划中（post-GA：Batch B / Search IndexBackend / deeper PCC / Ingress…）
+└── 当前主游标：GA Product Completion
 ```
-
-状态定义：
-
-- 已完成并验收：代码、测试、真实 smoke 或 benchmark 已通过；
-- 已完成待验收：实现完成，需要长期运行数据或生产验证；已设计未落地的项在本节标明；
-- 进行中：已有明确实现路径，当前正在推进；
-- 规划中：架构方向确定，等待前置条件。
-
-## 路线状态总览
-
-| 状态 | 含义 | 当前重点 |
-|---|---|---|
-| 已完成并验收 | 代码、测试、smoke/benchmark 已通过 | Rust runtime、Batch A、Result Optimization first wave、Project Context Cache first slice、Streaming First（#62+#66）、skill waves（#61）、health_watchdog status（#63） |
-| 已完成待验收 | 实现完成或设计完成，需要生产数据或后续落地 | Edge read path（含 #60 harden）、observability、Search first slice、Link candidate daemon（#65 staged） |
-| 进行中 | 已进入实现阶段 | （无独立实现片；下一片见下） |
-| 规划中 | 架构确定，等待前置条件 | Search remaining、Batch B（仍等 Layer 3）、Ingress、PCC deeper cache |
 
 ## 当前执行重点
 
-**Result Optimization first wave 已合入 main**（epoch 2 / 18 tools 不变）：`herdr_git status` compact（#53）、exec 成功输出 head/tail（#54）、`herdr_git` diff/log compact（#55）、`herdr_fs_grep` group-by-file（#56）。Evidence Store 仍等真实恢复需求，不为本波预留抽象。
+**当前主游标：GA Product Completion**（SSOT：[`docs/ga-release-gate.md`](./ga-release-gate.md)）。
 
-**Search Execution first slice 已合入，待生产验收**：`herdr_fs_grep` 优先 rg、Rust walker 回退（#52），与 grep compact 共用 finish path。IndexBackend 等其余 Search 架构仍属规划中。
+G5 Link production ownership **已 PASS**，不再是当前任务。下一阶段按门禁推进：
 
-**Project Context Cache first slice 已合入**（#58）：mutation 路径单次 `derive_routing` 复用；整体仍为 P1，更深 cache 等待基准再加深。
+1. install 路径（Release binary → `herdr-mcp install`）干净机验证
+2. doctor 分层诊断（含远端 HTTPS probe）干净机 / 公网验收
+3. extension versioned artifact + managed native-host（G15 决策 A）
+4. clean-machine UAT（G18）
+5. 退出 alpha → 评估 `0.4.0` stable（仅在候选全 PASS 后）
 
-**Streaming First 已合入**（#62+#66）：`herdr_exec_start` / `herdr_exec_read` 带 phase 与 progress；同步 `herdr_exec` / `herdr_fs_grep` 完成结果已有 phase/progress 字段对齐，仍无 mid-call stream（MCP sync 工具仍阻塞至完成）。
+**明确 post-GA / 不挡第一 stable：** Browser terminal input、interrupt、true steer、Browser mutation（G16 DEFERRED）；Batch B；Search IndexBackend；deeper PCC；IngressProfile；Continuity 2.0；Progressive Skills 继续扩张。
 
-**Edge read path harden 已合入**（#60）：ephemeral read 在 DO write quota 压力下继续观察；见下「已完成待验收」。
+**Result Optimization / Streaming First / Skill waves** 已合入，不是当前主游标。
 
-**Skill wave guidance**（#61）：skill 层收紧 compact 结果与长 exec 的 wave 指引；仍无 runtime Wave Scheduler。**health_watchdog**（#63）：`service status` 已单独暴露 `dev.herdr-mcp.health-watchdog`。**Link candidate daemon**（#65）：Rust daemon 已可用于 production cutover；本机 G5 sealed（alpha.14）后 production Link 为 Rust；干净机 / 多机仍属 G18/G19。
-
-**Tool Wave Scheduler** 仍仅 skill 层策略。**Batch B** 仍等 Layer 3 Connector UAT，不是当前片。
-
-下一产品焦点（GA gate SSOT）：**G5 已 PASS** → **干净机 UAT（G18）/ 退出 alpha（G1）/ G22 seal**。Streaming First 已合入，不是当前主游标。Browser Control Plane / true-steer 为 post-GA boundary（G16），本轮不实现。
+下一产品焦点（GA gate SSOT）：**G5 已 PASS** → **extension artifact（G15）→ 干净机 UAT（G18）→ 公网/安全验收 → 退出 alpha（G1）→ stable**。
 
 ## 已完成并验收
 
