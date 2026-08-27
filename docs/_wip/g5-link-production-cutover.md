@@ -2,29 +2,31 @@
 
 Status: alpha in progress. This folder is excluded from the docs site build.
 Developer-workstation **LaunchAgent cutover for `link-prod` landed 2026-08-27**
-(alpha.13). `production_ready` remains **false** until an auditable seal exists.
-"Dual verification" here means two independent observation passes by the same
-operator session (not a second human).
+(alpha.13). **G5 seal landed 2026-08-27** on live alpha.14
+(`production_ready=true` via `link seal --execute`; cleared only by cutover
+`--rollback`). "Dual verification" here means two independent observation passes
+by the same operator session (not a second human).
 
 Related: [#65](https://github.com/whshang/herdr-mcp/pull/65) staged Rust daemon,
 [#96](https://github.com/whshang/herdr-mcp/pull/96) cutover execute,
 [#97](https://github.com/whshang/herdr-mcp/pull/97) cutover harden + alpha.13,
+[#100](https://github.com/whshang/herdr-mcp/pull/100) alpha.14 seal/rollback,
 [`docs/ga-release-gate.md`](../ga-release-gate.md) G5.
 
 ## Current ownership (read-only truth)
 
-As of **alpha.13** on this developer workstation after live `link cutover --execute`
-(2026-08-27T15:18:47Z UTC, independent Shell only):
+As of **alpha.14** on this developer workstation after managed update +
+`link seal --execute` (2026-08-27, independent Shell only):
 
 | Layer | Owner today | Evidence |
 | --- | --- | --- |
-| MCP runtime service `dev.herdr-mcp.server` | Rust generation under `runtime/current` (**alpha.13** / `rust-5c7799b56a426855`) | `herdr-mcp service status` / `--version` |
-| User CLI `~/.local/bin/herdr-mcp` | Symlink → `runtime/current/herdr-mcp` (G3 sealed) | `ls -l` / `readlink` |
-| Production Link `dev.herdr-mcp.link-prod` | **Rust** `runtime/current/herdr-mcp link run` | ProgramArguments after execute; PID changed Node `10621` → Rust `4745`/`6131` |
-| Prod runtime-control / status | Rust-compatible ids (desired still `rust-6e3f0b…` no-op migrate; status active observed `rust-5c7799…`) | same loopback `127.0.0.1:8772/mcp` |
-| Dev/canary Link `dev.herdr-mcp.link` | **Node** unchanged | PID `3937` preserved through cutover |
-| Rust candidate `dev.herdr-mcp.link-rust-candidate` | argv `runtime/current link run`; **Edge retargeted to edge-prod (epoch 2)**; soak PID online with MCP+Edge TCP | Do not treat candidate health as prod blocker once prod Edge is online |
-| Health | `/health` has no `production_ready=true`; `link status` `production_ready_eligible=false` | seal still open |
+| MCP runtime service `dev.herdr-mcp.server` | Rust generation under `runtime/current` (**alpha.14** / `rust-7c0ac0b73060aae0`) | `herdr-mcp service status` / `--version` |
+| User CLI `~/.local/bin/herdr-mcp` | Symlink → `runtime/current/herdr-mcp` (G3 sealed on this machine) | `ls -l` / `readlink` |
+| Production Link `dev.herdr-mcp.link-prod` | **Rust** `runtime/current/herdr-mcp link run` | ProgramArguments; launchd loaded |
+| Prod runtime-control / status | Rust-compatible ids | same loopback `127.0.0.1:8772/mcp` |
+| Dev/canary Link `dev.herdr-mcp.link` | **Node** unchanged (left alone) | canary soak |
+| Rust candidate `dev.herdr-mcp.link-rust-candidate` | argv `runtime/current link run`; **Edge = edge-prod (epoch 2)** | soak PID online with MCP+Edge TCP |
+| Health / seal | `/health` `runtime=rust`; `native_migration.production_ready=true`; active `seals/link-production-ready.json` | G5 PASS on this machine; clean-machine still open |
 
 ### Live cutover evidence (developer workstation)
 
@@ -239,8 +241,8 @@ Developer workstation: **done** on alpha.13 (see evidence above). Remaining:
 - [x] `migrate-runtime-control` gated `--apply` (control file only)
 - [x] Dual self-observation Pass A/B recorded (this doc)
 - [x] Candidate `contract_rejected` root-caused: edge-dev `/health` still publishes epoch 1 while Rust hello is epoch 2; candidate defaults + install probe retarget to edge-prod (epoch 2). Live soak: PID online, MCP `8772` + Edge TCP ESTABLISHED; link-prod untouched
-- [ ] Deliberate Node rollback UAT via `link cutover --rollback` (alpha.14+) without deleting artifacts
-- [ ] Auditable `production_ready` seal via `link seal` (alpha.14+; rollback clears seal)
+- [x] Deliberate Node rollback UAT via `link cutover --rollback` (alpha.14+) without deleting artifacts
+- [x] Auditable `production_ready` seal via `link seal` (alpha.14+; rollback clears seal)
 - [ ] Longer candidate Edge soak matrix (heartbeat/cancel/long-request) on edge-prod
 - [ ] Clean-machine confirmation of G3 user CLI seal (shared with G3/G18)
 
@@ -255,7 +257,7 @@ Independent Shell, alpha.14 release binary for `--rollback`, then alpha.13 `runt
 4. Immediate re-cut: `HERDR_LINK_CUTOVER_I_UNDERSTAND=1 runtime/current link cutover --execute` → `ok=true` VERIFY.
 5. Rust again: PID 80664 `runtime/current/herdr-mcp link run`; MCP+Edge TCP; `tools/list` **18**; health alpha.13 `production_ready=false`.
 6. Backups retained. Seal evidence recorded under `~/.config/herdr-mcp/seals/evidence/{dual,rollback}-uat.json`.
-7. `link seal --execute` deferred until alpha.14 is the installed runtime (health/seal readers live in binary).
+7. After alpha.14 managed update (`rust-7c0ac0b73060aae0`): `link seal --dry-run` `ready_for_seal=true` → `HERDR_LINK_SEAL_I_UNDERSTAND=1 link seal --execute` → `production_ready=true`; `/health` `runtime=rust` + `native_migration.production_ready=true`; active seal `~/.config/herdr-mcp/seals/link-production-ready.json`.
 
 ### Candidate contract fix evidence (2026-08-27)
 
