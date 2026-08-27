@@ -33,20 +33,23 @@ Herdr Architecture Roadmap
 │   ├── Batch A Performance
 │   ├── Result Optimization first wave
 │   ├── Project Context Cache first slice
-│   └── Streaming First first slice
+│   ├── Streaming First (#62 start/read + #66 sync completion parity)
+│   ├── Skill wave guidance tighten (#61)
+│   └── health_watchdog in service status (#63)
 ├── 已完成待验收
 │   ├── Cloudflare Edge read fast path (#60 harden)
 │   ├── Long Task Progress Observability
-│   └── Search Execution first slice
+│   ├── Search Execution first slice
+│   └── Link candidate daemon staged (#65; production still Node)
 ├── 规划中
 │   ├── Search Execution Architecture (remaining)
 │   ├── Batch B Tool Batch Architecture
 │   └── IngressProfile
 ├── AI Tool Runtime Optimization Architecture
 │   ├── Result Optimization Layer (first wave landed)
-│   ├── Tool Wave Scheduler (skill-level only)
+│   ├── Tool Wave Scheduler (skill-level only; #61 guidance)
 │   ├── Project Context Cache (first slice landed; deeper waits on benchmarks)
-│   └── Streaming First (first slice landed; sync paths remain)
+│   └── Streaming First (#62+#66 landed; no mid-call stream for sync tools)
 ├── Appendix A
 │   └── Rust architecture history
 └── Appendix B
@@ -64,10 +67,10 @@ Herdr Architecture Roadmap
 
 | 状态 | 含义 | 当前重点 |
 |---|---|---|
-| 已完成并验收 | 代码、测试、smoke/benchmark 已通过 | Rust runtime、Batch A、Result Optimization first wave、Project Context Cache first slice、Streaming First first slice |
-| 已完成待验收 | 实现完成或设计完成，需要生产数据或后续落地 | Edge read path（含 #60 harden）、observability、Search first slice |
+| 已完成并验收 | 代码、测试、smoke/benchmark 已通过 | Rust runtime、Batch A、Result Optimization first wave、Project Context Cache first slice、Streaming First（#62+#66）、skill waves（#61）、health_watchdog status（#63） |
+| 已完成待验收 | 实现完成或设计完成，需要生产数据或后续落地 | Edge read path（含 #60 harden）、observability、Search first slice、Link candidate daemon（#65 staged） |
 | 进行中 | 已进入实现阶段 | （无独立实现片；下一片见下） |
-| 规划中 | 架构确定，等待前置条件 | Search remaining、Batch B（仍等 Layer 3）、Ingress、PCC deeper cache、Streaming sync paths |
+| 规划中 | 架构确定，等待前置条件 | Search remaining、Batch B（仍等 Layer 3）、Ingress、PCC deeper cache |
 
 ## 当前执行重点
 
@@ -77,13 +80,15 @@ Herdr Architecture Roadmap
 
 **Project Context Cache first slice 已合入**（#58）：mutation 路径单次 `derive_routing` 复用；整体仍为 P1，更深 cache 等待基准再加深。
 
-**Streaming First first slice 已合入**（#62）：`herdr_exec_start` / `herdr_exec_read` 结果带 phase 与 progress；同步 `herdr_exec` / `herdr_fs_grep` 仍阻塞至完成。
+**Streaming First 已合入**（#62+#66）：`herdr_exec_start` / `herdr_exec_read` 带 phase 与 progress；同步 `herdr_exec` / `herdr_fs_grep` 完成结果已有 phase/progress 字段对齐，仍无 mid-call stream（MCP sync 工具仍阻塞至完成）。
 
 **Edge read path harden 已合入**（#60）：ephemeral read 在 DO write quota 压力下继续观察；见下「已完成待验收」。
 
-**Tool Wave Scheduler** 仍仅 skill 层策略，无 runtime 调度器。**Batch B** 仍等 Layer 3 Connector UAT，不是当前片。
+**Skill wave guidance**（#61）：skill 层收紧 compact 结果与长 exec 的 wave 指引；仍无 runtime Wave Scheduler。**health_watchdog**（#63）：`service status` 已单独暴露 `dev.herdr-mcp.health-watchdog`。**Link candidate daemon**（#65）：Rust daemon 组装仅 staged；生产 Link 仍走 Node，切流不是当前片。
 
-下一唯一实现片：**更深 Streaming（同步 exec/grep 路径）**，让长阻塞工具也能先回 progress。
+**Tool Wave Scheduler** 仍仅 skill 层策略。**Batch B** 仍等 Layer 3 Connector UAT，不是当前片。
+
+下一唯一实现片：**生产装新 generation 验证 Streaming 字段**。
 
 ## 已完成并验收
 
@@ -147,13 +152,24 @@ Evidence Store 未做，等真实恢复需求。
 
 后续：更深 cache 需基准证明后再加深；不产生第二事实源。
 
-### Streaming First first slice
+### Streaming First（#62+#66）
 
-状态：已完成，已验收（#62）。整体 Streaming First 仍为 P1；同步路径未改。
+状态：已完成，已验收（#62+#66）。整体 Streaming First 仍为 P1；同步工具仍无 mid-call stream。
 
-内容：`herdr_exec_start` / `herdr_exec_read` 结果增加 phase 与 progress 字段，长会话可先看到阶段反馈；不改 epoch/schema，不新增 tool。
+内容：
 
-未覆盖：同步 `herdr_exec` / `herdr_fs_grep` 仍阻塞至完成。
+- #62：`herdr_exec_start` / `herdr_exec_read` 结果增加 phase 与 progress；
+- #66：同步 `herdr_exec` / `herdr_fs_grep` 完成结果对齐 phase/progress（`phase=completed` 与 timing/counters），不改 epoch/schema，不新增 tool。
+
+未覆盖：同步工具仍无 mid-call stream；MCP sync 调用仍阻塞至完成。
+
+### Skill wave guidance (#61)
+
+状态：已完成，已验收（#61）。skill 层收紧 compact 结果与长 exec 指引；无 runtime Wave Scheduler。
+
+### health_watchdog in service status (#63)
+
+状态：已完成，已验收（#63）。`service status` 单独暴露 `dev.herdr-mcp.health-watchdog`，与 legacy Node watchdog 字段区分。
 
 ## 已完成待验收
 
@@ -193,6 +209,10 @@ Evidence Store 未做，等真实恢复需求。
 
 后续验收：大仓库延迟与回退行为；IndexBackend 等其余 Search 架构仍属规划中。
 
+### Link candidate daemon staged (#65)
+
+状态：已完成实现，未生产切流（#65）。Rust `link::daemon` 组装仅 candidate/staged；生产 Link 继续走 Node。
+
 ## 规划中
 
 ### Search Execution Architecture
@@ -209,7 +229,7 @@ Evidence Store 未做，等真实恢复需求。
 
 ## AI Tool Runtime Optimization Architecture
 
-状态：Result Optimization first wave、Project Context Cache first slice、Streaming First first slice 已合入；下一片为更深 Streaming（同步路径）。更深 PCC 等待基准。
+状态：Result Optimization first wave、Project Context Cache first slice、Streaming First（#62+#66）已合入；下一片为生产装新 generation 验证 Streaming 字段。更深 PCC 等待基准。Batch B 仍等 Layer 3。
 
 参考 rtk-ai/rtk：核心不是改工具执行本身，而是在输出进入模型上下文前过滤、分组、截断、去重。Herdr 不复制 CLI proxy，在 Rust MCP runtime 内压缩展示，raw 事实仍可从同一次结果或后续 evidence 恢复。不改变 epoch 2 / 18 tools inputSchema。
 
@@ -218,7 +238,7 @@ Evidence Store 未做，等真实恢复需求。
 1. 工具执行速度（Batch A 已验收）
 2. 工具结果进入模型的效率（Result Optimization first wave 已合入）
 3. 多工具协同调度
-4. 长任务持续运行与反馈（Streaming First first slice 已合入；同步路径为下一片）
+4. 长任务持续运行与反馈（Streaming First #62+#66 已合入；同步工具仍无 mid-call stream）
 5. 资源生命周期管理
 
 ### Result Optimization Layer（P0）
@@ -246,15 +266,15 @@ Evidence Store 在有真实恢复需求后再做，不预留抽象接口。
 
 ### Tool Wave Scheduler（P0 设计 / skill 已有策略）
 
-`herdr_skill` 已要求独立 read 并行、mutation 有序。Runtime 级 dependency graph 调度等 Batch B 证明 round-trip 仍是瓶颈后再做；当前仍仅 skill 层，无 runtime scheduler。
+`herdr_skill` 已要求独立 read 并行、mutation 有序；#61 收紧 compact 结果与长 exec 的 skill 指引。Runtime 级 dependency graph 调度等 Batch B 证明 round-trip 仍是瓶颈后再做；当前仍仅 skill 层，无 runtime scheduler。
 
 ### Project Context Cache（P1；first slice 已合入）
 
 First slice（#58）：mutation 路径单次 `derive_routing` 复用。Batch A 已拆掉 routing 上的全仓库 status。更深 cache（跨请求/高频 read 侧）需基准证明后再加深；失效策略正确，不产生第二事实源。
 
-### Streaming First（P1；first slice 已合入）
+### Streaming First（P1；#62+#66 已合入）
 
-First slice（#62）：`herdr_exec_start` / `herdr_exec_read` 结果带 phase 与 progress。长 grep/exec/test/build 目标仍是先给 started/progress，再给完整 evidence；同步 `herdr_exec` / `herdr_fs_grep` 仍阻塞，为下一片。
+#62：`herdr_exec_start` / `herdr_exec_read` 结果带 phase 与 progress。#66：同步 `herdr_exec` / `herdr_fs_grep` 完成结果对齐 phase/progress。长 grep/exec/test/build 的 mid-call stream 仍未做；MCP sync 工具仍阻塞至完成。下一片是生产装新 generation 验证这些字段，不是再开 Evidence Store 或 Wave runtime。
 
 ## 不纳入当前路线
 
