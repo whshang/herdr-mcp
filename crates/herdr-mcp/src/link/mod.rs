@@ -16,6 +16,7 @@
 #![allow(dead_code)] // staged until the Rust link transport consumes it
 
 pub mod backoff;
+pub mod daemon;
 pub mod generation_fence;
 pub mod heartbeat;
 pub mod io_loop;
