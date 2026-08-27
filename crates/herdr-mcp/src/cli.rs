@@ -23,7 +23,7 @@ pub enum LinkCommand {
     Install,
     /// Remove only the Rust Link candidate LaunchAgent. Never touches live Node link/link-prod.
     Uninstall,
-    /// Production Link cutover planner. Default is dry-run; execute is a gated no-op stub.
+    /// Production Link cutover planner/executor. Default is dry-run; execute is env-gated.
     Cutover {
         mode: crate::link::CutoverMode,
     },
@@ -399,8 +399,10 @@ ownership/gates reporting. link run starts a foreground Rust Link candidate\n\
 (Keychain/plist credentials). link install/uninstall manage only the candidate\n\
 LaunchAgent dev.herdr-mcp.link-rust-candidate → runtime/current link run; they\n\
 never unload or replace live Node link/link-prod. link cutover defaults to\n\
-dry-run plan/validate only; --execute is a gated no-op stub and never cuts\n\
-production Link in this release. link migrate-runtime-control prepares a\n\
+dry-run plan/validate only; --execute requires HERDR_LINK_CUTOVER_I_UNDERSTAND=1\n\
+and runs a PREPARE/ACTIVATE/VERIFY transaction for link-prod only (with ROLLBACK),\n\
+never flips production_ready, and must be run from an independent Shell. link\n\
+migrate-runtime-control prepares a\n\
 Rust-compatible runtime-control-prod generation (default dry-run; --write-staging\n\
 writes a pending sibling; --apply rewrites the live control file only with\n\
 HERDR_LINK_MIGRATE_RUNTIME_CONTROL=1) and never mutates LaunchAgents.\n"

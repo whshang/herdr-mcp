@@ -17,6 +17,7 @@
 
 pub mod backoff;
 pub mod cutover;
+pub mod cutover_execute;
 pub mod daemon;
 pub mod generation_fence;
 pub mod heartbeat;

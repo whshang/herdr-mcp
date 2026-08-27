@@ -1,11 +1,17 @@
-//! Production Link cutover planner (dry-run / validate only).
+//! Production Link cutover planner and guarded execute transaction.
 //!
-//! `herdr-mcp link cutover` reads Node prod + Rust candidate LaunchAgents,
-//! validates AGENTS.md ownership rules for the *planned* ProgramArguments, and
-//! prints the exact cutover + rollback steps that WOULD run. It never mutates
-//! launchd, plists, `runtime/current`, or live Node `link` / `link-prod`.
+//! `herdr-mcp link cutover` (default `--dry-run`) reads Node prod + Rust
+//! candidate LaunchAgents, validates AGENTS.md ownership rules for the
+//! *planned* ProgramArguments, and prints the exact cutover + rollback steps.
+//! Dry-run never mutates launchd, plists, `runtime/current`, or live Node
+//! `link` / `link-prod`.
 //!
-//! `--execute` is intentionally a gated no-op stub in this G5 slice.
+//! `--execute` requires `HERDR_LINK_CUTOVER_I_UNDERSTAND=1` and runs a
+//! PREPARE/ACTIVATE/VERIFY transaction that rewrites **only**
+//! `dev.herdr-mcp.link-prod` to `runtime/current/herdr-mcp link run`, with
+//! automatic ROLLBACK to the Node plist backup on failure. It never flips
+//! `production_ready`, never touches `link` / `link-rust-candidate`, and never
+//! uses `launchctl submit`.
 
 use serde_json::{Value, json};
 use std::env;
@@ -65,11 +71,11 @@ pub fn run(mode: CutoverMode) -> Result<ExitCode, String> {
                 Ok(ExitCode::from(2))
             }
         }
-        CutoverMode::Execute => run_execute_stub(&home, &config_dir),
+        CutoverMode::Execute => run_execute(&home, &config_dir),
     }
 }
 
-fn run_execute_stub(home: &Path, config_dir: &Path) -> Result<ExitCode, String> {
+fn run_execute(home: &Path, config_dir: &Path) -> Result<ExitCode, String> {
     let understood = env::var_os(CUTOVER_EXECUTE_ENV)
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
     if !understood {
@@ -77,13 +83,15 @@ fn run_execute_stub(home: &Path, config_dir: &Path) -> Result<ExitCode, String> 
             "ok": false,
             "mode": "execute",
             "cutover_performed": false,
+            "execute_implemented": true,
             "error": format!(
-                "link cutover --execute is refused without {CUTOVER_EXECUTE_ENV}=1 (and execute is not implemented in this release)"
+                "link cutover --execute is refused without {CUTOVER_EXECUTE_ENV}=1"
             ),
             "protected_labels_untouched": protected_live_link_labels(),
             "notes": [
                 "No launchd/plist mutation occurred.",
                 "Use: herdr-mcp link cutover --dry-run",
+                "Then, from an independent Shell only: HERDR_LINK_CUTOVER_I_UNDERSTAND=1 herdr-mcp link cutover --execute",
             ],
         });
         println!(
@@ -93,26 +101,64 @@ fn run_execute_stub(home: &Path, config_dir: &Path) -> Result<ExitCode, String> 
         return Ok(ExitCode::from(3));
     }
 
-    // Even with the scary env set, this slice never mutates production Link.
     let dry = plan_dry_run(home, config_dir);
-    let report = json!({
-        "ok": false,
-        "mode": "execute",
-        "cutover_performed": false,
-        "execute_implemented": false,
-        "error": "link cutover --execute is not implemented; dry-run / plan / validate only in this G5 slice",
-        "dry_run": dry,
-        "protected_labels_untouched": protected_live_link_labels(),
-        "notes": [
-            "Env guard accepted, but execute still no-ops.",
-            "Live Node link/link-prod were not unloaded, replaced, or cut.",
-        ],
-    });
+    let preconditions = dry
+        .get("preconditions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let technical: Vec<Precondition> = preconditions
+        .iter()
+        .filter_map(|item| {
+            Some(Precondition {
+                id: item.get("id")?.as_str()?.to_owned(),
+                ok: item.get("ok")?.as_bool()?,
+                detail: item
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            })
+        })
+        .collect();
+    if !super::cutover_execute::technical_preconditions_ready(&technical) {
+        let report = json!({
+            "ok": false,
+            "mode": "execute",
+            "cutover_performed": false,
+            "execute_implemented": true,
+            "error": "technical cutover preconditions are not satisfied",
+            "dry_run": dry,
+            "protected_labels_untouched": protected_live_link_labels(),
+            "notes": [
+                "Env guard accepted, but execute refused before any launchd mutation.",
+                "Fix technical preconditions from dry-run, then retry from an independent Shell.",
+                "dual_verification_uat_recorded is a seal gate and does not block execute.",
+            ],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+        );
+        return Ok(ExitCode::from(2));
+    }
+
+    let prod_loaded = launchd_label_loaded(LINK_PROD_LABEL);
+    let prod = assess_agent(home, LINK_PROD_LABEL, prod_loaded);
+    let report = super::cutover_execute::execute_transaction(
+        home,
+        &prod,
+        &super::cutover_execute::RealLaunchd,
+    )?;
     println!(
         "{}",
         serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
     );
-    Ok(ExitCode::from(4))
+    if report.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(4))
+    }
 }
 
 /// Build the dry-run plan + precondition report (no mutations).
@@ -150,23 +196,35 @@ pub fn plan_dry_run_with_agents(
         planned_program_error.as_deref(),
         &ownership,
     );
-    let ready = preconditions.iter().all(|item| item.ok);
+    let ready = super::cutover_execute::technical_preconditions_ready(&preconditions);
     let gates = evaluate_production_ready_gates(home, config_dir, &prod, &link, LINK_RUN_WIRED);
 
     let planned_steps = build_planned_cutover_steps(home, &prod, planned_program.as_deref());
     let rollback_steps = build_planned_rollback_steps(home, &prod);
+    let seal_blockers = preconditions
+        .iter()
+        .filter(|item| item.id == "dual_verification_uat_recorded" && !item.ok)
+        .map(|item| {
+            json!({
+                "id": item.id,
+                "ok": item.ok,
+                "detail": item.detail,
+            })
+        })
+        .collect::<Vec<_>>();
 
     json!({
         "ok": true,
         "mode": "dry-run",
         "cutover_performed": false,
         "ready_for_execute": ready,
-        "execute_implemented": false,
+        "execute_implemented": true,
         "preconditions": preconditions.iter().map(|item| json!({
             "id": item.id,
             "ok": item.ok,
             "detail": item.detail,
         })).collect::<Vec<_>>(),
+        "seal_blockers": seal_blockers,
         "ownership_validation": ownership,
         "planned_program_arguments": planned_program,
         "planned_program_error": planned_program_error,
@@ -189,10 +247,10 @@ pub fn plan_dry_run_with_agents(
         "protected_labels_never_mutated_by_dry_run": protected_live_link_labels(),
         "notes": [
             "Dry-run only. No launchd bootout/bootstrap and no plist writes occurred.",
-            "Execute is not implemented; even with HERDR_LINK_CUTOVER_I_UNDERSTAND=1 it no-ops.",
+            "ready_for_execute ignores dual_verification_uat_recorded (seal gate); execute still requires HERDR_LINK_CUTOVER_I_UNDERSTAND=1.",
             "Do not confuse candidate soak (dev.herdr-mcp.link-rust-candidate) with production cutover.",
-            "Independent Shell dual verification remains mandatory before any live cut; see docs/_wip/g5-link-production-cutover.md",
-            "Dry-run helper landed does not equal G5 cutover or production_ready=true.",
+            "Independent Shell dual verification remains mandatory before production_ready seal; see docs/_wip/g5-link-production-cutover.md",
+            "Dry-run helper landed does not equal G5 cutover complete or production_ready=true.",
         ],
     })
 }
@@ -361,12 +419,12 @@ fn evaluate_cutover_preconditions(
         ),
     });
 
-    // Post-cutover / seal gates stay informational; dry-run must not claim they
-    // are execute preconditions, but incomplete dual UAT still blocks ready.
+    // Post-cutover / seal gates stay informational for ready_for_execute.
+    // Dual UAT is required before production_ready seal, not before LaunchAgent cut.
     out.push(Precondition {
         id: "dual_verification_uat_recorded".to_owned(),
         ok: false,
-        detail: "dual verification UAT is never auto-flipped; operator must record after a future execute slice"
+        detail: "dual verification UAT is never auto-flipped; operator must record after execute (seal gate, not execute blocker)"
             .to_owned(),
     });
 
@@ -441,7 +499,7 @@ fn build_planned_rollback_steps(home: &Path, prod: &LinkAgentView) -> Vec<String
     ]
 }
 
-fn prod_plist_backup_path(home: &Path) -> PathBuf {
+pub fn prod_plist_backup_path(home: &Path) -> PathBuf {
     home.join(".config")
         .join("herdr-mcp")
         .join("backups")
@@ -636,7 +694,7 @@ mod tests {
         assert_eq!(report["mode"], "dry-run");
         assert_eq!(report["cutover_performed"], false);
         assert_eq!(report["ready_for_execute"], false);
-        assert_eq!(report["execute_implemented"], false);
+        assert_eq!(report["execute_implemented"], true);
         let steps = report["planned_cutover_steps"].as_array().unwrap();
         assert!(steps.len() >= 5);
         assert!(
@@ -739,9 +797,10 @@ mod tests {
             true
         );
         assert_eq!(by_id("candidate_healthy")["ok"], true);
-        // Dual UAT always blocks ready_for_execute in this slice.
+        // Dual UAT remains a seal blocker but no longer blocks ready_for_execute.
         assert_eq!(by_id("dual_verification_uat_recorded")["ok"], false);
-        assert_eq!(report["ready_for_execute"], false);
+        assert_eq!(report["ready_for_execute"], true);
+        assert_eq!(report["execute_implemented"], true);
 
         let unloaded = assess_agent(&home, LINK_RUST_CANDIDATE_LABEL, false);
         let report_unloaded = plan_dry_run_with_agents(
@@ -762,28 +821,20 @@ mod tests {
     }
 
     #[test]
-    fn execute_stub_requires_env_and_never_cuts() {
+    fn execute_requires_env_guard_and_dry_run_stays_non_mutating() {
         let home = test_home();
         setup_managed_runtime(&home);
         let config_dir = home.join(".config/herdr-mcp");
         fs::create_dir_all(&config_dir).unwrap();
 
-        // SAFETY: test process isolates env for this stub check.
+        // SAFETY: test process isolates env for this guard check.
         let previous = env::var_os(CUTOVER_EXECUTE_ENV);
         unsafe {
             env::remove_var(CUTOVER_EXECUTE_ENV);
         }
-        let report = {
-            // Replicate stub branch without printing.
-            let understood = env::var_os(CUTOVER_EXECUTE_ENV)
-                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-            assert!(!understood);
-            json!({
-                "cutover_performed": false,
-                "execute_implemented": false,
-            })
-        };
-        assert_eq!(report["cutover_performed"], false);
+        let understood = env::var_os(CUTOVER_EXECUTE_ENV)
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        assert!(!understood);
 
         unsafe {
             env::set_var(CUTOVER_EXECUTE_ENV, "1");
@@ -791,6 +842,7 @@ mod tests {
         let dry = plan_dry_run(&home, &config_dir);
         assert_eq!(dry["cutover_performed"], false);
         assert_eq!(dry["mode"], "dry-run");
+        assert_eq!(dry["execute_implemented"], true);
 
         match previous {
             Some(value) => unsafe { env::set_var(CUTOVER_EXECUTE_ENV, value) },
