@@ -1,4 +1,4 @@
-use crate::projects;
+use crate::projects::{self, ProjectTopology};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -10,11 +10,19 @@ pub struct ManagedPath {
 }
 
 pub fn managed_roots(snapshot: &Value) -> Vec<PathBuf> {
-    let mut roots = projects::derive_routing(snapshot)
+    managed_roots_from(&projects::derive_routing(snapshot))
+}
+
+/// Extract managed Git roots from an already-derived routing topology.
+///
+/// Prefer this when the same request also needs busy-agent checks so the
+/// cwd→git-root identity is resolved once for the snapshot.
+pub fn managed_roots_from(topology: &ProjectTopology) -> Vec<PathBuf> {
+    let mut roots = topology
         .projects
-        .into_values()
+        .values()
         .filter(|project| project.managed && project.vcs == Some("git"))
-        .map(|project| project.root)
+        .map(|project| project.root.clone())
         .collect::<Vec<_>>();
     roots.sort_by(|left, right| {
         right
@@ -30,6 +38,15 @@ pub fn managed_roots(snapshot: &Value) -> Vec<PathBuf> {
 pub fn validate_existing(snapshot: &Value, input: &str) -> Result<ManagedPath, Value> {
     let roots = managed_roots(snapshot);
     validate_existing_with_roots(&roots, input)
+}
+
+/// Validate an existing path using a routing topology already derived for
+/// this request.
+pub fn validate_existing_with_topology(
+    topology: &ProjectTopology,
+    input: &str,
+) -> Result<ManagedPath, Value> {
+    validate_existing_with_roots(&managed_roots_from(topology), input)
 }
 
 /// Validate an existing path against one project root that was already
@@ -88,9 +105,13 @@ fn validate_existing_with_roots(roots: &[PathBuf], input: &str) -> Result<Manage
     })
 }
 
-pub fn validate_target(snapshot: &Value, input: &str) -> Result<ManagedPath, Value> {
-    let roots = managed_roots(snapshot);
-    validate_target_with_roots(&roots, input)
+/// Validate a writable target using a routing topology already derived for
+/// this request.
+pub fn validate_target_with_topology(
+    topology: &ProjectTopology,
+    input: &str,
+) -> Result<ManagedPath, Value> {
+    validate_target_with_roots(&managed_roots_from(topology), input)
 }
 
 /// Validate a writable target against one project root that was already
@@ -293,6 +314,22 @@ mod tests {
     }
 
     #[test]
+    fn managed_roots_from_matches_snapshot_derive() {
+        let root = repo();
+        let snap = snapshot(&root);
+        let topology = projects::derive_routing(&snap);
+        assert_eq!(managed_roots(&snap), managed_roots_from(&topology));
+        let file = root.join("src.txt");
+        fs::write(&file, "hello").unwrap();
+        let via_topology =
+            validate_existing_with_topology(&topology, file.to_str().unwrap()).unwrap();
+        let via_snapshot = validate_existing(&snap, file.to_str().unwrap()).unwrap();
+        assert_eq!(via_topology.root, via_snapshot.root);
+        assert_eq!(via_topology.real, via_snapshot.real);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn accepts_existing_file_inside_managed_git_root() {
         let root = repo();
         let file = root.join("src.txt");
@@ -309,7 +346,8 @@ mod tests {
         let src = root.join("src");
         fs::create_dir_all(&src).unwrap();
         let target = src.join("new.rs");
-        let validated = validate_target(&snapshot(&root), target.to_str().unwrap()).unwrap();
+        let topology = projects::derive_routing(&snapshot(&root));
+        let validated = validate_target_with_topology(&topology, target.to_str().unwrap()).unwrap();
         assert_eq!(validated.root, root);
         assert_eq!(
             validated.real,
@@ -318,7 +356,7 @@ mod tests {
 
         let missing_parent = root.join("missing/new.rs");
         let error =
-            validate_target(&snapshot(&root), missing_parent.to_str().unwrap()).unwrap_err();
+            validate_target_with_topology(&topology, missing_parent.to_str().unwrap()).unwrap_err();
         assert_eq!(error["reason"], "parent_not_found");
         fs::remove_dir_all(validated.root).unwrap();
     }

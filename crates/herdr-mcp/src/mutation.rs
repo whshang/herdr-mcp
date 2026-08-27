@@ -1,5 +1,5 @@
 use crate::fs_security;
-use crate::projects;
+use crate::projects::ProjectTopology;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::env;
@@ -41,8 +41,21 @@ impl MutationPolicy {
     }
 }
 
-pub fn check(snapshot: &Value, root: &Path, confirm_busy: bool) -> Result<Vec<Value>, Value> {
-    check_with_policy(snapshot, root, confirm_busy, &MutationPolicy::from_env())
+/// Busy-agent gate that reuses a routing topology already derived for this
+/// request (same snapshot identity as managed-root validation).
+pub fn check_with_topology(
+    snapshot: &Value,
+    topology: &ProjectTopology,
+    root: &Path,
+    confirm_busy: bool,
+) -> Result<Vec<Value>, Value> {
+    check_with_policy_and_topology(
+        snapshot,
+        topology,
+        root,
+        confirm_busy,
+        &MutationPolicy::from_env(),
+    )
 }
 
 pub fn check_global(action: &str) -> Result<(), Value> {
@@ -61,8 +74,12 @@ fn check_global_with_policy(action: &str, policy: &MutationPolicy) -> Result<(),
     Ok(())
 }
 
-pub fn working_agents(snapshot: &Value, root: &Path) -> Vec<Value> {
-    let topology = projects::derive_routing(snapshot);
+/// Resolve working agents for a project root from an already-derived topology.
+pub fn working_agents_from(
+    topology: &ProjectTopology,
+    snapshot: &Value,
+    root: &Path,
+) -> Vec<Value> {
     let pane_ids = topology
         .projects
         .get(root)
@@ -99,8 +116,9 @@ pub fn working_agents(snapshot: &Value, root: &Path) -> Vec<Value> {
     working
 }
 
-fn check_with_policy(
+fn check_with_policy_and_topology(
     snapshot: &Value,
+    topology: &ProjectTopology,
     root: &Path,
     confirm_busy: bool,
     policy: &MutationPolicy,
@@ -130,7 +148,7 @@ fn check_with_policy(
         }
     }
 
-    let working = working_agents(snapshot, root);
+    let working = working_agents_from(topology, snapshot, root);
 
     if !working.is_empty() && !confirm_busy {
         return Err(json!({
@@ -142,6 +160,17 @@ fn check_with_policy(
         }));
     }
     Ok(working)
+}
+
+#[cfg(test)]
+fn check_with_policy(
+    snapshot: &Value,
+    root: &Path,
+    confirm_busy: bool,
+    policy: &MutationPolicy,
+) -> Result<Vec<Value>, Value> {
+    let topology = crate::projects::derive_routing(snapshot);
+    check_with_policy_and_topology(snapshot, &topology, root, confirm_busy, policy)
 }
 
 #[derive(Debug, Clone)]
@@ -419,6 +448,39 @@ mod tests {
         assert_eq!(forced.len(), 1);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn mutation_gate_reuses_one_routing_derive_for_validate_and_busy_check() {
+        let root = repo();
+        let file = root.join("src.txt");
+        fs::write(&file, "hello").unwrap();
+        let snap = snapshot(&root, false);
+        let policy = MutationPolicy::new(false, vec![]);
+
+        crate::projects::reset_derive_routing_call_count();
+        let _ = fs_security::validate_existing(&snap, file.to_str().unwrap()).unwrap();
+        let _ = check_with_policy(&snap, &root, false, &policy).unwrap();
+        assert_eq!(
+            crate::projects::derive_routing_call_count(),
+            2,
+            "separate validate+check still derives twice"
+        );
+
+        crate::projects::reset_derive_routing_call_count();
+        let topology = crate::projects::derive_routing(&snap);
+        let validated =
+            fs_security::validate_existing_with_topology(&topology, file.to_str().unwrap())
+                .unwrap();
+        let working = check_with_topology(&snap, &topology, &validated.root, false).unwrap();
+        assert!(working.is_empty());
+        assert_eq!(
+            crate::projects::derive_routing_call_count(),
+            1,
+            "shared topology must resolve managed root identity once per request"
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

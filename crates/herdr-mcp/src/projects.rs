@@ -10,6 +10,11 @@ const GIT_TOPLEVEL_TIMEOUT: Duration = Duration::from_secs(1);
 const GIT_STATUS_TIMEOUT: Duration = Duration::from_millis(750);
 const GIT_OUTPUT_LIMIT: usize = 1024 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    static DERIVE_ROUTING_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ProjectInfo {
     pub root: PathBuf,
@@ -36,8 +41,25 @@ pub fn derive(snapshot: &Value) -> ProjectTopology {
 /// Security gates and busy-agent routing only need the managed Git root and
 /// pane/workspace ownership. Keeping that path separate avoids paying for a
 /// full repository status scan on every file read, write, grep, or exec gate.
+///
+/// Callers that need both managed-root validation and busy-agent checks in
+/// the same request should derive once and pass the topology through
+/// `fs_security` / `mutation` helpers so the same snapshot identity is not
+/// recomputed.
 pub fn derive_routing(snapshot: &Value) -> ProjectTopology {
+    #[cfg(test)]
+    DERIVE_ROUTING_CALLS.with(|count| count.set(count.get() + 1));
     derive_inner(snapshot, false)
+}
+
+#[cfg(test)]
+pub(crate) fn derive_routing_call_count() -> usize {
+    DERIVE_ROUTING_CALLS.with(|count| count.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_derive_routing_call_count() {
+    DERIVE_ROUTING_CALLS.with(|count| count.set(0));
 }
 
 fn derive_inner(snapshot: &Value, include_git_status: bool) -> ProjectTopology {

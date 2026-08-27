@@ -2,6 +2,7 @@ use crate::fs_security;
 use crate::git_tools;
 use crate::mutation::{self, AtomicStage};
 use crate::patch::{self, PatchOp};
+use crate::projects;
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use std::fs;
@@ -37,7 +38,8 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
         Err(error) => return error,
     };
 
-    let root_path = match fs_security::validate_existing(snapshot, root_input) {
+    let topology = projects::derive_routing(snapshot);
+    let root_path = match fs_security::validate_existing_with_topology(&topology, root_input) {
         Ok(value) => value,
         Err(error) => return error,
     };
@@ -67,10 +69,14 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
         Err(error) => return error.to_value(),
     };
 
-    let working = mutation::working_agents(snapshot, &root_path.root);
-    if !dry_run && let Err(error) = mutation::check(snapshot, &root_path.root, confirm_busy) {
-        return error;
-    }
+    let working = if dry_run {
+        mutation::working_agents_from(&topology, snapshot, &root_path.root)
+    } else {
+        match mutation::check_with_topology(snapshot, &topology, &root_path.root, confirm_busy) {
+            Ok(value) => value,
+            Err(error) => return error,
+        }
+    };
 
     let mut staged = Vec::<Staged>::new();
     let mut summaries = Vec::<String>::new();
