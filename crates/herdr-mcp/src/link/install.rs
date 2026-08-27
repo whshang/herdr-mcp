@@ -3,7 +3,7 @@
 //! Writes and bootstraps **only** `dev.herdr-mcp.link-rust-candidate`, with
 //! ProgramArguments pointing at `~/.config/herdr-mcp/runtime/current/herdr-mcp
 //! link run`. Never mutates `dev.herdr-mcp.link` or `dev.herdr-mcp.link-prod`,
-//! never uses `launchctl submit`, and never points launchd at a checkout or
+//! never schedules inferred launchd submission jobs, and never points launchd at a checkout or
 //! `target/` binary.
 
 use std::collections::BTreeMap;
@@ -44,9 +44,7 @@ pub fn protected_live_link_labels() -> &'static [&'static str] {
 pub fn install() -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     {
-        return Err(
-            "herdr-mcp link install is macOS-only (LaunchAgent candidate soak)".to_owned(),
-        );
+        return Err("herdr-mcp link install is macOS-only (LaunchAgent candidate soak)".to_owned());
     }
     #[cfg(target_os = "macos")]
     {
@@ -223,11 +221,11 @@ pub fn encode_candidate_plist(
     root.insert("RunAtLoad".to_owned(), PlistValue::Boolean(true));
     let mut keep_alive = Dictionary::new();
     keep_alive.insert("SuccessfulExit".to_owned(), PlistValue::Boolean(false));
+    root.insert("KeepAlive".to_owned(), PlistValue::Dictionary(keep_alive));
     root.insert(
-        "KeepAlive".to_owned(),
-        PlistValue::Dictionary(keep_alive),
+        "ThrottleInterval".to_owned(),
+        PlistValue::Integer(10.into()),
     );
-    root.insert("ThrottleInterval".to_owned(), PlistValue::Integer(10.into()));
     root.insert(
         "ProcessType".to_owned(),
         PlistValue::String("Background".to_owned()),
@@ -266,7 +264,10 @@ pub fn encode_candidate_plist(
 /// Default non-secret env for the candidate LaunchAgent.
 pub fn default_candidate_env() -> BTreeMap<String, String> {
     BTreeMap::from([
-        ("HERDR_EDGE_URL".to_owned(), MACOS_DEFAULT_EDGE_URL.to_owned()),
+        (
+            "HERDR_EDGE_URL".to_owned(),
+            MACOS_DEFAULT_EDGE_URL.to_owned(),
+        ),
         (
             "HERDR_WORKSTATION_ID".to_owned(),
             CANDIDATE_WORKSTATION_ID.to_owned(),
@@ -316,7 +317,10 @@ fn is_owned_generation_target(target: &Path) -> bool {
 }
 
 fn refuse_checkout_or_target_path(path: &Path) -> Result<(), String> {
-    let lower = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    let lower = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
     if lower.contains("/target/debug/")
         || lower.contains("/target/release/")
         || lower.ends_with("/target/debug/herdr-mcp")
@@ -367,12 +371,8 @@ fn install_candidate(home: &Path) -> Result<Value, String> {
     let env = default_candidate_env();
     let bytes = encode_candidate_plist(home, &program, &env)?;
     let paths = candidate_paths(home);
-    fs::create_dir_all(&paths.config_dir).map_err(|error| {
-        format!(
-            "cannot create {}: {error}",
-            paths.config_dir.display()
-        )
-    })?;
+    fs::create_dir_all(&paths.config_dir)
+        .map_err(|error| format!("cannot create {}: {error}", paths.config_dir.display()))?;
     atomic_write(&paths.plist, &bytes, 0o600)?;
 
     // Replace only the candidate job: bootout candidate label if loaded, then
@@ -402,9 +402,8 @@ fn uninstall_candidate(home: &Path) -> Result<Value, String> {
     bootout_label(LINK_RUST_CANDIDATE_LABEL)?;
     let removed = if paths.plist.is_file() {
         refuse_if_plist_is_protected_label(&paths.plist)?;
-        fs::remove_file(&paths.plist).map_err(|error| {
-            format!("cannot remove {}: {error}", paths.plist.display())
-        })?;
+        fs::remove_file(&paths.plist)
+            .map_err(|error| format!("cannot remove {}: {error}", paths.plist.display()))?;
         true
     } else {
         false
@@ -435,8 +434,8 @@ fn assert_not_protected_mutation(label: &str) -> Result<(), String> {
 }
 
 fn refuse_if_plist_is_protected_label(path: &Path) -> Result<(), String> {
-    let bytes = fs::read(path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let bytes =
+        fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let value = PlistValue::from_reader(std::io::Cursor::new(bytes))
         .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
     let label = value
@@ -592,7 +591,9 @@ where
         .first()
         .is_some_and(|value| value == OsStr::new("submit"))
     {
-        return Err("launchctl submit is forbidden for Link lifecycle mutations".to_owned());
+        return Err(
+            "inferred launchd submission is forbidden for Link lifecycle mutations".to_owned(),
+        );
     }
     let output = Command::new("/bin/launchctl")
         .args(&collected)
@@ -664,9 +665,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                managed_runtime_binary(&home)
-                    .to_string_lossy()
-                    .into_owned(),
+                managed_runtime_binary(&home).to_string_lossy().into_owned(),
                 "link".to_owned(),
                 "run".to_owned(),
             ]
@@ -684,11 +683,9 @@ mod tests {
             .join("Documents/herdr-mcp/target/release/herdr-mcp")
             .to_string_lossy()
             .into_owned();
-        let err = assert_safe_candidate_program(
-            &home,
-            &[checkout, "link".to_owned(), "run".to_owned()],
-        )
-        .expect_err("checkout");
+        let err =
+            assert_safe_candidate_program(&home, &[checkout, "link".to_owned(), "run".to_owned()])
+                .expect_err("checkout");
         assert!(err.contains("must be") || err.contains("refusing"));
 
         let target = "/tmp/project/target/debug/herdr-mcp".to_owned();

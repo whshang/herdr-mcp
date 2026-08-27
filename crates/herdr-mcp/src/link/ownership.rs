@@ -449,7 +449,11 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
     let candidate_loaded = launchd_label_loaded(crate::link::LINK_RUST_CANDIDATE_LABEL);
     let prod = assess_agent(home, LINK_PROD_LABEL, prod_loaded);
     let link = assess_agent(home, LINK_LABEL, link_loaded);
-    let candidate = assess_agent(home, crate::link::LINK_RUST_CANDIDATE_LABEL, candidate_loaded);
+    let candidate = assess_agent(
+        home,
+        crate::link::LINK_RUST_CANDIDATE_LABEL,
+        candidate_loaded,
+    );
     // Foreground `link run` is wired. Candidate LaunchAgent install is separate
     // from production cutover; production_ready stays false until all gates pass.
     let rust_cli_has_link_run = crate::link::LINK_RUN_WIRED;
