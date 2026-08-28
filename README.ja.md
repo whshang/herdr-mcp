@@ -171,14 +171,16 @@ workstation → Web conversation
 - long-conversation handoff
 - native custom MCP Connector を持たない z.ai / DeepSeek 向けの bounded JSON→MCP bridge
 
-Native Messaging host をインストールします。
+ブラウザ拡張を使う場合は、GitHub Release の versioned extension asset（`v0.4.0` では `herdr-mcp-extension-0.1.68.zip`）を安定したディレクトリへ展開し、インストール済み runtime から Native Messaging host を登録します。Extension version は runtime version と独立しています。
 
 ```bash
-bin/herdr-extension-host install
-bin/herdr-extension-host status
+mkdir -p ~/.config/herdr-mcp/extension
+# Release の zip をこのディレクトリへ展開し、manifest.json が直下にあることを確認
+herdr-mcp native-host install
+herdr-mcp native-host status
 ```
 
-その後 `extension/` を Chrome/Chromium の unpacked extension として読み込みます。
+その後 `~/.config/herdr-mcp/extension` を Chrome/Chromium の unpacked extension として読み込みます。通常ユーザー向け経路では git checkout の `extension/` や `bin/herdr-extension-host` を使いません。
 
 詳細：[Browser continuity](docs/i18n/en/browser-continuity.md) · [Browser extension](docs/i18n/en/extension.md)
 
