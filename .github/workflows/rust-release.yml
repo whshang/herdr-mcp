@@ -173,19 +173,50 @@ jobs:
         with:
           name: rust-release-bundle
           path: release-assets
-      - name: Publish GitHub Release assets
+      - name: Verify immutable release identity
+        id: bundle
         env:
-          GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
+          manifest="release-assets/release-manifest.json"
+          tag="$(jq -r '.tag' "$manifest")"
+          source_commit="$(jq -r '.release_identity.source_commit' "$manifest")"
+          source_ref="$(jq -r '.release_identity.source_ref' "$manifest")"
+          [[ "$tag" == "$GITHUB_REF_NAME" ]] || { echo "manifest tag does not match pushed ref" >&2; exit 1; }
+          [[ "$source_commit" == "$GITHUB_SHA" ]] || { echo "manifest source_commit does not match tag commit" >&2; exit 1; }
+          [[ "$source_ref" == "refs/tags/$GITHUB_REF_NAME" ]] || { echo "manifest source_ref does not match pushed tag" >&2; exit 1; }
+          expected_assets="$(jq -c '[.assets[].name] | sort' "$manifest")"
+          actual_assets="$(printf '%s\n' release-assets/herdr-mcp-* | sed 's#.*/##' | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+          [[ "$actual_assets" == "$expected_assets" ]] || { echo "release bundle binaries do not match manifest assets" >&2; exit 1; }
+          release_asset_count="$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          echo "release_identity_ok tag=$tag commit=$source_commit assets=$(jq '.assets | length' "$manifest") bundle_files=$release_asset_count"
+          echo "release_asset_count=$release_asset_count" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_RELEASE_ASSET_COUNT: ${{ steps.bundle.outputs.release_asset_count }}
+        shell: bash
+        run: |
+          set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
-          else
-            release_flags=(--verify-tag --generate-notes)
-            if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-              release_flags+=(--prerelease)
-            fi
-            gh release create "$GITHUB_REF_NAME" release-assets/* "${release_flags[@]}"
+            echo "GitHub Release $GITHUB_REF_NAME already exists; refusing publish overwrite" >&2
+            exit 1
           fi
+          release_flags=(--verify-tag --generate-notes)
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" release-assets/* "${release_flags[@]}"
+
+          release_json="$(gh release view "$GITHUB_REF_NAME" --json tagName,isDraft,isPrerelease,assets,url)"
+          [[ "$(jq -r '.tagName' <<<"$release_json")" == "$GITHUB_REF_NAME" ]]
+          [[ "$(jq -r '.isDraft' <<<"$release_json")" == "false" ]]
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            [[ "$(jq -r '.isPrerelease' <<<"$release_json")" == "true" ]]
+          fi
+          [[ "$(jq '.assets | length' <<<"$release_json")" == "$EXPECTED_RELEASE_ASSET_COUNT" ]]
+          echo "$release_json" | jq -c '{tagName,isDraft,isPrerelease,url,assets:[.assets[].name]}'

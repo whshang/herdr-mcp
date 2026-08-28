@@ -129,6 +129,10 @@ test("Rust GitHub Release provenance is tag-only and fail-closed before publish"
   assert.match(release, /--workflow-name \"\$GITHUB_WORKFLOW\"/);
   assert.match(publish, /needs: attest/, "GitHub Release publishing must fail closed when attestation fails");
   assert.match(publish, /if: startsWith\(github\.ref, 'refs\/tags\/v'\)/);
+  assert.match(publish, /Verify immutable release identity/);
+  assert.match(publish, /manifest source_commit does not match tag commit/);
+  assert.match(publish, /refusing publish overwrite/);
+  assert.doesNotMatch(publish, /--clobber/);
   assert.match(
     publish,
     /GH_REPO: \$\{\{ github\.repository \}\}/,
