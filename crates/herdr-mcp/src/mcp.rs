@@ -14,6 +14,9 @@ use crate::utility_exec;
 use serde_json::{Value, json};
 
 pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
+/// ChatGPT/OpenAI connector probe version; advertised on discover and negotiated
+/// down to [`SDK_WIRE_PROTOCOL`] for the actual wire session.
+pub const OPENAI_PROBE_PROTOCOL: &str = "2026-07-28";
 pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. Session start: herdr_inspect then herdr_skill once. Prefer deterministic herdr_fs_*/herdr_git/herdr_exec work before agent reasoning. Before unknown native API calls use herdr_methods, then herdr_call. Use explicit workspace/pane IDs and never blind-retry uncertain mutations.";
 
 const SUPPORTED_VERSIONS: [&str; 5] = [
@@ -71,16 +74,23 @@ pub fn handle(request: &Value, context: &RuntimeContext<'_>) -> Option<Value> {
     })
 }
 
+pub fn negotiate_protocol_version(requested: &str) -> &'static str {
+    match requested {
+        "2025-11-25" => "2025-11-25",
+        "2025-06-18" => "2025-06-18",
+        "2025-03-26" => "2025-03-26",
+        "2024-11-05" => "2024-11-05",
+        "2024-10-07" => "2024-10-07",
+        _ => SDK_WIRE_PROTOCOL,
+    }
+}
+
 fn initialize_result(request: &Value) -> Value {
     let requested = request
         .pointer("/params/protocolVersion")
         .and_then(Value::as_str)
         .unwrap_or(SDK_WIRE_PROTOCOL);
-    let protocol = if SUPPORTED_VERSIONS.contains(&requested) {
-        requested
-    } else {
-        SDK_WIRE_PROTOCOL
-    };
+    let protocol = negotiate_protocol_version(requested);
     let identity = contract::identity().ok();
     json!({
         "protocolVersion": protocol,
@@ -273,9 +283,21 @@ mod tests {
     #[test]
     fn unsupported_protocol_negotiates_to_sdk_wire() {
         let result = initialize_result(&json!({
-            "params": {"protocolVersion": "2026-07-28"}
+            "params": {"protocolVersion": OPENAI_PROBE_PROTOCOL}
         }));
         assert_eq!(result["protocolVersion"], SDK_WIRE_PROTOCOL);
+    }
+
+    #[test]
+    fn negotiate_protocol_version_matches_runtime_parity_probe() {
+        let parity: Value =
+            serde_json::from_str(include_str!("../../../contracts/runtime-parity.json")).unwrap();
+        let probe = parity["openai_discover_extra_versions"][0]
+            .as_str()
+            .unwrap();
+        assert_eq!(probe, OPENAI_PROBE_PROTOCOL);
+        assert_eq!(negotiate_protocol_version(probe), SDK_WIRE_PROTOCOL);
+        assert_eq!(negotiate_protocol_version("2025-06-18"), "2025-06-18");
     }
 
     #[test]

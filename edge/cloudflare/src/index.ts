@@ -194,6 +194,10 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
     const workstationId = resolveWorkstation(request, env);
     const dev = await handleMcp(parsed.value, workstationId, {
       limits,
+      client: {
+        userAgent: request.headers.get("user-agent"),
+        oauthClientId: devAuth.clientId ?? null,
+      },
       forward: async (stub: unknown, body: string) => {
         const internal = new Request("https://do.internal/internal/forward", {
           method: "POST",

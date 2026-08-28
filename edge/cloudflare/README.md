@@ -77,6 +77,11 @@ edge/cloudflare/
   through the DO to the link socket; deadlines are enforced by both an
   in-session timeout and a Durable Object alarm (timers may not fire while hibernated).
   Link error codes are mapped to the edge taxonomy (`mapLinkErrorCode`).
+- **MCP HTTP protocol negotiation** — `server/discover` advertises SDK wire
+  `2025-11-25` first, with legacy `2025-06-18` through `2024-10-07`. ChatGPT /
+  `openai-mcp` clients also see probe version `2026-07-28`; initialize negotiates
+  unknown future versions down to `2025-11-25` (wire-compatible with the frozen
+  epoch-2 contract).
 - **offline / reconnecting semantics** — `workstation_offline` (no link),
   `workstation_reconnecting` (queued/undelivered), `delivery_uncertain`
   (sent but dropped; reads retryable, mutating NOT — never blind replay).
