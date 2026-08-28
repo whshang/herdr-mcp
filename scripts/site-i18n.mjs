@@ -22,6 +22,7 @@ export const DOC_ORDER = [
   "quick-start",
   "install",
   "clean-machine-uat",
+  "second-mac-agent-prompt",
   "chatgpt-connector",
   "browser-continuity",
   "extension",
@@ -44,7 +45,7 @@ export const DOC_ORDER = [
 
 // Group membership is keyed by logical slug only; labels are translated in UI.
 export const NAV_GROUPS = [
-  { slugs: ["overview", "design-philosophy", "quick-start", "install", "clean-machine-uat", "chatgpt-connector"] },
+  { slugs: ["overview", "design-philosophy", "quick-start", "install", "clean-machine-uat", "second-mac-agent-prompt", "chatgpt-connector"] },
   { slugs: ["browser-continuity", "extension", "browser-control-center", "extension-wake", "extension-bridge"] },
   { slugs: ["architecture", "best-practices", "cli-reference"] },
   { slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade"] },
