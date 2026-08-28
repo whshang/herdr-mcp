@@ -131,8 +131,13 @@ test("Rust GitHub Release provenance is tag-only and fail-closed before publish"
   assert.match(publish, /if: startsWith\(github\.ref, 'refs\/tags\/v'\)/);
   assert.match(publish, /Verify immutable release identity/);
   assert.match(publish, /manifest source_commit does not match tag commit/);
-  assert.match(publish, /refusing publish overwrite/);
-  assert.doesNotMatch(publish, /--clobber/);
+  assert.match(
+    publish,
+    /! -name 'herdr-mcp-extension-\*'/,
+    "publish identity verify must exclude extension zip from manifest asset compare",
+  );
+  assert.match(publish, /refusing publish overwrite/, "publish must fail closed when GitHub Release already exists");
+  assert.doesNotMatch(publish, /--clobber/, "tag publish must not clobber existing release assets");
   assert.match(
     publish,
     /GH_REPO: \$\{\{ github\.repository \}\}/,
@@ -143,7 +148,6 @@ test("Rust GitHub Release provenance is tag-only and fail-closed before publish"
   assert.doesNotMatch(attest, /workflow_dispatch/);
   assert.doesNotMatch(publish, /workflow_dispatch/);
 });
-
 test("Rust Release recovery republishes only a previously attested GitHub run", async () => {
   const recovery = await readFile(join(ROOT, ".github/workflows/rust-release-recover.yml"), "utf8");
   assert.match(recovery, /workflow_dispatch:/);
