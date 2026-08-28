@@ -45,7 +45,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.66" };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.67" };
 const listeners = { onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
@@ -74,8 +74,13 @@ Date.now = () => realDateNow() + testClockOffsetMs;
 let mockStateWorkspaces = [];
 let mockLocalRuntimeAvailable = true;
 let hangAutomationNotifications = false;
+let failQueuedInsertStorage = false;
 const queuedInsertDeliveries = [];
 let blockQueuedInsertDelivery = false;
+let holdInitialLocaleRead = true;
+let initialLocaleReadSeen = false;
+let releaseInitialLocaleRead;
+const initialLocaleReadGate = new Promise((resolve) => { releaseInitialLocaleRead = resolve; });
 
 const nativeFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
@@ -259,11 +264,24 @@ globalThis.chrome = {
     local: {
       async get(keys) {
         if (typeof keys === "string") keys = [keys];
+        if (holdInitialLocaleRead && keys.includes("uiLocale")) {
+          initialLocaleReadSeen = true;
+          await initialLocaleReadGate;
+          holdInitialLocaleRead = false;
+        }
+        if (failQueuedInsertStorage && keys.includes("h2wQueuedInsertV1")) {
+          throw new Error("mock queued insert storage read failure");
+        }
         const out = {};
         for (const k of keys) out[k] = storage[k];
         return out;
       },
-      async set(obj) { Object.assign(storage, obj); },
+      async set(obj) {
+        if (failQueuedInsertStorage && Object.prototype.hasOwnProperty.call(obj, "h2wQueuedInsertV1")) {
+          throw new Error("mock queued insert storage write failure");
+        }
+        Object.assign(storage, obj);
+      },
       async remove(keys) {
         for (const key of Array.isArray(keys) ? keys : [keys]) delete storage[key];
       },
@@ -382,6 +400,31 @@ function installContentScript(tabId, url, convKey, site = "chatgpt") {
 await import(pathToFileURL(path.join(__dirname, "..", "..", "extension", "background.js")).href);
 const onMsg = listeners.onMessage[0];
 ok(!!onMsg, "background onMessage listener registered");
+
+console.log("\n[HUD cold-start locale readiness]");
+let coldHudSettled = false;
+const coldHudP = new Promise((resolve) => {
+  const keepChannel = onMsg({ type: "h2w_page_hud", convKey: CONV }, {}, (response) => {
+    coldHudSettled = true;
+    resolve(response);
+  });
+  ok(keepChannel === true, "cold-start HUD keeps the async response channel open");
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+ok(initialLocaleReadSeen, "locale/config initialization is deliberately held for the race fixture");
+ok(coldHudSettled === false, "cold-start HUD does not return a partial label payload before locale/config readiness");
+releaseInitialLocaleRead();
+const coldHud = await coldHudP;
+ok(coldHud?.ok === true
+    && coldHud?.labels?.manual_continue
+    && coldHud?.labels?.manual_status
+    && coldHud?.labels?.manual_judge
+    && coldHud?.labels?.automation_off
+    && coldHud?.labels?.web_state
+    && coldHud?.labels?.scope_counts,
+  "cold-start HUD returns the complete localized label contract after config readiness",
+  JSON.stringify(coldHud?.labels || {}));
+
 const actionClick = listeners.onActionClicked[0];
 ok(!!actionClick, "toolbar action click listener registered");
 actionClick({ windowId: 77 });
@@ -401,6 +444,38 @@ function dispatchMessage(msg, sender = {}) {
     setTimeout(() => done(undefined), 1000);
   });
 }
+
+console.log("\n[queued insert storage fail-closed]");
+storage.h2wQueuedInsertV1 = {
+  version: 1,
+  conversations: {
+    [CONV]: [{ id: "qi:existing", text: "keep this queued message", created_at: Date.now() }],
+  },
+};
+const queuedStorageBefore = JSON.stringify(storage.h2wQueuedInsertV1);
+failQueuedInsertStorage = true;
+const queuedStorageFailure = await dispatchMessage({
+  type: "h2w_queue_insert",
+  convKey: CONV,
+  text: "must not overwrite the existing queue",
+});
+ok(queuedStorageFailure?.ok === false && queuedStorageFailure?.error === "queue-storage-unavailable",
+  "queue storage failure returns a structured error instead of closing the message port",
+  JSON.stringify(queuedStorageFailure));
+ok(JSON.stringify(storage.h2wQueuedInsertV1) === queuedStorageBefore,
+  "failed queue storage read never overwrites the existing durable queue");
+const queuedTurnEndFailure = await dispatchMessage({
+  type: "h2w_turn_ended",
+  convKey: CONV,
+  assistantText: "finished current reply",
+});
+ok(queuedTurnEndFailure?.ok === false
+    && queuedTurnEndFailure?.error === "queue-storage-unavailable"
+    && queuedTurnEndFailure?.continue_skipped === true,
+  "turn-end fails closed instead of treating unreadable queue storage as an empty queue",
+  JSON.stringify(queuedTurnEndFailure));
+failQueuedInsertStorage = false;
+delete storage.h2wQueuedInsertV1;
 
 // ---- Queued insert is durable, ordered, and wins over generic post-turn continue ----
 console.log("\n[queued insert]");
