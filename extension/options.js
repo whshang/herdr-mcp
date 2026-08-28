@@ -121,7 +121,7 @@ $("test").addEventListener("click", () => {
   const url = $("url").value.trim().replace(/\/+$/, "");
   if (!url) { setStatus(t("need_url"), "err"); return; }
   setStatus(t("testing"), "");
-  // Exercise the exact same bounded background transport used by popup/HUD.
+  // Exercise the exact same bounded background transport used by the HUD / Control Center.
   // Direct Options-page fetch can otherwise hang indefinitely on Chrome's
   // loopback-network permission gate and hide the actual remediation.
   chrome.runtime.sendMessage({ type: "h2w_agents" }, (resp) => {

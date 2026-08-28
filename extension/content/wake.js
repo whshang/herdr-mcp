@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.65";
+const H2W_CONTENT_VERSION = "0.1.66";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -2462,15 +2462,14 @@ const H2W_CONTENT_VERSION = "0.1.65";
     } catch (e) {}
   }
 
-  // ---- Compact in-page HUD + operational drawer (ChatGPT) ----
-  // The always-visible bar stays small. Clicking it opens a layered control
-  // drawer for conversation binding and timing; the toolbar icon opens the
-  // full Options page for advanced transport / model configuration.
+  // ---- Compact in-page HUD ----
+  // The HUD is intentionally a single high-frequency status/action bar.
+  // Binding and workstation detail live only in the Side Panel; timing/model
+  // configuration lives only in Options. Do not reintroduce a HUD drawer.
   const HUD_ID = "h2w-page-hud";
   let hudPending = false;
   let hudCache = null;
   let hudEls = null;
-  let hudExpanded = false;
   let hudActionBusy = false;
   let nativeConversationTitle = "";
   let renderedHerdrTitle = "";
@@ -2548,24 +2547,6 @@ const H2W_CONTENT_VERSION = "0.1.65";
     titleObserver.observe(target, { subtree: true, childList: true, characterData: true });
   }
 
-  function parseHudSec(value, fallback) {
-    if (value === "" || value === undefined || value === null) return fallback;
-    const n = Number(value);
-    if (!Number.isFinite(n)) return fallback;
-    if (n <= 0) return 0;
-    return Math.min(Math.floor(n), 86400);
-  }
-
-  function hudWorkspaceId(workspace) {
-    return String(workspace?.id || workspace?.workspace_id || workspace?.workspace || "").trim();
-  }
-
-  function hudWorkspaceTitle(workspace) {
-    const id = hudWorkspaceId(workspace);
-    const label = String(workspace?.label || workspace?.workspace_label || "").trim();
-    return label ? `${label} (${id})` : id;
-  }
-
   function hudBoundRuntimeState(hud) {
     if (hud?.runtime_available === false) return "offline";
     const bindings = Array.isArray(hud?.bindings) ? hud.bindings : [];
@@ -2578,28 +2559,11 @@ const H2W_CONTENT_VERSION = "0.1.65";
     return statuses[0] || "bound";
   }
 
-  function hudBindingForWorkspace(id) {
-    return (Array.isArray(hudCache?.bindings) ? hudCache.bindings : [])
-      .find((binding) => String(binding?.workspace_id || "") === id) || null;
-  }
-
-  function setHudExpanded(expanded) {
-    const ui = ensurePageHud();
-    hudExpanded = Boolean(expanded);
-    ui.panel.hidden = !hudExpanded;
-    ui.expand.textContent = hudExpanded ? "⌄" : "⌃";
-    ui.expand.setAttribute("aria-expanded", String(hudExpanded));
-    if (hudExpanded) renderHudWorkspaceBindings();
-  }
-
   function setHudActionBusy(busy) {
     hudActionBusy = Boolean(busy);
     if (!hudEls) return;
     hudEls.quick.disabled = hudActionBusy;
-    hudEls.tick.disabled = hudActionBusy;
-    hudEls.fallback.disabled = hudActionBusy;
     syncHudManualButtons();
-    syncHudHandoffButton();
   }
 
   function syncHudManualButtons() {
@@ -2612,20 +2576,6 @@ const H2W_CONTENT_VERSION = "0.1.65";
       button.disabled = locked;
       button.setAttribute("aria-disabled", String(locked));
     }
-  }
-
-  function syncHudHandoffButton() {
-    if (!hudEls?.handoff) return;
-    const hud = hudCache || null;
-    const status = String(hud?.handoff?.status || "");
-    const active = ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(status)
-      && hud?.handoff?.can_resume !== true;
-    hudEls.handoff.hidden = hud?.manual_handoff_available !== true;
-    hudEls.handoff.textContent = handoffButtonText(hud);
-    hudEls.handoff.title = hudText("manual_handoff_hint");
-    hudEls.handoff.disabled = hudActionBusy || active || hud?.bound !== true;
-    hudEls.handoff.classList.toggle("locked", active);
-    hudEls.handoff.setAttribute("aria-disabled", String(hudEls.handoff.disabled));
   }
 
   function showHudToast(text, kind = "") {
@@ -2687,124 +2637,6 @@ const H2W_CONTENT_VERSION = "0.1.65";
     }
   }
 
-  async function saveHudTiming() {
-    if (hudActionBusy) return;
-    const ui = ensurePageHud();
-    const tick = parseHudSec(ui.tick.value, Number(hudCache?.progressTickSec) || 60);
-    const fallback = parseHudSec(ui.fallback.value, Number(hudCache?.progressFallbackSec) || 1200);
-    ui.tick.value = String(tick);
-    ui.fallback.value = String(fallback);
-    setHudActionBusy(true);
-    const result = await sendBg({
-      type: "h2w_set_config",
-      config: { progressTickSec: tick, progressFallbackSec: fallback },
-    });
-    if (result?.ok) {
-      hudCache = { ...(hudCache || {}), progressTickSec: tick, progressFallbackSec: fallback };
-      showHudToast(hudText("timing_saved"), "ok");
-    } else {
-      showHudToast(hudText("timing_save_failed"), "err");
-    }
-    setHudActionBusy(false);
-  }
-
-  async function mutateHudBinding(workspace, shouldBind) {
-    if (hudActionBusy) return;
-    const id = hudWorkspaceId(workspace);
-    if (!id) return;
-    setHudActionBusy(true);
-    let result;
-    if (shouldBind) {
-      result = await sendBg({
-        type: "h2w_bind",
-        convKey: ADAPTER.getConversationKey(),
-        workspace_id: id,
-        workspace_label: hudWorkspaceTitle(workspace),
-        workspace_label_raw: workspace?.label || null,
-        roots: workspace?.roots || [],
-      });
-    } else {
-      result = await sendBg({
-        type: "h2w_unbind",
-        convKey: ADAPTER.getConversationKey(),
-        workspace_id: id,
-      });
-    }
-    if (result?.ok) {
-      showHudToast(
-        shouldBind
-          ? hudText("bound_to", { name: hudWorkspaceTitle(workspace) })
-          : hudText("unbound_from", { name: hudWorkspaceTitle(workspace) }),
-        "ok",
-      );
-      await refreshPageHud();
-    } else {
-      showHudToast(hudText("binding_failed", { error: result?.error || "unknown" }), "err");
-    }
-    setHudActionBusy(false);
-  }
-
-  function renderHudWorkspaceBindings() {
-    if (!hudEls || !hudExpanded) return;
-    const list = hudEls.workspaces;
-    list.textContent = "";
-    const workspaces = Array.isArray(hudCache?.workspaces) ? [...hudCache.workspaces] : [];
-    const boundIds = new Set(hudCache?.bound_workspace_ids || []);
-    workspaces.sort((a, b) => {
-      const ai = boundIds.has(hudWorkspaceId(a)) ? 0 : 1;
-      const bi = boundIds.has(hudWorkspaceId(b)) ? 0 : 1;
-      return ai - bi || hudWorkspaceTitle(a).localeCompare(hudWorkspaceTitle(b));
-    });
-
-    if (!workspaces.length) {
-      const empty = document.createElement("div");
-      empty.className = "empty";
-      empty.textContent = hudCache?.workspace_error
-        ? hudText("workspaces_unavailable", { error: hudCache.workspace_error })
-        : hudText("no_workspaces");
-      list.appendChild(empty);
-      return;
-    }
-
-    for (const workspace of workspaces) {
-      const id = hudWorkspaceId(workspace);
-      if (!id) continue;
-      const bound = boundIds.has(id);
-      const row = document.createElement("div");
-      row.className = `ws-row${bound ? " bound" : ""}`;
-      const copy = document.createElement("div");
-      copy.className = "ws-copy";
-      const title = document.createElement("div");
-      title.className = "ws-title";
-      title.textContent = hudWorkspaceTitle(workspace);
-      const meta = document.createElement("div");
-      meta.className = "ws-meta";
-      const roots = Array.isArray(workspace?.roots) ? workspace.roots : [];
-      const binding = bound ? hudBindingForWorkspace(id) : null;
-      if (binding) {
-        const state = String(binding.status || "bound");
-        const active = Number(binding.working_count) || 0;
-        const stateLabel = hudLabels?.states?.[state] || state;
-        meta.textContent = active > 0 ? `${stateLabel} · ${hudText("active", { count: active })}` : stateLabel;
-      } else {
-        meta.textContent = roots.length ? String(roots[0]) : hudText("available");
-      }
-      copy.append(title, meta);
-      const action = document.createElement("button");
-      action.type = "button";
-      action.className = `ws-action${bound ? " danger" : ""}`;
-      action.textContent = bound ? hudText("unbind") : hudText("bind");
-      action.disabled = hudActionBusy;
-      action.addEventListener("pointerdown", (event) => event.stopPropagation());
-      action.addEventListener("click", (event) => {
-        event.stopPropagation();
-        void mutateHudBinding(workspace, !bound);
-      });
-      row.append(copy, action);
-      list.appendChild(row);
-    }
-  }
-
   async function manualContinueAction(action) {
     if (hudActionBusy || hudCache?.enabled === true) return { ok: false, error: "automation_enabled" };
     setHudActionBusy(true);
@@ -2829,40 +2661,6 @@ const H2W_CONTENT_VERSION = "0.1.65";
     }
   }
 
-  function handoffButtonText(hud) {
-    const status = String(hud?.handoff?.status || "");
-    if (hud?.handoff?.can_resume === true) return hudText("handoff_resume");
-    if (status === "summary_requested") return hudText("handoff_compressing");
-    if (["summary_ready", "target_opening", "seed_submitting"].includes(status)) return hudText("handoff_moving");
-    return hudText("manual_handoff");
-  }
-
-  function handoffErrorText(error) {
-    const code = String(error || "unknown");
-    if (["project_conversation_required", "handoff_conversation_required"].includes(code)) return hudText("handoff_project_only");
-    if (code === "binding_required") return hudText("handoff_binding_required");
-    if (code === "workspace_busy") return hudText("handoff_workspace_busy");
-    if (code === "automation_enabled") return hudText("handoff_automation_enabled");
-    return hudText("handoff_failed", { error: code });
-  }
-
-  async function manualHandoffAction() {
-    if (hudActionBusy) return { ok: false, error: "busy" };
-    setHudActionBusy(true);
-    try {
-      const result = await sendBg({ type: "h2w_handoff_start", trigger: "manual" });
-      if (result?.ok) {
-        showHudToast(hudText("handoff_started"), "ok");
-      } else {
-        showHudToast(handoffErrorText(result?.error), "err");
-      }
-      await refreshPageHud();
-      return result;
-    } finally {
-      setHudActionBusy(false);
-    }
-  }
-
   function ensurePageHud() {
     if (hudEls?.host?.isConnected) return hudEls;
     let host = document.getElementById(HUD_ID);
@@ -2876,183 +2674,81 @@ const H2W_CONTENT_VERSION = "0.1.65";
       <style>
         :host { all: initial; }
         .bar {
-          position: fixed; left: 0; right: 0; bottom: 0; z-index: 2147483646;
-          height: 30px; padding: 3px 8px 3px 12px; box-sizing: border-box;
-          display: flex; align-items: center; gap: 6px;
-          font: 12px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif;
-          color: #4d4d4d; background: rgba(255,255,255,.96);
-          border-top: 1px solid #eaeaea;
-          box-shadow: 0 -1px 8px rgba(0,0,0,.04);
-          pointer-events: auto; user-select: none;
-          backdrop-filter: blur(10px);
-          /* Keep the automation cue deterministic. Frequent HUD refreshes can restart CSS transitions and leave the bar visually stuck at the neutral color. */
-          transition: none;
+          position: fixed; z-index: 2147483645; left: 50%; bottom: 7px; transform: translateX(-50%);
+          max-width: calc(100vw - 20px); min-height: 28px; box-sizing: border-box;
+          display: flex; align-items: center; gap: 6px; padding: 3px 5px 3px 9px;
+          color: #252525; background: rgba(255,255,255,.96); border: 1px solid #dedede;
+          border-radius: 10px; box-shadow: 0 4px 18px rgba(0,0,0,.11);
+          font: 12px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+          backdrop-filter: blur(9px);
         }
-        .bar.automation-on {
-          color: #244c35;
-          background: rgba(236,253,245,.97);
-          border-top-color: #86d9a5;
-          box-shadow: 0 -2px 12px rgba(22,101,52,.10);
-        }
-        .bar.automation-on .workspace { color: #527361; }
-        .bar.automation-on .quick,
-        .bar.automation-on .manual,
-        .bar.automation-on .handoff,
-        .bar.automation-on .expand {
-          background: rgba(255,255,255,.72);
-          border-color: #a9dfbb;
-        }
-        .bar.automation-on .quick.on {
-          color: #14532d;
-          background: #dcfce7;
-          border-color: #6fcf8e;
-          font-weight: 650;
-        }
-        button, input { font: inherit; }
-        button { color: inherit; }
-        .summary {
-          min-width: 0; flex: 1; height: 24px; padding: 0; border: 0; background: transparent;
-          display: flex; align-items: center; gap: 7px; cursor: pointer; text-align: left;
-        }
-        .status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-        .workspace { color: #8a8a8a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
-        .quick, .manual, .handoff, .expand {
+        .bar.automation-on { color: #14532d; background: rgba(240,253,244,.97); border-color: #86d49f; }
+        .summary { min-width: 0; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+        .web-status, .status { font-weight: 650; }
+        .scope-counts { color: #777; font-size: 10.5px; }
+        .divider { color: #bbb; }
+        button { font: inherit; color: inherit; }
+        .quick, .manual {
           height: 22px; border: 1px solid #dedede; background: #fafafa; border-radius: 7px;
           cursor: pointer; padding: 0 7px; font-size: 11px; white-space: nowrap;
         }
         .quick.on { color: #166534; background: #f0fdf4; border-color: #bbf7d0; }
         .quick.off { color: #6b7280; background: #f5f5f5; }
-        .manual.locked, .handoff.locked { opacity: .45; cursor: not-allowed; }
-        .expand { width: 24px; padding: 0; font-size: 13px; }
-        button:hover { filter: brightness(.97); }
-        button:disabled, input:disabled { opacity: .55; cursor: wait; }
-        .manual.locked:disabled, .handoff.locked:disabled { opacity: .45; cursor: not-allowed; }
-        .bar.waiting .status { color: #8a4b00; }
-        .bar.working .status { color: #a15c00; }
-        .bar.done .status, .bar.idle .status { color: #18794e; }
-        .bar.blocked .status { color: #b42318; }
-        .bar.recovering .status { color: #9a3412; }
-        .bar.failed .status { color: #b42318; }
-        .panel {
-          position: fixed; right: 8px; bottom: 36px; z-index: 2147483647;
-          width: min(368px, calc(100vw - 16px)); max-height: min(62vh, 560px); overflow: auto;
-          box-sizing: border-box; padding: 0;
-          color: #252525; background: rgba(255,255,255,.985); border: 1px solid #dedede;
-          border-radius: 12px; box-shadow: 0 14px 42px rgba(0,0,0,.18);
-          font: 12px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif;
-          pointer-events: auto; user-select: none; backdrop-filter: blur(14px);
+        .manual.locked { opacity: .45; cursor: not-allowed; }
+        .toast {
+          position: fixed; z-index: 2147483646; left: 50%; bottom: 42px; transform: translateX(-50%);
+          max-width: min(520px, calc(100vw - 24px)); padding: 6px 9px; border: 1px solid #d7d7d7;
+          border-radius: 8px; background: rgba(255,255,255,.98); color: #333;
+          box-shadow: 0 4px 16px rgba(0,0,0,.12); font: 11px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
         }
-        .panel[hidden] { display: none !important; }
-        .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 11px 8px; }
-        .panel-title { font-size: 13px; font-weight: 700; }
-        .conversation { margin-top: 1px; max-width: 260px; color: #909090; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .options { border: 0; background: transparent; color: #6b7280; cursor: pointer; font-size: 11px; padding: 3px 5px; }
-        .section { border-top: 1px solid #efefef; padding: 9px 11px; }
-        .timing { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 9px; }
-        .timing label { display: grid; gap: 3px; color: #777; font-size: 10px; }
-        .timing input { width: 100%; box-sizing: border-box; height: 27px; border: 1px solid #ddd; border-radius: 7px; padding: 2px 7px; color: #333; background: #fff; }
-        .section-title { font-size: 10px; color: #858585; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 5px; }
-        .workspaces { display: grid; gap: 3px; min-width: 0; }
-        .ws-row {
-          display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0;
-          box-sizing: border-box; padding: 6px 7px; border-radius: 8px;
+        .toast.ok { border-color: #86d49f; }
+        .toast.err { border-color: #e49a9a; color: #991b1b; }
+        @media (max-width: 820px) {
+          .scope-counts { display: none; }
+          .bar { max-width: calc(100vw - 10px); gap: 4px; }
+          .quick, .manual { padding: 0 5px; font-size: 10px; }
         }
-        .ws-row:hover { background: #f7f7f7; }
-        .ws-row.bound { background: #f4fbf6; }
-        .ws-copy { flex: 1; min-width: 0; }
-        .ws-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .ws-meta { margin-top: 1px; color: #9b9b9b; font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .ws-action { flex: 0 0 auto; border: 1px solid #d5d5d5; background: #fff; border-radius: 7px; padding: 3px 7px; cursor: pointer; font-size: 10px; }
-        .ws-action.danger { color: #b42318; }
-        .empty { color: #999; padding: 7px 3px; }
-        .toast { margin: 0 11px 9px; padding: 6px 8px; border-radius: 7px; background: #f5f5f5; color: #555; font-size: 10px; }
-        .toast.ok { background: #f0fdf4; color: #166534; }
-        .toast.err { background: #fef2f2; color: #b42318; }
         @media (prefers-color-scheme: dark) {
-          .bar { color: #ddd; background: rgba(32,32,32,.96); border-color: #3a3a3a; }
-          .bar.automation-on {
-            color: #d9fbe5;
-            background: rgba(25,57,38,.97);
-            border-color: #397b52;
-            box-shadow: 0 -2px 12px rgba(34,197,94,.12);
-          }
-          .bar.automation-on .workspace { color: #a6d5b7; }
-          .bar.automation-on .quick,
-          .bar.automation-on .manual,
-          .bar.automation-on .handoff,
-          .bar.automation-on .expand { background: #23452f; border-color: #477b59; }
-          .bar.automation-on .quick.on { color: #bbf7d0; background: #1d5130; border-color: #5aa773; }
-          .workspace { color: #8d8d8d; }
-          .quick, .manual, .handoff, .expand { background: #292929; border-color: #454545; }
-          .quick.on { color: #86efac; background: #143020; border-color: #245c36; }
-          .panel { color: #e8e8e8; background: rgba(32,32,32,.985); border-color: #494949; }
-          .section { border-color: #414141; }
-          .timing input { color: #eee; background: #282828; border-color: #4a4a4a; }
-          .ws-row:hover { background: #292929; }
-          .ws-row.bound { background: #173020; }
-          .ws-action { color: #ddd; background: #272727; border-color: #4a4a4a; }
+          .bar { color: #eee; background: rgba(30,30,30,.96); border-color: #454545; box-shadow: 0 4px 18px rgba(0,0,0,.32); }
+          .bar.automation-on { color: #b8efc8; background: rgba(29,64,43,.96); border-color: #477b59; }
+          .scope-counts { color: #aaa; }
+          .divider { color: #666; }
+          .quick, .manual { background: #292929; border-color: #454545; }
+          .quick.on { color: #bbf7d0; background: #1d5130; border-color: #5aa773; }
+          .quick.off { color: #bbb; background: #292929; }
+          .toast { color: #eee; background: rgba(30,30,30,.98); border-color: #555; }
+          .toast.err { color: #fecaca; border-color: #7f1d1d; }
         }
       </style>
-      <div class="panel" part="panel" hidden>
-        <div class="panel-head">
-          <div><div class="panel-title"></div><div class="conversation"></div></div>
-          <button type="button" class="options"></button>
-        </div>
-        <div class="section">
-          <div class="section-title event-title"></div>
-          <div class="timing">
-            <label><span class="tick-label"></span><input class="tick" type="number" min="0" step="1"></label>
-            <label><span class="fallback-label"></span><input class="fallback" type="number" min="0" step="1"></label>
-          </div>
-        </div>
-        <div class="section"><div class="section-title bindings-title"></div><div class="workspaces"></div></div>
-        <div class="toast" hidden></div>
-      </div>
+      <div class="toast" hidden></div>
       <div class="bar" part="bar">
-        <button type="button" class="summary"><span class="status"></span><span class="workspace"></span></button>
+        <div class="summary" aria-live="polite">
+          <span class="web-status"></span><span class="divider">·</span>
+          <span class="status"></span><span class="scope-counts"></span>
+        </div>
         <button type="button" class="manual manual-continue"></button>
         <button type="button" class="manual manual-status"></button>
         <button type="button" class="manual manual-judge"></button>
-        <button type="button" class="handoff manual-handoff"></button>
         <button type="button" class="quick" aria-label=""></button>
-        <button type="button" class="expand" aria-label="" aria-expanded="false">⌃</button>
       </div>
     `;
     hudEls = {
       host,
       bar: shadow.querySelector(".bar"),
+      webStatus: shadow.querySelector(".web-status"),
       status: shadow.querySelector(".status"),
-      workspace: shadow.querySelector(".workspace"),
-      summary: shadow.querySelector(".summary"),
+      scopeCounts: shadow.querySelector(".scope-counts"),
       quick: shadow.querySelector(".quick"),
-      handoff: shadow.querySelector(".handoff"),
-      expand: shadow.querySelector(".expand"),
-      panel: shadow.querySelector(".panel"),
-      conversation: shadow.querySelector(".conversation"),
-      options: shadow.querySelector(".options"),
-      panelTitle: shadow.querySelector(".panel-title"),
-      eventTitle: shadow.querySelector(".event-title"),
-      tickLabel: shadow.querySelector(".tick-label"),
-      fallbackLabel: shadow.querySelector(".fallback-label"),
-      bindingsTitle: shadow.querySelector(".bindings-title"),
-      manualButtons: [...shadow.querySelectorAll(".manual")],
-      tick: shadow.querySelector(".tick"),
-      fallback: shadow.querySelector(".fallback"),
-      workspaces: shadow.querySelector(".workspaces"),
+      manualButtons: [
+        shadow.querySelector(".manual-continue"),
+        shadow.querySelector(".manual-status"),
+        shadow.querySelector(".manual-judge"),
+      ],
       toast: shadow.querySelector(".toast"),
     };
-    hudEls.summary.addEventListener("click", (event) => {
-      event.stopPropagation();
-      setHudExpanded(!hudExpanded);
-    });
-    hudEls.expand.addEventListener("click", (event) => {
-      event.stopPropagation();
-      setHudExpanded(!hudExpanded);
-    });
     hudEls.quick.addEventListener("click", () => {
       void setHudProjectAutomation(!(hudCache?.enabled === true));
     });
-    hudEls.handoff.addEventListener("click", () => { void manualHandoffAction(); });
     hudEls.manualButtons.forEach((button, index) => {
       const actions = ["direct", "status", "judge"];
       button.addEventListener("click", () => {
@@ -3060,18 +2756,6 @@ const H2W_CONTENT_VERSION = "0.1.65";
         void manualContinueAction(actions[index]);
       });
     });
-    hudEls.tick.addEventListener("change", () => { void saveHudTiming(); });
-    hudEls.fallback.addEventListener("change", () => { void saveHudTiming(); });
-    hudEls.options.addEventListener("click", () => { void sendBg({ type: "h2w_open_options" }); });
-    document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape" && hudExpanded) setHudExpanded(false);
-    });
-    document.addEventListener("pointerdown", (event) => {
-      if (!hudExpanded) return;
-      const path = typeof event.composedPath === "function" ? event.composedPath() : [];
-      if (path.includes(host) || event.target === host) return;
-      setHudExpanded(false);
-    }, true);
     return hudEls;
   }
 
@@ -3103,6 +2787,24 @@ const H2W_CONTENT_VERSION = "0.1.65";
     return "";
   }
 
+  function hudSiteLabel() {
+    if (ADAPTER.name === "chatgpt") return "ChatGPT";
+    if (ADAPTER.name === "claude") return "Claude";
+    if (ADAPTER.name === "z.ai") return "z.ai";
+    if (ADAPTER.name === "deepseek") return "DeepSeek";
+    return ADAPTER.name || "Web";
+  }
+
+  function hudWebActivityLabel() {
+    const healthState = String(conversationHealth?.state || "");
+    let stateKey = hasPendingReply() ? "reply_waiting" : "idle";
+    if (["reply_suspect", "recovery_message_sent", "reload_pending", "recovering", "rollover_recommended", "rollover_required"].includes(healthState)) {
+      stateKey = healthState;
+    }
+    const stateLabel = hudLabels?.states?.[stateKey] || stateKey;
+    return hudText("web_state", { site: hudSiteLabel(), state: stateLabel }, `${hudSiteLabel()} ● ${stateLabel}`);
+  }
+
   function paintPageHud(view = {}) {
     const ui = ensurePageHud();
     liftComposer(32);
@@ -3128,9 +2830,9 @@ const H2W_CONTENT_VERSION = "0.1.65";
       ? `${hudText(`reason_${hud.last.reason}`, null, hud.last.reason)}${hud.last.at ? ` @ ${new Date(hud.last.at).toLocaleTimeString()}` : ""}`
       : null;
     const input = {
-      workspace: hud?.workspace_label || hud?.workspace_id || null,
-      agent: hud?.focus_agent || hud?.agent || null,
-      conversation: ADAPTER.getConversationKey(),
+      workspace: null,
+      agent: null,
+      conversation: null,
       state,
       recovery: recoveryLabel(hud),
       lastEvent,
@@ -3146,15 +2848,16 @@ const H2W_CONTENT_VERSION = "0.1.65";
     automationAutoAllow = hud?.autoAllow !== false;
     syncAutomationPermissionWatch();
     syncDocumentTitle(hud, state);
-    ui.workspace.textContent = hud?.workspace_label || (hud?.bound
-      ? hudText("bound_count", { count: hud.binding_count || 1 })
-      : (hudLabels?.states?.unbound || ""));
-    ui.panelTitle.textContent = hudText("controls");
-    ui.options.textContent = hudText("advanced_options");
-    ui.eventTitle.textContent = hudText("event_settings");
-    ui.tickLabel.textContent = hudText("interval");
-    ui.fallbackLabel.textContent = hudText("fallback");
-    ui.bindingsTitle.textContent = hudText("bindings");
+    ui.webStatus.textContent = hudWebActivityLabel();
+    ui.scopeCounts.textContent = hud?.bound
+      ? hudText("scope_counts", {
+        workspaces: Number(hud?.bound_workspace_count ?? hud?.binding_count ?? 0),
+        panes: Number(hud?.bound_pane_count || 0),
+      })
+      : hudText("scope_unbound");
+    ui.scopeCounts.title = hud?.bound
+      ? hudText("scope_counts_hint", { working: Number(hud?.bound_working_count || 0) })
+      : hudText("scope_unbound");
     const manualLabels = [
       [hudLabels.manual_continue, hudLabels.manual_continue_hint],
       [hudLabels.manual_status, hudLabels.manual_status_hint],
@@ -3168,7 +2871,6 @@ const H2W_CONTENT_VERSION = "0.1.65";
     syncHudManualButtons();
     ui.quick.hidden = hud?.project_automation_available !== true
       && hud?.conversation_automation_available !== true;
-    syncHudHandoffButton();
     ui.quick.textContent = preferenceEnabled ? hudText("automation_on", null, "Auto on") : hudText("automation_off", null, "Auto off");
     ui.quick.className = `quick ${preferenceEnabled ? "on" : "off"}`;
     ui.quick.setAttribute("aria-pressed", String(preferenceEnabled));
@@ -3177,22 +2879,8 @@ const H2W_CONTENT_VERSION = "0.1.65";
     ui.quick.title = conversationAutomation
       ? (preferenceEnabled ? hudText("conversation_automation_on_hint") : hudText("conversation_automation_off_hint"))
       : (preferenceEnabled ? hudText("automation_on_hint") : hudText("automation_off_hint"));
-    ui.expand.setAttribute("aria-label", hudText("aria_open_controls"));
-    ui.expand.title = hudText("aria_open_controls");
-    ui.conversation.textContent = ADAPTER.getConversationKey();
-    if (document.activeElement !== ui.tick && shadowActiveElement(ui.host) !== ui.tick) {
-      ui.tick.value = String(hud?.progressTickSec ?? 60);
-    }
-    if (document.activeElement !== ui.fallback && shadowActiveElement(ui.host) !== ui.fallback) {
-      ui.fallback.value = String(hud?.progressFallbackSec ?? 1200);
-    }
-    renderHudWorkspaceBindings();
     const visual = hudVisualClass(state);
     ui.bar.className = `bar${effectiveEnabled ? " automation-on" : ""}${visual ? ` ${visual}` : ""}`;
-  }
-
-  function shadowActiveElement(host) {
-    try { return host?.shadowRoot?.activeElement || null; } catch (_) { return null; }
   }
 
   async function refreshPageHud() {

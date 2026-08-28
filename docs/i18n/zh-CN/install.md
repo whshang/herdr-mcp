@@ -189,11 +189,11 @@ MCP 解决的是“ChatGPT 到达工作站”。浏览器扩展再补三类能�
 
 安装后至少验证：
 
-1. Popup 显示本机 runtime 可达；
-2. 当前网页作用域能绑定正确 workspace；
-3. **浏览器控制中心**可以打开，并实时看到 workspace / pane / Agent；
+1. 点击 Herdr 工具栏图标会直接打开 **浏览器控制中心**，并显示本机 runtime 可达；
+2. Control Center 的“当前页面”能识别当前 Project / conversation，并在这里绑定正确 workspace；
+3. Control Center 能实时看到 workspace / pane / Agent；
 4. 创建/关闭 pane 后 Side Panel 能看到生命周期变化；
-5. Control Center 的 Prompt / Steer / Herdr / Terminal 明确显示为 Preview-only，而不是误以为已经开放写操作；
+5. Control Center 的“提示 Agent / 调整会话 / Herdr API / 终端输入”明确显示为 Preview-only，而不是误以为已经开放写操作；
 6. ChatGPT 正在回复时，“排队”不会打断当前 turn，settled 后再发送下一轮。
 
 控制中心交互见 [浏览器控制中心](browser-control-center.md)。

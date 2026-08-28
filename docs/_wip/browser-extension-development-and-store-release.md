@@ -26,7 +26,7 @@ Herdr workspace / pane / agent
 
 当前扩展名称：`herdr → Web wake`。
 
-当前浏览器产品化分支的 manifest 版本：`0.1.65`；合入后以实时 `origin/main` 为准。
+当前浏览器入口收敛分支的 manifest 版本：`0.1.66`；合入后以实时 `origin/main` 为准。
 
 核心能力包括：
 
@@ -34,8 +34,9 @@ Herdr workspace / pane / agent
 - progress、settled、页面恢复与长对话 handoff；
 - ChatGPT Project continuity；
 - z.ai / DeepSeek JSON → MCP bridge；
-- popup 快速状态与自动开关；
-- Chrome Side Panel Browser Control Center；
+- 工具栏图标直接打开 Chrome Side Panel Browser Control Center；
+- Side Panel 跟随当前激活 tab，识别 Project / conversation，并统一管理 workspace binding / unbinding 与手动接力；
+- HUD 仅保留网页状态、Herdr 状态、绑定 workspace / pane 数量、Auto 和三个预置会话动作；不再有 drawer；
 - workspace / pane / agent 实时状态；
 - explicit pinned target；
 - Phase A read-only / mutation dry-run control model；
@@ -80,8 +81,8 @@ chrome://extensions
 <repo>/extension/
 ```
 
-7. 打开 ChatGPT / Claude / z.ai / DeepSeek，检查 popup/HUD 是否加载。
-8. 打开 popup → **Open Control Center**，确认 Side Panel 可以打开。
+7. 打开 ChatGPT / Claude / z.ai / DeepSeek，检查页面 HUD 是否加载。
+8. 点击 Herdr 工具栏图标，确认 Side Panel Control Center 直接打开。
 9. 首次开发环境至少确认 Native Messaging 不报：
 
 ```text
@@ -98,7 +99,7 @@ Access to the specified native messaging host is forbidden.
 2. 找到 `herdr → Web wake`；
 3. 点击 **Reload / 重新加载**；
 4. 刷新已打开的支持站点页面；
-5. 检查 popup / HUD / Control Center 的版本和功能。
+5. 检查 HUD / Control Center / Options 的版本和功能。
 
 当前 content/background 具有版本自愈逻辑，但开发验证仍应显式 Reload，不能把自动 reinjection 当作发布验证替代品。
 
@@ -142,7 +143,6 @@ bin/herdr-extension-host status
 extension/
 ├── manifest.json
 ├── background.js                 # MV3 service worker orchestration
-├── popup.html / popup.js         # quick status/binding/automation/Control Center entry
 ├── options.html / options.js
 ├── control-center.html
 ├── control-center.css
@@ -298,7 +298,7 @@ cargo test --workspace
 
 - unpacked extension 真实加载；
 - MV3 service worker target 正常；
-- popup 可打开；
+- 工具栏图标可直接打开 Control Center；
 - Side Panel / `control-center.html` 可真实渲染；
 - 页面无 console/runtime exception；
 - Native Messaging exact origin 行为正确；
@@ -515,7 +515,6 @@ ZIP 必须满足：
 ```text
 manifest.json
 background.js
-popup.html
 control-center.html
 ...
 ```
@@ -667,7 +666,7 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 - [ ] extension package deterministic；
 - [ ] unpacked真实浏览器 smoke PASS；
 - [ ] Store-ID build + Native Host real smoke PASS；
-- [ ] popup/HUD/Side Panel/Queued Insert smoke PASS；
+- [ ] toolbar action → Side Panel、active-tab Current page、single-path binding/handoff、compact HUD、Queued Insert smoke PASS；
 - [ ] ChatGPT / Claude / z.ai / DeepSeek 支持矩阵重新验证；
 - [ ] handoff/recovery 回归 PASS；
 - [ ] Rust Native Messaging install/status/uninstall/rollback PASS；
@@ -750,7 +749,7 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 截至 2026-08-28：
 
 - 浏览器扩展继续以 unpacked development build 方式开发；
-- 本轮浏览器产品化分支把 extension manifest 升到 `0.1.65`；合入后以 main 实际版本为准；
+- 浏览器产品化已经进入 `0.1.65`；本轮入口收敛分支进一步升到 `0.1.66`：移除旧 Popup，工具栏图标直达 Side Panel；Side Panel 成为当前页面 binding / unbinding、手动接力与本机详细状态的唯一主入口；HUD drawer 删除，只保留状态、Auto、聚合绑定数量与三个预置动作；合入后以 main 实际版本为准；
 - Browser Control Center Phase A 与 pane lifecycle 已进入 main，0.1.65 进一步补齐 en / zh / ja、Pinned Target / Preview-only 产品文案与 Settings 入口；
 - ChatGPT Queued Insert 已进入 main，正式用户文档使用“排队 / Queue”描述其 next-turn 语义；
 - Chrome Web Store **暂不发布**；

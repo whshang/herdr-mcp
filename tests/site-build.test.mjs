@@ -338,6 +338,11 @@ test("release.json, skill artifact and design invariants are preserved", async (
   for (const locale of LOCALES) {
     const control = await readFile(join(OUT, "docs", locale, "browser-control-center.html"), "utf8");
     assert.match(control, /Chrome Side Panel/);
+    assert.match(control, /Current page|当前页面/, "Control Center docs must expose active-tab page context");
+    assert.match(control, /no drawer|没有抽屉/, "Control Center docs must keep the HUD as a compact non-duplicated surface");
+    assert.match(control, /Manual handoff|手动接力/, "manual handoff must be documented in the Side Panel path");
+    assert.match(control, /Prompt Agent|提示 Agent/);
+    assert.match(control, /Steer Session|调整会话/);
     assert.match(control, /Preview-only|preview-only|控制操作仅预览/);
     assert.match(control, /Pinned Target|固定目标/);
   }

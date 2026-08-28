@@ -26,7 +26,25 @@
 
     <section class="phase-banner" aria-live="polite">
       <strong data-i18n="cc_phase_title">Live state · preview-only controls</strong>
-      <p data-i18n="cc_phase_body">Workspace and pane state is live. Inspect and output-tail reads run now; Prompt, Steer, Herdr and Terminal actions only build a preview in this release.</p>
+      <p data-i18n="cc_phase_body">Workspace and pane state is live. Inspect and output-tail reads run now; Prompt Agent, Steer Session, Herdr API and Terminal Input only build a preview in this release.</p>
+    </section>
+
+    <section id="pageContextCard" class="page-context-card" aria-live="polite">
+      <div class="page-context-heading">
+        <strong data-i18n="cc_page_context_title">Current page</strong>
+        <span class="follow-badge" data-i18n="cc_page_following">FOLLOWS ACTIVE TAB</span>
+      </div>
+      <div id="pageContextTitle" class="page-context-title" data-i18n="cc_page_loading">Reading active tab…</div>
+      <div id="pageContextMeta" class="page-context-meta"></div>
+      <div id="pageBindings" class="page-bindings"></div>
+      <div class="page-bind-row">
+        <select id="pageWorkspaceSelect" aria-label="Workspace to bind" data-i18n-aria="cc_page_workspace_select_aria"></select>
+        <button id="pageBindButton" type="button" class="primary" disabled data-i18n="cc_page_bind">Bind</button>
+      </div>
+      <div class="page-actions">
+        <button id="pageHandoffButton" type="button" class="ghost" hidden data-i18n="cc_page_handoff">Manual handoff</button>
+      </div>
+      <div id="pageContextHelp" class="page-context-help" data-i18n="cc_page_context_help">Switching browser tabs updates this context automatically. It does not retarget the pinned control target.</div>
     </section>
 
     <section id="workspaceList" class="workspace-list" aria-label="Herdr workspaces" data-i18n-aria="cc_workspace_aria">
@@ -54,14 +72,14 @@
         <span data-i18n="cc_preview_badge">PREVIEW ONLY</span>
       </div>
       <div id="modeTabs" class="mode-tabs" role="tablist" aria-label="Control mode" data-i18n-aria="cc_mode_aria">
-        <button type="button" data-mode="agent_prompt" class="active" data-i18n="cc_mode_prompt">Prompt</button>
-        <button type="button" data-mode="steer" data-i18n="cc_mode_steer">Steer</button>
-        <button type="button" data-mode="herdr_method" data-i18n="cc_mode_herdr">Herdr</button>
-        <button type="button" data-mode="terminal_text" data-i18n="cc_mode_terminal">Terminal</button>
+        <button type="button" data-mode="agent_prompt" class="active" data-i18n="cc_mode_prompt">Prompt Agent</button>
+        <button type="button" data-mode="steer" data-i18n="cc_mode_steer">Steer Session</button>
+        <button type="button" data-mode="herdr_method" data-i18n="cc_mode_herdr">Herdr API</button>
+        <button type="button" data-mode="terminal_text" data-i18n="cc_mode_terminal">Terminal Input</button>
       </div>
-      <div id="modeHelp" class="mode-help" data-i18n="cc_mode_prompt_help">Preview a prompt for the pinned agent. Nothing is sent.</div>
+      <div id="modeHelp" class="mode-help" data-i18n="cc_mode_prompt_help">Build a preview of a new prompt for the pinned Agent. Nothing is sent.</div>
 
-      <textarea id="composer" placeholder="Describe the prompt you would send to the pinned agent."></textarea>
+      <textarea id="composer" placeholder="Describe the new prompt you would send to the pinned Agent."></textarea>
       <div class="composer-footer">
         <span id="riskBadge" class="risk">WRITE</span>
         <span id="blockedReason" class="blocked-reason" data-i18n="cc_preview_only_reason">Preview only in this release</span>

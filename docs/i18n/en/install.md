@@ -189,11 +189,11 @@ Installation is documented in [Browser extension](extension.md). The extension u
 
 After installation, verify at least:
 
-1. Popup reports the local runtime reachable;
-2. the current Web scope can bind the intended workspace;
-3. **Browser Control Center** opens and shows live workspace / pane / agent state;
+1. clicking the Herdr toolbar icon opens **Browser Control Center** directly and reports the local runtime reachable;
+2. the Control Center Current page card recognizes the active Project / conversation and can bind the intended workspace there;
+3. Control Center shows live workspace / pane / agent state;
 4. creating or closing a pane appears as a Side Panel lifecycle update;
-5. Prompt / Steer / Herdr / Terminal are visibly Preview-only rather than implying mutations are enabled;
+5. Prompt Agent / Steer Session / Herdr API / Terminal Input are visibly Preview-only rather than implying mutations are enabled;
 6. ChatGPT Queue does not interrupt a live reply and sends only after the turn settles.
 
 See [Browser Control Center](browser-control-center.md) for the interaction model.

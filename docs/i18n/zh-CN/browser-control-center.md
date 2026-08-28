@@ -6,7 +6,7 @@
 
 > 当网页 AI、本地 Agent、测试进程和终端同时工作时，怎样始终知道**哪一个现场正在发生什么，以及下一条人工控制明确指向哪里**？
 
-当前控制中心以**实时观察 + 明确目标 + 有界读取**为主。写操作仍保持 Preview-only，不会因为 UI 上出现 Prompt / Steer / Herdr / Terminal 就绕过现有 mutation 安全边界。
+当前控制中心以**当前页面上下文 + 实时观察 + 明确目标 + 有界读取**为主。写操作仍保持 Preview-only，不会因为 UI 上出现“提示 Agent / 调整会话 / Herdr API / 终端输入”就绕过现有 mutation 安全边界。
 
 ## 它和浏览器连续工作有什么区别
 
@@ -14,32 +14,40 @@
 
 | 操作面 | 主要问题 | 入口 |
 |---|---|---|
-| HUD / Continuity | 当前网页会话是否绑定、是否自动继续、恢复或接力 | ChatGPT / z.ai / DeepSeek 页面内 |
-| Control Center | 本机有哪些 workspace / pane / Agent，哪个 pane 是明确人工目标 | Chrome Side Panel |
+| HUD / Continuity | 当前网页在干嘛、Herdr 在干嘛，以及是否开启 Auto 或发送三个预置会话动作 | 支持的 Web AI 页面内 |
+| Control Center | 当前标签页属于哪个 Project / conversation、绑了什么、本机现场怎样、人工明确目标是谁 | Chrome Side Panel |
+| Options | timing / LLM / 语言等低频配置是什么 | Control Center 的“设置” |
 
-HUD 面向“**这个网页会话如何继续**”。
+HUD **不是第二个控制面板**：没有抽屉、workspace picker、binding 编辑、timing 表单，也没有 handoff 按钮；只显示网页状态、Herdr 状态、绑定工作区/窗格数量、Auto 和三个预置手动会话动作。
 
-Control Center 面向“**本机真实工作现场现在是什么**”。
+Control Center 统一负责**当前页面身份、绑定 / 解绑、手动接力、本机详细状态和明确目标选择**。
 
 两者共享同一条 Native Messaging / 本机 IPC 信任链，但不是同一个状态机。
 
 ## 怎么打开
 
-点击浏览器工具栏里的 Herdr 扩展图标，在 Popup 中找到：
-
-```text
-浏览器控制中心
-实时工作区 · 明确窗格目标
-[打开]
-```
-
-点击后 Chrome 会打开 Side Panel。
+点击浏览器工具栏里的 Herdr 扩展图标，Chrome 会直接打开 **浏览器控制中心** Side Panel；中间不再出现旧 Popup。
 
 控制中心沿用扩展 Options 中的语言设置，当前支持：
 
 - English；
 - 简体中文；
 - 日本語。
+
+## “当前页面”跟随浏览器激活标签页
+
+顶部 **当前页面** 卡片是浏览器上下文与本机状态之间的桥。它让既有 binding authority 读取 Chrome 当前激活 tab，并显示：
+
+- 当前受支持站点；
+- ChatGPT Project identity（如果有）；
+- conversation identity（如果有）；
+- 这个 Project / conversation 已绑定的 workspace；
+- 唯一的 workspace 绑定 / 解绑入口；
+- 当前页面支持安全接力时的 **手动接力**。
+
+切换 Chrome 标签页或当前标签页导航后，这张卡会通过 tab activation / navigation event 自动刷新，不做固定频率轮询；相应 workspace 会在本机 workspace 树中高亮。
+
+但它**不会自动改变 Pinned Target**。当前页面 binding 回答“这个网页上下文属于哪个本机 workspace”；Pinned Target 回答“未来人工控制明确针对哪个 pane”。
 
 ## 实时状态从哪里来
 
@@ -146,7 +154,7 @@ stale 后控制中心不会猜测新目标。需要用户重新点击 pane 才�
 
 当前请求有固定上限（40 行 / 4096 字符级别），不会因为一个运行数小时的 terminal 就把完整历史灌进 Side Panel。
 
-## Prompt / Steer / Herdr / Terminal 为什么只显示“操作预览”
+## 提示 Agent / 调整会话 / Herdr API / 终端输入为什么只显示“操作预览”
 
 控制中心已经把未来控制面的交互模型放进 UI，但**当前版本没有开启这些 mutation**。
 
@@ -158,10 +166,10 @@ stale 后控制中心不会猜测新目标。需要用户重新点击 pane 才�
 
 | 模式 | 最终意图 | 当前行为 |
 |---|---|---|
-| Prompt | 向 pinned Agent 发 prompt | 只生成 descriptor，不发送 |
-| Steer | 调整 provider / Agent 方向 | 只生成 descriptor，不发送 |
-| Herdr | 调用 Herdr mutation method | 只生成 descriptor，不执行 |
-| Terminal | 向 terminal 写入文本 / input | 只生成 descriptor，不写入 |
+| 提示 Agent | 通过 Herdr `agent.prompt` 给 pinned Agent 发一条新任务或补充提示 | 只生成 descriptor，不发送 |
+| 调整会话 | 对**已经运行中的** provider / Agent session 调整方向；未来还取决于 provider 是否支持 steer | 只生成 descriptor，不发送 |
+| Herdr API | 指定准备调用的 Herdr control-plane method；未来真正执行前必须通过实时 method schema 与安全检查，不是任意 shell | 只生成 descriptor，不执行，也不声称已经校验 |
+| 终端输入 | 向 pinned terminal pane 写 literal text / input / keys；这是风险最高的路径 | 只生成 descriptor，不写入 |
 
 点击“生成预览”只会展示经过分类的 action descriptor，例如：
 
@@ -233,7 +241,7 @@ HUD
 3. 回到 ChatGPT，让 Web planner 继续通过 MCP / Herdr 工具做实际控制；
 4. ChatGPT 正在回复时如果想到补充要求，使用“排队”而不是中断当前回合；
 5. 当前回复结束后，排队内容优先成为下一条用户消息；
-6. 长任务则由 HUD 的 progress / settled / recovery / handoff 负责连续性。
+6. 长任务由浏览器 continuity engine 维护 progress / settled / recovery / automatic handoff；HUD 只保留状态、Auto 和三个预置动作，手动接力只在“当前页面”。
 
 ## 本机安全模型
 

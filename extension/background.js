@@ -36,7 +36,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.65";
+const H2W_SCRIPT_VERSION = "0.1.66";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -105,18 +105,15 @@ function defaultPartialTemplate() {
 
 function hudLabels() {
   const keys = [
-    "automation", "automation_on", "automation_off", "manual_continue", "manual_status", "manual_judge", "manual_handoff",
-    "manual_continue_hint", "manual_status_hint", "manual_judge_hint", "manual_handoff_hint",
+    "automation_on", "automation_off", "manual_continue", "manual_status", "manual_judge",
+    "manual_continue_hint", "manual_status_hint", "manual_judge_hint",
     "queue_insert", "queue_insert_count", "queue_insert_hint", "queue_need_message", "queue_added", "queue_sent", "queue_waiting",
     "queue_full", "queue_failed", "queue_added_draft_changed", "queue_added_clear_failed", "queue_clear_confirm", "queue_cleared",
-    "controls", "advanced_options", "event_settings",
-    "handoff_started", "handoff_failed", "handoff_binding_required", "handoff_workspace_busy", "handoff_automation_enabled",
-    "automation_on_hint", "automation_off_hint", "conversation_automation_on_hint", "conversation_automation_off_hint", "on", "off", "interval", "fallback", "bindings", "bind", "unbind", "available",
-    "no_workspaces", "workspaces_unavailable", "active", "bound_count", "aria_toggle_automation",
-    "aria_open_controls", "automation_enabled", "automation_disabled", "automation_update_failed",
-    "timing_saved", "timing_save_failed", "bound_to", "unbound_from", "binding_failed", "judge_no_continue",
-    "continue_sent", "continue_failed", "tip_workspace", "tip_agent", "tip_conversation", "tip_state",
-    "tip_recovery", "tip_last_event", "none",
+    "automation_on_hint", "automation_off_hint", "conversation_automation_on_hint", "conversation_automation_off_hint",
+    "aria_toggle_automation", "automation_enabled", "automation_disabled", "automation_update_failed",
+    "judge_no_continue", "continue_sent", "continue_failed",
+    "web_state", "scope_counts", "scope_counts_hint", "scope_unbound",
+    "tip_state", "tip_recovery", "tip_last_event", "none",
     "reason_disabled", "reason_no_conv", "reason_llm_not_configured", "reason_unbound",
     "reason_still_generating", "reason_not_substantive", "reason_empty_assistant", "reason_nudge_loop",
     "reason_same_assistant", "reason_cooldown", "reason_llm_done", "reason_llm_ambiguous",
@@ -125,9 +122,6 @@ function hudLabels() {
   ];
   const out = {};
   for (const suffix of keys) out[suffix] = localizedText(`hud_${suffix}`);
-  for (const key of ["handoff_resume", "handoff_compressing", "handoff_moving", "handoff_project_only"]) {
-    out[key] = localizedText(key);
-  }
   out.states = {};
   for (const state of [
     "unknown", "ready", "bound", "unbound", "offline", "working", "idle", "done", "blocked", "reply_waiting",
@@ -3483,6 +3477,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ? session.filter((binding) => liveWorkspaceIds.has(String(binding.workspace_id || normalizeWorkspaceId(binding) || "")))
         : session;
       const labels = liveSession.map((b) => canonicalWorkspaceLabel(b, liveWorkspaces) || b.workspace_id).filter(Boolean);
+      const boundWorkspaceIds = new Set(liveSession.map((b) => String(b.workspace_id || normalizeWorkspaceId(b) || "")).filter(Boolean));
+      const boundPaneCount = liveWorkspaces.reduce((total, workspace) => {
+        const workspaceId = String(workspace?.id || workspace?.workspace_id || "");
+        if (!boundWorkspaceIds.has(workspaceId)) return total;
+        return total + (Array.isArray(workspace?.panes) ? workspace.panes.length : 0);
+      }, 0);
+      const boundWorkingCount = liveSession.reduce((total, binding) => total + Number(bindingView(binding)?.working_count || 0), 0);
       let llmHost = "";
       try {
         llmHost = CFG.llmJudgeBaseUrl ? new URL(llmJudgeCompletionsUrl(CFG.llmJudgeBaseUrl)).host : "";
@@ -3517,6 +3518,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         active_workspace_label: labels[0] || null,
         workspace_id: session[0]?.workspace_id || (session[0] ? normalizeWorkspaceId(session[0]) : null),
         binding_count: session.length,
+        bound_workspace_count: boundWorkspaceIds.size,
+        bound_pane_count: boundPaneCount,
+        bound_working_count: boundWorkingCount,
         bound_workspace_ids: session.map((b) => b.workspace_id || normalizeWorkspaceId(b)).filter(Boolean),
         bindings: await Promise.all(session.map(async (b) => ({
           ...bindingView(b),
@@ -3529,7 +3533,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           && (!handoffStatusIsActive(transfer?.status) || transferView?.can_resume === true),
         ),
         handoff: transferView,
-        workspaces: liveWorkspaces,
         workspace_source: state?.source || (state?.ok ? "push_state" : null),
         workspace_status: state?.ok ? 200 : (state?.status || 0),
         workspace_error: state?.ok ? null : (state?.error || (state?.status ? `HTTP ${state.status}` : "fetch-failed")),
@@ -3580,62 +3583,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // matching tab to acknowledge the broadcast. A stale or suspended tab
       // can otherwise leave the caller disabled indefinitely even though the
       // preference was already persisted successfully.
-      void notifyAutomationChanged();
-    })();
-    return true;
-  }
-  if (msg?.type === "h2w_popup_set_automation") {
-    void (async () => {
-      const tabId = Number(msg.tabId);
-      if (!Number.isInteger(tabId) || tabId <= 0) {
-        sendResponse({ ok: false, error: "tab-unavailable" });
-        return;
-      }
-      const convInfo = await conversationInfoForTab(tabId);
-      const convKey = String(convInfo?.convKey || "").trim();
-      if (!convKey) {
-        sendResponse({ ok: false, error: "conversation-unavailable" });
-        return;
-      }
-      const enabled = msg.enabled === true;
-      const projectId = String(convInfo?.project_id || "").trim();
-      if (projectId) {
-        if (!/^g-p-[0-9a-f]{32}$/i.test(projectId)) {
-          sendResponse({ ok: false, error: "project_required" });
-          return;
-        }
-        if (enabled && normalizeAutomationMode(CFG.automationMode) !== AUTOMATION_MODE_PROJECT) {
-          CFG = {
-            ...CFG,
-            automationMode: AUTOMATION_MODE_PROJECT,
-            enabled: false,
-            idleNudgeEnabled: false,
-          };
-          await chrome.storage.local.set({
-            automationMode: AUTOMATION_MODE_PROJECT,
-            enabled: false,
-            idleNudgeEnabled: false,
-          });
-        }
-        if (enabled) PROJECT_AUTOMATION[projectId] = true;
-        else delete PROJECT_AUTOMATION[projectId];
-        await chrome.storage.local.set({ [PROJECT_AUTOMATION_STORAGE_KEY]: PROJECT_AUTOMATION });
-      } else {
-        const site = conversationAutomationSiteForConversation(convKey);
-        if (!site) {
-          sendResponse({ ok: false, error: "conversation-automation-unavailable" });
-          return;
-        }
-        if (enabled) CONVERSATION_AUTOMATION[convKey] = true;
-        else delete CONVERSATION_AUTOMATION[convKey];
-        await chrome.storage.local.set({ [CONVERSATION_AUTOMATION_STORAGE_KEY]: CONVERSATION_AUTOMATION });
-      }
-      const bindings = await loadBindings();
-      reconcileProgressTimers(bindings);
-      for (const key of [...idleNudgeRetryTimers.keys()]) {
-        if (!automationScopeForConversation(key).enabled) clearIdleNudgeRetry(key);
-      }
-      sendResponse({ ok: true, ...automationScopeForConversation(convKey) });
       void notifyAutomationChanged();
     })();
     return true;
@@ -3711,7 +3658,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_state") {
     void (async () => {
       const bindings = await loadBindings();
-      // Opening the popup wakes the service worker; restore streams and timers lost to suspension.
+      // Opening a browser control surface wakes the service worker; restore streams and timers lost to suspension.
       void ensureAlive(bindings);
       let convInfo = null;
       if (msg.tabId) {
@@ -3763,7 +3710,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_agents") {
     void (async () => {
-      // Popup workspace list must prefer a fresh state read. The push hello cache
+      // Workspace discovery must prefer a fresh state read. The push hello cache
       // is an optimization for HUD rendering, not the authority for discovery.
       sendResponse(await fetchStateFresh() || { error: "fetch-failed" });
     })();
@@ -3819,6 +3766,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       b.revision = bindingRevision(b);
       bindings[storeKey] = b;
       await saveBindings(bindings);
+      broadcastControlMessage({ type: "herdr_control_binding_changed" });
       ensurePushStream(bindings);
       try { void chrome.tabs.sendMessage(tabId, { type: "h2w_bound", pane: workspace_label, workspace_id, workspace_label }).catch(() => {}); } catch (e) {}
       sendResponse({
@@ -3854,6 +3802,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         clearProgressTimer(storeKey);
       }
       await saveBindings(bindings);
+      broadcastControlMessage({ type: "herdr_control_binding_changed" });
       await restoreTabDiscardabilityIfUnbound(tabId, bindings);
       if (!bindingsForConv(bindings, convKey).length) {
         clearIdleNudgeRetry(convKey);
@@ -4058,7 +4007,16 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 try {
-  chrome.action.onClicked.addListener(() => { void chrome.runtime.openOptionsPage(); });
+  chrome.action.onClicked.addListener((tab) => {
+    const windowId = Number(tab?.windowId);
+    if (chrome.sidePanel?.open && Number.isInteger(windowId) && windowId >= 0) {
+      void chrome.sidePanel.open({ windowId })
+        .catch((error) => callLog("control center action failed:", error?.message || error));
+      return;
+    }
+    callLog("control center action unavailable; opening Options");
+    void chrome.runtime.openOptionsPage();
+  });
 } catch (e) {
   callLog("action click unavailable:", e.message);
 }

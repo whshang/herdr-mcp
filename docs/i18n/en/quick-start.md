@@ -201,7 +201,7 @@ Bind the current Web scope to the Herdr workspace doing the work. New Auto scope
 
 - the correct workspace is bound;
 - the HUD shows the expected state;
-- Browser Control Center opens from Popup and shows the real workspace / panes;
+- clicking the Herdr toolbar icon opens Browser Control Center directly and shows the real workspace / panes;
 - pane create/remove and working/settled changes appear live;
 - ChatGPT Queue can save a next-turn instruction without interrupting the current reply.
 

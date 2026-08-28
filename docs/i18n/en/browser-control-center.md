@@ -6,7 +6,7 @@ It is not a shortcut for giving the browser unrestricted shell access. It solves
 
 > When Web AI, local agents, tests, and terminals are all active, how do you keep the real workstation state visible and make the next human control target explicit?
 
-The current Control Center is **live observation + explicit targeting + bounded reads**. Mutation surfaces remain preview-only, so the presence of Prompt, Steer, Herdr, and Terminal tabs does not bypass existing mutation safety boundaries.
+The current Control Center is **active-page context + live observation + explicit targeting + bounded reads**. Mutation surfaces remain preview-only, so Prompt Agent, Steer Session, Herdr API, and Terminal Input do not bypass existing mutation safety boundaries.
 
 ## How it differs from browser continuity
 
@@ -14,32 +14,40 @@ The extension now has two related but distinct operational surfaces:
 
 | Surface | Main question | Entry point |
 |---|---|---|
-| HUD / Continuity | How should this Web conversation bind, continue, recover, or hand off? | Inside ChatGPT / z.ai / DeepSeek |
-| Control Center | What is happening in local workspaces and which pane is the explicit human target? | Chrome Side Panel |
+| HUD / Continuity | What is this page doing, what is Herdr doing, and should I run Auto or one of the three preset conversation actions? | Inside supported Web AI pages |
+| Control Center | Which Project / conversation is the active tab, what is it bound to, what is happening locally, and which pane is the explicit target? | Chrome Side Panel |
+| Options | What low-frequency timing / model / language settings should apply? | Control Center Settings |
 
-The HUD is about **how this browser conversation continues**.
+The HUD is deliberately **not a second control panel**. It has no drawer, workspace picker, binding editor, timing form, or handoff button. It shows Web state, Herdr state, aggregate bound workspace/pane counts, Auto, and the three preset manual conversation actions.
 
-The Control Center is about **what the real local worksite looks like now**.
+The Control Center owns **active-page identity, binding/unbinding, manual handoff, detailed workstation state, and explicit target selection**.
 
 They share the same Native Messaging and local-IPC trust path, but they are not one state machine.
 
 ## Open the Control Center
 
-Click the Herdr extension icon in the browser toolbar. The Popup exposes:
+Click the Herdr extension icon in the browser toolbar. Chrome opens the **Browser Control Center** Side Panel directly; there is no intermediate extension Popup.
 
-```text
-Browser Control Center
-Live workspaces · explicit pane target
-[Open]
-```
-
-Chrome then opens the Side Panel.
-
-The panel follows the same extension language setting as Popup and Options. Current UI locales are:
+The panel follows the same extension language setting as Options and the in-page HUD. Current UI locales are:
 
 - English;
 - Simplified Chinese;
 - Japanese.
+
+## Current page follows the active browser tab
+
+The top **Current page** card is the bridge between browser context and local state. It asks the existing binding authority for the active Chrome tab and shows:
+
+- supported site;
+- ChatGPT Project identity when present;
+- conversation identity when present;
+- workspace bindings for that Project / conversation;
+- the single UI path to bind or unbind a workspace;
+- **Manual handoff** when the current page supports the safe handoff contract.
+
+Changing Chrome tabs or navigating the active tab updates this card from tab activation/navigation events; there is no fixed polling loop. The corresponding workspace is highlighted in the local workspace tree.
+
+This does **not** retarget an explicit Pinned Target. Active-page binding answers “which local workspace belongs to this Web context”; Pinned Target answers “which exact pane would a future human control action address.”
 
 ## Where live state comes from
 
@@ -144,7 +152,7 @@ Use it to confirm:
 
 The request is deliberately limited (roughly 40 lines / 4096 characters), so a terminal that has run for hours cannot dump unbounded history into the Side Panel.
 
-## Why Prompt / Steer / Herdr / Terminal say “Action preview”
+## Why Prompt Agent / Steer Session / Herdr API / Terminal Input say “Action preview”
 
 The UI already models future control actions, but **those mutations are not enabled in the current release**.
 
@@ -156,10 +164,10 @@ The `Action preview` section contains four modes:
 
 | Mode | Intended future action | Current behavior |
 |---|---|---|
-| Prompt | Prompt the pinned agent | Build a descriptor only; nothing is sent |
-| Steer | Steer a provider / agent | Build a descriptor only; nothing is sent |
-| Herdr | Invoke a Herdr mutation method | Build a descriptor only; nothing executes |
-| Terminal | Write terminal text / input | Build a descriptor only; nothing is written |
+| Prompt Agent | Start or supplement work by sending a new prompt through Herdr `agent.prompt` to the pinned Agent | Build a descriptor only; nothing is sent |
+| Steer Session | Redirect an **already-running** provider / Agent session when that provider supports steer | Build a descriptor only; nothing is sent |
+| Herdr API | Name an intended Herdr control-plane method; future execution must pass the live method schema and safety checks, and is not arbitrary shell | Build a descriptor only; nothing executes or claims validation |
+| Terminal Input | Write literal text / input / keys to the pinned terminal pane; this is the highest-risk path | Build a descriptor only; nothing is written |
 
 `Preview action` returns a classified descriptor containing fields such as:
 
@@ -229,7 +237,7 @@ A typical flow is:
 3. Return to ChatGPT and let the Web planner perform real control through MCP / Herdr tools.
 4. If a new requirement occurs while ChatGPT is still replying, use Queue instead of interrupting the live turn.
 5. Queued content becomes the next user turn after the current reply settles.
-6. For long work, HUD progress / settled / recovery / handoff maintains continuity.
+6. For long work, the browser continuity engine maintains progress / settled / recovery / automatic handoff; the HUD only exposes status, Auto, and three preset manual actions, while Manual handoff stays in Current page.
 
 ## Local security model
 

@@ -50,9 +50,8 @@ The HUD can expose:
 - **Continue** — send a simple continuation to the current Web conversation;
 - **Herdr monitor** — inspect the bound workspace before continuing;
 - **LLM analysis** — ask a small configured model whether the latest reply is clearly unfinished;
-- **Manual handoff** — compact and move to a new conversation where supported.
 
-Continue/monitor/LLM-analysis are manual progression actions and are locked while Auto is on. Manual handoff is the exception: it can start with Auto on or off on supported conversations, pauses source automatic wakes during transfer, and makes the target inherit the source Auto state.
+The HUD exposes only Continue / Herdr monitor / LLM analysis; these manual progression actions are locked while Auto is on. Manual handoff has a single UI entry in **Control Center → Current page** and is the deliberate exception: it can start with Auto on or off on supported conversations, pauses source automatic wakes during transfer, and makes the target inherit the source Auto state.
 
 ## Queue: explicit next-turn user intent comes before auto-continue
 
@@ -221,7 +220,7 @@ It does **not** certify that runtime or Git state is still current. The fresh co
 
 ## Manual handoff
 
-Manual handoff is useful at a natural work boundary before the current conversation becomes difficult to manage.
+Manual handoff is useful at a natural work boundary before the current conversation becomes difficult to manage. Start it from **Control Center → Current page**; it is intentionally not duplicated in the HUD.
 
 It is supported for bound ChatGPT Project conversations and stable z.ai `/c/<chat_id>` conversations. Manual handoff can start with Auto on or off; the target conversation inherits the source Auto state. Automatic wakes from the source pause while the transfer is active. For ChatGPT, cutover changes only the Project binding's active conversation target; for z.ai it migrates the conversation-scoped binding. The workspace must not have active working agents, so settled/wake delivery cannot race the cutover.
 

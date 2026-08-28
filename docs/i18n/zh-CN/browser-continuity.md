@@ -97,6 +97,14 @@ Browser extension
 
 ChatGPT Project 里，连续性的 binding 不再依赖某一个 conversation。workspace 直接绑定稳定 `project_id`，所以可以在 Project 首页先绑定；具体 `/c/<id>` 只作为当前 `active_conv_key`，决定 progress/continue 应投递到哪里。接力时 Project binding 与 continuity id 都不搬家，只在新 seed 确认后切换 active target。
 
+## 人工与自动控制
+
+自动化按作用域管理。全局允许 ChatGPT Project 共享 Auto 后，每个 Project 仍从自己的 HUD 显式开启 / 关闭；普通 ChatGPT conversation、z.ai、DeepSeek 在支持时使用 conversation 级 Auto。所有新作用域默认都是 `自动 关`。
+
+HUD 只有三个预置人工动作：手动继续、提取 Herdr 状态、LLM 判断；开启 Auto 后它们会锁定，避免两个路径同时推进同一会话。**手动接力是例外，但它只有一个 UI 入口：Control Center → 当前页面**。支持的会话可以在 Auto 开 / 关时启动接力；transfer 期间源会话的自动 wake 暂停，目标继承源会话 Auto 状态。
+
+需要人工接管时，可以先关闭 Auto，再从 HUD 手动继续 / 提取 Herdr 状态 / 运行轻量 LLM 判断；需要主动切换会话时，从 Control Center 的“当前页面”启动接力。
+
 ## 为什么不用公网回推
 
 扩展和本机 runtime 在同一台机器上。

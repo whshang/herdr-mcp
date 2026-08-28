@@ -547,4 +547,4 @@ export function interpretLlmJudgeReply(text, opts = null) {
   return { done: false, cont: false, nudgeText: "", raw: t };
 }
 
-/** Popup pace presets removed — use numeric seconds in popup/options (0 = off). */
+/** Legacy pace presets removed — use numeric seconds in Options (0 = off). */
