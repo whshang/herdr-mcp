@@ -49,7 +49,7 @@
 
 走 B 节（公网 ChatGPT）前，先部署**机器专属** Worker：唯一 Worker `name`、唯一 `DEFAULT_WORKSTATION_ID`（如 `pi-uat-<date>`）、`OAUTH_ISSUER` 对应该 Worker URL；Link 侧 `HERDR_WORKSTATION_ID` 与之相同。步骤见 [Agent 协助安装](agent-install.md) §6（Edge 部署 + `LINK_SHARED_SECRET`）；UAT 保持 `workers_dev = true` 与 `routes = []`。
 
-**给 pi 上 coding Agent 的一键复制协议：** [第二台 Mac Agent 提示词](second-mac-agent-prompt.md)（34 条可执行步骤；含 Cloudflare Token 暂停、Link env 覆盖、最终报告模板）。
+**仅内部 GA UAT（非终端用户安装）：** 把 [第二台 Mac GA UAT Agent 协议](../../_wip/zh-CN/second-mac-ga-uat-agent-prompt.md) 复制给 pi 上的 coding Agent（Agent 优先协议；含 Cloudflare Token 暂停、Link env 覆盖、最终报告模板）。普通用户走 [install.md](install.md) 或 [agent-install.md](agent-install.md)。
 
 ## 一键操作者引导（第二台 Mac，默认实例）
 

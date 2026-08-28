@@ -55,6 +55,12 @@ edge/cloudflare/.wrangler/
 # --- Process / scratch notes (not for publishing) ---
 # Keep durable guides under docs/*.md tracked.
 # Put task logs, recon dumps, rewrite checklists in docs/_wip/ only.
-docs/_wip/
+docs/_wip/*
+!docs/_wip/en/
+!docs/_wip/zh-CN/
+docs/_wip/en/*
+!docs/_wip/en/second-mac-ga-uat-agent-prompt.md
+docs/_wip/zh-CN/*
+!docs/_wip/zh-CN/second-mac-ga-uat-agent-prompt.md
 TODO.md
 OPTIMIZATION.md
