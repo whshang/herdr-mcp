@@ -188,7 +188,7 @@ jobs:
           [[ "$source_commit" == "$GITHUB_SHA" ]] || { echo "manifest source_commit does not match tag commit" >&2; exit 1; }
           [[ "$source_ref" == "refs/tags/$GITHUB_REF_NAME" ]] || { echo "manifest source_ref does not match pushed tag" >&2; exit 1; }
           expected_assets="$(jq -c '[.assets[].name] | sort' "$manifest")"
-          actual_assets="$(printf '%s\n' release-assets/herdr-mcp-* | sed 's#.*/##' | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+          actual_assets="$(find release-assets -maxdepth 1 -type f -name 'herdr-mcp-*' ! -name 'herdr-mcp-extension-*' -printf '%f\n' | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')"
           [[ "$actual_assets" == "$expected_assets" ]] || { echo "release bundle binaries do not match manifest assets" >&2; exit 1; }
           release_asset_count="$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
           echo "release_identity_ok tag=$tag commit=$source_commit assets=$(jq '.assets | length' "$manifest") bundle_files=$release_asset_count"
