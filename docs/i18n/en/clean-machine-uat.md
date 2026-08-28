@@ -49,6 +49,8 @@ Public ChatGPT MCP on a **second Mac** is not "reuse dogfood URL + Link secret."
 
 Deploy a **machine-specific** Worker before section B: unique Worker `name`, unique `DEFAULT_WORKSTATION_ID` (e.g. `pi-uat-<date>`), `OAUTH_ISSUER` matching that Worker URL, and set the same `workstation_id` on Link (`HERDR_WORKSTATION_ID`). Follow [Agent-assisted installation](agent-install.md) §6 (Edge deploy + `LINK_SHARED_SECRET`); keep `workers_dev = true` and `routes = []` for UAT.
 
+**Copy-paste contract for a pi coding Agent:** [Second Mac Agent prompt](second-mac-agent-prompt.md) (34 executable steps; Cloudflare Token pause, Link env override, final report template).
+
 ## One-command operator bootstrap (second Mac, default instance)
 
 Replace `TAG` if a newer prerelease is under test:
