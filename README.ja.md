@@ -67,11 +67,13 @@ native Herdr long tail
 - [Herdr](https://herdr.dev) がインストール済み・起動中
 - ChatGPT から公開接続する場合は Cloudflare account
 
+`v0.4.0` の clean-machine 検証済み経路は **macOS Apple Silicon** です。Windows x64 バイナリも Release に含まれますが、Windows の end-to-end UAT はまだ完了していません。`v0.4.0` では Linux runtime を正式対応として宣言していません。
+
 **ローカル MCP runtime** はネイティブバイナリです。実行に Node.js / npm は**不要**です。Node は Cloudflare Edge デプロイ、ブラウザ拡張ツールチェーン、およびこのリポジトリからの貢献者ビルド向けに残ります。
 
 ### ネイティブ runtime のインストール（主経路）
 
-1. [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) から、対象プラットフォームの `herdr-mcp` バイナリをダウンロードします（alpha 期間中は prerelease タグが想定されます）。
+1. [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) から、対象プラットフォームの `herdr-mcp` バイナリをダウンロードします。現在の stable は [`v0.4.0`](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0) です。
 2. `PATH` 上に置き（例: `~/.local/bin/herdr-mcp`）、実行権限を付与します。
 3. マネージドなローカルサービスをインストールして確認します:
 
@@ -92,7 +94,7 @@ herdr-mcp rollback
 
 上記のトップレベルコマンドを優先してください。`herdr-mcp service install` を通常のユーザー向けインストール経路にしないでください。ローカル MCP runtime のインストールに git clone / `npm` / `cargo` を使わないでください。
 
-alpha 期間中は `update.channel = "preview"`（または alpha バイナリで config 未作成）を保ち、prerelease を発見できるようにします。`stable` は non-prerelease のみです。
+現在の stable は **`v0.4.0`** です。通常は `update.channel = "stable"` を使用し、non-prerelease のみを取得します。`preview` は prerelease を意図的に検証するときだけ使用します。
 
 Edge を足す前に Herdr を確認します。
 
@@ -107,13 +109,10 @@ ChatGPT から使う場合は、まず Cloudflare Worker を `workers.dev` に�
 
 ### ローカル Coding Agent に任せる
 
-ローカル Coding Agent にセットアップを任せる場合は、推測させず英語の正本を先に読ませてください。
+ローカル Coding Agent にセットアップを任せる場合は、推測させず英語の end-user protocol を先に読ませてください。
 
 ```text
-Install and deploy herdr-mcp for me. First read:
-https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md
-
-Follow that guide end to end. Install the local runtime from GitHub Releases (not git clone/npm). Use workers.dev for the first install and do not expose or commit secrets.
+Install herdr-mcp for me. Read and follow the full protocol at https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/quick-agent-install.md end to end. Use GitHub Releases for the local runtime (not git clone). Pause only for Cloudflare login/API Token creation. Do not echo or commit secrets.
 ```
 
 ### 付録: 貢献者向けソースビルド
@@ -172,14 +171,16 @@ workstation → Web conversation
 - long-conversation handoff
 - native custom MCP Connector を持たない z.ai / DeepSeek 向けの bounded JSON→MCP bridge
 
-Native Messaging host をインストールします。
+ブラウザ拡張を使う場合は、GitHub Release の versioned extension asset（`v0.4.0` では `herdr-mcp-extension-0.1.68.zip`）を安定したディレクトリへ展開し、インストール済み runtime から Native Messaging host を登録します。Extension version は runtime version と独立しています。
 
 ```bash
-bin/herdr-extension-host install
-bin/herdr-extension-host status
+mkdir -p ~/.config/herdr-mcp/extension
+# Release の zip をこのディレクトリへ展開し、manifest.json が直下にあることを確認
+herdr-mcp native-host install
+herdr-mcp native-host status
 ```
 
-その後 `extension/` を Chrome/Chromium の unpacked extension として読み込みます。
+その後 `~/.config/herdr-mcp/extension` を Chrome/Chromium の unpacked extension として読み込みます。通常ユーザー向け経路では git checkout の `extension/` や `bin/herdr-extension-host` を使いません。
 
 詳細：[Browser continuity](docs/i18n/en/browser-continuity.md) · [Browser extension](docs/i18n/en/extension.md)
 

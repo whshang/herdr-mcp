@@ -129,7 +129,7 @@ bin/herdr-extension-host status
 
 ## 8. macOS 持久 Herdr Link
 
-把 `LINK_SHARED_SECRET` 存进 Keychain，服务名 `herdr-edge-link-<WORKSTATION_ID>`。命令文本只能引用环境变量，不能写字面秘密。优先使用已安装 `herdr-mcp` 二进制提供的托管 Link 安装路径（当前 alpha 的 `herdr-mcp link ...` / 产品文档）。不要把生产 Link 所有权留在仓库 Bash 包装上。
+把 `LINK_SHARED_SECRET` 存进 Keychain，服务名 `herdr-edge-link-<WORKSTATION_ID>`。命令文本只能引用环境变量，不能写字面秘密。优先使用已安装 `herdr-mcp` 二进制提供的托管 Link 安装路径（`herdr-mcp link ...` / 当前 stable 产品文档）。不要把生产 Link 所有权留在仓库 Bash 包装上。
 
 在中国或 `workers.dev` 被 SNI 拦截时，Link WSS 需走系统/显式代理或改用自定义域名。代理变量优先级：`HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`；macOS 还会读取 `scutil --proxy`。完整决策树见 [快速 Agent 安装](quick-agent-install.md) §5。
 

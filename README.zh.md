@@ -71,6 +71,8 @@ Herdr 原生长尾能力
 - 已安装并运行 [Herdr](https://herdr.dev)；
 - 如果要从 ChatGPT 公网连接，需要一个 Cloudflare 账号。
 
+`v0.4.0` 已完成干净机实测的平台是 **macOS Apple Silicon**。Release 同时提供 Windows x64 二进制，但 Windows 端到端 UAT 尚未封板；`v0.4.0` 暂不宣称 Linux runtime 支持。
+
 **本机 MCP runtime** 是原生二进制，运行它**不需要** Node.js / npm。Node 仍可用于 Cloudflare Edge 部署、浏览器扩展工具链，以及从本仓库做贡献者构建。
 
 ### 安装原生 runtime（主路径）
