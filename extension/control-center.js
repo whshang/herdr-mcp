@@ -1,7 +1,15 @@
 import { createBrowserStateStore } from "./browser-state-store.js";
 import { createPinnedTarget, revalidatePinnedTarget } from "./target-pin.js";
 import { ACTION_TYPES, ACTION_RISK, buildActionDescriptor, classifyAction } from "./control-actions.js";
-import { controlCenterStats, createRenderCoalescer, formatElapsed, runtimePresentation, sortWorkspaces } from "./control-center-model.js";
+import {
+  controlCenterStats,
+  createRenderCoalescer,
+  formatElapsed,
+  runtimePresentation,
+  sortWorkspaces,
+  workspaceAggregateStatus,
+  workspaceRowsForPage,
+} from "./control-center-model.js";
 import { boundedTail } from "./browser-state.js";
 import { detectOrLoadLocale, getLocale, t } from "./i18n.js";
 
@@ -16,6 +24,7 @@ let eventStreamHealthy = null;
 let selectedMode = ACTION_TYPES.AGENT_PROMPT;
 let pageContext = { loading: true, tabId: null, windowId: null, response: null, error: null };
 let pageContextRefreshSeq = 0;
+let bindingMutationWorkspaceId = null;
 
 const $ = (id) => document.getElementById(id);
 const runtimeDot = $("runtimeDot");
@@ -25,9 +34,6 @@ const workspaceList = $("workspaceList");
 const pageContextCard = $("pageContextCard");
 const pageContextTitle = $("pageContextTitle");
 const pageContextMeta = $("pageContextMeta");
-const pageBindings = $("pageBindings");
-const pageWorkspaceSelect = $("pageWorkspaceSelect");
-const pageBindButton = $("pageBindButton");
 const pageHandoffButton = $("pageHandoffButton");
 const pageContextHelp = $("pageContextHelp");
 const targetCard = $("targetCard");
@@ -149,14 +155,12 @@ function renderPageContext(state) {
   const bindings = pageContextBindings();
   const supported = Boolean(info?.convKey);
   pageContextCard.classList.toggle("unsupported", !supported);
-  pageBindings.replaceChildren();
-  pageWorkspaceSelect.replaceChildren();
 
   if (pageContext.loading) {
     pageContextTitle.textContent = t("cc_page_loading");
     pageContextMeta.textContent = "";
+    pageContextMeta.title = "";
     pageContextHelp.textContent = t("cc_page_context_help");
-    pageBindButton.disabled = true;
     pageHandoffButton.disabled = true;
     pageHandoffButton.textContent = t("cc_page_handoff");
     return;
@@ -165,14 +169,10 @@ function renderPageContext(state) {
   if (!supported) {
     pageContextTitle.textContent = t("cc_page_unsupported");
     pageContextMeta.textContent = pageContext.error || t("cc_page_unsupported_meta");
+    pageContextMeta.title = "";
     pageContextHelp.textContent = t("cc_page_handoff_unavailable_help");
-    pageBindButton.disabled = true;
     pageHandoffButton.disabled = true;
     pageHandoffButton.textContent = t("cc_page_handoff");
-    const option = document.createElement("option");
-    option.textContent = t("cc_page_select_disabled");
-    option.value = "";
-    pageWorkspaceSelect.appendChild(option);
     return;
   }
 
@@ -181,27 +181,14 @@ function renderPageContext(state) {
   else if (info.project_id) pageContextTitle.textContent = t("cc_page_project_home", { site });
   else pageContextTitle.textContent = t("cc_page_conversation", { site });
 
-  const meta = [];
-  if (info.project_id) meta.push(t("cc_page_project_id", { value: shortIdentity(info.project_id) }));
-  if (info.conversation_id) meta.push(t("cc_page_conversation_id", { value: shortIdentity(info.conversation_id) }));
-  meta.push(bindings.length ? t("cc_page_binding_count", { count: bindings.length }) : t("cc_page_unbound"));
-  pageContextMeta.textContent = meta.join(" · ");
+  pageContextMeta.textContent = bindings.length
+    ? t("cc_page_binding_count", { count: bindings.length })
+    : t("cc_page_unbound");
+  const identity = [];
+  if (info.project_id) identity.push(t("cc_page_project_id", { value: shortIdentity(info.project_id, 48) }));
+  if (info.conversation_id) identity.push(t("cc_page_conversation_id", { value: shortIdentity(info.conversation_id, 48) }));
+  pageContextMeta.title = identity.join(" · ");
 
-  for (const binding of bindings) {
-    const chip = document.createElement("div");
-    chip.className = "binding-chip";
-    const label = document.createElement("span");
-    label.textContent = binding.workspace_label || binding.workspace_id || t("cc_page_unknown_workspace");
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.dataset.unbindWorkspace = binding.workspace_id || "";
-    remove.textContent = t("cc_page_unbind");
-    remove.setAttribute("aria-label", `${t("cc_page_unbind")} ${label.textContent}`);
-    chip.append(label, remove);
-    pageBindings.appendChild(chip);
-  }
-
-  const boundIds = pageContextBindingIds();
   const handoffStatus = String(pageContext.response?.handoff?.status || "");
   const handoffPageSupported = (
     (info.site === "chatgpt" && Boolean(info.project_id) && Boolean(info.conversation_id))
@@ -219,21 +206,6 @@ function renderPageContext(state) {
       ? t("cc_page_handoff_resume")
       : (transferBusy ? t("cc_page_handoff_working") : t("cc_page_handoff")));
 
-  const visibleWorkspaces = sortWorkspaces(state.workspaces || []);
-  const available = visibleWorkspaces.filter((workspace) => !boundIds.has(String(workspace.workspace_id)));
-  const placeholder = document.createElement("option");
-  placeholder.value = "";
-  placeholder.textContent = !visibleWorkspaces.length
-    ? t("cc_page_no_workspaces")
-    : (available.length ? t("cc_page_select_workspace") : t("cc_page_all_bound"));
-  pageWorkspaceSelect.appendChild(placeholder);
-  for (const workspace of available) {
-    const option = document.createElement("option");
-    option.value = workspace.workspace_id;
-    option.textContent = workspace.label || workspace.workspace_id;
-    pageWorkspaceSelect.appendChild(option);
-  }
-  pageBindButton.disabled = !available.length || !pageWorkspaceSelect.value;
   let handoffHelp = t("cc_page_context_help");
   if (!handoffPageSupported) {
     if (info.site === "chatgpt") handoffHelp = t("cc_page_handoff_project_required");
@@ -315,7 +287,8 @@ function renderRuntime(state) {
 function renderWorkspaceTree(state) {
   seedExpansion(state);
   workspaceList.replaceChildren();
-  const workspaces = sortWorkspaces(state.workspaces || []);
+  const pageBoundIds = pageContextBindingIds();
+  const workspaces = workspaceRowsForPage(state.workspaces || [], pageContextBindings());
   if (!workspaces.length) {
     const empty = document.createElement("div");
     empty.className = "empty";
@@ -325,43 +298,68 @@ function renderWorkspaceTree(state) {
   }
 
   const fragment = document.createDocumentFragment();
-  const pageBoundIds = pageContextBindingIds();
+  const pageSupported = Boolean(pageContextInfo()?.convKey && pageContext.tabId && !pageContext.loading);
+  const bindingBusy = Boolean(bindingMutationWorkspaceId);
   for (const workspace of workspaces) {
+    const workspaceId = String(workspace.workspace_id);
+    const workspaceName = workspace.label || workspaceId;
+    const contextBound = pageBoundIds.has(workspaceId);
+    const bindingMissing = workspace.binding_missing === true;
     const section = document.createElement("section");
-    const contextBound = pageBoundIds.has(String(workspace.workspace_id));
-    section.className = `workspace${contextBound ? " context-bound" : ""}`;
-    section.dataset.workspaceId = workspace.workspace_id;
+    section.className = `workspace${contextBound ? " context-bound" : ""}${bindingMissing ? " binding-missing" : ""}`;
+    section.dataset.workspaceId = workspaceId;
 
-    const header = document.createElement("button");
-    header.type = "button";
+    const header = document.createElement("div");
     header.className = "workspace-header";
-    header.dataset.workspaceToggle = workspace.workspace_id;
-    const expanded = expandedWorkspaces.has(workspace.workspace_id);
+    const expanded = !bindingMissing && expandedWorkspaces.has(workspaceId);
+
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "workspace-toggle";
+    toggle.dataset.workspaceToggle = workspaceId;
+    toggle.disabled = bindingMissing;
+    toggle.setAttribute("aria-expanded", String(expanded));
 
     const chevron = document.createElement("span");
     chevron.className = "chevron";
-    chevron.textContent = expanded ? "▾" : "▸";
+    chevron.textContent = bindingMissing ? "·" : (expanded ? "▾" : "▸");
+    const stateDot = document.createElement("span");
+    stateDot.className = bindingMissing ? "dot stale" : `dot ${statusDotClass(workspaceAggregateStatus(workspace))}`;
     const name = document.createElement("span");
     name.className = "workspace-name";
-    name.textContent = workspace.label || workspace.workspace_id;
+    name.textContent = workspaceName;
     const id = document.createElement("span");
     id.className = "workspace-id";
-    id.textContent = `(${workspace.workspace_id})`;
+    id.textContent = `(${workspaceId})`;
     const count = document.createElement("span");
     count.className = "workspace-count";
     const workingCount = (workspace.panes || []).filter((pane) => pane.status === "working").length;
-    count.textContent = t("cc_workspace_count", {
-      panes: workspace.panes?.length || 0,
-      working: workingCount,
-    });
-    if (contextBound) {
-      const boundBadge = document.createElement("span");
-      boundBadge.className = "context-bound-badge";
-      boundBadge.textContent = t("cc_page_bound_badge");
-      header.append(chevron, name, id, boundBadge, count);
-    } else {
-      header.append(chevron, name, id, count);
-    }
+    count.textContent = bindingMissing
+      ? t("cc_workspace_not_visible")
+      : t("cc_workspace_count", {
+        panes: workspace.panes?.length || 0,
+        working: workingCount,
+      });
+    toggle.append(chevron, stateDot, name, id, count);
+
+    const bindingToggle = document.createElement("button");
+    bindingToggle.type = "button";
+    bindingToggle.className = `workspace-binding-toggle${bindingMutationWorkspaceId === workspaceId ? " binding-busy" : ""}`;
+    bindingToggle.dataset.workspaceBindingAction = workspaceId;
+    bindingToggle.setAttribute("aria-pressed", String(contextBound));
+    bindingToggle.disabled = !pageSupported || bindingBusy;
+    bindingToggle.textContent = bindingMutationWorkspaceId === workspaceId
+      ? t("cc_workspace_binding_updating")
+      : (contextBound ? t("cc_workspace_bound") : t("cc_workspace_bind"));
+    bindingToggle.title = !pageSupported
+      ? t("cc_workspace_binding_disabled")
+      : (contextBound
+        ? t("cc_workspace_unbind_hint", { workspace: workspaceName })
+        : t("cc_workspace_bind_hint", { workspace: workspaceName }));
+    bindingToggle.setAttribute("aria-label", contextBound
+      ? t("cc_workspace_unbind_aria", { workspace: workspaceName })
+      : t("cc_workspace_bind_aria", { workspace: workspaceName }));
+    header.append(toggle, bindingToggle);
     section.appendChild(header);
 
     if (expanded) {
@@ -501,42 +499,33 @@ pageHandoffButton.addEventListener("click", async () => {
   renderPageContext(store.get());
 });
 
-pageWorkspaceSelect.addEventListener("change", () => {
-  pageBindButton.disabled = !pageContextInfo()?.convKey || !pageWorkspaceSelect.value;
-});
-
-pageBindButton.addEventListener("click", async () => {
+async function mutateWorkspaceBinding(workspaceId) {
   const info = pageContextInfo();
-  const workspaceId = pageWorkspaceSelect.value;
-  if (!info?.convKey || !pageContext.tabId || !workspaceId) return;
+  if (!info?.convKey || !pageContext.tabId || !workspaceId || bindingMutationWorkspaceId) return;
+  const currentlyBound = pageContextBindingIds().has(String(workspaceId));
   const workspace = (store.get().workspaces || []).find((row) => String(row.workspace_id) === String(workspaceId));
-  pageBindButton.disabled = true;
-  const response = await bg({
-    type: "h2w_bind",
-    tabId: pageContext.tabId,
-    convKey: info.convKey,
-    workspace_id: workspaceId,
-    workspace_label: workspace?.label || workspaceId,
-  });
-  const actionError = !response?.ok && response?.error !== "already-bound"
-    ? t("cc_page_bind_failed", { error: response?.error || "unknown" })
-    : null;
-  await refreshPageContext();
-  if (actionError) { pageContext.error = actionError; renderPageContext(store.get()); }
-});
+  if (!currentlyBound && !workspace) return;
+  bindingMutationWorkspaceId = String(workspaceId);
+  renderAll();
 
-pageBindings.addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-unbind-workspace]");
-  if (!button) return;
-  const info = pageContextInfo();
-  const workspaceId = button.dataset.unbindWorkspace;
-  if (!info?.convKey || !workspaceId) return;
-  button.disabled = true;
-  const response = await bg({ type: "h2w_unbind", convKey: info.convKey, workspace_id: workspaceId });
-  const actionError = !response?.ok ? t("cc_page_unbind_failed", { error: response?.error || "unknown" }) : null;
+  const response = currentlyBound
+    ? await bg({ type: "h2w_unbind", convKey: info.convKey, workspace_id: workspaceId })
+    : await bg({
+      type: "h2w_bind",
+      tabId: pageContext.tabId,
+      convKey: info.convKey,
+      workspace_id: workspaceId,
+      workspace_label: workspace.label || workspaceId,
+    });
+  const actionError = !response?.ok && response?.error !== "already-bound"
+    ? t(currentlyBound ? "cc_page_unbind_failed" : "cc_page_bind_failed", { error: response?.error || "unknown" })
+    : null;
+
   await refreshPageContext();
-  if (actionError) { pageContext.error = actionError; renderPageContext(store.get()); }
-});
+  bindingMutationWorkspaceId = null;
+  if (actionError) pageContext.error = actionError;
+  renderAll();
+}
 
 try {
   chrome.tabs.onActivated.addListener(() => { void refreshPageContext(); });
@@ -627,6 +616,11 @@ function connectControlPort(reconcile = false) {
 }
 
 workspaceList.addEventListener("click", async (event) => {
+  const bindingAction = event.target.closest?.("[data-workspace-binding-action]");
+  if (bindingAction) {
+    await mutateWorkspaceBinding(bindingAction.dataset.workspaceBindingAction);
+    return;
+  }
   const toggle = event.target.closest?.("[data-workspace-toggle]");
   if (toggle) {
     const workspaceId = toggle.dataset.workspaceToggle;

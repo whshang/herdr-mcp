@@ -36,19 +36,20 @@
       </div>
       <div id="pageContextTitle" class="page-context-title" data-i18n="cc_page_loading">Reading active tab…</div>
       <div id="pageContextMeta" class="page-context-meta"></div>
-      <div id="pageBindings" class="page-bindings"></div>
-      <div class="page-bind-row">
-        <select id="pageWorkspaceSelect" aria-label="Workspace to bind" data-i18n-aria="cc_page_workspace_select_aria"></select>
-        <button id="pageBindButton" type="button" class="primary" disabled data-i18n="cc_page_bind">Bind</button>
-      </div>
       <div class="page-actions">
         <button id="pageHandoffButton" type="button" class="ghost" disabled data-i18n="cc_page_handoff">Manual handoff</button>
       </div>
       <div id="pageContextHelp" class="page-context-help" data-i18n="cc_page_context_help">Switching browser tabs updates this context automatically. It does not retarget the pinned control target.</div>
     </section>
 
-    <section id="workspaceList" class="workspace-list" aria-label="Herdr workspaces" data-i18n-aria="cc_workspace_aria">
-      <div class="empty" data-i18n="cc_loading">Loading local Herdr state…</div>
+    <section class="workspace-panel" aria-label="Herdr workspaces" data-i18n-aria="cc_workspace_aria">
+      <div class="workspace-panel-heading">
+        <strong data-i18n="cc_workspaces_heading">Workspaces</strong>
+        <span data-i18n="cc_workspaces_binding_hint">Live state · current-page binding</span>
+      </div>
+      <div id="workspaceList" class="workspace-list">
+        <div class="empty" data-i18n="cc_loading">Loading local Herdr state…</div>
+      </div>
     </section>
 
     <section class="control-dock" aria-label="Pinned control target" data-i18n-aria="cc_target_aria">

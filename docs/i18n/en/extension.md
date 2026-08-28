@@ -117,8 +117,8 @@ bin/herdr-extension-host status
 
 5. Open ChatGPT, z.ai, DeepSeek, or another currently supported page.
 6. Click the Herdr toolbar icon and confirm **Browser Control Center** opens directly in Chrome Side Panel.
-7. In **Browser Control Center**, confirm the active tab is recognized as the intended Project / conversation and bind it to the Herdr workspace there.
-8. Confirm the local runtime is reachable and live workspace / pane state is visible. Switching tabs should update the Current page card without changing an explicit Pinned Target.
+7. In **Browser Control Center**, confirm the active tab is recognized as the intended Project / conversation, then bind it directly from the matching workspace row below; binding state and live workspace state share that row.
+8. Confirm the local runtime is reachable and live workspace / pane state is visible. Switching tabs should update both the Current page card and workspace binding highlight without changing an explicit Pinned Target.
 
 ### Developer path
 

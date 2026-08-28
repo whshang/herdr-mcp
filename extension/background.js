@@ -36,7 +36,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.68";
+const H2W_SCRIPT_VERSION = "0.1.69";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",

@@ -41,11 +41,12 @@ Control Center 统一负责**当前页面身份、绑定 / 解绑、手动接力
 - 当前受支持站点；
 - ChatGPT Project identity（如果有）；
 - conversation identity（如果有）；
-- 这个 Project / conversation 已绑定的 workspace；
-- 唯一的 workspace 绑定 / 解绑入口；
+- 这个 Project / conversation 当前绑定了多少个 workspace；
 - 始终可发现的 **手动接力**。当前页面不支持、尚未绑定、Herdr 仍在工作或还没进入具体会话时，按钮保留但禁用，并直接解释原因。
 
-切换 Chrome 标签页或当前标签页导航后，这张卡会通过 tab activation / navigation event 自动刷新，不做固定频率轮询；相应 workspace 会在本机 workspace 树中高亮。
+绑定 / 解绑不再在“当前页面”卡里复制一套 selector / chip。唯一入口就是下方 **workspace 行右侧的绑定 toggle**：状态和绑定在同一行完成识别与操作。
+
+切换 Chrome 标签页或当前标签页导航后，这张卡会通过 tab activation / navigation event 自动刷新，不做固定频率轮询；相应 workspace 会排到本机 workspace 列表前部并高亮。
 
 但它**不会自动改变 Pinned Target**。当前页面 binding 回答“这个网页上下文属于哪个本机 workspace”；Pinned Target 回答“未来人工控制明确针对哪个 pane”。
 
@@ -91,13 +92,20 @@ Side Panel 隐藏时会减少无意义 DOM 工作；重新可见或事件流重�
 
 这避免了一个高风险问题：**用户以为下一条命令发给 A，实际因为焦点变化发给了 B。**
 
-## Workspace / Pane 树里能看到什么
+## Workspace 状态和当前页面绑定是一张列表
 
-控制中心按 workspace 展开 pane。
-
-当前展示包括：
+控制中心不再把“workspace 状态”和“当前页面绑定”拆成两套 UI。每个 workspace 行同时显示：
 
 - workspace label / id；
+- workspace 聚合状态点；
+- pane 数量与 working 数量；
+- 当前页面是否绑定到这个 workspace；
+- 唯一的 **绑定 / ✓ 已绑定** toggle。
+
+当前页面已经绑定的 workspace 会排在列表前部并高亮。点击 workspace 行主体只负责展开 / 收起 pane；点击右侧绑定 toggle 只负责 bind / unbind，两种操作不会互相触发。绑定 mutation 在 UI 内串行化，避免连续点击制造难以判断的中间状态。若已绑定 workspace 已关闭或暂时不在 runtime snapshot 中，仍保留一个“当前不可见”的绑定行，允许直接解绑，不会把失效绑定藏起来。
+
+展开后继续展示 pane 级明细：
+
 - pane id；
 - Agent 名称，或 terminal-only；
 - working / idle / done / blocked 等状态；
@@ -107,7 +115,7 @@ Side Panel 隐藏时会减少无意义 DOM 工作；重新可见或事件流重�
 - 最近活动时间；
 - 最近一条有界摘要 / terminal title。
 
-有 working pane 的 workspace 优先展示；初次打开会展开有限数量的 workspace，避免大量项目同时存在时把面板撑成不可读的长列表。
+初次打开只展开有限数量的 workspace，避免大量项目同时存在时把面板撑成不可读的长列表。切换浏览器 tab 会更新绑定排序与高亮，但不会改变 Pinned Target。
 
 ## Pin 一个明确目标
 

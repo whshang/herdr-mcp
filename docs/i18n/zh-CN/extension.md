@@ -119,8 +119,8 @@ bin/herdr-extension-host status
 
 5. 打开 ChatGPT、z.ai、DeepSeek 或其它当前支持页面。
 6. 点击浏览器工具栏里的 Herdr 图标，确认 **浏览器控制中心**直接在 Chrome Side Panel 打开。
-7. 在 **浏览器控制中心**确认“当前页面”识别到了正确 Project / conversation，并在这里绑定 Herdr workspace。
-8. 确认本机 runtime 在线、workspace / pane 状态实时可见；切换浏览器标签页时“当前页面”应自动切换，但明确固定的 Pinned Target 不会跟着改变。
+7. 在 **浏览器控制中心**确认“当前页面”识别到了正确 Project / conversation，然后直接在下方对应 workspace 行点击“绑定”；绑定状态和实时 workspace 状态在同一行显示。
+8. 确认本机 runtime 在线、workspace / pane 状态实时可见；切换浏览器标签页时“当前页面”和 workspace 绑定高亮应自动切换，但明确固定的 Pinned Target 不会跟着改变。
 
 ### 开发者路径
 
