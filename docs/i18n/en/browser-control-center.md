@@ -18,9 +18,9 @@ The extension now has two related but distinct operational surfaces:
 | Control Center | Which Project / conversation is the active tab, what is it bound to, what is happening locally, and which pane is the explicit target? | Chrome Side Panel |
 | Options | What low-frequency timing / model / language settings should apply? | Control Center Settings |
 
-The HUD is deliberately **not a second control panel**. It has no drawer, workspace picker, binding editor, timing form, or handoff button. It shows Web state, Herdr state, one compact binding badge (`🔗N`), Auto, and the three preset manual conversation actions. Pane and Agent detail stays in the Control Center.
+The HUD is deliberately **not a second control panel**. It has no drawer, workspace picker, binding editor, timing form, or local Herdr mutation controls. It shows Web state, Herdr state, one compact binding badge (`🔗N`), Auto, the three preset progression actions, and Manual handoff because those actions operate on the current web conversation. Pane and Agent detail stays in the Control Center.
 
-The Control Center owns **active-page identity, binding/unbinding, manual handoff, detailed workstation state, and explicit target selection**.
+The Control Center owns **active-page identity, binding/unbinding, detailed workstation state, and explicit local target selection**. Manual handoff is intentionally owned by the in-page HUD.
 
 They share the same Native Messaging and local-IPC trust path, but they are not one state machine.
 
@@ -42,7 +42,6 @@ The top **Current page** card is the bridge between browser context and local st
 - ChatGPT Project identity when present;
 - conversation identity when present;
 - how many workspaces are currently bound to that Project / conversation;
-- an always-discoverable **Manual handoff** action. When the current page is unsupported, unbound, busy, or not yet a concrete conversation, the action stays visible but disabled and explains why.
 
 Bind / unbind is no longer duplicated inside the Current page card as chips plus a selector. The single path is the **binding toggle on each workspace row below**, so live state and page binding are read and changed in the same place.
 
@@ -250,7 +249,7 @@ A typical flow is:
 3. Return to ChatGPT and let the Web planner perform real control through MCP / Herdr tools.
 4. If a new requirement occurs while ChatGPT is still replying, use Queue instead of interrupting the live turn.
 5. Queued content becomes the next user turn after the current reply settles.
-6. For long work, the browser continuity engine maintains progress / settled / recovery / automatic handoff; the HUD only exposes page-scoped status, Auto, and three preset manual actions, while binding and Manual handoff stay in the Side Panel.
+6. For long work, the browser continuity engine maintains progress / settled / recovery / automatic handoff; the HUD exposes page-scoped status, Auto, the three preset progression actions, and Manual handoff, while binding and local Herdr control stay in the Side Panel.
 
 ## Local security model
 

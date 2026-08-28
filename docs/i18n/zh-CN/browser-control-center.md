@@ -18,9 +18,9 @@
 | Control Center | 当前标签页属于哪个 Project / conversation、绑了什么、本机现场怎样、人工明确目标是谁 | Chrome Side Panel |
 | Options | timing / LLM / 语言等低频配置是什么 | Control Center 的“设置” |
 
-HUD **不是第二个控制面板**：没有抽屉、workspace picker、binding 编辑、timing 表单，也没有 handoff 按钮；只显示网页状态、Herdr 状态、一个紧凑的绑定徽标（`🔗N`）、Auto 和三个预置手动会话动作。pane / Agent 明细只在 Control Center 展示。
+HUD **不是第二个控制面板**：没有抽屉、workspace picker、binding 编辑、timing 表单，也没有本地 Herdr mutation 控件；它显示网页状态、Herdr 状态、一个紧凑的绑定徽标（`🔗N`）、Auto、三个预置推进动作和“手动接力”，因为这些操作都直接作用于当前网页会话。pane / Agent 明细只在 Control Center 展示。
 
-Control Center 统一负责**当前页面身份、绑定 / 解绑、手动接力、本机详细状态和明确目标选择**。
+Control Center 统一负责**当前页面身份、绑定 / 解绑、本机详细状态和明确的本地目标选择**；手动接力由页面 HUD 负责。
 
 两者共享同一条 Native Messaging / 本机 IPC 信任链，但不是同一个状态机。
 
@@ -42,7 +42,6 @@ Control Center 统一负责**当前页面身份、绑定 / 解绑、手动接力
 - ChatGPT Project identity（如果有）；
 - conversation identity（如果有）；
 - 这个 Project / conversation 当前绑定了多少个 workspace；
-- 始终可发现的 **手动接力**。当前页面不支持、尚未绑定、Herdr 仍在工作或还没进入具体会话时，按钮保留但禁用，并直接解释原因。
 
 绑定 / 解绑不再在“当前页面”卡里复制一套 selector / chip。唯一入口就是下方 **workspace 行右侧的绑定 toggle**：状态和绑定在同一行完成识别与操作。
 
@@ -252,7 +251,7 @@ Control Center · 本地 Herdr 目标
 3. 回到 ChatGPT，让 Web planner 继续通过 MCP / Herdr 工具做实际控制；
 4. ChatGPT 正在回复时如果想到补充要求，使用“排队”而不是中断当前回合；
 5. 当前回复结束后，排队内容优先成为下一条用户消息；
-6. 长任务由浏览器 continuity engine 维护 progress / settled / recovery / automatic handoff；HUD 只保留页面级状态、Auto 和三个预置动作，绑定与手动接力留在 Side Panel。
+6. 长任务由浏览器 continuity engine 维护 progress / settled / recovery / automatic handoff；HUD 保留页面级状态、Auto、三个预置推进动作和手动接力，绑定与本地 Herdr 控制留在 Side Panel。
 
 ## 本机安全模型
 

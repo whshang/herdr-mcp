@@ -59,7 +59,7 @@ The **Queue** control beside the ChatGPT composer means “send this user intent
 | Queue | Preserve a clear next-turn user message while the current turn is still running |
 | Options | Language, continuity timing, optional LLM judge, other low-frequency settings |
 
-Binding / unbinding and manual handoff live in Control Center. The HUD stays compact rather than duplicating Side Panel management UI.
+Binding / unbinding and local Herdr controls live in Control Center. Manual handoff lives in the compact HUD because it acts on the current web conversation; the HUD still does not duplicate Side Panel binding or local-control UI.
 
 ## Security architecture
 

@@ -57,7 +57,7 @@ ChatGPT composer 旁的 **“排队”** 表示“等当前回复结束后，再
 | Queue / 排队 | 当前回复结束后发送明确下一轮用户消息 |
 | Options | 语言、continuity timing、可选 LLM judge 等低频配置 |
 
-绑定 / 解绑与手动接力统一放在 Control Center；HUD 保持紧凑，不重复 Side Panel 的管理 UI。
+绑定 / 解绑与本地 Herdr 控制统一放在 Control Center；手动接力放在紧凑 HUD，因为它直接作用于当前网页会话。HUD 仍不复制 Side Panel 的绑定或本地控制 UI。
 
 ## 安全架构
 

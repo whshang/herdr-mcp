@@ -153,7 +153,7 @@ Do not treat the extension as another planner.
 
 New automation scopes default off. Enable Auto only after you have confirmed the binding and event stream are correct.
 
-The HUD's three preset manual progression actions are mutually exclusive with Auto. **Manual handoff is intentionally different and lives only in Control Center → Current page:** where supported, it can start with Auto on or off, pauses source automatic wakes during the transfer, and makes the new conversation inherit the source Auto state.
+The HUD's three preset manual progression actions are mutually exclusive with Auto. **Manual handoff is intentionally different and lives only in the HUD:** where supported, it can start with Auto on or off, pauses source automatic wakes during the transfer, and makes the new conversation inherit the source Auto state.
 
 A handoff packet is historical context; the target conversation still re-checks Herdr/Git/runtime before mutation.
 

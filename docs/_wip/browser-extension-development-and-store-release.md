@@ -26,7 +26,7 @@ Herdr workspace / pane / agent
 
 当前扩展名称：`herdr → Web wake`。
 
-当前开发版本：`0.1.71`。`0.1.69` 首次上传 Chrome Web Store 时因 manifest `description` 超过 132 字符被拒；`0.1.70` 完成 Store 合规修正，`0.1.71` 继续收紧 HUD / Side Panel 的职责边界与信息密度。
+当前开发版本：`0.1.72`。`0.1.69` 首次上传 Chrome Web Store 时因 manifest `description` 超过 132 字符被拒；`0.1.70` 完成 Store 合规修正，`0.1.71` 收紧 HUD / Side Panel 的职责边界与信息密度；`0.1.72` 将手动接力归回 HUD，并增加对话硬上限时的已配置 LLM 摘要兜底。
 
 核心能力包括：
 
@@ -771,7 +771,7 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 截至 2026-08-28：
 
 - 浏览器扩展继续以 unpacked development build 方式开发；
-- 浏览器扩展开发版本已进入 `0.1.71`；Side Panel 是 binding / unbinding、手动接力与本机详细状态的主入口，底部固定本地 Herdr target；HUD 保持当前网页会话的紧凑状态与快捷动作面；
+- 浏览器扩展开发版本已进入 `0.1.72`；Side Panel 是 binding / unbinding 与本机详细状态的主入口，底部固定本地 Herdr target；HUD 保持当前网页会话的紧凑状态、快捷推进和手动接力动作面；
 - Browser Control Center Phase A 与 pane lifecycle 已进入 main，0.1.65 进一步补齐 en / zh / ja、Pinned Target / Preview-only 产品文案与 Settings 入口；
 - ChatGPT Queued Insert 已进入 main，正式用户文档使用“排队 / Queue”描述其 next-turn 语义；
 - Chrome Web Store 首次发布流程**已经启动**；Developer Dashboard publisher 已可用，Store item 已创建；

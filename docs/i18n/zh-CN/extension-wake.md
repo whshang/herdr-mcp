@@ -69,7 +69,7 @@ HUD 提供几类显式操作：
 - **herdr监控**：先读取绑定 workspace 的实时状态，再把结果带回网页；
 - **LLM 分析**：用 Options 中配置的小模型判断当前回复是否仍有明显未完成工作；
 
-HUD 只保留 `继续 / 查 Herdr / LLM 判断` 三个页面级人工推进动作，当前作用域 `自动 开` 时会锁定，避免和自动状态机同时推进同一会话。workspace 绑定与手动接力留在 Side Panel。**手动接力只有一个 UI 入口：Control Center → 当前页面**；它是例外，支持的会话在 `自动 开/关` 两种状态都可启动，transfer 期间源会话自动 wake 暂停，target 继承 source 的 Auto 状态。
+HUD 提供 `继续 / 查 Herdr / LLM 判断` 三个页面级推进动作和“手动接力”。前三个动作在当前作用域 `自动 开` 时会锁定，避免和自动状态机同时推进同一会话；手动接力在安全门通过时仍可使用。workspace 绑定和本地 Herdr 控制留在 Side Panel。**手动接力只有一个 UI 入口：HUD**；transfer 期间源会话自动 wake 暂停，target 继承 source 的 Auto 状态。
 
 ## 排队：用户下一轮意图优先于自动继续
 
@@ -278,13 +278,15 @@ ChatGPT 还会虚拟化旧 DOM，所以“当前页面只挂着 5 条消息”�
 
 ## 手动接力
 
-手动接力从 **Control Center → 当前页面**启动，不在 HUD 重复入口。它适用于：
+手动接力从页面 **HUD 的“接力”**启动，Side Panel 不再复制这个会话操作。它适用于：
 
 - 你知道这条 conversation 已经很长；
 - 当前工作已经到自然边界；
 - 想主动在状态还清晰时换到新会话。
 
 当前支持已绑定的 ChatGPT Project，以及稳定 `/c/<chat_id>` 的 z.ai 会话。手动接力在当前作用域 `自动 开` 或 `自动 关` 时都可以启动；新目标会话继承源会话的 Auto 状态。ChatGPT 接力只切换 Project binding 的 active target；z.ai 才迁移会话级 binding。接力期间源会话的自动 wake 暂停，workspace 仍有 working Agent 时则拒绝开始，避免 settled/wake 与 cutover 竞争。
+
+正常情况下仍优先让当前网页主模型生成 handoff packet，因为它持有最完整的会话上下文。如果页面已经显示单次对话硬上限、接力 prompt 无法提交，或者主模型在有界等待后已停止生成但仍没有给出摘要，Herdr 会改用 Options 中已配置的 OpenAI-compatible LLM 兜底。兜底模型接收经过上限裁剪的 user/assistant 会话 transcript，仍必须输出同一个经过校验的 `HERDR_HANDOFF_V1` packet，之后继续复用原有 target / seed / binding / continuity commit 安全链。
 
 z.ai 的 handoff 控制消息走 raw channel，不经过 JSON→MCP task wrapper，避免摘要请求被误解释成 coding task。
 

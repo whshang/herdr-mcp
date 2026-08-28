@@ -23,7 +23,7 @@ import {
   conversationInfoFromSupportedUrl,
 } from "../../extension/binding-core.js";
 import {
-  buildHandoffRequest, buildHandoffSeed, chatGptConversationInfo,
+  buildHandoffFallbackPrompt, buildHandoffRequest, buildHandoffSeed, chatGptConversationInfo,
   classifyHandoffAssistantReply, extractHandoffPacket, handoffSeedContainsTransfer,
   newContinuityId, newTransferId,
 } from "../../extension/continuity-core.js";
@@ -71,9 +71,9 @@ const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.71", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.71"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.71"'), "content version matches manifest");
+ok(manifest.version === "0.1.72", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.72"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.72"'), "content version matches manifest");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")
@@ -228,13 +228,13 @@ ok(
     && wakeSource.includes("manual-continue")
     && wakeSource.includes("manual-status")
     && wakeSource.includes("manual-judge")
+    && wakeSource.includes("manual-handoff")
     && wakeSource.includes('class="quick"')
     && !wakeSource.includes('class="panel" part="panel"')
     && !wakeSource.includes("h2w_bind")
     && !wakeSource.includes("h2w_unbind")
-    && !wakeSource.includes("manual-handoff")
     && !wakeSource.includes("saveHudTiming"),
-  "HUD is one compact status/Auto/preset-action path with no drawer, binding UI, timing UI, or handoff",
+  "HUD stays compact while owning current-web-conversation actions including handoff, with no binding or local-control drawer",
 );
 ok(
   wakeSource.includes("hudBoundRuntimeState")
@@ -302,16 +302,27 @@ ok(
   "manual JSON bridge is site/sender scoped while automation uses the effective Project/conversation state",
 );
 ok(
-  controlCenterSource.includes('type: "h2w_handoff_start"')
-    && controlCenterSource.includes('trigger: "manual"')
-    && controlCenterHtml.includes('id="pageHandoffButton"')
-    && !wakeSource.includes("manualHandoffAction")
-    && !wakeSource.includes('trigger: "manual"')
+  wakeSource.includes("manualHandoffAction")
+    && wakeSource.includes('class="manual manual-handoff"')
+    && wakeSource.includes('type: "h2w_handoff_start"')
+    && wakeSource.includes('trigger: "manual"')
     && wakeSource.includes('trigger: "context_pressure"')
     && wakeSource.includes('trigger: "recovery_exhausted"')
+    && !controlCenterHtml.includes('id="pageHandoffButton"')
+    && !controlCenterSource.includes('type: "h2w_handoff_start"')
     && backgroundSource.includes("h2w_handoff_seed")
     && backgroundSource.includes("h2w_handoff_probe"),
-  "manual handoff has one UI path in the Side Panel and reuses the existing safe handoff internals",
+  "manual handoff has one current-conversation UI path in the HUD and reuses the existing safe handoff internals",
+);
+ok(
+  backgroundSource.includes("HANDOFF_FALLBACK_ALARM_PREFIX")
+    && backgroundSource.includes("handleTimedHandoffSummaryFallback")
+    && backgroundSource.includes('summary_source: "llm_fallback"')
+    && backgroundSource.includes("buildHandoffFallbackPrompt")
+    && wakeSource.includes("visibleConversationLimitSignal")
+    && wakeSource.includes("handoffBlocked")
+    && wakeSource.includes("transcript: server?.ok && server.transcript"),
+  "handoff uses a bounded conversation snapshot and configured LLM fallback only for hard-limit or failed/stalled primary summaries",
 );
 ok(
   backgroundSource.includes('manual_handoff_available: Boolean(chatgpt.project_id && chatgpt.conversation_id)')
@@ -461,6 +472,16 @@ console.log("\n[conversation continuity]");
   });
   ok(request.includes(`<<<HERDR_HANDOFF_V1 id=${transferId}>>>`) && request.includes("herdr-mcp (w5W)"),
     "handoff request carries transfer marker and bound workspace context");
+  const fallbackPrompt = buildHandoffFallbackPrompt({
+    transferId,
+    bindings: [{ workspace_id: "w5W", workspace_label: "herdr-mcp (w5W)" }],
+    transcript: "[user]\nImplement the browser change.\n\n[assistant]\nThe HUD work is in progress.",
+    reason: "conversation_limit_ui",
+  });
+  ok(fallbackPrompt.includes("<<<SOURCE_TRANSCRIPT>>>")
+      && fallbackPrompt.includes(`<<<HERDR_HANDOFF_V1 id=${transferId}>>>`)
+      && fallbackPrompt.includes("conversation_limit_ui"),
+    "fallback summary prompt carries bounded source context and the same validated handoff contract");
   const assistant = `<<<HERDR_HANDOFF_V1 id=${transferId}>>>\n# Project handoff\nCurrent objective: continue binding work.\nNext: verify live state.\n<<<END_HERDR_HANDOFF_V1>>>`;
   const packet = extractHandoffPacket(assistant, transferId);
   ok(!!packet && packet.includes("Current objective"), "handoff packet extracts the marked assistant payload");
@@ -540,7 +561,7 @@ ok(zhLocale.hud_manual_continue === "继续", "zh HUD continue label is exact");
 ok(zhLocale.hud_manual_status === "查 Herdr", "zh HUD Herdr check label is exact");
 ok(zhLocale.hud_manual_judge === "LLM 判断", "zh HUD LLM decision label is exact");
 ok(!("hud_manual_handoff" in zhLocale) && !("hud_bindings" in zhLocale) && !("hud_interval" in zhLocale),
-  "zh HUD removes drawer, binding, timing, and handoff copy after those paths move elsewhere");
+  "zh HUD removes legacy drawer, binding, and timing copy while handoff stays a compact conversation action");
 ok(zhLocale.cc_page_handoff === "手动接力"
     && zhLocale.cc_page_context_title === "当前页面"
     && zhLocale.cc_workspaces_heading === "工作区"
@@ -576,17 +597,15 @@ ok(
     && zhLocale.hud_automation_on_hint.includes("恢复")
     && zhLocale.hud_automation_on_hint.includes("自动接力")
     && zhLocale.hud_automation_on_hint.includes("权限卡")
-    && zhLocale.hud_automation_on_hint.includes("Control Center")
-    && zhLocale.hud_automation_on_hint.includes("当前页面"),
-  "zh Auto-on tooltip enumerates automatic behavior and points manual handoff to the Side Panel",
+    && zhLocale.hud_automation_on_hint.includes("接力"),
+  "zh Auto-on tooltip enumerates automatic behavior and keeps manual handoff available in the HUD",
 );
 ok(
   zhLocale.hud_automation_off_hint.includes("当前 ChatGPT Project")
-    && zhLocale.hud_automation_off_hint.includes("手动继续")
-    && zhLocale.hud_automation_off_hint.includes("Control Center")
-    && zhLocale.hud_automation_off_hint.includes("当前页面")
+    && zhLocale.hud_automation_off_hint.includes("继续")
+    && zhLocale.hud_automation_off_hint.includes("接力")
     && zhLocale.hud_automation_off_hint.includes("同一 Project"),
-  "zh Auto-off tooltip keeps HUD preset actions and sends manual handoff to the Side Panel",
+  "zh Auto-off tooltip keeps all safe current-conversation HUD actions available",
 );
 ok(zhLocale.label_automation_mode === "允许 ChatGPT 项目使用共享 Auto"
     && zhLocale.label_automation_mode.includes("共享 Auto")
@@ -616,11 +635,11 @@ ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
 ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")')
     && !backgroundSource.includes("CFG.autoAllow"),
   "permission-card automation is folded into effective Project automation");
-ok(!wakeDocEn.includes("- **Manual handoff (Control Center → Current page)**")
-    && !wakeDocZh.includes("- **手动接力（Control Center → 当前页面）**")
-    && wakeDocEn.includes("The HUD exposes only Continue / Check Herdr / LLM decide")
-    && wakeDocZh.includes("HUD 只保留 `继续 / 查 Herdr / LLM 判断`"),
-  "Wake docs list exactly the three HUD manual actions and keep handoff on the Side Panel path");
+ok(wakeDocEn.includes("The HUD exposes Continue / Check Herdr / LLM decide plus Manual handoff")
+    && wakeDocZh.includes("HUD 提供 `继续 / 查 Herdr / LLM 判断`")
+    && wakeDocEn.includes("configured OpenAI-compatible LLM as a fallback")
+    && wakeDocZh.includes("OpenAI-compatible LLM 兜底"),
+  "Wake docs place manual handoff in the HUD and document the configured LLM fallback");
 const actionClickStart = backgroundSource.indexOf("chrome.action.onClicked.addListener");
 const actionClickEnd = actionClickStart >= 0 ? backgroundSource.indexOf("void rebuildStreams();", actionClickStart) : -1;
 const actionClickBlock = actionClickStart >= 0 && actionClickEnd > actionClickStart
@@ -637,7 +656,7 @@ ok(!controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && !controlCenterHtml.includes('id="pageWorkspaceSelect"')
     && !controlCenterHtml.includes('id="pageBindings"')
     && !controlCenterHtml.includes('id="pageBindButton"')
-    && controlCenterHtml.includes('id="pageHandoffButton"')
+    && !controlCenterHtml.includes('id="pageHandoffButton"')
     && controlCenterHtml.includes('data-i18n="cc_preview_heading"')
     && controlCenterHtml.includes('data-i18n="cc_target_label"')
     && controlCenterSource.includes('from "./i18n.js"')
@@ -659,17 +678,12 @@ ok(!controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && controlCenterSource.includes("if (!currentlyBound && !workspace) return")
     && !controlCenterSource.includes("pageWorkspaceSelect")
     && !controlCenterSource.includes("pageBindings")
+    && !controlCenterSource.includes("handoffPageSupported")
+    && !controlCenterSource.includes("pageHandoffButton")
     && backgroundSource.includes('type: "herdr_control_binding_changed"')
-    && controlCenterSource.includes('const workspaceBusy = bindings.some')
-    && controlCenterSource.includes("const handoffPageSupported = (")
-    && controlCenterSource.includes('pageHandoffButton.disabled = !canHandoff || workspaceBusy || transferBusy')
-    && !controlCenterSource.includes("pageHandoffButton.hidden")
-    && controlCenterSource.includes('t("cc_page_handoff_project_required")')
-    && controlCenterSource.includes('t("cc_page_handoff_binding_required")')
-    && controlCenterSource.includes('if (code === "workspace_busy") return t("cc_page_handoff_busy_help")')
     && controlCenterSource.includes('t("cc_preview_only_reason")')
     && controlCenterSource.includes('t("native_host_help")'),
-  "Control Center keeps manual handoff discoverable with disabled reasons while localizing state, targeting, preview boundary, Settings, and Native Host failures");
+  "Control Center keeps page binding and explicit local targeting without duplicating the HUD handoff action");
 ok(backgroundSource.includes('event === "hello"')
     && backgroundSource.includes('type: "herdr_control_state"')
     && backgroundSource.includes('type: "herdr_control_event"')

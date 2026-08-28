@@ -34,7 +34,6 @@ const workspaceList = $("workspaceList");
 const pageContextCard = $("pageContextCard");
 const pageContextTitle = $("pageContextTitle");
 const pageContextMeta = $("pageContextMeta");
-const pageHandoffButton = $("pageHandoffButton");
 const pageContextHelp = $("pageContextHelp");
 const targetCard = $("targetCard");
 const targetTitle = $("targetTitle");
@@ -161,8 +160,6 @@ function renderPageContext(state) {
     pageContextMeta.textContent = "";
     pageContextMeta.title = "";
     pageContextHelp.textContent = t("cc_page_context_help");
-    pageHandoffButton.disabled = true;
-    pageHandoffButton.textContent = t("cc_page_handoff");
     return;
   }
 
@@ -170,9 +167,7 @@ function renderPageContext(state) {
     pageContextTitle.textContent = t("cc_page_unsupported");
     pageContextMeta.textContent = pageContext.error || t("cc_page_unsupported_meta");
     pageContextMeta.title = "";
-    pageContextHelp.textContent = t("cc_page_handoff_unavailable_help");
-    pageHandoffButton.disabled = true;
-    pageHandoffButton.textContent = t("cc_page_handoff");
+    pageContextHelp.textContent = t("cc_page_context_help");
     return;
   }
 
@@ -188,35 +183,7 @@ function renderPageContext(state) {
   if (info.project_id) identity.push(t("cc_page_project_id", { value: shortIdentity(info.project_id, 48) }));
   if (info.conversation_id) identity.push(t("cc_page_conversation_id", { value: shortIdentity(info.conversation_id, 48) }));
   pageContextMeta.title = identity.join(" · ");
-
-  const handoffStatus = String(pageContext.response?.handoff?.status || "");
-  const handoffPageSupported = (
-    (info.site === "chatgpt" && Boolean(info.project_id) && Boolean(info.conversation_id))
-    || (info.site === "z.ai" && Boolean(info.conversation_id))
-  );
-  const canHandoff = bindings.length > 0 && handoffPageSupported;
-  const workspaceBusy = bindings.some((binding) => (
-    String(binding?.status || "") === "working" || Number(binding?.working_count || 0) > 0
-  ));
-  const transferBusy = ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(handoffStatus);
-  pageHandoffButton.disabled = !canHandoff || workspaceBusy || transferBusy;
-  pageHandoffButton.textContent = workspaceBusy && canHandoff
-    ? t("cc_page_handoff_busy")
-    : (pageContext.response?.handoff?.can_resume === true
-      ? t("cc_page_handoff_resume")
-      : (transferBusy ? t("cc_page_handoff_working") : t("cc_page_handoff")));
-
-  let handoffHelp = t("cc_page_context_help");
-  if (!handoffPageSupported) {
-    if (info.site === "chatgpt") handoffHelp = t("cc_page_handoff_project_required");
-    else if (info.site === "z.ai") handoffHelp = t("cc_page_handoff_conversation_required");
-    else handoffHelp = t("cc_page_handoff_unavailable_help");
-  } else if (!bindings.length) {
-    handoffHelp = t("cc_page_handoff_binding_required");
-  } else if (workspaceBusy) {
-    handoffHelp = t("cc_page_handoff_busy_help");
-  }
-  pageContextHelp.textContent = pageContext.error || pageContext.notice || handoffHelp;
+  pageContextHelp.textContent = pageContext.error || t("cc_page_context_help");
 }
 
 async function refreshPageContext() {
@@ -479,26 +446,6 @@ document.querySelectorAll("#modeTabs [data-mode]").forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === selectedMode);
   });
 }
-
-function handoffFailureMessage(error) {
-  const code = String(error || "unknown");
-  if (code === "workspace_busy") return t("cc_page_handoff_busy_help");
-  if (code === "binding_required") return t("cc_page_handoff_binding_required");
-  return t("cc_page_handoff_failed", { error: code });
-}
-
-pageHandoffButton.addEventListener("click", async () => {
-  if (!pageContext.tabId || pageHandoffButton.disabled) return;
-  pageHandoffButton.disabled = true;
-  pageContextHelp.textContent = t("cc_page_handoff_starting");
-  const response = await bg({ type: "h2w_handoff_start", tabId: pageContext.tabId, trigger: "manual" });
-  const actionMessage = response?.ok
-    ? t("cc_page_handoff_started")
-    : handoffFailureMessage(response?.error);
-  await refreshPageContext();
-  pageContext.notice = actionMessage;
-  renderPageContext(store.get());
-});
 
 async function mutateWorkspaceBinding(workspaceId) {
   const info = pageContextInfo();

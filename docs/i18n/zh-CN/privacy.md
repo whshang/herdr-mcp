@@ -10,7 +10,7 @@
 
 为了实现上述用户可见功能，扩展在受支持的 Web AI 页面上可能处理：
 
-- **网站内容与个人通信内容：** 为连续工作、排队消息、对话接力/恢复以及可选 LLM 分析所需的对话文本和页面状态。
+- **网站内容与个人通信内容：** 为连续工作、排队消息、对话接力/恢复、可选 LLM 分析，以及下文所述的用户触发接力兜底所需的对话文本和页面状态。
 - **网页访问活动：** 当前受支持站点的 URL、由 URL 推导出的 conversation/project 标识，以及把当前页面与 Herdr workspace 对应起来所需的有限导航状态。扩展不会建立或出售通用浏览历史画像。
 - **用户活动：** 回合生成/提交/结束/恢复时间、扩展开关状态，以及判断连续工作或恢复动作何时可以安全执行所需的有限交互状态。
 - **认证信息：** 当用户主动配置可选的 OpenAI-compatible LLM endpoint 时，用户提供给该 endpoint 的 API Key。
@@ -39,7 +39,7 @@
 
 1. **同一台电脑上的本地 Herdr / herdr-mcp。** 通过 Native Messaging 向已安装的 native host 发送有界请求并读取实时 workspace 状态；这部分通信留在用户自己的电脑上。
 2. **受支持的 Web AI 网站。** 扩展只在产品文档声明的浏览器页面上运行（当前为 ChatGPT、Claude、z.ai 和 DeepSeek），用于观察当前对话状态并执行用户可见的连续工作/恢复交互。
-3. **用户主动配置的 LLM endpoint，仅在显式启用时。** 如果用户配置了可选的 OpenAI-compatible LLM 分析功能，扩展会把相关的近期用户/assistant 文本以及用户提供的 API credential 发往用户选择的 endpoint。该 endpoint 默认不是由 Herdr 发布者选择或运营，其自身的隐私与数据保留条款适用。
+3. **用户主动配置的 LLM endpoint，仅用于已配置的 LLM 功能。** 如果用户配置了 OpenAI-compatible LLM endpoint，扩展可为了可选的回合后分析，把相关的 user/assistant 文本和用户提供的 API credential 发往该 endpoint。如果对话接力由用户主动触发，或由用户已经开启的 Auto 策略触发，而当前 Web AI 会话已经达到硬性单次对话上限、接力摘要 prompt 无法提交，或主摘要路径已经停止但仍未得到有效 packet，扩展可改为把有界的源会话 transcript 发往同一个已配置 endpoint，由它生成 handoff packet。兜底 transcript 只包含扩展选取的 user/assistant 对话文本，并受扩展 handoff 上限约束（当前最多 70,000 字符；需要截断时保留早期任务背景和近期操作状态）。该 endpoint 由用户自行选择，默认不是由 Herdr 发布者选择或运营；该 endpoint Provider 自身的隐私与数据保留条款适用。
 
 扩展不会出售用户数据，不会把用户数据发送给广告网络，也不会为了无关画像、信用评估或放贷目的转移数据。
 
@@ -52,7 +52,7 @@
 - `alarms` — 周期性唤醒 MV3 service worker，使 Chrome 挂起 worker 后能够恢复本地 Herdr 状态流和 timer；
 - `nativeMessaging` — 连接本机安装的 herdr-mcp native host；
 - `sidePanel` — 承载 Herdr Browser Control Center；
-- host access — 在受支持的 Web AI 网站、本机 herdr-mcp endpoint，以及用户主动为 LLM 分析配置的 endpoint 上执行上述功能。
+- host access — 在受支持的 Web AI 网站、本机 herdr-mcp endpoint，以及用户主动为 LLM 分析和接力摘要兜底配置的 endpoint 上执行上述功能。
 
 **扩展不使用远程可执行代码。** 所有可执行 JavaScript 都随扩展包发布；网络返回内容只按数据处理，不会被 `eval`、动态 import 或作为 JavaScript / Wasm 执行。
 

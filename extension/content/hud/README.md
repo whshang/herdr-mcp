@@ -1,5 +1,5 @@
-# Read-only conversation HUD
+# Conversation HUD
 
-This directory contains the page status monitor only.
+This directory contains the compact in-page current-conversation surface.
 
-It must not expose binding, unbinding, handoff, or mutation actions.
+It may expose page-conversation actions such as Continue, LLM decision, and Manual handoff. It must not expose binding/unbinding, workspace selection, or local Herdr mutation controls.
