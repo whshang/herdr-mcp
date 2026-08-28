@@ -29,7 +29,7 @@ Node.js 只用于临时 Cloudflare Worker 引导（`npx wrangler`）和可选贡
 herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
-herdr-mcp update check
+herdr-mcp update          # same as update check
 ```
 
 `install` 会在 `~/.config/herdr-mcp/runtime/` 写入不可变 generation，并把 `~/.local/bin/herdr-mcp` 指到 `runtime/current/herdr-mcp`。优先使用以上顶层命令。不要把 `herdr-mcp service install` 写成普通安装主路径。

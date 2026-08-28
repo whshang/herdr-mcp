@@ -422,7 +422,7 @@ fn parse_update(args: &[String]) -> Result<Command, String> {
                 job_id: value.clone(),
             }))
         }
-        [] => Err("update requires check, apply, or status".to_owned()),
+        [] => Ok(Command::Update(UpdateCommand::Check { manifest_url: None })),
         [subcommand, ..] => Err(format!(
             "invalid update command or arguments for '{subcommand}'"
         )),
@@ -473,7 +473,7 @@ User path:\n\
   herdr-mcp install\n\
   herdr-mcp status\n\
   herdr-mcp doctor\n\
-  herdr-mcp update <check [--manifest URL]|apply [--manifest URL]|status>\n\
+  herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|status]\n\
   herdr-mcp rollback\n\
   herdr-mcp uninstall\n\n\
 Same-machine UAT isolation (optional):\n\
@@ -711,7 +711,10 @@ mod tests {
         assert!(parse(args(&["service"])).is_err());
         assert!(parse(args(&["service", "install", "--force"])).is_err());
         assert!(parse(args(&["install", "--adopt-node"])).is_err());
-        assert!(parse(args(&["update"])).is_err());
+        assert_eq!(
+            parse(args(&["update"])).unwrap().command,
+            Command::Update(UpdateCommand::Check { manifest_url: None })
+        );
         assert!(parse(args(&["update", "apply", "--force"])).is_err());
         assert!(parse(args(&["native-host"])).is_err());
         assert!(parse(args(&["native-host", "legacy"])).is_err());
