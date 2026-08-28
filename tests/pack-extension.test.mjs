@@ -54,6 +54,10 @@ test("repo pack-extension uses live extension manifest version", async () => {
   const outDir = await mkdtemp(join(tmpdir(), "herdr-pack-ext-live-"));
   try {
     const manifest = JSON.parse(await readFile(join(repoRoot, "extension", "manifest.json"), "utf8"));
+    assert.ok(
+      typeof manifest.description === "string" && manifest.description.length <= 132,
+      `Chrome Web Store manifest description must be <= 132 characters; got ${manifest.description?.length ?? "missing"}`,
+    );
     const result = await packExtension({ root: repoRoot, outDir });
     assert.equal(result.version, manifest.version);
     assert.equal(result.zipName, `herdr-mcp-extension-${manifest.version}.zip`);
