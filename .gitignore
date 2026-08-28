@@ -54,8 +54,9 @@ edge/cloudflare/.wrangler/
 
 # --- Process / scratch notes (not for publishing) ---
 # Keep durable guides under docs/*.md tracked.
-# Put task logs, recon dumps, rewrite checklists in docs/_wip/ only.
+# docs/_wip is for active design/planning Markdown only. Keep local evidence/recon dumps ignored.
 docs/_wip/*
+!docs/_wip/*.md
 !docs/_wip/en/
 !docs/_wip/zh-CN/
 TODO.md

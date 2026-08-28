@@ -63,13 +63,13 @@ herdr api schema >/dev/null
 
 Pause only if Herdr still does not become healthy. herdr-mcp does not replace Herdr, but this onboarding protocol installs it when needed.
 
-**Current herdr-mcp support boundary:** the most complete clean-machine evidence is on macOS Apple Silicon. Windows x64 has a release binary but Windows end-to-end UAT is still being completed. Linux is not yet claimed as a supported `v0.4.0` herdr-mcp runtime product surface.
+**Current herdr-mcp support boundary:** the most complete clean-machine evidence is on macOS Apple Silicon. Windows x64 has a release binary but Windows end-to-end UAT is still being completed. Linux is not yet claimed as a supported current-stable herdr-mcp runtime product surface.
 
 Node.js is only a temporary Edge deployment dependency through Wrangler; it is not a local herdr-mcp runtime dependency.
 
 ## Step 1 — install the native herdr-mcp runtime
 
-1. Download the newest stable `herdr-mcp` binary for this platform from <https://github.com/whshang/herdr-mcp/releases> (`v0.4.0` or a newer stable tag).
+1. Download the newest stable `herdr-mcp` binary for this platform from <https://github.com/whshang/herdr-mcp/releases> (`v0.4.1` is the current stable tag at this snapshot; always prefer the newest stable tag).
 2. Put it on `PATH` (for example `~/.local/bin/herdr-mcp`) and make it executable when the platform requires it.
 3. Run:
 

@@ -1,0 +1,66 @@
+{
+  "timestamp": "2026-08-28T08:12:00Z",
+  "rehearsal": "rc.1-equivalent preview-channel (no stable tag)",
+  "instance": "default (dogfood)",
+  "channel": "preview",
+  "before": {
+    "version": "0.4.0-alpha.19",
+    "generation": "rust-3d2f685c636c3f3e"
+  },
+  "rollback": {
+    "ok": true,
+    "from_generation": "rust-3d2f685c636c3f3e",
+    "rollback_id": "rb-1787903377082-rust-3d2f685c",
+    "guardian_settled": true,
+    "native_host_runtime_synced": true
+  },
+  "after_rollback": {
+    "version": "0.4.0-alpha.18",
+    "generation": "rust-50dc9a2550aefd2a",
+    "doctor": "all PASS layers",
+    "native_host": {
+      "runtime_matches_current": true,
+      "version_consistent": true
+    },
+    "link": {
+      "ok": true,
+      "production_owner": "rust",
+      "production_ready_eligible": true
+    },
+    "service_healthy": true
+  },
+  "update_check": {
+    "available": true,
+    "current_version": "0.4.0-alpha.18",
+    "release_version": "0.4.0-alpha.19",
+    "tag": "v0.4.0-alpha.19",
+    "update_channel": "preview",
+    "provenance_verified": true
+  },
+  "update_apply": {
+    "job_id": "upd-1787904465310-80994-3d2f685c",
+    "state": "succeeded",
+    "version": "0.4.0-alpha.19",
+    "detail": "service install committed and health gate passed"
+  },
+  "after_update": {
+    "version": "0.4.0-alpha.19",
+    "generation": "rust-3d2f685c636c3f3e",
+    "doctor": "all PASS layers",
+    "native_host": {
+      "runtime_matches_current": true,
+      "version_consistent": true
+    },
+    "link": {
+      "ok": true,
+      "production_ready_eligible": true
+    },
+    "service_healthy": true
+  },
+  "equivalence_limits": [
+    "Used preview channel alpha.18 <-> alpha.19, not stable-channel N->N+1",
+    "No v0.4.0-rc.1 or v0.4.0 stable tag cut",
+    "G9/G10 remain PARTIAL until stable-channel rehearsal after rc.1/stable tag"
+  ],
+  "verdict": "PASS (preview-channel rehearsal)"
+}

@@ -59,11 +59,11 @@ herdr-mcp 本机 runtime 使用 GitHub Releases，不用 git clone。只在 Clou
 
 ## 当前支持边界
 
-- `herdr-mcp` stable：`v0.4.0`；
+- `herdr-mcp` stable：`v0.4.1`；
 - 公共 MCP contract：epoch 2 / 18 tools；
 - 完整 clean-machine 证据最充分的平台：macOS Apple Silicon；
 - Windows x64 Release binary 已提供，但 Windows 端到端 UAT 仍在继续；
-- Linux runtime 暂不作为 `v0.4.0` 正式支持面承诺。
+- Linux runtime 暂不作为当前 stable 的正式支持面承诺。
 
 ## 本机 runtime CLI
 

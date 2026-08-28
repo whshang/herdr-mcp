@@ -4,7 +4,7 @@ Docs-only planning runbook. **Do not declare full GA until remaining vetoes are 
 
 SSOT for gate status: [`docs/ga-release-gate.md`](./ga-release-gate.md). **Live stable snapshot:** [`docs/ga-candidate-status.md`](./ga-candidate-status.md) (`v0.4.0` stable published; dogfood `0.4.0`). **Release model:** [`docs/release-model.md`](./release-model.md).
 
-**FREEZE:** `0.4.0-alpha.19` = final alpha candidate. **No alpha.20.** No delete release/branch/worktree. Alpha tags retained per release-model retention policy.
+**Historical alpha freeze (completed):** `0.4.0-alpha.19` was the final alpha candidate and there was no alpha.20. Immutable alpha tags/Releases remain retained per the release-model policy; merged/obsolete development branches and worktrees may be cleaned after live safety checks.
 
 ## Preconditions (2026-08-28 post-G4)
 
@@ -32,7 +32,7 @@ SSOT for gate status: [`docs/ga-release-gate.md`](./ga-release-gate.md). **Live 
 5. rollback → alpha.19 — PASS
 ```
 
-Evidence: `docs/_wip/g910-rc1-stable-rehearsal-20260828.json` (gitignored).
+Evidence: [`history/ga/g910-rc1-stable-rehearsal-20260828.json`](./history/ga/g910-rc1-stable-rehearsal-20260828.json) (archived, tracked).
 
 ## v0.4.0 stable path (executed 2026-08-28)
 
@@ -46,7 +46,7 @@ Evidence: `docs/_wip/g910-rc1-stable-rehearsal-20260828.json` (gitignored).
 7. G4 second Mac stable clean install — PASS (pi-ga-20260828)
 ```
 
-Evidence: `docs/_wip/g910-stable-v040-20260828.json` (gitignored); [`history/ga/g4-second-mac-stable-v040-uat-20260828.md`](./history/ga/g4-second-mac-stable-v040-uat-20260828.md).
+Evidence: the one-off stable-channel JSON was never tracked and is no longer retained; use [`ga-release-gate.md`](./ga-release-gate.md) + Rust Release run [`33157370273`](https://github.com/whshang/herdr-mcp/actions/runs/33157370273), plus [`history/ga/g4-second-mac-stable-v040-uat-20260828.md`](./history/ga/g4-second-mac-stable-v040-uat-20260828.md).
 
 ## Version surfaces (2026-08-28)
 

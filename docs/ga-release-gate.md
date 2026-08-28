@@ -1,7 +1,7 @@
 # herdr-mcp GA Release Gate
 
 状态：`v0.4.0` stable 已发布（2026-08-28）；stable-channel G9/G10 PASS；G20–G22 docs freeze PASS；**G4** 第二台 Mac 从 stable Release 干净安装 **PASS**（pi-ga-20260828）；**仍未 declare GA**（G25 及其他 PARTIAL 门禁见 scorecard）
-本文件是 **GA 判定的唯一事实源（SSOT）**。架构演进细节见 [`herdr-architecture-roadmap.md`](./herdr-architecture-roadmap.md)。
+本文件是 **第一版 GA 判定的唯一事实源（SSOT）**。当前 Rust runtime stable 已推进到 `v0.4.1`；本文件保留 `v0.4.0` 首次 stable / GA closure 的历史门禁事实，浏览器 Store/G15 仍按真实状态继续收口。架构演进细节见 [`herdr-architecture-roadmap.md`](./herdr-architecture-roadmap.md)。
 
 ## GA 定义
 
@@ -283,11 +283,11 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 本机 dogfood（默认实例，post GA-closure stable apply）：`production_ready=true`；`dev.herdr-mcp.server` `:8772` healthy；production Link=Rust；epoch 2 / 18 tools；用户 CLI → `runtime/current` → `0.4.0` / `rust-621d74d268b5299a`；`update.channel=stable`（config.toml）；`native-host status` `runtime_matches_current=true`。**G5 保持 PASS**。
 
-**Dogfood G6/G7 public UAT（2026-08-28 · alpha.19 · PASS）：** 默认实例公网路径 OAuth DCR+PKCE → `tools/list` 18/18 → read-only smoke → bounded `fs_write`（无重复）→ `exec_start`/`exec_read` 完成。证据 [`_wip/g67-dogfood-public-uat-20260828.json`](./_wip/g67-dogfood-public-uat-20260828.json)。
+**Dogfood G6/G7 public UAT（2026-08-28 · alpha.19 · PASS）：** 默认实例公网路径 OAuth DCR+PKCE → `tools/list` 18/18 → read-only smoke → bounded `fs_write`（无重复）→ `exec_start`/`exec_read` 完成。证据 [`history/ga/g67-dogfood-public-uat-20260828.json`](./history/ga/g67-dogfood-public-uat-20260828.json)。
 
-**Preview-channel rc.1 update/rollback（2026-08-28 · PASS）：** `alpha.19` → `update apply` → `0.4.0-rc.1` → `rollback` → `alpha.19`；native-host/doctor 全绿。证据 [`_wip/g910-rc1-stable-rehearsal-20260828.json`](./_wip/g910-rc1-stable-rehearsal-20260828.json)。
+**Preview-channel rc.1 update/rollback（2026-08-28 · PASS）：** `alpha.19` → `update apply` → `0.4.0-rc.1` → `rollback` → `alpha.19`；native-host/doctor 全绿。证据 [`history/ga/g910-rc1-stable-rehearsal-20260828.json`](./history/ga/g910-rc1-stable-rehearsal-20260828.json)。
 
-**Stable-channel G9/G10（2026-08-28 · PASS）：** `update.channel=stable` → `alpha.19` → `update check`/`apply` → `0.4.0` → `rollback` → `alpha.19`；native-host/doctor/link 全绿。证据 [`_wip/g910-stable-v040-20260828.json`](./_wip/g910-stable-v040-20260828.json)。Release run [`33157370273`](https://github.com/whshang/herdr-mcp/actions/runs/33157370273)。
+**Stable-channel G9/G10（2026-08-28 · PASS）：** `update.channel=stable` → `alpha.19` → `update check`/`apply` → `0.4.0` → `rollback` → `alpha.19`；native-host/doctor/link 全绿。结构化 one-off JSON 当时未纳入 Git 且现已不在本地保留；可信证据由本文件的已记录步骤/结论与 Release run [`33157370273`](https://github.com/whshang/herdr-mcp/actions/runs/33157370273) 共同保存。
 
 **第二台 Mac 默认实例 UAT（2026-08-28 · G4 PASS · stable `v0.4.0`）：** macOS aarch64 干净机；Release `v0.4.0` stable 二进制 → `install` → 独立 Worker `herdr-edge-yitaidiannao-local-ga` + Link（proxy）+ native-host（4 manifests）+ extension `0.1.68`；`doctor` 7/7；stable channel at head。详见 [`history/ga/g4-second-mac-stable-v040-uat-20260828.md`](./history/ga/g4-second-mac-stable-v040-uat-20260828.md)。
 
@@ -346,7 +346,7 @@ OAuth via programmatic DCR+PKCE (ChatGPT-equivalent endpoints). ChatGPT browser 
 | `rollback` rc.1→alpha.19 | PASS (`rb-1787906320335-rust-98dcc410`) |
 | `doctor` / native-host post-rollback | PASS |
 
-Evidence: [`_wip/g910-rc1-stable-rehearsal-20260828.json`](./_wip/g910-rc1-stable-rehearsal-20260828.json).
+Evidence: [`history/ga/g910-rc1-stable-rehearsal-20260828.json`](./history/ga/g910-rc1-stable-rehearsal-20260828.json).
 
 ### G9/G10 stable-channel v0.4.0 rehearsal（2026-08-28 · PASS）
 
@@ -360,7 +360,7 @@ Evidence: [`_wip/g910-rc1-stable-rehearsal-20260828.json`](./_wip/g910-rc1-stabl
 | `rollback` 0.4.0→alpha.19 | PASS (`rb-1787907991968-rust-621d74d2`) |
 | `doctor` / native-host post-rollback | PASS |
 
-Evidence: [`_wip/g910-stable-v040-20260828.json`](./_wip/g910-stable-v040-20260828.json).
+Evidence: the one-off local JSON was never tracked and is no longer retained; this scorecard section plus Release run [`33157370273`](https://github.com/whshang/herdr-mcp/actions/runs/33157370273) is the retained evidence.
 
 ### G9/G10 stable-channel rehearsal（2026-08-28 · historical BLOCKED）
 
@@ -534,7 +534,7 @@ herdr-mcp --instance uat uninstall
 
 ### GA closure C — stable update/rollback rehearsal（2026-08-28 · PASS）
 
-**Result (verified):** `update.channel=stable` → `update check` discovers `v0.4.0` → `apply` → `rollback` on default dogfood instance. Evidence: [`_wip/g910-stable-v040-20260828.json`](./_wip/g910-stable-v040-20260828.json).
+**Result (verified):** `update.channel=stable` → `update check` discovers `v0.4.0` → `apply` → `rollback` on default dogfood instance. Evidence: the one-off local JSON was never tracked and is no longer retained; this scorecard section plus Release run [`33157370273`](https://github.com/whshang/herdr-mcp/actions/runs/33157370273) is the retained evidence.
 
 **Stable-channel rehearsal（已完成 · PASS）：**
 
