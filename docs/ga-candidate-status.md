@@ -1,8 +1,10 @@
-# GA Candidate Status — `0.4.0-alpha.19` (last alpha)
+# GA Candidate Status — `0.4.0-alpha.19` (final GA candidate)
 
-Status: **alpha candidate frozen** (2026-08-28). **Do not cut `v0.4.0` stable** until remaining vetoes in [`ga-release-gate.md`](./ga-release-gate.md) are honest PASS.
+Status: **alpha candidate frozen** (2026-08-28). **Do not cut `v0.4.0` stable or `v0.4.0-rc.1`** until remaining vetoes in [`ga-release-gate.md`](./ga-release-gate.md) are honest PASS.
 
 SSOT for gate rows: [`docs/ga-release-gate.md`](./ga-release-gate.md). Exit-alpha runbook: [`docs/exit-alpha-checklist.md`](./exit-alpha-checklist.md).
+
+**FREEZE:** alpha.19 = final GA candidate. **No alpha.20.** No delete release/branch/worktree.
 
 ## Current candidate
 
@@ -15,7 +17,10 @@ SSOT for gate rows: [`docs/ga-release-gate.md`](./ga-release-gate.md). Exit-alph
 | Contract | epoch 2 / 18 tools / state schema 4 |
 | Release URL | <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0-alpha.19> |
 | Tag-path workflow | [Rust Release run 33152207094](https://github.com/whshang/herdr-mcp/actions/runs/33152207094) — verify → build → manifest → attest → **publish** all PASS |
-| Recovery-only? | **No** — first end-to-end tag-path publish after #133 extension-glob fix |
+| Connector URL (workers.dev) | `https://herdr-edge-prod.whshang.workers.dev/mcp` |
+| Connector URL (custom domain) | `https://herdr-mcp.agentforme.cc.cd/mcp` |
+| OAuth issuer | `https://herdr-mcp.agentforme.cc.cd` |
+| Update channel (dogfood) | `preview` |
 
 ## Release identity (G2 seal)
 
@@ -26,79 +31,73 @@ SSOT for gate rows: [`docs/ga-release-gate.md`](./ga-release-gate.md). Exit-alph
 | Binary SHA (darwin aarch64) | PASS | `3d2f685c636c3f3e2c4720c9a63c703a818307af0507a68ac953268f8a009a60` |
 | Updater provenance | PASS | dogfood `update check` `provenance_verified=true` |
 | Attestation | PASS | `actions/attest` job green on run 33152207094 |
-| Extension zip excluded from manifest assets | PASS | manifest lists 2 platform binaries only; bundle has 5 files (binaries + extension zip + sha256 + manifest) |
-| Fail-closed duplicate publish | PASS | alpha.18 tag run `33150060112` failed identity verify before publish; publish step refuses existing release (`refusing publish overwrite`) |
+| Extension zip excluded from manifest assets | PASS | manifest lists 2 platform binaries only |
+| Fail-closed duplicate publish | PASS | alpha.18 tag run failed identity verify; publish refuses clobber |
 
-## Dogfood cut (default instance)
+## G6/G7 dogfood public UAT (2026-08-28 · PASS)
+
+Evidence (local, gitignored): `docs/_wip/g67-dogfood-public-uat-20260828.json` · runner `docs/_wip/g67-dogfood-public-uat-20260828.mjs`
+
+| Step | Result | Notes |
+| --- | --- | --- |
+| Edge `/health` | PASS | HTTP 200, `contract_epoch=2` |
+| OAuth (DCR+PKCE) | PASS | Same issuer/endpoints as ChatGPT Connector; refresh issued |
+| `initialize` + `tools/list` | PASS | 18 tools, epoch-2 catalog |
+| Read-only (`inspect`, `fs_list`, `git`) | PASS | Public `/mcp` → Edge → Link → runtime |
+| Bounded mutation (`fs_write`) | PASS | Single write; duplicate blocked (`overwrite_confirmation_required`) |
+| Long exec (`exec_start` → `exec_read`) | PASS | `es_107ef-1a04768766c-10` completed in 2 polls |
+
+**Caveat:** OAuth via programmatic DCR+PKCE (ChatGPT-equivalent). ChatGPT browser UI not re-run this session; second-Mac G18 sealed Connector OAuth (alpha.17).
+
+## G9/G10 rc.1-equivalent rehearsal (2026-08-28 · PASS)
+
+Evidence (local, gitignored): `docs/_wip/g910-rc1-rehearsal-20260828.json`
 
 | Step | Result |
 | --- | --- |
-| `update apply` alpha.18 → alpha.19 | PASS (`upd-1787903368810-67219-3d2f685c`) |
-| `--version` | `0.4.0-alpha.19` |
-| `native-host` / `doctor` | `runtime_matches_current=true`, `version_consistent=true` |
-| `link seal status` | `production_ready=true` (unchanged) |
+| Preflight `alpha.19` | PASS |
+| `rollback` → `alpha.18` | PASS (`rb-1787903377082-rust-3d2f685c`, guardian settled, native-host synced) |
+| `doctor` / Link after rollback | PASS |
+| `update check` (preview) | PASS (`v0.4.0-alpha.19` available, provenance verified) |
+| `update apply` | PASS (job `upd-1787904465310-80994-3d2f685c`) |
+| Post-update `doctor` / native-host / Link | PASS on `alpha.19` |
 
-## G6/G7 local MCP smoke (dogfood, 2026-08-28)
+**Equivalence limits:** preview-channel `alpha.18↔alpha.19` ≠ stable-channel G9/G10 PASS.
 
-Not a substitute for owner ChatGPT UAT; records native tool path only.
+## rc.1 path (design — not executed)
 
-| Tool / flow | Result | Notes |
-| --- | --- | --- |
-| `herdr_inspect` | PASS | epoch 2 / 18 tools; `production_ready=true` |
-| `herdr_fs_grep` | PASS | `G2` hits in `docs/` |
-| `herdr_git status` | PASS | clean tree on `herdr-mcp` |
-| `herdr_fs_write` (bounded) | PASS | created `docs/_wip/ga-uat-local-mutation-evidence-20260828.txt` (gitignored) |
-| `herdr_exec_start` → `herdr_exec_read` | PASS | single session `es_107ef-…`; completed; no duplicate start |
-
-Public ChatGPT Connector matrix (OAuth, fresh `tools/list`, cross-turn) remains **owner-only** — see Owner ChatGPT UAT pack in `ga-release-gate.md`.
+```text
+v0.4.0-rc.1 tag (Cargo bump; no alpha.20)
+  → GitHub Release (rust-release.yml)
+  → install or update apply (preview)
+  → doctor → native-host status → Link health
+  → rollback → doctor → verify recovery
+  → stable-channel update/rollback rehearsal
+  → v0.4.0 stable tag only after stable-channel G9/G10 PASS
+```
 
 ## Remaining GA blockers (honest)
 
 | Gate | Why still open |
 | --- | --- |
 | G1 | Still alpha semver; no `v0.4.0` stable |
-| G9 / G10 | No stable-channel N→N+1 update/rollback rehearsal (blocked until stable tag) |
-| G6 / G7 | Dogfood local smoke only; full public matrix / soak not sealed |
+| G9 / G10 | No stable-channel N→N+1 rehearsal (blocked until rc.1/stable tag) |
+| G20–G22 | Stable docs freeze (user paths still mention alpha) |
 | G24 / G25 | Vetoes above; **do not tag stable** |
 
-## Stable candidate rehearsal design (`v0.4.0-rc.1` or `v0.4.0`)
+## Can enter `v0.4.0` formal release?
 
-**Not executed.** Rehearsal sequence for G9/G10 evidence after stable tag exists:
-
-```text
-install (or already on N)
-  → update check (stable channel)
-  → update apply
-  → doctor
-  → native-host status   # runtime_matches_current=true
-  → link seal status     # production_ready=true
-  → rollback
-  → doctor
-  → native-host status
-  → runtime identity unchanged / prior generation restored
-```
-
-Optional preview-channel rehearsal before stable tag (does **not** flip G9/G10 to PASS):
-
-```bash
-herdr-mcp update check --manifest <pinned-manifest-url>
-herdr-mcp update apply --manifest <pinned-manifest-url>
-herdr-mcp doctor
-herdr-mcp native-host status
-herdr-mcp rollback
-herdr-mcp doctor
-```
-
-Record job ids, generation paths, and non-secret `doctor` layer summaries in scorecard.
+**No.** Missing: G1 exit-alpha, stable-channel G9/G10, G20–G22 docs freeze, G25 vetoes cleared.
 
 ## Next owner actions
 
-1. Review G6/G7 Owner ChatGPT UAT pack on dogfood maintenance window or second Mac (if not already fully sealed).
-2. When vetoes clear: bump `Cargo.toml` to `0.4.0`, refresh docs, tag `v0.4.0`, run stable-channel G9/G10 rehearsal.
-3. **Do not** create `alpha.20+` unless a blocking defect requires a new prerelease.
+1. Approve `v0.4.0-rc.1` tag workflow PR (version bump + docs only).
+2. Run stable-channel rehearsal after rc.1 Release publishes.
+3. Re-run second-Mac clean install from rc.1 Release.
+4. Only then evaluate `v0.4.0` stable tag.
 
 ## Related
 
-- [`docs/ga-release-gate.md`](./ga-release-gate.md) — G1–G25 scorecard
-- [`docs/exit-alpha-checklist.md`](./exit-alpha-checklist.md) — G1 version unification
-- [`docs/i18n/en/clean-machine-uat.md`](./i18n/en/clean-machine-uat.md) — second Mac canonical path
+- [`docs/ga-release-gate.md`](./ga-release-gate.md)
+- [`docs/exit-alpha-checklist.md`](./exit-alpha-checklist.md)
+- [`docs/i18n/en/clean-machine-uat.md`](./i18n/en/clean-machine-uat.md)
