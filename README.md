@@ -75,7 +75,7 @@ The **local MCP runtime** is a native binary. You do **not** need Node.js or npm
 
 ### Install the native runtime (primary)
 
-1. Download the current `herdr-mcp` binary for your platform from [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) (prerelease tags are expected while the product is still alpha).
+1. Download the current `herdr-mcp` binary for your platform from [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) — current stable: [`v0.4.0`](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0).
 2. Place it on your `PATH` (for example `~/.local/bin/herdr-mcp`) and make it executable.
 3. Install the managed local service, then verify:
 
@@ -96,7 +96,7 @@ herdr-mcp rollback
 
 Prefer these top-level commands. Do **not** treat `herdr-mcp service install` as the normal user install path; `service ...` stays advanced/internal. Do **not** clone this repository or run `npm`/`cargo` to install the local MCP runtime.
 
-While the product is still alpha, keep `update.channel = "preview"` (or leave config absent on an alpha binary) so discovery sees prerelease tags. `stable` only discovers non-prerelease releases.
+The current stable release is **`v0.4.0`**. By default, `update.channel = "stable"` discovers non-prerelease releases only. Use `preview` only when you intentionally want prerelease tags.
 
 Verify Herdr before adding Edge:
 

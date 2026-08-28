@@ -6,7 +6,7 @@ SSOT for gate rows: [`docs/ga-release-gate.md`](./ga-release-gate.md). Exit-alph
 
 **FREEZE:** alpha.19 = final alpha candidate. **No alpha.20.** No delete release/branch/worktree. Prior tags `v0.4.0-alpha.19`, `v0.4.0-rc.1` retained.
 
-## Current candidate
+## Stable shipped
 
 | Field | Value |
 | --- | --- |
@@ -75,21 +75,19 @@ Evidence (local, gitignored): `docs/_wip/g910-stable-v040-20260828.json`
 
 | Gate | Why still open |
 | --- | --- |
-| G1 | User-facing docs still mention alpha; dogfood rolled back to alpha.19 after rehearsal |
-| G20–G22 | Stable docs freeze (user paths still mention alpha/candidate) |
-| G4 | Second Mac clean install from `v0.4.0` stable Release not yet sealed |
-| G24 / G25 | Vetoes above; **cannot declare full GA yet** |
+| G1 | Dogfood rolled back to `alpha.19` after stable G9/G10 rehearsal; optional stable apply pending |
+| G4 | Second Mac clean install from `v0.4.0` stable Release not yet sealed (prior G18 used `alpha.17`) |
+| G24 / G25 | G4 UAT open; G1 dogfood version not yet unified to `0.4.0` |
 
 ## Can declare GA stable?
 
-**Not yet.** `v0.4.0` stable Release exists and stable-channel G9/G10 PASS. Missing: G20–G22 docs freeze, G1 user-facing version unification, G4 stable clean install UAT, G25 veto #8 (docs == reality).
+**Not yet.** `v0.4.0` stable Release exists; stable-channel G9/G10 PASS; user-facing docs now reference `v0.4.0` stable. Missing: G4 second-Mac stable clean install UAT, G1 dogfood optional stable apply, G25 veto #8 until G4 seals.
 
 ## Next owner actions
 
-1. **G20–G22 — stable docs freeze** (remove alpha/candidate from user install paths).
-2. **G4 — second Mac clean install** from `v0.4.0` Release binary (not alpha.17).
-3. **G1 — exit alpha** (optionally leave dogfood on `0.4.0` after docs freeze).
-4. Re-run scorecard; if G24/G25 clear → declare GA.
+1. **G4 — second Mac clean install** from [`v0.4.0` Release](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0) binary (see [clean-machine-uat §One-command bootstrap](i18n/en/clean-machine-uat.md#one-command-operator-bootstrap-second-mac-default-instance); prior G18 used `alpha.17`).
+2. **G1 — exit alpha** (optionally `update apply` on dogfood to leave `0.4.0` resident after G4 PASS).
+3. Re-run scorecard; if G24/G25 clear → declare GA.
 
 ## Related
 

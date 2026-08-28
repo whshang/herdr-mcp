@@ -2,7 +2,7 @@
 
 Commands-only runbook for installing from a **GitHub Release binary** (no repo checkout as the runtime install source).
 
-Do **not** cut a non-alpha stable tag from this checklist alone. Product remains alpha until G1 + G18 + remaining GA vetoes pass.
+Do **not** declare full GA from this checklist alone. `v0.4.0` stable is published; stable-channel G9/G10 PASS; remaining vetoes (G4, G1 dogfood apply) must clear before GA declaration.
 
 ## Isolation honesty (same physical Mac)
 
@@ -22,7 +22,7 @@ Default production identities stay:
 
 Named-instance evidence advances G18 local install/doctor/status on the dogfood Mac. It does **not** replace a second-Mac default-instance seal for native-host + public OAuth when those must share production identities.
 
-Requires a Release that includes instance isolation (first: `v0.4.0-alpha.16` or newer). Do not claim named-instance UAT from `v0.4.0-alpha.15`.
+Requires a Release that includes instance isolation (`v0.4.0` stable or any `v0.4.0-alpha.16+` prerelease). Do not claim named-instance UAT from `v0.4.0-alpha.15`.
 
 ## Platform under test
 
@@ -53,10 +53,12 @@ Deploy a **machine-specific** Worker before section B: unique Worker `name`, uni
 
 ## One-command operator bootstrap (second Mac, default instance)
 
-Replace `TAG` if a newer prerelease is under test:
+**G4 stable clean install (maintainers):** use the **`v0.4.0` stable Release**, not `alpha.17`/`alpha.19`. Prior G18 PASS used `v0.4.0-alpha.17`; G4 requires re-seal from stable.
+
+Replace `TAG` only when testing a newer stable or intentional prerelease:
 
 ```bash
-TAG=v0.4.0-alpha.16
+TAG=v0.4.0
 REPO=whshang/herdr-mcp
 WORKDIR="${HOME}/herdr-mcp-clean-uat"
 mkdir -p "$WORKDIR/bin" "$WORKDIR/dl" && cd "$WORKDIR"
@@ -90,7 +92,7 @@ No `git clone`. No `npm ci` for the runtime path.
 Use a downloaded Release binary only (never `target/*/herdr-mcp`). Keep dogfood on the default instance.
 
 ```bash
-TAG=v0.4.0-alpha.16
+TAG=v0.4.0
 REPO=whshang/herdr-mcp
 WORKDIR="${HOME}/herdr-mcp-clean-uat"
 mkdir -p "$WORKDIR/bin" "$WORKDIR/dl" && cd "$WORKDIR"

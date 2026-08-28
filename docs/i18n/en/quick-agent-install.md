@@ -42,7 +42,7 @@ If Herdr is missing, stop and send the human to <https://herdr.dev>. herdr-mcp d
 
 ## Step 1 — Install native runtime
 
-1. Download `herdr-mcp` from <https://github.com/whshang/herdr-mcp/releases>
+1. Download `herdr-mcp` from <https://github.com/whshang/herdr-mcp/releases> — use the latest stable release ([`v0.4.0`](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0) or newer stable tag)
 2. Place on `PATH` (for example `~/.local/bin/herdr-mcp`) and make executable
 3. Run:
 
@@ -117,14 +117,14 @@ Do not mix issuer and Connector URL from different origins.
 
 ## Step 5 — Install Herdr Link (with network / China notes)
 
-Install the managed Rust Link candidate:
+Install the managed Rust Link:
 
 ```bash
 herdr-mcp link install
 herdr-mcp link status
 ```
 
-Set `HERDR_EDGE_URL` and `HERDR_WORKSTATION_ID` on the candidate LaunchAgent to match the deployed Worker.
+Set `HERDR_EDGE_URL` and `HERDR_WORKSTATION_ID` on the Link LaunchAgent to match the deployed Worker.
 
 ### Link proxy (workers.dev in China or via system proxy)
 
@@ -166,7 +166,7 @@ curl -fsS "${EDGE_ORIGIN}/health"
 curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 ```
 
-`herdr-mcp doctor` should show Link ownership and Edge layers (`edge-reachable`, `oauth-metadata`, `mcp-endpoint` with `401 auth=not-sent` acceptable). Candidate-only installs show `source=link-candidate-plist`, not `edge-unconfigured`.
+`herdr-mcp doctor` should show Link ownership and Edge layers healthy (`edge-reachable`, `oauth-metadata`, `mcp-endpoint`; `401 auth=not-sent` is acceptable).
 
 Unset `CLOUDFLARE_API_TOKEN` when done.
 

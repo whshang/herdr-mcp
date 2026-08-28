@@ -1,23 +1,25 @@
 # Exit-alpha checklist (G1) — `0.4.0` stable version unification
 
-Docs-only planning runbook. **Do not cut `v0.4.0` (non-prerelease) until remaining GA vetoes are cleared.**
+Docs-only planning runbook. **Do not declare full GA until remaining vetoes are cleared.**
 
-SSOT for gate status: [`docs/ga-release-gate.md`](./ga-release-gate.md). **Live candidate:** [`docs/ga-candidate-status.md`](./ga-candidate-status.md) (`0.4.0-rc.1` published; dogfood baseline `0.4.0-alpha.19`).
+SSOT for gate status: [`docs/ga-release-gate.md`](./ga-release-gate.md). **Live stable snapshot:** [`docs/ga-candidate-status.md`](./ga-candidate-status.md) (`v0.4.0` stable published; dogfood baseline `0.4.0-alpha.19` post G9/G10 rollback).
 
 **FREEZE:** `0.4.0-alpha.19` = final alpha candidate. **No alpha.20.** No delete release/branch/worktree.
 
-## Preconditions (all required before G1 / stable tag)
+## Preconditions (all required before G1 / GA declare)
 
 | Gate | Status (2026-08-28) | Notes |
 | --- | --- | --- |
-| G18 | **PASS** | Second Mac clean install + public MCP |
+| G18 | **PASS** | Second Mac clean install + public MCP (alpha.17 baseline) |
 | G6 / G7 | **PASS** | Dogfood public matrix sealed 2026-08-28 (alpha.19) |
 | G12 | **PASS** | Dogfood long-exec via public path |
-| G2 | **PASS** | rc.1 tag-path publish — run `33155520284`; see [`ga-candidate-status.md`](./ga-candidate-status.md) |
+| G2 | **PASS** | `v0.4.0` stable tag-path publish — run `33157370273` |
+| G9 / G10 | **PASS** | Preview `alpha.19↔rc.1` + **stable `alpha.19↔0.4.0`** PASS |
+| G20–G22 | **PASS** | User install paths reference `v0.4.0` stable (docs freeze) |
 | G15 | **PARTIAL** | Second Mac extension sealed; dogfood uat singleton |
 | G17 | **PARTIAL** | Public path OK; full security matrix open |
-| G9 / G10 | **PARTIAL** | Preview `alpha.19↔rc.1` PASS; **stable-channel BLOCKED** (no non-prerelease release) |
-| G25 | **FAIL** | Vetoes remain |
+| G4 | **PARTIAL** | Second Mac stable clean install from `v0.4.0` Release not yet sealed |
+| G25 | **PARTIAL** | G4 UAT open; dogfood still `alpha.19` after rehearsal |
 
 ## rc.1 path (executed 2026-08-28)
 
@@ -27,34 +29,44 @@ SSOT for gate status: [`docs/ga-release-gate.md`](./ga-release-gate.md). **Live 
 3. Preview: update check → apply → rc.1 — PASS
 4. native-host / doctor post-apply — PASS
 5. rollback → alpha.19 — PASS
-6. Stable channel update check — BLOCKED (by design)
 ```
 
 Evidence: `docs/_wip/g910-rc1-stable-rehearsal-20260828.json` (gitignored).
 
-**Stable-channel blocker:** `UpdateChannel::Stable` only accepts `version.pre.is_empty()`. GitHub has no non-prerelease `0.4.x` release yet. Stable G9/G10 requires `v0.4.0` stable tag (or policy change to accept `rc` on stable channel).
+## v0.4.0 stable path (executed 2026-08-28)
+
+```text
+1. Tag v0.4.0 (#142 Cargo bump) — DONE
+2. Rust Release run 33157370273 — publish PASS
+3. Stable: update check → apply → 0.4.0 — PASS
+4. native-host / doctor / link post-apply — PASS
+5. rollback → alpha.19 — PASS
+6. G20–G22 docs freeze — DONE (user paths reference v0.4.0 stable)
+```
+
+Evidence: `docs/_wip/g910-stable-v040-20260828.json` (gitignored).
 
 ## Version surfaces today vs stable target
 
-| Surface | Live today | rc.1 (published) | Stable target |
+| Surface | Live today | Stable target | Status |
 | --- | --- | --- | --- |
-| Rust runtime (dogfood) | `0.4.0-alpha.19` | `0.4.0-rc.1` (preview apply) | `0.4.0` |
-| `crates/herdr-mcp/Cargo.toml` (main) | `0.4.0-rc.1` | `0.4.0-rc.1` | `0.4.0` |
-| Git tag (latest rc) | — | `v0.4.0-rc.1` @ `0a4627e` | `v0.4.0` |
-| Update channel (dogfood) | `preview` | `preview` | `stable` |
-| `package.json` | `0.3.32` | unchanged | **not** runtime version |
+| Rust runtime (dogfood) | `0.4.0-alpha.19` | `0.4.0` | Post-rehearsal rollback; optional apply |
+| Git tag / GitHub Release | `v0.4.0` | `v0.4.0` | **DONE** |
+| User docs / README | `v0.4.0` stable primary | `0.4.0` | **DONE** (G20–G22) |
+| `crates/herdr-mcp/Cargo.toml` (main) | `0.4.0` | `0.4.0` | **DONE** |
+| Update channel (dogfood) | `stable` | `stable` | **DONE** |
+| `package.json` | `0.3.32` | **not** runtime version | N/A |
 
-## G1 unification assessment (2026-08-28)
+## G1 unification assessment (2026-08-28 post docs freeze)
 
-| Surface | Can unify to `0.4.0-rc.1` now? | Gap for `0.4.0` stable |
+| Surface | Unified to `0.4.0`? | Gap |
 | --- | --- | --- |
-| Cargo.toml / binary | **Yes** — main @ `0.4.0-rc.1`, Release published | Bump to `0.4.0`, retag |
-| Git tag / GitHub Release | **Yes** — `v0.4.0-rc.1` live | Need `v0.4.0` non-prerelease Release |
-| Dogfood runtime | **Partial** — rehearsal proved apply/rollback; baseline restored to alpha.19 | Stable-channel apply to `0.4.0` |
-| User docs / README | **No** — still alpha terminology (G20) | Stable docs freeze |
-| `package.json` | **N/A** — not runtime version | Keep separate |
+| Cargo.toml / binary / Git tag / Release | **Yes** | — |
+| User docs / README | **Yes** | G20–G22 PASS |
+| Dogfood runtime | **Partial** | Rolled back to `alpha.19` after stable G9/G10 rehearsal |
+| G4 second Mac UAT | **Open** | Prior G18 used `alpha.17`; re-seal from `v0.4.0` stable |
 
-## Maintainer sequence (stable — after stable-channel G9/G10 unblocked)
+## Maintainer sequence (optional dogfood stable apply — after G4 PASS)
 
 ```bash
 # 1. Preflight (read-only, independent shell)
@@ -62,36 +74,24 @@ herdr-mcp --version
 herdr-mcp service status
 herdr-mcp link seal status
 
-# 2. Bump Cargo.toml to 0.4.0 (no -alpha, no -rc)
-cargo fmt --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
-# Do not forget: cargo generate-lockfile / commit Cargo.lock
-
-# 3. Tag only when scorecard vetoes cleared
-git tag -a v0.4.0 -m "herdr-mcp 0.4.0 stable"
-git push origin v0.4.0
-
-# 4. Post-release (independent shell)
+# 2. Stable apply (independent shell; dogfood default instance)
 herdr-mcp update check    # stable channel → 0.4.0
 herdr-mcp update apply
 herdr-mcp doctor
-herdr-mcp --version       # 0.4.0, no alpha
+herdr-mcp --version       # expect 0.4.0
 
-# 5. Second Mac clean install regression from v0.4.0 Release
+# 3. Second Mac clean install regression from v0.4.0 Release (G4)
+# See docs/i18n/en/clean-machine-uat.md §One-command bootstrap
 ```
 
 ## Evidence to flip G1 → PASS
 
-- `herdr-mcp --version` → `0.4.0` on dogfood after stable-channel `update apply`
-- GitHub Release `v0.4.0` assets + manifest SHA verification
-- Stable-channel G9/G10 rehearsal PASS (currently **BLOCKED**)
-- Second Mac clean install from stable Release
+- `herdr-mcp --version` → `0.4.0` on dogfood (optional stable apply)
+- G4 second Mac clean install from [`v0.4.0` Release](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0)
 - `package.json` explicitly **not** the runtime product version
 
 ## Explicit non-steps
 
-- **Do not** tag `v0.4.0` while G9/G10 stable-channel remains BLOCKED.
 - **Do not** tag `v0.4.0-alpha.20` (alpha.19 is final candidate).
 - **Do not** rename `package.json` to `0.4.0` as a G1 shortcut.
 - **Do not** delete/move historical tags (`v0.4.0-alpha.*`, `v0.4.0-rc.1`).

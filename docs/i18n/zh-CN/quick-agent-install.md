@@ -40,7 +40,7 @@ Herdr 未就绪则引导用户到 <https://herdr.dev>。herdr-mcp 不替代 Herd
 
 ## 步骤 1 — 安装原生 runtime
 
-1. 从 <https://github.com/whshang/herdr-mcp/releases> 下载 `herdr-mcp`
+1. 从 <https://github.com/whshang/herdr-mcp/releases> 下载 `herdr-mcp` — 使用最新 stable 版本（[`v0.4.0`](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0) 或更新的 stable tag）
 2. 放到 `PATH` (如 `~/.local/bin/herdr-mcp`) 并赋予可执行权限
 3. 执行:
 
@@ -115,14 +115,14 @@ issuer 与 Connector URL 必须同一 origin。
 
 ## 步骤 5 — 安装 Herdr Link (含网络/中国说明)
 
-安装托管 Rust Link candidate:
+安装托管 Rust Link:
 
 ```bash
 herdr-mcp link install
 herdr-mcp link status
 ```
 
-将 candidate LaunchAgent 上的 `HERDR_EDGE_URL` 与 `HERDR_WORKSTATION_ID` 设为与 Worker 一致。
+将 Link LaunchAgent 上的 `HERDR_EDGE_URL` 与 `HERDR_WORKSTATION_ID` 设为与 Worker 一致。
 
 ### Link 代理 (中国 workers.dev 或系统代理)
 
@@ -164,7 +164,7 @@ curl -fsS "${EDGE_ORIGIN}/health"
 curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 ```
 
-`herdr-mcp doctor` 应显示 Link 与 Edge 层 (`edge-reachable`, `oauth-metadata`, `mcp-endpoint`; `401 auth=not-sent` 可接受)。仅 candidate 安装会显示 `source=link-candidate-plist`, 而不是 `edge-unconfigured`。
+`herdr-mcp doctor` 应显示 Link 与 Edge 层健康 (`edge-reachable`, `oauth-metadata`, `mcp-endpoint`; `401 auth=not-sent` 可接受)。
 
 完成后 unset `CLOUDFLARE_API_TOKEN`。
 

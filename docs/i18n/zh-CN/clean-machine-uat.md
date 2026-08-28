@@ -2,7 +2,7 @@
 
 给**从 GitHub Release 二进制安装**（不把本仓库当 runtime 安装源）用的命令清单。
 
-仅完成此清单也**不要**打非 alpha 的 stable tag。产品仍处 alpha，直到 G1 + G18 + 其余 GA veto 通过。
+仅完成此清单也**不要**宣告完整 GA。`v0.4.0` stable 已发布；stable-channel G9/G10 PASS；剩余 veto（G4、G1 dogfood apply）未清前不得宣告 GA。
 
 ## 同机隔离诚实说明
 
@@ -22,7 +22,7 @@
 
 命名实例证据推进狗粮机上的 G18 本机 install/doctor/status。它**不能**替代第二台 Mac 上默认实例的 native-host + 公网 OAuth 封板。
 
-需要已包含实例隔离的 Release（首个：`v0.4.0-alpha.16` 或更新）。不要用 `v0.4.0-alpha.15` 宣称命名实例 UAT。
+需要已包含实例隔离的 Release（`v0.4.0` stable 或任意 `v0.4.0-alpha.16+` prerelease）。不要用 `v0.4.0-alpha.15` 宣称命名实例 UAT。
 
 ## 测试平台
 
@@ -53,10 +53,12 @@
 
 ## 一键操作者引导（第二台 Mac，默认实例）
 
-若测更新的 prerelease，替换 `TAG`：
+**G4 stable 干净安装（维护者）：** 使用 **`v0.4.0` stable Release**，不要用 `alpha.17`/`alpha.19`。先前 G18 PASS 用的是 `v0.4.0-alpha.17`；G4 需从 stable 重新封板。
+
+仅在测试更新 stable 或有意测 prerelease 时替换 `TAG`：
 
 ```bash
-TAG=v0.4.0-alpha.16
+TAG=v0.4.0
 REPO=whshang/herdr-mcp
 WORKDIR="${HOME}/herdr-mcp-clean-uat"
 mkdir -p "$WORKDIR/bin" "$WORKDIR/dl" && cd "$WORKDIR"
@@ -90,7 +92,7 @@ herdr-mcp native-host status
 只用下载的 Release 二进制（禁止 `target/*/herdr-mcp`）。狗粮保持默认实例。
 
 ```bash
-TAG=v0.4.0-alpha.16
+TAG=v0.4.0
 REPO=whshang/herdr-mcp
 WORKDIR="${HOME}/herdr-mcp-clean-uat"
 mkdir -p "$WORKDIR/bin" "$WORKDIR/dl" && cd "$WORKDIR"
