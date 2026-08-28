@@ -613,6 +613,7 @@ dependencies = [
  "rustls",
  "ryu-js",
  "semver",
+ "serde",
  "serde_json",
  "sha2",
  "sigstore-trust-root",

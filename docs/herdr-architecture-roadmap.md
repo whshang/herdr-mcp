@@ -74,6 +74,32 @@ G5 Link production ownership **已 PASS**，不再是当前任务。**G18 第二
 - 18 tools parity；
 - runtime state 不替代 live state。
 
+### Modular Progressive Skills / Capability Scan
+
+状态：Progressive implementation 已随 `v0.4.0-alpha.16` 进入 production binary；默认仍 OFF。Capability Scan / Resolver 本轮补齐。
+
+冻结边界：
+
+- public MCP 继续 epoch 2 / 18 tools，不增加第 19 个 tool；
+- `herdr_mcp.skill.list/describe/load` 只走现有 `herdr_call` local namespace；
+- giant policy 拆为 global `AGENTS.md` + 7 个 on-demand Skill；
+- `HERDR_MCP_PROGRESSIVE_SKILLS` 在真实多 Agent UAT 前保持兼容默认；
+- unknown capability 永远不按 Agent 名称猜测。
+
+Capability truth：
+
+```text
+Herdr manifest + binary/version + bounded safe probe + live Agent state
+    → capability inventory
+    → capability resolver
+    → inspect/progressive compact projection
+    → dispatch decision
+```
+
+持久化边界：capability inventory 使用独立 SQLite schema，不提升 shared reliability `state.db` schema，避免新版本写入 capability metadata 后让旧 runtime rollback 因“state schema too new”失效。live status/cwd/project/pane/workspace/session 仍只认 Herdr/EventCache。
+
+生产迁移门禁：scan real smoke、resolver regression、capability-aware dispatch UAT、Progressive candidate ON A/B、CI/Grok audit 全 PASS 后，才评估 default ON；feature flag 是迁移/rollback gate，不应永久替代默认迁移决策。
+
 ### Batch A Performance
 
 状态：已完成，已验收。

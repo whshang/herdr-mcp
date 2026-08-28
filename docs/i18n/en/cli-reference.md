@@ -4,32 +4,37 @@ This page covers **herdr-mcp** commands only. For Herdr workspace, pane, agent a
 
 ## Daily runtime management
 
-On macOS, the main management CLI controls the LaunchAgent-backed runtime:
+The normal user path is the native Rust CLI installed from a GitHub Release:
 
 ```bash
+herdr-mcp install
 herdr-mcp status
-herdr-mcp start
-herdr-mcp stop
-herdr-mcp restart
-herdr-mcp logs
-herdr-mcp logs -f
+herdr-mcp doctor
+herdr-mcp update check
+herdr-mcp update apply
+herdr-mcp update status
+herdr-mcp rollback
+herdr-mcp uninstall
 ```
 
-Typical development loop:
+`service ...`, `link ...`, `native-host ...`, `candidate` and `dev` are advanced/internal commands. Do not use a repository checkout, Node.js, npm or `service install` as the normal runtime installation path.
+
+## Capability discovery: `scan`
+
+`doctor` answers **“is this installation healthy?”**. `scan` answers **“which local agent capabilities are actually evidenced on this workstation?”**.
 
 ```bash
-npm run build
-herdr-mcp restart
-herdr-mcp status
+herdr-mcp scan
+herdr-mcp scan --json
+herdr-mcp scan --probe
+herdr-mcp scan --refresh --probe
 ```
 
-For temporary development, run the Node process directly:
+The default scan reads Herdr agent manifests, discovers executable agent binaries on `PATH`, and records bounded `--version` evidence only for explicitly allowlisted self-description adapters that have passed side-effect smoke tests. `--probe` additionally runs bounded, non-interactive `--help` adapters for capabilities that can be proven from the agent's own CLI. A discovered binary with no trusted adapter remains installed-but-unprobed. `--refresh` explicitly reloads Herdr's agent manifests and bypasses cached probe evidence.
 
-```bash
-npm run dev
-# or
-node dist/server.js
-```
+Probe subprocesses receive no stdin, have a three-second timeout and a bounded output capture, and start from a cleared environment with only non-secret runtime variables restored. API keys, bearer tokens and provider credentials are not inherited. Unsupported or ambiguous traits remain unknown; herdr-mcp does not infer provider, model, vision, reasoning quality or code-edit support from an agent name.
+
+Static evidence is kept in a rollback-safe capability inventory under the herdr-mcp config directory. Live status, cwd, project, pane, workspace and session state always come from Herdr/EventCache and are not replaced by the inventory. `herdr_inspect` exposes only compact verified capability metadata for agents allowed by `HERDR_MCP_AGENT_ALLOW`.
 
 ## Connector information
 

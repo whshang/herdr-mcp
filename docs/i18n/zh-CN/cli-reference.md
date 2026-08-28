@@ -6,36 +6,37 @@ herdr-mcp 的命令可以按用途理解，而不是按 `bin/` 文件名死记�
 
 ## 日常管理：`herdr-mcp`
 
-macOS 上最常用的是项目的管理 CLI：
+普通用户应使用 GitHub Release 安装的原生 Rust CLI：
 
 ```bash
+herdr-mcp install
 herdr-mcp status
-herdr-mcp start
-herdr-mcp stop
-herdr-mcp restart
-herdr-mcp logs
-herdr-mcp logs -f
+herdr-mcp doctor
+herdr-mcp update check
+herdr-mcp update apply
+herdr-mcp update status
+herdr-mcp rollback
+herdr-mcp uninstall
 ```
 
-它管理本机 herdr-mcp runtime 的 LaunchAgent 生命周期。
+`service ...`、`link ...`、`native-host ...`、`candidate`、`dev` 属于高级/内部命令。正常安装本机 runtime 不需要仓库 checkout、Node.js、npm，也不应把 `service install` 当作普通用户入口。
 
-典型开发循环：
+## Agent 能力发现：`scan`
+
+`doctor` 回答的是**“这套安装现在健康吗？”**；`scan` 回答的是**“这台机器上的 Agent 到底有哪些已经被证据确认的能力？”**。
 
 ```bash
-npm run build
-herdr-mcp restart
-herdr-mcp status
+herdr-mcp scan
+herdr-mcp scan --json
+herdr-mcp scan --probe
+herdr-mcp scan --refresh --probe
 ```
 
-如果只是临时开发，也可以直接：
+默认 scan 会读取 Herdr Agent manifest、在 `PATH` 里发现真实 Agent binary；只有通过过副作用 smoke、进入显式 self-description adapter allowlist 的 Agent 才会执行有界 `--version`。`--probe` 额外运行有界、非交互的 `--help` adapter，只接受 Agent 自己 CLI 能明确证明的能力。发现 binary 但没有可信 adapter 时，只记录“已安装、未 probe”；`--refresh` 会显式重载 Herdr Agent manifest 并绕过已有 probe cache。
 
-```bash
-npm run dev
-# 或
-node dist/server.js
-```
+probe 子进程没有 stdin，超时上限为三秒，输出有大小上限，并且先清空继承环境，只恢复非敏感运行变量。API key、bearer token、provider credential 不会被继承。拿不到或存在歧义的字段继续保持 unknown；herdr-mcp 不会仅凭 Agent 名称猜 provider、model、vision、reasoning quality 或 code-edit 能力。
 
-此时不需要 LaunchAgent。
+静态 evidence 放在 herdr-mcp config 目录下独立、可回滚兼容的 capability inventory 中。status、cwd、project、pane、workspace、session 等实时事实始终来自 Herdr/EventCache，inventory 不会成为第二套 live truth。`herdr_inspect` 只向 `HERDR_MCP_AGENT_ALLOW` 允许看到的 Agent 投影紧凑的已验证 metadata。
 
 ## Connector 信息
 
