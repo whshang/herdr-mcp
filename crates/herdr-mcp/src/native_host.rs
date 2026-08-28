@@ -173,13 +173,23 @@ fn expected_extension_origin() -> Result<String, String> {
         return validate_extension_origin(origin.trim()).map(str::to_owned);
     }
 
-    let path = extension_path_for_install()?;
-    let id = chromium_id_for_path(&path)?;
-    Ok(format!("chrome-extension://{id}/"))
+    if let Some(path) = extension_path_for_install_optional()? {
+        let id = chromium_id_for_path(&path)?;
+        return Ok(format!("chrome-extension://{id}/"));
+    }
+    Ok(crate::browser_extension_identity::official_store_identity()?.origin)
 }
 
 #[cfg(unix)]
 pub(crate) fn extension_path_for_install() -> Result<PathBuf, String> {
+    extension_path_for_install_optional()?.ok_or_else(|| {
+        "extension directory not found: set HERDR_EXTENSION_PATH to an unpacked development extension directory when using an unpacked build"
+            .to_owned()
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn extension_path_for_install_optional() -> Result<Option<PathBuf>, String> {
     // Precedence for first install / origin derivation:
     // 1. HERDR_EXTENSION_PATH (explicit override; fail closed if set but invalid)
     // 2. managed ~/.config/herdr-mcp/extension (Release zip extract path)
@@ -190,33 +200,29 @@ pub(crate) fn extension_path_for_install() -> Result<PathBuf, String> {
         return require_extension_dir(
             &path,
             "HERDR_EXTENSION_PATH points to a missing or incomplete extension directory",
-        );
+        )
+        .map(Some);
     }
 
     if let Ok(runtime) = crate::paths::RuntimePaths::discover() {
         let managed = runtime.config_dir.join("extension");
         if is_extension_dir(&managed) {
-            return lexical_absolute(&managed);
+            return lexical_absolute(&managed).map(Some);
         }
     }
 
     if let Some(root) = env::var_os("HERDR_MCP_ROOT") {
         let path = PathBuf::from(root).join("extension");
         if is_extension_dir(&path) {
-            return lexical_absolute(&path);
+            return lexical_absolute(&path).map(Some);
         }
     }
 
     if let Some(path) = development_extension_path() {
-        return lexical_absolute(&path);
+        return lexical_absolute(&path).map(Some);
     }
 
-    Err(
-        "extension directory not found: extract the Release zip herdr-mcp-extension-<version>.zip \
-to ~/.config/herdr-mcp/extension (so that path contains manifest.json), or set \
-HERDR_EXTENSION_PATH to that unpacked directory, then re-run herdr-mcp native-host install"
-            .to_owned(),
-    )
+    Ok(None)
 }
 
 #[cfg(unix)]

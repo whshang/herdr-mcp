@@ -146,11 +146,43 @@ fn project_snapshot(
                 .is_some_and(|kind| inventory_by_agent.contains_key(kind))
         })
         .count();
+    let available_total = inventory
+        .iter()
+        .filter(|record| {
+            record
+                .available_for_start
+                .as_ref()
+                .is_some_and(|evidence| evidence.value)
+        })
+        .count();
+    let available_agents = inventory
+        .iter()
+        .filter(|record| {
+            record
+                .available_for_start
+                .as_ref()
+                .is_some_and(|evidence| evidence.value)
+                && visibility.is_visible(None, Some(record.agent.as_str()))
+        })
+        .map(|record| {
+            json!({
+                "kind": record.agent,
+                "binary_version": record.binary_version.as_ref().map(|value| value.value.clone()),
+                "can_run_headless": record.can_run_headless.as_ref().map(|value| value.value),
+                "supports_code_edit": record.supports_code_edit.as_ref().map(|value| value.value),
+                "supports_shell": record.supports_shell.as_ref().map(|value| value.value),
+            })
+        })
+        .collect::<Vec<_>>();
+    let hidden_available_agents = available_total.saturating_sub(available_agents.len());
     output.insert(
         "capability_inventory".to_owned(),
         json!({
             "source": if inventory.is_empty() { "not_scanned" } else { "scan_cache" },
+            "record_count": inventory.len(),
             "visible_worker_records": visible_scanned_workers,
+            "available_agents": available_agents,
+            "hidden_available_agents": hidden_available_agents,
             "unknown_semantics": "absent capability fields are unverified, never inferred",
             "refresh": "herdr-mcp scan --probe",
         }),
@@ -486,6 +518,27 @@ mod tests {
             manifest_source: Some("bundled".to_owned()),
             manifest_source_kind: Some("bundled".to_owned()),
             binary_path: Some(format!("/bin/{agent}")),
+            herdr_startable: Some(Evidence {
+                value: true,
+                source: "herdr_cli:agent_start_help".to_owned(),
+                authority: "herdr_declared".to_owned(),
+                observed_at_ms: 7,
+                detail: None,
+            }),
+            executable_available: Some(Evidence {
+                value: true,
+                source: "path_lookup".to_owned(),
+                authority: "observed".to_owned(),
+                observed_at_ms: 7,
+                detail: Some(format!("/bin/{agent}")),
+            }),
+            available_for_start: Some(Evidence {
+                value: true,
+                source: "herdr_start_kind+path_lookup".to_owned(),
+                authority: "derived".to_owned(),
+                observed_at_ms: 7,
+                detail: None,
+            }),
             binary_version: Some(Evidence {
                 value: format!("{agent} 1.2.3"),
                 source: "cli_version_probe".to_owned(),
@@ -540,6 +593,19 @@ mod tests {
         assert_eq!(output["agents"].as_array().unwrap().len(), 1);
         assert_eq!(output["agents_hidden"], 1);
         assert_eq!(output["capability_inventory"]["visible_worker_records"], 1);
+        assert_eq!(output["capability_inventory"]["record_count"], 2);
+        assert_eq!(
+            output["capability_inventory"]["available_agents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            output["capability_inventory"]["available_agents"][0]["kind"],
+            "pi"
+        );
+        assert_eq!(output["capability_inventory"]["hidden_available_agents"], 1);
         assert_eq!(
             output["agents"][0]["capabilities"]["source"],
             "capability_inventory"

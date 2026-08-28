@@ -8,9 +8,10 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-pub const PROBE_ADAPTER_VERSION: u32 = 1;
+pub const PROBE_ADAPTER_VERSION: u32 = 2;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_PROBE_OUTPUT_BYTES: usize = 32 * 1024;
+const MAX_HERDR_START_KINDS: usize = 256;
 const SAFE_ENV_KEYS: &[&str] = &["PATH", "LANG", "LC_ALL", "TMPDIR"];
 static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SAFE_SELF_DESCRIPTION_AGENTS: &[&str] = &[
@@ -147,6 +148,61 @@ pub fn find_executable(name: &str) -> Option<PathBuf> {
     find_executable_in_path(name, &path)
 }
 
+pub fn herdr_declared_start_kinds() -> Result<Vec<String>, String> {
+    let herdr = find_executable("herdr")
+        .ok_or_else(|| "Herdr CLI is not available on PATH for start-kind discovery".to_owned())?;
+    let output = run_bounded(
+        &herdr,
+        &[
+            OsStr::new("agent"),
+            OsStr::new("start"),
+            OsStr::new("--help"),
+        ],
+        COMMAND_TIMEOUT,
+    )?;
+    if output.timed_out {
+        return Err("Herdr start-kind discovery timed out".to_owned());
+    }
+    if !output.success {
+        return Err("Herdr start-kind discovery exited unsuccessfully".to_owned());
+    }
+    parse_herdr_start_kinds(&format!("{}\n{}", output.stdout, output.stderr))
+}
+
+fn parse_herdr_start_kinds(text: &str) -> Result<Vec<String>, String> {
+    let marker = "[possible values:";
+    let start = text
+        .find(marker)
+        .ok_or_else(|| "Herdr agent start help did not expose possible values".to_owned())?;
+    let rest = &text[start + marker.len()..];
+    let end = rest.find(']').ok_or_else(|| {
+        "Herdr agent start help has an unterminated possible-values list".to_owned()
+    })?;
+    let mut kinds = rest[..end]
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    kinds.sort();
+    kinds.dedup();
+    if kinds.is_empty() || kinds.len() > MAX_HERDR_START_KINDS {
+        return Err(format!(
+            "Herdr agent start help exposed {} possible values; expected 1..={MAX_HERDR_START_KINDS}",
+            kinds.len()
+        ));
+    }
+    if kinds.iter().any(|kind| {
+        kind.len() > 64
+            || !kind.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+            })
+    }) {
+        return Err("Herdr agent start help exposed an invalid agent kind".to_owned());
+    }
+    Ok(kinds)
+}
+
 fn find_executable_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {
     if name.contains(std::path::MAIN_SEPARATOR) {
         return None;
@@ -178,7 +234,12 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-pub fn fingerprint(agent: &str, manifest: &Value, binary: Option<&Path>) -> Result<String, String> {
+pub fn fingerprint(
+    agent: &str,
+    manifest: &Value,
+    binary: Option<&Path>,
+    herdr_startable: Option<bool>,
+) -> Result<String, String> {
     let mut digest = Sha256::new();
     digest.update(b"herdr-capability-fingerprint-v1\0");
     digest.update(agent.as_bytes());
@@ -191,6 +252,13 @@ pub fn fingerprint(agent: &str, manifest: &Value, binary: Option<&Path>) -> Resu
             digest.update(b"\0");
         }
     }
+    digest.update(b"herdr_startable=");
+    digest.update(match herdr_startable {
+        Some(true) => b"true".as_slice(),
+        Some(false) => b"false".as_slice(),
+        None => b"unknown".as_slice(),
+    });
+    digest.update(b"\0");
     digest.update(PROBE_ADAPTER_VERSION.to_le_bytes());
     if let Some(binary) = binary {
         digest.update(binary.as_os_str().as_encoded_bytes());
@@ -521,6 +589,21 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn herdr_start_kind_parser_uses_the_installed_cli_declaration() {
+        let kinds = parse_herdr_start_kinds(
+            "Usage: herdr agent start --kind <KIND>\n\n  --kind <KIND> [possible values: pi, claude, omp, qwen, mastracode]\n",
+        )
+        .unwrap();
+        assert_eq!(kinds, vec!["claude", "mastracode", "omp", "pi", "qwen"]);
+    }
+
+    #[test]
+    fn herdr_start_kind_parser_fails_closed_on_missing_or_invalid_declaration() {
+        assert!(parse_herdr_start_kinds("Usage: herdr agent start").is_err());
+        assert!(parse_herdr_start_kinds("[possible values: pi, ../foreign]").is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn print_flag_alone_does_not_verify_headless_execution() {
@@ -577,12 +660,17 @@ mod tests {
             "source": "bundled",
             "source_kind": "bundled"
         });
-        let first = fingerprint("demo", &first_manifest, Some(&binary)).unwrap();
-        let manifest_changed = fingerprint("demo", &second_manifest, Some(&binary)).unwrap();
+        let first = fingerprint("demo", &first_manifest, Some(&binary), Some(true)).unwrap();
+        let manifest_changed =
+            fingerprint("demo", &second_manifest, Some(&binary), Some(true)).unwrap();
         assert_ne!(first, manifest_changed);
+        let startability_changed =
+            fingerprint("demo", &first_manifest, Some(&binary), Some(false)).unwrap();
+        assert_ne!(first, startability_changed);
         fs::write(&binary, "#!/bin/sh\necho a-much-longer-version\n").unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-        let binary_changed = fingerprint("demo", &first_manifest, Some(&binary)).unwrap();
+        let binary_changed =
+            fingerprint("demo", &first_manifest, Some(&binary), Some(true)).unwrap();
         assert_ne!(first, binary_changed);
         let _ = fs::remove_dir_all(dir);
     }

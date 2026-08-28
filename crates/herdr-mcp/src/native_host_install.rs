@@ -61,6 +61,8 @@ struct InstallPaths {
     extension_path: Option<PathBuf>,
     extension_id: String,
     extension_origin: String,
+    extension_identity_source: String,
+    allow_origin_migration: bool,
     targets: Vec<(PathBuf, bool)>,
     backups_dir: PathBuf,
     rollback_file: PathBuf,
@@ -210,6 +212,8 @@ impl InstallPaths {
                 extension_path: None,
                 extension_id,
                 extension_origin: origin,
+                extension_identity_source: "durable_metadata".to_owned(),
+                allow_origin_migration: false,
                 targets,
                 backups_dir: native_dir.join(BACKUPS_DIR_NAME),
                 rollback_file: native_dir.join(ROLLBACK_FILE),
@@ -219,34 +223,37 @@ impl InstallPaths {
         }
 
         if matches!(command, NativeHostCommand::Install) {
-            if let Some(extension_origin) = find_registered_origin(&targets, &wrapper)? {
-                let extension_id = extension_id_from_origin(&extension_origin)
-                    .ok_or_else(|| "registered native-host origin is invalid".to_owned())?;
-                let extension_path = crate::native_host::extension_path_for_install()
-                    .ok()
-                    .filter(|path| {
-                        crate::native_host::chromium_id_for_path(path)
-                            .ok()
-                            .is_some_and(|id| id == extension_id)
-                    });
-                return Ok(Self {
+            if let Some(extension_origin) = explicit_extension_origin()? {
+                return Self::for_origin(
+                    &extension_origin,
+                    None,
+                    "env:HERDR_EXTENSION_ORIGIN",
+                    true,
                     source_binary,
-                    runtime_binary: native_dir.join("herdr-mcp"),
+                    native_dir,
                     wrapper,
-                    extension_path,
-                    extension_id,
-                    extension_origin,
                     targets,
-                    backups_dir: native_dir.join(BACKUPS_DIR_NAME),
-                    rollback_file: native_dir.join(ROLLBACK_FILE),
-                    pending_file: native_dir.join(PENDING_FILE),
-                    rollback_pending_file: native_dir.join(ROLLBACK_PENDING_FILE),
-                });
+                );
             }
-            let extension_path = crate::native_host::extension_path_for_install()?;
-            return Self::for_layout(
-                &extension_path,
-                Some(extension_path.clone()),
+            if env::var_os("HERDR_EXTENSION_PATH").is_some() {
+                let extension_path = crate::native_host::extension_path_for_install()?;
+                return Self::for_layout(
+                    &extension_path,
+                    Some(extension_path.clone()),
+                    "env:HERDR_EXTENSION_PATH",
+                    true,
+                    source_binary,
+                    native_dir,
+                    wrapper,
+                    targets,
+                );
+            }
+            let store = crate::browser_extension_identity::official_store_identity()?;
+            return Self::for_origin(
+                &store.origin,
+                None,
+                "chrome_web_store_contract",
+                true,
                 source_binary,
                 native_dir,
                 wrapper,
@@ -270,6 +277,8 @@ impl InstallPaths {
                 extension_path,
                 extension_id,
                 extension_origin,
+                extension_identity_source: "registered_manifest".to_owned(),
+                allow_origin_migration: false,
                 targets,
                 backups_dir: native_dir.join(BACKUPS_DIR_NAME),
                 rollback_file: native_dir.join(ROLLBACK_FILE),
@@ -278,10 +287,36 @@ impl InstallPaths {
             });
         }
 
-        let extension_path = crate::native_host::extension_path_for_install()?;
-        Self::for_layout(
-            &extension_path,
-            Some(extension_path.clone()),
+        if let Some(extension_origin) = explicit_extension_origin()? {
+            return Self::for_origin(
+                &extension_origin,
+                None,
+                "env:HERDR_EXTENSION_ORIGIN",
+                false,
+                source_binary,
+                native_dir,
+                wrapper,
+                targets,
+            );
+        }
+        if let Some(extension_path) = crate::native_host::extension_path_for_install_optional()? {
+            return Self::for_layout(
+                &extension_path,
+                Some(extension_path.clone()),
+                "extension_path",
+                false,
+                source_binary,
+                native_dir,
+                wrapper,
+                targets,
+            );
+        }
+        let store = crate::browser_extension_identity::official_store_identity()?;
+        Self::for_origin(
+            &store.origin,
+            None,
+            "chrome_web_store_contract",
+            false,
             source_binary,
             native_dir,
             wrapper,
@@ -300,6 +335,8 @@ impl InstallPaths {
         Self::for_layout(
             extension_path,
             Some(extension_path.to_path_buf()),
+            "test_extension_path",
+            false,
             source_binary.to_path_buf(),
             native_dir,
             wrapper,
@@ -310,6 +347,8 @@ impl InstallPaths {
     fn for_layout(
         identity_path: &Path,
         extension_path: Option<PathBuf>,
+        extension_identity_source: &str,
+        allow_origin_migration: bool,
         source_binary: PathBuf,
         native_dir: PathBuf,
         wrapper: PathBuf,
@@ -317,6 +356,30 @@ impl InstallPaths {
     ) -> Result<Self, String> {
         let extension_id = crate::native_host::chromium_id_for_path(identity_path)?;
         let extension_origin = format!("chrome-extension://{extension_id}/");
+        Self::for_origin(
+            &extension_origin,
+            extension_path,
+            extension_identity_source,
+            allow_origin_migration,
+            source_binary,
+            native_dir,
+            wrapper,
+            targets,
+        )
+    }
+
+    fn for_origin(
+        extension_origin: &str,
+        extension_path: Option<PathBuf>,
+        extension_identity_source: &str,
+        allow_origin_migration: bool,
+        source_binary: PathBuf,
+        native_dir: PathBuf,
+        wrapper: PathBuf,
+        targets: Vec<(PathBuf, bool)>,
+    ) -> Result<Self, String> {
+        let extension_id = extension_id_from_origin(extension_origin)
+            .ok_or_else(|| "native-host extension origin is invalid".to_owned())?;
         let backups_dir = native_dir.join(BACKUPS_DIR_NAME);
         let rollback_file = native_dir.join(ROLLBACK_FILE);
         let pending_file = native_dir.join(PENDING_FILE);
@@ -326,7 +389,9 @@ impl InstallPaths {
             wrapper,
             extension_path,
             extension_id,
-            extension_origin,
+            extension_origin: extension_origin.to_owned(),
+            extension_identity_source: extension_identity_source.to_owned(),
+            allow_origin_migration,
             targets,
             backups_dir,
             rollback_file,
@@ -398,6 +463,7 @@ fn install(paths: &InstallPaths) -> Result<Value, String> {
         "extension_id": paths.extension_id,
         "extension_path": paths.extension_path,
         "extension_origin": paths.extension_origin,
+        "extension_identity_source": paths.extension_identity_source,
         "runtime_binary": paths.runtime_binary,
         "runtime_sha256": runtime_sha256,
         "wrapper": paths.wrapper,
@@ -486,6 +552,13 @@ fn status(paths: &InstallPaths) -> Value {
     let recovery_required =
         path_present(&paths.pending_file) || path_present(&paths.rollback_pending_file);
     let rollback_in_progress = path_present(&paths.rollback_pending_file);
+    let official_store = crate::browser_extension_identity::official_store_identity().ok();
+    let official_store_extension_id = official_store
+        .as_ref()
+        .map(|identity| identity.extension_id.clone());
+    let store_origin_match = official_store
+        .as_ref()
+        .is_some_and(|identity| identity.origin == paths.extension_origin);
     json!({
         "ok": runtime_binary_ok && wrapper_ok && owned_count > 0,
         "implementation": "rust",
@@ -493,6 +566,9 @@ fn status(paths: &InstallPaths) -> Value {
         "extension_id": paths.extension_id,
         "extension_path": paths.extension_path,
         "extension_origin": paths.extension_origin,
+        "extension_identity_source": paths.extension_identity_source,
+        "official_store_extension_id": official_store_extension_id,
+        "store_origin_match": store_origin_match,
         "runtime_binary": paths.runtime_binary,
         "runtime_binary_ok": runtime_binary_ok,
         "runtime_matches_current": runtime_matches_current,
@@ -921,7 +997,10 @@ fn validate_cohort_ownership(paths: &InstallPaths) -> Result<(), String> {
         let manifest_path = target.join(format!("{HOST_NAME}.json"));
         if path_present(&manifest_path) {
             let view = manifest_status(&manifest_path, paths);
-            if view.get("owned").and_then(Value::as_bool) != Some(true) {
+            let owned = view.get("owned").and_then(Value::as_bool) == Some(true)
+                || (paths.allow_origin_migration
+                    && manifest_structurally_owned(&manifest_path, paths));
+            if !owned {
                 return Err(format!(
                     "native-host manifest {} is foreign or unowned",
                     manifest_path.display()
@@ -1609,6 +1688,23 @@ fn extension_id_from_origin(origin: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
+fn explicit_extension_origin() -> Result<Option<String>, String> {
+    let Some(raw) = env::var_os("HERDR_EXTENSION_ORIGIN") else {
+        return Ok(None);
+    };
+    let origin = raw.to_string_lossy().trim().to_owned();
+    if origin.is_empty() {
+        return Ok(None);
+    }
+    if extension_id_from_origin(&origin).is_none() {
+        return Err(
+            "HERDR_EXTENSION_ORIGIN is not a valid chrome-extension://<id>/ origin".to_owned(),
+        );
+    }
+    Ok(Some(origin))
+}
+
+#[cfg(target_os = "macos")]
 fn wrapper_body(paths: &InstallPaths) -> String {
     format!(
         "#!/bin/sh\n{WRAPPER_MARKER}\nexport HERDR_EXTENSION_ORIGIN={}\nexec {} extension-host \"$@\"\n",
@@ -1664,6 +1760,35 @@ fn manifest_status(path: &Path, paths: &InstallPaths) -> Value {
         "rust_wrapper": rust_wrapper,
         "owned": owned,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn manifest_structurally_owned(path: &Path, paths: &InstallPaths) -> bool {
+    let Ok(raw) = fs::read(path) else {
+        return false;
+    };
+    if raw.len() > 64 * 1024 {
+        return false;
+    }
+    let Ok(manifest) = serde_json::from_slice::<Value>(&raw) else {
+        return false;
+    };
+    let one_valid_origin = manifest
+        .get("allowed_origins")
+        .and_then(Value::as_array)
+        .is_some_and(|origins| {
+            origins.len() == 1
+                && origins
+                    .first()
+                    .and_then(Value::as_str)
+                    .and_then(extension_id_from_origin)
+                    .is_some()
+        });
+    wrapper_is_rust(&paths.wrapper)
+        && manifest.get("name").and_then(Value::as_str) == Some(HOST_NAME)
+        && manifest.get("type").and_then(Value::as_str) == Some("stdio")
+        && manifest.get("path").and_then(Value::as_str) == paths.wrapper.to_str()
+        && one_valid_origin
 }
 
 #[cfg(target_os = "macos")]
@@ -1931,6 +2056,53 @@ mod tests {
         assert!(!stable_manifest.exists());
         assert!(!paths.wrapper.exists());
         assert!(!paths.runtime_binary.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owned_unpacked_origin_migrates_transactionally_to_store_origin_and_rolls_back() {
+        let (root, dev_paths) = fixture();
+        install(&dev_paths).unwrap();
+        let old_origin = dev_paths.extension_origin.clone();
+        let old_wrapper = fs::read_to_string(&dev_paths.wrapper).unwrap();
+        let stable_manifest = dev_paths.targets[0].0.join(format!("{HOST_NAME}.json"));
+        let old_manifest = fs::read(&stable_manifest).unwrap();
+
+        let store = crate::browser_extension_identity::official_store_identity().unwrap();
+        assert_ne!(store.origin, old_origin);
+        let native_dir = dev_paths.runtime_binary.parent().unwrap().to_path_buf();
+        let store_paths = InstallPaths::for_origin(
+            &store.origin,
+            None,
+            "chrome_web_store_contract",
+            true,
+            dev_paths.source_binary.clone(),
+            native_dir,
+            dev_paths.wrapper.clone(),
+            dev_paths.targets.clone(),
+        )
+        .unwrap();
+
+        let migrated = install(&store_paths).unwrap();
+        assert_eq!(migrated["ok"], true);
+        assert_eq!(migrated["extension_origin"], store.origin);
+        assert_eq!(
+            migrated["extension_identity_source"],
+            "chrome_web_store_contract"
+        );
+        let migrated_manifest: Value =
+            serde_json::from_slice(&fs::read(&stable_manifest).unwrap()).unwrap();
+        assert_eq!(migrated_manifest["allowed_origins"], json!([store.origin]));
+        assert!(
+            fs::read_to_string(&store_paths.wrapper)
+                .unwrap()
+                .contains(&store.origin)
+        );
+
+        let rolled_back = rollback(&store_paths).unwrap();
+        assert_eq!(rolled_back["ok"], true);
+        assert_eq!(fs::read_to_string(&dev_paths.wrapper).unwrap(), old_wrapper);
+        assert_eq!(fs::read(&stable_manifest).unwrap(), old_manifest);
         fs::remove_dir_all(root).unwrap();
     }
 

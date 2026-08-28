@@ -38,6 +38,12 @@ pub struct AgentCapabilityRecord {
     pub manifest_source_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub herdr_startable: Option<Evidence<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_available: Option<Evidence<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_for_start: Option<Evidence<bool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binary_version: Option<Evidence<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -336,6 +342,9 @@ mod tests {
             manifest_source: Some("bundled".to_owned()),
             manifest_source_kind: Some("bundled".to_owned()),
             binary_path: Some(format!("/bin/{agent}")),
+            herdr_startable: None,
+            executable_available: None,
+            available_for_start: None,
             binary_version: None,
             provider: None,
             model: None,
