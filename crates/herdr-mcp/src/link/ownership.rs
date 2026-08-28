@@ -567,7 +567,8 @@ pub fn doctor_layer_summary(home: &Path, config_dir: &Path) -> String {
         "unowned"
     };
     format!(
-        "{ownership} production_owner={owner} prod_impl={prod_impl} prod_loaded={prod_loaded} link_impl={link_impl} link_loaded={link_loaded} production_ready_eligible={eligible} remote-probe=skipped"
+        "{ownership} production_owner={owner} prod_impl={prod_impl} prod_loaded={prod_loaded} link_impl={link_impl} link_loaded={link_loaded} candidate_label={} production_ready_eligible={eligible} remote-probe=edge-layer",
+        crate::link::install::LINK_RUST_CANDIDATE_LABEL
     )
 }
 
