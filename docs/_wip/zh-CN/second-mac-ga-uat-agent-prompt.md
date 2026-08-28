@@ -10,7 +10,7 @@
 ```text
 你收到了第二台 Mac GA UAT 协议。立即阅读本 URL 对应全文并开始执行 — 不要开场白、不要问「是否继续」，除非必须暂停等 Cloudflare API Token 或 Chrome Load unpacked。
 
-目标：在 pi 完成 G18 默认实例干净机 UAT — 独立 Herdr、Release `herdr-mcp` runtime、独立 Cloudflare Worker（仅 workers.dev）、独立 Link、扩展 + native-host；最后把 ChatGPT Connector URL 交给 owner 做 OAuth。
+目标：在 pi 完成 G4 默认实例干净机 UAT — 独立 Herdr、Release `v0.4.0` stable runtime、独立 Cloudflare Worker（仅 workers.dev）、独立 Link、扩展 + native-host；最后把 ChatGPT Connector URL 交给 owner 做 OAuth。
 
 卡住时参考：agent-install.md、clean-machine-uat.md、chatgpt-connector.md
 ```
@@ -43,7 +43,7 @@
 
 ### 1. 启动前检查
 
-6. GitHub Releases 最新 alpha（基线 `v0.4.0-alpha.16`；有更新则用最新 prerelease）。记录 `TAG`。
+6. GitHub Releases 最新 **stable**：`TAG=v0.4.0`（G4 干净安装）。G4 封板不要用 `alpha.17`/`alpha.19`。
 7. macOS Apple Silicon；`launchctl list | awk '$3 ~ /herdr-mcp/'` 为空；`:8772` 空闲。默认实例 — 不是狗粮 `--instance uat`。
 8. **不得**连接或配置 `herdr-edge-prod` / `wss://herdr-edge-prod.*.workers.dev/ws`。
 
@@ -58,7 +58,7 @@
 12. 下载 Release 到 `$HOME/herdr-mcp-clean-uat`（不要 `git clone` 当 runtime）：
 
     ```bash
-    TAG=v0.4.0-alpha.16
+    TAG=v0.4.0
     REPO=whshang/herdr-mcp
     WORKDIR="${HOME}/herdr-mcp-clean-uat"
     mkdir -p "$WORKDIR/bin" "$WORKDIR/dl" && cd "$WORKDIR"
@@ -71,7 +71,7 @@
     export PATH="$WORKDIR/bin:$PATH"
     ```
 
-13. `herdr-mcp install` → `doctor` → `status` → `update check`。Alpha 期保持 `update.channel = "preview"`。
+13. `herdr-mcp install` → `doctor` → `status` → `update check`。`v0.4.0` 上预期 `update.channel=stable` 且 head 处 `available=false`。
 
 ### 4. 身份（仅内存）
 

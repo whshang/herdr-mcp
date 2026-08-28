@@ -10,7 +10,7 @@
 ```text
 You received the second-Mac GA UAT contract. Read the full document at this URL and begin execution immediately — no preamble, no "shall I proceed?" unless you must pause for Cloudflare API Token creation or Chrome Load unpacked.
 
-Goal: G18 default-instance clean-machine UAT on pi — independent Herdr, Release `herdr-mcp` runtime, independent Cloudflare Worker (workers.dev only), independent Link, extension + native-host; hand ChatGPT Connector URL to owner for OAuth.
+Goal: G4 default-instance clean-machine UAT on pi — independent Herdr, Release `v0.4.0` stable runtime, independent Cloudflare Worker (workers.dev only), independent Link, extension + native-host; hand ChatGPT Connector URL to owner for OAuth.
 
 References (read if blocked): agent-install.md, clean-machine-uat.md, chatgpt-connector.md
 ```
@@ -43,7 +43,7 @@ References (read if blocked): agent-install.md, clean-machine-uat.md, chatgpt-co
 
 ### 1. Preflight
 
-6. Latest alpha from GitHub Releases (baseline `v0.4.0-alpha.16`; use newer prerelease if available). Record `TAG`.
+6. Latest **stable** from GitHub Releases: `TAG=v0.4.0` (G4 clean install). Do not use `alpha.17`/`alpha.19` for G4 seal.
 7. macOS Apple Silicon; `launchctl list | awk '$3 ~ /herdr-mcp/'` empty; `:8772` free. Default instance — not dogfood `--instance uat`.
 8. Do **not** connect to or configure `herdr-edge-prod` / `wss://herdr-edge-prod.*.workers.dev/ws`.
 
@@ -58,7 +58,7 @@ References (read if blocked): agent-install.md, clean-machine-uat.md, chatgpt-co
 12. Download Release assets to `$HOME/herdr-mcp-clean-uat` (no `git clone` as runtime):
 
     ```bash
-    TAG=v0.4.0-alpha.16
+    TAG=v0.4.0
     REPO=whshang/herdr-mcp
     WORKDIR="${HOME}/herdr-mcp-clean-uat"
     mkdir -p "$WORKDIR/bin" "$WORKDIR/dl" && cd "$WORKDIR"
@@ -71,7 +71,7 @@ References (read if blocked): agent-install.md, clean-machine-uat.md, chatgpt-co
     export PATH="$WORKDIR/bin:$PATH"
     ```
 
-13. `herdr-mcp install` → `doctor` → `status` → `update check`. Keep `update.channel = "preview"` during alpha.
+13. `herdr-mcp install` → `doctor` → `status` → `update check`. Expect `update.channel=stable` and `available=false` at head on `v0.4.0`.
 
 ### 4. Identities (memory only)
 

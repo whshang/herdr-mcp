@@ -1,6 +1,6 @@
 # GA Candidate Status — `0.4.0` stable
 
-Status: **`v0.4.0` stable published** (2026-08-28). Stable-channel G9/G10 **PASS**. **Full GA not declared** — G20–G22 docs freeze and remaining vetoes in [`ga-release-gate.md`](./ga-release-gate.md).
+Status: **`v0.4.0` stable published** (2026-08-28). Stable-channel G9/G10 **PASS**. G1 dogfood stable apply **PASS**. **Full GA not declared** — G4 stable clean install UAT remains open in [`ga-release-gate.md`](./ga-release-gate.md).
 
 SSOT for gate rows: [`docs/ga-release-gate.md`](./ga-release-gate.md). Exit-alpha runbook: [`docs/exit-alpha-checklist.md`](./exit-alpha-checklist.md).
 
@@ -13,9 +13,10 @@ SSOT for gate rows: [`docs/ga-release-gate.md`](./ga-release-gate.md). Exit-alph
 | Stable Release version | `0.4.0` |
 | Git tag | `v0.4.0` |
 | Tag commit | `19fc6a41a7e35d850981f2c66119035f5a2c467d` (#142) |
-| Runtime version (dogfood post G9/G10) | `0.4.0-alpha.19` (rollback baseline) |
-| Generation (dogfood baseline) | `rust-3d2f685c636c3f3e` |
-| Stable apply generation (rehearsal) | `rust-621d74d268b5299a` |
+| Runtime version (dogfood) | `0.4.0` |
+| Generation (dogfood) | `rust-621d74d268b5299a` |
+| Prior rollback baseline | `0.4.0-alpha.19` / `rust-3d2f685c636c3f3e` |
+| Stable apply job (GA closure) | `upd-1787908596603-46525-621d74d2` |
 | Contract | epoch 2 / 18 tools / state schema 4 |
 | Release URL | <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0> |
 | Tag-path workflow | [Rust Release run 33157370273](https://github.com/whshang/herdr-mcp/actions/runs/33157370273) — verify → build → manifest → attest → **publish** all PASS |
@@ -71,23 +72,32 @@ Evidence (local, gitignored): `docs/_wip/g910-stable-v040-20260828.json`
 | `rollback` 0.4.0→alpha.19 | PASS | `rb-1787907991968-rust-621d74d2`, guardian settled |
 | Post-rollback `doctor` / native-host | PASS | restored `0.4.0-alpha.19` |
 
+### Dogfood GA-closure stable apply (2026-08-28 · PASS)
+
+| Step | Result | Notes |
+| --- | --- | --- |
+| Preflight `alpha.19` | PASS | generation `rust-3d2f685c636c3f3e` |
+| `update check` (stable) | PASS | `0.4.0` available |
+| `update apply` alpha.19→0.4.0 | PASS | job `upd-1787908596603-46525-621d74d2` → `rust-621d74d268b5299a` |
+| Post-apply native-host | PASS | `runtime_matches_current=true`, version `0.4.0` |
+| Post-apply link | PASS | prod Link Rust, `production_ready=true` |
+| Post-apply `doctor` | PASS | all layers green |
+
 ## Remaining GA blockers (honest)
 
 | Gate | Why still open |
 | --- | --- |
-| G1 | Dogfood rolled back to `alpha.19` after stable G9/G10 rehearsal; optional stable apply pending |
 | G4 | Second Mac clean install from `v0.4.0` stable Release not yet sealed (prior G18 used `alpha.17`) |
-| G24 / G25 | G4 UAT open; G1 dogfood version not yet unified to `0.4.0` |
+| G24 / G25 | G4 UAT open; **do not declare GA** until G4 seals |
 
 ## Can declare GA stable?
 
-**Not yet.** `v0.4.0` stable Release exists; stable-channel G9/G10 PASS; user-facing docs now reference `v0.4.0` stable. Missing: G4 second-Mac stable clean install UAT, G1 dogfood optional stable apply, G25 veto #8 until G4 seals.
+**Not yet.** `v0.4.0` stable Release exists; stable-channel G9/G10 PASS; G1 dogfood `0.4.0`; user-facing docs reference `v0.4.0` stable. Missing: **G4** second-Mac stable clean install UAT; G25 veto #8 until G4 seals.
 
 ## Next owner actions
 
 1. **G4 — second Mac clean install** from [`v0.4.0` Release](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0) binary (see [clean-machine-uat §One-command bootstrap](i18n/en/clean-machine-uat.md#one-command-operator-bootstrap-second-mac-default-instance); prior G18 used `alpha.17`).
-2. **G1 — exit alpha** (optionally `update apply` on dogfood to leave `0.4.0` resident after G4 PASS).
-3. Re-run scorecard; if G24/G25 clear → declare GA.
+2. Re-run scorecard; if G4/G24/G25 clear → declare GA.
 
 ## Related
 
