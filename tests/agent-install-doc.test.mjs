@@ -13,9 +13,10 @@ test("README exposes copyable local-Agent prompts that point to the authoritativ
   const ja = read("README.ja.md");
   assert.match(en, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/quick-agent-install\.md/);
   assert.match(zh, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/zh-CN\/quick-agent-install\.md/);
-  assert.match(ja, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/agent-install\.md/);
+  assert.match(ja, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/quick-agent-install\.md/);
   assert.match(en, /quick-agent-install\.md/);
   assert.match(zh, /quick-agent-install\.md/);
+  assert.match(ja, /quick-agent-install\.md/);
 });
 
 test("Agent install guides own Cloudflare-token handoff and workers.dev-only bootstrap", () => {
