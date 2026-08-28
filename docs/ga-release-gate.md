@@ -279,9 +279,9 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ## Current Scorecard（2026-08-28 · v0.4.0 stable published · GA freeze）
 
-评分：`PASS` / `PARTIAL` / `FAIL` / `DEFERRED` / `UNKNOWN`。本表对齐 live dogfood baseline `0.4.0-alpha.19`（generation `rust-3d2f685c636c3f3e`，post stable G9/G10 rollback）与 stable Release <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0>（tag commit `19fc6a4`；Rust Release run `33157370273`）。**`v0.4.0` stable tag 已打**；rc.1 / alpha.19 保留。候选快照：[`docs/ga-candidate-status.md`](./ga-candidate-status.md)。
+评分：`PASS` / `PARTIAL` / `FAIL` / `DEFERRED` / `UNKNOWN`。本表对齐 live dogfood baseline `0.4.0`（generation `rust-621d74d268b5299a`，post GA-closure stable apply）与 stable Release <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0>（tag commit `19fc6a4`；Rust Release run `33157370273`）。**`v0.4.0` stable tag 已打**；rc.1 / alpha.19 保留。候选快照：[`docs/ga-candidate-status.md`](./ga-candidate-status.md)。
 
-本机 dogfood（默认实例，post stable G9/G10 rollback）：`production_ready=true`；`dev.herdr-mcp.server` `:8772` healthy；production Link=Rust；epoch 2 / 18 tools；用户 CLI → `runtime/current` → `0.4.0-alpha.19`；`update.channel=stable`（config.toml）；`native-host status` `runtime_matches_current=true`。**G5 保持 PASS**。
+本机 dogfood（默认实例，post GA-closure stable apply）：`production_ready=true`；`dev.herdr-mcp.server` `:8772` healthy；production Link=Rust；epoch 2 / 18 tools；用户 CLI → `runtime/current` → `0.4.0` / `rust-621d74d268b5299a`；`update.channel=stable`（config.toml）；`native-host status` `runtime_matches_current=true`。**G5 保持 PASS**。
 
 **Dogfood G6/G7 public UAT（2026-08-28 · alpha.19 · PASS）：** 默认实例公网路径 OAuth DCR+PKCE → `tools/list` 18/18 → read-only smoke → bounded `fs_write`（无重复）→ `exec_start`/`exec_read` 完成。证据 [`_wip/g67-dogfood-public-uat-20260828.json`](./_wip/g67-dogfood-public-uat-20260828.json)。
 
@@ -293,7 +293,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 | ID | 评分 | 一行证据 |
 | --- | --- | --- |
-| G1 | **PARTIAL** | `v0.4.0` stable tag + Release + user docs 已统一；dogfood post-rollback 仍 `alpha.19` |
+| G1 | **PASS** | `v0.4.0` stable tag + Release + user docs + dogfood runtime 已统一；无 alpha 主口径 |
 | G2 | **PASS** | stable tag-path publish 全绿（run `33157370273`）；manifest `source_commit=19fc6a4`；rc.1 run `33155520284` 仍有效 |
 | G3 | **PASS** | 顶层 CLI + symlink → `runtime/current`；README/install 已对齐 `v0.4.0` stable |
 | G4 | **PARTIAL** | 第二台 Mac + dogfood install/doctor 已封；从 **`v0.4.0` stable Release** 干净安装 UAT 未封（G18 曾用 alpha.17） |
@@ -316,10 +316,10 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G21 | **PASS** | 站点 CI 可绿；`v0.4.0` stable tag 已打；docs freeze 完成 |
 | G22 | **PASS** | 用户安装主路径不依赖开发仓库；第二台 Mac 实证已封 |
 | G23 | **PARTIAL** | main CI 可绿；stable tag-path Rust Release 全绿（`33157370273`）；#142 merged |
-| G24 | **PARTIAL** | 剩余 blocker：G4 stable clean install UAT、G1 dogfood 可选 stable apply |
-| G25 | **PARTIAL** | G4 UAT 未封；dogfood 仍 `alpha.19`；veto #8 待 G4 封板 |
+| G24 | **PARTIAL** | 剩余 blocker：**G4** stable clean install UAT（第二台 Mac 从 `v0.4.0` Release） |
+| G25 | **PARTIAL** | G4 UAT 未封；veto #8 待 G4 封板；**不得 declare GA** |
 
-**合计（诚实快照）**：PASS 12 · PARTIAL 9 · FAIL 0 · DEFERRED 1 · UNKNOWN 0
+**合计（诚实快照）**：PASS 13 · PARTIAL 8 · FAIL 0 · DEFERRED 1 · UNKNOWN 0
 
 ### G6/G7 dogfood public evidence（2026-08-28 · alpha.19 · PASS）
 
@@ -526,10 +526,9 @@ herdr-mcp --instance uat uninstall
 按 2026-08-28 GA freeze（`v0.4.0` stable published；stable-channel G9/G10 PASS；G20–G22 docs freeze DONE）排序：
 
 1. **G4 — stable Release 干净安装 UAT**（第二台 Mac 从 [`v0.4.0` Release](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0) 二进制；见 [clean-machine-uat](i18n/en/clean-machine-uat.md)）。
-2. **G1 — 退出 alpha 口径**（G4 PASS 后 dogfood 可选 `update apply` 留驻 `0.4.0`）。
-3. **G16 — 保持 DEFERRED**（browser terminal / true-steer 不进第一 GA）。
+2. **G16 — 保持 DEFERRED**（browser terminal / true-steer 不进第一 GA）。
 
-**已完成：** `v0.4.0` stable tag + tag-path PASS（#142）、preview `alpha.19↔rc.1` + stable `alpha.19↔0.4.0` update/rollback、G2/G6/G7/G9/G10/G12/G13/G18/G20/G21/G22。
+**已完成：** `v0.4.0` stable tag + tag-path PASS（#142）、preview `alpha.19↔rc.1` + stable `alpha.19↔0.4.0` update/rollback、G1 dogfood stable apply（`upd-1787908596603-46525-621d74d2`）、G2/G6/G7/G9/G10/G12/G13/G18/G20/G21/G22。
 
 ### GA closure C — stable update/rollback rehearsal（2026-08-28 · PASS）
 
@@ -547,7 +546,7 @@ herdr-mcp rollback
 herdr-mcp doctor
 ```
 
-**Remaining for GA:** G20–G22 docs freeze; G4 stable clean install UAT; G1 version unification in user-facing docs.
+**Remaining for GA:** G4 stable clean install UAT on second Mac from `v0.4.0` Release.
 
 ---
 
