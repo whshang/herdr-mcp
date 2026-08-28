@@ -175,6 +175,21 @@ If the ID is correct but the label is stale, the extension should refresh it fro
 
 If the ID itself is wrong, bind to the correct workspace.
 
+## Symptom: Browser Control Center will not open, shows no workspaces, or stays on Runtime unavailable
+
+Separate a **Side Panel UI problem**, a **Native Messaging identity problem**, and a **runtime problem**:
+
+1. Open the panel through “Browser Control Center” in the extension Popup rather than navigating to `control-center.html` as a normal web page.
+2. `herdr-mcp status` / `herdr-mcp doctor` should first prove the local runtime is healthy.
+3. `herdr-mcp native-host status` should report the Native Messaging host registered.
+4. If the extension was just updated, reload it in `chrome://extensions`.
+5. If a developer changes the absolute unpacked-extension path, Chromium may assign a different extension ID. A Native Messaging `allowed_origins` entry for the old ID can then produce `Access to the specified native messaging host is forbidden`. Re-register the Native Host for the current development identity rather than copying a bearer into browser storage.
+6. `Runtime healthy · event stream reconnecting` means the panel still has a snapshot while incremental events recover; it does not mean the whole local runtime is down. Use Refresh for an authoritative reconciliation.
+
+Prompt / Steer / Herdr / Terminal are intentionally Preview-only in the current Control Center. That is not a failure. The executable actions today are `Inspect state` and the bounded `Read output tail`.
+
+See [Browser Control Center](browser-control-center.md).
+
 ## Symptom: ChatGPT response is partial, disconnected or shows send timeout
 
 Do not immediately resend the original task. Tool mutations may already have occurred.
@@ -190,6 +205,21 @@ Continuity recovery is evidence-first:
 If automatic recovery cannot obtain trustworthy evidence, refresh manually and use **Herdr monitor** to re-read local state before continuing.
 
 See [Wake, recovery and handoff](extension-wake.md).
+
+## Symptom: ChatGPT Queue did not send immediately or queued content is still pending
+
+Queue is intentionally **not an immediate send**. While the assistant turn is live, content should remain in the current conversation's durable queue and send only after the turn settles, before generic auto-continue.
+
+Check:
+
+- the page is ChatGPT; other sites do not currently expose the same Queue UI;
+- whether the assistant is still generating, using tools, or waiting on a permission card; a live turn must not be interrupted by Queue;
+- a `turn-in-progress` or uncertain submit is not ACKed or dropped;
+- clicking Queue with an empty composer can retry a still-pending batch;
+- right-clicking Queue explicitly clears the current conversation queue;
+- after confirmed handoff, pending entries move to the new conversation and should not replay from the source.
+
+Content disappearing without confirmed delivery is the actual reliability failure. Capture the conversation, current turn state, and browser console evidence before filing an issue.
 
 ## Symptom: Manual handoff is unavailable
 

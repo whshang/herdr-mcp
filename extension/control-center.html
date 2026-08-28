@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="i18n-pending">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -10,50 +10,62 @@
   <main class="control-center">
     <header class="topbar">
       <div class="title-row">
-        <h1>Herdr Control Center</h1>
+        <h1 id="pageTitle" data-i18n="cc_title">Herdr Control Center</h1>
+        <button id="settingsButton" type="button" class="ghost" data-i18n="cc_settings">Settings</button>
       </div>
       <div class="runtime-line">
         <span id="runtimeDot" class="dot offline"></span>
-        <span id="runtimeText">Runtime connecting…</span>
+        <span id="runtimeText" data-i18n="cc_runtime_connecting">Runtime connecting…</span>
         <span id="runtimeStats" class="stats">0 workspaces · 0 panes · 0 working</span>
       </div>
       <div class="toolbar">
-        <button id="refreshButton" type="button">Refresh</button>
-        <button id="collapseButton" type="button" class="ghost">Collapse all</button>
+        <button id="refreshButton" type="button" data-i18n="cc_refresh">Refresh</button>
+        <button id="collapseButton" type="button" class="ghost" data-i18n="cc_collapse_all">Collapse all</button>
       </div>
     </header>
 
-    <section id="workspaceList" class="workspace-list" aria-label="Herdr workspaces">
-      <div class="empty">Loading local Herdr state…</div>
+    <section class="phase-banner" aria-live="polite">
+      <strong data-i18n="cc_phase_title">Live state · preview-only controls</strong>
+      <p data-i18n="cc_phase_body">Workspace and pane state is live. Inspect and output-tail reads run now; Prompt, Steer, Herdr and Terminal actions only build a preview in this release.</p>
     </section>
 
-    <section class="control-dock" aria-label="Pinned control target">
+    <section id="workspaceList" class="workspace-list" aria-label="Herdr workspaces" data-i18n-aria="cc_workspace_aria">
+      <div class="empty" data-i18n="cc_loading">Loading local Herdr state…</div>
+    </section>
+
+    <section class="control-dock" aria-label="Pinned control target" data-i18n-aria="cc_target_aria">
       <div id="targetCard" class="target-card">
+        <div class="target-label" data-i18n="cc_target_label">Pinned target</div>
         <div class="target-heading">
-          <span>📌</span>
-          <strong id="targetTitle">No pinned target</strong>
+          <span aria-hidden="true">📌</span>
+          <strong id="targetTitle" data-i18n="cc_no_target">No pinned target</strong>
           <span class="spacer"></span>
-          <button id="unpinButton" type="button" class="ghost" disabled>Unpin</button>
+          <button id="unpinButton" type="button" class="ghost" disabled data-i18n="cc_unpin">Unpin</button>
         </div>
-        <div id="targetDetails" class="target-details">Click a pane above to pin it. Herdr focus changes will not retarget this control.</div>
+        <div id="targetDetails" class="target-details" data-i18n="cc_target_help">Click a pane above to pin it. Herdr focus changes will not retarget this control.</div>
         <div class="read-actions">
-          <button id="inspectButton" type="button" disabled>Inspect</button>
-          <button id="readTailButton" type="button" disabled>Read bounded tail</button>
+          <button id="inspectButton" type="button" disabled data-i18n="cc_inspect_state">Inspect state</button>
+          <button id="readTailButton" type="button" disabled data-i18n="cc_read_tail">Read output tail</button>
         </div>
       </div>
 
-      <div id="modeTabs" class="mode-tabs" role="tablist" aria-label="Control mode">
-        <button type="button" data-mode="agent_prompt" class="active">Prompt</button>
-        <button type="button" data-mode="steer">Steer</button>
-        <button type="button" data-mode="herdr_method">Herdr</button>
-        <button type="button" data-mode="terminal_text">Terminal</button>
+      <div class="preview-heading">
+        <strong data-i18n="cc_preview_heading">Action preview</strong>
+        <span data-i18n="cc_preview_badge">PREVIEW ONLY</span>
       </div>
+      <div id="modeTabs" class="mode-tabs" role="tablist" aria-label="Control mode" data-i18n-aria="cc_mode_aria">
+        <button type="button" data-mode="agent_prompt" class="active" data-i18n="cc_mode_prompt">Prompt</button>
+        <button type="button" data-mode="steer" data-i18n="cc_mode_steer">Steer</button>
+        <button type="button" data-mode="herdr_method" data-i18n="cc_mode_herdr">Herdr</button>
+        <button type="button" data-mode="terminal_text" data-i18n="cc_mode_terminal">Terminal</button>
+      </div>
+      <div id="modeHelp" class="mode-help" data-i18n="cc_mode_prompt_help">Preview a prompt for the pinned agent. Nothing is sent.</div>
 
-      <textarea id="composer" placeholder="Describe the intended action. Phase A validates mutation actions as dry-run only."></textarea>
+      <textarea id="composer" placeholder="Describe the prompt you would send to the pinned agent."></textarea>
       <div class="composer-footer">
-        <span id="riskBadge" class="risk">MUTATION</span>
-        <span id="blockedReason" class="blocked-reason">Waiting for Rust control plane reliability</span>
-        <button id="sendButton" type="button" class="primary">Dry run</button>
+        <span id="riskBadge" class="risk">WRITE</span>
+        <span id="blockedReason" class="blocked-reason" data-i18n="cc_preview_only_reason">Preview only in this release</span>
+        <button id="sendButton" type="button" class="primary" data-i18n="cc_preview_action">Preview action</button>
       </div>
       <pre id="result" class="result" aria-live="polite"></pre>
     </section>

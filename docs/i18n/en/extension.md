@@ -1,222 +1,365 @@
-# Browser Extension: keep Web AI work continuous
+# Browser extension: continuity, Control Center, and the local bridge
 
-The browser extension is the continuity layer of herdr-mcp.
+The herdr-mcp browser extension is not a generic web-clicking bot and it is not a second agent runtime.
 
-MCP solves:
+It connects the Web conversation, the real local Herdr worksite, and the MCP runtime into a long-lived browser workflow that can be observed and recovered.
 
-```text
-ChatGPT / Web AI → local Herdr workstation
-```
-
-The extension solves:
+With MCP alone, the primary direction is:
 
 ```text
-local Herdr workstation → browser conversation
+Web AI → local workstation
 ```
 
-Together they make browser-based AI suitable for development tasks that last tens of minutes or hours.
+The browser extension adds a return path from the workstation to the conversation plus a Side Panel that observes local Herdr state directly:
 
-Chrome display name: **herdr → Web wake**.
+```text
+local Herdr → browser extension → Web conversation
+                         ↘ Control Center
+```
 
-The extension is not another agent runtime or a second orchestration platform. It maintains the connection between a browser conversation, local Herdr workspace and MCP runtime.
+## Three product surfaces
 
-## Two capability lines
+The current extension is easiest to understand as three responsibilities.
 
-| Line | Problem | Typical use |
+| Surface | Problem it solves | Main entry point |
 |---|---|---|
-| A. Browser continuity | The browser turn ended while local work continues | progress, settled wake, recovery, conversation handoff |
-| B. JSON → MCP bridge | A Web AI site has no native MCP Connector | z.ai / DeepSeek calling local Herdr tools |
+| Continuity | How does the correct Web conversation continue, recover, or hand off after local work changes? | In-page HUD |
+| Control Center | What workspaces / panes / agents exist locally, and which pane is the explicit human target? | Chrome Side Panel |
+| JSON → MCP bridge | How can a Web AI without a native MCP Connector call local Herdr tools? | Inside z.ai / DeepSeek |
 
-They share trusted local transport but solve different problems.
+The **Queue** button beside the ChatGPT composer is a related interaction capability: it records “send this user intent after the current reply” without interrupting the live assistant turn.
+
+## What each entry point is for
+
+| Entry point | Responsibility |
+|---|---|
+| Popup | Quick local health, current scope binding / Auto state, and the Control Center launcher |
+| HUD | Current Project / conversation binding, Auto, manual continue, monitor, LLM judge, and handoff |
+| Control Center | Live workspaces / panes / agents, explicit target pinning, read operations, and future-action previews |
+| Queue | Save the next ChatGPT user intent while the current reply is still running |
+| Options | Language, continuity timing, optional LLM judge, and other low-frequency configuration |
+
+Popup should stay fast; HUD belongs to the conversation; Control Center belongs to the workstation state; Options should not become a high-frequency control surface.
 
 ## Security architecture
 
-The extension does not store the Herdr bearer in page JavaScript, the service worker or ordinary browser storage.
+The extension does not place the Herdr bearer in page scripts, the service worker, or browser storage.
 
-Primary path:
+Primary local path:
 
 ```text
-content script
-    ↓
+page content script / Side Panel
+          ↓
 Chrome Extension Service Worker
-    ↓ Native Messaging
-native host
-    ↓ local Unix socket (0600)
-herdr-mcp runtime
+          ↓ Native Messaging
+local Host
+          ↓ Unix socket (0600)
+herdr-mcp Rust runtime
 ```
 
-The browser owns page interaction. The native host owns the trusted local bridge. herdr-mcp remains responsible for tool schemas and permission gates.
+This keeps responsibilities separate:
 
-Extension traffic does not need to traverse Cloudflare Edge. Public OAuth identity and trusted local IPC are separate security boundaries.
+- the browser owns page interaction and presentation;
+- the Native host owns the trusted local bridge;
+- herdr-mcp runtime retains tool, permission, and mutation boundaries;
+- Cloudflare Edge is not required for browser-extension access to local state.
 
-## Install and use it for the first time
+Public OAuth/MCP and local Native Messaging are different security boundaries.
 
-Primary path (no git clone required):
+## Installation and first use
 
-1. Download `herdr-mcp-extension-<version>.zip` (and the matching `.sha256` sidecar) from the same GitHub Release that published the Rust binaries. The zip is a Release asset only; it is **not** listed in `release-manifest.json`, so the binary updater schema stays unchanged.
-2. Verify the sidecar, then extract into the managed directory:
+### Primary end-user path
+
+Users do not need to clone the repository.
+
+1. From the same GitHub Release that publishes the current Rust binary, download:
+
+```text
+herdr-mcp-extension-<version>.zip
+herdr-mcp-extension-<version>.zip.sha256
+```
+
+The extension zip is a Release asset but is intentionally not part of the binary updater's `release-manifest.json` contract.
+
+2. Verify the sidecar and extract into a stable managed directory:
 
 ```bash
 mkdir -p ~/.config/herdr-mcp/extension
 unzip herdr-mcp-extension-<version>.zip -d ~/.config/herdr-mcp/extension
-# top-level files such as manifest.json must land directly under that directory
+# manifest.json must live directly in this directory
 ```
 
-3. In Chrome: `chrome://extensions` → enable Developer mode → **Load unpacked** → select `~/.config/herdr-mcp/extension`.
-4. Install the Native Messaging host (resolves the managed path, or `HERDR_EXTENSION_PATH` if set):
+3. Open:
+
+```text
+chrome://extensions
+```
+
+Enable Developer mode → **Load unpacked** → choose:
+
+```text
+~/.config/herdr-mcp/extension
+```
+
+4. Install the Native Messaging host:
 
 ```bash
 herdr-mcp native-host install
-# equivalent during migration:
-# bin/herdr-extension-host install
+herdr-mcp native-host status
 ```
 
-5. Open a supported Web AI site.
-6. Use the popup/HUD to bind a Herdr workspace. On ChatGPT this can be done from the root page, a Project home, or a concrete conversation; a Project does not need a `/c/<id>` first.
+During migration the repository script remains available:
 
-Developer checkout of `extension/` remains available for local work, but it is not the primary end-user path. Do not treat cloning this repository as the install method.
+```bash
+bin/herdr-extension-host install
+bin/herdr-extension-host status
+```
 
-The binding unit is a workspace, not a single agent, because real development commonly looks like:
+5. Open ChatGPT, z.ai, DeepSeek, or another currently supported page.
+6. Open the extension Popup and confirm the local runtime is reachable.
+7. Bind the current scope to a Herdr workspace through Popup or HUD.
+8. Open **Browser Control Center** from Popup and confirm live workspace / pane state.
+
+### Developer path
+
+Developers can load the repository's:
+
+```text
+<repo>/extension/
+```
+
+An unpacked extension identity depends on its absolute load path, while the Native Messaging host restricts the allowed extension origin. Do not casually move between worktree paths and assume an old Native Messaging registration still matches.
+
+The end-user path remains the stable managed extension directory rather than cloning the repository.
+
+## Binding, Pinned Target, and Focus
+
+The browser product now has three distinct kinds of “where”.
+
+### Workspace Binding
+
+A Workspace Binding says which local work context a Web Project / conversation belongs to.
+
+For example:
+
+```text
+ChatGPT Project → Herdr workspace wD7
+```
+
+The binding is a workspace identity, not one agent.
+
+A real development worksite may contain:
 
 ```text
 workspace
  ├─ coding agent
- ├─ test process
- ├─ server/log pane
- └─ review agent
+ ├─ tests
+ ├─ server
+ └─ reviewer
 ```
 
-Continuity should represent the whole work area.
+### Pinned Target
 
-For ChatGPT Projects, the persistent binding is keyed by stable `project_id`, not by one conversation id. A Project-home binding can therefore exist before any chat is created. The currently active Project `/c/<id>` is only the **delivery target** (`active_conv_key`) for progress/continue messages. Opening a sibling conversation in the background does not move the binding; activating that tab changes only the delivery target. A binding created on `https://chatgpt.com/` is provisional and tab-scoped until that tab first enters a concrete Project or conversation.
-
-## HUD controls
-
-The bottom HUD exposes current scope state and supported actions:
-
-- runtime/workspace status;
-- manual continue;
-- Herdr monitoring;
-- lightweight LLM analysis;
-- manual handoff where supported;
-- Auto on/off.
-
-Automation defaults off. It only becomes active after the user enables it for the relevant Project or conversation scope.
-
-When Auto is on, conflicting manual progression actions are locked so manual and automatic control paths do not advance the same conversation concurrently. Manual handoff is the deliberate exception: where supported, it can start with Auto on or off, pauses source automatic wakes during transfer, and makes the target inherit the source Auto state.
-
-## A. Browser continuity
-
-### Progress
-
-While agents are working in the bound Herdr workspace, the extension observes state and output changes.
-
-It does not blindly send a message on every timer tick. It checks frequently, sends when meaningful new progress exists, and can use a longer fallback interval when nothing new was produced.
-
-### Settled
-
-When the workspace finishes its active work, the extension wakes the Web planner once so it can re-inspect results.
-
-Settled means local work stopped. It does not mean tests passed, code should be committed, or the task is complete. The Web planner still verifies those facts.
-
-### Recovery
-
-Browser failure modes include partial replies, disconnected streams, explicit send-timeout errors and stale DOM where the ChatGPT server already has a newer message.
-
-Recovery is evidence-first:
+Pinned Target belongs to Control Center. It says exactly which pane / agent a future human control is about, for example:
 
 ```text
-observe browser problem
- ↓
-check server-side conversation state when possible
- ↓
-determine whether the request already advanced
- ↓
-synchronize the view
- ↓
-retry or handoff only when safe
+wD7:p2 / pi
 ```
 
-The extension does not simply resend the task because tool mutations may already have happened.
+Pinned Target does not follow Herdr focus changes automatically.
 
-### Handoff / rollover
+### Herdr Focus
 
-Long conversations eventually accumulate context pressure. Continuity can create a compact semantic handoff packet and move work into a fresh conversation.
+Herdr Focus is simply the pane the human is currently viewing in the Herdr UI.
 
-```text
-old conversation
- ↓
-compact handoff packet
- ↓
-new conversation
- ↓
-verify seed
- ↓
-switch active delivery target
-```
+Focus may change frequently, but it must not silently replace a binding or pinned target.
 
-For ChatGPT Projects, the Project/workspace binding and `continuity_id` remain stable throughout rollover. The old `active_conv_key` remains authoritative until the new conversation and seed are verified; only then does the extension switch the delivery target. Conversation-scoped sites such as z.ai still move their binding after confirmation. The handoff records established work history; the new conversation still re-checks live Herdr, Git and runtime state before mutation.
+See [Browser Control Center](browser-control-center.md).
 
-See [Auto-continue, recovery and handoff](extension-wake.md) for the current state machine.
+## Continuity: keep the right Web conversation moving
 
-## B. JSON → MCP bridge
+Browser continuity covers:
 
-Web AI sites without a native custom MCP Connector can use a compatibility protocol:
+- workspace binding;
+- working / progress / settled push-back;
+- ChatGPT stale-view, disconnect, and send-timeout recovery;
+- bounded page-health self-recovery;
+- long-conversation handoff / rollover;
+- Project- or conversation-scoped Auto preferences.
+
+### ChatGPT Project binding
+
+A ChatGPT Project binding uses the stable `project_id`, not one conversation id.
+
+A concrete `/c/<id>` is the current delivery target `active_conv_key`. Only a genuinely active tab may take over that target; opening a sibling conversation in the background does not steal it.
+
+During handoff the Project binding and `continuity_id` stay stable. The active target changes only after the new conversation and seed are confirmed.
+
+### Automation defaults off
+
+Every new scope starts with Auto off.
+
+Once Auto is explicitly enabled, the extension may run the subset of progress, settled, LLM continue, recovery, handoff, or in-page permission behavior supported by that site and scope.
+
+Turning Auto off does not delete the binding and does not stop observation.
+
+See [Auto-continue, recovery and handoff](extension-wake.md) for the state machine.
+
+## Queue: add the next instruction without interrupting the current reply
+
+While ChatGPT is generating, users often think of another requirement:
+
+- “also run the smoke test”;
+- “do not publish this yet”;
+- “check one more edge case”.
+
+Sending immediately can interrupt the live turn or race with tool work already in progress.
+
+The extension therefore adds **Queue** next to ChatGPT's native composer actions.
+
+Behavior:
+
+1. Write the additional requirement in the composer.
+2. Click Queue.
+3. The text enters a durable queue for the current conversation.
+4. The current assistant turn continues uninterrupted.
+5. After the turn settles, queued content is handled before generic LLM auto-continue.
+6. Multiple queued entries preserve order and merge with blank lines into one next user turn.
+7. Only an acknowledged delivered batch is removed.
+8. A `turn-in-progress` or other blocked delivery keeps the pending content instead of dropping it.
+
+Additional bounds:
+
+- the queue is size- and length-bounded;
+- right-click Queue to clear the current conversation queue;
+- clicking with an empty composer can retry a pending batch;
+- a successful handoff migrates pending queued content to the target conversation without reordering it.
+
+Queue represents **the user's next-turn intent**. It is not a background shell-command queue and it does not invoke a Herdr mutation directly.
+
+## Control Center: observe local truth before acting
+
+**Browser Control Center** in Popup opens Chrome Side Panel.
+
+The current Control Center can:
+
+- display live workspace / pane lifecycle;
+- show agent working / idle / done / blocked state;
+- distinguish terminal-only panes;
+- show current Herdr focus;
+- pin an explicit pane / agent target;
+- revalidate target identity after reconnect;
+- fail closed when a target becomes stale;
+- `Inspect state`;
+- `Read output tail` with bounded output;
+- build risk-classified preview descriptors for Prompt / Steer / Herdr / Terminal.
+
+### Mutation controls remain preview-only
+
+The panel says this directly:
+
+> Live state · preview-only controls
+
+Prompt, Steer, Herdr, and Terminal do not execute mutations in the current release.
+
+That is the Browser Control Plane Phase A boundary, not a missing click handler.
+
+See [Browser Control Center](browser-control-center.md).
+
+## JSON → MCP bridge
+
+For pages such as z.ai and DeepSeek that do not expose a ChatGPT-like native MCP Connector, the extension can provide a bounded compatibility path:
 
 ```text
 Web model
  ↓ JSON tool call
 extension
  ↓ Native Messaging
-local MCP runtime
+local MCP
  ↓
 Herdr tools
 ```
 
-The bridge can read the local tool catalog, execute `tools/call`, return results to the same conversation and continue a bounded tool loop until the model produces a normal answer.
+It can:
 
-This is a browser-side protocol adapter, not a claim that the target site natively implements MCP.
+- obtain local `tools/list`;
+- execute `tools/call`;
+- return tool results to the page;
+- continue controlled tool rounds until the assistant returns a normal answer;
+- fold internal protocol messages to reduce visual noise.
 
-See [JSON → MCP](extension-bridge.md).
+This is an explicit page-protocol adapter rather than pretending the site has native MCP.
 
-## Automation boundaries differ by site
+See [JSON → MCP bridge](extension-bridge.md).
 
-| Capability | ChatGPT | z.ai / DeepSeek |
-|---|---|---|
-| workspace binding | yes | yes |
-| progress / settled wake | yes | yes |
-| ChatGPT-specific stale-view recovery | yes where supported | not applicable |
-| ChatGPT Project automatic rollover | yes where supported | not applicable |
-| JSON → MCP bridge | normally unnecessary | yes |
+## Site capabilities are intentionally different
 
-ChatGPT Projects can use Project-scoped automation when globally permitted in Options. Normal ChatGPT conversations and supported non-ChatGPT sites use conversation-scoped preferences.
+Do not pretend ChatGPT-specific recovery exists everywhere.
 
-Site adapters intentionally expose only capabilities that can be implemented safely on that product. They do not pretend every Web AI has the same conversation APIs as ChatGPT.
+| Capability | ChatGPT | z.ai / DeepSeek | Claude |
+|---|---|---|---|
+| workspace binding | supported | supported | basic support |
+| progress / settled | supported | supported | depends on current adapter |
+| ChatGPT stale-view / send-timeout recovery | supported | not applicable | not applicable |
+| Project-scoped binding / rollover | supported | not applicable | not applicable |
+| conversation handoff | Project supported | persisted `/c/<id>` supported | not applicable |
+| Queue | supported | not applicable | not applicable |
+| JSON → MCP bridge | not needed | supported | not the same path |
+| Control Center | browser-level, shared local Herdr state | browser-level | browser-level |
 
-## Browser/local-network permissions
+The current manifest, adapters, and tests remain the authority for exact capability support.
 
-Modern Chrome versions can gate loopback/local-application access separately from normal host permissions. If the Options connection test or HUD reports that local access is blocked, allow the extension to access applications on the device in Chrome's extension site settings.
+## Options and low-frequency configuration
 
-The extension uses bounded connection attempts and reports this condition instead of loading forever.
+Options owns:
 
-`host_permissions` still includes `<all_urls>` for GA. Narrowing to the four content-script origins plus loopback would cover ChatGPT / Claude / z.ai / DeepSeek scripting and tab reload recovery, but the optional LLM-judge feature fetches a user-configured OpenAI-compatible base URL from the service worker, and Options also allow a non-default `herdrMcpUrl`. Those hosts are not known at install time, so `<all_urls>` remains until an optional-permissions UX can replace it. This is not a Chrome Web Store distribution claim.
+- en / zh / ja UI language;
+- local runtime URL for compatibility / diagnostics;
+- progress and fallback timing;
+- settled / progress message templates;
+- optional post-turn LLM judge;
+- the global ChatGPT Project-automation gate.
+
+An optional LLM judge API key stays in local browser storage. It is not a Herdr bearer and must not be committed to the repository.
+
+## Local-network and browser permissions
+
+Recent Chrome versions may expose loopback / local-device access separately from ordinary host permissions.
+
+Native Messaging is the current trusted primary path, while some diagnostic or compatibility paths may still surface a loopback permission prompt.
+
+If Popup / Options / HUD cannot reach the local runtime, check in this order:
+
+1. herdr-mcp runtime;
+2. Native Messaging host;
+3. whether the extension was reloaded;
+4. browser local-device / loopback permission.
+
+Do not copy `HERDR_MCP_TOKEN` into extension storage as a normal fix.
+
+The GA manifest currently retains `<all_urls>` in `host_permissions`. In addition to the fixed content-script sites, the optional LLM judge can target a user-configured OpenAI-compatible base URL that is unknown at install time, and Options retains compatibility with a non-default local runtime URL. Narrowing permissions requires a productized optional-permission UX rather than pretending the fixed content-script hosts cover all current network behavior.
+
+This is not a statement that the extension is already published in Chrome Web Store. Store publication remains a separate maintainer plan.
 
 ## What the extension does not do
 
-It does not:
+The extension does not:
 
-- replace ChatGPT reasoning;
+- replace ChatGPT / Web AI reasoning;
 - replace Herdr agents;
-- expose the local MCP server publicly;
-- store a high-privilege workstation bearer in browser state;
-- bypass browser, ChatGPT Workspace or operating-system permission controls;
-- turn every supported website into an identical automation environment.
+- enable arbitrary terminal mutation just because a Side Panel exists;
+- treat Herdr focus as a mutation target;
+- guess a replacement after a target becomes stale;
+- expose a high-privilege local bearer to web pages;
+- require a public Herdr control port for browser continuity;
+- bypass organization, browser, or OS permissions.
 
-Its job is narrower and more useful: keep a long-running AI development workflow connected across browser turns.
+Its job is **long-lived connectivity, observable state, explicit control boundaries, and browser-side recovery**.
 
-## Next reading
+## Read next
 
-- [Browser Continuity](browser-continuity.md) — why the return channel exists
-- [Auto-continue, recovery and handoff](extension-wake.md) — continuity mechanics
-- [JSON → MCP](extension-bridge.md) — local-tool compatibility for z.ai / DeepSeek
-- [Troubleshooting](troubleshooting.md) — permission, binding and recovery failures
+- [Browser continuity](browser-continuity.md)
+- [Browser Control Center](browser-control-center.md)
+- [Auto-continue, recovery and handoff](extension-wake.md)
+- [JSON → MCP bridge](extension-bridge.md)
+- [Troubleshooting](troubleshooting.md)

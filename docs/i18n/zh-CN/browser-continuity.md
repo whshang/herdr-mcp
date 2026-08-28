@@ -151,27 +151,16 @@ Agent 完成
 
 高风险动作保持显式边界。
 
-## 两类扩展能力
+## Continuity 只是扩展的一个产品面
 
-### A. Web continuity
+本页只解释 **Web continuity**：workspace binding、progress / settled 回推、stale response recovery 和 handoff / rollover。
 
-服务 ChatGPT、z.ai、DeepSeek 等网页会话：
+扩展现在还有两个职责不同的产品面：
 
-- workspace binding；
-- progress/settled 回推；
-- stale response recovery；
-- handoff / rollover。
+- [浏览器控制中心](browser-control-center.md)：Chrome Side Panel 里的实时 workspace / pane / Agent 观察、Pinned Target 和只读操作；
+- [JSON → MCP bridge](extension-bridge.md)：为没有原生 MCP Connector 的 z.ai / DeepSeek 提供本机工具兼容路径。
 
-### B. JSON → MCP bridge
-
-服务没有原生 MCP Connector 的网页：
-
-- 注入工具描述；
-- 解析 JSON tool call；
-- 调本机 MCP；
-- 回填工具结果。
-
-两者共享 Native Messaging 和本机 IPC，但解决的问题不同。
+它们共享 Native Messaging 和本机 IPC，但不能混成一个状态机：Continuity 决定网页会话如何持续；Control Center 展示本机事实并固定人工目标；JSON → MCP 负责协议适配。
 
 ## 设计原则
 

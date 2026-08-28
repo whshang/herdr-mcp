@@ -22,7 +22,8 @@ herdr-link + herdr-mcp runtime
 ├─ Herdr workspace / pane / agent 状态
 └─ Pi / Grok / 其它本地 Agent
 
-浏览器扩展 ── 进度、恢复、自动继续、长对话接力 ──► Web 会话
+浏览器扩展 ── continuity / 排队 ──► Web 会话
+         └── 实时 workspace / pane 状态 ──► Chrome Side Panel
 ```
 
 日常使用时，ChatGPT 可以像本地 Coding Agent 一样直接检查项目和执行确定性操作。需要独立推理、并行开发或审查时，再把任务交给 Herdr 中的本地 Agent。Herdr 保留所有工作区和窗格，因此网页端始终能知道“机器上现在有什么、谁在做什么、做到哪里了”。
@@ -78,5 +79,5 @@ Shell 本身具备执行任意命令的能力，因此它代表的是“允许�
 - 连接 ChatGPT：[ChatGPT Connector](chatgpt-connector.md)
 - 理解完整链路：[架构](architecture.md)
 - 学习日常工作方式：[最佳实践](best-practices.md)
-- 配置浏览器连续工作：[浏览器扩展](extension.md)
+- 配置浏览器工作层：[浏览器扩展](extension.md) 与 [浏览器控制中心](browser-control-center.md)
 - 处理安装和运行故障：[故障排查](troubleshooting.md)

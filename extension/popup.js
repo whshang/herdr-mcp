@@ -151,6 +151,14 @@ async function bindWorkspace(tab, ws, group, meta, title) {
   }
 }
 
+function friendlyLocalRuntimeError(error) {
+  const raw = String(error || "").trim();
+  if (/native messaging host|native host|specified native messaging host|forbidden/i.test(raw)) {
+    return t("native_host_help");
+  }
+  return raw || t("no_herdr");
+}
+
 async function refresh() {
   applyStaticI18n();
   const tab = await activeTab();
@@ -215,7 +223,8 @@ async function refresh() {
 
   const box = $("agents");
   if (!agentsResp?.ok) {
-    box.textContent = agentsResp?.error || t("no_herdr");
+    box.textContent = friendlyLocalRuntimeError(agentsResp?.error);
+    box.title = agentsResp?.error || "";
   } else if (!groups.size) {
     box.textContent = t("no_workspaces");
   } else if (!st.convInfo) {
@@ -290,7 +299,7 @@ $("automationQuickToggle").addEventListener("click", async (event) => {
 });
 $("openControlCenter").addEventListener("click", () => {
   if (!chrome.sidePanel?.open) {
-    showToast("Control Center is unavailable in this browser.");
+    showToast(t("control_center_unavailable"));
     return;
   }
   // Keep the call in the direct click handler so Chrome preserves the user

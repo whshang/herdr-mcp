@@ -16,7 +16,7 @@ herdr-mcp 给 Web planner 补上五类能力：
 - **确定性的工作站工具**：文件、Git、图片、Shell；
 - **可控委派**：只有确实需要独立推理时才派本地 Herdr worker；
 - **稳定的远程入口**：Cloudflare Edge 上的 OAuth/MCP + 工作站主动出站 Link；
-- **浏览器连续工作**：本地进度可以回到网页会话，超长对话可以安全接力到新会话。
+- **浏览器工作层**：把本地进度送回网页会话，在 Chrome Side Panel 观察 Herdr 现场，并把下一轮用户要求安全排队。
 
 整体关系：
 
@@ -158,7 +158,7 @@ herdr_fs_read / grep
 
 随后再尝试一次小修改 + 测试 + diff。只有任务确实需要独立分析时，才派本地 Agent。
 
-## 浏览器连续工作
+## 浏览器扩展
 
 MCP 本质上是请求驱动：
 
@@ -166,30 +166,16 @@ MCP 本质上是请求驱动：
 Web AI → workstation
 ```
 
-但一个本地 Agent 可能在浏览器回合结束后继续工作很久。可选的 MV3 扩展补上反向通道：
+本地 Agent 可能在浏览器回合结束后继续工作很久。可选 MV3 扩展同时补上反向 continuity 和浏览器里的本机观察面：
 
 ```text
 workstation → Web conversation
+          ↘ Chrome Side Panel Control Center
 ```
 
-扩展支持：
+当前浏览器产品面包括：workspace binding、progress / settled 回推、evidence-first 页面恢复、长 conversation handoff、只读/Preview-only 浏览器控制中心、ChatGPT “排队”，以及 z.ai / DeepSeek 的受限 JSON→MCP bridge。
 
-- workspace binding；
-- progress / settled 回推；
-- evidence-first 页面恢复；
-- 长 conversation handoff；
-- 为 z.ai / DeepSeek 等没有同类原生 Connector 的网页提供受限 JSON→MCP bridge。
-
-安装本机 Native Messaging host：
-
-```bash
-bin/herdr-extension-host install
-bin/herdr-extension-host status
-```
-
-然后在 Chrome/Chromium 中以“加载已解压扩展程序”的方式加载 `extension/`。
-
-详见 [浏览器连续工作](docs/i18n/zh-CN/browser-continuity.md) 和 [浏览器扩展](docs/i18n/zh-CN/extension.md)。
+浏览器扩展分发仍由 GA gate G15 约束；真正的浏览器 mutation 则在 G16 下单独延后，两者当前都不纳入第一 GA 平台承诺。开发/验收时应使用版本化 GitHub Release 扩展包和已安装 runtime 的 Native Messaging installer，完整步骤见 [浏览器扩展](docs/i18n/zh-CN/extension.md) 与 [浏览器控制中心](docs/i18n/zh-CN/browser-control-center.md)。不要把仓库 `extension/` 目录当成终端用户主安装路径。
 
 ## 安全边界
 

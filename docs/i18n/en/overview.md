@@ -22,7 +22,8 @@ herdr-link + herdr-mcp runtime
 ├─ Herdr workspace / pane / agent state
 └─ Pi / Grok / other local agents
 
-Browser extension ── progress, recovery, auto-continue, rollover ──► Web conversation
+Browser extension ── continuity / Queue ──► Web conversation
+                 └── live workspace / pane state ──► Chrome Side Panel
 ```
 
 For routine work, ChatGPT can inspect a project and perform deterministic operations much like a local coding agent. When a task benefits from independent reasoning, parallel implementation, or review, it can delegate that task to an agent running inside Herdr. Because Herdr retains the workspaces and panes, the remote planner can keep track of what exists, who is working, and what changed.
@@ -78,5 +79,5 @@ Shell execution is intentionally powerful. Granting it means trusting the remote
 - Connect ChatGPT: [ChatGPT Connector](chatgpt-connector.md)
 - Understand the full path: [Architecture](architecture.md)
 - Learn the normal workflow: [Best practices](best-practices.md)
-- Configure continuous browser work: [Browser extension](extension.md)
+- Configure the browser workspace layer: [Browser extension](extension.md) and [Browser Control Center](browser-control-center.md)
 - Diagnose installation and runtime failures: [Troubleshooting](troubleshooting.md)

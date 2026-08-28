@@ -1,8 +1,9 @@
 import { createBrowserStateStore } from "./browser-state-store.js";
 import { createPinnedTarget, revalidatePinnedTarget } from "./target-pin.js";
-import { ACTION_TYPES, buildActionDescriptor, classifyAction, phaseAAvailability } from "./control-actions.js";
-import { controlCenterStats, createRenderCoalescer, formatActivity, formatElapsed, runtimePresentation, sortWorkspaces } from "./control-center-model.js";
+import { ACTION_TYPES, ACTION_RISK, buildActionDescriptor, classifyAction } from "./control-actions.js";
+import { controlCenterStats, createRenderCoalescer, formatElapsed, runtimePresentation, sortWorkspaces } from "./control-center-model.js";
 import { boundedTail } from "./browser-state.js";
+import { detectOrLoadLocale, getLocale, t } from "./i18n.js";
 
 const TARGET_KEY = "herdrControlPinnedTarget";
 const store = createBrowserStateStore();
@@ -28,6 +29,7 @@ const readTailButton = $("readTailButton");
 const composer = $("composer");
 const riskBadge = $("riskBadge");
 const blockedReason = $("blockedReason");
+const modeHelp = $("modeHelp");
 const sendButton = $("sendButton");
 const result = $("result");
 
@@ -40,11 +42,46 @@ function bg(message) {
   });
 }
 
+function isNativeHostError(error) {
+  return /native messaging host|native host|specified native messaging host|forbidden/i.test(String(error || ""));
+}
+
+function runtimeErrorPresentation(response) {
+  const raw = String(response?.error || "").trim();
+  if (isNativeHostError(raw)) return { message: t("native_host_help"), detail: raw };
+  return {
+    message: raw || t("cc_runtime_request_failed", {
+      status: response?.status ? ` (${response.status})` : "",
+    }),
+    detail: raw,
+  };
+}
+
 function statusDotClass(status) {
   if (status === "working") return "working";
   if (status === "done" || status === "idle") return "done";
   if (status === "blocked") return "blocked";
   return "";
+}
+
+function statusLabel(status) {
+  if (status === "working") return t("cc_status_working");
+  if (status === "done") return t("cc_status_done");
+  if (status === "idle") return t("cc_status_idle");
+  if (status === "blocked") return t("cc_status_blocked");
+  if (status === "terminal-only") return t("cc_status_terminal");
+  return t("cc_status_unknown");
+}
+
+function activityLabel(at, nowMs = Date.now()) {
+  const value = Date.parse(at || "");
+  if (!Number.isFinite(value)) return "—";
+  const seconds = Math.max(0, Math.floor((nowMs - value) / 1000));
+  if (seconds < 10) return t("cc_time_now");
+  if (seconds < 60) return t("cc_time_seconds_ago", { value: seconds });
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return t("cc_time_minutes_ago", { value: minutes });
+  return t("cc_time_hours_ago", { value: Math.floor(minutes / 60) });
 }
 
 function paneSummary(pane) {
@@ -53,7 +90,23 @@ function paneSummary(pane) {
     const lines = String(pane.last_output).trim().split("\n").filter(Boolean);
     return lines.at(-1) || "";
   }
-  return pane.agent ? `${pane.agent.name || pane.agent.kind || "agent"} ${pane.status}` : "terminal-only pane";
+  return pane.agent
+    ? `${pane.agent.name || pane.agent.kind || "agent"} · ${statusLabel(pane.status)}`
+    : t("cc_status_terminal");
+}
+
+function applyStaticI18n() {
+  const locale = getLocale();
+  document.documentElement.lang = locale === "zh" ? "zh-CN" : locale;
+  document.title = t("cc_title");
+  document.querySelectorAll("[data-i18n]").forEach((element) => {
+    const key = element.getAttribute("data-i18n");
+    if (key) element.textContent = t(key);
+  });
+  document.querySelectorAll("[data-i18n-aria]").forEach((element) => {
+    const key = element.getAttribute("data-i18n-aria");
+    if (key) element.setAttribute("aria-label", t(key));
+  });
 }
 
 function seedExpansion(state) {
@@ -82,8 +135,12 @@ function renderRuntime(state) {
   const stats = controlCenterStats(state);
   const presentation = runtimePresentation({ runtimeHealthy, eventStreamHealthy });
   runtimeDot.className = `dot ${presentation.dot}`;
-  runtimeText.textContent = presentation.text;
-  runtimeStats.textContent = `${stats.workspaces} workspaces · ${stats.panes} panes · ${stats.working} working`;
+  runtimeText.textContent = !runtimeHealthy
+    ? t("cc_runtime_unavailable")
+    : eventStreamHealthy === false
+      ? t("cc_runtime_reconnecting")
+      : t("cc_runtime_healthy");
+  runtimeStats.textContent = t("cc_stats", stats);
 }
 
 function renderWorkspaceTree(state) {
@@ -93,7 +150,7 @@ function renderWorkspaceTree(state) {
   if (!workspaces.length) {
     const empty = document.createElement("div");
     empty.className = "empty";
-    empty.textContent = runtimeHealthy ? "No Herdr panes found." : "Local runtime is unavailable.";
+    empty.textContent = runtimeHealthy ? t("cc_no_panes") : t("cc_runtime_unavailable");
     workspaceList.appendChild(empty);
     return;
   }
@@ -122,7 +179,10 @@ function renderWorkspaceTree(state) {
     const count = document.createElement("span");
     count.className = "workspace-count";
     const workingCount = (workspace.panes || []).filter((pane) => pane.status === "working").length;
-    count.textContent = `${workspace.panes?.length || 0} panes${workingCount ? ` · ${workingCount} working` : ""}`;
+    count.textContent = t("cc_workspace_count", {
+      panes: workspace.panes?.length || 0,
+      working: workingCount,
+    });
     header.append(chevron, name, id, count);
     section.appendChild(header);
 
@@ -133,7 +193,7 @@ function renderWorkspaceTree(state) {
         const row = document.createElement("div");
         row.className = `pane${pinnedTarget?.pane_id === pane.pane_id ? " pinned" : ""}`;
         row.dataset.paneId = pane.pane_id;
-        row.title = "Click to pin this pane as the explicit control target";
+        row.title = t("cc_pin_hint");
 
         const first = document.createElement("div");
         first.className = "pane-line";
@@ -144,20 +204,24 @@ function renderWorkspaceTree(state) {
         paneId.textContent = pane.pane_id;
         const agent = document.createElement("span");
         agent.className = "pane-agent";
-        agent.textContent = pane.agent?.name || pane.agent?.kind || "terminal";
+        agent.textContent = pane.agent?.name || pane.agent?.kind || t("cc_terminal");
         const focus = document.createElement("span");
         focus.className = "focus-badge";
-        focus.textContent = pane.focused ? "focused" : "";
+        focus.textContent = pane.focused ? t("cc_focused") : "";
         const status = document.createElement("span");
         status.className = "status";
-        status.textContent = pane.status;
+        status.textContent = statusLabel(pane.status);
         first.append(dot, paneId, agent, focus, status);
 
         const meta = document.createElement("div");
         meta.className = "pane-meta";
         const elapsed = pane.agent?.started_at ? formatElapsed(pane.agent.started_at) : "—";
-        const activity = formatActivity(pane.agent?.last_activity_at || pane.last_event_at);
-        meta.textContent = `${pane.cwd || pane.project_root || "cwd unavailable"} · elapsed ${elapsed} · activity ${activity}`;
+        const activity = activityLabel(pane.agent?.last_activity_at || pane.last_event_at);
+        meta.textContent = t("cc_meta", {
+          cwd: pane.cwd || pane.project_root || "—",
+          elapsed,
+          activity,
+        });
 
         const summary = document.createElement("div");
         summary.className = "pane-summary";
@@ -172,6 +236,12 @@ function renderWorkspaceTree(state) {
   workspaceList.appendChild(fragment);
 }
 
+function staleReasonLabel(reason) {
+  if (reason === "pane_removed") return t("cc_stale_removed");
+  if (reason === "target_revision_changed") return t("cc_stale_replaced");
+  return reason || t("cc_status_unknown");
+}
+
 function renderTarget() {
   const target = reconcileTarget();
   const pane = currentPane();
@@ -183,22 +253,50 @@ function renderTarget() {
   readTailButton.disabled = !hasTarget || stale || !pane;
 
   if (!hasTarget) {
-    targetTitle.textContent = "No pinned target";
-    targetDetails.textContent = "Click a pane above to pin it. Herdr focus changes will not retarget this control.";
+    targetTitle.textContent = t("cc_no_target");
+    targetDetails.textContent = t("cc_target_help");
     return;
   }
-  targetTitle.textContent = `${target.workspace_id || "?"} / ${target.pane_id} / ${target.agent?.name || target.agent?.kind || "terminal"}`;
+  targetTitle.textContent = `${target.workspace_id || "?"} / ${target.pane_id} / ${target.agent?.name || target.agent?.kind || t("cc_terminal")}`;
   targetDetails.textContent = stale
-    ? `STALE · ${target.stale_reason || "target changed"} · select the pane again before any control action`
-    : `${target.status || "unknown"} · revision ${String(target.target_revision || "local").slice(0, 96)}`;
+    ? t("cc_target_stale", { reason: staleReasonLabel(target.stale_reason) })
+    : t("cc_target_current", {
+      status: statusLabel(target.status),
+      revision: String(target.target_revision || "local").slice(0, 96),
+    });
+}
+
+function modePresentation(mode) {
+  if (mode === ACTION_TYPES.STEER) {
+    return { help: "cc_mode_steer_help", placeholder: "cc_placeholder_steer" };
+  }
+  if (mode === ACTION_TYPES.HERDR_METHOD) {
+    return { help: "cc_mode_herdr_help", placeholder: "cc_placeholder_herdr" };
+  }
+  if (mode === ACTION_TYPES.TERMINAL_TEXT) {
+    return { help: "cc_mode_terminal_help", placeholder: "cc_placeholder_terminal" };
+  }
+  return { help: "cc_mode_prompt_help", placeholder: "cc_placeholder_prompt" };
+}
+
+function riskLabel(mode) {
+  const risk = classifyAction(mode);
+  if (risk === ACTION_RISK.PROVIDER_STEER) return t("cc_risk_provider");
+  if (risk === ACTION_RISK.TERMINAL_MUTATION) return t("cc_risk_terminal");
+  if (risk === ACTION_RISK.UNKNOWN) return t("cc_risk_herdr");
+  return t("cc_risk_write");
 }
 
 function renderComposerState() {
-  const availability = phaseAAvailability(selectedMode, { target: pinnedTarget });
-  riskBadge.textContent = classifyAction(selectedMode);
-  blockedReason.textContent = availability.reason || "Read-only action available";
-  sendButton.textContent = availability.enabled ? "Run" : "Dry run";
-  sendButton.disabled = !pinnedTarget?.pane_id;
+  const mode = modePresentation(selectedMode);
+  riskBadge.textContent = riskLabel(selectedMode);
+  modeHelp.textContent = t(mode.help);
+  composer.placeholder = t(mode.placeholder);
+  if (!pinnedTarget?.pane_id) blockedReason.textContent = t("cc_pin_first");
+  else if (pinnedTarget.stale) blockedReason.textContent = t("cc_target_stale_short");
+  else blockedReason.textContent = t("cc_preview_only_reason");
+  sendButton.textContent = t("cc_preview_action");
+  sendButton.disabled = !pinnedTarget?.pane_id || pinnedTarget?.stale === true;
   document.querySelectorAll("#modeTabs [data-mode]").forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === selectedMode);
   });
@@ -226,11 +324,13 @@ document.addEventListener("visibilitychange", () => {
 });
 
 async function refreshSnapshot(force = false) {
-  runtimeText.textContent = "Runtime connecting…";
+  runtimeText.textContent = t("cc_runtime_connecting");
   const response = await bg({ type: "herdr_control_center_subscribe", force });
   if (!response?.ok || !response.state) {
     runtimeHealthy = false;
-    result.textContent = response?.error || `Runtime request failed${response?.status ? ` (${response.status})` : ""}`;
+    const failure = runtimeErrorPresentation(response);
+    result.textContent = failure.message;
+    result.title = failure.detail || "";
     renderAll();
     return false;
   }
@@ -295,7 +395,10 @@ workspaceList.addEventListener("click", async (event) => {
   if (!pane) return;
   pinnedTarget = createPinnedTarget(pane);
   await chrome.storage.local.set({ [TARGET_KEY]: pinnedTarget });
-  result.textContent = `Pinned ${pinnedTarget.workspace_id || "?"} / ${pinnedTarget.pane_id}`;
+  result.textContent = t("cc_pinned", {
+    workspace: pinnedTarget.workspace_id || "?",
+    pane: pinnedTarget.pane_id,
+  });
   renderAll();
 });
 
@@ -305,10 +408,11 @@ $("collapseButton").addEventListener("click", () => {
   expansionSeeded = true;
   renderAll();
 });
+$("settingsButton").addEventListener("click", () => chrome.runtime.openOptionsPage());
 unpinButton.addEventListener("click", async () => {
   pinnedTarget = null;
   await chrome.storage.local.remove(TARGET_KEY);
-  result.textContent = "Pinned target cleared.";
+  result.textContent = t("cc_target_cleared");
   renderAll();
 });
 inspectButton.addEventListener("click", () => {
@@ -320,14 +424,16 @@ inspectButton.addEventListener("click", () => {
 readTailButton.addEventListener("click", async () => {
   if (!pinnedTarget?.pane_id || pinnedTarget.stale) return;
   readTailButton.disabled = true;
-  result.textContent = "Reading bounded pane tail…";
+  result.textContent = t("cc_reading_tail");
   const response = await bg({
     type: "herdr_control_read_tail",
     pane_id: pinnedTarget.pane_id,
     lines: 40,
     max_chars: 4096,
   });
-  result.textContent = response?.ok ? boundedTail(response.tail || "", 4096) || "(empty tail)" : `Read failed: ${response?.error || "unknown"}`;
+  result.textContent = response?.ok
+    ? boundedTail(response.tail || "", 4096) || t("cc_empty_tail")
+    : t("cc_read_failed", { error: response?.error || "unknown" });
   renderTarget();
 });
 
@@ -338,7 +444,7 @@ document.querySelectorAll("#modeTabs [data-mode]").forEach((button) => {
   });
 });
 sendButton.addEventListener("click", () => {
-  if (!pinnedTarget?.pane_id) return;
+  if (!pinnedTarget?.pane_id || pinnedTarget.stale) return;
   const text = composer.value.trim();
   const descriptor = buildActionDescriptor(selectedMode, {
     target: pinnedTarget,
@@ -349,6 +455,9 @@ sendButton.addEventListener("click", () => {
 });
 
 async function start() {
+  await detectOrLoadLocale();
+  applyStaticI18n();
+  document.documentElement.classList.remove("i18n-pending");
   const stored = await chrome.storage.local.get(TARGET_KEY);
   pinnedTarget = stored[TARGET_KEY] || null;
   connectControlPort(false);

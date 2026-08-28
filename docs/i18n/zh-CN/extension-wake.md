@@ -72,6 +72,37 @@ HUD 提供几类显式操作：
 
 `手动继续 / herdr监控 / LLM 分析` 属于人工推进动作，当前作用域 `自动 开` 时会锁定，避免和自动状态机同时推进同一会话。**手动接力是例外**：支持的会话在 `自动 开/关` 两种状态都可启动；transfer 期间源会话自动 wake 暂停，target 继承 source 的 Auto 状态。
 
+## 排队：用户下一轮意图优先于自动继续
+
+ChatGPT composer 旁的 **排队** 和 HUD 的“手动继续”不是同一种动作。
+
+排队用于：当前 assistant 仍在回复，但用户已经知道下一轮想补充什么。点击后不会打断 live turn，而是把当前 composer 内容持久保存到这个 conversation 的队列。
+
+当 turn settled 时，顺序是：
+
+```text
+当前 assistant turn 结束
+       ↓
+有排队内容？ ── yes ──► 合并并发送下一条用户消息
+       │ no
+       ▼
+再考虑通用 LLM auto-continue / idle nudge
+```
+
+这条优先级很重要：**明确的用户下一轮意图优先于模型自己判断“要不要继续”。**
+
+队列还遵守以下约束：
+
+- 多条内容按加入顺序保留，并用空行合并；
+- `turn-in-progress` 等阻塞不会 ACK 或丢弃内容；
+- 只有确认成功发送的 batch 才删除；
+- 队列数量、单条长度和总合并长度都有上限；
+- 右键排队按钮清空当前 conversation 队列；
+- composer 为空时点击可尝试重发尚未送达的 batch；
+- handoff 确认 cutover 后，未发送队列迁移到目标 conversation，并保持顺序。
+
+排队不直接执行 Herdr tool，也不改变 workspace binding；它只负责保存并交付**下一条用户消息**。
+
 ## 自动化作用域
 
 ### ChatGPT Project

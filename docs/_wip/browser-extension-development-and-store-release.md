@@ -26,7 +26,7 @@ Herdr workspace / pane / agent
 
 当前扩展名称：`herdr → Web wake`。
 
-当前 `origin/main` 的 manifest 版本：`0.1.64`。
+当前浏览器产品化分支的 manifest 版本：`0.1.65`；合入后以实时 `origin/main` 为准。
 
 核心能力包括：
 
@@ -734,6 +734,7 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 当前稳定用户/架构文档：
 
 - `docs/i18n/zh-CN/extension.md`
+- `docs/i18n/zh-CN/browser-control-center.md`
 - `docs/i18n/zh-CN/browser-continuity.md`
 - `docs/i18n/zh-CN/extension-bridge.md`
 - `docs/i18n/zh-CN/extension-wake.md`
@@ -749,9 +750,9 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 截至 2026-08-28：
 
 - 浏览器扩展继续以 unpacked development build 方式开发；
-- `origin/main` extension manifest 为 `0.1.64`；
-- Browser Control Center Phase A 与 pane lifecycle 已进入 main；
-- ChatGPT Queued Insert 已进入 main；
+- 本轮浏览器产品化分支把 extension manifest 升到 `0.1.65`；合入后以 main 实际版本为准；
+- Browser Control Center Phase A 与 pane lifecycle 已进入 main，0.1.65 进一步补齐 en / zh / ja、Pinned Target / Preview-only 产品文案与 Settings 入口；
+- ChatGPT Queued Insert 已进入 main，正式用户文档使用“排队 / Queue”描述其 next-turn 语义；
 - Chrome Web Store **暂不发布**；
 - Store item / Store Extension ID 尚未冻结；
 - 商店版 Native Host origin 迁移尚未开始；

@@ -67,9 +67,9 @@ const queuedInsertCoreSource = readFileSync(path.join(EXT, "queued-insert-core.j
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
-ok(manifest.version === "0.1.64", "manifest version stays aligned with the queued-insert build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.64"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.64"'), "content version matches manifest");
+ok(manifest.version === "0.1.65", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.65"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.65"'), "content version matches manifest");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")
@@ -471,12 +471,14 @@ ok(
 const localeCodes = ["en", "zh", "ja"];
 const localeHud = {};
 const localeHandoff = {};
+const localeControlCenter = {};
 for (const code of localeCodes) {
   const locPath = path.join(EXT, "locales", `${code}.json`);
   ok(existsSync(locPath), `locale file exists: ${code}`);
   const loc = JSON.parse(readFileSync(locPath, "utf8"));
   localeHud[code] = Object.keys(loc).filter((k) => k.startsWith("hud_")).sort();
   localeHandoff[code] = Object.keys(loc).filter((k) => k.startsWith("handoff_")).sort();
+  localeControlCenter[code] = Object.keys(loc).filter((k) => k.startsWith("cc_") || k.startsWith("control_center_")).sort();
 }
 ok(localeHud.en.length > 0, "en has hud keys");
 ok(localeHud.zh.join(",") === localeHud.en.join(","), "zh hud keys match en");
@@ -484,6 +486,13 @@ ok(localeHud.ja.join(",") === localeHud.en.join(","), "ja hud keys match en");
 ok(localeHandoff.en.length > 0, "en has handoff keys");
 ok(localeHandoff.zh.join(",") === localeHandoff.en.join(","), "zh handoff keys match en");
 ok(localeHandoff.ja.join(",") === localeHandoff.en.join(","), "ja handoff keys match en");
+ok(localeControlCenter.en.length > 20, "en has Control Center product copy");
+ok(localeControlCenter.zh.join(",") === localeControlCenter.en.join(","), "zh Control Center keys match en");
+ok(localeControlCenter.ja.join(",") === localeControlCenter.en.join(","), "ja Control Center keys match en");
+for (const code of ["en", "zh", "ja"]) {
+  const loc = JSON.parse(readFileSync(path.join(EXT, "locales", `${code}.json`), "utf8"));
+  ok(loc.native_host_help?.includes("herdr-mcp native-host install"), `${code} Native Host help uses the installed runtime command`);
+}
 const zhLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "zh.json"), "utf8"));
 ok(zhLocale.hud_manual_continue === "手动继续", "zh HUD manual continue label is exact");
 ok(zhLocale.hud_manual_status === "herdr监控", "zh HUD Herdr monitor label is exact");
@@ -528,6 +537,7 @@ ok(!readFileSync(path.join(EXT, "options.html"), "utf8").includes("Enable wake +
   "Options source no longer exposes the legacy wake+nudge switch name");
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
 const popupHtml = readFileSync(path.join(EXT, "popup.html"), "utf8");
+const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
 ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
     && !optionsHtml.includes('id="enabled"')
@@ -544,8 +554,21 @@ ok(!popupHtml.includes('id="idleNudgeEnabled"') && !popupHtml.includes('id="enab
     && backgroundSource.includes('msg?.type === "h2w_popup_set_automation"'),
   "popup keeps the effective automation status plus a scope-aware quick toggle");
 ok(popupHtml.includes('id="openControlCenter"')
-    && readFileSync(path.join(EXT, "popup.js"), "utf8").includes("chrome.sidePanel.open"),
-  "popup exposes an explicit Control Center entry point");
+    && popupHtml.includes('data-i18n="control_center_label"')
+    && popupHtml.includes('data-i18n="control_center_hint"')
+    && readFileSync(path.join(EXT, "popup.js"), "utf8").includes("chrome.sidePanel.open")
+    && readFileSync(path.join(EXT, "popup.js"), "utf8").includes('t("control_center_unavailable")'),
+  "popup exposes a localized Control Center entry point");
+ok(controlCenterHtml.includes('data-i18n="cc_phase_title"')
+    && controlCenterHtml.includes('data-i18n="cc_preview_heading"')
+    && controlCenterHtml.includes('data-i18n="cc_target_label"')
+    && controlCenterSource.includes('from "./i18n.js"')
+    && controlCenterSource.includes("await detectOrLoadLocale()")
+    && controlCenterSource.includes('chrome.runtime.openOptionsPage()')
+    && controlCenterSource.includes('t("cc_preview_only_reason")')
+    && controlCenterSource.includes('t("native_host_help")')
+    && readFileSync(path.join(EXT, "popup.js"), "utf8").includes('friendlyLocalRuntimeError'),
+  "Control Center localizes state, explicit targeting, preview boundary, Settings, and Native Host failures");
 ok(backgroundSource.includes('event === "hello"')
     && backgroundSource.includes('type: "herdr_control_state"')
     && backgroundSource.includes('type: "herdr_control_event"')

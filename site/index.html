@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="description" content="herdr-mcp connects ChatGPT and other Web AI to a local Herdr workstation for code, Git, shell, local-agent delegation and browser continuity.">
   <meta name="color-scheme" content="light dark">
+  <link rel="icon" type="image/png" href="./favicon.png">
   <title>herdr-mcp · local development control plane for Web AI</title>
   <link rel="canonical" href="https://whshang.github.io/herdr-mcp/">
   <link rel="alternate" hreflang="en" href="https://whshang.github.io/herdr-mcp/">
@@ -36,6 +37,7 @@
       <p class="lead">herdr-mcp is a remote development control plane between Web AI and a local Herdr workstation. ChatGPT can read and edit code, inspect Git, run shell commands, observe persistent workspaces, and delegate to local agents when independent reasoning is useful—while code and execution stay on your machine.</p>
       <div class="actions">
         <a class="primary" href="./docs/en/quick-start.html">Quick start</a>
+        <a href="./docs/en/extension.html">Browser extension</a>
         <a href="./docs/en/design-philosophy.html">Why it is designed this way</a>
         <a href="./docs/en/architecture.html">Architecture</a>
         <a href="https://github.com/whshang/herdr-mcp">GitHub</a>
@@ -54,14 +56,14 @@
       <article><h2>Give Web AI local hands and eyes</h2><p>Deterministic work uses first-class file, search, patch, Git and shell tools directly. The Web model can keep ownership of goals, trade-offs and verification instead of routing every action through another agent.</p></article>
       <article><h2>Herdr keeps the real workspace alive</h2><p>Workspaces, panes, PTYs and agents outlive individual browser requests. Long tests, servers and parallel agents keep stable identities that later turns can inspect again.</p></article>
       <article><h2>Delegate only when another reasoning process helps</h2><p>Focused investigation, parallel implementation and review can go to Herdr agents such as Pi or Grok. Reading files, checking Git and running tests remain direct operations.</p></article>
-      <article><h2>Browser continuity closes the return path</h2><p>MCP handles Web AI → workstation. The extension adds workstation → browser conversation, supporting progress, settled wakeups, evidence-first recovery and long-conversation handoff.</p></article>
+      <article><h2>The browser extension closes the working loop</h2><p>Continuity sends progress and recovery back to the right conversation; Browser Control Center shows live workspaces and explicit pane targets in Chrome Side Panel; Queue saves the next ChatGPT instruction without interrupting the current reply.</p></article>
       <article><h2>No public inbound workstation port</h2><p>Cloudflare Edge provides the stable OAuth/MCP origin while the workstation creates an authenticated outbound WSS link. ChatGPT never needs the local bearer.</p></article>
       <article><h2>Upgrade the local runtime independently</h2><p>Runtime A/B validates candidates, switches traffic, drains old generations and supports rollback within the same public contract—without changing the Connector URL.</p></article>
     </section>
 
     <section class="grid">
       <article><h2>First setup</h2><p>With Herdr already installed, use Quick Start to bring up the local runtime, a workers.dev Edge, the ChatGPT Connector and a real <code>herdr_inspect</code> validation.</p><p><a href="./docs/en/quick-start.html">Open Quick Start →</a></p></article>
-      <article><h2>Long-running browser development</h2><p>Bind a conversation to a Herdr workspace so progress, settled state, recovery and handoff become part of the workflow.</p><p><a href="./docs/en/browser-continuity.html">Understand browser continuity →</a></p></article>
+      <article><h2>Browser workspace</h2><p>Bind the Web conversation, observe the local Herdr worksite in Side Panel, read bounded pane output, and keep explicit next-turn user intent queued while a reply is still running.</p><p><a href="./docs/en/extension.html">Explore the browser extension →</a> · <a href="./docs/en/browser-control-center.html">Control Center →</a></p></article>
       <article><h2>Go deeper</h2><p>Learn why the public MCP contract stays compact, why runtime truth belongs to Herdr, and how Edge, Link, Runtime and the extension divide responsibilities.</p><p><a href="./docs/en/architecture.html">Read the architecture →</a></p></article>
     </section>
 

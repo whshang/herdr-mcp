@@ -40,7 +40,7 @@ Its job is narrower:
 - feed useful progress back into the right conversation;
 - recover a browser view that stalled or lost part of a response;
 - hand a very long conversation to a fresh conversation safely;
-- provide a local JSON → MCP compatibility path for Web AI sites without a native MCP connector.
+- keep the right browser conversation connected to that local work over time.
 
 The Web model remains the planner. Herdr remains the runtime truth. The extension keeps the two sides connected over time.
 
@@ -137,16 +137,16 @@ herdr-mcp runtime
 
 The browser does not route continuity traffic through the public Cloudflare Edge. This keeps public OAuth identity and local extension trust as separate security boundaries.
 
-## JSON → MCP is a separate compatibility path
+## Continuity is one extension surface, not the whole browser product
 
-Some Web AI sites do not expose a native custom MCP Connector. For those sites, the extension can translate a constrained JSON tool-call protocol into local MCP calls through the same trusted Native Messaging path.
+This page focuses on **Web continuity**: workspace binding, progress / settled push-back, stale-view recovery, and handoff / rollover.
 
-That bridge solves a different problem:
+The extension now has two other product surfaces with different responsibilities:
 
-- **continuity** keeps a browser conversation alive over time;
-- **JSON → MCP** lets a site without native MCP call local tools.
+- [Browser Control Center](browser-control-center.md) — live workspace / pane / agent observation, explicit Pinned Target, and bounded reads in Chrome Side Panel;
+- [JSON → MCP bridge](extension-bridge.md) — a local tool compatibility path for z.ai / DeepSeek when the site does not expose a native MCP Connector.
 
-They share transport and conversation identity, but neither should be mistaken for the other.
+They share Native Messaging and local IPC, but they are not one state machine. Continuity decides how a Web conversation persists; Control Center presents local truth and explicit human targeting; JSON → MCP adapts tool protocol.
 
 ## The mental model
 
@@ -156,6 +156,7 @@ With all three pieces in place, a long coding task no longer has to fit inside o
 
 Next:
 
-- [Browser extension](extension.md) — installation, HUD and capability overview
+- [Browser extension](extension.md) — installation and the full browser-product overview
+- [Browser Control Center](browser-control-center.md) — Side Panel live state and explicit targeting
 - [Wake, recovery and handoff](extension-wake.md) — continuity state machine and current behavior
 - [JSON → MCP bridge](extension-bridge.md) — z.ai / DeepSeek compatibility path

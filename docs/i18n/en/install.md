@@ -179,11 +179,22 @@ Then test a small reversible edit and a test command.
 
 The current production public contract is **epoch 2 / 18 tools**. If a new conversation still exposes 17 tools, investigate Connector/tool snapshot caching before reinstalling the runtime.
 
-## Step 8: install the browser extension when continuity matters
+## Step 8: install the browser extension for continuity and local observation
 
-MCP solves "ChatGPT reaches the workstation." If you also want the browser to resume when local agents complete, recover stalled replies, or hand off very long conversations, install the browser extension.
+MCP solves “ChatGPT reaches the workstation.” The browser extension adds three more product surfaces: browser continuity, a Chrome Side Panel Control Center, and the local JSON → MCP bridge for z.ai / DeepSeek. ChatGPT also gets Queue for saving the next user instruction without interrupting the current reply.
 
-See [Browser extension](extension.md). The extension uses Native Messaging and local IPC; it does not store the Herdr bearer in browser state.
+Installation is documented in [Browser extension](extension.md). The extension uses Native Messaging and local IPC; it does not store the Herdr bearer in browser state.
+
+After installation, verify at least:
+
+1. Popup reports the local runtime reachable;
+2. the current Web scope can bind the intended workspace;
+3. **Browser Control Center** opens and shows live workspace / pane / agent state;
+4. creating or closing a pane appears as a Side Panel lifecycle update;
+5. Prompt / Steer / Herdr / Terminal are visibly Preview-only rather than implying mutations are enabled;
+6. ChatGPT Queue does not interrupt a live reply and sends only after the turn settles.
+
+See [Browser Control Center](browser-control-center.md) for the interaction model.
 
 ## When to add a Custom Domain
 

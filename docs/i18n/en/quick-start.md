@@ -18,15 +18,16 @@ local herdr-mcp
 Herdr + Git + shell + agents
 ```
 
-Optionally, the browser extension provides the return path:
+Optionally, the browser extension adds both a return path and a local Side Panel:
 
 ```text
 Herdr progress / settled
   ↓
-browser extension
-  ↓
-current Web conversation
+browser extension → current Web conversation
+        ↘ Browser Control Center
 ```
+
+The extension also adds ChatGPT Queue, which saves the next user instruction without interrupting a live reply.
 
 ## Prerequisites
 
@@ -185,28 +186,30 @@ The Web planner can dispatch a Herdr-native worker, then use `herdr_since`, Git 
 
 The agent's final prose is not the source of truth; the repository is.
 
-## 9. Add browser continuity for long work
+## 9. Add the browser extension for long work
 
-Install the Native Messaging host:
+Use the versioned extension asset from the same GitHub Release as the native runtime, extract it to the stable managed extension directory, and load that directory through `chrome://extensions` → **Load unpacked**. The full path is documented in [Browser extension](extension.md).
+
+Then install the Native Messaging host:
 
 ```bash
-bin/herdr-extension-host install
-bin/herdr-extension-host status
+herdr-mcp native-host install
+herdr-mcp native-host status
 ```
 
-Load `extension/` as an unpacked Chrome/Chromium extension and bind the current Web conversation to the Herdr workspace doing the work.
-
-New Auto scopes default off. First confirm:
+Bind the current Web scope to the Herdr workspace doing the work. New Auto scopes default off. First confirm:
 
 - the correct workspace is bound;
 - the HUD shows the expected state;
-- progress/settled events are observable.
+- Browser Control Center opens from Popup and shows the real workspace / panes;
+- pane create/remove and working/settled changes appear live;
+- ChatGPT Queue can save a next-turn instruction without interrupting the current reply.
 
 Then enable Auto where appropriate.
 
 Manual handoff, where supported, can be started with Auto on or off. During transfer, automatic wakes from the source pause and the target conversation inherits the source Auto state.
 
-See [Browser continuity](browser-continuity.md) and [Wake, recovery and handoff](extension-wake.md).
+See [Browser continuity](browser-continuity.md), [Browser Control Center](browser-control-center.md), and [Wake, recovery and handoff](extension-wake.md).
 
 ## Three supported usage routes
 

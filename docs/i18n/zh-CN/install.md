@@ -179,11 +179,22 @@ ChatGPT 会缓存工具快照。服务器升级后旧会话仍可能暴露旧契
 
 当前生产公共契约是 **epoch 2 / 18 tools**。如果新会话仍只看到 17 个工具，先排查 Connector/工具快照缓存，而不是重装 runtime。
 
-## 第八步：需要连续性时再装浏览器扩展
+## 第八步：需要浏览器连续工作与本机观察时再装扩展
 
-MCP 解决的是“ChatGPT 到达工作站”。如果你还希望本地 Agent 完成后浏览器能继续、恢复卡住的回复，或交接超长会话，再安装浏览器扩展。
+MCP 解决的是“ChatGPT 到达工作站”。浏览器扩展再补三类能力：网页连续工作、Chrome Side Panel 控制中心，以及 z.ai / DeepSeek 的本机 JSON → MCP bridge。ChatGPT 还会获得“排队”，用于不中断当前回复地保存下一轮用户要求。
 
-见 [浏览器扩展](extension.md)。扩展使用 Native Messaging 与本机 IPC；不把 Herdr bearer 存进浏览器状态。
+安装步骤见 [浏览器扩展](extension.md)。扩展使用 Native Messaging 与本机 IPC；不把 Herdr bearer 存进浏览器状态。
+
+安装后至少验证：
+
+1. Popup 显示本机 runtime 可达；
+2. 当前网页作用域能绑定正确 workspace；
+3. **浏览器控制中心**可以打开，并实时看到 workspace / pane / Agent；
+4. 创建/关闭 pane 后 Side Panel 能看到生命周期变化；
+5. Control Center 的 Prompt / Steer / Herdr / Terminal 明确显示为 Preview-only，而不是误以为已经开放写操作；
+6. ChatGPT 正在回复时，“排队”不会打断当前 turn，settled 后再发送下一轮。
+
+控制中心交互见 [浏览器控制中心](browser-control-center.md)。
 
 ## 何时再加 Custom Domain
 

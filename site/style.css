@@ -253,8 +253,9 @@ body:not(.docs-page):not(.docs-index-page) footer a { text-decoration: none; }
 
 @media (max-width: 720px) {
   :root { --topbar-h: 54px; }
-  .topbar { height: var(--topbar-h); gap: 8px; padding-inline: 10px; }
-  .topnav a:not([aria-current]) { display: none; }
+  .topbar { height: var(--topbar-h); grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding-inline: 10px; }
+  .topbar.has-drawer { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .topnav, .version-badge { display: none; }
   .search-label, .search-trigger kbd { display: none; }
   .search-trigger { width: 36px; justify-content: center; padding: 0; }
   .article-column { width: min(100% - 28px, var(--article-w)); padding: 32px 0 34px; }
