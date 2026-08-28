@@ -89,8 +89,8 @@ test("quick-start runtime section rejects Node runtime and service install prima
   }
 });
 
-test("G20 WIP notes keep the known CLI FAIL list for remaining mismatches", () => {
-  const wip = read("docs/_wip/g20-command-contract.md");
+test("G20 archived notes keep the known CLI FAIL list for remaining mismatches", () => {
+  const wip = read("docs/history/ga/g20-command-contract.md");
   assert.match(wip, /G1 debt/);
   assert.match(wip, /herdr-mcp start/);
   assert.match(wip, /herdr-mcp watchdog/);
