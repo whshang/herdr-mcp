@@ -10,8 +10,8 @@ herdr-mcp 浏览器扩展不是第二个 Agent runtime。它给已经可用的 h
 
 最终用户只从 Chrome Web Store 安装扩展，不需要本地扩展 build 或仓库 checkout。
 
-1. 打开 [Chrome Web Store](https://chromewebstore.google.com/)；
-2. 搜索 `Herdr`，选择 Herdr 官方扩展；
+1. 打开 [Herdr Chrome Web Store 官方详情页](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp)；
+2. 核对发布者与产品身份后选择 Herdr 官方扩展；
 3. 点击 **添加至 Chrome / Add to Chrome**；
 4. 安装后在终端运行：
 
@@ -22,7 +22,7 @@ herdr-mcp native-host status
 
 `0.4.1+` 的普通 `native-host install` 会直接使用官方 Chrome Web Store 扩展身份，不要求本机存在 unpacked extension 目录或源码 checkout。已有、确认为 herdr-mcp 自己管理的开发 origin 会走事务式迁移，并保留 rollback 能力。
 
-5. 打开 ChatGPT、z.ai、DeepSeek 或其它当前支持页面；
+5. 打开 ChatGPT 或其它当前支持页面。z.ai 与 DeepSeek 属于实验性集成，默认关闭；需要在 **Herdr 设置 → 实验性功能** 中分别开启，然后刷新对应网页；
 6. 点击浏览器工具栏里的 Herdr 图标，确认 **浏览器控制中心**直接在 Chrome Side Panel 打开；
 7. 在控制中心确认“当前页面”识别到了正确 Project / conversation，再绑定 Herdr workspace。
 
@@ -41,7 +41,7 @@ herdr-mcp native-host status
 |---|---|---|
 | Continuity | 本地工作发生变化后，让正确的网页会话继续、恢复或接力 | 页面内 HUD |
 | Control Center | 查看 workspace / pane / Agent，绑定当前网页并固定明确目标 | Chrome Side Panel |
-| JSON → MCP bridge | 为没有原生 MCP Connector 的 Web AI 提供有界本机桥接 | z.ai / DeepSeek 页面内 |
+| JSON → MCP bridge | 为没有原生 MCP Connector 的 Web AI 提供实验性的有界本机桥接，默认关闭 | z.ai / DeepSeek 页面内 |
 
 ChatGPT composer 旁的 **“排队”** 表示“等当前回复结束后，再把这条用户意图作为下一轮发出去”，不会中断正在生成的回复。
 

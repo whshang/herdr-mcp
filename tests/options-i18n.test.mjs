@@ -7,7 +7,7 @@ const optionsHtml = readFileSync(new URL("../extension/options.html", import.met
 const optionsJs = readFileSync(new URL("../extension/options.js", import.meta.url), "utf8");
 
 test("Simplified Chinese Options copy avoids legacy mixed-language prose", () => {
-  assert.equal(zh.options_title, "herdr → 网页唤醒 · 配置");
+  assert.equal(zh.options_title, "Herdr · 设置");
   assert.equal(zh.label_llm_url, "判定服务地址");
   assert.equal(zh.label_llm_key, "判定接口密钥");
   assert.equal(zh.placeholder_llm_model, "填写模型名称");
@@ -24,6 +24,9 @@ test("Simplified Chinese Options copy avoids legacy mixed-language prose", () =>
     "llm_need_config",
     "llm_timeout",
     "hint_automation_mode",
+    "hint_experimental_section",
+    "hint_experimental_zai",
+    "hint_experimental_deepseek",
     "connect_ok",
     "http_401",
   ];

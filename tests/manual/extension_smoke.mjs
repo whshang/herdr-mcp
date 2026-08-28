@@ -50,7 +50,9 @@ for (const r of referenced) {
   ok(existsSync(path.join(EXT, r)), `manifest reference exists: ${r}`);
 }
 ok(manifest.background?.type === "module", "background is a module worker");
-ok(manifest.content_scripts.length === 4, "manifest contains four site content scripts");
+ok(manifest.content_scripts.length === 2
+    && manifest.content_scripts.every((entry) => !entry.matches.some((match) => /z\.ai|deepseek/.test(match))),
+  "manifest keeps only always-on ChatGPT/Claude scripts; experimental sites register dynamically");
 ok(manifest.permissions?.includes("nativeMessaging"), "manifest enables Chrome Native Messaging for automatic local authentication");
 ok(manifest.permissions?.includes("sidePanel")
     && manifest.side_panel?.default_path === "control-center.html"
@@ -72,9 +74,9 @@ const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.73", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.73"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.73"'), "content version matches manifest");
+ok(manifest.version === "0.1.74", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.74"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.74"'), "content version matches manifest");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")
@@ -612,13 +614,11 @@ ok(
 ok(zhLocale.label_automation_mode === "允许 ChatGPT 项目使用共享 Auto"
     && zhLocale.label_automation_mode.includes("共享 Auto")
     && zhLocale.hint_automation_mode.includes("全局能力门")
-    && zhLocale.hint_automation_mode.includes("不是当前项目的第二个 Auto 开关")
     && zhLocale.hint_automation_mode.includes("普通 ChatGPT")
-    && zhLocale.hint_automation_mode.includes("不受这个能力门影响")
-    && zhLocale.hint_automation_mode.includes("权限卡")
+    && zhLocale.hint_automation_mode.includes("实验")
     && zhLocale.hint_automation_mode.includes("z.ai")
     && zhLocale.hint_automation_mode.includes("DeepSeek"),
-  "zh Options distinguishes the global Project Auto capability gate from the HUD scope switch");
+  "zh Options distinguishes the Project Auto gate from default-off experimental sites");
 for (const obsolete of ["hud_wake_on", "hud_wake_off", "hud_nudge_on", "hud_nudge_off", "hud_llm", "hud_llm_off"]) {
   ok(!(obsolete in zhLocale), `obsolete HUD locale key removed: ${obsolete}`);
 }
@@ -634,6 +634,24 @@ ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
     && !optionsHtml.includes('id="autoAllow"')
     && !optionsHtml.includes('<select id="automationMode">'),
   "Options exposes one Project-automation checkbox and no independent permission toggle");
+ok(optionsHtml.includes('id="experimentalZAiEnabled"')
+    && optionsHtml.includes('id="experimentalDeepSeekEnabled"')
+    && optionsSource.includes('"experimentalZAiEnabled", "experimentalDeepSeekEnabled"')
+    && optionsSource.includes('experimentalZAiEnabled: $("experimentalZAiEnabled").checked')
+    && optionsSource.includes('experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked'),
+  "Options exposes separate experimental z.ai and DeepSeek switches");
+ok(optionsSource.includes("github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/quick-agent-install.md")
+    && optionsSource.includes("setConnectionFailure")
+    && [enLocale, zhLocale, jaLocale].every((locale) => locale.open_github_setup_guide),
+  "failed local connection tests link to a localized GitHub setup path");
+ok(backgroundSource.includes('experimentalZAiEnabled: false')
+    && backgroundSource.includes('experimentalDeepSeekEnabled: false')
+    && backgroundSource.includes('error: "experimental-site-disabled"')
+    && wakeSource.includes("experimentalZAiEnabled")
+    && wakeSource.includes("experimentalDeepSeekEnabled")
+    && jsonBridgeSource.includes("experimentalZAiEnabled")
+    && jsonBridgeSource.includes("experimentalDeepSeekEnabled"),
+  "experimental site integrations fail closed in both background and content layers");
 ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")')
     && !backgroundSource.includes("CFG.autoAllow"),
   "permission-card automation is folded into effective Project automation");

@@ -36,8 +36,40 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.73";
-const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
+const H2W_SCRIPT_VERSION = "0.1.74";
+const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
+const EXPERIMENTAL_TAB_URLS = {
+  "z.ai": "*://chat.z.ai/*",
+  deepseek: "*://chat.deepseek.com/*",
+};
+const EXPERIMENTAL_CONTENT_SCRIPTS = [
+  {
+    id: "herdr-experimental-zai",
+    site: "z.ai",
+    matches: ["https://chat.z.ai/*"],
+    js: [
+      "content/base.js", "content/injector/zai.js", "content/webmcp/speaks-json.js",
+      "content/webmcp/json-bridge-core.js", "content/webmcp/json-bridge.js", "performance-core.js",
+      "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js",
+      "content/hud/hud.js", "content/wake.js",
+    ],
+    runAt: "document_idle",
+    persistAcrossSessions: true,
+  },
+  {
+    id: "herdr-experimental-deepseek",
+    site: "deepseek",
+    matches: ["https://chat.deepseek.com/*"],
+    js: [
+      "content/base.js", "content/injector/deepseek.js", "content/webmcp/speaks-json.js",
+      "content/webmcp/json-bridge-core.js", "content/webmcp/json-bridge.js", "performance-core.js",
+      "content/hud/state-view.js", "content/hud/tooltip.js", "content/hud/renderer.js",
+      "content/hud/hud.js", "content/wake.js",
+    ],
+    runAt: "document_idle",
+    persistAcrossSessions: true,
+  },
+];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
   "content/injector/chatgpt.js",
@@ -157,6 +189,9 @@ let CFG = {
   llmJudgeModel: "",
   llmJudgePromptTemplate: "",
   llmJudgeSkipKeywords: DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
+  // z.ai and DeepSeek stay opt-in until the next compatibility/UAT cycle.
+  experimentalZAiEnabled: false,
+  experimentalDeepSeekEnabled: false,
 };
 let PROJECT_AUTOMATION = {};
 let CONVERSATION_AUTOMATION = {};
@@ -183,6 +218,48 @@ function isJsonBridgeConversation(convKey) {
   }
 }
 
+function experimentalSiteEnabled(site) {
+  if (site === "z.ai") return CFG.experimentalZAiEnabled === true;
+  if (site === "deepseek") return CFG.experimentalDeepSeekEnabled === true;
+  return true;
+}
+
+function activeH2WTabUrls() {
+  const urls = [...CORE_TAB_URLS];
+  for (const [site, pattern] of Object.entries(EXPERIMENTAL_TAB_URLS)) {
+    if (experimentalSiteEnabled(site)) urls.push(pattern);
+  }
+  return urls;
+}
+
+async function syncExperimentalContentScripts() {
+  if (!chrome.scripting?.getRegisteredContentScripts
+    || !chrome.scripting?.registerContentScripts
+    || !chrome.scripting?.unregisterContentScripts) return;
+  const ids = EXPERIMENTAL_CONTENT_SCRIPTS.map((spec) => spec.id);
+  let current = [];
+  try { current = await chrome.scripting.getRegisteredContentScripts({ ids }); } catch (_) { return; }
+  const registered = new Set(current.map((item) => item.id));
+  for (const spec of EXPERIMENTAL_CONTENT_SCRIPTS) {
+    const { site, ...registration } = spec;
+    if (!experimentalSiteEnabled(site)) {
+      if (registered.has(spec.id)) {
+        try { await chrome.scripting.unregisterContentScripts({ ids: [spec.id] }); } catch (_) {}
+      }
+      continue;
+    }
+    try {
+      if (registered.has(spec.id) && chrome.scripting?.updateContentScripts) {
+        await chrome.scripting.updateContentScripts([registration]);
+      } else if (!registered.has(spec.id)) {
+        await chrome.scripting.registerContentScripts([registration]);
+      }
+    } catch (error) {
+      callLog(`experimental content script sync failed for ${site}:`, error?.message || String(error));
+    }
+  }
+}
+
 function conversationAutomationSiteForConversation(convKey) {
   const chatgpt = chatGptConversationInfo(convKey);
   if (chatgpt?.site === "chatgpt" && !chatgpt.project_id && chatgpt.conversation_id) return "chatgpt";
@@ -196,8 +273,8 @@ function isConversationAutomationConversation(convKey) {
 function jsonBridgeSiteForConversation(convKey) {
   try {
     const origin = new URL(String(convKey || "")).origin;
-    if (origin === "https://chat.z.ai") return "z.ai";
-    if (origin === "https://chat.deepseek.com") return "deepseek";
+    if (origin === "https://chat.z.ai") return experimentalSiteEnabled("z.ai") ? "z.ai" : null;
+    if (origin === "https://chat.deepseek.com") return experimentalSiteEnabled("deepseek") ? "deepseek" : null;
   } catch (_) {}
   return null;
 }
@@ -234,13 +311,16 @@ function handoffConversationInfo(rawUrl, siteHint = null) {
       manual_handoff_available: Boolean(chatgpt.project_id && chatgpt.conversation_id),
     };
   }
-  if (!siteHint || siteHint === "z.ai") return zAiConversationInfo(rawUrl);
+  if ((!siteHint || siteHint === "z.ai") && experimentalSiteEnabled("z.ai")) return zAiConversationInfo(rawUrl);
   return null;
 }
 
 function validateJsonBridgeSender(msg, sender) {
   const convKey = String(msg?.convKey || "").trim();
   const site = String(msg?.site || "").trim();
+  if (["z.ai", "deepseek"].includes(site) && !experimentalSiteEnabled(site)) {
+    return { ok: false, error: "experimental-site-disabled" };
+  }
   const expectedSite = jsonBridgeSiteForConversation(convKey);
   if (!expectedSite || site !== expectedSite) return { ok: false, error: "json-bridge-site-mismatch" };
   try {
@@ -255,8 +335,11 @@ function validateJsonBridgeSender(msg, sender) {
 
 async function authorizeConversationAutomation(msg, sender) {
   const convKey = String(msg?.convKey || "").trim();
-  const expectedSite = conversationAutomationSiteForConversation(convKey);
   const site = String(msg?.site || "").trim();
+  if (["z.ai", "deepseek"].includes(site) && !experimentalSiteEnabled(site)) {
+    return { ok: false, error: "experimental-site-disabled" };
+  }
+  const expectedSite = conversationAutomationSiteForConversation(convKey);
   if (!expectedSite || site !== expectedSite) {
     return { ok: false, error: "conversation-automation-site-mismatch" };
   }
@@ -293,8 +376,9 @@ function automationScopeForConversation(convKey) {
   const projectAutomationAvailable = projectMode && Boolean(projectId);
   const projectEnabled = projectAutomationAvailable && PROJECT_AUTOMATION[projectId] === true;
   // Conversation-scoped automation is independent from the global ChatGPT
-  // Project gate. Plain ChatGPT /c/<id>, z.ai and DeepSeek can always opt in
-  // from their own HUD. The global mode only gates Project-shared automation.
+  // Project gate. Plain ChatGPT /c/<id> can opt in from its HUD. Experimental
+  // z.ai / DeepSeek scopes become eligible only after their site gate is enabled.
+  // The global mode only gates Project-shared automation.
   const conversationAutomationAvailable = !projectId && isConversationAutomationConversation(convKey);
   const conversationEnabled = conversationAutomationAvailable && CONVERSATION_AUTOMATION[convKey] === true;
   const enabled = projectId ? projectEnabled : conversationEnabled;
@@ -341,7 +425,7 @@ function inheritedAutomationStorageForTransfer(transfer, targetConvKey) {
 
 async function notifyAutomationChanged() {
   try {
-    const groups = await Promise.all(H2W_TAB_URLS.map((url) => chrome.tabs.query({ url })));
+    const groups = await Promise.all(activeH2WTabUrls().map((url) => chrome.tabs.query({ url })));
     const tabs = [...new Map(groups.flat().filter((tab) => tab?.id).map((tab) => [tab.id, tab])).values()];
     await Promise.allSettled(tabs.map((tab) => (
       chrome.tabs.sendMessage(tab.id, { type: "h2w_automation_changed" })
@@ -412,6 +496,7 @@ const configReady = new Promise((r) => { resolveConfigReady = r; });
   // mode-0600 local IPC socket. Remove historical browser-stored Herdr tokens
   // during upgrade; old extension binaries remain server-compatible separately.
   try { await chrome.storage.local.remove(["autoAllow", "token"]); } catch (e) {}
+  await syncExperimentalContentScripts();
   resolveConfigReady();
 })();
 
@@ -471,7 +556,7 @@ async function conversationInfoForTab(tabId) {
 // ---- Content-script version synchronization ----
 async function sweepStaleTabs() {
   try {
-    const tabs = await chrome.tabs.query({ url: H2W_TAB_URLS });
+    const tabs = await chrome.tabs.query({ url: activeH2WTabUrls() });
     for (const t of tabs) {
       if (t.status !== "complete" || reloadedTabs.has(t.id)) continue;
       if (tabVersions.get(t.id) === H2W_SCRIPT_VERSION) continue;
@@ -3482,6 +3567,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_json_bridge_catalog") {
     void (async () => {
+      await configReady;
       const access = validateJsonBridgeSender(msg, sender);
       if (!access.ok) {
         sendResponse(access);
@@ -3496,6 +3582,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_json_bridge_call") {
     void (async () => {
+      await configReady;
       const access = validateJsonBridgeSender(msg, sender);
       if (!access.ok) {
         sendResponse(access);
@@ -3517,6 +3604,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_register") {
     void (async () => {
+      await configReady;
+      const registeringSite = String(msg.site || "").trim();
+      if (["z.ai", "deepseek"].includes(registeringSite) && !experimentalSiteEnabled(registeringSite)) {
+        sendResponse({ ok: false, error: "experimental-site-disabled" });
+        return;
+      }
       const bindings = await loadBindings();
       const pageInfo = conversationInfoFromSupportedUrl(msg.url || msg.convKey);
       let matched = bindingsForConv(bindings, msg.convKey);
@@ -3840,6 +3933,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       delete CFG.idleNudgeCooldownSec;
       await chrome.storage.local.set({ ...CFG, enabled: false, idleNudgeEnabled: false });
       try { await chrome.storage.local.remove(["idleNudgeCooldownSec", "autoAllow", "token"]); } catch (e) {}
+      await syncExperimentalContentScripts();
       void rebuildStreams();
       sendResponse({ ok: true });
       // The initiating Options/content-script request must not wait for every

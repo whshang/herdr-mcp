@@ -41,12 +41,12 @@ Browser extension は conversation continuity、Chrome Side Panel の Control Ce
 一般ユーザーは **Chrome Web Store** からのみインストールします。
 
 1. runtime + Connector の検証を先に完了します。
-2. [Chrome Web Store](https://chromewebstore.google.com/) で `Herdr` を検索します。
+2. [Herdr Chrome Web Store item](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) を開きます。初回公開が Draft の間は **Item not available** と表示される場合があります。
 3. 公式 Herdr extension を選び **Add to Chrome** を押します。
 4. `herdr-mcp native-host install` と `herdr-mcp native-host status` を実行します。
 5. 以後の extension update は Chrome Web Store の通常更新に任せます。通常ユーザーにローカル extension package は不要です。
 
-> Extension は現在 Chrome Web Store の初回公開準備中です。listing 公開前はこの任意ステップをスキップし、ローカル開発版を代替インストールしないでください。
+> Store item は初回公開フロー中です。公開前は item page が利用できず、Store 検索にも表示されない場合があります。その間はこの任意ステップをスキップし、ローカル開発版を代替インストールしないでください。
 
 詳細：[Browser extension（英語）](docs/i18n/en/extension.md) · [Browser Control Center（英語）](docs/i18n/en/browser-control-center.md)
 

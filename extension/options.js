@@ -10,6 +10,7 @@ const KEYS = [
   "progressTemplate", "automationMode", "enabled",
   "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
   "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
+  "experimentalZAiEnabled", "experimentalDeepSeekEnabled",
 ];
 /** Seconds: empty/invalid → fallback; <=0 → 0 (off); cap 86400. */
 function parseTickSec(v, fallback = 120) {
@@ -24,6 +25,11 @@ function applyI18n() {
   document.documentElement.lang = getLocale() === "zh" ? "zh-CN" : getLocale();
   document.title = t("options_title");
   $("title").textContent = t("options_title");
+  $("subtitle").textContent = t("options_subtitle");
+  $("title_general").textContent = t("options_general_section");
+  $("title_continuity").textContent = t("options_continuity_section");
+  $("title_diagnostics").textContent = t("options_diagnostics_section");
+  $("hint_diagnostics").textContent = t("options_diagnostics_hint");
   $("lab_locale").textContent = t("label_locale");
   $("hint_locale").textContent = t("hint_locale");
   $("lab_url").textContent = t("label_url");
@@ -49,6 +55,13 @@ function applyI18n() {
   $("hint_llm_skip").textContent = t("hint_llm_skip");
   $("lab_automation_mode").textContent = t("label_automation_mode");
   $("hint_automation_mode").textContent = t("hint_automation_mode");
+  $("title_experimental").textContent = t("label_experimental_section");
+  $("experimental_badge").textContent = t("experimental_badge");
+  $("hint_experimental").textContent = t("hint_experimental_section");
+  $("lab_experimental_zai").textContent = t("label_experimental_zai");
+  $("hint_experimental_zai").textContent = t("hint_experimental_zai");
+  $("lab_experimental_deepseek").textContent = t("label_experimental_deepseek");
+  $("hint_experimental_deepseek").textContent = t("hint_experimental_deepseek");
   $("llmJudgeApiKey").placeholder = t("placeholder_llm_key");
   $("llmJudgeModel").placeholder = t("placeholder_llm_model");
   $("save").textContent = t("save");
@@ -81,6 +94,31 @@ async function loadForm() {
     : DEFAULT_LLM_SKIP_KEYWORDS_TEXT;
   $("automationMode").checked = cfg.automationMode === "project_auto"
     || (cfg.automationMode == null && cfg.enabled === true);
+  $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
+  $("experimentalDeepSeekEnabled").checked = cfg.experimentalDeepSeekEnabled === true;
+}
+
+function setupGuideUrl() {
+  if (getLocale() === "zh") {
+    return "https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/zh-CN/quick-agent-install.md";
+  }
+  if (getLocale() === "ja") return "https://github.com/whshang/herdr-mcp/blob/main/README.ja.md";
+  return "https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/quick-agent-install.md";
+}
+
+function setConnectionFailure(text) {
+  const status = $("status");
+  status.className = "err";
+  status.replaceChildren();
+  const message = document.createElement("span");
+  message.textContent = text;
+  status.append(message, document.createElement("br"));
+  const link = document.createElement("a");
+  link.href = setupGuideUrl();
+  link.target = "_blank";
+  link.rel = "noreferrer";
+  link.textContent = t("open_github_setup_guide");
+  status.append(link);
 }
 
 $("uiLocale").addEventListener("change", async () => {
@@ -104,6 +142,8 @@ $("save").addEventListener("click", () => {
     llmJudgeModel: $("llmJudgeModel").value.trim(),
     llmJudgePromptTemplate: $("llmJudgePromptTemplate").value.trim() || t("default_llm_judge_prompt") || DEFAULT_LLM_JUDGE_PROMPT,
     llmJudgeSkipKeywords: $("llmJudgeSkipKeywords").value.trim() || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
+    experimentalZAiEnabled: $("experimentalZAiEnabled").checked,
+    experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
     uiLocale: getLocale(),
   };
   chrome.runtime.sendMessage({ type: "h2w_set_config", config }, (resp) => {
@@ -126,7 +166,7 @@ $("test").addEventListener("click", () => {
   // loopback-network permission gate and hide the actual remediation.
   chrome.runtime.sendMessage({ type: "h2w_agents" }, (resp) => {
     if (chrome.runtime.lastError) {
-      setStatus(`✖ ${t("unreachable_detail", { msg: chrome.runtime.lastError.message })}`, "err");
+      setConnectionFailure(`✖ ${t("unreachable_detail", { msg: chrome.runtime.lastError.message })}`);
       return;
     }
     if (resp?.ok) {
@@ -134,18 +174,18 @@ $("test").addEventListener("click", () => {
       return;
     }
     if (resp?.status === 401) {
-      setStatus(`✖ ${t("http_401")}`, "err");
+      setConnectionFailure(`✖ ${t("http_401")}`);
       return;
     }
     const localError = String(resp?.error || "");
     if (/native[- ]messaging|native host|native-host|specified native/i.test(localError)) {
-      setStatus(`✖ ${t("native_host_help")}`, "err");
+      setConnectionFailure(`✖ ${t("native_host_help")}`);
       return;
     }
     const detail = /native.*timeout/i.test(localError)
       ? t("native_ipc_timeout_help")
       : (localError || `HTTP ${resp?.status || "?"}`);
-    setStatus(`✖ ${t("unreachable_detail", { msg: detail })}`, "err");
+    setConnectionFailure(`✖ ${t("unreachable_detail", { msg: detail })}`);
   });
 });
 

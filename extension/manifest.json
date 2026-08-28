@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "herdr → Web wake",
-  "version": "0.1.73",
-  "description": "Connect Web AI to Herdr workspaces with Side Panel control, browser continuity, queued turns, and local MCP bridging.",
+  "name": "Herdr — AI Workspace Bridge",
+  "version": "0.1.74",
+  "description": "Connect ChatGPT and Web AI to local Herdr workspaces with Control Center, safe continuity, handoff, and queued next turns.",
   "permissions": [
     "storage",
     "scripting",
@@ -49,44 +49,6 @@
     }
   ],
   "content_scripts": [
-    {
-      "matches": [
-        "https://chat.z.ai/*"
-      ],
-      "js": [
-        "content/base.js",
-        "content/injector/zai.js",
-        "content/webmcp/speaks-json.js",
-        "content/webmcp/json-bridge-core.js",
-        "content/webmcp/json-bridge.js",
-        "performance-core.js",
-        "content/hud/state-view.js",
-        "content/hud/tooltip.js",
-        "content/hud/renderer.js",
-        "content/hud/hud.js",
-        "content/wake.js"
-      ],
-      "run_at": "document_idle"
-    },
-    {
-      "matches": [
-        "https://chat.deepseek.com/*"
-      ],
-      "js": [
-        "content/base.js",
-        "content/injector/deepseek.js",
-        "content/webmcp/speaks-json.js",
-        "content/webmcp/json-bridge-core.js",
-        "content/webmcp/json-bridge.js",
-        "performance-core.js",
-        "content/hud/state-view.js",
-        "content/hud/tooltip.js",
-        "content/hud/renderer.js",
-        "content/hud/hud.js",
-        "content/wake.js"
-      ],
-      "run_at": "document_idle"
-    },
     {
       "matches": [
         "https://claude.ai/*"

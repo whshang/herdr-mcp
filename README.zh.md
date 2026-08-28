@@ -48,12 +48,12 @@ herdr-mcp 本机 runtime 使用 GitHub Releases，不用 git clone。只在 Clou
 最终用户只通过 **Chrome Web Store** 安装：
 
 1. 先完成上面的 runtime + Connector 验证；
-2. 打开 [Chrome Web Store](https://chromewebstore.google.com/) 并搜索 `Herdr`；
+2. 打开 [Herdr Chrome Web Store 插件详情页](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp)；首次发布仍处于 Draft 时，该页面会显示 **Item not available**；
 3. 在 Herdr 官方扩展上点击 **添加至 Chrome / Add to Chrome**；
 4. 安装完成后执行 `herdr-mcp native-host install` 和 `herdr-mcp native-host status`；
 5. 以后扩展更新由 Chrome Web Store 正常更新机制负责，普通用户不需要任何本地扩展安装包。
 
-> 当前扩展正在进入 Chrome Web Store 首次发布流程。在正式 listing 上线前，普通用户直接跳过这个可选步骤，不要改用本地开发版。
+> 当前 Store 条目处于首次发布流程。正式发布前，详情页可能不可用、商店搜索也可能没有结果；普通用户直接跳过这个可选步骤，不要改用本地开发版。
 
 详见 [浏览器扩展](docs/i18n/zh-CN/extension.md) 和 [浏览器控制中心](docs/i18n/zh-CN/browser-control-center.md)。
 
