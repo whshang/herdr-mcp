@@ -1,6 +1,6 @@
 # Release model — Runtime, Extension, and Contract Compatibility
 
-Status: **stable `v0.4.0` published** (2026-08-28). This file is the contributor-facing definition of how releases are sliced. GA gate status lives in [`ga-release-gate.md`](./ga-release-gate.md).
+Status: **current runtime stable `v0.4.1` published** (2026-08-28). First-GA `v0.4.0` evidence remains historical and immutable. This file is the contributor-facing definition of how releases are sliced. GA gate status lives in [`ga-release-gate.md`](./ga-release-gate.md).
 
 ## Three release planes (independent lifecycles)
 
@@ -20,7 +20,7 @@ An extension-only change must **not** force a Rust runtime version bump. Maintai
 - **Verify gate:** Rust fmt/clippy/test, `npm` build/test/edge, extension smoke, site build, `git diff --check`.
 - **Build:** cross-target binaries per `.github/rust-release-targets.json`.
 - **Manifest:** `scripts/build-rust-release-manifest.mjs` — lists the complete Runtime Release binary set; the browser extension is not a Runtime Release asset.
-- **Publish:** GitHub Release; prerelease when tag contains `-` (e.g. `v0.4.0-alpha.19`, `v0.4.0-rc.1`); stable when tag is plain `v0.4.0`.
+- **Publish:** GitHub Release; prerelease when semver has a prerelease component (for example historical `v0.4.0-rc.1`); stable when the tag is plain semver (current: `v0.4.1`).
 - **Attestation:** `actions/attest` on release bundle.
 - **Recovery:** `.github/workflows/rust-release-recover.yml` for attested recovery publishes (fail-closed on identity mismatch).
 
@@ -30,7 +30,7 @@ An extension-only change must **not** force a Rust runtime version bump. Maintai
 
 | Channel | Discovers | Typical use |
 | --- | --- | --- |
-| `stable` | Tags with empty semver prerelease (`0.4.0`) | Default after GA |
+| `stable` | Tags with empty semver prerelease (current: `0.4.1`) | Default |
 | `preview` | Prerelease tags (`0.4.0-rc.1`, `0.4.0-alpha.19`) | Maintainer rehearsal |
 
 Installed generations are content-addressed (`rust-<sha256-prefix>`). Update applies a new generation and switches `runtime/current`; rollback reactivates a prior generation without rebuild.
@@ -39,15 +39,15 @@ Installed generations are content-addressed (`rust-<sha256-prefix>`). Update app
 
 - **Store packaging:** maintainers run `node scripts/pack-extension.mjs` only for Chrome Web Store upload or explicit unpacked UAT.
 - **Runtime release boundary:** `.github/workflows/rust-release.yml` never attaches an extension zip.
-- **On GitHub Release:** uploaded alongside binaries for one-click download.
-- **Not in updater manifest:** extension is not selected by `update apply`; operators install/load separately and run `native-host install` against the **active runtime**.
+- **Distribution:** end users install the extension from the Chrome Web Store. A locally packed zip is maintainer-only Store-upload / explicit unpacked-UAT input, not a Runtime GitHub Release asset.
+- **Updater separation:** `update apply` updates the Rust runtime only. After a Store install, `native-host install` binds the official Store origin to the **active runtime**; explicit unpacked development remains a maintainer override.
 
-### Extension vs runtime version matrix (example: `v0.4.0` stable)
+### Extension vs runtime version matrix (current snapshot)
 
 | Artifact | Version | Notes |
 | --- | --- | --- |
-| Runtime binary | `0.4.0` | Updater + service |
-| Chrome Web Store extension | `0.1.72` | Independent Store semver and update path |
+| Runtime binary | `0.4.1` | Current stable; updater + service |
+| Chrome Web Store extension | `0.1.72` source snapshot | Independent Store semver/update path; Store publication/development lifecycle is still separate |
 | Native Messaging host | Managed by runtime generation | `native-host status` must show `runtime_matches_current=true` |
 
 ## Contract Compatibility (shared public surface)
@@ -79,13 +79,13 @@ Historical prerelease tags **`v0.4.0-alpha.17` through `v0.4.0-alpha.19`** and *
 - rollback baselines recorded in service state
 - audit trail for GA closure
 
-They are **superseded** by `v0.4.0` stable for new installs. Do **not** delete GitHub Releases/tags as part of post-GA cleanup.
+They were **superseded** by the first stable `v0.4.0`; the current runtime stable is `v0.4.1`. Do **not** delete historical GitHub Releases/tags as part of cleanup.
 
 ## Post-GA workflow recommendations (docs only — not implemented here)
 
 | Item | Recommendation |
 | --- | --- |
-| Dedicated `extension-release.yml` | Optional later workflow: tag `extension-v*` → pack zip → GitHub Release or store pipeline **without** runtime bump |
+| Dedicated `extension-release.yml` | Optional later automation: tag `extension-v*` → deterministic Store-upload / CI artifact → Chrome Web Store submission **without** runtime bump; do not create a second end-user GitHub extension channel |
 | Extension version in manifest metadata | Optional non-updater field for docs automation only |
 | Store / CRX pipeline | See `docs/_wip/browser-extension-development-and-store-release.md` |
 | Windows runtime target | Already published as `x86_64-pc-windows-msvc`; keep support claims conservative until G19 Windows end-to-end UAT seals |
