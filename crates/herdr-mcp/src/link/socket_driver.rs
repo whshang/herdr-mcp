@@ -123,6 +123,9 @@ pub enum WebSocketCommand {
         attempt_id: SocketAttemptId,
         frame: String,
     },
+    SendPing {
+        attempt_id: SocketAttemptId,
+    },
     Close {
         attempt_id: SocketAttemptId,
         code: u16,
@@ -137,6 +140,7 @@ impl WebSocketCommand {
     pub fn attempt_id(&self) -> SocketAttemptId {
         match self {
             Self::SendText { attempt_id, .. }
+            | Self::SendPing { attempt_id, .. }
             | Self::Close { attempt_id, .. }
             | Self::Terminate { attempt_id } => *attempt_id,
         }
@@ -154,6 +158,9 @@ pub enum WebSocketEvent {
         text: String,
     },
     SocketErrorObserved {
+        attempt_id: SocketAttemptId,
+    },
+    TransportLiveness {
         attempt_id: SocketAttemptId,
     },
     Closed {
@@ -400,6 +407,9 @@ pub fn command_for_action(action: &TransportAction) -> Option<WebSocketCommand> 
             attempt_id: *attempt_id,
             frame: frame.clone(),
         }),
+        TransportAction::TransportPingDue { attempt_id } => Some(WebSocketCommand::SendPing {
+            attempt_id: *attempt_id,
+        }),
         TransportAction::CloseSocket {
             attempt_id,
             code,
@@ -435,6 +445,12 @@ pub fn feed_socket_event(
         }
         WebSocketEvent::Text { attempt_id, text } => {
             Ok(core.frame_received(attempt_id, &text, now_ms, rng_sample)?)
+        }
+        WebSocketEvent::TransportLiveness { attempt_id } => {
+            if core.active_attempt() == Some(attempt_id) {
+                core.transport_liveness_observed(now_ms);
+            }
+            Ok(Vec::new())
         }
         WebSocketEvent::SocketErrorObserved { attempt_id } => Ok(core.socket_error(attempt_id)),
         WebSocketEvent::Closed {
@@ -581,6 +597,12 @@ async fn run_connected_socket<S>(
                             break;
                         }
                     }
+                    WebSocketCommand::SendPing { .. } => {
+                        if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                            emit_error_then_closed(&event_tx, attempt_id, "socket ping failed").await;
+                            break;
+                        }
+                    }
                     WebSocketCommand::Close { code, reason, .. } => {
                         let frame = CloseFrame {
                             code: CloseCode::from(code),
@@ -644,9 +666,16 @@ async fn run_connected_socket<S>(
                         ).await;
                         break;
                     }
-                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
-                        // Tungstenite performs RFC control-frame handling. Link
-                        // liveness is the separate Relay heartbeat JSON message.
+                    Some(Ok(Message::Ping(_))) => {
+                        // Tungstenite answers inbound ping with pong locally.
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        if !send_event(
+                            &event_tx,
+                            WebSocketEvent::TransportLiveness { attempt_id },
+                        ).await {
+                            break;
+                        }
                     }
                     Some(Ok(Message::Frame(_))) => {
                         // Raw frames are an internal tungstenite detail and never

@@ -41,6 +41,13 @@ export const DEFAULT_LINK_STALE_AFTER_MS = 45_000;
  */
 export const HEARTBEAT_PERSIST_THROTTLE_MS = 300_000; // 5 min
 
+/**
+ * Edge status (hello_ack-style liveness ack) on heartbeat only when runtime
+ * changed or this interval elapsed. Keeps Node Link silence watchdog fed while
+ * avoiding a JSON status frame on every application heartbeat wake.
+ */
+export const EDGE_STATUS_REPLY_INTERVAL_MS = 30_000;
+
 /** Frame payload bound — well below the 32 MiB DO limit. */
 export const DEFAULT_MAX_FRAME_BYTES = 1_048_576; // 1 MiB
 
