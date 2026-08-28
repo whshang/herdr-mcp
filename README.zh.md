@@ -111,14 +111,13 @@ herdr api schema >/dev/null
 
 ### 让本地 Coding Agent 自动安装
 
-如果你已经在使用 Codex、Claude Code、Pi、DSH、Cline 等能读文件和执行命令的本地 Agent，可以直接把下面这段交给它，不要让 Agent 根据 README 自己猜部署步骤：
+如果你已经在使用 Codex、Claude Code、Pi、DSH、Cline 等能读文件和执行命令的本地 Agent，直接把下面这句话交给它，不要让 Agent 根据 README 自己猜部署步骤：
 
 ```text
-请帮我安装并部署 herdr-mcp。先读取唯一权威安装协议：
-https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md
-
-严格按文档完成。本机 runtime 从 GitHub Releases 安装，不要 git clone/npm。首次安装不要创建 Custom Domain、DNS 记录或 Tunnel，只使用 workers.dev。不要回显或提交任何 Token。每个 mutation 后先验证状态再继续。
+请帮我安装 herdr-mcp。完整协议请阅读并严格执行: https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/quick-agent-install.md 。本机 runtime 用 GitHub Releases (不要 git clone)。只在 Cloudflare 登录/创建 API Token 时暂停。不要回显或提交任何秘密。
 ```
+
+面向维护者的详细合同仍在 [Agent 协助安装](docs/i18n/zh-CN/agent-install.md)。
 
 该 Edge 流程生成 Cloudflare-safe Worker 名时使用仓库内的确定性 helper：
 

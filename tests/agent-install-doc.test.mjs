@@ -11,11 +11,11 @@ test("README exposes copyable local-Agent prompts that point to the authoritativ
   const en = read("README.md");
   const zh = read("README.zh.md");
   const ja = read("README.ja.md");
-  assert.match(en, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/agent-install\.md/);
-  assert.match(zh, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/zh-CN\/agent-install\.md/);
+  assert.match(en, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/quick-agent-install\.md/);
+  assert.match(zh, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/zh-CN\/quick-agent-install\.md/);
   assert.match(ja, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/agent-install\.md/);
-  assert.match(en, /Do not create a Custom Domain, DNS records or a Tunnel/);
-  assert.match(zh, /不要创建 Custom Domain、DNS 记录或 Tunnel/);
+  assert.match(en, /quick-agent-install\.md/);
+  assert.match(zh, /quick-agent-install\.md/);
 });
 
 test("Agent install guides own Cloudflare-token handoff and workers.dev-only bootstrap", () => {
@@ -66,6 +66,23 @@ test("Agent install uses deterministic Cloudflare-safe Worker names and reports 
     assert.match(doc, /scripts\/cloudflare-worker-name\.mjs/);
     assert.match(doc, /WORKER_NAME/);
     assert.match(doc, /herdr-mcp install/);
+  }
+});
+
+test("quick agent install guides expose one-liner, proxy, custom domain, and extension path", () => {
+  for (const rel of [
+    "docs/i18n/en/quick-agent-install.md",
+    "docs/i18n/zh-CN/quick-agent-install.md",
+  ]) {
+    const doc = read(rel);
+    assert.match(doc, /quick-agent-install\.md/);
+    assert.match(doc, /HERDR_LINK_PROXY/);
+    assert.match(doc, /herdr-mcp-extension/);
+    assert.match(doc, /herdr-edge-device\.username\.workers\.dev\/mcp/);
+    assert.match(doc, /herdr-mcp\.example\.com\/mcp/);
+    assert.match(doc, /workers\.dev/);
+    assert.match(doc, /Custom Domain|自定义域名/);
+    assert.doesNotMatch(doc, /second-mac-agent-prompt/);
   }
 });
 
