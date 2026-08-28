@@ -4,9 +4,9 @@
 //! configuration. When no proxy is configured, callers connect directly.
 
 use std::io;
-use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::process::Command;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
