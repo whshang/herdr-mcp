@@ -277,11 +277,11 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ---
 
-## Current Scorecard（2026-08-28 · live alpha.18 · dogfood cut）
+## Current Scorecard（2026-08-28 · live alpha.19 · last alpha candidate）
 
-评分：`PASS` / `PARTIAL` / `FAIL` / `DEFERRED` / `UNKNOWN`。本表对齐 live `0.4.0-alpha.18`（generation `rust-50dc9a2550aefd2a`；Release <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0-alpha.18>；tag commit `5ad301fc`）。产品仍处 **alpha**，**未达 GA**。**未打 stable `0.4.0` tag**。
+评分：`PASS` / `PARTIAL` / `FAIL` / `DEFERRED` / `UNKNOWN`。本表对齐 live `0.4.0-alpha.19`（generation `rust-3d2f685c636c3f3e`；Release <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0-alpha.19>；tag commit `4690c13`）。产品仍处 **alpha**，**未达 GA**。**未打 stable `0.4.0` tag**。候选快照：[`docs/ga-candidate-status.md`](./ga-candidate-status.md)。
 
-本机 dogfood（默认实例）：`production_ready=true`；`dev.herdr-mcp.server` `:8772` healthy；production Link=Rust；epoch 2 / 18 tools；用户 CLI → `runtime/current`；`native-host status` `runtime_matches_current=true`。**G5 保持 PASS**。
+本机 dogfood（默认实例）：`production_ready=true`；`dev.herdr-mcp.server` `:8772` healthy；production Link=Rust；epoch 2 / 18 tools；用户 CLI → `runtime/current`；`native-host status` `runtime_matches_current=true`（alpha.19 cut）。**G5 保持 PASS**。
 
 **第二台 Mac 默认实例 UAT（2026-08-28 · owner re-eval · G18 PASS）：** macOS 15.7.3 aarch64 干净机；Release `v0.4.0-alpha.17` 二进制 → `install` → 独立 Worker + Rust Link + native-host + extension；ChatGPT Connector OAuth/tools/list epoch2/18 + tools/call OK；临时 custom domain 拆除后 workers.dev 闭环仍绿。详见下方 **G18 second-Mac evidence**。
 
@@ -291,15 +291,15 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 | ID | 评分 | 一行证据 |
 | --- | --- | --- |
-| G1 | **FAIL** | 仍处 alpha：live `0.4.0-alpha.18`；`package.json` 不得冒充 runtime 产品版本 |
-| G2 | **PARTIAL** | alpha.18 Release + attestation/manifest + extension zip 齐；publish fail-closed 已证（tag run 拒绝 clobber；recovery 从 attested bundle 发布）；tag-path identity verify 仍须修 extension glob（见 #131 follow-up） |
+| G1 | **FAIL** | 仍处 alpha：live `0.4.0-alpha.19`（last alpha candidate）；`package.json` 不得冒充 runtime 产品版本 |
+| G2 | **PASS** | alpha.19 tag-path publish 全绿（run `33152207094`）；manifest `source_commit=4690c13`；attestation + extension zip；fail-closed 已证（alpha.18 identity verify 拒发；publish 拒 clobber） |
 | G3 | **PARTIAL** | 顶层 CLI + live symlink → `runtime/current`；第二台 Mac 默认实例已 seal（G18）但 stable 口径未统一 |
 | G4 | **PARTIAL** | 第二台 Mac 默认实例 install/doctor/status 已封；stable install/update/rollback 证据仍缺 |
 | G5 | **PASS** | 本机 + 第二台 Mac production owner=rust；link-prod Rust；health/`doctor`/`link seal status` `production_ready` |
 | G6 | **PARTIAL** | 第二台 Mac ChatGPT tools/list + tools/call 已封；完整 bounded mutation / long-exec GA 矩阵未全封 |
 | G7 | **PARTIAL** | 第二台 Mac 公网 OAuth→Edge→Link→runtime 闭环已封；dogfood 级 soak / failover 矩阵未全封 |
 | G8 | **PARTIAL** | 第二台 Mac `doctor` 全层绿；dogfood uat 仍 `native-messaging absent`（同机 Chrome singleton）；WSS dial skipped |
-| G9 | **PARTIAL** | alpha.17→alpha.18 dogfood `update apply` + provenance 已封；**无 stable-channel N→N+1 rehearsal**（无 stable tag） |
+| G9 | **PARTIAL** | alpha.18→alpha.19 dogfood `update apply` + provenance 已封；**无 stable-channel N→N+1 rehearsal**（无 stable tag） |
 | G10 | **PARTIAL** | 受控 alpha rollback 有证据；**无 stable-channel rollback rehearsal** |
 | G11 | **PARTIAL** | service guardian / Link reconnect 有证据；完整矩阵未做 |
 | G12 | **PARTIAL** | Streaming basics 已落地；跨网页回合 GA UAT 未全封 |
@@ -313,11 +313,11 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G20 | **PARTIAL** | README/install/agent-install/extension + clean-machine-uat 已有第二台 Mac 路径；stable 文档封板未做 |
 | G21 | **PARTIAL** | 站点 CI 可绿；无 stable tag 封板 |
 | G22 | **PARTIAL** | docs PASS（#104）；第二台 Mac 实证已封 G18；stable 文档封板未做 |
-| G23 | **PARTIAL** | main CI 可绿；alpha.18 tag + recovery publish 已封；tag-path publish verify 小修待合 |
-| G24 | **FAIL** | 剩余 GA blocker：G1 alpha、G9/G10 stable update/rollback、G6/G7 公网矩阵 residual；G2 tag-path verify 小修 |
+| G23 | **PARTIAL** | main CI 可绿；alpha.19 tag-path Rust Release 全绿（`33152207094`）；stable tag 全绿验收未跑 |
+| G24 | **FAIL** | 剩余 GA blocker：G1 alpha、G9/G10 stable update/rollback、G6/G7 公网矩阵 residual |
 | G25 | **FAIL** | 未达 GA：不得打 stable |
 
-**合计（诚实快照）**：PASS 3 · PARTIAL 18 · FAIL 3 · DEFERRED 1 · UNKNOWN 0
+**合计（诚实快照）**：PASS 4 · PARTIAL 17 · FAIL 3 · DEFERRED 1 · UNKNOWN 0
 
 ### G18 second-Mac evidence（2026-08-28 · alpha.17 · owner re-eval PASS）
 
@@ -337,7 +337,43 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 Score **PASS** for canonical second-Mac default-instance clean install + public MCP closed loop. Same-machine `--instance uat` evidence below remains historical progress only.
 
-### alpha.18 dogfood evidence（2026-08-28 · #130 + #131 cut）
+### alpha.19 tag-path release evidence（2026-08-28 · #133 + #134 · G2 PASS）
+
+Tag `v0.4.0-alpha.19` @ `4690c13`（#134 bump）。**Rust Release** tag-path run [`33152207094`](https://github.com/whshang/herdr-mcp/actions/runs/33152207094)：verify → build (darwin + windows) → manifest → attest → **publish** 全 PASS。**非 recovery-only**。
+
+| Check | Result |
+| --- | --- |
+| GitHub Release | <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0-alpha.19> |
+| Assets (5) | darwin aarch64 + windows exe + extension `0.1.66` zip + sha256 + `release-manifest.json` |
+| Manifest `source_commit` | `4690c13d9e7304852f9f762cb783d1326f7a5e12` |
+| Manifest `source_ref` | `refs/tags/v0.4.0-alpha.19` |
+| Darwin SHA256 | `3d2f685c636c3f3e2c4720c9a63c703a818307af0507a68ac953268f8a009a60` |
+| `state_schema` | 4 |
+| Identity verify (#133) | extension zip excluded from manifest asset compare |
+| Fail-closed (prior) | alpha.18 tag run `33150060112` failed identity verify; publish refuses clobber on existing release |
+
+### alpha.19 dogfood evidence（2026-08-28 · default instance）
+
+| Step | Before (alpha.18) | After (alpha.19) |
+| --- | --- | --- |
+| `--version` | `0.4.0-alpha.18` / `rust-50dc9a2550aefd2a` | `0.4.0-alpha.19` / `rust-3d2f685c636c3f3e` |
+| `update apply` | — | `upd-1787903368810-67219-3d2f685c` succeeded |
+| `native-host` / `doctor` | `runtime_matches_current=true` | `runtime_matches_current=true`, `version_consistent=true` |
+| `link seal status` | `production_ready=true` | `production_ready=true` |
+
+### G6 dogfood local MCP smoke（2026-08-28 · not public ChatGPT UAT）
+
+| Tool / flow | Result |
+| --- | --- |
+| `herdr_inspect` | PASS — epoch 2 / 18 tools |
+| `herdr_fs_grep` | PASS — docs `G2` hits |
+| `herdr_git status` | PASS |
+| `herdr_fs_write` | PASS — bounded create under `docs/_wip/` |
+| `herdr_exec_start` → `herdr_exec_read` | PASS — single session completed |
+
+Public Connector OAuth / cross-turn matrix：仍 **owner-only**（见 Owner ChatGPT UAT pack）。
+
+### alpha.18 dogfood evidence（2026-08-28 · #130 + #131 cut · historical）
 
 Release `v0.4.0-alpha.18`（tag `5ad301fc`）via recovery workflow from attested tag run `33150060112`（publish identity verify fail-closed；recovery `33150646912` 发布）。Edge `#130` 已在 main push 部署（run `33142199660` / `9bb0df8`）；`link-prod` 未动。
 
@@ -424,14 +460,15 @@ herdr-mcp --instance uat uninstall
 
 ## Current P0 work queue
 
-按 2026-08-28 owner re-eval（G18 PASS on second Mac）排序：
+按 2026-08-28 alpha.19 tag-path seal 排序：
 
-1. **GA closure A — release immutable identity**（`rust-release.yml` fail-closed publish；tag SHA == manifest `source_commit` == binary identity；**下一 prerelease 用新 tag，禁止复用 alpha.17**）。
-2. **GA closure B — native-host runtime drift**（`update apply` / `service rollback` 后 `runtime_matches_current=true`；`doctor` 标 `stale-runtime`；不覆盖 foreign manifests）。
-3. **GA closure C — stable update/rollback rehearsal**（无 stable tag 前：对 stable-channel candidate 跑 `update apply` → `doctor` → `native-host status` → `rollback`；或记录精确 blocker）。
-4. **GA closure D — scorecard sealing**（本文件 + exit-alpha-checklist + roadmap 对齐 live 证据；**不**伪造 G6/G7/G9/G10 PASS）。
-5. **G1 — 退出 alpha**（A–D 封板后再评估 `0.4.0` stable；**现在不要打 stable tag**；见 [`docs/exit-alpha-checklist.md`](./exit-alpha-checklist.md)）。
-6. **G16 — 保持 DEFERRED**（browser terminal / true-steer / mutation 不进第一 GA）。
+1. **G9/G10 — stable update/rollback rehearsal**（需 `v0.4.0` tag；见 [`ga-candidate-status.md`](./ga-candidate-status.md) stable rehearsal design）。
+2. **G6/G7 — 公网 ChatGPT residual**（owner-only Owner ChatGPT UAT pack；dogfood local MCP smoke 已记，不冒充 PASS）。
+3. **G1 — 退出 alpha**（G9/G10 + G6/G7 封板后再评估 `0.4.0` stable；**现在不要打 stable tag**；见 [`docs/exit-alpha-checklist.md`](./exit-alpha-checklist.md)）。
+4. **GA closure D — scorecard sealing**（本文件 + `ga-candidate-status.md` + exit-alpha-checklist 对齐 live 证据）。
+5. **G16 — 保持 DEFERRED**（browser terminal / true-steer / mutation 不进第一 GA）。
+
+**已完成（保留历史）：** GA closure A（G2 tag-path PASS alpha.19）、B（native-host drift alpha.18/19）、G18 second-Mac PASS。
 
 ### GA closure C — stable update/rollback rehearsal（blocker until stable tag）
 

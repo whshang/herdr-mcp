@@ -4,7 +4,7 @@
 原则：用效率最高、可能是最复杂但对用户最友好的方案，不追求短期收益。
 来源：合并 `rust-rearchitecture.md` 与 `tool-performance-optimization.md`；本文件是架构规划基线。RTK 的结果压缩思路进入 AI Tool Runtime Optimization，不复制 CLI proxy。
 
-**GA Release Gate SSOT**：[`docs/ga-release-gate.md`](./ga-release-gate.md)。当前产品焦点是 alpha → GA，是否可正式对普通用户开放只看该门禁（G1–G25 + 八个 veto），不是「Rust 重构做完」。本 roadmap 继续记录架构切片与历史，不替代 GA 判定。
+**GA Release Gate SSOT**：[`docs/ga-release-gate.md`](./ga-release-gate.md)。**GA candidate snapshot**：[`docs/ga-candidate-status.md`](./ga-candidate-status.md)（live `0.4.0-alpha.19`）。当前产品焦点是 alpha → GA，是否可正式对普通用户开放只看该门禁（G1–G25 + 八个 veto），不是「Rust 重构做完」。本 roadmap 继续记录架构切片与历史，不替代 GA 判定。
 
 ## 总体目标
 

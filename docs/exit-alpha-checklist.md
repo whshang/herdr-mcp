@@ -2,7 +2,7 @@
 
 Docs-only planning runbook. **Do not cut `v0.4.0` (non-prerelease) until owner UAT closes the remaining GA vetoes.**
 
-SSOT for gate status: [`docs/ga-release-gate.md`](./ga-release-gate.md). Owner execution paths: **Owner ChatGPT UAT pack** and [`docs/i18n/en/clean-machine-uat.md`](./i18n/en/clean-machine-uat.md) in that file.
+SSOT for gate status: [`docs/ga-release-gate.md`](./ga-release-gate.md). **Live candidate:** [`docs/ga-candidate-status.md`](./ga-candidate-status.md) (`0.4.0-alpha.19`). Owner execution paths: **Owner ChatGPT UAT pack** and [`docs/i18n/en/clean-machine-uat.md`](./i18n/en/clean-machine-uat.md) in that file.
 
 ## Preconditions (all required before G1 work)
 
@@ -15,7 +15,7 @@ Do **not** start version unification until these rows are honest **PASS** (not P
 | G15 | Second Mac extension + native-host sealed in G18; dogfood same-Mac uat remains partial |
 | G17 | Clean-machine + public security acceptance matrix |
 | G9 / G10 | **Stable-channel** `update apply` + `rollback` on default instance (**blocked until `v0.4.0` tag**; alpha rehearsal only until then) |
-| G2 | Release immutable identity (no `gh release upload --clobber`; tag SHA == manifest `source_commit`) |
+| G2 | **PASS** (2026-08-28): alpha.19 tag-path publish — see [`ga-candidate-status.md`](./ga-candidate-status.md) |
 | G25 | No remaining GA veto (see scorecard) |
 
 Same-machine `--instance uat` evidence (alpha.16) **does not** satisfy G18/G15/G6/G7 public segments.
@@ -24,13 +24,13 @@ Same-machine `--instance uat` evidence (alpha.16) **does not** satisfy G18/G15/G
 
 | Surface | Live / repo today | Stable target | Notes |
 | --- | --- | --- | --- |
-| Rust runtime (`herdr-mcp --version`) | `0.4.0-alpha.17` | `0.4.0` | Authoritative product version |
-| `crates/herdr-mcp/Cargo.toml` | `0.4.0-alpha.17` | `0.4.0` | Bump before tag |
-| Git tag / GitHub Release | `v0.4.0-alpha.17` | `v0.4.0` | Triggers `.github/workflows/rust-release.yml`; **next prerelease must be a new tag (e.g. alpha.18), never reuse alpha.17** |
+| Rust runtime (`herdr-mcp --version`) | `0.4.0-alpha.19` | `0.4.0` | Authoritative product version |
+| `crates/herdr-mcp/Cargo.toml` | `0.4.0-alpha.19` | `0.4.0` | Bump before tag |
+| Git tag / GitHub Release | `v0.4.0-alpha.19` | `v0.4.0` | Triggers `.github/workflows/rust-release.yml`; **alpha.19 = last alpha candidate** |
 | User CLI symlink | `~/.local/bin/herdr-mcp` → `runtime/current` | unchanged pattern | After release: `update apply` on dogfood |
 | `package.json` `version` | `0.3.32` | **unchanged or tooling-only bump** | Must **not** become the runtime product version in README/docs (G1) |
 | Extension `manifest.json` | `0.1.64` (independent semver) | release zip from tag | Extension artifact version ≠ runtime semver; document mapping in release notes |
-| Docs / scorecard | alpha.16 references | `0.4.0` stable wording | Flip G1 row only after live dogfood runs stable |
+| Docs / scorecard | alpha.19 references | `0.4.0` stable wording | Flip G1 row only after live dogfood runs stable |
 
 ## Maintainer sequence (after preconditions)
 
@@ -86,6 +86,7 @@ Non-secret bullets only:
 
 ## Related
 
+- [`docs/ga-candidate-status.md`](./ga-candidate-status.md) — live alpha.19 candidate, release evidence, stable rehearsal design
 - [`docs/ga-release-gate.md`](./ga-release-gate.md) — G1–G25 scorecard and Owner ChatGPT UAT pack
 - [`docs/i18n/en/clean-machine-uat.md`](./i18n/en/clean-machine-uat.md) — Path A second Mac canonical G18
 - [`docs/i18n/zh-CN/clean-machine-uat.md`](./i18n/zh-CN/clean-machine-uat.md) — 中文 runbook
