@@ -14,6 +14,8 @@ Herdr + managed Git projects
 
 如果只想快速体验，先看 [快速开始](quick-start.md)。如果想让本地 Coding Agent 代你完成绝大多数安装步骤，看 [Agent 辅助安装](agent-install.md)。
 
+**普通用户路径：** GitHub Release 二进制 → `herdr-mcp install` → `herdr-mcp doctor`（Edge 可能已预置，或按 agent-install §6 部署）。**第二台 Mac GA UAT**（仅维护者，不是面向消费者的安装流程）用内部文档 [_wip UAT Agent 协议](../../_wip/zh-CN/second-mac-ga-uat-agent-prompt.md) — 见 [干净机 UAT](clean-machine-uat.md)。
+
 ## 安装前确认
 
 ### 1. Herdr 已经可用
