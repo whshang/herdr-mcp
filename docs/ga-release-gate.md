@@ -1,6 +1,6 @@
 # herdr-mcp GA Release Gate
 
-状态：alpha 进行中（截至 2026-08-28 **未达 GA**）
+状态：`v0.4.0` stable 已发布（2026-08-28）；stable-channel G9/G10 PASS；**仍未达 GA**（G20–G22 docs freeze 等未清）
 本文件是 **GA 判定的唯一事实源（SSOT）**。架构演进细节见 [`herdr-architecture-roadmap.md`](./herdr-architecture-roadmap.md)。
 
 ## GA 定义
@@ -277,32 +277,32 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ---
 
-## Current Scorecard（2026-08-28 · rc.1 published · GA freeze）
+## Current Scorecard（2026-08-28 · v0.4.0 stable published · GA freeze）
 
-评分：`PASS` / `PARTIAL` / `FAIL` / `DEFERRED` / `UNKNOWN`。本表对齐 live dogfood baseline `0.4.0-alpha.19`（generation `rust-3d2f685c636c3f3e`）与 rc.1 Release <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0-rc.1>（tag commit `0a4627e`；Rust Release run `33155520284`）。产品仍处 **rc 候选**，**未达 GA**。**未打 stable `0.4.0` tag**。**alpha.19 = final alpha candidate（禁止 alpha.20）**。候选快照：[`docs/ga-candidate-status.md`](./ga-candidate-status.md)。
+评分：`PASS` / `PARTIAL` / `FAIL` / `DEFERRED` / `UNKNOWN`。本表对齐 live dogfood baseline `0.4.0-alpha.19`（generation `rust-3d2f685c636c3f3e`，post stable G9/G10 rollback）与 stable Release <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0>（tag commit `19fc6a4`；Rust Release run `33157370273`）。**`v0.4.0` stable tag 已打**；rc.1 / alpha.19 保留。候选快照：[`docs/ga-candidate-status.md`](./ga-candidate-status.md)。
 
-本机 dogfood（默认实例，post-rollback）：`production_ready=true`；`dev.herdr-mcp.server` `:8772` healthy；production Link=Rust；epoch 2 / 18 tools；用户 CLI → `runtime/current` → `0.4.0-alpha.19`；`native-host status` `runtime_matches_current=true`。**G5 保持 PASS**。
+本机 dogfood（默认实例，post stable G9/G10 rollback）：`production_ready=true`；`dev.herdr-mcp.server` `:8772` healthy；production Link=Rust；epoch 2 / 18 tools；用户 CLI → `runtime/current` → `0.4.0-alpha.19`；`update.channel=stable`（config.toml）；`native-host status` `runtime_matches_current=true`。**G5 保持 PASS**。
 
 **Dogfood G6/G7 public UAT（2026-08-28 · alpha.19 · PASS）：** 默认实例公网路径 OAuth DCR+PKCE → `tools/list` 18/18 → read-only smoke → bounded `fs_write`（无重复）→ `exec_start`/`exec_read` 完成。证据 [`_wip/g67-dogfood-public-uat-20260828.json`](./_wip/g67-dogfood-public-uat-20260828.json)。
 
 **Preview-channel rc.1 update/rollback（2026-08-28 · PASS）：** `alpha.19` → `update apply` → `0.4.0-rc.1` → `rollback` → `alpha.19`；native-host/doctor 全绿。证据 [`_wip/g910-rc1-stable-rehearsal-20260828.json`](./_wip/g910-rc1-stable-rehearsal-20260828.json)。
 
-**Stable-channel G9/G10（2026-08-28 · BLOCKED）：** `update.channel=stable` → `update check` fail-closed：GitHub 上无非 prerelease manifest release；`UpdateChannel::Stable` 只接受 `version.pre.is_empty()`，`0.4.0-rc.1` 被排除。**需 `v0.4.0` stable tag 或 owner 政策调整** 才能封 stable-channel PASS。
+**Stable-channel G9/G10（2026-08-28 · PASS）：** `update.channel=stable` → `alpha.19` → `update check`/`apply` → `0.4.0` → `rollback` → `alpha.19`；native-host/doctor/link 全绿。证据 [`_wip/g910-stable-v040-20260828.json`](./_wip/g910-stable-v040-20260828.json)。Release run [`33157370273`](https://github.com/whshang/herdr-mcp/actions/runs/33157370273)。
 
 **第二台 Mac 默认实例 UAT（2026-08-28 · owner re-eval · G18 PASS）：** macOS 15.7.3 aarch64 干净机；Release `v0.4.0-alpha.17` 二进制 → `install` → 独立 Worker + Rust Link + native-host + extension；ChatGPT Connector OAuth/tools/list epoch2/18 + tools/call OK。详见 **G18 second-Mac evidence**。
 
 | ID | 评分 | 一行证据 |
 | --- | --- | --- |
-| G1 | **FAIL** | Dogfood baseline `0.4.0-alpha.19`；rc.1 published 但未统一 stable 口径；`package.json` 不得冒充 runtime 产品版本 |
-| G2 | **PASS** | rc.1 tag-path publish 全绿（run `33155520284`）；manifest `source_commit=0a4627e`；alpha.19 run `33152207094` 仍有效 |
-| G3 | **PARTIAL** | 顶层 CLI + symlink → `runtime/current`；stable 口径未统一 |
-| G4 | **PARTIAL** | 第二台 Mac + dogfood install/doctor 已封；stable install 路径未封 |
+| G1 | **PARTIAL** | `v0.4.0` stable tag + Release 已统一；dogfood post-rollback 仍 `alpha.19`；用户文档仍含 alpha 术语 |
+| G2 | **PASS** | stable tag-path publish 全绿（run `33157370273`）；manifest `source_commit=19fc6a4`；rc.1 run `33155520284` 仍有效 |
+| G3 | **PARTIAL** | 顶层 CLI + symlink → `runtime/current`；README/docs 仍写 alpha 安装指引 |
+| G4 | **PARTIAL** | 第二台 Mac + dogfood install/doctor 已封；从 stable Release 干净安装 UAT 未封 |
 | G5 | **PASS** | production owner=rust；link-prod Rust；`production_ready=true` |
 | G6 | **PASS** | dogfood 公网 OAuth+tools/list 18/18+mutation+long-exec 已封（2026-08-28）；+ 第二台 Mac tools/call |
 | G7 | **PASS** | dogfood 公网 Edge→Link→runtime 全矩阵已封；soak/failover 未做（非 veto） |
 | G8 | **PARTIAL** | dogfood `doctor` 全层绿；WSS dial skipped |
-| G9 | **PARTIAL** | preview `alpha.19→rc.1` update apply 已封；**stable-channel BLOCKED**（无非 prerelease release） |
-| G10 | **PARTIAL** | preview `rc.1→alpha.19` rollback 已封；**stable-channel BLOCKED** |
+| G9 | **PASS** | preview `alpha.19→rc.1` + **stable `alpha.19→0.4.0`** update apply 已封（2026-08-28） |
+| G10 | **PASS** | preview `rc.1→alpha.19` + **stable `0.4.0→alpha.19`** rollback 已封（2026-08-28） |
 | G11 | **PARTIAL** | guardian / Link reconnect 有证据；完整矩阵未做 |
 | G12 | **PASS** | dogfood 公网 `exec_start`→`exec_read` completed（2026-08-28） |
 | G13 | **PASS** | Batch A + Result Optimization 已合入 |
@@ -316,10 +316,10 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G21 | **PARTIAL** | 站点 CI 可绿；无 stable tag 封板 |
 | G22 | **PARTIAL** | docs PASS（#104）；第二台 Mac 实证已封；stable 文档封板未做 |
 | G23 | **PARTIAL** | main CI 可绿；rc.1 tag-path Rust Release 全绿（`33155520284`）；#138+#139 merged |
-| G24 | **FAIL** | 剩余 blocker：G1 stable 口径、G9/G10 stable-channel BLOCKED、G20–G22 docs freeze |
-| G25 | **FAIL** | 未达 GA：不得打 stable |
+| G24 | **FAIL** | 剩余 blocker：G1 口径统一、G20–G22 docs freeze、G4 stable clean install UAT |
+| G25 | **FAIL** | 未达 GA：veto #8（docs 宣称 vs 现实）与 G20–G22 未清 |
 
-**合计（诚实快照）**：PASS 7 · PARTIAL 14 · FAIL 3 · DEFERRED 1 · UNKNOWN 0
+**合计（诚实快照）**：PASS 9 · PARTIAL 12 · FAIL 2 · DEFERRED 1 · UNKNOWN 0
 
 ### G6/G7 dogfood public evidence（2026-08-28 · alpha.19 · PASS）
 
@@ -346,15 +346,27 @@ OAuth via programmatic DCR+PKCE (ChatGPT-equivalent endpoints). ChatGPT browser 
 
 Evidence: [`_wip/g910-rc1-stable-rehearsal-20260828.json`](./_wip/g910-rc1-stable-rehearsal-20260828.json).
 
-### G9/G10 stable-channel rehearsal（2026-08-28 · BLOCKED）
+### G9/G10 stable-channel v0.4.0 rehearsal（2026-08-28 · PASS）
 
 | Step | Result |
 | --- | --- |
-| `update check` (stable) | **BLOCKED** — no non-prerelease release with manifest |
-| Policy | `UpdateChannel::Stable` → `version.pre.is_empty()` only |
-| Unblock | Tag `v0.4.0` stable **or** extend stable channel to accept `rc` prereleases |
+| `update.channel=stable` (config.toml) | PASS |
+| `update check` (stable) | PASS (`v0.4.0` available, provenance verified) |
+| `update apply` alpha.19→0.4.0 | PASS (`upd-1787907966241-37421-621d74d2`) |
+| native-host post-apply | PASS (`runtime_matches_current=true`, version `0.4.0`) |
+| `link status` post-apply | PASS (prod Link Rust, loaded) |
+| `rollback` 0.4.0→alpha.19 | PASS (`rb-1787907991968-rust-621d74d2`) |
+| `doctor` / native-host post-rollback | PASS |
 
-**Not GA PASS.** Stable-channel requires at least one non-prerelease release on GitHub.
+Evidence: [`_wip/g910-stable-v040-20260828.json`](./_wip/g910-stable-v040-20260828.json).
+
+### G9/G10 stable-channel rehearsal（2026-08-28 · historical BLOCKED）
+
+| Step | Result |
+| --- | --- |
+| `update check` (stable) | **BLOCKED** (pre-`v0.4.0` tag) — no non-prerelease release with manifest |
+| Policy | `UpdateChannel::Stable` → `version.pre.is_empty()` only |
+| Unblock | **Done** — Tag `v0.4.0` stable published 2026-08-28 |
 
 ### alpha.18 dogfood evidence（2026-08-28 · historical）
 
@@ -374,7 +386,21 @@ Evidence: [`_wip/g910-rc1-stable-rehearsal-20260828.json`](./_wip/g910-rc1-stabl
 
 Score **PASS** for canonical second-Mac default-instance clean install + public MCP closed loop. Same-machine `--instance uat` evidence below remains historical progress only.
 
-### alpha.19 tag-path release evidence（2026-08-28 · #133 + #134 · G2 PASS）
+### v0.4.0 stable tag-path release evidence（2026-08-28 · #142 · G2 PASS）
+
+Tag `v0.4.0` @ `19fc6a4`（#142 bump）。**Rust Release** tag-path run [`33157370273`](https://github.com/whshang/herdr-mcp/actions/runs/33157370273)：verify → build (darwin + windows) → manifest → attest → **publish** 全 PASS。
+
+| Check | Result |
+| --- | --- |
+| GitHub Release | <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0> |
+| Assets (5) | darwin aarch64 + windows exe + extension `0.1.68` zip + sha256 + `release-manifest.json` |
+| Manifest `source_commit` | `19fc6a41a7e35d850981f2c66119035f5a2c467d` |
+| Manifest `source_ref` | `refs/tags/v0.4.0` |
+| Darwin SHA256 | `621d74d268b5299a7141e67710e107e38efd87f16594dfb8ff54ce66097e29c5` |
+| Prerelease flag | `isPrerelease=false` |
+| Prior tags retained | `v0.4.0-alpha.19`, `v0.4.0-rc.1` — not deleted |
+
+### alpha.19 tag-path release evidence（2026-08-28 · #133 + #134 · G2 PASS · historical）
 
 Tag `v0.4.0-alpha.19` @ `4690c13`（#134 bump）。**Rust Release** tag-path run [`33152207094`](https://github.com/whshang/herdr-mcp/actions/runs/33152207094)：verify → build (darwin + windows) → manifest → attest → **publish** 全 PASS。**非 recovery-only**。
 
@@ -497,31 +523,32 @@ herdr-mcp --instance uat uninstall
 
 ## Current P0 work queue
 
-按 2026-08-28 GA freeze（rc.1 published；preview rc.1 G9/G10 PASS；stable-channel BLOCKED）排序：
+按 2026-08-28 GA freeze（`v0.4.0` stable published；stable-channel G9/G10 PASS）排序：
 
-1. **Stable-channel policy decision** — 当前 `stable` 只接受非 prerelease；rc.1 不可见。选项：直接打 `v0.4.0` stable 后跑 stable G9/G10，或最小代码改 `UpdateChannel::Stable` 接受 `rc`。
-2. **G9/G10 — stable-channel rehearsal**（需 `v0.4.0` stable tag 或政策调整）。
-3. **G1 — 退出 alpha**（stable-channel G9/G10 PASS 后；**现在不要打 stable tag** 除非 policy 已决且 rehearsal 通过）。
-4. **G20–G22 — stable docs freeze**（用户路径去除 alpha/candidate 术语）。
-5. **G16 — 保持 DEFERRED**（browser terminal / true-steer 不进第一 GA）。
+1. **G20–G22 — stable docs freeze**（用户路径去除 alpha/candidate 术语；README/install 对齐 `0.4.0` stable）。
+2. **G1 — 退出 alpha 口径**（dogfood 可择机 stable apply 留驻 `0.4.0`；文档/CLI 只呈现 stable 产品版本）。
+3. **G4 — stable Release 干净安装 UAT**（第二台 Mac 从 `v0.4.0` Release 二进制，非 alpha.17）。
+4. **G16 — 保持 DEFERRED**（browser terminal / true-steer 不进第一 GA）。
 
-**已完成：** rc.1 tag-path PASS（#138+#139）、preview `alpha.19↔rc.1` update/rollback、G2/G6/G7/G18 历史 PASS。
+**已完成：** `v0.4.0` stable tag + tag-path PASS（#142）、preview `alpha.19↔rc.1` + stable `alpha.19↔0.4.0` update/rollback、G2/G6/G7/G18 历史 PASS。
 
-### GA closure C — stable update/rollback rehearsal（2026-08-28 · BLOCKED）
+### GA closure C — stable update/rollback rehearsal（2026-08-28 · PASS）
 
-**Blocker (verified):** GitHub 上无非 prerelease release；`update.channel=stable` 的 `update check` fail-closed。`0.4.0-rc.1` 是 prerelease，stable channel 按设计排除（`config.rs` `UpdateChannel::Stable` → `version.pre.is_empty()`）。
+**Result (verified):** `update.channel=stable` → `update check` discovers `v0.4.0` → `apply` → `rollback` on default dogfood instance. Evidence: [`_wip/g910-stable-v040-20260828.json`](./_wip/g910-stable-v040-20260828.json).
 
-**Preview-channel rc.1 rehearsal（已完成 · PASS）：**
+**Stable-channel rehearsal（已完成 · PASS）：**
 
 ```bash
-herdr-mcp update check          # preview → 0.4.0-rc.1 available
+# config.toml: update.channel = "stable"
+herdr-mcp update check          # stable → 0.4.0 available
 herdr-mcp update apply
 herdr-mcp native-host status    # runtime_matches_current=true
+herdr-mcp link status
 herdr-mcp rollback
 herdr-mcp doctor
 ```
 
-**GA PASS criteria for G9/G10:** same commands on **default instance** using **stable-channel** `update check` (no `--manifest` override) with a **non-prerelease** target release. Minimum unblock: tag `v0.4.0` stable, then stable `update check` → `apply` → `rollback`.
+**Remaining for GA:** G20–G22 docs freeze; G4 stable clean install UAT; G1 version unification in user-facing docs.
 
 ---
 

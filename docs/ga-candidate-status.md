@@ -1,47 +1,48 @@
-# GA Candidate Status — `0.4.0-rc.1` (GA release candidate)
+# GA Candidate Status — `0.4.0` stable
 
-Status: **rc.1 published** (2026-08-28). **Do not cut `v0.4.0` stable** until remaining vetoes in [`ga-release-gate.md`](./ga-release-gate.md) are honest PASS.
+Status: **`v0.4.0` stable published** (2026-08-28). Stable-channel G9/G10 **PASS**. **Full GA not declared** — G20–G22 docs freeze and remaining vetoes in [`ga-release-gate.md`](./ga-release-gate.md).
 
 SSOT for gate rows: [`docs/ga-release-gate.md`](./ga-release-gate.md). Exit-alpha runbook: [`docs/exit-alpha-checklist.md`](./exit-alpha-checklist.md).
 
-**FREEZE:** alpha.19 = final alpha candidate. **No alpha.20.** No delete release/branch/worktree.
+**FREEZE:** alpha.19 = final alpha candidate. **No alpha.20.** No delete release/branch/worktree. Prior tags `v0.4.0-alpha.19`, `v0.4.0-rc.1` retained.
 
 ## Current candidate
 
 | Field | Value |
 | --- | --- |
-| Runtime version (dogfood) | `0.4.0-alpha.19` (post-rollback baseline) |
-| rc.1 Release version | `0.4.0-rc.1` |
-| Git tag | `v0.4.0-rc.1` |
-| Tag commit | `0a4627ebfbd69aa7ff914e8c5d3aa76dbd643c40` (#138 + #139) |
+| Stable Release version | `0.4.0` |
+| Git tag | `v0.4.0` |
+| Tag commit | `19fc6a41a7e35d850981f2c66119035f5a2c467d` (#142) |
+| Runtime version (dogfood post G9/G10) | `0.4.0-alpha.19` (rollback baseline) |
 | Generation (dogfood baseline) | `rust-3d2f685c636c3f3e` |
-| rc.1 generation (rehearsal) | `rust-98dcc4100429554a` |
+| Stable apply generation (rehearsal) | `rust-621d74d268b5299a` |
 | Contract | epoch 2 / 18 tools / state schema 4 |
-| Release URL | <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0-rc.1> |
-| Tag-path workflow | [Rust Release run 33155520284](https://github.com/whshang/herdr-mcp/actions/runs/33155520284) — verify → build → manifest → attest → **publish** all PASS |
+| Release URL | <https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0> |
+| Tag-path workflow | [Rust Release run 33157370273](https://github.com/whshang/herdr-mcp/actions/runs/33157370273) — verify → build → manifest → attest → **publish** all PASS |
+| Prior rc candidate | `v0.4.0-rc.1` @ `0a4627e` — retained, not deleted |
 | Prior alpha candidate | `v0.4.0-alpha.19` @ `4690c13` — retained, not deleted |
 | Connector URL (workers.dev) | `https://herdr-edge-prod.whshang.workers.dev/mcp` |
 | Connector URL (custom domain) | `https://herdr-mcp.agentforme.cc.cd/mcp` |
 | OAuth issuer | `https://herdr-mcp.agentforme.cc.cd` |
-| Update channel (dogfood) | `preview` |
+| Update channel (dogfood) | `stable` (config.toml) |
 
-## Release identity (G2 seal — rc.1)
+## Release identity (G2 seal — v0.4.0 stable)
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| Tag SHA == manifest `source_commit` | PASS | `0a4627e…` in `release-manifest.json` |
-| Manifest `source_ref` | PASS | `refs/tags/v0.4.0-rc.1` |
-| Binary SHA (darwin aarch64) | PASS | `98dcc4100429554a42e3fcd39fdebc3682393ba36a05fefc50386fec3d76d3f7` |
-| Updater provenance | PASS | preview `update check` `provenance_verified=true` |
-| Attestation | PASS | `actions/attest` job green on run 33155520284 |
+| Tag SHA == manifest `source_commit` | PASS | `19fc6a4…` in `release-manifest.json` |
+| Manifest `source_ref` | PASS | `refs/tags/v0.4.0` |
+| Binary SHA (darwin aarch64) | PASS | `621d74d268b5299a7141e67710e107e38efd87f16594dfb8ff54ce66097e29c5` |
+| Updater provenance | PASS | stable `update check` `provenance_verified=true` |
+| Attestation | PASS | `actions/attest` job green on run 33157370273 |
 | Extension zip excluded from manifest assets | PASS | manifest lists 2 platform binaries only |
-| Prerelease flag | PASS | GitHub Release `isPrerelease=true` (`v*-*` policy) |
+| Prerelease flag | PASS | GitHub Release `isPrerelease=false` |
 
 ## G6/G7 dogfood public UAT (2026-08-28 · PASS · alpha.19)
 
 Evidence (local, gitignored): `docs/_wip/g67-dogfood-public-uat-20260828.json`
 
-Sealed on alpha.19 baseline; rc.1 does not change public MCP contract.
+Sealed on alpha.19 baseline; v0.4.0 stable does not change public MCP contract.
 
 ## G9/G10 preview-channel rc.1 rehearsal (2026-08-28 · PASS)
 
@@ -56,48 +57,39 @@ Evidence (local, gitignored): `docs/_wip/g910-rc1-stable-rehearsal-20260828.json
 | `rollback` | PASS | `rb-1787906320335-rust-98dcc410`, guardian settled |
 | Post-rollback `doctor` / native-host | PASS | restored `0.4.0-alpha.19` |
 
-## G9/G10 stable-channel rehearsal (2026-08-28 · BLOCKED)
+## G9/G10 stable-channel v0.4.0 rehearsal (2026-08-28 · PASS)
+
+Evidence (local, gitignored): `docs/_wip/g910-stable-v040-20260828.json`
 
 | Step | Result | Notes |
 | --- | --- | --- |
-| `update check` (stable) | **BLOCKED** | No non-prerelease release with manifest on GitHub |
-| Policy | by design | `UpdateChannel::Stable` accepts `version.pre.is_empty()` only; `0.4.0-rc.1` excluded |
-| GA implication | **BLOCKED** | Stable N→N+1 requires `v0.4.0` stable tag first |
-
-**Minimal unblock path:** tag `v0.4.0` (non-prerelease) → stable channel discovers it → rehearsal stable `alpha.19 or rc.1` → `0.4.0` → rollback. Alternative owner policy: extend stable channel to accept `rc` prereleases (code change in `config.rs`).
+| `update.channel=stable` | PASS | config.toml created/verified |
+| `update check` (stable) | PASS | `0.4.0` available, provenance verified |
+| `update apply` alpha.19→0.4.0 | PASS | job `upd-1787907966241-37421-621d74d2` → `rust-621d74d268b5299a` |
+| Post-update native-host | PASS | `runtime_matches_current=true`, version `0.4.0` |
+| Post-update link | PASS | prod Link Rust, loaded |
+| `rollback` 0.4.0→alpha.19 | PASS | `rb-1787907991968-rust-621d74d2`, guardian settled |
+| Post-rollback `doctor` / native-host | PASS | restored `0.4.0-alpha.19` |
 
 ## Remaining GA blockers (honest)
 
 | Gate | Why still open |
 | --- | --- |
-| G1 | Dogfood baseline still alpha.19; no `v0.4.0` stable |
-| G9 / G10 | Stable-channel rehearsal **BLOCKED** — no stable release exists yet |
-| G20–G22 | Stable docs freeze (user paths still mention alpha) |
-| G24 / G25 | Vetoes above; **do not tag stable** |
+| G1 | User-facing docs still mention alpha; dogfood rolled back to alpha.19 after rehearsal |
+| G20–G22 | Stable docs freeze (user paths still mention alpha/candidate) |
+| G4 | Second Mac clean install from `v0.4.0` stable Release not yet sealed |
+| G24 / G25 | Vetoes above; **cannot declare full GA yet** |
 
-## Can enter `v0.4.0` formal release?
+## Can declare GA stable?
 
-**No.** Missing: G1 exit-alpha, stable-channel G9/G10 (needs `v0.4.0` stable tag + rehearsal), G20–G22 docs freeze, G25 vetoes cleared.
+**Not yet.** `v0.4.0` stable Release exists and stable-channel G9/G10 PASS. Missing: G20–G22 docs freeze, G1 user-facing version unification, G4 stable clean install UAT, G25 veto #8 (docs == reality).
 
-## Next owner actions (Option A — owner confirmed 2026-08-28)
+## Next owner actions
 
-**Owner chose Option A (stable tag path).** Phase 0 verified @ `e6521ad7`. Do **not** change `UpdateChannel::Stable`. Do **not** tag `v0.4.0` in the version-bump PR — tagging is a separate owner-gated step.
-
-| Step | Status |
-| --- | --- |
-| Bump `main` Cargo to `0.4.0` (+ lock sync) | **In flight** — PR after merge |
-| Tag `v0.4.0` (non-prerelease) | **Next** — owner only, after merge + CI green |
-| Stable-channel G9/G10 rehearsal | After tag: `update check` (stable) → `apply` → `rollback` |
-| G20–G22 stable docs freeze | After stable rehearsal PASS |
-| G1 exit-alpha | After vetoes cleared |
-
-**After stable-channel G9/G10 PASS:** G20–G22 docs freeze, second Mac clean install from stable Release.
-
-<details>
-<summary>Superseded fork (Option B — not chosen)</summary>
-
-Option B would have extended `UpdateChannel::Stable` to accept `rc` prereleases. **Not selected.**
-</details>
+1. **G20–G22 — stable docs freeze** (remove alpha/candidate from user install paths).
+2. **G4 — second Mac clean install** from `v0.4.0` Release binary (not alpha.17).
+3. **G1 — exit alpha** (optionally leave dogfood on `0.4.0` after docs freeze).
+4. Re-run scorecard; if G24/G25 clear → declare GA.
 
 ## Related
 
