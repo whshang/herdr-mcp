@@ -605,6 +605,8 @@ pub fn run_status() -> Result<ExitCode, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -730,11 +732,31 @@ mod tests {
 
     #[test]
     fn gate_catalog_keeps_production_ready_false() {
+        let root = env::temp_dir().join(format!(
+            "herdr-link-catalog-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let previous_home = env::var_os("HOME");
+        unsafe {
+            env::set_var("HOME", &root);
+        }
         let catalog = production_ready_gate_catalog();
         assert_eq!(catalog["production_ready"], false);
         assert_eq!(
             catalog["requires_all"].as_array().map(Vec::len),
             Some(PRODUCTION_READY_GATE_IDS.len())
         );
+        unsafe {
+            match previous_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(root);
     }
 }

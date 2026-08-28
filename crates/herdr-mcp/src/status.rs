@@ -289,6 +289,18 @@ fn format_native_messaging_layer() -> String {
                 .get("runtime_binary_ok")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let runtime_matches = value
+                .get("runtime_matches_current")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let version_consistent = value
+                .get("version_consistent")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let stale_runtime = value
+                .get("stale_runtime")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let ownership = if ok {
                 "owned"
             } else if owned == 0 && !wrapper_ok && !runtime_ok {
@@ -296,8 +308,9 @@ fn format_native_messaging_layer() -> String {
             } else {
                 "unowned"
             };
+            let stale = if stale_runtime { " stale-runtime" } else { "" };
             format!(
-                "{ownership} manifests={owned} wrapper_ok={wrapper_ok} runtime_binary_ok={runtime_ok}"
+                "{ownership}{stale} manifests={owned} wrapper_ok={wrapper_ok} runtime_binary_ok={runtime_ok} runtime_matches_current={runtime_matches} version_consistent={version_consistent}"
             )
         }
         Err(error) => format!("error detail={}", compact_detail(&error)),
