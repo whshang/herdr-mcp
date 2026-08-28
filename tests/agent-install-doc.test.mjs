@@ -93,26 +93,36 @@ test("herdr-link resolves Node from PATH for fresh Apple Silicon installs", () =
   assert.doesNotMatch(src, /^NODE_BIN="\/usr\/local\/bin\/node"$/m);
 });
 
-test("second-Mac agent prompt enforces independent Worker, Link env override, and owner OAuth handoff", () => {
+test("second-Mac GA UAT agent prompt enforces independent Worker, Link env override, and owner OAuth handoff", () => {
   for (const rel of [
-    "docs/i18n/en/second-mac-agent-prompt.md",
-    "docs/i18n/zh-CN/second-mac-agent-prompt.md",
+    "docs/_wip/en/second-mac-ga-uat-agent-prompt.md",
+    "docs/_wip/zh-CN/second-mac-ga-uat-agent-prompt.md",
   ]) {
     const doc = read(rel);
+    assert.match(doc, /INTERNAL GA UAT|内部 GA UAT/);
+    assert.match(doc, /not end-user install|非终端用户安装/);
+    assert.match(doc, /begin execution immediately|立即阅读本 URL/);
     assert.match(doc, /herdr\.dev\/install\.sh/);
     assert.match(doc, /cloudflare-worker-name\.mjs/);
     assert.match(doc, /herdr-edge-prod/);
     assert.match(doc, /HERDR_EDGE_URL/);
     assert.match(doc, /HERDR_WORKSTATION_ID/);
     assert.match(doc, /HERDR_LINK_KEYCHAIN_SERVICE/);
-    assert.match(doc, /PlistBuddy/);
+    assert.match(doc, /PlistBuddy|patch plist/i);
     assert.match(doc, /workers_dev = true/);
     assert.match(doc, /v0\.4\.0-alpha\.16/);
     assert.match(doc, /chrome:\/\/extensions/);
+    assert.match(doc, /Edit Cloudflare Workers/);
+    assert.match(doc, /CLOUDFLARE_API_TOKEN/);
+    assert.match(doc, /Account Resources/);
+    assert.match(doc, /Zone Resources/);
+    assert.match(doc, /dash\.cloudflare\.com\/profile\/api-tokens/);
     assert.match(doc, /multi-device/i);
   }
   const zhUat = read("docs/i18n/zh-CN/clean-machine-uat.md");
   const enUat = read("docs/i18n/en/clean-machine-uat.md");
-  assert.match(zhUat, /second-mac-agent-prompt\.md/);
-  assert.match(enUat, /second-mac-agent-prompt\.md/);
+  assert.match(zhUat, /second-mac-ga-uat-agent-prompt\.md/);
+  assert.match(enUat, /second-mac-ga-uat-agent-prompt\.md/);
+  assert.match(read("docs/i18n/en/install.md"), /second-mac-ga-uat-agent-prompt\.md/);
+  assert.match(read("docs/i18n/zh-CN/install.md"), /second-mac-ga-uat-agent-prompt\.md/);
 });

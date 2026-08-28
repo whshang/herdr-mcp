@@ -232,4 +232,4 @@ herdr-mcp native-host status
 
 ## 维护者 UAT (不是本页)
 
-第二台机器维护者验证见 [干净机 UAT](clean-machine-uat.md) 与 [第二台 Mac Agent 提示词](second-mac-agent-prompt.md)。不要把 34 步 UAT 发给最终用户。
+第二台机器维护者验证见 [干净机 UAT](clean-machine-uat.md) 与内部 [第二台 Mac GA UAT Agent 提示词](../../_wip/zh-CN/second-mac-ga-uat-agent-prompt.md)。不要把 34 步 UAT 发给最终用户。
