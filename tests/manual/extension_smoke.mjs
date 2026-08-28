@@ -71,9 +71,9 @@ const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.70", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.70"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.70"'), "content version matches manifest");
+ok(manifest.version === "0.1.71", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.71"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.71"'), "content version matches manifest");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")
@@ -536,9 +536,9 @@ const zhLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "zh.json"), "
 const jaLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "ja.json"), "utf8"));
 ok([enLocale, zhLocale, jaLocale].every((locale) => !Object.keys(locale).some((key) => key.startsWith("popup_"))),
   "deleted toolbar Popup leaves no dead popup locale identity");
-ok(zhLocale.hud_manual_continue === "手动继续", "zh HUD manual continue label is exact");
-ok(zhLocale.hud_manual_status === "herdr监控", "zh HUD Herdr monitor label is exact");
-ok(zhLocale.hud_manual_judge === "LLM 分析", "zh HUD LLM analysis label is exact");
+ok(zhLocale.hud_manual_continue === "继续", "zh HUD continue label is exact");
+ok(zhLocale.hud_manual_status === "查 Herdr", "zh HUD Herdr check label is exact");
+ok(zhLocale.hud_manual_judge === "LLM 判断", "zh HUD LLM decision label is exact");
 ok(!("hud_manual_handoff" in zhLocale) && !("hud_bindings" in zhLocale) && !("hud_interval" in zhLocale),
   "zh HUD removes drawer, binding, timing, and handoff copy after those paths move elsewhere");
 ok(zhLocale.cc_page_handoff === "手动接力"
@@ -618,8 +618,8 @@ ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")'
   "permission-card automation is folded into effective Project automation");
 ok(!wakeDocEn.includes("- **Manual handoff (Control Center → Current page)**")
     && !wakeDocZh.includes("- **手动接力（Control Center → 当前页面）**")
-    && wakeDocEn.includes("The HUD exposes only Continue / Herdr monitor / LLM analysis")
-    && wakeDocZh.includes("HUD 只保留 `手动继续 / herdr监控 / LLM 分析`"),
+    && wakeDocEn.includes("The HUD exposes only Continue / Check Herdr / LLM decide")
+    && wakeDocZh.includes("HUD 只保留 `继续 / 查 Herdr / LLM 判断`"),
   "Wake docs list exactly the three HUD manual actions and keep handoff on the Side Panel path");
 const actionClickStart = backgroundSource.indexOf("chrome.action.onClicked.addListener");
 const actionClickEnd = actionClickStart >= 0 ? backgroundSource.indexOf("void rebuildStreams();", actionClickStart) : -1;
@@ -630,7 +630,7 @@ ok(actionClickBlock.includes("chrome.sidePanel.open({ windowId })")
     && actionClickBlock.includes("tab?.windowId")
     && !backgroundSource.includes('msg?.type === "h2w_popup_set_automation"'),
   "toolbar action opens the Control Center Side Panel directly and removes popup-only protocol");
-ok(controlCenterHtml.includes('data-i18n="cc_phase_title"')
+ok(!controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && controlCenterHtml.includes('id="pageContextCard"')
     && controlCenterHtml.includes('class="workspace-panel"')
     && controlCenterHtml.includes('data-i18n="cc_workspaces_binding_hint"')
@@ -651,6 +651,7 @@ ok(controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && controlCenterSource.includes("async function mutateWorkspaceBinding")
     && controlCenterSource.includes("data-workspace-binding-action")
     && controlCenterSource.includes('setAttribute("aria-pressed", String(contextBound))')
+    && controlCenterSource.includes("if (pageSupported) {")
     && controlCenterSource.includes("workspaceRowsForPage(state.workspaces || [], pageContextBindings())")
     && controlCenterModelSource.includes("export function workspaceRowsForPage")
     && controlCenterModelSource.includes("...sorted.filter((workspace) => boundIds.has")

@@ -230,11 +230,14 @@ After reconnect the panel refreshes an authoritative snapshot and resumes increm
 Treat the three surfaces as different layers:
 
 ```text
-Control Center
-  observe local workspace / pane / agent truth
-  ↓
 HUD
-  manage current Project / conversation binding and Auto state
+  current web conversation: status, Auto, Continue / Check Herdr / LLM decide
+  ↓
+Control Center · Current page + Workspaces
+  current page ↔ workspace binding plus live workspace / pane / agent truth
+  ↓
+Control Center · Local Herdr target
+  explicit pinned pane and local Herdr reads / action preview
   ↓
 Queue (ChatGPT composer)
   add the next user intent without interrupting the current reply
@@ -247,7 +250,7 @@ A typical flow is:
 3. Return to ChatGPT and let the Web planner perform real control through MCP / Herdr tools.
 4. If a new requirement occurs while ChatGPT is still replying, use Queue instead of interrupting the live turn.
 5. Queued content becomes the next user turn after the current reply settles.
-6. For long work, the browser continuity engine maintains progress / settled / recovery / automatic handoff; the HUD only exposes status, Auto, and three preset manual actions, while Manual handoff stays in Current page.
+6. For long work, the browser continuity engine maintains progress / settled / recovery / automatic handoff; the HUD only exposes page-scoped status, Auto, and three preset manual actions, while binding and Manual handoff stay in the Side Panel.
 
 ## Local security model
 

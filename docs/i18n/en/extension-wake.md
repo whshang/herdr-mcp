@@ -51,7 +51,7 @@ The HUD can expose:
 - **Herdr monitor** — inspect the bound workspace before continuing;
 - **LLM analysis** — ask a small configured model whether the latest reply is clearly unfinished;
 
-The HUD exposes only Continue / Herdr monitor / LLM analysis; these manual progression actions are locked while Auto is on. Manual handoff has a single UI entry in **Control Center → Current page** and is the deliberate exception: it can start with Auto on or off on supported conversations, pauses source automatic wakes during transfer, and makes the target inherit the source Auto state.
+The HUD exposes only Continue / Check Herdr / LLM decide; these page-scoped manual progression actions are locked while Auto is on. Workspace binding and Manual handoff stay in the Side Panel. Manual handoff has a single UI entry in **Control Center → Current page** and is the deliberate exception: it can start with Auto on or off on supported conversations, pauses source automatic wakes during transfer, and makes the target inherit the source Auto state.
 
 ## Queue: explicit next-turn user intent comes before auto-continue
 

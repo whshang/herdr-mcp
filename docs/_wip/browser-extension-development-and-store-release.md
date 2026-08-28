@@ -26,7 +26,7 @@ Herdr workspace / pane / agent
 
 当前扩展名称：`herdr → Web wake`。
 
-当前 `origin/main` 浏览器扩展版本：`0.1.70`。`0.1.69` 首次上传 Chrome Web Store 时因 manifest `description` 超过 132 字符被拒；`0.1.70` 仅做 Store 合规修正并已通过扩展 CI。
+当前开发版本：`0.1.71`。`0.1.69` 首次上传 Chrome Web Store 时因 manifest `description` 超过 132 字符被拒；`0.1.70` 完成 Store 合规修正，`0.1.71` 继续收紧 HUD / Side Panel 的职责边界与信息密度。
 
 核心能力包括：
 
@@ -35,8 +35,8 @@ Herdr workspace / pane / agent
 - ChatGPT Project continuity；
 - z.ai / DeepSeek JSON → MCP bridge；
 - 工具栏图标直接打开 Chrome Side Panel Browser Control Center；
-- Side Panel 跟随当前激活 tab，识别 Project / conversation，并统一管理 workspace binding / unbinding 与手动接力；
-- HUD 仅保留网页状态、Herdr 状态、绑定 workspace / pane 数量、Auto 和三个预置会话动作；不再有 drawer；
+- Side Panel 跟随当前激活 tab，识别 Project / conversation；workspace 实时状态与当前页面 binding / unbinding 合并在同一行，手动接力留在 Current page；
+- HUD 仅保留网页状态、Herdr 状态、紧凑 binding 数量、Auto 和三个当前网页会话动作；不再有 drawer 或 binding UI；
 - workspace / pane / agent 实时状态；
 - explicit pinned target；
 - Phase A read-only / mutation dry-run control model；
@@ -771,7 +771,7 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 截至 2026-08-28：
 
 - 浏览器扩展继续以 unpacked development build 方式开发；
-- main 浏览器扩展版本已进入 `0.1.70`；Side Panel 是 binding / unbinding、手动接力与本机详细状态的主入口，HUD 保持紧凑状态面；
+- 浏览器扩展开发版本已进入 `0.1.71`；Side Panel 是 binding / unbinding、手动接力与本机详细状态的主入口，底部固定本地 Herdr target；HUD 保持当前网页会话的紧凑状态与快捷动作面；
 - Browser Control Center Phase A 与 pane lifecycle 已进入 main，0.1.65 进一步补齐 en / zh / ja、Pinned Target / Preview-only 产品文案与 Settings 入口；
 - ChatGPT Queued Insert 已进入 main，正式用户文档使用“排队 / Queue”描述其 next-turn 语义；
 - Chrome Web Store 首次发布流程**已经启动**；Developer Dashboard publisher 已可用，Store item 已创建；

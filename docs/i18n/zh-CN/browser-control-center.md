@@ -232,11 +232,14 @@ stale 后控制中心不会猜测新目标。需要用户重新点击 pane 才�
 推荐把三个操作面理解成不同层级：
 
 ```text
-Control Center
-  看本机真实 workspace / pane / Agent
-  ↓
 HUD
-  管理当前网页 Project / conversation 的 binding 与 Auto
+  当前网页会话：状态、Auto、继续 / 查 Herdr / LLM 判断
+  ↓
+Control Center · 当前页面 + 工作区
+  当前页面 ↔ workspace 绑定，同时看 workspace / pane / Agent 实时状态
+  ↓
+Control Center · 本地 Herdr 目标
+  固定明确 pane，执行本地读取与操作预览
   ↓
 排队（ChatGPT composer）
   在当前回复不中断的前提下追加下一轮用户意图
@@ -249,7 +252,7 @@ HUD
 3. 回到 ChatGPT，让 Web planner 继续通过 MCP / Herdr 工具做实际控制；
 4. ChatGPT 正在回复时如果想到补充要求，使用“排队”而不是中断当前回合；
 5. 当前回复结束后，排队内容优先成为下一条用户消息；
-6. 长任务由浏览器 continuity engine 维护 progress / settled / recovery / automatic handoff；HUD 只保留状态、Auto 和三个预置动作，手动接力只在“当前页面”。
+6. 长任务由浏览器 continuity engine 维护 progress / settled / recovery / automatic handoff；HUD 只保留页面级状态、Auto 和三个预置动作，绑定与手动接力留在 Side Panel。
 
 ## 本机安全模型
 

@@ -40,10 +40,6 @@ button:disabled { opacity: .45; cursor: default; }
 button.primary { border-color: #3d6fa8; background: #17406c; }
 button.ghost { background: transparent; }
 
-.phase-banner { margin: 8px 8px 0; padding: 10px 11px; border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
-.phase-banner strong { display: block; font-size: 11px; letter-spacing: .01em; }
-.phase-banner p { margin: 3px 0 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
-
 .page-context-card { margin: 8px 8px 0; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
 .page-context-heading { display: flex; align-items: center; gap: 8px; }
 .page-context-heading strong { font-size: 11px; }
