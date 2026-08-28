@@ -180,7 +180,7 @@ fn expected_extension_origin() -> Result<String, String> {
     Ok(crate::browser_extension_identity::official_store_identity()?.origin)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 pub(crate) fn extension_path_for_install() -> Result<PathBuf, String> {
     extension_path_for_install_optional()?.ok_or_else(|| {
         "extension directory not found: set HERDR_EXTENSION_PATH to an unpacked development extension directory when using an unpacked build"
