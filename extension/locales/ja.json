@@ -294,11 +294,14 @@
   "cc_page_handoff_started": "引き継ぎを開始しました。継続性確認中に現在のタブが移動する場合があります。",
   "cc_page_handoff_failed": "引き継ぎ失敗: {error}",
   "hud_web_state": "{site} ● {state}",
-  "hud_scope_counts": "{workspaces} workspace · {panes} pane",
-  "hud_scope_counts_hint": "バインド中 pane のうち {working} 件が稼働中",
+  "hud_scope_binding_count": "🔗{count}",
+  "hud_scope_binding_hint": "現在のページには {count} 個の Herdr workspace がバインドされています。pane と Agent の詳細は Control Center で確認してください。",
   "hud_scope_unbound": "未バインド",
   "cc_page_no_workspaces": "利用可能なローカル workspace がありません — Herdr runtime を確認してください",
   "cc_page_handoff_busy": "Herdr の settled を待つ",
   "cc_page_handoff_busy_help": "バインド中の Herdr workspace がまだ作業中です。ローカル作業が idle / settled になってから、この「現在のページ」カードで手動引き継ぎを開始してください。",
-  "cc_page_handoff_binding_required": "手動引き継ぎを開始する前に、少なくとも 1 つの workspace をバインドしてください。"
+  "cc_page_handoff_binding_required": "手動引き継ぎを開始する前に、少なくとも 1 つの workspace をバインドしてください。",
+  "cc_page_handoff_project_required": "ChatGPT の手動引き継ぎは Project 内の具体的な会話から開始します。先に Project の会話を開いてください。",
+  "cc_page_handoff_conversation_required": "手動引き継ぎを開始する前に、具体的な会話を開いてください。",
+  "cc_page_handoff_unavailable_help": "このページでは手動引き継ぎを利用できません。現在は ChatGPT Project の会話と z.ai の会話に対応しています。"
 }

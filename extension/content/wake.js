@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.67";
+const H2W_CONTENT_VERSION = "0.1.68";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -39,8 +39,17 @@ const H2W_CONTENT_VERSION = "0.1.67";
   const QUEUED_INSERT_BUTTON_ID = "h2w-queued-insert-button";
   const QUEUED_INSERT_STYLE_ID = "h2w-queued-insert-style";
   const QUEUED_INSERT_LAST_BATCH_KEY = "h2wQueuedInsertLastBatchV1";
+  const QUEUED_INSERT_OWNER_ATTR = "data-h2w-queue-owner";
+  const queuedInsertOwnerId = `${H2W_CONTENT_VERSION}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`;
   const HEALTH_STORAGE_KEY = "h2wConversationHealthByConv";
   const CONTEXT_PRESSURE_STORAGE_KEY = "h2wContextPressureByConv";
+
+  try { document.documentElement?.setAttribute(QUEUED_INSERT_OWNER_ATTR, queuedInsertOwnerId); } catch (_) {}
+
+  function ownsQueuedInsertSurface() {
+    try { return document.documentElement?.getAttribute(QUEUED_INSERT_OWNER_ATTR) === queuedInsertOwnerId; }
+    catch (_) { return false; }
+  }
 
   function conversationHasPendingReply() {
     const submitAt = Number(conversationHealth?.last_user_submit_at || 0);
@@ -413,6 +422,12 @@ const H2W_CONTENT_VERSION = "0.1.67";
     queuedInsertButton = null;
   }
 
+  function removeStaleQueuedInsertButtons() {
+    for (const button of document.querySelectorAll(`#${QUEUED_INSERT_BUTTON_ID}`)) {
+      if (button !== queuedInsertButton) button.remove();
+    }
+  }
+
   function ensureQueuedInsertStyle() {
     if (document.getElementById(QUEUED_INSERT_STYLE_ID)) return;
     const style = document.createElement("style");
@@ -600,6 +615,13 @@ const H2W_CONTENT_VERSION = "0.1.67";
   }
 
   function ensureQueuedInsertButton() {
+    // A newly injected content script owns the Queue surface. Older contexts
+    // left alive by an extension reload may still have timers, but they must
+    // only remove their own stale node and must never create a second button.
+    if (!runtimeAlive() || !ownsQueuedInsertSurface()) {
+      removeQueuedInsertButton();
+      return null;
+    }
     if (ADAPTER.name !== "chatgpt" || !chatGptConversationId()) {
       removeQueuedInsertButton();
       return null;
@@ -611,8 +633,10 @@ const H2W_CONTENT_VERSION = "0.1.67";
     const parent = anchor?.parentElement;
     if (!anchor || !parent) return queuedInsertButton;
     if (!queuedInsertButton || !queuedInsertButton.isConnected) {
+      removeStaleQueuedInsertButtons();
       queuedInsertButton = document.createElement("button");
       queuedInsertButton.id = QUEUED_INSERT_BUTTON_ID;
+      queuedInsertButton.dataset.h2wQueueOwner = queuedInsertOwnerId;
       queuedInsertButton.type = "button";
       queuedInsertButton.addEventListener("click", (event) => {
         event.preventDefault();
@@ -624,6 +648,8 @@ const H2W_CONTENT_VERSION = "0.1.67";
         event.stopPropagation();
         void clearQueuedInsertMessages();
       });
+    } else {
+      removeStaleQueuedInsertButtons();
     }
     if (queuedInsertButton.parentElement !== parent || queuedInsertButton.nextSibling !== anchor) {
       parent.insertBefore(queuedInsertButton, anchor);
@@ -2666,7 +2692,7 @@ const H2W_CONTENT_VERSION = "0.1.67";
 
   function hudLabelsReady(labels) {
     const required = [
-      "web_state", "scope_counts", "scope_unbound",
+      "web_state", "scope_binding_count", "scope_binding_hint", "scope_unbound",
       "manual_continue", "manual_status", "manual_judge",
       "automation_on", "automation_off", "aria_toggle_automation",
     ];
@@ -2953,15 +2979,14 @@ const H2W_CONTENT_VERSION = "0.1.67";
     syncAutomationPermissionWatch();
     syncDocumentTitle(hud, state);
     ui.webStatus.textContent = hudWebActivityLabel();
+    const boundWorkspaceCount = Number(hud?.bound_workspace_count ?? hud?.binding_count ?? 0);
     ui.scopeCounts.textContent = hud?.bound
-      ? hudText("scope_counts", {
-        workspaces: Number(hud?.bound_workspace_count ?? hud?.binding_count ?? 0),
-        panes: Number(hud?.bound_pane_count || 0),
-      })
+      ? hudText("scope_binding_count", { count: boundWorkspaceCount }, `🔗${boundWorkspaceCount}`)
       : hudText("scope_unbound");
     ui.scopeCounts.title = hud?.bound
-      ? hudText("scope_counts_hint", { working: Number(hud?.bound_working_count || 0) })
+      ? hudText("scope_binding_hint", { count: boundWorkspaceCount })
       : hudText("scope_unbound");
+    ui.scopeCounts.setAttribute("aria-label", ui.scopeCounts.title || ui.scopeCounts.textContent || "");
     const manualLabels = [
       [hudLabels.manual_continue, hudLabels.manual_continue_hint],
       [hudLabels.manual_status, hudLabels.manual_status_hint],

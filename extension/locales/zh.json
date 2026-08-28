@@ -294,11 +294,14 @@
   "cc_page_handoff_started": "接力已启动；连续性验证期间当前标签页可能会跳转。",
   "cc_page_handoff_failed": "接力失败：{error}",
   "hud_web_state": "{site} ● {state}",
-  "hud_scope_counts": "{workspaces} 个工作区 · {panes} 个窗格",
-  "hud_scope_counts_hint": "当前有 {working} 个已绑定窗格在工作",
+  "hud_scope_binding_count": "🔗{count}",
+  "hud_scope_binding_hint": "当前页面绑定了 {count} 个 Herdr 工作区；窗格和 Agent 详情请在控制中心查看。",
   "hud_scope_unbound": "未绑定",
   "cc_page_no_workspaces": "暂无可用本机工作区 — 请检查 Herdr 运行时",
   "cc_page_handoff_busy": "等待 Herdr 空闲",
   "cc_page_handoff_busy_help": "当前绑定的 Herdr 工作区仍在工作。请先让本机任务进入空闲 / settled，再从这张“当前页面”卡启动手动接力。",
-  "cc_page_handoff_binding_required": "至少绑定一个工作区后才能启动手动接力。"
+  "cc_page_handoff_binding_required": "至少绑定一个工作区后才能启动手动接力。",
+  "cc_page_handoff_project_required": "ChatGPT 手动接力目前只从 Project 内的具体会话启动。请先进入一个 Project 会话。",
+  "cc_page_handoff_conversation_required": "请先进入一个具体会话，再启动手动接力。",
+  "cc_page_handoff_unavailable_help": "当前页面不支持手动接力。现阶段支持 ChatGPT Project 会话和 z.ai 具体会话。"
 }

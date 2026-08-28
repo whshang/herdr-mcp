@@ -70,9 +70,9 @@ const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extensi
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
-ok(manifest.version === "0.1.67", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.67"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.67"'), "content version matches manifest");
+ok(manifest.version === "0.1.68", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.68"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.68"'), "content version matches manifest");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")
@@ -238,9 +238,20 @@ ok(
 ok(
   wakeSource.includes("hudBoundRuntimeState")
     && wakeSource.includes("hudWebActivityLabel")
-    && wakeSource.includes('hudText("scope_counts"')
+    && wakeSource.includes('hudText("scope_binding_count"')
+    && wakeSource.includes('hudText("scope_binding_hint"')
+    && !wakeSource.includes('hudText("scope_counts"')
+    && !wakeSource.includes("bound_pane_count || 0")
     && !wakeSource.includes("hudExpanded"),
-  "HUD reports Web + Herdr state and aggregate binding counts without workspace or pane names",
+  "HUD reports Web + Herdr state plus one compact binding count and leaves pane detail to Control Center",
+);
+ok(
+  wakeSource.includes('const QUEUED_INSERT_OWNER_ATTR = "data-h2w-queue-owner"')
+    && wakeSource.includes("function ownsQueuedInsertSurface()")
+    && wakeSource.includes("function removeStaleQueuedInsertButtons()")
+    && wakeSource.includes("if (!runtimeAlive() || !ownsQueuedInsertSurface())")
+    && wakeSource.includes("removeStaleQueuedInsertButtons();"),
+  "Queue surface uses one DOM owner and removes stale duplicate buttons after extension reload/reinjection",
 );
 ok(
   wakeSource.includes("function sendBgResult(msg)")
@@ -531,9 +542,10 @@ ok(!("hud_manual_handoff" in zhLocale) && !("hud_bindings" in zhLocale) && !("hu
   "zh HUD removes drawer, binding, timing, and handoff copy after those paths move elsewhere");
 ok(zhLocale.cc_page_handoff === "手动接力"
     && zhLocale.cc_page_context_title === "当前页面"
-    && zhLocale.hud_scope_counts.includes("工作区")
-    && zhLocale.hud_scope_counts.includes("窗格"),
-  "zh copy places handoff/binding context in Side Panel and keeps HUD aggregate-only");
+    && zhLocale.hud_scope_binding_count === "🔗{count}"
+    && zhLocale.hud_scope_binding_hint.includes("控制中心")
+    && !zhLocale.hud_scope_binding_hint.includes("0 个窗格"),
+  "zh copy keeps HUD binding identity compact and moves pane/Agent detail to Control Center");
 ok(zhLocale.cc_page_handoff_busy.includes("Herdr")
     && zhLocale.cc_page_handoff_busy_help.includes("工作区仍在工作")
     && zhLocale.cc_mode_herdr_help.includes("不会假装已经完成 schema 校验")
@@ -617,11 +629,15 @@ ok(controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && controlCenterSource.includes('type: "h2w_unbind"')
     && backgroundSource.includes('type: "herdr_control_binding_changed"')
     && controlCenterSource.includes('const workspaceBusy = bindings.some')
+    && controlCenterSource.includes("const handoffPageSupported = (")
     && controlCenterSource.includes('pageHandoffButton.disabled = !canHandoff || workspaceBusy || transferBusy')
+    && !controlCenterSource.includes("pageHandoffButton.hidden")
+    && controlCenterSource.includes('t("cc_page_handoff_project_required")')
+    && controlCenterSource.includes('t("cc_page_handoff_binding_required")')
     && controlCenterSource.includes('if (code === "workspace_busy") return t("cc_page_handoff_busy_help")')
     && controlCenterSource.includes('t("cc_preview_only_reason")')
     && controlCenterSource.includes('t("native_host_help")'),
-  "Control Center localizes state, explicit targeting, preview boundary, Settings, and Native Host failures");
+  "Control Center keeps manual handoff discoverable with disabled reasons while localizing state, targeting, preview boundary, Settings, and Native Host failures");
 ok(backgroundSource.includes('event === "hello"')
     && backgroundSource.includes('type: "herdr_control_state"')
     && backgroundSource.includes('type: "herdr_control_event"')
