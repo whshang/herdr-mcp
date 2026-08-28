@@ -1,241 +1,181 @@
 # 安装：从一台 Herdr 工作站到可用的 Web AI 开发环境
 
-这篇文档负责把系统真正装起来。目标不是“某个本地进程能启动”，而是完成下面这条链：
+> **推荐给普通用户：** 不需要从这里手抄命令。把 [快速 Agent 安装](quick-agent-install.md) 里的一句话发给 Cursor / Codex / Claude Code 等本地 Coding Agent，让它自动安装 Herdr、herdr-mcp、Edge 和 Link，只在 Cloudflare 与 ChatGPT 必须人工操作时暂停。本页保留为手动安装和排障参考。
 
-```text
-ChatGPT
-  ↓ OAuth + MCP
-Cloudflare Edge
-  ↓ authenticated WSS
-herdr-link / herdr-mcp
-  ↓
-Herdr + managed Git projects
-```
-
-如果只想快速体验，先看 [快速开始](quick-start.md)。如果想让本地 Coding Agent 代你完成绝大多数安装步骤，把 [快速 Agent 安装](quick-agent-install.md) 里的一句话发给 Agent；详细合同见 [Agent 辅助安装](agent-install.md)。
-
-**普通用户路径：** GitHub Release 二进制 → `herdr-mcp install` → `herdr-mcp doctor`（Edge 可能已预置，或按 agent-install §6 部署）。**第二台 Mac GA UAT**（仅维护者）— 协议已归档于 [`history/ga/second-mac-ga-uat-agent-prompt-zh-CN.md`](../../history/ga/second-mac-ga-uat-agent-prompt-zh-CN.md)；见 [干净机 UAT](clean-machine-uat.md)。
+目标是把一台本地工作站接到 ChatGPT / Web AI，同时保持代码和真实执行环境留在自己的机器上。
 
 ## 安装前确认
 
 ### 1. Herdr 已经可用
-
-herdr-mcp 建立在 Herdr 上，不安装也不替代 Herdr。
 
 ```bash
 herdr --version
 herdr api schema >/dev/null
 ```
 
-如果这里失败，先按 [Herdr 官方安装文档](https://herdr.dev/zh-cn/docs/install/) 修好 Herdr。
+如果 Herdr 未安装，推荐直接使用 Herdr 官方 stable 安装器：
 
-### 2. 明确你要连接哪类客户端
+```bash
+# macOS / Linux
+curl -fsSL https://herdr.dev/install.sh | sh
+```
 
-- **ChatGPT**：需要稳定公网 Edge + OAuth。
-- **同机 Cursor / curl**：可以直接连接 `127.0.0.1`，不需要 Cloudflare。
-- **z.ai / DeepSeek 浏览器桥接**：依赖浏览器扩展和 Native Messaging，本机链路即可。
+Windows：
 
-本页主线以 ChatGPT 为例，因为它覆盖了完整安装链路。
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
+```
 
-运行本机 MCP runtime **不需要** Node.js。部署 Cloudflare Worker（`npx wrangler`）时仍可能临时用到 Node。从源码构建浏览器扩展属于高级/开发者路径，不是主安装路径。
+安装后重新执行 `herdr --version`。Herdr 本体的详细安装行为以 <https://herdr.dev/docs/install/> 为准。
 
-## 支持平台（第一版 GA 建议）
+### 2. 明确要连接的客户端
 
-- **第一版 GA 正式支持：** macOS Apple Silicon（托管 install / service / update / rollback）。
-- **Preview artifact：** Windows x64 仍可能作为 Release 资产发布；在 G19 封板前不要宣称完整托管生命周期对等。
-- **第一版 GA 不宣称：** Linux service lifecycle。CI 矩阵里出现 Linux 二进制不等于 Linux 已是 GA 平台。
+- ChatGPT / 其它公网 Web AI → 需要 Cloudflare Edge + 出站 Herdr Link；
+- 只在本机用 MCP 客户端 → 可以直接连接 loopback runtime，不需要 Cloudflare；
+- 浏览器扩展 → 是基础 Connector 连通后的可选能力，不是第一次安装前置条件。
 
-## 第一步：安装原生 runtime（主路径）
+## 支持平台
 
-从 [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) 下载当前平台的 `herdr-mcp` 二进制（当前 stable：[`v0.4.0`](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0)），放到 `PATH`（例如 `~/.local/bin/herdr-mcp`）并赋予可执行权限。然后执行 `herdr-mcp install`：安装器会在 `~/.config/herdr-mcp/runtime/` 下写入不可变 generation，并把 `~/.local/bin/herdr-mcp` 重定向到 `runtime/current/herdr-mcp`，使 PATH 入口不再依赖 git checkout。
+当前 `v0.4.0` clean-machine 证据最充分的是 **macOS Apple Silicon**。Windows x64 Release binary 已提供，但 Windows 端到端 UAT 仍在继续；Linux runtime 暂不作为 `v0.4.0` 正式支持面承诺。
+
+## 第一步：安装原生 herdr-mcp runtime
+
+从 <https://github.com/whshang/herdr-mcp/releases> 下载当前平台的最新 stable `herdr-mcp` binary，放到 `PATH`，然后执行：
 
 ```bash
 herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
-herdr-mcp update check   # bare `herdr-mcp update` is equivalent
+herdr-mcp update check
 ```
 
-优先使用以上顶层命令。**不要**把 `herdr-mcp service install` 写成普通用户安装主路径；`service ...` 仍是高级/内部接口。**不要**用 clone 仓库或 `npm`/`cargo` 安装本机 MCP runtime。
-
-当前 stable 版本为 **`v0.4.0`**。默认 `update.channel = "stable"` 只发现非 prerelease。仅在需要 prerelease（如 `0.4.0-rc.1` 或更早 `0.4.0-alpha.x`）时使用 `preview`。
+`install` 会把不可变 generation 放到 `~/.config/herdr-mcp/runtime/` 并让用户 PATH 入口指向 `runtime/current/herdr-mcp`。普通用户不要用 git clone、`npm` 或 `cargo` 安装本机 runtime。
 
 ## 第二步：先把本地 runtime 跑通
 
-受管 runtime 默认监听 `127.0.0.1:8772`。二进制安装且本机服务健康后：
+至少确认：
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
+herdr-mcp doctor
+herdr-mcp status
 ```
 
-返回 `200` 或 `401` 都说明 HTTP 服务存在；`401` 表示它正在要求本机 bearer。
+如果本地 doctor 不健康，不要继续部署公网 Edge。先解决本机 runtime / Herdr 问题。
 
-这一步还应该确认 Herdr socket 能被 runtime 访问。稍后真正连接后，`herdr_inspect` 应能返回当前 workspace / pane / managed roots。
+## 第三步：部署稳定公网 Edge
 
-日常升级（`herdr-mcp update` 与 `update check` 等价；有可用版本时 JSON 会给出 `next_action`）：
+如果 ChatGPT 需要从公网访问工作站，使用 Cloudflare Worker 提供稳定 OAuth/MCP 入口。首次安装优先 `workers.dev`，除非你明确需要自有域名。
 
-```bash
-herdr-mcp update          # same as update check
-herdr-mcp update apply
-herdr-mcp update status
-```
+推荐让 Coding Agent 按 [快速 Agent 安装](quick-agent-install.md) 自动完成这段，因为里面包含 Token 最小权限、Worker 命名、secret 注入、Account 选择和代理判断。
 
-## 第三步：让 runtime 长期运行
+手动执行时，至少遵守：
 
-在 macOS 上，安装完成后由原生二进制管理 LaunchAgent 生命周期。健康检查用 `herdr-mcp status` / `herdr-mcp doctor`，升级用 `herdr-mcp update ...`。不要把 launchd 指到 git checkout 或 `target/*/herdr-mcp`。
-
-Linux / Windows 的服务封装目前更窄。第一版 GA 建议只正式支持 macOS Apple Silicon；Windows 若发布二进制仅作 preview。不要把未封板的 Linux lifecycle 写成正式支持。把 Release 二进制放在 `PATH` 上，并按当前 Release 资产中的平台说明处理。
-
-## 第四步：部署稳定公网 Edge
-
-ChatGPT 不能访问你的 `127.0.0.1`。推荐架构是 Cloudflare Worker / Durable Object 作为稳定公网入口，工作站主动建立出站 WSS。
-
-首次安装直接使用 `workers.dev`。它不要求购买域名，也避免在安装阶段把 DNS、证书和业务域名一起引入。
-
-### 生成 Worker name
+- Cloudflare API Token 只作为临时进程环境变量；
+- 不把 Token 写进仓库、日志、截图或 shell history；
+- 默认 `workers_dev = true`、`routes = []`；
+- Worker 名使用仓库 helper：
 
 ```bash
 WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
-printf '%s\n' "$WORKER_NAME"
 ```
 
-Worker name 是 DNS label。像 `MacBook.local` 这种主机名不要原样复制；helper 会做规范化。
+- `LINK_SHARED_SECRET` 作为 Worker secret 保存；
+- 工作站只主动建立出站 WSS，不暴露本机公网端口。
 
-### 准备 Wrangler 配置
+详细手动协议见 [Agent 协助安装](agent-install.md) 与 [Cloudflare Edge 部署](cloudflare-edge-deployment.md)。
+
+## 第四步：安装并验证 Herdr Link
 
 ```bash
-cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
+herdr-mcp link install
+herdr-mcp link status
 ```
 
-按模板填入：
+如果 `workers.dev` 在当前网络不可达，优先复用已有代理：
 
-- Worker name；
-- workstation identity；
-- `OAUTH_ISSUER` / 公网 origin；
-- 模板要求的其他部署值。
+```text
+HERDR_LINK_PROXY
+HTTPS_PROXY / https_proxy
+HTTP_PROXY / http_proxy
+ALL_PROXY / all_proxy
+```
 
-部署：
+macOS 也会读取 `scutil --proxy`。不要还没验证代理就把网络问题扩大成 DNS / Custom Domain 变更。
+
+## 第五步：验证公网路径
 
 ```bash
-cd edge/cloudflare
-npx wrangler deploy --config wrangler.user.toml
+herdr-mcp doctor
+herdr-mcp link status
+curl -fsS "${EDGE_ORIGIN}/health"
+curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 ```
 
-公网 origin 形如：
+未带 OAuth 的 `/mcp` 返回 `401` 可以是正确结果。真正的成功标准是：runtime 健康、Link 已连接、Edge `/health` 正常、OAuth metadata 可访问。
+
+## 第六步：在 ChatGPT 添加 herdr Connector
+
+这一步需要用户本人操作。让 Coding Agent 暂停并指导：
+
+1. 打开 ChatGPT 设置中的 Apps / Connectors；
+2. 当前 UI 需要时开启 Developer mode；
+3. 添加自定义 MCP Connector，名称建议 `herdr`；
+4. URL 填部署后的 `${MCP_URL}`，必须以 `/mcp` 结尾；
+5. 完成浏览器 OAuth；
+6. 在新会话或 Project 中启用该 Connector。
+
+然后先做只读验证：
 
 ```text
-https://herdr-edge-xxx.<account-subdomain>.workers.dev
+分析我的 Herdr 里有哪些项目。只读，不要修改。
 ```
 
-MCP 端点：
+如果 `herdr_inspect` 能返回真实工作站数据，基础闭环就已经可用。
 
-```text
-https://herdr-edge-xxx.<account-subdomain>.workers.dev/mcp
+详见 [ChatGPT Connector](chatgpt-connector.md)。
+
+## 第七步：需要浏览器连续工作时再装扩展
+
+浏览器扩展用于 Side Panel 控制中心、workspace binding、长对话连续性和“排队”下一轮消息。它不是基础 MCP 闭环的必需项。
+
+最终用户只从 **Chrome Web Store** 安装：
+
+1. 打开 <https://chromewebstore.google.com/>；
+2. 搜索 `Herdr`，选择 Herdr 官方扩展；
+3. 点击 **添加至 Chrome / Add to Chrome**；
+4. Chrome Web Store listing 尚未正式上线时，直接跳过扩展，不回退到开发者模式安装；
+5. 安装完成后运行：
+
+```bash
+herdr-mcp native-host install
+herdr-mcp native-host status
 ```
 
-凭据最小权限见 [Cloudflare Edge Token](cloudflare-edge-token.md)；Worker / Durable Object / Link 细节见 [Cloudflare Edge 部署](cloudflare-edge-deployment.md)。
+以后扩展版本通过 Chrome Web Store 正常更新机制分发；普通用户不需要重复下载 zip、覆盖本地目录或手工 Reload 扩展。
 
-## 第五步：验证工作站链路
-
-Worker 部署成功只证明 Edge 存在。Edge 还必须能路由到你的工作站。
-
-确认：
-
-1. 本机 runtime 健康；
-2. `herdr-link` 在跑；
-3. workstation identity 与 Edge 配置一致；
-4. Edge `/health` 报告工作站在线；
-5. runtime generation/version 符合预期。
-
-即使工作站离线，OAuth 也可能成功，所以要把公网 Edge 健康与工作站可达性当成不同层。
-
-## 第六步：创建 ChatGPT Connector
-
-在 ChatGPT 中：
-
-1. 打开 Developer mode；
-2. 创建自定义 MCP Connector；
-3. 填入 `https://<worker>.<account>.workers.dev/mcp`；
-4. 在浏览器完成 OAuth；
-5. **新开一个会话**做验证。
-
-不要把 `HERDR_MCP_TOKEN` 贴进 ChatGPT。公网 Connector 的认证边界是 OAuth。
-
-ChatGPT 会缓存工具快照。服务器升级后旧会话仍可能暴露旧契约；见 [ChatGPT Connector](chatgpt-connector.md)。
-
-## 第七步：做一次真实验证
-
-从只读请求开始：
-
-```text
-检查当前 Herdr workspace 和项目状态。只读，不要修改。
-```
-
-预期：
-
-1. `herdr_inspect` 成功；
-2. 模型能看到真实 workspace / managed Git roots；
-3. 可能加载一次 `herdr_skill`；
-4. 能对真实项目状态使用 `herdr_git` 或 `herdr_fs_read`。
-
-然后再试一次小的可逆编辑和测试命令。
-
-当前生产公共契约是 **epoch 2 / 18 tools**。如果新会话仍只看到 17 个工具，先排查 Connector/工具快照缓存，而不是重装 runtime。
-
-## 第八步：需要浏览器连续工作与本机观察时再装扩展
-
-MCP 解决的是“ChatGPT 到达工作站”。浏览器扩展再补三类能力：网页连续工作、Chrome Side Panel 控制中心，以及 z.ai / DeepSeek 的本机 JSON → MCP bridge。ChatGPT 还会获得“排队”，用于不中断当前回复地保存下一轮用户要求。
-
-安装步骤见 [浏览器扩展](extension.md)。扩展使用 Native Messaging 与本机 IPC；不把 Herdr bearer 存进浏览器状态。
-
-安装后至少验证：
-
-1. 点击 Herdr 工具栏图标会直接打开 **浏览器控制中心**，并显示本机 runtime 可达；
-2. Control Center 的“当前页面”能识别当前 Project / conversation，并可直接在下方 workspace 行完成绑定 / 解绑；
-3. 同一个 workspace 行同时显示绑定状态与实时状态，展开后能看到 pane / Agent；
-4. 创建/关闭 pane 后 Side Panel 能看到生命周期变化；
-5. Control Center 的“提示 Agent / 调整会话 / Herdr API / 终端输入”明确显示为 Preview-only，而不是误以为已经开放写操作；
-6. ChatGPT 正在回复时，“排队”不会打断当前 turn，settled 后再发送下一轮。
-
-控制中心交互见 [浏览器控制中心](browser-control-center.md)。
-
-## 何时再加 Custom Domain
-
-`workers.dev` 足以验证完整 Connector 路径。Custom Domain 适合：
-
-- 你要在自己控制的域名下长期固定 OAuth issuer；
-- 团队有集中域名治理；
-- 你想把公网身份与 Cloudflare account 子域解耦。
-
-先在 `workers.dev` 上跑通完整流程，再单独迁移稳定 origin。
-
-## 本机客户端：绕过 Cloudflare
-
-本机 Cursor / curl 可以直接连：
-
-```text
-http://127.0.0.1:8772/mcp
-```
-
-并使用本机静态 bearer。这条路径也便于把 runtime 故障与 Edge 故障分开。
-
-## 附录：开发者从源码构建
-
-clone + `npm`/`cargo` 工作流仍留给开发 herdr-mcp 本身的人。那不是最终用户安装主路径，也不应被要求用来运行本机 MCP runtime。
+详见 [浏览器扩展](extension.md) 与 [浏览器控制中心](browser-control-center.md)。
 
 ## 什么叫“装好了”
 
-一次完整的 ChatGPT 安装需要同时满足：
+至少满足：
 
-- Herdr socket 可用；
-- herdr-mcp runtime 可用；
-- Edge 已部署；
-- 工作站链路在线；
-- OAuth 成功；
-- 新 ChatGPT 会话拿到 epoch-2 目录；
-- `herdr_inspect` 能看到真实工作站；
-- 至少一次真实的文件/Git/测试操作成功。
+- `herdr --version` 正常；
+- `herdr-mcp doctor` 健康；
+- Herdr Link 已连接；
+- Edge `/health` 正常；
+- ChatGPT OAuth 完成；
+- 新会话能调用 `herdr_inspect` 读取真实工作站；
+- 可选扩展如果已安装，`herdr-mcp native-host status` 正常且 Side Panel 能看到 workspace。
 
-Worker 部署成功或 Connector 显示“connected”只是其中一层。
+## 手动安装之外
 
-分层排障见 [故障排查](troubleshooting.md)：本机 runtime → Link → Edge → OAuth → MCP → ChatGPT 快照。
+如果目标只是“尽快用起来”，回到 [快速 Agent 安装](quick-agent-install.md)，让本地 Coding Agent 按协议自动执行。
+
+更深入的内容按需查看：
+
+- [故障排查](troubleshooting.md)
+- [架构](architecture.md)
+- [Runtime A/B](runtime-self-upgrade.md)
+- [Cloudflare Edge 部署](cloudflare-edge-deployment.md)
+
+维护者 UAT、GA gate 和发布证据不属于普通用户安装流程。

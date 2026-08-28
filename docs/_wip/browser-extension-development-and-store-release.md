@@ -2,7 +2,7 @@
 
 > 状态：WIP / 开发期文档
 >
-> 当前决定：**继续使用 unpacked 开发版，不立即发布到 Chrome Web Store。**
+> 当前决定：**开发期仍可使用 unpacked build，但最终用户分发正式切换到 Chrome Web Store。已启动 Developer 注册 / Store item 首次发布流程。**
 >
 > 本文记录开发期安装、Native Messaging 身份、测试门槛、未来商店上架步骤和待办，避免后续把“代码已合并”“开发版已加载”“商店版已发布”混为一谈。
 
@@ -379,7 +379,27 @@ herdr-mcp Rust runtime
 
 Chrome Web Store 要求申请完成 single purpose 所需的最小权限。不能为了未来功能提前请求宽权限。
 
-## 8. 当前不发布 Chrome Web Store
+## 8. Chrome Web Store 首次发布已经启动
+
+2026-08-28 已在本机 Chrome 打开 Chrome Web Store Developer Dashboard 注册入口。当前官方要求重新核对后确认：
+
+- 新 publisher 需要注册 Chrome Web Store Developer、接受协议并支付一次性注册费（当前官方说明为 US$5）；
+- 发布/更新扩展的 Google Account 必须启用 2-Step Verification；
+- 首次发布前必须完成 Store listing 与 Privacy practices；
+- Privacy practices 必须说明 single purpose、逐项解释 permissions，并准确声明 remote code；
+- Manifest V3 不允许执行 remotely hosted code；
+- 官方 minimum-permission policy 要求只申请当前功能真正需要的最小权限。
+
+因此当前 `host_permissions` 中的 `<all_urls>` 在首次提交前必须独立做一次最小权限审计；不要仅因为现有代码能运行就假定商店审核会接受宽权限。
+
+当前最终用户文档已经改为：**Chrome Web Store 是唯一正式浏览器扩展安装路径**。Store listing 正式上线前，普通用户直接跳过扩展，不回退到 `Load unpacked`。
+
+官方参考：
+
+- https://developer.chrome.com/docs/webstore/register
+- https://developer.chrome.com/docs/webstore/prepare
+- https://developer.chrome.com/docs/webstore/cws-dashboard-privacy
+- https://developer.chrome.com/docs/webstore/using-api
 
 当前阶段继续：
 
@@ -402,20 +422,22 @@ real browser smoke
 
 原因：Store ID 与 Native Messaging origin 是一个需要一次性设计正确的身份边界；不能为了“先上架看看”临时打补丁。
 
-## 9. 未来 Chrome Web Store 上架设计
+## 9. Chrome Web Store 上架执行设计
 
-### 9.1 第一阶段：创建 Store item，只拿固定 ID，不发布
+### 9.1 第一阶段：注册 publisher + 创建 Store item + 冻结 ID
 
-未来上架时：
+当前执行顺序：
 
 1. 注册 Chrome Web Store Developer；
 2. 从 `extension/` 生成 ZIP；
 3. ZIP 根目录直接包含 `manifest.json`；
 4. Developer Dashboard → Add new item → upload；
-5. **暂不发布**；
+5. 先完成 Store listing / Privacy / permission justification；
 6. 记录 Chrome Web Store item / Extension ID；
 7. 从 Dashboard 获取开发期需要的 public key / identity 信息；
-8. 冻结 production extension identity。
+8. 冻结 production extension identity；
+9. 优先用 Trusted Testers 做第一轮真实商店安装 / 自动更新 UAT；
+10. UAT 通过后再提交 public review。
 
 官方参考：
 
@@ -749,10 +771,12 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 截至 2026-08-28：
 
 - 浏览器扩展继续以 unpacked development build 方式开发；
-- 浏览器产品化已经进入 `0.1.65`；本轮入口收敛分支进一步升到 `0.1.66`：移除旧 Popup，工具栏图标直达 Side Panel；Side Panel 成为当前页面 binding / unbinding、手动接力与本机详细状态的唯一主入口；HUD drawer 删除，只保留状态、Auto、聚合绑定数量与三个预置动作；合入后以 main 实际版本为准；
+- main 浏览器扩展版本已进入 `0.1.69`；Side Panel 是 binding / unbinding、手动接力与本机详细状态的主入口，HUD 保持紧凑状态面；
 - Browser Control Center Phase A 与 pane lifecycle 已进入 main，0.1.65 进一步补齐 en / zh / ja、Pinned Target / Preview-only 产品文案与 Settings 入口；
 - ChatGPT Queued Insert 已进入 main，正式用户文档使用“排队 / Queue”描述其 next-turn 语义；
-- Chrome Web Store **暂不发布**；
-- Store item / Store Extension ID 尚未冻结；
+- Chrome Web Store 首次发布流程**已经启动**；Developer Dashboard 注册入口已打开；
+- 普通用户正式安装路径已经切为 Chrome Web Store，Store listing 上线前直接跳过扩展；
+- Store item / Store Extension ID 尚未冻结，需完成 publisher 注册与首次 item upload；
 - 商店版 Native Host origin 迁移尚未开始；
-- 下一次真正启动 Store 发布时，必须从第 9 节重新检查实时 Chrome Web Store policy，不得把本 WIP 的时间点描述当成永久不变的商店规则。
+- 首次 Store submit 前必须审计 `<all_urls>` 等 permissions 是否能缩窄；
+- 后续每次 Store 发布仍需重新核对实时 Chrome Web Store policy，不得把本 WIP 的时间点描述当成永久不变的商店规则。

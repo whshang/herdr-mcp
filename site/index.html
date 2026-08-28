@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="herdr-mcp connects ChatGPT and other Web AI to a local Herdr workstation for code, Git, shell, local-agent delegation and browser continuity.">
+  <meta name="description" content="herdr-mcp connects ChatGPT and other Web AI to a local Herdr workstation. The fastest setup is one prompt to your coding agent.">
   <meta name="color-scheme" content="light dark">
   <link rel="icon" type="image/png" href="./favicon.png">
-  <title>herdr-mcp · local development control plane for Web AI</title>
+  <title>herdr-mcp · Connect ChatGPT to your development machine</title>
   <link rel="canonical" href="https://whshang.github.io/herdr-mcp/">
   <link rel="alternate" hreflang="en" href="https://whshang.github.io/herdr-mcp/">
   <link rel="alternate" hreflang="zh-CN" href="https://whshang.github.io/herdr-mcp/zh-CN/index.html">
@@ -23,58 +23,61 @@
 <body>
   <header class="topbar">
     <a class="brand" href="./" aria-label="herdr-mcp home">herdr-mcp</a>
-    <nav class="topnav" aria-label="Primary"><a href="./docs/">Docs</a><a href="https://github.com/whshang/herdr-mcp">GitHub</a></nav>
+    <nav class="topnav" aria-label="Primary"><a href="./docs/en/">Docs</a><a href="https://github.com/whshang/herdr-mcp">GitHub</a></nav>
     <div class="topbar-actions">
-      <nav class="lang-switcher" data-lang-switch aria-label="Change language"><a href="./" hreflang="en" data-locale="en" aria-current="true">English</a><a href="./zh-CN/index.html" hreflang="zh-CN" data-locale="zh-CN">简体中文</a></nav>
+      <nav class="lang-switcher" data-lang-switch aria-label="Language"><a href="./" hreflang="en" data-locale="en" aria-current="true">English</a><a href="./zh-CN/index.html" hreflang="zh-CN" data-locale="zh-CN">简体中文</a></nav>
       <button class="theme-toggle" type="button" data-theme-toggle aria-label="Toggle color theme"><span data-theme-icon aria-hidden="true">◐</span></button>
     </div>
   </header>
 
   <main>
     <header class="hero">
-      <div class="eyebrow">Web AI reasons · Herdr keeps the workspace · herdr-mcp connects both sides</div>
-      <h1>Connect ChatGPT to the real development machine.</h1>
-      <p class="lead">herdr-mcp is a remote development control plane between Web AI and a local Herdr workstation. ChatGPT can read and edit code, inspect Git, run shell commands, observe persistent workspaces, and delegate to local agents when independent reasoning is useful—while code and execution stay on your machine.</p>
+      <div class="eyebrow">Web AI plans · Herdr keeps the worksite alive · herdr-mcp connects both ends</div>
+      <h1>Give ChatGPT real access to your development machine.</h1>
+      <p class="lead">You do not need to learn the architecture or assemble deployment commands first. Give one setup prompt to Cursor, Codex, Claude Code, or another local coding agent. It installs Herdr and herdr-mcp, deploys Edge and Link, and pauses only for Cloudflare and ChatGPT steps that require you.</p>
       <div class="actions">
-        <a class="primary" href="./docs/en/quick-start.html">Quick start</a>
-        <a href="./docs/en/extension.html">Browser extension</a>
-        <a href="./docs/en/design-philosophy.html">Why it is designed this way</a>
-        <a href="./docs/en/architecture.html">Architecture</a>
+        <a class="primary" href="./docs/en/quick-agent-install.html">Let my agent install it</a>
+        <a href="./docs/en/install.html">Manual install</a>
+        <a href="./docs/en/overview.html">What is herdr-mcp?</a>
         <a href="https://github.com/whshang/herdr-mcp">GitHub</a>
       </div>
     </header>
 
-    <section class="diagram" aria-label="Architecture">
-      <div>ChatGPT / Web AI</div><span>↓ MCP + OAuth</span>
-      <div>Cloudflare Edge</div><span>↓ authenticated WSS</span>
-      <div>herdr-link + herdr-mcp</div><span>↓ local control</span>
-      <div>Herdr persistent workspaces</div><span>↓</span>
-      <div>files · Git · shell · panes · agents</div>
+    <section class="grid">
+      <article>
+        <h2>1. Copy one prompt</h2>
+        <p>Give the install guide URL to the coding agent you already use. If Herdr is missing, the agent installs the official stable build too.</p>
+        <p><a href="./docs/en/quick-agent-install.html">Copy the setup prompt →</a></p>
+      </article>
+      <article>
+        <h2>2. Do only two human steps</h2>
+        <p>First: Cloudflare sign-in / API Token. Second: add the <code>herdr</code> Connector in ChatGPT and complete OAuth. The agent automates and verifies everything else.</p>
+      </article>
+      <article>
+        <h2>3. Run one real task</h2>
+        <p>Open a new ChatGPT conversation and ask it to inspect your Herdr projects read-only. That proves the public path reaches the real workstation.</p>
+      </article>
     </section>
 
     <section class="grid">
-      <article><h2>Give Web AI local hands and eyes</h2><p>Deterministic work uses first-class file, search, patch, Git and shell tools directly. The Web model can keep ownership of goals, trade-offs and verification instead of routing every action through another agent.</p></article>
-      <article><h2>Herdr keeps the real workspace alive</h2><p>Workspaces, panes, PTYs and agents outlive individual browser requests. Long tests, servers and parallel agents keep stable identities that later turns can inspect again.</p></article>
-      <article><h2>Delegate only when another reasoning process helps</h2><p>Focused investigation, parallel implementation and review can go to Herdr agents such as Pi or Grok. Reading files, checking Git and running tests remain direct operations.</p></article>
-      <article><h2>The browser extension closes the working loop</h2><p>Continuity sends progress and recovery back to the right conversation; Browser Control Center shows live workspaces and explicit pane targets in Chrome Side Panel; Queue saves the next ChatGPT instruction without interrupting the current reply.</p></article>
-      <article><h2>No public inbound workstation port</h2><p>Cloudflare Edge provides the stable OAuth/MCP origin while the workstation creates an authenticated outbound WSS link. ChatGPT never needs the local bearer.</p></article>
-      <article><h2>Upgrade the local runtime independently</h2><p>Runtime A/B validates candidates, switches traffic, drains old generations and supports rollback within the same public contract—without changing the Connector URL.</p></article>
-    </section>
-
-    <section class="grid">
-      <article><h2>First setup</h2><p>With Herdr already installed, use Quick Start to bring up the local runtime, a workers.dev Edge, the ChatGPT Connector and a real <code>herdr_inspect</code> validation.</p><p><a href="./docs/en/quick-start.html">Open Quick Start →</a></p></article>
-      <article><h2>Browser workspace</h2><p>Bind the Web conversation, observe the local Herdr worksite in Side Panel, read bounded pane output, and keep explicit next-turn user intent queued while a reply is still running.</p><p><a href="./docs/en/extension.html">Explore the browser extension →</a> · <a href="./docs/en/browser-control-center.html">Control Center →</a></p></article>
-      <article><h2>Go deeper</h2><p>Learn why the public MCP contract stays compact, why runtime truth belongs to Herdr, and how Edge, Link, Runtime and the extension divide responsibilities.</p><p><a href="./docs/en/architecture.html">Read the architecture →</a></p></article>
+      <article>
+        <h2>The browser extension is optional</h2>
+        <p>After the base Connector works, install the Herdr extension from the Chrome Web Store for Browser Control Center, workspace binding, long-conversation continuity, and queued next-turn messages. Normal users do not use Developer mode / Load unpacked.</p>
+        <p><a href="./docs/en/extension.html">Chrome Web Store install →</a> · <a href="./docs/en/browser-control-center.html">Browser Control Center →</a></p>
+      </article>
+      <article>
+        <h2>Go deeper only when needed</h2>
+        <p>A normal install does not require understanding MCP epochs, Runtime A/B, Worker internals, or GA evidence. Read those pages only for troubleshooting or herdr-mcp development.</p>
+        <p><a href="./docs/en/troubleshooting.html">Troubleshooting →</a> · <a href="./docs/en/architecture.html">Architecture →</a></p>
+      </article>
     </section>
 
     <footer>
       <span>herdr-mcp</span>
-      <a href="./docs/">Documentation</a>
-      <a href="./docs/en/best-practices.html">Best practices</a>
-      <a href="./docs/en/runtime-self-upgrade.html">Runtime A/B</a>
-      <a href="./docs/en/capability-benchmark.html">Capability decisions</a>
-      <a href="./docs/en/cloudflare-edge-deployment.html">Cloudflare Edge</a>
+      <a href="./docs/en/quick-agent-install.html">Quick install</a>
       <a href="./docs/en/troubleshooting.html">Troubleshooting</a>
+      <a href="./docs/en/privacy.html">Privacy</a>
+      <a href="./docs/en/architecture.html">Architecture</a>
       <a href="./zh-CN/index.html" hreflang="zh-CN">简体中文</a>
     </footer>
   </main>

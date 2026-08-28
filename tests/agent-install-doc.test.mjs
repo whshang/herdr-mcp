@@ -45,7 +45,7 @@ test("Agent install guide makes the bootstrap Token ephemeral and DNS-free", () 
   assert.match(en, /No Zone\/DNS mutation is required/);
 });
 
-test("Agent install uses deterministic Cloudflare-safe Worker names and reports the extension directory", () => {
+test("maintainer install keeps deterministic Worker/bootstrap details while end-user entry stays short", () => {
   for (const rel of ["docs/i18n/en/agent-install.md", "docs/i18n/zh-CN/agent-install.md"]) {
     const doc = read(rel);
     assert.match(doc, /GitHub Releases/);
@@ -62,27 +62,38 @@ test("Agent install uses deterministic Cloudflare-safe Worker names and reports 
     assert.match(doc, /Native Messaging/);
     assert.match(doc, /HERDR_MCP_TOKEN/);
   }
-  for (const rel of ["README.md", "README.zh.md", "docs/i18n/en/install.md", "docs/i18n/zh-CN/install.md"]) {
+  for (const rel of ["docs/i18n/en/install.md", "docs/i18n/zh-CN/install.md"]) {
     const doc = read(rel);
     assert.match(doc, /scripts\/cloudflare-worker-name\.mjs/);
     assert.match(doc, /WORKER_NAME/);
     assert.match(doc, /herdr-mcp install/);
   }
+  for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
+    const doc = read(rel);
+    assert.match(doc, /quick-agent-install\.md/);
+    assert.match(doc, /Chrome Web Store/);
+    assert.doesNotMatch(doc, /scripts\/cloudflare-worker-name\.mjs/);
+  }
 });
 
-test("quick agent install guides expose one-liner, proxy, custom domain, and extension path", () => {
+test("quick agent install guides automate Herdr/runtime and keep the extension Store-only", () => {
   for (const rel of [
     "docs/i18n/en/quick-agent-install.md",
     "docs/i18n/zh-CN/quick-agent-install.md",
   ]) {
     const doc = read(rel);
     assert.match(doc, /quick-agent-install\.md/);
+    assert.match(doc, /herdr\.dev\/install\.(?:sh|ps1)/);
+    assert.match(doc, /GitHub Releases/);
     assert.match(doc, /HERDR_LINK_PROXY/);
-    assert.match(doc, /herdr-mcp-extension/);
+    assert.match(doc, /Chrome Web Store/);
+    assert.doesNotMatch(doc, /herdr-mcp-extension/);
+    assert.match(doc, /Do \*\*not\*\* use `Load unpacked`|不使用 `Load unpacked`/);
+    assert.doesNotMatch(doc, /cp -R extension|ln -s .*extension/);
     assert.match(doc, /herdr-edge-device\.username\.workers\.dev\/mcp/);
     assert.match(doc, /herdr-mcp\.example\.com\/mcp/);
     assert.match(doc, /workers\.dev/);
-    assert.match(doc, /Custom Domain|自定义域名/);
+    assert.match(doc, /custom domain|自定义域名/i);
     assert.doesNotMatch(doc, /second-mac-agent-prompt/);
   }
 });
@@ -124,6 +135,18 @@ test("second-Mac GA UAT agent prompt enforces independent Worker, Link env overr
   const enUat = read("docs/i18n/en/clean-machine-uat.md");
   assert.match(zhUat, /second-mac-ga-uat-agent-prompt/);
   assert.match(enUat, /second-mac-ga-uat-agent-prompt/);
-  assert.match(read("docs/i18n/en/install.md"), /second-mac-ga-uat-agent-prompt/);
-  assert.match(read("docs/i18n/zh-CN/install.md"), /second-mac-ga-uat-agent-prompt/);
+  assert.doesNotMatch(read("docs/i18n/en/install.md"), /second-mac-ga-uat-agent-prompt/);
+  assert.doesNotMatch(read("docs/i18n/zh-CN/install.md"), /second-mac-ga-uat-agent-prompt/);
+});
+
+test("browser privacy policy matches the Store-first extension data model", () => {
+  for (const rel of ["docs/i18n/en/privacy.md", "docs/i18n/zh-CN/privacy.md"]) {
+    const doc = read(rel);
+    assert.match(doc, /chrome\.storage\.local/);
+    assert.match(doc, /Native Messaging|nativeMessaging/);
+    assert.match(doc, /OpenAI-compatible/);
+    assert.match(doc, /Limited Use/);
+    assert.match(doc, /remote executable code|远程可执行代码/);
+    assert.match(doc, /credit|信用/);
+  }
 });

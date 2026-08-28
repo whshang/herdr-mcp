@@ -1,198 +1,73 @@
 # herdr-mcp
 
-**A remote control plane that lets Web AI work on a real local development workstation through Herdr.**
+**Connect ChatGPT / Web AI safely to your local Herdr workstation.**
 
-ChatGPT can reason about a repository, but the browser cannot see your local files, Git state, shell, long-running processes or Herdr workspaces by itself. herdr-mcp connects those two worlds without exposing the workstation directly to the public Internet.
+ChatGPT keeps the plan and decisions, Herdr keeps the real worksite alive, and herdr-mcp connects the browser model to local files, Git, shell, long-running jobs, and agents.
 
 **Docs:** https://whshang.github.io/herdr-mcp/ · **Source:** https://github.com/whshang/herdr-mcp
 
 Languages: **English** · [简体中文](README.zh.md) · [日本語](README.ja.md)
 
-## What it does
+## Fastest setup: paste one prompt into your coding agent
 
-herdr-mcp gives a Web planner five things it normally lacks:
-
-- **persistent local context** — Herdr workspaces, panes and agent lifecycle;
-- **deterministic workstation tools** — files, Git, images and shell;
-- **delegation** — send bounded reasoning tasks to local Herdr workers when useful;
-- **stable remote access** — OAuth/MCP at Cloudflare Edge with an outbound workstation link;
-- **browser workspace layer** — continuity back into the Web conversation, a live Chrome Side Panel Control Center, and queued next-turn user intent.
-
-The model is simple:
+Use Cursor, Codex, Claude Code, Pi, Cline, or another local coding agent that can read URLs and run commands:
 
 ```text
-User
-  ↓
-ChatGPT / Web AI
-  ↓ MCP + OAuth
-Cloudflare Edge
-  ↓ authenticated routing
-herdr-link
-  ↓
-local herdr-mcp runtime
-  ↓
-Herdr workspace
-  ├─ files / Git / shell
-  └─ local agents
+Install and configure Herdr and herdr-mcp for me. First read and follow this guide end to end: https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/quick-agent-install.md .
 
-Herdr progress
-  ↓
-browser extension
-  ↓
-Web conversation resumes
+Install the local herdr-mcp runtime from GitHub Releases, not from a git clone. Pause only when I personally need to sign in/create a Cloudflare API Token, or when I need to add the herdr Connector/app in ChatGPT. Automate and verify everything else.
 ```
 
-## What it is not
+The local herdr-mcp runtime is a native binary; normal users do **not** need Node.js or npm to run it. Node may be used temporarily by the Agent only for Cloudflare/Wrangler bootstrap.
 
-herdr-mcp does **not** replace Herdr, create another agent runtime, or turn every Herdr socket method into a public MCP tool.
+The guide tells the agent to:
 
-The Web model remains the planner. Herdr remains the persistent local workspace. Local agents are workers. Git and runtime state are the source of truth.
+1. check Herdr and install the official stable build if it is missing;
+2. install the latest stable `herdr-mcp` runtime from GitHub Releases;
+3. deploy Cloudflare Edge, configure the workstation Link, and verify public `/health` and `/mcp`;
+4. pause only for Cloudflare sign-in / API Token creation;
+5. pause only for adding the `herdr` Connector in ChatGPT and completing OAuth;
+6. finish with `herdr-mcp doctor` and a real MCP smoke test.
 
-## Why the public tool surface is small
+Prefer to do it manually? See [Installation](docs/i18n/en/install.md).
 
-Herdr exposes a much larger native Socket API than a Web model should carry in every MCP tool catalog.
+## First real test
 
-The public contract therefore keeps high-frequency remote operations first-class and exposes the Herdr long tail dynamically:
+In a new ChatGPT conversation with the `herdr` Connector enabled, send:
 
 ```text
-frequent work
-  → herdr_inspect / herdr_since / herdr_fs_* / herdr_git / herdr_exec* / herdr_prompt
-
-native Herdr long tail
-  → herdr_methods → herdr_call
+Inspect my Herdr projects. Read only; do not modify anything.
 ```
 
-Current production contract: **epoch 2 / 18 tools**, including read-only `herdr_skill`.
+A healthy setup lets ChatGPT see real workspaces, panes, agents, Git state, and project files through the MCP tools.
 
-## Fastest path to a working setup
+## Browser extension: optional, after the Connector works
 
-Prerequisites:
+The browser extension adds long-conversation continuity, the Side Panel Control Center, workspace binding, and queued next-turn messages. It is **not** required for the first ChatGPT-to-workstation connection.
 
-- [Herdr](https://herdr.dev) installed and running;
-- a Cloudflare account if ChatGPT will connect over the Internet.
+End users install it only from the **Chrome Web Store**:
 
-Validated clean-machine path for `v0.4.0`: **macOS Apple Silicon**. A Windows x64 binary is published, but Windows end-to-end UAT is not yet sealed; Linux is not claimed as a `v0.4.0` supported runtime target.
+1. finish the runtime + Connector verification first;
+2. open the [Chrome Web Store](https://chromewebstore.google.com/) and search for `Herdr`;
+3. choose the official Herdr extension and click **Add to Chrome**;
+4. run `herdr-mcp native-host install` and `herdr-mcp native-host status`;
+5. future extension updates are delivered through the normal Chrome Web Store update mechanism—no repeated ZIP downloads or developer-mode Reload flow.
 
-The **local MCP runtime** is a native binary. You do **not** need Node.js or npm to run it. Node remains useful for Cloudflare Edge deploys, the browser extension toolchain, and contributor builds from this repository.
+> The extension is currently entering its first Chrome Web Store publication flow. Until the listing is live, normal end users should simply skip the extension; `Load unpacked` is not the end-user installation path.
 
-### Install the native runtime (primary)
+See [Browser extension](docs/i18n/en/extension.md) and [Browser Control Center](docs/i18n/en/browser-control-center.md).
 
-1. Download the current `herdr-mcp` binary for your platform from [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) — current stable: [`v0.4.0`](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0).
-2. Place it on your `PATH` (for example `~/.local/bin/herdr-mcp`) and make it executable.
-3. Install the managed local service, then verify:
+## Current support boundary
 
-```bash
-herdr-mcp install
-herdr-mcp doctor
-herdr-mcp status
-herdr-mcp update check
-```
-
-`install` stages an immutable generation under `~/.config/herdr-mcp/runtime/` and retargets `~/.local/bin/herdr-mcp` to `runtime/current/herdr-mcp`. Day-to-day lifecycle after that:
-
-```bash
-herdr-mcp update apply
-herdr-mcp update status
-herdr-mcp rollback
-```
-
-Prefer these top-level commands. Do **not** treat `herdr-mcp service install` as the normal user install path; `service ...` stays advanced/internal. Do **not** clone this repository or run `npm`/`cargo` to install the local MCP runtime.
-
-The current stable release is **`v0.4.0`**. By default, `update.channel = "stable"` discovers non-prerelease releases only. Use `preview` only when you intentionally want prerelease tags.
-
-Verify Herdr before adding Edge:
-
-```bash
-herdr --version
-herdr api schema >/dev/null
-```
-
-For ChatGPT, deploy the Cloudflare Worker on the default `workers.dev` origin, start the managed Link, then add the public `/mcp` URL as a custom MCP App/Connector and complete OAuth. See [Installation](docs/i18n/en/install.md).
-
-Do **not** paste `HERDR_MCP_TOKEN` or a Cloudflare API token into ChatGPT.
-
-### Let a local coding agent install it
-
-If you already use Codex, Claude Code, Pi, DSH, Cline or another local coding agent, give it this one sentence instead of asking it to guess the deployment steps:
-
-```text
-Install herdr-mcp for me. Read and follow the full protocol at https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/quick-agent-install.md end to end. Use GitHub Releases for the local runtime (not git clone). Pause only for Cloudflare login/API Token creation. Do not echo or commit secrets.
-```
-
-The detailed maintainer-oriented contract remains in [Agent-assisted installation](docs/i18n/en/agent-install.md).
-
-The deterministic Worker-name helper used by that Edge flow is:
-
-```bash
-WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
-```
-
-### Appendix: contributor build from source
-
-Clone this repository only when you are developing herdr-mcp itself. Source builds may still use the Node toolchain for site/extension/Edge packages; that path is not the primary way end users run the MCP runtime. Details live under [Installation](docs/i18n/en/install.md#appendix-developer-from-source).
-
-Full walkthrough: [Quick start](docs/i18n/en/quick-start.md) · [Installation](docs/i18n/en/install.md) · [ChatGPT Connector](docs/i18n/en/chatgpt-connector.md)
-
-## A good first task
-
-After the Connector is ready, open a **new conversation** and ask:
-
-```text
-Inspect the current Herdr workspaces and Git status. Read only; do not modify anything.
-```
-
-A healthy loop usually looks like:
-
-```text
-herdr_inspect
-  ↓
-herdr_skill
-  ↓
-herdr_git status
-  ↓
-herdr_fs_read / grep
-  ↓
-answer
-```
-
-Then try one small edit + test + diff. Delegate to a local agent only when the task benefits from independent reasoning.
-
-## Browser extension
-
-MCP is request-driven:
-
-```text
-Web AI → workstation
-```
-
-A local agent may keep working after the browser turn ends. The optional MV3 extension adds both the reverse continuity path and a browser-local view of the workstation:
-
-```text
-workstation → Web conversation
-          ↘ Chrome Side Panel Control Center
-```
-
-Current browser-product surfaces include workspace binding, progress/settled wakeups, evidence-first recovery, long-conversation handoff, the read-only/preview-only Browser Control Center, ChatGPT Queue for next-turn user intent, and a bounded JSON→MCP compatibility bridge for sites such as z.ai / DeepSeek.
-
-Browser extension distribution is still gated by G15. True browser mutation remains separately deferred under G16; neither is part of the first-GA platform claim yet. Use the versioned extension Release asset plus the managed Native Messaging installer from the installed runtime, and follow [Browser extension](docs/i18n/en/extension.md) / [Browser Control Center](docs/i18n/en/browser-control-center.md). Do not treat a git-checkout `extension/` directory as the primary end-user path.
-
-## Security model
-
-Key boundaries are explicit:
-
-- the local runtime binds to loopback;
-- the workstation creates an **outbound** authenticated WSS connection to Edge;
-- ChatGPT uses OAuth at the public Edge;
-- browser continuity uses Native Messaging + a mode-`0600` local Unix socket;
-- `herdr_fs_*` is constrained by managed Git roots and write/secret-path gates;
-- `herdr_exec` is a stronger shell capability and is **not** a sandbox;
-- uncertain mutations are inspected before retry rather than blindly repeated.
-
-See [Architecture](docs/i18n/en/architecture.md) and [Best practices](docs/i18n/en/best-practices.md).
+- stable herdr-mcp: `v0.4.0`;
+- public MCP contract: epoch 2 / 18 tools;
+- strongest clean-machine evidence: macOS Apple Silicon;
+- Windows x64 release binary is available, while Windows end-to-end UAT is still being completed;
+- Linux runtime is not claimed as a supported `v0.4.0` product surface yet.
 
 ## Local runtime CLI
 
-Once the native runtime is installed, day-to-day lifecycle uses these top-level commands:
+Most users can let their coding agent manage this lifecycle. The stable top-level user commands are:
 
 ```bash
 herdr-mcp install
@@ -205,66 +80,16 @@ herdr-mcp rollback
 herdr-mcp uninstall
 ```
 
-`herdr-mcp service ...` remains available for advanced/internal service control (for example `service install --adopt-node`). Prefer the top-level commands above for normal install, health, update, and rollback.
+`herdr-mcp service ...` is an **advanced / internal** service-control surface, not the normal install path.
 
-See [CLI reference](docs/i18n/en/cli-reference.md) and [Runtime A/B](docs/i18n/en/runtime-self-upgrade.md).
+## Read more only when you need it
 
-## Runtime upgrades without changing the Connector
+- [Quick agent install](docs/i18n/en/quick-agent-install.md) — recommended onboarding protocol for a coding agent;
+- [Installation](docs/i18n/en/install.md) — manual setup;
+- [ChatGPT Connector](docs/i18n/en/chatgpt-connector.md) — OAuth / MCP connection;
+- [Browser extension](docs/i18n/en/extension.md) — Chrome Web Store install and continuity;
+- [Browser extension privacy](docs/i18n/en/privacy.md) — extension data handling and Limited Use;
+- [Troubleshooting](docs/i18n/en/troubleshooting.md) — doctor, Link, Edge, OAuth;
+- [Architecture](docs/i18n/en/architecture.md) — Runtime / Edge / Link / Extension boundaries.
 
-The public Edge identity and the local runtime are separate release planes.
-
-```text
-stable Edge / OAuth / MCP URL
-        ↓
-persistent herdr-link
-        ↓
-runtime generation A / B
-```
-
-A new local generation can be validated, activated and rolled back without changing the ChatGPT Connector URL, as long as the public contract epoch remains compatible.
-
-See [Runtime A/B](docs/i18n/en/runtime-self-upgrade.md).
-
-## Documentation map
-
-Start here:
-
-- [Overview](docs/i18n/en/overview.md)
-- [Design philosophy](docs/i18n/en/design-philosophy.md)
-- [Quick start](docs/i18n/en/quick-start.md)
-- [Installation](docs/i18n/en/install.md)
-- [Clean-machine UAT (G18)](docs/i18n/en/clean-machine-uat.md)
-- [Release model](docs/release-model.md) — runtime vs extension vs contract
-- [GA release gate](docs/ga-release-gate.md)
-- [ChatGPT Connector](docs/i18n/en/chatgpt-connector.md)
-
-Operate the system:
-
-- [Browser continuity](docs/i18n/en/browser-continuity.md)
-- [Browser extension](docs/i18n/en/extension.md)
-- [Architecture](docs/i18n/en/architecture.md)
-- [Best practices](docs/i18n/en/best-practices.md)
-- [CLI reference](docs/i18n/en/cli-reference.md)
-- [Cloudflare Edge deployment](docs/i18n/en/cloudflare-edge-deployment.md)
-- [Runtime A/B](docs/i18n/en/runtime-self-upgrade.md)
-- [Troubleshooting](docs/i18n/en/troubleshooting.md)
-
-Maintainer reference:
-
-- [Automation](docs/i18n/en/automation.md)
-- [Capability benchmark](docs/i18n/en/capability-benchmark.md)
-- [Why Herdr + herdr-mcp](docs/i18n/en/herdr-vs-ecosystem.md)
-- [Worker fallbacks](docs/i18n/en/worker-fallbacks.md)
-- [Local-agent installation protocol](docs/i18n/en/agent-install.md)
-
-## Development checks
-
-```bash
-npm run build
-npm test
-npm run test:edge
-npm run build:site
-git diff --check
-```
-
-The documentation site is generated from the bilingual logical-document set; new formal pages must exist in both `docs/i18n/en` and `docs/i18n/zh-CN`.
+Maintainer release gates, UAT, CI, Runtime A/B, and historical GA evidence remain documented, but they are intentionally outside the first-install path.

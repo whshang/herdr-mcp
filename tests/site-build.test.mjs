@@ -32,8 +32,8 @@ function matches(text, regex) {
 
 // First document the docs entries land on; short (sidebar-safe) titles.
 const FIRST_SLUG = DOC_ORDER[0];
-const EN_TITLE = "Overview";
-const ZH_TITLE = "总览";
+const EN_TITLE = "Quick agent install: one user prompt, one complete agent protocol";
+const ZH_TITLE = "快速 Agent 安装：用户一句话，Agent 完整协议";
 
 test("documentation site build publishes every logical doc x 2 locales under locale-aware URLs", async () => {
   await rm(OUT, { recursive: true, force: true });
@@ -309,14 +309,17 @@ test("release.json, skill artifact and design invariants are preserved", async (
   assert.match(home, /<html lang="en">/);
   assert.match(home, /rel="icon" type="image\/png" href="\.\/favicon\.png"/);
   assert.match(home, /herdr-docs-lang/, "homepage must route zh browsers to the zh mirror");
-  assert.match(home, /href="\.\/docs\/"/);
-  assert.match(home, /href="\.\/docs\/en\/runtime-self-upgrade\.html"/);
-  assert.match(home, /href="\.\/docs\/en\/capability-benchmark\.html"/);
-  assert.match(home, /href="\.\/docs\/en\/cloudflare-edge-deployment\.html"/);
-  assert.match(home, /href="\.\/docs\/en\/extension\.html"/, "homepage must expose the browser extension as a primary product surface");
+  assert.match(home, /href="\.\/docs\/en\/quick-agent-install\.html"/, "homepage must make agent-assisted install the primary path");
+  assert.match(home, /href="\.\/docs\/en\/install\.html"/, "homepage must keep manual install as a secondary path");
+  assert.match(home, /href="\.\/docs\/en\/overview\.html"/, "homepage must keep a product overview link");
+  assert.match(home, /href="\.\/docs\/en\/extension\.html"/, "homepage must expose the optional browser extension");
+  assert.match(home, /href="\.\/docs\/en\/privacy\.html"/, "homepage must expose extension privacy one click away");
   assert.match(home, /href="\.\/docs\/en\/browser-control-center\.html"/, "homepage must link the Browser Control Center");
   assert.match(home, /Browser Control Center/);
-  assert.match(home, /Queue/);
+  assert.match(home, /queued next-turn/i);
+  assert.doesNotMatch(home, /href="\.\/docs\/en\/runtime-self-upgrade\.html"/, "maintainer runtime details stay out of the novice homepage");
+  assert.doesNotMatch(home, /href="\.\/docs\/en\/capability-benchmark\.html"/, "capability benchmark stays out of the novice homepage");
+  assert.doesNotMatch(home, /href="\.\/docs\/en\/cloudflare-edge-deployment\.html"/, "manual Edge internals stay out of the novice homepage");
   // Homepage is bilingual: no hard-coded "Start locally", topbar switch + zh mirror.
   assert.doesNotMatch(home, /Start locally/);
   assert.match(home, /href="\.\/zh-CN\/index\.html"[^>]*hreflang="zh-CN"/);
@@ -327,12 +330,15 @@ test("release.json, skill artifact and design invariants are preserved", async (
   assert.match(homeZh, /rel="icon" type="image\/png" href="\.\.\/favicon\.png"/);
   assert.ok(matches(homeZh, /\.\.\/docs\/zh-CN\//g).length >= 5, "zh homepage docs links all point at zh-CN docs");
   assert.doesNotMatch(homeZh, /href="\.\.\/docs\/"/, "zh homepage must not link the bare (English) docs entry");
-  assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/runtime-self-upgrade\.html"/);
-  assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/capability-benchmark\.html"/);
+  assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/quick-agent-install\.html"/);
+  assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/install\.html"/);
+  assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/privacy\.html"/);
   assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/extension\.html"/);
   assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/browser-control-center\.html"/);
   assert.match(homeZh, /浏览器控制中心/);
   assert.match(homeZh, /排队/);
+  assert.doesNotMatch(homeZh, /href="\.\.\/docs\/zh-CN\/runtime-self-upgrade\.html"/);
+  assert.doesNotMatch(homeZh, /href="\.\.\/docs\/zh-CN\/capability-benchmark\.html"/);
   assert.match(homeZh, /href="\.\.\/" [^>]*hreflang="en"/);
 
   for (const locale of LOCALES) {

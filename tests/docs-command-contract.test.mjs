@@ -8,14 +8,14 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (p) => readFileSync(path.join(ROOT, p), "utf8");
 
 const README_PRIMARY = [
-  ["README.md", "## Fastest path to a working setup"],
-  ["README.zh.md", "## 最短安装路径"],
-  ["README.ja.md", "## 最短セットアップ"],
+  ["README.md", "## Fastest setup: paste one prompt into your coding agent"],
+  ["README.zh.md", "## 最快开始：把这一句话发给你的 Coding Agent"],
+  ["README.ja.md", "## 最短セットアップ：Coding Agent にこのプロンプトを渡す"],
 ];
 
 const INSTALL_PRIMARY = [
-  ["docs/i18n/en/install.md", "## Step 1: install the native runtime (primary)"],
-  ["docs/i18n/zh-CN/install.md", "## 第一步：安装原生 runtime（主路径）"],
+  ["docs/i18n/en/install.md", "## Step 1: install the native herdr-mcp runtime"],
+  ["docs/i18n/zh-CN/install.md", "## 第一步：安装原生 herdr-mcp runtime"],
 ];
 
 const QUICK_START_RUNTIME = [
