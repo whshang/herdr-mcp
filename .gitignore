@@ -58,9 +58,5 @@ edge/cloudflare/.wrangler/
 docs/_wip/*
 !docs/_wip/en/
 !docs/_wip/zh-CN/
-docs/_wip/en/*
-!docs/_wip/en/second-mac-ga-uat-agent-prompt.md
-docs/_wip/zh-CN/*
-!docs/_wip/zh-CN/second-mac-ga-uat-agent-prompt.md
 TODO.md
 OPTIMIZATION.md

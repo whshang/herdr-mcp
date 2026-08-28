@@ -1,5 +1,7 @@
 # AGENTS.md
 
+Release planes (runtime vs extension vs contract): [`docs/release-model.md`](docs/release-model.md). GA gate SSOT: [`docs/ga-release-gate.md`](docs/ga-release-gate.md).
+
 ## Binary and runtime ownership
 
 `herdr-mcp` has distinct source, build, installed, active-runtime, and user-entry identities. Treat them as separate objects at all times.

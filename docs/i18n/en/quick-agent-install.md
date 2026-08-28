@@ -238,4 +238,4 @@ Never include `HERDR_MCP_TOKEN`, `LINK_SHARED_SECRET`, or Cloudflare API tokens.
 
 ## Maintainer UAT (not this page)
 
-Second-machine maintainer validation lives in [Clean-machine UAT](clean-machine-uat.md) and the internal [Second Mac GA UAT Agent prompt](../../_wip/en/second-mac-ga-uat-agent-prompt.md). Do not give end users the 34-step UAT prompt.
+Second-machine maintainer validation: [Clean-machine UAT](clean-machine-uat.md) and archived [Second Mac GA UAT Agent prompt](../../history/ga/second-mac-ga-uat-agent-prompt-en.md). Do not give end users the 34-step UAT prompt.

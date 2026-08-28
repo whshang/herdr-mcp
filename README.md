@@ -232,6 +232,7 @@ Start here:
 - [Quick start](docs/i18n/en/quick-start.md)
 - [Installation](docs/i18n/en/install.md)
 - [Clean-machine UAT (G18)](docs/i18n/en/clean-machine-uat.md)
+- [Release model](docs/release-model.md) — runtime vs extension vs contract
 - [GA release gate](docs/ga-release-gate.md)
 - [ChatGPT Connector](docs/i18n/en/chatgpt-connector.md)
 

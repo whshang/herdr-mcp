@@ -95,8 +95,8 @@ test("herdr-link resolves Node from PATH for fresh Apple Silicon installs", () =
 
 test("second-Mac GA UAT agent prompt enforces independent Worker, Link env override, and owner OAuth handoff", () => {
   for (const rel of [
-    "docs/_wip/en/second-mac-ga-uat-agent-prompt.md",
-    "docs/_wip/zh-CN/second-mac-ga-uat-agent-prompt.md",
+    "docs/history/ga/second-mac-ga-uat-agent-prompt-en.md",
+    "docs/history/ga/second-mac-ga-uat-agent-prompt-zh-CN.md",
   ]) {
     const doc = read(rel);
     assert.match(doc, /INTERNAL GA UAT|内部 GA UAT/);
@@ -110,7 +110,7 @@ test("second-Mac GA UAT agent prompt enforces independent Worker, Link env overr
     assert.match(doc, /HERDR_LINK_KEYCHAIN_SERVICE/);
     assert.match(doc, /PlistBuddy|patch plist/i);
     assert.match(doc, /workers_dev = true/);
-    assert.match(doc, /v0\.4\.0-alpha\.16/);
+    assert.match(doc, /TAG=v0\.4\.0/);
     assert.match(doc, /chrome:\/\/extensions/);
     assert.match(doc, /Edit Cloudflare Workers/);
     assert.match(doc, /CLOUDFLARE_API_TOKEN/);
@@ -121,8 +121,8 @@ test("second-Mac GA UAT agent prompt enforces independent Worker, Link env overr
   }
   const zhUat = read("docs/i18n/zh-CN/clean-machine-uat.md");
   const enUat = read("docs/i18n/en/clean-machine-uat.md");
-  assert.match(zhUat, /second-mac-ga-uat-agent-prompt\.md/);
-  assert.match(enUat, /second-mac-ga-uat-agent-prompt\.md/);
-  assert.match(read("docs/i18n/en/install.md"), /second-mac-ga-uat-agent-prompt\.md/);
-  assert.match(read("docs/i18n/zh-CN/install.md"), /second-mac-ga-uat-agent-prompt\.md/);
+  assert.match(zhUat, /second-mac-ga-uat-agent-prompt/);
+  assert.match(enUat, /second-mac-ga-uat-agent-prompt/);
+  assert.match(read("docs/i18n/en/install.md"), /second-mac-ga-uat-agent-prompt/);
+  assert.match(read("docs/i18n/zh-CN/install.md"), /second-mac-ga-uat-agent-prompt/);
 });

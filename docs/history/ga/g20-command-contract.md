@@ -1,3 +1,5 @@
+# Completed / Historical
+
 # G20 / G1 WIP notes (not published site content)
 
 Status: alpha in progress. This folder is intentionally excluded from the docs site build.
