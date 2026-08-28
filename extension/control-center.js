@@ -25,6 +25,7 @@ let selectedMode = ACTION_TYPES.AGENT_PROMPT;
 let pageContext = { loading: true, tabId: null, windowId: null, response: null, error: null };
 let pageContextRefreshSeq = 0;
 let bindingMutationWorkspaceId = null;
+let actionInFlight = false;
 
 const $ = (id) => document.getElementById(id);
 const runtimeDot = $("runtimeDot");
@@ -46,6 +47,7 @@ const riskBadge = $("riskBadge");
 const blockedReason = $("blockedReason");
 const modeHelp = $("modeHelp");
 const sendButton = $("sendButton");
+const actionModeBadge = $("actionModeBadge");
 const result = $("result");
 
 function bg(message) {
@@ -431,18 +433,52 @@ function riskLabel(mode) {
   return t("cc_risk_write");
 }
 
+function controlOutcomeLabel(outcome) {
+  const key = `cc_outcome_${String(outcome || "failed")}`;
+  const label = t(key);
+  return label === key ? String(outcome || "failed") : label;
+}
+
+function controlOutcomeText(response) {
+  const outcome = String(response?.outcome || (response?.ok ? "submitted" : "failed"));
+  const phase = String(response?.delivery_phase || "unknown");
+  const lines = [t("cc_control_result", {
+    outcome: controlOutcomeLabel(outcome),
+    phase,
+  })];
+  if (response?.op_id) lines.push(t("cc_control_op", { value: response.op_id }));
+  const reason = response?.detail?.capability?.reason
+    || response?.detail?.reason
+    || response?.message
+    || response?.error;
+  if (reason) lines.push(String(reason));
+  if (outcome === "uncertain") lines.push(t("cc_control_uncertain_hint"));
+  return lines.join("\n");
+}
+
 function renderComposerState() {
   const mode = modePresentation(selectedMode);
+  const descriptor = buildActionDescriptor(selectedMode, { target: pinnedTarget });
   riskBadge.textContent = riskLabel(selectedMode);
   modeHelp.textContent = t(mode.help);
   composer.placeholder = t(mode.placeholder);
+  actionModeBadge.textContent = descriptor.executable ? t("cc_live_badge") : t("cc_preview_badge");
+  actionModeBadge.classList.toggle("live", descriptor.executable);
   if (!pinnedTarget?.pane_id) blockedReason.textContent = t("cc_pin_first");
   else if (pinnedTarget.stale) blockedReason.textContent = t("cc_target_stale_short");
+  else if (descriptor.executable && selectedMode === ACTION_TYPES.STEER) {
+    const known = pinnedTarget?.control_capabilities?.steer?.outcome;
+    blockedReason.textContent = known
+      ? t("cc_steer_probe_state", { outcome: controlOutcomeLabel(known) })
+      : t("cc_action_ready");
+  } else if (descriptor.executable) blockedReason.textContent = t("cc_action_ready");
   else blockedReason.textContent = t("cc_preview_only_reason");
-  sendButton.textContent = t("cc_preview_action");
-  sendButton.disabled = !pinnedTarget?.pane_id || pinnedTarget?.stale === true;
+  sendButton.textContent = descriptor.executable
+    ? (selectedMode === ACTION_TYPES.STEER ? t("cc_execute_steer") : t("cc_execute_prompt"))
+    : t("cc_preview_action");
+  sendButton.disabled = actionInFlight || !pinnedTarget?.pane_id || pinnedTarget?.stale === true;
 
-document.querySelectorAll("#modeTabs [data-mode]").forEach((button) => {
+  document.querySelectorAll("#modeTabs [data-mode]").forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === selectedMode);
   });
 }
@@ -631,15 +667,41 @@ document.querySelectorAll("#modeTabs [data-mode]").forEach((button) => {
     renderComposerState();
   });
 });
-sendButton.addEventListener("click", () => {
-  if (!pinnedTarget?.pane_id || pinnedTarget.stale) return;
+sendButton.addEventListener("click", async () => {
+  if (!pinnedTarget?.pane_id || pinnedTarget.stale || actionInFlight) return;
   const text = composer.value.trim();
   const descriptor = buildActionDescriptor(selectedMode, {
     target: pinnedTarget,
     text: selectedMode === ACTION_TYPES.HERDR_METHOD ? "" : text,
     method: selectedMode === ACTION_TYPES.HERDR_METHOD ? text : null,
   });
-  result.textContent = JSON.stringify(descriptor, null, 2);
+  if (!descriptor.executable) {
+    result.textContent = JSON.stringify(descriptor, null, 2);
+    return;
+  }
+  if (!text && [ACTION_TYPES.AGENT_PROMPT, ACTION_TYPES.STEER].includes(selectedMode)) {
+    result.textContent = t("cc_control_text_required");
+    return;
+  }
+
+  actionInFlight = true;
+  renderComposerState();
+  result.textContent = t("cc_control_sending");
+  const request = {
+    action: descriptor.action,
+    target: descriptor.target,
+    args: descriptor.args,
+    idempotency_key: `browser-control:${crypto.randomUUID()}`,
+  };
+  const response = await bg({ type: "herdr_control_action", request });
+  result.textContent = controlOutcomeText(response);
+  if (response?.outcome === "stale_target") {
+    pinnedTarget = { ...pinnedTarget, stale: true, stale_reason: "target_revision_changed" };
+    await chrome.storage.local.set({ [TARGET_KEY]: pinnedTarget });
+    await refreshSnapshot();
+  }
+  actionInFlight = false;
+  renderAll();
 });
 
 async function start() {

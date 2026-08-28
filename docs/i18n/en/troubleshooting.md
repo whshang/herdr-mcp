@@ -186,7 +186,7 @@ Separate a **Side Panel UI problem**, a **Native Messaging identity problem**, a
 5. `herdr-mcp native-host status` should report the official Store extension identity; if it reports an origin mismatch, re-run `herdr-mcp native-host install` from the current runtime. Maintainer-only unpacked identity troubleshooting lives in the Store-development WIP, not this user guide.
 6. `Runtime healthy · event stream reconnecting` means the panel still has a snapshot while incremental events recover; it does not mean the whole local runtime is down. Use Refresh for an authoritative reconciliation.
 
-Prompt Agent / Steer Session / Herdr API / Terminal Input are intentionally Preview-only in the current Control Center. That is not a failure. The executable actions today are `Inspect state` and the bounded `Read output tail`.
+`Prompt Agent` now executes through the trusted local control route; `Steer Session` returns an exact provider capability/outcome and never silently becomes Prompt. `Herdr API` and raw `Terminal Input` remain Preview-only. If Prompt reports `uncertain`, inspect live state before retrying. If Steer reports `session_not_resolved`, the pinned provider session lacks a verifiable control endpoint/thread/active-turn mapping; that is a capability result, not a transport failure.
 
 See [Browser Control Center](browser-control-center.md).
 

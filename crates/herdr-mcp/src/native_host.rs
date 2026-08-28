@@ -60,7 +60,13 @@ const MIN_TIMEOUT_MS: u64 = 1_000;
 const MAX_TIMEOUT_MS: u64 = 120_000;
 
 #[cfg(unix)]
-const ALLOWED_PROXY_PATHS: &[&str] = &["/mcp", "/push/state", "/push/events", "/push/mcp-activity"];
+const ALLOWED_PROXY_PATHS: &[&str] = &[
+    "/mcp",
+    "/push/state",
+    "/push/events",
+    "/push/mcp-activity",
+    "/extension/control/action",
+];
 #[cfg(unix)]
 const FORWARDED_HEADERS: &[&str] = &[
     "content-type",

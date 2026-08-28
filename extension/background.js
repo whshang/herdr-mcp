@@ -36,7 +36,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.72";
+const H2W_SCRIPT_VERSION = "0.1.73";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -3412,6 +3412,39 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true, state });
       }
       else sendResponse(state || { ok: false });
+    })();
+    return true;
+  }
+  if (msg?.type === "herdr_control_action") {
+    void (async () => {
+      const request = msg.request && typeof msg.request === "object" ? msg.request : null;
+      if (!request) {
+        sendResponse({ ok: false, outcome: "rejected", error: "control-request-required" });
+        return;
+      }
+      const url = `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/extension/control/action`;
+      try {
+        const response = await localHerdrFetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(request),
+          nativeTimeoutMs: 45_000,
+        });
+        let payload = null;
+        try { payload = await response.json(); } catch (_) {}
+        if (!payload || typeof payload !== "object") {
+          sendResponse({ ok: false, outcome: "uncertain", error: `control-http-${response.status}` });
+          return;
+        }
+        sendResponse({ ...payload, http_status: response.status });
+      } catch (error) {
+        sendResponse({
+          ok: false,
+          outcome: "uncertain",
+          delivery_phase: "uncertain",
+          error: String(error?.message || error || "control-request-failed"),
+        });
+      }
     })();
     return true;
   }

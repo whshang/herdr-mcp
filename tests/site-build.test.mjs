@@ -349,8 +349,11 @@ test("release.json, skill artifact and design invariants are preserved", async (
     assert.match(control, /Manual handoff|手动接力/, "Control Center docs must explain that manual handoff belongs to the HUD conversation surface");
     assert.match(control, /Prompt Agent|提示 Agent/);
     assert.match(control, /Steer Session|调整会话/);
-    assert.match(control, /Preview-only|preview-only|控制操作仅预览/);
-    assert.match(control, /Pinned Target|固定目标/);
+    assert.match(control, /trusted|可信|Native Messaging/, "Control Center docs must describe the trusted local action route");
+    assert.match(control, /session_not_resolved/, "Control Center docs must distinguish unresolved provider steer from Prompt");
+    assert.match(control, /Preview only|preview-only|仅预览/, "high-risk Herdr/terminal modes must remain preview-only");
+    assert.match(control, /reload loop|刷新死循环/, "Control Center docs must keep bounded reload-loop protection in the reliability contract");
+    assert.match(control, /Pinned Target|固定目标|pinned target/, "Control Center docs must document the explicit local target");
   }
 
   const generatedDocs = await readdir(join(OUT, "docs"));

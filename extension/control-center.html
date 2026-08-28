@@ -61,8 +61,8 @@
       </div>
 
       <div class="preview-heading">
-        <strong data-i18n="cc_preview_heading">Local action preview</strong>
-        <span data-i18n="cc_preview_badge">PREVIEW ONLY</span>
+        <strong data-i18n="cc_action_heading">Local actions</strong>
+        <span id="actionModeBadge" data-i18n="cc_live_badge">TRUSTED LOCAL</span>
       </div>
       <div id="modeTabs" class="mode-tabs" role="tablist" aria-label="Control mode" data-i18n-aria="cc_mode_aria">
         <button type="button" data-mode="agent_prompt" class="active" data-i18n="cc_mode_prompt">Prompt Agent</button>
@@ -70,7 +70,7 @@
         <button type="button" data-mode="herdr_method" data-i18n="cc_mode_herdr">Herdr API</button>
         <button type="button" data-mode="terminal_text" data-i18n="cc_mode_terminal">Terminal Input</button>
       </div>
-      <div id="modeHelp" class="mode-help" data-i18n="cc_mode_prompt_help">Build a preview of a new prompt for the pinned Agent. Nothing is sent.</div>
+      <div id="modeHelp" class="mode-help" data-i18n="cc_mode_prompt_help">Send a reliable prompt to the pinned Agent through the trusted local bridge.</div>
 
       <textarea id="composer" placeholder="Describe the new prompt you would send to the pinned Agent."></textarea>
       <div class="composer-footer">

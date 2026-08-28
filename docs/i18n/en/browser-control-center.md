@@ -6,7 +6,7 @@ It is not a shortcut for giving the browser unrestricted shell access. It solves
 
 > When Web AI, local agents, tests, and terminals are all active, how do you keep the real workstation state visible and make the next human control target explicit?
 
-The current Control Center is **active-page context + live observation + explicit targeting + bounded reads**. Mutation surfaces remain preview-only, so Prompt Agent, Steer Session, Herdr API, and Terminal Input do not bypass existing mutation safety boundaries.
+The current Control Center is **active-page context + live observation + explicit targeting + bounded reads + fenced local actions**. `Prompt Agent` now executes through the trusted Native Messaging path. `Steer Session` sends a provider-steer request and reports the real provider capability/outcome without silently substituting Prompt. Arbitrary Herdr methods and raw Terminal Input remain preview-only.
 
 ## How it differs from browser continuity
 
@@ -142,78 +142,84 @@ The panel does not guess a replacement. The user must select a pane again before
 
 ## Actions that really execute today
 
-Only **read operations** execute from the current panel.
+The panel now has four kinds of behavior rather than one blanket “preview-only” rule:
+
+| Mode | Current behavior | Delivery semantics |
+|---|---|---|
+| Inspect state | Executes a bounded read | Read-only |
+| Read output tail | Executes a bounded terminal-tail read | Read-only |
+| Prompt Agent | **Executes** through the trusted extension-only local action route and existing Herdr `agent.prompt` reliability kernel | `submitted`, `queued`, `rejected`, `uncertain`, or `failed`, with an operation id/evidence when available |
+| Steer Session | **Executes a provider steer request/probe** against the pinned target | Reports `steered` only when provider-native same-turn steering is actually proven; otherwise reports exact outcomes such as `session_not_resolved`, `no_active_turn`, or `unsupported_provider` |
+| Herdr API | Preview only | No arbitrary Herdr mutation is executed from this UI |
+| Terminal Input | Preview only | No raw terminal bytes/keys are written from this UI |
 
 ### Inspect state
 
 `Inspect state` displays structured pane state while bounding potentially large recent output.
 
-Use it to confirm:
-
-- the current pane identity;
-- status;
-- cwd / project root;
-- recent output.
-
 ### Read output tail
 
-`Read output tail` asks the local runtime for a bounded terminal tail.
+`Read output tail` asks the local runtime for a bounded terminal tail. The request is deliberately limited (roughly 40 lines / 4096 characters), so a terminal that has run for hours cannot dump unbounded history into the Side Panel.
 
-The request is deliberately limited (roughly 40 lines / 4096 characters), so a terminal that has run for hours cannot dump unbounded history into the Side Panel.
+### Prompt Agent: reliable local mutation, not terminal injection
 
-## Why Prompt Agent / Steer Session / Herdr API / Terminal Input say “Action preview”
+`Prompt Agent` targets the explicitly pinned pane and travels only through:
 
-The UI already models future control actions, but **those mutations are not enabled in the current release**.
+```text
+Side Panel
+  → extension service worker
+  → Chrome Native Messaging
+  → mode-0600 herdr-mcp Unix socket
+  → POST /extension/control/action
+  → existing durable agent.prompt operation
+```
 
-The panel says this directly:
+The HTTP route is deliberately unusable on ordinary TCP: even a caller with the normal herdr-mcp bearer receives `403`. This prevents the browser control mutation surface from becoming a public workstation API.
 
-> Live state · preview-only controls
+Every action carries a runtime-generated `target_revision`. Rust re-reads the live pane immediately before mutation. If the pane disappeared, the Agent/session behind the pane changed, or the runtime generation changed, the request returns `stale_target` without submitting anything.
 
-The `Action preview` section contains four modes:
+Prompt also reuses the existing `agent.prompt` persistent idempotency record instead of inventing browser-only retry logic. The Side Panel creates an idempotency key and surfaces uncertain delivery explicitly. If the result is uncertain, inspect live state before retrying; do not blindly resend.
 
-| Mode | Intended future action | Current behavior |
-|---|---|---|
-| Prompt Agent | Start or supplement work by sending a new prompt through Herdr `agent.prompt` to the pinned Agent | Build a descriptor only; nothing is sent |
-| Steer Session | Redirect an **already-running** provider / Agent session when that provider supports steer | Build a descriptor only; nothing is sent |
-| Herdr API | Name an intended Herdr control-plane method; future execution must pass the live method schema and safety checks, and is not arbitrary shell | Build a descriptor only; nothing executes or claims validation |
-| Terminal Input | Write literal text / input / keys to the pinned terminal pane; this is the highest-risk path | Build a descriptor only; nothing is written |
+### Steer Session: never impersonate true steer
 
-`Preview action` returns a classified descriptor containing fields such as:
+`Steer Session` is intentionally stricter than Prompt. It does **not** fall back to `agent.prompt` and then label the result as steer.
 
-- action type;
-- risk class;
-- workspace / pane identity;
-- target revision;
-- args;
-- `executable: false`;
-- `execution_mode: dry_run`.
+For Codex, provider-native same-turn `turn/steer` needs an authoritative mapping from the pinned Herdr pane to the active app-server control endpoint, `threadId`, and current `expectedTurnId`. The current Herdr pane/session metadata does not expose that mapping. Therefore a working Codex pane currently reports `session_not_resolved`; an idle Codex pane reports `no_active_turn`; other providers can report `unsupported_provider`.
 
-This is a deliberate Phase A safety boundary, not a disabled button waiting to be wired up casually.
+A local `~/.codex/ipc/ipc.sock` file by itself is not sufficient evidence: a socket can be stale, can belong to a different client/session, and does not identify the target thread or expected active turn. Provider-native steer will only be enabled when those identities can be proven end to end.
 
-## Why preview comes before terminal mutation
+This is the direct resolution of the original Issue #57 ambiguity: **queued/prompted work and same-turn steering are separate outcomes, never aliases.**
+
+## Reliability kernel: memory, request pressure, timeout recovery, and reload loops
+
+Browser Control Plane reliability is not limited to action delivery. The extension already carries the page/runtime protections that were planned alongside the Side Panel work:
+
+- **No fixed Side Panel polling loop.** The panel takes one snapshot and consumes incremental workspace/pane events.
+- **One shared Herdr event stream.** Workspace observation does not create one network stream per binding.
+- **State-fetch deduplication.** Concurrent freshness requests coalesce instead of multiplying `/push/state` traffic.
+- **MutationObserver/render coalescing.** DOM bursts are folded into bounded UI work instead of triggering a render/action for every mutation.
+- **Hidden-page suspension.** Expensive UI work is deferred while the surface is hidden and reconciled when visible again.
+- **Bounded retained output.** Terminal/output tails are clipped, so long-running panes do not accumulate unbounded browser-side history.
+- **UI pressure / heap signals.** The recovery layer observes mutation rate, timer drift, and JS heap pressure where the browser exposes it.
+- **429 is backoff-only.** Rate-limit responses extend network backoff; they do not trigger a page reload storm.
+- **Evidence-first reply recovery.** Send timeout/disconnected-stream recovery checks same-origin/server state before deciding whether a request needs retry or a view refresh.
+- **Force reload is a last bounded recovery step.** Reload requests are sender-scoped, automation-gated, persisted before navigation, protected by a durable cooldown/budget, and concurrent requests elect one winner.
+- **No reload loop.** A repeated request during cooldown is rejected, and Auto-off conversations cannot force a background reload.
+
+These mechanisms are one reliability layer shared by continuity and Browser Control Plane. The action route does not add another polling loop, heartbeat, or retry daemon.
+
+## Why Terminal Input and arbitrary Herdr methods still stay preview-only
 
 The difficult part of browser control is not writing bytes to a terminal. The hard part is preserving answers to questions such as:
 
 - Is the target still the exact object the user selected?
 - Did a failed request get delivered?
 - Would retrying duplicate a mutation?
-- Has the agent session behind a pane changed?
+- Has the Agent session behind a pane changed?
 - Should provider steer and raw terminal input have different confirmation rules?
 - Can delivery phase survive browser reload or MV3 service-worker restart?
 
-Opening arbitrary terminal mutation before those contracts are reliable would undermine the mutation, idempotency, and recovery discipline already enforced by herdr-mcp.
-
-The intended order is therefore:
-
-```text
-observe state accurately
-  ↓
-pin an explicit target
-  ↓
-describe action and risk
-  ↓
-only then enable mutation classes one by one
-```
+Prompt now satisfies those contracts by reusing Rust target fencing and `agent.prompt` idempotency. Raw terminal input and arbitrary Herdr method invocation have broader effects and therefore remain fail-closed until they receive their own narrow schemas, confirmation rules, idempotency model, and UAT.
 
 ## Runtime and event-stream states
 
@@ -276,24 +282,18 @@ Opening the panel does not:
 The Control Center currently includes:
 
 - a first-class Chrome Side Panel entry point;
-- live workspace / pane lifecycle;
+- live workspace / pane lifecycle without fixed polling;
 - agent status presentation;
 - explicit pinned target;
-- stale-target fail-closed behavior;
+- runtime-authoritative `target_revision` and stale-target fail-closed behavior;
 - bounded state / output reads;
-- mutation risk classification;
-- preview-only action descriptors;
+- executable trusted `Prompt Agent` with durable idempotency/outcome evidence;
+- executable provider `Steer Session` request with honest capability outcomes and **no Prompt masquerade**;
+- preview-only arbitrary Herdr API / raw terminal controls;
+- shared memory/request-pressure/timeout/reload-loop protections;
 - en / zh / ja UI.
 
-It currently does **not** execute:
-
-- agent Prompt from the Side Panel;
-- provider Steer;
-- arbitrary Herdr mutation;
-- terminal text / input / key writes;
-- interrupt.
-
-Any future action moving from preview to executable must pass its own reliability, safety, and real-browser UAT. The presence of a tab in the UI is not authorization to enable it.
+Codex true same-turn steer remains gated on a verifiable pane → app-server endpoint → `threadId` → active `expectedTurnId` mapping. Until that primitive exists, `session_not_resolved` is the correct outcome rather than a hidden fallback.
 
 ## Related documentation
 

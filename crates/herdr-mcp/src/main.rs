@@ -1,4 +1,5 @@
 mod agent_visibility;
+mod browser_control;
 mod browser_extension_identity;
 mod capability_inventory;
 mod capability_probe;

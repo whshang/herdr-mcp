@@ -174,7 +174,7 @@ Herdr events → local runtime → Native Messaging → browser extension
                                                   └─ workspace / pane / Agent 实时观察
 ```
 
-因此，MCP 负责“网页向机器伸手”；扩展的 Continuity 负责“机器在必要时敲一下正确的网页会话”；Control Center 则把本机真实工作现场送进 Chrome Side Panel。三者职责不同，但共享同一套本机 runtime 与身份边界。
+因此，MCP 负责“网页向机器伸手”；扩展的 Continuity 负责“机器在必要时敲一下正确的网页会话”；Control Center 则把本机真实工作现场送进 Chrome Side Panel，并提供受信任的本地控制面：Agent Prompt 复用 Rust target fencing 与持久化幂等，provider Steer 如实返回 capability outcome，而任意 Herdr 方法和 raw terminal write 继续 fail-closed/Preview-only。三者职责不同，但共享同一套本机 runtime 与身份边界。
 
 ## 浏览器为什么不保存 Herdr bearer
 

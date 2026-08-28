@@ -1,15 +1,21 @@
-// Browser Control Plane Phase A explicit target pinning.
-// The revision is extension-local until Rust exposes an authoritative revision.
+// Browser Control Plane explicit target pinning.
+// Prefer the runtime-authoritative target revision; keep a local fingerprint only for legacy snapshots.
 
 function targetFingerprint(pane) {
   if (!pane?.pane_id) return null;
+  if (pane.target_revision) return String(pane.target_revision);
   const agent = pane.agent || null;
+  const session = pane.agent_session || null;
   return [
     pane.workspace_id || "",
     pane.pane_id,
+    pane.revision ?? "",
     agent?.name || "terminal",
     agent?.kind || "terminal",
     agent?.started_at || "",
+    session?.source || "",
+    session?.kind || "",
+    session?.value || "",
   ].join("|");
 }
 
@@ -19,6 +25,8 @@ export function createPinnedTarget(pane, revision = null, now = () => new Date()
     workspace_id: pane?.workspace_id || null,
     pane_id: pane?.pane_id || null,
     agent: pane?.agent || null,
+    agent_session: pane?.agent_session || null,
+    control_capabilities: pane?.control_capabilities || null,
     target_revision: targetRevision,
     status: pane?.status || "unknown",
     stale: !pane?.pane_id,
@@ -39,6 +47,9 @@ export function revalidatePinnedTarget(target, panes = []) {
     ...target,
     workspace_id: pane.workspace_id || target.workspace_id || null,
     agent: pane.agent || null,
+    agent_session: pane.agent_session || null,
+    control_capabilities: pane.control_capabilities || null,
+    target_revision: currentRevision || target.target_revision || null,
     status: pane.status || target.status || "unknown",
     stale: revisionChanged,
     stale_reason: revisionChanged ? "target_revision_changed" : null,

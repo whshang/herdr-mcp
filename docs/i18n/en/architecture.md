@@ -155,7 +155,7 @@ Long-lived development also needs the reverse direction:
 workstation → browser conversation
 ```
 
-The browser extension binds a conversation to a Herdr workspace and can route progress/settled signals, recovery state and handoff control back into the page. Its Chrome Side Panel also presents live workspace / pane / agent state, explicit Pinned Targets, bounded reads, and preview-only future controls.
+The browser extension binds a conversation to a Herdr workspace and can route progress/settled signals, recovery state and handoff control back into the page. Its Chrome Side Panel presents live workspace / pane / agent state, explicit Pinned Targets, bounded reads, and a trusted local control plane: Agent Prompt executes with Rust target fencing and durable idempotency; provider Steer reports exact capability outcomes; arbitrary Herdr methods and raw terminal writes remain fail-closed/preview-only.
 
 That extension is not another runtime. Continuity, Control Center, Queue, and JSON → MCP are browser surfaces over the same trusted local bridge, while Herdr remains the runtime truth.
 

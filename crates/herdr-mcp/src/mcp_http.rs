@@ -1,3 +1,4 @@
+use crate::browser_control;
 use crate::exec_sessions::ExecRegistry;
 #[cfg(unix)]
 use crate::extension_ipc::ExtensionIpcSocket;
@@ -312,6 +313,10 @@ fn candidate_router(state: AppState) -> Router {
         .route("/push/state", get(push_state))
         .route("/push/events", get(push_events))
         .route("/push/mcp-activity", get(push_mcp_activity))
+        .route(
+            "/extension/control/action",
+            post(post_extension_control_action),
+        )
         .route("/health", get(health))
         .with_state(state)
 }
@@ -353,6 +358,78 @@ async fn push_state(State(state): State<AppState>, headers: HeaderMap) -> Respon
         return StatusCode::UNAUTHORIZED.into_response();
     }
     json_response(StatusCode::OK, &push_state_payload(&state.cache))
+}
+
+async fn post_extension_control_action(State(state): State<AppState>, body: Bytes) -> Response {
+    if !state.trusted_extension_ipc {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &json!({
+                "ok": false,
+                "outcome": "rejected",
+                "delivery_phase": "not_submitted",
+                "code": "trusted_extension_ipc_required",
+            }),
+        );
+    }
+    if body.len() > MAX_REQUEST_BYTES {
+        return json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &json!({
+                "ok": false,
+                "outcome": "rejected",
+                "delivery_phase": "not_submitted",
+                "code": "request_too_large",
+            }),
+        );
+    }
+    let request = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) if value.is_object() => value,
+        Ok(_) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "ok": false,
+                    "outcome": "rejected",
+                    "delivery_phase": "not_submitted",
+                    "code": "invalid_request",
+                    "message": "request body must be a JSON object",
+                }),
+            );
+        }
+        Err(error) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "ok": false,
+                    "outcome": "rejected",
+                    "delivery_phase": "not_submitted",
+                    "code": "invalid_json",
+                    "message": error.to_string(),
+                }),
+            );
+        }
+    };
+    let blocking_state = state.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        browser_control::execute_action(
+            &blocking_state.client,
+            &blocking_state.cache,
+            &blocking_state.prompt,
+            &request,
+        )
+    })
+    .await
+    .unwrap_or_else(|error| {
+        json!({
+            "ok": false,
+            "outcome": "uncertain",
+            "delivery_phase": "uncertain",
+            "code": "control_task_failed",
+            "message": error.to_string(),
+        })
+    });
+    json_response(StatusCode::OK, &result)
 }
 
 async fn push_events(
@@ -445,12 +522,18 @@ fn push_state_payload(cache: &EventCache) -> Value {
     let digest = cache.digest_since(u64::MAX);
     let snapshot = cache.snapshot();
     let agents = push_agent_views(&digest.agents);
-    let panes = snapshot
+    let raw_panes = snapshot
         .get("panes")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let panes = raw_panes
+        .iter()
+        .map(|pane| browser_control::pane_view(cache, pane))
+        .collect::<Vec<_>>();
     json!({
+        "boot_id": cache.boot_id(),
+        "state_seq": digest.cursor,
         "server_time": iso_now(),
         "agents": agents,
         "workspaces": push_workspace_views(&digest.workspaces, &agents, &panes),
@@ -514,7 +597,7 @@ fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Respons
             let mut body = String::new();
 
             for event in &digest.events {
-                if let Some((name, data)) = push_browser_lifecycle_event(event)
+                if let Some((name, data)) = push_browser_lifecycle_event(event, &state.cache)
                     && push_filter_matches(&state.filters, &data)
                 {
                     body.push_str(&sse_event(name, &data));
@@ -554,7 +637,10 @@ fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Respons
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-fn push_browser_lifecycle_event(event: &Value) -> Option<(&'static str, Value)> {
+fn push_browser_lifecycle_event(
+    event: &Value,
+    cache: &EventCache,
+) -> Option<(&'static str, Value)> {
     let raw = event.get("type").and_then(Value::as_str)?;
     let normalized = raw.replace('.', "_");
     let kind = normalized.strip_suffix("_event").unwrap_or(&normalized);
@@ -567,11 +653,26 @@ fn push_browser_lifecycle_event(event: &Value) -> Option<(&'static str, Value)> 
         | "pane_moved"
         | "pane_agent_detected"
         | "pane_agent_status_changed" => {
-            let pane_data = event.get("pane")?.clone();
+            let event_pane = event.get("pane")?;
             let pane_id = event
                 .get("pane_id")
                 .and_then(Value::as_str)
-                .or_else(|| pane_data.get("pane_id").and_then(Value::as_str))?;
+                .or_else(|| event_pane.get("pane_id").and_then(Value::as_str))?;
+            // Herdr lifecycle events can be narrower than the authoritative
+            // snapshot. Resolve the current pane before deriving target fencing
+            // so an incremental update cannot temporarily publish a weaker or
+            // mismatched target_revision.
+            let snapshot = cache.snapshot();
+            let live_pane = snapshot
+                .get("panes")
+                .and_then(Value::as_array)
+                .and_then(|panes| {
+                    panes
+                        .iter()
+                        .find(|pane| pane.get("pane_id").and_then(Value::as_str) == Some(pane_id))
+                })
+                .unwrap_or(event_pane);
+            let pane_data = browser_control::pane_view(cache, live_pane);
             let workspace = event
                 .get("workspace_id")
                 .and_then(Value::as_str)
@@ -1225,6 +1326,15 @@ mod tests {
     use std::path::PathBuf;
     use tower::ServiceExt;
 
+    fn control_request(body: Value) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/extension/control/action")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
     fn test_root(label: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1238,6 +1348,7 @@ mod tests {
 
     #[test]
     fn browser_lifecycle_maps_pane_create_and_remove() {
+        let cache = EventCache::from_snapshot_for_test(json!({"panes": []}));
         let created = json!({
             "type": "pane.created",
             "at": "2026-08-27T10:00:00Z",
@@ -1250,7 +1361,7 @@ mod tests {
                 "agent": null
             }
         });
-        let (name, data) = push_browser_lifecycle_event(&created).expect("pane create");
+        let (name, data) = push_browser_lifecycle_event(&created, &cache).expect("pane create");
         assert_eq!(name, "pane_upsert");
         assert_eq!(data["pane"], "w1:p2");
         assert_eq!(data["workspace"], "w1");
@@ -1262,7 +1373,7 @@ mod tests {
             "workspace_id": "w1",
             "pane_id": "w1:p2"
         });
-        let (name, data) = push_browser_lifecycle_event(&removed).expect("pane remove");
+        let (name, data) = push_browser_lifecycle_event(&removed, &cache).expect("pane remove");
         assert_eq!(name, "pane_removed");
         assert_eq!(data["pane_id"], "w1:p2");
         assert_eq!(data["workspace"], "w1");
@@ -1270,6 +1381,7 @@ mod tests {
 
     #[test]
     fn browser_lifecycle_maps_workspace_create_and_remove() {
+        let cache = EventCache::from_snapshot_for_test(json!({"panes": []}));
         let created = json!({
             "type": "workspace_created_event",
             "at": "2026-08-27T10:01:00Z",
@@ -1279,7 +1391,8 @@ mod tests {
                 "label": "repo-two"
             }
         });
-        let (name, data) = push_browser_lifecycle_event(&created).expect("workspace create");
+        let (name, data) =
+            push_browser_lifecycle_event(&created, &cache).expect("workspace create");
         assert_eq!(name, "workspace_upsert");
         assert_eq!(data["workspace"], "w2");
         assert_eq!(data["workspace_data"]["label"], "repo-two");
@@ -1289,9 +1402,71 @@ mod tests {
             "at": "2026-08-27T10:01:01Z",
             "workspace_id": "w2"
         });
-        let (name, data) = push_browser_lifecycle_event(&removed).expect("workspace remove");
+        let (name, data) =
+            push_browser_lifecycle_event(&removed, &cache).expect("workspace remove");
         assert_eq!(name, "workspace_removed");
         assert_eq!(data["workspace"], "w2");
+    }
+
+    #[tokio::test]
+    async fn extension_control_is_local_only_and_fences_stale_targets() {
+        let root = test_root("browser-control-route");
+        let snapshot = json!({
+            "workspaces": [{"id": "w1", "label": "repo"}],
+            "panes": [{
+                "workspace_id": "w1",
+                "pane_id": "w1:p1",
+                "revision": 4,
+                "agent": "codex",
+                "agent_status": "working",
+                "agent_session": {"agent": "codex", "kind": "id", "source": "herdr:codex", "value": "opaque-session"}
+            }],
+            "agents": []
+        });
+        let tcp_state = test_state_with_snapshot(&root.join("tcp"), snapshot.clone());
+        let pane = tcp_state.cache.snapshot()["panes"][0].clone();
+        let revision = browser_control::target_revision(&tcp_state.cache, &pane).unwrap();
+        let request = json!({
+            "action": "steer",
+            "target": {"pane_id": "w1:p1", "target_revision": revision},
+            "args": {"text": "keep compatibility"},
+            "idempotency_key": "browser-control-test"
+        });
+        let response = candidate_router(tcp_state)
+            .oneshot(control_request(request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let mut extension_state = test_state_with_snapshot(&root.join("extension"), snapshot);
+        extension_state.trusted_extension_ipc = true;
+        let app = candidate_router(extension_state.clone());
+        let response = app.clone().oneshot(control_request(request)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["outcome"], "session_not_resolved");
+        assert_eq!(result["delivery_phase"], "not_submitted");
+        assert_eq!(result["detail"]["prompt_fallback"], false);
+
+        let stale = json!({
+            "action": "agent_prompt",
+            "target": {"pane_id": "w1:p1", "target_revision": "btr1_stale"},
+            "args": {"text": "do work"},
+            "idempotency_key": "browser-control-stale"
+        });
+        let response = app.oneshot(control_request(stale)).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["outcome"], "stale_target");
+        assert_eq!(result["delivery_phase"], "not_submitted");
+        assert!(
+            result["target"]["target_revision"]
+                .as_str()
+                .unwrap()
+                .starts_with("btr1_")
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn test_state(root: &std::path::Path) -> AppState {

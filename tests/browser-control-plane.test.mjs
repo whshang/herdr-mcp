@@ -262,7 +262,7 @@ test("no duplicate pane rows after repeated upsert", () => {
   assert.equal(view.panes.filter((pane) => pane.pane_id === "w1:p1").length, 1);
 });
 
-test("action risk classification covers all Phase A action types", () => {
+test("action risk classification covers browser control action types", () => {
   assert.equal(classifyAction(ACTION_TYPES.INSPECT), ACTION_RISK.READ);
   assert.equal(classifyAction(ACTION_TYPES.READ_TAIL), ACTION_RISK.READ);
   assert.equal(classifyAction(ACTION_TYPES.AGENT_PROMPT), ACTION_RISK.MUTATION);
@@ -271,14 +271,42 @@ test("action risk classification covers all Phase A action types", () => {
   assert.equal(classifyAction(ACTION_TYPES.TERMINAL_INPUT), ACTION_RISK.TERMINAL_MUTATION);
 });
 
-test("mutation action is blocked and produces a validated dry-run descriptor", () => {
+test("trusted prompt and steer probe are executable while high-risk modes stay preview-only", () => {
   const target = createPinnedTarget(normalizeBrowserState(baseSnapshot()).panes[0]);
-  assert.equal(phaseAAvailability(ACTION_TYPES.AGENT_PROMPT, { target }).enabled, false);
-  const descriptor = buildActionDescriptor(ACTION_TYPES.AGENT_PROMPT, { target, text: "keep compatibility" });
-  assert.equal(descriptor.executable, false);
-  assert.equal(descriptor.execution_mode, "dry_run");
-  assert.equal(descriptor.target.pane_id, "w1:p1");
-  assert.equal(descriptor.args.text, "keep compatibility");
+  assert.equal(phaseAAvailability(ACTION_TYPES.AGENT_PROMPT, { target }).enabled, true);
+  const prompt = buildActionDescriptor(ACTION_TYPES.AGENT_PROMPT, { target, text: "keep compatibility" });
+  assert.equal(prompt.phase, "control-v1");
+  assert.equal(prompt.executable, true);
+  assert.equal(prompt.execution_mode, "trusted_extension");
+  assert.equal(prompt.target.pane_id, "w1:p1");
+  assert.equal(prompt.args.text, "keep compatibility");
+
+  const steer = buildActionDescriptor(ACTION_TYPES.STEER, { target, text: "do not change schema" });
+  assert.equal(steer.executable, true);
+  assert.equal(steer.execution_mode, "provider_probe");
+
+  const terminal = buildActionDescriptor(ACTION_TYPES.TERMINAL_INPUT, { target, text: "rm -rf /" });
+  assert.equal(terminal.executable, false);
+  assert.equal(terminal.execution_mode, "dry_run");
+});
+
+test("runtime authoritative target revision survives normalization and pinning", () => {
+  const snapshot = baseSnapshot();
+  snapshot.boot_id = "boot-1";
+  snapshot.panes[0] = {
+    ...snapshot.panes[0],
+    revision: 7,
+    target_revision: "btr1_authoritative",
+    agent_session: { agent: "pi", source: "herdr:pi", kind: "path", value: "/tmp/session.jsonl" },
+    control_capabilities: { agent_prompt: { available: true }, steer: { available: false, outcome: "unsupported_provider" } },
+  };
+  const pane = normalizeBrowserState(snapshot).panes[0];
+  assert.equal(pane.target_revision, "btr1_authoritative");
+  assert.equal(pane.revision, 7);
+  assert.equal(pane.agent_session.value, "/tmp/session.jsonl");
+  const target = createPinnedTarget(pane);
+  assert.equal(target.target_revision, "btr1_authoritative");
+  assert.equal(target.control_capabilities.steer.outcome, "unsupported_provider");
 });
 
 test("READ tail requires a live pinned target", () => {

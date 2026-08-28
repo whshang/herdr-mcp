@@ -72,9 +72,9 @@ const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.72", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.72"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.72"'), "content version matches manifest");
+ok(manifest.version === "0.1.73", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.73"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.73"'), "content version matches manifest");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")
@@ -659,7 +659,8 @@ ok(!controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && !controlCenterHtml.includes('id="pageBindings"')
     && !controlCenterHtml.includes('id="pageBindButton"')
     && !controlCenterHtml.includes('id="pageHandoffButton"')
-    && controlCenterHtml.includes('data-i18n="cc_preview_heading"')
+    && controlCenterHtml.includes('data-i18n="cc_action_heading"')
+    && controlCenterHtml.includes('id="actionModeBadge"')
     && controlCenterHtml.includes('data-i18n="cc_target_label"')
     && controlCenterSource.includes('from "./i18n.js"')
     && controlCenterSource.includes("await detectOrLoadLocale()")
@@ -683,9 +684,14 @@ ok(!controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && !controlCenterSource.includes("handoffPageSupported")
     && !controlCenterSource.includes("pageHandoffButton")
     && backgroundSource.includes('type: "herdr_control_binding_changed"')
+    && backgroundSource.includes('msg?.type === "herdr_control_action"')
+    && backgroundSource.includes('/extension/control/action')
+    && controlCenterSource.includes('type: "herdr_control_action"')
+    && controlCenterSource.includes('crypto.randomUUID()')
+    && controlCenterSource.includes('t("cc_control_uncertain_hint")')
     && controlCenterSource.includes('t("cc_preview_only_reason")')
     && controlCenterSource.includes('t("native_host_help")'),
-  "Control Center keeps page binding and explicit local targeting without duplicating the HUD handoff action");
+  "Control Center keeps page binding and pinned local targeting while Prompt/Steer use the trusted action route and risky modes stay preview-only");
 ok(backgroundSource.includes('event === "hello"')
     && backgroundSource.includes('type: "herdr_control_state"')
     && backgroundSource.includes('type: "herdr_control_event"')
