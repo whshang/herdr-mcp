@@ -256,6 +256,19 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
         let install = service_manager::run(ServiceCommand::Install { adopt_node: false });
         let succeeded = matches!(install, Ok(code) if code == ExitCode::SUCCESS);
         if succeeded {
+            if let Err(error) = crate::native_host_install::sync_owned_runtime_from_active() {
+                store.update_update_job(
+                    job_id,
+                    "failed",
+                    Some("service install succeeded but native-host runtime sync failed"),
+                    None,
+                    now_ms_i64(),
+                )?;
+                cleanup_staging(&binary);
+                return Err(format!(
+                    "update committed the service generation but failed to sync owned native-host runtime: {error}"
+                ));
+            }
             store.update_update_job(
                 job_id,
                 "succeeded",

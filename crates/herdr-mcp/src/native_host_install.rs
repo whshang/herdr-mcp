@@ -115,6 +115,74 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
     }
 }
 
+/// Copy the active `runtime/current` binary into an owned native-host install.
+///
+/// This is invoked after managed service update/rollback so Chrome keeps talking
+/// to the same generation as the production runtime without rewriting manifests
+/// or consuming native-host rollback evidence.
+#[cfg(target_os = "macos")]
+pub fn sync_owned_runtime_from_active() -> Result<serde_json::Value, String> {
+    let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
+    let view = status(&paths);
+    if view.get("recovery_required").and_then(Value::as_bool) == Some(true) {
+        return Err(
+            "native-host recovery is required before syncing the managed runtime binary".to_owned(),
+        );
+    }
+    let owned_count = view
+        .get("owned_manifest_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if owned_count == 0
+        || view.get("wrapper_ok").and_then(Value::as_bool) != Some(true)
+        || view.get("runtime_binary_ok").and_then(Value::as_bool) != Some(true)
+    {
+        return Ok(json!({
+            "ok": true,
+            "skipped": true,
+            "reason": "native_host_not_owned",
+        }));
+    }
+
+    let home = home_dir()?;
+    let active = crate::link::install::resolve_managed_runtime_binary(&home)?;
+    let native_sha = file_sha256(&paths.runtime_binary)?;
+    let active_sha = file_sha256(&active)?;
+    if native_sha == active_sha {
+        return Ok(json!({
+            "ok": true,
+            "skipped": true,
+            "reason": "already_current",
+            "active_runtime": active,
+            "native_runtime_version": read_binary_version(&paths.runtime_binary),
+            "active_runtime_version": read_binary_version(&active),
+            "runtime_matches_current": true,
+            "version_consistent": view
+                .get("version_consistent")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        }));
+    }
+
+    atomic_copy_executable(&active, &paths.runtime_binary)?;
+    let refreshed = status(&paths);
+    Ok(json!({
+        "ok": true,
+        "synced": true,
+        "from": active,
+        "native_runtime_version": refreshed.get("native_runtime_version").cloned(),
+        "active_runtime_version": refreshed.get("active_runtime_version").cloned(),
+        "runtime_matches_current": refreshed
+            .get("runtime_matches_current")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "version_consistent": refreshed
+            .get("version_consistent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }))
+}
+
 #[cfg(target_os = "macos")]
 impl InstallPaths {
     fn discover(command: &NativeHostCommand) -> Result<Self, String> {
@@ -384,12 +452,20 @@ fn install_mutation(paths: &InstallPaths) -> Result<(), String> {
 fn status(paths: &InstallPaths) -> Value {
     let runtime_binary_ok = is_regular_executable(&paths.runtime_binary);
     let wrapper_ok = wrapper_is_rust(&paths.wrapper);
+    let active_runtime = home_dir()
+        .ok()
+        .and_then(|home| crate::link::install::resolve_managed_runtime_binary(&home).ok());
     let runtime_matches_current = runtime_binary_ok
-        && file_sha256(&paths.source_binary)
-            .ok()
-            .is_some_and(|source| {
-                file_sha256(&paths.runtime_binary).ok().as_deref() == Some(source.as_str())
-            });
+        && active_runtime.as_ref().is_some_and(|active| {
+            file_sha256(&paths.runtime_binary).ok().as_deref()
+                == file_sha256(active).ok().as_deref()
+        });
+    let native_runtime_version = read_binary_version(&paths.runtime_binary);
+    let active_runtime_version = active_runtime
+        .as_ref()
+        .and_then(|active| read_binary_version(active));
+    let version_consistent =
+        native_runtime_version.is_some() && native_runtime_version == active_runtime_version;
     let mut manifests = Vec::new();
     let mut owned_count = 0usize;
     for (target, _) in &paths.targets {
@@ -420,6 +496,10 @@ fn status(paths: &InstallPaths) -> Value {
         "runtime_binary": paths.runtime_binary,
         "runtime_binary_ok": runtime_binary_ok,
         "runtime_matches_current": runtime_matches_current,
+        "native_runtime_version": native_runtime_version,
+        "active_runtime_version": active_runtime_version,
+        "version_consistent": version_consistent,
+        "stale_runtime": owned_count > 0 && wrapper_ok && runtime_binary_ok && !runtime_matches_current,
         "wrapper": paths.wrapper,
         "wrapper_ok": wrapper_ok,
         "owned_manifest_count": owned_count,
@@ -1745,6 +1825,27 @@ fn path_present(path: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn read_binary_version(path: &Path) -> Option<String> {
+    if !is_regular_executable(path) {
+        return None;
+    }
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+#[cfg(target_os = "macos")]
 fn file_sha256(path: &Path) -> Result<String, String> {
     let mut file =
         fs::File::open(path).map_err(|error| format!("cannot hash {}: {error}", path.display()))?;
@@ -2433,6 +2534,106 @@ mod tests {
         assert_eq!(first["ok"], true);
         let second = rollback(&paths).unwrap();
         assert_eq!(second["rollback_available"], false);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn with_isolated_home_env<F>(home: &Path, config_dir: &Path, run: F)
+    where
+        F: FnOnce(),
+    {
+        let previous_home = env::var_os("HOME");
+        let previous_config = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_instance = env::var_os("HERDR_MCP_INSTANCE");
+        unsafe {
+            env::set_var("HOME", home);
+            env::set_var("HERDR_MCP_CONFIG_DIR", config_dir);
+            env::remove_var("HERDR_MCP_INSTANCE");
+        }
+        run();
+        unsafe {
+            match previous_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+            match previous_config {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_instance {
+                Some(value) => env::set_var("HERDR_MCP_INSTANCE", value),
+                None => env::remove_var("HERDR_MCP_INSTANCE"),
+            }
+        }
+    }
+
+    fn write_managed_active_runtime(config_dir: &Path, bytes: &[u8]) -> PathBuf {
+        let generation_dir = config_dir
+            .join("runtime")
+            .join("generations")
+            .join("rust-testgen");
+        fs::create_dir_all(&generation_dir).unwrap();
+        let active_binary = generation_dir.join("herdr-mcp");
+        fs::write(&active_binary, bytes).unwrap();
+        fs::set_permissions(&active_binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let current_link = config_dir.join("runtime").join("current");
+        fs::create_dir_all(current_link.parent().unwrap()).unwrap();
+        if current_link.exists() {
+            fs::remove_file(&current_link).unwrap();
+        }
+        std::os::unix::fs::symlink(Path::new("generations").join("rust-testgen"), &current_link)
+            .unwrap();
+        active_binary
+    }
+
+    #[test]
+    fn sync_owned_runtime_copies_active_generation_and_is_idempotent() {
+        let (root, paths) = fixture();
+        let home = root.join("home");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        let active_binary = write_managed_active_runtime(&config_dir, b"active-runtime-binary-v2");
+
+        with_isolated_home_env(&home, &config_dir, || {
+            install(&paths).unwrap();
+            assert_ne!(
+                fs::read(&paths.runtime_binary).unwrap(),
+                fs::read(&active_binary).unwrap()
+            );
+            let before = status(&paths);
+            assert_eq!(before["runtime_matches_current"], false);
+            assert_eq!(before["stale_runtime"], true);
+
+            let synced = super::sync_owned_runtime_from_active().unwrap();
+            assert_eq!(synced["synced"], true);
+            assert_eq!(
+                fs::read(&paths.runtime_binary).unwrap(),
+                fs::read(&active_binary).unwrap()
+            );
+            let after = status(&paths);
+            assert_eq!(after["runtime_matches_current"], true);
+            assert_eq!(after["stale_runtime"], false);
+
+            let again = super::sync_owned_runtime_from_active().unwrap();
+            assert_eq!(again["skipped"], true);
+            assert_eq!(again["reason"], "already_current");
+        });
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_skips_when_native_host_is_not_owned() {
+        let (root, paths) = fixture();
+        let home = root.join("home");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        write_managed_active_runtime(&config_dir, b"active-runtime-binary-v2");
+
+        with_isolated_home_env(&home, &config_dir, || {
+            let skipped = super::sync_owned_runtime_from_active().unwrap();
+            assert_eq!(skipped["skipped"], true);
+            assert_eq!(skipped["reason"], "native_host_not_owned");
+            assert!(!paths.runtime_binary.exists());
+        });
+
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -153,25 +153,56 @@ fn started_at() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn with_empty_home<F>(run: F)
+    where
+        F: FnOnce(),
+    {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-runtime-meta-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let previous_home = env::var_os("HOME");
+        unsafe {
+            env::set_var("HOME", &root);
+        }
+        run();
+        unsafe {
+            match previous_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn migration_status_is_derived_from_epoch2_catalog() {
-        let status = migration_status();
-        assert_eq!(status["tool_count"], 18);
-        assert_eq!(status["migrated_tool_count"], 18);
-        assert_eq!(status["pending_tool_count"], 0);
-        assert_eq!(status["native_parity_ready"], true);
-        assert_eq!(status["production_ready"], false);
-        assert_eq!(status["link_cutover"]["production_ready"], false);
-        assert!(
-            status["link_cutover"]["requires_all"]
-                .as_array()
-                .is_some_and(|gates| !gates.is_empty())
-        );
-        assert_eq!(status["pending_tools"], json!([]));
-        for name in MIGRATED_TOOLS {
-            assert!(contract::tool_names().contains(&name));
-        }
+        with_empty_home(|| {
+            let status = migration_status();
+            assert_eq!(status["tool_count"], 18);
+            assert_eq!(status["migrated_tool_count"], 18);
+            assert_eq!(status["pending_tool_count"], 0);
+            assert_eq!(status["native_parity_ready"], true);
+            assert_eq!(status["production_ready"], false);
+            assert_eq!(status["link_cutover"]["production_ready"], false);
+            assert!(
+                status["link_cutover"]["requires_all"]
+                    .as_array()
+                    .is_some_and(|gates| !gates.is_empty())
+            );
+            assert_eq!(status["pending_tools"], json!([]));
+            for name in MIGRATED_TOOLS {
+                assert!(contract::tool_names().contains(&name));
+            }
+        });
     }
 
     #[test]

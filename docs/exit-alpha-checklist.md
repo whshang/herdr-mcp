@@ -10,11 +10,12 @@ Do **not** start version unification until these rows are honest **PASS** (not P
 
 | Gate | What must be sealed first |
 | --- | --- |
-| G18 | Second Mac **default instance** clean install: binary → install → doctor/status/update-check → optional update/rollback |
-| G6 / G7 | Public ChatGPT OAuth → fresh `tools/list` → epoch 2 / 18 tools → read-only + bounded mutation + long-exec smoke |
-| G15 | Chrome Load unpacked + `native-host install` + binding smoke on a machine that owns the Chrome profile (second Mac or owner maintenance window on dogfood default instance) |
-| G17 | Clean-machine + public security acceptance recorded |
-| G9 / G10 | Stable-channel `update apply` and controlled `rollback` on the clean default instance |
+| G18 | **PASS** (2026-08-28 owner re-eval): second Mac default instance clean install + public MCP loop — see [`ga-release-gate.md`](./ga-release-gate.md) G18 second-Mac evidence |
+| G6 / G7 | Public ChatGPT residual matrix (bounded mutation / long-exec / soak) — **do not** mark full PASS from tools/list alone |
+| G15 | Second Mac extension + native-host sealed in G18; dogfood same-Mac uat remains partial |
+| G17 | Clean-machine + public security acceptance matrix |
+| G9 / G10 | **Stable-channel** `update apply` + `rollback` on default instance (**blocked until `v0.4.0` tag**; alpha rehearsal only until then) |
+| G2 | Release immutable identity (no `gh release upload --clobber`; tag SHA == manifest `source_commit`) |
 | G25 | No remaining GA veto (see scorecard) |
 
 Same-machine `--instance uat` evidence (alpha.16) **does not** satisfy G18/G15/G6/G7 public segments.
@@ -23,9 +24,9 @@ Same-machine `--instance uat` evidence (alpha.16) **does not** satisfy G18/G15/G
 
 | Surface | Live / repo today | Stable target | Notes |
 | --- | --- | --- | --- |
-| Rust runtime (`herdr-mcp --version`) | `0.4.0-alpha.16` | `0.4.0` | Authoritative product version |
-| `crates/herdr-mcp/Cargo.toml` | `0.4.0-alpha.16` | `0.4.0` | Bump before tag |
-| Git tag / GitHub Release | `v0.4.0-alpha.16` | `v0.4.0` | Triggers `.github/workflows/rust-release.yml` |
+| Rust runtime (`herdr-mcp --version`) | `0.4.0-alpha.17` | `0.4.0` | Authoritative product version |
+| `crates/herdr-mcp/Cargo.toml` | `0.4.0-alpha.17` | `0.4.0` | Bump before tag |
+| Git tag / GitHub Release | `v0.4.0-alpha.17` | `v0.4.0` | Triggers `.github/workflows/rust-release.yml`; **next prerelease must be a new tag (e.g. alpha.18), never reuse alpha.17** |
 | User CLI symlink | `~/.local/bin/herdr-mcp` → `runtime/current` | unchanged pattern | After release: `update apply` on dogfood |
 | `package.json` `version` | `0.3.32` | **unchanged or tooling-only bump** | Must **not** become the runtime product version in README/docs (G1) |
 | Extension `manifest.json` | `0.1.64` (independent semver) | release zip from tag | Extension artifact version ≠ runtime semver; document mapping in release notes |

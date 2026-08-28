@@ -40,19 +40,20 @@ Herdr Architecture Roadmap
 
 **当前主游标：GA Product Completion**（SSOT：[`docs/ga-release-gate.md`](./ga-release-gate.md)）。
 
-G5 Link production ownership **已 PASS**，不再是当前任务。下一阶段按门禁推进：
+G5 Link production ownership **已 PASS**，不再是当前任务。**G18 第二台 Mac 默认实例干净机 UAT 已于 2026-08-28 owner re-eval 封 PASS**（alpha.17）。当前 GA closure sprint（A–D）：
 
-1. install 路径（Release binary → `herdr-mcp install`）干净机验证
-2. doctor 分层诊断（含远端 HTTPS probe）干净机 / 公网验收
-3. extension versioned artifact + managed native-host（G15 决策 A）
-4. clean-machine UAT（G18）
-5. 退出 alpha → 评估 `0.4.0` stable（仅在候选全 PASS 后）
+1. **A — release immutable identity**（`rust-release.yml` fail-closed publish；tag SHA == manifest `source_commit`；禁止 `gh release upload --clobber`）
+2. **B — native-host runtime drift**（managed `update apply` / `service rollback` 后同步 owned native-host binary；`doctor` 标 `stale-runtime`）
+3. **C — stable update/rollback rehearsal**（无 stable tag 前仅 alpha/candidate 彩排；G9/G10 GA 证据需 stable-channel）
+4. **D — scorecard sealing**（[`ga-release-gate.md`](./ga-release-gate.md) / [`exit-alpha-checklist.md`](./exit-alpha-checklist.md) 对齐 live 证据）
+
+历史切片（保留）：install 路径、doctor 分层、extension artifact（G15）、公网 ChatGPT 矩阵 residual。
 
 **明确 post-GA / 不挡第一 stable：** Browser terminal input、interrupt、true steer、Browser mutation（G16 DEFERRED）；Batch B；Search IndexBackend；deeper PCC；IngressProfile；Continuity 2.0；Progressive Skills 继续扩张。
 
 **Result Optimization / Streaming First / Skill waves** 已合入，不是当前主游标。
 
-下一产品焦点（GA gate SSOT）：**G5 已 PASS** → **extension artifact（G15）→ 干净机 UAT（G18）→ 公网/安全验收 → 退出 alpha（G1）→ stable**。
+下一产品焦点（GA gate SSOT）：**G18 PASS** → **GA closure A–D** → **G9/G10 stable rehearsal** → **退出 alpha（G1）→ stable**（**不得**提前打 `v0.4.0` tag）。
 
 ## 已完成并验收
 
