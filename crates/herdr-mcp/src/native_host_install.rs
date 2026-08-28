@@ -124,64 +124,63 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
 pub fn sync_owned_runtime_from_active() -> Result<serde_json::Value, String> {
     let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
     let view = status(&paths);
-        if view.get("recovery_required").and_then(Value::as_bool) == Some(true) {
-            return Err(
-                "native-host recovery is required before syncing the managed runtime binary"
-                    .to_owned(),
-            );
-        }
-        let owned_count = view
-            .get("owned_manifest_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if owned_count == 0
-            || view.get("wrapper_ok").and_then(Value::as_bool) != Some(true)
-            || view.get("runtime_binary_ok").and_then(Value::as_bool) != Some(true)
-        {
-            return Ok(json!({
-                "ok": true,
-                "skipped": true,
-                "reason": "native_host_not_owned",
-            }));
-        }
-
-        let home = home_dir()?;
-        let active = crate::link::install::resolve_managed_runtime_binary(&home)?;
-        let native_sha = file_sha256(&paths.runtime_binary)?;
-        let active_sha = file_sha256(&active)?;
-        if native_sha == active_sha {
-            return Ok(json!({
-                "ok": true,
-                "skipped": true,
-                "reason": "already_current",
-                "active_runtime": active,
-                "native_runtime_version": read_binary_version(&paths.runtime_binary),
-                "active_runtime_version": read_binary_version(&active),
-                "runtime_matches_current": true,
-                "version_consistent": view
-                    .get("version_consistent")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true),
-            }));
-        }
-
-        atomic_copy_executable(&active, &paths.runtime_binary)?;
-        let refreshed = status(&paths);
-        Ok(json!({
+    if view.get("recovery_required").and_then(Value::as_bool) == Some(true) {
+        return Err(
+            "native-host recovery is required before syncing the managed runtime binary".to_owned(),
+        );
+    }
+    let owned_count = view
+        .get("owned_manifest_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if owned_count == 0
+        || view.get("wrapper_ok").and_then(Value::as_bool) != Some(true)
+        || view.get("runtime_binary_ok").and_then(Value::as_bool) != Some(true)
+    {
+        return Ok(json!({
             "ok": true,
-            "synced": true,
-            "from": active,
-            "native_runtime_version": refreshed.get("native_runtime_version").cloned(),
-            "active_runtime_version": refreshed.get("active_runtime_version").cloned(),
-            "runtime_matches_current": refreshed
-                .get("runtime_matches_current")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            "version_consistent": refreshed
+            "skipped": true,
+            "reason": "native_host_not_owned",
+        }));
+    }
+
+    let home = home_dir()?;
+    let active = crate::link::install::resolve_managed_runtime_binary(&home)?;
+    let native_sha = file_sha256(&paths.runtime_binary)?;
+    let active_sha = file_sha256(&active)?;
+    if native_sha == active_sha {
+        return Ok(json!({
+            "ok": true,
+            "skipped": true,
+            "reason": "already_current",
+            "active_runtime": active,
+            "native_runtime_version": read_binary_version(&paths.runtime_binary),
+            "active_runtime_version": read_binary_version(&active),
+            "runtime_matches_current": true,
+            "version_consistent": view
                 .get("version_consistent")
                 .and_then(Value::as_bool)
-                .unwrap_or(false),
-        }))
+                .unwrap_or(true),
+        }));
+    }
+
+    atomic_copy_executable(&active, &paths.runtime_binary)?;
+    let refreshed = status(&paths);
+    Ok(json!({
+        "ok": true,
+        "synced": true,
+        "from": active,
+        "native_runtime_version": refreshed.get("native_runtime_version").cloned(),
+        "active_runtime_version": refreshed.get("active_runtime_version").cloned(),
+        "runtime_matches_current": refreshed
+            .get("runtime_matches_current")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "version_consistent": refreshed
+            .get("version_consistent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }))
 }
 
 #[cfg(target_os = "macos")]
