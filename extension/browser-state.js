@@ -56,6 +56,12 @@ function normalizePane(pane, agent, workspace) {
     project_root: stringOrNull(pane?.project_root) || longestMatchingRoot(cwd, roots),
     terminal_title: stringOrNull(pane?.terminal_title) || stringOrNull(pane?.terminal_title_stripped) || stringOrNull(agent?.terminal_title),
     focused: pane?.focused === true,
+    revision: Number.isFinite(pane?.revision) ? pane.revision : null,
+    target_revision: stringOrNull(pane?.target_revision),
+    agent_session: pane?.agent_session && typeof pane.agent_session === "object" ? { ...pane.agent_session } : null,
+    control_capabilities: pane?.control_capabilities && typeof pane.control_capabilities === "object"
+      ? structuredClone(pane.control_capabilities)
+      : null,
     agent: normalizedAgent,
     status: normalizedAgent?.status || "terminal-only",
     current_summary: stringOrNull(pane?.current_summary) || null,

@@ -30,21 +30,19 @@ const RISKS = Object.freeze({
   [ACTION_TYPES.INTERRUPT]: ACTION_RISK.MUTATION,
 });
 
-const PHASE_A_REASONS = Object.freeze({
-  [ACTION_TYPES.AGENT_PROMPT]: "Waiting for Rust control plane reliability",
-  [ACTION_TYPES.STEER]: "Provider steer unsupported in Phase A",
-  [ACTION_TYPES.HERDR_METHOD]: "Herdr mutation methods are dry-run only in Phase A",
-  [ACTION_TYPES.TERMINAL_TEXT]: "Terminal mutation is disabled in Phase A",
-  [ACTION_TYPES.TERMINAL_INPUT]: "Terminal mutation is disabled in Phase A",
-  [ACTION_TYPES.TERMINAL_KEYS]: "Terminal mutation is disabled in Phase A",
-  [ACTION_TYPES.INTERRUPT]: "Reliability required before interrupt is enabled",
+const CONTROL_BLOCK_REASONS = Object.freeze({
+  [ACTION_TYPES.HERDR_METHOD]: "Arbitrary Herdr methods remain preview-only",
+  [ACTION_TYPES.TERMINAL_TEXT]: "Raw terminal mutation remains disabled",
+  [ACTION_TYPES.TERMINAL_INPUT]: "Raw terminal mutation remains disabled",
+  [ACTION_TYPES.TERMINAL_KEYS]: "Raw terminal mutation remains disabled",
+  [ACTION_TYPES.INTERRUPT]: "Provider interrupt ownership is not resolved",
 });
 
 export function classifyAction(type) {
   return RISKS[type] || ACTION_RISK.UNKNOWN;
 }
 
-export function phaseAAvailability(type, context = {}) {
+export function controlAvailability(type, context = {}) {
   const risk = classifyAction(type);
   if (risk === ACTION_RISK.READ) {
     if (!context.target && type === ACTION_TYPES.READ_TAIL) {
@@ -55,18 +53,38 @@ export function phaseAAvailability(type, context = {}) {
     }
     return { enabled: true, mode: "read", reason: null };
   }
+  if (!context.target?.pane_id) {
+    return { enabled: false, mode: "mutation", reason: "Pin a pane first" };
+  }
+  if (context.target?.stale) {
+    return { enabled: false, mode: "mutation", reason: "Target stale" };
+  }
+  if (type === ACTION_TYPES.AGENT_PROMPT) {
+    return context.target?.agent
+      ? { enabled: true, mode: "trusted_extension", reason: null }
+      : { enabled: false, mode: "trusted_extension", reason: "Pinned pane has no active agent" };
+  }
+  if (type === ACTION_TYPES.STEER) {
+    return context.target?.agent
+      ? { enabled: true, mode: "provider_probe", reason: null }
+      : { enabled: false, mode: "provider_probe", reason: "Pinned pane has no active agent" };
+  }
   return {
     enabled: false,
     mode: "dry_run",
-    reason: PHASE_A_REASONS[type] || "Unsupported action",
+    reason: CONTROL_BLOCK_REASONS[type] || "Unsupported action",
   };
+}
+
+export function phaseAAvailability(type, context = {}) {
+  return controlAvailability(type, context);
 }
 
 export function buildActionDescriptor(type, { target = null, text = "", method = null, args = null } = {}) {
   const risk = classifyAction(type);
-  const availability = phaseAAvailability(type, { target });
+  const availability = controlAvailability(type, { target });
   return {
-    phase: "A",
+    phase: "control-v1",
     action: type,
     risk,
     target: target ? {

@@ -6,7 +6,7 @@
 
 > 当网页 AI、本地 Agent、测试进程和终端同时工作时，怎样始终知道**哪一个现场正在发生什么，以及下一条人工控制明确指向哪里**？
 
-当前控制中心以**当前页面上下文 + 实时观察 + 明确目标 + 有界读取**为主。写操作仍保持 Preview-only，不会因为 UI 上出现“提示 Agent / 调整会话 / Herdr API / 终端输入”就绕过现有 mutation 安全边界。
+当前控制中心已经形成**当前页面上下文 + 实时观察 + 明确目标 + 有界读取 + 有 fencing 的本地操作**。`提示 Agent` 现在会通过可信 Native Messaging 真正执行；`调整会话`会发起 provider steer 请求并如实返回能力/结果，不会偷偷用 Prompt 冒充 steer；任意 Herdr 方法和原始终端输入仍保持 Preview-only。
 
 ## 它和浏览器连续工作有什么区别
 
@@ -142,78 +142,77 @@ stale 后控制中心不会猜测新目标。需要用户重新点击 pane 才�
 
 ## 当前真正会执行的操作
 
-当前版本只有**只读动作**会立即执行。
+现在不能再用“一律 Preview-only”描述底部控制区，而是分成四类：
+
+| 模式 | 当前行为 | 投递语义 |
+|---|---|---|
+| 查看状态 | 执行有界只读 | 只读 |
+| 读取最近输出 | 执行有界 terminal tail 读取 | 只读 |
+| 提示 Agent | **真实执行**：走 extension-only 的本地可信 action route，并复用 Herdr `agent.prompt` 可靠性内核 | 返回 `submitted` / `queued` / `rejected` / `uncertain` / `failed`，可用时带 operation id / evidence |
+| 调整会话 | **真实发起 provider steer 请求/探测** | 只有确实完成 provider-native 同一 active turn steer 才返回 `steered`；否则明确返回 `session_not_resolved` / `no_active_turn` / `unsupported_provider` 等 |
+| Herdr API | 仅预览 | 不从这个 UI 执行任意 Herdr mutation |
+| 终端输入 | 仅预览 | 不从这个 UI 向终端写入原始字节/按键 |
 
 ### 查看状态
 
-`查看状态` 展示当前 pane 的结构化状态，并把可能很长的输出裁成有界尾部。
-
-它适合快速确认：
-
-- 这个 pane 当前是谁；
-- status 是什么；
-- cwd / project root 在哪里；
-- 最近输出是什么。
+`查看状态`展示结构化 pane 状态，同时对可能很大的最近输出做上限裁剪。
 
 ### 读取最近输出
 
-`读取最近输出` 从本机 runtime 读取受限的 terminal tail。
+`读取最近输出`让本地 runtime 返回有界 terminal tail（大致 40 行 / 4096 字符），即使终端运行数小时也不会把无限历史灌进 Side Panel。
 
-当前请求有固定上限（40 行 / 4096 字符级别），不会因为一个运行数小时的 terminal 就把完整历史灌进 Side Panel。
+### 提示 Agent：可靠 mutation，不是终端注入
 
-## 提示 Agent / 调整会话 / Herdr API / 终端输入为什么只显示“操作预览”
-
-控制中心已经把未来控制面的交互模型放进 UI，但**当前版本没有开启这些 mutation**。
-
-页面会明确显示：
-
-> 实时状态 · 控制操作仅预览
-
-并将下面四种模式放在 `操作预览` 区：
-
-| 模式 | 最终意图 | 当前行为 |
-|---|---|---|
-| 提示 Agent | 通过 Herdr `agent.prompt` 给 pinned Agent 发一条新任务或补充提示 | 只生成 descriptor，不发送 |
-| 调整会话 | 对**已经运行中的** provider / Agent session 调整方向；未来还取决于 provider 是否支持 steer | 只生成 descriptor，不发送 |
-| Herdr API | 指定准备调用的 Herdr control-plane method；未来真正执行前必须通过实时 method schema 与安全检查，不是任意 shell | 只生成 descriptor，不执行，也不声称已经校验 |
-| 终端输入 | 向 pinned terminal pane 写 literal text / input / keys；这是风险最高的路径 | 只生成 descriptor，不写入 |
-
-点击“生成预览”只会展示经过分类的 action descriptor，例如：
-
-- action type；
-- risk class；
-- workspace / pane；
-- target revision；
-- args；
-- `executable: false`；
-- `execution_mode: dry_run`。
-
-这不是“按钮坏了”，而是当前 Phase A 的产品安全边界。
-
-## 为什么先做 Preview，而不是直接开放终端输入
-
-浏览器控制面的风险不是“能不能把文本写进去”，而是：
-
-- 目标是否仍然是用户刚才选择的对象；
-- 请求失败时到底有没有送达；
-- 重试会不会重复 mutation；
-- Agent session 是否已经换代；
-- provider steer 与普通 terminal input 是否需要不同确认；
-- 浏览器 reload / service worker restart 后是否仍能判断 delivery phase。
-
-在这些契约稳定之前，让 Side Panel 直接拥有任意 terminal 写入，会破坏 herdr-mcp 已有的 mutation / idempotency / recovery 纪律。
-
-因此当前顺序是：
+`提示 Agent`始终作用于用户显式固定的 pane，数据路径只有：
 
 ```text
-先把状态看准
-  ↓
-再把目标固定
-  ↓
-再把动作和风险描述清楚
-  ↓
-最后才逐类开放可执行 mutation
+Side Panel
+  → extension service worker
+  → Chrome Native Messaging
+  → mode-0600 herdr-mcp Unix socket
+  → POST /extension/control/action
+  → 已有的持久化 agent.prompt operation
 ```
+
+这个 HTTP route 在普通 TCP 上固定不可用：即使持有常规 herdr-mcp bearer 也会收到 `403`。因此浏览器控制 mutation 不会演变成公网/网页可直接调用的工作站控制 API。
+
+每次 action 都携带 runtime 生成的 `target_revision`。Rust 在 mutation 前重新读取 live pane；如果 pane 已消失、pane 后面的 Agent/session 已替换，或 runtime generation 已变化，直接返回 `stale_target`，不会提交 mutation。
+
+Prompt 还复用 `agent.prompt` 已有的持久化 idempotency/op record，而不是自己造浏览器重试逻辑。Side Panel 为一次用户动作生成 idempotency key，并明确展示 `uncertain`。结果不确定时，先检查 live state，不要盲目重发。
+
+### 调整会话：绝不把 Prompt 冒充 true steer
+
+`调整会话`比 Prompt 更严格：它**不会**在 steer 失败时偷偷退化成 `agent.prompt`，再把结果写成“已 steer”。
+
+对于 Codex，provider-native 同一 active turn 的 `turn/steer` 至少需要把固定的 Herdr pane 权威映射到 app-server control endpoint、`threadId` 和当前 `expectedTurnId`。当前 Herdr pane/session metadata 并没有这些关联。因此：working Codex 当前返回 `session_not_resolved`；idle Codex 返回 `no_active_turn`；其它 provider 可以返回 `unsupported_provider`。
+
+仅看到 `~/.codex/ipc/ipc.sock` 文件不能证明可 steer：socket 可能已经 stale、可能属于别的 client/session，而且它本身既不标识目标 thread，也不提供 expected active turn。只有这些身份能够端到端证明时，才会开放真正的 provider steer。
+
+这正是 Issue #57 原始需求最容易混淆的地方：**“已排队/已 Prompt”与“同一 active turn 已 steer”是不同 outcome，绝不能互相冒充。**
+
+## Reliability Kernel：内存、请求压力、超时恢复与刷新死循环
+
+Side Panel 不是孤立功能。之前规划的页面性能/自愈能力已经是同一 Browser Control Plane 可靠性底座的一部分：
+
+- **Side Panel 没有固定轮询循环。** 首次只取一次 snapshot，之后消费 workspace/pane 增量事件。
+- **全局只保留一条共享 Herdr event stream。** 不会每个 binding 各开一条网络流。
+- **状态请求去重。** 并发 freshness 请求会合并，不会放大 `/push/state` 请求量。
+- **MutationObserver / render 合并调度。** DOM burst 被折叠成有界 UI 工作，不会每个 mutation 都触发一轮重计算/动作。
+- **隐藏页面暂停昂贵 UI 工作。** 重新可见时再 reconcile。
+- **输出严格有界。** terminal/output tail 会裁剪，长时间运行不会让浏览器无限保留历史。
+- **UI 压力 / heap 信号。** 浏览器可提供时，会结合 mutation rate、timer drift、JS heap pressure 判断页面健康。
+- **429 只做 backoff。** 遇到限流扩大网络退避，不因为 429 制造刷新风暴。
+- **回复超时/断流走 evidence-first 恢复。** 先核对 same-origin/server state，再决定是否重试请求或只同步视图。
+- **强制刷新是最后且有界的恢复手段。** sender-scoped、受 Auto gate 控制、导航前持久化、带 durable cooldown/budget；并发刷新请求只能选出一个 winner。
+- **不会刷新死循环。** cooldown 内重复请求直接拒绝；Auto 关闭的会话不能由 background 强刷。
+
+这些机制由 continuity 与 Browser Control Plane 共用；新 action route 没有增加另一套 polling、heartbeat 或盲重试 daemon。
+
+## 为什么 Herdr API / 原始终端输入仍只做 Preview
+
+浏览器控制最难的不是“把字节写进终端”，而是保证：目标是不是原目标、失败是否已投递、重试会不会重复 mutation、pane 后面的 session 是否已换、不同 provider/terminal mutation 应该采用什么确认规则，以及 MV3 reload 后还能否判断 delivery phase。
+
+Prompt 已经通过 Rust target fencing + `agent.prompt` idempotency 满足了这些契约；任意 Herdr 方法和 raw terminal input 的作用面更广，所以继续 fail-closed，等它们各自拥有窄 schema、确认规则、幂等模型和真实 UAT 后再开放。
 
 ## Runtime 或事件流断开时会看到什么
 
@@ -275,27 +274,21 @@ herdr-mcp Rust runtime
 
 ## 当前产品边界
 
-当前 Control Center 已具备：
+Control Center 当前包括：
 
-- Chrome Side Panel 正式入口；
-- 实时 workspace / pane lifecycle；
+- Chrome Side Panel 一级入口；
+- 无固定轮询的 live workspace / pane lifecycle；
 - Agent 状态展示；
-- explicit pinned target；
-- stale target fail-closed；
+- 显式 pinned target；
+- runtime-authoritative `target_revision` 与 stale-target fail-closed；
 - 有界状态 / 输出读取；
-- mutation risk classification；
-- Preview-only action descriptor；
+- 可执行的可信 `提示 Agent`，复用持久化幂等与 outcome evidence；
+- 可执行的 provider `调整会话`请求，并如实返回 capability outcome，**绝不拿 Prompt 冒充 steer**；
+- 仅预览的任意 Herdr API / raw terminal control；
+- 共用的内存/请求压力/超时/刷新循环防护；
 - en / zh / ja UI。
 
-当前**不具备**：
-
-- 从 Side Panel 真正发送 Prompt；
-- provider steer；
-- 任意 Herdr mutation；
-- terminal text / input / key 写入；
-- interrupt。
-
-未来任何一项从 Preview 进入可执行状态，都必须单独通过可靠性、安全和真实浏览器 UAT，而不是因为 UI 已经存在就自动启用。
+Codex true same-turn steer 仍严格依赖可验证的 pane → app-server endpoint → `threadId` → active `expectedTurnId` 映射。在这个 primitive 出现前，`session_not_resolved` 才是正确结果，而不是隐藏 fallback。
 
 ## 相关文档
 

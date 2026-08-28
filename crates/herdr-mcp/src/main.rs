@@ -1,4 +1,5 @@
 mod agent_visibility;
+mod browser_control;
 mod cli;
 mod config;
 mod contract;

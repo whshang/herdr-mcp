@@ -191,7 +191,7 @@ workstation → ChatGPT
 5. 如果开发时换过 unpacked extension 的绝对路径，扩展 ID 可能变化；Native Messaging `allowed_origins` 仍指向旧 ID 时会看到类似 `Access to the specified native messaging host is forbidden`。这时应针对当前开发版身份重新注册 Native Host，而不是复制 bearer；
 6. 顶部如果显示“运行时正常 · 事件流正在重连”，说明已有 snapshot，但增量事件正在恢复，不等于整个 runtime 离线；可以先点刷新让 Side Panel 做一次权威 reconciliation。
 
-Control Center 的“提示 Agent / 调整会话 / Herdr API / 终端输入”当前本来就是 Preview-only。按钮不执行 mutation 不是故障；当前可执行的是 `查看状态` 和有界的 `读取最近输出`。
+Control Center 的 `提示 Agent` 现在会走本地可信控制链真实执行；`调整会话`会返回真实 provider capability/outcome，绝不会偷偷降级成 Prompt。`Herdr API` 与 raw `终端输入`仍是 Preview-only。Prompt 返回 `uncertain` 时先检查 live state 再考虑重试；Steer 返回 `session_not_resolved` 表示当前 pinned provider session 没有可验证的 control endpoint/thread/active-turn 映射，这是 capability 结果，不是 transport 故障。
 
 详见 [浏览器控制中心](browser-control-center.md)。
 

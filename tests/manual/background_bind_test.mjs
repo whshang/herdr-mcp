@@ -45,7 +45,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.72" };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.73" };
 const listeners = { onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
@@ -78,6 +78,7 @@ let mockLocalRuntimeAvailable = true;
 let hangAutomationNotifications = false;
 let failQueuedInsertStorage = false;
 const queuedInsertDeliveries = [];
+const controlActionRequests = [];
 let blockQueuedInsertDelivery = false;
 let holdInitialLocaleRead = true;
 let initialLocaleReadSeen = false;
@@ -229,6 +230,25 @@ globalThis.chrome = {
           status: 200,
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ workspaces: mockStateWorkspaces, panes: [], agents: [] }),
+        });
+        return;
+      }
+      if (message.path === "/extension/control/action") {
+        const body = JSON.parse(message.body || "{}");
+        controlActionRequests.push(body);
+        callback({
+          ok: true,
+          transport: "ipc",
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            ok: true,
+            action: body.action,
+            outcome: body.action === "steer" ? "session_not_resolved" : "submitted",
+            delivery_phase: body.action === "steer" ? "not_submitted" : "submitted",
+            target: body.target,
+            op_id: body.action === "agent_prompt" ? "op:prompt:test" : null,
+          }),
         });
         return;
       }
@@ -455,6 +475,37 @@ function dispatchMessage(msg, sender = {}) {
     onMsg(msg, sender, done);
     setTimeout(() => done(undefined), 1000);
   });
+}
+
+console.log("\n[trusted browser control action]");
+{
+  const promptRequest = {
+    action: "agent_prompt",
+    target: { pane_id: "w1:p1", target_revision: "btr1_test" },
+    args: { text: "keep compatibility" },
+    idempotency_key: "browser-control:test",
+  };
+  let resolvePrompt;
+  const promptP = new Promise((resolve) => { resolvePrompt = resolve; });
+  onMsg({ type: "herdr_control_action", request: promptRequest }, {}, (value) => resolvePrompt(value));
+  const prompt = await promptP;
+  ok(prompt?.ok === true && prompt?.outcome === "submitted" && prompt?.op_id === "op:prompt:test",
+    "background forwards reliable Agent Prompt through the trusted Native Messaging control route");
+  ok(controlActionRequests.at(-1)?.target?.target_revision === "btr1_test"
+      && controlActionRequests.at(-1)?.idempotency_key === "browser-control:test",
+    "browser control request preserves target fencing and idempotency metadata");
+
+  let resolveSteer;
+  const steerP = new Promise((resolve) => { resolveSteer = resolve; });
+  onMsg({ type: "herdr_control_action", request: {
+    action: "steer",
+    target: { pane_id: "w1:p1", target_revision: "btr1_test" },
+    args: { text: "do not change schema" },
+    idempotency_key: "browser-control:steer-test",
+  } }, {}, (value) => resolveSteer(value));
+  const steer = await steerP;
+  ok(steer?.ok === true && steer?.outcome === "session_not_resolved" && steer?.delivery_phase === "not_submitted",
+    "background surfaces provider steer capability outcome without silently converting it to Prompt");
 }
 
 console.log("\n[queued insert storage fail-closed]");

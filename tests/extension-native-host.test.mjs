@@ -93,6 +93,42 @@ test("native host proxies request over tokenless Unix IPC", async () => {
   });
 });
 
+test("native host allows the trusted browser control path over tokenless Unix IPC", async () => {
+  await withIpcServer((req, res) => {
+    assert.equal(req.url, "/extension/control/action");
+    assert.equal(req.method, "POST");
+    assert.equal(req.headers.authorization, undefined);
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      assert.equal(body.action, "steer");
+      assert.equal(body.target.target_revision, "btr1_test");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, outcome: "session_not_resolved", delivery_phase: "not_submitted" }));
+    });
+  }, async (socketPath) => {
+    const frames = await runHost(socketPath, {
+      type: "request",
+      base_url: "http://127.0.0.1:8772",
+      path: "/extension/control/action",
+      method: "POST",
+      headers: { Authorization: "Bearer must-be-stripped", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "steer",
+        target: { pane_id: "w1:p1", target_revision: "btr1_test" },
+        args: { text: "keep compatibility" },
+        idempotency_key: "browser-control:test",
+      }),
+    });
+    assert.equal(frames.length, 1);
+    assert.equal(frames[0].ok, true);
+    assert.equal(frames[0].transport, "ipc");
+    const body = JSON.parse(frames[0].body);
+    assert.equal(body.outcome, "session_not_resolved");
+  });
+});
+
 test("native host carries SSE bytes over persistent tokenless Unix IPC", async () => {
   await withIpcServer((req, res) => {
     assert.equal(req.url, "/push/events");
