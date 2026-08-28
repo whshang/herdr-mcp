@@ -120,20 +120,10 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
 /// This is invoked after managed service update/rollback so Chrome keeps talking
 /// to the same generation as the production runtime without rewriting manifests
 /// or consuming native-host rollback evidence.
+#[cfg(target_os = "macos")]
 pub fn sync_owned_runtime_from_active() -> Result<serde_json::Value, String> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(serde_json::json!({
-            "ok": true,
-            "skipped": true,
-            "reason": "unsupported_platform",
-        }))
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
-        let view = status(&paths);
+    let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
+    let view = status(&paths);
         if view.get("recovery_required").and_then(Value::as_bool) == Some(true) {
             return Err(
                 "native-host recovery is required before syncing the managed runtime binary"
@@ -192,7 +182,6 @@ pub fn sync_owned_runtime_from_active() -> Result<serde_json::Value, String> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         }))
-    }
 }
 
 #[cfg(target_os = "macos")]
