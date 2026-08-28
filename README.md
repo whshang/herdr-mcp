@@ -51,9 +51,9 @@ End users install it only from the **Chrome Web Store**:
 2. open the [Chrome Web Store](https://chromewebstore.google.com/) and search for `Herdr`;
 3. choose the official Herdr extension and click **Add to Chrome**;
 4. run `herdr-mcp native-host install` and `herdr-mcp native-host status`;
-5. future extension updates are delivered through the normal Chrome Web Store update mechanism—no repeated ZIP downloads or developer-mode Reload flow.
+5. future extension updates are delivered through the normal Chrome Web Store update mechanism; no local extension package is required.
 
-> The extension is currently entering its first Chrome Web Store publication flow. Until the listing is live, normal end users should simply skip the extension; `Load unpacked` is not the end-user installation path.
+> The extension is currently entering its first Chrome Web Store publication flow. Until the listing is live, normal end users should simply skip this optional step rather than install a local development build.
 
 See [Browser extension](docs/i18n/en/extension.md) and [Browser Control Center](docs/i18n/en/browser-control-center.md).
 
@@ -80,7 +80,7 @@ herdr-mcp rollback
 herdr-mcp uninstall
 ```
 
-`herdr-mcp service ...` is an **advanced / internal** service-control surface, not the normal install path.
+`herdr-mcp service ...` is an **advanced / internal** service-control surface, not the normal install path. On `0.4.1+`, `herdr-mcp scan --json` refreshes the evidence-backed inventory of locally startable Herdr agent kinds; see the [CLI reference](docs/i18n/en/cli-reference.md#capability-discovery-scan) for details.
 
 ## Read more only when you need it
 

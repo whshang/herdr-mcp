@@ -1,38 +1,4 @@
-use crate::agent_visibility::AgentVisibility;
-use serde_json::Value;
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct WorkerCapability {
-    pub agent_id: String,
-    pub kind: Option<String>,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub profile: Option<String>,
-    pub supports_code_edit: Option<bool>,
-    pub supports_shell: Option<bool>,
-    pub supports_vision: Option<bool>,
-    pub reasoning_tier: Option<u8>,
-    pub latency_tier: Option<u8>,
-    pub cost_tier: Option<u8>,
-    pub context_tier: Option<u8>,
-    pub interactive_only: Option<bool>,
-    pub can_run_headless: Option<bool>,
-    pub allowed_for_auto_dispatch: bool,
-    pub current_status: String,
-    pub current_project: Option<String>,
-    pub cwd: Option<String>,
-    pub pane_id: Option<String>,
-    pub workspace_id: Option<String>,
-    pub interactive_ready: Option<bool>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct CapabilitySnapshot {
-    pub source: String,
-    pub revision: Option<u64>,
-    pub workers: Vec<WorkerCapability>,
-    pub hidden_workers: usize,
-}
+use crate::capability_resolver::{CapabilitySnapshot, WorkerCapability};
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct TaskProfile {
@@ -59,42 +25,6 @@ pub struct DispatchDecision {
     pub action: DispatchAction,
     pub reason: String,
     pub rejected: Vec<String>,
-}
-
-pub fn project_capabilities(snapshot: &Value, visibility: &AgentVisibility) -> CapabilitySnapshot {
-    let agents = snapshot
-        .get("agents")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let total_agents = agents.len();
-    let agents = agents
-        .into_iter()
-        .filter(|agent| {
-            visibility.is_visible(
-                agent.get("name").and_then(Value::as_str),
-                agent
-                    .get("agent")
-                    .or_else(|| agent.get("kind"))
-                    .and_then(Value::as_str),
-            )
-        })
-        .collect::<Vec<_>>();
-    let hidden_workers = total_agents.saturating_sub(agents.len());
-    let revision = agents
-        .iter()
-        .filter_map(|agent| agent.get("state_change_seq").and_then(Value::as_u64))
-        .max();
-    let workers = agents
-        .iter()
-        .filter_map(|agent| worker_from_agent(agent, visibility))
-        .collect();
-    CapabilitySnapshot {
-        source: "herdr:event-cache".to_owned(),
-        revision,
-        workers,
-        hidden_workers,
-    }
 }
 
 pub fn decide_dispatch(task: &TaskProfile, snapshot: &CapabilitySnapshot) -> DispatchDecision {
@@ -159,53 +89,6 @@ pub fn decide_dispatch(task: &TaskProfile, snapshot: &CapabilitySnapshot) -> Dis
     }
 }
 
-fn worker_from_agent(agent: &Value, visibility: &AgentVisibility) -> Option<WorkerCapability> {
-    let kind = agent
-        .get("agent")
-        .or_else(|| agent.get("kind"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let name = agent.get("name").and_then(Value::as_str).map(str::to_owned);
-    let agent_id = name.clone().or_else(|| kind.clone())?;
-    let status = agent
-        .get("agent_status")
-        .or_else(|| agent.get("status"))
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_owned();
-    let cwd = agent.get("cwd").and_then(Value::as_str).map(str::to_owned);
-    Some(WorkerCapability {
-        agent_id,
-        kind: kind.clone(),
-        provider: None,
-        model: None,
-        profile: None,
-        supports_code_edit: None,
-        supports_shell: None,
-        supports_vision: None,
-        reasoning_tier: None,
-        latency_tier: None,
-        cost_tier: None,
-        context_tier: None,
-        interactive_only: None,
-        can_run_headless: None,
-        allowed_for_auto_dispatch: visibility.is_visible(name.as_deref(), kind.as_deref()),
-        current_status: status,
-        current_project: cwd.clone(),
-        cwd,
-        pane_id: agent
-            .get("pane_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        workspace_id: agent
-            .get("workspace_id")
-            .or_else(|| agent.get("workspace"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        interactive_ready: agent.get("interactive_ready").and_then(Value::as_bool),
-    })
-}
-
 fn matches_target(worker: &WorkerCapability, target: &str) -> bool {
     worker.agent_id == target
         || worker.kind.as_deref() == Some(target)
@@ -255,6 +138,8 @@ fn no_dispatch(reason: &str, rejected: Vec<String>) -> DispatchDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_visibility::AgentVisibility;
+    use crate::capability_resolver::{project_capabilities, project_capabilities_with_inventory};
 
     fn worker(id: &str, status: &str) -> WorkerCapability {
         WorkerCapability {
@@ -288,6 +173,45 @@ mod tests {
             revision: Some(1),
             workers,
             hidden_workers: 0,
+        }
+    }
+
+    fn scanned_pi() -> crate::capability_inventory::AgentCapabilityRecord {
+        use crate::capability_inventory::{Evidence, INVENTORY_SCHEMA_VERSION, ProbeLevel};
+        let evidence = |value| Evidence {
+            value,
+            source: "test_probe".to_owned(),
+            authority: "reported".to_owned(),
+            observed_at_ms: 1,
+            detail: None,
+        };
+        crate::capability_inventory::AgentCapabilityRecord {
+            schema_version: INVENTORY_SCHEMA_VERSION,
+            agent: "pi".to_owned(),
+            manifest_version: Some("1".to_owned()),
+            manifest_source: Some("bundled".to_owned()),
+            manifest_source_kind: Some("bundled".to_owned()),
+            binary_path: Some("/bin/pi".to_owned()),
+            herdr_startable: None,
+            executable_available: None,
+            available_for_start: None,
+            binary_version: None,
+            provider: None,
+            model: None,
+            profile: None,
+            supports_code_edit: Some(evidence(true)),
+            supports_shell: None,
+            supports_vision: None,
+            reasoning_tier: None,
+            latency_tier: None,
+            cost_tier: None,
+            context_tier: None,
+            interactive_only: None,
+            can_run_headless: Some(evidence(true)),
+            probe_level: ProbeLevel::Deep,
+            probe_adapter_version: 1,
+            fingerprint: "sha256:test".to_owned(),
+            observed_at_ms: 1,
         }
     }
 
@@ -344,6 +268,48 @@ mod tests {
         assert_eq!(
             decision.action,
             DispatchAction::Worker("reviewer".to_owned())
+        );
+    }
+
+    #[test]
+    fn scanned_capability_enriches_worker_but_live_status_remains_authoritative() {
+        let visibility = AgentVisibility::Allow(["pi".to_owned()].into_iter().collect());
+        let inventory = vec![scanned_pi()];
+        let live = serde_json::json!({
+            "agents": [{
+                "agent": "pi",
+                "name": "worker",
+                "agent_status": "working",
+                "cwd": "/repo",
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "state_change_seq": 7
+            }]
+        });
+        let snapshot = project_capabilities_with_inventory(&live, &visibility, &inventory);
+        assert_eq!(snapshot.source, "herdr:event-cache+capability-inventory");
+        assert_eq!(snapshot.workers[0].supports_code_edit, Some(true));
+        assert_eq!(snapshot.workers[0].can_run_headless, Some(true));
+        assert_eq!(snapshot.workers[0].current_status, "working");
+        let task = TaskProfile {
+            project_root: Some("/repo".to_owned()),
+            requires_code_edit: true,
+            ..TaskProfile::default()
+        };
+        assert_eq!(
+            decide_dispatch(&task, &snapshot).action,
+            DispatchAction::NoDispatch
+        );
+
+        let mut idle_live = live.clone();
+        idle_live["agents"][0]["agent_status"] = serde_json::Value::String("idle".to_owned());
+        let idle_snapshot =
+            project_capabilities_with_inventory(&idle_live, &visibility, &inventory);
+        assert_eq!(idle_snapshot.workers[0].supports_code_edit, Some(true));
+        assert_eq!(idle_snapshot.workers[0].current_status, "idle");
+        assert_eq!(
+            decide_dispatch(&task, &idle_snapshot).action,
+            DispatchAction::Worker("worker".to_owned())
         );
     }
 

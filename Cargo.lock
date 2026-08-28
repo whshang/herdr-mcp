@@ -597,7 +597,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "herdr-mcp"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "axum",
  "base64",
@@ -613,6 +613,7 @@ dependencies = [
  "rustls",
  "ryu-js",
  "semver",
+ "serde",
  "serde_json",
  "sha2",
  "sigstore-trust-root",

@@ -401,7 +401,7 @@ Chrome Web Store 要求申请完成 single purpose 所需的最小权限。不�
 - https://developer.chrome.com/docs/webstore/cws-dashboard-privacy
 - https://developer.chrome.com/docs/webstore/using-api
 
-当前阶段继续：
+当前开发期仍保留：
 
 ```text
 Git/main
@@ -411,16 +411,9 @@ unpacked development extension
 real browser smoke
 ```
 
-本阶段不做：
+Chrome Web Store publisher、Store item、listing/privacy draft 和 production Store identity 已经建立；**仍禁止在 Native Messaging Store-origin 闭环真实通过前提交 review / public publish**。Chrome Web Store API 自动发布继续后置，首次发布仍以人工 Dashboard 流程为准。
 
-- Developer Dashboard 正式提交；
-- Store Listing 上线；
-- production Store ID 写入 installer；
--公开发布；
-- Chrome Web Store API 自动发布；
--用户级一键 installer 产品化。
-
-原因：Store ID 与 Native Messaging origin 是一个需要一次性设计正确的身份边界；不能为了“先上架看看”临时打补丁。
+Store ID 与 Native Messaging origin 是一次性身份边界：production identity 的机器可读 SSOT 为 `contracts/browser-extension-store.json`。Rust 通过编译期嵌入并校验该 contract 使用 Store identity，源码不保存 Store ID 字面量。
 
 ## 9. Chrome Web Store 上架执行设计
 
@@ -444,41 +437,17 @@ real browser smoke
 - https://developer.chrome.com/docs/webstore/prepare
 - https://developer.chrome.com/docs/extensions/reference/manifest/key
 
-### 9.2 固定 Store ID 与开发 ID
+### 9.2 Store identity 与开发 identity
 
-上架前必须明确两种身份策略之一：
+最终策略已经冻结：**Native Messaging manifest 任一时刻只允许一个精确 origin，不同时放行 dev + Store 两个 ID，也不使用 wildcard。**
 
-#### 策略 A：开发版与商店版使用同一 ID（优先评估）
+- 普通 `herdr-mcp native-host install`：从 `contracts/browser-extension-store.json` 读取并注册 production Store identity；
+- unpacked 开发版：维护者必须显式执行 `HERDR_EXTENSION_PATH=/path/to/extension herdr-mcp native-host install`，由该路径派生开发 ID；
+- 从既有 herdr-mcp-owned dev origin 切回 Store origin：install 走完整 snapshot / atomic mutation / rollback evidence 事务；
+- foreign、multi-origin、symlink 或非本项目拥有的 Native Messaging state 继续 fail closed；
+- Store ID 不硬编码进 Rust，contract 是唯一机器可读 SSOT。
 
-使用 Store item 对应的 public key 在开发期固定 unpacked extension ID。
-
-优点：
-
-- Native Host `allowed_origins` 简单；
-- local storage / permissions / identity 更接近生产；
--真实 pre-release smoke 与商店身份一致。
-
-注意：
-
-- 只处理公开 identity/public key；
-- 绝不能提交任何 Chrome Web Store 私钥、OAuth refresh token 或发布凭据。
-
-#### 策略 B：dev/store 两个明确 ID
-
-Native Host installer 显式允许受控 dev origin + production Store origin。
-
-例如：
-
-```json
-{
-  "allowed_origins": [
-    "chrome-extension://<DEV_ID>/",
-    "chrome-extension://<STORE_ID>/"
-  ]
-}
-```
-
-禁止 wildcard。
+这样 production 默认路径稳定，开发身份仍可测试，同时避免长期扩大 Native Messaging allowlist。
 
 官方 Native Messaging 规则：
 
@@ -486,15 +455,14 @@ Native Host installer 显式允许受控 dev origin + production Store origin。
 
 ### 9.3 Native Host installer 改造
 
-商店发布前，installer 不能继续只依赖当前 repo path 推导 production identity。
+`0.4.1` 的目标实现为：
 
-必须支持：
-
-- fixed production Store ID；
-- 可选、明确受控的 development ID；
-- existing registered origin migration；
-- install/status/uninstall/rollback；
-- origin drift 检测；
+- production Store ID 由 `contracts/browser-extension-store.json` 提供；
+- 普通 install 不需要 repo checkout 或 unpacked extension 目录；
+- development ID 只能通过显式 `HERDR_EXTENSION_PATH` / 受控 origin override 选择；
+- existing herdr-mcp-owned origin 可以事务式迁移；
+- install/status/uninstall/rollback 与 runtime sync 继续保留原有恢复证据；
+- status 显式报告 `official_store_extension_id`、`store_origin_match`、`extension_identity_source`；
 - 不因升级 runtime 覆盖成错误 origin；
 - Chrome / Chromium / Edge / Brave / ego lite 的目标清单仍保持各浏览器自己的注册路径。
 
@@ -675,25 +643,25 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 
 以下全部满足才允许从 WIP 转正式 release plan：
 
-- [ ] extension single purpose 已冻结；
-- [ ] Store item 已创建但尚未公开；
-- [ ] production Store ID 已冻结；
-- [ ] Native Host installer 支持 production Store origin；
-- [ ] dev/store identity 策略明确；
+- [x] extension single purpose 已冻结并写入 Store Privacy；
+- [x] Store item 已创建但尚未公开；
+- [x] production Store ID 已冻结到 `contracts/browser-extension-store.json`；
+- [x] `0.4.1` Native Host installer 支持 production Store origin；`HOME` **与** `HERDR_MCP_CONFIG_DIR` 双隔离的 fresh-install/status/rollback smoke、dev→Store→rollback 单测均 PASS，且隔离 smoke 前后真实 Native Host binary/wrapper/5 份浏览器 manifest SHA 完全一致；
+- [x] dev/store identity 策略明确：Store-first、单 origin、开发版显式 override；
 - [ ] manifest permissions 完成最小权限审计；
 - [ ] `<all_urls>` 已证明必要，或缩小；
-- [ ] Privacy Policy 已上线；
-- [ ] User Data / Limited Use disclosures 完整；
-- [ ] remote-hosted-code audit PASS；
-- [ ] extension package deterministic；
+- [x] Privacy Policy 已上线并写入 Store；
+- [x] User Data / Limited Use disclosures 已填写并保存；
+- [x] remote executable code audit：Store 声明 `No`，可执行 JS 全部随扩展打包；
+- [x] extension package deterministic；
 - [ ] unpacked真实浏览器 smoke PASS；
 - [ ] Store-ID build + Native Host real smoke PASS；
 - [ ] toolbar action → Side Panel、active-tab Current page、single-path binding/handoff、compact HUD、Queued Insert smoke PASS；
 - [ ] ChatGPT / Claude / z.ai / DeepSeek 支持矩阵重新验证；
 - [ ] handoff/recovery 回归 PASS；
-- [ ] Rust Native Messaging install/status/uninstall/rollback PASS；
+- [x] Rust Native Messaging install/status/uninstall/rollback 单测 PASS；
 - [ ] reviewer test instructions 可复现；
-- [ ] screenshots/listing metadata 与真实产品一致；
+- [x] screenshots/listing metadata 与真实产品一致；
 - [ ] Private trusted-tester UAT PASS；
 - [ ] rollback / disable strategy 已确认。
 
@@ -776,9 +744,9 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 - ChatGPT Queued Insert 已进入 main，正式用户文档使用“排队 / Queue”描述其 next-turn 语义；
 - Chrome Web Store 首次发布流程**已经启动**；Developer Dashboard publisher 已可用，Store item 已创建；
 - 普通用户正式安装路径已经切为 Chrome Web Store，Store listing 上线前直接跳过扩展；
-- Store Extension ID 已冻结为 `kpcengcaammanfnbclapecdgahdmhanp`；Store listing、128x128 icon、1280x800 screenshot 与 Privacy practices 已写入 draft；
-- **当前 Store 发布 blocker：Native Messaging origin 仍绑定开发版 path-derived ID。** stable `0.4.0` 当前 `native-host status` 的 extension ID 为 `dklcamincneeijhcelpkdbcekfemldii`，与 Store ID 不同；在正式提交审核前必须提供受支持的 Store-origin 安装/迁移路径，并完成商店安装后的真实 Native Messaging smoke；
-- Store Privacy Policy 已补入正式 docs，待 docs PR 合并并由 GitHub Pages 发布后，将 `https://whshang.github.io/herdr-mcp/docs/en/privacy.html` 写入 Store Privacy tab；
-- Publisher contact email 仍需配置并完成 Google verification；该邮箱会公开展示，不得由 Agent 猜测；
+- Store Extension ID 已冻结；唯一机器可读 SSOT 为 `contracts/browser-extension-store.json`，Store listing、128x128 icon、1280x800 screenshot 与 Privacy practices 已写入 draft；
+- `0.4.1` 开发线已经实现 Store-first Native Messaging identity：普通 `native-host install` 从 Store contract 读取 production identity，显式 `HERDR_EXTENSION_PATH` 仅保留维护者 unpacked 开发路径，既有 herdr-mcp-owned dev origin 可事务迁移并 rollback；一次仅替换 `HOME` 的早期 smoke 暴露出调用环境继承真实 `HERDR_MCP_CONFIG_DIR` 会造成跨作用域 Native Host mutation，已使用原事务 evidence 精确 rollback，生产状态恢复为原 dev identity / `runtime_matches_current=true`；随后用**独立 `HOME` + 独立 `HERDR_MCP_CONFIG_DIR`**重跑 fresh-install/status/rollback，Store ID、`store_origin_match=true`、rollback 均 PASS，且真实 native binary/wrapper/5 份浏览器 manifest 前后 SHA 完全一致。后续任何 Native Host UAT 都必须同时隔离这两个路径，不能把“临时 HOME”单独视为隔离证据；**剩余 Store blocker 是发布/安装真实 `0.4.1` 后，用当前 Chrome Web Store `0.1.72` 做一次真实商店安装 + Native Messaging UAT**；
+- Store Privacy Policy 已由 GitHub Pages 发布并验证可读，`https://whshang.github.io/herdr-mcp/docs/en/privacy.html` 已写入 Store Privacy tab；
+- Publisher 已明确 contact email；Dashboard 仍需完成保存与 Google verification，未验证前不得视为已配置；
 - 首次 Store submit 前必须审计 `<all_urls>` 等 permissions 是否能缩窄；
 - 后续每次 Store 发布仍需重新核对实时 Chrome Web Store policy，不得把本 WIP 的时间点描述当成永久不变的商店规则。

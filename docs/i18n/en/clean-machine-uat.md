@@ -64,9 +64,7 @@ WORKDIR="${HOME}/herdr-mcp-clean-uat"
 mkdir -p "$WORKDIR/bin" "$WORKDIR/dl" && cd "$WORKDIR"
 gh release download "$TAG" -R "$REPO" -D dl \
   -p "herdr-mcp-*-aarch64-apple-darwin" \
-  -p "release-manifest.json" \
-  -p "herdr-mcp-extension-*.zip" \
-  -p "herdr-mcp-extension-*.zip.sha256"
+  -p "release-manifest.json"
 install -m 755 dl/herdr-mcp-*-aarch64-apple-darwin bin/herdr-mcp
 export PATH="$WORKDIR/bin:$PATH"
 herdr --version
@@ -76,11 +74,9 @@ herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
 herdr-mcp update check
-# Extension (optional for G15 residual on the clean machine):
-shasum -a 256 -c dl/herdr-mcp-extension-*.zip.sha256
-mkdir -p ~/.config/herdr-mcp/extension
-unzip -o dl/herdr-mcp-extension-*.zip -d ~/.config/herdr-mcp/extension
-# Chrome: Load unpacked -> ~/.config/herdr-mcp/extension
+# Optional browser-extension UAT:
+# Install the official Herdr extension from Chrome Web Store when the listing
+# under test is available. If it is not live yet, skip extension UAT here.
 herdr-mcp native-host install
 herdr-mcp native-host status
 ```
@@ -123,23 +119,9 @@ ls -l "$HOME/.local/bin/herdr-mcp"
 launchctl list | awk -v label='dev.herdr-mcp.server' '$3 == label { print $1, $2, $3 }'
 ```
 
-### Named-instance extension (same Mac, static only)
+### Named-instance browser checks (same Mac, static only)
 
-Extract the Release extension zip into the **uat** config root (not dogfood `~/.config/herdr-mcp/extension`):
-
-```bash
-export HERDR_MCP_INSTANCE=uat
-gh release download "$TAG" -R "$REPO" -D "$WORKDIR/dl" \
-  -p "herdr-mcp-extension-*.zip" \
-  -p "herdr-mcp-extension-*.zip.sha256"
-shasum -a 256 -c "$WORKDIR/dl"/herdr-mcp-extension-*.zip.sha256
-mkdir -p "$HOME/.config/herdr-mcp-uat/extension"
-unzip -o "$WORKDIR/dl"/herdr-mcp-extension-*.zip -d "$HOME/.config/herdr-mcp-uat/extension"
-herdr-mcp --instance uat doctor
-# expect: local-ipc PASS; native-messaging absent (Chrome host name dev.herdr.mcp is singleton)
-```
-
-Static smoke (no Chrome required; run from a checkout):
+The Chrome Web Store extension and Native Messaging host are machine/browser scoped, not named-instance scoped. Do not install or replace the browser extension while validating a same-Mac `uat` runtime instance. Static extension tests may still run from the checkout:
 
 ```bash
 node tests/manual/extension_smoke.mjs
@@ -147,18 +129,11 @@ node tests/manual/background_bind_test.mjs
 node --test tests/queued-insert.test.mjs
 ```
 
-**Do not** run `herdr-mcp --instance uat native-host install` on the dogfood Mac: it would overwrite the production Chrome manifest at `NativeMessagingHosts/dev.herdr.mcp.json`. Full G15 native-host + Load unpacked seal requires a second Mac default instance or an owner maintenance window on dogfood default instance.
-
-Cleanup when finished (does not touch dogfood):
-
-```bash
-export HERDR_MCP_INSTANCE=uat
-herdr-mcp --instance uat uninstall
-```
+Run Store-install + Native Messaging UAT only on a dedicated clean Mac or during an explicit owner maintenance window on the default instance. Historical pre-Store package evidence remains under `docs/history/ga/`; it is not a current install protocol.
 
 ### Named-instance non-goals on the dogfood Mac
 
-- Do not run `native-host install` / Chrome Load unpacked against dogfood profiles from this path.
+- Do not replace the Chrome Web Store extension or run `native-host install` against dogfood profiles from this named-instance path.
 - Do not run `link install` / `link cutover` / seal mutations for the UAT instance on the dogfood Mac.
 - Public ChatGPT OAuth remains an **owner** step on a machine/Edge identity you intend to expose; stop at OAuth and record the exact blocked step.
 

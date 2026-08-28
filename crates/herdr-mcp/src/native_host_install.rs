@@ -61,11 +61,22 @@ struct InstallPaths {
     extension_path: Option<PathBuf>,
     extension_id: String,
     extension_origin: String,
+    extension_identity_source: String,
+    allow_origin_migration: bool,
     targets: Vec<(PathBuf, bool)>,
     backups_dir: PathBuf,
     rollback_file: PathBuf,
     pending_file: PathBuf,
     rollback_pending_file: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct NativeHostLayout {
+    source_binary: PathBuf,
+    native_dir: PathBuf,
+    wrapper: PathBuf,
+    targets: Vec<(PathBuf, bool)>,
 }
 
 pub fn run(command: NativeHostCommand) -> Result<ExitCode, String> {
@@ -124,6 +135,17 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
 pub fn sync_owned_runtime_from_active() -> Result<serde_json::Value, String> {
     let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
     let view = status(&paths);
+    if let Some(result) = sync_preflight(&view)? {
+        return Ok(result);
+    }
+
+    let home = home_dir()?;
+    let active = crate::link::install::resolve_managed_runtime_binary(&home)?;
+    sync_owned_runtime_with_active(&paths, &active)
+}
+
+#[cfg(target_os = "macos")]
+fn sync_preflight(view: &Value) -> Result<Option<Value>, String> {
     if view.get("recovery_required").and_then(Value::as_bool) == Some(true) {
         return Err(
             "native-host recovery is required before syncing the managed runtime binary".to_owned(),
@@ -137,17 +159,24 @@ pub fn sync_owned_runtime_from_active() -> Result<serde_json::Value, String> {
         || view.get("wrapper_ok").and_then(Value::as_bool) != Some(true)
         || view.get("runtime_binary_ok").and_then(Value::as_bool) != Some(true)
     {
-        return Ok(json!({
+        return Ok(Some(json!({
             "ok": true,
             "skipped": true,
             "reason": "native_host_not_owned",
-        }));
+        })));
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn sync_owned_runtime_with_active(paths: &InstallPaths, active: &Path) -> Result<Value, String> {
+    let view = status_with_active_runtime(paths, Some(active));
+    if let Some(result) = sync_preflight(&view)? {
+        return Ok(result);
     }
 
-    let home = home_dir()?;
-    let active = crate::link::install::resolve_managed_runtime_binary(&home)?;
     let native_sha = file_sha256(&paths.runtime_binary)?;
-    let active_sha = file_sha256(&active)?;
+    let active_sha = file_sha256(active)?;
     if native_sha == active_sha {
         return Ok(json!({
             "ok": true,
@@ -155,7 +184,7 @@ pub fn sync_owned_runtime_from_active() -> Result<serde_json::Value, String> {
             "reason": "already_current",
             "active_runtime": active,
             "native_runtime_version": read_binary_version(&paths.runtime_binary),
-            "active_runtime_version": read_binary_version(&active),
+            "active_runtime_version": read_binary_version(active),
             "runtime_matches_current": true,
             "version_consistent": view
                 .get("version_consistent")
@@ -164,8 +193,8 @@ pub fn sync_owned_runtime_from_active() -> Result<serde_json::Value, String> {
         }));
     }
 
-    atomic_copy_executable(&active, &paths.runtime_binary)?;
-    let refreshed = status(&paths);
+    atomic_copy_executable(active, &paths.runtime_binary)?;
+    let refreshed = status_with_active_runtime(paths, Some(active));
     Ok(json!({
         "ok": true,
         "synced": true,
@@ -191,70 +220,70 @@ impl InstallPaths {
         let source_binary = env::current_exe()
             .map_err(|error| format!("cannot locate current herdr-mcp binary: {error}"))?;
         let native_dir = runtime_paths.config_dir.join("native");
-        let wrapper = native_dir.join("herdr-extension-host");
-        let targets = install_targets(&home);
+        let layout = NativeHostLayout {
+            source_binary,
+            wrapper: native_dir.join("herdr-extension-host"),
+            targets: install_targets(&home),
+            native_dir,
+        };
 
         // Rollback (and read-only status) must be able to recover the exact
         // managed origin/paths from durable metadata even when the current
         // worktree, extension path, or live manifest is not intact or missing.
         if (matches!(command, NativeHostCommand::Rollback)
             || matches!(command, NativeHostCommand::Status))
-            && let Some(origin) = durable_extension_origin(&native_dir)?
+            && let Some(origin) = durable_extension_origin(&layout.native_dir)?
         {
             let extension_id = extension_id_from_origin(&origin)
                 .ok_or_else(|| "durable native-host origin is invalid".to_owned())?;
             return Ok(Self {
-                source_binary,
-                runtime_binary: native_dir.join("herdr-mcp"),
-                wrapper,
+                source_binary: layout.source_binary,
+                runtime_binary: layout.native_dir.join("herdr-mcp"),
+                wrapper: layout.wrapper,
                 extension_path: None,
                 extension_id,
                 extension_origin: origin,
-                targets,
-                backups_dir: native_dir.join(BACKUPS_DIR_NAME),
-                rollback_file: native_dir.join(ROLLBACK_FILE),
-                pending_file: native_dir.join(PENDING_FILE),
-                rollback_pending_file: native_dir.join(ROLLBACK_PENDING_FILE),
+                extension_identity_source: "durable_metadata".to_owned(),
+                allow_origin_migration: false,
+                targets: layout.targets,
+                backups_dir: layout.native_dir.join(BACKUPS_DIR_NAME),
+                rollback_file: layout.native_dir.join(ROLLBACK_FILE),
+                pending_file: layout.native_dir.join(PENDING_FILE),
+                rollback_pending_file: layout.native_dir.join(ROLLBACK_PENDING_FILE),
             });
         }
 
         if matches!(command, NativeHostCommand::Install) {
-            if let Some(extension_origin) = find_registered_origin(&targets, &wrapper)? {
-                let extension_id = extension_id_from_origin(&extension_origin)
-                    .ok_or_else(|| "registered native-host origin is invalid".to_owned())?;
-                let extension_path = crate::native_host::extension_path_for_install()
-                    .ok()
-                    .filter(|path| {
-                        crate::native_host::chromium_id_for_path(path)
-                            .ok()
-                            .is_some_and(|id| id == extension_id)
-                    });
-                return Ok(Self {
-                    source_binary,
-                    runtime_binary: native_dir.join("herdr-mcp"),
-                    wrapper,
-                    extension_path,
-                    extension_id,
-                    extension_origin,
-                    targets,
-                    backups_dir: native_dir.join(BACKUPS_DIR_NAME),
-                    rollback_file: native_dir.join(ROLLBACK_FILE),
-                    pending_file: native_dir.join(PENDING_FILE),
-                    rollback_pending_file: native_dir.join(ROLLBACK_PENDING_FILE),
-                });
+            if let Some(extension_origin) = explicit_extension_origin()? {
+                return Self::for_origin(
+                    &extension_origin,
+                    None,
+                    "env:HERDR_EXTENSION_ORIGIN",
+                    true,
+                    layout,
+                );
             }
-            let extension_path = crate::native_host::extension_path_for_install()?;
-            return Self::for_layout(
-                &extension_path,
-                Some(extension_path.clone()),
-                source_binary,
-                native_dir,
-                wrapper,
-                targets,
+            if env::var_os("HERDR_EXTENSION_PATH").is_some() {
+                let extension_path = crate::native_host::extension_path_for_install()?;
+                return Self::for_layout(
+                    &extension_path,
+                    Some(extension_path.clone()),
+                    "env:HERDR_EXTENSION_PATH",
+                    true,
+                    layout,
+                );
+            }
+            let store = crate::browser_extension_identity::official_store_identity()?;
+            return Self::for_origin(
+                &store.origin,
+                None,
+                "chrome_web_store_contract",
+                true,
+                layout,
             );
         }
 
-        if let Some(extension_origin) = find_registered_origin(&targets, &wrapper)? {
+        if let Some(extension_origin) = find_registered_origin(&layout.targets, &layout.wrapper)? {
             let extension_id = extension_id_from_origin(&extension_origin)
                 .ok_or_else(|| "registered native-host origin is invalid".to_owned())?;
             let live_path = crate::native_host::extension_path_for_install().ok();
@@ -264,28 +293,47 @@ impl InstallPaths {
                     .is_some_and(|id| id == extension_id)
             });
             return Ok(Self {
-                source_binary,
-                runtime_binary: native_dir.join("herdr-mcp"),
-                wrapper,
+                source_binary: layout.source_binary,
+                runtime_binary: layout.native_dir.join("herdr-mcp"),
+                wrapper: layout.wrapper,
                 extension_path,
                 extension_id,
                 extension_origin,
-                targets,
-                backups_dir: native_dir.join(BACKUPS_DIR_NAME),
-                rollback_file: native_dir.join(ROLLBACK_FILE),
-                pending_file: native_dir.join(PENDING_FILE),
-                rollback_pending_file: native_dir.join(ROLLBACK_PENDING_FILE),
+                extension_identity_source: "registered_manifest".to_owned(),
+                allow_origin_migration: false,
+                targets: layout.targets,
+                backups_dir: layout.native_dir.join(BACKUPS_DIR_NAME),
+                rollback_file: layout.native_dir.join(ROLLBACK_FILE),
+                pending_file: layout.native_dir.join(PENDING_FILE),
+                rollback_pending_file: layout.native_dir.join(ROLLBACK_PENDING_FILE),
             });
         }
 
-        let extension_path = crate::native_host::extension_path_for_install()?;
-        Self::for_layout(
-            &extension_path,
-            Some(extension_path.clone()),
-            source_binary,
-            native_dir,
-            wrapper,
-            targets,
+        if let Some(extension_origin) = explicit_extension_origin()? {
+            return Self::for_origin(
+                &extension_origin,
+                None,
+                "env:HERDR_EXTENSION_ORIGIN",
+                false,
+                layout,
+            );
+        }
+        if let Some(extension_path) = crate::native_host::extension_path_for_install_optional()? {
+            return Self::for_layout(
+                &extension_path,
+                Some(extension_path.clone()),
+                "extension_path",
+                false,
+                layout,
+            );
+        }
+        let store = crate::browser_extension_identity::official_store_identity()?;
+        Self::for_origin(
+            &store.origin,
+            None,
+            "chrome_web_store_contract",
+            false,
+            layout,
         )
     }
 
@@ -296,42 +344,65 @@ impl InstallPaths {
         source_binary: &Path,
     ) -> Result<Self, String> {
         let native_dir = home.join(".config").join("herdr-mcp").join("native");
-        let wrapper = native_dir.join("herdr-extension-host");
+        let layout = NativeHostLayout {
+            source_binary: source_binary.to_path_buf(),
+            wrapper: native_dir.join("herdr-extension-host"),
+            targets: install_targets(home),
+            native_dir,
+        };
         Self::for_layout(
             extension_path,
             Some(extension_path.to_path_buf()),
-            source_binary.to_path_buf(),
-            native_dir,
-            wrapper,
-            install_targets(home),
+            "test_extension_path",
+            false,
+            layout,
         )
     }
 
     fn for_layout(
         identity_path: &Path,
         extension_path: Option<PathBuf>,
-        source_binary: PathBuf,
-        native_dir: PathBuf,
-        wrapper: PathBuf,
-        targets: Vec<(PathBuf, bool)>,
+        extension_identity_source: &str,
+        allow_origin_migration: bool,
+        layout: NativeHostLayout,
     ) -> Result<Self, String> {
         let extension_id = crate::native_host::chromium_id_for_path(identity_path)?;
         let extension_origin = format!("chrome-extension://{extension_id}/");
-        let backups_dir = native_dir.join(BACKUPS_DIR_NAME);
-        let rollback_file = native_dir.join(ROLLBACK_FILE);
-        let pending_file = native_dir.join(PENDING_FILE);
+        Self::for_origin(
+            &extension_origin,
+            extension_path,
+            extension_identity_source,
+            allow_origin_migration,
+            layout,
+        )
+    }
+
+    fn for_origin(
+        extension_origin: &str,
+        extension_path: Option<PathBuf>,
+        extension_identity_source: &str,
+        allow_origin_migration: bool,
+        layout: NativeHostLayout,
+    ) -> Result<Self, String> {
+        let extension_id = extension_id_from_origin(extension_origin)
+            .ok_or_else(|| "native-host extension origin is invalid".to_owned())?;
+        let backups_dir = layout.native_dir.join(BACKUPS_DIR_NAME);
+        let rollback_file = layout.native_dir.join(ROLLBACK_FILE);
+        let pending_file = layout.native_dir.join(PENDING_FILE);
         Ok(Self {
-            source_binary,
-            runtime_binary: native_dir.join("herdr-mcp"),
-            wrapper,
+            source_binary: layout.source_binary,
+            runtime_binary: layout.native_dir.join("herdr-mcp"),
+            wrapper: layout.wrapper,
             extension_path,
             extension_id,
-            extension_origin,
-            targets,
+            extension_origin: extension_origin.to_owned(),
+            extension_identity_source: extension_identity_source.to_owned(),
+            allow_origin_migration,
+            targets: layout.targets,
             backups_dir,
             rollback_file,
             pending_file,
-            rollback_pending_file: native_dir.join(ROLLBACK_PENDING_FILE),
+            rollback_pending_file: layout.native_dir.join(ROLLBACK_PENDING_FILE),
         })
     }
 }
@@ -398,6 +469,7 @@ fn install(paths: &InstallPaths) -> Result<Value, String> {
         "extension_id": paths.extension_id,
         "extension_path": paths.extension_path,
         "extension_origin": paths.extension_origin,
+        "extension_identity_source": paths.extension_identity_source,
         "runtime_binary": paths.runtime_binary,
         "runtime_sha256": runtime_sha256,
         "wrapper": paths.wrapper,
@@ -450,20 +522,23 @@ fn install_mutation(paths: &InstallPaths) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn status(paths: &InstallPaths) -> Value {
-    let runtime_binary_ok = is_regular_executable(&paths.runtime_binary);
-    let wrapper_ok = wrapper_is_rust(&paths.wrapper);
     let active_runtime = home_dir()
         .ok()
         .and_then(|home| crate::link::install::resolve_managed_runtime_binary(&home).ok());
+    status_with_active_runtime(paths, active_runtime.as_deref())
+}
+
+#[cfg(target_os = "macos")]
+fn status_with_active_runtime(paths: &InstallPaths, active_runtime: Option<&Path>) -> Value {
+    let runtime_binary_ok = is_regular_executable(&paths.runtime_binary);
+    let wrapper_ok = wrapper_is_rust(&paths.wrapper);
     let runtime_matches_current = runtime_binary_ok
-        && active_runtime.as_ref().is_some_and(|active| {
+        && active_runtime.is_some_and(|active| {
             file_sha256(&paths.runtime_binary).ok().as_deref()
                 == file_sha256(active).ok().as_deref()
         });
     let native_runtime_version = read_binary_version(&paths.runtime_binary);
-    let active_runtime_version = active_runtime
-        .as_ref()
-        .and_then(|active| read_binary_version(active));
+    let active_runtime_version = active_runtime.and_then(read_binary_version);
     let version_consistent =
         native_runtime_version.is_some() && native_runtime_version == active_runtime_version;
     let mut manifests = Vec::new();
@@ -486,6 +561,13 @@ fn status(paths: &InstallPaths) -> Value {
     let recovery_required =
         path_present(&paths.pending_file) || path_present(&paths.rollback_pending_file);
     let rollback_in_progress = path_present(&paths.rollback_pending_file);
+    let official_store = crate::browser_extension_identity::official_store_identity().ok();
+    let official_store_extension_id = official_store
+        .as_ref()
+        .map(|identity| identity.extension_id.clone());
+    let store_origin_match = official_store
+        .as_ref()
+        .is_some_and(|identity| identity.origin == paths.extension_origin);
     json!({
         "ok": runtime_binary_ok && wrapper_ok && owned_count > 0,
         "implementation": "rust",
@@ -493,6 +575,9 @@ fn status(paths: &InstallPaths) -> Value {
         "extension_id": paths.extension_id,
         "extension_path": paths.extension_path,
         "extension_origin": paths.extension_origin,
+        "extension_identity_source": paths.extension_identity_source,
+        "official_store_extension_id": official_store_extension_id,
+        "store_origin_match": store_origin_match,
         "runtime_binary": paths.runtime_binary,
         "runtime_binary_ok": runtime_binary_ok,
         "runtime_matches_current": runtime_matches_current,
@@ -921,7 +1006,10 @@ fn validate_cohort_ownership(paths: &InstallPaths) -> Result<(), String> {
         let manifest_path = target.join(format!("{HOST_NAME}.json"));
         if path_present(&manifest_path) {
             let view = manifest_status(&manifest_path, paths);
-            if view.get("owned").and_then(Value::as_bool) != Some(true) {
+            let owned = view.get("owned").and_then(Value::as_bool) == Some(true)
+                || (paths.allow_origin_migration
+                    && manifest_structurally_owned(&manifest_path, paths));
+            if !owned {
                 return Err(format!(
                     "native-host manifest {} is foreign or unowned",
                     manifest_path.display()
@@ -1609,6 +1697,23 @@ fn extension_id_from_origin(origin: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
+fn explicit_extension_origin() -> Result<Option<String>, String> {
+    let Some(raw) = env::var_os("HERDR_EXTENSION_ORIGIN") else {
+        return Ok(None);
+    };
+    let origin = raw.to_string_lossy().trim().to_owned();
+    if origin.is_empty() {
+        return Ok(None);
+    }
+    if extension_id_from_origin(&origin).is_none() {
+        return Err(
+            "HERDR_EXTENSION_ORIGIN is not a valid chrome-extension://<id>/ origin".to_owned(),
+        );
+    }
+    Ok(Some(origin))
+}
+
+#[cfg(target_os = "macos")]
 fn wrapper_body(paths: &InstallPaths) -> String {
     format!(
         "#!/bin/sh\n{WRAPPER_MARKER}\nexport HERDR_EXTENSION_ORIGIN={}\nexec {} extension-host \"$@\"\n",
@@ -1664,6 +1769,35 @@ fn manifest_status(path: &Path, paths: &InstallPaths) -> Value {
         "rust_wrapper": rust_wrapper,
         "owned": owned,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn manifest_structurally_owned(path: &Path, paths: &InstallPaths) -> bool {
+    let Ok(raw) = fs::read(path) else {
+        return false;
+    };
+    if raw.len() > 64 * 1024 {
+        return false;
+    }
+    let Ok(manifest) = serde_json::from_slice::<Value>(&raw) else {
+        return false;
+    };
+    let one_valid_origin = manifest
+        .get("allowed_origins")
+        .and_then(Value::as_array)
+        .is_some_and(|origins| {
+            origins.len() == 1
+                && origins
+                    .first()
+                    .and_then(Value::as_str)
+                    .and_then(extension_id_from_origin)
+                    .is_some()
+        });
+    wrapper_is_rust(&paths.wrapper)
+        && manifest.get("name").and_then(Value::as_str) == Some(HOST_NAME)
+        && manifest.get("type").and_then(Value::as_str) == Some("stdio")
+        && manifest.get("path").and_then(Value::as_str) == paths.wrapper.to_str()
+        && one_valid_origin
 }
 
 #[cfg(target_os = "macos")]
@@ -1931,6 +2065,56 @@ mod tests {
         assert!(!stable_manifest.exists());
         assert!(!paths.wrapper.exists());
         assert!(!paths.runtime_binary.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owned_unpacked_origin_migrates_transactionally_to_store_origin_and_rolls_back() {
+        let (root, dev_paths) = fixture();
+        install(&dev_paths).unwrap();
+        let old_origin = dev_paths.extension_origin.clone();
+        let old_wrapper = fs::read_to_string(&dev_paths.wrapper).unwrap();
+        let stable_manifest = dev_paths.targets[0].0.join(format!("{HOST_NAME}.json"));
+        let old_manifest = fs::read(&stable_manifest).unwrap();
+
+        let store = crate::browser_extension_identity::official_store_identity().unwrap();
+        assert_ne!(store.origin, old_origin);
+        let native_dir = dev_paths.runtime_binary.parent().unwrap().to_path_buf();
+        let layout = NativeHostLayout {
+            source_binary: dev_paths.source_binary.clone(),
+            native_dir,
+            wrapper: dev_paths.wrapper.clone(),
+            targets: dev_paths.targets.clone(),
+        };
+        let store_paths = InstallPaths::for_origin(
+            &store.origin,
+            None,
+            "chrome_web_store_contract",
+            true,
+            layout,
+        )
+        .unwrap();
+
+        let migrated = install(&store_paths).unwrap();
+        assert_eq!(migrated["ok"], true);
+        assert_eq!(migrated["extension_origin"], store.origin);
+        assert_eq!(
+            migrated["extension_identity_source"],
+            "chrome_web_store_contract"
+        );
+        let migrated_manifest: Value =
+            serde_json::from_slice(&fs::read(&stable_manifest).unwrap()).unwrap();
+        assert_eq!(migrated_manifest["allowed_origins"], json!([store.origin]));
+        assert!(
+            fs::read_to_string(&store_paths.wrapper)
+                .unwrap()
+                .contains(&store.origin)
+        );
+
+        let rolled_back = rollback(&store_paths).unwrap();
+        assert_eq!(rolled_back["ok"], true);
+        assert_eq!(fs::read_to_string(&dev_paths.wrapper).unwrap(), old_wrapper);
+        assert_eq!(fs::read(&stable_manifest).unwrap(), old_manifest);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2537,35 +2721,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    fn with_isolated_home_env<F>(home: &Path, config_dir: &Path, run: F)
-    where
-        F: FnOnce(),
-    {
-        let previous_home = env::var_os("HOME");
-        let previous_config = env::var_os("HERDR_MCP_CONFIG_DIR");
-        let previous_instance = env::var_os("HERDR_MCP_INSTANCE");
-        unsafe {
-            env::set_var("HOME", home);
-            env::set_var("HERDR_MCP_CONFIG_DIR", config_dir);
-            env::remove_var("HERDR_MCP_INSTANCE");
-        }
-        run();
-        unsafe {
-            match previous_home {
-                Some(value) => env::set_var("HOME", value),
-                None => env::remove_var("HOME"),
-            }
-            match previous_config {
-                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
-                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
-            }
-            match previous_instance {
-                Some(value) => env::set_var("HERDR_MCP_INSTANCE", value),
-                None => env::remove_var("HERDR_MCP_INSTANCE"),
-            }
-        }
-    }
-
     fn write_managed_active_runtime(config_dir: &Path, bytes: &[u8]) -> PathBuf {
         let generation_dir = config_dir
             .join("runtime")
@@ -2592,30 +2747,28 @@ mod tests {
         let config_dir = home.join(".config").join("herdr-mcp");
         let active_binary = write_managed_active_runtime(&config_dir, b"active-runtime-binary-v2");
 
-        with_isolated_home_env(&home, &config_dir, || {
-            install(&paths).unwrap();
-            assert_ne!(
-                fs::read(&paths.runtime_binary).unwrap(),
-                fs::read(&active_binary).unwrap()
-            );
-            let before = status(&paths);
-            assert_eq!(before["runtime_matches_current"], false);
-            assert_eq!(before["stale_runtime"], true);
+        install(&paths).unwrap();
+        assert_ne!(
+            fs::read(&paths.runtime_binary).unwrap(),
+            fs::read(&active_binary).unwrap()
+        );
+        let before = status_with_active_runtime(&paths, Some(&active_binary));
+        assert_eq!(before["runtime_matches_current"], false);
+        assert_eq!(before["stale_runtime"], true);
 
-            let synced = super::sync_owned_runtime_from_active().unwrap();
-            assert_eq!(synced["synced"], true);
-            assert_eq!(
-                fs::read(&paths.runtime_binary).unwrap(),
-                fs::read(&active_binary).unwrap()
-            );
-            let after = status(&paths);
-            assert_eq!(after["runtime_matches_current"], true);
-            assert_eq!(after["stale_runtime"], false);
+        let synced = sync_owned_runtime_with_active(&paths, &active_binary).unwrap();
+        assert_eq!(synced["synced"], true);
+        assert_eq!(
+            fs::read(&paths.runtime_binary).unwrap(),
+            fs::read(&active_binary).unwrap()
+        );
+        let after = status_with_active_runtime(&paths, Some(&active_binary));
+        assert_eq!(after["runtime_matches_current"], true);
+        assert_eq!(after["stale_runtime"], false);
 
-            let again = super::sync_owned_runtime_from_active().unwrap();
-            assert_eq!(again["skipped"], true);
-            assert_eq!(again["reason"], "already_current");
-        });
+        let again = sync_owned_runtime_with_active(&paths, &active_binary).unwrap();
+        assert_eq!(again["skipped"], true);
+        assert_eq!(again["reason"], "already_current");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2625,14 +2778,11 @@ mod tests {
         let (root, paths) = fixture();
         let home = root.join("home");
         let config_dir = home.join(".config").join("herdr-mcp");
-        write_managed_active_runtime(&config_dir, b"active-runtime-binary-v2");
-
-        with_isolated_home_env(&home, &config_dir, || {
-            let skipped = super::sync_owned_runtime_from_active().unwrap();
-            assert_eq!(skipped["skipped"], true);
-            assert_eq!(skipped["reason"], "native_host_not_owned");
-            assert!(!paths.runtime_binary.exists());
-        });
+        let active_binary = write_managed_active_runtime(&config_dir, b"active-runtime-binary-v2");
+        let skipped = sync_owned_runtime_with_active(&paths, &active_binary).unwrap();
+        assert_eq!(skipped["skipped"], true);
+        assert_eq!(skipped["reason"], "native_host_not_owned");
+        assert!(!paths.runtime_binary.exists());
 
         fs::remove_dir_all(root).unwrap();
     }

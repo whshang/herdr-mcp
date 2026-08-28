@@ -143,7 +143,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 1. 打开 <https://chromewebstore.google.com/>；
 2. 搜索 `Herdr`，选择 Herdr 官方扩展；
 3. 点击 **添加至 Chrome / Add to Chrome**；
-4. Chrome Web Store listing 尚未正式上线时，直接跳过扩展，不回退到开发者模式安装；
+4. Chrome Web Store listing 尚未正式上线时，直接跳过扩展，不改用本地开发版；
 5. 安装完成后运行：
 
 ```bash

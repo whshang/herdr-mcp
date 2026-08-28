@@ -115,17 +115,14 @@ herdr-mcp doctor
 
 Do not recreate a repo-linked `~/.local/bin/herdr-mcp` bridge. Do not point LaunchAgent at a git checkout or `target/*/herdr-mcp`.
 
-Browser extension / Native Messaging remains optional and is not required for the first ChatGPT closed loop. If the human asks for continuity later, after `herdr-mcp doctor` is healthy:
+Browser extension / Native Messaging remains optional and is not required for the first ChatGPT closed loop. If the human asks for continuity later, install the official **Herdr** extension from the Chrome Web Store. If the Store listing is not live yet, skip this optional step rather than using a local development build. After `herdr-mcp doctor` is healthy and the Store extension is installed:
 
 ```bash
 herdr-mcp native-host install
 herdr-mcp native-host status
-# compatibility wrappers still accepted where published:
-bin/herdr-extension-host install
-bin/herdr-extension-host status
 ```
 
-Then guide Chrome: open `chrome://extensions`, enable Developer mode, **Load unpacked** only when following the sealed G15 package path or an explicitly requested developer session. Do not treat unpacking `extension/` from a random git checkout as the primary end-user path. See [Browser continuity](browser-continuity.md).
+See [Browser extension](extension.md) and [Browser continuity](browser-continuity.md).
 
 ## 8. macOS persistent Herdr Link
 

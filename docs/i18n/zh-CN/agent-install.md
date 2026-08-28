@@ -115,17 +115,14 @@ herdr-mcp doctor
 
 不要重建指向仓库的 `~/.local/bin/herdr-mcp` bridge。不要把 LaunchAgent 指到 git checkout 或 `target/*/herdr-mcp`。
 
-浏览器扩展 / Native Messaging 仍是可选项，不是第一条 ChatGPT 闭环的必需。若用户之后要连续性，在 `herdr-mcp doctor` 健康后：
+浏览器扩展 / Native Messaging 仍是可选项，不是第一条 ChatGPT 闭环的必需。若用户之后要连续性，只从 Chrome Web Store 安装官方 **Herdr** 扩展；Store listing 尚未上线时直接跳过，不改用本地开发版。`herdr-mcp doctor` 健康且商店扩展安装完成后：
 
 ```bash
 herdr-mcp native-host install
 herdr-mcp native-host status
-# 兼容包装仍可用时：
-bin/herdr-extension-host install
-bin/herdr-extension-host status
 ```
 
-再引导 Chrome：打开 `chrome://extensions`，开启开发者模式；仅在已封板的 G15 包路径或用户明确要求的开发者会话里 **Load unpacked**。不要把随便一个 git checkout 里的 `extension/` 当成最终用户主路径。详见 [浏览器连续性](browser-continuity.md)。
+详见 [浏览器扩展](extension.md) 与 [浏览器连续性](browser-continuity.md)。
 
 ## 8. macOS 持久 Herdr Link
 

@@ -55,10 +55,11 @@ test("maintainer install keeps deterministic Worker/bootstrap details while end-
     assert.match(doc, /WORKER_NAME/);
     assert.match(doc, /ACCOUNT_SUBDOMAIN/);
     assert.match(doc, /Cloudflare API/);
-    assert.match(doc, /chrome:\/\/extensions/);
+    assert.match(doc, /Chrome Web Store/);
+    assert.doesNotMatch(doc, /chrome:\/\/extensions|Load unpacked|herdr-mcp-extension/);
     assert.match(doc, /extension/);
-    assert.match(doc, /herdr-extension-host install/);
-    assert.match(doc, /herdr-extension-host status/);
+    assert.match(doc, /herdr-mcp native-host install/);
+    assert.match(doc, /herdr-mcp native-host status/);
     assert.match(doc, /Native Messaging/);
     assert.match(doc, /HERDR_MCP_TOKEN/);
   }
@@ -88,8 +89,9 @@ test("quick agent install guides automate Herdr/runtime and keep the extension S
     assert.match(doc, /HERDR_LINK_PROXY/);
     assert.match(doc, /Chrome Web Store/);
     assert.doesNotMatch(doc, /herdr-mcp-extension/);
-    assert.match(doc, /Do \*\*not\*\* use `Load unpacked`|不使用 `Load unpacked`/);
+    assert.doesNotMatch(doc, /Load unpacked|chrome:\/\/extensions|~\/\.config\/herdr-mcp\/extension/);
     assert.doesNotMatch(doc, /cp -R extension|ln -s .*extension/);
+    assert.match(doc, /local development build|本地开发版/);
     assert.match(doc, /herdr-edge-device\.username\.workers\.dev\/mcp/);
     assert.match(doc, /herdr-mcp\.example\.com\/mcp/);
     assert.match(doc, /workers\.dev/);

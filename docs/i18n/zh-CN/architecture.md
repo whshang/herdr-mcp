@@ -117,6 +117,33 @@ Herdr 本身拥有大量 Socket API 方法。herdr-mcp 没有把它们逐个包�
 
 `herdr_skill` 则给 Web planner 提供当前项目策略和与运行版本匹配的 Herdr 使用指导。
 
+## Progressive Skills 与 Capability Truth
+
+epoch 2 的 18-tool catalog 保持不变，但 planner policy 不必永远加载成一份巨大的 Skill 文本。Rust runtime 已内置 compact global `AGENTS.md` 和 7 个按需模块：workstation control、files search、files mutation、Git、execution、agent dispatch、development orchestration。内部 `herdr_mcp.skill.list/describe/load` 仍通过现有 `herdr_call` 进入，不增加第 19 个公共 MCP tool。
+
+模块化 Skill 和“Agent 到底会什么”是两个独立问题。系统不会因为一个进程叫 Pi、Claude、Codex 或 Grok，就直接认定它一定支持 code edit、vision、某个 provider/model 或某档 reasoning。能力事实由 `herdr-mcp scan` 建立：
+
+```text
+Herdr Agent manifest
+  + executable/version evidence
+  + bounded agent-specific probe
+  + Herdr live session state
+        ↓
+Capability Inventory
+        ↓
+Capability Resolver
+        ↓
+compact inspect / progressive summary
+        ↓
+safe dispatch decision
+```
+
+静态/半静态 evidence 使用独立 capability SQLite inventory，而不抬高 reliability state DB 的 schema。这样新版本增加 capability 字段后，旧 runtime 回滚时不会因为共享 state schema 过新而无法启动。binary identity、manifest version、probe adapter version 都参与 cache invalidation。status、cwd、project、pane、workspace、session 始终由 Herdr/EventCache 实时负责。
+
+unknown 的语义是**未验证**，不是 false，也不是“按经验应该支持”。probe 必须非交互、有超时、有输出上限、不继承凭据，只允许明确的 Agent 自描述 adapter 把字段升级为 verified。完整 probe evidence 留给诊断，模型可见的 Progressive bootstrap 只得到紧凑计数和已验证 worker trait。
+
+Modular Progressive Skills 已进入 Rust runtime，但通过 `HERDR_MCP_PROGRESSIVE_SKILLS` 保留兼容开关。在 capability-aware 多 Agent UAT 足以支持默认迁移之前，默认行为仍保持 legacy。
+
 ## 两条数据路径
 
 系统里有两类通信，理解它们可以解释为什么浏览器扩展和 MCP 都存在。

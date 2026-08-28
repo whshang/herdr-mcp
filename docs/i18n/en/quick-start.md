@@ -188,7 +188,7 @@ The agent's final prose is not the source of truth; the repository is.
 
 ## 9. Add the browser extension for long work
 
-Use the versioned extension asset from the same GitHub Release as the native runtime, extract it to the stable managed extension directory, and load that directory through `chrome://extensions` → **Load unpacked**. The full path is documented in [Browser extension](extension.md).
+Install the official **Herdr** extension from the Chrome Web Store. Runtime GitHub Releases do not distribute browser-extension installation packages. If the Store listing is not live yet, skip this optional step. See [Browser extension](extension.md).
 
 Then install the Native Messaging host:
 

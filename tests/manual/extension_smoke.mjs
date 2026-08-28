@@ -67,6 +67,7 @@ const chatGptAdapterSource = readFileSync(path.join(EXT, "content", "injector", 
 const queuedInsertCoreSource = readFileSync(path.join(EXT, "queued-insert-core.js"), "utf8");
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
+const rustNativeHostSource = readFileSync(path.join(EXT, "..", "crates", "herdr-mcp", "src", "native_host.rs"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
@@ -168,14 +169,15 @@ ok(
     && localAuthSource.includes('type: "stream"')
     && !localAuthSource.includes("expires_at")
     && !backgroundSource.includes("CFG.token")
-    && nativeHostSource.includes("extension.sock")
-    && nativeHostSource.includes('transport: "ipc"')
-    && nativeHostSource.includes("/extension/session")
-    && nativeHostSource.includes("allowed_origins")
-    && nativeHostSource.includes("chromiumIdForPath")
-    && nativeHostSource.includes("EXTENSION_PATH")
-    && nativeHostSource.includes('"Citro Labs", "ego lite", "NativeMessagingHosts"'),
-  "extension uses tokenless Native Messaging IPC and retains old-session server compatibility",
+    && nativeHostSource.includes("spawnSync")
+    && nativeHostSource.includes('"extension-host"')
+    && nativeHostSource.includes('"native-host"')
+    && !nativeHostSource.includes("chromiumIdForPath")
+    && !nativeHostSource.includes("allowed_origins")
+    && rustNativeHostSource.includes("extension.sock")
+    && rustNativeHostSource.includes('"transport": "ipc"')
+    && rustNativeHostSource.includes("proxy_path_not_allowed"),
+  "extension uses tokenless Native Messaging IPC with Rust as the sole host owner",
 );
 ok(
   jsonBridgeSource.includes("const ROUND_YIELD_INTERVAL = 12")

@@ -7,19 +7,19 @@ Status: **stable `v0.4.0` published** (2026-08-28). This file is the contributor
 | Plane | What ships | Version source | Consumer update path | Bound to runtime tag? |
 | --- | --- | --- | --- | --- |
 | **Runtime Release** | `herdr-mcp` Rust binary, `release-manifest.json`, platform SHA256 sidecars | `crates/herdr-mcp/Cargo.toml` → Git tag `v*` | `herdr-mcp update check/apply` on `stable` or `preview` channel | **Yes** — manifest drives updater |
-| **Browser Extension Release** | `herdr-mcp-extension-<version>.zip` on the same GitHub Release page | `extension/manifest.json` `version` | Manual load / future store; `native-host install` binds to active runtime | **No** — convenience bundle only |
+| **Browser Extension Release** | Chrome Web Store item | `extension/manifest.json` `version` | Chrome Web Store automatic update; `native-host install` binds the Store origin to the active runtime | **No** — independent Store lifecycle |
 | **Contract Compatibility** | MCP epoch, tool catalog, state schema, Edge OAuth/MCP surface | Code + release manifest fields | Edge deploy + Link + runtime generation together | **Coupled by epoch**, not by zip filename |
 
-**Critical rule:** the extension zip attached to a Runtime Release is a **distribution artifact**, not a lifecycle binding. Shipping extension `0.1.68` beside runtime `0.4.0` does **not** mean the updater upgrades the extension or that extension version must equal runtime version.
+**Critical rule:** Runtime GitHub Releases do **not** distribute the browser extension. The extension is a Chrome Web Store product with its own version and update cadence. Shipping extension `0.1.72` near runtime `0.4.1` does not create a semver or updater coupling between them.
 
-An extension-only change must **not** force a Rust runtime version bump. If an extension version needs distribution between runtime releases, use or add an extension-only release path (for example `extension-v*` / `extension-release.yml`) rather than creating `0.4.x` only to carry a zip.
+An extension-only change must **not** force a Rust runtime version bump. Maintainers may use `scripts/pack-extension.mjs` to build a deterministic Store-upload / explicit unpacked-UAT package, but that zip is not an end-user Runtime Release asset.
 
 ## Runtime Release (authoritative product version)
 
 - **Workflow:** `.github/workflows/rust-release.yml` on tag push `v*`.
 - **Verify gate:** Rust fmt/clippy/test, `npm` build/test/edge, extension smoke, site build, `git diff --check`.
 - **Build:** cross-target binaries per `.github/rust-release-targets.json`.
-- **Manifest:** `scripts/build-rust-release-manifest.mjs` — lists **platform binaries only** (extension zip deliberately excluded from manifest asset compare; see workflow `Verify immutable release identity`).
+- **Manifest:** `scripts/build-rust-release-manifest.mjs` — lists the complete Runtime Release binary set; the browser extension is not a Runtime Release asset.
 - **Publish:** GitHub Release; prerelease when tag contains `-` (e.g. `v0.4.0-alpha.19`, `v0.4.0-rc.1`); stable when tag is plain `v0.4.0`.
 - **Attestation:** `actions/attest` on release bundle.
 - **Recovery:** `.github/workflows/rust-release-recover.yml` for attested recovery publishes (fail-closed on identity mismatch).
@@ -37,8 +37,8 @@ Installed generations are content-addressed (`rust-<sha256-prefix>`). Update app
 
 ## Browser Extension Release
 
-- **Pack step:** `node scripts/pack-extension.mjs` inside `rust-release.yml` `manifest` job.
-- **Artifact name:** `herdr-mcp-extension-<extension-version>.zip` (+ sha256 sidecar).
+- **Store packaging:** maintainers run `node scripts/pack-extension.mjs` only for Chrome Web Store upload or explicit unpacked UAT.
+- **Runtime release boundary:** `.github/workflows/rust-release.yml` never attaches an extension zip.
 - **On GitHub Release:** uploaded alongside binaries for one-click download.
 - **Not in updater manifest:** extension is not selected by `update apply`; operators install/load separately and run `native-host install` against the **active runtime**.
 
@@ -47,7 +47,7 @@ Installed generations are content-addressed (`rust-<sha256-prefix>`). Update app
 | Artifact | Version | Notes |
 | --- | --- | --- |
 | Runtime binary | `0.4.0` | Updater + service |
-| Extension zip on Release | `0.1.68` | Bundled convenience; independent semver |
+| Chrome Web Store extension | `0.1.72` | Independent Store semver and update path |
 | Native Messaging host | Managed by runtime generation | `native-host status` must show `runtime_matches_current=true` |
 
 ## Contract Compatibility (shared public surface)

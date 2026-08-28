@@ -4,13 +4,24 @@ pub enum Command {
     Version,
     Status,
     Doctor,
+    Scan {
+        json: bool,
+        refresh: bool,
+        probe: bool,
+    },
     Config(ConfigCommand),
-    Dev { dry_run: bool },
-    Candidate { port: u16 },
+    Dev {
+        dry_run: bool,
+    },
+    Candidate {
+        port: u16,
+    },
     Service(ServiceCommand),
     Update(UpdateCommand),
     NativeHost(NativeHostCommand),
-    ExtensionHost { caller_origin: String },
+    ExtensionHost {
+        caller_origin: String,
+    },
     Link(LinkCommand),
 }
 
@@ -145,6 +156,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         ),
         "status" => no_extra(args, Command::Status),
         "doctor" => no_extra(args, Command::Doctor),
+        "scan" => parse_scan(&args[1..]),
         "rollback" => no_extra(args, Command::Service(ServiceCommand::Rollback)),
         "uninstall" => no_extra(args, Command::Service(ServiceCommand::Uninstall)),
         "config" => parse_config(&args[1..]),
@@ -315,6 +327,32 @@ fn no_extra(args: &[String], command: Command) -> Result<Command, String> {
     }
 }
 
+fn parse_scan(args: &[String]) -> Result<Command, String> {
+    let mut json = false;
+    let mut refresh = false;
+    let mut probe = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" if !json => json = true,
+            "--refresh" if !refresh => refresh = true,
+            "--probe" if !probe => probe = true,
+            "--json" | "--refresh" | "--probe" => {
+                return Err(format!("duplicate scan argument '{arg}'"));
+            }
+            value => {
+                return Err(format!(
+                    "unknown scan argument '{value}' (expected --json, --refresh, or --probe)"
+                ));
+            }
+        }
+    }
+    Ok(Command::Scan {
+        json,
+        refresh,
+        probe,
+    })
+}
+
 fn parse_dev(args: &[String]) -> Result<Command, String> {
     let mut dry_run = false;
     for arg in args {
@@ -473,6 +511,7 @@ User path:\n\
   herdr-mcp install\n\
   herdr-mcp status\n\
   herdr-mcp doctor\n\
+  herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|status]\n\
   herdr-mcp rollback\n\
   herdr-mcp uninstall\n\n\
@@ -496,7 +535,7 @@ Advanced / internal:\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\
   herdr-mcp dev [--dry-run]\n\
   herdr-mcp candidate [--port 8873]\n\n\
-Prefer the top-level install/status/doctor/update/rollback/uninstall commands\n\
+Prefer the top-level install/status/doctor/scan/update/rollback/uninstall commands\n\
 for normal lifecycle. Use service ... only for advanced service control\n\
 (for example service install --adopt-node). link status is read-only G5\n\
 ownership/gates reporting. link run starts a foreground Rust Link candidate\n\
@@ -533,6 +572,14 @@ mod tests {
         );
         assert_eq!(parse(args(&["status"])).unwrap().command, Command::Status);
         assert_eq!(parse(args(&["doctor"])).unwrap().command, Command::Doctor);
+        assert_eq!(
+            parse(args(&["scan", "--json", "--probe"])).unwrap().command,
+            Command::Scan {
+                json: true,
+                refresh: false,
+                probe: true
+            }
+        );
         assert_eq!(
             parse(args(&["rollback"])).unwrap().command,
             Command::Service(ServiceCommand::Rollback)
@@ -734,6 +781,8 @@ mod tests {
         assert!(parse(args(&["link", "status", "extra"])).is_err());
         assert!(parse(args(&["extension-host", "https://example.com/"])).is_err());
         assert!(parse(args(&["status", "extra"])).is_err());
+        assert!(parse(args(&["scan", "--force"])).is_err());
+        assert!(parse(args(&["scan", "--json", "--json"])).is_err());
         assert!(parse(args(&["unknown"])).is_err());
     }
 
@@ -765,6 +814,7 @@ mod tests {
             "herdr-mcp install",
             "herdr-mcp status",
             "herdr-mcp doctor",
+            "herdr-mcp scan",
             "herdr-mcp update",
             "herdr-mcp rollback",
             "herdr-mcp uninstall",

@@ -74,6 +74,32 @@ G5 Link production ownership **已 PASS**，不再是当前任务。**G18 第二
 - 18 tools parity；
 - runtime state 不替代 live state。
 
+### Modular Progressive Skills / Capability Scan
+
+状态：Progressive implementation 已随 `v0.4.0-alpha.16` 进入 production binary；默认仍 OFF。Capability Scan / Resolver 本轮补齐。
+
+冻结边界：
+
+- public MCP 继续 epoch 2 / 18 tools，不增加第 19 个 tool；
+- `herdr_mcp.skill.list/describe/load` 只走现有 `herdr_call` local namespace；
+- giant policy 拆为 global `AGENTS.md` + 7 个 on-demand Skill；
+- `HERDR_MCP_PROGRESSIVE_SKILLS` 在真实多 Agent UAT 前保持兼容默认；
+- unknown capability 永远不按 Agent 名称猜测。
+
+Capability truth：
+
+```text
+Herdr manifest + binary/version + bounded safe probe + live Agent state
+    → capability inventory
+    → capability resolver
+    → inspect/progressive compact projection
+    → dispatch decision
+```
+
+持久化边界：capability inventory 使用独立 SQLite schema，不提升 shared reliability `state.db` schema，避免新版本写入 capability metadata 后让旧 runtime rollback 因“state schema too new”失效。live status/cwd/project/pane/workspace/session 仍只认 Herdr/EventCache。
+
+生产迁移门禁：scan real smoke、resolver regression、capability-aware dispatch UAT、Progressive candidate ON A/B、CI/Grok audit 全 PASS 后，才评估 default ON；feature flag 是迁移/rollback gate，不应永久替代默认迁移决策。
+
 ### Batch A Performance
 
 状态：已完成，已验收。
@@ -465,7 +491,7 @@ Rust runtime 完成后删除本地 Node runtime。
 57. 该上行通道真实 smoke 已验证：trusted Unix socket 无 bearer 可读取 `/push/state`/`/push/events`，同一路由从 TCP 无 bearer 返回 401；SSE 首帧包含 `retry: 2000`、`event: hello`、`herdr-mcp-push/v1`，w77 的真实 worktree root 可在 state 与 hello 中一致恢复。该 checkpoint gate 为 Rust **125/125**、Node **321/321**、Edge **212/212**、双语站点 **21 篇/语言**，extension smoke 全通过。
 58. `1d79963 test: stabilize extension IPC stale-socket fixture` 修复 macOS Unix listener 刚关闭后短时间仍可能成功 `connect()` 的测试竞态：production `prepare_socket_path` 继续把可连接 socket 视为 live 并 fail-closed，测试等待内核确认 stale 后才验证替换；同时临时 socket 名加入高熵 nonce。该针对性测试已连续运行 20 次通过。
 59. `edd8c89 feat: add Rust Native Messaging host data plane` 新增 `herdr-mcp extension-host <chrome-extension://.../>`：实现 Chromium 4-byte little-endian Native Messaging framing，严格校验 caller origin、loopback HTTP base URL、既有 proxy path/method/header allowlist，并把 `request` / persistent `stream` 直接转发到 mode-0600 Rust Unix IPC。browser bearer 不进入 host；`Authorization` 不在 forwarded-header allowlist；request/native frame/response 分别有 1 MiB / 1 MiB / 8 MiB 边界，普通 request 的连接与 response body 都受 timeout 约束。`stream` 使用 64 KiB base64 frame 持续转发 SSE，不缓存完整长连接。
-60. Rust Native Messaging host 当前只实现现代 extension 的 `request` / `stream` 数据面；旧 `session` 消息明确返回 `legacy_session_requires_compat_host`。现有 `bin/herdr-extension-host install/status` 与浏览器 manifest 仍保持 Node compatibility host，尚未切换 production host path，因此不会让旧 extension build 或仍运行 Node runtime 的安装失效。
+60. **历史阶段（pre-0.4.1）**：Rust Native Messaging host 起初只实现现代 extension 的 `request` / `stream` 数据面，Node `bin/herdr-extension-host` 仍拥有 path-derived ID 与 manifest 安装逻辑。该状态已被 0.4.1 取代：Native Messaging 由 Rust `herdr-mcp native-host ...` / `herdr-mcp extension-host` 单独拥有，兼容脚本仅委托 Rust，不再推导 extension ID 或写 manifest；production identity 来自 Chrome Web Store contract。
 61. 真实 native-framing smoke 已闭环：Rust candidate 在 `8892` 暴露 `/tmp/herdr-mcp-native-host-smoke/extension.sock` 后，Rust `extension-host` 以当前 unpacked extension 的路径派生 origin `chrome-extension://ciggfiookaelnpaaocdapmohgmaghgge/`，`request /push/state` 返回 `transport=ipc/status=200` 并恢复 w77 worktree root；`stream /push/events` 返回 `stream_open → stream_chunk`，chunk 内含 `event: hello` 与 `herdr-mcp-push/v1`。candidate 停止后 8892 与 socket 均清理。最新整仓 gate 为 Rust **130/130**、Node **321/321**、Edge **212/212**、双语站点 **21 篇/语言**，extension smoke 全通过。
 62. `a2438ec feat: add Rust Native Messaging host lifecycle` 新增 `herdr-mcp native-host install|status|uninstall` candidate 管理面。`install` 把当前 Rust 单二进制原子复制到稳定 `~/.config/herdr-mcp/native/herdr-mcp`，Chrome manifest 永远指向同目录稳定 wrapper `herdr-extension-host`；wrapper 只注入 exact extension origin 并执行 colocated Rust binary，不携带 bearer。native dir / binary / wrapper / manifest 分别收紧为 0700 / 0700 / 0700 / 0600，并拒绝 symlink target。
 63. Native Messaging 安装身份不进入 `state.db`：`status/uninstall` 优先从已注册、指向稳定 wrapper 的 Chromium manifest 恢复 exact origin，因此源码 worktree 不存在、`state.db` 损坏或 runtime generation 切换时仍可识别安装。多个已注册 manifest 若 origin 冲突则 fail-closed。`uninstall` 只有在 manifest 精确匹配 host/type/path/origin 且 wrapper 含 Rust ownership marker 时才删除；现有 Node compatibility wrapper、被篡改 manifest 与 symlink 均保留并报告非 owned，避免迁移工具误删当前生产桥。

@@ -1,9 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { rmSync } from "node:fs";
-import { createServer } from "node:http";
+import { mkdtemp, readFile, rm, writeFile, chmod } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,158 +9,64 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
 const hostPath = path.join(root, "bin", "herdr-extension-host");
-const extensionPath = path.join(root, "extension");
-const extensionId = [...createHash("sha256").update(Buffer.from(extensionPath)).digest("hex").slice(0, 32)]
-  .map((char) => "abcdefghijklmnop"[Number.parseInt(char, 16)])
-  .join("");
-const extensionOrigin = `chrome-extension://${extensionId}/`;
 
-function encodeNativeMessage(value) {
-  const body = Buffer.from(JSON.stringify(value), "utf8");
-  const header = Buffer.alloc(4);
-  header.writeUInt32LE(body.length, 0);
-  return Buffer.concat([header, body]);
-}
-
-function parseNativeFrames(buffer) {
-  const frames = [];
-  let offset = 0;
-  while (offset + 4 <= buffer.length) {
-    const size = buffer.readUInt32LE(offset);
-    offset += 4;
-    if (offset + size > buffer.length) break;
-    frames.push(JSON.parse(buffer.subarray(offset, offset + size).toString("utf8")));
-    offset += size;
-  }
-  return frames;
-}
-
-async function withIpcServer(handler, fn) {
-  const socketPath = path.join(os.tmpdir(), `herdr-native-host-${process.pid}-${Math.random().toString(16).slice(2)}.sock`);
-  const server = createServer(handler);
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(socketPath, resolve);
-  });
+async function withFakeRust(fn) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "herdr-extension-host-delegate-"));
+  const fake = path.join(dir, "herdr-mcp");
+  const capture = path.join(dir, "args.txt");
+  await writeFile(
+    fake,
+    `#!/bin/sh\nprintf '%s\\n' "$@" > "$HERDR_DELEGATE_CAPTURE"\n`,
+    "utf8",
+  );
+  await chmod(fake, 0o700);
   try {
-    return await fn(socketPath);
+    await fn({ fake, capture });
   } finally {
-    await new Promise((resolve) => server.close(() => resolve()));
-    try { rmSync(socketPath, { force: true }); } catch {}
+    await rm(dir, { recursive: true, force: true });
   }
 }
 
-async function runHost(socketPath, message) {
-  const child = spawn(process.execPath, [hostPath, extensionOrigin], {
+async function runCompat(args, fake, capture) {
+  const child = spawn(process.execPath, [hostPath, ...args], {
     env: {
       ...process.env,
-      HERDR_EXTENSION_IPC_SOCKET: socketPath,
-      HERDR_MCP_TOKEN: "",
+      HERDR_MCP_BIN: fake,
+      HERDR_DELEGATE_CAPTURE: capture,
     },
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe"],
   });
-  const stdout = [];
-  const stderr = [];
-  child.stdout.on("data", (chunk) => stdout.push(chunk));
-  child.stderr.on("data", (chunk) => stderr.push(chunk));
-  child.stdin.end(encodeNativeMessage(message));
-  const code = await new Promise((resolve) => child.once("exit", resolve));
-  assert.equal(code, 0, Buffer.concat(stderr).toString("utf8"));
-  return parseNativeFrames(Buffer.concat(stdout));
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const code = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", resolve);
+  });
+  assert.equal(code, 0, stderr);
+  return (await readFile(capture, "utf8")).trim().split("\n").filter(Boolean);
 }
 
-test("native host proxies request over tokenless Unix IPC", async () => {
-  await withIpcServer((req, res) => {
-    assert.equal(req.url, "/push/state");
-    assert.equal(req.headers.authorization, undefined);
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, transport: "socket" }));
-  }, async (socketPath) => {
-    const frames = await runHost(socketPath, {
-      type: "request",
-      base_url: "http://127.0.0.1:8772",
-      path: "/push/state",
-      method: "GET",
-      headers: { Authorization: "Bearer must-be-stripped" },
-    });
-    assert.equal(frames.length, 1);
-    assert.equal(frames[0].ok, true);
-    assert.equal(frames[0].transport, "ipc");
-    assert.equal(frames[0].status, 200);
-    assert.deepEqual(JSON.parse(frames[0].body), { ok: true, transport: "socket" });
+test("compat entrypoint delegates install/status lifecycle to Rust native-host", async () => {
+  await withFakeRust(async ({ fake, capture }) => {
+    assert.deepEqual(await runCompat(["install"], fake, capture), ["native-host", "install"]);
+    assert.deepEqual(await runCompat(["status"], fake, capture), ["native-host", "status"]);
+    assert.deepEqual(await runCompat(["rollback"], fake, capture), ["native-host", "rollback"]);
   });
 });
 
-test("native host allows the trusted browser control path over tokenless Unix IPC", async () => {
-  await withIpcServer((req, res) => {
-    assert.equal(req.url, "/extension/control/action");
-    assert.equal(req.method, "POST");
-    assert.equal(req.headers.authorization, undefined);
-    const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => {
-      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-      assert.equal(body.action, "steer");
-      assert.equal(body.target.target_revision, "btr1_test");
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: false, outcome: "session_not_resolved", delivery_phase: "not_submitted" }));
-    });
-  }, async (socketPath) => {
-    const frames = await runHost(socketPath, {
-      type: "request",
-      base_url: "http://127.0.0.1:8772",
-      path: "/extension/control/action",
-      method: "POST",
-      headers: { Authorization: "Bearer must-be-stripped", "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action: "steer",
-        target: { pane_id: "w1:p1", target_revision: "btr1_test" },
-        args: { text: "keep compatibility" },
-        idempotency_key: "browser-control:test",
-      }),
-    });
-    assert.equal(frames.length, 1);
-    assert.equal(frames[0].ok, true);
-    assert.equal(frames[0].transport, "ipc");
-    const body = JSON.parse(frames[0].body);
-    assert.equal(body.outcome, "session_not_resolved");
+test("compat entrypoint delegates Chrome invocation to Rust extension-host", async () => {
+  await withFakeRust(async ({ fake, capture }) => {
+    assert.deepEqual(await runCompat([], fake, capture), ["extension-host"]);
+    const origin = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/";
+    assert.deepEqual(await runCompat([origin], fake, capture), ["extension-host", origin]);
   });
 });
 
-test("native host carries SSE bytes over persistent tokenless Unix IPC", async () => {
-  await withIpcServer((req, res) => {
-    assert.equal(req.url, "/push/events");
-    assert.equal(req.headers.authorization, undefined);
-    res.writeHead(200, { "Content-Type": "text/event-stream" });
-    res.write("event: hello\ndata: {\"ok\":true}\n\n");
-    res.end();
-  }, async (socketPath) => {
-    const frames = await runHost(socketPath, {
-      type: "stream",
-      base_url: "http://127.0.0.1:8772",
-      path: "/push/events",
-    });
-    assert.equal(frames[0].type, "stream_open");
-    assert.equal(frames[0].transport, "ipc");
-    assert.equal(frames[0].status, 200);
-    const chunks = frames
-      .filter((frame) => frame.type === "stream_chunk")
-      .map((frame) => Buffer.from(frame.chunk_b64, "base64"));
-    assert.equal(Buffer.concat(chunks).toString("utf8"), "event: hello\ndata: {\"ok\":true}\n\n");
-    assert.equal(frames.at(-1).type, "stream_end");
-  });
-});
-
-test("native host refuses arbitrary loopback proxy paths", async () => {
-  await withIpcServer((_req, res) => res.end("unexpected"), async (socketPath) => {
-    const frames = await runHost(socketPath, {
-      type: "request",
-      base_url: "http://127.0.0.1:8772",
-      path: "/oauth/token",
-      method: "GET",
-    });
-    assert.equal(frames.length, 1);
-    assert.equal(frames[0].ok, false);
-    assert.equal(frames[0].error, "proxy_path_not_allowed");
-  });
+test("compat entrypoint contains no legacy extension identity or manifest owner", async () => {
+  const source = await readFile(hostPath, "utf8");
+  assert.match(source, /spawnSync/);
+  assert.match(source, /native-host/);
+  assert.match(source, /extension-host/);
+  assert.doesNotMatch(source, /chromiumIdForPath|EXTENSION_PATH|allowed_origins|NativeMessagingHosts|writeFileSync/);
 });

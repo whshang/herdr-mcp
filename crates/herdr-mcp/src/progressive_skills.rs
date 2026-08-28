@@ -1,5 +1,7 @@
 use crate::agent_visibility::AgentVisibility;
-use crate::skill_dispatch::project_capabilities;
+use crate::capability_inventory::CapabilityInventoryStore;
+use crate::capability_resolver::project_capabilities_with_inventory;
+use crate::paths::RuntimePaths;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeSet, HashMap};
@@ -513,7 +515,11 @@ fn load_evidence_json(evidence: &LoadEvidence) -> Value {
 
 fn capability_summary(snapshot: &Value) -> Value {
     let visibility = AgentVisibility::from_env();
-    let snapshot = project_capabilities(snapshot, &visibility);
+    let inventory = RuntimePaths::discover()
+        .ok()
+        .and_then(|paths| CapabilityInventoryStore::load_existing(&paths.config_dir).ok())
+        .unwrap_or_default();
+    let snapshot = project_capabilities_with_inventory(snapshot, &visibility, &inventory);
     let mut status_counts = Map::new();
     for worker in &snapshot.workers {
         let count = status_counts
@@ -522,13 +528,23 @@ fn capability_summary(snapshot: &Value) -> Value {
             .unwrap_or(0);
         status_counts.insert(worker.current_status.clone(), json!(count + 1));
     }
+    let verified = json!({
+        "provider_known": snapshot.workers.iter().filter(|worker| worker.provider.is_some()).count(),
+        "model_known": snapshot.workers.iter().filter(|worker| worker.model.is_some()).count(),
+        "code_edit": snapshot.workers.iter().filter(|worker| worker.supports_code_edit == Some(true)).count(),
+        "shell": snapshot.workers.iter().filter(|worker| worker.supports_shell == Some(true)).count(),
+        "vision": snapshot.workers.iter().filter(|worker| worker.supports_vision == Some(true)).count(),
+        "headless": snapshot.workers.iter().filter(|worker| worker.can_run_headless == Some(true)).count(),
+    });
     json!({
         "source": snapshot.source,
         "revision": snapshot.revision,
         "worker_count": snapshot.workers.len(),
         "hidden_workers": snapshot.hidden_workers,
         "status_counts": status_counts,
+        "verified_capabilities": verified,
         "detail_refresh": "herdr_inspect/herdr_since",
+        "capability_refresh": "herdr-mcp scan --probe",
         "unverified_traits": "unknown; never inferred",
     })
 }
@@ -772,12 +788,20 @@ mod tests {
             result["capability_snapshot"]["detail_refresh"],
             "herdr_inspect/herdr_since"
         );
+        assert_eq!(
+            result["capability_snapshot"]["capability_refresh"],
+            "herdr-mcp scan --probe"
+        );
+        assert_eq!(
+            result["capability_snapshot"]["verified_capabilities"]["code_edit"],
+            0
+        );
     }
 
     #[test]
     fn capability_projection_keeps_unverified_traits_unknown() {
         let visibility = AgentVisibility::Allow(["pi".to_owned()].into_iter().collect());
-        let result = project_capabilities(&snapshot(), &visibility);
+        let result = crate::capability_resolver::project_capabilities(&snapshot(), &visibility);
         let worker = &result.workers[0];
         assert_eq!(worker.kind.as_deref(), Some("pi"));
         assert!(worker.provider.is_none());
