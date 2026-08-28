@@ -4,7 +4,6 @@
 //! configuration. When no proxy is configured, callers connect directly.
 
 use std::io;
-use std::process::Command;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
