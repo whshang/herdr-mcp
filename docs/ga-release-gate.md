@@ -1,6 +1,6 @@
 # herdr-mcp GA Release Gate
 
-状态：`v0.4.0` stable 已发布（2026-08-28）；stable-channel G9/G10 PASS；**仍未达 GA**（G20–G22 docs freeze 等未清）
+状态：`v0.4.0` stable 已发布（2026-08-28）；stable-channel G9/G10 PASS；G20–G22 docs freeze PASS；**仍未达 GA**（G4 stable UAT、G1 dogfood apply 未清）
 本文件是 **GA 判定的唯一事实源（SSOT）**。架构演进细节见 [`herdr-architecture-roadmap.md`](./herdr-architecture-roadmap.md)。
 
 ## GA 定义
