@@ -47,7 +47,7 @@ Node.js is **not** required to run the local MCP runtime. You may still need Nod
 
 ## Step 1: install the native runtime (primary)
 
-Download the current `herdr-mcp` binary for your platform from [GitHub Releases](https://github.com/whshang/herdr-mcp/releases), place it on your `PATH` (for example `~/.local/bin/herdr-mcp`), and make it executable. Then run `herdr-mcp install`: the installer stages an immutable generation under `~/.config/herdr-mcp/runtime/` and retargets `~/.local/bin/herdr-mcp` to `runtime/current/herdr-mcp` so the PATH entry no longer depends on a git checkout.
+Download the current `herdr-mcp` binary for your platform from [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) (current stable: [`v0.4.0`](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0)), place it on your `PATH` (for example `~/.local/bin/herdr-mcp`), and make it executable. Then run `herdr-mcp install`: the installer stages an immutable generation under `~/.config/herdr-mcp/runtime/` and retargets `~/.local/bin/herdr-mcp` to `runtime/current/herdr-mcp` so the PATH entry no longer depends on a git checkout.
 
 ```bash
 herdr-mcp install
@@ -58,7 +58,7 @@ herdr-mcp update check   # bare `herdr-mcp update` is equivalent
 
 Prefer these top-level commands. Do **not** use `herdr-mcp service install` as the normal user install instruction; `service ...` remains advanced/internal. Do **not** clone this repository or run `npm`/`cargo` to install the local MCP runtime.
 
-While the product is still alpha, keep `update.channel = "preview"` (or leave config absent on an alpha binary) so discovery sees prerelease tags. The `stable` channel discovers non-prerelease releases only.
+The current stable release is **`v0.4.0`**. By default, `update.channel = "stable"` discovers non-prerelease releases only. Use `preview` only when you intentionally want prerelease tags (for example `0.4.0-rc.1` or older `0.4.0-alpha.x`).
 
 ## Step 2: validate the local runtime first
 

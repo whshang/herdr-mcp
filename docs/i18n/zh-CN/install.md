@@ -47,7 +47,7 @@ herdr api schema >/dev/null
 
 ## 第一步：安装原生 runtime（主路径）
 
-从 [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) 下载当前平台的 `herdr-mcp` 二进制，放到 `PATH`（例如 `~/.local/bin/herdr-mcp`）并赋予可执行权限。然后执行 `herdr-mcp install`：安装器会在 `~/.config/herdr-mcp/runtime/` 下写入不可变 generation，并把 `~/.local/bin/herdr-mcp` 重定向到 `runtime/current/herdr-mcp`，使 PATH 入口不再依赖 git checkout。
+从 [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) 下载当前平台的 `herdr-mcp` 二进制（当前 stable：[`v0.4.0`](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0)），放到 `PATH`（例如 `~/.local/bin/herdr-mcp`）并赋予可执行权限。然后执行 `herdr-mcp install`：安装器会在 `~/.config/herdr-mcp/runtime/` 下写入不可变 generation，并把 `~/.local/bin/herdr-mcp` 重定向到 `runtime/current/herdr-mcp`，使 PATH 入口不再依赖 git checkout。
 
 ```bash
 herdr-mcp install
@@ -58,7 +58,7 @@ herdr-mcp update check   # bare `herdr-mcp update` is equivalent
 
 优先使用以上顶层命令。**不要**把 `herdr-mcp service install` 写成普通用户安装主路径；`service ...` 仍是高级/内部接口。**不要**用 clone 仓库或 `npm`/`cargo` 安装本机 MCP runtime。
 
-产品仍处 alpha 时，保持 `update.channel = "preview"`（或在 alpha 二进制上不写 config），才能发现 prerelease；`stable` 只发现非 prerelease。
+当前 stable 版本为 **`v0.4.0`**。默认 `update.channel = "stable"` 只发现非 prerelease。仅在需要 prerelease（如 `0.4.0-rc.1` 或更早 `0.4.0-alpha.x`）时使用 `preview`。
 
 ## 第二步：先把本地 runtime 跑通
 

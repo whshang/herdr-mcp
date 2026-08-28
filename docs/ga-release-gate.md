@@ -293,10 +293,10 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 | ID | 评分 | 一行证据 |
 | --- | --- | --- |
-| G1 | **PARTIAL** | `v0.4.0` stable tag + Release 已统一；dogfood post-rollback 仍 `alpha.19`；用户文档仍含 alpha 术语 |
+| G1 | **PARTIAL** | `v0.4.0` stable tag + Release + user docs 已统一；dogfood post-rollback 仍 `alpha.19` |
 | G2 | **PASS** | stable tag-path publish 全绿（run `33157370273`）；manifest `source_commit=19fc6a4`；rc.1 run `33155520284` 仍有效 |
-| G3 | **PARTIAL** | 顶层 CLI + symlink → `runtime/current`；README/docs 仍写 alpha 安装指引 |
-| G4 | **PARTIAL** | 第二台 Mac + dogfood install/doctor 已封；从 stable Release 干净安装 UAT 未封 |
+| G3 | **PASS** | 顶层 CLI + symlink → `runtime/current`；README/install 已对齐 `v0.4.0` stable |
+| G4 | **PARTIAL** | 第二台 Mac + dogfood install/doctor 已封；从 **`v0.4.0` stable Release** 干净安装 UAT 未封（G18 曾用 alpha.17） |
 | G5 | **PASS** | production owner=rust；link-prod Rust；`production_ready=true` |
 | G6 | **PASS** | dogfood 公网 OAuth+tools/list 18/18+mutation+long-exec 已封（2026-08-28）；+ 第二台 Mac tools/call |
 | G7 | **PASS** | dogfood 公网 Edge→Link→runtime 全矩阵已封；soak/failover 未做（非 veto） |
@@ -312,14 +312,14 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G17 | **PARTIAL** | 公网路径已走通（dogfood + 第二台 Mac）；完整安全矩阵未全封 |
 | G18 | **PASS** | 第二台 Mac clean install + public MCP loop |
 | G19 | **PARTIAL** | 第二台 Mac Apple Silicon UAT 已封；Windows/Linux 未宣称 |
-| G20 | **PARTIAL** | 用户文档仍有 alpha 术语；stable 封板未做 |
-| G21 | **PARTIAL** | 站点 CI 可绿；无 stable tag 封板 |
-| G22 | **PARTIAL** | docs PASS（#104）；第二台 Mac 实证已封；stable 文档封板未做 |
-| G23 | **PARTIAL** | main CI 可绿；rc.1 tag-path Rust Release 全绿（`33155520284`）；#138+#139 merged |
-| G24 | **FAIL** | 剩余 blocker：G1 口径统一、G20–G22 docs freeze、G4 stable clean install UAT |
-| G25 | **FAIL** | 未达 GA：veto #8（docs 宣称 vs 现实）与 G20–G22 未清 |
+| G20 | **PASS** | README/install/quick-agent-install 已对齐 `v0.4.0` stable；用户路径无 alpha/candidate 主术语 |
+| G21 | **PASS** | 站点 CI 可绿；`v0.4.0` stable tag 已打；docs freeze 完成 |
+| G22 | **PASS** | 用户安装主路径不依赖开发仓库；第二台 Mac 实证已封 |
+| G23 | **PARTIAL** | main CI 可绿；stable tag-path Rust Release 全绿（`33157370273`）；#142 merged |
+| G24 | **PARTIAL** | 剩余 blocker：G4 stable clean install UAT、G1 dogfood 可选 stable apply |
+| G25 | **PARTIAL** | G4 UAT 未封；dogfood 仍 `alpha.19`；veto #8 待 G4 封板 |
 
-**合计（诚实快照）**：PASS 9 · PARTIAL 12 · FAIL 2 · DEFERRED 1 · UNKNOWN 0
+**合计（诚实快照）**：PASS 12 · PARTIAL 9 · FAIL 0 · DEFERRED 1 · UNKNOWN 0
 
 ### G6/G7 dogfood public evidence（2026-08-28 · alpha.19 · PASS）
 
@@ -523,14 +523,13 @@ herdr-mcp --instance uat uninstall
 
 ## Current P0 work queue
 
-按 2026-08-28 GA freeze（`v0.4.0` stable published；stable-channel G9/G10 PASS）排序：
+按 2026-08-28 GA freeze（`v0.4.0` stable published；stable-channel G9/G10 PASS；G20–G22 docs freeze DONE）排序：
 
-1. **G20–G22 — stable docs freeze**（用户路径去除 alpha/candidate 术语；README/install 对齐 `0.4.0` stable）。
-2. **G1 — 退出 alpha 口径**（dogfood 可择机 stable apply 留驻 `0.4.0`；文档/CLI 只呈现 stable 产品版本）。
-3. **G4 — stable Release 干净安装 UAT**（第二台 Mac 从 `v0.4.0` Release 二进制，非 alpha.17）。
-4. **G16 — 保持 DEFERRED**（browser terminal / true-steer 不进第一 GA）。
+1. **G4 — stable Release 干净安装 UAT**（第二台 Mac 从 [`v0.4.0` Release](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0) 二进制；见 [clean-machine-uat](i18n/en/clean-machine-uat.md)）。
+2. **G1 — 退出 alpha 口径**（G4 PASS 后 dogfood 可选 `update apply` 留驻 `0.4.0`）。
+3. **G16 — 保持 DEFERRED**（browser terminal / true-steer 不进第一 GA）。
 
-**已完成：** `v0.4.0` stable tag + tag-path PASS（#142）、preview `alpha.19↔rc.1` + stable `alpha.19↔0.4.0` update/rollback、G2/G6/G7/G18 历史 PASS。
+**已完成：** `v0.4.0` stable tag + tag-path PASS（#142）、preview `alpha.19↔rc.1` + stable `alpha.19↔0.4.0` update/rollback、G2/G6/G7/G9/G10/G12/G13/G18/G20/G21/G22。
 
 ### GA closure C — stable update/rollback rehearsal（2026-08-28 · PASS）
 

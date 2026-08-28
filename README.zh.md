@@ -75,7 +75,7 @@ Herdr 原生长尾能力
 
 ### 安装原生 runtime（主路径）
 
-1. 从 [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) 下载当前平台的 `herdr-mcp` 二进制（产品仍处 alpha 时会出现 prerelease 标签）。
+1. 从 [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) 下载当前平台的 `herdr-mcp` 二进制 — 当前 stable：[`v0.4.0`](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0)。
 2. 放到 `PATH` 上（例如 `~/.local/bin/herdr-mcp`）并赋予可执行权限。
 3. 安装托管本机服务并验证：
 
@@ -96,7 +96,7 @@ herdr-mcp rollback
 
 优先使用以上顶层命令。**不要**把 `herdr-mcp service install` 当成普通用户安装主路径；`service ...` 仍是高级/内部接口。**不要**用 clone 仓库或 `npm`/`cargo` 安装本机 MCP runtime。
 
-产品仍处 alpha 时，保持 `update.channel = "preview"`（或在 alpha 二进制上不写 config），才能发现 prerelease；`stable` 只发现非 prerelease。
+当前 stable 版本为 **`v0.4.0`**。默认 `update.channel = "stable"` 只发现非 prerelease。仅在需要 prerelease 时使用 `preview`。
 
 加 Edge 之前先确认 Herdr：
 
