@@ -1,241 +1,181 @@
-# Installation: from a Herdr workstation to a usable Web AI development environment
+# Installation: from one Herdr workstation to usable Web AI development
 
-This guide installs the complete path, not just a local process:
+> **Recommended for normal users:** do not copy commands from this page one by one. Give the one-line prompt in [Quick agent install](quick-agent-install.md) to Cursor / Codex / Claude Code or another local coding agent. It installs Herdr, herdr-mcp, Edge, and Link, and pauses only for Cloudflare and ChatGPT steps that require the human. This page remains the manual-install and troubleshooting reference.
 
-```text
-ChatGPT
-  ↓ OAuth + MCP
-Cloudflare Edge
-  ↓ authenticated WSS
-herdr-link / herdr-mcp
-  ↓
-Herdr + managed Git projects
-```
-
-For the shortest path, start with [Quick Start](quick-start.md). To let a local coding agent perform most setup work, paste the one-liner from [Quick agent install](quick-agent-install.md); the detailed contract is [Agent-assisted installation](agent-install.md).
-
-**Regular user path:** GitHub Release binary → `herdr-mcp install` → `herdr-mcp doctor` (Edge may already be provisioned, or follow agent-install §6). **Second Mac GA UAT** (maintainers only) — archived protocol in [`history/ga/second-mac-ga-uat-agent-prompt-en.md`](../../history/ga/second-mac-ga-uat-agent-prompt-en.md); see [clean-machine-uat](clean-machine-uat.md).
+The goal is to connect a local workstation to ChatGPT / Web AI while keeping source code and real execution on the workstation.
 
 ## Before installation
 
-### 1. Herdr is already working
-
-herdr-mcp builds on Herdr and does not install or replace it.
+### 1. Herdr must be available
 
 ```bash
 herdr --version
 herdr api schema >/dev/null
 ```
 
-If this fails, fix Herdr first using the [official installation guide](https://herdr.dev/docs/install/).
+If Herdr is missing, use the official stable installer.
 
-### 2. Know which client path you need
+macOS / Linux:
 
-- **ChatGPT** requires a stable public Edge and OAuth.
-- **Local Cursor / curl** can connect directly to `127.0.0.1`.
-- **z.ai / DeepSeek browser bridge** uses the extension and Native Messaging on the local machine.
+```bash
+curl -fsSL https://herdr.dev/install.sh | sh
+```
 
-This guide follows the ChatGPT path because it covers the complete architecture.
+Windows:
 
-Node.js is **not** required to run the local MCP runtime. You may still need Node temporarily when deploying the Cloudflare Worker (`npx wrangler`). Building the browser extension from source is an advanced/developer path, not the primary install.
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
+```
 
-## Supported platforms (first GA recommendation)
+Then run `herdr --version` again. Herdr's own install behavior is authoritative at <https://herdr.dev/docs/install/>.
 
-- **Officially supported for first GA:** macOS Apple Silicon (managed install / service / update / rollback).
-- **Preview artifact:** Windows x64 may still be published as a Release asset; do not claim full managed lifecycle parity until G19 seals it.
-- **Not claimed for first GA:** Linux service lifecycle. Presence of a Linux binary in CI matrices does not make Linux a GA platform.
+### 2. Decide which client path you need
 
-## Step 1: install the native runtime (primary)
+- ChatGPT / another public Web AI → Cloudflare Edge + outbound Herdr Link;
+- local MCP clients only → loopback runtime can be used without Cloudflare;
+- browser extension → optional after the base Connector works, not a first-install prerequisite.
 
-Download the current `herdr-mcp` binary for your platform from [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) (current stable: [`v0.4.0`](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0)), place it on your `PATH` (for example `~/.local/bin/herdr-mcp`), and make it executable. Then run `herdr-mcp install`: the installer stages an immutable generation under `~/.config/herdr-mcp/runtime/` and retargets `~/.local/bin/herdr-mcp` to `runtime/current/herdr-mcp` so the PATH entry no longer depends on a git checkout.
+## Supported platform boundary
+
+The strongest `v0.4.0` clean-machine evidence is on **macOS Apple Silicon**. A Windows x64 release binary is available, while Windows end-to-end UAT is still being completed. Linux is not yet claimed as a supported `v0.4.0` herdr-mcp runtime surface.
+
+## Step 1: install the native herdr-mcp runtime
+
+Download the newest stable `herdr-mcp` binary for this platform from <https://github.com/whshang/herdr-mcp/releases>, put it on `PATH`, then run:
 
 ```bash
 herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
-herdr-mcp update check   # bare `herdr-mcp update` is equivalent
+herdr-mcp update check
 ```
 
-Prefer these top-level commands. Do **not** use `herdr-mcp service install` as the normal user install instruction; `service ...` remains advanced/internal. Do **not** clone this repository or run `npm`/`cargo` to install the local MCP runtime.
+`install` stages an immutable generation under `~/.config/herdr-mcp/runtime/` and points the user PATH entry at `runtime/current/herdr-mcp`. Normal users do not install the local runtime with a git clone, `npm`, or `cargo`.
 
-The current stable release is **`v0.4.0`**. By default, `update.channel = "stable"` discovers non-prerelease releases only. Use `preview` only when you intentionally want prerelease tags (for example `0.4.0-rc.1` or older `0.4.0-alpha.x`).
+## Step 2: make the local runtime healthy first
 
-## Step 2: validate the local runtime first
-
-The managed runtime listens on `127.0.0.1:8772` by default. After the binary is installed and the local service is healthy:
+At minimum verify:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
+herdr-mcp doctor
+herdr-mcp status
 ```
 
-`200` or `401` both prove that the HTTP service exists. `401` means it is asking for the local bearer.
+Do not add public Edge while the local doctor is unhealthy. Fix the local runtime / Herdr layer first.
 
-The runtime must also reach the Herdr socket. After connecting, `herdr_inspect` should report real workspaces, panes and managed roots.
+## Step 3: deploy the public Edge
 
-Day-to-day upgrades (`herdr-mcp update` is equivalent to `update check`; when a newer release exists the JSON includes `next_action`):
+When ChatGPT needs to reach the workstation over the Internet, use a Cloudflare Worker as the stable OAuth/MCP entry point. Prefer `workers.dev` for the first setup unless a custom domain is an explicit requirement.
 
-```bash
-herdr-mcp update          # same as update check
-herdr-mcp update apply
-herdr-mcp update status
-```
+The recommended route is to let a coding agent follow [Quick agent install](quick-agent-install.md), because that protocol owns Token scoping, Worker naming, secret injection, account choice, and proxy handling.
 
-## Step 3: keep the runtime alive
+For a manual deployment, keep these constraints:
 
-On macOS, the native binary owns the managed LaunchAgent lifecycle once installed. Use `herdr-mcp status` / `herdr-mcp doctor` for health, and `herdr-mcp update ...` for upgrades. Avoid pointing launchd at a git checkout or `target/*/herdr-mcp`.
-
-Linux / Windows service packaging is narrower today. First-GA recommendation: officially support macOS Apple Silicon only; treat a published Windows binary as preview until G19 seals it. Do not advertise an unsupported Linux lifecycle. Keep the release binary on `PATH` and follow platform-specific notes in the current Release assets.
-
-## Step 4: deploy a stable public Edge
-
-ChatGPT cannot reach your loopback address. The recommended design uses Cloudflare Worker / Durable Object as the public endpoint while the workstation creates an outbound authenticated WSS connection.
-
-Use `workers.dev` for the first deployment. It requires no custom domain and keeps DNS out of initial debugging.
-
-### Generate a Worker name
+- Cloudflare API Token is an ephemeral process value, not a repository or log value;
+- default to `workers_dev = true` and `routes = []`;
+- derive the Worker name using the repository helper:
 
 ```bash
 WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
-printf '%s\n' "$WORKER_NAME"
 ```
 
-A Worker name is a DNS label. A hostname such as `MacBook.local` should not be copied verbatim; the helper normalizes it.
+- keep `LINK_SHARED_SECRET` as a Worker secret;
+- the workstation makes outbound authenticated WSS and does not expose a public local port.
 
-### Prepare Wrangler configuration
+See [Agent-assisted installation](agent-install.md) and [Cloudflare Edge deployment](cloudflare-edge-deployment.md) for the detailed manual contract.
+
+## Step 4: install and verify the Herdr Link
 
 ```bash
-cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
+herdr-mcp link install
+herdr-mcp link status
 ```
 
-Fill in the template fields for:
+If `workers.dev` is unreachable from the workstation network, prefer existing proxy configuration:
 
-- Worker name;
-- workstation identity;
-- `OAUTH_ISSUER` / public origin;
-- other deployment values required by the template.
+```text
+HERDR_LINK_PROXY
+HTTPS_PROXY / https_proxy
+HTTP_PROXY / http_proxy
+ALL_PROXY / all_proxy
+```
 
-Deploy:
+On macOS, Link can also read `scutil --proxy`. Do not expand a connectivity problem into DNS / custom-domain changes before checking the proxy path.
+
+## Step 5: verify the public path
 
 ```bash
-cd edge/cloudflare
-npx wrangler deploy --config wrangler.user.toml
+herdr-mcp doctor
+herdr-mcp link status
+curl -fsS "${EDGE_ORIGIN}/health"
+curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 ```
 
-The public origin looks like:
+An unauthenticated `/mcp` response of `401` can be correct. The useful checks are: local runtime healthy, Link connected, Edge `/health` reachable, and OAuth metadata reachable.
+
+## Step 6: add the herdr Connector in ChatGPT
+
+This is a human step. The coding agent should pause and guide the user:
+
+1. open ChatGPT settings → Apps / Connectors;
+2. enable Developer mode when the current UI requires it;
+3. add a custom MCP Connector named `herdr`;
+4. enter the deployed `${MCP_URL}` ending in `/mcp`;
+5. complete OAuth in the browser;
+6. enable the Connector in a new conversation or Project.
+
+Then do a read-only test:
 
 ```text
-https://herdr-edge-xxx.<account-subdomain>.workers.dev
+Inspect my Herdr projects. Read only; do not modify anything.
 ```
 
-The MCP endpoint is:
+If `herdr_inspect` returns real workstation data, the base loop is usable.
 
-```text
-https://herdr-edge-xxx.<account-subdomain>.workers.dev/mcp
+See [ChatGPT Connector](chatgpt-connector.md).
+
+## Step 7: add the browser extension only when continuity is needed
+
+The browser extension adds Side Panel Control Center, workspace binding, long-conversation continuity, and queued next-turn messages. It is not required for the base MCP loop.
+
+End users install only from the **Chrome Web Store**:
+
+1. open <https://chromewebstore.google.com/>;
+2. search for `Herdr` and choose the official Herdr extension;
+3. click **Add to Chrome**;
+4. if the Chrome Web Store listing is not live yet, skip the extension rather than falling back to a developer-mode install;
+5. after installation run:
+
+```bash
+herdr-mcp native-host install
+herdr-mcp native-host status
 ```
 
-See [Cloudflare Edge Token](cloudflare-edge-token.md) for least-privilege credential handling and [Cloudflare Edge deployment](cloudflare-edge-deployment.md) for Worker / Durable Object / Link details.
+Future extension versions are delivered through Chrome's normal Web Store update mechanism. Normal users do not repeatedly download ZIPs, overwrite local extension directories, or manually Reload the extension.
 
-## Step 5: verify the workstation link
+See [Browser extension](extension.md) and [Browser Control Center](browser-control-center.md).
 
-A deployed Worker only proves that the Edge exists. The Edge must also be able to route to your workstation.
+## What “installed” means
 
-Check that:
+At minimum:
 
-1. the local runtime is healthy;
-2. `herdr-link` is running;
-3. workstation identity matches the Edge configuration;
-4. Edge `/health` reports the workstation online;
-5. runtime generation/version is expected.
+- `herdr --version` works;
+- `herdr-mcp doctor` is healthy;
+- Herdr Link is connected;
+- Edge `/health` is reachable;
+- ChatGPT OAuth is complete;
+- a new conversation can call `herdr_inspect` against the real workstation;
+- if the optional extension is installed, `herdr-mcp native-host status` is healthy and Control Center can see workspaces.
 
-OAuth may succeed even while the workstation is offline, so treat public Edge health and workstation reachability as separate layers.
+## Beyond manual installation
 
-## Step 6: create the ChatGPT Connector
+If the goal is simply to get working quickly, return to [Quick agent install](quick-agent-install.md) and let the coding agent execute the protocol.
 
-In ChatGPT:
+Read deeper only when needed:
 
-1. enable Developer mode;
-2. create a custom MCP Connector;
-3. enter `https://<worker>.<account>.workers.dev/mcp`;
-4. complete OAuth in the browser;
-5. create a **new conversation** for validation.
+- [Troubleshooting](troubleshooting.md)
+- [Architecture](architecture.md)
+- [Runtime A/B](runtime-self-upgrade.md)
+- [Cloudflare Edge deployment](cloudflare-edge-deployment.md)
 
-Do not paste `HERDR_MCP_TOKEN` into ChatGPT. The public Connector authentication boundary is OAuth.
-
-ChatGPT caches tool snapshots. See [ChatGPT Connector](chatgpt-connector.md) for why an old conversation can continue to expose an old contract after the server has been upgraded.
-
-## Step 7: perform a real validation
-
-Start with a safe read-only request:
-
-```text
-Inspect the current Herdr workspaces and project state. Read only; do not modify anything.
-```
-
-Expected behavior:
-
-1. `herdr_inspect` runs successfully;
-2. the model sees real workspaces / managed Git roots;
-3. it may load `herdr_skill` once;
-4. it can use `herdr_git` or `herdr_fs_read` on real project state.
-
-Then test a small reversible edit and a test command.
-
-The current production public contract is **epoch 2 / 18 tools**. If a new conversation still exposes 17 tools, investigate Connector/tool snapshot caching before reinstalling the runtime.
-
-## Step 8: install the browser extension for continuity and local observation
-
-MCP solves “ChatGPT reaches the workstation.” The browser extension adds three more product surfaces: browser continuity, a Chrome Side Panel Control Center, and the local JSON → MCP bridge for z.ai / DeepSeek. ChatGPT also gets Queue for saving the next user instruction without interrupting the current reply.
-
-Installation is documented in [Browser extension](extension.md). The extension uses Native Messaging and local IPC; it does not store the Herdr bearer in browser state.
-
-After installation, verify at least:
-
-1. clicking the Herdr toolbar icon opens **Browser Control Center** directly and reports the local runtime reachable;
-2. the Control Center Current page card recognizes the active Project / conversation and bind/unbind is available directly on the workspace rows below;
-3. each workspace row combines current-page binding state with live workspace state, with pane / agent detail available on expand;
-4. creating or closing a pane appears as a Side Panel lifecycle update;
-5. Prompt Agent / Steer Session / Herdr API / Terminal Input are visibly Preview-only rather than implying mutations are enabled;
-6. ChatGPT Queue does not interrupt a live reply and sends only after the turn settles.
-
-See [Browser Control Center](browser-control-center.md) for the interaction model.
-
-## When to add a Custom Domain
-
-`workers.dev` is enough to validate the complete Connector path. A Custom Domain is useful when:
-
-- you want a long-lived OAuth issuer under a domain you control;
-- your team has central domain governance;
-- you want to decouple the public identity from the Cloudflare account subdomain.
-
-Validate the complete flow on `workers.dev` first, then migrate the stable origin separately.
-
-## Local clients: bypass Cloudflare
-
-Local Cursor / curl can connect directly to:
-
-```text
-http://127.0.0.1:8772/mcp
-```
-
-using the local static bearer. This path is also useful for separating runtime failures from Edge failures.
-
-## Appendix: developer from source
-
-Clone + `npm`/`cargo` workflows remain available for people developing herdr-mcp itself. That contributor path is not the primary end-user install path and must not be required to run the local MCP runtime.
-
-## What "installed" means
-
-A complete ChatGPT installation satisfies all of these:
-
-- Herdr socket works;
-- herdr-mcp runtime works;
-- Edge is deployed;
-- workstation link is online;
-- OAuth succeeds;
-- a new ChatGPT conversation receives the epoch-2 catalog;
-- `herdr_inspect` sees the real workstation;
-- one real file/Git/test operation works.
-
-A successful Worker deployment or a Connector marked "connected" is only one layer of that validation.
-
-Use [Troubleshooting](troubleshooting.md) to diagnose failures from local runtime → Link → Edge → OAuth → MCP → ChatGPT snapshot.
+Maintainer UAT, GA gates, and release evidence are intentionally outside the normal user installation flow.

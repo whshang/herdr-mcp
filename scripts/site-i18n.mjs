@@ -17,18 +17,18 @@ export const LOCALE_NAMES = { en: "English", "zh-CN": "简体中文" };
 
 // Logical document order — defines prev/next order in every locale.
 export const DOC_ORDER = [
-  "overview",
-  "design-philosophy",
-  "quick-start",
-  "install",
   "quick-agent-install",
-  "clean-machine-uat",
+  "overview",
+  "install",
   "chatgpt-connector",
+  "quick-start",
   "browser-continuity",
   "extension",
+  "privacy",
   "browser-control-center",
   "extension-wake",
   "extension-bridge",
+  "design-philosophy",
   "architecture",
   "best-practices",
   "cli-reference",
@@ -40,23 +40,24 @@ export const DOC_ORDER = [
   "capability-benchmark",
   "herdr-vs-ecosystem",
   "worker-fallbacks",
+  "clean-machine-uat",
   "troubleshooting",
 ];
 
 // Group membership is keyed by logical slug only; labels are translated in UI.
 export const NAV_GROUPS = [
-  { slugs: ["overview", "design-philosophy", "quick-start", "install", "quick-agent-install", "clean-machine-uat", "chatgpt-connector"] },
-  { slugs: ["browser-continuity", "extension", "browser-control-center", "extension-wake", "extension-bridge"] },
-  { slugs: ["architecture", "best-practices", "cli-reference"] },
+  { slugs: ["quick-agent-install", "overview", "install", "chatgpt-connector", "quick-start"] },
+  { slugs: ["browser-continuity", "extension", "privacy", "browser-control-center", "extension-wake", "extension-bridge"] },
+  { slugs: ["design-philosophy", "architecture", "best-practices", "cli-reference"] },
   { slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade"] },
-  { slugs: ["agent-install", "automation", "capability-benchmark", "herdr-vs-ecosystem", "worker-fallbacks"] },
+  { slugs: ["agent-install", "automation", "capability-benchmark", "herdr-vs-ecosystem", "worker-fallbacks", "clean-machine-uat"] },
   { slugs: ["troubleshooting"] },
 ];
 
 // Per-locale navigation group labels, in NAV_GROUPS order.
 export const NAV_GROUP_LABELS = {
-  "zh-CN": ["开始", "浏览器", "工作方式与架构", "部署与运行", "高级参考", "排障"],
-  en: ["Start", "Browser", "Workflow & architecture", "Deploy & operate", "Advanced reference", "Troubleshooting"],
+  "zh-CN": ["开始使用", "浏览器（可选）", "理解与日常使用", "部署与运行", "维护者参考", "排障"],
+  en: ["Get started", "Browser (optional)", "Understand & use", "Deploy & operate", "Maintainer reference", "Troubleshooting"],
 };
 
 // Per-locale user-visible strings. The build fails fast if a label is missing,
@@ -91,19 +92,19 @@ export const UI = {
     indexEyebrow: "文档",
     indexTitle: "让 Web AI 真正接上你的开发机。",
     indexLead:
-      "herdr-mcp 把 ChatGPT 等 Web AI 连接到本地 Herdr 工作站：直接读改代码、运行 Git/Shell、调度本地 Agent，并通过浏览器连续工作跨越长任务和长对话。第一次使用从总览与快速开始进入。",
-    indexCtaConnect: "快速开始",
+      "第一次使用不需要先学架构。把一条安装提示词交给 Cursor、Codex、Claude Code 等本地 Coding Agent；它会安装 Herdr 和 herdr-mcp，只在 Cloudflare 和 ChatGPT 必须人工操作时暂停。",
+    indexCtaConnect: "让 Agent 帮我安装",
     indexCtaArchitecture: "总览",
     indexCtaDeploy: "连接 ChatGPT",
     indexHome: "首页",
     indexSource: "源码",
     indexFooterAria: "文档索引底部导航",
     versionBadgeAria: "当前版本",
-    agentIntroTitle: "或者，让 agent 带你上手",
-    agentIntroLead: "如果你已经有一个 AI 编码 agent，让它来引导你：把这句提示语粘贴给 agent。",
+    agentIntroTitle: "最快方式：让 Coding Agent 直接安装",
+    agentIntroLead: "把下面提示词交给本地 Coding Agent。它应该先读完整安装协议，再自动执行能够自动化的步骤。",
     agentPrompt:
-      "请先阅读 https://whshang.github.io/herdr-mcp/herdr-mcp-SKILL.md，然后一步步带我理解并配置 herdr-mcp。",
-    agentSkillLink: "阅读 herdr-mcp-SKILL.md（agent 版项目手册）",
+      "请帮我安装并配置 Herdr 和 herdr-mcp，请先完整阅读并严格按照这个指引执行：https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/quick-agent-install.md 。herdr-mcp 本机 runtime 使用 GitHub Releases，不用 git clone。只在 Cloudflare 登录/创建 API Token，以及 ChatGPT 添加 herdr Connector/插件这两类需要我本人操作的步骤暂停并指导我，其余步骤请自动完成并验证。",
+    agentSkillLink: "阅读完整快速 Agent 安装协议",
     copyCode: "复制",
     copiedCode: "已复制",
   },
@@ -136,20 +137,20 @@ export const UI = {
     indexEyebrow: "Documentation",
     indexTitle: "Connect Web AI to the real development machine.",
     indexLead:
-      "herdr-mcp connects ChatGPT and other Web AI to a local Herdr workstation for direct code, Git and shell work, local-agent delegation, and browser continuity across long tasks and long conversations. Start with Overview and Quick start.",
-    indexCtaConnect: "Quick start",
+      "You do not need to learn the architecture first. Give one setup prompt to Cursor, Codex, Claude Code, or another local coding agent; it installs Herdr and herdr-mcp and pauses only for Cloudflare and ChatGPT steps that require you.",
+    indexCtaConnect: "Let my agent install it",
     indexCtaArchitecture: "Overview",
     indexCtaDeploy: "Connect ChatGPT",
     indexHome: "Home",
     indexSource: "Source",
     indexFooterAria: "Documentation index footer",
     versionBadgeAria: "Current version",
-    agentIntroTitle: "Or let your agent introduce you",
+    agentIntroTitle: "Fastest path: let your coding agent install it",
     agentIntroLead:
-      "If you already run an AI coding agent, let it handle the onboarding. Paste this prompt to your agent:",
+      "Give this prompt to your local coding agent. It should read the complete install protocol first, then automate everything that does not require you personally.",
     agentPrompt:
-      "Help me understand and set up herdr-mcp. Read https://whshang.github.io/herdr-mcp/herdr-mcp-SKILL.md first, then walk me through it step by step.",
-    agentSkillLink: "Read herdr-mcp-SKILL.md (the agent-facing project guide)",
+      "Install and configure Herdr and herdr-mcp for me. First read and follow this guide end to end: https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/quick-agent-install.md . Install the local herdr-mcp runtime from GitHub Releases, not from a git clone. Pause only when I personally need to sign in/create a Cloudflare API Token, or when I need to add the herdr Connector/app in ChatGPT. Automate and verify everything else.",
+    agentSkillLink: "Read the complete quick agent install protocol",
     copyCode: "Copy",
     copiedCode: "Copied",
   },

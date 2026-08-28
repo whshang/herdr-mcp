@@ -7,7 +7,9 @@
 复制下面整块发给 Codex、Claude Code、Cursor、Pi、Cline 等能读 URL 并执行命令的 Agent:
 
 ```text
-请帮我安装 herdr-mcp。完整协议请阅读并严格执行: https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/quick-agent-install.md 。本机 runtime 用 GitHub Releases (不要 git clone)。只在 Cloudflare 登录/创建 API Token 时暂停。不要回显或提交任何秘密。
+请帮我安装并配置 Herdr 和 herdr-mcp，请先完整阅读并严格按照这个指引执行：https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/quick-agent-install.md 。
+
+herdr-mcp 本机 runtime 使用 GitHub Releases，不用 git clone。只在 Cloudflare 登录/创建 API Token，以及 ChatGPT 添加 herdr Connector/插件这两类需要我本人操作的步骤暂停并指导我，其余步骤请自动完成并验证。
 ```
 
 Agent 应读完本文并执行。Cloudflare Token 暂停细节也可参考 [Agent 协助安装](agent-install.md)。
@@ -22,19 +24,34 @@ Agent 应读完本文并执行。Cloudflare Token 暂停细节也可参考 [Agen
 
 ## Agent 合同 (简版)
 
-1. 能自动化的 shell 直接执行; 只在 Cloudflare 交互登录/API Token 或多 Account 选择时暂停。
+1. 能自动化的 shell 直接执行；只在 Cloudflare 交互登录/API Token、无法自动判断的 Account 选择，或 ChatGPT 添加 `herdr` Connector/OAuth 时暂停。
 2. **本机 MCP runtime 必须从 GitHub Releases 安装**; 除非用户明确要求开发 herdr-mcp, 否则不要 `git clone` + `npm`/`cargo`。
 3. 每个 mutation 后验证 (`herdr-mcp doctor`, Link status, Edge `/health`, 公网 `/mcp`)。
 4. 秘密不得写入仓库、日志、截图或 shell history。
 
 ## 前置条件
 
+先检查 Herdr：
+
 ```bash
 herdr --version
 herdr api schema >/dev/null
 ```
 
-Herdr 未就绪则引导用户到 <https://herdr.dev>。herdr-mcp 不替代 Herdr。
+如果 Herdr 未安装，Agent 直接按 Herdr 官方 stable 安装方式安装，不把用户丢到另一篇文档自行研究：
+
+```bash
+# macOS / Linux
+curl -fsSL https://herdr.dev/install.sh | sh
+```
+
+Windows 使用 Herdr 官方 PowerShell 安装器：
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
+```
+
+安装后重新运行 `herdr --version` 和 `herdr api schema >/dev/null`；仍失败才暂停并说明问题。herdr-mcp 不替代 Herdr，但本协议负责把 Herdr 一并装好。
 
 **平台:** 第一版 GA 以 macOS Apple Silicon 为主。Node.js 仅临时用于 `npx wrangler` 部署 Edge, 不是本机 runtime 依赖。
 
@@ -192,20 +209,16 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 
 详见 [ChatGPT Connector](chatgpt-connector.md)。
 
-## 步骤 8 — 可选浏览器扩展 (ChatGPT 手动可用之后)
+## 步骤 8 — 可选 Chrome Web Store 浏览器扩展
 
 仅在步骤 7 成功后再做。
 
-git checkout 里的 `extension/` 常在隐藏目录旁, **Load unpacked** 时推荐复制到可见路径:
+最终用户只通过 Chrome Web Store 安装，不使用 `Load unpacked` / 开发者模式，也不要求机器上存在 herdr-mcp git checkout：
 
-```bash
-cp -R extension ~/Documents/herdr-mcp-extension
-# 或: ln -s "$(pwd)/extension" ~/Documents/herdr-mcp-extension
-```
-
-Chrome 打开 `chrome://extensions` → 开发者模式 → **加载已解压的扩展程序** → 选 `~/Documents/herdr-mcp-extension`。
-
-**备选:** 文件选择器按 **Cmd+Shift+.** 显示隐藏文件, 再选 checkout 里的 `extension/`。
+1. 打开 <https://chromewebstore.google.com/>；
+2. 搜索 `Herdr`，选择 Herdr 官方扩展；
+3. 点击 **添加至 Chrome / Add to Chrome**；
+4. Chrome Web Store listing 尚未正式上线时，直接跳过本步骤，不要回退到开发者模式安装。
 
 `herdr-mcp doctor` 健康后安装 Native Messaging:
 
@@ -214,7 +227,7 @@ herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
-见 [浏览器连续性](browser-continuity.md)。
+Chrome Web Store 安装后，扩展版本更新由 Chrome 的正常扩展更新机制负责；普通用户不需要重复下载 zip 或手动 Reload 扩展。见 [浏览器扩展](extension.md) 与 [浏览器连续性](browser-continuity.md)。
 
 ## 给用户的最终报告
 

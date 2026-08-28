@@ -1,121 +1,138 @@
-# Quick agent install: one sentence for users, full protocol for your coding Agent
+# Quick agent install: one user prompt, one complete agent protocol
 
-This page is the **end-user onboarding path** for herdr-mcp GA. It is not the maintainer UAT playbook in `docs/_wip/`.
+This is the **recommended end-user onboarding path** for herdr-mcp. It is written for a local coding agent to execute, not for the human to copy commands one by one.
 
-## One sentence to paste into your local coding Agent
+## One prompt to paste into your local coding agent
 
-Copy this block to Codex, Claude Code, Cursor, Pi, Cline, or any agent that can read URLs and run shell commands:
+Give this whole block to Cursor, Codex, Claude Code, Pi, Cline, or another local coding agent that can read URLs and run commands:
 
 ```text
-Install herdr-mcp for me. Read and follow the full protocol at https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/quick-agent-install.md end to end. Use GitHub Releases for the local runtime (not git clone). Pause only for Cloudflare login/API Token creation. Do not echo or commit secrets.
+Install and configure Herdr and herdr-mcp for me. First read and follow this guide end to end: https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/quick-agent-install.md .
+
+Install the local herdr-mcp runtime from GitHub Releases, not from a git clone. Pause only when I personally need to sign in/create a Cloudflare API Token, or when I need to add the herdr Connector/app in ChatGPT. Automate and verify everything else.
 ```
 
-The Agent should read this entire document and execute it. For the detailed Cloudflare Token pause flow, it may also consult [Agent-assisted installation](agent-install.md).
+The agent must read this page completely before mutating the machine. More detailed Cloudflare credential handling remains in [Agent-assisted installation](agent-install.md).
 
-## What the user gets
+## What the user gets when this is complete
 
-After a successful run:
+- Herdr installed and healthy;
+- the native stable `herdr-mcp` runtime installed from GitHub Releases;
+- a personal Cloudflare Edge Worker (`workers.dev`, or a custom domain only when intentionally selected);
+- an outbound workstation Herdr Link;
+- ChatGPT Developer mode + a custom `herdr` MCP Connector pointing at `/mcp`;
+- an optional Chrome Web Store browser extension after the base Connector works.
 
-- Herdr + native `herdr-mcp` runtime installed and healthy
-- A personal Cloudflare Edge Worker (`workers.dev` or custom domain)
-- Outbound Herdr Link from the workstation to Edge
-- ChatGPT Developer mode + custom MCP Connector wired to `/mcp`
-- Optional browser extension for long-session continuity (only after ChatGPT works manually)
+## Agent contract
 
-## Agent contract (short)
+1. Run automatable shell steps directly. Pause only for interactive Cloudflare login/API Token creation, an account choice that cannot be resolved safely, or the human ChatGPT Connector/OAuth step.
+2. **Install the local herdr-mcp runtime from GitHub Releases.** Do not `git clone` + `npm`/`cargo` unless the user explicitly asked to develop herdr-mcp itself.
+3. Verify after mutations: Herdr health, `herdr-mcp doctor`, Link status, Edge `/health`, public `/mcp`, and final ChatGPT MCP access.
+4. Do not echo or persist secrets in repositories, ordinary logs, screenshots, or shell history.
+5. If a mutation returns ambiguously, verify actual state before retrying it.
 
-1. Execute shell steps directly. Pause only for Cloudflare interactive login / API Token creation, or when choosing among multiple Cloudflare Accounts.
-2. Install the **local MCP runtime from GitHub Releases**. Do not use `git clone` + `npm`/`cargo` unless the human explicitly asked to develop herdr-mcp itself.
-3. Verify every mutation before continuing (`herdr-mcp doctor`, Link status, Edge `/health`, public `/mcp`).
-4. Never echo or write secrets to the repo, logs, screenshots, or shell history.
+## Prerequisite — install Herdr if it is missing
 
-## Prerequisites
+Check first:
 
 ```bash
 herdr --version
 herdr api schema >/dev/null
 ```
 
-If Herdr is missing, stop and send the human to <https://herdr.dev>. herdr-mcp does not replace Herdr.
+If Herdr is missing, install the official stable build instead of sending the human away to research another guide.
 
-**Platform:** macOS Apple Silicon is the first fully supported GA path. Node.js is only needed temporarily for `npx wrangler` Edge deploy, not for the local runtime.
+macOS / Linux:
 
-## Step 1 — Install native runtime
+```bash
+curl -fsSL https://herdr.dev/install.sh | sh
+```
 
-1. Download `herdr-mcp` from <https://github.com/whshang/herdr-mcp/releases> — use the latest stable release ([`v0.4.0`](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0) or newer stable tag)
-2. Place on `PATH` (for example `~/.local/bin/herdr-mcp`) and make executable
+Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
+```
+
+Then re-run:
+
+```bash
+herdr --version
+herdr api schema >/dev/null
+```
+
+Pause only if Herdr still does not become healthy. herdr-mcp does not replace Herdr, but this onboarding protocol installs it when needed.
+
+**Current herdr-mcp support boundary:** the most complete clean-machine evidence is on macOS Apple Silicon. Windows x64 has a release binary but Windows end-to-end UAT is still being completed. Linux is not yet claimed as a supported `v0.4.0` herdr-mcp runtime product surface.
+
+Node.js is only a temporary Edge deployment dependency through Wrangler; it is not a local herdr-mcp runtime dependency.
+
+## Step 1 — install the native herdr-mcp runtime
+
+1. Download the newest stable `herdr-mcp` binary for this platform from <https://github.com/whshang/herdr-mcp/releases> (`v0.4.0` or a newer stable tag).
+2. Put it on `PATH` (for example `~/.local/bin/herdr-mcp`) and make it executable when the platform requires it.
 3. Run:
 
 ```bash
 herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
+herdr-mcp update check
 ```
 
-## Step 2 — Choose public Edge URL strategy
+The normal user path must not depend on a git checkout.
 
-Before deploying Edge, decide how ChatGPT will reach the workstation:
+## Step 2 — choose the public Edge URL strategy
+
+Use the simplest safe path for the first installation:
+
+- no intentional custom-domain requirement → use `workers.dev`;
+- user explicitly owns and wants to use a Cloudflare-managed domain → a custom domain may be configured;
+- if `workers.dev` connectivity is blocked, first use the Link proxy support described below before expanding DNS scope.
+
+Example Connector URLs:
 
 ```text
-Do you own a domain you can point at Cloudflare?
-  ├─ YES → prefer Custom Domain for the Connector URL
-  │         Example MCP URL: https://herdr-mcp.example.com/mcp
-  │         See "Custom domain path" below
-  └─ NO  → use workers.dev for first install
-            Example MCP URL: https://herdr-edge-device.username.workers.dev/mcp
-            In China / restrictive networks, also configure Link proxy (see below)
+https://herdr-edge-device.username.workers.dev/mcp
+https://herdr-mcp.example.com/mcp
 ```
 
-| Situation | Recommended public origin | ChatGPT Connector URL |
-|---|---|---|
-| Own a domain + Cloudflare zone | Custom Domain | `https://herdr-mcp.example.com/mcp` |
-| No domain / fastest first install | `workers.dev` | `https://herdr-edge-device.username.workers.dev/mcp` |
-| `workers.dev` blocked (China SNI) | Custom Domain **or** `workers.dev` + proxy | same patterns as above |
+## Step 3 — Cloudflare Token pause (human action)
 
-Full Custom Domain operations: [Cloudflare Edge deployment](cloudflare-edge-deployment.md#when-to-use-a-custom-domain).
+Open <https://dash.cloudflare.com/profile/api-tokens> and guide the human to create a token using the current **Edit Cloudflare Workers** template, limited to the intended account. The default `workers.dev` bootstrap does not need DNS Write.
 
-## Step 3 — Cloudflare Token pause (human only)
+Use the token only as an ephemeral process environment value. Never echo it. Never commit it. Never put it in a normal `.env` file or shell history.
 
-Open <https://dash.cloudflare.com/profile/api-tokens> and create a token with **Edit Cloudflare Workers** scoped to one Account. Do **not** add DNS Write for the default `workers.dev` bootstrap.
+If more than one Cloudflare account is available and the intended account cannot be inferred safely, ask the human which account to use.
 
-Inject only as temporary process env:
+## Step 4 — deploy Edge
 
-```bash
-export CLOUDFLARE_API_TOKEN='...'
-```
+Use a temporary Edge source checkout only for deployment; it must never become the installed runtime path.
 
-See [Agent-assisted installation](agent-install.md) §4–§5 for verify/`whoami`/account selection. Unset the token after deploy.
-
-## Step 4 — Deploy Edge
-
-Generate identities in Agent memory (never print): `HERDR_MCP_TOKEN`, `LINK_SHARED_SECRET`, `WORKSTATION_ID`, and:
+The canonical Worker name is produced by the repository helper:
 
 ```bash
 WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 ```
 
-Deploy with `workers_dev = true` and `routes = []` for the default path. Record:
+Use a user Wrangler config with:
 
-```text
-EDGE_ORIGIN=https://${WORKER_NAME}.${ACCOUNT_SUBDOMAIN}.workers.dev
-HERDR_EDGE_URL=wss://${WORKER_NAME}.${ACCOUNT_SUBDOMAIN}.workers.dev/ws
-MCP_URL=${EDGE_ORIGIN}/mcp
+```toml
+workers_dev = true
+routes = []
 ```
 
-Store `LINK_SHARED_SECRET` as a Worker secret. Details: [Agent-assisted installation](agent-install.md) §6.
+Deploy and configure the Link secret using the detailed commands in [Agent-assisted installation](agent-install.md). The expected public shape is:
 
-### Custom domain path (when user owns a domain)
+```text
+EDGE_ORIGIN=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev
+HERDR_EDGE_URL=wss://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev/ws
+MCP_URL=<EDGE_ORIGIN>/mcp
+```
 
-Only when the human has a domain on Cloudflare:
+If a custom domain is intentionally selected, the OAuth issuer and Connector URL must use the same origin.
 
-1. Add a Worker route for the hostname (for example `herdr-mcp.example.com/*`)
-2. Create DNS pointing to the Worker
-3. Set `OAUTH_ISSUER=https://herdr-mcp.example.com` in `wrangler.user.toml`
-4. Redeploy and record `MCP_URL=https://herdr-mcp.example.com/mcp`
-
-Do not mix issuer and Connector URL from different origins.
-
-## Step 5 — Install Herdr Link (with network / China notes)
+## Step 5 — install the Herdr Link
 
 Install the managed Rust Link:
 
@@ -124,40 +141,22 @@ herdr-mcp link install
 herdr-mcp link status
 ```
 
-Set `HERDR_EDGE_URL` and `HERDR_WORKSTATION_ID` on the Link LaunchAgent to match the deployed Worker.
+If `workers.dev` is blocked on the workstation network, use the existing proxy configuration where possible. Supported priority:
 
-### Link proxy (workers.dev in China or via system proxy)
-
-Link connects **outbound WSS** to Edge. If ChatGPT works through a local proxy but Link fails with connection reset, configure proxy env before `link install` or on the LaunchAgent:
-
-| Variable | Purpose |
-|---|---|
-| `HERDR_LINK_PROXY` | Explicit override for Link WSS (highest priority) |
-| `HTTPS_PROXY` / `https_proxy` | Standard HTTPS proxy (used for `wss://`) |
-| `HTTP_PROXY` / `http_proxy` | Fallback HTTP proxy |
-| `ALL_PROXY` / `all_proxy` | Last-resort env proxy (HTTP/HTTPS schemes) |
-
-Example:
-
-```bash
-export HERDR_LINK_PROXY=http://127.0.0.1:7890
-# or rely on existing https_proxy if ChatGPT already uses it
-herdr-mcp link install
+```text
+HERDR_LINK_PROXY
+HTTPS_PROXY / https_proxy
+HTTP_PROXY / http_proxy
+ALL_PROXY / all_proxy
 ```
 
-On macOS, Link also reads system proxy from `scutil --proxy` when env vars are unset.
+On macOS the Link can also discover the system proxy via `scutil --proxy`.
 
-**Agent behavior:**
+Do not turn a connectivity problem into an unnecessary DNS/custom-domain mutation before checking the proxy path.
 
-1. Probe whether `https_proxy` / `HERDR_LINK_PROXY` / system proxy is available
-2. If ChatGPT works but proxy cannot be detected, continue — transparent proxy may still work
-3. If `workers.dev` remains unreachable after proxy, present **both** options:
-   - set `HERDR_LINK_PROXY` (or system `https_proxy`) and retry Link
-   - **or** switch to Custom Domain on a hostname the network can reach
+## Step 6 — verify the local and public path
 
-Without proxy, Link uses a direct connection (unchanged default).
-
-## Step 6 — Verify
+Run:
 
 ```bash
 herdr-mcp doctor
@@ -166,76 +165,72 @@ curl -fsS "${EDGE_ORIGIN}/health"
 curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 ```
 
-`herdr-mcp doctor` should show Link ownership and Edge layers healthy (`edge-reachable`, `oauth-metadata`, `mcp-endpoint`; `401 auth=not-sent` is acceptable).
+Expected behavior:
 
-Unset `CLOUDFLARE_API_TOKEN` when done.
+- runtime/service/Native Messaging ownership checks are healthy for the installed surface;
+- Link is connected;
+- `/health` is reachable;
+- unauthenticated `/mcp` may correctly return `401`;
+- Cloudflare bootstrap credentials are removed from the environment after deployment.
 
-## Step 7 — Connect ChatGPT (manual, practical)
+## Step 7 — add the herdr Connector in ChatGPT (human action)
 
-Do this **before** the browser extension.
+Pause and guide the human through ChatGPT:
 
-1. Open ChatGPT → **Settings** → **Apps** / **Connectors** (names vary by plan)
-2. Enable **Developer mode**
-3. Browse connectors → **+** (top right)
-4. Name it `herdr` (or any short name)
-5. Connector URL — use your deployed origin:
-   - `https://herdr-edge-device.username.workers.dev/mcp`, or
-   - `https://herdr-mcp.example.com/mcp`
-6. Check **I understand and wish to continue**
-7. Complete browser OAuth
-8. In chat: add the plugin **or** create a Project and add the plugin there (Project path works better with the browser extension relay later)
-9. First prompt in a **new** chat:
+1. open ChatGPT settings / Connectors or Apps;
+2. enable Developer mode when required by the current ChatGPT UI;
+3. add a custom MCP Connector named `herdr`;
+4. enter the deployed `${MCP_URL}` ending in `/mcp`;
+5. complete OAuth in the browser;
+6. enable the Connector in a new conversation or Project.
+
+Then test with:
 
 ```text
-分析我的 herdr 里有哪些项目
+Inspect my Herdr projects. Read only; do not modify anything.
 ```
 
-English equivalent: `What projects do I have in Herdr? Inspect only.`
+Success means the public tool list is available and `herdr_inspect` returns the real workstation.
 
-Success means OAuth completes, tools appear, and `herdr_inspect` returns real workstation data.
+See [ChatGPT Connector](chatgpt-connector.md) for UI detail.
 
-More detail: [ChatGPT Connector](chatgpt-connector.md).
-
-## Step 8 — Optional browser extension (after ChatGPT works)
+## Step 8 — optional Chrome Web Store browser extension
 
 Only after Step 7 succeeds.
 
-The extension folder in git checkouts is often hidden (`.cursor`, dotfiles). For **Load unpacked** in `chrome://extensions`:
+End users install only from the Chrome Web Store. Do **not** use `Load unpacked`, Developer mode, or require a herdr-mcp git checkout.
 
-**Recommended:** copy or symlink to a visible path:
+1. open <https://chromewebstore.google.com/>;
+2. search for `Herdr` and choose the official Herdr extension;
+3. click **Add to Chrome**;
+4. if the Chrome Web Store listing is not live yet, skip this optional step rather than falling back to a developer-mode install.
 
-```bash
-cp -R extension ~/Documents/herdr-mcp-extension
-# or: ln -s "$(pwd)/extension" ~/Documents/herdr-mcp-extension
-```
-
-Then in Chrome: Developer mode → **Load unpacked** → select `~/Documents/herdr-mcp-extension`.
-
-**Alternative:** in the file picker press **Cmd+Shift+.** to show hidden files and pick `extension/` from the checkout.
-
-Install Native Messaging when `herdr-mcp doctor` is healthy:
+After the extension is installed, register the local Native Messaging host:
 
 ```bash
 herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
-See [Browser continuity](browser-continuity.md).
+Future extension versions are delivered through Chrome's normal Chrome Web Store update mechanism. Normal users do not repeatedly download ZIP files or manually Reload an unpacked extension.
+
+See [Browser extension](extension.md) and [Browser continuity](browser-continuity.md).
 
 ## Final report to the human
 
 Return only non-sensitive facts:
 
-- installed runtime version / generation
-- `herdr-mcp doctor` summary
-- Link status + `HERDR_EDGE_URL` host
-- Cloudflare Account (name + shortened ID)
-- Worker name and public origin
-- MCP URL used for ChatGPT (`/mcp`)
-- whether proxy or custom domain was chosen
+- installed Herdr version;
+- installed herdr-mcp version / generation;
+- `herdr-mcp doctor` summary;
+- Link state and Edge hostname;
+- Cloudflare account name plus shortened ID when useful;
+- Worker name and public `/mcp` URL;
+- whether a proxy or intentional custom domain was used;
+- whether the optional Chrome Web Store extension was installed or skipped.
 
-Never include `HERDR_MCP_TOKEN`, `LINK_SHARED_SECRET`, or Cloudflare API tokens.
+Never include `HERDR_MCP_TOKEN`, `LINK_SHARED_SECRET`, or the Cloudflare API Token.
 
-## Maintainer UAT (not this page)
+## Maintainer UAT is not this page
 
-Second-machine maintainer validation: [Clean-machine UAT](clean-machine-uat.md) and archived [Second Mac GA UAT Agent prompt](../../history/ga/second-mac-ga-uat-agent-prompt-en.md). Do not give end users the 34-step UAT prompt.
+Clean-machine release qualification belongs in [Clean-machine UAT](clean-machine-uat.md) and archived GA evidence. Do not give those maintainer scripts to a normal end user.
