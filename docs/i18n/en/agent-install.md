@@ -129,7 +129,7 @@ Then guide Chrome: open `chrome://extensions`, enable Developer mode, **Load unp
 
 ## 8. macOS persistent Herdr Link
 
-Store `LINK_SHARED_SECRET` in Keychain under `herdr-edge-link-<WORKSTATION_ID>`. The command text must reference the environment variable rather than a literal secret. Prefer the managed Link install path exposed by the installed `herdr-mcp` binary (`herdr-mcp link ...` / product docs for the current alpha). Do not leave production Link ownership on a repository Bash wrapper.
+Store `LINK_SHARED_SECRET` in Keychain under `herdr-edge-link-<WORKSTATION_ID>`. The command text must reference the environment variable rather than a literal secret. Prefer the managed Link install path exposed by the installed `herdr-mcp` binary (`herdr-mcp link ...` / current stable product docs). Do not leave production Link ownership on a repository Bash wrapper.
 
 When `workers.dev` is blocked (for example China SNI) or the machine already uses a system proxy for ChatGPT, configure Link WSS proxy or switch to a Custom Domain. Proxy precedence: `HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`; macOS also reads `scutil --proxy`. See [Quick agent install](quick-agent-install.md) §5 for the full decision tree.
 

@@ -28,7 +28,7 @@ Release planes (runtime vs extension vs contract): [`docs/release-model.md`](doc
 
 ### Validation ownership and test selection
 
-The native `herdr-mcp` service/runtime is Rust (`crates/herdr-mcp`). The repository still intentionally contains JavaScript/TypeScript for the browser extension, Cloudflare Edge, documentation/site generation, compatibility paths, cross-language contract tests, and the still-Node production Link path until G5 cutover. The existence of `package.json`, `src/`, or `dist/` does **not** make Node the owner of the `herdr-mcp` runtime.
+The native `herdr-mcp` service/runtime is Rust (`crates/herdr-mcp`). The repository still intentionally contains JavaScript/TypeScript for the browser extension, Cloudflare Edge, documentation/site generation, compatibility paths, cross-language contract tests, and an optional legacy/dev Node Link canary. Production Link ownership completed the G5 cutover and is Rust. The existence of `package.json`, `src/`, or `dist/` does **not** make Node the owner of the `herdr-mcp` runtime.
 
 Choose validation by the component being changed. Do not substitute one lane for another:
 
@@ -64,12 +64,13 @@ Rust service mutations (`service install`, `start`, `stop`, `restart`, `rollback
 
 Destructive service/update/native-host/Link lifecycle mutations must never use `launchctl submit`. Inferred launchd jobs may replay after the command exits and can consume rollback or repeat another non-idempotent mutation. Use the managed lifecycle path or an explicit one-shot plist with `RunAtLoad=true` and `KeepAlive=false` when an independent launchd job is required.
 
-### Link ownership (G5)
+### Link ownership (post-G5)
 
-Production Link (`dev.herdr-mcp.link-prod`) and the existing Node canary
-(`dev.herdr-mcp.link`) remain Node until an explicit dual-verified cutover. Do
-not bootout, rewrite, or retarget those live Node Link LaunchAgents as part of
-ordinary development, install, update, `link run`, or candidate soak work.
+Production Link (`dev.herdr-mcp.link-prod`) is Rust and must execute the active
+runtime path `~/.config/herdr-mcp/runtime/current/herdr-mcp link run`. A legacy
+or dev Node canary (`dev.herdr-mcp.link`) may still exist for compatibility or
+soak work, but it is not a production dependency. Do not retarget production
+Link to a checkout, worktree, `dist/`, or a fixed generation path.
 
 1. `herdr-mcp link run` is a foreground **candidate** only. It must not mutate
    `runtime/current` or change production Link ownership by itself.
@@ -81,9 +82,10 @@ ordinary development, install, update, `link run`, or candidate soak work.
 3. Link install/uninstall/cutover/rollback mutations follow the same
    independent-Shell rule as service mutations: never from a managed
    `herdr_exec` session; never via `launchctl submit`.
-4. Before any production Link cutover, dual verification from independent Shells
-   is mandatory. Code must keep health `production_ready=false` until every gate
-   is true and operators explicitly seal.
+4. Any future production Link ownership migration or rollback must preserve the
+   recorded G5 seal/evidence and use independent-Shell lifecycle operations.
+   Ordinary extension or runtime development must not reopen the completed G5
+   ownership cutover.
 
 Before a lifecycle mutation, capture live state instead of trusting a handoff or previous message:
 

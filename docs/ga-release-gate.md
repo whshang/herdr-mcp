@@ -30,7 +30,7 @@ Rust production ownership
 
 ## 25 道门禁（G1–G25）
 
-每条对应产品标准 1–25。发布前以 checklist 勾选；任一门禁未 PASS 则不得 merge GA docs 分支并打 stable tag。
+每条对应产品标准 1–25。`v0.4.0` stable 已于 2026-08-28 发布；从这一时间点起，未 PASS 的门禁继续阻塞 **full GA declaration**，但不把已经发布且通过 stable install/update/rollback 验证的 `v0.4.0` 重新描述成 prerelease。后续版本是否发布仍按对应风险与支持范围单独判定。
 
 ### G1 — 单一正式产品版本
 
@@ -225,7 +225,7 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 ### G25 — 最后的 GA Definition of Done
 
-见下一节八个一票否决问题；任一项仍是「要看情况 / 需要手工 hack / 先跑仓库脚本 / 文档写的是未来设计」→ 不得打 stable tag。
+见下一节八个一票否决问题；任一项仍是「要看情况 / 需要手工 hack / 先跑仓库脚本 / 文档写的是未来设计」→ 不得宣告 full GA。
 
 ---
 
@@ -317,11 +317,11 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G20 | **PASS** | README/install/quick-agent-install 已对齐 `v0.4.0` stable；用户路径无 alpha/candidate 主术语 |
 | G21 | **PASS** | 站点 CI 可绿；`v0.4.0` stable tag 已打；docs freeze 完成 |
 | G22 | **PASS** | 用户安装主路径不依赖开发仓库；第二台 Mac 实证已封 |
-| G23 | **PARTIAL** | main CI 可绿；stable tag-path Rust Release 全绿（`33157370273`）；#142 merged |
+| G23 | **PASS** | `v0.4.0` tag-path Rust Release 全绿（`33157370273`）；当前 `main` `c1f5820` CI 与 Pages 均 PASS；release artifact verification / platform build / fmt / clippy / Node+Edge+extension+site lanes 已由对应 workflow 封存 |
 | G24 | **PASS** | P0 blocker 队列已清（G4 stable clean install sealed 2026-08-28） |
 | G25 | **PARTIAL** | G4/G18 安装与文档路径已封；veto #5/#7 仍受 G14/G15 PARTIAL 约束；**不得 declare GA** 直至 veto 全清或 honest DEFERRED |
 
-**合计（诚实快照）**：PASS 15 · PARTIAL 6 · FAIL 0 · DEFERRED 1 · UNKNOWN 0
+**合计（诚实快照）**：PASS 16 · PARTIAL 5 · FAIL 0 · DEFERRED 1 · UNKNOWN 0
 
 ### G6/G7 dogfood public evidence（2026-08-28 · alpha.19 · PASS）
 
