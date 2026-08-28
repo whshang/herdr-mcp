@@ -12,6 +12,8 @@ Status: **stable `v0.4.0` published** (2026-08-28). This file is the contributor
 
 **Critical rule:** the extension zip attached to a Runtime Release is a **distribution artifact**, not a lifecycle binding. Shipping extension `0.1.68` beside runtime `0.4.0` does **not** mean the updater upgrades the extension or that extension version must equal runtime version.
 
+An extension-only change must **not** force a Rust runtime version bump. If an extension version needs distribution between runtime releases, use or add an extension-only release path (for example `extension-v*` / `extension-release.yml`) rather than creating `0.4.x` only to carry a zip.
+
 ## Runtime Release (authoritative product version)
 
 - **Workflow:** `.github/workflows/rust-release.yml` on tag push `v*`.
