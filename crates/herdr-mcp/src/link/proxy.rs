@@ -5,6 +5,8 @@
 
 use std::io;
 use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
