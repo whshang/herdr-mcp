@@ -52,11 +52,11 @@ Browser extension は conversation continuity、Chrome Side Panel の Control Ce
 
 ## 現在のサポート範囲
 
-- herdr-mcp stable: `v0.4.0`
+- herdr-mcp stable: `v0.4.1`
 - public MCP contract: epoch 2 / 18 tools
 - clean-machine evidence が最も揃っているのは macOS Apple Silicon
 - Windows x64 binary は提供済みだが、Windows end-to-end UAT は継続中
-- Linux runtime はまだ `v0.4.0` の正式対応面として宣言していません
+- Linux runtime はまだ current stable の正式対応面として宣言していません
 
 ## Local runtime CLI
 

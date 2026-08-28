@@ -59,11 +59,11 @@ See [Browser extension](docs/i18n/en/extension.md) and [Browser Control Center](
 
 ## Current support boundary
 
-- stable herdr-mcp: `v0.4.0`;
+- stable herdr-mcp: `v0.4.1`;
 - public MCP contract: epoch 2 / 18 tools;
 - strongest clean-machine evidence: macOS Apple Silicon;
 - Windows x64 release binary is available, while Windows end-to-end UAT is still being completed;
-- Linux runtime is not claimed as a supported `v0.4.0` product surface yet.
+- Linux runtime is not claimed as a supported current-stable product surface yet.
 
 ## Local runtime CLI
 
