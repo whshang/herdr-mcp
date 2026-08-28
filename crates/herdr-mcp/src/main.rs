@@ -1,4 +1,9 @@
 mod agent_visibility;
+mod browser_extension_identity;
+mod capability_inventory;
+mod capability_probe;
+mod capability_resolver;
+mod capability_scan;
 mod cli;
 mod config;
 mod contract;
@@ -96,6 +101,15 @@ fn run() -> Result<ExitCode, String> {
                 ExitCode::from(2)
             })
         }
+        cli::Command::Scan {
+            json,
+            refresh,
+            probe,
+        } => capability_scan::run(capability_scan::ScanOptions {
+            json,
+            refresh,
+            probe,
+        }),
         cli::Command::Config(command) => {
             let paths = paths::RuntimePaths::discover()?;
             match command {

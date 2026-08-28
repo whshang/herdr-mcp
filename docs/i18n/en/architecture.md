@@ -99,6 +99,33 @@ This preserves native reachability without turning every Herdr method into a per
 
 The current production contract is **epoch 2 / 18 tools**. Tool-catalog changes are explicit contract migrations, not incidental runtime changes.
 
+## Progressive skills and capability truth
+
+The epoch-2 tool catalog stays fixed, but the planner policy no longer has to be one giant always-loaded document. The Rust runtime contains a compact global `AGENTS.md` plus seven on-demand modules: workstation control, file search, file mutation, Git, execution, agent dispatch, and development orchestration. Internal `herdr_mcp.skill.list/describe/load` methods are reached through the existing `herdr_call`; they do not add a nineteenth public MCP tool.
+
+The progressive path is deliberately separated from capability truth. A worker is not treated as code-edit capable, vision capable, high-reasoning, or tied to a provider/model merely because of its product name. `herdr-mcp scan` builds evidence instead:
+
+```text
+Herdr agent manifest
+  + executable/version evidence
+  + bounded agent-specific probe
+  + live Herdr session state
+        ↓
+capability inventory
+        ↓
+capability resolver
+        ↓
+compact inspect / progressive summary
+        ↓
+safe dispatch decision
+```
+
+Static or semi-static evidence is stored separately from the reliability state database so a new capability schema cannot make an older runtime unable to roll back. Binary identity, manifest version and probe-adapter version invalidate cached evidence. The inventory never owns live status, cwd, project, pane, workspace or session facts; those continue to come from Herdr/EventCache.
+
+Unknown means **unverified**, not false and not “probably supported.” Probe subprocesses are non-interactive, bounded, receive no inherited credentials, and only promote traits explicitly reported by a trusted self-description adapter. Full probe evidence is diagnostic data; the model-visible progressive bootstrap receives only compact counts and verified worker traits.
+
+The Modular Progressive Skills implementation ships in the Rust runtime behind `HERDR_MCP_PROGRESSIVE_SKILLS`. The compatibility/default path remains legacy until capability-aware multi-agent UAT provides evidence for a default-on migration.
+
 ## Why files, Git and shell are first-class
 
 A Web model cannot see the workstation filesystem by itself. That is different from Herdr-native pane management.

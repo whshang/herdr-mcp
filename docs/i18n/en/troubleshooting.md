@@ -182,8 +182,8 @@ Separate a **Side Panel UI problem**, a **Native Messaging identity problem**, a
 1. Click the Herdr toolbar icon and verify Chrome opens the Control Center Side Panel directly; do not navigate to `control-center.html` as a normal web page.
 2. `herdr-mcp status` / `herdr-mcp doctor` should first prove the local runtime is healthy.
 3. `herdr-mcp native-host status` should report the Native Messaging host registered.
-4. If the extension was just updated, reload it in `chrome://extensions`.
-5. If a developer changes the absolute unpacked-extension path, Chromium may assign a different extension ID. A Native Messaging `allowed_origins` entry for the old ID can then produce `Access to the specified native messaging host is forbidden`. Re-register the Native Host for the current development identity rather than copying a bearer into browser storage.
+4. If Chrome just updated the Store extension, refresh the affected web page (or restart Chrome if needed) so the current content script is loaded.
+5. `herdr-mcp native-host status` should report the official Store extension identity; if it reports an origin mismatch, re-run `herdr-mcp native-host install` from the current runtime. Maintainer-only unpacked identity troubleshooting lives in the Store-development WIP, not this user guide.
 6. `Runtime healthy · event stream reconnecting` means the panel still has a snapshot while incremental events recover; it does not mean the whole local runtime is down. Use Refresh for an authoritative reconciliation.
 
 Prompt Agent / Steer Session / Herdr API / Terminal Input are intentionally Preview-only in the current Control Center. That is not a failure. The executable actions today are `Inspect state` and the bounded `Read output tail`.

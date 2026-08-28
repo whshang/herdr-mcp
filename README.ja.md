@@ -44,9 +44,9 @@ Browser extension は conversation continuity、Chrome Side Panel の Control Ce
 2. [Chrome Web Store](https://chromewebstore.google.com/) で `Herdr` を検索します。
 3. 公式 Herdr extension を選び **Add to Chrome** を押します。
 4. `herdr-mcp native-host install` と `herdr-mcp native-host status` を実行します。
-5. 以後の extension update は Chrome Web Store の通常更新に任せます。ZIP の再ダウンロードや Developer mode の Reload は通常ユーザー経路ではありません。
+5. 以後の extension update は Chrome Web Store の通常更新に任せます。通常ユーザーにローカル extension package は不要です。
 
-> Extension は現在 Chrome Web Store の初回公開準備中です。listing 公開前は extension をスキップしてください。`Load unpacked` はエンドユーザー向けインストール方法ではありません。
+> Extension は現在 Chrome Web Store の初回公開準備中です。listing 公開前はこの任意ステップをスキップし、ローカル開発版を代替インストールしないでください。
 
 詳細：[Browser extension（英語）](docs/i18n/en/extension.md) · [Browser Control Center（英語）](docs/i18n/en/browser-control-center.md)
 
@@ -73,7 +73,7 @@ herdr-mcp rollback
 herdr-mcp uninstall
 ```
 
-`herdr-mcp service ...` は **Advanced / internal** の service control で、通常の install path ではありません。
+`herdr-mcp service ...` は **Advanced / internal** の service control で、通常の install path ではありません。`0.4.1+` では `herdr-mcp scan --json` で、このクライアントから実際に起動可能な Herdr Agent kind の evidence-backed inventory を更新できます。詳細は [CLI reference（英語）](docs/i18n/en/cli-reference.md#capability-discovery-scan) を参照してください。
 
 ## 必要になったときだけ読む
 

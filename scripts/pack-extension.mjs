@@ -2,11 +2,12 @@
 /**
  * Build a deterministic zip of extension/ for GitHub Release distribution.
  *
- * Output: herdr-mcp-extension-<manifest.version>.zip (+ .sha256 sidecar)
- * Zip root contains the unpacked extension files (manifest.json at top level)
- * so: unzip -d ~/.config/herdr-mcp/extension herdr-mcp-extension-<ver>.zip
+ * Maintainer-only Chrome Web Store / explicit unpacked-UAT packaging utility.
+ * Output: herdr-mcp-extension-<manifest.version>.zip (+ .sha256 sidecar).
+ * Zip root contains manifest.json at top level, as required for Store upload.
  *
- * Not listed in release-manifest.json (updater schema stays platform binaries only).
+ * This artifact is NOT an end-user herdr-mcp Release asset and is never installed
+ * into ~/.config/herdr-mcp/extension by the normal product path.
  */
 import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";

@@ -51,9 +51,9 @@ herdr-mcp 本机 runtime 使用 GitHub Releases，不用 git clone。只在 Clou
 2. 打开 [Chrome Web Store](https://chromewebstore.google.com/) 并搜索 `Herdr`；
 3. 在 Herdr 官方扩展上点击 **添加至 Chrome / Add to Chrome**；
 4. 安装完成后执行 `herdr-mcp native-host install` 和 `herdr-mcp native-host status`；
-5. 以后扩展更新由 Chrome Web Store 正常更新机制负责，不需要重新下载 zip 或进入开发者模式手动 Reload。
+5. 以后扩展更新由 Chrome Web Store 正常更新机制负责，普通用户不需要任何本地扩展安装包。
 
-> 当前扩展正在进入 Chrome Web Store 首次发布流程。在正式 listing 上线前，普通用户可以直接跳过扩展；不要把 `Load unpacked` 当作最终用户安装方式。
+> 当前扩展正在进入 Chrome Web Store 首次发布流程。在正式 listing 上线前，普通用户直接跳过这个可选步骤，不要改用本地开发版。
 
 详见 [浏览器扩展](docs/i18n/zh-CN/extension.md) 和 [浏览器控制中心](docs/i18n/zh-CN/browser-control-center.md)。
 
@@ -80,7 +80,7 @@ herdr-mcp rollback
 herdr-mcp uninstall
 ```
 
-`herdr-mcp service ...` 属于**高级 / 内部**服务控制，不是普通安装主路径。
+`herdr-mcp service ...` 属于**高级 / 内部**服务控制，不是普通安装主路径。`0.4.1+` 可运行 `herdr-mcp scan --json` 刷新“当前客户端实际可启动的 Herdr Agent”证据清单；详细语义见 [CLI Reference](docs/i18n/zh-CN/cli-reference.md#agent-能力发现scan)。
 
 ## 需要更多信息时再看
 

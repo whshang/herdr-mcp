@@ -8,7 +8,7 @@ herdr-mcp 浏览器扩展不是第二个 Agent runtime。它给已经可用的 h
 
 ## 最终用户安装：只用 Chrome Web Store
 
-最终用户不需要 git clone，不需要下载 extension zip，也不需要开启 Chrome Developer mode。
+最终用户只从 Chrome Web Store 安装扩展，不需要本地扩展 build 或仓库 checkout。
 
 1. 打开 [Chrome Web Store](https://chromewebstore.google.com/)；
 2. 搜索 `Herdr`，选择 Herdr 官方扩展；
@@ -20,20 +20,18 @@ herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
+`0.4.1+` 的普通 `native-host install` 会直接使用官方 Chrome Web Store 扩展身份，不要求本机存在 unpacked extension 目录或源码 checkout。已有、确认为 herdr-mcp 自己管理的开发 origin 会走事务式迁移，并保留 rollback 能力。
+
 5. 打开 ChatGPT、z.ai、DeepSeek 或其它当前支持页面；
 6. 点击浏览器工具栏里的 Herdr 图标，确认 **浏览器控制中心**直接在 Chrome Side Panel 打开；
 7. 在控制中心确认“当前页面”识别到了正确 Project / conversation，再绑定 Herdr workspace。
 
-> 当前扩展正在进入 Chrome Web Store 首次发布流程。在正式 listing 上线前，普通用户可以跳过扩展；不要把 `Load unpacked` 当作最终用户安装方式。
+> 当前扩展正在进入 Chrome Web Store 首次发布流程。在正式 listing 上线前，普通用户直接跳过这个可选步骤，不要改用本地开发版。
 
 ## 更新方式
 
-通过 Chrome Web Store 安装后，扩展更新走 Chrome 的正常 Web Store 更新机制。普通用户不需要：
+通过 Chrome Web Store 安装后，扩展更新走 Chrome 的正常 Web Store 更新机制。普通用户不需要本地扩展安装包，也不需要仓库 checkout。
 
-- 重新下载 `herdr-mcp-extension-*.zip`；
-- 覆盖 `~/.config/herdr-mcp/extension`；
-- 打开开发者模式；
-- 每次版本升级手工点扩展 Reload。
 
 扩展更新后，如果某个已经打开很久的 ChatGPT 页面仍运行旧 content script，刷新该网页即可让页面使用新版本。Chrome 扩展本身的版本更新与 Rust runtime 版本独立；纯 UI / DOM / browser compatibility 修复不要求发布新的 Rust runtime。
 
@@ -134,12 +132,14 @@ Pinned Target 不会因为 Herdr focus 变化自动漂移。
 
 ## 开发者与商店发布
 
-`Load unpacked`、本地 extension checkout、Chrome Web Store Developer Dashboard、包上传、Trusted Testers、商店素材和审核流程属于**维护者/扩展开发流程**，不属于最终用户安装文档。
+本地 extension build、Chrome Web Store Developer Dashboard、包上传、Trusted Testers、商店素材和审核流程属于**维护者/扩展开发流程**，不属于最终用户安装文档。
 
-维护者请看：
+维护者请使用：
 
-- `docs/_wip/browser-extension-development-and-store-release.md`
-- `AGENTS.md` 中的 extension 验证与发布边界
+- `contracts/browser-extension-store.json` 作为 Chrome Web Store 身份的唯一机器可读 SSOT；Rust 只读取和校验这个 contract，不在源码里硬编码 Store ID；
+- `HERDR_EXTENSION_PATH=/path/to/unpacked/extension herdr-mcp native-host install` 显式测试 unpacked 开发身份；
+- `docs/_wip/browser-extension-development-and-store-release.md` 维护商店流程；
+- `AGENTS.md` 中的 extension 验证与发布边界。
 
 正式商店发布后，最终用户文档只保留 Chrome Web Store 安装路径。
 

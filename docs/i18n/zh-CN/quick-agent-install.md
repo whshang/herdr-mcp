@@ -213,12 +213,12 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 
 仅在步骤 7 成功后再做。
 
-最终用户只通过 Chrome Web Store 安装，不使用 `Load unpacked` / 开发者模式，也不要求机器上存在 herdr-mcp git checkout：
+最终用户只通过 Chrome Web Store 安装，不用本地开发版替代，也不要求机器上存在 herdr-mcp git checkout：
 
 1. 打开 <https://chromewebstore.google.com/>；
 2. 搜索 `Herdr`，选择 Herdr 官方扩展；
 3. 点击 **添加至 Chrome / Add to Chrome**；
-4. Chrome Web Store listing 尚未正式上线时，直接跳过本步骤，不要回退到开发者模式安装。
+4. Chrome Web Store listing 尚未正式上线时，直接跳过本步骤，不要回退到本地开发版。
 
 `herdr-mcp doctor` 健康后安装 Native Messaging:
 
@@ -227,7 +227,7 @@ herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
-Chrome Web Store 安装后，扩展版本更新由 Chrome 的正常扩展更新机制负责；普通用户不需要重复下载 zip 或手动 Reload 扩展。见 [浏览器扩展](extension.md) 与 [浏览器连续性](browser-continuity.md)。
+Chrome Web Store 安装后，扩展版本更新由 Chrome 的正常扩展更新机制负责；普通用户不需要本地扩展安装包。见 [浏览器扩展](extension.md) 与 [浏览器连续性](browser-continuity.md)。
 
 ## 给用户的最终报告
 
