@@ -312,7 +312,9 @@ fn format_link_layer(paths: &RuntimePaths) -> String {
 fn format_edge_configured_layer(edge: &Option<EdgeConfigView>) -> String {
     match edge {
         Some(edge) => format!(
-            "configured-local host={} origin={} plist={}",
+            "configured-local source={} label={} host={} origin={} plist={}",
+            edge.source.as_str(),
+            edge.label.as_deref().unwrap_or("-"),
             edge.host,
             edge.origin,
             edge.plist
@@ -320,7 +322,26 @@ fn format_edge_configured_layer(edge: &Option<EdgeConfigView>) -> String {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "unset".to_owned())
         ),
-        None => "absent".to_owned(),
+        None => "unconfigured reason=no-link-plist-or-HERDR_EDGE_URL".to_owned(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeConfigSource {
+    LinkProdPlist,
+    LinkPlist,
+    LinkCandidatePlist,
+    ProcessEnv,
+}
+
+impl EdgeConfigSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LinkProdPlist => "link-prod-plist",
+            Self::LinkPlist => "link-plist",
+            Self::LinkCandidatePlist => "link-candidate-plist",
+            Self::ProcessEnv => "link-env",
+        }
     }
 }
 
@@ -329,6 +350,8 @@ struct EdgeConfigView {
     host: String,
     origin: String,
     plist: Option<PathBuf>,
+    source: EdgeConfigSource,
+    label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -350,15 +373,19 @@ impl RemoteProbeReport {
 
 fn resolve_edge_config() -> Option<EdgeConfigView> {
     let home = home_dir()?;
-    let candidates = [
-        home.join("Library")
-            .join("LaunchAgents")
-            .join("dev.herdr-mcp.link-prod.plist"),
-        home.join("Library")
-            .join("LaunchAgents")
-            .join("dev.herdr-mcp.link.plist"),
+    let plist_candidates = [
+        ("dev.herdr-mcp.link-prod", EdgeConfigSource::LinkProdPlist),
+        ("dev.herdr-mcp.link", EdgeConfigSource::LinkPlist),
+        (
+            "dev.herdr-mcp.link-rust-candidate",
+            EdgeConfigSource::LinkCandidatePlist,
+        ),
     ];
-    for path in candidates {
+    for (label, source) in plist_candidates {
+        let path = home
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{label}.plist"));
         if !path.is_file() {
             continue;
         }
@@ -368,10 +395,25 @@ fn resolve_edge_config() -> Option<EdgeConfigView> {
                 host,
                 origin,
                 plist: Some(path),
+                source,
+                label: Some(label.to_owned()),
             });
         }
     }
-    None
+
+    let edge_url = std::env::var("HERDR_EDGE_URL")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())?;
+    let host = edge_host(&edge_url)?;
+    let origin = https_origin_for_host(&host)?;
+    Some(EdgeConfigView {
+        host,
+        origin,
+        plist: None,
+        source: EdgeConfigSource::ProcessEnv,
+        label: None,
+    })
 }
 
 fn https_origin_for_host(host: &str) -> Option<String> {
@@ -887,6 +929,32 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn edge_config_source_labels_candidate_and_env_paths() {
+        assert_eq!(
+            EdgeConfigSource::LinkCandidatePlist.as_str(),
+            "link-candidate-plist"
+        );
+        assert_eq!(EdgeConfigSource::ProcessEnv.as_str(), "link-env");
+        let edge = EdgeConfigView {
+            host: "herdr-edge-device.username.workers.dev".to_owned(),
+            origin: "https://herdr-edge-device.username.workers.dev".to_owned(),
+            plist: None,
+            source: EdgeConfigSource::ProcessEnv,
+            label: None,
+        };
+        let formatted = format_edge_configured_layer(&Some(edge));
+        assert!(formatted.contains("source=link-env"));
+        assert!(!formatted.contains("unconfigured"));
+    }
+
+    #[test]
+    fn unconfigured_edge_layer_names_missing_link_and_env() {
+        let formatted = format_edge_configured_layer(&None);
+        assert!(formatted.contains("unconfigured"));
+        assert!(formatted.contains("HERDR_EDGE_URL"));
     }
 
     #[test]
