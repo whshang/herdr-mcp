@@ -43,9 +43,33 @@ test("server/discover advertises supported versions without OAuth claims", async
   const d = deps();
   const r = await handleMcp(req("d", "server/discover", {}), "w1", d.value);
   assert.equal(r.body.id, "d");
-  assert.deepEqual(r.body.result.supportedVersions, ["2025-11-25", "2025-06-18"]);
+  assert.deepEqual(r.body.result.supportedVersions, [
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+    "2024-10-07",
+  ]);
   assert.equal(r.body.result.capabilities.tools.listChanged, false);
   assert.equal(Object.hasOwn(r.body.result, "authorizationServers"), false);
+});
+
+test("server/discover for openai-mcp keeps SDK wire first and adds 2026-07-28", async () => {
+  const d = deps();
+  d.value.client = { userAgent: "openai-mcp/1.0.0", oauthClientId: null };
+  const r = await handleMcp(req("d", "server/discover", {}), "w1", d.value);
+  assert.equal(r.body.result.supportedVersions[0], "2025-11-25");
+  assert.equal(r.body.result.supportedVersions.includes("2026-07-28"), true);
+});
+
+test("initialize negotiates unknown protocol versions down to SDK wire", async () => {
+  const d = deps();
+  const r = await handleMcp(
+    req(11, "initialize", { protocolVersion: "2026-07-28", capabilities: {}, clientInfo: { name: "ChatGPT" } }),
+    "w1",
+    d.value,
+  );
+  assert.equal(r.body.result.protocolVersion, "2025-11-25");
 });
 
 test("tools/list is exactly the frozen 18-tool epoch-2 catalog", async () => {

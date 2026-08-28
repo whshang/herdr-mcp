@@ -1107,8 +1107,11 @@ fn augment_openai_discover(response: &mut Value) {
     else {
         return;
     };
-    if !versions.iter().any(|value| value == "2026-07-28") {
-        versions.push(json!("2026-07-28"));
+    if !versions
+        .iter()
+        .any(|value| value == mcp::OPENAI_PROBE_PROTOCOL)
+    {
+        versions.push(json!(mcp::OPENAI_PROBE_PROTOCOL));
     }
 }
 
@@ -1704,8 +1707,77 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|value| value == "2026-07-28")
+                .any(|value| value == mcp::OPENAI_PROBE_PROTOCOL)
         );
+    }
+
+    #[tokio::test]
+    async fn openai_discover_accepts_future_protocol_version_header() {
+        let root = test_root("openai-discover-header");
+        let app = candidate_router(test_state(&root));
+        let discover = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "server/discover",
+            "params": {}
+        });
+        let response = app
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(discover),
+                &[
+                    ("user-agent", "openai-mcp/1.0.0"),
+                    ("mcp-protocol-version", mcp::OPENAI_PROBE_PROTOCOL),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["result"]["supportedVersions"][0],
+            mcp::SDK_WIRE_PROTOCOL
+        );
+        assert!(
+            payload["result"]["supportedVersions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == mcp::OPENAI_PROBE_PROTOCOL)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn openai_tools_call_accepts_future_protocol_version_header() {
+        let root = test_root("openai-call-header");
+        let app = candidate_router(test_state(&root));
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "herdr_methods", "arguments": {"query": "ping"}}
+        });
+        let response = app
+            .oneshot(rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(call),
+                &[
+                    ("user-agent", "openai-mcp/1.0.0"),
+                    ("mcp-protocol-version", mcp::OPENAI_PROBE_PROTOCOL),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert!(payload.get("result").is_some());
+        assert!(payload.get("error").is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

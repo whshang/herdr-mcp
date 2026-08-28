@@ -7,10 +7,22 @@ import { classifyOp, type EdgeLimits } from "./limits.js";
 import { checkArgsBudget } from "./payload.js";
 import { newRequestId } from "./pending.js";
 import type { InternalForwardRequest } from "./workstation-do.js";
+import {
+  isChatgptOAuthClientId,
+  isOpenAiMcpUserAgent,
+} from "./mcp-chatgpt-transport.js";
 
 export const MCP_SERVER_NAME = "herdr-mcp";
 export const MCP_LEGACY_PROTOCOL = "2025-11-25";
-export const MCP_SUPPORTED_PROTOCOLS = [MCP_LEGACY_PROTOCOL, "2025-06-18"] as const;
+/** ChatGPT/OpenAI connector probe version; advertised on discover only. */
+export const OPENAI_PROBE_PROTOCOL = "2026-07-28" as const;
+export const MCP_SUPPORTED_PROTOCOLS = [
+  MCP_LEGACY_PROTOCOL,
+  "2025-06-18",
+  "2025-03-26",
+  "2024-11-05",
+  "2024-10-07",
+] as const;
 
 export type JsonRpcId = string | number | null;
 
@@ -26,12 +38,18 @@ export interface McpResponse {
   body: Record<string, unknown> | null;
 }
 
+export interface McpClientContext {
+  userAgent?: string | null;
+  oauthClientId?: string | null;
+}
+
 export interface McpDeps {
   limits: EdgeLimits;
   forward(stub: unknown, body: string): Promise<Response>;
   getStub(workstationId: string): unknown;
   logger: { warn(event: string, fields?: Record<string, unknown>): void };
   now?: () => number;
+  client?: McpClientContext;
 }
 
 interface ForwardEnvelope {
@@ -122,6 +140,25 @@ export function publicContractIdentity(): Record<string, unknown> {
   };
 }
 
+function isOpenAiDiscoverClient(client?: McpClientContext): boolean {
+  return isOpenAiMcpUserAgent(client?.userAgent) || isChatgptOAuthClientId(client?.oauthClientId);
+}
+
+function discoverSupportedVersions(client?: McpClientContext): string[] {
+  const versions: string[] = [...MCP_SUPPORTED_PROTOCOLS];
+  if (isOpenAiDiscoverClient(client) && !versions.includes(OPENAI_PROBE_PROTOCOL)) {
+    versions.push(OPENAI_PROBE_PROTOCOL);
+  }
+  return versions;
+}
+
+function negotiateProtocolVersion(requested: unknown): string {
+  if (typeof requested === "string" && (MCP_SUPPORTED_PROTOCOLS as readonly string[]).includes(requested)) {
+    return requested;
+  }
+  return MCP_LEGACY_PROTOCOL;
+}
+
 export async function handleMcp(
   input: unknown,
   workstationId: string,
@@ -143,8 +180,9 @@ export async function handleMcp(
     if (request.params !== undefined && !isRecord(request.params)) {
       return rpcError(id, -32602, "Invalid params");
     }
+    const params = isRecord(request.params) ? request.params : {};
     return rpcResult(id, {
-      protocolVersion: MCP_LEGACY_PROTOCOL,
+      protocolVersion: negotiateProtocolVersion(params.protocolVersion),
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
       instructions: "Stable edge MCP contract epoch 2; workstation execution is relayed over authenticated Herdr Link.",
@@ -155,7 +193,7 @@ export async function handleMcp(
   if (request.method === "server/discover") {
     return rpcResult(id, {
       resultType: "complete",
-      supportedVersions: [...MCP_SUPPORTED_PROTOCOLS],
+      supportedVersions: discoverSupportedVersions(deps.client),
       capabilities: { tools: { listChanged: false } },
       instructions: "Herdr Edge with frozen MCP contract epoch 2.",
       ttlMs: 3_600_000,
