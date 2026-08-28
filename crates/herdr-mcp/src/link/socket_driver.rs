@@ -20,9 +20,12 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
-use tokio_tungstenite::{WebSocketStream, connect_async_tls_with_config};
+use tokio_tungstenite::{
+    WebSocketStream, client_async_tls_with_config, connect_async_tls_with_config,
+};
 use url::Url;
 
+use super::proxy::{connect_via_http_proxy, resolve_link_proxy, wss_target};
 use super::transport::{
     LINK_DEFAULT_MAX_FRAME_BYTES, LinkTransportCore, SocketAttemptId, TransportAction,
     TransportError,
@@ -455,10 +458,20 @@ pub async fn connect_socket_attempt(
     ensure_rustls_crypto_provider();
     let config = config.normalized();
     let request = client_request(edge_url, application_protocol, link_token)?;
-    let (socket, response) =
-        connect_async_tls_with_config(request, Some(config.websocket_config()), true, None)
+    let (socket, response) = if let Some(proxy) = resolve_link_proxy() {
+        let (target_host, target_port) =
+            wss_target(edge_url).ok_or(SocketDriverError::InvalidUrl)?;
+        let tcp = connect_via_http_proxy(&proxy.url, &target_host, target_port)
             .await
             .map_err(|_| SocketDriverError::ConnectFailed)?;
+        client_async_tls_with_config(request, tcp, Some(config.websocket_config()), None)
+            .await
+            .map_err(|_| SocketDriverError::ConnectFailed)?
+    } else {
+        connect_async_tls_with_config(request, Some(config.websocket_config()), true, None)
+            .await
+            .map_err(|_| SocketDriverError::ConnectFailed)?
+    };
 
     let selected_protocol = verify_selected_protocol(
         response.headers().get(SEC_WEBSOCKET_PROTOCOL),
