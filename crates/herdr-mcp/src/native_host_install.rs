@@ -120,10 +120,10 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
 /// This is invoked after managed service update/rollback so Chrome keeps talking
 /// to the same generation as the production runtime without rewriting manifests
 /// or consuming native-host rollback evidence.
-pub fn sync_owned_runtime_from_active() -> Result<Value, String> {
+pub fn sync_owned_runtime_from_active() -> Result<serde_json::Value, String> {
     #[cfg(not(target_os = "macos"))]
     {
-        Ok(json!({
+        Ok(serde_json::json!({
             "ok": true,
             "skipped": true,
             "reason": "unsupported_platform",
