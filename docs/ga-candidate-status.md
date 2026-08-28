@@ -1,10 +1,10 @@
 # GA Candidate Status — `0.4.0` stable
 
-Status: **`v0.4.0` stable published** (2026-08-28). Stable-channel G9/G10 **PASS**. G1 dogfood stable apply **PASS**. **Full GA not declared** — G4 stable clean install UAT remains open in [`ga-release-gate.md`](./ga-release-gate.md).
+Status: **`v0.4.0` stable published** (2026-08-28). Stable-channel G9/G10 **PASS**. G1 dogfood stable apply **PASS**. G4 second-Mac stable clean install **PASS** (pi-ga-20260828). **Full GA not declared** — G25 remains **PARTIAL** (G14/G15 veto-adjacent rows; see [`ga-release-gate.md`](./ga-release-gate.md)).
 
-SSOT for gate rows: [`docs/ga-release-gate.md`](./ga-release-gate.md). Exit-alpha runbook: [`docs/exit-alpha-checklist.md`](./exit-alpha-checklist.md).
+SSOT for gate rows: [`docs/ga-release-gate.md`](./ga-release-gate.md). Exit-alpha runbook: [`docs/exit-alpha-checklist.md`](./exit-alpha-checklist.md). Release planes: [`docs/release-model.md`](./release-model.md).
 
-**FREEZE:** alpha.19 = final alpha candidate. **No alpha.20.** No delete release/branch/worktree. Prior tags `v0.4.0-alpha.19`, `v0.4.0-rc.1` retained.
+**FREEZE:** alpha.19 = final alpha candidate. **No alpha.20.** No delete release/branch/worktree. Historical tags retained per [`release-model.md`](./release-model.md#alpha-release-retention-policy).
 
 ## Stable shipped
 
@@ -36,8 +36,21 @@ SSOT for gate rows: [`docs/ga-release-gate.md`](./ga-release-gate.md). Exit-alph
 | Binary SHA (darwin aarch64) | PASS | `621d74d268b5299a7141e67710e107e38efd87f16594dfb8ff54ce66097e29c5` |
 | Updater provenance | PASS | stable `update check` `provenance_verified=true` |
 | Attestation | PASS | `actions/attest` job green on run 33157370273 |
-| Extension zip excluded from manifest assets | PASS | manifest lists 2 platform binaries only |
+| Extension zip excluded from manifest assets | PASS | manifest lists 2 platform binaries only; zip `0.1.68` bundled separately |
 | Prerelease flag | PASS | GitHub Release `isPrerelease=false` |
+
+## G4 second Mac stable clean install (2026-08-28 · PASS)
+
+Evidence: [`docs/history/ga/g4-second-mac-stable-v040-uat-20260828.md`](./history/ga/g4-second-mac-stable-v040-uat-20260828.md)
+
+| Check | Result | Notes |
+| --- | --- | --- |
+| Release binary | PASS | `v0.4.0` stable — not alpha.17/alpha.19 |
+| `install` / `doctor` | PASS | 7/7 layers on pi |
+| Independent Worker | PASS | `herdr-edge-yitaidiannao-local-ga` (retained UAT env) |
+| Link | PASS | via operator proxy |
+| Extension + native-host | PASS | extension `0.1.68`; 4 manifests |
+| Stable channel at head | PASS | `update check` `available=false` |
 
 ## G6/G7 dogfood public UAT (2026-08-28 · PASS · alpha.19)
 
@@ -83,24 +96,25 @@ Evidence (local, gitignored): `docs/_wip/g910-stable-v040-20260828.json`
 | Post-apply link | PASS | prod Link Rust, `production_ready=true` |
 | Post-apply `doctor` | PASS | all layers green |
 
-## Remaining GA blockers (honest)
+## Remaining before GA declare (honest)
 
 | Gate | Why still open |
 | --- | --- |
-| G4 | Second Mac clean install from `v0.4.0` stable Release not yet sealed (prior G18 used `alpha.17`) |
-| G24 / G25 | G4 UAT open; **do not declare GA** until G4 seals |
+| G25 | **PARTIAL** — G14/G15 (and related veto #5/#7) not fully sealed; G4 install path **PASS** |
+| G8 / G11 / G14 / G15 / G17 / G19 / G23 | **PARTIAL** — see scorecard; not all are veto-level |
 
 ## Can declare GA stable?
 
-**Not yet.** `v0.4.0` stable Release exists; stable-channel G9/G10 PASS; G1 dogfood `0.4.0`; user-facing docs reference `v0.4.0` stable. Missing: **G4** second-Mac stable clean install UAT; G25 veto #8 until G4 seals.
+**Not yet.** `v0.4.0` stable Release exists; G4 second-Mac stable clean install PASS; dogfood `0.4.0`; user docs reference stable. Remaining: honest G25 / partial rows per [`ga-release-gate.md`](./ga-release-gate.md) — do not declare GA until vetoes clear or are explicitly DEFERRED post-GA.
 
 ## Next owner actions
 
-1. **G4 — second Mac clean install** from [`v0.4.0` Release](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0) binary (see [clean-machine-uat §One-command bootstrap](i18n/en/clean-machine-uat.md#one-command-operator-bootstrap-second-mac-default-instance); prior G18 used `alpha.17`).
-2. Re-run scorecard; if G4/G24/G25 clear → declare GA.
+1. Re-run scorecard when G14/G15 (or agreed post-GA DEFERRED) positions are updated.
+2. Optional: dedicated `extension-release.yml` workflow (see [`release-model.md`](./release-model.md)).
 
 ## Related
 
 - [`docs/ga-release-gate.md`](./ga-release-gate.md)
 - [`docs/exit-alpha-checklist.md`](./exit-alpha-checklist.md)
+- [`docs/history/ga/README.md`](./history/ga/README.md)
 - [`docs/i18n/en/clean-machine-uat.md`](./i18n/en/clean-machine-uat.md)

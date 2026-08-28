@@ -1,6 +1,6 @@
 # herdr-mcp GA Release Gate
 
-状态：`v0.4.0` stable 已发布（2026-08-28）；stable-channel G9/G10 PASS；G20–G22 docs freeze PASS；**仍未达 GA**（G4 stable UAT、G1 dogfood apply 未清）
+状态：`v0.4.0` stable 已发布（2026-08-28）；stable-channel G9/G10 PASS；G20–G22 docs freeze PASS；**G4** 第二台 Mac 从 stable Release 干净安装 **PASS**（pi-ga-20260828）；**仍未 declare GA**（G25 及其他 PARTIAL 门禁见 scorecard）
 本文件是 **GA 判定的唯一事实源（SSOT）**。架构演进细节见 [`herdr-architecture-roadmap.md`](./herdr-architecture-roadmap.md)。
 
 ## GA 定义
@@ -289,14 +289,16 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 
 **Stable-channel G9/G10（2026-08-28 · PASS）：** `update.channel=stable` → `alpha.19` → `update check`/`apply` → `0.4.0` → `rollback` → `alpha.19`；native-host/doctor/link 全绿。证据 [`_wip/g910-stable-v040-20260828.json`](./_wip/g910-stable-v040-20260828.json)。Release run [`33157370273`](https://github.com/whshang/herdr-mcp/actions/runs/33157370273)。
 
-**第二台 Mac 默认实例 UAT（2026-08-28 · owner re-eval · G18 PASS）：** macOS 15.7.3 aarch64 干净机；Release `v0.4.0-alpha.17` 二进制 → `install` → 独立 Worker + Rust Link + native-host + extension；ChatGPT Connector OAuth/tools/list epoch2/18 + tools/call OK。详见 **G18 second-Mac evidence**。
+**第二台 Mac 默认实例 UAT（2026-08-28 · G4 PASS · stable `v0.4.0`）：** macOS aarch64 干净机；Release `v0.4.0` stable 二进制 → `install` → 独立 Worker `herdr-edge-yitaidiannao-local-ga` + Link（proxy）+ native-host（4 manifests）+ extension `0.1.68`；`doctor` 7/7；stable channel at head。详见 [`history/ga/g4-second-mac-stable-v040-uat-20260828.md`](./history/ga/g4-second-mac-stable-v040-uat-20260828.md)。
+
+**第二台 Mac G18（2026-08-28 · historical · alpha.17）：** macOS 15.7.3 aarch64 干净机；Release `v0.4.0-alpha.17` 二进制 → `install` → 独立 Worker + Rust Link + native-host + extension；ChatGPT Connector OAuth/tools/list epoch2/18 + tools/call OK。Superseded for G4 by stable run above; evidence retained for audit.
 
 | ID | 评分 | 一行证据 |
 | --- | --- | --- |
 | G1 | **PASS** | `v0.4.0` stable tag + Release + user docs + dogfood runtime 已统一；无 alpha 主口径 |
 | G2 | **PASS** | stable tag-path publish 全绿（run `33157370273`）；manifest `source_commit=19fc6a4`；rc.1 run `33155520284` 仍有效 |
 | G3 | **PASS** | 顶层 CLI + symlink → `runtime/current`；README/install 已对齐 `v0.4.0` stable |
-| G4 | **PARTIAL** | 第二台 Mac + dogfood install/doctor 已封；从 **`v0.4.0` stable Release** 干净安装 UAT 未封（G18 曾用 alpha.17） |
+| G4 | **PASS** | 第二台 Mac（pi-ga-20260828）从 **`v0.4.0` stable Release** 干净安装；Worker `herdr-edge-yitaidiannao-local-ga`；extension `0.1.68`；doctor 7/7；stable channel at head。证据 [`history/ga/g4-second-mac-stable-v040-uat-20260828.md`](./history/ga/g4-second-mac-stable-v040-uat-20260828.md) |
 | G5 | **PASS** | production owner=rust；link-prod Rust；`production_ready=true` |
 | G6 | **PASS** | dogfood 公网 OAuth+tools/list 18/18+mutation+long-exec 已封（2026-08-28）；+ 第二台 Mac tools/call |
 | G7 | **PASS** | dogfood 公网 Edge→Link→runtime 全矩阵已封；soak/failover 未做（非 veto） |
@@ -316,10 +318,10 @@ GA merge/tag 前：Rust unit/integration、service guardian、Node compatibility
 | G21 | **PASS** | 站点 CI 可绿；`v0.4.0` stable tag 已打；docs freeze 完成 |
 | G22 | **PASS** | 用户安装主路径不依赖开发仓库；第二台 Mac 实证已封 |
 | G23 | **PARTIAL** | main CI 可绿；stable tag-path Rust Release 全绿（`33157370273`）；#142 merged |
-| G24 | **PARTIAL** | 剩余 blocker：**G4** stable clean install UAT（第二台 Mac 从 `v0.4.0` Release） |
-| G25 | **PARTIAL** | G4 UAT 未封；veto #8 待 G4 封板；**不得 declare GA** |
+| G24 | **PASS** | P0 blocker 队列已清（G4 stable clean install sealed 2026-08-28） |
+| G25 | **PARTIAL** | G4/G18 安装与文档路径已封；veto #5/#7 仍受 G14/G15 PARTIAL 约束；**不得 declare GA** 直至 veto 全清或 honest DEFERRED |
 
-**合计（诚实快照）**：PASS 13 · PARTIAL 8 · FAIL 0 · DEFERRED 1 · UNKNOWN 0
+**合计（诚实快照）**：PASS 15 · PARTIAL 6 · FAIL 0 · DEFERRED 1 · UNKNOWN 0
 
 ### G6/G7 dogfood public evidence（2026-08-28 · alpha.19 · PASS）
 
@@ -480,7 +482,7 @@ Score as **PARTIAL**, not PASS: advances honest same-Mac runtime install path; c
 
 | Path | When to use | Risk to dogfood |
 | --- | --- | --- |
-| **A. Second Mac / VM, default instance** | Canonical G18 + G7 seal; deploy an independent Edge Worker first ([clean-machine-uat §Second Mac Worker](i18n/en/clean-machine-uat.md)); copy the internal [_wip Second Mac GA UAT Agent prompt](_wip/en/second-mac-ga-uat-agent-prompt.md) to the pi coding Agent (not the public install tutorial) | None |
+| **A. Second Mac / VM, default instance** | Canonical G18 + G7 seal; deploy an independent Edge Worker first ([clean-machine-uat §Second Mac Worker](i18n/en/clean-machine-uat.md)); archived [Second Mac GA UAT Agent prompt](history/ga/second-mac-ga-uat-agent-prompt-en.md) (G4 sealed) | None |
 | **B. Dogfood Mac, default instance, maintenance window** | Owner accepts brief prod Link/Edge coupling | OAuth/tools exercise uses live `link-prod`; follow rollback runbook if anything regresses |
 
 **Do not** run ChatGPT OAuth UAT through `--instance uat` on the dogfood Mac: uat has no owned Link/Edge identity and must not cut over `link-prod`.
@@ -523,12 +525,12 @@ herdr-mcp --instance uat uninstall
 
 ## Current P0 work queue
 
-按 2026-08-28 GA freeze（`v0.4.0` stable published；stable-channel G9/G10 PASS；G20–G22 docs freeze DONE）排序：
+按 2026-08-28 post-stable cleanup（`v0.4.0` published；G4 stable clean install PASS）排序：
 
-1. **G4 — stable Release 干净安装 UAT**（第二台 Mac 从 [`v0.4.0` Release](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.0) 二进制；见 [clean-machine-uat](i18n/en/clean-machine-uat.md)）。
-2. **G16 — 保持 DEFERRED**（browser terminal / true-steer 不进第一 GA）。
+1. **G16 — 保持 DEFERRED**（browser terminal / true-steer 不进第一 GA）。
+2. **G14 / G15 / G8 / G11 / G17 — 诚实 PARTIAL**（非全部 veto；见 scorecard）。
 
-**已完成：** `v0.4.0` stable tag + tag-path PASS（#142）、preview `alpha.19↔rc.1` + stable `alpha.19↔0.4.0` update/rollback、G1 dogfood stable apply（`upd-1787908596603-46525-621d74d2`）、G2/G6/G7/G9/G10/G12/G13/G18/G20/G21/G22。
+**已完成：** `v0.4.0` stable tag + tag-path PASS（#142）、preview `alpha.19↔rc.1` + stable `alpha.19↔0.4.0` update/rollback、G1 dogfood stable apply、G2/G4/G6/G7/G9/G10/G12/G13/G18/G20/G21/G22、第二台 Mac G4 stable clean install（pi-ga-20260828）。
 
 ### GA closure C — stable update/rollback rehearsal（2026-08-28 · PASS）
 
@@ -546,7 +548,11 @@ herdr-mcp rollback
 herdr-mcp doctor
 ```
 
-**Remaining for GA:** G4 stable clean install UAT on second Mac from `v0.4.0` Release.
+**Remaining for GA declare:** honest G25 veto clearance（G14/G15 等 PARTIAL 行）— **not** G4 install path.
+
+## Release model
+
+Runtime vs extension vs contract compatibility: [`release-model.md`](./release-model.md).
 
 ---
 

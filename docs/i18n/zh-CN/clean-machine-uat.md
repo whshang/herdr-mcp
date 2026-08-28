@@ -2,7 +2,7 @@
 
 给**从 GitHub Release 二进制安装**（不把本仓库当 runtime 安装源）用的命令清单。
 
-仅完成此清单也**不要**宣告完整 GA。`v0.4.0` stable 已发布；stable-channel G9/G10 PASS；剩余 veto（G4、G1 dogfood apply）未清前不得宣告 GA。
+仅完成此清单也**不要**宣告完整 GA。`v0.4.0` stable 已发布；G4 第二台 Mac stable 干净安装 **PASS**（pi-ga-20260828）。完整 GA 宣告仍受 [`ga-release-gate.md`](../../ga-release-gate.md) 中 G25 PARTIAL 约束。
 
 ## 同机隔离诚实说明
 
@@ -49,11 +49,11 @@
 
 走 B 节（公网 ChatGPT）前，先部署**机器专属** Worker：唯一 Worker `name`、唯一 `DEFAULT_WORKSTATION_ID`（如 `pi-uat-<date>`）、`OAUTH_ISSUER` 对应该 Worker URL；Link 侧 `HERDR_WORKSTATION_ID` 与之相同。步骤见 [Agent 协助安装](agent-install.md) §6（Edge 部署 + `LINK_SHARED_SECRET`）；UAT 保持 `workers_dev = true` 与 `routes = []`。
 
-**仅内部 GA UAT（非终端用户安装）：** 把 [第二台 Mac GA UAT Agent 协议](../../_wip/zh-CN/second-mac-ga-uat-agent-prompt.md) 复制给 pi 上的 coding Agent（Agent 优先协议；含 Cloudflare Token 暂停、Link env 覆盖、最终报告模板）。普通用户走 [install.md](install.md) 或 [agent-install.md](agent-install.md)。
+**内部 GA UAT（历史协议）：** 已归档于 [第二台 Mac GA UAT Agent 协议](../../history/ga/second-mac-ga-uat-agent-prompt-zh-CN.md)（G4 已于 2026-08-28 封板）。后续周期从此清单 fork，勿当作终端用户安装。普通用户走 [install.md](install.md) 或 [agent-install.md](agent-install.md)。
 
 ## 一键操作者引导（第二台 Mac，默认实例）
 
-**G4 stable 干净安装（维护者）：** 使用 **`v0.4.0` stable Release**，不要用 `alpha.17`/`alpha.19`。先前 G18 PASS 用的是 `v0.4.0-alpha.17`；G4 需从 stable 重新封板。
+**G4 stable 干净安装（维护者）：** 使用 **`v0.4.0` stable Release**。证据：[`history/ga/g4-second-mac-stable-v040-uat-20260828.md`](../../history/ga/g4-second-mac-stable-v040-uat-20260828.md)。先前 G18 使用 `v0.4.0-alpha.17`。
 
 仅在测试更新 stable 或有意测 prerelease 时替换 `TAG`：
 

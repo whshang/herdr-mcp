@@ -329,7 +329,7 @@ pub fn plan_dry_run_with_agents(
             "Dry-run only. No launchd bootout/bootstrap and no plist writes occurred.",
             "ready_for_execute ignores dual_verification_uat_recorded (seal gate); execute still requires HERDR_LINK_CUTOVER_I_UNDERSTAND=1.",
             "Do not confuse candidate soak (dev.herdr-mcp.link-rust-candidate) with production cutover.",
-            "Independent Shell dual verification remains mandatory before production_ready seal; see docs/_wip/g5-link-production-cutover.md",
+            "Independent Shell dual verification remains mandatory before production_ready seal; see docs/history/ga/g5-link-production-cutover.md",
             "Dry-run helper landed does not equal G5 cutover complete or production_ready=true.",
         ],
     })

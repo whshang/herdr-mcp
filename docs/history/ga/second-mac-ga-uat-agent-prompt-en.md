@@ -1,3 +1,5 @@
+# Completed / Historical (G4 sealed 2026-08-28)
+
 # INTERNAL GA UAT — Second Mac Agent contract (not end-user install)
 
 > **Audience:** Herdr-mcp maintainers running **G18 clean-machine UAT** on a second Mac (pi).  

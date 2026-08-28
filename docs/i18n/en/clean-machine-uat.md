@@ -2,7 +2,7 @@
 
 Commands-only runbook for installing from a **GitHub Release binary** (no repo checkout as the runtime install source).
 
-Do **not** declare full GA from this checklist alone. `v0.4.0` stable is published; stable-channel G9/G10 PASS; remaining vetoes (G4, G1 dogfood apply) must clear before GA declaration.
+Do **not** declare full GA from this checklist alone. `v0.4.0` stable is published; G4 second-Mac stable clean install **PASS** (pi-ga-20260828). Full GA declare still blocked by G25 PARTIAL rows in [`ga-release-gate.md`](../../ga-release-gate.md).
 
 ## Isolation honesty (same physical Mac)
 
@@ -49,11 +49,11 @@ Public ChatGPT MCP on a **second Mac** is not "reuse dogfood URL + Link secret."
 
 Deploy a **machine-specific** Worker before section B: unique Worker `name`, unique `DEFAULT_WORKSTATION_ID` (e.g. `pi-uat-<date>`), `OAUTH_ISSUER` matching that Worker URL, and set the same `workstation_id` on Link (`HERDR_WORKSTATION_ID`). Follow [Agent-assisted installation](agent-install.md) §6 (Edge deploy + `LINK_SHARED_SECRET`); keep `workers_dev = true` and `routes = []` for UAT.
 
-**Internal GA UAT only (not end-user install):** copy the [Second Mac GA UAT Agent prompt](../../_wip/en/second-mac-ga-uat-agent-prompt.md) to the pi coding Agent (agent-first contract; Cloudflare Token pause, Link env override, final report template). Regular users install via [install.md](install.md) or [agent-install.md](agent-install.md).
+**Internal GA UAT (historical protocol):** archived at [Second Mac GA UAT Agent prompt](../../history/ga/second-mac-ga-uat-agent-prompt-en.md) (G4 sealed 2026-08-28). For future cycles, fork from this checklist — do not treat as end-user install. Regular users install via [install.md](install.md) or [agent-install.md](agent-install.md).
 
 ## One-command operator bootstrap (second Mac, default instance)
 
-**G4 stable clean install (maintainers):** use the **`v0.4.0` stable Release**, not `alpha.17`/`alpha.19`. Prior G18 PASS used `v0.4.0-alpha.17`; G4 requires re-seal from stable.
+**G4 stable clean install (maintainers):** use the **`v0.4.0` stable Release**. Evidence: [`history/ga/g4-second-mac-stable-v040-uat-20260828.md`](../../history/ga/g4-second-mac-stable-v040-uat-20260828.md). Prior G18 used `v0.4.0-alpha.17`.
 
 Replace `TAG` only when testing a newer stable or intentional prerelease:
 

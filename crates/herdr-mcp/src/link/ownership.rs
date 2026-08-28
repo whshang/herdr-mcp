@@ -499,7 +499,7 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
         "notes": [
             "Read-only report. Does not mutate launchd, plists, or Node Link.",
             "Candidate label is dev.herdr-mcp.link-rust-candidate (link install/uninstall); never confuses with live Node link/link-prod.",
-            "Live production cutover requires independent dual verification; see docs/_wip/g5-link-production-cutover.md",
+            "Live production cutover requires independent dual verification; see docs/history/ga/g5-link-production-cutover.md",
         ],
     })
 }
@@ -586,7 +586,7 @@ pub fn production_ready_gate_catalog() -> Value {
     json!({
         "production_ready": sealed,
         "requires_all": PRODUCTION_READY_GATE_IDS,
-        "cutover_doc": "docs/_wip/g5-link-production-cutover.md",
+        "cutover_doc": "docs/history/ga/g5-link-production-cutover.md",
         "note": "Gates are evaluated by herdr-mcp link status; production_ready follows link seal --execute (cleared by cutover --rollback)",
     })
 }

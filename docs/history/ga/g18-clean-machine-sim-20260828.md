@@ -1,3 +1,5 @@
+# Completed / Historical
+
 # G18 Clean-Machine UAT Simulation — 2026-08-28
 
 ## Scope and honesty statement

@@ -1,3 +1,5 @@
+# Completed / Historical (G4 sealed 2026-08-28)
+
 # 内部 GA UAT — 第二台 Mac Agent 协议（非终端用户安装）
 
 > **受众：** 在第二台 Mac（pi）上跑 **G18 干净机 UAT** 的 herdr-mcp 维护者。  
