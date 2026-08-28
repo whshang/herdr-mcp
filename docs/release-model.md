@@ -10,7 +10,7 @@ Status: **current runtime stable `v0.4.1` published** (2026-08-28). First-GA `v0
 | **Browser Extension Release** | Chrome Web Store item | `extension/manifest.json` `version` | Chrome Web Store automatic update; `native-host install` binds the Store origin to the active runtime | **No** — independent Store lifecycle |
 | **Contract Compatibility** | MCP epoch, tool catalog, state schema, Edge OAuth/MCP surface | Code + release manifest fields | Edge deploy + Link + runtime generation together | **Coupled by epoch**, not by zip filename |
 
-**Critical rule:** Runtime GitHub Releases do **not** distribute the browser extension. The extension is a Chrome Web Store product with its own version and update cadence. Shipping extension `0.1.72` near runtime `0.4.1` does not create a semver or updater coupling between them.
+**Critical rule:** Runtime GitHub Releases do **not** distribute the browser extension. The extension is a Chrome Web Store product with its own version and update cadence. Browser-extension `0.1.x` and runtime `0.4.x` evolve independently; proximity in release time does not create a semver or updater coupling between them.
 
 An extension-only change must **not** force a Rust runtime version bump. Maintainers may use `scripts/pack-extension.mjs` to build a deterministic Store-upload / explicit unpacked-UAT package, but that zip is not an end-user Runtime Release asset.
 
@@ -47,7 +47,7 @@ Installed generations are content-addressed (`rust-<sha256-prefix>`). Update app
 | Artifact | Version | Notes |
 | --- | --- | --- |
 | Runtime binary | `0.4.1` | Current stable; updater + service |
-| Chrome Web Store extension | `0.1.72` source snapshot | Independent Store semver/update path; Store publication/development lifecycle is still separate |
+| Browser extension source | `0.1.73` | Current development source; Chrome Web Store published/review version may lag and must be checked independently |
 | Native Messaging host | Managed by runtime generation | `native-host status` must show `runtime_matches_current=true` |
 
 ## Contract Compatibility (shared public surface)
