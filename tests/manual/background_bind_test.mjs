@@ -45,7 +45,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.71" };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.72" };
 const listeners = { onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
@@ -62,6 +62,8 @@ let seedTemplateCaptures = [];
 let tabCreateCount = 0;
 let tabUpdateCount = 0;
 let lastTabUpdate = null;
+let llmHandoffResponder = null;
+const llmHandoffRequests = [];
 const reloadCalls = [];
 const sidePanelOpenCalls = [];
 let projectNavigationReadyAfter = 0;
@@ -85,6 +87,15 @@ const initialLocaleReadGate = new Promise((resolve) => { releaseInitialLocaleRea
 const nativeFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
   const url = String(input || "");
+  if (url === "https://llm.test/v1/chat/completions" && llmHandoffResponder) {
+    const body = JSON.parse(init?.body || "{}");
+    llmHandoffRequests.push(body);
+    const content = llmHandoffResponder(body);
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (url.startsWith("chrome-extension://test-ext/")) {
     const rel = url.slice("chrome-extension://test-ext/".length);
     return new Response(readFileSync(path.join(EXT, rel), "utf8"), {
@@ -1999,6 +2010,118 @@ console.log("\n[z.ai manual handoff separate tab]");
       && storage.herdrWakeBindings[targetKey]?.handoff_from === ZAI_SOURCE,
     "z.ai separate-tab handoff preserves continuity and predecessor",
     JSON.stringify(storage.herdrWakeBindings[targetKey]));
+}
+
+
+// ---- Scenario 10: hard ChatGPT conversation limit falls back to configured LLM ----------------
+console.log("\n[project hard-limit handoff LLM fallback]");
+{
+  for (const key of Object.keys(storage.herdrWakeBindings || {})) {
+    if (key.startsWith(`${PROJECT_KEY}::`)) delete storage.herdrWakeBindings[key];
+  }
+  targetSeeded = false;
+  handoffSeedMode = "confirmed";
+  targetComposerReady = true;
+  targetComposerReadyAfter = 0;
+  targetProbeCount = 0;
+  targetSeedCount = 0;
+  seedTemplateCaptures = [];
+  projectNavigationReadyAfter = 0;
+  projectNavigationPollCount = 0;
+  llmHandoffRequests.length = 0;
+
+  let resolveConfig;
+  const configP = new Promise((r) => { resolveConfig = r; });
+  onMsg({ type: "h2w_set_config", config: {
+    llmJudgeBaseUrl: "https://llm.test/v1",
+    llmJudgeApiKey: "test-key",
+    llmJudgeModel: "handoff-test",
+  } }, {}, (r) => resolveConfig(r));
+  const configured = await configP;
+  ok(configured?.ok === true, "fallback LLM can be configured through the existing Options config path");
+
+  let primaryPromptCount = 0;
+  const fallbackTabId = 470;
+  tabs.set(fallbackTabId, {
+    id: fallbackTabId,
+    url: PROJECT_SOURCE_URL,
+    active: true,
+    status: "complete",
+    listener: (msg, _sender, sendResponse) => {
+      if (msg?.type === "h2w_get_convkey") {
+        sendResponse({ convKey: PROJECT_SOURCE, url: PROJECT_SOURCE_URL, site: "chatgpt" });
+        return;
+      }
+      if (msg?.type === "h2w_snapshot_turn") {
+        sendResponse({
+          assistantText: "Previous settled answer.",
+          turnInProgress: false,
+          generating: false,
+          transcript: "[user]\nImplement the HUD handoff change.\n\n[assistant]\nImplementation is ready for handoff.",
+          handoffBlocked: true,
+          handoffBlockReason: "conversation_limit_ui",
+        });
+        return;
+      }
+      if (msg?.type === "h2w_handoff_prompt") {
+        primaryPromptCount += 1;
+        sendResponse({ ok: false, error: "conversation-limit" });
+        return;
+      }
+      sendResponse({ ok: true });
+    },
+  });
+
+  let resolveBind;
+  const bindP = new Promise((r) => { resolveBind = r; });
+  onMsg({ type: "h2w_bind", tabId: fallbackTabId, workspace_id: "wH", workspace_label: "herdr-mcp (wH)" },
+    { tab: { id: fallbackTabId, url: PROJECT_SOURCE_URL } }, (r) => resolveBind(r));
+  const bound = await bindP;
+  ok(bound?.ok === true, "hard-limit fallback fixture binds the Project source before handoff", JSON.stringify(bound));
+  const sourceKey = `${PROJECT_KEY}::wH`;
+  const continuityId = storage.herdrWakeBindings[sourceKey]?.continuity_id;
+
+  llmHandoffResponder = (body) => {
+    const prompt = String(body?.messages?.[0]?.content || "");
+    const match = prompt.match(/<<<HERDR_HANDOFF_V1 id=([^>]+)>>>/);
+    const id = match?.[1] || "missing";
+    return [
+      `<<<HERDR_HANDOFF_V1 id=${id}>>>`,
+      "# Project handoff",
+      "Current objective: continue the HUD handoff change in a fresh conversation.",
+      "Completed: fallback packet was generated from the bounded source transcript.",
+      "Next: verify live state before mutation.",
+      "<<<END_HERDR_HANDOFF_V1>>>",
+    ].join("\n");
+  };
+
+  let resolveStart;
+  const startP = new Promise((r) => { resolveStart = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: fallbackTabId, trigger: "manual" },
+    { tab: { id: fallbackTabId, url: PROJECT_SOURCE_URL } }, (r) => resolveStart(r));
+  const started = await startP;
+  ok(started?.ok === true && started?.fallback === true && started?.handoff?.summary_source === "llm_fallback",
+    "hard conversation limit switches directly to the configured LLM summary path", JSON.stringify(started));
+  ok(primaryPromptCount === 0, "hard-limit detection does not send an impossible web-model summary prompt");
+  ok(llmHandoffRequests.length === 1
+      && String(llmHandoffRequests[0]?.messages?.[0]?.content || "").includes("<<<SOURCE_TRANSCRIPT>>>")
+      && String(llmHandoffRequests[0]?.messages?.[0]?.content || "").includes("Implement the HUD handoff change"),
+    "fallback LLM receives one bounded source transcript under the existing handoff contract");
+
+  await waitForTest(() => storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_TARGET, 5000);
+  ok(storage.herdrWakeBindings[sourceKey]?.active_conv_key === PROJECT_TARGET
+      && storage.herdrWakeBindings[sourceKey]?.continuity_id === continuityId,
+    "LLM fallback rejoins the normal Project cutover and preserves continuity", JSON.stringify(storage.herdrWakeBindings[sourceKey]));
+
+  llmHandoffResponder = null;
+  let resolveClearConfig;
+  const clearConfigP = new Promise((r) => { resolveClearConfig = r; });
+  onMsg({ type: "h2w_set_config", config: {
+    llmJudgeBaseUrl: "",
+    llmJudgeApiKey: "",
+    llmJudgeModel: "",
+  } }, {}, (r) => resolveClearConfig(r));
+  await clearConfigP;
 }
 
 console.log(`\n=== ${failures === 0 ? "BACKGROUND BIND ALL PASS" : failures + " FAILURES"} ===`);

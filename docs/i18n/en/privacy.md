@@ -10,7 +10,7 @@ The extension's single purpose is to connect supported Web AI conversations to t
 
 To provide that user-facing functionality, the extension may handle the following data on supported Web AI sites:
 
-- **Website content and personal communications:** conversation text and page state needed for continuity, queued messages, handoff/recovery, and optional LLM analysis.
+- **Website content and personal communications:** conversation text and page state needed for continuity, queued messages, handoff/recovery, optional LLM analysis, and the user-invoked handoff fallback described below.
 - **Web history:** the current supported-site URL, conversation/project identifiers derived from that URL, and limited navigation state needed to associate the active page with a Herdr workspace. The extension does not build or sell a general-purpose browsing-history profile.
 - **User activity:** turn state, submit/settle/recovery timestamps, extension button/toggle state, and other bounded interaction state needed to determine when continuity and recovery actions are safe.
 - **Authentication information:** an optional API key for a user-configured OpenAI-compatible LLM endpoint when the user explicitly configures that feature.
@@ -39,7 +39,7 @@ The extension communicates only as needed for its user-facing features:
 
 1. **Local Herdr / herdr-mcp on the same computer.** Native Messaging is used to exchange bounded requests and live workspace state with the installed native host. This traffic stays on the user's computer.
 2. **Supported Web AI sites.** The extension runs only on its documented supported browser surfaces (currently ChatGPT, Claude, z.ai, and DeepSeek) to observe the current conversation state and perform user-facing continuity/recovery interactions.
-3. **A user-configured LLM endpoint, only when explicitly enabled.** If the user configures the optional OpenAI-compatible LLM analysis feature, the extension sends the relevant recent user/assistant text plus the user-supplied API credential to the endpoint chosen by the user. The endpoint is not selected or operated by the Herdr publisher by default; its own privacy and retention terms apply.
+3. **A user-configured LLM endpoint, only for configured LLM features.** If the user configures an OpenAI-compatible LLM endpoint, the extension can send relevant user/assistant text plus the user-supplied API credential to that endpoint for optional post-turn analysis. If conversation handoff is invoked by the user, or is triggered by an Auto policy the user enabled, and the current Web AI conversation cannot produce the required handoff summary because it has reached a hard conversation limit, the handoff prompt cannot be submitted, or the primary summary settles without a valid packet, the extension can instead send a bounded source transcript to that same configured endpoint to generate the handoff packet. The fallback transcript contains only user/assistant conversation text selected by the extension and is bounded to the extension's handoff limit (currently 70,000 characters, preserving early task framing plus recent operational state when truncation is required). The endpoint is chosen by the user and is not selected or operated by the Herdr publisher by default; the endpoint provider's own privacy and retention terms apply.
 
 The extension does not sell user data, send user data to advertising networks, or transfer user data for unrelated profiling or credit/lending decisions.
 
@@ -52,7 +52,7 @@ The extension requests Chrome permissions only to provide the described function
 - `alarms` — wake the MV3 service worker periodically so it can restore missing local Herdr state streams and timers after Chrome suspends it;
 - `nativeMessaging` — connect to the locally installed herdr-mcp native host;
 - `sidePanel` — host Herdr Browser Control Center;
-- host access — operate on supported Web AI sites, the local herdr-mcp endpoint, and an optional endpoint explicitly configured by the user for LLM analysis.
+- host access — operate on supported Web AI sites, the local herdr-mcp endpoint, and an optional endpoint explicitly configured by the user for LLM analysis and handoff-summary fallback.
 
 **No remote executable code is used.** All executable JavaScript is packaged with the extension. Network responses are handled as data and are not evaluated, imported, or executed as JavaScript or Wasm.
 

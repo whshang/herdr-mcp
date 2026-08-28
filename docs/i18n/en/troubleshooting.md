@@ -223,7 +223,7 @@ Content disappearing without confirmed delivery is the actual reliability failur
 
 ## Symptom: Manual handoff is unavailable
 
-Open **Browser Control Center → Current page** first. Manual handoff is intentionally not duplicated in the HUD. Then verify:
+Use **Handoff** in the in-page HUD. If it is unavailable or disabled, verify:
 
 - the current site/conversation type supports handoff;
 - a workspace is bound;

@@ -51,7 +51,7 @@ The HUD can expose:
 - **Herdr monitor** — inspect the bound workspace before continuing;
 - **LLM analysis** — ask a small configured model whether the latest reply is clearly unfinished;
 
-The HUD exposes only Continue / Check Herdr / LLM decide; these page-scoped manual progression actions are locked while Auto is on. Workspace binding and Manual handoff stay in the Side Panel. Manual handoff has a single UI entry in **Control Center → Current page** and is the deliberate exception: it can start with Auto on or off on supported conversations, pauses source automatic wakes during transfer, and makes the target inherit the source Auto state.
+The HUD exposes Continue / Check Herdr / LLM decide plus Manual handoff. The first three page-scoped progression actions are locked while Auto is on; Manual handoff remains available when its safety gates pass. Workspace binding and local Herdr controls stay in the Side Panel. Manual handoff has a single UI entry in the **HUD**, pauses source automatic wakes during transfer, and makes the target inherit the source Auto state.
 
 ## Queue: explicit next-turn user intent comes before auto-continue
 
@@ -220,9 +220,11 @@ It does **not** certify that runtime or Git state is still current. The fresh co
 
 ## Manual handoff
 
-Manual handoff is useful at a natural work boundary before the current conversation becomes difficult to manage. Start it from **Control Center → Current page**; it is intentionally not duplicated in the HUD.
+Manual handoff is useful at a natural work boundary before the current conversation becomes difficult to manage. Start it from the **in-page HUD**; the Side Panel does not duplicate this conversation action.
 
 It is supported for bound ChatGPT Project conversations and stable z.ai `/c/<chat_id>` conversations. Manual handoff can start with Auto on or off; the target conversation inherits the source Auto state. Automatic wakes from the source pause while the transfer is active. For ChatGPT, cutover changes only the Project binding's active conversation target; for z.ai it migrates the conversation-scoped binding. The workspace must not have active working agents, so settled/wake delivery cannot race the cutover.
+
+Normally the current web model creates the handoff packet because it has the richest conversation context. If the page already signals a hard conversation limit, the handoff prompt cannot be submitted, or a settled primary summary does not arrive within the bounded grace period, Herdr uses the configured OpenAI-compatible LLM as a fallback. The fallback receives a bounded user/assistant source transcript, must produce the same validated `HERDR_HANDOFF_V1` packet, and then rejoins the existing target/seed/binding/continuity commit path.
 
 z.ai summary/seed control messages use a raw channel so they are not wrapped again as JSON→MCP coding tasks.
 

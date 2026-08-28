@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.71";
+const H2W_CONTENT_VERSION = "0.1.72";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -1223,6 +1223,8 @@ const H2W_CONTENT_VERSION = "0.1.71";
           const server = ADAPTER.name === "chatgpt"
             ? await fetchChatGptConversationSnapshot()
             : { ok: false };
+          const pressure = CONTEXT_PRESSURE ? await updateContextPressure() : null;
+          const visibleLimit = visibleConversationLimitSignal();
           const serverAssistantCurrent = Boolean(server?.ok && server.currentNodeRole === "assistant");
           const serverUserCurrent = Boolean(server?.ok && server.currentNodeRole === "user");
           const serverSettled = serverAssistantCurrent && server.finished === true;
@@ -1245,6 +1247,10 @@ const H2W_CONTENT_VERSION = "0.1.71";
             serverFinished: serverAssistantCurrent ? server.finished : null,
             serverMessageId: serverAssistantCurrent ? server.messageId || null : null,
             serverCurrentNodeRole: server?.ok ? server.currentNodeRole || "" : "",
+            transcript: server?.ok && server.transcript ? server.transcript : domConversationTranscript(),
+            pressureState: pressure?.state || null,
+            handoffBlocked: Boolean(visibleLimit),
+            handoffBlockReason: visibleLimit ? "conversation_limit_ui" : null,
           });
         })();
         return true;
@@ -1263,6 +1269,19 @@ const H2W_CONTENT_VERSION = "0.1.71";
             markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
           }
           if (!result?.ok || ADAPTER.name === "chatgpt") {
+            if (result?.ok && ADAPTER.name === "chatgpt") {
+              // A hard conversation cap can surface only after Send is accepted.
+              // Give the page a short window to expose that terminal UI signal
+              // so background can switch immediately to the fallback summarizer.
+              await wait(1200);
+              const visibleLimit = visibleConversationLimitSignal();
+              sendResponse({
+                ...result,
+                handoffBlocked: Boolean(visibleLimit),
+                handoffBlockReason: visibleLimit ? "conversation_limit_ui" : null,
+              });
+              return;
+            }
             sendResponse(result);
             return;
           }
@@ -1538,6 +1557,67 @@ const H2W_CONTENT_VERSION = "0.1.71";
     return parts.map((part) => typeof part === "string" ? part : (part?.text || "")).join("\n").replace(/\s+/g, " ").trim();
   }
 
+  function boundedHandoffTranscript(rows, maxChars = 70000) {
+    const normalized = (rows || [])
+      .map((row) => ({ role: String(row?.role || "").trim(), text: String(row?.text || "").trim() }))
+      .filter((row) => ["user", "assistant"].includes(row.role) && row.text);
+    const render = (items) => items.map((row) => `[${row.role}]\n${row.text}`).join("\n\n");
+    const full = render(normalized);
+    if (full.length <= maxChars) return full;
+
+    const head = [];
+    let headChars = 0;
+    for (const row of normalized) {
+      const next = `[${row.role}]\n${row.text}`;
+      if (head.length >= 12 || headChars + next.length > 12000) break;
+      head.push(row);
+      headChars += next.length + 2;
+    }
+    const tail = [];
+    let tailChars = 0;
+    for (let i = normalized.length - 1; i >= head.length; i -= 1) {
+      const row = normalized[i];
+      const next = `[${row.role}]\n${row.text}`;
+      if (tail.length >= 120 || tailChars + next.length > 54000) break;
+      tail.unshift(row);
+      tailChars += next.length + 2;
+    }
+    return `${render(head)}\n\n[... middle of conversation omitted by Herdr fallback ...]\n\n${render(tail)}`.slice(0, maxChars);
+  }
+
+  function chatGptConversationTranscript(body) {
+    const mapping = body?.mapping || {};
+    const rows = [];
+    let nodeId = body?.current_node || null;
+    for (let i = 0; nodeId && i < 240; i += 1) {
+      const node = mapping?.[nodeId];
+      const message = node?.message;
+      const role = String(message?.author?.role || "");
+      const text = serverMessageText(message);
+      if ((role === "user" || role === "assistant") && text) rows.push({ role, text });
+      nodeId = node?.parent || null;
+    }
+    rows.reverse();
+    return boundedHandoffTranscript(rows);
+  }
+
+  function domConversationTranscript() {
+    return boundedHandoffTranscript(observedConversationTurns());
+  }
+
+  function visibleConversationLimitSignal() {
+    const candidates = [
+      ...document.querySelectorAll('[role="alert"], [aria-live="assertive"], [data-testid*="error"], [data-testid*="limit"]'),
+    ];
+    const pattern = /maximum length for this conversation|conversation (?:has )?reached (?:its )?(?:maximum|limit)|conversation is too long|start (?:a )?new chat|continue in (?:a )?new chat|对话.{0,18}(?:达到|已达|超过).{0,18}(?:上限|最大)|(?:当前)?对话.{0,12}(?:过长|已满)|新建.{0,8}(?:聊天|对话)|会話.{0,12}(?:上限|長すぎ)/i;
+    for (const el of candidates) {
+      if (!el || el.offsetParent === null) continue;
+      const text = normText(el.innerText || el.textContent || "");
+      if (text && pattern.test(text)) return text.slice(0, 240);
+    }
+    return "";
+  }
+
   async function fetchChatGptConversationSnapshot() {
     const conversationId = chatGptConversationId();
     if (!conversationId || ADAPTER.name !== "chatgpt") return { ok: false, reason: "not-chatgpt-conversation" };
@@ -1553,6 +1633,7 @@ const H2W_CONTENT_VERSION = "0.1.71";
       if (!response.ok) return { ok: false, reason: `http-${response.status}` };
       const body = await response.json();
       const mapping = body?.mapping || {};
+      const transcript = chatGptConversationTranscript(body);
       const currentMessage = mapping?.[body?.current_node]?.message || null;
       const currentNodeRole = String(currentMessage?.author?.role || "");
       let nodeId = body?.current_node || null;
@@ -1588,6 +1669,7 @@ const H2W_CONTENT_VERSION = "0.1.71";
           userMessageId: user?.id ? String(user.id) : null,
           userText: serverMessageText(user),
           userCreatedAt: Number(user?.create_time || 0) > 0 ? Number(user.create_time) * 1000 : null,
+          transcript,
         };
       }
       const finishType = String(assistant?.metadata?.finish_details?.type || "");
@@ -1610,6 +1692,7 @@ const H2W_CONTENT_VERSION = "0.1.71";
         userMessageId: user?.id ? String(user.id) : null,
         userText: serverMessageText(user),
         userCreatedAt: Number(user?.create_time || 0) > 0 ? Number(user.create_time) * 1000 : null,
+        transcript,
       };
     } catch (error) {
       return { ok: false, reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
@@ -2666,6 +2749,19 @@ const H2W_CONTENT_VERSION = "0.1.71";
       button.disabled = locked;
       button.setAttribute("aria-disabled", String(locked));
     }
+
+    const handoffStatus = String(hudCache?.handoff?.status || "");
+    const transferBusy = ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(handoffStatus)
+      && hudCache?.handoff?.can_resume !== true;
+    const handoffAvailable = hudCache?.manual_handoff_available === true;
+    const handoffLocked = hudActionBusy
+      || hudCache?.can_handoff !== true
+      || Number(hudCache?.bound_working_count || 0) > 0
+      || transferBusy;
+    hudEls.handoff.hidden = !handoffAvailable;
+    hudEls.handoff.classList.toggle("locked", handoffLocked);
+    hudEls.handoff.disabled = handoffLocked;
+    hudEls.handoff.setAttribute("aria-disabled", String(handoffLocked));
   }
 
   function showHudToast(text, kind = "") {
@@ -2693,7 +2789,8 @@ const H2W_CONTENT_VERSION = "0.1.71";
   function hudLabelsReady(labels) {
     const required = [
       "web_state", "scope_binding_count", "scope_binding_hint", "scope_unbound",
-      "manual_continue", "manual_status", "manual_judge",
+      "manual_continue", "manual_status", "manual_judge", "handoff", "handoff_hint",
+      "handoff_resume", "handoff_working", "handoff_starting", "handoff_started", "handoff_fallback", "handoff_failed", "handoff_llm_required",
       "automation_on", "automation_off", "aria_toggle_automation",
     ];
     return Boolean(
@@ -2781,6 +2878,32 @@ const H2W_CONTENT_VERSION = "0.1.71";
     }
   }
 
+  async function manualHandoffAction() {
+    if (hudActionBusy || hudCache?.manual_handoff_available !== true || hudCache?.can_handoff !== true) {
+      return { ok: false, error: "handoff_unavailable" };
+    }
+    setHudActionBusy(true);
+    showHudToast(hudText("handoff_starting"));
+    try {
+      const result = await sendBg({ type: "h2w_handoff_start", trigger: "manual" });
+      if (result?.ok) {
+        showHudToast(result?.fallback === true ? hudText("handoff_fallback") : hudText("handoff_started"), "ok");
+      } else {
+        const error = String(result?.error || "unknown");
+        showHudToast(
+          error === "handoff_fallback_llm_not_configured"
+            ? hudText("handoff_llm_required")
+            : hudText("handoff_failed", { error }),
+          "err",
+        );
+      }
+      await refreshPageHud();
+      return result;
+    } finally {
+      setHudActionBusy(false);
+    }
+  }
+
   function ensurePageHud() {
     if (hudEls?.host?.isConnected) return hudEls;
     let host = document.getElementById(HUD_ID);
@@ -2849,6 +2972,7 @@ const H2W_CONTENT_VERSION = "0.1.71";
         <button type="button" class="manual manual-continue"></button>
         <button type="button" class="manual manual-status"></button>
         <button type="button" class="manual manual-judge"></button>
+        <button type="button" class="manual manual-handoff"></button>
         <button type="button" class="quick" aria-label=""></button>
       </div>
     `;
@@ -2859,6 +2983,7 @@ const H2W_CONTENT_VERSION = "0.1.71";
       status: shadow.querySelector(".status"),
       scopeCounts: shadow.querySelector(".scope-counts"),
       quick: shadow.querySelector(".quick"),
+      handoff: shadow.querySelector(".manual-handoff"),
       manualButtons: [
         shadow.querySelector(".manual-continue"),
         shadow.querySelector(".manual-status"),
@@ -2876,6 +3001,7 @@ const H2W_CONTENT_VERSION = "0.1.71";
         void manualContinueAction(actions[index]);
       });
     });
+    hudEls.handoff.addEventListener("click", () => { void manualHandoffAction(); });
     return hudEls;
   }
 
@@ -2997,6 +3123,13 @@ const H2W_CONTENT_VERSION = "0.1.71";
       ui.manualButtons[i].textContent = text || "";
       ui.manualButtons[i].title = title || "";
     }
+    const handoffStatus = String(hud?.handoff?.status || "");
+    const handoffBusy = ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(handoffStatus)
+      && hud?.handoff?.can_resume !== true;
+    ui.handoff.textContent = handoffBusy
+      ? hudText("handoff_working")
+      : (hud?.handoff?.can_resume === true ? hudText("handoff_resume") : hudText("handoff"));
+    ui.handoff.title = hudText("handoff_hint");
     syncHudManualButtons();
     ui.quick.hidden = hud?.project_automation_available !== true
       && hud?.conversation_automation_available !== true;

@@ -18,7 +18,7 @@ import {
   conversationInfoFromSupportedUrl,
 } from "./binding-core.js";
 import {
-  buildHandoffRequest, buildHandoffSeed, chatGptConversationInfo,
+  buildHandoffFallbackPrompt, buildHandoffRequest, buildHandoffSeed, chatGptConversationInfo,
   classifyHandoffAssistantReply, extractHandoffPacket, handoffSeedContainsTransfer, handoffStatusIsActive,
   newContinuityId, newTransferId, shouldDiscardRetiredSourceTab,
 } from "./continuity-core.js";
@@ -36,7 +36,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.71";
+const H2W_SCRIPT_VERSION = "0.1.72";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -58,6 +58,9 @@ const PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS = 180000;
 const PAGE_HEALTH_FORCE_RELOAD_REQUEST_MAX_AGE_MS = 15000;
 const PAGE_HEALTH_STORAGE_KEY = "h2wConversationHealthByConv";
 const HANDOFF_STORAGE_KEY = "herdrConversationTransfers";
+const HANDOFF_FALLBACK_ALARM_PREFIX = "h2w-handoff-summary-fallback:";
+const HANDOFF_PRIMARY_SUMMARY_GRACE_MS = 60000;
+const HANDOFF_GENERATING_RECHECK_MS = 45000;
 const PROJECT_AUTOMATION_STORAGE_KEY = "herdrProjectAutomation";
 const CONVERSATION_AUTOMATION_STORAGE_KEY = "herdrConversationAutomation";
 const AUTOMATION_MODE_MANUAL = "manual";
@@ -107,6 +110,7 @@ function hudLabels() {
   const keys = [
     "automation_on", "automation_off", "manual_continue", "manual_status", "manual_judge",
     "manual_continue_hint", "manual_status_hint", "manual_judge_hint",
+    "handoff", "handoff_resume", "handoff_working", "handoff_hint", "handoff_starting", "handoff_started", "handoff_fallback", "handoff_failed", "handoff_llm_required",
     "queue_insert", "queue_insert_count", "queue_insert_hint", "queue_need_message", "queue_added", "queue_sent", "queue_waiting",
     "queue_full", "queue_failed", "queue_extension_reloaded", "queue_background_unavailable", "queue_storage_unavailable",
     "queue_added_draft_changed", "queue_added_clear_failed", "queue_clear_confirm", "queue_cleared",
@@ -1153,6 +1157,8 @@ function handoffView(row, convKey = null) {
     role: convKey && row.target_conv_key === convKey ? "target" : "source",
     trigger: row.trigger || "manual",
     error: row.error || null,
+    summary_source: row.summary_source || null,
+    fallback_reason: row.fallback_reason || null,
     can_resume: canResume,
     age_ms: ageMs,
     created_at: row.created_at || null,
@@ -1643,6 +1649,166 @@ async function fetchLlmJudge(userText, assistantText, cfgOverride = null) {
     await new Promise((r) => setTimeout(r, 800));
   }
   return last;
+}
+
+async function fetchLlmHandoffOnce(prompt) {
+  if (!isLlmJudgeConfigured(CFG)) return { ok: false, reason: "not_configured" };
+  const url = llmJudgeCompletionsUrl(CFG.llmJudgeBaseUrl);
+  const body = {
+    model: String(CFG.llmJudgeModel).trim(),
+    messages: [{ role: "user", content: String(prompt || "") }],
+    temperature: 0,
+    stream: false,
+  };
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${String(CFG.llmJudgeApiKey).trim()}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(LLM_JUDGE_TIMEOUT_MS),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => "");
+      return { ok: false, reason: "http", status: resp.status, error: errText.slice(0, 200) };
+    }
+    const json = await resp.json();
+    const content = json?.choices?.[0]?.message?.content;
+    if (typeof content !== "string") return { ok: false, reason: "bad_response" };
+    return { ok: true, content };
+  } catch (error) {
+    const name = error?.name || "";
+    if (name === "TimeoutError" || name === "AbortError") return { ok: false, reason: "timeout" };
+    return { ok: false, reason: "network", error: String(error?.message || error) };
+  }
+}
+
+function transcriptBeforeSubmittedHandoff(transcript, transferId) {
+  const source = String(transcript || "").trim();
+  if (!source) return "";
+  const marker = `<<<HERDR_HANDOFF_V1 id=${String(transferId || "").trim()}>>>`;
+  const markerAt = source.lastIndexOf(marker);
+  if (markerAt < 0) return source;
+  const userAt = source.lastIndexOf("[user]\n", markerAt);
+  return userAt > 0 ? source.slice(0, userAt).trim() : source;
+}
+
+function scheduleHandoffSummaryFallback(transferId, delayMs = HANDOFF_PRIMARY_SUMMARY_GRACE_MS) {
+  if (!isLlmJudgeConfigured(CFG) || !transferId) return false;
+  try {
+    chrome.alarms.create(`${HANDOFF_FALLBACK_ALARM_PREFIX}${transferId}`, { when: Date.now() + delayMs });
+    return true;
+  } catch (error) {
+    callLog("handoff fallback alarm unavailable:", error?.message || error);
+    return false;
+  }
+}
+
+async function summarizeHandoffWithFallbackLlm(transferId, { snapshot = null, reason = "primary_unavailable" } = {}) {
+  await configReady;
+  const transfers = await loadHandoffTransfers();
+  const transfer = transfers[transferId];
+  if (!transfer) return { ok: false, error: "handoff_missing" };
+  if (transfer.status !== "summary_requested") {
+    return { ok: true, pending: handoffStatusIsActive(transfer.status), superseded: true, handoff: handoffView(transfer) };
+  }
+  if (!isLlmJudgeConfigured(CFG)) return { ok: false, error: "handoff_fallback_llm_not_configured" };
+
+  let sourceSnapshot = snapshot;
+  if (!sourceSnapshot && transfer.source_tab_id && await tabStillExists(transfer.source_tab_id)) {
+    try {
+      sourceSnapshot = await sendHandoffTabMessage(transfer.source_tab_id, transfer.site || "chatgpt", { type: "h2w_snapshot_turn" });
+    } catch (_) {}
+  }
+  const transcript = transcriptBeforeSubmittedHandoff(sourceSnapshot?.transcript, transfer.id);
+  if (!transcript) return { ok: false, error: "handoff_fallback_transcript_unavailable" };
+
+  const bindings = await loadBindings();
+  const source = bindingsForTransferSource(bindings, transfer);
+  const expected = transfer.source_bindings || [];
+  if (!sameWorkspaceSet(
+    source.map((b) => b.workspace_id || normalizeWorkspaceId(b)),
+    expected.map((b) => b.workspace_id),
+  )) return { ok: false, error: "source_binding_set_changed" };
+
+  let prompt = buildHandoffFallbackPrompt({
+    transferId: transfer.id,
+    bindings: source,
+    transcript,
+    template: handoffRequestTemplateForSite(transfer.site || "chatgpt"),
+    reason,
+  });
+  let lastFailure = "handoff_fallback_bad_response";
+  let packet = null;
+  for (let attempt = 1; attempt <= 2 && !packet; attempt += 1) {
+    const llm = await fetchLlmHandoffOnce(prompt);
+    if (!llm.ok) {
+      lastFailure = `handoff_fallback_${llm.reason || "failed"}`;
+      break;
+    }
+    packet = extractHandoffPacket(llm.content, transfer.id);
+    if (!packet) {
+      lastFailure = "handoff_fallback_packet_invalid";
+      prompt += "\n\nYour previous format was invalid. Return only the requested HERDR_HANDOFF_V1 packet with the exact transfer id and markers.";
+    }
+  }
+  if (!packet) return { ok: false, error: lastFailure };
+
+  const latestTransfers = await loadHandoffTransfers();
+  const latest = latestTransfers[transfer.id];
+  if (!latest || latest.status !== "summary_requested") {
+    return { ok: true, pending: Boolean(latest && handoffStatusIsActive(latest.status)), superseded: true, handoff: handoffView(latest) };
+  }
+  const ready = await markTransfer(transfer.id, {
+    status: "summary_ready",
+    handoff_text: packet,
+    summary_source: "llm_fallback",
+    fallback_reason: reason,
+    error: null,
+  });
+  setTimeout(() => { void launchHandoffTarget(transfer.id); }, 0);
+  return { ok: true, pending: true, fallback: true, handoff: handoffView(ready) };
+}
+
+async function failWithHandoffFallback(transferId, options = {}) {
+  const fallback = await summarizeHandoffWithFallbackLlm(transferId, options);
+  if (fallback.ok) return fallback;
+  const failed = await markTransfer(transferId, { status: "failed", error: fallback.error || "handoff_fallback_failed" });
+  return { ok: false, error: fallback.error || "handoff_fallback_failed", handoff: handoffView(failed) };
+}
+
+async function handleTimedHandoffSummaryFallback(transferId) {
+  const transfers = await loadHandoffTransfers();
+  const transfer = transfers[transferId];
+  if (!transfer || transfer.status !== "summary_requested") return;
+  let snapshot = null;
+  try {
+    snapshot = await sendHandoffTabMessage(transfer.source_tab_id, transfer.site || "chatgpt", { type: "h2w_snapshot_turn" });
+  } catch (_) {}
+  const recovered = extractHandoffPacket(snapshot?.assistantText, transfer.id);
+  if (recovered) {
+    const ready = await markTransfer(transfer.id, {
+      status: "summary_ready",
+      handoff_text: recovered,
+      summary_source: "web_model",
+      error: null,
+    });
+    setTimeout(() => { void launchHandoffTarget(transfer.id); }, 0);
+    return;
+  }
+  if (snapshot?.turnInProgress || snapshot?.generating) {
+    scheduleHandoffSummaryFallback(transfer.id, HANDOFF_GENERATING_RECHECK_MS);
+    return;
+  }
+  const fallback = await summarizeHandoffWithFallbackLlm(transfer.id, { snapshot, reason: "primary_summary_timeout" });
+  if (!fallback.ok) {
+    callLog(`handoff fallback failed for ${transfer.id}:`, fallback.error || "unknown");
+    // Preserve the primary summary request so a late web-model reply can still
+    // complete the transfer or the user can explicitly resume it.
+    scheduleHandoffSummaryFallback(transfer.id, HANDOFF_GENERATING_RECHECK_MS);
+  }
 }
 
 function rememberIdleNudge(convKey, result) {
@@ -2863,12 +3029,17 @@ async function acceptImmediateHandoffSummary(transfer, result) {
     return { ok: true, pending: true, handoff: handoffView(transfer) };
   }
   if (disposition.kind !== "packet") {
+    if (isLlmJudgeConfigured(CFG)) {
+      const fallback = await summarizeHandoffWithFallbackLlm(transfer.id, { reason: "primary_packet_invalid" });
+      if (fallback.ok) return fallback;
+    }
     const failed = await markTransfer(transfer.id, { status: "failed", error: "handoff_packet_invalid" });
     return { ok: false, error: "handoff_packet_invalid", handoff: handoffView(failed) };
   }
   const ready = await markTransfer(transfer.id, {
     status: "summary_ready",
     handoff_text: disposition.packet,
+    summary_source: "web_model",
     error: null,
   });
   setTimeout(() => { void launchHandoffTarget(transfer.id); }, 0);
@@ -2885,6 +3056,7 @@ async function recoverExistingHandoffPacket(transfer) {
   const ready = await markTransfer(transfer.id, {
     status: "summary_ready",
     handoff_text: packet,
+    summary_source: "web_model",
     error: null,
   });
   setTimeout(() => { void launchHandoffTarget(transfer.id); }, 0);
@@ -2905,13 +3077,26 @@ async function resumeSummaryRequested(transfer) {
     const ready = await markTransfer(transfer.id, {
       status: "summary_ready",
       handoff_text: recoveredPacket,
+      summary_source: "web_model",
       error: null,
     });
     setTimeout(() => { void launchHandoffTarget(transfer.id); }, 0);
     return { ok: true, pending: true, recovered: true, handoff: handoffView(ready) };
   }
   if (snapshot?.turnInProgress || snapshot?.generating) {
+    scheduleHandoffSummaryFallback(transfer.id, HANDOFF_GENERATING_RECHECK_MS);
     return { ok: true, pending: true, handoff: handoffView(transfer) };
+  }
+  if (snapshot?.handoffBlocked || isLlmJudgeConfigured(CFG)) {
+    const fallback = await summarizeHandoffWithFallbackLlm(transfer.id, {
+      snapshot,
+      reason: snapshot?.handoffBlockReason || "manual_resume_timeout",
+    });
+    if (fallback.ok) return fallback;
+    if (snapshot?.handoffBlocked) {
+      const failed = await markTransfer(transfer.id, { status: "failed", error: fallback.error || "handoff_fallback_failed" });
+      return { ok: false, error: fallback.error || "handoff_fallback_failed", handoff: handoffView(failed) };
+    }
   }
 
   const bindings = await loadBindings();
@@ -2986,6 +3171,7 @@ async function resumeHandoffForCurrentTab(tabId) {
 }
 
 async function startHandoffForTab(tabId, trigger = "manual") {
+  await configReady;
   if (trigger === "manual") {
     let currentTab = null;
     try { currentTab = await chrome.tabs.get(tabId); } catch (_) {}
@@ -3073,10 +3259,11 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   const transferId = newTransferId(now);
   const continuityId = chainIds[0] || newContinuityId(now);
   let sourceAssistantFp = null;
+  let sourceSnapshot = null;
   try {
-    const snapshot = await sendHandoffTabMessage(tabId, convInfo.site, { type: "h2w_snapshot_turn" });
-    if (String(snapshot?.assistantText || "").trim()) {
-      sourceAssistantFp = assistantNudgeFingerprint(snapshot.assistantText);
+    sourceSnapshot = await sendHandoffTabMessage(tabId, convInfo.site, { type: "h2w_snapshot_turn" });
+    if (String(sourceSnapshot?.assistantText || "").trim()) {
+      sourceAssistantFp = assistantNudgeFingerprint(sourceSnapshot.assistantText);
     }
   } catch (_) {}
   const row = {
@@ -3096,6 +3283,8 @@ async function startHandoffForTab(tabId, trigger = "manual") {
     source_automation_scope: convInfo.project_id ? "project" : "conversation",
     source_automation_enabled: sourceAutomation.enabled === true,
     handoff_text: null,
+    summary_source: null,
+    fallback_reason: null,
     target_tab_id: null,
     target_conv_key: null,
     error: null,
@@ -3105,6 +3294,15 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   };
   transfers[transferId] = row;
   await saveHandoffTransfers(transfers);
+
+  const sourceLimitBlocked = sourceSnapshot?.handoffBlockReason === "conversation_limit_ui";
+  if (sourceLimitBlocked) {
+    return failWithHandoffFallback(transferId, {
+      snapshot: sourceSnapshot,
+      reason: sourceSnapshot?.handoffBlockReason || "source_rollover_required",
+    });
+  }
+
   const prompt = buildHandoffRequest({
     transferId,
     bindings: session,
@@ -3118,14 +3316,25 @@ async function startHandoffForTab(tabId, trigger = "manual") {
       template: prompt,
     });
   } catch (e) {
+    if (isLlmJudgeConfigured(CFG)) {
+      return failWithHandoffFallback(transferId, { snapshot: sourceSnapshot, reason: "summary_prompt_failed" });
+    }
     await markTransfer(transferId, { status: "failed", error: `summary_prompt_failed:${e.message}` });
     return { ok: false, error: "summary_prompt_failed" };
   }
-  if (!result?.ok) {
+  if (!result?.ok || result?.handoffBlocked) {
+    if (result?.handoffBlocked || isLlmJudgeConfigured(CFG)) {
+      return failWithHandoffFallback(transferId, {
+        snapshot: sourceSnapshot,
+        reason: result?.handoffBlockReason || result?.error || result?.blocked || "summary_prompt_not_submitted",
+      });
+    }
     await markTransfer(transferId, { status: "failed", error: result?.error || result?.blocked || "summary_prompt_not_submitted" });
     return { ok: false, error: result?.error || result?.blocked || "summary_prompt_not_submitted" };
   }
-  return acceptImmediateHandoffSummary(row, result);
+  const accepted = await acceptImmediateHandoffSummary(row, result);
+  if (accepted?.handoff?.status === "summary_requested") scheduleHandoffSummaryFallback(transferId);
+  return accepted;
 }
 
 async function handleHandoffTurnEnded(msg) {
@@ -3154,6 +3363,10 @@ async function handleHandoffTurnEnded(msg) {
     };
   }
   if (disposition.kind !== "packet") {
+    if (isLlmJudgeConfigured(CFG)) {
+      const fallback = await summarizeHandoffWithFallbackLlm(transfer.id, { reason: "primary_packet_invalid" });
+      if (fallback.ok) return { handled: true, ...fallback };
+    }
     const failed = await markTransfer(transfer.id, { status: "failed", error: "handoff_packet_invalid" });
     return { handled: true, ok: false, error: "handoff_packet_invalid", handoff: handoffView(failed) };
   }
@@ -3177,6 +3390,7 @@ async function handleHandoffTurnEnded(msg) {
   const ready = await markTransfer(transfer.id, {
     status: "summary_ready",
     handoff_text: disposition.packet,
+    summary_source: "web_model",
     error: null,
   });
   setTimeout(() => { void launchHandoffTarget(transfer.id); }, 0);
@@ -4076,7 +4290,14 @@ void rebuildStreams();
 try {
   chrome.alarms.create("h2w-keepalive", { periodInMinutes: 1 });
   chrome.alarms.onAlarm.addListener((a) => {
-    if (a.name === "h2w-keepalive") void ensureAlive();
+    if (a.name === "h2w-keepalive") {
+      void ensureAlive();
+      return;
+    }
+    if (String(a.name || "").startsWith(HANDOFF_FALLBACK_ALARM_PREFIX)) {
+      const transferId = String(a.name).slice(HANDOFF_FALLBACK_ALARM_PREFIX.length);
+      if (transferId) void handleTimedHandoffSummaryFallback(transferId);
+    }
   });
 } catch (e) {
   callLog("alarms unavailable:", e.message);

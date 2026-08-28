@@ -346,7 +346,7 @@ test("release.json, skill artifact and design invariants are preserved", async (
     assert.match(control, /Chrome Side Panel/);
     assert.match(control, /Current page|当前页面/, "Control Center docs must expose active-tab page context");
     assert.match(control, /no drawer|没有抽屉/, "Control Center docs must keep the HUD as a compact non-duplicated surface");
-    assert.match(control, /Manual handoff|手动接力/, "manual handoff must be documented in the Side Panel path");
+    assert.match(control, /Manual handoff|手动接力/, "Control Center docs must explain that manual handoff belongs to the HUD conversation surface");
     assert.match(control, /Prompt Agent|提示 Agent/);
     assert.match(control, /Steer Session|调整会话/);
     assert.match(control, /Preview-only|preview-only|控制操作仅预览/);
