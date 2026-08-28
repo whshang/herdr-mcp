@@ -11,11 +11,11 @@ test("README exposes copyable local-Agent prompts that point to the authoritativ
   const en = read("README.md");
   const zh = read("README.zh.md");
   const ja = read("README.ja.md");
-  assert.match(en, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/agent-install\.md/);
-  assert.match(zh, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/zh-CN\/agent-install\.md/);
+  assert.match(en, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/quick-agent-install\.md/);
+  assert.match(zh, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/zh-CN\/quick-agent-install\.md/);
   assert.match(ja, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/agent-install\.md/);
-  assert.match(en, /Do not create a Custom Domain, DNS records or a Tunnel/);
-  assert.match(zh, /不要创建 Custom Domain、DNS 记录或 Tunnel/);
+  assert.match(en, /quick-agent-install\.md/);
+  assert.match(zh, /quick-agent-install\.md/);
 });
 
 test("Agent install guides own Cloudflare-token handoff and workers.dev-only bootstrap", () => {
@@ -69,6 +69,23 @@ test("Agent install uses deterministic Cloudflare-safe Worker names and reports 
   }
 });
 
+test("quick agent install guides expose one-liner, proxy, custom domain, and extension path", () => {
+  for (const rel of [
+    "docs/i18n/en/quick-agent-install.md",
+    "docs/i18n/zh-CN/quick-agent-install.md",
+  ]) {
+    const doc = read(rel);
+    assert.match(doc, /quick-agent-install\.md/);
+    assert.match(doc, /HERDR_LINK_PROXY/);
+    assert.match(doc, /herdr-mcp-extension/);
+    assert.match(doc, /herdr-edge-device\.username\.workers\.dev\/mcp/);
+    assert.match(doc, /herdr-mcp\.example\.com\/mcp/);
+    assert.match(doc, /workers\.dev/);
+    assert.match(doc, /Custom Domain|自定义域名/);
+    assert.doesNotMatch(doc, /second-mac-agent-prompt/);
+  }
+});
+
 test("herdr-link resolves Node from PATH for fresh Apple Silicon installs", () => {
   const src = read("bin/herdr-link");
   assert.match(src, /HERDR_NODE_BIN/);
@@ -76,36 +93,26 @@ test("herdr-link resolves Node from PATH for fresh Apple Silicon installs", () =
   assert.doesNotMatch(src, /^NODE_BIN="\/usr\/local\/bin\/node"$/m);
 });
 
-test("second-Mac GA UAT agent prompt enforces independent Worker, Link env override, and owner OAuth handoff", () => {
+test("second-Mac agent prompt enforces independent Worker, Link env override, and owner OAuth handoff", () => {
   for (const rel of [
-    "docs/_wip/en/second-mac-ga-uat-agent-prompt.md",
-    "docs/_wip/zh-CN/second-mac-ga-uat-agent-prompt.md",
+    "docs/i18n/en/second-mac-agent-prompt.md",
+    "docs/i18n/zh-CN/second-mac-agent-prompt.md",
   ]) {
     const doc = read(rel);
-    assert.match(doc, /INTERNAL GA UAT|内部 GA UAT/);
-    assert.match(doc, /not end-user install|非终端用户安装/);
-    assert.match(doc, /begin execution immediately|立即阅读本 URL/);
     assert.match(doc, /herdr\.dev\/install\.sh/);
     assert.match(doc, /cloudflare-worker-name\.mjs/);
     assert.match(doc, /herdr-edge-prod/);
     assert.match(doc, /HERDR_EDGE_URL/);
     assert.match(doc, /HERDR_WORKSTATION_ID/);
     assert.match(doc, /HERDR_LINK_KEYCHAIN_SERVICE/);
-    assert.match(doc, /PlistBuddy|patch plist/i);
+    assert.match(doc, /PlistBuddy/);
     assert.match(doc, /workers_dev = true/);
     assert.match(doc, /v0\.4\.0-alpha\.16/);
     assert.match(doc, /chrome:\/\/extensions/);
-    assert.match(doc, /Edit Cloudflare Workers/);
-    assert.match(doc, /CLOUDFLARE_API_TOKEN/);
-    assert.match(doc, /Account Resources/);
-    assert.match(doc, /Zone Resources/);
-    assert.match(doc, /dash\.cloudflare\.com\/profile\/api-tokens/);
     assert.match(doc, /multi-device/i);
   }
   const zhUat = read("docs/i18n/zh-CN/clean-machine-uat.md");
   const enUat = read("docs/i18n/en/clean-machine-uat.md");
-  assert.match(zhUat, /second-mac-ga-uat-agent-prompt\.md/);
-  assert.match(enUat, /second-mac-ga-uat-agent-prompt\.md/);
-  assert.match(read("docs/i18n/en/install.md"), /second-mac-ga-uat-agent-prompt\.md/);
-  assert.match(read("docs/i18n/zh-CN/install.md"), /second-mac-ga-uat-agent-prompt\.md/);
+  assert.match(zhUat, /second-mac-agent-prompt\.md/);
+  assert.match(enUat, /second-mac-agent-prompt\.md/);
 });

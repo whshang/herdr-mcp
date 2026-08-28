@@ -12,7 +12,7 @@ herdr-link / herdr-mcp
 Herdr + managed Git projects
 ```
 
-For the shortest path, start with [Quick Start](quick-start.md). To let a local coding agent perform most setup work, use [Agent-assisted installation](agent-install.md).
+For the shortest path, start with [Quick Start](quick-start.md). To let a local coding agent perform most setup work, paste the one-liner from [Quick agent install](quick-agent-install.md); the detailed contract is [Agent-assisted installation](agent-install.md).
 
 **Regular user path:** GitHub Release binary → `herdr-mcp install` → `herdr-mcp doctor` (Edge may already be provisioned, or follow agent-install §6). **Second Mac GA UAT** (maintainers only, not a consumer install flow) uses the internal [_wip UAT Agent prompt](../../_wip/en/second-mac-ga-uat-agent-prompt.md) — see [clean-machine-uat](clean-machine-uat.md).
 

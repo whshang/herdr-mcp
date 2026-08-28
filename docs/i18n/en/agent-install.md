@@ -1,6 +1,6 @@
 # Local-Agent install and `workers.dev` deployment
 
-This is an execution contract for a **local coding Agent**, not a list of commands for the human to copy. The human should only need to perform Cloudflare interactive login/API-Token creation; the Agent owns environment checks, Release-binary install, Cloudflare Worker deployment, the outbound WSS Link, and verification.
+This is an execution contract for a **local coding Agent**, not a list of commands for the human to copy. End-user one-sentence onboarding lives in [Quick agent install](quick-agent-install.md). The human should only need to perform Cloudflare interactive login/API-Token creation; the Agent owns environment checks, Release-binary install, Cloudflare Worker deployment, the outbound WSS Link, and verification.
 
 > Current boundary: fully automated background-service setup is **macOS Apple Silicon first**. Windows may receive Release artifacts as preview. Do not invent unsupported Linux lifecycle packaging. Edge deploy may use Node/`wrangler` temporarily; the local MCP runtime itself must come from GitHub Releases, not `git clone` + `npm ci`.
 
@@ -130,6 +130,8 @@ Then guide Chrome: open `chrome://extensions`, enable Developer mode, **Load unp
 ## 8. macOS persistent Herdr Link
 
 Store `LINK_SHARED_SECRET` in Keychain under `herdr-edge-link-<WORKSTATION_ID>`. The command text must reference the environment variable rather than a literal secret. Prefer the managed Link install path exposed by the installed `herdr-mcp` binary (`herdr-mcp link ...` / product docs for the current alpha). Do not leave production Link ownership on a repository Bash wrapper.
+
+When `workers.dev` is blocked (for example China SNI) or the machine already uses a system proxy for ChatGPT, configure Link WSS proxy or switch to a Custom Domain. Proxy precedence: `HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`; macOS also reads `scutil --proxy`. See [Quick agent install](quick-agent-install.md) §5 for the full decision tree.
 
 ## 9. Verify the closed loop
 

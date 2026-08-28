@@ -111,14 +111,13 @@ Do **not** paste `HERDR_MCP_TOKEN` or a Cloudflare API token into ChatGPT.
 
 ### Let a local coding agent install it
 
-If you already use Codex, Claude Code, Pi, DSH, Cline or another local coding agent, give it this authoritative guide instead of asking it to guess the deployment steps:
+If you already use Codex, Claude Code, Pi, DSH, Cline or another local coding agent, give it this one sentence instead of asking it to guess the deployment steps:
 
 ```text
-Install and deploy herdr-mcp for me. First read the authoritative guide:
-https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md
-
-Follow it end to end. Install the local runtime from GitHub Releases (not git clone/npm). Do not create a Custom Domain, DNS records or a Tunnel for the first installation; use workers.dev. Do not expose or commit any token. Verify each mutation before continuing.
+Install herdr-mcp for me. Read and follow the full protocol at https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/quick-agent-install.md end to end. Use GitHub Releases for the local runtime (not git clone). Pause only for Cloudflare login/API Token creation. Do not echo or commit secrets.
 ```
+
+The detailed maintainer-oriented contract remains in [Agent-assisted installation](docs/i18n/en/agent-install.md).
 
 The deterministic Worker-name helper used by that Edge flow is:
 

@@ -1,6 +1,6 @@
 # 本地 Agent 安装与 `workers.dev` 部署
 
-这是一份给**本地 coding Agent**读取并执行的安装协议，不是给用户逐条复制命令的教程。目标是：用户只负责 Cloudflare 本人登录和创建 API Token；Agent 负责环境检查、Release 二进制安装、Cloudflare Worker、出站 WSS Link 和验证。
+这是一份给**本地 coding Agent**读取并执行的安装协议，不是给用户逐条复制命令的教程。面向最终用户的一句话安装入口见 [快速 Agent 安装](quick-agent-install.md)。目标是：用户只负责 Cloudflare 本人登录和创建 API Token；Agent 负责环境检查、Release 二进制安装、Cloudflare Worker、出站 WSS Link 和验证。
 
 > 当前约束：完整的后台服务自动安装路径以 **macOS Apple Silicon** 为第一正式平台。Windows 可有 Release artifact 作为 preview。不要发明未支持的 Linux lifecycle 包装。Edge 部署可临时使用 Node/`wrangler`；本机 MCP runtime **必须**来自 GitHub Releases，而不是 `git clone` + `npm ci`。
 
@@ -130,6 +130,8 @@ bin/herdr-extension-host status
 ## 8. macOS 持久 Herdr Link
 
 把 `LINK_SHARED_SECRET` 存进 Keychain，服务名 `herdr-edge-link-<WORKSTATION_ID>`。命令文本只能引用环境变量，不能写字面秘密。优先使用已安装 `herdr-mcp` 二进制提供的托管 Link 安装路径（当前 alpha 的 `herdr-mcp link ...` / 产品文档）。不要把生产 Link 所有权留在仓库 Bash 包装上。
+
+在中国或 `workers.dev` 被 SNI 拦截时，Link WSS 需走系统/显式代理或改用自定义域名。代理变量优先级：`HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`；macOS 还会读取 `scutil --proxy`。完整决策树见 [快速 Agent 安装](quick-agent-install.md) §5。
 
 ## 9. 验证闭环
 
