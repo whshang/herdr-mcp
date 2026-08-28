@@ -508,7 +508,8 @@ test("ChatGPT turn watcher caches latest turns and reuses settled turns for pres
   assert.match(wake, /recordTimerDrift\(driftMs\)/);
   assert.match(wake, /rehydrate the latest-turn cache/);
   assert.match(wake, /let lastAsstLen = initialAssistant\.text\.length/);
-  assert.match(wake, /const hasPendingReply = \(\) =>/);
+  assert.match(wake, /function conversationHasPendingReply\(\)/);
+  assert.match(wake, /const hasPendingReply = conversationHasPendingReply/);
   assert.match(wake, /event\.isTrusted/);
   assert.match(wake, /markReplyWaiting\(conversationHealth, at\)/);
   assert.match(wake, /serverSnapshotMatchesPendingTurn/);

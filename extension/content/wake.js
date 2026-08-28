@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.66";
+const H2W_CONTENT_VERSION = "0.1.67";
 (function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
@@ -42,6 +42,12 @@ const H2W_CONTENT_VERSION = "0.1.66";
   const HEALTH_STORAGE_KEY = "h2wConversationHealthByConv";
   const CONTEXT_PRESSURE_STORAGE_KEY = "h2wContextPressureByConv";
 
+  function conversationHasPendingReply() {
+    const submitAt = Number(conversationHealth?.last_user_submit_at || 0);
+    const endedAt = Number(conversationHealth?.last_turn_end_at || 0);
+    return submitAt > 0 && submitAt > endedAt;
+  }
+
   function runtimeAlive() {
     try { return !!chrome.runtime?.id; } catch { return false; }
   }
@@ -56,6 +62,42 @@ const H2W_CONTENT_VERSION = "0.1.66";
           else resolve(resp);
         });
       } catch (e) { resolve(null); }
+    });
+  }
+
+  function classifyBgMessageFailure(message = "") {
+    const text = String(message || "").toLowerCase();
+    if (!runtimeAlive() || text.includes("extension context invalidated")) {
+      return "extension-context-invalidated";
+    }
+    if (text.includes("receiving end does not exist")
+      || text.includes("message port closed")
+      || text.includes("could not establish connection")) {
+      return "background-unavailable";
+    }
+    return "background-message-failed";
+  }
+
+  // Queue mutations need structured transport failures. Keep sendBg()'s older
+  // null-on-failure contract for recovery/register callers that depend on it.
+  function sendBgResult(msg) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage(msg, (resp) => {
+          const lastError = chrome.runtime.lastError;
+          if (lastError) {
+            resolve({ ok: false, error: classifyBgMessageFailure(lastError.message) });
+            return;
+          }
+          if (resp === undefined) {
+            resolve({ ok: false, error: "background-no-response" });
+            return;
+          }
+          resolve(resp);
+        });
+      } catch (error) {
+        resolve({ ok: false, error: classifyBgMessageFailure(error?.message) });
+      }
     });
   }
   async function refreshAutomationState() {
@@ -423,6 +465,23 @@ const H2W_CONTENT_VERSION = "0.1.66";
       "Queue this message without interrupting the current reply. Right-click to clear the queue.");
   }
 
+  function queuedInsertFailureText(error) {
+    const code = String(error || "background-no-response");
+    if (code === "extension-context-invalidated") {
+      return hudText("queue_extension_reloaded", null,
+        "Herdr was updated. Reload this ChatGPT tab before queueing another message.");
+    }
+    if (["background-unavailable", "background-no-response", "background-message-failed"].includes(code)) {
+      return hudText("queue_background_unavailable", null,
+        "Herdr background is unavailable. Reload this ChatGPT tab and try again.");
+    }
+    if (code === "queue-storage-unavailable") {
+      return hudText("queue_storage_unavailable", null,
+        "Queue storage is temporarily unavailable. The message was not queued; try again.");
+    }
+    return hudText("queue_failed", { error: code }, `Queue failed: ${code}`);
+  }
+
   async function refreshQueuedInsertStatus() {
     if (ADAPTER.name !== "chatgpt" || !chatGptConversationId()) {
       queuedInsertCount = 0;
@@ -430,9 +489,13 @@ const H2W_CONTENT_VERSION = "0.1.66";
       return null;
     }
     const convKey = ADAPTER.getConversationKey();
-    const response = await sendBg({ type: "h2w_queue_status", convKey });
+    const response = await sendBgResult({ type: "h2w_queue_status", convKey });
     if (convKey !== ADAPTER.getConversationKey()) return response;
     if (response?.ok) queuedInsertCount = Math.max(0, Number(response.status?.count) || 0);
+    if (response?.error === "extension-context-invalidated") {
+      removeQueuedInsertButton();
+      return response;
+    }
     ensureQueuedInsertButton();
     updateQueuedInsertButton();
     return response;
@@ -451,10 +514,12 @@ const H2W_CONTENT_VERSION = "0.1.66";
       queuedInsertActionBusy = true;
       updateQueuedInsertButton();
       try {
-        const result = await sendBg({ type: "h2w_queue_flush", convKey, reason: "button-retry" });
+        const result = await sendBgResult({ type: "h2w_queue_flush", convKey, reason: "button-retry" });
         if (result?.delivered) {
           queuedInsertCount = Math.max(0, Number(result.status?.count) || 0);
           showHudToast(hudText("queue_sent", null, "Queued message sent."), "ok");
+        } else if (result?.ok === false && result?.error) {
+          showHudToast(queuedInsertFailureText(result.error), "err");
         } else {
           showHudToast(hudText("queue_waiting", { count: queuedInsertCount }, `Queued: ${queuedInsertCount}`));
         }
@@ -468,10 +533,12 @@ const H2W_CONTENT_VERSION = "0.1.66";
     queuedInsertActionBusy = true;
     updateQueuedInsertButton();
     try {
-      const queued = await sendBg({ type: "h2w_queue_insert", convKey, text });
+      const queued = await sendBgResult({ type: "h2w_queue_insert", convKey, text });
       if (!queued?.ok) {
         const key = queued?.error === "queue-full" ? "queue_full" : "queue_failed";
-        showHudToast(hudText(key, { error: queued?.error || "unknown" }, queued?.error || "Queue failed"), "err");
+        if (key === "queue_full") showHudToast(hudText(key), "err");
+        else showHudToast(queuedInsertFailureText(queued?.error), "err");
+        if (queued?.error === "extension-context-invalidated") removeQueuedInsertButton();
         return;
       }
       queuedInsertCount = Math.max(0, Number(queued.status?.count) || queuedInsertCount + 1);
@@ -496,7 +563,7 @@ const H2W_CONTENT_VERSION = "0.1.66";
         showHudToast(hudText("queue_added", { count: queuedInsertCount }, `Queued: ${queuedInsertCount}`), "ok");
         return;
       }
-      const flushed = await sendBg({ type: "h2w_queue_flush", convKey, reason: "enqueue-idle" });
+      const flushed = await sendBgResult({ type: "h2w_queue_flush", convKey, reason: "enqueue-idle" });
       if (flushed?.delivered) {
         queuedInsertCount = Math.max(0, Number(flushed.status?.count) || 0);
         showHudToast(hudText("queue_sent", null, "Queued message sent."), "ok");
@@ -518,12 +585,13 @@ const H2W_CONTENT_VERSION = "0.1.66";
     queuedInsertActionBusy = true;
     updateQueuedInsertButton();
     try {
-      const response = await sendBg({ type: "h2w_queue_clear", convKey });
+      const response = await sendBgResult({ type: "h2w_queue_clear", convKey });
       if (response?.ok) {
         queuedInsertCount = 0;
         showHudToast(hudText("queue_cleared", null, "Queue cleared."), "ok");
       } else {
-        showHudToast(hudText("queue_failed", { error: response?.error || "unknown" }, "Queue update failed."), "err");
+        showHudToast(queuedInsertFailureText(response?.error), "err");
+        if (response?.error === "extension-context-invalidated") removeQueuedInsertButton();
       }
     } finally {
       queuedInsertActionBusy = false;
@@ -2165,11 +2233,7 @@ const H2W_CONTENT_VERSION = "0.1.66";
       RECOVERY_CONTROLLER?.DEFAULT_RECOVERY_POLICY?.freshnessProbeIntervalMs || 15000,
     );
 
-    const hasPendingReply = () => {
-      const submitAt = Number(conversationHealth?.last_user_submit_at || 0);
-      const endedAt = Number(conversationHealth?.last_turn_end_at || 0);
-      return submitAt > 0 && submitAt > endedAt;
-    };
+    const hasPendingReply = conversationHasPendingReply;
 
     const syncPendingSubmitAnchor = () => {
       const submitAt = Number(conversationHealth?.last_user_submit_at || 0);
@@ -2579,6 +2643,8 @@ const H2W_CONTENT_VERSION = "0.1.66";
   }
 
   function showHudToast(text, kind = "") {
+    // A toast must never be the path that creates an untranslated HUD shell.
+    if (!hudLabelsReady(hudLabels)) return;
     const ui = ensurePageHud();
     ui.toast.textContent = String(text || "");
     ui.toast.className = `toast${kind ? ` ${kind}` : ""}`;
@@ -2596,6 +2662,34 @@ const H2W_CONTENT_VERSION = "0.1.66";
       }
     }
     return text;
+  }
+
+  function hudLabelsReady(labels) {
+    const required = [
+      "web_state", "scope_counts", "scope_unbound",
+      "manual_continue", "manual_status", "manual_judge",
+      "automation_on", "automation_off", "aria_toggle_automation",
+    ];
+    return Boolean(
+      labels
+      && required.every((key) => typeof labels[key] === "string" && labels[key].trim())
+      && labels.states
+      && typeof labels.states.idle === "string"
+      && labels.states.idle.trim()
+      && typeof labels.states.done === "string"
+      && labels.states.done.trim()
+    );
+  }
+
+  function clearUnreadyPageHud() {
+    try { document.getElementById(HUD_ID)?.remove(); } catch (_) {}
+    hudEls = null;
+    try {
+      const ta = document.querySelector("#prompt-textarea");
+      const form = ta?.closest("form");
+      form?.style?.removeProperty("padding-bottom");
+    } catch (_) {}
+    try { document.documentElement.style.removeProperty("padding-bottom"); } catch (_) {}
   }
 
   async function setHudProjectAutomation(enabled) {
@@ -2797,7 +2891,7 @@ const H2W_CONTENT_VERSION = "0.1.66";
 
   function hudWebActivityLabel() {
     const healthState = String(conversationHealth?.state || "");
-    let stateKey = hasPendingReply() ? "reply_waiting" : "idle";
+    let stateKey = conversationHasPendingReply() ? "reply_waiting" : "idle";
     if (["reply_suspect", "recovery_message_sent", "reload_pending", "recovering", "rollover_recommended", "rollover_required"].includes(healthState)) {
       stateKey = healthState;
     }
@@ -2806,13 +2900,23 @@ const H2W_CONTENT_VERSION = "0.1.66";
   }
 
   function paintPageHud(view = {}) {
-    const ui = ensurePageHud();
-    liftComposer(32);
     if (view.hud) hudCache = view.hud;
     if (view.continuity) hudCache = { ...(hudCache || {}), continuity: view.continuity };
     const hud = view.hud || hudCache || null;
     hudLabels = hud?.labels || hudLabels;
+    // Queue is a separate conversation affordance and must not depend on HUD
+    // localization becoming ready.
     updateQueuedInsertButton();
+    // Never leave a half-initialized HUD in the page. In particular, MV3
+    // worker cold start or an extension reload can briefly leave content code
+    // without the localized label payload. Hide/remove the stale host until a
+    // complete payload arrives instead of rendering empty action buttons.
+    if (!hudLabelsReady(hudLabels)) {
+      clearUnreadyPageHud();
+      return;
+    }
+    const ui = ensurePageHud();
+    liftComposer(32);
     if (view.pending === true) hudPending = true;
     if (view.pending === false) hudPending = false;
 
@@ -2891,7 +2995,6 @@ const H2W_CONTENT_VERSION = "0.1.66";
 
   function startPageHud() {
     startDocumentTitleSync();
-    paintPageHud({ pending: false });
     void refreshPageHud();
     setInterval(() => {
       if (!document.hidden) void refreshPageHud();

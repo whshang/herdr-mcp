@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "herdr → Web wake",
-  "version": "0.1.66",
+  "version": "0.1.67",
   "description": "Connect Web AI to live Herdr workspaces with browser continuity, a Side Panel Control Center, queued next-turn messages, and local MCP bridging. UI: en / zh / ja.",
   "permissions": [
     "storage",

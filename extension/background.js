@@ -36,7 +36,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.66";
+const H2W_SCRIPT_VERSION = "0.1.67";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -108,7 +108,8 @@ function hudLabels() {
     "automation_on", "automation_off", "manual_continue", "manual_status", "manual_judge",
     "manual_continue_hint", "manual_status_hint", "manual_judge_hint",
     "queue_insert", "queue_insert_count", "queue_insert_hint", "queue_need_message", "queue_added", "queue_sent", "queue_waiting",
-    "queue_full", "queue_failed", "queue_added_draft_changed", "queue_added_clear_failed", "queue_clear_confirm", "queue_cleared",
+    "queue_full", "queue_failed", "queue_extension_reloaded", "queue_background_unavailable", "queue_storage_unavailable",
+    "queue_added_draft_changed", "queue_added_clear_failed", "queue_clear_confirm", "queue_cleared",
     "automation_on_hint", "automation_off_hint", "conversation_automation_on_hint", "conversation_automation_off_hint",
     "aria_toggle_automation", "automation_enabled", "automation_disabled", "automation_update_failed",
     "judge_no_continue", "continue_sent", "continue_failed",
@@ -664,16 +665,22 @@ const queuedInsertInFlight = new Set();
 
 async function readQueuedInsertState() {
   try {
-    const raw = (await chrome.storage.local.get(QUEUED_INSERT_STORAGE_KEY))[QUEUED_INSERT_STORAGE_KEY];
-    return normalizeQueuedInsertState(raw || {});
+    return await readQueuedInsertStateStrict();
   } catch (_) {
     return normalizeQueuedInsertState({});
   }
 }
 
+async function readQueuedInsertStateStrict() {
+  const raw = (await chrome.storage.local.get(QUEUED_INSERT_STORAGE_KEY))[QUEUED_INSERT_STORAGE_KEY];
+  return normalizeQueuedInsertState(raw || {});
+}
+
 function mutateQueuedInsertState(mutator) {
   const run = queuedInsertMutationTail.then(async () => {
-    const current = await readQueuedInsertState();
+    // Mutations fail closed if storage cannot be read. Treating a failed read
+    // as an empty queue could overwrite durable queued messages.
+    const current = await readQueuedInsertStateStrict();
     const result = await mutator(current);
     const next = normalizeQueuedInsertState(result?.state || current);
     await chrome.storage.local.set({ [QUEUED_INSERT_STORAGE_KEY]: next });
@@ -685,6 +692,10 @@ function mutateQueuedInsertState(mutator) {
 
 async function queuedInsertStateForConversation(convKey) {
   return queuedInsertStatus(await readQueuedInsertState(), convKey);
+}
+
+async function queuedInsertStateForConversationStrict(convKey) {
+  return queuedInsertStatus(await readQueuedInsertStateStrict(), convKey);
 }
 
 async function enqueueQueuedInsertForConversation(convKey, text) {
@@ -748,7 +759,7 @@ async function flushQueuedInsert(convKey, tabId, reason = "manual") {
   }
   queuedInsertInFlight.add(convKey);
   try {
-    const state = await readQueuedInsertState();
+    const state = await readQueuedInsertStateStrict();
     const batch = queuedInsertBatch(state, convKey);
     if (!batch) {
       const status = queuedInsertStatus(state, convKey);
@@ -3358,6 +3369,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_automation_state") {
     void (async () => {
+      await configReady;
       const scope = automationScopeForConversation(String(msg.convKey || "").trim());
       const runtimeGate = await automationRuntimeGate();
       const runtimeAvailable = runtimeGate.ok === true;
@@ -3455,6 +3467,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_page_hud") {
     void (async () => {
+      // HUD copy is generated from the locale catalog. A freshly started MV3
+      // service worker can receive this message before detectOrLoadLocale()
+      // finishes, so do not return a partially localized payload.
+      await configReady;
       const convKey = String(msg.convKey || "").trim();
       const bindings = await loadBindings();
       const session = convKey ? bindingsForConv(bindings, convKey) : [];
@@ -3849,8 +3865,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "conversation-required", status: { count: 0, chars: 0, oldest_at: null } });
         return;
       }
-      sendResponse({ ok: true, status: await queuedInsertStateForConversation(convKey) });
-    })();
+      sendResponse({ ok: true, status: await queuedInsertStateForConversationStrict(convKey) });
+    })().catch((error) => {
+      callLog("queued insert status failed:", error?.message || String(error));
+      sendResponse({ ok: false, error: "queue-storage-unavailable" });
+    });
     return true;
   }
   if (msg?.type === "h2w_queue_insert") {
@@ -3865,7 +3884,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const status = result.status || queuedInsertStatus(result.state, convKey);
       notifyQueuedInsertState(sender.tab?.id, convKey, status);
       sendResponse({ ok: result.ok === true, error: result.error || null, status });
-    })();
+    })().catch((error) => {
+      callLog("queued insert enqueue failed:", error?.message || String(error));
+      sendResponse({ ok: false, error: "queue-storage-unavailable" });
+    });
     return true;
   }
   if (msg?.type === "h2w_queue_flush") {
@@ -3878,7 +3900,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       sendResponse(await flushQueuedInsert(convKey, tabId, msg.reason || "manual"));
-    })();
+    })().catch((error) => {
+      callLog("queued insert flush failed:", error?.message || String(error));
+      sendResponse({ ok: false, error: "queue-storage-unavailable" });
+    });
     return true;
   }
   if (msg?.type === "h2w_queue_clear") {
@@ -3893,7 +3918,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const status = await queuedInsertStateForConversation(convKey);
       notifyQueuedInsertState(sender.tab?.id, convKey, status, { cleared: true });
       sendResponse({ ok: true, status });
-    })();
+    })().catch((error) => {
+      callLog("queued insert clear failed:", error?.message || String(error));
+      sendResponse({ ok: false, error: "queue-storage-unavailable" });
+    });
     return true;
   }
   if (msg?.type === "h2w_turn_ended") {
@@ -3903,10 +3931,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse(handoff);
         return;
       }
-      const queued = await queuedInsertStateForConversation(msg.convKey || "");
+      let queued;
+      try {
+        queued = await queuedInsertStateForConversationStrict(msg.convKey || "");
+      } catch (error) {
+        callLog("queued insert turn-end read failed:", error?.message || String(error));
+        sendResponse({
+          ok: false,
+          error: "queue-storage-unavailable",
+          queued_insert: true,
+          continue_skipped: true,
+        });
+        return;
+      }
       if (queued.count > 0) {
-        const delivery = await flushQueuedInsert(msg.convKey || "", sender.tab?.id, "turn-ended");
-        sendResponse({ ...delivery, queued_insert: true });
+        try {
+          const delivery = await flushQueuedInsert(msg.convKey || "", sender.tab?.id, "turn-ended");
+          sendResponse({ ...delivery, queued_insert: true });
+        } catch (error) {
+          callLog("queued insert turn-end flush failed:", error?.message || String(error));
+          sendResponse({
+            ok: false,
+            error: "queue-storage-unavailable",
+            queued_insert: true,
+            continue_skipped: true,
+          });
+        }
         return;
       }
       const r = await maybeIdleNudge(msg);

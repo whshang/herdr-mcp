@@ -70,9 +70,9 @@ const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extensi
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
-ok(manifest.version === "0.1.66", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.66"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.66"'), "content version matches manifest");
+ok(manifest.version === "0.1.67", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.67"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.67"'), "content version matches manifest");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")
@@ -241,6 +241,33 @@ ok(
     && wakeSource.includes('hudText("scope_counts"')
     && !wakeSource.includes("hudExpanded"),
   "HUD reports Web + Herdr state and aggregate binding counts without workspace or pane names",
+);
+ok(
+  wakeSource.includes("function sendBgResult(msg)")
+    && wakeSource.includes("extension-context-invalidated")
+    && wakeSource.includes("background-no-response")
+    && wakeSource.includes("function queuedInsertFailureText(error)")
+    && !wakeSource.includes('queued?.error || "unknown"')
+    && backgroundSource.includes("queue-storage-unavailable")
+    && backgroundSource.includes("readQueuedInsertStateStrict"),
+  "Queue reports structured transport/storage failures instead of unknown and fails closed on storage reads",
+);
+ok(
+  backgroundSource.includes('if (msg?.type === "h2w_page_hud")')
+    && backgroundSource.includes("// HUD copy is generated from the locale catalog.")
+    && backgroundSource.includes("await configReady;")
+    && wakeSource.includes("function hudLabelsReady(labels)")
+    && wakeSource.includes("if (!hudLabelsReady(hudLabels))")
+    && wakeSource.includes("clearUnreadyPageHud();")
+    && !wakeSource.includes("paintPageHud({ pending: false });"),
+  "compact HUD waits for localized labels and never renders an empty startup shell",
+);
+ok(
+  wakeSource.includes("function conversationHasPendingReply()")
+    && wakeSource.includes("const hasPendingReply = conversationHasPendingReply;")
+    && wakeSource.includes('let stateKey = conversationHasPendingReply() ? "reply_waiting" : "idle";')
+    && wakeSource.includes("if (!hudLabelsReady(hudLabels)) return;"),
+  "HUD web-state rendering uses a module-scope pending-reply helper and toast cannot bypass label readiness",
 );
 ok(
   backgroundSource.includes("global/Project automation policy")
