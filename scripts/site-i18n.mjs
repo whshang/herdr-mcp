@@ -49,7 +49,7 @@ export const NAV_GROUPS = [
   { slugs: ["browser-continuity", "extension", "browser-control-center", "extension-wake", "extension-bridge"] },
   { slugs: ["architecture", "best-practices", "cli-reference"] },
   { slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade"] },
-  { slugs: ["agent-install", "quick-agent-install", "automation", "capability-benchmark", "herdr-vs-ecosystem", "worker-fallbacks"] },
+  { slugs: ["agent-install", "automation", "capability-benchmark", "herdr-vs-ecosystem", "worker-fallbacks"] },
   { slugs: ["troubleshooting"] },
 ];
 
