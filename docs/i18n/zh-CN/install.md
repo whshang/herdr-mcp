@@ -53,7 +53,7 @@ herdr api schema >/dev/null
 herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
-herdr-mcp update check
+herdr-mcp update check   # bare `herdr-mcp update` is equivalent
 ```
 
 优先使用以上顶层命令。**不要**把 `herdr-mcp service install` 写成普通用户安装主路径；`service ...` 仍是高级/内部接口。**不要**用 clone 仓库或 `npm`/`cargo` 安装本机 MCP runtime。
@@ -72,9 +72,10 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 
 这一步还应该确认 Herdr socket 能被 runtime 访问。稍后真正连接后，`herdr_inspect` 应能返回当前 workspace / pane / managed roots。
 
-日常升级：
+日常升级（`herdr-mcp update` 与 `update check` 等价；有可用版本时 JSON 会给出 `next_action`）：
 
 ```bash
+herdr-mcp update          # same as update check
 herdr-mcp update apply
 herdr-mcp update status
 ```

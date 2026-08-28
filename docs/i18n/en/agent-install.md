@@ -29,7 +29,7 @@ Node.js is required only for temporary Cloudflare Worker bootstrap (`npx wrangle
 herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
-herdr-mcp update check
+herdr-mcp update          # same as update check
 ```
 
 `install` stages an immutable generation under `~/.config/herdr-mcp/runtime/` and retargets `~/.local/bin/herdr-mcp` to `runtime/current/herdr-mcp`. Prefer these top-level commands. Do **not** use `herdr-mcp service install` as the normal install path.

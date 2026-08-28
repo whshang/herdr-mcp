@@ -81,12 +81,13 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
     let channel = load_update_channel()?;
     let plan = fetch_release_plan(manifest_override, channel)?;
     let current = current_version()?;
+    let available = plan.version > current;
     print_json(&json!({
         "ok": true,
         "code": "update_check",
         "update_channel": channel.as_str(),
         "current_version": current.to_string(),
-        "available": plan.version > current,
+        "available": available,
         "release_version": plan.version.to_string(),
         "tag": plan.tag,
         "source_commit": plan.identity.source_commit,
@@ -96,6 +97,11 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
         "asset": plan.asset.name,
         "sha256": plan.asset.sha256,
         "size": plan.asset.size,
+        "next_action": if available {
+            Some("herdr-mcp update apply")
+        } else {
+            None
+        },
     }))?;
     Ok(ExitCode::SUCCESS)
 }

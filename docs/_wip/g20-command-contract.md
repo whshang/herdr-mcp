@@ -21,7 +21,7 @@ herdr-mcp config [path|show|init]
 herdr-mcp dev [--dry-run]
 herdr-mcp candidate [--port 8873]
 herdr-mcp service <install [--adopt-node]|status|start|stop|restart|rollback|uninstall>
-herdr-mcp update <check [--manifest URL]|apply [--manifest URL]|status>
+herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|status]
 herdr-mcp native-host <install|status|uninstall|rollback>
 herdr-mcp extension-host [chrome-extension://.../]
 ```

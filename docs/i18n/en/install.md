@@ -53,7 +53,7 @@ Download the current `herdr-mcp` binary for your platform from [GitHub Releases]
 herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
-herdr-mcp update check
+herdr-mcp update check   # bare `herdr-mcp update` is equivalent
 ```
 
 Prefer these top-level commands. Do **not** use `herdr-mcp service install` as the normal user install instruction; `service ...` remains advanced/internal. Do **not** clone this repository or run `npm`/`cargo` to install the local MCP runtime.
@@ -72,9 +72,10 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 
 The runtime must also reach the Herdr socket. After connecting, `herdr_inspect` should report real workspaces, panes and managed roots.
 
-Day-to-day upgrades:
+Day-to-day upgrades (`herdr-mcp update` is equivalent to `update check`; when a newer release exists the JSON includes `next_action`):
 
 ```bash
+herdr-mcp update          # same as update check
 herdr-mcp update apply
 herdr-mcp update status
 ```
