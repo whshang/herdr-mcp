@@ -41,11 +41,12 @@ The top **Current page** card is the bridge between browser context and local st
 - supported site;
 - ChatGPT Project identity when present;
 - conversation identity when present;
-- workspace bindings for that Project / conversation;
-- the single UI path to bind or unbind a workspace;
+- how many workspaces are currently bound to that Project / conversation;
 - an always-discoverable **Manual handoff** action. When the current page is unsupported, unbound, busy, or not yet a concrete conversation, the action stays visible but disabled and explains why.
 
-Changing Chrome tabs or navigating the active tab updates this card from tab activation/navigation events; there is no fixed polling loop. The corresponding workspace is highlighted in the local workspace tree.
+Bind / unbind is no longer duplicated inside the Current page card as chips plus a selector. The single path is the **binding toggle on each workspace row below**, so live state and page binding are read and changed in the same place.
+
+Changing Chrome tabs or navigating the active tab updates this card from tab activation/navigation events; there is no fixed polling loop. Bound workspaces move to the front of the local workspace list and stay highlighted.
 
 This does **not** retarget an explicit Pinned Target. Active-page binding answers “which local workspace belongs to this Web context”; Pinned Target answers “which exact pane would a future human control action address.”
 
@@ -91,11 +92,20 @@ If the human later focuses `wD7:p3` in Herdr, the Control Center must not silent
 
 That prevents a dangerous class of mistakes: **the user thinks an action targets A while a focus change causes it to target B**.
 
-## What the workspace / pane tree shows
+## Workspace state and current-page binding share one list
 
-The panel groups panes under their workspace and currently shows:
+The Control Center no longer splits “workspace status” and “current-page binding” into separate UI modules. Every workspace row now shows:
 
 - workspace label / id;
+- an aggregate workspace status dot;
+- pane count and working count;
+- whether the active page is bound to this workspace;
+- the single **Bind / ✓ Bound** toggle.
+
+Workspaces already bound to the active page move to the front and remain highlighted. Clicking the workspace body only expands or collapses its panes; clicking the binding toggle only binds or unbinds, so the two interactions do not trigger each other. Binding mutations are serialized in the UI to avoid ambiguous intermediate states from repeated clicks. If a bound workspace has been closed or is temporarily absent from the runtime snapshot, the list keeps a “not currently visible” bound row so the stale binding can still be removed instead of becoming hidden state.
+
+Expanded rows continue to show pane-level detail:
+
 - pane id;
 - agent name or terminal-only state;
 - working / idle / done / blocked status;
@@ -105,7 +115,7 @@ The panel groups panes under their workspace and currently shows:
 - recent activity;
 - a bounded recent summary or terminal title.
 
-Workspaces containing active work sort first. Initial expansion is bounded so a workstation with many projects does not open as an unreadable wall of rows.
+Initial expansion is bounded so a workstation with many projects does not open as an unreadable wall of rows. Switching browser tabs updates binding order and highlight without retargeting the Pinned Target.
 
 ## Pin an explicit target
 

@@ -23,6 +23,8 @@ import {
   controlCenterStats,
   createRenderCoalescer,
   runtimePresentation,
+  workspaceAggregateStatus,
+  workspaceRowsForPage,
 } from "../extension/control-center-model.js";
 import { createBrowserStateStore } from "../extension/browser-state-store.js";
 
@@ -330,6 +332,31 @@ test("runtime presentation distinguishes snapshot health from event reconnect", 
     dot: "healthy",
     text: "Runtime healthy",
   });
+});
+
+test("workspace aggregate status exposes the highest-priority live state", () => {
+  assert.equal(workspaceAggregateStatus({ panes: [{ status: "done" }, { status: "working" }] }), "working");
+  assert.equal(workspaceAggregateStatus({ panes: [{ status: "done" }, { status: "blocked" }] }), "blocked");
+  assert.equal(workspaceAggregateStatus({ panes: [{ status: "idle" }, { status: "done" }] }), "idle");
+  assert.equal(workspaceAggregateStatus({ panes: [{ status: "done" }] }), "done");
+  assert.equal(workspaceAggregateStatus({ panes: [] }), "unknown");
+});
+
+test("workspace rows merge current-page binding with live state and preserve stale unbind targets", () => {
+  const live = [
+    { workspace_id: "w1", label: "Alpha", panes: [{ status: "done" }] },
+    { workspace_id: "w2", label: "Beta", panes: [{ status: "working" }] },
+    { workspace_id: "w3", label: "Gamma", panes: [] },
+  ];
+  const rows = workspaceRowsForPage(live, [
+    { workspace_id: "w1", workspace_label: "Alpha" },
+    { workspace_id: "w9", workspace_label: "Closed workspace" },
+    { workspace_id: "w9", workspace_label: "Closed workspace" },
+  ]);
+  assert.deepEqual(rows.map((row) => row.workspace_id), ["w1", "w9", "w2", "w3"]);
+  assert.equal(rows[1].binding_missing, true);
+  assert.equal(rows[1].label, "Closed workspace");
+  assert.deepEqual(live.map((row) => row.workspace_id), ["w1", "w2", "w3"], "input order is not mutated");
 });
 
 test("50-pane state and incremental burst stay small and fast", () => {

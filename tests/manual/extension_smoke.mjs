@@ -70,9 +70,10 @@ const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extensi
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
-ok(manifest.version === "0.1.68", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.68"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.68"'), "content version matches manifest");
+const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
+ok(manifest.version === "0.1.69", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.69"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.69"'), "content version matches manifest");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")
@@ -542,10 +543,26 @@ ok(!("hud_manual_handoff" in zhLocale) && !("hud_bindings" in zhLocale) && !("hu
   "zh HUD removes drawer, binding, timing, and handoff copy after those paths move elsewhere");
 ok(zhLocale.cc_page_handoff === "手动接力"
     && zhLocale.cc_page_context_title === "当前页面"
+    && zhLocale.cc_workspaces_heading === "工作区"
+    && zhLocale.cc_workspaces_binding_hint.includes("当前页面绑定")
+    && zhLocale.cc_workspace_bound.includes("已绑定")
+    && zhLocale.cc_workspace_bind === "绑定"
     && zhLocale.hud_scope_binding_count === "🔗{count}"
     && zhLocale.hud_scope_binding_hint.includes("控制中心")
     && !zhLocale.hud_scope_binding_hint.includes("0 个窗格"),
-  "zh copy keeps HUD binding identity compact and moves pane/Agent detail to Control Center");
+  "zh copy keeps HUD compact and merges current-page binding into workspace rows");
+ok([enLocale, zhLocale, jaLocale].every((locale) => [
+  "cc_page_workspace_select_aria",
+  "cc_page_bind",
+  "cc_page_unbind",
+  "cc_page_select_disabled",
+  "cc_page_unknown_workspace",
+  "cc_page_select_workspace",
+  "cc_page_all_bound",
+  "cc_page_bound_badge",
+  "cc_page_no_workspaces",
+].every((key) => !(key in locale))),
+  "Control Center locales remove the old separate binding-selector vocabulary");
 ok(zhLocale.cc_page_handoff_busy.includes("Herdr")
     && zhLocale.cc_page_handoff_busy_help.includes("工作区仍在工作")
     && zhLocale.cc_mode_herdr_help.includes("不会假装已经完成 schema 校验")
@@ -615,7 +632,11 @@ ok(actionClickBlock.includes("chrome.sidePanel.open({ windowId })")
   "toolbar action opens the Control Center Side Panel directly and removes popup-only protocol");
 ok(controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && controlCenterHtml.includes('id="pageContextCard"')
-    && controlCenterHtml.includes('id="pageWorkspaceSelect"')
+    && controlCenterHtml.includes('class="workspace-panel"')
+    && controlCenterHtml.includes('data-i18n="cc_workspaces_binding_hint"')
+    && !controlCenterHtml.includes('id="pageWorkspaceSelect"')
+    && !controlCenterHtml.includes('id="pageBindings"')
+    && !controlCenterHtml.includes('id="pageBindButton"')
     && controlCenterHtml.includes('id="pageHandoffButton"')
     && controlCenterHtml.includes('data-i18n="cc_preview_heading"')
     && controlCenterHtml.includes('data-i18n="cc_target_label"')
@@ -627,6 +648,16 @@ ok(controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && controlCenterSource.includes('type: "h2w_state"')
     && controlCenterSource.includes('type: "h2w_bind"')
     && controlCenterSource.includes('type: "h2w_unbind"')
+    && controlCenterSource.includes("async function mutateWorkspaceBinding")
+    && controlCenterSource.includes("data-workspace-binding-action")
+    && controlCenterSource.includes('setAttribute("aria-pressed", String(contextBound))')
+    && controlCenterSource.includes("workspaceRowsForPage(state.workspaces || [], pageContextBindings())")
+    && controlCenterModelSource.includes("export function workspaceRowsForPage")
+    && controlCenterModelSource.includes("...sorted.filter((workspace) => boundIds.has")
+    && controlCenterModelSource.includes("binding_missing: true")
+    && controlCenterSource.includes("if (!currentlyBound && !workspace) return")
+    && !controlCenterSource.includes("pageWorkspaceSelect")
+    && !controlCenterSource.includes("pageBindings")
     && backgroundSource.includes('type: "herdr_control_binding_changed"')
     && controlCenterSource.includes('const workspaceBusy = bindings.some')
     && controlCenterSource.includes("const handoffPageSupported = (")
