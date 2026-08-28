@@ -71,6 +71,8 @@ Prerequisites:
 - [Herdr](https://herdr.dev) installed and running;
 - a Cloudflare account if ChatGPT will connect over the Internet.
 
+Validated clean-machine path for `v0.4.0`: **macOS Apple Silicon**. A Windows x64 binary is published, but Windows end-to-end UAT is not yet sealed; Linux is not claimed as a `v0.4.0` supported runtime target.
+
 The **local MCP runtime** is a native binary. You do **not** need Node.js or npm to run it. Node remains useful for Cloudflare Edge deploys, the browser extension toolchain, and contributor builds from this repository.
 
 ### Install the native runtime (primary)

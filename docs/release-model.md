@@ -86,7 +86,7 @@ They are **superseded** by `v0.4.0` stable for new installs. Do **not** delete G
 | Dedicated `extension-release.yml` | Optional later workflow: tag `extension-v*` → pack zip → GitHub Release or store pipeline **without** runtime bump |
 | Extension version in manifest metadata | Optional non-updater field for docs automation only |
 | Store / CRX pipeline | See `docs/_wip/browser-extension-development-and-store-release.md` |
-| Windows runtime target | Add to `.github/rust-release-targets.json` when G19 Windows UAT seals |
+| Windows runtime target | Already published as `x86_64-pc-windows-msvc`; keep support claims conservative until G19 Windows end-to-end UAT seals |
 
 ## Related
 
