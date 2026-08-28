@@ -157,16 +157,18 @@ function renderPageContext(state) {
     pageContextMeta.textContent = "";
     pageContextHelp.textContent = t("cc_page_context_help");
     pageBindButton.disabled = true;
-    pageHandoffButton.hidden = true;
+    pageHandoffButton.disabled = true;
+    pageHandoffButton.textContent = t("cc_page_handoff");
     return;
   }
 
   if (!supported) {
     pageContextTitle.textContent = t("cc_page_unsupported");
     pageContextMeta.textContent = pageContext.error || t("cc_page_unsupported_meta");
-    pageContextHelp.textContent = t("cc_page_context_help");
+    pageContextHelp.textContent = t("cc_page_handoff_unavailable_help");
     pageBindButton.disabled = true;
-    pageHandoffButton.hidden = true;
+    pageHandoffButton.disabled = true;
+    pageHandoffButton.textContent = t("cc_page_handoff");
     const option = document.createElement("option");
     option.textContent = t("cc_page_select_disabled");
     option.value = "";
@@ -201,15 +203,15 @@ function renderPageContext(state) {
 
   const boundIds = pageContextBindingIds();
   const handoffStatus = String(pageContext.response?.handoff?.status || "");
-  const canHandoff = bindings.length > 0 && (
+  const handoffPageSupported = (
     (info.site === "chatgpt" && Boolean(info.project_id) && Boolean(info.conversation_id))
     || (info.site === "z.ai" && Boolean(info.conversation_id))
   );
+  const canHandoff = bindings.length > 0 && handoffPageSupported;
   const workspaceBusy = bindings.some((binding) => (
     String(binding?.status || "") === "working" || Number(binding?.working_count || 0) > 0
   ));
   const transferBusy = ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(handoffStatus);
-  pageHandoffButton.hidden = !canHandoff;
   pageHandoffButton.disabled = !canHandoff || workspaceBusy || transferBusy;
   pageHandoffButton.textContent = workspaceBusy && canHandoff
     ? t("cc_page_handoff_busy")
@@ -232,9 +234,17 @@ function renderPageContext(state) {
     pageWorkspaceSelect.appendChild(option);
   }
   pageBindButton.disabled = !available.length || !pageWorkspaceSelect.value;
-  pageContextHelp.textContent = pageContext.error
-    || pageContext.notice
-    || (workspaceBusy && canHandoff ? t("cc_page_handoff_busy_help") : t("cc_page_context_help"));
+  let handoffHelp = t("cc_page_context_help");
+  if (!handoffPageSupported) {
+    if (info.site === "chatgpt") handoffHelp = t("cc_page_handoff_project_required");
+    else if (info.site === "z.ai") handoffHelp = t("cc_page_handoff_conversation_required");
+    else handoffHelp = t("cc_page_handoff_unavailable_help");
+  } else if (!bindings.length) {
+    handoffHelp = t("cc_page_handoff_binding_required");
+  } else if (workspaceBusy) {
+    handoffHelp = t("cc_page_handoff_busy_help");
+  }
+  pageContextHelp.textContent = pageContext.error || pageContext.notice || handoffHelp;
 }
 
 async function refreshPageContext() {
@@ -479,7 +489,7 @@ function handoffFailureMessage(error) {
 }
 
 pageHandoffButton.addEventListener("click", async () => {
-  if (!pageContext.tabId || pageHandoffButton.hidden || pageHandoffButton.disabled) return;
+  if (!pageContext.tabId || pageHandoffButton.disabled) return;
   pageHandoffButton.disabled = true;
   pageContextHelp.textContent = t("cc_page_handoff_starting");
   const response = await bg({ type: "h2w_handoff_start", tabId: pageContext.tabId, trigger: "manual" });

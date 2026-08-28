@@ -18,7 +18,7 @@
 | Control Center | 当前标签页属于哪个 Project / conversation、绑了什么、本机现场怎样、人工明确目标是谁 | Chrome Side Panel |
 | Options | timing / LLM / 语言等低频配置是什么 | Control Center 的“设置” |
 
-HUD **不是第二个控制面板**：没有抽屉、workspace picker、binding 编辑、timing 表单，也没有 handoff 按钮；只显示网页状态、Herdr 状态、绑定工作区/窗格数量、Auto 和三个预置手动会话动作。
+HUD **不是第二个控制面板**：没有抽屉、workspace picker、binding 编辑、timing 表单，也没有 handoff 按钮；只显示网页状态、Herdr 状态、一个紧凑的绑定徽标（`🔗N`）、Auto 和三个预置手动会话动作。pane / Agent 明细只在 Control Center 展示。
 
 Control Center 统一负责**当前页面身份、绑定 / 解绑、手动接力、本机详细状态和明确目标选择**。
 
@@ -43,7 +43,7 @@ Control Center 统一负责**当前页面身份、绑定 / 解绑、手动接力
 - conversation identity（如果有）；
 - 这个 Project / conversation 已绑定的 workspace；
 - 唯一的 workspace 绑定 / 解绑入口；
-- 当前页面支持安全接力时的 **手动接力**。
+- 始终可发现的 **手动接力**。当前页面不支持、尚未绑定、Herdr 仍在工作或还没进入具体会话时，按钮保留但禁用，并直接解释原因。
 
 切换 Chrome 标签页或当前标签页导航后，这张卡会通过 tab activation / navigation event 自动刷新，不做固定频率轮询；相应 workspace 会在本机 workspace 树中高亮。
 

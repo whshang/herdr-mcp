@@ -18,7 +18,7 @@ The extension now has two related but distinct operational surfaces:
 | Control Center | Which Project / conversation is the active tab, what is it bound to, what is happening locally, and which pane is the explicit target? | Chrome Side Panel |
 | Options | What low-frequency timing / model / language settings should apply? | Control Center Settings |
 
-The HUD is deliberately **not a second control panel**. It has no drawer, workspace picker, binding editor, timing form, or handoff button. It shows Web state, Herdr state, aggregate bound workspace/pane counts, Auto, and the three preset manual conversation actions.
+The HUD is deliberately **not a second control panel**. It has no drawer, workspace picker, binding editor, timing form, or handoff button. It shows Web state, Herdr state, one compact binding badge (`🔗N`), Auto, and the three preset manual conversation actions. Pane and Agent detail stays in the Control Center.
 
 The Control Center owns **active-page identity, binding/unbinding, manual handoff, detailed workstation state, and explicit target selection**.
 
@@ -43,7 +43,7 @@ The top **Current page** card is the bridge between browser context and local st
 - conversation identity when present;
 - workspace bindings for that Project / conversation;
 - the single UI path to bind or unbind a workspace;
-- **Manual handoff** when the current page supports the safe handoff contract.
+- an always-discoverable **Manual handoff** action. When the current page is unsupported, unbound, busy, or not yet a concrete conversation, the action stays visible but disabled and explains why.
 
 Changing Chrome tabs or navigating the active tab updates this card from tab activation/navigation events; there is no fixed polling loop. The corresponding workspace is highlighted in the local workspace tree.
 

@@ -36,7 +36,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.67";
+const H2W_SCRIPT_VERSION = "0.1.68";
 const H2W_TAB_URLS = ["*://chat.z.ai/*", "*://chat.deepseek.com/*", "*://claude.ai/*", "*://chatgpt.com/*"];
 const CHATGPT_CONTENT_SCRIPT_FILES = [
   "content/base.js",
@@ -113,7 +113,7 @@ function hudLabels() {
     "automation_on_hint", "automation_off_hint", "conversation_automation_on_hint", "conversation_automation_off_hint",
     "aria_toggle_automation", "automation_enabled", "automation_disabled", "automation_update_failed",
     "judge_no_continue", "continue_sent", "continue_failed",
-    "web_state", "scope_counts", "scope_counts_hint", "scope_unbound",
+    "web_state", "scope_binding_count", "scope_binding_hint", "scope_unbound",
     "tip_state", "tip_recovery", "tip_last_event", "none",
     "reason_disabled", "reason_no_conv", "reason_llm_not_configured", "reason_unbound",
     "reason_still_generating", "reason_not_substantive", "reason_empty_assistant", "reason_nudge_loop",

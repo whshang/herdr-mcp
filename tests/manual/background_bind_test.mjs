@@ -45,7 +45,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.67" };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.68" };
 const listeners = { onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
@@ -421,7 +421,8 @@ ok(coldHud?.ok === true
     && coldHud?.labels?.manual_judge
     && coldHud?.labels?.automation_off
     && coldHud?.labels?.web_state
-    && coldHud?.labels?.scope_counts,
+    && coldHud?.labels?.scope_binding_count
+    && coldHud?.labels?.scope_binding_hint,
   "cold-start HUD returns the complete localized label contract after config readiness",
   JSON.stringify(coldHud?.labels || {}));
 

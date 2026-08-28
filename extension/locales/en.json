@@ -294,11 +294,14 @@
   "cc_page_handoff_started": "Handoff started. The active tab may navigate while continuity is verified.",
   "cc_page_handoff_failed": "Handoff failed: {error}",
   "hud_web_state": "{site} ● {state}",
-  "hud_scope_counts": "{workspaces} workspaces · {panes} panes",
-  "hud_scope_counts_hint": "{working} bound panes currently working",
+  "hud_scope_binding_count": "🔗{count}",
+  "hud_scope_binding_hint": "{count} workspace binding(s) for this page. Open Control Center for pane and Agent details.",
   "hud_scope_unbound": "unbound",
   "cc_page_no_workspaces": "No local workspaces available — check the Herdr runtime",
   "cc_page_handoff_busy": "Wait for Herdr to settle",
   "cc_page_handoff_busy_help": "Manual handoff waits for the bound Herdr workspace to become idle. Let the current local work settle, then hand off from this Current page card.",
-  "cc_page_handoff_binding_required": "Bind at least one workspace before starting a manual handoff."
+  "cc_page_handoff_binding_required": "Bind at least one workspace before starting a manual handoff.",
+  "cc_page_handoff_project_required": "ChatGPT manual handoff is available from a concrete conversation inside a Project. Open a Project conversation first.",
+  "cc_page_handoff_conversation_required": "Open a concrete conversation before starting manual handoff.",
+  "cc_page_handoff_unavailable_help": "Manual handoff is not available for this page. Supported sources are ChatGPT Project conversations and z.ai conversations."
 }
