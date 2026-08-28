@@ -79,18 +79,25 @@ Evidence (local, gitignored): `docs/_wip/g910-rc1-stable-rehearsal-20260828.json
 
 **No.** Missing: G1 exit-alpha, stable-channel G9/G10 (needs `v0.4.0` stable tag + rehearsal), G20–G22 docs freeze, G25 vetoes cleared.
 
-## Next owner actions (fork — pick one)
+## Next owner actions (Option A — owner confirmed 2026-08-28)
 
-**Owner decision required:** stable-channel G9/G10 is BLOCKED until one path is chosen. Do not tag `v0.4.0` stable or change `UpdateChannel` policy without explicit owner approval.
+**Owner chose Option A (stable tag path).** Phase 0 verified @ `e6521ad7`. Do **not** change `UpdateChannel::Stable`. Do **not** tag `v0.4.0` in the version-bump PR — tagging is a separate owner-gated step.
 
-| | Option A — stable tag path | Option B — stable channel accepts rc |
-| --- | --- | --- |
-| **Action** | Tag `v0.4.0` (non-prerelease) after vetoes cleared | Code PR: extend `UpdateChannel::Stable` to accept `rc` prereleases |
-| **Then** | Stable-channel G9/G10 rehearsal (`update check` → `apply` → `rollback`) | Stable-channel G9/G10 rehearsal against `0.4.0-rc.1` on stable channel |
-| **Docs** | G20–G22 stable docs freeze | G20–G22 stable docs freeze (wording may differ) |
-| **Risk / note** | Standard semver GA cut; stable users get `0.4.0` only | Policy change; needs owner approval + regression tests; no stable tag yet |
+| Step | Status |
+| --- | --- |
+| Bump `main` Cargo to `0.4.0` (+ lock sync) | **In flight** — PR after merge |
+| Tag `v0.4.0` (non-prerelease) | **Next** — owner only, after merge + CI green |
+| Stable-channel G9/G10 rehearsal | After tag: `update check` (stable) → `apply` → `rollback` |
+| G20–G22 stable docs freeze | After stable rehearsal PASS |
+| G1 exit-alpha | After vetoes cleared |
 
-**After chosen path PASS:** G1 exit-alpha, G20–G22 docs freeze, second Mac clean install from stable or rc.1 Release.
+**After stable-channel G9/G10 PASS:** G20–G22 docs freeze, second Mac clean install from stable Release.
+
+<details>
+<summary>Superseded fork (Option B — not chosen)</summary>
+
+Option B would have extended `UpdateChannel::Stable` to accept `rc` prereleases. **Not selected.**
+</details>
 
 ## Related
 
