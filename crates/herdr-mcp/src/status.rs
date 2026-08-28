@@ -314,14 +314,10 @@ fn format_edge_configured_layer(edge: &Option<EdgeConfigView>) -> String {
         Some(edge) => format!(
             "configured-local source={} label={} host={} origin={} plist={}",
             edge.source.as_str(),
-            edge
-                .label
-                .as_deref()
-                .unwrap_or("-"),
+            edge.label.as_deref().unwrap_or("-"),
             edge.host,
             edge.origin,
-            edge
-                .plist
+            edge.plist
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "unset".to_owned())
@@ -378,10 +374,7 @@ impl RemoteProbeReport {
 fn resolve_edge_config() -> Option<EdgeConfigView> {
     let home = home_dir()?;
     let plist_candidates = [
-        (
-            "dev.herdr-mcp.link-prod",
-            EdgeConfigSource::LinkProdPlist,
-        ),
+        ("dev.herdr-mcp.link-prod", EdgeConfigSource::LinkProdPlist),
         ("dev.herdr-mcp.link", EdgeConfigSource::LinkPlist),
         (
             "dev.herdr-mcp.link-rust-candidate",
