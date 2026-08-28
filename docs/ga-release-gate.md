@@ -345,7 +345,7 @@ Score as **PARTIAL**, not PASS: advances honest same-Mac runtime install path; c
 
 | Path | When to use | Risk to dogfood |
 | --- | --- | --- |
-| **A. Second Mac / VM, default instance** | Canonical G18 + G7 seal | None |
+| **A. Second Mac / VM, default instance** | Canonical G18 + G7 seal; deploy an independent Edge Worker first ([clean-machine-uat §Second Mac Worker](i18n/en/clean-machine-uat.md)) | None |
 | **B. Dogfood Mac, default instance, maintenance window** | Owner accepts brief prod Link/Edge coupling | OAuth/tools exercise uses live `link-prod`; follow rollback runbook if anything regresses |
 
 **Do not** run ChatGPT OAuth UAT through `--instance uat` on the dogfood Mac: uat has no owned Link/Edge identity and must not cut over `link-prod`.
