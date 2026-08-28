@@ -25,6 +25,7 @@ export const DOC_ORDER = [
   "chatgpt-connector",
   "browser-continuity",
   "extension",
+  "browser-control-center",
   "extension-wake",
   "extension-bridge",
   "architecture",
@@ -44,7 +45,7 @@ export const DOC_ORDER = [
 // Group membership is keyed by logical slug only; labels are translated in UI.
 export const NAV_GROUPS = [
   { slugs: ["overview", "design-philosophy", "quick-start", "install", "clean-machine-uat", "chatgpt-connector"] },
-  { slugs: ["browser-continuity", "extension", "extension-wake", "extension-bridge"] },
+  { slugs: ["browser-continuity", "extension", "browser-control-center", "extension-wake", "extension-bridge"] },
   { slugs: ["architecture", "best-practices", "cli-reference"] },
   { slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade"] },
   { slugs: ["agent-install", "automation", "capability-benchmark", "herdr-vs-ecosystem", "worker-fallbacks"] },
@@ -53,8 +54,8 @@ export const NAV_GROUPS = [
 
 // Per-locale navigation group labels, in NAV_GROUPS order.
 export const NAV_GROUP_LABELS = {
-  "zh-CN": ["开始", "连续工作", "工作方式与架构", "部署与运行", "高级参考", "排障"],
-  en: ["Start", "Continuous work", "Workflow & architecture", "Deploy & operate", "Advanced reference", "Troubleshooting"],
+  "zh-CN": ["开始", "浏览器", "工作方式与架构", "部署与运行", "高级参考", "排障"],
+  en: ["Start", "Browser", "Workflow & architecture", "Deploy & operate", "Advanced reference", "Troubleshooting"],
 };
 
 // Per-locale user-visible strings. The build fails fast if a label is missing,

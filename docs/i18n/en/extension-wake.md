@@ -54,6 +54,37 @@ The HUD can expose:
 
 Continue/monitor/LLM-analysis are manual progression actions and are locked while Auto is on. Manual handoff is the exception: it can start with Auto on or off on supported conversations, pauses source automatic wakes during transfer, and makes the target inherit the source Auto state.
 
+## Queue: explicit next-turn user intent comes before auto-continue
+
+**Queue** beside the ChatGPT composer is different from the HUD's manual Continue action.
+
+Queue is for the case where the assistant is still replying but the user already knows what the next instruction should be. Clicking it does not interrupt the live turn; it persists the current composer text for that conversation.
+
+When the turn settles, ordering is:
+
+```text
+current assistant turn ends
+       ↓
+queued content? ── yes ──► merge and send the next user message
+       │ no
+       ▼
+then consider generic LLM auto-continue / idle nudge
+```
+
+This priority is deliberate: **an explicit next-turn user instruction outranks the model deciding for itself whether to continue.**
+
+The queue also follows these bounds:
+
+- entries preserve insertion order and merge with blank lines;
+- a `turn-in-progress` or other blocked delivery does not ACK or drop content;
+- only a confirmed delivered batch is removed;
+- entry count, per-entry length, and merged length are bounded;
+- right-click Queue to clear the current conversation queue;
+- click with an empty composer to retry a still-pending batch;
+- after handoff cutover is confirmed, pending content migrates to the target conversation in the same order.
+
+Queue does not execute a Herdr tool or change workspace binding. It only preserves and delivers **the next user message**.
+
 ## Automation scope
 
 ### ChatGPT Projects

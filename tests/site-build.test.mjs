@@ -61,7 +61,7 @@ test("documentation site build publishes every logical doc x 2 locales under loc
     await access(join(OUT, "docs", locale, "index.html"), constants.R_OK);
   }
 
-  for (const rel of ["index.html", "style.css", "app.js", "zh-CN/index.html", "docs/index.html", "herdr-mcp-SKILL.md", "release.json", ".nojekyll"]) {
+  for (const rel of ["index.html", "style.css", "app.js", "favicon.png", "zh-CN/index.html", "docs/index.html", "herdr-mcp-SKILL.md", "release.json", ".nojekyll"]) {
     await access(join(OUT, rel), constants.R_OK);
   }
 
@@ -150,6 +150,7 @@ test("article pages carry same-slug language switching, per-locale search isolat
       const other = LOCALES.find((lang) => lang !== locale);
       assert.equal(matches(switcher, new RegExp(`href="\\.\\./${other}/${slug}\\.html"`, "g")).length, 1, `exactly one switch to ${other} same slug (${locale}/${slug})`);
       assert.match(html, /class="brand" href="\.\.\/\.\.\/"/);
+      assert.match(html, /rel="icon" type="image\/png" href="\.\.\/\.\.\/favicon\.png"/);
 
       // Canonical is self; alternates cover both locales; x-default -> default-locale same slug.
       assert.match(html, new RegExp(`rel="canonical" href="${ORIGIN}/docs/${locale}/${slug}\\.html"`));
@@ -280,6 +281,7 @@ test("shared runtime assets keep theme/drawer/search behavior and gain localized
   assert.match(css, /--article-w:\s*760px/);
   assert.match(css, /@media \(max-width: 1023px\)/);
   assert.match(css, /@media \(max-width: 720px\)/);
+  assert.match(css, /\.topnav, \.version-badge \{ display: none; \}/, "mobile docs header hides redundant nav and version badge");
   assert.match(css, /:root\[data-theme="dark"\]/);
   assert.match(css, /\.lang-switcher/, "language switcher styling");
   assert.doesNotMatch(css, /chooser/, "no leftover language-chooser styling");
@@ -305,11 +307,16 @@ test("release.json, skill artifact and design invariants are preserved", async (
   const home = await readFile(join(OUT, "index.html"), "utf8");
   assert.match(home, /herdr-mcp/);
   assert.match(home, /<html lang="en">/);
+  assert.match(home, /rel="icon" type="image\/png" href="\.\/favicon\.png"/);
   assert.match(home, /herdr-docs-lang/, "homepage must route zh browsers to the zh mirror");
   assert.match(home, /href="\.\/docs\/"/);
   assert.match(home, /href="\.\/docs\/en\/runtime-self-upgrade\.html"/);
   assert.match(home, /href="\.\/docs\/en\/capability-benchmark\.html"/);
   assert.match(home, /href="\.\/docs\/en\/cloudflare-edge-deployment\.html"/);
+  assert.match(home, /href="\.\/docs\/en\/extension\.html"/, "homepage must expose the browser extension as a primary product surface");
+  assert.match(home, /href="\.\/docs\/en\/browser-control-center\.html"/, "homepage must link the Browser Control Center");
+  assert.match(home, /Browser Control Center/);
+  assert.match(home, /Queue/);
   // Homepage is bilingual: no hard-coded "Start locally", topbar switch + zh mirror.
   assert.doesNotMatch(home, /Start locally/);
   assert.match(home, /href="\.\/zh-CN\/index\.html"[^>]*hreflang="zh-CN"/);
@@ -317,11 +324,23 @@ test("release.json, skill artifact and design invariants are preserved", async (
   // documentation links all point at the Chinese docs (never the English ones).
   const homeZh = await readFile(join(OUT, "zh-CN", "index.html"), "utf8");
   assert.match(homeZh, /<html lang="zh-CN">/);
+  assert.match(homeZh, /rel="icon" type="image\/png" href="\.\.\/favicon\.png"/);
   assert.ok(matches(homeZh, /\.\.\/docs\/zh-CN\//g).length >= 5, "zh homepage docs links all point at zh-CN docs");
   assert.doesNotMatch(homeZh, /href="\.\.\/docs\/"/, "zh homepage must not link the bare (English) docs entry");
   assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/runtime-self-upgrade\.html"/);
   assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/capability-benchmark\.html"/);
+  assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/extension\.html"/);
+  assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/browser-control-center\.html"/);
+  assert.match(homeZh, /浏览器控制中心/);
+  assert.match(homeZh, /排队/);
   assert.match(homeZh, /href="\.\.\/" [^>]*hreflang="en"/);
+
+  for (const locale of LOCALES) {
+    const control = await readFile(join(OUT, "docs", locale, "browser-control-center.html"), "utf8");
+    assert.match(control, /Chrome Side Panel/);
+    assert.match(control, /Preview-only|preview-only|控制操作仅预览/);
+    assert.match(control, /Pinned Target|固定目标/);
+  }
 
   const generatedDocs = await readdir(join(OUT, "docs"));
   assert.equal(generatedDocs.some((name) => name.includes("_wip")), false);

@@ -133,18 +133,21 @@ Web AI → MCP → Edge → WSS → runtime → files / shell / Herdr
 
 网页模型有一个天然限制：没有用户消息时，它不会永远主动轮询你的电脑。一个本地 Agent 工作了二十分钟后完成，ChatGPT 本身不会突然醒来问“结果怎么样了”。
 
-浏览器扩展负责这条反向通道：
+浏览器扩展复用同一条受信任本机桥，同时服务两种不同的浏览器路径：
 
 ```text
 Herdr events → local runtime → Native Messaging → browser extension
                                               │
-                                              ├─ progress
-                                              ├─ settled
-                                              ├─ recovery
-                                              └─ conversation rollover
+                                              ├─ Web conversation
+                                              │   ├─ progress / settled
+                                              │   ├─ recovery
+                                              │   └─ conversation rollover
+                                              │
+                                              └─ Chrome Side Panel
+                                                  └─ workspace / pane / Agent 实时观察
 ```
 
-因此，MCP 负责“网页向机器伸手”，扩展负责“机器在必要时敲一下网页”。两者组合后，长任务才具备连续性。
+因此，MCP 负责“网页向机器伸手”；扩展的 Continuity 负责“机器在必要时敲一下正确的网页会话”；Control Center 则把本机真实工作现场送进 Chrome Side Panel。三者职责不同，但共享同一套本机 runtime 与身份边界。
 
 ## 浏览器为什么不保存 Herdr bearer
 
@@ -225,7 +228,7 @@ Runtime A/B 把“ChatGPT 连哪里”和“当前跑哪个本地版本”分开
 | `herdr-mcp` runtime | 工作站常驻 | MCP tools、文件/Git/Shell、安全闸门 |
 | Herdr daemon | 工作站常驻 | workspace/pane/PTY/Agent/Socket API |
 | Native Messaging host | 浏览器按需 | extension ↔ local runtime trusted bridge |
-| Browser extension | 浏览器会话 | 状态 HUD、恢复、连续工作、JSON→MCP |
+| Browser extension | 浏览器会话 + Chrome Side Panel | HUD 连续工作、Control Center、Queue、JSON→MCP |
 
 ## 关键环境变量
 

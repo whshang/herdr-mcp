@@ -138,6 +138,7 @@ function headMeta({ pre, locale, canonicalHref, alternates, xDefault, descriptio
   <link rel="canonical" href="${esc(canonicalHref)}">
   ${alternatesHtml}
   <link rel="alternate" hreflang="x-default" href="${esc(xDefault)}">
+  <link rel="icon" type="image/png" href="${pre}favicon.png">
   <link rel="stylesheet" href="${pre}style.css">`;
 }
 
@@ -279,6 +280,7 @@ function localeEntryShell({ locale }) {
   ${LOCALES.map((lang) => `<link rel="alternate" hreflang="${esc(lang)}" href="${esc(`${origin}/docs/${lang}/${first}.html`)}">`).join("\n  ")}
   <link rel="alternate" hreflang="x-default" href="${esc(`${origin}/docs/${DEFAULT_LOCALE}/${first}.html`)}">
   <meta http-equiv="refresh" content="0; url=./${first}.html">
+  <link rel="icon" type="image/png" href="../../favicon.png">
   <link rel="stylesheet" href="../../style.css">
 </head>
 <body class="docs-index-page">
@@ -316,6 +318,7 @@ function docsRedirectShell() {
   <link rel="alternate" hreflang="zh-CN" href="${esc(zhFirst)}">
   <link rel="alternate" hreflang="x-default" href="${esc(enFirst)}">
   <meta http-equiv="refresh" content="0; url=./en/${first}.html">
+  <link rel="icon" type="image/png" href="../favicon.png">
   <link rel="stylesheet" href="../style.css">
 </head>
 <body class="docs-index-page">

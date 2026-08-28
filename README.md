@@ -16,7 +16,7 @@ herdr-mcp gives a Web planner five things it normally lacks:
 - **deterministic workstation tools** — files, Git, images and shell;
 - **delegation** — send bounded reasoning tasks to local Herdr workers when useful;
 - **stable remote access** — OAuth/MCP at Cloudflare Edge with an outbound workstation link;
-- **browser continuity** — push local progress back into the Web conversation and safely hand long conversations to a fresh one.
+- **browser workspace layer** — continuity back into the Web conversation, a live Chrome Side Panel Control Center, and queued next-turn user intent.
 
 The model is simple:
 
@@ -156,7 +156,7 @@ answer
 
 Then try one small edit + test + diff. Delegate to a local agent only when the task benefits from independent reasoning.
 
-## Browser continuity
+## Browser extension
 
 MCP is request-driven:
 
@@ -164,15 +164,16 @@ MCP is request-driven:
 Web AI → workstation
 ```
 
-A local agent may keep working after the browser turn ends. The optional MV3 extension provides the reverse continuity path:
+A local agent may keep working after the browser turn ends. The optional MV3 extension adds both the reverse continuity path and a browser-local view of the workstation:
 
 ```text
 workstation → Web conversation
+          ↘ Chrome Side Panel Control Center
 ```
 
-It supports workspace binding, progress/settled wakeups, evidence-first recovery, long-conversation handoff, and a bounded JSON→MCP compatibility bridge for sites such as z.ai / DeepSeek that do not expose the same native custom MCP connector.
+Current browser-product surfaces include workspace binding, progress/settled wakeups, evidence-first recovery, long-conversation handoff, the read-only/preview-only Browser Control Center, ChatGPT Queue for next-turn user intent, and a bounded JSON→MCP compatibility bridge for sites such as z.ai / DeepSeek.
 
-Browser continuity is optional and not part of the first-GA platform claim until extension distribution is sealed (see GA gate G15/G16). When you need it on a developer workstation, use the managed Native Messaging installer from the installed runtime and follow [Browser continuity](docs/i18n/en/browser-continuity.md) / [Browser extension](docs/i18n/en/extension.md). Do not treat unpacking `extension/` from a git checkout as the primary end-user path.
+Browser extension distribution is still gated by G15. True browser mutation remains separately deferred under G16; neither is part of the first-GA platform claim yet. Use the versioned extension Release asset plus the managed Native Messaging installer from the installed runtime, and follow [Browser extension](docs/i18n/en/extension.md) / [Browser Control Center](docs/i18n/en/browser-control-center.md). Do not treat a git-checkout `extension/` directory as the primary end-user path.
 
 ## Security model
 

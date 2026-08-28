@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="description" content="herdr-mcp 把 ChatGPT 等 Web AI 连接到本地 Herdr 工作站：读改代码、运行 Git/Shell、调度本地 Agent，并支持长任务与长对话连续工作。">
   <meta name="color-scheme" content="light dark">
+  <link rel="icon" type="image/png" href="../favicon.png">
   <title>herdr-mcp · Web AI 的本地开发控制面</title>
   <link rel="canonical" href="https://whshang.github.io/herdr-mcp/zh-CN/index.html">
   <link rel="alternate" hreflang="en" href="https://whshang.github.io/herdr-mcp/">
@@ -29,6 +30,7 @@
       <p class="lead">herdr-mcp 是 Web AI 与本地 Herdr 工作站之间的远程开发控制面。ChatGPT 可以直接读改代码、查看 Git、运行 Shell、观察持久工作区，并在需要独立推理时调度本地 Agent；代码和真实执行仍留在自己的机器上。</p>
       <div class="actions">
         <a class="primary" href="../docs/zh-CN/quick-start.html">快速开始</a>
+        <a href="../docs/zh-CN/extension.html">浏览器扩展</a>
         <a href="../docs/zh-CN/design-philosophy.html">为什么这样设计</a>
         <a href="../docs/zh-CN/architecture.html">架构</a>
         <a href="https://github.com/whshang/herdr-mcp">GitHub</a>
@@ -47,14 +49,14 @@
       <article><h2>Web 模型，拥有本机的手和眼睛</h2><p>确定性工作直接用文件、搜索、Patch、Git 和 Shell 工具完成，不必把每一步都转交给另一个 Agent。网页模型可以一直掌握目标、取舍和验收。</p></article>
       <article><h2>Herdr 保存真正的工作现场</h2><p>workspace、pane、PTY 和 Agent 不依赖某一次网页请求存在。长测试、服务器、并行 Agent 都有稳定身份，新的网页回合回来后可以重新观察并继续。</p></article>
       <article><h2>需要第二份推理时再调度 Agent</h2><p>独立调查、并行实现、代码审查可以交给 Pi、Grok 等 Herdr Agent。读文件、看 Git、跑测试则直接做，减少转述、延迟和上下文消耗。</p></article>
-      <article><h2>浏览器连续工作</h2><p>MCP 负责 Web AI → 工作站；浏览器扩展补上工作站 → Web 会话。Agent 完成、回复卡住或对话过长时，可以按安全状态机继续、恢复或接力。</p></article>
+      <article><h2>浏览器扩展补全长期工作闭环</h2><p>Continuity 把进度、恢复和接力送回正确会话；浏览器控制中心在 Chrome Side Panel 实时展示 workspace / pane 和明确目标；“排队”让用户不中断当前回复地保存下一轮要求。</p></article>
       <article><h2>工作站不用暴露公网端口</h2><p>Cloudflare Edge 提供稳定 OAuth/MCP 入口，工作站主动建立认证 WSS。ChatGPT 不需要本机 bearer，公网身份和本地执行环境彼此解耦。</p></article>
       <article><h2>本机 Runtime 可以独立升级</h2><p>Runtime A/B 在同一公开契约内验证 candidate、切换、drain 和 rollback。公网 Connector URL 保持稳定，不需要因为普通本机修复反复重连 ChatGPT。</p></article>
     </section>
 
     <section class="grid">
       <article><h2>第一次使用</h2><p>已有 Herdr 后，按快速开始完成本机 runtime、workers.dev Edge、ChatGPT Connector 和一次真实 <code>herdr_inspect</code> 验收。</p><p><a href="../docs/zh-CN/quick-start.html">打开快速开始 →</a></p></article>
-      <article><h2>长期网页开发</h2><p>把会话绑定到 Herdr workspace，让 progress、settled、recovery 和 handoff 成为长任务的一部分。</p><p><a href="../docs/zh-CN/browser-continuity.html">理解浏览器连续工作 →</a></p></article>
+      <article><h2>浏览器工作台</h2><p>绑定网页会话，在 Side Panel 观察真实 Herdr 现场、读取有界 pane 输出，并在回复仍进行时把明确的下一轮用户意图先排队。</p><p><a href="../docs/zh-CN/extension.html">了解浏览器扩展 →</a> · <a href="../docs/zh-CN/browser-control-center.html">控制中心 →</a></p></article>
       <article><h2>深入设计</h2><p>了解为什么公共 MCP 契约保持紧凑、为什么运行事实属于 Herdr，以及 Edge、Link、Runtime 和扩展各自负责什么。</p><p><a href="../docs/zh-CN/architecture.html">阅读架构 →</a></p></article>
     </section>
 

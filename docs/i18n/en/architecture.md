@@ -8,7 +8,7 @@ The key idea is not “put a shell on the Internet.” It is to keep responsibil
 - Herdr owns persistent workspaces, panes and agent lifecycle;
 - herdr-mcp exposes a compact, safe remote-control surface;
 - Cloudflare Edge provides a stable public OAuth/MCP identity;
-- the browser extension provides the return path from local progress back into a Web conversation.
+- the browser extension provides the return path into Web conversations plus a Side Panel for observing live local workspace / pane state.
 
 ```text
 User
@@ -128,9 +128,9 @@ Long-lived development also needs the reverse direction:
 workstation → browser conversation
 ```
 
-The browser extension binds a conversation to a Herdr workspace and can route progress/settled signals, recovery state and handoff control back into the page.
+The browser extension binds a conversation to a Herdr workspace and can route progress/settled signals, recovery state and handoff control back into the page. Its Chrome Side Panel also presents live workspace / pane / agent state, explicit Pinned Targets, bounded reads, and preview-only future controls.
 
-That extension is not another runtime. It is a continuity channel.
+That extension is not another runtime. Continuity, Control Center, Queue, and JSON → MCP are browser surfaces over the same trusted local bridge, while Herdr remains the runtime truth.
 
 See [Browser continuity](browser-continuity.md).
 
