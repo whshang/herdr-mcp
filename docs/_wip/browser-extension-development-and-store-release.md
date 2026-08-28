@@ -26,7 +26,7 @@ Herdr workspace / pane / agent
 
 当前扩展名称：`herdr → Web wake`。
 
-当前浏览器入口收敛分支的 manifest 版本：`0.1.66`；合入后以实时 `origin/main` 为准。
+当前 `origin/main` 浏览器扩展版本：`0.1.70`。`0.1.69` 首次上传 Chrome Web Store 时因 manifest `description` 超过 132 字符被拒；`0.1.70` 仅做 Store 合规修正并已通过扩展 CI。
 
 核心能力包括：
 
@@ -771,12 +771,14 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 截至 2026-08-28：
 
 - 浏览器扩展继续以 unpacked development build 方式开发；
-- main 浏览器扩展版本已进入 `0.1.69`；Side Panel 是 binding / unbinding、手动接力与本机详细状态的主入口，HUD 保持紧凑状态面；
+- main 浏览器扩展版本已进入 `0.1.70`；Side Panel 是 binding / unbinding、手动接力与本机详细状态的主入口，HUD 保持紧凑状态面；
 - Browser Control Center Phase A 与 pane lifecycle 已进入 main，0.1.65 进一步补齐 en / zh / ja、Pinned Target / Preview-only 产品文案与 Settings 入口；
 - ChatGPT Queued Insert 已进入 main，正式用户文档使用“排队 / Queue”描述其 next-turn 语义；
-- Chrome Web Store 首次发布流程**已经启动**；Developer Dashboard 注册入口已打开；
+- Chrome Web Store 首次发布流程**已经启动**；Developer Dashboard publisher 已可用，Store item 已创建；
 - 普通用户正式安装路径已经切为 Chrome Web Store，Store listing 上线前直接跳过扩展；
-- Store item / Store Extension ID 尚未冻结，需完成 publisher 注册与首次 item upload；
-- 商店版 Native Host origin 迁移尚未开始；
+- Store Extension ID 已冻结为 `kpcengcaammanfnbclapecdgahdmhanp`；Store listing、128x128 icon、1280x800 screenshot 与 Privacy practices 已写入 draft；
+- **当前 Store 发布 blocker：Native Messaging origin 仍绑定开发版 path-derived ID。** stable `0.4.0` 当前 `native-host status` 的 extension ID 为 `dklcamincneeijhcelpkdbcekfemldii`，与 Store ID 不同；在正式提交审核前必须提供受支持的 Store-origin 安装/迁移路径，并完成商店安装后的真实 Native Messaging smoke；
+- Store Privacy Policy 已补入正式 docs，待 docs PR 合并并由 GitHub Pages 发布后，将 `https://whshang.github.io/herdr-mcp/docs/en/privacy.html` 写入 Store Privacy tab；
+- Publisher contact email 仍需配置并完成 Google verification；该邮箱会公开展示，不得由 Agent 猜测；
 - 首次 Store submit 前必须审计 `<all_urls>` 等 permissions 是否能缩窄；
 - 后续每次 Store 发布仍需重新核对实时 Chrome Web Store policy，不得把本 WIP 的时间点描述当成永久不变的商店规则。
