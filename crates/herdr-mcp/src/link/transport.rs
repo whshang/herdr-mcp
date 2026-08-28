@@ -24,7 +24,8 @@ use crate::relay::wire::{
 use serde_json::Value;
 use std::io::{self, Write};
 
-pub const LINK_DEFAULT_HEARTBEAT_MS: i64 = 30_000;
+pub const LINK_DEFAULT_TRANSPORT_PING_MS: i64 = 15_000;
+pub const LINK_DEFAULT_HEARTBEAT_MS: i64 = 60_000;
 pub const LINK_DEFAULT_HANDSHAKE_TIMEOUT_MS: i64 = 10_000;
 pub const LINK_DEFAULT_MAX_FRAME_BYTES: usize = 262_144;
 pub const LINK_DEFAULT_MAX_SILENCE_MS: i64 = 90_000;
@@ -34,6 +35,7 @@ pub struct SocketAttemptId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportConfig {
+    pub transport_ping_ms: i64,
     pub heartbeat_ms: i64,
     pub handshake_timeout_ms: i64,
     pub max_frame_bytes: usize,
@@ -43,6 +45,7 @@ pub struct TransportConfig {
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
+            transport_ping_ms: LINK_DEFAULT_TRANSPORT_PING_MS,
             heartbeat_ms: LINK_DEFAULT_HEARTBEAT_MS,
             handshake_timeout_ms: LINK_DEFAULT_HANDSHAKE_TIMEOUT_MS,
             max_frame_bytes: LINK_DEFAULT_MAX_FRAME_BYTES,
@@ -70,6 +73,7 @@ pub enum TransportAction {
     ScheduleReconnect(ReconnectSchedule),
     CancelReconnectWait,
     StartOnlineTimers {
+        transport_ping_ms: i64,
         heartbeat_ms: i64,
         silence_check_ms: f64,
     },
@@ -92,6 +96,9 @@ pub enum TransportAction {
         reason: String,
     },
     HeartbeatDue {
+        attempt_id: SocketAttemptId,
+    },
+    TransportPingDue {
         attempt_id: SocketAttemptId,
     },
     Inbound {
@@ -297,6 +304,7 @@ impl LinkTransportCore {
                                 connected_at_ms: now_ms,
                             },
                             TransportAction::StartOnlineTimers {
+                                transport_ping_ms: self.config.transport_ping_ms,
                                 heartbeat_ms: self.config.heartbeat_ms,
                                 silence_check_ms: silence_check_interval_ms(
                                     self.config.heartbeat_ms as f64,
@@ -470,6 +478,23 @@ impl LinkTransportCore {
             return vec![TransportAction::HeartbeatDue { attempt_id }];
         }
         Vec::new()
+    }
+
+    pub fn transport_ping_tick(&self) -> Vec<TransportAction> {
+        if heartbeat_eligible(
+            self.lifecycle.phase(),
+            self.lifecycle.stopped(),
+            self.socket_open,
+        ) && let Some(attempt_id) = self.active_attempt
+        {
+            return vec![TransportAction::TransportPingDue { attempt_id }];
+        }
+        Vec::new()
+    }
+
+    /// RFC WebSocket pong (or any edge control-frame liveness) observed.
+    pub fn transport_liveness_observed(&mut self, now_ms: i64) {
+        self.last_edge_seen_ms = Some(now_ms);
     }
 
     pub fn silence_tick(&mut self, now_ms: i64) -> Vec<TransportAction> {
@@ -758,7 +783,8 @@ mod tests {
                     ..
                 },
                 TransportAction::StartOnlineTimers {
-                    heartbeat_ms: 30_000,
+                    transport_ping_ms: 15_000,
+                    heartbeat_ms: 60_000,
                     silence_check_ms: 30_000.0,
                 }
             ]
@@ -966,6 +992,23 @@ mod tests {
             error.runtime_generation,
             OptionalNullable::Value("g1".to_owned())
         );
+    }
+
+    #[test]
+    fn transport_ping_tick_and_liveness_observed_match_online_gate() {
+        let mut core = core();
+        let attempt = open_and_handshake(&mut core);
+        core.frame_received(attempt, &success_ack(), 2_000, 0.5)
+            .unwrap();
+        assert_eq!(
+            core.transport_ping_tick(),
+            vec![TransportAction::TransportPingDue {
+                attempt_id: attempt
+            }]
+        );
+        core.transport_liveness_observed(2_500);
+        assert_eq!(core.last_edge_seen_ms(), Some(2_500));
+        assert!(core.silence_tick(62_000).is_empty());
     }
 
     #[test]

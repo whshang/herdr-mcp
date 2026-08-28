@@ -39,7 +39,8 @@ pub const PUBLIC_CONTRACT_HASH: &str =
 pub const LEGACY_EPOCH1_CONTRACT_HASH: &str =
     "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d";
 
-const DAEMON_HEARTBEAT_MS: i64 = 15_000;
+const DAEMON_TRANSPORT_PING_MS: i64 = 15_000;
+const DAEMON_HEARTBEAT_MS: i64 = 60_000;
 const DAEMON_MAX_SILENCE_MS: i64 = 60_000;
 const DAEMON_REQUEST_TIMEOUT_MS: u64 = 60_000;
 const DAEMON_DRAIN_MS: u64 = 5_000;
@@ -238,6 +239,7 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
         None,
         ExponentialBackoff::new(BackoffOptions::default()),
         TransportConfig {
+            transport_ping_ms: DAEMON_TRANSPORT_PING_MS,
             heartbeat_ms: DAEMON_HEARTBEAT_MS,
             handshake_timeout_ms: LINK_DEFAULT_HANDSHAKE_TIMEOUT_MS,
             max_frame_bytes: LINK_DEFAULT_MAX_FRAME_BYTES,
@@ -557,6 +559,7 @@ mod tests {
                 jitter: Some(0.0),
             }),
             TransportConfig {
+                transport_ping_ms: DAEMON_TRANSPORT_PING_MS,
                 heartbeat_ms: DAEMON_HEARTBEAT_MS,
                 handshake_timeout_ms: LINK_DEFAULT_HANDSHAKE_TIMEOUT_MS,
                 max_frame_bytes: LINK_DEFAULT_MAX_FRAME_BYTES,

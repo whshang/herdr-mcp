@@ -25,6 +25,10 @@
  *  - On restart, state is rebuilt from storage; any resolver lost is
  *    reconciled by the alarm sweep from persisted state (never replays a
  *    mutating request).
+ *  - RFC WebSocket ping/pong is handled by the Cloudflare runtime without
+ *    calling webSocketMessage or waking a hibernated isolate. Application JSON
+ *    heartbeats are throttled on the Link side; steady-state beats update
+ *    in-memory last_seen only and avoid Durable Object storage writes.
  */
 
 import type { Env } from "./env.js";
@@ -40,7 +44,12 @@ import {
   type RelayErrorCode,
   type RelayErrorResult,
 } from "./errors.js";
-import { classifyOp, makeLimits, HEARTBEAT_PERSIST_THROTTLE_MS } from "./limits.js";
+import {
+  classifyOp,
+  makeLimits,
+  HEARTBEAT_PERSIST_THROTTLE_MS,
+  EDGE_STATUS_REPLY_INTERVAL_MS,
+} from "./limits.js";
 import { checkArgsBudget, parseJsonFrame, readBodyBounded } from "./payload.js";
 import {
   PendingRequestRegistry,
@@ -130,6 +139,7 @@ export class WorkstationDO {
   private initialized = false;
   private initPromise: Promise<void> | undefined;
   private lastSeenPersistedAtMs = 0;
+  private lastEdgeStatusReplyAtMs = 0;
   /** Known-safe reads are correlated only in memory and never enter DO storage. */
   private readonly ephemeralReads = new Map<string, EphemeralReadRequest>();
   /** In-memory resolver cache only; storage remains authoritative. */
@@ -807,23 +817,39 @@ export class WorkstationDO {
 
   private async handleHeartbeat(msg: HeartbeatMessage, ws: WebSocket): Promise<void> {
     const now = Date.now();
+    let runtimeChanged = false;
+    let persisted = false;
+    let statusReplied = false;
     if (this.session) {
       this.session.lastSeenAtMs = now;
-      const runtimeChanged = applyRuntimeStatusGlimpse(this.session, msg.runtime, true);
+      runtimeChanged = applyRuntimeStatusGlimpse(this.session, msg.runtime, true);
       if (runtimeChanged || now - this.lastSeenPersistedAtMs >= HEARTBEAT_PERSIST_THROTTLE_MS) {
         this.lastSeenPersistedAtMs = now;
         await this.state.storage.put(KEY_SESSION, serializeSession(this.session));
+        persisted = true;
+      }
+      if (runtimeChanged || now - this.lastEdgeStatusReplyAtMs >= EDGE_STATUS_REPLY_INTERVAL_MS) {
+        this.lastEdgeStatusReplyAtMs = now;
+        statusReplied = true;
+        const edgeSeen: StatusMessage = {
+          protocol_version: RELAY_PROTOCOL_VERSION,
+          kind: "status",
+          workstation_id: this.workstationId(),
+          healthy: true,
+          sent_at_ms: now,
+        };
+        this.sendToSocket(ws, edgeSeen);
       }
     }
-    const edgeSeen: StatusMessage = {
-      protocol_version: RELAY_PROTOCOL_VERSION,
-      kind: "status",
-      workstation_id: this.workstationId(),
-      healthy: true,
-      sent_at_ms: now,
-    };
-    this.sendToSocket(ws, edgeSeen);
-    this.logger.info("ws.heartbeat", { workstationId: this.session?.workstationId, bootId: msg.boot_id });
+    if (runtimeChanged || persisted || statusReplied) {
+      this.logger.info("ws.heartbeat", {
+        workstationId: this.session?.workstationId,
+        bootId: msg.boot_id,
+        runtimeChanged,
+        persisted,
+        statusReplied,
+      });
+    }
   }
 
   private async handleLinkStatus(msg: StatusMessage): Promise<void> {

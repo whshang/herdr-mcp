@@ -165,6 +165,9 @@ enum LoopEvent<H> {
     HeartbeatTick {
         generation: u64,
     },
+    TransportPingTick {
+        generation: u64,
+    },
     SilenceTick {
         generation: u64,
     },
@@ -197,8 +200,9 @@ where
     reconnect_generation: u64,
     reconnect_timer: Option<JoinHandle<()>>,
     online_generation: u64,
-    online_delays: Option<(Duration, Duration)>,
+    online_delays: Option<(Duration, Duration, Duration)>,
     heartbeat_timer: Option<JoinHandle<()>>,
+    transport_ping_timer: Option<JoinHandle<()>>,
     silence_timer: Option<JoinHandle<()>>,
     drain_generation: u64,
     drain_timer: Option<JoinHandle<()>>,
@@ -248,6 +252,7 @@ where
             online_generation: 0,
             online_delays: None,
             heartbeat_timer: None,
+            transport_ping_timer: None,
             silence_timer: None,
             drain_generation: 0,
             drain_timer: None,
@@ -429,9 +434,24 @@ where
                 let exit = self.pump_actions(actions).await?;
                 if exit.is_none()
                     && generation == self.online_generation
-                    && let Some((heartbeat_delay, _)) = self.online_delays
+                    && let Some((_, heartbeat_delay, _)) = self.online_delays
                 {
                     self.arm_heartbeat(generation, heartbeat_delay);
+                }
+                Ok(exit)
+            }
+            LoopEvent::TransportPingTick { generation } => {
+                if generation != self.online_generation || self.online_delays.is_none() {
+                    return Ok(None);
+                }
+                self.transport_ping_timer.take();
+                let actions = self.core.transport_ping_tick();
+                let exit = self.pump_actions(actions).await?;
+                if exit.is_none()
+                    && generation == self.online_generation
+                    && let Some((transport_ping_delay, _, _)) = self.online_delays
+                {
+                    self.arm_transport_ping(generation, transport_ping_delay);
                 }
                 Ok(exit)
             }
@@ -444,7 +464,7 @@ where
                 let exit = self.pump_actions(actions).await?;
                 if exit.is_none()
                     && generation == self.online_generation
-                    && let Some((_, silence_delay)) = self.online_delays
+                    && let Some((_, _, silence_delay)) = self.online_delays
                 {
                     self.arm_silence(generation, silence_delay);
                 }
@@ -530,6 +550,10 @@ where
                     let generated = self.execute_socket_action(&action).await?;
                     queue.extend(generated);
                 }
+                TransportAction::TransportPingDue { .. } => {
+                    let generated = self.execute_socket_action(&action).await?;
+                    queue.extend(generated);
+                }
                 TransportAction::ArmHandshakeTimeout {
                     attempt_id,
                     delay_ms,
@@ -544,9 +568,10 @@ where
                 }
                 TransportAction::CancelReconnectWait => self.cancel_reconnect(),
                 TransportAction::StartOnlineTimers {
+                    transport_ping_ms,
                     heartbeat_ms,
                     silence_check_ms,
-                } => self.start_online_timers(heartbeat_ms, silence_check_ms),
+                } => self.start_online_timers(transport_ping_ms, heartbeat_ms, silence_check_ms),
                 TransportAction::StopOnlineTimers => self.stop_online_timers(),
                 TransportAction::OversizedInbound {
                     request_id: Some(request_id),
@@ -691,13 +716,20 @@ where
         abort_task(&mut self.reconnect_timer);
     }
 
-    fn start_online_timers(&mut self, heartbeat_ms: i64, silence_check_ms: f64) {
+    fn start_online_timers(
+        &mut self,
+        transport_ping_ms: i64,
+        heartbeat_ms: i64,
+        silence_check_ms: f64,
+    ) {
         self.stop_online_timers();
         self.online_generation = self.online_generation.saturating_add(1);
         let generation = self.online_generation;
+        let transport_ping_delay = duration_from_i64_ms(transport_ping_ms);
         let heartbeat_delay = duration_from_i64_ms(heartbeat_ms);
         let silence_delay = duration_from_f64_ms(silence_check_ms);
-        self.online_delays = Some((heartbeat_delay, silence_delay));
+        self.online_delays = Some((transport_ping_delay, heartbeat_delay, silence_delay));
+        self.arm_transport_ping(generation, transport_ping_delay);
         self.arm_heartbeat(generation, heartbeat_delay);
         self.arm_silence(generation, silence_delay);
     }
@@ -706,7 +738,17 @@ where
         self.online_generation = self.online_generation.saturating_add(1);
         self.online_delays = None;
         abort_task(&mut self.heartbeat_timer);
+        abort_task(&mut self.transport_ping_timer);
         abort_task(&mut self.silence_timer);
+    }
+
+    fn arm_transport_ping(&mut self, generation: u64, delay: Duration) {
+        abort_task(&mut self.transport_ping_timer);
+        let event_tx = self.event_tx.clone();
+        self.transport_ping_timer = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = event_tx.send(LoopEvent::TransportPingTick { generation });
+        }));
     }
 
     fn arm_heartbeat(&mut self, generation: u64, delay: Duration) {
@@ -762,6 +804,7 @@ where
         abort_task(&mut self.handshake_timer);
         abort_task(&mut self.reconnect_timer);
         abort_task(&mut self.heartbeat_timer);
+        abort_task(&mut self.transport_ping_timer);
         abort_task(&mut self.silence_timer);
         abort_task(&mut self.drain_timer);
     }
@@ -781,6 +824,7 @@ async fn next_socket_poll<H: LoopSocketHandle>(socket: &mut Option<H>) -> Socket
 fn socket_action_attempt(action: &TransportAction) -> Option<SocketAttemptId> {
     match action {
         TransportAction::SendFrame { attempt_id, .. }
+        | TransportAction::TransportPingDue { attempt_id }
         | TransportAction::CloseSocket { attempt_id, .. }
         | TransportAction::TerminateSocket { attempt_id } => Some(*attempt_id),
         _ => None,
@@ -842,7 +886,8 @@ mod tests {
         LINK_SUBPROTOCOL, SocketDriverError, WebSocketCommand, WebSocketEvent, command_for_action,
     };
     use crate::link::transport::{
-        LinkTransportCore, SocketAttemptId, TransportAction, TransportConfig,
+        LINK_DEFAULT_TRANSPORT_PING_MS, LinkTransportCore, SocketAttemptId, TransportAction,
+        TransportConfig,
     };
     use crate::relay::protocol::{
         DeliveryState, HelloAckMessage, HelloAckOutcome, RelayEnvelope, RelayMessage,
@@ -1096,6 +1141,7 @@ mod tests {
             max_reconnect_attempts,
             backoff,
             TransportConfig {
+                transport_ping_ms: LINK_DEFAULT_TRANSPORT_PING_MS,
                 heartbeat_ms,
                 handshake_timeout_ms,
                 max_frame_bytes,
