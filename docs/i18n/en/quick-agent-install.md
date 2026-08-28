@@ -198,12 +198,12 @@ See [ChatGPT Connector](chatgpt-connector.md) for UI detail.
 
 Only after Step 7 succeeds.
 
-End users install only from the Chrome Web Store. Do **not** use `Load unpacked`, Developer mode, or require a herdr-mcp git checkout.
+End users install only from the Chrome Web Store. Do **not** substitute a local development build or require a herdr-mcp git checkout.
 
 1. open <https://chromewebstore.google.com/>;
 2. search for `Herdr` and choose the official Herdr extension;
 3. click **Add to Chrome**;
-4. if the Chrome Web Store listing is not live yet, skip this optional step rather than falling back to a developer-mode install.
+4. if the Chrome Web Store listing is not live yet, skip this optional step rather than falling back to a local development build.
 
 After the extension is installed, register the local Native Messaging host:
 

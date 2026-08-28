@@ -30,11 +30,19 @@ herdr-mcp scan --probe
 herdr-mcp scan --refresh --probe
 ```
 
-The default scan reads Herdr agent manifests, discovers executable agent binaries on `PATH`, and records bounded `--version` evidence only for explicitly allowlisted self-description adapters that have passed side-effect smoke tests. `--probe` additionally runs bounded, non-interactive `--help` adapters for capabilities that can be proven from the agent's own CLI. A discovered binary with no trusted adapter remains installed-but-unprobed. `--refresh` explicitly reloads Herdr's agent manifests and bypasses cached probe evidence.
+The scan intentionally does **not** reimplement Herdr's live-agent detection. It combines three evidence sources owned by the installed Herdr/runtime stack:
+
+- `agent.list` is authoritative for live agent instances, status, pane/workspace and cwd;
+- `server.agent_manifests` is authoritative for the detection manifests loaded by Herdr;
+- the installed `herdr agent start --help` declaration is used to discover the agent kinds that this Herdr build says it can start.
+
+herdr-mcp takes the bounded union of those kinds, looks for the corresponding executable on `PATH`, and records `herdr_startable`, `executable_available`, and the derived `available_for_start`. A kind is considered available for a new delegation only when the installed Herdr declares it startable **and** the executable is present. This avoids copying a stale hard-coded Agent-kind list into herdr-mcp while still recording workstation-local availability.
+
+The default scan records bounded `--version` evidence only for explicitly allowlisted self-description adapters that have passed side-effect smoke tests. `--probe` additionally runs bounded, non-interactive `--help` adapters for capabilities that can be proven from the agent's own CLI. A discovered binary with no trusted adapter remains installed-but-unprobed. `--refresh` explicitly reloads Herdr's agent manifests and bypasses cached probe evidence.
 
 Probe subprocesses receive no stdin, have a three-second timeout and a bounded output capture, and start from a cleared environment with only non-secret runtime variables restored. API keys, bearer tokens and provider credentials are not inherited. Unsupported or ambiguous traits remain unknown; herdr-mcp does not infer provider, model, vision, reasoning quality or code-edit support from an agent name.
 
-Static evidence is kept in a rollback-safe capability inventory under the herdr-mcp config directory. Live status, cwd, project, pane, workspace and session state always come from Herdr/EventCache and are not replaced by the inventory. `herdr_inspect` exposes only compact verified capability metadata for agents allowed by `HERDR_MCP_AGENT_ALLOW`.
+Static evidence is kept in a bounded capability inventory under the herdr-mcp config directory. Live status, cwd, project, pane, workspace and session state always come from Herdr/EventCache and are not replaced by the inventory. `herdr_inspect.capability_inventory.available_agents` exposes only locally available kinds permitted by `HERDR_MCP_AGENT_ALLOW`, so discovery improves delegation without bypassing the existing worker/auditor visibility policy.
 
 ## Connector information
 
@@ -80,8 +88,8 @@ The browser extension also supports English, Simplified Chinese and Japanese.
 ## Browser Native Messaging host
 
 ```bash
-bin/herdr-extension-host install
-bin/herdr-extension-host status
+herdr-mcp native-host install
+herdr-mcp native-host status
 ```
 
 Primary path:
@@ -176,7 +184,7 @@ The supervised updater reuses generation activation and must not be used to sile
 | runtime status | `herdr-mcp status` |
 | follow logs | `herdr-mcp logs -f` |
 | rebuild local runtime | `npm run build && herdr-mcp restart` |
-| install browser bridge | `bin/herdr-extension-host install` |
+| install browser bridge | `herdr-mcp native-host install` |
 | preflight Cloudflare permissions | `bin/herdr-cloudflare-token ... --dry-run` |
 | inspect A/B state | `bin/herdr-runtime-generation status` |
 | rollback runtime | `bin/herdr-runtime-generation rollback` |

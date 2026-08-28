@@ -8,7 +8,7 @@ Data handling and permission use are documented in the [Browser extension privac
 
 ## End-user installation: Chrome Web Store only
 
-Normal users do not need a git clone, an extension ZIP, or Chrome Developer mode.
+Normal users install the extension from Chrome Web Store and do not need a local extension build or repository checkout.
 
 1. Open the [Chrome Web Store](https://chromewebstore.google.com/).
 2. Search for `Herdr` and choose the official Herdr extension.
@@ -20,20 +20,18 @@ herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
+On `0.4.1+`, the normal `native-host install` path uses the official Chrome Web Store extension identity; it does not require an unpacked extension directory or a source checkout. An existing herdr-mcp-owned development origin is migrated transactionally and remains rollbackable.
+
 5. Open ChatGPT, z.ai, DeepSeek, or another currently supported site.
 6. Click the Herdr toolbar icon and confirm the **Browser Control Center** opens in Chrome Side Panel.
 7. Confirm the active page is recognized as the intended Project / conversation, then bind the Herdr workspace from the Control Center.
 
-> The extension is currently entering its first Chrome Web Store publication flow. Until the listing is live, normal users should skip the extension; `Load unpacked` is not the end-user installation path.
+> The extension is currently entering its first Chrome Web Store publication flow. Until the listing is live, normal users should skip this optional step rather than install a local development build.
 
 ## Updates
 
-After a Chrome Web Store installation, Chrome's normal Web Store update mechanism delivers new extension versions. Normal users should not need to:
+After a Chrome Web Store installation, Chrome's normal Web Store update mechanism delivers new extension versions. Normal users do not need a local extension package or a repository checkout.
 
-- download `herdr-mcp-extension-*.zip` repeatedly;
-- overwrite `~/.config/herdr-mcp/extension`;
-- enable Developer mode;
-- manually Reload the extension for each release.
 
 If a long-open ChatGPT tab still runs an older content script after Chrome updates the extension, refresh that web page so the new content script is injected.
 
@@ -136,12 +134,14 @@ See [Browser continuity](browser-continuity.md) and [wake / recovery](extension-
 
 ## Development and store publishing
 
-`Load unpacked`, local extension checkouts, Chrome Web Store Developer Dashboard, package upload, Trusted Testers, listing assets, and review operations are **maintainer / extension-development workflows**, not end-user installation instructions.
+Local extension builds, Chrome Web Store Developer Dashboard, package upload, Trusted Testers, listing assets, and review operations are **maintainer / extension-development workflows**, not end-user installation instructions.
 
 Maintainers should use:
 
-- `docs/_wip/browser-extension-development-and-store-release.md`
-- the extension validation and release ownership rules in `AGENTS.md`
+- `contracts/browser-extension-store.json` as the single machine-readable Chrome Web Store identity SSOT; Rust consumes and validates this contract instead of hard-coding the Store ID;
+- `HERDR_EXTENSION_PATH=/path/to/unpacked/extension herdr-mcp native-host install` when intentionally testing an unpacked development identity;
+- `docs/_wip/browser-extension-development-and-store-release.md` for the Store workflow;
+- the extension validation and release ownership rules in `AGENTS.md`.
 
 Once the Store listing is public, end-user documentation keeps only the Chrome Web Store installation path.
 

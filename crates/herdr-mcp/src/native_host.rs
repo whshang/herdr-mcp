@@ -190,39 +190,18 @@ pub(crate) fn extension_path_for_install() -> Result<PathBuf, String> {
 
 #[cfg(unix)]
 pub(crate) fn extension_path_for_install_optional() -> Result<Option<PathBuf>, String> {
-    // Precedence for first install / origin derivation:
-    // 1. HERDR_EXTENSION_PATH (explicit override; fail closed if set but invalid)
-    // 2. managed ~/.config/herdr-mcp/extension (Release zip extract path)
-    // 3. HERDR_MCP_ROOT/extension (compat)
-    // 4. checkout extension/ via CARGO_MANIFEST_DIR (developer only)
-    if let Some(raw) = env::var_os("HERDR_EXTENSION_PATH") {
-        let path = lexical_absolute(&PathBuf::from(raw))?;
-        return require_extension_dir(
-            &path,
-            "HERDR_EXTENSION_PATH points to a missing or incomplete extension directory",
-        )
-        .map(Some);
-    }
-
-    if let Ok(runtime) = crate::paths::RuntimePaths::discover() {
-        let managed = runtime.config_dir.join("extension");
-        if is_extension_dir(&managed) {
-            return lexical_absolute(&managed).map(Some);
-        }
-    }
-
-    if let Some(root) = env::var_os("HERDR_MCP_ROOT") {
-        let path = PathBuf::from(root).join("extension");
-        if is_extension_dir(&path) {
-            return lexical_absolute(&path).map(Some);
-        }
-    }
-
-    if let Some(path) = development_extension_path() {
-        return lexical_absolute(&path).map(Some);
-    }
-
-    Ok(None)
+    // Production is Store-first. An unpacked identity is selected only by an
+    // explicit maintainer override; legacy managed/check-out extension paths
+    // must never silently change the Native Messaging origin.
+    let Some(raw) = env::var_os("HERDR_EXTENSION_PATH") else {
+        return Ok(None);
+    };
+    let path = lexical_absolute(&PathBuf::from(raw))?;
+    require_extension_dir(
+        &path,
+        "HERDR_EXTENSION_PATH points to a missing or incomplete unpacked development extension directory",
+    )
+    .map(Some)
 }
 
 #[cfg(unix)]
@@ -240,14 +219,6 @@ fn require_extension_dir(path: &Path, context: &str) -> Result<PathBuf, String> 
             path.display()
         ))
     }
-}
-
-#[cfg(unix)]
-fn development_extension_path() -> Option<PathBuf> {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir.parent()?.parent()?;
-    let extension = root.join("extension");
-    is_extension_dir(&extension).then_some(extension)
 }
 
 #[cfg(unix)]

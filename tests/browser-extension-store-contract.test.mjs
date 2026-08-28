@@ -33,3 +33,22 @@ test("Chrome Web Store extension id has one machine-readable SSOT outside Rust s
     );
   }
 });
+
+
+test("production native-host identity is Store-first and ignores legacy local extension locations", async () => {
+  const source = await readFile(path.join(RUST_SRC, "native_host.rs"), "utf8");
+  assert.match(source, /HERDR_EXTENSION_PATH/);
+  assert.doesNotMatch(source, /config_dir\.join\("extension"\)/);
+  assert.doesNotMatch(source, /HERDR_MCP_ROOT[^\n]*extension/);
+  assert.doesNotMatch(source, /development_extension_path/);
+  assert.doesNotMatch(source, /CARGO_MANIFEST_DIR[^\n]*extension/);
+});
+
+test("runtime GitHub Release does not distribute a browser-extension zip", async () => {
+  const release = await readFile(path.join(ROOT, ".github", "workflows", "rust-release.yml"), "utf8");
+  const recovery = await readFile(path.join(ROOT, ".github", "workflows", "rust-release-recover.yml"), "utf8");
+  for (const source of [release, recovery]) {
+    assert.doesNotMatch(source, /pack-extension\.mjs/);
+    assert.doesNotMatch(source, /herdr-mcp-extension-/);
+  }
+});

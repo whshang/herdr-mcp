@@ -32,11 +32,19 @@ herdr-mcp scan --probe
 herdr-mcp scan --refresh --probe
 ```
 
-默认 scan 会读取 Herdr Agent manifest、在 `PATH` 里发现真实 Agent binary；只有通过过副作用 smoke、进入显式 self-description adapter allowlist 的 Agent 才会执行有界 `--version`。`--probe` 额外运行有界、非交互的 `--help` adapter，只接受 Agent 自己 CLI 能明确证明的能力。发现 binary 但没有可信 adapter 时，只记录“已安装、未 probe”；`--refresh` 会显式重载 Herdr Agent manifest 并绕过已有 probe cache。
+`scan` **不会自己重做 Herdr 的 live-agent detection**，而是组合当前安装的 Herdr/runtime 已经拥有的三类证据：
+
+- `agent.list` 是 live Agent 实例、status、pane/workspace、cwd 的权威来源；
+- `server.agent_manifests` 是 Herdr 当前加载 detection manifest 的权威来源；
+- 当前安装的 `herdr agent start --help` 声明用于发现“这个 Herdr 版本明确支持启动哪些 Agent kind”。
+
+herdr-mcp 对这三类 kind 做有界并集，再检查对应 executable 是否真实存在于 `PATH`，分别记录 `herdr_startable`、`executable_available`，并派生 `available_for_start`。只有 **Herdr 自己声明可启动 + 本机 executable 存在** 时，才认为这个 kind 可用于新任务分派。这样 herdr-mcp 不需要复制一份很快过期的 Agent kind 硬编码清单，同时仍能记录当前客户端的真实可用能力。
+
+默认 scan 只有对通过副作用 smoke、进入显式 self-description adapter allowlist 的 Agent 才会执行有界 `--version`。`--probe` 额外运行有界、非交互的 `--help` adapter，只接受 Agent 自己 CLI 能明确证明的能力。发现 binary 但没有可信 adapter 时，只记录“已安装、未 probe”；`--refresh` 会显式重载 Herdr Agent manifest 并绕过已有 probe cache。
 
 probe 子进程没有 stdin，超时上限为三秒，输出有大小上限，并且先清空继承环境，只恢复非敏感运行变量。API key、bearer token、provider credential 不会被继承。拿不到或存在歧义的字段继续保持 unknown；herdr-mcp 不会仅凭 Agent 名称猜 provider、model、vision、reasoning quality 或 code-edit 能力。
 
-静态 evidence 放在 herdr-mcp config 目录下独立、可回滚兼容的 capability inventory 中。status、cwd、project、pane、workspace、session 等实时事实始终来自 Herdr/EventCache，inventory 不会成为第二套 live truth。`herdr_inspect` 只向 `HERDR_MCP_AGENT_ALLOW` 允许看到的 Agent 投影紧凑的已验证 metadata。
+静态 evidence 放在 herdr-mcp config 目录下有界的 capability inventory 中。status、cwd、project、pane、workspace、session 等实时事实始终来自 Herdr/EventCache，inventory 不会成为第二套 live truth。`herdr_inspect.capability_inventory.available_agents` 只暴露 `HERDR_MCP_AGENT_ALLOW` 允许看到、且本机真实可启动的 kind，因此能力发现会帮助分派任务，但不会绕过现有 worker/auditor 可见性策略。
 
 ## Connector 信息
 
@@ -98,8 +106,8 @@ herdr-mcp lang ja
 浏览器扩展主链路需要本机 Native Messaging host：
 
 ```bash
-bin/herdr-extension-host install
-bin/herdr-extension-host status
+herdr-mcp native-host install
+herdr-mcp native-host status
 ```
 
 安装后：
@@ -223,7 +231,7 @@ bin/herdr-link
 | 看本机 runtime 是否活着 | `herdr-mcp status` |
 | 看错误 | `herdr-mcp logs -f` |
 | 更新本地开发构建 | `npm run build && herdr-mcp restart` |
-| 安装扩展本机桥 | `bin/herdr-extension-host install` |
+| 安装扩展本机桥 | `herdr-mcp native-host install` |
 | 部署前检查 Cloudflare 权限 | `bin/herdr-cloudflare-token ... --dry-run` |
 | 看 A/B 当前状态 | `bin/herdr-runtime-generation status` |
 | runtime 出问题回滚 | `bin/herdr-runtime-generation rollback` |

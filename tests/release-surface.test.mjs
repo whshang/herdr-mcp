@@ -121,8 +121,8 @@ test("Rust GitHub Release provenance is tag-only and fail-closed before publish"
   );
   assert.match(attest, /release-assets\/herdr-mcp-\*/);
   assert.match(attest, /release-assets\/release-manifest\.json/);
-  assert.match(release, /pack-extension\.mjs/);
-  assert.match(release, /Pack browser extension release zip/);
+  assert.doesNotMatch(release, /pack-extension\.mjs/);
+  assert.doesNotMatch(release, /Pack browser extension release zip/);
   assert.match(release, /--repository-id \"\$GITHUB_REPOSITORY_ID\"/);
   assert.match(release, /--source-commit \"\$GITHUB_SHA\"/);
   assert.match(release, /--source-ref \"\$GITHUB_REF\"/);
@@ -133,8 +133,8 @@ test("Rust GitHub Release provenance is tag-only and fail-closed before publish"
   assert.match(publish, /manifest source_commit does not match tag commit/);
   assert.match(
     publish,
-    /! -name 'herdr-mcp-extension-\*'/,
-    "publish identity verify must exclude extension zip from manifest asset compare",
+    /-name 'herdr-mcp-\*'/,
+    "publish identity verify must compare the complete runtime bundle directly",
   );
   assert.match(publish, /refusing publish overwrite/, "publish must fail closed when GitHub Release already exists");
   assert.doesNotMatch(publish, /--clobber/, "tag publish must not clobber existing release assets");
@@ -174,7 +174,7 @@ test("Rust Release recovery republishes only a previously attested GitHub run", 
   assert.match(recovery, /release manifest repository identity mismatch/);
   assert.match(recovery, /release manifest provenance identity mismatch/);
   assert.match(recovery, /release manifest targets do not match tagged target contract/);
-  assert.match(recovery, /herdr-mcp-extension-/);
+  assert.doesNotMatch(recovery, /herdr-mcp-extension-/);
   assert.match(recovery, /release_asset_count=/);
   assert.match(recovery, /steps\.verify\.outputs\.release_asset_count/);
   assert.doesNotMatch(recovery, /length == 5/);

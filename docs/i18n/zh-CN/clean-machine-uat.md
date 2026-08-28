@@ -64,9 +64,7 @@ WORKDIR="${HOME}/herdr-mcp-clean-uat"
 mkdir -p "$WORKDIR/bin" "$WORKDIR/dl" && cd "$WORKDIR"
 gh release download "$TAG" -R "$REPO" -D dl \
   -p "herdr-mcp-*-aarch64-apple-darwin" \
-  -p "release-manifest.json" \
-  -p "herdr-mcp-extension-*.zip" \
-  -p "herdr-mcp-extension-*.zip.sha256"
+  -p "release-manifest.json"
 install -m 755 dl/herdr-mcp-*-aarch64-apple-darwin bin/herdr-mcp
 export PATH="$WORKDIR/bin:$PATH"
 herdr --version
@@ -76,11 +74,9 @@ herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
 herdr-mcp update check
-# 扩展（干净机上的 G15 残余验收，可选）：
-shasum -a 256 -c dl/herdr-mcp-extension-*.zip.sha256
-mkdir -p ~/.config/herdr-mcp/extension
-unzip -o dl/herdr-mcp-extension-*.zip -d ~/.config/herdr-mcp/extension
-# Chrome: Load unpacked -> ~/.config/herdr-mcp/extension
+# 可选浏览器扩展 UAT：
+# 待验收的 Herdr Chrome Web Store listing 可用时，从商店安装官方扩展；
+# listing 尚未上线时，本轮直接跳过扩展 UAT。
 herdr-mcp native-host install
 herdr-mcp native-host status
 ```
@@ -123,23 +119,9 @@ ls -l "$HOME/.local/bin/herdr-mcp"
 launchctl list | awk -v label='dev.herdr-mcp.server' '$3 == label { print $1, $2, $3 }'
 ```
 
-### 命名实例扩展 (同机, 仅静态)
+### 命名实例浏览器检查（同机，仅静态）
 
-将 Release 扩展 zip 解压到 **uat** 配置根 (不要写入狗粮 `~/.config/herdr-mcp/extension`):
-
-```bash
-export HERDR_MCP_INSTANCE=uat
-gh release download "$TAG" -R "$REPO" -D "$WORKDIR/dl" \
-  -p "herdr-mcp-extension-*.zip" \
-  -p "herdr-mcp-extension-*.zip.sha256"
-shasum -a 256 -c "$WORKDIR/dl"/herdr-mcp-extension-*.zip.sha256
-mkdir -p "$HOME/.config/herdr-mcp-uat/extension"
-unzip -o "$WORKDIR/dl"/herdr-mcp-extension-*.zip -d "$HOME/.config/herdr-mcp-uat/extension"
-herdr-mcp --instance uat doctor
-# 预期: local-ipc PASS; native-messaging absent (Chrome 主机名 dev.herdr.mcp 单例)
-```
-
-静态 smoke (无需 Chrome; 在 checkout 中运行):
+Chrome Web Store 扩展与 Native Messaging host 属于整台机器/浏览器，不属于 named instance。验证同机 `uat` runtime 时，不安装或替换浏览器扩展。可以在 checkout 内运行静态扩展测试：
 
 ```bash
 node tests/manual/extension_smoke.mjs
@@ -147,18 +129,11 @@ node tests/manual/background_bind_test.mjs
 node --test tests/queued-insert.test.mjs
 ```
 
-**不要**在狗粮机上跑 `herdr-mcp --instance uat native-host install`: 会覆盖生产 Chrome 清单 `NativeMessagingHosts/dev.herdr.mcp.json`。完整 G15 native-host + Load unpacked 封板需第二台 Mac 默认实例, 或在狗粮默认实例的 owner 维护窗进行。
-
-结束后清理（不动狗粮）：
-
-```bash
-export HERDR_MCP_INSTANCE=uat
-herdr-mcp --instance uat uninstall
-```
+Store 安装 + Native Messaging UAT 只在独立干净 Mac，或默认实例的明确 owner 维护窗执行。旧的 pre-Store 包验收证据只保留在 `docs/history/ga/`，不再作为当前安装协议。
 
 ### 狗粮机上命名实例的非目标
 
-- 不要对狗粮 Chrome 跑 `native-host install` / Load unpacked。
+- 不要从 named UAT 实例替换商店扩展，也不要对狗粮 Chrome 执行 `native-host install`。
 - 不要对 UAT 实例跑 `link install` / `link cutover` / seal 变更。
 - 公网 ChatGPT OAuth 仍是 **owner** 步骤；卡在 OAuth 时记下确切停在哪一步。
 
