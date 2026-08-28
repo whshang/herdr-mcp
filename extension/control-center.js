@@ -342,24 +342,25 @@ function renderWorkspaceTree(state) {
       });
     toggle.append(chevron, stateDot, name, id, count);
 
-    const bindingToggle = document.createElement("button");
-    bindingToggle.type = "button";
-    bindingToggle.className = `workspace-binding-toggle${bindingMutationWorkspaceId === workspaceId ? " binding-busy" : ""}`;
-    bindingToggle.dataset.workspaceBindingAction = workspaceId;
-    bindingToggle.setAttribute("aria-pressed", String(contextBound));
-    bindingToggle.disabled = !pageSupported || bindingBusy;
-    bindingToggle.textContent = bindingMutationWorkspaceId === workspaceId
-      ? t("cc_workspace_binding_updating")
-      : (contextBound ? t("cc_workspace_bound") : t("cc_workspace_bind"));
-    bindingToggle.title = !pageSupported
-      ? t("cc_workspace_binding_disabled")
-      : (contextBound
+    header.appendChild(toggle);
+    if (pageSupported) {
+      const bindingToggle = document.createElement("button");
+      bindingToggle.type = "button";
+      bindingToggle.className = `workspace-binding-toggle${bindingMutationWorkspaceId === workspaceId ? " binding-busy" : ""}`;
+      bindingToggle.dataset.workspaceBindingAction = workspaceId;
+      bindingToggle.setAttribute("aria-pressed", String(contextBound));
+      bindingToggle.disabled = bindingBusy;
+      bindingToggle.textContent = bindingMutationWorkspaceId === workspaceId
+        ? t("cc_workspace_binding_updating")
+        : (contextBound ? t("cc_workspace_bound") : t("cc_workspace_bind"));
+      bindingToggle.title = contextBound
         ? t("cc_workspace_unbind_hint", { workspace: workspaceName })
-        : t("cc_workspace_bind_hint", { workspace: workspaceName }));
-    bindingToggle.setAttribute("aria-label", contextBound
-      ? t("cc_workspace_unbind_aria", { workspace: workspaceName })
-      : t("cc_workspace_bind_aria", { workspace: workspaceName }));
-    header.append(toggle, bindingToggle);
+        : t("cc_workspace_bind_hint", { workspace: workspaceName });
+      bindingToggle.setAttribute("aria-label", contextBound
+        ? t("cc_workspace_unbind_aria", { workspace: workspaceName })
+        : t("cc_workspace_bind_aria", { workspace: workspaceName }));
+      header.appendChild(bindingToggle);
+    }
     section.appendChild(header);
 
     if (expanded) {
