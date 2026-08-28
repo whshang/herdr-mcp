@@ -179,14 +179,14 @@ If the ID itself is wrong, bind to the correct workspace.
 
 Separate a **Side Panel UI problem**, a **Native Messaging identity problem**, and a **runtime problem**:
 
-1. Open the panel through “Browser Control Center” in the extension Popup rather than navigating to `control-center.html` as a normal web page.
+1. Click the Herdr toolbar icon and verify Chrome opens the Control Center Side Panel directly; do not navigate to `control-center.html` as a normal web page.
 2. `herdr-mcp status` / `herdr-mcp doctor` should first prove the local runtime is healthy.
 3. `herdr-mcp native-host status` should report the Native Messaging host registered.
 4. If the extension was just updated, reload it in `chrome://extensions`.
 5. If a developer changes the absolute unpacked-extension path, Chromium may assign a different extension ID. A Native Messaging `allowed_origins` entry for the old ID can then produce `Access to the specified native messaging host is forbidden`. Re-register the Native Host for the current development identity rather than copying a bearer into browser storage.
 6. `Runtime healthy · event stream reconnecting` means the panel still has a snapshot while incremental events recover; it does not mean the whole local runtime is down. Use Refresh for an authoritative reconciliation.
 
-Prompt / Steer / Herdr / Terminal are intentionally Preview-only in the current Control Center. That is not a failure. The executable actions today are `Inspect state` and the bounded `Read output tail`.
+Prompt Agent / Steer Session / Herdr API / Terminal Input are intentionally Preview-only in the current Control Center. That is not a failure. The executable actions today are `Inspect state` and the bounded `Read output tail`.
 
 See [Browser Control Center](browser-control-center.md).
 
@@ -223,7 +223,7 @@ Content disappearing without confirmed delivery is the actual reliability failur
 
 ## Symptom: Manual handoff is unavailable
 
-Verify:
+Open **Browser Control Center → Current page** first. Manual handoff is intentionally not duplicated in the HUD. Then verify:
 
 - the current site/conversation type supports handoff;
 - a workspace is bound;

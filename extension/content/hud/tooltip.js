@@ -10,9 +10,6 @@ globalThis.H2W_HUD.renderHudTooltip = function renderHudTooltip(state = {}) {
     ? (labels.none || "none")
     : (labels.states?.[state.recovery] || state.recovery);
   return [
-    state.workspace ? `${labels.tip_workspace || "Workspace"}: ${state.workspace}` : null,
-    state.agent ? `${labels.tip_agent || "Agent"}: ${state.agent}` : null,
-    state.conversation ? `${labels.tip_conversation || "Conversation"}: ${state.conversation}` : null,
     `${labels.tip_state || "State"}: ${stateLabel}`,
     `${labels.tip_recovery || "Recovery"}: ${recoveryLabel}`,
     state.lastEvent ? `${labels.tip_last_event || "Last event"}: ${state.lastEvent}` : null,

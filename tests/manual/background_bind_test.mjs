@@ -45,8 +45,8 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.65" };
-const listeners = { onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [] };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.66" };
+const listeners = { onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
 let nextTabId = 500;
@@ -63,6 +63,7 @@ let tabCreateCount = 0;
 let tabUpdateCount = 0;
 let lastTabUpdate = null;
 const reloadCalls = [];
+const sidePanelOpenCalls = [];
 let projectNavigationReadyAfter = 0;
 let projectNavigationPollCount = 0;
 let sourceProbeLooksSeeded = false;
@@ -336,6 +337,14 @@ globalThis.chrome = {
     async reload(tabId, options) { reloadCalls.push({ tabId, options }); },
     onActivated: { addListener: (fn) => listeners.onActivated.push(fn) },
   },
+  action: {
+    onClicked: { addListener: (fn) => listeners.onActionClicked.push(fn) },
+    setBadgeText: async () => {},
+    setBadgeBackgroundColor: async () => {},
+  },
+  sidePanel: {
+    async open(options) { sidePanelOpenCalls.push(options); },
+  },
   scripting: { executeScript: async () => [{ result: { ok: true } }] },
   alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
 };
@@ -373,6 +382,12 @@ function installContentScript(tabId, url, convKey, site = "chatgpt") {
 await import(pathToFileURL(path.join(__dirname, "..", "..", "extension", "background.js")).href);
 const onMsg = listeners.onMessage[0];
 ok(!!onMsg, "background onMessage listener registered");
+const actionClick = listeners.onActionClicked[0];
+ok(!!actionClick, "toolbar action click listener registered");
+actionClick({ windowId: 77 });
+await new Promise((resolve) => setTimeout(resolve, 0));
+ok(sidePanelOpenCalls.length === 1 && sidePanelOpenCalls[0]?.windowId === 77,
+  "toolbar action opens the Control Center Side Panel in the clicked window", JSON.stringify(sidePanelOpenCalls));
 
 function dispatchMessage(msg, sender = {}) {
   return new Promise((resolve) => {
@@ -691,6 +706,9 @@ console.log("\n[binding flow]");
   onMsg({ type: "h2w_page_hud", convKey: CONV }, {}, (r) => resolveP(r));
   const r = await p;
   ok(r?.workspace_label?.includes("herdr-mcp"), "HUD prefers live workspace label over stale binding label", JSON.stringify(r));
+  ok(r?.bound_workspace_count === 1 && r?.bound_pane_count === 0 && r?.bound_working_count === 0
+      && !Object.prototype.hasOwnProperty.call(r, "workspaces"),
+    "compact HUD returns aggregate binding counts without the detailed workspace catalog", JSON.stringify(r));
   ok(storage.herdrWakeBindings[staleKey]?.workspace_label?.includes("herdr-mcp"), "stale binding label is repaired");
   mockStateWorkspaces = [];
 }

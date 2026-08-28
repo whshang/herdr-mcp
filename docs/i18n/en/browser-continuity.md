@@ -115,9 +115,9 @@ Automation is scoped deliberately.
 
 For ChatGPT Projects, automation can be shared at the Project level when the global Project permission is enabled. Normal ChatGPT conversations, z.ai and DeepSeek use conversation-level settings where supported.
 
-New scopes default to Auto off. Most manual HUD actions are mutually exclusive with automatic progression so the same conversation is not advanced by two paths at once. Manual handoff is the deliberate exception: where supported, it can start with Auto on or off, pauses automatic wakes from the source during transfer, and makes the target inherit the source Auto state.
+New scopes default to Auto off. The HUD's three preset manual actions are mutually exclusive with automatic progression so the same conversation is not advanced by two paths at once. Manual handoff is the deliberate exception and has one UI entry in **Control Center → Current page**: where supported, it can start with Auto on or off, pauses automatic wakes from the source during transfer, and makes the target inherit the source Auto state.
 
-Manual takeover remains important. The user can turn Auto off to inspect state, continue manually, or run the lightweight LLM judge; an explicit handoff can be started directly where supported.
+Manual takeover remains important. The user can turn Auto off to continue manually, extract Herdr status, or run the lightweight LLM judge from the HUD; an explicit handoff starts from Control Center where supported.
 
 ## Why local Native Messaging is used
 

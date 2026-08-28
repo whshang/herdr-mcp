@@ -35,13 +35,13 @@ Web AI → 本机工作站
 
 | 入口 | 用来做什么 |
 |---|---|
-| Popup | 快速检查本机连接、当前作用域 binding / Auto，并打开 Control Center |
-| HUD | 当前网页 Project / conversation 的 binding、Auto、手动继续、监控、LLM 判断和 handoff |
-| Control Center | 实时查看 workspace / pane / Agent，pin 明确目标，执行只读 inspect / tail，预览未来控制动作 |
+| 工具栏图标 | 直接打开 Chrome Side Panel 浏览器控制中心 |
+| HUD | 当前页面的紧凑状态（网页 + Herdr + 绑定数量）、Auto、手动继续、提取 Herdr 状态、LLM 判断 |
+| Control Center | 跟随当前标签页识别 Project / conversation，统一 binding / handoff，并查看 workspace / pane / Agent、pin 明确目标、执行只读 inspect / tail、预览未来控制动作 |
 | Queue / 排队 | ChatGPT 正在回复时先保存补充要求，回合结束后优先作为下一条用户消息 |
 | Options | 语言、continuity timing、可选 LLM judge 等低频配置 |
 
-Popup 要保持快；HUD 要贴近当前对话；Control Center 要贴近本机工作现场；Options 不承担高频操作。
+工具栏图标直接进入 Control Center。绑定 / 解绑与手动接力只在 Control Center 有一个 UI 路径；HUD 不再有抽屉，只保留高频状态、Auto 和三个预置会话动作；timing / LLM 等低频配置只在 Options。
 
 ## 安全架构
 
@@ -118,9 +118,9 @@ bin/herdr-extension-host status
 ```
 
 5. 打开 ChatGPT、z.ai、DeepSeek 或其它当前支持页面。
-6. 点击扩展 Popup，先确认本机 runtime 在线。
-7. 用 Popup 或页面 HUD 把当前作用域绑定到 Herdr workspace。
-8. 从 Popup 打开 **浏览器控制中心**，确认 workspace / pane 状态可以实时看到。
+6. 点击浏览器工具栏里的 Herdr 图标，确认 **浏览器控制中心**直接在 Chrome Side Panel 打开。
+7. 在 **浏览器控制中心**确认“当前页面”识别到了正确 Project / conversation，并在这里绑定 Herdr workspace。
+8. 确认本机 runtime 在线、workspace / pane 状态实时可见；切换浏览器标签页时“当前页面”应自动切换，但明确固定的 Pinned Target 不会跟着改变。
 
 ### 开发者路径
 
@@ -243,7 +243,7 @@ ChatGPT 正在生成时，用户经常会想到：
 
 ## Control Center：看清本机现场再决定下一步
 
-Popup 中的 **浏览器控制中心** 打开 Chrome Side Panel。
+点击 Herdr 工具栏图标会直接打开 Chrome Side Panel 里的 **浏览器控制中心**。
 
 当前控制中心可以：
 
@@ -256,7 +256,7 @@ Popup 中的 **浏览器控制中心** 打开 Chrome Side Panel。
 - target stale 时 fail closed；
 - `查看状态`；
 - `读取最近输出`（有界）；
-- 对 Prompt / Steer / Herdr / Terminal 生成风险分类后的 Preview descriptor。
+- 对 **提示 Agent / 调整会话 / Herdr API / 终端输入**生成风险分类后的 Preview descriptor。
 
 ### 当前写操作仍是 Preview-only
 
@@ -264,7 +264,7 @@ Popup 中的 **浏览器控制中心** 打开 Chrome Side Panel。
 
 > 实时状态 · 控制操作仅预览
 
-Prompt / Steer / Herdr / Terminal 当前都不会真正执行 mutation。
+提示 Agent / 调整会话 / Herdr API / 终端输入当前都不会真正执行 mutation。
 
 这是当前 Browser Control Plane Phase A 的边界，不是缺少一个 click handler。
 
@@ -332,7 +332,7 @@ Options 中的小模型 API key 只保存在本机浏览器存储中；它不是
 
 Native Messaging 是当前受信任主链路；某些诊断或兼容路径仍可能暴露 loopback 权限提示。
 
-如果 Popup / Options / HUD 显示本机不可达，先检查：
+如果 Control Center / Options / HUD 显示本机不可达，先检查：
 
 1. `herdr-mcp` runtime；
 2. Native Messaging host；

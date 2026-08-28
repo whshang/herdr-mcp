@@ -14,12 +14,22 @@ let runtimeHealthy = false;
 let hasSnapshot = false;
 let eventStreamHealthy = null;
 let selectedMode = ACTION_TYPES.AGENT_PROMPT;
+let pageContext = { loading: true, tabId: null, windowId: null, response: null, error: null };
+let pageContextRefreshSeq = 0;
 
 const $ = (id) => document.getElementById(id);
 const runtimeDot = $("runtimeDot");
 const runtimeText = $("runtimeText");
 const runtimeStats = $("runtimeStats");
 const workspaceList = $("workspaceList");
+const pageContextCard = $("pageContextCard");
+const pageContextTitle = $("pageContextTitle");
+const pageContextMeta = $("pageContextMeta");
+const pageBindings = $("pageBindings");
+const pageWorkspaceSelect = $("pageWorkspaceSelect");
+const pageBindButton = $("pageBindButton");
+const pageHandoffButton = $("pageHandoffButton");
+const pageContextHelp = $("pageContextHelp");
 const targetCard = $("targetCard");
 const targetTitle = $("targetTitle");
 const targetDetails = $("targetDetails");
@@ -109,6 +119,155 @@ function applyStaticI18n() {
   });
 }
 
+function siteLabel(site) {
+  if (site === "chatgpt") return "ChatGPT";
+  if (site === "claude" || site === "claude.ai") return "Claude";
+  if (site === "z.ai" || site === "zai") return "z.ai";
+  if (site === "deepseek") return "DeepSeek";
+  return site || t("cc_page_unknown_site");
+}
+
+function shortIdentity(value, max = 18) {
+  const text = String(value || "");
+  return text.length > max ? `${text.slice(0, 8)}…${text.slice(-6)}` : text;
+}
+
+function pageContextInfo() {
+  return pageContext.response?.convInfo || null;
+}
+
+function pageContextBindings() {
+  return Array.isArray(pageContext.response?.sessionBindings) ? pageContext.response.sessionBindings : [];
+}
+
+function pageContextBindingIds() {
+  return new Set(pageContextBindings().map((binding) => String(binding?.workspace_id || "")).filter(Boolean));
+}
+
+function renderPageContext(state) {
+  const info = pageContextInfo();
+  const bindings = pageContextBindings();
+  const supported = Boolean(info?.convKey);
+  pageContextCard.classList.toggle("unsupported", !supported);
+  pageBindings.replaceChildren();
+  pageWorkspaceSelect.replaceChildren();
+
+  if (pageContext.loading) {
+    pageContextTitle.textContent = t("cc_page_loading");
+    pageContextMeta.textContent = "";
+    pageContextHelp.textContent = t("cc_page_context_help");
+    pageBindButton.disabled = true;
+    pageHandoffButton.hidden = true;
+    return;
+  }
+
+  if (!supported) {
+    pageContextTitle.textContent = t("cc_page_unsupported");
+    pageContextMeta.textContent = pageContext.error || t("cc_page_unsupported_meta");
+    pageContextHelp.textContent = t("cc_page_context_help");
+    pageBindButton.disabled = true;
+    pageHandoffButton.hidden = true;
+    const option = document.createElement("option");
+    option.textContent = t("cc_page_select_disabled");
+    option.value = "";
+    pageWorkspaceSelect.appendChild(option);
+    return;
+  }
+
+  const site = siteLabel(info.site);
+  if (info.project_id && info.conversation_id) pageContextTitle.textContent = t("cc_page_project_conversation", { site });
+  else if (info.project_id) pageContextTitle.textContent = t("cc_page_project_home", { site });
+  else pageContextTitle.textContent = t("cc_page_conversation", { site });
+
+  const meta = [];
+  if (info.project_id) meta.push(t("cc_page_project_id", { value: shortIdentity(info.project_id) }));
+  if (info.conversation_id) meta.push(t("cc_page_conversation_id", { value: shortIdentity(info.conversation_id) }));
+  meta.push(bindings.length ? t("cc_page_binding_count", { count: bindings.length }) : t("cc_page_unbound"));
+  pageContextMeta.textContent = meta.join(" · ");
+
+  for (const binding of bindings) {
+    const chip = document.createElement("div");
+    chip.className = "binding-chip";
+    const label = document.createElement("span");
+    label.textContent = binding.workspace_label || binding.workspace_id || t("cc_page_unknown_workspace");
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.dataset.unbindWorkspace = binding.workspace_id || "";
+    remove.textContent = t("cc_page_unbind");
+    remove.setAttribute("aria-label", `${t("cc_page_unbind")} ${label.textContent}`);
+    chip.append(label, remove);
+    pageBindings.appendChild(chip);
+  }
+
+  const boundIds = pageContextBindingIds();
+  const handoffStatus = String(pageContext.response?.handoff?.status || "");
+  const canHandoff = bindings.length > 0 && (
+    (info.site === "chatgpt" && Boolean(info.project_id) && Boolean(info.conversation_id))
+    || (info.site === "z.ai" && Boolean(info.conversation_id))
+  );
+  const workspaceBusy = bindings.some((binding) => (
+    String(binding?.status || "") === "working" || Number(binding?.working_count || 0) > 0
+  ));
+  const transferBusy = ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(handoffStatus);
+  pageHandoffButton.hidden = !canHandoff;
+  pageHandoffButton.disabled = !canHandoff || workspaceBusy || transferBusy;
+  pageHandoffButton.textContent = workspaceBusy && canHandoff
+    ? t("cc_page_handoff_busy")
+    : (pageContext.response?.handoff?.can_resume === true
+      ? t("cc_page_handoff_resume")
+      : (transferBusy ? t("cc_page_handoff_working") : t("cc_page_handoff")));
+
+  const visibleWorkspaces = sortWorkspaces(state.workspaces || []);
+  const available = visibleWorkspaces.filter((workspace) => !boundIds.has(String(workspace.workspace_id)));
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = !visibleWorkspaces.length
+    ? t("cc_page_no_workspaces")
+    : (available.length ? t("cc_page_select_workspace") : t("cc_page_all_bound"));
+  pageWorkspaceSelect.appendChild(placeholder);
+  for (const workspace of available) {
+    const option = document.createElement("option");
+    option.value = workspace.workspace_id;
+    option.textContent = workspace.label || workspace.workspace_id;
+    pageWorkspaceSelect.appendChild(option);
+  }
+  pageBindButton.disabled = !available.length || !pageWorkspaceSelect.value;
+  pageContextHelp.textContent = pageContext.error
+    || pageContext.notice
+    || (workspaceBusy && canHandoff ? t("cc_page_handoff_busy_help") : t("cc_page_context_help"));
+}
+
+async function refreshPageContext() {
+  const seq = ++pageContextRefreshSeq;
+  pageContext = { ...pageContext, loading: true, error: null };
+  renderPageContext(store.get());
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({ active: true, currentWindow: true }); }
+  catch (error) {
+    if (seq !== pageContextRefreshSeq) return;
+    pageContext = { loading: false, tabId: null, windowId: null, response: null, error: String(error?.message || error) };
+    renderAll();
+    return;
+  }
+  const tab = tabs[0] || null;
+  if (seq !== pageContextRefreshSeq) return;
+  if (!tab?.id) {
+    pageContext = { loading: false, tabId: null, windowId: tab?.windowId || null, response: null, error: null };
+    renderAll();
+    return;
+  }
+  const response = await bg({ type: "h2w_state", tabId: tab.id });
+  if (seq !== pageContextRefreshSeq) return;
+  pageContext = {
+    loading: false,
+    tabId: tab.id,
+    windowId: tab.windowId ?? null,
+    response,
+    error: response?.error || null,
+  };
+  renderAll();
+}
+
 function seedExpansion(state) {
   if (expansionSeeded) return;
   const workspaces = sortWorkspaces(state.workspaces || []);
@@ -156,9 +315,11 @@ function renderWorkspaceTree(state) {
   }
 
   const fragment = document.createDocumentFragment();
+  const pageBoundIds = pageContextBindingIds();
   for (const workspace of workspaces) {
     const section = document.createElement("section");
-    section.className = "workspace";
+    const contextBound = pageBoundIds.has(String(workspace.workspace_id));
+    section.className = `workspace${contextBound ? " context-bound" : ""}`;
     section.dataset.workspaceId = workspace.workspace_id;
 
     const header = document.createElement("button");
@@ -183,7 +344,14 @@ function renderWorkspaceTree(state) {
       panes: workspace.panes?.length || 0,
       working: workingCount,
     });
-    header.append(chevron, name, id, count);
+    if (contextBound) {
+      const boundBadge = document.createElement("span");
+      boundBadge.className = "context-bound-badge";
+      boundBadge.textContent = t("cc_page_bound_badge");
+      header.append(chevron, name, id, boundBadge, count);
+    } else {
+      header.append(chevron, name, id, count);
+    }
     section.appendChild(header);
 
     if (expanded) {
@@ -297,14 +465,80 @@ function renderComposerState() {
   else blockedReason.textContent = t("cc_preview_only_reason");
   sendButton.textContent = t("cc_preview_action");
   sendButton.disabled = !pinnedTarget?.pane_id || pinnedTarget?.stale === true;
-  document.querySelectorAll("#modeTabs [data-mode]").forEach((button) => {
+
+document.querySelectorAll("#modeTabs [data-mode]").forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === selectedMode);
   });
 }
 
+function handoffFailureMessage(error) {
+  const code = String(error || "unknown");
+  if (code === "workspace_busy") return t("cc_page_handoff_busy_help");
+  if (code === "binding_required") return t("cc_page_handoff_binding_required");
+  return t("cc_page_handoff_failed", { error: code });
+}
+
+pageHandoffButton.addEventListener("click", async () => {
+  if (!pageContext.tabId || pageHandoffButton.hidden || pageHandoffButton.disabled) return;
+  pageHandoffButton.disabled = true;
+  pageContextHelp.textContent = t("cc_page_handoff_starting");
+  const response = await bg({ type: "h2w_handoff_start", tabId: pageContext.tabId, trigger: "manual" });
+  const actionMessage = response?.ok
+    ? t("cc_page_handoff_started")
+    : handoffFailureMessage(response?.error);
+  await refreshPageContext();
+  pageContext.notice = actionMessage;
+  renderPageContext(store.get());
+});
+
+pageWorkspaceSelect.addEventListener("change", () => {
+  pageBindButton.disabled = !pageContextInfo()?.convKey || !pageWorkspaceSelect.value;
+});
+
+pageBindButton.addEventListener("click", async () => {
+  const info = pageContextInfo();
+  const workspaceId = pageWorkspaceSelect.value;
+  if (!info?.convKey || !pageContext.tabId || !workspaceId) return;
+  const workspace = (store.get().workspaces || []).find((row) => String(row.workspace_id) === String(workspaceId));
+  pageBindButton.disabled = true;
+  const response = await bg({
+    type: "h2w_bind",
+    tabId: pageContext.tabId,
+    convKey: info.convKey,
+    workspace_id: workspaceId,
+    workspace_label: workspace?.label || workspaceId,
+  });
+  const actionError = !response?.ok && response?.error !== "already-bound"
+    ? t("cc_page_bind_failed", { error: response?.error || "unknown" })
+    : null;
+  await refreshPageContext();
+  if (actionError) { pageContext.error = actionError; renderPageContext(store.get()); }
+});
+
+pageBindings.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-unbind-workspace]");
+  if (!button) return;
+  const info = pageContextInfo();
+  const workspaceId = button.dataset.unbindWorkspace;
+  if (!info?.convKey || !workspaceId) return;
+  button.disabled = true;
+  const response = await bg({ type: "h2w_unbind", convKey: info.convKey, workspace_id: workspaceId });
+  const actionError = !response?.ok ? t("cc_page_unbind_failed", { error: response?.error || "unknown" }) : null;
+  await refreshPageContext();
+  if (actionError) { pageContext.error = actionError; renderPageContext(store.get()); }
+});
+
+try {
+  chrome.tabs.onActivated.addListener(() => { void refreshPageContext(); });
+  chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+    if (tab?.active && (changeInfo?.url || changeInfo?.status === "complete")) void refreshPageContext();
+  });
+} catch (_) {}
+
 function renderAll() {
   const state = store.get();
   renderRuntime(state);
+  renderPageContext(state);
   renderTarget();
   renderWorkspaceTree(state);
   renderComposerState();
@@ -350,6 +584,8 @@ function handleControlMessage(message) {
   } else if (message?.type === "herdr_control_event" && message.event) {
     eventStreamHealthy = true;
     store.event(message.event);
+  } else if (message?.type === "herdr_control_binding_changed") {
+    void refreshPageContext();
   } else if (message?.type === "herdr_control_runtime") {
     eventStreamHealthy = message.healthy === true;
     if (message.healthy === true) runtimeHealthy = true;
@@ -463,6 +699,7 @@ async function start() {
   connectControlPort(false);
   renderAll();
   await refreshSnapshot();
+  await refreshPageContext();
 }
 
 void start();

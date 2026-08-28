@@ -184,14 +184,14 @@ workstation → ChatGPT
 
 先区分 **Side Panel UI 问题**、**Native Messaging 身份问题** 和 **runtime 问题**：
 
-1. 从扩展 Popup 的“浏览器控制中心”打开，不要把 `control-center.html` 当普通网页直接访问；
+1. 点击 Herdr 工具栏图标，确认 Chrome 直接打开 Control Center Side Panel；不要把 `control-center.html` 当普通网页直接访问；
 2. `herdr-mcp status` / `herdr-mcp doctor` 应该先证明本机 runtime 正常；
 3. `herdr-mcp native-host status` 应显示 Native Messaging host 已注册；
 4. 如果刚更新扩展，先在 `chrome://extensions` 重新加载；
 5. 如果开发时换过 unpacked extension 的绝对路径，扩展 ID 可能变化；Native Messaging `allowed_origins` 仍指向旧 ID 时会看到类似 `Access to the specified native messaging host is forbidden`。这时应针对当前开发版身份重新注册 Native Host，而不是复制 bearer；
 6. 顶部如果显示“运行时正常 · 事件流正在重连”，说明已有 snapshot，但增量事件正在恢复，不等于整个 runtime 离线；可以先点刷新让 Side Panel 做一次权威 reconciliation。
 
-Control Center 的 Prompt / Steer / Herdr / Terminal 当前本来就是 Preview-only。按钮不执行 mutation 不是故障；当前可执行的是 `查看状态` 和有界的 `读取最近输出`。
+Control Center 的“提示 Agent / 调整会话 / Herdr API / 终端输入”当前本来就是 Preview-only。按钮不执行 mutation 不是故障；当前可执行的是 `查看状态` 和有界的 `读取最近输出`。
 
 详见 [浏览器控制中心](browser-control-center.md)。
 
@@ -228,7 +228,7 @@ Control Center 的 Prompt / Steer / Herdr / Terminal 当前本来就是 Preview-
 
 ## 症状：手动接力不可用
 
-先确认：
+先打开 **浏览器控制中心 → 当前页面**；HUD 不再重复提供手动接力入口。然后确认：
 
 - 当前站点/会话类型支持 handoff；
 - workspace 已绑定；

@@ -42,7 +42,6 @@ const referenced = [];
 for (const cs of manifest.content_scripts || []) for (const js of cs.js || []) referenced.push(js);
 referenced.push(manifest.background?.service_worker);
 referenced.push(manifest.options_page);
-referenced.push(manifest.action?.default_popup);
 referenced.push(manifest.side_panel?.default_path);
 for (const [k, v] of Object.entries(manifest.icons || {})) referenced.push(v);
 for (const [k, v] of Object.entries(manifest.action?.default_icon || {})) referenced.push(v);
@@ -55,8 +54,10 @@ ok(manifest.content_scripts.length === 4, "manifest contains four site content s
 ok(manifest.permissions?.includes("nativeMessaging"), "manifest enables Chrome Native Messaging for automatic local authentication");
 ok(manifest.permissions?.includes("sidePanel")
     && manifest.side_panel?.default_path === "control-center.html"
-    && manifest.action?.default_popup === "popup.html",
-  "popup remains the quick surface and Chrome Side Panel hosts the Control Center");
+    && !manifest.action?.default_popup,
+  "toolbar action has no legacy popup and Chrome Side Panel hosts the Control Center");
+ok(!existsSync(path.join(EXT, "popup.html")) && !existsSync(path.join(EXT, "popup.js")),
+  "legacy popup files are removed from the extension package");
 ok(!manifest.key, "unpacked extension keeps its existing Chromium path-derived identity");
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
@@ -67,9 +68,11 @@ const queuedInsertCoreSource = readFileSync(path.join(EXT, "queued-insert-core.j
 const localAuthSource = readFileSync(path.join(EXT, "local-auth.js"), "utf8");
 const nativeHostSource = readFileSync(path.join(EXT, "..", "bin", "herdr-extension-host"), "utf8");
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
-ok(manifest.version === "0.1.65", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.65"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.65"'), "content version matches manifest");
+const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
+const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
+ok(manifest.version === "0.1.66", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.66"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.66"'), "content version matches manifest");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")
@@ -195,11 +198,10 @@ ok(
 );
 ok(
   wakeSource.includes(".bar.automation-on")
-    && wakeSource.includes(".bar.automation-on .handoff")
     && wakeSource.includes('effectiveEnabled ? " automation-on" : ""')
-    && wakeSource.includes("rgba(236,253,245,.97)")
-    && wakeSource.includes("transition: none;"),
-  "effective automation gives the whole HUD a deterministic light-green treatment without refresh-restarted transitions",
+    && wakeSource.includes("rgba(240,253,244,.97)")
+    && !wakeSource.includes(".bar.automation-on .handoff"),
+  "effective automation gives the compact HUD one deterministic light-green Auto-on treatment",
 );
 ok(
   manifest.content_scripts.find((cs) => cs.matches?.includes("https://chatgpt.com/*"))?.js?.includes("context-pressure.js"),
@@ -207,43 +209,38 @@ ok(
 );
 ok(
   backgroundSource.includes("bound_workspace_ids:")
+    && backgroundSource.includes("bound_workspace_count:")
+    && backgroundSource.includes("bound_pane_count:")
+    && backgroundSource.includes("bound_working_count:")
     && backgroundSource.includes("bindingView(b)")
-    && backgroundSource.includes("workspaces: liveWorkspaces"),
-  "page HUD response carries live workspace and binding runtime state",
+    && !backgroundSource.includes("workspaces: liveWorkspaces"),
+  "compact page HUD carries binding counts without duplicating the Side Panel workspace catalog",
 );
 ok(
   backgroundSource.includes("msg.tabId || sender.tab?.id"),
   "in-page bind resolves the sender tab without popup-only tabId",
 );
 ok(
-  wakeSource.includes("Compact in-page HUD + operational drawer")
-    && wakeSource.includes("h2w_bind")
-    && wakeSource.includes("h2w_unbind")
-    && wakeSource.includes("ws-action"),
-  "in-page HUD contains the conversation controls",
+  wakeSource.includes("Compact in-page HUD")
+    && wakeSource.includes('class="web-status"')
+    && wakeSource.includes('class="scope-counts"')
+    && wakeSource.includes("manual-continue")
+    && wakeSource.includes("manual-status")
+    && wakeSource.includes("manual-judge")
+    && wakeSource.includes('class="quick"')
+    && !wakeSource.includes('class="panel" part="panel"')
+    && !wakeSource.includes("h2w_bind")
+    && !wakeSource.includes("h2w_unbind")
+    && !wakeSource.includes("manual-handoff")
+    && !wakeSource.includes("saveHudTiming"),
+  "HUD is one compact status/Auto/preset-action path with no drawer, binding UI, timing UI, or handoff",
 );
-{
-  const panelStart = wakeSource.indexOf('<div class="panel" part="panel" hidden>');
-  const barStart = wakeSource.indexOf('<div class="bar" part="bar">');
-  const panelHtml = wakeSource.slice(panelStart, barStart);
-  const barHtml = wakeSource.slice(barStart, wakeSource.indexOf("`;", barStart));
-  ok(
-    panelStart >= 0 && barStart > panelStart
-      && !panelHtml.includes("manual-continue")
-      && !panelHtml.includes('class="quick"')
-      && barHtml.includes("manual-continue")
-      && barHtml.includes("manual-status")
-      && barHtml.includes("manual-judge")
-      && barHtml.includes("manual-handoff")
-      && barHtml.includes('class="quick"'),
-    "frequent manual actions, manual handoff, and automation switch live on the HUD bar, not in the drawer",
-  );
-}
 ok(
   wakeSource.includes("hudBoundRuntimeState")
-    && wakeSource.includes('document.addEventListener("pointerdown"')
-    && wakeSource.includes("path.includes(host)"),
-  "HUD stays runtime-state driven and closes its drawer on outside click",
+    && wakeSource.includes("hudWebActivityLabel")
+    && wakeSource.includes('hudText("scope_counts"')
+    && !wakeSource.includes("hudExpanded"),
+  "HUD reports Web + Herdr state and aggregate binding counts without workspace or pane names",
 );
 ok(
   backgroundSource.includes("global/Project automation policy")
@@ -266,20 +263,22 @@ ok(
   "manual JSON bridge is site/sender scoped while automation uses the effective Project/conversation state",
 );
 ok(
-  wakeSource.includes('class="handoff manual-handoff"')
-    && wakeSource.includes("manualHandoffAction")
-    && wakeSource.includes("hudActionBusy || active || hud?.bound !== true")
-    && !wakeSource.includes('if (hudCache?.enabled === true) return { ok: false, error: "automation_enabled" }')
-    && wakeSource.includes("h2w_handoff_start")
-    && wakeSource.includes('trigger: "manual"')
-    && wakeSource.includes("h2w_handoff_seed")
-    && wakeSource.includes("h2w_handoff_probe"),
-  "manual HUD handoff stays available with Auto on and reuses recoverable internals",
+  controlCenterSource.includes('type: "h2w_handoff_start"')
+    && controlCenterSource.includes('trigger: "manual"')
+    && controlCenterHtml.includes('id="pageHandoffButton"')
+    && !wakeSource.includes("manualHandoffAction")
+    && !wakeSource.includes('trigger: "manual"')
+    && wakeSource.includes('trigger: "context_pressure"')
+    && wakeSource.includes('trigger: "recovery_exhausted"')
+    && backgroundSource.includes("h2w_handoff_seed")
+    && backgroundSource.includes("h2w_handoff_probe"),
+  "manual handoff has one UI path in the Side Panel and reuses the existing safe handoff internals",
 );
 ok(
   backgroundSource.includes('manual_handoff_available: Boolean(chatgpt.project_id && chatgpt.conversation_id)')
-    && wakeSource.includes('button.hidden = !chatGptConversationActionsAvailable'),
-  "ChatGPT root/Project-home pages keep binding controls but hide conversation-only manual actions",
+    && wakeSource.includes('button.hidden = !chatGptConversationActionsAvailable')
+    && !wakeSource.includes("h2w_bind"),
+  "ChatGPT root/Project-home HUD hides conversation-only preset actions while binding stays out of the HUD",
 );
 ok(
   backgroundSource.includes("herdrConversationTransfers")
@@ -465,7 +464,7 @@ ok(
     && backgroundSource.includes('"context-pressure.js"')
     && backgroundSource.includes('"conversation-health.js"')
     && backgroundSource.includes('"recovery-controller.js"'),
-  "popup/bind recovery reinjects the complete ChatGPT content-script stack when an open tab lost its MV3 listener",
+  "bind recovery reinjects the complete ChatGPT content-script stack when an open tab lost its MV3 listener",
 );
 
 const localeCodes = ["en", "zh", "ja"];
@@ -493,41 +492,56 @@ for (const code of ["en", "zh", "ja"]) {
   const loc = JSON.parse(readFileSync(path.join(EXT, "locales", `${code}.json`), "utf8"));
   ok(loc.native_host_help?.includes("herdr-mcp native-host install"), `${code} Native Host help uses the installed runtime command`);
 }
+const enLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "en.json"), "utf8"));
 const zhLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "zh.json"), "utf8"));
+const jaLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "ja.json"), "utf8"));
+ok([enLocale, zhLocale, jaLocale].every((locale) => !Object.keys(locale).some((key) => key.startsWith("popup_"))),
+  "deleted toolbar Popup leaves no dead popup locale identity");
 ok(zhLocale.hud_manual_continue === "手动继续", "zh HUD manual continue label is exact");
 ok(zhLocale.hud_manual_status === "herdr监控", "zh HUD Herdr monitor label is exact");
 ok(zhLocale.hud_manual_judge === "LLM 分析", "zh HUD LLM analysis label is exact");
-ok(zhLocale.hud_manual_handoff === "手动接力", "zh HUD manual handoff label is exact");
-ok(zhLocale.hud_manual_handoff_hint.includes("ChatGPT")
-    && zhLocale.hud_manual_handoff_hint.includes("z.ai")
-    && zhLocale.hud_manual_handoff_hint.includes("seed")
-    && zhLocale.hud_manual_handoff_hint.includes("binding")
-    && zhLocale.hud_manual_handoff_hint.includes("自动"),
-  "zh HUD manual handoff tooltip explains cross-site safe rollover semantics");
+ok(!("hud_manual_handoff" in zhLocale) && !("hud_bindings" in zhLocale) && !("hud_interval" in zhLocale),
+  "zh HUD removes drawer, binding, timing, and handoff copy after those paths move elsewhere");
+ok(zhLocale.cc_page_handoff === "手动接力"
+    && zhLocale.cc_page_context_title === "当前页面"
+    && zhLocale.hud_scope_counts.includes("工作区")
+    && zhLocale.hud_scope_counts.includes("窗格"),
+  "zh copy places handoff/binding context in Side Panel and keeps HUD aggregate-only");
+ok(zhLocale.cc_page_handoff_busy.includes("Herdr")
+    && zhLocale.cc_page_handoff_busy_help.includes("工作区仍在工作")
+    && zhLocale.cc_mode_herdr_help.includes("不会假装已经完成 schema 校验")
+    && enLocale.cc_mode_herdr_help.includes("future execution must pass")
+    && jaLocale.cc_mode_herdr_help.includes("schema 検証済みとも扱いません"),
+  "handoff busy and Herdr API preview copy fail closed without validation overclaim");
 ok(zhLocale.hud_automation_off === "自动 关", "zh HUD automation-off label is localized");
 ok(
   zhLocale.hud_automation_on_hint.includes("进度")
     && (zhLocale.hud_automation_on_hint.includes("LLM") || zhLocale.hud_automation_on_hint.includes("小模型"))
     && zhLocale.hud_automation_on_hint.includes("恢复")
-    && zhLocale.hud_automation_on_hint.includes("接力")
-    && zhLocale.hud_automation_on_hint.includes("权限卡"),
-  "zh Auto-on tooltip enumerates all automatic continuity behaviors",
+    && zhLocale.hud_automation_on_hint.includes("自动接力")
+    && zhLocale.hud_automation_on_hint.includes("权限卡")
+    && zhLocale.hud_automation_on_hint.includes("Control Center")
+    && zhLocale.hud_automation_on_hint.includes("当前页面"),
+  "zh Auto-on tooltip enumerates automatic behavior and points manual handoff to the Side Panel",
 );
 ok(
   zhLocale.hud_automation_off_hint.includes("当前 ChatGPT Project")
     && zhLocale.hud_automation_off_hint.includes("手动继续")
-    && zhLocale.hud_automation_off_hint.includes("手动接力")
+    && zhLocale.hud_automation_off_hint.includes("Control Center")
+    && zhLocale.hud_automation_off_hint.includes("当前页面")
     && zhLocale.hud_automation_off_hint.includes("同一 Project"),
-  "zh Auto-off tooltip explains Project scope and manual availability",
+  "zh Auto-off tooltip keeps HUD preset actions and sends manual handoff to the Side Panel",
 );
-ok(zhLocale.label_automation_mode === "启用 ChatGPT 项目自动化"
-    && zhLocale.hint_automation_mode.includes("只控制 ChatGPT 项目共享自动化")
+ok(zhLocale.label_automation_mode === "允许 ChatGPT 项目使用共享 Auto"
+    && zhLocale.label_automation_mode.includes("共享 Auto")
+    && zhLocale.hint_automation_mode.includes("全局能力门")
+    && zhLocale.hint_automation_mode.includes("不是当前项目的第二个 Auto 开关")
     && zhLocale.hint_automation_mode.includes("普通 ChatGPT")
-    && zhLocale.hint_automation_mode.includes("即使这里关闭也能单独启用")
+    && zhLocale.hint_automation_mode.includes("不受这个能力门影响")
     && zhLocale.hint_automation_mode.includes("权限卡")
     && zhLocale.hint_automation_mode.includes("z.ai")
     && zhLocale.hint_automation_mode.includes("DeepSeek"),
-  "zh automation checkbox explains the Project-only gate and independent conversation scopes");
+  "zh Options distinguishes the global Project Auto capability gate from the HUD scope switch");
 for (const obsolete of ["hud_wake_on", "hud_wake_off", "hud_nudge_on", "hud_nudge_off", "hud_llm", "hud_llm_off"]) {
   ok(!(obsolete in zhLocale), `obsolete HUD locale key removed: ${obsolete}`);
 }
@@ -536,9 +550,8 @@ ok(!wakeSource.includes("Wake on") && !wakeSource.includes("Wake off") && !wakeS
 ok(!readFileSync(path.join(EXT, "options.html"), "utf8").includes("Enable wake + LLM nudge"),
   "Options source no longer exposes the legacy wake+nudge switch name");
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
-const popupHtml = readFileSync(path.join(EXT, "popup.html"), "utf8");
-const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
-const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
+const wakeDocEn = readFileSync(path.join(EXT, "..", "docs", "i18n", "en", "extension-wake.md"), "utf8");
+const wakeDocZh = readFileSync(path.join(EXT, "..", "docs", "i18n", "zh-CN", "extension-wake.md"), "utf8");
 ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
     && !optionsHtml.includes('id="enabled"')
     && !optionsHtml.includes('id="autoAllow"')
@@ -547,27 +560,40 @@ ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
 ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")')
     && !backgroundSource.includes("CFG.autoAllow"),
   "permission-card automation is folded into effective Project automation");
-ok(!popupHtml.includes('id="idleNudgeEnabled"') && !popupHtml.includes('id="enabled"')
-    && popupHtml.includes('id="automationModeStatus"')
-    && popupHtml.includes('id="automationQuickToggle"')
-    && readFileSync(path.join(EXT, "popup.js"), "utf8").includes('type: "h2w_popup_set_automation"')
-    && backgroundSource.includes('msg?.type === "h2w_popup_set_automation"'),
-  "popup keeps the effective automation status plus a scope-aware quick toggle");
-ok(popupHtml.includes('id="openControlCenter"')
-    && popupHtml.includes('data-i18n="control_center_label"')
-    && popupHtml.includes('data-i18n="control_center_hint"')
-    && readFileSync(path.join(EXT, "popup.js"), "utf8").includes("chrome.sidePanel.open")
-    && readFileSync(path.join(EXT, "popup.js"), "utf8").includes('t("control_center_unavailable")'),
-  "popup exposes a localized Control Center entry point");
+ok(!wakeDocEn.includes("- **Manual handoff (Control Center → Current page)**")
+    && !wakeDocZh.includes("- **手动接力（Control Center → 当前页面）**")
+    && wakeDocEn.includes("The HUD exposes only Continue / Herdr monitor / LLM analysis")
+    && wakeDocZh.includes("HUD 只保留 `手动继续 / herdr监控 / LLM 分析`"),
+  "Wake docs list exactly the three HUD manual actions and keep handoff on the Side Panel path");
+const actionClickStart = backgroundSource.indexOf("chrome.action.onClicked.addListener");
+const actionClickEnd = actionClickStart >= 0 ? backgroundSource.indexOf("void rebuildStreams();", actionClickStart) : -1;
+const actionClickBlock = actionClickStart >= 0 && actionClickEnd > actionClickStart
+  ? backgroundSource.slice(actionClickStart, actionClickEnd)
+  : "";
+ok(actionClickBlock.includes("chrome.sidePanel.open({ windowId })")
+    && actionClickBlock.includes("tab?.windowId")
+    && !backgroundSource.includes('msg?.type === "h2w_popup_set_automation"'),
+  "toolbar action opens the Control Center Side Panel directly and removes popup-only protocol");
 ok(controlCenterHtml.includes('data-i18n="cc_phase_title"')
+    && controlCenterHtml.includes('id="pageContextCard"')
+    && controlCenterHtml.includes('id="pageWorkspaceSelect"')
+    && controlCenterHtml.includes('id="pageHandoffButton"')
     && controlCenterHtml.includes('data-i18n="cc_preview_heading"')
     && controlCenterHtml.includes('data-i18n="cc_target_label"')
     && controlCenterSource.includes('from "./i18n.js"')
     && controlCenterSource.includes("await detectOrLoadLocale()")
     && controlCenterSource.includes('chrome.runtime.openOptionsPage()')
+    && controlCenterSource.includes('chrome.tabs.query({ active: true, currentWindow: true })')
+    && controlCenterSource.includes('chrome.tabs.onActivated.addListener')
+    && controlCenterSource.includes('type: "h2w_state"')
+    && controlCenterSource.includes('type: "h2w_bind"')
+    && controlCenterSource.includes('type: "h2w_unbind"')
+    && backgroundSource.includes('type: "herdr_control_binding_changed"')
+    && controlCenterSource.includes('const workspaceBusy = bindings.some')
+    && controlCenterSource.includes('pageHandoffButton.disabled = !canHandoff || workspaceBusy || transferBusy')
+    && controlCenterSource.includes('if (code === "workspace_busy") return t("cc_page_handoff_busy_help")')
     && controlCenterSource.includes('t("cc_preview_only_reason")')
-    && controlCenterSource.includes('t("native_host_help")')
-    && readFileSync(path.join(EXT, "popup.js"), "utf8").includes('friendlyLocalRuntimeError'),
+    && controlCenterSource.includes('t("native_host_help")'),
   "Control Center localizes state, explicit targeting, preview boundary, Settings, and Native Host failures");
 ok(backgroundSource.includes('event === "hello"')
     && backgroundSource.includes('type: "herdr_control_state"')
@@ -611,7 +637,7 @@ ok((backgroundSource.match(/await moveQueuedInsertForHandoff\(/g) || []).length 
   "handoff commit migrates queued user messages to every supported target cutover path");
 
 // ---- 2. JavaScript syntax for the fixed file list ----
-const fixed = ["background.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "popup.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js",
+const fixed = ["background.js", "binding-core.js", "continuity-core.js", "queued-insert-core.js", "options.js", "browser-state.js", "browser-state-store.js", "target-pin.js", "control-actions.js", "control-center-model.js", "control-center.js", "context-pressure.js", "performance-core.js", "content/base.js",
   "content/injector/zai.js", "content/injector/deepseek.js", "content/injector/claude.js",
   "content/injector/chatgpt.js", "content/webmcp/speaks-json.js", "content/wake.js"];
 for (const f of fixed) {

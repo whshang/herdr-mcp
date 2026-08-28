@@ -33,13 +33,13 @@ The **Queue** button beside the ChatGPT composer is a related interaction capabi
 
 | Entry point | Responsibility |
 |---|---|
-| Popup | Quick local health, current scope binding / Auto state, and the Control Center launcher |
-| HUD | Current Project / conversation binding, Auto, manual continue, monitor, LLM judge, and handoff |
-| Control Center | Live workspaces / panes / agents, explicit target pinning, read operations, and future-action previews |
+| Toolbar action | Open the Browser Control Center directly in Chrome Side Panel |
+| HUD | Compact current-page status (Web + Herdr + aggregate binding counts), Auto, manual continue, Herdr status extraction, and LLM judge |
+| Control Center | Active-tab Project / conversation binding and handoff, live workspaces / panes / agents, explicit target pinning, reads, and future-action previews |
 | Queue | Save the next ChatGPT user intent while the current reply is still running |
 | Options | Language, continuity timing, optional LLM judge, and other low-frequency configuration |
 
-Popup should stay fast; HUD belongs to the conversation; Control Center belongs to the workstation state; Options should not become a high-frequency control surface.
+The toolbar action goes straight to Control Center. Binding / unbinding and manual handoff have one UI path in Control Center; the HUD does not have a drawer. The HUD keeps only high-frequency status, Auto, and three preset conversation actions. Timing and model configuration stay in Options.
 
 ## Security architecture
 
@@ -116,9 +116,9 @@ bin/herdr-extension-host status
 ```
 
 5. Open ChatGPT, z.ai, DeepSeek, or another currently supported page.
-6. Open the extension Popup and confirm the local runtime is reachable.
-7. Bind the current scope to a Herdr workspace through Popup or HUD.
-8. Open **Browser Control Center** from Popup and confirm live workspace / pane state.
+6. Click the Herdr toolbar icon and confirm **Browser Control Center** opens directly in Chrome Side Panel.
+7. In **Browser Control Center**, confirm the active tab is recognized as the intended Project / conversation and bind it to the Herdr workspace there.
+8. Confirm the local runtime is reachable and live workspace / pane state is visible. Switching tabs should update the Current page card without changing an explicit Pinned Target.
 
 ### Developer path
 
@@ -239,7 +239,7 @@ Queue represents **the user's next-turn intent**. It is not a background shell-c
 
 ## Control Center: observe local truth before acting
 
-**Browser Control Center** in Popup opens Chrome Side Panel.
+Clicking the Herdr toolbar icon opens **Browser Control Center** directly in Chrome Side Panel.
 
 The current Control Center can:
 
@@ -252,7 +252,7 @@ The current Control Center can:
 - fail closed when a target becomes stale;
 - `Inspect state`;
 - `Read output tail` with bounded output;
-- build risk-classified preview descriptors for Prompt / Steer / Herdr / Terminal.
+- build risk-classified preview descriptors for **Prompt Agent / Steer Session / Herdr API / Terminal Input**.
 
 ### Mutation controls remain preview-only
 
@@ -260,7 +260,7 @@ The panel says this directly:
 
 > Live state · preview-only controls
 
-Prompt, Steer, Herdr, and Terminal do not execute mutations in the current release.
+Prompt Agent, Steer Session, Herdr API, and Terminal Input do not execute mutations in the current release.
 
 That is the Browser Control Plane Phase A boundary, not a missing click handler.
 
@@ -328,7 +328,7 @@ Recent Chrome versions may expose loopback / local-device access separately from
 
 Native Messaging is the current trusted primary path, while some diagnostic or compatibility paths may still surface a loopback permission prompt.
 
-If Popup / Options / HUD cannot reach the local runtime, check in this order:
+If Control Center / Options / HUD cannot reach the local runtime, check in this order:
 
 1. herdr-mcp runtime;
 2. Native Messaging host;
