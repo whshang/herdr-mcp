@@ -39,6 +39,16 @@
 - **默认实例**安装前：确认 `launchctl list | awk '$3 ~ /herdr-mcp/'` 为空，且本机无人占用 `:8772`。
 - **命名实例**在狗粮机上：不要动默认 `dev.herdr-mcp.server` / `:8772`；不要用 UAT 二进制对狗粮 Chrome 跑 Link cutover / `native-host install`。
 
+## 第二台 Mac 需要独立的 Edge Worker
+
+第二台 Mac 走公网 ChatGPT 路径时，不能复用 dogfood 的 Edge URL 和 Link 密钥。Edge 按 Worker 单租户路由：
+
+- **`DEFAULT_WORKSTATION_ID` 路由：** 每个已部署 Worker 把公网 `/mcp`（及 OAuth discovery）绑定到一个 `DEFAULT_WORKSTATION_ID`。无显式 workstation 头的请求会落到该 ID。一个 Worker 对应公网路径上的一个逻辑 workstation。
+- **每个 `workstation_id` 仅一条活跃 Link：** Link 连 `/ws/{workstation_id}`。Edge Durable Object 每个 ID 只保留一条活跃 Link；新的 `hello` 会把旧连接标为非活跃并关闭（`superseded by newer workstation link`）。
+- **pi 不能复用 dogfood 身份：** 让 UAT 机指向 `herdr-edge-prod` + `prod-real-runtime`（或任何 live dogfood Worker / `DEFAULT_WORKSTATION_ID`）会踢掉 dogfood 生产 Link，或把 ChatGPT 工具调用路由到错误机器。**G18 封板禁止。**
+
+走 B 节（公网 ChatGPT）前，先部署**机器专属** Worker：唯一 Worker `name`、唯一 `DEFAULT_WORKSTATION_ID`（如 `pi-uat-<date>`）、`OAUTH_ISSUER` 对应该 Worker URL；Link 侧 `HERDR_WORKSTATION_ID` 与之相同。步骤见 [Agent 协助安装](agent-install.md) §6（Edge 部署 + `LINK_SHARED_SECRET`）；UAT 保持 `workers_dev = true` 与 `routes = []`。
+
 ## 一键操作者引导（第二台 Mac，默认实例）
 
 若测更新的 prerelease，替换 `TAG`：

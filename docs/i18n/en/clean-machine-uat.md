@@ -39,6 +39,16 @@ First-GA recommendation: **macOS Apple Silicon** only.
 - For **default-instance** install: confirm `launchctl list | awk '$3 ~ /herdr-mcp/'` is empty and nothing listens on `:8772`.
 - For **named-instance** install on a dogfood Mac: leave default `dev.herdr-mcp.server` / `:8772` alone; do not run Link cutover / `native-host install` against dogfood Chrome from the UAT binary.
 
+## Second Mac needs an independent Edge Worker
+
+Public ChatGPT MCP on a **second Mac** is not "reuse dogfood URL + Link secret." Edge is single-tenant per Worker:
+
+- **`DEFAULT_WORKSTATION_ID` routing:** Each deployed Worker binds public `/mcp` (and OAuth discovery) to one `DEFAULT_WORKSTATION_ID`. Requests without an explicit workstation header/query resolve to that ID. One Worker → one logical workstation for the public path.
+- **One active Link per `workstation_id`:** Link connects to `/ws/{workstation_id}`. The Edge Durable Object accepts exactly one active Link socket per ID; a newer `hello` marks the previous Link inactive and closes it (`superseded by newer workstation link`).
+- **Do not reuse dogfood identities on pi:** Pointing the UAT Mac at `herdr-edge-prod` + `prod-real-runtime` (or any live dogfood Worker / `DEFAULT_WORKSTATION_ID`) would either kick dogfood's production Link or route ChatGPT tool calls to the wrong machine. **Forbidden for G18 seal.**
+
+Deploy a **machine-specific** Worker before section B: unique Worker `name`, unique `DEFAULT_WORKSTATION_ID` (e.g. `pi-uat-<date>`), `OAUTH_ISSUER` matching that Worker URL, and set the same `workstation_id` on Link (`HERDR_WORKSTATION_ID`). Follow [Agent-assisted installation](agent-install.md) §6 (Edge deploy + `LINK_SHARED_SECRET`); keep `workers_dev = true` and `routes = []` for UAT.
+
 ## One-command operator bootstrap (second Mac, default instance)
 
 Replace `TAG` if a newer prerelease is under test:
