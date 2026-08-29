@@ -72,6 +72,10 @@ setup_isolated_herdr() {
   export HERDR_SOCKET="${HERDR_STATE_DIR}/herdr.sock"
   export HERDR_SOCKET_PATH="${HERDR_SOCKET}"
   export HERDR_INSTALL_DIR="${GATE_TMP}/bin"
+  # ci-herdr-runtime.sh runs in a child shell, so its PATH export cannot update
+  # this release-gate process. Export the isolated install dir here so the Node
+  # transport tests resolve the exact pinned Herdr binary in the same step.
+  export PATH="${HERDR_INSTALL_DIR}:${PATH}"
   export GITHUB_WORKSPACE="${GITHUB_WORKSPACE:-${ROOT}}"
   export HERDR_CI_WORKSPACE="${GATE_TMP}/workspace"
   # Mark cleanup ownership before start so a partial spawn/readiness failure is

@@ -128,6 +128,7 @@ test("pinned Herdr bootstrap supports CI Linux and local macOS", async () => {
   const ownership = gate.indexOf("RUNTIME_STARTED=1");
   const start = gate.indexOf("scripts/ci-herdr-runtime.sh start");
   assert.ok(ownership >= 0 && start > ownership, "cleanup ownership must be marked before start can fail");
+  assert.match(gate, /export PATH="\$\{HERDR_INSTALL_DIR\}:\$\{PATH\}"/);
 });
 
 test("Herdr dependency recovery stays internal and is installed on both install and updater paths", async () => {
