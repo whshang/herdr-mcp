@@ -37,7 +37,7 @@ Then run `herdr --version` again. Herdr's own install behavior is authoritative 
 
 ## Supported platform boundary
 
-Current stable runtime is **`v0.4.2`**. The strongest clean-machine qualification evidence remains the `v0.4.0` **macOS Apple Silicon** run. A Windows x64 release binary is available, while Windows end-to-end UAT is still being completed. Linux is not yet claimed as a supported current-stable herdr-mcp runtime surface.
+Current published stable runtime is **`v0.4.1`**. The `v0.4.2` source candidate is merged and release-ready, but its signed stable tag is intentionally blocked until the required macOS Developer ID credentials are configured in GitHub Actions. The strongest clean-machine qualification evidence remains the `v0.4.0` **macOS Apple Silicon** run. A Windows x64 release binary is available, while Windows end-to-end UAT is still being completed. Linux is not yet claimed as a supported current-stable herdr-mcp runtime surface.
 
 ## Step 1: install the native herdr-mcp runtime
 
