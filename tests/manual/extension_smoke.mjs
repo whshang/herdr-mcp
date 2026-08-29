@@ -74,9 +74,19 @@ const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.74", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.74"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.74"'), "content version matches manifest");
+ok(manifest.version === "0.1.75", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.75"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.75"'), "content version matches manifest");
+ok(!manifest.host_permissions?.includes("<all_urls>")
+    && manifest.host_permissions?.includes("http://127.0.0.1:8772/*")
+    && manifest.host_permissions?.includes("https://chatgpt.com/*")
+    && manifest.host_permissions?.includes("https://claude.ai/*")
+    && manifest.optional_host_permissions?.includes("https://*/*")
+    && manifest.optional_host_permissions?.includes("http://*/*"),
+  "broad network access is optional and the always-on host permission stays loopback-only");
+ok(backgroundSource.includes("EXPERIMENTAL_SITE_PERMISSION_PATTERNS")
+    && backgroundSource.includes("await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site])"),
+  "experimental content-script registration requires an explicitly granted site permission");
 ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
     && backgroundSource.includes("const tabId = sender.tab?.id")
     && backgroundSource.includes("PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS")

@@ -352,5 +352,8 @@
   "hint_experimental_zai": "Off by default. Enables the z.ai page HUD, continuity, and local JSON→MCP bridge. Reload existing z.ai tabs after changing this switch.",
   "label_experimental_deepseek": "Enable chat.deepseek.com integration",
   "hint_experimental_deepseek": "Off by default. Enables the DeepSeek page HUD, continuity, and local JSON→MCP bridge. Reload existing DeepSeek tabs after changing this switch.",
-  "open_github_setup_guide": "Open the Herdr GitHub setup guide"
+  "open_github_setup_guide": "Open the Herdr GitHub setup guide",
+  "host_permission_denied": "Site access was not granted. Herdr only requests access to sites or endpoints you explicitly enable.",
+  "host_permission_invalid_url": "The configured endpoint must use http:// or https://.",
+  "hud_reason_llm_permission": "LLM site access not granted"
 }

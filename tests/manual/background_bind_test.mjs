@@ -45,7 +45,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.74", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.75", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true };
 const listeners = { onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
@@ -205,6 +205,11 @@ function targetListener(tab) {
 }
 
 globalThis.chrome = {
+  permissions: {
+    async contains() { return true; },
+    async request() { return true; },
+    async remove() { return true; },
+  },
   runtime: {
     id: "test-ext",
     getURL: (rel) => `chrome-extension://test-ext/${rel}`,

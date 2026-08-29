@@ -12,6 +12,49 @@ const KEYS = [
   "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
   "experimentalZAiEnabled", "experimentalDeepSeekEnabled",
 ];
+let loadedHostPermissionOrigins = [];
+
+function hostPermissionPatternForUrl(rawUrl) {
+  const value = String(rawUrl || "").trim();
+  if (!value) return "";
+  let url;
+  try {
+    url = new URL(value);
+  } catch (_) {
+    throw new Error("invalid_url");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("invalid_url");
+  return `${url.protocol}//${url.host}/*`;
+}
+
+function configuredHostPermissionOrigins(config) {
+  const origins = [];
+  if (config.experimentalZAiEnabled === true) origins.push("https://chat.z.ai/*");
+  if (config.experimentalDeepSeekEnabled === true) origins.push("https://chat.deepseek.com/*");
+  const llmOrigin = hostPermissionPatternForUrl(config.llmJudgeBaseUrl);
+  if (llmOrigin) origins.push(llmOrigin);
+  return [...new Set(origins)];
+}
+
+async function requestHostPermissions(origins) {
+  if (!origins.length) return true;
+  if (!chrome.permissions?.request) return false;
+  return chrome.permissions.request({ origins });
+}
+
+async function removeHostPermissions(origins) {
+  if (!origins.length || !chrome.permissions?.remove) return;
+  try { await chrome.permissions.remove({ origins }); } catch (_) {}
+}
+
+function runtimeMessage(message) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(message, (resp) => {
+      resolve({ resp, error: chrome.runtime.lastError?.message || "" });
+    });
+  });
+}
+
 /** Seconds: empty/invalid → fallback; <=0 → 0 (off); cap 86400. */
 function parseTickSec(v, fallback = 120) {
   const n = Number(v);
@@ -96,6 +139,7 @@ async function loadForm() {
     || (cfg.automationMode == null && cfg.enabled === true);
   $("experimentalZAiEnabled").checked = cfg.experimentalZAiEnabled === true;
   $("experimentalDeepSeekEnabled").checked = cfg.experimentalDeepSeekEnabled === true;
+  try { loadedHostPermissionOrigins = configuredHostPermissionOrigins(cfg); } catch (_) { loadedHostPermissionOrigins = []; }
 }
 
 function setupGuideUrl() {
@@ -129,7 +173,7 @@ $("uiLocale").addEventListener("change", async () => {
   });
 });
 
-$("save").addEventListener("click", () => {
+$("save").addEventListener("click", async () => {
   const config = {
     herdrMcpUrl: $("url").value.trim(),
     wakeTemplate: $("template").value,
@@ -146,15 +190,30 @@ $("save").addEventListener("click", () => {
     experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked,
     uiLocale: getLocale(),
   };
-  chrome.runtime.sendMessage({ type: "h2w_set_config", config }, (resp) => {
-    if (chrome.runtime.lastError || !resp?.ok) {
-      setStatus(`${t("save_failed")}: ${chrome.runtime.lastError?.message || ""}`, "err");
-    } else {
-      setStatus(`✓ ${t("saved")}`, "ok");
-      $("llmJudgePromptTemplate").value = config.llmJudgePromptTemplate;
-      $("llmJudgeSkipKeywords").value = config.llmJudgeSkipKeywords;
-    }
-  });
+  let nextPermissionOrigins;
+  try {
+    nextPermissionOrigins = configuredHostPermissionOrigins(config);
+  } catch (_) {
+    setStatus(`${t("save_failed")}: ${t("host_permission_invalid_url")}`, "err");
+    return;
+  }
+  let granted = false;
+  try { granted = await requestHostPermissions(nextPermissionOrigins); } catch (_) { granted = false; }
+  if (!granted) {
+    setStatus(`${t("save_failed")}: ${t("host_permission_denied")}`, "err");
+    return;
+  }
+  const { resp, error } = await runtimeMessage({ type: "h2w_set_config", config });
+  if (error || !resp?.ok) {
+    setStatus(`${t("save_failed")}: ${error}`, "err");
+    return;
+  }
+  const staleOrigins = loadedHostPermissionOrigins.filter((origin) => !nextPermissionOrigins.includes(origin));
+  await removeHostPermissions(staleOrigins);
+  loadedHostPermissionOrigins = nextPermissionOrigins;
+  setStatus(`✓ ${t("saved")}`, "ok");
+  $("llmJudgePromptTemplate").value = config.llmJudgePromptTemplate;
+  $("llmJudgeSkipKeywords").value = config.llmJudgeSkipKeywords;
 });
 
 $("test").addEventListener("click", () => {
@@ -189,7 +248,7 @@ $("test").addEventListener("click", () => {
   });
 });
 
-$("testLlm").addEventListener("click", () => {
+$("testLlm").addEventListener("click", async () => {
   const base = $("llmJudgeBaseUrl").value.trim();
   const key = $("llmJudgeApiKey").value.trim();
   const model = $("llmJudgeModel").value.trim();
@@ -197,11 +256,24 @@ $("testLlm").addEventListener("click", () => {
     setStatus(t("llm_need_config"), "err");
     return;
   }
+  let origin;
+  try {
+    origin = hostPermissionPatternForUrl(base);
+  } catch (_) {
+    setStatus(`✖ ${t("host_permission_invalid_url")}`, "err");
+    return;
+  }
+  let granted = false;
+  try { granted = await requestHostPermissions([origin]); } catch (_) { granted = false; }
+  if (!granted) {
+    setStatus(`✖ ${t("host_permission_denied")}`, "err");
+    return;
+  }
+  const ephemeralOrigins = loadedHostPermissionOrigins.includes(origin) ? [] : [origin];
   const btn = $("testLlm");
   btn.disabled = true;
   setStatus(t("testing"), "");
-  // Route via service worker (host_permissions + shared timeout path); Options-page fetch can hang with no feedback.
-  chrome.runtime.sendMessage({
+  const { resp, error } = await runtimeMessage({
     type: "h2w_test_llm",
     config: {
       llmJudgeBaseUrl: base,
@@ -210,32 +282,33 @@ $("testLlm").addEventListener("click", () => {
       llmJudgePromptTemplate: $("llmJudgePromptTemplate").value.trim() || t("default_llm_judge_prompt") || DEFAULT_LLM_JUDGE_PROMPT,
       llmJudgeSkipKeywords: $("llmJudgeSkipKeywords").value.trim() || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
     },
-  }, (resp) => {
-    btn.disabled = false;
-    if (chrome.runtime.lastError) {
-      setStatus(`✖ ${chrome.runtime.lastError.message}`, "err");
-      return;
-    }
-    if (!resp?.ok) {
-      if (resp?.reason === "timeout") setStatus(`✖ ${t("llm_timeout")}`, "err");
-      else if (resp?.reason === "http") {
-        setStatus(`✖ ${t("llm_test_http_error", {
-          status: resp.status || "?",
-          detail: resp.error ? `: ${resp.error}` : "",
-        })}`, "err");
-      } else {
-        setStatus(`✖ ${t("llm_test_failed", { error: resp?.error || resp?.reason || "?" })}`, "err");
-      }
-      return;
-    }
-    const send = resp.cont ? t("llm_test_send", { send: JSON.stringify(resp.nudgeText) }) : "";
-    setStatus(`✓ ${t("llm_test_result", {
-      raw: JSON.stringify(resp.content),
-      done: t(resp.done ? "boolean_yes" : "boolean_no"),
-      cont: t(resp.cont ? "boolean_yes" : "boolean_no"),
-      send,
-    })}`, "ok");
   });
+  btn.disabled = false;
+  if (ephemeralOrigins.length) await removeHostPermissions(ephemeralOrigins);
+  if (error) {
+    setStatus(`✖ ${error}`, "err");
+    return;
+  }
+  if (!resp?.ok) {
+    if (resp?.reason === "timeout") setStatus(`✖ ${t("llm_timeout")}`, "err");
+    else if (resp?.reason === "permission") setStatus(`✖ ${t("host_permission_denied")}`, "err");
+    else if (resp?.reason === "http") {
+      setStatus(`✖ ${t("llm_test_http_error", {
+        status: resp.status || "?",
+        detail: resp.error ? `: ${resp.error}` : "",
+      })}`, "err");
+    } else {
+      setStatus(`✖ ${t("llm_test_failed", { error: resp?.error || resp?.reason || "?" })}`, "err");
+    }
+    return;
+  }
+  const send = resp.cont ? t("llm_test_send", { send: JSON.stringify(resp.nudgeText) }) : "";
+  setStatus(`✓ ${t("llm_test_result", {
+    raw: JSON.stringify(resp.content),
+    done: t(resp.done ? "boolean_yes" : "boolean_no"),
+    cont: t(resp.cont ? "boolean_yes" : "boolean_no"),
+    send,
+  })}`, "ok");
 });
 
 onLocaleReady(async () => {

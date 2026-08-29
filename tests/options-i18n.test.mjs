@@ -80,3 +80,13 @@ test("LLM test booleans are localized instead of rendering true/false", () => {
   assert.match(optionsJs, /t\(resp\.done \? "boolean_yes" : "boolean_no"\)/);
   assert.match(optionsJs, /t\(resp\.cont \? "boolean_yes" : "boolean_no"\)/);
 });
+
+test("Options requests optional host access only from explicit user settings", () => {
+  assert.match(optionsJs, /chrome\.permissions\?\.request/);
+  assert.match(optionsJs, /https:\/\/chat\.z\.ai\/\*/);
+  assert.match(optionsJs, /https:\/\/chat\.deepseek\.com\/\*/);
+  assert.match(optionsJs, /removeHostPermissions/);
+  assert.equal(typeof zh.host_permission_denied, "string");
+  assert.equal(typeof zh.host_permission_invalid_url, "string");
+  assert.equal(typeof zh.hud_reason_llm_permission, "string");
+});

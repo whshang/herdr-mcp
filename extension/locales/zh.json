@@ -352,5 +352,8 @@
   "hint_experimental_zai": "默认关闭。开启后启用 z.ai 页面 HUD、连续性和本机 JSON→MCP 桥接。切换后请刷新已打开的 z.ai 页面。",
   "label_experimental_deepseek": "启用 chat.deepseek.com 集成",
   "hint_experimental_deepseek": "默认关闭。开启后启用 DeepSeek 页面 HUD、连续性和本机 JSON→MCP 桥接。切换后请刷新已打开的 DeepSeek 页面。",
-  "open_github_setup_guide": "打开 Herdr GitHub 新手配置指南"
+  "open_github_setup_guide": "打开 Herdr GitHub 新手配置指南",
+  "host_permission_denied": "未授予站点访问权限。Herdr 只会请求你明确启用的站点或接口地址。",
+  "host_permission_invalid_url": "配置的接口地址必须使用 http:// 或 https://。",
+  "hud_reason_llm_permission": "未授予小模型站点访问权限"
 }

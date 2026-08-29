@@ -365,14 +365,19 @@ herdr-mcp Rust runtime
   ],
   "host_permissions": [
     "http://127.0.0.1:8772/*",
-    "<all_urls>"
+    "https://chatgpt.com/*",
+    "https://claude.ai/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
   ]
 }
 ```
 
 上架前必须逐项证明必要性，尤其是：
 
-- `<all_urls>`；
+- 任意 origin 的 optional host permission（仅用于用户配置的 OpenAI-compatible endpoint，并在运行时只申请精确 origin）；
 - `scripting`；
 - `nativeMessaging`；
 - 网站内容/对话数据访问。
@@ -390,7 +395,7 @@ Chrome Web Store 要求申请完成 single purpose 所需的最小权限。不�
 - Manifest V3 不允许执行 remotely hosted code；
 - 官方 minimum-permission policy 要求只申请当前功能真正需要的最小权限。
 
-因此当前 `host_permissions` 中的 `<all_urls>` 在首次提交前必须独立做一次最小权限审计；不要仅因为现有代码能运行就假定商店审核会接受宽权限。
+2026-08-29 的真实 Store 预检验证了这一要求：0.1.74 的常驻 `<all_urls>` 会触发 **Broad Host Permissions** 延迟审核提示。0.1.75 已移除常驻 `<all_urls>`，把常驻 host access 缩到本机 Herdr、ChatGPT 与 Claude；z.ai/DeepSeek 和用户配置的 OpenAI-compatible endpoint 改为 optional host permission，并且只在用户显式启用/保存/测试时申请精确 origin。由于 Chrome Web Store 仍把 manifest 中用于“任意用户自定义 endpoint”的 optional wildcard declaration 视为 Broad Host Permissions，0.1.75 接受 in-depth review，而不是为了消除审核提示新增一个与当前 0.4.1 不兼容的 native-host 外部代理协议。
 
 当前最终用户文档已经改为：**Chrome Web Store 是唯一正式浏览器扩展安装路径**。Store listing 正式上线前，普通用户直接跳过扩展，不回退到 `Load unpacked`。
 
@@ -649,7 +654,7 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 - [x] `0.4.1` Native Host installer 支持 production Store origin；`HOME` **与** `HERDR_MCP_CONFIG_DIR` 双隔离的 fresh-install/status/rollback smoke、dev→Store→rollback 单测均 PASS，且隔离 smoke 前后真实 Native Host binary/wrapper/5 份浏览器 manifest SHA 完全一致；
 - [x] dev/store identity 策略明确：Store-first、单 origin、开发版显式 override；
 - [ ] manifest permissions 完成最小权限审计；
-- [ ] `<all_urls>` 已证明必要，或缩小；
+- [x] 常驻 `<all_urls>` 已移除；任意 endpoint 仅保留 optional wildcard declaration，并以运行时精确-origin 授权 + Store in-depth review 作为当前边界；
 - [x] Privacy Policy 已上线并写入 Store；
 - [x] User Data / Limited Use disclosures 已填写并保存；
 - [x] remote executable code audit：Store 声明 `No`，可执行 JS 全部随扩展打包；
@@ -748,5 +753,5 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 - `0.4.1` 开发线已经实现 Store-first Native Messaging identity：普通 `native-host install` 从 Store contract 读取 production identity，显式 `HERDR_EXTENSION_PATH` 仅保留维护者 unpacked 开发路径，既有 herdr-mcp-owned dev origin 可事务迁移并 rollback；一次仅替换 `HOME` 的早期 smoke 暴露出调用环境继承真实 `HERDR_MCP_CONFIG_DIR` 会造成跨作用域 Native Host mutation，已使用原事务 evidence 精确 rollback，生产状态恢复为原 dev identity / `runtime_matches_current=true`；随后用**独立 `HOME` + 独立 `HERDR_MCP_CONFIG_DIR`**重跑 fresh-install/status/rollback，Store ID、`store_origin_match=true`、rollback 均 PASS，且真实 native binary/wrapper/5 份浏览器 manifest 前后 SHA 完全一致。后续任何 Native Host UAT 都必须同时隔离这两个路径，不能把“临时 HOME”单独视为隔离证据；**剩余 Store blocker 是发布/安装真实 `0.4.1` 后，用当前 Chrome Web Store `0.1.72` 做一次真实商店安装 + Native Messaging UAT**；
 - Store Privacy Policy 已由 GitHub Pages 发布并验证可读，`https://whshang.github.io/herdr-mcp/docs/en/privacy.html` 已写入 Store Privacy tab；
 - Publisher 已明确 contact email；Dashboard 仍需完成保存与 Google verification，未验证前不得视为已配置；
-- 首次 Store submit 前必须审计 `<all_urls>` 等 permissions 是否能缩窄；
+- 首次 Store submit 前必须审计 broad permissions；0.1.75 已移除常驻 `<all_urls>`，任意 endpoint 的 optional wildcard 由真实 Store in-depth review 验证；
 - 后续每次 Store 发布仍需重新核对实时 Chrome Web Store policy，不得把本 WIP 的时间点描述当成永久不变的商店规则。

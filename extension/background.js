@@ -36,11 +36,15 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.74";
+const H2W_SCRIPT_VERSION = "0.1.75";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
   deepseek: "*://chat.deepseek.com/*",
+};
+const EXPERIMENTAL_SITE_PERMISSION_PATTERNS = {
+  "z.ai": "https://chat.z.ai/*",
+  deepseek: "https://chat.deepseek.com/*",
 };
 const EXPERIMENTAL_CONTENT_SCRIPTS = [
   {
@@ -154,7 +158,7 @@ function hudLabels() {
     "reason_disabled", "reason_no_conv", "reason_llm_not_configured", "reason_unbound",
     "reason_still_generating", "reason_not_substantive", "reason_empty_assistant", "reason_nudge_loop",
     "reason_same_assistant", "reason_cooldown", "reason_llm_done", "reason_llm_ambiguous",
-    "reason_llm_continue", "reason_llm_timeout", "reason_llm_http", "reason_llm_network",
+    "reason_llm_continue", "reason_llm_timeout", "reason_llm_http", "reason_llm_network", "reason_llm_permission",
     "reason_wake_failed", "reason_llm_bad_response", "reason_queued_insert_pending",
   ];
   const out = {};
@@ -232,6 +236,29 @@ function activeH2WTabUrls() {
   return urls;
 }
 
+function hostPermissionPatternForUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || "").trim());
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    return `${url.protocol}//${url.host}/*`;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function hasHostPermission(pattern) {
+  if (!pattern || !chrome.permissions?.contains) return false;
+  try {
+    return await chrome.permissions.contains({ origins: [pattern] });
+  } catch (_) {
+    return false;
+  }
+}
+
+async function hasLlmHostPermission(cfg) {
+  return hasHostPermission(hostPermissionPatternForUrl(cfg?.llmJudgeBaseUrl));
+}
+
 async function syncExperimentalContentScripts() {
   if (!chrome.scripting?.getRegisteredContentScripts
     || !chrome.scripting?.registerContentScripts
@@ -242,7 +269,9 @@ async function syncExperimentalContentScripts() {
   const registered = new Set(current.map((item) => item.id));
   for (const spec of EXPERIMENTAL_CONTENT_SCRIPTS) {
     const { site, ...registration } = spec;
-    if (!experimentalSiteEnabled(site)) {
+    const permitted = experimentalSiteEnabled(site)
+      && await hasHostPermission(EXPERIMENTAL_SITE_PERMISSION_PATTERNS[site]);
+    if (!permitted) {
       if (registered.has(spec.id)) {
         try { await chrome.scripting.unregisterContentScripts({ ids: [spec.id] }); } catch (_) {}
       }
@@ -1688,6 +1717,9 @@ const LLM_JUDGE_MAX_ATTEMPTS = 2;
 async function fetchLlmJudgeOnce(userText, assistantText, cfgOverride = null) {
   const cfg = cfgOverride || CFG;
   if (!isLlmJudgeConfigured(cfg)) return { ok: false, reason: "not_configured" };
+  if (!await hasLlmHostPermission(cfg)) {
+    return { ok: false, reason: "permission", error: "LLM endpoint site access is not granted" };
+  }
   const url = llmJudgeCompletionsUrl(cfg.llmJudgeBaseUrl);
   const prompt = buildLlmJudgeUserMessage(cfg.llmJudgePromptTemplate, { userText, assistantText });
   const body = {
@@ -1738,6 +1770,9 @@ async function fetchLlmJudge(userText, assistantText, cfgOverride = null) {
 
 async function fetchLlmHandoffOnce(prompt) {
   if (!isLlmJudgeConfigured(CFG)) return { ok: false, reason: "not_configured" };
+  if (!await hasLlmHostPermission(CFG)) {
+    return { ok: false, reason: "permission", error: "LLM endpoint site access is not granted" };
+  }
   const url = llmJudgeCompletionsUrl(CFG.llmJudgeBaseUrl);
   const body = {
     model: String(CFG.llmJudgeModel).trim(),

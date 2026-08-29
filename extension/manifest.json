@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Herdr — AI Workspace Bridge",
-  "version": "0.1.74",
+  "version": "0.1.75",
   "description": "Connect ChatGPT and Web AI to local Herdr workspaces with Control Center, safe continuity, handoff, and queued next turns.",
   "permissions": [
     "storage",
@@ -12,7 +12,12 @@
   ],
   "host_permissions": [
     "http://127.0.0.1:8772/*",
-    "<all_urls>"
+    "https://chatgpt.com/*",
+    "https://claude.ai/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
   ],
   "background": {
     "service_worker": "background.js",

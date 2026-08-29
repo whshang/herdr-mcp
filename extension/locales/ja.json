@@ -352,5 +352,8 @@
   "hint_experimental_zai": "既定はオフです。z.ai の HUD、継続性、ローカル JSON→MCP ブリッジを有効にします。変更後は開いている z.ai タブを再読み込みしてください。",
   "label_experimental_deepseek": "chat.deepseek.com 統合を有効にする",
   "hint_experimental_deepseek": "既定はオフです。DeepSeek の HUD、継続性、ローカル JSON→MCP ブリッジを有効にします。変更後は開いている DeepSeek タブを再読み込みしてください。",
-  "open_github_setup_guide": "Herdr の GitHub セットアップガイドを開く"
+  "open_github_setup_guide": "Herdr の GitHub セットアップガイドを開く",
+  "host_permission_denied": "サイトアクセスが許可されていません。Herdr は明示的に有効化したサイトまたはエンドポイントだけを要求します。",
+  "host_permission_invalid_url": "設定するエンドポイントは http:// または https:// を使用してください。",
+  "hud_reason_llm_permission": "LLM サイトアクセス未許可"
 }
