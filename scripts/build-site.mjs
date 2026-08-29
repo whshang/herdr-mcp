@@ -170,7 +170,7 @@ function langSwitcher({ locale, localePrefix, slug = null, current = null }) {
 function topbar({ pre, locale, drawer = false, slug = null, localePrefix, version = null }) {
   const ui = UI[locale];
   const badge = version
-    ? `<a class="version-badge" href="https://github.com/whshang/herdr-mcp/releases" aria-label="${esc(ui.versionBadgeAria)}: v${esc(version)}">v${esc(version)}</a>`
+    ? `<a class="version-badge" href="https://github.com/whshang/herdr-mcp/releases" aria-label="${esc(ui.versionBadgeAria)}: v${esc(version)}">${esc(ui.versionBadgeAria)} v${esc(version)}</a>`
     : "";
   return `<header class="topbar${drawer ? " has-drawer" : ""}">
     ${drawer ? `<button class="nav-toggle" type="button" data-nav-toggle aria-label="${esc(ui.openNav)}" aria-controls="docs-sidebar" aria-expanded="false"><span aria-hidden="true">☰</span></button>` : ""}
