@@ -95,5 +95,5 @@ They were **superseded** by the first stable `v0.4.0`; the current runtime stabl
 - [`AGENTS.md`](../AGENTS.md) — binary/runtime hard rules
 - [`ga-release-gate.md`](./ga-release-gate.md) — GA SSOT
 - [`ga-candidate-status.md`](./ga-candidate-status.md) — live stable snapshot
-- [`exit-alpha-checklist.md`](./exit-alpha-checklist.md) — G1 unification runbook
+- [`history/ga/exit-alpha-checklist.md`](./history/ga/exit-alpha-checklist.md) — G1 unification runbook (archived)
 - [`i18n/en/install.md`](./i18n/en/install.md) — user install path

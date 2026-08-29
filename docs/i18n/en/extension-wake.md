@@ -1,5 +1,7 @@
 # Auto-continue, recovery and conversation handoff
 
+> **Role:** advanced reference for the browser continuity state machine. Most users only need [Browser Extension](extension.md) and [Browser Control Center](browser-control-center.md).
+
 This page describes the browser continuity state machine: how the extension wakes the correct Web conversation when Herdr work continues after a browser turn ends, how it recovers stalled ChatGPT views, and how it hands a long conversation to a fresh one without duplicating mutations.
 
 Read [Browser Continuity](browser-continuity.md) first for the architectural motivation. Installation and HUD usage are covered in [Browser Extension](extension.md).

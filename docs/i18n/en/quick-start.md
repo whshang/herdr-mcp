@@ -1,8 +1,12 @@
 # Quick start: experience the first real remote development loop
 
-This page is the shortest path from “I have Herdr locally” to “ChatGPT can inspect my workstation and keep working after the current browser turn ends.”
+> **Role:** this page is what to do **after** installation to prove the first useful remote task. It is not another installation tutorial.
+> - Give a Coding Agent the authoritative install protocol: [Quick agent install](quick-agent-install.md).
+> - Install manually: [Installation](install.md).
+>
+> For the architecture, read [Overview](overview.md) and [Architecture](architecture.md).
 
-For every installation detail, use [Installation](install.md). For the architecture, read [Overview](overview.md) and [Architecture](architecture.md).
+This page is the shortest path from “I have Herdr locally” to “ChatGPT can inspect my workstation and keep working after the current browser turn ends.”
 
 ## What you are building
 

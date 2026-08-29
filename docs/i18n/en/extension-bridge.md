@@ -1,5 +1,7 @@
 # JSON → MCP: local tools for Web AI sites without a native Connector
 
+> **Role:** advanced reference for the experimental JSON → MCP compatibility bridge. Most users do not need this page.
+
 ChatGPT can call herdr-mcp through a custom MCP Connector. Not every Web AI product exposes an equivalent integration point. z.ai and DeepSeek can reason in the browser, but they do not provide the same standard path for registering a local Herdr tool catalog.
 
 The JSON → MCP bridge is a compatibility layer for that gap.

@@ -1,5 +1,7 @@
 # JSON → MCP：给没有原生 Connector 的网页 AI 一条本地工具通道
 
+> **职责：** 实验性 JSON → MCP 兼容桥的高级参考。大多数用户不需要本页。
+
 ChatGPT 可以通过自定义 MCP Connector 直接调用 herdr-mcp，但不是所有网页 AI 都提供同类能力。z.ai / DeepSeek 的网页会话可以很好地推理，却没有标准入口把本机 Herdr 工具注册进去。
 
 JSON → MCP bridge 解决的就是这个兼容问题。

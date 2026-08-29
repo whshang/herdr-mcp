@@ -33,6 +33,7 @@ const EXEC_SURFACES = ['bin', 'crates', 'src', 'scripts', '.github', 'extension'
 // Landmarks allowed to *document* the pattern — but only with the prohibition.
 const DOC_LANDMARKS = [
   'docs/herdr-architecture-roadmap.md',
+  'docs/history/architecture/rust-native-rearchitecture.md',
   'docs/i18n/en/runtime-self-upgrade.md',
   'docs/i18n/zh-CN/runtime-self-upgrade.md',
   'AGENTS.md',

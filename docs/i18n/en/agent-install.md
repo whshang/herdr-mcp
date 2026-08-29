@@ -1,5 +1,7 @@
 # Local-Agent install and `workers.dev` deployment
 
+> **Role:** maintainer/automation implementation reference for a local coding Agent. End users should start from [Quick agent install](quick-agent-install.md) or [Installation](install.md).
+
 This is an execution contract for a **local coding Agent**, not a list of commands for the human to copy. End-user one-sentence onboarding lives in [Quick agent install](quick-agent-install.md). The human should only need to perform Cloudflare interactive login/API-Token creation; the Agent owns environment checks, Release-binary install, Cloudflare Worker deployment, the outbound WSS Link, and verification.
 
 > Current boundary: fully automated background-service setup is **macOS Apple Silicon first**. Windows may receive Release artifacts as preview. Do not invent unsupported Linux lifecycle packaging. Edge deploy may use Node/`wrangler` temporarily; the local MCP runtime itself must come from GitHub Releases, not `git clone` + `npm ci`.
@@ -21,7 +23,7 @@ Node.js is required only for temporary Cloudflare Worker bootstrap (`npx wrangle
 
 ## 2. Install the native runtime from GitHub Releases (primary)
 
-1. Download the current platform binary from <https://github.com/whshang/herdr-mcp/releases> (prerelease tags are expected while the product is still alpha).
+1. Download the current stable platform binary from <https://github.com/whshang/herdr-mcp/releases> (current stable runtime: `v0.4.1`). Use a prerelease tag only when deliberately testing the preview channel.
 2. Place it on `PATH` (for example `~/.local/bin/herdr-mcp`) and make it executable.
 3. Run:
 
@@ -34,7 +36,7 @@ herdr-mcp update          # same as update check
 
 `install` stages an immutable generation under `~/.config/herdr-mcp/runtime/` and retargets `~/.local/bin/herdr-mcp` to `runtime/current/herdr-mcp`. Prefer these top-level commands. Do **not** use `herdr-mcp service install` as the normal install path.
 
-While the product is still alpha, keep `update.channel = "preview"` (or leave config absent on an alpha binary) so discovery sees prerelease tags.
+Use `update.channel = "preview"` only when deliberately testing prerelease builds. On the current stable runtime, the default `stable` channel is correct.
 
 ## 3. Generate local identities without printing secrets
 
