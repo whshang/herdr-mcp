@@ -101,7 +101,7 @@ impl HostConfig {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", test))]
 fn owner_is_active(expected_origin: &str, registered_origin: Option<&str>) -> bool {
     registered_origin == Some(expected_origin)
 }
