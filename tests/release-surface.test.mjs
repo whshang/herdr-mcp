@@ -40,6 +40,8 @@ test("CI/CD and documentation publishing entrypoints are tracked in the release 
     ".github/workflows/ci.yml",
     ".github/workflows/pages.yml",
     ".github/workflows/cloudflare-edge.yml",
+    "scripts/release-gate.sh",
+    "scripts/sign-macos-release.sh",
     "scripts/build-site.mjs",
     "assets/herdr-mcp-SKILL.md",
     "site/index.html",
@@ -50,12 +52,16 @@ test("CI/CD and documentation publishing entrypoints are tracked in the release 
   assert.equal(pkg.scripts?.["self:update"], "bin/herdr-self-update");
 });
 
-test("Actions build docs and keep Cloudflare deployment on the gated Worker plane", async () => {
+test("Actions consume the shared gate and keep Cloudflare deployment on the gated Worker plane", async () => {
   const ci = await readFile(join(ROOT, ".github/workflows/ci.yml"), "utf8");
+  const gate = await readFile(join(ROOT, "scripts/release-gate.sh"), "utf8");
   const pages = await readFile(join(ROOT, ".github/workflows/pages.yml"), "utf8");
   const edge = await readFile(join(ROOT, ".github/workflows/cloudflare-edge.yml"), "utf8");
-  assert.match(ci, /npm run build:site/);
-  assert.match(ci, /extension_smoke\.mjs/);
+  assert.match(ci, /scripts\/release-gate\.sh rust/);
+  assert.match(ci, /scripts\/release-gate\.sh node/);
+  assert.match(ci, /scripts\/release-gate\.sh hygiene/);
+  assert.match(gate, /npm run build:site/);
+  assert.match(gate, /extension_smoke\.mjs/);
   assert.match(pages, /npm run build:site/);
   assert.match(pages, /path: site-dist/);
   assert.match(pages, /actions\/deploy-pages@v4/);
@@ -67,19 +73,134 @@ test("Actions build docs and keep Cloudflare deployment on the gated Worker plan
   assert.doesNotMatch(edge, /cloudflared|DNS Write|Tunnel/);
 });
 
-test("Rust release verification provisions and always cleans the pinned Herdr runtime", async () => {
+test("Rust release verification consumes the shared gate with bounded runtime cleanup", async () => {
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
-  const start = release.indexOf("scripts/ci-herdr-runtime.sh start");
-  const rootTests = release.indexOf("npm test");
-  const stop = release.indexOf("scripts/ci-herdr-runtime.sh stop");
-  assert.ok(start >= 0, "release verify must start the pinned Herdr runtime");
+  const gate = await readFile(join(ROOT, "scripts/release-gate.sh"), "utf8");
+  assert.match(release, /scripts\/release-gate\.sh full/);
+  const start = gate.indexOf("scripts/ci-herdr-runtime.sh start");
+  const rootTests = gate.indexOf("npm test");
+  const stop = gate.lastIndexOf("scripts/ci-herdr-runtime.sh stop");
+  assert.ok(start >= 0, "shared gate must start the pinned Herdr runtime");
   assert.ok(rootTests > start, "runtime must be ready before root transport tests");
   assert.ok(stop > rootTests, "runtime cleanup must run after root transport tests");
-  assert.match(
-    release,
-    /- name: Stop Herdr runtime\n\s+if: always\(\)\n\s+run: scripts\/ci-herdr-runtime\.sh stop/,
-    "release verify must clean the pinned Herdr runtime even after a failed gate",
+  assert.match(gate, /trap cleanup EXIT/, "shared gate must clean the isolated runtime on failure");
+});
+
+test("shared gate scrubs production overrides and isolates the live Herdr test runtime", async () => {
+  const gate = await readFile(join(ROOT, "scripts/release-gate.sh"), "utf8");
+  for (const name of [
+    "HERDR_MCP_PORT",
+    "HERDR_MCP_CONFIG_DIR",
+    "HERDR_MCP_INSTANCE",
+    "HERDR_EXTENSION_PATH",
+    "HERDR_EXTENSION_ORIGIN",
+    "HERDR_MCP_ROOT",
+  ]) {
+    assert.match(gate, new RegExp(`\\b${name}\\b`));
+  }
+  assert.match(gate, /mktemp -d \/tmp\/herdr-gate/);
+  assert.match(gate, /XDG_CONFIG_HOME=/);
+  assert.match(gate, /HERDR_STATE_DIR=/);
+  assert.match(gate, /HERDR_SOCKET_PATH=/);
+  assert.match(gate, /HERDR_INSTALL_DIR=/);
+});
+
+test("pinned Herdr bootstrap supports CI Linux and local macOS", async () => {
+  const bootstrap = await readFile(join(ROOT, "scripts/ci-herdr-runtime.sh"), "utf8");
+  assert.match(bootstrap, /herdr-linux-x86_64/);
+  assert.match(bootstrap, /herdr-linux-aarch64/);
+  assert.match(bootstrap, /herdr-macos-aarch64/);
+  assert.match(bootstrap, /herdr-macos-x86_64/);
+  assert.match(bootstrap, /local start requires isolated XDG_CONFIG_HOME/);
+  assert.match(bootstrap, /HERDR_STATE_DIR must equal XDG_CONFIG_HOME\/herdr/);
+  assert.match(bootstrap, /HERDR_SOCKET must equal HERDR_STATE_DIR\/herdr.sock/);
+  assert.match(bootstrap, /server_pid_identity_ok/);
+  assert.match(bootstrap, /terminate_exact_server_pid/);
+  assert.match(bootstrap, /workspace create exceeded 10s/);
+  assert.match(bootstrap, /HERDR_CI_WORKSPACE/);
+  assert.match(bootstrap, /CI_WORKSPACE=.*STATE_DIR.*ci-workspace/);
+  assert.doesNotMatch(
+    bootstrap,
+    /HERDR_BIN.*server stop/,
+    "isolated cleanup must never invoke generic Herdr server stop",
   );
+  const gate = await readFile(join(ROOT, "scripts/release-gate.sh"), "utf8");
+  const ownership = gate.indexOf("RUNTIME_STARTED=1");
+  const start = gate.indexOf("scripts/ci-herdr-runtime.sh start");
+  assert.ok(ownership >= 0 && start > ownership, "cleanup ownership must be marked before start can fail");
+  assert.match(gate, /export PATH="\$\{HERDR_INSTALL_DIR\}:\$\{PATH\}"/);
+});
+
+test("Herdr dependency recovery stays internal and is installed on both install and updater paths", async () => {
+  const cli = await readFile(join(ROOT, "crates/herdr-mcp/src/cli.rs"), "utf8");
+  const supervisor = await readFile(join(ROOT, "crates/herdr-mcp/src/herdr_supervisor.rs"), "utf8");
+  const updater = await readFile(join(ROOT, "crates/herdr-mcp/src/updater.rs"), "utf8");
+  const runtimeMeta = await readFile(join(ROOT, "crates/herdr-mcp/src/runtime_meta.rs"), "utf8");
+  assert.match(cli, /herdr-mcp herdr-supervisor/);
+  assert.match(supervisor, /dev\.herdr-mcp\.herdr-supervisor|DEFAULT_HERDR_SUPERVISOR_LABEL/);
+  assert.match(supervisor, /desired_running/);
+  assert.match(supervisor, /session_restore_blocked/);
+  assert.match(supervisor, /KeepAlive/);
+  assert.match(supervisor, /ThrottleInterval/);
+  assert.doesNotMatch(supervisor, /"StartInterval"/);
+  assert.match(updater, /service_lifecycle::run\(ServiceCommand::Install/);
+  assert.match(runtimeMeta, /MIGRATED_TOOLS: \[&str; 18\]/);
+  assert.doesNotMatch(runtimeMeta, /herdr_supervisor/);
+});
+
+test("request child lifecycle persists only ownership metadata and reaps confirmed boot orphans", async () => {
+  const children = await readFile(join(ROOT, "crates/herdr-mcp/src/child_process.rs"), "utf8");
+  const service = await readFile(join(ROOT, "crates/herdr-mcp/src/service_manager.rs"), "utf8");
+  const main = await readFile(join(ROOT, "crates/herdr-mcp/src/main.rs"), "utf8");
+  const status = await readFile(join(ROOT, "crates/herdr-mcp/src/status.rs"), "utf8");
+  assert.match(service, /HERDR_MCP_CHILD_REGISTRY/);
+  assert.match(main, /reap_confirmed_orphans_on_boot/);
+  assert.match(status, /child_process::doctor_line/);
+  assert.match(children, /process_start_identity_mismatch/);
+  assert.match(children, /process_command_identity_mismatch/);
+  assert.match(children, /recorded_parent_still_alive/);
+  assert.match(children, /record_too_old_for_automatic_reap/);
+  assert.match(children, /child-process-reap-last\.json/);
+  assert.doesNotMatch(children, /get_args\(/, "persistent child ownership must not record request arguments");
+});
+
+test("service lifecycle keeps Herdr supervisor transactional across install update rollback and uninstall", async () => {
+  const main = await readFile(join(ROOT, "crates/herdr-mcp/src/main.rs"), "utf8");
+  const updater = await readFile(join(ROOT, "crates/herdr-mcp/src/updater.rs"), "utf8");
+  const lifecycle = await readFile(join(ROOT, "crates/herdr-mcp/src/service_lifecycle.rs"), "utf8");
+  const supervisor = await readFile(join(ROOT, "crates/herdr-mcp/src/herdr_supervisor.rs"), "utf8");
+  assert.match(main, /Command::Service\(command\) => service_lifecycle::run\(command\)/);
+  assert.match(updater, /service_lifecycle::run\(ServiceCommand::Install/);
+  assert.doesNotMatch(updater, /herdr_supervisor::ensure_installed_for_service/);
+  assert.match(lifecycle, /InstallRecovery::Rollback => service_manager::run\(ServiceCommand::Rollback\)/);
+  assert.match(lifecycle, /InstallRecovery::Uninstall => service_manager::run\(ServiceCommand::Uninstall\)/);
+  assert.match(lifecycle, /reconcile_after_service_rollback/);
+  assert.match(lifecycle, /remove_for_service\(\)\?/);
+  assert.match(supervisor, /refusing bootout because it may own a live Herdr child/);
+  assert.match(supervisor, /runtime_supports_supervisor/);
+  assert.match(supervisor, /starts_with\("herdr-mcp herdr-supervisor </);
+  assert.match(lifecycle, /rollback_target_runtime_binary/);
+  assert.match(lifecycle, /RollbackSupervisorStrategy::Preserve/);
+});
+
+test("current workflows pin checkout and setup-node to reviewed v7 commits", async () => {
+  const checkout = "3d3c42e5aac5ba805825da76410c181273ba90b1";
+  const setupNode = "820762786026740c76f36085b0efc47a31fe5020";
+  for (const rel of [
+    ".github/workflows/ci.yml",
+    ".github/workflows/pages.yml",
+    ".github/workflows/cloudflare-edge.yml",
+    ".github/workflows/rust-release.yml",
+    ".github/workflows/rust-release-recover.yml",
+  ]) {
+    const workflow = await readFile(join(ROOT, rel), "utf8");
+    for (const match of workflow.matchAll(/actions\/checkout@([^\s]+)/g)) {
+      assert.equal(match[1], checkout, `${rel} checkout ref must be pinned`);
+    }
+    for (const match of workflow.matchAll(/actions\/setup-node@([^\s]+)/g)) {
+      assert.equal(match[1], setupNode, `${rel} setup-node ref must be pinned`);
+    }
+  }
 });
 
 test("Rust release defaults to one authoritative macOS ARM64 + Windows x64 target contract", async () => {
@@ -98,6 +219,26 @@ test("Rust release defaults to one authoritative macOS ARM64 + Windows x64 targe
   assert.match(release, /matrix: \$\{\{ fromJSON\(needs\.targets\.outputs\.matrix\) \}\}/);
   assert.doesNotMatch(release, /x86_64-apple-darwin/);
   assert.doesNotMatch(release, /unknown-linux-gnu/);
+});
+
+test("tagged macOS Rust releases require a stable Developer ID code identity", async () => {
+  const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
+  const signer = await readFile(join(ROOT, "scripts/sign-macos-release.sh"), "utf8");
+  assert.match(release, /Sign tagged macOS release identity/);
+  assert.match(release, /startsWith\(github\.ref, 'refs\/tags\/v'\)/);
+  assert.match(release, /contains\(matrix\.target, 'apple-darwin'\)/);
+  assert.match(release, /HERDR_MACOS_CERT_P12_BASE64: \${{ secrets\.HERDR_MACOS_CERT_P12_BASE64 }}/);
+  assert.match(release, /HERDR_MACOS_CERT_PASSWORD: \${{ secrets\.HERDR_MACOS_CERT_PASSWORD }}/);
+  assert.match(release, /HERDR_MACOS_SIGNING_IDENTITY: \${{ secrets\.HERDR_MACOS_SIGNING_IDENTITY }}/);
+  assert.match(release, /HERDR_MACOS_TEAM_ID: \${{ vars\.HERDR_MACOS_TEAM_ID }}/);
+  assert.match(release, /scripts\/sign-macos-release\.sh/);
+  assert.match(signer, /STABLE_IDENTIFIER="dev\.herdr\.mcp"/);
+  assert.match(signer, /--options runtime/);
+  assert.match(signer, /--timestamp/);
+  assert.match(signer, /--identifier "\$STABLE_IDENTIFIER"/);
+  assert.match(signer, /TeamIdentifier is missing/);
+  assert.match(signer, /does not match expected/);
+  assert.match(signer, /designated requirement is still cdhash-bound/);
 });
 
 test("Rust GitHub Release provenance is tag-only and fail-closed before publish", async () => {

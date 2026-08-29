@@ -4,6 +4,8 @@ pub enum Command {
     Version,
     Status,
     Doctor,
+    DocumentsProbe,
+    HerdrSupervisor(HerdrSupervisorCommand),
     Scan {
         json: bool,
         refresh: bool,
@@ -23,6 +25,19 @@ pub enum Command {
         caller_origin: String,
     },
     Link(LinkCommand),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HerdrSupervisorCommand {
+    Install,
+    Status,
+    Enable,
+    Disable,
+    Start,
+    Stop,
+    Run,
+    RunOnce,
+    Uninstall,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -156,6 +171,8 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         ),
         "status" => no_extra(args, Command::Status),
         "doctor" => no_extra(args, Command::Doctor),
+        "__documents-probe" => no_extra(args, Command::DocumentsProbe),
+        "herdr-supervisor" => parse_herdr_supervisor(&args[1..]),
         "scan" => parse_scan(&args[1..]),
         "rollback" => no_extra(args, Command::Service(ServiceCommand::Rollback)),
         "uninstall" => no_extra(args, Command::Service(ServiceCommand::Uninstall)),
@@ -169,6 +186,23 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "link" => parse_link(&args[1..]),
         value => Err(format!("unknown command '{value}'\n\n{}", help())),
     }
+}
+
+fn parse_herdr_supervisor(args: &[String]) -> Result<Command, String> {
+    let command = match args {
+        [subcommand] if subcommand == "install" => HerdrSupervisorCommand::Install,
+        [subcommand] if subcommand == "status" => HerdrSupervisorCommand::Status,
+        [subcommand] if subcommand == "enable" => HerdrSupervisorCommand::Enable,
+        [subcommand] if subcommand == "disable" => HerdrSupervisorCommand::Disable,
+        [subcommand] if subcommand == "start" => HerdrSupervisorCommand::Start,
+        [subcommand] if subcommand == "stop" => HerdrSupervisorCommand::Stop,
+        [subcommand] if subcommand == "run" => HerdrSupervisorCommand::Run,
+        [subcommand] if subcommand == "run-once" => HerdrSupervisorCommand::RunOnce,
+        [subcommand] if subcommand == "uninstall" => HerdrSupervisorCommand::Uninstall,
+        [] => return Err("herdr-supervisor requires install, status, enable, disable, start, stop, run-once, or uninstall".to_owned()),
+        [subcommand, ..] => return Err(format!("invalid herdr-supervisor command or arguments for '{subcommand}'")),
+    };
+    Ok(Command::HerdrSupervisor(command))
 }
 
 fn parse_link(args: &[String]) -> Result<Command, String> {
@@ -524,6 +558,7 @@ Advanced / internal:\n\
   herdr-mcp version\n\
   herdr-mcp config [path|show|init]\n\
   herdr-mcp service <install [--adopt-node]|status|start|stop|restart|rollback|uninstall>\n\
+  herdr-mcp herdr-supervisor <install|status|enable|disable|start|stop|uninstall>\n\
   herdr-mcp link status\n\
   herdr-mcp link run\n\
   herdr-mcp link install\n\
@@ -572,6 +607,12 @@ mod tests {
         );
         assert_eq!(parse(args(&["status"])).unwrap().command, Command::Status);
         assert_eq!(parse(args(&["doctor"])).unwrap().command, Command::Doctor);
+        assert_eq!(
+            parse(args(&["herdr-supervisor", "status"]))
+                .unwrap()
+                .command,
+            Command::HerdrSupervisor(HerdrSupervisorCommand::Status)
+        );
         assert_eq!(
             parse(args(&["scan", "--json", "--probe"])).unwrap().command,
             Command::Scan {

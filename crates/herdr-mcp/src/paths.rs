@@ -56,16 +56,9 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     #[test]
     fn named_instance_uses_isolated_config_leaf_without_config_dir_override() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = crate::test_env::lock();
         let previous_instance = env::var_os("HERDR_MCP_INSTANCE");
         let previous_config = env::var_os("HERDR_MCP_CONFIG_DIR");
         let previous_xdg = env::var_os("XDG_CONFIG_HOME");

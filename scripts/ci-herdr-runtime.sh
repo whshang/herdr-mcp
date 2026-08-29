@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# ci-herdr-runtime.sh — bootstrap a real, pinned Herdr runtime on a GitHub-hosted
-# Ubuntu runner for the non-hermetic transport/regression tests.
+# ci-herdr-runtime.sh — bootstrap a real, pinned Herdr runtime for the
+# non-hermetic transport/regression tests on CI Linux or an isolated local macOS run.
 #
 # The transport tests (tests/transport.test.mjs) connect to a live Herdr over
 # HERDR_SOCKET_PATH (default ~/.config/herdr/herdr.sock) and assert herdr_inspect
-# returns a focused_workspace. On a fresh runner there is no pre-existing session,
-# so the CI server listens on that default socket and tests find it automatically.
+# returns a focused_workspace. The bootstrap workspace is deliberately non-Git:
+# Herdr 0.8.2 can block workspace creation on Git discovery, which must not make
+# the transport test fixture depend on repository metadata.
 #
 # We pin the exact release (v0.8.2) instead of the rolling `latest` installer for
 # reproducibility, and fail fast if the installed version differs.
@@ -15,13 +16,31 @@
 #   scripts/ci-herdr-runtime.sh stop    # stop the server we started (idempotent)
 #
 # Env overrides (only for isolated testing on a dev machine; CI uses defaults):
-#   HERDR_VERSION, HERDR_INSTALL_DIR, HERDR_STATE_DIR, HERDR_SOCKET
-# This script never starts a TUI and never touches a developer's default session
-# unless HERDR_STATE_DIR/HERDR_SOCKET are explicitly pointed at it.
+#   HERDR_VERSION, HERDR_INSTALL_DIR, HERDR_STATE_DIR, HERDR_SOCKET,
+#   HERDR_CI_WORKSPACE, XDG_CONFIG_HOME
+# Local callers must isolate Herdr's persisted state via XDG_CONFIG_HOME as well as
+# its socket. This script never starts a TUI and refuses the developer default state.
 set -euo pipefail
 
 : "${HERDR_VERSION:=0.8.2}"
-HERDR_ASSET="herdr-linux-x86_64"
+
+detect_asset() {
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+  case "${os}/${arch}" in
+    Linux/x86_64|Linux/amd64) printf '%s\n' 'herdr-linux-x86_64' ;;
+    Linux/aarch64|Linux/arm64) printf '%s\n' 'herdr-linux-aarch64' ;;
+    Darwin/arm64|Darwin/aarch64) printf '%s\n' 'herdr-macos-aarch64' ;;
+    Darwin/x86_64|Darwin/amd64) printf '%s\n' 'herdr-macos-x86_64' ;;
+    *)
+      printf '[ci-herdr] ERROR: unsupported host for pinned Herdr runtime: %s/%s\n' "$os" "$arch" >&2
+      return 1
+      ;;
+  esac
+}
+
+HERDR_ASSET="${HERDR_ASSET:-$(detect_asset)}"
 HERDR_URL="https://github.com/herdrdev/herdr/releases/download/v${HERDR_VERSION}/${HERDR_ASSET}"
 INSTALL_DIR="${HERDR_INSTALL_DIR:-$HOME/.local/bin}"
 HERDR_BIN="${INSTALL_DIR}/herdr"
@@ -30,6 +49,7 @@ HERDR_BIN="${INSTALL_DIR}/herdr"
 STATE_DIR="${HERDR_STATE_DIR:-$HOME/.config/herdr}"
 SOCKET="${HERDR_SOCKET:-${STATE_DIR}/herdr.sock}"
 PID_FILE="${STATE_DIR}/ci-server.pid"
+CI_WORKSPACE="${HERDR_CI_WORKSPACE:-${STATE_DIR}/ci-workspace}"
 
 log() { printf '[ci-herdr] %s\n' "$*" >&2; }
 err() { printf '[ci-herdr] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -57,16 +77,85 @@ install_herdr() {
   log "installed herdr ${installed} to ${HERDR_BIN}"
 }
 
+server_pid_identity_ok() {
+  local pid="$1"
+  local command=""
+  command="$(ps -p "${pid}" -o command= 2>/dev/null || true)"
+  case "${command}" in
+    "${HERDR_BIN} server"|"${HERDR_BIN} server "*) return 0 ;;
+    *)
+      log "refusing process mutation: pid=${pid} command=${command:-<missing>} expected=${HERDR_BIN} server"
+      return 1
+      ;;
+  esac
+}
+
+terminate_exact_server_pid() {
+  local pid="$1"
+  local i
+  kill -0 "${pid}" 2>/dev/null || return 0
+  server_pid_identity_ok "${pid}" || return 1
+  log "pid ${pid} still alive; sending TERM"
+  kill -TERM "${pid}" 2>/dev/null || true
+  for i in $(seq 1 20); do
+    kill -0 "${pid}" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  server_pid_identity_ok "${pid}" || return 1
+  log "pid ${pid} still alive after TERM; sending KILL"
+  kill -KILL "${pid}" 2>/dev/null || true
+  for i in $(seq 1 20); do
+    kill -0 "${pid}" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  log "pid ${pid} remained alive after KILL"
+  return 1
+}
+
+create_workspace_bounded() {
+  local stdout_file="${STATE_DIR}/ci-workspace-create.out"
+  local stderr_file="${STATE_DIR}/ci-workspace-create.err"
+  local workspace_pid status i
+  rm -f "${stdout_file}" "${stderr_file}"
+  HERDR_SOCKET_PATH="${SOCKET}" "${HERDR_BIN}" workspace create \
+    --cwd "${CI_WORKSPACE}" --label "ci" --focus \
+    >"${stdout_file}" 2>"${stderr_file}" &
+  workspace_pid=$!
+  for i in $(seq 1 40); do
+    if ! kill -0 "${workspace_pid}" 2>/dev/null; then
+      if wait "${workspace_pid}"; then
+        cat "${stdout_file}"
+        return 0
+      else
+        status=$?
+        tail -n 25 "${stderr_file}" >&2 || true
+        return "${status}"
+      fi
+    fi
+    sleep 0.25
+  done
+  log "workspace create exceeded 10s; terminating exact pid=${workspace_pid}"
+  kill -TERM "${workspace_pid}" 2>/dev/null || true
+  for i in $(seq 1 10); do
+    kill -0 "${workspace_pid}" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "${workspace_pid}" 2>/dev/null; then
+    kill -KILL "${workspace_pid}" 2>/dev/null || true
+  fi
+  wait "${workspace_pid}" 2>/dev/null || true
+  tail -n 25 "${stderr_file}" >&2 || true
+  return 124
+}
+
 start_server() {
-  # GitHub-hosted CI intentionally uses the default state/socket path because
-  # the job starts without a developer Herdr session. Local runs must opt into
-  # an isolated state directory or socket explicitly. Otherwise `stop` would
-  # target the developer's live default session and terminate its pane
-  # processes when the test trap exits.
-  if [ "${GITHUB_ACTIONS:-}" != "true" ] \
-      && [ -z "${HERDR_STATE_DIR+x}" ] \
-      && [ -z "${HERDR_SOCKET+x}" ]; then
-    err "local start requires isolated HERDR_STATE_DIR or HERDR_SOCKET; refusing the default developer Herdr session"
+  # GitHub-hosted CI starts from an empty machine. Local runs must isolate both
+  # persisted Herdr state and the socket so workspace creation cannot observe or
+  # mutate the developer's live session.
+  if [ "${GITHUB_ACTIONS:-}" != "true" ]; then
+    [ -n "${XDG_CONFIG_HOME:-}" ] || err "local start requires isolated XDG_CONFIG_HOME"
+    [ "${STATE_DIR}" = "${XDG_CONFIG_HOME}/herdr" ] || err "local HERDR_STATE_DIR must equal XDG_CONFIG_HOME/herdr"
+    [ "${SOCKET}" = "${STATE_DIR}/herdr.sock" ] || err "local HERDR_SOCKET must equal HERDR_STATE_DIR/herdr.sock"
   fi
   install_herdr
   # Export the install dir for this and all later runner steps (GITHUB_PATH
@@ -79,7 +168,7 @@ start_server() {
     *) export PATH="${INSTALL_DIR}:${PATH}" ;;
   esac
   log "starting headless herdr server (socket=${SOCKET})"
-  mkdir -p "${STATE_DIR}"
+  mkdir -p "${STATE_DIR}" "${CI_WORKSPACE}"
   rm -f "${PID_FILE}"
   # `herdr server` is intentionally a foreground headless server. Start it as a
   # real background child for CI; otherwise this script blocks here forever and
@@ -114,9 +203,12 @@ start_server() {
   # Create and focus a workspace rooted at the checkout so inspect/snapshot has a
   # focused_workspace on first run; on re-runs an existing one just gets focused.
   local ws
-  ws="$(HERDR_SOCKET_PATH="${SOCKET}" "${HERDR_BIN}" workspace create \
-        --cwd "${GITHUB_WORKSPACE:-$PWD}" --label "ci" --focus 2>/dev/null || true)"
-  log "workspace create/focus: ${ws:-<idempotent/focused>}"
+  if ! ws="$(create_workspace_bounded)"; then
+    log "server.log tail after workspace create failure:"
+    tail -n 25 "${STATE_DIR}/ci-server.log" >&2 || true
+    err "Herdr workspace create did not complete successfully within its 10s budget"
+  fi
+  log "workspace create/focus: ${ws:-<focused>}"
   # Final reachability confirmation.
   HERDR_SOCKET_PATH="${SOCKET}" "${HERDR_BIN}" status server --json >/dev/null 2>&1 \
     || err "server not reachable after workspace setup"
@@ -124,49 +216,42 @@ start_server() {
 }
 
 stop_server() {
-  if [ "${GITHUB_ACTIONS:-}" != "true" ] \
-      && [ -z "${HERDR_STATE_DIR+x}" ] \
-      && [ -z "${HERDR_SOCKET+x}" ]; then
-    err "local stop requires isolated HERDR_STATE_DIR or HERDR_SOCKET; refusing the default developer Herdr session"
+  if [ "${GITHUB_ACTIONS:-}" != "true" ]; then
+    [ -n "${XDG_CONFIG_HOME:-}" ] || err "local stop requires isolated XDG_CONFIG_HOME"
+    [ "${STATE_DIR}" = "${XDG_CONFIG_HOME}/herdr" ] || err "local HERDR_STATE_DIR must equal XDG_CONFIG_HOME/herdr"
+    [ "${SOCKET}" = "${STATE_DIR}/herdr.sock" ] || err "local HERDR_SOCKET must equal HERDR_STATE_DIR/herdr.sock"
   fi
   local server_pid=""
   if [ -f "${PID_FILE}" ]; then
     server_pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
   fi
-  if [ -x "${HERDR_BIN}" ]; then
-    log "stopping herdr server (socket=${SOCKET})"
-    HERDR_SOCKET_PATH="${SOCKET}" "${HERDR_BIN}" server stop >/dev/null 2>&1 || true
-  fi
-  # Validate the pidfile content is a positive integer before acting on it.
+  # Never call generic `herdr server stop` here: an environment/socket mistake
+  # could terminate the developer's real Herdr session. Only the exact PID
+  # recorded immediately after this script's spawn is eligible for mutation.
   if printf '%s\n' "${server_pid}" | grep -Eq '^[0-9]+$' && [ "${server_pid}" -gt 0 ] \
       && kill -0 "${server_pid}" 2>/dev/null; then
-    # Grace period for the socket-level stop, then TERM, then KILL — bounding all
-    # signals to the exact CI child we spawned. Never a broad pkill on shared
-    # runners.
-    local i
-    for i in $(seq 1 20); do
-      kill -0 "${server_pid}" 2>/dev/null || break
-      sleep 0.25
-    done
-    if kill -0 "${server_pid}" 2>/dev/null; then
-      log "pid ${server_pid} still alive; sending TERM"
-      kill -TERM "${server_pid}" 2>/dev/null || true
-      for i in $(seq 1 10); do
-        kill -0 "${server_pid}" 2>/dev/null || break
-        sleep 0.25
-      done
-      if kill -0 "${server_pid}" 2>/dev/null; then
-        log "pid ${server_pid} still alive after TERM; sending KILL"
-        kill -KILL "${server_pid}" 2>/dev/null || true
-      fi
+    if ! terminate_exact_server_pid "${server_pid}"; then
+      err "refusing to remove PID evidence for an unverified or unreaped Herdr process"
     fi
   fi
   rm -f "${PID_FILE}"
-  log "herdr server stopped"
+  log "isolated Herdr server stopped"
 }
 
 case "${1:-}" in
-  start) start_server ;;
+  start)
+    start_cleanup() {
+      local status=$?
+      trap - EXIT
+      if [ "${status}" -ne 0 ]; then
+        stop_server || true
+      fi
+      exit "${status}"
+    }
+    trap start_cleanup EXIT
+    start_server
+    trap - EXIT
+    ;;
   stop)  stop_server ;;
   *) err "usage: $0 start|stop" ;;
 esac

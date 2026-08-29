@@ -13,8 +13,6 @@ use crate::config::{Config, UpdateChannel};
 use crate::contract;
 use crate::paths::RuntimePaths;
 use crate::release_trust::{self, ReleaseIdentity};
-#[cfg(target_os = "macos")]
-use crate::service_manager;
 use crate::state_store::SCHEMA_VERSION;
 use crate::updater_store::{UpdateJobRecord, UpdateStore};
 use reqwest::blocking::{Client, Response};
@@ -253,7 +251,7 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
             now_ms_i64(),
         )?;
 
-        let install = service_manager::run(ServiceCommand::Install { adopt_node: false });
+        let install = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false });
         let succeeded = matches!(install, Ok(code) if code == ExitCode::SUCCESS);
         if succeeded {
             if let Err(error) = crate::native_host_install::sync_owned_runtime_from_active() {

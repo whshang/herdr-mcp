@@ -1,12 +1,13 @@
+use crate::child_process;
 use crate::fs_security;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value, json};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -20,6 +21,7 @@ const GREP_MAX_MATCHES: usize = 1000;
 const GREP_DEFAULT_FILE_BYTES: u64 = 64 * 1024;
 const GREP_MAX_FILE_BYTES: u64 = 1024 * 1024;
 const GREP_COMPACT_AFTER: usize = 24;
+const GREP_RG_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn read(snapshot: &Value, args: &Value) -> Value {
     let path = match required_str(args, "path") {
@@ -290,8 +292,8 @@ fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Val
         LineMatcher::Literal(pattern.to_owned())
     };
 
-    if let Some(rg_path) = rg.as_deref()
-        && let Some((matches, truncated)) = try_grep_rg(&GrepRgOptions {
+    if let Some(rg_path) = rg.as_deref() {
+        match try_grep_rg(&GrepRgOptions {
             rg: rg_path,
             search_root: &managed.real,
             pattern,
@@ -300,16 +302,30 @@ fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Val
             glob,
             max_matches,
             max_bytes,
-        })
-    {
-        return finish_grep_result(
-            &managed.resolved,
-            matches,
-            truncated,
-            "rg",
-            started_at_ms,
-            started.elapsed().as_millis() as u64,
-        );
+            timeout: GREP_RG_TIMEOUT,
+        }) {
+            GrepRgOutcome::Complete { matches, truncated } => {
+                return finish_grep_result(
+                    &managed.resolved,
+                    matches,
+                    truncated,
+                    "rg",
+                    started_at_ms,
+                    started.elapsed().as_millis() as u64,
+                );
+            }
+            GrepRgOutcome::TimedOut { pid } => {
+                return json!({
+                    "ok": false,
+                    "code": "grep_timeout",
+                    "message": format!("rg command timed out after {}ms", GREP_RG_TIMEOUT.as_millis()),
+                    "root": managed.resolved.to_string_lossy(),
+                    "pid": pid,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                });
+            }
+            GrepRgOutcome::Unavailable => {}
+        }
     }
 
     let mut matches = Vec::new();
@@ -482,9 +498,21 @@ struct GrepRgOptions<'a> {
     glob: Option<&'a str>,
     max_matches: usize,
     max_bytes: u64,
+    timeout: Duration,
 }
 
-fn try_grep_rg(options: &GrepRgOptions<'_>) -> Option<(Vec<Value>, bool)> {
+enum GrepRgOutcome {
+    Complete {
+        matches: Vec<Value>,
+        truncated: bool,
+    },
+    TimedOut {
+        pid: u32,
+    },
+    Unavailable,
+}
+
+fn try_grep_rg(options: &GrepRgOptions<'_>) -> GrepRgOutcome {
     let mut args = vec![
         "--line-number".to_owned(),
         "--no-heading".to_owned(),
@@ -506,76 +534,104 @@ fn try_grep_rg(options: &GrepRgOptions<'_>) -> Option<(Vec<Value>, bool)> {
     args.push(options.pattern.to_owned());
     args.push(".".to_owned());
 
-    let mut child = Command::new(options.rg)
+    let mut command = Command::new(options.rg);
+    command
         .args(&args)
         .current_dir(options.search_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let stdout = child.stdout.take()?;
-    let mut matches = Vec::new();
-    let mut truncated = false;
-    let mut total_bytes = 0u64;
-    let stdout_ceiling = options.max_bytes.saturating_mul(8);
-    {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            let Ok(line) = line else {
-                break;
-            };
-            total_bytes = total_bytes
-                .saturating_add(line.len() as u64)
-                .saturating_add(1);
-            if total_bytes > stdout_ceiling {
-                truncated = true;
-                let _ = child.kill();
-                break;
+        .stderr(Stdio::null());
+    child_process::configure_process_group(&mut command);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return GrepRgOutcome::Unavailable,
+    };
+    let _registration = child_process::register_owned_child("rg", &child);
+    let pid = child.id();
+    let Some(mut stdout) = child.stdout.take() else {
+        child_process::terminate_and_reap(&mut child);
+        return GrepRgOutcome::Unavailable;
+    };
+    let stdout_ceiling = options.max_bytes.saturating_mul(8).min(8 * 1024 * 1024);
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::with_capacity((stdout_ceiling as usize).min(64 * 1024));
+        let mut buffer = [0_u8; 8192];
+        let retain_cap = stdout_ceiling.saturating_add(1) as usize;
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if output.len() < retain_cap {
+                        let keep = count.min(retain_cap - output.len());
+                        output.extend_from_slice(&buffer[..keep]);
+                    }
+                }
+                Err(_) => break,
             }
-            if line.trim().is_empty() {
-                continue;
-            }
-            if matches.len() >= options.max_matches {
-                truncated = true;
-                let _ = child.kill();
-                break;
-            }
-            let Some((file, line_no, content)) = parse_rg_line(&line) else {
-                continue;
-            };
-            if content.len() as u64 > options.max_bytes {
-                truncated = true;
-                continue;
-            }
-            let file_path = PathBuf::from(&file);
-            let abs = if file_path.is_absolute() {
-                file_path
-            } else {
-                options.search_root.join(file_path)
-            };
-            if !fs_security::path_within(options.search_root, &abs)
-                || fs_security::denied_secret_path(&abs)
-            {
-                continue;
-            }
-            if fs::metadata(&abs).is_ok_and(|metadata| metadata.len() > options.max_bytes) {
-                truncated = true;
-                continue;
-            }
-            matches.push(json!({
-                "file": abs.to_string_lossy(),
-                "line": line_no,
-                "content": content,
-            }));
         }
+        output
+    });
+
+    let status = match child_process::wait_bounded(&mut child, options.timeout) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            let _ = reader.join();
+            return GrepRgOutcome::TimedOut { pid };
+        }
+        Err(_) => {
+            child_process::terminate_and_reap(&mut child);
+            let _ = reader.join();
+            return GrepRgOutcome::Unavailable;
+        }
+    };
+    let output = match reader.join() {
+        Ok(output) => output,
+        Err(_) => return GrepRgOutcome::Unavailable,
+    };
+    if status.code() != Some(0) && status.code() != Some(1) {
+        return GrepRgOutcome::Unavailable;
     }
-    let status = child.wait().ok()?;
-    if truncated || status.code() == Some(0) || status.code() == Some(1) {
-        Some((matches, truncated))
-    } else {
-        None
+
+    let mut matches = Vec::new();
+    let mut truncated = output.len() as u64 > stdout_ceiling;
+    let retained = &output[..output.len().min(stdout_ceiling as usize)];
+    for line in String::from_utf8_lossy(retained).lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if matches.len() >= options.max_matches {
+            truncated = true;
+            break;
+        }
+        let Some((file, line_no, content)) = parse_rg_line(line) else {
+            continue;
+        };
+        if content.len() as u64 > options.max_bytes {
+            truncated = true;
+            continue;
+        }
+        let file_path = PathBuf::from(&file);
+        let abs = if file_path.is_absolute() {
+            file_path
+        } else {
+            options.search_root.join(file_path)
+        };
+        if !fs_security::path_within(options.search_root, &abs)
+            || fs_security::denied_secret_path(&abs)
+        {
+            continue;
+        }
+        if fs::metadata(&abs).is_ok_and(|metadata| metadata.len() > options.max_bytes) {
+            truncated = true;
+            continue;
+        }
+        matches.push(json!({
+            "file": abs.to_string_lossy(),
+            "line": line_no,
+            "content": content,
+        }));
     }
+    GrepRgOutcome::Complete { matches, truncated }
 }
 
 fn parse_rg_line(line: &str) -> Option<(String, usize, String)> {
@@ -980,6 +1036,46 @@ mod tests {
         let regex = glob_regex("*.rs").unwrap();
         assert!(regex.is_match("main.rs"));
         assert!(!regex.is_match("main.ts"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rg_timeout_reaps_the_exact_child() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static NEXT_FAKE_RG: AtomicU64 = AtomicU64::new(0);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sequence = NEXT_FAKE_RG.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-rg-timeout-{}-{unique}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let fake_rg = root.join("rg");
+        fs::write(&fake_rg, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&fake_rg, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let outcome = try_grep_rg(&GrepRgOptions {
+            rg: &fake_rg,
+            search_root: &root,
+            pattern: "needle",
+            regex_mode: false,
+            case_insensitive: false,
+            glob: None,
+            max_matches: 10,
+            max_bytes: 1024,
+            timeout: Duration::from_millis(30),
+        });
+        let GrepRgOutcome::TimedOut { pid } = outcome else {
+            panic!("expected timed-out fake rg");
+        };
+        assert!(unsafe { libc::kill(pid as i32, 0) } != 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

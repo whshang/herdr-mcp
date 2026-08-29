@@ -902,6 +902,7 @@ mod tests {
 
     #[test]
     fn execute_requires_env_guard_and_dry_run_stays_non_mutating() {
+        let _env_guard = crate::test_env::lock();
         let home = test_home();
         setup_managed_runtime(&home);
         let config_dir = home.join(".config/herdr-mcp");

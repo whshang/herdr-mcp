@@ -732,6 +732,7 @@ mod tests {
 
     #[test]
     fn gate_catalog_keeps_production_ready_false() {
+        let _env_guard = crate::test_env::lock();
         let root = env::temp_dir().join(format!(
             "herdr-link-catalog-{}-{}",
             std::process::id(),

@@ -160,6 +160,7 @@ mod tests {
     where
         F: FnOnce(),
     {
+        let _env_guard = crate::test_env::lock();
         let root = std::env::temp_dir().join(format!(
             "herdr-runtime-meta-{}-{}",
             std::process::id(),

@@ -16,6 +16,9 @@ pub const DEFAULT_WATCHDOG_LABEL: &str = "dev.herdr-mcp.watchdog";
 /// Rust-era health sidecar label (default instance).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const DEFAULT_HEALTH_WATCHDOG_LABEL: &str = "dev.herdr-mcp.health-watchdog";
+/// Herdr dependency supervisor (default production instance only).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const DEFAULT_HERDR_SUPERVISOR_LABEL: &str = "dev.herdr-mcp.herdr-supervisor";
 pub const DEFAULT_RUNTIME_PORT: u16 = 8772;
 pub const DEFAULT_CONFIG_LEAF: &str = "herdr-mcp";
 

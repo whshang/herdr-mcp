@@ -11,6 +11,15 @@ const root = process.env.HERDR_BENCH_ROOT ?? process.cwd();
 const outputPath = process.env.HERDR_BENCH_OUT ?? join(root, 'docs', 'benchmarks', 'tool-performance-latest.json');
 const baseCommit = process.env.HERDR_BENCH_BASE_COMMIT ?? 'baseline';
 const candidateCommit = process.env.HERDR_BENCH_CANDIDATE_COMMIT ?? 'candidate';
+const requestTimeoutMs = Number(process.env.HERDR_BENCH_TIMEOUT_MS ?? '5000');
+const sampleScale = Number(process.env.HERDR_BENCH_SAMPLE_SCALE ?? '1');
+
+if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs < 100 || requestTimeoutMs > 60_000) {
+  throw new Error('HERDR_BENCH_TIMEOUT_MS must be between 100 and 60000');
+}
+if (!Number.isFinite(sampleScale) || sampleScale <= 0 || sampleScale > 10) {
+  throw new Error('HERDR_BENCH_SAMPLE_SCALE must be greater than 0 and at most 10');
+}
 
 if (!token) {
   throw new Error('HERDR_BENCH_TOKEN is required');
@@ -26,16 +35,22 @@ async function callTool(url, name, args) {
     params: { name, arguments: args },
   });
   const started = performance.now();
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${token}`,
-      'content-type': 'application/json',
-      accept: 'application/json',
-      'user-agent': 'openai-mcp/herdr-benchmark',
-    },
-    body,
-  });
+  let response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+        accept: 'application/json',
+        'user-agent': 'openai-mcp/herdr-benchmark',
+      },
+      body,
+      signal: AbortSignal.timeout(requestTimeoutMs),
+    });
+  } catch (error) {
+    throw new Error(`${name} request failed for ${url} within ${requestTimeoutMs}ms: ${error?.message ?? error}`);
+  }
   const text = await response.text();
   const elapsedMs = performance.now() - started;
   if (!response.ok) {
@@ -114,7 +129,8 @@ for (const [label, url] of [['baseline', baseUrl], ['candidate', candidateUrl]])
 const results = {};
 for (const spec of specs) {
   const buckets = { baseline: [], candidate: [] };
-  for (let index = 0; index < spec.samples; index += 1) {
+  const sampleCount = Math.max(1, Math.ceil(spec.samples * sampleScale));
+  for (let index = 0; index < sampleCount; index += 1) {
     const order = index % 2 === 0
       ? [['baseline', baseUrl], ['candidate', candidateUrl]]
       : [['candidate', candidateUrl], ['baseline', baseUrl]];
@@ -143,6 +159,8 @@ const report = {
   methodology: {
     transport: 'loopback MCP HTTP tools/call, openai-mcp stateless client',
     ordering: 'alternating baseline/candidate per sample',
+    request_timeout_ms: requestTimeoutMs,
+    sample_scale: sampleScale,
     note: 'Local server timings isolate Rust/tool-path work; real Connector/model latency is measured separately after self-upgrade.',
   },
   cold_methods: cold,
