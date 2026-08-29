@@ -1,8 +1,12 @@
 # herdr-mcp
 
-**让 ChatGPT / Web AI 安全连接到你的本地 Herdr 工作站。**
+**把你已经拥有的 ChatGPT / Web AI 推理额度，变成一个持续存在的本地开发环境。**
 
-ChatGPT 负责规划和判断，Herdr 保留真实工作现场，herdr-mcp 把网页模型与本地文件、Git、Shell、长期任务和 Agent 连接起来。
+Web AI 订阅往往提供比 API 或本地 Coding Agent 工作流更充裕的可用推理额度，而 MCP 又让网页模型第一次可以用标准方式调用你自己的机器。Herdr-MCP 从这个机会出发，不要求你为了远程开发再购买一套模型能力。
+
+**MCP 让 Web AI 有了操作本机的双手；Herdr 给这些双手一个持续存在的工作现场；可选浏览器扩展再把本地变化接回 Web 对话。**
+
+ChatGPT 可以直接读改代码、操作 Git、执行命令和测试，也可以把长任务交给本地 Coding Agent。Herdr 让 workspace、终端、进程和 Agent 独立于任何单个 ChatGPT 对话持续存在，因此并行工作和长对话接力都不需要重建本地现场。
 
 **文档：** https://whshang.github.io/herdr-mcp/ · **源码：** https://github.com/whshang/herdr-mcp
 

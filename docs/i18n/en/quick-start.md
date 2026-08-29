@@ -8,6 +8,12 @@
 
 This page is the shortest path from “I have Herdr locally” to “ChatGPT can inspect my workstation and keep working after the current browser turn ends.”
 
+The product model is deliberately simple:
+
+> **MCP gives Web AI hands. Herdr gives those hands a persistent workplace. The browser extension is the optional return path that closes the loop.**
+
+You do not need the extension to read or modify files, use Git, run commands, inspect workspaces, or delegate to local agents. Install it when you want local completion events, browser recovery, or long-conversation handoff to reconnect work to the Web conversation.
+
 ## What you are building
 
 ```text
