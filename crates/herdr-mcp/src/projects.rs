@@ -7,7 +7,6 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-const GIT_TOPLEVEL_TIMEOUT: Duration = Duration::from_secs(1);
 const GIT_STATUS_TIMEOUT: Duration = Duration::from_millis(750);
 const GIT_OUTPUT_LIMIT: usize = 1024 * 1024;
 
@@ -208,12 +207,7 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
         }
     }
 
-    let output = run_git(cwd, &["rev-parse", "--show-toplevel"], GIT_TOPLEVEL_TIMEOUT)?;
-    if !output.success {
-        return None;
-    }
-    let root = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (!root.is_empty()).then(|| PathBuf::from(root))
+    None
 }
 
 fn git_statuses(roots: &[PathBuf]) -> HashMap<PathBuf, (bool, usize)> {
@@ -395,6 +389,26 @@ mod tests {
         assert_eq!(routed_project.pane_ids, vec!["w1:p1"]);
         assert_eq!(routing.pane_to_workspace["w1:p1"], "w1");
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn routing_handles_non_repo_cwd_without_git_fallback() {
+        let root = temp_dir();
+        let nested = root.join("plain/nested");
+        fs::create_dir_all(&nested).unwrap();
+        let snapshot = json!({
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": nested.to_string_lossy()
+            }],
+            "agents": []
+        });
+        let routing = derive_routing(&snapshot);
+        let project = routing.projects.get(&nested).unwrap();
+        assert_eq!(project.vcs, None);
+        assert!(!project.managed);
         fs::remove_dir_all(root).unwrap();
     }
 }
