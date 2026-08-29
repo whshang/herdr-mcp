@@ -10,11 +10,13 @@ use crate::paths::RuntimePaths;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_AGENT_MANIFESTS: usize = 256;
+const MAX_PARALLEL_AGENT_PROBES: usize = 4;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ScanOptions {
@@ -48,11 +50,22 @@ struct ScanReport {
     manifest_count: usize,
     herdr_start_kind_count: usize,
     cache_hits: usize,
+    probe_misses: usize,
+    probe_parallelism: usize,
     inventory_updated: bool,
     inventory_path: String,
     agents: Vec<AgentCapabilityRecord>,
     live_instances: Vec<LiveAgentInstance>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ScanJob {
+    agent: String,
+    manifest: Value,
+    binary: Option<PathBuf>,
+    herdr_startable: Option<bool>,
+    fingerprint: String,
 }
 
 pub fn run(options: ScanOptions) -> Result<ExitCode, String> {
@@ -115,6 +128,7 @@ pub fn run(options: ScanOptions) -> Result<ExitCode, String> {
     let existing_records = CapabilityInventoryStore::load_existing(&paths.config_dir)?;
     let mut cache_hits = 0_usize;
     let mut records = Vec::with_capacity(discovered_agents.len());
+    let mut probe_jobs = Vec::new();
     for agent in discovered_agents {
         let manifest = manifest_by_agent.get(&agent).unwrap_or(&Value::Null);
         let herdr_startable = start_kind_set.as_ref().map(|kinds| kinds.contains(&agent));
@@ -130,16 +144,21 @@ pub fn run(options: ScanOptions) -> Result<ExitCode, String> {
             records.push(cached);
             continue;
         }
-        records.push(scan_agent(
-            &agent,
-            manifest,
-            binary.as_deref(),
+        probe_jobs.push(ScanJob {
+            agent,
+            manifest: manifest.clone(),
+            binary,
             herdr_startable,
             fingerprint,
-            requested_level,
-            observed_at_ms,
-        ));
+        });
     }
+    let probe_misses = probe_jobs.len();
+    let probe_parallelism = probe_misses.min(MAX_PARALLEL_AGENT_PROBES);
+    records.extend(scan_jobs_bounded(
+        &probe_jobs,
+        requested_level,
+        observed_at_ms,
+    )?);
     records.sort_by(|left, right| left.agent.cmp(&right.agent));
     let inventory_updated = records != existing_records;
     if inventory_updated {
@@ -154,6 +173,8 @@ pub fn run(options: ScanOptions) -> Result<ExitCode, String> {
         manifest_count: manifest_rows.len(),
         herdr_start_kind_count: declared_start_kinds.as_ref().map_or(0, Vec::len),
         cache_hits,
+        probe_misses,
+        probe_parallelism,
         inventory_updated,
         inventory_path: store.path().display().to_string(),
         agents: records,
@@ -170,6 +191,44 @@ pub fn run(options: ScanOptions) -> Result<ExitCode, String> {
         print_human(&report);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn scan_jobs_bounded(
+    jobs: &[ScanJob],
+    probe_level: ProbeLevel,
+    observed_at_ms: i64,
+) -> Result<Vec<AgentCapabilityRecord>, String> {
+    let mut records = Vec::with_capacity(jobs.len());
+    for chunk in jobs.chunks(MAX_PARALLEL_AGENT_PROBES) {
+        let batch = thread::scope(|scope| {
+            let handles = chunk
+                .iter()
+                .map(|job| {
+                    scope.spawn(move || {
+                        scan_agent(
+                            &job.agent,
+                            &job.manifest,
+                            job.binary.as_deref(),
+                            job.herdr_startable,
+                            job.fingerprint.clone(),
+                            probe_level,
+                            observed_at_ms,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| "capability probe worker panicked".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        records.extend(batch);
+    }
+    Ok(records)
 }
 
 fn scan_agent(
@@ -319,6 +378,8 @@ fn print_human(report: &ScanReport) {
     println!("manifests: {}", report.manifest_count);
     println!("Herdr start kinds: {}", report.herdr_start_kind_count);
     println!("cache hits: {}", report.cache_hits);
+    println!("probe misses: {}", report.probe_misses);
+    println!("probe parallelism: {}", report.probe_parallelism);
     println!("inventory updated: {}", report.inventory_updated);
     println!("inventory: {}", report.inventory_path);
     println!("agents:");
@@ -391,6 +452,25 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn probe_batches_never_exceed_the_parallelism_cap() {
+        let jobs = (0..11)
+            .map(|index| ScanJob {
+                agent: format!("agent-{index}"),
+                manifest: Value::Null,
+                binary: None,
+                herdr_startable: None,
+                fingerprint: format!("fp-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let sizes = jobs
+            .chunks(MAX_PARALLEL_AGENT_PROBES)
+            .map(<[ScanJob]>::len)
+            .collect::<Vec<_>>();
+        assert_eq!(sizes, vec![4, 4, 3]);
+        assert!(sizes.iter().all(|size| *size <= MAX_PARALLEL_AGENT_PROBES));
     }
 
     #[test]
