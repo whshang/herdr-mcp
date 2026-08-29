@@ -673,8 +673,12 @@ pub fn enriched_exec_path() -> String {
 fn shell_command(command: &str, id: &str) -> Command {
     let shell = resolve_exec_shell();
     let marker = process_marker(id);
+    // Keep the marked shell as the process-group leader for the full request.
+    // A bare `shell -lc "sleep 30"` may exec its final command, replacing argv[0]
+    // and making restart fencing unable to prove process ownership.
+    let wrapped = format!("{command}\n__herdr_mcp_exec_status=$?\nexit $__herdr_mcp_exec_status");
     let mut process = Command::new(&shell);
-    process.arg0(&marker).args(["-lc", command]);
+    process.arg0(&marker).args(["-lc", &wrapped]);
     process
 }
 
@@ -1352,6 +1356,7 @@ mod tests {
             .unwrap() as u32;
         #[cfg(unix)]
         {
+            thread::sleep(Duration::from_millis(50));
             assert!(process_has_marker(pid, id));
             assert_eq!(process_group_id(pid), Some(pid));
         }

@@ -1,10 +1,11 @@
+use crate::child_process;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const GIT_TOPLEVEL_TIMEOUT: Duration = Duration::from_secs(1);
 const GIT_STATUS_TIMEOUT: Duration = Duration::from_millis(750);
@@ -256,33 +257,28 @@ struct CommandOutput {
 }
 
 fn run_git(cwd: &Path, args: &[&str], timeout: Duration) -> Option<CommandOutput> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(cwd)
         .env("GIT_PAGER", "cat")
         .env("PAGER", "cat")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped());
+    child_process::configure_process_group(&mut command);
+    let mut child = command.spawn().ok()?;
+    let _registration = child_process::register_owned_child("git-topology", &child);
     let stdout = child.stdout.take()?;
     let stderr = child.stderr.take()?;
     let stdout_reader = thread::spawn(move || read_limited(stdout, GIT_OUTPUT_LIMIT));
     let stderr_reader = thread::spawn(move || read_limited(stderr, 64 * 1024));
-    let started = Instant::now();
-
-    let status = loop {
-        match child.try_wait().ok()? {
-            Some(status) => break status,
-            None if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return None;
-            }
-            None => thread::sleep(Duration::from_millis(10)),
+    let status = match child_process::wait_bounded(&mut child, timeout).ok()? {
+        Some(status) => status,
+        None => {
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return None;
         }
     };
 

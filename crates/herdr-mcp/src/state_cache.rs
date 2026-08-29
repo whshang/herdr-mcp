@@ -12,7 +12,8 @@ use time::format_description::well_known::Rfc3339;
 
 const EVENT_STREAM_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
 const FULL_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
-const RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(250);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const EVENT_POLL: Duration = Duration::from_millis(250);
 const DIGEST_HISTORY_MAX: usize = 2048;
 const INITIAL_DIGEST_TAIL: usize = 64;
@@ -914,6 +915,7 @@ impl Drop for EventCache {
 }
 
 fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
+    let mut reconnect_failures = 0_u32;
     while !shared.stop.load(Ordering::Acquire) {
         shared.stream_connected.store(false, Ordering::Release);
         shared.stream_live.store(false, Ordering::Release);
@@ -932,7 +934,10 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
             }
             Err(error) => {
                 set_last_error(&shared, error);
-                sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+                sleep_interruptible(
+                    &shared.stop,
+                    next_reconnect_backoff(&mut reconnect_failures),
+                );
                 continue;
             }
         }
@@ -947,7 +952,10 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
                 Ok(stream) => stream,
                 Err(error) => {
                     set_last_error(&shared, error.to_string());
-                    sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+                    sleep_interruptible(
+                        &shared.stop,
+                        next_reconnect_backoff(&mut reconnect_failures),
+                    );
                     continue;
                 }
             };
@@ -964,7 +972,10 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
             Ok(stream) => stream,
             Err(error) => {
                 set_last_error(&shared, error.to_string());
-                sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+                sleep_interruptible(
+                    &shared.stop,
+                    next_reconnect_backoff(&mut reconnect_failures),
+                );
                 continue;
             }
         };
@@ -974,13 +985,19 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
         if let Err(error) = discard_initial_replay(&mut topology_stream, &shared.stop) {
             shared.stream_connected.store(false, Ordering::Release);
             set_last_error(&shared, error);
-            sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+            sleep_interruptible(
+                &shared.stop,
+                next_reconnect_backoff(&mut reconnect_failures),
+            );
             continue;
         }
         if let Err(error) = discard_initial_replay(&mut status_stream, &shared.stop) {
             shared.stream_connected.store(false, Ordering::Release);
             set_last_error(&shared, error);
-            sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+            sleep_interruptible(
+                &shared.stop,
+                next_reconnect_backoff(&mut reconnect_failures),
+            );
             continue;
         }
         if shared.stop.load(Ordering::Acquire) {
@@ -1001,7 +1018,10 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
             Err(error) => {
                 shared.stream_connected.store(false, Ordering::Release);
                 set_last_error(&shared, error);
-                sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+                sleep_interruptible(
+                    &shared.stop,
+                    next_reconnect_backoff(&mut reconnect_failures),
+                );
                 continue;
             }
         }
@@ -1026,13 +1046,17 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
                 Err(error) => {
                     shared.stream_connected.store(false, Ordering::Release);
                     set_last_error(&shared, error);
-                    sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+                    sleep_interruptible(
+                        &shared.stop,
+                        next_reconnect_backoff(&mut reconnect_failures),
+                    );
                     continue;
                 }
             }
         }
         clear_last_error(&shared);
         shared.stream_live.store(true, Ordering::Release);
+        reconnect_failures = 0;
         let mut full_snapshot_started = Instant::now();
 
         loop {
@@ -1115,8 +1139,20 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
         shared.stream_connected.store(false, Ordering::Release);
         shared.stream_live.store(false, Ordering::Release);
 
-        sleep_interruptible(&shared.stop, RECONNECT_BACKOFF);
+        sleep_interruptible(
+            &shared.stop,
+            next_reconnect_backoff(&mut reconnect_failures),
+        );
     }
+}
+
+fn next_reconnect_backoff(failures: &mut u32) -> Duration {
+    let shift = (*failures).min(5);
+    *failures = failures.saturating_add(1);
+    let multiplier = 1_u32 << shift;
+    RECONNECT_BACKOFF_MIN
+        .saturating_mul(multiplier)
+        .min(RECONNECT_BACKOFF_MAX)
 }
 
 fn replace_status_stream(
@@ -1325,6 +1361,39 @@ fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_backoff_is_exponential_and_capped() {
+        let mut failures = 0;
+        assert_eq!(
+            next_reconnect_backoff(&mut failures),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            next_reconnect_backoff(&mut failures),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            next_reconnect_backoff(&mut failures),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            next_reconnect_backoff(&mut failures),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            next_reconnect_backoff(&mut failures),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            next_reconnect_backoff(&mut failures),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            next_reconnect_backoff(&mut failures),
+            Duration::from_secs(5)
+        );
+    }
 
     fn fixture() -> Value {
         json!({

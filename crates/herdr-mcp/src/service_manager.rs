@@ -26,6 +26,21 @@ pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
     }
 }
 
+/// Return the managed Rust binary targeted by the current ready rollback.
+/// This is read-only preflight data; `rollback()` independently revalidates the
+/// ledger and target immediately before mutation.
+pub fn rollback_target_runtime_binary() -> Result<Option<std::path::PathBuf>, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(None)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos::rollback_target_runtime_binary()
+    }
+}
+
 /// Read-only service ownership snapshot for `doctor`. Never mutates launchd.
 pub fn doctor_status() -> Result<serde_json::Value, String> {
     #[cfg(not(target_os = "macos"))]
@@ -1910,6 +1925,38 @@ mod macos {
         }))
     }
 
+    pub(super) fn rollback_target_runtime_binary() -> Result<Option<PathBuf>, String> {
+        let paths = ServicePaths::discover()?;
+        let store = StateStore::open_in_dir(&paths.config_dir, "state")?;
+        let Some(rollback) = store.latest_ready_service_rollback()? else {
+            return Ok(None);
+        };
+        if rollback.source_kind != "rust" {
+            return Ok(None);
+        }
+        let target = rollback
+            .previous_current_target
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                "Rust rollback source has no previous runtime/current target".to_owned()
+            })?;
+        if !is_owned_generation_target(&target) {
+            return Err("rollback previous runtime/current target is not managed".to_owned());
+        }
+        let generation_id = generation_id_from_target(&target).ok_or_else(|| {
+            "Rust rollback source has no managed previous generation target".to_owned()
+        })?;
+        let binary = paths.generations_dir.join(generation_id).join("herdr-mcp");
+        if !binary.is_file() {
+            return Err(format!(
+                "rollback target runtime binary is missing: {}",
+                binary.display()
+            ));
+        }
+        Ok(Some(binary))
+    }
+
     fn rollback(
         paths: &ServicePaths,
         mutation_lock: &ServiceMutationLock,
@@ -2380,6 +2427,7 @@ mod macos {
             "HERDR_MCP_CONFIG_DIR".to_owned(),
             paths.config_dir.to_string_lossy().into_owned(),
         );
+        out.insert("HERDR_MCP_CHILD_REGISTRY".to_owned(), "1".to_owned());
         if let Some(name) = paths.instance.name() {
             out.insert("HERDR_MCP_INSTANCE".to_owned(), name.to_owned());
         }

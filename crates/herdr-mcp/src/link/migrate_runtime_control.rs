@@ -653,6 +653,7 @@ mod tests {
 
     #[test]
     fn apply_requires_env_guard_and_rewrites_live_control() {
+        let _env_guard = crate::test_env::lock();
         let home = test_home();
         setup_managed_runtime(&home, "rust-testhashmigrate03");
         let config_dir = home.join(".config").join("herdr-mcp");

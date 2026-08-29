@@ -1,5 +1,7 @@
 use crate::config::Config;
 use crate::herdr::HerdrClient;
+use crate::herdr_supervisor;
+use crate::macos_privacy;
 use crate::native_host_install;
 use crate::native_tools;
 use crate::paths::RuntimePaths;
@@ -102,6 +104,8 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         .unwrap_or_else(|| json!({"ok": false}));
     let inspect_healthy = inspect_result["ok"].as_bool() == Some(true);
     let event_cache = probe_event_cache(paths);
+    let documents_permission = macos_privacy::probe_documents_permission();
+    let code_identity = macos_privacy::probe_code_identity();
     println!("Herdr MCP doctor");
     print_check("runtime endpoint", runtime_healthy);
     print_check("Herdr local transport", report.herdr_transport_reachable);
@@ -110,6 +114,10 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     print_check("Herdr snapshot state", snapshot_healthy);
     print_check("Herdr inspect projection", inspect_healthy);
     print_check("Herdr event cache", event_cache.healthy);
+    println!("{}", documents_permission.doctor_line());
+    println!("{}", code_identity.doctor_line());
+    println!("{}", herdr_supervisor::doctor_line());
+    println!("{}", crate::child_process::doctor_line());
     print_layer_ownership(paths, config, &report);
     println!("INFO config {}", paths.config_file.display());
     println!("INFO state {}", paths.config_dir.display());
@@ -155,6 +163,7 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         && snapshot_healthy
         && inspect_healthy
         && event_cache.healthy
+        && documents_permission.doctor_pass()
 }
 
 /// Product-layer ownership map. Local probes always run. When Edge is

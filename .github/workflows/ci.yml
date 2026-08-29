@@ -18,41 +18,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
-      - name: Rust format
-        run: cargo fmt --check
-      - name: Rust lint
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Rust tests
-        run: cargo test --workspace
+      - name: Rust release gate
+        run: scripts/release-gate.sh rust
 
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
-      - run: npm run build
-      - name: Build documentation site
-        run: npm run build:site
-      - name: Start Herdr runtime (pinned, headless)
-        run: scripts/ci-herdr-runtime.sh start
-      - run: npm test
-      - run: npm run test:edge
-      - name: Browser extension smoke
-        run: node tests/manual/extension_smoke.mjs
-      - name: Shell syntax
-        run: bash -n bin/herdr-mcp bin/watchdog.sh bin/lib/i18n.sh scripts/ci-herdr-runtime.sh
-      - name: Package surface
-        run: npm pack --dry-run
-      - name: Diff hygiene
-        run: git diff --check
-      - name: Stop Herdr runtime
-        if: always()
-        run: scripts/ci-herdr-runtime.sh stop
+      - name: Node/docs/Edge release gate
+        run: scripts/release-gate.sh node
+      - name: Package and diff hygiene
+        run: scripts/release-gate.sh hygiene

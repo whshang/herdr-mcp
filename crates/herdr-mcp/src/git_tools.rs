@@ -1,10 +1,11 @@
+use crate::child_process;
 use crate::fs_security;
 use serde_json::{Map, Value, json};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const DEFAULT_MAX_BYTES: usize = 65_536;
 const MAX_BYTES: usize = 512_000;
@@ -547,16 +548,20 @@ fn run_git(
     budget: usize,
     timeout: Duration,
 ) -> Result<GitResult, String> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(cwd)
         .env("GIT_PAGER", "cat")
         .env("PAGER", "cat")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    child_process::configure_process_group(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|error| format!("cannot start git: {error}"))?;
+    let _registration = child_process::register_owned_child("git", &child);
     let stdout = child
         .stdout
         .take()
@@ -567,21 +572,17 @@ fn run_git(
         .ok_or_else(|| "git stderr unavailable".to_owned())?;
     let stdout_reader = thread::spawn(move || read_capped(stdout, budget.saturating_add(1)));
     let stderr_reader = thread::spawn(move || read_capped(stderr, 2001));
-    let started = Instant::now();
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|error| format!("cannot wait for git: {error}"))?
-        {
-            Some(status) => break status,
-            None if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err("git command timed out after 15s".to_owned());
-            }
-            None => thread::sleep(Duration::from_millis(10)),
+    let status = match child_process::wait_bounded(&mut child, timeout)
+        .map_err(|error| format!("cannot wait for git: {error}"))?
+    {
+        Some(status) => status,
+        None => {
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(format!(
+                "git command timed out after {}ms",
+                timeout.as_millis()
+            ));
         }
     };
     let stdout = stdout_reader.join().unwrap_or_default();

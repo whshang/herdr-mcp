@@ -13,35 +13,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace
-      - run: npm ci
-      - run: npm run build
-      - name: Build documentation site
-        run: npm run build:site
-      - name: Start Herdr runtime (pinned, headless)
-        run: scripts/ci-herdr-runtime.sh start
-      - run: npm test
-      - run: npm run test:edge
-      - name: Browser extension smoke
-        run: node tests/manual/extension_smoke.mjs
-      - name: Shell syntax
-        run: bash -n bin/herdr-mcp bin/watchdog.sh bin/lib/i18n.sh scripts/ci-herdr-runtime.sh
-      - name: Package surface
-        run: npm pack --dry-run
-      - name: Diff hygiene
-        run: git diff --check
-      - name: Stop Herdr runtime
-        if: always()
-        run: scripts/ci-herdr-runtime.sh stop
+      - name: Authoritative release gate
+        run: scripts/release-gate.sh full
 
   targets:
     runs-on: ubuntu-24.04
@@ -49,7 +29,7 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Load authoritative Rust release targets
         id: matrix
         shell: bash
@@ -67,13 +47,22 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned Rust toolchain
         shell: bash
         run: rustup toolchain install 1.97.1 --profile minimal --target "${{ matrix.target }}"
       - name: Build release binary
         shell: bash
         run: cargo build --locked --release -p herdr-mcp --target "${{ matrix.target }}"
+      - name: Sign tagged macOS release identity
+        if: startsWith(github.ref, 'refs/tags/v') && contains(matrix.target, 'apple-darwin')
+        shell: bash
+        env:
+          HERDR_MACOS_CERT_P12_BASE64: ${{ secrets.HERDR_MACOS_CERT_P12_BASE64 }}
+          HERDR_MACOS_CERT_PASSWORD: ${{ secrets.HERDR_MACOS_CERT_PASSWORD }}
+          HERDR_MACOS_SIGNING_IDENTITY: ${{ secrets.HERDR_MACOS_SIGNING_IDENTITY }}
+          HERDR_MACOS_TEAM_ID: ${{ vars.HERDR_MACOS_TEAM_ID }}
+        run: scripts/sign-macos-release.sh "target/${{ matrix.target }}/release/herdr-mcp"
       - name: Stage raw release asset
         shell: bash
         run: |
@@ -97,8 +86,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
       - uses: actions/download-artifact@v4

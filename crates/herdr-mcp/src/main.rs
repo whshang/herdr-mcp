@@ -5,6 +5,7 @@ mod capability_inventory;
 mod capability_probe;
 mod capability_resolver;
 mod capability_scan;
+mod child_process;
 mod cli;
 mod config;
 mod contract;
@@ -21,9 +22,11 @@ mod fs_security;
 mod fs_tools;
 mod git_tools;
 mod herdr;
+mod herdr_supervisor;
 mod inspect;
 mod instance;
 mod link;
+mod macos_privacy;
 mod mcp;
 mod mcp_http;
 mod mutation;
@@ -39,6 +42,7 @@ mod relay;
 mod release_trust;
 mod runtime_meta;
 mod schema;
+mod service_lifecycle;
 mod service_manager;
 mod skill;
 pub mod skill_dispatch;
@@ -46,6 +50,8 @@ mod snapshot;
 mod state_cache;
 mod state_store;
 mod status;
+#[cfg(test)]
+mod test_env;
 mod updater;
 mod updater_store;
 // Wired only from the macOS service manager; keep unit tests compiling on Linux CI.
@@ -102,6 +108,8 @@ fn run() -> Result<ExitCode, String> {
                 ExitCode::from(2)
             })
         }
+        cli::Command::DocumentsProbe => Ok(macos_privacy::run_documents_probe_child()),
+        cli::Command::HerdrSupervisor(command) => herdr_supervisor::run(command),
         cli::Command::Scan {
             json,
             refresh,
@@ -149,8 +157,11 @@ fn run() -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Dev { dry_run } => dev::run(dry_run),
-        cli::Command::Candidate { port } => mcp_http::serve_candidate(port),
-        cli::Command::Service(command) => service_manager::run(command),
+        cli::Command::Candidate { port } => {
+            eprintln!("{}", child_process::reap_confirmed_orphans_on_boot());
+            mcp_http::serve_candidate(port)
+        }
+        cli::Command::Service(command) => service_lifecycle::run(command),
         cli::Command::Update(command) => updater::run(command),
         cli::Command::NativeHost(command) => native_host_install::run(command),
         cli::Command::ExtensionHost { caller_origin } => native_host::run(&caller_origin),
