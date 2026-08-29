@@ -86,6 +86,15 @@ test("Rust release verification consumes the shared gate with bounded runtime cl
   assert.match(gate, /trap cleanup EXIT/, "shared gate must clean the isolated runtime on failure");
 });
 
+test("Node schema reflection uses the explicit pinned Herdr binary when provided", async () => {
+  const source = await readFile(join(ROOT, "src/schema.ts"), "utf8");
+  const gate = await readFile(join(ROOT, "scripts/release-gate.sh"), "utf8");
+  assert.match(source, /execFileSync/);
+  assert.match(source, /process\.env\.HERDR_BIN/);
+  assert.doesNotMatch(source, /execSync\("herdr api schema --json"/);
+  assert.match(gate, /export HERDR_BIN="\$\{HERDR_INSTALL_DIR\}\/herdr"/);
+});
+
 test("shared gate scrubs production overrides and isolates the live Herdr test runtime", async () => {
   const gate = await readFile(join(ROOT, "scripts/release-gate.sh"), "utf8");
   for (const name of [
@@ -95,6 +104,7 @@ test("shared gate scrubs production overrides and isolates the live Herdr test r
     "HERDR_EXTENSION_PATH",
     "HERDR_EXTENSION_ORIGIN",
     "HERDR_MCP_ROOT",
+    "HERDR_BIN",
   ]) {
     assert.match(gate, new RegExp(`\\b${name}\\b`));
   }

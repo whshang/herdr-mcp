@@ -1,10 +1,14 @@
 use std::process::ExitCode;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 pub(crate) const STABLE_CODE_IDENTIFIER: &str = "dev.herdr.mcp";
+#[cfg(target_os = "macos")]
 const DOCUMENTS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "macos")]
 const DOCUMENTS_PERMISSION_DENIED_EXIT: u8 = 77;
+#[cfg(target_os = "macos")]
 const DOCUMENTS_NOT_PRESENT_EXIT: u8 = 66;
 
 // Variants are intentionally platform-specific: macOS constructs the probe states,
@@ -227,6 +231,7 @@ pub(crate) fn probe_code_identity() -> CodeIdentity {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn value_after_prefix(text: &str, prefix: &str) -> Option<String> {
     text.lines()
         .map(str::trim)

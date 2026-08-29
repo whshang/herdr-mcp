@@ -3,7 +3,7 @@ use crate::cli::HerdrSupervisorCommand;
 use crate::paths::RuntimePaths;
 #[cfg(any(target_os = "macos", test))]
 use serde::{Deserialize, Serialize};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 use serde_json::Value;
 use serde_json::json;
 use std::process::ExitCode;
@@ -198,6 +198,7 @@ impl SupervisorState {
         self.last_reason = reason;
     }
 
+    #[cfg(target_os = "macos")]
     fn as_json(&self) -> Value {
         json!({
             "schema_version": self.schema_version,
