@@ -10,6 +10,7 @@ use std::process::ExitCode;
 
 pub(crate) const LABEL: &str = crate::instance::DEFAULT_HERDR_SUPERVISOR_LABEL;
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct InstallState {
     pub(crate) present: bool,
@@ -111,6 +112,7 @@ pub(crate) fn runtime_binary_supports_supervisor(binary: &std::path::Path) -> Re
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn reconcile_after_service_rollback() -> Result<bool, String> {
     #[cfg(target_os = "macos")]
     {
@@ -1236,6 +1238,7 @@ mod platform {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn supervisor_capability_requires_an_explicit_help_command() {
         assert!(platform::help_declares_supervisor_command(
@@ -1246,6 +1249,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn loaded_supervisor_install_is_noop_only_when_configuration_matches() {
         use platform::{InstallDisposition, install_disposition};
