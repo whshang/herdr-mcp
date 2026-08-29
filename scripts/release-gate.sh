@@ -163,7 +163,8 @@ run_hygiene() {
     bin/lib/i18n.sh \
     scripts/ci-herdr-runtime.sh \
     scripts/release-gate.sh \
-    scripts/sign-macos-release.sh
+    scripts/sign-macos-release.sh \
+    scripts/macos-signed-launchd-uat.sh
   log 'Package surface'
   npm pack --dry-run
   log 'Diff hygiene'
