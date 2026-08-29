@@ -45,6 +45,12 @@ herdr-mcp 本机 runtime 使用 GitHub Releases，不用 git clone。只在 Clou
 
 正常情况下，ChatGPT 会通过 `herdr_inspect` 看到真实 workspace / pane / Agent，并能够继续读取 Git 和项目文件。
 
+### v0.4.2 的图片与视觉开发能力
+
+v0.4.2 把同一套工作站安全边界扩展到视觉开发：`herdr_fs_image` 可以让 ChatGPT 直接读取 managed project 内的 PNG/JPEG/GIF/WebP；ChatGPT 生成的图片通过私有、短生命周期的 Cloudflare R2 artifact relay 中转，再由 Rust runtime 在写入仓库前完成 HTTPS/SSRF、大小、MIME/文件签名、摘要、managed-root、dirty-file 和 busy-agent 校验。公共 MCP catalog 仍保持 18 个工具。
+
+浏览器扩展明确**不参与图片传输**。它继续只负责长会话连续工作和浏览器控制；生成图片的传递属于 runtime + artifact relay。
+
 ## 浏览器扩展：可选，基础 Connector 可用后再装
 
 浏览器扩展用于长期会话连续工作、Side Panel 控制中心、workspace binding 和“排队”下一轮消息。它**不是**第一次连通 ChatGPT 的前置条件。

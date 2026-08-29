@@ -34,6 +34,12 @@ Inspect my Herdr projects. Read only; do not modify anything.
 
 正常なら、ChatGPT は実際の workspace / pane / agent / Git / project files を MCP 経由で確認できます。
 
+### v0.4.2 の画像・ビジュアル開発
+
+v0.4.2 は同じ workstation security boundary を visual development にも拡張します。`herdr_fs_image` で managed project 内の PNG/JPEG/GIF/WebP を ChatGPT が直接確認できます。生成画像は private・短寿命の Cloudflare R2 artifact relay を経由し、Rust runtime が HTTPS/SSRF、サイズ、MIME/file signature、digest、managed-root、dirty-file、busy-agent を検証してから repository に書き込みます。public MCP catalog は 18 tools のままです。
+
+Browser extension はこの画像経路には**参加しません**。役割は conversation continuity と browser control であり、generated-image transport は runtime + artifact relay が担当します。
+
 ## Browser extension は任意
 
 Browser extension は conversation continuity、Chrome Side Panel の Control Center、workspace binding、次ターンの queue を追加します。最初の Connector 接続には不要です。

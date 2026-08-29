@@ -45,6 +45,12 @@ Inspect my Herdr projects. Read only; do not modify anything.
 
 A healthy setup lets ChatGPT see real workspaces, panes, agents, Git state, and project files through the MCP tools.
 
+### Images and visual work in v0.4.2
+
+The v0.4.2 runtime extends the same workstation boundary to visual development work. `herdr_fs_image` lets ChatGPT inspect PNG/JPEG/GIF/WebP assets directly from managed projects. Generated images travel through a private, short-lived Cloudflare R2 artifact relay and are imported by the Rust runtime with HTTPS/SSRF, size, MIME/signature, digest, managed-root, dirty-file, and busy-agent checks before they are written to the repository. The public MCP catalog stays at 18 tools.
+
+The browser extension is deliberately **not** part of this image path. Its job is conversation continuity and browser control; generated-image transport belongs to the runtime + artifact relay.
+
 ## Browser extension: optional, after the Connector works
 
 The browser extension adds long-conversation continuity, the Side Panel Control Center, workspace binding, and queued next-turn messages. It is **not** required for the first ChatGPT-to-workstation connection.
