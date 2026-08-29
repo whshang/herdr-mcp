@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-29",
+  "candidate": {
+    "runtime_version": "0.4.2",
+    "source_commit": "d5186f534146a2cfcfe0944142971a22ebb619a0",
+    "note": "PR #168 was docs-only and does not change the candidate runtime exercised here."
+  },
+  "production_baseline": {
+    "runtime_version": "0.4.1",
+    "observations": [
+      {
+        "surface": "herdr_git status",
+        "result": "timeout",
+        "budget_ms": 15000,
+        "control": "the equivalent shell command `git status --porcelain -b` completed in about 30 ms"
+      },
+      {
+        "surface": "herdr_fs_patch dirty gate",
+        "result": "git_status_failed",
+        "budget_ms": 15000,
+        "control": "the underlying repository was clean and direct Git remained fast"
+      },
+      {
+        "surface": "herdr_exec_start cargo build",
+        "result": "failed",
+        "elapsed_ms": 37958,
+        "error": "Could not locate working directory: Interrupted system call (os error 4)",
+        "control": "the same cargo build in the visible utility pane completed successfully in 6.56 s"
+      }
+    ]
+  },
+  "candidate_uat": {
+    "child_registry_disabled_probe": {
+      "herdr_git_status": {
+        "runs": 30,
+        "pass": 30,
+        "p50_ms": 31.66,
+        "p95_ms": 31.98,
+        "max_ms": 34.15
+      },
+      "herdr_fs_patch_dry_run": {
+        "runs": 20,
+        "pass": 20,
+        "p50_ms": 16.28,
+        "p95_ms": 16.58,
+        "max_ms": 22.3,
+        "writes": 0
+      }
+    },
+    "production_shape_child_registry_enabled": {
+      "env": {
+        "HERDR_MCP_CHILD_REGISTRY": "1",
+        "config_state": "isolated temporary directory"
+      },
+      "herdr_git_status": {
+        "runs": 50,
+        "pass": 50,
+        "p50_ms": 49.93,
+        "p95_ms": 51.11,
+        "max_ms": 51.96
+      },
+      "herdr_fs_patch_dry_run": {
+        "runs": 30,
+        "pass": 30,
+        "p50_ms": 25.09,
+        "p95_ms": 26.09,
+        "max_ms": 26.26,
+        "writes": 0
+      },
+      "herdr_exec_start": {
+        "command": "/usr/bin/time -p cargo build --locked -p herdr-mcp",
+        "exit_code": 0,
+        "signal": null,
+        "mcp_elapsed_ms": 509,
+        "cargo_reported_build_seconds": 0.22
+      },
+      "postconditions": {
+        "candidate_stopped_cleanly": true,
+        "child_registry_records": 0,
+        "owned_git_children_remaining": 0,
+        "main_worktree_dirty": false
+      }
+    }
+  },
+  "release_gate_probe": {
+    "original_observation": {
+      "surface": "scripts/release-gate.sh full -> git diff --check",
+      "result": "one fail-closed timeout",
+      "budget_ms": 10000,
+      "immediate_direct_control_seconds": 0.01
+    },
+    "follow_up": [
+      {
+        "scenario": "sequential hygiene",
+        "runs": 5,
+        "pass": 5,
+        "elapsed_seconds_range": [
+          0.743,
+          0.887
+        ]
+      },
+      {
+        "scenario": "four concurrent hygiene processes",
+        "runs": 4,
+        "pass": 4
+      },
+      {
+        "scenario": "node release gate load plus foreground hygiene",
+        "hygiene_runs": 5,
+        "hygiene_pass": 5,
+        "hygiene_elapsed_seconds_range": [
+          0.722,
+          0.914
+        ],
+        "node_gate_pass": true
+      },
+      {
+        "scenario": "git fetch --prune origin plus foreground hygiene",
+        "hygiene_runs": 5,
+        "hygiene_pass": 5,
+        "hygiene_elapsed_seconds_range": [
+          0.725,
+          0.863
+        ],
+        "fetch_pass": true
+      }
+    ],
+    "classification": "DOWNSTREAM_SIGNAL_OF_PRODUCTION_V0_4_1_DOCUMENTS_IDENTITY_HANG",
+    "decision": "Keep the existing 10 s fail-closed bound. The timeout correctly detected a Git open() hang when the gate ran through the production 0.4.1 exec-session responsible context. Utility-pane A/B runs passed because they do not reproduce that launchd/privacy context. Do not rewrite the gate watchdog to hide the underlying identity failure."
+  },
+  "acceptance": {
+    "v0_4_2_git_tool_process_lifecycle_candidate": "PASS",
+    "v0_4_2_fs_dirty_gate_process_lifecycle_candidate": "PASS",
+    "v0_4_2_exec_session_process_lifecycle_candidate": "PASS",
+    "v0_4_2_child_reaping_candidate": "PASS",
+    "macos_documents_stable_responsible_identity": "BLOCKED_PENDING_DEVELOPER_ID_SIGNED_LAUNCHD_UAT",
+    "release_gate_timeout_behavior": "PASS_FAIL_CLOSED",
+    "stable_publish": "BLOCKED_EXTERNAL_DEVELOPER_ID_CREDENTIALS"
+  },
+  "macos_documents_identity_ab": {
+    "production_runtime": {
+      "version": "0.4.1",
+      "service_pid": 39569,
+      "signature": "adhoc",
+      "identifier": "herdr_mcp-6be5f72a3377fc3f",
+      "team_identifier": null,
+      "designated_requirement": "cdhash-bound"
+    },
+    "linked_worktree": "/Users/qingxian/.herdr/worktrees/herdr-mcp/v0-4-2-reliability-uat-evidence-20260829",
+    "common_gitdir": "/Users/qingxian/Documents/herdr-mcp/.git/worktrees/v0-4-2-reliability-uat-evidence-20260829",
+    "probes": [
+      {
+        "context": "0.4.1 herdr_exec_start",
+        "operation": "Python open/read of the linked worktree .git file outside Documents",
+        "result": "PASS",
+        "elapsed_ms": 52
+      },
+      {
+        "context": "0.4.1 herdr_exec_start",
+        "operation": "Python open/read of common gitdir HEAD under ~/Documents",
+        "result": "HUNG_UNTIL_KILLED",
+        "observed_seconds_before_sample": 21,
+        "sample": "803/803 samples in _io_open -> FileIO.__init__ -> open -> __open"
+      },
+      {
+        "context": "visible utility pane",
+        "operation": "read of the exact same common gitdir HEAD under ~/Documents",
+        "result": "PASS",
+        "elapsed_seconds": 0.0
+      },
+      {
+        "context": "0.4.1 herdr_exec_start",
+        "operation": "git diff --check from the linked worktree",
+        "result": "HUNG_UNTIL_KILLED",
+        "sample": "801/801 samples in git setup_git_directory -> read_gitfile_gently -> is_git_directory -> git_open_with_retry -> open -> __open"
+      },
+      {
+        "context": "visible utility pane",
+        "operation": "git diff --check from the exact same linked worktree",
+        "result": "PASS",
+        "elapsed_seconds": 0.01
+      }
+    ],
+    "classification": "MACOS_PROTECTED_DOCUMENTS_RESPONSIBLE_IDENTITY_BLOCKER",
+    "evidence_strength": "path-level A/B plus syscall sampling; no exact tccd attribution line was present in the hang window, so the evidence demonstrates the protected-path/responsible-context boundary without claiming a specific undocumented TCC internal mechanism",
+    "required_signed_release_uat": [
+      "Start the Developer ID signed 0.4.2 runtime through the real launchd service path.",
+      "From a linked worktree outside Documents whose common gitdir is under ~/Documents, read the common gitdir HEAD and run herdr_git status, herdr_fs_patch dry_run, and herdr_exec_start.",
+      "Require bounded completion with no privacy hang and no residual owned child.",
+      "Apply an updater generation change using the same stable signed identity, then repeat the exact probes.",
+      "Require no new privacy authorization/prompt and no identity drift across the generation swap."
+    ]
+  }
+}
