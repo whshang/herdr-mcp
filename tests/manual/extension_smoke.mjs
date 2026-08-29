@@ -82,6 +82,8 @@ const queueOwnerClaimIndex = wakeSource.indexOf('setAttribute(QUEUED_INSERT_OWNE
 ok(ownerGateIndex >= 0
     && queueOwnerClaimIndex >= 0
     && ownerGateIndex < queueOwnerClaimIndex
+    && wakeSource.includes("OWNER_STATUS_ATTEMPTS = 6")
+    && wakeSource.includes("A later page refresh can retry after MV3 recovers")
     && wakeSource.includes('[h2w] extension standby; skipping page control'),
   "inactive sibling extension exits before claiming shared page UI ownership");
 ok(!manifest.host_permissions?.includes("<all_urls>")

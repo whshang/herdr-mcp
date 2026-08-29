@@ -101,7 +101,7 @@ impl HostConfig {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn owner_is_active(expected_origin: &str, registered_origin: Option<&str>) -> bool {
     registered_origin == Some(expected_origin)
 }
@@ -716,6 +716,7 @@ mod tests {
         assert!(validate_extension_origin("https://example.com/").is_err());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn active_owner_fence_requires_the_exact_current_origin() {
         let expected = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/";

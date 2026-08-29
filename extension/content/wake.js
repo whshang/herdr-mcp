@@ -15,22 +15,36 @@ const H2W_CONTENT_VERSION = "0.1.76";
   // Gate before reading adapter state, claiming shared DOM markers, registering
   // listeners, or creating HUD/Queue surfaces so an inactive sibling build is
   // completely inert on this page.
-  const ownerAllowsPageControl = await new Promise((resolve) => {
-    try {
-      chrome.runtime.sendMessage({ type: "h2w_extension_owner_status" }, (status) => {
-        if (chrome.runtime.lastError || status === undefined) {
-          // Compatibility/offline path: old Native Hosts do not implement the
-          // identity probe. Preserve the pre-0.1.76 behavior unless Chromium
-          // has explicitly told the background that this origin is inactive.
-          resolve(true);
-          return;
+  const OWNER_STATUS_ATTEMPTS = 6;
+  async function probeOwnerAllowsPageControl() {
+    for (let attempt = 0; attempt < OWNER_STATUS_ATTEMPTS; attempt += 1) {
+      const status = await new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage({ type: "h2w_extension_owner_status" }, (response) => {
+            if (chrome.runtime.lastError || response === undefined) {
+              resolve(null);
+              return;
+            }
+            resolve(response);
+          });
+        } catch (_) {
+          resolve(null);
         }
-        resolve(!(status?.ok === true && status.active === false));
       });
-    } catch (_) {
-      resolve(true);
+      if (status !== null) {
+        // Old/offline Native Hosts can return a structured non-owner-probe
+        // error. Only Chromium's explicit admission denial maps to active=false.
+        return !(status?.ok === true && status.active === false);
+      }
+      if (attempt + 1 < OWNER_STATUS_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, 60 * (attempt + 1)));
+      }
     }
-  });
+    // A 0.1.76 content script with no responsive 0.1.76 background must not
+    // claim shared page state. A later page refresh can retry after MV3 recovers.
+    return false;
+  }
+  const ownerAllowsPageControl = await probeOwnerAllowsPageControl();
   if (!ownerAllowsPageControl) {
     console.log("[h2w] extension standby; skipping page control");
     return;
