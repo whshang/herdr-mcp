@@ -8,8 +8,48 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.75";
+const H2W_CONTENT_VERSION = "0.1.76";
 (async function () {
+  // Store and unpacked Dev builds can be installed at the same time. Only the
+  // Native Messaging origin selected by herdr-mcp may own page-side control.
+  // Gate before reading adapter state, claiming shared DOM markers, registering
+  // listeners, or creating HUD/Queue surfaces so an inactive sibling build is
+  // completely inert on this page.
+  const OWNER_STATUS_ATTEMPTS = 6;
+  async function probeOwnerAllowsPageControl() {
+    for (let attempt = 0; attempt < OWNER_STATUS_ATTEMPTS; attempt += 1) {
+      const status = await new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage({ type: "h2w_extension_owner_status" }, (response) => {
+            if (chrome.runtime.lastError || response === undefined) {
+              resolve(null);
+              return;
+            }
+            resolve(response);
+          });
+        } catch (_) {
+          resolve(null);
+        }
+      });
+      if (status !== null) {
+        // Old/offline Native Hosts can return a structured non-owner-probe
+        // error. Only Chromium's explicit admission denial maps to active=false.
+        return !(status?.ok === true && status.active === false);
+      }
+      if (attempt + 1 < OWNER_STATUS_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, 60 * (attempt + 1)));
+      }
+    }
+    // A 0.1.76 content script with no responsive 0.1.76 background must not
+    // claim shared page state. A later page refresh can retry after MV3 recovers.
+    return false;
+  }
+  const ownerAllowsPageControl = await probeOwnerAllowsPageControl();
+  if (!ownerAllowsPageControl) {
+    console.log("[h2w] extension standby; skipping page control");
+    return;
+  }
+
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
   const experimentalFlag = ADAPTER.name === "z.ai"

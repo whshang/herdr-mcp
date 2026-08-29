@@ -76,6 +76,10 @@ pub enum NativeHostCommand {
     Status,
     Uninstall,
     Rollback,
+    DevEnable { path: Option<String> },
+    DevDisable,
+    UseStore,
+    UseDev,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -515,12 +519,29 @@ fn parse_native_host(args: &[String]) -> Result<Command, String> {
         [subcommand] if subcommand == "rollback" => {
             Ok(Command::NativeHost(NativeHostCommand::Rollback))
         }
-        [] => Err("native-host requires install, status, uninstall, or rollback".to_owned()),
-        [subcommand] => Err(format!("unknown native-host command '{subcommand}'")),
-        _ => Err(
-            "native-host accepts exactly one subcommand: install, status, uninstall, or rollback"
+        [group, action] if group == "dev" && action == "enable" => Ok(Command::NativeHost(
+            NativeHostCommand::DevEnable { path: None },
+        )),
+        [group, action, path] if group == "dev" && action == "enable" => Ok(
+            Command::NativeHost(NativeHostCommand::DevEnable {
+                path: Some(path.clone()),
+            }),
+        ),
+        [group, action] if group == "dev" && action == "disable" => {
+            Ok(Command::NativeHost(NativeHostCommand::DevDisable))
+        }
+        [subcommand, channel] if subcommand == "use" && channel == "store" => {
+            Ok(Command::NativeHost(NativeHostCommand::UseStore))
+        }
+        [subcommand, channel] if subcommand == "use" && channel == "dev" => {
+            Ok(Command::NativeHost(NativeHostCommand::UseDev))
+        }
+        [] => Err(
+            "native-host requires install, status, uninstall, rollback, dev enable|disable, or use store|dev"
                 .to_owned(),
         ),
+        [subcommand] => Err(format!("unknown native-host command '{subcommand}'")),
+        _ => Err("invalid native-host command or arguments".to_owned()),
     }
 }
 
@@ -567,6 +588,8 @@ Advanced / internal:\n\
   herdr-mcp link seal [status|record --dual-uat|record --rollback-uat|--dry-run|--execute]\n\
   herdr-mcp link migrate-runtime-control [--dry-run|--write-staging|--apply]\n\
   herdr-mcp native-host <install|status|uninstall|rollback>\n\
+  herdr-mcp native-host dev <enable [PATH]|disable>\n\
+  herdr-mcp native-host use <store|dev>\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\
   herdr-mcp dev [--dry-run]\n\
   herdr-mcp candidate [--port 8873]\n\n\
@@ -773,6 +796,36 @@ mod tests {
             Command::NativeHost(NativeHostCommand::Rollback)
         );
         assert_eq!(
+            parse(args(&["native-host", "dev", "enable"]))
+                .unwrap()
+                .command,
+            Command::NativeHost(NativeHostCommand::DevEnable { path: None })
+        );
+        assert_eq!(
+            parse(args(&["native-host", "dev", "enable", "./extension"]))
+                .unwrap()
+                .command,
+            Command::NativeHost(NativeHostCommand::DevEnable {
+                path: Some("./extension".to_owned())
+            })
+        );
+        assert_eq!(
+            parse(args(&["native-host", "dev", "disable"]))
+                .unwrap()
+                .command,
+            Command::NativeHost(NativeHostCommand::DevDisable)
+        );
+        assert_eq!(
+            parse(args(&["native-host", "use", "store"]))
+                .unwrap()
+                .command,
+            Command::NativeHost(NativeHostCommand::UseStore)
+        );
+        assert_eq!(
+            parse(args(&["native-host", "use", "dev"])).unwrap().command,
+            Command::NativeHost(NativeHostCommand::UseDev)
+        );
+        assert_eq!(
             parse(args(&["extension-host"])).unwrap().command,
             Command::ExtensionHost {
                 caller_origin: String::new()
@@ -806,6 +859,8 @@ mod tests {
         assert!(parse(args(&["update", "apply", "--force"])).is_err());
         assert!(parse(args(&["native-host"])).is_err());
         assert!(parse(args(&["native-host", "legacy"])).is_err());
+        assert!(parse(args(&["native-host", "dev", "disable", "extra"])).is_err());
+        assert!(parse(args(&["native-host", "use", "preview"])).is_err());
         assert!(parse(args(&["link"])).is_err());
         assert!(parse(args(&["link", "cutover", "--force"])).is_err());
         assert!(parse(args(&["link", "cutover", "--dry-run", "--execute"])).is_err());

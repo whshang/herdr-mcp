@@ -24,7 +24,7 @@ import {
 } from "./continuity-core.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
-import { localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
+import { getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 import {
   QUEUED_INSERT_STORAGE_KEY,
   ackQueuedInsertBatch,
@@ -36,7 +36,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.75";
+const H2W_SCRIPT_VERSION = "0.1.76";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
@@ -3519,6 +3519,12 @@ async function handleHandoffTurnEnded(msg) {
 
 // ---- Message handling ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === "h2w_extension_owner_status") {
+    void getNativeExtensionOwnerStatus()
+      .then((status) => sendResponse(status || { ok: false, error: "native-owner-status-unavailable" }))
+      .catch((error) => sendResponse({ ok: false, error: String(error?.message || error || "native-owner-status-failed") }));
+    return true;
+  }
   if (msg?.type === "herdr_control_center_subscribe") {
     void (async () => {
       if (msg.force !== true && controlCenterLastState && Date.now() - controlCenterSnapshotAt <= 1500) {
@@ -4384,6 +4390,21 @@ async function fetchState() {
   return stateFetchInFlight;
 }
 
+async function extensionOwnerAllowsControl() {
+  try {
+    const owner = await getNativeExtensionOwnerStatus();
+    if (owner?.ok === true && owner.active === false) {
+      callLog(`extension standby: active owner is ${owner.active_extension_origin || "another trusted build"}`);
+      return false;
+    }
+  } catch (error) {
+    callLog(`extension owner status unavailable (${error?.message || String(error)}); preserving reconnect behavior`);
+  }
+  // Preserve 0.4.1/offline compatibility: lack of a native identity response is not
+  // enough to disable the extension. Native Messaging remains fail-closed.
+  return true;
+}
+
 // Full rebuild: exactly one shared stream regardless of binding count.
 async function rebuildStreams() {
   await configReady;
@@ -4393,6 +4414,10 @@ async function rebuildStreams() {
   // from the previous server while the new shared stream is reconnecting.
   pushWorkspaceCatalog = [];
   pushWorkspaceCatalogAt = 0;
+  if (!(await extensionOwnerAllowsControl())) {
+    reconcileProgressTimers({});
+    return;
+  }
   const bindings = await loadBindings();
   callLog(
     `rebuild streams v${H2W_SCRIPT_VERSION}: ${Object.keys(bindings).length} binding(s),`,
@@ -4406,6 +4431,11 @@ async function rebuildStreams() {
 // from storage without aborting live streams or resetting existing clocks.
 async function ensureAlive(preloaded) {
   await configReady;
+  if (!(await extensionOwnerAllowsControl())) {
+    stopPushStream();
+    reconcileProgressTimers({});
+    return;
+  }
   const bindings = preloaded || await loadBindings();
   ensurePushStream(bindings);
   if (progressTickSecMs() <= 0) return;

@@ -446,13 +446,21 @@ Store ID 与 Native Messaging origin 是一次性身份边界：production ident
 
 最终策略已经冻结：**Native Messaging manifest 任一时刻只允许一个精确 origin，不同时放行 dev + Store 两个 ID，也不使用 wildcard。**
 
-- 普通 `herdr-mcp native-host install`：从 `contracts/browser-extension-store.json` 读取并注册 production Store identity；
-- unpacked 开发版：维护者必须显式执行 `HERDR_EXTENSION_PATH=/path/to/extension herdr-mcp native-host install`，由该路径派生开发 ID；
-- 从既有 herdr-mcp-owned dev origin 切回 Store origin：install 走完整 snapshot / atomic mutation / rollback evidence 事务；
+- fresh 普通 `herdr-mcp native-host install`：从 `contracts/browser-extension-store.json` 读取并注册 production Store identity；
+- `0.4.2+` unpacked 开发版：维护者执行 `herdr-mcp native-host dev enable [PATH]` 登记路径派生的 Dev ID；`PATH` 省略时使用当前 checkout 的 `./extension`；
+- Store 与一个 Dev extension 可以同时安装在 Chrome，但只有一个是 herdr-mcp 的 active/default Native Messaging owner；
+- `herdr-mcp native-host use store` / `use dev` 走完整 snapshot / atomic mutation / rollback evidence 事务切换唯一 active origin；
+- `herdr-mcp native-host dev disable` 清除已登记 Dev identity，并让 Store 回到 active；
+- 旧 `HERDR_EXTENSION_PATH=/path/to/extension herdr-mcp native-host install` 只保留为维护者兼容入口；
+- 既有 `0.4.1` herdr-mcp-owned Dev 安装升级到 `0.4.2` 时不静默切换 active owner；首次 0.4.2 install 会把该 Dev origin 写入受管 wrapper metadata；
 - foreign、multi-origin、symlink 或非本项目拥有的 Native Messaging state 继续 fail closed；
 - Store ID 不硬编码进 Rust，contract 是唯一机器可读 SSOT。
 
-这样 production 默认路径稳定，开发身份仍可测试，同时避免长期扩大 Native Messaging allowlist。
+已登记 Dev origin 不是第二个 Native Messaging allowlist 项，而只是受管 wrapper 中的候选 metadata。manifest 的 `allowed_origins` 在 Store-active 与 Dev-active 状态下都严格只有一个 exact origin。Chrome 正常启动 Native Messaging host 时不会可靠追加 caller-origin positional argv，因此不能用一个 multi-origin manifest 再靠 host 猜 caller；单-origin admission 才是这里的安全边界。
+
+`0.1.76+` 开发源码会在启动控制路径前查询 Native Host `identity`。当前 active build 能通过 Chromium admission 获得 identity；同机安装但 inactive 的 Store/Dev build 会在 Chromium 层被拒绝并进入 standby，不启动共享 push stream，也不渲染 operational HUD。切换 active owner 后，已经存在的旧 Native Messaging request/stream 也会由 Rust Native Host 重新核对当前受管 manifest；持续 SSE stream 最迟在下一次 1 秒 owner-fence tick 或下一帧时失效，避免旧连接跨切换继续拥有本地控制权。该机制不要求修改已经提交审核的 `0.1.75` Store candidate。
+
+这个共存契约要求两份同时启用的扩展都升级到 `0.1.76+`。当前正在审核的 `0.1.75` 先按 Store-only 路径完成审核与真实安装 UAT，不回改候选包；随后通过正常 Store update 发布 `0.1.76`，再执行 Store+Dev 同机共存 UAT。不要为了让旧 `0.1.75` 参与共存而新增 `management` 权限、修改 Chrome Preferences 或自动禁用另一份扩展。
 
 官方 Native Messaging 规则：
 
@@ -460,16 +468,38 @@ Store ID 与 Native Messaging origin 是一次性身份边界：production ident
 
 ### 9.3 Native Host installer 改造
 
-`0.4.1` 的目标实现为：
+`0.4.1` 已建立 Store-first 单-origin Native Host。`0.4.2` 在不放宽这个边界的前提下补齐 Store/Dev 共存与显式切换：
 
 - production Store ID 由 `contracts/browser-extension-store.json` 提供；
 - 普通 install 不需要 repo checkout 或 unpacked extension 目录；
-- development ID 只能通过显式 `HERDR_EXTENSION_PATH` / 受控 origin override 选择；
-- existing herdr-mcp-owned origin 可以事务式迁移；
+- development ID 通过 `native-host dev enable [PATH]` 显式登记，旧 `HERDR_EXTENSION_PATH` 仍兼容；
+- `native-host use store|dev` 事务式切换唯一 active origin，另一份 Chrome 扩展无需卸载；
+- `native-host dev disable` 撤销 Dev 候选并回到 Store；
+- existing herdr-mcp-owned origin 可以事务式迁移、切换与 rollback；
 - install/status/uninstall/rollback 与 runtime sync 继续保留原有恢复证据；
-- status 显式报告 `official_store_extension_id`、`store_origin_match`、`extension_identity_source`；
+- remembered Dev candidate 复用 owned wrapper metadata，不新增独立 registry/state database；
+- status 显式报告 `official_store_extension_id`、`store_origin_match`、`extension_identity_source`、`active_channel`、`dev_enabled` 与已登记 Dev ID/origin；
 - 不因升级 runtime 覆盖成错误 origin；
 - Chrome / Chromium / Edge / Brave / ego lite 的目标清单仍保持各浏览器自己的注册路径。
+
+维护者本地开发推荐流程：
+
+```bash
+# clone/check out repo 后，Chrome Developer mode → Load unpacked → 选择 ./extension
+herdr-mcp native-host dev enable ./extension
+herdr-mcp native-host status
+
+# 同机 Store build 与 Dev build 可保留；只切换 Herdr active owner
+herdr-mcp native-host use store
+herdr-mcp native-host use dev
+
+# 不再使用该 Dev identity
+herdr-mcp native-host dev disable
+```
+
+如果移动了 unpacked extension 的绝对路径，必须重新执行 `dev enable`，因为 Chromium 的 unpacked ID 与加载路径相关。
+
+`use store` / `use dev` 切换后，刷新已经打开的 ChatGPT / Claude / z.ai / DeepSeek 页面。0.1.76 的 page-owner gate 在 content script 注入最前面执行；刷新后 newly-active build 才会接管页面，inactive build 会在注册监听器、Queue owner 或 HUD 之前直接退出。
 
 发布版最终用户不应该执行：
 
