@@ -69,7 +69,7 @@ Node.js is only a temporary Edge deployment dependency through Wrangler; it is n
 
 ## Step 1 — install the native herdr-mcp runtime
 
-1. Download the newest stable `herdr-mcp` binary for this platform from <https://github.com/whshang/herdr-mcp/releases> (`v0.4.1` is the current stable tag at this snapshot; always prefer the newest stable tag).
+1. Download the newest stable `herdr-mcp` binary for this platform from <https://github.com/whshang/herdr-mcp/releases> (`v0.4.2` is the current stable tag at this snapshot; always prefer the newest stable tag).
 2. Put it on `PATH` (for example `~/.local/bin/herdr-mcp`) and make it executable when the platform requires it.
 3. Run:
 

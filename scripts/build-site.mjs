@@ -11,6 +11,7 @@ import {
   LOCALE_NAMES,
   NAV_GROUPS,
   NAV_GROUP_LABELS,
+  READING_ORDER,
   SITE_ORIGIN_ENV,
   UI,
 } from "./site-i18n.mjs";
@@ -21,9 +22,19 @@ const i18nDocsDir = join(rootPath, "docs", "i18n");
 const outDir = join(rootPath, "site-dist");
 
 const origin = (process.env[SITE_ORIGIN_ENV] || DEFAULT_ORIGIN).replace(/\/+$/, "");
-// Read once up-front: the version badge on every docs page and release.json
-// both come from package.json.
+// package.json is build-tooling metadata, not the user-facing Runtime Release
+// version. Keep the docs badge/release.json aligned with the authoritative Rust
+// runtime version defined by crates/herdr-mcp/Cargo.toml.
 const pkg = JSON.parse(await readFile(join(rootPath, "package.json"), "utf8"));
+const cargoManifest = await readFile(join(rootPath, "crates", "herdr-mcp", "Cargo.toml"), "utf8");
+const runtimeVersion = parseCargoPackageVersion(cargoManifest);
+
+function parseCargoPackageVersion(source) {
+  const packageSection = source.match(/(?:^|\n)\[package\]\s*\n([\s\S]*?)(?=\n\[|$)/)?.[1];
+  const version = packageSection?.match(/^\s*version\s*=\s*"([^"]+)"\s*$/m)?.[1];
+  if (!version) throw new Error("crates/herdr-mcp/Cargo.toml is missing [package].version");
+  return version;
+}
 
 // Fail fast when someone adds a locale without translating every string.
 const uiKeys = Object.keys(UI[LOCALES[0]]).slice().sort();
@@ -174,7 +185,7 @@ function topbar({ pre, locale, drawer = false, slug = null, localePrefix, versio
 }
 
 function sidebarNav(docsBySlug, activeSlug = "", ui, locale) {
-  const groups = NAV_GROUPS.map((group, index) => `<section class="nav-group"><h2>${esc(NAV_GROUP_LABELS[locale][index])}</h2><ul>${group.slugs.map((slug) => {
+  const groups = NAV_GROUPS.map((group, index) => `<section class="nav-group${group.secondary ? " nav-secondary" : ""}"><h2>${esc(NAV_GROUP_LABELS[locale][index])}</h2><ul>${group.slugs.map((slug) => {
     const doc = docsBySlug.get(slug);
     const active = slug === activeSlug;
     return `<li><a data-doc-slug="${esc(slug)}" href="./${esc(slug)}.html"${active ? ' aria-current="page" class="active"' : ""}>${esc(doc.title)}</a></li>`;
@@ -215,9 +226,10 @@ function searchUi({ pre, locale, searchIndex }) {
 }
 
 function pageNav(docsBySlug, slug, ui) {
-  const index = DOC_ORDER.indexOf(slug);
-  const prev = index > 0 ? docsBySlug.get(DOC_ORDER[index - 1]) : null;
-  const next = index >= 0 && index < DOC_ORDER.length - 1 ? docsBySlug.get(DOC_ORDER[index + 1]) : null;
+  const index = READING_ORDER.indexOf(slug);
+  if (index < 0) return "";
+  const prev = index > 0 ? docsBySlug.get(READING_ORDER[index - 1]) : null;
+  const next = index < READING_ORDER.length - 1 ? docsBySlug.get(READING_ORDER[index + 1]) : null;
   return `<nav class="page-nav" aria-label="${esc(ui.pageNavAria)}">
     ${prev ? `<a class="page-nav-link prev" data-prev href="./${esc(prev.slug)}.html"><span>${esc(ui.previous)}</span><strong>← ${esc(prev.title)}</strong></a>` : `<span></span>`}
     ${next ? `<a class="page-nav-link next" data-next href="./${esc(next.slug)}.html"><span>${esc(ui.next)}</span><strong>${esc(next.title)} →</strong></a>` : `<span></span>`}
@@ -245,7 +257,7 @@ function articleShell({ locale, doc, body, toc, docsBySlug, searchIndex, version
     <aside class="sidebar" id="docs-sidebar" data-sidebar>${sidebarNav(docsBySlug, doc.slug, ui, locale)}</aside>
     <main class="article-column">
       <article class="doc-body" data-doc-slug="${esc(doc.slug)}">${bodyWithCopy}</article>
-      ${doc.slug === DOC_ORDER[0] ? agentIntroBlock(ui, pre) : ""}
+      ${doc.slug === READING_ORDER[0] ? agentIntroBlock(ui, pre) : ""}
       ${pageNav(docsBySlug, doc.slug, ui)}
       <footer class="docs-footer"><a href="https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/${esc(locale)}/${esc(doc.slug)}.md">${esc(ui.editSource)}</a></footer>
     </main>
@@ -429,10 +441,10 @@ for (const locale of LOCALES) {
     const page = rendered.get(slug);
     await writeFile(
       join(localeOut, `${slug}.html`),
-      articleShell({ locale, doc, body: page.html, toc: page.toc, docsBySlug, searchIndex, version: pkg.version })
+      articleShell({ locale, doc, body: page.html, toc: page.toc, docsBySlug, searchIndex, version: runtimeVersion })
     );
   }
-  await writeFile(join(localeOut, "index.html"), localeEntryShell({ locale, docsBySlug, searchIndex, version: pkg.version }));
+  await writeFile(join(localeOut, "index.html"), localeEntryShell({ locale, docsBySlug, searchIndex, version: runtimeVersion }));
 }
 
 await writeFile(join(outDir, "docs", "index.html"), docsRedirectShell());
@@ -449,11 +461,11 @@ try {
 } catch { /* skill ships with newer releases; Pages remains deployable without it */ }
 await writeFile(join(outDir, "release.json"), `${JSON.stringify({
   name: pkg.name,
-  version: pkg.version,
+  version: runtimeVersion,
   commit,
   docs: "./docs/",
   skill,
 }, null, 2)}\n`);
 await writeFile(join(outDir, ".nojekyll"), "");
 
-console.log(JSON.stringify({ ok: true, output: "site-dist", locales: LOCALES.map((l) => `${l}*${DOC_ORDER.length}`), docs: DOC_ORDER.length, version: pkg.version, commit }));
+console.log(JSON.stringify({ ok: true, output: "site-dist", locales: LOCALES.map((l) => `${l}*${DOC_ORDER.length}`), docs: DOC_ORDER.length, version: runtimeVersion, commit }));

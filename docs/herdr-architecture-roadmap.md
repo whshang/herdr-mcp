@@ -3,7 +3,7 @@
 状态：实施中
 原则：用效率最高、可能是最复杂但对用户最友好的方案，不追求短期收益。
 
-**First-GA gate SSOT**：[`docs/ga-release-gate.md`](./ga-release-gate.md)。**当前 Rust runtime stable**：`v0.4.1`；[`docs/ga-candidate-status.md`](./ga-candidate-status.md) 保留 `v0.4.0` 首次 stable 的 GA closure snapshot。**Release model**：[`docs/release-model.md`](./release-model.md)。是否可正式对普通用户开放只看 GA 门禁（G1–G25 + 八个 veto），不是「Rust 重构做完」。
+**First-GA gate SSOT**：[`docs/ga-release-gate.md`](./ga-release-gate.md)。**当前 Rust runtime stable**：`v0.4.2`；[`docs/ga-candidate-status.md`](./ga-candidate-status.md) 保留 `v0.4.0` 首次 stable 的 GA closure snapshot。**Release model**：[`docs/release-model.md`](./release-model.md)。是否可正式对普通用户开放只看 GA 门禁（G1–G25 + 八个 veto），不是「Rust 重构做完」。
 
 > 历史迁移/发布 chronology 已拆分到 [`docs/history/architecture/rust-native-rearchitecture.md`](./history/architecture/rust-native-rearchitecture.md)（Rust 原生化重构细节）与 [`docs/history/architecture/tool-performance-optimization.md`](./history/architecture/tool-performance-optimization.md)（18 个工具性能实现细节与基准）。本文件只保留当前架构与路线。
 
@@ -37,9 +37,9 @@ Herdr 性能优化不以单点 benchmark 为目标，目标是建立长期可演
 当前主线有两个彼此解耦的执行面：
 
 1. **Browser extension / Store / real-browser UAT** — 浏览器扩展持续独立迭代；Store 发布、实验站点 UAT、Control Center/continuity 修复使用独立扩展版本与分支，不要求每次都发布 Rust runtime。
-2. **`v0.4.2` quality/consolidation** — 按 [`_wip/v0.4.2-quality-docs-and-operations-plan.md`](./_wip/v0.4.2-quality-docs-and-operations-plan.md) 推进。Wave A release/test hardening 与 Wave B measured efficiency 已完成；当前执行 Wave C docs taxonomy，随后用独立分支执行 Wave D 文档站 redesign，再进入 release/UAT。
+2. **`v0.4.2` quality/consolidation** — 实施计划与验收证据已归档到 [`history/v0.4.2/v0.4.2-quality-docs-and-operations-plan.md`](./history/v0.4.2/v0.4.2-quality-docs-and-operations-plan.md)。Wave A reliability、Wave B measured efficiency、Wave C docs taxonomy 与 docs-site homepage/navigation redesign 均已完成；稳定版只通过 tag-driven signed Release 与 supported updater dogfood 收口。
 
-当前 stable runtime 为 **`v0.4.1`**，production Rust ownership / updater / Link / Native Messaging runtime sync 已经是基线，不再重复做 alpha-era cutover。第一版 GA 的 `v0.4.0` G1–G25 与历史 release/UAT 证据继续由 [`ga-release-gate.md`](./ga-release-gate.md) 和 `docs/history/ga/` 保存，不能为了让旧文档看起来“更新”而改写历史版本号。
+当前 stable runtime 为 **`v0.4.2`**，production Rust ownership / updater / Link / Native Messaging runtime sync 已经是基线，不再重复做 alpha-era cutover。第一版 GA 的 `v0.4.0` G1–G25 与历史 release/UAT 证据继续由 [`ga-release-gate.md`](./ga-release-gate.md) 和 `docs/history/ga/` 保存，不能为了让旧文档看起来“更新”而改写历史版本号。
 
 活跃但不自动进入 `v0.4.2` feature scope 的长期设计包括 [`_wip/multi-device-worker-control-plane.md`](./_wip/multi-device-worker-control-plane.md) 与 Browser Control Plane 的后续扩展；只有测量结果或明确版本计划批准后才转为实现任务。
 
@@ -208,7 +208,7 @@ Evidence Store 未做，等真实恢复需求。
 
 ## AI Tool Runtime Optimization Architecture
 
-状态：Result Optimization first wave、Project Context Cache first slice、Streaming First（#62+#66）已合入。当前主游标是 **`v0.4.2` quality/consolidation**：Wave A/B 已完成，Wave C docs taxonomy 正在收尾，Wave D 文档站 redesign 与 release/UAT 随后执行。更深 PCC 与 Batch B 仍不进入本版本主线。
+状态：Result Optimization first wave、Project Context Cache first slice、Streaming First（#62+#66）已合入。**`v0.4.2` quality/consolidation** 的 implementation waves、documentation taxonomy 与 docs-site redesign 已完成并进入稳定发布/升级验收；更深 PCC 与 Batch B 仍不进入本版本主线。
 
 参考 rtk-ai/rtk：核心不是改工具执行本身，而是在输出进入模型上下文前过滤、分组、截断、去重。Herdr 不复制 CLI proxy，在 Rust MCP runtime 内压缩展示，raw 事实仍可从同一次结果或后续 evidence 恢复。不改变 epoch 2 / 18 tools inputSchema。
 
@@ -279,7 +279,7 @@ Roadmap 不与当前 Rust parity 并行扩张 public surface。顺序固定为�
   → Product Completion hardening
 ```
 
-截至 `v0.4.1`，`18-tool native parity → production transport parity → Shared Local State Store foundation → supervisor / Native Messaging / updater / link → Node runtime removal` 已完成并成为生产基线。`v0.4.2` 当前执行顺序为 `Wave A release/test hardening → Wave B measured efficiency → Wave C docs taxonomy → Wave D docs-site redesign → release/UAT`；A/B 已完成，C 正在收尾。Reliability Kernel、Continuity 2.0 与 Work Context/Evidence 保持后续路线，不能借本版本质量整理扩大 public surface 或改变 epoch 2 / 18 tools 行为契约。
+截至 `v0.4.1`，`18-tool native parity → production transport parity → Shared Local State Store foundation → supervisor / Native Messaging / updater / link → Node runtime removal` 已成为生产基线。`v0.4.2` 已完成 `Wave A release/test hardening → Wave B measured efficiency → Wave C docs taxonomy → docs-site redesign`，保持 epoch 2 / 18 tools public contract 不变，并以 signed Release + supported updater dogfood 作为稳定版闭环。Reliability Kernel、Continuity 2.0 与 Work Context/Evidence 保持后续路线。
 
 工具性能作为独立 lane 演进，详细历史与基准见 [`docs/history/architecture/tool-performance-optimization.md`](./history/architecture/tool-performance-optimization.md)。Batch A/B 的普通优化不得改变 epoch 2 / 18-tool visible contract；生产 Rust Link 已是稳定基线，不再作为性能 lane 的并行 cutover 任务。只有测量证明固定 MCP/model round-trip 仍是主要瓶颈后，才在未来明确评估 multi-operation tool schema / JSON-RPC batch 与 contract epoch 演进，禁止把 model-visible schema 变化混入普通 Rust 重构。
 

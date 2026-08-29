@@ -9,13 +9,15 @@
 export const SITE_ORIGIN_ENV = "HERDR_SITE_ORIGIN";
 export const DEFAULT_ORIGIN = "https://whshang.github.io/herdr-mcp";
 
-// English is the default locale: /docs/ lands on it directly, and the topbar
-// language switcher is how readers reach the Chinese docs.
+// English is the canonical/default locale. The neutral /docs/ router still
+// honors an unpinned zh browser preference before landing on a locale homepage.
 export const DEFAULT_LOCALE = "en";
 export const LOCALES = ["en", "zh-CN"];
 export const LOCALE_NAMES = { en: "English", "zh-CN": "简体中文" };
 
-// Logical document order — defines prev/next order in every locale.
+// Logical document catalog order — defines sidebar/search/build order in every
+// locale. Maintainer-only references remain discoverable but are deliberately
+// excluded from the ordinary next/previous reading flow below.
 export const DOC_ORDER = [
   "quick-agent-install",
   "overview",
@@ -25,37 +27,48 @@ export const DOC_ORDER = [
   "best-practices",
   "automation",
   "cli-reference",
+  "browser-continuity",
+  "extension",
+  "browser-control-center",
+  "privacy",
   "cloudflare-edge-deployment",
   "cloudflare-edge-token",
   "runtime-self-upgrade",
   "worker-fallbacks",
   "troubleshooting",
-  "browser-continuity",
-  "extension",
-  "browser-control-center",
-  "extension-wake",
-  "extension-bridge",
-  "privacy",
   "design-philosophy",
   "architecture",
   "capability-benchmark",
   "herdr-vs-ecosystem",
+  "extension-wake",
+  "extension-bridge",
   "agent-install",
   "clean-machine-uat",
 ];
 
+export const MAINTAINER_DOCS = [
+  "extension-wake",
+  "extension-bridge",
+  "agent-install",
+  "clean-machine-uat",
+];
+
+export const READING_ORDER = DOC_ORDER.filter((slug) => !MAINTAINER_DOCS.includes(slug));
+
 // Group membership is keyed by logical slug only; labels are translated in UI.
 export const NAV_GROUPS = [
   { slugs: ["quick-agent-install", "overview", "install", "chatgpt-connector", "quick-start"] },
-  { slugs: ["best-practices", "automation", "cli-reference", "cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade", "worker-fallbacks", "troubleshooting"] },
-  { slugs: ["browser-continuity", "extension", "browser-control-center", "extension-wake", "extension-bridge", "privacy"] },
-  { slugs: ["design-philosophy", "architecture", "capability-benchmark", "herdr-vs-ecosystem", "agent-install", "clean-machine-uat"] },
+  { slugs: ["best-practices", "automation", "cli-reference"] },
+  { slugs: ["browser-continuity", "extension", "browser-control-center", "privacy"] },
+  { slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade", "worker-fallbacks", "troubleshooting"] },
+  { slugs: ["design-philosophy", "architecture", "capability-benchmark", "herdr-vs-ecosystem"] },
+  { slugs: MAINTAINER_DOCS, secondary: true },
 ];
 
 // Per-locale navigation group labels, in NAV_GROUPS order.
 export const NAV_GROUP_LABELS = {
-  "zh-CN": ["开始", "使用与运维", "浏览器（可选）", "架构与参考"],
-  en: ["Start", "Use & operate", "Browser (optional)", "Architecture & reference"],
+  "zh-CN": ["开始", "使用 herdr-mcp", "浏览器（可选）", "运维与排障", "架构与进阶", "维护者参考"],
+  en: ["Start", "Use herdr-mcp", "Browser (optional)", "Operate & troubleshoot", "Architecture & advanced", "Maintainer reference"],
 };
 
 // Per-locale user-visible strings. The build fails fast if a label is missing,

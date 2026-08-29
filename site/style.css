@@ -166,11 +166,12 @@ button { color: inherit; }
 
 /* "Let your agent introduce you": a paste-ready prompt pointing at the
    agent-facing skill file, mirroring the reference docs' agent guide. */
-.agent-intro { margin: 34px 0 8px; padding: 20px 20px 17px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.agent-intro { min-width: 0; max-width: 100%; margin: 34px 0 8px; padding: 20px 20px 17px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
 .agent-intro-head { max-width: 720px; }
 .agent-intro h2 { margin: 7px 0 6px; font-size: 17px; letter-spacing: -0.01em; }
 .agent-intro p { margin: 0; color: var(--muted-strong); font-size: 13.5px; line-height: 1.55; }
-.agent-prompt { position: relative; margin: 14px 0 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--code-bg); color: var(--code-text); font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.agent-prompt { position: relative; max-width: 100%; margin: 14px 0 0; overflow: auto; padding: 12px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--code-bg); color: var(--code-text); font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+.agent-prompt > .code-copy { opacity: 1; }
 .agent-intro-note { margin-top: 10px !important; font-size: 12.5px !important; }
 .agent-intro-note a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
 .docs-paths { display: grid; gap: 42px; padding: 46px 0 30px; }
@@ -181,7 +182,7 @@ button { color: inherit; }
 .doc-card h2 { margin: 0 0 6px; font-size: 15px; line-height: 1.4; }
 .doc-card h2 a { text-decoration: none; }
 .doc-card p { display: -webkit-box; margin: 0; overflow: hidden; color: var(--muted); font-size: 12.5px; line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
-.docs-home-column { width: min(900px, 100%); }
+.docs-home-column { min-width: 0; width: min(900px, 100%); max-width: 100%; }
 .docs-home-page .docs-hero { max-width: 900px; }
 .home-section { scroll-margin-top: calc(var(--topbar-h) + 24px); }
 .index-group-heading { max-width: 760px; margin-bottom: 14px; }
@@ -231,9 +232,9 @@ body:not(.docs-page):not(.docs-index-page) > main { width: min(1080px, calc(100%
 .grid h2 { margin: 0 0 8px; font-size: 16px; }
 .grid p { color: var(--muted-strong); font-size: 13px; }
 
-/* /docs/ entry: English by default; a 0s redirect to the English index that
-   leaves a readable fallback (with the language links) for no-meta-refresh
-   clients. */
+/* /docs/ entry: English is canonical/default; browser-language routing may
+   select zh-CN when there is no explicit language pin. Keep readable fallback
+   links for no-script/no-meta-refresh clients. */
 .redirect-note { max-width: 620px; padding: 22px 24px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
 .redirect-note h1 { margin: 10px 0; font-size: 30px; letter-spacing: -0.03em; }
 .redirect-note p { margin: 0 0 14px; color: var(--muted-strong); }
@@ -272,7 +273,8 @@ body:not(.docs-page):not(.docs-index-page) footer a { text-decoration: none; }
   .topnav, .version-badge { display: none; }
   .search-label, .search-trigger kbd { display: none; }
   .search-trigger { width: 36px; justify-content: center; padding: 0; }
-  .article-column { width: min(100% - 28px, var(--article-w)); padding: 32px 0 34px; }
+  .article-column, .docs-home-column { width: calc(100% - 28px); max-width: var(--article-w); padding: 32px 0 34px; }
+  .docs-home-column > *, .docs-hero, .agent-intro, .docs-paths, .home-section { min-width: 0; max-width: 100%; }
   .doc-body h1 { font-size: clamp(30px, 10vw, 40px); }
   .doc-body h2 { font-size: 21px; }
   .page-nav { grid-template-columns: 1fr; margin-top: 44px; }
@@ -280,11 +282,22 @@ body:not(.docs-page):not(.docs-index-page) footer a { text-decoration: none; }
   .page-nav-link.next { text-align: left; }
   .docs-index { width: min(100% - 28px, 1040px); padding-top: 42px; }
   .docs-hero { padding-bottom: 38px; }
-  .docs-hero h1 { font-size: clamp(38px, 13vw, 54px); }
-  .docs-hero p { font-size: 16px; }
-  .docs-grid, .grid { grid-template-columns: 1fr; }
+  .docs-hero h1 { max-width: 100%; font-size: clamp(36px, 12vw, 48px); overflow-wrap: anywhere; }
+  .docs-hero p { max-width: 100%; font-size: 16px; overflow-wrap: anywhere; }
+  .hero-actions { max-width: 100%; }
+  .hero-actions .button { max-width: 100%; }
+  .docs-grid, .docs-grid.home-three, .grid { grid-template-columns: minmax(0, 1fr); }
   .docs-paths { gap: 34px; padding-top: 36px; }
   body:not(.docs-page):not(.docs-index-page) > main { width: min(100% - 28px, 1080px); padding-top: 46px; }
+}
+
+@media (max-width: 460px) {
+  .topbar-actions { min-width: 0; gap: 4px; }
+  .lang-switcher a { padding-inline: 6px; font-size: 11.5px; }
+  .search-trigger, .theme-toggle { display: none; }
+  .hero-actions .button { flex: 1 1 auto; justify-content: center; }
+  .agent-intro { padding: 16px 14px 14px; }
+  .agent-prompt { font-size: 11.5px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

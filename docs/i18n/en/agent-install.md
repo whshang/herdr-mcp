@@ -23,7 +23,7 @@ Node.js is required only for temporary Cloudflare Worker bootstrap (`npx wrangle
 
 ## 2. Install the native runtime from GitHub Releases (primary)
 
-1. Download the current stable platform binary from <https://github.com/whshang/herdr-mcp/releases> (current stable runtime: `v0.4.1`). Use a prerelease tag only when deliberately testing the preview channel.
+1. Download the current stable platform binary from <https://github.com/whshang/herdr-mcp/releases> (current stable runtime: `v0.4.2`). Use a prerelease tag only when deliberately testing the preview channel.
 2. Place it on `PATH` (for example `~/.local/bin/herdr-mcp`) and make it executable.
 3. Run:
 
