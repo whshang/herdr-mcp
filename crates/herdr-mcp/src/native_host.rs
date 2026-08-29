@@ -41,7 +41,7 @@ use hyper_util::rt::TokioIo;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 #[cfg(unix)]
-use tokio::time::timeout;
+use tokio::time::{MissedTickBehavior, interval, timeout};
 
 const MAX_NATIVE_MESSAGE: usize = 1024 * 1024;
 #[cfg(unix)]
@@ -81,6 +81,8 @@ const FORWARDED_HEADERS: &[&str] = &[
 struct HostConfig {
     expected_origin: String,
     socket_path: PathBuf,
+    #[cfg(test)]
+    enforce_owner_fence: bool,
 }
 
 #[cfg(unix)]
@@ -93,8 +95,35 @@ impl HostConfig {
         Ok(Self {
             expected_origin,
             socket_path,
+            #[cfg(test)]
+            enforce_owner_fence: true,
         })
     }
+}
+
+#[cfg(target_os = "macos")]
+fn owner_is_active(expected_origin: &str, registered_origin: Option<&str>) -> bool {
+    registered_origin == Some(expected_origin)
+}
+
+#[cfg(unix)]
+fn require_active_owner(config: &HostConfig) -> Result<(), String> {
+    #[cfg(test)]
+    if !config.enforce_owner_fence {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let registered = crate::native_host_install::current_registered_extension_origin()?;
+        if !owner_is_active(&config.expected_origin, registered.as_deref()) {
+            return Err("extension_origin_not_active".to_owned());
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = config;
+    }
+    Ok(())
 }
 
 pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
@@ -137,11 +166,25 @@ pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
             return Ok(ExitCode::SUCCESS);
         }
 
+        let message_type = message.get("type").and_then(Value::as_str).unwrap_or("");
+        if message_type == "identity" {
+            let active = require_active_owner(&config).is_ok();
+            write_native_message(
+                &mut writer,
+                &json!({
+                    "ok": true,
+                    "active": active,
+                    "extension_origin": config.expected_origin,
+                    "transport": "native",
+                }),
+            )?;
+            return Ok(ExitCode::SUCCESS);
+        }
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| format!("cannot build native-host runtime: {error}"))?;
-        let message_type = message.get("type").and_then(Value::as_str).unwrap_or("");
         match message_type {
             "request" => match runtime.block_on(proxy_request(&config, &message)) {
                 Ok(value) => write_native_message(&mut writer, &value)?,
@@ -481,6 +524,7 @@ fn projected_response_headers(response: &Response<Incoming>) -> Value {
 
 #[cfg(unix)]
 async fn proxy_request(config: &HostConfig, message: &Value) -> Result<Value, String> {
+    require_active_owner(config)?;
     validate_base_url(message.get("base_url"))?;
     let path = validate_proxy_path(message.get("path"))?;
     let method = proxy_method(message.get("method"))?;
@@ -514,6 +558,7 @@ async fn proxy_stream<W: Write>(
     message: &Value,
     writer: &mut W,
 ) -> Result<(), String> {
+    require_active_owner(config)?;
     validate_base_url(message.get("base_url"))?;
     let path = match message.get("path") {
         Some(path) => validate_proxy_path(Some(path))?,
@@ -550,16 +595,29 @@ async fn proxy_stream<W: Write>(
     }
 
     let mut body = response.into_body();
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| "native_stream_failed".to_owned())?;
-        let Ok(data) = frame.into_data() else {
-            continue;
-        };
-        for chunk in data.chunks(STREAM_CHUNK_BYTES) {
-            write_native_message(
-                writer,
-                &json!({"type": "stream_chunk", "chunk_b64": BASE64.encode(chunk)}),
-            )?;
+    let mut owner_fence = interval(Duration::from_secs(1));
+    owner_fence.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = owner_fence.tick() => {
+                require_active_owner(config)?;
+            }
+            frame = body.frame() => {
+                let Some(frame) = frame else {
+                    break;
+                };
+                require_active_owner(config)?;
+                let frame = frame.map_err(|_| "native_stream_failed".to_owned())?;
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                for chunk in data.chunks(STREAM_CHUNK_BYTES) {
+                    write_native_message(
+                        writer,
+                        &json!({"type": "stream_chunk", "chunk_b64": BASE64.encode(chunk)}),
+                    )?;
+                }
+            }
         }
     }
     write_native_message(writer, &json!({"type": "stream_end"}))
@@ -658,6 +716,16 @@ mod tests {
         assert!(validate_extension_origin("https://example.com/").is_err());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn active_owner_fence_requires_the_exact_current_origin() {
+        let expected = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/";
+        let other = "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/";
+        assert!(owner_is_active(expected, Some(expected)));
+        assert!(!owner_is_active(expected, Some(other)));
+        assert!(!owner_is_active(expected, None));
+    }
+
     #[cfg(unix)]
     #[test]
     fn extension_dir_helpers_require_manifest_json() {
@@ -709,6 +777,7 @@ mod tests {
         let config = HostConfig {
             expected_origin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/".to_owned(),
             socket_path: path.clone(),
+            enforce_owner_fence: false,
         };
         let result = proxy_request(
             &config,
@@ -761,6 +830,7 @@ mod tests {
         let config = HostConfig {
             expected_origin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/".to_owned(),
             socket_path: path.clone(),
+            enforce_owner_fence: false,
         };
         let mut output = Vec::new();
         proxy_stream(

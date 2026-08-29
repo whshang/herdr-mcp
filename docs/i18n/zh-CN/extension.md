@@ -20,7 +20,7 @@ herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
-`0.4.1+` 的普通 `native-host install` 会直接使用官方 Chrome Web Store 扩展身份，不要求本机存在 unpacked extension 目录或源码 checkout。已有、确认为 herdr-mcp 自己管理的开发 origin 会走事务式迁移，并保留 rollback 能力。
+全新安装时，`0.4.1+` 的普通 `native-host install` 会直接使用官方 Chrome Web Store 扩展身份，不要求本机存在 unpacked extension 目录或源码 checkout。到 `0.4.2+`，维护者可以让一个 unpacked Dev 版本和 Store 版本同时安装在 Chrome 中，但 herdr-mcp 同时仍只授权一个 active/default Native Messaging origin。
 
 5. 打开 ChatGPT 或其它当前支持页面。z.ai 与 DeepSeek 属于实验性集成，默认关闭；需要在 **Herdr 设置 → 实验性功能** 中分别开启，然后刷新对应网页；
 6. 点击浏览器工具栏里的 Herdr 图标，确认 **浏览器控制中心**直接在 Chrome Side Panel 打开；
@@ -137,9 +137,16 @@ Pinned Target 不会因为 Herdr focus 变化自动漂移。
 维护者请使用：
 
 - `contracts/browser-extension-store.json` 作为 Chrome Web Store 身份的唯一机器可读 SSOT；Rust 只读取和校验这个 contract，不在源码里硬编码 Store ID；
-- `HERDR_EXTENSION_PATH=/path/to/unpacked/extension herdr-mcp native-host install` 显式测试 unpacked 开发身份；
+- `herdr-mcp native-host dev enable [PATH]` 登记并激活一个 unpacked Dev 身份（`PATH` 默认是 `./extension`）；
+- `herdr-mcp native-host use store` / `herdr-mcp native-host use dev` 在不卸载另一份 Chrome 扩展的情况下切换唯一 active/default 浏览器 owner；
+- `herdr-mcp native-host dev disable` 撤销 Dev 身份并让 Store 回到 active；
+- `HERDR_EXTENSION_PATH=/path/to/unpacked/extension herdr-mcp native-host install` 只保留为旧维护者流程的兼容写法；
 - `docs/_wip/browser-extension-development-and-store-release.md` 维护商店流程；
 - `AGENTS.md` 中的 extension 验证与发布边界。
+
+Store 与 Dev 可以作为两份 Chrome 扩展共存，但受管 Native Messaging manifest 始终只有一个精确的 `allowed_origins`：当前 active owner。非 active 的 `0.1.76+` 扩展保持安装但进入 standby，不启动本地 shared stream，也不渲染 operational HUD。切换 active owner 后，Rust Native Host 还会通过受管 origin fence 撤销旧 build 已经打开的 Native Messaging request/stream，避免旧 persistent connection 继续保有本地控制权。unpacked 目录移动后 Chromium 的路径派生 ID 会变化，因此必须重新执行 `dev enable`。
+
+执行 `native-host use store` 或 `native-host use dev` 后，请刷新已经打开的受支持 Web AI 页面。`0.1.76+` 的 page-owner gate 在 content script 注入最前面决定页面归属；刷新后 newly-active build 才会接管页面，inactive sibling 会在注册页面监听器或 HUD/Queue UI 之前直接退出。因此同时启用 Store+Dev 的完整安全共存要求两份浏览器扩展都达到 `0.1.76+`；首次提交审核的 `0.1.75` Store candidate 仍按 Store-only 候选验证，不原地改包。
 
 正式商店发布后，最终用户文档只保留 Chrome Web Store 安装路径。
 

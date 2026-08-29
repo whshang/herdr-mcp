@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { localHerdrFetch, openLocalHerdrStream, HERDR_NATIVE_HOST } from "../extension/local-auth.js";
+import { getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, HERDR_NATIVE_HOST } from "../extension/local-auth.js";
 
 test("extension proxies localhost requests through Native Messaging without forwarding bearer auth", async () => {
   const oldChrome = globalThis.chrome;
   let seen = null;
   globalThis.chrome = {
     runtime: {
+      id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       lastError: null,
       sendNativeMessage(host, message, callback) {
         assert.equal(host, HERDR_NATIVE_HOST);
@@ -48,6 +49,7 @@ test("extension receives push SSE bytes over one persistent Native Messaging str
   let disconnected = false;
   globalThis.chrome = {
     runtime: {
+      id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       lastError: null,
       connectNative(host) {
         assert.equal(host, HERDR_NATIVE_HOST);
@@ -86,6 +88,56 @@ test("extension receives push SSE bytes over one persistent Native Messaging str
     assert.equal(Buffer.concat(chunks).toString("utf8"), "event: hello\ndata: {\"ok\":true}\n\n");
     stream.close();
     assert.equal(disconnected, false, "already-ended native stream needs no forced disconnect");
+  } finally {
+    globalThis.chrome = oldChrome;
+  }
+});
+
+
+test("extension confirms active ownership through Chromium-admitted native identity", async () => {
+  const oldChrome = globalThis.chrome;
+  let seen = null;
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      sendNativeMessage(host, message, callback) {
+        assert.equal(host, HERDR_NATIVE_HOST);
+        seen = message;
+        callback({ ok: true, active: true, extension_origin: "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/" });
+      },
+    },
+  };
+  try {
+    const result = await getNativeExtensionOwnerStatus();
+    assert.equal(result.ok, true);
+    assert.equal(result.active, true);
+    assert.equal(seen.type, "identity");
+  } finally {
+    globalThis.chrome = oldChrome;
+  }
+});
+
+test("extension treats Chromium native-host admission denial as standby", async () => {
+  const oldChrome = globalThis.chrome;
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      sendNativeMessage(_host, _message, callback) {
+        globalThis.chrome.runtime.lastError = {
+          message: "Access to the specified native messaging host is forbidden.",
+        };
+        callback(undefined);
+        globalThis.chrome.runtime.lastError = null;
+      },
+    },
+  };
+  try {
+    const result = await getNativeExtensionOwnerStatus();
+    assert.deepEqual(result, {
+      ok: true,
+      active: false,
+      reason: "native-origin-not-active",
+    });
   } finally {
     globalThis.chrome = oldChrome;
   }
