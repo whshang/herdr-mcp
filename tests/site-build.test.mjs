@@ -72,46 +72,58 @@ test("documentation site build publishes every logical doc x 2 locales under loc
   assert.deepEqual(flat, [], `flat single-language doc pages must not be published: ${flat.join(",")}`);
 });
 
-test("neutral /docs/ entry routes by browser language straight to the first document", async () => {
+test("neutral /docs/ entry routes by browser language to real locale homepages", async () => {
   assert.equal(DEFAULT_LOCALE, "en", "English must be the default locale");
   const entry = await readFile(join(OUT, "docs", "index.html"), "utf8");
   assert.match(entry, /<html lang="en">/);
-  // No language chooser: no locale cards, no flattened doc nav, no per-locale search.
-  assert.doesNotMatch(entry, /chooser|data-doc-slug|class="doc-card"/, "docs entry must not be a language chooser");
-  assert.doesNotMatch(entry, /data-search-open|data-search-dialog/, "docs entry is a redirect, not a searchable page");
-  const first = DOC_ORDER[0];
-  // Default forwards to the first English document; zh browsers are routed to
-  // the Chinese first document so the entry never dumps them into English.
-  assert.match(entry, new RegExp(`<meta http-equiv="refresh" content="0; url=\\./en/${first}\\.html">`));
+  assert.doesNotMatch(entry, /data-search-open|data-search-dialog/, "neutral docs entry stays a lightweight locale router");
+  assert.match(entry, /<meta http-equiv="refresh" content="0; url=\.\/en\/">/);
   assert.match(entry, /herdr-docs-lang/, "docs entry must carry the language-routing script");
-  assert.match(entry, new RegExp(`location\\.replace\\(wantsZh \\? "\\./zh-CN/${first}\\.html" : "\\./en/${first}\\.html"\\)`));
-  assert.match(entry, new RegExp(`href="\\./en/${first}\\.html"`), "fallback link to the English first document");
-  assert.match(entry, new RegExp(`href="\\./zh-CN/${first}\\.html"`), "fallback link to the Chinese first document");
-  assert.match(entry, new RegExp(`rel="canonical" href="${ORIGIN}/docs/en/${first}\\.html"`));
+  assert.match(entry, /location\.replace\(wantsZh \? "\.\/zh-CN\/" : "\.\/en\/"\)/);
+  assert.match(entry, /href="\.\/en\/"/, "fallback link to the English homepage");
+  assert.match(entry, /href="\.\/zh-CN\/"/, "fallback link to the Chinese homepage");
+  assert.match(entry, new RegExp(`rel="canonical" href="${ORIGIN}/docs/en/"`));
   assert.deepEqual(
     matches(entry, /rel="alternate" hreflang="([^"]+)"/g).map((m) => m[1]).filter((lang) => lang !== "x-default"),
     LOCALES,
     "docs entry must advertise one hreflang alternate per locale"
   );
-  assert.match(entry, new RegExp(`rel="alternate" hreflang="x-default" href="${ORIGIN}/docs/${DEFAULT_LOCALE}/${first}\\.html"`));
+  assert.match(entry, new RegExp(`rel="alternate" hreflang="x-default" href="${ORIGIN}/docs/${DEFAULT_LOCALE}/"`));
   assert.match(entry, /href="\.\.\/style\.css"/);
 });
 
-test("each locale docs entry redirects straight to the first document page", async () => {
+test("each locale docs entry is a real user-first homepage", async () => {
   for (const locale of LOCALES) {
     const ui = UI[locale];
-    const first = DOC_ORDER[0];
     const entry = await readFile(join(OUT, "docs", locale, "index.html"), "utf8");
     assert.match(entry, new RegExp(`<html lang="${ui.htmlLang}">`));
-    assert.match(entry, new RegExp(`rel="canonical" href="${ORIGIN}/docs/${locale}/${first}\\.html"`));
+    assert.match(entry, new RegExp(`rel="canonical" href="${ORIGIN}/docs/${locale}/"`));
     for (const lang of LOCALES) {
-      assert.match(entry, new RegExp(`rel="alternate" hreflang="${lang}" href="${ORIGIN}/docs/${lang}/${first}\\.html"`));
+      assert.match(entry, new RegExp(`rel="alternate" hreflang="${lang}" href="${ORIGIN}/docs/${lang}/"`));
     }
-    assert.match(entry, new RegExp(`rel="alternate" hreflang="x-default" href="${ORIGIN}/docs/${DEFAULT_LOCALE}/${first}\\.html"`));
-    assert.match(entry, new RegExp(`<meta http-equiv="refresh" content="0; url=\\./${first}\\.html">`));
-    assert.match(entry, new RegExp(`location\\.replace\\("\\./${first}\\.html"\\)`));
-    // A bare redirect: no landing hero, no cards, no search surface, no agent intro.
-    assert.doesNotMatch(entry, /class="doc-card"|data-nav-group|data-search-open|data-agent-intro/, `locale entry (${locale}) must be a bare redirect`);
+    assert.match(entry, new RegExp(`rel="alternate" hreflang="x-default" href="${ORIGIN}/docs/${DEFAULT_LOCALE}/"`));
+    assert.doesNotMatch(entry, /http-equiv="refresh"|location\.replace\(/, `locale homepage (${locale}) must not redirect to an article`);
+    assert.match(entry, /class="docs-page docs-home-page"/);
+    assert.match(entry, /data-agent-intro/);
+    assert.match(entry, /data-search-open/);
+    assert.match(entry, /data-search-dialog/);
+    assert.match(entry, /data-copy-code/);
+    assert.match(entry, /href="\.\/quick-agent-install\.html"/);
+    assert.match(entry, /href="\.\/install\.html"/);
+    assert.match(entry, /href="\.\/overview\.html"/);
+    assert.match(entry, /href="\.\/extension\.html"/);
+    assert.match(entry, /Cloudflare/);
+    assert.match(entry, /ChatGPT Connector/);
+    assert.match(entry, /docs\/history/);
+    assert.match(entry, new RegExp(ui.indexCtaConnect.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(entry, new RegExp(ui.homeHandoffsTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    const switcher = section(entry, '<nav class="lang-switcher"', "</nav>");
+    for (const lang of LOCALES) {
+      assert.match(switcher, new RegExp(`href="\\.\\./${lang}/index\\.html"`));
+    }
+    const sidebar = section(entry, '<nav class="sidebar-nav"', "</nav>");
+    const sidebarSlugs = matches(sidebar, /data-doc-slug="([^"]+)"/g).map((m) => m[1]);
+    assert.deepEqual(sidebarSlugs, DOC_ORDER, `homepage sidebar (${locale}) must preserve the article reading order`);
   }
 });
 
