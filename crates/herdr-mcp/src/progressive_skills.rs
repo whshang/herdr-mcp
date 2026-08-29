@@ -1,5 +1,5 @@
 use crate::agent_visibility::AgentVisibility;
-use crate::capability_inventory::CapabilityInventoryStore;
+use crate::capability_inventory::{AgentCapabilityRecord, CapabilityInventoryStore};
 use crate::capability_resolver::project_capabilities_with_inventory;
 use crate::paths::RuntimePaths;
 use serde_json::{Map, Value, json};
@@ -245,6 +245,18 @@ impl ProgressiveSkillService {
     }
 
     pub fn bootstrap(&self, snapshot: &Value) -> Value {
+        let inventory = RuntimePaths::discover()
+            .ok()
+            .and_then(|paths| CapabilityInventoryStore::load_existing(&paths.config_dir).ok())
+            .unwrap_or_default();
+        self.bootstrap_with_inventory(snapshot, &inventory)
+    }
+
+    fn bootstrap_with_inventory(
+        &self,
+        snapshot: &Value,
+        inventory: &[AgentCapabilityRecord],
+    ) -> Value {
         let global_content = GLOBAL_AGENTS.trim();
         let global_digest = Digest::from_content(global_content);
         let catalog = self.catalog();
@@ -273,7 +285,7 @@ impl ProgressiveSkillService {
                 "sticky": "conversation/task-context until source identity or digest changes, new capability domain, handoff, or explicit refresh",
                 "authorization": "none"
             },
-            "capability_snapshot": capability_summary(snapshot),
+            "capability_snapshot": capability_summary_with_inventory(snapshot, inventory),
             "bytes": content.len(),
         })
     }
@@ -513,13 +525,12 @@ fn load_evidence_json(evidence: &LoadEvidence) -> Value {
     })
 }
 
-fn capability_summary(snapshot: &Value) -> Value {
+fn capability_summary_with_inventory(
+    snapshot: &Value,
+    inventory: &[AgentCapabilityRecord],
+) -> Value {
     let visibility = AgentVisibility::from_env();
-    let inventory = RuntimePaths::discover()
-        .ok()
-        .and_then(|paths| CapabilityInventoryStore::load_existing(&paths.config_dir).ok())
-        .unwrap_or_default();
-    let snapshot = project_capabilities_with_inventory(snapshot, &visibility, &inventory);
+    let snapshot = project_capabilities_with_inventory(snapshot, &visibility, inventory);
     let mut status_counts = Map::new();
     for worker in &snapshot.workers {
         let count = status_counts
@@ -711,7 +722,7 @@ mod tests {
                 "state_change_seq": 99
             }]
         });
-        let bootstrap = service.bootstrap(&changed_snapshot);
+        let bootstrap = service.bootstrap_with_inventory(&changed_snapshot, &[]);
         assert_eq!(bootstrap["capability_snapshot"]["revision"], 99);
         assert_eq!(service.cache_len(), 1);
 
@@ -772,7 +783,7 @@ mod tests {
     #[test]
     fn bootstrap_exposes_agents_catalog_and_load_schema_without_skill_bodies() {
         let service = ProgressiveSkillService::new();
-        let result = service.bootstrap(&snapshot());
+        let result = service.bootstrap_with_inventory(&snapshot(), &[]);
         assert_eq!(result["ok"], true);
         assert_eq!(result["mode"], "progressive");
         assert_eq!(result["catalog"].as_array().unwrap().len(), 7);
