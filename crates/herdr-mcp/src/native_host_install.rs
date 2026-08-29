@@ -1860,6 +1860,7 @@ fn install_targets(home: &Path) -> Vec<(PathBuf, bool)> {
     let app_support = home.join("Library").join("Application Support");
     [
         (vec!["Google", "Chrome"], true),
+        (vec!["Google", "ChromeForTesting"], false),
         (vec!["Google", "Chrome Beta"], false),
         (vec!["Google", "Chrome Canary"], false),
         (vec!["Chromium"], false),
@@ -2306,6 +2307,27 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn install_targets_include_chrome_for_testing_as_optional() {
+        let home = PathBuf::from("/tmp/herdr-cft-target-test-home");
+        let target = home
+            .join("Library")
+            .join("Application Support")
+            .join("Google")
+            .join("ChromeForTesting")
+            .join("NativeMessagingHosts");
+        let targets = install_targets(&home);
+        let matches = targets
+            .iter()
+            .filter(|(path, _)| path == &target)
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1);
+        assert!(
+            !matches[0].1,
+            "Chrome for Testing is a dev/UAT target, not an always-created user target"
+        );
+    }
 
     fn fixture() -> (PathBuf, InstallPaths) {
         let root = env::temp_dir().join(format!(
@@ -2836,11 +2858,13 @@ mod tests {
         let backup_dir = paths.backups_dir.join(&id);
         let prior_wrapper = fs::read(&paths.wrapper).unwrap();
 
-        // Arm the failpoint to abort after the 8th restore mutation. Evidence
-        // entries are ordered manifest-0..6 then binary then wrapper, so the
-        // binary (entry 8) is restored and the failpoint then aborts before the
-        // wrapper is restored.
-        arm_failpoint_after_n_mutations(8);
+        // Evidence entries are ordered one per managed browser target, then the
+        // runtime binary, then the wrapper. Derive the failpoint from that
+        // semantic boundary so adding/removing an optional browser target does
+        // not silently retarget this recovery test. After this entry the binary
+        // is restored and the failpoint aborts before the wrapper is restored.
+        let fail_after_binary = paths.targets.len() as u32 + 1;
+        arm_failpoint_after_n_mutations(fail_after_binary);
         let error = rollback(&paths).unwrap_err();
         assert!(error.contains("injected native-host restore failure"));
         // The injected failure must leave the durable marker and READY intact so

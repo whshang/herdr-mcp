@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-29",
+  "source_runtime_version": "0.4.2",
+  "extension_source_version": "0.1.76",
+  "store_candidate_version": "0.1.75",
+  "store_candidate_state": "pending_review_unlisted_not_yet_real-install-verified",
+  "chrome": {
+    "branded_version": "152.0.7977.65",
+    "automation_boundary": "Branded Chrome no longer supports command-line unpacked side-loading; official Chrome uses Developer Mode -> Load unpacked, while automated unpacked UAT uses Chrome for Testing or Chromium."
+  },
+  "chrome_for_testing": {
+    "version": "152.0.7977.64",
+    "platform": "mac-arm64",
+    "download_scope": "temporary /tmp UAT only",
+    "extension_id": "dklcamincneeijhcelpkdbcekfemldii",
+    "extension_path": "/Users/qingxian/Documents/herdr-mcp/extension",
+    "from_webstore": false,
+    "disable_reasons": [],
+    "service_worker_started": true,
+    "control_center_loaded": true,
+    "control_center_title": "Herdr 浏览器控制中心"
+  },
+  "native_host": {
+    "new_optional_target": "~/Library/Application Support/Google/ChromeForTesting/NativeMessagingHosts/dev.herdr.mcp.json",
+    "chrome_146_plus_separate_target": true,
+    "isolated_install": {
+      "home": "/tmp/herdr-cft-uat-home",
+      "config": "/tmp/herdr-cft-uat-config",
+      "installed_manifests": [
+        "Google/Chrome/NativeMessagingHosts/dev.herdr.mcp.json",
+        "Google/ChromeForTesting/NativeMessagingHosts/dev.herdr.mcp.json"
+      ],
+      "allowed_origin": "chrome-extension://dklcamincneeijhcelpkdbcekfemldii/",
+      "runtime_version": "0.4.2",
+      "owned_manifest_count": 2
+    },
+    "browser_identity_probe": {
+      "ok": true,
+      "active": true,
+      "transport": "native",
+      "extension_origin": "chrome-extension://dklcamincneeijhcelpkdbcekfemldii/",
+      "last_error": null
+    },
+    "control_center_owner_probe": {
+      "ok": true,
+      "active": true,
+      "transport": "native"
+    },
+    "runtime_state_probe": {
+      "ok": false,
+      "error": "extension_ipc_unavailable",
+      "classification": "isolated-UAT-only limitation; the candidate config intentionally did not own the production extension IPC socket and this result is not counted as a runtime-state E2E pass"
+    }
+  },
+  "automated_extension_regression": {
+    "tests": 75,
+    "passed": 75,
+    "manual_static_smoke": "PASS",
+    "covers": [
+      "Store contract/listing",
+      "owner gate",
+      "Native Messaging transport contract",
+      "Control Plane",
+      "handoff/recovery",
+      "429/backoff",
+      "optional permissions",
+      "deterministic packaging",
+      "local auth"
+    ]
+  },
+  "rust_native_host_regression": {
+    "tests": 29,
+    "passed": 29,
+    "clippy_deny_warnings": "PASS",
+    "restore_failpoint": "derived from semantic target-count boundary rather than a fixed browser-target count"
+  },
+  "production_safety": {
+    "ordinary_chrome_manifest_sha256_before": "02687feef6aff4a8b24829dbc1fb0562af49cc621f760791a9bcf8c79ddf675e",
+    "ordinary_chrome_manifest_mutated": false,
+    "store_candidate_package_mutated": false,
+    "real_cft_default_manifest_prestate": "absent",
+    "real_cft_default_manifest_restored_to_prestate": true
+  },
+  "acceptance": {
+    "unpacked_cft_load": "PASS",
+    "cft_native_identity": "PASS",
+    "control_center_native_owner": "PASS",
+    "native_host_cft_target": "PASS",
+    "automated_extension_regression": "PASS",
+    "store_id_real_install": "BLOCKED_PENDING_STORE_REVIEW_INSTALLABILITY",
+    "provider_page_manual_matrix": "OPEN",
+    "store_plus_dev_same_profile_real_uat": "BLOCKED_UNTIL_STORE_BUILD_0_1_76_PLUS"
+  },
+  "release_gates": {
+    "rust": {
+      "result": "PASS",
+      "unit_tests": 562,
+      "guardian_process_tests": 1
+    },
+    "node": {
+      "result": "PASS",
+      "node_tests": 439,
+      "edge_tests": 228,
+      "browser_extension_smoke": "PASS"
+    },
+    "hygiene": {
+      "result": "PASS",
+      "git_diff_check": "PASS"
+    }
+  }
+}
