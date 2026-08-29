@@ -337,7 +337,11 @@ test("release.json, skill artifact and design invariants are preserved", async (
   const home = await readFile(join(OUT, "index.html"), "utf8");
   assert.match(home, /herdr-mcp/);
   const docsHome = await readFile(join(OUT, "docs", DEFAULT_LOCALE, "index.html"), "utf8");
-  assert.match(docsHome, new RegExp(`class="version-badge"[^>]*>v${runtimeVersion.replaceAll(".", "\\.")}<`));
+  const zhDocsHome = await readFile(join(OUT, "docs", "zh-CN", "index.html"), "utf8");
+  const escapedRuntimeVersion = runtimeVersion.replaceAll(".", "\\.");
+  assert.match(docsHome, new RegExp(`class="version-badge"[^>]*aria-label="Source version: v${escapedRuntimeVersion}"[^>]*>Source version v${escapedRuntimeVersion}<`));
+  assert.match(zhDocsHome, new RegExp(`class="version-badge"[^>]*aria-label="源码版本: v${escapedRuntimeVersion}"[^>]*>源码版本 v${escapedRuntimeVersion}<`));
+  assert.doesNotMatch(docsHome, /Current version/, "main-built docs must not claim an unpublished source version is the current stable release");
   assert.match(home, /<html lang="en">/);
   assert.match(home, /rel="icon" type="image\/png" href="\.\/favicon\.png"/);
   assert.match(home, /herdr-docs-lang/, "homepage must route zh browsers to the zh mirror");

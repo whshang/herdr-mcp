@@ -110,7 +110,7 @@ export const UI = {
     indexHome: "首页",
     indexSource: "源码",
     indexFooterAria: "文档索引底部导航",
-    versionBadgeAria: "当前版本",
+    versionBadgeAria: "源码版本",
     agentIntroTitle: "最快方式：让 Coding Agent 直接安装",
     agentIntroLead: "把下面提示词交给本地 Coding Agent。它应该先读完整安装协议，再自动执行能够自动化的步骤。",
     agentPrompt:
@@ -181,7 +181,7 @@ export const UI = {
     indexHome: "Home",
     indexSource: "Source",
     indexFooterAria: "Documentation index footer",
-    versionBadgeAria: "Current version",
+    versionBadgeAria: "Source version",
     agentIntroTitle: "Fastest path: let your coding agent install it",
     agentIntroLead:
       "Give this prompt to your local coding agent. It should read the complete install protocol first, then automate everything that does not require you personally.",
