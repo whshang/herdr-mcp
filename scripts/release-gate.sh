@@ -39,6 +39,7 @@ scrub_test_environment() {
     HERDR_EXTENSION_ORIGIN \
     HERDR_EXTENSION_IPC_SOCKET \
     HERDR_CONFIG_PATH \
+    HERDR_BIN \
     HERDR_CLIENT_SOCKET_PATH \
     HERDR_SOCKET_PATH \
     HERDR_SOCKET \
@@ -72,6 +73,7 @@ setup_isolated_herdr() {
   export HERDR_SOCKET="${HERDR_STATE_DIR}/herdr.sock"
   export HERDR_SOCKET_PATH="${HERDR_SOCKET}"
   export HERDR_INSTALL_DIR="${GATE_TMP}/bin"
+  export HERDR_BIN="${HERDR_INSTALL_DIR}/herdr"
   # ci-herdr-runtime.sh runs in a child shell, so its PATH export cannot update
   # this release-gate process. Export the isolated install dir here so the Node
   # transport tests resolve the exact pinned Herdr binary in the same step.

@@ -6,7 +6,7 @@
  * more blind passthrough. `$ref` values are resolved against
  * `schemas.request.$defs` (that is where the daemon publishes param shapes).
  */
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 export interface ParamsSchema {
   /** Raw property map: name -> JSON schema fragment (may contain $ref/type/enum/anyOf). */
@@ -47,7 +47,12 @@ function loadSchema(force = false): SchemaDoc {
     return JSON.parse(schemaCache.raw) as SchemaDoc;
   }
   try {
-    const raw = execSync("herdr api schema --json", { encoding: "utf-8", timeout: SCHEMA_LOAD_TIMEOUT_MS });
+    const herdrBin = process.env.HERDR_BIN?.trim() || "herdr";
+    const raw = execFileSync(herdrBin, ["api", "schema", "--json"], {
+      encoding: "utf-8",
+      timeout: SCHEMA_LOAD_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     schemaCache = { raw, loadedAt: now };
     return JSON.parse(raw) as SchemaDoc;
   } catch (e) {
