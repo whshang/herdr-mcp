@@ -231,12 +231,14 @@ test("Rust release defaults to one authoritative macOS ARM64 + Windows x64 targe
   assert.doesNotMatch(release, /unknown-linux-gnu/);
 });
 
-test("tagged macOS Rust releases require a stable Developer ID code identity", async () => {
+test("tagged releases and manual qualification require the same stable Developer ID identity", async () => {
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
   const signer = await readFile(join(ROOT, "scripts/sign-macos-release.sh"), "utf8");
-  assert.match(release, /Sign tagged macOS release identity/);
-  assert.match(release, /startsWith\(github\.ref, 'refs\/tags\/v'\)/);
-  assert.match(release, /contains\(matrix\.target, 'apple-darwin'\)/);
+  assert.match(release, /Sign macOS release or qualification identity/);
+  assert.match(
+    release,
+    /if: \(startsWith\(github\.ref, 'refs\/tags\/v'\) \|\| github\.event_name == 'workflow_dispatch'\) && contains\(matrix\.target, 'apple-darwin'\)/,
+  );
   assert.match(release, /HERDR_MACOS_CERT_P12_BASE64: \${{ secrets\.HERDR_MACOS_CERT_P12_BASE64 }}/);
   assert.match(release, /HERDR_MACOS_CERT_PASSWORD: \${{ secrets\.HERDR_MACOS_CERT_PASSWORD }}/);
   assert.match(release, /HERDR_MACOS_SIGNING_IDENTITY: \${{ secrets\.HERDR_MACOS_SIGNING_IDENTITY }}/);
@@ -251,16 +253,19 @@ test("tagged macOS Rust releases require a stable Developer ID code identity", a
   assert.match(signer, /designated requirement is still cdhash-bound/);
 });
 
-test("Rust GitHub Release provenance is tag-only and fail-closed before publish", async () => {
+test("Rust GitHub Release provenance keeps manual qualification signed and tag-only publish fail-closed", async () => {
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
   const attestJob = release.indexOf("\n  attest:\n");
+  const qualificationJob = release.indexOf("\n  qualification:\n");
   const publishJob = release.indexOf("\n  publish:\n");
   assert.ok(attestJob >= 0, "release workflow must have a dedicated attestation job");
-  assert.ok(publishJob > attestJob, "attestation must be declared before GitHub Release publishing");
-  const attest = release.slice(attestJob, publishJob);
+  assert.ok(qualificationJob > attestJob, "manual qualification must consume the attested bundle");
+  assert.ok(publishJob > qualificationJob, "GitHub Release publishing must remain a separate final job");
+  const attest = release.slice(attestJob, qualificationJob);
+  const qualification = release.slice(qualificationJob, publishJob);
   const publish = release.slice(publishJob);
   assert.match(attest, /needs: manifest/);
-  assert.match(attest, /if: startsWith\(github\.ref, 'refs\/tags\/v'\)/);
+  assert.match(attest, /if: startsWith\(github\.ref, 'refs\/tags\/v'\) \|\| github\.event_name == 'workflow_dispatch'/);
   assert.match(attest, /contents: read/);
   assert.match(attest, /id-token: write/);
   assert.match(attest, /attestations: write/);
@@ -279,7 +284,7 @@ test("Rust GitHub Release provenance is tag-only and fail-closed before publish"
   assert.match(release, /--source-ref \"\$GITHUB_REF\"/);
   assert.match(release, /--workflow-name \"\$GITHUB_WORKFLOW\"/);
   assert.match(publish, /needs: attest/, "GitHub Release publishing must fail closed when attestation fails");
-  assert.match(publish, /if: startsWith\(github\.ref, 'refs\/tags\/v'\)/);
+  assert.match(publish, /if: github\.event_name == 'push' && startsWith\(github\.ref, 'refs\/tags\/v'\)/);
   assert.match(publish, /Verify immutable release identity/);
   assert.match(publish, /manifest source_commit does not match tag commit/);
   assert.match(
@@ -296,7 +301,14 @@ test("Rust GitHub Release provenance is tag-only and fail-closed before publish"
   );
   assert.match(publish, /release_flags=\(--verify-tag --generate-notes\)/);
   assert.match(publish, /release_flags\+=\(--prerelease\)/, "semver prereleases must be marked as GitHub prereleases");
-  assert.doesNotMatch(attest, /workflow_dispatch/);
+  assert.match(qualification, /needs: attest/);
+  assert.match(qualification, /if: github\.event_name == 'workflow_dispatch'/);
+  assert.match(qualification, /Verify signed qualification source identity/);
+  assert.match(qualification, /qualification source_commit does not match dispatched commit/);
+  assert.match(qualification, /qualification source_ref does not match dispatched ref/);
+  assert.match(qualification, /qualification mode refuses a tag ref/);
+  assert.doesNotMatch(qualification, /gh release create/);
+  assert.match(publish, /github\.event_name == 'push'/);
   assert.doesNotMatch(publish, /workflow_dispatch/);
 });
 test("Rust Release recovery republishes only a previously attested GitHub run", async () => {
