@@ -1,8 +1,16 @@
 # 总览
 
-herdr-mcp 让 ChatGPT 等 Web AI 直接参与本机软件开发：读取和修改代码、搜索仓库、查看 Git、运行命令、观察 Herdr 工作区，并在需要时调度本地 coding agent。数据和执行仍留在自己的机器上，公网侧只提供稳定、可认证的 MCP 入口。
+## 从 Web AI 已经拥有的能力开始
 
-它解决的是一个很具体的问题：网页模型推理能力强、上下文大，但天然看不到你的终端、仓库和正在运行的 Agent；本地 Coding Agent 能操作机器，却通常各自困在一个终端会话里。Herdr 提供持久工作区、真实 PTY、Agent 状态和 Socket API，herdr-mcp 再把这些能力压缩成适合远程模型使用的控制面。
+ChatGPT 等 Web AI 的价值不只在模型能力，还在订阅产品提供的可用推理额度。实际使用中，这个额度与 API / 本地 Coding Agent 的计费和限额结构可能有显著差异；具体额度会随账号、模型和产品策略变化，因此 Herdr-MCP 不把任何固定倍率当作产品保证。
+
+真正改变架构的是 MCP：只要 Web AI 支持通过 MCP 调用一个 HTTP 服务，网页里的强模型就不再只能聊天，它可以安全地连接到用户自己的执行环境。
+
+最简单的方案是 Web AI → MCP → files / Git / shell。Herdr-MCP 选择继续向前一步：把 MCP 接到一个持续存在、可观察、可人工接管的 Herdr 工作现场。
+
+> **MCP 让 Web AI 有了操作本机的双手；Herdr 给这些双手一个持续存在的工作现场；浏览器扩展再把本地变化接回 Web 对话。**
+
+这也是为什么项目没有重新实现一套 Coding Agent。确定性小任务由 Web AI 直接调用工具；复杂或并行工作再委派 Pi、Grok 等本地 Agent。ChatGPT 对话可以结束或接力，而本地 workspace、PTY、进程、Agent 和 worktree 不必随之消失。
 
 ## 你得到什么
 

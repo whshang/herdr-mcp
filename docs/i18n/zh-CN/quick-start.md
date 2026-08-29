@@ -8,9 +8,13 @@
 
 目标：在已经安装 Herdr 的情况下，让 ChatGPT 等 Web AI 第一次真正连接自己的开发环境。
 
-整个过程只需要理解一件事：
+整个过程只需要理解三句话：
 
-> Herdr 提供本机开发现场，herdr-mcp 把这个现场安全地连接给 Web AI。
+> **MCP 让 Web AI 有了操作本机的双手。** 你可以继续使用已经订阅的 ChatGPT / Web AI，而不是先换到另一套模型入口。
+>
+> **Herdr 给这些双手一个持续存在的工作现场。** workspace、终端、进程和 Agent 不依赖某一个 ChatGPT 对话存活。
+>
+> **浏览器扩展是可选的闭环层。** 没有它，MCP 的文件、Git、Shell、Agent 和多 workspace 能力照常工作；安装它以后，本地完成事件、页面恢复和长对话接力才能主动接回 Web 会话。
 
 ## 1. 准备本机开发现场
 
@@ -75,9 +79,11 @@ Herdr 工作站
 
 首次部署推荐使用 `workers.dev`。自定义域名属于长期生产优化，不是第一次运行的前置条件。
 
-### 路线 B：浏览器连续工作
+### 路线 B（可选）：给 MCP 增加反向通道
 
-适合：希望网页会话持续观察本地任务。
+适合：希望长任务完成后重新唤起 Web 工作流，或需要页面恢复、长对话接力和浏览器侧状态。
+
+只想让 ChatGPT 操作本机时可以完全跳过这一节。标准 MCP 解决的是 Web → workstation；扩展补的是 workstation / page → Web，这不是第一次连接的前置条件。
 
 先从 [Herdr Chrome Web Store 官方详情页](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) 安装扩展；如果首次发布仍处于 Draft、详情页不可用或商店搜索不到 Herdr，就先跳过这个可选步骤，不要改用本地开发版。然后运行：
 

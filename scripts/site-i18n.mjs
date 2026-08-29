@@ -40,6 +40,7 @@ export const DOC_ORDER = [
   "architecture",
   "capability-benchmark",
   "herdr-vs-ecosystem",
+  "remote-coding-ecosystem-research",
   "extension-wake",
   "extension-bridge",
   "agent-install",
@@ -61,7 +62,7 @@ export const NAV_GROUPS = [
   { slugs: ["best-practices", "automation", "cli-reference"] },
   { slugs: ["browser-continuity", "extension", "browser-control-center", "privacy"] },
   { slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade", "worker-fallbacks", "troubleshooting"] },
-  { slugs: ["design-philosophy", "architecture", "capability-benchmark", "herdr-vs-ecosystem"] },
+  { slugs: ["design-philosophy", "architecture", "capability-benchmark", "herdr-vs-ecosystem", "remote-coding-ecosystem-research"] },
   { slugs: MAINTAINER_DOCS, secondary: true },
 ];
 

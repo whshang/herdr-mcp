@@ -1,8 +1,12 @@
 # herdr-mcp
 
-**Connect ChatGPT / Web AI safely to your local Herdr workstation.**
+**Turn the reasoning capacity you already have in ChatGPT / Web AI into a persistent local development environment.**
 
-ChatGPT keeps the plan and decisions, Herdr keeps the real worksite alive, and herdr-mcp connects the browser model to local files, Git, shell, long-running jobs, and agents.
+Web AI subscriptions can provide substantially more usable reasoning capacity than many API or local-agent workflows, and MCP gives those browser models a standard way to call software on your machines. Herdr-MCP starts from that opportunity instead of introducing another model subscription.
+
+**MCP gives Web AI hands. Herdr gives those hands a persistent workplace. The optional browser extension closes the loop.**
+
+ChatGPT can inspect and modify code, use Git, run commands and tests, or delegate long-running work to local coding agents. Herdr keeps workspaces, terminals, processes and agents alive independently of any single chat, so parallel work and conversation handoff do not require rebuilding the local worksite.
 
 **Docs:** https://whshang.github.io/herdr-mcp/ · **Source:** https://github.com/whshang/herdr-mcp
 

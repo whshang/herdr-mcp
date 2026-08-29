@@ -1,8 +1,16 @@
 # Overview
 
-herdr-mcp lets ChatGPT and other Web AI work directly on a local software project: read and edit code, search repositories, inspect Git, run commands, observe Herdr workspaces, and delegate to local coding agents when independent reasoning is useful. Data and execution stay on your workstation; the public side provides a stable, authenticated MCP entry point.
+## Start with the capability already available in Web AI
 
-It addresses a concrete gap. Web models have strong reasoning and large conversational context, but cannot normally see your terminals, repositories, or running agents. Local coding agents can operate the machine, but are usually isolated inside individual terminal sessions. Herdr supplies persistent workspaces, real PTYs, agent state, and a Socket API; herdr-mcp turns that environment into a compact control plane designed for remote models.
+The value of ChatGPT and other Web AI products is not only model quality: subscriptions can also provide substantial usable reasoning capacity under a different quota and pricing model from APIs or local coding agents. Those limits change by account, model and product policy, so Herdr-MCP does not promise a fixed multiplier.
+
+MCP is the architectural unlock. Once a Web AI host can call an HTTP service through MCP, the strong model in the browser can reach software running in your own environment instead of remaining a chat-only surface.
+
+The simplest design is Web AI → MCP → files / Git / shell. Herdr-MCP goes one step further and connects MCP to a persistent, observable, human-takeover-friendly Herdr worksite.
+
+> **MCP gives Web AI hands. Herdr gives those hands a persistent workplace. The browser extension closes the loop.**
+
+That is also why Herdr-MCP does not reinvent another coding agent. The Web AI can perform deterministic small operations directly and delegate complex or parallel work to replaceable local agents. A browser conversation can end or hand off while the workspace, PTYs, processes, agents and worktrees remain alive.
 
 ## What you get
 
