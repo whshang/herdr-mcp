@@ -139,11 +139,6 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
 #[cfg(target_os = "macos")]
 pub fn sync_owned_runtime_from_active() -> Result<serde_json::Value, String> {
     let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
-    let view = status(&paths);
-    if let Some(result) = sync_preflight(&view)? {
-        return Ok(result);
-    }
-
     let home = home_dir()?;
     let active = crate::link::install::resolve_managed_runtime_binary(&home)?;
     sync_owned_runtime_with_active(&paths, &active)
@@ -174,8 +169,153 @@ fn sync_preflight(view: &Value) -> Result<Option<Value>, String> {
 }
 
 #[cfg(target_os = "macos")]
+fn managed_native_host_footprint_present(paths: &InstallPaths) -> bool {
+    path_present(&paths.runtime_binary)
+        || path_present(&paths.wrapper)
+        || paths
+            .targets
+            .iter()
+            .any(|(target, _)| path_present(&target.join(format!("{HOST_NAME}.json"))))
+}
+
+/// Refresh the wrapper identity contract for a pre-dual-mode Rust Native Host.
+///
+/// v0.4.1 already owned the stable wrapper/runtime/manifests but its wrapper did
+/// not remember `HERDR_DEV_EXTENSION_ORIGIN`. v0.4.2 intentionally makes that
+/// remembered Dev identity part of exact ownership. During a managed runtime
+/// update we may upgrade only a cohort that can still be proven to be the old
+/// Herdr-managed shape. Manifests and rollback evidence remain byte-for-byte
+/// untouched; the active admitted origin therefore cannot change as a side
+/// effect of runtime synchronization.
+#[cfg(target_os = "macos")]
+fn refresh_legacy_managed_wrapper_identity(paths: &InstallPaths) -> Result<bool, String> {
+    let current = status(paths);
+    if current
+        .get("owned_manifest_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
+        return Ok(false);
+    }
+    if !managed_native_host_footprint_present(paths) {
+        return Ok(false);
+    }
+    if current.get("recovery_required").and_then(Value::as_bool) == Some(true) {
+        return Err(
+            "native-host recovery is required before migrating legacy wrapper identity".to_owned(),
+        );
+    }
+
+    // A migratable legacy cohort must be complete. A partial managed footprint
+    // is ambiguous and therefore blocks the update rather than being treated as
+    // an uninstalled Native Host.
+    if !path_present(&paths.runtime_binary) || !path_present(&paths.wrapper) {
+        return Err(
+            "native-host legacy cohort is incomplete; refusing identity migration".to_owned(),
+        );
+    }
+    let present_manifests = paths
+        .targets
+        .iter()
+        .map(|(target, _)| target.join(format!("{HOST_NAME}.json")))
+        .filter(|path| path_present(path))
+        .count();
+    if present_manifests == 0 {
+        return Err(
+            "native-host legacy cohort has no managed manifests; refusing identity migration"
+                .to_owned(),
+        );
+    }
+
+    // The pre-dual-mode wrapper must already admit exactly the same active
+    // origin as the manifests. The only legacy difference we are allowed to
+    // repair is the absence of the remembered Dev origin line. A Herdr-looking
+    // wrapper with a different active origin or an incompatible Dev line is
+    // tampered/stale v0.4.2 state, not a v0.4.1 cohort.
+    let legacy_wrapper = fs::read_to_string(&paths.wrapper)
+        .map_err(|error| format!("cannot read legacy native-host wrapper: {error}"))?;
+    let expected_active_line = format!(
+        "export HERDR_EXTENSION_ORIGIN={}",
+        shell_quote(&paths.extension_origin)
+    );
+    if !legacy_wrapper
+        .lines()
+        .any(|line| line == expected_active_line)
+    {
+        return Err(
+            "native-host legacy wrapper active origin does not match registered manifests"
+                .to_owned(),
+        );
+    }
+    if wrapper_dev_extension_origin(&paths.wrapper)?.is_some() {
+        return Err(
+            "native-host wrapper already carries an incompatible remembered Dev identity"
+                .to_owned(),
+        );
+    }
+
+    // Reuse the installer's existing strict migration proof. It requires the
+    // Rust wrapper marker, the managed runtime target, and structurally-owned
+    // Herdr manifests. `InstallPaths::discover(Status)` has already rejected
+    // conflicting registered origins, so this cannot merge Store/Dev identities.
+    let mut migration_paths = paths.clone();
+    migration_paths.allow_origin_migration = true;
+    validate_cohort_ownership(&migration_paths).map_err(|error| {
+        format!("native-host legacy cohort is foreign or unsafe to migrate: {error}")
+    })?;
+
+    let registered_before = find_registered_origin(&paths.targets, &paths.wrapper)?;
+    if registered_before.as_deref() != Some(paths.extension_origin.as_str()) {
+        return Err(
+            "native-host legacy cohort active origin is ambiguous; refusing migration".to_owned(),
+        );
+    }
+
+    let original_wrapper = legacy_wrapper.into_bytes();
+    atomic_write(&paths.wrapper, wrapper_body(paths).as_bytes(), 0o700)?;
+
+    let refreshed = status(paths);
+    let refreshed_owned = refreshed
+        .get("owned_manifest_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let registered_after = find_registered_origin(&paths.targets, &paths.wrapper)?;
+    if refreshed_owned == 0 || registered_after != registered_before {
+        let restore = atomic_write(&paths.wrapper, &original_wrapper, 0o700);
+        return Err(match restore {
+            Ok(()) => {
+                "native-host legacy wrapper migration failed validation; original wrapper restored"
+                    .to_owned()
+            }
+            Err(error) => format!(
+                "native-host legacy wrapper migration failed validation and restore failed: {error}"
+            ),
+        });
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
 fn sync_owned_runtime_with_active(paths: &InstallPaths, active: &Path) -> Result<Value, String> {
-    let view = status_with_active_runtime(paths, Some(active));
+    let mut view = status_with_active_runtime(paths, Some(active));
+    if view.get("recovery_required").and_then(Value::as_bool) == Some(true) {
+        sync_preflight(&view)?;
+    }
+
+    let identity_migrated = if view
+        .get("owned_manifest_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        == 0
+    {
+        refresh_legacy_managed_wrapper_identity(paths)?
+    } else {
+        false
+    };
+    if identity_migrated {
+        view = status_with_active_runtime(paths, Some(active));
+    }
     if let Some(result) = sync_preflight(&view)? {
         return Ok(result);
     }
@@ -187,6 +327,7 @@ fn sync_owned_runtime_with_active(paths: &InstallPaths, active: &Path) -> Result
             "ok": true,
             "skipped": true,
             "reason": "already_current",
+            "identity_migrated": identity_migrated,
             "active_runtime": active,
             "native_runtime_version": read_binary_version(&paths.runtime_binary),
             "active_runtime_version": read_binary_version(active),
@@ -200,9 +341,18 @@ fn sync_owned_runtime_with_active(paths: &InstallPaths, active: &Path) -> Result
 
     atomic_copy_executable(active, &paths.runtime_binary)?;
     let refreshed = status_with_active_runtime(paths, Some(active));
+    if refreshed.get("ok").and_then(Value::as_bool) != Some(true)
+        || refreshed
+            .get("runtime_matches_current")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err("native-host runtime sync completed but the refreshed ownership/status gate is not healthy".to_owned());
+    }
     Ok(json!({
         "ok": true,
         "synced": true,
+        "identity_migrated": identity_migrated,
         "from": active,
         "native_runtime_version": refreshed.get("native_runtime_version").cloned(),
         "active_runtime_version": refreshed.get("active_runtime_version").cloned(),
@@ -2991,6 +3141,124 @@ mod tests {
         let again = sync_owned_runtime_with_active(&paths, &active_binary).unwrap();
         assert_eq!(again["skipped"], true);
         assert_eq!(again["reason"], "already_current");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_migrates_v041_dev_wrapper_without_rewriting_manifests_or_rollback() {
+        let (root, paths) = fixture();
+        let home = root.join("home");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        let active_binary =
+            write_managed_active_runtime(&config_dir, b"active-runtime-binary-v042");
+
+        install(&paths).unwrap();
+        let dev_origin = paths
+            .dev_extension_origin
+            .as_deref()
+            .expect("fixture must model an unpacked Dev identity");
+        assert_eq!(paths.extension_origin, dev_origin);
+
+        let rollback_before = fs::read(&paths.rollback_file).unwrap();
+        let manifests_before = paths
+            .targets
+            .iter()
+            .map(|(target, _)| target.join(format!("{HOST_NAME}.json")))
+            .filter(|path| path_present(path))
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        assert!(!manifests_before.is_empty());
+
+        // v0.4.1 only recorded the active origin. Remove the v0.4.2 remembered
+        // Dev line while retaining the exact Rust marker, managed binary target,
+        // and manifests to model an in-place stable upgrade.
+        let current_wrapper = fs::read_to_string(&paths.wrapper).unwrap();
+        let legacy_wrapper = current_wrapper
+            .lines()
+            .filter(|line| !line.starts_with("export HERDR_DEV_EXTENSION_ORIGIN="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        atomic_write(&paths.wrapper, legacy_wrapper.as_bytes(), 0o700).unwrap();
+
+        let before = status_with_active_runtime(&paths, Some(&active_binary));
+        assert_eq!(before["owned_manifest_count"], 0);
+        assert_eq!(before["runtime_matches_current"], false);
+        assert_eq!(
+            find_registered_origin(&paths.targets, &paths.wrapper)
+                .unwrap()
+                .as_deref(),
+            Some(dev_origin)
+        );
+
+        let synced = sync_owned_runtime_with_active(&paths, &active_binary).unwrap();
+        assert_eq!(synced["synced"], true);
+        assert_eq!(synced["identity_migrated"], true);
+        assert_eq!(
+            fs::read(&paths.runtime_binary).unwrap(),
+            fs::read(&active_binary).unwrap()
+        );
+
+        let refreshed_wrapper = fs::read_to_string(&paths.wrapper).unwrap();
+        assert!(refreshed_wrapper.contains(&format!(
+            "export HERDR_DEV_EXTENSION_ORIGIN={}",
+            shell_quote(dev_origin)
+        )));
+        let after = status_with_active_runtime(&paths, Some(&active_binary));
+        assert_eq!(after["ok"], true);
+        assert!(after["owned_manifest_count"].as_u64().unwrap() > 0);
+        assert_eq!(after["runtime_matches_current"], true);
+        // Fixture binaries are opaque bytes rather than runnable `--version`
+        // programs; version_consistent is covered by real-binary release UAT.
+        assert_eq!(
+            find_registered_origin(&paths.targets, &paths.wrapper)
+                .unwrap()
+                .as_deref(),
+            Some(dev_origin)
+        );
+
+        assert_eq!(fs::read(&paths.rollback_file).unwrap(), rollback_before);
+        for (path, before_bytes) in manifests_before {
+            assert_eq!(fs::read(path).unwrap(), before_bytes);
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_fails_closed_for_foreign_or_partial_native_host_footprint() {
+        let (root, paths) = fixture();
+        let home = root.join("home");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        let active_binary =
+            write_managed_active_runtime(&config_dir, b"active-runtime-binary-v042");
+
+        fs::create_dir_all(paths.runtime_binary.parent().unwrap()).unwrap();
+        fs::write(&paths.runtime_binary, b"legacy-runtime").unwrap();
+        fs::set_permissions(&paths.runtime_binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let tampered_origin = "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/";
+        let tampered_wrapper = format!(
+            "#!/bin/sh\n{WRAPPER_MARKER}\nexport HERDR_EXTENSION_ORIGIN={}\nexec {} extension-host \"$@\"\n",
+            shell_quote(tampered_origin),
+            shell_quote(paths.runtime_binary.to_string_lossy().as_ref()),
+        );
+        fs::write(&paths.wrapper, tampered_wrapper.as_bytes()).unwrap();
+        fs::set_permissions(&paths.wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest_path = paths.targets[0].0.join(format!("{HOST_NAME}.json"));
+        fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        write_json_file(&manifest_path, &manifest_value(&paths), 0o600).unwrap();
+
+        let error = sync_owned_runtime_with_active(&paths, &active_binary).unwrap_err();
+        assert!(error.contains("active origin does not match registered manifests"));
+        assert_eq!(fs::read(&paths.runtime_binary).unwrap(), b"legacy-runtime");
+        assert_eq!(
+            fs::read_to_string(&paths.wrapper).unwrap(),
+            tampered_wrapper
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
