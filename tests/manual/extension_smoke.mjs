@@ -74,9 +74,9 @@ const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.76", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.76"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.76"'), "content version matches manifest");
+ok(manifest.version === "0.1.77", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.77"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.77"'), "content version matches manifest");
 const ownerGateIndex = wakeSource.indexOf('type: "h2w_extension_owner_status"');
 const queueOwnerClaimIndex = wakeSource.indexOf('setAttribute(QUEUED_INSERT_OWNER_ATTR');
 ok(ownerGateIndex >= 0
@@ -232,6 +232,20 @@ ok(
   "ChatGPT loads the classic context-pressure policy before wake.js",
 );
 ok(
+  wakeSource.includes('type: "h2w_open_control_center"')
+    && wakeSource.includes('hudEls.bar.addEventListener("click"')
+    && backgroundSource.includes('msg?.type === "h2w_open_control_center"')
+    && backgroundSource.includes('chrome.sidePanel.open({ windowId })'),
+  "clicking the non-button HUD bar opens the Control Center Side Panel through the sender window",
+);
+ok(
+  wakeSource.includes('ui.quick.hidden = !hud?.project_id')
+    && wakeSource.includes('enable_project_gate: projectScope && !projectMode && on')
+    && backgroundSource.includes('msg.enable_project_gate === true && msg.enabled === true')
+    && backgroundSource.includes('project_automation_sender_mismatch'),
+  "Project HUD always exposes Auto and an explicit click can enable the guarded Project Auto capability",
+);
+ok(
   backgroundSource.includes("bound_workspace_ids:")
     && backgroundSource.includes("bound_workspace_count:")
     && backgroundSource.includes("bound_pane_count:")
@@ -317,7 +331,7 @@ ok(
     && backgroundSource.includes("authorizeConversationAutomation")
     && backgroundSource.includes('msg?.type === "h2w_set_project_automation"')
     && backgroundSource.includes("stored.enabled === true ? AUTOMATION_MODE_PROJECT : AUTOMATION_MODE_MANUAL")
-    && wakeSource.includes("hud?.project_automation_available !== true")
+    && wakeSource.includes("ui.quick.hidden = !hud?.project_id")
     && wakeSource.includes("hud?.conversation_automation_available !== true")
     && wakeSource.includes('site: ADAPTER.name')
     && wakeSource.includes('type: "h2w_set_project_automation"')

@@ -36,7 +36,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.76";
+const H2W_SCRIPT_VERSION = "0.1.77";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
@@ -3846,6 +3846,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true;
   }
+  if (msg?.type === "h2w_open_control_center") {
+    const windowId = Number(sender?.tab?.windowId);
+    if (!chrome.sidePanel?.open || !Number.isInteger(windowId) || windowId < 0) {
+      sendResponse({ ok: false, error: "control_center_unavailable" });
+      return false;
+    }
+    void chrome.sidePanel.open({ windowId })
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+    return true;
+  }
   if (msg?.type === "h2w_page_hud") {
     void (async () => {
       // HUD copy is generated from the locale catalog. A freshly started MV3
@@ -4006,9 +4017,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "project_required" });
         return;
       }
+      const senderUrl = String(sender?.tab?.url || sender?.url || "");
+      if (senderUrl) {
+        const senderInfo = chatGptConversationInfo(senderUrl);
+        if (!senderInfo || senderInfo.project_id !== projectId || (convKey && senderInfo.convKey !== convKey)) {
+          sendResponse({ ok: false, error: "project_automation_sender_mismatch" });
+          return;
+        }
+      }
       if (normalizeAutomationMode(CFG.automationMode) !== AUTOMATION_MODE_PROJECT) {
-        sendResponse({ ok: false, error: "global_manual_mode" });
-        return;
+        if (msg.enable_project_gate === true && msg.enabled === true) {
+          CFG.automationMode = AUTOMATION_MODE_PROJECT;
+          await chrome.storage.local.set({ automationMode: AUTOMATION_MODE_PROJECT });
+        } else {
+          sendResponse({ ok: false, error: "global_manual_mode" });
+          return;
+        }
       }
       if (msg.enabled === true) PROJECT_AUTOMATION[projectId] = true;
       else delete PROJECT_AUTOMATION[projectId];
