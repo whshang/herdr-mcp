@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.76";
+const H2W_CONTENT_VERSION = "0.1.77";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -2871,18 +2871,20 @@ const H2W_CONTENT_VERSION = "0.1.76";
 
   async function setHudProjectAutomation(enabled) {
     if (hudActionBusy) return;
-    const projectMode = hudCache?.project_automation_available === true && Boolean(hudCache?.project_id);
+    const projectScope = Boolean(hudCache?.project_id);
+    const projectMode = hudCache?.project_automation_available === true && projectScope;
     const conversationMode = hudCache?.conversation_automation_available === true;
-    if (!projectMode && !conversationMode) return;
+    if (!projectScope && !conversationMode) return;
     setHudActionBusy(true);
     try {
       const on = Boolean(enabled);
       const result = await sendBg({
         type: "h2w_set_project_automation",
-        project_id: projectMode ? hudCache.project_id : null,
+        project_id: projectScope ? hudCache.project_id : null,
         site: ADAPTER.name,
         convKey: ADAPTER.getConversationKey(),
         enabled: on,
+        enable_project_gate: projectScope && !projectMode && on,
       });
       if (result?.ok) {
         automationEnabled = on && hudCache?.runtime_available === true;
@@ -2891,7 +2893,8 @@ const H2W_CONTENT_VERSION = "0.1.76";
           enabled: on,
           effective_enabled: automationEnabled,
           idleNudgeEnabled: automationEnabled,
-          project_automation_enabled: projectMode ? on : hudCache?.project_automation_enabled,
+          project_automation_available: projectScope ? true : hudCache?.project_automation_available,
+          project_automation_enabled: projectScope ? on : hudCache?.project_automation_enabled,
           conversation_automation_enabled: conversationMode ? on : hudCache?.conversation_automation_enabled,
         };
         syncAutomationPermissionWatch();
@@ -3048,6 +3051,12 @@ const H2W_CONTENT_VERSION = "0.1.76";
     hudEls.quick.addEventListener("click", () => {
       void setHudProjectAutomation(!(hudCache?.enabled === true));
     });
+    hudEls.bar.addEventListener("click", (event) => {
+      if (event.target?.closest?.("button")) return;
+      void sendBg({ type: "h2w_open_control_center" }).then((result) => {
+        if (!result?.ok) showHudToast(hudText("control_center_open_failed", null, "Could not open Control Center."), "err");
+      });
+    });
     hudEls.manualButtons.forEach((button, index) => {
       const actions = ["direct", "status", "judge"];
       button.addEventListener("click", () => {
@@ -3185,7 +3194,7 @@ const H2W_CONTENT_VERSION = "0.1.76";
       : (hud?.handoff?.can_resume === true ? hudText("handoff_resume") : hudText("handoff"));
     ui.handoff.title = hudText("handoff_hint");
     syncHudManualButtons();
-    ui.quick.hidden = hud?.project_automation_available !== true
+    ui.quick.hidden = !hud?.project_id
       && hud?.conversation_automation_available !== true;
     ui.quick.textContent = preferenceEnabled ? hudText("automation_on", null, "Auto on") : hudText("automation_off", null, "Auto off");
     ui.quick.className = `quick ${preferenceEnabled ? "on" : "off"}`;

@@ -45,7 +45,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.76", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.77", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true };
 const listeners = { onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
@@ -468,6 +468,14 @@ actionClick({ windowId: 77 });
 await new Promise((resolve) => setTimeout(resolve, 0));
 ok(sidePanelOpenCalls.length === 1 && sidePanelOpenCalls[0]?.windowId === 77,
   "toolbar action opens the Control Center Side Panel in the clicked window", JSON.stringify(sidePanelOpenCalls));
+const hudPanelOpen = await new Promise((resolve) => {
+  const keepChannel = onMsg({ type: "h2w_open_control_center" }, { tab: { windowId: 88 } }, resolve);
+  ok(keepChannel === true, "HUD Control Center request keeps the async response channel open");
+});
+ok(hudPanelOpen?.ok === true
+    && sidePanelOpenCalls.length === 2
+    && sidePanelOpenCalls[1]?.windowId === 88,
+  "HUD user gesture opens the Control Center Side Panel in the sender window", JSON.stringify(sidePanelOpenCalls));
 
 function dispatchMessage(msg, sender = {}) {
   return new Promise((resolve) => {
