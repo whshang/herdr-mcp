@@ -141,6 +141,7 @@ Pinned Target 不会因为 Herdr focus 变化自动漂移。
 - `herdr-mcp native-host use store` / `herdr-mcp native-host use dev` 在不卸载另一份 Chrome 扩展的情况下切换唯一 active/default 浏览器 owner；
 - `herdr-mcp native-host dev disable` 撤销 Dev 身份并让 Store 回到 active；
 - `HERDR_EXTENSION_PATH=/path/to/unpacked/extension herdr-mcp native-host install` 只保留为旧维护者流程的兼容写法；
+- `native-host dev enable` 只配置 Dev identity / Native Host trust / active owner，**不会**把 unpacked 扩展静默安装进正式 Chrome。Chrome 137+ branded build 已移除 `--load-extension`，139+ 又移除 `--disable-extensions-except`；因此 clone 后首次加载请打开 `chrome://extensions` → Developer mode → **Load unpacked** 并选择 `extension/`。自动化 smoke 使用 Chrome for Testing 或 Chromium；Chrome 146+ 的 CfT Native Messaging 目录为 `~/Library/Application Support/Google/ChromeForTesting/NativeMessagingHosts/`，`0.4.2` 会在该浏览器目录存在时作为 optional target 管理。
 - `docs/_wip/browser-extension-development-and-store-release.md` 维护商店流程；
 - `AGENTS.md` 中的 extension 验证与发布边界。
 

@@ -478,9 +478,11 @@ Store ID 与 Native Messaging origin 是一次性身份边界：production ident
 - existing herdr-mcp-owned origin 可以事务式迁移、切换与 rollback；
 - install/status/uninstall/rollback 与 runtime sync 继续保留原有恢复证据；
 - remembered Dev candidate 复用 owned wrapper metadata，不新增独立 registry/state database；
+- Chrome for Testing 在 Chrome 146+ 使用独立的 macOS user Native Messaging 目录 `~/Library/Application Support/Google/ChromeForTesting/NativeMessagingHosts/`；`0.4.2` 将它作为 optional dev/UAT target 纳入同一 install/status/rollback 事务，只有该浏览器目录存在时才写，不为普通用户凭空创建 CfT 配置面；
+- Chrome branded builds 自 137 起不再支持 `--load-extension`，自 139 起也不再支持 `--disable-extensions-except`。因此 `native-host dev enable [PATH]` 的职责是登记 Dev identity、Native Host trust 与 active owner，**不是**静默把 unpacked 扩展装入正式 Chrome；正式 Chrome 首次加载仍使用 `chrome://extensions` → Developer mode → Load unpacked，自动化/UAT 使用 Chrome for Testing 或 Chromium；
 - status 显式报告 `official_store_extension_id`、`store_origin_match`、`extension_identity_source`、`active_channel`、`dev_enabled` 与已登记 Dev ID/origin；
 - 不因升级 runtime 覆盖成错误 origin；
-- Chrome / Chromium / Edge / Brave / ego lite 的目标清单仍保持各浏览器自己的注册路径。
+- Chrome / Chrome for Testing / Chromium / Edge / Brave / ego lite 的目标清单仍保持各浏览器自己的注册路径。
 
 维护者本地开发推荐流程：
 
@@ -681,24 +683,24 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 - [x] extension single purpose 已冻结并写入 Store Privacy；
 - [x] Store item 已创建但尚未公开；
 - [x] production Store ID 已冻结到 `contracts/browser-extension-store.json`；
-- [x] `0.4.1` Native Host installer 支持 production Store origin；`HOME` **与** `HERDR_MCP_CONFIG_DIR` 双隔离的 fresh-install/status/rollback smoke、dev→Store→rollback 单测均 PASS，且隔离 smoke 前后真实 Native Host binary/wrapper/5 份浏览器 manifest SHA 完全一致；
-- [x] dev/store identity 策略明确：Store-first、单 origin、开发版显式 override；
-- [ ] manifest permissions 完成最小权限审计；
+- [x] Native Host installer 从 `0.4.1` Store-first 单-origin 演进到 `0.4.2` Store+Dev trusted identities / single active owner；既有双隔离 fresh-install/status/rollback 与 dev→Store→rollback 证据保留，`0.4.2` 另补 Chrome for Testing optional manifest target，Native Host lifecycle 29/29 PASS；
+- [x] dev/store identity 策略明确：Store 与 Dev 可同时安装，Native Messaging 只承认唯一 active origin；`dev enable` / `use store|dev` / `dev disable` 显式控制，inactive `0.1.76+` build 进入 standby；
+- [x] manifest permissions 已完成最小权限审计：`0.1.75` 移除 required `<all_urls>`，ChatGPT/Claude 保持 exact required hosts，z.ai/DeepSeek 与自定义 endpoint 采用 optional/runtime exact-origin 授权；
 - [x] 常驻 `<all_urls>` 已移除；任意 endpoint 仅保留 optional wildcard declaration，并以运行时精确-origin 授权 + Store in-depth review 作为当前边界；
 - [x] Privacy Policy 已上线并写入 Store；
 - [x] User Data / Limited Use disclosures 已填写并保存；
 - [x] remote executable code audit：Store 声明 `No`，可执行 JS 全部随扩展打包；
 - [x] extension package deterministic；
-- [ ] unpacked真实浏览器 smoke PASS；
-- [ ] Store-ID build + Native Host real smoke PASS；
-- [ ] toolbar action → Side Panel、active-tab Current page、single-path binding/handoff、compact HUD、Queued Insert smoke PASS；
-- [ ] ChatGPT / Claude / z.ai / DeepSeek 支持矩阵重新验证；
-- [ ] handoff/recovery 回归 PASS；
-- [x] Rust Native Messaging install/status/uninstall/rollback 单测 PASS；
-- [ ] reviewer test instructions 可复现；
+- [x] unpacked 真实浏览器 smoke PASS：Chrome for Testing `152.0.7977.64` mac-arm64 真实加载 `0.1.76`，Dev ID=`dklcamincneeijhcelpkdbcekfemldii`，service worker / Control Center / Native owner identity 均 PASS；证据 [`history/v0.4.2/browser-extension-cft-uat-20260829.json`](../history/v0.4.2/browser-extension-cft-uat-20260829.json)；
+- [ ] Store-ID build + Native Host real smoke PASS —— **BLOCKED**：待审核中的 Unlisted `0.1.75` 尚未确认可从真实 Store item 安装；不得用 unpacked/CfT smoke 冒充 Store-ID smoke；
+- [ ] toolbar action → Side Panel、active-tab Current page、single-path binding/handoff、compact HUD、Queued Insert **真实 provider-page smoke** PASS；自动化已覆盖 Control Plane/owner/handoff/queue，但还不替代真实页面交互；
+- [ ] ChatGPT / Claude / z.ai / DeepSeek 真实支持矩阵重新验证；
+- [x] handoff/recovery 自动化回归 PASS：正确 build 前置后 browser/store/control/native/recovery/auth 集合 75/75 PASS，`tests/manual/extension_smoke.mjs` PASS；
+- [x] Rust Native Messaging install/status/uninstall/rollback 单测 PASS：加入 CfT target 后 29/29 PASS，restore failpoint 改为语义边界而非固定 target 数量；clippy `-D warnings` PASS；
+- [x] reviewer test instructions 可复现：`contracts/browser-extension-store-listing.json` 的 `review_notes` 明确 matching runtime、`native-host install`、ChatGPT + Side Panel 验证和 optional-site 权限边界；
 - [x] screenshots/listing metadata 与真实产品一致；
-- [ ] Private trusted-tester UAT PASS；
-- [ ] rollback / disable strategy 已确认。
+- [x] Private trusted-tester 不再是当前 gate：Dashboard 无法持久化 self tester 后首次路径已明确切换为 **Unlisted review/install**；真实安装 UAT 在 Store item 可安装后执行，不虚构 Private UAT PASS；
+- [x] rollback / disable strategy 已确认：`native-host use store|dev` 可切 active owner，`native-host dev disable` 撤销 Dev；`0.1.76+` inactive sibling standby，必要时 Chrome 侧可直接 disable/uninstall Dev build。
 
 ## 15. 开发期发布前检查清单
 
@@ -771,17 +773,17 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 
 ## 18. 当前决定记录
 
-截至 2026-08-28：
+截至 2026-08-29：
 
-- 浏览器扩展继续以 unpacked development build 方式开发；
-- 浏览器扩展开发版本已进入 `0.1.73`；Side Panel 是 binding / unbinding、本机详细状态与显式 Pinned Target 的主入口；底部 Prompt Agent 已走 Native Messaging + extension-only Unix socket 的可信控制链，Steer Session 不再 Preview-only 但会如实返回 `session_not_resolved` / `no_active_turn` / `unsupported_provider` 等 outcome，绝不会拿 Prompt 冒充 true steer；Herdr API / raw Terminal Input 仍 Preview-only；HUD 保持当前网页会话的紧凑状态、快捷推进和手动接力动作面；
+- 浏览器扩展继续支持 unpacked development build，但正式 Chrome 137+/139+ 已移除命令行 side-load flags：clone 后由 `native-host dev enable ./extension` 配置 Dev trust/owner，再在 `chrome://extensions` 的 Developer Mode 使用 **Load unpacked**；自动化/UAT 使用 Chrome for Testing/Chromium；
+- 浏览器扩展源码已进入 `0.1.76`；Side Panel 是 binding / unbinding、本机详细状态与显式 Pinned Target 的主入口；底部 Prompt Agent 已走 Native Messaging + extension-only Unix socket 的可信控制链，Steer Session 不再 Preview-only 但会如实返回 `session_not_resolved` / `no_active_turn` / `unsupported_provider` 等 outcome，绝不会拿 Prompt 冒充 true steer；Herdr API / raw Terminal Input 仍 Preview-only；HUD 保持当前网页会话的紧凑状态、快捷推进和手动接力动作面；
 - Browser Control Center Phase A 与 pane lifecycle 已进入 main，0.1.65 进一步补齐 en / zh / ja、Pinned Target / Preview-only 产品文案与 Settings 入口；
 - ChatGPT Queued Insert 已进入 main，正式用户文档使用“排队 / Queue”描述其 next-turn 语义；
 - Chrome Web Store 首次发布流程**已经启动**；Developer Dashboard publisher 已可用，Store item 已创建；
 - 普通用户正式安装路径已经切为 Chrome Web Store，Store listing 上线前直接跳过扩展；
 - Store Extension ID 已冻结；唯一机器可读 SSOT 为 `contracts/browser-extension-store.json`，Store listing、128x128 icon、1280x800 screenshot 与 Privacy practices 已写入 draft；
-- `0.4.1` 开发线已经实现 Store-first Native Messaging identity：普通 `native-host install` 从 Store contract 读取 production identity，显式 `HERDR_EXTENSION_PATH` 仅保留维护者 unpacked 开发路径，既有 herdr-mcp-owned dev origin 可事务迁移并 rollback；一次仅替换 `HOME` 的早期 smoke 暴露出调用环境继承真实 `HERDR_MCP_CONFIG_DIR` 会造成跨作用域 Native Host mutation，已使用原事务 evidence 精确 rollback，生产状态恢复为原 dev identity / `runtime_matches_current=true`；随后用**独立 `HOME` + 独立 `HERDR_MCP_CONFIG_DIR`**重跑 fresh-install/status/rollback，Store ID、`store_origin_match=true`、rollback 均 PASS，且真实 native binary/wrapper/5 份浏览器 manifest 前后 SHA 完全一致。后续任何 Native Host UAT 都必须同时隔离这两个路径，不能把“临时 HOME”单独视为隔离证据；**剩余 Store blocker 是发布/安装真实 `0.4.1` 后，用当前 Chrome Web Store `0.1.72` 做一次真实商店安装 + Native Messaging UAT**；
+- `0.4.1` 的 Store-first Native Messaging identity 证据继续保留；`0.4.2` 已进一步实现 Store+Dev 共存、唯一 active owner、`dev enable/use/dev disable`、`0.1.76+` standby fencing，并在 updater 中补齐 legacy Dev wrapper migration。Chrome 146+ 的 Chrome for Testing 已使用独立 Native Messaging 目录，`0.4.2` 现将 `Google/ChromeForTesting/NativeMessagingHosts` 纳入 optional transactional target；CfT `152.0.7977.64` 真实 unpacked UAT 已验证 Dev service worker、Control Center 与 Native owner identity PASS。剩余 Store blocker 是待审 Unlisted `0.1.75` 真正可安装后执行 Store-ID + Native Messaging UAT；随后正常 Store update 到 `0.1.76+` 后再做 Store+Dev 同 profile 共存 UAT；
 - Store Privacy Policy 已由 GitHub Pages 发布并验证可读，`https://whshang.github.io/herdr-mcp/docs/en/privacy.html` 已写入 Store Privacy tab；
-- Publisher 已明确 contact email；Dashboard 仍需完成保存与 Google verification，未验证前不得视为已配置；
+- Publisher contact email 已完成 Google verification；当前 Store candidate `0.1.75` 已按 Unlisted 提交审核，审核通过/真实 item 可安装前不得宣称 Store 安装 UAT 已完成；
 - 首次 Store submit 前必须审计 broad permissions；0.1.75 已移除常驻 `<all_urls>`，任意 endpoint 的 optional wildcard 由真实 Store in-depth review 验证；
 - 后续每次 Store 发布仍需重新核对实时 Chrome Web Store policy，不得把本 WIP 的时间点描述当成永久不变的商店规则。

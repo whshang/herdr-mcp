@@ -143,6 +143,7 @@ Maintainers should use:
 - `herdr-mcp native-host use store` / `herdr-mcp native-host use dev` to switch the one active/default browser owner without uninstalling the other Chrome extension;
 - `herdr-mcp native-host dev disable` to forget the Dev identity and return Store to active ownership;
 - `HERDR_EXTENSION_PATH=/path/to/unpacked/extension herdr-mcp native-host install` only as a compatibility form for older maintainer workflows;
+- `native-host dev enable` configures the Dev identity, Native Host trust, and active owner; it does **not** silently install an unpacked extension into branded Chrome. Chrome 137+ removed `--load-extension` from branded builds and 139+ also removed `--disable-extensions-except`, so after cloning use `chrome://extensions` → Developer mode → **Load unpacked** and select `extension/`. Automated smoke uses Chrome for Testing or Chromium. Chrome 146+ CfT uses `~/Library/Application Support/Google/ChromeForTesting/NativeMessagingHosts/`; `0.4.2` manages it as an optional target when that browser directory exists.
 - `docs/_wip/browser-extension-development-and-store-release.md` for the Store workflow;
 - the extension validation and release ownership rules in `AGENTS.md`.
 
