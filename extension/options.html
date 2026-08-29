@@ -4,79 +4,134 @@
   <meta charset="utf-8">
   <style>
     .i18n-pending body { visibility: hidden; }
-    body { font: 14px/1.6 -apple-system, sans-serif; max-width: 640px; margin: 24px auto; color: #1f2937; padding: 0 16px; }
-    h1 { font-size: 18px; }
+    :root { color-scheme: light; --green:#16784c; --green-soft:#eef8f2; --line:#dfe7e2; --muted:#66736d; --ink:#16231d; }
+    * { box-sizing: border-box; }
+    body { font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 760px; margin: 0 auto; color: var(--ink); padding: 32px 20px 56px; background:#f7faf8; }
+    .hero { display:flex; gap:14px; align-items:center; margin-bottom:20px; }
+    .brand-mark { width:44px; height:44px; border-radius:12px; display:grid; place-items:center; background:linear-gradient(145deg,#24a565,#0d673d); color:white; font-size:22px; font-weight:800; box-shadow:0 8px 22px rgba(22,120,76,.18); }
+    h1 { font-size: 22px; line-height:1.2; margin:0; }
+    h2 { font-size:15px; margin:0 0 6px; }
+    .subtitle { color:var(--muted); margin-top:3px; }
+    .card { background:#fff; border:1px solid var(--line); border-radius:14px; padding:18px 20px; margin:14px 0; box-shadow:0 3px 14px rgba(32,70,49,.04); }
     label { display: block; margin: 12px 0 4px; font-weight: 600; font-size: 13px; color: #374151; }
-    input[type=text], input[type=number], textarea, select { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; font: 13px/1.5 monospace; }
+    input[type=text], input[type=password], input[type=number], textarea, select { width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 7px; font: 13px/1.5 monospace; background:#fff; }
     select { font-family: -apple-system, sans-serif; }
-    textarea { height: 120px; }
-    button { margin-top: 16px; padding: 8px 18px; border: 1px solid #d1d5db; background: #f9fafb; border-radius: 6px; cursor: pointer; }
-    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    textarea { height: 120px; resize: vertical; }
+    button { margin-top: 16px; padding: 9px 16px; border: 1px solid #cbd8d0; background: #fff; border-radius: 8px; cursor: pointer; }
+    button.primary { background: var(--green); border-color: var(--green); color: #fff; }
     .hint { color: #6b7280; font-size: 12px; margin-top: 2px; }
-    #status { margin-top: 12px; font-size: 13px; }
-    .ok { color: #16a34a; } .err { color: #dc2626; white-space: pre-line; }
+    .switch-row { display:grid; grid-template-columns:24px 1fr; gap:2px 8px; align-items:start; padding:12px 0; border-top:1px solid #edf1ee; }
+    .switch-row:first-of-type { border-top:0; }
+    .switch-row input { margin-top:5px; }
+    .switch-row label { margin:0; }
+    .switch-row .hint { grid-column:2; }
+    .experimental { border-color:#d8e8dd; background:linear-gradient(180deg,#fff,#fbfefc); }
+    .badge { display:inline-block; margin-left:7px; padding:1px 7px; border-radius:999px; background:#fff3d9; color:#8a5a00; font-size:10px; font-weight:700; vertical-align:2px; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; }
+    #status { margin-top: 12px; font-size: 13px; padding:10px 12px; border-radius:8px; background:#f8faf9; }
+    #status:empty { display:none; }
+    #status a { color:var(--green); font-weight:650; }
+    .ok { color: #16784c; } .err { color: #b42318; white-space: pre-line; }
   </style>
 </head>
 <body>
-  <h1 id="title" data-i18n="options_title">herdr → Web wake · Settings</h1>
+  <div class="hero">
+    <div class="brand-mark" aria-hidden="true">H</div>
+    <div>
+      <h1 id="title">Herdr · Settings</h1>
+      <div id="subtitle" class="subtitle">Connect web AI conversations to your local Herdr workspace.</div>
+    </div>
+  </div>
 
-  <label id="lab_locale" data-i18n="label_locale">Language</label>
-  <select id="uiLocale">
-    <option value="en">English</option>
-    <option value="zh">简体中文</option>
-    <option value="ja">日本語</option>
-  </select>
-  <div class="hint" id="hint_locale" data-i18n="hint_locale">en / Simplified Chinese / Japanese. First install follows system language; default English.</div>
+  <section class="card">
+    <h2 id="title_general">General</h2>
+    <label id="lab_locale">Language</label>
+    <select id="uiLocale">
+      <option value="en">English</option>
+      <option value="zh">简体中文</option>
+      <option value="ja">日本語</option>
+    </select>
+    <div class="hint" id="hint_locale"></div>
 
-  <label id="lab_url">herdr-mcp URL (local)</label>
-  <input type="text" id="url" placeholder="http://127.0.0.1:8772">
-  <div class="hint" id="hint_url">Local access is proxied through Chrome Native Messaging and a mode-0600 Unix socket. The extension stores no Herdr token.</div>
+    <label id="lab_url">herdr-mcp URL (local)</label>
+    <input type="text" id="url" placeholder="http://127.0.0.1:8772">
+    <div class="hint" id="hint_url"></div>
+  </section>
 
-  <label id="lab_wake">Wake template (settled)</label>
-  <textarea id="template">{agent} · {pane} · {status} · {output}</textarea>
-  <div class="hint" id="hint_wake">Placeholders: {workspace_label} {workspace} {agent} {pane} {status} {output} {working_count} {roster} {idle_hint}</div>
+  <section class="card">
+    <h2 id="title_continuity">Continuity</h2>
+    <label id="lab_wake">Wake template (settled)</label>
+    <textarea id="template">{agent} · {pane} · {status} · {output}</textarea>
+    <div class="hint" id="hint_wake"></div>
 
-  <label id="lab_tick">Wake interval (seconds)</label>
-  <input type="number" id="progressTickSec" min="0" step="1">
-  <div class="hint" id="hint_tick">Default 60. Progress check while working + post-turn nudge cooldown. 0 = off both.</div>
+    <label id="lab_tick">Wake interval (seconds)</label>
+    <input type="number" id="progressTickSec" min="0" step="1">
+    <div class="hint" id="hint_tick"></div>
 
-  <label id="lab_fallback">Fallback interval when summary unchanged (seconds)</label>
-  <input type="number" id="progressFallbackSec" min="0" step="1">
-  <div class="hint" id="hint_fallback">Default 1200 (20 min). 0 = new summary only.</div>
+    <label id="lab_fallback">Fallback interval when summary unchanged (seconds)</label>
+    <input type="number" id="progressFallbackSec" min="0" step="1">
+    <div class="hint" id="hint_fallback"></div>
 
-  <label id="lab_progress">Progress template (while working)</label>
-  <textarea id="progressTemplate">{agent} still running {pane} ({status})</textarea>
-  <div class="hint" id="hint_progress">Separate from settled template.</div>
+    <label id="lab_progress">Progress template (while working)</label>
+    <textarea id="progressTemplate">{agent} still running {pane} ({status})</textarea>
+    <div class="hint" id="hint_progress"></div>
 
-  <h2 id="title_llm" style="font-size:15px;margin:28px 0 8px">Post-turn LLM judge</h2>
-  <div class="hint" id="hint_llm_sec">OpenAI-compatible chat/completions. Leave URL/key/model empty to disable post-turn nudge. Secrets stay on this machine; do not commit them.</div>
+    <div class="switch-row">
+      <input type="checkbox" id="automationMode">
+      <label id="lab_automation_mode" for="automationMode">Allow ChatGPT Project-shared Auto controls</label>
+      <div class="hint" id="hint_automation_mode"></div>
+    </div>
+  </section>
 
-  <label id="lab_llm_url">Judge API base URL</label>
-  <input type="text" id="llmJudgeBaseUrl" placeholder="https://example.com/v1">
-  <div class="hint" id="hint_llm_url">Accepts …/v1 or …/v1/chat/completions.</div>
+  <section class="card experimental">
+    <h2><span id="title_experimental">Experimental features</span><span id="experimental_badge" class="badge">EXPERIMENTAL</span></h2>
+    <div class="hint" id="hint_experimental"></div>
+    <div class="switch-row">
+      <input type="checkbox" id="experimentalZAiEnabled">
+      <label id="lab_experimental_zai" for="experimentalZAiEnabled">Enable chat.z.ai integration</label>
+      <div class="hint" id="hint_experimental_zai"></div>
+    </div>
+    <div class="switch-row">
+      <input type="checkbox" id="experimentalDeepSeekEnabled">
+      <label id="lab_experimental_deepseek" for="experimentalDeepSeekEnabled">Enable chat.deepseek.com integration</label>
+      <div class="hint" id="hint_experimental_deepseek"></div>
+    </div>
+  </section>
 
-  <label id="lab_llm_key">Judge API key (Bearer)</label>
-  <input type="password" id="llmJudgeApiKey" placeholder="(empty = off)" autocomplete="off">
-  <div class="hint" id="hint_llm_key">Stored only in chrome.storage.local on this machine.</div>
+  <section class="card">
+    <h2 id="title_llm">Post-turn LLM judge</h2>
+    <div class="hint" id="hint_llm_sec"></div>
 
-  <label id="lab_llm_model">Judge model</label>
-  <input type="text" id="llmJudgeModel" placeholder="e.g. small-fast-model">
+    <label id="lab_llm_url">Judge API base URL</label>
+    <input type="text" id="llmJudgeBaseUrl" placeholder="https://example.com/v1">
+    <div class="hint" id="hint_llm_url"></div>
 
-  <label id="lab_llm_prompt">Judge prompt template</label>
-  <textarea id="llmJudgePromptTemplate"></textarea>
-  <div class="hint" id="hint_llm_prompt">Placeholders: {content} {user} {assistant}. Done tokens must match the no-send list below. When not done, the model reply is submitted as-is.</div>
+    <label id="lab_llm_key">Judge API key (Bearer)</label>
+    <input type="password" id="llmJudgeApiKey" placeholder="(empty = off)" autocomplete="off">
+    <div class="hint" id="hint_llm_key"></div>
 
-  <label id="lab_llm_skip">No-send keywords (done tokens)</label>
-  <textarea id="llmJudgeSkipKeywords" style="height:72px"></textarea>
-  <div class="hint" id="hint_llm_skip">One per line (or comma-separated). If the judge reply is only one of these, do not nudge.</div>
+    <label id="lab_llm_model">Judge model</label>
+    <input type="text" id="llmJudgeModel" placeholder="e.g. small-fast-model">
 
-  <label><input type="checkbox" id="automationMode"> <span id="lab_automation_mode">Enable automation</span></label>
-  <div class="hint" id="hint_automation_mode"></div>
+    <label id="lab_llm_prompt">Judge prompt template</label>
+    <textarea id="llmJudgePromptTemplate"></textarea>
+    <div class="hint" id="hint_llm_prompt"></div>
 
-  <button class="primary" id="save">Save</button>
-  <button id="test">Test connection</button>
-  <button id="testLlm">Test LLM judge</button>
-  <div id="status"></div>
+    <label id="lab_llm_skip">No-send keywords (done tokens)</label>
+    <textarea id="llmJudgeSkipKeywords" style="height:72px"></textarea>
+    <div class="hint" id="hint_llm_skip"></div>
+  </section>
+
+  <section class="card">
+    <h2 id="title_diagnostics">Diagnostics</h2>
+    <div class="hint" id="hint_diagnostics"></div>
+    <div class="actions">
+      <button class="primary" id="save">Save</button>
+      <button id="test">Test connection</button>
+      <button id="testLlm">Test LLM judge</button>
+    </div>
+    <div id="status"></div>
+  </section>
 
   <script type="module" src="options.js"></script>
 </body>

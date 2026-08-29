@@ -7,7 +7,7 @@ const optionsHtml = readFileSync(new URL("../extension/options.html", import.met
 const optionsJs = readFileSync(new URL("../extension/options.js", import.meta.url), "utf8");
 
 test("Simplified Chinese Options copy avoids legacy mixed-language prose", () => {
-  assert.equal(zh.options_title, "herdr → 网页唤醒 · 配置");
+  assert.equal(zh.options_title, "Herdr · 设置");
   assert.equal(zh.label_llm_url, "判定服务地址");
   assert.equal(zh.label_llm_key, "判定接口密钥");
   assert.equal(zh.placeholder_llm_model, "填写模型名称");
@@ -24,6 +24,9 @@ test("Simplified Chinese Options copy avoids legacy mixed-language prose", () =>
     "llm_need_config",
     "llm_timeout",
     "hint_automation_mode",
+    "hint_experimental_section",
+    "hint_experimental_zai",
+    "hint_experimental_deepseek",
     "connect_ok",
     "http_401",
   ];
@@ -76,4 +79,14 @@ test("LLM test booleans are localized instead of rendering true/false", () => {
   assert.equal(zh.boolean_no, "否");
   assert.match(optionsJs, /t\(resp\.done \? "boolean_yes" : "boolean_no"\)/);
   assert.match(optionsJs, /t\(resp\.cont \? "boolean_yes" : "boolean_no"\)/);
+});
+
+test("Options requests optional host access only from explicit user settings", () => {
+  assert.match(optionsJs, /chrome\.permissions\?\.request/);
+  assert.match(optionsJs, /https:\/\/chat\.z\.ai\/\*/);
+  assert.match(optionsJs, /https:\/\/chat\.deepseek\.com\/\*/);
+  assert.match(optionsJs, /removeHostPermissions/);
+  assert.equal(typeof zh.host_permission_denied, "string");
+  assert.equal(typeof zh.host_permission_invalid_url, "string");
+  assert.equal(typeof zh.hud_reason_llm_permission, "string");
 });

@@ -73,6 +73,13 @@ Herdr 工作站
 
 适合：希望网页会话持续观察本地任务。
 
+先从 [Herdr Chrome Web Store 官方详情页](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) 安装扩展；如果首次发布仍处于 Draft、详情页不可用或商店搜索不到 Herdr，就先跳过这个可选步骤，不要改用本地开发版。然后运行：
+
+```bash
+herdr-mcp native-host install
+herdr-mcp native-host status
+```
+
 浏览器扩展提供：
 
 - workspace 绑定与 Agent 进度 / settled 回推；
@@ -80,7 +87,7 @@ Herdr 工作站
 - Chrome Side Panel 浏览器控制中心：实时查看 workspace / pane / Agent；
 - 明确 pin 一个 pane，读取状态与最近输出；
 - ChatGPT **排队**：当前回复不中断，补充要求在下一轮优先发送；
-- z.ai / DeepSeek 的 JSON → MCP 兼容桥。
+- z.ai / DeepSeek 的实验性 JSON → MCP 兼容桥；两个站点默认关闭，需要在 **Herdr 设置 → 实验性功能** 中分别开启并刷新对应页面。
 
 第一次使用先保持 Auto 关闭，确认 binding、Control Center 实时状态和人工操作都符合预期，再按作用域开启自动化。
 

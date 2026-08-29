@@ -8,10 +8,24 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.73";
-(function () {
+const H2W_CONTENT_VERSION = "0.1.75";
+(async function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
+  const experimentalFlag = ADAPTER.name === "z.ai"
+    ? "experimentalZAiEnabled"
+    : (ADAPTER.name === "deepseek" ? "experimentalDeepSeekEnabled" : null);
+  if (experimentalFlag) {
+    try {
+      const cfg = await chrome.storage.local.get([experimentalFlag]);
+      if (cfg?.[experimentalFlag] !== true) {
+        console.log(`[h2w] ${ADAPTER.name} integration is experimental and disabled`);
+        return;
+      }
+    } catch (_) {
+      return;
+    }
+  }
   const SPEAKS = window.__H2W_SPEAKS_JSON__ || null;
   const CONTEXT_PRESSURE = globalThis.H2W_CONTEXT_PRESSURE || null;
   const CONVERSATION_HEALTH = globalThis.H2W_CONVERSATION_HEALTH || null;

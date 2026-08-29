@@ -48,12 +48,12 @@ The browser extension adds long-conversation continuity, the Side Panel Control 
 End users install it only from the **Chrome Web Store**:
 
 1. finish the runtime + Connector verification first;
-2. open the [Chrome Web Store](https://chromewebstore.google.com/) and search for `Herdr`;
+2. open the [Herdr Chrome Web Store item](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp); while the first listing is still a draft, this direct page can show **Item not available**;
 3. choose the official Herdr extension and click **Add to Chrome**;
 4. run `herdr-mcp native-host install` and `herdr-mcp native-host status`;
 5. future extension updates are delivered through the normal Chrome Web Store update mechanism; no local extension package is required.
 
-> The extension is currently entering its first Chrome Web Store publication flow. Until the listing is live, normal end users should simply skip this optional step rather than install a local development build.
+> The Store item is currently in its first publication flow. Until the listing is published, the direct item page can be unavailable and Store search may return no result. Normal end users should skip this optional step rather than install a local development build.
 
 See [Browser extension](docs/i18n/en/extension.md) and [Browser Control Center](docs/i18n/en/browser-control-center.md).
 

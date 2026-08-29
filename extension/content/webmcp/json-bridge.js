@@ -2,11 +2,26 @@
 // It intercepts a textarea submit, injects a compact Herdr tool protocol, parses
 // assistant JSON tool calls, executes them through the background service worker,
 // and feeds TOOL_RESULT messages back until the model returns a normal answer.
-(function () {
+(async function () {
   const ADAPTER = window.__H2W_ADAPTER__;
   const SPEAKS = window.__H2W_SPEAKS_JSON__;
   const CORE = globalThis.H2W_JSON_BRIDGE_CORE;
   if (!ADAPTER || !SPEAKS?.enabled || !CORE || !["z.ai", "deepseek"].includes(ADAPTER.name)) {
+    window.__H2W_JSON_BRIDGE__ = null;
+    return;
+  }
+
+  const experimentalFlag = ADAPTER.name === "z.ai"
+    ? "experimentalZAiEnabled"
+    : "experimentalDeepSeekEnabled";
+  try {
+    const cfg = await chrome.storage.local.get([experimentalFlag]);
+    if (cfg?.[experimentalFlag] !== true) {
+      console.log(`[h2w-json] ${ADAPTER.name} integration is experimental and disabled`);
+      window.__H2W_JSON_BRIDGE__ = null;
+      return;
+    }
+  } catch (_) {
     window.__H2W_JSON_BRIDGE__ = null;
     return;
   }

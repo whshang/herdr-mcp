@@ -10,8 +10,8 @@ Data handling and permission use are documented in the [Browser extension privac
 
 Normal users install the extension from Chrome Web Store and do not need a local extension build or repository checkout.
 
-1. Open the [Chrome Web Store](https://chromewebstore.google.com/).
-2. Search for `Herdr` and choose the official Herdr extension.
+1. Open the [official Herdr Chrome Web Store item](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp).
+2. Confirm the publisher/product identity, then choose the official Herdr extension.
 3. Click **Add to Chrome**.
 4. After installation, run:
 
@@ -22,7 +22,7 @@ herdr-mcp native-host status
 
 On `0.4.1+`, the normal `native-host install` path uses the official Chrome Web Store extension identity; it does not require an unpacked extension directory or a source checkout. An existing herdr-mcp-owned development origin is migrated transactionally and remains rollbackable.
 
-5. Open ChatGPT, z.ai, DeepSeek, or another currently supported site.
+5. Open ChatGPT or another currently supported site. z.ai and DeepSeek are experimental and remain disabled by default until you enable them separately in **Herdr Settings → Experimental features**, then reload that site.
 6. Click the Herdr toolbar icon and confirm the **Browser Control Center** opens in Chrome Side Panel.
 7. Confirm the active page is recognized as the intended Project / conversation, then bind the Herdr workspace from the Control Center.
 
@@ -43,7 +43,7 @@ Browser-extension versions and Rust-runtime versions have independent release ca
 |---|---|---|
 | Continuity | Resume, recover, or hand off the correct web conversation after local work changes | Page HUD |
 | Control Center | Observe workspaces / panes / agents, bind the active page, and pin an explicit target | Chrome Side Panel |
-| JSON → MCP bridge | Bounded local bridge for Web AI without a native MCP Connector | z.ai / DeepSeek page |
+| JSON → MCP bridge | Experimental bounded local bridge for Web AI without a native MCP Connector; disabled by default | z.ai / DeepSeek page |
 
 The **Queue** control beside the ChatGPT composer means “send this user intent as the next turn after the current reply settles.” It does not interrupt the live reply.
 

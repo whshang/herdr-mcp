@@ -223,7 +223,7 @@ ChatGPT → Edge → workstation
 
 ### Web AI plus browser bridge
 
-For sites such as z.ai / DeepSeek that do not provide the same native custom MCP connector, the extension can provide a local JSON→MCP compatibility path.
+For sites such as z.ai / DeepSeek that do not provide the same native custom MCP connector, the extension has an experimental local JSON→MCP compatibility path. Both site integrations are disabled by default; enable the corresponding switch in **Herdr Settings → Experimental features** and reload the page before testing them.
 
 ```text
 Web page → extension → Native Messaging → local MCP
