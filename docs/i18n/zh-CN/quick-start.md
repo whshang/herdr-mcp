@@ -1,5 +1,11 @@
 # 快速开始：从零体验第一次远程开发
 
+> **职责：** 本页是**安装之后**用来验证并跑通第一个真实远程任务的内容，不是另一份安装教程。
+> - 交给 Coding Agent 的权威安装协议：[快速 Agent 安装](quick-agent-install.md)。
+> - 手动安装：[安装](install.md)。
+>
+> 深入理解请阅读 [设计思路](design-philosophy.md) 与 [架构](architecture.md)。
+
 目标：在已经安装 Herdr 的情况下，让 ChatGPT 等 Web AI 第一次真正连接自己的开发环境。
 
 整个过程只需要理解一件事：

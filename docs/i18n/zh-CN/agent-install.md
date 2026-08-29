@@ -1,5 +1,7 @@
 # 本地 Agent 安装与 `workers.dev` 部署
 
+> **职责：** 面向维护者/自动化的实现参考，供本地 coding Agent 执行。最终用户应从 [快速 Agent 安装](quick-agent-install.md) 或 [安装](install.md) 开始。
+
 这是一份给**本地 coding Agent**读取并执行的安装协议，不是给用户逐条复制命令的教程。面向最终用户的一句话安装入口见 [快速 Agent 安装](quick-agent-install.md)。目标是：用户只负责 Cloudflare 本人登录和创建 API Token；Agent 负责环境检查、Release 二进制安装、Cloudflare Worker、出站 WSS Link 和验证。
 
 > 当前约束：完整的后台服务自动安装路径以 **macOS Apple Silicon** 为第一正式平台。Windows 可有 Release artifact 作为 preview。不要发明未支持的 Linux lifecycle 包装。Edge 部署可临时使用 Node/`wrangler`；本机 MCP runtime **必须**来自 GitHub Releases，而不是 `git clone` + `npm ci`。
@@ -21,7 +23,7 @@ Node.js 只用于临时 Cloudflare Worker 引导（`npx wrangler`）和可选贡
 
 ## 2. 从 GitHub Releases 安装原生 runtime（主路径）
 
-1. 从 <https://github.com/whshang/herdr-mcp/releases> 下载当前平台二进制（产品仍处 alpha 时会出现 prerelease 标签）。
+1. 从 <https://github.com/whshang/herdr-mcp/releases> 下载当前 stable 平台二进制（当前 stable runtime：`v0.4.1`）。只有明确测试 preview channel 时才选择 prerelease 标签。
 2. 放到 `PATH`（例如 `~/.local/bin/herdr-mcp`）并赋予可执行权限。
 3. 执行：
 
@@ -34,7 +36,7 @@ herdr-mcp update          # same as update check
 
 `install` 会在 `~/.config/herdr-mcp/runtime/` 写入不可变 generation，并把 `~/.local/bin/herdr-mcp` 指到 `runtime/current/herdr-mcp`。优先使用以上顶层命令。不要把 `herdr-mcp service install` 写成普通安装主路径。
 
-产品仍处 alpha 时，保持 `update.channel = "preview"`（或在 alpha 二进制上不写 config），才能发现 prerelease。
+只有明确测试 prerelease build 时才使用 `update.channel = "preview"`。当前 stable runtime 使用默认 `stable` channel 即可。
 
 ## 3. 在内存中生成身份，不要打印秘密
 

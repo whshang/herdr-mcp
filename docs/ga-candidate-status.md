@@ -2,7 +2,7 @@
 
 Status: **`v0.4.0` stable published** (2026-08-28). Stable-channel G9/G10 **PASS**. G1 dogfood stable apply **PASS**. G4 second-Mac stable clean install **PASS** (pi-ga-20260828). **Full GA not declared** — G25 remains **PARTIAL** (G14/G15 veto-adjacent rows; see [`ga-release-gate.md`](./ga-release-gate.md)).
 
-SSOT for gate rows: [`docs/ga-release-gate.md`](./ga-release-gate.md). Exit-alpha runbook: [`docs/exit-alpha-checklist.md`](./exit-alpha-checklist.md). Release planes: [`docs/release-model.md`](./release-model.md). **Patch-line note:** current Rust runtime stable is `v0.4.1`; this file intentionally preserves the first-GA `v0.4.0` closure snapshot instead of rewriting historical evidence for each patch release.
+SSOT for gate rows: [`docs/ga-release-gate.md`](./ga-release-gate.md). Exit-alpha runbook (archived): [`docs/history/ga/exit-alpha-checklist.md`](./history/ga/exit-alpha-checklist.md). Release planes: [`docs/release-model.md`](./release-model.md). **Patch-line note:** current Rust runtime stable is `v0.4.1`; this file intentionally preserves the first-GA `v0.4.0` closure snapshot instead of rewriting historical evidence for each patch release.
 
 **Historical alpha freeze (completed):** alpha.19 was the final alpha candidate and there was no alpha.20. Immutable historical tags/Releases remain retained per [`release-model.md`](./release-model.md#alpha-release-retention-policy). Merged/obsolete development branches and worktrees may now be cleaned after live safety checks.
 
@@ -115,6 +115,6 @@ Evidence: the one-off local JSON was never tracked and is no longer retained; au
 ## Related
 
 - [`docs/ga-release-gate.md`](./ga-release-gate.md)
-- [`docs/exit-alpha-checklist.md`](./exit-alpha-checklist.md)
+- [`docs/history/ga/exit-alpha-checklist.md`](./history/ga/exit-alpha-checklist.md)
 - [`docs/history/ga/README.md`](./history/ga/README.md)
 - [`docs/i18n/en/clean-machine-uat.md`](./i18n/en/clean-machine-uat.md)

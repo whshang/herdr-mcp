@@ -181,6 +181,7 @@ function sidebarNav(docsBySlug, activeSlug = "", ui, locale) {
   }).join("")}</ul></section>`).join("");
   return `<nav class="sidebar-nav" aria-label="${esc(ui.docsSidebarAria)}">
     ${groups}
+    <section class="nav-group nav-secondary"><h2>${esc(ui.historyNav)}</h2><ul><li><a href="https://github.com/whshang/herdr-mcp/tree/main/docs/history">${esc(ui.homeHistory)}</a></li></ul></section>
   </nav>`;
 }
 
@@ -263,36 +264,61 @@ function agentIntroBlock(ui, pre) {
   </section>`;
 }
 
-// Docs have no landing page: /docs/<locale>/ forwards straight to the first
-// document (DOC_ORDER[0]) so there is one click between entry and content.
-function localeEntryShell({ locale }) {
+// Real locale documentation homepage. It is intentionally user-first: the
+// primary path is Agent-assisted install, with the two human handoff points
+// called out before architecture/maintainer material.
+function localeEntryShell({ locale, docsBySlug, searchIndex, version }) {
+  const pre = "../../";
   const ui = UI[locale];
-  const first = DOC_ORDER[0];
+  const selfHref = `${origin}/docs/${locale}/`;
+  const alternates = LOCALES.map((lang) => ({ lang, href: `${origin}/docs/${lang}/` }));
+  const xDefault = `${origin}/docs/${DEFAULT_LOCALE}/`;
   return `<!doctype html>
 <html lang="${ui.htmlLang}">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="${esc(ui.indexLead)}">
-  <meta name="color-scheme" content="light dark">
-  <title>herdr-mcp ${esc(ui.docsNav)}</title>
-  <link rel="canonical" href="${esc(`${origin}/docs/${locale}/${first}.html`)}">
-  ${LOCALES.map((lang) => `<link rel="alternate" hreflang="${esc(lang)}" href="${esc(`${origin}/docs/${lang}/${first}.html`)}">`).join("\n  ")}
-  <link rel="alternate" hreflang="x-default" href="${esc(`${origin}/docs/${DEFAULT_LOCALE}/${first}.html`)}">
-  <meta http-equiv="refresh" content="0; url=./${first}.html">
-  <link rel="icon" type="image/png" href="../../favicon.png">
-  <link rel="stylesheet" href="../../style.css">
+  ${headMeta({ pre, locale, canonicalHref: selfHref, alternates, xDefault, description: ui.indexLead, title: `herdr-mcp ${ui.docsNav}` })}
 </head>
-<body class="docs-index-page">
-  <main class="docs-index">
-    <div class="redirect-note">
-      <span class="eyebrow">${esc(ui.docsNav)}</span>
-      <h1>herdr-mcp ${esc(ui.docsNav)}</h1>
-      <p>${esc(ui.indexLead)}</p>
-      <p class="redirect-links"><a href="./${first}.html">${esc(ui.indexCtaArchitecture)} →</a></p>
-    </div>
-  </main>
-  <script>location.replace("./${first}.html");</script>
+<body class="docs-page docs-home-page">
+  ${topbar({ pre, locale, drawer: true, localePrefix: "../", version })}
+  <div class="nav-overlay" data-nav-overlay hidden></div>
+  <div class="docs-layout">
+    <aside class="sidebar" id="docs-sidebar" data-sidebar>${sidebarNav(docsBySlug, "", ui, locale)}</aside>
+    <main class="article-column docs-home-column">
+      <section class="docs-hero" id="start">
+        <span class="eyebrow">${esc(ui.indexEyebrow)}</span>
+        <h1>${esc(ui.indexTitle)}</h1>
+        <p>${esc(ui.indexLead)}</p>
+        <div class="hero-actions">
+          <a class="button primary" href="./quick-agent-install.html">${esc(ui.indexCtaConnect)}</a>
+          <a class="button" href="./install.html">${esc(ui.homeManualPathTitle)}</a>
+          <a class="button" href="./overview.html">${esc(ui.indexCtaArchitecture)}</a>
+        </div>
+      </section>
+
+      <section class="agent-intro" data-agent-intro id="agent-install">
+        <div class="agent-intro-head"><span class="eyebrow">${esc(ui.homeAgentPathTitle)}</span><h2>${esc(ui.agentIntroTitle)}</h2><p>${esc(ui.agentIntroLead)}</p></div>
+        <pre class="agent-prompt" tabindex="0"><button type="button" class="code-copy" data-copy-code aria-label="${esc(ui.copyCode)}">${esc(ui.copyCode)}</button><code>${esc(ui.agentPrompt)}</code></pre>
+        <p class="agent-intro-note"><a href="./quick-agent-install.html">${esc(ui.agentSkillLink)}</a></p>
+      </section>
+
+      <div class="docs-paths">
+        <section class="home-section" id="agent-does"><div class="index-group-heading"><span class="eyebrow">01</span><h2>${esc(ui.homeWillDoTitle)}</h2><p>${esc(ui.homeWillDoLead)}</p></div><div class="docs-grid home-three"><article class="doc-card"><h2>Herdr + herdr-mcp</h2><p>${esc(ui.homeWillDoHerdr)}</p></article><article class="doc-card"><h2>Edge + Link</h2><p>${esc(ui.homeWillDoEdge)}</p></article><article class="doc-card"><h2>Doctor</h2><p>${esc(ui.homeWillDoVerify)}</p></article></div></section>
+
+        <section class="home-section" id="handoffs"><div class="index-group-heading"><span class="eyebrow">02</span><h2>${esc(ui.homeHandoffsTitle)}</h2></div><div class="docs-grid"><article class="doc-card handoff-card"><h2>${esc(ui.homeCloudflareTitle)}</h2><p>${esc(ui.homeCloudflareBody)}</p></article><article class="doc-card handoff-card"><h2>${esc(ui.homeChatgptTitle)}</h2><p>${esc(ui.homeChatgptBody)}</p></article></div></section>
+
+        <section class="home-section" id="paths"><div class="index-group-heading"><span class="eyebrow">03</span><h2>${esc(ui.homePathsTitle)}</h2></div><div class="docs-grid home-three"><article class="doc-card"><h2><a href="./quick-agent-install.html">${esc(ui.homeAgentPathTitle)}</a></h2><p>${esc(ui.homeAgentPathBody)}</p></article><article class="doc-card"><h2><a href="./install.html">${esc(ui.homeManualPathTitle)}</a></h2><p>${esc(ui.homeManualPathBody)}</p></article><article class="doc-card"><h2><a href="./extension.html">${esc(ui.homeBrowserPathTitle)}</a></h2><p>${esc(ui.homeBrowserPathBody)}</p></article></div></section>
+
+        <section class="home-section" id="outcomes"><div class="index-group-heading"><span class="eyebrow">04</span><h2>${esc(ui.homeOutcomesTitle)}</h2></div><ul class="home-checks"><li>${esc(ui.homeOutcome1)}</li><li>${esc(ui.homeOutcome2)}</li><li>${esc(ui.homeOutcome3)}</li></ul></section>
+
+        <section class="home-section home-safety" id="safety"><div class="index-group-heading"><span class="eyebrow">05</span><h2>${esc(ui.homeSafetyTitle)}</h2><p>${esc(ui.homeSafetyBody)}</p></div></section>
+
+        <section class="home-section" id="support"><div class="index-group-heading"><span class="eyebrow">06</span><h2>${esc(ui.homeSupportTitle)}</h2></div><div class="docs-grid home-three"><article class="doc-card"><h2><a href="./troubleshooting.html">${esc(docsBySlug.get("troubleshooting").title)}</a></h2><p>${esc(docsBySlug.get("troubleshooting").description)}</p></article><article class="doc-card"><h2><a href="./architecture.html">${esc(docsBySlug.get("architecture").title)}</a></h2><p>${esc(docsBySlug.get("architecture").description)}</p></article><article class="doc-card"><h2><a href="https://github.com/whshang/herdr-mcp/tree/main/docs/history">${esc(ui.homeHistory)}</a></h2><p>${esc(ui.historyNav)}</p></article></div></section>
+      </div>
+      <footer class="docs-footer"><a href="https://github.com/whshang/herdr-mcp">GitHub</a><a href="./privacy.html">${esc(docsBySlug.get("privacy").title)}</a></footer>
+    </main>
+    <aside class="toc" aria-label="${esc(ui.onThisPage)}"><div class="toc-inner"><h2>${esc(ui.onThisPage)}</h2><ol><li><a href="#agent-install">${esc(ui.homeAgentPathTitle)}</a></li><li><a href="#agent-does">${esc(ui.homeWillDoTitle)}</a></li><li><a href="#handoffs">${esc(ui.homeHandoffsTitle)}</a></li><li><a href="#paths">${esc(ui.homePathsTitle)}</a></li><li><a href="#safety">${esc(ui.homeSafetyTitle)}</a></li></ol></div></aside>
+  </div>
+  ${searchUi({ pre, locale, searchIndex })}
 </body>
 </html>`;
 }
@@ -302,9 +328,8 @@ function localeEntryShell({ locale }) {
 // Chinese docs so the neutral entry never dumps Chinese readers into English.
 function docsRedirectShell() {
   const ui = UI[DEFAULT_LOCALE];
-  const first = DOC_ORDER[0];
-  const enFirst = `${origin}/docs/en/${first}.html`;
-  const zhFirst = `${origin}/docs/zh-CN/${first}.html`;
+  const enHome = `${origin}/docs/en/`;
+  const zhHome = `${origin}/docs/zh-CN/`;
   return `<!doctype html>
 <html lang="${ui.htmlLang}">
 <head>
@@ -313,27 +338,20 @@ function docsRedirectShell() {
   <meta name="description" content="${esc(ui.indexLead)}">
   <meta name="color-scheme" content="light dark">
   <title>herdr-mcp ${esc(ui.docsNav)}</title>
-  <link rel="canonical" href="${esc(enFirst)}">
-  <link rel="alternate" hreflang="en" href="${esc(enFirst)}">
-  <link rel="alternate" hreflang="zh-CN" href="${esc(zhFirst)}">
-  <link rel="alternate" hreflang="x-default" href="${esc(enFirst)}">
-  <meta http-equiv="refresh" content="0; url=./en/${first}.html">
+  <link rel="canonical" href="${esc(enHome)}">
+  <link rel="alternate" hreflang="en" href="${esc(enHome)}">
+  <link rel="alternate" hreflang="zh-CN" href="${esc(zhHome)}">
+  <link rel="alternate" hreflang="x-default" href="${esc(enHome)}">
+  <meta http-equiv="refresh" content="0; url=./en/">
   <link rel="icon" type="image/png" href="../favicon.png">
   <link rel="stylesheet" href="../style.css">
 </head>
 <body class="docs-index-page">
-  <main class="docs-index">
-    <div class="redirect-note">
-      <span class="eyebrow">${esc(ui.docsNav)}</span>
-      <h1>herdr-mcp ${esc(ui.docsNav)}</h1>
-      <p>${esc(ui.indexLead)}</p>
-      <p class="redirect-links"><a href="./en/${first}.html">English →</a><a href="./zh-CN/${first}.html">简体中文</a></p>
-    </div>
-  </main>
+  <main class="docs-index"><div class="redirect-note"><span class="eyebrow">${esc(ui.docsNav)}</span><h1>herdr-mcp ${esc(ui.docsNav)}</h1><p>${esc(ui.indexLead)}</p><p class="redirect-links"><a href="./en/">English →</a><a href="./zh-CN/">简体中文</a></p></div></main>
   <script>
     var langKey = "herdr-docs-lang";
     var wantsZh = !localStorage.getItem(langKey) && (navigator.languages || [navigator.language]).some(function (l) { return (l || "").toLowerCase().indexOf("zh") === 0; });
-    location.replace(wantsZh ? "./zh-CN/${first}.html" : "./en/${first}.html");
+    location.replace(wantsZh ? "./zh-CN/" : "./en/");
   </script>
 </body>
 </html>`;
@@ -414,7 +432,7 @@ for (const locale of LOCALES) {
       articleShell({ locale, doc, body: page.html, toc: page.toc, docsBySlug, searchIndex, version: pkg.version })
     );
   }
-  await writeFile(join(localeOut, "index.html"), localeEntryShell({ locale }));
+  await writeFile(join(localeOut, "index.html"), localeEntryShell({ locale, docsBySlug, searchIndex, version: pkg.version }));
 }
 
 await writeFile(join(outDir, "docs", "index.html"), docsRedirectShell());
