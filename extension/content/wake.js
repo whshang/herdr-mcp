@@ -8,8 +8,34 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.75";
+const H2W_CONTENT_VERSION = "0.1.76";
 (async function () {
+  // Store and unpacked Dev builds can be installed at the same time. Only the
+  // Native Messaging origin selected by herdr-mcp may own page-side control.
+  // Gate before reading adapter state, claiming shared DOM markers, registering
+  // listeners, or creating HUD/Queue surfaces so an inactive sibling build is
+  // completely inert on this page.
+  const ownerAllowsPageControl = await new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ type: "h2w_extension_owner_status" }, (status) => {
+        if (chrome.runtime.lastError || status === undefined) {
+          // Compatibility/offline path: old Native Hosts do not implement the
+          // identity probe. Preserve the pre-0.1.76 behavior unless Chromium
+          // has explicitly told the background that this origin is inactive.
+          resolve(true);
+          return;
+        }
+        resolve(!(status?.ok === true && status.active === false));
+      });
+    } catch (_) {
+      resolve(true);
+    }
+  });
+  if (!ownerAllowsPageControl) {
+    console.log("[h2w] extension standby; skipping page control");
+    return;
+  }
+
   const ADAPTER = window.__H2W_ADAPTER__;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
   const experimentalFlag = ADAPTER.name === "z.ai"

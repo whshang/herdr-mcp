@@ -20,7 +20,7 @@ herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
-On `0.4.1+`, the normal `native-host install` path uses the official Chrome Web Store extension identity; it does not require an unpacked extension directory or a source checkout. An existing herdr-mcp-owned development origin is migrated transactionally and remains rollbackable.
+On a fresh `0.4.1+` installation, the normal `native-host install` path uses the official Chrome Web Store extension identity; it does not require an unpacked extension directory or a source checkout. On `0.4.2+`, a maintainer may keep one unpacked Dev build installed alongside the Store build, but herdr-mcp still authorizes exactly one active Native Messaging origin at a time.
 
 5. Open ChatGPT or another currently supported site. z.ai and DeepSeek are experimental and remain disabled by default until you enable them separately in **Herdr Settings → Experimental features**, then reload that site.
 6. Click the Herdr toolbar icon and confirm the **Browser Control Center** opens in Chrome Side Panel.
@@ -139,9 +139,16 @@ Local extension builds, Chrome Web Store Developer Dashboard, package upload, Tr
 Maintainers should use:
 
 - `contracts/browser-extension-store.json` as the single machine-readable Chrome Web Store identity SSOT; Rust consumes and validates this contract instead of hard-coding the Store ID;
-- `HERDR_EXTENSION_PATH=/path/to/unpacked/extension herdr-mcp native-host install` when intentionally testing an unpacked development identity;
+- `herdr-mcp native-host dev enable [PATH]` to register and activate one unpacked Dev identity (`PATH` defaults to `./extension`);
+- `herdr-mcp native-host use store` / `herdr-mcp native-host use dev` to switch the one active/default browser owner without uninstalling the other Chrome extension;
+- `herdr-mcp native-host dev disable` to forget the Dev identity and return Store to active ownership;
+- `HERDR_EXTENSION_PATH=/path/to/unpacked/extension herdr-mcp native-host install` only as a compatibility form for older maintainer workflows;
 - `docs/_wip/browser-extension-development-and-store-release.md` for the Store workflow;
 - the extension validation and release ownership rules in `AGENTS.md`.
+
+Store and Dev may coexist as Chrome extensions, but the managed Native Messaging manifest always carries one exact `allowed_origins` entry: the currently active owner. The inactive 0.1.76+ build stays installed but enters standby instead of opening the local shared stream or operational HUD. Switching the active owner also revokes an already-open old Native Messaging request/stream through the Rust host's managed-origin fence, so the previous build cannot keep local control through a persistent connection. If an unpacked directory is moved, run `dev enable` again because Chromium's unpacked identity is path-derived.
+
+After `native-host use store` or `native-host use dev`, refresh already-open supported Web AI tabs. Page ownership is decided when the 0.1.76+ content script is injected, so a refresh lets the newly active build claim the page while the inactive sibling exits before registering page listeners or HUD/Queue UI. Safe simultaneous Store+Dev enablement therefore requires both browser builds to be 0.1.76+; the first 0.1.75 Store candidate remains a Store-only release candidate and is not rewritten in place.
 
 Once the Store listing is public, end-user documentation keeps only the Chrome Web Store installation path.
 

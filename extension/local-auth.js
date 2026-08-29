@@ -6,6 +6,14 @@
 
 export const HERDR_NATIVE_HOST = "dev.herdr.mcp";
 
+function isNativeAdmissionDenied(message) {
+  const text = String(message || "").toLowerCase();
+  return text.includes("forbidden")
+    || text.includes("not allowed")
+    || text.includes("access denied")
+    || text.includes("permission denied");
+}
+
 function nativeMessage(message) {
   return new Promise((resolve) => {
     if (!globalThis.chrome?.runtime?.sendNativeMessage) {
@@ -16,6 +24,10 @@ function nativeMessage(message) {
       chrome.runtime.sendNativeMessage(HERDR_NATIVE_HOST, message, (response) => {
         const err = chrome.runtime.lastError?.message;
         if (err) {
+          if (isNativeAdmissionDenied(err)) {
+            resolve({ ok: true, active: false, reason: "native-origin-not-active" });
+            return;
+          }
           resolve({ ok: false, error: err });
           return;
         }
@@ -49,6 +61,10 @@ function requestParts(input) {
     baseUrl: url.origin,
     path: `${url.pathname}${url.search}`,
   };
+}
+
+export async function getNativeExtensionOwnerStatus() {
+  return nativeMessage({ type: "identity" });
 }
 
 export async function localHerdrFetch(input, init = {}) {
