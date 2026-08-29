@@ -20,7 +20,7 @@
 - **Workers Routes Write**：限定到目标 zone；
 - **Workers Scripts Write**：限定到对应 account。
 
-它不会为了方便默认申请全账号管理员权限。
+它不会为了方便默认申请全账号管理员权限。helper 同时申请 Account **Workers R2 Storage Write**，用于在 Worker 部署前创建和验证私有 artifact bucket；Cloudflare 部分界面可能将这项能力显示为 **Workers R2 Storage:Edit**。
 
 如果首次部署只使用 `workers.dev`，是否需要 zone route 权限取决于你实际走的部署路径；本 helper 主要服务既有 Edge/cutover 工作流和 Custom Domain/route 场景。不要因为文档列出了权限，就给无关资源扩大作用域。
 

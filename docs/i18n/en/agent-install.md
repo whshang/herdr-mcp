@@ -52,9 +52,9 @@ WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 
 Open <https://dash.cloudflare.com/profile/api-tokens> when browser control is available; otherwise give the user that URL.
 
-The simplest supported path is Cloudflare's current **Edit Cloudflare Workers** template, scoped to the single Account used for this install. Do **not** add DNS Write.
+The simplest supported path is Cloudflare's current **Edit Cloudflare Workers** template, scoped to the single Account used for this install, **plus Account → Workers R2 Storage → Edit**. Do **not** add DNS Write. R2 write is required so the generated-image relay bucket can be created before Worker deploy.
 
-For a tighter custom token, retain at least Account → **Workers Scripts → Write/Edit**, Account → **Account Settings → Read**, User → **Memberships → Read**, and User → **User Details → Read**. `workers.dev` bootstrap does not need Zone/DNS permissions.
+For a tighter custom token, retain at least Account → **Workers Scripts → Write/Edit**, Account → **Workers R2 Storage → Edit**, Account → **Account Settings → Read**, User → **Memberships → Read**, and User → **User Details → Read**. `workers.dev` bootstrap does not need Zone/DNS permissions.
 
 Tell the user the secret is shown once and ask them to paste it only into the current local-Agent session; prefer a dedicated secret-input channel when available.
 
@@ -91,9 +91,10 @@ GET it again afterward and require the returned value to match before deploying 
 
 Obtain the Edge Worker sources needed for deploy (temporary shallow clone or Release-adjacent docs package is acceptable for this Edge step only). Generate ignored `wrangler.user.toml` from the published user example, then set `name`, `DEFAULT_WORKSTATION_ID`, and `OAUTH_ISSUER=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`. Keep `workers_dev = true` and `routes = []`.
 
-Deploy:
+Create the private R2 bucket named in `wrangler.user.toml` (idempotent if it already exists), then deploy the Worker. Do not skip the provision step: `wrangler deploy` fails closed when the bound bucket is missing.
 
 ```bash
+node provision-r2.mjs --config wrangler.user.toml
 npx wrangler deploy --config wrangler.user.toml
 ```
 

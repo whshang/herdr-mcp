@@ -99,6 +99,7 @@ Configure the Worker name, workstation identity and OAuth issuer, then deploy:
 
 ```bash
 cd edge/cloudflare
+node provision-r2.mjs --config wrangler.user.toml
 npx wrangler deploy --config wrangler.user.toml
 ```
 

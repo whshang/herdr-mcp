@@ -30,6 +30,15 @@ new_sqlite_classes = ["WorkstationDO"]
 tag = "v2"
 new_sqlite_classes = ["OAuthStoreDO"]
 
+# Private Worker-only R2 relay. Choose a unique bucket name per Worker/account.
+# Do not attach a public r2.dev domain or make this bucket publicly readable.
+[[r2_buckets]]
+binding = "ARTIFACT_BUCKET"
+bucket_name = "herdr-edge-artifacts"
+
+[triggers]
+crons = ["*/10 * * * *"]
+
 # Optional after workers.dev validation:
 # [[routes]]
 # pattern = "herdr.example.com"

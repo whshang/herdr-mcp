@@ -51,6 +51,14 @@ export const EDGE_STATUS_REPLY_INTERVAL_MS = 30_000;
 /** Frame payload bound — well below the 32 MiB DO limit. */
 export const DEFAULT_MAX_FRAME_BYTES = 1_048_576; // 1 MiB
 
+/** Temporary generated-image R2 relay. Objects never ride the 1 MiB MCP/DO frame. */
+export const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
+export const ARTIFACT_TTL_MS = 15 * 60 * 1000;
+export const ARTIFACT_ID_BYTES = 16;
+export const ARTIFACT_CAPABILITY_BYTES = 32;
+export const ARTIFACT_KEY_PREFIX = "artifacts/";
+export const ARTIFACT_MIME_TYPES = Object.freeze(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
 /** Dead-letter / diagnostics caps. */
 export const MAX_ARGS_SUMMARY_KEYS = 32;
 

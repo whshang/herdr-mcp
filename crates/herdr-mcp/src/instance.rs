@@ -140,15 +140,17 @@ impl InstanceId {
     /// Default loopback port for this instance.
     /// Named instances use a stable port in `8800..=8999` so they never take `8772`.
     pub fn default_port(&self) -> u16 {
-        match env::var("HERDR_MCP_PORT") {
-            Ok(value) if !value.is_empty() => {
-                if let Ok(port) = value.parse::<u16>()
-                    && port > 0
-                {
-                    return port;
+        if self.is_default() {
+            match env::var("HERDR_MCP_PORT") {
+                Ok(value) if !value.is_empty() => {
+                    if let Ok(port) = value.parse::<u16>()
+                        && port > 0
+                    {
+                        return port;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
         match &self.name {
             None => DEFAULT_RUNTIME_PORT,
@@ -199,6 +201,7 @@ mod tests {
         let port = named_instance_port("uat");
         assert_ne!(port, 8772);
         assert!((8800..=8999).contains(&port));
+        assert_eq!(id.default_port(), port);
     }
 
     #[test]

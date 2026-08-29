@@ -5,6 +5,7 @@ import {
   parseJsonFrame,
   checkArgsBudget,
   readBodyBounded,
+  readBytesBounded,
   byteLengthOf,
 } from "../dist/payload.js";
 
@@ -53,6 +54,26 @@ test("payload: readBodyBounded accepts small body", async () => {
   const r = await readBodyBounded(body, MB);
   assert.equal(r.ok, true);
   assert.deepEqual(r.value, { ok: true });
+});
+
+test("payload: readBytesBounded rejects declared content-length over budget", async () => {
+  const body = {
+    headers: { get: (n) => (n === "content-length" ? String(MB + 5) : null) },
+    arrayBuffer: async () => new Uint8Array(1).buffer,
+  };
+  const r = await readBytesBounded(body, MB);
+  assert.equal(r.ok, false);
+  assert.equal(r.code, "payload_too_large");
+});
+
+test("payload: readBytesBounded accepts raw image bytes", async () => {
+  const bytes = Uint8Array.from([1, 2, 3, 4]);
+  const r = await readBytesBounded({
+    headers: { get: () => null },
+    arrayBuffer: async () => bytes.buffer,
+  }, MB);
+  assert.equal(r.ok, true);
+  assert.deepEqual([...r.bytes], [1, 2, 3, 4]);
 });
 
 test("payload: checkArgsBudget rejects oversized args", () => {

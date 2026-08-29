@@ -1,4 +1,5 @@
 mod agent_visibility;
+mod artifact_import;
 mod browser_control;
 mod browser_extension_identity;
 mod capability_inventory;
@@ -165,6 +166,7 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::Update(command) => updater::run(command),
         cli::Command::NativeHost(command) => native_host_install::run(command),
         cli::Command::ExtensionHost { caller_origin } => native_host::run(&caller_origin),
+        cli::Command::ArtifactImport(args) => artifact_import::run(args),
         cli::Command::Link(command) => match command {
             cli::LinkCommand::Status => link::run_link_status(),
             cli::LinkCommand::Run => link::run_link(),

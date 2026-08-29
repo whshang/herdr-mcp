@@ -32,3 +32,11 @@ new_sqlite_classes = ["WorkstationDO"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["OAuthStoreDO"]
+
+# Private Worker-only R2 relay. Do not attach a public r2.dev domain.
+[[r2_buckets]]
+binding = "ARTIFACT_BUCKET"
+bucket_name = "herdr-edge-prod-artifacts"
+
+[triggers]
+crons = ["*/10 * * * *"]

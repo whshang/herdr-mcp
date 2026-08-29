@@ -8,6 +8,7 @@ const DEFAULT_ZONE = 'agentforme.cc.cd';
 const DEFAULT_OUTPUT = join(homedir(), '.config', 'herdr-mcp', 'cloudflare-cutover.env');
 const ROUTES_PERMISSION = 'Workers Routes Write';
 const SCRIPTS_PERMISSION = 'Workers Scripts Write';
+const R2_PERMISSION = 'Workers R2 Storage Write';
 
 function parseArgs(argv) {
   const out = { zone: DEFAULT_ZONE, output: DEFAULT_OUTPUT, name: '', rotate: false, dryRun: false, verifyOnly: false };
@@ -90,17 +91,19 @@ async function loadExisting(path) {
 }
 
 async function verifyGenerated({ token, accountId, zoneId }) {
-  const [verify, routes, scripts] = await Promise.all([
+  const [verify, routes, scripts, r2] = await Promise.all([
     cf(token, `/accounts/${encodeURIComponent(accountId)}/tokens/verify`),
     cf(token, `/zones/${encodeURIComponent(zoneId)}/workers/routes`),
     cf(token, `/accounts/${encodeURIComponent(accountId)}/workers/scripts`),
+    cf(token, `/accounts/${encodeURIComponent(accountId)}/r2/buckets?per_page=1`),
   ]);
   return {
-    ok: verify.ok && routes.ok && scripts.ok,
+    ok: verify.ok && routes.ok && scripts.ok && r2.ok,
     tokenActive: verify.ok && verify.result?.status === 'active',
     routesAccess: routes.ok,
     scriptsAccess: scripts.ok,
-    statuses: { verify: verify.status, routes: routes.status, scripts: scripts.status },
+    r2Access: r2.ok,
+    statuses: { verify: verify.status, routes: routes.status, scripts: scripts.status, r2: r2.status },
   };
 }
 
@@ -117,11 +120,12 @@ async function resolveBootstrap(token, zoneName) {
   const byName = new Map((Array.isArray(groups.result) ? groups.result : []).map((g) => [g?.name, g]));
   const routes = byName.get(ROUTES_PERMISSION);
   const scripts = byName.get(SCRIPTS_PERMISSION);
-  if (!routes?.id || !scripts?.id) return { ok: false, stage: 'permission_group_lookup', code: 'required_permission_group_missing' };
-  return { ok: true, zoneId: zone.id, accountId, routesPermissionId: routes.id, scriptsPermissionId: scripts.id };
+  const r2 = byName.get(R2_PERMISSION);
+  if (!routes?.id || !scripts?.id || !r2?.id) return { ok: false, stage: 'permission_group_lookup', code: 'required_permission_group_missing' };
+  return { ok: true, zoneId: zone.id, accountId, routesPermissionId: routes.id, scriptsPermissionId: scripts.id, r2PermissionId: r2.id };
 }
 
-function tokenPayload({ name, accountId, zoneId, routesPermissionId, scriptsPermissionId }) {
+function tokenPayload({ name, accountId, zoneId, routesPermissionId, scriptsPermissionId, r2PermissionId }) {
   return {
     name,
     policies: [
@@ -133,6 +137,11 @@ function tokenPayload({ name, accountId, zoneId, routesPermissionId, scriptsPerm
       {
         effect: 'allow',
         permission_groups: [{ id: scriptsPermissionId }],
+        resources: { [`com.cloudflare.api.account.${accountId}`]: '*' },
+      },
+      {
+        effect: 'allow',
+        permission_groups: [{ id: r2PermissionId }],
         resources: { [`com.cloudflare.api.account.${accountId}`]: '*' },
       },
     ],
@@ -189,7 +198,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (!resolved.ok) { emit({ ok: false, code: resolved.code, stage: resolved.stage, status: resolved.status ?? null }, 2); return; }
   const payload = tokenPayload({ name: args.name, ...resolved });
   if (args.dryRun) {
-    emit({ ok: true, code: 'dry_run_ready', zone: args.zone, accountId: resolved.accountId, zoneId: resolved.zoneId, permissions: [ROUTES_PERMISSION, SCRIPTS_PERMISSION], output: args.output });
+    emit({ ok: true, code: 'dry_run_ready', zone: args.zone, accountId: resolved.accountId, zoneId: resolved.zoneId, permissions: [ROUTES_PERMISSION, SCRIPTS_PERMISSION, R2_PERMISSION], output: args.output });
     return;
   }
 
@@ -201,7 +210,7 @@ export async function main(argv = process.argv.slice(2)) {
 
   const mode = await atomicWriteCredential(args.output, { token, accountId: resolved.accountId, zoneId: resolved.zoneId, zone: args.zone });
   const verify = await verifyGenerated({ token, accountId: resolved.accountId, zoneId: resolved.zoneId });
-  emit({ ok: verify.ok, code: verify.ok ? 'credential_created' : 'credential_created_but_verify_failed', path: args.output, mode, zone: args.zone, permissions: [ROUTES_PERMISSION, SCRIPTS_PERMISSION], ...verify }, verify.ok ? 0 : 2);
+  emit({ ok: verify.ok, code: verify.ok ? 'credential_created' : 'credential_created_but_verify_failed', path: args.output, mode, zone: args.zone, permissions: [ROUTES_PERMISSION, SCRIPTS_PERMISSION, R2_PERMISSION], ...verify }, verify.ok ? 0 : 2);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) await main();

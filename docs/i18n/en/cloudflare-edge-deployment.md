@@ -35,9 +35,10 @@ The Cloudflare layer provides:
 - workstation identity and routing;
 - persistent WSS link management;
 - runtime online/offline and generation/version state;
-- MCP request/response relay.
+- MCP request/response relay;
+- short-lived private R2 generated-image relay (`/artifacts`, Worker-only bucket).
 
-Edge does not store your Git repositories or replace Herdr. Code, shell commands and agents still run on the workstation.
+Edge does not store your Git repositories or replace Herdr. Code, shell commands and agents still run on the workstation. The R2 bucket is an ephemeral image relay, not an asset library.
 
 ## First deployment: workers.dev
 
@@ -78,8 +79,11 @@ OAuth issuer / `HERDR_MCP_BASE_URL` should use the same origin without `/mcp`.
 
 ### Deploy
 
+Create the private R2 artifact bucket first (idempotent), then deploy the Worker. The bucket is a Worker binding only; do not attach a public r2.dev domain.
+
 ```bash
 cd edge/cloudflare
+node provision-r2.mjs --config wrangler.user.toml
 npx wrangler deploy --config wrangler.user.toml
 ```
 

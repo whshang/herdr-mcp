@@ -24,6 +24,7 @@ pub enum Command {
     ExtensionHost {
         caller_origin: String,
     },
+    ArtifactImport(crate::artifact_import::ImportArgs),
     Link(LinkCommand),
 }
 
@@ -187,9 +188,98 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "update" => parse_update(&args[1..]),
         "native-host" => parse_native_host(&args[1..]),
         "extension-host" => parse_extension_host(&args[1..]),
+        "artifact" => parse_artifact(&args[1..]),
         "link" => parse_link(&args[1..]),
         value => Err(format!("unknown command '{value}'\n\n{}", help())),
     }
+}
+
+fn parse_artifact(args: &[String]) -> Result<Command, String> {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return Err("artifact requires import".to_owned());
+    };
+    if subcommand != "import" {
+        return Err(format!("unknown artifact command '{subcommand}'"));
+    }
+
+    let mut url = None;
+    let mut path = None;
+    let mut expected_sha256 = None;
+    let mut capability_env = crate::artifact_import::default_capability_env().to_owned();
+    let mut overwrite = false;
+    let mut confirm_dirty = false;
+    let mut confirm_busy = false;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--url" => {
+                url = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--url requires a value".to_owned())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--path" => {
+                path = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--path requires a value".to_owned())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--sha256" => {
+                expected_sha256 = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--sha256 requires a value".to_owned())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--capability-env" => {
+                capability_env = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--capability-env requires a value".to_owned())?
+                    .clone();
+                if capability_env.is_empty()
+                    || !capability_env.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+                {
+                    return Err(
+                        "--capability-env must be an uppercase environment variable name"
+                            .to_owned(),
+                    );
+                }
+                index += 2;
+            }
+            "--overwrite" => {
+                overwrite = true;
+                index += 1;
+            }
+            "--confirm-dirty" => {
+                confirm_dirty = true;
+                index += 1;
+            }
+            "--confirm-busy" => {
+                confirm_busy = true;
+                index += 1;
+            }
+            value => return Err(format!("unknown artifact import argument '{value}'")),
+        }
+    }
+
+    Ok(Command::ArtifactImport(
+        crate::artifact_import::ImportArgs {
+            url: url.ok_or_else(|| "artifact import requires --url".to_owned())?,
+            path: path.ok_or_else(|| "artifact import requires --path".to_owned())?,
+            expected_sha256,
+            capability_env,
+            overwrite,
+            confirm_dirty,
+            confirm_busy,
+        },
+    ))
 }
 
 fn parse_herdr_supervisor(args: &[String]) -> Result<Command, String> {
@@ -591,6 +681,7 @@ Advanced / internal:\n\
   herdr-mcp native-host dev <enable [PATH]|disable>\n\
   herdr-mcp native-host use <store|dev>\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\
+  herdr-mcp artifact import --url HTTPS_URL --path PROJECT_PATH [--sha256 HEX] [--capability-env NAME] [--overwrite] [--confirm-dirty] [--confirm-busy]\n\
   herdr-mcp dev [--dry-run]\n\
   herdr-mcp candidate [--port 8873]\n\n\
 Prefer the top-level install/status/doctor/scan/update/rollback/uninstall commands\n\
@@ -842,6 +933,32 @@ mod tests {
                 caller_origin: "chrome-extension://abcdefghijklmnop/".to_owned()
             }
         );
+        assert_eq!(
+            parse(args(&[
+                "artifact",
+                "import",
+                "--url",
+                "https://edge.example/artifacts/abc",
+                "--path",
+                "/tmp/project/image.png",
+                "--sha256",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--confirm-busy"
+            ]))
+            .unwrap()
+            .command,
+            Command::ArtifactImport(crate::artifact_import::ImportArgs {
+                url: "https://edge.example/artifacts/abc".to_owned(),
+                path: "/tmp/project/image.png".to_owned(),
+                expected_sha256: Some(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()
+                ),
+                capability_env: "HERDR_ARTIFACT_CAPABILITY".to_owned(),
+                overwrite: false,
+                confirm_dirty: false,
+                confirm_busy: true,
+            })
+        );
     }
 
     #[test]
@@ -876,6 +993,29 @@ mod tests {
         assert!(parse(args(&["link", "migrate-runtime-control", "--force"])).is_err());
         assert!(parse(args(&["link", "status", "extra"])).is_err());
         assert!(parse(args(&["extension-host", "https://example.com/"])).is_err());
+        assert!(parse(args(&["artifact"])).is_err());
+        assert!(
+            parse(args(&[
+                "artifact",
+                "import",
+                "--url",
+                "https://example.com"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(args(&[
+                "artifact",
+                "import",
+                "--url",
+                "https://example.com/a",
+                "--path",
+                "/tmp/a.png",
+                "--capability-env",
+                "bad-name"
+            ]))
+            .is_err()
+        );
         assert!(parse(args(&["status", "extra"])).is_err());
         assert!(parse(args(&["scan", "--force"])).is_err());
         assert!(parse(args(&["scan", "--json", "--json"])).is_err());

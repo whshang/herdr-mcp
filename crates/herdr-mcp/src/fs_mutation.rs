@@ -102,6 +102,24 @@ pub fn write(snapshot: &Value, args: &Value) -> Value {
         Ok(value) => value.unwrap_or(false),
         Err(error) => return error,
     };
+    write_bytes(
+        snapshot,
+        path,
+        content.as_bytes(),
+        overwrite,
+        confirm_dirty,
+        confirm_busy,
+    )
+}
+
+pub(crate) fn write_bytes(
+    snapshot: &Value,
+    path: &str,
+    content: &[u8],
+    overwrite: bool,
+    confirm_dirty: bool,
+    confirm_busy: bool,
+) -> Value {
     let topology = projects::derive_routing(snapshot);
     let target = match fs_security::validate_target_with_topology(&topology, path) {
         Ok(value) => value,
@@ -135,7 +153,7 @@ pub fn write(snapshot: &Value, args: &Value) -> Value {
             Err(message) => return fail("git_status_failed", path, Some(message)),
         }
     }
-    if let Err(message) = mutation::atomic_write(&target.real, content.as_bytes()) {
+    if let Err(message) = mutation::atomic_write(&target.real, content) {
         return fail("write_failed", path, Some(message));
     }
     success_with_working(
