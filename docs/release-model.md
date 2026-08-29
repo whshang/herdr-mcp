@@ -16,15 +16,30 @@ An extension-only change must **not** force a Rust runtime version bump. Maintai
 
 ## Runtime Release (authoritative product version)
 
-- **Workflow:** `.github/workflows/rust-release.yml` on tag push `v*`.
+- **Workflow:** `.github/workflows/rust-release.yml`; `workflow_dispatch` is a **signed qualification** path, while only a `push` of a `v*` tag can publish.
 - **Verify gate:** Rust fmt/clippy/test, `npm` build/test/edge, extension smoke, site build, `git diff --check`.
 - **Build:** cross-target binaries per `.github/rust-release-targets.json`.
+- **macOS signing:** both manual qualification and tagged release builds use the same `scripts/sign-macos-release.sh`, Developer ID secrets, stable identifier and Team ID contract.
 - **Manifest:** `scripts/build-rust-release-manifest.mjs` — lists the complete Runtime Release binary set; the browser extension is not a Runtime Release asset.
-- **Publish:** GitHub Release; prerelease when semver has a prerelease component (for example historical `v0.4.0-rc.1`); stable when the tag is plain semver (current: `v0.4.1`).
-- **Attestation:** `actions/attest` on release bundle.
-- **Recovery:** `.github/workflows/rust-release-recover.yml` for attested recovery publishes (fail-closed on identity mismatch).
+- **Attestation:** both signed qualification and tag-push bundles use the pinned `actions/attest` path.
+- **Publish:** **tag push only** (`event=push` + `refs/tags/v*`). `workflow_dispatch` never creates or overwrites a GitHub Release. Prerelease tags remain GitHub prereleases; plain semver tags are stable (current published stable: `v0.4.1`).
+- **Recovery:** `.github/workflows/rust-release-recover.yml` accepts only an attested **tag-push** source run whose SHA/ref/manifest/attestation all match the immutable tag; a manual qualification run cannot be recovered into a Release.
 
 **User-facing version** = Runtime Release version (`herdr-mcp --version`, README, install docs). `package.json` remains site/extension build tooling — **not** the runtime product version (G1).
+
+### Pre-tag signed macOS qualification
+
+A release that changes or depends on macOS privacy / responsible-code identity must not use the immutable tag as its first real Developer ID test. Before creating the version tag:
+
+1. provision the repository Actions secrets `HERDR_MACOS_CERT_P12_BASE64`, `HERDR_MACOS_CERT_PASSWORD`, `HERDR_MACOS_SIGNING_IDENTITY` and variable `HERDR_MACOS_TEAM_ID`;
+2. manually dispatch **Rust Release** on the exact source ref intended for release; require verify → build → Developer ID sign → manifest → attest → qualification PASS and confirm the `publish` job is skipped;
+3. download the signed macOS qualification artifact and verify `codesign`: identifier `dev.herdr.mcp`, expected non-empty TeamIdentifier, Developer ID signature, and a designated requirement that is not cdhash-bound;
+4. run that signed binary through a real launchd-managed installation (prefer an isolated named instance while qualifying) and repeat the protected-folder probe that previously failed: a linked worktree outside `~/Documents` whose common Git dir is inside `~/Documents`, plus `herdr_git status`, `herdr_fs_patch dry_run`, and `herdr_exec_start`; all operations must finish within their bounds with no owned child leak;
+5. replace the managed signed generation using the same signed identity path and repeat the probes. The code identity must remain stable and macOS must not require a new privacy authorization merely because the generation bytes/path changed;
+6. only after the signed qualification is retained as evidence may the immutable `v*` tag be created, and that tag **must point to the exact `release_identity.source_commit` recorded by the qualified manifest**. The tag-push run independently rebuilds/signs/attests that same source and is the only path allowed to publish;
+7. after publication, perform the normal stable-channel `update apply` / rollback dogfood and confirm the same identity/Native Host/service invariants before declaring patch-line closure.
+
+A workflow-dispatch artifact is qualification evidence only. Its manifest preserves the actual branch/ref and commit provenance; it is not discoverable by the updater and must never be presented as a published stable or preview Release.
 
 ### Update channels
 

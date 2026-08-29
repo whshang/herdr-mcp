@@ -54,8 +54,8 @@ jobs:
       - name: Build release binary
         shell: bash
         run: cargo build --locked --release -p herdr-mcp --target "${{ matrix.target }}"
-      - name: Sign tagged macOS release identity
-        if: startsWith(github.ref, 'refs/tags/v') && contains(matrix.target, 'apple-darwin')
+      - name: Sign macOS release or qualification identity
+        if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && contains(matrix.target, 'apple-darwin')
         shell: bash
         env:
           HERDR_MACOS_CERT_P12_BASE64: ${{ secrets.HERDR_MACOS_CERT_P12_BASE64 }}
@@ -122,7 +122,7 @@ jobs:
 
   attest:
     needs: manifest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -135,16 +135,48 @@ jobs:
         with:
           name: rust-release-bundle
           path: release-assets
-      - name: Attest GitHub Release assets
+      - name: Attest signed release or qualification assets
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             release-assets/herdr-mcp-*
             release-assets/release-manifest.json
 
+  qualification:
+    needs: attest
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-release-bundle
+          path: release-assets
+      - name: Verify signed qualification source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="release-assets/release-manifest.json"
+          source_commit="$(jq -r '.release_identity.source_commit' "$manifest")"
+          source_ref="$(jq -r '.release_identity.source_ref' "$manifest")"
+          [[ "$source_commit" == "$GITHUB_SHA" ]] || { echo "qualification source_commit does not match dispatched commit" >&2; exit 1; }
+          [[ "$source_ref" == "$GITHUB_REF" ]] || { echo "qualification source_ref does not match dispatched ref" >&2; exit 1; }
+          [[ "$source_ref" != refs/tags/* ]] || { echo "qualification mode refuses a tag ref" >&2; exit 1; }
+          echo "signed_qualification_ok commit=$source_commit ref=$source_ref assets=$(jq '.assets | length' "$manifest")"
+          {
+            echo '### Signed qualification bundle'
+            echo
+            echo "Commit: $source_commit"
+            echo "Source ref: $source_ref"
+            echo
+            echo 'This workflow-dispatch run signs and attests the candidate bundle but never publishes a GitHub Release. Run the signed launchd/TCC qualification before creating the immutable version tag.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   publish:
     needs: attest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
