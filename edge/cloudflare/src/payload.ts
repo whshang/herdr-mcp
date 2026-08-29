@@ -48,6 +48,70 @@ export interface BodySource {
   text(): Promise<string>;
 }
 
+export interface BytesBodySource {
+  headers: { get(name: string): string | null };
+  body?: ReadableStream<Uint8Array> | null;
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+export type BoundedBytesResult =
+  | { ok: true; bytes: Uint8Array }
+  | { ok: false; code: RelayErrorCode; reason: string };
+
+/**
+ * Read a raw request body with an early content-length gate and a hard byte
+ * ceiling. Used for binary artifact uploads; JSON MCP bodies stay on
+ * `readBodyBounded`.
+ */
+export async function readBytesBounded(
+  body: BytesBodySource,
+  maxBytes: number,
+): Promise<BoundedBytesResult> {
+  const declared = body.headers.get("content-length");
+  if (declared !== null) {
+    const n = Number.parseInt(declared, 10);
+    if (Number.isFinite(n) && n > maxBytes) {
+      return { ok: false, code: "payload_too_large", reason: `content-length ${n} exceeds ${maxBytes} budget` };
+    }
+  }
+  if (body.body) {
+    const reader = body.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel();
+          return { ok: false, code: "payload_too_large", reason: `body exceeds ${maxBytes} budget` };
+        }
+        chunks.push(value);
+      }
+    } catch {
+      return { ok: false, code: "bad_request", reason: "could not read request body" };
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { ok: true, bytes };
+  }
+  try {
+    const bytes = new Uint8Array(await body.arrayBuffer());
+    if (bytes.byteLength > maxBytes) {
+      return { ok: false, code: "payload_too_large", reason: `body exceeds ${maxBytes} budget` };
+    }
+    return { ok: true, bytes };
+  } catch {
+    return { ok: false, code: "bad_request", reason: "could not read request body" };
+  }
+}
+
 /**
  * Read a request body with an early content-length gate plus a post-read byte
  * check. Keeps oversized bodies out of memory as early as possible.

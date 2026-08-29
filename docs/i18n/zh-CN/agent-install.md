@@ -52,9 +52,9 @@ WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 
 有浏览器控制时打开 <https://dash.cloudflare.com/profile/api-tokens>；否则把该 URL 交给用户。
 
-最简单支持路径是 Cloudflare 当前的 **Edit Cloudflare Workers** 模板，并限定到本次安装使用的单个 Account。**不要**加 DNS Write。
+最简单支持路径是 Cloudflare 当前的 **Edit Cloudflare Workers** 模板，限定到本次安装使用的单个 Account，并额外授予 Account → **Workers R2 Storage → Edit**。**不要**加 DNS Write。R2 写权限用于在 Worker 部署前幂等创建生成图中继桶。
 
-更紧的自定义 token 至少保留 Account → **Workers Scripts → Write/Edit**、Account → **Account Settings → Read**、User → **Memberships → Read**、User → **User Details → Read**。`workers.dev` bootstrap 不需要 Zone/DNS 权限。
+更紧的自定义 token 至少保留 Account → **Workers Scripts → Write/Edit**、Account → **Workers R2 Storage → Edit**、Account → **Account Settings → Read**、User → **Memberships → Read**、User → **User Details → Read**。`workers.dev` bootstrap 不需要 Zone/DNS 权限。
 
 告知用户秘密只显示一次，并要求只粘贴到当前本地 Agent 会话；有专用密输通道时优先使用。
 
@@ -91,9 +91,10 @@ Content-Type: application/json
 
 仅为 Edge 部署获取 Worker 源码（临时 shallow clone 或与 Release 相邻的文档包均可）。从已发布的 user example 生成被忽略的 `wrangler.user.toml`，设置 `name`、`DEFAULT_WORKSTATION_ID`、`OAUTH_ISSUER=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`。保持 `workers_dev = true` 与 `routes = []`。
 
-部署：
+先按 `wrangler.user.toml` 幂等创建私有 R2 桶（已存在视为成功），再部署 Worker。不要跳过 provision：绑定的桶不存在时 `wrangler deploy` 会失败。
 
 ```bash
+node provision-r2.mjs --config wrangler.user.toml
 npx wrangler deploy --config wrangler.user.toml
 ```
 

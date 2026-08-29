@@ -31,6 +31,8 @@ test("Agent install guides own Cloudflare-token handoff and workers.dev-only boo
     assert.match(doc, /workers\/subdomain/);
     assert.match(doc, /PUT \/client\/v4\/accounts\/<ACCOUNT_ID>\/workers\/subdomain/);
     assert.match(doc, /wrangler deploy --config wrangler\.user\.toml/);
+    assert.match(doc, /provision-r2\.mjs/);
+    assert.match(doc, /Workers R2 Storage/);
     assert.match(doc, /wrangler secret put LINK_SHARED_SECRET/);
     assert.match(doc, /workers_dev = true/);
     assert.match(doc, /routes = \[\]/);

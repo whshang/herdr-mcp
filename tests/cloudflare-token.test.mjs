@@ -10,6 +10,9 @@ const deploymentDoc = await readFile(new URL('../docs/i18n/en/cloudflare-edge-de
 test('long-lived Cloudflare token keeps Edge permissions separate from DNS migration', () => {
   assert.match(edgeScript, /Workers Routes Write/);
   assert.match(edgeScript, /Workers Scripts Write/);
+  assert.match(edgeScript, /Workers R2 Storage Write/);
+  assert.match(edgeScript, /\/r2\/buckets\?per_page=1/);
+  assert.match(edgeScript, /r2Access/);
   assert.match(edgeScript, /0o600/);
   assert.doesNotMatch(edgeScript, /DNS Write/);
   assert.doesNotMatch(edgeScript, /Tunnel Edit|Account Admin/);
@@ -49,6 +52,7 @@ test('Cloudflare docs describe workers.dev default, optional Custom Domain, and 
   assert.match(tokenDoc, /bootstrap credential/);
   assert.match(tokenDoc, /Workers Routes Write/);
   assert.match(tokenDoc, /Workers Scripts Write/);
+  assert.match(tokenDoc, /Workers R2 Storage Write/);
   assert.match(tokenDoc, /0600/);
   assert.match(deploymentDoc, /does not require users to own a domain/);
   assert.match(deploymentDoc, /workers\.dev/);

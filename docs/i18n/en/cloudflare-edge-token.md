@@ -18,9 +18,10 @@ The goal is to remove the bootstrap credential from the normal workflow as soon 
 The project helper creates a token scoped to:
 
 - **Workers Routes Write** for the target zone;
-- **Workers Scripts Write** for the corresponding account.
+- **Workers Scripts Write** for the corresponding account;
+- **Workers R2 Storage Write** for the corresponding account, so Worker setup can create and verify the private artifact bucket before deploy.
 
-It does not request broad account administrator access by default.
+It does not request broad account administrator access by default. Cloudflare may label the R2 capability as **Workers R2 Storage:Edit** in parts of the UI; the API permission-group name used by the helper is **Workers R2 Storage Write**.
 
 A pure `workers.dev` deployment may not need a zone route for every operation. Grant only the permissions required by the deployment path you actually use.
 
@@ -100,7 +101,8 @@ A good verification confirms:
 - token active state;
 - correct account identity;
 - Workers Scripts access;
-- Workers Routes access for the target zone where required.
+- Workers Routes access for the target zone where required;
+- Workers R2 Storage access for private artifact-bucket provisioning.
 
 When deployment fails, distinguish credential failure from Worker/DO configuration failure.
 

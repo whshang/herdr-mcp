@@ -10,6 +10,11 @@ export interface Env {
   WORKSTATION_DO: DurableObjectNamespace;
   /** Global OAuth state Durable Object binding (class OAuthStoreDO). */
   OAUTH_STORE_DO: DurableObjectNamespace;
+  /**
+   * Private R2 bucket for short-lived generated-image relay. Absent binding
+   * fails closed; the bucket is never a public r2.dev asset store.
+   */
+  ARTIFACT_BUCKET?: R2Bucket;
   /** Shared workstation-link secret. Fail closed when absent. */
   LINK_SHARED_SECRET?: string;
   /** Optional development-only static MCP bearer fallback. */

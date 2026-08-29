@@ -29,11 +29,14 @@ edge/cloudflare/
 ├── README.md                 ← Edge architecture and operations
 ├── wrangler.toml             ← dev config: herdr-edge-dev, workers.dev, no routes
 ├── wrangler.prod.toml        ← production candidate: still validates on workers.dev first
+├── wrangler.user.example.toml
+├── provision-r2.mjs          ← idempotent R2 bucket create before wrangler deploy
 ├── tsconfig.json             ← edge-local type check + compile (outDir: dist/)
 ├── .dev.vars.example         ← copy to .dev.vars, change the secret
 ├── .gitignore                ← ignores dist/ (build output)
 ├── src/
-│   ├── index.ts              ← Worker entry: /health /info /status /ws /mcp / OAuth
+│   ├── index.ts              ← Worker entry: /health /info /status /ws /mcp /artifacts / OAuth
+│   ├── artifact-relay.ts     ← private R2 generated-image relay (not an MCP tool)
 │   ├── workstation-do.ts     ← Durable Object per workstation_id
 │   ├── relay-adapter.ts      ← ★ SOLE Relay Protocol v1 wire boundary
 │   ├── canonical-imports.ts   ← canonical v1 type/validation port (isolated build)
@@ -56,6 +59,7 @@ edge/cloudflare/
 
 ## What's implemented (boundaries)
 
+- **`POST /artifacts`, `GET|DELETE /artifacts/:id`** — private R2 generated-image relay. Existing MCP/OAuth or `LINK_SHARED_SECRET` for upload; object capability for download/delete. 8 MiB, PNG/JPEG/GIF/WebP + magic, 15-minute expiry, random IDs. Not a public bucket and not a nineteenth MCP tool.
 - **`GET /health`** — stable edge role: service, version, contract epoch/hash marker. No DO dependency.
 - **`GET /info`** — route + stage table for debugging.
 - **`GET /ws/:workstationId`** — workstation link WSS upgrade. Bearer check at the Worker
@@ -164,6 +168,9 @@ node --test edge/cloudflare/tests/*.test.mjs
 cd edge/cloudflare
 cp .dev.vars.example .dev.vars                    # then CHANGE the secret
 npm install --no-save wrangler                    # or npx wrangler@latest
+# Remote deploy only: create the private R2 bucket if needed, then deploy.
+# node provision-r2.mjs --config wrangler.toml
+# npx wrangler deploy --config wrangler.toml
 npx wrangler dev                                   # binds http://127.0.0.1:8787
 ```
 

@@ -7,6 +7,7 @@
  *   GET  /info                            route/stage table for debugging
  *   GET  /status/:workstationId           DO presence snapshot (dev-open)
  *   GET  /ws/:workstationId               workstation link WSS upgrade (auth)
+ *   POST /artifacts  GET|DELETE /artifacts/:id   private R2 image relay
  *   GET  /mcp  POST /mcp                  public MCP transport
  *   /.well-known/*                        OAuth / MCP discovery
  *
@@ -14,6 +15,7 @@
  * binds hello.workstationId to the route key and enforces protocol version.
  */
 
+import { handleArtifactRequest, sweepExpiredArtifacts } from "./artifact-relay.js";
 import { authenticateStaticMcpBearer, SharedSecretLinkAuthenticator, hasLinkApplicationProtocol } from "./auth.js";
 import type { Env } from "./env.js";
 import { errorResult } from "./errors.js";
@@ -85,6 +87,7 @@ export default {
           { path: "/ws/:workstationId", stage: "dev (WS upgrade, link auth)" },
           { path: "/status/:workstationId", stage: "dev (DO presence)" },
           { path: "/mcp", stage: `public MCP epoch-${identity.contractEpoch} + sessionless ChatGPT SSE` },
+          { path: "/artifacts", stage: "private R2 generated-image relay (auth + capability)" },
           { path: "/.well-known/mcp.json", stage: "public MCP discovery" },
           { path: "/.well-known/oauth-*", stage: "public OAuth discovery" },
         ],
@@ -156,12 +159,24 @@ export default {
       return stub.fetch(request);
     }
 
+    // ---- Private generated-image R2 relay. Not an MCP tool; not public.
+    const artifactResponse = await handleArtifactRequest(request, env, {
+      verifyEdgeToken: (token) => verifyEdgeAccessToken(env, token),
+    });
+    if (artifactResponse) return artifactResponse;
+
     // ---- /mcp + unknown well-known fallback.
     if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/") || url.pathname.startsWith("/.well-known/")) {
       return handleMcpRouter(request, env);
     }
 
     return jsonResponse({ ok: false, code: "not_found", retryable: false, path: url.pathname }, 404);
+  },
+
+  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    if (!env.ARTIFACT_BUCKET) return;
+    const result = await sweepExpiredArtifacts(env.ARTIFACT_BUCKET, Date.now());
+    logger.info("artifact.sweep", { scanned: result.scanned, deleted: result.deleted });
   },
 };
 
@@ -325,19 +340,21 @@ async function handleOAuthAdmin(request: Request, env: Env): Promise<Response> {
   return jsonResponse({ ok: false, code: "not_found" }, 404);
 }
 
+async function verifyEdgeAccessToken(env: Env, token: string): Promise<{ ok: boolean; clientId?: string }> {
+  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+  const response = await stub.fetch(new Request("https://oauth.internal/internal/oauth/access/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token, now_sec: Math.floor(Date.now() / 1000) }),
+  }));
+  if (!response.ok) return { ok: false };
+  const payload = await response.json() as Record<string, unknown>;
+  const clientId = typeof payload.client_id === "string" ? payload.client_id : undefined;
+  return clientId ? { ok: true, clientId } : { ok: payload.ok === true };
+}
+
 async function authenticateEdgeMcpRequest(request: Request, env: Env) {
   return authenticateMcpRequest(request, env, {
-    verifyEdgeToken: async (token: string) => {
-      const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
-      const response = await stub.fetch(new Request("https://oauth.internal/internal/oauth/access/verify", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ token, now_sec: Math.floor(Date.now() / 1000) }),
-      }));
-      if (!response.ok) return { ok: false };
-      const payload = await response.json() as Record<string, unknown>;
-      const clientId = typeof payload.client_id === "string" ? payload.client_id : undefined;
-      return clientId ? { ok: true, clientId } : { ok: payload.ok === true };
-    },
+    verifyEdgeToken: (token) => verifyEdgeAccessToken(env, token),
   });
 }
