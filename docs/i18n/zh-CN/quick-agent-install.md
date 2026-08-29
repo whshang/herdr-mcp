@@ -57,7 +57,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 
 ## 步骤 1 — 安装原生 runtime
 
-1. 从 <https://github.com/whshang/herdr-mcp/releases> 下载 `herdr-mcp` — 使用最新 stable 版本（当前快照为 [`v0.4.1`](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.1)，后续始终优先更新的 stable tag）
+1. 从 <https://github.com/whshang/herdr-mcp/releases> 下载 `herdr-mcp` — 使用最新 stable 版本（当前快照为 [`v0.4.2`](https://github.com/whshang/herdr-mcp/releases/tag/v0.4.2)，后续始终优先更新的 stable tag）
 2. 放到 `PATH` (如 `~/.local/bin/herdr-mcp`) 并赋予可执行权限
 3. 执行:
 

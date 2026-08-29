@@ -11,6 +11,7 @@ import {
   LOCALE_NAMES,
   NAV_GROUPS,
   NAV_GROUP_LABELS,
+  READING_ORDER,
   UI,
 } from "../scripts/site-i18n.mjs";
 
@@ -123,7 +124,12 @@ test("each locale docs entry is a real user-first homepage", async () => {
     }
     const sidebar = section(entry, '<nav class="sidebar-nav"', "</nav>");
     const sidebarSlugs = matches(sidebar, /data-doc-slug="([^"]+)"/g).map((m) => m[1]);
-    assert.deepEqual(sidebarSlugs, DOC_ORDER, `homepage sidebar (${locale}) must preserve the article reading order`);
+    assert.deepEqual(sidebarSlugs, DOC_ORDER, `homepage sidebar (${locale}) must preserve the document catalog order`);
+    const homepageMain = section(entry, '<main class="article-column docs-home-column">', "</main>");
+    assert.equal(matches(homepageMain, /class="button primary"/g).length, 1, `homepage (${locale}) must expose one primary CTA`);
+    assert.match(homepageMain, /class="agent-prompt" tabindex="0"/, `homepage (${locale}) install prompt must be keyboard-focusable`);
+    assert.match(homepageMain, /Chrome Web Store/, `homepage (${locale}) browser path must be Store-first`);
+    assert.doesNotMatch(homepageMain, /\b(?:alpha|candidate|UAT|Runtime A\/B|worktree)\b|G\d+|GA scorecard/i, `homepage main content (${locale}) must keep release-engineering jargon out of the user path`);
   }
 });
 
@@ -148,6 +154,9 @@ test("article pages carry same-slug language switching, per-locale search isolat
         assert.ok(offset > lastGroupOffset, `sidebar group ${label} (${locale}/${slug}) must appear in configured order`);
         lastGroupOffset = offset;
       });
+      const maintainerGroup = NAV_GROUPS.at(-1);
+      assert.equal(maintainerGroup.secondary, true, "maintainer reference must stay secondary");
+      assert.match(sidebar, new RegExp(`class="nav-group nav-secondary"><h2>${NAV_GROUP_LABELS[locale].at(-1).replaceAll("&", "&amp;")}</h2>`));
 
       // Same-slug language switch: exactly the other locale's same slug.
       const switcher = section(html, '<nav class="lang-switcher"', "</nav>");
@@ -194,18 +203,23 @@ test("article pages carry same-slug language switching, per-locale search isolat
         assert.match(html, new RegExp(`href="\\./${sl}\\.html"`), `same-locale doc link for ${sl} (${locale}/${slug})`);
       }
 
-      // Localized prev/next navigation within the locale.
-      const pageIndex = DOC_ORDER.indexOf(slug);
-      if (pageIndex > 0) {
-        assert.match(html, new RegExp(`data-prev href="\\./${DOC_ORDER[pageIndex - 1]}\\.html"`));
+      // Localized prev/next navigation within the ordinary user reading flow.
+      // Maintainer-only references remain discoverable in the sidebar/search,
+      // but do not pull users into release-engineering material by default.
+      const pageIndex = READING_ORDER.indexOf(slug);
+      if (pageIndex < 0) {
+        assert.doesNotMatch(html, /class="page-nav"/, `maintainer reference (${locale}/${slug}) must not join the ordinary reading chain`);
+      }
+      else if (pageIndex > 0) {
+        assert.match(html, new RegExp(`data-prev href="\\./${READING_ORDER[pageIndex - 1]}\\.html"`));
         assert.ok(html.includes(`<span>${ui.previous}</span>`), `previous label (${locale}/${slug})`);
       }
       else assert.doesNotMatch(html, /data-prev/, "first document must not render prev");
-      if (pageIndex < DOC_ORDER.length - 1) {
-        assert.match(html, new RegExp(`data-next href="\\./${DOC_ORDER[pageIndex + 1]}\\.html"`));
+      if (pageIndex >= 0 && pageIndex < READING_ORDER.length - 1) {
+        assert.match(html, new RegExp(`data-next href="\\./${READING_ORDER[pageIndex + 1]}\\.html"`));
         assert.ok(html.includes(`<span>${ui.next}</span>`), `next label (${locale}/${slug})`);
       }
-      else assert.doesNotMatch(html, /data-next/, "last document must not render next");
+      else assert.doesNotMatch(html, /data-next/, "last or maintainer-only document must not render next");
 
       // Search index: this locale's documents, own-locale titles, plus
       // cross-language aliases so the same term finds docs from either side.
@@ -307,7 +321,11 @@ test("shared runtime assets keep theme/drawer/search behavior and gain localized
 test("release.json, skill artifact and design invariants are preserved", async () => {
   const release = JSON.parse(await readFile(join(OUT, "release.json"), "utf8"));
   const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8"));
-  assert.equal(release.version, pkg.version);
+  const cargoManifest = await readFile(join(ROOT, "crates", "herdr-mcp", "Cargo.toml"), "utf8");
+  const runtimeVersion = cargoManifest.match(/(?:^|\n)\[package\]\s*\n([\s\S]*?)(?=\n\[|$)/)?.[1]?.match(/^\s*version\s*=\s*"([^"]+)"\s*$/m)?.[1];
+  assert.ok(runtimeVersion, "Rust runtime package version must be readable");
+  assert.equal(release.version, runtimeVersion);
+  assert.notEqual(release.version, pkg.version, "site runtime version must not silently fall back to the Node build-tooling version");
   assert.equal(release.commit, "site-build-test");
   assert.equal(release.docs, "./docs/");
   assert.equal(release.skill, "./herdr-mcp-SKILL.md");
@@ -318,6 +336,8 @@ test("release.json, skill artifact and design invariants are preserved", async (
 
   const home = await readFile(join(OUT, "index.html"), "utf8");
   assert.match(home, /herdr-mcp/);
+  const docsHome = await readFile(join(OUT, "docs", DEFAULT_LOCALE, "index.html"), "utf8");
+  assert.match(docsHome, new RegExp(`class="version-badge"[^>]*>v${runtimeVersion.replaceAll(".", "\\.")}<`));
   assert.match(home, /<html lang="en">/);
   assert.match(home, /rel="icon" type="image\/png" href="\.\/favicon\.png"/);
   assert.match(home, /herdr-docs-lang/, "homepage must route zh browsers to the zh mirror");

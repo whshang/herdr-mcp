@@ -46,8 +46,8 @@ Installed generations are content-addressed (`rust-<sha256-prefix>`). Update app
 
 | Artifact | Version | Notes |
 | --- | --- | --- |
-| Runtime binary | `0.4.1` | Current stable; updater + service |
-| Browser extension source | `0.1.73` | Current development source; Chrome Web Store published/review version may lag and must be checked independently |
+| Runtime binary | `0.4.2` | Current stable; updater + service |
+| Browser extension source | `0.1.76` | Current development source; Chrome Web Store published/review version may lag and must be checked independently |
 | Native Messaging host | Managed by runtime generation | `native-host status` must show `runtime_matches_current=true` |
 
 ## Contract Compatibility (shared public surface)

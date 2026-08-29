@@ -23,7 +23,7 @@ Node.js 只用于临时 Cloudflare Worker 引导（`npx wrangler`）和可选贡
 
 ## 2. 从 GitHub Releases 安装原生 runtime（主路径）
 
-1. 从 <https://github.com/whshang/herdr-mcp/releases> 下载当前 stable 平台二进制（当前 stable runtime：`v0.4.1`）。只有明确测试 preview channel 时才选择 prerelease 标签。
+1. 从 <https://github.com/whshang/herdr-mcp/releases> 下载当前 stable 平台二进制（当前 stable runtime：`v0.4.2`）。只有明确测试 preview channel 时才选择 prerelease 标签。
 2. 放到 `PATH`（例如 `~/.local/bin/herdr-mcp`）并赋予可执行权限。
 3. 执行：
 
