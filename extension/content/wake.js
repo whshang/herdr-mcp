@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.80";
+const H2W_CONTENT_VERSION = "0.1.81";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -51,6 +51,7 @@ const H2W_CONTENT_VERSION = "0.1.80";
   }
 
   const ADAPTER = window.__H2W_ADAPTER__;
+  const CORE = window.HerdrChatGptArtifactCore;
   if (!ADAPTER) { console.warn("[h2w] no adapter; skipping"); return; }
   const experimentalFlag = ADAPTER.name === "z.ai"
     ? "experimentalZAiEnabled"
@@ -1758,87 +1759,293 @@ const H2W_CONTENT_VERSION = "0.1.80";
     return "";
   }
 
-  async function fetchChatGptConversationSnapshot() {
-    const conversationId = chatGptConversationId();
-    if (!conversationId || ADAPTER.name !== "chatgpt") return { ok: false, reason: "not-chatgpt-conversation" };
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
-    try {
-      const response = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
-        credentials: "include",
-        cache: "no-store",
-        headers: { accept: "application/json" },
-        signal: controller.signal,
-      });
-      if (!response.ok) return { ok: false, reason: `http-${response.status}` };
-      const body = await response.json();
-      const mapping = body?.mapping || {};
-      const transcript = chatGptConversationTranscript(body);
-      const currentMessage = mapping?.[body?.current_node]?.message || null;
-      const currentNodeRole = String(currentMessage?.author?.role || "");
-      let nodeId = body?.current_node || null;
-      let assistant = null;
-      let assistantNodeId = null;
-      for (let i = 0; nodeId && i < 40; i += 1) {
-        const node = mapping?.[nodeId];
-        const message = node?.message;
-        if (message?.author?.role === "assistant") {
-          assistant = message;
-          assistantNodeId = nodeId;
-          break;
-        }
-        nodeId = node?.parent || null;
-      }
-      let user = currentNodeRole === "user" ? currentMessage : null;
-      if (!user) {
-        nodeId = assistantNodeId ? mapping?.[assistantNodeId]?.parent || null : null;
-        for (let i = 0; nodeId && i < 40; i += 1) {
-          const node = mapping?.[nodeId];
-          const message = node?.message;
-          if (message?.author?.role === "user") { user = message; break; }
-          nodeId = node?.parent || null;
-        }
-      }
-      if (!assistant?.id) {
-        return {
-          ok: true,
-          currentNodeRole,
-          messageId: null,
-          text: "",
-          finished: null,
-          userMessageId: user?.id ? String(user.id) : null,
-          userText: serverMessageText(user),
-          userCreatedAt: Number(user?.create_time || 0) > 0 ? Number(user.create_time) * 1000 : null,
-          transcript,
-        };
-      }
-      const finishType = String(assistant?.metadata?.finish_details?.type || "");
-      const status = String(assistant?.status || "");
-      const completed = assistant?.end_turn === true
-        || status === "finished_successfully"
-        || ["stop", "max_tokens", "length"].includes(finishType);
-      const explicitlyOpen = assistant?.end_turn === false || ["in_progress", "streaming"].includes(status);
-      const finished = completed ? true : (explicitlyOpen ? false : null);
-      const updateSeconds = Number(assistant?.update_time || assistant?.create_time || body?.update_time || 0);
+  function chatGptPluralConversationSnapshot(body) {
+    const turn = CORE.latestTurnMessages(body);
+    if (!turn) return null;
+    const { messages, currentRole: currentNodeRole, assistant, user } = turn;
+    const transcript = boundedHandoffTranscript(messages.map((message) => ({
+      role: String(message?.author?.role || ""),
+      text: serverMessageText(message),
+    })).filter((row) => (row.role === "user" || row.role === "assistant") && row.text));
+    if (!assistant?.id) {
       return {
         ok: true,
         currentNodeRole,
-        messageId: String(assistant.id),
-        text: serverMessageText(assistant),
-        status,
-        finished,
-        createdAt: Number(assistant?.create_time || 0) > 0 ? Number(assistant.create_time) * 1000 : null,
-        updatedAt: updateSeconds > 0 ? updateSeconds * 1000 : null,
+        messageId: null,
+        text: "",
+        finished: null,
         userMessageId: user?.id ? String(user.id) : null,
         userText: serverMessageText(user),
         userCreatedAt: Number(user?.create_time || 0) > 0 ? Number(user.create_time) * 1000 : null,
         transcript,
       };
+    }
+    const finishType = String(assistant?.metadata?.finish_details?.type || "");
+    const status = String(assistant?.status || "");
+    const completed = assistant?.end_turn === true
+      || status === "finished_successfully"
+      || ["stop", "max_tokens", "length"].includes(finishType);
+    const explicitlyOpen = assistant?.end_turn === false || ["in_progress", "streaming"].includes(status);
+    const finished = completed ? true : (explicitlyOpen ? false : null);
+    const updateSeconds = Number(assistant?.update_time || assistant?.create_time || body?.update_time || 0);
+    return {
+      ok: true,
+      currentNodeRole,
+      messageId: String(assistant.id),
+      text: serverMessageText(assistant),
+      status,
+      finished,
+      createdAt: Number(assistant?.create_time || 0) > 0 ? Number(assistant.create_time) * 1000 : null,
+      updatedAt: updateSeconds > 0 ? updateSeconds * 1000 : null,
+      userMessageId: user?.id ? String(user.id) : null,
+      userText: serverMessageText(user),
+      userCreatedAt: Number(user?.create_time || 0) > 0 ? Number(user.create_time) * 1000 : null,
+      transcript,
+    };
+  }
+
+  async function fetchChatGptConversationSnapshot() {
+    const conversationId = chatGptConversationId();
+    if (!conversationId || ADAPTER.name !== "chatgpt") return { ok: false, reason: "not-chatgpt-conversation" };
+    const conversation = await fetchChatGptConversation({ conversationId, timeoutMs: 6000 });
+    if (!conversation.ok) return { ok: false, reason: conversation.reason || "conversation-failed" };
+    const body = conversation.body;
+    const pluralSnapshot = chatGptPluralConversationSnapshot(body);
+    if (pluralSnapshot) return pluralSnapshot;
+    const mapping = body?.mapping || {};
+    const transcript = chatGptConversationTranscript(body);
+    const currentMessage = mapping?.[body?.current_node]?.message || null;
+    const currentNodeRole = String(currentMessage?.author?.role || "");
+    let nodeId = body?.current_node || null;
+    let assistant = null;
+    let assistantNodeId = null;
+    for (let i = 0; nodeId && i < 40; i += 1) {
+      const node = mapping?.[nodeId];
+      const message = node?.message;
+      if (message?.author?.role === "assistant") {
+        assistant = message;
+        assistantNodeId = nodeId;
+        break;
+      }
+      nodeId = node?.parent || null;
+    }
+    let user = currentNodeRole === "user" ? currentMessage : null;
+    if (!user) {
+      nodeId = assistantNodeId ? mapping?.[assistantNodeId]?.parent || null : null;
+      for (let i = 0; nodeId && i < 40; i += 1) {
+        const node = mapping?.[nodeId];
+        const message = node?.message;
+        if (message?.author?.role === "user") { user = message; break; }
+        nodeId = node?.parent || null;
+      }
+    }
+    if (!assistant?.id) {
+      return {
+        ok: true,
+        currentNodeRole,
+        messageId: null,
+        text: "",
+        finished: null,
+        userMessageId: user?.id ? String(user.id) : null,
+        userText: serverMessageText(user),
+        userCreatedAt: Number(user?.create_time || 0) > 0 ? Number(user.create_time) * 1000 : null,
+        transcript,
+      };
+    }
+    const finishType = String(assistant?.metadata?.finish_details?.type || "");
+    const status = String(assistant?.status || "");
+    const completed = assistant?.end_turn === true
+      || status === "finished_successfully"
+      || ["stop", "max_tokens", "length"].includes(finishType);
+    const explicitlyOpen = assistant?.end_turn === false || ["in_progress", "streaming"].includes(status);
+    const finished = completed ? true : (explicitlyOpen ? false : null);
+    const updateSeconds = Number(assistant?.update_time || assistant?.create_time || body?.update_time || 0);
+    return {
+      ok: true,
+      currentNodeRole,
+      messageId: String(assistant.id),
+      text: serverMessageText(assistant),
+      status,
+      finished,
+      createdAt: Number(assistant?.create_time || 0) > 0 ? Number(assistant.create_time) * 1000 : null,
+      updatedAt: updateSeconds > 0 ? updateSeconds * 1000 : null,
+      userMessageId: user?.id ? String(user.id) : null,
+      userText: serverMessageText(user),
+      userCreatedAt: Number(user?.create_time || 0) > 0 ? Number(user.create_time) * 1000 : null,
+      transcript,
+    };
+  }
+
+  // Shared authenticated ChatGPT conversation fetch. Gets a short access token
+  // from /api/auth/session (kept strictly in page memory) and calls the plural
+  // /backend-api/conversations/<id> endpoint with a Bearer header. Any
+  // 401/404/timeout fails closed and returns an error payload only; the token
+  // never leaves this function scope and is never logged/stored.
+  async function fetchChatGptConversation({ conversationId, timeoutMs = 6000 } = {}) {
+    if (!conversationId || ADAPTER.name !== "chatgpt") {
+      return { ok: false, error: "not-chatgpt-conversation" };
+    }
+    const accessToken = await readChatGptAccessToken();
+    if (!accessToken) return { ok: false, error: "session-missing", reason: "auth", status: 401 };
+    const sessionToken = String(accessToken);
+    if (sessionToken.length === 0 || sessionToken.length > 4096) {
+      return { ok: false, error: "session-missing", reason: "auth" };
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const url = CORE.conversationsUrl(conversationId, 40);
+      const response = await fetch(url, {
+        credentials: "include",
+        cache: "no-store",
+        redirect: "error",
+        headers: { accept: "application/json", authorization: `Bearer ${sessionToken}` },
+        signal: controller.signal,
+      });
+      if (!response.ok) return { ok: false, error: "conversation-http", reason: `http-${response.status}`, status: response.status };
+      const body = await response.json();
+      return { ok: true, body };
     } catch (error) {
-      return { ok: false, reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
+      return { ok: false, error: "conversation-failed", reason: error?.name === "AbortError" ? "timeout" : "fetch-failed" };
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  async function readChatGptAccessToken() {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4000);
+      try {
+        const response = await fetch("/api/auth/session", {
+          credentials: "include",
+          cache: "no-store",
+          redirect: "error",
+          headers: { accept: "application/json" },
+          signal: controller.signal,
+        });
+        if (!response.ok) return null;
+        const body = await response.json();
+        return String(body?.accessToken || "") || null;
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Only file ids that have not already been captured for THIS conversation in
+  // this content-script lifetime. Bounded to MAX_FILES_PER_TURN; native cache
+  // dedup keeps cross-reload/idempotency safe, so this is just a fast path.
+  const capturedFileIds = new Set();
+  function markFileIdCaptured(conversationId, fileId) {
+    // Bounded memory: key by conversation to avoid unbounded growth.
+    const key = `${conversationId}:${fileId}`;
+    if (capturedFileIds.size >= 256) capturedFileIds.clear();
+    capturedFileIds.add(key);
+  }
+  function alreadyCapturedFileId(conversationId, fileId) {
+    return capturedFileIds.has(`${conversationId}:${fileId}`);
+  }
+
+  async function captureChatGptTurnImages(conversationId) {
+    if (ADAPTER.name !== "chatgpt" || !conversationId) return { ok: false, reason: "not-eligible" };
+    // Best-effort: fetch the finalized conversation and look only for
+    // image_asset_pointer parts. Fail closed into a no-op on any error — never
+    // blocks or delays turn completion.
+    const conversation = await fetchChatGptConversation({ conversationId, timeoutMs: 8000 });
+    if (!conversation.ok) return { ok: false, reason: conversation.reason || conversation.error };
+    const fileIds = CORE.imageFileIdsFromConversation(conversation.body);
+    if (!fileIds.length) return { ok: false, reason: "no-image-assets" };
+    let captured = 0;
+    for (const fileId of fileIds.slice(0, CORE.MAX_FILES_PER_TURN)) {
+      if (alreadyCapturedFileId(conversationId, fileId)) continue;
+      const artifact = await downloadCaptureChatGptImage(conversationId, fileId);
+      if (!artifact) continue;
+      // Native Messaging starts a host process per message. Serialize captures
+      // here so cache bounds/dedup remain deterministic across multi-image turns,
+      // and only suppress retries after the native host confirms persistence.
+      const result = await sendBg({ type: "h2w_artifact_capture", artifact });
+      if (!result?.ok) continue;
+      markFileIdCaptured(conversationId, fileId);
+      captured += 1;
+    }
+    if (!captured) return { ok: false, reason: "none-captured" };
+    return { ok: true, count: captured };
+  }
+
+  async function downloadCaptureChatGptImage(conversationId, fileId) {
+    const accessToken = await readChatGptAccessToken();
+    if (!accessToken) return null;
+    const sessionToken = String(accessToken);
+    if (!sessionToken) return null;
+    try {
+      const headers = { accept: "application/json", authorization: `Bearer ${sessionToken}` };
+      const downloadController = new AbortController();
+      const downloadTimer = setTimeout(() => downloadController.abort(), 8000);
+      let download;
+      try {
+        const downloadResponse = await fetch(CORE.fileDownloadUrl(fileId, conversationId), {
+          credentials: "include",
+          cache: "no-store",
+          redirect: "error",
+          headers,
+          signal: downloadController.signal,
+        });
+        if (!downloadResponse.ok) return null;
+        download = await downloadResponse.json();
+      } finally {
+        clearTimeout(downloadTimer);
+      }
+      const downloadUrl = String(download?.download_url || "");
+      const declaredMime = String(download?.mime_type ? CORE.baseMime(download.mime_type) : (download?.file_metadata?.mime_type ? CORE.baseMime(download.file_metadata.mime_type) : ""));
+      if (!downloadUrl || !CORE.isChatGptDownloadUrl(downloadUrl)) return null;
+      const sizeHint = Number(download?.file_size_bytes || download?.file_metadata?.size || 0);
+      if (sizeHint > 0 && sizeHint > CORE.RAW_LIMIT_BYTES) return null;
+
+      const bytesController = new AbortController();
+      const bytesTimer = setTimeout(() => bytesController.abort(), 15000);
+      let raw;
+      try {
+        const bytesResponse = await fetch(downloadUrl, {
+          credentials: "include",
+          cache: "no-store",
+          redirect: "error",
+          headers: { accept: "*/*", authorization: `Bearer ${sessionToken}` },
+          signal: bytesController.signal,
+        });
+        if (!bytesResponse.ok) return null;
+        const contentType = String(bytesResponse.headers.get("content-type") || "");
+        const sizeBytes = Number(bytesResponse.headers.get("content-length") || 0);
+        const buffer = await bytesResponse.arrayBuffer();
+        raw = new Uint8Array(buffer);
+        if (!raw || raw.length === 0 || raw.length > CORE.RAW_LIMIT_BYTES) return null;
+        if (sizeBytes > 0 && sizeBytes !== raw.length) return null;
+        const mime = CORE.resolvedImageMime(contentType || declaredMime, raw);
+        if (!mime) return null;
+        const bytes_b64 = CORE.bytesToBase64(raw);
+        const sha256 = await CORE.sha256Hex(raw);
+        const message = CORE.nativeArtifactMessage({
+          conversation_id: conversationId,
+          file_id: fileId,
+          mime,
+          bytes_b64,
+          sha256,
+        });
+        return message;
+      } finally {
+        clearTimeout(bytesTimer);
+      }
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function maybeCaptureChatGptTurnImages() {
+    const conversationId = chatGptConversationId();
+    if (!conversationId || ADAPTER.name !== "chatgpt" || document.hidden) return;
+    void captureChatGptTurnImages(conversationId);
   }
 
   function explicitChatGptThreadError() {
@@ -2564,6 +2771,7 @@ const H2W_CONTENT_VERSION = "0.1.80";
         if (pressure) paintPageHud({ continuity: pressure });
       });
       paintPageHud({ pending: true });
+      void maybeCaptureChatGptTurnImages();
       sendBg(payload).then((r) => {
         console.log("[h2w] idle-nudge result:", r);
         hudPending = false;

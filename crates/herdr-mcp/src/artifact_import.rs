@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 use url::{Host, Url};
 
-const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 3;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -326,7 +326,7 @@ fn ipv6_public(ip: Ipv6Addr) -> bool {
         || (segments[0] == 0x2001 && segments[1] == 0x0db8))
 }
 
-fn supported_mime(value: &str) -> Option<&'static str> {
+pub(crate) fn supported_mime(value: &str) -> Option<&'static str> {
     match value.to_ascii_lowercase().as_str() {
         // images (strict magic enforced)
         "image/png" => Some("image/png"),
@@ -350,14 +350,14 @@ fn supported_mime(value: &str) -> Option<&'static str> {
     }
 }
 
-fn is_image_mime(mime: &str) -> bool {
+pub(crate) fn is_image_mime(mime: &str) -> bool {
     matches!(
         mime,
         "image/png" | "image/jpeg" | "image/gif" | "image/webp"
     )
 }
 
-fn magic_matches(mime: &str, bytes: &[u8]) -> bool {
+pub(crate) fn magic_matches(mime: &str, bytes: &[u8]) -> bool {
     match mime {
         "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
         "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
@@ -369,7 +369,7 @@ fn magic_matches(mime: &str, bytes: &[u8]) -> bool {
     }
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }

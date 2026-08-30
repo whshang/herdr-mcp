@@ -44,6 +44,11 @@ use tokio::net::UnixStream;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
 const MAX_NATIVE_MESSAGE: usize = 1024 * 1024;
+/// Largest frame the native host will read from the browser. Generic messages
+/// stay capped at [`MAX_NATIVE_MESSAGE`]; only the dedicated `artifact_capture`
+/// message is permitted to exceed that within this bounded envelope so it can
+/// carry up to 8 MiB of raw artifact bytes plus base64 JSON.
+const MAX_NATIVE_MESSAGE_FRAME: usize = 16 * 1024 * 1024;
 #[cfg(unix)]
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8772";
 #[cfg(unix)]
@@ -134,7 +139,7 @@ pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
     let mut reader = stdin.lock();
     let mut writer = stdout.lock();
     let message = match read_native_message(&mut reader) {
-        Ok(message) => message,
+        Ok((message, encoded_size)) => (message, encoded_size),
         Err(error) => {
             write_error(&mut writer, &error)?;
             return Ok(ExitCode::SUCCESS);
@@ -151,6 +156,7 @@ pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
 
     #[cfg(unix)]
     {
+        let (message, encoded_size) = message;
         let config = match HostConfig::from_env() {
             Ok(config) => config,
             Err(error) => {
@@ -169,6 +175,14 @@ pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
         }
 
         let message_type = message.get("type").and_then(Value::as_str).unwrap_or("");
+        // Only the dedicated artifact capture message may exceed the generic
+        // native-message bound. All other messages remain capped at 1 MiB
+        // measured against the bytes the host actually read.
+        if let Some(error) = enforce_message_size_gate(message_type, encoded_size) {
+            write_error(&mut writer, &error)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+
         if message_type == "identity" {
             let active = require_active_owner(&config).is_ok();
             write_native_message(
@@ -198,9 +212,25 @@ pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
                 }
             }
             "session" => write_error(&mut writer, "legacy_session_requires_compat_host")?,
+            "artifact_capture" => match handle_artifact_capture(&config, &message) {
+                Ok(value) => write_native_message(&mut writer, &value)?,
+                Err(error) => write_error(&mut writer, &error)?,
+            },
             _ => write_error(&mut writer, "unsupported_message")?,
         }
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// Per-type size gate: only `artifact_capture` may exceed [`MAX_NATIVE_MESSAGE`].
+/// All other message types stay capped at exactly 1 MiB measured against the
+/// bytes the host actually read from the browser.
+#[cfg(unix)]
+fn enforce_message_size_gate(message_type: &str, encoded_size: usize) -> Option<String> {
+    if message_type != "artifact_capture" && encoded_size > MAX_NATIVE_MESSAGE {
+        Some("native_message_too_large".to_owned())
+    } else {
+        None
     }
 }
 
@@ -322,20 +352,23 @@ pub(crate) fn chromium_id_for_path(path: &Path) -> Result<String, String> {
     Ok(id)
 }
 
-fn read_native_message<R: Read>(reader: &mut R) -> Result<Value, String> {
+fn read_native_message<R: Read>(reader: &mut R) -> Result<(Value, usize), String> {
     let mut header = [0_u8; 4];
     reader
         .read_exact(&mut header)
         .map_err(|_| "invalid_native_message".to_owned())?;
     let size = u32::from_le_bytes(header) as usize;
-    if size > MAX_NATIVE_MESSAGE {
+    if size > MAX_NATIVE_MESSAGE_FRAME {
         return Err("native_message_too_large".to_owned());
     }
     let mut body = vec![0_u8; size];
     reader
         .read_exact(&mut body)
         .map_err(|_| "invalid_native_message".to_owned())?;
-    serde_json::from_slice(&body).map_err(|_| "invalid_native_message".to_owned())
+    match serde_json::from_slice::<Value>(&body) {
+        Ok(value) => Ok((value, size)),
+        Err(_) => Err("invalid_native_message".to_owned()),
+    }
 }
 
 fn write_native_message<W: Write>(writer: &mut W, value: &Value) -> Result<(), String> {
@@ -625,6 +658,80 @@ async fn proxy_stream<W: Write>(
     write_native_message(writer, &json!({"type": "stream_end"}))
 }
 
+/// Handle a dedicated ChatGPT Web artifact capture message.
+///
+/// The extension sends only image bytes and non-secret identifiers; tokens,
+/// cookies, and download URLs must never cross the native-message boundary. The
+/// host rejects unknown fields (so secrets cannot be smuggled in), base64-decodes
+/// strictly, enforces the 8 MiB raw limit and image MIME/magic, recomputes
+/// SHA-256 in Rust, and stores the artifact in the secure short-lived cache.
+#[cfg(unix)]
+fn handle_artifact_capture(config: &HostConfig, message: &Value) -> Result<Value, String> {
+    require_active_owner(config)?;
+
+    let Some(object) = message.as_object() else {
+        return Err("artifact_capture_invalid".to_owned());
+    };
+    const ALLOWED_FIELDS: &[&str] = &[
+        "type",
+        "conversation_id",
+        "file_id",
+        "mime",
+        "bytes_b64",
+        "sha256",
+    ];
+    // Reject unknown fields so a token/cookie/download URL accidentally sent by
+    // the browser cannot cross the boundary even on an otherwise-valid message.
+    if object
+        .keys()
+        .any(|key| !ALLOWED_FIELDS.contains(&key.as_str()))
+    {
+        return Err("artifact_capture_unknown_field".to_owned());
+    }
+
+    let conversation_id = string_field(message, "conversation_id")?;
+    let file_id = string_field(message, "file_id")?;
+    let mime = string_field(message, "mime")?;
+    let encoded = string_field(message, "bytes_b64")?;
+    let browser_sha256 = match message.get("sha256") {
+        Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+        None => None,
+        Some(_) => return Err("artifact_capture_invalid_sha256".to_owned()),
+    };
+
+    if encoded.len() > 16 * 1024 * 1024 {
+        return Err("artifact_capture_too_large".to_owned());
+    }
+    let raw = BASE64
+        .decode(encoded)
+        .map_err(|_| "artifact_capture_invalid_base64".to_owned())?;
+
+    let paths = crate::paths::RuntimePaths::discover()?;
+    let captured = crate::web_artifact_cache::capture(
+        &paths.config_dir,
+        conversation_id,
+        file_id,
+        mime,
+        &raw,
+        browser_sha256,
+    )?;
+
+    Ok(json!({
+        "ok": true,
+        "type": "artifact_capture",
+        "artifact": captured.metadata_json(),
+    }))
+}
+
+#[cfg(unix)]
+fn string_field<'a>(message: &'a Value, key: &str) -> Result<&'a str, String> {
+    message
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("artifact_capture_missing_{key}"))
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -676,15 +783,61 @@ mod tests {
     fn native_message_framing_round_trips_and_is_bounded() {
         let value = json!({"type":"request","path":"/push/state"});
         let encoded = frame(&value);
+        let encoded_len = encoded.len() - 4;
+        let (parsed, size) = read_native_message(&mut Cursor::new(encoded)).unwrap();
+        assert_eq!(parsed, value);
+        assert_eq!(size, encoded_len);
+
+        // Frames beyond the dedicated 16 MiB envelope are rejected outright.
+        let mut beyond_frame = ((MAX_NATIVE_MESSAGE_FRAME + 1) as u32)
+            .to_le_bytes()
+            .to_vec();
+        beyond_frame.extend_from_slice(b"{}");
         assert_eq!(
-            read_native_message(&mut Cursor::new(encoded)).unwrap(),
-            value
+            read_native_message(&mut Cursor::new(beyond_frame)).unwrap_err(),
+            "native_message_too_large"
         );
 
-        let mut oversized = ((MAX_NATIVE_MESSAGE + 1) as u32).to_le_bytes().to_vec();
-        oversized.extend_from_slice(b"{}");
+        // A generic-typed message of 1 MiB+ parses at the framing gate; the
+        // per-type 1 MiB cap is enforced in `run` and is covered there.
+        let big_body = vec![b' '; MAX_NATIVE_MESSAGE + 1];
+        let generic_big = frame(&json!({"body": big_body, "type": "request"}));
+        let (_, generic_size) = read_native_message(&mut Cursor::new(generic_big)).unwrap();
+        assert!(generic_size > MAX_NATIVE_MESSAGE);
+
+        // An artifact-typed frame under the 16 MiB bound always parses; the
+        // per-type gate (and payload limits) are decided in `handle_artifact_capture`.
+        let payload_len = MAX_NATIVE_MESSAGE + 8;
+        let big_payload = vec![b'a'; payload_len];
+        let big = json!({"type":"artifact_capture","bytes_b64": big_payload});
+        let big_encoded = frame(&big);
+        let (parsed_big, big_size) = read_native_message(&mut Cursor::new(big_encoded)).unwrap();
+        assert_eq!(parsed_big["type"], "artifact_capture");
+        assert!(big_size > MAX_NATIVE_MESSAGE);
+        assert!(big_size <= MAX_NATIVE_MESSAGE_FRAME);
+    }
+
+    #[test]
+    fn per_type_size_gate_keeps_generic_messages_at_one_megabyte() {
+        // The per-type gate in `run` admits only `artifact_capture` beyond 1 MiB.
         assert_eq!(
-            read_native_message(&mut Cursor::new(oversized)).unwrap_err(),
+            enforce_message_size_gate("artifact_capture", MAX_NATIVE_MESSAGE + 8),
+            None
+        );
+        assert_eq!(
+            enforce_message_size_gate("request", MAX_NATIVE_MESSAGE),
+            None
+        );
+        const { assert!(MAX_NATIVE_MESSAGE_FRAME > MAX_NATIVE_MESSAGE) };
+
+        // A generic message over 1 MiB is refused by the gate.
+        let over_size = MAX_NATIVE_MESSAGE + 4;
+        assert_eq!(
+            enforce_message_size_gate("request", over_size).unwrap(),
+            "native_message_too_large"
+        );
+        assert_eq!(
+            enforce_message_size_gate("stream", over_size).unwrap(),
             "native_message_too_large"
         );
     }
