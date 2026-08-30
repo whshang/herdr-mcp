@@ -281,6 +281,22 @@ Roadmap 不与当前 Rust parity 并行扩张 public surface。顺序固定为�
 
 截至 `v0.4.1`，`18-tool native parity → production transport parity → Shared Local State Store foundation → supervisor / Native Messaging / updater / link → Node runtime removal` 已成为生产基线。`v0.4.2` 已完成 `Wave A release/test hardening → Wave B measured efficiency → Wave C docs taxonomy → docs-site redesign`，保持 epoch 2 / 18 tools public contract 不变，并加入 crash-safe Continuity Journal foundation：绑定 Web 会话的 finalized turn 可增量进入 Rust `state.db`，新会话可用稳定 `continuity_id` 经现有 `herdr_call` 恢复有界上下文；ID-only 接力前必须实时确认 Rust chain 仍存在，失败时继续使用既有 handoff packet 路径。完整 Continuity 2.0（rolling semantic checkpoint、更多 browser control state Rust 化、长期 retention 策略）与 Work Context/Evidence 保持后续路线。
 
+### 未来版本目标：Continuity 2.0
+
+Continuity 2.0 是 `v0.4.2` 之后的正式未来版本目标之一，但**当前不绑定具体版本号，也不纳入 `v0.4.2` scope**。版本归属应在 `v0.4.2` 发布并完成一段真实 dogfood 后，根据恢复成功率、journal 增长速度、resume token 成本、conversation rollover 频率和浏览器内存/主线程压力等数据进入 release planning。
+
+该阶段的产品目标是把 `v0.4.2` 的“持续保存 raw turn、崩溃后可恢复”升级为“长期任务始终维护一份有界、结构化、可验证的当前工作状态”。核心目标包括：
+
+- rolling semantic checkpoint：把较老 raw turns 增量压成 `objective / completed / decisions / constraints / active / pending / files / branches / commits / anchors / next_actions` 等结构化状态；
+- bounded resume：恢复时优先读取“最新 checkpoint + 最近 raw tail”，不重复把完整长会话重新送回模型；
+- incremental compaction：Sidecar 只处理 `previous checkpoint + new raw tail`，避免每次 handoff 重新压缩 80k+ conversation；
+- verified retention：达到 raw cap 时必须先生成并验证新 checkpoint，再回收最早 raw body；不能直接截断导致信息不可恢复；
+- Rust-owned continuity state：逐步把 handoff ticket、ACK、checkpoint、retention 和更多 browser continuity control state 收敛到 Shared Local State Store；
+- browser pressure integration：把模型上下文压力、页面内存、长 DOM 与主线程/render 压力共同作为 rollover 信号，并在确认 target 已接管后安全 retire/discard source tab；
+- fail-closed recovery：stale generation、重复 wake、正在生成、未确认 mutation、checkpoint/ACK 不确定等状态不得静默推进。
+
+实施顺序继续保持 `Reliability Kernel → Continuity 2.0`。Reliability Kernel 提供 `op_id`、idempotency、delivery phase 与 uncertain reconciliation，使 checkpoint 生成、写入、ACK、raw prune 等有副作用动作在 timeout/runtime restart 后仍能判断真实结果。详细设计与初始阈值见 [`docs/history/architecture/rust-native-rearchitecture.md`](./history/architecture/rust-native-rearchitecture.md#phase-8continuity-20)。
+
 工具性能作为独立 lane 演进，详细历史与基准见 [`docs/history/architecture/tool-performance-optimization.md`](./history/architecture/tool-performance-optimization.md)。Batch A/B 的普通优化不得改变 epoch 2 / 18-tool visible contract；生产 Rust Link 已是稳定基线，不再作为性能 lane 的并行 cutover 任务。只有测量证明固定 MCP/model round-trip 仍是主要瓶颈后，才在未来明确评估 multi-operation tool schema / JSON-RPC batch 与 contract epoch 演进，禁止把 model-visible schema 变化混入普通 Rust 重构。
 
 长任务可观察性作为性能与可靠性并行 lane 纳入 [`docs/history/architecture/tool-performance-optimization.md`](./history/architecture/tool-performance-optimization.md)。该 lane 通过 Task Journal、phase event 和 checkpoint 提供长 release/CI/deploy/self-upgrade 过程的阶段反馈，不替代 Git/runtime live state，也不改变 epoch 2 / 18 tools contract。
