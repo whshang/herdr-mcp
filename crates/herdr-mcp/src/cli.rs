@@ -220,6 +220,8 @@ fn parse_artifact(args: &[String]) -> Result<Command, String> {
     let mut path = None;
     let mut expected_sha256 = None;
     let mut capability_env = crate::artifact_import::default_capability_env().to_owned();
+    let mut capability_env_explicit = false;
+    let mut signed_url = false;
     let mut overwrite = false;
     let mut confirm_dirty = false;
     let mut confirm_busy = false;
@@ -251,6 +253,7 @@ fn parse_artifact(args: &[String]) -> Result<Command, String> {
                 index += 2;
             }
             "--capability-env" => {
+                capability_env_explicit = true;
                 capability_env = args
                     .get(index + 1)
                     .ok_or_else(|| "--capability-env requires a value".to_owned())?
@@ -266,6 +269,10 @@ fn parse_artifact(args: &[String]) -> Result<Command, String> {
                     );
                 }
                 index += 2;
+            }
+            "--signed-url" => {
+                signed_url = true;
+                index += 1;
             }
             "--overwrite" => {
                 overwrite = true;
@@ -283,12 +290,17 @@ fn parse_artifact(args: &[String]) -> Result<Command, String> {
         }
     }
 
+    if signed_url && capability_env_explicit {
+        return Err("--signed-url cannot be combined with --capability-env".to_owned());
+    }
+
     Ok(Command::ArtifactImport(
         crate::artifact_import::ImportArgs {
             url: url.ok_or_else(|| "artifact import requires --url".to_owned())?,
             path: path.ok_or_else(|| "artifact import requires --path".to_owned())?,
             expected_sha256,
             capability_env,
+            signed_url,
             overwrite,
             confirm_dirty,
             confirm_busy,
@@ -761,7 +773,7 @@ Advanced / internal:\n\
   herdr-mcp native-host dev <enable [PATH]|disable>\n\
   herdr-mcp native-host use <store|dev>\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\
-  herdr-mcp artifact import --url HTTPS_URL --path PROJECT_PATH [--sha256 HEX] [--capability-env NAME] [--overwrite] [--confirm-dirty] [--confirm-busy]\n\
+  herdr-mcp artifact import --url HTTPS_URL --path PROJECT_PATH [--sha256 HEX] [--capability-env NAME | --signed-url] [--overwrite] [--confirm-dirty] [--confirm-busy]\n\
   herdr-mcp dev [--dry-run]\n\
   herdr-mcp candidate [--port 8873]\n\n\
 Prefer the top-level install/status/doctor/permissions/scan/update/rollback/uninstall commands\n\
@@ -1106,10 +1118,48 @@ mod tests {
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()
                 ),
                 capability_env: "HERDR_ARTIFACT_CAPABILITY".to_owned(),
+                signed_url: false,
                 overwrite: false,
                 confirm_dirty: false,
                 confirm_busy: true,
             })
+        );
+        assert_eq!(
+            parse(args(&[
+                "artifact",
+                "import",
+                "--url",
+                "https://signed.example/image.png?sig=abc",
+                "--path",
+                "/tmp/project/image.png",
+                "--signed-url"
+            ]))
+            .unwrap()
+            .command,
+            Command::ArtifactImport(crate::artifact_import::ImportArgs {
+                url: "https://signed.example/image.png?sig=abc".to_owned(),
+                path: "/tmp/project/image.png".to_owned(),
+                expected_sha256: None,
+                capability_env: "HERDR_ARTIFACT_CAPABILITY".to_owned(),
+                signed_url: true,
+                overwrite: false,
+                confirm_dirty: false,
+                confirm_busy: false,
+            })
+        );
+        assert!(
+            parse(args(&[
+                "artifact",
+                "import",
+                "--url",
+                "https://signed.example/image.png?sig=abc",
+                "--path",
+                "/tmp/project/image.png",
+                "--signed-url",
+                "--capability-env",
+                "CUSTOM_CAPABILITY"
+            ]))
+            .is_err()
         );
     }
 
