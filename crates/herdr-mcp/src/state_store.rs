@@ -31,7 +31,7 @@ pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
 /// assert it remains exactly equal to the append-only migration count.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Meta-table key holding the applied schema version. Stored as a string.
 const META_SCHEMA_VERSION: &str = "schema_version";
@@ -162,9 +162,81 @@ CREATE INDEX IF NOT EXISTS idx_service_rollbacks_created
     ON service_rollbacks(created_at DESC);
 "#;
 
+/// Migration 5: crash-safe browser conversation continuity.
+/// Raw turns are append-only and idempotent by `(continuity_id, message_id)`.
+const MIGRATION_V5: &str = r#"
+CREATE TABLE IF NOT EXISTS continuity_chains (
+    continuity_id TEXT PRIMARY KEY NOT NULL,
+    title          TEXT,
+    project_id     TEXT,
+    status         TEXT NOT NULL DEFAULT 'active',
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_continuity_chains_updated
+    ON continuity_chains(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS continuity_bindings (
+    continuity_id   TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    workspace_id    TEXT NOT NULL DEFAULT '',
+    bound_at        INTEGER NOT NULL,
+    PRIMARY KEY (continuity_id, conversation_id, workspace_id),
+    FOREIGN KEY (continuity_id) REFERENCES continuity_chains(continuity_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_continuity_bindings_conversation
+    ON continuity_bindings(conversation_id);
+
+CREATE TABLE IF NOT EXISTS continuity_turns (
+    continuity_id   TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    message_id      TEXT NOT NULL,
+    role            TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    fingerprint     TEXT,
+    observed_at     INTEGER NOT NULL,
+    PRIMARY KEY (continuity_id, message_id),
+    FOREIGN KEY (continuity_id) REFERENCES continuity_chains(continuity_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_continuity_turns_order
+    ON continuity_turns(continuity_id, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS continuity_checkpoints (
+    continuity_id      TEXT NOT NULL,
+    checkpoint_id      TEXT NOT NULL,
+    through_message_id TEXT,
+    summary            TEXT NOT NULL,
+    anchors_json       TEXT,
+    created_at         INTEGER NOT NULL,
+    PRIMARY KEY (continuity_id, checkpoint_id),
+    FOREIGN KEY (continuity_id) REFERENCES continuity_chains(continuity_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_continuity_checkpoints_latest
+    ON continuity_checkpoints(continuity_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS continuity_transfers (
+    transfer_id            TEXT PRIMARY KEY NOT NULL,
+    continuity_id          TEXT NOT NULL,
+    source_conversation_id TEXT,
+    target_conversation_id TEXT,
+    state                  TEXT NOT NULL,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    FOREIGN KEY (continuity_id) REFERENCES continuity_chains(continuity_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_continuity_transfers_chain
+    ON continuity_transfers(continuity_id, updated_at DESC);
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
-const MIGRATIONS: &[&str] = &[MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4];
+const MIGRATIONS: &[&str] = &[
+    MIGRATION_V1,
+    MIGRATION_V2,
+    MIGRATION_V3,
+    MIGRATION_V4,
+    MIGRATION_V5,
+];
 
 /// Existing durable operation found while reserving an idempotency key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +256,49 @@ pub struct OperationRecord {
 pub enum OperationReservation {
     Reserved,
     Existing(OperationRecord),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ContinuityTurnInput<'a> {
+    pub continuity_id: &'a str,
+    pub conversation_id: &'a str,
+    pub workspace_id: Option<&'a str>,
+    pub project_id: Option<&'a str>,
+    pub title: Option<&'a str>,
+    pub message_id: &'a str,
+    pub role: &'a str,
+    pub text: &'a str,
+    pub fingerprint: Option<&'a str>,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuityTurnRecord {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub role: String,
+    pub text: String,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuityResumeRecord {
+    pub continuity_id: String,
+    pub title: Option<String>,
+    pub project_id: Option<String>,
+    pub status: String,
+    pub checkpoint: Option<String>,
+    pub turns: Vec<ContinuityTurnRecord>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuityCandidate {
+    pub continuity_id: String,
+    pub title: Option<String>,
+    pub project_id: Option<String>,
+    pub status: String,
+    pub updated_at: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +617,213 @@ impl StateStore {
         }
         tx.commit()
             .map_err(|error| format!("cannot commit operation completion: {error}"))
+    }
+
+    pub fn append_continuity_turn(
+        &mut self,
+        input: ContinuityTurnInput<'_>,
+    ) -> Result<bool, String> {
+        let ContinuityTurnInput {
+            continuity_id,
+            conversation_id,
+            workspace_id,
+            project_id,
+            title,
+            message_id,
+            role,
+            text,
+            fingerprint,
+            observed_at,
+        } = input;
+        if continuity_id.is_empty() || conversation_id.is_empty() || message_id.is_empty() {
+            return Err("continuity_id, conversation_id and message_id are required".to_owned());
+        }
+        if !matches!(role, "user" | "assistant") {
+            return Err(format!("unsupported continuity role {role:?}"));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin continuity append: {error}"))?;
+        tx.execute(
+            "INSERT INTO continuity_chains (
+                continuity_id, title, project_id, status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'active', ?4, ?4)
+             ON CONFLICT(continuity_id) DO UPDATE SET
+                title = COALESCE(excluded.title, continuity_chains.title),
+                project_id = COALESCE(excluded.project_id, continuity_chains.project_id),
+                updated_at = MAX(continuity_chains.updated_at, excluded.updated_at)",
+            params![continuity_id, title, project_id, observed_at],
+        )
+        .map_err(|error| format!("cannot upsert continuity chain: {error}"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO continuity_bindings (
+                continuity_id, conversation_id, workspace_id, bound_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                continuity_id,
+                conversation_id,
+                workspace_id.unwrap_or(""),
+                observed_at
+            ],
+        )
+        .map_err(|error| format!("cannot persist continuity binding: {error}"))?;
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO continuity_turns (
+                    continuity_id, conversation_id, message_id, role, text,
+                    fingerprint, observed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    continuity_id,
+                    conversation_id,
+                    message_id,
+                    role,
+                    text,
+                    fingerprint,
+                    observed_at
+                ],
+            )
+            .map_err(|error| format!("cannot append continuity turn: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit continuity append: {error}"))?;
+        Ok(inserted == 1)
+    }
+
+    pub fn continuity_resume(
+        &self,
+        continuity_id: &str,
+        max_turns: usize,
+    ) -> Result<Option<ContinuityResumeRecord>, String> {
+        let chain = self
+            .conn
+            .query_row(
+                "SELECT continuity_id, title, project_id, status, updated_at
+                 FROM continuity_chains WHERE continuity_id = ?1",
+                [continuity_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read continuity chain: {error}"))?;
+        let Some((continuity_id, title, project_id, status, updated_at)) = chain else {
+            return Ok(None);
+        };
+        let checkpoint = self
+            .conn
+            .query_row(
+                "SELECT summary FROM continuity_checkpoints
+                 WHERE continuity_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                [&continuity_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot read continuity checkpoint: {error}"))?;
+        let limit = i64::try_from(max_turns.clamp(1, 64)).unwrap_or(64);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT conversation_id, message_id, role, text, observed_at
+                 FROM continuity_turns WHERE continuity_id = ?1
+                 ORDER BY observed_at DESC LIMIT ?2",
+            )
+            .map_err(|error| format!("cannot prepare continuity turns query: {error}"))?;
+        let rows = stmt
+            .query_map(params![continuity_id, limit], |row| {
+                Ok(ContinuityTurnRecord {
+                    conversation_id: row.get(0)?,
+                    message_id: row.get(1)?,
+                    role: row.get(2)?,
+                    text: row.get(3)?,
+                    observed_at: row.get(4)?,
+                })
+            })
+            .map_err(|error| format!("cannot query continuity turns: {error}"))?;
+        let mut turns = Vec::new();
+        for row in rows {
+            turns.push(row.map_err(|error| format!("cannot decode continuity turn: {error}"))?);
+        }
+        turns.reverse();
+        // Keep resume payloads bounded. The browser stores raw history durably;
+        // a fresh context window should receive only the most recent useful tail.
+        let mut bytes = turns.iter().map(|turn| turn.text.len()).sum::<usize>();
+        while turns.len() > 1 && bytes > 64 * 1024 {
+            bytes = bytes.saturating_sub(turns[0].text.len());
+            turns.remove(0);
+        }
+        Ok(Some(ContinuityResumeRecord {
+            continuity_id,
+            title,
+            project_id,
+            status,
+            checkpoint,
+            turns,
+            updated_at,
+        }))
+    }
+
+    pub fn continuity_candidates(&self, limit: usize) -> Result<Vec<ContinuityCandidate>, String> {
+        let limit = i64::try_from(limit.clamp(1, 20)).unwrap_or(20);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT continuity_id, title, project_id, status, updated_at
+                 FROM continuity_chains WHERE status = 'active'
+                 ORDER BY updated_at DESC LIMIT ?1",
+            )
+            .map_err(|error| format!("cannot prepare continuity candidates query: {error}"))?;
+        let rows = stmt
+            .query_map([limit], |row| {
+                Ok(ContinuityCandidate {
+                    continuity_id: row.get(0)?,
+                    title: row.get(1)?,
+                    project_id: row.get(2)?,
+                    status: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })
+            .map_err(|error| format!("cannot query continuity candidates: {error}"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result
+                .push(row.map_err(|error| format!("cannot decode continuity candidate: {error}"))?);
+        }
+        Ok(result)
+    }
+
+    pub fn continuity_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT b.continuity_id
+                 FROM continuity_bindings b
+                 JOIN continuity_chains c ON c.continuity_id = b.continuity_id
+                 WHERE b.conversation_id = ?1 AND c.status = 'active'
+                 ORDER BY c.updated_at DESC LIMIT 2",
+            )
+            .map_err(|error| format!("cannot prepare continuity binding lookup: {error}"))?;
+        let rows = stmt
+            .query_map([conversation_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query continuity binding: {error}"))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(|error| format!("cannot decode continuity binding: {error}"))?);
+        }
+        match ids.as_slice() {
+            [] => Ok(None),
+            [only] => Ok(Some(only.clone())),
+            _ => Err("continuity_binding_ambiguous".to_owned()),
+        }
     }
 }
 
@@ -2214,6 +2536,90 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn continuity_turns_are_idempotent_resumable_and_ambiguity_fails_closed() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        assert_eq!(store.schema_version().unwrap(), 5);
+        assert!(
+            store
+                .append_continuity_turn(ContinuityTurnInput {
+                    continuity_id: "hc:alpha",
+                    conversation_id: "conv-a",
+                    workspace_id: Some("w19"),
+                    project_id: Some("project-a"),
+                    title: Some("Continuity alpha"),
+                    message_id: "msg-user-1",
+                    role: "user",
+                    text: "continue the work",
+                    fingerprint: Some("fp-user-1"),
+                    observed_at: 100,
+                })
+                .unwrap()
+        );
+        assert!(
+            !store
+                .append_continuity_turn(ContinuityTurnInput {
+                    continuity_id: "hc:alpha",
+                    conversation_id: "conv-a",
+                    workspace_id: Some("w19"),
+                    project_id: Some("project-a"),
+                    title: Some("Continuity alpha"),
+                    message_id: "msg-user-1",
+                    role: "user",
+                    text: "duplicate payload is ignored",
+                    fingerprint: Some("fp-user-1"),
+                    observed_at: 101,
+                })
+                .unwrap()
+        );
+        assert!(
+            store
+                .append_continuity_turn(ContinuityTurnInput {
+                    continuity_id: "hc:alpha",
+                    conversation_id: "conv-a",
+                    workspace_id: Some("w19"),
+                    project_id: Some("project-a"),
+                    title: None,
+                    message_id: "msg-assistant-1",
+                    role: "assistant",
+                    text: "work completed",
+                    fingerprint: None,
+                    observed_at: 102,
+                })
+                .unwrap()
+        );
+
+        let resume = store.continuity_resume("hc:alpha", 32).unwrap().unwrap();
+        assert_eq!(resume.continuity_id, "hc:alpha");
+        assert_eq!(resume.turns.len(), 2);
+        assert_eq!(resume.turns[0].message_id, "msg-user-1");
+        assert_eq!(resume.turns[1].message_id, "msg-assistant-1");
+        assert_eq!(
+            store.continuity_for_conversation("conv-a").unwrap(),
+            Some("hc:alpha".to_owned())
+        );
+
+        store
+            .append_continuity_turn(ContinuityTurnInput {
+                continuity_id: "hc:beta",
+                conversation_id: "conv-a",
+                workspace_id: Some("w20"),
+                project_id: Some("project-a"),
+                title: Some("Continuity beta"),
+                message_id: "msg-user-2",
+                role: "user",
+                text: "other chain",
+                fingerprint: None,
+                observed_at: 103,
+            })
+            .unwrap();
+        assert_eq!(
+            store.continuity_for_conversation("conv-a").unwrap_err(),
+            "continuity_binding_ambiguous"
+        );
+        assert_eq!(store.continuity_candidates(10).unwrap().len(), 2);
     }
 
     #[cfg(unix)]

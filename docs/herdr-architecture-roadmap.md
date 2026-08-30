@@ -279,7 +279,7 @@ Roadmap 不与当前 Rust parity 并行扩张 public surface。顺序固定为�
   → Product Completion hardening
 ```
 
-截至 `v0.4.1`，`18-tool native parity → production transport parity → Shared Local State Store foundation → supervisor / Native Messaging / updater / link → Node runtime removal` 已成为生产基线。`v0.4.2` 已完成 `Wave A release/test hardening → Wave B measured efficiency → Wave C docs taxonomy → docs-site redesign`，保持 epoch 2 / 18 tools public contract 不变，并以 signed Release + supported updater dogfood 作为稳定版闭环。Reliability Kernel、Continuity 2.0 与 Work Context/Evidence 保持后续路线。
+截至 `v0.4.1`，`18-tool native parity → production transport parity → Shared Local State Store foundation → supervisor / Native Messaging / updater / link → Node runtime removal` 已成为生产基线。`v0.4.2` 已完成 `Wave A release/test hardening → Wave B measured efficiency → Wave C docs taxonomy → docs-site redesign`，保持 epoch 2 / 18 tools public contract 不变，并加入 crash-safe Continuity Journal foundation：绑定 Web 会话的 finalized turn 可增量进入 Rust `state.db`，新会话可用稳定 `continuity_id` 经现有 `herdr_call` 恢复有界上下文；ID-only 接力前必须实时确认 Rust chain 仍存在，失败时继续使用既有 handoff packet 路径。完整 Continuity 2.0（rolling semantic checkpoint、更多 browser control state Rust 化、长期 retention 策略）与 Work Context/Evidence 保持后续路线。
 
 工具性能作为独立 lane 演进，详细历史与基准见 [`docs/history/architecture/tool-performance-optimization.md`](./history/architecture/tool-performance-optimization.md)。Batch A/B 的普通优化不得改变 epoch 2 / 18-tool visible contract；生产 Rust Link 已是稳定基线，不再作为性能 lane 的并行 cutover 任务。只有测量证明固定 MCP/model round-trip 仍是主要瓶颈后，才在未来明确评估 multi-operation tool schema / JSON-RPC batch 与 contract epoch 演进，禁止把 model-visible schema 变化混入普通 Rust 重构。
 

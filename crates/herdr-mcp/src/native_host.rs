@@ -66,6 +66,8 @@ const ALLOWED_PROXY_PATHS: &[&str] = &[
     "/push/events",
     "/push/mcp-activity",
     "/extension/control/action",
+    "/extension/continuity/turn",
+    "/extension/continuity/resolve",
 ];
 #[cfg(unix)]
 const FORWARDED_HEADERS: &[&str] = &[
@@ -696,6 +698,14 @@ mod tests {
         assert_eq!(
             validate_proxy_path(Some(&json!("/push/events?workspace=w77"))).unwrap(),
             "/push/events?workspace=w77"
+        );
+        assert_eq!(
+            validate_proxy_path(Some(&json!("/extension/continuity/turn"))).unwrap(),
+            "/extension/continuity/turn"
+        );
+        assert_eq!(
+            validate_proxy_path(Some(&json!("/extension/continuity/resolve"))).unwrap(),
+            "/extension/continuity/resolve"
         );
         assert_eq!(
             validate_proxy_path(Some(&json!("/oauth/token"))).unwrap_err(),
