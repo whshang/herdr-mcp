@@ -101,7 +101,7 @@ The current production contract is **epoch 2 / 18 tools**. Tool-catalog changes 
 
 ## Progressive skills and capability truth
 
-The epoch-2 tool catalog stays fixed, but the planner policy no longer has to be one giant always-loaded document. The Rust runtime contains a compact global `AGENTS.md` plus seven on-demand modules: workstation control, file search, file mutation, Git, execution, agent dispatch, and development orchestration. Internal `herdr_mcp.skill.list/describe/load` methods are reached through the existing `herdr_call`; they do not add a nineteenth public MCP tool.
+The epoch-2 tool catalog stays fixed, but the planner policy no longer has to be one giant always-loaded document. The Rust runtime contains a compact global `AGENTS.md` plus eight on-demand modules: workstation control, file search, file mutation, Git, execution, agent dispatch, development orchestration, and engineering robustness/self-verification. Internal `herdr_mcp.skill.list/describe/load` methods are reached through the existing `herdr_call`; they do not add a nineteenth public MCP tool.
 
 The progressive path is deliberately separated from capability truth. A worker is not treated as code-edit capable, vision capable, high-reasoning, or tied to a provider/model merely because of its product name. `herdr-mcp scan` builds evidence instead:
 

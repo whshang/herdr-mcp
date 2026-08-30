@@ -81,6 +81,7 @@ const modulePaths = {
   execution: "assets/herdr/skills/execution/SKILL.md",
   "agent-dispatch": "assets/herdr/skills/agent-dispatch/SKILL.md",
   "development-orchestration": "assets/herdr/skills/development-orchestration/SKILL.md",
+  "engineering-robustness": "assets/herdr/skills/engineering-robustness/SKILL.md",
 };
 
 const moduleBytes = {};
@@ -96,6 +97,7 @@ const profiles = {
     "workstation-control",
     "agent-dispatch",
     "development-orchestration",
+    "engineering-robustness",
     "git-repository",
     "files-mutation",
   ],

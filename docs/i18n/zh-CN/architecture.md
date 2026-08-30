@@ -119,7 +119,7 @@ Herdr 本身拥有大量 Socket API 方法。herdr-mcp 没有把它们逐个包�
 
 ## Progressive Skills 与 Capability Truth
 
-epoch 2 的 18-tool catalog 保持不变，但 planner policy 不必永远加载成一份巨大的 Skill 文本。Rust runtime 已内置 compact global `AGENTS.md` 和 7 个按需模块：workstation control、files search、files mutation、Git、execution、agent dispatch、development orchestration。内部 `herdr_mcp.skill.list/describe/load` 仍通过现有 `herdr_call` 进入，不增加第 19 个公共 MCP tool。
+epoch 2 的 18-tool catalog 保持不变，但 planner policy 不必永远加载成一份巨大的 Skill 文本。Rust runtime 已内置 compact global `AGENTS.md` 和 8 个按需模块：workstation control、files search、files mutation、Git、execution、agent dispatch、development orchestration，以及 engineering robustness/self-verification。内部 `herdr_mcp.skill.list/describe/load` 仍通过现有 `herdr_call` 进入，不增加第 19 个公共 MCP tool。
 
 模块化 Skill 和“Agent 到底会什么”是两个独立问题。系统不会因为一个进程叫 Pi、Claude、Codex 或 Grok，就直接认定它一定支持 code edit、vision、某个 provider/model 或某档 reasoning。能力事实由 `herdr-mcp scan` 建立：
 

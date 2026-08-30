@@ -78,6 +78,9 @@ test("fetchHerdrSkill appends release-matched native Herdr reference with remote
     assert.match(r.native_reference.source, /^(local:herdr --skill|bundled:assets\/herdr-agent-SKILL\.md)$/);
     assert.match(r.content, /Appendix: release-matched native Herdr reference/);
     assert.match(r.content, /HERDR_ENV=1.*does \*\*not\*\* override/s);
+    assert.match(r.content, /engineering-robustness/);
+    assert.match(r.content, /silent-wrongness/);
+    assert.match(r.content, /state as separate planes/);
     assert.match(r.content, /name: herdr/);
   } finally {
     if (prev === undefined) delete process.env.HERDR_SKILL_NETWORK;
