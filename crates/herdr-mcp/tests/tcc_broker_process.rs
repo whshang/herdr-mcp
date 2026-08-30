@@ -259,10 +259,15 @@ fn permissions_status_setup_verify_and_broker_preservation() {
     let config = root.join("config");
     let broker = config.join("tcc-broker").join("herdr-mcp-broker");
     let binary = env!("CARGO_BIN_EXE_herdr-mcp");
+    // Never let this process-level test probe the developer's real protected
+    // ~/Documents. The broker still exercises the same read_dir + W_OK path,
+    // but against an isolated synthetic HOME.
+    fs::create_dir_all(root.join("Documents")).unwrap();
 
     let output = Command::new(binary)
         .args(["permissions", "status"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
+        .env("HOME", &root)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -283,6 +288,7 @@ fn permissions_status_setup_verify_and_broker_preservation() {
         .args(["permissions", "setup"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
         .env("HERDR_MCP_PERMISSIONS_DRY_RUN", "1")
+        .env("HOME", &root)
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -298,6 +304,7 @@ fn permissions_status_setup_verify_and_broker_preservation() {
     let output = Command::new(binary)
         .args(["permissions", "verify"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
+        .env("HOME", &root)
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&output.stdout);
@@ -316,6 +323,7 @@ fn permissions_status_setup_verify_and_broker_preservation() {
         .args(["permissions", "setup"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
         .env("HERDR_MCP_PERMISSIONS_DRY_RUN", "1")
+        .env("HOME", &root)
         .output()
         .unwrap();
     assert!(output.status.success());

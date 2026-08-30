@@ -8,8 +8,6 @@
 use crate::tcc_broker;
 use serde_json::{Value, json};
 use std::io::ErrorKind;
-#[cfg(target_os = "macos")]
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(target_os = "macos")]
@@ -206,13 +204,36 @@ fn print_status(report: &PermissionReport) {
         "broker_update_available: {}",
         report.broker_update_available
     );
+    if let Some(config_dir) = report.broker_path.parent().and_then(Path::parent) {
+        let upgrade = tcc_broker::upgrade_status(config_dir);
+        println!(
+            "broker_installed_revision: {}",
+            upgrade
+                .installed_revision
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned())
+        );
+        println!("broker_candidate_revision: {}", upgrade.candidate_revision);
+        println!(
+            "broker_identity_compatible: {}",
+            upgrade
+                .identity_compatible
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        );
+        println!(
+            "broker_update_requires_reauthorization: {}",
+            upgrade.update_requires_reauthorization
+        );
+    }
     println!("probe: {}", report.probe);
     println!("hint: {}", report.hint);
 }
 
 fn run_setup(upgrade_broker: bool) -> Result<ExitCode, String> {
     let config_dir = crate::paths::RuntimePaths::discover()?.config_dir;
-    if upgrade_broker {
+    let upgrade = tcc_broker::upgrade_status(&config_dir);
+    if upgrade_broker && upgrade.update_available {
         tcc_broker::install(&config_dir, true)?;
     }
     let sync = preserve_or_install_broker(&config_dir)?;
@@ -256,12 +277,21 @@ fn run_verify() -> Result<ExitCode, String> {
     {
         let report = collect_status()?;
         print_status(&report);
-        let git = verify_git_common_dir_and_status();
-        println!("git_common_dir: {}", git.common_dir);
-        println!("git_status: {}", git.status);
-        let write_gate = verify_mutation_free_write_gate();
-        println!("write_gate: {}", write_gate);
-        let ok = report.state == PermissionState::Granted && git.ok && write_gate_ok(write_gate);
+        // TCC verification must not make the rotating runtime (or a git child
+        // spawned by it) the responsible client. The broker probe validates
+        // read_dir + W_OK on ~/Documents without mutation. `herdr_git` is
+        // separately routed through the broker during real MCP use.
+        println!("git_common_dir: skipped (broker-owned MCP path)");
+        println!("git_status: skipped (verify with herdr_git after setup)");
+        println!(
+            "write_gate: {}",
+            if report.state == PermissionState::Granted {
+                "granted (broker probe)"
+            } else {
+                "skipped"
+            }
+        );
+        let ok = report.state == PermissionState::Granted;
         Ok(if ok {
             ExitCode::SUCCESS
         } else {
@@ -270,13 +300,9 @@ fn run_verify() -> Result<ExitCode, String> {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn write_gate_ok(label: &str) -> bool {
-    matches!(label, "granted" | "not_present" | "skipped")
-}
-
-/// Install the broker when missing. If bytes already differ, keep the installed
-/// identity and report `broker_update_available` instead of replacing it.
+/// Install the broker when missing. An existing broker is a long-lived TCC
+/// identity: ordinary runtime byte changes never replace it, and update
+/// availability is driven only by the broker compatibility revision.
 pub fn preserve_or_install_broker(config_dir: &Path) -> Result<BrokerSync, String> {
     let path = tcc_broker::broker_path(config_dir);
     if tcc_broker::status(&path).is_none() {
@@ -289,37 +315,13 @@ pub fn preserve_or_install_broker(config_dir: &Path) -> Result<BrokerSync, Strin
             sha256: info.map(|info| info.sha256),
         });
     }
-    let available = broker_update_available(config_dir);
-    if available {
-        let info = tcc_broker::status(&path);
-        return Ok(BrokerSync {
-            path,
-            installed: true,
-            broker_update_available: true,
-            sha256: info.map(|info| info.sha256),
-        });
-    }
-    match tcc_broker::install(config_dir, false) {
-        Ok(()) => {
-            let info = tcc_broker::status(&path);
-            Ok(BrokerSync {
-                path,
-                installed: true,
-                broker_update_available: false,
-                sha256: info.map(|info| info.sha256),
-            })
-        }
-        Err(message) if message.contains("already exists with different bytes") => {
-            let info = tcc_broker::status(&path);
-            Ok(BrokerSync {
-                path,
-                installed: true,
-                broker_update_available: true,
-                sha256: info.map(|info| info.sha256),
-            })
-        }
-        Err(message) => Err(message),
-    }
+    let info = tcc_broker::status(&path);
+    Ok(BrokerSync {
+        path,
+        installed: true,
+        broker_update_available: broker_update_available(config_dir),
+        sha256: info.map(|info| info.sha256),
+    })
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -461,20 +463,7 @@ fn tcc_blocked_value(path: &Path, message: String) -> Value {
 }
 
 fn broker_update_available(config_dir: &Path) -> bool {
-    let path = tcc_broker::broker_path(config_dir);
-    if tcc_broker::status(&path).is_none() {
-        return false;
-    }
-    let Ok(source) = std::env::current_exe() else {
-        return false;
-    };
-    let Ok(source_bytes) = std::fs::read(&source) else {
-        return false;
-    };
-    let Ok(existing) = std::fs::read(&path) else {
-        return false;
-    };
-    existing != source_bytes
+    tcc_broker::upgrade_status(config_dir).update_available
 }
 
 #[cfg(target_os = "macos")]
@@ -540,189 +529,6 @@ fn open_privacy_settings() -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("open exited {}", status.code().unwrap_or(-1)))
-    }
-}
-
-#[cfg(target_os = "macos")]
-struct GitVerify {
-    ok: bool,
-    common_dir: String,
-    status: String,
-}
-
-#[cfg(target_os = "macos")]
-fn verify_git_common_dir_and_status() -> GitVerify {
-    let cwd = match std::env::current_dir() {
-        Ok(path) => path,
-        Err(error) => {
-            return GitVerify {
-                ok: false,
-                common_dir: format!("unavailable: {error}"),
-                status: "skipped".to_owned(),
-            };
-        }
-    };
-    match git_bounded(&cwd, &["rev-parse", "--git-common-dir"]) {
-        GitBounded::Ok(output) => {
-            let common = output.trim().to_owned();
-            match git_bounded(&cwd, &["status", "--porcelain", "-b"]) {
-                GitBounded::Ok(_) => GitVerify {
-                    ok: true,
-                    common_dir: common,
-                    status: "ok".to_owned(),
-                },
-                GitBounded::Denied(message) => GitVerify {
-                    ok: false,
-                    common_dir: common,
-                    status: format!("macos_tcc_access_blocked: {message}"),
-                },
-                GitBounded::Timeout => GitVerify {
-                    ok: false,
-                    common_dir: common,
-                    status: "macos_tcc_access_blocked: timeout".to_owned(),
-                },
-                GitBounded::Other(message) => GitVerify {
-                    ok: true,
-                    common_dir: common,
-                    status: format!("unrelated: {message}"),
-                },
-            }
-        }
-        GitBounded::Denied(message) => GitVerify {
-            ok: false,
-            common_dir: format!("macos_tcc_access_blocked: {message}"),
-            status: "skipped".to_owned(),
-        },
-        GitBounded::Timeout => GitVerify {
-            ok: false,
-            common_dir: "macos_tcc_access_blocked: timeout".to_owned(),
-            status: "skipped".to_owned(),
-        },
-        GitBounded::Other(message) => GitVerify {
-            ok: true,
-            common_dir: format!("skipped: {message}"),
-            status: "skipped".to_owned(),
-        },
-    }
-}
-
-#[cfg(target_os = "macos")]
-enum GitBounded {
-    Ok(String),
-    Denied(String),
-    Timeout,
-    Other(String),
-}
-
-#[cfg(target_os = "macos")]
-fn git_bounded(cwd: &Path, args: &[&str]) -> GitBounded {
-    use crate::child_process;
-    use std::process::{Command, Stdio};
-    use std::thread;
-
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    child_process::configure_process_group(&mut command);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => return GitBounded::Other(error.to_string()),
-    };
-    let _registration = child_process::register_owned_child("macos-permissions-git", &child);
-    let mut stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            child_process::terminate_and_reap(&mut child);
-            return GitBounded::Other("git stdout unavailable".to_owned());
-        }
-    };
-    let mut stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            child_process::terminate_and_reap(&mut child);
-            return GitBounded::Other("git stderr unavailable".to_owned());
-        }
-    };
-    let stdout_handle = thread::spawn(move || read_capped(&mut stdout, 4096));
-    let stderr_handle = thread::spawn(move || read_capped(&mut stderr, 4096));
-    match child_process::wait_bounded(&mut child, PROBE_TIMEOUT) {
-        Ok(None) => {
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-            GitBounded::Timeout
-        }
-        Ok(Some(status)) => {
-            let out =
-                String::from_utf8_lossy(&stdout_handle.join().unwrap_or_default()).into_owned();
-            let err =
-                String::from_utf8_lossy(&stderr_handle.join().unwrap_or_default()).into_owned();
-            if status.success() {
-                GitBounded::Ok(out)
-            } else if is_permission_denied_text(&err) {
-                GitBounded::Denied(err)
-            } else if err.trim().is_empty() {
-                GitBounded::Other(format!("exit {}", status.code().unwrap_or(-1)))
-            } else {
-                GitBounded::Other(err)
-            }
-        }
-        Err(error) => {
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-            GitBounded::Other(error.to_string())
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn read_capped(reader: &mut impl Read, max_bytes: usize) -> Vec<u8> {
-    let mut retained = Vec::new();
-    let mut buffer = [0_u8; 1024];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                if retained.len() < max_bytes {
-                    let keep = count.min(max_bytes - retained.len());
-                    retained.extend_from_slice(&buffer[..keep]);
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    retained
-}
-
-#[cfg(target_os = "macos")]
-fn verify_mutation_free_write_gate() -> &'static str {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return "unknown";
-    };
-    let documents = home.join("Documents");
-    if !documents.exists() {
-        return "not_present";
-    }
-    let cstr = match std::ffi::CString::new(documents.to_string_lossy().as_bytes()) {
-        Ok(value) => value,
-        Err(_) => return "unknown",
-    };
-    let result = unsafe { libc::access(cstr.as_ptr(), libc::W_OK) };
-    if result == 0 {
-        return "granted";
-    }
-    let error = std::io::Error::last_os_error();
-    if is_permission_denied_io(&error) {
-        "denied"
-    } else if error.kind() == ErrorKind::NotFound {
-        "not_present"
-    } else {
-        "unknown"
     }
 }
 
@@ -867,14 +673,18 @@ mod tests {
     }
 
     #[test]
-    fn preserve_or_install_reports_update_available_without_replacing() {
+    fn preserve_or_install_ignores_runtime_byte_changes_at_same_broker_revision() {
         let dir = temp_dir("preserve");
         let config = dir.join("config");
         let target = tcc_broker::broker_path(&config);
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, b"existing-stable-broker").unwrap();
         let sync = preserve_or_install_broker(&config).unwrap();
-        assert!(sync.broker_update_available);
+        assert!(!sync.broker_update_available);
+        assert_eq!(
+            tcc_broker::installed_compat_revision(&config),
+            Some(tcc_broker::BROKER_COMPAT_REVISION)
+        );
         assert_eq!(fs::read(&target).unwrap(), b"existing-stable-broker");
         let _ = fs::remove_dir_all(&dir);
     }

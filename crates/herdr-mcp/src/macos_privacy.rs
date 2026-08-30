@@ -1,3 +1,6 @@
+use std::path::Path;
+#[cfg(any(target_os = "macos", test))]
+use std::path::PathBuf;
 use std::process::ExitCode;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
@@ -75,14 +78,32 @@ impl CodeIdentity {
 pub(crate) fn run_documents_probe_child() -> ExitCode {
     use std::fs;
     use std::io::ErrorKind;
-    use std::path::PathBuf;
 
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return ExitCode::from(1);
     };
     let documents = home.join("Documents");
     match fs::read_dir(&documents) {
-        Ok(_handle) => ExitCode::SUCCESS,
+        Ok(_handle) => {
+            let Ok(cstr) = std::ffi::CString::new(documents.to_string_lossy().as_bytes()) else {
+                return ExitCode::from(1);
+            };
+            // Validate the mutation-free write gate under the same stable
+            // broker identity. The rotating runtime must never probe W_OK on
+            // ~/Documents directly.
+            if unsafe { libc::access(cstr.as_ptr(), libc::W_OK) } == 0 {
+                ExitCode::SUCCESS
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == ErrorKind::PermissionDenied {
+                    ExitCode::from(DOCUMENTS_PERMISSION_DENIED_EXIT)
+                } else if error.kind() == ErrorKind::NotFound {
+                    ExitCode::from(DOCUMENTS_NOT_PRESENT_EXIT)
+                } else {
+                    ExitCode::from(1)
+                }
+            }
+        }
         Err(error) if error.kind() == ErrorKind::PermissionDenied => {
             ExitCode::from(DOCUMENTS_PERMISSION_DENIED_EXIT)
         }
@@ -99,13 +120,15 @@ pub(crate) fn run_documents_probe_child() -> ExitCode {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn probe_documents_permission() -> DocumentsPermission {
+pub(crate) fn probe_documents_permission(config_dir: &Path) -> DocumentsPermission {
     use crate::child_process;
     use std::process::{Command, Stdio};
 
-    let executable = match std::env::current_exe() {
+    let broker = crate::tcc_broker::broker_path(config_dir);
+    let broker_is_owned_regular_file = crate::tcc_broker::status(&broker).is_some();
+    let executable = match documents_probe_executable(&broker, broker_is_owned_regular_file) {
         Ok(path) => path,
-        Err(error) => return DocumentsPermission::ProbeFailed(error.to_string()),
+        Err(detail) => return DocumentsPermission::ProbeFailed(detail),
     };
     let mut command = Command::new(executable);
     command
@@ -136,8 +159,24 @@ pub(crate) fn probe_documents_permission() -> DocumentsPermission {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn probe_documents_permission() -> DocumentsPermission {
+pub(crate) fn probe_documents_permission(_config_dir: &Path) -> DocumentsPermission {
     DocumentsPermission::NotApplicable
+}
+
+/// Select the executable that is allowed to become the macOS TCC responsible
+/// client for the Documents probe. Doctor is also invoked directly from user
+/// shells, which do not necessarily inherit the service LaunchAgent's
+/// `HERDR_MCP_TCC_BROKER=1`. Therefore the protected-path probe always uses the
+/// installed broker and never falls back to a rotating runtime generation.
+#[cfg(any(target_os = "macos", test))]
+fn documents_probe_executable(broker: &Path, broker_exists: bool) -> Result<PathBuf, String> {
+    if broker_exists {
+        return Ok(broker.to_path_buf());
+    }
+    Err(format!(
+        "TCC broker routing is enabled but broker is missing at {}",
+        broker.display()
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -268,5 +307,12 @@ mod tests {
             DocumentsPermission::TimedOut.doctor_line(),
             "FAIL macOS Documents permission — probe timed out"
         );
+    }
+
+    #[test]
+    fn documents_probe_never_falls_back_to_rotating_runtime() {
+        let broker = Path::new("/tmp/config/tcc-broker/herdr-mcp-broker");
+        assert_eq!(documents_probe_executable(broker, true).unwrap(), broker);
+        assert!(documents_probe_executable(broker, false).is_err());
     }
 }
