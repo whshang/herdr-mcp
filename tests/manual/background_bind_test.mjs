@@ -45,7 +45,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.79", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true };
 const listeners = { onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
@@ -1662,6 +1662,22 @@ console.log("\n[project handoff]");
     "Project handoff preserves Auto on in shared Project state");
   ok(storage.herdrWakeBindings[targetKey]?.active_conv_key === PROJECT_TARGET,
     "Auto-on Project handoff switches only the active conversation target");
+
+  const staleSourceTabId = 406;
+  installContentScript(staleSourceTabId, PROJECT_SOURCE_URL, PROJECT_SOURCE);
+  const transferCountBeforeStaleAuto = Object.keys(storage.herdrConversationTransfers || {}).length;
+  let resolveStaleAuto;
+  const staleAutoP = new Promise((r) => { resolveStaleAuto = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: staleSourceTabId, trigger: "context_pressure" },
+    { tab: { id: staleSourceTabId, url: PROJECT_SOURCE_URL } }, (r) => resolveStaleAuto(r));
+  const staleAuto = await staleAutoP;
+  ok(staleAuto?.ok === false && staleAuto?.error === "inactive_project_conversation",
+    "a stale Project source tab cannot auto-roll over again after the binding moved to the target",
+    JSON.stringify(staleAuto));
+  ok(Object.keys(storage.herdrConversationTransfers || {}).length === transferCountBeforeStaleAuto,
+    "inactive Project source rejection creates no duplicate transfer");
+  tabs.delete(staleSourceTabId);
+
   let resolveAutoTargetHud;
   const autoTargetHudP = new Promise((r) => { resolveAutoTargetHud = r; });
   onMsg({ type: "h2w_page_hud", convKey: PROJECT_TARGET }, { tab: { id: storage.herdrWakeBindings[targetKey]?.tabId } }, (r) => resolveAutoTargetHud(r));
