@@ -457,6 +457,12 @@ fn find_meta(dir: &Path, artifact_id: &str) -> Result<Option<CapturedArtifact>, 
         return Ok(None);
     }
     let (_, meta_path) = entry_paths(dir, artifact_id);
+    let Ok(file_meta) = fs::symlink_metadata(&meta_path) else {
+        return Ok(None);
+    };
+    if file_meta.file_type().is_symlink() || !file_meta.is_file() {
+        return Ok(None);
+    }
     let Ok(text) = fs::read_to_string(&meta_path) else {
         return Ok(None);
     };
@@ -826,6 +832,26 @@ mod tests {
         remove(&config, &captured.artifact_id).unwrap();
         assert!(read(&config, &captured.artifact_id).is_err());
         assert_eq!(list(&config).unwrap().len(), 0);
+        fs::remove_dir_all(&config).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_read_rejects_symlinked_metadata() {
+        let config = temp_config();
+        let raw = png_bytes();
+        let captured =
+            capture(&config, "conv-1", "file-meta-link", "image/png", &raw, None).unwrap();
+        let dir = cache_dir_if_present(&config).unwrap().unwrap();
+        let (_, meta_path) = entry_paths(&dir, &captured.artifact_id);
+        let saved_meta = config.join("saved-artifact-meta.json");
+        fs::rename(&meta_path, &saved_meta).unwrap();
+        std::os::unix::fs::symlink(&saved_meta, &meta_path).unwrap();
+
+        assert_eq!(
+            read(&config, &captured.artifact_id).unwrap_err(),
+            "artifact_not_found"
+        );
         fs::remove_dir_all(&config).unwrap();
     }
 

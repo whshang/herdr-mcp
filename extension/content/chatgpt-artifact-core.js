@@ -108,8 +108,9 @@
     if (typeof value !== "string" || !value || value.length > 8192) return false;
     try {
       const url = new URL(value);
-      return url.protocol === "https:"
-        && url.hostname.toLowerCase() === "chatgpt.com"
+      return url.origin === "https://chatgpt.com"
+        && !url.username
+        && !url.password
         && url.pathname === "/backend-api/estuary/content";
     } catch (_) {
       return false;

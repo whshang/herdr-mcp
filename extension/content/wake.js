@@ -1898,6 +1898,7 @@ const H2W_CONTENT_VERSION = "0.1.81";
       const response = await fetch(url, {
         credentials: "include",
         cache: "no-store",
+        redirect: "error",
         headers: { accept: "application/json", authorization: `Bearer ${sessionToken}` },
         signal: controller.signal,
       });
@@ -1919,6 +1920,7 @@ const H2W_CONTENT_VERSION = "0.1.81";
         const response = await fetch("/api/auth/session", {
           credentials: "include",
           cache: "no-store",
+          redirect: "error",
           headers: { accept: "application/json" },
           signal: controller.signal,
         });
@@ -1956,20 +1958,21 @@ const H2W_CONTENT_VERSION = "0.1.81";
     if (!conversation.ok) return { ok: false, reason: conversation.reason || conversation.error };
     const fileIds = CORE.imageFileIdsFromConversation(conversation.body);
     if (!fileIds.length) return { ok: false, reason: "no-image-assets" };
-    const artifacts = [];
+    let captured = 0;
     for (const fileId of fileIds.slice(0, CORE.MAX_FILES_PER_TURN)) {
       if (alreadyCapturedFileId(conversationId, fileId)) continue;
       const artifact = await downloadCaptureChatGptImage(conversationId, fileId);
       if (!artifact) continue;
-      artifacts.push(artifact);
+      // Native Messaging starts a host process per message. Serialize captures
+      // here so cache bounds/dedup remain deterministic across multi-image turns,
+      // and only suppress retries after the native host confirms persistence.
+      const result = await sendBg({ type: "h2w_artifact_capture", artifact });
+      if (!result?.ok) continue;
       markFileIdCaptured(conversationId, fileId);
+      captured += 1;
     }
-    if (!artifacts.length) return { ok: false, reason: "none-downloaded" };
-    // Send each artifact as an independent non-secret message with no blocking.
-    for (const artifact of artifacts) {
-      void sendBg({ type: "h2w_artifact_capture", artifact });
-    }
-    return { ok: true, count: artifacts.length };
+    if (!captured) return { ok: false, reason: "none-captured" };
+    return { ok: true, count: captured };
   }
 
   async function downloadCaptureChatGptImage(conversationId, fileId) {
@@ -1986,6 +1989,7 @@ const H2W_CONTENT_VERSION = "0.1.81";
         const downloadResponse = await fetch(CORE.fileDownloadUrl(fileId, conversationId), {
           credentials: "include",
           cache: "no-store",
+          redirect: "error",
           headers,
           signal: downloadController.signal,
         });
@@ -2007,6 +2011,7 @@ const H2W_CONTENT_VERSION = "0.1.81";
         const bytesResponse = await fetch(downloadUrl, {
           credentials: "include",
           cache: "no-store",
+          redirect: "error",
           headers: { accept: "*/*", authorization: `Bearer ${sessionToken}` },
           signal: bytesController.signal,
         });

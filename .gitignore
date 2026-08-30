@@ -48,6 +48,7 @@ Desktop.ini
 
 # --- Herdr / PI / OMP local artifacts ---
 .herdr/
+.herdr-uat/
 .omp/
 .hermes/
 edge/cloudflare/.wrangler/

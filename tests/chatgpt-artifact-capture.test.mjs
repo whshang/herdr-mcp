@@ -60,6 +60,9 @@ test("ChatGPT authenticated download target is pinned to HTTPS chatgpt.com estua
   assert.equal(core.isChatGptDownloadUrl(good), true);
   assert.equal(core.isChatGptDownloadUrl(good.replace("https:", "http:")), false);
   assert.equal(core.isChatGptDownloadUrl("https://evil.example/backend-api/estuary/content?id=x"), false);
+  assert.equal(core.isChatGptDownloadUrl("https://chatgpt.com.evil.example/backend-api/estuary/content?id=x"), false);
+  assert.equal(core.isChatGptDownloadUrl("https://user:pass@chatgpt.com/backend-api/estuary/content?id=x"), false);
+  assert.equal(core.isChatGptDownloadUrl("https://chatgpt.com:444/backend-api/estuary/content?id=x"), false);
   assert.equal(core.isChatGptDownloadUrl("https://oaiusercontent.com/file.png"), false);
   assert.equal(core.isChatGptDownloadUrl("https://chatgpt.com/backend-api/files/download/file_x"), false);
 });
@@ -127,7 +130,10 @@ test("extension source keeps Bearer private while both authenticated download st
   assert.match(wake, /CORE\.conversationsUrl/);
   assert.match(wake, /CORE\.fileDownloadUrl/);
   assert.match(wake, /CORE\.isChatGptDownloadUrl/);
+  assert.ok((wake.match(/redirect: "error"/g) || []).length >= 4, "authenticated ChatGPT fetches fail closed on redirects");
   assert.match(wake, /headers: \{ accept: "\*\/\*", authorization: `Bearer \$\{sessionToken\}` \}/);
+  assert.match(wake, /const result = await sendBg\(\{ type: "h2w_artifact_capture", artifact \}\);/);
+  assert.doesNotMatch(wake, /void sendBg\(\{ type: "h2w_artifact_capture", artifact \}\);/);
   assert.match(wake, /void maybeCaptureChatGptTurnImages\(\);/);
   assert.match(background, /msg\?\.type === "h2w_artifact_capture"/);
   assert.match(background, /bindingAllowsArtifactCapture/);
