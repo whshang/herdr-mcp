@@ -99,6 +99,14 @@ ChatGPT Project 里，连续性的 binding 不再依赖某一个 conversation。
 
 从 0.4.2 开始，已绑定会话的 finalized user / assistant turn 会通过 Native Messaging 增量写入本机 Rust `state.db` 的 Continuity Journal。浏览器准备接力时会实时向 Rust 确认当前 `continuity_id` 仍存在；确认成功后，新会话只需要携带这个 ID，并通过现有 `herdr_call(method="continuity.resume", ...)` 恢复有界的最近工作上下文，再重新检查实时 Herdr、runtime 与 Git 状态。多个候选链不会按“最近一次”猜测，歧义会显式失败。Rust journal 不可用或实时确认失败时，扩展继续使用既有 `HERDR_HANDOFF_V1` 与 bounded transcript 路径。
 
+### 未来目标：Continuity 2.0
+
+`v0.4.2` 解决的是“平时持续记录，窗口或会话失效后仍能恢复”。后续正式路线中的 Continuity 2.0 继续解决“同一个工作链持续几天、几百轮甚至更久以后，恢复上下文如何仍然保持很小”。它当前不属于 `v0.4.2`，也尚未绑定具体版本号；版本归属将在 `v0.4.2` 发布和 dogfood 数据稳定后进入 release planning。
+
+Continuity 2.0 会持续把较老 raw turns 压成 rolling semantic checkpoint，保留目标、已完成事项、关键决定、约束、活跃文件/分支/commit、待办、下一步和 literal anchors。恢复时优先使用“最新 checkpoint + 最近 raw tail”，而不是重新发送完整长会话。只有新 checkpoint 已验证可恢复后，系统才能回收更早的 raw body；页面内存、长 DOM 和主线程/render 压力也会与模型 context pressure 一起参与 rollover 决策。
+
+实施顺序保持 `Reliability Kernel → Continuity 2.0`，详细技术设计见 [Rust Native Rearchitecture](../../history/architecture/rust-native-rearchitecture.md#phase-8continuity-20) 的 Phase 8 章节。
+
 ## 人工与自动控制
 
 自动化按作用域管理。全局允许 ChatGPT Project 共享 Auto 后，每个 Project 仍从自己的 HUD 显式开启 / 关闭；普通 ChatGPT conversation、z.ai、DeepSeek 在支持时使用 conversation 级 Auto。所有新作用域默认都是 `自动 关`。

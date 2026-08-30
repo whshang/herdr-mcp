@@ -105,6 +105,14 @@ If the local journal is unavailable or the live Rust resolve fails, the extensio
 
 This preserves continuity without making the dying source page responsible for the only recoverable copy of working state.
 
+### Future target: Continuity 2.0
+
+`v0.4.2` solves the first durability problem: keep recording working turns so a dead tab, extension reload, runtime restart, or conversation rollover does not erase the only recoverable context. Continuity 2.0 is a formal post-`v0.4.2` roadmap target for a different problem: keeping recovery context small even when one work chain spans days, hundreds of turns, or longer. It is not part of the `v0.4.2` scope and is not assigned to a concrete release number yet; release planning should happen after `v0.4.2` ships and dogfood data is available.
+
+Continuity 2.0 will incrementally compact older raw turns into rolling semantic checkpoints that preserve objectives, completed work, decisions, constraints, active files/branches/commits, pending work, next actions, and literal anchors. Resume should then consume the latest verified checkpoint plus a recent raw tail rather than replaying the full long conversation. Old raw bodies may be reclaimed only after a replacement checkpoint has been generated and verified. Browser memory, long-DOM cost, and main-thread/render pressure also become rollover inputs alongside model context pressure.
+
+The implementation order remains `Reliability Kernel → Continuity 2.0`. The Reliability Kernel provides operation identity, idempotency, delivery phases, and uncertain-result reconciliation for checkpoint generation, ACK, and raw-journal retention. The detailed design remains in [Phase 8 of the Rust Native Rearchitecture document](../../history/architecture/rust-native-rearchitecture.md#phase-8continuity-20).
+
 ## Manual and automatic control
 
 Automation is scoped deliberately.
