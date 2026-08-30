@@ -96,6 +96,26 @@ While `herdr-mcp` is still under active development, every task about developing
 - If `herdr_exec` may already have been delivered, never blindly rerun it after a transport/control-plane error.
 - Treat TaskGroup/ExceptionGroup snapshot failures as a control-plane transient until file/Git/direct exec evidence says otherwise.
 
+## 2A. Engineering robustness and AI self-verification
+
+For non-trivial implementation, bug fixes, reliability/refactor work, state-machine/background work, or releases, load the built-in `engineering-robustness` reference once for the task when available:
+
+```text
+herdr_call(method="herdr_mcp.skill.load", params={"ids":["engineering-robustness"],"project_root":"<project-root>"})
+```
+
+The reference is policy only and grants no mutation authority. Even when the progressive module is unavailable, preserve this minimum loop:
+
+- understand current architecture, ownership, invariants, and relevant project rules before adding another state owner or abstraction;
+- for a real bug, leave a regression test/check that would fail on the old behavior when feasible, then search sibling paths for the same failure class;
+- prioritize **silent-wrongness** tests: stale results, late tasks overwriting newer state, ambiguous delivery, command-success-without-effect, generation/cache mismatch, duplicate retry side effects, and source/artifact/runtime drift;
+- avoid unnecessary settings, permissions, resident listeners, compatibility branches, and lifecycle/state entities when a safe existing boundary or default is sufficient;
+- let AI execute focused regression tests, the broader relevant gate, and the real boundary verification instead of handing routine verification back to a human;
+- verify source/Git/CI/artifact/deployment/activated-runtime/user-visible state as separate planes when they are relevant; never infer a later plane from an earlier green signal;
+- update durable rules/references when a non-obvious failure rationale should survive the current task, and remove stale rules/tests when behavior is intentionally retired.
+
+A task is not complete merely because code compiles, a worker says done, a process exits 0, or one test suite is green. Completion requires evidence at the boundary that can actually falsify the user-visible failure.
+
 ## 3. Agent dispatch preferences
 
 Use an agent when at least one is true:

@@ -70,7 +70,7 @@ Herdr 性能优化不以单点 benchmark 为目标，目标是建立长期可演
 
 - public MCP 继续 epoch 2 / 18 tools，不增加第 19 个 tool；
 - `herdr_mcp.skill.list/describe/load` 只走现有 `herdr_call` local namespace；
-- giant policy 拆为 global `AGENTS.md` + 7 个 on-demand Skill；
+- giant policy 拆为 global `AGENTS.md` + 8 个 on-demand Skill；其中 `engineering-robustness` 把 regression-first、silent-wrongness、AI self-verification 与多 state-plane 验收作为按需 reference 内化；
 - `HERDR_MCP_PROGRESSIVE_SKILLS` 在真实多 Agent UAT 前保持兼容默认；
 - unknown capability 永远不按 Agent 名称猜测。
 

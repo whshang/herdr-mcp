@@ -28,6 +28,6 @@ Parallel mutations require non-overlapping file/runtime ownership. Shared files 
 
 ## Validation and reclamation
 
-After implementation, run the smallest relevant validation wave plus Git evidence, then reconcile all lanes before integration.
+After implementation, run the smallest relevant validation wave plus Git evidence, then reconcile all lanes before integration. For non-trivial implementation, bug fixes, reliability/refactor work, or releases, also load the `engineering-robustness` reference and apply its regression, sibling-path, and state-plane completion gates.
 
 Reclaim a lane only when no worker is active, no mutation outcome is uncertain, changes are clean or preserved, and branch disposition is known. Reconcile Herdr workspace and Git worktree state separately. Runtime release generations are outside development-worktree cleanup.

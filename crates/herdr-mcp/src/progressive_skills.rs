@@ -28,6 +28,8 @@ const EXECUTION: &str = include_str!("../../../assets/herdr/skills/execution/SKI
 const AGENT_DISPATCH: &str = include_str!("../../../assets/herdr/skills/agent-dispatch/SKILL.md");
 const DEVELOPMENT_ORCHESTRATION: &str =
     include_str!("../../../assets/herdr/skills/development-orchestration/SKILL.md");
+const ENGINEERING_ROBUSTNESS: &str =
+    include_str!("../../../assets/herdr/skills/engineering-robustness/SKILL.md");
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Digest(String);
@@ -92,7 +94,7 @@ struct BuiltinSkillSpec {
     owned_tools: &'static [&'static str],
 }
 
-const BUILTIN_SKILLS: [BuiltinSkillSpec; 7] = [
+const BUILTIN_SKILLS: [BuiltinSkillSpec; 8] = [
     BuiltinSkillSpec {
         id: "workstation-control",
         description: "Control live Herdr workspaces, panes, agents, incremental state, and native methods.",
@@ -210,8 +212,29 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 7] = [
             "git-repository",
             "execution",
             "agent-dispatch",
+            "engineering-robustness",
         ],
         risk_domains: &["cross-lane-mutation"],
+        owned_tools: &[],
+    },
+    BuiltinSkillSpec {
+        id: "engineering-robustness",
+        description: "Design and verify maintainable AI-generated code with regression-first bug fixes, silent-wrongness tests, layered delivery evidence, and minimal product state.",
+        content: ENGINEERING_ROBUSTNESS,
+        triggers: &[
+            "bug fix",
+            "regression",
+            "robustness",
+            "reliability",
+            "self-test",
+            "refactor",
+            "release",
+            "race",
+            "stale state",
+        ],
+        requires_capabilities: &[],
+        related_skills: &["development-orchestration", "execution", "git-repository"],
+        risk_domains: &[],
         owned_tools: &[],
     },
 ];
@@ -792,9 +815,10 @@ mod tests {
     fn catalog_is_stable_and_covers_all_non_skill_tools_once() {
         let service = ProgressiveSkillService::new();
         let catalog = service.catalog();
-        assert_eq!(catalog.len(), 7);
+        assert_eq!(catalog.len(), 8);
         assert_eq!(catalog[0].id, "workstation-control");
         assert_eq!(catalog[6].id, "development-orchestration");
+        assert_eq!(catalog[7].id, "engineering-robustness");
         let tools = catalog
             .iter()
             .flat_map(|item| item.owned_tools.iter().cloned())
@@ -815,13 +839,48 @@ mod tests {
     }
 
     #[test]
+    fn engineering_robustness_reference_is_discoverable_and_loadable() {
+        let service = ProgressiveSkillService::new();
+        let descriptor = service
+            .catalog()
+            .into_iter()
+            .find(|item| item.id == "engineering-robustness")
+            .expect("engineering robustness reference must be in the builtin catalog");
+        assert!(
+            descriptor
+                .triggers
+                .iter()
+                .any(|trigger| trigger == "bug fix")
+        );
+        assert!(
+            descriptor
+                .triggers
+                .iter()
+                .any(|trigger| trigger == "release")
+        );
+        let loaded = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["engineering-robustness"]}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(loaded["ok"], true);
+        let content = loaded["skills"][0]["content"].as_str().unwrap();
+        assert!(content.contains("silent wrongness"));
+        assert!(content.contains("Turn every real bug into a durable asset"));
+        assert!(content.contains("Verify state planes separately"));
+        assert!(content.contains("minimum-entity rule"));
+    }
+
+    #[test]
     fn discovery_does_not_load_and_batched_load_hits_immutable_cache() {
         with_isolated_home(|| {
             let service = ProgressiveSkillService::new();
             let listed = service
                 .local_call(LOCAL_LIST_METHOD, &json!({}), &snapshot())
                 .unwrap();
-            assert_eq!(listed["count"], 7);
+            assert_eq!(listed["count"], 8);
             assert_eq!(service.cache_len(), 0);
             let first = service
                 .local_call(
@@ -971,12 +1030,14 @@ mod tests {
         let result = service.bootstrap_with_inventory(&snapshot(), &[]);
         assert_eq!(result["ok"], true);
         assert_eq!(result["mode"], "progressive");
-        assert_eq!(result["catalog"].as_array().unwrap().len(), 7);
+        assert_eq!(result["catalog"].as_array().unwrap().len(), 8);
         assert_eq!(result["load"]["method"], LOCAL_LOAD_METHOD);
         let content = result["content"].as_str().unwrap();
         assert!(content.contains("# Herdr Global AGENTS.md"));
         assert!(content.contains("compact `catalog` field"));
         assert!(content.contains("A new user turn does not reload it"));
+        assert!(content.contains("engineering-robustness"));
+        assert!(!content.contains("# Engineering Robustness Reference"));
         assert!(!content.contains("# Files Mutation"));
         assert!(!content.contains("# Agent Dispatch"));
         assert_eq!(result["capability_snapshot"]["worker_count"], 1);
@@ -1064,7 +1125,7 @@ description: \"user ego\"
             )
             .unwrap();
         assert_eq!(listed["ok"], true);
-        assert_eq!(listed["count"], 8); // 7 builtin + 1 unique project alpha
+        assert_eq!(listed["count"], 9); // 8 builtin + 1 unique project alpha
         let skills = listed["skills"].as_array().unwrap();
         let alpha = skills
             .iter()
@@ -1105,7 +1166,7 @@ description: \"user ego\"
                 )
                 .unwrap();
             assert_eq!(listed["ok"], true);
-            assert_eq!(listed["count"], 7);
+            assert_eq!(listed["count"], 8);
         });
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&project);
@@ -1302,7 +1363,7 @@ description: \"user ego\"
                 &snapshot(),
             )
             .unwrap();
-        assert_eq!(listed["count"], 7, "oversized skill is skipped");
+        assert_eq!(listed["count"], 8, "oversized skill is skipped");
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("HOME", value),
