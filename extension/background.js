@@ -39,7 +39,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.77";
+const H2W_SCRIPT_VERSION = "0.1.78";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
@@ -4617,6 +4617,48 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         observedAt: msg?.startedAt || Date.now(),
       });
       sendResponse(result);
+    })();
+    return true;
+  }
+  if (msg?.type === "h2w_continuity_backfill") {
+    void (async () => {
+      const convKey = String(msg?.convKey || "").trim();
+      const userText = String(msg?.userText || "").trim();
+      if (!convKey || !userText) {
+        sendResponse({ ok: false, durable: false, error: "continuity-fields-incomplete" });
+        return;
+      }
+      let session = [];
+      try {
+        const bindings = await loadBindings();
+        session = bindingsForConv(bindings, convKey);
+      } catch (_) {}
+      const continuityIds = [...new Set(session.map((binding) => binding?.continuity_id).filter(Boolean))];
+      if (continuityIds.length !== 1) {
+        sendResponse({
+          ok: false,
+          durable: false,
+          error: continuityIds.length > 1 ? "binding_continuity_conflict" : "continuity_unbound",
+        });
+        return;
+      }
+      const primary = session[0] || null;
+      const result = await journalAppendFinalizedTurn({
+        continuityId: continuityIds[0],
+        conv_key: convKey,
+        conversation_id: msg?.conversation_id || convKey,
+        project_id: primary?.project_id || null,
+        workspace_id: primary?.workspace_id || normalizeWorkspaceId(primary) || null,
+        title: primary?.workspace_label || primary?.workspace_id || null,
+        userMessageId: msg?.userMessageId || null,
+        userText,
+        messageId: msg?.messageId || null,
+        assistantText: msg?.assistantText || null,
+        startedAt: msg?.userCreatedAt || Date.now(),
+        endedAt: msg?.assistantUpdatedAt || null,
+        nowRaw: msg?.assistantUpdatedAt || msg?.userCreatedAt || Date.now(),
+      });
+      sendResponse({ ...result, backfilled: true });
     })();
     return true;
   }

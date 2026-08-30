@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.77";
+const H2W_CONTENT_VERSION = "0.1.78";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -1483,6 +1483,51 @@ const H2W_CONTENT_VERSION = "0.1.77";
   // run in an isolated world and cannot reliably intercept the page's History API.
   let registeredConvKey = null;
 
+  async function backfillCurrentChatGptContinuity(convKey, reason = "register") {
+    if (ADAPTER.name !== "chatgpt") return null;
+    const conversationId = chatGptConversationId();
+    if (!conversationId || !convKey) return null;
+
+    // Project-home -> /c/<id> materialization happens after the trusted Enter
+    // event. At Project home there is no conversation health record yet, so the
+    // first accepted user message can otherwise become the new DOM baseline and
+    // never emit h2w_turn_started. Use ChatGPT's server-confirmed conversation
+    // mapping as an idempotent repair source once the concrete route exists.
+    for (const delayMs of [0, 250, 750]) {
+      if (delayMs > 0) await wait(delayMs);
+      const server = await fetchChatGptConversationSnapshot();
+      const userText = normText(server?.userText || "");
+      if (!server?.ok || !userText) continue;
+
+      const submitAt = Number(server.userCreatedAt || Date.now());
+      if (CONVERSATION_HEALTH && conversationHealth && server.finished !== true) {
+        const currentSubmitAt = Number(conversationHealth.last_user_submit_at || 0);
+        if (currentSubmitAt < submitAt) {
+          markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth, submitAt));
+        }
+      }
+
+      const result = await sendBg({
+        type: "h2w_continuity_backfill",
+        convKey,
+        conversation_id: conversationId,
+        userMessageId: server.userMessageId || null,
+        userText,
+        userCreatedAt: server.userCreatedAt || submitAt,
+        messageId: server.finished === true ? (server.messageId || null) : null,
+        assistantText: server.finished === true ? normText(server.text || "") : "",
+        assistantUpdatedAt: server.finished === true
+          ? (server.updatedAt || server.createdAt || Date.now())
+          : null,
+      });
+      if (result?.ok) {
+        console.log(`[h2w] continuity backfill durable (${reason}): ${convKey}`);
+        return result;
+      }
+    }
+    return null;
+  }
+
   async function registerCurrentConversation(reason = "startup") {
     if (!runtimeAlive()) return null;
     const convKey = ADAPTER.getConversationKey();
@@ -1494,7 +1539,10 @@ const H2W_CONTENT_VERSION = "0.1.77";
       const concreteChat = ADAPTER.name !== "chatgpt" || Boolean(chatGptConversationId());
       if (concreteChat) {
         await ensureConversationHealth(convKey);
-        if (ADAPTER.name === "chatgpt") void refreshQueuedInsertStatus();
+        if (ADAPTER.name === "chatgpt") {
+          void refreshQueuedInsertStatus();
+          if (response?.bound === true) void backfillCurrentChatGptContinuity(convKey, reason);
+        }
         if (CONTEXT_PRESSURE) {
           contextPressureRecord = await loadContextPressure(convKey);
           void updateContextPressure().then((pressure) => {
