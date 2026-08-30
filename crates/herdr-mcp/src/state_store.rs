@@ -1443,6 +1443,26 @@ impl StateStore {
             .map_err(|error| format!("cannot read ready service rollback: {error}"))
     }
 
+    pub fn protected_service_rollbacks(&self) -> Result<Vec<ServiceRollbackRecord>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT rollback_id, source_kind, activated_generation_id,
+                        server_plist_backup, watchdog_plist_backup,
+                        previous_current_target, server_was_loaded,
+                        watchdog_was_loaded, created_at, state
+                 FROM service_rollbacks
+                 WHERE state IN ('prepared', 'ready', 'consuming')
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|error| format!("cannot prepare protected service rollback read: {error}"))?;
+        let rows = statement
+            .query_map([], decode_service_rollback)
+            .map_err(|error| format!("cannot read protected service rollbacks: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode protected service rollback: {error}"))
+    }
+
     pub fn claim_service_rollback(
         &mut self,
         rollback_id: &str,
