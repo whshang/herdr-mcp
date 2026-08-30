@@ -1,10 +1,13 @@
 use crate::child_process;
 use crate::fs_security;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::{DynamicImage, Rgb, RgbImage};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value, json};
 use std::fs;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +25,12 @@ const GREP_DEFAULT_FILE_BYTES: u64 = 64 * 1024;
 const GREP_MAX_FILE_BYTES: u64 = 1024 * 1024;
 const GREP_COMPACT_AFTER: usize = 24;
 const GREP_RG_TIMEOUT: Duration = Duration::from_secs(5);
+// Remote Link frames default to 256 KiB. Keeping the binary preview at or
+// below 160 KiB leaves room for base64 expansion plus the MCP/relay envelope.
+const IMAGE_INLINE_SAFE_BYTES: usize = 160 * 1024;
+const IMAGE_PREVIEW_MAX_PIXELS: u64 = 40_000_000;
+const IMAGE_PREVIEW_START_MAX_DIM: u32 = 1600;
+const IMAGE_PREVIEW_MIN_MAX_DIM: u32 = 320;
 
 pub fn read(snapshot: &Value, args: &Value) -> Value {
     let path = match required_str(args, "path") {
@@ -126,6 +135,14 @@ pub struct ImageData {
     pub mime_type: &'static str,
 }
 
+struct PreparedImage {
+    data: Vec<u8>,
+    mime_type: &'static str,
+    preview: bool,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
 pub fn image(snapshot: &Value, args: &Value) -> Result<ImageData, Value> {
     let path = required_str(args, "path")?;
     let managed = fs_security::validate_existing(snapshot, path)?;
@@ -165,18 +182,123 @@ pub fn image(snapshot: &Value, args: &Value) -> Result<ImageData, Value> {
             "max_bytes": max_bytes,
         }));
     }
+    let prepared = prepare_image_for_mcp(&data, mime_type).map_err(|message| {
+        json!({
+            "ok": false,
+            "reason": "image_preview_failed",
+            "path": managed.resolved.to_string_lossy(),
+            "bytes": data.len(),
+            "message": message,
+        })
+    })?;
     let meta = json!({
         "ok": true,
         "path": managed.resolved.to_string_lossy(),
         "root": managed.root.to_string_lossy(),
-        "mime_type": mime_type,
-        "bytes": data.len(),
+        "mime_type": prepared.mime_type,
+        "bytes": prepared.data.len(),
+        "source_mime_type": mime_type,
+        "source_bytes": data.len(),
+        "preview": prepared.preview,
+        "preview_width": prepared.width,
+        "preview_height": prepared.height,
+        "inline_budget_bytes": IMAGE_INLINE_SAFE_BYTES,
     });
     Ok(ImageData {
         meta,
-        data: STANDARD.encode(data),
-        mime_type,
+        data: STANDARD.encode(prepared.data),
+        mime_type: prepared.mime_type,
     })
+}
+
+fn prepare_image_for_mcp(data: &[u8], mime_type: &'static str) -> Result<PreparedImage, String> {
+    if data.len() <= IMAGE_INLINE_SAFE_BYTES {
+        return Ok(PreparedImage {
+            data: data.to_vec(),
+            mime_type,
+            preview: false,
+            width: None,
+            height: None,
+        });
+    }
+
+    let reader = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|error| format!("image format detection failed: {error}"))?;
+    let (source_width, source_height) = reader
+        .into_dimensions()
+        .map_err(|error| format!("image dimensions unavailable: {error}"))?;
+    let pixels = u64::from(source_width).saturating_mul(u64::from(source_height));
+    if pixels > IMAGE_PREVIEW_MAX_PIXELS {
+        return Err(format!(
+            "image has {pixels} pixels; preview limit is {IMAGE_PREVIEW_MAX_PIXELS}"
+        ));
+    }
+
+    let decoded =
+        image::load_from_memory(data).map_err(|error| format!("image decode failed: {error}"))?;
+    let source_max_dim = source_width.max(source_height);
+    let mut max_dim = source_max_dim.min(IMAGE_PREVIEW_START_MAX_DIM);
+    let mut quality = 82_u8;
+
+    loop {
+        let resized = if source_max_dim > max_dim {
+            decoded.resize(max_dim, max_dim, FilterType::Triangle)
+        } else {
+            decoded.clone()
+        };
+        let width = resized.width();
+        let height = resized.height();
+        let rgb = flatten_to_white(&resized);
+        let mut preview = Vec::new();
+        JpegEncoder::new_with_quality(&mut preview, quality)
+            .encode_image(&DynamicImage::ImageRgb8(rgb))
+            .map_err(|error| format!("jpeg preview encode failed: {error}"))?;
+        if preview.len() <= IMAGE_INLINE_SAFE_BYTES {
+            return Ok(PreparedImage {
+                data: preview,
+                mime_type: "image/jpeg",
+                preview: true,
+                width: Some(width),
+                height: Some(height),
+            });
+        }
+
+        if quality > 52 {
+            quality = quality.saturating_sub(10);
+            continue;
+        }
+        if max_dim <= IMAGE_PREVIEW_MIN_MAX_DIM {
+            return Err(format!(
+                "preview remains {} bytes at {}x{}; inline budget is {} bytes",
+                preview.len(),
+                width,
+                height,
+                IMAGE_INLINE_SAFE_BYTES
+            ));
+        }
+        max_dim = ((u64::from(max_dim) * 3) / 4).max(u64::from(IMAGE_PREVIEW_MIN_MAX_DIM)) as u32;
+        quality = 72;
+    }
+}
+
+fn flatten_to_white(image: &DynamicImage) -> RgbImage {
+    let rgba = image.to_rgba8();
+    let mut output = RgbImage::new(rgba.width(), rgba.height());
+    for (x, y, pixel) in rgba.enumerate_pixels() {
+        let alpha = u16::from(pixel[3]);
+        let inverse = 255_u16.saturating_sub(alpha);
+        let blend = |channel: u8| -> u8 {
+            let value = u16::from(channel) * alpha + 255_u16 * inverse;
+            ((value + 127) / 255) as u8
+        };
+        output.put_pixel(
+            x,
+            y,
+            Rgb([blend(pixel[0]), blend(pixel[1]), blend(pixel[2])]),
+        );
+    }
+    output
 }
 
 fn image_mime(path: &Path) -> Option<&'static str> {
@@ -1130,6 +1252,45 @@ mod tests {
         assert_eq!(image_mime(Path::new("anim.gif")), Some("image/gif"));
         assert_eq!(image_mime(Path::new("screen.webp")), Some("image/webp"));
         assert_eq!(image_mime(Path::new("vector.svg")), None);
+    }
+
+    #[test]
+    fn image_preview_stays_within_remote_frame_budget() {
+        let width = 1024_u32;
+        let height = 768_u32;
+        let source = RgbImage::from_fn(width, height, |x, y| {
+            let seed = x
+                .wrapping_mul(1_664_525)
+                .wrapping_add(y.wrapping_mul(1_013_904_223));
+            Rgb([
+                (seed & 0xff) as u8,
+                ((seed >> 8) & 0xff) as u8,
+                ((seed >> 16) & 0xff) as u8,
+            ])
+        });
+        let mut cursor = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(source)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        let png = cursor.into_inner();
+        assert!(png.len() > IMAGE_INLINE_SAFE_BYTES);
+
+        let prepared = prepare_image_for_mcp(&png, "image/png").unwrap();
+        assert!(prepared.preview);
+        assert_eq!(prepared.mime_type, "image/jpeg");
+        assert!(prepared.data.len() <= IMAGE_INLINE_SAFE_BYTES);
+        assert!(prepared.width.unwrap() <= width);
+        assert!(prepared.height.unwrap() <= height);
+        image::load_from_memory(&prepared.data).unwrap();
+    }
+
+    #[test]
+    fn small_image_payload_is_preserved_without_preview() {
+        let bytes = vec![1_u8, 2, 3, 4];
+        let prepared = prepare_image_for_mcp(&bytes, "image/png").unwrap();
+        assert!(!prepared.preview);
+        assert_eq!(prepared.mime_type, "image/png");
+        assert_eq!(prepared.data, bytes);
     }
 
     #[test]
