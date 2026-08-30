@@ -1,5 +1,5 @@
 use crate::cli::ServiceCommand;
-use crate::{herdr_supervisor, link, paths::RuntimePaths, service_manager};
+use crate::{herdr_supervisor, link, native_host_install, paths::RuntimePaths, service_manager};
 use serde_json::Value;
 use std::process::ExitCode;
 
@@ -119,6 +119,12 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
             .unwrap_or_default();
         return Err(format!(
             "service install committed but production Link generation reconcile failed: {link_error}; {service_detail}{supervisor_detail}{link_detail}"
+        ));
+    }
+
+    if let Err(native_host_error) = native_host_install::sync_owned_runtime_from_active() {
+        return Err(format!(
+            "service install committed but owned native-host runtime sync failed: {native_host_error}"
         ));
     }
 
