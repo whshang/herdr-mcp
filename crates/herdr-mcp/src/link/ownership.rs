@@ -277,6 +277,18 @@ pub fn read_status_active_generation(path: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn current_managed_runtime_generation(home: &Path) -> Option<String> {
+    let target = fs::read_link(
+        home.join(".config")
+            .join("herdr-mcp")
+            .join("runtime")
+            .join("current"),
+    )
+    .ok()?;
+    let generation = target.file_name()?.to_str()?.trim();
+    generation_looks_rust_compatible(generation).then(|| generation.to_owned())
+}
+
 /// Compute which G5 gates are currently open. Live cutover is never performed here.
 pub fn evaluate_production_ready_gates(
     home: &Path,
@@ -300,22 +312,20 @@ pub fn evaluate_production_ready_gates(
         .as_ref()
         .and_then(|path| read_status_active_generation(path))
         .or_else(|| prod.runtime_generation.clone());
+    let current = current_managed_runtime_generation(home);
 
     let prod_is_rust = prod.present
         && prod.implementation == LinkImplementation::Rust
         && program_points_at_managed_runtime(&prod.program_arguments, home);
     let checkout_refused =
         !prod.present || !program_points_at_repo_checkout(&prod.program_arguments);
-    let generation_ok = match (desired.as_deref(), active.as_deref()) {
-        (Some(desired), Some(active)) => {
-            desired == active
-                && generation_looks_rust_compatible(desired)
-                && generation_looks_rust_compatible(active)
-        }
-        (Some(desired), None) => generation_looks_rust_compatible(desired),
-        (None, Some(active)) => generation_looks_rust_compatible(active),
-        (None, None) => false,
-    };
+    let generation_ok = matches!(
+        (current.as_deref(), desired.as_deref(), active.as_deref()),
+        (Some(current), Some(desired), Some(active))
+            if current == desired
+                && desired == active
+                && generation_looks_rust_compatible(current)
+    );
 
     let user_cli = home.join(".local").join("bin").join("herdr-mcp");
     let user_cli_ok = user_cli_points_at_managed_runtime(&user_cli, home);
@@ -361,7 +371,8 @@ pub fn evaluate_production_ready_gates(
             id: "runtime_control_generation_rust_compatible".to_owned(),
             ok: generation_ok,
             detail: format!(
-                "desired={} active={}",
+                "current={} desired={} active={}",
+                current.as_deref().unwrap_or("-"),
                 desired.as_deref().unwrap_or("-"),
                 active.as_deref().unwrap_or("-")
             ),

@@ -199,6 +199,29 @@ fn apply_live(home: &Path, config_dir: &Path) -> Result<Value, String> {
     Ok(out)
 }
 
+/// Internal lifecycle reconciliation used after the default service changes
+/// `runtime/current`. Production is already Rust-owned here, so the live
+/// control document must follow the exact managed generation automatically.
+pub(crate) fn reconcile_current_generation(home: &Path, config_dir: &Path) -> Result<bool, String> {
+    let plan = plan_migrate(home, config_dir, MigrateMode::Apply)?;
+    if plan.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(format!("runtime-control reconcile plan failed: {plan}"));
+    }
+    if plan.get("already_rust_compatible").and_then(Value::as_bool) == Some(true) {
+        return Ok(false);
+    }
+    let control_path = plan
+        .get("control_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "runtime-control reconcile plan missing control_path".to_owned())?;
+    let planned = plan
+        .get("planned_control")
+        .cloned()
+        .ok_or_else(|| "runtime-control reconcile plan missing planned_control".to_owned())?;
+    atomic_json(Path::new(control_path), &planned)?;
+    Ok(true)
+}
+
 /// Build the migration plan without writing files.
 pub fn plan_migrate(home: &Path, config_dir: &Path, mode: MigrateMode) -> Result<Value, String> {
     // Touch managed runtime so we refuse planning against a missing/broken install.
@@ -232,12 +255,11 @@ pub fn plan_migrate(home: &Path, config_dir: &Path, mode: MigrateMode) -> Result
         .as_ref()
         .and_then(|path| read_status_active_generation(path));
 
-    let already = active
-        .as_deref()
-        .or(desired.as_deref())
-        .is_some_and(generation_looks_rust_compatible)
-        && !desired.as_deref().is_some_and(generation_looks_node_era)
-        && !active.as_deref().is_some_and(generation_looks_node_era);
+    // "Rust-compatible" is not sufficient here: after a runtime generation
+    // switch an older rust-* id is still syntactically valid but stale.  The
+    // live control document is current only when it targets the exact managed
+    // runtime/current generation.
+    let already = desired.as_deref() == Some(generation_id.as_str());
 
     let endpoint =
         extract_endpoint(current.as_ref()).unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned());
@@ -622,6 +644,37 @@ mod tests {
         // Live files untouched by dry-run.
         let live = fs::read_to_string(config_dir.join("runtime-control-prod.json")).unwrap();
         assert!(live.contains("stable-0.3.32"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn stale_rust_generation_reconciles_to_exact_current_generation() {
+        let home = test_home();
+        setup_managed_runtime(&home, "rust-currentmigrate04");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        let live_path = config_dir.join("runtime-control-prod.json");
+        fs::write(
+            &live_path,
+            r#"{"schema_version":1,"revision":8,"desired_active":"rust-stalemigrate04","generations":[{"generation":"rust-stalemigrate04","endpoint":"http://127.0.0.1:8772/mcp"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            config_dir.join("runtime-status-prod.json"),
+            r#"{"schema_version":1,"manager":{"active_generation":"rust-stalemigrate04"}}"#,
+        )
+        .unwrap();
+
+        let report = plan_migrate(&home, &config_dir, MigrateMode::DryRun).unwrap();
+        assert_eq!(report["already_rust_compatible"], false);
+        assert_eq!(
+            report["planned_control"]["desired_active"],
+            "rust-currentmigrate04"
+        );
+
+        assert!(reconcile_current_generation(&home, &config_dir).unwrap());
+        let live: Value = serde_json::from_slice(&fs::read(&live_path).unwrap()).unwrap();
+        assert_eq!(live["desired_active"], "rust-currentmigrate04");
+        assert!(!reconcile_current_generation(&home, &config_dir).unwrap());
         let _ = fs::remove_dir_all(&home);
     }
 

@@ -21,6 +21,7 @@ pub mod cutover_execute;
 pub mod daemon;
 pub mod edge_contract;
 pub mod generation_fence;
+pub mod generation_refresh;
 pub mod heartbeat;
 pub mod install;
 pub mod io_loop;
@@ -40,6 +41,7 @@ pub mod socket_driver;
 pub mod transport;
 
 pub use cutover::{CutoverMode, run as run_link_cutover};
+pub(crate) use generation_refresh::reconcile_after_service_generation_change;
 pub use install::{
     LINK_RUST_CANDIDATE_LABEL, install as run_link_install, uninstall as run_link_uninstall,
 };
