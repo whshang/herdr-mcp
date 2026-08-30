@@ -763,12 +763,36 @@ mod tests {
         path
     }
 
+    fn write_user_claude_skill(
+        home: &std::path::Path,
+        name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        let dir = home.join(".claude/skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("SKILL.md");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
     fn write_project_skill(
         project: &std::path::Path,
         name: &str,
         body: &str,
     ) -> std::path::PathBuf {
         let dir = project.join(".agents/skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("SKILL.md");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn write_project_claude_skill(
+        project: &std::path::Path,
+        name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        let dir = project.join(".claude/skills").join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("SKILL.md");
         std::fs::write(&path, body).unwrap();
@@ -1081,6 +1105,77 @@ description: \"user ego\"
             !skills.iter().any(|item| item["id"] == "files-search"
                 && item["source_identity"] != "herdr-mcp:builtin")
         );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn local_skill_precedence_project_claude_and_user_claude_tiers() {
+        let home = temp_root("claude-home");
+        let project = temp_root("claude-project");
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        // Same id at every tier; first occurrence in precedence order wins.
+        let tiers = [
+            (
+                "project-agents",
+                write_project_skill(
+                    &project,
+                    "tiered",
+                    "---\nname: tiered\ndescription: project-agents\n---\n# a\n",
+                ),
+            ),
+            (
+                "project-claude",
+                write_project_claude_skill(
+                    &project,
+                    "tiered",
+                    "---\nname: tiered\ndescription: project-claude\n---\n# c\n",
+                ),
+            ),
+            (
+                "user-agents",
+                write_user_skill(
+                    &home,
+                    "tiered",
+                    "---\nname: tiered\ndescription: user-agents\n---\n# u\n",
+                ),
+            ),
+            (
+                "user-claude",
+                write_user_claude_skill(
+                    &home,
+                    "tiered",
+                    "---\nname: tiered\ndescription: user-claude\n---\n# u\n",
+                ),
+            ),
+        ];
+        let service = ProgressiveSkillService::new();
+        let listed = service
+            .local_call(
+                LOCAL_LIST_METHOD,
+                &json!({"project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        let skills = listed["skills"].as_array().unwrap();
+        let tiered = skills
+            .iter()
+            .find(|item| item["id"] == "tiered")
+            .expect("tiered present");
+        assert_eq!(listed["count"], 8); // 7 builtin + 1 unique tiered
+        assert_eq!(tiered["description"], "project-agents");
+        // The four helper paths must exist so the test writes were actually placed.
+        assert!(tiers.iter().map(|(_, p)| p).all(|p| p.is_file()));
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("HOME", value),
