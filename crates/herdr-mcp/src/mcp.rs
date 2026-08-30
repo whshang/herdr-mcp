@@ -185,6 +185,8 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             };
             if method.starts_with("continuity.") {
                 continuity_call(context.state_store, method, &params)
+            } else if method.starts_with("artifact.") {
+                artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
             } else {
                 native_tools::call_with_local(
                     context.client,
@@ -522,6 +524,151 @@ fn continuity_search_string<'a>(
     }
 }
 
+fn config_dir() -> std::path::PathBuf {
+    crate::paths::RuntimePaths::discover()
+        .map(|paths| paths.config_dir)
+        .unwrap_or_else(|_| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| ".".into())
+                .join(".config")
+                .join("herdr-mcp")
+        })
+}
+
+/// Local dispatch for the internal `artifact.*` methods. These are reached over
+/// `herdr_call` and never add an MCP catalog tool. They operate on the secure,
+/// bounded, short-lived web-artifact cache written by the native-host capture
+/// path, and `artifact.import` re-uses `fs_mutation::write_bytes` so every
+/// managed-root/read-only/dirty/busy/overwrite/symlink gate still applies.
+fn artifact_call(
+    config_dir: &std::path::Path,
+    snapshot: &Value,
+    method: &str,
+    params: &Value,
+) -> Value {
+    match method {
+        "artifact.list" => match artifact_list(config_dir) {
+            Ok(artifacts) => json!({"ok": true, "artifacts": artifacts}),
+            Err(error) => {
+                json!({"ok": false, "code": "artifact_list_failed", "message": error})
+            }
+        },
+        "artifact.import" => artifact_import_call(config_dir, snapshot, params),
+        "artifact.info" => {
+            match params
+                .get("artifact_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(artifact_id) => {
+                    match crate::web_artifact_cache::read(config_dir, artifact_id) {
+                        Ok((metadata, _)) => {
+                            json!({"ok": true, "artifact": metadata.metadata_json()})
+                        }
+                        Err(error) => {
+                            json!({"ok": false, "code": error, "artifact_id": artifact_id})
+                        }
+                    }
+                }
+                None => json!({
+                    "ok": false,
+                    "code": "artifact_id_required",
+                    "message": "artifact.info requires a non-empty artifact_id",
+                }),
+            }
+        }
+        _ => json!({
+            "ok": false,
+            "code": "artifact_unknown_method",
+            "method": method,
+            "message": "unknown artifact local method; no request was forwarded",
+        }),
+    }
+}
+
+fn artifact_list(config_dir: &std::path::Path) -> Result<Vec<Value>, String> {
+    crate::web_artifact_cache::list(config_dir)
+}
+
+fn artifact_import_call(config_dir: &std::path::Path, snapshot: &Value, params: &Value) -> Value {
+    let Some(artifact_id) = params
+        .get("artifact_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return json!({
+            "ok": false,
+            "code": "artifact_id_required",
+            "message": "artifact.import requires a non-empty artifact_id",
+        });
+    };
+    let Some(destination) = params
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return json!({
+            "ok": false,
+            "code": "artifact_path_required",
+            "message": "artifact.import requires an absolute managed destination path",
+        });
+    };
+    let overwrite = params
+        .get("overwrite")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let confirm_dirty = params
+        .get("confirm_dirty")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let confirm_busy = params
+        .get("confirm_busy")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let (metadata, raw) = match crate::web_artifact_cache::read(config_dir, artifact_id) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "code": error,
+                "artifact_id": artifact_id,
+            });
+        }
+    };
+    let result = crate::fs_mutation::write_bytes(
+        snapshot,
+        destination.trim(),
+        &raw,
+        overwrite,
+        confirm_dirty,
+        confirm_busy,
+    );
+    if result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        // On success, consume the one-shot cache entry so a repeated import fails
+        // closed instead of silently re-writing the same bytes.
+        let _ = crate::web_artifact_cache::remove(config_dir, artifact_id);
+        json!({
+            "ok": true,
+            "artifact_id": artifact_id,
+            "mime": metadata.mime,
+            "bytes": metadata.bytes,
+            "sha256": metadata.sha256,
+            "write": result,
+        })
+    } else {
+        json!({
+            "ok": false,
+            "artifact_id": artifact_id,
+            "message": "artifact write was rejected by managed-root gates",
+            "write": result,
+        })
+    }
+}
+
 fn image_tool_result(image: fs_tools::ImageData) -> Value {
     let text = serde_json::to_string(&image.meta).unwrap_or_else(|_| "{}".to_owned());
     json!({
@@ -812,5 +959,196 @@ mod tests {
             .map(|value| value.as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(expected, SUPPORTED_VERSIONS);
+    }
+
+    #[test]
+    fn artifact_dispatch_lists_and_fails_closed_without_leaking_secrets() {
+        use crate::web_artifact_cache;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let config_dir = std::env::temp_dir().join(format!(
+            "herdr-mcp-artifact-dispatch-{}-{}-{nonce:x}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let snapshot = json!({});
+
+        let unknown = artifact_call(&config_dir, &snapshot, "artifact.nope", &json!({}));
+        assert_eq!(unknown["ok"], false);
+        assert_eq!(unknown["code"], "artifact_unknown_method");
+
+        let empty = artifact_call(&config_dir, &snapshot, "artifact.list", &json!({}));
+        assert_eq!(empty["ok"], true);
+        assert_eq!(empty["artifacts"].as_array().unwrap().len(), 0);
+
+        let missing_import = artifact_call(
+            &config_dir,
+            &snapshot,
+            "artifact.import",
+            &json!({"path": "/tmp/x.png"}),
+        );
+        assert_eq!(missing_import["code"], "artifact_id_required");
+        let missing_path = artifact_call(
+            &config_dir,
+            &snapshot,
+            "artifact.import",
+            &json!({"artifact_id": "abc"}),
+        );
+        assert_eq!(missing_path["code"], "artifact_path_required");
+        let not_found = artifact_call(
+            &config_dir,
+            &snapshot,
+            "artifact.import",
+            &json!({"artifact_id": "abc", "path": "/tmp/x.png"}),
+        );
+        assert_eq!(not_found["ok"], false);
+        assert_eq!(not_found["code"], "artifact_not_found");
+
+        // A captured artifact surfaces in list with non-secret fields only.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[1, 2, 3, 4]);
+        let captured = web_artifact_cache::capture(
+            &config_dir,
+            "conv-dispatch-1",
+            "file-dispatch-1",
+            "image/png",
+            &png,
+            None,
+        )
+        .unwrap();
+        let listed = artifact_call(&config_dir, &snapshot, "artifact.list", &json!({}));
+        assert_eq!(listed["artifacts"].as_array().unwrap().len(), 1);
+        let meta = &listed["artifacts"][0];
+        for secret in [
+            "bearer",
+            "cookie",
+            "accessToken",
+            "authorization",
+            "download_url",
+        ] {
+            assert!(meta.get(secret).is_none(), "{secret} must not be exposed");
+        }
+        assert_eq!(meta["artifact_id"], captured.artifact_id);
+
+        let info = artifact_call(
+            &config_dir,
+            &snapshot,
+            "artifact.info",
+            &json!({"artifact_id": captured.artifact_id}),
+        );
+        assert_eq!(info["ok"], true);
+        assert_eq!(info["artifact"]["sha256"], captured.sha256);
+        assert!(info["artifact"].get("download_url").is_none());
+
+        std::fs::remove_dir_all(&config_dir).unwrap();
+    }
+
+    #[test]
+    fn artifact_import_uses_write_bytes_gates_and_consumes_one_shot() {
+        use crate::web_artifact_cache;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let config_dir = std::env::temp_dir().join(format!(
+            "herdr-mcp-artifact-import-{}-{}-{nonce:x}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-artifact-repo-{}-{}-{nonce:x}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("kept.txt"), "baseline\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "kept.txt"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Herdr Test",
+                    "-c",
+                    "user.email=herdr@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "baseline",
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let snapshot = json!({
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
+            "agents": [],
+        });
+
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[9, 9, 9]);
+        let captured = web_artifact_cache::capture(
+            &config_dir,
+            "conv-import-1",
+            "file-import-1",
+            "image/png",
+            &png,
+            None,
+        )
+        .unwrap();
+        let destination = root.join("generated.png");
+
+        // First import writes into the managed root and consumes the cache entry.
+        let first = artifact_call(
+            &config_dir,
+            &snapshot,
+            "artifact.import",
+            &json!({"artifact_id": captured.artifact_id, "path": destination}),
+        );
+        assert_eq!(first["ok"], true, "{}r", first);
+        assert_eq!(std::fs::read(&destination).unwrap(), png);
+        assert_eq!(
+            first["write"]["created"], true,
+            "write gates should report a fresh file"
+        );
+
+        // The cache entry was consumed: a second import fails closed.
+        let second = artifact_call(
+            &config_dir,
+            &snapshot,
+            "artifact.import",
+            &json!({"artifact_id": captured.artifact_id, "path": destination}),
+        );
+        assert_eq!(second["ok"], false);
+        assert_eq!(second["code"], "artifact_not_found");
+
+        std::fs::remove_dir_all(&config_dir).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

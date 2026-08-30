@@ -20,6 +20,7 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+getrandom = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 plist = "1"
 semver = "1"

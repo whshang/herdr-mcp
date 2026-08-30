@@ -102,6 +102,28 @@ pub fn augment_inspect(view: &mut Value, cache: Option<&EventCache>, exec: Optio
             exec.map(ExecRegistry::diagnostics).unwrap_or(Value::Null),
         );
         workstation.insert("native_migration".to_owned(), migration_status());
+        // Non-sensitive web-artifact metadata only. Never includes token, cookie,
+        // or download URL material. On cache discovery/read failure we surface a
+        // terse readiness code and an empty list, never the raw error path.
+        let artifact_ready = crate::paths::RuntimePaths::discover().is_ok();
+        let artifacts = if artifact_ready {
+            let config_dir = crate::paths::RuntimePaths::discover()
+                .map(|paths| paths.config_dir)
+                .ok();
+            config_dir
+                .and_then(|dir| crate::web_artifact_cache::list(&dir).ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        workstation.insert(
+            "web_artifacts".to_owned(),
+            json!({
+                "enabled": artifact_ready,
+                "entry_count": artifacts.len(),
+                "artifacts": artifacts,
+            }),
+        );
     }
 }
 
@@ -228,5 +250,22 @@ mod tests {
             "rust-native"
         );
         assert_eq!(view["workstation_info"]["exec_sessions_ready"], false);
+        // Non-sensitive web-artifact readiness block must never leak secrets.
+        let artifacts = &view["workstation_info"]["web_artifacts"];
+        assert!(artifacts.get("enabled").is_some());
+        assert_eq!(artifacts["entry_count"], 0);
+        for secret in [
+            "bearer",
+            "cookie",
+            "accesstoken",
+            "authorization",
+            "download_url",
+        ] {
+            let serialized = serde_json::to_string(&view).unwrap().to_ascii_lowercase();
+            assert!(
+                !serialized.contains(secret),
+                "serialized inspect must not contain {secret}"
+            );
+        }
     }
 }

@@ -25,9 +25,12 @@ import {
 import {
   CONTINUITY_JOURNAL_STORAGE_KEY, buildContinuitySeed, turnFingerprint,
 } from "./continuity-journal.js";
+import {
+  bindingAllowsArtifactCapture, captureSenderContext, normalizeCaptureArtifact,
+} from "./artifact-capture-gate.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
-import { getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
+import { captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
 import {
   QUEUED_INSERT_STORAGE_KEY,
   ackQueuedInsertBatch,
@@ -39,7 +42,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.80";
+const H2W_SCRIPT_VERSION = "0.1.81";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
@@ -3778,12 +3781,38 @@ async function handleHandoffTurnEnded(msg) {
   return { handled: true, ok: true, pending: true, handoff: handoffView(ready) };
 }
 
+async function handleWebArtifactCapture(msg, sender) {
+  const artifact = normalizeCaptureArtifact(msg?.artifact);
+  if (!artifact) return { ok: false, error: "artifact-capture-invalid" };
+  const senderUrl = String(sender?.url || sender?.tab?.url || "");
+  const senderInfo = captureSenderContext(senderUrl, artifact.conversation_id);
+  const senderTabId = Number(sender?.tab?.id || 0);
+  if (!senderInfo || !Number.isInteger(senderTabId) || senderTabId <= 0) {
+    return { ok: false, error: "artifact-capture-sender-mismatch" };
+  }
+  const bindings = await loadBindings();
+  const session = bindingsForConv(bindings, senderInfo.convKey);
+  if (!session.some((binding) => bindingAllowsArtifactCapture(binding, senderInfo, senderTabId))) {
+    return { ok: false, error: "artifact-capture-unbound" };
+  }
+  const response = await captureWebArtifactNative(artifact);
+  return response && typeof response === "object"
+    ? response
+    : { ok: false, error: "artifact-capture-native-empty" };
+}
+
 // ---- Message handling ----
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_extension_owner_status") {
     void getNativeExtensionOwnerStatus()
       .then((status) => sendResponse(status || { ok: false, error: "native-owner-status-unavailable" }))
       .catch((error) => sendResponse({ ok: false, error: String(error?.message || error || "native-owner-status-failed") }));
+    return true;
+  }
+  if (msg?.type === "h2w_artifact_capture") {
+    void handleWebArtifactCapture(msg, sender)
+      .then((result) => sendResponse(result))
+      .catch(() => sendResponse({ ok: false, error: "artifact-capture-failed" }));
     return true;
   }
   if (msg?.type === "herdr_control_center_subscribe") {

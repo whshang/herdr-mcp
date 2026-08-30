@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, HERDR_NATIVE_HOST } from "../extension/local-auth.js";
+import { captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, HERDR_NATIVE_HOST } from "../extension/local-auth.js";
 
 test("extension proxies localhost requests through Native Messaging without forwarding bearer auth", async () => {
   const oldChrome = globalThis.chrome;
@@ -138,6 +138,42 @@ test("extension treats Chromium native-host admission denial as standby", async 
       active: false,
       reason: "native-origin-not-active",
     });
+  } finally {
+    globalThis.chrome = oldChrome;
+  }
+});
+
+test("generated-image capture forwards only the strict non-secret artifact shape", async () => {
+  const oldChrome = globalThis.chrome;
+  let seen = null;
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      sendNativeMessage(host, message, callback) {
+        assert.equal(host, HERDR_NATIVE_HOST);
+        seen = message;
+        callback({ ok: true, artifact_id: "0123456789abcdef0123456789abcdef" });
+      },
+    },
+  };
+  const capture = {
+    conversation_id: "6a94508d-7f64-83ea-86f1-45a6685cee08",
+    file_id: "00000000cc1c81fd8ee18b5f0913cf46",
+    mime: "image/png",
+    bytes_b64: "iVBORw0KGgo=",
+    sha256: "a".repeat(64),
+  };
+  try {
+    const result = await captureWebArtifactNative(capture);
+    assert.equal(result.ok, true);
+    assert.deepEqual(Object.keys(seen).sort(), ["bytes_b64", "conversation_id", "file_id", "mime", "sha256", "type"]);
+    assert.equal(seen.type, "artifact_capture");
+    assert.equal(JSON.stringify(seen).includes("Bearer"), false);
+    assert.equal(JSON.stringify(seen).includes("download_url"), false);
+    assert.equal(JSON.stringify(seen).includes("cookie"), false);
+
+    const denied = await captureWebArtifactNative({ ...capture, authorization: "Bearer secret" });
+    assert.deepEqual(denied, { ok: false, error: "artifact-capture-invalid" });
   } finally {
     globalThis.chrome = oldChrome;
   }
