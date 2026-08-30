@@ -68,7 +68,7 @@ mod macos {
     use plist::{Dictionary, Value as PlistValue};
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::env;
     use std::ffi::OsStr;
     use std::fs::{self, File, OpenOptions};
@@ -162,6 +162,12 @@ mod macos {
         generation_id: String,
         sha256: String,
         binary: PathBuf,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct GenerationGcReport {
+        retained: Vec<String>,
+        pruned: Vec<String>,
     }
 
     #[derive(Debug)]
@@ -1449,6 +1455,7 @@ mod macos {
 
         if let Some(mut result) = same_active_install_noop_with(paths, &existing, loaded, healthy)?
         {
+            annotate_generation_gc(&mut result, prune_obsolete_generations(paths));
             if let Some(object) = result.as_object_mut() {
                 insert_user_cli_fields(object, paths)?;
             }
@@ -1456,6 +1463,11 @@ mod macos {
             return Ok(result);
         }
 
+        // Bound on-disk generations before creating a new candidate. This is a
+        // fail-closed precondition for mutation: a healthy current generation,
+        // rollback-safe previous generation, and the new candidate are the only
+        // generations normally needed during an install transaction.
+        let pre_install_gc = prune_obsolete_generations(paths)?;
         let generation = prepare_generation(paths)?;
         let now = now_ms_i64();
         let mut store = StateStore::open_in_dir(&paths.config_dir, "state")?;
@@ -1651,6 +1663,12 @@ mod macos {
             )
             .is_ok();
 
+        let post_install_gc = if guardian_settled {
+            Some(prune_obsolete_generations(paths))
+        } else {
+            None
+        };
+
         let user_cli = user_cli_link.ok_or_else(|| {
             "user CLI link missing after successful service activation".to_owned()
         })?;
@@ -1677,7 +1695,20 @@ mod macos {
             "guardian_transaction": transaction_id,
             "guardian_settled": guardian_settled,
             "evidence_recorded": evidence_recorded,
+            "generation_gc_pre_pruned": pre_install_gc.pruned,
         });
+        match post_install_gc {
+            Some(report) => annotate_generation_gc(&mut result, report),
+            None => {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("generation_gc_ok".to_owned(), json!(false));
+                    object.insert(
+                        "generation_gc_detail".to_owned(),
+                        json!("post-install generation GC skipped because guardian settlement was not confirmed"),
+                    );
+                }
+            }
+        }
         crate::macos_permissions::annotate_service_result(&mut result, &paths.config_dir);
         Ok(result)
     }
@@ -2606,6 +2637,169 @@ mod macos {
         Ok(runs_legacy_script && args.contains(&"once"))
     }
 
+    fn annotate_generation_gc(result: &mut Value, report: Result<GenerationGcReport, String>) {
+        let Some(object) = result.as_object_mut() else {
+            return;
+        };
+        match report {
+            Ok(report) => {
+                object.insert("generation_gc_ok".to_owned(), json!(true));
+                object.insert("generation_gc_retained".to_owned(), json!(report.retained));
+                object.insert("generation_gc_pruned".to_owned(), json!(report.pruned));
+            }
+            Err(error) => {
+                object.insert("generation_gc_ok".to_owned(), json!(false));
+                object.insert("generation_gc_detail".to_owned(), json!(error));
+            }
+        }
+    }
+
+    fn protect_generation_target(target: &str, protected: &mut BTreeSet<String>) {
+        if let Some(generation_id) = generation_id_from_target(Path::new(target)) {
+            protected.insert(generation_id.to_owned());
+        }
+    }
+
+    fn prune_obsolete_generations(paths: &ServicePaths) -> Result<GenerationGcReport, String> {
+        let mut protected = BTreeSet::new();
+        if let Some(target) = current_target(paths)? {
+            let generation_id = generation_id_from_target(&target).ok_or_else(|| {
+                format!(
+                    "runtime/current points outside managed generations: {}",
+                    target.display()
+                )
+            })?;
+            protected.insert(generation_id.to_owned());
+        }
+
+        let store = StateStore::open_in_dir(&paths.config_dir, "state")?;
+        for rollback in store.protected_service_rollbacks()? {
+            protected.insert(rollback.activated_generation_id);
+            if let Some(target) = rollback.previous_current_target.as_deref() {
+                protect_generation_target(target, &mut protected);
+            }
+        }
+
+        match fs::symlink_metadata(&paths.guardians_dir) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(format!(
+                        "guardian root is not a managed directory: {}",
+                        paths.guardians_dir.display()
+                    ));
+                }
+                for entry in fs::read_dir(&paths.guardians_dir)
+                    .map_err(|error| format!("cannot list guardian transactions: {error}"))?
+                {
+                    let entry = entry
+                        .map_err(|error| format!("cannot inspect guardian transaction: {error}"))?;
+                    let entry_type = entry
+                        .file_type()
+                        .map_err(|error| format!("cannot inspect guardian entry type: {error}"))?;
+                    if entry_type.is_symlink() {
+                        return Err(format!(
+                            "guardian transaction must not be a symlink: {}",
+                            entry.path().display()
+                        ));
+                    }
+                    if !entry_type.is_dir() {
+                        continue;
+                    }
+                    let transaction_id = entry.file_name().to_string_lossy().into_owned();
+                    if !valid_guardian_transaction_id(&transaction_id) {
+                        continue;
+                    }
+                    let guardian = read_guardian_record(paths, &transaction_id)?;
+                    if matches!(
+                        guardian.state.as_str(),
+                        "armed" | "watching" | "recovering" | "expired_parent_alive"
+                    ) {
+                        if let Some(generation_id) = guardian.candidate_generation_id {
+                            protected.insert(generation_id);
+                        }
+                        if let Some(target) = guardian.previous_current_target.as_deref() {
+                            protect_generation_target(target, &mut protected);
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect guardian root {}: {error}",
+                    paths.guardians_dir.display()
+                ));
+            }
+        }
+
+        match fs::symlink_metadata(&paths.generations_dir) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(format!(
+                        "runtime generations root is not a managed directory: {}",
+                        paths.generations_dir.display()
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(GenerationGcReport {
+                    retained: Vec::new(),
+                    pruned: Vec::new(),
+                });
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect runtime generations root {}: {error}",
+                    paths.generations_dir.display()
+                ));
+            }
+        }
+
+        let mut retained = Vec::new();
+        let mut obsolete = Vec::new();
+        for entry in fs::read_dir(&paths.generations_dir)
+            .map_err(|error| format!("cannot list runtime generations: {error}"))?
+        {
+            let entry =
+                entry.map_err(|error| format!("cannot inspect runtime generation: {error}"))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("rust-") {
+                continue;
+            }
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect runtime generation type: {error}"))?;
+            if file_type.is_symlink() {
+                return Err(format!(
+                    "runtime generation must not be a symlink: {}",
+                    entry.path().display()
+                ));
+            }
+            if !file_type.is_dir() {
+                continue;
+            }
+            if protected.contains(&name) {
+                retained.push(name);
+            } else {
+                obsolete.push((name, entry.path()));
+            }
+        }
+
+        retained.sort();
+        obsolete.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut pruned = Vec::with_capacity(obsolete.len());
+        for (generation_id, path) in obsolete {
+            fs::remove_dir_all(&path).map_err(|error| {
+                format!(
+                    "cannot prune obsolete runtime generation {}: {error}",
+                    path.display()
+                )
+            })?;
+            pruned.push(generation_id);
+        }
+        Ok(GenerationGcReport { retained, pruned })
+    }
+
     fn prepare_generation(paths: &ServicePaths) -> Result<PreparedGeneration, String> {
         ensure_secure_dir(&paths.config_dir)?;
         ensure_secure_dir(&paths.runtime_root)?;
@@ -3311,6 +3505,150 @@ mod macos {
                 home.join(".config/herdr/herdr.sock"),
             );
             (root, paths)
+        }
+
+        fn create_generation_dir(paths: &ServicePaths, generation_id: &str) -> PathBuf {
+            fs::create_dir_all(&paths.generations_dir).unwrap();
+            let generation = paths.generations_dir.join(generation_id);
+            fs::create_dir_all(&generation).unwrap();
+            fs::write(generation.join("herdr-mcp"), generation_id.as_bytes()).unwrap();
+            generation
+        }
+
+        fn point_current(paths: &ServicePaths, generation_id: &str) {
+            fs::create_dir_all(&paths.runtime_root).unwrap();
+            symlink(
+                PathBuf::from("generations").join(generation_id),
+                &paths.current_link,
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn generation_gc_retains_current_and_ready_rollback_previous() {
+            let (root, paths) = fixture();
+            for generation in ["rust-current", "rust-previous", "rust-old-a", "rust-old-b"] {
+                create_generation_dir(&paths, generation);
+            }
+            point_current(&paths, "rust-current");
+
+            let mut store = StateStore::open_in_dir(&paths.config_dir, "state").unwrap();
+            store
+                .stage_runtime_generation(
+                    "rust-previous",
+                    "/runtime/previous",
+                    "sha-previous",
+                    "install",
+                    10,
+                )
+                .unwrap();
+            store
+                .stage_runtime_generation(
+                    "rust-current",
+                    "/runtime/current",
+                    "sha-current",
+                    "update",
+                    20,
+                )
+                .unwrap();
+            store
+                .activate_runtime_generation("rust-previous", 30)
+                .unwrap();
+            store
+                .prepare_service_rollback(&ServiceRollbackRecord {
+                    rollback_id: "rb-generation-gc".to_owned(),
+                    source_kind: "rust".to_owned(),
+                    activated_generation_id: "rust-current".to_owned(),
+                    server_plist_backup: None,
+                    watchdog_plist_backup: None,
+                    previous_current_target: Some("generations/rust-previous".to_owned()),
+                    server_was_loaded: true,
+                    watchdog_was_loaded: false,
+                    created_at: 35,
+                    state: "prepared".to_owned(),
+                })
+                .unwrap();
+            store
+                .activate_runtime_generation_with_rollback(
+                    "rust-current",
+                    Some("rb-generation-gc"),
+                    40,
+                )
+                .unwrap();
+            drop(store);
+
+            let report = prune_obsolete_generations(&paths).unwrap();
+            assert_eq!(
+                report.retained,
+                vec!["rust-current".to_owned(), "rust-previous".to_owned()]
+            );
+            assert_eq!(report.pruned.len(), 2);
+            assert!(paths.generations_dir.join("rust-current").is_dir());
+            assert!(paths.generations_dir.join("rust-previous").is_dir());
+            assert!(!paths.generations_dir.join("rust-old-a").exists());
+            assert!(!paths.generations_dir.join("rust-old-b").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn generation_gc_retains_armed_guardian_candidate_during_transaction() {
+            let (root, paths) = fixture();
+            for generation in [
+                "rust-current",
+                "rust-previous",
+                "rust-candidate",
+                "rust-old",
+            ] {
+                create_generation_dir(&paths, generation);
+            }
+            point_current(&paths, "rust-current");
+            ensure_secure_dir(&paths.guardians_dir).unwrap();
+            let transaction_id = "gtx-123456-generation-gc";
+            ensure_secure_dir(&guardian_dir(&paths, transaction_id).unwrap()).unwrap();
+            write_guardian_record(
+                &paths,
+                &GuardianRecord {
+                    transaction_id: transaction_id.to_owned(),
+                    mode: GuardianMode::Install,
+                    state: "armed".to_owned(),
+                    parent_pid: std::process::id(),
+                    created_at: 10,
+                    rollback_id: None,
+                    candidate_generation_id: Some("rust-candidate".to_owned()),
+                    server_plist_backup: None,
+                    watchdog_plist_backup: None,
+                    previous_current_target: Some("generations/rust-previous".to_owned()),
+                    server_was_loaded: true,
+                    watchdog_was_loaded: false,
+                    detail: None,
+                },
+            )
+            .unwrap();
+
+            let report = prune_obsolete_generations(&paths).unwrap();
+            assert_eq!(report.retained.len(), 3);
+            assert!(report.retained.contains(&"rust-current".to_owned()));
+            assert!(report.retained.contains(&"rust-previous".to_owned()));
+            assert!(report.retained.contains(&"rust-candidate".to_owned()));
+            assert_eq!(report.pruned, vec!["rust-old".to_owned()]);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn generation_gc_fails_closed_before_deleting_when_generation_is_symlink() {
+            let (root, paths) = fixture();
+            create_generation_dir(&paths, "rust-current");
+            create_generation_dir(&paths, "rust-old");
+            point_current(&paths, "rust-current");
+            let external = root.join("external-generation");
+            fs::create_dir_all(&external).unwrap();
+            symlink(&external, paths.generations_dir.join("rust-unsafe")).unwrap();
+
+            let error = prune_obsolete_generations(&paths).unwrap_err();
+            assert!(error.contains("must not be a symlink"));
+            assert!(paths.generations_dir.join("rust-old").is_dir());
+            assert!(external.is_dir());
+            fs::remove_dir_all(root).unwrap();
         }
 
         fn node_plist(paths: &ServicePaths) -> Vec<u8> {
