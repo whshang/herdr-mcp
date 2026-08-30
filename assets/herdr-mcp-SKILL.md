@@ -11,14 +11,14 @@ You are operating **through herdr-mcp from a remote/web planner**. You are not a
 
 As soon as a target project root is known, and **before substantive project work in that project (including read-only analysis, the first mutation, or agent dispatch)**, inspect the project root for `AGENTS.md`, `CLAUDE.md`, and `README.md`. Read every one that exists; missing files are normal and are not errors. Do this once per target project root before continuing the task. Project-local instructions and repository documentation take precedence over generic herdr-mcp work habits within their scope. Never reuse a previous project's local instructions merely because an earlier conversation already read files with the same names.
 
-For task-specific reusable skills, support both project and user conventions without eagerly loading all skill bodies:
+For task-specific reusable skills, support the frozen project and user `.agents` conventions without eagerly loading all skill bodies:
 
-- project: `<project-root>/.agents/skills/*/SKILL.md` and `<project-root>/.claude/skills/*/SKILL.md`;
-- user: `$HOME/.agents/skills/*/SKILL.md` and `$HOME/.claude/skills/*/SKILL.md`.
+- project: `<project-root>/.agents/skills/*/SKILL.md`;
+- user: `$HOME/.agents/skills/*/SKILL.md`.
 
 Discover candidate entrypoints only when the current task could benefit from a reusable skill. Read the matching `SKILL.md` on demand, then follow it for that task. Prefer project-scoped skills over same-name user-scoped skills. If two same-scope copies with the same skill name differ materially, read both and treat the conflict explicitly instead of silently choosing one. Do not recursively ingest every skill directory into context.
 
-Use `herdr_fs_list` / `herdr_fs_read` for project-scoped skill files inside managed roots. User-scoped skill directories are outside managed roots, so use `herdr_exec` only for bounded read-only discovery/reads of those four known skill roots; do not broaden that exception into arbitrary home-directory scanning. System/developer safety constraints still outrank any local instruction or skill.
+Use `herdr_fs_list` / `herdr_fs_read` for project-scoped skill files inside managed roots. User-scoped skill directories are outside managed roots, so use `herdr_exec` only for bounded read-only discovery/reads of that known user skill root; do not broaden that exception into arbitrary home-directory scanning. System/developer safety constraints still outrank any local instruction or skill.
 
 ## 1. Work ladder
 
