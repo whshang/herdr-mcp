@@ -39,7 +39,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.79";
+const H2W_SCRIPT_VERSION = "0.1.80";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
@@ -3551,6 +3551,15 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   const bindings = await loadBindings();
   const session = bindingsForConv(bindings, convInfo.convKey);
   if (!session.length) return { ok: false, error: "binding_required" };
+  if (trigger !== "manual") {
+    const projectBindings = session.filter((binding) => isProjectScopedBinding(binding));
+    if (projectBindings.length) {
+      const activeTargets = new Set(projectBindings.map((binding) => bindingDeliveryConvKey(binding)).filter(Boolean));
+      if (activeTargets.size !== 1 || !activeTargets.has(convInfo.convKey)) {
+        return { ok: false, error: "inactive_project_conversation" };
+      }
+    }
+  }
 
   // Roll over only at a quiescent boundary. Moving the wake destination while
   // a bound workspace is actively working risks racing an agent-settled wake
