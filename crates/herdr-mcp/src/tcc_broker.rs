@@ -95,20 +95,86 @@ fn write_broker_metadata(config_dir: &Path) -> Result<(), String> {
     atomic_write(&broker_metadata_path(config_dir), &bytes, 0o600)
 }
 
-/// Compatibility revision of an installed broker. A pre-metadata broker is
-/// explicitly treated as the first v0.4.2 revision rather than compared to
-/// the current runtime binary bytes.
-pub fn installed_compat_revision(config_dir: &Path) -> Option<u32> {
-    status(&broker_path(config_dir))?;
-    let metadata = std::fs::read(broker_metadata_path(config_dir)).ok();
-    match metadata
-        .as_deref()
-        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
-        .and_then(|value| value.get("compat_revision").and_then(Value::as_u64))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstalledCompatState {
+    LegacyRevision,
+    Revision(u32),
+    Invalid(String),
+}
+
+fn parse_broker_metadata(bytes: &[u8]) -> Result<u32, String> {
+    let value = serde_json::from_slice::<Value>(bytes)
+        .map_err(|error| format!("metadata JSON is invalid: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "metadata must be a JSON object".to_owned())?;
+    let schema = object
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "metadata schema_version must be an integer".to_owned())?;
+    if schema != u64::from(BROKER_METADATA_SCHEMA) {
+        return Err(format!(
+            "unsupported metadata schema_version {schema} (expected {BROKER_METADATA_SCHEMA})"
+        ));
+    }
+    let revision = object
+        .get("compat_revision")
+        .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
-    {
-        Some(revision) => Some(revision),
-        None => Some(LEGACY_BROKER_COMPAT_REVISION),
+        .ok_or_else(|| "metadata compat_revision must be a u32 integer".to_owned())?;
+    let identifier = object
+        .get("preferred_signing_identifier")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "metadata preferred_signing_identifier must be a string".to_owned())?;
+    if identifier != BROKER_SIGNING_IDENTIFIER {
+        return Err(format!(
+            "unexpected metadata signing identifier '{identifier}' (expected '{BROKER_SIGNING_IDENTIFIER}')"
+        ));
+    }
+    Ok(revision)
+}
+
+pub fn installed_compat_state(config_dir: &Path) -> Option<InstalledCompatState> {
+    status(&broker_path(config_dir))?;
+    let metadata_path = broker_metadata_path(config_dir);
+    let metadata = match std::fs::symlink_metadata(&metadata_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(InstalledCompatState::LegacyRevision);
+        }
+        Err(error) => {
+            return Some(InstalledCompatState::Invalid(format!(
+                "cannot inspect {}: {error}",
+                metadata_path.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Some(InstalledCompatState::Invalid(format!(
+            "{} must be a regular file and not a symlink",
+            metadata_path.display()
+        )));
+    }
+    match std::fs::read(&metadata_path) {
+        Ok(bytes) => Some(match parse_broker_metadata(&bytes) {
+            Ok(revision) => InstalledCompatState::Revision(revision),
+            Err(detail) => InstalledCompatState::Invalid(detail),
+        }),
+        Err(error) => Some(InstalledCompatState::Invalid(format!(
+            "cannot read {}: {error}",
+            metadata_path.display()
+        ))),
+    }
+}
+
+/// Compatibility revision of an installed broker. Only a genuinely missing
+/// metadata file inherits the first v0.4.2 legacy revision. Present-but-invalid
+/// metadata returns `None` so callers fail closed.
+pub fn installed_compat_revision(config_dir: &Path) -> Option<u32> {
+    match installed_compat_state(config_dir)? {
+        InstalledCompatState::LegacyRevision => Some(LEGACY_BROKER_COMPAT_REVISION),
+        InstalledCompatState::Revision(revision) => Some(revision),
+        InstalledCompatState::Invalid(_) => None,
     }
 }
 
@@ -137,6 +203,7 @@ pub struct BrokerUpgradeStatus {
     pub update_available: bool,
     pub identity_compatible: Option<bool>,
     pub update_requires_reauthorization: bool,
+    pub metadata_invalid: Option<String>,
     pub installed_identity: Option<BrokerCodeIdentity>,
 }
 
@@ -188,6 +255,7 @@ pub fn inspect_code_identity(path: &Path) -> BrokerCodeIdentity {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn line_value(text: &str, prefix: &str) -> Option<String> {
     text.lines()
         .find_map(|line| line.trim().strip_prefix(prefix).map(str::trim))
@@ -224,13 +292,23 @@ fn replacement_identity_compatible(installed: &Path, candidate: &Path) -> bool {
 
 pub fn upgrade_status(config_dir: &Path) -> BrokerUpgradeStatus {
     let installed = broker_path(config_dir);
-    let installed_revision = installed_compat_revision(config_dir);
+    let installed_state = installed_compat_state(config_dir);
+    let metadata_invalid = installed_state.as_ref().and_then(|state| match state {
+        InstalledCompatState::Invalid(detail) => Some(detail.clone()),
+        _ => None,
+    });
+    let installed_revision = installed_state.as_ref().and_then(|state| match state {
+        InstalledCompatState::LegacyRevision => Some(LEGACY_BROKER_COMPAT_REVISION),
+        InstalledCompatState::Revision(revision) => Some(*revision),
+        InstalledCompatState::Invalid(_) => None,
+    });
     let candidate_revision = BROKER_COMPAT_REVISION;
-    let update_available = installed_revision
-        .map(|revision| revision != candidate_revision)
-        .unwrap_or(false);
+    let update_available = metadata_invalid.is_none()
+        && installed_revision
+            .map(|revision| revision != candidate_revision)
+            .unwrap_or(false);
     let installed_identity = status(&installed).map(|_| inspect_code_identity(&installed));
-    let identity_compatible = if installed_revision.is_none() {
+    let identity_compatible = if metadata_invalid.is_some() || installed_revision.is_none() {
         None
     } else if !update_available {
         Some(true)
@@ -239,13 +317,15 @@ pub fn upgrade_status(config_dir: &Path) -> BrokerUpgradeStatus {
             .ok()
             .map(|candidate| replacement_identity_compatible(&installed, &candidate))
     };
-    let update_requires_reauthorization = update_available && identity_compatible != Some(true);
+    let update_requires_reauthorization =
+        metadata_invalid.is_some() || (update_available && identity_compatible != Some(true));
     BrokerUpgradeStatus {
         installed_revision,
         candidate_revision,
         update_available,
         identity_compatible,
         update_requires_reauthorization,
+        metadata_invalid,
         installed_identity,
     }
 }
@@ -253,8 +333,18 @@ pub fn upgrade_status(config_dir: &Path) -> BrokerUpgradeStatus {
 pub fn doctor_line(config_dir: &Path) -> String {
     let upgrade = upgrade_status(config_dir);
     let identity = upgrade.installed_identity.as_ref();
+    let revision = upgrade
+        .installed_revision
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| {
+            if upgrade.metadata_invalid.is_some() {
+                "invalid".to_owned()
+            } else {
+                "none".to_owned()
+            }
+        });
     format!(
-        "LAYER tcc-broker-identity mode={} identifier={} team={} installed_revision={} candidate_revision={} identity_compatible={} update_requires_reauthorization={}",
+        "LAYER tcc-broker-identity mode={} identifier={} team={} installed_revision={} candidate_revision={} metadata={} identity_compatible={} update_requires_reauthorization={}",
         identity
             .map(|value| value.mode.as_str())
             .unwrap_or("missing"),
@@ -264,11 +354,13 @@ pub fn doctor_line(config_dir: &Path) -> String {
         identity
             .and_then(|value| value.team.as_deref())
             .unwrap_or("none"),
-        upgrade
-            .installed_revision
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_owned()),
+        revision,
         upgrade.candidate_revision,
+        if upgrade.metadata_invalid.is_some() {
+            "invalid"
+        } else {
+            "ok"
+        },
         upgrade
             .identity_compatible
             .map(|value| value.to_string())
@@ -321,9 +413,28 @@ pub fn run_cli(command: TccBrokerCommand) -> Result<ExitCode, String> {
                         "installed_revision: {}",
                         upgrade
                             .installed_revision
-                            .unwrap_or(LEGACY_BROKER_COMPAT_REVISION)
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| if upgrade.metadata_invalid.is_some() {
+                                "invalid".to_owned()
+                            } else {
+                                "none".to_owned()
+                            })
                     );
                     println!("candidate_revision: {}", upgrade.candidate_revision);
+                    println!(
+                        "metadata_status: {}",
+                        if upgrade.metadata_invalid.is_some() {
+                            "invalid"
+                        } else {
+                            "ok"
+                        }
+                    );
+                    if let Some(detail) = upgrade.metadata_invalid.as_deref() {
+                        println!("metadata_error: {detail}");
+                        println!(
+                            "metadata_hint: repair the broker metadata or perform an explicit one-time broker identity migration and reauthorization"
+                        );
+                    }
                     println!("update_available: {}", upgrade.update_available);
                     println!(
                         "identity_compatible: {}",
@@ -390,6 +501,12 @@ pub fn install(config_dir: &Path, force: bool) -> Result<(), String> {
         )
     })?;
     if target.exists() {
+        if let Some(InstalledCompatState::Invalid(detail)) = installed_compat_state(config_dir) {
+            return Err(format!(
+                "refusing to modify TCC broker {} because its metadata is invalid: {detail}; repair the metadata or explicitly migrate the broker identity and reauthorize macOS access",
+                target.display()
+            ));
+        }
         let existing = std::fs::read(&target).map_err(|error| {
             format!("cannot read existing broker {}: {error}", target.display())
         })?;
@@ -400,8 +517,9 @@ pub fn install(config_dir: &Path, force: bool) -> Result<(), String> {
             }
             return Ok(());
         }
-        let installed_revision =
-            installed_compat_revision(config_dir).unwrap_or(LEGACY_BROKER_COMPAT_REVISION);
+        let installed_revision = installed_compat_revision(config_dir).ok_or_else(|| {
+            "installed TCC broker compatibility revision is unavailable".to_owned()
+        })?;
         if installed_revision == BROKER_COMPAT_REVISION {
             // The broker implementation did not change. Never replace a stable
             // TCC client merely because the surrounding runtime was rebuilt.
@@ -472,13 +590,26 @@ pub fn status_line(config_dir: &Path) -> String {
     match status(&path) {
         Some(info) => {
             let upgrade = upgrade_status(config_dir);
+            let revision = upgrade
+                .installed_revision
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| {
+                    if upgrade.metadata_invalid.is_some() {
+                        "invalid".to_owned()
+                    } else {
+                        "none".to_owned()
+                    }
+                });
             format!(
-                "installed at {} (sha256 {}, revision {}, identity {}, reauth={})",
+                "installed at {} (sha256 {}, revision {}, metadata {}, identity {}, reauth={})",
                 path.display(),
                 &info.sha256[..16.min(info.sha256.len())],
-                upgrade
-                    .installed_revision
-                    .unwrap_or(LEGACY_BROKER_COMPAT_REVISION),
+                revision,
+                if upgrade.metadata_invalid.is_some() {
+                    "invalid"
+                } else {
+                    "ok"
+                },
                 upgrade
                     .installed_identity
                     .as_ref()
@@ -1033,6 +1164,47 @@ mod tests {
         // revision replacement must require explicit reauthorization.
         assert!(status.update_requires_reauthorization);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_broker_metadata_fails_closed_without_rewriting_identity() {
+        let dir = temp_dir("invalid-metadata");
+        let config = dir.join("config");
+        let target = broker_path(&config);
+        let metadata = broker_metadata_path(&config);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"stable-broker").unwrap();
+        fs::write(&metadata, b"{not-json").unwrap();
+
+        assert_eq!(installed_compat_revision(&config), None);
+        let status = upgrade_status(&config);
+        assert_eq!(status.installed_revision, None);
+        assert!(status.metadata_invalid.is_some());
+        assert_eq!(status.identity_compatible, None);
+        assert!(!status.update_available);
+        assert!(status.update_requires_reauthorization);
+
+        for force in [false, true] {
+            let error = install(&config, force).unwrap_err();
+            assert!(error.contains("metadata is invalid"));
+            assert!(error.contains("explicitly migrate"));
+            assert_eq!(fs::read(&target).unwrap(), b"stable-broker");
+            assert_eq!(fs::read(&metadata).unwrap(), b"{not-json");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broker_metadata_validation_rejects_wrong_schema_revision_and_identifier() {
+        let cases: &[&[u8]] = &[
+            br#"{"schema_version":99,"compat_revision":1,"preferred_signing_identifier":"cc.agentforme.herdr.tcc-broker"}"#,
+            br#"{"schema_version":1,"compat_revision":4294967296,"preferred_signing_identifier":"cc.agentforme.herdr.tcc-broker"}"#,
+            br#"{"schema_version":1,"compat_revision":1,"preferred_signing_identifier":"unexpected.identifier"}"#,
+        ];
+        for metadata in cases {
+            assert!(parse_broker_metadata(metadata).is_err());
+        }
     }
 
     #[test]

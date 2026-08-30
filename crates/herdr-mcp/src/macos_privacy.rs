@@ -166,6 +166,7 @@ pub(crate) fn probe_documents_permission(_config_dir: &Path) -> DocumentsPermiss
 /// shells, which do not necessarily inherit the service LaunchAgent's
 /// `HERDR_MCP_TCC_BROKER=1`. Therefore the protected-path probe always uses the
 /// installed broker and never falls back to a rotating runtime generation.
+#[cfg(any(target_os = "macos", test))]
 fn documents_probe_executable(broker: &Path, broker_exists: bool) -> Result<PathBuf, String> {
     if broker_exists {
         return Ok(broker.to_path_buf());
