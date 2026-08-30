@@ -52,6 +52,7 @@ mod snapshot;
 mod state_cache;
 mod state_store;
 mod status;
+mod tcc_broker;
 #[cfg(test)]
 mod test_env;
 mod updater;
@@ -111,6 +112,8 @@ fn run() -> Result<ExitCode, String> {
             })
         }
         cli::Command::DocumentsProbe => Ok(macos_privacy::run_documents_probe_child()),
+        cli::Command::TccBrokerRun => Ok(tcc_broker::run_broker_once()),
+        cli::Command::TccBroker(command) => tcc_broker::run_cli(command),
         cli::Command::HerdrSupervisor(command) => herdr_supervisor::run(command),
         cli::Command::Scan {
             json,

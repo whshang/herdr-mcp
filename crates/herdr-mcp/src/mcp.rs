@@ -10,6 +10,7 @@ use crate::native_tools;
 use crate::prompt::{self, PromptRegistry};
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
+use crate::tcc_broker;
 use crate::utility_exec;
 use serde_json::{Value, json};
 
@@ -188,21 +189,34 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 params,
             )
         }
-        "herdr_fs_read" => fs_tools::read(&context.cache.snapshot(), &arguments),
-        "herdr_fs_list" => fs_tools::list(&context.cache.snapshot(), &arguments),
-        "herdr_fs_grep" => fs_tools::grep(&context.cache.snapshot(), &arguments),
+        "herdr_fs_read" => route_fs_git("fs_read", &context.cache.snapshot(), &arguments),
+        "herdr_fs_list" => route_fs_git("fs_list", &context.cache.snapshot(), &arguments),
+        "herdr_fs_grep" => route_fs_git("fs_grep", &context.cache.snapshot(), &arguments),
         "herdr_fs_image" => {
             return Ok(
-                match fs_tools::image(&context.cache.snapshot(), &arguments) {
-                    Ok(image) => image_tool_result(image),
-                    Err(error) => tool_result(error, false),
+                match tcc_broker::route_fs_git("fs_image", &context.cache.snapshot(), &arguments) {
+                    Some(Ok(value)) => match tcc_broker::image_tool_result_from_broker(&value) {
+                        Ok(tool) => tool,
+                        Err(message) => tool_result(
+                            json!({ "ok": false, "code": "broker_image_invalid", "message": message }),
+                            true,
+                        ),
+                    },
+                    Some(Err(message)) => tool_result(
+                        json!({ "ok": false, "code": "broker_failed", "message": message }),
+                        true,
+                    ),
+                    None => match fs_tools::image(&context.cache.snapshot(), &arguments) {
+                        Ok(image) => image_tool_result(image),
+                        Err(error) => tool_result(error, false),
+                    },
                 },
             );
         }
-        "herdr_fs_edit" => fs_mutation::edit(&context.cache.snapshot(), &arguments),
-        "herdr_fs_write" => fs_mutation::write(&context.cache.snapshot(), &arguments),
-        "herdr_fs_patch" => fs_patch::apply(&context.cache.snapshot(), &arguments),
-        "herdr_git" => git_tools::run(&context.cache.snapshot(), &arguments),
+        "herdr_fs_edit" => route_fs_git("fs_edit", &context.cache.snapshot(), &arguments),
+        "herdr_fs_write" => route_fs_git("fs_write", &context.cache.snapshot(), &arguments),
+        "herdr_fs_patch" => route_fs_git("fs_patch", &context.cache.snapshot(), &arguments),
+        "herdr_git" => route_fs_git("git", &context.cache.snapshot(), &arguments),
         "herdr_exec_start" => {
             exec_tools::start(&context.cache.snapshot(), context.exec, &arguments)
         }
@@ -251,6 +265,32 @@ fn tool_result(value: Value, is_error: bool) -> Value {
         json!({"content": [{"type": "text", "text": text}], "isError": true})
     } else {
         json!({"content": [{"type": "text", "text": text}]})
+    }
+}
+
+/// Route a focused fs/git tool through the stable TCC broker when
+/// `HERDR_MCP_TCC_BROKER=1` is set. Returns `None` when broker routing is not
+/// enabled, so the caller falls back to direct in-process execution. When
+/// routing is enabled, the broker result is returned as the tool result value
+/// (or an error value on broker failure).
+fn route_fs_git(op: &str, snapshot: &Value, arguments: &Value) -> Value {
+    match tcc_broker::route_fs_git(op, snapshot, arguments) {
+        None => match op {
+            "fs_read" => fs_tools::read(snapshot, arguments),
+            "fs_list" => fs_tools::list(snapshot, arguments),
+            "fs_grep" => fs_tools::grep(snapshot, arguments),
+            "fs_edit" => fs_mutation::edit(snapshot, arguments),
+            "fs_write" => fs_mutation::write(snapshot, arguments),
+            "fs_patch" => fs_patch::apply(snapshot, arguments),
+            "git" => git_tools::run(snapshot, arguments),
+            _ => json!({"ok": false, "code": "unknown_operation", "op": op}),
+        },
+        Some(Ok(value)) => value,
+        Some(Err(message)) => json!({
+            "ok": false,
+            "code": "broker_failed",
+            "message": message,
+        }),
     }
 }
 
