@@ -1,4 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(target_os = "macos", test))]
+use std::path::PathBuf;
 use std::process::ExitCode;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
