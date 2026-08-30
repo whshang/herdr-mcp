@@ -16,14 +16,12 @@
 //! a strict allowlist of bounded fs/git operations to the existing security
 //! gates. Arbitrary shell execution is intentionally outside this broker; on
 //! macOS protected roots, exec sessions use a dedicated Herdr pane instead.
-//! unrelated callers.
 //!
 //! Routing is opt-in via `HERDR_MCP_TCC_BROKER=1`; the default MCP path stays
 //! direct in-process execution. This is a feasibility layer for a non-paid
 //! macOS TCC story — it does not by itself grant TCC permission, and it does
 //! not claim to replace a Developer ID / notarization.
 
-#[cfg(target_os = "macos")]
 use crate::cli::TccBrokerCommand;
 use crate::fs_mutation;
 use crate::fs_patch;
@@ -34,7 +32,6 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
