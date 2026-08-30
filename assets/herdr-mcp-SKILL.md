@@ -20,6 +20,21 @@ Discover candidate entrypoints only when the current task could benefit from a r
 
 Use `herdr_fs_list` / `herdr_fs_read` for project-scoped skill files inside managed roots. User-scoped skill directories are outside managed roots, so use `herdr_exec` only for bounded read-only discovery/reads of that known user skill root; do not broaden that exception into arbitrary home-directory scanning. System/developer safety constraints still outrank any local instruction or skill.
 
+## 0A. Conversation continuity recovery
+
+Treat phrases such as “continue”, “resume”, “keep going”, “接着”, “继续上次”, or “where did we leave off?” as **prior-work continuity intent** when the current conversation does not already contain enough verified context. Do not ask the user to provide a Herdr continuity ID before attempting safe discovery.
+
+Use the existing `herdr_call` local methods in this order:
+
+1. If the conversation contains an explicit `continuity_id` or `[HERDR_CONTINUITY_REF ...]`, call `continuity.resume` for exactly that ID.
+2. If a concrete current/known conversation ID is available, prefer `continuity.resolve` for that exact conversation.
+3. Otherwise call `continuity.search` with the strongest stable identity facts already known: `conversation_id`, `project_id`, and/or `workspace_id`. Add `query` only from distinguishing task terms the user actually supplied; a generic word such as “continue” is a trigger, not selection evidence.
+4. When `continuity.search` returns `resolution=unique_exact` and `auto_resume_safe=true`, resume exactly that candidate automatically.
+5. When it returns `confirmation_required`, show only the bounded candidate evidence (for example title, workspace, update time, recent user/assistant excerpts) and ask the user which prior chain to continue. **Never** select a chain merely because it is newest or textually most similar.
+6. When no chain matches, do not invent an ID. Ask for one distinguishing detail, or proceed as fresh work if the user says this is new work.
+
+After any `continuity.resume`, treat the journal as persisted historical working context, not current machine truth: re-check the relevant Herdr workspace/runtime/Git state before mutation. Read-only discovery may happen before continuity identity is resolved; mutations must not rely on an uncertain recovered chain.
+
 ## 1. Work ladder
 
 Use the cheapest deterministic layer that can complete the task.

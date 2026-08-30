@@ -10,7 +10,7 @@ use crate::native_tools;
 use crate::prompt::{self, PromptRegistry};
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
-use crate::state_store::StateStore;
+use crate::state_store::{ContinuitySearchInput, StateStore};
 use crate::tcc_broker;
 use crate::utility_exec;
 use serde_json::{Value, json};
@@ -19,7 +19,7 @@ pub const SDK_WIRE_PROTOCOL: &str = "2025-11-25";
 /// ChatGPT/OpenAI connector probe version; advertised on discover and negotiated
 /// down to [`SDK_WIRE_PROTOCOL`] for the actual wire session.
 pub const OPENAI_PROBE_PROTOCOL: &str = "2026-07-28";
-pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. Session start: herdr_inspect then herdr_skill once. Prefer deterministic herdr_fs_*/herdr_git/herdr_exec work before agent reasoning. Before unknown native API calls use herdr_methods, then herdr_call. Use explicit workspace/pane IDs and never blind-retry uncertain mutations.";
+pub const SERVER_INSTRUCTIONS: &str = "Herdr control plane for a WEB planner. Session start: herdr_inspect then herdr_skill once. On fresh prior-work continue/resume intent, load herdr_skill and search durable Continuity before asking the user for an internal ID; never select a chain by recency or text similarity alone. Prefer deterministic herdr_fs_*/herdr_git/herdr_exec work before agent reasoning. Before unknown native API calls use herdr_methods, then herdr_call. Use explicit workspace/pane IDs and never blind-retry uncertain mutations.";
 
 const SUPPORTED_VERSIONS: [&str; 5] = [
     "2025-11-25",
@@ -336,6 +336,139 @@ fn continuity_call(
             }),
             Err(error) => json!({"ok": false, "code": "continuity_list_failed", "message": error}),
         },
+        "continuity.search" => {
+            let Some(object) = params.as_object() else {
+                return json!({"ok": false, "code": "continuity_search_params_invalid", "message": "params must be an object"});
+            };
+            const ALLOWED: &[&str] = &[
+                "project_id",
+                "workspace_id",
+                "conversation_id",
+                "query",
+                "limit",
+            ];
+            if let Some(key) = object.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
+                return json!({
+                    "ok": false,
+                    "code": "continuity_search_params_invalid",
+                    "message": format!("unknown continuity.search param: {key}"),
+                });
+            }
+            let project_id = match continuity_search_string(params, "project_id", 256) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let workspace_id = match continuity_search_string(params, "workspace_id", 128) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let conversation_id = match continuity_search_string(params, "conversation_id", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let query = match continuity_search_string(params, "query", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let limit = match params.get("limit") {
+                None | Some(Value::Null) => 5,
+                Some(value) => match value.as_u64() {
+                    Some(value @ 1..=10) => value as usize,
+                    _ => {
+                        return json!({
+                            "ok": false,
+                            "code": "continuity_search_params_invalid",
+                            "message": "limit must be an integer between 1 and 10",
+                        });
+                    }
+                },
+            };
+            let exact_identity_hint =
+                project_id.is_some() || workspace_id.is_some() || conversation_id.is_some();
+            let mut match_reasons = Vec::new();
+            if conversation_id.is_some() {
+                match_reasons.push("conversation_id");
+            }
+            if project_id.is_some() {
+                match_reasons.push("project_id");
+            }
+            if workspace_id.is_some() {
+                match_reasons.push("workspace_id");
+            }
+            if query.is_some() {
+                match_reasons.push("query");
+            }
+            match store.continuity_search(ContinuitySearchInput {
+                project_id,
+                workspace_id,
+                conversation_id,
+                query,
+                limit,
+            }) {
+                Ok(records) => {
+                    let identity_match = if exact_identity_hint {
+                        store.continuity_search(ContinuitySearchInput {
+                            project_id,
+                            workspace_id,
+                            conversation_id,
+                            query: None,
+                            limit: 2,
+                        })
+                    } else {
+                        Ok(Vec::new())
+                    };
+                    let identity_match = match identity_match {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return json!({"ok": false, "code": "continuity_search_failed", "message": error});
+                        }
+                    };
+                    let auto_resume_safe = records.len() == 1
+                        && identity_match.len() == 1
+                        && records[0].continuity_id == identity_match[0].continuity_id;
+                    let resolution = if records.is_empty() {
+                        "none"
+                    } else if auto_resume_safe {
+                        "unique_exact"
+                    } else {
+                        "confirmation_required"
+                    };
+                    let candidates = records
+                        .into_iter()
+                        .map(|record| {
+                            json!({
+                                "continuity_id": record.continuity_id,
+                                "title": record.title,
+                                "project_id": record.project_id,
+                                "workspace_ids": record.workspace_ids,
+                                "status": record.status,
+                                "updated_at": record.updated_at,
+                                "recent_user_excerpt": record.recent_user_excerpt,
+                                "recent_assistant_excerpt": record.recent_assistant_excerpt,
+                                "match_reasons": match_reasons,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    json!({
+                        "ok": true,
+                        "resolution": resolution,
+                        "auto_resume_safe": auto_resume_safe,
+                        "confirmation_required": !auto_resume_safe && !candidates.is_empty(),
+                        "candidates": candidates,
+                        "instruction": if auto_resume_safe {
+                            "Exactly one active chain matched a stable identity hint. Resume that continuity_id, then re-check live Herdr/runtime/Git state before mutation."
+                        } else if resolution == "confirmation_required" {
+                            "Do not choose by recency or textual similarity alone. Show the bounded candidate evidence to the user and ask which prior work chain to continue; after confirmation, resume exactly that continuity_id."
+                        } else {
+                            "No active continuity chain matched. Do not invent an id; ask for a distinguishing detail or proceed as fresh work if that is the user's intent."
+                        },
+                    })
+                }
+                Err(error) => {
+                    json!({"ok": false, "code": "continuity_search_failed", "message": error})
+                }
+            }
+        }
         "continuity.resolve" => {
             let Some(conversation_id) = params
                 .get("conversation_id")
@@ -357,6 +490,35 @@ fn continuity_call(
             }
         }
         _ => json!({"ok": false, "code": "unknown_local_method", "method": method}),
+    }
+}
+
+fn continuity_search_string<'a>(
+    params: &'a Value,
+    key: &str,
+    max_chars: usize,
+) -> Result<Option<&'a str>, Value> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Ok(None);
+            }
+            if value.chars().count() > max_chars {
+                return Err(json!({
+                    "ok": false,
+                    "code": "continuity_search_params_invalid",
+                    "message": format!("{key} exceeds {max_chars} characters"),
+                }));
+            }
+            Ok(Some(value))
+        }
+        Some(_) => Err(json!({
+            "ok": false,
+            "code": "continuity_search_params_invalid",
+            "message": format!("{key} must be a string when provided"),
+        })),
     }
 }
 
@@ -430,6 +592,10 @@ mod tests {
         assert_eq!(result["protocolVersion"], "2025-06-18");
         assert_eq!(result["serverInfo"]["name"], "herdr-mcp");
         assert_eq!(result["_meta"]["herdr_contract_epoch"], 2);
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(instructions.contains("continue/resume intent"));
+        assert!(instructions.contains("search durable Continuity before asking"));
+        assert!(instructions.contains("never select a chain by recency or text similarity alone"));
     }
 
     #[test]
@@ -495,6 +661,135 @@ mod tests {
                 .contains("native_tool_pending")
         );
     }
+    #[test]
+    fn continuity_search_requires_confirmation_without_stable_identity() {
+        use crate::state_store::ContinuityTurnInput;
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        {
+            let mut guard = store.lock().unwrap();
+            for (
+                continuity_id,
+                conversation_id,
+                workspace_id,
+                project_id,
+                title,
+                message_id,
+                text,
+                observed_at,
+            ) in [
+                (
+                    "hc:alpha",
+                    "conv-a",
+                    "w19",
+                    "project-a",
+                    "Alpha release",
+                    "msg-a",
+                    "continue v0.4.2 release work",
+                    100,
+                ),
+                (
+                    "hc:beta",
+                    "conv-b",
+                    "w20",
+                    "project-b",
+                    "Beta provider",
+                    "msg-b",
+                    "continue provider work",
+                    200,
+                ),
+            ] {
+                guard
+                    .append_continuity_turn(ContinuityTurnInput {
+                        continuity_id,
+                        conversation_id,
+                        workspace_id: Some(workspace_id),
+                        project_id: Some(project_id),
+                        title: Some(title),
+                        message_id,
+                        role: "user",
+                        text,
+                        fingerprint: None,
+                        observed_at,
+                    })
+                    .unwrap();
+            }
+        }
+
+        let bare = continuity_call(&store, "continuity.search", &json!({}));
+        assert_eq!(bare["ok"], true);
+        assert_eq!(bare["resolution"], "confirmation_required");
+        assert_eq!(bare["auto_resume_safe"], false);
+        assert_eq!(bare["confirmation_required"], true);
+        assert_eq!(bare["candidates"].as_array().unwrap().len(), 2);
+        assert!(
+            bare["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("Do not choose by recency")
+        );
+
+        let exact = continuity_call(&store, "continuity.search", &json!({"workspace_id": "w19"}));
+        assert_eq!(exact["resolution"], "unique_exact");
+        assert_eq!(exact["auto_resume_safe"], true);
+        assert_eq!(exact["confirmation_required"], false);
+        assert_eq!(exact["candidates"][0]["continuity_id"], "hc:alpha");
+        assert_eq!(exact["candidates"][0]["match_reasons"][0], "workspace_id");
+
+        let text_only = continuity_call(&store, "continuity.search", &json!({"query": "v0.4.2"}));
+        assert_eq!(text_only["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(text_only["resolution"], "confirmation_required");
+        assert_eq!(text_only["auto_resume_safe"], false);
+
+        {
+            let mut guard = store.lock().unwrap();
+            guard
+                .append_continuity_turn(ContinuityTurnInput {
+                    continuity_id: "hc:gamma",
+                    conversation_id: "conv-c",
+                    workspace_id: Some("w19"),
+                    project_id: Some("project-a"),
+                    title: Some("Gamma release"),
+                    message_id: "msg-c",
+                    role: "user",
+                    text: "another release chain",
+                    fingerprint: None,
+                    observed_at: 300,
+                })
+                .unwrap();
+        }
+        let ambiguous =
+            continuity_call(&store, "continuity.search", &json!({"workspace_id": "w19"}));
+        assert_eq!(ambiguous["resolution"], "confirmation_required");
+        assert_eq!(ambiguous["auto_resume_safe"], false);
+        assert_eq!(ambiguous["candidates"].as_array().unwrap().len(), 2);
+
+        let identity_plus_text = continuity_call(
+            &store,
+            "continuity.search",
+            &json!({"workspace_id": "w19", "query": "v0.4.2"}),
+        );
+        assert_eq!(
+            identity_plus_text["candidates"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            identity_plus_text["candidates"][0]["continuity_id"],
+            "hc:alpha"
+        );
+        assert_eq!(identity_plus_text["resolution"], "confirmation_required");
+        assert_eq!(identity_plus_text["auto_resume_safe"], false);
+
+        let invalid = continuity_call(
+            &store,
+            "continuity.search",
+            &json!({"workspace_id": 19, "limit": 99}),
+        );
+        assert_eq!(invalid["ok"], false);
+        assert_eq!(invalid["code"], "continuity_search_params_invalid");
+    }
+
     #[test]
     fn runtime_parity_fixture_matches_native_protocol_constants() {
         let parity: Value =

@@ -97,7 +97,11 @@ Browser extension
 
 ChatGPT Project 里，连续性的 binding 不再依赖某一个 conversation。workspace 直接绑定稳定 `project_id`，所以可以在 Project 首页先绑定；具体 `/c/<id>` 只作为当前 `active_conv_key`，决定 progress/continue 应投递到哪里。接力时 Project binding 与 continuity id 都不搬家，只在新 seed 确认后切换 active target。
 
-从 0.4.2 开始，已绑定会话的 finalized user / assistant turn 会通过 Native Messaging 增量写入本机 Rust `state.db` 的 Continuity Journal。浏览器准备接力时会实时向 Rust 确认当前 `continuity_id` 仍存在；确认成功后，新会话只需要携带这个 ID，并通过现有 `herdr_call(method="continuity.resume", ...)` 恢复有界的最近工作上下文，再重新检查实时 Herdr、runtime 与 Git 状态。多个候选链不会按“最近一次”猜测，歧义会显式失败。Rust journal 不可用或实时确认失败时，扩展继续使用既有 `HERDR_HANDOFF_V1` 与 bounded transcript 路径。
+从 0.4.2 开始，已绑定会话的 finalized user / assistant turn 会通过 Native Messaging 增量写入本机 Rust `state.db` 的 Continuity Journal。浏览器准备接力时会实时向 Rust 确认当前 `continuity_id` 仍存在；确认成功后，新会话只需要携带这个 ID，并通过现有 `herdr_call(method="continuity.resume", ...)` 恢复有界的最近工作上下文，再重新检查实时 Herdr、runtime 与 Git 状态。
+
+用户**手动**在同一个已绑定 ChatGPT Project 里新开会话时，不需要记住或输入 `continuity_id`。新会话第一条已确认发送的用户消息（例如“继续”）会沿用 Project binding 写入同一条 continuity chain；Web planner 看到“继续 / 接着 / 恢复上次”等意图后，应先通过 `continuity.resolve` / `continuity.search` 搜索，而不是先要求用户提供内部 ID。只有 `conversation_id`、`project_id`、`workspace_id` 这类稳定身份把候选收敛为唯一链时才允许自动 `continuity.resume`。单纯文本匹配即使只剩一个候选也仍需要用户确认；“继续”本身只是触发搜索，不是选择证据。多个候选会返回有界的标题、workspace、更新时间和最近对话摘要供确认，系统禁止用“最近一次”或“最像”直接猜。
+
+Rust journal 不可用或实时确认失败时，扩展继续使用既有 `HERDR_HANDOFF_V1` 与 bounded transcript 路径。
 
 ### 未来目标：Continuity 2.0
 

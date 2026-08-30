@@ -81,6 +81,10 @@ test("fetchHerdrSkill appends release-matched native Herdr reference with remote
     assert.match(r.content, /engineering-robustness/);
     assert.match(r.content, /silent-wrongness/);
     assert.match(r.content, /state as separate planes/);
+    assert.match(r.content, /continuity\.search/);
+    assert.match(r.content, /confirmation_required/);
+    assert.match(r.content, /Do not ask the user to provide a Herdr continuity ID before attempting safe discovery/);
+    assert.match(r.content, /Never.*newest.*textually most similar/s);
     assert.match(r.content, /name: herdr/);
   } finally {
     if (prev === undefined) delete process.env.HERDR_SKILL_NETWORK;
