@@ -727,6 +727,7 @@ fn should_use_pane_backend(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn is_protected_root_for_home(cwd: &Path, home: &Path) -> bool {
     ["Documents", "Desktop", "Downloads"]
         .into_iter()
