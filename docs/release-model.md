@@ -16,28 +16,31 @@ An extension-only change must **not** force a Rust runtime version bump. Maintai
 
 ## Runtime Release (authoritative product version)
 
-- **Workflow:** `.github/workflows/rust-release.yml`; `workflow_dispatch` is a **signed qualification** path, while only a `push` of a `v*` tag can publish.
+- **Workflow:** `.github/workflows/rust-release.yml`; `workflow_dispatch` is an **attested qualification** path, while only a `push` of a `v*` tag can publish.
 - **Verify gate:** Rust fmt/clippy/test, `npm` build/test/edge, extension smoke, site build, `git diff --check`.
 - **Build:** cross-target binaries per `.github/rust-release-targets.json`.
-- **macOS signing:** both manual qualification and tagged release builds use the same `scripts/sign-macos-release.sh`, Developer ID secrets, stable identifier and Team ID contract.
+- **macOS signing:** paid Apple Developer / Developer ID signing is optional distribution hardening. It is not required for the open-source runtime, qualification, or stable publication path. `scripts/sign-macos-release.sh` remains available for downstream/private distributors that deliberately opt into it.
 - **Manifest:** `scripts/build-rust-release-manifest.mjs` — lists the complete Runtime Release binary set; the browser extension is not a Runtime Release asset.
-- **Attestation:** both signed qualification and tag-push bundles use the pinned `actions/attest` path.
+- **Attestation:** both manual qualification and tag-push bundles use the pinned `actions/attest` path.
 - **Publish:** **tag push only** (`event=push` + `refs/tags/v*`). `workflow_dispatch` never creates or overwrites a GitHub Release. Prerelease tags remain GitHub prereleases; plain semver tags are stable (current published stable: `v0.4.1`).
 - **Recovery:** `.github/workflows/rust-release-recover.yml` accepts only an attested **tag-push** source run whose SHA/ref/manifest/attestation all match the immutable tag; a manual qualification run cannot be recovered into a Release.
 
 **User-facing version** = Runtime Release version (`herdr-mcp --version`, README, install docs). `package.json` remains site/extension build tooling — **not** the runtime product version (G1).
 
-### Pre-tag signed macOS qualification
+### Pre-tag macOS protected-folder qualification
 
-A release that changes or depends on macOS privacy / responsible-code identity must not use the immutable tag as its first real Developer ID test. Before creating the version tag:
+Herdr-MCP must remain usable without a paid Apple Developer account. macOS protected-folder reliability therefore uses an unsigned/open-source path: rotating runtime generations must not own the long-lived TCC permission boundary. The supported design is a stable, minimal local broker whose identity is independent of `runtime/current`; a user may grant that fixed broker macOS Files & Folders / Full Disk Access once when their projects require protected locations such as `~/Documents`.
 
-1. provision the repository Actions secrets `HERDR_MACOS_CERT_P12_BASE64`, `HERDR_MACOS_CERT_PASSWORD`, `HERDR_MACOS_SIGNING_IDENTITY` and variable `HERDR_MACOS_TEAM_ID`;
-2. manually dispatch **Rust Release** on the exact source ref intended for release; require verify → build → Developer ID sign → manifest → attest → qualification PASS and confirm the `publish` job is skipped;
-3. download the signed macOS qualification artifact and verify `codesign`: identifier `dev.herdr.mcp`, expected non-empty TeamIdentifier, Developer ID signature, and a designated requirement that is not cdhash-bound;
-4. run that signed binary through a real launchd-managed installation (prefer an isolated named instance while qualifying) and repeat the protected-folder probe that previously failed: a linked worktree outside `~/Documents` whose common Git dir is inside `~/Documents`, plus `herdr_git status`, `herdr_fs_patch dry_run`, and `herdr_exec_start`; all operations must finish within their bounds with no owned child leak;
-5. replace the managed signed generation using the same signed identity path and repeat the probes. The code identity must remain stable and macOS must not require a new privacy authorization merely because the generation bytes/path changed;
-6. only after the signed qualification is retained as evidence may the immutable `v*` tag be created, and that tag **must point to the exact `release_identity.source_commit` recorded by the qualified manifest**. The tag-push run independently rebuilds/signs/attests that same source and is the only path allowed to publish;
-7. after publication, perform the normal stable-channel `update apply` / rollback dogfood and confirm the same identity/Native Host/service invariants before declaring patch-line closure.
+Before creating the version tag:
+
+1. manually dispatch **Rust Release** on the exact source ref intended for release; require verify → build → manifest → attest → qualification PASS and confirm the `publish` job is skipped;
+2. run the macOS candidate through the real launchd-managed path and repeat the protected-folder probe that previously failed: a linked worktree outside `~/Documents` whose common Git dir is inside `~/Documents`, plus `herdr_git status`, `herdr_fs_read`, `herdr_fs_patch dry_run`, and bounded exec;
+3. where direct launchd access is denied by TCC, verify the stable broker path completes the same managed-root operation while preserving all existing path/secret/dirty/busy gates;
+4. apply a new runtime generation and repeat the probes without replacing the stable broker. Runtime generation churn must not require a new macOS privacy grant;
+5. retain the qualification evidence, then create the immutable `v*` tag pointing to the exact `release_identity.source_commit` recorded by the qualified manifest. The tag-push run independently rebuilds and attests the same source and is the only path allowed to publish;
+6. after publication, perform the normal stable-channel `update apply` / rollback dogfood and confirm broker/runtime/Native Host/service invariants before declaring patch-line closure.
+
+Developer ID signing and notarization may still be used by a distributor that already participates in the Apple Developer Program, but neither is a Herdr-MCP runtime requirement or release gate.
 
 A workflow-dispatch artifact is qualification evidence only. Its manifest preserves the actual branch/ref and commit provenance; it is not discoverable by the updater and must never be presented as a published stable or preview Release.
 
@@ -61,7 +64,7 @@ Installed generations are content-addressed (`rust-<sha256-prefix>`). Update app
 
 | Artifact | Version | Notes |
 | --- | --- | --- |
-| Runtime binary | `0.4.1` published / `0.4.2` source-ready | `0.4.2` is merged; signed stable tag/publish remains fail-closed on Developer ID credentials |
+| Runtime binary | `0.4.1` published / `0.4.2` source-ready | `0.4.2` does not require paid Apple signing; protected-folder qualification must pass through the unsigned stable-broker path before tagging |
 | Browser extension source | `0.1.77` | Current development source; Chrome Web Store published/review version may lag and must be checked independently |
 | Native Messaging host | Managed by runtime generation | `native-host status` must show `runtime_matches_current=true` |
 

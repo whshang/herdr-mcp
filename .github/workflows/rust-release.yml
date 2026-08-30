@@ -54,15 +54,6 @@ jobs:
       - name: Build release binary
         shell: bash
         run: cargo build --locked --release -p herdr-mcp --target "${{ matrix.target }}"
-      - name: Sign macOS release or qualification identity
-        if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && contains(matrix.target, 'apple-darwin')
-        shell: bash
-        env:
-          HERDR_MACOS_CERT_P12_BASE64: ${{ secrets.HERDR_MACOS_CERT_P12_BASE64 }}
-          HERDR_MACOS_CERT_PASSWORD: ${{ secrets.HERDR_MACOS_CERT_PASSWORD }}
-          HERDR_MACOS_SIGNING_IDENTITY: ${{ secrets.HERDR_MACOS_SIGNING_IDENTITY }}
-          HERDR_MACOS_TEAM_ID: ${{ vars.HERDR_MACOS_TEAM_ID }}
-        run: scripts/sign-macos-release.sh "target/${{ matrix.target }}/release/herdr-mcp"
       - name: Stage raw release asset
         shell: bash
         run: |
@@ -135,7 +126,7 @@ jobs:
         with:
           name: rust-release-bundle
           path: release-assets
-      - name: Attest signed release or qualification assets
+      - name: Attest release or qualification assets
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
@@ -154,7 +145,7 @@ jobs:
         with:
           name: rust-release-bundle
           path: release-assets
-      - name: Verify signed qualification source identity
+      - name: Verify qualification source identity
         shell: bash
         run: |
           set -euo pipefail
@@ -164,14 +155,14 @@ jobs:
           [[ "$source_commit" == "$GITHUB_SHA" ]] || { echo "qualification source_commit does not match dispatched commit" >&2; exit 1; }
           [[ "$source_ref" == "$GITHUB_REF" ]] || { echo "qualification source_ref does not match dispatched ref" >&2; exit 1; }
           [[ "$source_ref" != refs/tags/* ]] || { echo "qualification mode refuses a tag ref" >&2; exit 1; }
-          echo "signed_qualification_ok commit=$source_commit ref=$source_ref assets=$(jq '.assets | length' "$manifest")"
+          echo "qualification_ok commit=$source_commit ref=$source_ref assets=$(jq '.assets | length' "$manifest")"
           {
-            echo '### Signed qualification bundle'
+            echo '### Qualification bundle'
             echo
             echo "Commit: $source_commit"
             echo "Source ref: $source_ref"
             echo
-            echo 'This workflow-dispatch run signs and attests the candidate bundle but never publishes a GitHub Release. Run the signed launchd/TCC qualification before creating the immutable version tag.'
+            echo 'This workflow-dispatch run builds and attests the candidate bundle but never publishes a GitHub Release. macOS paid Developer ID signing is optional hardening, not a release prerequisite.'
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish:

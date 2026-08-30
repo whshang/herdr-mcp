@@ -231,19 +231,16 @@ test("Rust release defaults to one authoritative macOS ARM64 + Windows x64 targe
   assert.doesNotMatch(release, /unknown-linux-gnu/);
 });
 
-test("tagged releases and manual qualification require the same stable Developer ID identity", async () => {
+test("tagged releases do not require paid Apple Developer signing", async () => {
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
   const signer = await readFile(join(ROOT, "scripts/sign-macos-release.sh"), "utf8");
-  assert.match(release, /Sign macOS release or qualification identity/);
-  assert.match(
-    release,
-    /if: \(startsWith\(github\.ref, 'refs\/tags\/v'\) \|\| github\.event_name == 'workflow_dispatch'\) && contains\(matrix\.target, 'apple-darwin'\)/,
-  );
-  assert.match(release, /HERDR_MACOS_CERT_P12_BASE64: \${{ secrets\.HERDR_MACOS_CERT_P12_BASE64 }}/);
-  assert.match(release, /HERDR_MACOS_CERT_PASSWORD: \${{ secrets\.HERDR_MACOS_CERT_PASSWORD }}/);
-  assert.match(release, /HERDR_MACOS_SIGNING_IDENTITY: \${{ secrets\.HERDR_MACOS_SIGNING_IDENTITY }}/);
-  assert.match(release, /HERDR_MACOS_TEAM_ID: \${{ vars\.HERDR_MACOS_TEAM_ID }}/);
-  assert.match(release, /scripts\/sign-macos-release\.sh/);
+  assert.doesNotMatch(release, /Sign macOS release or qualification identity/);
+  assert.doesNotMatch(release, /HERDR_MACOS_CERT_P12_BASE64/);
+  assert.doesNotMatch(release, /HERDR_MACOS_CERT_PASSWORD/);
+  assert.doesNotMatch(release, /HERDR_MACOS_SIGNING_IDENTITY/);
+  assert.doesNotMatch(release, /HERDR_MACOS_TEAM_ID/);
+  assert.doesNotMatch(release, /scripts\/sign-macos-release\.sh/);
+  // Keep the optional signer available for downstream/private distributions.
   assert.match(signer, /STABLE_IDENTIFIER="dev\.herdr\.mcp"/);
   assert.match(signer, /--options runtime/);
   assert.match(signer, /--timestamp/);
@@ -253,7 +250,7 @@ test("tagged releases and manual qualification require the same stable Developer
   assert.match(signer, /designated requirement is still cdhash-bound/);
 });
 
-test("Rust GitHub Release provenance keeps manual qualification signed and tag-only publish fail-closed", async () => {
+test("Rust GitHub Release provenance keeps manual qualification attested and tag-only publish fail-closed", async () => {
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
   const attestJob = release.indexOf("\n  attest:\n");
   const qualificationJob = release.indexOf("\n  qualification:\n");
@@ -303,7 +300,7 @@ test("Rust GitHub Release provenance keeps manual qualification signed and tag-o
   assert.match(publish, /release_flags\+=\(--prerelease\)/, "semver prereleases must be marked as GitHub prereleases");
   assert.match(qualification, /needs: attest/);
   assert.match(qualification, /if: github\.event_name == 'workflow_dispatch'/);
-  assert.match(qualification, /Verify signed qualification source identity/);
+  assert.match(qualification, /Verify qualification source identity/);
   assert.match(qualification, /qualification source_commit does not match dispatched commit/);
   assert.match(qualification, /qualification source_ref does not match dispatched ref/);
   assert.match(qualification, /qualification mode refuses a tag ref/);
