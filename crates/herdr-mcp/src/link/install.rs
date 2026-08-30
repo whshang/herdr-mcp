@@ -21,6 +21,9 @@ use plist::{Dictionary, Value as PlistValue};
 #[cfg(target_os = "macos")]
 use serde_json::{Value, json};
 
+use crate::config::Config;
+use crate::instance::InstanceId;
+
 use super::ownership::{LINK_LABEL, LINK_PROD_LABEL};
 use super::run::{MACOS_DEFAULT_EDGE_URL, MACOS_LINK_KEYCHAIN_SERVICE};
 
@@ -268,7 +271,7 @@ pub fn encode_candidate_plist(
 
 /// Default non-secret env for the candidate LaunchAgent.
 pub fn default_candidate_env() -> BTreeMap<String, String> {
-    BTreeMap::from([
+    let mut env = BTreeMap::from([
         (
             "HERDR_EDGE_URL".to_owned(),
             MACOS_DEFAULT_EDGE_URL.to_owned(),
@@ -285,7 +288,39 @@ pub fn default_candidate_env() -> BTreeMap<String, String> {
             "PATH".to_owned(),
             "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_owned(),
         ),
-    ])
+    ]);
+    env.extend(inherited_proxy_env());
+    env
+}
+
+pub(crate) fn inherited_proxy_env() -> BTreeMap<String, String> {
+    const KEYS: [&str; 8] = [
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+        "no_proxy",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ];
+    let mut out = BTreeMap::new();
+    for key in KEYS {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                out.insert(key.to_owned(), value.to_owned());
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn configured_edge_ws_url(home: &Path) -> Option<String> {
+    let path = home.join(".config").join("herdr-mcp").join("config.toml");
+    Config::load_for_instance(&path, &InstanceId::default_instance())
+        .ok()
+        .and_then(|config| config.edge_ws_url().ok().flatten())
 }
 
 pub fn candidate_plist_path(home: &Path) -> PathBuf {
@@ -374,7 +409,10 @@ fn home_dir() -> Option<PathBuf> {
 fn install_candidate(home: &Path) -> Result<Value, String> {
     assert_not_protected_mutation(LINK_RUST_CANDIDATE_LABEL)?;
     let program = candidate_program_arguments(home)?;
-    let env = default_candidate_env();
+    let mut env = default_candidate_env();
+    if let Some(edge_url) = configured_edge_ws_url(home) {
+        env.insert("HERDR_EDGE_URL".to_owned(), edge_url);
+    }
     let edge_url = env
         .get("HERDR_EDGE_URL")
         .cloned()

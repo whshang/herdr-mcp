@@ -306,10 +306,16 @@ pub fn evaluate_production_ready_gates(
         && program_points_at_managed_runtime(&prod.program_arguments, home);
     let checkout_refused =
         !prod.present || !program_points_at_repo_checkout(&prod.program_arguments);
-    let generation_ok = active
-        .as_deref()
-        .or(desired.as_deref())
-        .is_some_and(generation_looks_rust_compatible);
+    let generation_ok = match (desired.as_deref(), active.as_deref()) {
+        (Some(desired), Some(active)) => {
+            desired == active
+                && generation_looks_rust_compatible(desired)
+                && generation_looks_rust_compatible(active)
+        }
+        (Some(desired), None) => generation_looks_rust_compatible(desired),
+        (None, Some(active)) => generation_looks_rust_compatible(active),
+        (None, None) => false,
+    };
 
     let user_cli = home.join(".local").join("bin").join("herdr-mcp");
     let user_cli_ok = user_cli_points_at_managed_runtime(&user_cli, home);
@@ -652,6 +658,18 @@ mod tests {
         assert!(generation_looks_rust_compatible("rust-7ef4a3f7b328c3d2"));
         assert!(generation_looks_rust_compatible("local-mcp-active"));
         assert!(generation_looks_rust_compatible("0.4.0-alpha.9"));
+        let current = |desired: Option<&str>, active: Option<&str>| match (desired, active) {
+            (Some(desired), Some(active)) => {
+                desired == active
+                    && generation_looks_rust_compatible(desired)
+                    && generation_looks_rust_compatible(active)
+            }
+            (Some(desired), None) => generation_looks_rust_compatible(desired),
+            (None, Some(active)) => generation_looks_rust_compatible(active),
+            (None, None) => false,
+        };
+        assert!(current(Some("rust-current"), Some("rust-current")));
+        assert!(!current(Some("rust-desired"), Some("rust-stale")));
     }
 
     #[test]

@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use super::cutover::{Precondition, prod_plist_backup_path};
 use super::install::{
     LINK_RUST_CANDIDATE_LABEL, assert_safe_candidate_program, candidate_program_arguments,
+    configured_edge_ws_url, inherited_proxy_env,
 };
 use super::ownership::{
     LINK_LABEL, LINK_PROD_LABEL, LinkAgentView, LinkImplementation, classify_program_arguments,
@@ -496,7 +497,20 @@ pub fn encode_prod_rust_plist(
             env_keys.push(key.clone());
         }
     }
+    if let Some(edge_url) = configured_edge_ws_url(home) {
+        env_out.insert("HERDR_EDGE_URL".to_owned(), PlistValue::String(edge_url));
+        if !env_keys.iter().any(|key| key == "HERDR_EDGE_URL") {
+            env_keys.push("HERDR_EDGE_URL".to_owned());
+        }
+    }
+    for (key, value) in inherited_proxy_env() {
+        if !env_out.contains_key(&key) {
+            env_out.insert(key.clone(), PlistValue::String(value));
+            env_keys.push(key);
+        }
+    }
     env_keys.sort();
+    env_keys.dedup();
 
     // Point generation label at the managed rust generation when available.
     if let Ok(target) = fs::read_link(
@@ -854,12 +868,21 @@ mod tests {
     fn encode_preserves_keychain_service_and_strips_embedded_token() {
         let home = test_home();
         setup_managed_runtime(&home);
+        let config_dir = home.join(".config/herdr-mcp");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            "[edge]\npublic_origin = \"https://herdr-mcp.agentforme.cc.cd\"\n",
+        )
+        .unwrap();
         let program = candidate_program_arguments(&home).unwrap();
         let (bytes, keys) =
             encode_prod_rust_plist(&home, &node_prod_plist_xml(&home), &program).unwrap();
         let xml = String::from_utf8_lossy(&bytes);
         assert!(xml.contains("runtime/current/herdr-mcp"));
         assert!(xml.contains("herdr-edge-prod-link-secret"));
+        assert!(xml.contains("wss://herdr-mcp.agentforme.cc.cd/ws"));
+        assert!(!xml.contains("wss://herdr-edge-prod.example/ws"));
         assert!(!xml.contains("should-be-stripped"));
         assert!(keys.contains(&"HERDR_LINK_KEYCHAIN_SERVICE".to_owned()));
         assert!(!keys.iter().any(|key| key == "HERDR_MCP_TOKEN"));

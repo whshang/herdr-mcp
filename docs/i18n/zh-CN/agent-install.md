@@ -10,7 +10,7 @@
 
 1. 能自动化的 shell 步骤直接执行；只在 Cloudflare 交互登录 / API Token 创建，或多个 Account 选择时暂停。
 2. 不破坏已有工作。禁止对无关 checkout 做 `reset --hard`、`clean -fd` 或覆盖用户修改。
-3. 首次安装只用 `workers.dev`。不要创建 Custom Domain、DNS、Cloudflare Tunnel，也不要改已有 zone。
+3. 首次安装就确定一个 canonical public origin，并让 Worker OAuth、MCP、Link WSS 全部使用同一个入口。`workers.dev` 仍是无需 DNS 的 bootstrap 路径；用户已有自定义域名，或工作站网络对 `workers.dev` 不稳定（例如中国大陆）时，从第一次部署就使用 Custom Domain。没有用户明确意图时，不创建或修改 Custom Domain/DNS zone。
 4. Cloudflare Token 是高敏凭据。禁止回显或写入仓库、`.env`、普通日志、截图、shell history。优先进程环境注入；若必须落临时文件，用 mode `0600` 并在部署后立刻删除。
 5. 每个 mutation 后先验证再继续。出错时先判断 mutation 是否已经提交，再决定是否重试。
 6. **不要**用 clone 本仓库或 `npm`/`cargo` 安装本机 MCP runtime，除非用户明确要求贡献者/从源码开发会话。

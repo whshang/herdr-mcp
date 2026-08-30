@@ -69,16 +69,15 @@ herdr-mcp status
 
 ## 步骤 2 — 选择公网 Edge URL 策略
 
-部署 Edge 前先决定 ChatGPT 如何访问工作站:
+部署 Edge 前先确定一个 canonical public origin，OAuth、MCP、Link WSS 后续都引用同一个入口:
 
 ```text
-你是否有可指向 Cloudflare 的自有域名?
-  ├─ 有 → 优先用自定义域名作为 Connector URL
+你是否已有可指向 Cloudflare 的自有域名，或当前网络对 workers.dev 不稳定?
+  ├─ 是 → 从第一次部署就使用自定义域名
   │       示例 MCP URL: https://herdr-mcp.example.com/mcp
   │       见下文「自定义域名路径」
-  └─ 无 → 首次安装用 workers.dev
+  └─ 否 → 使用 workers.dev 作为无需 DNS 的 bootstrap
             示例 MCP URL: https://herdr-edge-device.username.workers.dev/mcp
-            中国/受限网络还需配置 Link 代理 (见下文)
 ```
 
 | 场景 | 推荐公网 origin | ChatGPT Connector URL |
@@ -128,7 +127,11 @@ MCP_URL=${EDGE_ORIGIN}/mcp
 3. 在 `wrangler.user.toml` 设置 `OAUTH_ISSUER=https://herdr-mcp.example.com`
 4. 重新部署, 记录 `MCP_URL=https://herdr-mcp.example.com/mcp`
 
-issuer 与 Connector URL 必须同一 origin。
+issuer 与 Connector URL 必须同一 origin。确定最终 `EDGE_ORIGIN` 后立即写入 herdr-mcp 实例配置，后续生成或重建 LaunchAgent 时统一派生同一个 WSS 入口：
+
+```bash
+herdr-mcp config set-edge-origin "$EDGE_ORIGIN"
+```
 
 ## 步骤 5 — 安装 Herdr Link (含网络/中国说明)
 
