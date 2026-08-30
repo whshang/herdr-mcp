@@ -1193,7 +1193,29 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         let fake_rg = root.join("rg");
-        fs::write(&fake_rg, "#!/bin/sh\nsleep 30\n").unwrap();
+        // `wait_bounded` starts its window at spawn, so the window covers the
+        // child's fork/exec + dash startup. A 30ms window raced that startup on
+        // loaded CI runners: the timeout SIGTERM landed while the child was
+        // still `/bin/sh`, the shell died by signal before `exec sleep`, and
+        // the outcome was misclassified as Unavailable instead of TimedOut.
+        //
+        // The fake rg therefore makes premature termination benign and its
+        // progress observable:
+        // - `trap '' TERM` keeps a startup-phase SIGTERM from killing the
+        //   child, so only a genuine timeout can end it (and the production
+        //   TERM -> grace -> SIGKILL -> reap chain is exercised for real);
+        // - `$0.started` records that the script actually reached its
+        //   long-running state, turning any residual race into a named
+        //   failure instead of a silent classification flip;
+        // - `exec /bin/sleep 30` uses an absolute path so no PATH mutation
+        //   can turn the run into a fast exit-code failure.
+        // The window is sized orders of magnitude above worst-case startup
+        // latency; beating it would require a multi-second scheduling stall.
+        fs::write(
+            &fake_rg,
+            "#!/bin/sh\ntrap '' TERM\n: > \"$0.started\"\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
         fs::set_permissions(&fake_rg, fs::Permissions::from_mode(0o755)).unwrap();
 
         let outcome = try_grep_rg(&GrepRgOptions {
@@ -1205,11 +1227,19 @@ mod tests {
             glob: None,
             max_matches: 10,
             max_bytes: 1024,
-            timeout: Duration::from_millis(30),
+            timeout: Duration::from_secs(2),
         });
+        let started = root.join("rg.started");
         let GrepRgOutcome::TimedOut { pid } = outcome else {
-            panic!("expected timed-out fake rg");
+            panic!(
+                "expected timed-out fake rg (script_started={})",
+                started.exists()
+            );
         };
+        assert!(
+            started.is_file(),
+            "fake rg never reached its long-running state before the timeout"
+        );
         assert!(unsafe { libc::kill(pid as i32, 0) } != 0);
         fs::remove_dir_all(root).unwrap();
     }
