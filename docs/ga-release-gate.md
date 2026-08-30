@@ -1,7 +1,7 @@
 # herdr-mcp GA Release Gate
 
 状态：`v0.4.0` stable 已发布（2026-08-28）；stable-channel G9/G10 PASS；G20–G22 docs freeze PASS；**G4** 第二台 Mac 从 stable Release 干净安装 **PASS**（pi-ga-20260828）；**仍未 declare GA**（G25 及其他 PARTIAL 门禁见 scorecard）
-本文件是 **第一版 GA 判定的唯一事实源（SSOT）**。当前已发布 Rust runtime stable 仍是 `v0.4.1`；`v0.4.2` source candidate 已合入，并在发布前 candidate UAT 中补齐了 `0.4.1 -> 0.4.2` legacy Dev Native Host wrapper 的 fail-closed updater 迁移。当前 patch-line 的剩余 macOS gate 是稳定权限 broker 在真实 launchd + runtime generation swap 下的受保护目录验收。manual Rust Release 只生成**不会发布**的 build/attestation qualification bundle；该路径 PASS 后才允许创建 immutable `v0.4.2` tag，由 tag-push path 发布。本文件保留 `v0.4.0` 首次 stable / GA closure 的历史门禁事实，浏览器 Store/G15 仍按真实状态继续收口。架构演进细节见 [`herdr-architecture-roadmap.md`](./herdr-architecture-roadmap.md)。
+本文件是 **第一版 GA 判定的唯一事实源（SSOT）**。当前已发布 Rust runtime stable 仍是 `v0.4.1`；`v0.4.2` source candidate 已合入但**尚未 tag**（当前源码 `state_schema` **5**；下文 `v0.4.0` / alpha 证据表中的 schema 4 是历史快照，不改写），并在发布前 candidate UAT 中补齐了 `0.4.1 -> 0.4.2` legacy Dev Native Host wrapper 的 fail-closed updater 迁移。稳定 TCC broker 已完成跨 generation 授权验证；Apple Developer ID 仅为 optional hardening。tag 前仍需 exact-final-source Rust Release qualification、final Artifact Relay/R2 deploy-import-readback UAT、PR #199 / generic relay 收敛、pane-session PR #200 合入；若最终纳入 `continuity.search` 则完成其集成。manual Rust Release 只生成**不会发布**的 build/attestation qualification bundle；该路径 PASS 后才允许创建 immutable `v0.4.2` tag，由 tag-push path 发布。本文件保留 `v0.4.0` 首次 stable / GA closure 的历史门禁事实，浏览器 Store/G15 仍按真实状态继续收口。架构演进细节见 [`herdr-architecture-roadmap.md`](./herdr-architecture-roadmap.md)。
 
 ## GA 定义
 

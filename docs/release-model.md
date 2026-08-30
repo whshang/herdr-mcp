@@ -27,18 +27,21 @@ An extension-only change must **not** force a Rust runtime version bump. Maintai
 
 **User-facing version** = Runtime Release version (`herdr-mcp --version`, README, install docs). `package.json` remains site/extension build tooling — **not** the runtime product version (G1).
 
-### Pre-tag macOS protected-folder qualification
+### macOS permissions broker (completed)
 
-macOS protected-folder access uses a stable local permissions broker whose identity is independent of `runtime/current`. When a project lives in a protected location such as `~/Documents`, the user grants that fixed broker the required macOS privacy access once; rotating runtime generations reuse it.
+macOS protected-folder access uses a stable local TCC broker whose identity is independent of `runtime/current`. When a project lives in a protected location such as `~/Documents`, the user grants that fixed broker the required macOS privacy access once; rotating runtime generations reuse it. Cross-generation authorization reuse has been verified. Apple Developer ID signing and notarization remain **optional hardening**, not a v0.4.2 release gate.
 
-Before creating the version tag:
+### Pre-tag remaining gates (`v0.4.2`)
 
-1. manually dispatch **Rust Release** on the exact source ref intended for release; require verify → build → manifest → attest → qualification PASS and confirm the `publish` job is skipped;
-2. run the macOS candidate through the real launchd-managed path and repeat the protected-folder probe that previously failed: a linked worktree outside `~/Documents` whose common Git dir is inside `~/Documents`, plus `herdr_git status`, `herdr_fs_read`, `herdr_fs_patch dry_run`, and bounded exec;
-3. where direct launchd access is denied by TCC, verify the stable broker path completes the same managed-root operation while preserving all existing path/secret/dirty/busy gates;
-4. apply a new runtime generation and repeat the probes without replacing the stable broker. Runtime generation churn must not require a new macOS privacy grant;
-5. retain the qualification evidence, then create the immutable `v*` tag pointing to the exact `release_identity.source_commit` recorded by the qualified manifest. The tag-push run independently rebuilds and attests the same source and is the only path allowed to publish;
-6. after publication, perform the normal stable-channel `update apply` / rollback dogfood and confirm broker/runtime/Native Host/service invariants before declaring patch-line closure.
+`v0.4.2` is **not tagged**. Do not describe it as published. Before creating the version tag:
+
+1. manually dispatch **Rust Release** on the **exact final source** intended for release; require verify → build → manifest → attest → qualification PASS and confirm the `publish` job is skipped;
+2. complete final Artifact Relay / R2 deploy-import-readback UAT;
+3. land PR #199 / generic relay convergence;
+4. land pane-session PR #200;
+5. if `continuity.search` is included in the release, finish its integration first; if it is not included, do not document it as a shipped capability;
+6. retain the qualification evidence, then create the immutable `v*` tag pointing to the exact `release_identity.source_commit` recorded by the qualified manifest. The tag-push run independently rebuilds and attests the same source and is the only path allowed to publish;
+7. after publication, perform the normal stable-channel `update apply` / rollback dogfood and confirm broker/runtime/Native Host/service invariants before declaring patch-line closure.
 
 A workflow-dispatch artifact is qualification evidence only. Its manifest preserves the actual branch/ref and commit provenance; it is not discoverable by the updater and must never be presented as a published stable or preview Release.
 
@@ -62,8 +65,8 @@ Installed generations are content-addressed (`rust-<sha256-prefix>`). Update app
 
 | Artifact | Version | Notes |
 | --- | --- | --- |
-| Runtime binary | `0.4.1` published / `0.4.2` source-ready | `0.4.2` still needs the protected-folder stable-broker qualification before tagging |
-| Browser extension source | `0.1.77` | Current development source; Chrome Web Store published/review version may lag and must be checked independently |
+| Runtime binary | `0.4.1` published / `0.4.2` source candidate | `v0.4.2` is not tagged. Stable TCC broker cross-generation authorization is verified; Developer ID is optional hardening. Remaining before tag: exact-final-source Rust Release qualification, final Artifact Relay/R2 deploy-import-readback UAT, PR #199 / generic relay convergence, pane-session PR #200, and `continuity.search` integration only if that capability is included |
+| Browser extension source | `0.1.80` | Current development source; Chrome Web Store published/review version may lag and must be checked independently |
 | Native Messaging host | Managed by runtime generation | `native-host status` must show `runtime_matches_current=true` |
 
 ## Contract Compatibility (shared public surface)
@@ -71,7 +74,7 @@ Installed generations are content-addressed (`rust-<sha256-prefix>`). Update app
 These must stay aligned across Edge, Link, and runtime for a given **contract epoch**:
 
 - MCP tool catalog (GA: epoch **2**, **18 tools**)
-- `state_schema` in release manifest (currently **4**)
+- `state_schema` in release manifest (currently **5**)
 - OAuth issuer / MCP endpoint behavior on public Edge
 - Link `production_ready` seal and health `runtime=rust` when production Link is Rust
 

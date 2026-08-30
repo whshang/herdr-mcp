@@ -36,7 +36,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 
 ## 支持平台
 
-当前已发布的 stable runtime 仍是 **`v0.4.1`**。`v0.4.2` source candidate 正在完成稳定权限 broker 的 macOS 受保护目录验收，runtime generation 升级后继续复用同一权限身份。最充分的 clean-machine qualification 证据仍来自 `v0.4.0` 的 **macOS Apple Silicon** 验收。Windows x64 Release binary 已提供，但 Windows 端到端 UAT 仍在继续；Linux runtime 暂不作为当前 stable 的正式支持面承诺。
+当前已发布的 stable runtime 仍是 **`v0.4.1`**。`v0.4.2` source candidate **尚未 tag**。稳定 TCC broker 已完成跨 generation 授权验证；Apple Developer ID 仅为可选加固。macOS 上用 `herdr-mcp permissions setup` 准备 broker，用 `herdr-mcp permissions verify` 检查访问。最充分的 clean-machine qualification 证据仍来自 `v0.4.0` 的 **macOS Apple Silicon** 验收。Windows x64 Release binary 已提供，但 Windows 端到端 UAT 仍在继续；Linux runtime 暂不作为当前 stable 的正式支持面承诺。
 
 ## 第一步：安装原生 herdr-mcp runtime
 
