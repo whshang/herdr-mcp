@@ -74,9 +74,9 @@ const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.79", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.79"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.79"'), "content version matches manifest");
+ok(manifest.version === "0.1.80", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.80"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.80"'), "content version matches manifest");
 const ownerGateIndex = wakeSource.indexOf('type: "h2w_extension_owner_status"');
 const queueOwnerClaimIndex = wakeSource.indexOf('setAttribute(QUEUED_INSERT_OWNER_ATTR');
 ok(ownerGateIndex >= 0
