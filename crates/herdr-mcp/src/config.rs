@@ -2,6 +2,7 @@ use crate::instance::InstanceId;
 use semver::Version;
 use std::fs;
 use std::path::Path;
+use url::Url;
 
 pub const DEFAULT_RUNTIME_PORT: u16 = 8772;
 pub const DEFAULT_DEV_PORT: u16 = 8872;
@@ -36,6 +37,7 @@ pub struct Config {
     pub dev_port: u16,
     pub update_channel: UpdateChannel,
     pub update_check: bool,
+    pub edge_public_origin: Option<String>,
 }
 
 impl Default for Config {
@@ -45,6 +47,7 @@ impl Default for Config {
             dev_port: DEFAULT_DEV_PORT,
             update_channel: UpdateChannel::Stable,
             update_check: true,
+            edge_public_origin: None,
         }
     }
 }
@@ -84,13 +87,36 @@ impl Config {
     }
 
     pub fn render(&self) -> String {
-        format!(
+        let mut rendered = format!(
             "[runtime]\nport = {}\n\n[dev]\nport = {}\n\n[update]\nchannel = \"{}\"\ncheck = {}\n",
             self.runtime_port,
             self.dev_port,
             self.update_channel.as_str(),
             self.update_check
-        )
+        );
+        if let Some(origin) = &self.edge_public_origin {
+            rendered.push_str(&format!("\n[edge]\npublic_origin = \"{origin}\"\n"));
+        }
+        rendered
+    }
+
+    pub fn set_edge_public_origin(&mut self, origin: &str) -> Result<(), String> {
+        self.edge_public_origin = Some(normalize_edge_public_origin(origin)?);
+        Ok(())
+    }
+
+    pub fn edge_ws_url(&self) -> Result<Option<String>, String> {
+        let Some(origin) = &self.edge_public_origin else {
+            return Ok(None);
+        };
+        let mut url =
+            Url::parse(origin).map_err(|error| format!("invalid edge public origin: {error}"))?;
+        url.set_scheme("wss")
+            .map_err(|_| "edge public origin must use https://".to_owned())?;
+        url.set_path("/ws");
+        url.set_query(None);
+        url.set_fragment(None);
+        Ok(Some(url.to_string()))
     }
 }
 
@@ -107,7 +133,7 @@ fn parse(content: &str) -> Result<Config, String> {
         if line.starts_with('[') && line.ends_with(']') {
             section = line[1..line.len() - 1].trim();
             match section {
-                "runtime" | "dev" | "update" => continue,
+                "runtime" | "dev" | "update" | "edge" => continue,
                 _ => return Err(format!("line {line_number}: unknown section [{section}]")),
             }
         }
@@ -143,12 +169,37 @@ fn parse(content: &str) -> Result<Config, String> {
                     }
                 }
             }
+            ("edge", "public_origin") => {
+                config.edge_public_origin = Some(normalize_edge_public_origin(unquote(value))?)
+            }
             ("", _) => return Err(format!("line {line_number}: keys must be inside a section")),
             _ => return Err(format!("line {line_number}: unknown key {section}.{key}")),
         }
     }
 
     Ok(config)
+}
+
+fn normalize_edge_public_origin(value: &str) -> Result<String, String> {
+    let mut url =
+        Url::parse(value).map_err(|error| format!("edge.public_origin is invalid: {error}"))?;
+    if url.scheme() != "https" {
+        return Err("edge.public_origin must use https://".to_owned());
+    }
+    if url.host_str().is_none() {
+        return Err("edge.public_origin must include a host".to_owned());
+    }
+    if url.username() != "" || url.password().is_some() {
+        return Err("edge.public_origin must not include credentials".to_owned());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("edge.public_origin must not include query or fragment".to_owned());
+    }
+    if url.path() != "/" && !url.path().is_empty() {
+        return Err("edge.public_origin must not include a path".to_owned());
+    }
+    url.set_path("");
+    Ok(url.to_string().trim_end_matches('/').to_owned())
 }
 
 fn parse_port(value: &str, line_number: usize) -> Result<u16, String> {
@@ -198,6 +249,7 @@ mod tests {
         assert_eq!(Config::default().dev_port, 8872);
         assert_eq!(Config::default().update_channel, UpdateChannel::Stable);
         assert!(Config::default().update_check);
+        assert_eq!(Config::default().edge_public_origin, None);
     }
 
     #[test]
@@ -233,6 +285,9 @@ mod tests {
             [update]
             channel = "preview"
             check = false
+
+            [edge]
+            public_origin = "https://herdr.example.com"
             "#,
         )
         .unwrap();
@@ -241,6 +296,14 @@ mod tests {
         assert_eq!(config.dev_port, 9001);
         assert_eq!(config.update_channel, UpdateChannel::Preview);
         assert!(!config.update_check);
+        assert_eq!(
+            config.edge_public_origin.as_deref(),
+            Some("https://herdr.example.com")
+        );
+        assert_eq!(
+            config.edge_ws_url().unwrap().as_deref(),
+            Some("wss://herdr.example.com/ws")
+        );
     }
 
     #[test]
@@ -248,6 +311,7 @@ mod tests {
         assert!(parse("port = 1").is_err());
         assert!(parse("[runtime]\nport = 0").is_err());
         assert!(parse("[update]\nchannel = \"nightly\"").is_err());
+        assert!(parse("[edge]\npublic_origin = \"http://example.com\"").is_err());
         assert!(parse("[unknown]\nvalue = 1").is_err());
     }
 
@@ -258,6 +322,7 @@ mod tests {
             dev_port: 9001,
             update_channel: UpdateChannel::Preview,
             update_check: false,
+            edge_public_origin: Some("https://herdr.example.com".to_owned()),
         };
         assert_eq!(parse(&config.render()).unwrap(), config);
     }

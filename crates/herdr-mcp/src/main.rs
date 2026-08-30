@@ -129,7 +129,7 @@ fn run() -> Result<ExitCode, String> {
                         config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
                     print!("{}", config.render());
                 }
-                cli::ConfigCommand::Init => {
+                cli::ConfigCommand::Init { edge_origin } => {
                     if paths.config_file.exists() {
                         return Err(format!(
                             "config already exists: {}",
@@ -142,17 +142,36 @@ fn run() -> Result<ExitCode, String> {
                             paths.config_dir.display()
                         )
                     })?;
-                    std::fs::write(
-                        &paths.config_file,
-                        config::Config::missing_file_default_for_instance(&paths.instance).render(),
-                    )
-                    .map_err(|error| {
+                    let mut config =
+                        config::Config::missing_file_default_for_instance(&paths.instance);
+                    if let Some(origin) = edge_origin {
+                        config.set_edge_public_origin(&origin)?;
+                    }
+                    std::fs::write(&paths.config_file, config.render()).map_err(|error| {
                         format!(
                             "cannot write config {}: {error}",
                             paths.config_file.display()
                         )
                     })?;
                     println!("created {}", paths.config_file.display());
+                }
+                cli::ConfigCommand::SetEdgeOrigin { edge_origin } => {
+                    std::fs::create_dir_all(&paths.config_dir).map_err(|error| {
+                        format!(
+                            "cannot create config directory {}: {error}",
+                            paths.config_dir.display()
+                        )
+                    })?;
+                    let mut config =
+                        config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
+                    config.set_edge_public_origin(&edge_origin)?;
+                    std::fs::write(&paths.config_file, config.render()).map_err(|error| {
+                        format!(
+                            "cannot write config {}: {error}",
+                            paths.config_file.display()
+                        )
+                    })?;
+                    println!("updated {}", paths.config_file.display());
                 }
             }
             Ok(ExitCode::SUCCESS)

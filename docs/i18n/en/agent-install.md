@@ -10,7 +10,7 @@ This is an execution contract for a **local coding Agent**, not a list of comman
 
 1. Execute work directly; do not offload automatable shell steps to the human. Pause only for Cloudflare interactive login/API-Token creation or selection among multiple Cloudflare Accounts.
 2. Preserve existing work. Never `reset --hard`, `clean -fd`, or overwrite user changes in an unrelated checkout.
-3. First install uses `workers.dev` only. Do not create a Custom Domain, DNS record, Cloudflare Tunnel, or mutate an existing zone.
+3. Choose one canonical public origin during the first install and keep it consistent across Worker OAuth, MCP, and Link WSS. `workers.dev` remains the zero-DNS bootstrap path; use a Custom Domain from the start when the user already owns one or when `workers.dev` is unreliable on the workstation network (for example mainland China). Do not create or mutate a Custom Domain/DNS zone without explicit user intent.
 4. Treat the Cloudflare Token as a high-sensitivity credential. Never echo it or write it to the repo, `.env`, ordinary logs, screenshots, or shell history. Prefer process-environment injection; if a temporary file is unavoidable, use mode `0600` and delete it immediately after deployment.
 5. Verify every mutation before continuing. On an error, determine whether the mutation already committed before retrying.
 6. Do **not** install the local MCP runtime by cloning this repository or running `npm`/`cargo` unless the human explicitly asked for a contributor/from-source session.

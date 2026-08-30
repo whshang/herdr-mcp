@@ -84,11 +84,11 @@ The normal user path must not depend on a git checkout.
 
 ## Step 2 — choose the public Edge URL strategy
 
-Use the simplest safe path for the first installation:
+Choose one canonical public origin during the first installation and keep it for OAuth, MCP, and Link WSS:
 
-- no intentional custom-domain requirement → use `workers.dev`;
-- user explicitly owns and wants to use a Cloudflare-managed domain → a custom domain may be configured;
-- if `workers.dev` connectivity is blocked, first use the Link proxy support described below before expanding DNS scope.
+- `workers.dev` is the zero-DNS bootstrap path when it is reachable from the workstation network;
+- use a Custom Domain from the start when the user already owns one or when `workers.dev` is unreliable/blocked on the workstation network (for example mainland China);
+- use Link proxy support when the selected origin still requires the workstation's existing proxy path.
 
 Example Connector URLs:
 
@@ -130,7 +130,11 @@ HERDR_EDGE_URL=wss://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev/ws
 MCP_URL=<EDGE_ORIGIN>/mcp
 ```
 
-If a custom domain is intentionally selected, the OAuth issuer and Connector URL must use the same origin.
+If a custom domain is intentionally selected, the OAuth issuer and Connector URL must use the same origin. Persist the selected origin before installing/reloading Link so every generated LaunchAgent derives the same WSS endpoint:
+
+```bash
+herdr-mcp config set-edge-origin "$EDGE_ORIGIN"
+```
 
 ## Step 5 — install the Herdr Link
 

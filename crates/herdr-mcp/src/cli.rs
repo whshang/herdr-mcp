@@ -68,7 +68,8 @@ pub enum LinkCommand {
 pub enum ConfigCommand {
     Path,
     Show,
-    Init,
+    Init { edge_origin: Option<String> },
+    SetEdgeOrigin { edge_origin: String },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -441,9 +442,24 @@ fn parse_config(args: &[String]) -> Result<Command, String> {
         [] => Ok(Command::Config(ConfigCommand::Show)),
         [subcommand] if subcommand == "path" => Ok(Command::Config(ConfigCommand::Path)),
         [subcommand] if subcommand == "show" => Ok(Command::Config(ConfigCommand::Show)),
-        [subcommand] if subcommand == "init" => Ok(Command::Config(ConfigCommand::Init)),
+        [subcommand] if subcommand == "init" => {
+            Ok(Command::Config(ConfigCommand::Init { edge_origin: None }))
+        }
+        [subcommand, flag, origin] if subcommand == "init" && flag == "--edge-origin" => {
+            Ok(Command::Config(ConfigCommand::Init {
+                edge_origin: Some(origin.clone()),
+            }))
+        }
+        [subcommand, origin] if subcommand == "set-edge-origin" => {
+            Ok(Command::Config(ConfigCommand::SetEdgeOrigin {
+                edge_origin: origin.clone(),
+            }))
+        }
         [subcommand] => Err(format!("unknown config command '{subcommand}'")),
-        _ => Err("config accepts exactly one subcommand: path, show, or init".to_owned()),
+        _ => Err(
+            "config accepts path, show, init [--edge-origin https://host], or set-edge-origin https://host"
+                .to_owned(),
+        ),
     }
 }
 
@@ -667,7 +683,7 @@ Same-machine UAT isolation (optional):\n\
   ~/.config/herdr-mcp-<name>. They never rewrite ~/.local/bin/herdr-mcp.\n\n\
 Advanced / internal:\n\
   herdr-mcp version\n\
-  herdr-mcp config [path|show|init]\n\
+  herdr-mcp config [path|show|init [--edge-origin https://host]|set-edge-origin https://host]\n\
   herdr-mcp service <install [--adopt-node]|status|start|stop|restart|rollback|uninstall>\n\
   herdr-mcp herdr-supervisor <install|status|enable|disable|start|stop|uninstall>\n\
   herdr-mcp link status\n\
@@ -746,6 +762,31 @@ mod tests {
         assert_eq!(
             parse(args(&["config", "show"])).unwrap().command,
             Command::Config(ConfigCommand::Show)
+        );
+        assert_eq!(
+            parse(args(&[
+                "config",
+                "init",
+                "--edge-origin",
+                "https://herdr.example.com",
+            ]))
+            .unwrap()
+            .command,
+            Command::Config(ConfigCommand::Init {
+                edge_origin: Some("https://herdr.example.com".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "config",
+                "set-edge-origin",
+                "https://herdr.example.com",
+            ]))
+            .unwrap()
+            .command,
+            Command::Config(ConfigCommand::SetEdgeOrigin {
+                edge_origin: "https://herdr.example.com".to_owned(),
+            })
         );
         assert_eq!(
             parse(args(&["dev", "--dry-run"])).unwrap().command,

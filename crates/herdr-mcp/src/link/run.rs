@@ -10,6 +10,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use crate::config::Config;
+use crate::paths::RuntimePaths;
+
 use super::daemon::{
     DaemonConfigError, LinkDaemonConfig, read_link_daemon_config, run_link_daemon,
 };
@@ -19,7 +22,9 @@ use super::daemon::{
 /// Node canary still uses `herdr-edge-dev-link-secret` against edge-dev. Rust
 /// `link run` requires public contract epoch 2, so defaults follow edge-prod.
 pub const MACOS_LINK_KEYCHAIN_SERVICE: &str = "herdr-edge-prod-link-secret";
-/// Default Edge WSS URL for Rust Link (must publish contract epoch 2).
+/// Legacy fallback Edge WSS URL for Rust Link when no instance-specific
+/// canonical public origin has been configured yet. New installations should
+/// persist `[edge].public_origin` during setup instead of relying on this.
 pub const MACOS_DEFAULT_EDGE_URL: &str = "wss://herdr-edge-prod.whshang.workers.dev/ws";
 /// Default workstation id for foreground `link run` without env overrides.
 pub const MACOS_DEFAULT_WORKSTATION_ID: &str = "dev-rust-link-candidate";
@@ -58,9 +63,14 @@ fn enrich_macos_credentials(
     env_map: &mut HashMap<String, String>,
 ) -> Result<(), DaemonConfigError> {
     if optional_trimmed(env_map, "HERDR_EDGE_URL").is_none() {
+        let configured = RuntimePaths::discover().ok().and_then(|paths| {
+            Config::load_for_instance(&paths.config_file, &paths.instance)
+                .ok()
+                .and_then(|config| config.edge_ws_url().ok().flatten())
+        });
         env_map.insert(
             "HERDR_EDGE_URL".to_owned(),
-            MACOS_DEFAULT_EDGE_URL.to_owned(),
+            configured.unwrap_or_else(|| MACOS_DEFAULT_EDGE_URL.to_owned()),
         );
     }
     if optional_trimmed(env_map, "HERDR_WORKSTATION_ID").is_none() {
