@@ -27,6 +27,7 @@ mod herdr_supervisor;
 mod inspect;
 mod instance;
 mod link;
+mod local_skills;
 mod macos_privacy;
 mod mcp;
 mod mcp_http;
