@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -26,7 +26,6 @@ const KILL_GRACE: Duration = Duration::from_millis(1500);
 const OUTPUT_DRAIN_BUDGET: Duration = Duration::from_millis(500);
 const RECOVERY_MAX_ENTRIES: usize = 64;
 const PANE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
-const PANE_READ_LINES: u64 = 10_000;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -68,11 +67,19 @@ enum SessionBackend {
     Pane {
         client: HerdrClient,
         pane_id: String,
-        start_marker: String,
-        done_marker: String,
         script_path: PathBuf,
-        last_output: Mutex<String>,
+        spool: PaneSpoolPaths,
+        stdout_offset: Mutex<u64>,
+        stderr_offset: Mutex<u64>,
     },
+}
+
+#[derive(Debug, Clone)]
+struct PaneSpoolPaths {
+    stdout: PathBuf,
+    stderr: PathBuf,
+    status: PathBuf,
+    status_tmp: PathBuf,
 }
 
 #[derive(Debug)]
@@ -275,9 +282,8 @@ impl ExecRegistry {
             PANE_RPC_TIMEOUT,
         );
         let script_path = pane_script_path(&id);
-        let start_marker = format!("__HM_EXEC_START_{}__", marker_safe_id(&id));
-        let done_marker = format!("__HM_EXEC_DONE_{}__", marker_safe_id(&id));
-        write_pane_script(&script_path, cwd, command, &start_marker, &done_marker)?;
+        let spool = pane_spool_paths(&id);
+        write_pane_script(&script_path, cwd, command, &spool)?;
         let launch_line = format!(
             "{} {}",
             shell_quote(resolve_exec_shell().to_string_lossy().as_ref()),
@@ -288,7 +294,7 @@ impl ExecRegistry {
             json!({"pane_id": pane_id, "text": format!("{launch_line}\n")}),
             PANE_RPC_TIMEOUT,
         ) {
-            let _ = fs::remove_file(&script_path);
+            cleanup_pane_files(&script_path, &spool);
             let _ = client.call_with_timeout(
                 "pane.close",
                 json!({"pane_id": pane_id}),
@@ -306,10 +312,10 @@ impl ExecRegistry {
             backend: SessionBackend::Pane {
                 client,
                 pane_id: pane_id.clone(),
-                start_marker,
-                done_marker,
                 script_path,
-                last_output: Mutex::new(String::new()),
+                spool,
+                stdout_offset: Mutex::new(0),
+                stderr_offset: Mutex::new(0),
             },
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
@@ -767,12 +773,21 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn pane_spool_paths(id: &str) -> PaneSpoolPaths {
+    let base = env::temp_dir().join(format!("herdr-mcp-pane-exec-{}", marker_safe_id(id)));
+    PaneSpoolPaths {
+        stdout: base.with_extension("stdout"),
+        stderr: base.with_extension("stderr"),
+        status: base.with_extension("status"),
+        status_tmp: base.with_extension("status.tmp"),
+    }
+}
+
 fn write_pane_script(
     path: &Path,
     cwd: &Path,
     command: &str,
-    start_marker: &str,
-    done_marker: &str,
+    spool: &PaneSpoolPaths,
 ) -> Result<(), String> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -782,13 +797,22 @@ fn write_pane_script(
         .open(path)
         .map_err(|error| format!("cannot create pane exec script {}: {error}", path.display()))?;
     let body = format!(
-        "#!{}\nset +e\nexport PAGER=cat\nexport GIT_PAGER=cat\nexport GH_PAGER=cat\nexport SYSTEMD_PAGER=cat\nexport MANPAGER=cat\nexport DELTA_PAGER=cat\ntrap 'rm -f -- \"$0\"' EXIT\nprintf '%s' {}\ncd -- {}\ncd_ec=$?\nif [ \"$cd_ec\" -ne 0 ]; then printf '%s%s__' {} \"$cd_ec\"; exit \"$cd_ec\"; fi\n{}\nec=$?\nprintf '%s%s__' {} \"$ec\"\nexit \"$ec\"\n",
+        "#!{}\nset +e\numask 077\nexport PAGER=cat\nexport GIT_PAGER=cat\nexport GH_PAGER=cat\nexport SYSTEMD_PAGER=cat\nexport MANPAGER=cat\nexport DELTA_PAGER=cat\ntrap 'rm -f -- \"$0\"' EXIT\n: > {}\n: > {}\nrm -f -- {} {}\ncd -- {}\ncd_ec=$?\nif [ \"$cd_ec\" -ne 0 ]; then printf '%s\\n' \"$cd_ec\" > {}; mv -f -- {} {}; exit \"$cd_ec\"; fi\n(\n{}\n) > {} 2> {}\nec=$?\nprintf '%s\\n' \"$ec\" > {}\nmv -f -- {} {}\nexit \"$ec\"\n",
         resolve_exec_shell().display(),
-        shell_quote(start_marker),
+        shell_quote(spool.stdout.to_string_lossy().as_ref()),
+        shell_quote(spool.stderr.to_string_lossy().as_ref()),
+        shell_quote(spool.status.to_string_lossy().as_ref()),
+        shell_quote(spool.status_tmp.to_string_lossy().as_ref()),
         shell_quote(cwd.to_string_lossy().as_ref()),
-        shell_quote(done_marker),
+        shell_quote(spool.status_tmp.to_string_lossy().as_ref()),
+        shell_quote(spool.status_tmp.to_string_lossy().as_ref()),
+        shell_quote(spool.status.to_string_lossy().as_ref()),
         command,
-        shell_quote(done_marker),
+        shell_quote(spool.stdout.to_string_lossy().as_ref()),
+        shell_quote(spool.stderr.to_string_lossy().as_ref()),
+        shell_quote(spool.status_tmp.to_string_lossy().as_ref()),
+        shell_quote(spool.status_tmp.to_string_lossy().as_ref()),
+        shell_quote(spool.status.to_string_lossy().as_ref()),
     );
     file.write_all(body.as_bytes())
         .and_then(|_| file.sync_all())
@@ -799,89 +823,81 @@ fn write_pane_script(
     Ok(())
 }
 
-fn read_pane_text(client: &HerdrClient, pane_id: &str) -> Result<String, String> {
-    let result = client
-        .call_with_timeout(
-            "pane.read",
-            json!({
-                "pane_id": pane_id,
-                "source": "recent_unwrapped",
-                "lines": PANE_READ_LINES,
-                "strip_ansi": true,
-            }),
-            PANE_RPC_TIMEOUT,
-        )
-        .map_err(|error| format!("pane.read failed: {error}"))?;
-    let read = result.get("read").unwrap_or(&result);
-    Ok(read
-        .get("content")
-        .and_then(Value::as_str)
-        .or_else(|| read.get("text").and_then(Value::as_str))
-        .or_else(|| read.get("output").and_then(Value::as_str))
-        .unwrap_or("")
-        .to_owned())
+fn drain_spool_file(session: &Arc<Session>, path: &Path, stream: StreamKind, offset: &Mutex<u64>) {
+    let Ok(mut offset) = offset.lock() else {
+        return;
+    };
+    let Ok(mut file) = fs::File::open(path) else {
+        return;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    let end = metadata.len();
+    if end <= *offset {
+        return;
+    }
+    let room = session
+        .buffers
+        .lock()
+        .map(|buffers| match stream {
+            StreamKind::Stdout => MAX_BUFFER_PER_STREAM.saturating_sub(buffers.stdout_bytes),
+            StreamKind::Stderr => MAX_BUFFER_PER_STREAM.saturating_sub(buffers.stderr_bytes),
+        })
+        .unwrap_or(0);
+    let available = end.saturating_sub(*offset);
+    let take = available.min(room as u64) as usize;
+    if take > 0 && file.seek(SeekFrom::Start(*offset)).is_ok() {
+        let mut bytes = vec![0_u8; take];
+        if file.read_exact(&mut bytes).is_ok() {
+            push_chunk(session, stream, &bytes);
+        }
+    }
+    if available > room as u64
+        && let Ok(mut buffers) = session.buffers.lock()
+    {
+        buffers.truncated = true;
+    }
+    *offset = end;
 }
 
-fn pane_command_segment<'a>(
-    raw: &'a str,
-    start_marker: &str,
-    done_marker: &str,
-) -> Option<(&'a str, Option<i32>)> {
-    let start = raw.rfind(start_marker)? + start_marker.len();
-    let after = &raw[start..];
-    let Some(done) = after.find(done_marker) else {
-        return Some((after, None));
-    };
-    let body = &after[..done];
-    let suffix = &after[done + done_marker.len()..];
-    let digits = suffix
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    let exit_code = (!digits.is_empty() && suffix[digits.len()..].starts_with("__"))
-        .then(|| digits.parse::<i32>().ok())
-        .flatten();
-    Some((body, exit_code))
+fn read_pane_exit_code(path: &Path) -> Option<i32> {
+    let raw = fs::read_to_string(path).ok()?;
+    raw.trim().parse::<i32>().ok()
+}
+
+fn cleanup_pane_files(script_path: &Path, spool: &PaneSpoolPaths) {
+    for path in [
+        script_path,
+        spool.stdout.as_path(),
+        spool.stderr.as_path(),
+        spool.status.as_path(),
+        spool.status_tmp.as_path(),
+    ] {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn refresh_pane_session(session: &Arc<Session>) -> bool {
     let SessionBackend::Pane {
         client,
         pane_id,
-        start_marker,
-        done_marker,
         script_path,
-        last_output,
+        spool,
+        stdout_offset,
+        stderr_offset,
     } = &session.backend
     else {
         return false;
     };
-    let Ok(raw) = read_pane_text(client, pane_id) else {
-        return false;
-    };
-    let Some((body, exit_code)) = pane_command_segment(&raw, start_marker, done_marker) else {
-        return false;
-    };
-    if let Ok(mut previous) = last_output.lock() {
-        if body.starts_with(previous.as_str()) {
-            let delta = &body[previous.len()..];
-            if !delta.is_empty() {
-                push_chunk(session, StreamKind::Stdout, delta.as_bytes());
-            }
-        } else if body != previous.as_str() {
-            if let Ok(mut buffers) = session.buffers.lock() {
-                buffers.truncated = true;
-            }
-            push_chunk(session, StreamKind::Stdout, body.as_bytes());
-        }
-        *previous = body.to_owned();
-    }
-    let Some(exit_code) = exit_code else {
+    drain_spool_file(session, &spool.stdout, StreamKind::Stdout, stdout_offset);
+    drain_spool_file(session, &spool.stderr, StreamKind::Stderr, stderr_offset);
+    let Some(exit_code) = read_pane_exit_code(&spool.status) else {
         return false;
     };
     let transitioned = mark_closed_with_signal(session, Some(exit_code), None);
     if transitioned {
-        let _ = fs::remove_file(script_path);
+        cleanup_pane_files(script_path, spool);
         let _ =
             client.call_with_timeout("pane.close", json!({"pane_id": pane_id}), PANE_RPC_TIMEOUT);
     }
@@ -1125,6 +1141,7 @@ fn terminate_session(session: &Arc<Session>, force: bool) {
             client,
             pane_id,
             script_path,
+            spool,
             ..
         } => {
             let _ = client.call_with_timeout(
@@ -1132,7 +1149,7 @@ fn terminate_session(session: &Arc<Session>, force: bool) {
                 json!({"pane_id": pane_id}),
                 PANE_RPC_TIMEOUT,
             );
-            let _ = fs::remove_file(script_path);
+            cleanup_pane_files(script_path, spool);
             mark_closed_with_signal(
                 session,
                 None,
@@ -1807,22 +1824,55 @@ mod tests {
     }
 
     #[test]
-    fn pane_marker_parser_preserves_exact_output_and_exit_code() {
-        let start = "__HM_EXEC_START_demo__";
-        let done = "__HM_EXEC_DONE_demo__";
-        let raw = format!("shell echo noise{start}A\\nB\\n{done}7__prompt");
-        let (body, exit) = pane_command_segment(&raw, start, done).unwrap();
-        assert_eq!(body, "A\\nB\\n");
-        assert_eq!(exit, Some(7));
+    fn pane_spool_paths_are_session_scoped() {
+        let a = pane_spool_paths("es_demo_a");
+        let b = pane_spool_paths("es_demo_b");
+        assert_ne!(a.stdout, b.stdout);
+        assert_ne!(a.stderr, b.stderr);
+        assert_ne!(a.status, b.status);
+        assert!(a.stdout.to_string_lossy().ends_with(".stdout"));
+        assert!(a.stderr.to_string_lossy().ends_with(".stderr"));
+        assert!(a.status.to_string_lossy().ends_with(".status"));
+        assert!(a.status_tmp.to_string_lossy().ends_with(".status.tmp"));
     }
 
     #[test]
-    fn pane_marker_parser_reports_streaming_before_done_marker() {
-        let start = "__HM_EXEC_START_demo__";
-        let done = "__HM_EXEC_DONE_demo__";
-        let raw = format!("noise{start}partial");
-        let (body, exit) = pane_command_segment(&raw, start, done).unwrap();
-        assert_eq!(body, "partial");
-        assert_eq!(exit, None);
+    fn pane_script_spools_streams_and_publishes_status_atomically() {
+        let id = format!(
+            "es_script_test_{}_{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let script = pane_script_path(&id);
+        let spool = pane_spool_paths(&id);
+        write_pane_script(
+            &script,
+            Path::new("/tmp"),
+            "printf out; printf err >&2; exit 7",
+            &spool,
+        )
+        .unwrap();
+        let body = fs::read_to_string(&script).unwrap();
+        assert!(body.contains(spool.stdout.to_string_lossy().as_ref()));
+        assert!(body.contains(spool.stderr.to_string_lossy().as_ref()));
+        assert!(body.contains(spool.status_tmp.to_string_lossy().as_ref()));
+        assert!(body.contains(spool.status.to_string_lossy().as_ref()));
+        assert!(body.contains("mv -f --"));
+        cleanup_pane_files(&script, &spool);
+    }
+
+    #[test]
+    fn pane_exit_code_requires_complete_integer_status() {
+        let id = format!(
+            "es_status_test_{}_{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let spool = pane_spool_paths(&id);
+        fs::write(&spool.status, "7\n").unwrap();
+        assert_eq!(read_pane_exit_code(&spool.status), Some(7));
+        fs::write(&spool.status, "partial").unwrap();
+        assert_eq!(read_pane_exit_code(&spool.status), None);
+        cleanup_pane_files(Path::new("/tmp/no-pane-script"), &spool);
     }
 }
