@@ -26,6 +26,9 @@ pub enum Command {
     },
     ArtifactImport(crate::artifact_import::ImportArgs),
     Link(LinkCommand),
+    TccBroker(TccBrokerCommand),
+    TccBrokerRun,
+    Permissions(crate::macos_permissions::PermissionsCommand),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -70,6 +73,13 @@ pub enum ConfigCommand {
     Show,
     Init { edge_origin: Option<String> },
     SetEdgeOrigin { edge_origin: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TccBrokerCommand {
+    Install { force: bool },
+    Status,
+    Uninstall,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -178,6 +188,9 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "status" => no_extra(args, Command::Status),
         "doctor" => no_extra(args, Command::Doctor),
         "__documents-probe" => no_extra(args, Command::DocumentsProbe),
+        "__tcc-broker" => no_extra(args, Command::TccBrokerRun),
+        "tcc-broker" => parse_tcc_broker(&args[1..]),
+        "permissions" => parse_permissions(&args[1..]),
         "herdr-supervisor" => parse_herdr_supervisor(&args[1..]),
         "scan" => parse_scan(&args[1..]),
         "rollback" => no_extra(args, Command::Service(ServiceCommand::Rollback)),
@@ -580,6 +593,48 @@ fn parse_service(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn parse_permissions(args: &[String]) -> Result<Command, String> {
+    use crate::macos_permissions::PermissionsCommand;
+    match args {
+        [subcommand] if subcommand == "status" => {
+            Ok(Command::Permissions(PermissionsCommand::Status))
+        }
+        [subcommand] if subcommand == "setup" => {
+            Ok(Command::Permissions(PermissionsCommand::Setup))
+        }
+        [subcommand] if subcommand == "verify" => {
+            Ok(Command::Permissions(PermissionsCommand::Verify))
+        }
+        [] => Err("permissions requires status, setup, or verify".to_owned()),
+        [subcommand, ..] => Err(format!(
+            "invalid permissions command or arguments for '{subcommand}'"
+        )),
+    }
+}
+
+fn parse_tcc_broker(args: &[String]) -> Result<Command, String> {
+    match args {
+        [subcommand] if subcommand == "install" => {
+            Ok(Command::TccBroker(TccBrokerCommand::Install {
+                force: false,
+            }))
+        }
+        [subcommand, flag] if subcommand == "install" && flag == "--force" => {
+            Ok(Command::TccBroker(TccBrokerCommand::Install {
+                force: true,
+            }))
+        }
+        [subcommand] if subcommand == "status" => Ok(Command::TccBroker(TccBrokerCommand::Status)),
+        [subcommand] if subcommand == "uninstall" => {
+            Ok(Command::TccBroker(TccBrokerCommand::Uninstall))
+        }
+        [] => Err("tcc-broker requires install [--force], status, or uninstall".to_owned()),
+        [subcommand, ..] => Err(format!(
+            "invalid tcc-broker command or arguments for '{subcommand}'"
+        )),
+    }
+}
+
 fn parse_update(args: &[String]) -> Result<Command, String> {
     match args {
         [subcommand] if subcommand == "check" => {
@@ -672,6 +727,7 @@ User path:\n\
   herdr-mcp install\n\
   herdr-mcp status\n\
   herdr-mcp doctor\n\
+  herdr-mcp permissions <status|setup|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|status]\n\
   herdr-mcp rollback\n\
@@ -693,6 +749,7 @@ Advanced / internal:\n\
   herdr-mcp link cutover [--dry-run|--execute|--rollback]\n\
   herdr-mcp link seal [status|record --dual-uat|record --rollback-uat|--dry-run|--execute]\n\
   herdr-mcp link migrate-runtime-control [--dry-run|--write-staging|--apply]\n\
+  herdr-mcp tcc-broker <install [--force]|status|uninstall>\n\
   herdr-mcp native-host <install|status|uninstall|rollback>\n\
   herdr-mcp native-host dev <enable [PATH]|disable>\n\
   herdr-mcp native-host use <store|dev>\n\
@@ -700,7 +757,7 @@ Advanced / internal:\n\
   herdr-mcp artifact import --url HTTPS_URL --path PROJECT_PATH [--sha256 HEX] [--capability-env NAME] [--overwrite] [--confirm-dirty] [--confirm-busy]\n\
   herdr-mcp dev [--dry-run]\n\
   herdr-mcp candidate [--port 8873]\n\n\
-Prefer the top-level install/status/doctor/scan/update/rollback/uninstall commands\n\
+Prefer the top-level install/status/doctor/permissions/scan/update/rollback/uninstall commands\n\
 for normal lifecycle. Use service ... only for advanced service control\n\
 (for example service install --adopt-node). link status is read-only G5\n\
 ownership/gates reporting. link run starts a foreground Rust Link candidate\n\
@@ -737,6 +794,20 @@ mod tests {
         );
         assert_eq!(parse(args(&["status"])).unwrap().command, Command::Status);
         assert_eq!(parse(args(&["doctor"])).unwrap().command, Command::Doctor);
+        assert_eq!(
+            parse(args(&["permissions", "status"])).unwrap().command,
+            Command::Permissions(crate::macos_permissions::PermissionsCommand::Status)
+        );
+        assert_eq!(
+            parse(args(&["permissions", "setup"])).unwrap().command,
+            Command::Permissions(crate::macos_permissions::PermissionsCommand::Setup)
+        );
+        assert_eq!(
+            parse(args(&["permissions", "verify"])).unwrap().command,
+            Command::Permissions(crate::macos_permissions::PermissionsCommand::Verify)
+        );
+        assert!(parse(args(&["permissions"])).is_err());
+        assert!(parse(args(&["permissions", "grant"])).is_err());
         assert_eq!(
             parse(args(&["herdr-supervisor", "status"]))
                 .unwrap()
@@ -798,6 +869,29 @@ mod tests {
                 .command,
             Command::Candidate { port: 9000 }
         );
+        assert_eq!(
+            parse(args(&["tcc-broker", "install"])).unwrap().command,
+            Command::TccBroker(TccBrokerCommand::Install { force: false })
+        );
+        assert_eq!(
+            parse(args(&["tcc-broker", "install", "--force"]))
+                .unwrap()
+                .command,
+            Command::TccBroker(TccBrokerCommand::Install { force: true })
+        );
+        assert_eq!(
+            parse(args(&["tcc-broker", "status"])).unwrap().command,
+            Command::TccBroker(TccBrokerCommand::Status)
+        );
+        assert_eq!(
+            parse(args(&["tcc-broker", "uninstall"])).unwrap().command,
+            Command::TccBroker(TccBrokerCommand::Uninstall)
+        );
+        assert_eq!(
+            parse(args(&["__tcc-broker"])).unwrap().command,
+            Command::TccBrokerRun
+        );
+        assert!(parse(args(&["tcc-broker", "bogus"])).is_err());
         assert_eq!(
             parse(args(&["service", "install", "--adopt-node"]))
                 .unwrap()
@@ -1091,6 +1185,7 @@ mod tests {
             "herdr-mcp install",
             "herdr-mcp status",
             "herdr-mcp doctor",
+            "herdr-mcp permissions",
             "herdr-mcp scan",
             "herdr-mcp update",
             "herdr-mcp rollback",

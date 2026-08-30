@@ -70,6 +70,10 @@ pub fn print_status(paths: &RuntimePaths, config: &Config) {
             "unreachable"
         }
     );
+    println!(
+        "tcc broker: {}",
+        crate::tcc_broker::status_line(&paths.config_dir)
+    );
     println!("update channel: {}", config.update_channel.as_str());
     println!(
         "update checks: {}",
@@ -114,7 +118,12 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     print_check("Herdr snapshot state", snapshot_healthy);
     print_check("Herdr inspect projection", inspect_healthy);
     print_check("Herdr event cache", event_cache.healthy);
+    let macos_permissions = crate::macos_permissions::collect_status();
     println!("{}", documents_permission.doctor_line());
+    println!(
+        "{}",
+        crate::macos_permissions::doctor_layer_from(&macos_permissions)
+    );
     println!("{}", code_identity.doctor_line());
     println!("{}", herdr_supervisor::doctor_line());
     println!("{}", crate::child_process::doctor_line());
@@ -164,6 +173,10 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         && inspect_healthy
         && event_cache.healthy
         && documents_permission.doctor_pass()
+        && macos_permissions
+            .as_ref()
+            .map(crate::macos_permissions::report_doctor_pass)
+            .unwrap_or(true)
 }
 
 /// Product-layer ownership map. Local probes always run. When Edge is

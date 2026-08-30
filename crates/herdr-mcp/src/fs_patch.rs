@@ -233,10 +233,10 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
             }
             Ok(None) => {}
             Err(message) => {
-                return fail(
-                    "git_status_failed",
-                    root_path.resolved.to_string_lossy().as_ref(),
-                    Some(message),
+                return crate::macos_permissions::git_failure_to_value(
+                    &root_path.root,
+                    "status",
+                    message,
                 );
             }
         }
