@@ -39,7 +39,7 @@ Herdr 性能优化不以单点 benchmark 为目标，目标是建立长期可演
 1. **Browser extension / Store / real-browser UAT** — 浏览器扩展持续独立迭代；Store 发布、实验站点 UAT、Control Center/continuity 修复使用独立扩展版本与分支，不要求每次都发布 Rust runtime。
 2. **`v0.4.2` quality/consolidation** — 实施计划与验收证据已归档到 [`history/v0.4.2/v0.4.2-quality-docs-and-operations-plan.md`](./history/v0.4.2/v0.4.2-quality-docs-and-operations-plan.md)。Wave A reliability、Wave B measured efficiency、Wave C docs taxonomy 与 docs-site homepage/navigation redesign 均已完成；稳定版只通过 tag-driven signed Release 与 supported updater dogfood 收口。
 
-当前已发布 stable runtime 仍为 **`v0.4.1`**；`v0.4.2` source candidate 已合入 main，并只等待 Developer ID signed tag/publish gate。production Rust ownership / updater / Link / Native Messaging runtime sync 已经是基线，不再重复做 alpha-era cutover。第一版 GA 的 `v0.4.0` G1–G25 与历史 release/UAT 证据继续由 [`ga-release-gate.md`](./ga-release-gate.md) 和 `docs/history/ga/` 保存，不能为了让旧文档看起来“更新”而改写历史版本号。
+当前已发布 stable runtime 仍为 **`v0.4.1`**；`v0.4.2` source candidate 已合入 main，发布收尾不再依赖 Developer ID。macOS 受保护目录改用 generation-independent 的 unsigned stable broker 作为长期 TCC 权限边界，Developer ID 仅为可选发行增强。production Rust ownership / updater / Link / Native Messaging runtime sync 已经是基线，不再重复做 alpha-era cutover。第一版 GA 的 `v0.4.0` G1–G25 与历史 release/UAT 证据继续由 [`ga-release-gate.md`](./ga-release-gate.md) 和 `docs/history/ga/` 保存，不能为了让旧文档看起来“更新”而改写历史版本号。
 
 活跃但不自动进入 `v0.4.2` feature scope 的长期设计包括 [`_wip/multi-device-worker-control-plane.md`](./_wip/multi-device-worker-control-plane.md) 与 Browser Control Plane 的后续扩展；只有测量结果或明确版本计划批准后才转为实现任务。
 
