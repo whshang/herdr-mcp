@@ -929,6 +929,43 @@ Skill 内容建议内容寻址：
 - 文件发生变化时 digest 改变；
 - dirty project Skill 必须明确标记 `working-tree` 来源。
 
+### 11.1 v0.4.2 已落地：Local Skill Registry（本地 skill 注册表）
+
+v0.4.2 为现有 `ProgressiveSkillService` 增加了本地 skill 注册，用于确定性、有界、
+canonical-path 收敛地发现与读取本地 `SKILL.md`/`skill.md`，不新增 public MCP tool。
+
+冻结的优先级（从高到低）：
+
+```text
+herdr-mcp builtin / 上游 Herdr usage（最高）
+        ↓
+project  <project_root>/.agents/skills/*/SKILL.md
+        ↓
+user     ~/.agents/skills/*/SKILL.md
+```
+
+- 同名更低优先级 skill 不允许覆盖更高优先级；builtin 名称（如 `files-search`）被
+  project/user 同名 shadow 时直接丢弃。
+- **只扫描 `.agents/skills`**；v0.4.2 不探测 `.claude/skills`，不扩大兼容目录。
+- `SKILL.md` 与 `skill.md` 均接受。
+- discovery 只返回 metadata（`id`/`name`/`description`/`source_identity`/`uri`/`digest`/
+  `version`/`size`）；`load` 按需返回正文，并以 `(source_identity, uri, digest)` 为 cache key。
+- `list`/`describe`/`load` 接受可选 `project_root`，使项目 skill 确定性解析；缺省则跳过项目 scope。
+- 仅做确定性元数据读取，绝不执行任意脚本，不接入 SkillHub/网络分发。
+
+收敛与安全：候选目录 canonicalize；子目录或 `SKILL.md` 的 symlink 解析到 `.agents/skills`
+base 之外即拒绝；per-scope 数量上限与单文件 512 KiB 大小上限限制发现；`load` 校验所服务
+字节的 digest 并在相同大小上限内读取，避免后续膨胀文件被服务。
+
+外部本地 skill 使用 `project:<root>` / `user:<home>` source identity 与
+`skill://local/<id>` URI，digest 为 trim 后正文的 SHA-256。
+
+常见 frontmatter（`name`/`description`/`summary`/`version`，含 `metadata.version` 与折叠
+`>` 标量）已足够解析真实 `~/.agents/skills` skill，例如 `ego-browser` 与 `opencli-usage`。
+
+> 后续若需要 `.claude/skills` 兼容或其他 scope，应作为显式的独立决策，而不是默认扫描目录。
+
+
 对于未来 remote/MCP Skill：
 
 - server/source identity + URI；
@@ -1124,6 +1161,9 @@ skill.read_resource (if needed)
 5. cache hit 不重复加载 bytes；
 6. Skill 修改后 digest/revision 改变；
 7. project-local same-name Skill 不与 builtin/remote 冲突；
+   （v0.4.2 已由 `local-skill-*` 测试覆盖：precedence、same-name shadowing、
+   symlink escape 拒绝、缺失目录、size/path 边界、metadata-only + load、外部
+   身份/digest、frontmatter 解析。）
 8. discovery 不自动 load；
 9. load 不授予 mutation 权限；
 10. agent-dispatch 使用 live capability，而非硬编码存在性；

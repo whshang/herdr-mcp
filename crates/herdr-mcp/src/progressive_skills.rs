@@ -1,10 +1,12 @@
 use crate::agent_visibility::AgentVisibility;
 use crate::capability_inventory::{AgentCapabilityRecord, CapabilityInventoryStore};
 use crate::capability_resolver::project_capabilities_with_inventory;
+use crate::local_skills::{self, LocalSkillFile, parse_frontmatter, read_file_bounded};
 use crate::paths::RuntimePaths;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -244,6 +246,76 @@ impl ProgressiveSkillService {
         BUILTIN_SKILLS.iter().map(descriptor).collect()
     }
 
+    /// Resolve the effective skill catalog with precedence builtin > project
+    /// `.agents/skills` > user `~/.agents/skills`. Same-name lower-precedence
+    /// local skills never override higher-precedence ones. An optional
+    /// `project_root` enables deterministic project-skill resolution.
+    pub fn effective_catalog(&self, project_root: Option<&Path>) -> Vec<SkillDescriptor> {
+        self.effective_entries(project_root)
+            .into_iter()
+            .map(|entry| entry.descriptor)
+            .collect()
+    }
+
+    /// Resolve precedence-merged builtin + local entries (metadata only).
+    fn effective_entries(&self, project_root: Option<&Path>) -> Vec<LocalEntry> {
+        let mut entries = Vec::with_capacity(BUILTIN_SKILLS.len() + 8);
+        let mut seen = BTreeSet::new();
+        for spec in BUILTIN_SKILLS.iter() {
+            seen.insert(spec.id.to_owned());
+            entries.push(LocalEntry::from_builtin(spec));
+        }
+
+        let home = local_skills::home_dir().unwrap_or_default();
+        let discovery = local_skills::LocalSkillRegistry::discover(project_root, &home);
+        for file in discovery.project.into_iter().chain(discovery.user) {
+            if !seen.insert(file.id.clone()) {
+                continue;
+            }
+            if let Some(entry) = Self::entry_from_file(&file) {
+                entries.push(entry);
+            }
+        }
+        entries
+    }
+
+    fn entry_from_file(file: &LocalSkillFile) -> Option<LocalEntry> {
+        let content = read_file_bounded(&file.path)?;
+        let fm = parse_frontmatter(&content);
+        // Digest the exact raw bytes that load() will verify, mirroring the
+        // builtin trim-for-metadata convention but kept internally consistent.
+        let body = content.trim();
+        let digest = Digest::from_content(body);
+        let size = body.len();
+        let name = fm.name.clone().unwrap_or_else(|| file.id.clone());
+        let description = fm.description.clone().unwrap_or_default();
+        let version = fm.version;
+        let descriptor = SkillDescriptor {
+            id: file.id.clone(),
+            name,
+            description,
+            identity: SkillIdentity {
+                source_identity: file.scope_identity.clone(),
+                uri: format!("skill://local/{}", file.id),
+                digest,
+                version,
+            },
+            size,
+            triggers: Vec::new(),
+            requires_capabilities: Vec::new(),
+            related_skills: Vec::new(),
+            risk_domains: Vec::new(),
+            owned_tools: Vec::new(),
+        };
+        // load_verified() digests the exact trimmed bytes it receives, so the
+        // cached body is the same trimmed slice used for the identity digest.
+        let content = Arc::from(body);
+        Some(LocalEntry {
+            descriptor,
+            content,
+        })
+    }
+
     pub fn bootstrap(&self, snapshot: &Value) -> Value {
         let inventory = RuntimePaths::discover()
             .ok()
@@ -280,7 +352,8 @@ impl ProgressiveSkillService {
                 "method": LOCAL_LOAD_METHOD,
                 "params": {
                     "ids": "required array<string>, batched, first-request order preserved",
-                    "expected_digests": "optional object keyed by skill id; mismatch fails closed"
+                    "expected_digests": "optional object keyed by skill id; mismatch fails closed",
+                    "project_root": "optional string; enables deterministic project-local .agents/skills resolution"
                 },
                 "sticky": "conversation/task-context until source identity or digest changes, new capability domain, handoff, or explicit refresh",
                 "authorization": "none"
@@ -308,10 +381,14 @@ impl ProgressiveSkillService {
     }
 
     fn list_method(&self, params: &Value) -> Value {
-        if let Err(error) = validate_object_keys(params, &[]) {
+        if let Err(error) = validate_object_keys(params, &["project_root"]) {
             return error;
         }
-        let catalog = self.catalog();
+        let project_root = match optional_project_root(params) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        let catalog = self.effective_catalog(project_root.as_deref());
         json!({
             "ok": true,
             "skills": catalog.iter().map(descriptor_json).collect::<Vec<_>>(),
@@ -321,7 +398,7 @@ impl ProgressiveSkillService {
     }
 
     fn describe_method(&self, params: &Value) -> Value {
-        if let Err(error) = validate_object_keys(params, &["id"]) {
+        if let Err(error) = validate_object_keys(params, &["id", "project_root"]) {
             return error;
         }
         let Some(id) = params.get("id").and_then(Value::as_str) else {
@@ -330,14 +407,24 @@ impl ProgressiveSkillService {
         if id.trim().is_empty() {
             return invalid_params("id must be a non-empty string");
         }
-        match self.catalog().into_iter().find(|item| item.id == id) {
+        let project_root = match optional_project_root(params) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        match self
+            .effective_catalog(project_root.as_deref())
+            .into_iter()
+            .find(|item| item.id == id)
+        {
             Some(item) => json!({"ok": true, "skill": descriptor_json(&item), "loaded": false}),
             None => json!({"ok": false, "code": "unknown_skill", "id": id}),
         }
     }
 
     fn load_method(&self, params: &Value) -> Value {
-        if let Err(error) = validate_object_keys(params, &["ids", "expected_digests"]) {
+        if let Err(error) =
+            validate_object_keys(params, &["ids", "expected_digests", "project_root"])
+        {
             return error;
         }
         let Some(ids) = params.get("ids").and_then(Value::as_array) else {
@@ -350,6 +437,10 @@ impl ProgressiveSkillService {
             None | Some(Value::Null) => None,
             Some(Value::Object(value)) => Some(value),
             Some(_) => return invalid_params("expected_digests must be an object when provided"),
+        };
+        let project_root = match optional_project_root(params) {
+            Ok(value) => value,
+            Err(error) => return error,
         };
 
         let mut requested = Vec::new();
@@ -366,12 +457,13 @@ impl ProgressiveSkillService {
             }
         }
 
-        let catalog = self.catalog();
+        let entries = self.effective_entries(project_root.as_deref());
         let mut loaded = Vec::with_capacity(requested.len());
         for id in requested {
-            let Some(descriptor) = catalog.iter().find(|item| item.id == id) else {
+            let Some(entry) = entries.iter().find(|entry| entry.descriptor.id == id) else {
                 return json!({"ok": false, "code": "unknown_skill", "id": id});
             };
+            let descriptor = &entry.descriptor;
             if let Some(expected_digest) = expected
                 .and_then(|map| map.get(&id))
                 .and_then(Value::as_str)
@@ -385,21 +477,18 @@ impl ProgressiveSkillService {
                     "actual_digest": descriptor.identity.digest.as_str(),
                 });
             }
-            let Some(spec) = BUILTIN_SKILLS.iter().find(|spec| spec.id == id) else {
-                return json!({"ok": false, "code": "skill_source_missing", "id": id});
+            let content = entry.content.clone();
+            let (content, cache_hit) = match self.load_verified(&descriptor.identity, &content) {
+                Ok(value) => value,
+                Err(message) => {
+                    return json!({
+                        "ok": false,
+                        "code": "skill_digest_mismatch",
+                        "id": id,
+                        "message": message,
+                    });
+                }
             };
-            let (content, cache_hit) =
-                match self.load_verified(&descriptor.identity, spec.content.trim()) {
-                    Ok(value) => value,
-                    Err(message) => {
-                        return json!({
-                            "ok": false,
-                            "code": "skill_digest_mismatch",
-                            "id": id,
-                            "message": message,
-                        });
-                    }
-                };
             let evidence = LoadEvidence {
                 id: descriptor.id.clone(),
                 identity: descriptor.identity.clone(),
@@ -457,6 +546,24 @@ impl ProgressiveSkillService {
     }
 }
 
+/// `builtin_content` is the frozen spec body; `file` entries carry the body
+/// captured at discovery so discovery stays metadata-only while `load` is a
+/// cheap in-memory read of the SAME bounded file bytes (digest-verified).
+#[derive(Debug, Clone)]
+struct LocalEntry {
+    descriptor: SkillDescriptor,
+    content: Arc<str>,
+}
+
+impl LocalEntry {
+    fn from_builtin(spec: &BuiltinSkillSpec) -> Self {
+        Self {
+            descriptor: descriptor(spec),
+            content: Arc::from(spec.content.trim()),
+        }
+    }
+}
+
 fn descriptor(spec: &BuiltinSkillSpec) -> SkillDescriptor {
     let content = spec.content.trim();
     SkillDescriptor {
@@ -475,6 +582,19 @@ fn descriptor(spec: &BuiltinSkillSpec) -> SkillDescriptor {
         related_skills: strings(spec.related_skills),
         risk_domains: strings(spec.risk_domains),
         owned_tools: strings(spec.owned_tools),
+    }
+}
+
+fn optional_project_root(params: &Value) -> Result<Option<PathBuf>, Value> {
+    match params.get("project_root") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => {
+            Ok(Some(PathBuf::from(value.trim())))
+        }
+        Some(Value::String(_)) => Ok(None),
+        Some(_) => Err(invalid_params(
+            "project_root must be a string when provided",
+        )),
     }
 }
 
@@ -605,6 +725,69 @@ mod tests {
         })
     }
 
+    /// Run a closure with HOME pointed at an empty temp dir so local-skill
+    /// discovery is hermetic (builtin catalog only) and never reads the real
+    /// developer `~/.agents/skills`.
+    fn with_isolated_home<T>(run: impl FnOnce() -> T) -> T {
+        let _guard = crate::test_env::lock();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-progressive-skill-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &root);
+        }
+        let result = run();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+        result
+    }
+
+    // Write `$HOME/.agents/skills/<name>/SKILL.md` (or a project root variant).
+    fn write_user_skill(home: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let dir = home.join(".agents/skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("SKILL.md");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn write_project_skill(
+        project: &std::path::Path,
+        name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        let dir = project.join(".agents/skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("SKILL.md");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn temp_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-local-skill-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
     #[test]
     fn catalog_is_stable_and_covers_all_non_skill_tools_once() {
         let service = ProgressiveSkillService::new();
@@ -633,34 +816,36 @@ mod tests {
 
     #[test]
     fn discovery_does_not_load_and_batched_load_hits_immutable_cache() {
-        let service = ProgressiveSkillService::new();
-        let listed = service
-            .local_call(LOCAL_LIST_METHOD, &json!({}), &snapshot())
-            .unwrap();
-        assert_eq!(listed["count"], 7);
-        assert_eq!(service.cache_len(), 0);
-        let first = service
-            .local_call(
-                LOCAL_LOAD_METHOD,
-                &json!({"ids": ["files-search", "git-repository"]}),
-                &snapshot(),
-            )
-            .unwrap();
-        assert_eq!(first["ok"], true);
-        assert_eq!(first["skills"][0]["id"], "files-search");
-        assert_eq!(first["skills"][1]["id"], "git-repository");
-        assert_eq!(first["skills"][0]["cache_hit"], false);
-        assert_eq!(first["skills"][1]["cache_hit"], false);
-        let second = service
-            .local_call(
-                LOCAL_LOAD_METHOD,
-                &json!({"ids": ["files-search", "git-repository"]}),
-                &snapshot(),
-            )
-            .unwrap();
-        assert_eq!(second["skills"][0]["cache_hit"], true);
-        assert_eq!(second["skills"][1]["cache_hit"], true);
-        assert_eq!(second["authorization"], "none");
+        with_isolated_home(|| {
+            let service = ProgressiveSkillService::new();
+            let listed = service
+                .local_call(LOCAL_LIST_METHOD, &json!({}), &snapshot())
+                .unwrap();
+            assert_eq!(listed["count"], 7);
+            assert_eq!(service.cache_len(), 0);
+            let first = service
+                .local_call(
+                    LOCAL_LOAD_METHOD,
+                    &json!({"ids": ["files-search", "git-repository"]}),
+                    &snapshot(),
+                )
+                .unwrap();
+            assert_eq!(first["ok"], true);
+            assert_eq!(first["skills"][0]["id"], "files-search");
+            assert_eq!(first["skills"][1]["id"], "git-repository");
+            assert_eq!(first["skills"][0]["cache_hit"], false);
+            assert_eq!(first["skills"][1]["cache_hit"], false);
+            let second = service
+                .local_call(
+                    LOCAL_LOAD_METHOD,
+                    &json!({"ids": ["files-search", "git-repository"]}),
+                    &snapshot(),
+                )
+                .unwrap();
+            assert_eq!(second["skills"][0]["cache_hit"], true);
+            assert_eq!(second["skills"][1]["cache_hit"], true);
+            assert_eq!(second["authorization"], "none");
+        })
     }
 
     #[test]
@@ -834,5 +1019,339 @@ mod tests {
                 .local_call("agent.list", &json!({}), &snapshot())
                 .is_none()
         );
+    }
+
+    // ---- v0.4.2 local skill registry ----
+
+    const USER_SKILL: &str = "---\nname: ego
+version: 1.2.3
+description: \"user ego\"
+---\n# user body\n";
+
+    #[test]
+    fn local_skill_precedence_builtin_then_project_then_user() {
+        let home = temp_root("precedence-home");
+        let project = temp_root("precedence-project");
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        // project skill
+        write_project_skill(
+            &project,
+            "alpha",
+            "---\nname: alpha\ndescription: \"project alpha\"\n---\n# project body\n",
+        );
+        // user skill with the SAME name must not override the project skill
+        write_user_skill(
+            &home,
+            "alpha",
+            "---\nname: alpha\ndescription: \"user alpha\"\n---\n# user body\n",
+        );
+        // user skill shadowing a builtin id must be dropped
+        write_user_skill(
+            &home,
+            "files-search",
+            "---\nname: files-search\ndescription: \"shadow attempt\"\n---\n# nope\n",
+        );
+        let service = ProgressiveSkillService::new();
+        let listed = service
+            .local_call(
+                LOCAL_LIST_METHOD,
+                &json!({"project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(listed["ok"], true);
+        assert_eq!(listed["count"], 8); // 7 builtin + 1 unique project alpha
+        let skills = listed["skills"].as_array().unwrap();
+        let alpha = skills
+            .iter()
+            .find(|item| item["id"] == "alpha")
+            .expect("alpha present");
+        assert_eq!(alpha["description"], "project alpha");
+        assert!(
+            alpha["source_identity"]
+                .as_str()
+                .unwrap()
+                .starts_with("project:")
+        );
+        assert!(
+            !skills.iter().any(|item| item["id"] == "files-search"
+                && item["source_identity"] != "herdr-mcp:builtin")
+        );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn local_skill_missing_dirs_discover_nothing() {
+        let home = temp_root("missing-home");
+        let project = temp_root("missing-project");
+        with_isolated_home(|| {
+            let service = ProgressiveSkillService::new();
+            let listed = service
+                .local_call(
+                    LOCAL_LIST_METHOD,
+                    &json!({"project_root": project.to_string_lossy()}),
+                    &snapshot(),
+                )
+                .unwrap();
+            assert_eq!(listed["ok"], true);
+            assert_eq!(listed["count"], 7);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn local_skill_discovery_metadata_only_and_load_returns_body() {
+        let home = temp_root("meta-home");
+        let project = temp_root("meta-project");
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        write_project_skill(&project, "beta", USER_SKILL);
+        let service = ProgressiveSkillService::new();
+        let listed = service
+            .local_call(
+                LOCAL_LIST_METHOD,
+                &json!({"project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        let skills = listed["skills"].as_array().unwrap();
+        let beta = skills
+            .iter()
+            .find(|item| item["id"] == "beta")
+            .expect("beta present");
+        assert!(
+            beta.get("content").is_none(),
+            "discovery stays metadata-only"
+        );
+        assert_eq!(beta["version"], "1.2.3");
+        assert_eq!(beta["name"], "ego");
+        assert_eq!(service.cache_len(), 0);
+
+        let loaded = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["beta"], "project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(loaded["ok"], true);
+        assert!(
+            loaded["skills"][0]["content"]
+                .as_str()
+                .is_some_and(|body| body.contains("# user body"))
+        );
+        assert_eq!(loaded["skills"][0]["cache_hit"], false);
+        let reloaded = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["beta"], "project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(reloaded["skills"][0]["cache_hit"], true);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn local_skill_symlink_escape_is_rejected() {
+        let home = temp_root("escape-home");
+        let project = temp_root("escape-project");
+        let outside = temp_root("escape-outside");
+        let outside_file = outside.join("secret.md");
+        std::fs::write(
+            &outside_file,
+            "---\nname: evil\ndescription: outside\n---\n# evil body\n",
+        )
+        .unwrap();
+        let skills_dir = project.join(".agents/skills").join("evil");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside_file, skills_dir.join("SKILL.md")).unwrap();
+        }
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let service = ProgressiveSkillService::new();
+        let listed = service
+            .local_call(
+                LOCAL_LIST_METHOD,
+                &json!({"project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert!(
+            !listed["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["id"] == "evil"),
+            "symlink escape must not be discovered"
+        );
+        let loaded = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["evil"], "project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(loaded["code"], "unknown_skill");
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn local_skill_external_identity_and_digest() {
+        let home = temp_root("identity-home");
+        let project = temp_root("identity-project");
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let body =
+            "---\nname: gamma\nversion: 4.5.6\ndescription: gamma skill\n---\n# gamma body\n";
+        let path = write_project_skill(&project, "gamma", body);
+        let service = ProgressiveSkillService::new();
+        let listed = service
+            .local_call(
+                LOCAL_LIST_METHOD,
+                &json!({"project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        let gamma = listed["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "gamma")
+            .expect("gamma present");
+        assert_eq!(gamma["version"], "4.5.6");
+        assert_eq!(gamma["size"], body.trim().len() as u64);
+        let digest = Digest::from_content(body.trim()).as_str().to_owned();
+        assert_eq!(gamma["digest"], digest);
+        let loaded = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["gamma"], "project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(loaded["skills"][0]["digest"], digest);
+        assert_eq!(loaded["skills"][0]["bytes"], body.trim().len() as u64);
+        assert!(path.is_file());
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn local_skill_size_bound_is_enforced() {
+        let home = temp_root("size-home");
+        let project = temp_root("size-project");
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let dir = project.join(".agents/skills").join("huge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let oversized = "# pad\n".repeat(local_skills::MAX_LOCAL_SKILL_BYTES / 6 + 1);
+        std::fs::write(dir.join("SKILL.md"), &oversized).unwrap();
+        let service = ProgressiveSkillService::new();
+        let listed = service
+            .local_call(
+                LOCAL_LIST_METHOD,
+                &json!({"project_root": project.to_string_lossy()}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(listed["count"], 7, "oversized skill is skipped");
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn project_root_parser_behavior() {
+        assert_eq!(optional_project_root(&json!({})).unwrap(), None);
+        assert_eq!(
+            optional_project_root(&json!({ "project_root": null })).unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_project_root(&json!({ "project_root": "/tmp/x" })).unwrap(),
+            Some(PathBuf::from("/tmp/x"))
+        );
+        let error = optional_project_root(&json!({ "project_root": 42 })).unwrap_err();
+        assert_eq!(error["code"], "invalid_params");
+    }
+
+    #[test]
+    fn frontmatter_parser_handles_real_skills() {
+        // ego-browser style: name + description + metadata.version.
+        let ego = "---\nname: ego-browser\ndescription: drives a browser\nmetadata:\n  version: \"1.2.6\"\n  date: \"2026-07-20\"\n---\n# body\n";
+        let fm = parse_frontmatter(ego);
+        assert_eq!(fm.name.as_deref(), Some("ego-browser"));
+        assert_eq!(fm.description.as_deref(), Some("drives a browser"));
+        assert_eq!(fm.version.as_deref(), Some("1.2.6"));
+
+        // opencli-usage style: plain single-line fields, unknown keys ignored.
+        let opencli = "---\nname: opencli-usage\ndescription: top-level map\nallowed-tools: Bash(opencli:*), Read\n---\n# body\n";
+        let fm = parse_frontmatter(opencli);
+        assert_eq!(fm.name.as_deref(), Some("opencli-usage"));
+        assert_eq!(fm.description.as_deref(), Some("top-level map"));
+        assert!(fm.version.is_none());
+
+        // quoted values and folded descriptions.
+        let folded = "---\nname: glab\ndescription: >\n  Multi-line\n  folded description.\nversion: \"2.0\"\n---\n# body\n";
+        let fm = parse_frontmatter(folded);
+        assert_eq!(fm.name.as_deref(), Some("glab"));
+        assert_eq!(
+            fm.description.as_deref(),
+            Some("Multi-line folded description.")
+        );
+        assert_eq!(fm.version.as_deref(), Some("2.0"));
     }
 }
