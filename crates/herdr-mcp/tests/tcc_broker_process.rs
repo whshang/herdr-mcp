@@ -252,3 +252,77 @@ fn broker_status_reports_installed_identity() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn permissions_status_setup_verify_and_broker_preservation() {
+    let root = test_root("permissions");
+    let config = root.join("config");
+    let broker = config.join("tcc-broker").join("herdr-mcp-broker");
+    let binary = env!("CARGO_BIN_EXE_herdr-mcp");
+
+    let output = Command::new(binary)
+        .args(["permissions", "status"])
+        .env("HERDR_MCP_CONFIG_DIR", &config)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("needs_setup")
+            || text.contains("not_applicable")
+            || text.contains("granted")
+            || text.contains("denied")
+            || text.contains("unknown")
+            || text.contains("timeout")
+    );
+    assert!(text.contains("hint:"));
+    assert!(text.contains("status:"));
+    assert!(!text.to_ascii_lowercase().contains("developer id"));
+
+    let output = Command::new(binary)
+        .args(["permissions", "setup"])
+        .env("HERDR_MCP_CONFIG_DIR", &config)
+        .env("HERDR_MCP_PERMISSIONS_DRY_RUN", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.to_ascii_lowercase().contains("granted permission"));
+    assert!(
+        text.contains("does not grant permission")
+            || text.contains("not_applicable")
+            || text.contains("broker_installed:")
+    );
+    assert!(broker.is_file());
+
+    let output = Command::new(binary)
+        .args(["permissions", "verify"])
+        .env("HERDR_MCP_CONFIG_DIR", &config)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("status:") || text.contains("not_applicable"));
+    assert!(
+        text.contains("granted")
+            || text.contains("denied")
+            || text.contains("needs_setup")
+            || text.contains("unknown")
+            || text.contains("timeout")
+            || text.contains("not_applicable")
+    );
+
+    fs::write(&broker, b"different-stable-broker-identity").unwrap();
+    let output = Command::new(binary)
+        .args(["permissions", "setup"])
+        .env("HERDR_MCP_CONFIG_DIR", &config)
+        .env("HERDR_MCP_PERMISSIONS_DRY_RUN", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read(&broker).unwrap(),
+        b"different-stable-broker-identity"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

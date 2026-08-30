@@ -74,12 +74,7 @@ fn validate_existing_with_roots(roots: &[PathBuf], input: &str) -> Result<Manage
         }));
     }
     let real = std::fs::canonicalize(&resolved).map_err(|error| {
-        json!({
-            "ok": false,
-            "reason": "not_found",
-            "path": resolved.to_string_lossy(),
-            "message": error.to_string(),
-        })
+        crate::macos_permissions::io_error_to_fs_value("not_found", &resolved, error)
     })?;
     let root_real = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
     if !path_within(&root_real, &real) {
@@ -139,12 +134,7 @@ fn validate_target_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedP
     let root_real = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
     let real = if resolved.exists() {
         std::fs::canonicalize(&resolved).map_err(|error| {
-            json!({
-                "ok": false,
-                "reason": "target_unresolvable",
-                "path": resolved.to_string_lossy(),
-                "message": error.to_string(),
-            })
+            crate::macos_permissions::io_error_to_fs_value("target_unresolvable", &resolved, error)
         })?
     } else {
         let parent = resolved.parent().ok_or_else(|| {
@@ -155,12 +145,7 @@ fn validate_target_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedP
             })
         })?;
         let parent_real = std::fs::canonicalize(parent).map_err(|error| {
-            json!({
-                "ok": false,
-                "reason": "parent_not_found",
-                "path": resolved.to_string_lossy(),
-                "message": error.to_string(),
-            })
+            crate::macos_permissions::io_error_to_fs_value("parent_not_found", &resolved, error)
         })?;
         if !parent_real.is_dir() {
             return Err(

@@ -80,12 +80,7 @@ pub fn run(snapshot: &Value, args: &Value) -> Value {
     let result = match run_git(&managed.root, &command_args, budget, TIMEOUT) {
         Ok(value) => value,
         Err(message) => {
-            return json!({
-                "ok": false,
-                "root": managed.root.to_string_lossy(),
-                "action": action,
-                "message": message,
-            });
+            return crate::macos_permissions::git_failure_to_value(&managed.root, action, message);
         }
     };
     let mut output = Map::new();
@@ -132,7 +127,7 @@ pub fn run(snapshot: &Value, args: &Value) -> Value {
     if !result.stderr.is_empty() {
         output.insert("stderr".to_owned(), json!(result.stderr));
     }
-    Value::Object(output)
+    crate::macos_permissions::map_fs_git_result(Value::Object(output))
 }
 
 struct StatusCompact {

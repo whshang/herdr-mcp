@@ -2,7 +2,7 @@ use crate::fs_security;
 use crate::git_tools;
 use crate::mutation;
 use crate::projects;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::fs;
 
 pub fn edit(snapshot: &Value, args: &Value) -> Value {
@@ -39,7 +39,13 @@ pub fn edit(snapshot: &Value, args: &Value) -> Value {
         };
     let old = match fs::read_to_string(&target.real) {
         Ok(value) => value,
-        Err(error) => return fail("read_failed", path, Some(error.to_string())),
+        Err(error) => {
+            return crate::macos_permissions::io_error_to_fs_value(
+                "read_failed",
+                &target.resolved,
+                error,
+            );
+        }
     };
     let occurrences = old.match_indices(old_string).count();
     if occurrences != 1 {
@@ -61,12 +67,22 @@ pub fn edit(snapshot: &Value, args: &Value) -> Value {
                 });
             }
             Ok(false) => {}
-            Err(message) => return fail("git_status_failed", path, Some(message)),
+            Err(message) => {
+                return crate::macos_permissions::git_failure_to_value(
+                    &target.root,
+                    "status",
+                    message,
+                );
+            }
         }
     }
     let next = old.replacen(old_string, new_string, 1);
     if let Err(message) = mutation::atomic_write(&target.real, next.as_bytes()) {
-        return fail("write_failed", path, Some(message));
+        return crate::macos_permissions::io_message_to_fs_value(
+            "write_failed",
+            &target.resolved,
+            message,
+        );
     }
     success_with_working(
         json!({
@@ -150,11 +166,21 @@ pub(crate) fn write_bytes(
                 });
             }
             Ok(false) => {}
-            Err(message) => return fail("git_status_failed", path, Some(message)),
+            Err(message) => {
+                return crate::macos_permissions::git_failure_to_value(
+                    &target.root,
+                    "status",
+                    message,
+                );
+            }
         }
     }
     if let Err(message) = mutation::atomic_write(&target.real, content) {
-        return fail("write_failed", path, Some(message));
+        return crate::macos_permissions::io_message_to_fs_value(
+            "write_failed",
+            &target.resolved,
+            message,
+        );
     }
     success_with_working(
         json!({
@@ -194,17 +220,6 @@ fn optional_bool(args: &Value, key: &str) -> Result<Option<bool>, Value> {
 
 fn invalid(message: &str) -> Value {
     json!({"ok": false, "code": "invalid_params", "message": message})
-}
-
-fn fail(reason: &str, path: &str, message: Option<String>) -> Value {
-    let mut output = Map::new();
-    output.insert("ok".to_owned(), json!(false));
-    output.insert("reason".to_owned(), json!(reason));
-    output.insert("path".to_owned(), json!(path));
-    if let Some(message) = message {
-        output.insert("message".to_owned(), json!(message));
-    }
-    Value::Object(output)
 }
 
 #[cfg(test)]

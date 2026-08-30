@@ -35,11 +35,23 @@ pub fn read(snapshot: &Value, args: &Value) -> Value {
     let metadata = match fs::metadata(&managed.real) {
         Ok(value) if value.is_file() => value,
         Ok(_) => return fail("not_a_file", &managed.resolved, None),
-        Err(error) => return fail("stat_failed", &managed.resolved, Some(error.to_string())),
+        Err(error) => {
+            return crate::macos_permissions::io_error_to_fs_value(
+                "stat_failed",
+                &managed.resolved,
+                error,
+            );
+        }
     };
     let data = match fs::read(&managed.real) {
         Ok(value) => value,
-        Err(error) => return fail("read_failed", &managed.resolved, Some(error.to_string())),
+        Err(error) => {
+            return crate::macos_permissions::io_error_to_fs_value(
+                "read_failed",
+                &managed.resolved,
+                error,
+            );
+        }
     };
     let text = String::from_utf8_lossy(&data);
     let lines = text.split('\n').collect::<Vec<_>>();
@@ -118,8 +130,9 @@ pub fn image(snapshot: &Value, args: &Value) -> Result<ImageData, Value> {
     let path = required_str(args, "path")?;
     let managed = fs_security::validate_existing(snapshot, path)?;
     let max_bytes = optional_usize(args, "max_bytes", 1, 8_000_000)?.unwrap_or(2_097_152);
-    let metadata = fs::metadata(&managed.real)
-        .map_err(|error| fail("stat_failed", &managed.resolved, Some(error.to_string())))?;
+    let metadata = fs::metadata(&managed.real).map_err(|error| {
+        crate::macos_permissions::io_error_to_fs_value("stat_failed", &managed.resolved, error)
+    })?;
     if !metadata.is_file() {
         return Err(fail("not_a_file", &managed.resolved, None));
     }
@@ -140,8 +153,9 @@ pub fn image(snapshot: &Value, args: &Value) -> Result<ImageData, Value> {
             "hint": "png/jpeg/gif/webp only",
         })
     })?;
-    let data = fs::read(&managed.real)
-        .map_err(|error| fail("read_failed", &managed.resolved, Some(error.to_string())))?;
+    let data = fs::read(&managed.real).map_err(|error| {
+        crate::macos_permissions::io_error_to_fs_value("read_failed", &managed.resolved, error)
+    })?;
     if data.len() > max_bytes {
         return Err(json!({
             "ok": false,

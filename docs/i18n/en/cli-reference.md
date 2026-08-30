@@ -10,6 +10,7 @@ The normal user path is the native Rust CLI installed from a GitHub Release:
 herdr-mcp install
 herdr-mcp status
 herdr-mcp doctor
+herdr-mcp permissions status
 herdr-mcp update check
 herdr-mcp update apply
 herdr-mcp update status
@@ -18,6 +19,16 @@ herdr-mcp uninstall
 ```
 
 `service ...`, `link ...`, `native-host ...`, `candidate` and `dev` are advanced/internal commands. Do not use a repository checkout, Node.js, npm or `service install` as the normal runtime installation path.
+
+## macOS permissions
+
+```bash
+herdr-mcp permissions status
+herdr-mcp permissions setup
+herdr-mcp permissions verify
+```
+
+`status` is `granted`, `denied`, `needs_setup`, `unknown`, or `timeout`. `setup` may open Privacy & Security and does not grant access. `verify` checks a protected path. If file/git tools return `macos_tcc_access_blocked`, grant Files and Folders or Full Disk Access to `herdr-mcp-broker`, then verify again.
 
 ## Capability discovery: `scan`
 

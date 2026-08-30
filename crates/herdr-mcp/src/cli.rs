@@ -28,6 +28,7 @@ pub enum Command {
     Link(LinkCommand),
     TccBroker(TccBrokerCommand),
     TccBrokerRun,
+    Permissions(crate::macos_permissions::PermissionsCommand),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -189,6 +190,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "__documents-probe" => no_extra(args, Command::DocumentsProbe),
         "__tcc-broker" => no_extra(args, Command::TccBrokerRun),
         "tcc-broker" => parse_tcc_broker(&args[1..]),
+        "permissions" => parse_permissions(&args[1..]),
         "herdr-supervisor" => parse_herdr_supervisor(&args[1..]),
         "scan" => parse_scan(&args[1..]),
         "rollback" => no_extra(args, Command::Service(ServiceCommand::Rollback)),
@@ -591,6 +593,25 @@ fn parse_service(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn parse_permissions(args: &[String]) -> Result<Command, String> {
+    use crate::macos_permissions::PermissionsCommand;
+    match args {
+        [subcommand] if subcommand == "status" => {
+            Ok(Command::Permissions(PermissionsCommand::Status))
+        }
+        [subcommand] if subcommand == "setup" => {
+            Ok(Command::Permissions(PermissionsCommand::Setup))
+        }
+        [subcommand] if subcommand == "verify" => {
+            Ok(Command::Permissions(PermissionsCommand::Verify))
+        }
+        [] => Err("permissions requires status, setup, or verify".to_owned()),
+        [subcommand, ..] => Err(format!(
+            "invalid permissions command or arguments for '{subcommand}'"
+        )),
+    }
+}
+
 fn parse_tcc_broker(args: &[String]) -> Result<Command, String> {
     match args {
         [subcommand] if subcommand == "install" => {
@@ -706,6 +727,7 @@ User path:\n\
   herdr-mcp install\n\
   herdr-mcp status\n\
   herdr-mcp doctor\n\
+  herdr-mcp permissions <status|setup|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|status]\n\
   herdr-mcp rollback\n\
@@ -735,7 +757,7 @@ Advanced / internal:\n\
   herdr-mcp artifact import --url HTTPS_URL --path PROJECT_PATH [--sha256 HEX] [--capability-env NAME] [--overwrite] [--confirm-dirty] [--confirm-busy]\n\
   herdr-mcp dev [--dry-run]\n\
   herdr-mcp candidate [--port 8873]\n\n\
-Prefer the top-level install/status/doctor/scan/update/rollback/uninstall commands\n\
+Prefer the top-level install/status/doctor/permissions/scan/update/rollback/uninstall commands\n\
 for normal lifecycle. Use service ... only for advanced service control\n\
 (for example service install --adopt-node). link status is read-only G5\n\
 ownership/gates reporting. link run starts a foreground Rust Link candidate\n\
@@ -772,6 +794,20 @@ mod tests {
         );
         assert_eq!(parse(args(&["status"])).unwrap().command, Command::Status);
         assert_eq!(parse(args(&["doctor"])).unwrap().command, Command::Doctor);
+        assert_eq!(
+            parse(args(&["permissions", "status"])).unwrap().command,
+            Command::Permissions(crate::macos_permissions::PermissionsCommand::Status)
+        );
+        assert_eq!(
+            parse(args(&["permissions", "setup"])).unwrap().command,
+            Command::Permissions(crate::macos_permissions::PermissionsCommand::Setup)
+        );
+        assert_eq!(
+            parse(args(&["permissions", "verify"])).unwrap().command,
+            Command::Permissions(crate::macos_permissions::PermissionsCommand::Verify)
+        );
+        assert!(parse(args(&["permissions"])).is_err());
+        assert!(parse(args(&["permissions", "grant"])).is_err());
         assert_eq!(
             parse(args(&["herdr-supervisor", "status"]))
                 .unwrap()
@@ -1149,6 +1185,7 @@ mod tests {
             "herdr-mcp install",
             "herdr-mcp status",
             "herdr-mcp doctor",
+            "herdr-mcp permissions",
             "herdr-mcp scan",
             "herdr-mcp update",
             "herdr-mcp rollback",

@@ -195,20 +195,35 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         "herdr_fs_image" => {
             return Ok(
                 match tcc_broker::route_fs_git("fs_image", &context.cache.snapshot(), &arguments) {
-                    Some(Ok(value)) => match tcc_broker::image_tool_result_from_broker(&value) {
-                        Ok(tool) => tool,
-                        Err(message) => tool_result(
-                            json!({ "ok": false, "code": "broker_image_invalid", "message": message }),
-                            true,
-                        ),
-                    },
+                    Some(Ok(value)) => {
+                        let value = crate::macos_permissions::map_fs_git_result(value);
+                        match tcc_broker::image_tool_result_from_broker(&value) {
+                            Ok(tool) => tool,
+                            Err(_)
+                                if value.get("code").and_then(Value::as_str)
+                                    == Some("macos_tcc_access_blocked") =>
+                            {
+                                tool_result(value, true)
+                            }
+                            Err(message) => tool_result(
+                                json!({ "ok": false, "code": "broker_image_invalid", "message": message }),
+                                true,
+                            ),
+                        }
+                    }
                     Some(Err(message)) => tool_result(
-                        json!({ "ok": false, "code": "broker_failed", "message": message }),
+                        crate::macos_permissions::map_fs_git_result(json!({
+                            "ok": false,
+                            "code": "broker_failed",
+                            "message": message
+                        })),
                         true,
                     ),
                     None => match fs_tools::image(&context.cache.snapshot(), &arguments) {
                         Ok(image) => image_tool_result(image),
-                        Err(error) => tool_result(error, false),
+                        Err(error) => {
+                            tool_result(crate::macos_permissions::map_fs_git_result(error), false)
+                        }
                     },
                 },
             );
@@ -274,7 +289,7 @@ fn tool_result(value: Value, is_error: bool) -> Value {
 /// routing is enabled, the broker result is returned as the tool result value
 /// (or an error value on broker failure).
 fn route_fs_git(op: &str, snapshot: &Value, arguments: &Value) -> Value {
-    match tcc_broker::route_fs_git(op, snapshot, arguments) {
+    let value = match tcc_broker::route_fs_git(op, snapshot, arguments) {
         None => match op {
             "fs_read" => fs_tools::read(snapshot, arguments),
             "fs_list" => fs_tools::list(snapshot, arguments),
@@ -291,7 +306,8 @@ fn route_fs_git(op: &str, snapshot: &Value, arguments: &Value) -> Value {
             "code": "broker_failed",
             "message": message,
         }),
-    }
+    };
+    crate::macos_permissions::map_fs_git_result(value)
 }
 
 fn id(request: &Value) -> Value {
@@ -346,6 +362,27 @@ mod tests {
         assert_eq!(result["resultType"], "complete");
         assert_eq!(result["supportedVersions"][0], SDK_WIRE_PROTOCOL);
         assert_eq!(result["_meta"]["herdr_contract_epoch"], 2);
+    }
+
+    #[test]
+    fn fs_git_broker_timeout_maps_to_macos_tcc_without_masking_other_errors() {
+        let timeout = route_fs_git_map_for_test(json!({
+            "ok": false,
+            "code": "broker_failed",
+            "message": "broker request timed out"
+        }));
+        assert_eq!(timeout["code"], "macos_tcc_access_blocked");
+        let outside = route_fs_git_map_for_test(json!({
+            "ok": false,
+            "reason": "outside_managed_roots",
+            "message": "not in a project"
+        }));
+        assert_eq!(outside["reason"], "outside_managed_roots");
+        assert_ne!(outside["code"], "macos_tcc_access_blocked");
+    }
+
+    fn route_fs_git_map_for_test(value: Value) -> Value {
+        crate::macos_permissions::map_fs_git_result(value)
     }
 
     #[test]

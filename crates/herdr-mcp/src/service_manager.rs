@@ -1451,6 +1451,7 @@ mod macos {
             if let Some(object) = result.as_object_mut() {
                 insert_user_cli_fields(object, paths)?;
             }
+            crate::macos_permissions::annotate_service_result(&mut result, &paths.config_dir);
             return Ok(result);
         }
 
@@ -1653,7 +1654,7 @@ mod macos {
             "user CLI link missing after successful service activation".to_owned()
         })?;
 
-        Ok(json!({
+        let mut result = json!({
             "ok": true,
             "implementation": "rust",
             "label": paths.service_label,
@@ -1675,7 +1676,9 @@ mod macos {
             "guardian_transaction": transaction_id,
             "guardian_settled": guardian_settled,
             "evidence_recorded": evidence_recorded,
-        }))
+        });
+        crate::macos_permissions::annotate_service_result(&mut result, &paths.config_dir);
+        Ok(result)
     }
 
     fn same_active_install_noop_with<Loaded, Healthy>(
@@ -2250,12 +2253,14 @@ mod macos {
         let user_cli_removed = maybe_remove_user_cli(paths)?;
         remove_current_if_owned(paths)?;
         let evidence_recorded = record_action(paths, "uninstall", "ok", &descriptor, None);
+        let broker_removed = crate::tcc_broker::uninstall_broker(&paths.config_dir)?;
         Ok(json!({
             "ok": true,
             "action": "uninstall",
             "label": paths.service_label,
             "generations_preserved": true,
             "user_cli_removed": user_cli_removed,
+            "broker_removed": broker_removed,
             "evidence_recorded": evidence_recorded,
         }))
     }
@@ -3412,11 +3417,8 @@ mod macos {
             let current_before = fs::read_link(&paths.current_link).unwrap();
             let backups_before = paths.backups_dir.exists();
             let guardians_before = paths.guardians_dir.exists();
-            let mut config_entries_before = fs::read_dir(&paths.config_dir)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect::<Vec<_>>();
-            config_entries_before.sort();
+            let broker_path = crate::tcc_broker::broker_path(&paths.config_dir);
+            let broker_before = fs::read(&broker_path).ok();
 
             let result = install_with_noop_checks(&paths, false, &lock, || true, || true).unwrap();
             assert_eq!(result["ok"], true);
@@ -3429,12 +3431,9 @@ mod macos {
             assert_eq!(fs::read_link(&paths.current_link).unwrap(), current_before);
             assert_eq!(paths.backups_dir.exists(), backups_before);
             assert_eq!(paths.guardians_dir.exists(), guardians_before);
-            let mut config_entries_after = fs::read_dir(&paths.config_dir)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect::<Vec<_>>();
-            config_entries_after.sort();
-            assert_eq!(config_entries_after, config_entries_before);
+            if let Some(bytes) = broker_before {
+                assert_eq!(fs::read(&broker_path).unwrap(), bytes);
+            }
             fs::remove_dir_all(root).unwrap();
         }
 

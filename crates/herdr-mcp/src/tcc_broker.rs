@@ -107,9 +107,7 @@ pub fn run_cli(command: TccBrokerCommand) -> Result<ExitCode, String> {
         }
         TccBrokerCommand::Uninstall => {
             let path = broker_path(&config_dir);
-            if path.exists() {
-                std::fs::remove_file(&path)
-                    .map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
+            if uninstall_broker(&config_dir)? {
                 println!("tcc-broker removed: {}", path.display());
             } else {
                 println!("tcc-broker not installed: {}", path.display());
@@ -158,6 +156,26 @@ pub fn install(config_dir: &Path, force: bool) -> Result<(), String> {
         }
     }
     atomic_write(&target, &source_bytes, 0o700)
+}
+
+/// Remove the stable broker binary. Full uninstall may call this; ordinary
+/// runtime/generation rotation must not. Returns whether a file was removed.
+pub fn uninstall_broker(config_dir: &Path) -> Result<bool, String> {
+    let path = broker_path(config_dir);
+    if let Ok(metadata) = std::fs::symlink_metadata(&path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(format!("broker {} must not be a symlink", path.display()));
+    }
+    if !path.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_file(&path)
+        .map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    Ok(true)
 }
 
 /// Read-only status of an installed broker.

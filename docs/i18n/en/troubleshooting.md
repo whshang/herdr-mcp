@@ -37,7 +37,10 @@ On macOS LaunchAgent installations:
 ```bash
 herdr-mcp status
 herdr-mcp logs
+herdr-mcp permissions status
 ```
+
+If file/git tools return `macos_tcc_access_blocked`, run `herdr-mcp permissions setup`, grant access to `herdr-mcp-broker`, then `herdr-mcp permissions verify`. Ordinary `not_found` errors are unrelated.
 
 ### Is Herdr itself available?
 
