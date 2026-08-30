@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.78";
+const H2W_CONTENT_VERSION = "0.1.79";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -1482,50 +1482,77 @@ const H2W_CONTENT_VERSION = "0.1.78";
   // conversation key instead of monkey-patching history.pushState: content scripts
   // run in an isolated world and cannot reliably intercept the page's History API.
   let registeredConvKey = null;
+  const continuityBackfillInFlight = new Set();
 
   async function backfillCurrentChatGptContinuity(convKey, reason = "register") {
     if (ADAPTER.name !== "chatgpt") return null;
     const conversationId = chatGptConversationId();
-    if (!conversationId || !convKey) return null;
+    if (!conversationId || !convKey || continuityBackfillInFlight.has(convKey)) return null;
+    continuityBackfillInFlight.add(convKey);
 
     // Project-home -> /c/<id> materialization happens after the trusted Enter
-    // event. At Project home there is no conversation health record yet, so the
-    // first accepted user message can otherwise become the new DOM baseline and
-    // never emit h2w_turn_started. Use ChatGPT's server-confirmed conversation
-    // mapping as an idempotent repair source once the concrete route exists.
-    for (const delayMs of [0, 250, 750]) {
-      if (delayMs > 0) await wait(delayMs);
-      const server = await fetchChatGptConversationSnapshot();
-      const userText = normText(server?.userText || "");
-      if (!server?.ok || !userText) continue;
+    // event. At Project home there is no concrete conversation health record, so
+    // the first accepted user message can otherwise become the new DOM baseline.
+    // Prefer ChatGPT's server mapping when it is readable, but never depend on the
+    // private backend: some logged-in surfaces return conversation_inaccessible
+    // while the same conversation is already rendered with stable message ids.
+    let server = null;
+    try {
+      server = await fetchChatGptConversationSnapshot();
+      for (const delayMs of [0, 250, 750, 2000, 5000]) {
+        if (delayMs > 0) await wait(delayMs);
+        if (chatGptConversationId() !== conversationId) return null;
 
-      const submitAt = Number(server.userCreatedAt || Date.now());
-      if (CONVERSATION_HEALTH && conversationHealth && server.finished !== true) {
-        const currentSubmitAt = Number(conversationHealth.last_user_submit_at || 0);
-        if (currentSubmitAt < submitAt) {
-          markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth, submitAt));
+        const domUser = latestDomMessageSnapshot("user");
+        const domAssistant = latestDomMessageSnapshot("assistant");
+        const userText = normText(server?.ok && server.userText ? server.userText : domUser.text);
+        if (!userText) continue;
+
+        const assistantRunning = isTurnInProgress();
+        const assistantFinished = server?.ok && server.finished === true
+          ? true
+          : (!assistantRunning && Boolean(domAssistant.text));
+        const submitAt = Number(
+          (server?.ok ? server.userCreatedAt : null)
+          || domUser.messageAt
+          || Date.now(),
+        );
+        if (CONVERSATION_HEALTH && conversationHealth && !assistantFinished) {
+          const currentSubmitAt = Number(conversationHealth.last_user_submit_at || 0);
+          if (currentSubmitAt < submitAt) {
+            markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth, submitAt));
+          }
+        }
+
+        const result = await sendBg({
+          type: "h2w_continuity_backfill",
+          convKey,
+          conversation_id: conversationId,
+          userMessageId: (server?.ok ? server.userMessageId : null) || domUser.messageId || null,
+          userText,
+          userCreatedAt: (server?.ok ? server.userCreatedAt : null) || domUser.messageAt || submitAt,
+          messageId: assistantFinished
+            ? ((server?.ok && server.finished === true ? server.messageId : null) || domAssistant.messageId || null)
+            : null,
+          assistantText: assistantFinished
+            ? normText((server?.ok && server.finished === true ? server.text : "") || domAssistant.text)
+            : "",
+          assistantUpdatedAt: assistantFinished
+            ? ((server?.ok && server.finished === true
+              ? (server.updatedAt || server.createdAt)
+              : domAssistant.messageAt) || Date.now())
+            : null,
+        });
+        if (result?.ok) {
+          const source = server?.ok ? "server" : "dom";
+          console.log(`[h2w] continuity backfill durable (${reason}/${source}): ${convKey}`);
+          return result;
         }
       }
-
-      const result = await sendBg({
-        type: "h2w_continuity_backfill",
-        convKey,
-        conversation_id: conversationId,
-        userMessageId: server.userMessageId || null,
-        userText,
-        userCreatedAt: server.userCreatedAt || submitAt,
-        messageId: server.finished === true ? (server.messageId || null) : null,
-        assistantText: server.finished === true ? normText(server.text || "") : "",
-        assistantUpdatedAt: server.finished === true
-          ? (server.updatedAt || server.createdAt || Date.now())
-          : null,
-      });
-      if (result?.ok) {
-        console.log(`[h2w] continuity backfill durable (${reason}): ${convKey}`);
-        return result;
-      }
+      return null;
+    } finally {
+      continuityBackfillInFlight.delete(convKey);
     }
-    return null;
   }
 
   async function registerCurrentConversation(reason = "startup") {
@@ -1640,10 +1667,13 @@ const H2W_CONTENT_VERSION = "0.1.78";
     return "";
   }
 
-  function latestDomAssistantSnapshot() {
-    const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+  function latestDomMessageSnapshot(role) {
+    if (role !== "user" && role !== "assistant") {
+      return { messageId: null, text: "", messageAt: null };
+    }
+    const nodes = [...document.querySelectorAll(`[data-message-author-role="${role}"]`)];
     const el = nodes[nodes.length - 1] || null;
-    if (!el) return { messageId: null, text: "", messageAt: null, changedAt: null };
+    if (!el) return { messageId: null, text: "", messageAt: null };
     const container = el.closest("[data-message-id]") || el.closest("[data-turn-id]") || el;
     const timeNode = container?.querySelector?.("time[datetime]") || null;
     const parsedTime = timeNode?.getAttribute?.("datetime") ? Date.parse(timeNode.getAttribute("datetime")) : NaN;
@@ -1651,6 +1681,12 @@ const H2W_CONTENT_VERSION = "0.1.78";
       messageId: container?.getAttribute?.("data-message-id") || el.getAttribute("data-message-id") || null,
       text: String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim(),
       messageAt: Number.isFinite(parsedTime) ? parsedTime : null,
+    };
+  }
+
+  function latestDomAssistantSnapshot() {
+    return {
+      ...latestDomMessageSnapshot("assistant"),
       changedAt: Number(conversationHealth?.last_assistant_progress_at || conversationHealth?.last_turn_end_at || 0) || null,
     };
   }
