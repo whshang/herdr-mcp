@@ -1,8 +1,7 @@
 //! v0.4.2 local skill registry: deterministic, bounded, canonical-path-confined
-//! discovery of local `SKILL.md` / `skill.md` skills under the known roots
-//! `.agents/skills` and `.claude/skills`, per scope (project and user).
-//! Discovery returns metadata only; load returns the body on demand. Never a
-//! vector for arbitrary home scanning.
+//! discovery of local `SKILL.md` / `skill.md` skills from `.agents/skills`
+//! scopes (project and user). Discovery returns metadata only; load returns the
+//! body on demand. Never a vector for arbitrary home scanning.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,27 +40,27 @@ pub struct LocalSkillRegistry;
 
 impl LocalSkillRegistry {
     /// Discover local skills under an optional project root first, then the user
-    /// home, in frozen precedence order: within each scope `.agents/skills` is
-    /// enumerated before `.claude/skills`, and project scope precedes user
-    /// scope. Precedence deduplication (builtin > project > user, and
-    /// `.agents` > `.claude` inside a scope) happens in
-    /// [`crate::progressive_skills::ProgressiveSkillService`] by keeping the
-    /// first occurrence for a given skill id.
+    /// home. Precedence deduplication (builtin > project > user) happens in
+    /// [`crate::progressive_skills::ProgressiveSkillService`].
     pub fn discover(project_root: Option<&Path>, home: &Path) -> LocalDiscovery {
         let mut discovery = LocalDiscovery::default();
         if let Some(root) = project_root
             && let Ok(canon) = fs::canonicalize(root)
         {
             let identity = format!("project:{}", canon.display());
-            for sub in [".agents/skills", ".claude/skills"] {
-                collect_base(&canon.join(sub), &identity, &mut discovery.project);
-            }
+            collect_base(
+                &canon.join(".agents/skills"),
+                &identity,
+                &mut discovery.project,
+            );
         }
         if let Ok(home_canon) = fs::canonicalize(home) {
             let identity = format!("user:{}", home_canon.display());
-            for sub in [".agents/skills", ".claude/skills"] {
-                collect_base(&home_canon.join(sub), &identity, &mut discovery.user);
-            }
+            collect_base(
+                &home_canon.join(".agents/skills"),
+                &identity,
+                &mut discovery.user,
+            );
         }
         discovery
     }
