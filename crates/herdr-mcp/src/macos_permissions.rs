@@ -17,37 +17,54 @@ use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "macos", test))]
 const HINT_SETUP: &str = "run `herdr-mcp permissions setup`";
 const HINT_DENIED: &str = "enable Files and Folders or Full Disk Access for herdr-mcp-broker, then `herdr-mcp permissions verify`";
+#[cfg(any(target_os = "macos", test))]
 const HINT_TIMEOUT: &str =
     "probe timed out (2s); finish the macOS prompt, then `herdr-mcp permissions verify`";
+#[cfg(any(target_os = "macos", test))]
 const HINT_UNKNOWN: &str = "re-run `herdr-mcp permissions verify`";
+#[cfg(any(target_os = "macos", test))]
 const HINT_GRANTED: &str = "protected path readable";
+#[cfg(any(not(target_os = "macos"), test))]
 const HINT_NOT_APPLICABLE: &str = "macOS only";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermissionState {
+    #[cfg(any(target_os = "macos", test))]
     Granted,
+    #[cfg(any(target_os = "macos", test))]
     Denied,
+    #[cfg(any(target_os = "macos", test))]
     NeedsSetup,
+    #[cfg(any(target_os = "macos", test))]
     Unknown,
+    #[cfg(any(target_os = "macos", test))]
     Timeout,
-    #[allow(dead_code)]
+    #[cfg(any(not(target_os = "macos"), test))]
     NotApplicable,
 }
 
 impl PermissionState {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            #[cfg(any(target_os = "macos", test))]
             Self::Granted => "granted",
+            #[cfg(any(target_os = "macos", test))]
             Self::Denied => "denied",
+            #[cfg(any(target_os = "macos", test))]
             Self::NeedsSetup => "needs_setup",
+            #[cfg(any(target_os = "macos", test))]
             Self::Unknown => "unknown",
+            #[cfg(any(target_os = "macos", test))]
             Self::Timeout => "timeout",
+            #[cfg(any(not(target_os = "macos"), test))]
             Self::NotApplicable => "not_applicable",
         }
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn hint(self) -> &'static str {
         match self {
             Self::Granted => HINT_GRANTED,
@@ -55,12 +72,20 @@ impl PermissionState {
             Self::NeedsSetup => HINT_SETUP,
             Self::Unknown => HINT_UNKNOWN,
             Self::Timeout => HINT_TIMEOUT,
+            #[cfg(test)]
             Self::NotApplicable => HINT_NOT_APPLICABLE,
         }
     }
 
     fn doctor_pass(self) -> bool {
-        !matches!(self, Self::Denied | Self::Timeout)
+        #[cfg(any(target_os = "macos", test))]
+        {
+            !matches!(self, Self::Denied | Self::Timeout)
+        }
+        #[cfg(all(not(target_os = "macos"), not(test)))]
+        {
+            true
+        }
     }
 }
 
@@ -105,14 +130,14 @@ pub(crate) fn collect_status() -> Result<PermissionReport, String> {
     {
         let config_dir = crate::paths::RuntimePaths::discover()?.config_dir;
         let path = tcc_broker::broker_path(&config_dir);
-        return Ok(PermissionReport {
+        Ok(PermissionReport {
             state: PermissionState::NotApplicable,
             broker_installed: tcc_broker::status(&path).is_some(),
             broker_path: path,
             broker_update_available: false,
             probe: "skipped",
             hint: HINT_NOT_APPLICABLE.to_owned(),
-        });
+        })
     }
 
     #[cfg(target_os = "macos")]
@@ -213,7 +238,7 @@ fn run_verify() -> Result<ExitCode, String> {
     {
         println!("status: not_applicable");
         println!("hint: {HINT_NOT_APPLICABLE}");
-        return Ok(ExitCode::SUCCESS);
+        Ok(ExitCode::SUCCESS)
     }
 
     #[cfg(target_os = "macos")]
@@ -286,6 +311,7 @@ pub fn preserve_or_install_broker(config_dir: &Path) -> Result<BrokerSync, Strin
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn annotate_service_result(result: &mut Value, config_dir: &Path) {
     match preserve_or_install_broker(config_dir) {
         Ok(sync) => {
