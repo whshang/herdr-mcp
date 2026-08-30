@@ -126,7 +126,9 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
 
     #[cfg(target_os = "macos")]
     {
-        if let Err(native_host_error) = native_host_install::sync_owned_runtime_from_active() {
+        if !paths.instance.is_named()
+            && let Err(native_host_error) = native_host_install::sync_owned_runtime_from_active()
+        {
             return Err(format!(
                 "service install committed but owned native-host runtime sync failed: {native_host_error}"
             ));

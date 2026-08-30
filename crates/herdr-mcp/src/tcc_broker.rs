@@ -12,15 +12,21 @@
 //! rotating `runtime/generations/rust-<sha256>/` runtime generations. Because
 //! the broker path and binary are never rewritten by service install / update
 //! apply, the broker keeps one stable identity across runtime upgrades. The
-//! broker is a one-shot JSON-over-stdin/stdout process that dispatches only a
-//! strict allowlist of bounded operations to the existing fs/git security
-//! gates. It never exposes arbitrary shell or arbitrary operation names.
+//! broker has two internal entry points. The one-shot JSON broker dispatches
+//! only a strict allowlist of bounded fs/git operations to the existing
+//! security gates. The exec-host entry point may launch the command already
+//! authorized by `herdr_exec_start`, but only when its direct parent is the
+//! exact managed `runtime/current` binary. This keeps shell descendants under
+//! the stable TCC identity without creating a standalone shell interface for
+//! unrelated callers.
 //!
 //! Routing is opt-in via `HERDR_MCP_TCC_BROKER=1`; the default MCP path stays
 //! direct in-process execution. This is a feasibility layer for a non-paid
 //! macOS TCC story — it does not by itself grant TCC permission, and it does
 //! not claim to replace a Developer ID / notarization.
 
+#[cfg(target_os = "macos")]
+use crate::child_process;
 use crate::cli::TccBrokerCommand;
 use crate::fs_mutation;
 use crate::fs_patch;
@@ -31,7 +37,9 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
+use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Broker protocol version. Bump only on a breaking wire change.
@@ -42,6 +50,11 @@ pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Hard wall-clock budget for a single broker request.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
+const EXEC_HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "macos")]
+const EXEC_HOST_MAX_REQUEST_BYTES: usize = 256 * 1024;
+const EXEC_HOST_ID: &str = "herdr-tcc-exec-host-v1";
 
 /// The 8 focused operations the broker may dispatch. This is the complete
 /// allowlist — no arbitrary operation names are accepted.
@@ -54,9 +67,184 @@ pub fn broker_path(config_dir: &Path) -> PathBuf {
     config_dir.join("tcc-broker").join("herdr-mcp-broker")
 }
 
-/// Run the one-shot broker mode (`__tcc-broker`). Reads a single bounded JSON
-/// request from stdin, dispatches it, and writes a single bounded JSON response
-/// to stdout. Returns a process exit code.
+/// Run the stable exec-host mode used by `herdr_exec_start` on macOS.
+/// `--probe` is intentionally side-effect free and allows service install to
+/// verify that an already-authorized, older broker understands this protocol.
+pub fn run_exec_host(probe: bool) -> ExitCode {
+    if probe {
+        println!("{EXEC_HOST_ID}");
+        return ExitCode::SUCCESS;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("tcc exec host is macOS-only");
+        ExitCode::from(2)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(error) = verify_exec_host_parent() {
+            eprintln!("tcc exec host refused parent: {error}");
+            return ExitCode::from(2);
+        }
+        let request = match read_bounded_stdin(EXEC_HOST_MAX_REQUEST_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("tcc exec host request failed: {error}");
+                return ExitCode::from(2);
+            }
+        };
+        let value: Value = match serde_json::from_slice(&request) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("tcc exec host request is invalid JSON: {error}");
+                return ExitCode::from(2);
+            }
+        };
+        if value.get("protocol").and_then(Value::as_str) != Some(EXEC_HOST_ID)
+            || value.get("version").and_then(Value::as_u64) != Some(1)
+        {
+            eprintln!("tcc exec host protocol mismatch");
+            return ExitCode::from(2);
+        }
+        let Some(command) = value.get("command").and_then(Value::as_str) else {
+            eprintln!("tcc exec host command missing");
+            return ExitCode::from(2);
+        };
+        if command.is_empty() {
+            eprintln!("tcc exec host command must not be empty");
+            return ExitCode::from(2);
+        }
+
+        let shell = crate::exec_sessions::resolve_exec_shell();
+        let status = match Command::new(shell)
+            .args(["-lc", command])
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+        {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("tcc exec host cannot start shell: {error}");
+                return ExitCode::from(2);
+            }
+        };
+        let code = status.code().unwrap_or(1).clamp(0, 255) as u8;
+        ExitCode::from(code)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_exec_host_parent() -> Result<(), String> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let paths = crate::paths::RuntimePaths::discover()?;
+    let current_binary = paths
+        .config_dir
+        .join("runtime")
+        .join("current")
+        .join("herdr-mcp");
+    let expected = std::fs::canonicalize(&current_binary).map_err(|error| {
+        format!(
+            "cannot resolve managed runtime {}: {error}",
+            current_binary.display()
+        )
+    })?;
+    let ppid = unsafe { libc::getppid() };
+    let mut buffer = vec![0_u8; 4096];
+    let length = unsafe {
+        libc::proc_pidpath(
+            ppid,
+            buffer.as_mut_ptr().cast::<libc::c_void>(),
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 {
+        return Err(format!("cannot resolve parent executable for pid {ppid}"));
+    }
+    buffer.truncate(length as usize);
+    let parent = PathBuf::from(OsString::from_vec(buffer));
+    let parent = std::fs::canonicalize(&parent)
+        .map_err(|error| format!("cannot canonicalize parent {}: {error}", parent.display()))?;
+    if parent != expected {
+        return Err(format!(
+            "parent {} is not managed runtime {}",
+            parent.display(),
+            expected.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the installed stable broker supports the exec-host v1 protocol.
+pub fn exec_host_capable(config_dir: &Path) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = config_dir;
+        false
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let path = broker_path(config_dir);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            return false;
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return false;
+        }
+        let mut command = Command::new(&path);
+        command.arg("__tcc-exec-host").arg("--probe");
+        match child_process::run_bounded_output(&mut command, EXEC_HOST_PROBE_TIMEOUT, 4096) {
+            Ok(Some(output)) if output.status.success() && !output.truncated => {
+                String::from_utf8_lossy(&output.stdout).trim() == EXEC_HOST_ID
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Prepare a stable broker process and bounded stdin payload for one exec
+/// session. The caller still owns the session registry, stdout/stderr pipes,
+/// process group and kill lifecycle.
+pub(crate) fn prepare_exec_host(command: &str) -> Result<Option<(Command, Vec<u8>)>, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = command;
+        Ok(None)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if std::env::var("HERDR_MCP_TCC_BROKER").ok().as_deref() != Some("1") {
+            return Ok(None);
+        }
+        let paths = crate::paths::RuntimePaths::discover()?;
+        let broker = broker_path(&paths.config_dir);
+        if !broker.is_file() {
+            return Err(format!(
+                "stable permissions broker missing at {}; run `herdr-mcp permissions setup`",
+                broker.display()
+            ));
+        }
+        let payload = serde_json::to_vec(&json!({
+            "protocol": EXEC_HOST_ID,
+            "version": 1,
+            "command": command,
+        }))
+        .map_err(|error| format!("cannot encode tcc exec request: {error}"))?;
+        if payload.len() > EXEC_HOST_MAX_REQUEST_BYTES {
+            return Err(format!(
+                "exec command exceeds stable broker request budget of {EXEC_HOST_MAX_REQUEST_BYTES} bytes"
+            ));
+        }
+        let mut process = Command::new(broker);
+        process.arg("__tcc-exec-host");
+        Ok(Some((process, payload)))
+    }
+}
+
 pub fn run_broker_once() -> ExitCode {
     let request = match read_bounded_stdin(MAX_REQUEST_BYTES) {
         Ok(bytes) => bytes,

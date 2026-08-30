@@ -28,6 +28,9 @@ pub enum Command {
     Link(LinkCommand),
     TccBroker(TccBrokerCommand),
     TccBrokerRun,
+    TccExecHost {
+        probe: bool,
+    },
     Permissions(crate::macos_permissions::PermissionsCommand),
 }
 
@@ -189,6 +192,11 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "doctor" => no_extra(args, Command::Doctor),
         "__documents-probe" => no_extra(args, Command::DocumentsProbe),
         "__tcc-broker" => no_extra(args, Command::TccBrokerRun),
+        "__tcc-exec-host" => match &args[1..] {
+            [] => Ok(Command::TccExecHost { probe: false }),
+            [flag] if flag == "--probe" => Ok(Command::TccExecHost { probe: true }),
+            _ => Err("__tcc-exec-host accepts only --probe".to_owned()),
+        },
         "tcc-broker" => parse_tcc_broker(&args[1..]),
         "permissions" => parse_permissions(&args[1..]),
         "herdr-supervisor" => parse_herdr_supervisor(&args[1..]),
@@ -600,12 +608,19 @@ fn parse_permissions(args: &[String]) -> Result<Command, String> {
             Ok(Command::Permissions(PermissionsCommand::Status))
         }
         [subcommand] if subcommand == "setup" => {
-            Ok(Command::Permissions(PermissionsCommand::Setup))
+            Ok(Command::Permissions(PermissionsCommand::Setup {
+                upgrade_broker: false,
+            }))
+        }
+        [subcommand, flag] if subcommand == "setup" && flag == "--upgrade-broker" => {
+            Ok(Command::Permissions(PermissionsCommand::Setup {
+                upgrade_broker: true,
+            }))
         }
         [subcommand] if subcommand == "verify" => {
             Ok(Command::Permissions(PermissionsCommand::Verify))
         }
-        [] => Err("permissions requires status, setup, or verify".to_owned()),
+        [] => Err("permissions requires status, setup [--upgrade-broker], or verify".to_owned()),
         [subcommand, ..] => Err(format!(
             "invalid permissions command or arguments for '{subcommand}'"
         )),
@@ -727,7 +742,7 @@ User path:\n\
   herdr-mcp install\n\
   herdr-mcp status\n\
   herdr-mcp doctor\n\
-  herdr-mcp permissions <status|setup|verify>\n\
+  herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|status]\n\
   herdr-mcp rollback\n\
@@ -800,12 +815,29 @@ mod tests {
         );
         assert_eq!(
             parse(args(&["permissions", "setup"])).unwrap().command,
-            Command::Permissions(crate::macos_permissions::PermissionsCommand::Setup)
+            Command::Permissions(crate::macos_permissions::PermissionsCommand::Setup {
+                upgrade_broker: false
+            })
         );
         assert_eq!(
             parse(args(&["permissions", "verify"])).unwrap().command,
             Command::Permissions(crate::macos_permissions::PermissionsCommand::Verify)
         );
+        assert_eq!(
+            parse(args(&["permissions", "setup", "--upgrade-broker"]))
+                .unwrap()
+                .command,
+            Command::Permissions(crate::macos_permissions::PermissionsCommand::Setup {
+                upgrade_broker: true
+            })
+        );
+        assert_eq!(
+            parse(args(&["__tcc-exec-host", "--probe"]))
+                .unwrap()
+                .command,
+            Command::TccExecHost { probe: true }
+        );
+        assert!(parse(args(&["__tcc-exec-host", "--bogus"])).is_err());
         assert!(parse(args(&["permissions"])).is_err());
         assert!(parse(args(&["permissions", "grant"])).is_err());
         assert_eq!(
