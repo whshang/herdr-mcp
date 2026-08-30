@@ -108,7 +108,7 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         .unwrap_or_else(|| json!({"ok": false}));
     let inspect_healthy = inspect_result["ok"].as_bool() == Some(true);
     let event_cache = probe_event_cache(paths);
-    let documents_permission = macos_privacy::probe_documents_permission();
+    let documents_permission = macos_privacy::probe_documents_permission(&paths.config_dir);
     let code_identity = macos_privacy::probe_code_identity();
     println!("Herdr MCP doctor");
     print_check("runtime endpoint", runtime_healthy);
@@ -124,6 +124,7 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
         "{}",
         crate::macos_permissions::doctor_layer_from(&macos_permissions)
     );
+    println!("{}", crate::tcc_broker::doctor_line(&paths.config_dir));
     println!("{}", code_identity.doctor_line());
     println!("{}", herdr_supervisor::doctor_line());
     println!("{}", crate::child_process::doctor_line());

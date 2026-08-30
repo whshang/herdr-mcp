@@ -42,6 +42,7 @@ test("CI/CD and documentation publishing entrypoints are tracked in the release 
     ".github/workflows/cloudflare-edge.yml",
     "scripts/release-gate.sh",
     "scripts/sign-macos-release.sh",
+    "scripts/sign-macos-tcc-broker.sh",
     "scripts/build-site.mjs",
     "assets/herdr-mcp-SKILL.md",
     "site/index.html",
@@ -242,13 +243,17 @@ test("tagged releases do not require paid Apple Developer signing", async () => 
   assert.doesNotMatch(release, /HERDR_MACOS_TEAM_ID/);
   assert.doesNotMatch(release, /scripts\/sign-macos-release\.sh/);
   // Keep the optional signer available for downstream/private distributions.
-  assert.match(signer, /STABLE_IDENTIFIER="dev\.herdr\.mcp"/);
+  assert.match(signer, /STABLE_IDENTIFIER="\$\{HERDR_MACOS_SIGNING_IDENTIFIER:-dev\.herdr\.mcp\}"/);
   assert.match(signer, /--options runtime/);
   assert.match(signer, /--timestamp/);
   assert.match(signer, /--identifier "\$STABLE_IDENTIFIER"/);
   assert.match(signer, /TeamIdentifier is missing/);
   assert.match(signer, /does not match expected/);
   assert.match(signer, /designated requirement is still cdhash-bound/);
+  const brokerSigner = await readFile(join(ROOT, "scripts/sign-macos-tcc-broker.sh"), "utf8");
+  assert.match(brokerSigner, /cc\.agentforme\.herdr\.tcc-broker/);
+  assert.match(brokerSigner, /persistent local code-signing identity/);
+  assert.match(brokerSigner, /designated requirement is cdhash-bound/);
 });
 
 test("Rust GitHub Release provenance keeps manual qualification attested and tag-only publish fail-closed", async () => {

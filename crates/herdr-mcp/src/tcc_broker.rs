@@ -32,11 +32,22 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Broker protocol version. Bump only on a breaking wire change.
 pub const PROTOCOL_VERSION: u32 = 1;
+/// Compatibility revision of the long-lived broker implementation. This is
+/// deliberately independent of the rotating `herdr-mcp` runtime bytes. Bump
+/// only when the installed broker itself must be replaced.
+pub const BROKER_COMPAT_REVISION: u32 = 1;
+/// Stable signing identifier reserved for separately signed broker candidates.
+pub const BROKER_SIGNING_IDENTIFIER: &str = "cc.agentforme.herdr.tcc-broker";
+/// Brokers installed before revision metadata existed are the v0.4.2 revision.
+const LEGACY_BROKER_COMPAT_REVISION: u32 = 1;
+const BROKER_METADATA_SCHEMA: u32 = 1;
 /// Maximum accepted request size (bytes) on stdin.
 pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum response size (bytes) written to stdout.
@@ -53,6 +64,217 @@ const ALLOWED_OPS: [&str; 8] = [
 /// Stable broker path, independent of `runtime/generations`.
 pub fn broker_path(config_dir: &Path) -> PathBuf {
     config_dir.join("tcc-broker").join("herdr-mcp-broker")
+}
+
+pub fn broker_metadata_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("tcc-broker").join("metadata.json")
+}
+
+fn broker_candidate_path() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("HERDR_MCP_TCC_BROKER_CANDIDATE") {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            return Err(format!(
+                "TCC broker candidate is not a regular file: {}",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
+    std::env::current_exe().map_err(|error| format!("cannot resolve current executable: {error}"))
+}
+
+fn write_broker_metadata(config_dir: &Path) -> Result<(), String> {
+    let value = json!({
+        "schema_version": BROKER_METADATA_SCHEMA,
+        "compat_revision": BROKER_COMPAT_REVISION,
+        "preferred_signing_identifier": BROKER_SIGNING_IDENTIFIER,
+    });
+    let bytes = serde_json::to_vec_pretty(&value)
+        .map_err(|error| format!("cannot encode TCC broker metadata: {error}"))?;
+    atomic_write(&broker_metadata_path(config_dir), &bytes, 0o600)
+}
+
+/// Compatibility revision of an installed broker. A pre-metadata broker is
+/// explicitly treated as the first v0.4.2 revision rather than compared to
+/// the current runtime binary bytes.
+pub fn installed_compat_revision(config_dir: &Path) -> Option<u32> {
+    status(&broker_path(config_dir))?;
+    let metadata = std::fs::read(broker_metadata_path(config_dir)).ok();
+    match metadata
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+        .and_then(|value| value.get("compat_revision").and_then(Value::as_u64))
+        .and_then(|value| u32::try_from(value).ok())
+    {
+        Some(revision) => Some(revision),
+        None => Some(LEGACY_BROKER_COMPAT_REVISION),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerCodeIdentity {
+    pub mode: String,
+    pub identifier: Option<String>,
+    pub team: Option<String>,
+    designated_requirement: Option<String>,
+}
+
+impl BrokerCodeIdentity {
+    fn stable_requirement(&self) -> Option<&str> {
+        let requirement = self.designated_requirement.as_deref()?;
+        if self.mode == "adhoc" || requirement.trim_start().starts_with("cdhash ") {
+            return None;
+        }
+        Some(requirement)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerUpgradeStatus {
+    pub installed_revision: Option<u32>,
+    pub candidate_revision: u32,
+    pub update_available: bool,
+    pub identity_compatible: Option<bool>,
+    pub update_requires_reauthorization: bool,
+    pub installed_identity: Option<BrokerCodeIdentity>,
+}
+
+pub fn inspect_code_identity(path: &Path) -> BrokerCodeIdentity {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/usr/bin/codesign")
+            .args(["-dvvv", "--requirements", "-"])
+            .arg(path)
+            .output();
+        let Ok(output) = output else {
+            return BrokerCodeIdentity {
+                mode: "unverifiable".to_owned(),
+                identifier: None,
+                team: None,
+                designated_requirement: None,
+            };
+        };
+        let text = String::from_utf8_lossy(&output.stderr);
+        let identifier = line_value(&text, "Identifier=");
+        let team = line_value(&text, "TeamIdentifier=")
+            .filter(|value| value != "not set" && !value.is_empty());
+        let designated_requirement = line_value(&text, "# designated => ");
+        let mode = if text.lines().any(|line| line.trim() == "Signature=adhoc") {
+            "adhoc"
+        } else if team.is_some() {
+            "certificate"
+        } else if identifier.is_some() {
+            "signed-no-team"
+        } else {
+            "unsigned-or-unverifiable"
+        };
+        BrokerCodeIdentity {
+            mode: mode.to_owned(),
+            identifier,
+            team,
+            designated_requirement,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        BrokerCodeIdentity {
+            mode: "not-applicable".to_owned(),
+            identifier: None,
+            team: None,
+            designated_requirement: None,
+        }
+    }
+}
+
+fn line_value(text: &str, prefix: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(prefix).map(str::trim))
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
+}
+
+fn candidate_satisfies_requirement(candidate: &Path, requirement: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("/usr/bin/codesign")
+            .arg("--verify")
+            .arg("--strict")
+            .arg(format!("-R={requirement}"))
+            .arg(candidate)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (candidate, requirement);
+        false
+    }
+}
+
+fn replacement_identity_compatible(installed: &Path, candidate: &Path) -> bool {
+    let identity = inspect_code_identity(installed);
+    identity
+        .stable_requirement()
+        .map(|requirement| candidate_satisfies_requirement(candidate, requirement))
+        .unwrap_or(false)
+}
+
+pub fn upgrade_status(config_dir: &Path) -> BrokerUpgradeStatus {
+    let installed = broker_path(config_dir);
+    let installed_revision = installed_compat_revision(config_dir);
+    let candidate_revision = BROKER_COMPAT_REVISION;
+    let update_available = installed_revision
+        .map(|revision| revision != candidate_revision)
+        .unwrap_or(false);
+    let installed_identity = status(&installed).map(|_| inspect_code_identity(&installed));
+    let identity_compatible = if installed_revision.is_none() {
+        None
+    } else if !update_available {
+        Some(true)
+    } else {
+        broker_candidate_path()
+            .ok()
+            .map(|candidate| replacement_identity_compatible(&installed, &candidate))
+    };
+    let update_requires_reauthorization = update_available && identity_compatible != Some(true);
+    BrokerUpgradeStatus {
+        installed_revision,
+        candidate_revision,
+        update_available,
+        identity_compatible,
+        update_requires_reauthorization,
+        installed_identity,
+    }
+}
+
+pub fn doctor_line(config_dir: &Path) -> String {
+    let upgrade = upgrade_status(config_dir);
+    let identity = upgrade.installed_identity.as_ref();
+    format!(
+        "LAYER tcc-broker-identity mode={} identifier={} team={} installed_revision={} candidate_revision={} identity_compatible={} update_requires_reauthorization={}",
+        identity
+            .map(|value| value.mode.as_str())
+            .unwrap_or("missing"),
+        identity
+            .and_then(|value| value.identifier.as_deref())
+            .unwrap_or("unknown"),
+        identity
+            .and_then(|value| value.team.as_deref())
+            .unwrap_or("none"),
+        upgrade
+            .installed_revision
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_owned()),
+        upgrade.candidate_revision,
+        upgrade
+            .identity_compatible
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        upgrade.update_requires_reauthorization,
+    )
 }
 
 pub fn run_broker_once() -> ExitCode {
@@ -90,10 +312,39 @@ pub fn run_cli(command: TccBrokerCommand) -> Result<ExitCode, String> {
             let path = broker_path(&config_dir);
             match status(&path) {
                 Some(info) => {
+                    let upgrade = upgrade_status(&config_dir);
                     println!("tcc-broker: installed");
                     println!("path: {}", path.display());
                     println!("sha256: {}", info.sha256);
                     println!("bytes: {}", info.bytes);
+                    println!(
+                        "installed_revision: {}",
+                        upgrade
+                            .installed_revision
+                            .unwrap_or(LEGACY_BROKER_COMPAT_REVISION)
+                    );
+                    println!("candidate_revision: {}", upgrade.candidate_revision);
+                    println!("update_available: {}", upgrade.update_available);
+                    println!(
+                        "identity_compatible: {}",
+                        upgrade
+                            .identity_compatible
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned())
+                    );
+                    println!(
+                        "update_requires_reauthorization: {}",
+                        upgrade.update_requires_reauthorization
+                    );
+                    if let Some(identity) = upgrade.installed_identity {
+                        println!("identity_mode: {}", identity.mode);
+                        println!(
+                            "signing_identifier: {}",
+                            identity.identifier.as_deref().unwrap_or("unknown")
+                        );
+                        println!("team: {}", identity.team.as_deref().unwrap_or("none"));
+                    }
+                    println!("preferred_signing_identifier: {BROKER_SIGNING_IDENTIFIER}");
                     Ok(ExitCode::SUCCESS)
                 }
                 None => {
@@ -116,12 +367,12 @@ pub fn run_cli(command: TccBrokerCommand) -> Result<ExitCode, String> {
 }
 
 /// Install the broker as an immutable copy of the current executable at the
-/// stable broker path. Idempotent: if the broker already exists with identical
-/// bytes it is left untouched (so an existing TCC grant on that identity is
-/// preserved). Pass `force` to reinstall.
+/// stable broker path. Runtime byte changes do not imply a broker update: an
+/// installed broker with the same compatibility revision is always preserved.
+/// `force` only permits a real revision upgrade whose candidate satisfies the
+/// installed broker's stable designated requirement.
 pub fn install(config_dir: &Path, force: bool) -> Result<(), String> {
-    let source = std::env::current_exe()
-        .map_err(|error| format!("cannot resolve current executable: {error}"))?;
+    let source = broker_candidate_path()?;
     let target = broker_path(config_dir);
     let parent = target
         .parent()
@@ -144,22 +395,41 @@ pub fn install(config_dir: &Path, force: bool) -> Result<(), String> {
         })?;
         if existing == source_bytes {
             // Identical bytes already installed — preserve the stable identity.
+            if !broker_metadata_path(config_dir).is_file() {
+                write_broker_metadata(config_dir)?;
+            }
+            return Ok(());
+        }
+        let installed_revision =
+            installed_compat_revision(config_dir).unwrap_or(LEGACY_BROKER_COMPAT_REVISION);
+        if installed_revision == BROKER_COMPAT_REVISION {
+            // The broker implementation did not change. Never replace a stable
+            // TCC client merely because the surrounding runtime was rebuilt.
+            // A different-byte pre-metadata broker is preserved as legacy
+            // evidence rather than being silently blessed with new metadata.
             return Ok(());
         }
         if !force {
             return Err(format!(
-                "broker {} already exists with different bytes; refusing to overwrite a stable identity (re-run with --force to reinstall explicitly)",
+                "TCC broker revision {installed_revision} is installed and revision {BROKER_COMPAT_REVISION} is available; run `herdr-mcp permissions setup --upgrade-broker` for an identity-checked upgrade"
+            ));
+        }
+        if !replacement_identity_compatible(&target, &source) {
+            return Err(format!(
+                "refusing to replace TCC broker {} because the candidate does not satisfy the installed stable code requirement; this upgrade requires a one-time TCC identity migration and reauthorization (explicitly uninstall the broker first if that migration is intended)",
                 target.display()
             ));
         }
     }
-    atomic_write(&target, &source_bytes, 0o700)
+    atomic_write(&target, &source_bytes, 0o700)?;
+    write_broker_metadata(config_dir)
 }
 
 /// Remove the stable broker binary. Full uninstall may call this; ordinary
 /// runtime/generation rotation must not. Returns whether a file was removed.
 pub fn uninstall_broker(config_dir: &Path) -> Result<bool, String> {
     let path = broker_path(config_dir);
+    let metadata_path = broker_metadata_path(config_dir);
     if let Ok(metadata) = std::fs::symlink_metadata(&path)
         && metadata.file_type().is_symlink()
     {
@@ -170,6 +440,10 @@ pub fn uninstall_broker(config_dir: &Path) -> Result<bool, String> {
     }
     std::fs::remove_file(&path)
         .map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
+    if metadata_path.exists() {
+        std::fs::remove_file(&metadata_path)
+            .map_err(|error| format!("cannot remove {}: {error}", metadata_path.display()))?;
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::remove_dir(parent);
     }
@@ -196,11 +470,23 @@ pub fn status(path: &Path) -> Option<BrokerStatus> {
 pub fn status_line(config_dir: &Path) -> String {
     let path = broker_path(config_dir);
     match status(&path) {
-        Some(info) => format!(
-            "installed at {} (sha256 {})",
-            path.display(),
-            &info.sha256[..16.min(info.sha256.len())]
-        ),
+        Some(info) => {
+            let upgrade = upgrade_status(config_dir);
+            format!(
+                "installed at {} (sha256 {}, revision {}, identity {}, reauth={})",
+                path.display(),
+                &info.sha256[..16.min(info.sha256.len())],
+                upgrade
+                    .installed_revision
+                    .unwrap_or(LEGACY_BROKER_COMPAT_REVISION),
+                upgrade
+                    .installed_identity
+                    .as_ref()
+                    .map(|identity| identity.mode.as_str())
+                    .unwrap_or("unknown"),
+                upgrade.update_requires_reauthorization,
+            )
+        }
         None => format!("not installed (expected {})", path.display()),
     }
 }
@@ -702,23 +988,71 @@ mod tests {
     }
 
     #[test]
-    fn install_is_idempotent_and_preserves_existing_bytes() {
+    fn same_broker_revision_preserves_existing_identity_across_runtime_byte_changes() {
         let dir = temp_dir("install");
         let config = dir.join("config");
         let target = broker_path(&config);
-        // Simulate an existing broker with distinct bytes.
+        // A v0.4.2 pre-metadata broker is compatibility revision 1. Runtime
+        // rebuilds can have different bytes without implying a broker upgrade.
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, b"existing-broker-bytes").unwrap();
-        // install() reads current_exe; we only assert the "different bytes"
-        // guard fires rather than overwriting.
         let result = install(&config, false);
-        assert!(result.is_err());
+        assert!(result.is_ok());
         assert_eq!(fs::read(&target).unwrap(), b"existing-broker-bytes");
-        // With force, the stable identity is replaced.
+        assert_eq!(
+            installed_compat_revision(&config),
+            Some(BROKER_COMPAT_REVISION)
+        );
+        assert!(!broker_metadata_path(&config).is_file());
+
+        // Even an explicit setup pass cannot replace the identity when the
+        // broker implementation revision did not change.
         let result = install(&config, true);
         assert!(result.is_ok());
-        assert_ne!(fs::read(&target).unwrap(), b"existing-broker-bytes");
+        assert_eq!(fs::read(&target).unwrap(), b"existing-broker-bytes");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compatibility_revision_controls_update_availability() {
+        let dir = temp_dir("revision");
+        let config = dir.join("config");
+        let target = broker_path(&config);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"stable-broker").unwrap();
+        fs::write(
+            broker_metadata_path(&config),
+            br#"{"schema_version":1,"compat_revision":0,"preferred_signing_identifier":"cc.agentforme.herdr.tcc-broker"}"#,
+        )
+        .unwrap();
+        let status = upgrade_status(&config);
+        assert_eq!(status.installed_revision, Some(0));
+        assert_eq!(status.candidate_revision, BROKER_COMPAT_REVISION);
+        assert!(status.update_available);
+        // Synthetic/legacy bytes have no stable certificate requirement, so a
+        // revision replacement must require explicit reauthorization.
+        assert!(status.update_requires_reauthorization);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adhoc_cdhash_requirement_is_not_stable_for_broker_replacement() {
+        let adhoc = BrokerCodeIdentity {
+            mode: "adhoc".to_owned(),
+            identifier: Some("legacy.herdr".to_owned()),
+            team: None,
+            designated_requirement: Some("cdhash H\"deadbeef\"".to_owned()),
+        };
+        assert_eq!(adhoc.stable_requirement(), None);
+        let stable = BrokerCodeIdentity {
+            mode: "certificate".to_owned(),
+            identifier: Some(BROKER_SIGNING_IDENTIFIER.to_owned()),
+            team: Some("ABCDE12345".to_owned()),
+            designated_requirement: Some(
+                "identifier \"cc.agentforme.herdr.tcc-broker\" and anchor apple generic".to_owned(),
+            ),
+        };
+        assert!(stable.stable_requirement().is_some());
     }
 
     #[test]

@@ -3403,6 +3403,10 @@ mod macos {
             assert_ne!(a.plist.file_name(), b.plist.file_name());
             let generation = prepare_generation(&a).unwrap();
             let env = service_environment(&a, &BTreeMap::new(), &generation).unwrap();
+            assert_eq!(
+                env.get("HERDR_MCP_TCC_BROKER").map(String::as_str),
+                Some("1")
+            );
             let plist = encode_service_plist(&a, &env).unwrap();
             let value = PlistValue::from_reader(Cursor::new(&plist)).unwrap();
             let dict = value.as_dictionary().unwrap();
