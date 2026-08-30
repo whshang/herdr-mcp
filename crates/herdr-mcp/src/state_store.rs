@@ -905,6 +905,32 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn record_pane_exec_running(
+        &self,
+        session_id: &str,
+        started_at_ms: u64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO exec_sessions (
+                    session_id, pid, process_group, started_at, ended_at,
+                    exit_code, signal, state, expires_at
+                 ) VALUES (?1, NULL, NULL, ?2, NULL, NULL, NULL, 'running', NULL)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    pid = NULL,
+                    process_group = NULL,
+                    started_at = excluded.started_at,
+                    ended_at = NULL,
+                    exit_code = NULL,
+                    signal = NULL,
+                    state = 'running',
+                    expires_at = NULL",
+                rusqlite::params![session_id, i64::try_from(started_at_ms).unwrap_or(i64::MAX),],
+            )
+            .map_err(|error| format!("cannot persist running pane exec session: {error}"))?;
+        Ok(())
+    }
+
     pub fn settle_exec_session(
         &self,
         session_id: &str,

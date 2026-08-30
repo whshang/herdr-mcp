@@ -320,11 +320,24 @@ impl ExecRegistry {
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
         });
+        if let Err(error) = self
+            .inner
+            .state_store
+            .lock()
+            .map_err(|_| "exec state store lock poisoned".to_owned())
+            .and_then(|store| store.record_pane_exec_running(&id, started_at_ms))
+        {
+            terminate_session(&session, true, None);
+            return Err(format!(
+                "cannot durably register pane exec session; pane closed before return: {error}"
+            ));
+        }
         self.inner
             .sessions
             .lock()
             .map_err(|_| "exec registry lock poisoned".to_owned())?
-            .insert(id.clone(), session);
+            .insert(id.clone(), Arc::clone(&session));
+        spawn_monitor(Arc::clone(&session), Arc::downgrade(&self.inner));
         Ok(json!({
             "ok": true,
             "session_id": id,
@@ -417,14 +430,14 @@ impl ExecRegistry {
                 "signal": status.signal,
             });
         }
-        terminate_session(&session, false);
+        terminate_session(&session, false, Some(&self.inner));
         let weak = Arc::downgrade(&session);
         thread::spawn(move || {
             thread::sleep(KILL_GRACE);
             if let Some(session) = weak.upgrade()
                 && !session_status(&session).closed
             {
-                terminate_session(&session, true);
+                terminate_session(&session, true, None);
             }
         });
         json!({
@@ -927,7 +940,13 @@ fn refresh_session_status(session: &Arc<Session>, registry: Option<&RegistryInne
             }
             true
         }
-        SessionBackend::Pane { .. } => refresh_pane_session(session),
+        SessionBackend::Pane { .. } => {
+            let closed = refresh_pane_session(session);
+            if closed && let Some(registry) = registry {
+                persist_closed_session(registry, session);
+            }
+            closed
+        }
     }
 }
 
@@ -1116,7 +1135,7 @@ fn signal_name(signal: i32) -> String {
     }
 }
 
-fn terminate_session(session: &Arc<Session>, force: bool) {
+fn terminate_session(session: &Arc<Session>, force: bool, registry: Option<&RegistryInner>) {
     match &session.backend {
         SessionBackend::Native { child, .. } => {
             #[cfg(unix)]
@@ -1150,17 +1169,20 @@ fn terminate_session(session: &Arc<Session>, force: bool) {
                 PANE_RPC_TIMEOUT,
             );
             cleanup_pane_files(script_path, spool);
-            mark_closed_with_signal(
+            if mark_closed_with_signal(
                 session,
                 None,
                 Some(if force { "SIGKILL" } else { "SIGTERM" }),
-            );
+            ) && let Some(registry) = registry
+            {
+                persist_closed_session(registry, session);
+            }
         }
     }
 }
 
 fn terminate_and_wait(session: &Arc<Session>) {
-    terminate_session(session, true);
+    terminate_session(session, true, None);
     if let SessionBackend::Native { child, .. } = &session.backend
         && let Ok(mut child) = child.lock()
     {
@@ -1388,6 +1410,56 @@ mod tests {
             NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
         ));
         ExecRegistry::new(path).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn pane_session(id: &str) -> (Arc<Session>, PathBuf) {
+        let socket = env::temp_dir().join(format!(
+            "herdr-mcp-pane-monitor-{}-{}.sock",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let script_path = pane_script_path(id);
+        let spool = pane_spool_paths(id);
+        cleanup_pane_files(&script_path, &spool);
+        let session = Arc::new(Session {
+            id: id.to_owned(),
+            cwd: PathBuf::from("/tmp"),
+            command: "pane-test".to_owned(),
+            started_at_ms: now_ms(),
+            pid: None,
+            backend: SessionBackend::Pane {
+                client: HerdrClient::new(&socket),
+                pane_id: "pane-test".to_owned(),
+                script_path,
+                spool,
+                stdout_offset: Mutex::new(0),
+                stderr_offset: Mutex::new(0),
+            },
+            buffers: Mutex::new(Buffers::default()),
+            status: Mutex::new(SessionStatus::default()),
+        });
+        (session, socket)
+    }
+
+    #[cfg(unix)]
+    fn pane_spool(session: &Session) -> &PaneSpoolPaths {
+        let SessionBackend::Pane { spool, .. } = &session.backend else {
+            unreachable!("pane test constructed a non-pane session");
+        };
+        spool
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pane_close(session: &Arc<Session>) -> SessionStatus {
+        for _ in 0..500 {
+            let status = session_status(session);
+            if status.closed {
+                return status;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("pane session monitor did not close");
     }
 
     #[test]
@@ -1821,6 +1893,234 @@ mod tests {
             Path::new("/Users/other/Documents/repo"),
             home
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_monitor_observes_normal_exit_without_read_polling() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let id = format!(
+            "es_pane_monitor_normal_{}_{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let (session, socket) = pane_session(&id);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Value = serde_json::from_str(
+                BufReader::new(stream.try_clone().unwrap())
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .as_str(),
+            )
+            .unwrap();
+            assert_eq!(request["method"], "pane.close");
+            writeln!(
+                stream,
+                "{}",
+                json!({"id": request["id"].clone(), "result": {"ok": true}})
+            )
+            .unwrap();
+        });
+        let registry = registry();
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .record_pane_exec_running(&id, session.started_at_ms)
+            .unwrap();
+        let spool = pane_spool(&session).clone();
+        fs::write(&spool.stdout, "out").unwrap();
+        fs::write(&spool.stderr, "err").unwrap();
+
+        spawn_monitor(Arc::clone(&session), Arc::downgrade(&registry.inner));
+        fs::write(&spool.status, "7\n").unwrap();
+
+        let status = wait_for_pane_close(&session);
+        server.join().unwrap();
+        assert_eq!(status.exit_code, Some(7));
+        assert_eq!(status.signal, None);
+        let buffers = session.buffers.lock().unwrap();
+        let (output, _) = read_buffer_slice(&buffers, None, 0, usize::MAX);
+        assert_eq!(output, b"outerr");
+        assert!(!spool.status.exists());
+        let store = registry.inner.state_store.lock().unwrap();
+        assert_eq!(
+            store
+                .scalar_text(&format!(
+                    "SELECT state FROM exec_sessions WHERE session_id = '{}'",
+                    session.id
+                ))
+                .unwrap()
+                .as_deref(),
+            Some("closed")
+        );
+        drop(store);
+        assert_eq!(registry.diagnostics()["persistence_failures"], 0);
+        fs::remove_file(socket).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_monitor_exits_after_forced_close_without_status_file() {
+        let id = format!(
+            "es_pane_monitor_forced_{}_{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let (session, socket) = pane_session(&id);
+        let weak = Arc::downgrade(&session);
+        spawn_monitor(Arc::clone(&session), Weak::new());
+
+        assert!(mark_closed_with_signal(&session, None, Some("pane_closed")));
+        drop(session);
+        for _ in 0..500 {
+            if weak.upgrade().is_none() {
+                fs::remove_file(socket).ok();
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("pane monitor retained a force-closed session");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_monitor_survives_registry_restart_until_status_can_be_reaped() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let id = format!(
+            "es_pane_monitor_restart_{}_{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let (session, socket) = pane_session(&id);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Value = serde_json::from_str(
+                BufReader::new(stream.try_clone().unwrap())
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .as_str(),
+            )
+            .unwrap();
+            assert_eq!(request["method"], "pane.close");
+            writeln!(
+                stream,
+                "{}",
+                json!({"id": request["id"].clone(), "result": {"ok": true}})
+            )
+            .unwrap();
+        });
+        let registry = registry();
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .record_pane_exec_running(&id, session.started_at_ms)
+            .unwrap();
+        let state_path = registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .path()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let weak_registry = Arc::downgrade(&registry.inner);
+        let spool = pane_spool(&session).clone();
+        spawn_monitor(Arc::clone(&session), weak_registry);
+        drop(registry);
+        let restarted = ExecRegistry::new(state_path).unwrap();
+        assert_eq!(restarted.diagnostics()["reaped_on_boot"], 0);
+        assert_eq!(restarted.diagnostics()["closed_on_boot"], 0);
+
+        fs::write(&spool.status, "0\n").unwrap();
+
+        let status = wait_for_pane_close(&session);
+        server.join().unwrap();
+        assert_eq!(status.exit_code, Some(0));
+        assert!(!spool.status.exists());
+        fs::remove_file(socket).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_pane_monitors_close_once_and_both_exit() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let id = format!(
+            "es_pane_monitor_duplicate_{}_{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let (session, socket) = pane_session(&id);
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let close_count = Arc::new(AtomicUsize::new(0));
+        let server_count = Arc::clone(&close_count);
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request: Value = serde_json::from_str(
+                            BufReader::new(stream.try_clone().unwrap())
+                                .lines()
+                                .next()
+                                .unwrap()
+                                .unwrap()
+                                .as_str(),
+                        )
+                        .unwrap();
+                        assert_eq!(request["method"], "pane.close");
+                        server_count.fetch_add(1, Ordering::Relaxed);
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"id": request["id"].clone(), "result": {"ok": true}})
+                        )
+                        .unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("pane close listener failed: {error}"),
+                }
+            }
+        });
+        let weak = Arc::downgrade(&session);
+        let spool = pane_spool(&session).clone();
+        spawn_monitor(Arc::clone(&session), Weak::new());
+        spawn_monitor(Arc::clone(&session), Weak::new());
+        fs::write(&spool.status, "0\n").unwrap();
+
+        assert_eq!(wait_for_pane_close(&session).exit_code, Some(0));
+        drop(session);
+        for _ in 0..500 {
+            if weak.upgrade().is_none() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(weak.upgrade().is_none());
+        server.join().unwrap();
+        assert_eq!(close_count.load(Ordering::Relaxed), 1);
+        fs::remove_file(socket).ok();
     }
 
     #[test]
