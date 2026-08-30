@@ -38,6 +38,13 @@ const CONTROL_BLOCK_REASONS = Object.freeze({
   [ACTION_TYPES.INTERRUPT]: "Provider interrupt ownership is not resolved",
 });
 
+export function actionModesForTarget(target) {
+  if (!target?.pane_id) return [];
+  return target.agent
+    ? [ACTION_TYPES.AGENT_PROMPT, ACTION_TYPES.STEER]
+    : [ACTION_TYPES.TERMINAL_TEXT];
+}
+
 export function classifyAction(type) {
   return RISKS[type] || ACTION_RISK.UNKNOWN;
 }

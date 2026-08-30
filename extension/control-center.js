@@ -1,6 +1,6 @@
 import { createBrowserStateStore } from "./browser-state-store.js";
 import { createPinnedTarget, revalidatePinnedTarget } from "./target-pin.js";
-import { ACTION_TYPES, ACTION_RISK, buildActionDescriptor, classifyAction } from "./control-actions.js";
+import { ACTION_TYPES, ACTION_RISK, actionModesForTarget, buildActionDescriptor, classifyAction } from "./control-actions.js";
 import {
   controlCenterStats,
   createRenderCoalescer,
@@ -21,7 +21,7 @@ let pinnedTarget = null;
 let runtimeHealthy = false;
 let hasSnapshot = false;
 let eventStreamHealthy = null;
-let selectedMode = ACTION_TYPES.AGENT_PROMPT;
+let selectedMode = null;
 let pageContext = { loading: true, tabId: null, windowId: null, response: null, error: null };
 let pageContextRefreshSeq = 0;
 let bindingMutationWorkspaceId = null;
@@ -38,13 +38,17 @@ const pageContextMeta = $("pageContextMeta");
 const pageContextHelp = $("pageContextHelp");
 const targetCard = $("targetCard");
 const targetTitle = $("targetTitle");
+const targetKindBadge = $("targetKindBadge");
 const targetDetails = $("targetDetails");
 const unpinButton = $("unpinButton");
 const inspectButton = $("inspectButton");
 const readTailButton = $("readTailButton");
 const composer = $("composer");
+const composerFooter = $("composerFooter");
 const riskBadge = $("riskBadge");
 const blockedReason = $("blockedReason");
+const actionHeading = $("actionHeading");
+const modeTabs = $("modeTabs");
 const modeHelp = $("modeHelp");
 const sendButton = $("sendButton");
 const actionModeBadge = $("actionModeBadge");
@@ -303,12 +307,14 @@ function renderWorkspaceTree(state) {
     const count = document.createElement("span");
     count.className = "workspace-count";
     const workingCount = (workspace.panes || []).filter((pane) => pane.status === "working").length;
-    count.textContent = bindingMissing
-      ? t("cc_workspace_not_visible")
-      : t("cc_workspace_count", {
-        panes: workspace.panes?.length || 0,
-        working: workingCount,
-      });
+    if (bindingMissing) {
+      count.textContent = t("cc_workspace_not_visible");
+    } else {
+      const paneCount = workspace.panes?.length || 0;
+      count.textContent = t("cc_workspace_count", { panes: paneCount });
+      count.title = t("cc_workspace_count_detail", { panes: paneCount, working: workingCount });
+      count.setAttribute("aria-label", count.title);
+    }
     toggle.append(chevron, stateDot, name, id, count);
 
     header.appendChild(toggle);
@@ -401,8 +407,16 @@ function renderTarget() {
   if (!hasTarget) {
     targetTitle.textContent = t("cc_no_target");
     targetDetails.textContent = t("cc_target_help");
+    targetKindBadge.hidden = true;
+    targetKindBadge.className = "target-kind-badge";
+    actionHeading.textContent = t("cc_action_heading");
     return;
   }
+  const kind = target.agent ? "agent" : "terminal";
+  targetKindBadge.hidden = false;
+  targetKindBadge.className = `target-kind-badge ${kind}`;
+  targetKindBadge.textContent = t(kind === "agent" ? "cc_target_kind_agent" : "cc_target_kind_terminal");
+  actionHeading.textContent = t(kind === "agent" ? "cc_action_heading_agent" : "cc_action_heading_terminal");
   targetTitle.textContent = `${target.workspace_id || "?"} / ${target.pane_id} / ${target.agent?.name || target.agent?.kind || t("cc_terminal")}`;
   targetDetails.textContent = stale
     ? t("cc_target_stale", { reason: staleReasonLabel(target.stale_reason) })
@@ -423,6 +437,29 @@ function modePresentation(mode) {
     return { help: "cc_mode_terminal_help", placeholder: "cc_placeholder_terminal" };
   }
   return { help: "cc_mode_prompt_help", placeholder: "cc_placeholder_prompt" };
+}
+
+function modeLabelKey(mode) {
+  if (mode === ACTION_TYPES.STEER) return "cc_mode_steer";
+  if (mode === ACTION_TYPES.TERMINAL_TEXT) return "cc_mode_terminal";
+  return "cc_mode_prompt";
+}
+
+function renderModeTabs(modes) {
+  modeTabs.replaceChildren();
+  modeTabs.hidden = modes.length === 0;
+  for (const mode of modes) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.mode = mode;
+    button.textContent = t(modeLabelKey(mode));
+    button.classList.toggle("active", mode === selectedMode);
+    button.addEventListener("click", () => {
+      selectedMode = mode;
+      renderComposerState();
+    });
+    modeTabs.appendChild(button);
+  }
 }
 
 function riskLabel(mode) {
@@ -457,6 +494,18 @@ function controlOutcomeText(response) {
 }
 
 function renderComposerState() {
+  const modes = actionModesForTarget(pinnedTarget);
+  if (!modes.includes(selectedMode)) selectedMode = modes[0] || null;
+  renderModeTabs(modes);
+  const hasMode = Boolean(selectedMode);
+  composer.hidden = !hasMode;
+  composerFooter.hidden = !hasMode;
+  actionModeBadge.hidden = !hasMode;
+  if (!hasMode) {
+    modeHelp.textContent = t("cc_pin_first");
+    sendButton.disabled = true;
+    return;
+  }
   const mode = modePresentation(selectedMode);
   const descriptor = buildActionDescriptor(selectedMode, { target: pinnedTarget });
   riskBadge.textContent = riskLabel(selectedMode);
@@ -478,9 +527,6 @@ function renderComposerState() {
     : t("cc_preview_action");
   sendButton.disabled = actionInFlight || !pinnedTarget?.pane_id || pinnedTarget?.stale === true;
 
-  document.querySelectorAll("#modeTabs [data-mode]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.mode === selectedMode);
-  });
 }
 
 async function mutateWorkspaceBinding(workspaceId) {
@@ -617,7 +663,12 @@ workspaceList.addEventListener("click", async (event) => {
   if (!paneNode) return;
   const pane = (store.get().panes || []).find((item) => item.pane_id === paneNode.dataset.paneId);
   if (!pane) return;
-  pinnedTarget = createPinnedTarget(pane);
+  const previousPaneId = pinnedTarget?.pane_id || null;
+  const previousKind = pinnedTarget?.pane_id ? (pinnedTarget.agent ? "agent" : "terminal") : null;
+  const nextTarget = createPinnedTarget(pane);
+  const nextKind = nextTarget.agent ? "agent" : "terminal";
+  if (previousPaneId !== nextTarget.pane_id || previousKind !== nextKind) composer.value = "";
+  pinnedTarget = nextTarget;
   await chrome.storage.local.set({ [TARGET_KEY]: pinnedTarget });
   result.textContent = t("cc_pinned", {
     workspace: pinnedTarget.workspace_id || "?",
@@ -661,12 +712,6 @@ readTailButton.addEventListener("click", async () => {
   renderTarget();
 });
 
-document.querySelectorAll("#modeTabs [data-mode]").forEach((button) => {
-  button.addEventListener("click", () => {
-    selectedMode = button.dataset.mode;
-    renderComposerState();
-  });
-});
 sendButton.addEventListener("click", async () => {
   if (!pinnedTarget?.pane_id || pinnedTarget.stale || actionInFlight) return;
   const text = composer.value.trim();
