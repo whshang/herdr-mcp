@@ -1393,6 +1393,13 @@ mod macos {
         adopt_node: bool,
         mutation_lock: &ServiceMutationLock,
     ) -> Result<Value, String> {
+        let broker = crate::macos_permissions::preserve_or_install_broker(&paths.config_dir)?;
+        if !crate::tcc_broker::exec_host_capable(&paths.config_dir) {
+            return Err(format!(
+                "stable permissions broker at {} does not support exec-host v1; run `herdr-mcp permissions setup --upgrade-broker`, re-authorize it if macOS asks, then retry install",
+                broker.path.display()
+            ));
+        }
         install_with_noop_checks(
             paths,
             adopt_node,
@@ -1787,6 +1794,9 @@ mod macos {
             .map(String::as_str)
             != Some(generation_id.as_str())
         {
+            return Ok(None);
+        }
+        if existing.env.get("HERDR_MCP_TCC_BROKER").map(String::as_str) != Some("1") {
             return Ok(None);
         }
 
@@ -2433,6 +2443,7 @@ mod macos {
             paths.config_dir.to_string_lossy().into_owned(),
         );
         out.insert("HERDR_MCP_CHILD_REGISTRY".to_owned(), "1".to_owned());
+        out.insert("HERDR_MCP_TCC_BROKER".to_owned(), "1".to_owned());
         if let Some(name) = paths.instance.name() {
             out.insert("HERDR_MCP_INSTANCE".to_owned(), name.to_owned());
         }

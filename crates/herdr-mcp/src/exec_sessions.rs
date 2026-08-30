@@ -4,7 +4,7 @@ use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -122,12 +122,23 @@ impl ExecRegistry {
             return Err("command must not be empty".to_owned());
         }
         let id = new_session_id();
-        let mut process = shell_command(command, &id);
+        let (mut process, stdin_payload) = match crate::tcc_broker::prepare_exec_host(command)? {
+            Some((mut process, payload)) => {
+                #[cfg(unix)]
+                process.arg0(process_marker(&id));
+                (process, Some(payload))
+            }
+            None => (shell_command(command, &id), None),
+        };
         process
             .current_dir(cwd)
             .env("HERDR_MCP_EXEC_ID", &id)
             .env("PATH", enriched_exec_path())
-            .stdin(Stdio::null())
+            .stdin(if stdin_payload.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]
@@ -135,6 +146,15 @@ impl ExecRegistry {
         let mut child = process
             .spawn()
             .map_err(|error| format!("cannot start background command: {error}"))?;
+        if let Some(payload) = stdin_payload {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "stable exec host stdin unavailable".to_owned())?;
+            thread::spawn(move || {
+                let _ = stdin.write_all(&payload);
+            });
+        }
         let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
