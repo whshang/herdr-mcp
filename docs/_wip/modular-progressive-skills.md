@@ -944,22 +944,9 @@ project  <project_root>/.agents/skills/*/SKILL.md
 user     ~/.agents/skills/*/SKILL.md
 ```
 
-- **优先级（从高到低）：**
-
-  ```text
-  herdr-mcp builtin / 上游 Herdr usage（最高）
-          ↓
-  project  <project_root>/.agents/skills
-          ↓  <project_root>/.claude/skills
-          ↓
-  user     ~/.agents/skills
-          ↓  ~/.claude/skills
-  ```
-
 - 同名更低优先级 skill 不允许覆盖更高优先级；builtin 名称（如 `files-search`）被
   project/user 同名 shadow 时直接丢弃。
-- 每个 scope 下 `.agents/skills` 先扫描，再扫描 `.claude/skills`；同一 id 首次出现的
-  位置胜出，因此 project `.agents` > project `.claude`、user `.agents` > user `.claude`。
+- **只扫描 `.agents/skills`**；v0.4.2 不探测 `.claude/skills`，不扩大兼容目录。
 - `SKILL.md` 与 `skill.md` 均接受。
 - discovery 只返回 metadata（`id`/`name`/`description`/`source_identity`/`uri`/`digest`/
   `version`/`size`）；`load` 按需返回正文，并以 `(source_identity, uri, digest)` 为 cache key。
@@ -976,7 +963,7 @@ base 之外即拒绝；per-scope 数量上限与单文件 512 KiB 大小上限�
 常见 frontmatter（`name`/`description`/`summary`/`version`，含 `metadata.version` 与折叠
 `>` 标量）已足够解析真实 `~/.agents/skills` skill，例如 `ego-browser` 与 `opencli-usage`。
 
-> 后续若需要新的 scope/目录，仍应作为显式的独立决策，而不是默认漫游扫描。
+> 后续若需要 `.claude/skills` 兼容或其他 scope，应作为显式的独立决策，而不是默认扫描目录。
 
 
 对于未来 remote/MCP Skill：
