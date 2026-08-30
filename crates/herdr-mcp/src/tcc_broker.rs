@@ -25,6 +25,7 @@
 //! macOS TCC story — it does not by itself grant TCC permission, and it does
 //! not claim to replace a Developer ID / notarization.
 
+#[cfg(target_os = "macos")]
 use crate::child_process;
 use crate::cli::TccBrokerCommand;
 use crate::fs_mutation;
@@ -36,7 +37,9 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
+use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Broker protocol version. Bump only on a breaking wire change.
@@ -47,7 +50,9 @@ pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Hard wall-clock budget for a single broker request.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
 const EXEC_HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "macos")]
 const EXEC_HOST_MAX_REQUEST_BYTES: usize = 256 * 1024;
 const EXEC_HOST_ID: &str = "herdr-tcc-exec-host-v1";
 
@@ -62,9 +67,6 @@ pub fn broker_path(config_dir: &Path) -> PathBuf {
     config_dir.join("tcc-broker").join("herdr-mcp-broker")
 }
 
-/// Run the one-shot broker mode (`__tcc-broker`). Reads a single bounded JSON
-/// request from stdin, dispatches it, and writes a single bounded JSON response
-/// to stdout. Returns a process exit code.
 /// Run the stable exec-host mode used by `herdr_exec_start` on macOS.
 /// `--probe` is intentionally side-effect free and allows service install to
 /// verify that an already-authorized, older broker understands this protocol.
@@ -77,7 +79,7 @@ pub fn run_exec_host(probe: bool) -> ExitCode {
     #[cfg(not(target_os = "macos"))]
     {
         eprintln!("tcc exec host is macOS-only");
-        return ExitCode::from(2);
+        ExitCode::from(2)
     }
 
     #[cfg(target_os = "macos")]
