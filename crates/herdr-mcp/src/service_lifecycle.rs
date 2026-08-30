@@ -1,4 +1,6 @@
 use crate::cli::ServiceCommand;
+#[cfg(target_os = "macos")]
+use crate::native_host_install;
 use crate::{herdr_supervisor, link, paths::RuntimePaths, service_manager};
 use serde_json::Value;
 use std::process::ExitCode;
@@ -120,6 +122,15 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
         return Err(format!(
             "service install committed but production Link generation reconcile failed: {link_error}; {service_detail}{supervisor_detail}{link_detail}"
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(native_host_error) = native_host_install::sync_owned_runtime_from_active() {
+            return Err(format!(
+                "service install committed but owned native-host runtime sync failed: {native_host_error}"
+            ));
+        }
     }
 
     Ok(result)
