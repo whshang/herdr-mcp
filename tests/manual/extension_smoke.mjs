@@ -74,9 +74,9 @@ const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.78", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.78"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.78"'), "content version matches manifest");
+ok(manifest.version === "0.1.79", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.79"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.79"'), "content version matches manifest");
 const ownerGateIndex = wakeSource.indexOf('type: "h2w_extension_owner_status"');
 const queueOwnerClaimIndex = wakeSource.indexOf('setAttribute(QUEUED_INSERT_OWNER_ATTR');
 ok(ownerGateIndex >= 0
@@ -374,6 +374,13 @@ ok(
     && backgroundSource.includes('msg?.type === "h2w_continuity_backfill"')
     && wakeSource.includes("fetchChatGptConversationSnapshot"),
   "ChatGPT concrete-route registration backfills the first Project turn from server-confirmed message ids",
+);
+ok(
+  wakeSource.includes('latestDomMessageSnapshot("user")')
+    && wakeSource.includes('latestDomMessageSnapshot("assistant")')
+    && wakeSource.includes("conversation_inaccessible")
+    && wakeSource.includes("continuityBackfillInFlight"),
+  "continuity backfill falls back to rendered stable message ids when the private ChatGPT conversation endpoint is unavailable",
 );
 ok(
   backgroundSource.includes('manual_handoff_available: Boolean(chatgpt.project_id && chatgpt.conversation_id)')
