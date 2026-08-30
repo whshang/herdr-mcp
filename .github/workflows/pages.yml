@@ -8,6 +8,7 @@ on:
       - "docs/**"
       - "assets/herdr-mcp-SKILL.md"
       - "scripts/build-site.mjs"
+      - "scripts/site-i18n.mjs"
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/pages.yml"

@@ -91,6 +91,8 @@ ChatGPT Project → Herdr workspace wD7
 
 binding 的对象是 workspace，不是某一个 agent。
 
+对于已绑定的 ChatGPT Project，用户手动新开会话后不需要复制内部 continuity ID；直接说“继续 / 接着上次”会先走本机 Continuity Journal 的搜索。只有稳定身份唯一命中时才自动恢复，存在歧义就要求用户确认。完整 search / confirm / resume 规则见 [浏览器连续工作](browser-continuity.md)。
+
 ### Pinned Target
 
 只属于 Control Center，表示下一条人工控制明确针对哪个 pane / Agent，例如：

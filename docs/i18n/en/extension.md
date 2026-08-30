@@ -93,6 +93,8 @@ ChatGPT Project → Herdr workspace wD7
 
 The binding target is a workspace, not an individual agent.
 
+For a bound ChatGPT Project, manually starting a fresh conversation does not require copying an internal continuity ID. A plain prior-work intent such as “continue” is resolved through the durable Continuity Journal; automatic resume is allowed only for a unique stable-identity match, otherwise Herdr asks for confirmation. See [Browser continuity](browser-continuity.md) for the exact search / confirm / resume rules.
+
 ### Pinned Target
 
 A Control Center-only explicit target for the next human control action, for example:

@@ -44,6 +44,8 @@ Browser extension はあらゆる file/artifact 経路には**参加しません
 
 Browser extension は conversation continuity、Chrome Side Panel の Control Center、workspace binding、次ターンの queue を追加します。最初の Connector 接続には不要です。
 
+v0.4.2 source candidate では、同じ bound ChatGPT Project 内で新しい conversation を手動で開いたあと、内部 `continuity_id` を入力せず **“continue” / “resume”** と言うだけで再開できます。Herdr は stable な conversation / Project / workspace identity で Continuity Journal を検索し、その identity 自体が active chain を一意に特定できる場合だけ自動 resume します。曖昧な場合は bounded candidate evidence を提示して確認し、最新・文字類似だけで chain を選びません。詳細は [Browser continuity（英語）](docs/i18n/en/browser-continuity.md) を参照してください。
+
 一般ユーザーは **Chrome Web Store** からのみインストールします。
 
 1. runtime + Connector の検証を先に完了します。

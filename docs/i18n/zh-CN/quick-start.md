@@ -95,7 +95,7 @@ herdr-mcp native-host status
 浏览器扩展提供：
 
 - workspace 绑定与 Agent 进度 / settled 回推；
-- ChatGPT 页面恢复与长对话接力；
+- ChatGPT 页面恢复与长对话接力；同一个已绑定 Project 中手动新开会话后可直接说“继续”，无需提供内部 continuity ID，歧义时由 Herdr 展示有界候选让用户确认；
 - Chrome Side Panel 浏览器控制中心：实时查看 workspace / pane / Agent；
 - 明确 pin 一个 pane，读取状态与最近输出；
 - ChatGPT **排队**：当前回复不中断，补充要求在下一轮优先发送；

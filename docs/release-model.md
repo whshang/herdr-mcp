@@ -36,12 +36,11 @@ macOS protected-folder access uses a stable local TCC broker whose identity is i
 `v0.4.2` is **not tagged**. Do not describe it as published. Before creating the version tag:
 
 1. manually dispatch **Rust Release** on the **exact final source** intended for release; require verify → build → manifest → attest → qualification PASS and confirm the `publish` job is skipped;
-2. complete final Artifact Relay / R2 deploy-import-readback UAT;
-3. land PR #199 / generic relay convergence;
-4. land pane-session PR #200;
-5. if `continuity.search` is included in the release, finish its integration first; if it is not included, do not document it as a shipped capability;
-6. retain the qualification evidence, then create the immutable `v*` tag pointing to the exact `release_identity.source_commit` recorded by the qualified manifest. The tag-push run independently rebuilds and attests the same source and is the only path allowed to publish;
-7. after publication, perform the normal stable-channel `update apply` / rollback dogfood and confirm broker/runtime/Native Host/service invariants before declaring patch-line closure.
+2. complete final production Artifact Relay / R2 deploy-upload → Rust artifact import → read-back UAT;
+3. retain the qualification evidence, then create the immutable `v*` tag pointing to the exact `release_identity.source_commit` recorded by the qualified manifest. The tag-push run independently rebuilds and attests the same source and is the only path allowed to publish;
+4. after publication, perform the normal stable-channel `update apply` / rollback dogfood and confirm broker/runtime/Native Host/service invariants before declaring patch-line closure.
+
+Already closed on current main: generic Artifact Relay landed via PR #204; overlapping PR #199 was closed without merge, pane-session PR #200 is merged, and `continuity.search` is integrated via PR #202. These are no longer pre-tag TODOs.
 
 A workflow-dispatch artifact is qualification evidence only. Its manifest preserves the actual branch/ref and commit provenance; it is not discoverable by the updater and must never be presented as a published stable or preview Release.
 
@@ -65,7 +64,7 @@ Installed generations are content-addressed (`rust-<sha256-prefix>`). Update app
 
 | Artifact | Version | Notes |
 | --- | --- | --- |
-| Runtime binary | `0.4.1` published / `0.4.2` source candidate | `v0.4.2` is not tagged. Stable TCC broker cross-generation authorization is verified; Developer ID is optional hardening. Remaining before tag: exact-final-source Rust Release qualification, final Artifact Relay/R2 deploy-import-readback UAT, PR #199 / generic relay convergence, pane-session PR #200, and `continuity.search` integration only if that capability is included |
+| Runtime binary | `0.4.1` published / `0.4.2` source candidate | `v0.4.2` is not tagged. Stable TCC broker cross-generation authorization is verified; Developer ID is optional hardening. Remaining before tag: exact-final-source Rust Release qualification plus final production Artifact Relay/R2 deploy-upload → Rust import → read-back UAT; PR #204/#200/#202 integration is already complete and overlapping PR #199 is closed without merge |
 | Browser extension source | `0.1.80` | Current development source; Chrome Web Store published/review version may lag and must be checked independently |
 | Native Messaging host | Managed by runtime generation | `native-host status` must show `runtime_matches_current=true` |
 

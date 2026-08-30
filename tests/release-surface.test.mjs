@@ -63,6 +63,7 @@ test("Actions consume the shared gate and keep Cloudflare deployment on the gate
   assert.match(gate, /npm run build:site/);
   assert.match(gate, /extension_smoke\.mjs/);
   assert.match(pages, /npm run build:site/);
+  assert.match(pages, /scripts\/site-i18n\.mjs/, "Pages must rebuild when generated homepage/i18n input changes");
   assert.match(pages, /path: site-dist/);
   assert.match(pages, /actions\/deploy-pages@v4/);
   assert.match(edge, /cloudflare\/wrangler-action@v4/);
