@@ -21,6 +21,7 @@ pub struct ImportArgs {
     pub path: String,
     pub expected_sha256: Option<String>,
     pub capability_env: String,
+    pub signed_url: bool,
     pub overwrite: bool,
     pub confirm_dirty: bool,
     pub confirm_busy: bool,
@@ -35,16 +36,25 @@ struct FetchedArtifact {
 }
 
 pub fn run(args: ImportArgs) -> Result<ExitCode, String> {
-    let capability = std::env::var(&args.capability_env).map_err(|_| {
-        format!(
-            "artifact capability is missing; set {} in the process environment",
-            args.capability_env
-        )
-    })?;
-    if capability.is_empty() || capability.len() > 512 {
-        return Err("artifact capability has invalid length".to_owned());
-    }
-    let artifact = fetch_artifact(&args.url, &capability, args.expected_sha256.as_deref())?;
+    let capability = if args.signed_url {
+        None
+    } else {
+        let capability = std::env::var(&args.capability_env).map_err(|_| {
+            format!(
+                "artifact capability is missing; set {} in the process environment",
+                args.capability_env
+            )
+        })?;
+        if capability.is_empty() || capability.len() > 512 {
+            return Err("artifact capability has invalid length".to_owned());
+        }
+        Some(capability)
+    };
+    let artifact = fetch_artifact(
+        &args.url,
+        capability.as_deref(),
+        args.expected_sha256.as_deref(),
+    )?;
 
     let paths = RuntimePaths::discover()?;
     let socket = paths
@@ -76,7 +86,7 @@ pub fn run(args: ImportArgs) -> Result<ExitCode, String> {
             "bytes": artifact.bytes.len(),
             "mime_type": artifact.mime_type,
             "sha256": artifact.sha256,
-            "source": "r2_artifact_relay",
+            "source": if args.signed_url { "signed_https_url" } else { "r2_artifact_relay" },
             "final_url": artifact.final_url,
             "write": result,
         }))
@@ -87,16 +97,18 @@ pub fn run(args: ImportArgs) -> Result<ExitCode, String> {
 
 fn fetch_artifact(
     source: &str,
-    capability: &str,
+    capability: Option<&str>,
     expected_sha256: Option<&str>,
 ) -> Result<FetchedArtifact, String> {
     let mut url = parse_allowed_url(source)?;
     let origin = origin_tuple(&url)?;
     for redirect_count in 0..=MAX_REDIRECTS {
         let client = pinned_client(&url)?;
-        let response = client
-            .get(url.clone())
-            .header(AUTHORIZATION, format!("Bearer {capability}"))
+        let mut request = client.get(url.clone());
+        if let Some(capability) = capability {
+            request = request.header(AUTHORIZATION, format!("Bearer {capability}"));
+        }
+        let response = request
             .send()
             .map_err(|error| format_reqwest_error("artifact fetch failed", &error))?;
         if response.status().is_redirection() {
