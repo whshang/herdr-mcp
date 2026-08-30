@@ -169,14 +169,25 @@ Do not silently substitute local container/shell work for an unavailable Herdr w
 - Cloudflare production deployment runs only after the Edge/contract gate and uses a GitHub `production` Environment with a least-privilege Workers token. The workflow must never require DNS/Tunnel/Admin permission.
 - Runtime self-update and Cloudflare Edge deploy are intentionally separate release planes.
 
-## 8. Browser extension boundary
+## 8. Artifact transport policy
+
+Treat transport as a capability decision, not an image-specific workflow:
+
+- For a local project image that the Web model needs to inspect, prefer `herdr_fs_image`; large sources are represented by a bounded preview while the original file remains unchanged.
+- When a remote source already exposes a transferable short-lived public HTTPS capability, prefer direct Rust import (`herdr-mcp artifact import --signed-url ...`) instead of copying bytes through R2. `herdr_inspect.workstation_info.web_artifacts` may expose such an unexpired URL when the optional Thin Web Bridge observed one.
+- Cloudflare R2 is provisioned during normal Edge setup as a private generic artifact relay. Use it opportunistically when there is no direct transferable URL, or when a temporary cross-device/cross-session handoff is useful. Objects are bounded to 8 MiB, capability-scoped, and expire after 15 minutes. Delete them after successful transfer when practical. Never treat R2 as a permanent asset library.
+- If `web_artifacts` is absent/empty or the browser extension is unavailable, do not poll, repeatedly retry, or block the coding task waiting for it. Continue with normal MCP/local tools; use R2 only when the task actually needs a relay and an authorized upload path exists.
+
+## 9. Browser extension boundary
 
 The browser extension is the reverse/wake channel and stays on the local machine. Current installs send bounded request/stream messages to the registered Chrome Native Messaging host, which reaches herdr-mcp through `~/.config/herdr-mcp/extension.sock` (mode `0600`). The browser receives and stores no Herdr bearer. Static `HERDR_MCP_TOKEN` remains for other local clients and for the native host's old-runtime HTTP fallback only. The extension does not need the public Worker/OAuth URL. Do not route extension traffic through Cloudflare merely because the Connector uses Cloudflare.
 
-## 9. Native Herdr reference
+For ChatGPT-generated artifacts, the extension may additionally act as a Thin Web Bridge: it observes supported short-lived signed URLs and forwards URL metadata only. It does not upload/download artifact bytes, it does not poll for missing artifacts, and a failed local delivery is a silent optional-feature downgrade.
+
+## 10. Native Herdr reference
 
 The installed `herdr --skill` is useful as **release-matched native Herdr reference material** for pane/workspace/agent concepts and CLI semantics. Its `HERDR_ENV=1` / "stop when outside Herdr" rule applies to pane-local agents, not to this remote MCP planner. For remote calls, the installed socket schema returned by `herdr_methods` is authoritative.
 
-## 10. Completion discipline
+## 11. Completion discipline
 
 For operational changes, do not declare success from code or unit tests alone. Verify the relevant real boundary: local runtime, persistent Link, Edge status, browser extension smoke, GitHub workflow syntax, or public endpoint as appropriate. Keep rollback evidence until the replacement path has been proven from the same client that matters.

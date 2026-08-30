@@ -36,9 +36,11 @@ The Cloudflare layer provides:
 - persistent WSS link management;
 - runtime online/offline and generation/version state;
 - MCP request/response relay;
-- short-lived private R2 generated-image relay (`/artifacts`, Worker-only bucket).
+- short-lived private R2 generic artifact relay (`/artifacts`, Worker-only bucket; 8 MiB / 15-minute objects).
 
-Edge does not store your Git repositories or replace Herdr. Code, shell commands and agents still run on the workstation. The R2 bucket is an ephemeral image relay, not an asset library.
+Edge does not store your Git repositories or replace Herdr. Code, shell commands and agents still run on the workstation. The R2 bucket is an ephemeral artifact relay, not an asset library. It is provisioned during normal setup so the capability is ready, while ChatGPT/agents decide at task time whether a relay is actually useful. The relay has no browser-extension dependency.
+
+Prefer direct transfer when the source already exposes a safe transferable HTTPS URL. Use R2 for temporary cross-boundary file handoff when a direct URL is unavailable or unsuitable. Local image inspection should continue to use `herdr_fs_image`.
 
 ## First deployment: workers.dev
 
@@ -79,7 +81,7 @@ OAuth issuer / `HERDR_MCP_BASE_URL` should use the same origin without `/mcp`.
 
 ### Deploy
 
-Create the private R2 artifact bucket first (idempotent), then deploy the Worker. The bucket is a Worker binding only; do not attach a public r2.dev domain.
+Create the private R2 artifact-relay bucket first (idempotent), then deploy the Worker. The bucket is a Worker binding only; do not attach a public r2.dev domain. Its objects are temporary capability-scoped transfer objects, not durable published URLs.
 
 ```bash
 cd edge/cloudflare

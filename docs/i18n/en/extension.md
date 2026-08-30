@@ -4,6 +4,8 @@ The herdr-mcp browser extension is not a second agent runtime. It adds browser-s
 
 **Finish the runtime + ChatGPT Connector first, then install the browser extension.** The extension is not required for the first ChatGPT-to-workstation connection.
 
+In v0.4.2 the extension also provides an optional **Thin Web Bridge** for ChatGPT-generated artifacts. It observes a supported short-lived signed URL already present in the logged-in page and forwards only URL metadata through Native Messaging. Rust fetches and validates the bytes. There is no polling/retry loop when the extension or local bridge is absent, and the feature does not affect normal coding, MCP, local image reads, or the independent R2 artifact relay.
+
 Data handling and permission use are documented in the [Browser extension privacy policy](privacy.md).
 
 ## End-user installation: Chrome Web Store only

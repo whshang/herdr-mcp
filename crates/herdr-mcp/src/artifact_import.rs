@@ -30,7 +30,7 @@ pub struct ImportArgs {
 #[derive(Debug)]
 struct FetchedArtifact {
     bytes: Vec<u8>,
-    mime_type: &'static str,
+    mime_type: String,
     sha256: String,
     final_url: String,
 }
@@ -177,8 +177,8 @@ fn read_artifact(
         .and_then(|value| value.split(';').next())
         .map(str::trim)
         .ok_or_else(|| "artifact response is missing Content-Type".to_owned())?;
-    let mime_type = supported_mime(declared_mime)
-        .ok_or_else(|| format!("unsupported artifact MIME type '{declared_mime}'"))?;
+    let mime_type = normalize_artifact_mime(declared_mime)
+        .ok_or_else(|| format!("invalid artifact MIME type '{declared_mime}'"))?;
 
     let mut bytes = Vec::new();
     response
@@ -188,7 +188,7 @@ fn read_artifact(
     if bytes.is_empty() || bytes.len() > MAX_ARTIFACT_BYTES {
         return Err("artifact size is outside the allowed range".to_owned());
     }
-    if !magic_matches(mime_type, &bytes) {
+    if raster_mime_requires_magic(&mime_type) && !magic_matches(&mime_type, &bytes) {
         return Err("artifact MIME type does not match file signature".to_owned());
     }
 
@@ -326,14 +326,38 @@ fn ipv6_public(ip: Ipv6Addr) -> bool {
         || (segments[0] == 0x2001 && segments[1] == 0x0db8))
 }
 
-fn supported_mime(value: &str) -> Option<&'static str> {
-    match value.to_ascii_lowercase().as_str() {
-        "image/png" => Some("image/png"),
-        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
-        "image/gif" => Some("image/gif"),
-        "image/webp" => Some("image/webp"),
-        _ => None,
+fn normalize_artifact_mime(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() || value.len() > 127 {
+        return None;
     }
+    let (kind, subtype) = value.split_once('/')?;
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 64
+            && part.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-'
+                    )
+            })
+    };
+    if !valid(kind) || !valid(subtype) {
+        return None;
+    }
+    Some(if value == "image/jpg" {
+        "image/jpeg".to_owned()
+    } else {
+        value
+    })
+}
+
+fn raster_mime_requires_magic(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
 }
 
 fn magic_matches(mime: &str, bytes: &[u8]) -> bool {
@@ -397,6 +421,26 @@ mod tests {
         assert!(parse_allowed_url("https://[fc00::1]/a").is_err());
         assert!(parse_allowed_url("https://[fe80::1]/a").is_err());
         assert!(parse_allowed_url("https://8.8.8.8/a").is_ok());
+    }
+
+    #[test]
+    fn generic_mime_validation_preserves_raster_magic_checks() {
+        assert_eq!(normalize_artifact_mime("text/plain;"), None);
+        assert_eq!(
+            normalize_artifact_mime("text/plain"),
+            Some("text/plain".to_owned())
+        );
+        assert_eq!(
+            normalize_artifact_mime("application/octet-stream"),
+            Some("application/octet-stream".to_owned())
+        );
+        assert_eq!(
+            normalize_artifact_mime("image/jpg"),
+            Some("image/jpeg".to_owned())
+        );
+        assert!(raster_mime_requires_magic("image/png"));
+        assert!(!raster_mime_requires_magic("text/plain"));
+        assert_eq!(normalize_artifact_mime("not-a-mime"), None);
     }
 
     #[test]

@@ -52,7 +52,7 @@ WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 
 Open <https://dash.cloudflare.com/profile/api-tokens> when browser control is available; otherwise give the user that URL.
 
-The simplest supported path is Cloudflare's current **Edit Cloudflare Workers** template, scoped to the single Account used for this install, **plus Account → Workers R2 Storage → Edit**. Do **not** add DNS Write. R2 write is required so the generated-image relay bucket can be created before Worker deploy.
+The simplest supported path is Cloudflare's current **Edit Cloudflare Workers** template, scoped to the single Account used for this install, **plus Account → Workers R2 Storage → Edit**. Do **not** add DNS Write. R2 write is requested during normal setup so the private generic artifact-relay bucket can be provisioned before Worker deploy. The relay is ready by default but used only when a task needs temporary artifact transfer.
 
 For a tighter custom token, retain at least Account → **Workers Scripts → Write/Edit**, Account → **Workers R2 Storage → Edit**, Account → **Account Settings → Read**, User → **Memberships → Read**, and User → **User Details → Read**. `workers.dev` bootstrap does not need Zone/DNS permissions.
 
@@ -91,7 +91,7 @@ GET it again afterward and require the returned value to match before deploying 
 
 Obtain the Edge Worker sources needed for deploy (temporary shallow clone or Release-adjacent docs package is acceptable for this Edge step only). Generate ignored `wrangler.user.toml` from the published user example, then set `name`, `DEFAULT_WORKSTATION_ID`, and `OAUTH_ISSUER=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`. Keep `workers_dev = true` and `routes = []`.
 
-Create the private R2 bucket named in `wrangler.user.toml` (idempotent if it already exists), then deploy the Worker. Do not skip the provision step: `wrangler deploy` fails closed when the bound bucket is missing.
+Create the private R2 artifact-relay bucket named in `wrangler.user.toml` (idempotent if it already exists), then deploy the Worker. Provisioning is part of the default setup even though runtime use is opportunistic and independent of the browser extension. Do not skip the provision step: `wrangler deploy` fails closed when the bound bucket is missing.
 
 ```bash
 node provision-r2.mjs --config wrangler.user.toml

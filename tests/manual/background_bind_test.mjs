@@ -45,7 +45,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.81", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true };
 const listeners = { onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.

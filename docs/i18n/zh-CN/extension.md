@@ -4,6 +4,8 @@ herdr-mcp 浏览器扩展不是第二个 Agent runtime。它给已经可用的 h
 
 **先完成 runtime + ChatGPT Connector，再安装浏览器扩展。** 第一次把 ChatGPT 连到工作站并不需要扩展。
 
+0.4.2 中扩展还提供可选的 **Thin Web Bridge**：它只观察登录态 ChatGPT 页面里已经出现的、受支持的短时签名 URL，并通过 Native Messaging 上报 URL 元数据；图片/文件字节仍由 Rust 下载和校验。扩展或本机 bridge 不存在时不会轮询、不会频繁重试，也不会影响正常 Coding、MCP、本地读图或独立的 R2 artifact relay。
+
 数据处理方式和权限用途见[浏览器扩展隐私政策](privacy.md)。
 
 ## 最终用户安装：只用 Chrome Web Store

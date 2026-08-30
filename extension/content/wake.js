@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.80";
+const H2W_CONTENT_VERSION = "0.1.81";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.

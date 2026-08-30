@@ -54,8 +54,13 @@
 
     <section class="grid">
       <article>
+        <h2>0.4.2：图片与临时 artifact</h2>
+        <p>本地图片直接通过 MCP 读取；已有可转移签名 HTTPS URL 时直接导入；只有需要跨边界临时传文件时才使用私有 R2 artifact relay。R2 在安装阶段默认 provision，但不是长期素材库。</p>
+        <p><a href="../docs/zh-CN/cloudflare-edge-deployment.html">Artifact 传输策略 →</a></p>
+      </article>
+      <article>
         <h2>浏览器扩展是可选项</h2>
-        <p>基础 Connector 可用后，再从 Chrome Web Store 安装 Herdr 扩展，用于浏览器控制中心、workspace binding、长对话连续工作和“排队”下一轮消息。普通用户不走 Developer mode / Load unpacked。</p>
+        <p>基础 Connector 可用后，再从 Chrome Web Store 安装 Herdr 扩展，用于浏览器控制中心、workspace binding、长对话连续工作、“排队”下一轮消息，以及可选 Thin Web Bridge。Thin Bridge 只传 signed URL 元数据；没有扩展时 Coding 仍正常工作。</p>
         <p><a href="../docs/zh-CN/extension.html">Chrome Web Store 安装说明 →</a> · <a href="../docs/zh-CN/browser-control-center.html">浏览器控制中心 →</a></p>
       </article>
       <article>

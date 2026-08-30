@@ -7,7 +7,7 @@
  *   GET  /info                            route/stage table for debugging
  *   GET  /status/:workstationId           DO presence snapshot (dev-open)
  *   GET  /ws/:workstationId               workstation link WSS upgrade (auth)
- *   POST /artifacts  GET|DELETE /artifacts/:id   private R2 image relay
+ *   POST /artifacts  GET|DELETE /artifacts/:id   private R2 artifact relay
  *   GET  /mcp  POST /mcp                  public MCP transport
  *   /.well-known/*                        OAuth / MCP discovery
  *
@@ -87,7 +87,7 @@ export default {
           { path: "/ws/:workstationId", stage: "dev (WS upgrade, link auth)" },
           { path: "/status/:workstationId", stage: "dev (DO presence)" },
           { path: "/mcp", stage: `public MCP epoch-${identity.contractEpoch} + sessionless ChatGPT SSE` },
-          { path: "/artifacts", stage: "private R2 generated-image relay (auth + capability)" },
+          { path: "/artifacts", stage: "private R2 generic artifact relay (auth + capability)" },
           { path: "/.well-known/mcp.json", stage: "public MCP discovery" },
           { path: "/.well-known/oauth-*", stage: "public OAuth discovery" },
         ],
@@ -159,7 +159,7 @@ export default {
       return stub.fetch(request);
     }
 
-    // ---- Private generated-image R2 relay. Not an MCP tool; not public.
+    // ---- Private generic artifact R2 relay. Not an MCP tool; not public.
     const artifactResponse = await handleArtifactRequest(request, env, {
       verifyEdgeToken: (token) => verifyEdgeAccessToken(env, token),
     });

@@ -45,9 +45,11 @@ Cloudflare 层主要承担：
 - 持久 WSS link 的连接管理；
 - runtime online/offline 与 generation/version 状态；
 - MCP request/response relay；
-- 短时私有 R2 生成图中继（`/artifacts`，仅 Worker binding）。
+- 短时私有 R2 通用 artifact 中继（`/artifacts`，仅 Worker binding；单对象 8 MiB / 15 分钟）。
 
-Edge **不保存你的 Git 仓库**，也不代替本机 Herdr。代码、shell 和 Agent 仍在工作站执行。R2 桶只是临时中继，不是素材库。
+Edge **不保存你的 Git 仓库**，也不代替本机 Herdr。代码、shell 和 Agent 仍在工作站执行。R2 桶只是临时 artifact 中继，不是素材库。正常安装阶段默认 provision，让能力随时可用；真正执行任务时由 ChatGPT / Agent 判断是否需要中转。该能力不依赖浏览器扩展。
+
+源端已经提供安全、可转移的短时 HTTPS URL 时优先直连；没有直接 URL、或者需要跨设备/跨会话临时传文件时再用 R2。本地图片给模型读取时继续优先 `herdr_fs_image`。
 
 ## 第一次部署：workers.dev
 
@@ -94,7 +96,7 @@ https://<worker>.<account-subdomain>.workers.dev
 
 ### 部署
 
-先幂等创建私有 R2 中继桶，再部署 Worker。该桶只通过 Worker binding 访问，不要挂 public r2.dev 域名。
+先幂等创建私有 R2 artifact 中继桶，再部署 Worker。该桶只通过 Worker binding 访问，不要挂 public r2.dev 域名；对象是带 capability 的临时传输对象，不是长期公开 URL。
 
 ```bash
 cd edge/cloudflare

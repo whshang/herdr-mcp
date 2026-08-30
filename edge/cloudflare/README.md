@@ -36,7 +36,7 @@ edge/cloudflare/
 ├── .gitignore                ← ignores dist/ (build output)
 ├── src/
 │   ├── index.ts              ← Worker entry: /health /info /status /ws /mcp /artifacts / OAuth
-│   ├── artifact-relay.ts     ← private R2 generated-image relay (not an MCP tool)
+│   ├── artifact-relay.ts     ← private R2 generic artifact relay (not an MCP tool)
 │   ├── workstation-do.ts     ← Durable Object per workstation_id
 │   ├── relay-adapter.ts      ← ★ SOLE Relay Protocol v1 wire boundary
 │   ├── canonical-imports.ts   ← canonical v1 type/validation port (isolated build)
@@ -59,7 +59,7 @@ edge/cloudflare/
 
 ## What's implemented (boundaries)
 
-- **`POST /artifacts`, `GET|DELETE /artifacts/:id`** — private R2 generated-image relay. Existing MCP/OAuth or `LINK_SHARED_SECRET` for upload; object capability for download/delete. 8 MiB, PNG/JPEG/GIF/WebP + magic, 15-minute expiry, random IDs. Not a public bucket and not a nineteenth MCP tool.
+- **`POST /artifacts`, `GET|DELETE /artifacts/:id`** — private R2 generic artifact relay. Existing MCP/OAuth or `LINK_SHARED_SECRET` for upload; object capability for download/delete. 8 MiB, generic MIME, raster magic checks, SHA-256, 15-minute expiry, random IDs. Not a public bucket and not a nineteenth MCP tool.
 - **`GET /health`** — stable edge role: service, version, contract epoch/hash marker. No DO dependency.
 - **`GET /info`** — route + stage table for debugging.
 - **`GET /ws/:workstationId`** — workstation link WSS upgrade. Bearer check at the Worker

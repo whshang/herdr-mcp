@@ -45,11 +45,13 @@ Inspect my Herdr projects. Read only; do not modify anything.
 
 A healthy setup lets ChatGPT see real workspaces, panes, agents, Git state, and project files through the MCP tools.
 
-### Images and visual work in v0.4.2
+### Images, artifacts, and the optional Thin Web Bridge in v0.4.2
 
-The v0.4.2 runtime extends the same workstation boundary to visual development work. `herdr_fs_image` lets ChatGPT inspect PNG/JPEG/GIF/WebP assets directly from managed projects. Generated images travel through a private, short-lived Cloudflare R2 artifact relay and are imported by the Rust runtime with HTTPS/SSRF, size, MIME/signature, digest, managed-root, dirty-file, and busy-agent checks before they are written to the repository. The public MCP catalog stays at 18 tools.
+The v0.4.2 runtime extends the same workstation boundary to visual and binary artifact work. `herdr_fs_image` reads PNG/JPEG/GIF/WebP from managed projects and produces a bounded preview when an original image would exceed the remote MCP frame budget. Incoming artifacts are fetched by Rust with HTTPS/SSRF, size, MIME, digest, managed-root, dirty-file, and busy-agent checks. Known raster formats also receive magic-byte validation. The public MCP catalog stays at 18 tools.
 
-The browser extension is deliberately **not** part of this image path. Its job is conversation continuity and browser control; generated-image transport belongs to the runtime + artifact relay.
+Transport is selected by capability, not by file type. Prefer a transferable short-lived HTTPS URL when the source already provides one. Cloudflare R2 is provisioned during normal Edge setup as a private 8 MiB / 15-minute artifact relay and is used only when a direct URL is unavailable or a temporary cross-device/cross-session handoff is useful. It is not a permanent asset library.
+
+The browser extension remains optional. On ChatGPT Web it can act as a **Thin Web Bridge** that observes a short-lived signed `oaiusercontent.com` URL and sends only that URL metadata through Native Messaging; image bytes are fetched by Rust. If the extension or local bridge is absent, Herdr makes no polling/retry loop and normal coding, MCP, local-image reading, and R2 artifact relay continue to work.
 
 ## Browser extension: optional, after the Connector works
 
