@@ -650,7 +650,7 @@ fn read_program_arguments(bytes: &[u8]) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;

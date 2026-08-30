@@ -1,5 +1,5 @@
 use crate::cli::ServiceCommand;
-use crate::{herdr_supervisor, service_manager};
+use crate::{herdr_supervisor, link, paths::RuntimePaths, service_manager};
 use serde_json::Value;
 use std::process::ExitCode;
 
@@ -74,6 +74,51 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
             .unwrap_or_default();
         return Err(format!(
             "service install committed but Herdr supervisor activation failed: {supervisor_error}; {service_detail}{cleanup_detail}{restore_detail}"
+        ));
+    }
+
+    let paths = RuntimePaths::discover()?;
+    if let Err(link_error) = link::reconcile_after_service_generation_change(&paths) {
+        let after_service = service_snapshot()?;
+        let recovery = install_recovery(&before_service, &after_service);
+        let service_recovery = match recovery {
+            InstallRecovery::None => Ok(ExitCode::SUCCESS),
+            InstallRecovery::Rollback => service_manager::run(ServiceCommand::Rollback),
+            InstallRecovery::Uninstall => service_manager::run(ServiceCommand::Uninstall),
+        };
+        let service_recovered = matches!(service_recovery, Ok(code) if code == ExitCode::SUCCESS);
+        let supervisor_restore = if service_recovered {
+            herdr_supervisor::restore_install_state_for_service(before_supervisor)
+        } else {
+            Ok(())
+        };
+        let link_restore = if service_recovered && recovery != InstallRecovery::None {
+            RuntimePaths::discover()
+                .and_then(|paths| link::reconcile_after_service_generation_change(&paths))
+        } else {
+            Ok(())
+        };
+
+        if service_recovered && supervisor_restore.is_ok() && link_restore.is_ok() {
+            return Err(format!(
+                "service install post-commit production Link generation reconcile failed and the service change was recovered ({recovery:?}): {link_error}"
+            ));
+        }
+
+        let service_detail = match service_recovery {
+            Ok(code) => format!("service recovery exited with {code:?}"),
+            Err(error) => format!("service recovery failed: {error}"),
+        };
+        let supervisor_detail = supervisor_restore
+            .err()
+            .map(|error| format!("; previous supervisor state restore failed: {error}"))
+            .unwrap_or_default();
+        let link_detail = link_restore
+            .err()
+            .map(|error| format!("; production Link restore failed: {error}"))
+            .unwrap_or_default();
+        return Err(format!(
+            "service install committed but production Link generation reconcile failed: {link_error}; {service_detail}{supervisor_detail}{link_detail}"
         ));
     }
 
