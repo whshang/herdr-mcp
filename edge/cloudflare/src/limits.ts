@@ -51,13 +51,66 @@ export const EDGE_STATUS_REPLY_INTERVAL_MS = 30_000;
 /** Frame payload bound — well below the 32 MiB DO limit. */
 export const DEFAULT_MAX_FRAME_BYTES = 1_048_576; // 1 MiB
 
-/** Temporary generated-image R2 relay. Objects never ride the 1 MiB MCP/DO frame. */
+/** Temporary generic short-lived private artifact relay. Objects never ride the 1 MiB MCP/DO frame. */
 export const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
 export const ARTIFACT_TTL_MS = 15 * 60 * 1000;
 export const ARTIFACT_ID_BYTES = 16;
 export const ARTIFACT_CAPABILITY_BYTES = 32;
 export const ARTIFACT_KEY_PREFIX = "artifacts/";
-export const ARTIFACT_MIME_TYPES = Object.freeze(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
+/**
+ * Conservative MIME allowlist for the generic artifact relay.
+ *
+ * Images keep strict magic checks. Inert text/docs, archives, and the opaque
+ * octet-stream fallback are accepted without image-magic rejection. Active
+ * content semantics (HTML, SVG, JavaScript, executables) are never assigned;
+ * downloads are served as attachments with nosniff so a relayed object is
+ * opaque bytes written only through the existing filesystem gates.
+ */
+export const ARTIFACT_MIME_TYPES = Object.freeze([
+  // images (strict magic enforced)
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  // inert text / docs
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "text/css",
+  "application/json",
+  "application/pdf",
+  // archives
+  "application/zip",
+  "application/gzip",
+  "application/x-tar",
+  // opaque fallback
+  "application/octet-stream",
+]);
+
+/**
+ * MIME types that are explicitly rejected even though they are common.
+ * These carry active-content semantics and must never be relayed as-is.
+ */
+export const ARTIFACT_ACTIVE_MIME_TYPES = Object.freeze([
+  "text/html",
+  "application/xhtml+xml",
+  "image/svg+xml",
+  "text/javascript",
+  "application/javascript",
+  "application/x-javascript",
+  "application/ecmascript",
+  "text/ecmascript",
+  "application/xml",
+  "text/xml",
+  "application/x-httpd-php",
+  "application/x-sh",
+  "application/x-msdownload",
+  "application/x-msdos-program",
+  "application/x-executable",
+  "application/x-mach-binary",
+  "application/vnd.microsoft.portable-executable",
+]);
 
 /** Dead-letter / diagnostics caps. */
 export const MAX_ARGS_SUMMARY_KEYS = 32;

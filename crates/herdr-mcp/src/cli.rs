@@ -774,6 +774,8 @@ Advanced / internal:\n\
   herdr-mcp native-host use <store|dev>\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\
   herdr-mcp artifact import --url HTTPS_URL --path PROJECT_PATH [--sha256 HEX] [--capability-env NAME | --signed-url] [--overwrite] [--confirm-dirty] [--confirm-busy]\n\
+  (--signed-url imports a safe signed HTTPS URL directly; R2 relay objects use
+  HERDR_ARTIFACT_CAPABILITY, which is never a CLI arg)\n\
   herdr-mcp dev [--dry-run]\n\
   herdr-mcp candidate [--port 8873]\n\n\
 Prefer the top-level install/status/doctor/permissions/scan/update/rollback/uninstall commands\n\

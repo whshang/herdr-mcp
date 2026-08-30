@@ -188,7 +188,7 @@ fn read_artifact(
     if bytes.is_empty() || bytes.len() > MAX_ARTIFACT_BYTES {
         return Err("artifact size is outside the allowed range".to_owned());
     }
-    if !magic_matches(mime_type, &bytes) {
+    if is_image_mime(mime_type) && !magic_matches(mime_type, &bytes) {
         return Err("artifact MIME type does not match file signature".to_owned());
     }
 
@@ -328,12 +328,33 @@ fn ipv6_public(ip: Ipv6Addr) -> bool {
 
 fn supported_mime(value: &str) -> Option<&'static str> {
     match value.to_ascii_lowercase().as_str() {
+        // images (strict magic enforced)
         "image/png" => Some("image/png"),
         "image/jpeg" | "image/jpg" => Some("image/jpeg"),
         "image/gif" => Some("image/gif"),
         "image/webp" => Some("image/webp"),
+        // inert text / docs
+        "text/plain" => Some("text/plain"),
+        "text/markdown" => Some("text/markdown"),
+        "text/csv" => Some("text/csv"),
+        "text/css" => Some("text/css"),
+        "application/json" => Some("application/json"),
+        "application/pdf" => Some("application/pdf"),
+        // archives
+        "application/zip" => Some("application/zip"),
+        "application/gzip" => Some("application/gzip"),
+        "application/x-tar" => Some("application/x-tar"),
+        // opaque fallback
+        "application/octet-stream" => Some("application/octet-stream"),
         _ => None,
     }
+}
+
+fn is_image_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
 }
 
 fn magic_matches(mime: &str, bytes: &[u8]) -> bool {
@@ -408,6 +429,56 @@ mod tests {
         assert_eq!(digest.len(), 64);
         assert!(validate_digest(&digest).is_ok());
         assert!(validate_digest("nope").is_err());
+    }
+
+    #[test]
+    fn non_image_allowlist_and_octet_stream_are_accepted_without_magic() {
+        for mime in [
+            "text/plain",
+            "text/markdown",
+            "text/csv",
+            "text/css",
+            "application/json",
+            "application/pdf",
+            "application/zip",
+            "application/gzip",
+            "application/x-tar",
+            "application/octet-stream",
+        ] {
+            assert_eq!(supported_mime(mime), Some(mime), "{mime} should be allowed");
+            assert!(!is_image_mime(mime), "{mime} must not require image magic");
+        }
+        // image/jpg canonicalizes to image/jpeg on both sides.
+        assert_eq!(supported_mime("image/jpg"), Some("image/jpeg"));
+        assert!(is_image_mime("image/jpeg"));
+    }
+
+    #[test]
+    fn active_content_mime_types_are_rejected() {
+        for mime in [
+            "text/html",
+            "application/xhtml+xml",
+            "image/svg+xml",
+            "text/javascript",
+            "application/javascript",
+            "application/xml",
+            "text/xml",
+            "application/x-sh",
+            "application/x-msdownload",
+            "application/x-executable",
+        ] {
+            assert_eq!(supported_mime(mime), None, "{mime} must be rejected");
+        }
+    }
+
+    #[test]
+    fn image_magic_is_required_only_for_images() {
+        // A non-image allowlisted MIME with arbitrary bytes is accepted (no magic).
+        assert!(!is_image_mime("application/octet-stream"));
+        assert!(!is_image_mime("text/plain"));
+        // An image MIME with mismatched bytes is rejected.
+        assert!(is_image_mime("image/png"));
+        assert!(!magic_matches("image/png", b"not a png"));
     }
 
     #[test]

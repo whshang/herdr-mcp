@@ -11,6 +11,8 @@ import {
   artifactObjectKey,
   handleArtifactRequest,
   imageMagicMatches,
+  isImageMime,
+  normalizeArtifactMime,
   randomHex,
   sha256Hex,
   sweepExpiredArtifacts,
@@ -128,6 +130,67 @@ test("artifact magic accepts png/jpeg/gif/webp and rejects mismatch", () => {
   assert.equal(imageMagicMatches("image/webp", WEBP), true);
   assert.equal(imageMagicMatches("image/png", JPEG), false);
   assert.equal(imageMagicMatches("image/svg+xml", PNG), false);
+});
+
+test("non-image allowlist and octet-stream are accepted without image magic", async () => {
+  const state = env();
+  const cases = [
+    { mime: "text/plain", bytes: Uint8Array.from(Buffer.from("hello artifact\n")) },
+    { mime: "application/json", bytes: Uint8Array.from(Buffer.from('{"ok":true}')) },
+    { mime: "application/octet-stream", bytes: Uint8Array.from([0x00, 0x01, 0x02, 0xff]) },
+    { mime: "application/zip", bytes: Uint8Array.from(Buffer.from("PK\x03\x04fake")) },
+  ];
+  for (const { mime, bytes } of cases) {
+    const created = await (await upload(state, bytes, authHeaders(mime))).json();
+    assert.equal(created.ok, true, mime);
+    assert.equal(created.mime_type, mime, mime);
+    assert.equal(created.bytes, bytes.byteLength, mime);
+    const digest = await sha256Hex(bytes);
+    assert.equal(created.sha256, digest, mime);
+
+    const downloaded = await handleArtifactRequest(
+      new Request(`https://edge.example/artifacts/${created.id}`, {
+        headers: { authorization: `Bearer ${created.capability}` },
+      }),
+      state,
+    );
+    assert.equal(downloaded.status, 200, mime);
+    assert.equal(downloaded.headers.get("content-type"), mime, mime);
+    assert.equal(downloaded.headers.get("content-disposition"), `attachment; filename="${created.id}"`, mime);
+    assert.equal(downloaded.headers.get("x-content-type-options"), "nosniff", mime);
+    assert.equal(downloaded.headers.get("x-artifact-sha256"), digest, mime);
+    assert.deepEqual([...new Uint8Array(await downloaded.arrayBuffer())], [...bytes], mime);
+  }
+});
+
+test("active-content MIME declarations are rejected", async () => {
+  const state = env();
+  for (const mime of [
+    "text/html",
+    "application/xhtml+xml",
+    "image/svg+xml",
+    "text/javascript",
+    "application/javascript",
+    "application/xml",
+    "application/x-sh",
+    "application/x-msdownload",
+  ]) {
+    const response = await upload(state, PNG, authHeaders(mime));
+    assert.equal(response.status, 415, mime);
+    assert.equal((await response.json()).code, "artifact_mime_unsupported", mime);
+  }
+});
+
+test("normalizeArtifactMime and isImageMime classify the allowlist", () => {
+  assert.equal(normalizeArtifactMime("image/png"), "image/png");
+  assert.equal(normalizeArtifactMime("text/plain; charset=utf-8"), "text/plain");
+  assert.equal(normalizeArtifactMime("application/octet-stream"), "application/octet-stream");
+  assert.equal(normalizeArtifactMime("text/html"), null);
+  assert.equal(normalizeArtifactMime("image/svg+xml"), null);
+  assert.equal(normalizeArtifactMime("application/x-sh"), null);
+  assert.equal(isImageMime("image/png"), true);
+  assert.equal(isImageMime("text/plain"), false);
+  assert.equal(isImageMime("application/octet-stream"), false);
 });
 
 test("artifact upload requires existing Edge MCP or Link bearer", async () => {

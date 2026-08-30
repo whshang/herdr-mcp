@@ -11,7 +11,7 @@ export interface Env {
   /** Global OAuth state Durable Object binding (class OAuthStoreDO). */
   OAUTH_STORE_DO: DurableObjectNamespace;
   /**
-   * Private R2 bucket for short-lived generated-image relay. Absent binding
+   * Private R2 bucket for short-lived generic artifact relay. Absent binding
    * fails closed; the bucket is never a public r2.dev asset store.
    */
   ARTIFACT_BUCKET?: R2Bucket;

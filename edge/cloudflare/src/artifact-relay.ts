@@ -1,15 +1,20 @@
 /**
- * artifact-relay.ts — short-lived private R2 relay for generated images.
+ * artifact-relay.ts — short-lived private R2 relay for generic artifacts.
  *
  * This is not an MCP tool and not a public bucket. Upload requires the existing
  * Edge MCP/OAuth or Link shared-secret bearer. Download/delete require the
  * one-time object capability (or the same upload principal). Object IDs are
- * random; MIME, size, magic, and expiry are enforced here.
+ * random; MIME, size, magic, and expiry are enforced here. Images are one
+ * artifact type among many; recognized images keep strict magic checks, while
+ * inert text/docs, archives, and the opaque octet-stream fallback are accepted
+ * without image-magic rejection. Active-content MIME semantics are never
+ * assigned and downloads are served as attachments with nosniff.
  */
 
 import { authenticateStaticMcpBearer, constantTimeEqual } from "./auth.js";
 import type { Env } from "./env.js";
 import {
+  ARTIFACT_ACTIVE_MIME_TYPES,
   ARTIFACT_CAPABILITY_BYTES,
   ARTIFACT_ID_BYTES,
   ARTIFACT_KEY_PREFIX,
@@ -73,7 +78,14 @@ export function imageMagicMatches(mimeType: string, data: Uint8Array): boolean {
 
 export function normalizeArtifactMime(raw: string | null): string | null {
   const mime = (raw ?? "").split(";")[0].trim().toLowerCase();
-  return (ARTIFACT_MIME_TYPES as readonly string[]).includes(mime) ? mime : null;
+  if (!(ARTIFACT_MIME_TYPES as readonly string[]).includes(mime)) return null;
+  if ((ARTIFACT_ACTIVE_MIME_TYPES as readonly string[]).includes(mime)) return null;
+  return mime;
+}
+
+/** True when the normalized MIME is a recognized image that requires magic. */
+export function isImageMime(mime: string): boolean {
+  return mime === "image/png" || mime === "image/jpeg" || mime === "image/gif" || mime === "image/webp";
 }
 
 export function randomHex(byteCount: number): string {
@@ -185,7 +197,7 @@ async function uploadArtifact(
   }
   const mime = normalizeArtifactMime(request.headers.get("content-type"));
   if (!mime) {
-    return fail(415, "artifact_mime_unsupported", "supported MIME types are image/png, image/jpeg, image/gif, and image/webp");
+    return fail(415, "artifact_mime_unsupported", "supported MIME types are images, inert text/docs, archives, and application/octet-stream");
   }
   const read = await readBytesBounded(request, MAX_ARTIFACT_BYTES);
   if (!read.ok) {
@@ -194,7 +206,7 @@ async function uploadArtifact(
   if (read.bytes.byteLength === 0) {
     return fail(400, "artifact_size_invalid", "artifact body must not be empty");
   }
-  if (!imageMagicMatches(mime, read.bytes)) {
+  if (isImageMime(mime) && !imageMagicMatches(mime, read.bytes)) {
     return fail(415, "artifact_format_mismatch", "image bytes do not match the declared MIME type");
   }
 
@@ -266,10 +278,13 @@ async function downloadArtifact(
     return fail(401, "artifact_auth_failed", "artifact download requires the object capability or Edge auth");
   }
   const bytes = new Uint8Array(await loaded.object.arrayBuffer());
+  const mime = loaded.metadata.mime_type || loaded.object.httpMetadata?.contentType || "application/octet-stream";
   return new Response(bytes, {
     status: 200,
     headers: {
-      "content-type": loaded.metadata.mime_type || loaded.object.httpMetadata?.contentType || "application/octet-stream",
+      "content-type": mime,
+      "content-disposition": `attachment; filename="${id}"`,
+      "x-content-type-options": "nosniff",
       "cache-control": "no-store",
       "x-artifact-id": id,
       "x-artifact-sha256": loaded.metadata.sha256 ?? "",

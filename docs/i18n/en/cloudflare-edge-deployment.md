@@ -36,9 +36,9 @@ The Cloudflare layer provides:
 - persistent WSS link management;
 - runtime online/offline and generation/version state;
 - MCP request/response relay;
-- short-lived private R2 generated-image relay (`/artifacts`, Worker-only bucket).
+- short-lived private R2 generic artifact relay (`/artifacts`, Worker-only bucket).
 
-Edge does not store your Git repositories or replace Herdr. Code, shell commands and agents still run on the workstation. The R2 bucket is an ephemeral image relay, not an asset library.
+Edge does not store your Git repositories or replace Herdr. Code, shell commands and agents still run on the workstation. The R2 bucket is an ephemeral generic artifact relay, not an asset library.
 
 ## First deployment: workers.dev
 

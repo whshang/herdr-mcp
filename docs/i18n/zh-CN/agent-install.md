@@ -52,7 +52,7 @@ WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 
 有浏览器控制时打开 <https://dash.cloudflare.com/profile/api-tokens>；否则把该 URL 交给用户。
 
-最简单支持路径是 Cloudflare 当前的 **Edit Cloudflare Workers** 模板，限定到本次安装使用的单个 Account，并额外授予 Account → **Workers R2 Storage → Edit**。**不要**加 DNS Write。R2 写权限用于在 Worker 部署前幂等创建生成图中继桶。
+最简单支持路径是 Cloudflare 当前的 **Edit Cloudflare Workers** 模板，限定到本次安装使用的单个 Account，并额外授予 Account → **Workers R2 Storage → Edit**。**不要**加 DNS Write。R2 写权限用于在 Worker 部署前幂等创建私有 artifact 中继桶。
 
 更紧的自定义 token 至少保留 Account → **Workers Scripts → Write/Edit**、Account → **Workers R2 Storage → Edit**、Account → **Account Settings → Read**、User → **Memberships → Read**、User → **User Details → Read**。`workers.dev` bootstrap 不需要 Zone/DNS 权限。
 

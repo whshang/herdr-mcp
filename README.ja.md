@@ -36,9 +36,9 @@ Inspect my Herdr projects. Read only; do not modify anything.
 
 ### v0.4.2 の画像・ビジュアル開発
 
-v0.4.2 は同じ workstation security boundary を visual development にも拡張します。`herdr_fs_image` で managed project 内の PNG/JPEG/GIF/WebP を ChatGPT が直接確認できます。生成画像は private・短寿命の Cloudflare R2 artifact relay を経由し、Rust runtime が HTTPS/SSRF、サイズ、MIME/file signature、digest、managed-root、dirty-file、busy-agent を検証してから repository に書き込みます。public MCP catalog は 18 tools のままです。
+v0.4.2 は同じ workstation security boundary を visual および file import にも拡張します。`herdr_fs_image` で managed project 内の PNG/JPEG/GIF/WebP を ChatGPT が直接確認できます。組み込みのプランナーポリシーは artifact を最短安全経路で処理します：managed ローカルファイルは直接 `herdr_fs_*` ツール、安全な署名付き HTTPS URL は直接 `herdr-mcp artifact import --signed-url`、直接消費できる MCP/Connector のファイル参照は直接消費し、残りのクロスバウンダリ転送だけが private・短寿命の Cloudflare R2 generic artifact relay を経由します。Rust runtime が HTTPS/SSRF、サイズ、MIME/file signature、digest、managed-root、dirty-file、busy-agent を検証してから repository に書き込みます。public MCP catalog は 18 tools のままです。
 
-Browser extension はこの画像経路には**参加しません**。役割は conversation continuity と browser control であり、generated-image transport は runtime + artifact relay が担当します。
+Browser extension はあらゆる file/artifact 経路には**参加しません**。役割は conversation continuity と browser control であり、artifact transport は runtime + direct signed import + private artifact relay が担当します。
 
 ## Browser extension は任意
 
