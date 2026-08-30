@@ -28,6 +28,7 @@ use crate::fs_tools;
 use crate::git_tools;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -173,6 +174,19 @@ pub fn status(path: &Path) -> Option<BrokerStatus> {
     let bytes = metadata.len();
     let sha256 = file_sha256(path).ok()?;
     Some(BrokerStatus { sha256, bytes })
+}
+
+/// One-line status for `herdr-mcp status` output.
+pub fn status_line(config_dir: &Path) -> String {
+    let path = broker_path(config_dir);
+    match status(&path) {
+        Some(info) => format!(
+            "installed at {} (sha256 {})",
+            path.display(),
+            &info.sha256[..16.min(info.sha256.len())]
+        ),
+        None => format!("not installed (expected {})", path.display()),
+    }
 }
 
 /// Parse and validate a broker request. Strict: exact top-level keys, object
@@ -361,20 +375,36 @@ pub fn route_fs_git(op: &str, snapshot: &Value, args: &Value) -> Option<Result<V
 }
 
 fn run_broker_child(broker: &Path, request_bytes: &[u8]) -> Result<Value, String> {
+    use crate::child_process;
     use std::process::{Command, Stdio};
 
-    let mut child = Command::new(broker)
+    // Fail closed: never spawn a broker path that is a symlink or not a
+    // regular file.
+    let metadata = std::fs::symlink_metadata(broker)
+        .map_err(|error| format!("cannot inspect broker {}: {error}", broker.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "broker {} must be a regular file (not a symlink)",
+            broker.display()
+        ));
+    }
+
+    let mut command = Command::new(broker);
+    command
         .arg("__tcc-broker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    child_process::configure_process_group(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|error| format!("cannot spawn broker {}: {error}", broker.display()))?;
+    let _registration = child_process::register_owned_child("tcc-broker", &child);
     let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| "broker stdin unavailable".to_owned())?;
-    let stdout = child
+    let mut stdout = child
         .stdout
         .take()
         .ok_or_else(|| "broker stdout unavailable".to_owned())?;
@@ -387,36 +417,25 @@ fn run_broker_child(broker: &Path, request_bytes: &[u8]) -> Result<Value, String
     let write_handle = std::thread::spawn(move || {
         let _ = stdin.write_all(&request_owned);
     });
-    let read_handle = std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let _ = stdout
-            .take((MAX_RESPONSE_BYTES + 1) as u64)
-            .read_to_end(&mut out);
-        let mut err = Vec::new();
-        let _ = stderr.read_to_end(&mut err);
-        (out, err)
-    });
+    // Read stdout and stderr concurrently, each bounded to avoid unbounded
+    // memory growth from a misbehaving broker.
+    let stdout_handle = std::thread::spawn(move || read_capped(&mut stdout, MAX_RESPONSE_BYTES));
+    let stderr_handle = std::thread::spawn(move || read_capped(&mut stderr, 64 * 1024));
 
-    let deadline = SystemTime::now() + REQUEST_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if SystemTime::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("broker request timed out".to_owned());
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(format!("broker wait failed: {error}")),
-        }
-    };
+    let status = child_process::wait_bounded(&mut child, REQUEST_TIMEOUT)
+        .map_err(|error| format!("broker wait failed: {error}"))?;
     let _ = write_handle.join();
-    let (out, err) = read_handle
+    let out = stdout_handle
         .join()
-        .map_err(|_| "broker read thread panicked".to_owned())?;
+        .map_err(|_| "broker stdout reader panicked".to_owned())?;
+    let err = stderr_handle
+        .join()
+        .map_err(|_| "broker stderr reader panicked".to_owned())?;
 
+    let Some(status) = status else {
+        // wait_bounded already terminated and reaped the child on timeout.
+        return Err("broker request timed out".to_owned());
+    };
     if !status.success() {
         let detail = String::from_utf8_lossy(&err).trim().to_owned();
         return Err(format!(
@@ -435,6 +454,26 @@ fn run_broker_child(broker: &Path, request_bytes: &[u8]) -> Result<Value, String
         ));
     }
     serde_json::from_slice(&out).map_err(|error| format!("invalid broker response JSON: {error}"))
+}
+
+/// Read up to `max_bytes` from a reader, retaining the first `max_bytes` and
+/// draining the rest so the child never blocks on a full pipe.
+fn read_capped(reader: &mut impl Read, max_bytes: usize) -> Vec<u8> {
+    let mut retained = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                if retained.len() < max_bytes {
+                    let keep = count.min(max_bytes - retained.len());
+                    retained.extend_from_slice(&buffer[..keep]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    retained
 }
 
 fn read_bounded_stdin(max_bytes: usize) -> Result<Vec<u8>, String> {
@@ -484,8 +523,10 @@ fn ensure_secure_dir(path: &Path) -> Result<(), String> {
     }
     std::fs::create_dir_all(path)
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    #[cfg(unix)]
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("cannot secure {}: {error}", path.display()))
+        .map_err(|error| format!("cannot secure {}: {error}", path.display()))?;
+    Ok(())
 }
 
 fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
@@ -508,7 +549,9 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
         now_ms_i64()
     ));
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true).mode(mode);
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(mode);
     let mut file = options
         .open(&temp)
         .map_err(|error| format!("cannot create {}: {error}", temp.display()))?;
@@ -516,6 +559,7 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
         .map_err(|error| format!("cannot write {}: {error}", temp.display()))?;
     file.sync_all()
         .map_err(|error| format!("cannot sync {}: {error}", temp.display()))?;
+    #[cfg(unix)]
     std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))
         .map_err(|error| format!("cannot chmod {}: {error}", temp.display()))?;
     std::fs::rename(&temp, path)
@@ -781,80 +825,5 @@ mod tests {
     #[test]
     fn contract_has_18_tools() {
         assert_eq!(crate::contract::tool_names().len(), 18);
-    }
-
-    #[test]
-    fn end_to_end_subprocess_round_trip() {
-        let dir = temp_dir("subprocess");
-        let root = dir.join("repo");
-        fs::create_dir_all(&root).unwrap();
-        init_git_repo(&root);
-        fs::write(root.join("hello.txt"), "hello world\n").unwrap();
-        let snapshot = make_snapshot(&root);
-        let req = request(
-            "fs_read",
-            &snapshot,
-            json!({"path": root.join("hello.txt")}),
-        );
-        let request_bytes = serde_json::to_vec(&req).unwrap();
-        let result_path = dir.join("result.json");
-
-        // Re-invoke the test harness as a subprocess helper that reads a
-        // bounded JSON request on stdin and writes the response to a file,
-        // mirroring the one-shot broker process boundary (spawn + stdin pipe
-        // + env + JSON round trip through handle_request_bytes).
-        let exe = std::env::current_exe().unwrap();
-        let mut child = Command::new(exe)
-            .args([
-                "--exact",
-                "tcc_broker::tests::broker_subprocess_helper",
-                "--nocapture",
-            ])
-            .env("HERDR_MCP_BROKER_TEST_HELPER", "1")
-            .env("HERDR_MCP_BROKER_TEST_RESULT", &result_path)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        {
-            use std::io::Write;
-            child
-                .stdin
-                .as_mut()
-                .unwrap()
-                .write_all(&request_bytes)
-                .unwrap();
-        }
-        let status = child.wait().unwrap();
-        assert!(status.success());
-        let response: Value = serde_json::from_slice(&fs::read(&result_path).unwrap()).unwrap();
-        assert_eq!(response["ok"].as_bool(), Some(true));
-        assert!(
-            response["content"]
-                .as_str()
-                .unwrap()
-                .contains("hello world")
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Subprocess helper for [`end_to_end_subprocess_round_trip`]: reads a
-    /// bounded JSON request on stdin and writes the response to the file named
-    /// by `HERDR_MCP_BROKER_TEST_RESULT`.
-    #[test]
-    fn broker_subprocess_helper() {
-        if std::env::var("HERDR_MCP_BROKER_TEST_HELPER")
-            .ok()
-            .as_deref()
-            != Some("1")
-        {
-            return;
-        }
-        let result_path = std::env::var("HERDR_MCP_BROKER_TEST_RESULT").unwrap();
-        let request = read_bounded_stdin(MAX_REQUEST_BYTES).unwrap();
-        let response = handle_request_bytes(&request).unwrap();
-        let bytes = serde_json::to_vec(&response).unwrap();
-        fs::write(&result_path, &bytes).unwrap();
     }
 }

@@ -70,6 +70,10 @@ pub fn print_status(paths: &RuntimePaths, config: &Config) {
             "unreachable"
         }
     );
+    println!(
+        "tcc broker: {}",
+        crate::tcc_broker::status_line(&paths.config_dir)
+    );
     println!("update channel: {}", config.update_channel.as_str());
     println!(
         "update checks: {}",
