@@ -47,9 +47,9 @@ herdr-mcp 本机 runtime 使用 GitHub Releases，不用 git clone。只在 Clou
 
 ### v0.4.2 的图片与视觉开发能力
 
-v0.4.2 把同一套工作站安全边界扩展到视觉开发：`herdr_fs_image` 可以让 ChatGPT 直接读取 managed project 内的 PNG/JPEG/GIF/WebP；ChatGPT 生成的图片通过私有、短生命周期的 Cloudflare R2 artifact relay 中转，再由 Rust runtime 在写入仓库前完成 HTTPS/SSRF、大小、MIME/文件签名、摘要、managed-root、dirty-file 和 busy-agent 校验。公共 MCP catalog 仍保持 18 个工具。
+v0.4.2 把同一套工作站安全边界扩展到视觉与文件导入：`herdr_fs_image` 可以让 ChatGPT 直接读取 managed project 内的 PNG/JPEG/GIF/WebP；内置规划策略让 artifact 走最短安全路径——managed 本地文件直接用 `herdr_fs_*` 工具，安全签名 HTTPS URL 直接用 `herdr-mcp artifact import --signed-url` 导入，可直接消费的 MCP/Connector 文件引用直接消费，其余跨边界传输才使用私有、短生命周期的 Cloudflare R2 通用 artifact 中继。Rust runtime 在写入仓库前完成 HTTPS/SSRF、大小、MIME/文件签名、摘要、managed-root、dirty-file 和 busy-agent 校验。公共 MCP catalog 仍保持 18 个工具。
 
-浏览器扩展明确**不参与图片传输**。它继续只负责长会话连续工作和浏览器控制；生成图片的传递属于 runtime + artifact relay。
+浏览器扩展明确**不参与任何文件/artifact 传输**。它继续只负责长会话连续工作和浏览器控制；artifact 传递属于 runtime + 直接签名导入 + 私有 artifact 中继。
 
 ## 浏览器扩展：可选，基础 Connector 可用后再装
 

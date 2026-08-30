@@ -52,7 +52,7 @@ WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 
 Open <https://dash.cloudflare.com/profile/api-tokens> when browser control is available; otherwise give the user that URL.
 
-The simplest supported path is Cloudflare's current **Edit Cloudflare Workers** template, scoped to the single Account used for this install, **plus Account → Workers R2 Storage → Edit**. Do **not** add DNS Write. R2 write is required so the generated-image relay bucket can be created before Worker deploy.
+The simplest supported path is Cloudflare's current **Edit Cloudflare Workers** template, scoped to the single Account used for this install, **plus Account → Workers R2 Storage → Edit**. Do **not** add DNS Write. R2 write is required so the private artifact relay bucket can be created before Worker deploy.
 
 For a tighter custom token, retain at least Account → **Workers Scripts → Write/Edit**, Account → **Workers R2 Storage → Edit**, Account → **Account Settings → Read**, User → **Memberships → Read**, and User → **User Details → Read**. `workers.dev` bootstrap does not need Zone/DNS permissions.
 

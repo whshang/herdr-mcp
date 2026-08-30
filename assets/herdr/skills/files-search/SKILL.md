@@ -11,6 +11,6 @@ Use the smallest scope that answers the question. Prefer targeted grep/list/read
 
 Use bounded line/byte windows and narrow subsequent reads from compact results. Treat search truncation as a signal to reduce scope, not to repeat the same broad query. Use literal search unless regex is required; add file globs/match limits when they materially narrow work.
 
-`herdr_fs_grep` may use an `rg` fast path or safe fallback; depend on the behavior contract, not a fixed backend. Use `herdr_fs_image` only for targeted visual inspection of images already inside a managed Git root.
+`herdr_fs_grep` may use an `rg` fast path or safe fallback; depend on the behavior contract, not a fixed backend. Use `herdr_fs_image` only for targeted visual inspection of images already inside a managed Git root. Images are one artifact type; the generic artifact relay / direct signed import path (see the herdr-mcp planner skill) handles other file types and cross-boundary ingress.
 
 Managed-root, secret-path, symlink, and byte-limit boundaries remain runtime-enforced. Read-only investigation needs specific evidence, not a new worktree or coding-agent merely to perform file IO.

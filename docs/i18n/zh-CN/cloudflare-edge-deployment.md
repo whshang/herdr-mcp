@@ -45,9 +45,9 @@ Cloudflare 层主要承担：
 - 持久 WSS link 的连接管理；
 - runtime online/offline 与 generation/version 状态；
 - MCP request/response relay；
-- 短时私有 R2 生成图中继（`/artifacts`，仅 Worker binding）。
+- 短时私有 R2 通用 artifact 中继（`/artifacts`，仅 Worker binding）。
 
-Edge **不保存你的 Git 仓库**，也不代替本机 Herdr。代码、shell 和 Agent 仍在工作站执行。R2 桶只是临时中继，不是素材库。
+Edge **不保存你的 Git 仓库**，也不代替本机 Herdr。代码、shell 和 Agent 仍在工作站执行。R2 桶只是临时通用 artifact 中继，不是素材库。
 
 ## 第一次部署：workers.dev
 

@@ -45,11 +45,11 @@ Inspect my Herdr projects. Read only; do not modify anything.
 
 A healthy setup lets ChatGPT see real workspaces, panes, agents, Git state, and project files through the MCP tools.
 
-### Images and visual work in v0.4.2
+### Artifacts and visual work in v0.4.2
 
-The v0.4.2 runtime extends the same workstation boundary to visual development work. `herdr_fs_image` lets ChatGPT inspect PNG/JPEG/GIF/WebP assets directly from managed projects. Generated images travel through a private, short-lived Cloudflare R2 artifact relay and are imported by the Rust runtime with HTTPS/SSRF, size, MIME/signature, digest, managed-root, dirty-file, and busy-agent checks before they are written to the repository. The public MCP catalog stays at 18 tools.
+The v0.4.2 runtime extends the same workstation boundary to visual and file-import work. `herdr_fs_image` lets ChatGPT inspect PNG/JPEG/GIF/WebP assets directly from managed projects, and the built-in planner policy routes artifacts over the shortest safe path: managed local files go through the direct `herdr_fs_*` tools, safe signed HTTPS URLs are imported directly with `herdr-mcp artifact import --signed-url`, directly consumable MCP/Connector file references are consumed directly, and only the remaining cross-boundary transfers use a private, short-lived Cloudflare R2 generic artifact relay. The Rust runtime imports with HTTPS/SSRF, size, MIME/signature, digest, managed-root, dirty-file, and busy-agent checks before anything is written to the repository. The public MCP catalog stays at 18 tools.
 
-The browser extension is deliberately **not** part of this image path. Its job is conversation continuity and browser control; generated-image transport belongs to the runtime + artifact relay.
+The browser extension is deliberately **not** part of any file/artifact path. Its job is conversation continuity and browser control; artifact transport belongs to the runtime + direct signed import + private artifact relay.
 
 ## Browser extension: optional, after the Connector works
 
