@@ -97,17 +97,13 @@ The goal is not maximum automation. The goal is preventing duplicate work while 
 
 A productive Herdr session can outlive one ChatGPT conversation. Tool calls, project instructions and visible text all consume context, while the browser may virtualize older messages and stop keeping the entire history in the DOM.
 
-The extension therefore supports semantic handoff:
+From 0.4.2, finalized user and assistant turns from a bound conversation are appended incrementally through Native Messaging into the Rust `state.db` Continuity Journal. Before an ID-only rollover, the extension performs a live Rust resolve for the current `continuity_id`. When that resolve succeeds, the fresh conversation receives only the compact continuity reference, calls the existing `herdr_call(method="continuity.resume", ...)` path to recover a bounded recent working tail, and then re-inspects Herdr, Git and relevant services before mutation.
 
-1. the current conversation produces a compact handoff packet;
-2. a fresh conversation is opened in the same Project where supported;
-3. the packet is submitted as the seed message;
-4. the extension verifies that the new conversation really exists and contains the seed;
-5. only then is the delivery target switched to the new conversation. On ChatGPT Projects the Project/workspace binding and continuity id stay in place; conversation-scoped sites still migrate their binding after confirmation.
+The continuity id identifies one stable work chain across conversations. Multiple active candidates are preserved and ambiguity fails closed; Herdr does not silently choose the most recent chain. On ChatGPT Projects the Project/workspace binding and continuity id stay in place while only the confirmed active conversation target changes.
 
-The handoff packet describes established work state. It is not proof that runtime state is still unchanged. The new conversation must re-inspect Herdr, Git and relevant services before mutation.
+If the local journal is unavailable or the live Rust resolve fails, the extension keeps the existing semantic handoff path as a compatibility fallback: the source conversation or configured fallback LLM produces a validated `HERDR_HANDOFF_V1` packet from bounded source context, the target is seeded, and cutover happens only after target confirmation.
 
-This preserves continuity without carrying an indefinitely growing transcript into every new turn.
+This preserves continuity without making the dying source page responsible for the only recoverable copy of working state.
 
 ## Manual and automatic control
 

@@ -10,6 +10,7 @@ use crate::native_tools;
 use crate::prompt::{self, PromptRegistry};
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
+use crate::state_store::StateStore;
 use crate::tcc_broker;
 use crate::utility_exec;
 use serde_json::{Value, json};
@@ -34,6 +35,7 @@ pub struct RuntimeContext<'a> {
     pub exec: &'a ExecRegistry,
     pub prompt: &'a PromptRegistry,
     pub skill: &'a SkillService,
+    pub state_store: &'a std::sync::Arc<std::sync::Mutex<StateStore>>,
 }
 
 pub fn handle(request: &Value, context: &RuntimeContext<'_>) -> Option<Value> {
@@ -181,13 +183,17 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     ));
                 }
             };
-            native_tools::call_with_local(
-                context.client,
-                context.skill,
-                &context.cache.snapshot(),
-                method,
-                params,
-            )
+            if method.starts_with("continuity.") {
+                continuity_call(context.state_store, method, &params)
+            } else {
+                native_tools::call_with_local(
+                    context.client,
+                    context.skill,
+                    &context.cache.snapshot(),
+                    method,
+                    params,
+                )
+            }
         }
         "herdr_fs_read" => route_fs_git("fs_read", &context.cache.snapshot(), &arguments),
         "herdr_fs_list" => route_fs_git("fs_list", &context.cache.snapshot(), &arguments),
@@ -262,6 +268,96 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     };
 
     Ok(tool_result(output, false))
+}
+
+fn continuity_call(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    method: &str,
+    params: &Value,
+) -> Value {
+    let Ok(store) = store.lock() else {
+        return json!({"ok": false, "code": "continuity_store_unavailable"});
+    };
+    match method {
+        "continuity.resume" => {
+            let Some(continuity_id) = params
+                .get("continuity_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return json!({"ok": false, "code": "continuity_id_required"});
+            };
+            match store.continuity_resume(continuity_id, 32) {
+                Ok(Some(record)) => {
+                    let turns = record
+                        .turns
+                        .into_iter()
+                        .map(|turn| {
+                            json!({
+                                "conversation_id": turn.conversation_id,
+                                "message_id": turn.message_id,
+                                "role": turn.role,
+                                "text": turn.text,
+                                "observed_at": turn.observed_at,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    json!({
+                        "ok": true,
+                        "continuity_id": record.continuity_id,
+                        "title": record.title,
+                        "project_id": record.project_id,
+                        "status": record.status,
+                        "checkpoint": record.checkpoint,
+                        "turns": turns,
+                        "updated_at": record.updated_at,
+                        "instruction": "Treat this as persisted working context. Re-check live Herdr/runtime/Git state before any mutation."
+                    })
+                }
+                Ok(None) => {
+                    json!({"ok": false, "code": "continuity_not_found", "continuity_id": continuity_id})
+                }
+                Err(error) => {
+                    json!({"ok": false, "code": "continuity_read_failed", "message": error})
+                }
+            }
+        }
+        "continuity.list" => match store.continuity_candidates(10) {
+            Ok(records) => json!({
+                "ok": true,
+                "candidates": records.into_iter().map(|record| json!({
+                    "continuity_id": record.continuity_id,
+                    "title": record.title,
+                    "project_id": record.project_id,
+                    "status": record.status,
+                    "updated_at": record.updated_at,
+                })).collect::<Vec<_>>()
+            }),
+            Err(error) => json!({"ok": false, "code": "continuity_list_failed", "message": error}),
+        },
+        "continuity.resolve" => {
+            let Some(conversation_id) = params
+                .get("conversation_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return json!({"ok": false, "code": "conversation_id_required"});
+            };
+            match store.continuity_for_conversation(conversation_id) {
+                Ok(Some(continuity_id)) => json!({"ok": true, "continuity_id": continuity_id}),
+                Ok(None) => json!({"ok": false, "code": "continuity_not_found"}),
+                Err(error) if error == "continuity_binding_ambiguous" => {
+                    json!({"ok": false, "code": "continuity_ambiguous"})
+                }
+                Err(error) => {
+                    json!({"ok": false, "code": "continuity_resolve_failed", "message": error})
+                }
+            }
+        }
+        _ => json!({"ok": false, "code": "unknown_local_method", "method": method}),
+    }
 }
 
 fn image_tool_result(image: fs_tools::ImageData) -> Value {

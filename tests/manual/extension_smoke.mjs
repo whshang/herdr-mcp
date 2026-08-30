@@ -362,6 +362,13 @@ ok(
   "handoff uses a bounded conversation snapshot and configured LLM fallback only for hard-limit or failed/stalled primary summaries",
 );
 ok(
+  wakeSource.includes('type: "h2w_turn_started"')
+    && backgroundSource.includes('msg?.type === "h2w_turn_started"')
+    && backgroundSource.includes("journalAppendContinuityTurn")
+    && backgroundSource.includes('role: "user"'),
+  "continuity journal records submitted user intent before assistant completion",
+);
+ok(
   backgroundSource.includes('manual_handoff_available: Boolean(chatgpt.project_id && chatgpt.conversation_id)')
     && wakeSource.includes('button.hidden = !chatGptConversationActionsAvailable')
     && !wakeSource.includes("h2w_bind"),

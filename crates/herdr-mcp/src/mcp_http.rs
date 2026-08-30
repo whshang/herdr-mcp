@@ -9,7 +9,7 @@ use crate::prompt::PromptRegistry;
 use crate::runtime_meta;
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
-use crate::state_store::StateStore;
+use crate::state_store::{ContinuityTurnInput, StateStore};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
@@ -192,6 +192,7 @@ struct AppState {
     exec: ExecRegistry,
     prompt: PromptRegistry,
     skill: SkillService,
+    state_store: Arc<Mutex<StateStore>>,
     sessions: SessionRegistry,
     activity: McpActivityRegistry,
     bearer_token: Arc<[u8]>,
@@ -220,7 +221,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
         "state",
     )?));
     let exec = ExecRegistry::new(exec_state_dir)?;
-    let prompt = PromptRegistry::with_store(state_store);
+    let prompt = PromptRegistry::with_store(state_store.clone());
     let skill = SkillService::new();
     crate::schema::prewarm_async();
     if !cache.wait_ready(Duration::from_secs(3)) {
@@ -251,6 +252,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             exec,
             prompt,
             skill,
+            state_store,
             sessions: SessionRegistry::default(),
             activity: McpActivityRegistry::default(),
             bearer_token: Arc::<[u8]>::from(token.into_bytes()),
@@ -317,8 +319,179 @@ fn candidate_router(state: AppState) -> Router {
             "/extension/control/action",
             post(post_extension_control_action),
         )
+        .route(
+            "/extension/continuity/turn",
+            post(post_extension_continuity_turn),
+        )
+        .route(
+            "/extension/continuity/resolve",
+            post(post_extension_continuity_resolve),
+        )
         .route("/health", get(health))
         .with_state(state)
+}
+
+async fn post_extension_continuity_turn(State(state): State<AppState>, body: Bytes) -> Response {
+    if !state.trusted_extension_ipc {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if body.len() > MAX_REQUEST_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let payload: Value = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) if value.is_object() => value,
+        _ => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"ok": false, "error": "invalid_json"}),
+            );
+        }
+    };
+    let required = |name: &str| {
+        payload
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let Some(continuity_id) = required("continuity_id") else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "continuity_id_required"}),
+        );
+    };
+    let Some(conversation_id) = required("conversation_id") else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "conversation_id_required"}),
+        );
+    };
+    let Some(message_id) = required("message_id") else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "message_id_required"}),
+        );
+    };
+    let Some(role) = required("role") else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "role_required"}),
+        );
+    };
+    let Some(text) = required("text") else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "text_required"}),
+        );
+    };
+    if continuity_id.len() > 160
+        || conversation_id.len() > 256
+        || message_id.len() > 256
+        || text.len() > 64 * 1024
+    {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "continuity_field_too_large"}),
+        );
+    }
+    let observed_at = payload
+        .get("observed_at")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(i64::MAX)
+        });
+    let workspace_id = payload.get("workspace_id").and_then(Value::as_str);
+    let project_id = payload.get("project_id").and_then(Value::as_str);
+    let title = payload.get("title").and_then(Value::as_str);
+    let fingerprint = payload.get("fingerprint").and_then(Value::as_str);
+    let inserted = match state.state_store.lock() {
+        Ok(mut store) => store.append_continuity_turn(ContinuityTurnInput {
+            continuity_id,
+            conversation_id,
+            workspace_id,
+            project_id,
+            title,
+            message_id,
+            role,
+            text,
+            fingerprint,
+            observed_at,
+        }),
+        Err(_) => Err("continuity_store_lock_poisoned".to_owned()),
+    };
+    match inserted {
+        Ok(inserted) => json_response(
+            StatusCode::OK,
+            &json!({"ok": true, "continuity_id": continuity_id, "inserted": inserted}),
+        ),
+        Err(error) => json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": error}),
+        ),
+    }
+}
+
+async fn post_extension_continuity_resolve(State(state): State<AppState>, body: Bytes) -> Response {
+    if !state.trusted_extension_ipc {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if body.len() > MAX_REQUEST_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let payload: Value = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) if value.is_object() => value,
+        _ => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"ok": false, "error": "invalid_json"}),
+            );
+        }
+    };
+    let Some(continuity_id) = payload
+        .get("continuity_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "continuity_id_required"}),
+        );
+    };
+    if continuity_id.len() > 160 {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "continuity_field_too_large"}),
+        );
+    }
+    let resolved = match state.state_store.lock() {
+        Ok(store) => store.continuity_resume(continuity_id, 1),
+        Err(_) => Err("continuity_store_lock_poisoned".to_owned()),
+    };
+    match resolved {
+        Ok(Some(record)) => json_response(
+            StatusCode::OK,
+            &json!({
+                "ok": true,
+                "continuity_id": record.continuity_id,
+                "status": record.status,
+                "updated_at": record.updated_at
+            }),
+        ),
+        Ok(None) => json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"ok": false, "error": "continuity_not_found"}),
+        ),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"ok": false, "error": error}),
+        ),
+    }
 }
 
 async fn shutdown_signal() {
@@ -1102,6 +1275,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             exec: &blocking_state.exec,
             prompt: &blocking_state.prompt,
             skill: &blocking_state.skill,
+            state_store: &blocking_state.state_store,
         };
         mcp::handle(&blocking_request, &context)
     })
@@ -1487,6 +1661,9 @@ mod tests {
             exec: ExecRegistry::new(root.join("exec")).unwrap(),
             prompt: PromptRegistry::new(),
             skill: SkillService::new(),
+            state_store: Arc::new(Mutex::new(
+                StateStore::open_in_dir(root, "state-test").unwrap(),
+            )),
             sessions: SessionRegistry::default(),
             activity: McpActivityRegistry::default(),
             bearer_token: Arc::<[u8]>::from(b"test-token".to_vec()),
@@ -1515,6 +1692,73 @@ mod tests {
                 None => Body::empty(),
             })
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn continuity_turn_route_is_trusted_ipc_only_and_persists_idempotently() {
+        let root = test_root("continuity-turn-route");
+        let payload = json!({
+            "continuity_id": "hc:test",
+            "conversation_id": "conv-1",
+            "workspace_id": "w19",
+            "project_id": "project-1",
+            "title": "continuity test",
+            "message_id": "msg-1",
+            "role": "user",
+            "text": "continue",
+            "fingerprint": "fp-1",
+            "observed_at": 1234
+        });
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/extension/continuity/turn")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        };
+
+        let tcp = candidate_router(test_state(&root.join("tcp")));
+        let response = tcp.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let mut extension_state = test_state(&root.join("extension"));
+        extension_state.trusted_extension_ipc = true;
+        let store = extension_state.state_store.clone();
+        let app = candidate_router(extension_state);
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["inserted"], true);
+
+        let response = app.clone().oneshot(request()).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["inserted"], false);
+
+        let resolve = Request::builder()
+            .method(Method::POST)
+            .uri("/extension/continuity/resolve")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"continuity_id": "hc:test"}).to_string()))
+            .unwrap();
+        let response = app.oneshot(resolve).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["continuity_id"], "hc:test");
+
+        let resume = store
+            .lock()
+            .unwrap()
+            .continuity_resume("hc:test", 32)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resume.turns.len(), 1);
+        assert_eq!(resume.turns[0].text, "continue");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1782,6 +2026,67 @@ mod tests {
         assert_eq!(local["skills"][0]["id"], "files-search");
         assert_eq!(local["skills"][0]["cache_hit"], false);
         assert_eq!(local["authorization"], "none");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn herdr_call_continuity_resume_round_trips_through_rust_http_without_socket() {
+        let root = test_root("local-continuity-resume");
+        let state = test_state(&root);
+        {
+            let mut store = state.state_store.lock().unwrap();
+            store
+                .append_continuity_turn(ContinuityTurnInput {
+                    continuity_id: "hc:http-test",
+                    conversation_id: "conv-http-test",
+                    workspace_id: Some("w19"),
+                    project_id: Some("project-http-test"),
+                    title: Some("HTTP continuity test"),
+                    message_id: "msg-http-user",
+                    role: "user",
+                    text: "continue from the persisted journal",
+                    fingerprint: Some("fp-http-user"),
+                    observed_at: 1700000000000,
+                })
+                .unwrap();
+        }
+        let app = candidate_router(state);
+        let request = rpc_request(
+            Method::POST,
+            "/mcp",
+            Some(json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{
+                    "name":"herdr_call",
+                    "arguments":{
+                        "method":"continuity.resume",
+                        "params":"{\"continuity_id\":\"hc:http-test\"}"
+                    }
+                }
+            })),
+            &[("user-agent", "openai-mcp/1.0")],
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = payload["result"]["content"][0]["text"].as_str().unwrap();
+        let local: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(local["ok"], true);
+        assert_eq!(local["continuity_id"], "hc:http-test");
+        assert_eq!(local["turns"][0]["role"], "user");
+        assert_eq!(
+            local["turns"][0]["text"],
+            "continue from the persisted journal"
+        );
+        assert!(
+            local["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("Re-check live")
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

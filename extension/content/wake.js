@@ -1161,8 +1161,10 @@ const H2W_CONTENT_VERSION = "0.1.77";
     // Only the NEW-conversation seed wrapper proves target delivery. The
     // source handoff request itself contains the raw HERDR_HANDOFF_V1 packet,
     // so accepting that marker here can misclassify the source conversation as
-    // an already-seeded target during same-tab navigation.
-    return body.includes(`[HERDR_CONTINUITY_TRANSFER id=${id}]`);
+    // an already-seeded target during same-tab navigation. The compact durable
+    // continuity-reference wrapper is the second valid NEW-conversation form.
+    return body.includes(`[HERDR_CONTINUITY_TRANSFER id=${id}]`)
+      || body.includes(`[HERDR_CONTINUITY_REF id=${id} `);
   }
 
   async function waitForHandoffTarget(transferId, timeoutMs = 25000) {
@@ -2384,6 +2386,7 @@ const H2W_CONTENT_VERSION = "0.1.77";
     let settleTimer = null;
     let lastReportedEnd = 0;
     let lastReportedTurnKey = "";
+    let lastStartedJournalKey = "";
     let lastAsstLen = initialAssistant.text.length;
     let lastAsstSignature = assistantSignature(initialAssistant.text);
     let lastAsstCount = initialAssistant.count;
@@ -2556,9 +2559,28 @@ const H2W_CONTENT_VERSION = "0.1.77";
       const userChanged = currentUserText && (currentUserSignature !== lastUserSignature || currentUserCount > lastUserCount);
       if (userChanged) {
         // ChatGPT virtualizes old turns while scrolling. A mounted user node
-        // changing is never sufficient evidence of a new submit, nor trusted
-        // as the pending turn text. Real submits are captured at the composer
-        // and extension-originated submits are already known through lastWake.
+        // changing is not sufficient evidence by itself. Pair it with the fresh
+        // pending-submit anchor and the exact composer/extension text before
+        // persisting the user intent, so a failed Send click is never recorded
+        // as an accepted conversation turn.
+        const submitAt = syncPendingSubmitAnchor();
+        const expectedUser = pendingUserTextHint();
+        const confirmedPendingUser = hasPendingReply()
+          && submitAt > 0
+          && Date.now() - submitAt <= 30000
+          && expectedUser
+          && (currentUserText.includes(expectedUser.slice(0, 160))
+            || expectedUser.includes(currentUserText.slice(0, 160)));
+        const journalKey = `${submitAt}:${currentUserSignature}`;
+        if (confirmedPendingUser && journalKey !== lastStartedJournalKey) {
+          lastStartedJournalKey = journalKey;
+          void sendBg({
+            type: "h2w_turn_started",
+            convKey: ADAPTER.getConversationKey(),
+            startedAt: submitAt,
+            userText: currentUserText,
+          });
+        }
         lastUserSignature = currentUserSignature;
         lastUserCount = currentUserCount;
       }

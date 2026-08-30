@@ -22,6 +22,9 @@ import {
   classifyHandoffAssistantReply, extractHandoffPacket, handoffSeedContainsTransfer, handoffStatusIsActive,
   newContinuityId, newTransferId, shouldDiscardRetiredSourceTab,
 } from "./continuity-core.js";
+import {
+  CONTINUITY_JOURNAL_STORAGE_KEY, buildContinuitySeed, turnFingerprint,
+} from "./continuity-journal.js";
 import { detectOrLoadLocale, getLocale, setLocale, t as i18nText } from "./i18n.js";
 import { callMcpJsonRpc } from "./mcp-json-rpc.js";
 import { getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, resetLocalAuth } from "./local-auth.js";
@@ -1203,6 +1206,214 @@ async function loadHandoffTransfers() {
 
 async function saveHandoffTransfers(transfers) {
   await chrome.storage.local.set({ [HANDOFF_STORAGE_KEY]: transfers || {} });
+}
+
+// ---- Durable continuity journal persistence (bounded local cache to Rust).
+// Rust state_store v5 is AUTHORITATIVE. The extension best-effort pushes submitted
+// user intent and finalized assistant turns to `POST /extension/continuity/turn`
+// over trusted native IPC; chrome.storage is only bounded transient metadata.
+// `durable` becomes true only after a positive Rust acknowledgement (`{ok:true}`
+// over HTTP 200), never after a chrome.storage write. Turn handling must never be
+// blocked on persistence failure.
+
+const CONTINUITY_TURN_MAX_AGE = 24 * 60 * 60 * 1000; // pending metadata TTL
+const CONTINUITY_TURN_MAX_CACHED = 400;
+const CONTINUITY_IPCC_TIMEOUT_MS = 12_000;
+
+// continuityId -> true once Rust has acknowledged at least one turn. Persisted to
+// chrome.storage so it survives MV3 worker restart. This is diagnostic state only;
+// a fresh `/extension/continuity/resolve` is authoritative for ID-only handoff.
+const RUST_ACKED_KEY = "herdrContinuityDurableV1";
+let rustAcked = null; // lazily loaded { [continuityId]: true }
+
+async function loadRustAcked() {
+  if (rustAcked) return rustAcked;
+  let raw = {};
+  try {
+    raw = (await chrome.storage.local.get(RUST_ACKED_KEY))[RUST_ACKED_KEY] || {};
+  } catch (_) {}
+  rustAcked = (raw && typeof raw === "object") ? raw : {};
+  return rustAcked;
+}
+async function persistRustAcked() {
+  try { await chrome.storage.local.set({ [RUST_ACKED_KEY]: rustAcked || {} }); } catch (_) {}
+}
+
+async function loadContinuityCache() {
+  try {
+    return (await chrome.storage.local.get(CONTINUITY_JOURNAL_STORAGE_KEY))[CONTINUITY_JOURNAL_STORAGE_KEY] || {};
+  } catch (_) { return {}; }
+}
+async function saveContinuityCache(cache) {
+  try { await chrome.storage.local.set({ [CONTINUITY_JOURNAL_STORAGE_KEY]: cache || {} }); } catch (_) {}
+}
+
+function continuityTurnUrl() {
+  return `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/extension/continuity/turn`;
+}
+
+function continuityResolveUrl() {
+  return `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/extension/continuity/resolve`;
+}
+
+/** Post one finalized turn to Rust. Durable only on HTTP 200 + parsed {ok:true}. */
+async function journalPostTurnToRust(payload) {
+  const url = continuityTurnUrl();
+  try {
+    const response = await localHerdrFetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      nativeTimeoutMs: CONTINUITY_IPCC_TIMEOUT_MS,
+    });
+    const parsed = await response.json().catch(() => null);
+    if (response.ok && parsed?.ok === true) {
+      noteLocalRuntimeReachability(true);
+      if (payload?.continuity_id) {
+        await loadRustAcked();
+        rustAcked[payload.continuity_id] = true;
+        await persistRustAcked();
+      }
+      return { ok: true, durable: true, inserted: parsed.inserted === true };
+    }
+    noteLocalRuntimeReachability(false);
+    return { ok: false, durable: false, error: parsed?.error || `http-${response.status}` };
+  } catch (error) {
+    noteLocalRuntimeReachability(false);
+    return { ok: false, durable: false, error: String(error?.message || error || "native-transport-failed") };
+  }
+}
+
+/**
+ * Append one finalized side (user or assistant) to Rust. `message_id` is the Rust
+ * idempotency key (`PRIMARY KEY (continuity_id, message_id)`); when the page did
+ * not supply one, derive it deterministically from a content fingerprint so repeated
+ * observations dedupe and user/assistant sides stay distinct. The extension keeps
+ * only bounded pending metadata; Rust is the recoverable copy after ACK.
+ */
+async function journalAppendContinuityTurn(payload) {
+  const continuityId = String(payload?.continuityId || "").trim();
+  const convKey = String(payload?.conv_key || "").trim();
+  const role = String(payload?.role || "").toLowerCase();
+  const text = String(payload?.text || "").trim();
+  if (!continuityId || !convKey || !["user", "assistant"].includes(role) || !text) {
+    return { ok: false, durable: false, error: "continuity-fields-incomplete" };
+  }
+
+  const messageId = String(payload?.message_id || "").trim()
+    || `jt:${turnFingerprint({
+      convKey,
+      startedAt: payload?.startedAt || payload?.observedAt,
+      userText: role === "user" ? text : "",
+      assistantText: role === "assistant" ? text : "",
+    }).slice(0, 16)}`;
+
+  // Bounded retry/cache entry (never durable proof).
+  try {
+    const cache = await loadContinuityCache();
+    const pending = cache.pending && typeof cache.pending === "object" ? cache.pending : {};
+    const rows = Array.isArray(pending[continuityId]) ? pending[continuityId] : [];
+    const now = Date.now();
+    if (!rows.some((r) => r.message_id === messageId)) {
+      rows.push({ message_id: messageId, role, createdAt: now });
+      if (rows.length > CONTINUITY_TURN_MAX_CACHED) rows.splice(0, rows.length - CONTINUITY_TURN_MAX_CACHED);
+    }
+    await saveContinuityCache({ ...cache, pending: { ...pending, [continuityId]: rows } });
+  } catch (_) {}
+
+  const ack = await journalPostTurnToRust({
+    continuity_id: continuityId,
+    conversation_id: payload?.conversation_id || convKey,
+    workspace_id: payload?.workspace_id || null,
+    project_id: payload?.project_id || null,
+    title: payload?.title || null,
+    message_id: messageId,
+    role,
+    text,
+    fingerprint: payload?.fingerprint || null,
+    observed_at: payload?.observedAt || payload?.endedAt || Date.now(),
+  });
+  if (ack.ok && ack.durable) {
+    // Rust is the source of truth; drop the pending retry once acknowledged.
+    try {
+      const cache = await loadContinuityCache();
+      const pending = cache.pending && typeof cache.pending === "object" ? cache.pending : {};
+      const rows = Array.isArray(pending[continuityId]) ? pending[continuityId] : [];
+      cache.pending = { ...pending, [continuityId]: rows.filter((r) => r.message_id !== messageId) };
+      await saveContinuityCache(cache);
+    } catch (_) {}
+  }
+  return ack;
+}
+
+/** Append a finalized user+assistant turn to Rust (both sides, separately). */
+async function journalAppendFinalizedTurn(payload) {
+  const results = [];
+  if (String(payload?.userText || "").trim()) {
+    results.push(await journalAppendContinuityTurn({
+      ...payload, role: "user", text: payload.userText, message_id: payload.userMessageId,
+    }));
+  }
+  if (String(payload?.assistantText || "").trim()) {
+    results.push(await journalAppendContinuityTurn({
+      ...payload, role: "assistant", text: payload.assistantText, message_id: payload.messageId,
+    }));
+  }
+  return {
+    ok: results.some((r) => r?.ok && r.durable),
+    durable: results.some((r) => r?.ok && r.durable),
+    results,
+  };
+}
+
+/**
+ * RESOLVE durable availability for a continuity chain at handoff time.
+ *
+ * LIVE RESOLVE IS AUTHORITATIVE: this posts `{continuity_id}` to the trusted
+ * native IPC `POST /extension/continuity/resolve` and only returns durable:true
+ * when state.db currently holds the chain (HTTP 200 + parsed `{ok:true}`). The
+ * persisted `rust_acked` flag is only a hint/cache and never upgrades a failed
+ * or missing live resolve. Any resolve failure (404, 5xx, transport) returns
+ * durable:false so the classic HERDR_HANDOFF_V1 packet fallback runs. Unknown
+ * or ambiguous chains fail closed.
+ */
+async function durableChainWindow(continuityIdRaw) {
+  const continuityId = String(continuityIdRaw || "").trim();
+  if (!continuityId) return null;
+
+  // Live authoritative resolve before any ID-only seed is allowed.
+  let liveOk = false;
+  try {
+    const response = await localHerdrFetch(continuityResolveUrl(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ continuity_id: continuityId }),
+      nativeTimeoutMs: CONTINUITY_IPCC_TIMEOUT_MS,
+    });
+    if (response.ok) {
+      const parsed = await response.json().catch(() => null);
+      liveOk = parsed?.ok === true;
+    }
+    noteLocalRuntimeReachability(liveOk);
+  } catch (error) {
+    noteLocalRuntimeReachability(false);
+    liveOk = false;
+  }
+
+  // Hint/cache only — never authoritative on its own.
+  const acked = await loadRustAcked();
+  const durable = liveOk; // and keep the hint for diagnostics
+  return {
+    continuity_id: continuityId,
+    durable,
+    rust_acked_hint: acked[continuityId] === true,
+    turn_count: durable ? 1 : 0, // Rust owns the exact count; query continuity.resume
+    raw_bytes: 0,
+    per_chain_cap: 200,
+    raw_cap_bytes: 16 * 1024 * 1024,
+    created_at: null,
+    updated_at: null,
+  };
 }
 
 function latestTransferForConversation(transfers, convKey) {
@@ -2927,22 +3138,35 @@ async function waitForHandoffTargetComposer(transfer, targetTabId, timeoutMs = H
 async function seedHandoffIntoTarget(transferId, targetTabId) {
   const transfers = await loadHandoffTransfers();
   const transfer = transfers[transferId];
-  if (!transfer?.handoff_text) return { ok: false, error: "handoff_packet_missing" };
+  // Prefer the durable continuity journal: when the source chain has real local
+  // state, the target only needs the continuity_id reference, not a large
+  // model-written HERDR_HANDOFF_V1 packet. The packet remains the fallback for
+  // chains without durable state (jittery storage, unknown continuity, etc.).
+  const durable = transfer?.continuity_id
+    ? await durableChainWindow(transfer.continuity_id)
+    : null;
+  const durableAvailable = Boolean(durable?.durable && durable?.turn_count > 0);
+  if (!durableAvailable && !transfer?.handoff_text) {
+    return { ok: false, error: "handoff_packet_missing" };
+  }
   if (transfer.trigger !== "manual") {
     const runtimeGate = await automationRuntimeGate();
     if (!runtimeGate.ok) {
       return { ok: false, error: "local_runtime_unavailable", reason: runtimeGate.reason };
     }
   }
-  const seed = buildHandoffSeed({
-    transferId,
-    packet: transfer.handoff_text,
-    template: localizedText("handoff_seed_template"),
-  });
+  const seed = durableAvailable
+    ? buildContinuitySeed({ transferId, continuityId: transfer.continuity_id })
+    : buildHandoffSeed({
+        transferId,
+        packet: transfer.handoff_text,
+        template: localizedText("handoff_seed_template"),
+      });
   await markTransfer(transferId, {
     status: "seed_submitting",
     target_tab_id: targetTabId,
     error: null,
+    seed_kind: durableAvailable ? "continuity_reference" : "handoff_v1",
   });
   if (manualChatGptProjectHandoff(transfer)) {
     // Current-tab Project navigation destroys the source content script before
@@ -3029,7 +3253,16 @@ async function launchHandoffTarget(transferId) {
   const transfers = await loadHandoffTransfers();
   const transfer = transfers[transferId];
   const launchUrl = transfer?.handoff_launch_url || transfer?.project_launch_url || null;
-  if (!transfer?.handoff_text || !launchUrl) return { ok: false, error: "handoff_not_ready" };
+  // A durable continuity chain is itself sufficient launch material. Re-resolve
+  // immediately before navigation so a stale browser ACK can never authorize an
+  // ID-only cutover after state.db was replaced or reset.
+  const durable = !transfer?.handoff_text && transfer?.continuity_id
+    ? await durableChainWindow(transfer.continuity_id)
+    : null;
+  const continuityReady = Boolean(durable?.durable && durable?.turn_count > 0);
+  if ((!transfer?.handoff_text && !continuityReady) || !launchUrl) {
+    return { ok: false, error: "handoff_not_ready" };
+  }
   if (transfer.trigger !== "manual") {
     const runtimeGate = await automationRuntimeGate();
     if (!runtimeGate.ok) {
@@ -3378,20 +3611,27 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   const now = Date.now();
   const transferId = newTransferId(now);
   const continuityId = chainIds[0] || newContinuityId(now);
+  // Durable continuity is checked before touching the source conversation. When
+  // Rust already owns this chain, rollover needs only the stable continuity_id;
+  // do not spend another source turn generating HERDR_HANDOFF_V1.
+  const durable = await durableChainWindow(continuityId);
+  const durableAvailable = Boolean(durable?.durable && durable?.turn_count > 0);
   let sourceAssistantFp = null;
   let sourceSnapshot = null;
-  try {
-    sourceSnapshot = await sendHandoffTabMessage(tabId, convInfo.site, { type: "h2w_snapshot_turn" });
-    if (String(sourceSnapshot?.assistantText || "").trim()) {
-      sourceAssistantFp = assistantNudgeFingerprint(sourceSnapshot.assistantText);
-    }
-  } catch (_) {}
+  if (!durableAvailable) {
+    try {
+      sourceSnapshot = await sendHandoffTabMessage(tabId, convInfo.site, { type: "h2w_snapshot_turn" });
+      if (String(sourceSnapshot?.assistantText || "").trim()) {
+        sourceAssistantFp = assistantNudgeFingerprint(sourceSnapshot.assistantText);
+      }
+    } catch (_) {}
+  }
   const row = {
     version: 1,
     id: transferId,
     continuity_id: continuityId,
     site: convInfo.site,
-    status: "summary_requested",
+    status: durableAvailable ? "summary_ready" : "summary_requested",
     source_conv_key: convInfo.convKey,
     source_tab_id: tabId,
     project_id: convInfo.project_id,
@@ -3403,7 +3643,7 @@ async function startHandoffForTab(tabId, trigger = "manual") {
     source_automation_scope: convInfo.project_id ? "project" : "conversation",
     source_automation_enabled: sourceAutomation.enabled === true,
     handoff_text: null,
-    summary_source: null,
+    summary_source: durableAvailable ? "continuity_journal" : null,
     fallback_reason: null,
     target_tab_id: null,
     target_conv_key: null,
@@ -3414,6 +3654,18 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   };
   transfers[transferId] = row;
   await saveHandoffTransfers(transfers);
+
+  if (durableAvailable) {
+    // Keep the launch asynchronous like the packet path: the start request can
+    // return immediately while target creation/seed confirmation owns cutover.
+    setTimeout(() => { void launchHandoffTarget(transferId); }, 0);
+    return {
+      ok: true,
+      pending: true,
+      continuity_reference: true,
+      handoff: handoffView(row),
+    };
+  }
 
   const sourceLimitBlocked = sourceSnapshot?.handoffBlockReason === "conversation_limit_ui";
   if (sourceLimitBlocked) {
@@ -4330,6 +4582,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return true;
   }
+  if (msg?.type === "h2w_turn_started") {
+    void (async () => {
+      const convKey = String(msg?.convKey || "").trim();
+      const userText = String(msg?.userText || "").trim();
+      if (!convKey || !userText) {
+        sendResponse({ ok: false, error: "continuity-fields-incomplete" });
+        return;
+      }
+      let session = [];
+      try {
+        const bindings = await loadBindings();
+        session = bindingsForConv(bindings, convKey);
+      } catch (_) {}
+      const continuityIds = [...new Set(session.map((binding) => binding?.continuity_id).filter(Boolean))];
+      if (continuityIds.length !== 1) {
+        sendResponse({
+          ok: false,
+          error: continuityIds.length > 1 ? "binding_continuity_conflict" : "continuity_unbound",
+        });
+        return;
+      }
+      const primary = session[0] || null;
+      const result = await journalAppendContinuityTurn({
+        continuityId: continuityIds[0],
+        conv_key: convKey,
+        conversation_id: msg?.conversation_id || convKey,
+        workspace_id: primary?.workspace_id || normalizeWorkspaceId(primary) || null,
+        project_id: primary?.project_id || null,
+        title: primary?.workspace_label || primary?.workspace_id || null,
+        role: "user",
+        text: userText,
+        startedAt: msg?.startedAt || Date.now(),
+        observedAt: msg?.startedAt || Date.now(),
+      });
+      sendResponse(result);
+    })();
+    return true;
+  }
   if (msg?.type === "h2w_turn_ended") {
     void (async () => {
       const handoff = await handleHandoffTurnEnded(msg);
@@ -4337,6 +4627,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse(handoff);
         return;
       }
+      // Best-effort durable continuity journal: append the finalized turn so
+      // the next conversation can resume from local state without a large
+      // model-written HERDR_HANDOFF_V1. Never blocks turn handling on failure.
+      let continuityId = String(msg?.continuity_id || "").trim();
+      let primaryBinding = null;
+      try {
+        const bindings = await loadBindings();
+        const session = bindingsForConv(bindings, msg?.convKey || "");
+        const continuityIds = [...new Set(session.map((binding) => binding?.continuity_id).filter(Boolean))];
+        if (!continuityId && continuityIds.length === 1) continuityId = continuityIds[0];
+        if (continuityIds.length <= 1) {
+          primaryBinding = session.find((binding) => !continuityId || binding?.continuity_id === continuityId) || session[0] || null;
+        } else if (!msg?.continuity_id) {
+          // Never guess when one Web conversation is accidentally associated
+          // with multiple active continuity chains.
+          continuityId = "";
+        }
+      } catch (_) {}
+      await journalAppendFinalizedTurn({
+        continuityId: continuityId || null,
+        conv_key: msg?.convKey || null,
+        project_id: msg?.project_id || primaryBinding?.project_id || null,
+        workspace_id: msg?.workspace_id || primaryBinding?.workspace_id || normalizeWorkspaceId(primaryBinding) || null,
+        title: primaryBinding?.workspace_label || primaryBinding?.workspace_id || null,
+        conversation_id: msg?.conversation_id || null,
+        userText: msg?.userText || null,
+        assistantText: msg?.assistantText || null,
+        startedAt: msg?.startedAt || null,
+        nowRaw: msg?.endedAt || Date.now(),
+      });
       let queued;
       try {
         queued = await queuedInsertStateForConversationStrict(msg.convKey || "");

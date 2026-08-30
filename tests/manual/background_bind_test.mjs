@@ -79,6 +79,10 @@ let hangAutomationNotifications = false;
 let failQueuedInsertStorage = false;
 const queuedInsertDeliveries = [];
 const controlActionRequests = [];
+let mockContinuityPersistenceEnabled = false;
+const mockContinuityChains = new Set();
+const continuityTurnRequests = [];
+const continuityResolveRequests = [];
 let blockQueuedInsertDelivery = false;
 let holdInitialLocaleRead = true;
 let initialLocaleReadSeen = false;
@@ -254,6 +258,44 @@ globalThis.chrome = {
             target: body.target,
             op_id: body.action === "agent_prompt" ? "op:prompt:test" : null,
           }),
+        });
+        return;
+      }
+      if (message.path === "/extension/continuity/turn") {
+        const body = JSON.parse(message.body || "{}");
+        continuityTurnRequests.push(body);
+        if (!mockLocalRuntimeAvailable) {
+          callback({ ok: false, error: "connect ECONNREFUSED 127.0.0.1:8772" });
+          return;
+        }
+        if (!mockContinuityPersistenceEnabled) {
+          callback({
+            ok: true, transport: "ipc", status: 503,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ok: false, error: "continuity-test-disabled" }),
+          });
+          return;
+        }
+        if (body.continuity_id) mockContinuityChains.add(body.continuity_id);
+        callback({
+          ok: true, transport: "ipc", status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ok: true, continuity_id: body.continuity_id, inserted: true }),
+        });
+        return;
+      }
+      if (message.path === "/extension/continuity/resolve") {
+        const body = JSON.parse(message.body || "{}");
+        continuityResolveRequests.push(body);
+        const found = mockLocalRuntimeAvailable
+          && mockContinuityPersistenceEnabled
+          && mockContinuityChains.has(body.continuity_id);
+        callback({
+          ok: true, transport: "ipc", status: found ? 200 : 404,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(found
+            ? { ok: true, continuity_id: body.continuity_id, status: "active" }
+            : { ok: false, error: "continuity_not_found" }),
         });
         return;
       }
@@ -1535,29 +1577,55 @@ console.log("\n[project handoff]");
 
   const autoCreateBefore = tabCreateCount;
   const autoUpdateBefore = tabUpdateCount;
+  const durableContinuityId = storage.herdrWakeBindings[targetKey]?.continuity_id;
+  ok(Boolean(durableContinuityId), "Project binding has a stable continuity id before durable rollover");
+  mockContinuityPersistenceEnabled = true;
+  const turnRequestsBeforeStarted = continuityTurnRequests.length;
+  let resolveTurnStarted;
+  const turnStartedP = new Promise((r) => { resolveTurnStarted = r; });
+  onMsg({
+    type: "h2w_turn_started",
+    convKey: PROJECT_SOURCE,
+    startedAt: 123456789,
+    userText: "continue durable work",
+  }, { tab: { id: 401 } }, (r) => resolveTurnStarted(r));
+  const turnStarted = await turnStartedP;
+  ok(turnStarted?.ok === true && turnStarted?.durable === true,
+    "user intent is persisted to Rust before the assistant finishes", JSON.stringify(turnStarted));
+  ok(continuityTurnRequests.length === turnRequestsBeforeStarted + 1
+      && continuityTurnRequests.at(-1)?.continuity_id === durableContinuityId
+      && continuityTurnRequests.at(-1)?.project_id === PROJECT_ID
+      && String(continuityTurnRequests.at(-1)?.title || "").includes("herdr-mcp")
+      && continuityTurnRequests.at(-1)?.role === "user"
+      && continuityTurnRequests.at(-1)?.text === "continue durable work",
+    "turn-start persistence writes the exact continuity id, Project/workspace metadata, and user intent");
+  const resolveCountBeforeDurableStart = continuityResolveRequests.length;
   let resolveAutoStart;
   const autoStartP = new Promise((r) => { resolveAutoStart = r; });
   onMsg({ type: "h2w_handoff_start", tabId: 401, trigger: "manual" }, { tab: { id: 401 } }, (r) => resolveAutoStart(r));
   const autoStart = await autoStartP;
-  ok(autoStart?.ok === true && autoStart?.pending === true,
-    "manual Project handoff remains available while Auto is on", JSON.stringify(autoStart));
+  ok(autoStart?.ok === true && autoStart?.pending === true && autoStart?.continuity_reference === true,
+    "durable Project handoff starts directly from continuity_id while Auto is on", JSON.stringify(autoStart));
   const autoTransfer = Object.values(storage.herdrConversationTransfers || {})
     .filter((transfer) => transfer?.source_conv_key === PROJECT_SOURCE)
     .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0];
   ok(autoTransfer?.source_automation_scope === "project" && autoTransfer?.source_automation_enabled === true,
     "Project handoff snapshots Auto on before cutover", JSON.stringify(autoTransfer));
-  const autoAssistantText = [
-    `<<<HERDR_HANDOFF_V1 id=${autoTransfer?.id}>>>`,
-    "# Project handoff",
-    "Current objective: verify Auto-on inheritance.",
-    "Next: verify the target keeps automation enabled.",
-    "<<<END_HERDR_HANDOFF_V1>>>",
-  ].join("\n");
-  let resolveAutoEnded;
-  const autoEndedP = new Promise((r) => { resolveAutoEnded = r; });
-  onMsg({ type: "h2w_turn_ended", convKey: PROJECT_SOURCE, assistantText: autoAssistantText, userText: "roll over" }, { tab: { id: 401 } }, (r) => resolveAutoEnded(r));
-  await autoEndedP;
+  ok(autoTransfer?.summary_source === "continuity_journal" && !autoTransfer?.handoff_text,
+    "durable rollover records the Rust journal as its source without a handoff packet", JSON.stringify(autoTransfer));
+  ok(handoffPrompt === "",
+    "durable rollover never submits a summary prompt to the source conversation");
+  ok(continuityResolveRequests.length > resolveCountBeforeDurableStart
+      && continuityResolveRequests.slice(resolveCountBeforeDurableStart).every((request) => request.continuity_id === durableContinuityId),
+    "durable rollover live-resolves the exact continuity id before cutover");
   await waitForTest(() => storage.herdrConversationTransfers?.[autoTransfer?.id]?.status === "committed");
+  ok(seedTemplateCaptures.some((seed) => seed.includes(`[HERDR_CONTINUITY_REF id=${autoTransfer?.id} continuity_id=${durableContinuityId}]`)
+      && seed.includes("continuity.resume")
+      && !seed.includes("<<<HERDR_HANDOFF_V1")),
+    "durable rollover seeds only the continuity reference and resume instruction",
+    JSON.stringify(seedTemplateCaptures).slice(0, 300));
+  mockContinuityPersistenceEnabled = false;
+  mockContinuityChains.clear();
   ok(storage.herdrConversationTransfers[autoTransfer?.id]?.status === "committed",
     "Auto-on Project handoff commits normally");
   ok(tabCreateCount === autoCreateBefore && tabUpdateCount === autoUpdateBefore + 1,
