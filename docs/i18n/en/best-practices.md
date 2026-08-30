@@ -157,6 +157,8 @@ The HUD's three preset manual progression actions are mutually exclusive with Au
 
 A handoff packet is historical context; the target conversation still re-checks Herdr/Git/runtime before mutation.
 
+If a user manually starts a new conversation in the same bound ChatGPT Project and says only “continue” / “resume”, do not ask them to find a `continuity_id`. Resolve/search durable continuity first. Text-only recall never authorizes automatic selection; ambiguity must be confirmed before resume, and live Herdr / Git / runtime state must be re-inspected before mutation.
+
 ## 9. Keep the public Edge stable while the local runtime evolves
 
 Do not couple a local implementation update to a new public URL.

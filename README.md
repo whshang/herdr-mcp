@@ -55,6 +55,8 @@ The browser extension is deliberately **not** part of any file/artifact path. It
 
 The browser extension adds long-conversation continuity, the Side Panel Control Center, workspace binding, and queued next-turn messages. It is **not** required for the first ChatGPT-to-workstation connection.
 
+In the v0.4.2 source candidate, a user who manually opens another conversation inside the same bound ChatGPT Project can simply say **“continue”** or **“resume”** without supplying an internal continuity ID. Herdr first searches the durable Continuity Journal with stable conversation / Project / workspace identity. It auto-resumes only when that identity identifies exactly one active chain; otherwise it shows bounded candidate evidence and asks the user to confirm. Recency or text similarity alone never selects a chain. See [Browser continuity](docs/i18n/en/browser-continuity.md).
+
 End users install it only from the **Chrome Web Store**:
 
 1. finish the runtime + Connector verification first;

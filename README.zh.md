@@ -55,6 +55,8 @@ v0.4.2 把同一套工作站安全边界扩展到视觉与文件导入：`herdr_
 
 浏览器扩展用于长期会话连续工作、Side Panel 控制中心、workspace binding 和“排队”下一轮消息。它**不是**第一次连通 ChatGPT 的前置条件。
 
+在 v0.4.2 source candidate 中，用户手动在同一个已绑定 ChatGPT Project 里新开会话后，直接说 **“继续” / “接着上次”** 即可，不需要提供内部 `continuity_id`。Herdr 会先按稳定的 conversation / Project / workspace 身份搜索本机 Continuity Journal；只有稳定身份本身唯一命中一条 active chain 时才自动恢复，否则只展示有界候选证据让用户确认。系统不会因为“最近一次”或“文字最像”就直接猜。详见 [浏览器连续工作](docs/i18n/zh-CN/browser-continuity.md)。
+
 最终用户只通过 **Chrome Web Store** 安装：
 
 1. 先完成上面的 runtime + Connector 验证；

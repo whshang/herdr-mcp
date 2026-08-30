@@ -90,6 +90,8 @@ git diff --check
 
 ChatGPT Project、普通 ChatGPT 会话、z.ai 和 DeepSeek 的作用域规则不同，具体以 [浏览器扩展](extension.md) 和 [自动继续与接力](extension-wake.md) 为准。
 
+如果用户手动在同一个已绑定 ChatGPT Project 里新开会话，只说“继续 / 接着上次”，不要先要求用户寻找 `continuity_id`。应先 resolve/search 本机 durable continuity；纯文本召回没有自动选择权，存在歧义必须确认后才能 resume，恢复后还要重新检查实时 Herdr / Git / runtime 再 mutation。
+
 ## 8. Edge 保持稳定，本地 Runtime 可以演进
 
 ChatGPT 保存的是稳定的 MCP/OAuth identity。工作站只建立出站认证连接，不开放公网入站端口。

@@ -218,7 +218,7 @@ Bind the current Web scope to the Herdr workspace doing the work. New Auto scope
 
 Then enable Auto where appropriate.
 
-Manual handoff, where supported, can be started with Auto on or off. During transfer, automatic wakes from the source pause and the target conversation inherits the source Auto state.
+Manual handoff, where supported, can be started with Auto on or off. During transfer, automatic wakes from the source pause and the target conversation inherits the source Auto state. In the same bound ChatGPT Project, a user who manually opens a fresh conversation can simply say “continue” / “resume” without providing an internal continuity ID; Herdr searches durable continuity and asks for confirmation if stable identity is ambiguous.
 
 See [Browser continuity](browser-continuity.md), [Browser Control Center](browser-control-center.md), and [Wake, recovery and handoff](extension-wake.md).
 

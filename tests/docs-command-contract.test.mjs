@@ -99,3 +99,17 @@ test("G20 archived notes keep the known CLI FAIL list for remaining mismatches",
   assert.match(wip, /cli-reference\.md/);
   assert.match(wip, /agent-install\.md/);
 });
+
+test("README continuity path stays no-ID and fail-closed across languages", () => {
+  const cases = [
+    ["README.md", /simply say \*\*“continue”\*\* or \*\*“resume”\*\*/, /without supplying an internal continuity ID/, /Recency or text similarity alone never selects a chain/],
+    ["README.zh.md", /直接说 \*\*“继续” \/ “接着上次”\*\*/, /不需要提供内部 `continuity_id`/, /不会因为“最近一次”或“文字最像”就直接猜/],
+    ["README.ja.md", /\*\*“continue” \/ “resume”\*\*/, /内部 `continuity_id` を入力せず/, /最新・文字類似だけで chain を選びません/],
+  ];
+  for (const [rel, intent, noId, failClosed] of cases) {
+    const doc = read(rel);
+    assert.match(doc, intent, `${rel} must expose the manual continue/resume path`);
+    assert.match(doc, noId, `${rel} must say an internal continuity ID is not required`);
+    assert.match(doc, failClosed, `${rel} must keep ambiguous selection fail-closed`);
+  }
+});

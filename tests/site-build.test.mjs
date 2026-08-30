@@ -129,6 +129,9 @@ test("each locale docs entry is a real user-first homepage", async () => {
     assert.equal(matches(homepageMain, /class="button primary"/g).length, 1, `homepage (${locale}) must expose one primary CTA`);
     assert.match(homepageMain, /class="agent-prompt" tabindex="0"/, `homepage (${locale}) install prompt must be keyboard-focusable`);
     assert.match(homepageMain, /Chrome Web Store/, `homepage (${locale}) browser path must be Store-first`);
+    assert.match(homepageMain, /durable continuity/, `homepage (${locale}) must explain no-ID continuity discovery`);
+    if (locale === "en") assert.match(homepageMain, /fresh manual conversation can simply say “continue”/);
+    else assert.match(homepageMain, /手动新开会话后可直接说“继续”/);
     assert.doesNotMatch(homepageMain, /\b(?:alpha|candidate|UAT|Runtime A\/B|worktree)\b|G\d+|GA scorecard/i, `homepage main content (${locale}) must keep release-engineering jargon out of the user path`);
   }
 });
@@ -139,6 +142,12 @@ test("article pages carry same-slug language switching, per-locale search isolat
     for (const slug of DOC_ORDER) {
       const html = await readFile(join(OUT, "docs", locale, `${slug}.html`), "utf8");
       assert.match(html, new RegExp(`<html lang="${ui.htmlLang}">`));
+      if (slug === "browser-continuity") {
+        assert.match(html, /continuity\.search/);
+        assert.match(html, /continuity_id/);
+        if (locale === "en") assert.match(html, /text-only match remains confirmation-required/);
+        else assert.match(html, /单纯文本匹配即使只剩一个候选也仍需要用户确认/);
+      }
       assert.match(html, /class="topbar has-drawer"/);
       assert.match(html, /data-nav-toggle/);
 
