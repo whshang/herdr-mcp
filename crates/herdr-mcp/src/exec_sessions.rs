@@ -1,9 +1,10 @@
 use crate::exec_compact;
+use crate::herdr::HerdrClient;
 use crate::state_store::{ExecSessionFence, StateStore};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -15,7 +16,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 
@@ -24,6 +25,8 @@ const SESSION_TTL_MS: u64 = 60 * 60_000;
 const KILL_GRACE: Duration = Duration::from_millis(1500);
 const OUTPUT_DRAIN_BUDGET: Duration = Duration::from_millis(500);
 const RECOVERY_MAX_ENTRIES: usize = 64;
+const PANE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const PANE_READ_LINES: u64 = 10_000;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -57,15 +60,30 @@ struct SessionStatus {
 }
 
 #[derive(Debug)]
+enum SessionBackend {
+    Native {
+        child: Mutex<Child>,
+        output_readers: AtomicUsize,
+    },
+    Pane {
+        client: HerdrClient,
+        pane_id: String,
+        start_marker: String,
+        done_marker: String,
+        script_path: PathBuf,
+        last_output: Mutex<String>,
+    },
+}
+
+#[derive(Debug)]
 struct Session {
     id: String,
     cwd: PathBuf,
     command: String,
     started_at_ms: u64,
-    pid: u32,
-    child: Mutex<Child>,
+    pid: Option<u32>,
+    backend: SessionBackend,
     buffers: Mutex<Buffers>,
-    output_readers: AtomicUsize,
     status: Mutex<SessionStatus>,
 }
 
@@ -74,6 +92,7 @@ struct RegistryInner {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     recovered: Mutex<HashMap<String, String>>,
     state_store: Mutex<StateStore>,
+    client: Option<HerdrClient>,
     persistence_failures: AtomicUsize,
     reaped_on_boot: usize,
     detached_on_boot: usize,
@@ -94,7 +113,15 @@ pub struct ExecRegistry {
 }
 
 impl ExecRegistry {
+    #[cfg(test)]
     pub fn new(state_dir: PathBuf) -> Result<Self, String> {
+        Self::new_with_client(state_dir, None)
+    }
+
+    pub fn new_with_client(
+        state_dir: PathBuf,
+        client: Option<HerdrClient>,
+    ) -> Result<Self, String> {
         fs::create_dir_all(&state_dir)
             .map_err(|error| format!("cannot create exec state directory: {error}"))?;
         #[cfg(unix)]
@@ -108,6 +135,7 @@ impl ExecRegistry {
                 sessions: Mutex::new(HashMap::new()),
                 recovered: Mutex::new(recovery.states),
                 state_store: Mutex::new(state_store),
+                client,
                 persistence_failures: AtomicUsize::new(0),
                 reaped_on_boot: recovery.reaped,
                 detached_on_boot: recovery.detached,
@@ -116,29 +144,35 @@ impl ExecRegistry {
         })
     }
 
+    #[cfg(test)]
     pub fn start(&self, cwd: &Path, command: &str) -> Result<Value, String> {
+        self.start_in_workspace(cwd, command, None)
+    }
+
+    pub fn start_in_workspace(
+        &self,
+        cwd: &Path,
+        command: &str,
+        workspace_id: Option<&str>,
+    ) -> Result<Value, String> {
         self.prune();
         if command.is_empty() {
             return Err("command must not be empty".to_owned());
         }
+        if should_use_pane_backend(cwd, workspace_id, self.inner.client.as_ref()) {
+            return self.start_pane(cwd, command, workspace_id.expect("checked above"));
+        }
+        self.start_native(cwd, command)
+    }
+
+    fn start_native(&self, cwd: &Path, command: &str) -> Result<Value, String> {
         let id = new_session_id();
-        let (mut process, stdin_payload) = match crate::tcc_broker::prepare_exec_host(command)? {
-            Some((mut process, payload)) => {
-                #[cfg(unix)]
-                process.arg0(process_marker(&id));
-                (process, Some(payload))
-            }
-            None => (shell_command(command, &id), None),
-        };
+        let mut process = shell_command(command, &id);
         process
             .current_dir(cwd)
             .env("HERDR_MCP_EXEC_ID", &id)
             .env("PATH", enriched_exec_path())
-            .stdin(if stdin_payload.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]
@@ -146,15 +180,6 @@ impl ExecRegistry {
         let mut child = process
             .spawn()
             .map_err(|error| format!("cannot start background command: {error}"))?;
-        if let Some(payload) = stdin_payload {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| "stable exec host stdin unavailable".to_owned())?;
-            thread::spawn(move || {
-                let _ = stdin.write_all(&payload);
-            });
-        }
         let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -164,10 +189,12 @@ impl ExecRegistry {
             cwd: cwd.to_path_buf(),
             command: command.to_owned(),
             started_at_ms: now_ms(),
-            pid,
-            child: Mutex::new(child),
+            pid: Some(pid),
+            backend: SessionBackend::Native {
+                child: Mutex::new(child),
+                output_readers: AtomicUsize::new(output_readers),
+            },
             buffers: Mutex::new(Buffers::default()),
-            output_readers: AtomicUsize::new(output_readers),
             status: Mutex::new(SessionStatus::default()),
         });
         if let Some(stdout) = stdout {
@@ -208,6 +235,99 @@ impl ExecRegistry {
             "command": command,
             "started_at": iso_from_ms(session.started_at_ms),
             "pid": pid,
+            "backend": "native",
+            "phase": "started",
+            "progress": {
+                "bytes_read": 0,
+                "bytes_total": 0,
+                "elapsed_ms": 0,
+            },
+        }))
+    }
+
+    fn start_pane(&self, cwd: &Path, command: &str, workspace_id: &str) -> Result<Value, String> {
+        let client = self
+            .inner
+            .client
+            .clone()
+            .ok_or_else(|| "Herdr pane backend is unavailable".to_owned())?;
+        let id = new_session_id();
+        let pane = client
+            .call_with_timeout(
+                "pane.split",
+                json!({
+                    "workspace_id": workspace_id,
+                    "direction": "right",
+                    "cwd": cwd.to_string_lossy(),
+                    "focus": false,
+                }),
+                PANE_RPC_TIMEOUT,
+            )
+            .map_err(|error| format!("cannot create Herdr exec pane: {error}"))?;
+        let pane_id =
+            extract_pane_id(&pane).ok_or_else(|| "pane.split returned no pane id".to_owned())?;
+        let _ = client.call_with_timeout(
+            "pane.rename",
+            json!({
+                "pane_id": pane_id,
+                "label": format!("herdr-mcp:exec:{}", short_session_id(&id)),
+            }),
+            PANE_RPC_TIMEOUT,
+        );
+        let script_path = pane_script_path(&id);
+        let start_marker = format!("__HM_EXEC_START_{}__", marker_safe_id(&id));
+        let done_marker = format!("__HM_EXEC_DONE_{}__", marker_safe_id(&id));
+        write_pane_script(&script_path, cwd, command, &start_marker, &done_marker)?;
+        let launch_line = format!(
+            "{} {}",
+            shell_quote(resolve_exec_shell().to_string_lossy().as_ref()),
+            shell_quote(script_path.to_string_lossy().as_ref()),
+        );
+        if let Err(error) = client.call_with_timeout(
+            "pane.send_text",
+            json!({"pane_id": pane_id, "text": format!("{launch_line}\n")}),
+            PANE_RPC_TIMEOUT,
+        ) {
+            let _ = fs::remove_file(&script_path);
+            let _ = client.call_with_timeout(
+                "pane.close",
+                json!({"pane_id": pane_id}),
+                PANE_RPC_TIMEOUT,
+            );
+            return Err(format!("cannot start Herdr pane command: {error}"));
+        }
+        let started_at_ms = now_ms();
+        let session = Arc::new(Session {
+            id: id.clone(),
+            cwd: cwd.to_path_buf(),
+            command: command.to_owned(),
+            started_at_ms,
+            pid: None,
+            backend: SessionBackend::Pane {
+                client,
+                pane_id: pane_id.clone(),
+                start_marker,
+                done_marker,
+                script_path,
+                last_output: Mutex::new(String::new()),
+            },
+            buffers: Mutex::new(Buffers::default()),
+            status: Mutex::new(SessionStatus::default()),
+        });
+        self.inner
+            .sessions
+            .lock()
+            .map_err(|_| "exec registry lock poisoned".to_owned())?
+            .insert(id.clone(), session);
+        Ok(json!({
+            "ok": true,
+            "session_id": id,
+            "cwd": cwd.to_string_lossy(),
+            "command": command,
+            "started_at": iso_from_ms(started_at_ms),
+            "pid": Value::Null,
+            "backend": "herdr_pane",
+            "pane_id": pane_id,
             "phase": "started",
             "progress": {
                 "bytes_read": 0,
@@ -479,13 +599,18 @@ where
             };
             push_chunk(&session, stream, &buffer[..read]);
         }
-        session.output_readers.fetch_sub(1, Ordering::Release);
+        if let SessionBackend::Native { output_readers, .. } = &session.backend {
+            output_readers.fetch_sub(1, Ordering::Release);
+        }
     });
 }
 
 fn wait_for_output_readers(session: &Arc<Session>) {
+    let SessionBackend::Native { output_readers, .. } = &session.backend else {
+        return;
+    };
     let deadline = Instant::now() + OUTPUT_DRAIN_BUDGET;
-    while session.output_readers.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+    while output_readers.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(2));
     }
 }
@@ -580,27 +705,213 @@ fn spawn_monitor(session: Arc<Session>, registry: Weak<RegistryInner>) {
     });
 }
 
+fn should_use_pane_backend(
+    cwd: &Path,
+    workspace_id: Option<&str>,
+    client: Option<&HerdrClient>,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if workspace_id.is_none() || client.is_none() {
+            return false;
+        }
+        let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+            return false;
+        };
+        is_protected_root_for_home(cwd, &home)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (cwd, workspace_id, client);
+        false
+    }
+}
+
+fn is_protected_root_for_home(cwd: &Path, home: &Path) -> bool {
+    ["Documents", "Desktop", "Downloads"]
+        .into_iter()
+        .map(|name| home.join(name))
+        .any(|protected| cwd.starts_with(protected))
+}
+
+fn extract_pane_id(value: &Value) -> Option<String> {
+    let pane = value.get("pane").unwrap_or(value);
+    pane.get("pane_id")
+        .and_then(Value::as_str)
+        .or_else(|| pane.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+fn marker_safe_id(id: &str) -> String {
+    id.chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
+fn short_session_id(id: &str) -> String {
+    id.chars()
+        .rev()
+        .take(10)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
+}
+
+fn pane_script_path(id: &str) -> PathBuf {
+    env::temp_dir().join(format!("herdr-mcp-pane-exec-{}.sh", marker_safe_id(id)))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn write_pane_script(
+    path: &Path,
+    cwd: &Path,
+    command: &str,
+    start_marker: &str,
+    done_marker: &str,
+) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o700);
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("cannot create pane exec script {}: {error}", path.display()))?;
+    let body = format!(
+        "#!{}\nset +e\nexport PAGER=cat\nexport GIT_PAGER=cat\nexport GH_PAGER=cat\nexport SYSTEMD_PAGER=cat\nexport MANPAGER=cat\nexport DELTA_PAGER=cat\ntrap 'rm -f -- \"$0\"' EXIT\nprintf '%s' {}\ncd -- {}\ncd_ec=$?\nif [ \"$cd_ec\" -ne 0 ]; then printf '%s%s__' {} \"$cd_ec\"; exit \"$cd_ec\"; fi\n{}\nec=$?\nprintf '%s%s__' {} \"$ec\"\nexit \"$ec\"\n",
+        resolve_exec_shell().display(),
+        shell_quote(start_marker),
+        shell_quote(cwd.to_string_lossy().as_ref()),
+        shell_quote(done_marker),
+        command,
+        shell_quote(done_marker),
+    );
+    file.write_all(body.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("cannot write pane exec script {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("cannot secure pane exec script {}: {error}", path.display()))?;
+    Ok(())
+}
+
+fn read_pane_text(client: &HerdrClient, pane_id: &str) -> Result<String, String> {
+    let result = client
+        .call_with_timeout(
+            "pane.read",
+            json!({
+                "pane_id": pane_id,
+                "source": "recent_unwrapped",
+                "lines": PANE_READ_LINES,
+                "strip_ansi": true,
+            }),
+            PANE_RPC_TIMEOUT,
+        )
+        .map_err(|error| format!("pane.read failed: {error}"))?;
+    let read = result.get("read").unwrap_or(&result);
+    Ok(read
+        .get("content")
+        .and_then(Value::as_str)
+        .or_else(|| read.get("text").and_then(Value::as_str))
+        .or_else(|| read.get("output").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_owned())
+}
+
+fn pane_command_segment<'a>(
+    raw: &'a str,
+    start_marker: &str,
+    done_marker: &str,
+) -> Option<(&'a str, Option<i32>)> {
+    let start = raw.rfind(start_marker)? + start_marker.len();
+    let after = &raw[start..];
+    let Some(done) = after.find(done_marker) else {
+        return Some((after, None));
+    };
+    let body = &after[..done];
+    let suffix = &after[done + done_marker.len()..];
+    let digits = suffix
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    let exit_code = (!digits.is_empty() && suffix[digits.len()..].starts_with("__"))
+        .then(|| digits.parse::<i32>().ok())
+        .flatten();
+    Some((body, exit_code))
+}
+
+fn refresh_pane_session(session: &Arc<Session>) -> bool {
+    let SessionBackend::Pane {
+        client,
+        pane_id,
+        start_marker,
+        done_marker,
+        script_path,
+        last_output,
+    } = &session.backend
+    else {
+        return false;
+    };
+    let Ok(raw) = read_pane_text(client, pane_id) else {
+        return false;
+    };
+    let Some((body, exit_code)) = pane_command_segment(&raw, start_marker, done_marker) else {
+        return false;
+    };
+    if let Ok(mut previous) = last_output.lock() {
+        if body.starts_with(previous.as_str()) {
+            let delta = &body[previous.len()..];
+            if !delta.is_empty() {
+                push_chunk(session, StreamKind::Stdout, delta.as_bytes());
+            }
+        } else if body != previous.as_str() {
+            if let Ok(mut buffers) = session.buffers.lock() {
+                buffers.truncated = true;
+            }
+            push_chunk(session, StreamKind::Stdout, body.as_bytes());
+        }
+        *previous = body.to_owned();
+    }
+    let Some(exit_code) = exit_code else {
+        return false;
+    };
+    let transitioned = mark_closed_with_signal(session, Some(exit_code), None);
+    if transitioned {
+        let _ = fs::remove_file(script_path);
+        let _ =
+            client.call_with_timeout("pane.close", json!({"pane_id": pane_id}), PANE_RPC_TIMEOUT);
+    }
+    true
+}
+
 fn refresh_session_status(session: &Arc<Session>, registry: Option<&RegistryInner>) -> bool {
     if session_status(session).closed {
         return true;
     }
-    let result = session
-        .child
-        .lock()
-        .map_err(|_| "child lock poisoned".to_owned())
-        .and_then(|mut child| child.try_wait().map_err(|error| error.to_string()));
-    let transitioned = match result {
-        Ok(Some(exit)) => {
-            wait_for_output_readers(session);
-            mark_closed(session, &exit)
+    match &session.backend {
+        SessionBackend::Native { child, .. } => {
+            let result = child
+                .lock()
+                .map_err(|_| "child lock poisoned".to_owned())
+                .and_then(|mut child| child.try_wait().map_err(|error| error.to_string()));
+            let transitioned = match result {
+                Ok(Some(exit)) => {
+                    wait_for_output_readers(session);
+                    mark_closed(session, &exit)
+                }
+                Ok(None) => return false,
+                Err(_) => mark_closed_unknown(session),
+            };
+            if transitioned && let Some(registry) = registry {
+                persist_closed_session(registry, session);
+            }
+            true
         }
-        Ok(None) => return false,
-        Err(_) => mark_closed_unknown(session),
-    };
-    if transitioned && let Some(registry) = registry {
-        persist_closed_session(registry, session);
+        SessionBackend::Pane { .. } => refresh_pane_session(session),
     }
-    true
 }
 
 fn mark_closed(session: &Arc<Session>, exit: &ExitStatus) -> bool {
@@ -625,6 +936,24 @@ fn mark_closed_unknown(session: &Arc<Session>) -> bool {
         return false;
     }
     status.closed = true;
+    status.ended_at_ms = Some(now_ms());
+    true
+}
+
+fn mark_closed_with_signal(
+    session: &Arc<Session>,
+    exit_code: Option<i32>,
+    signal: Option<&str>,
+) -> bool {
+    let Ok(mut status) = session.status.lock() else {
+        return false;
+    };
+    if status.closed {
+        return false;
+    }
+    status.closed = true;
+    status.exit_code = exit_code;
+    status.signal = signal.map(str::to_owned);
     status.ended_at_ms = Some(now_ms());
     true
 }
@@ -771,26 +1100,52 @@ fn signal_name(signal: i32) -> String {
 }
 
 fn terminate_session(session: &Arc<Session>, force: bool) {
-    #[cfg(unix)]
-    {
-        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
-        let group = -(session.pid as i32);
-        let delivered = unsafe { libc::kill(group, signal) } == 0;
-        if !delivered && let Ok(mut child) = session.child.lock() {
-            let _ = child.kill();
+    match &session.backend {
+        SessionBackend::Native { child, .. } => {
+            #[cfg(unix)]
+            {
+                let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+                if let Some(pid) = session.pid {
+                    let group = -(pid as i32);
+                    let delivered = unsafe { libc::kill(group, signal) } == 0;
+                    if !delivered && let Ok(mut child) = child.lock() {
+                        let _ = child.kill();
+                    }
+                }
+            }
+            #[cfg(windows)]
+            {
+                if let Ok(mut child) = child.lock() {
+                    let _ = child.kill();
+                }
+            }
         }
-    }
-    #[cfg(windows)]
-    {
-        if let Ok(mut child) = session.child.lock() {
-            let _ = child.kill();
+        SessionBackend::Pane {
+            client,
+            pane_id,
+            script_path,
+            ..
+        } => {
+            let _ = client.call_with_timeout(
+                "pane.close",
+                json!({"pane_id": pane_id}),
+                PANE_RPC_TIMEOUT,
+            );
+            let _ = fs::remove_file(script_path);
+            mark_closed_with_signal(
+                session,
+                None,
+                Some(if force { "SIGKILL" } else { "SIGTERM" }),
+            );
         }
     }
 }
 
 fn terminate_and_wait(session: &Arc<Session>) {
     terminate_session(session, true);
-    if let Ok(mut child) = session.child.lock() {
+    if let SessionBackend::Native { child, .. } = &session.backend
+        && let Ok(mut child) = child.lock()
+    {
         let _ = child.wait();
     }
 }
@@ -1294,10 +1649,12 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             command: "exit 9".to_owned(),
             started_at_ms: now_ms(),
-            pid,
-            child: Mutex::new(child),
+            pid: Some(pid),
+            backend: SessionBackend::Native {
+                child: Mutex::new(child),
+                output_readers: AtomicUsize::new(output_readers),
+            },
             buffers: Mutex::new(Buffers::default()),
-            output_readers: AtomicUsize::new(output_readers),
             status: Mutex::new(SessionStatus::default()),
         });
         if let Some(stdout) = stdout {
@@ -1421,5 +1778,50 @@ mod tests {
         );
         drop(registry);
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn protected_root_detection_is_scoped_to_user_privacy_folders() {
+        let home = Path::new("/Users/example");
+        assert!(is_protected_root_for_home(
+            Path::new("/Users/example/Documents/repo"),
+            home
+        ));
+        assert!(is_protected_root_for_home(
+            Path::new("/Users/example/Desktop/repo"),
+            home
+        ));
+        assert!(is_protected_root_for_home(
+            Path::new("/Users/example/Downloads/repo"),
+            home
+        ));
+        assert!(!is_protected_root_for_home(
+            Path::new("/Users/example/src/repo"),
+            home
+        ));
+        assert!(!is_protected_root_for_home(
+            Path::new("/Users/other/Documents/repo"),
+            home
+        ));
+    }
+
+    #[test]
+    fn pane_marker_parser_preserves_exact_output_and_exit_code() {
+        let start = "__HM_EXEC_START_demo__";
+        let done = "__HM_EXEC_DONE_demo__";
+        let raw = format!("shell echo noise{start}A\\nB\\n{done}7__prompt");
+        let (body, exit) = pane_command_segment(&raw, start, done).unwrap();
+        assert_eq!(body, "A\\nB\\n");
+        assert_eq!(exit, Some(7));
+    }
+
+    #[test]
+    fn pane_marker_parser_reports_streaming_before_done_marker() {
+        let start = "__HM_EXEC_START_demo__";
+        let done = "__HM_EXEC_DONE_demo__";
+        let raw = format!("noise{start}partial");
+        let (body, exit) = pane_command_segment(&raw, start, done).unwrap();
+        assert_eq!(body, "partial");
+        assert_eq!(exit, None);
     }
 }

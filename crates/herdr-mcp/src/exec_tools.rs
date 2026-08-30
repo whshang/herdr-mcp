@@ -41,7 +41,10 @@ pub fn start(snapshot: &Value, registry: &ExecRegistry, args: &Value) -> Value {
             Ok(value) => value,
             Err(error) => return error,
         };
-    match registry.start(&managed.real, command) {
+    let workspace_id = projects::workspaces_for_root(&topology, &managed.root)
+        .into_iter()
+        .next();
+    match registry.start_in_workspace(&managed.real, command, workspace_id.as_deref()) {
         Ok(mut result) => {
             if let Some(object) = result.as_object_mut() {
                 object.insert("root".to_owned(), json!(managed.root.to_string_lossy()));
