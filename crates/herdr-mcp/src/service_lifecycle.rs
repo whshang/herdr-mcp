@@ -1,5 +1,7 @@
 use crate::cli::ServiceCommand;
-use crate::{herdr_supervisor, link, native_host_install, paths::RuntimePaths, service_manager};
+#[cfg(target_os = "macos")]
+use crate::native_host_install;
+use crate::{herdr_supervisor, link, paths::RuntimePaths, service_manager};
 use serde_json::Value;
 use std::process::ExitCode;
 
@@ -122,10 +124,13 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
         ));
     }
 
-    if let Err(native_host_error) = native_host_install::sync_owned_runtime_from_active() {
-        return Err(format!(
-            "service install committed but owned native-host runtime sync failed: {native_host_error}"
-        ));
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(native_host_error) = native_host_install::sync_owned_runtime_from_active() {
+            return Err(format!(
+                "service install committed but owned native-host runtime sync failed: {native_host_error}"
+            ));
+        }
     }
 
     Ok(result)
