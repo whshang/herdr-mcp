@@ -45,7 +45,7 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 }
 
 // ---- chrome mock ----
-const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.77", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true };
+const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.78", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true };
 const listeners = { onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [] };
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
@@ -1599,6 +1599,34 @@ console.log("\n[project handoff]");
       && continuityTurnRequests.at(-1)?.role === "user"
       && continuityTurnRequests.at(-1)?.text === "continue durable work",
     "turn-start persistence writes the exact continuity id, Project/workspace metadata, and user intent");
+
+  const turnRequestsBeforeBackfill = continuityTurnRequests.length;
+  let resolveBackfill;
+  const backfillP = new Promise((r) => { resolveBackfill = r; });
+  onMsg({
+    type: "h2w_continuity_backfill",
+    convKey: PROJECT_SOURCE,
+    conversation_id: "project-source-conversation",
+    userMessageId: "server-user-first-turn",
+    userText: "first Project turn",
+    userCreatedAt: 123456790,
+    messageId: "server-assistant-first-turn",
+    assistantText: "first Project reply",
+    assistantUpdatedAt: 123456799,
+  }, { tab: { id: 401 } }, (r) => resolveBackfill(r));
+  const backfill = await backfillP;
+  const backfillRequests = continuityTurnRequests.slice(turnRequestsBeforeBackfill);
+  ok(backfill?.ok === true && backfill?.durable === true && backfill?.backfilled === true,
+    "server-confirmed Project route backfill is persisted durably", JSON.stringify(backfill));
+  ok(backfillRequests.length === 2
+      && backfillRequests[0]?.message_id === "server-user-first-turn"
+      && backfillRequests[0]?.role === "user"
+      && backfillRequests[1]?.message_id === "server-assistant-first-turn"
+      && backfillRequests[1]?.role === "assistant"
+      && backfillRequests.every((request) => request.continuity_id === durableContinuityId),
+    "route backfill preserves server message ids and the existing continuity chain",
+    JSON.stringify(backfillRequests));
+
   const resolveCountBeforeDurableStart = continuityResolveRequests.length;
   let resolveAutoStart;
   const autoStartP = new Promise((r) => { resolveAutoStart = r; });
