@@ -207,21 +207,32 @@ pub fn capture(
     }
 
     let dir = ensure_cache_dir(config_dir)?;
-    let now = now_millis();
-    let expires_at = now.saturating_add(TTL_SECS * 1000);
+    let wall_now = now_millis();
+    let existing = scan_entries(&dir)?;
+    // `captured_at` is also the eviction order. Multiple browser captures can
+    // arrive within the same millisecond, so make it strictly monotonic within
+    // this cache instead of relying on wall-clock resolution alone.
+    let captured_at = existing
+        .iter()
+        .map(|(metadata, _)| metadata.captured_at)
+        .max()
+        .map(|latest| wall_now.max(latest.saturating_add(1)))
+        .unwrap_or(wall_now);
+    let expires_at = captured_at.saturating_add(TTL_SECS * 1000);
 
     // Deduplicate by (conversation_id, file_id). A matching digest is idempotent;
     // any other hit for the same pair is a conflict and must fail closed.
-    for (metadata, _) in scan_entries(&dir)? {
+    for (metadata, _) in existing {
         if metadata.conversation_id != conversation_id || metadata.file_id != file_id {
             continue;
         }
-        if metadata.expires_at <= now {
+        if metadata.expires_at <= wall_now {
             let _ = remove_entry(&dir, &metadata.artifact_id);
             continue;
         }
         if metadata.sha256.eq_ignore_ascii_case(&sha256) && metadata.bytes == raw.len() {
-            // Refresh the TTL without creating a second entry.
+            // Refresh the TTL without creating a second entry. A refresh is a
+            // new capture event for eviction purposes, so it becomes newest.
             let refreshed = CapturedArtifact {
                 artifact_id: metadata.artifact_id.clone(),
                 conversation_id: metadata.conversation_id.clone(),
@@ -229,7 +240,7 @@ pub fn capture(
                 mime: mime.to_owned(),
                 bytes: metadata.bytes,
                 sha256: metadata.sha256.clone(),
-                captured_at: now,
+                captured_at,
                 expires_at,
             };
             write_meta(&dir, &refreshed)?;
@@ -246,7 +257,7 @@ pub fn capture(
         mime: mime.to_owned(),
         bytes: raw.len(),
         sha256,
-        captured_at: now,
+        captured_at,
         expires_at,
     };
 
