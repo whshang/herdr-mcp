@@ -301,6 +301,27 @@ pub struct ContinuityCandidate {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContinuitySearchInput<'a> {
+    pub project_id: Option<&'a str>,
+    pub workspace_id: Option<&'a str>,
+    pub conversation_id: Option<&'a str>,
+    pub query: Option<&'a str>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuitySearchCandidate {
+    pub continuity_id: String,
+    pub title: Option<String>,
+    pub project_id: Option<String>,
+    pub status: String,
+    pub updated_at: i64,
+    pub workspace_ids: Vec<String>,
+    pub recent_user_excerpt: Option<String>,
+    pub recent_assistant_excerpt: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -798,6 +819,142 @@ impl StateStore {
         Ok(result)
     }
 
+    pub fn continuity_search(
+        &self,
+        input: ContinuitySearchInput<'_>,
+    ) -> Result<Vec<ContinuitySearchCandidate>, String> {
+        let limit = i64::try_from(input.limit.clamp(1, 10)).unwrap_or(10);
+        let project_id = input
+            .project_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let workspace_id = input
+            .workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let conversation_id = input
+            .conversation_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let query = input.query.map(str::trim).filter(|value| !value.is_empty());
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT c.continuity_id, c.title, c.project_id, c.status, c.updated_at
+                 FROM continuity_chains c
+                 WHERE c.status = 'active'
+                   AND (?1 IS NULL OR c.project_id = ?1)
+                   AND (?2 IS NULL OR EXISTS (
+                       SELECT 1 FROM continuity_bindings bw
+                       WHERE bw.continuity_id = c.continuity_id AND bw.workspace_id = ?2
+                   ))
+                   AND (?3 IS NULL OR EXISTS (
+                       SELECT 1 FROM continuity_bindings bc
+                       WHERE bc.continuity_id = c.continuity_id AND bc.conversation_id = ?3
+                   ))
+                   AND (?4 IS NULL
+                        OR instr(lower(COALESCE(c.title, '')), lower(?4)) > 0
+                        OR EXISTS (
+                            SELECT 1 FROM continuity_turns tq
+                            WHERE tq.continuity_id = c.continuity_id
+                              AND instr(lower(tq.text), lower(?4)) > 0
+                        ))
+                 ORDER BY c.updated_at DESC
+                 LIMIT ?5",
+            )
+            .map_err(|error| format!("cannot prepare continuity search: {error}"))?;
+        let rows = stmt
+            .query_map(
+                params![project_id, workspace_id, conversation_id, query, limit],
+                |row| {
+                    Ok(ContinuityCandidate {
+                        continuity_id: row.get(0)?,
+                        title: row.get(1)?,
+                        project_id: row.get(2)?,
+                        status: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("cannot query continuity search: {error}"))?;
+        let mut basic = Vec::new();
+        for row in rows {
+            basic.push(
+                row.map_err(|error| format!("cannot decode continuity search candidate: {error}"))?,
+            );
+        }
+        drop(stmt);
+
+        let mut workspace_stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT workspace_id
+                 FROM continuity_bindings
+                 WHERE continuity_id = ?1 AND workspace_id <> ''
+                 ORDER BY bound_at DESC
+                 LIMIT 8",
+            )
+            .map_err(|error| format!("cannot prepare continuity workspace lookup: {error}"))?;
+        let mut recent_stmt = self
+            .conn
+            .prepare(
+                "SELECT role, text
+                 FROM continuity_turns
+                 WHERE continuity_id = ?1
+                 ORDER BY observed_at DESC
+                 LIMIT 12",
+            )
+            .map_err(|error| format!("cannot prepare continuity excerpt lookup: {error}"))?;
+
+        let mut result = Vec::with_capacity(basic.len());
+        for candidate in basic {
+            let workspace_rows = workspace_stmt
+                .query_map([candidate.continuity_id.as_str()], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|error| format!("cannot query continuity workspaces: {error}"))?;
+            let mut workspace_ids = Vec::new();
+            for row in workspace_rows {
+                workspace_ids.push(
+                    row.map_err(|error| format!("cannot decode continuity workspace: {error}"))?,
+                );
+            }
+
+            let recent_rows = recent_stmt
+                .query_map([candidate.continuity_id.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| format!("cannot query continuity excerpts: {error}"))?;
+            let mut recent_user_excerpt = None;
+            let mut recent_assistant_excerpt = None;
+            for row in recent_rows {
+                let (role, text) =
+                    row.map_err(|error| format!("cannot decode continuity excerpt: {error}"))?;
+                if role == "user" && recent_user_excerpt.is_none() {
+                    recent_user_excerpt = Some(bounded_continuity_excerpt(&text));
+                } else if role == "assistant" && recent_assistant_excerpt.is_none() {
+                    recent_assistant_excerpt = Some(bounded_continuity_excerpt(&text));
+                }
+                if recent_user_excerpt.is_some() && recent_assistant_excerpt.is_some() {
+                    break;
+                }
+            }
+
+            result.push(ContinuitySearchCandidate {
+                continuity_id: candidate.continuity_id,
+                title: candidate.title,
+                project_id: candidate.project_id,
+                status: candidate.status,
+                updated_at: candidate.updated_at,
+                workspace_ids,
+                recent_user_excerpt,
+                recent_assistant_excerpt,
+            });
+        }
+        Ok(result)
+    }
+
     pub fn continuity_for_conversation(
         &self,
         conversation_id: &str,
@@ -824,6 +981,17 @@ impl StateStore {
             [only] => Ok(Some(only.clone())),
             _ => Err("continuity_binding_ambiguous".to_owned()),
         }
+    }
+}
+
+fn bounded_continuity_excerpt(text: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let mut chars = text.trim().chars();
+    let excerpt = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{excerpt}…")
+    } else {
+        excerpt
     }
 }
 
@@ -2646,6 +2814,141 @@ mod tests {
             "continuity_binding_ambiguous"
         );
         assert_eq!(store.continuity_candidates(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn continuity_search_filters_identity_and_returns_bounded_confirmation_evidence() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        let rows = [
+            (
+                "hc:alpha",
+                "conv-a",
+                "w19",
+                "project-a",
+                "Alpha release work",
+                "msg-a-user",
+                "user",
+                "continue the v0.4.2 release qualification and continuity search",
+                100,
+            ),
+            (
+                "hc:alpha",
+                "conv-a",
+                "w19",
+                "project-a",
+                "Alpha release work",
+                "msg-a-assistant",
+                "assistant",
+                "release gate is green; continuity search still needs confirmation coverage",
+                101,
+            ),
+            (
+                "hc:beta",
+                "conv-b",
+                "w20",
+                "project-b",
+                "Beta provider work",
+                "msg-b-user",
+                "user",
+                "continue provider migration",
+                200,
+            ),
+        ];
+        for (
+            continuity_id,
+            conversation_id,
+            workspace_id,
+            project_id,
+            title,
+            message_id,
+            role,
+            text,
+            observed_at,
+        ) in rows
+        {
+            store
+                .append_continuity_turn(ContinuityTurnInput {
+                    continuity_id,
+                    conversation_id,
+                    workspace_id: Some(workspace_id),
+                    project_id: Some(project_id),
+                    title: Some(title),
+                    message_id,
+                    role,
+                    text,
+                    fingerprint: None,
+                    observed_at,
+                })
+                .unwrap();
+        }
+
+        let by_workspace = store
+            .continuity_search(ContinuitySearchInput {
+                workspace_id: Some("w19"),
+                limit: 5,
+                ..ContinuitySearchInput::default()
+            })
+            .unwrap();
+        assert_eq!(by_workspace.len(), 1);
+        assert_eq!(by_workspace[0].continuity_id, "hc:alpha");
+        assert_eq!(by_workspace[0].workspace_ids, vec!["w19"]);
+        assert!(
+            by_workspace[0]
+                .recent_user_excerpt
+                .as_deref()
+                .unwrap()
+                .contains("continuity search")
+        );
+        assert!(
+            by_workspace[0]
+                .recent_assistant_excerpt
+                .as_deref()
+                .unwrap()
+                .contains("confirmation coverage")
+        );
+
+        let by_project = store
+            .continuity_search(ContinuitySearchInput {
+                project_id: Some("project-a"),
+                limit: 5,
+                ..ContinuitySearchInput::default()
+            })
+            .unwrap();
+        assert_eq!(by_project.len(), 1);
+        assert_eq!(by_project[0].continuity_id, "hc:alpha");
+
+        let by_conversation = store
+            .continuity_search(ContinuitySearchInput {
+                conversation_id: Some("conv-b"),
+                limit: 5,
+                ..ContinuitySearchInput::default()
+            })
+            .unwrap();
+        assert_eq!(by_conversation.len(), 1);
+        assert_eq!(by_conversation[0].continuity_id, "hc:beta");
+
+        let by_text = store
+            .continuity_search(ContinuitySearchInput {
+                query: Some("qualification"),
+                limit: 5,
+                ..ContinuitySearchInput::default()
+            })
+            .unwrap();
+        assert_eq!(by_text.len(), 1);
+        assert_eq!(by_text[0].continuity_id, "hc:alpha");
+
+        let all = store
+            .continuity_search(ContinuitySearchInput {
+                limit: 5,
+                ..ContinuitySearchInput::default()
+            })
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].continuity_id, "hc:beta");
+        assert_eq!(all[1].continuity_id, "hc:alpha");
+
+        let long = "x".repeat(300);
+        assert_eq!(bounded_continuity_excerpt(&long).chars().count(), 241);
     }
 
     #[cfg(unix)]

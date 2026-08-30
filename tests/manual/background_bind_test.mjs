@@ -1538,6 +1538,29 @@ console.log("\n[project handoff]");
   ok(storage.herdrConversationTransfers[transferId]?.status === "committed", "transfer metadata records committed state");
   ok(storage.herdrConversationTransfers[transferId]?.handoff_text == null, "committed transfer clears the temporary handoff packet");
 
+  const priorContinuityPersistence = mockContinuityPersistenceEnabled;
+  mockContinuityPersistenceEnabled = true;
+  const manualContinueBefore = continuityTurnRequests.length;
+  let resolveManualContinue;
+  const manualContinueP = new Promise((r) => { resolveManualContinue = r; });
+  onMsg({
+    type: "h2w_turn_started",
+    convKey: PROJECT_TARGET,
+    startedAt: 123456700,
+    userText: "continue without continuity id",
+  }, { tab: { id: storage.herdrWakeBindings[targetKey]?.tabId } }, (r) => resolveManualContinue(r));
+  const manualContinue = await manualContinueP;
+  ok(manualContinue?.ok === true && manualContinue?.durable === true,
+    "a manual continue turn in the new Project conversation is journaled without an explicit continuity id",
+    JSON.stringify(manualContinue));
+  ok(continuityTurnRequests.length === manualContinueBefore + 1
+      && continuityTurnRequests.at(-1)?.continuity_id === continuityId
+      && continuityTurnRequests.at(-1)?.project_id === PROJECT_ID
+      && continuityTurnRequests.at(-1)?.role === "user"
+      && continuityTurnRequests.at(-1)?.text === "continue without continuity id",
+    "manual continue inherits the Project continuity chain instead of creating or requiring another id");
+  mockContinuityPersistenceEnabled = priorContinuityPersistence;
+
   // Repeat with Project Auto on. Manual handoff must remain available and the
   // target must preserve the source Auto-on snapshot.
   delete storage.herdrWakeBindings[targetKey];

@@ -105,6 +105,10 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 8] = [
             "agent state",
             "native method",
             "reconnect",
+            "continue prior work",
+            "resume conversation",
+            "handoff",
+            "continuity",
         ],
         requires_capabilities: &["herdr socket"],
         related_skills: &["agent-dispatch", "development-orchestration"],
@@ -836,6 +840,34 @@ mod tests {
             assert!(item.identity.uri.starts_with("skill://herdr-mcp/"));
             assert!(item.identity.digest.as_str().starts_with("sha256:"));
         }
+    }
+
+    #[test]
+    fn workstation_control_exposes_fail_closed_continuity_recovery() {
+        let service = ProgressiveSkillService::new();
+        let descriptor = service
+            .catalog()
+            .into_iter()
+            .find(|item| item.id == "workstation-control")
+            .expect("workstation-control must be in the builtin catalog");
+        assert!(
+            descriptor
+                .triggers
+                .iter()
+                .any(|trigger| trigger == "continuity")
+        );
+        let loaded = service
+            .local_call(
+                LOCAL_LOAD_METHOD,
+                &json!({"ids": ["workstation-control"]}),
+                &snapshot(),
+            )
+            .unwrap();
+        assert_eq!(loaded["ok"], true);
+        let content = loaded["skills"][0]["content"].as_str().unwrap();
+        assert!(content.contains("continuity.search"));
+        assert!(content.contains("confirmation_required"));
+        assert!(content.contains("never choose by recency or textual similarity"));
     }
 
     #[test]

@@ -2091,6 +2091,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn herdr_call_continuity_search_round_trips_through_rust_http_without_socket() {
+        let root = test_root("local-continuity-search");
+        let state = test_state(&root);
+        {
+            let mut store = state.state_store.lock().unwrap();
+            store
+                .append_continuity_turn(ContinuityTurnInput {
+                    continuity_id: "hc:http-search",
+                    conversation_id: "conv-http-search",
+                    workspace_id: Some("w19"),
+                    project_id: Some("project-http-search"),
+                    title: Some("HTTP continuity search"),
+                    message_id: "msg-http-search-user",
+                    role: "user",
+                    text: "continue the persisted search chain",
+                    fingerprint: Some("fp-http-search-user"),
+                    observed_at: 1700000001000,
+                })
+                .unwrap();
+        }
+        let app = candidate_router(state);
+        let request = rpc_request(
+            Method::POST,
+            "/mcp",
+            Some(json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{
+                    "name":"herdr_call",
+                    "arguments":{
+                        "method":"continuity.search",
+                        "params":"{\"workspace_id\":\"w19\"}"
+                    }
+                }
+            })),
+            &[("user-agent", "openai-mcp/1.0")],
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = payload["result"]["content"][0]["text"].as_str().unwrap();
+        let local: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(local["ok"], true);
+        assert_eq!(local["resolution"], "unique_exact");
+        assert_eq!(local["auto_resume_safe"], true);
+        assert_eq!(local["confirmation_required"], false);
+        assert_eq!(local["candidates"][0]["continuity_id"], "hc:http-search");
+        assert_eq!(local["candidates"][0]["workspace_ids"][0], "w19");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
     async fn mcp_activity_bad_window_and_trusted_ipc_auth_match_push_contract() {
         let root = test_root("mcp-activity-auth");
         let tcp = candidate_router(test_state(&root.join("tcp")));

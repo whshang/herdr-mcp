@@ -15,6 +15,7 @@ Global policy for a remote/Web planner. Project and nested `AGENTS.md` files may
 9. Auto-delegate only useful independent work to a safe compatible live worker. Preserve explicit user targets and required quality.
 10. Completion requires relevant evidence from live state, Git/files, tests/builds, delivery, or the affected runtime boundary.
 11. For non-trivial implementation, bug fixes, reliability/refactor work, or releases, load `engineering-robustness` and close the loop from regression evidence through the real delivery boundary.
+12. On prior-work continuity intent in a fresh or uncertain conversation, search the durable Continuity Journal before asking for an ID. Auto-resume only one chain uniquely backed by stable conversation/project/workspace identity; otherwise show bounded candidates and ask the user to confirm. Recency or text similarity alone never selects a chain.
 
 ## Instruction precedence
 
