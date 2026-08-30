@@ -19,7 +19,7 @@ An extension-only change must **not** force a Rust runtime version bump. Maintai
 - **Workflow:** `.github/workflows/rust-release.yml`; `workflow_dispatch` is an **attested qualification** path, while only a `push` of a `v*` tag can publish.
 - **Verify gate:** Rust fmt/clippy/test, `npm` build/test/edge, extension smoke, site build, `git diff --check`.
 - **Build:** cross-target binaries per `.github/rust-release-targets.json`.
-- **macOS signing:** paid Apple Developer / Developer ID signing is optional distribution hardening. It is not required for the open-source runtime, qualification, or stable publication path. `scripts/sign-macos-release.sh` remains available for downstream/private distributors that deliberately opt into it.
+- **macOS distribution signing:** optional. The open-source runtime and stable release path do not require a paid Apple Developer account; `scripts/sign-macos-release.sh` remains available for distributors that opt into signing/notarization.
 - **Manifest:** `scripts/build-rust-release-manifest.mjs` — lists the complete Runtime Release binary set; the browser extension is not a Runtime Release asset.
 - **Attestation:** both manual qualification and tag-push bundles use the pinned `actions/attest` path.
 - **Publish:** **tag push only** (`event=push` + `refs/tags/v*`). `workflow_dispatch` never creates or overwrites a GitHub Release. Prerelease tags remain GitHub prereleases; plain semver tags are stable (current published stable: `v0.4.1`).
@@ -29,7 +29,7 @@ An extension-only change must **not** force a Rust runtime version bump. Maintai
 
 ### Pre-tag macOS protected-folder qualification
 
-Herdr-MCP must remain usable without a paid Apple Developer account. macOS protected-folder reliability therefore uses an unsigned/open-source path: rotating runtime generations must not own the long-lived TCC permission boundary. The supported design is a stable, minimal local broker whose identity is independent of `runtime/current`; a user may grant that fixed broker macOS Files & Folders / Full Disk Access once when their projects require protected locations such as `~/Documents`.
+macOS protected-folder access uses a stable local permissions broker whose identity is independent of `runtime/current`. When a project lives in a protected location such as `~/Documents`, the user grants that fixed broker the required macOS privacy access once; rotating runtime generations reuse it.
 
 Before creating the version tag:
 
@@ -39,8 +39,6 @@ Before creating the version tag:
 4. apply a new runtime generation and repeat the probes without replacing the stable broker. Runtime generation churn must not require a new macOS privacy grant;
 5. retain the qualification evidence, then create the immutable `v*` tag pointing to the exact `release_identity.source_commit` recorded by the qualified manifest. The tag-push run independently rebuilds and attests the same source and is the only path allowed to publish;
 6. after publication, perform the normal stable-channel `update apply` / rollback dogfood and confirm broker/runtime/Native Host/service invariants before declaring patch-line closure.
-
-Developer ID signing and notarization may still be used by a distributor that already participates in the Apple Developer Program, but neither is a Herdr-MCP runtime requirement or release gate.
 
 A workflow-dispatch artifact is qualification evidence only. Its manifest preserves the actual branch/ref and commit provenance; it is not discoverable by the updater and must never be presented as a published stable or preview Release.
 
@@ -64,7 +62,7 @@ Installed generations are content-addressed (`rust-<sha256-prefix>`). Update app
 
 | Artifact | Version | Notes |
 | --- | --- | --- |
-| Runtime binary | `0.4.1` published / `0.4.2` source-ready | `0.4.2` does not require paid Apple signing; protected-folder qualification must pass through the unsigned stable-broker path before tagging |
+| Runtime binary | `0.4.1` published / `0.4.2` source-ready | `0.4.2` still needs the protected-folder stable-broker qualification before tagging |
 | Browser extension source | `0.1.77` | Current development source; Chrome Web Store published/review version may lag and must be checked independently |
 | Native Messaging host | Managed by runtime generation | `native-host status` must show `runtime_matches_current=true` |
 
