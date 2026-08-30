@@ -98,7 +98,7 @@ fn fetch_artifact(
             .get(url.clone())
             .header(AUTHORIZATION, format!("Bearer {capability}"))
             .send()
-            .map_err(|error| format!("artifact fetch failed: {error}"))?;
+            .map_err(|error| format_reqwest_error("artifact fetch failed", &error))?;
         if response.status().is_redirection() {
             if redirect_count == MAX_REDIRECTS {
                 return Err("artifact redirect limit exceeded".to_owned());
@@ -128,6 +128,18 @@ fn fetch_artifact(
         return read_artifact(response, &url, expected_sha256);
     }
     Err("artifact redirect limit exceeded".to_owned())
+}
+
+fn format_reqwest_error(prefix: &str, error: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    let mut message = format!("{prefix}: {error}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 fn read_artifact(
@@ -212,8 +224,7 @@ fn pinned_client(url: &Url) -> Result<Client, String> {
     match host {
         Host::Domain(domain) => {
             let addresses = resolve_public(domain, port)?;
-            let selected = addresses[0];
-            builder = builder.resolve(domain, selected);
+            builder = builder.resolve_to_addrs(domain, &addresses);
         }
         Host::Ipv4(address) => ensure_public_ip(IpAddr::V4(address))?,
         Host::Ipv6(address) => ensure_public_ip(IpAddr::V6(address))?,
