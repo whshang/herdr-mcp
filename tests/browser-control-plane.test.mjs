@@ -15,6 +15,7 @@ import {
 import {
   ACTION_TYPES,
   ACTION_RISK,
+  actionModesForTarget,
   classifyAction,
   phaseAAvailability,
   buildActionDescriptor,
@@ -269,6 +270,25 @@ test("action risk classification covers browser control action types", () => {
   assert.equal(classifyAction(ACTION_TYPES.STEER), ACTION_RISK.PROVIDER_STEER);
   assert.equal(classifyAction(ACTION_TYPES.HERDR_METHOD), ACTION_RISK.UNKNOWN);
   assert.equal(classifyAction(ACTION_TYPES.TERMINAL_INPUT), ACTION_RISK.TERMINAL_MUTATION);
+});
+
+test("pinned target type exposes only matching control modes", () => {
+  const view = normalizeBrowserState(baseSnapshot());
+  const agentTarget = createPinnedTarget(view.panes[0]);
+  const terminalTarget = createPinnedTarget(view.panes[1]);
+
+  assert.deepEqual(actionModesForTarget(agentTarget), [ACTION_TYPES.AGENT_PROMPT, ACTION_TYPES.STEER]);
+  assert.deepEqual(actionModesForTarget(terminalTarget), [ACTION_TYPES.TERMINAL_TEXT]);
+  assert.deepEqual(actionModesForTarget(null), []);
+  assert.deepEqual(actionModesForTarget({}), []);
+  assert.deepEqual(actionModesForTarget({ ...agentTarget, stale: true }), [ACTION_TYPES.AGENT_PROMPT, ACTION_TYPES.STEER]);
+
+  const terminalPreview = buildActionDescriptor(ACTION_TYPES.TERMINAL_TEXT, {
+    target: terminalTarget,
+    text: "echo hello",
+  });
+  assert.equal(terminalPreview.executable, false);
+  assert.equal(buildActionDescriptor(ACTION_TYPES.AGENT_PROMPT, { target: terminalTarget, text: "hello" }).executable, false);
 });
 
 test("trusted prompt and steer probe are executable while high-risk modes stay preview-only", () => {
