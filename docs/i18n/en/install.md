@@ -37,7 +37,7 @@ Then run `herdr --version` again. Herdr's own install behavior is authoritative 
 
 ## Supported platform boundary
 
-Current published stable runtime is **`v0.4.1`**. The `v0.4.2` source candidate is being closed for stable publication without requiring a paid Apple Developer / Developer ID identity. macOS protected-folder reliability is qualified through the unsigned stable-broker path so runtime generation upgrades do not own the long-lived TCC permission boundary. Developer ID signing/notarization remains optional distributor hardening. The strongest clean-machine qualification evidence remains the `v0.4.0` **macOS Apple Silicon** run. A Windows x64 release binary is available, while Windows end-to-end UAT is still being completed. Linux is not yet claimed as a supported current-stable herdr-mcp runtime surface.
+Current published stable runtime is **`v0.4.1`**. The `v0.4.2` source candidate is completing macOS protected-folder qualification with a stable permissions broker that survives runtime generation upgrades. The strongest clean-machine qualification evidence remains the `v0.4.0` **macOS Apple Silicon** run. A Windows x64 release binary is available, while Windows end-to-end UAT is still being completed. Linux is not yet claimed as a supported current-stable herdr-mcp runtime surface.
 
 ## Step 1: install the native herdr-mcp runtime
 
