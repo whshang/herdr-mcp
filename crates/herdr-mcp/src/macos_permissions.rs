@@ -95,7 +95,6 @@ pub(crate) struct PermissionReport {
     pub(crate) broker_installed: bool,
     pub(crate) broker_path: PathBuf,
     pub(crate) broker_update_available: bool,
-    pub(crate) exec_host_capable: bool,
     pub(crate) probe: &'static str,
     pub(crate) hint: String,
 }
@@ -136,7 +135,6 @@ pub(crate) fn collect_status() -> Result<PermissionReport, String> {
             broker_installed: tcc_broker::status(&path).is_some(),
             broker_path: path,
             broker_update_available: false,
-            exec_host_capable: false,
             probe: "skipped",
             hint: HINT_NOT_APPLICABLE.to_owned(),
         })
@@ -154,24 +152,17 @@ pub(crate) fn collect_status() -> Result<PermissionReport, String> {
                 broker_installed: false,
                 broker_path: path,
                 broker_update_available: false,
-                exec_host_capable: false,
                 probe: "skipped",
                 hint: HINT_SETUP.to_owned(),
             });
         }
-        let exec_host_capable = tcc_broker::exec_host_capable(&config_dir);
         let (state, probe) = classify_probe(probe_protected_path(&path));
-        let hint = if !exec_host_capable {
-            "stable broker needs exec-host upgrade; run `herdr-mcp permissions setup --upgrade-broker`, re-authorize if macOS asks, then verify".to_owned()
-        } else {
-            state.hint().to_owned()
-        };
+        let hint = state.hint().to_owned();
         Ok(PermissionReport {
             state,
             broker_installed: true,
             broker_path: path,
             broker_update_available: update_available,
-            exec_host_capable,
             probe,
             hint,
         })
@@ -181,7 +172,7 @@ pub(crate) fn collect_status() -> Result<PermissionReport, String> {
 pub(crate) fn doctor_layer_from(report: &Result<PermissionReport, String>) -> String {
     match report {
         Ok(report) => format!(
-            "LAYER macos-permissions status={} broker={} update_available={} exec_host_capable={} probe={} hint={}",
+            "LAYER macos-permissions status={} broker={} update_available={} probe={} hint={}",
             report.state.as_str(),
             if report.broker_installed {
                 "installed"
@@ -189,7 +180,6 @@ pub(crate) fn doctor_layer_from(report: &Result<PermissionReport, String>) -> St
                 "missing"
             },
             report.broker_update_available,
-            report.exec_host_capable,
             report.probe,
             report.hint
         ),
@@ -200,7 +190,7 @@ pub(crate) fn doctor_layer_from(report: &Result<PermissionReport, String>) -> St
 pub(crate) fn report_doctor_pass(report: &PermissionReport) -> bool {
     #[cfg(target_os = "macos")]
     {
-        report.state.doctor_pass() && report.exec_host_capable
+        report.state.doctor_pass()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -216,7 +206,6 @@ fn print_status(report: &PermissionReport) {
         "broker_update_available: {}",
         report.broker_update_available
     );
-    println!("exec_host_capable: {}", report.exec_host_capable);
     println!("probe: {}", report.probe);
     println!("hint: {}", report.hint);
 }
@@ -230,10 +219,6 @@ fn run_setup(upgrade_broker: bool) -> Result<ExitCode, String> {
     println!("broker: {}", sync.path.display());
     println!("broker_installed: {}", sync.installed);
     println!("broker_update_available: {}", sync.broker_update_available);
-    println!(
-        "exec_host_capable: {}",
-        tcc_broker::exec_host_capable(&config_dir)
-    );
     #[cfg(target_os = "macos")]
     {
         if std::env::var_os("HERDR_MCP_PERMISSIONS_DRY_RUN").is_some() {
@@ -276,10 +261,7 @@ fn run_verify() -> Result<ExitCode, String> {
         println!("git_status: {}", git.status);
         let write_gate = verify_mutation_free_write_gate();
         println!("write_gate: {}", write_gate);
-        let ok = report.state == PermissionState::Granted
-            && report.exec_host_capable
-            && git.ok
-            && write_gate_ok(write_gate);
+        let ok = report.state == PermissionState::Granted && git.ok && write_gate_ok(write_gate);
         Ok(if ok {
             ExitCode::SUCCESS
         } else {
@@ -798,28 +780,20 @@ mod tests {
     }
 
     #[test]
-    fn doctor_requires_exec_host_capability_on_macos() {
+    fn doctor_permission_layer_tracks_broker_access_only() {
         let report = PermissionReport {
             state: PermissionState::Granted,
             broker_installed: true,
             broker_path: PathBuf::from("/tmp/herdr-mcp-broker"),
             broker_update_available: true,
-            exec_host_capable: false,
             probe: "ok",
-            hint: "upgrade broker".to_owned(),
-        };
-        #[cfg(target_os = "macos")]
-        assert!(!report_doctor_pass(&report));
-        #[cfg(not(target_os = "macos"))]
-        assert!(report_doctor_pass(&report));
-
-        let report = PermissionReport {
-            exec_host_capable: true,
-            ..report
+            hint: "protected path readable".to_owned(),
         };
         assert!(report_doctor_pass(&report));
         let layer = doctor_layer_from(&Ok(report));
-        assert!(layer.contains("exec_host_capable=true"));
+        assert!(layer.contains("status=granted"));
+        assert!(layer.contains("update_available=true"));
+        assert!(!layer.contains("exec_host"));
     }
 
     #[test]

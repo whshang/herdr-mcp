@@ -28,9 +28,6 @@ pub enum Command {
     Link(LinkCommand),
     TccBroker(TccBrokerCommand),
     TccBrokerRun,
-    TccExecHost {
-        probe: bool,
-    },
     Permissions(crate::macos_permissions::PermissionsCommand),
 }
 
@@ -192,11 +189,6 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "doctor" => no_extra(args, Command::Doctor),
         "__documents-probe" => no_extra(args, Command::DocumentsProbe),
         "__tcc-broker" => no_extra(args, Command::TccBrokerRun),
-        "__tcc-exec-host" => match &args[1..] {
-            [] => Ok(Command::TccExecHost { probe: false }),
-            [flag] if flag == "--probe" => Ok(Command::TccExecHost { probe: true }),
-            _ => Err("__tcc-exec-host accepts only --probe".to_owned()),
-        },
         "tcc-broker" => parse_tcc_broker(&args[1..]),
         "permissions" => parse_permissions(&args[1..]),
         "herdr-supervisor" => parse_herdr_supervisor(&args[1..]),
@@ -831,13 +823,6 @@ mod tests {
                 upgrade_broker: true
             })
         );
-        assert_eq!(
-            parse(args(&["__tcc-exec-host", "--probe"]))
-                .unwrap()
-                .command,
-            Command::TccExecHost { probe: true }
-        );
-        assert!(parse(args(&["__tcc-exec-host", "--bogus"])).is_err());
         assert!(parse(args(&["permissions"])).is_err());
         assert!(parse(args(&["permissions", "grant"])).is_err());
         assert_eq!(

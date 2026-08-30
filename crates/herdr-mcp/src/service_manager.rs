@@ -1393,13 +1393,7 @@ mod macos {
         adopt_node: bool,
         mutation_lock: &ServiceMutationLock,
     ) -> Result<Value, String> {
-        let broker = crate::macos_permissions::preserve_or_install_broker(&paths.config_dir)?;
-        if !crate::tcc_broker::exec_host_capable(&paths.config_dir) {
-            return Err(format!(
-                "stable permissions broker at {} does not support exec-host v1; run `herdr-mcp permissions setup --upgrade-broker`, re-authorize it if macOS asks, then retry install",
-                broker.path.display()
-            ));
-        }
+        crate::macos_permissions::preserve_or_install_broker(&paths.config_dir)?;
         install_with_noop_checks(
             paths,
             adopt_node,
