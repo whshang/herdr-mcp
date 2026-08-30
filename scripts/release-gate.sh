@@ -74,6 +74,23 @@ setup_isolated_herdr() {
   export HERDR_SOCKET_PATH="${HERDR_SOCKET}"
   export HERDR_INSTALL_DIR="${GATE_TMP}/bin"
   export HERDR_BIN="${HERDR_INSTALL_DIR}/herdr"
+  # Local qualification should not depend on a fresh GitHub download when the
+  # exact pinned Herdr is already installed. Copy it into the isolated bin so
+  # state/socket/process ownership remains fully isolated. CI still downloads
+  # from the immutable release URL on an empty runner.
+  if [ "${GITHUB_ACTIONS:-}" != "true" ]; then
+    local host_herdr host_version
+    host_herdr="$(command -v herdr 2>/dev/null || true)"
+    if [ -n "${host_herdr}" ] && [ -x "${host_herdr}" ]; then
+      host_version="$("${host_herdr}" --version 2>/dev/null | awk '{print $2}')"
+      if [ "${host_version}" = "${HERDR_VERSION:-0.8.2}" ]; then
+        mkdir -p "${HERDR_INSTALL_DIR}"
+        cp "${host_herdr}" "${HERDR_BIN}"
+        chmod +x "${HERDR_BIN}"
+        log "seeded isolated Herdr ${host_version} from local pinned binary"
+      fi
+    fi
+  fi
   # ci-herdr-runtime.sh runs in a child shell, so its PATH export cannot update
   # this release-gate process. Export the isolated install dir here so the Node
   # transport tests resolve the exact pinned Herdr binary in the same step.
