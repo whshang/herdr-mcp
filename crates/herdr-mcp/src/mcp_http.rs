@@ -320,6 +320,10 @@ fn candidate_router(state: AppState) -> Router {
             post(post_extension_control_action),
         )
         .route(
+            "/extension/artifacts/observe",
+            post(post_extension_artifact_observe),
+        )
+        .route(
             "/extension/continuity/turn",
             post(post_extension_continuity_turn),
         )
@@ -329,6 +333,31 @@ fn candidate_router(state: AppState) -> Router {
         )
         .route("/health", get(health))
         .with_state(state)
+}
+
+async fn post_extension_artifact_observe(State(state): State<AppState>, body: Bytes) -> Response {
+    if !state.trusted_extension_ipc {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if body.len() > 32 * 1024 {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let payload: Value = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) if value.is_object() => value,
+        _ => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"ok": false, "error": "invalid_json"}),
+            );
+        }
+    };
+    match crate::web_artifacts::observe(&payload) {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(error) => json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": error}),
+        ),
+    }
 }
 
 async fn post_extension_continuity_turn(State(state): State<AppState>, body: Bytes) -> Response {
@@ -1692,6 +1721,46 @@ mod tests {
                 None => Body::empty(),
             })
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn artifact_observe_route_is_trusted_ipc_only_and_bounded() {
+        let root = test_root("artifact-observe-route");
+        let expiry = (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let payload = json!({
+            "url": format!("https://example.oaiusercontent.com/files/asset-route/raw?se={}&sig=abc",
+                url::form_urlencoded::byte_serialize(expiry.as_bytes()).collect::<String>()),
+            "source": "chatgpt_image_gen",
+            "conversation_id": "conv-route",
+            "asset_id": "asset-route",
+            "observed_at": 1234
+        });
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/extension/artifacts/observe")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        };
+
+        let tcp = candidate_router(test_state(&root.join("tcp")));
+        let response = tcp.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let mut extension_state = test_state(&root.join("extension"));
+        extension_state.trusted_extension_ipc = true;
+        let app = candidate_router(extension_state);
+        let response = app.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["accepted"], true);
+        assert_eq!(result["transport"], "thin_web_bridge");
+        assert_eq!(crate::web_artifacts::inspect_view()["available"], true);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

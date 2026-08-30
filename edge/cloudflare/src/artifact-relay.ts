@@ -1,10 +1,11 @@
 /**
- * artifact-relay.ts — short-lived private R2 relay for generated images.
+ * artifact-relay.ts — short-lived private R2 relay for bounded artifacts.
  *
  * This is not an MCP tool and not a public bucket. Upload requires the existing
  * Edge MCP/OAuth or Link shared-secret bearer. Download/delete require the
  * one-time object capability (or the same upload principal). Object IDs are
- * random; MIME, size, magic, and expiry are enforced here.
+ * random; MIME syntax, size, digest, capability, and expiry are enforced here.
+ * Known raster image MIME types additionally receive magic-byte validation.
  */
 
 import { authenticateStaticMcpBearer, constantTimeEqual } from "./auth.js";
@@ -13,7 +14,7 @@ import {
   ARTIFACT_CAPABILITY_BYTES,
   ARTIFACT_ID_BYTES,
   ARTIFACT_KEY_PREFIX,
-  ARTIFACT_MIME_TYPES,
+  ARTIFACT_IMAGE_MIME_TYPES,
   ARTIFACT_TTL_MS,
   MAX_ARTIFACT_BYTES,
 } from "./limits.js";
@@ -72,8 +73,11 @@ export function imageMagicMatches(mimeType: string, data: Uint8Array): boolean {
 }
 
 export function normalizeArtifactMime(raw: string | null): string | null {
-  const mime = (raw ?? "").split(";")[0].trim().toLowerCase();
-  return (ARTIFACT_MIME_TYPES as readonly string[]).includes(mime) ? mime : null;
+  const mime = (raw ?? "application/octet-stream").split(";")[0].trim().toLowerCase();
+  if (!mime || mime.length > 127) return null;
+  return /^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}$/.test(mime)
+    ? mime
+    : null;
 }
 
 export function randomHex(byteCount: number): string {
@@ -185,7 +189,7 @@ async function uploadArtifact(
   }
   const mime = normalizeArtifactMime(request.headers.get("content-type"));
   if (!mime) {
-    return fail(415, "artifact_mime_unsupported", "supported MIME types are image/png, image/jpeg, image/gif, and image/webp");
+    return fail(415, "artifact_mime_invalid", "artifact Content-Type is invalid");
   }
   const read = await readBytesBounded(request, MAX_ARTIFACT_BYTES);
   if (!read.ok) {
@@ -194,7 +198,7 @@ async function uploadArtifact(
   if (read.bytes.byteLength === 0) {
     return fail(400, "artifact_size_invalid", "artifact body must not be empty");
   }
-  if (!imageMagicMatches(mime, read.bytes)) {
+  if ((ARTIFACT_IMAGE_MIME_TYPES as readonly string[]).includes(mime) && !imageMagicMatches(mime, read.bytes)) {
     return fail(415, "artifact_format_mismatch", "image bytes do not match the declared MIME type");
   }
 

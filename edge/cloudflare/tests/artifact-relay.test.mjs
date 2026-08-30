@@ -11,6 +11,7 @@ import {
   artifactObjectKey,
   handleArtifactRequest,
   imageMagicMatches,
+  normalizeArtifactMime,
   randomHex,
   sha256Hex,
   sweepExpiredArtifacts,
@@ -164,7 +165,7 @@ test("artifact IDs are random opaque 128-bit values, not sequential names", asyn
   assert.equal(randomHex(16).length, 32);
 });
 
-test("artifact upload rejects oversized, empty, and unsupported MIME bodies", async () => {
+test("artifact upload rejects oversized, empty, invalid MIME, and mismatched raster bodies", async () => {
   const state = env();
   const tooLarge = await handleArtifactRequest(
     new Request("https://edge.example/artifacts", {
@@ -181,13 +182,37 @@ test("artifact upload rejects oversized, empty, and unsupported MIME bodies", as
   assert.equal(empty.status, 400);
   assert.equal((await empty.json()).code, "artifact_size_invalid");
 
-  const svg = await upload(state, PNG, authHeaders("image/svg+xml"));
-  assert.equal(svg.status, 415);
-  assert.equal((await svg.json()).code, "artifact_mime_unsupported");
+  const invalidMime = await upload(state, PNG, authHeaders("not-a-mime"));
+  assert.equal(invalidMime.status, 415);
+  assert.equal((await invalidMime.json()).code, "artifact_mime_invalid");
 
   const mismatch = await upload(state, JPEG, authHeaders("image/png"));
   assert.equal(mismatch.status, 415);
   assert.equal((await mismatch.json()).code, "artifact_format_mismatch");
+});
+
+test("artifact relay accepts bounded non-image files without weakening raster validation", async () => {
+  const state = env();
+  const text = new TextEncoder().encode("herdr generic artifact relay\n");
+  assert.equal(normalizeArtifactMime("text/plain; charset=utf-8"), "text/plain");
+  assert.equal(normalizeArtifactMime("application/octet-stream"), "application/octet-stream");
+  assert.equal(normalizeArtifactMime("not-a-mime"), null);
+
+  const createdResponse = await upload(state, text, authHeaders("text/plain"));
+  assert.equal(createdResponse.status, 201);
+  const created = await createdResponse.json();
+  assert.equal(created.mime_type, "text/plain");
+  assert.equal(created.bytes, text.byteLength);
+
+  const downloaded = await handleArtifactRequest(
+    new Request(`https://edge.example/artifacts/${created.id}`, {
+      headers: { authorization: `Bearer ${created.capability}` },
+    }),
+    state,
+  );
+  assert.equal(downloaded.status, 200);
+  assert.equal(downloaded.headers.get("content-type"), "text/plain");
+  assert.equal(await downloaded.text(), "herdr generic artifact relay\n");
 });
 
 test("artifact download/delete are capability-scoped and expire", async () => {

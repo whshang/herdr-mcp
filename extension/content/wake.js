@@ -128,6 +128,90 @@ const H2W_CONTENT_VERSION = "0.1.80";
     });
   }
 
+  const observedWebArtifactUrls = new Set();
+  const WEB_ARTIFACT_SEEN_LIMIT = 64;
+
+  function transferableWebArtifact(rawUrl) {
+    if (ADAPTER.name !== "chatgpt" || !rawUrl) return null;
+    try {
+      const url = new URL(String(rawUrl), location.href);
+      const host = url.hostname.toLowerCase();
+      if (url.protocol !== "https:" || (host !== "oaiusercontent.com" && !host.endsWith(".oaiusercontent.com"))) return null;
+      if (!url.pathname.endsWith("/raw") || !url.searchParams.get("sig") || !url.searchParams.get("se")) return null;
+      const expiresAt = Date.parse(url.searchParams.get("se") || "");
+      if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) return null;
+      const parts = url.pathname.split("/").filter(Boolean);
+      const filesIndex = parts.indexOf("files");
+      return {
+        url: url.href,
+        asset_id: filesIndex >= 0 ? (parts[filesIndex + 1] || null) : null,
+        expires_at: Number.isFinite(expiresAt) ? expiresAt : null,
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function observeWebArtifactUrl(rawUrl) {
+    const artifact = transferableWebArtifact(rawUrl);
+    if (!artifact || observedWebArtifactUrls.has(artifact.url)) return;
+    observedWebArtifactUrls.add(artifact.url);
+    while (observedWebArtifactUrls.size > WEB_ARTIFACT_SEEN_LIMIT) {
+      observedWebArtifactUrls.delete(observedWebArtifactUrls.values().next().value);
+    }
+    void sendBg({
+      type: "h2w_artifact_observed",
+      artifact: {
+        ...artifact,
+        source: "chatgpt_image_gen",
+        conversation_id: ADAPTER.getConversationKey() || null,
+        observed_at: Date.now(),
+      },
+    });
+  }
+
+  function scanWebArtifactImages(root) {
+    if (ADAPTER.name !== "chatgpt" || !root) return;
+    if (root instanceof HTMLImageElement) {
+      observeWebArtifactUrl(root.currentSrc || root.src);
+    }
+    if (typeof root.querySelectorAll === "function") {
+      for (const image of root.querySelectorAll("img")) {
+        observeWebArtifactUrl(image.currentSrc || image.src);
+      }
+    }
+  }
+
+  function startWebArtifactObserver() {
+    if (ADAPTER.name !== "chatgpt") return;
+    scanWebArtifactImages(document);
+    try {
+      const resources = performance.getEntriesByType?.("resource") || [];
+      for (const entry of resources) observeWebArtifactUrl(entry?.name);
+      const observer = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) observeWebArtifactUrl(entry?.name);
+      });
+      observer.observe({ type: "resource", buffered: true });
+    } catch (_) {}
+    try {
+      document.addEventListener("load", (event) => {
+        if (event.target instanceof HTMLImageElement) scanWebArtifactImages(event.target);
+      }, true);
+      const observer = new MutationObserver((records) => {
+        for (const record of records) {
+          if (record.type === "attributes") scanWebArtifactImages(record.target);
+          for (const node of record.addedNodes || []) scanWebArtifactImages(node);
+        }
+      });
+      observer.observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ["src", "srcset"],
+      });
+    } catch (_) {}
+  }
+
   function classifyBgMessageFailure(message = "") {
     const text = String(message || "").toLowerCase();
     if (!runtimeAlive() || text.includes("extension context invalidated")) {
@@ -2443,6 +2527,7 @@ const H2W_CONTENT_VERSION = "0.1.80";
     }
     // Talk-without-tools: watch turn boundaries and ask background to check MCP activity.
     if (ADAPTER.name === "chatgpt") {
+      startWebArtifactObserver();
       startIdleNudgeWatch();
       startConversationHealthWatch();
     }

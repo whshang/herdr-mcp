@@ -62,6 +62,7 @@ mod updater_store;
 #[cfg(any(target_os = "macos", test))]
 mod user_cli;
 mod utility_exec;
+mod web_artifacts;
 mod workstation;
 
 use std::process::ExitCode;

@@ -66,6 +66,7 @@ const ALLOWED_PROXY_PATHS: &[&str] = &[
     "/push/events",
     "/push/mcp-activity",
     "/extension/control/action",
+    "/extension/artifacts/observe",
     "/extension/continuity/turn",
     "/extension/continuity/resolve",
 ];
@@ -698,6 +699,10 @@ mod tests {
         assert_eq!(
             validate_proxy_path(Some(&json!("/push/events?workspace=w77"))).unwrap(),
             "/push/events?workspace=w77"
+        );
+        assert_eq!(
+            validate_proxy_path(Some(&json!("/extension/artifacts/observe"))).unwrap(),
+            "/extension/artifacts/observe"
         );
         assert_eq!(
             validate_proxy_path(Some(&json!("/extension/continuity/turn"))).unwrap(),

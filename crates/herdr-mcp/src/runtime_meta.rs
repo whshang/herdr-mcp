@@ -101,6 +101,10 @@ pub fn augment_inspect(view: &mut Value, cache: Option<&EventCache>, exec: Optio
             "exec_sessions_diagnostics".to_owned(),
             exec.map(ExecRegistry::diagnostics).unwrap_or(Value::Null),
         );
+        workstation.insert(
+            "web_artifacts".to_owned(),
+            crate::web_artifacts::inspect_view(),
+        );
         workstation.insert("native_migration".to_owned(), migration_status());
     }
 }

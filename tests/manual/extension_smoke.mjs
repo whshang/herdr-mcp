@@ -200,6 +200,34 @@ ok(
     && rustNativeHostSource.includes("proxy_path_not_allowed"),
   "extension uses tokenless Native Messaging IPC with Rust as the sole host owner",
 );
+const artifactBridgeSource = wakeSource.slice(
+  wakeSource.indexOf("const observedWebArtifactUrls"),
+  wakeSource.indexOf("function classifyBgMessageFailure"),
+);
+const artifactBackgroundSource = backgroundSource.slice(
+  backgroundSource.indexOf('msg?.type === "h2w_artifact_observed"'),
+  backgroundSource.indexOf('msg?.type === "herdr_control_center_subscribe"'),
+);
+ok(
+  artifactBridgeSource.includes("startWebArtifactObserver")
+    && artifactBridgeSource.includes("PerformanceObserver")
+    && artifactBridgeSource.includes("MutationObserver")
+    && artifactBridgeSource.includes("WEB_ARTIFACT_SEEN_LIMIT = 64")
+    && artifactBridgeSource.includes("oaiusercontent.com")
+    && !artifactBridgeSource.includes("setInterval")
+    && !artifactBridgeSource.includes("fetch("),
+  "ChatGPT artifact bridge observes signed URL metadata without polling or moving image bytes",
+);
+ok(
+  artifactBackgroundSource.includes("/extension/artifacts/observe")
+    && artifactBackgroundSource.includes("nativeTimeoutMs: 2_000")
+    && artifactBackgroundSource.includes("artifact-bridge-unavailable")
+    && !artifactBackgroundSource.includes("setTimeout")
+    && !artifactBackgroundSource.includes("setInterval")
+    && rustNativeHostSource.includes('"/extension/artifacts/observe"'),
+  "optional artifact metadata delivery makes one bounded Native Messaging attempt and silently degrades",
+);
+
 ok(
   jsonBridgeSource.includes("const ROUND_YIELD_INTERVAL = 12")
     && jsonBridgeSource.includes("while (taskSeq === currentTaskSeq)")

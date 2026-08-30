@@ -3786,6 +3786,34 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch((error) => sendResponse({ ok: false, error: String(error?.message || error || "native-owner-status-failed") }));
     return true;
   }
+  if (msg?.type === "h2w_artifact_observed") {
+    void (async () => {
+      const artifact = msg.artifact && typeof msg.artifact === "object" ? msg.artifact : null;
+      if (!artifact?.url) {
+        sendResponse({ ok: false, error: "artifact-url-required" });
+        return;
+      }
+      const url = `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/extension/artifacts/observe`;
+      try {
+        const response = await localHerdrFetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(artifact),
+          nativeTimeoutMs: 2_000,
+        });
+        let payload = null;
+        try { payload = await response.json(); } catch (_) {}
+        sendResponse(payload && typeof payload === "object"
+          ? { ...payload, http_status: response.status }
+          : { ok: false, error: `artifact-observe-http-${response.status}` });
+      } catch (_) {
+        // Thin bridge is optional. One failed delivery is a silent downgrade;
+        // there is deliberately no retry timer or polling loop.
+        sendResponse({ ok: false, error: "artifact-bridge-unavailable" });
+      }
+    })();
+    return true;
+  }
   if (msg?.type === "herdr_control_center_subscribe") {
     void (async () => {
       if (msg.force !== true && controlCenterLastState && Date.now() - controlCenterSnapshotAt <= 1500) {
