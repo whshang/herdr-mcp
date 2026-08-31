@@ -192,6 +192,7 @@
   "placeholder_llm_model": "e.g. small-fast-model",
   "manual_continue_message": "Continue",
   "manual_status_continue_intro": "Continue from the current Herdr window and Agent state below. Do not repeat completed work; prioritize the current unfinished task.",
+  "herdr_status_checked": "Herdr checked: {workspaces} workspace(s), {agents} agent(s), {working} working.",
   "recovery_probe_template": "Herdr recovery check: the previous assistant turn did not visibly start.\nDo not call tools, do not repeat or continue any external action, and do not mutate anything.\nOnly report whether the previous request appears to have completed in this conversation. If you cannot verify that, reply exactly: recovery needed.",
   "stale_view_activation_template": "Herdr browser recovery: this page was refreshed because the previous assistant response appeared stale or stalled. Re-read the latest visible conversation state and continue exactly from where the previous response stopped. Do not repeat completed work. Before any external mutation, re-check current Herdr/runtime/Git state as needed.",
   "default_wake_template": "herdr workspace {workspace_label}: agents stopped (focus {agent} @ {pane} → {status}).\n\nFocus pane output:\n{output}\n\n{roster}\n\n{idle_hint}\n\nContinue orchestration from these results; prefer fs/exec over expensive models.",

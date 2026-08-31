@@ -138,6 +138,12 @@ export function openLocalHerdrStream({ baseUrl, path = "/push/events", timeoutMs
   let rejectDone;
   const opened = new Promise((resolve, reject) => { resolveOpened = resolve; rejectOpened = reject; });
   const done = new Promise((resolve, reject) => { resolveDone = resolve; rejectDone = reject; });
+  // Native IPC can fail both phases before the caller advances from awaiting
+  // `opened` to awaiting `done`. Mark both promises observed immediately so
+  // MV3 does not emit Uncaught (in promise); later awaits still see the same
+  // rejection on the original promise.
+  void opened.catch(() => {});
+  void done.catch(() => {});
 
   const fail = (error) => {
     const err = error instanceof Error ? error : new Error(String(error || "native-stream-failed"));
