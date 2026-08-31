@@ -8,21 +8,20 @@ ChatGPT が計画と判断を持ち、Herdr が実際の作業現場を保持し
 
 Languages: [English](README.md) · [简体中文](README.zh.md) · **日本語**
 
-## 最短セットアップ：Coding Agent にこのプロンプトを渡す
+## Agent-first セットアップ
 
-Cursor、Codex、Claude Code、Pi、Cline など、URL を読んでコマンドを実行できるローカル Coding Agent に渡してください。
+正式なインストール入口は、実行可能な Agent に直接向けて書かれたプロトコルです：
 
-```text
-Install and configure Herdr and herdr-mcp for me. First read and follow this guide end to end: https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/quick-agent-install.md .
+- [Quick agent install（英語）](docs/i18n/en/quick-agent-install.md) — 短い end-to-end 実行プロトコル；
+- [Agent install（英語）](docs/i18n/en/agent-install.md) — Cloudflare、Link、security、verification の詳細契約。
 
-Install the local herdr-mcp runtime from GitHub Releases, not from a git clone. Pause only when I personally need to sign in/create a Cloudflare API Token, or when I need to add the herdr Connector/app in ChatGPT. Automate and verify everything else.
-```
+Agent はプロトコルを自分で読み、決定的な check / mutation を直接実行し、人の承認や選択が本当に必要な場合だけ停止します。通常 workstation の PROD runtime は published GitHub Releases から導入し、git checkout からは導入しません。network/login/third-party availability が blocker なら、Agent は停止して報告し、proxy や bypass infrastructure を勝手に作りません。
 
 Local herdr-mcp runtime は native binary です。Node.js / npm は**不要**です。Node は Cloudflare / Wrangler bootstrap で Agent が一時的に使う場合だけあります。
 
-Agent は Herdr がなければ公式 stable installer で導入し、herdr-mcp を GitHub Releases から導入し、Cloudflare Edge / Link を構成します。最後に `herdr-mcp doctor` と実際の MCP smoke で検証します。人の操作が必要なのは Cloudflare のログイン/API Token と ChatGPT の herdr Connector/OAuth です。
+Protocol は Herdr / herdr-mcp install、Cloudflare Edge、Link、ChatGPT Connector/OAuth、`herdr-mcp doctor` と real MCP smoke までを検証します。
 
-手動手順は [Installation（英語）](docs/i18n/en/install.md) を参照してください。
+手動/運用リファレンスは [Installation（英語）](docs/i18n/en/install.md) を参照してください。
 
 ## 最初のテスト
 
@@ -38,7 +37,7 @@ Inspect my Herdr projects. Read only; do not modify anything.
 
 v0.4.2 は同じ workstation security boundary を visual および file import にも拡張します。`herdr_fs_image` で managed project 内の PNG/JPEG/GIF/WebP を ChatGPT が直接確認できます。組み込みのプランナーポリシーは artifact を最短安全経路で処理します：managed ローカルファイルは直接 `herdr_fs_*` ツール、安全な署名付き HTTPS URL は直接 `herdr-mcp artifact import --signed-url`、直接消費できる MCP/Connector のファイル参照は直接消費し、残りのクロスバウンダリ転送だけが private・短寿命の Cloudflare R2 generic artifact relay を経由します。Rust runtime が HTTPS/SSRF、サイズ、MIME/file signature、digest、managed-root、dirty-file、busy-agent を検証してから repository に書き込みます。public MCP catalog は 18 tools のままです。
 
-Browser extension はあらゆる file/artifact 経路には**参加しません**。役割は conversation continuity と browser control であり、artifact transport は runtime + direct signed import + private artifact relay が担当します。
+Browser extension は **generic file/artifact relay ではありません**。v0.4.2 では current ChatGPT Web conversation で完成した assistant turn の画像だけを対象にした narrow source-capture path を持ちます。ChatGPT cookie と短寿命 bearer は browser memory に残し、extension は `image_asset_pointer` / `file_id` を解決して allowlisted `chatgpt.com` HTTPS endpoint から画像を取得し、validated image bytes と non-secret metadata だけを local Native Host に渡します。cookie、bearer、Authorization header、download URL はこの boundary を越えません。その他の artifact routing は runtime + direct import + private R2 fallback が担当します。
 
 ## Browser extension は任意
 
@@ -46,21 +45,23 @@ Browser extension は conversation continuity、Chrome Side Panel の Control Ce
 
 v0.4.2 source candidate では、同じ bound ChatGPT Project 内で新しい conversation を手動で開いたあと、内部 `continuity_id` を入力せず **“continue” / “resume”** と言うだけで再開できます。Herdr は stable な conversation / Project / workspace identity で Continuity Journal を検索し、その identity 自体が active chain を一意に特定できる場合だけ自動 resume します。曖昧な場合は bounded candidate evidence を提示して確認し、最新・文字類似だけで chain を選びません。詳細は [Browser continuity（英語）](docs/i18n/en/browser-continuity.md) を参照してください。
 
-一般ユーザーは **Chrome Web Store** からのみインストールします。
+Browser extension の distribution identity は Runtime DEV/PROD とは別のモデルです：
 
-1. runtime + Connector の検証を先に完了します。
-2. [Herdr Chrome Web Store item](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) を開きます。初回公開が Draft の間は **Item not available** と表示される場合があります。
-3. 公式 Herdr extension を選び **Add to Chrome** を押します。
-4. `herdr-mcp native-host install` と `herdr-mcp native-host status` を実行します。
-5. 以後の extension update は Chrome Web Store の通常更新に任せます。通常ユーザーにローカル extension package は不要です。
+| Extension channel | 用途 | identity / update source |
+| --- | --- | --- |
+| **STORE** | 通常ユーザーの既定 | fixed Chrome Web Store identity + Store update |
+| **STANDALONE** | GitHub/manual install、Store 非依存 | fixed non-Store identity + deterministic package；v0.4.3+ |
+| **DEV** | extension/source development | repo/worktree の unpacked path；path-derived identity |
 
-> Store item は初回公開フロー中です。公開前は item page が利用できず、Store 検索にも表示されない場合があります。その間はこの任意ステップをスキップし、ローカル開発版を代替インストールしないでください。
+現在の stable v0.4.2 Native Host は Store/DEV ownership です。v0.4.3 で fixed-identity **STANDALONE** を追加し、v0.4.2 の tag/assets は作り直しません。Agent は GitHub/manual standalone package を dev と呼ばず、path-derived DEV build を通常インストールの fallback にしません。
+
+現在の stable Store path は、runtime + Connector を検証してから [Herdr Chrome Web Store item](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) を利用可能な場合にインストールし、`herdr-mcp native-host install` と `herdr-mcp native-host status` を実行します。v0.4.3+ で runtime が standalone support を明示し、Store が利用できないか user が independent distribution を選んだ場合は STANDALONE を選べます。
 
 詳細：[Browser extension（英語）](docs/i18n/en/extension.md) · [Browser Control Center（英語）](docs/i18n/en/browser-control-center.md)
 
 ## 現在のサポート範囲
 
-- herdr-mcp stable: `v0.4.1`
+- herdr-mcp stable: `v0.4.2`
 - public MCP contract: epoch 2 / 18 tools
 - clean-machine evidence が最も揃っているのは macOS Apple Silicon
 - Windows x64 binary は提供済みだが、Windows end-to-end UAT は継続中

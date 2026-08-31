@@ -6,34 +6,35 @@ herdr-mcp 浏览器扩展不是第二个 Agent runtime。它给已经可用的 h
 
 数据处理方式和权限用途见[浏览器扩展隐私政策](privacy.md)。
 
-## 最终用户安装：只用 Chrome Web Store
+## 安装身份：STORE / STANDALONE / DEV
 
-最终用户只从 Chrome Web Store 安装扩展，不需要本地扩展 build 或仓库 checkout。
+浏览器扩展的身份模型与 Runtime DEV/PROD 分开：
 
-1. 打开 [Herdr Chrome Web Store 官方详情页](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp)；
-2. 核对发布者与产品身份后选择 Herdr 官方扩展；
-3. 点击 **添加至 Chrome / Add to Chrome**；
-4. 安装后在终端运行：
+| 通道 | 用途 | Chromium 身份 |
+| --- | --- | --- |
+| **STORE** | 普通用户默认 | Chrome Web Store 固定身份，由商店更新 |
+| **STANDALONE** | v0.4.3+ GitHub / 手动独立分发 | 固定非 Store 身份；安装路径变化不改变 ID |
+| **DEV** | 源码开发 | repo/worktree `extension/` Load unpacked；ID 由路径派生 |
+
+当前 stable v0.4.2 的 Native Host contract 只有 Store/DEV；v0.4.3 才加入 standalone。不要重打/移动 v0.4.2 tag，也不要用路径派生 DEV 版本冒充 standalone。
+
+STORE 路径：安装 [Herdr Chrome Web Store 官方扩展](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp)。STANDALONE 路径：只使用 v0.4.3+ 正式发布的固定身份 package。DEV 路径：仅贡献者/扩展开发时打开 `chrome://extensions` → Developer mode → **Load unpacked** 并选择明确的 repo/worktree `extension/`。
+
+安装/选择通道后运行：
 
 ```bash
-herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
-全新安装时，`0.4.1+` 的普通 `native-host install` 会直接使用官方 Chrome Web Store 扩展身份，不要求本机存在 unpacked extension 目录或源码 checkout。到 `0.4.2+`，维护者可以让一个 unpacked Dev 版本和 Store 版本同时安装在 Chrome 中，但 herdr-mcp 同时仍只授权一个 active/default Native Messaging origin。
-
-5. 打开 ChatGPT 或其它当前支持页面。z.ai 与 DeepSeek 属于实验性集成，默认关闭；需要在 **Herdr 设置 → 实验性功能** 中分别开启，然后刷新对应网页；
-6. 点击浏览器工具栏里的 Herdr 图标，确认 **浏览器控制中心**直接在 Chrome Side Panel 打开；
-7. 在控制中心确认“当前页面”识别到了正确 Project / conversation，再绑定 Herdr workspace。
-
-> 当前扩展正在进入 Chrome Web Store 首次发布流程。在正式 listing 上线前，普通用户直接跳过这个可选步骤，不要改用本地开发版。
+要求 active channel / extension identity 与所选通道一致，并确认 Native Host runtime 与当前 runtime generation 一致。之后打开 ChatGPT 或其它当前支持页面；z.ai 与 DeepSeek 属于实验性集成，默认关闭，需要在 **Herdr 设置 → 实验性功能** 中分别开启并刷新页面。点击工具栏 Herdr 图标，确认控制中心在 Chrome Side Panel 打开，再核对当前 Project / conversation 与 workspace binding。
 
 ## 更新方式
 
-通过 Chrome Web Store 安装后，扩展更新走 Chrome 的正常 Web Store 更新机制。普通用户不需要本地扩展安装包，也不需要仓库 checkout。
+- **STORE**：由 Chrome Web Store 正常更新。
+- **STANDALONE**：由 GitHub/独立发布面提供新的固定身份 package；不会因为解压目录变化而变成新的浏览器身份。
+- **DEV**：跟随所加载 repo/worktree 源码，由开发者显式 Reload。
 
-
-扩展更新后，如果某个已经打开很久的 ChatGPT 页面仍运行旧 content script，刷新该网页即可让页面使用新版本。Chrome 扩展本身的版本更新与 Rust runtime 版本独立；纯 UI / DOM / browser compatibility 修复不要求发布新的 Rust runtime。
+扩展更新后，如果某个已经打开很久的 ChatGPT 页面仍运行旧 content script，刷新该网页即可让页面使用新版本。Chrome 扩展版本与 Rust runtime 版本独立；纯 UI / DOM / browser compatibility 修复不要求发布新的 Rust runtime，但新增 Native Host identity/channel contract 时必须使用实际支持该 contract 的 runtime。
 
 ## 三个产品面
 
@@ -110,8 +111,8 @@ Pinned Target 不会因为 Herdr focus 变化自动漂移。
 ## 第一次使用
 
 1. 先确认 `herdr-mcp doctor` 健康；
-2. 从 Chrome Web Store 安装扩展；
-3. 运行 `herdr-mcp native-host install`；
+2. 按上面的 STORE / STANDALONE / DEV 规则选择并安装扩展；
+3. 用 runtime 支持的 Native Host 命令激活所选通道，再确认 `herdr-mcp native-host status`；
 4. 打开 ChatGPT Project / conversation；
 5. 打开浏览器控制中心；
 6. 从对应 workspace 行完成绑定；
@@ -132,13 +133,14 @@ Pinned Target 不会因为 Herdr focus 变化自动漂移。
 
 细节见 [浏览器连续工作](browser-continuity.md) 与 [自动继续 / 恢复](extension-wake.md)。
 
-## 开发者与商店发布
+## 开发者、Standalone 与 Store 发布
 
-本地 extension build、Chrome Web Store Developer Dashboard、包上传、Trusted Testers、商店素材和审核流程属于**维护者/扩展开发流程**，不属于最终用户安装文档。
+DEV 源码加载、STANDALONE 固定身份 package、Chrome Web Store Developer Dashboard/审核属于三个不同发布路径。扩展版本生命周期独立于 Rust runtime，但 Native Host channel contract 必须与实际 runtime 能力匹配。
 
 维护者请使用：
 
 - `contracts/browser-extension-store.json` 作为 Chrome Web Store 身份的唯一机器可读 SSOT；Rust 只读取和校验这个 contract，不在源码里硬编码 Store ID；
+- v0.4.3 的 `contracts/browser-extension-standalone.json` 作为 Standalone 固定身份 SSOT；打包时只注入公开 manifest key，DEV 源 `extension/manifest.json` 继续不带固定 `key`；
 - `herdr-mcp native-host dev enable [PATH]` 登记并激活一个 unpacked Dev 身份（`PATH` 默认是 `./extension`）；
 - `herdr-mcp native-host use store` / `herdr-mcp native-host use dev` 在不卸载另一份 Chrome 扩展的情况下切换唯一 active/default 浏览器 owner；
 - `herdr-mcp native-host dev disable` 撤销 Dev 身份并让 Store 回到 active；
@@ -147,11 +149,11 @@ Pinned Target 不会因为 Herdr focus 变化自动漂移。
 - `docs/_wip/browser-extension-development-and-store-release.md` 维护商店流程；
 - `AGENTS.md` 中的 extension 验证与发布边界。
 
-Store 与 Dev 可以作为两份 Chrome 扩展共存，但受管 Native Messaging manifest 始终只有一个精确的 `allowed_origins`：当前 active owner。非 active 的 `0.1.76+` 扩展保持安装但进入 standby，不启动本地 shared stream，也不渲染 operational HUD。切换 active owner 后，Rust Native Host 还会通过受管 origin fence 撤销旧 build 已经打开的 Native Messaging request/stream，避免旧 persistent connection 继续保有本地控制权。unpacked 目录移动后 Chromium 的路径派生 ID 会变化，因此必须重新执行 `dev enable`。
+STORE / STANDALONE / DEV 可以作为不同 Chrome 扩展身份共存，但受管 Native Messaging manifest 始终只有一个精确的 `allowed_origins`：当前 active owner。非 active build 保持安装但进入 standby，不启动本地 shared stream，也不渲染 operational HUD。切换 active owner 后，Rust Native Host 继续通过受管 origin fence 撤销旧 build 已打开的 Native Messaging request/stream，避免旧 persistent connection 跨通道继续保有本地控制权。只有 DEV 是路径派生身份；移动 unpacked DEV 目录后必须重新登记。
 
-执行 `native-host use store` 或 `native-host use dev` 后，请刷新已经打开的受支持 Web AI 页面。`0.1.76+` 的 page-owner gate 在 content script 注入最前面决定页面归属；刷新后 newly-active build 才会接管页面，inactive sibling 会在注册页面监听器或 HUD/Queue UI 之前直接退出。因此同时启用 Store+Dev 的完整安全共存要求两份浏览器扩展都达到 `0.1.76+`；首次提交审核的 `0.1.75` Store candidate 仍按 Store-only 候选验证，不原地改包。
+切换 `native-host use store` / `use standalone` / `use dev` 后，请刷新已经打开的受支持 Web AI 页面。page-owner gate 在 content script 注入最前面决定页面归属；刷新后 newly-active build 接管页面，inactive sibling 在注册页面监听器或 HUD/Queue UI 前退出。`use standalone` 只在实际支持该命令的 v0.4.3+ runtime 上使用；v0.4.2 不伪装支持。
 
-正式商店发布后，最终用户文档只保留 Chrome Web Store 安装路径。
+普通用户默认仍优先 STORE；STANDALONE 是正式的独立分发路径，不再被归类为开发版。
 
 ## 相关文档
 

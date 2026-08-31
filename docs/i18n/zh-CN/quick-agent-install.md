@@ -1,18 +1,17 @@
-# 快速 Agent 安装：用户一句话，Agent 完整协议
+# 快速 Agent 安装协议
 
-本页是 herdr-mcp **面向最终用户的 GA 上手路径**，不是 `docs/_wip/` 里的维护者 UAT 剧本。
+> **执行角色：Agent。** 本页不是给用户逐条抄命令的教程，也不是需要再次包装成一段“发给某个 Coding Agent”的提示词。收到安装 herdr-mcp 的任务后，Agent 直接读取并执行本文。
 
-## 粘贴给本地 Coding Agent 的一句话
+这是普通工作站安装的精简执行协议。更完整的 Cloudflare 权限、秘密处理、Link 与故障边界见 [Agent 安装合同](agent-install.md)。维护者 UAT 不属于本协议。
 
-复制下面整块发给 Codex、Claude Code、Cursor、Pi、Cline 等能读 URL 并执行命令的 Agent:
+## 执行约束
 
-```text
-请帮我安装并配置 Herdr 和 herdr-mcp，请先完整阅读并严格按照这个指引执行：https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/quick-agent-install.md 。
-
-herdr-mcp 本机 runtime 使用 GitHub Releases，不用 git clone。只在 Cloudflare 登录/创建 API Token，以及 ChatGPT 添加 herdr Connector/插件这两类需要我本人操作的步骤暂停并指导我，其余步骤请自动完成并验证。
-```
-
-Agent 应读完本文并执行。Cloudflare Token 暂停细节也可参考 [Agent 协助安装](agent-install.md)。
+1. 先读完本页，再做 mutation；能确定执行的 shell / 文件 /状态检查直接完成。
+2. 只在 Cloudflare 交互登录/API Token、无法安全推断的 Account 选择、ChatGPT Connector/OAuth 等确实需要用户本人操作时暂停。
+3. 普通工作站的 PROD runtime 从正式 GitHub Release 安装；除非任务明确是开发 herdr-mcp，否则不要用 git checkout、`target/*` 或本地 build 代替。
+4. 如果网络、登录状态或第三方服务不可用，停止并报告 blocker；不要自行搭代理、切网络节点、改系统代理或发明旁路。
+5. 每个关键 mutation 后验证实际状态；投递结果不确定时先读取状态，禁止盲目重试。
+6. 秘密不得进入仓库、普通日志、截图、shell history 或最终报告。
 
 ## 完成后用户得到什么
 
@@ -20,14 +19,7 @@ Agent 应读完本文并执行。Cloudflare Token 暂停细节也可参考 [Agen
 - 个人 Cloudflare Edge Worker (`workers.dev` 或自定义域名)
 - 工作站到 Edge 的出站 Herdr Link
 - ChatGPT 开发者模式 + 自定义 MCP Connector 指向 `/mcp`
-- 可选浏览器扩展 (仅在 ChatGPT 手动连通之后)
-
-## Agent 合同 (简版)
-
-1. 能自动化的 shell 直接执行；只在 Cloudflare 交互登录/API Token、无法自动判断的 Account 选择，或 ChatGPT 添加 `herdr` Connector/OAuth 时暂停。
-2. **本机 MCP runtime 必须从 GitHub Releases 安装**; 除非用户明确要求开发 herdr-mcp, 否则不要 `git clone` + `npm`/`cargo`。
-3. 每个 mutation 后验证 (`herdr-mcp doctor`, Link status, Edge `/health`, 公网 `/mcp`)。
-4. 秘密不得写入仓库、日志、截图或 shell history。
+- 可选浏览器扩展（基础 Connector 连通后，按 runtime 实际支持选择 STORE / STANDALONE / DEV）
 
 ## 前置条件
 
@@ -69,11 +61,11 @@ herdr-mcp status
 
 ## 步骤 2 — 选择公网 Edge URL 策略
 
-部署 Edge 前先确定一个 canonical public origin，OAuth、MCP、Link WSS 后续都引用同一个入口:
+部署 Edge 前先确定一个 canonical public origin，OAuth、MCP、Link WSS 后续都引用同一个入口。只有用户已经明确选择自定义域名，或现有安装配置/策略能证明该意图时，才从一开始走自定义域名；运行中一旦发现连通性失败，先停下询问用户，不自动改路径：
 
 ```text
-你是否已有可指向 Cloudflare 的自有域名，或当前网络对 workers.dev 不稳定?
-  ├─ 是 → 从第一次部署就使用自定义域名
+用户是否已明确选择可指向 Cloudflare 的自定义域名?
+  ├─ 是 → 从第一次部署就使用该自定义域名
   │       示例 MCP URL: https://herdr-mcp.example.com/mcp
   │       见下文「自定义域名路径」
   └─ 否 → 使用 workers.dev 作为无需 DNS 的 bootstrap
@@ -82,9 +74,9 @@ herdr-mcp status
 
 | 场景 | 推荐公网 origin | ChatGPT Connector URL |
 |---|---|---|
-| 有域名 + Cloudflare zone | 自定义域名 | `https://herdr-mcp.example.com/mcp` |
+| 用户已明确选择自定义域名 + Cloudflare zone | 自定义域名 | `https://herdr-mcp.example.com/mcp` |
 | 无域名 / 最快首次安装 | `workers.dev` | `https://herdr-edge-device.username.workers.dev/mcp` |
-| `workers.dev` 被拦 (中国 SNI) | 自定义域名 **或** `workers.dev` + 代理 | 同上 |
+| `workers.dev` 不可达 | 停止并让用户选择现有代理路径或自定义域名 | 由用户确认后决定 |
 
 自定义域名操作详见 [Cloudflare Edge 部署](cloudflare-edge-deployment.md#何时使用自定义域名)。
 
@@ -144,9 +136,9 @@ herdr-mcp link status
 
 将 Link LaunchAgent 上的 `HERDR_EDGE_URL` 与 `HERDR_WORKSTATION_ID` 设为与 Worker 一致。
 
-### Link 代理 (中国 workers.dev 或系统代理)
+### Link 网络路径
 
-Link 以**出站 WSS** 连 Edge。若 ChatGPT 走本地代理但 Link 直连被 reset, 在 `link install` 前或 LaunchAgent 环境变量中配置:
+Link 以**出站 WSS** 连 Edge。它可以复用用户已经配置好的代理环境；Agent 不得为了完成安装而自行新建或修改代理。
 
 | 变量 | 用途 |
 |---|---|
@@ -155,25 +147,9 @@ Link 以**出站 WSS** 连 Edge。若 ChatGPT 走本地代理但 Link 直连被 
 | `HTTP_PROXY` / `http_proxy` | HTTP 代理回退 |
 | `ALL_PROXY` / `all_proxy` | 最后尝试 (仅 HTTP/HTTPS scheme) |
 
-示例:
+macOS 上 Link 也会读取现有 `scutil --proxy` 系统代理。这些能力用于识别/复用现状，不代表 Agent 可以修改系统网络。
 
-```bash
-export HERDR_LINK_PROXY=http://127.0.0.1:7890
-# 或复用已有 https_proxy (ChatGPT 已能上网时)
-herdr-mcp link install
-```
-
-macOS 上若未设置 env, Link 还会读取 `scutil --proxy` 系统代理。
-
-**Agent 行为:**
-
-1. 探测 `https_proxy` / `HERDR_LINK_PROXY` / 系统代理
-2. 若 ChatGPT 可用但探测不到代理, 仍继续 (透明代理可能已生效)
-3. 若配置代理后 `workers.dev` 仍不可达, 向用户给出**两条路**:
-   - 设置 `HERDR_LINK_PROXY` (或系统 `https_proxy`) 后重试 Link
-   - **或** 改用网络可达的自定义域名
-
-无代理时 Link 直连 (默认行为不变)。
+**Agent 行为：**先只读检查当前 `HERDR_LINK_PROXY` / proxy env / 系统代理并按现状执行；如果目标仍不可达，立即停止并报告 blocker，让用户明确选择是否调整代理、网络或改用自定义域名。未经用户明确指示不得继续网络 mutation。
 
 ## 步骤 6 — 验证
 
@@ -212,25 +188,27 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 
 详见 [ChatGPT Connector](chatgpt-connector.md)。
 
-## 步骤 8 — 可选 Chrome Web Store 浏览器扩展
+## 步骤 8 — 选择可选浏览器扩展通道
 
-仅在步骤 7 成功后再做。
+仅在步骤 7 成功后再做。扩展通道与 Runtime DEV/PROD 是两套不同概念：
 
-最终用户只通过 Chrome Web Store 安装，不用本地开发版替代，也不要求机器上存在 herdr-mcp git checkout：
+- **STORE**：普通用户默认路径；由 Chrome Web Store 提供固定身份和更新。
+- **STANDALONE**：v0.4.3+ 的 GitHub / 手动安装路径；使用固定非 Store 身份，不依赖 unpacked 目录路径。
+- **DEV**：仅用于开发 herdr-mcp/extension 源码；从 repo/worktree `extension/` Load unpacked，身份由路径派生。
 
-1. 打开 <https://chromewebstore.google.com/>；
-2. 搜索 `Herdr`，选择 Herdr 官方扩展；
-3. 点击 **添加至 Chrome / Add to Chrome**；
-4. Chrome Web Store listing 尚未正式上线时，直接跳过本步骤，不要回退到本地开发版。
+先让已安装 runtime 报告其支持的 Native Host 通道。当前 stable v0.4.2 只有 Store/DEV；不要假装它支持 standalone。v0.4.3+ 如果明确提供 `native-host use standalone`，则按以下顺序选择：
 
-`herdr-mcp doctor` 健康后安装 Native Messaging:
+1. 用户未指定且 Store 可用 → **STORE**；
+2. Store 不可用或用户明确要求 GitHub/独立分发，且 runtime 支持 → **STANDALONE**；
+3. 只有任务明确是源码开发时 → **DEV**。
+
+Store 路径安装官方 Herdr 扩展；Standalone 路径只使用正式固定身份 package；DEV 不得作为普通用户 fallback。随后根据所选通道安装/同步 Native Messaging，并运行：
 
 ```bash
-herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
-Chrome Web Store 安装后，扩展版本更新由 Chrome 的正常扩展更新机制负责；普通用户不需要本地扩展安装包。见 [浏览器扩展](extension.md) 与 [浏览器连续性](browser-continuity.md)。
+状态必须明确显示预期 active channel / extension identity，并且 Native Host runtime 与当前 runtime generation 一致。见 [浏览器扩展](extension.md) 与 [浏览器连续性](browser-continuity.md)。
 
 ## 给用户的最终报告
 

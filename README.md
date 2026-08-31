@@ -12,28 +12,20 @@ ChatGPT can inspect and modify code, use Git, run commands and tests, or delegat
 
 Languages: **English** · [简体中文](README.zh.md) · [日本語](README.ja.md)
 
-## Fastest setup: paste one prompt into your coding agent
+## Agent-first setup
 
-Use Cursor, Codex, Claude Code, Pi, Cline, or another local coding agent that can read URLs and run commands:
+The canonical installation path is an **execution protocol written directly for an Agent**:
 
-```text
-Install and configure Herdr and herdr-mcp for me. First read and follow this guide end to end: https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/quick-agent-install.md .
+- [Quick agent install](docs/i18n/en/quick-agent-install.md) — concise end-to-end protocol;
+- [Agent install](docs/i18n/en/agent-install.md) — detailed security, Cloudflare, Link, and verification contract.
 
-Install the local herdr-mcp runtime from GitHub Releases, not from a git clone. Pause only when I personally need to sign in/create a Cloudflare API Token, or when I need to add the herdr Connector/app in ChatGPT. Automate and verify everything else.
-```
+An execution-capable Agent should read the protocol itself, perform deterministic checks and mutations directly, and pause only for genuinely interactive human authorization or choices. Ordinary workstation PROD installs use published GitHub Releases for herdr-mcp, not a repo checkout. If network/login/third-party availability blocks the requested path, the Agent should stop and report the blocker rather than inventing proxy or bypass infrastructure.
 
 The local herdr-mcp runtime is a native binary; normal users do **not** need Node.js or npm to run it. Node may be used temporarily by the Agent only for Cloudflare/Wrangler bootstrap.
 
-The guide tells the agent to:
+The protocol covers Herdr installation, stable herdr-mcp installation, Cloudflare Edge, the workstation Link, ChatGPT Connector/OAuth, `herdr-mcp doctor`, and a real MCP smoke test.
 
-1. check Herdr and install the official stable build if it is missing;
-2. install the latest stable `herdr-mcp` runtime from GitHub Releases;
-3. deploy Cloudflare Edge, configure the workstation Link, and verify public `/health` and `/mcp`;
-4. pause only for Cloudflare sign-in / API Token creation;
-5. pause only for adding the `herdr` Connector in ChatGPT and completing OAuth;
-6. finish with `herdr-mcp doctor` and a real MCP smoke test.
-
-Prefer to do it manually? See [Installation](docs/i18n/en/install.md).
+For operator/manual reference, see [Installation](docs/i18n/en/install.md).
 
 ## First real test
 
@@ -57,15 +49,17 @@ The browser extension adds long-conversation continuity, the Side Panel Control 
 
 In v0.4.2, a user who manually opens another conversation inside the same bound ChatGPT Project can simply say **“continue”** or **“resume”** without supplying an internal continuity ID. Herdr first searches the durable Continuity Journal with stable conversation / Project / workspace identity. It auto-resumes only when that identity identifies exactly one active chain; otherwise it shows bounded candidate evidence and asks the user to confirm. Recency or text similarity alone never selects a chain. See [Browser continuity](docs/i18n/en/browser-continuity.md).
 
-End users install it only from the **Chrome Web Store**:
+The browser-extension distribution model is intentionally separate from the Runtime DEV/PROD model:
 
-1. finish the runtime + Connector verification first;
-2. open the [Herdr Chrome Web Store item](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp); while the first listing is still a draft, this direct page can show **Item not available**;
-3. choose the official Herdr extension and click **Add to Chrome**;
-4. run `herdr-mcp native-host install` and `herdr-mcp native-host status`;
-5. future extension updates are delivered through the normal Chrome Web Store update mechanism; no local extension package is required.
+| Extension channel | Intended use | Identity/update source |
+| --- | --- | --- |
+| **STORE** | default ordinary-user install | fixed Chrome Web Store identity + Store updates |
+| **STANDALONE** | GitHub/manual install without Store dependency | fixed non-Store identity + deterministic package; first-class in v0.4.3+ |
+| **DEV** | extension/source development only | unpacked repo/worktree path; path-derived identity |
 
-> The Store item is currently in its first publication flow. Until the listing is published, the direct item page can be unavailable and Store search may return no result. Normal end users should skip this optional step rather than install a local development build.
+Current stable v0.4.2 has Store/DEV Native Host ownership. v0.4.3 adds the fixed-identity **STANDALONE** path; v0.4.2 is not repacked or retagged to retrofit it. An Agent must not call a GitHub/manual standalone package "dev", and must not use a path-derived DEV build as the fallback for an ordinary install.
+
+For the current stable Store path: finish runtime + Connector verification, install the [Herdr Chrome Web Store item](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) when available, then run `herdr-mcp native-host install` and `herdr-mcp native-host status`. A v0.4.3+ Agent may instead select STANDALONE when the runtime explicitly advertises that channel and Store installation is unavailable or the user requests independent distribution.
 
 See [Browser extension](docs/i18n/en/extension.md) and [Browser Control Center](docs/i18n/en/browser-control-center.md).
 
@@ -99,7 +93,7 @@ herdr-mcp uninstall
 - [Quick agent install](docs/i18n/en/quick-agent-install.md) — recommended onboarding protocol for a coding agent;
 - [Installation](docs/i18n/en/install.md) — manual setup;
 - [ChatGPT Connector](docs/i18n/en/chatgpt-connector.md) — OAuth / MCP connection;
-- [Browser extension](docs/i18n/en/extension.md) — Chrome Web Store install and continuity;
+- [Browser extension](docs/i18n/en/extension.md) — STORE / STANDALONE / DEV identities and continuity;
 - [Browser extension privacy](docs/i18n/en/privacy.md) — extension data handling and Limited Use;
 - [Troubleshooting](docs/i18n/en/troubleshooting.md) — doctor, Link, Edge, OAuth;
 - [Architecture](docs/i18n/en/architecture.md) — Runtime / Edge / Link / Extension boundaries.

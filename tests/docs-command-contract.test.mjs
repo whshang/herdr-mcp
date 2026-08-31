@@ -8,9 +8,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (p) => readFileSync(path.join(ROOT, p), "utf8");
 
 const README_PRIMARY = [
-  ["README.md", "## Fastest setup: paste one prompt into your coding agent"],
-  ["README.zh.md", "## 最快开始：把这一句话发给你的 Coding Agent"],
-  ["README.ja.md", "## 最短セットアップ：Coding Agent にこのプロンプトを渡す"],
+  ["README.md", "## Agent-first setup"],
+  ["README.zh.md", "## Agent-first 安装"],
+  ["README.ja.md", "## Agent-first セットアップ"],
 ];
 
 const INSTALL_PRIMARY = [

@@ -85,10 +85,9 @@ Herdr 工作站
 
 只想让 ChatGPT 操作本机时可以完全跳过这一节。标准 MCP 解决的是 Web → workstation；扩展补的是 workstation / page → Web，这不是第一次连接的前置条件。
 
-先从 [Herdr Chrome Web Store 官方详情页](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) 安装扩展；如果首次发布仍处于 Draft、详情页不可用或商店搜索不到 Herdr，就先跳过这个可选步骤，不要改用本地开发版。然后运行：
+扩展有 STORE / STANDALONE / DEV 三种身份。当前 stable v0.4.2 只支持 Store/DEV Native Host ownership；v0.4.3+ 才支持固定身份的 STANDALONE。普通用户默认从 [Herdr Chrome Web Store 官方详情页](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) 走 STORE；Store 不可用或用户明确选择独立分发时，只有在已安装 runtime 明确支持 standalone 的情况下才使用正式 GitHub/manual STANDALONE package。DEV 仅用于源码开发。随后按当前 runtime 支持的通道完成 Native Host 选择并运行：
 
 ```bash
-herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 

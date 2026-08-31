@@ -199,12 +199,11 @@ The agent's final prose is not the source of truth; the repository is.
 
 ## 9. Add the browser extension for long work
 
-Install the official **Herdr** extension from the Chrome Web Store. Runtime GitHub Releases do not distribute browser-extension installation packages. If the Store listing is not live yet, skip this optional step. See [Browser extension](extension.md).
+The extension has STORE / STANDALONE / DEV identities. Current stable v0.4.2 supports Store/DEV Native Host ownership; v0.4.3+ adds fixed-identity STANDALONE. Prefer the official Chrome Web Store build for ordinary users. Use a published GitHub/manual STANDALONE package only when the installed runtime explicitly supports that channel and Store is unavailable or independent distribution was requested. DEV is source-development only. See [Browser extension](extension.md).
 
-Then install the Native Messaging host:
+After installing/selecting a supported channel, verify Native Messaging ownership:
 
 ```bash
-herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 

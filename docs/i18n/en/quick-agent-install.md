@@ -1,18 +1,17 @@
-# Quick agent install: one user prompt, one complete agent protocol
+# Quick Agent installation protocol
 
-This is the **recommended end-user onboarding path** for herdr-mcp. It is written for a local coding agent to execute, not for the human to copy commands one by one.
+> **Executor: Agent.** This page is not a command list for a human to copy and is not a prompt template that needs to be wrapped for a named coding product. When assigned a herdr-mcp installation task, the Agent reads and executes this protocol directly.
 
-## One prompt to paste into your local coding agent
+This is the concise ordinary-workstation installation protocol. The full Cloudflare permission, secret-handling, Link, and failure-boundary contract lives in [Agent installation](agent-install.md). Maintainer UAT is outside this protocol.
 
-Give this whole block to Cursor, Codex, Claude Code, Pi, Cline, or another local coding agent that can read URLs and run commands:
+## Execution constraints
 
-```text
-Install and configure Herdr and herdr-mcp for me. First read and follow this guide end to end: https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/quick-agent-install.md .
-
-Install the local herdr-mcp runtime from GitHub Releases, not from a git clone. Pause only when I personally need to sign in/create a Cloudflare API Token, or when I need to add the herdr Connector/app in ChatGPT. Automate and verify everything else.
-```
-
-The agent must read this page completely before mutating the machine. More detailed Cloudflare credential handling remains in [Agent-assisted installation](agent-install.md).
+1. Read this page before mutation; execute deterministic shell, file, and state checks directly.
+2. Pause only for genuinely interactive human actions: Cloudflare sign-in/API Token creation, an account choice that cannot be inferred safely, and ChatGPT Connector/OAuth authorization.
+3. Install the ordinary workstation PROD runtime from published GitHub Releases. Unless the task explicitly concerns herdr-mcp development, do not substitute a git checkout, `target/*`, or a local build.
+4. If network, login state, or third-party availability blocks the requested path, stop and report the blocker. Do not build a proxy, switch network nodes, rewrite system proxy settings, or invent a bypass.
+5. Verify actual state after important mutations. If delivery is uncertain, inspect state before retrying; never blind-retry a mutation.
+6. Never put secrets in the repository, ordinary logs, screenshots, shell history, or the final report.
 
 ## What the user gets when this is complete
 
@@ -21,15 +20,7 @@ The agent must read this page completely before mutating the machine. More detai
 - a personal Cloudflare Edge Worker (`workers.dev`, or a custom domain only when intentionally selected);
 - an outbound workstation Herdr Link;
 - ChatGPT Developer mode + a custom `herdr` MCP Connector pointing at `/mcp`;
-- an optional Chrome Web Store browser extension after the base Connector works.
-
-## Agent contract
-
-1. Run automatable shell steps directly. Pause only for interactive Cloudflare login/API Token creation, an account choice that cannot be resolved safely, or the human ChatGPT Connector/OAuth step.
-2. **Install the local herdr-mcp runtime from GitHub Releases.** Do not `git clone` + `npm`/`cargo` unless the user explicitly asked to develop herdr-mcp itself.
-3. Verify after mutations: Herdr health, `herdr-mcp doctor`, Link status, Edge `/health`, public `/mcp`, and final ChatGPT MCP access.
-4. Do not echo or persist secrets in repositories, ordinary logs, screenshots, or shell history.
-5. If a mutation returns ambiguously, verify actual state before retrying it.
+- an optional browser extension using a supported STORE / STANDALONE / DEV channel after the base Connector works.
 
 ## Prerequisite — install Herdr if it is missing
 
@@ -87,8 +78,10 @@ The normal user path must not depend on a git checkout.
 Choose one canonical public origin during the first installation and keep it for OAuth, MCP, and Link WSS:
 
 - `workers.dev` is the zero-DNS bootstrap path when it is reachable from the workstation network;
-- use a Custom Domain from the start when the user already owns one or when `workers.dev` is unreliable/blocked on the workstation network (for example mainland China);
-- use Link proxy support when the selected origin still requires the workstation's existing proxy path.
+- use a Custom Domain from the start only when the user has already selected that path or an existing installation policy/configuration makes that intent explicit;
+- preserve an already-configured workstation proxy path when it is part of the user's environment; do not create or change proxy/network settings as an automatic workaround.
+
+If a connectivity probe fails while choosing or verifying the origin, stop and ask the user before changing this decision.
 
 Example Connector URLs:
 
@@ -145,7 +138,7 @@ herdr-mcp link install
 herdr-mcp link status
 ```
 
-If `workers.dev` is blocked on the workstation network, use the existing proxy configuration where possible. Supported priority:
+The Link can recognize an already-configured proxy path with this priority:
 
 ```text
 HERDR_LINK_PROXY
@@ -154,9 +147,9 @@ HTTP_PROXY / http_proxy
 ALL_PROXY / all_proxy
 ```
 
-On macOS the Link can also discover the system proxy via `scutil --proxy`.
+On macOS the Link can also discover the existing system proxy via `scutil --proxy`. This is observation/reuse, not permission to mutate network settings.
 
-Do not turn a connectivity problem into an unnecessary DNS/custom-domain mutation before checking the proxy path.
+If the selected Edge origin is still unreachable, **stop and ask the user**. Do not set a new proxy, change the system proxy, switch network nodes, or move to a custom domain without explicit user direction.
 
 ## Step 6 — verify the local and public path
 
@@ -198,25 +191,27 @@ Success means the public tool list is available and `herdr_inspect` returns the 
 
 See [ChatGPT Connector](chatgpt-connector.md) for UI detail.
 
-## Step 8 — optional Chrome Web Store browser extension
+## Step 8 — choose the optional browser-extension channel
 
-Only after Step 7 succeeds.
+Only after Step 7 succeeds. Extension channels are separate from the Runtime DEV/PROD model:
 
-End users install only from the Chrome Web Store. Do **not** substitute a local development build or require a herdr-mcp git checkout.
+- **STORE** — default ordinary-user path; fixed Chrome Web Store identity and Store updates.
+- **STANDALONE** — v0.4.3+ GitHub/manual path; fixed non-Store identity, independent of the unpacked directory path.
+- **DEV** — source-development path only; Load unpacked from a repo/worktree `extension/` directory with a path-derived identity.
 
-1. open <https://chromewebstore.google.com/>;
-2. search for `Herdr` and choose the official Herdr extension;
-3. click **Add to Chrome**;
-4. if the Chrome Web Store listing is not live yet, skip this optional step rather than falling back to a local development build.
+First inspect what the installed runtime actually supports. Current stable v0.4.2 has Store/DEV Native Host ownership; do not pretend it supports standalone. On v0.4.3+ when `native-host use standalone` is explicitly available, choose in this order:
 
-After the extension is installed, register the local Native Messaging host:
+1. no user preference and Store is available → **STORE**;
+2. Store is unavailable or the user explicitly requests GitHub/independent distribution, and the runtime supports it → **STANDALONE**;
+3. the task explicitly concerns extension/source development → **DEV**.
+
+Use only the official Store build for STORE, a fixed-identity release package for STANDALONE, and never use DEV as an ordinary-user fallback. After installing/selecting the chosen channel, synchronize Native Messaging and run:
 
 ```bash
-herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
-Future extension versions are delivered through Chrome's normal Chrome Web Store update mechanism. Normal users do not repeatedly download ZIP files or manually Reload an unpacked extension.
+The status must identify the expected active channel/extension identity and show the Native Host runtime consistent with the active runtime generation.
 
 See [Browser extension](extension.md) and [Browser continuity](browser-continuity.md).
 

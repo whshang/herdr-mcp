@@ -33,8 +33,8 @@ function matches(text, regex) {
 
 // First document the docs entries land on; short (sidebar-safe) titles.
 const FIRST_SLUG = DOC_ORDER[0];
-const EN_TITLE = "Quick agent install: one user prompt, one complete agent protocol";
-const ZH_TITLE = "快速 Agent 安装：用户一句话，Agent 完整协议";
+const EN_TITLE = "Quick Agent installation protocol";
+const ZH_TITLE = "快速 Agent 安装协议";
 
 test("documentation site build publishes every logical doc x 2 locales under locale-aware URLs", async () => {
   await rm(OUT, { recursive: true, force: true });
