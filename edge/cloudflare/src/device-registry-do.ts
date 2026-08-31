@@ -2,10 +2,12 @@ import type { Env } from "./env.js";
 import { constantTimeEqual } from "./auth.js";
 import {
   isCredentialVerifier,
-  isEnrollmentCode,
+  isPairingCode,
+  isPairingId,
   newCredentialId,
   newDeviceSecret,
-  newEnrollmentCode,
+  newPairingCode,
+  newPairingId,
   sha256Hex,
 } from "./device-crypto.js";
 import {
@@ -18,18 +20,47 @@ import {
 
 const DEVICE_PREFIX = "device:";
 const WORKSTATION_PREFIX = "workstation:";
-const ENROLLMENT_PREFIX = "enrollment:";
+const PAIRING_PREFIX = "pairing:";
 const CREDENTIAL_PREFIX = "credential:";
-const DEFAULT_ENROLLMENT_TTL_MS = 10 * 60 * 1000;
-const MIN_ENROLLMENT_TTL_MS = 60 * 1000;
-const MAX_ENROLLMENT_TTL_MS = 15 * 60 * 1000;
+const DEFAULT_PAIRING_TTL_MS = 10 * 60 * 1000;
+const MIN_PAIRING_TTL_MS = 60 * 1000;
+const MAX_PAIRING_TTL_MS = 10 * 60 * 1000;
+/** Fifth wrong code permanently locks the pairing session. */
+const MAX_PAIRING_ATTEMPTS = 5;
 const enc = new TextEncoder();
 
-interface EnrollmentRecord {
+/**
+ * Storage snapshot resistance: the lookup key is SHA-256(raw pairing_id), so a
+ * snapshot alone never exposes the raw id. The stored verifier is
+ * HMAC-SHA256 keyed by the raw pairing_id over worker_context || code, so a
+ * storage snapshot cannot enumerate the six-digit code offline: the HMAC key
+ * (the raw pairing_id, a short-lived secret capability) is absent from
+ * storage. Verified in constant time. No deployment-wide pepper secret exists.
+ */
+interface PairingRecord {
   verifier_sha256: string;
   created_at_ms: number;
   expires_at_ms: number;
+  attempts: number;
+  state: "pending" | "locked";
   name: string | null;
+}
+
+async function pairingStorageKey(pairingId: string): Promise<string> {
+  return PAIRING_PREFIX + await sha256Hex(pairingId);
+}
+
+/** HMAC-SHA256(key = raw pairing_id, message = worker_context || ":" || code). */
+async function pairingVerifier(pairingId: string, code: string, workerContext: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(pairingId),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const mac = await crypto.subtle.sign("HMAC", key, enc.encode(`${workerContext}:${code}`));
+  return [...new Uint8Array(mac)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 interface DeviceCredentialRecord {
@@ -69,11 +100,11 @@ export class DeviceRegistryDO {
     if (request.method === "GET" && url.pathname === "/internal/devices") {
       return this.listDevices();
     }
-    if (request.method === "POST" && url.pathname === "/internal/devices/enrollments") {
-      return this.createEnrollment(request);
+    if (request.method === "POST" && url.pathname === "/internal/devices/pairings") {
+      return this.createPairing(request);
     }
-    if (request.method === "POST" && url.pathname === "/internal/devices/enrollments/consume") {
-      return this.consumeEnrollment(request);
+    if (request.method === "POST" && url.pathname === "/internal/devices/pairings/consume") {
+      return this.consumePairing(request);
     }
     if (request.method === "POST" && url.pathname === "/internal/devices/authenticate") {
       return this.authenticateDevice(request);
@@ -130,7 +161,7 @@ export class DeviceRegistryDO {
     return json({ ok: true, device: parsed });
   }
 
-  private async createEnrollment(request: Request): Promise<Response> {
+  private async createPairing(request: Request): Promise<Response> {
     let body: unknown;
     try {
       body = await request.json();
@@ -138,63 +169,91 @@ export class DeviceRegistryDO {
       return json({ ok: false, code: "bad_request" }, 400);
     }
     if (!isRecord(body)) return json({ ok: false, code: "bad_request" }, 400);
-    const ttlMs = normalizeEnrollmentTtlMs(body.ttl_seconds);
-    if (ttlMs === null) return json({ ok: false, code: "invalid_enrollment_ttl" }, 400);
+    const ttlMs = normalizePairingTtlMs(body.ttl_seconds);
+    if (ttlMs === null) return json({ ok: false, code: "invalid_pairing_ttl" }, 400);
     const name = normalizeOptionalName(body.name);
     if (body.name !== undefined && name === null) return json({ ok: false, code: "invalid_device_name" }, 400);
+    const workerContext = typeof body.worker_context === "string" && body.worker_context.length > 0 && body.worker_context.length <= 256
+      ? body.worker_context
+      : null;
+    if (workerContext === null) return json({ ok: false, code: "bad_request" }, 400);
 
-    const enrollmentCode = newEnrollmentCode();
-    const verifier = await sha256Hex(enrollmentCode);
+    const pairingId = newPairingId();
+    const code = newPairingCode();
     const now = Date.now();
-    const record: EnrollmentRecord = {
+    const verifier = await pairingVerifier(pairingId, code, workerContext);
+    const record: PairingRecord = {
       verifier_sha256: verifier,
       created_at_ms: now,
       expires_at_ms: now + ttlMs,
+      attempts: 0,
+      state: "pending",
       name,
     };
-    await this.state.storage.put(ENROLLMENT_PREFIX + verifier, record);
-    return json({ ok: true, enrollment_code: enrollmentCode, expires_at_ms: record.expires_at_ms });
+
+    // At most one active unconsumed pairing session per Worker: creating a new
+    // session atomically invalidates (replaces) any prior one, so the owner
+    // never has to wait out an abandoned session. The DO transaction is the
+    // serialization point; a concurrent consume either sees the old or the new
+    // record, never both.
+    const stored = await this.state.storage.transaction(async (tx) => {
+      const prior = await tx.list({ prefix: PAIRING_PREFIX });
+      for (const key of prior.keys()) await tx.delete(key);
+      const key = await pairingStorageKey(pairingId);
+      await tx.put(key, record);
+      return key;
+    });
+    void stored;
+    // Raw pairing_id and code are returned exactly once and never stored or logged.
+    return json({ ok: true, pairing_id: pairingId, code, expires_at_ms: record.expires_at_ms });
   }
 
-  private async consumeEnrollment(request: Request): Promise<Response> {
+  private async consumePairing(request: Request): Promise<Response> {
     let body: unknown;
     try {
       body = await request.json();
     } catch {
       return json({ ok: false, code: "bad_request" }, 400);
     }
-    if (!isRecord(body) || !isEnrollmentCode(body.enrollment_code)) {
-      return json({ ok: false, code: "invalid_enrollment" }, 401);
+    if (!isRecord(body)) return json({ ok: false, code: "bad_request" }, 400);
+    if (!isPairingId(body.pairing_id) || !isPairingCode(body.code)) {
+      return json({ ok: false, code: "invalid_pairing_request" }, 400);
     }
     const requestedName = normalizeOptionalName(body.name);
     if (body.name !== undefined && requestedName === null) return json({ ok: false, code: "invalid_device_name" }, 400);
+    const workerContext = typeof body.worker_context === "string" && body.worker_context.length > 0 && body.worker_context.length <= 256
+      ? body.worker_context
+      : null;
+    if (workerContext === null) return json({ ok: false, code: "bad_request" }, 400);
 
-    const verifier = await sha256Hex(body.enrollment_code);
+    const storageKey = await pairingStorageKey(body.pairing_id);
+    const expectedVerifier = await pairingVerifier(body.pairing_id, body.code, workerContext);
     const now = Date.now();
-    const deviceId = newDeviceId(now);
-    const workstationId = deviceId;
-    const credentialId = newCredentialId();
-    const deviceSecret = newDeviceSecret();
-    const credentialVerifier = await sha256Hex(deviceSecret);
 
+    // The DO transaction is the authoritative serialization point: concurrent
+    // consumes interleave only here, so exactly one ever sees the live record.
     const result = await this.state.storage.transaction(async (tx) => {
-      const enrollmentKey = ENROLLMENT_PREFIX + verifier;
-      const enrollment = await tx.get<EnrollmentRecord>(enrollmentKey);
-      if (!enrollment || !constantTimeEqual(enc.encode(enrollment.verifier_sha256), enc.encode(verifier))) {
-        return { ok: false as const, code: "invalid_enrollment" };
+      const record = await tx.get<PairingRecord>(storageKey);
+      if (!record) return { ok: false as const, code: "pairing_rejected" as const };
+      if (record.state === "locked") return { ok: false as const, code: "pairing_rejected" as const };
+      if (record.expires_at_ms <= now) {
+        await tx.delete(storageKey);
+        return { ok: false as const, code: "pairing_rejected" as const };
       }
-      if (enrollment.expires_at_ms <= now) {
-        await tx.delete(enrollmentKey);
-        return { ok: false as const, code: "enrollment_expired" };
-      }
-      if (await tx.get(WORKSTATION_PREFIX + workstationId)) {
-        return { ok: false as const, code: "registry_conflict" };
+      if (!constantTimeEqual(enc.encode(record.verifier_sha256), enc.encode(expectedVerifier))) {
+        const attempts = record.attempts + 1;
+        const locked = attempts >= MAX_PAIRING_ATTEMPTS;
+        await tx.put(storageKey, { ...record, attempts, state: locked ? "locked" : record.state });
+        return { ok: false as const, code: "pairing_rejected" as const };
       }
 
+      const deviceId = newDeviceId(now);
+      const credentialId = newCredentialId();
+      const deviceSecret = newDeviceSecret();
       const device: DeviceRecord = {
         device_id: deviceId,
-        workstation_id: workstationId,
-        name: enrollment.name ?? requestedName ?? deviceId,
+        workstation_id: deviceId,
+        name: record.name ?? requestedName ?? deviceId,
         authorization: "active",
         scheduling: "enabled",
         credential_id: credentialId,
@@ -205,27 +264,24 @@ export class DeviceRegistryDO {
       const credential: DeviceCredentialRecord = {
         credential_id: credentialId,
         device_id: deviceId,
-        workstation_id: workstationId,
-        verifier_sha256: credentialVerifier,
+        workstation_id: deviceId,
+        verifier_sha256: await sha256Hex(deviceSecret),
         created_at_ms: now,
       };
-      await tx.delete(enrollmentKey);
+      await tx.delete(storageKey);
       await tx.put(DEVICE_PREFIX + deviceId, device);
-      await tx.put(WORKSTATION_PREFIX + workstationId, deviceId);
+      await tx.put(WORKSTATION_PREFIX + deviceId, deviceId);
       await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
-      return { ok: true as const, device };
+      return { ok: true as const, device_id: deviceId, credential_id: credentialId, device_secret: deviceSecret };
     });
 
-    if (!result.ok) {
-      const status = result.code === "enrollment_expired" ? 410 : result.code === "invalid_enrollment" ? 401 : 409;
-      return json(result, status);
-    }
+    if (!result.ok) return json(result, 401);
     return json({
       ok: true,
-      device_id: result.device.device_id,
-      workstation_id: result.device.workstation_id,
-      credential_id: credentialId,
-      device_secret: deviceSecret,
+      device_id: result.device_id,
+      workstation_id: result.device_id,
+      credential_id: result.credential_id,
+      device_secret: result.device_secret,
     });
   }
 
@@ -319,11 +375,11 @@ export class DeviceRegistryDO {
   }
 }
 
-function normalizeEnrollmentTtlMs(value: unknown): number | null {
-  if (value === undefined) return DEFAULT_ENROLLMENT_TTL_MS;
+function normalizePairingTtlMs(value: unknown): number | null {
+  if (value === undefined) return DEFAULT_PAIRING_TTL_MS;
   if (typeof value !== "number" || !Number.isSafeInteger(value)) return null;
   const ttlMs = value * 1000;
-  return ttlMs >= MIN_ENROLLMENT_TTL_MS && ttlMs <= MAX_ENROLLMENT_TTL_MS ? ttlMs : null;
+  return ttlMs >= MIN_PAIRING_TTL_MS && ttlMs <= MAX_PAIRING_TTL_MS ? ttlMs : null;
 }
 
 function normalizeOptionalName(value: unknown): string | null {

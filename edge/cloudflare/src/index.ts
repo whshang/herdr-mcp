@@ -6,8 +6,8 @@
  *   GET  /health                          edge health (no DO involved)
  *   GET  /info                            route/stage table for debugging
  *   GET  /status/:workstationId           DO presence snapshot (dev-open)
- *   POST /devices/enrollments             owner-authenticated one-time enrollment creation
- *   POST /devices/enroll                   one-time enrollment consumption by a new device
+ *   POST /devices/pairings               owner-authenticated pairing session creation
+ *   POST /devices/pairings/consume       one-time pairing consumption by a new device
  *   GET  /ws/:workstationId               workstation link WSS upgrade (auth)
  *   POST /artifacts  GET|DELETE /artifacts/:id   private R2 generic artifact relay
  *   GET  /mcp  POST /mcp                  public MCP transport
@@ -40,8 +40,8 @@ import { OAuthStoreDO } from "./oauth-store-do.js";
 import { DeviceRegistryDO } from "./device-registry-do.js";
 import {
   authenticateDeviceCredential,
-  consumeDeviceEnrollment,
-  createDeviceEnrollment,
+  consumePairingSession,
+  createPairingSession,
   ensureLegacyDeviceRegistration,
   listPublicDevices,
   resolveDeviceRouteWithContext,
@@ -123,8 +123,8 @@ export default {
           { path: "/info", stage: "dev" },
           { path: "/ws/:workstationId", stage: "dev (WS upgrade, link auth)" },
           { path: "/status/:workstationId", stage: "dev (DO presence)" },
-          { path: "/devices/enrollments", stage: "owner-authenticated device enrollment creation" },
-          { path: "/devices/enroll", stage: "one-time device enrollment consumption" },
+          { path: "/devices/pairings", stage: "owner-authenticated device pairing creation" },
+          { path: "/devices/pairings/consume", stage: "one-time device pairing consumption" },
           { path: "/mcp", stage: `public MCP epoch-${identity.contractEpoch} + sessionless ChatGPT SSE` },
           { path: "/artifacts", stage: "private R2 generic artifact relay (auth + capability)" },
           { path: "/.well-known/mcp.json", stage: "public MCP discovery" },
@@ -156,39 +156,61 @@ export default {
       }, response.ok ? 200 : 503);
     }
 
-    // ---- Device enrollment control plane. Enrollment creation requires
-    // owner/operator auth; consumption requires only the high-entropy one-time
-    // code, so a second workstation never needs Cloudflare deploy credentials.
-    if (request.method === "POST" && url.pathname === "/devices/enrollments") {
-      const ownerAuth = await authenticateEnrollmentCreator(request, env);
-      if (!ownerAuth) return noStoreJsonResponse({ ok: false, code: "enrollment_admin_required" }, 401);
+    // ---- Device pairing control plane. Pairing creation requires
+    // owner/operator auth; consumption requires only the raw pairing_id plus
+    // the six-digit code, so a second workstation never needs Cloudflare
+    // deploy credentials. Raw pairing material is returned once and never
+    // stored or logged; the DO keeps only digest-keyed, HMAC-bound verifiers.
+    // The six-digit code NEVER travels in a URL/URI/query — consumption is
+    // JSON-body-only; only the pairing_id may appear in a descriptor/fragment.
+    if (request.method === "POST" && url.pathname === "/devices/pairings") {
+      const ownerAuth = await authenticatePairingCreator(request, env);
+      if (!ownerAuth) return noStoreJsonResponse({ ok: false, code: "pairing_admin_required" }, 401);
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value)) {
         const code = parsed.ok ? "bad_request" : parsed.code;
         return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
       }
-      const input: { ttl_seconds?: number; name?: string } = {};
+      const input: { ttl_seconds?: number; name?: string; worker_context: string } = {
+        worker_context: pairingWorkerContext(env),
+      };
       if (parsed.value.ttl_seconds !== undefined) input.ttl_seconds = parsed.value.ttl_seconds as number;
       if (parsed.value.name !== undefined) input.name = parsed.value.name as string;
       const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
-      const result = await createDeviceEnrollment(registry, input);
+      const result = await createPairingSession(registry, input);
       return result.ok
-        ? noStoreJsonResponse({ ok: true, ...result.enrollment })
+        ? noStoreJsonResponse({
+            ok: true,
+            pairing_id: result.pairing.pairing_id,
+            code: result.pairing.code,
+            expires_at_ms: result.pairing.expires_at_ms,
+            worker_origin: url.origin,
+          })
         : noStoreJsonResponse({ ok: false, code: result.code }, result.status);
     }
 
-    if (request.method === "POST" && url.pathname === "/devices/enroll") {
+    if (request.method === "POST" && url.pathname === "/devices/pairings/consume") {
       const parsed = await readBodyBounded(request, 8 * 1024);
-      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.enrollment_code !== "string") {
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.pairing_id !== "string" || typeof parsed.value.code !== "string") {
         const code = parsed.ok ? "bad_request" : parsed.code;
         return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
       }
-      const input: { enrollment_code: string; name?: string } = { enrollment_code: parsed.value.enrollment_code };
+      const input: { pairing_id: string; code: string; name?: string; worker_context: string } = {
+        pairing_id: parsed.value.pairing_id,
+        code: parsed.value.code,
+        worker_context: pairingWorkerContext(env),
+      };
       if (parsed.value.name !== undefined) input.name = parsed.value.name as string;
       const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
-      const result = await consumeDeviceEnrollment(registry, input);
+      const result = await consumePairingSession(registry, input);
       return result.ok
-        ? noStoreJsonResponse({ ok: true, ...result.enrollment })
+        ? noStoreJsonResponse({
+            ok: true,
+            device_id: result.credential.device_id,
+            workstation_id: result.credential.workstation_id,
+            credential_id: result.credential.credential_id,
+            device_secret: result.credential.device_secret,
+          })
         : noStoreJsonResponse({ ok: false, code: result.code }, result.status);
     }
 
@@ -492,7 +514,17 @@ async function authenticateEdgeMcpRequest(request: Request, env: Env) {
   });
 }
 
-async function authenticateEnrollmentCreator(request: Request, env: Env): Promise<boolean> {
+/**
+ * Stable per-deployment context binding for pairing verifiers. Create and
+ * consume requests must carry the same derived context, so a pairing minted by
+ * one Worker/deployment can never be consumed against another. Cross-Worker
+ * mismatches fail closed inside the registry DO.
+ */
+function pairingWorkerContext(env: Env): string {
+  return `${env.EDGE_PROJECT ?? "herdr-edge"}@${env.EDGE_ENV ?? "dev"}`;
+}
+
+async function authenticatePairingCreator(request: Request, env: Env): Promise<boolean> {
   const owner = await authenticateEdgeMcpRequest(request, env);
   if (owner.ok) return true;
 

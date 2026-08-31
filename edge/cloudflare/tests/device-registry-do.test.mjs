@@ -117,66 +117,67 @@ test("legacy workstation registration creates one stable device and does not rew
   assert.equal(storage.writeCount, writesAfterFirst);
 });
 
-test("device enrollment stores only verifiers, is single-use, and authenticates only its bound workstation", async () => {
+test("device pairing stores only digest-keyed verifiers, is single-use, and authenticates only its bound workstation", async () => {
   const { storage, registry } = makeRegistry();
-  const create = await registry.fetch(new Request("https://registry.internal/internal/devices/enrollments", {
+  const create = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ttl_seconds: 60, name: "macbook-secondary" }),
+    body: JSON.stringify({ ttl_seconds: 60, name: "macbook-secondary", worker_context: "herdr-edge@test" }),
   }));
   assert.equal(create.status, 200);
   const created = await create.json();
-  assert.match(created.enrollment_code, /^enroll_[0-9a-f]{64}$/);
-  assert.equal(JSON.stringify([...storage.map]).includes(created.enrollment_code), false);
+  assert.match(created.pairing_id, /^pair_[0-9a-f]{64}$/);
+  assert.match(created.code, /^[0-9]{6}$/);
+  assert.equal(JSON.stringify([...storage.map]).includes(created.pairing_id), false);
+  assert.equal(JSON.stringify([...storage.map]).includes(created.code), false);
 
-  const consumeRequest = () => new Request("https://registry.internal/internal/devices/enrollments/consume", {
+  const consumeRequest = () => new Request("https://registry.internal/internal/devices/pairings/consume", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ enrollment_code: created.enrollment_code }),
+    body: JSON.stringify({ pairing_id: created.pairing_id, code: created.code, worker_context: "herdr-edge@test" }),
   });
   const consume = await registry.fetch(consumeRequest());
   assert.equal(consume.status, 200);
-  const enrolled = await consume.json();
-  assert.match(enrolled.device_id, /^dev_[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
-  assert.equal(enrolled.workstation_id, enrolled.device_id);
-  assert.match(enrolled.credential_id, /^cred_[0-9a-f]{32}$/);
-  assert.match(enrolled.device_secret, /^devsec_[0-9a-f]{64}$/);
-  assert.equal(JSON.stringify([...storage.map]).includes(enrolled.device_secret), false);
+  const paired = await consume.json();
+  assert.match(paired.device_id, /^dev_[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+  assert.equal(paired.workstation_id, paired.device_id);
+  assert.match(paired.credential_id, /^cred_[0-9a-f]{32}$/);
+  assert.match(paired.device_secret, /^devsec_[0-9a-f]{64}$/);
+  assert.equal(JSON.stringify([...storage.map]).includes(paired.device_secret), false);
 
-  const verifier = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(enrolled.device_secret));
+  const verifier = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(paired.device_secret));
   const verifierHex = [...new Uint8Array(verifier)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   const auth = await registry.fetch(new Request("https://registry.internal/internal/devices/authenticate", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ workstation_id: enrolled.workstation_id, credential_verifier_sha256: verifierHex }),
+    body: JSON.stringify({ workstation_id: paired.workstation_id, credential_verifier_sha256: verifierHex }),
   }));
   assert.equal(auth.status, 200);
-  assert.equal((await auth.json()).device_id, enrolled.device_id);
+  assert.equal((await auth.json()).device_id, paired.device_id);
 
   const replay = await registry.fetch(consumeRequest());
   assert.equal(replay.status, 401);
-  assert.equal((await replay.json()).code, "invalid_enrollment");
+  assert.equal((await replay.json()).code, "pairing_rejected");
 });
 
-test("expired enrollment is rejected and deleted", async () => {
+test("expired pairing is rejected generically and deleted", async () => {
   const { storage, registry } = makeRegistry();
-  const create = await registry.fetch(new Request("https://registry.internal/internal/devices/enrollments", {
+  const create = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ttl_seconds: 60 }),
+    body: JSON.stringify({ ttl_seconds: 60, worker_context: "herdr-edge@test" }),
   }));
   const created = await create.json();
-  const enrollmentEntry = [...storage.map.entries()].find(([key]) => key.startsWith("enrollment:"));
-  assert.ok(enrollmentEntry);
-  enrollmentEntry[1].expires_at_ms = Date.now() - 1;
-  storage.map.set(enrollmentEntry[0], enrollmentEntry[1]);
+  const pairingEntry = [...storage.map.entries()].find(([key]) => key.startsWith("pairing:"));
+  assert.ok(pairingEntry);
+  storage.map.set(pairingEntry[0], { ...pairingEntry[1], expires_at_ms: Date.now() - 1 });
 
-  const consume = await registry.fetch(new Request("https://registry.internal/internal/devices/enrollments/consume", {
+  const consume = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings/consume", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ enrollment_code: created.enrollment_code }),
+    body: JSON.stringify({ pairing_id: created.pairing_id, code: created.code, worker_context: "herdr-edge@test" }),
   }));
-  assert.equal(consume.status, 410);
-  assert.equal((await consume.json()).code, "enrollment_expired");
-  assert.equal(storage.map.has(enrollmentEntry[0]), false);
+  assert.equal(consume.status, 401);
+  assert.equal((await consume.json()).code, "pairing_rejected");
+  assert.equal(storage.map.has(pairingEntry[0]), false);
 });

@@ -15,9 +15,12 @@
 export type LogLevel = "info" | "warn" | "error";
 
 const SENSITIVE_KEY_PATTERN =
-  /(authorization|bearer|token|secret|password|passwd|credential|cookie|api[_-]?key|session|enrollment)/i;
+  /(authorization|bearer|token|secret|password|passwd|credential|cookie|api[_-]?key|session|enrollment|pairing)/i;
 
 const FORBIDDEN_VALUE_KEYS = /(body|args|arguments|prompt|result|output|content|file|data|message)/i;
+
+/** A bare six-digit `code` value is a pairing code; error codes are strings. */
+const SIX_DIGIT_CODE = /^[0-9]{6}$/;
 
 /** Redact key names that look sensitive; drop payload-shaped values. */
 export function sanitize(value: unknown): unknown {
@@ -26,6 +29,8 @@ export function sanitize(value: unknown): unknown {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       if (SENSITIVE_KEY_PATTERN.test(k)) {
+        out[k] = "[redacted]";
+      } else if (k === "code" && typeof v === "string" && SIX_DIGIT_CODE.test(v)) {
         out[k] = "[redacted]";
       } else if (FORBIDDEN_VALUE_KEYS.test(k)) {
         out[k] = "[omitted]";

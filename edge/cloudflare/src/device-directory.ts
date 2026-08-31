@@ -5,12 +5,13 @@ interface FetchStub {
   fetch(request: Request): Promise<Response>;
 }
 
-export interface DeviceEnrollment {
-  enrollment_code: string;
+export interface PairingSession {
+  pairing_id: string;
+  code: string;
   expires_at_ms: number;
 }
 
-export interface EnrolledDeviceCredential {
+export interface PairedDeviceCredential {
   device_id: string;
   workstation_id: string;
   credential_id: string;
@@ -30,11 +31,11 @@ export type DeviceCredentialAuthResult =
   | { ok: true; device_id: string; credential_id: string }
   | { ok: false; code: DeviceCredentialAuthCode };
 
-export async function createDeviceEnrollment(
+export async function createPairingSession(
   registry: FetchStub,
-  input: { ttl_seconds?: number; name?: string },
-): Promise<{ ok: true; enrollment: DeviceEnrollment } | { ok: false; code: string; status: number }> {
-  const response = await registry.fetch(new Request("https://registry.internal/internal/devices/enrollments", {
+  input: { ttl_seconds?: number; name?: string; worker_context: string },
+): Promise<{ ok: true; pairing: PairingSession } | { ok: false; code: string; status: number }> {
+  const response = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(input),
@@ -43,21 +44,24 @@ export async function createDeviceEnrollment(
   if (!response.ok) {
     return {
       ok: false,
-      code: isRecord(body) && typeof body.code === "string" ? body.code : "enrollment_create_failed",
+      code: isRecord(body) && typeof body.code === "string" ? body.code : "pairing_create_failed",
       status: response.status,
     };
   }
-  if (!isRecord(body) || body.ok !== true || typeof body.enrollment_code !== "string" || typeof body.expires_at_ms !== "number") {
+  if (!isRecord(body) || body.ok !== true || typeof body.pairing_id !== "string" || typeof body.code !== "string" || typeof body.expires_at_ms !== "number") {
     return { ok: false, code: "invalid_registry_response", status: 503 };
   }
-  return { ok: true, enrollment: { enrollment_code: body.enrollment_code, expires_at_ms: body.expires_at_ms } };
+  return {
+    ok: true,
+    pairing: { pairing_id: body.pairing_id, code: body.code, expires_at_ms: body.expires_at_ms },
+  };
 }
 
-export async function consumeDeviceEnrollment(
+export async function consumePairingSession(
   registry: FetchStub,
-  input: { enrollment_code: string; name?: string },
-): Promise<{ ok: true; enrollment: EnrolledDeviceCredential } | { ok: false; code: string; status: number }> {
-  const response = await registry.fetch(new Request("https://registry.internal/internal/devices/enrollments/consume", {
+  input: { pairing_id: string; code: string; name?: string; worker_context: string },
+): Promise<{ ok: true; credential: PairedDeviceCredential } | { ok: false; code: string; status: number }> {
+  const response = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings/consume", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(input),
@@ -66,7 +70,7 @@ export async function consumeDeviceEnrollment(
   if (!response.ok) {
     return {
       ok: false,
-      code: isRecord(body) && typeof body.code === "string" ? body.code : "enrollment_failed",
+      code: isRecord(body) && typeof body.code === "string" ? body.code : "pairing_rejected",
       status: response.status,
     };
   }
@@ -75,7 +79,7 @@ export async function consumeDeviceEnrollment(
   }
   return {
     ok: true,
-    enrollment: {
+    credential: {
       device_id: body.device_id,
       workstation_id: body.workstation_id,
       credential_id: body.credential_id,
