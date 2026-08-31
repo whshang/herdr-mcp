@@ -36,6 +36,8 @@ use super::ownership::{
 #[cfg(target_os = "macos")]
 const ACTIVE_WAIT_BUDGET: Duration = Duration::from_secs(8);
 #[cfg(target_os = "macos")]
+const ACTIVE_RECONCILE_ATTEMPTS: usize = 2;
+#[cfg(target_os = "macos")]
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Reconcile production Link generation state after a successful service
@@ -90,7 +92,23 @@ pub(crate) fn reconcile_after_service_generation_change(
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| paths.config_dir.join("runtime-status-prod.json"));
-        wait_for_active_generation(&status_path, &generation)
+        let wait_slice = ACTIVE_WAIT_BUDGET / ACTIVE_RECONCILE_ATTEMPTS as u32;
+        let mut last_error = None;
+        for attempt in 0..ACTIVE_RECONCILE_ATTEMPTS {
+            if attempt > 0 {
+                // Bootstrap compatibility: an already-running pre-fix Link may have
+                // consumed the first revision while the single-port runtime was
+                // restarting. If status is still stale, bump a fresh desired-state
+                // revision without restarting Link so it gets one bounded retry.
+                reconcile_current_generation(&home, &paths.config_dir)?;
+            }
+            match wait_for_active_generation(&status_path, &generation, wait_slice) {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| format!("production Link did not activate generation {generation}")))
     }
 }
 
@@ -174,18 +192,22 @@ fn refresh_prod_plist_generation(
 }
 
 #[cfg(target_os = "macos")]
-fn wait_for_active_generation(status_path: &Path, generation: &str) -> Result<(), String> {
+fn wait_for_active_generation(
+    status_path: &Path,
+    generation: &str,
+    budget: Duration,
+) -> Result<(), String> {
     let started = Instant::now();
     loop {
         if read_status_active_generation(status_path).as_deref() == Some(generation) {
             return Ok(());
         }
-        if started.elapsed() >= ACTIVE_WAIT_BUDGET {
+        if started.elapsed() >= budget {
             let observed =
                 read_status_active_generation(status_path).unwrap_or_else(|| "missing".to_owned());
             return Err(format!(
                 "production Link did not activate generation {generation} within {}ms; observed={observed} status={}",
-                ACTIVE_WAIT_BUDGET.as_millis(),
+                budget.as_millis(),
                 status_path.display()
             ));
         }
