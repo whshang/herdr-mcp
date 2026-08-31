@@ -22,9 +22,10 @@ const i18nDocsDir = join(rootPath, "docs", "i18n");
 const outDir = join(rootPath, "site-dist");
 
 const origin = (process.env[SITE_ORIGIN_ENV] || DEFAULT_ORIGIN).replace(/\/+$/, "");
-// package.json is build-tooling metadata, not the user-facing Runtime Release
-// version. Keep the docs badge/release.json aligned with the authoritative Rust
-// runtime version defined by crates/herdr-mcp/Cargo.toml.
+// package.json is build-tooling metadata whose version intentionally mirrors the
+// Runtime package identity. Keep the docs badge/release.json sourced from the
+// authoritative Rust runtime version defined by crates/herdr-mcp/Cargo.toml so
+// site generation cannot silently switch authorities later.
 const pkg = JSON.parse(await readFile(join(rootPath, "package.json"), "utf8"));
 const cargoManifest = await readFile(join(rootPath, "crates", "herdr-mcp", "Cargo.toml"), "utf8");
 const runtimeVersion = parseCargoPackageVersion(cargoManifest);

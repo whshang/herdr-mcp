@@ -334,7 +334,9 @@ test("release.json, skill artifact and design invariants are preserved", async (
   const runtimeVersion = cargoManifest.match(/(?:^|\n)\[package\]\s*\n([\s\S]*?)(?=\n\[|$)/)?.[1]?.match(/^\s*version\s*=\s*"([^"]+)"\s*$/m)?.[1];
   assert.ok(runtimeVersion, "Rust runtime package version must be readable");
   assert.equal(release.version, runtimeVersion);
-  assert.notEqual(release.version, pkg.version, "site runtime version must not silently fall back to the Node build-tooling version");
+  assert.equal(pkg.version, runtimeVersion, "Node package metadata and Rust runtime package identity must stay aligned");
+  const siteBuilder = await readFile(join(ROOT, "scripts", "build-site.mjs"), "utf8");
+  assert.match(siteBuilder, /const runtimeVersion = parseCargoPackageVersion\(cargoManifest\);/, "site runtime version must remain sourced from Cargo.toml even when package versions are aligned");
   assert.equal(release.commit, "site-build-test");
   assert.equal(release.docs, "./docs/");
   assert.equal(release.skill, "./herdr-mcp-SKILL.md");
