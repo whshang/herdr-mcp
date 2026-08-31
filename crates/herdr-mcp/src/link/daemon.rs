@@ -256,6 +256,7 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
         link_token: config.link_token.clone(),
         socket: Default::default(),
         drain_ms: DAEMON_DRAIN_MS,
+        offline_recycle_ms: super::io_loop::LINK_DEFAULT_OFFLINE_RECYCLE_MS,
         now_ms: Arc::new(system_now_ms),
         rng_sample: Arc::new(system_rng_sample),
     };
@@ -573,6 +574,7 @@ mod tests {
                 link_token: cfg.link_token,
                 socket: Default::default(),
                 drain_ms: DAEMON_DRAIN_MS,
+                offline_recycle_ms: crate::link::io_loop::LINK_DEFAULT_OFFLINE_RECYCLE_MS,
                 now_ms: Arc::new(|| 0),
                 rng_sample: Arc::new(|| 0.0),
             },

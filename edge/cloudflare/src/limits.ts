@@ -33,6 +33,8 @@ export const MAX_REQUEST_TIMEOUT_MS = 60_000;
 
 /** Link presence: after this long with no hello/heartbeat the link is stale. */
 export const DEFAULT_LINK_STALE_AFTER_MS = 45_000;
+/** Brief request-side grace for a workstation that was connected moments ago. */
+export const DEFAULT_LINK_RECONNECT_GRACE_MS = 2_000;
 
 /**
  * Persist `last_seen` only as a low-frequency recovery checkpoint. Live
@@ -121,6 +123,7 @@ export interface EdgeLimits {
   completedRecordTtlMs: number;
   requestTimeoutMs: number;
   linkStaleAfterMs: number;
+  linkReconnectGraceMs: number;
   maxFrameBytes: number;
 }
 
@@ -139,6 +142,7 @@ export function makeLimits(env?: {
   EDGE_MAX_FRAME_BYTES?: string;
   DEFAULT_REQUEST_TIMEOUT_MS?: string;
   LINK_STALE_AFTER_MS?: string;
+  LINK_RECONNECT_GRACE_MS?: string;
 }): EdgeLimits {
   const requestTimeoutMs = Math.min(
     Math.max(
@@ -153,6 +157,7 @@ export function makeLimits(env?: {
     completedRecordTtlMs: DEFAULT_COMPLETED_RECORD_TTL_MS,
     requestTimeoutMs,
     linkStaleAfterMs: parsePositiveInt(env?.LINK_STALE_AFTER_MS, DEFAULT_LINK_STALE_AFTER_MS),
+    linkReconnectGraceMs: parsePositiveInt(env?.LINK_RECONNECT_GRACE_MS, DEFAULT_LINK_RECONNECT_GRACE_MS),
     maxFrameBytes: parsePositiveInt(env?.EDGE_MAX_FRAME_BYTES, DEFAULT_MAX_FRAME_BYTES),
   };
 }
