@@ -7,6 +7,7 @@ import type { RelayErrorResult } from "./errors.js";
 import { classifyOp, type EdgeLimits } from "./limits.js";
 import { checkArgsBudget } from "./payload.js";
 import { newRequestId } from "./pending.js";
+import type { DeviceRouteResult } from "./device-directory.js";
 import type { InternalForwardRequest } from "./workstation-do.js";
 import {
   isChatgptOAuthClientId,
@@ -49,6 +50,7 @@ export interface McpDeps {
   forward(stub: unknown, body: string): Promise<Response>;
   getStub(workstationId: string): unknown;
   listDevices?(): Promise<unknown>;
+  resolveDevice?(selector: string | undefined): Promise<DeviceRouteResult>;
   logger: { warn(event: string, fields?: Record<string, unknown>): void };
   now?: () => number;
   client?: McpClientContext;
@@ -260,18 +262,45 @@ export async function handleMcp(
       }
     }
 
+    const selectorValue = args.device;
+    if (selectorValue !== undefined && typeof selectorValue !== "string") {
+      return rpcError(id, -32602, "Invalid params", { reason: "device must be a string" });
+    }
+    let route: DeviceRouteResult;
+    try {
+      route = deps.resolveDevice
+        ? await deps.resolveDevice(selectorValue)
+        : {
+            ok: true,
+            device_id: null,
+            workstation_id: workstationId,
+            routing_reason: "legacy_default_device",
+          };
+    } catch {
+      return rpcResult(
+        id,
+        callToolResult({ ok: false, code: "device_registry_unavailable", retryable: true }, true),
+      );
+    }
+    if (!route.ok) {
+      return rpcResult(id, callToolResult({ ok: false, code: route.code, retryable: false }, true));
+    }
+
+    const runtimeArgs = { ...args };
+    delete runtimeArgs.device;
+
     const now = deps.now?.() ?? Date.now();
     const requestId = newRequestId();
     const idempotencyKey =
-      typeof args.idempotency_key === "string" && args.idempotency_key.length > 0
-        ? args.idempotency_key
+      typeof runtimeArgs.idempotency_key === "string" && runtimeArgs.idempotency_key.length > 0
+        ? runtimeArgs.idempotency_key
         : undefined;
     const internal: InternalForwardRequest = {
       kind: "request",
       requestId,
       op: name,
       opClass: classifyOp(name),
-      args,
+      args: runtimeArgs,
       deadlineMs: now + deps.limits.requestTimeoutMs,
       contractEpoch: RUNTIME_EXECUTION_CONTRACT.contract_epoch,
       contractHash: RUNTIME_EXECUTION_CONTRACT.contract_hash,
@@ -280,14 +309,16 @@ export async function handleMcp(
 
     deps.logger.warn("mcp.tools_call.forward", {
       requestId,
-      workstationId,
+      workstationId: route.workstation_id,
+      deviceId: route.device_id,
+      routingReason: route.routing_reason,
       op: name,
       opClass: internal.opClass,
     });
 
     let response: Response;
     try {
-      response = await deps.forward(deps.getStub(workstationId), JSON.stringify(internal));
+      response = await deps.forward(deps.getStub(route.workstation_id), JSON.stringify(internal));
     } catch (error) {
       return rpcResult(
         id,
@@ -299,7 +330,7 @@ export async function handleMcp(
             delivery_state: "not_delivered",
             message: String(error),
             request_id: requestId,
-            workstation_id: workstationId,
+            workstation_id: route.workstation_id,
           },
           true,
         ),
@@ -319,7 +350,7 @@ export async function handleMcp(
             retryable: false,
             delivery_state: "delivery_unknown",
             request_id: requestId,
-            workstation_id: workstationId,
+            workstation_id: route.workstation_id,
           },
           true,
         ),
@@ -330,10 +361,10 @@ export async function handleMcp(
       return rpcResult(id, normalizeSuccessfulToolResult(forwarded.completion.result));
     }
     if (forwarded.status === "ok" && forwarded.completion?.status === "error") {
-      return rpcResult(id, relayErrorToolResult(forwarded.completion.error, requestId, workstationId));
+      return rpcResult(id, relayErrorToolResult(forwarded.completion.error, requestId, route.workstation_id));
     }
     if (forwarded.status === "error" && forwarded.error) {
-      return rpcResult(id, relayErrorToolResult(forwarded.error, requestId, workstationId));
+      return rpcResult(id, relayErrorToolResult(forwarded.error, requestId, route.workstation_id));
     }
     return rpcResult(
       id,
@@ -344,7 +375,7 @@ export async function handleMcp(
           retryable: false,
           delivery_state: "delivery_unknown",
           request_id: requestId,
-          workstation_id: workstationId,
+          workstation_id: route.workstation_id,
         },
         true,
       ),

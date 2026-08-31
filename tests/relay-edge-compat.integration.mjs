@@ -109,6 +109,10 @@ test("public epoch 3 evolves independently while runtime execution stays epoch 2
   assert.equal(PUBLIC_CONTRACT.tool_count, 19);
   assert.equal(PUBLIC_CONTRACT.tools.some((tool) => tool.name === "herdr_devices"), true);
   assert.equal(computeContractHash(PUBLIC_CONTRACT.tools), PUBLIC_CONTRACT.contract_hash);
+  const publicInspect = PUBLIC_CONTRACT.tools.find((tool) => tool.name === "herdr_inspect");
+  const runtimeInspect = EPOCH2_CONTRACT.tools.find((tool) => tool.name === "herdr_inspect");
+  assert.equal(publicInspect.inputSchema.properties.device.type, "string");
+  assert.equal(Object.hasOwn(runtimeInspect.inputSchema.properties, "device"), false);
   assert.equal(isCompatibleRuntimeContract(2, EPOCH2_CONTRACT.contract_hash), true);
   assert.equal(isCompatibleRuntimeContract(1, EPOCH1_CONTRACT.contract_hash), true);
   assert.equal(isCompatibleRuntimeContract(2, EPOCH1_CONTRACT.contract_hash), false);

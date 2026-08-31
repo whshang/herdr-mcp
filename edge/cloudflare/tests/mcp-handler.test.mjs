@@ -8,13 +8,19 @@ import { handleMcp } from "../dist/mcp-handler.js";
 
 function deps(over = {}) {
   const calls = [];
+  const targets = [];
   return {
     calls,
+    targets,
     value: {
       limits: makeLimits(),
       logger: { warn() {} },
-      getStub: (workstationId) => ({ workstationId }),
+      getStub: (workstationId) => {
+        targets.push(workstationId);
+        return { workstationId };
+      },
       listDevices: async () => over.devices ?? [],
+      resolveDevice: over.resolveDevice,
       forward: async (_stub, body) => {
         calls.push(JSON.parse(body));
         if (over.forward) return over.forward(_stub, body);
@@ -104,6 +110,46 @@ test("herdr_devices executes at Edge and never forwards to a workstation", async
   const r = await handleMcp(req(72, "tools/call", { name: "herdr_devices", arguments: {} }), "legacy-default", d.value);
   assert.equal(r.body.result.isError, undefined);
   assert.deepEqual(r.body.result.structuredContent, { ok: true, devices });
+  assert.equal(d.calls.length, 0);
+});
+
+test("explicit device routing selects one workstation and strips Edge-only device metadata", async () => {
+  let routeCalls = 0;
+  const d = deps({
+    resolveDevice: async (selector) => {
+      routeCalls += 1;
+      assert.equal(selector, DEVICE_A);
+      return {
+        ok: true,
+        device_id: DEVICE_A,
+        workstation_id: "prod-real-runtime",
+        routing_reason: "explicit_device",
+      };
+    },
+  });
+  const r = await handleMcp(
+    req(73, "tools/call", { name: "herdr_inspect", arguments: { device: DEVICE_A } }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(r.body.result.isError, undefined);
+  assert.equal(routeCalls, 1);
+  assert.deepEqual(d.targets, ["prod-real-runtime"]);
+  assert.equal(Object.hasOwn(d.calls[0].args, "device"), false);
+  assert.equal(d.calls[0].contractEpoch, EPOCH2_CONTRACT.contract_epoch);
+  assert.equal(d.calls[0].contractHash, EPOCH2_CONTRACT.contract_hash);
+});
+
+test("ambiguous device routing fails closed before workstation delivery", async () => {
+  const d = deps({ resolveDevice: async () => ({ ok: false, code: "device_ambiguous" }) });
+  const r = await handleMcp(
+    req(74, "tools/call", { name: "herdr_prompt", arguments: { target: "w1:p1", text: "test" } }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(r.body.result.isError, true);
+  assert.equal(r.body.result.structuredContent.code, "device_ambiguous");
+  assert.equal(d.targets.length, 0);
   assert.equal(d.calls.length, 0);
 });
 

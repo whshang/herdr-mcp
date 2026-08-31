@@ -31,7 +31,11 @@ import { createLogger } from "./logger.js";
 import { WorkstationDO } from "./workstation-do.js";
 import { OAuthStoreDO } from "./oauth-store-do.js";
 import { DeviceRegistryDO } from "./device-registry-do.js";
-import { ensureLegacyDeviceRegistration, listPublicDevices } from "./device-directory.js";
+import {
+  ensureLegacyDeviceRegistration,
+  listPublicDevices,
+  resolveDeviceRoute,
+} from "./device-directory.js";
 import { authenticateMcpRequest } from "./oauth-mcp-auth.js";
 import { createOAuthIdentity } from "./oauth-edge.js";
 import { createOAuthPublicStore, handleOAuthPublic } from "./oauth-public.js";
@@ -246,6 +250,10 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
           registry,
           (id) => env.WORKSTATION_DO.get(env.WORKSTATION_DO.idFromName(id)),
         );
+      },
+      resolveDevice: async (selector) => {
+        const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+        return resolveDeviceRoute(registry, selector, workstationId);
       },
       logger,
     });

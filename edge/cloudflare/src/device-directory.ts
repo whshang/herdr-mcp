@@ -1,4 +1,4 @@
-import type { DeviceRecord } from "./device-model.js";
+import { isRoutableDevice, normalizeDeviceId, type DeviceRecord } from "./device-model.js";
 
 interface FetchStub {
   fetch(request: Request): Promise<Response>;
@@ -39,6 +39,18 @@ interface RegistryEnvelope {
   devices?: DeviceRecord[];
 }
 
+export type DeviceRouteResult =
+  | {
+      ok: true;
+      device_id: string | null;
+      workstation_id: string;
+      routing_reason: "explicit_device" | "single_available_device" | "legacy_default_device";
+    }
+  | {
+      ok: false;
+      code: "device_not_found" | "device_ambiguous" | "device_paused" | "device_suspended" | "device_revoked" | "device_unavailable";
+    };
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -64,18 +76,75 @@ function nonNegativeInteger(value: unknown): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
-export async function listPublicDevices(
-  registry: FetchStub,
-  getWorkstationStub: (workstationId: string) => FetchStub,
-): Promise<PublicDeviceSummary[]> {
+async function readRegistryDevices(registry: FetchStub): Promise<DeviceRecord[]> {
   const response = await registry.fetch(new Request("https://registry.internal/internal/devices"));
   if (!response.ok) throw new Error(`device registry returned HTTP ${response.status}`);
   const envelope = await response.json() as RegistryEnvelope;
   if (envelope.ok !== true || !Array.isArray(envelope.devices)) {
     throw new Error("device registry returned an invalid device list");
   }
+  return envelope.devices;
+}
 
-  return Promise.all(envelope.devices.map(async (device) => {
+function unavailableReason(device: DeviceRecord): DeviceRouteResult {
+  if (device.authorization === "revoked") return { ok: false, code: "device_revoked" };
+  if (device.authorization === "suspended") return { ok: false, code: "device_suspended" };
+  if (device.scheduling !== "enabled") return { ok: false, code: "device_paused" };
+  return { ok: false, code: "device_unavailable" };
+}
+
+export async function resolveDeviceRoute(
+  registry: FetchStub,
+  selector: string | undefined,
+  legacyWorkstationId: string,
+): Promise<DeviceRouteResult> {
+  const devices = await readRegistryDevices(registry);
+
+  if (selector !== undefined) {
+    const trimmed = selector.trim();
+    if (trimmed.length === 0) return { ok: false, code: "device_not_found" };
+    const canonicalId = normalizeDeviceId(trimmed);
+    const matches = canonicalId
+      ? devices.filter((device) => device.device_id === canonicalId)
+      : devices.filter((device) => device.name === trimmed);
+    if (matches.length === 0) return { ok: false, code: "device_not_found" };
+    if (matches.length > 1) return { ok: false, code: "device_ambiguous" };
+    const selected = matches[0];
+    if (!isRoutableDevice(selected)) return unavailableReason(selected);
+    return {
+      ok: true,
+      device_id: selected.device_id,
+      workstation_id: selected.workstation_id,
+      routing_reason: "explicit_device",
+    };
+  }
+
+  const routable = devices.filter(isRoutableDevice);
+  if (routable.length === 1) {
+    return {
+      ok: true,
+      device_id: routable[0].device_id,
+      workstation_id: routable[0].workstation_id,
+      routing_reason: "single_available_device",
+    };
+  }
+  if (routable.length > 1) return { ok: false, code: "device_ambiguous" };
+  if (devices.length === 1) return unavailableReason(devices[0]);
+  if (devices.length > 1) return { ok: false, code: "device_unavailable" };
+  return {
+    ok: true,
+    device_id: null,
+    workstation_id: legacyWorkstationId,
+    routing_reason: "legacy_default_device",
+  };
+}
+
+export async function listPublicDevices(
+  registry: FetchStub,
+  getWorkstationStub: (workstationId: string) => FetchStub,
+): Promise<PublicDeviceSummary[]> {
+  const devices = await readRegistryDevices(registry);
+  return Promise.all(devices.map(async (device) => {
     const status = await readStatus(getWorkstationStub(device.workstation_id));
     return {
       device_id: device.device_id,
