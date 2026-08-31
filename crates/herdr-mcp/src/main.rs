@@ -28,6 +28,7 @@ mod inspect;
 mod instance;
 mod link;
 mod local_skills;
+mod macos_keychain;
 mod macos_permissions;
 mod macos_privacy;
 mod mcp;
@@ -66,6 +67,7 @@ mod updater_store;
 mod user_cli;
 mod utility_exec;
 mod web_artifact_cache;
+mod worker;
 mod workstation;
 
 use std::process::ExitCode;
@@ -188,6 +190,7 @@ fn run() -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        cli::Command::Worker(command) => worker::run(command),
         cli::Command::Dev(command) => dev::run(command),
         cli::Command::Candidate { port } => {
             eprintln!("{}", child_process::reap_confirmed_orphans_on_boot());

@@ -25,43 +25,29 @@ Protocol は Herdr / herdr-mcp install、Cloudflare Edge、Link、ChatGPT Connec
 
 ## 既存の Worker に新しいコンピュータを追加する（v0.4.3+）
 
-この経路は**v0.4.3+ 限定**です。現在の stable はまだ **v0.4.2** なので、通常インストールでは以下のコマンドは使えません。Agent は **fail closed** しなければなりません：インストール済み CLI が `herdr-mcp worker connect`（および enrollment コマンド）を提供しない場合は、停止してバージョン/能力 blocker を報告し、勝手に代替手段を作ってはいけません。
+この経路は**v0.4.3+ 限定**です。現在の stable はまだ **v0.4.2** なので、通常インストールでは以下のコマンドは使えません。Agent は **fail closed** しなければなりません：インストール済み CLI が `herdr-mcp worker pair` / `herdr-mcp worker connect` を提供しない場合は、停止してバージョン/能力 blocker を報告し、勝手に代替手段を作ってはいけません。
 
 これは**新規 Worker デプロイではありません**。「この新しいコンピュータを既存の Worker に接続して」と言われたら、Agent は Cloudflare Worker、Durable Object namespace、OAuth app/client、Connector を新規作成してはならず、旧来のグローバル `LINK_SHARED_SECRET` をコピーしてもいけません。既存の Worker に参加するだけです。
 
-### フェーズ A — すでに認可済みの既存 macOS コンピュータ上で
+### すでに認可済みの既存 macOS コンピュータ上で
 
-短寿命・単回使用・`0600` の enrollment ファイルを生成します：
+短寿命のペアリングセッションを開始します（デフォルト 10 分）：
 
 ```bash
-herdr-mcp worker enrollment create --ttl-seconds 600 --name "<new-device-name>" --output "<secure-path>"
+herdr-mcp worker pair
 ```
 
-- TTL 範囲は **60..900 秒**です。期限切れになったら新しいファイルを生成します。
-- ファイルを**安全に**新しいコンピュータへ転送します（例：AirDrop、暗号化チャネル）。enrollment code を chat、argv、logs、clipboard の指示、issue tracker、README の例に貼り付け/コピーしてはいけません。
+これにより**ペアリングアドレス**と**6 桁の検証コード**（`123 456` 形式）が表示されます。コードは意図された短寿命のペアリング資格情報で、10 分で期限切れになり、単回使用です。
 
-### フェーズ B — 新しいコンピュータ上の Coding Agent にこのプロンプトを貼り付ける
-
-以下は、**新しいコンピュータ上で動く** Coding Agent（Pi など）向けの、そのままコピーできる完全なプロンプトです。直接的・命令的で、Agent はそれを実行し、本当に必要な人間の認証や安全なファイル転送のときだけ停止します。
+### 新しいコンピュータ上で — Coding Agent にこのプロンプトを貼り付ける
 
 ```text
-あなたはこの macOS コンピュータを既存の herdr-mcp Cloudflare Worker/Connector に登録しています。これは新規デプロイではありません。
-
-1. まずリポジトリの権威ある Agent インストールプロトコル（docs/i18n/en/agent-install.md）を読み、その安全/前提条件/Release インストールのルールを引き継いでください。意図は**既存** Worker への登録なので、その新規 Cloudflare Worker/DO/OAuth/Connector デプロイの章は実行**しない**でください。Worker バインドについては、本項の既存 Worker 向け指示が優先されます。
-2. インストール前に、最新の stable Release のバージョン/能力を確認してください。stable がまだ <0.4.3 であるか、stable runtime に `worker connect` がない場合は、停止してリリース/能力 blocker を報告してください。ユーザーが明示的に preview/source をテストするよう求めた場合を除き、prerelease/source build をインストールしないでください。
-3. GitHub Release から最新の stable PROD herdr-mcp をインストールしてください。repo checkout からはインストールしないでください。source/dev build を通常インストールとして扱わないでください。インストール後にバージョン/能力を検証し、`herdr-mcp worker connect` を提供する v0.4.3+ を要求してください。インストール済み CLI が提供しない場合は、停止してバージョン/能力 blocker を報告してください。
-4. ユーザーが明示的に提供した enrollment ファイルパスを使ってください。ファイルシステムを広く検索して enrollment/secret ファイルを探さず、その内容を print/cat しないでください。
-5. この v0.4.3 の安全な enrollment 経路は macOS を要求します。Linux/Windows の場合は、この経路では unsupported/fail-closed として停止してください。
-6. enrollment ファイルの所有権/モードが安全（0600、現在のユーザー）であることを確認してから、次を実行してください：
-   herdr-mcp worker connect --enrollment-file "<path>" --name "<device-name>"
-   通常は --edge-origin を渡さないでください。ファイルは Worker にバインドされているためです。override を使う場合、それはファイルにバインドされた Worker origin と完全に一致しなければなりません。
-7. enrollment code や最終デバイスシークレットを argv/stdout/logs に決して置かないでください。最終デバイス資格情報は macOS Keychain に属します。
-8. 既存の Worker/Connector にのみ接続してください。プロトコルが enrollment が利用できないことを証明し、かつユーザーが明示的に新規 Worker を求めた場合を除き、Cloudflare をデプロイ/変更しないでください。それ以外は停止してください。
-9. `herdr-mcp status`、`herdr-mcp doctor`、`herdr-mcp link status` を検証してください。結果の不変な `device_id`、Link online/healthy、ローカルバインドの成功を確認してください。成功した connect は一回限りの enrollment ファイルを消費/削除します。
-10. いずれかの mutation が不確実な配信を報告したら、盲目的に再試行せず、まず現在の状態を調べてください。connect がサーバー側消費後に失敗した場合は、組み込みの補償/revoke 動作に頼り、手動のシークレット処理を発明せずに証拠を報告してください。
+Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/ja/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: <pairing-address>  Verification code: <code>
 ```
 
-両デバイスの enrollment が完了すると、同じ既存の ChatGPT Connector/Worker は multi-device の公開面を通じて両デバイスを確認できるはずです。これは v0.4.3 の期待される動作で、リリース/UAT 待ちです。正式な 2 デバイス GA/UAT はまだ通過していません。
+`<pairing-address>` と `<code>` を `herdr-mcp worker pair` が表示した値に置き換えてください。正規ドキュメントが、バージョン/能力チェック、Release からのインストール規則、macOS-only 境界、シークレット処理、検証、復旧をすべて担います。
+
+両デバイスのペアリングが完了すると、同じ既存の ChatGPT Connector/Worker は multi-device の公開面を通じて両デバイスを確認できるはずです。これは v0.4.3 の期待される動作で、リリース/UAT 待ちです。正式な 2 デバイス GA/UAT はまだ通過していません。
 
 ## 最初のテスト
 

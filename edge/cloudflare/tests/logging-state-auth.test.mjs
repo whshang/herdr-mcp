@@ -18,6 +18,7 @@ import {
   SharedSecretLinkAuthenticator,
   authenticateStaticMcpBearer,
   buildLinkAuthProtocol,
+  extractLinkCredential,
   hasLinkApplicationProtocol,
 } from "../dist/auth.js";
 import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
@@ -196,6 +197,35 @@ test("auth: fails closed when secret unset", () => {
   const auth = new SharedSecretLinkAuthenticator({});
   const req = { headers: { get: () => "Bearer x" } };
   assert.equal(auth.authenticate(req, "w1", 1).ok, false);
+});
+
+test("auth: credential extraction accepts exactly one bounded bearer or websocket secret", () => {
+  const bearer = { headers: { get: (name) => name.toLowerCase() === "authorization" ? "Bearer device-secret" : null } };
+  assert.deepEqual(extractLinkCredential(bearer), {
+    ok: true,
+    credential: "device-secret",
+    transport: "authorization",
+  });
+  const websocket = {
+    headers: {
+      get: (name) => name.toLowerCase() === "sec-websocket-protocol"
+        ? `herdr-link.v1, ${buildLinkAuthProtocol("device-secret")}`
+        : null,
+    },
+  };
+  assert.deepEqual(extractLinkCredential(websocket), {
+    ok: true,
+    credential: "device-secret",
+    transport: "websocket_protocol",
+  });
+  const multiple = {
+    headers: {
+      get: (name) => name.toLowerCase() === "sec-websocket-protocol"
+        ? `${buildLinkAuthProtocol("a")}, ${buildLinkAuthProtocol("b")}`
+        : null,
+    },
+  };
+  assert.equal(extractLinkCredential(multiple).ok, false);
 });
 
 test("auth: static MCP bearer is separate and fail-closed", () => {

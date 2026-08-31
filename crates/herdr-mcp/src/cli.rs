@@ -14,6 +14,7 @@ pub enum Command {
         probe: bool,
     },
     Config(ConfigCommand),
+    Worker(WorkerCommand),
     Dev(DevCommand),
     Candidate {
         port: u16,
@@ -74,6 +75,18 @@ pub enum ConfigCommand {
     Show,
     Init { edge_origin: Option<String> },
     SetEdgeOrigin { edge_origin: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkerCommand {
+    Pair {
+        ttl_seconds: u64,
+        name: Option<String>,
+    },
+    Connect {
+        pairing_address: String,
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -213,6 +226,8 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "uninstall" => no_extra(args, Command::Uninstall),
         "reinstall" => no_extra(args, Command::Reinstall),
         "config" => parse_config(&args[1..]),
+        "worker" => parse_worker(&args[1..]),
+        "device" => parse_device_alias(&args[1..]),
         "dev" => parse_dev(&args[1..]),
         "candidate" => parse_candidate(&args[1..]),
         "service" => parse_service(&args[1..]),
@@ -478,6 +493,122 @@ fn parse_link_migrate_runtime_control(args: &[String]) -> Result<Command, String
         MigrateMode::DryRun
     };
     Ok(Command::Link(LinkCommand::MigrateRuntimeControl { mode }))
+}
+
+fn parse_worker(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
+        Some("pair") => parse_worker_pair(&args[1..]),
+        Some("connect") => parse_worker_connect(&args[1..]),
+        Some(value) => Err(format!(
+            "unknown worker command '{value}' (expected pair or connect)"
+        )),
+        None => Err("worker requires pair or connect".to_owned()),
+    }
+}
+
+fn parse_device_alias(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
+        Some("pair") => parse_worker_pair(&args[1..]),
+        Some(value) => Err(format!(
+            "device '{value}' is not implemented yet; v0.4.3 P0 supports only device pairing"
+        )),
+        None => Err("device requires pair".to_owned()),
+    }
+}
+
+fn parse_worker_pair(args: &[String]) -> Result<Command, String> {
+    let mut ttl_seconds = 600_u64;
+    let mut name = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--ttl-seconds" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--ttl-seconds requires 60..600".to_owned())?;
+                ttl_seconds = value
+                    .parse::<u64>()
+                    .map_err(|_| "--ttl-seconds requires an integer".to_owned())?;
+                if !(60..=600).contains(&ttl_seconds) {
+                    return Err("--ttl-seconds must be between 60 and 600".to_owned());
+                }
+                index += 2;
+            }
+            "--name" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--name requires a device name".to_owned())?;
+                if value.trim().is_empty() || value.len() > 128 {
+                    return Err("--name must contain 1..128 characters".to_owned());
+                }
+                name = Some(value.clone());
+                index += 2;
+            }
+            "--code" => {
+                return Err(
+                    "pairing codes are never accepted on argv; the new device enters the code interactively"
+                        .to_owned(),
+                );
+            }
+            value => {
+                return Err(format!("unknown worker pair argument '{value}'"));
+            }
+        }
+    }
+    Ok(Command::Worker(WorkerCommand::Pair { ttl_seconds, name }))
+}
+
+fn parse_worker_connect(args: &[String]) -> Result<Command, String> {
+    let mut pairing_address = None;
+    let mut name = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--name" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--name requires a device name".to_owned())?;
+                if value.trim().is_empty() || value.len() > 128 {
+                    return Err("--name must contain 1..128 characters".to_owned());
+                }
+                name = Some(value.clone());
+                index += 2;
+            }
+            "--code" => {
+                return Err(
+                    "pairing codes are never accepted on argv; enter the code interactively"
+                        .to_owned(),
+                );
+            }
+            "--enrollment-file" => {
+                return Err(
+                    "the enrollment-file flow was replaced by pairing; use `worker connect <pairing-address>`"
+                        .to_owned(),
+                );
+            }
+            "--edge-origin" => {
+                return Err(
+                    "--edge-origin is not needed; the pairing address carries the Worker origin"
+                        .to_owned(),
+                );
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown worker connect argument '{value}'"));
+            }
+            value => {
+                if pairing_address.is_some() {
+                    return Err("worker connect accepts exactly one pairing address".to_owned());
+                }
+                pairing_address = Some(value.to_owned());
+                index += 1;
+            }
+        }
+    }
+    Ok(Command::Worker(WorkerCommand::Connect {
+        pairing_address: pairing_address
+            .ok_or_else(|| "worker connect requires a pairing address".to_owned())?,
+        name,
+    }))
 }
 
 fn parse_config(args: &[String]) -> Result<Command, String> {
@@ -826,6 +957,8 @@ User path:\n\
   herdr-mcp doctor\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
+  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS only; v0.4.3 secure pairing — Linux/Windows: unavailable, fail-closed)\n\
+  herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS only; requires Keychain, reads the 6-digit code from an interactive or stdin prompt, never argv)\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|auto|status]\n\
   herdr-mcp extension standalone <install [--ref REF]|status>\n\
   herdr-mcp rollback\n\
@@ -976,6 +1109,78 @@ mod tests {
             .command,
             Command::Config(ConfigCommand::SetEdgeOrigin {
                 edge_origin: "https://herdr.example.com".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "worker",
+                "pair",
+                "--ttl-seconds",
+                "120",
+                "--name",
+                "mac-b",
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::Pair {
+                ttl_seconds: 120,
+                name: Some("mac-b".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "worker",
+                "connect",
+                "https://edge.example/pair#pair_abc123",
+                "--name",
+                "mac-b",
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::Connect {
+                pairing_address: "https://edge.example/pair#pair_abc123".to_owned(),
+                name: Some("mac-b".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(args(&["device", "pair"])).unwrap().command,
+            Command::Worker(WorkerCommand::Pair {
+                ttl_seconds: 600,
+                name: None,
+            })
+        );
+        assert!(parse(args(&["worker", "connect", "--code", "secret"])).is_err());
+        assert!(parse(args(&["device", "pair", "--code", "secret"])).is_err());
+        assert!(parse(args(&["worker", "pair", "--code", "secret"])).is_err());
+        assert!(
+            parse(args(&[
+                "worker",
+                "connect",
+                "https://edge.example/pair#pair_abc123",
+                "--enrollment-file",
+                "/tmp/enrollment.json",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(args(&[
+                "worker",
+                "connect",
+                "https://edge.example/pair#pair_abc123",
+                "--edge-origin",
+                "https://edge.example",
+            ]))
+            .is_err()
+        );
+        assert!(parse(args(&["worker", "connect"])).is_err());
+        assert!(parse(args(&["worker", "connect", "a", "b"])).is_err());
+        assert!(parse(args(&["worker", "pair", "--ttl-seconds", "900"])).is_err());
+        assert!(parse(args(&["worker", "pair", "--ttl-seconds", "59"])).is_err());
+        assert_eq!(
+            parse(args(&["worker", "pair"])).unwrap().command,
+            Command::Worker(WorkerCommand::Pair {
+                ttl_seconds: 600,
+                name: None,
             })
         );
         assert_eq!(

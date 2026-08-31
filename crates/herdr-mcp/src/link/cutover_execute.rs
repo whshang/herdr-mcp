@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use super::cutover::{Precondition, prod_plist_backup_path};
 use super::install::{
     LINK_RUST_CANDIDATE_LABEL, assert_safe_candidate_program, candidate_program_arguments,
-    configured_edge_ws_url, inherited_proxy_env,
+    configured_edge_device_identity, configured_edge_ws_url, inherited_proxy_env,
 };
 use super::ownership::{
     LINK_LABEL, LINK_PROD_LABEL, LinkAgentView, LinkImplementation, classify_program_arguments,
@@ -501,6 +501,21 @@ pub fn encode_prod_rust_plist(
         env_out.insert("HERDR_EDGE_URL".to_owned(), PlistValue::String(edge_url));
         if !env_keys.iter().any(|key| key == "HERDR_EDGE_URL") {
             env_keys.push("HERDR_EDGE_URL".to_owned());
+        }
+    }
+    if let Some((device_id, keychain_service)) = configured_edge_device_identity(home) {
+        env_out.insert(
+            "HERDR_WORKSTATION_ID".to_owned(),
+            PlistValue::String(device_id),
+        );
+        env_out.insert(
+            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+            PlistValue::String(keychain_service),
+        );
+        for key in ["HERDR_WORKSTATION_ID", "HERDR_LINK_KEYCHAIN_SERVICE"] {
+            if !env_keys.iter().any(|existing| existing == key) {
+                env_keys.push(key.to_owned());
+            }
         }
     }
     for (key, value) in inherited_proxy_env() {

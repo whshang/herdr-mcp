@@ -6,6 +6,8 @@
  *   GET  /health                          edge health (no DO involved)
  *   GET  /info                            route/stage table for debugging
  *   GET  /status/:workstationId           DO presence snapshot (dev-open)
+ *   POST /devices/pairings               owner-authenticated pairing session creation
+ *   POST /devices/pairings/consume       one-time pairing consumption by a new device
  *   GET  /ws/:workstationId               workstation link WSS upgrade (auth)
  *   POST /artifacts  GET|DELETE /artifacts/:id   private R2 generic artifact relay
  *   GET  /mcp  POST /mcp                  public MCP transport
@@ -16,7 +18,12 @@
  */
 
 import { handleArtifactRequest, sweepExpiredArtifacts } from "./artifact-relay.js";
-import { authenticateStaticMcpBearer, SharedSecretLinkAuthenticator, hasLinkApplicationProtocol } from "./auth.js";
+import {
+  authenticateStaticMcpBearer,
+  extractLinkCredential,
+  SharedSecretLinkAuthenticator,
+  hasLinkApplicationProtocol,
+} from "./auth.js";
 import type { Env } from "./env.js";
 import { errorResult } from "./errors.js";
 import { edgeIdentity, MCP_SERVER_VERSION } from "./version.js";
@@ -32,9 +39,14 @@ import { WorkstationDO } from "./workstation-do.js";
 import { OAuthStoreDO } from "./oauth-store-do.js";
 import { DeviceRegistryDO } from "./device-registry-do.js";
 import {
+  authenticateDeviceCredential,
+  consumePairingSession,
+  createPairingSession,
   ensureLegacyDeviceRegistration,
   listPublicDevices,
   resolveDeviceRouteWithContext,
+  revokeRegisteredDevice,
+  resolveDeviceRoute,
 } from "./device-directory.js";
 import { authenticateMcpRequest } from "./oauth-mcp-auth.js";
 import { createOAuthIdentity } from "./oauth-edge.js";
@@ -49,6 +61,21 @@ function jsonResponse(payload: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function noStoreJsonResponse(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      pragma: "no-cache",
+    },
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 export default {
@@ -96,6 +123,8 @@ export default {
           { path: "/info", stage: "dev" },
           { path: "/ws/:workstationId", stage: "dev (WS upgrade, link auth)" },
           { path: "/status/:workstationId", stage: "dev (DO presence)" },
+          { path: "/devices/pairings", stage: "owner-authenticated device pairing creation" },
+          { path: "/devices/pairings/consume", stage: "one-time device pairing consumption" },
           { path: "/mcp", stage: `public MCP epoch-${identity.contractEpoch} + sessionless ChatGPT SSE` },
           { path: "/artifacts", stage: "private R2 generic artifact relay (auth + capability)" },
           { path: "/.well-known/mcp.json", stage: "public MCP discovery" },
@@ -125,6 +154,85 @@ export default {
         refresh: stats.refresh ?? 0,
         codes: stats.codes ?? 0,
       }, response.ok ? 200 : 503);
+    }
+
+    // ---- Device pairing control plane. Pairing creation requires
+    // owner/operator auth; consumption requires only the raw pairing_id plus
+    // the six-digit code, so a second workstation never needs Cloudflare
+    // deploy credentials. Raw pairing material is returned once and never
+    // stored or logged; the DO keeps only digest-keyed, HMAC-bound verifiers.
+    // The six-digit code NEVER travels in a URL/URI/query — consumption is
+    // JSON-body-only; only the pairing_id may appear in a descriptor/fragment.
+    if (request.method === "POST" && url.pathname === "/devices/pairings") {
+      const ownerAuth = await authenticatePairingCreator(request, env);
+      if (!ownerAuth) return noStoreJsonResponse({ ok: false, code: "pairing_admin_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value)) {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const input: { ttl_seconds?: number; name?: string; worker_context: string } = {
+        worker_context: pairingWorkerContext(env),
+      };
+      if (parsed.value.ttl_seconds !== undefined) input.ttl_seconds = parsed.value.ttl_seconds as number;
+      if (parsed.value.name !== undefined) input.name = parsed.value.name as string;
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      const result = await createPairingSession(registry, input);
+      return result.ok
+        ? noStoreJsonResponse({
+            ok: true,
+            pairing_id: result.pairing.pairing_id,
+            code: result.pairing.code,
+            expires_at_ms: result.pairing.expires_at_ms,
+            worker_origin: url.origin,
+          })
+        : noStoreJsonResponse({ ok: false, code: result.code }, result.status);
+    }
+
+    if (request.method === "POST" && url.pathname === "/devices/pairings/consume") {
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.pairing_id !== "string" || typeof parsed.value.code !== "string") {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const input: { pairing_id: string; code: string; name?: string; worker_context: string } = {
+        pairing_id: parsed.value.pairing_id,
+        code: parsed.value.code,
+        worker_context: pairingWorkerContext(env),
+      };
+      if (parsed.value.name !== undefined) input.name = parsed.value.name as string;
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      const result = await consumePairingSession(registry, input);
+      return result.ok
+        ? noStoreJsonResponse({
+            ok: true,
+            device_id: result.credential.device_id,
+            workstation_id: result.credential.workstation_id,
+            credential_id: result.credential.credential_id,
+            device_secret: result.credential.device_secret,
+          })
+        : noStoreJsonResponse({ ok: false, code: result.code }, result.status);
+    }
+
+    if (request.method === "POST" && url.pathname === "/devices/revoke-self") {
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.workstation_id !== "string") {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const workstationId = parsed.value.workstation_id.trim();
+      if (!workstationId || !/^[A-Za-z0-9_.-]{1,64}$/.test(workstationId)) {
+        return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+      }
+      const extracted = extractLinkCredential(request);
+      if (!extracted.ok) return noStoreJsonResponse({ ok: false, code: "link_auth_failed" }, 401);
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      const authenticated = await authenticateDeviceCredential(registry, workstationId, extracted.credential);
+      if (!authenticated.ok) return noStoreJsonResponse({ ok: false, code: authenticated.code }, 401);
+      const revoked = await revokeRegisteredDevice(registry, authenticated.device_id);
+      return revoked
+        ? noStoreJsonResponse({ ok: true, device_id: authenticated.device_id })
+        : noStoreJsonResponse({ ok: false, code: "revoke_failed" }, 503);
     }
 
     // ---- /status/:workstationId — dev presence via DO.
@@ -158,21 +266,35 @@ export default {
       if (!hasLinkApplicationProtocol(request)) {
         return jsonResponse(errorResult("bad_request", { message: "missing herdr-link.v1 websocket subprotocol" }), 400);
       }
-      const authenticator = new SharedSecretLinkAuthenticator({ secret: env.LINK_SHARED_SECRET });
-      const decision = authenticator.authenticate(request, workstationId, Date.now());
-      if (!decision.ok) {
-        logger.warn("ws.upgrade.denied", { workstationId, code: decision.code });
-        return jsonResponse(errorResult("link_auth_failed", { message: decision.reason, workstationId }), 401);
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      const extracted = extractLinkCredential(request);
+      const deviceAuth = extracted.ok
+        ? await authenticateDeviceCredential(registry, workstationId, extracted.credential)
+        : { ok: false as const, code: "link_auth_failed" as const };
+      let authenticatedBy: "device" | "legacy" | null = deviceAuth.ok ? "device" : null;
+
+      if (!authenticatedBy && !deviceAuth.ok && env.DEFAULT_WORKSTATION_ID === workstationId) {
+        const legacyEligible = deviceAuth.code === "device_not_found" || deviceAuth.code === "device_credential_missing";
+        if (legacyEligible) {
+          const authenticator = new SharedSecretLinkAuthenticator({ secret: env.LINK_SHARED_SECRET });
+          const legacyDecision = authenticator.authenticate(request, workstationId, Date.now());
+          if (legacyDecision.ok) authenticatedBy = "legacy";
+        }
       }
-      if (env.DEFAULT_WORKSTATION_ID === workstationId) {
+
+      if (!authenticatedBy) {
+        const code = !deviceAuth.ok ? deviceAuth.code : "link_auth_failed";
+        logger.warn("ws.upgrade.denied", { workstationId, code });
+        return jsonResponse(errorResult("link_auth_failed", { message: "credential rejected", workstationId }), 401);
+      }
+
+      if (authenticatedBy === "legacy") {
         try {
-          const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
           const registered = await ensureLegacyDeviceRegistration(registry, workstationId);
           if (registered.created) {
             logger.info("device.legacy_registered", { workstationId, deviceId: registered.device_id });
           }
         } catch (error) {
-          // Preserve existing Link availability during rollout; a later reconnect retries registration.
           logger.warn("device.legacy_registration_failed", { workstationId, error: String(error) });
         }
       }
@@ -390,4 +512,33 @@ async function authenticateEdgeMcpRequest(request: Request, env: Env) {
   return authenticateMcpRequest(request, env, {
     verifyEdgeToken: (token) => verifyEdgeAccessToken(env, token),
   });
+}
+
+/**
+ * Stable per-deployment context binding for pairing verifiers. Create and
+ * consume requests must carry the same derived context, so a pairing minted by
+ * one Worker/deployment can never be consumed against another. Cross-Worker
+ * mismatches fail closed inside the registry DO.
+ */
+function pairingWorkerContext(env: Env): string {
+  return `${env.EDGE_PROJECT ?? "herdr-edge"}@${env.EDGE_ENV ?? "dev"}`;
+}
+
+async function authenticatePairingCreator(request: Request, env: Env): Promise<boolean> {
+  const owner = await authenticateEdgeMcpRequest(request, env);
+  if (owner.ok) return true;
+
+  const workstationId = request.headers.get("x-herdr-workstation")?.trim() ?? "";
+  if (!env.DEFAULT_WORKSTATION_ID || workstationId !== env.DEFAULT_WORKSTATION_ID) return false;
+  const extracted = extractLinkCredential(request);
+  if (!extracted.ok) return false;
+
+  const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+  const deviceAuth = await authenticateDeviceCredential(registry, workstationId, extracted.credential);
+  if (deviceAuth.ok) return true;
+  if (deviceAuth.code !== "device_not_found" && deviceAuth.code !== "device_credential_missing") {
+    return false;
+  }
+  const legacy = new SharedSecretLinkAuthenticator({ secret: env.LINK_SHARED_SECRET });
+  return legacy.authenticate(request, workstationId, Date.now()).ok;
 }

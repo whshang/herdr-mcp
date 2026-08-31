@@ -1,7 +1,134 @@
+import { sha256Hex } from "./device-crypto.js";
 import { isRoutableDevice, normalizeDeviceId, type DeviceRecord } from "./device-model.js";
 
 interface FetchStub {
   fetch(request: Request): Promise<Response>;
+}
+
+export interface PairingSession {
+  pairing_id: string;
+  code: string;
+  expires_at_ms: number;
+}
+
+export interface PairedDeviceCredential {
+  device_id: string;
+  workstation_id: string;
+  credential_id: string;
+  device_secret: string;
+}
+
+export type DeviceCredentialAuthCode =
+  | "device_not_found"
+  | "device_credential_missing"
+  | "device_revoked"
+  | "device_suspended"
+  | "link_auth_failed"
+  | "registry_corrupt"
+  | "internal_error";
+
+export type DeviceCredentialAuthResult =
+  | { ok: true; device_id: string; credential_id: string }
+  | { ok: false; code: DeviceCredentialAuthCode };
+
+export async function createPairingSession(
+  registry: FetchStub,
+  input: { ttl_seconds?: number; name?: string; worker_context: string },
+): Promise<{ ok: true; pairing: PairingSession } | { ok: false; code: string; status: number }> {
+  const response = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  }));
+  const body: unknown = await response.json();
+  if (!response.ok) {
+    return {
+      ok: false,
+      code: isRecord(body) && typeof body.code === "string" ? body.code : "pairing_create_failed",
+      status: response.status,
+    };
+  }
+  if (!isRecord(body) || body.ok !== true || typeof body.pairing_id !== "string" || typeof body.code !== "string" || typeof body.expires_at_ms !== "number") {
+    return { ok: false, code: "invalid_registry_response", status: 503 };
+  }
+  return {
+    ok: true,
+    pairing: { pairing_id: body.pairing_id, code: body.code, expires_at_ms: body.expires_at_ms },
+  };
+}
+
+export async function consumePairingSession(
+  registry: FetchStub,
+  input: { pairing_id: string; code: string; name?: string; worker_context: string },
+): Promise<{ ok: true; credential: PairedDeviceCredential } | { ok: false; code: string; status: number }> {
+  const response = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings/consume", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  }));
+  const body: unknown = await response.json();
+  if (!response.ok) {
+    return {
+      ok: false,
+      code: isRecord(body) && typeof body.code === "string" ? body.code : "pairing_rejected",
+      status: response.status,
+    };
+  }
+  if (!isRecord(body) || body.ok !== true || typeof body.device_id !== "string" || typeof body.workstation_id !== "string" || typeof body.credential_id !== "string" || typeof body.device_secret !== "string") {
+    return { ok: false, code: "invalid_registry_response", status: 503 };
+  }
+  return {
+    ok: true,
+    credential: {
+      device_id: body.device_id,
+      workstation_id: body.workstation_id,
+      credential_id: body.credential_id,
+      device_secret: body.device_secret,
+    },
+  };
+}
+
+export async function authenticateDeviceCredential(
+  registry: FetchStub,
+  workstationId: string,
+  credential: string,
+): Promise<DeviceCredentialAuthResult> {
+  try {
+    const verifier = await sha256Hex(credential);
+    const response = await registry.fetch(new Request("https://registry.internal/internal/devices/authenticate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workstation_id: workstationId, credential_verifier_sha256: verifier }),
+    }));
+    const body: unknown = await response.json();
+    if (response.ok && isRecord(body) && body.ok === true && typeof body.device_id === "string" && typeof body.credential_id === "string") {
+      return { ok: true, device_id: body.device_id, credential_id: body.credential_id };
+    }
+    const code = isRecord(body) && typeof body.code === "string" ? body.code : "internal_error";
+    switch (code) {
+      case "device_not_found":
+      case "device_credential_missing":
+      case "device_revoked":
+      case "device_suspended":
+      case "link_auth_failed":
+      case "registry_corrupt":
+        return { ok: false, code };
+      default:
+        return { ok: false, code: "internal_error" };
+    }
+  } catch {
+    return { ok: false, code: "internal_error" };
+  }
+}
+
+export async function revokeRegisteredDevice(registry: FetchStub, deviceId: string): Promise<boolean> {
+  const response = await registry.fetch(new Request(
+    `https://registry.internal/internal/devices/${encodeURIComponent(deviceId)}/revoke`,
+    { method: "POST" },
+  ));
+  if (!response.ok) return false;
+  const body: unknown = await response.json();
+  return isRecord(body) && body.ok === true;
 }
 
 export async function ensureLegacyDeviceRegistration(

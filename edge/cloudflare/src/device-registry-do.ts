@@ -1,4 +1,15 @@
 import type { Env } from "./env.js";
+import { constantTimeEqual } from "./auth.js";
+import {
+  isCredentialVerifier,
+  isPairingCode,
+  isPairingId,
+  newCredentialId,
+  newDeviceSecret,
+  newPairingCode,
+  newPairingId,
+  sha256Hex,
+} from "./device-crypto.js";
 import {
   isWorkstationId,
   newDeviceId,
@@ -9,6 +20,56 @@ import {
 
 const DEVICE_PREFIX = "device:";
 const WORKSTATION_PREFIX = "workstation:";
+const PAIRING_PREFIX = "pairing:";
+const CREDENTIAL_PREFIX = "credential:";
+const DEFAULT_PAIRING_TTL_MS = 10 * 60 * 1000;
+const MIN_PAIRING_TTL_MS = 60 * 1000;
+const MAX_PAIRING_TTL_MS = 10 * 60 * 1000;
+/** Fifth wrong code permanently locks the pairing session. */
+const MAX_PAIRING_ATTEMPTS = 5;
+const enc = new TextEncoder();
+
+/**
+ * Storage snapshot resistance: the lookup key is SHA-256(raw pairing_id), so a
+ * snapshot alone never exposes the raw id. The stored verifier is
+ * HMAC-SHA256 keyed by the raw pairing_id over worker_context || code, so a
+ * storage snapshot cannot enumerate the six-digit code offline: the HMAC key
+ * (the raw pairing_id, a short-lived secret capability) is absent from
+ * storage. Verified in constant time. No deployment-wide pepper secret exists.
+ */
+interface PairingRecord {
+  verifier_sha256: string;
+  created_at_ms: number;
+  expires_at_ms: number;
+  attempts: number;
+  state: "pending" | "locked";
+  name: string | null;
+}
+
+async function pairingStorageKey(pairingId: string): Promise<string> {
+  return PAIRING_PREFIX + await sha256Hex(pairingId);
+}
+
+/** HMAC-SHA256(key = raw pairing_id, message = worker_context || ":" || code). */
+async function pairingVerifier(pairingId: string, code: string, workerContext: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(pairingId),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const mac = await crypto.subtle.sign("HMAC", key, enc.encode(`${workerContext}:${code}`));
+  return [...new Uint8Array(mac)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+interface DeviceCredentialRecord {
+  credential_id: string;
+  device_id: string;
+  workstation_id: string;
+  verifier_sha256: string;
+  created_at_ms: number;
+}
 
 function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -38,6 +99,19 @@ export class DeviceRegistryDO {
 
     if (request.method === "GET" && url.pathname === "/internal/devices") {
       return this.listDevices();
+    }
+    if (request.method === "POST" && url.pathname === "/internal/devices/pairings") {
+      return this.createPairing(request);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/devices/pairings/consume") {
+      return this.consumePairing(request);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/devices/authenticate") {
+      return this.authenticateDevice(request);
+    }
+    const revokeMatch = /^\/internal\/devices\/(dev_[0-9A-Z]+)\/revoke$/.exec(url.pathname);
+    if (request.method === "POST" && revokeMatch) {
+      return this.revokeDevice(revokeMatch[1]);
     }
     if (request.method === "POST" && url.pathname === "/internal/devices/legacy/ensure") {
       return this.ensureLegacyDevice(request);
@@ -87,6 +161,174 @@ export class DeviceRegistryDO {
     return json({ ok: true, device: parsed });
   }
 
+  private async createPairing(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    if (!isRecord(body)) return json({ ok: false, code: "bad_request" }, 400);
+    const ttlMs = normalizePairingTtlMs(body.ttl_seconds);
+    if (ttlMs === null) return json({ ok: false, code: "invalid_pairing_ttl" }, 400);
+    const name = normalizeOptionalName(body.name);
+    if (body.name !== undefined && name === null) return json({ ok: false, code: "invalid_device_name" }, 400);
+    const workerContext = typeof body.worker_context === "string" && body.worker_context.length > 0 && body.worker_context.length <= 256
+      ? body.worker_context
+      : null;
+    if (workerContext === null) return json({ ok: false, code: "bad_request" }, 400);
+
+    const pairingId = newPairingId();
+    const code = newPairingCode();
+    const now = Date.now();
+    const verifier = await pairingVerifier(pairingId, code, workerContext);
+    const record: PairingRecord = {
+      verifier_sha256: verifier,
+      created_at_ms: now,
+      expires_at_ms: now + ttlMs,
+      attempts: 0,
+      state: "pending",
+      name,
+    };
+
+    // At most one active unconsumed pairing session per Worker: creating a new
+    // session atomically invalidates (replaces) any prior one, so the owner
+    // never has to wait out an abandoned session. The DO transaction is the
+    // serialization point; a concurrent consume either sees the old or the new
+    // record, never both.
+    const stored = await this.state.storage.transaction(async (tx) => {
+      const prior = await tx.list({ prefix: PAIRING_PREFIX });
+      for (const key of prior.keys()) await tx.delete(key);
+      const key = await pairingStorageKey(pairingId);
+      await tx.put(key, record);
+      return key;
+    });
+    void stored;
+    // Raw pairing_id and code are returned exactly once and never stored or logged.
+    return json({ ok: true, pairing_id: pairingId, code, expires_at_ms: record.expires_at_ms });
+  }
+
+  private async consumePairing(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    if (!isRecord(body)) return json({ ok: false, code: "bad_request" }, 400);
+    if (!isPairingId(body.pairing_id) || !isPairingCode(body.code)) {
+      return json({ ok: false, code: "invalid_pairing_request" }, 400);
+    }
+    const requestedName = normalizeOptionalName(body.name);
+    if (body.name !== undefined && requestedName === null) return json({ ok: false, code: "invalid_device_name" }, 400);
+    const workerContext = typeof body.worker_context === "string" && body.worker_context.length > 0 && body.worker_context.length <= 256
+      ? body.worker_context
+      : null;
+    if (workerContext === null) return json({ ok: false, code: "bad_request" }, 400);
+
+    const storageKey = await pairingStorageKey(body.pairing_id);
+    const expectedVerifier = await pairingVerifier(body.pairing_id, body.code, workerContext);
+    const now = Date.now();
+
+    // The DO transaction is the authoritative serialization point: concurrent
+    // consumes interleave only here, so exactly one ever sees the live record.
+    const result = await this.state.storage.transaction(async (tx) => {
+      const record = await tx.get<PairingRecord>(storageKey);
+      if (!record) return { ok: false as const, code: "pairing_rejected" as const };
+      if (record.state === "locked") return { ok: false as const, code: "pairing_rejected" as const };
+      if (record.expires_at_ms <= now) {
+        await tx.delete(storageKey);
+        return { ok: false as const, code: "pairing_rejected" as const };
+      }
+      if (!constantTimeEqual(enc.encode(record.verifier_sha256), enc.encode(expectedVerifier))) {
+        const attempts = record.attempts + 1;
+        const locked = attempts >= MAX_PAIRING_ATTEMPTS;
+        await tx.put(storageKey, { ...record, attempts, state: locked ? "locked" : record.state });
+        return { ok: false as const, code: "pairing_rejected" as const };
+      }
+
+      const deviceId = newDeviceId(now);
+      const credentialId = newCredentialId();
+      const deviceSecret = newDeviceSecret();
+      const device: DeviceRecord = {
+        device_id: deviceId,
+        workstation_id: deviceId,
+        name: record.name ?? requestedName ?? deviceId,
+        authorization: "active",
+        scheduling: "enabled",
+        credential_id: credentialId,
+        enrolled_at_ms: now,
+        updated_at_ms: now,
+        revoked_at_ms: null,
+      };
+      const credential: DeviceCredentialRecord = {
+        credential_id: credentialId,
+        device_id: deviceId,
+        workstation_id: deviceId,
+        verifier_sha256: await sha256Hex(deviceSecret),
+        created_at_ms: now,
+      };
+      await tx.delete(storageKey);
+      await tx.put(DEVICE_PREFIX + deviceId, device);
+      await tx.put(WORKSTATION_PREFIX + deviceId, deviceId);
+      await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
+      return { ok: true as const, device_id: deviceId, credential_id: credentialId, device_secret: deviceSecret };
+    });
+
+    if (!result.ok) return json(result, 401);
+    return json({
+      ok: true,
+      device_id: result.device_id,
+      workstation_id: result.device_id,
+      credential_id: result.credential_id,
+      device_secret: result.device_secret,
+    });
+  }
+
+  private async authenticateDevice(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    if (!isRecord(body) || !isWorkstationId(body.workstation_id) || !isCredentialVerifier(body.credential_verifier_sha256)) {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    const deviceId = await this.state.storage.get<string>(WORKSTATION_PREFIX + body.workstation_id);
+    if (!deviceId) return json({ ok: false, code: "device_not_found" }, 401);
+    const device = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + deviceId));
+    if (!device) return json({ ok: false, code: "registry_corrupt" }, 409);
+    if (device.authorization === "revoked") return json({ ok: false, code: "device_revoked" }, 403);
+    if (device.authorization === "suspended") return json({ ok: false, code: "device_suspended" }, 403);
+    if (!device.credential_id) return json({ ok: false, code: "device_credential_missing" }, 401);
+
+    const credential = await this.state.storage.get<DeviceCredentialRecord>(CREDENTIAL_PREFIX + device.credential_id);
+    if (!credential || credential.device_id !== device.device_id || credential.workstation_id !== device.workstation_id) {
+      return json({ ok: false, code: "registry_corrupt" }, 409);
+    }
+    if (!constantTimeEqual(enc.encode(credential.verifier_sha256), enc.encode(body.credential_verifier_sha256))) {
+      return json({ ok: false, code: "link_auth_failed" }, 401);
+    }
+    return json({ ok: true, device_id: device.device_id, credential_id: credential.credential_id });
+  }
+
+  private async revokeDevice(deviceId: string): Promise<Response> {
+    const canonical = normalizeDeviceId(deviceId);
+    if (!canonical) return json({ ok: false, code: "invalid_device_id" }, 400);
+    const existing = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + canonical));
+    if (!existing) return json({ ok: false, code: "device_not_found" }, 404);
+    const now = Date.now();
+    const revoked: DeviceRecord = {
+      ...existing,
+      authorization: "revoked",
+      revoked_at_ms: existing.revoked_at_ms ?? now,
+      updated_at_ms: now,
+    };
+    await this.state.storage.put(DEVICE_PREFIX + canonical, revoked);
+    return json({ ok: true, device: revoked });
+  }
+
   private async ensureLegacyDevice(request: Request): Promise<Response> {
     let body: unknown;
     try {
@@ -131,4 +373,18 @@ export class DeviceRegistryDO {
 
     return result.ok ? json(result) : json(result, 409);
   }
+}
+
+function normalizePairingTtlMs(value: unknown): number | null {
+  if (value === undefined) return DEFAULT_PAIRING_TTL_MS;
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return null;
+  const ttlMs = value * 1000;
+  return ttlMs >= MIN_PAIRING_TTL_MS && ttlMs <= MAX_PAIRING_TTL_MS ? ttlMs : null;
+}
+
+function normalizeOptionalName(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") return null;
+  const name = value.trim();
+  return name.length > 0 && name.length <= 128 ? name : null;
 }

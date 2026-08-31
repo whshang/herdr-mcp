@@ -12,7 +12,11 @@ Implementation status (2026-08-31):
 - [x] Public epoch 3 exposes Edge-local `herdr_devices`; Runtime execution remains epoch 2.
 - [x] Workstation-bound public tools carry one common Edge-only `device` selector; Edge resolves once, strips it, then forwards Runtime v2 args.
 - [x] Explicit ID/name routing, single-routable-device selection, legacy-empty-registry fallback, and `device_ambiguous` fail-closed behavior are covered by tests.
-- [ ] Per-device credential and one-time enrollment are not implemented yet; a second device is therefore not formally supported yet.
+- [x] Per-device credential and one-time enrollment are implemented in the Worker/Registry and macOS Rust CLI, including single-use expiry, credential-to-device binding, self-revoke compensation, and native Keychain persistence.
+- [ ] Real two-device UAT is still pending until the secure enrollment Edge is
+  deployed to production and a real second Mac joins the same deployed
+  Worker/Connector; second-device support is not release-qualified before that
+  UAT passes.
 - [ ] Device-aware opaque workspace/pane refs, scheduling mutations, and Web Control Console remain later phases.
 
 ## 1. Product decision
@@ -318,7 +322,7 @@ Public-key device identity can be introduced later without changing `device_id`.
 
 `LINK_SHARED_SECRET` remains a legacy compatibility path for existing single-device deployments. It is not the normal enrollment mechanism for adding a second v0.4.3 device.
 
-## 11. Enrollment
+## 11. Pairing
 
 Runtime installation stays independent:
 
@@ -327,27 +331,27 @@ herdr-mcp install
 herdr-mcp doctor
 ```
 
-Worker onboarding is explicit:
+Worker onboarding is explicit and uses only the implemented P0-C pairing CLI:
 
 ```text
-herdr-mcp worker setup
+herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]
+herdr-mcp device pair [same options]
+herdr-mcp worker connect <pairing-address> [--name NAME]
 ```
 
-Logical choices:
-
-```text
-create new Worker
-connect existing Worker
-local only
-```
+A richer onboarding tree (`worker setup`, `worker create`, `worker status`,
+`devices list`) remains a later product surface (Section 13).
 
 For an existing Worker, the intended deterministic path is:
 
 ```text
-owner creates one-time enrollment
+owner starts a short-lived pairing session (worker pair)
        |
        v
-new device: herdr-mcp worker connect --code <code>
+pairing address + 6-digit code are shown to the user
+       |
+       v
+new device: herdr-mcp worker connect <pairing-address>  (code entered interactively)
        |
        v
 stable device_id + per-device credential
@@ -356,15 +360,49 @@ stable device_id + per-device credential
 Link online on the same Worker
 ```
 
-Enrollment code requirements:
+Pairing creation authority:
 
+- only the owner/default workstation creates pairings; the Edge accepts
+  pairing creation only from the Edge MCP (OAuth owner) identity or from the
+  configured `DEFAULT_WORKSTATION_ID` presenting its production Link credential
+  (`authenticateEnrollmentCreator`);
+- the CLI creator path resolves the production Link identity and its Keychain
+  credential before it will call the Edge;
+- member devices cannot recursively create further pairings. A joining device
+  receives only the ability to consume a one-time pairing; it never gains
+  pairing-creation authority.
+
+Pairing code requirements:
+
+- six decimal digits (000000..999999, leading zeros allowed), CSPRNG-generated;
 - single use;
-- short TTL;
+- short TTL (default 600s, max 600s);
 - Worker-bound;
-- device-enrollment scope only;
+- device-pairing scope only;
 - not persisted in normal logs;
 - not equivalent to the final device credential;
+- never accepted as a command-line argument;
+- limited to 5 wrong attempts before the session is permanently locked;
 - Cloudflare deployment credentials are not required on the joining device.
+
+Pairing id requirements:
+
+- high entropy (>=128 random bits) and unguessable;
+- carried in the pairing address URL fragment, not in HTTP access-log paths;
+- never stored raw; the Edge stores only a verifier bound to the raw pairing
+  id + code + Worker context;
+- redacted from logs.
+
+Current macOS credential contract:
+
+- the joining device receives the final 256-bit random credential once;
+- the Worker persists only its verifier/hash;
+- Rust writes the final credential directly through Security.framework into macOS Keychain;
+- `edge.device_id` is non-secret config and selects a deterministic per-device Keychain service;
+- production Link reconciliation updates `HERDR_WORKSTATION_ID` and `HERDR_LINK_KEYCHAIN_SERVICE` without putting the credential in the plist, argv, shell history, or logs;
+- if Keychain persistence fails after pairing consumption, the client uses the just-issued credential only to revoke that same device as compensation.
+
+The current secure joining CLI is macOS-only because the credential backend is Keychain. Other platforms must gain an equivalent OS credential store before their `worker connect` path may consume a one-time pairing.
 
 ## 12. Edge-local MCP tools
 
@@ -411,12 +449,21 @@ Mutation semantics must share one Device Administration Service with CLI and fut
 
 ## 13. CLI boundary
 
-Target command tree:
+Implemented P0-C command surface:
+
+```text
+herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]
+herdr-mcp device pair [same options]
+herdr-mcp worker connect <pairing-address> [--name NAME]
+```
+
+The pairing code is intentionally absent from argv and normal stdout. `worker pair` reports the pairing address, the 6-digit code (formatted `123 456`), and expiry only. `worker connect` reads the code from a no-echo TTY prompt (or a single non-echo stdin line when noninteractive).
+
+Later command tree:
 
 ```text
 herdr-mcp worker setup
 herdr-mcp worker create
-herdr-mcp worker connect
 herdr-mcp worker status
 herdr-mcp worker doctor
 
@@ -548,12 +595,13 @@ Edge maps internal workstation errors to the stable device-facing boundary and r
 
 ### P0-C — Secure enrollment
 
-- one-time enrollment contract;
-- per-device credential;
-- second-device connect flow;
-- credential-to-device binding;
-- revoke path;
-- retain legacy shared-secret compatibility for the existing device only.
+- [x] one-time enrollment contract;
+- [x] per-device credential;
+- [x] macOS second-device connect flow with native Keychain persistence;
+- [x] credential-to-device binding;
+- [x] self-revoke/compensation path;
+- [x] retain legacy shared-secret compatibility for the configured default workstation only;
+- [ ] real Device A + Device B deployed UAT before release qualification.
 
 ### P0-D — Explicit execution routing
 
