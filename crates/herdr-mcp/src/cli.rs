@@ -18,6 +18,7 @@ pub enum Command {
     },
     Service(ServiceCommand),
     Update(UpdateCommand),
+    Extension(ExtensionCommand),
     NativeHost(NativeHostCommand),
     ExtensionHost {
         caller_origin: String,
@@ -91,6 +92,12 @@ pub enum NativeHostCommand {
     UseStore,
     UseStandalone,
     UseDev,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExtensionCommand {
+    StandaloneInstall { reference: Option<String> },
+    StandaloneStatus,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -207,6 +214,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "candidate" => parse_candidate(&args[1..]),
         "service" => parse_service(&args[1..]),
         "update" => parse_update(&args[1..]),
+        "extension" => parse_extension(&args[1..]),
         "native-host" => parse_native_host(&args[1..]),
         "extension-host" => parse_extension_host(&args[1..]),
         "artifact" => parse_artifact(&args[1..]),
@@ -768,6 +776,30 @@ fn parse_native_host(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn parse_extension(args: &[String]) -> Result<Command, String> {
+    match args {
+        [channel, action] if channel == "standalone" && action == "install" => {
+            Ok(Command::Extension(ExtensionCommand::StandaloneInstall {
+                reference: None,
+            }))
+        }
+        [channel, action, flag, reference]
+            if channel == "standalone" && action == "install" && flag == "--ref" =>
+        {
+            Ok(Command::Extension(ExtensionCommand::StandaloneInstall {
+                reference: Some(reference.clone()),
+            }))
+        }
+        [channel, action] if channel == "standalone" && action == "status" => {
+            Ok(Command::Extension(ExtensionCommand::StandaloneStatus))
+        }
+        [] => {
+            Err("extension requires standalone install [--ref REF] or standalone status".to_owned())
+        }
+        _ => Err("invalid extension command or arguments".to_owned()),
+    }
+}
+
 fn parse_extension_host(args: &[String]) -> Result<Command, String> {
     match args {
         [] => Ok(Command::ExtensionHost {
@@ -792,6 +824,7 @@ User path:\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|auto|status]\n\
+  herdr-mcp extension standalone <install [--ref REF]|status>\n\
   herdr-mcp rollback\n\
   herdr-mcp uninstall\n\n\
 Same-machine UAT isolation (optional):\n\
@@ -1156,6 +1189,32 @@ mod tests {
         assert_eq!(
             parse(args(&["native-host", "use", "dev"])).unwrap().command,
             Command::NativeHost(NativeHostCommand::UseDev)
+        );
+        assert_eq!(
+            parse(args(&["extension", "standalone", "install"]))
+                .unwrap()
+                .command,
+            Command::Extension(ExtensionCommand::StandaloneInstall { reference: None })
+        );
+        assert_eq!(
+            parse(args(&[
+                "extension",
+                "standalone",
+                "install",
+                "--ref",
+                "main"
+            ]))
+            .unwrap()
+            .command,
+            Command::Extension(ExtensionCommand::StandaloneInstall {
+                reference: Some("main".to_owned())
+            })
+        );
+        assert_eq!(
+            parse(args(&["extension", "standalone", "status"]))
+                .unwrap()
+                .command,
+            Command::Extension(ExtensionCommand::StandaloneStatus)
         );
         assert_eq!(
             parse(args(&["extension-host"])).unwrap().command,

@@ -50,6 +50,7 @@ mod service_manager;
 mod skill;
 pub mod skill_dispatch;
 mod snapshot;
+mod standalone_extension;
 mod state_cache;
 mod state_store;
 mod status;
@@ -191,6 +192,14 @@ fn run() -> Result<ExitCode, String> {
         }
         cli::Command::Service(command) => service_lifecycle::run(command),
         cli::Command::Update(command) => updater::run(command),
+        cli::Command::Extension(command) => match command {
+            cli::ExtensionCommand::StandaloneInstall { reference } => {
+                standalone_extension::run_install(standalone_extension::StandaloneInstallOptions {
+                    reference,
+                })
+            }
+            cli::ExtensionCommand::StandaloneStatus => standalone_extension::run_status(),
+        },
         cli::Command::NativeHost(command) => native_host_install::run(command),
         cli::Command::ExtensionHost { caller_origin } => native_host::run(&caller_origin),
         cli::Command::ArtifactImport(args) => artifact_import::run(args),
