@@ -2,6 +2,8 @@
 
 Release planes and publication boundaries: [`docs/release-model.md`](docs/release-model.md).
 
+Documentation retention: do not classify a document as disposable solely because its filename or origin says `research`, `benchmark`, `UAT`, or `history`. Delete raw execution evidence, one-off repro logs, and superseded process records when appropriate; retain distilled articles that contain reusable architecture comparisons, product positioning, design trade-offs, or long-lived constraints, and update/consolidate them instead of deleting them.
+
 Do not bump the Rust runtime version solely to ship an extension-only UI/DOM/browser-compatibility change. If the current release tooling cannot publish the extension independently, fix or add the extension release path instead of manufacturing a runtime patch release with no runtime change.
 
 ## Binary and runtime ownership
