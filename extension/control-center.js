@@ -544,6 +544,7 @@ async function mutateWorkspaceBinding(workspaceId) {
       convKey: info.convKey,
       workspace_id: workspaceId,
       workspace_label: workspace.label || workspaceId,
+      local_project_key: workspace.local_project_key || null,
     });
   const actionError = !response?.ok && response?.error !== "already-bound"
     ? t(currentlyBound ? "cc_page_unbind_failed" : "cc_page_bind_failed", { error: response?.error || "unknown" })

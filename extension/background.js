@@ -10,7 +10,7 @@
 // Keep H2W_SCRIPT_VERSION here aligned with H2W_CONTENT_VERSION in wake.js.
 import {
   decideWorkspaceWake, agentsInWorkspace, formatWorkspaceRoster, workspaceTitleWithId,
-  reconcileWorkspaceWakeKind,
+  reconcileWorkspaceWakeKind, reconcileWorkspaceCatalogBindings,
   pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
   isIdleNudgeText, looksLikeSubstantiveReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage, interpretLlmJudgeReply,
   assistantNudgeFingerprint, assistantDeclaresPendingWork,
@@ -780,6 +780,36 @@ async function loadBindings() {
 }
 async function saveBindings(b) {
   try { await chrome.storage.local.set({ herdrWakeBindings: b }); } catch (e) {}
+}
+
+async function reconcileBindingsWithLiveWorkspaces(bindings, workspaces, source = "snapshot") {
+  const result = reconcileWorkspaceCatalogBindings(bindings, workspaces);
+  if (!result.changed) return bindings;
+  for (const key of result.prunedKeys) clearProgressTimer(key);
+  await saveBindings(result.kept);
+  const parts = [];
+  if (result.prunedKeys.length) parts.push(`pruned ${result.prunedKeys.length} closed workspace bindings`);
+  if (result.inheritedKeys.length) parts.push(`inherited ${result.inheritedKeys.length} local-project bindings`);
+  callLog(`${parts.join("; ") || "refreshed local project identity"} (${source})`);
+  broadcastControlMessage({ type: "herdr_control_binding_changed" });
+  return result.kept;
+}
+
+async function removeBindingsForWorkspace(bindings, workspaceId) {
+  const id = String(workspaceId || "");
+  if (!id) return bindings;
+  const kept = {};
+  const removed = [];
+  for (const [key, binding] of Object.entries(bindings || {})) {
+    if (normalizeWorkspaceId(binding) === id) removed.push(key);
+    else kept[key] = binding;
+  }
+  if (!removed.length) return bindings;
+  for (const key of removed) clearProgressTimer(key);
+  await saveBindings(kept);
+  callLog(`pruned ${removed.length} bindings for removed workspace ${id}`);
+  broadcastControlMessage({ type: "herdr_control_binding_changed" });
+  return kept;
 }
 
 let queuedInsertMutationTail = Promise.resolve();
@@ -1819,13 +1849,32 @@ async function handlePushBlock(block) {
   ].includes(event)) {
     broadcastControlMessage({ type: "herdr_control_event", event: { type: event, ...data } });
   }
-  const bindings = await loadBindings();
+  let bindings = await loadBindings();
+  if (event === "hello" && Array.isArray(data.workspaces)) {
+    cachePushWorkspaceCatalog(data.workspaces);
+    if (data.workspaces.length > 0) {
+      bindings = await reconcileBindingsWithLiveWorkspaces(bindings, data.workspaces, "push_hello");
+    }
+  } else if (event === "workspace_removed" && data.workspace) {
+    bindings = await removeBindingsForWorkspace(bindings, data.workspace);
+  } else if (event === "workspace_upsert" && Object.keys(bindings).length) {
+    const state = await fetchStateFresh();
+    if (state?.ok && Array.isArray(state.workspaces)) {
+      controlCenterSnapshotAt = Date.now();
+      controlCenterLastState = state;
+      cachePushWorkspaceCatalog(state.workspaces);
+      if (state.workspaces.length > 0) {
+        bindings = await reconcileBindingsWithLiveWorkspaces(bindings, state.workspaces, "workspace_upsert");
+      }
+      if (controlCenterPorts.size > 0) broadcastControlMessage({ type: "herdr_control_state", state });
+    }
+  }
+
   const entries = Object.entries(bindings);
   const scoped = data.workspace
     ? entries.filter(([, b]) => normalizeWorkspaceId(b) === data.workspace)
     : entries;
   if (event === "hello") {
-    cachePushWorkspaceCatalog(data.workspaces);
     for (const [storeKey] of entries) await onPushHello(storeKey, data);
   } else if (event === "agent_working") {
     for (const [storeKey] of scoped) await onPushWorking(storeKey, data);
@@ -4415,7 +4464,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_state") {
     void (async () => {
-      const bindings = await loadBindings();
+      let bindings = await loadBindings();
+      const authoritativeState = controlCenterLastState
+        && Date.now() - controlCenterSnapshotAt <= 5000
+        ? controlCenterLastState
+        : await fetchState();
+      if (authoritativeState?.ok
+        && Array.isArray(authoritativeState.workspaces)
+        && authoritativeState.workspaces.length > 0) {
+        bindings = await reconcileBindingsWithLiveWorkspaces(
+          bindings,
+          authoritativeState.workspaces,
+          "control_center",
+        );
+      }
       // Opening a browser control surface wakes the service worker; restore streams and timers lost to suspension.
       void ensureAlive(bindings);
       let convInfo = null;
@@ -4476,7 +4538,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_bind") {
     void (async () => {
-      const bindings = await loadBindings();
+      let bindings = await loadBindings();
       const tabId = msg.tabId || sender.tab?.id;
       if (!tabId) { sendResponse({ ok: false, error: "tab-unavailable" }); return; }
       const convInfo = await conversationInfoForTab(tabId);
@@ -4510,6 +4572,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         binding_scope: projectScoped ? "project" : (pendingRoot ? "pending" : "conversation"),
         project_id: pageInfo?.project_id || null,
         project_key: pageInfo?.project_key || null,
+        local_project_key: msg.local_project_key || null,
         active_conv_key: projectScoped && hasConversationTarget ? pageInfo.convKey : null,
         tabId: deliveryTabId,
         tabUrl: deliveryTabId ? (pageInfo?.url || sender.tab?.url || null) : null,
@@ -4544,8 +4607,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const convKey = msg.convKey;
       const wsId = msg.workspace_id || null;
       const session = bindingsForConv(bindings, convKey);
+      const selected = wsId
+        ? session.find((b) => (b.workspace_id || normalizeWorkspaceId(b)) === wsId)
+        : null;
+      const localProjectKey = selected?.local_project_key || null;
       const targets = wsId
-        ? session.filter((b) => (b.workspace_id || normalizeWorkspaceId(b)) === wsId).map((b) => ({ storeKey: b.storeKey }))
+        ? session
+          .filter((b) => localProjectKey
+            ? b.local_project_key === localProjectKey
+            : (b.workspace_id || normalizeWorkspaceId(b)) === wsId)
+          .map((b) => ({ storeKey: b.storeKey }))
         : session.map((b) => ({ storeKey: b.storeKey }));
       if (!targets.length || targets.every((t) => !bindings[t.storeKey])) {
         sendResponse({ ok: false, error: "not-found" });

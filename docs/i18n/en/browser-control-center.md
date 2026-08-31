@@ -99,9 +99,13 @@ The Control Center no longer splits “workspace status” and “current-page b
 - an aggregate workspace status dot;
 - pane count and working count;
 - whether the active page is bound to this workspace;
-- the single **Bind / ✓ Bound** toggle.
+- the single **Bind / Bound** toggle.
 
-Workspaces already bound to the active page move to the front and remain highlighted. Clicking the workspace body only expands or collapses its panes; clicking the binding toggle only binds or unbinds, so the two interactions do not trigger each other. Binding mutations are serialized in the UI to avoid ambiguous intermediate states from repeated clicks. Once a workspace disappears from Herdr's authoritative live snapshot, its page bindings are pruned automatically. Opening Control Center also performs a compensating reconciliation, so closed historical workspaces do not remain as offline rows or make different pages report different workspace counts.
+Workspaces already bound to the active page move to the front and remain highlighted. Clicking the workspace body only expands or collapses its panes; clicking the binding toggle only binds or unbinds, so the two interactions do not trigger each other. Binding mutations are serialized in the UI to avoid ambiguous intermediate states from repeated clicks.
+
+A binding also carries a local project identity that is independent from ChatGPT's Project identity. For Git workspaces, the runtime derives it from Git common-dir metadata, so the main checkout and linked worktrees belong to the same local project. For a non-Git workspace, the canonical local folder is the fallback identity. After one workspace is bound, a newly opened Herdr workspace with the same local project identity automatically inherits that same browser scope. In a ChatGPT Project this remains Project-scoped; in a normal `/c/<id>` chat it remains conversation-scoped and does not leak into another chat.
+
+Exact `workspace_removed` lifecycle events remove closed workspace bindings immediately. A non-empty authoritative workspace catalog also performs compensating reconciliation for events missed while the MV3 worker was suspended. An empty or transient catalog is not treated as proof that every workspace closed. Closed historical workspaces are not synthesized as offline rows. Unbinding one member of an auto-bound local-project group removes that group from the current browser scope, preventing immediate re-inheritance.
 
 Expanded rows continue to show pane-level detail:
 

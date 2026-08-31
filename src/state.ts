@@ -13,11 +13,71 @@
  *   {"event":"pane_updated","data":{"type":"pane_updated","pane":{<full PaneInfo>}}}
  * `data.pane` is a FULL post-change PaneInfo, so any pane event is an upsert.
  */
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import * as path from "node:path";
 import { HerdrClient, HerdrEvent, HerdrResult } from "./herdr.js";
 import { fetchSessionSnapshot, reconcileSnapshotWithListApis } from "./snap-fallback.js";
 
 const RESUBSCRIBE_SEC = 25;   // subscribe chunk (daemon may not send on idle)
 const TTL_MS = 30_000;        // force a full re-snapshot at least this often
+
+function canonicalLocalPath(value: string): string {
+  try { return realpathSync(value); } catch { return path.resolve(value); }
+}
+
+function findGitTopLevel(start: string): string | null {
+  let current = canonicalLocalPath(start);
+  for (;;) {
+    if (existsSync(path.join(current, ".git"))) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+function gitCommonDir(gitRoot: string): string | null {
+  const dotGit = path.join(gitRoot, ".git");
+  let gitDir: string;
+  try {
+    const stat = statSync(dotGit);
+    if (stat.isDirectory()) {
+      gitDir = canonicalLocalPath(dotGit);
+    } else if (stat.isFile()) {
+      const line = readFileSync(dotGit, "utf8")
+        .split(/\r?\n/)
+        .find((value) => value.startsWith("gitdir:"));
+      if (!line) return null;
+      const value = line.slice("gitdir:".length).trim();
+      gitDir = canonicalLocalPath(path.isAbsolute(value) ? value : path.join(gitRoot, value));
+    } else {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+
+  const commonFile = path.join(gitDir, "commondir");
+  if (!existsSync(commonFile)) return gitDir;
+  try {
+    const value = readFileSync(commonFile, "utf8").split(/\r?\n/, 1)[0]?.trim();
+    if (!value) return gitDir;
+    return canonicalLocalPath(path.isAbsolute(value) ? value : path.join(gitDir, value));
+  } catch {
+    return gitDir;
+  }
+}
+
+function localProjectKey(root: string): string {
+  const canonicalRoot = canonicalLocalPath(root);
+  const gitRoot = findGitTopLevel(canonicalRoot);
+  const commonDir = gitRoot ? gitCommonDir(gitRoot) : null;
+  return commonDir ? `git:${commonDir}` : `dir:${canonicalRoot}`;
+}
+
+function localProjectKeyForRoots(roots: string[]): string | null {
+  const keys = [...new Set(roots.filter(Boolean).map(localProjectKey))];
+  return keys.length === 1 ? keys[0] : null;
+}
 
 export interface AgentView {
   name: string | null;
@@ -391,10 +451,10 @@ export class SnapshotCache {
     return arr as Record<string, unknown>[];
   }
 
-  workspaceViews(): { id: string; label: string | null; roots: string[] }[] {
+  workspaceViews(): { id: string; label: string | null; roots: string[]; local_project_key: string | null }[] {
     const wss = (this.state["workspaces"] as unknown[]) ?? [];
     const agents = this.agentViews();
-    const out: { id: string; label: string | null; roots: string[] }[] = [];
+    const out: { id: string; label: string | null; roots: string[]; local_project_key: string | null }[] = [];
     for (const w of wss) {
       const rec = (w ?? {}) as Record<string, unknown>;
       const id = typeof rec["workspace_id"] === "string" ? (rec["workspace_id"] as string)
@@ -425,7 +485,7 @@ export class SnapshotCache {
           if (cwd && !roots.includes(cwd)) roots.push(cwd);
         }
       }
-      out.push({ id, label, roots });
+      out.push({ id, label, roots, local_project_key: localProjectKeyForRoots(roots) });
     }
     return out;
   }

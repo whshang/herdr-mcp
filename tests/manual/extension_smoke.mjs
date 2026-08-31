@@ -63,6 +63,7 @@ ok(!existsSync(path.join(EXT, "popup.html")) && !existsSync(path.join(EXT, "popu
 ok(!manifest.key, "unpacked extension keeps its existing Chromium path-derived identity");
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
+const bindingCoreSource = readFileSync(path.join(EXT, "binding-core.js"), "utf8");
 const pushSource = readFileSync(path.join(EXT, "..", "src", "push.ts"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const chatGptAdapterSource = readFileSync(path.join(EXT, "content", "injector", "chatgpt.js"), "utf8");
@@ -774,7 +775,8 @@ ok(!controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && controlCenterSource.includes("workspaceRowsForPage(state.workspaces || [], pageContextBindings())")
     && controlCenterModelSource.includes("export function workspaceRowsForPage")
     && controlCenterModelSource.includes("...sorted.filter((workspace) => boundIds.has")
-    && controlCenterModelSource.includes("binding_missing: true")
+    && !controlCenterModelSource.includes("binding_missing: true")
+    && controlCenterSource.includes("local_project_key: workspace.local_project_key || null")
     && controlCenterSource.includes("if (!currentlyBound && !workspace) return")
     && !controlCenterSource.includes("pageWorkspaceSelect")
     && !controlCenterSource.includes("pageBindings")
@@ -797,6 +799,13 @@ ok(!controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && controlCenterSource.includes('t("native_host_help")'),
   "Control Center keeps explicit local targets, shows steer only when advertised, and exposes fenced Agent Ctrl+C plus narrow terminal command execution");
 ok(backgroundSource.includes('event === "hello"')
+    && backgroundSource.includes("reconcileWorkspaceCatalogBindings")
+    && backgroundSource.includes("reconcileBindingsWithLiveWorkspaces")
+    && backgroundSource.includes("removeBindingsForWorkspace")
+    && backgroundSource.includes('event === "workspace_removed"')
+    && backgroundSource.includes('event === "workspace_upsert"')
+    && bindingCoreSource.includes("export function reconcileWorkspaceCatalogBindings")
+    && bindingCoreSource.includes('persistence: "local_project_inherited"')
     && backgroundSource.includes('type: "herdr_control_state"')
     && backgroundSource.includes('type: "herdr_control_event"')
     && backgroundSource.includes('"pane_upsert", "pane_removed", "workspace_upsert", "workspace_removed"')

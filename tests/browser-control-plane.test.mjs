@@ -28,11 +28,12 @@ import {
   workspaceRowsForPage,
 } from "../extension/control-center-model.js";
 import { createBrowserStateStore } from "../extension/browser-state-store.js";
+import { reconcileWorkspaceCatalogBindings } from "../extension/binding-core.js";
 
 function baseSnapshot() {
   return {
     server_time: "2026-08-27T09:00:00Z",
-    workspaces: [{ id: "w1", label: "repo", roots: ["/repo"] }],
+    workspaces: [{ id: "w1", label: "repo", roots: ["/repo"], local_project_key: "git:/repo/.git" }],
     panes: [
       { pane_id: "w1:p1", workspace_id: "w1", cwd: "/repo", terminal_title: "pi - repo" },
       { pane_id: "w1:p2", workspace_id: "w1", cwd: "/repo/tools" },
@@ -55,9 +56,47 @@ test("snapshot -> BrowserStateView normalizes current Rust push shape", () => {
   const view = normalizeBrowserState(baseSnapshot());
   assert.equal(view.workspaces.length, 1);
   assert.equal(view.workspaces[0].workspace_id, "w1");
+  assert.equal(view.workspaces[0].local_project_key, "git:/repo/.git");
   assert.equal(view.panes[0].agent.name, "pi");
   assert.equal(view.panes[0].project_root, "/repo");
   assert.equal(view.panes[0].status, "working");
+});
+
+test("workspace catalog reconciliation inherits same local project and prunes closed workspaces", () => {
+  const now = 12345;
+  const source = {
+    workspace_id: "w1",
+    workspace_label: "main",
+    convKey: "https://chatgpt.com/c/abc",
+    created_at: 100,
+    persistence: "explicit",
+    continuity_id: "continuity-1",
+    workingPanes: { "w1:p1": true },
+    status: "working",
+    lastSettle: { seq: 1, at: 99 },
+  };
+  const bindings = {
+    "https://chatgpt.com/c/abc::w1": source,
+    "https://chatgpt.com/c/abc::wGone": {
+      ...source,
+      workspace_id: "wGone",
+      workspace_label: "gone",
+    },
+  };
+  const result = reconcileWorkspaceCatalogBindings(bindings, [
+    { id: "w1", label: "main", roots: ["/repo"], local_project_key: "git:/repo/.git" },
+    { id: "w2", label: "feature", roots: ["/worktree"], local_project_key: "git:/repo/.git" },
+    { id: "w3", label: "other", roots: ["/other"], local_project_key: "git:/other/.git" },
+  ], now);
+
+  assert.equal(result.changed, true);
+  assert.deepEqual(result.prunedKeys, ["https://chatgpt.com/c/abc::wGone"]);
+  assert.deepEqual(result.inheritedKeys, ["https://chatgpt.com/c/abc::w2"]);
+  assert.equal(result.kept["https://chatgpt.com/c/abc::w1"].local_project_key, "git:/repo/.git");
+  assert.equal(result.kept["https://chatgpt.com/c/abc::w2"].persistence, "local_project_inherited");
+  assert.equal(result.kept["https://chatgpt.com/c/abc::w2"].continuity_id, "continuity-1");
+  assert.deepEqual(result.kept["https://chatgpt.com/c/abc::w2"].workingPanes, {});
+  assert.equal(result.kept["https://chatgpt.com/c/abc::w3"], undefined);
 });
 
 test("BrowserStateStore UI adapter supports snapshot/get/event subscription", () => {
@@ -409,7 +448,7 @@ test("workspace aggregate status exposes the highest-priority live state", () =>
   assert.equal(workspaceAggregateStatus({ panes: [] }), "unknown");
 });
 
-test("workspace rows merge current-page binding with live state and preserve stale unbind targets", () => {
+test("workspace rows prioritize live bound workspaces without synthesizing closed rows", () => {
   const live = [
     { workspace_id: "w1", label: "Alpha", panes: [{ status: "done" }] },
     { workspace_id: "w2", label: "Beta", panes: [{ status: "working" }] },
@@ -420,9 +459,7 @@ test("workspace rows merge current-page binding with live state and preserve sta
     { workspace_id: "w9", workspace_label: "Closed workspace" },
     { workspace_id: "w9", workspace_label: "Closed workspace" },
   ]);
-  assert.deepEqual(rows.map((row) => row.workspace_id), ["w1", "w9", "w2", "w3"]);
-  assert.equal(rows[1].binding_missing, true);
-  assert.equal(rows[1].label, "Closed workspace");
+  assert.deepEqual(rows.map((row) => row.workspace_id), ["w1", "w2", "w3"]);
   assert.deepEqual(live.map((row) => row.workspace_id), ["w1", "w2", "w3"], "input order is not mutated");
 });
 
