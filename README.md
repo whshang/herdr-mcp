@@ -26,6 +26,46 @@ The protocol covers Herdr installation, stable herdr-mcp installation, Cloudflar
 
 For operator/manual reference, see [Installation](docs/i18n/en/install.md).
 
+## Add a new computer to an existing Worker (v0.4.3+)
+
+This path is **v0.4.3+ only**. Current stable is still **v0.4.2**, so the commands below are not yet available on a stock install. The Agent must **fail closed**: if the installed CLI does not expose `herdr-mcp worker connect` (and the enrollment commands), stop and report the version/capability blocker instead of improvising.
+
+This is **not** a fresh Worker deployment. If you say “connect this new computer to my existing Worker”, the Agent must **not** create a new Cloudflare Worker, Durable Object namespace, OAuth app/client, Connector, or copy the legacy global `LINK_SHARED_SECRET`. It joins the Worker you already have.
+
+### Phase A — on the already-authorized existing macOS computer
+
+Generate a short-lived, single-use, `0600` enrollment file:
+
+```bash
+herdr-mcp worker enrollment create --ttl-seconds 600 --name "<new-device-name>" --output "<secure-path>"
+```
+
+- TTL range is **60..900 seconds**. If the file expires, generate a new one.
+- Transfer the file **securely** to the new computer (e.g. AirDrop, an encrypted channel). Do **not** paste or copy the enrollment code into chat, argv, logs, clipboard instructions, issue trackers, or README examples.
+
+### Phase B — paste this prompt into a Coding Agent on the new computer
+
+The following is a complete, copy-paste prompt for a Coding Agent such as Pi running **on the new computer**. It is direct and imperative; the Agent should execute it and pause only for genuine human auth or secure-file transfer.
+
+```text
+You are enrolling this macOS computer into an EXISTING herdr-mcp Cloudflare Worker/Connector. This is NOT a fresh deployment.
+
+1. Read the repository's authoritative Agent install protocol first (docs/i18n/en/agent-install.md) to inherit its safety/prerequisite/Release-install rules. Because the intent is EXISTING Worker enrollment, do NOT execute its fresh Cloudflare Worker/DO/OAuth/Connector deployment sections. The existing-worker instructions in this section take precedence for Worker binding.
+2. Before installing, check the latest stable Release version/capability. If stable is still <0.4.3 or the stable runtime lacks `worker connect`, stop and report a release/capability blocker. Do not install a prerelease/source build unless the user explicitly asked to test preview/source.
+3. Install the latest stable PROD herdr-mcp from the GitHub Release, not from a repo checkout. Do not treat a source/dev build as a normal install. After install, verify version/capability and require v0.4.3+ with `herdr-mcp worker connect`. If the installed CLI does not expose it, stop and report the version/capability blocker.
+4. Use the enrollment file path the user explicitly provides. Do NOT broadly search the filesystem for enrollment/secret files, and do NOT print or cat its contents.
+5. This v0.4.3 secure enrollment path requires macOS. If this is Linux/Windows, stop as unsupported/fail-closed for this path.
+6. Ensure the enrollment file ownership/mode are safe (0600, current user), then run:
+   herdr-mcp worker connect --enrollment-file "<path>" --name "<device-name>"
+   Normally do NOT pass --edge-origin because the file is Worker-bound. If an override is ever used, it must exactly match the file-bound Worker origin.
+7. Never put the enrollment code or the final device secret on argv/stdout/logs. The final device credential belongs in the macOS Keychain.
+8. Connect to the existing Worker/Connector only. Do not deploy or mutate Cloudflare unless the protocol proves enrollment is unavailable AND the user explicitly asked for a fresh Worker; otherwise stop.
+9. Verify `herdr-mcp status`, `herdr-mcp doctor`, and `herdr-mcp link status`. Confirm the resulting immutable `device_id`, Link online/healthy, and successful local binding. A successful connect consumes/deletes the one-shot enrollment file.
+10. If any mutation reports uncertain delivery, do not blind retry; inspect current state first. If connect fails after server-side consume, rely on the built-in compensation/revoke behavior and report evidence rather than inventing manual secret handling.
+```
+
+After both devices are enrolled, the same existing ChatGPT Connector/Worker should see both devices through the multi-device public surface. This is expected v0.4.3 behavior pending release/UAT; formal two-device GA/UAT has not yet passed.
+
 ## First real test
 
 In a new ChatGPT conversation with the `herdr` Connector enabled, send:
