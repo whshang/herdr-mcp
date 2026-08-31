@@ -12,9 +12,7 @@ pub enum Command {
         probe: bool,
     },
     Config(ConfigCommand),
-    Dev {
-        dry_run: bool,
-    },
+    Dev(DevCommand),
     Candidate {
         port: u16,
     },
@@ -92,6 +90,13 @@ pub enum NativeHostCommand {
     DevDisable,
     UseStore,
     UseDev,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum DevCommand {
+    Sync { dry_run: bool, allow_dirty: bool },
+    Status,
+    Rollback,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -523,14 +528,46 @@ fn parse_scan(args: &[String]) -> Result<Command, String> {
 }
 
 fn parse_dev(args: &[String]) -> Result<Command, String> {
+    if args.is_empty() {
+        return Ok(Command::Dev(DevCommand::Status));
+    }
+    if args[0] == "status" {
+        if args.len() != 1 {
+            return Err("dev status does not accept extra arguments".to_owned());
+        }
+        return Ok(Command::Dev(DevCommand::Status));
+    }
+    if args[0] == "rollback" {
+        if args.len() != 1 {
+            return Err("dev rollback does not accept extra arguments".to_owned());
+        }
+        return Ok(Command::Dev(DevCommand::Rollback));
+    }
+
+    // Compatibility: old `herdr-mcp dev --dry-run` means native `dev sync --dry-run`.
+    let option_start = if args[0] == "sync" { 1 } else { 0 };
+    if option_start == 0 && !args[0].starts_with('-') {
+        return Err(format!(
+            "unknown dev command '{}' (expected sync | status | rollback)",
+            args[0]
+        ));
+    }
     let mut dry_run = false;
-    for arg in args {
+    let mut allow_dirty = false;
+    for arg in &args[option_start..] {
         match arg.as_str() {
-            "--dry-run" => dry_run = true,
-            value => return Err(format!("unknown dev argument '{value}'")),
+            "--dry-run" if !dry_run => dry_run = true,
+            "--allow-dirty" if !allow_dirty => allow_dirty = true,
+            "--dry-run" | "--allow-dirty" => {
+                return Err(format!("duplicate dev sync argument '{arg}'"));
+            }
+            value => return Err(format!("unknown dev sync argument '{value}'")),
         }
     }
-    Ok(Command::Dev { dry_run })
+    Ok(Command::Dev(DevCommand::Sync {
+        dry_run,
+        allow_dirty,
+    }))
 }
 
 fn parse_candidate(args: &[String]) -> Result<Command, String> {
@@ -776,7 +813,9 @@ Advanced / internal:\n\
   herdr-mcp artifact import --url HTTPS_URL --path PROJECT_PATH [--sha256 HEX] [--capability-env NAME | --signed-url] [--overwrite] [--confirm-dirty] [--confirm-busy]\n\
   (--signed-url imports a safe signed HTTPS URL directly; R2 relay objects use
   HERDR_ARTIFACT_CAPABILITY, which is never a CLI arg)\n\
-  herdr-mcp dev [--dry-run]\n\
+  herdr-mcp dev [status]\n\
+  herdr-mcp dev sync [--dry-run] [--allow-dirty]\n\
+  herdr-mcp dev rollback\n\
   herdr-mcp candidate [--port 8873]\n\n\
 Prefer the top-level install/status/doctor/permissions/scan/update/rollback/uninstall commands\n\
 for normal lifecycle. Use service ... only for advanced service control\n\
@@ -892,7 +931,27 @@ mod tests {
         );
         assert_eq!(
             parse(args(&["dev", "--dry-run"])).unwrap().command,
-            Command::Dev { dry_run: true }
+            Command::Dev(DevCommand::Sync {
+                dry_run: true,
+                allow_dirty: false
+            })
+        );
+        assert_eq!(
+            parse(args(&["dev"])).unwrap().command,
+            Command::Dev(DevCommand::Status)
+        );
+        assert_eq!(
+            parse(args(&["dev", "sync", "--allow-dirty"]))
+                .unwrap()
+                .command,
+            Command::Dev(DevCommand::Sync {
+                dry_run: false,
+                allow_dirty: true
+            })
+        );
+        assert_eq!(
+            parse(args(&["dev", "rollback"])).unwrap().command,
+            Command::Dev(DevCommand::Rollback)
         );
         assert_eq!(
             parse(args(&["candidate", "--port", "9000"]))

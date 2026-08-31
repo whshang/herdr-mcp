@@ -90,7 +90,7 @@ fn run() -> Result<ExitCode, String> {
         }
         cli::Command::Version => {
             let contract = contract::identity()?;
-            println!("herdr-mcp {}", env!("CARGO_PKG_VERSION"));
+            println!("herdr-mcp {}", runtime_meta::runtime_version());
             println!(
                 "contract epoch {} / {} tools",
                 contract.epoch, contract.tool_count
@@ -183,7 +183,7 @@ fn run() -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        cli::Command::Dev { dry_run } => dev::run(dry_run),
+        cli::Command::Dev(command) => dev::run(command),
         cli::Command::Candidate { port } => {
             eprintln!("{}", child_process::reap_confirmed_orphans_on_boot());
             mcp_http::serve_candidate(port)

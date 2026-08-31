@@ -434,7 +434,8 @@ fn runtime_context(config: &SkillConfig) -> Value {
     let worker_fallbacks = worker_fallback_context(config);
     let contract = contract::identity().ok();
     json!({
-        "server_version": env!("CARGO_PKG_VERSION"),
+        "server_version": crate::runtime_meta::runtime_version(),
+        "runtime_channel": crate::runtime_meta::runtime_channel(),
         "build_commit": env::var("HERDR_MCP_BUILD_COMMIT").unwrap_or_else(|_| "dev".to_owned()),
         "contract_profile": env::var("HERDR_MCP_CONTRACT_PROFILE").unwrap_or_else(|_| "current".to_owned()),
         "tool_execution": {

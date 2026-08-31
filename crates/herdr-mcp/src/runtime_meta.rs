@@ -30,15 +30,48 @@ const MIGRATED_TOOLS: [&str; 18] = [
 
 static STARTED_AT: OnceLock<String> = OnceLock::new();
 
+pub fn runtime_channel() -> &'static str {
+    match option_env!("HERDR_MCP_BUILD_CHANNEL") {
+        Some("dev") => "dev",
+        _ => "prod",
+    }
+}
+
+pub fn runtime_version() -> &'static str {
+    match option_env!("HERDR_MCP_BUILD_VERSION") {
+        Some(value) if !value.is_empty() => value,
+        _ => env!("CARGO_PKG_VERSION"),
+    }
+}
+
+pub fn compiled_source_commit() -> Option<&'static str> {
+    match option_env!("HERDR_MCP_BUILD_COMMIT") {
+        Some(value) if !value.is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+pub fn compiled_source_dirty() -> bool {
+    matches!(option_env!("HERDR_MCP_BUILD_DIRTY"), Some("1" | "true"))
+}
+
 pub fn build_info() -> Value {
     let started_at = started_at();
     let built_at = env::var("HERDR_MCP_BUILT_AT").unwrap_or_else(|_| started_at.clone());
+    let commit = compiled_source_commit()
+        .map(str::to_owned)
+        .or_else(|| env::var("HERDR_MCP_BUILD_COMMIT").ok())
+        .unwrap_or_else(|| "unknown".to_owned());
     json!({
-        "commit": env::var("HERDR_MCP_BUILD_COMMIT").unwrap_or_else(|_| "dev".to_owned()),
+        "commit": commit,
         "built_at": built_at,
         "started_at": started_at,
         "pid": std::process::id(),
-        "server_version": env!("CARGO_PKG_VERSION"),
+        "server_version": runtime_version(),
+        "package_version": env!("CARGO_PKG_VERSION"),
+        "channel": runtime_channel(),
+        "source_commit": compiled_source_commit(),
+        "source_dirty": compiled_source_dirty(),
         "runtime": "rust",
         "stale": false,
     })
@@ -143,7 +176,8 @@ pub fn health_fields(cache: &EventCache, exec: Option<&ExecRegistry>) -> Map<Str
         "runtime".to_owned(),
         json!(if sealed { "rust" } else { "rust-candidate" }),
     );
-    output.insert("version".to_owned(), json!(env!("CARGO_PKG_VERSION")));
+    output.insert("version".to_owned(), json!(runtime_version()));
+    output.insert("channel".to_owned(), json!(runtime_channel()));
     output.insert("build".to_owned(), build_info());
     output.insert("native_migration".to_owned(), migration_status());
     output.insert(
@@ -233,7 +267,9 @@ mod tests {
         let first = build_info();
         let second = build_info();
         assert_eq!(first["started_at"], second["started_at"]);
-        assert_eq!(first["server_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(first["server_version"], runtime_version());
+        assert_eq!(first["channel"], runtime_channel());
+        assert_eq!(first["package_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(first["runtime"], "rust");
     }
 

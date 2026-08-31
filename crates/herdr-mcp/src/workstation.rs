@@ -20,7 +20,10 @@ pub fn info(view: &Value, topology: &ProjectTopology) -> Value {
 
     json!({
         "server_name": "herdr-mcp",
-        "server_version": env!("CARGO_PKG_VERSION"),
+        "server_version": crate::runtime_meta::runtime_version(),
+        "runtime_channel": crate::runtime_meta::runtime_channel(),
+        "runtime_source_commit": crate::runtime_meta::compiled_source_commit(),
+        "runtime_source_dirty": crate::runtime_meta::compiled_source_dirty(),
         "default_cwd": default_cwd(view),
         "managed_git_roots": managed_git_roots,
         "readonly_mode": env::var("HERDR_MCP_READONLY").ok().as_deref() == Some("1"),

@@ -56,7 +56,20 @@ fn collect(paths: &RuntimePaths, config: &Config) -> StatusReport {
 
 pub fn print_status(paths: &RuntimePaths, config: &Config) {
     let report = collect(paths, config);
-    println!("Herdr MCP {}", env!("CARGO_PKG_VERSION"));
+    println!("Herdr MCP {}", crate::runtime_meta::runtime_version());
+    println!(
+        "runtime channel: {}",
+        crate::runtime_meta::runtime_channel()
+    );
+    println!(
+        "runtime source: {}{}",
+        crate::runtime_meta::compiled_source_commit().unwrap_or("release"),
+        if crate::runtime_meta::compiled_source_dirty() {
+            " (dirty)"
+        } else {
+            ""
+        }
+    );
     println!("config: {}", paths.config_file.display());
     println!(
         "runtime: {}",
@@ -111,6 +124,17 @@ pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
     let documents_permission = macos_privacy::probe_documents_permission(&paths.config_dir);
     let code_identity = macos_privacy::probe_code_identity();
     println!("Herdr MCP doctor");
+    println!(
+        "runtime provenance: channel={} version={} source={}{}",
+        crate::runtime_meta::runtime_channel(),
+        crate::runtime_meta::runtime_version(),
+        crate::runtime_meta::compiled_source_commit().unwrap_or("release"),
+        if crate::runtime_meta::compiled_source_dirty() {
+            " dirty"
+        } else {
+            ""
+        }
+    );
     print_check("runtime endpoint", runtime_healthy);
     print_check("Herdr local transport", report.herdr_transport_reachable);
     print_check("Herdr API schema", schema_healthy);

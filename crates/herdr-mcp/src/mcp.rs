@@ -100,7 +100,7 @@ fn initialize_result(request: &Value) -> Value {
         "capabilities": {"tools": {"listChanged": true}},
         "serverInfo": {
             "name": "herdr-mcp",
-            "version": env!("CARGO_PKG_VERSION")
+            "version": crate::runtime_meta::runtime_version()
         },
         "instructions": SERVER_INSTRUCTIONS,
         "_meta": {
@@ -122,7 +122,7 @@ fn discover_result() -> Value {
         "_meta": {
             "io.modelcontextprotocol/serverInfo": {
                 "name": "herdr-mcp",
-                "version": env!("CARGO_PKG_VERSION")
+                "version": crate::runtime_meta::runtime_version()
             },
             "herdr_contract_epoch": identity.as_ref().map(|value| value.epoch),
             "herdr_contract_hash": identity.as_ref().map(|value| value.hash.as_str()),
