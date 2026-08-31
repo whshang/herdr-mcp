@@ -23,7 +23,9 @@ use super::cutover_execute::{LaunchdOps, RealLaunchd, atomic_write};
 #[cfg(target_os = "macos")]
 use super::install::{configured_edge_ws_url, inherited_proxy_env};
 #[cfg(target_os = "macos")]
-use super::migrate_runtime_control::{active_rust_generation_id, reconcile_current_generation};
+use super::migrate_runtime_control::{
+    active_rust_generation_id, read_binary_version_hint, reconcile_current_generation,
+};
 #[cfg(target_os = "macos")]
 use super::ownership::{
     LINK_PROD_LABEL, LinkImplementation, assess_agent, program_points_at_managed_runtime,
@@ -69,8 +71,14 @@ pub(crate) fn reconcile_after_service_generation_change(
         }
 
         let generation = active_rust_generation_id(&home)?;
+        let runtime_version = read_binary_version_hint(&home);
         let control_changed = reconcile_current_generation(&home, &paths.config_dir)?;
-        let plist_changed = refresh_prod_plist_generation(&home, &prod.plist_path, &generation)?;
+        let plist_changed = refresh_prod_plist_generation(
+            &home,
+            &prod.plist_path,
+            &generation,
+            runtime_version.as_deref(),
+        )?;
 
         if control_changed || plist_changed {
             launchd.bootout_prod(LINK_PROD_LABEL)?;
@@ -91,6 +99,7 @@ fn refresh_prod_plist_generation(
     home: &Path,
     plist_path: &Path,
     generation: &str,
+    runtime_version: Option<&str>,
 ) -> Result<bool, String> {
     let original = fs::read(plist_path)
         .map_err(|error| format!("cannot read {}: {error}", plist_path.display()))?;
@@ -129,6 +138,17 @@ fn refresh_prod_plist_generation(
         "HERDR_RUNTIME_GENERATION".to_owned(),
         PlistValue::String(generation.to_owned()),
     );
+    match runtime_version {
+        Some(version) if !version.trim().is_empty() => {
+            env_out.insert(
+                "HERDR_RUNTIME_VERSION".to_owned(),
+                PlistValue::String(version.trim().to_owned()),
+            );
+        }
+        _ => {
+            env_out.remove("HERDR_RUNTIME_VERSION");
+        }
+    }
     if let Some(edge_url) = configured_edge_ws_url(home) {
         env_out.insert("HERDR_EDGE_URL".to_owned(), PlistValue::String(edge_url));
     }
@@ -181,6 +201,65 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prod_plist_refresh_pins_generation_and_runtime_version_together() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-link-generation-refresh-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let plist_path = root.join("link-prod.plist");
+        let mut env = Dictionary::new();
+        env.insert(
+            "HERDR_RUNTIME_GENERATION".to_owned(),
+            PlistValue::String("rust-old".to_owned()),
+        );
+        env.insert(
+            "HERDR_RUNTIME_VERSION".to_owned(),
+            PlistValue::String("0.4.2".to_owned()),
+        );
+        let mut root_dict = Dictionary::new();
+        root_dict.insert(
+            "Label".to_owned(),
+            PlistValue::String(LINK_PROD_LABEL.to_owned()),
+        );
+        root_dict.insert(
+            "EnvironmentVariables".to_owned(),
+            PlistValue::Dictionary(env),
+        );
+        let mut bytes = Vec::new();
+        PlistValue::Dictionary(root_dict)
+            .to_writer_xml(&mut bytes)
+            .unwrap();
+        std::fs::write(&plist_path, bytes).unwrap();
+
+        assert!(
+            refresh_prod_plist_generation(&root, &plist_path, "rust-new", Some("0.4.3-dev"),)
+                .unwrap()
+        );
+        let updated = PlistValue::from_file(&plist_path).unwrap();
+        let env = updated
+            .as_dictionary()
+            .unwrap()
+            .get("EnvironmentVariables")
+            .unwrap()
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(
+            env.get("HERDR_RUNTIME_GENERATION")
+                .and_then(PlistValue::as_string),
+            Some("rust-new")
+        );
+        assert_eq!(
+            env.get("HERDR_RUNTIME_VERSION")
+                .and_then(PlistValue::as_string),
+            Some("0.4.3-dev")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn named_instance_is_always_a_noop() {

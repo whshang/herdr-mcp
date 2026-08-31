@@ -53,6 +53,7 @@ pub struct LinkDaemonConfig {
     pub runtime_token: String,
     pub runtime_endpoint: String,
     pub runtime_generation: String,
+    pub runtime_version: Option<String>,
     pub contract_epoch: u64,
     pub contract_hash: String,
     pub runtime_control_path: PathBuf,
@@ -89,6 +90,7 @@ pub fn read_link_daemon_config(
         .unwrap_or_else(|| LOCAL_MCP_DEFAULT_ENDPOINT.to_owned());
     let runtime_generation = optional_trimmed(env_map, "HERDR_RUNTIME_GENERATION")
         .unwrap_or_else(|| "local-mcp-active".to_owned());
+    let runtime_version = optional_trimmed(env_map, "HERDR_RUNTIME_VERSION");
     let contract_hash = optional_trimmed(env_map, "HERDR_CONTRACT_HASH")
         .unwrap_or_else(|| PUBLIC_CONTRACT_HASH.to_owned());
     let contract_epoch = match optional_trimmed(env_map, "HERDR_CONTRACT_EPOCH") {
@@ -154,6 +156,7 @@ pub fn read_link_daemon_config(
         runtime_token,
         runtime_endpoint,
         runtime_generation,
+        runtime_version,
         contract_epoch,
         contract_hash,
         runtime_control_path,
@@ -188,7 +191,7 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
     let base = RuntimeGenerationSpec {
         generation: config.runtime_generation.clone(),
         endpoint: config.runtime_endpoint.clone(),
-        expected_runtime_version: None,
+        expected_runtime_version: config.runtime_version.clone(),
         runtime_commit: None,
     };
     let mut manager_options = RuntimeGenerationManagerOptions::new(
@@ -400,11 +403,19 @@ mod tests {
     }
 
     #[test]
+    fn daemon_config_carries_runtime_version_into_base_identity() {
+        let cfg = read_link_daemon_config(&env(&[("HERDR_RUNTIME_VERSION", "0.4.3-dev")]))
+            .expect("config");
+        assert_eq!(cfg.runtime_version.as_deref(), Some("0.4.3-dev"));
+    }
+
+    #[test]
     fn daemon_config_uses_public_epoch2_identity_and_loopback_mcp_default() {
         let cfg = read_link_daemon_config(&env(&[])).expect("config");
         assert_eq!(cfg.contract_epoch, PUBLIC_CONTRACT_EPOCH);
         assert_eq!(cfg.contract_hash, PUBLIC_CONTRACT_HASH);
         assert_eq!(cfg.runtime_endpoint, LOCAL_MCP_DEFAULT_ENDPOINT);
+        assert_eq!(cfg.runtime_version, None);
         assert_eq!(cfg.edge_url, "wss://herdr-edge-dev.example/ws");
         assert_eq!(cfg.workstation_id, "dev-w1");
     }
@@ -509,6 +520,7 @@ mod tests {
             runtime_token: "runtime-secret".to_owned(),
             runtime_endpoint: "http://127.0.0.1:8772/mcp".to_owned(),
             runtime_generation: "local-mcp-active".to_owned(),
+            runtime_version: Some("0.4.3-dev".to_owned()),
             contract_epoch: PUBLIC_CONTRACT_EPOCH,
             contract_hash: PUBLIC_CONTRACT_HASH.to_owned(),
             runtime_control_path: control_path.clone(),
@@ -519,7 +531,7 @@ mod tests {
         let base = RuntimeGenerationSpec {
             generation: cfg.runtime_generation.clone(),
             endpoint: cfg.runtime_endpoint.clone(),
-            expected_runtime_version: None,
+            expected_runtime_version: cfg.runtime_version.clone(),
             runtime_commit: None,
         };
         let manager = Arc::new(
