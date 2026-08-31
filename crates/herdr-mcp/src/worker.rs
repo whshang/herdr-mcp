@@ -152,6 +152,8 @@ fn connect_existing_worker(
         write_config_atomic,
         revoke_self,
         crate::macos_keychain::delete_generic_secret,
+        crate::link::reconcile_after_service_generation_change,
+        consume_enrollment,
     )
 }
 
@@ -171,8 +173,70 @@ fn compensate_after_store(
 }
 
 #[cfg(any(target_os = "macos", test))]
+struct ReconcileRollbackEvidence {
+    revoked: bool,
+    keychain_deleted: bool,
+    config_restored: bool,
+    link_reconciled: bool,
+    restore_error: Option<String>,
+    reconcile_error: Option<String>,
+}
+
+#[cfg(any(target_os = "macos", test))]
 #[allow(clippy::too_many_arguments)]
-fn connect_macos_inner<F, G, H, I, J>(
+fn rollback_after_reconcile_failure<H, I, J, K>(
+    edge_origin: &str,
+    device_id: &str,
+    keychain_service: &str,
+    account: &str,
+    device_secret: &str,
+    paths: &RuntimePaths,
+    previous_config: &Config,
+    write_config: &H,
+    revoke_fn: &I,
+    delete_secret: &J,
+    reconcile: &K,
+) -> ReconcileRollbackEvidence
+where
+    H: Fn(&RuntimePaths, &Config) -> Result<(), String>,
+    I: Fn(&str, &str, &str) -> Result<bool, String>,
+    J: Fn(&str, &str) -> Result<(), String>,
+    K: Fn(&RuntimePaths) -> Result<(), String>,
+{
+    let (revoked, keychain_deleted) = compensate_after_store(
+        edge_origin,
+        device_id,
+        keychain_service,
+        account,
+        device_secret,
+        revoke_fn,
+        delete_secret,
+    );
+    let (config_restored, restore_error) = match write_config(paths, previous_config) {
+        Ok(()) => (true, None),
+        Err(error) => (false, Some(error)),
+    };
+    let (link_reconciled, reconcile_error) = if config_restored {
+        match reconcile(paths) {
+            Ok(()) => (true, None),
+            Err(error) => (false, Some(error)),
+        }
+    } else {
+        (false, None)
+    };
+    ReconcileRollbackEvidence {
+        revoked,
+        keychain_deleted,
+        config_restored,
+        link_reconciled,
+        restore_error,
+        reconcile_error,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[allow(clippy::too_many_arguments)]
+fn connect_macos_inner<F, G, H, I, J, K, L>(
     paths: &RuntimePaths,
     enrollment_path: &Path,
     edge_origin_override: Option<&str>,
@@ -182,6 +246,8 @@ fn connect_macos_inner<F, G, H, I, J>(
     write_config: H,
     revoke_fn: I,
     delete_secret: J,
+    reconcile: K,
+    consume: L,
 ) -> Result<ExitCode, String>
 where
     F: Fn(&str, &str, &str) -> Result<(), String>,
@@ -189,6 +255,8 @@ where
     H: Fn(&RuntimePaths, &Config) -> Result<(), String>,
     I: Fn(&str, &str, &str) -> Result<bool, String>,
     J: Fn(&str, &str) -> Result<(), String>,
+    K: Fn(&RuntimePaths) -> Result<(), String>,
+    L: Fn(&str, &str, Option<&str>) -> Result<EnrolledCredential, String>,
 {
     let enrollment = read_enrollment_file(enrollment_path)?;
     if enrollment.expires_at_ms <= now_ms() {
@@ -210,7 +278,7 @@ where
     };
     validate_enrollment_code(&enrollment.enrollment_code)?;
 
-    let enrolled = consume_enrollment(&edge_origin, &enrollment.enrollment_code, name)?;
+    let enrolled = consume(&edge_origin, &enrollment.enrollment_code, name)?;
     let device_id = crate::config::normalize_device_id(&enrolled.device_id)?;
     if enrolled.workstation_id != device_id {
         let _ = revoke_fn(
@@ -246,7 +314,9 @@ where
     // Any failure after the secret is durably stored must revoke the remote device
     // and delete the local Keychain credential to avoid orphans. No secret is ever
     // printed in the error.
-    let mut config = match load_config(&paths.config_file, &paths.instance) {
+    // Retain the previous local binding so a post-write failure can roll the
+    // transaction back instead of leaving config/plist bound to a revoked device.
+    let previous_config = match load_config(&paths.config_file, &paths.instance) {
         Ok(c) => c,
         Err(error) => {
             let (revoked, deleted) = compensate_after_store(
@@ -263,6 +333,7 @@ where
             ));
         }
     };
+    let mut config = previous_config.clone();
     if let Err(error) = config.set_edge_public_origin(&edge_origin) {
         let (revoked, deleted) = compensate_after_store(
             &edge_origin,
@@ -306,12 +377,42 @@ where
         ));
     }
 
-    let enrollment_deleted = fs::remove_file(enrollment_path).is_ok();
-    if let Err(error) = crate::link::reconcile_after_service_generation_change(paths) {
+    if let Err(error) = reconcile(paths) {
+        // The config is durably written, but the persisted Link identity could not
+        // be reconciled. Roll the whole local transaction back: exact remote
+        // revoke-self, local Keychain deletion, best-effort atomic restore of the
+        // previous config, and best-effort reconcile of the Link identity from
+        // that config. Rollback failures are reported, never hidden, and no secret
+        // is ever printed. The one-time code is already consumed server-side, so
+        // remove the local file to avoid presenting it as reusable.
+        let evidence = rollback_after_reconcile_failure(
+            &edge_origin,
+            &device_id,
+            &keychain_service,
+            &account,
+            &enrolled.device_secret,
+            paths,
+            &previous_config,
+            &write_config,
+            &revoke_fn,
+            &delete_secret,
+            &reconcile,
+        );
+        let _ = fs::remove_file(enrollment_path);
         return Err(format!(
-            "device {device_id} is enrolled and persisted, but production Link reconciliation failed: {error}"
+            "device {device_id} is enrolled but the local binding could not be reconciled: {error}; compensation revoked={} keychain_deleted={} config_restored={} link_reconciled={} restore_error={} reconcile_error={}",
+            evidence.revoked,
+            evidence.keychain_deleted,
+            evidence.config_restored,
+            evidence.link_reconciled,
+            evidence.restore_error.as_deref().unwrap_or("none"),
+            evidence.reconcile_error.as_deref().unwrap_or("none"),
         ));
     }
+
+    // The local transaction has closed successfully. Only now delete the
+    // consumed enrollment file; deletion never implies success before this point.
+    let enrollment_deleted = fs::remove_file(enrollment_path).is_ok();
 
     print_json(&json!({
         "ok": true,
@@ -858,5 +959,312 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = paths; // keep paths used
+    }
+
+    #[test]
+    fn reconcile_failure_rolls_back_local_binding_with_evidence() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = env::temp_dir().join(format!(
+            "herdr-worker-reconcile-rollback-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let paths = crate::paths::RuntimePaths {
+            config_dir: dir.clone(),
+            config_file: config_path.clone(),
+            dev_state_dir: dir.join("dev-state"),
+            herdr_socket: None,
+            instance: InstanceId::default_instance(),
+        };
+
+        // Previous config is the durable local binding that must be restored.
+        // OLD and NEW device ids are distinct valid ULIDs so the "new id absent"
+        // assertion is meaningful, not a false positive.
+        const OLD_DEVICE_ID: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const NEW_DEVICE_ID: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        let previous_config = Config {
+            edge_public_origin: Some("https://old.example".to_owned()),
+            edge_device_id: Some(OLD_DEVICE_ID.to_owned()),
+            ..Config::default()
+        };
+
+        let written = Rc::new(RefCell::new(Vec::<Config>::new()));
+        let written_clone = written.clone();
+        let write_config = move |_paths: &RuntimePaths, config: &Config| -> Result<(), String> {
+            written_clone.borrow_mut().push(config.clone());
+            Ok(())
+        };
+        let revoke = |_: &str, _: &str, _: &str| -> Result<bool, String> { Ok(true) };
+        let delete = |_: &str, _: &str| -> Result<(), String> { Ok(()) };
+        let reconcile = |_paths: &RuntimePaths| -> Result<(), String> {
+            Err("simulated reconcile failure".to_owned())
+        };
+
+        let evidence = rollback_after_reconcile_failure(
+            "https://edge.example",
+            NEW_DEVICE_ID,
+            &format!("herdr-edge-link-{NEW_DEVICE_ID}"),
+            "testuser",
+            &format!("devsec_{}", "b".repeat(64)),
+            &paths,
+            &previous_config,
+            &write_config,
+            &revoke,
+            &delete,
+            &reconcile,
+        );
+
+        assert!(evidence.revoked);
+        assert!(evidence.keychain_deleted);
+        assert!(evidence.config_restored);
+        assert!(!evidence.link_reconciled);
+        assert!(evidence.reconcile_error.is_some());
+        assert!(evidence.restore_error.is_none());
+
+        // The previous config (old device binding) must be the last thing written,
+        // so the new device id is never left in the local binding after rollback.
+        let writes = written.borrow();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0], previous_config);
+        assert_eq!(writes[0].edge_device_id.as_deref(), Some(OLD_DEVICE_ID));
+        assert_ne!(writes[0].edge_device_id.as_deref(), Some(NEW_DEVICE_ID));
+
+        // No secret is ever surfaced in the rollback evidence.
+        let error = format!(
+            "device {} is enrolled but the local binding could not be reconciled: simulated; compensation revoked={} keychain_deleted={} config_restored={} link_reconciled={} restore_error={} reconcile_error={}",
+            NEW_DEVICE_ID,
+            evidence.revoked,
+            evidence.keychain_deleted,
+            evidence.config_restored,
+            evidence.link_reconciled,
+            evidence.restore_error.as_deref().unwrap_or("none"),
+            evidence.reconcile_error.as_deref().unwrap_or("none"),
+        );
+        assert!(!error.contains("devsec_"));
+        assert!(!error.contains("enroll_"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_failure_restore_error_is_reported_not_hidden() {
+        let dir = env::temp_dir().join(format!(
+            "herdr-worker-reconcile-restore-error-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let paths = crate::paths::RuntimePaths {
+            config_dir: dir.clone(),
+            config_file: config_path.clone(),
+            dev_state_dir: dir.join("dev-state"),
+            herdr_socket: None,
+            instance: InstanceId::default_instance(),
+        };
+        let previous_config = Config::default();
+
+        let write_config = |_paths: &RuntimePaths, _config: &Config| -> Result<(), String> {
+            Err("restore write failed".to_owned())
+        };
+        let revoke = |_: &str, _: &str, _: &str| -> Result<bool, String> { Ok(true) };
+        let delete = |_: &str, _: &str| -> Result<(), String> { Ok(()) };
+        let reconcile = |_paths: &RuntimePaths| -> Result<(), String> {
+            Err("simulated reconcile failure".to_owned())
+        };
+
+        let evidence = rollback_after_reconcile_failure(
+            "https://edge.example",
+            "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "testuser",
+            &format!("devsec_{}", "b".repeat(64)),
+            &paths,
+            &previous_config,
+            &write_config,
+            &revoke,
+            &delete,
+            &reconcile,
+        );
+
+        // A failed restore must be surfaced, not hidden, and must not claim
+        // link_reconciled since the config was never restored.
+        assert!(evidence.revoked);
+        assert!(evidence.keychain_deleted);
+        assert!(!evidence.config_restored);
+        assert!(!evidence.link_reconciled);
+        assert!(evidence.restore_error.is_some());
+        assert!(evidence.reconcile_error.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connect_macos_inner_rolls_back_whole_transaction_on_reconcile_failure() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        const OLD_DEVICE_ID: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const NEW_DEVICE_ID: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        const DEVICE_SECRET: &str =
+            "devsec_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+        let dir = env::temp_dir().join(format!(
+            "herdr-worker-connect-transaction-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        // Enrollment file written and owned by this user at mode 0600.
+        let enrollment_path = dir.join("enrollment.json");
+        let enrollment_body = serde_json::to_vec(&EnrollmentFile {
+            schema_version: ENROLLMENT_FILE_SCHEMA,
+            edge_origin: "https://edge.example".to_owned(),
+            enrollment_code: format!("enroll_{}", "d".repeat(64)),
+            expires_at_ms: now_ms() + 60_000,
+        })
+        .unwrap();
+        fs::write(&enrollment_path, &enrollment_body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = fs::metadata(&enrollment_path).unwrap().permissions();
+            perm.set_mode(0o600);
+            fs::set_permissions(&enrollment_path, perm).unwrap();
+        }
+
+        // Config file carries the OLD device binding before the transaction.
+        let config_path = dir.join("config.toml");
+        let previous_config = Config {
+            edge_public_origin: Some("https://old.example".to_owned()),
+            edge_device_id: Some(OLD_DEVICE_ID.to_owned()),
+            ..Config::default()
+        };
+        fs::write(&config_path, previous_config.render()).unwrap();
+
+        let paths = crate::paths::RuntimePaths {
+            config_dir: dir.clone(),
+            config_file: config_path.clone(),
+            dev_state_dir: dir.join("dev-state"),
+            herdr_socket: None,
+            instance: InstanceId::default_instance(),
+        };
+
+        // current_account() reads the real USER env var; use it for assertions.
+        let account = current_account().unwrap();
+        let account_for_store = account.clone();
+        let account_for_delete = account.clone();
+
+        let revoke_calls = Rc::new(RefCell::new(0));
+        let delete_calls = Rc::new(RefCell::new(0));
+        let reconcile_calls = Rc::new(RefCell::new(0));
+        let writes = Rc::new(RefCell::new(Vec::<Config>::new()));
+        let revoke_calls_hook = revoke_calls.clone();
+        let delete_calls_hook = delete_calls.clone();
+        let reconcile_calls_hook = reconcile_calls.clone();
+        let writes_hook = writes.clone();
+
+        let store_secret = move |service: &str, acct: &str, _secret: &str| -> Result<(), String> {
+            assert_eq!(service, format!("herdr-edge-link-{NEW_DEVICE_ID}"));
+            assert_eq!(acct, account_for_store);
+            Ok(())
+        };
+        let load_config = |path: &Path, instance: &InstanceId| -> Result<Config, String> {
+            Config::load_for_instance(path, instance)
+        };
+        let write_config = move |_paths: &RuntimePaths, config: &Config| -> Result<(), String> {
+            writes_hook.borrow_mut().push(config.clone());
+            Ok(())
+        };
+        let revoke = move |origin: &str, device: &str, secret: &str| -> Result<bool, String> {
+            assert_eq!(origin, "https://edge.example");
+            assert_eq!(device, NEW_DEVICE_ID);
+            assert_eq!(secret, DEVICE_SECRET);
+            *revoke_calls_hook.borrow_mut() += 1;
+            Ok(true)
+        };
+        let delete = move |service: &str, acct: &str| -> Result<(), String> {
+            assert_eq!(service, format!("herdr-edge-link-{NEW_DEVICE_ID}"));
+            assert_eq!(acct, account_for_delete);
+            *delete_calls_hook.borrow_mut() += 1;
+            Ok(())
+        };
+        // First reconcile call (in the transaction) fails; the rollback's
+        // reconcile-back (second call) succeeds.
+        let reconcile = move |_paths: &RuntimePaths| -> Result<(), String> {
+            let call = *reconcile_calls_hook.borrow();
+            *reconcile_calls_hook.borrow_mut() += 1;
+            if call == 0 {
+                Err("simulated reconcile failure".to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        let consume = move |origin: &str, code: &str, name: Option<&str>| {
+            assert_eq!(origin, "https://edge.example");
+            assert_eq!(code, format!("enroll_{}", "d".repeat(64)));
+            assert_eq!(name, None);
+            Ok(EnrolledCredential {
+                device_id: NEW_DEVICE_ID.to_owned(),
+                workstation_id: NEW_DEVICE_ID.to_owned(),
+                device_secret: DEVICE_SECRET.to_owned(),
+            })
+        };
+
+        let result = connect_macos_inner(
+            &paths,
+            &enrollment_path,
+            None,
+            None,
+            store_secret,
+            load_config,
+            write_config,
+            revoke,
+            delete,
+            reconcile,
+            consume,
+        );
+
+        // The transaction must fail closed with rollback evidence.
+        let error = result.unwrap_err();
+        assert!(error.contains("could not be reconciled"));
+        assert!(error.contains("revoked=true"));
+        assert!(error.contains("keychain_deleted=true"));
+        assert!(error.contains("config_restored=true"));
+        assert!(error.contains("link_reconciled=true"));
+        assert!(!error.contains("devsec_"));
+        assert!(!error.contains("enroll_"));
+
+        // Remote revoke + Keychain delete happened exactly once, in the rollback.
+        assert_eq!(*revoke_calls.borrow(), 1);
+        assert_eq!(*delete_calls.borrow(), 1);
+        // Reconcile ran twice: once in the transaction (failed), once as
+        // reconcile-back after config restore (succeeded).
+        assert_eq!(*reconcile_calls.borrow(), 2);
+
+        // Final write must be the OLD config: old id present, new id absent.
+        let final_writes = writes.borrow();
+        assert_eq!(final_writes.len(), 2);
+        assert_eq!(
+            final_writes[0].edge_device_id.as_deref(),
+            Some(NEW_DEVICE_ID)
+        );
+        assert_eq!(
+            final_writes[1].edge_device_id.as_deref(),
+            Some(OLD_DEVICE_ID)
+        );
+        assert_ne!(
+            final_writes[1].edge_device_id.as_deref(),
+            Some(NEW_DEVICE_ID)
+        );
+
+        // The consumed enrollment file must not be presented as reusable.
+        assert!(!enrollment_path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
