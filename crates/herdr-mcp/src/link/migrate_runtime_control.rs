@@ -254,12 +254,33 @@ pub fn plan_migrate(home: &Path, config_dir: &Path, mode: MigrateMode) -> Result
     let active = status_path
         .as_ref()
         .and_then(|path| read_status_active_generation(path));
+    let status = match status_path.as_ref() {
+        Some(path) => read_optional_json(path)?,
+        None => None,
+    };
+    let control_revision = current
+        .as_ref()
+        .and_then(|value| value.get("revision"))
+        .and_then(Value::as_u64);
+    let processed_revision = status
+        .as_ref()
+        .and_then(|value| value.get("processed_revision"))
+        .and_then(Value::as_u64);
 
     // "Rust-compatible" is not sufficient here: after a runtime generation
     // switch an older rust-* id is still syntactically valid but stale.  The
-    // live control document is current only when it targets the exact managed
-    // runtime/current generation.
-    let already = desired.as_deref() == Some(generation_id.as_str());
+    // live control document must target the exact managed runtime/current
+    // generation.  However, do not churn revisions while the running Link has
+    // not consumed the current desired-state revision yet.  A compatibility
+    // retry is needed only when status proves that revision was consumed and
+    // the manager nevertheless remained on an older generation.
+    let desired_is_current = desired.as_deref() == Some(generation_id.as_str());
+    let active_is_current = active.as_deref() == Some(generation_id.as_str());
+    let status_consumed_current = matches!(
+        (processed_revision, control_revision),
+        (Some(processed), Some(control)) if processed >= control
+    );
+    let already = desired_is_current && (active_is_current || !status_consumed_current);
 
     let endpoint =
         extract_endpoint(current.as_ref()).unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned());
@@ -674,6 +695,47 @@ mod tests {
         assert!(reconcile_current_generation(&home, &config_dir).unwrap());
         let live: Value = serde_json::from_slice(&fs::read(&live_path).unwrap()).unwrap();
         assert_eq!(live["desired_active"], "rust-currentmigrate04");
+        assert!(!reconcile_current_generation(&home, &config_dir).unwrap());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn desired_current_but_status_stale_bumps_revision_for_running_old_link() {
+        let home = test_home();
+        setup_managed_runtime(&home, "rust-currentmigrate05");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        let live_path = config_dir.join("runtime-control-prod.json");
+        fs::write(
+            &live_path,
+            r#"{"schema_version":1,"revision":11,"desired_active":"rust-currentmigrate05","generations":[{"generation":"rust-currentmigrate05","endpoint":"http://127.0.0.1:8772/mcp"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            config_dir.join("runtime-status-prod.json"),
+            r#"{"schema_version":1,"processed_revision":11,"outcome":"candidate_rejected:health_http_503","manager":{"active_generation":"rust-oldmigrate05"}}"#,
+        )
+        .unwrap();
+
+        let report = plan_migrate(&home, &config_dir, MigrateMode::DryRun).unwrap();
+        assert_eq!(report["already_rust_compatible"], false);
+        assert_eq!(report["planned_control"]["revision"], 12);
+        assert_eq!(
+            report["planned_control"]["desired_active"],
+            "rust-currentmigrate05"
+        );
+        assert!(reconcile_current_generation(&home, &config_dir).unwrap());
+        let live: Value = serde_json::from_slice(&fs::read(&live_path).unwrap()).unwrap();
+        assert_eq!(live["revision"], 12);
+        // Until Link consumes revision 12, another reconciliation must not
+        // immediately create revision 13.  This keeps compatibility retries
+        // bounded and prevents revision churn under a slow/unavailable Link.
+        assert!(!reconcile_current_generation(&home, &config_dir).unwrap());
+
+        fs::write(
+            config_dir.join("runtime-status-prod.json"),
+            r#"{"schema_version":1,"processed_revision":12,"outcome":"activated","manager":{"active_generation":"rust-currentmigrate05"}}"#,
+        )
+        .unwrap();
         assert!(!reconcile_current_generation(&home, &config_dir).unwrap());
         let _ = fs::remove_dir_all(&home);
     }
