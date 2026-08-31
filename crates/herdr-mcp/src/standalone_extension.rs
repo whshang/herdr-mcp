@@ -2,6 +2,7 @@ use reqwest::blocking::{Client, Response};
 use reqwest::redirect::Policy;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
@@ -40,6 +41,7 @@ struct TreeEntry {
     #[serde(rename = "type")]
     kind: String,
     size: Option<u64>,
+    sha: String,
 }
 
 #[derive(Debug)]
@@ -47,6 +49,7 @@ struct Blob {
     repo_path: String,
     relative_path: PathBuf,
     size: u64,
+    git_sha: String,
 }
 
 #[derive(Debug)]
@@ -273,6 +276,12 @@ fn list_blobs(client: &Client, commit: &str) -> Result<Vec<Blob>, String> {
         }
         let relative_path = safe_rel(rel)?;
         let size = entry.size.unwrap_or(0);
+        if !is_sha(&entry.sha) {
+            return Err(format!(
+                "extension tree returned invalid Git blob SHA: {}",
+                entry.path
+            ));
+        }
         if size > MAX_FILE_BYTES {
             return Err(format!("extension file too large: {}", entry.path));
         }
@@ -286,6 +295,7 @@ fn list_blobs(client: &Client, commit: &str) -> Result<Vec<Blob>, String> {
             repo_path: entry.path,
             relative_path,
             size,
+            git_sha: entry.sha.to_ascii_lowercase(),
         });
         if out.len() > MAX_FILES {
             return Err("extension tree exceeds file-count limit".to_owned());
@@ -312,7 +322,21 @@ fn download_blob(client: &Client, commit: &str, blob: &Blob) -> Result<Vec<u8>, 
     if bytes.len() as u64 > MAX_FILE_BYTES || (blob.size != 0 && bytes.len() as u64 != blob.size) {
         return Err(format!("downloaded file size mismatch: {}", blob.repo_path));
     }
+    let actual_git_sha = git_blob_sha(&bytes);
+    if actual_git_sha != blob.git_sha {
+        return Err(format!(
+            "downloaded file Git blob SHA mismatch: {}",
+            blob.repo_path
+        ));
+    }
     Ok(bytes.to_vec())
+}
+
+fn git_blob_sha(bytes: &[u8]) -> String {
+    let mut digest = Sha1::new();
+    digest.update(format!("blob {}\0", bytes.len()).as_bytes());
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
 }
 
 fn resolve_ref(client: &Client, reference: &str) -> Result<String, String> {
@@ -447,6 +471,10 @@ mod tests {
         assert!(safe_rel("../Cargo.toml").is_err());
         assert!(safe_rel("content/../manifest.json").is_err());
         assert!(safe_rel("/tmp/file").is_err());
+        assert_eq!(
+            git_blob_sha(b"test content\n"),
+            "d670460b4b4aece5915caf5c68d12f560a9fe3e4"
+        );
     }
 
     #[test]
