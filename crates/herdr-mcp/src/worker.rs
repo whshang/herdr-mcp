@@ -16,12 +16,14 @@ use reqwest::redirect::Policy;
 use serde_json::{Value, json};
 #[cfg(any(target_os = "macos", test))]
 use std::env;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 use std::fs::{self, OpenOptions};
+#[cfg(target_os = "macos")]
+use std::io;
 #[cfg(any(target_os = "macos", test))]
 use std::io::BufRead;
-#[cfg(target_os = "macos")]
-use std::io::{self, Write};
+#[cfg(any(target_os = "macos", test))]
+use std::io::Write;
 #[cfg(any(target_os = "macos", test))]
 use std::path::Path;
 #[cfg(target_os = "macos")]
@@ -34,7 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(any(target_os = "macos", test))]
 use url::Url;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 use std::os::unix::fs::OpenOptionsExt;
 
 #[cfg(target_os = "macos")]
