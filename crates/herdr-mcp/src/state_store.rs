@@ -33,6 +33,14 @@ pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 /// assert it remains exactly equal to the append-only migration count.
 pub const SCHEMA_VERSION: i64 = 5;
 
+/// Oldest durable-state reader that a release may safely roll back to.
+///
+/// Migration v5 only adds Continuity Journal tables/indexes. Schema-4 readers
+/// do not reference those objects, so rollback may lower only the meta version
+/// back to 4 while leaving v5 data intact. Any future non-additive migration
+/// must revisit this constant and the explicit downgrade gate below.
+pub const ROLLBACK_COMPATIBLE_SCHEMA_VERSION: i64 = 4;
+
 /// Meta-table key holding the applied schema version. Stored as a string.
 const META_SCHEMA_VERSION: &str = "schema_version";
 
@@ -364,6 +372,29 @@ impl StateStore {
     /// securing the directory first. A `db_name` ending in `.db` or `.sqlite`
     /// keeps its suffix; otherwise `.db` is appended.
     pub fn open_in_dir(state_dir: impl AsRef<Path>, db_name: &str) -> Result<Self, String> {
+        Self::open_in_dir_with_migration_ceiling(state_dir, db_name, SCHEMA_VERSION)
+    }
+
+    /// Open durable state for a service install/rollback transaction without
+    /// migrating an older database past the rollback-compatible reader level.
+    /// If the database is already newer (for example schema 5), it is preserved
+    /// as-is; future schemas remain fail-closed.
+    pub fn open_in_dir_for_service_mutation(
+        state_dir: impl AsRef<Path>,
+        db_name: &str,
+    ) -> Result<Self, String> {
+        Self::open_in_dir_with_migration_ceiling(
+            state_dir,
+            db_name,
+            ROLLBACK_COMPATIBLE_SCHEMA_VERSION,
+        )
+    }
+
+    fn open_in_dir_with_migration_ceiling(
+        state_dir: impl AsRef<Path>,
+        db_name: &str,
+        migration_ceiling: i64,
+    ) -> Result<Self, String> {
         let dir = state_dir.as_ref();
         reject_symlink(dir, "state dir")?;
         std::fs::create_dir_all(dir)
@@ -376,7 +407,7 @@ impl StateStore {
         let mut conn = open_connection(Some(&path))?;
         #[cfg(unix)]
         set_mode(&path, 0o600)?;
-        migrate(&mut conn)?;
+        migrate_with_ceiling(&mut conn, migration_ceiling)?;
         Ok(Self {
             path: Some(path),
             conn,
@@ -508,6 +539,38 @@ impl StateStore {
         value
             .parse::<i64>()
             .map_err(|_| format!("invalid meta schema_version {value:?}; refusing to continue"))
+    }
+
+    /// Prepare additive schema v5 state for a rollback to a schema-v4 binary.
+    /// Continuity tables/data are deliberately preserved; only the authoritative
+    /// meta version is lowered so the old reader can open the database. A later
+    /// v5+ open reruns the idempotent v5 migration and restores the meta version.
+    pub fn prepare_rollback_to_schema(&mut self, target: i64) -> Result<bool, String> {
+        let current = self.schema_version()?;
+        if current == target {
+            return Ok(false);
+        }
+        if current != SCHEMA_VERSION
+            || target != ROLLBACK_COMPATIBLE_SCHEMA_VERSION
+            || SCHEMA_VERSION != 5
+            || ROLLBACK_COMPATIBLE_SCHEMA_VERSION != 4
+        {
+            return Err(format!(
+                "unsupported state schema rollback {current}->{target}; only audited additive 5->4 rollback is allowed"
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|error| format!("cannot begin schema rollback transaction: {error}"))?;
+        tx.execute(
+            "UPDATE meta SET value = ?1 WHERE key = ?2",
+            rusqlite::params![target.to_string(), META_SCHEMA_VERSION],
+        )
+        .map_err(|error| format!("cannot prepare schema rollback to {target}: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit schema rollback to {target}: {error}"))?;
+        Ok(true)
     }
 
     /// Path of the open database file, if any (None for in-memory).
@@ -1759,22 +1822,37 @@ fn open_connection(path: Option<&Path>) -> Result<Connection, String> {
 /// Ensure the `meta` key/value table exists, then run pending migrations and
 /// bump `schema_version`. Version higher than our maximum fails closed.
 fn migrate(conn: &mut Connection) -> Result<(), String> {
+    migrate_with_ceiling(conn, SCHEMA_VERSION)
+}
+
+/// Run migrations only as far as `migration_ceiling`, unless the database is
+/// already newer. This is used by service mutation so an old schema-4 service
+/// is not made unstartable before the candidate service/guardian owns recovery.
+fn migrate_with_ceiling(conn: &mut Connection, migration_ceiling: i64) -> Result<(), String> {
+    if !(1..=SCHEMA_VERSION).contains(&migration_ceiling) {
+        return Err(format!(
+            "invalid state migration ceiling {migration_ceiling}; supported range is 1..={SCHEMA_VERSION}"
+        ));
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )
     .map_err(|error| format!("cannot bootstrap meta table: {error}"))?;
 
     let current = i64_schema_version(conn)?;
-    let target = SCHEMA_VERSION;
-    if current > target {
+    if current > SCHEMA_VERSION {
         return Err(format!(
             "state store schema version {current} is newer than this binary supports \
-             ({target}); refusing to run (fail-closed, no silent downgrade)"
+             ({SCHEMA_VERSION}); refusing to run (fail-closed, no silent downgrade)"
         ));
     }
+    let target = current.max(migration_ceiling);
 
     for (index, migration) in MIGRATIONS.iter().enumerate() {
         let version = (index + 1) as i64;
+        if version > target {
+            break;
+        }
         if current >= version {
             continue;
         }
@@ -2750,6 +2828,86 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn service_mutation_holds_schema_four_then_additive_rollback_preserves_v5_data() {
+        let dir = temp_dir();
+        let service_store = StateStore::open_in_dir_for_service_mutation(&dir, "state").unwrap();
+        assert_eq!(
+            service_store.schema_version().unwrap(),
+            ROLLBACK_COMPATIBLE_SCHEMA_VERSION
+        );
+        drop(service_store);
+
+        let mut current = StateStore::open_in_dir(&dir, "state").unwrap();
+        assert_eq!(current.schema_version().unwrap(), SCHEMA_VERSION);
+        assert!(
+            current
+                .append_continuity_turn(ContinuityTurnInput {
+                    continuity_id: "hc:rollback-preserve",
+                    conversation_id: "conv-preserve",
+                    workspace_id: Some("w-preserve"),
+                    project_id: Some("project-preserve"),
+                    title: Some("rollback preserve"),
+                    message_id: "msg-preserve",
+                    role: "user",
+                    text: "preserve me across schema rollback",
+                    fingerprint: Some("fp-preserve"),
+                    observed_at: 100,
+                })
+                .unwrap()
+        );
+        assert!(
+            current
+                .prepare_rollback_to_schema(ROLLBACK_COMPATIBLE_SCHEMA_VERSION)
+                .unwrap()
+        );
+        assert_eq!(
+            current.schema_version().unwrap(),
+            ROLLBACK_COMPATIBLE_SCHEMA_VERSION
+        );
+        let preserved: i64 = current
+            .conn
+            .query_row("SELECT COUNT(*) FROM continuity_turns", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(preserved, 1);
+        drop(current);
+
+        let reopened_for_old = StateStore::open_in_dir_for_service_mutation(&dir, "state").unwrap();
+        assert_eq!(
+            reopened_for_old.schema_version().unwrap(),
+            ROLLBACK_COMPATIBLE_SCHEMA_VERSION
+        );
+        let preserved: i64 = reopened_for_old
+            .conn
+            .query_row("SELECT COUNT(*) FROM continuity_turns", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(preserved, 1);
+        drop(reopened_for_old);
+
+        let current_again = StateStore::open_in_dir(&dir, "state").unwrap();
+        assert_eq!(current_again.schema_version().unwrap(), SCHEMA_VERSION);
+        let preserved: i64 = current_again
+            .conn
+            .query_row("SELECT COUNT(*) FROM continuity_turns", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(preserved, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn schema_rollback_rejects_unsupported_targets() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        let error = store.prepare_rollback_to_schema(3).unwrap_err();
+        assert!(error.contains("only audited additive 5->4 rollback"));
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
