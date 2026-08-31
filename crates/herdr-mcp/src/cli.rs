@@ -544,7 +544,13 @@ fn parse_worker_pair(args: &[String]) -> Result<Command, String> {
                 name = Some(value.clone());
                 index += 2;
             }
-            "--code" => {
+            "--code" | "--pin" => {
+                return Err(
+                    "pairing codes are never accepted on argv; the new device enters the code interactively"
+                        .to_owned(),
+                );
+            }
+            value if value.starts_with("--code") || value.starts_with("--pin") => {
                 return Err(
                     "pairing codes are never accepted on argv; the new device enters the code interactively"
                         .to_owned(),
@@ -574,7 +580,13 @@ fn parse_worker_connect(args: &[String]) -> Result<Command, String> {
                 name = Some(value.clone());
                 index += 2;
             }
-            "--code" => {
+            "--code" | "--pin" => {
+                return Err(
+                    "pairing codes are never accepted on argv; enter the code interactively"
+                        .to_owned(),
+                );
+            }
+            value if value.starts_with("--code") || value.starts_with("--pin") => {
                 return Err(
                     "pairing codes are never accepted on argv; enter the code interactively"
                         .to_owned(),
@@ -1131,14 +1143,14 @@ mod tests {
             parse(args(&[
                 "worker",
                 "connect",
-                "https://edge.example/pair#pair_abc123",
+                "https://edge.example/pair#pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "--name",
                 "mac-b",
             ]))
             .unwrap()
             .command,
             Command::Worker(WorkerCommand::Connect {
-                pairing_address: "https://edge.example/pair#pair_abc123".to_owned(),
+                pairing_address: "https://edge.example/pair#pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
                 name: Some("mac-b".to_owned()),
             })
         );
@@ -1156,7 +1168,7 @@ mod tests {
             parse(args(&[
                 "worker",
                 "connect",
-                "https://edge.example/pair#pair_abc123",
+                "https://edge.example/pair#pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "--enrollment-file",
                 "/tmp/enrollment.json",
             ]))
@@ -1166,7 +1178,7 @@ mod tests {
             parse(args(&[
                 "worker",
                 "connect",
-                "https://edge.example/pair#pair_abc123",
+                "https://edge.example/pair#pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "--edge-origin",
                 "https://edge.example",
             ]))
