@@ -44,11 +44,11 @@ export type DeviceRouteResult =
       ok: true;
       device_id: string | null;
       workstation_id: string;
-      routing_reason: "explicit_device" | "single_available_device" | "legacy_default_device";
+      routing_reason: "explicit_device" | "device_ref" | "single_available_device" | "legacy_default_device";
     }
   | {
       ok: false;
-      code: "device_not_found" | "device_ambiguous" | "device_paused" | "device_suspended" | "device_revoked" | "device_unavailable";
+      code: "device_not_found" | "device_ambiguous" | "device_ref_conflict" | "device_paused" | "device_suspended" | "device_revoked" | "device_unavailable";
     };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -98,10 +98,40 @@ export async function resolveDeviceRoute(
   selector: string | undefined,
   legacyWorkstationId: string,
 ): Promise<DeviceRouteResult> {
-  const devices = await readRegistryDevices(registry);
+  return resolveDeviceRouteWithContext(registry, { selector, legacyWorkstationId });
+}
 
-  if (selector !== undefined) {
-    const trimmed = selector.trim();
+export interface DeviceRouteContext {
+  selector?: string;
+  args?: Record<string, unknown>;
+  legacyWorkstationId: string;
+}
+
+export async function resolveDeviceRouteWithContext(
+  registry: FetchStub,
+  ctx: DeviceRouteContext,
+): Promise<DeviceRouteResult> {
+  const devices = await readRegistryDevices(registry);
+  const byId = new Map(devices.map((d) => [d.device_id, d]));
+
+  // Pre-extract opaque ref for explicit-vs-ref conflict detection.
+  // Binding args are NOT trusted (caller-controlled) – they are ignored for routing.
+  let extractedRef: { deviceId: string; field: string; raw: string; kind: "ref" } | null = null;
+  if (ctx.args) {
+    const { extractDeviceIdFromArgs } = await import("./device-refs.js");
+    extractedRef = extractDeviceIdFromArgs(ctx.args);
+    if (extractedRef) {
+      if (extractedRef.deviceId === "__conflict__" || extractedRef.deviceId === "__type_mismatch__") {
+        return { ok: false, code: "device_ref_conflict" };
+      }
+    }
+  }
+
+  // 1) explicit device selector (highest priority) – but fail closed if it
+  // conflicts with an opaque ref bound to a different device. Caller must use
+  // raw B-local ids with device=B, not reuse A's opaque ref on B.
+  if (ctx.selector !== undefined) {
+    const trimmed = ctx.selector.trim();
     if (trimmed.length === 0) return { ok: false, code: "device_not_found" };
     const canonicalId = normalizeDeviceId(trimmed);
     const matches = canonicalId
@@ -111,11 +141,27 @@ export async function resolveDeviceRoute(
     if (matches.length > 1) return { ok: false, code: "device_ambiguous" };
     const selected = matches[0];
     if (!isRoutableDevice(selected)) return unavailableReason(selected);
+    if (extractedRef && extractedRef.deviceId !== selected.device_id) {
+      return { ok: false, code: "device_ref_conflict" };
+    }
     return {
       ok: true,
       device_id: selected.device_id,
       workstation_id: selected.workstation_id,
       routing_reason: "explicit_device",
+    };
+  }
+
+  // 2) device-aware opaque ref (workspace/pane) – strict, no binding fallback
+  if (extractedRef) {
+    const device = byId.get(extractedRef.deviceId);
+    if (!device) return { ok: false, code: "device_not_found" };
+    if (!isRoutableDevice(device)) return unavailableReason(device);
+    return {
+      ok: true,
+      device_id: device.device_id,
+      workstation_id: device.workstation_id,
+      routing_reason: "device_ref",
     };
   }
 
@@ -134,7 +180,7 @@ export async function resolveDeviceRoute(
   return {
     ok: true,
     device_id: null,
-    workstation_id: legacyWorkstationId,
+    workstation_id: ctx.legacyWorkstationId,
     routing_reason: "legacy_default_device",
   };
 }

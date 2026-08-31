@@ -109,10 +109,23 @@ export function reconcileWorkspaceCatalogBindings(bindings, workspaces, now = Da
       continue;
     }
     const next = { ...binding };
-    const localProjectKey = live.get(workspaceId)?.local_project_key;
+    const liveRow = live.get(workspaceId);
+    const localProjectKey = liveRow?.local_project_key;
     if (typeof localProjectKey === "string" && localProjectKey && next.local_project_key !== localProjectKey) {
       next.local_project_key = localProjectKey;
       changed = true;
+    }
+    // Preserve trusted device identity for browser conversation/project binding.
+    // New bindings may carry device_id; existing single-device bindings remain valid
+    // without it (backward compatible). Device switching must not change device_id.
+    const liveDeviceId = typeof liveRow?.device_id === "string" ? liveRow.device_id.trim() : "";
+    if (liveDeviceId && next.device_id !== liveDeviceId) {
+      // Only adopt live device_id if binding had none; otherwise preserve original
+      // to keep cross-device retry fail-closed.
+      if (!next.device_id) {
+        next.device_id = liveDeviceId;
+        changed = true;
+      }
     }
     kept[storeKey] = next;
   }
@@ -122,6 +135,10 @@ export function reconcileWorkspaceCatalogBindings(bindings, workspaces, now = Da
     for (const workspace of live.values()) {
       const workspaceId = workspaceIdFromCatalogRow(workspace);
       if (!workspaceId || workspace.local_project_key !== source.local_project_key) continue;
+      // Device-aware inheritance: sibling workspace with same local_project_key
+      // must remain on the same device as the source binding; otherwise a
+      // shared path could silently route to another device.
+      if (source.device_id && workspace.device_id && source.device_id !== workspace.device_id) continue;
       const storeKey = `${source.convKey}::${workspaceId}`;
       if (kept[storeKey]) continue;
       const inherited = {
@@ -142,6 +159,9 @@ export function reconcileWorkspaceCatalogBindings(bindings, workspaces, now = Da
         status: "unknown",
         lastSettle: null,
       };
+      // Preserve device affinity for the inherited sibling
+      if (source.device_id) inherited.device_id = source.device_id;
+      else if (workspace.device_id) inherited.device_id = workspace.device_id;
       inherited.revision = bindingRevision(inherited);
       kept[storeKey] = inherited;
       inheritedKeys.push(storeKey);

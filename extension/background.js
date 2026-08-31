@@ -4570,6 +4570,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const pendingRoot = pageInfo?.site === "chatgpt" && pageInfo?.is_new_chat_root === true;
       const hasConversationTarget = Boolean(pageInfo?.conversation_id);
       const deliveryTabId = projectScoped && !hasConversationTarget ? null : tabId;
+      // Device-aware binding: preserve immutable device identity where known.
+      // The local workspace catalog may advertise device_id; otherwise use
+      // explicit msg.device_id (from control center) or leave absent for
+      // legacy single-device bindings (backward compatible).
+      let bindingDeviceId = null;
+      const candidateDeviceId = typeof msg.device_id === "string" ? msg.device_id.trim() : "";
+      if (candidateDeviceId) {
+        // Validate loosely: must look like dev_<ulid>
+        if (/^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(candidateDeviceId)) bindingDeviceId = candidateDeviceId.toUpperCase();
+      }
       const b = {
         workspace_id,
         workspace_label,
@@ -4583,6 +4593,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         project_id: pageInfo?.project_id || null,
         project_key: pageInfo?.project_key || null,
         local_project_key: msg.local_project_key || null,
+        device_id: bindingDeviceId,
         active_conv_key: projectScoped && hasConversationTarget ? pageInfo.convKey : null,
         tabId: deliveryTabId,
         tabUrl: deliveryTabId ? (pageInfo?.url || sender.tab?.url || null) : null,

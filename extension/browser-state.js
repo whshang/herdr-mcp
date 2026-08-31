@@ -87,6 +87,7 @@ export function rebuildWorkspaceViews(view = {}) {
         label: stringOrNull(row.label) || workspaceId,
         roots: Array.isArray(row.roots) ? [...row.roots] : [],
         local_project_key: stringOrNull(row.local_project_key),
+        device_id: stringOrNull(row.device_id),
         panes: panes.filter((pane) => pane.workspace_id === workspaceId),
         tabs: tabs.filter((tab) => workspaceIdOf(tab) === workspaceId),
       };
