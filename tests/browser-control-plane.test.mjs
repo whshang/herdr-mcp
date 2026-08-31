@@ -284,23 +284,25 @@ test("pinned target type exposes only matching control modes", () => {
 
   assert.deepEqual(actionModesForTarget(agentTarget), [ACTION_TYPES.AGENT_PROMPT]);
   assert.deepEqual(actionModesForTarget(steerCapableAgentTarget), [ACTION_TYPES.AGENT_PROMPT, ACTION_TYPES.STEER]);
-  assert.deepEqual(actionModesForTarget(terminalTarget), []);
+  assert.deepEqual(actionModesForTarget(terminalTarget), [ACTION_TYPES.TERMINAL_INPUT]);
   assert.deepEqual(actionModesForTarget(null), []);
   assert.deepEqual(actionModesForTarget({}), []);
   assert.deepEqual(actionModesForTarget({ ...agentTarget, stale: true }), [ACTION_TYPES.AGENT_PROMPT]);
 
-  const terminalPreview = buildActionDescriptor(ACTION_TYPES.TERMINAL_TEXT, {
+  const terminalInput = buildActionDescriptor(ACTION_TYPES.TERMINAL_INPUT, {
     target: terminalTarget,
     text: "echo hello",
   });
-  assert.equal(terminalPreview.executable, false);
+  assert.equal(terminalInput.executable, true);
+  assert.equal(terminalInput.execution_mode, "trusted_terminal_input");
   assert.equal(buildActionDescriptor(ACTION_TYPES.AGENT_PROMPT, { target: terminalTarget, text: "hello" }).executable, false);
+  assert.equal(buildActionDescriptor(ACTION_TYPES.TERMINAL_INPUT, { target: agentTarget, text: "echo nope" }).executable, false);
   assert.equal(buildActionDescriptor(ACTION_TYPES.INTERRUPT, { target: agentTarget }).executable, true);
   assert.equal(buildActionDescriptor(ACTION_TYPES.INTERRUPT, { target: { ...agentTarget, status: "idle" } }).executable, false);
   assert.equal(buildActionDescriptor(ACTION_TYPES.INTERRUPT, { target: terminalTarget }).executable, false);
 });
 
-test("trusted prompt is executable, steer requires an advertised capability, and high-risk modes stay preview-only", () => {
+test("trusted prompt and fenced terminal input execute only on matching targets", () => {
   const target = createPinnedTarget(normalizeBrowserState(baseSnapshot()).panes[0]);
   assert.equal(phaseAAvailability(ACTION_TYPES.AGENT_PROMPT, { target }).enabled, true);
   const prompt = buildActionDescriptor(ACTION_TYPES.AGENT_PROMPT, { target, text: "keep compatibility" });
@@ -319,9 +321,12 @@ test("trusted prompt is executable, steer requires an advertised capability, and
   assert.equal(steer.executable, true);
   assert.equal(steer.execution_mode, "provider_probe");
 
-  const terminal = buildActionDescriptor(ACTION_TYPES.TERMINAL_INPUT, { target, text: "rm -rf /" });
-  assert.equal(terminal.executable, false);
-  assert.equal(terminal.execution_mode, "dry_run");
+  const terminalTarget = createPinnedTarget(normalizeBrowserState(baseSnapshot()).panes[1]);
+  const terminal = buildActionDescriptor(ACTION_TYPES.TERMINAL_INPUT, { target: terminalTarget, text: "echo hello" });
+  assert.equal(terminal.executable, true);
+  assert.equal(terminal.execution_mode, "trusted_terminal_input");
+  assert.equal(terminal.target.pane_id, terminalTarget.pane_id);
+  assert.equal(terminal.args.text, "echo hello");
 });
 
 test("runtime authoritative target revision survives normalization and pinning", () => {

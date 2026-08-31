@@ -12,7 +12,7 @@
 - **Rust runtime 拥有生产 MCP / service / updater / Link / Native Messaging 路径**；`bin/herdr-extension-host` 只是委托 Rust 的兼容入口，不是第二套 installer/broker。
 - **生产 Link 是 Rust**，执行 `~/.config/herdr-mcp/runtime/current/herdr-mcp link run`。
 - **公共 MCP contract 保持 epoch 2 / 18 tools**，不增加第 19 个 tool，不因内部优化改变 schema。
-- **浏览器控制面是有界的**：不宣称 browser true-steer；高风险的 Terminal Input / 任意 Herdr method 保持 preview-only。
+- **浏览器控制面是有界的**：不宣称 browser true-steer；普通终端只开放有 target fencing 的窄化 `Run command -> pane.send_input + Enter`，任意 Herdr method 仍保持 preview-only。
 - **`v0.4.2` 已发布能力可作为当前产品能力呈现**；任何尚未发布的后续特性仍必须描述为 development/upcoming，不能提前写成当前产品能力。
 
 ## 总体目标

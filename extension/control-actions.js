@@ -33,13 +33,12 @@ const RISKS = Object.freeze({
 const CONTROL_BLOCK_REASONS = Object.freeze({
   [ACTION_TYPES.HERDR_METHOD]: "Arbitrary Herdr methods remain preview-only",
   [ACTION_TYPES.TERMINAL_TEXT]: "Raw terminal mutation remains disabled",
-  [ACTION_TYPES.TERMINAL_INPUT]: "Raw terminal mutation remains disabled",
   [ACTION_TYPES.TERMINAL_KEYS]: "Raw terminal mutation remains disabled",
 });
 
 export function actionModesForTarget(target) {
   if (!target?.pane_id) return [];
-  if (!target.agent) return [];
+  if (!target.agent) return [ACTION_TYPES.TERMINAL_INPUT];
   const modes = [ACTION_TYPES.AGENT_PROMPT];
   if (target.control_capabilities?.steer?.available === true) modes.push(ACTION_TYPES.STEER);
   return modes;
@@ -86,6 +85,11 @@ export function controlAvailability(type, context = {}) {
     return context.target?.status === "working"
       ? { enabled: true, mode: "trusted_terminal_interrupt", reason: null }
       : { enabled: false, mode: "trusted_terminal_interrupt", reason: "Pinned agent is not working" };
+  }
+  if (type === ACTION_TYPES.TERMINAL_INPUT) {
+    return context.target?.agent
+      ? { enabled: false, mode: "trusted_terminal_input", reason: "Use Agent actions for Agent panes" }
+      : { enabled: true, mode: "trusted_terminal_input", reason: null };
   }
   return {
     enabled: false,
