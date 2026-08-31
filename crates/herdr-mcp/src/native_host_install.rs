@@ -193,11 +193,6 @@ fn product_uninstall_view_preflight(view: &Value, footprint_present: bool) -> Re
     Ok(true)
 }
 
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn product_uninstall_preflight() -> Result<bool, String> {
-    Err("native host product uninstall currently requires macOS".to_owned())
-}
-
 /// Capture immutable Native Host ownership evidence before the product removes
 /// any manifest, wrapper, or runtime binary. The outer product-uninstall journal
 /// persists this snapshot so an interrupted uninstall can resume without
@@ -226,11 +221,6 @@ pub(crate) fn product_uninstall_snapshot() -> Result<Option<serde_json::Value>, 
         "wrapper_sha256": file_sha256(&paths.wrapper)?,
         "manifests": manifests,
     })))
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn product_uninstall_snapshot() -> Result<Option<serde_json::Value>, String> {
-    Err("native host product uninstall currently requires macOS".to_owned())
 }
 
 /// Remove or resume removal of the exact Native Host cohort captured by
@@ -301,13 +291,6 @@ pub(crate) fn product_uninstall_owned_from_snapshot(
         "removed": removed,
         "resumed_from_product_snapshot": true,
     }))
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn product_uninstall_owned_from_snapshot(
-    _snapshot: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    Err("native host product uninstall currently requires macOS".to_owned())
 }
 
 #[cfg(target_os = "macos")]

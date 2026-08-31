@@ -6,6 +6,7 @@
 //! runtime. The herdr-mcp service may still connect to Herdr through its normal
 //! runtime transport while being health-validated.
 
+#[cfg(target_os = "macos")]
 use crate::paths::RuntimePaths;
 use std::process::ExitCode;
 
@@ -34,28 +35,16 @@ pub(crate) fn uninstall() -> Result<ExitCode, String> {
 }
 
 /// Validate the durable config-root ownership marker before a service install.
+#[cfg(target_os = "macos")]
 pub(crate) fn preflight_installation_identity() -> Result<(), String> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos::preflight_installation_identity()
-    }
+    macos::preflight_installation_identity()
 }
 
 /// Record the config root as intentionally managed by herdr-mcp. The narrower
 /// `service uninstall` preserves this marker for later product cleanup.
+#[cfg(target_os = "macos")]
 pub(crate) fn record_installation_identity() -> Result<(), String> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(())
-    }
-    #[cfg(target_os = "macos")]
-    {
-        macos::record_installation_identity()
-    }
+    macos::record_installation_identity()
 }
 
 fn refuse_managed_exec_mutation() -> Result<(), String> {
