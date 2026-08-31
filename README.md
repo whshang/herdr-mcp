@@ -55,7 +55,7 @@ The browser extension is **not a generic file relay**. In v0.4.2 it has one narr
 
 The browser extension adds long-conversation continuity, the Side Panel Control Center, workspace binding, and queued next-turn messages. It is **not** required for the first ChatGPT-to-workstation connection.
 
-In the v0.4.2 source candidate, a user who manually opens another conversation inside the same bound ChatGPT Project can simply say **“continue”** or **“resume”** without supplying an internal continuity ID. Herdr first searches the durable Continuity Journal with stable conversation / Project / workspace identity. It auto-resumes only when that identity identifies exactly one active chain; otherwise it shows bounded candidate evidence and asks the user to confirm. Recency or text similarity alone never selects a chain. See [Browser continuity](docs/i18n/en/browser-continuity.md).
+In v0.4.2, a user who manually opens another conversation inside the same bound ChatGPT Project can simply say **“continue”** or **“resume”** without supplying an internal continuity ID. Herdr first searches the durable Continuity Journal with stable conversation / Project / workspace identity. It auto-resumes only when that identity identifies exactly one active chain; otherwise it shows bounded candidate evidence and asks the user to confirm. Recency or text similarity alone never selects a chain. See [Browser continuity](docs/i18n/en/browser-continuity.md).
 
 End users install it only from the **Chrome Web Store**:
 
@@ -71,7 +71,7 @@ See [Browser extension](docs/i18n/en/extension.md) and [Browser Control Center](
 
 ## Current support boundary
 
-- stable herdr-mcp: `v0.4.1`;
+- stable herdr-mcp: `v0.4.2`;
 - public MCP contract: epoch 2 / 18 tools;
 - strongest clean-machine evidence: macOS Apple Silicon;
 - Windows x64 release binary is available, while Windows end-to-end UAT is still being completed;
