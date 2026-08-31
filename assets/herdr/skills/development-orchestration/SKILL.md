@@ -18,11 +18,15 @@ shared files or shared runtime/state   -> single mutation lane
 
 Optimize for correct ownership and dependencies, not maximum parallelism.
 
+Complex tasks may benefit from multiple independent lanes when decomposition is clean and expected latency/quality gains exceed orchestration overhead. This is an opportunity for the Web planner to consider, never a requirement triggered by task size or idle-worker count.
+
 For multiple lines, reason with a lightweight lane: `objective`, `project_root`, optional branch/worktree, owner, `file_scope`, dependencies, and validation. Keep overall orchestration and cross-lane reconciliation with the Web planner.
 
 ## Worktrees and ownership
 
 Create/reuse a worktree only for independent mutation, isolation from unrelated dirty work, or an explicit user requirement. Read-only investigation, grep, review, and ordinary tests stay in an existing safe checkout/pane. Never touch another task's dirty worktree.
+
+Treat workspaces and panes as bounded reusable resources. Reuse an existing compatible workspace/pane before creating another; one canonical `herdr-mcp:utility` pane per workspace is normally sufficient. Duplicate utility panes or finished temporary lanes are resource-pressure evidence for the planner, not a reason to run an autonomous cleanup daemon.
 
 Parallel mutations require non-overlapping file/runtime ownership. Shared files serialize unless ownership is deliberately transferred. Delegated workers receive one bounded objective and do not dispatch other workers.
 

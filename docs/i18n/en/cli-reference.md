@@ -72,7 +72,28 @@ The default scan records bounded `--version` evidence only for explicitly allowl
 
 Probe subprocesses receive no stdin, have a three-second timeout and a bounded output capture, and start from a cleared environment with only non-secret runtime variables restored. API keys, bearer tokens and provider credentials are not inherited. Unsupported or ambiguous traits remain unknown; herdr-mcp does not infer provider, model, vision, reasoning quality or code-edit support from an agent name.
 
-Static evidence is kept in a bounded capability inventory under the herdr-mcp config directory. Live status, cwd, project, pane, workspace and session state always come from Herdr/EventCache and are not replaced by the inventory. `herdr_inspect.capability_inventory.available_agents` exposes only locally available kinds permitted by `HERDR_MCP_AGENT_ALLOW`, so discovery improves delegation without bypassing the existing worker/auditor visibility policy.
+Static evidence is kept in a bounded capability inventory under the herdr-mcp config directory. Live status, cwd, project, pane, workspace and session state always come from Herdr/EventCache and are not replaced by the inventory. `herdr_inspect.capability_inventory.available_agents` exposes every locally available discovered kind by default; `HERDR_MCP_AGENT_ALLOW` is an explicit operator restriction when a narrower view is required. Availability does not assign a role or require delegation: the Web planner decides from task structure, live load, verified capabilities and resource state, while unknown quality/cost/latency traits remain unknown.
+
+### Dynamic planning advice for the Web planner
+
+v0.4.3 keeps the 18-tool public MCP contract and does not add a dedicated planning tool. The progressive `herdr_skill` bootstrap advertises a read-only local method routed through the existing `herdr_call` tool:
+
+```text
+herdr_call(
+  method="herdr_mcp.planning.advise",
+  params={
+    "project_root":"/path/to/project",
+    "requires_code_edit":true,
+    "requires_shell":true,
+    "independent_units":2,
+    "ownership_isolated":true
+  }
+)
+```
+
+The result separates evidence from the decision: live compatible/rejected workers, scan-proven startable-but-not-running Agent kinds, a direct deterministic option, a parallelism opportunity, and workspace/pane/worktree/utility-pane resource facts. The method never starts an Agent, creates a worktree, or auto-selects a worker. Explicit user targets are preserved; required capabilities fail closed when evidence is missing; optional quality/cost/latency traits remain unknown when unverified.
+
+The Web planner can then choose direct execution, reuse an existing Agent, create one new lane, or parallelize only when work is genuinely independent and mutation ownership is isolated. Existing idle/done Agents, worktrees, and duplicate utility panes are exposed as reuse signals; cleanup remains planner-owned after completion rather than becoming a background cleanup daemon.
 
 ## Connector information
 
@@ -203,7 +224,7 @@ The supervised updater reuses generation activation and must not be used to sile
 | `HERDR_SOCKET_PATH` | `~/.config/herdr/herdr.sock` | Herdr Socket API |
 | `HERDR_MCP_READONLY` | off | disable mutation |
 | `HERDR_MCP_WRITE_ROOTS` | managed roots | restrict writable projects |
-| `HERDR_MCP_AGENT_ALLOW` | default workers/auditors | control agent visibility in inspect/since |
+| `HERDR_MCP_AGENT_ALLOW` | all discovered agents | optionally restrict agent visibility in inspect/since |
 | `HERDR_MCP_ALL_TOOLS` | off | expose advanced/compatibility tools |
 | `HERDR_SKILL_NETWORK` | on | `0` uses bundled skill only |
 

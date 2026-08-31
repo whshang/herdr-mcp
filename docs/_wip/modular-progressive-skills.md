@@ -1209,9 +1209,9 @@ skill.read_resource (if needed)
 2. **第一版 taxonomy 按当前 17 个非-`herdr_skill` tools 划分。** 固定为 6 个 tool-domain Skills + `development-orchestration` compositional Skill。
 3. **Skill 正文以 Markdown 为 canonical content。** descriptor / identity / digest / load evidence / capability snapshot 使用结构化数据。
 4. **Project instruction precedence 按通用 AGENTS.md 模型。** 项目/嵌套文件可以细化工作流，但不能覆盖 runtime 强制安全边界。
-5. **Agent dispatch 第一版尽量自动。** 满足 allowlist、capability、busy/dirty/ownership、安全边界时直接派工；用户明确 target 优先；不允许静默质量降级或递归中间管理。
+5. **Agent dispatch 第一版提供可解释建议，由 Web planner 决策。** runtime 自动发现候选与 capability/resource evidence，过滤 busy/dirty/ownership/安全冲突并给出 direct/delegation/parallelism advice；复杂任务可以考虑多 Agent 并行，但不会因为存在空闲 Agent 或任务较大就强制派工。用户明确 target 优先；Agent 名称不承载固定角色或质量等级；不允许静默质量降级或递归中间管理。
 6. **Skill 按 conversation/task-context sticky。** 不是每条命令 reload；首次命中新能力域时额外加载一次，一次可以 batch 多个 Skill；live state 单独通过 inspect/since 更新。
-7. **当前 Web ChatGPT 不要求支持 Skills over MCP。** 使用 `herdr_skill` bootstrap + `herdr_call(method="herdr_mcp.skill.load", ...)` 完成 progressive loading。
+7. **当前 Web ChatGPT 不要求支持 Skills over MCP。** 使用 `herdr_skill` bootstrap + `herdr_call(method="herdr_mcp.skill.load", ...)` 完成 progressive loading；同一个 bootstrap 还声明 `herdr_mcp.planning.advise`，通过现有 `herdr_call` 返回只读 planning advice，不新增 public tool。
 8. **不新增第 19 个 public MCP tool，不改变 epoch 2 / 18-tool contract。**
 9. **MCP Skills Extension 仅作为未来 adapter。** 不冻结当前 draft 的具体协议细节。
 10. **模块化必须用 token/bytes/round-trip/task-success benchmark 证明真实收益。**
@@ -1230,7 +1230,7 @@ Global AGENTS.md
 + 6 tool-domain Skills
 + development-orchestration Skill
 + live Agent/model capability projection
-+ safe automatic agent dispatch
++ evidence-backed planning advice + planner-owned dispatch
 + legacy herdr_skill compatibility adapter
 + unchanged 18-tool contract tests
 + token/round-trip benchmark
