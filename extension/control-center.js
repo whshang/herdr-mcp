@@ -32,6 +32,7 @@ const runtimeDot = $("runtimeDot");
 const runtimeText = $("runtimeText");
 const runtimeStats = $("runtimeStats");
 const workspaceList = $("workspaceList");
+const controlDock = $("controlDock");
 const pageContextCard = $("pageContextCard");
 const pageContextTitle = $("pageContextTitle");
 const pageContextMeta = $("pageContextMeta");
@@ -43,6 +44,8 @@ const targetDetails = $("targetDetails");
 const unpinButton = $("unpinButton");
 const inspectButton = $("inspectButton");
 const readTailButton = $("readTailButton");
+const agentQuickActions = $("agentQuickActions");
+const interruptButton = $("interruptButton");
 const composer = $("composer");
 const composerFooter = $("composerFooter");
 const riskBadge = $("riskBadge");
@@ -259,6 +262,8 @@ function renderRuntime(state) {
 
 function renderWorkspaceTree(state) {
   seedExpansion(state);
+  controlDock.remove();
+  controlDock.hidden = true;
   workspaceList.replaceChildren();
   const pageBoundIds = pageContextBindingIds();
   const workspaces = workspaceRowsForPage(state.workspaces || [], pageContextBindings());
@@ -379,6 +384,10 @@ function renderWorkspaceTree(state) {
         summary.className = "pane-summary";
         summary.textContent = paneSummary(pane);
         row.append(first, meta, summary);
+        if (pinnedTarget?.pane_id === pane.pane_id) {
+          controlDock.hidden = false;
+          row.appendChild(controlDock);
+        }
         panes.appendChild(row);
       }
       section.appendChild(panes);
@@ -403,27 +412,28 @@ function renderTarget() {
   unpinButton.disabled = !hasTarget;
   inspectButton.disabled = !hasTarget || stale || !pane;
   readTailButton.disabled = !hasTarget || stale || !pane;
+  const interruptDescriptor = buildActionDescriptor(ACTION_TYPES.INTERRUPT, { target });
+  agentQuickActions.hidden = !hasTarget || !target?.agent;
+  interruptButton.disabled = actionInFlight || !interruptDescriptor.executable;
 
   if (!hasTarget) {
-    targetTitle.textContent = t("cc_no_target");
-    targetDetails.textContent = t("cc_target_help");
+    targetTitle.textContent = "";
+    targetDetails.textContent = "";
     targetKindBadge.hidden = true;
     targetKindBadge.className = "target-kind-badge";
-    actionHeading.textContent = t("cc_action_heading");
+    actionHeading.textContent = "";
+    agentQuickActions.hidden = true;
+    controlDock.hidden = true;
     return;
   }
   const kind = target.agent ? "agent" : "terminal";
-  targetKindBadge.hidden = false;
+  targetKindBadge.hidden = true;
   targetKindBadge.className = `target-kind-badge ${kind}`;
-  targetKindBadge.textContent = t(kind === "agent" ? "cc_target_kind_agent" : "cc_target_kind_terminal");
-  actionHeading.textContent = t(kind === "agent" ? "cc_action_heading_agent" : "cc_action_heading_terminal");
-  targetTitle.textContent = `${target.workspace_id || "?"} / ${target.pane_id} / ${target.agent?.name || target.agent?.kind || t("cc_terminal")}`;
-  targetDetails.textContent = stale
-    ? t("cc_target_stale", { reason: staleReasonLabel(target.stale_reason) })
-    : t("cc_target_current", {
-      status: statusLabel(target.status),
-      revision: String(target.target_revision || "local").slice(0, 96),
-    });
+  actionHeading.textContent = "";
+  targetTitle.textContent = target.agent
+    ? t("cc_agent_actions_for", { agent: target.agent?.name || target.agent?.kind || "Agent" })
+    : t("cc_terminal_actions");
+  targetDetails.textContent = stale ? t("cc_target_stale_short") : statusLabel(target.status);
 }
 
 function modePresentation(mode) {
@@ -478,19 +488,23 @@ function controlOutcomeLabel(outcome) {
 
 function controlOutcomeText(response) {
   const outcome = String(response?.outcome || (response?.ok ? "submitted" : "failed"));
-  const phase = String(response?.delivery_phase || "unknown");
-  const lines = [t("cc_control_result", {
-    outcome: controlOutcomeLabel(outcome),
-    phase,
-  })];
-  if (response?.op_id) lines.push(t("cc_control_op", { value: response.op_id }));
+  const lines = [controlOutcomeLabel(outcome)];
   const reason = response?.detail?.capability?.reason
     || response?.detail?.reason
     || response?.message
     || response?.error;
-  if (reason) lines.push(String(reason));
+  if (reason && response?.ok !== true) lines.push(String(reason));
   if (outcome === "uncertain") lines.push(t("cc_control_uncertain_hint"));
   return lines.join("\n");
+}
+
+async function applyControlResponse(response) {
+  result.textContent = controlOutcomeText(response);
+  if (response?.outcome === "stale_target") {
+    pinnedTarget = { ...pinnedTarget, stale: true, stale_reason: "target_revision_changed" };
+    await chrome.storage.local.set({ [TARGET_KEY]: pinnedTarget });
+    await refreshSnapshot();
+  }
 }
 
 function renderComposerState() {
@@ -500,7 +514,7 @@ function renderComposerState() {
   const hasMode = Boolean(selectedMode);
   composer.hidden = !hasMode;
   composerFooter.hidden = !hasMode;
-  actionModeBadge.hidden = !hasMode;
+  actionModeBadge.hidden = true;
   if (!hasMode) {
     modeHelp.textContent = t("cc_pin_first");
     sendButton.disabled = true;
@@ -515,12 +529,7 @@ function renderComposerState() {
   actionModeBadge.classList.toggle("live", descriptor.executable);
   if (!pinnedTarget?.pane_id) blockedReason.textContent = t("cc_pin_first");
   else if (pinnedTarget.stale) blockedReason.textContent = t("cc_target_stale_short");
-  else if (descriptor.executable && selectedMode === ACTION_TYPES.STEER) {
-    const known = pinnedTarget?.control_capabilities?.steer?.outcome;
-    blockedReason.textContent = known
-      ? t("cc_steer_probe_state", { outcome: controlOutcomeLabel(known) })
-      : t("cc_action_ready");
-  } else if (descriptor.executable) blockedReason.textContent = t("cc_action_ready");
+  else if (descriptor.executable) blockedReason.textContent = "";
   else blockedReason.textContent = t("cc_preview_only_reason");
   sendButton.textContent = descriptor.executable
     ? (selectedMode === ACTION_TYPES.STEER ? t("cc_execute_steer") : t("cc_execute_prompt"))
@@ -646,6 +655,7 @@ function connectControlPort(reconcile = false) {
 }
 
 workspaceList.addEventListener("click", async (event) => {
+  if (event.target.closest?.("#controlDock")) return;
   const bindingAction = event.target.closest?.("[data-workspace-binding-action]");
   if (bindingAction) {
     await mutateWorkspaceBinding(bindingAction.dataset.workspaceBindingAction);
@@ -664,16 +674,20 @@ workspaceList.addEventListener("click", async (event) => {
   const pane = (store.get().panes || []).find((item) => item.pane_id === paneNode.dataset.paneId);
   if (!pane) return;
   const previousPaneId = pinnedTarget?.pane_id || null;
+  if (previousPaneId === pane.pane_id && pinnedTarget?.stale !== true) {
+    pinnedTarget = null;
+    composer.value = "";
+    await chrome.storage.local.remove(TARGET_KEY);
+    renderAll();
+    return;
+  }
   const previousKind = pinnedTarget?.pane_id ? (pinnedTarget.agent ? "agent" : "terminal") : null;
   const nextTarget = createPinnedTarget(pane);
   const nextKind = nextTarget.agent ? "agent" : "terminal";
   if (previousPaneId !== nextTarget.pane_id || previousKind !== nextKind) composer.value = "";
   pinnedTarget = nextTarget;
   await chrome.storage.local.set({ [TARGET_KEY]: pinnedTarget });
-  result.textContent = t("cc_pinned", {
-    workspace: pinnedTarget.workspace_id || "?",
-    pane: pinnedTarget.pane_id,
-  });
+  result.textContent = "";
   renderAll();
 });
 
@@ -712,6 +726,28 @@ readTailButton.addEventListener("click", async () => {
   renderTarget();
 });
 
+interruptButton.addEventListener("click", async () => {
+  if (!pinnedTarget?.pane_id || pinnedTarget.stale || actionInFlight) return;
+  if (!confirm(t("cc_interrupt_confirm"))) return;
+  const descriptor = buildActionDescriptor(ACTION_TYPES.INTERRUPT, { target: pinnedTarget });
+  if (!descriptor.executable) return;
+  actionInFlight = true;
+  renderAll();
+  result.textContent = t("cc_interrupt_sending");
+  const response = await bg({
+    type: "herdr_control_action",
+    request: {
+      action: descriptor.action,
+      target: descriptor.target,
+      args: descriptor.args,
+      idempotency_key: `browser-control:${crypto.randomUUID()}`,
+    },
+  });
+  await applyControlResponse(response);
+  actionInFlight = false;
+  renderAll();
+});
+
 sendButton.addEventListener("click", async () => {
   if (!pinnedTarget?.pane_id || pinnedTarget.stale || actionInFlight) return;
   const text = composer.value.trim();
@@ -739,12 +775,7 @@ sendButton.addEventListener("click", async () => {
     idempotency_key: `browser-control:${crypto.randomUUID()}`,
   };
   const response = await bg({ type: "herdr_control_action", request });
-  result.textContent = controlOutcomeText(response);
-  if (response?.outcome === "stale_target") {
-    pinnedTarget = { ...pinnedTarget, stale: true, stale_reason: "target_revision_changed" };
-    await chrome.storage.local.set({ [TARGET_KEY]: pinnedTarget });
-    await refreshSnapshot();
-  }
+  await applyControlResponse(response);
   actionInFlight = false;
   renderAll();
 });

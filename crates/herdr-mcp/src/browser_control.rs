@@ -104,11 +104,28 @@ pub fn control_capabilities(pane: &Value) -> Value {
             "provider": Value::Null,
         }),
     };
+    let interrupt = match agent {
+        Some(_) if status == "working" => json!({
+            "available": true,
+            "outcome": "ready",
+            "delivery_mode": "terminal_ctrl_c",
+        }),
+        Some(_) => json!({
+            "available": false,
+            "outcome": "no_active_turn",
+            "delivery_mode": "terminal_ctrl_c",
+        }),
+        None => json!({
+            "available": false,
+            "outcome": "no_agent",
+            "delivery_mode": "terminal_ctrl_c",
+        }),
+    };
     json!({
         "agent_prompt": { "available": agent.is_some() },
         "steer": steer,
         "terminal_input": { "available": false, "outcome": "disabled_high_risk" },
-        "interrupt": { "available": false, "outcome": "not_implemented" },
+        "interrupt": interrupt,
     })
 }
 
@@ -190,15 +207,7 @@ pub fn execute_action(
             json!(current_revision),
             json!({"reason": "raw_terminal_control_disabled"}),
         ),
-        "interrupt" => action_result(
-            false,
-            action,
-            "not_steerable",
-            "not_submitted",
-            pane_id,
-            json!(current_revision),
-            json!({"reason": "provider_interrupt_not_resolved"}),
-        ),
+        "interrupt" => execute_interrupt(client, pane, pane_id, &current_revision),
         _ => action_result(
             false,
             action,
@@ -338,6 +347,82 @@ fn steer_capability_result(pane: &Value, pane_id: &str, revision: &str) -> Value
     )
 }
 
+fn execute_interrupt(client: &HerdrClient, pane: &Value, pane_id: &str, revision: &str) -> Value {
+    if pane.get("agent").and_then(Value::as_str).is_none() {
+        return action_result(
+            false,
+            "interrupt",
+            "rejected",
+            "not_submitted",
+            pane_id,
+            json!(revision),
+            json!({"reason": "no_agent", "delivery_mode": "terminal_ctrl_c"}),
+        );
+    }
+    let status = pane
+        .get("agent_status")
+        .or_else(|| pane.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if status != "working" {
+        return action_result(
+            false,
+            "interrupt",
+            "no_active_turn",
+            "not_submitted",
+            pane_id,
+            json!(revision),
+            json!({"reason": "agent_not_working", "delivery_mode": "terminal_ctrl_c"}),
+        );
+    }
+
+    match client.call(
+        "pane.send_keys",
+        json!({
+            "pane_id": pane_id,
+            "keys": ["C-c"],
+        }),
+    ) {
+        Ok(evidence) => action_result(
+            true,
+            "interrupt",
+            "interrupted",
+            "submitted",
+            pane_id,
+            json!(revision),
+            json!({
+                "delivery_mode": "terminal_ctrl_c",
+                "provider_interrupt": false,
+                "evidence": evidence,
+            }),
+        ),
+        Err(error) => {
+            let uncertain = matches!(
+                error.code.as_str(),
+                "timeout" | "unexpected_eof" | "socket_error"
+            );
+            action_result(
+                false,
+                "interrupt",
+                if uncertain { "uncertain" } else { "failed" },
+                if uncertain {
+                    "uncertain"
+                } else {
+                    "not_submitted"
+                },
+                pane_id,
+                json!(revision),
+                json!({
+                    "reason": error.code,
+                    "message": error.message,
+                    "delivery_mode": "terminal_ctrl_c",
+                    "provider_interrupt": false,
+                }),
+            )
+        }
+    }
+}
+
 fn action_result(
     ok: bool,
     action: &str,
@@ -378,8 +463,11 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
 
     fn pane(agent: Option<&str>, status: &str, revision: u64) -> Value {
         json!({
@@ -419,8 +507,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "herdr-browser-control-{}-{unique}.sock",
+            "herdr-browser-control-{}-{unique}-{sequence}.sock",
             std::process::id()
         ))
     }
@@ -491,5 +580,55 @@ mod tests {
             control_capabilities(&claude)["steer"]["outcome"],
             "unsupported_provider"
         );
+        assert_eq!(
+            control_capabilities(&working_codex)["interrupt"]["available"],
+            true
+        );
+        assert_eq!(
+            control_capabilities(&idle_codex)["interrupt"]["outcome"],
+            "no_active_turn"
+        );
+    }
+
+    #[test]
+    fn interrupt_sends_ctrl_c_to_the_fenced_agent_pane() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "pane.send_keys");
+            assert_eq!(request["params"]["pane_id"], "w1:p1");
+            assert_eq!(request["params"]["keys"], json!(["C-c"]));
+            writeln!(
+                stream,
+                "{}",
+                json!({"id": request["id"], "result": {"type": "ok"}})
+            )
+            .unwrap();
+        });
+
+        let pane = pane(Some("pi"), "working", 1);
+        let cache = EventCache::from_snapshot_for_test(json!({"panes": [pane.clone()]}));
+        let revision = target_revision(&cache, &pane).unwrap();
+        let request = json!({
+            "action": "interrupt",
+            "target": {"pane_id": "w1:p1", "target_revision": revision},
+            "args": {},
+            "idempotency_key": "browser-control-interrupt-1"
+        });
+        let client = HerdrClient::new(&socket);
+        let registry = PromptRegistry::new();
+        let result = execute_action(&client, &cache, &registry, &request);
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["outcome"], "interrupted");
+        assert_eq!(result["detail"]["delivery_mode"], "terminal_ctrl_c");
+        assert_eq!(result["detail"]["provider_interrupt"], false);
+        server.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
     }
 }

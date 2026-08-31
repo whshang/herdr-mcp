@@ -80,19 +80,6 @@ const EXPERIMENTAL_CONTENT_SCRIPTS = [
     persistAcrossSessions: true,
   },
 ];
-const CHATGPT_CONTENT_SCRIPT_FILES = [
-  "content/base.js",
-  "content/injector/chatgpt.js",
-  "context-pressure.js",
-  "conversation-health.js",
-  "recovery-controller.js",
-  "performance-core.js",
-  "content/hud/state-view.js",
-  "content/hud/tooltip.js",
-  "content/hud/renderer.js",
-  "content/hud/hud.js",
-  "content/wake.js",
-];
 const PUSH_CONNECT_MS = 5000;
 const STATE_FETCH_MS = 4000;
 const TAB_RECOVERY_COOLDOWN_MS = 30000;
@@ -569,21 +556,32 @@ async function conversationInfoForTab(tabId) {
   if (!fallback) return null;
 
   // A manual MV3 extension reload can leave an already-open ChatGPT tab without
-  // a live listener even when the extension version did not change. Recover the
-  // content script in-place, then prefer its canonical adapter identity.
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: CHATGPT_CONTENT_SCRIPT_FILES,
-    });
-    await sleep(50);
-    const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
-    if (live?.convKey) {
-      const parsed = conversationInfoFromSupportedUrl(live.url || live.convKey);
-      return parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
+  // a live listener. Never re-inject the manifest-managed classic-script bundle
+  // into the same document: top-level class/const declarations would collide.
+  // One bounded page reload gives Chrome a fresh document and one manifest load.
+  if (fallback.site === "chatgpt") {
+    try {
+      const last = tabRecoveryAttemptAt.get(tabId) || 0;
+      if (Date.now() - last >= TAB_RECOVERY_COOLDOWN_MS) {
+        tabRecoveryAttemptAt.set(tabId, Date.now());
+        await chrome.tabs.reload(tabId);
+        await waitForTabComplete(tabId, 15000);
+      }
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try {
+          const live = await chrome.tabs.sendMessage(tabId, { type: "h2w_get_convkey" });
+          if (live?.convKey) {
+            const parsed = conversationInfoFromSupportedUrl(live.url || live.convKey);
+            return parsed ? { ...live, ...parsed, convKey: parsed.convKey } : live;
+          }
+        } catch (error) {
+          if (!missingReceiverError(error)) throw error;
+        }
+        await sleep(100);
+      }
+    } catch (e) {
+      callLog(`content-script recovery failed for tab ${tabId}:`, e.message);
     }
-  } catch (e) {
-    callLog(`content-script recovery failed for tab ${tabId}:`, e.message);
   }
   return fallback;
 }
@@ -1574,12 +1572,23 @@ async function sendChatGptTabMessage(tabId, message) {
     return await chrome.tabs.sendMessage(tabId, message);
   } catch (first) {
     if (!missingReceiverError(first)) throw first;
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: CHATGPT_CONTENT_SCRIPT_FILES,
-    });
-    await sleep(80);
-    return chrome.tabs.sendMessage(tabId, message);
+    // ChatGPT is manifest-managed. Re-injecting the whole classic-script bundle
+    // into an already-open document can redeclare top-level class/const names
+    // after an extension reload. Recover with one bounded page reload instead;
+    // the manifest then installs exactly one fresh content-script instance.
+    await chrome.tabs.reload(tabId);
+    await waitForTabComplete(tabId, 15000);
+    let lastError = first;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        return await chrome.tabs.sendMessage(tabId, message);
+      } catch (error) {
+        lastError = error;
+        if (!missingReceiverError(error)) throw error;
+        await sleep(100);
+      }
+    }
+    throw lastError;
   }
 }
 
@@ -1613,8 +1622,42 @@ let stateFetchInFlight = null;
 let localRuntimeReachable = null;
 let localRuntimeCheckedAt = 0;
 const controlCenterPorts = new Set();
+const controlCenterOpenWindows = new Set();
 let controlCenterSnapshotAt = 0;
 let controlCenterLastState = null;
+
+try {
+  chrome.sidePanel?.onOpened?.addListener((info) => {
+    const windowId = Number(info?.windowId);
+    if (Number.isInteger(windowId) && windowId >= 0) controlCenterOpenWindows.add(windowId);
+  });
+  chrome.sidePanel?.onClosed?.addListener((info) => {
+    const windowId = Number(info?.windowId);
+    if (Number.isInteger(windowId) && windowId >= 0) controlCenterOpenWindows.delete(windowId);
+  });
+} catch (_) {}
+
+async function openControlCenter(windowId) {
+  if (!chrome.sidePanel?.open || !Number.isInteger(windowId) || windowId < 0) {
+    return { ok: false, error: "control_center_unavailable" };
+  }
+  await chrome.sidePanel.open({ windowId });
+  controlCenterOpenWindows.add(windowId);
+  return { ok: true, open: true };
+}
+
+async function toggleControlCenter(windowId) {
+  if (!Number.isInteger(windowId) || windowId < 0 || !chrome.sidePanel?.open) {
+    return { ok: false, error: "control_center_unavailable" };
+  }
+  if (controlCenterOpenWindows.has(windowId)) {
+    if (!chrome.sidePanel?.close) return { ok: false, error: "control_center_close_unavailable" };
+    await chrome.sidePanel.close({ windowId });
+    controlCenterOpenWindows.delete(windowId);
+    return { ok: true, open: false };
+  }
+  return openControlCenter(windowId);
+}
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port?.name !== "herdr-control-center") return;
@@ -4138,12 +4181,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_open_control_center") {
     const windowId = Number(sender?.tab?.windowId);
-    if (!chrome.sidePanel?.open || !Number.isInteger(windowId) || windowId < 0) {
-      sendResponse({ ok: false, error: "control_center_unavailable" });
-      return false;
-    }
-    void chrome.sidePanel.open({ windowId })
-      .then(() => sendResponse({ ok: true }))
+    void openControlCenter(windowId)
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+    return true;
+  }
+  if (msg?.type === "h2w_toggle_control_center") {
+    const windowId = Number(sender?.tab?.windowId);
+    void toggleControlCenter(windowId)
+      .then(sendResponse)
       .catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
     return true;
   }
@@ -4890,7 +4936,7 @@ try {
   chrome.action.onClicked.addListener((tab) => {
     const windowId = Number(tab?.windowId);
     if (chrome.sidePanel?.open && Number.isInteger(windowId) && windowId >= 0) {
-      void chrome.sidePanel.open({ windowId })
+      void openControlCenter(windowId)
         .catch((error) => callLog("control center action failed:", error?.message || error));
       return;
     }

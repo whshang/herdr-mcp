@@ -46,7 +46,10 @@ async function waitForTest(predicate, timeoutMs = 5000, pollMs = 20) {
 
 // ---- chrome mock ----
 const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", token: "test-token", enabled: true, wakeTemplate: "a {status}", h2wBgVersion: "0.1.80", experimentalZAiEnabled: true, experimentalDeepSeekEnabled: true };
-const listeners = { onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [] };
+const listeners = {
+  onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [],
+  onSidePanelOpened: [], onSidePanelClosed: [],
+};
 const sentMessages = []; // Messages from background to content.
 const tabs = new Map();   // tabId -> { url, listener }.
 let nextTabId = 500;
@@ -66,6 +69,7 @@ let llmHandoffResponder = null;
 const llmHandoffRequests = [];
 const reloadCalls = [];
 const sidePanelOpenCalls = [];
+const sidePanelCloseCalls = [];
 let projectNavigationReadyAfter = 0;
 let projectNavigationPollCount = 0;
 let sourceProbeLooksSeeded = false;
@@ -439,7 +443,16 @@ globalThis.chrome = {
     setBadgeBackgroundColor: async () => {},
   },
   sidePanel: {
-    async open(options) { sidePanelOpenCalls.push(options); },
+    async open(options) {
+      sidePanelOpenCalls.push(options);
+      for (const listener of listeners.onSidePanelOpened) listener({ windowId: options.windowId, path: "control-center.html" });
+    },
+    async close(options) {
+      sidePanelCloseCalls.push(options);
+      for (const listener of listeners.onSidePanelClosed) listener({ windowId: options.windowId, path: "control-center.html" });
+    },
+    onOpened: { addListener: (fn) => listeners.onSidePanelOpened.push(fn) },
+    onClosed: { addListener: (fn) => listeners.onSidePanelClosed.push(fn) },
   },
   scripting: { executeScript: async () => [{ result: { ok: true } }] },
   alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
@@ -518,6 +531,23 @@ ok(hudPanelOpen?.ok === true
     && sidePanelOpenCalls.length === 2
     && sidePanelOpenCalls[1]?.windowId === 88,
   "HUD user gesture opens the Control Center Side Panel in the sender window", JSON.stringify(sidePanelOpenCalls));
+const hudPanelClose = await new Promise((resolve) => {
+  const keepChannel = onMsg({ type: "h2w_toggle_control_center" }, { tab: { windowId: 88 } }, resolve);
+  ok(keepChannel === true, "HUD Control Center toggle keeps the async response channel open");
+});
+ok(hudPanelClose?.ok === true
+    && hudPanelClose?.open === false
+    && sidePanelCloseCalls.length === 1
+    && sidePanelCloseCalls[0]?.windowId === 88,
+  "second HUD gesture closes the Control Center Side Panel", JSON.stringify(sidePanelCloseCalls));
+const hudPanelReopen = await new Promise((resolve) => {
+  onMsg({ type: "h2w_toggle_control_center" }, { tab: { windowId: 88 } }, resolve);
+});
+ok(hudPanelReopen?.ok === true
+    && hudPanelReopen?.open === true
+    && sidePanelOpenCalls.length === 3
+    && sidePanelOpenCalls[2]?.windowId === 88,
+  "third HUD gesture reopens the Control Center Side Panel", JSON.stringify(sidePanelOpenCalls));
 
 function dispatchMessage(msg, sender = {}) {
   return new Promise((resolve) => {

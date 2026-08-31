@@ -73,6 +73,7 @@ const rustNativeHostSource = readFileSync(path.join(EXT, "..", "crates", "herdr-
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
+const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
 ok(manifest.version === "0.1.82", "manifest version stays aligned with the browser product build");
 ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.82"'), "background version matches manifest");
@@ -108,7 +109,7 @@ ok(backgroundSource.includes('msg?.type === "h2w_force_tab_reload"')
   "bounded page self-healing keeps forced reload sender-scoped and 429 backoff-only");
 ok(backgroundSource.includes("automationRuntimeGate")
     && backgroundSource.includes('reason: "local_runtime_unavailable"')
-    && wakeSource.includes('blocked: "local-runtime-unavailable"'),
+    && wakeSource.includes('automationRuntimeAvailable ? "automation-disabled" : "local-runtime-unavailable"'),
   "automatic continuation fails closed when the local Herdr runtime is unavailable");
 ok(wakeSource.includes("syncDocumentTitle")
     && wakeSource.includes('.join("-")')
@@ -232,11 +233,19 @@ ok(
   "ChatGPT loads the classic context-pressure policy before wake.js",
 );
 ok(
-  wakeSource.includes('type: "h2w_open_control_center"')
+  wakeSource.includes('type: "h2w_toggle_control_center"')
     && wakeSource.includes('hudEls.bar.addEventListener("click"')
-    && backgroundSource.includes('msg?.type === "h2w_open_control_center"')
-    && backgroundSource.includes('chrome.sidePanel.open({ windowId })'),
-  "clicking the non-button HUD bar opens the Control Center Side Panel through the sender window",
+    && backgroundSource.includes('msg?.type === "h2w_toggle_control_center"')
+    && backgroundSource.includes('chrome.sidePanel.open({ windowId })')
+    && backgroundSource.includes('chrome.sidePanel.close({ windowId })')
+    && backgroundSource.includes("controlCenterOpenWindows"),
+  "clicking the non-button HUD bar toggles the Control Center Side Panel in the sender window",
+);
+ok(
+  wakeSource.includes("msg?.data?.manual !== true && !automationActive")
+    && wakeSource.includes('automationRuntimeAvailable ? "automation-disabled" : "local-runtime-unavailable"')
+    && wakeSource.includes("result?.error || result?.blocked || result?.reason"),
+  "manual Continue bypasses the Auto-enabled gate and surfaces structured failure reasons instead of unknown",
 );
 ok(
   wakeSource.includes('ui.quick.hidden = !hud?.project_id')
@@ -578,11 +587,11 @@ ok(
 
 ok(
   backgroundSource.includes("conversationInfoForTab(msg.tabId)")
-    && backgroundSource.includes("files: CHATGPT_CONTENT_SCRIPT_FILES")
-    && backgroundSource.includes('"context-pressure.js"')
-    && backgroundSource.includes('"conversation-health.js"')
-    && backgroundSource.includes('"recovery-controller.js"'),
-  "bind recovery reinjects the complete ChatGPT content-script stack when an open tab lost its MV3 listener",
+    && !backgroundSource.includes("CHATGPT_CONTENT_SCRIPT_FILES")
+    && backgroundSource.includes("Never re-inject the manifest-managed classic-script bundle")
+    && backgroundSource.includes("await chrome.tabs.reload(tabId)")
+    && backgroundSource.includes("await waitForTabComplete(tabId, 15000)"),
+  "ChatGPT listener recovery reloads the document instead of redeclaring manifest-managed classic scripts",
 );
 
 const localeCodes = ["en", "zh", "ja"];
@@ -644,10 +653,10 @@ ok([enLocale, zhLocale, jaLocale].every((locale) => [
   "Control Center locales remove the old separate binding-selector vocabulary");
 ok(zhLocale.cc_page_handoff_busy.includes("Herdr")
     && zhLocale.cc_page_handoff_busy_help.includes("工作区仍在工作")
-    && zhLocale.cc_mode_herdr_help.includes("不会假装已经完成 schema 校验")
-    && enLocale.cc_mode_herdr_help.includes("future execution must pass")
-    && jaLocale.cc_mode_herdr_help.includes("schema 検証済みとも扱いません"),
-  "handoff busy and Herdr API preview copy fail closed without validation overclaim");
+    && zhLocale.cc_mode_terminal_help.includes("暂未开放")
+    && enLocale.cc_mode_terminal_help.includes("not enabled yet")
+    && jaLocale.cc_mode_terminal_help.includes("まだ有効ではありません"),
+  "handoff busy and terminal preview copy fail closed without exposing implementation jargon");
 ok(zhLocale.hud_automation_off === "自动 关", "zh HUD automation-off label is localized");
 ok(
   zhLocale.hud_automation_on_hint.includes("进度")
@@ -719,7 +728,7 @@ const actionClickEnd = actionClickStart >= 0 ? backgroundSource.indexOf("void re
 const actionClickBlock = actionClickStart >= 0 && actionClickEnd > actionClickStart
   ? backgroundSource.slice(actionClickStart, actionClickEnd)
   : "";
-ok(actionClickBlock.includes("chrome.sidePanel.open({ windowId })")
+ok(actionClickBlock.includes("openControlCenter(windowId)")
     && actionClickBlock.includes("tab?.windowId")
     && !backgroundSource.includes('msg?.type === "h2w_popup_set_automation"'),
   "toolbar action opens the Control Center Side Panel directly and removes popup-only protocol");
@@ -731,9 +740,10 @@ ok(!controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && !controlCenterHtml.includes('id="pageBindings"')
     && !controlCenterHtml.includes('id="pageBindButton"')
     && !controlCenterHtml.includes('id="pageHandoffButton"')
-    && controlCenterHtml.includes('data-i18n="cc_action_heading"')
+    && controlCenterHtml.includes('id="controlDock"')
     && controlCenterHtml.includes('id="actionModeBadge"')
-    && controlCenterHtml.includes('data-i18n="cc_target_label"')
+    && controlCenterSource.includes("row.appendChild(controlDock)")
+    && controlCenterSource.includes('event.target.closest?.("#controlDock")')
     && controlCenterSource.includes('from "./i18n.js"')
     && controlCenterSource.includes("await detectOrLoadLocale()")
     && controlCenterSource.includes('chrome.runtime.openOptionsPage()')
@@ -759,11 +769,15 @@ ok(!controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && backgroundSource.includes('msg?.type === "herdr_control_action"')
     && backgroundSource.includes('/extension/control/action')
     && controlCenterSource.includes('type: "herdr_control_action"')
+    && controlCenterHtml.includes('id="interruptButton"')
+    && controlCenterSource.includes("ACTION_TYPES.INTERRUPT")
+    && controlActionsSource.includes('target.control_capabilities?.steer?.available === true')
+    && controlActionsSource.includes('mode: "trusted_terminal_interrupt"')
     && controlCenterSource.includes('crypto.randomUUID()')
     && controlCenterSource.includes('t("cc_control_uncertain_hint")')
     && controlCenterSource.includes('t("cc_preview_only_reason")')
     && controlCenterSource.includes('t("native_host_help")'),
-  "Control Center keeps page binding and pinned local targeting while Prompt/Steer use the trusted action route and risky modes stay preview-only");
+  "Control Center keeps explicit local targets, shows steer only when advertised, and exposes fenced Agent Ctrl+C separately from raw terminal input");
 ok(backgroundSource.includes('event === "hello"')
     && backgroundSource.includes('type: "herdr_control_state"')
     && backgroundSource.includes('type: "herdr_control_event"')

@@ -27,7 +27,7 @@ const RISKS = Object.freeze({
   [ACTION_TYPES.TERMINAL_TEXT]: ACTION_RISK.TERMINAL_MUTATION,
   [ACTION_TYPES.TERMINAL_INPUT]: ACTION_RISK.TERMINAL_MUTATION,
   [ACTION_TYPES.TERMINAL_KEYS]: ACTION_RISK.TERMINAL_MUTATION,
-  [ACTION_TYPES.INTERRUPT]: ACTION_RISK.MUTATION,
+  [ACTION_TYPES.INTERRUPT]: ACTION_RISK.TERMINAL_MUTATION,
 });
 
 const CONTROL_BLOCK_REASONS = Object.freeze({
@@ -35,14 +35,14 @@ const CONTROL_BLOCK_REASONS = Object.freeze({
   [ACTION_TYPES.TERMINAL_TEXT]: "Raw terminal mutation remains disabled",
   [ACTION_TYPES.TERMINAL_INPUT]: "Raw terminal mutation remains disabled",
   [ACTION_TYPES.TERMINAL_KEYS]: "Raw terminal mutation remains disabled",
-  [ACTION_TYPES.INTERRUPT]: "Provider interrupt ownership is not resolved",
 });
 
 export function actionModesForTarget(target) {
   if (!target?.pane_id) return [];
-  return target.agent
-    ? [ACTION_TYPES.AGENT_PROMPT, ACTION_TYPES.STEER]
-    : [ACTION_TYPES.TERMINAL_TEXT];
+  if (!target.agent) return [ACTION_TYPES.TERMINAL_TEXT];
+  const modes = [ACTION_TYPES.AGENT_PROMPT];
+  if (target.control_capabilities?.steer?.available === true) modes.push(ACTION_TYPES.STEER);
+  return modes;
 }
 
 export function classifyAction(type) {
@@ -72,9 +72,20 @@ export function controlAvailability(type, context = {}) {
       : { enabled: false, mode: "trusted_extension", reason: "Pinned pane has no active agent" };
   }
   if (type === ACTION_TYPES.STEER) {
-    return context.target?.agent
+    if (!context.target?.agent) {
+      return { enabled: false, mode: "provider_probe", reason: "Selected pane has no active agent" };
+    }
+    return context.target?.control_capabilities?.steer?.available === true
       ? { enabled: true, mode: "provider_probe", reason: null }
-      : { enabled: false, mode: "provider_probe", reason: "Pinned pane has no active agent" };
+      : { enabled: false, mode: "provider_probe", reason: "Adjust is not available for this agent" };
+  }
+  if (type === ACTION_TYPES.INTERRUPT) {
+    if (!context.target?.agent) {
+      return { enabled: false, mode: "trusted_terminal_interrupt", reason: "Pinned pane has no active agent" };
+    }
+    return context.target?.status === "working"
+      ? { enabled: true, mode: "trusted_terminal_interrupt", reason: null }
+      : { enabled: false, mode: "trusted_terminal_interrupt", reason: "Pinned agent is not working" };
   }
   return {
     enabled: false,

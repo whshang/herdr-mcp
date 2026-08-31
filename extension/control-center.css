@@ -39,6 +39,7 @@ button:hover { border-color: #40556b; }
 button:disabled { opacity: .45; cursor: default; }
 button.primary { border-color: #3d6fa8; background: #17406c; }
 button.ghost { background: transparent; }
+button.danger { border-color: color-mix(in srgb, var(--danger) 62%, var(--border)); color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--panel-2)); }
 
 .page-context-card { margin: 8px 8px 0; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
 .page-context-heading { display: flex; align-items: center; gap: 8px; }
@@ -85,8 +86,9 @@ button.ghost { background: transparent; }
 .pane-meta, .pane-summary { margin-top: 3px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pane-summary { color: #b9c5d1; }
 
-.control-dock { position: sticky; bottom: 0; z-index: 5; border-top: 1px solid var(--border); background: var(--bg); padding: 10px; }
-.target-card { padding: 8px; border: 1px solid var(--border); background: var(--panel); border-radius: 8px; }
+.control-dock { margin-top: 8px; padding: 0; cursor: default; }
+.control-dock[hidden] { display: none; }
+.target-card { padding: 8px; border: 1px solid var(--border); background: var(--panel-2); border-radius: 8px; }
 .target-label { margin-bottom: 5px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
 .target-heading { display: flex; align-items: center; gap: 6px; }
 .target-heading strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -101,6 +103,10 @@ button.ghost { background: transparent; }
 .target-action-heading { display: flex; align-items: center; gap: 7px; margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--border); }
 .target-action-heading strong { font-size: 11px; }
 .target-action-heading span { margin-left: auto; padding: 2px 6px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: 9px; font-weight: 750; letter-spacing: .06em; }
+.agent-quick-actions { display: flex; align-items: center; gap: 7px; margin-top: 8px; }
+.agent-quick-actions[hidden] { display: none; }
+.agent-quick-actions span { min-width: 0; flex: 1; color: var(--muted); font-size: 10px; line-height: 1.35; }
+.agent-quick-actions button { flex: 0 0 auto; }
 .mode-tabs { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 4px; margin-top: 8px; }
 .mode-tabs button { padding: 5px 2px; }
 .mode-tabs button.active { border-color: var(--accent); background: #173452; }

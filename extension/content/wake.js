@@ -87,6 +87,7 @@ const H2W_CONTENT_VERSION = "0.1.82";
   // read-only HUD/workspace observers do not depend on these flags.
   let automationEnabled = false;
   let automationAutoAllow = false;
+  let automationRuntimeAvailable = false;
   let hudLabels = {};
   let queuedInsertCount = 0;
   let queuedInsertActionBusy = false;
@@ -169,8 +170,10 @@ const H2W_CONTENT_VERSION = "0.1.82";
     if (!state?.ok) {
       automationEnabled = false;
       automationAutoAllow = false;
+      automationRuntimeAvailable = false;
       return false;
     }
+    automationRuntimeAvailable = state.runtime_available !== false;
     automationEnabled = state.enabled === true;
     automationAutoAllow = state.autoAllow !== false;
     hudLabels = state.labels || hudLabels;
@@ -1454,8 +1457,12 @@ const H2W_CONTENT_VERSION = "0.1.82";
       }
       if (msg?.type === "h2w_wake") {
         (async () => {
-          if (!(await refreshAutomationState())) {
-            sendResponse({ ok: false, blocked: "local-runtime-unavailable" });
+          const automationActive = await refreshAutomationState();
+          if (msg?.data?.manual !== true && !automationActive) {
+            sendResponse({
+              ok: false,
+              blocked: automationRuntimeAvailable ? "automation-disabled" : "local-runtime-unavailable",
+            });
             return;
           }
           await ensureConversationHealth();
@@ -3326,7 +3333,8 @@ const H2W_CONTENT_VERSION = "0.1.82";
       } else if (result?.ok) {
         showHudToast(hudText("continue_sent"), "ok");
       } else {
-        showHudToast(hudText("continue_failed", { error: result?.error || "unknown" }), "err");
+        const error = result?.error || result?.blocked || result?.reason || "manual-continue-failed";
+        showHudToast(hudText("continue_failed", { error }), "err");
       }
       return result;
     } finally {
@@ -3452,7 +3460,7 @@ const H2W_CONTENT_VERSION = "0.1.82";
     });
     hudEls.bar.addEventListener("click", (event) => {
       if (event.target?.closest?.("button")) return;
-      void sendBg({ type: "h2w_open_control_center" }).then((result) => {
+      void sendBg({ type: "h2w_toggle_control_center" }).then((result) => {
         if (!result?.ok) showHudToast(hudText("control_center_open_failed", null, "Could not open Control Center."), "err");
       });
     });

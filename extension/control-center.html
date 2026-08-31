@@ -44,34 +44,34 @@
       </div>
     </section>
 
-    <section class="control-dock" aria-label="Pinned control target" data-i18n-aria="cc_target_aria">
+    <section id="controlDock" class="control-dock" aria-label="Pane actions" data-i18n-aria="cc_target_aria" hidden>
       <div id="targetCard" class="target-card">
-        <div class="target-label" data-i18n="cc_target_label">Local Herdr control</div>
         <div class="target-heading">
-          <span aria-hidden="true">📌</span>
-          <strong id="targetTitle" data-i18n="cc_no_target">No pinned target</strong>
+          <strong id="targetTitle">Pane actions</strong>
           <span id="targetKindBadge" class="target-kind-badge" hidden></span>
           <span class="spacer"></span>
-          <button id="unpinButton" type="button" class="ghost" disabled data-i18n="cc_unpin">Unpin</button>
+          <button id="unpinButton" type="button" class="ghost" data-i18n="cc_unpin">Collapse</button>
         </div>
-        <div id="targetDetails" class="target-details" data-i18n="cc_target_help">Click a pane above to pin it. Herdr focus changes will not retarget this control.</div>
+        <div id="targetDetails" class="target-details"></div>
         <div class="read-actions">
-          <button id="inspectButton" type="button" disabled data-i18n="cc_inspect_state">Inspect state</button>
-          <button id="readTailButton" type="button" disabled data-i18n="cc_read_tail">Read output tail</button>
+          <button id="inspectButton" type="button" disabled data-i18n="cc_inspect_state">Details</button>
+          <button id="readTailButton" type="button" disabled data-i18n="cc_read_tail">Recent output</button>
         </div>
 
-        <div class="target-action-heading">
-          <strong id="actionHeading" data-i18n="cc_action_heading">Target actions</strong>
-          <span id="actionModeBadge" data-i18n="cc_live_badge" hidden>TRUSTED LOCAL</span>
+        <div id="actionHeading" hidden></div>
+        <span id="actionModeBadge" hidden></span>
+        <span id="riskBadge" hidden></span>
+        <div id="agentQuickActions" class="agent-quick-actions" hidden>
+          <button id="interruptButton" type="button" class="danger" disabled data-i18n="cc_interrupt_agent">Stop task</button>
+          <span data-i18n="cc_interrupt_agent_help">Same as Ctrl+C.</span>
         </div>
-        <div id="modeTabs" class="mode-tabs" role="tablist" aria-label="Control mode" data-i18n-aria="cc_mode_aria" hidden></div>
-        <div id="modeHelp" class="mode-help" data-i18n="cc_pin_first">Pin a pane first</div>
+        <div id="modeTabs" class="mode-tabs" role="tablist" aria-label="Action" data-i18n-aria="cc_mode_aria" hidden></div>
+        <div id="modeHelp" class="mode-help"></div>
 
-        <textarea id="composer" placeholder="Describe the new prompt you would send to the pinned Agent." hidden></textarea>
+        <textarea id="composer" hidden></textarea>
         <div id="composerFooter" class="composer-footer" hidden>
-          <span id="riskBadge" class="risk">WRITE</span>
-          <span id="blockedReason" class="blocked-reason" data-i18n="cc_preview_only_reason">Preview only in this release</span>
-          <button id="sendButton" type="button" class="primary" data-i18n="cc_preview_action">Preview action</button>
+          <span id="blockedReason" class="blocked-reason"></span>
+          <button id="sendButton" type="button" class="primary" data-i18n="cc_preview_action">Preview</button>
         </div>
         <pre id="result" class="result" aria-live="polite"></pre>
       </div>

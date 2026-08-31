@@ -6,7 +6,7 @@ It is not a shortcut for giving the browser unrestricted shell access. It solves
 
 > When Web AI, local agents, tests, and terminals are all active, how do you keep the real workstation state visible and make the next human control target explicit?
 
-The current Control Center is **active-page context + live observation + explicit targeting + bounded reads + fenced local actions**. `Prompt Agent` now executes through the trusted Native Messaging path. `Steer Session` sends a provider-steer request and reports the real provider capability/outcome without silently substituting Prompt. Arbitrary Herdr methods and raw Terminal Input remain preview-only.
+The current Control Center is **active-page context + live observation + inline pane actions + bounded reads + fenced local actions**. Click a pane to expand its actions directly underneath it; click it again or choose Collapse to close them. `Send instruction` executes through Herdr `agent.prompt`. `Adjust current task` appears only when the runtime explicitly advertises native steer. A working Agent also exposes a separate `Stop task` action. Raw Terminal Input remains preview-only.
 
 ## How it differs from browser continuity
 
@@ -146,10 +146,11 @@ The panel now has four kinds of behavior rather than one blanket “preview-only
 
 | Mode | Current behavior | Delivery semantics |
 |---|---|---|
-| Inspect state | Executes a bounded read | Read-only |
-| Read output tail | Executes a bounded terminal-tail read | Read-only |
-| Prompt Agent | **Executes** through the trusted extension-only local action route and existing Herdr `agent.prompt` reliability kernel | `submitted`, `queued`, `rejected`, `uncertain`, or `failed`, with an operation id/evidence when available |
-| Steer Session | **Executes a provider steer request/probe** against the pinned target | Reports `steered` only when provider-native same-turn steering is actually proven; otherwise reports exact outcomes such as `session_not_resolved`, `no_active_turn`, or `unsupported_provider` |
+| Details | Executes a bounded read | Read-only |
+| Recent output | Executes a bounded terminal-tail read | Read-only |
+| Send instruction | **Executes** through the trusted extension-only local action route and existing Herdr `agent.prompt` reliability kernel | `submitted`, `queued`, `rejected`, `uncertain`, or `failed`, with an operation id/evidence when available |
+| Steer current task | Shown only when the runtime explicitly advertises native steer for the pinned provider | Redirects the active task without stopping its current turn; never falls back to Agent Prompt |
+| Stop task | Available only for an Agent that is currently working; confirms before sending literal `Ctrl+C` to that pane | Stops the current CLI turn/process; never presented as a provider interrupt |
 | Herdr API | Preview only | No arbitrary Herdr mutation is executed from this UI |
 | Terminal Input | Preview only | No raw terminal bytes/keys are written from this UI |
 
@@ -161,9 +162,9 @@ The panel now has four kinds of behavior rather than one blanket “preview-only
 
 `Read output tail` asks the local runtime for a bounded terminal tail. The request is deliberately limited (roughly 40 lines / 4096 characters), so a terminal that has run for hours cannot dump unbounded history into the Side Panel.
 
-### Prompt Agent: reliable local mutation, not terminal injection
+### Send instruction: reliable Agent Prompt, not terminal injection
 
-`Prompt Agent` targets the explicitly pinned pane and travels only through:
+`Send instruction` targets the pane whose inline action area is open and travels only through:
 
 ```text
 Side Panel
@@ -180,13 +181,15 @@ Every action carries a runtime-generated `target_revision`. Rust re-reads the li
 
 Prompt also reuses the existing `agent.prompt` persistent idempotency record instead of inventing browser-only retry logic. The Side Panel creates an idempotency key and surfaces uncertain delivery explicitly. If the result is uncertain, inspect live state before retrying; do not blindly resend.
 
-### Steer Session: never impersonate true steer
+### Steer current task: never impersonate true steer
 
-`Steer Session` is intentionally stricter than Prompt. It does **not** fall back to `agent.prompt` and then label the result as steer.
+`Steer current task` is intentionally stricter than Prompt. The UI shows it only when `control_capabilities.steer.available` is true. It does **not** fall back to `agent.prompt` and then label the result as steer.
 
 For Codex, provider-native same-turn `turn/steer` needs an authoritative mapping from the pinned Herdr pane to the active app-server control endpoint, `threadId`, and current `expectedTurnId`. The current Herdr pane/session metadata does not expose that mapping. Therefore a working Codex pane currently reports `session_not_resolved`; an idle Codex pane reports `no_active_turn`; other providers can report `unsupported_provider`.
 
 A local `~/.codex/ipc/ipc.sock` file by itself is not sufficient evidence: a socket can be stale, can belong to a different client/session, and does not identify the target thread or expected active turn. Provider-native steer will only be enabled when those identities can be proven end to end.
+
+`Stop task` is a separate, narrower local-control path. It is enabled only for an Agent in `working` state, asks for confirmation, and sends `pane.send_keys(["C-c"])`. It does not claim provider-level interrupt semantics and is not automatically retried after uncertain delivery; inspect the target state before sending another stop.
 
 This is the direct resolution of the original Issue #57 ambiguity: **queued/prompted work and same-turn steering are separate outcomes, never aliases.**
 

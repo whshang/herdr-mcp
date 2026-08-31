@@ -270,18 +270,24 @@ test("action risk classification covers browser control action types", () => {
   assert.equal(classifyAction(ACTION_TYPES.STEER), ACTION_RISK.PROVIDER_STEER);
   assert.equal(classifyAction(ACTION_TYPES.HERDR_METHOD), ACTION_RISK.UNKNOWN);
   assert.equal(classifyAction(ACTION_TYPES.TERMINAL_INPUT), ACTION_RISK.TERMINAL_MUTATION);
+  assert.equal(classifyAction(ACTION_TYPES.INTERRUPT), ACTION_RISK.TERMINAL_MUTATION);
 });
 
 test("pinned target type exposes only matching control modes", () => {
   const view = normalizeBrowserState(baseSnapshot());
   const agentTarget = createPinnedTarget(view.panes[0]);
   const terminalTarget = createPinnedTarget(view.panes[1]);
+  const steerCapableAgentTarget = {
+    ...agentTarget,
+    control_capabilities: { steer: { available: true, outcome: "ready" } },
+  };
 
-  assert.deepEqual(actionModesForTarget(agentTarget), [ACTION_TYPES.AGENT_PROMPT, ACTION_TYPES.STEER]);
+  assert.deepEqual(actionModesForTarget(agentTarget), [ACTION_TYPES.AGENT_PROMPT]);
+  assert.deepEqual(actionModesForTarget(steerCapableAgentTarget), [ACTION_TYPES.AGENT_PROMPT, ACTION_TYPES.STEER]);
   assert.deepEqual(actionModesForTarget(terminalTarget), [ACTION_TYPES.TERMINAL_TEXT]);
   assert.deepEqual(actionModesForTarget(null), []);
   assert.deepEqual(actionModesForTarget({}), []);
-  assert.deepEqual(actionModesForTarget({ ...agentTarget, stale: true }), [ACTION_TYPES.AGENT_PROMPT, ACTION_TYPES.STEER]);
+  assert.deepEqual(actionModesForTarget({ ...agentTarget, stale: true }), [ACTION_TYPES.AGENT_PROMPT]);
 
   const terminalPreview = buildActionDescriptor(ACTION_TYPES.TERMINAL_TEXT, {
     target: terminalTarget,
@@ -289,9 +295,12 @@ test("pinned target type exposes only matching control modes", () => {
   });
   assert.equal(terminalPreview.executable, false);
   assert.equal(buildActionDescriptor(ACTION_TYPES.AGENT_PROMPT, { target: terminalTarget, text: "hello" }).executable, false);
+  assert.equal(buildActionDescriptor(ACTION_TYPES.INTERRUPT, { target: agentTarget }).executable, true);
+  assert.equal(buildActionDescriptor(ACTION_TYPES.INTERRUPT, { target: { ...agentTarget, status: "idle" } }).executable, false);
+  assert.equal(buildActionDescriptor(ACTION_TYPES.INTERRUPT, { target: terminalTarget }).executable, false);
 });
 
-test("trusted prompt and steer probe are executable while high-risk modes stay preview-only", () => {
+test("trusted prompt is executable, steer requires an advertised capability, and high-risk modes stay preview-only", () => {
   const target = createPinnedTarget(normalizeBrowserState(baseSnapshot()).panes[0]);
   assert.equal(phaseAAvailability(ACTION_TYPES.AGENT_PROMPT, { target }).enabled, true);
   const prompt = buildActionDescriptor(ACTION_TYPES.AGENT_PROMPT, { target, text: "keep compatibility" });
@@ -301,7 +310,12 @@ test("trusted prompt and steer probe are executable while high-risk modes stay p
   assert.equal(prompt.target.pane_id, "w1:p1");
   assert.equal(prompt.args.text, "keep compatibility");
 
-  const steer = buildActionDescriptor(ACTION_TYPES.STEER, { target, text: "do not change schema" });
+  assert.equal(buildActionDescriptor(ACTION_TYPES.STEER, { target, text: "adjust" }).executable, false);
+  const steerTarget = {
+    ...target,
+    control_capabilities: { steer: { available: true, outcome: "ready" } },
+  };
+  const steer = buildActionDescriptor(ACTION_TYPES.STEER, { target: steerTarget, text: "do not change schema" });
   assert.equal(steer.executable, true);
   assert.equal(steer.execution_mode, "provider_probe");
 

@@ -6,7 +6,7 @@
 
 > 当网页 AI、本地 Agent、测试进程和终端同时工作时，怎样始终知道**哪一个现场正在发生什么，以及下一条人工控制明确指向哪里**？
 
-当前控制中心已经形成**当前页面上下文 + 实时观察 + 明确目标 + 有界读取 + 有 fencing 的本地操作**。`提示 Agent` 现在会通过可信 Native Messaging 真正执行；`调整会话`会发起 provider steer 请求并如实返回能力/结果，不会偷偷用 Prompt 冒充 steer；任意 Herdr 方法和原始终端输入仍保持 Preview-only。
+当前控制中心已经形成**当前页面上下文 + 实时观察 + 明确目标 + 有界读取 + 有 fencing 的本地操作**。`发送指令`通过可信 Native Messaging 调用 Herdr `agent.prompt`；只有 runtime 明确声明当前 provider 支持原生 steer 时才显示`调整当前任务`；正在运行的 Agent 还提供独立的`停止 (Ctrl+C)`。任意 Herdr 方法和原始终端输入仍保持 Preview-only。
 
 ## 它和浏览器连续工作有什么区别
 
@@ -114,21 +114,13 @@ Side Panel 隐藏时会减少无意义 DOM 工作；重新可见或事件流重�
 - 最近活动时间；
 - 最近一条有界摘要 / terminal title。
 
-初次打开只展开有限数量的 workspace，避免大量项目同时存在时把面板撑成不可读的长列表。切换浏览器 tab 会更新绑定排序与高亮，但不会改变 Pinned Target。
+初次打开只展开有限数量的 workspace，避免大量项目同时存在时把面板撑成不可读的长列表。切换浏览器 tab 会更新绑定排序与高亮，但不会偷偷切换你正在操作的窗格。
 
-## Pin 一个明确目标
+## 在窗格里直接展开操作
 
-点击某个 pane 行即可固定它。
+点击某个 pane 行，会直接在这个 pane 下方展开它自己的操作区；再次点击同一个 pane，或点击“收起”，即可关闭。
 
-固定后底部会显示：
-
-```text
-固定目标
-wD7 / wD7:p2 / pi
-运行中 · revision ...
-```
-
-Pinned Target 会持久保存在扩展本地状态中，并在新的 snapshot / reconnect 后重新验证。
+用户不需要先理解“固定目标”再去面板底部找操作。内部仍会保存并校验 pane identity，确保发送指令或停止任务时不会误操作已经被替换的 Agent session。
 
 ### 为什么会变成“目标已失效”
 
@@ -138,32 +130,33 @@ Pinned Target 会持久保存在扩展本地状态中，并在新的 snapshot / 
 - 同一个 pane id 已经属于新的 Agent session；
 - 目标 revision 发生了不能安全视为同一执行对象的变化。
 
-stale 后控制中心不会猜测新目标。需要用户重新点击 pane 才能继续读取或预览操作。
+stale 后控制中心不会猜测新目标。需要用户重新点击 pane 才能继续操作。
 
 ## 当前真正会执行的操作
 
-现在不能再用“一律 Preview-only”描述底部控制区，而是分成四类：
+每个 pane 的展开区会根据它是 Agent 还是普通终端，只显示真正适用的操作：
 
 | 模式 | 当前行为 | 投递语义 |
 |---|---|---|
-| 查看状态 | 执行有界只读 | 只读 |
-| 读取最近输出 | 执行有界 terminal tail 读取 | 只读 |
-| 提示 Agent | **真实执行**：走 extension-only 的本地可信 action route，并复用 Herdr `agent.prompt` 可靠性内核 | 返回 `submitted` / `queued` / `rejected` / `uncertain` / `failed`，可用时带 operation id / evidence |
-| 调整会话 | **真实发起 provider steer 请求/探测** | 只有确实完成 provider-native 同一 active turn steer 才返回 `steered`；否则明确返回 `session_not_resolved` / `no_active_turn` / `unsupported_provider` 等 |
+| 详情 | 执行有界只读 | 只读 |
+| 最近输出 | 执行有界 terminal tail 读取 | 只读 |
+| 发送指令 | **真实执行**：走 extension-only 的本地可信 action route，并复用 Herdr `agent.prompt` 可靠性内核 | 返回 `submitted` / `queued` / `rejected` / `uncertain` / `failed`，可用时带 operation id / evidence |
+| 调整当前任务 | 仅当 runtime 明确声明当前 provider 的 native steer 可用时显示 | 在不中断当前 active turn 的前提下调整正在执行的任务；不会退化成 Agent Prompt |
+| 停止任务 | 仅对正在运行的 Agent 可用；确认后向该 pane 发送 `Ctrl+C` | 用于停止当前 CLI turn/process；不冒充 provider interrupt |
 | Herdr API | 仅预览 | 不从这个 UI 执行任意 Herdr mutation |
 | 终端输入 | 仅预览 | 不从这个 UI 向终端写入原始字节/按键 |
 
-### 查看状态
+### 详情
 
-`查看状态`展示结构化 pane 状态，同时对可能很大的最近输出做上限裁剪。
+`详情`展示结构化 pane 状态，同时对可能很大的最近输出做上限裁剪。
 
-### 读取最近输出
+### 最近输出
 
-`读取最近输出`让本地 runtime 返回有界 terminal tail（大致 40 行 / 4096 字符），即使终端运行数小时也不会把无限历史灌进 Side Panel。
+`最近输出`让本地 runtime 返回有界 terminal tail（大致 40 行 / 4096 字符），即使终端运行数小时也不会把无限历史灌进 Side Panel。
 
-### 提示 Agent：可靠 mutation，不是终端注入
+### 发送指令：可靠 Agent Prompt，不是终端注入
 
-`提示 Agent`始终作用于用户显式固定的 pane，数据路径只有：
+`发送指令`始终作用于当前展开操作区所属的 pane，数据路径只有：
 
 ```text
 Side Panel
@@ -180,13 +173,15 @@ Side Panel
 
 Prompt 还复用 `agent.prompt` 已有的持久化 idempotency/op record，而不是自己造浏览器重试逻辑。Side Panel 为一次用户动作生成 idempotency key，并明确展示 `uncertain`。结果不确定时，先检查 live state，不要盲目重发。
 
-### 调整会话：绝不把 Prompt 冒充 true steer
+### 调整当前任务：绝不把 Prompt 冒充 true steer
 
-`调整会话`比 Prompt 更严格：它**不会**在 steer 失败时偷偷退化成 `agent.prompt`，再把结果写成“已 steer”。
+`调整当前任务`比 Prompt 更严格：只有 runtime 的 `control_capabilities.steer.available` 为 true 时 UI 才显示它。它**不会**在 steer 失败时偷偷退化成 `agent.prompt`，再把结果写成“已 steer”。
 
-对于 Codex，provider-native 同一 active turn 的 `turn/steer` 至少需要把固定的 Herdr pane 权威映射到 app-server control endpoint、`threadId` 和当前 `expectedTurnId`。当前 Herdr pane/session metadata 并没有这些关联。因此：working Codex 当前返回 `session_not_resolved`；idle Codex 返回 `no_active_turn`；其它 provider 可以返回 `unsupported_provider`。
+对于 Codex，provider-native 同一 active turn 的 `turn/steer` 至少需要把所选 Herdr pane 权威映射到 app-server control endpoint、`threadId` 和当前 `expectedTurnId`。当前 Herdr pane/session metadata 并没有这些关联。因此目前 UI 通常不会显示“调整当前任务”。
 
 仅看到 `~/.codex/ipc/ipc.sock` 文件不能证明可 steer：socket 可能已经 stale、可能属于别的 client/session，而且它本身既不标识目标 thread，也不提供 expected active turn。只有这些身份能够端到端证明时，才会开放真正的 provider steer。
+
+`停止任务`是另一条更窄的本地控制路径。它只对处于 `working` 状态的 Agent 显示为可用，用户确认后通过 `pane.send_keys(["C-c"])` 发送终端中断键。它不声明 provider-level interrupt，也不会在投递结果不确定后自动重试；再次停止前先检查目标状态。
 
 这正是 Issue #57 原始需求最容易混淆的地方：**“已排队/已 Prompt”与“同一 active turn 已 steer”是不同 outcome，绝不能互相冒充。**
 
