@@ -42,7 +42,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.85";
+const H2W_SCRIPT_VERSION = "0.1.86";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
@@ -145,7 +145,7 @@ function hudLabels() {
     "queue_added_draft_changed", "queue_added_clear_failed", "queue_clear_confirm", "queue_cleared",
     "automation_on_hint", "automation_off_hint", "conversation_automation_on_hint", "conversation_automation_off_hint",
     "aria_toggle_automation", "automation_enabled", "automation_disabled", "automation_update_failed",
-    "judge_no_continue", "judge_turn_in_progress", "continue_sent", "continue_failed",
+    "judge_no_continue", "judge_turn_in_progress", "herdr_status_checked", "continue_sent", "continue_failed",
     "web_state", "scope_binding_count", "scope_binding_hint", "scope_unbound",
     "tip_state", "tip_recovery", "tip_last_event", "none",
     "reason_disabled", "reason_no_conv", "reason_llm_not_configured", "reason_fallback_continue", "reason_fallback_complete", "reason_unbound",
@@ -2787,7 +2787,7 @@ async function manualDirectContinue(tabId, convKey) {
   });
 }
 
-async function manualHerdrStatusContinue(tabId, convKey) {
+async function manualHerdrStatusContinue(_tabId, convKey) {
   const bindings = await loadBindings();
   const session = bindingsForConv(bindings, convKey);
   if (!session.length) return { ok: false, error: "binding_required" };
@@ -2796,10 +2796,14 @@ async function manualHerdrStatusContinue(tabId, convKey) {
   if (!state?.ok) return { ok: false, error: "herdr_state_unavailable" };
 
   const blocks = [];
+  let agentCount = 0;
+  let workingCount = 0;
   for (const b of session) {
     const ws = b.workspace_id || normalizeWorkspaceId(b);
     if (!ws) continue;
     const scope = agentsInWorkspace(state.agents || [], ws);
+    agentCount += scope.length;
+    workingCount += scope.filter((agent) => String(agent?.status || "").toLowerCase() === "working").length;
     const meta = (state.workspaces || []).find((w) => w.id === ws) || null;
     const pack = formatWorkspaceRoster(scope, b.pane || null, {
       id: ws,
@@ -2810,18 +2814,19 @@ async function manualHerdrStatusContinue(tabId, convKey) {
   }
   if (!blocks.length) return { ok: false, error: "herdr_state_empty" };
 
-  const template = [
-    localizedText("manual_status_continue_intro", null, "Continue from the current Herdr state below."),
-    ...blocks,
-  ].join("\n\n");
-  return deliverWakeToTab({ ...session[0], tabId: tabId || session[0].tabId, convKey }, {
-    type: "h2w_wake",
-    data: {
-      template,
-      manual: true,
-      autoAllow: false,
-    },
-  });
+  // "Check Herdr" is deliberately read-only. It must never route through
+  // h2w_wake/composer delivery, so a stale/visible Stop control cannot turn
+  // a local status inspection into composer-busy.
+  return {
+    ok: true,
+    checked: true,
+    continued: false,
+    nudged: false,
+    workspace_count: blocks.length,
+    agent_count: agentCount,
+    working_count: workingCount,
+    status_text: blocks.join("\n\n"),
+  };
 }
 
 async function manualLlmJudgeContinue(tabId, convKey, userText, assistantText) {

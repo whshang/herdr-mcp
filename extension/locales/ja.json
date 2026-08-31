@@ -192,6 +192,7 @@
   "placeholder_llm_model": "例：small-fast-model",
   "manual_continue_message": "続行",
   "manual_status_continue_intro": "以下の Herdr ウィンドウと Agent の現在状態から作業を続けてください。完了済みの作業を繰り返さず、現在の未完了タスクを優先してください。",
+  "herdr_status_checked": "Herdr 確認済み：{workspaces} ワークスペース、{agents} Agent、{working} 件が稼働中。",
   "recovery_probe_template": "Herdr 復旧チェック：直前の助手ターンが明確に開始されていません。\nツールを呼び出さず、外部操作を繰り返したり続行したりせず、mutation も行わないでください。\n直前の依頼がこの会話で完了したように見えるかだけを報告してください。確認できない場合は「復旧が必要」とだけ返信してください。",
   "stale_view_activation_template": "Herdr ブラウザ復旧：直前の助手応答が古いキャッシュ表示または途中停止の可能性があるため、このページを再読み込みしました。現在表示されている最新の会話状態を読み直し、前の応答が実際に止まった位置から続けてください。完了済みの作業を繰り返さず、外部 mutation の前に必要に応じて現在の Herdr/runtime/Git 状態を再確認してください。",
   "default_wake_template": "Herdr ワークスペース {workspace_label}：Agent 停止（フォーカス {agent} @ {pane} → {status}）。\n\nフォーカスペイン出力：\n{output}\n\n{roster}\n\n{idle_hint}\n\nこの結果から編成を続けてください。高コストモデルより fs/exec を優先してください。",

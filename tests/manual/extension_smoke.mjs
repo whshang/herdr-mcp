@@ -77,9 +77,9 @@ const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "u
 const controlCenterCss = readFileSync(path.join(EXT, "control-center.css"), "utf8");
 const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.85", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.85"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.85"'), "content version matches manifest");
+ok(manifest.version === "0.1.86", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.86"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.86"'), "content version matches manifest");
 const ownerGateIndex = wakeSource.indexOf('type: "h2w_extension_owner_status"');
 const queueOwnerClaimIndex = wakeSource.indexOf('setAttribute(QUEUED_INSERT_OWNER_ATTR');
 ok(ownerGateIndex >= 0
@@ -876,6 +876,21 @@ ok(wakeHandlerBlock.indexOf("sendResponse(result);") >= 0
     && backgroundSource.includes('error: "handoff_start_failed"')
     && backgroundSource.includes('}, 10_000);'),
   "manual HUD controls respond on submission, avoid partial-turn LLM judging, and keep read-only failure paths bounded");
+const manualStatusStart = backgroundSource.indexOf("async function manualHerdrStatusContinue(");
+const manualStatusEnd = manualStatusStart >= 0 ? backgroundSource.indexOf("async function manualLlmJudgeContinue(", manualStatusStart) : -1;
+const manualStatusBlock = manualStatusStart >= 0 && manualStatusEnd > manualStatusStart
+  ? backgroundSource.slice(manualStatusStart, manualStatusEnd)
+  : "";
+ok(manualStatusBlock.includes("fetchStateFresh()")
+    && manualStatusBlock.includes("checked: true")
+    && manualStatusBlock.includes("status_text")
+    && !manualStatusBlock.includes("deliverWakeToTab")
+    && !manualStatusBlock.includes('type: "h2w_wake"')
+    && wakeSource.includes('action === "status" && result?.ok && result?.checked === true'),
+  "Check Herdr is read-only and cannot be blocked by composer Stop controls");
+ok(localAuthSource.includes("void opened.catch(() => {});")
+    && localAuthSource.includes("void done.catch(() => {});"),
+  "native stream failures are observed immediately without hiding later await errors");
 const queueTurnEndedStart = backgroundSource.indexOf('if (msg?.type === "h2w_turn_ended")');
 const queueTurnEndedEnd = queueTurnEndedStart >= 0 ? backgroundSource.indexOf('if (msg?.type === "h2w_handoff_start")', queueTurnEndedStart) : -1;
 const queueTurnEndedBlock = queueTurnEndedStart >= 0 && queueTurnEndedEnd > queueTurnEndedStart

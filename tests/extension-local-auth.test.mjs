@@ -94,6 +94,48 @@ test("extension receives push SSE bytes over one persistent Native Messaging str
 });
 
 
+test("native stream pre-open IPC failure is handled without losing await-visible errors", async () => {
+  const oldChrome = globalThis.chrome;
+  const messageListeners = [];
+  const disconnectListeners = [];
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  globalThis.chrome = {
+    runtime: {
+      id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      lastError: null,
+      connectNative(host) {
+        assert.equal(host, HERDR_NATIVE_HOST);
+        return {
+          onMessage: { addListener(fn) { messageListeners.push(fn); } },
+          onDisconnect: { addListener(fn) { disconnectListeners.push(fn); } },
+          postMessage(message) {
+            assert.equal(message.type, "stream");
+            queueMicrotask(() => {
+              for (const fn of messageListeners) fn({ type: "stream_error", ok: false, error: "extension_ipc_unavailable" });
+            });
+          },
+          disconnect() {
+            for (const fn of disconnectListeners) fn();
+          },
+        };
+      },
+    },
+  };
+
+  try {
+    const stream = openLocalHerdrStream({ baseUrl: "http://127.0.0.1:8772" });
+    await assert.rejects(stream.opened, /extension_ipc_unavailable/);
+    await assert.rejects(stream.done, /extension_ipc_unavailable/);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    globalThis.chrome = oldChrome;
+  }
+});
+
 test("extension confirms active ownership through Chromium-admitted native identity", async () => {
   const oldChrome = globalThis.chrome;
   let seen = null;
