@@ -6,6 +6,8 @@
  *   GET  /health                          edge health (no DO involved)
  *   GET  /info                            route/stage table for debugging
  *   GET  /status/:workstationId           DO presence snapshot (dev-open)
+ *   POST /devices/enrollments             owner-authenticated one-time enrollment creation
+ *   POST /devices/enroll                   one-time enrollment consumption by a new device
  *   GET  /ws/:workstationId               workstation link WSS upgrade (auth)
  *   POST /artifacts  GET|DELETE /artifacts/:id   private R2 generic artifact relay
  *   GET  /mcp  POST /mcp                  public MCP transport
@@ -16,7 +18,12 @@
  */
 
 import { handleArtifactRequest, sweepExpiredArtifacts } from "./artifact-relay.js";
-import { authenticateStaticMcpBearer, SharedSecretLinkAuthenticator, hasLinkApplicationProtocol } from "./auth.js";
+import {
+  authenticateStaticMcpBearer,
+  extractLinkCredential,
+  SharedSecretLinkAuthenticator,
+  hasLinkApplicationProtocol,
+} from "./auth.js";
 import type { Env } from "./env.js";
 import { errorResult } from "./errors.js";
 import { edgeIdentity, MCP_SERVER_VERSION } from "./version.js";
@@ -32,6 +39,9 @@ import { WorkstationDO } from "./workstation-do.js";
 import { OAuthStoreDO } from "./oauth-store-do.js";
 import { DeviceRegistryDO } from "./device-registry-do.js";
 import {
+  authenticateDeviceCredential,
+  consumeDeviceEnrollment,
+  createDeviceEnrollment,
   ensureLegacyDeviceRegistration,
   listPublicDevices,
   resolveDeviceRouteWithContext,
@@ -49,6 +59,21 @@ function jsonResponse(payload: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function noStoreJsonResponse(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      pragma: "no-cache",
+    },
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 export default {
@@ -96,6 +121,8 @@ export default {
           { path: "/info", stage: "dev" },
           { path: "/ws/:workstationId", stage: "dev (WS upgrade, link auth)" },
           { path: "/status/:workstationId", stage: "dev (DO presence)" },
+          { path: "/devices/enrollments", stage: "owner-authenticated device enrollment creation" },
+          { path: "/devices/enroll", stage: "one-time device enrollment consumption" },
           { path: "/mcp", stage: `public MCP epoch-${identity.contractEpoch} + sessionless ChatGPT SSE` },
           { path: "/artifacts", stage: "private R2 generic artifact relay (auth + capability)" },
           { path: "/.well-known/mcp.json", stage: "public MCP discovery" },
@@ -125,6 +152,42 @@ export default {
         refresh: stats.refresh ?? 0,
         codes: stats.codes ?? 0,
       }, response.ok ? 200 : 503);
+    }
+
+    // ---- Device enrollment control plane. Enrollment creation requires
+    // owner/operator auth; consumption requires only the high-entropy one-time
+    // code, so a second workstation never needs Cloudflare deploy credentials.
+    if (request.method === "POST" && url.pathname === "/devices/enrollments") {
+      const ownerAuth = await authenticateEdgeMcpRequest(request, env);
+      if (!ownerAuth.ok) return noStoreJsonResponse({ ok: false, code: "mcp_auth_failed" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value)) {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const input: { ttl_seconds?: number; name?: string } = {};
+      if (parsed.value.ttl_seconds !== undefined) input.ttl_seconds = parsed.value.ttl_seconds as number;
+      if (parsed.value.name !== undefined) input.name = parsed.value.name as string;
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      const result = await createDeviceEnrollment(registry, input);
+      return result.ok
+        ? noStoreJsonResponse({ ok: true, ...result.enrollment })
+        : noStoreJsonResponse({ ok: false, code: result.code }, result.status);
+    }
+
+    if (request.method === "POST" && url.pathname === "/devices/enroll") {
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.enrollment_code !== "string") {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const input: { enrollment_code: string; name?: string } = { enrollment_code: parsed.value.enrollment_code };
+      if (parsed.value.name !== undefined) input.name = parsed.value.name as string;
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      const result = await consumeDeviceEnrollment(registry, input);
+      return result.ok
+        ? noStoreJsonResponse({ ok: true, ...result.enrollment })
+        : noStoreJsonResponse({ ok: false, code: result.code }, result.status);
     }
 
     // ---- /status/:workstationId — dev presence via DO.
@@ -158,21 +221,35 @@ export default {
       if (!hasLinkApplicationProtocol(request)) {
         return jsonResponse(errorResult("bad_request", { message: "missing herdr-link.v1 websocket subprotocol" }), 400);
       }
-      const authenticator = new SharedSecretLinkAuthenticator({ secret: env.LINK_SHARED_SECRET });
-      const decision = authenticator.authenticate(request, workstationId, Date.now());
-      if (!decision.ok) {
-        logger.warn("ws.upgrade.denied", { workstationId, code: decision.code });
-        return jsonResponse(errorResult("link_auth_failed", { message: decision.reason, workstationId }), 401);
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      const extracted = extractLinkCredential(request);
+      const deviceAuth = extracted.ok
+        ? await authenticateDeviceCredential(registry, workstationId, extracted.credential)
+        : { ok: false as const, code: "link_auth_failed" as const };
+      let authenticatedBy: "device" | "legacy" | null = deviceAuth.ok ? "device" : null;
+
+      if (!authenticatedBy && !deviceAuth.ok && env.DEFAULT_WORKSTATION_ID === workstationId) {
+        const legacyEligible = deviceAuth.code === "device_not_found" || deviceAuth.code === "device_credential_missing";
+        if (legacyEligible) {
+          const authenticator = new SharedSecretLinkAuthenticator({ secret: env.LINK_SHARED_SECRET });
+          const legacyDecision = authenticator.authenticate(request, workstationId, Date.now());
+          if (legacyDecision.ok) authenticatedBy = "legacy";
+        }
       }
-      if (env.DEFAULT_WORKSTATION_ID === workstationId) {
+
+      if (!authenticatedBy) {
+        const code = !deviceAuth.ok ? deviceAuth.code : "link_auth_failed";
+        logger.warn("ws.upgrade.denied", { workstationId, code });
+        return jsonResponse(errorResult("link_auth_failed", { message: "credential rejected", workstationId }), 401);
+      }
+
+      if (authenticatedBy === "legacy") {
         try {
-          const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
           const registered = await ensureLegacyDeviceRegistration(registry, workstationId);
           if (registered.created) {
             logger.info("device.legacy_registered", { workstationId, deviceId: registered.device_id });
           }
         } catch (error) {
-          // Preserve existing Link availability during rollout; a later reconnect retries registration.
           logger.warn("device.legacy_registration_failed", { workstationId, error: String(error) });
         }
       }

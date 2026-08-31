@@ -29,6 +29,10 @@ export type StaticMcpBearerDecision =
   | { ok: true }
   | { ok: false; code: "mcp_auth_failed"; reason: string };
 
+export type LinkCredentialDecision =
+  | { ok: true; credential: string; transport: "authorization" | "websocket_protocol" }
+  | { ok: false; code: "link_auth_failed"; reason: string };
+
 /** Minimal request view so auth stays pure and testable outside Workers. */
 export interface AuthRequestLike {
   headers: { get(name: string): string | null };
@@ -94,6 +98,48 @@ export function buildLinkAuthProtocol(secret: string): string {
   return `${LINK_AUTH_PROTOCOL_PREFIX}${hex}`;
 }
 
+function decodeLinkAuthProtocol(value: string): string | null {
+  if (!value.startsWith(LINK_AUTH_PROTOCOL_PREFIX)) return null;
+  const hex = value.slice(LINK_AUTH_PROTOCOL_PREFIX.length);
+  if (hex.length === 0 || hex.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(hex)) return null;
+  if (hex.length > MAX_RESOURCE_TOKEN_LEN * 2) return null;
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/** Extract one raw Link credential without deciding which device it belongs to. */
+export function extractLinkCredential(request: AuthRequestLike): LinkCredentialDecision {
+  const header = request.headers.get("authorization");
+  if (header) {
+    const match = /^Bearer\s+([A-Za-z0-9._~+/=-]+)$/.exec(header.trim());
+    if (!match) return { ok: false, code: "link_auth_failed", reason: "unsupported Authorization scheme" };
+    const credential = match[1];
+    if (credential.length > MAX_RESOURCE_TOKEN_LEN) {
+      return { ok: false, code: "link_auth_failed", reason: "credential rejected (length)" };
+    }
+    return { ok: true, credential, transport: "authorization" };
+  }
+
+  const authProtocols = requestedWebSocketProtocols(request).filter((value) => value.startsWith(LINK_AUTH_PROTOCOL_PREFIX));
+  if (authProtocols.length !== 1) {
+    return {
+      ok: false,
+      code: "link_auth_failed",
+      reason: authProtocols.length > 1 ? "multiple websocket credentials are not allowed" : "missing link credential",
+    };
+  }
+  const credential = decodeLinkAuthProtocol(authProtocols[0]);
+  if (credential === null || credential.length > MAX_RESOURCE_TOKEN_LEN) {
+    return { ok: false, code: "link_auth_failed", reason: "credential rejected" };
+  }
+  return { ok: true, credential, transport: "websocket_protocol" };
+}
+
 /**
  * Dev shared-secret authenticator. Accepts either:
  * - `Authorization: Bearer <secret>` for non-WebSocket/manual clients; or
@@ -119,25 +165,9 @@ export class SharedSecretLinkAuthenticator implements LinkAuthenticator {
     if (!workstationId || workstationId.length === 0 || workstationId.length > MAX_WS_ID_LEN) {
       return { ok: false, code: "bad_request", reason: "invalid workstation_id" };
     }
-    const header = request.headers.get("authorization");
-    let credentialMatched = false;
-    if (header) {
-      const match = /^Bearer\s+([A-Za-z0-9._~+/=-]+)$/.exec(header.trim());
-      if (!match) return { ok: false, code: "link_auth_failed", reason: "unsupported Authorization scheme" };
-      const token = match[1];
-      if (token.length > MAX_RESOURCE_TOKEN_LEN) {
-        return { ok: false, code: "link_auth_failed", reason: "credential rejected (length)" };
-      }
-      credentialMatched = constantTimeEqual(enc.encode(token), enc.encode(this.secret));
-    } else {
-      const protocols = requestedWebSocketProtocols(request);
-      if (protocols.length > 0) {
-        const expected = buildLinkAuthProtocol(this.secret);
-        credentialMatched = protocols.some((candidate) =>
-          constantTimeEqual(enc.encode(candidate), enc.encode(expected)),
-        );
-      }
-    }
+    const extracted = extractLinkCredential(request);
+    if (!extracted.ok) return extracted;
+    const credentialMatched = constantTimeEqual(enc.encode(extracted.credential), enc.encode(this.secret));
     if (!credentialMatched) {
       return { ok: false, code: "link_auth_failed", reason: "credential rejected" };
     }

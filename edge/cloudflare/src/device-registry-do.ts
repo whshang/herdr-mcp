@@ -1,4 +1,13 @@
 import type { Env } from "./env.js";
+import { constantTimeEqual } from "./auth.js";
+import {
+  isCredentialVerifier,
+  isEnrollmentCode,
+  newCredentialId,
+  newDeviceSecret,
+  newEnrollmentCode,
+  sha256Hex,
+} from "./device-crypto.js";
 import {
   isWorkstationId,
   newDeviceId,
@@ -9,6 +18,27 @@ import {
 
 const DEVICE_PREFIX = "device:";
 const WORKSTATION_PREFIX = "workstation:";
+const ENROLLMENT_PREFIX = "enrollment:";
+const CREDENTIAL_PREFIX = "credential:";
+const DEFAULT_ENROLLMENT_TTL_MS = 10 * 60 * 1000;
+const MIN_ENROLLMENT_TTL_MS = 60 * 1000;
+const MAX_ENROLLMENT_TTL_MS = 15 * 60 * 1000;
+const enc = new TextEncoder();
+
+interface EnrollmentRecord {
+  verifier_sha256: string;
+  created_at_ms: number;
+  expires_at_ms: number;
+  name: string | null;
+}
+
+interface DeviceCredentialRecord {
+  credential_id: string;
+  device_id: string;
+  workstation_id: string;
+  verifier_sha256: string;
+  created_at_ms: number;
+}
 
 function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -38,6 +68,15 @@ export class DeviceRegistryDO {
 
     if (request.method === "GET" && url.pathname === "/internal/devices") {
       return this.listDevices();
+    }
+    if (request.method === "POST" && url.pathname === "/internal/devices/enrollments") {
+      return this.createEnrollment(request);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/devices/enrollments/consume") {
+      return this.consumeEnrollment(request);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/devices/authenticate") {
+      return this.authenticateDevice(request);
     }
     if (request.method === "POST" && url.pathname === "/internal/devices/legacy/ensure") {
       return this.ensureLegacyDevice(request);
@@ -87,6 +126,133 @@ export class DeviceRegistryDO {
     return json({ ok: true, device: parsed });
   }
 
+  private async createEnrollment(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    if (!isRecord(body)) return json({ ok: false, code: "bad_request" }, 400);
+    const ttlMs = normalizeEnrollmentTtlMs(body.ttl_seconds);
+    if (ttlMs === null) return json({ ok: false, code: "invalid_enrollment_ttl" }, 400);
+    const name = normalizeOptionalName(body.name);
+    if (body.name !== undefined && name === null) return json({ ok: false, code: "invalid_device_name" }, 400);
+
+    const enrollmentCode = newEnrollmentCode();
+    const verifier = await sha256Hex(enrollmentCode);
+    const now = Date.now();
+    const record: EnrollmentRecord = {
+      verifier_sha256: verifier,
+      created_at_ms: now,
+      expires_at_ms: now + ttlMs,
+      name,
+    };
+    await this.state.storage.put(ENROLLMENT_PREFIX + verifier, record);
+    return json({ ok: true, enrollment_code: enrollmentCode, expires_at_ms: record.expires_at_ms });
+  }
+
+  private async consumeEnrollment(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    if (!isRecord(body) || !isEnrollmentCode(body.enrollment_code)) {
+      return json({ ok: false, code: "invalid_enrollment" }, 401);
+    }
+    const requestedName = normalizeOptionalName(body.name);
+    if (body.name !== undefined && requestedName === null) return json({ ok: false, code: "invalid_device_name" }, 400);
+
+    const verifier = await sha256Hex(body.enrollment_code);
+    const now = Date.now();
+    const deviceId = newDeviceId(now);
+    const workstationId = deviceId;
+    const credentialId = newCredentialId();
+    const deviceSecret = newDeviceSecret();
+    const credentialVerifier = await sha256Hex(deviceSecret);
+
+    const result = await this.state.storage.transaction(async (tx) => {
+      const enrollmentKey = ENROLLMENT_PREFIX + verifier;
+      const enrollment = await tx.get<EnrollmentRecord>(enrollmentKey);
+      if (!enrollment || enrollment.verifier_sha256 !== verifier) {
+        return { ok: false as const, code: "invalid_enrollment" };
+      }
+      if (enrollment.expires_at_ms <= now) {
+        await tx.delete(enrollmentKey);
+        return { ok: false as const, code: "enrollment_expired" };
+      }
+      if (await tx.get(WORKSTATION_PREFIX + workstationId)) {
+        return { ok: false as const, code: "registry_conflict" };
+      }
+
+      const device: DeviceRecord = {
+        device_id: deviceId,
+        workstation_id: workstationId,
+        name: enrollment.name ?? requestedName ?? deviceId,
+        authorization: "active",
+        scheduling: "enabled",
+        credential_id: credentialId,
+        enrolled_at_ms: now,
+        updated_at_ms: now,
+        revoked_at_ms: null,
+      };
+      const credential: DeviceCredentialRecord = {
+        credential_id: credentialId,
+        device_id: deviceId,
+        workstation_id: workstationId,
+        verifier_sha256: credentialVerifier,
+        created_at_ms: now,
+      };
+      await tx.delete(enrollmentKey);
+      await tx.put(DEVICE_PREFIX + deviceId, device);
+      await tx.put(WORKSTATION_PREFIX + workstationId, deviceId);
+      await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
+      return { ok: true as const, device };
+    });
+
+    if (!result.ok) {
+      const status = result.code === "enrollment_expired" ? 410 : result.code === "invalid_enrollment" ? 401 : 409;
+      return json(result, status);
+    }
+    return json({
+      ok: true,
+      device_id: result.device.device_id,
+      workstation_id: result.device.workstation_id,
+      credential_id: credentialId,
+      device_secret: deviceSecret,
+    });
+  }
+
+  private async authenticateDevice(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    if (!isRecord(body) || !isWorkstationId(body.workstation_id) || !isCredentialVerifier(body.credential_verifier_sha256)) {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    const deviceId = await this.state.storage.get<string>(WORKSTATION_PREFIX + body.workstation_id);
+    if (!deviceId) return json({ ok: false, code: "device_not_found" }, 401);
+    const device = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + deviceId));
+    if (!device) return json({ ok: false, code: "registry_corrupt" }, 409);
+    if (device.authorization === "revoked") return json({ ok: false, code: "device_revoked" }, 403);
+    if (device.authorization === "suspended") return json({ ok: false, code: "device_suspended" }, 403);
+    if (!device.credential_id) return json({ ok: false, code: "device_credential_missing" }, 401);
+
+    const credential = await this.state.storage.get<DeviceCredentialRecord>(CREDENTIAL_PREFIX + device.credential_id);
+    if (!credential || credential.device_id !== device.device_id || credential.workstation_id !== device.workstation_id) {
+      return json({ ok: false, code: "registry_corrupt" }, 409);
+    }
+    if (!constantTimeEqual(enc.encode(credential.verifier_sha256), enc.encode(body.credential_verifier_sha256))) {
+      return json({ ok: false, code: "link_auth_failed" }, 401);
+    }
+    return json({ ok: true, device_id: device.device_id, credential_id: credential.credential_id });
+  }
+
   private async ensureLegacyDevice(request: Request): Promise<Response> {
     let body: unknown;
     try {
@@ -131,4 +297,18 @@ export class DeviceRegistryDO {
 
     return result.ok ? json(result) : json(result, 409);
   }
+}
+
+function normalizeEnrollmentTtlMs(value: unknown): number | null {
+  if (value === undefined) return DEFAULT_ENROLLMENT_TTL_MS;
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return null;
+  const ttlMs = value * 1000;
+  return ttlMs >= MIN_ENROLLMENT_TTL_MS && ttlMs <= MAX_ENROLLMENT_TTL_MS ? ttlMs : null;
+}
+
+function normalizeOptionalName(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") return null;
+  const name = value.trim();
+  return name.length > 0 && name.length <= 128 ? name : null;
 }
