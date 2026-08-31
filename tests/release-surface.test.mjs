@@ -88,6 +88,12 @@ test("Rust release verification consumes the shared gate with bounded runtime cl
   assert.match(gate, /trap cleanup EXIT/, "shared gate must clean the isolated runtime on failure");
 });
 
+test("Rust release binary embeds the immutable GitHub source commit", async () => {
+  const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
+  assert.match(release, /HERDR_MCP_BUILD_COMMIT:\s*\$\{\{ github\.sha \}\}/);
+  assert.match(release, /cargo build --locked --release -p herdr-mcp/);
+});
+
 test("Node schema reflection uses the explicit pinned Herdr binary when provided", async () => {
   const source = await readFile(join(ROOT, "src/schema.ts"), "utf8");
   const gate = await readFile(join(ROOT, "scripts/release-gate.sh"), "utf8");
