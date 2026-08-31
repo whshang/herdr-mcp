@@ -107,6 +107,110 @@ test("browser performance scheduler suspends while hidden and flushes on resume"
   assert.equal(runs, 1);
 });
 
+test("turn mutation filter ignores tool-card and HUD churn but keeps turn changes", () => {
+  const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
+  const makeElement = ({ parent = null, matches = [], contains = [] } = {}) => ({
+    nodeType: 1,
+    parentElement: parent,
+    matches: (selector) => matches.includes(selector),
+    closest(selector) {
+      if (matches.includes(selector)) return this;
+      return parent?.closest?.(selector) || null;
+    },
+    querySelector: (selector) => contains.includes(selector) ? {} : null,
+  });
+  const toolSelector = perf.DEFAULT_IGNORED_TURN_MUTATION_SELECTOR;
+  const turnSelector = perf.DEFAULT_TURN_MUTATION_SELECTOR;
+  const assistant = makeElement({ matches: [turnSelector] });
+  const tool = makeElement({ parent: assistant, matches: [toolSelector] });
+  const toolChild = makeElement({ parent: tool });
+
+  assert.equal(perf.mutationRecordsAreIgnoredChurn([{
+    target: assistant,
+    addedNodes: [tool],
+    removedNodes: [],
+  }]), true);
+
+  assert.equal(perf.mutationTouchesConversationTurns([{
+    target: tool,
+    addedNodes: [toolChild],
+    removedNodes: [],
+  }]), false);
+
+  const streamedText = { nodeType: 3, parentElement: assistant };
+  assert.equal(perf.mutationRecordsAreIgnoredChurn([{
+    target: assistant,
+    addedNodes: [tool, streamedText],
+    removedNodes: [],
+  }]), false);
+  assert.equal(perf.mutationTouchesConversationTurns([{
+    target: assistant,
+    addedNodes: [streamedText],
+    removedNodes: [],
+  }]), true);
+
+  const wrapper = makeElement({ contains: [turnSelector] });
+  assert.equal(perf.mutationTouchesConversationTurns([{
+    target: makeElement(),
+    addedNodes: [wrapper],
+    removedNodes: [],
+  }]), true);
+
+  const broadPageTarget = makeElement({ contains: [turnSelector] });
+  const unrelatedSidePane = makeElement();
+  assert.equal(perf.mutationTouchesConversationTurns([{
+    target: broadPageTarget,
+    addedNodes: [unrelatedSidePane],
+    removedNodes: [],
+  }]), false);
+});
+
+test("bounded message sampler preserves growth length while skipping tool subtrees", () => {
+  const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
+  const ignoredSelector = perf.DEFAULT_IGNORED_MESSAGE_TEXT_SELECTOR;
+  const text = (value) => ({ nodeType: 3, nodeValue: value, parentElement: null });
+  const element = (children = [], { ignored = false, parent = null } = {}) => {
+    const node = {
+      nodeType: 1,
+      childNodes: children,
+      parentElement: parent,
+      closest(selector) {
+        if (ignored && selector === ignoredSelector) return this;
+        return parent?.closest?.(selector) || null;
+      },
+    };
+    for (const child of children) child.parentElement = node;
+    return node;
+  };
+  const toolText = text("Z".repeat(5000));
+  const tool = element([toolText], { ignored: true });
+  const root = element([
+    text("A".repeat(700)),
+    tool,
+    text("B".repeat(700)),
+  ]);
+  const sample = perf.sampleBoundedMessageText(root, { maxChars: 1024, tailChars: 256 });
+
+  assert.equal(sample.total_chars, 1400);
+  assert.equal(sample.truncated, true);
+  assert.equal(sample.skipped_subtrees, 1);
+  assert.ok(sample.text.length <= 1024);
+  assert.ok(sample.text.startsWith("A"));
+  assert.ok(sample.text.endsWith("B".repeat(256)));
+  assert.doesNotMatch(sample.text, /Z/);
+
+  const poisonTool = {
+    nodeType: 1,
+    parentElement: null,
+    closest: (selector) => selector === ignoredSelector ? poisonTool : null,
+    get childNodes() { throw new Error("ignored tool subtree was traversed"); },
+  };
+  const poisonRoot = element([text("before"), poisonTool, text("after")]);
+  const poisonSample = perf.sampleBoundedMessageText(poisonRoot, { maxChars: 1024 });
+  assert.equal(poisonSample.text, "beforeafter");
+  assert.equal(poisonSample.skipped_subtrees, 1);
+});
+
 test("ui pressure classifier bands healthy, warning, high from bounded inputs", () => {
   const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
   const classify = perf.classifyUiPressure;
@@ -504,10 +608,14 @@ test("ChatGPT turn watcher caches latest turns and reuses settled turns for pres
   assert.match(wake, /updateContextPressureFromSettledTurns\(/);
   assert.match(wake, /CONTEXT_PRESSURE\.mergeSettledTurns\(/);
   assert.match(wake, /uiPressure\?\.recordMutation\(\)/);
+  assert.match(wake, /mutationRecordsAreIgnoredChurn\(records\)/);
+  assert.match(wake, /if \(ignoredChurn\) return/);
   assert.match(wake, /uiPressure\?\.recordTick\(\)/);
   assert.match(wake, /recordTimerDrift\(driftMs\)/);
   assert.match(wake, /rehydrate the latest-turn cache/);
-  assert.match(wake, /let lastAsstLen = initialAssistant\.text\.length/);
+  assert.match(wake, /sampleLatestMessageText\(el\)/);
+  assert.match(wake, /let lastAsstLen = initialAssistant\.totalChars/);
+  assert.match(wake, /const curLen = currentAssistant\.totalChars/);
   assert.match(wake, /function conversationHasPendingReply\(\)/);
   assert.match(wake, /const hasPendingReply = conversationHasPendingReply/);
   assert.match(wake, /event\.isTrusted/);

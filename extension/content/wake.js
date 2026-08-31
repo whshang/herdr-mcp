@@ -1123,6 +1123,15 @@ const H2W_CONTENT_VERSION = "0.1.84";
     return role === "user" ? latestTurns.user : latestTurns.assistant;
   }
 
+  function sampleLatestMessageText(el) {
+    if (!el) return { text: "", total_chars: 0, truncated: false };
+    if (BROWSER_PERFORMANCE?.sampleBoundedMessageText) {
+      return BROWSER_PERFORMANCE.sampleBoundedMessageText(el);
+    }
+    const text = String(el.textContent || "").trim();
+    return { text, total_chars: text.length, truncated: false };
+  }
+
   function lastMessageByRole(role) {
     try {
       if (typeof ADAPTER.getLastMessageText === "function") {
@@ -1131,7 +1140,7 @@ const H2W_CONTENT_VERSION = "0.1.84";
       }
     } catch (_) {}
     const el = latestTurnForRole(role);
-    return el ? String(el.innerText || "").trim() : "";
+    return sampleLatestMessageText(el).text;
   }
 
   async function waitForStableAssistantReply(beforeText = "", beforeCount = 0, timeoutMs = 120000) {
@@ -2746,9 +2755,12 @@ const H2W_CONTENT_VERSION = "0.1.84";
     latestTurnCacheActive = true;
     const roleSnapshot = (role) => {
       const el = latestTurnForRole(role);
+      const sample = sampleLatestMessageText(el);
       return {
         count: role === "user" ? latestTurns.userCount : latestTurns.assistantCount,
-        text: el ? String(el.innerText || el.textContent || "").trim() : "",
+        text: sample.text,
+        totalChars: sample.total_chars,
+        truncated: sample.truncated,
       };
     };
     const initialUser = roleSnapshot("user");
@@ -2760,7 +2772,7 @@ const H2W_CONTENT_VERSION = "0.1.84";
     let lastReportedTurnKey = "";
     const artifactCaptureTurnKeys = new Set();
     let lastStartedJournalKey = "";
-    let lastAsstLen = initialAssistant.text.length;
+    let lastAsstLen = initialAssistant.totalChars;
     let lastAsstSignature = assistantSignature(initialAssistant.text);
     let lastAsstCount = initialAssistant.count;
     let stableRounds = 0;
@@ -2990,7 +3002,7 @@ const H2W_CONTENT_VERSION = "0.1.84";
       }
       const currentAssistant = roleSnapshot("assistant");
       const assistantText = currentAssistant.text;
-      const curLen = assistantText.length;
+      const curLen = currentAssistant.totalChars;
       const curSignature = assistantSignature(assistantText);
       const curCount = currentAssistant.count;
       const assistantChanged = curLen > 0 && (curSignature !== lastAsstSignature || curCount > lastAsstCount);
@@ -3041,9 +3053,9 @@ const H2W_CONTENT_VERSION = "0.1.84";
             stableRounds = 0;
             return;
           }
-          const cur = roleSnapshot("assistant").text;
-          if (cur.length === lastAsstLen) stableRounds += 1;
-          else { lastAsstLen = cur.length; stableRounds = 0; }
+          const cur = roleSnapshot("assistant");
+          if (cur.totalChars === lastAsstLen) stableRounds += 1;
+          else { lastAsstLen = cur.totalChars; stableRounds = 0; }
           if (stableRounds < 2) return;
           clearInterval(settleTimer);
           settleTimer = null;
@@ -3074,10 +3086,17 @@ const H2W_CONTENT_VERSION = "0.1.84";
       else onTick();
     }, 800);
     try {
-      const mo = new MutationObserver(() => {
+      const mo = new MutationObserver((records) => {
         if (document.hidden) return;
         uiPressure?.recordMutation();
-        markLatestTurnsDirty();
+        const ignoredChurn = BROWSER_PERFORMANCE?.mutationRecordsAreIgnoredChurn
+          ? BROWSER_PERFORMANCE.mutationRecordsAreIgnoredChurn(records)
+          : false;
+        if (ignoredChurn) return;
+        const turnCacheMayBeStale = BROWSER_PERFORMANCE?.mutationTouchesConversationTurns
+          ? BROWSER_PERFORMANCE.mutationTouchesConversationTurns(records)
+          : true;
+        if (turnCacheMayBeStale) markLatestTurnsDirty();
         if (tickScheduler) tickScheduler.schedule();
         else onTick();
       });
