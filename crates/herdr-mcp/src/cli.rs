@@ -4,6 +4,8 @@ pub enum Command {
     Version,
     Status,
     Doctor,
+    Uninstall,
+    Reinstall,
     DocumentsProbe,
     HerdrSupervisor(HerdrSupervisorCommand),
     Scan {
@@ -208,7 +210,8 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "herdr-supervisor" => parse_herdr_supervisor(&args[1..]),
         "scan" => parse_scan(&args[1..]),
         "rollback" => no_extra(args, Command::Service(ServiceCommand::Rollback)),
-        "uninstall" => no_extra(args, Command::Service(ServiceCommand::Uninstall)),
+        "uninstall" => no_extra(args, Command::Uninstall),
+        "reinstall" => no_extra(args, Command::Reinstall),
         "config" => parse_config(&args[1..]),
         "dev" => parse_dev(&args[1..]),
         "candidate" => parse_candidate(&args[1..]),
@@ -826,6 +829,7 @@ User path:\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|auto|status]\n\
   herdr-mcp extension standalone <install [--ref REF]|status>\n\
   herdr-mcp rollback\n\
+  herdr-mcp reinstall\n\
   herdr-mcp uninstall\n\n\
 Same-machine UAT isolation (optional):\n\
   herdr-mcp --instance uat install\n\
@@ -856,7 +860,7 @@ Advanced / internal:\n\
   herdr-mcp dev sync [--dry-run] [--allow-dirty]\n\
   herdr-mcp dev rollback\n\
   herdr-mcp candidate [--port 8873]\n\n\
-Prefer the top-level install/status/doctor/permissions/scan/update/rollback/uninstall commands\n\
+Prefer the top-level install/status/doctor/permissions/scan/update/rollback/reinstall/uninstall commands\n\
 for normal lifecycle. Use service ... only for advanced service control\n\
 (for example service install --adopt-node). link status is read-only G5\n\
 ownership/gates reporting. link run starts a foreground Rust Link candidate\n\
@@ -937,8 +941,14 @@ mod tests {
         );
         assert_eq!(
             parse(args(&["uninstall"])).unwrap().command,
-            Command::Service(ServiceCommand::Uninstall)
+            Command::Uninstall
         );
+        assert_eq!(
+            parse(args(&["reinstall"])).unwrap().command,
+            Command::Reinstall
+        );
+        assert!(parse(args(&["uninstall", "--force"])).is_err());
+        assert!(parse(args(&["reinstall", "--force"])).is_err());
         assert_eq!(
             parse(args(&["config", "show"])).unwrap().command,
             Command::Config(ConfigCommand::Show)

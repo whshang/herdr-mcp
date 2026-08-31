@@ -17,10 +17,13 @@ herdr-mcp update apply
 herdr-mcp update auto
 herdr-mcp update status
 herdr-mcp rollback
+herdr-mcp reinstall
 herdr-mcp uninstall
 ```
 
 `update auto` 是后台调度入口。默认 macOS PROD 实例执行 `service install` 时会 reconcile 归属明确的 `dev.herdr-mcp.auto-update` LaunchAgent；任务在加载时先执行一次，随后每天触发。自动安装严格限制为 **PROD runtime + Stable Release**：编译为 DEV 的 runtime、`[update] check = false`、named instance、`preview` 都会在访问网络前直接跳过。发现严格更高的 Stable Release 后，继续复用正常的 provenance 验签、detached worker 和 rollback-safe 更新事务，不新增第二套下载器，也不绕过回滚门槛。`service uninstall` 会先写入归属明确的持久 update fence 并移除 scheduler；detached worker 在真正 activation 前会再次检查该 fence，因此已经排队的静默更新不能在卸载后复活服务。显式成功的 install 才会解除 fence。
+
+`reinstall` 是产品级修复 / 重装入口：重新执行 managed Rust service lifecycle，并保留配置与凭据；runtime generations 继续遵循正常 service GC，仅承诺 active / rollback-safe 保留集合。`uninstall` 会完整清理**经过强 ownership 校验的 herdr-mcp runtime/config 状态**。默认实例负责自己的 service、归属明确的 auto-update scheduler、Link/watchdog、Native Messaging host、managed user CLI 和 config root；named instance 则严格限定为自己的 service/watchdog/config，不取得默认 scheduler、Link、Native Host 或 user CLI 的 ownership。默认 product uninstall 会在 config 删除后保留一个很小的用户 cache update-fence tombstone，防止此前 detached 的 updater 复活 service；只有显式且成功的 install/reinstall 才清除它。两者都明确**不会**卸载或修改独立的 `herdr` executable、Herdr service/socket/config，也不会删除浏览器扩展账号状态、Cloudflare 资源、macOS Keychain 项或 TCC 授权。`service uninstall` 仍然只是更窄的高级 service primitive。
 
 `service ...`、`link ...`、`native-host ...`、`candidate` 属于高级/内部命令；`dev` 是下面单独说明的**源码开发**入口。正常安装本机 runtime 不需要仓库 checkout、Node.js、npm，也不应把 `service install` 当作普通用户入口。
 

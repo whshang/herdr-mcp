@@ -52,6 +52,31 @@ pub(crate) fn remove_before_service_uninstall_checked() -> Result<Value, String>
     remove_before_service_uninstall_inner()
 }
 
+/// Mutation-grade ownership check for product uninstall. A missing scheduler
+/// is fine, an owned scheduler is removable, and any loaded-without-plist or
+/// foreign plist state fails closed before the product journal starts removal.
+#[cfg(target_os = "macos")]
+pub(crate) fn product_uninstall_preflight() -> Result<bool, String> {
+    let paths = RuntimePaths::discover()?;
+    if paths.instance.is_named() {
+        return Ok(false);
+    }
+    let home = home_dir()?;
+    let plist_path = launch_agent_path(&home);
+    let state = launchd_state(AUTO_UPDATE_LABEL)?;
+    match read_optional_regular(&plist_path)? {
+        Some(bytes) => {
+            verify_owned_plist(&bytes, &paths)?;
+            Ok(true)
+        }
+        None if state == LaunchdState::Loaded => Err(
+            "auto-update LaunchAgent is loaded without an inspectable owned plist; refusing product uninstall"
+                .to_owned(),
+        ),
+        None => Ok(false),
+    }
+}
+
 pub(crate) fn status_line() -> String {
     match status_snapshot() {
         Ok(value) => {
@@ -106,14 +131,12 @@ pub(crate) fn arm_service_uninstall_fence() -> Result<(), String> {
     if read_service_uninstall_fence(&paths)? == FenceState::Owned {
         return Ok(());
     }
-    let update_dir = paths.config_dir.join("update");
-    ensure_real_dir(&paths.config_dir)?;
-    ensure_real_dir(&update_dir)?;
-    atomic_write(
-        &service_uninstall_fence_path(&paths),
-        SERVICE_UNINSTALL_FENCE_BYTES,
-        0o600,
-    )
+    let fence_path = service_uninstall_fence_path(&paths)?;
+    let update_dir = fence_path
+        .parent()
+        .ok_or_else(|| "service-uninstall fence has no parent directory".to_owned())?;
+    ensure_real_dir(update_dir)?;
+    atomic_write(&fence_path, SERVICE_UNINSTALL_FENCE_BYTES, 0o600)
 }
 
 /// A successful explicit install/reinstall is the only operation that clears the fence.
@@ -123,7 +146,7 @@ pub(crate) fn clear_service_uninstall_fence() -> Result<(), String> {
     if paths.instance.is_named() {
         return Ok(());
     }
-    let path = service_uninstall_fence_path(&paths);
+    let path = service_uninstall_fence_path(&paths)?;
     match read_service_uninstall_fence(&paths)? {
         FenceState::Absent => Ok(()),
         FenceState::Owned => fs::remove_file(&path)
@@ -139,11 +162,10 @@ enum FenceState {
 }
 
 #[cfg(target_os = "macos")]
-fn service_uninstall_fence_path(paths: &RuntimePaths) -> PathBuf {
-    paths
-        .config_dir
-        .join("update")
-        .join(SERVICE_UNINSTALL_FENCE)
+fn service_uninstall_fence_path(_paths: &RuntimePaths) -> Result<PathBuf, String> {
+    Ok(home_dir()?
+        .join("Library/Caches/herdr-mcp/update")
+        .join(SERVICE_UNINSTALL_FENCE))
 }
 
 #[cfg(target_os = "macos")]
@@ -151,7 +173,7 @@ fn read_service_uninstall_fence(paths: &RuntimePaths) -> Result<FenceState, Stri
     if paths.instance.is_named() {
         return Ok(FenceState::Absent);
     }
-    let path = service_uninstall_fence_path(paths);
+    let path = service_uninstall_fence_path(paths)?;
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -650,12 +672,21 @@ mod tests {
         arm_service_uninstall_fence().unwrap();
         arm_service_uninstall_fence().unwrap();
         assert!(ensure_updates_allowed().is_err());
+        let paths = RuntimePaths::discover().unwrap();
+        let fence = service_uninstall_fence_path(&paths).unwrap();
+        assert!(
+            !fence.starts_with(&config),
+            "the service-uninstall fence must survive product config deletion"
+        );
+        fs::remove_dir_all(&config).unwrap();
+        assert!(
+            ensure_updates_allowed().is_err(),
+            "deleting product config must not clear the uninstall intent"
+        );
         preflight_service_install_fence().unwrap();
         clear_service_uninstall_fence().unwrap();
         assert!(ensure_updates_allowed().is_ok());
 
-        let paths = RuntimePaths::discover().unwrap();
-        let fence = service_uninstall_fence_path(&paths);
         fs::create_dir_all(fence.parent().unwrap()).unwrap();
         fs::write(&fence, b"foreign\n").unwrap();
         assert!(preflight_service_install_fence().is_err());

@@ -126,10 +126,13 @@ herdr-mcp update apply
 herdr-mcp update auto
 herdr-mcp update status
 herdr-mcp rollback
+herdr-mcp reinstall
 herdr-mcp uninstall
 ```
 
 macOS 的 v0.4.3+ 默认 PROD 实例会安装 `dev.herdr-mcp.auto-update` 后台 launchd 任务：加载时执行一次，之后每 86,400 秒触发一次。`update auto` 只有在**编译时 runtime channel 为 `prod`**、`[update] check = true` 且 Release channel 为 `stable` 时才访问 GitHub；named instance、DEV runtime 和 `preview` 都会在任何网络请求前直接跳过。发现严格更高的 Stable Release 后，仍复用 `update apply` 的同一套 SHA-256、GitHub Sigstore/SLSA 验签、detached worker 与 rollback-safe 更新链。`service uninstall` 会先写入持久 update fence 并移除归属明确的 scheduler，因此已经启动的 detached worker 也不能在卸载后把服务重新装回来；只有显式且成功的 `install`/`reinstall` 才解除该 fence。把 `[update] check = false` 即可关闭网络检查。
+
+`herdr-mcp reinstall` 是修复 / 重装入口：重新执行 managed Rust service lifecycle，并保留配置与凭据；runtime generations 继续遵循正常 service GC policy，只承诺保留 active / rollback-safe 集合，不承诺保留全部历史 generation。`herdr-mcp uninstall` 是产品级本机 runtime/config 完整清理入口：默认实例只删除经过强 ownership 校验的 herdr-mcp service、auto-update scheduler、Link/watchdog、Native Messaging host、用户 CLI 和 config state；named instance 只删除自己的 service/watchdog/config，不碰默认 scheduler、Link、Native Host 或用户 CLI。删除 config root 前会在用户 cache 中保留一个极小的 update-fence tombstone，确保先前启动的 detached updater 不能把 service 复活；只有之后显式且成功的 install/reinstall 才会清除它。两者都明确保留独立的 `herdr` executable / service / socket / config，以及由 Keychain、TCC、浏览器和 Cloudflare 分别管理的授权状态。`herdr-mcp service uninstall` 仍然只是更窄的高级 service primitive。
 
 如果你是在开发 **herdr-mcp 自身源码**，v0.4.3+ 的 runtime 明确区分 DEV / PROD：
 

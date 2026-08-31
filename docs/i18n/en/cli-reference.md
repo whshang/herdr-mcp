@@ -16,10 +16,13 @@ herdr-mcp update apply
 herdr-mcp update auto
 herdr-mcp update status
 herdr-mcp rollback
+herdr-mcp reinstall
 herdr-mcp uninstall
 ```
 
 `update auto` is the scheduler entrypoint. On the default macOS production instance, `service install` reconciles the owned `dev.herdr-mcp.auto-update` LaunchAgent. It runs on load and then daily. Automatic installation is intentionally **PROD-runtime + Stable-release only**: a compiled DEV runtime, `[update] check = false`, named instances, or `preview` all skip before network access. When a strictly newer Stable Release exists, the command reuses the normal provenance-verified detached update transaction; it does not introduce a second downloader or bypass rollback gates. `service uninstall` first arms an owned durable update fence and removes the scheduler; detached workers re-check that fence before activation, so service removal cannot be undone by a queued silent update. An explicit successful install clears the fence.
+
+`reinstall` is the product repair/replacement path. It re-applies the managed Rust service lifecycle while preserving configuration and credentials; runtime generations continue to follow normal service GC and retain the active/rollback-safe set. `uninstall` performs complete cleanup of **strongly owned herdr-mcp runtime/config state**. The default instance covers its service, owned auto-update scheduler, Link/watchdogs, Native Messaging host, managed user CLI, and config root; a named instance is intentionally limited to its own service/watchdogs/config and never takes ownership of default scheduler/Link/Native Host/user-CLI state. The default product uninstall intentionally leaves one small update-fence tombstone in the user cache after config deletion so a previously detached updater cannot resurrect the service; only an explicit successful install/reinstall clears it. Both deliberately do **not** uninstall or mutate the independent `herdr` executable, Herdr service/socket/config, browser extension account state, Cloudflare resources, macOS Keychain entries, or TCC authorization. `service uninstall` remains the narrower advanced service primitive.
 
 `service ...`, `link ...`, `native-host ...` and `candidate` are advanced/internal commands. `dev` is an advanced **source-development** surface described below. Do not use a repository checkout, Node.js, npm or `service install` as the normal runtime installation path.
 
