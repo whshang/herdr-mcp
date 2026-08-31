@@ -1,5 +1,5 @@
 #[cfg(target_os = "macos")]
-use security_framework::passwords::{generic_password, set_generic_password, PasswordOptions};
+use security_framework::passwords::{PasswordOptions, generic_password, set_generic_password};
 
 pub fn store_generic_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {
     validate_label(service, "service")?;
@@ -10,8 +10,9 @@ pub fn store_generic_secret(service: &str, account: &str, secret: &str) -> Resul
 
     #[cfg(target_os = "macos")]
     {
-        set_generic_password(service, account, secret.as_bytes())
-            .map_err(|error| format!("cannot store workstation credential in macOS Keychain: {error}"))
+        set_generic_password(service, account, secret.as_bytes()).map_err(|error| {
+            format!("cannot store workstation credential in macOS Keychain: {error}")
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -27,7 +28,9 @@ pub fn load_generic_secret(service: &str, account: &str) -> Result<String, Strin
     #[cfg(target_os = "macos")]
     {
         let bytes = generic_password(PasswordOptions::new_generic_password(service, account))
-            .map_err(|error| format!("cannot load workstation credential from macOS Keychain: {error}"))?;
+            .map_err(|error| {
+                format!("cannot load workstation credential from macOS Keychain: {error}")
+            })?;
         let secret = String::from_utf8(bytes)
             .map_err(|_| "workstation credential in macOS Keychain is not UTF-8".to_owned())?;
         if secret.is_empty() || secret.len() > 4096 {

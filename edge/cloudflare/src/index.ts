@@ -199,6 +199,9 @@ export default {
         return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
       }
       const workstationId = parsed.value.workstation_id.trim();
+      if (!workstationId || !/^[A-Za-z0-9_.-]{1,64}$/.test(workstationId)) {
+        return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+      }
       const extracted = extractLinkCredential(request);
       if (!extracted.ok) return noStoreJsonResponse({ ok: false, code: "link_auth_failed" }, 401);
       const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));

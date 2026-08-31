@@ -28,8 +28,8 @@ mod inspect;
 mod instance;
 mod link;
 mod local_skills;
-mod macos_permissions;
 mod macos_keychain;
+mod macos_permissions;
 mod macos_privacy;
 mod mcp;
 mod mcp_http;
@@ -67,8 +67,8 @@ mod updater_store;
 mod user_cli;
 mod utility_exec;
 mod web_artifact_cache;
-mod workstation;
 mod worker;
+mod workstation;
 
 use std::process::ExitCode;
 

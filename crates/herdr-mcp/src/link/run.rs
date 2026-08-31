@@ -62,9 +62,9 @@ fn env_map_from_process() -> HashMap<String, String> {
 fn enrich_macos_credentials(
     env_map: &mut HashMap<String, String>,
 ) -> Result<(), DaemonConfigError> {
-    let configured = RuntimePaths::discover().ok().and_then(|paths| {
-        Config::load_for_instance(&paths.config_file, &paths.instance).ok()
-    });
+    let configured = RuntimePaths::discover()
+        .ok()
+        .and_then(|paths| Config::load_for_instance(&paths.config_file, &paths.instance).ok());
     if optional_trimmed(env_map, "HERDR_EDGE_URL").is_none() {
         let edge_url = configured
             .as_ref()

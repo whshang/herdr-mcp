@@ -180,7 +180,7 @@ export class DeviceRegistryDO {
     const result = await this.state.storage.transaction(async (tx) => {
       const enrollmentKey = ENROLLMENT_PREFIX + verifier;
       const enrollment = await tx.get<EnrollmentRecord>(enrollmentKey);
-      if (!enrollment || enrollment.verifier_sha256 !== verifier) {
+      if (!enrollment || !constantTimeEqual(enc.encode(enrollment.verifier_sha256), enc.encode(verifier))) {
         return { ok: false as const, code: "invalid_enrollment" };
       }
       if (enrollment.expires_at_ms <= now) {

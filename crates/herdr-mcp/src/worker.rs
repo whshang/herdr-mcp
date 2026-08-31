@@ -145,7 +145,10 @@ fn connect_existing_worker(
             Some(value) => {
                 let normalized = normalize_edge_origin(value)?;
                 if normalized != file_origin {
-                    return Err("--edge-origin does not match the Worker bound into the enrollment file".to_owned());
+                    return Err(
+                        "--edge-origin does not match the Worker bound into the enrollment file"
+                            .to_owned(),
+                    );
                 }
                 normalized
             }
@@ -156,7 +159,11 @@ fn connect_existing_worker(
         let enrolled = consume_enrollment(&edge_origin, &enrollment.enrollment_code, name)?;
         let device_id = crate::config::normalize_device_id(&enrolled.device_id)?;
         if enrolled.workstation_id != device_id {
-            let _ = revoke_self(&edge_origin, &enrolled.workstation_id, &enrolled.device_secret);
+            let _ = revoke_self(
+                &edge_origin,
+                &enrolled.workstation_id,
+                &enrolled.device_secret,
+            );
             return Err("Worker returned a workstation identity that does not match the immutable device_id".to_owned());
         }
         validate_device_secret(&enrolled.device_secret)?;
@@ -168,7 +175,8 @@ fn connect_existing_worker(
             &account,
             &enrolled.device_secret,
         ) {
-            let revoked = revoke_self(&edge_origin, &device_id, &enrolled.device_secret).unwrap_or(false);
+            let revoked =
+                revoke_self(&edge_origin, &device_id, &enrolled.device_secret).unwrap_or(false);
             return Err(format!(
                 "cannot persist the new device credential; remote compensation revoked={revoked}: {error}"
             ));
@@ -234,7 +242,10 @@ fn revoke_self(edge_origin: &str, workstation_id: &str, credential: &str) -> Res
     Ok(response.status().is_success())
 }
 
-fn resolve_owner_link_identity(paths: &RuntimePaths, config: &Config) -> Result<OwnerLinkIdentity, String> {
+fn resolve_owner_link_identity(
+    paths: &RuntimePaths,
+    config: &Config,
+) -> Result<OwnerLinkIdentity, String> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (paths, config);
@@ -256,9 +267,9 @@ fn resolve_owner_link_identity(paths: &RuntimePaths, config: &Config) -> Result<
         let edge_origin = match config.edge_public_origin.clone() {
             Some(origin) => normalize_edge_origin(&origin)?,
             None => {
-                let edge_url = plist_env
-                    .get("HERDR_EDGE_URL")
-                    .ok_or_else(|| "configure [edge].public_origin before creating an enrollment".to_owned())?;
+                let edge_url = plist_env.get("HERDR_EDGE_URL").ok_or_else(|| {
+                    "configure [edge].public_origin before creating an enrollment".to_owned()
+                })?;
                 origin_from_ws_url(edge_url)?
             }
         };
@@ -282,8 +293,12 @@ fn production_link_environment() -> Result<std::collections::BTreeMap<String, St
         .join("Library")
         .join("LaunchAgents")
         .join(format!("{LINK_PROD_LABEL}.plist"));
-    let root = plist::Value::from_file(&path)
-        .map_err(|error| format!("cannot read production Link plist {}: {error}", path.display()))?;
+    let root = plist::Value::from_file(&path).map_err(|error| {
+        format!(
+            "cannot read production Link plist {}: {error}",
+            path.display()
+        )
+    })?;
     let env_dict = root
         .as_dictionary()
         .and_then(|dict| dict.get("EnvironmentVariables"))
@@ -291,7 +306,11 @@ fn production_link_environment() -> Result<std::collections::BTreeMap<String, St
         .ok_or_else(|| "production Link plist has no EnvironmentVariables".to_owned())?;
     Ok(env_dict
         .iter()
-        .filter_map(|(key, value)| value.as_string().map(|value| (key.clone(), value.to_owned())))
+        .filter_map(|(key, value)| {
+            value
+                .as_string()
+                .map(|value| (key.clone(), value.to_owned()))
+        })
         .collect())
 }
 
@@ -308,8 +327,12 @@ fn enrollment_output_path(
             .join(format!("device-enrollment-{expires_at_ms}.json")),
     };
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create enrollment directory {}: {error}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "cannot create enrollment directory {}: {error}",
+                parent.display()
+            )
+        })?;
     }
     Ok(path)
 }
@@ -354,14 +377,21 @@ fn read_enrollment_file(path: &Path) -> Result<EnrollmentFile, String> {
     let file: EnrollmentFile = serde_json::from_slice(&bytes)
         .map_err(|_| "enrollment file is not valid Herdr enrollment JSON".to_owned())?;
     if file.schema_version != ENROLLMENT_FILE_SCHEMA {
-        return Err(format!("unsupported enrollment file schema {}", file.schema_version));
+        return Err(format!(
+            "unsupported enrollment file schema {}",
+            file.schema_version
+        ));
     }
     Ok(file)
 }
 
 fn write_config_atomic(paths: &RuntimePaths, config: &Config) -> Result<(), String> {
-    fs::create_dir_all(&paths.config_dir)
-        .map_err(|error| format!("cannot create config directory {}: {error}", paths.config_dir.display()))?;
+    fs::create_dir_all(&paths.config_dir).map_err(|error| {
+        format!(
+            "cannot create config directory {}: {error}",
+            paths.config_dir.display()
+        )
+    })?;
     let temp = paths
         .config_file
         .with_extension(format!("toml.tmp-{}", std::process::id()));
@@ -374,10 +404,18 @@ fn write_config_atomic(paths: &RuntimePaths, config: &Config) -> Result<(), Stri
         .map_err(|error| format!("cannot create temporary config {}: {error}", temp.display()))?;
     file.write_all(config.render().as_bytes())
         .and_then(|_| file.sync_all())
-        .map_err(|error| format!("cannot persist temporary config {}: {error}", temp.display()))?;
+        .map_err(|error| {
+            format!(
+                "cannot persist temporary config {}: {error}",
+                temp.display()
+            )
+        })?;
     fs::rename(&temp, &paths.config_file).map_err(|error| {
         let _ = fs::remove_file(&temp);
-        format!("cannot replace config {}: {error}", paths.config_file.display())
+        format!(
+            "cannot replace config {}: {error}",
+            paths.config_file.display()
+        )
     })
 }
 
@@ -390,7 +428,8 @@ fn client() -> Result<Client, String> {
 }
 
 fn bearer_headers(credential: &str) -> Result<HeaderMap, String> {
-    if credential.is_empty() || credential.len() > 4096 || credential.chars().any(char::is_control) {
+    if credential.is_empty() || credential.len() > 4096 || credential.chars().any(char::is_control)
+    {
         return Err("workstation credential is invalid".to_owned());
     }
     let mut headers = HeaderMap::new();
@@ -434,7 +473,8 @@ fn normalize_edge_origin(value: &str) -> Result<String, String> {
 }
 
 fn origin_from_ws_url(value: &str) -> Result<String, String> {
-    let mut url = Url::parse(value).map_err(|error| format!("invalid production Link URL: {error}"))?;
+    let mut url =
+        Url::parse(value).map_err(|error| format!("invalid production Link URL: {error}"))?;
     let scheme = match url.scheme() {
         "wss" => "https",
         "ws" => "http",
@@ -481,7 +521,9 @@ fn current_account() -> Result<String, String> {
     env::var("USER")
         .ok()
         .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty() && value.len() <= 255 && !value.chars().any(char::is_control))
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 255 && !value.chars().any(char::is_control)
+        })
         .ok_or_else(|| "USER is required for macOS Keychain device credentials".to_owned())
 }
 
@@ -520,5 +562,42 @@ mod tests {
             origin_from_ws_url("wss://herdr.example.com/ws?ignored=1").unwrap(),
             "https://herdr.example.com"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enrollment_file_reads_require_0600_owner_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = env::temp_dir().join(format!(
+            "herdr-worker-enrollment-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("enrollment.json");
+        let body = serde_json::to_vec(&EnrollmentFile {
+            schema_version: ENROLLMENT_FILE_SCHEMA,
+            edge_origin: "https://edge.example".to_owned(),
+            enrollment_code: format!("enroll_{}", "a".repeat(64)),
+            expires_at_ms: now_ms() + 60_000,
+        })
+        .unwrap();
+
+        fs::write(&path, &body).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&path, permissions).unwrap();
+        assert!(read_enrollment_file(&path).is_err());
+
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&path, permissions).unwrap();
+        let file = read_enrollment_file(&path).unwrap();
+        assert_eq!(file.schema_version, ENROLLMENT_FILE_SCHEMA);
+        assert_eq!(file.edge_origin, "https://edge.example");
+        assert!(validate_enrollment_code(&file.enrollment_code).is_ok());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

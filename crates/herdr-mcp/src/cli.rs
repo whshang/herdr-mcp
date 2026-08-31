@@ -564,7 +564,11 @@ fn parse_worker_enrollment_create(args: &[String]) -> Result<Command, String> {
             "--code" => {
                 return Err("enrollment secrets are never accepted on argv; use the generated 0600 enrollment file".to_owned());
             }
-            value => return Err(format!("unknown worker enrollment create argument '{value}'")),
+            value => {
+                return Err(format!(
+                    "unknown worker enrollment create argument '{value}'"
+                ));
+            }
         }
     }
     Ok(Command::Worker(WorkerCommand::EnrollmentCreate {
@@ -610,7 +614,10 @@ fn parse_worker_connect(args: &[String]) -> Result<Command, String> {
                 index += 2;
             }
             "--code" => {
-                return Err("enrollment secrets are never accepted on argv; use --enrollment-file".to_owned());
+                return Err(
+                    "enrollment secrets are never accepted on argv; use --enrollment-file"
+                        .to_owned(),
+                );
             }
             value => return Err(format!("unknown worker connect argument '{value}'")),
         }
@@ -1173,7 +1180,47 @@ mod tests {
             })
         );
         assert!(parse(args(&["worker", "connect", "--code", "secret"])).is_err());
-        assert!(parse(args(&["device", "enrollment", "create", "--code", "secret"])).is_err());
+        assert!(
+            parse(args(&[
+                "device",
+                "enrollment",
+                "create",
+                "--code",
+                "secret"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(args(&[
+                "worker",
+                "enrollment",
+                "create",
+                "--code",
+                "secret"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(args(&[
+                "worker",
+                "connect",
+                "--enrollment-file",
+                "/tmp/enrollment.json",
+                "--device-secret",
+                "devsec_x"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(args(&[
+                "worker",
+                "enrollment",
+                "create",
+                "--enrollment-code",
+                "enroll_x"
+            ]))
+            .is_err()
+        );
         assert_eq!(
             parse(args(&["dev", "--dry-run"])).unwrap().command,
             Command::Dev(DevCommand::Sync {

@@ -12,7 +12,11 @@ Implementation status (2026-08-31):
 - [x] Public epoch 3 exposes Edge-local `herdr_devices`; Runtime execution remains epoch 2.
 - [x] Workstation-bound public tools carry one common Edge-only `device` selector; Edge resolves once, strips it, then forwards Runtime v2 args.
 - [x] Explicit ID/name routing, single-routable-device selection, legacy-empty-registry fallback, and `device_ambiguous` fail-closed behavior are covered by tests.
-- [ ] Per-device credential and one-time enrollment are not implemented yet; a second device is therefore not formally supported yet.
+- [x] Per-device credential and one-time enrollment are implemented in the Worker/Registry and macOS Rust CLI, including single-use expiry, credential-to-device binding, self-revoke compensation, and native Keychain persistence.
+- [ ] Real two-device UAT is still pending until the secure enrollment Edge is
+  deployed to production and a real second Mac joins the same deployed
+  Worker/Connector; second-device support is not release-qualified before that
+  UAT passes.
 - [ ] Device-aware opaque workspace/pane refs, scheduling mutations, and Web Control Console remain later phases.
 
 ## 1. Product decision
@@ -327,19 +331,16 @@ herdr-mcp install
 herdr-mcp doctor
 ```
 
-Worker onboarding is explicit:
+Worker onboarding is explicit and uses only the implemented P0-C enrollment CLI:
 
 ```text
-herdr-mcp worker setup
+herdr-mcp worker enrollment create [--ttl-seconds 600] [--name NAME] [--output PATH]
+herdr-mcp device enrollment create [same options]
+herdr-mcp worker connect --enrollment-file PATH [--edge-origin HTTPS_ORIGIN] [--name NAME]
 ```
 
-Logical choices:
-
-```text
-create new Worker
-connect existing Worker
-local only
-```
+A richer onboarding tree (`worker setup`, `worker create`, `worker status`,
+`devices list`) remains a later product surface (Section 13).
 
 For an existing Worker, the intended deterministic path is:
 
@@ -347,7 +348,10 @@ For an existing Worker, the intended deterministic path is:
 owner creates one-time enrollment
        |
        v
-new device: herdr-mcp worker connect --code <code>
+0600 enrollment file is transferred out-of-band
+       |
+       v
+new device: herdr-mcp worker connect --enrollment-file <path>
        |
        v
 stable device_id + per-device credential
@@ -355,6 +359,18 @@ stable device_id + per-device credential
        v
 Link online on the same Worker
 ```
+
+Enrollment creation authority:
+
+- only the owner/default workstation creates enrollments; the Edge accepts
+  enrollment creation only from the Edge MCP (OAuth owner) identity or from the
+  configured `DEFAULT_WORKSTATION_ID` presenting its production Link credential
+  (`authenticateEnrollmentCreator`);
+- the CLI creator path resolves the production Link identity and its Keychain
+  credential before it will call the Edge;
+- member devices cannot recursively enroll further devices. A joining device
+  receives only the ability to consume a one-time enrollment code; it never
+  gains enrollment-creation authority.
 
 Enrollment code requirements:
 
@@ -364,7 +380,20 @@ Enrollment code requirements:
 - device-enrollment scope only;
 - not persisted in normal logs;
 - not equivalent to the final device credential;
+- never accepted as a command-line argument;
+- written only to a mode-0600 enrollment file by the current P0 CLI;
 - Cloudflare deployment credentials are not required on the joining device.
+
+Current macOS credential contract:
+
+- the joining device receives the final 256-bit random credential once;
+- the Worker persists only its verifier/hash;
+- Rust writes the final credential directly through Security.framework into macOS Keychain;
+- `edge.device_id` is non-secret config and selects a deterministic per-device Keychain service;
+- production Link reconciliation updates `HERDR_WORKSTATION_ID` and `HERDR_LINK_KEYCHAIN_SERVICE` without putting the credential in the plist, argv, shell history, or logs;
+- if Keychain persistence fails after enrollment consumption, the client uses the just-issued credential only to revoke that same device as compensation.
+
+The current secure joining CLI is macOS-only because the credential backend is Keychain. Other platforms must gain an equivalent OS credential store before their `worker connect` path may consume a one-time enrollment.
 
 ## 12. Edge-local MCP tools
 
@@ -411,12 +440,21 @@ Mutation semantics must share one Device Administration Service with CLI and fut
 
 ## 13. CLI boundary
 
-Target command tree:
+Implemented P0-C command surface:
+
+```text
+herdr-mcp worker enrollment create [--ttl-seconds 600] [--name NAME] [--output PATH]
+herdr-mcp device enrollment create [same options]
+herdr-mcp worker connect --enrollment-file PATH [--edge-origin HTTPS_ORIGIN] [--name NAME]
+```
+
+The enrollment secret is intentionally absent from argv and normal stdout. `worker enrollment create` reports the secret file path and expiry only.
+
+Later command tree:
 
 ```text
 herdr-mcp worker setup
 herdr-mcp worker create
-herdr-mcp worker connect
 herdr-mcp worker status
 herdr-mcp worker doctor
 
@@ -548,12 +586,13 @@ Edge maps internal workstation errors to the stable device-facing boundary and r
 
 ### P0-C — Secure enrollment
 
-- one-time enrollment contract;
-- per-device credential;
-- second-device connect flow;
-- credential-to-device binding;
-- revoke path;
-- retain legacy shared-secret compatibility for the existing device only.
+- [x] one-time enrollment contract;
+- [x] per-device credential;
+- [x] macOS second-device connect flow with native Keychain persistence;
+- [x] credential-to-device binding;
+- [x] self-revoke/compensation path;
+- [x] retain legacy shared-secret compatibility for the configured default workstation only;
+- [ ] real Device A + Device B deployed UAT before release qualification.
 
 ### P0-D — Explicit execution routing
 

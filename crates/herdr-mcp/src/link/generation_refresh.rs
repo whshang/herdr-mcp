@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use super::cutover_execute::{LaunchdOps, RealLaunchd, atomic_write};
 #[cfg(target_os = "macos")]
-use super::install::{configured_edge_device_identity, configured_edge_ws_url, inherited_proxy_env};
+use super::install::{
+    configured_edge_device_identity, configured_edge_ws_url, inherited_proxy_env,
+};
 #[cfg(target_os = "macos")]
 use super::migrate_runtime_control::{
     active_rust_generation_id, read_binary_version_hint, reconcile_current_generation,
