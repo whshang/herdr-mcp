@@ -162,29 +162,19 @@ function renderPageContext(state) {
   const info = pageContextInfo();
   const bindings = pageContextBindings();
   const supported = Boolean(info?.convKey);
-  pageContextCard.classList.toggle("unsupported", !supported);
 
   if (pageContext.loading) {
-    pageContextTitle.textContent = t("cc_page_loading");
-    pageContextMeta.textContent = "";
-    pageContextMeta.title = "";
-    pageContextHelp.textContent = t("cc_page_context_help");
+    pageContextCard.hidden = true;
     return;
   }
 
   if (!supported) {
-    pageContextTitle.textContent = t("cc_page_unsupported");
-    pageContextMeta.textContent = pageContext.error || t("cc_page_unsupported_meta");
-    pageContextMeta.title = "";
-    pageContextHelp.textContent = t("cc_page_context_help");
+    pageContextCard.hidden = true;
     return;
   }
 
-  const site = siteLabel(info.site);
-  if (info.project_id && info.conversation_id) pageContextTitle.textContent = t("cc_page_project_conversation", { site });
-  else if (info.project_id) pageContextTitle.textContent = t("cc_page_project_home", { site });
-  else pageContextTitle.textContent = t("cc_page_conversation", { site });
-
+  pageContextCard.hidden = false;
+  pageContextTitle.textContent = siteLabel(info.site);
   pageContextMeta.textContent = bindings.length
     ? t("cc_page_binding_count", { count: bindings.length })
     : t("cc_page_unbound");
@@ -192,7 +182,8 @@ function renderPageContext(state) {
   if (info.project_id) identity.push(t("cc_page_project_id", { value: shortIdentity(info.project_id, 48) }));
   if (info.conversation_id) identity.push(t("cc_page_conversation_id", { value: shortIdentity(info.conversation_id, 48) }));
   pageContextMeta.title = identity.join(" · ");
-  pageContextHelp.textContent = pageContext.error || t("cc_page_context_help");
+  pageContextHelp.hidden = !pageContext.error;
+  pageContextHelp.textContent = pageContext.error || "";
 }
 
 async function refreshPageContext() {
@@ -313,7 +304,7 @@ function renderWorkspaceTree(state) {
     count.className = "workspace-count";
     const workingCount = (workspace.panes || []).filter((pane) => pane.status === "working").length;
     if (bindingMissing) {
-      count.textContent = t("cc_workspace_not_visible");
+      count.textContent = t("cc_workspace_offline_bound");
     } else {
       const paneCount = workspace.panes?.length || 0;
       count.textContent = t("cc_workspace_count", { panes: paneCount });

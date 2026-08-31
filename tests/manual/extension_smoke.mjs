@@ -630,15 +630,15 @@ ok(zhLocale.hud_manual_judge === "LLM 判断", "zh HUD LLM decision label is exa
 ok(!("hud_manual_handoff" in zhLocale) && !("hud_bindings" in zhLocale) && !("hud_interval" in zhLocale),
   "zh HUD removes legacy drawer, binding, and timing copy while handoff stays a compact conversation action");
 ok(zhLocale.cc_page_handoff === "手动接力"
-    && zhLocale.cc_page_context_title === "当前页面"
-    && zhLocale.cc_workspaces_heading === "工作区"
-    && zhLocale.cc_workspaces_binding_hint.includes("当前页面绑定")
+    && zhLocale.cc_brand === "Herdr"
+    && zhLocale.cc_stats === "{working} 运行"
+    && zhLocale.cc_workspace_offline_bound.includes("离线")
     && zhLocale.cc_workspace_bound.includes("已绑定")
     && zhLocale.cc_workspace_bind === "绑定"
     && zhLocale.hud_scope_binding_count === "🔗{count}"
     && zhLocale.hud_scope_binding_hint.includes("控制中心")
     && !zhLocale.hud_scope_binding_hint.includes("0 个窗格"),
-  "zh copy keeps HUD compact and merges current-page binding into workspace rows");
+  "zh copy keeps the HUD and Side Panel compact while preserving binding state");
 ok([enLocale, zhLocale, jaLocale].every((locale) => [
   "cc_page_workspace_select_aria",
   "cc_page_bind",
@@ -653,10 +653,9 @@ ok([enLocale, zhLocale, jaLocale].every((locale) => [
   "Control Center locales remove the old separate binding-selector vocabulary");
 ok(zhLocale.cc_page_handoff_busy.includes("Herdr")
     && zhLocale.cc_page_handoff_busy_help.includes("工作区仍在工作")
-    && zhLocale.cc_mode_terminal_help.includes("暂未开放")
-    && enLocale.cc_mode_terminal_help.includes("not enabled yet")
-    && jaLocale.cc_mode_terminal_help.includes("まだ有効ではありません"),
-  "handoff busy and terminal preview copy fail closed without exposing implementation jargon");
+    && controlActionsSource.includes("if (!target.agent) return []")
+    && !controlCenterHtml.includes('data-i18n="cc_mode_terminal_help"'),
+  "terminal panes keep raw write preview out of the beginner-facing Side Panel");
 ok(zhLocale.hud_automation_off === "自动 关", "zh HUD automation-off label is localized");
 ok(
   zhLocale.hud_automation_on_hint.includes("进度")
@@ -734,8 +733,11 @@ ok(actionClickBlock.includes("openControlCenter(windowId)")
   "toolbar action opens the Control Center Side Panel directly and removes popup-only protocol");
 ok(!controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && controlCenterHtml.includes('id="pageContextCard"')
+    && controlCenterHtml.includes('class="page-context-strip"')
     && controlCenterHtml.includes('class="workspace-panel"')
-    && controlCenterHtml.includes('data-i18n="cc_workspaces_binding_hint"')
+    && !controlCenterHtml.includes('data-i18n="cc_workspaces_binding_hint"')
+    && !controlCenterHtml.includes('data-i18n="cc_page_following"')
+    && controlCenterHtml.includes('data-i18n="cc_brand"')
     && !controlCenterHtml.includes('id="pageWorkspaceSelect"')
     && !controlCenterHtml.includes('id="pageBindings"')
     && !controlCenterHtml.includes('id="pageBindButton"')

@@ -9,36 +9,28 @@
 <body>
   <main class="control-center">
     <header class="topbar">
-      <div class="title-row">
-        <h1 id="pageTitle" data-i18n="cc_title">Herdr Control Center</h1>
-        <button id="settingsButton" type="button" class="ghost" data-i18n="cc_settings">Settings</button>
-      </div>
-      <div class="runtime-line">
+      <div class="topbar-row">
+        <strong id="pageTitle" class="brand" data-i18n="cc_brand">Herdr</strong>
         <span id="runtimeDot" class="dot offline"></span>
         <span id="runtimeText" data-i18n="cc_runtime_connecting">Runtime connecting…</span>
-        <span id="runtimeStats" class="stats">0 workspaces · 0 panes · 0 working</span>
-      </div>
-      <div class="toolbar">
-        <button id="refreshButton" type="button" data-i18n="cc_refresh">Refresh</button>
-        <button id="collapseButton" type="button" class="ghost" data-i18n="cc_collapse_all">Collapse all</button>
+        <span id="runtimeStats" class="stats">0 working</span>
+        <span class="topbar-spacer"></span>
+        <div class="toolbar">
+          <button id="refreshButton" type="button" class="ghost compact-action" data-i18n="cc_refresh">Refresh</button>
+          <button id="collapseButton" type="button" class="ghost compact-action" data-i18n="cc_collapse_all">Collapse</button>
+          <button id="settingsButton" type="button" class="ghost compact-action" data-i18n="cc_settings">Settings</button>
+        </div>
       </div>
     </header>
 
-    <section id="pageContextCard" class="page-context-card" aria-live="polite">
-      <div class="page-context-heading">
-        <strong data-i18n="cc_page_context_title">Current page</strong>
-        <span class="follow-badge" data-i18n="cc_page_following">FOLLOWS ACTIVE TAB</span>
-      </div>
-      <div id="pageContextTitle" class="page-context-title" data-i18n="cc_page_loading">Reading active tab…</div>
-      <div id="pageContextMeta" class="page-context-meta"></div>
-      <div id="pageContextHelp" class="page-context-help" data-i18n="cc_page_context_help">Switching browser tabs updates this context automatically. It does not retarget the pinned control target.</div>
+    <section id="pageContextCard" class="page-context-strip" aria-live="polite" hidden>
+      <strong id="pageContextTitle"></strong>
+      <span class="context-separator">·</span>
+      <span id="pageContextMeta"></span>
+      <span id="pageContextHelp" class="context-error" hidden></span>
     </section>
 
     <section class="workspace-panel" aria-label="Herdr workspaces" data-i18n-aria="cc_workspace_aria">
-      <div class="workspace-panel-heading">
-        <strong data-i18n="cc_workspaces_heading">Workspaces</strong>
-        <span data-i18n="cc_workspaces_binding_hint">Live state · current-page binding</span>
-      </div>
       <div id="workspaceList" class="workspace-list">
         <div class="empty" data-i18n="cc_loading">Loading local Herdr state…</div>
       </div>
