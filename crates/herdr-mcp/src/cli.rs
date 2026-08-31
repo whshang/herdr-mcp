@@ -89,6 +89,7 @@ pub enum NativeHostCommand {
     DevEnable { path: Option<String> },
     DevDisable,
     UseStore,
+    UseStandalone,
     UseDev,
 }
 
@@ -752,11 +753,14 @@ fn parse_native_host(args: &[String]) -> Result<Command, String> {
         [subcommand, channel] if subcommand == "use" && channel == "store" => {
             Ok(Command::NativeHost(NativeHostCommand::UseStore))
         }
+        [subcommand, channel] if subcommand == "use" && channel == "standalone" => {
+            Ok(Command::NativeHost(NativeHostCommand::UseStandalone))
+        }
         [subcommand, channel] if subcommand == "use" && channel == "dev" => {
             Ok(Command::NativeHost(NativeHostCommand::UseDev))
         }
         [] => Err(
-            "native-host requires install, status, uninstall, rollback, dev enable|disable, or use store|dev"
+            "native-host requires install, status, uninstall, rollback, dev enable|disable, or use store|standalone|dev"
                 .to_owned(),
         ),
         [subcommand] => Err(format!("unknown native-host command '{subcommand}'")),
@@ -810,7 +814,7 @@ Advanced / internal:\n\
   herdr-mcp tcc-broker <install [--force]|status|uninstall>\n\
   herdr-mcp native-host <install|status|uninstall|rollback>\n\
   herdr-mcp native-host dev <enable [PATH]|disable>\n\
-  herdr-mcp native-host use <store|dev>\n\
+  herdr-mcp native-host use <store|standalone|dev>\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\
   herdr-mcp artifact import --url HTTPS_URL --path PROJECT_PATH [--sha256 HEX] [--capability-env NAME | --signed-url] [--overwrite] [--confirm-dirty] [--confirm-busy]\n\
   (--signed-url imports a safe signed HTTPS URL directly; R2 relay objects use
@@ -1142,6 +1146,12 @@ mod tests {
                 .unwrap()
                 .command,
             Command::NativeHost(NativeHostCommand::UseStore)
+        );
+        assert_eq!(
+            parse(args(&["native-host", "use", "standalone"]))
+                .unwrap()
+                .command,
+            Command::NativeHost(NativeHostCommand::UseStandalone)
         );
         assert_eq!(
             parse(args(&["native-host", "use", "dev"])).unwrap().command,
