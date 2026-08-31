@@ -77,9 +77,9 @@ const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "u
 const controlCenterCss = readFileSync(path.join(EXT, "control-center.css"), "utf8");
 const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.83", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.83"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.83"'), "content version matches manifest");
+ok(manifest.version === "0.1.84", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.84"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.84"'), "content version matches manifest");
 const ownerGateIndex = wakeSource.indexOf('type: "h2w_extension_owner_status"');
 const queueOwnerClaimIndex = wakeSource.indexOf('setAttribute(QUEUED_INSERT_OWNER_ATTR');
 ok(ownerGateIndex >= 0
@@ -654,6 +654,8 @@ ok([enLocale, zhLocale, jaLocale].every((locale) => !Object.keys(locale).some((k
 ok(zhLocale.hud_manual_continue === "继续", "zh HUD continue label is exact");
 ok(zhLocale.hud_manual_status === "查 Herdr", "zh HUD Herdr check label is exact");
 ok(zhLocale.hud_manual_judge === "LLM 判断", "zh HUD LLM decision label is exact");
+ok([enLocale, zhLocale, jaLocale].every((locale) => Boolean(locale.hud_judge_turn_in_progress)),
+  "manual LLM decision has localized in-progress guidance");
 ok(!("hud_manual_handoff" in zhLocale) && !("hud_bindings" in zhLocale) && !("hud_interval" in zhLocale),
   "zh HUD removes legacy drawer, binding, and timing copy while handoff stays a compact conversation action");
 ok(zhLocale.cc_page_handoff === "手动接力"
@@ -852,6 +854,22 @@ ok(chatGptAdapterSource.includes("getStopButtonCandidates()")
     && wakeSource.includes('data.manual === true ? 1200 : 15000')
     && wakeSource.includes('busy_reason: composerBusyReason() || "unknown"'),
   "manual Continue scopes composer busy detection to explicit composer stop controls and fails fast when truly busy");
+const wakeHandlerStart = wakeSource.indexOf('if (msg?.type === "h2w_wake")');
+const wakeHandlerEnd = wakeHandlerStart >= 0 ? wakeSource.indexOf('sendResponse({});', wakeHandlerStart) : -1;
+const wakeHandlerBlock = wakeHandlerStart >= 0 && wakeHandlerEnd > wakeHandlerStart
+  ? wakeSource.slice(wakeHandlerStart, wakeHandlerEnd)
+  : "";
+ok(wakeHandlerBlock.indexOf("sendResponse(result);") >= 0
+    && wakeHandlerBlock.indexOf("confirmReplyStarted()") > wakeHandlerBlock.indexOf("sendResponse(result);")
+    && wakeHandlerBlock.includes('error: "wake-handler-failed"')
+    && wakeSource.includes('action === "judge" && isTurnInProgress()')
+    && wakeSource.includes('error: "action-busy"')
+    && backgroundSource.includes("const MANUAL_LLM_JUDGE_TIMEOUT_MS = 15000")
+    && backgroundSource.includes("maxAttempts: 1")
+    && backgroundSource.includes('error: "manual_action_failed"')
+    && backgroundSource.includes('error: "handoff_start_failed"')
+    && backgroundSource.includes('}, 10_000);'),
+  "manual HUD controls respond on submission, avoid partial-turn LLM judging, and keep read-only failure paths bounded");
 const queueTurnEndedStart = backgroundSource.indexOf('if (msg?.type === "h2w_turn_ended")');
 const queueTurnEndedEnd = queueTurnEndedStart >= 0 ? backgroundSource.indexOf('if (msg?.type === "h2w_handoff_start")', queueTurnEndedStart) : -1;
 const queueTurnEndedBlock = queueTurnEndedStart >= 0 && queueTurnEndedEnd > queueTurnEndedStart

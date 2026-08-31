@@ -42,7 +42,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.83";
+const H2W_SCRIPT_VERSION = "0.1.84";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
@@ -109,12 +109,12 @@ const FALLBACK_PARTIAL_TEMPLATE =
 // ---- Browser JSON bridge (z.ai / DeepSeek without MCP Connector) ----
 // The page only receives tool schemas and results. The bearer token stays inside
 // the extension service worker.
-async function jsonBridgeRpc(method, params = {}) {
+async function jsonBridgeRpc(method, params = {}, nativeTimeoutMs = 90_000) {
   return callMcpJsonRpc({
     baseUrl: CFG.herdrMcpUrl,
     method,
     params,
-    fetchFn: (url, init) => localHerdrFetch(url, { ...init, nativeTimeoutMs: 90_000 }),
+    fetchFn: (url, init) => localHerdrFetch(url, { ...init, nativeTimeoutMs }),
   });
 }
 
@@ -145,7 +145,7 @@ function hudLabels() {
     "queue_added_draft_changed", "queue_added_clear_failed", "queue_clear_confirm", "queue_cleared",
     "automation_on_hint", "automation_off_hint", "conversation_automation_on_hint", "conversation_automation_off_hint",
     "aria_toggle_automation", "automation_enabled", "automation_disabled", "automation_update_failed",
-    "judge_no_continue", "continue_sent", "continue_failed",
+    "judge_no_continue", "judge_turn_in_progress", "continue_sent", "continue_failed",
     "web_state", "scope_binding_count", "scope_binding_hint", "scope_unbound",
     "tip_state", "tip_recovery", "tip_last_event", "none",
     "reason_disabled", "reason_no_conv", "reason_llm_not_configured", "reason_unbound",
@@ -2012,6 +2012,7 @@ const lastTurnEndedPayload = new Map(); // convKey -> last h2w_turn_ended payloa
 
 const LLM_JUDGE_TIMEOUT_MS = 60000;
 const LLM_JUDGE_MAX_ATTEMPTS = 2;
+const MANUAL_LLM_JUDGE_TIMEOUT_MS = 15000;
 
 /**
  * One-shot OpenAI-compatible chat/completions call to judge if the turn is done.
@@ -2020,7 +2021,7 @@ const LLM_JUDGE_MAX_ATTEMPTS = 2;
  * @param {string} assistantText
  * @param {object|null} [cfgOverride] — Options test may pass form values before Save.
  */
-async function fetchLlmJudgeOnce(userText, assistantText, cfgOverride = null) {
+async function fetchLlmJudgeOnce(userText, assistantText, cfgOverride = null, timeoutMs = LLM_JUDGE_TIMEOUT_MS) {
   const cfg = cfgOverride || CFG;
   if (!isLlmJudgeConfigured(cfg)) return { ok: false, reason: "not_configured" };
   if (!await hasLlmHostPermission(cfg)) {
@@ -2042,7 +2043,7 @@ async function fetchLlmJudgeOnce(userText, assistantText, cfgOverride = null) {
         Authorization: `Bearer ${String(cfg.llmJudgeApiKey).trim()}`,
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(LLM_JUDGE_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");
@@ -2055,20 +2056,25 @@ async function fetchLlmJudgeOnce(userText, assistantText, cfgOverride = null) {
   } catch (e) {
     const name = e?.name || "";
     if (name === "TimeoutError" || name === "AbortError") {
-      return { ok: false, reason: "timeout", error: `timed out after ${LLM_JUDGE_TIMEOUT_MS}ms` };
+      return { ok: false, reason: "timeout", error: `timed out after ${timeoutMs}ms` };
     }
     return { ok: false, reason: "network", error: e.message };
   }
 }
 
-async function fetchLlmJudge(userText, assistantText, cfgOverride = null) {
+async function fetchLlmJudge(
+  userText,
+  assistantText,
+  cfgOverride = null,
+  { timeoutMs = LLM_JUDGE_TIMEOUT_MS, maxAttempts = LLM_JUDGE_MAX_ATTEMPTS } = {},
+) {
   let last = null;
-  for (let attempt = 1; attempt <= LLM_JUDGE_MAX_ATTEMPTS; attempt += 1) {
-    last = await fetchLlmJudgeOnce(userText, assistantText, cfgOverride);
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    last = await fetchLlmJudgeOnce(userText, assistantText, cfgOverride, timeoutMs);
     if (last.ok) return last;
     const retryable = last.reason === "timeout" || last.reason === "network";
-    if (!retryable || attempt >= LLM_JUDGE_MAX_ATTEMPTS) break;
-    callLog(`llm-judge retry ${attempt}/${LLM_JUDGE_MAX_ATTEMPTS - 1} after ${last.reason}`);
+    if (!retryable || attempt >= maxAttempts) break;
+    callLog(`llm-judge retry ${attempt}/${maxAttempts - 1} after ${last.reason}`);
     await new Promise((r) => setTimeout(r, 800));
   }
   return last;
@@ -2753,8 +2759,7 @@ async function manualHerdrStatusContinue(tabId, convKey) {
   const session = bindingsForConv(bindings, convKey);
   if (!session.length) return { ok: false, error: "binding_required" };
 
-  let state = await fetchStateFresh();
-  if (!state?.ok) state = await fetchState();
+  const state = await fetchStateFresh();
   if (!state?.ok) return { ok: false, error: "herdr_state_unavailable" };
 
   const blocks = [];
@@ -2795,7 +2800,10 @@ async function manualLlmJudgeContinue(tabId, convKey, userText, assistantText) {
     return rememberIdleNudge(convKey, { ok: false, nudged: false, reason: "empty_assistant", error: "empty_assistant" });
   }
 
-  const judged = await fetchLlmJudge(String(userText || ""), assistant);
+  const judged = await fetchLlmJudge(String(userText || ""), assistant, null, {
+    timeoutMs: MANUAL_LLM_JUDGE_TIMEOUT_MS,
+    maxAttempts: 1,
+  });
   if (!judged.ok) {
     return rememberIdleNudge(convKey, {
       ok: false,
@@ -3971,7 +3979,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           method: "pane.read",
           params: JSON.stringify({ pane_id: paneId, source: "recent_unwrapped", lines, strip_ansi: true }),
         },
-      });
+      }, 10_000);
       if (!call.ok) {
         sendResponse({ ok: false, error: call.error || "read-tail-failed", detail: call.detail || null });
         return;
@@ -3985,7 +3993,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ? read
         : String(read.content ?? read.text ?? read.output ?? text ?? "");
       sendResponse({ ok: true, pane_id: paneId, tail: raw.slice(-maxChars), truncated: raw.length > maxChars });
-    })();
+    })().catch((error) => {
+      sendResponse({ ok: false, error: String(error?.message || error || "read-tail-failed") });
+    });
     return true;
   }
   if (msg?.type === "h2w_json_bridge_catalog") {
@@ -4667,7 +4677,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       sendResponse({ ok: false, error: "manual_action_unknown" });
-    })();
+    })().catch((error) => {
+      callLog("manual continue failed:", error?.message || String(error));
+      sendResponse({ ok: false, error: "manual_action_failed" });
+    });
     return true;
   }
   if (msg?.type === "h2w_queue_status") {
@@ -4892,7 +4905,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const tabId = msg.tabId || sender.tab?.id;
       if (!tabId) { sendResponse({ ok: false, error: "tab-unavailable" }); return; }
       sendResponse(await startHandoffForTab(tabId, msg.trigger || "manual"));
-    })();
+    })().catch((error) => {
+      callLog("manual handoff start failed:", error?.message || String(error));
+      sendResponse({ ok: false, error: "handoff_start_failed" });
+    });
     return true;
   }
   if (msg?.type === "h2w_wake_ack") {

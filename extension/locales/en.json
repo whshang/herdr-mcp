@@ -155,6 +155,7 @@
   "hud_automation_update_failed": "Could not update automation state",
   "hud_control_center_open_failed": "Could not open Control Center",
   "hud_judge_no_continue": "Judge result: no continuation needed",
+  "hud_judge_turn_in_progress": "Wait for the current reply to finish before LLM decide.",
   "hud_continue_sent": "Continue request sent",
   "hud_continue_failed": "Continue failed: {error}",
   "hud_tip_state": "State",
