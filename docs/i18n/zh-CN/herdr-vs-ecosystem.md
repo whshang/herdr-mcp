@@ -1,185 +1,125 @@
-# 为什么选择 Herdr + herdr-mcp：与 tmux、cmux、ACP 及同类 MCP 的架构比较
+# 为什么选择 Herdr + herdr-mcp：架构与同类生态比较
 
-这篇文档回答一个长期问题：当 Web AI 需要真正控制本地开发环境时，为什么 herdr-mcp 继续选择 Herdr 作为持久运行现场，而不是改成 tmux、cmux、ACP，或者直接复制 coding-tools-mcp、AgenticGPT、gpt-webcodex 的产品形态。
+当 Web AI 需要真正控制本机开发机器时，现有方案有很多种形态。这篇文章解释 Herdr + herdr-mcp 在生态中的位置、为什么采用这套架构，以及什么时候选用其它工具才是更好的选择。这是一个系统边界决策，不是功能数量比拼。
 
-结论先行：**Herdr + herdr-mcp 当前最适合“Web AI 是 planner，本机是可持续、可观察、可接管的真实开发现场”这一目标。** 这个结论不意味着其它项目能力弱；它们分别在终端复用、桌面体验、Agent 协议、安全工具 Runtime、远程 Worker 和 Windows 产品化上有明显优势。关键在于系统边界是否匹配。
+结论先行：**Herdr + herdr-mcp 最适合“Web AI 是 planner，本机是可持续、可观察、可人工接管的真实开发现场”这一目标。** Web 模型直接完成确定性小任务，把更大的工作委派给可替换的本地 Agent，并让工作现场跨会话持续存在，从而用户可以随时离开、回来并接管。
 
-## 评判标准
+## 比较的维度
 
-herdr-mcp 的目标不是再做一个 Coding Agent。评判后端和同类方案时，重点看六件事：
+让 ChatGPT 或 Codex 操作本地开发环境的项目，最大的差异来自三个正交问题：
 
-1. Web AI 能否直接获得真实文件、Git、Shell 和运行状态；
-2. 数小时任务中 workspace、PTY、Agent、进程能否持续存在；
-3. Web 对话结束后，本机状态变化能否反向推动网页恢复工作；
-4. mutation 超时后能否判断动作是否已经发生，避免重复执行；
-5. 人是否可以随时看到现场、进入终端、修改方向；
-6. 系统是否保持 Agent 中立，不把 Claude、Codex、Pi、OpenCode、Grok、Droid 等某一个 CLI 变成必要依赖。
+1. **任务从哪里开始** — ChatGPT Web、Codex CLI、桌面应用，还是任意 MCP 客户端。
+2. **谁负责规划** — Web 模型直接调用确定性工具，还是委派给本地 Coding Agent。
+3. **本机保存什么长期状态** — 单次 MCP 请求，还是持久 session、task、PTY、Agent、浏览器会话和恢复证据。
 
-这六项组合起来，才是 herdr-mcp 所说的“远程控制面”。
+因为组合方式比单个工具更重要，主流项目大致归为几类架构路线。
 
-## Herdr、tmux、cmux、ACP 分别处在哪一层
+| 路线 | 典型代表 | 主入口 | 规划/执行 | 最适合 |
+| --- | --- | --- | --- | --- |
+| 通用 Coding MCP Runtime | coding-tools-mcp、MCPX、DevSpace Local Artifacts | 任意 MCP 客户端 / 模型 | 客户端模型直接调确定性工具 | 给已有 AI 客户端加安全本地编程工具 |
+| Web → 工作站 | AgenticGPT、gpt-webcodex、chatgpt-workspace-mcp、chatgpt-local-coder | ChatGPT Web | Web planner → 本地 runtime/worker | 从 Web/手机操作一台开发机 |
+| Web → Coding Agent | codex-from-chatgpt、codex-chatgpt-bridge | ChatGPT Web | Web → Codex → 本地仓库 | 让专用 CLI 成为 coding executor |
+| Codex → ChatGPT Web | codex-chatgpt-web | Codex CLI | Codex 驱动，消费 Web 模型 | 保留 Codex harness，使用 Web 模型 |
+| 双 Agent 协作 | codex-with-chatgpt | ChatGPT + Codex | Web planner/reviewer ↔ Codex executor | 明确的计划–执行–复核工作流 |
+| 持久工作现场控制面 | Herdr + herdr-mcp | ChatGPT / 任意 MCP 客户端 | Web planner → 确定性工具或可替换 Agent | 长期工作站 + 浏览器连续性 |
+
+## 架构路线
+
+### Coding MCP Runtime：模型直接驱动工具
+
+```text
+ChatGPT / Claude / Grok / Cursor
+              │ MCP
+              ▼
+      coding-tools-mcp / MCPX
+              │
+       files / Git / exec
+```
+
+Runtime 保持模型中立，客户端模型决定检查、修改和执行什么。coding-tools-mcp 强调服务端强制、稳定紧凑的 file/search/patch、Git、PTY/exec，并带 workspace confinement 和有界结果；MCPX 展示持久 Remote Session 如何给工具表面带来恢复语义。当全部问题是安全的 file/Git/exec 时，这是最简单的形态——也正因如此，Herdr-MCP 不重复实现这些工具。
+
+### 远程工作站产品
+
+```text
+ChatGPT Web → Secure MCP Tunnel / HTTPS → 本地 runtime → workspace / process / tools
+```
+
+产品表面从工具扩展到安装、隧道管理、权限、后台工作、恢复和本地生命周期。AgenticGPT（Linux 远程 worker，带 managed Jobs 和可选 Hub）和 gpt-webcodex（打包的 Windows 产品）属于这一类。它们在故障域隔离和产品化上是很好的参考，但往往把所有操作都塞进 job/task 系统。
+
+### Codex-first 桥
+
+```text
+ChatGPT Web → MCP → Codex bridge → Codex CLI → repository
+```
+
+codex-from-chatgpt 和 codex-chatgpt-bridge 复用 Codex 自己的沙箱和 Agent 循环，代价是让 Codex 成为强制的执行跳板。反向的 codex-chatgpt-web 保留 Codex 作为用户界面、只把背后的模型换成 ChatGPT Web——当你已经把 Codex 当作入口时很有价值。
+
+### 双 Agent 协作
+
+```text
+ChatGPT planner/reviewer ↔ Codex executor
+```
+
+codex-with-chatgpt 把规划与执行明确分离：planner 走只读 MCP bridge，控制通道只传小状态。当显式双 Agent 循环正是目标时，它是个好模型。
+
+## Herdr 与 tmux、cmux、ACP
+
+这三者经常被提议为 Herdr 层的更简单替代。它们解决的问题不同。
 
 | 方案 | 主要抽象 | 最强项 | 对 herdr-mcp 的主要缺口 |
 | --- | --- | --- | --- |
-| tmux | session / window / pane / PTY | 极成熟、轻量、SSH 友好 | 不理解 Agent 语义、项目关系、事件与恢复策略 |
-| cmux | AI 增强桌面终端 / workspace | macOS UI、终端与浏览器组合、交互体验 | 更偏桌面产品，远程 Web 控制面与跨平台部署不是核心 |
-| ACP | client ↔ coding agent 协议 | session、prompt、permission、结构化 Agent 通信 | 不负责真实 workstation、长期 PTY、Git/进程现场和 browser continuity |
-| Herdr | 持久 workspace / pane / agent / event runtime | 长期开发现场、Agent 状态、人工接管、Socket API | 本身不负责公网 MCP/OAuth，也不直接提供 Web AI 的文件/Git 安全工具 |
+| tmux | session / window / pane / PTY | 成熟、轻量、SSH 友好 | 不理解 Agent 语义、项目关系、事件与恢复 |
+| cmux | AI 增强桌面终端 / workspace | macOS UI、本地交互体验 | 远程 Web 控制面与跨平台 runtime 不是核心 |
+| ACP | client ↔ coding agent 协议 | session、prompt、permission、事件 | 不负责 workstation、PTY、Git/进程状态和浏览器连续性 |
+| Herdr | 持久 workspace / pane / agent / event runtime | 长期现场、Agent 状态、人工接管、Socket API | 需要 herdr-mcp 提供公网 MCP/OAuth 与 Web 工具 |
 
-### tmux：优秀的最低层，但抽象太低
+- **tmux** 是优秀的最低层但抽象太低：长期 Web planner 还需要项目/workspace 身份、语义化 Agent 状态、增量事件、人工接管后的安全重观察，以及浏览器绑定。在 tmux 上重建这些会逐渐得到一个 Agent-aware runtime——Herdr 已经承担了这层。
+- **cmux** 是出色的本地 macOS 前端，但 herdr-mcp 针对的是“用户可能不在开发机前”，机器要数小时保持可达、可观察、可恢复。Runtime 身份和事件语义优先于桌面呈现。
+- **ACP** 是未来 client↔agent 通信的自然兼容层，但控制面仍然需要 workspace、repo/worktree、PTY、process、Git state、long exec、runtime generation 与 handoff。更清晰的边界是让 Herdr 管现场，未来通过可选 Agent adapter 使用 ACP。
 
-tmux 非常适合长期 shell 和远程 SSH。若需求只是创建 pane、发送按键、抓取输出，tmux 已经足够。
-
-但 Web AI 编排长期开发时还需要知道 pane 属于哪个项目和 workspace、里面是不是 Agent、Agent 当前 working/idle/blocked/done、哪些状态变化发生在上一个观察 cursor 之后，以及人接管之后如何重新观察。这些语义都可以在 tmux 上重新开发，但做完后会逐渐得到一个新的 Agent-aware runtime。Herdr 已经承担了这层职责。
-
-### cmux：更好的桌面体验，但不是远程事实源
-
-cmux 对本地 AI 编程体验很有吸引力：终端、workspace、通知、浏览器等界面组合得更紧密。对于主要坐在 Mac 前工作的用户，它可以比传统终端更顺手。
-
-herdr-mcp 的核心问题却发生在“人不一定坐在开发机前”的场景：
-
-```text
-Web Chat / 手机 / 平板
-        ↓
-稳定公网入口
-        ↓
-私有工作站
-        ↓
-数小时存在的开发现场
-```
-
-这里首先需要稳定 runtime identity、远程观察、事件和恢复；GUI 是第二层问题。cmux 可以作为优秀的人类前端，但不适合因此替换 Herdr 作为 herdr-mcp 的运行事实层。
-
-### ACP：适合 Agent 接入，不适合作为 workstation 控制面
-
-ACP 很适合统一不同 coding agent 的交互：客户端创建 session、发送 prompt、处理 permission、接收结构化事件。长期看，ACP 可能是很好的 Agent compatibility layer。
-
-但 herdr-mcp 还必须处理 workspace、repo/worktree、pane/PTY、process、Git state、long exec、runtime generation、browser conversation binding 与 handoff/wakeup。如果把 ACP 放到核心，就仍需另外建设 workstation runtime。更自然的边界是：Herdr 管现场；未来 Agent 若原生支持 ACP，可以由 Herdr 或 adapter 使用 ACP，而 herdr-mcp 公共控制面无需因此改写。
-
-## 为什么 Herdr 更匹配 Web planner 模型
-
-herdr-mcp 的设计原则是 **planner 留在 Web**。
+## 为什么 Web-planner 模型让工作保持轻量
 
 ```text
 Web AI
-  ├─ 理解需求
-  ├─ 讨论方案
   ├─ 直接读文件 / Git / 执行测试
-  ├─ 决定是否修改
+  ├─ 做确定性修改
   └─ 需要时委派本地 Agent
           ↓
        Herdr worker
 ```
 
-这样临时小任务不需要先启动本地 Agent；调研和讨论也不必人为转换成“Agent task”。复杂开发才使用并行 worker。
+临时小任务、调研和架构讨论保持轻量；复杂开发再组合多个本地 worker。若强制所有请求都经过另一个 Coding Agent，Web 模型会变成第二个 planner 的 UI，引入额外延迟和上下文转述。
 
-这使系统保持很宽的任务分布：
+## 完整闭环是差异点
 
-- **临时小任务**：查一个配置、改一行、跑一次测试；
-- **调研任务**：检查源码、运行实验、比较结果；
-- **讨论任务**：基于 live Git/runtime 事实讨论架构，不发生 mutation；
-- **复杂开发任务**：Web planner 自己做确定性部分，把独立调查、实现或审查交给多个本地 Agent。
-
-若强制所有任务都经过一个本地 Coding Agent，Web Chat 会变成给另一个 planner 发需求的 UI，增加上下文、延迟和语义转述。
-
-## herdr-mcp 与 coding-tools-mcp
-
-coding-tools-mcp 是优秀的确定性 Coding Tools Runtime。它把 file/search/patch、Git、PTY/exec 做成固定 MCP 工具，并强调 workspace confinement、permission mode、结果压缩和可复现 benchmark。
-
-最值得 herdr-mcp 学习的内容包括：稳定 public tool catalog、patch baseline 与原子 mutation、bounded output、上下文体积控制、deterministic dogfood benchmark、由服务端真正执行的安全边界。
-
-两者边界不同：coding-tools-mcp 可以独立给任何 MCP 客户端“安全的编程双手”；herdr-mcp 除了这些双手，还要知道长期 Herdr 现场，并维持公网 Edge、workstation routing、runtime A/B 与浏览器反向连续性。
-
-如果 herdr-mcp 只做 file/git/exec，那么 coding-tools-mcp 会是更简单的选择。Herdr 和 continuity 才构成额外价值。
-
-## herdr-mcp 与 AgenticGPT
-
-AgenticGPT 已覆盖很多远程 Worker 能力：Secure MCP Tunnel、可选集中 Hub、managed jobs、命令策略、path policy、confirmation、downstream MCP、tmux workspace 等。
-
-它证明了“本机 Worker + Tunnel/Hub + Job”是一条有效路线，也提醒 herdr-mcp 不要重复建设通用 job platform。
-
-herdr-mcp 的差异在于：Herdr workspace 是长期开发现场；Web planner 可以直接操作确定性工具，也可以自由选择是否派 Agent；公网 Connector 与本机 runtime generation 解耦；浏览器扩展提供 workstation → Web 的反向 continuity；重点是持续开发会话，而不是把所有执行都封装成 Job。
-
-## herdr-mcp 与 gpt-webcodex
-
-gpt-webcodex 把 Coding Tools MCP 包装成 Windows 一体化桌面产品，并加入 worktree 隔离、长任务、heartbeat、任务恢复、系统通知、Runtime/Schema identity 等能力。
-
-它最值得吸收的是产品体验：安装后直接可用、Runtime 生命周期明确、长任务可恢复、worktree 降低主 checkout 污染风险、完成和失败有桌面通知。
-
-它的默认路径更接近“一个 Windows 桌面 Coding Agent 管一个任务”。herdr-mcp 需要保持更通用：一台工作站可以同时有多个项目、多个 pane、普通 shell、开发服务器和任意 Agent，Web Chat 也可以只做讨论或调研而不创建正式任务。
-
-因此 herdr-mcp 应吸收生命周期和证据设计，而不把所有交互都强制升级成 Task Center。
-
-## 完整闭环为什么重要
-
-Herdr 与 herdr-mcp 组合后的关键能力不是某一个 tool，而是两个方向的链路同时存在。
-
-### 下行控制
+大多数 Coding MCP server 只解决下行方向：
 
 ```text
-Web AI
-  ↓ MCP + OAuth
-Cloudflare Edge
-  ↓ authenticated routing
-herdr-link
-  ↓
-Rust herdr-mcp runtime
-  ↓
-files / Git / exec / Herdr Socket API
+Web AI → MCP/OAuth → Edge → outbound link → herdr-mcp → files / Git / exec / Herdr Socket API
 ```
 
-### 上行连续性
+这对短任务够用。但当工作持续数小时、用户离开屏幕时，你需要返回路径：
 
 ```text
-Herdr events
-   ↓
-herdr-mcp runtime
-   ↓ local IPC / Native Messaging
-browser extension
-   ↓
-当前网页会话
+Herdr events → herdr-mcp → 本地 IPC / Native Messaging → browser extension → Web conversation
 ```
 
-很多 MCP 工具只解决第一条链。对于十分钟任务已经够用；对于持续几个小时、人在中途离开的任务，第二条链决定了系统是否真正闭环。
+浏览器扩展在首次安装时可选，但它对无人值守长任务、页面恢复和跨会话接力是闭环所需的第二条通道。没有它，标准 MCP 无法在本地 Agent 完成后让已经静止的 Web 会话自动开启新的一轮。
 
-## 为什么不把任务管理做得更重
+## 该吸收、复用和避免什么
 
-研究 DSH、Luvus 等系统后，很容易产生“再加 Team、Task DAG、Lease、Mailbox、Workflow”的冲动。Herdr-MCP 当前刻意不这么做。
+生态里可长期迁移的经验包括：
 
-Web Chat 本身就是强 planner。herdr-mcp 更适合提供事实和轻量工作上下文，例如 `work_id`、scope、acceptance criteria、evidence、operation state。这些信息帮助恢复、观察和验收；它们不应该要求用户先创建 project/task/worker 才能执行一次简单操作。
+- **身份与恢复优先。** 把传输会话与 continuity/work identity 分离；task、edit、operation、artifact、runtime generation、browser page epoch、handoff checkpoint 都用服务端生成的稳定 ID；绝不从日志猜 ID。
+- **语义化健康，而不是绿色 `/healthz`。** READY 至少需要协议握手、generation/schema 一致、真实 request/response probe，以及需要浏览器控制时页面语义可用。
+- **Browser Lease / Page Epoch。** 每个受控 tab/conversation 应有显式 lease；navigation、reload、discard、extension reload、handoff 或 generation change 都应撤销旧 lease 并取消 observer、timer、listener 和 pending 操作。
+- **控制面/数据面分离。** handoff 和 wake 消息只传状态、identity 和 evidence 引用；文件、diff、日志、测试结果按需读取。
+- **Artifact 一等化。** 构建报告、截图、测试报告、附件和大日志应带 id、hash、size、media type、source 和有界读取，而不是反复塞进模型上下文。
+- **独立故障域。** 中心服务只路由和协调；每台 workstation 在中心故障时仍独立可用；heartbeat、activity 和 analytics 保持有界。
 
-> 任务语义可以帮助复杂工作，但不能成为所有工作的门槛。
+Herdr-MCP 复用 Herdr 处理 workspace/pane/PTY、Agent 生命周期与状态、event stream、worktree、原生高级操作和人工 attach/focus/inspect。主线之外不做的包括：第二套 Agent runtime、第二个 terminal multiplexer、完整 Team/Task DAG/Lease 系统、强制 ACP 内部化、绑定单一 Coding Agent 品牌，以及通用浏览器自动化框架。Task 语义（轻量 `work_id`、scope、acceptance criteria、evidence）可辅助复杂工作，但不应成为一次临时读取或命令的门槛。
 
-这也使 Herdr-MCP 对 Agent 品牌保持中立。Claude、Codex、Pi、OpenCode、Grok、Droid 或以后出现的工具都只是 worker；没有它们时，Web AI 仍能依靠 files/Git/exec 完成大量工作。
-
-## 哪些能力应该继续吸收
-
-### 应该吸收
-
-- coding-tools-mcp 的安全边界、bounded result、benchmark 方法；
-- gpt-webcodex 的 Runtime identity、长任务恢复和产品安装体验；
-- AgenticGPT 的 bounded jobs、confirmation 与 recovery 思路；
-- Luvus 的任务 scope/evidence 概念，但保持为轻量 metadata；
-- ACP 的 capability negotiation 思想，用于未来可选 Agent compatibility。
-
-### 应该复用 Herdr
-
-- workspace / pane / PTY；
-- Agent lifecycle 与 Agent status；
-- event stream；
-- worktree 和原生高级动作；
-- 人工 attach / focus / terminal inspection。
-
-### 暂时不做
-
-- 第二套 Agent runtime；
-- 第二套 terminal multiplexer；
-- 自建完整 Team/Task DAG/Lease 系统；
-- 强制 ACP 成为内部控制协议；
-- 绑定某一种 Coding Agent；
-- 通用浏览器自动化框架。
-
-## 当前推荐架构
+## 推荐架构
 
 ```text
                     Web AI
@@ -203,23 +143,36 @@ Web Chat 本身就是强 planner。herdr-mcp 更适合提供事实和轻量工�
                         Browser continuity
 ```
 
-职责保持单一：Web AI 是 planner；herdr-mcp 是安全远程控制面和连续性层；Herdr 是持久运行事实源；本地 Agent 是可替换 worker；浏览器扩展负责把本机事件重新接回网页，不承担推理。
+职责保持单一：Web AI 是 planner；herdr-mcp 是安全远程控制面和连续性层；Herdr 是持久运行事实源；本地 Agent 是可替换 worker；浏览器扩展是返回通道而非推理系统。传输层（Secure MCP Tunnel、Cloudflare Edge 或其它）保持可替换，不拥有 canonical workstation state。
 
-## 什么时候应该选择别的方案
+## 什么时候选择其它方案
 
-Herdr + herdr-mcp 并非所有场景都最优。
+- 只需要本地终端复用 → 直接用 tmux；
+- 追求 Mac 桌面终端体验 → 优先 cmux；
+- 需要 client↔coding-agent 互通 → 优先 ACP；
+- 只需要独立的 file/Git/exec MCP → coding-tools-mcp 更简单；
+- 需要 Linux 远程 Worker/Hub → 评估 AgenticGPT；
+- 需要 Windows 开箱即用的 ChatGPT 桌面产品 → gpt-webcodex；
+- 已经喜欢 Codex 界面、只换 Web 模型推理 → 看 codex-chatgpt-web。
 
-- 只需要本地终端复用：直接 tmux；
-- 主要追求 Mac 桌面终端体验：优先 cmux；
-- 只需要统一 editor 与 coding agent：优先 ACP；
-- 只需要给一个 MCP 客户端安全 file/git/exec：coding-tools-mcp 更简单；
-- 只需要 Linux 远程 Worker/Hub：AgenticGPT 值得优先评估；
-- Windows 用户希望开箱即用的 ChatGPT Coding 桌面助手：gpt-webcodex 的产品形态更贴近。
+Herdr + herdr-mcp 最适合的场景是：**继续使用最强 Web 模型作为主要思考者，同时让它长期、可靠、可观察地操作真实本机开发现场，并且人可以随时离开、回来和接管。**
 
-Herdr + herdr-mcp 最适合的场景是：**希望继续使用最强 Web 模型作为主要思考者，同时让它长期、可靠、可观察地操作真实本机开发现场，并且人可以随时离开、回来和接管。**
+## 参考项目
 
-## 对 Roadmap 的约束
+本轮重点核查的项目：
 
-后续架构升级优先：Rust 单二进制和跨平台产品化；mutation identity、delivery phase、idempotency 和 recovery；browser continuity 的可靠状态机；work context 与 evidence；安装、升级、回滚、doctor 和可观测性。
+- https://github.com/xyTom/coding-tools-mcp
+- https://github.com/opentokenz/mcpx
+- https://github.com/cooky-dance/devspace-local-artifacts
+- https://github.com/slhaf/AgenticGPT
+- https://github.com/3169657175/gpt-webcodex
+- https://github.com/miuuyy/codex-chatgpt-web
+- https://github.com/XiaoDuoYa/codex-with-chatgpt
+- https://github.com/dxawdc/chatgpt-workspace-mcp
+- https://github.com/alexcodeplace/chatgpt-mcp
+- https://github.com/posavr/chatgpt-local-coder
+- https://github.com/joseanu/codex-from-chatgpt
+- https://github.com/Dalomeve/codex-chatgpt-bridge
+- https://github.com/openai/tunnel-client
 
-每增加一个新能力，都继续问：它是否让 Web AI 更可靠地控制真实开发现场？如果只是复制 Herdr、Agent runtime 或其它项目已有的能力，就优先复用而不是扩张 public surface。
+这些项目演化很快，具体实现细节请对照各自最新发行版。涉及 ChatGPT plan、Developer Mode、Secure MCP Tunnel 等平台可用性时，以 OpenAI 当前官方文档和工作区 policy 为准。

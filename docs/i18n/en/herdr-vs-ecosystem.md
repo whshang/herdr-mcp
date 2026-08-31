@@ -1,39 +1,86 @@
-# Why Herdr + herdr-mcp: tmux, cmux, ACP and coding MCP alternatives
+# Why Herdr + herdr-mcp: the architecture and the ecosystem alternatives
 
-This document records a long-term architecture decision: when a Web AI needs real control over a local development machine, why does herdr-mcp keep Herdr as the persistent runtime instead of replacing it with tmux, cmux, ACP, or copying the product shape of coding-tools-mcp, AgenticGPT, or gpt-webcodex?
+A Web AI that wants real control over a local development machine has many shapes to choose from. This article explains where Herdr + herdr-mcp sits in that ecosystem, why this architecture exists, and when another tool is genuinely a better fit. It is a boundary decision, not a feature-count contest.
 
-**Herdr + herdr-mcp currently best fits the model where the Web AI remains the planner and the workstation remains a persistent, observable, human-takeover-friendly development environment.** Other projects are stronger in narrower layers; this is a boundary decision, not a feature-count contest.
+The short answer: **Herdr + herdr-mcp is most useful when the Web AI stays the planner and the workstation stays a persistent, observable, human-takeover-friendly development environment.** The Web model performs deterministic small work directly, delegates larger work to replaceable local agents, and keeps the worksite alive across conversations so the user can leave, return, and take over at any time.
 
-## Evaluation criteria
+## What is being compared
 
-The control plane needs six properties together: direct access to files/Git/shell/runtime facts; workspaces, PTYs, agents and processes that survive for hours; a return path from workstation events to the Web conversation; mutation semantics that distinguish uncertain delivery from safe retry; human visibility and takeover; and agent neutrality so Claude, Codex, Pi, OpenCode, Grok, Droid and future CLIs remain optional workers.
+Projects that let ChatGPT or Codex operate a local development environment differ on three decisive axes:
 
-## Herdr, tmux, cmux and ACP live at different layers
+1. **Where the task starts** — ChatGPT Web, Codex CLI, a desktop app, or any MCP client.
+2. **Who owns planning** — the Web model calls deterministic tools directly, or it delegates to a local coding agent.
+3. **What durable state exists locally** — a single MCP request, or persistent sessions, tasks, PTYs, agents, browser conversations, and recovery evidence.
+
+Because these combinations matter more than any one tool, most projects fall into a few architecture families rather than a long tail of unrelated features.
+
+| Family | Representative projects | Primary entry | Planning/execution | Best fit |
+| --- | --- | --- | --- | --- |
+| General coding MCP runtime | coding-tools-mcp, MCPX, DevSpace Local Artifacts | Any MCP client / model | Client model calls deterministic tools | Add safe local coding tools to an existing AI client |
+| ChatGPT → workstation | AgenticGPT, gpt-webcodex, chatgpt-workspace-mcp, chatgpt-local-coder | ChatGPT Web | Web planner → local runtime/worker | Operate one dev machine from Web/mobile |
+| ChatGPT → coding agent | codex-from-chatgpt, codex-chatgpt-bridge | ChatGPT Web | Web → Codex → local repository | Make a dedicated CLI the coding executor |
+| Codex → ChatGPT Web | codex-chatgpt-web | Codex CLI | Codex-driven loop using Web inference | Keep the Codex harness while using Web models |
+| Dual-agent collaboration | codex-with-chatgpt | ChatGPT + Codex | Web planner/reviewer ↔ Codex executor | Explicit plan–execute–review workflow |
+| Persistent worksite control plane | Herdr + herdr-mcp | ChatGPT / any MCP client | Web planner → deterministic tools or replaceable agents | Long-lived workstation + browser continuity |
+
+## The architecture families
+
+### A coding MCP runtime: the model drives tools directly
+
+```text
+ChatGPT / Claude / Grok / Cursor
+              │ MCP
+              ▼
+      coding-tools-mcp / MCPX
+              │
+       files / Git / exec
+```
+
+The runtime is model-neutral. The client model decides what to inspect, modify, and execute. coding-tools-mcp emphasizes a stable, server-enforced file/search/patch, Git, and PTY/exec surface with workspace confinement and bounded results; MCPX shows how durable remote sessions give that surface recovery semantics. This is the simplest shape when the whole problem is safe local file/Git/exec access — and it is exactly why Herdr-MCP does not re-implement those tools.
+
+### A remote workstation product
+
+```text
+ChatGPT Web → Secure MCP Tunnel / HTTPS → local runtime → workspace / process / tools
+```
+
+The product surface expands from tools to installation, tunnel management, permissions, background work, recovery, and local lifecycle management. AgenticGPT (a Linux remote worker with managed jobs and an optional Hub) and gpt-webcodex (a packaged Windows product) live here. Both are strong references for fault-domain isolation and productization, but they tend to put every operation through a job/task system.
+
+### A Codex-first bridge
+
+```text
+ChatGPT Web → MCP → Codex bridge → Codex CLI → repository
+```
+
+codex-from-chatgpt and codex-chatgpt-bridge reuse Codex's own sandboxing and agent loop, at the cost of making Codex a mandatory execution hop. In the reverse direction, codex-chatgpt-web keeps Codex as the user interface while swapping the model behind it for ChatGPT Web, which is valuable if Codex is already your entry point.
+
+### Dual-agent collaboration
+
+```text
+ChatGPT planner/reviewer ↔ Codex executor
+```
+
+codex-with-chatgpt splits planning and execution deliberately, with a read-only MCP bridge for the planner and a small control channel carrying state. It is a good model when an explicit two-agent loop is the goal.
+
+## Herdr vs. tmux, cmux, and ACP
+
+These three are often proposed as simpler replacements for the Herdr layer. They solve different problems.
 
 | Option | Primary abstraction | Strength | Main gap for herdr-mcp |
 | --- | --- | --- | --- |
 | tmux | session / window / pane / PTY | mature, lightweight, SSH-friendly | no agent/project semantics or recovery model |
 | cmux | AI-oriented desktop terminal/workspace | strong macOS UX and local interaction | remote Web control and cross-platform runtime are not its core |
-| ACP | client ↔ coding-agent protocol | structured session, prompt, permission and events | does not own workstation, PTY, Git/process state or browser continuity |
-| Herdr | persistent workspace / pane / agent / event runtime | long-lived state, agent status, human takeover, Socket API | needs herdr-mcp for public MCP/OAuth and Web-facing coding tools |
+| ACP | client ↔ coding-agent protocol | structured session, prompt, permission, events | does not own workstation, PTY, Git/process state, or browser continuity |
+| Herdr | persistent workspace / pane / agent / event runtime | long-lived state, agent status, human takeover, Socket API | needs herdr-mcp for public MCP/OAuth and Web-facing tools |
 
-### tmux is an excellent substrate, but too low-level
+- **tmux** is an excellent substrate but too low-level: a long-running Web planner also needs project/workspace identity, semantic agent state, incremental events, safe re-observation after human takeover, and browser binding. Rebuilding those on tmux gradually becomes an agent-aware runtime — which Herdr already owns.
+- **cmux** is a strong local macOS frontend, but herdr-mcp targets the case where the user may be on another device and the development machine must stay reachable, observable, and recoverable for hours. Runtime identity and event semantics come before desktop presentation.
+- **ACP** is a natural future compatibility layer for client↔agent communication, but the control plane still needs workspace, repository/worktree, PTY, process, Git state, long exec, runtime generations, and handoff. A cleaner boundary lets Herdr own the environment and use ACP behind an optional agent adapter.
 
-tmux already solves durable terminals. A long-running Web planner additionally needs project/workspace identity, semantic agent state, incremental events, safe re-observation after human takeover, and browser-to-workspace binding. Those can be rebuilt on tmux, but the result gradually becomes an agent-aware runtime. Herdr already owns that layer.
-
-### cmux is a strong human frontend, not the remote source of truth
-
-cmux can provide a better local desktop experience by combining terminal, workspace, notifications and browser-oriented workflows. herdr-mcp primarily targets the case where the user may be on another device and the development machine must stay reachable, observable and recoverable for hours. Runtime identity and event semantics come before desktop presentation.
-
-### ACP is useful for agent compatibility, not workstation control
-
-ACP standardizes communication between a client and a coding agent. It is a natural future compatibility layer. The herdr-mcp control plane still needs workspace, repository/worktree, PTY, process, Git state, long exec, runtime generation, browser binding and handoff. Making ACP the core would still require a workstation runtime beside it. A cleaner boundary is to let Herdr own the environment and optionally use ACP behind an agent adapter later.
-
-## Why Herdr fits a Web-planner architecture
+## Why the Web-planner model keeps work lightweight
 
 ```text
 Web AI
-  ├─ understand and discuss
   ├─ read files / inspect Git / run tests directly
   ├─ make deterministic changes
   └─ delegate only when another reasoning worker helps
@@ -41,57 +88,36 @@ Web AI
        Herdr worker
 ```
 
-Small edits, research and architecture discussions stay lightweight. Complex development can compose multiple local workers. Forcing every request through another coding agent would turn the Web model into a UI for a second planner and add latency and context translation.
-
-## herdr-mcp vs coding-tools-mcp
-
-coding-tools-mcp is a strong deterministic coding-tools runtime: file/search/patch, Git and PTY/exec exposed through a stable MCP catalog with workspace confinement, permission modes, bounded results and reproducible benchmarking.
-
-herdr-mcp should adopt patterns such as stable schemas, baseline-aware patching, bounded output, server-enforced security and deterministic dogfood metrics. Its extra responsibility is the persistent Herdr environment, stable public Edge, workstation routing, runtime generations and browser continuity. If file/Git/exec were the whole problem, coding-tools-mcp would be the simpler shape.
-
-## herdr-mcp vs AgenticGPT
-
-AgenticGPT demonstrates a capable remote-worker model with Secure MCP Tunnel, optional Hub, managed jobs, path/command policy, confirmation, downstream MCP and tmux workspaces. It is a useful reference for bounded jobs and recovery.
-
-herdr-mcp treats the Herdr workspace as a long-lived development site, lets the Web planner choose direct deterministic tools or optional agents, decouples the public Connector from local runtime generations, and maintains a browser return channel. Its center of gravity is continuous development rather than putting every operation into a Job system.
-
-## herdr-mcp vs gpt-webcodex
-
-gpt-webcodex packages Coding Tools MCP into a Windows desktop product with worktree isolation, background tasks, heartbeat, recovery, notifications and runtime/schema identity. Its strongest lessons are product experience and lifecycle clarity.
-
-herdr-mcp should absorb those ideas without requiring every interaction to become a managed task. A workstation may contain multiple projects, shells, development servers and arbitrary agents, while a Web conversation may only be doing research or discussion.
+Small edits, research, and architecture discussions stay lightweight; complex development can compose multiple local workers. Forcing every request through another coding agent would turn the Web model into a UI for a second planner and add latency and context translation.
 
 ## The closed loop is the differentiator
 
-Downstream control:
+Most coding MCP servers solve only the downstream direction:
 
 ```text
-Web AI → MCP/OAuth → Edge → outbound link → Rust herdr-mcp
-       → files / Git / exec / Herdr Socket API
+Web AI → MCP/OAuth → Edge → outbound link → herdr-mcp → files / Git / exec / Herdr Socket API
 ```
 
-Upstream continuity:
+That is enough for short tasks. When work runs for hours while the user leaves the screen, you need the return path:
 
 ```text
-Herdr events → herdr-mcp → local IPC / Native Messaging
-             → browser extension → Web conversation
+Herdr events → herdr-mcp → local IPC / Native Messaging → browser extension → Web conversation
 ```
 
-Many coding MCP servers solve only the first direction. That is enough for short tasks. When work runs for hours while the user leaves the screen, the return path closes the loop.
+The browser extension is optional for first setup, but it is the missing second channel for unattended long tasks, page recovery, and cross-conversation handoff. Without it, standard MCP cannot cause an already-settled Web conversation to start a new turn when a local agent finishes.
 
-## Why task management stays intentionally light
+## What to absorb, reuse, and avoid
 
-DSH, Luvus and similar systems show useful Team, DAG, lease, mailbox and orchestration ideas. herdr-mcp should not turn them into mandatory workflow machinery. Lightweight metadata such as `work_id`, scope, acceptance criteria, operation state and evidence can improve recovery and observability without requiring a formal task before a one-off read or command.
+Across the ecosystem the durable transferable lessons are:
 
-Task semantics may assist complex work, but must not become the entry fee for simple work. This also keeps local agents replaceable workers rather than product dependencies.
+- **Identity and recovery first.** Separate transport sessions from continuity/work identity; use server-generated ids for tasks, edits, operations, artifacts, runtime generations, browser page epochs, and handoff checkpoints. Never reconstruct identity from logs.
+- **Semantic health, not green `/healthz`.** READY should require a protocol handshake, generation/schema agreement, a real request/response probe, and browser-surface liveness when browser control is required.
+- **Browser Lease / Page Epoch.** Every controlled tab/conversation should have an explicit lease that navigation, reload, discard, extension reload, handoff, or generation change revokes, cancelling observers, timers, and pending work.
+- **Control-plane / data-plane separation.** Handoff and wake messages carry state, identity, and evidence references; files, diffs, logs, and test output are fetched on demand.
+- **First-class artifacts.** Build reports, screenshots, test reports, attachments, and large logs carry ids, hashes, sizes, media types, sources, and bounded reads instead of being serialized into model context.
+- **Independent fault domains.** Central services route and coordinate; each workstation stays useful during central disruption. Heartbeat, recent activity, and analytics remain bounded.
 
-## What to absorb, reuse and avoid
-
-Absorb security, bounded results and benchmark methods from coding-tools-mcp; runtime identity and recovery UX from gpt-webcodex; bounded-job and confirmation ideas from AgenticGPT; lightweight scope/evidence ideas from richer orchestrators; and capability-negotiation ideas from ACP for optional compatibility.
-
-Reuse Herdr for workspace/pane/PTY, agent lifecycle and semantic status, event streams, worktrees, advanced native operations, and human attach/focus/inspection.
-
-Keep out of the main line for now: a second agent runtime, another terminal multiplexer, a full Team/Task DAG/Lease implementation, mandatory ACP internally, dependency on one coding-agent brand, and a general browser-automation framework.
+Herdr-MCP reuses Herdr for workspace/pane/PTY, agent lifecycle and status, event streams, worktrees, advanced native operations, and human attach/focus/inspection. It keeps out of the main line: a second agent runtime, another terminal multiplexer, a full Team/Task DAG/Lease system, mandatory ACP internally, dependence on one coding-agent brand, and a general browser-automation framework. Task semantics (lightweight `work_id`, scope, acceptance criteria, evidence) can assist complex work but must not become the entry fee for a one-off read or command.
 
 ## Recommended architecture
 
@@ -117,16 +143,36 @@ Keep out of the main line for now: a second agent runtime, another terminal mult
                         Browser continuity
 ```
 
-Responsibilities stay narrow: Web AI is the planner; herdr-mcp is the secure remote-control and continuity layer; Herdr is the persistent source of runtime truth; local agents are replaceable workers; the browser extension is a return channel, not a reasoning system.
+Responsibilities stay narrow: Web AI is the planner; herdr-mcp is the secure remote-control and continuity layer; Herdr is the persistent source of runtime truth; local agents are replaceable workers; the browser extension is a return channel, not a reasoning system. Transport (Secure MCP Tunnel, Cloudflare Edge, or another) stays replaceable and never owns canonical workstation state.
 
 ## When another option is better
 
-Use tmux when terminal multiplexing is all that is needed. Prefer cmux for a local macOS desktop-terminal experience. Prefer ACP for client-to-coding-agent interoperability. coding-tools-mcp is simpler for standalone safe file/Git/exec MCP. AgenticGPT is compelling for a Linux remote-worker/Hub deployment. gpt-webcodex is closer to an out-of-box Windows ChatGPT coding desktop product.
+- Need only local terminal multiplexing → use tmux.
+- Want a polished macOS desktop-terminal experience → prefer cmux.
+- Need client↔coding-agent interoperability → prefer ACP.
+- Want standalone safe file/Git/exec MCP → coding-tools-mcp is simpler.
+- Want a Linux remote-worker/Hub deployment → evaluate AgenticGPT.
+- Want a packaged Windows ChatGPT coding desktop product → gpt-webcodex.
+- Prefer Codex as the interface while using Web-model inference → look at codex-chatgpt-web.
 
-Herdr + herdr-mcp is strongest when the goal is to **keep a strong Web model as the primary thinker while giving it durable, reliable and observable control over a real development workstation, with the user free to leave, return and take over at any time.**
+Herdr + herdr-mcp is strongest when the goal is to **keep a strong Web model as the primary thinker while giving it durable, reliable, and observable control over a real development workstation, with the user free to leave, return, and take over at any time.**
 
-## Roadmap constraint
+## References
 
-Future work should prioritize Rust single-binary and cross-platform productization; mutation identity, delivery phase, idempotency and recovery; a reliable browser-continuity state machine; work context and evidence; and installation/update/rollback/doctor/observability.
+Primary projects reviewed for this comparison:
 
-Every new capability should still answer one question: does it make Web AI more reliable at controlling the real development environment? If it mainly duplicates Herdr, another agent runtime or an existing product, reuse that layer instead of growing the public surface.
+- https://github.com/xyTom/coding-tools-mcp
+- https://github.com/opentokenz/mcpx
+- https://github.com/cooky-dance/devspace-local-artifacts
+- https://github.com/slhaf/AgenticGPT
+- https://github.com/3169657175/gpt-webcodex
+- https://github.com/miuuyy/codex-chatgpt-web
+- https://github.com/XiaoDuoYa/codex-with-chatgpt
+- https://github.com/dxawdc/chatgpt-workspace-mcp
+- https://github.com/alexcodeplace/chatgpt-mcp
+- https://github.com/posavr/chatgpt-local-coder
+- https://github.com/joseanu/codex-from-chatgpt
+- https://github.com/Dalomeve/codex-chatgpt-bridge
+- https://github.com/openai/tunnel-client
+
+These projects evolve quickly; verify implementation details against their current releases. For ChatGPT plan availability, Developer Mode, and Secure MCP Tunnel behavior, check current OpenAI documentation and workspace policy.

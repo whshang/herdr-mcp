@@ -1,6 +1,10 @@
 # Design Philosophy: Connect the strongest reasoning with the real development machine
 
+> **Role:** [Overview](overview.md) explains what herdr-mcp is and [Architecture](architecture.md) explains how the system works. This chapter answers only **why these design principles were chosen**.
+
 Many AI coding products start by building another Coding Agent. herdr-mcp starts from a different observation: Web models are already strong at reasoning, while local development environments are already strong at execution. The missing piece is a reliable, observable connection between them.
+
+This chapter intentionally does not repeat installation steps, component topology, or the ecosystem comparison. It records the principles that future design decisions should preserve.
 
 ## Web AI and local coding agents have different strengths
 

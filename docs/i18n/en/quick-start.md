@@ -1,294 +1,79 @@
-# Quick start: experience the first real remote development loop
+# Quick start: prove the first real task after installation
 
-> **Role:** this page is what to do **after** installation to prove the first useful remote task. It is not another installation tutorial.
-> - Give a Coding Agent the authoritative install protocol: [Agent install](agent-install.md).
-> - Install manually: [Installation](install.md).
->
-> For the architecture, read [Overview](overview.md) and [Architecture](architecture.md).
+> **Role:** this page starts after herdr-mcp is installed and connected. For the executable install contract, use [Agent install](agent-install.md). For manual installation and operations, use [Installation](install.md).
 
-This page is the shortest path from “I have Herdr locally” to “ChatGPT can inspect my workstation and keep working after the current browser turn ends.”
+Do not redeploy Edge, reinstall the runtime, or add the browser extension just to follow this page. The goal is simpler: prove that Web AI actually reaches your workstation and can complete one verifiable task in a real repository.
 
-The product model is deliberately simple:
+## 1. Start with a read-only check
 
-> **MCP gives Web AI hands. Herdr gives those hands a persistent workplace. The browser extension is the optional return path that closes the loop.**
-
-You do not need the extension to read or modify files, use Git, run commands, inspect workspaces, or delegate to local agents. Install it when you want local completion events, browser recovery, or long-conversation handoff to reconnect work to the Web conversation.
-
-## What you are building
-
-```text
-ChatGPT / Web AI
-  ↓ MCP + OAuth
-Cloudflare Edge
-  ↓ authenticated workstation routing
-herdr-link
-  ↓
-local herdr-mcp
-  ↓
-Herdr + Git + shell + agents
-```
-
-Optionally, the browser extension adds both a return path and a local Side Panel:
-
-```text
-Herdr progress / settled
-  ↓
-browser extension → current Web conversation
-        ↘ Browser Control Center
-```
-
-The extension also adds ChatGPT Queue, which saves the next user instruction without interrupting a live reply.
-
-## Prerequisites
-
-You need:
-
-- a working Herdr installation;
-- the native `herdr-mcp` binary from [GitHub Releases](https://github.com/whshang/herdr-mcp/releases);
-- a Cloudflare account if ChatGPT will connect over the Internet.
-
-A custom domain is not required. Start with `workers.dev`.
-
-Node.js is **not** required to run the local MCP runtime. You may still need Node when deploying Edge with Wrangler.
-
-## 1. Install the local runtime
-
-Download the current release binary for your platform, place `herdr-mcp` on your `PATH`, then verify:
-
-```bash
-herdr-mcp doctor
-herdr-mcp status
-```
-
-Check that something is listening:
-
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
-```
-
-`200` or `401` proves the local HTTP process is alive. Prefer top-level `doctor` / `status` / `update ...` commands; do not use `herdr-mcp service install` as the normal install path.
-
-### Source developers only: dogfood the current checkout
-
-Ordinary users should stay on PROD release artifacts. If you are developing herdr-mcp itself on v0.4.3+, use the explicit DEV plane instead of replacing `runtime/current` by hand:
-
-```bash
-herdr-mcp dev status
-herdr-mcp dev sync --dry-run
-herdr-mcp dev sync
-```
-
-`dev sync` builds the current clean checkout as `0.4.3-dev`, records source provenance, pins the pre-existing PROD binary/checksum, and activates the DEV binary through the same transactional runtime lifecycle. Server, Native Host and the production workstation Link must converge on the same generation before the switch is accepted. Dirty source is refused unless `--allow-dirty` is explicit.
-
-Return to the fixed PROD recovery source with:
-
-```bash
-herdr-mcp dev rollback
-```
-
-This runtime DEV/PROD plane is independent from extension DEV/STANDALONE/STORE channels. A DEV runtime switch does not deploy Edge, change DNS/OAuth, or create a third persistent test environment.
-
-## 2. Verify Herdr before adding the Internet
-
-Do not debug Cloudflare while the local runtime cannot see Herdr.
-
-Check:
-
-```bash
-herdr --version
-herdr api schema >/dev/null
-```
-
-The first real MCP-side check should ultimately be `herdr_inspect`: it should show actual workspaces, panes and managed Git roots from your machine.
-
-## 3. Deploy the public Edge
-
-Copy the local Wrangler template:
-
-```bash
-cp edge/cloudflare/wrangler.user.example.toml edge/cloudflare/wrangler.user.toml
-```
-
-Generate a DNS-safe Worker name:
-
-```bash
-node scripts/cloudflare-worker-name.mjs "$(hostname)"
-```
-
-Configure the Worker name, workstation identity and OAuth issuer, then deploy:
-
-```bash
-cd edge/cloudflare
-node provision-r2.mjs --config wrangler.user.toml
-npx wrangler deploy --config wrangler.user.toml
-```
-
-The public origin looks like:
-
-```text
-https://<worker>.<account-subdomain>.workers.dev
-```
-
-MCP URL:
-
-```text
-https://<worker>.<account-subdomain>.workers.dev/mcp
-```
-
-Keep the origin stable after ChatGPT is connected.
-
-## 4. Start the workstation link
-
-The workstation connects **outward** to Edge over authenticated WSS. You do not expose port 8772 publicly.
-
-Use the repository `herdr-link` installation/status flow for your local environment, then verify Edge can see the workstation online.
-
-If OAuth works but tools report `workstation offline`, this is the layer to investigate. On v0.4.3+, a recently connected workstation gets a short Edge reconnect grace before the error is surfaced; persistent Link loss is then handled by the local reconnect/recycle path. See [Troubleshooting](troubleshooting.md) for the retry and mutation-safety rules.
-
-## 5. Add the ChatGPT Connector
-
-In ChatGPT Web:
-
-1. enable the available Developer/custom MCP capability for your Workspace;
-2. create a custom MCP App/Connector;
-3. use `https://<edge-origin>/mcp`;
-4. complete OAuth in the browser;
-5. open a **new conversation** for validation.
-
-Do not paste `HERDR_MCP_TOKEN` or a Cloudflare API token into ChatGPT.
-
-The current production public contract is **epoch 2 / 18 tools**, including `herdr_skill`.
-
-## 6. Run the first read-only task
-
-Use a prompt such as:
+Open a new ChatGPT conversation and ask:
 
 ```text
 Inspect the current Herdr workspaces and Git status. Read only; do not modify anything.
 ```
 
-A healthy first loop looks like:
+A healthy path looks like:
 
 ```text
 herdr_inspect
   ↓
-herdr_skill
-  ↓
-select a managed Git root
+select a real managed Git root
   ↓
 herdr_git status
   ↓
-herdr_fs_read / grep
+herdr_fs_read / herdr_fs_grep
   ↓
-answer
+answer from workstation facts
 ```
 
-This proves more than a green “connected” badge: it proves the public path reaches the real workstation.
+This proves more than a green Connector badge: the public MCP path, workstation Link, runtime, and Herdr workplace are actually connected.
 
-## 7. Try one deterministic edit
+If this step reports `workstation_offline`, zero tools, an OAuth loop, or a managed-root denial, stop before testing mutations and use [Troubleshooting](troubleshooting.md) to locate the failing layer.
 
-After the read-only path is correct, choose a disposable or safe file and ask ChatGPT for a small change plus a verification command.
+## 2. Make one deterministic change
 
-The desired behavior is:
+Choose a safe, easy-to-verify change such as a documentation correction, a test fixture, or a narrowly scoped configuration edit. Ask the Web planner to:
 
 ```text
-inspect Git
-  ↓
-read target file
-  ↓
-edit/patch
-  ↓
-run test
-  ↓
-show diff
+Check Git first, read the target file, make this one small change, run the most relevant verification, and finish with the diff and result. Do not delegate to a local agent.
 ```
 
-The Web model should not start a local coding agent merely to edit one known line.
-
-## 8. Try one delegated task
-
-Now choose a task that actually benefits from independent reasoning, for example:
+The desired loop is:
 
 ```text
-Investigate why this test is failing and implement the narrowest fix. Keep unrelated files unchanged.
+inspect → read → patch → test → diff
 ```
 
-The Web planner can dispatch a Herdr-native worker, then use `herdr_since`, Git and tests to verify the result.
+This proves the Web planner can perform deterministic work directly instead of turning every edit into another Coding Agent task.
 
-The agent's final prose is not the source of truth; the repository is.
+## 3. Then try a task that deserves delegation
 
-## 9. Add the browser extension for long work
-
-The extension has STORE / STANDALONE / DEV identities. Current stable v0.4.2 supports Store/DEV Native Host ownership; v0.4.3+ adds fixed-identity STANDALONE. Prefer the official Chrome Web Store build for ordinary users. Use a published GitHub/manual STANDALONE package only when the installed runtime explicitly supports that channel and Store is unavailable or independent distribution was requested. DEV is source-development only. See [Browser extension](extension.md).
-
-After installing/selecting a supported channel, verify Native Messaging ownership:
-
-```bash
-herdr-mcp native-host status
-```
-
-Bind the current Web scope to the Herdr workspace doing the work. New Auto scopes default off. First confirm:
-
-- the correct workspace is bound;
-- the HUD shows the expected state;
-- clicking the Herdr toolbar icon opens Browser Control Center directly and shows the real workspace / panes;
-- pane create/remove and working/settled changes appear live;
-- ChatGPT Queue can save a next-turn instruction without interrupting the current reply.
-
-Then enable Auto where appropriate.
-
-Manual handoff, where supported, can be started with Auto on or off. During transfer, automatic wakes from the source pause and the target conversation inherits the source Auto state. In the same bound ChatGPT Project, a user who manually opens a fresh conversation can simply say “continue” / “resume” without providing an internal continuity ID; Herdr searches durable continuity and asks for confirmation if stable identity is ambiguous.
-
-See [Browser continuity](browser-continuity.md), [Browser Control Center](browser-control-center.md), and [Wake, recovery and handoff](browser-continuity.md).
-
-## Three supported usage routes
-
-### ChatGPT with public Connector
-
-Best when you want a Web model to orchestrate local development from anywhere.
+Delegate only when independent reasoning, parallel investigation, or a longer execution really helps. For example:
 
 ```text
-ChatGPT → Edge → workstation
+Investigate the root cause of this failing test and implement the narrowest fix. Keep unrelated files unchanged, then re-check the Git diff and tests yourself.
 ```
 
-### Web AI plus browser bridge
+The worker's final prose is not the source of truth. The Web planner should re-read repository state, tests, and runtime facts before accepting the result. Worker selection, timeout, and fallback rules live in [Worker fallbacks](worker-fallbacks.md).
 
-For sites such as z.ai / DeepSeek that do not provide the same native custom MCP connector, the extension has an experimental local JSON→MCP compatibility path. Both site integrations are disabled by default; enable the corresponding switch in **Herdr Settings → Experimental features** and reload the page before testing them.
+## 4. Add the browser extension only for long-running Web work
 
-```text
-Web page → extension → Native Messaging → local MCP
-```
+Standard MCP already covers files, Git, shell, agents, and multiple workspaces. Add the extension when you specifically need:
 
-See [JSON → MCP bridge](extension.md).
+- local `working / progress / settled` events to return to the correct Web conversation;
+- page recovery and long-conversation handoff;
+- Chrome Side Panel visibility into workspaces, panes, and agents;
+- Queue, which sends an explicit next-turn user instruction after the current reply ends.
 
-### Local MCP client only
+Keep Auto off on first use and verify binding and live state manually. See [Browser extension](extension.md) for the product overview, [Browser Continuity](browser-continuity.md) for the return path, and [Browser Control Center](browser-control-center.md) for Side Panel operations.
 
-Cursor/curl can connect directly to:
+## 5. What counts as a successful first experience
 
-```text
-http://127.0.0.1:8772/mcp
-```
+The minimum acceptance is not merely “the service is healthy.” All four should be true:
 
-No Cloudflare Edge is required when the client runs on the same machine.
+1. Web AI can read the real Herdr workplace and repository;
+2. a small deterministic edit is verified and visible in the real Git diff;
+3. when delegation is useful, the Web planner independently verifies the worker's result;
+4. if the extension is enabled, a long task can safely return to the correct conversation without replaying the original mutation.
 
-## What “working” means
-
-A useful acceptance checklist is:
-
-- local runtime is healthy;
-- `herdr_inspect` sees real Herdr state;
-- Edge sees the workstation online;
-- OAuth succeeds;
-- a new ChatGPT conversation gets the current tool catalog;
-- a read-only real tool call succeeds;
-- a small write/test/diff loop succeeds;
-- browser continuity can wake the conversation after a long local task if you install the extension.
-
-At that point you have the intended product experience: a Web planner operating a persistent local development workshop rather than a one-shot remote command endpoint.
-
-Next:
-
-- [Installation](install.md) — detailed setup
-- [ChatGPT Connector](chatgpt-connector.md) — OAuth, tool snapshots and compatibility
-- [Best practices](best-practices.md) — daily orchestration
-- [Troubleshooting](troubleshooting.md) — layer-by-layer diagnosis
+At that point installation is over. Continue with [Best practices](best-practices.md) for daily workflow and [Architecture](architecture.md) for the system model.

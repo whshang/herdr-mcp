@@ -1,29 +1,31 @@
-# Automation: separate documentation, Edge, and runtime release planes
+# Automation: deploy documentation, Edge, and the local Runtime independently
 
-This page is for maintainers. New users do not need to understand all CI/CD details to install herdr-mcp.
+This maintainer page explains **how CI/CD executes**. It does not redefine the release model.
 
-herdr-mcp intentionally separates automation into independent planes:
+There is one long-lived SSOT for release boundaries: [`docs/release-model.md`](../../release-model.md). That document defines Runtime, Browser Extension, and Contract Compatibility as version/compatibility planes. This page instead describes the everyday **deployment surfaces** exercised by automation:
 
 ```text
-Documentation       Public Edge          Local Runtime
-GitHub Pages         Cloudflare Worker    runtime generation A/B
-     │                    │                     │
-Human + agent docs    OAuth/MCP/WSS       fs/git/shell/Herdr
+Documentation publish     Public Edge deploy       Local Runtime activation
+GitHub Pages               Cloudflare Worker        runtime generation A/B
+       │                          │                         │
+Human + agent docs          OAuth / MCP / WSS        fs / Git / shell / Herdr
 ```
 
-They share a repository, but not credentials, rollback boundaries, or failure domains.
+These actions share a repository but should not share credentials, rollback boundaries, or failure domains. Browser Extension distribution and contract migration have their own flows; this page only explains how they interact with CI.
 
-## Why separate release planes
+## Why automation must stay decoupled
 
-A normal fix should not accidentally change:
+A routine fix should not casually change OAuth identity, Cloudflare routing, local runtime generation, browser-extension identity, and the ChatGPT tool contract at the same time.
 
-- public documentation;
-- OAuth identity;
-- Cloudflare routing;
-- local runtime generation;
-- ChatGPT tool contract.
+The operating rule is: **trigger only the deployment action required by the task, while keeping the other release/compatibility planes stable.**
 
-The rule is simple: change the smallest plane required by the task.
+Examples:
+
+- documentation fix → publish Pages only;
+- Edge relay fix → deploy the Worker only;
+- runtime implementation fix → qualify and switch only the local generation;
+- public tool-catalog change → use the explicit contract-compatibility migration;
+- extension-only UI fix → use the extension distribution path without publishing a Runtime release.
 
 ## GitHub Pages
 

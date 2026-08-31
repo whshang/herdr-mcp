@@ -18,9 +18,9 @@ const INSTALL_PRIMARY = [
   ["docs/i18n/zh-CN/install.md", "## 第一步：安装原生 herdr-mcp runtime"],
 ];
 
-const QUICK_START_RUNTIME = [
-  ["docs/i18n/en/quick-start.md", "## 1. Install the local runtime"],
-  ["docs/i18n/zh-CN/quick-start.md", "## 2. 安装 herdr-mcp"],
+const QUICK_START_POST_INSTALL = [
+  ["docs/i18n/en/quick-start.md", /this page starts after herdr-mcp is installed and connected/i, /## 1\. Start with a read-only check/],
+  ["docs/i18n/zh-CN/quick-start.md", /本页从“herdr-mcp 已安装并连接”开始/, /## 1\. 先做一次只读检查/],
 ];
 
 function sectionAfterHeading(doc, heading) {
@@ -81,11 +81,15 @@ test("install.md primary step is native binary, not Node or service install", ()
   }
 });
 
-test("quick-start runtime section rejects Node runtime and service install primary", () => {
-  for (const [rel, heading] of QUICK_START_RUNTIME) {
-    const section = sectionAfterHeading(read(rel), heading);
-    assert.match(section, /herdr-mcp doctor/);
-    assertNotNodeRuntimePrimary(rel, section);
+test("quick-start starts after installation instead of duplicating the install runbook", () => {
+  for (const [rel, role, firstTask] of QUICK_START_POST_INSTALL) {
+    const doc = read(rel);
+    assert.match(doc, role, `${rel} must explicitly start after installation`);
+    assert.match(doc, firstTask, `${rel} must lead with a real read-only task`);
+    assert.match(doc, /agent-install\.md/);
+    assert.match(doc, /install\.md/);
+    assert.doesNotMatch(doc, /## .*Install the local runtime|## .*安装 herdr-mcp/i);
+    assert.doesNotMatch(doc, /herdr-mcp dev sync|wrangler deploy|GitHub Releases/i);
   }
 });
 

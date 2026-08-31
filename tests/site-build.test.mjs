@@ -12,6 +12,7 @@ import {
   NAV_GROUPS,
   NAV_GROUP_LABELS,
   READING_ORDER,
+  REDIRECTS,
   UI,
 } from "../scripts/site-i18n.mjs";
 
@@ -60,6 +61,13 @@ test("documentation site build publishes every logical doc x 2 locales under loc
       await access(join(ROOT, "docs", "i18n", locale, `${slug}.md`), constants.R_OK);
     }
     await access(join(OUT, "docs", locale, "index.html"), constants.R_OK);
+    for (const [retired, target] of Object.entries(REDIRECTS)) {
+      const redirect = await readFile(join(OUT, "docs", locale, `${retired}.html`), "utf8");
+      assert.match(redirect, new RegExp(`<meta http-equiv="refresh" content="0; url=\\./${target}\\.html">`));
+      assert.match(redirect, new RegExp(`rel="canonical" href="${ORIGIN}/docs/${locale}/${target}\\.html"`));
+      assert.match(redirect, new RegExp(`href="\\./${target}\\.html"`));
+      assert.ok(!DOC_ORDER.includes(retired), `${retired} must remain retired from first-class navigation`);
+    }
   }
 
   for (const rel of ["index.html", "style.css", "app.js", "favicon.png", "zh-CN/index.html", "docs/index.html", "herdr-mcp-SKILL.md", "release.json", ".nojekyll"]) {
