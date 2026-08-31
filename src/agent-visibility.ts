@@ -3,16 +3,7 @@
  * Hidden agents are omitted from listings only — herdr_prompt / herdr_call still work.
  */
 
-const DEFAULT_ALLOW = [
-  // execution workers
-  "pi",
-  "cline",
-  "opencode",
-  "anti",
-  // audit workers
-  "droid",
-  "grok",
-] as const;
+const DEFAULT_ALLOW: readonly string[] = [];
 
 /** Parsed allowlist, or null when every agent is visible (`*` / `all`). */
 export function agentAllowlist(): Set<string> | null {
@@ -25,7 +16,7 @@ export function agentAllowlist(): Set<string> | null {
       trimmed.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
     );
   }
-  return new Set(DEFAULT_ALLOW);
+  return null;
 }
 
 export function defaultAgentAllowlist(): readonly string[] {
@@ -89,6 +80,6 @@ export function visibilityMeta(hiddenCount: number): Record<string, unknown> {
     agent_visibility: "allowlist",
     agent_allow: [...allow].sort(),
     agents_hidden: hiddenCount,
-    hint: "Lists omit non-allowlisted agents (soft hide). herdr_prompt by name/pane_id still works. HERDR_MCP_AGENT_ALLOW=* shows all.",
+    hint: "HERDR_MCP_AGENT_ALLOW explicitly restricts discovery. Unset, '*' or 'all' shows every discovered agent; roles and quality are not inferred from agent names.",
   };
 }

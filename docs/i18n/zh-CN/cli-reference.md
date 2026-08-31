@@ -63,7 +63,28 @@ herdr-mcp 对这三类 kind 做有界并集，再检查对应 executable 是否�
 
 probe 子进程没有 stdin，超时上限为三秒，输出有大小上限，并且先清空继承环境，只恢复非敏感运行变量。API key、bearer token、provider credential 不会被继承。拿不到或存在歧义的字段继续保持 unknown；herdr-mcp 不会仅凭 Agent 名称猜 provider、model、vision、reasoning quality 或 code-edit 能力。
 
-静态 evidence 放在 herdr-mcp config 目录下有界的 capability inventory 中。status、cwd、project、pane、workspace、session 等实时事实始终来自 Herdr/EventCache，inventory 不会成为第二套 live truth。`herdr_inspect.capability_inventory.available_agents` 只暴露 `HERDR_MCP_AGENT_ALLOW` 允许看到、且本机真实可启动的 kind，因此能力发现会帮助分派任务，但不会绕过现有 worker/auditor 可见性策略。
+静态 evidence 放在 herdr-mcp config 目录下有界的 capability inventory 中。status、cwd、project、pane、workspace、session 等实时事实始终来自 Herdr/EventCache，inventory 不会成为第二套 live truth。`herdr_inspect.capability_inventory.available_agents` 默认暴露本机真实发现且可用的全部 kind；只有显式配置 `HERDR_MCP_AGENT_ALLOW` 时才缩小可见范围。发现某个 Agent 只代表它进入候选事实集，不代表固定角色，也不要求派工；Web planner 根据任务结构、实时负载、已验证能力和资源状态自行决策，质量、成本、延迟等拿不到证据的字段继续保持 unknown。
+
+### Web planner 的动态规划建议
+
+v0.4.3 继续保持 18 个 public MCP tools，不新增专用 planning tool。`herdr_skill` 的 progressive bootstrap 会声明一个现有 `herdr_call` 可调用的本地只读方法：
+
+```text
+herdr_call(
+  method="herdr_mcp.planning.advise",
+  params={
+    "project_root":"/path/to/project",
+    "requires_code_edit":true,
+    "requires_shell":true,
+    "independent_units":2,
+    "ownership_isolated":true
+  }
+)
+```
+
+返回值把事实与决策分开：live compatible/rejected workers、scan 证明可启动但当前未运行的 Agent kind、direct deterministic option、parallelism opportunity，以及 workspace/pane/worktree/utility-pane 资源信息。它不会启动 Agent、不会创建 worktree、不会自动选择 worker。用户明确指定 target 时保留 target；任务要求的能力没有 evidence 时 fail closed；可选质量/成本/延迟证据缺失时继续保持 unknown。
+
+Web planner 可据此决定直接执行、复用已有 Agent、创建一个新 lane，或在确实独立且 ownership 已隔离时并行。重复 utility pane、已有 idle/done Agent、已有 worktree 都作为“优先复用”的资源事实返回，清理仍由 planner 在确认任务完成后执行，不增加后台 cleanup daemon。
 
 ## Connector 信息
 
@@ -239,7 +260,7 @@ bin/herdr-link
 | `HERDR_SOCKET_PATH` | `~/.config/herdr/herdr.sock` | Herdr Socket API |
 | `HERDR_MCP_READONLY` | 关 | 禁止 mutation |
 | `HERDR_MCP_WRITE_ROOTS` | managed roots | 缩小允许写的项目范围 |
-| `HERDR_MCP_AGENT_ALLOW` | 默认 worker/auditor | 控制 inspect/since 展示哪些 Agent |
+| `HERDR_MCP_AGENT_ALLOW` | 全部已发现 Agent | 可选地限制 inspect/since 展示哪些 Agent |
 | `HERDR_MCP_ALL_TOOLS` | 关 | 打开高级/兼容工具；正常 ChatGPT 不需要 |
 | `HERDR_SKILL_NETWORK` | 开 | `0` 时只使用 bundled skill |
 

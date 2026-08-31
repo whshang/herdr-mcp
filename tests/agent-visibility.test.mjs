@@ -25,17 +25,18 @@ function withEnv(value, fn) {
   }
 }
 
-test("default allowlist shows workers and auditors", () => {
+test("default visibility exposes every discovered agent", () => {
   withEnv(undefined, () => {
+    assert.equal(agentAllowlist(), null);
     assert.equal(isAgentVisible("pi"), true);
     assert.equal(isAgentVisible("cline"), true);
     assert.equal(isAgentVisible("opencode"), true);
     assert.equal(isAgentVisible("anti"), true);
     assert.equal(isAgentVisible("droid"), true);
     assert.equal(isAgentVisible("grok"), true);
-    assert.equal(isAgentVisible("claude"), false);
-    assert.equal(isAgentVisible("omp"), false);
-    assert.equal(isAgentVisible("codex"), false);
+    assert.equal(isAgentVisible("claude"), true);
+    assert.equal(isAgentVisible("omp"), true);
+    assert.equal(isAgentVisible("codex"), true);
   });
 });
 
@@ -48,7 +49,7 @@ test("HERDR_MCP_AGENT_ALLOW=* shows all", () => {
 });
 
 test("filterVisibleAgents + redactPaneAgents", () => {
-  withEnv(undefined, () => {
+  withEnv("pi", () => {
     const agents = filterVisibleAgents([
       { name: "pi", pane: "w1:p1" },
       { name: "claude", pane: "w1:p2" },

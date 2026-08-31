@@ -1,8 +1,7 @@
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 
-const DEFAULT_ALLOW: [&str; 6] = ["pi", "cline", "opencode", "anti", "droid", "grok"];
-const VISIBILITY_HINT: &str = "Lists omit non-allowlisted agents (soft hide). herdr_prompt by name/pane_id still works. HERDR_MCP_AGENT_ALLOW=* shows all.";
+const VISIBILITY_HINT: &str = "All discovered agents are visible by default. Set HERDR_MCP_AGENT_ALLOW to an explicit comma-separated allowlist to restrict discovery; '*' or 'all' restores full visibility.";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AgentVisibility {
@@ -107,7 +106,7 @@ fn parse_allowlist(raw: Option<&str>) -> AgentVisibility {
                 .map(str::to_ascii_lowercase)
                 .collect(),
         ),
-        None => AgentVisibility::Allow(DEFAULT_ALLOW.into_iter().map(str::to_owned).collect()),
+        None => AgentVisibility::All,
     }
 }
 
@@ -116,11 +115,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_allowlist_matches_current_public_policy() {
-        assert_eq!(
-            parse_allowlist(None),
-            AgentVisibility::Allow(DEFAULT_ALLOW.into_iter().map(str::to_owned).collect())
-        );
+    fn default_visibility_allows_runtime_self_discovery() {
+        assert_eq!(parse_allowlist(None), AgentVisibility::All);
     }
 
     #[test]

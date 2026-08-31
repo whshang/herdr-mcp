@@ -267,7 +267,7 @@ Runtime A/B 把“ChatGPT 连哪里”和“当前跑哪个本地版本”分开
 | `HERDR_MCP_READONLY` | 关 | 禁止 mutation |
 | `HERDR_MCP_WRITE_ROOTS` | managed roots | 限定可写项目 |
 | `HERDR_MCP_ALL_TOOLS` | 关 | 开启高级/兼容工具；正常 ChatGPT 使用保持关闭 |
-| `HERDR_MCP_AGENT_ALLOW` | worker + auditor | 控制 inspect/since 展示的 Agent |
+| `HERDR_MCP_AGENT_ALLOW` | 全部已发现 Agent | 可选地限制 inspect/since 展示的 Agent；不定义 Agent 角色 |
 | `HERDR_MCP_STATE_DIR` | `~/.config/herdr-mcp` | runtime state / exec journal |
 | `HERDR_MCP_OAUTH_DIR` | state dir 下 oauth | OAuth key/client state |
 | `HERDR_SKILL_NETWORK` | 开 | `0` 时仅使用 bundled skill |

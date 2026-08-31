@@ -1,8 +1,9 @@
 use crate::agent_visibility::AgentVisibility;
 use crate::capability_inventory::{AgentCapabilityRecord, CapabilityInventoryStore};
-use crate::capability_resolver::project_capabilities_with_inventory;
+use crate::capability_resolver::{WorkerCapability, project_capabilities_with_inventory};
 use crate::local_skills::{self, LocalSkillFile, parse_frontmatter, read_file_bounded};
 use crate::paths::RuntimePaths;
+use crate::skill_dispatch::{DispatchAdvice, TaskProfile, advise_dispatch};
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeSet, HashMap};
@@ -14,10 +15,12 @@ use time::format_description::well_known::Rfc3339;
 pub const LOCAL_LIST_METHOD: &str = "herdr_mcp.skill.list";
 pub const LOCAL_DESCRIBE_METHOD: &str = "herdr_mcp.skill.describe";
 pub const LOCAL_LOAD_METHOD: &str = "herdr_mcp.skill.load";
+pub const PLANNING_ADVISE_METHOD: &str = "herdr_mcp.planning.advise";
 
 const BUILTIN_SOURCE_IDENTITY: &str = "herdr-mcp:builtin";
 const GLOBAL_POLICY_URI: &str = "skill://herdr-mcp/AGENTS.md";
 const GLOBAL_AGENTS: &str = include_str!("../../../assets/herdr/AGENTS.md");
+const MAX_PLANNING_WORKERS: usize = 12;
 
 const WORKSTATION_CONTROL: &str =
     include_str!("../../../assets/herdr/skills/workstation-control/SKILL.md");
@@ -360,8 +363,8 @@ impl ProgressiveSkillService {
         let global_digest = Digest::from_content(global_content);
         let catalog = self.catalog();
         let content = format!(
-            "{}\n\n## Progressive load contract\n\nUse the compact `catalog` field to select policy modules. Load all required domains in one call:\n\n```text\nherdr_call(method=\"{}\", params={{\"ids\":[\"files-search\",\"git-repository\"]}})\n```\n\nLoaded text is sticky in the current context while source identity and digest are unchanged. A new user turn does not reload it. Refresh live worker/pane/runtime facts through inspect/since.",
-            global_content, LOCAL_LOAD_METHOD
+            "{}\n\n## Progressive load contract\n\nUse the compact `catalog` field to select policy modules. Load all required domains in one call:\n\n```text\nherdr_call(method=\"{}\", params={{\"ids\":[\"files-search\",\"git-repository\"]}})\n```\n\nFor non-trivial task planning, `herdr_call(method=\"{}\", ...)` returns evidence-backed direct/delegation/parallelism advice without choosing or starting an Agent. Loaded text is sticky in the current context while source identity and digest are unchanged. A new user turn does not reload it. Refresh live worker/pane/runtime facts through inspect/since.",
+            global_content, LOCAL_LOAD_METHOD, PLANNING_ADVISE_METHOD
         );
         json!({
             "ok": true,
@@ -385,12 +388,32 @@ impl ProgressiveSkillService {
                 "sticky": "conversation/task-context until source identity or digest changes, new capability domain, handoff, or explicit refresh",
                 "authorization": "none"
             },
+            "planning_advice": {
+                "method": PLANNING_ADVISE_METHOD,
+                "decision_owner": "web_planner",
+                "effect": "read_only_advice",
+                "params": {
+                    "deterministic_tool": "optional non-empty string",
+                    "project_root": "optional non-empty string",
+                    "explicit_target": "optional non-empty agent id/kind/pane id",
+                    "requires_code_edit": "optional boolean",
+                    "requires_shell": "optional boolean",
+                    "requires_vision": "optional boolean",
+                    "minimum_reasoning_tier": "optional integer 0..255",
+                    "destructive_production_mutation": "optional boolean",
+                    "delegates_other_workers": "optional boolean",
+                    "independent_units": "optional integer 1..64; defaults to 1",
+                    "ownership_isolated": "optional boolean",
+                    "shared_runtime_state": "optional boolean"
+                }
+            },
             "capability_snapshot": capability_summary_with_inventory(snapshot, inventory),
+            "planning_context": planning_context_with_inventory(snapshot, inventory),
             "bytes": content.len(),
         })
     }
 
-    pub fn local_call(&self, method: &str, params: &Value, _snapshot: &Value) -> Option<Value> {
+    pub fn local_call(&self, method: &str, params: &Value, snapshot: &Value) -> Option<Value> {
         if !method.starts_with("herdr_mcp.") {
             return None;
         }
@@ -398,12 +421,64 @@ impl ProgressiveSkillService {
             LOCAL_LIST_METHOD => self.list_method(params),
             LOCAL_DESCRIBE_METHOD => self.describe_method(params),
             LOCAL_LOAD_METHOD => self.load_method(params),
+            PLANNING_ADVISE_METHOD => self.planning_advise_method(params, snapshot),
             _ => json!({
                 "ok": false,
                 "code": "unknown_local_method",
                 "method": method,
                 "message": "unknown herdr-mcp local method; request was not forwarded to the Herdr socket",
             }),
+        })
+    }
+
+    fn planning_advise_method(&self, params: &Value, snapshot: &Value) -> Value {
+        let inventory = RuntimePaths::discover()
+            .ok()
+            .and_then(|paths| CapabilityInventoryStore::load_existing(&paths.config_dir).ok())
+            .unwrap_or_default();
+        self.planning_advise_method_with_inventory(params, snapshot, &inventory)
+    }
+
+    fn planning_advise_method_with_inventory(
+        &self,
+        params: &Value,
+        snapshot: &Value,
+        inventory: &[AgentCapabilityRecord],
+    ) -> Value {
+        const KEYS: &[&str] = &[
+            "deterministic_tool",
+            "project_root",
+            "explicit_target",
+            "requires_code_edit",
+            "requires_shell",
+            "requires_vision",
+            "minimum_reasoning_tier",
+            "destructive_production_mutation",
+            "delegates_other_workers",
+            "independent_units",
+            "ownership_isolated",
+            "shared_runtime_state",
+        ];
+        if let Err(error) = validate_object_keys(params, KEYS) {
+            return error;
+        }
+        let task = match task_profile_from_params(params) {
+            Ok(task) => task,
+            Err(error) => return error,
+        };
+        let visibility = AgentVisibility::from_env();
+        let capabilities = project_capabilities_with_inventory(snapshot, &visibility, inventory);
+        let advice = advise_dispatch(&task, &capabilities);
+        json!({
+            "ok": true,
+            "decision_owner": "web_planner",
+            "advice": dispatch_advice_json(&advice),
+            "startable_candidates": startable_candidates_json(inventory, &visibility, snapshot, &task),
+            "resource_context": resource_context_json(snapshot),
+            "refresh": {
+                "live": "herdr_inspect/herdr_since",
+                "capabilities": "herdr-mcp scan --probe",
+            },
         })
     }
 
@@ -707,6 +782,386 @@ fn capability_summary_with_inventory(
     })
 }
 
+fn planning_context_with_inventory(
+    raw_snapshot: &Value,
+    inventory: &[AgentCapabilityRecord],
+) -> Value {
+    let visibility = AgentVisibility::from_env();
+    let snapshot = project_capabilities_with_inventory(raw_snapshot, &visibility, inventory);
+    let shown = snapshot
+        .workers
+        .iter()
+        .take(MAX_PLANNING_WORKERS)
+        .map(planning_worker_json)
+        .collect::<Vec<_>>();
+
+    json!({
+        "decision_owner": "web_planner",
+        "delegation": "optional",
+        "parallelism": "advisory",
+        "workers": {
+            "total": snapshot.workers.len(),
+            "shown": shown.len(),
+            "truncated": snapshot.workers.len() > shown.len(),
+            "candidates": shown,
+            "unknown_traits": "remain unknown; never infer role, quality, cost, or latency from agent name/kind",
+        },
+        "resources": resource_context_json(raw_snapshot),
+        "refresh": {
+            "live": "herdr_inspect/herdr_since",
+            "capabilities": "herdr-mcp scan --probe",
+        },
+    })
+}
+
+fn planning_worker_json(worker: &WorkerCapability) -> Value {
+    json!({
+        "agent_id": worker.agent_id,
+        "control_target": worker.pane_id.as_deref().unwrap_or(worker.agent_id.as_str()),
+        "kind": worker.kind,
+        "provider": worker.provider,
+        "model": worker.model,
+        "status": worker.current_status,
+        "project": worker.current_project,
+        "verified": {
+            "code_edit": worker.supports_code_edit,
+            "shell": worker.supports_shell,
+            "vision": worker.supports_vision,
+            "headless": worker.can_run_headless,
+        },
+        "observed_traits": {
+            "reasoning_tier": worker.reasoning_tier,
+            "latency_tier": worker.latency_tier,
+            "cost_tier": worker.cost_tier,
+            "context_tier": worker.context_tier,
+        },
+    })
+}
+
+fn task_profile_from_params(params: &Value) -> Result<TaskProfile, Value> {
+    Ok(TaskProfile {
+        deterministic_tool: optional_nonempty_string(params, "deterministic_tool")?,
+        project_root: optional_nonempty_string(params, "project_root")?,
+        explicit_target: optional_nonempty_string(params, "explicit_target")?,
+        requires_code_edit: optional_bool(params, "requires_code_edit")?,
+        requires_shell: optional_bool(params, "requires_shell")?,
+        requires_vision: optional_bool(params, "requires_vision")?,
+        minimum_reasoning_tier: optional_u8(params, "minimum_reasoning_tier")?,
+        destructive_production_mutation: optional_bool(params, "destructive_production_mutation")?,
+        delegates_other_workers: optional_bool(params, "delegates_other_workers")?,
+        independent_units: optional_independent_units(params)?,
+        ownership_isolated: optional_bool(params, "ownership_isolated")?,
+        shared_runtime_state: optional_bool(params, "shared_runtime_state")?,
+    })
+}
+
+fn optional_nonempty_string(params: &Value, key: &str) -> Result<Option<String>, Value> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.trim().to_owned())),
+        Some(Value::String(_)) => Err(invalid_params(&format!(
+            "{key} must be non-empty when provided"
+        ))),
+        Some(_) => Err(invalid_params(&format!(
+            "{key} must be a string when provided"
+        ))),
+    }
+}
+
+fn optional_bool(params: &Value, key: &str) -> Result<bool, Value> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(invalid_params(&format!(
+            "{key} must be a boolean when provided"
+        ))),
+    }
+}
+
+fn optional_u8(params: &Value, key: &str) -> Result<Option<u8>, Value> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| invalid_params(&format!("{key} must be an integer from 0 to 255"))),
+    }
+}
+
+fn optional_independent_units(params: &Value) -> Result<usize, Value> {
+    match params.get("independent_units") {
+        None | Some(Value::Null) => Ok(1),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| (1..=64).contains(value))
+            .map(|value| value as usize)
+            .ok_or_else(|| invalid_params("independent_units must be an integer from 1 to 64")),
+    }
+}
+
+fn dispatch_advice_json(advice: &DispatchAdvice) -> Value {
+    let candidates = advice
+        .candidates
+        .iter()
+        .take(MAX_PLANNING_WORKERS)
+        .map(|candidate| {
+            json!({
+                "agent_id": candidate.agent_id,
+                "control_target": candidate.control_target,
+                "kind": candidate.kind,
+                "provider": candidate.provider,
+                "model": candidate.model,
+                "status": candidate.current_status,
+                "project": candidate.current_project,
+                "workspace_id": candidate.workspace_id,
+                "observed_traits": {
+                    "reasoning_tier": candidate.reasoning_tier,
+                    "latency_tier": candidate.latency_tier,
+                    "cost_tier": candidate.cost_tier,
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let rejected = advice
+        .rejected
+        .iter()
+        .take(MAX_PLANNING_WORKERS)
+        .map(|rejection| {
+            json!({
+                "agent_id": rejection.agent_id,
+                "reason": rejection.reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "direct_tool": advice.direct_tool,
+        "explicit_target": advice.explicit_target,
+        "delegation_allowed": advice.delegation_allowed,
+        "reason": advice.reason,
+        "candidate_count": advice.candidates.len(),
+        "candidates_shown": candidates.len(),
+        "candidates_truncated": advice.candidates.len() > candidates.len(),
+        "candidates": candidates,
+        "rejection_count": advice.rejected.len(),
+        "rejections_shown": rejected.len(),
+        "rejections_truncated": advice.rejected.len() > rejected.len(),
+        "rejected": rejected,
+        "parallelism": {
+            "worth_considering": advice.parallelism.worth_considering,
+            "max_useful_lanes": advice.parallelism.max_useful_lanes,
+            "reason": advice.parallelism.reason,
+        },
+    })
+}
+
+fn startable_candidates_json(
+    inventory: &[AgentCapabilityRecord],
+    visibility: &AgentVisibility,
+    snapshot: &Value,
+    task: &TaskProfile,
+) -> Value {
+    let live_kinds = snapshot
+        .get("agents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|agent| {
+            agent
+                .get("agent")
+                .or_else(|| agent.get("kind"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let available = inventory
+        .iter()
+        .filter(|record| {
+            record.available_for_start.as_ref().map(|value| value.value) == Some(true)
+                && visibility.is_visible(Some(record.agent.as_str()), Some(record.agent.as_str()))
+                && !live_kinds.contains(&record.agent)
+        })
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    let mut rejected = Vec::new();
+    for record in available {
+        if let Some(reason) = inactive_candidate_reject_reason(record, task) {
+            rejected.push(json!({"kind": record.agent, "reason": reason}));
+        } else {
+            candidates.push(record);
+        }
+    }
+    let shown = candidates
+        .iter()
+        .take(MAX_PLANNING_WORKERS)
+        .map(|record| {
+            json!({
+                "kind": record.agent,
+                "status": "not_running",
+                "start_kind": record.agent,
+                "binary_version": record.binary_version.as_ref().map(|value| value.value.as_str()),
+                "provider": record.provider.as_ref().map(|value| value.value.as_str()),
+                "model": record.model.as_ref().map(|value| value.value.as_str()),
+                "verified": {
+                    "code_edit": record.supports_code_edit.as_ref().map(|value| value.value),
+                    "shell": record.supports_shell.as_ref().map(|value| value.value),
+                    "vision": record.supports_vision.as_ref().map(|value| value.value),
+                    "headless": record.can_run_headless.as_ref().map(|value| value.value),
+                },
+                "observed_traits": {
+                    "reasoning_tier": record.reasoning_tier.as_ref().map(|value| value.value),
+                    "latency_tier": record.latency_tier.as_ref().map(|value| value.value),
+                    "cost_tier": record.cost_tier.as_ref().map(|value| value.value),
+                    "context_tier": record.context_tier.as_ref().map(|value| value.value),
+                },
+                "evidence": {
+                    "available_for_start": true,
+                    "source": record.available_for_start.as_ref().map(|value| value.source.as_str()),
+                    "observed_at_ms": record.observed_at_ms,
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let rejected_total = rejected.len();
+    let rejected_shown = rejected
+        .into_iter()
+        .take(MAX_PLANNING_WORKERS)
+        .collect::<Vec<_>>();
+    json!({
+        "available_total": candidates.len() + rejected_total,
+        "compatible_total": candidates.len(),
+        "shown": shown.len(),
+        "truncated": candidates.len() > shown.len(),
+        "candidates": shown,
+        "rejected_total": rejected_total,
+        "rejected_shown": rejected_shown.len(),
+        "rejected_truncated": rejected_total > rejected_shown.len(),
+        "rejected": rejected_shown,
+        "meaning": "installed/startable evidence only; planner decides whether creating a new Agent lane is worth the resource cost",
+    })
+}
+
+fn inactive_candidate_reject_reason(
+    record: &AgentCapabilityRecord,
+    task: &TaskProfile,
+) -> Option<&'static str> {
+    if task.deterministic_tool.is_some() {
+        return Some("deterministic_native_tool_available");
+    }
+    if task.destructive_production_mutation {
+        return Some("destructive_production_mutation_not_auto_delegated");
+    }
+    if task.delegates_other_workers {
+        return Some("middle_manager_delegation_forbidden");
+    }
+    if let Some(target) = task.explicit_target.as_deref()
+        && record.agent != target
+    {
+        return Some("explicit_target_mismatch");
+    }
+    if task.requires_code_edit
+        && record.supports_code_edit.as_ref().map(|value| value.value) != Some(true)
+    {
+        return Some("code_edit_capability_not_verified");
+    }
+    if task.requires_shell && record.supports_shell.as_ref().map(|value| value.value) != Some(true)
+    {
+        return Some("shell_capability_not_verified");
+    }
+    if task.requires_vision
+        && record.supports_vision.as_ref().map(|value| value.value) != Some(true)
+    {
+        return Some("vision_capability_not_verified");
+    }
+    if let Some(minimum) = task.minimum_reasoning_tier {
+        match record.reasoning_tier.as_ref().map(|value| value.value) {
+            Some(actual) if actual >= minimum => {}
+            Some(_) => return Some("reasoning_tier_below_requirement"),
+            None => return Some("reasoning_tier_not_verified"),
+        }
+    }
+    None
+}
+
+fn resource_context_json(raw_snapshot: &Value) -> Value {
+    let panes = raw_snapshot
+        .get("panes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let workspaces = raw_snapshot
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let agents = raw_snapshot
+        .get("agents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut utility_by_workspace = HashMap::<String, usize>::new();
+    for pane in &panes {
+        if pane.get("label").and_then(Value::as_str) != Some("herdr-mcp:utility") {
+            continue;
+        }
+        let workspace = pane
+            .get("workspace_id")
+            .or_else(|| pane.get("workspace"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        *utility_by_workspace.entry(workspace).or_default() += 1;
+    }
+    let utility_panes = utility_by_workspace.values().copied().sum::<usize>();
+    let duplicate_utility_panes = utility_by_workspace
+        .values()
+        .map(|count| count.saturating_sub(1))
+        .sum::<usize>();
+    let working_agents = agents
+        .iter()
+        .filter(|agent| {
+            agent
+                .get("agent_status")
+                .or_else(|| agent.get("status"))
+                .and_then(Value::as_str)
+                == Some("working")
+        })
+        .count();
+    let reusable_agents = agents
+        .iter()
+        .filter(|agent| {
+            matches!(
+                agent
+                    .get("agent_status")
+                    .or_else(|| agent.get("status"))
+                    .and_then(Value::as_str),
+                Some("idle" | "done")
+            )
+        })
+        .count();
+    let worktree_paths = workspaces
+        .iter()
+        .filter_map(|workspace| {
+            workspace
+                .get("worktree")
+                .and_then(|worktree| worktree.get("checkout_path"))
+                .and_then(Value::as_str)
+        })
+        .collect::<BTreeSet<_>>();
+    json!({
+        "workspace_count": workspaces.len(),
+        "pane_count": panes.len(),
+        "known_worktree_count": worktree_paths.len(),
+        "utility_panes": utility_panes,
+        "duplicate_utility_panes": duplicate_utility_panes,
+        "working_agents": working_agents,
+        "reusable_idle_or_done_agents": reusable_agents,
+        "reuse_preferred": true,
+        "new_lane_requires_task_value": true,
+        "cleanup": "planner-owned; no autonomous cleanup daemon",
+    })
+}
+
 fn validate_object_keys(params: &Value, allowed: &[&str]) -> Result<(), Value> {
     let Some(object) = params.as_object() else {
         return Err(invalid_params("params must be an object"));
@@ -750,6 +1205,69 @@ mod tests {
                 {"agent": "claude", "agent_status": "idle", "cwd": "/repo", "pane_id": "w1:p2", "workspace_id": "w1", "state_change_seq": 8}
             ]
         })
+    }
+
+    fn planning_snapshot() -> Value {
+        json!({
+            "agents": [
+                {"agent": "pi", "name": "worker", "agent_status": "idle", "cwd": "/repo", "pane_id": "w1:p1", "workspace_id": "w1", "state_change_seq": 7},
+                {"agent": "reviewer", "name": "reviewer-live", "agent_status": "working", "cwd": "/repo", "pane_id": "w1:p2", "workspace_id": "w1", "state_change_seq": 8}
+            ],
+            "panes": [
+                {"pane_id": "w1:p1", "workspace_id": "w1", "label": "worker"},
+                {"pane_id": "w1:p2", "workspace_id": "w1", "label": "herdr-mcp:utility"},
+                {"pane_id": "w1:p3", "workspace_id": "w1", "label": "herdr-mcp:utility"}
+            ],
+            "workspaces": [
+                {"workspace_id": "w1", "worktree": {"checkout_path": "/repo"}}
+            ]
+        })
+    }
+
+    fn bool_evidence(value: bool) -> crate::capability_inventory::Evidence<bool> {
+        crate::capability_inventory::Evidence {
+            value,
+            source: "test-scan".to_owned(),
+            authority: "test".to_owned(),
+            observed_at_ms: 1,
+            detail: None,
+        }
+    }
+
+    fn inventory_record(
+        agent: &str,
+        startable: bool,
+        code_edit: Option<bool>,
+        shell: Option<bool>,
+    ) -> AgentCapabilityRecord {
+        AgentCapabilityRecord {
+            schema_version: crate::capability_inventory::INVENTORY_SCHEMA_VERSION,
+            agent: agent.to_owned(),
+            manifest_version: Some("test".to_owned()),
+            manifest_source: Some("test".to_owned()),
+            manifest_source_kind: Some("test".to_owned()),
+            binary_path: Some(format!("/bin/{agent}")),
+            herdr_startable: Some(bool_evidence(startable)),
+            executable_available: Some(bool_evidence(startable)),
+            available_for_start: Some(bool_evidence(startable)),
+            binary_version: None,
+            provider: None,
+            model: None,
+            profile: None,
+            supports_code_edit: code_edit.map(bool_evidence),
+            supports_shell: shell.map(bool_evidence),
+            supports_vision: None,
+            reasoning_tier: None,
+            latency_tier: None,
+            cost_tier: None,
+            context_tier: None,
+            interactive_only: None,
+            can_run_headless: Some(bool_evidence(true)),
+            probe_level: crate::capability_inventory::ProbeLevel::Deep,
+            probe_adapter_version: 1,
+            fingerprint: format!("test:{agent}"),
+            observed_at_ms: 1,
+        }
     }
 
     /// Run a closure with HOME pointed at an empty temp dir so local-skill
@@ -1064,6 +1582,8 @@ mod tests {
         assert_eq!(result["mode"], "progressive");
         assert_eq!(result["catalog"].as_array().unwrap().len(), 8);
         assert_eq!(result["load"]["method"], LOCAL_LOAD_METHOD);
+        assert_eq!(result["planning_advice"]["method"], PLANNING_ADVISE_METHOD);
+        assert_eq!(result["planning_advice"]["decision_owner"], "web_planner");
         let content = result["content"].as_str().unwrap();
         assert!(content.contains("# Herdr Global AGENTS.md"));
         assert!(content.contains("compact `catalog` field"));
@@ -1072,7 +1592,7 @@ mod tests {
         assert!(!content.contains("# Engineering Robustness Reference"));
         assert!(!content.contains("# Files Mutation"));
         assert!(!content.contains("# Agent Dispatch"));
-        assert_eq!(result["capability_snapshot"]["worker_count"], 1);
+        assert_eq!(result["capability_snapshot"]["worker_count"], 2);
         assert_eq!(
             result["capability_snapshot"]["detail_refresh"],
             "herdr_inspect/herdr_since"
@@ -1085,6 +1605,86 @@ mod tests {
             result["capability_snapshot"]["verified_capabilities"]["code_edit"],
             0
         );
+        assert_eq!(result["planning_context"]["decision_owner"], "web_planner");
+        assert_eq!(result["planning_context"]["delegation"], "optional");
+        assert_eq!(result["planning_context"]["parallelism"], "advisory");
+        assert_eq!(result["planning_context"]["workers"]["total"], 2);
+        assert_eq!(
+            result["planning_context"]["workers"]["candidates"][0]["control_target"],
+            "w1:p1"
+        );
+    }
+
+    #[test]
+    fn planning_advice_exposes_live_and_inactive_candidates_without_selecting_one() {
+        let service = ProgressiveSkillService::new();
+        let inventory = vec![
+            inventory_record("pi", true, Some(true), Some(true)),
+            inventory_record("builder", true, Some(true), Some(true)),
+            inventory_record("unknown-worker", true, None, None),
+        ];
+        let result = service.planning_advise_method_with_inventory(
+            &json!({
+                "project_root": "/repo",
+                "requires_code_edit": true,
+                "requires_shell": true,
+                "independent_units": 2,
+                "ownership_isolated": true
+            }),
+            &planning_snapshot(),
+            &inventory,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["decision_owner"], "web_planner");
+        assert_eq!(result["advice"]["delegation_allowed"], true);
+        assert_eq!(result["advice"]["candidates"].as_array().unwrap().len(), 1);
+        assert_eq!(result["advice"]["candidates"][0]["agent_id"], "worker");
+        assert_eq!(result["advice"]["candidates"][0]["control_target"], "w1:p1");
+        assert_eq!(result["advice"]["candidates"][0]["status"], "idle");
+        assert_eq!(result["advice"]["parallelism"]["worth_considering"], true);
+        assert_eq!(result["advice"]["parallelism"]["max_useful_lanes"], 2);
+        assert_eq!(result["startable_candidates"]["available_total"], 2);
+        assert_eq!(result["startable_candidates"]["compatible_total"], 1);
+        assert_eq!(result["startable_candidates"]["rejected_total"], 1);
+        assert_eq!(
+            result["startable_candidates"]["candidates"][0]["kind"],
+            "builder"
+        );
+        assert!(
+            result["startable_candidates"]["rejected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["kind"] == "unknown-worker"
+                    && item["reason"] == "code_edit_capability_not_verified")
+        );
+        assert_eq!(result["resource_context"]["duplicate_utility_panes"], 1);
+        assert_eq!(result["resource_context"]["working_agents"], 1);
+        assert_eq!(
+            result["resource_context"]["reusable_idle_or_done_agents"],
+            1
+        );
+        assert!(result["advice"].get("selected_target").is_none());
+    }
+
+    #[test]
+    fn planning_advice_parameter_validation_fails_closed() {
+        let service = ProgressiveSkillService::new();
+        let result = service.planning_advise_method_with_inventory(
+            &json!({"requires_shell": "yes"}),
+            &planning_snapshot(),
+            &[],
+        );
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["code"], "invalid_params");
+
+        let result = service.planning_advise_method_with_inventory(
+            &json!({"independent_units": 0}),
+            &planning_snapshot(),
+            &[],
+        );
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["code"], "invalid_params");
     }
 
     #[test]
