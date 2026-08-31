@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.81";
+const H2W_CONTENT_VERSION = "0.1.82";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -1763,6 +1763,7 @@ const H2W_CONTENT_VERSION = "0.1.81";
     const turn = CORE.latestTurnMessages(body);
     if (!turn) return null;
     const { messages, currentRole: currentNodeRole, assistant, user } = turn;
+    const imageFileIds = CORE.imageFileIdsFromConversation(body);
     const transcript = boundedHandoffTranscript(messages.map((message) => ({
       role: String(message?.author?.role || ""),
       text: serverMessageText(message),
@@ -1777,6 +1778,7 @@ const H2W_CONTENT_VERSION = "0.1.81";
         userMessageId: user?.id ? String(user.id) : null,
         userText: serverMessageText(user),
         userCreatedAt: Number(user?.create_time || 0) > 0 ? Number(user.create_time) * 1000 : null,
+        imageFileIds,
         transcript,
       };
     }
@@ -1800,6 +1802,7 @@ const H2W_CONTENT_VERSION = "0.1.81";
       userMessageId: user?.id ? String(user.id) : null,
       userText: serverMessageText(user),
       userCreatedAt: Number(user?.create_time || 0) > 0 ? Number(user.create_time) * 1000 : null,
+      imageFileIds,
       transcript,
     };
   }
@@ -1813,6 +1816,7 @@ const H2W_CONTENT_VERSION = "0.1.81";
     const pluralSnapshot = chatGptPluralConversationSnapshot(body);
     if (pluralSnapshot) return pluralSnapshot;
     const mapping = body?.mapping || {};
+    const imageFileIds = CORE.imageFileIdsFromConversation(body);
     const transcript = chatGptConversationTranscript(body);
     const currentMessage = mapping?.[body?.current_node]?.message || null;
     const currentNodeRole = String(currentMessage?.author?.role || "");
@@ -1849,6 +1853,7 @@ const H2W_CONTENT_VERSION = "0.1.81";
         userMessageId: user?.id ? String(user.id) : null,
         userText: serverMessageText(user),
         userCreatedAt: Number(user?.create_time || 0) > 0 ? Number(user.create_time) * 1000 : null,
+        imageFileIds,
         transcript,
       };
     }
@@ -1872,6 +1877,7 @@ const H2W_CONTENT_VERSION = "0.1.81";
       userMessageId: user?.id ? String(user.id) : null,
       userText: serverMessageText(user),
       userCreatedAt: Number(user?.create_time || 0) > 0 ? Number(user.create_time) * 1000 : null,
+      imageFileIds,
       transcript,
     };
   }
@@ -1939,6 +1945,8 @@ const H2W_CONTENT_VERSION = "0.1.81";
   // this content-script lifetime. Bounded to MAX_FILES_PER_TURN; native cache
   // dedup keeps cross-reload/idempotency safe, so this is just a fast path.
   const capturedFileIds = new Set();
+  const artifactCaptureSequences = new Map();
+  const ARTIFACT_CAPTURE_RETRY_DELAYS_MS = [0, 1200, 3000];
   function markFileIdCaptured(conversationId, fileId) {
     // Bounded memory: key by conversation to avoid unbounded growth.
     const key = `${conversationId}:${fileId}`;
@@ -1949,30 +1957,76 @@ const H2W_CONTENT_VERSION = "0.1.81";
     return capturedFileIds.has(`${conversationId}:${fileId}`);
   }
 
-  async function captureChatGptTurnImages(conversationId) {
+  async function captureChatGptTurnImages(conversationId, fileIdsHint = null) {
     if (ADAPTER.name !== "chatgpt" || !conversationId) return { ok: false, reason: "not-eligible" };
-    // Best-effort: fetch the finalized conversation and look only for
-    // image_asset_pointer parts. Fail closed into a no-op on any error — never
-    // blocks or delays turn completion.
-    const conversation = await fetchChatGptConversation({ conversationId, timeoutMs: 8000 });
-    if (!conversation.ok) return { ok: false, reason: conversation.reason || conversation.error };
-    const fileIds = CORE.imageFileIdsFromConversation(conversation.body);
+    let fileIds = Array.isArray(fileIdsHint)
+      ? fileIdsHint.filter((fileId) => typeof fileId === "string").slice(0, CORE.MAX_FILES_PER_TURN)
+      : null;
+    if (!fileIds) {
+      // DOM/text settlement does not carry the server snapshot, so fetch once
+      // and freeze the current-turn ids before downloading. Server-settled
+      // image-only turns pass their already-confirmed ids directly.
+      const conversation = await fetchChatGptConversation({ conversationId, timeoutMs: 8000 });
+      if (!conversation.ok) return { ok: false, reason: conversation.reason || conversation.error };
+      fileIds = CORE.imageFileIdsFromConversation(conversation.body);
+    }
     if (!fileIds.length) return { ok: false, reason: "no-image-assets" };
     let captured = 0;
+    let alreadyCaptured = 0;
+    let failed = 0;
     for (const fileId of fileIds.slice(0, CORE.MAX_FILES_PER_TURN)) {
-      if (alreadyCapturedFileId(conversationId, fileId)) continue;
+      if (alreadyCapturedFileId(conversationId, fileId)) {
+        alreadyCaptured += 1;
+        continue;
+      }
       const artifact = await downloadCaptureChatGptImage(conversationId, fileId);
-      if (!artifact) continue;
+      if (!artifact) {
+        failed += 1;
+        continue;
+      }
       // Native Messaging starts a host process per message. Serialize captures
       // here so cache bounds/dedup remain deterministic across multi-image turns,
       // and only suppress retries after the native host confirms persistence.
       const result = await sendBg({ type: "h2w_artifact_capture", artifact });
-      if (!result?.ok) continue;
+      if (!result?.ok) {
+        failed += 1;
+        continue;
+      }
       markFileIdCaptured(conversationId, fileId);
       captured += 1;
     }
-    if (!captured) return { ok: false, reason: "none-captured" };
-    return { ok: true, count: captured };
+    const complete = failed === 0 && captured + alreadyCaptured === fileIds.length;
+    if (!captured && !complete) {
+      return { ok: false, reason: "none-captured", count: 0, complete: false };
+    }
+    return { ok: true, count: captured, complete };
+  }
+
+  function captureChatGptTurnImagesWithRetry(conversationId, fileIdsHint = null) {
+    if (!conversationId || ADAPTER.name !== "chatgpt") {
+      return Promise.resolve({ ok: false, reason: "not-eligible" });
+    }
+    const frozenFileIds = Array.isArray(fileIdsHint)
+      ? fileIdsHint.filter((fileId) => typeof fileId === "string").slice(0, CORE.MAX_FILES_PER_TURN)
+      : null;
+    const sequenceKey = frozenFileIds?.length
+      ? `${conversationId}:${frozenFileIds.join(",")}`
+      : conversationId;
+    const existing = artifactCaptureSequences.get(sequenceKey);
+    if (existing) return existing;
+    const sequence = (async () => {
+      let lastResult = { ok: false, reason: "not-attempted" };
+      for (const delayMs of ARTIFACT_CAPTURE_RETRY_DELAYS_MS) {
+        if (delayMs > 0) await wait(delayMs);
+        lastResult = await captureChatGptTurnImages(conversationId, frozenFileIds);
+        if (lastResult?.ok && lastResult?.complete !== false) return lastResult;
+      }
+      return lastResult;
+    })().finally(() => {
+      artifactCaptureSequences.delete(sequenceKey);
+    });
+    artifactCaptureSequences.set(sequenceKey, sequence);
+    return sequence;
   }
 
   async function downloadCaptureChatGptImage(conversationId, fileId) {
@@ -2045,7 +2099,7 @@ const H2W_CONTENT_VERSION = "0.1.81";
   function maybeCaptureChatGptTurnImages() {
     const conversationId = chatGptConversationId();
     if (!conversationId || ADAPTER.name !== "chatgpt" || document.hidden) return;
-    void captureChatGptTurnImages(conversationId);
+    void captureChatGptTurnImagesWithRetry(conversationId);
   }
 
   function explicitChatGptThreadError() {
@@ -2677,6 +2731,7 @@ const H2W_CONTENT_VERSION = "0.1.81";
     let settleTimer = null;
     let lastReportedEnd = 0;
     let lastReportedTurnKey = "";
+    const artifactCaptureTurnKeys = new Set();
     let lastStartedJournalKey = "";
     let lastAsstLen = initialAssistant.text.length;
     let lastAsstSignature = assistantSignature(initialAssistant.text);
@@ -2710,6 +2765,25 @@ const H2W_CONTENT_VERSION = "0.1.81";
         return normText(lastWakeNorm);
       }
       return "";
+    };
+
+    const scheduleServerSettledImageCapture = (server) => {
+      const conversationId = chatGptConversationId();
+      const submitAt = syncPendingSubmitAnchor();
+      const key = CORE.settledImageCaptureKey({
+        adapterName: ADAPTER.name,
+        conversationId,
+        pending: hasPendingReply(),
+        submitAt,
+        server,
+      });
+      if (!key || artifactCaptureTurnKeys.has(key)) return false;
+      if (artifactCaptureTurnKeys.size >= 64) artifactCaptureTurnKeys.clear();
+      artifactCaptureTurnKeys.add(key);
+      void captureChatGptTurnImagesWithRetry(conversationId, server.imageFileIds).then((result) => {
+        if (result?.ok) console.log("[h2w] captured ChatGPT image artifact for settled turn");
+      });
+      return true;
     };
 
     const noteTrustedManualSubmit = () => {
@@ -2783,7 +2857,6 @@ const H2W_CONTENT_VERSION = "0.1.81";
     const serverSnapshotMatchesPendingTurn = (server) => {
       if (!hasPendingReply() || !server?.ok) return false;
       if (server.currentNodeRole !== "assistant" || server.finished !== true) return false;
-      if (!String(server.text || "").trim()) return false;
       const submitAt = syncPendingSubmitAnchor();
       const expectedUser = pendingUserTextHint();
       const serverUser = normText(server.userText || "");
@@ -2817,12 +2890,24 @@ const H2W_CONTENT_VERSION = "0.1.81";
         const server = await fetchChatGptConversationSnapshot();
         if (!server?.ok) return { checked: false, reported: false };
         if (!serverSnapshotMatchesPendingTurn(server)) return { checked: true, reported: false };
-        const reported = reportTurnEnded(server.text, Date.now(), {
+        const endedAt = Date.now();
+        const captureScheduled = scheduleServerSettledImageCapture(server);
+        const reported = reportTurnEnded(server.text, endedAt, {
           userText: server.userText || "",
           serverConfirmed: true,
         });
         if (reported) console.log(`[h2w] turn ended from ChatGPT server snapshot (${reason})`);
-        return { checked: true, reported };
+        if (!reported && captureScheduled) {
+          // Image-only turns have no substantive assistant text, so they must
+          // not emit h2w_turn_ended / continuity / idle-nudge side effects.
+          // The server-confirmed finished image turn is nevertheless complete
+          // for recovery health, while its bounded capture sequence continues.
+          markObservedTurnEnded(endedAt);
+          hudPending = false;
+          void refreshPageHud();
+          console.log(`[h2w] image-only turn settled from ChatGPT server snapshot (${reason})`);
+        }
+        return { checked: true, reported, captureScheduled };
       } finally {
         serverSettleInFlight = false;
       }

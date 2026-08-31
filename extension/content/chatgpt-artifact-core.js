@@ -65,10 +65,13 @@
     return match ? match[1] : null;
   }
 
-  // Extract unique image-asset file_ids from a conversation payload's
-  // `messages[].content.parts[]` (plural conversations API shape). Also
-  // tolerates a `mapping` object whose message values carry the same parts
-  // (legacy singular snapshot shape). Bounded to MAX_FILES_PER_TURN.
+  // Extract unique image-asset file_ids from the CURRENT turn only. For the
+  // plural conversations shape, the turn starts at the latest user message and
+  // includes any following tool/image/assistant messages. For the legacy
+  // mapping shape, follow the current-node parent chain back to the latest user.
+  // This deliberately refuses to scan older turns: a newly-settled image-only
+  // turn must never capture a historical image just because it is still in the
+  // conversation payload. Bounded to MAX_FILES_PER_TURN.
   function imageFileIdsFromConversation(payload) {
     const seen = new Set();
     const found = [];
@@ -80,18 +83,64 @@
     };
     if (isPlainObject(payload)) {
       if (Array.isArray(payload.messages)) {
-        for (const message of payload.messages) {
+        let latestUserIndex = -1;
+        for (let i = payload.messages.length - 1; i >= 0; i -= 1) {
+          if (payload.messages[i]?.author?.role === "user") {
+            latestUserIndex = i;
+            break;
+          }
+        }
+        const scopedMessages = latestUserIndex >= 0
+          ? payload.messages.slice(latestUserIndex)
+          : [];
+        for (const message of scopedMessages) {
           for (const part of partsOf(message)) push(part);
         }
+        return found;
       }
-      if (isPlainObject(payload.mapping)) {
-        for (const node of Object.values(payload.mapping)) {
-          if (!isPlainObject(node)) continue;
-          for (const part of partsOf(node.message)) push(part);
+      if (isPlainObject(payload.mapping) && typeof payload.current_node === "string") {
+        const currentTurn = [];
+        let nodeId = payload.current_node;
+        for (let i = 0; nodeId && i < 80; i += 1) {
+          const node = payload.mapping[nodeId];
+          if (!isPlainObject(node)) break;
+          const message = node.message;
+          if (isPlainObject(message)) currentTurn.push(message);
+          if (message?.author?.role === "user") break;
+          nodeId = node.parent || null;
+        }
+        currentTurn.reverse();
+        if (currentTurn[0]?.author?.role !== "user") return found;
+        for (const message of currentTurn) {
+          for (const part of partsOf(message)) push(part);
         }
       }
     }
     return found;
+  }
+
+  // Pure eligibility/key helper for the watcher. Text completion and image
+  // capture intentionally have different gates: an image-only ChatGPT turn can
+  // be server-finished with empty assistant text. The returned key is stable for
+  // duplicate watcher ticks and is suitable for a bounded in-memory once fence.
+  function settledImageCaptureKey({
+    adapterName,
+    conversationId,
+    pending,
+    submitAt,
+    server,
+  } = {}) {
+    if (adapterName !== "chatgpt" || !pending || !validConversationId(conversationId)) return null;
+    if (!isPlainObject(server) || server.ok !== true) return null;
+    if (server.currentNodeRole !== "assistant" || server.finished !== true) return null;
+    const fileIds = Array.isArray(server.imageFileIds)
+      ? server.imageFileIds.filter((fileId) => validFileId(fileId)).slice(0, MAX_FILES_PER_TURN)
+      : [];
+    if (!fileIds.length) return null;
+    const turnIdentity = String(server.messageId || server.updatedAt || server.createdAt || "");
+    if (!turnIdentity) return null;
+    const submit = Number(submitAt || 0);
+    return `${conversationId}:${submit > 0 ? submit : 0}:${turnIdentity}:${fileIds.join(",")}`;
   }
 
   // ---- address/link builders and endpoint path validation ----------------
@@ -243,6 +292,7 @@
     latestTurnMessages,
     parseFileIdFromPart,
     imageFileIdsFromConversation,
+    settledImageCaptureKey,
     conversationsUrl,
     fileDownloadUrl,
     isChatGptDownloadUrl,
