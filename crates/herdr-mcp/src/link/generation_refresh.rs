@@ -2,8 +2,9 @@
 //!
 //! A service generation switch updates `runtime/current`. The production Link has
 //! two additional generation references: its launchd environment and the live
-//! runtime-control document. Leaving either reference on an older `rust-*`
-//! generation makes a syntactically valid but stale Link look healthy.
+//! runtime-control document. The running Link watches runtime-control and can
+//! switch generations without dropping its Edge WebSocket; the plist is updated
+//! only so a later natural Link restart starts with the same generation identity.
 
 use crate::paths::RuntimePaths;
 
@@ -72,18 +73,17 @@ pub(crate) fn reconcile_after_service_generation_change(
 
         let generation = active_rust_generation_id(&home)?;
         let runtime_version = read_binary_version_hint(&home);
-        let control_changed = reconcile_current_generation(&home, &paths.config_dir)?;
-        let plist_changed = refresh_prod_plist_generation(
+        // Update runtime-control first. The already-running Link polls this file and
+        // hot-switches its local runtime generation while keeping the Edge WebSocket
+        // alive. Updating the plist is persistence for the next natural restart; do
+        // not bootout/bootstrap link-prod merely to refresh generation metadata.
+        reconcile_current_generation(&home, &paths.config_dir)?;
+        refresh_prod_plist_generation(
             &home,
             &prod.plist_path,
             &generation,
             runtime_version.as_deref(),
         )?;
-
-        if control_changed || plist_changed {
-            launchd.bootout_prod(LINK_PROD_LABEL)?;
-            launchd.bootstrap_prod(&prod.plist_path, LINK_PROD_LABEL)?;
-        }
 
         let status_path = prod
             .status_path
