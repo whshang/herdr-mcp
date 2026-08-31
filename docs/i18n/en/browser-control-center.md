@@ -6,7 +6,7 @@ It is not a shortcut for giving the browser unrestricted shell access. It solves
 
 > When Web AI, local agents, tests, and terminals are all active, how do you keep the real workstation state visible and make the next human control target explicit?
 
-The current Control Center uses a compact layout: the header keeps only Herdr connectivity/running state and a few global actions; a supported active page is reduced to one line such as `ChatGPT · 3 bound`; workspace and pane rows are the primary UI. Click a pane to expand its actions inline. `Send instruction` executes through Herdr `agent.prompt`; `Adjust current task` appears only when native steer is advertised; a working Agent exposes `Stop task`. Raw Terminal Input remains disabled and is no longer exposed as a beginner-facing preview.
+The current Control Center uses a compact layout: the header keeps only Herdr connectivity/running state and a few global actions; a supported active page is reduced to one line such as `ChatGPT · 3 bound`; workspace and pane rows are the primary UI. Click a pane to expand its actions inline. `Send instruction` executes through Herdr `agent.prompt`; `Adjust current task` appears only when native steer is advertised; a working Agent exposes `Stop task`; terminal-only panes expose a fenced `Run command` action through `pane.send_input + Enter`.
 
 ## How it differs from browser continuity
 
@@ -101,7 +101,7 @@ The Control Center no longer splits “workspace status” and “current-page b
 - whether the active page is bound to this workspace;
 - the single **Bind / ✓ Bound** toggle.
 
-Workspaces already bound to the active page move to the front and remain highlighted. Clicking the workspace body only expands or collapses its panes; clicking the binding toggle only binds or unbinds, so the two interactions do not trigger each other. Binding mutations are serialized in the UI to avoid ambiguous intermediate states from repeated clicks. If a bound workspace has been closed or is temporarily absent from the runtime snapshot, the list keeps a “not currently visible” bound row so the stale binding can still be removed instead of becoming hidden state.
+Workspaces already bound to the active page move to the front and remain highlighted. Clicking the workspace body only expands or collapses its panes; clicking the binding toggle only binds or unbinds, so the two interactions do not trigger each other. Binding mutations are serialized in the UI to avoid ambiguous intermediate states from repeated clicks. Once a workspace disappears from Herdr's authoritative live snapshot, its page bindings are pruned automatically. Opening Control Center also performs a compensating reconciliation, so closed historical workspaces do not remain as offline rows or make different pages report different workspace counts.
 
 Expanded rows continue to show pane-level detail:
 
@@ -152,7 +152,7 @@ The panel now has four kinds of behavior rather than one blanket “preview-only
 | Steer current task | Shown only when the runtime explicitly advertises native steer for the pinned provider | Redirects the active task without stopping its current turn; never falls back to Agent Prompt |
 | Stop task | Available only for an Agent that is currently working; confirms before sending literal `Ctrl+C` to that pane | Stops the current CLI turn/process; never presented as a provider interrupt |
 | Herdr API | Preview only | No arbitrary Herdr mutation is executed from this UI |
-| Terminal Input | Preview only | No raw terminal bytes/keys are written from this UI |
+| Run command | **Executes** only for terminal-only panes through `pane.send_input` plus `Enter` | Revalidates `target_revision` before mutation and never auto-retries uncertain delivery |
 
 ### Inspect state
 
@@ -191,6 +191,16 @@ A local `~/.codex/ipc/ipc.sock` file by itself is not sufficient evidence: a soc
 
 `Stop task` is a separate, narrower local-control path. It is enabled only for an Agent in `working` state, asks for confirmation, and sends `pane.send_keys(["C-c"])`. It does not claim provider-level interrupt semantics and is not automatically retried after uncertain delivery; inspect the target state before sending another stop.
 
+### Run command: terminal-only and fenced
+
+A terminal-only pane exposes `Run command` when expanded. This is not arbitrary Herdr API access and it does not bypass target selection. The Side Panel carries the pane's `target_revision`; Rust re-reads the live pane immediately before mutation and only then calls:
+
+```text
+pane.send_input({ pane_id, text, keys: ["Enter"] })
+```
+
+If the pane disappeared, was replaced, or became an Agent pane, the action returns `stale_target` or `rejected`. IPC/network ambiguity returns `uncertain` and the UI does not automatically resend the command. The path is covered by an isolated real-terminal UAT that verifies the text plus `Enter` executes in the selected pane.
+
 This is the direct resolution of the original Issue #57 ambiguity: **queued/prompted work and same-turn steering are separate outcomes, never aliases.**
 
 ## Reliability kernel: memory, request pressure, timeout recovery, and reload loops
@@ -211,7 +221,7 @@ Browser Control Plane reliability is not limited to action delivery. The extensi
 
 These mechanisms are one reliability layer shared by continuity and Browser Control Plane. The action route does not add another polling loop, heartbeat, or retry daemon.
 
-## Why Terminal Input and arbitrary Herdr methods still stay preview-only
+## Why arbitrary Herdr methods still stay preview-only
 
 The difficult part of browser control is not writing bytes to a terminal. The hard part is preserving answers to questions such as:
 
@@ -219,10 +229,9 @@ The difficult part of browser control is not writing bytes to a terminal. The ha
 - Did a failed request get delivered?
 - Would retrying duplicate a mutation?
 - Has the Agent session behind a pane changed?
-- Should provider steer and raw terminal input have different confirmation rules?
 - Can delivery phase survive browser reload or MV3 service-worker restart?
 
-Prompt now satisfies those contracts by reusing Rust target fencing and `agent.prompt` idempotency. Raw terminal input and arbitrary Herdr method invocation have broader effects and therefore remain fail-closed until they receive their own narrow schemas, confirmation rules, idempotency model, and UAT.
+Prompt satisfies those contracts by reusing Rust target fencing and `agent.prompt` idempotency. Terminal control now exposes only one narrow `terminal_input -> pane.send_input + Enter` operation with the same target fencing and no automatic retry after uncertain delivery. Arbitrary Herdr method invocation still has a much wider effect surface and therefore remains fail-closed / preview-only.
 
 ## Runtime and event-stream states
 

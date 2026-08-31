@@ -547,7 +547,7 @@ risk: read / mutation / unknown
 
 ### 9.4 Terminal Input
 
-这是最底层、风险最高的 escape hatch。
+底层 Herdr 已正式提供：
 
 明确区分：
 
@@ -557,9 +557,9 @@ Send input       # 文本 + Enter / shell submission
 Send keys        # Ctrl-C / arrows / shortcuts
 ```
 
-它是 raw terminal control，不是 Agent prompt，也不是 steer。
+Browser Control Center 不直接暴露完整 raw terminal escape hatch。普通 terminal-only pane 只开放一个窄化的`运行命令`动作：`terminal_input -> pane.send_input({ text, keys: ["Enter"] })`。
 
-默认折叠在 Advanced 区域。
+该动作复用 `target_revision` fencing；目标消失、被替换或变成 Agent pane 时 fail closed；delivery uncertain 时禁止自动重试。`send_text` 与任意 `send_keys` 仍不作为普通用户 UI 暴露，`Ctrl+C` 只在 Agent `Stop task` 的窄化路径中使用。
 
 ---
 
@@ -769,7 +769,7 @@ Interrupt 和 steer 分开。
 
 1. provider / Herdr 有明确 interrupt primitive -> 使用明确 primitive；
 2. 对用户已显式固定且 `working` 的 Agent pane，可以提供窄化的 `停止 (Ctrl+C)` 操作，通过 `pane.send_keys(["C-c"])` 发送终端中断；
-3. 普通 Terminal Input 仍保持独立、高风险、默认 Preview-only；
+3. 普通 terminal-only pane 的`运行命令`使用独立的 fenced `pane.send_input + Enter` 路径；
 4. 不把 `Ctrl-C` 冒充 provider interrupt。
 
 Ctrl+C 停止必须复用 target fencing，投递结果不确定时禁止自动重试。真正的 provider interrupt 仍按独立 capability 处理。

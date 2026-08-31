@@ -273,44 +273,38 @@ function renderWorkspaceTree(state) {
     const workspaceId = String(workspace.workspace_id);
     const workspaceName = workspace.label || workspaceId;
     const contextBound = pageBoundIds.has(workspaceId);
-    const bindingMissing = workspace.binding_missing === true;
     const section = document.createElement("section");
-    section.className = `workspace${contextBound ? " context-bound" : ""}${bindingMissing ? " binding-missing" : ""}`;
+    section.className = `workspace${contextBound ? " context-bound" : ""}`;
     section.dataset.workspaceId = workspaceId;
 
     const header = document.createElement("div");
     header.className = "workspace-header";
-    const expanded = !bindingMissing && expandedWorkspaces.has(workspaceId);
+    const expanded = expandedWorkspaces.has(workspaceId);
 
     const toggle = document.createElement("button");
     toggle.type = "button";
     toggle.className = "workspace-toggle";
     toggle.dataset.workspaceToggle = workspaceId;
-    toggle.disabled = bindingMissing;
     toggle.setAttribute("aria-expanded", String(expanded));
 
     const chevron = document.createElement("span");
     chevron.className = "chevron";
-    chevron.textContent = bindingMissing ? "·" : (expanded ? "▾" : "▸");
+    chevron.textContent = expanded ? "▾" : "▸";
     const stateDot = document.createElement("span");
-    stateDot.className = bindingMissing ? "dot stale" : `dot ${statusDotClass(workspaceAggregateStatus(workspace))}`;
+    stateDot.className = `dot ${statusDotClass(workspaceAggregateStatus(workspace))}`;
     const name = document.createElement("span");
     name.className = "workspace-name";
     name.textContent = workspaceName;
     const id = document.createElement("span");
     id.className = "workspace-id";
-    id.textContent = `(${workspaceId})`;
+    id.textContent = workspaceId;
     const count = document.createElement("span");
     count.className = "workspace-count";
     const workingCount = (workspace.panes || []).filter((pane) => pane.status === "working").length;
-    if (bindingMissing) {
-      count.textContent = t("cc_workspace_offline_bound");
-    } else {
-      const paneCount = workspace.panes?.length || 0;
-      count.textContent = t("cc_workspace_count", { panes: paneCount });
-      count.title = t("cc_workspace_count_detail", { panes: paneCount, working: workingCount });
-      count.setAttribute("aria-label", count.title);
-    }
+    const paneCount = workspace.panes?.length || 0;
+    count.textContent = t("cc_workspace_count", { panes: paneCount });
+    count.title = t("cc_workspace_count_detail", { panes: paneCount, working: workingCount });
+    count.setAttribute("aria-label", count.title);
     toggle.append(chevron, stateDot, name, id, count);
 
     header.appendChild(toggle);
@@ -434,7 +428,7 @@ function modePresentation(mode) {
   if (mode === ACTION_TYPES.HERDR_METHOD) {
     return { help: "cc_mode_herdr_help", placeholder: "cc_placeholder_herdr" };
   }
-  if (mode === ACTION_TYPES.TERMINAL_TEXT) {
+  if ([ACTION_TYPES.TERMINAL_TEXT, ACTION_TYPES.TERMINAL_INPUT].includes(mode)) {
     return { help: "cc_mode_terminal_help", placeholder: "cc_placeholder_terminal" };
   }
   return { help: "cc_mode_prompt_help", placeholder: "cc_placeholder_prompt" };
@@ -442,7 +436,7 @@ function modePresentation(mode) {
 
 function modeLabelKey(mode) {
   if (mode === ACTION_TYPES.STEER) return "cc_mode_steer";
-  if (mode === ACTION_TYPES.TERMINAL_TEXT) return "cc_mode_terminal";
+  if ([ACTION_TYPES.TERMINAL_TEXT, ACTION_TYPES.TERMINAL_INPUT].includes(mode)) return "cc_mode_terminal";
   return "cc_mode_prompt";
 }
 
@@ -523,7 +517,11 @@ function renderComposerState() {
   else if (descriptor.executable) blockedReason.textContent = "";
   else blockedReason.textContent = t("cc_preview_only_reason");
   sendButton.textContent = descriptor.executable
-    ? (selectedMode === ACTION_TYPES.STEER ? t("cc_execute_steer") : t("cc_execute_prompt"))
+    ? (selectedMode === ACTION_TYPES.STEER
+      ? t("cc_execute_steer")
+      : selectedMode === ACTION_TYPES.TERMINAL_INPUT
+        ? t("cc_execute_terminal")
+        : t("cc_execute_prompt"))
     : t("cc_preview_action");
   sendButton.disabled = actionInFlight || !pinnedTarget?.pane_id || pinnedTarget?.stale === true;
 
@@ -751,7 +749,7 @@ sendButton.addEventListener("click", async () => {
     result.textContent = JSON.stringify(descriptor, null, 2);
     return;
   }
-  if (!text && [ACTION_TYPES.AGENT_PROMPT, ACTION_TYPES.STEER].includes(selectedMode)) {
+  if (!text && [ACTION_TYPES.AGENT_PROMPT, ACTION_TYPES.STEER, ACTION_TYPES.TERMINAL_INPUT].includes(selectedMode)) {
     result.textContent = t("cc_control_text_required");
     return;
   }
@@ -767,6 +765,7 @@ sendButton.addEventListener("click", async () => {
   };
   const response = await bg({ type: "herdr_control_action", request });
   await applyControlResponse(response);
+  if (response?.ok && selectedMode === ACTION_TYPES.TERMINAL_INPUT) composer.value = "";
   actionInFlight = false;
   renderAll();
 });

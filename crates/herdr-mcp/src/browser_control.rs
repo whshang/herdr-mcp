@@ -124,7 +124,11 @@ pub fn control_capabilities(pane: &Value) -> Value {
     json!({
         "agent_prompt": { "available": agent.is_some() },
         "steer": steer,
-        "terminal_input": { "available": false, "outcome": "disabled_high_risk" },
+        "terminal_input": {
+            "available": agent.is_none(),
+            "outcome": if agent.is_none() { "ready" } else { "agent_pane" },
+            "delivery_mode": "pane_send_input",
+        },
         "interrupt": interrupt,
     })
 }
@@ -198,7 +202,10 @@ pub fn execute_action(
             &current_revision,
         ),
         "steer" => steer_capability_result(pane, pane_id, &current_revision),
-        "terminal_text" | "terminal_input" | "terminal_keys" => action_result(
+        "terminal_input" => {
+            execute_terminal_input(client, request_object, pane, pane_id, &current_revision)
+        }
+        "terminal_text" | "terminal_keys" => action_result(
             false,
             action,
             "rejected",
@@ -345,6 +352,83 @@ fn steer_capability_result(pane: &Value, pane_id: &str, revision: &str) -> Value
             "prompt_fallback": false,
         }),
     )
+}
+
+fn execute_terminal_input(
+    client: &HerdrClient,
+    request: &Map<String, Value>,
+    pane: &Value,
+    pane_id: &str,
+    revision: &str,
+) -> Value {
+    if pane.get("agent").and_then(Value::as_str).is_some() {
+        return action_result(
+            false,
+            "terminal_input",
+            "rejected",
+            "not_submitted",
+            pane_id,
+            json!(revision),
+            json!({"reason": "agent_pane", "delivery_mode": "pane_send_input"}),
+        );
+    }
+    let text = match request
+        .get("args")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("text"))
+        .and_then(Value::as_str)
+    {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => return invalid("args.text is required for terminal_input"),
+    };
+    if text.chars().count() > MAX_CONTROL_TEXT_CHARS {
+        return invalid("args.text is too large");
+    }
+
+    match client.call(
+        "pane.send_input",
+        json!({
+            "pane_id": pane_id,
+            "text": text,
+            "keys": ["Enter"],
+        }),
+    ) {
+        Ok(evidence) => action_result(
+            true,
+            "terminal_input",
+            "submitted",
+            "submitted",
+            pane_id,
+            json!(revision),
+            json!({
+                "delivery_mode": "pane_send_input",
+                "evidence": evidence,
+            }),
+        ),
+        Err(error) => {
+            let uncertain = matches!(
+                error.code.as_str(),
+                "timeout" | "unexpected_eof" | "socket_error"
+            );
+            action_result(
+                false,
+                "terminal_input",
+                if uncertain { "uncertain" } else { "failed" },
+                if uncertain {
+                    "uncertain"
+                } else {
+                    "not_submitted"
+                },
+                pane_id,
+                json!(revision),
+                json!({
+                    "reason": error.code,
+                    "message": error.message,
+                    "delivery_mode": "pane_send_input",
+                }),
+            )
+        }
+    }
 }
 
 fn execute_interrupt(client: &HerdrClient, pane: &Value, pane_id: &str, revision: &str) -> Value {
@@ -588,6 +672,57 @@ mod tests {
             control_capabilities(&idle_codex)["interrupt"]["outcome"],
             "no_active_turn"
         );
+        let terminal = pane(None, "unknown", 1);
+        assert_eq!(
+            control_capabilities(&terminal)["terminal_input"]["available"],
+            true
+        );
+        assert_eq!(
+            control_capabilities(&working_codex)["terminal_input"]["available"],
+            false
+        );
+    }
+
+    #[test]
+    fn terminal_input_runs_on_the_fenced_terminal_pane() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "pane.send_input");
+            assert_eq!(request["params"]["pane_id"], "w1:p1");
+            assert_eq!(request["params"]["text"], "printf 'ok\\n'");
+            assert_eq!(request["params"]["keys"], json!(["Enter"]));
+            writeln!(
+                stream,
+                "{}",
+                json!({"id": request["id"], "result": {"type": "ok"}})
+            )
+            .unwrap();
+        });
+
+        let pane = pane(None, "unknown", 1);
+        let cache = EventCache::from_snapshot_for_test(json!({"panes": [pane.clone()]}));
+        let revision = target_revision(&cache, &pane).unwrap();
+        let request = json!({
+            "action": "terminal_input",
+            "target": {"pane_id": "w1:p1", "target_revision": revision},
+            "args": {"text": "printf 'ok\\n'"},
+            "idempotency_key": "browser-control-terminal-1"
+        });
+        let client = HerdrClient::new(&socket);
+        let registry = PromptRegistry::new();
+        let result = execute_action(&client, &cache, &registry, &request);
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["outcome"], "submitted");
+        assert_eq!(result["detail"]["delivery_mode"], "pane_send_input");
+        server.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
     }
 
     #[test]
