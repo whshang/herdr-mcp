@@ -204,6 +204,10 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
     manager_options.max_timeout_ms = 60_000;
     manager_options.observation_checks = 3;
     manager_options.observation_interval_ms = 500;
+    manager_options.managed_current_link = config
+        .runtime_control_path
+        .parent()
+        .map(|config_dir| config_dir.join("runtime/current"));
 
     let manager = Arc::new(
         RuntimeGenerationManager::new(manager_options)
@@ -236,7 +240,7 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
     let mut runner_config =
         RunnerConfig::new(config.workstation_id.clone(), boot_id, started_at_ms);
     runner_config.request_timeout_ms = DAEMON_REQUEST_TIMEOUT_MS;
-    let runner = LinkRunnerCore::new(runner_config, Arc::clone(&manager), base.generation);
+    let runner = LinkRunnerCore::new(runner_config, Arc::clone(&manager));
     let transport = LinkTransportCore::new(
         config.workstation_id.clone(),
         None,
@@ -560,7 +564,6 @@ mod tests {
         let runner = LinkRunnerCore::new(
             RunnerConfig::new("dev-w1", "boot-test", 1),
             Arc::clone(&manager),
-            base.generation,
         );
         let transport = LinkTransportCore::new(
             "dev-w1",

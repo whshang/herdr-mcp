@@ -1,13 +1,10 @@
 //! Async runtime-dispatch coordinator for the staged Rust Link transport.
 //!
 //! This is the composition layer between [`LinkTransportCore`],
-//! [`PendingRequests`], [`GenerationFence`] and an injected
-//! [`LinkRuntimeTransport`]. It owns first-settler-wins request races and
-//! generation leases, while socket I/O/timer delivery remain outside this
-//! staged library boundary.
-//!
-//! No CLI/daemon/service path constructs this runner yet; production Link
-//! remains on the Node implementation until later cutover gates are complete.
+//! [`PendingRequests`] and an injected [`LinkRuntimeTransport`]. It owns
+//! first-settler-wins request races while generation ownership stays inside the
+//! runtime transport. Generation-aware transports reserve exactly one request
+//! lease at accept time and dispatch through that same lease.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +12,6 @@ use std::time::Duration;
 use serde_json::{Number, Value, json};
 use tokio::sync::mpsc;
 
-use super::generation_fence::{FenceError, GenerationFence};
 use super::local_mcp::{LinkRuntimeTransport, RuntimeHealth, RuntimeToolResult};
 use super::request_core::{
     CODE_DUPLICATE_REQUEST, CODE_LINK_STOPPING, CODE_QUEUE_FULL, CODE_REQUEST_TIMEOUT,
@@ -28,6 +24,8 @@ use crate::relay::wire::{
     build_cancel_ack_message, build_heartbeat_message, build_hello_message, build_status_report,
     build_tool_error_message, build_tool_result_message,
 };
+
+const CODE_RUNTIME_GENERATION_DISPATCH_REJECTED: &str = "runtime_generation_dispatch_rejected";
 
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
@@ -56,24 +54,8 @@ impl RunnerConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunnerError {
-    Fence(FenceError),
     Transport(TransportError),
-    GenerationProofMissing {
-        request_id: String,
-        expected: String,
-    },
-    GenerationMismatch {
-        request_id: String,
-        expected: String,
-        observed: String,
-    },
     RuntimeEventChannelClosed,
-}
-
-impl From<FenceError> for RunnerError {
-    fn from(value: FenceError) -> Self {
-        Self::Fence(value)
-    }
 }
 
 impl From<TransportError> for RunnerError {
@@ -86,8 +68,7 @@ impl From<TransportError> for RunnerError {
 enum RuntimeEvent {
     DispatchCompleted {
         slot: PendingSlot,
-        owner_generation: String,
-        serving_generation: Option<String>,
+        serving_generation: String,
         result: RuntimeToolResult,
     },
     RequestTimeout {
@@ -102,14 +83,13 @@ pub struct LinkRunnerCore<T: LinkRuntimeTransport> {
     config: RunnerConfig,
     runtime: Arc<T>,
     pending: PendingRequests,
-    fence: GenerationFence,
     event_tx: mpsc::Sender<RuntimeEvent>,
     event_rx: mpsc::Receiver<RuntimeEvent>,
     stopping: bool,
 }
 
 impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
-    pub fn new(config: RunnerConfig, runtime: Arc<T>, base_generation: impl Into<String>) -> Self {
+    pub fn new(config: RunnerConfig, runtime: Arc<T>) -> Self {
         let max_pending = config.max_pending.max(1);
         let event_capacity = max_pending.saturating_mul(2).max(8);
         let (event_tx, event_rx) = mpsc::channel(event_capacity);
@@ -117,7 +97,6 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
             config,
             runtime,
             pending: PendingRequests::new(max_pending),
-            fence: GenerationFence::new(base_generation),
             event_tx,
             event_rx,
             stopping: false,
@@ -130,10 +109,6 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
 
     pub fn stopping(&self) -> bool {
         self.stopping
-    }
-
-    pub fn request_owner(&self, request_id: &str) -> Option<&str> {
-        self.fence.request_owner(request_id)
     }
 
     pub fn runtime_info(&self) -> RuntimeContractInfo {
@@ -265,12 +240,20 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
             }
         };
 
-        let lease = match self.fence.begin_request(slot.request.request_id.clone()) {
-            Ok(lease) => lease,
+        let serving_generation = match self.runtime.begin_request_lease(&slot.request.request_id) {
+            Ok(generation) => generation,
             Err(error) => {
                 let _ = slot.claim_settle();
                 self.pending.drop_if_same(&slot);
-                return Err(error.into());
+                return Ok(vec![self.immediate_error(
+                    &request_id,
+                    CODE_RUNTIME_GENERATION_DISPATCH_REJECTED,
+                    false,
+                    &error,
+                    DeliveryState::NotDelivered,
+                    now_ms,
+                    None,
+                )]);
             }
         };
 
@@ -286,16 +269,16 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
         let completion_tx = self.event_tx.clone();
         let runtime = Arc::clone(&self.runtime);
         let completion_slot = slot.clone();
-        let owner_generation = lease.generation;
         tokio::spawn(async move {
-            let serving_generation = runtime.runtime_info().runtime_generation;
             let result = runtime
-                .dispatch_request(completion_slot.request.clone())
+                .dispatch_request_with_lease(
+                    completion_slot.request.clone(),
+                    serving_generation.clone(),
+                )
                 .await;
             let _ = completion_tx
                 .send(RuntimeEvent::DispatchCompleted {
                     slot: completion_slot,
-                    owner_generation,
                     serving_generation,
                     result,
                 })
@@ -310,12 +293,9 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
         reason: Option<String>,
         now_ms: i64,
     ) -> Result<Vec<RelayMessage>, RunnerError> {
-        let owner = self.fence.request_owner(&request_id).map(str::to_owned);
         let outcome = self.pending.cancel(&request_id);
         let accepted = matches!(outcome, super::request_core::CancelOutcome::Accepted(_));
         if accepted {
-            let owner = owner.ok_or_else(|| FenceError::UnknownRequest(request_id.clone()))?;
-            self.fence.complete_request(&request_id, &owner)?;
             let runtime = Arc::clone(&self.runtime);
             let runtime_request_id = request_id.clone();
             let runtime_reason = reason.clone().unwrap_or_else(|| "edge_cancel".to_owned());
@@ -375,12 +355,6 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
                     return Ok(Vec::new());
                 };
                 let request_id = slot.request.request_id.clone();
-                let owner = self
-                    .fence
-                    .request_owner(&request_id)
-                    .map(str::to_owned)
-                    .ok_or_else(|| FenceError::UnknownRequest(request_id.clone()))?;
-                self.fence.complete_request(&request_id, &owner)?;
                 Ok(vec![self.immediate_error(
                     &request_id,
                     CODE_REQUEST_TIMEOUT,
@@ -396,39 +370,21 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
             }
             RuntimeEvent::DispatchCompleted {
                 slot,
-                owner_generation,
                 serving_generation,
                 result,
             } => {
-                // Timeout/cancel/hard-stop may have already won this race.
-                // In that case the completion is stale and must not perform
-                // generation-proof checks against a lease that was released.
+                // Timeout/cancel/hard-stop may have already won this race. The
+                // generation-aware runtime still completes its authoritative
+                // lease when dispatch finishes; the runner only drops the late
+                // correlated response.
                 if slot.is_settled() {
                     return Ok(Vec::new());
                 }
                 let request_id = slot.request.request_id.clone();
-                let Some(serving_generation) = serving_generation else {
-                    return Err(RunnerError::GenerationProofMissing {
-                        request_id,
-                        expected: owner_generation,
-                    });
-                };
-                if serving_generation != owner_generation {
-                    return Err(RunnerError::GenerationMismatch {
-                        request_id,
-                        expected: owner_generation,
-                        observed: serving_generation,
-                    });
-                }
-                // Only settle/drop after the serving-generation proof passes.
-                // A proof failure leaves PendingRequests and GenerationFence
-                // aligned so a timeout or hard-stop can still release both.
                 if !slot.claim_settle() {
                     return Ok(Vec::new());
                 }
                 self.pending.drop_if_same(&slot);
-                self.fence
-                    .complete_request(&request_id, &serving_generation)?;
                 Ok(vec![self.result_message(
                     request_id,
                     result,
@@ -453,12 +409,6 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
         let mut outbound = Vec::new();
         for slot in self.pending.reject_all() {
             let request_id = slot.request.request_id.clone();
-            let owner = self
-                .fence
-                .request_owner(&request_id)
-                .map(str::to_owned)
-                .ok_or_else(|| FenceError::UnknownRequest(request_id.clone()))?;
-            self.fence.complete_request(&request_id, &owner)?;
             outbound.push(self.immediate_error(
                 &request_id,
                 CODE_LINK_STOPPING,
@@ -629,7 +579,7 @@ mod tests {
 
     use serde_json::{Map, Number, json};
 
-    use super::{LinkRunnerCore, RunnerConfig, RunnerError};
+    use super::{LinkRunnerCore, RunnerConfig};
     use crate::link::local_mcp::{LinkRuntimeTransport, RuntimeHealth, RuntimeToolResult};
     use crate::link::request_core::RuntimeRequest;
     use crate::relay::protocol::{
@@ -638,7 +588,7 @@ mod tests {
     };
 
     struct MockRuntime {
-        generation: Option<String>,
+        generation: Mutex<Option<String>>,
         delay_ms: u64,
         health_delay_ms: u64,
         result: RuntimeToolResult,
@@ -649,7 +599,7 @@ mod tests {
     impl MockRuntime {
         fn new(generation: &str, delay_ms: u64, result: RuntimeToolResult) -> Self {
             Self {
-                generation: Some(generation.to_owned()),
+                generation: Mutex::new(Some(generation.to_owned())),
                 delay_ms,
                 health_delay_ms: 0,
                 result,
@@ -659,6 +609,13 @@ mod tests {
                     details: None,
                 },
             }
+        }
+
+        fn set_generation(&self, generation: Option<&str>) {
+            *self
+                .generation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = generation.map(str::to_owned);
         }
 
         fn with_health_delay(mut self, health_delay_ms: u64) -> Self {
@@ -676,7 +633,11 @@ mod tests {
             RuntimeContractInfo {
                 runtime_version: "test".to_owned(),
                 runtime_commit: None,
-                runtime_generation: self.generation.clone(),
+                runtime_generation: self
+                    .generation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
                 contract_epoch: Number::from(2),
                 contract_hash: Some("sha256:test".to_owned()),
                 herdr_version: None,
@@ -725,7 +686,7 @@ mod tests {
         let mut config = RunnerConfig::new("ws1", "boot1", 1_000);
         config.request_timeout_ms = request_timeout_ms;
         config.max_pending = 2;
-        LinkRunnerCore::new(config, runtime, "gen-a")
+        LinkRunnerCore::new(config, runtime)
     }
 
     #[tokio::test]
@@ -746,11 +707,9 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(runner.active_requests(), 1);
-        assert_eq!(runner.request_owner("r1"), Some("gen-a"));
 
         let outbound = runner.next_runtime_output(1_120).await.unwrap();
         assert_eq!(runner.active_requests(), 0);
-        assert_eq!(runner.request_owner("r1"), None);
         match outbound.as_slice() {
             [RelayMessage::ToolResult(result)] => {
                 assert_eq!(result.request_id, "r1");
@@ -784,7 +743,6 @@ mod tests {
             .unwrap();
         let outbound = runner.next_runtime_output(1_120).await.unwrap();
         assert_eq!(runner.active_requests(), 0);
-        assert_eq!(runner.request_owner("r1"), None);
         assert!(matches!(
             outbound.as_slice(),
             [RelayMessage::ToolError(error)]
@@ -819,7 +777,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(runner.active_requests(), 0);
-        assert_eq!(runner.request_owner("r1"), None);
         assert!(matches!(
             outbound.as_slice(),
             [RelayMessage::CancelAck(ack)] if ack.accepted
@@ -837,12 +794,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generation_mismatch_drops_result_and_preserves_fence_evidence() {
+    async fn request_lease_generation_is_used_for_the_correlated_result() {
         let runtime = Arc::new(MockRuntime::new(
             "gen-b",
             0,
             RuntimeToolResult::Success {
-                result: Some(json!({"unsafe": true})),
+                result: Some(json!({"ok": true})),
             },
         ));
         let mut runner = runner(runtime, 1_000);
@@ -850,52 +807,40 @@ mod tests {
             .handle_inbound(request_message("r1", 500), 1_100)
             .await
             .unwrap();
-        assert_eq!(
-            runner.next_runtime_output(1_120).await,
-            Err(RunnerError::GenerationMismatch {
-                request_id: "r1".to_owned(),
-                expected: "gen-a".to_owned(),
-                observed: "gen-b".to_owned(),
-            })
-        );
-        assert_eq!(runner.active_requests(), 1);
-        assert_eq!(runner.request_owner("r1"), Some("gen-a"));
-        let stopped = runner.begin_stopping(1_130).unwrap();
+        let outbound = runner.next_runtime_output(1_120).await.unwrap();
         assert_eq!(runner.active_requests(), 0);
-        assert_eq!(runner.request_owner("r1"), None);
         assert!(matches!(
-            stopped.as_slice(),
-            [RelayMessage::ToolError(error)] if error.code == "link_stopping"
+            outbound.as_slice(),
+            [RelayMessage::ToolResult(result)]
+                if result.request_id == "r1"
+                    && result.runtime_generation == OptionalNullable::Value("gen-b".to_owned())
         ));
     }
 
     #[tokio::test]
-    async fn missing_generation_proof_preserves_pending_and_fence_until_cleanup() {
-        let mut mock = MockRuntime::new(
+    async fn missing_generation_lease_fails_only_the_request_and_keeps_link_alive() {
+        let mock = Arc::new(MockRuntime::new(
             "gen-a",
             0,
             RuntimeToolResult::Success {
                 result: Some(json!({"unsafe": true})),
             },
-        );
-        mock.generation = None;
-        let mut runner = runner(Arc::new(mock), 1_000);
-        runner
+        ));
+        mock.set_generation(None);
+        let mut runner = runner(mock, 1_000);
+        let outbound = runner
             .handle_inbound(request_message("r1", 500), 1_100)
             .await
             .unwrap();
-        assert_eq!(
-            runner.next_runtime_output(1_120).await,
-            Err(RunnerError::GenerationProofMissing {
-                request_id: "r1".to_owned(),
-                expected: "gen-a".to_owned(),
-            })
-        );
-        assert_eq!(runner.active_requests(), 1);
-        assert_eq!(runner.request_owner("r1"), Some("gen-a"));
-        runner.begin_stopping(1_130).unwrap();
         assert_eq!(runner.active_requests(), 0);
-        assert_eq!(runner.request_owner("r1"), None);
+        assert!(matches!(
+            outbound.as_slice(),
+            [RelayMessage::ToolError(error)]
+                if error.request_id == "r1"
+                    && error.code == "runtime_generation_dispatch_rejected"
+                    && !error.retryable
+                    && error.delivery_state == Some(DeliveryState::NotDelivered)
+        ));
     }
 
     #[tokio::test]
@@ -927,7 +872,6 @@ mod tests {
                     && error.delivery_state == Some(DeliveryState::NotDelivered)
         ));
         assert_eq!(runner.active_requests(), 2);
-        assert_eq!(runner.request_owner("r3"), None);
     }
 
     #[tokio::test]

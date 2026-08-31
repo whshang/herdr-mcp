@@ -464,6 +464,37 @@ fn launchd_label_loaded(label: &str) -> bool {
     }
 }
 
+fn parse_launchd_environment_value(output: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key} =>");
+    output.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix(&prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn launchd_loaded_environment_value(label: &str, key: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let target = format!("gui/{}/{label}", unsafe { libc::geteuid() });
+        let output = Command::new("launchctl")
+            .args(["print", target.as_str()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_launchd_environment_value(&String::from_utf8_lossy(&output.stdout), key)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (label, key);
+        None
+    }
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -480,6 +511,30 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
         crate::link::LINK_RUST_CANDIDATE_LABEL,
         candidate_loaded,
     );
+    let configured_prod_generation = prod.runtime_generation.clone();
+    let loaded_prod_generation =
+        launchd_loaded_environment_value(LINK_PROD_LABEL, "HERDR_RUNTIME_GENERATION");
+    let current_generation = current_managed_runtime_generation(home);
+    let status_path = prefer_existing(&[
+        config_dir.join("runtime-status-prod.json"),
+        config_dir.join("runtime-status.json"),
+    ]);
+    let active_generation = status_path
+        .as_ref()
+        .and_then(|path| read_status_active_generation(path));
+    let configured_matches_current = matches!(
+        (configured_prod_generation.as_deref(), current_generation.as_deref()),
+        (Some(configured), Some(current)) if configured == current
+    );
+    let loaded_matches_current = matches!(
+        (loaded_prod_generation.as_deref(), current_generation.as_deref()),
+        (Some(loaded), Some(current)) if loaded == current
+    );
+    let runtime_control_active_matches_current = matches!(
+        (active_generation.as_deref(), current_generation.as_deref()),
+        (Some(active), Some(current)) if active == current
+    );
+    let loaded_environment_stale = prod_loaded && !loaded_matches_current;
     // Foreground `link run` is wired. Candidate LaunchAgent install is separate
     // from production cutover; production_ready stays false until all gates pass.
     let rust_cli_has_link_run = crate::link::LINK_RUN_WIRED;
@@ -513,6 +568,23 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
             agent_json(&link),
             agent_json(&candidate),
         ],
+        "production_runtime_alignment": {
+            "current_generation": current_generation,
+            "active_generation": active_generation,
+            "configured_launchd_generation": configured_prod_generation,
+            "loaded_launchd_generation": loaded_prod_generation,
+            "configured_matches_current": configured_matches_current,
+            "loaded_matches_current": loaded_matches_current,
+            "runtime_control_active_matches_current": runtime_control_active_matches_current,
+            "loaded_environment_stale": loaded_environment_stale,
+            "detail": if loaded_environment_stale && runtime_control_active_matches_current {
+                "runtime-control reports active=current, but the loaded launchd environment still carries a stale startup generation"
+            } else if loaded_environment_stale {
+                "loaded launchd generation is stale relative to runtime/current and runtime-control has not reported active=current"
+            } else {
+                "loaded/configured Link generation is aligned with runtime/current"
+            },
+        },
         "notes": [
             "Read-only report. Does not mutate launchd, plists, or Node Link.",
             "Candidate label is dev.herdr-mcp.link-rust-candidate (link install/uninstall); never confuses with live Node link/link-prod.",
@@ -659,6 +731,25 @@ mod tests {
         );
         assert!(program_points_at_managed_runtime(&program, &home));
         assert!(!program_points_at_repo_checkout(&program));
+    }
+
+    #[test]
+    fn parses_loaded_launchd_runtime_generation_from_print_output() {
+        let output = r#"
+environment = {
+    HERDR_RUNTIME_VERSION => 0.4.3-dev
+    HERDR_RUNTIME_GENERATION => rust-c286e4312263b688
+    HERDR_WORKSTATION_ID => prod-real-runtime
+}
+"#;
+        assert_eq!(
+            parse_launchd_environment_value(output, "HERDR_RUNTIME_GENERATION").as_deref(),
+            Some("rust-c286e4312263b688")
+        );
+        assert_eq!(
+            parse_launchd_environment_value(output, "HERDR_EDGE_URL"),
+            None
+        );
     }
 
     #[test]

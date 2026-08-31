@@ -710,16 +710,21 @@ export function buildRollbackPlan(job) {
     steps.push({ action: "restore_server_plist", from: job.server_plist_backup, to: job.server_plist });
     steps.push({ action: "reload_server_from_original" });
     steps.push({ action: "verify_original_runtime" });
+  } else if (job.server_plist_edited === true) {
+    // File-only restore: the running 8772 process is still the original runtime.
+    // Persist the original restart identity before the manager pointer moves back.
+    steps.push({ action: "restore_server_plist", from: job.server_plist_backup, to: job.server_plist });
+  }
+  if (job.link_plist_backup) {
+    // Restoring the plist does not restart the live Link. Doing it before the
+    // activation closes the rollback crash window for a natural Link restart.
+    steps.push({ action: "restore_link_plist", from: job.link_plist_backup, to: job.link_plist });
   }
   if (job.candidate_active || job.original_active) {
     steps.push({ action: "activate_original_generation", generation: job.original_active });
   }
-  // plist was edited but the server was never reloaded -> restore file only.
-  if (job.server_plist_edited === true && !serverSwitched) {
-    steps.push({ action: "restore_server_plist", from: job.server_plist_backup, to: job.server_plist });
-  }
-  if (job.link_plist_backup) {
-    steps.push({ action: "restore_link_plist", from: job.link_plist_backup, to: job.link_plist });
+  if (job.candidate_active === true && job.candidate_generation) {
+    steps.push({ action: "wait_candidate_generation_drain", generation: job.candidate_generation });
   }
   if (job.candidate_generation) {
     steps.push({ action: "remove_candidate_generation", generation: job.candidate_generation });
@@ -838,6 +843,14 @@ async function cmdWorker(args, env) {
     if (!candidateActive) throw new Error("candidate did not become active");
     await setState(jobPath, job, { stage: "candidate_active", candidate_active: true });
 
+    // Requests accepted before the switch remain pinned to the original
+    // generation. Never replace 8772 until those leases have drained.
+    if (job.original_active) {
+      const originalDrained = await waitForGenerationDrained(job, job.original_active);
+      if (!originalDrained) throw new Error(`original generation did not drain: ${job.original_active}`);
+      await setState(jobPath, job, { stage: "original_drained" });
+    }
+
     // --- reload server (8772) to release dist/server.js ---
     await setStage(jobPath, job, "reload_server", log);
     await writePlist(job.server_plist, transformServerPlist(serverPlist, join(job.release, "dist", "server.js")));
@@ -863,6 +876,13 @@ async function cmdWorker(args, env) {
     if (regStable.code !== 0 || !parseJsonOk(regStable.stdout)) throw new Error("register stable failed");
     const stableVal = await waitForValidation(job, stable, job.version);
     if (!stableVal.ok) throw new Error("stable validation failed");
+
+    // Persist the Link restart identity before activating stable. This does not
+    // restart the live Link, but closes the stable-active/stale-plist crash window.
+    const linkPlist = await readPlist(job.link_plist);
+    await writePlist(job.link_plist, transformLinkPlist(linkPlist, stable));
+    await setState(jobPath, job, { stage: "link_plist_prepared", link_plist_prepared: true });
+
     const actStable = await execFileWrap(process.execPath, [paths.runtimeGenCli, "activate",
       "--generation", stable, "--checks", "3", "--interval-ms", "500"], { env: runtimeEnv(env, paths), encoding: "utf8" });
     if (actStable.code !== 0 || !parseJsonOk(actStable.stdout)) throw new Error("activate stable failed");
@@ -870,13 +890,14 @@ async function cmdWorker(args, env) {
     if (!stableActive) throw new Error("stable did not become active");
     await setState(jobPath, job, { stage: "stable_active" });
 
-    // --- update link-prod plist generation (do NOT restart the link) ---
-    const linkPlist = await readPlist(job.link_plist);
-    await writePlist(job.link_plist, transformLinkPlist(linkPlist, stable));
-    await setState(jobPath, job, { stage: "link_plist_updated" });
+    // Requests accepted while the candidate was active remain pinned there.
+    // Never remove or terminate that process until its authoritative leases drain.
+    const candidateDrained = await waitForGenerationDrained(job, job.candidate_generation);
+    if (!candidateDrained) throw new Error(`candidate generation did not drain: ${job.candidate_generation}`);
+    await setState(jobPath, job, { stage: "candidate_drained" });
 
     // --- cleanup old generations (safe order) ---
-    // 1) remove the candidate (traffic already moved to stable).
+    // 1) remove the drained candidate (traffic already moved to stable).
     await execFileWrap(process.execPath, [paths.runtimeGenCli, "remove", "--generation", job.candidate_generation],
       { env: runtimeEnv(env, paths), encoding: "utf8" }).catch(() => {});
     // 2) drop generations that are not the new stable and whose endpoint is the
@@ -959,6 +980,27 @@ async function waitForActiveGeneration(job, generation) {
   while (Date.now() < deadline) {
     const st = await readJson(job.status_path).catch(() => null);
     if (st?.manager?.active_generation === generation) return true;
+    await sleep(400);
+  }
+  return false;
+}
+
+/** Pure status predicate used by update/rollback ordering and unit tests. */
+export function generationDrained(status, generation) {
+  if (!generation) return true;
+  const manager = status?.manager;
+  if (!manager || !Array.isArray(manager.generations)) return false;
+  if (manager.active_generation === generation) return false;
+  const record = manager.generations.find((entry) => entry?.generation === generation);
+  if (!record) return true;
+  return Number.isInteger(record.in_flight) && record.in_flight === 0 && record.phase !== "active";
+}
+
+async function waitForGenerationDrained(job, generation, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const status = await readJson(job.status_path).catch(() => null);
+    if (generationDrained(status, generation)) return true;
     await sleep(400);
   }
   return false;
@@ -1193,6 +1235,11 @@ async function runRollbackStep(step, job, env, paths) {
       const r = await execFileWrap(process.execPath, [paths.runtimeGenCli, "activate", "--generation", step.generation], { env: rtEnv, encoding: "utf8" });
       return { ok: r.code === 0 || parseJsonOk(r.stdout) };
     }
+    case "wait_candidate_generation_drain": {
+      if (!step.generation) return { ok: true };
+      const drained = await waitForGenerationDrained(job, step.generation);
+      return drained ? { ok: true } : { ok: false, error: "candidate_generation_drain_timeout" };
+    }
     case "restore_server_plist": {
       await copyFile(step.from, step.to);
       await chmod(step.to, 0o600);
@@ -1229,6 +1276,12 @@ async function runRollbackStep(step, job, env, paths) {
     }
     case "stop_candidate": {
       const pid = Number(job.candidate_pid ?? 0);
+      if (job.candidate_active === true && job.candidate_generation) {
+        const status = await readJson(job.status_path).catch(() => null);
+        if (!generationDrained(status, job.candidate_generation)) {
+          return { ok: false, error: "candidate_generation_not_drained" };
+        }
+      }
       if (Number.isInteger(pid) && pid > 0 && isPidAlive(pid)) {
         try { process.kill(pid, "SIGTERM"); } catch { /* ignore */ }
       }
