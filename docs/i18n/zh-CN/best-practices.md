@@ -32,18 +32,11 @@ herdr-mcp 的理想工作方式是：**Web 模型负责理解目标、做决策�
 
 ## 3. 什么时候调度本地 Agent
 
-适合 `herdr_prompt` 的任务包括：
+只有任务需要**独立推理、真正并行或独立审查**时才委派；已知文件上的确定性编辑、Git 查询和测试不要再包装成 Agent 任务。
 
-- 可以和主线独立并行的实现；
-- 需要第二种思路的故障调查；
-- 独立 code review / audit；
-- 较长、边界明确、结果可以通过 Git 和测试验证的工作。
+一次好的委派应该有明确的问题边界、工作目录、允许修改范围、验收证据和停止条件。Web planner 保留总体拆分、优先级和最终验收权，并在 worker 完成后重新检查 Git、测试和运行状态。
 
-Pi、Cline、OpenCode 等 worker 适合执行实现；Grok、Droid 等可以承担独立审查。具体可见 Agent 由当前 Herdr 配置决定，不应在业务流程里假设某个 Agent 永远存在。
-
-Web planner 自己保留总体任务拆分、优先级和最终验收权。一个 Agent 完成后，直接检查 Git diff、测试和运行结果，不依赖它的自然语言“已经完成”。
-
-Herdr worker 不可用且本机安装了 DSH 时，可以用 `dsh --profile headless` 作为 CLI fallback。长任务通过 `herdr_exec_start` 运行，避免把正常的长推理误判成同步命令超时。详见 [Worker fallback](worker-fallbacks.md)。
+具体 worker 怎么选、首选 worker 不可用怎么办、长任务如何运行、timeout 后如何避免重复 mutation，统一见 [Worker 备选](worker-fallbacks.md)。本页不维护第二套 worker 顺序和 fallback 规则。
 
 ## 4. 并行开发要隔离工作区
 
@@ -82,15 +75,11 @@ git diff --check
 
 不要为了得到状态而让另一个 Agent 运行 `git status`。这些确定性事实直接读取更快，也更可靠。
 
-## 7. 浏览器扩展负责连续工作
+## 7. 浏览器扩展只负责“时间上的连续”，不替代 planner
 
-扩展解决的是 Web 会话自身不持续运行的问题。它负责把 Herdr 进度送回网页、恢复超时回复、按作用域自动继续，并在长对话接近容量边界时生成接力摘要并迁移到新会话。
+当任务会跨越当前网页回合时，扩展负责把本机进度、恢复和接力重新接到正确会话；它不负责重新规划任务，也不能因为“继续”而跳过 live-state 验证。
 
-自动化开启后，应该让扩展负责这些机械动作；HUD 负责网页 / Herdr 状态、Auto、三个预置推进动作和当前会话的手动接力。需要主动切换会话时，直接使用 **HUD 的“接力”**；自动接力仍由容量和恢复策略触发。
-
-ChatGPT Project、普通 ChatGPT 会话、z.ai 和 DeepSeek 的作用域规则不同，具体以 [浏览器扩展](extension.md) 和 [自动继续与接力](browser-continuity.md) 为准。
-
-如果用户手动在同一个已绑定 ChatGPT Project 里新开会话，只说“继续 / 接着上次”，不要先要求用户寻找 `continuity_id`。应先 resolve/search 本机 durable continuity；纯文本召回没有自动选择权，存在歧义必须确认后才能 resume，恢复后还要重新检查实时 Herdr / Git / runtime 再 mutation。
+日常原则只有两条：第一次使用保持 Auto 关闭；任何恢复/接力后的 mutation 都重新检查 Herdr、Git 和 runtime。HUD、作用域、handoff、歧义确认、429/页面恢复等机制统一以 [浏览器连续工作](browser-continuity.md) 为 SSOT；Side Panel 操作见 [浏览器控制中心](browser-control-center.md)。本页不重复浏览器状态机细节。
 
 ## 8. Edge 保持稳定，本地 Runtime 可以演进
 

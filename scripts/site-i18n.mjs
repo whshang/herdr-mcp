@@ -30,6 +30,7 @@ export const DOC_ORDER = [
   "browser-continuity",
   "extension",
   "browser-control-center",
+  "browser-json-mcp-bridge",
   "privacy",
   "cloudflare-edge-deployment",
   "cloudflare-edge-token",
@@ -40,7 +41,6 @@ export const DOC_ORDER = [
   "architecture",
   "capability-benchmark",
   "herdr-vs-ecosystem",
-  "remote-coding-ecosystem-research",
 ];
 
 export const MAINTAINER_DOCS = [];
@@ -51,11 +51,19 @@ export const READING_ORDER = DOC_ORDER.filter((slug) => !MAINTAINER_DOCS.include
 export const NAV_GROUPS = [
   { slugs: ["agent-install", "overview", "install", "chatgpt-connector", "quick-start"] },
   { slugs: ["best-practices", "automation", "cli-reference"] },
-  { slugs: ["browser-continuity", "extension", "browser-control-center", "privacy"] },
+  { slugs: ["browser-continuity", "extension", "browser-control-center", "browser-json-mcp-bridge", "privacy"] },
   { slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade", "worker-fallbacks", "troubleshooting"] },
-  { slugs: ["design-philosophy", "architecture", "capability-benchmark", "herdr-vs-ecosystem", "remote-coding-ecosystem-research"] },
+  { slugs: ["design-philosophy", "architecture", "capability-benchmark", "herdr-vs-ecosystem"] },
   { slugs: MAINTAINER_DOCS, secondary: true },
 ];
+
+// Retired logical docs that still need URL backward compatibility. The value is
+// the slug each retired slug redirects to. These are NOT published as first-class
+// articles (they are absent from DOC_ORDER above and from the file layout), only
+// as generated HTML redirect pages preserving public links.
+export const REDIRECTS = {
+  "remote-coding-ecosystem-research": "herdr-vs-ecosystem",
+};
 
 // Per-locale navigation group labels, in NAV_GROUPS order.
 export const NAV_GROUP_LABELS = {
@@ -158,6 +166,7 @@ export const UI = {
     homeSupportTitle: "需要更多信息？",
     homeHistory: "历史与发布证据",
     historyNav: "History / 历史证据",
+    redirectFollow: "此页面已迁移，请跟随新的地址继续阅读 →",
     copyCode: "复制",
     copiedCode: "已复制",
   },
@@ -254,6 +263,7 @@ export const UI = {
     homeSupportTitle: "Need more detail?",
     homeHistory: "History and release evidence",
     historyNav: "History / evidence",
+    redirectFollow: "This page has moved; follow the new address to keep reading →",
     copyCode: "Copy",
     copiedCode: "Copied",
   },

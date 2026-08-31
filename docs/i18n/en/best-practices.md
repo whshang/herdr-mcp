@@ -45,26 +45,13 @@ long tests/build    → herdr_exec_start/read
 
 This saves model context, lowers latency and gives the Web planner direct evidence.
 
-## 3. Delegate one bounded reasoning task at a time
+## 3. Delegate only work that deserves an independent worker
 
-Good delegation tasks include:
+Delegate when a task genuinely benefits from **independent reasoning, real parallelism, or an independent review**. Deterministic edits in known files, Git queries, and test execution should stay direct.
 
-- investigate one subsystem;
-- implement one narrow feature;
-- compare two approaches;
-- review a completed diff;
-- explore an independent hypothesis in parallel.
+A bounded delegation has a clear problem, working directory, allowed mutation scope, acceptance evidence, and stopping condition. The Web planner still owns integration and re-checks Git, tests, and runtime facts after the worker finishes.
 
-A good prompt specifies:
-
-- repository and working area;
-- exact problem boundary;
-- files or interfaces owned by the worker;
-- what not to modify;
-- expected tests/evidence;
-- whether the worker should only analyze or may mutate.
-
-The local worker should not become a hidden “manager of managers.” The Web planner owns integration.
+Worker choice, fallback order, long-running execution, and timeout/retry safety have one SSOT: [Worker fallbacks](worker-fallbacks.md). This page intentionally does not maintain a second worker-selection policy.
 
 ## 4. Use worktrees for real parallel edits
 
@@ -136,28 +123,9 @@ If the server restarted and the cursor is no longer valid, use fresh inspect sta
 
 ## 8. Use browser continuity for time, not for reasoning
 
-MCP sends work from the browser to the workstation. It does not automatically start a new Web turn when a local worker finishes later.
+When work outlives the current Web turn, the extension reconnects progress, recovery, and handoff to the correct conversation. It does not become another planner, and “resume” never authorizes skipping fresh Herdr/Git/runtime checks.
 
-Bind the conversation to the relevant Herdr workspace when the task is expected to outlive the current turn.
-
-Use the extension for:
-
-- progress/settled wakeups;
-- stale-view/send-timeout recovery;
-- long-conversation handoff;
-- JSON→MCP on sites without a native Connector.
-
-Do not treat the extension as another planner.
-
-### Auto and manual handoff
-
-New automation scopes default off. Enable Auto only after you have confirmed the binding and event stream are correct.
-
-The HUD's three preset manual progression actions are mutually exclusive with Auto. **Manual handoff is intentionally different and lives only in the HUD:** where supported, it can start with Auto on or off, pauses source automatic wakes during the transfer, and makes the new conversation inherit the source Auto state.
-
-A handoff packet is historical context; the target conversation still re-checks Herdr/Git/runtime before mutation.
-
-If a user manually starts a new conversation in the same bound ChatGPT Project and says only “continue” / “resume”, do not ask them to find a `continuity_id`. Resolve/search durable continuity first. Text-only recall never authorizes automatic selection; ambiguity must be confirmed before resume, and live Herdr / Git / runtime state must be re-inspected before mutation.
+Keep Auto off on first use. Treat any handoff packet as historical context and re-inspect live state before mutation. HUD behavior, automation scope, handoff ambiguity, 429/page recovery, and conversation rollover have one SSOT: [Browser Continuity](browser-continuity.md). Side Panel operations live in [Browser Control Center](browser-control-center.md). This page intentionally does not duplicate the browser state machine.
 
 ## 9. Keep the public Edge stable while the local runtime evolves
 

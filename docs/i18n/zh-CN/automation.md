@@ -1,38 +1,31 @@
-# 自动化：把文档、Edge 和本机 Runtime 分成三个发布平面
+# 自动化：让文档、Edge 与本机 Runtime 独立部署
 
-这篇面向维护者。普通用户第一次安装 herdr-mcp 不需要理解全部 CI/CD 细节。
+这篇面向维护者，回答的是 **CI/CD 怎样执行**，不是重新定义 release model。
 
-herdr-mcp 有三类自动化，而且刻意不把它们揉成一个“大部署按钮”：
+长期 release 边界只有一份 SSOT：[`docs/release-model.md`](../../release-model.md)。其中 Runtime、Browser Extension、Contract Compatibility 是版本与兼容性平面；本页讨论的是日常自动化会触达的几个**部署面**：
 
 ```text
-文档平面          公网 Edge 平面          本机 Runtime 平面
-GitHub Pages       Cloudflare Worker       runtime generation A/B
-     │                    │                       │
-给人和 agent 阅读      OAuth / MCP / WSS       fs / git / shell / Herdr
+文档发布            公网 Edge 部署           本机 Runtime 激活
+GitHub Pages         Cloudflare Worker        runtime generation A/B
+     │                      │                        │
+人类/Agent 文档         OAuth / MCP / WSS         fs / Git / shell / Herdr
 ```
 
-它们共享同一个 Git 仓库，但应该拥有不同的凭据、健康检查、回滚方式和故障域。
+这些动作共享同一个 Git 仓库，但不应共享凭据、回滚边界或故障域。Browser Extension 和 contract migration 也有各自独立流程，本页只说明它们如何与 CI 协作。
 
-## 为什么要分三个发布平面
+## 为什么自动化必须解耦
 
-如果一个 commit 同时能：
+一次普通修复不应该顺手改变 OAuth identity、Cloudflare routing、本机 runtime generation、浏览器扩展身份和 ChatGPT tool contract。
 
-- 改公开文档；
-- 改 OAuth issuer；
-- 改 Cloudflare 路由；
-- 替换本机 runtime；
-- 修改 ChatGPT tool contract；
-
-那么一次普通修复的爆炸半径会非常大。
-
-herdr-mcp 的发布原则是：**只改变本次任务真正需要改变的平面。**
+执行原则是：**只触发本次任务真正需要的部署动作，并保持其它 release/compatibility plane 不变。**
 
 例如：
 
 - 修文档 → 只发布 Pages；
-- 修 Edge relay → 只发布 Worker；
-- 修 `herdr_fs_*` → 只切本机 runtime generation；
-- 改 public tool catalog → 走独立 contract epoch migration。
+- 修 Edge relay → 只部署 Worker；
+- 修 runtime implementation → 只验证并切换本机 generation；
+- 改 public tool catalog → 走独立 contract compatibility migration；
+- 只改扩展 UI → 走扩展自己的发布路径，不顺带发布 Runtime。
 
 ## 1. GitHub Pages：人类文档和 Agent 策略
 

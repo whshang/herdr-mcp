@@ -12,6 +12,7 @@ import {
   NAV_GROUPS,
   NAV_GROUP_LABELS,
   READING_ORDER,
+  REDIRECTS,
   SITE_ORIGIN_ENV,
   UI,
 } from "./site-i18n.mjs";
@@ -224,6 +225,26 @@ function searchUi({ pre, locale, searchIndex }) {
   <script id="search-index" type="application/json">${jsonForScript(searchIndex)}</script>
   <script id="search-i18n" type="application/json">${jsonForScript(i18n)}</script>
   <script src="${pre}app.js" defer></script>`;
+}
+
+// A retired-but-URL-published logical doc redirects to its successor slug within
+// the same locale. This keeps old links (e.g. remote-coding-ecosystem-research)
+// resolving without re-publishing the withdrawn article as first-class content.
+function retiredRedirectShell({ locale, slug, target, targetTitle, ui, runtimeVersion }) {
+  const selfHref = `${origin}/docs/${locale}/${slug}.html`;
+  const targetHref = `${origin}/docs/${locale}/${target}.html`;
+  const alternates = LOCALES.map((lang) => ({ lang, href: `${origin}/docs/${lang}/${target}.html` }));
+  return `<!doctype html>
+<html lang="${ui.htmlLang}">
+<head>
+  ${headMeta({ pre: "../../", locale, canonicalHref: targetHref, alternates, xDefault: targetHref, description: "", title: `${targetTitle} · herdr-mcp` })}
+  <meta http-equiv="refresh" content="0; url=./${target}.html">
+</head>
+<body class="docs-page">
+  ${topbar({ pre: "../../", locale, drawer: true, localePrefix: "../", version: runtimeVersion })}
+  <main class="redirect-note"><a href="./${target}.html">${esc(ui.redirectFollow)}</a></main>
+</body>
+</html>`;
 }
 
 function pageNav(docsBySlug, slug, ui) {
@@ -450,6 +471,16 @@ for (const locale of LOCALES) {
     await writeFile(
       join(localeOut, `${slug}.html`),
       articleShell({ locale, doc, body: page.html, toc: page.toc, docsBySlug, searchIndex, version: runtimeVersion })
+    );
+  }
+  // Backward-compatible URL pages for retired logical docs: meta-refresh to the
+  // successor slug within the same locale. They carry the same topbar so a human
+  // landing on an old link still sees the docs chrome while the page reloads.
+  for (const [slug, target] of Object.entries(REDIRECTS)) {
+    const targetTitle = docsBySlug.get(target)?.title ?? target;
+    await writeFile(
+      join(localeOut, `${slug}.html`),
+      retiredRedirectShell({ locale, slug, target, targetTitle, ui: UI[locale], runtimeVersion })
     );
   }
   await writeFile(join(localeOut, "index.html"), localeEntryShell({ locale, docsBySlug, searchIndex, version: runtimeVersion }));

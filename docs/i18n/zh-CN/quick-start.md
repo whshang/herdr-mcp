@@ -1,179 +1,79 @@
-# 快速开始：从零体验第一次远程开发
+# 快速开始：完成安装后的第一次真实任务
 
-> **职责：** 本页是**安装之后**用来验证并跑通第一个真实远程任务的内容，不是另一份安装教程。
-> - 交给 Coding Agent 的权威安装协议：[Agent 安装](agent-install.md)。
-> - 手动安装：[安装](install.md)。
->
-> 深入理解请阅读 [设计思路](design-philosophy.md) 与 [架构](architecture.md)。
+> **职责：** 本页从“herdr-mcp 已安装并连接”开始，只验证第一次真实远程开发闭环。安装协议见 [Agent 安装](agent-install.md)；人工安装与运维步骤见 [安装](install.md)。
 
-目标：在已经安装 Herdr 的情况下，让 ChatGPT 等 Web AI 第一次真正连接自己的开发环境。
+第一次体验不需要重新部署 Edge、重新安装 runtime，也不需要先装浏览器扩展。目标只有一个：证明 Web AI 真的到达了你的工作站，并能在真实仓库里完成一次可验证的工作。
 
-整个过程只需要理解三句话：
+## 1. 先做一次只读检查
 
-> **MCP 让 Web AI 有了操作本机的双手。** 你可以继续使用已经订阅的 ChatGPT / Web AI，而不是先换到另一套模型入口。
->
-> **Herdr 给这些双手一个持续存在的工作现场。** workspace、终端、进程和 Agent 不依赖某一个 ChatGPT 对话存活。
->
-> **浏览器扩展是可选的闭环层。** 没有它，MCP 的文件、Git、Shell、Agent 和多 workspace 能力照常工作；安装它以后，本地完成事件、页面恢复和长对话接力才能主动接回 Web 会话。
-
-## 1. 准备本机开发现场
-
-herdr-mcp 不替代 Herdr。先安装并启动官方 Herdr：
-
-```bash
-herdr --version
-herdr api schema >/dev/null
-```
-
-如果第一次接触 Herdr，先理解这些概念：
-
-- workspace：一个长期存在的工作空间；
-- tab：工作区中的标签页；
-- pane：具体终端/Agent 工作面板；
-- agent：正在执行任务的本地智能体；
-- session：可以恢复的长期执行状态。
-
-这些状态会成为 Web AI 后续观察和恢复工作的依据。
-
-## 2. 安装 herdr-mcp
-
-从 [GitHub Releases](https://github.com/whshang/herdr-mcp/releases) 下载当前平台的原生 `herdr-mcp` 二进制，放到 `PATH` 上，然后验证：
-
-```bash
-herdr-mcp doctor
-herdr-mcp status
-```
-
-本机 MCP runtime **不需要** Node.js / npm。优先使用顶层 `doctor` / `status` / `update ...`；不要把 `herdr-mcp service install` 当成普通安装主路径。
-
-确认本机 HTTP 在听：
-
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
-```
-
-`200` 或 `401` 都说明本机 HTTP 进程已起来。
-
-### 只给源码开发者：让本机直接 dogfood 当前 checkout
-
-普通用户继续使用 PROD Release。只有在开发 herdr-mcp 自身源码、且 runtime 为 v0.4.3+ 时，才使用明确的 DEV plane，不要手工覆盖 `runtime/current`：
-
-```bash
-herdr-mcp dev status
-herdr-mcp dev sync --dry-run
-herdr-mcp dev sync
-```
-
-`dev sync` 会把当前 clean checkout 构建成 `0.4.3-dev`，记录 source provenance，固定保存进入 DEV 前的 PROD binary/checksum，然后通过与 PROD 相同的 transactional runtime lifecycle 激活。只有 server、Native Host 与 production workstation Link 收敛到同一个 generation，切换才算成功。dirty source 默认拒绝，除非显式使用 `--allow-dirty`。
-
-需要回到固定 PROD 恢复源时执行：
-
-```bash
-herdr-mcp dev rollback
-```
-
-Runtime DEV/PROD 与扩展 DEV/STANDALONE/STORE 是两套独立通道。DEV runtime 切换不会部署 Edge、修改 DNS/OAuth，也不会建立第三套长期 test 环境。
-
-## 3. 选择你的第一次连接方式
-
-### 路线 A：ChatGPT Connector
-
-适合：希望用最强 Web 模型直接开发。
-
-链路：
+在一个新的 ChatGPT 会话里发送：
 
 ```text
-ChatGPT
- ↓
-Cloudflare Edge + OAuth
- ↓
-herdr-mcp
- ↓
-Herdr 工作站
+检查当前 Herdr workspace 和 Git 状态。只读，不要修改。
 ```
 
-继续阅读：
+正常路径应当是：
 
-- [安装](install.md)
-- [连接 ChatGPT](chatgpt-connector.md)
-
-首次部署推荐使用 `workers.dev`。自定义域名属于长期生产优化，不是第一次运行的前置条件。
-
-如果 OAuth 正常但工具调用返回 `workstation offline`，优先检查 workstation Link，而不是删除/重建 Connector。v0.4.3+ 对刚掉线的 workstation 会先在 Edge 做短暂 reconnect grace；持续 Link 失联再交给本机 reconnect/recycle。完整的 retry 与 mutation safety 规则见 [故障排查](troubleshooting.md)。
-
-### 路线 B（可选）：给 MCP 增加反向通道
-
-适合：希望长任务完成后重新唤起 Web 工作流，或需要页面恢复、长对话接力和浏览器侧状态。
-
-只想让 ChatGPT 操作本机时可以完全跳过这一节。标准 MCP 解决的是 Web → workstation；扩展补的是 workstation / page → Web，这不是第一次连接的前置条件。
-
-扩展有 STORE / STANDALONE / DEV 三种身份。当前 stable v0.4.2 只支持 Store/DEV Native Host ownership；v0.4.3+ 才支持固定身份的 STANDALONE。普通用户默认从 [Herdr Chrome Web Store 官方详情页](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) 走 STORE；Store 不可用或用户明确选择独立分发时，只有在已安装 runtime 明确支持 standalone 的情况下才使用正式 GitHub/manual STANDALONE package。DEV 仅用于源码开发。随后按当前 runtime 支持的通道完成 Native Host 选择并运行：
-
-```bash
-herdr-mcp native-host status
+```text
+herdr_inspect
+  ↓
+选择真实 managed Git root
+  ↓
+herdr_git status
+  ↓
+herdr_fs_read / herdr_fs_grep
+  ↓
+基于本机事实回答
 ```
 
-浏览器扩展提供：
+这一步验证的不是“Connector 显示已连接”，而是公网 MCP、workstation Link、runtime 与 Herdr 现场确实连成了一条链。
 
-- workspace 绑定与 Agent 进度 / settled 回推；
-- ChatGPT 页面恢复与长对话接力；同一个已绑定 Project 中手动新开会话后可直接说“继续”，无需提供内部 continuity ID，歧义时由 Herdr 展示有界候选让用户确认；
-- Chrome Side Panel 浏览器控制中心：实时查看 workspace / pane / Agent；
-- 明确 pin 一个 pane，读取状态与最近输出；
-- ChatGPT **排队**：当前回复不中断，补充要求在下一轮优先发送；
-- z.ai / DeepSeek 的实验性 JSON → MCP 兼容桥；两个站点默认关闭，需要在 **Herdr 设置 → 实验性功能** 中分别开启并刷新对应页面。
+如果这里出现 `workstation_offline`、0 tools、OAuth 循环或 managed-root 拒绝，不要继续做写入测试，先按 [故障排查](troubleshooting.md) 定位对应层。
 
-第一次使用先保持 Auto 关闭，确认 binding、Control Center 实时状态和人工操作都符合预期，再按作用域开启自动化。
+## 2. 做一次确定性小修改
 
-继续阅读：[浏览器扩展](extension.md) 和 [浏览器控制中心](browser-control-center.md)。
+选择一个安全、容易验证的改动，例如文档错字、测试夹具或小范围配置，然后要求：
 
-### 路线 C：本地 CLI / Agent 集成
+```text
+先检查 Git 状态，读取目标文件，完成这一个小修改，运行最相关的验证，最后给我 diff 和结果。不要调度本地 Agent。
+```
 
-适合：Cursor、Claude Code、Pi、其它本地 Agent。
+理想流程是：
 
-它们可以直接使用本机 MCP，不经过公网 Edge。
+```text
+inspect → read → patch → test → diff
+```
 
-## 4. 第一次让 ChatGPT 操作项目
+这一步验证 Web planner 能直接完成确定性工作，而不是把所有事情再次包装成 Coding Agent 任务。
 
-推荐从一个小任务开始：
+## 3. 再试一次真正值得委派的任务
 
-例如：
+只有任务需要独立推理、并行调查或较长执行时，再让 Web planner 调度本地 worker。例如：
 
-> 查看这个仓库最近一次测试失败原因，修复后运行相关测试。
+```text
+调查这个失败测试的根因并实现最小修复。保持无关文件不变，完成后由你重新检查 Git diff 和测试结果。
+```
 
-一个正常流程应该类似：
+本地 Agent 的最终文字不是事实源。Web planner 应重新读取仓库、测试和运行状态再验收。worker 选择、超时和 fallback 规则见 [Worker 备选](worker-fallbacks.md)。
 
-1. ChatGPT 调 `herdr_inspect` 查看当前工作现场；
-2. 使用 `herdr_git` 确认仓库状态；
-3. 使用 `herdr_fs_read/grep` 定位代码；
-4. 使用 patch 修改；
-5. 使用 exec 运行测试；
-6. 检查 diff 和测试结果。
+## 4. 需要长时间离开页面时，再加浏览器扩展
 
-需要并行分析时，再调度本地 Agent。
+标准 MCP 已经足够完成文件、Git、Shell、Agent 和多 workspace 工作。浏览器扩展只在你需要这些能力时再加入：
 
-## 5. 验收连接是否真正成功
+- 本地 `working / progress / settled` 主动回到正确网页会话；
+- 页面卡顿、刷新和长对话接力；
+- Chrome Side Panel 观察 workspace / pane / Agent；
+- 当前回复结束后发送的“排队”消息。
 
-不要只检查服务有没有启动。真正可用需要验证：
+第一次启用扩展时保持 Auto 关闭，先确认 binding 与实时状态正确。扩展总览见 [浏览器扩展](extension.md)，连续工作机制见 [浏览器连续工作](browser-continuity.md)，Side Panel 操作见 [浏览器控制中心](browser-control-center.md)。
 
-- ChatGPT 能获取当前 MCP tools；
-- 工具调用可以读取真实项目文件；
-- Git 状态来自你的真实仓库；
-- 浏览器扩展可以看到 workspace；
-- 长任务完成后，状态可以回到网页会话。
+## 5. 什么才算第一次体验成功
 
-## 6. 什么时候开启自动继续
+最低验收不是“服务健康”，而是下面四件事同时成立：
 
-自动化用于减少等待，不用于绕过确认。
+1. Web AI 能读取真实 Herdr workspace 和真实仓库；
+2. 一个小修改经过相关验证并能看到真实 diff；
+3. 需要委派时，Web planner 能重新验收 worker 的实际结果；
+4. 如果启用浏览器扩展，长任务完成后能安全回到正确会话，而不是重复执行原 mutation。
 
-建议：
-
-- 第一次使用保持手动模式；
-- 熟悉流程后，再针对稳定项目开启自动继续；
-- 高风险操作（部署、权限修改、生产数据变化）保持人工确认。
-
-## 下一步
-
-- 深入理解：[设计思路](design-philosophy.md)
-- 理解系统：[架构](architecture.md)
-- 连接 ChatGPT：[ChatGPT Connector](chatgpt-connector.md)
-- 学习日常流程：[最佳实践](best-practices.md)
+做到这里，安装阶段就结束了。日常工作方式继续看 [最佳实践](best-practices.md)；系统为什么这样设计看 [架构](architecture.md)。
