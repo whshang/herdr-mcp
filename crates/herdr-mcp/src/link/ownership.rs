@@ -564,9 +564,9 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
             "detail": gate.detail,
         })).collect::<Vec<_>>(),
         "agents": [
-            agent_json(&prod),
-            agent_json(&link),
-            agent_json(&candidate),
+            agent_json(&prod, home),
+            agent_json(&link, home),
+            agent_json(&candidate, home),
         ],
         "production_runtime_alignment": {
             "current_generation": current_generation,
@@ -593,7 +593,7 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
     })
 }
 
-fn agent_json(agent: &LinkAgentView) -> Value {
+fn agent_json(agent: &LinkAgentView, home: &Path) -> Value {
     json!({
         "label": agent.label,
         "plist": agent.plist_path.display().to_string(),
@@ -607,6 +607,7 @@ fn agent_json(agent: &LinkAgentView) -> Value {
         "status_path": agent.status_path,
         "runtime_generation": agent.runtime_generation,
         "points_at_repo_checkout": program_points_at_repo_checkout(&agent.program_arguments),
+        "points_at_managed_runtime": program_points_at_managed_runtime(&agent.program_arguments, home),
     })
 }
 
@@ -731,6 +732,47 @@ mod tests {
         );
         assert!(program_points_at_managed_runtime(&program, &home));
         assert!(!program_points_at_repo_checkout(&program));
+    }
+
+    #[test]
+    fn agent_json_exposes_positive_managed_runtime_ownership() {
+        let home = PathBuf::from("/Users/example");
+        let binary = home
+            .join(".config")
+            .join("herdr-mcp")
+            .join("runtime")
+            .join("current")
+            .join("herdr-mcp");
+        let managed = LinkAgentView {
+            label: LINK_PROD_LABEL.to_owned(),
+            plist_path: home
+                .join("Library")
+                .join("LaunchAgents")
+                .join("dev.herdr-mcp.link-prod.plist"),
+            present: true,
+            loaded: true,
+            implementation: LinkImplementation::Rust,
+            program_arguments: args(&[binary.to_str().unwrap(), "link", "run"]),
+            edge_url: None,
+            workstation_id: None,
+            control_path: None,
+            status_path: None,
+            runtime_generation: Some("rust-7d7db9d2063970d2".to_owned()),
+        };
+        let json = agent_json(&managed, &home);
+        assert_eq!(json["points_at_managed_runtime"], true);
+        assert_eq!(json["points_at_repo_checkout"], false);
+        assert_eq!(json["implementation"], "rust");
+
+        // A foreign Rust binary (same implementation, not the managed path) must
+        // NOT be treated as owned: points_at_managed_runtime is the positive proof.
+        let foreign = LinkAgentView {
+            program_arguments: args(&["/opt/other/herdr-mcp", "link", "run"]),
+            ..managed.clone()
+        };
+        let foreign_json = agent_json(&foreign, &home);
+        assert_eq!(foreign_json["points_at_managed_runtime"], false);
+        assert_eq!(foreign_json["implementation"], "rust");
     }
 
     #[test]
