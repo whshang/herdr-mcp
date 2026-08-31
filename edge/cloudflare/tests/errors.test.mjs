@@ -45,8 +45,20 @@ test("errors: mapLinkErrorCode keeps known, degrades unknown to internal", () =>
 });
 
 test("errors: structured results carry requestId", () => {
-  assert.equal(offlineResult({ requestId: "r1" }).requestId, "r1");
+  const offline = offlineResult({ requestId: "r1" });
+  assert.equal(offline.requestId, "r1");
+  assert.equal(offline.retryable, true);
+  assert.equal(offline.delivery_state, "not_delivered");
+  assert.equal(offline.retry_after_ms, 5_000);
+  assert.deepEqual(offline.recovery, {
+    action: "retry_read_only_probe",
+    probe_tool: "herdr_inspect",
+    max_attempts: 3,
+    backoff_ms: [5_000, 10_000, 20_000],
+    mutation_replay: "only_after_not_delivered_or_verified_not_applied",
+  });
   assert.equal(reconnectingResult({ requestId: "r1" }).retryable, true);
+  assert.equal(reconnectingResult({ requestId: "r1" }).delivery_state, "not_delivered");
   assert.equal(uncertainResult({ requestId: "r1" }).retryable, false);
   assert.equal(capacityResult({ requestId: "r1" }).retryable, true);
 });
