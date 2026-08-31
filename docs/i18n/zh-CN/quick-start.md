@@ -54,6 +54,26 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 
 `200` 或 `401` 都说明本机 HTTP 进程已起来。
 
+### 只给源码开发者：让本机直接 dogfood 当前 checkout
+
+普通用户继续使用 PROD Release。只有在开发 herdr-mcp 自身源码、且 runtime 为 v0.4.3+ 时，才使用明确的 DEV plane，不要手工覆盖 `runtime/current`：
+
+```bash
+herdr-mcp dev status
+herdr-mcp dev sync --dry-run
+herdr-mcp dev sync
+```
+
+`dev sync` 会把当前 clean checkout 构建成 `0.4.3-dev`，记录 source provenance，固定保存进入 DEV 前的 PROD binary/checksum，然后通过与 PROD 相同的 transactional runtime lifecycle 激活。只有 server、Native Host 与 production workstation Link 收敛到同一个 generation，切换才算成功。dirty source 默认拒绝，除非显式使用 `--allow-dirty`。
+
+需要回到固定 PROD 恢复源时执行：
+
+```bash
+herdr-mcp dev rollback
+```
+
+Runtime DEV/PROD 与扩展 DEV/STANDALONE/STORE 是两套独立通道。DEV runtime 切换不会部署 Edge、修改 DNS/OAuth，也不会建立第三套长期 test 环境。
+
 ## 3. 选择你的第一次连接方式
 
 ### 路线 A：ChatGPT Connector
@@ -78,6 +98,8 @@ Herdr 工作站
 - [连接 ChatGPT](chatgpt-connector.md)
 
 首次部署推荐使用 `workers.dev`。自定义域名属于长期生产优化，不是第一次运行的前置条件。
+
+如果 OAuth 正常但工具调用返回 `workstation offline`，优先检查 workstation Link，而不是删除/重建 Connector。v0.4.3+ 对刚掉线的 workstation 会先在 Edge 做短暂 reconnect grace；持续 Link 失联再交给本机 reconnect/recycle。完整的 retry 与 mutation safety 规则见 [故障排查](troubleshooting.md)。
 
 ### 路线 B（可选）：给 MCP 增加反向通道
 

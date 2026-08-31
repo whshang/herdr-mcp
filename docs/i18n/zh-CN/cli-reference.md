@@ -19,7 +19,26 @@ herdr-mcp rollback
 herdr-mcp uninstall
 ```
 
-`service ...`、`link ...`、`native-host ...`、`candidate`、`dev` 属于高级/内部命令。正常安装本机 runtime 不需要仓库 checkout、Node.js、npm，也不应把 `service install` 当作普通用户入口。
+`service ...`、`link ...`、`native-host ...`、`candidate` 属于高级/内部命令；`dev` 是下面单独说明的**源码开发**入口。正常安装本机 runtime 不需要仓库 checkout、Node.js、npm，也不应把 `service install` 当作普通用户入口。
+
+## 源码开发 Runtime：DEV / PROD
+
+v0.4.3+ 只有这一条正式路径可以让开发机 dogfood herdr-mcp 源码，同时始终保留稳定 PROD 恢复源：
+
+```bash
+herdr-mcp dev status
+herdr-mcp dev sync --dry-run
+herdr-mcp dev sync
+herdr-mcp dev rollback
+```
+
+- `dev status` 只读，显示 runtime channel、active/dev/prod generation、source repo/branch/commit/dirty provenance、`runtime/current` 是否与记录一致，以及固定 PROD 快照是否通过校验。
+- `dev sync --dry-run` 只展示计划，不构建、不切换 runtime。
+- `dev sync` 默认要求 clean source checkout，把源码构建成例如 `0.4.3-dev` 的 DEV identity；进入 DEV 前先把现有 PROD binary 与 SHA-256 evidence 固定保存在 `~/.config/herdr-mcp/runtime/channels/prod/`，再复用正式 transactional service install。只有 server、Native Host、`dev.herdr-mcp.link-prod` 都 reconcile 到同一个 managed generation，激活才算成功。
+- `dev sync --allow-dirty` 是给明确的本地实验使用的 provenance override，不应作为日常默认值。
+- `dev rollback` 校验并重新安装固定 PROD binary。连续多次 DEV sync 保留最初固定的 PROD 恢复源，不会把“上一个 DEV generation”当作新的 PROD。
+
+DEV/PROD 切换只影响本机 runtime lifecycle，不部署 Cloudflare Edge，不修改 DNS/OAuth，也不创建第三套长期 test 环境。Runtime DEV/PROD 与扩展 DEV/STANDALONE/STORE 身份模型相互独立。
 
 ## Agent 能力发现：`scan`
 
@@ -230,7 +249,9 @@ bin/herdr-link
 |---|---|
 | 看本机 runtime 是否活着 | `herdr-mcp status` |
 | 看错误 | `herdr-mcp logs -f` |
-| 更新本地开发构建 | `npm run build && herdr-mcp restart` |
+| 把当前源码 dogfood 为 DEV runtime | `herdr-mcp dev sync` |
+| 查看 DEV/PROD provenance | `herdr-mcp dev status` |
+| 从 DEV 回到固定 PROD | `herdr-mcp dev rollback` |
 | 安装扩展本机桥 | `herdr-mcp native-host install` |
 | 部署前检查 Cloudflare 权限 | `bin/herdr-cloudflare-token ... --dry-run` |
 | 看 A/B 当前状态 | `bin/herdr-runtime-generation status` |

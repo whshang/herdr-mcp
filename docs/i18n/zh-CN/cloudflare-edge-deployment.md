@@ -124,6 +124,8 @@ workstation ── outbound WSS ──► Edge
 
 如果 OAuth 正常、Worker `/health` 也能打开，但工具调用报告 workstation offline，应该查 link，而不是重新安装 Connector。
 
+v0.4.3+ 会先给最近在线过的 workstation 一小段纯内存 reconnect grace；如果 validated Link 没有回来，MCP 错误会明确带上 `retryable`、`delivery_state`、`retry_after_ms` 和有界只读 recovery policy，让 Agent 不需要猜“能不能重放”。本机 Link 自己负责 reconnect/backoff 与 prolonged-offline recycle；这条恢复链不依赖浏览器扩展状态，也不会为了请求恢复额外制造 request-led Durable Object write/alarm。精确的 replay 规则见 [故障排查](troubleshooting.md)。
+
 ## 第一次验收顺序
 
 不要一上来就在 ChatGPT 里排所有问题。按层验证：

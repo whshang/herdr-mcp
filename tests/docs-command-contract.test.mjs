@@ -98,6 +98,38 @@ test("release model keeps publication and ownership boundaries explicit", () => 
   assert.match(model, /DEV/);
 });
 
+test("v0.4.3 source-development docs expose DEV/PROD dogfood without the old npm rebuild path", () => {
+  for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
+    const doc = read(rel);
+    assert.match(doc, /herdr-mcp dev status/, `${rel} must expose read-only DEV provenance`);
+    assert.match(doc, /herdr-mcp dev sync/, `${rel} must expose the explicit DEV activation path`);
+    assert.match(doc, /herdr-mcp dev rollback/, `${rel} must expose the pinned PROD rollback path`);
+  }
+
+  for (const rel of ["docs/i18n/en/cli-reference.md", "docs/i18n/zh-CN/cli-reference.md"]) {
+    const doc = read(rel);
+    assert.match(doc, /herdr-mcp dev status/);
+    assert.match(doc, /herdr-mcp dev sync --dry-run/);
+    assert.match(doc, /herdr-mcp dev rollback/);
+    assert.doesNotMatch(doc, /npm run build && herdr-mcp restart/);
+  }
+});
+
+test("workstation_offline docs preserve layered self-healing and delivery-state safety", () => {
+  const cases = [
+    ["docs/i18n/en/troubleshooting.md", /2 seconds/, /300 seconds/, /delivery_state=not_delivered/, /retry_after_ms=5000/, /browser extension does not make this decision/],
+    ["docs/i18n/zh-CN/troubleshooting.md", /2 秒/, /300 秒/, /not_delivered/, /retry_after_ms=5000/, /浏览器扩展不参与这个错误判定/],
+  ];
+  for (const [rel, edgeGrace, localRecycle, notDelivered, retryAfter, extensionBoundary] of cases) {
+    const doc = read(rel);
+    assert.match(doc, edgeGrace, `${rel} must document bounded Edge reconnect grace`);
+    assert.match(doc, localRecycle, `${rel} must document prolonged local Link recycle`);
+    assert.match(doc, notDelivered, `${rel} must document confirmed non-delivery`);
+    assert.match(doc, retryAfter, `${rel} must document machine-readable retry timing`);
+    assert.match(doc, extensionBoundary, `${rel} must keep browser extension outside the offline decision path`);
+  }
+});
+
 test("README continuity path stays no-ID and fail-closed across languages", () => {
   const cases = [
     ["README.md", /simply say \*\*“continue”\*\* or \*\*“resume”\*\*/, /without supplying an internal continuity ID/, /Recency or text similarity alone never selects a chain/],

@@ -36,6 +36,8 @@ Inspect my Herdr projects. Read only; do not modify anything.
 
 A healthy setup lets ChatGPT see real workspaces, panes, agents, Git state, and project files through the MCP tools.
 
+On v0.4.3+, `workstation_offline` is a Link/Edge reachability condition, not a browser-extension error. Edge absorbs short reconnects before surfacing the error; if it still must return one, the MCP result carries explicit retry/delivery metadata, while the workstation Link keeps local reconnect/backoff and prolonged-offline recycle. See [Troubleshooting](docs/i18n/en/troubleshooting.md) for the exact mutation replay rules.
+
 ### Artifacts and visual work in v0.4.2
 
 The v0.4.2 runtime extends the same workstation boundary to visual and file-import work. `herdr_fs_image` lets ChatGPT inspect PNG/JPEG/GIF/WebP assets directly from managed projects, and the built-in planner policy routes artifacts over the shortest safe path: managed local files go through the direct `herdr_fs_*` tools, safe signed HTTPS URLs are imported directly with `herdr-mcp artifact import --signed-url`, directly consumable MCP/Connector file references are consumed directly, and only the remaining cross-boundary transfers use a private, short-lived Cloudflare R2 generic artifact relay. The Rust runtime imports with HTTPS/SSRF, size, MIME/signature, digest, managed-root, dirty-file, and busy-agent checks before anything is written to the repository. The public MCP catalog stays at 18 tools.
@@ -84,6 +86,18 @@ herdr-mcp update status
 herdr-mcp rollback
 herdr-mcp uninstall
 ```
+
+For **herdr-mcp source development** on v0.4.3+, the runtime plane is explicitly split into DEV and PROD:
+
+```bash
+herdr-mcp dev status
+herdr-mcp dev sync
+herdr-mcp dev rollback
+```
+
+`dev sync` is the deliberate dogfood path: it builds the current clean checkout as `0.4.3-dev`, embeds source commit/dirty provenance, pins the existing PROD binary and SHA-256 recovery source, then reuses the transactional service lifecycle so the server, Native Host and `dev.herdr-mcp.link-prod` converge on one managed DEV generation. `dev status` is read-only. `dev rollback` returns to the pinned PROD binary; repeated DEV syncs do not redefine PROD as the previous DEV generation. `dev sync --dry-run` previews the transaction without mutating runtime state, and dirty source is refused unless `--allow-dirty` is explicit.
+
+These DEV commands are for maintainers/source developers, not an alternate ordinary-user install path. Runtime **DEV / PROD** is also separate from browser-extension **DEV / STANDALONE / STORE** identity.
 
 `herdr-mcp service ...` is an **advanced / internal** service-control surface, not the normal install path. On `0.4.1+`, `herdr-mcp scan --json` refreshes the evidence-backed inventory of locally startable Herdr agent kinds; see the [CLI reference](docs/i18n/en/cli-reference.md#capability-discovery-scan) for details.
 

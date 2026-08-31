@@ -18,7 +18,26 @@ herdr-mcp rollback
 herdr-mcp uninstall
 ```
 
-`service ...`, `link ...`, `native-host ...`, `candidate` and `dev` are advanced/internal commands. Do not use a repository checkout, Node.js, npm or `service install` as the normal runtime installation path.
+`service ...`, `link ...`, `native-host ...` and `candidate` are advanced/internal commands. `dev` is an advanced **source-development** surface described below. Do not use a repository checkout, Node.js, npm or `service install` as the normal runtime installation path.
+
+## Source-development runtime: DEV / PROD
+
+v0.4.3+ has one explicit path for dogfooding herdr-mcp source without losing a stable recovery source:
+
+```bash
+herdr-mcp dev status
+herdr-mcp dev sync --dry-run
+herdr-mcp dev sync
+herdr-mcp dev rollback
+```
+
+- `dev status` is read-only. It reports current runtime channel, active/dev/prod generations, source repo/branch/commit/dirty provenance, whether `runtime/current` matches recorded state, and whether the pinned PROD snapshot validates.
+- `dev sync --dry-run` shows the intended transaction without building or switching runtime state.
+- `dev sync` requires a clean source checkout by default, builds a DEV identity such as `0.4.3-dev`, pins the pre-existing PROD binary and SHA-256 evidence under `~/.config/herdr-mcp/runtime/channels/prod/`, then reuses the normal transactional service install path. Server, Native Host and `dev.herdr-mcp.link-prod` must reconcile to the same managed generation before activation is accepted.
+- `dev sync --allow-dirty` is an explicit provenance override for deliberate local experiments. Do not make it the default.
+- `dev rollback` verifies and reinstalls the pinned PROD binary. Repeated DEV syncs preserve that fixed PROD recovery source rather than treating the previous DEV generation as PROD.
+
+DEV/PROD switching is local runtime lifecycle only. It does not deploy Cloudflare Edge, change DNS/OAuth, or create a third persistent test environment. Runtime DEV/PROD is independent from extension DEV/STANDALONE/STORE identity.
 
 ## macOS permissions
 
@@ -194,7 +213,9 @@ The supervised updater reuses generation activation and must not be used to sile
 |---|---|
 | runtime status | `herdr-mcp status` |
 | follow logs | `herdr-mcp logs -f` |
-| rebuild local runtime | `npm run build && herdr-mcp restart` |
+| dogfood current source as DEV runtime | `herdr-mcp dev sync` |
+| inspect DEV/PROD provenance | `herdr-mcp dev status` |
+| return from DEV to pinned PROD | `herdr-mcp dev rollback` |
 | install browser bridge | `herdr-mcp native-host install` |
 | preflight Cloudflare permissions | `bin/herdr-cloudflare-token ... --dry-run` |
 | inspect A/B state | `bin/herdr-runtime-generation status` |

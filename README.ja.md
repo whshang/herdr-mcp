@@ -33,6 +33,8 @@ Inspect my Herdr projects. Read only; do not modify anything.
 
 正常なら、ChatGPT は実際の workspace / pane / agent / Git / project files を MCP 経由で確認できます。
 
+v0.4.3+ の `workstation_offline` は Link/Edge から target workstation への reachability condition で、browser-extension error ではありません。Edge は短い reconnect を先に吸収し、それでも error を返す場合は MCP result に retry/delivery metadata を含めます。workstation Link 側も reconnect/backoff と prolonged-offline recycle を続けます。mutation replay の安全条件は [Troubleshooting（英語）](docs/i18n/en/troubleshooting.md) を参照してください。
+
 ### v0.4.2 の画像・ビジュアル開発
 
 v0.4.2 は同じ workstation security boundary を visual および file import にも拡張します。`herdr_fs_image` で managed project 内の PNG/JPEG/GIF/WebP を ChatGPT が直接確認できます。組み込みのプランナーポリシーは artifact を最短安全経路で処理します：managed ローカルファイルは直接 `herdr_fs_*` ツール、安全な署名付き HTTPS URL は直接 `herdr-mcp artifact import --signed-url`、直接消費できる MCP/Connector のファイル参照は直接消費し、残りのクロスバウンダリ転送だけが private・短寿命の Cloudflare R2 generic artifact relay を経由します。Rust runtime が HTTPS/SSRF、サイズ、MIME/file signature、digest、managed-root、dirty-file、busy-agent を検証してから repository に書き込みます。public MCP catalog は 18 tools のままです。
@@ -81,6 +83,18 @@ herdr-mcp update status
 herdr-mcp rollback
 herdr-mcp uninstall
 ```
+
+**herdr-mcp 自体の source development** では、v0.4.3+ の runtime を DEV / PROD に明示的に分離します：
+
+```bash
+herdr-mcp dev status
+herdr-mcp dev sync
+herdr-mcp dev rollback
+```
+
+`dev sync` は deliberate dogfood path です。current clean checkout を `0.4.3-dev` として build し、source commit / dirty provenance を binary に埋め込み、現在の PROD binary と SHA-256 recovery source を固定保存してから、同じ transactional service lifecycle で server / Native Host / `dev.herdr-mcp.link-prod` を同一 DEV generation に収束させます。`dev status` は read-only、`dev rollback` は固定 PROD snapshot に戻します。繰り返し DEV sync しても previous DEV を PROD として再定義しません。`dev sync --dry-run` は mutation-free です。dirty source は明示的な `--allow-dirty` がない限り拒否されます。
+
+これは maintainer/source developer 用で、通常ユーザー向け install path ではありません。Runtime **DEV / PROD** と browser-extension **DEV / STANDALONE / STORE** は別の identity model です。
 
 `herdr-mcp service ...` は **Advanced / internal** の service control で、通常の install path ではありません。`0.4.1+` では `herdr-mcp scan --json` で、このクライアントから実際に起動可能な Herdr Agent kind の evidence-backed inventory を更新できます。詳細は [CLI reference（英語）](docs/i18n/en/cli-reference.md#capability-discovery-scan) を参照してください。
 
