@@ -22,7 +22,8 @@ OAUTH_ISSUER = "https://herdr-mcp.agentforme.cc.cd"
 [durable_objects]
 bindings = [
   { name = "WORKSTATION_DO", class_name = "WorkstationDO" },
-  { name = "OAUTH_STORE_DO", class_name = "OAuthStoreDO" }
+  { name = "OAUTH_STORE_DO", class_name = "OAuthStoreDO" },
+  { name = "DEVICE_REGISTRY_DO", class_name = "DeviceRegistryDO" }
 ]
 
 [[migrations]]
@@ -32,6 +33,10 @@ new_sqlite_classes = ["WorkstationDO"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["OAuthStoreDO"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["DeviceRegistryDO"]
 
 # Private Worker-only R2 relay. Do not attach a public r2.dev domain.
 [[r2_buckets]]

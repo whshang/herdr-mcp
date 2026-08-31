@@ -15,7 +15,9 @@ import {
   RUNTIME_VERSION as DOMAIN_RUNTIME_VERSION,
 } from "../bin/herdr-cloudflare-domain";
 import { EPOCH2_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch2.js";
+import { EPOCH3_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch3.js";
 import { PUBLIC_CONTRACT } from "../edge/cloudflare/dist/contracts/public.js";
+import { RUNTIME_EXECUTION_CONTRACT } from "../edge/cloudflare/dist/contracts/runtime.js";
 import {
   CONTRACT_EPOCH as EDGE_EPOCH,
   CONTRACT_HASH as EDGE_HASH,
@@ -27,12 +29,13 @@ const contractFixture = JSON.parse(
   await readFile(new URL("../contracts/epoch2.json", import.meta.url), "utf8"),
 );
 
-test("epoch-2 public contract identity is identical across runtime, link, edge and operational CLIs", () => {
+test("public epoch 3 is independent while runtime/link operational contract stays epoch 2", () => {
   const expectedHash = contractFixture.contract_hash;
   const expectedEpoch = contractFixture.contract_epoch;
   const expectedCount = contractFixture.tool_count;
 
-  assert.equal(PUBLIC_CONTRACT, EPOCH2_CONTRACT);
+  assert.equal(PUBLIC_CONTRACT, EPOCH3_CONTRACT);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT, EPOCH2_CONTRACT);
   assert.deepEqual(EPOCH2_CONTRACT, contractFixture);
   assert.equal(expectedEpoch, 2);
   assert.equal(expectedCount, 18);
@@ -41,8 +44,10 @@ test("epoch-2 public contract identity is identical across runtime, link, edge a
 
   assert.equal(PUBLIC_CONTRACT_EPOCH, expectedEpoch);
   assert.equal(PUBLIC_CONTRACT_HASH, expectedHash);
-  assert.equal(EDGE_EPOCH, expectedEpoch);
-  assert.equal(EDGE_HASH, expectedHash);
+  assert.equal(EDGE_EPOCH, 3);
+  assert.equal(EDGE_HASH, EPOCH3_CONTRACT.contract_hash);
+  assert.equal(EPOCH3_CONTRACT.tool_count, 19);
+  assert.equal(EPOCH3_CONTRACT.tools.some((tool) => tool.name === "herdr_devices"), true);
   assert.equal(SELF_UPDATE_HASH, expectedHash);
   assert.equal(SELF_UPDATE_TOOL_COUNT, expectedCount);
   assert.equal(PUBLIC_CONTRACT_PROFILE, "epoch2");

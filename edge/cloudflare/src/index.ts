@@ -30,11 +30,17 @@ import { makeLimits } from "./limits.js";
 import { createLogger } from "./logger.js";
 import { WorkstationDO } from "./workstation-do.js";
 import { OAuthStoreDO } from "./oauth-store-do.js";
+import { DeviceRegistryDO } from "./device-registry-do.js";
+import {
+  ensureLegacyDeviceRegistration,
+  listPublicDevices,
+  resolveDeviceRoute,
+} from "./device-directory.js";
 import { authenticateMcpRequest } from "./oauth-mcp-auth.js";
 import { createOAuthIdentity } from "./oauth-edge.js";
 import { createOAuthPublicStore, handleOAuthPublic } from "./oauth-public.js";
 
-export { OAuthStoreDO, WorkstationDO };
+export { DeviceRegistryDO, OAuthStoreDO, WorkstationDO };
 
 const logger = createLogger("edge-worker");
 
@@ -70,6 +76,8 @@ export default {
         edgeEnv: identity.edgeEnv,
         contractEpoch: identity.contractEpoch,
         contractHash: identity.contractHash,
+        runtimeContractEpoch: identity.runtimeContractEpoch,
+        runtimeContractHash: identity.runtimeContractHash,
         timestampMs: Date.now(),
       });
     }
@@ -81,6 +89,8 @@ export default {
         service: identity.edgeProject,
         stage: identity.edgeEnv,
         edgeVersion: identity.edgeVersion,
+        publicContract: { epoch: identity.contractEpoch, hash: identity.contractHash },
+        runtimeContract: { epoch: identity.runtimeContractEpoch, hash: identity.runtimeContractHash },
         routes: [
           { path: "/health", stage: "stable" },
           { path: "/info", stage: "dev" },
@@ -154,6 +164,18 @@ export default {
         logger.warn("ws.upgrade.denied", { workstationId, code: decision.code });
         return jsonResponse(errorResult("link_auth_failed", { message: decision.reason, workstationId }), 401);
       }
+      if (env.DEFAULT_WORKSTATION_ID === workstationId) {
+        try {
+          const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+          const registered = await ensureLegacyDeviceRegistration(registry, workstationId);
+          if (registered.created) {
+            logger.info("device.legacy_registered", { workstationId, deviceId: registered.device_id });
+          }
+        } catch (error) {
+          // Preserve existing Link availability during rollout; a later reconnect retries registration.
+          logger.warn("device.legacy_registration_failed", { workstationId, error: String(error) });
+        }
+      }
       // Route to the workstation DO — hibernation-safe accept happens there.
       const stub = env.WORKSTATION_DO.get(env.WORKSTATION_DO.idFromName(workstationId));
       return stub.fetch(request);
@@ -222,6 +244,17 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         return (stub as { fetch(r: Request): Promise<Response> }).fetch(internal);
       },
       getStub: (id: string) => env.WORKSTATION_DO.get(env.WORKSTATION_DO.idFromName(id)),
+      listDevices: async () => {
+        const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+        return listPublicDevices(
+          registry,
+          (id) => env.WORKSTATION_DO.get(env.WORKSTATION_DO.idFromName(id)),
+        );
+      },
+      resolveDevice: async (selector) => {
+        const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+        return resolveDeviceRoute(registry, selector, workstationId);
+      },
       logger,
     });
     const method =

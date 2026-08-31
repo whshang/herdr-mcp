@@ -16,7 +16,12 @@ import {
 } from "../edge/cloudflare/dist/canonical-imports.js";
 import { EPOCH1_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch1.js";
 import { EPOCH2_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch2.js";
-import { PUBLIC_CONTRACT, isCompatibleLinkContract } from "../edge/cloudflare/dist/contracts/public.js";
+import { EPOCH3_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch3.js";
+import { PUBLIC_CONTRACT } from "../edge/cloudflare/dist/contracts/public.js";
+import {
+  RUNTIME_EXECUTION_CONTRACT,
+  isCompatibleRuntimeContract,
+} from "../edge/cloudflare/dist/contracts/runtime.js";
 
 const base = { protocol_version: 1, workstation_id: "w1" };
 
@@ -97,11 +102,19 @@ test("tracked Cloudflare epoch-2 catalog stays frozen to the captured 18-tool co
   assert.equal(computeContractHash(EPOCH2_CONTRACT.tools), expected);
 });
 
-test("public edge contract points at epoch 2 while epoch 1 remains only a compatibility baseline", () => {
-  assert.equal(PUBLIC_CONTRACT, EPOCH2_CONTRACT);
-  assert.notEqual(PUBLIC_CONTRACT.contract_hash, EPOCH1_CONTRACT.contract_hash);
-  assert.equal(isCompatibleLinkContract(2, EPOCH2_CONTRACT.contract_hash), true);
-  assert.equal(isCompatibleLinkContract(1, EPOCH1_CONTRACT.contract_hash), true);
-  assert.equal(isCompatibleLinkContract(2, EPOCH1_CONTRACT.contract_hash), false);
-  assert.equal(isCompatibleLinkContract(1, EPOCH2_CONTRACT.contract_hash), false);
+test("public epoch 3 evolves independently while runtime execution stays epoch 2", () => {
+  assert.equal(PUBLIC_CONTRACT, EPOCH3_CONTRACT);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT, EPOCH2_CONTRACT);
+  assert.equal(PUBLIC_CONTRACT.contract_epoch, 3);
+  assert.equal(PUBLIC_CONTRACT.tool_count, 19);
+  assert.equal(PUBLIC_CONTRACT.tools.some((tool) => tool.name === "herdr_devices"), true);
+  assert.equal(computeContractHash(PUBLIC_CONTRACT.tools), PUBLIC_CONTRACT.contract_hash);
+  const publicInspect = PUBLIC_CONTRACT.tools.find((tool) => tool.name === "herdr_inspect");
+  const runtimeInspect = EPOCH2_CONTRACT.tools.find((tool) => tool.name === "herdr_inspect");
+  assert.equal(publicInspect.inputSchema.properties.device.type, "string");
+  assert.equal(Object.hasOwn(runtimeInspect.inputSchema.properties, "device"), false);
+  assert.equal(isCompatibleRuntimeContract(2, EPOCH2_CONTRACT.contract_hash), true);
+  assert.equal(isCompatibleRuntimeContract(1, EPOCH1_CONTRACT.contract_hash), true);
+  assert.equal(isCompatibleRuntimeContract(2, EPOCH1_CONTRACT.contract_hash), false);
+  assert.equal(isCompatibleRuntimeContract(1, EPOCH2_CONTRACT.contract_hash), false);
 });
