@@ -16,6 +16,7 @@ class FakeStorage {
   async list({ prefix } = {}) {
     return new Map([...this.map].filter(([key]) => !prefix || key.startsWith(prefix)));
   }
+  async transaction(fn) { return fn(this); }
 }
 
 function record(deviceId, overrides = {}) {
@@ -89,4 +90,28 @@ test("device registry rejects non-canonical identity and mismatched records", as
   }));
   assert.equal(mismatch.status, 409);
   assert.equal(storage.writeCount, 0);
+});
+
+test("legacy workstation registration creates one stable device and does not rewrite on reconnect", async () => {
+  const { storage, registry } = makeRegistry();
+  const makeRequest = () => new Request("https://registry.internal/internal/devices/legacy/ensure", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workstation_id: "prod-real-runtime", name: "macbook-main" }),
+  });
+
+  const first = await registry.fetch(makeRequest());
+  assert.equal(first.status, 200);
+  const firstBody = await first.json();
+  assert.equal(firstBody.created, true);
+  assert.equal(firstBody.device.workstation_id, "prod-real-runtime");
+  assert.match(firstBody.device.device_id, /^dev_[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+  const writesAfterFirst = storage.writeCount;
+
+  const second = await registry.fetch(makeRequest());
+  assert.equal(second.status, 200);
+  const secondBody = await second.json();
+  assert.equal(secondBody.created, false);
+  assert.equal(secondBody.device.device_id, firstBody.device.device_id);
+  assert.equal(storage.writeCount, writesAfterFirst);
 });

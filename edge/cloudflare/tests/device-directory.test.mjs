@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { listPublicDevices } from "../dist/device-directory.js";
+import { ensureLegacyDeviceRegistration, listPublicDevices } from "../dist/device-directory.js";
 
 const DEV_A = "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYZ";
 const DEV_B = "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYY";
@@ -41,4 +41,19 @@ test("device directory degrades one failed realtime status to offline", async ()
   assert.equal(devices[0].device_id, DEV_A);
   assert.equal(devices[0].connection, "offline");
   assert.equal(devices[0].health, "unknown");
+});
+
+test("legacy registration helper uses the registry mutation endpoint without exposing credentials", async () => {
+  let captured = null;
+  const registry = {
+    fetch: async (request) => {
+      captured = { url: request.url, body: await request.json() };
+      return response({ ok: true, created: true, device: { device_id: DEV_A } });
+    },
+  };
+  const result = await ensureLegacyDeviceRegistration(registry, "prod-real-runtime");
+  assert.deepEqual(result, { device_id: DEV_A, created: true });
+  assert.equal(new URL(captured.url).pathname, "/internal/devices/legacy/ensure");
+  assert.deepEqual(captured.body, { workstation_id: "prod-real-runtime", name: "prod-real-runtime" });
+  assert.equal(Object.keys(captured.body).some((key) => /secret|token|credential/i.test(key)), false);
 });

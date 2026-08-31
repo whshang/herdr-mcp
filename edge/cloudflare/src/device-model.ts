@@ -1,7 +1,9 @@
 export const DEVICE_ID_PREFIX = "dev_" as const;
 
-const DEVICE_ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/i;
+const DEVICE_ULID_RE = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/i;
 const WORKSTATION_ID_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+const CROCKFORD_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const MAX_ULID_TIME_MS = 0xffffffffffff;
 
 export type DeviceAuthorization = "active" | "suspended" | "revoked";
 export type DeviceScheduling = "enabled" | "draining" | "paused";
@@ -25,6 +27,26 @@ export function normalizeDeviceId(value: string): string | null {
   const suffix = trimmed.slice(DEVICE_ID_PREFIX.length);
   if (!DEVICE_ULID_RE.test(suffix)) return null;
   return `${DEVICE_ID_PREFIX}${suffix.toUpperCase()}`;
+}
+
+function encodeBase32(value: bigint, length: number): string {
+  let encoded = "";
+  for (let i = 0; i < length; i += 1) {
+    encoded = CROCKFORD_BASE32[Number(value & 31n)] + encoded;
+    value >>= 5n;
+  }
+  return encoded;
+}
+
+export function newDeviceId(nowMs = Date.now(), randomBytes?: Uint8Array): string {
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0 || nowMs > MAX_ULID_TIME_MS) {
+    throw new Error("device id timestamp is outside the ULID range");
+  }
+  const bytes = randomBytes ?? crypto.getRandomValues(new Uint8Array(10));
+  if (bytes.length !== 10) throw new Error("device id randomness must be exactly 10 bytes");
+  let random = 0n;
+  for (const byte of bytes) random = (random << 8n) | BigInt(byte);
+  return `${DEVICE_ID_PREFIX}${encodeBase32(BigInt(nowMs), 10)}${encodeBase32(random, 16)}`;
 }
 
 export function isDeviceId(value: unknown): value is string {

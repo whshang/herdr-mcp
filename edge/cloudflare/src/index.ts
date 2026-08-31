@@ -31,7 +31,7 @@ import { createLogger } from "./logger.js";
 import { WorkstationDO } from "./workstation-do.js";
 import { OAuthStoreDO } from "./oauth-store-do.js";
 import { DeviceRegistryDO } from "./device-registry-do.js";
-import { listPublicDevices } from "./device-directory.js";
+import { ensureLegacyDeviceRegistration, listPublicDevices } from "./device-directory.js";
 import { authenticateMcpRequest } from "./oauth-mcp-auth.js";
 import { createOAuthIdentity } from "./oauth-edge.js";
 import { createOAuthPublicStore, handleOAuthPublic } from "./oauth-public.js";
@@ -159,6 +159,18 @@ export default {
       if (!decision.ok) {
         logger.warn("ws.upgrade.denied", { workstationId, code: decision.code });
         return jsonResponse(errorResult("link_auth_failed", { message: decision.reason, workstationId }), 401);
+      }
+      if (env.DEFAULT_WORKSTATION_ID === workstationId) {
+        try {
+          const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+          const registered = await ensureLegacyDeviceRegistration(registry, workstationId);
+          if (registered.created) {
+            logger.info("device.legacy_registered", { workstationId, deviceId: registered.device_id });
+          }
+        } catch (error) {
+          // Preserve existing Link availability during rollout; a later reconnect retries registration.
+          logger.warn("device.legacy_registration_failed", { workstationId, error: String(error) });
+        }
       }
       // Route to the workstation DO — hibernation-safe accept happens there.
       const stub = env.WORKSTATION_DO.get(env.WORKSTATION_DO.idFromName(workstationId));

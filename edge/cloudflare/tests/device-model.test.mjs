@@ -5,6 +5,7 @@ import {
   isDeviceId,
   isRoutableDevice,
   isWorkstationId,
+  newDeviceId,
   normalizeDeviceId,
   validateDeviceRecord,
 } from "../dist/device-model.js";
@@ -31,6 +32,13 @@ test("device identity is a canonical dev_ prefixed ULID", () => {
   assert.equal(isDeviceId(DEVICE), true);
   assert.equal(isDeviceId("prod-real-runtime"), false);
   assert.equal(isDeviceId("dev_01J9Z6P8G2K4M6N8Q0RSTVWOYZ"), false);
+});
+
+test("new device ids use canonical ULID encoding", () => {
+  const id = newDeviceId(1_788_153_600_000, new Uint8Array(10));
+  assert.equal(id, "dev_01M1B456000000000000000000");
+  assert.equal(isDeviceId(id), true);
+  assert.throws(() => newDeviceId(1, new Uint8Array(9)), /exactly 10 bytes/);
 });
 
 test("legacy workstation ids remain valid execution identities", () => {

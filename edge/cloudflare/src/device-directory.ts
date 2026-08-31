@@ -4,6 +4,23 @@ interface FetchStub {
   fetch(request: Request): Promise<Response>;
 }
 
+export async function ensureLegacyDeviceRegistration(
+  registry: FetchStub,
+  workstationId: string,
+): Promise<{ device_id: string; created: boolean }> {
+  const response = await registry.fetch(new Request("https://registry.internal/internal/devices/legacy/ensure", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workstation_id: workstationId, name: workstationId }),
+  }));
+  if (!response.ok) throw new Error(`legacy device registration returned HTTP ${response.status}`);
+  const body: unknown = await response.json();
+  if (!isRecord(body) || body.ok !== true || !isRecord(body.device) || typeof body.device.device_id !== "string") {
+    throw new Error("legacy device registration returned an invalid response");
+  }
+  return { device_id: body.device.device_id, created: body.created === true };
+}
+
 export interface PublicDeviceSummary {
   device_id: string;
   name: string;
