@@ -543,7 +543,7 @@ impl LinkTransportCore {
         }
         let frame = match encode_relay_message(&message, Some(&self.validation_options())) {
             Ok(frame) => frame,
-            Err(error) if error.code == "frame_too_large" => {
+            Err(error) if error.code == "frame_too_large" || error.code == "payload_too_large" => {
                 let RelayMessage::ToolResult(result) = &message else {
                     return Ok(Vec::new());
                 };
@@ -992,6 +992,41 @@ mod tests {
             error.runtime_generation,
             OptionalNullable::Value("g1".to_owned())
         );
+    }
+
+    #[test]
+    fn oversized_outbound_result_payload_budget_falls_back_without_link_failure() {
+        let mut core = core();
+        let attempt = open_and_handshake(&mut core);
+        core.frame_received(attempt, &success_ack(), 2_000, 0.5)
+            .unwrap();
+
+        let result = RelayMessage::ToolResult(ToolResultMessage {
+            envelope: RelayEnvelope::new("ws1"),
+            request_id: "r-payload-budget".to_owned(),
+            result: Some(json!({ "payload": "x".repeat((1024 * 1024) + 1) })),
+            served_at_ms: Number::from(2_500),
+            runtime_generation: OptionalNullable::Value("g1".to_owned()),
+            transport_name: OptionalNullable::Value("local".to_owned()),
+        });
+
+        let raw_error = encode_relay_message(&result, Some(&core.validation_options()))
+            .expect_err("result payload should exceed max_result_bytes");
+        assert_eq!(raw_error.code, "payload_too_large");
+
+        let actions = core.send_outbound(result).expect("compact fallback");
+        let frame = match actions.as_slice() {
+            [TransportAction::SendFrame { frame, .. }] => frame,
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        let decoded = decode_relay_frame(frame, None).expect("compact frame");
+        let RelayMessage::ToolError(error) = decoded else {
+            panic!("expected compact tool_error");
+        };
+        assert_eq!(error.request_id, "r-payload-budget");
+        assert_eq!(error.code, "response_too_large");
+        assert!(!error.retryable);
+        assert_eq!(error.delivery_state, Some(DeliveryState::Delivered));
     }
 
     #[test]
