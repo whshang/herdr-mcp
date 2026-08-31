@@ -144,6 +144,8 @@ export class WorkstationDO {
   private readonly ephemeralReads = new Map<string, EphemeralReadRequest>();
   /** In-memory resolver cache only; storage remains authoritative. */
   private readonly resolvers = new Map<string, (completion: Completion) => void>();
+  /** Brief reconnect grace waiters. Process-local only: zero DO storage/alarm writes. */
+  private readonly linkWaiters = new Set<() => void>();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -303,8 +305,8 @@ export class WorkstationDO {
       return this.json({ status: "error", error: drainingResult({ requestId, workstationId, atMs: now }) }, 503);
     }
 
-    const links = this.state.getWebSockets("link");
-    if (links.length === 0) {
+    const deadlineMs = now + (wire.timeout_ms ?? this.limits.requestTimeoutMs);
+    if (!this.hasActiveLink() && !(await this.waitForActiveLink(deadlineMs))) {
       return this.json({ status: "error", error: offlineResult({ requestId, workstationId, atMs: now }) }, 503);
     }
 
@@ -316,7 +318,6 @@ export class WorkstationDO {
       );
     }
 
-    const deadlineMs = now + (wire.timeout_ms ?? this.limits.requestTimeoutMs);
     const opClass = classifyOp(req.op);
 
     // Known reads are safe to retry after ambiguity. Keep their request
@@ -419,6 +420,41 @@ export class WorkstationDO {
     }
     const completion = await this.awaitCompletion(entry.requestId, deadlineMs);
     return this.json({ status: "ok", completion });
+  }
+
+  private hasActiveLink(): boolean {
+    return this.state.getWebSockets("link").some((ws) => this.isActiveLink(ws));
+  }
+
+  private waitForActiveLink(deadlineMs: number): Promise<boolean> {
+    if (this.hasActiveLink()) return Promise.resolve(true);
+    const now = Date.now();
+    const recentlyConnected = this.session?.connectedAtMs !== undefined
+      && (this.session.status === "online"
+        || this.session.status === "connecting"
+        || (this.session.disconnectedAtMs !== undefined
+          && now - this.session.disconnectedAtMs <= this.limits.linkReconnectGraceMs));
+    if (!recentlyConnected) return Promise.resolve(false);
+    const waitMs = Math.max(0, Math.min(this.limits.linkReconnectGraceMs, deadlineMs - now));
+    if (waitMs === 0) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (online: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.linkWaiters.delete(onLink);
+        resolve(online);
+      };
+      const onLink = () => finish(this.hasActiveLink());
+      const timer = setTimeout(() => finish(this.hasActiveLink()), waitMs);
+      this.linkWaiters.add(onLink);
+      if (this.hasActiveLink()) finish(true);
+    });
+  }
+
+  private notifyLinkAvailable(): void {
+    for (const waiter of [...this.linkWaiters]) waiter();
   }
 
   private async forwardEphemeralRead(opts: {
@@ -771,6 +807,7 @@ export class WorkstationDO {
       other.serializeAttachment({ ...this.readLinkAttachment(other), active: false });
       try { other.close(4409, "superseded by newer workstation link"); } catch { /* already closed */ }
     }
+    this.notifyLinkAvailable();
 
     const now = Date.now();
     this.session = sessionFromClaims({

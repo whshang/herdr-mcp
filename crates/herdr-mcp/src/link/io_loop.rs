@@ -29,6 +29,7 @@ use super::transport::{LinkTransportCore, SocketAttemptId, TransportAction, Tran
 use crate::relay::protocol::RelayMessage;
 
 pub(crate) const LINK_DEFAULT_DRAIN_MS: u64 = 5_000;
+pub(crate) const LINK_DEFAULT_OFFLINE_RECYCLE_MS: u64 = 300_000;
 
 #[derive(Clone)]
 pub(crate) struct LinkIoConfig {
@@ -37,6 +38,7 @@ pub(crate) struct LinkIoConfig {
     pub link_token: String,
     pub socket: SocketDriverConfig,
     pub drain_ms: u64,
+    pub offline_recycle_ms: u64,
     pub now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
     pub rng_sample: Arc<dyn Fn() -> f64 + Send + Sync>,
 }
@@ -49,6 +51,7 @@ impl LinkIoConfig {
             link_token: link_token.into(),
             socket: SocketDriverConfig::default(),
             drain_ms: LINK_DEFAULT_DRAIN_MS,
+            offline_recycle_ms: LINK_DEFAULT_OFFLINE_RECYCLE_MS,
             now_ms: Arc::new(system_now_ms),
             rng_sample: Arc::new(system_rng_sample),
         }
@@ -61,6 +64,7 @@ pub(crate) enum LinkIoError {
     Transport(TransportError),
     Runner(RunnerError),
     InternalEventChannelClosed,
+    ProlongedOffline { threshold_ms: u64 },
 }
 
 impl From<SocketDriverError> for LinkIoError {
@@ -162,6 +166,9 @@ enum LoopEvent<H> {
         generation: u64,
         expected_attempt: u64,
     },
+    OfflineRecycleElapsed {
+        generation: u64,
+    },
     HeartbeatTick {
         generation: u64,
     },
@@ -199,6 +206,8 @@ where
     handshake_timer: Option<JoinHandle<()>>,
     reconnect_generation: u64,
     reconnect_timer: Option<JoinHandle<()>>,
+    offline_recycle_generation: u64,
+    offline_recycle_timer: Option<JoinHandle<()>>,
     online_generation: u64,
     online_delays: Option<(Duration, Duration, Duration)>,
     heartbeat_timer: Option<JoinHandle<()>>,
@@ -249,6 +258,8 @@ where
             handshake_timer: None,
             reconnect_generation: 0,
             reconnect_timer: None,
+            offline_recycle_generation: 0,
+            offline_recycle_timer: None,
             online_generation: 0,
             online_delays: None,
             heartbeat_timer: None,
@@ -265,6 +276,7 @@ where
         mut self,
         mut stop_rx: watch::Receiver<bool>,
     ) -> Result<LinkExitKind, LinkIoError> {
+        self.arm_offline_recycle();
         let start = self.core.start()?;
         if let Some(exit) = self.pump_actions(start).await? {
             return self.normalize_exit(exit);
@@ -424,6 +436,18 @@ where
                 self.reconnect_timer.take();
                 let actions = self.core.reconnect_wait_elapsed(expected_attempt)?;
                 self.pump_actions(actions).await
+            }
+            LoopEvent::OfflineRecycleElapsed { generation } => {
+                if generation != self.offline_recycle_generation || self.stopping {
+                    return Ok(None);
+                }
+                self.offline_recycle_timer.take();
+                if self.core.phase() == ConnectionPhase::Online {
+                    return Ok(None);
+                }
+                Err(LinkIoError::ProlongedOffline {
+                    threshold_ms: self.config.offline_recycle_ms,
+                })
             }
             LoopEvent::HeartbeatTick { generation } => {
                 if generation != self.online_generation || self.online_delays.is_none() {
@@ -590,10 +614,10 @@ where
                 TransportAction::OversizedInbound {
                     request_id: None, ..
                 }
-                | TransportAction::Online { .. }
-                | TransportAction::Disconnected { .. }
                 | TransportAction::InboundRejected { .. }
                 | TransportAction::SocketErrorObserved { .. } => {}
+                TransportAction::Online { .. } => self.cancel_offline_recycle(),
+                TransportAction::Disconnected { .. } => self.arm_offline_recycle(),
                 TransportAction::HeartbeatDue { .. } | TransportAction::Inbound { .. } => {
                     unreachable!("runner routes higher-layer transport actions before the I/O pump")
                 }
@@ -714,6 +738,25 @@ where
     fn cancel_reconnect(&mut self) {
         self.reconnect_generation = self.reconnect_generation.saturating_add(1);
         abort_task(&mut self.reconnect_timer);
+    }
+
+    fn arm_offline_recycle(&mut self) {
+        if self.config.offline_recycle_ms == 0 || self.offline_recycle_timer.is_some() {
+            return;
+        }
+        self.offline_recycle_generation = self.offline_recycle_generation.saturating_add(1);
+        let generation = self.offline_recycle_generation;
+        let delay = Duration::from_millis(self.config.offline_recycle_ms);
+        let event_tx = self.event_tx.clone();
+        self.offline_recycle_timer = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = event_tx.send(LoopEvent::OfflineRecycleElapsed { generation });
+        }));
+    }
+
+    fn cancel_offline_recycle(&mut self) {
+        self.offline_recycle_generation = self.offline_recycle_generation.saturating_add(1);
+        abort_task(&mut self.offline_recycle_timer);
     }
 
     fn start_online_timers(
@@ -875,7 +918,8 @@ mod tests {
     use tokio::sync::{Notify, Semaphore, mpsc, watch};
 
     use super::{
-        LinkIoConfig, LinkIoLoop, LoopSocketConnector, LoopSocketHandle, SocketConnectRequest,
+        LINK_DEFAULT_OFFLINE_RECYCLE_MS, LinkIoConfig, LinkIoError, LinkIoLoop,
+        LoopSocketConnector, LoopSocketHandle, SocketConnectRequest,
     };
     use crate::link::backoff::{BackoffOptions, ExponentialBackoff};
     use crate::link::local_mcp::{LinkRuntimeTransport, RuntimeHealth, RuntimeToolResult};
@@ -1165,6 +1209,7 @@ mod tests {
             link_token: "test-link-token".to_owned(),
             socket: Default::default(),
             drain_ms,
+            offline_recycle_ms: LINK_DEFAULT_OFFLINE_RECYCLE_MS,
             now_ms: Arc::new(move || {
                 10_000_i64.saturating_add(started.elapsed().as_millis() as i64)
             }),
@@ -1630,6 +1675,33 @@ mod tests {
         assert!(
             !matches!(stale_control, Ok(Some(_))),
             "aborted connect must not materialize a stale socket handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn prolonged_offline_recycles_the_link_process_without_disabling_reconnect() {
+        let runtime = Arc::new(MockRuntime::immediate(RuntimeToolResult::Success {
+            result: None,
+        }));
+        let (connector, _controls) =
+            FakeConnector::new(std::iter::repeat_n(ConnectPlan::Fail(Duration::ZERO), 32));
+        let mut config = io_config(100);
+        config.offline_recycle_ms = 40;
+        let io = LinkIoLoop::with_connector(
+            config,
+            make_core(1_000, 100, 3_000, 262_144, None),
+            make_runner(runtime),
+            Arc::clone(&connector),
+        );
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let error = tokio::time::timeout(Duration::from_secs(1), io.run(stop_rx))
+            .await
+            .expect("offline recycle must stay bounded")
+            .expect_err("continuous offline state must request process recycle");
+        assert_eq!(error, LinkIoError::ProlongedOffline { threshold_ms: 40 });
+        assert!(
+            connector.attempts().len() >= 2,
+            "normal reconnect attempts must run before the process recycle guard fires"
         );
     }
 
