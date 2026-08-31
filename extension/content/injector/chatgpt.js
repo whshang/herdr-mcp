@@ -63,6 +63,27 @@ class ChatGPTAdapter extends BaseAdapter {
     return this.getSendButtonCandidates()[0] || null;
   }
 
+  getStopButtonCandidates() {
+    const input = this.getInputEl();
+    const scope = input?.closest?.("form") || input?.parentElement?.parentElement || document;
+    const selectors = [
+      'button[data-testid="stop-button"]',
+      '[role="button"][data-testid="stop-button"]',
+      'button[aria-label="Stop generating" i]',
+      'button[aria-label="Stop streaming" i]',
+      'button[aria-label="停止生成"]',
+      'button[aria-label="停止流式"]',
+    ];
+    const seen = new Set();
+    const out = [];
+    for (const selector of selectors) {
+      for (const el of scope.querySelectorAll?.(selector) || []) {
+        if (!seen.has(el)) { seen.add(el); out.push(el); }
+      }
+    }
+    return out;
+  }
+
   getComposerActionAnchor() {
     const input = this.getInputEl();
     const scope = input?.closest?.("form") || input?.parentElement?.parentElement || document;

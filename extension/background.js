@@ -42,7 +42,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.82";
+const H2W_SCRIPT_VERSION = "0.1.83";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",

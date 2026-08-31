@@ -77,9 +77,9 @@ const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "u
 const controlCenterCss = readFileSync(path.join(EXT, "control-center.css"), "utf8");
 const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.82", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.82"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.82"'), "content version matches manifest");
+ok(manifest.version === "0.1.83", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.83"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.83"'), "content version matches manifest");
 const ownerGateIndex = wakeSource.indexOf('type: "h2w_extension_owner_status"');
 const queueOwnerClaimIndex = wakeSource.indexOf('setAttribute(QUEUED_INSERT_OWNER_ATTR');
 ok(ownerGateIndex >= 0
@@ -505,6 +505,31 @@ ok(
   vm.runInContext(chatgptCode, rootCtx);
   ok(vm.runInContext("window.__H2W_ADAPTER__.getConversationKey()", rootCtx) === "https://chatgpt.com",
     "ChatGPT root exposes a pending binding key before a conversation exists");
+
+  const composerStop = { id: "composer-stop" };
+  const unrelatedStop = { id: "unrelated-stop" };
+  const composerScope = {
+    querySelectorAll: () => [composerStop],
+  };
+  const composerInput = {
+    closest: (selector) => selector === "form" ? composerScope : null,
+    parentElement: null,
+  };
+  const stopCtx = vm.createContext({
+    window: {},
+    location: { origin: u.origin, pathname: "/c/test" },
+    document: {
+      querySelector: (selector) => selector === '#prompt-textarea[contenteditable="true"]' ? composerInput : null,
+      querySelectorAll: () => [unrelatedStop],
+      body: null,
+      documentElement: null,
+    },
+    console,
+  });
+  vm.runInContext(baseCode, stopCtx);
+  vm.runInContext(chatgptCode, stopCtx);
+  ok(vm.runInContext("window.__H2W_ADAPTER__.getStopButtonCandidates().length", stopCtx) === 1,
+    "ChatGPT busy detection scopes Stop candidates to the composer instead of unrelated page controls");
 }
 {
   const normal = "https://chatgpt.com/c/6a89c95e-70bc-83ea-bf3d-fab6b83fc86e";
@@ -821,6 +846,12 @@ ok(backgroundSource.includes('event === "hello"')
     && controlCenterSource.includes('refreshSnapshot(true)')
     && !controlCenterSource.includes("setInterval("),
   "Control Center uses a live side-panel port, one initial/reconnect snapshot, and incremental lifecycle events without fixed polling");
+ok(chatGptAdapterSource.includes("getStopButtonCandidates()")
+    && chatGptAdapterSource.includes('button[data-testid="stop-button"]')
+    && !wakeSource.includes('document.querySelectorAll("button, [role=button]").filter')
+    && wakeSource.includes('data.manual === true ? 1200 : 15000')
+    && wakeSource.includes('busy_reason: composerBusyReason() || "unknown"'),
+  "manual Continue scopes composer busy detection to explicit composer stop controls and fails fast when truly busy");
 const queueTurnEndedStart = backgroundSource.indexOf('if (msg?.type === "h2w_turn_ended")');
 const queueTurnEndedEnd = queueTurnEndedStart >= 0 ? backgroundSource.indexOf('if (msg?.type === "h2w_handoff_start")', queueTurnEndedStart) : -1;
 const queueTurnEndedBlock = queueTurnEndedStart >= 0 && queueTurnEndedEnd > queueTurnEndedStart

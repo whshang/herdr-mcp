@@ -162,7 +162,7 @@ test("extension source keeps Bearer private while both authenticated download st
   const localAuth = await readFile(join(root, "extension/local-auth.js"), "utf8");
   const manifest = JSON.parse(await readFile(join(root, "extension/manifest.json"), "utf8"));
 
-  assert.equal(manifest.version, "0.1.82");
+  assert.equal(manifest.version, "0.1.83");
   const chatgpt = manifest.content_scripts.find((entry) => entry.matches.includes("https://chatgpt.com/*"));
   assert.ok(chatgpt);
   assert.ok(chatgpt.js.indexOf("content/chatgpt-artifact-core.js") < chatgpt.js.indexOf("content/wake.js"));
