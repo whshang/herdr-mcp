@@ -42,7 +42,7 @@ herdr-mcp worker pair
 ### 新しいコンピュータ上で — Coding Agent にこのプロンプトを貼り付ける
 
 ```text
-Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: <pairing-address>  Verification code: <code>
+Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/ja/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: <pairing-address>  Verification code: <code>
 ```
 
 `<pairing-address>` と `<code>` を `herdr-mcp worker pair` が表示した値に置き換えてください。正規ドキュメントが、バージョン/能力チェック、Release からのインストール規則、macOS-only 境界、シークレット処理、検証、復旧をすべて担います。
