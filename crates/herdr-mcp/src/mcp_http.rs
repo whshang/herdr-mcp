@@ -34,6 +34,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
@@ -1332,11 +1333,12 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     } else {
         None
     };
-    let http_response = if wants_sse(&headers, &request) {
+    let mut http_response = if wants_sse(&headers, &request) {
         sse_response(&response, issued_session.as_deref())
     } else {
         json_response_with_session(StatusCode::OK, &response, issued_session.as_deref())
     };
+    attach_runtime_generation_header(&mut http_response);
     if request.get("method").and_then(Value::as_str) == Some("tools/call")
         && let Some(tool) = request.pointer("/params/name").and_then(Value::as_str)
     {
@@ -1442,6 +1444,20 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+fn attach_runtime_generation_header(response: &mut Response) {
+    let Some(generation) = env::var_os("HERDR_MCP_RUNTIME_GENERATION")
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(&generation) {
+        response
+            .headers_mut()
+            .insert(RUNTIME_GENERATION_HEADER, value);
+    }
+}
+
 fn json_response(status: StatusCode, value: &Value) -> Response {
     json_response_with_session(status, value, None)
 }
@@ -1531,6 +1547,28 @@ mod tests {
             "herdr-mcp-http-{label}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn runtime_generation_header_reflects_service_process_identity() {
+        let _guard = crate::test_env::lock();
+        let previous = env::var_os("HERDR_MCP_RUNTIME_GENERATION");
+        unsafe { env::set_var("HERDR_MCP_RUNTIME_GENERATION", "rust-generation-proof") };
+        let mut response = json_response(StatusCode::OK, &json!({"ok": true}));
+        attach_runtime_generation_header(&mut response);
+        assert_eq!(
+            response
+                .headers()
+                .get(RUNTIME_GENERATION_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("rust-generation-proof")
+        );
+        unsafe {
+            match previous {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_GENERATION", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_GENERATION"),
+            }
+        }
     }
 
     #[test]

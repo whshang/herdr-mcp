@@ -204,6 +204,10 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
     manager_options.max_timeout_ms = 60_000;
     manager_options.observation_checks = 3;
     manager_options.observation_interval_ms = 500;
+    manager_options.managed_current_link = config
+        .runtime_control_path
+        .parent()
+        .map(|config_dir| config_dir.join("runtime/current"));
 
     let manager = Arc::new(
         RuntimeGenerationManager::new(manager_options)

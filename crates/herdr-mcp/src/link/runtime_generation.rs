@@ -14,6 +14,8 @@
 //! launchd/service mutation, or production Link cutover.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -167,6 +169,11 @@ struct Inner {
 
 pub struct RuntimeGenerationManagerOptions {
     pub base: RuntimeGenerationSpec,
+    /// Managed `runtime/current` symlink used to fence the shared production
+    /// endpoint while service install/dev sync is replacing the process behind
+    /// the same loopback address. Candidate generations on other ports ignore
+    /// this guard.
+    pub managed_current_link: Option<PathBuf>,
     pub bearer_token: String,
     pub contract_hash: String,
     pub contract_epoch: u64,
@@ -185,6 +192,7 @@ impl RuntimeGenerationManagerOptions {
     ) -> Self {
         Self {
             base,
+            managed_current_link: None,
             bearer_token: bearer_token.into(),
             contract_hash: contract_hash.into(),
             contract_epoch: LOCAL_MCP_CONTRACT_EPOCH,
@@ -198,6 +206,8 @@ impl RuntimeGenerationManagerOptions {
 }
 
 pub struct RuntimeGenerationManager {
+    managed_current_link: Option<PathBuf>,
+    managed_service_endpoint: String,
     bearer_token: String,
     contract_hash: String,
     contract_epoch: u64,
@@ -264,7 +274,10 @@ impl RuntimeGenerationManager {
                 validation: None,
             },
         );
+        let managed_service_endpoint = options.base.endpoint.clone();
         Ok(Self {
+            managed_current_link: options.managed_current_link,
+            managed_service_endpoint,
             bearer_token: options.bearer_token,
             contract_hash: options.contract_hash,
             contract_epoch: options.contract_epoch,
@@ -287,6 +300,12 @@ impl RuntimeGenerationManager {
 
     pub fn active_generation_id(&self) -> String {
         self.lock_inner().fence.active_generation().to_owned()
+    }
+
+    fn managed_current_generation(&self) -> Option<String> {
+        self.managed_current_link
+            .as_deref()
+            .and_then(current_generation_from_link)
     }
 
     pub fn get_generation_spec(&self, generation: &str) -> Option<RuntimeGenerationSpec> {
@@ -833,16 +852,34 @@ impl LinkRuntimeTransport for RuntimeGenerationManager {
                 };
             }
             let active_generation = inner.fence.active_generation().to_owned();
+            let reserved_endpoint = inner
+                .records
+                .get(&generation)
+                .map(|record| record.spec.endpoint.clone());
+            if reserved_endpoint.as_deref() == Some(self.managed_service_endpoint.as_str())
+                && let Some(current_generation) = self.managed_current_generation()
+                && current_generation != generation
+            {
+                let _ = inner.fence.complete_request(&request_id, &generation);
+                return RuntimeToolResult::Failure {
+                    code: "runtime_generation_superseded_before_dispatch".to_owned(),
+                    retryable: true,
+                    message: "runtime/current superseded the reserved generation on the managed loopback endpoint before dispatch"
+                        .to_owned(),
+                    details: Some(json!({
+                        "reserved_generation": generation,
+                        "current_generation": current_generation,
+                    })),
+                };
+            }
             if active_generation != generation {
-                let reserved_endpoint = inner
-                    .records
-                    .get(&generation)
-                    .map(|record| record.spec.endpoint.as_str());
                 let active_endpoint = inner
                     .records
                     .get(&active_generation)
                     .map(|record| record.spec.endpoint.as_str());
-                if reserved_endpoint.is_some() && reserved_endpoint == active_endpoint {
+                if reserved_endpoint.as_deref().is_some()
+                    && reserved_endpoint.as_deref() == active_endpoint
+                {
                     let _ = inner.fence.complete_request(&request_id, &generation);
                     return RuntimeToolResult::Failure {
                         code: "runtime_generation_superseded_before_dispatch".to_owned(),
@@ -953,6 +990,15 @@ fn bounded_positive(value: Option<f64>, fallback: f64, min: f64, max: f64) -> u6
         }
         _ => fallback.floor() as u64,
     }
+}
+
+fn current_generation_from_link(link: &Path) -> Option<String> {
+    let target = fs::read_link(link).ok()?;
+    target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn system_now_ms() -> i64 {
@@ -1516,6 +1562,72 @@ mod tests {
                 result: Some(json!({ "port": "8772" })),
             }
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_current_link_refuses_external_same_port_replacement_before_control_reconcile()
+    {
+        use std::os::unix::fs::symlink;
+
+        let hash = compute_contract_hash(&catalog()).unwrap();
+        let state = Arc::new(MockState {
+            version: "0.3.23".to_owned(),
+            port_label: "8772".to_owned(),
+            catalog: catalog(),
+            fail_health_after: None,
+            health_calls: AtomicU32::new(0),
+            defer_tools: false,
+            release: Mutex::new(None),
+        });
+        let endpoint = serve_mock(state).await;
+        let root = std::env::temp_dir().join(format!(
+            "herdr-managed-current-generation-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        let current = root.join("runtime/current");
+        symlink("generations/candidate", &current).unwrap();
+
+        let mut manager_options = options(&endpoint, &hash);
+        manager_options.managed_current_link = Some(current.clone());
+        let manager = manager_for(&endpoint, manager_options).await;
+
+        // Reproduce direct Rust service install/dev sync: the Link manager has
+        // not processed runtime-control yet, so `stable` remains active, while
+        // service_manager has already switched runtime/current (and the process
+        // behind the same 8772 endpoint) to candidate. The request must never
+        // be sent under a forged old-generation proof.
+        let old_generation = manager.begin_request_lease("old-external").unwrap();
+        assert_eq!(old_generation, "stable");
+        assert_eq!(manager.active_generation_id(), "stable");
+        let stale = manager
+            .dispatch_request_with_lease(request("old-external"), old_generation)
+            .await;
+        assert!(matches!(
+            stale,
+            RuntimeToolResult::Failure {
+                code,
+                retryable: true,
+                ..
+            } if code == "runtime_generation_superseded_before_dispatch"
+        ));
+        assert_eq!(manager.get_status().generations[0].in_flight, 0);
+
+        std::fs::remove_file(&current).unwrap();
+        symlink("generations/stable", &current).unwrap();
+        let stable_generation = manager.begin_request_lease("stable-again").unwrap();
+        let fresh = manager
+            .dispatch_request_with_lease(request("stable-again"), stable_generation)
+            .await;
+        assert_eq!(
+            fresh,
+            RuntimeToolResult::Success {
+                result: Some(json!({ "port": "8772" })),
+            }
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

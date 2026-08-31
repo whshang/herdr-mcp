@@ -28,6 +28,7 @@ pub const LOCAL_MCP_DEFAULT_TIMEOUT_MS: u64 = 10_000;
 pub const LOCAL_MCP_MAX_TIMEOUT_MS: u64 = 120_000;
 pub const LOCAL_MCP_CONTRACT_EPOCH: u64 = 2;
 
+const LOCAL_MCP_RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const LOCAL_MCP_MIN_FRAME_BYTES: usize = 64;
 const LOCAL_MCP_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -43,6 +44,7 @@ pub mod code {
     pub const MALFORMED_RESPONSE: &str = "local_mcp_malformed_response";
     pub const ID_MISMATCH: &str = "local_mcp_id_mismatch";
     pub const JSONRPC_ERROR: &str = "local_mcp_jsonrpc_error";
+    pub const RUNTIME_GENERATION_MISMATCH: &str = "local_mcp_runtime_generation_mismatch";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +353,25 @@ impl LocalMcpTransport {
             }
             Err(_) => unreachable!("send_json only returns unreachable"),
         };
+        if let (Some(expected), Some(observed)) = (
+            self.runtime_generation.as_deref(),
+            response
+                .headers()
+                .get(LOCAL_MCP_RUNTIME_GENERATION_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty()),
+        ) && expected != observed
+        {
+            return self.failure(
+                code::RUNTIME_GENERATION_MISMATCH,
+                false,
+                "local runtime generation does not match the reserved generation; response withheld",
+                Some(json!({
+                    "expected_generation": expected,
+                    "observed_generation": observed,
+                })),
+            );
+        }
         let (status, text) = match self.read_bounded_body(response).await {
             Ok(value) => value,
             Err(HttpFailure::ResponseTooLarge) => {
@@ -838,6 +859,16 @@ mod tests {
         body: String,
         delay_ms: u64,
     ) -> (String, oneshot::Receiver<String>) {
+        spawn_server_with_generation(status, body, delay_ms, None).await
+    }
+
+    async fn spawn_server_with_generation(
+        status: u16,
+        body: String,
+        delay_ms: u64,
+        runtime_generation: Option<&str>,
+    ) -> (String, oneshot::Receiver<String>) {
+        let runtime_generation = runtime_generation.map(str::to_owned);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (request_tx, request_rx) = oneshot::channel();
@@ -878,8 +909,12 @@ mod tests {
             } else {
                 "ERR"
             };
+            let generation_header = runtime_generation
+                .as_deref()
+                .map(|generation| format!("X-Herdr-Runtime-Generation: {generation}\r\n"))
+                .unwrap_or_default();
             let response = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{generation_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes()).await;
@@ -1064,6 +1099,59 @@ mod tests {
         assert_eq!(value["method"], "tools/call");
         assert_eq!(value["params"]["name"], "herdr_inspect");
         assert_eq!(value["params"]["arguments"], json!({"query": "ping"}));
+    }
+
+    #[tokio::test]
+    async fn runtime_generation_response_header_prevents_old_lease_from_accepting_new_process_result()
+     {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "local-1",
+            "result": {"served_by": "candidate"}
+        });
+        let (endpoint, _) =
+            spawn_server_with_generation(200, response.to_string(), 0, Some("rust-candidate"))
+                .await;
+        let mut config = LocalMcpConfig::new("token", "sha256:test");
+        config.endpoint = endpoint;
+        config.runtime_generation = Some("rust-stable".to_owned());
+        let transport = LocalMcpTransport::new(config).unwrap();
+        let outcome = transport
+            .dispatch_request(request("generation-mismatch"))
+            .await;
+        assert!(matches!(
+            outcome,
+            RuntimeToolResult::Failure {
+                ref code,
+                retryable: false,
+                ref details,
+                ..
+            } if code == super::code::RUNTIME_GENERATION_MISMATCH
+                && details == &Some(json!({
+                    "expected_generation": "rust-stable",
+                    "observed_generation": "rust-candidate",
+                }))
+        ));
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "local-1",
+            "result": {"served_by": "stable"}
+        });
+        let (endpoint, _) =
+            spawn_server_with_generation(200, response.to_string(), 0, Some("rust-stable")).await;
+        let mut config = LocalMcpConfig::new("token", "sha256:test");
+        config.endpoint = endpoint;
+        config.runtime_generation = Some("rust-stable".to_owned());
+        let transport = LocalMcpTransport::new(config).unwrap();
+        assert_eq!(
+            transport
+                .dispatch_request(request("generation-match"))
+                .await,
+            RuntimeToolResult::Success {
+                result: Some(json!({"served_by": "stable"})),
+            }
+        );
     }
 
     #[tokio::test]
