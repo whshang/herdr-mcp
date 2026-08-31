@@ -1,6 +1,9 @@
 #[cfg(target_os = "macos")]
-use security_framework::passwords::{PasswordOptions, generic_password, set_generic_password};
+use security_framework::passwords::{
+    PasswordOptions, delete_generic_password, generic_password, set_generic_password,
+};
 
+#[cfg(any(target_os = "macos", test))]
 pub fn store_generic_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {
     validate_label(service, "service")?;
     validate_label(account, "account")?;
@@ -21,6 +24,7 @@ pub fn store_generic_secret(service: &str, account: &str, secret: &str) -> Resul
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn load_generic_secret(service: &str, account: &str) -> Result<String, String> {
     validate_label(service, "service")?;
     validate_label(account, "account")?;
@@ -45,11 +49,29 @@ pub fn load_generic_secret(service: &str, account: &str) -> Result<String, Strin
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn validate_label(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > 255 || value.chars().any(char::is_control) {
         return Err(format!("Keychain {label} is invalid"));
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub fn delete_generic_secret(service: &str, account: &str) -> Result<(), String> {
+    validate_label(service, "service")?;
+    validate_label(account, "account")?;
+    #[cfg(target_os = "macos")]
+    {
+        delete_generic_password(service, account).map_err(|error| {
+            format!("cannot delete workstation credential from macOS Keychain: {error}")
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (service, account);
+        Err("workstation credential deletion requires macOS Keychain".to_owned())
+    }
 }
 
 #[cfg(test)]
