@@ -29,43 +29,29 @@ Languages: [English](README.md) · **简体中文** · [日本語](README.ja.md)
 
 ## 把一台新电脑加入已有的 Worker（v0.4.3+）
 
-本路径**仅限 v0.4.3+**。当前 stable 仍是 **v0.4.2**，因此以下命令在普通安装上还不可用。Agent 必须**fail closed**：如果已安装 CLI 不提供 `herdr-mcp worker connect`（以及 enrollment 相关命令），就停止并报告版本/能力 blocker，而不是自行发挥。
+本路径**仅限 v0.4.3+**。当前 stable 仍是 **v0.4.2**，因此以下命令在普通安装上还不可用。Agent 必须**fail closed**：如果已安装 CLI 不提供 `herdr-mcp worker pair` / `herdr-mcp worker connect`，就停止并报告版本/能力 blocker，而不是自行发挥。
 
 这**不是**全新 Worker 部署。如果你说“把这台新电脑连到我已有的 Worker”，Agent 必须**不要**新建 Cloudflare Worker、Durable Object namespace、OAuth app/client、Connector，也不要复制旧的全局 `LINK_SHARED_SECRET`。它加入的是你已有的那个 Worker。
 
-### 阶段 A —— 在已授权的既有 macOS 电脑上
+### 在已授权的既有 macOS 电脑上
 
-生成一个短生命周期、一次性、`0600` 的 enrollment 文件：
+启动一个短生命周期配对会话（默认 10 分钟）：
 
 ```bash
-herdr-mcp worker enrollment create --ttl-seconds 600 --name "<new-device-name>" --output "<secure-path>"
+herdr-mcp worker pair
 ```
 
-- TTL 范围是 **60..900 秒**。如果文件过期，就重新生成一个。
-- 把文件**安全地**传输到新电脑（例如 AirDrop、加密通道）。**不要**把 enrollment code 粘贴/复制到聊天、argv、日志、剪贴板说明、issue tracker 或 README 示例里。
+它会打印一个**配对地址**和一个**6 位验证码**（格式 `123 456`）。验证码就是预期的短生命周期配对凭据；10 分钟后过期，且一次性使用。
 
-### 阶段 B —— 把下面这段提示词粘贴到新电脑上的 Coding Agent
-
-下面是一段完整、可直接复制的提示词，给**运行在新电脑上**的 Coding Agent（如 Pi）。它直接、命令式；Agent 应执行它，只在真正需要人工授权或安全传输文件时暂停。
+### 在新电脑上 —— 把下面这段提示词粘贴到 Coding Agent
 
 ```text
-你正在把这台 macOS 电脑加入一个已有的 herdr-mcp Cloudflare Worker/Connector。这不是全新部署。
-
-1. 先阅读仓库的权威 Agent 安装协议（docs/i18n/zh-CN/agent-install.md），继承其中的安全/前置条件/Release 安装规则。因为意图是加入**已有** Worker，所以**不要**执行其中全新 Cloudflare Worker/DO/OAuth/Connector 的部署章节。本节的既有 Worker 指令在 Worker 绑定上优先。
-2. 安装前先检查最新 stable Release 的版本/能力。如果 stable 仍是 <0.4.3，或 stable runtime 缺少 `worker connect`，就停止并报告 release/能力 blocker。除非用户明确要求测试 preview/source，否则不要安装 prerelease/source build。
-3. 从 GitHub Release 安装最新 stable PROD herdr-mcp，不要从 repo checkout 安装。不要把 source/dev build 当作正常安装。安装后验证版本/能力，要求 v0.4.3+ 且提供 `herdr-mcp worker connect`。如果已安装 CLI 不提供它，就停止并报告版本/能力 blocker。
-4. 使用用户明确提供的 enrollment 文件路径。不要大范围搜索文件系统里的 enrollment/secret 文件，也不要打印或 cat 它的内容。
-5. 这条 v0.4.3 安全 enrollment 路径要求 macOS。如果是 Linux/Windows，就按不支持/fail-closed 停止。
-6. 确保 enrollment 文件的属主/权限安全（0600、当前用户），然后运行：
-   herdr-mcp worker connect --enrollment-file "<path>" --name "<device-name>"
-   通常不要传 --edge-origin，因为文件已绑定 Worker。如果确实要用 override，它必须与文件绑定的 Worker origin 完全一致。
-7. 永远不要把 enrollment code 或最终设备密钥放到 argv/stdout/日志里。最终设备凭据应存入 macOS Keychain。
-8. 只连接已有的 Worker/Connector。除非协议证明 enrollment 不可用且用户明确要求全新 Worker，否则不要部署或改动 Cloudflare；否则停止。
-9. 验证 `herdr-mcp status`、`herdr-mcp doctor` 和 `herdr-mcp link status`。确认最终的不可变 `device_id`、Link online/healthy 以及本地绑定成功。成功 connect 会消费/删除一次性 enrollment 文件。
-10. 如果任何 mutation 报告投递不确定，不要盲目重试；先检查当前状态。如果 connect 在服务端消费后失败，依赖内置的补偿/revoke 行为并报告证据，不要自行发明手动密钥处理。
+请阅读并执行 https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/zh-CN/existing-worker-connect.md ，把这台电脑接入我已有的 Herdr Worker。配对地址：<pairing-address>，验证码：<code>
 ```
 
-两台设备都完成 enrollment 后，同一个已有的 ChatGPT Connector/Worker 应能通过 multi-device 公共面看到两台设备。这是预期的 v0.4.3 行为，待发布/UAT 确认；正式的双设备 GA/UAT 尚未通过。
+把 `<pairing-address>` 和 `<code>` 替换成 `herdr-mcp worker pair` 打印的值。权威文档负责所有版本/能力检查、从 Release 安装的规则、macOS-only 边界、密钥处理、验证与恢复。
+
+两台设备都完成配对后，同一个已有的 ChatGPT Connector/Worker 应能通过 multi-device 公共面看到两台设备。这是预期的 v0.4.3 行为，待发布/UAT 确认；正式的双设备 GA/UAT 尚未通过。
 
 ## 安装完成后，先做这一件事
 

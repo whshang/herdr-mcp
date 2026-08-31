@@ -125,11 +125,6 @@ impl Config {
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "macos", test)))]
-    pub fn set_edge_device_id(&mut self, _device_id: &str) -> Result<(), String> {
-        Err("edge configuration requires macOS".to_owned())
-    }
-
     #[cfg(any(target_os = "macos", test))]
     pub fn edge_link_keychain_service(&self) -> Option<String> {
         self.edge_device_id

@@ -85,19 +85,19 @@ test("cargo-built herdr-mcp --help lists the user path ahead of service", () => 
 });
 
 const ENROLLMENT_COMMANDS = [
-  "herdr-mcp worker enrollment create",
-  "herdr-mcp device enrollment create",
-  "herdr-mcp worker connect --enrollment-file PATH",
+  "herdr-mcp worker pair",
+  "herdr-mcp device pair",
+  "herdr-mcp worker connect <pairing-address>",
 ];
 
-test("v0.4.3 enrollment docs use only the implemented CLI surface", () => {
+test("v0.4.3 pairing docs use only the implemented CLI surface", () => {
   const controlPlane = read("docs/_wip/multi-device-worker-control-plane.md");
   const boundary = sectionAfterHeading(controlPlane, "## 13. CLI boundary");
-  const enrollment = sectionAfterHeading(controlPlane, "## 11. Enrollment");
+  const pairing = sectionAfterHeading(controlPlane, "## 11. Pairing");
   const plan = read("docs/_wip/v0.4.3-plan.md");
-  const p0c = sectionAfterHeading(plan, "### P0-C — Secure enrollment");
+  const p0c = sectionAfterHeading(plan, "### P0-C — Secure pairing");
 
-  for (const section of [boundary, enrollment, p0c]) {
+  for (const section of [boundary, pairing, p0c]) {
     for (const command of ENROLLMENT_COMMANDS) {
       assert.match(section, new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     }
@@ -105,20 +105,20 @@ test("v0.4.3 enrollment docs use only the implemented CLI surface", () => {
 
   // The unimplemented onboarding tree must not be presented as the current path.
   assert.doesNotMatch(
-    enrollment,
+    pairing,
     /herdr-mcp worker setup\b/,
-    "enrollment section must not present unimplemented `worker setup` as current onboarding",
+    "pairing section must not present unimplemented `worker setup` as current onboarding",
   );
   assert.match(boundary, /Later command tree:[\s\S]*herdr-mcp worker setup/);
 
   // Secrets never ride argv; joining devices never need deploy credentials.
-  assert.match(enrollment, /never accepted as a command-line argument/);
-  assert.match(enrollment, /Cloudflare deployment credentials are not required/);
+  assert.match(pairing, /never accepted as a command-line argument/);
+  assert.match(pairing, /Cloudflare deployment credentials are not required/);
   assert.match(p0c, /never accepted on argv/);
 
-  // Owner-only enrollment creation and pending two-device UAT are stated.
-  assert.match(enrollment, /owner\/default workstation creates enrollments/);
-  assert.match(enrollment, /cannot recursively enroll further devices/);
+  // Owner-only pairing creation and pending two-device UAT are stated.
+  assert.match(pairing, /owner\/default workstation creates pairings/);
+  assert.match(pairing, /cannot recursively create further pairings/);
   assert.match(controlPlane, /Real two-device UAT is still pending/);
   assert.match(plan, /pending production Edge[\s\S]*second Mac/);
 });
