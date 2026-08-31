@@ -82,10 +82,13 @@ herdr-mcp status
 herdr-mcp doctor
 herdr-mcp update check
 herdr-mcp update apply
+herdr-mcp update auto
 herdr-mcp update status
 herdr-mcp rollback
 herdr-mcp uninstall
 ```
+
+On macOS v0.4.3+, the default production instance installs `dev.herdr-mcp.auto-update`, a background launchd trigger that runs on load and then once every 86,400 seconds. `update auto` reaches GitHub only when the **compiled runtime channel is `prod`**, `[update] check = true`, and the release channel is `stable`; named instances, DEV runtimes, and `preview` all skip before any network request. A strictly newer Stable Release is queued through the same SHA-256 + GitHub Sigstore/SLSA verified, detached, rollback-safe updater used by `update apply`. `service uninstall` first arms a durable update fence and removes the owned scheduler so an already-running detached worker cannot resurrect the service; an explicit successful `install`/`reinstall` clears that fence. Set `[update] check = false` to disable the network check.
 
 For **herdr-mcp source development** on v0.4.3+, the runtime plane is explicitly split into DEV and PROD:
 

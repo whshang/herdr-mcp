@@ -96,6 +96,10 @@ pub fn print_status(paths: &RuntimePaths, config: &Config) {
             "disabled"
         }
     );
+    println!(
+        "auto update scheduler: {}",
+        crate::update_scheduler::status_line()
+    );
 }
 
 pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
