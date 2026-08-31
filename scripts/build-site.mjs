@@ -329,11 +329,13 @@ function localeEntryShell({ locale, docsBySlug, searchIndex, version }) {
 
         <section class="home-section" id="paths"><div class="index-group-heading"><span class="eyebrow">05</span><h2>${esc(ui.homePathsTitle)}</h2></div><div class="docs-grid home-three"><article class="doc-card"><h2><a href="./agent-install.html">${esc(ui.homeAgentPathTitle)}</a></h2><p>${esc(ui.homeAgentPathBody)}</p></article><article class="doc-card"><h2><a href="./install.html">${esc(ui.homeManualPathTitle)}</a></h2><p>${esc(ui.homeManualPathBody)}</p></article><article class="doc-card"><h2><a href="./extension.html">${esc(ui.homeBrowserPathTitle)}</a></h2><p>${esc(ui.homeBrowserPathBody)}</p></article></div></section>
 
+        <section class="home-section home-research" id="research"><div><span class="eyebrow">06 · Landscape</span><h2>${esc(ui.homeResearchTitle)}</h2><p>${esc(ui.homeResearchBody)}</p></div><a class="button" href="./herdr-vs-ecosystem.html">${esc(ui.homeResearchLink)} →</a></section>
+
         <section class="home-section" id="support"><div class="index-group-heading"><span class="eyebrow">07</span><h2>${esc(ui.homeSupportTitle)}</h2></div><div class="docs-grid home-three"><article class="doc-card"><h2><a href="./troubleshooting.html">${esc(docsBySlug.get("troubleshooting").title)}</a></h2><p>${esc(docsBySlug.get("troubleshooting").description)}</p></article><article class="doc-card"><h2><a href="./architecture.html">${esc(docsBySlug.get("architecture").title)}</a></h2><p>${esc(docsBySlug.get("architecture").description)}</p></article><article class="doc-card"><h2><a href="https://github.com/whshang/herdr-mcp/tree/main/docs/history">${esc(ui.homeHistory)}</a></h2><p>${esc(ui.historyNav)}</p></article></div></section>
       </div>
       <footer class="docs-footer"><a href="https://github.com/whshang/herdr-mcp">GitHub</a><a href="./privacy.html">${esc(docsBySlug.get("privacy").title)}</a></footer>
     </main>
-    <aside class="toc" aria-label="${esc(ui.onThisPage)}"><div class="toc-inner"><h2>${esc(ui.onThisPage)}</h2><ol><li><a href="#flow">${esc(ui.homeFlowTitle)}</a></li><li><a href="#value">${esc(ui.homeValueTitle)}</a></li><li><a href="#agent-install">${esc(ui.homeAgentPathTitle)}</a></li><li><a href="#handoffs">${esc(ui.homeHandoffsTitle)}</a></li></ol></div></aside>
+    <aside class="toc" aria-label="${esc(ui.onThisPage)}"><div class="toc-inner"><h2>${esc(ui.onThisPage)}</h2><ol><li><a href="#flow">${esc(ui.homeFlowTitle)}</a></li><li><a href="#value">${esc(ui.homeValueTitle)}</a></li><li><a href="#agent-install">${esc(ui.homeAgentPathTitle)}</a></li><li><a href="#handoffs">${esc(ui.homeHandoffsTitle)}</a></li><li><a href="#research">${esc(ui.homeResearchTitle)}</a></li></ol></div></aside>
   </div>
   ${searchUi({ pre, locale, searchIndex })}
 </body>
