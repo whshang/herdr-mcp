@@ -71,6 +71,8 @@ export default {
         edgeEnv: identity.edgeEnv,
         contractEpoch: identity.contractEpoch,
         contractHash: identity.contractHash,
+        runtimeContractEpoch: identity.runtimeContractEpoch,
+        runtimeContractHash: identity.runtimeContractHash,
         timestampMs: Date.now(),
       });
     }
@@ -82,6 +84,8 @@ export default {
         service: identity.edgeProject,
         stage: identity.edgeEnv,
         edgeVersion: identity.edgeVersion,
+        publicContract: { epoch: identity.contractEpoch, hash: identity.contractHash },
+        runtimeContract: { epoch: identity.runtimeContractEpoch, hash: identity.runtimeContractHash },
         routes: [
           { path: "/health", stage: "stable" },
           { path: "/info", stage: "dev" },

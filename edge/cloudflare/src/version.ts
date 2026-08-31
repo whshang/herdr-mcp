@@ -1,5 +1,6 @@
 /** version.ts — edge identity shared by dev/prod Worker deployments. */
 import { PUBLIC_CONTRACT } from "./contracts/public.js";
+import { RUNTIME_EXECUTION_CONTRACT } from "./contracts/runtime.js";
 
 export const EDGE_VERSION = "0.1.0-dev";
 export const EDGE_PROJECT = "herdr-edge-dev";
@@ -14,6 +15,8 @@ export interface EdgeIdentity {
   edgeEnv: string;
   contractEpoch: number;
   contractHash: string;
+  runtimeContractEpoch: number;
+  runtimeContractHash: string;
 }
 
 export function edgeIdentity(options: {
@@ -27,5 +30,7 @@ export function edgeIdentity(options: {
     edgeEnv: options.edgeEnv ?? "dev",
     contractEpoch: CONTRACT_EPOCH,
     contractHash: CONTRACT_HASH,
+    runtimeContractEpoch: RUNTIME_EXECUTION_CONTRACT.contract_epoch,
+    runtimeContractHash: RUNTIME_EXECUTION_CONTRACT.contract_hash,
   };
 }
