@@ -18,6 +18,7 @@ pub enum Command {
     },
     Service(ServiceCommand),
     Update(UpdateCommand),
+    Extension(ExtensionCommand),
     NativeHost(NativeHostCommand),
     ExtensionHost {
         caller_origin: String,
@@ -89,7 +90,14 @@ pub enum NativeHostCommand {
     DevEnable { path: Option<String> },
     DevDisable,
     UseStore,
+    UseStandalone,
     UseDev,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExtensionCommand {
+    StandaloneInstall { reference: Option<String> },
+    StandaloneStatus,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -206,6 +214,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "candidate" => parse_candidate(&args[1..]),
         "service" => parse_service(&args[1..]),
         "update" => parse_update(&args[1..]),
+        "extension" => parse_extension(&args[1..]),
         "native-host" => parse_native_host(&args[1..]),
         "extension-host" => parse_extension_host(&args[1..]),
         "artifact" => parse_artifact(&args[1..]),
@@ -752,15 +761,42 @@ fn parse_native_host(args: &[String]) -> Result<Command, String> {
         [subcommand, channel] if subcommand == "use" && channel == "store" => {
             Ok(Command::NativeHost(NativeHostCommand::UseStore))
         }
+        [subcommand, channel] if subcommand == "use" && channel == "standalone" => {
+            Ok(Command::NativeHost(NativeHostCommand::UseStandalone))
+        }
         [subcommand, channel] if subcommand == "use" && channel == "dev" => {
             Ok(Command::NativeHost(NativeHostCommand::UseDev))
         }
         [] => Err(
-            "native-host requires install, status, uninstall, rollback, dev enable|disable, or use store|dev"
+            "native-host requires install, status, uninstall, rollback, dev enable|disable, or use store|standalone|dev"
                 .to_owned(),
         ),
         [subcommand] => Err(format!("unknown native-host command '{subcommand}'")),
         _ => Err("invalid native-host command or arguments".to_owned()),
+    }
+}
+
+fn parse_extension(args: &[String]) -> Result<Command, String> {
+    match args {
+        [channel, action] if channel == "standalone" && action == "install" => {
+            Ok(Command::Extension(ExtensionCommand::StandaloneInstall {
+                reference: None,
+            }))
+        }
+        [channel, action, flag, reference]
+            if channel == "standalone" && action == "install" && flag == "--ref" =>
+        {
+            Ok(Command::Extension(ExtensionCommand::StandaloneInstall {
+                reference: Some(reference.clone()),
+            }))
+        }
+        [channel, action] if channel == "standalone" && action == "status" => {
+            Ok(Command::Extension(ExtensionCommand::StandaloneStatus))
+        }
+        [] => {
+            Err("extension requires standalone install [--ref REF] or standalone status".to_owned())
+        }
+        _ => Err("invalid extension command or arguments".to_owned()),
     }
 }
 
@@ -788,6 +824,7 @@ User path:\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|auto|status]\n\
+  herdr-mcp extension standalone <install [--ref REF]|status>\n\
   herdr-mcp rollback\n\
   herdr-mcp uninstall\n\n\
 Same-machine UAT isolation (optional):\n\
@@ -810,7 +847,7 @@ Advanced / internal:\n\
   herdr-mcp tcc-broker <install [--force]|status|uninstall>\n\
   herdr-mcp native-host <install|status|uninstall|rollback>\n\
   herdr-mcp native-host dev <enable [PATH]|disable>\n\
-  herdr-mcp native-host use <store|dev>\n\
+  herdr-mcp native-host use <store|standalone|dev>\n\
   herdr-mcp extension-host [chrome-extension://.../]\n\
   herdr-mcp artifact import --url HTTPS_URL --path PROJECT_PATH [--sha256 HEX] [--capability-env NAME | --signed-url] [--overwrite] [--confirm-dirty] [--confirm-busy]\n\
   (--signed-url imports a safe signed HTTPS URL directly; R2 relay objects use
@@ -1144,8 +1181,40 @@ mod tests {
             Command::NativeHost(NativeHostCommand::UseStore)
         );
         assert_eq!(
+            parse(args(&["native-host", "use", "standalone"]))
+                .unwrap()
+                .command,
+            Command::NativeHost(NativeHostCommand::UseStandalone)
+        );
+        assert_eq!(
             parse(args(&["native-host", "use", "dev"])).unwrap().command,
             Command::NativeHost(NativeHostCommand::UseDev)
+        );
+        assert_eq!(
+            parse(args(&["extension", "standalone", "install"]))
+                .unwrap()
+                .command,
+            Command::Extension(ExtensionCommand::StandaloneInstall { reference: None })
+        );
+        assert_eq!(
+            parse(args(&[
+                "extension",
+                "standalone",
+                "install",
+                "--ref",
+                "main"
+            ]))
+            .unwrap()
+            .command,
+            Command::Extension(ExtensionCommand::StandaloneInstall {
+                reference: Some("main".to_owned())
+            })
+        );
+        assert_eq!(
+            parse(args(&["extension", "standalone", "status"]))
+                .unwrap()
+                .command,
+            Command::Extension(ExtensionCommand::StandaloneStatus)
         );
         assert_eq!(
             parse(args(&["extension-host"])).unwrap().command,

@@ -53,6 +53,8 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal --target "${{ matrix.target }}"
       - name: Build release binary
         shell: bash
+        env:
+          HERDR_MCP_BUILD_COMMIT: ${{ github.sha }}
         run: cargo build --locked --release -p herdr-mcp --target "${{ matrix.target }}"
       - name: Stage raw release asset
         shell: bash

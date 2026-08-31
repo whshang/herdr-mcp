@@ -95,6 +95,7 @@ pub fn run(command: NativeHostCommand) -> Result<ExitCode, String> {
             | NativeHostCommand::DevEnable { .. }
             | NativeHostCommand::DevDisable
             | NativeHostCommand::UseStore
+            | NativeHostCommand::UseStandalone
             | NativeHostCommand::UseDev => install(&paths)?,
             NativeHostCommand::Status => status(&paths),
             NativeHostCommand::Uninstall => uninstall(&paths)?,
@@ -382,9 +383,13 @@ impl InstallPaths {
             native_dir,
         };
         let store = crate::browser_extension_identity::official_store_identity()?;
+        let standalone = crate::browser_extension_identity::official_standalone_identity()?;
         let registered = find_registered_origin(&layout.targets, &layout.wrapper)?;
-        let remembered_dev = wrapper_dev_extension_origin(&layout.wrapper)?
-            .or_else(|| registered.clone().filter(|origin| origin != &store.origin));
+        let remembered_dev = wrapper_dev_extension_origin(&layout.wrapper)?.or_else(|| {
+            registered
+                .clone()
+                .filter(|origin| origin != &store.origin && origin != &standalone.origin)
+        });
 
         // Rollback and status must recover the active origin from durable state;
         // the remembered Dev candidate is advisory metadata embedded in the
@@ -407,7 +412,9 @@ impl InstallPaths {
         match command {
             NativeHostCommand::Install => {
                 if let Some(extension_origin) = explicit_extension_origin()? {
-                    let dev = if extension_origin == store.origin {
+                    let dev = if extension_origin == store.origin
+                        || extension_origin == standalone.origin
+                    {
                         remembered_dev
                     } else {
                         Some(extension_origin.clone())
@@ -435,7 +442,7 @@ impl InstallPaths {
                 // upgrade; Store becomes the always-available fallback contract
                 // but is not silently activated under a working developer.
                 if let Some(active) = registered {
-                    let dev = if active == store.origin {
+                    let dev = if active == store.origin || active == standalone.origin {
                         remembered_dev
                     } else {
                         Some(active.clone())
@@ -462,19 +469,33 @@ impl InstallPaths {
                 let extension_path = dev_extension_path(path.as_deref())?;
                 Self::for_dev_path(&extension_path, "native_host_dev_enable", true, layout)
             }
-            NativeHostCommand::DevDisable => Self::for_origin_with_dev(
-                &store.origin,
-                None,
-                None,
-                "native_host_dev_disable",
-                true,
-                layout,
-            ),
+            NativeHostCommand::DevDisable => {
+                let fixed_origin = registered
+                    .as_deref()
+                    .filter(|origin| *origin == standalone.origin)
+                    .unwrap_or(&store.origin);
+                Self::for_origin_with_dev(
+                    fixed_origin,
+                    None,
+                    None,
+                    "native_host_dev_disable",
+                    true,
+                    layout,
+                )
+            }
             NativeHostCommand::UseStore => Self::for_origin_with_dev(
                 &store.origin,
                 None,
                 remembered_dev,
                 "native_host_use_store",
+                true,
+                layout,
+            ),
+            NativeHostCommand::UseStandalone => Self::for_origin_with_dev(
+                &standalone.origin,
+                None,
+                remembered_dev,
+                "native_host_use_standalone",
                 true,
                 layout,
             ),
@@ -562,14 +583,21 @@ impl InstallPaths {
         let extension_id = extension_id_from_origin(extension_origin)
             .ok_or_else(|| "native-host extension origin is invalid".to_owned())?;
         let store = crate::browser_extension_identity::official_store_identity()?;
+        let standalone = crate::browser_extension_identity::official_standalone_identity()?;
         if let Some(dev) = dev_extension_origin.as_deref() {
-            if dev == store.origin || extension_id_from_origin(dev).is_none() {
+            if dev == store.origin
+                || dev == standalone.origin
+                || extension_id_from_origin(dev).is_none()
+            {
                 return Err("native_host_dev_origin_invalid".to_owned());
             }
-            if extension_origin != store.origin && extension_origin != dev {
-                return Err("native_host_active_origin_not_store_or_registered_dev".to_owned());
+            if extension_origin != store.origin
+                && extension_origin != standalone.origin
+                && extension_origin != dev
+            {
+                return Err("native_host_active_origin_not_fixed_or_registered_dev".to_owned());
             }
-        } else if extension_origin != store.origin {
+        } else if extension_origin != store.origin && extension_origin != standalone.origin {
             return Err("native_host_dev_origin_not_registered".to_owned());
         }
         let backups_dir = layout.native_dir.join(BACKUPS_DIR_NAME);
@@ -809,11 +837,25 @@ fn status_with_active_runtime(paths: &InstallPaths, active_runtime: Option<&Path
     let store_origin_match = official_store
         .as_ref()
         .is_some_and(|identity| identity.origin == paths.extension_origin);
+    let official_standalone =
+        crate::browser_extension_identity::official_standalone_identity().ok();
+    let official_standalone_extension_id = official_standalone
+        .as_ref()
+        .map(|identity| identity.extension_id.clone());
+    let standalone_origin_match = official_standalone
+        .as_ref()
+        .is_some_and(|identity| identity.origin == paths.extension_origin);
     let registered_dev_extension_id = paths
         .dev_extension_origin
         .as_deref()
         .and_then(extension_id_from_origin);
-    let active_channel = if store_origin_match { "store" } else { "dev" };
+    let active_channel = if store_origin_match {
+        "store"
+    } else if standalone_origin_match {
+        "standalone"
+    } else {
+        "dev"
+    };
     json!({
         "ok": runtime_binary_ok && wrapper_ok && owned_count > 0,
         "implementation": "rust",
@@ -824,6 +866,8 @@ fn status_with_active_runtime(paths: &InstallPaths, active_runtime: Option<&Path
         "extension_identity_source": paths.extension_identity_source,
         "official_store_extension_id": official_store_extension_id,
         "store_origin_match": store_origin_match,
+        "official_standalone_extension_id": official_standalone_extension_id,
+        "standalone_origin_match": standalone_origin_match,
         "active_channel": active_channel,
         "dev_enabled": paths.dev_extension_origin.is_some(),
         "registered_dev_extension_id": registered_dev_extension_id,
@@ -2454,11 +2498,14 @@ mod tests {
     }
 
     #[test]
-    fn store_and_dev_switches_keep_manifest_exactly_single_origin() {
+    fn store_standalone_and_dev_switches_keep_manifest_exactly_single_origin() {
         let (root, dev_paths) = fixture();
         install(&dev_paths).unwrap();
         let dev_origin = dev_paths.extension_origin.clone();
         let store = crate::browser_extension_identity::official_store_identity().unwrap();
+        let standalone = crate::browser_extension_identity::official_standalone_identity().unwrap();
+        assert_ne!(standalone.origin, store.origin);
+        assert_ne!(standalone.origin, dev_origin);
         let native_dir = dev_paths.runtime_binary.parent().unwrap().to_path_buf();
         let store_layout = NativeHostLayout {
             source_binary: dev_paths.source_binary.clone(),
@@ -2483,6 +2530,44 @@ mod tests {
         assert_eq!(
             store_manifest["allowed_origins"].as_array().unwrap().len(),
             1
+        );
+
+        let standalone_layout = NativeHostLayout {
+            source_binary: dev_paths.source_binary.clone(),
+            native_dir: native_dir.clone(),
+            wrapper: dev_paths.wrapper.clone(),
+            targets: dev_paths.targets.clone(),
+        };
+        let standalone_paths = InstallPaths::for_origin_with_dev(
+            &standalone.origin,
+            None,
+            Some(dev_origin.clone()),
+            "native_host_use_standalone",
+            true,
+            standalone_layout,
+        )
+        .unwrap();
+        install(&standalone_paths).unwrap();
+        let standalone_manifest: Value =
+            serde_json::from_slice(&fs::read(&stable_manifest).unwrap()).unwrap();
+        assert_eq!(
+            standalone_manifest["allowed_origins"],
+            json!([standalone.origin])
+        );
+        assert_eq!(
+            standalone_manifest["allowed_origins"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let standalone_view = status(&standalone_paths);
+        assert_eq!(standalone_view["active_channel"], "standalone");
+        assert_eq!(standalone_view["standalone_origin_match"], true);
+        assert_eq!(standalone_view["dev_enabled"], true);
+        assert_eq!(
+            standalone_view["registered_dev_extension_origin"],
+            dev_origin
         );
 
         let dev_layout = NativeHostLayout {

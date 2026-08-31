@@ -28,6 +28,17 @@ Stable v0.4.2 only has STORE/DEV Native Host ownership. STANDALONE requires a v0
 
 Default to the [official Herdr Chrome Web Store extension](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp). Use STANDALONE only when Store distribution is not appropriate and the installed runtime explicitly supports it. DEV is for source development only.
 
+A v0.4.3+ runtime can materialize a Load-unpacked STANDALONE copy directly from the GitHub repository without cloning the source tree:
+
+```bash
+herdr-mcp extension standalone install
+herdr-mcp native-host use standalone
+```
+
+A release runtime defaults to its immutable compile-time source commit; only a development build without a verifiable build commit falls back to `main`. Use `herdr-mcp extension standalone install --ref main` when development explicitly needs the latest repository source. The managed copy lives at the stable path `~/.config/herdr-mcp/extensions/standalone/current`; choose that directory once in `chrome://extensions` → Developer mode → Load unpacked, then future updates keep the same path.
+
+The installer resolves the requested ref to an immutable commit SHA and downloads only Git-tracked files below that commit's `extension/` tree. Every file remains byte-identical to the repository source except `manifest.json`, where Herdr injects the public `key` required for the fixed STANDALONE extension ID. The repo/worktree DEV manifest is never modified. `herdr-mcp extension standalone status` reports the installed commit, version, ID, and path.
+
 After choosing a channel, verify:
 
 ```bash
