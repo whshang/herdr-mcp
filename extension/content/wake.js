@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.84";
+const H2W_CONTENT_VERSION = "0.1.85";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -3242,11 +3242,13 @@ const H2W_CONTENT_VERSION = "0.1.84";
     if (!hudEls) return;
     const chatGptConversationActionsAvailable = ADAPTER.name !== "chatgpt" || Boolean(chatGptConversationId());
     const locked = hudActionBusy || hudCache?.enabled === true || !chatGptConversationActionsAvailable;
-    for (const button of hudEls.manualButtons || []) {
-      button.hidden = !chatGptConversationActionsAvailable;
+    for (let i = 0; i < (hudEls.manualButtons || []).length; i += 1) {
+      const button = hudEls.manualButtons[i];
+      const unavailable = i === 2 && hudCache?.llmConfigured !== true;
+      button.hidden = !chatGptConversationActionsAvailable || unavailable;
       button.classList.toggle("locked", locked);
-      button.disabled = locked;
-      button.setAttribute("aria-disabled", String(locked));
+      button.disabled = locked || unavailable;
+      button.setAttribute("aria-disabled", String(locked || unavailable));
     }
 
     const handoffStatus = String(hudCache?.handoff?.status || "");

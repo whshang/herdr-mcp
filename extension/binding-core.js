@@ -612,6 +612,18 @@ export function assistantDeclaresPendingWork(text) {
     || /\b(?:still need to|not yet complete|pending (?:verification|validation|work|check))\b/i.test(tail);
 }
 
+
+/**
+ * Bounded no-LLM Auto fallback. One ordinary settled turn may receive a
+ * simple Continue. A turn that was itself triggered by a short Continue only
+ * chains again when the assistant explicitly says work remains unfinished.
+ */
+export function shouldAutoContinueWithoutLlm(userText, assistantText) {
+  const pending = assistantDeclaresPendingWork(assistantText);
+  if (isIdleNudgeText(userText) && !pending) return false;
+  return true;
+}
+
 /**
  * Interpret a tiny judge-model reply.
  * - Matches no-send keywords → done (do not wake)
