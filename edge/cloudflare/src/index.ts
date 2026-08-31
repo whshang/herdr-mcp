@@ -30,11 +30,12 @@ import { makeLimits } from "./limits.js";
 import { createLogger } from "./logger.js";
 import { WorkstationDO } from "./workstation-do.js";
 import { OAuthStoreDO } from "./oauth-store-do.js";
+import { DeviceRegistryDO } from "./device-registry-do.js";
 import { authenticateMcpRequest } from "./oauth-mcp-auth.js";
 import { createOAuthIdentity } from "./oauth-edge.js";
 import { createOAuthPublicStore, handleOAuthPublic } from "./oauth-public.js";
 
-export { OAuthStoreDO, WorkstationDO };
+export { DeviceRegistryDO, OAuthStoreDO, WorkstationDO };
 
 const logger = createLogger("edge-worker");
 
