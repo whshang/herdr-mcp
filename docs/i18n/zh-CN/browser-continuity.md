@@ -105,7 +105,7 @@ Rust journal 不可用或实时确认失败时，扩展继续使用既有 `HERDR
 
 ### 未来目标：Continuity 2.0
 
-`v0.4.2` 解决的是“平时持续记录，窗口或会话失效后仍能恢复”。后续正式路线中的 Continuity 2.0 继续解决“同一个工作链持续几天、几百轮甚至更久以后，恢复上下文如何仍然保持很小”。它当前不属于 `v0.4.2`，也尚未绑定具体版本号；版本归属将在 `v0.4.2` 发布和 dogfood 数据稳定后进入 release planning。
+`v0.4.2` 解决的是“平时持续记录，窗口或会话失效后仍能恢复”。后续正式路线中的 Continuity 2.0 继续解决“同一个工作链持续几天、几百轮甚至更久以后，恢复上下文如何仍然保持很小”。它当前不属于 `v0.4.2`，也尚未绑定具体版本号；版本归属继续作为独立的 post-`v0.4.2` release planning 决策。
 
 Continuity 2.0 会持续把较老 raw turns 压成 rolling semantic checkpoint，保留目标、已完成事项、关键决定、约束、活跃文件/分支/commit、待办、下一步和 literal anchors。恢复时优先使用“最新 checkpoint + 最近 raw tail”，而不是重新发送完整长会话。只有新 checkpoint 已验证可恢复后，系统才能回收更早的 raw body；页面内存、长 DOM 和主线程/render 压力也会与模型 context pressure 一起参与 rollover 决策。
 
