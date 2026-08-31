@@ -4,6 +4,17 @@ Status: **v0.4.3 core design frozen for implementation**
 Baseline: `origin/main` at branch creation (`1f8f9cf`, after v0.4.2)
 Scope owner: Cloudflare Worker control plane + Rust Link compatibility
 
+Implementation status (2026-08-31):
+
+- [x] Public Edge Contract and Runtime Execution Contract are separated in code.
+- [x] `DeviceRegistryDO` and canonical `dev_<ULID>` identity exist.
+- [x] The configured legacy default workstation bootstraps one stable registry device on Link connect without heartbeat writes.
+- [x] Public epoch 3 exposes Edge-local `herdr_devices`; Runtime execution remains epoch 2.
+- [x] Workstation-bound public tools carry one common Edge-only `device` selector; Edge resolves once, strips it, then forwards Runtime v2 args.
+- [x] Explicit ID/name routing, single-routable-device selection, legacy-empty-registry fallback, and `device_ambiguous` fail-closed behavior are covered by tests.
+- [ ] Per-device credential and one-time enrollment are not implemented yet; a second device is therefore not formally supported yet.
+- [ ] Device-aware opaque workspace/pane refs, scheduling mutations, and Web Control Console remain later phases.
+
 ## 1. Product decision
 
 Herdr v0.4.3 evolves the public control plane from one Worker targeting one workstation into one Worker routing to multiple user devices:
