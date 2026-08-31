@@ -28,6 +28,17 @@ stable v0.4.2 的 Native Host contract 只有 STORE/DEV；STANDALONE 需要实�
 
 默认安装 [Herdr Chrome Web Store 官方扩展](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp)。只有 Store 不适用且 runtime 明确支持时才选 STANDALONE；DEV 只用于源码开发。
 
+v0.4.3+ 可直接从 GitHub 仓库生成本机可 Load unpacked 的 STANDALONE 副本，不需要 clone 源码仓库：
+
+```bash
+herdr-mcp extension standalone install
+herdr-mcp native-host use standalone
+```
+
+正式 runtime 默认使用编译时记录的不可变 source commit；开发构建无法证明 build commit 时才回退 `main`。需要明确追踪仓库最新源码时可执行 `herdr-mcp extension standalone install --ref main`。下载结果稳定放在 `~/.config/herdr-mcp/extensions/standalone/current`，Chrome 首次进入 `chrome://extensions` → Developer mode → Load unpacked 后选择该目录，后续更新继续复用同一路径。
+
+下载器先把 ref 解析为不可变 commit SHA，再只下载该 commit 下 Git 跟踪的 `extension/` 文件。除 `manifest.json` 为固定 STANDALONE ID 注入公开 `key` 外，其余文件必须与该 commit 的 `extension/` 字节一致；repo/worktree 中的 DEV `extension/manifest.json` 不会被修改。可用 `herdr-mcp extension standalone status` 查看已安装 commit、版本、ID 和路径。
+
 选择通道后验证：
 
 ```bash
