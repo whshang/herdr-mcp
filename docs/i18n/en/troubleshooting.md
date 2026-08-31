@@ -93,17 +93,32 @@ If new conversations see 18 tools and an old one sees 17, the server is usually 
 
 ## Symptom: tools are visible but `herdr_inspect` reports workstation offline
 
-This is no longer a ChatGPT schema problem.
+This is no longer a ChatGPT schema problem. If ChatGPT received a structured `workstation_offline` result, the ChatGPT → MCP Edge path was alive enough to return that result; Edge did not have a usable Link WebSocket for the selected workstation. The browser extension does not make this decision.
 
-Check:
+On v0.4.3+, recovery is layered rather than "restart everything":
 
-- local runtime health;
-- `herdr-link` status;
-- workstation identity;
-- active runtime generation health;
-- recent heartbeat on Edge.
+1. A recently connected workstation gets up to **2 seconds** of process-local reconnect grace at Edge. A validated Link `hello` wakes the pending request immediately. This grace does not write Durable Object storage or alarms.
+2. If the workstation is still unavailable, Edge returns machine-readable recovery metadata: `retryable=true`, `delivery_state=not_delivered`, `retry_after_ms=5000`, and a read-only `herdr_inspect` probe policy with 5s / 10s / 20s backoff.
+3. The local Link keeps its normal reconnect/backoff loop. A successful Online transition clears the prolonged-offline timer.
+4. If the Link cannot become Online continuously for **300 seconds**, it exits with diagnostic evidence so launchd `KeepAlive` can start a fresh `dev.herdr-mcp.link-prod` process.
+5. The server health watchdog remains responsible only for an actually unhealthy local server. `workstation_offline` by itself is not a reason to restart a healthy `dev.herdr-mcp.server`.
 
-Do not delete/recreate the Connector to fix a workstation-link problem.
+The replay rule is deliberately stricter than the retry hint:
+
+- `delivery_state=not_delivered`: the request did not reach the workstation; after recovery it may be sent again. Reuse an idempotency key when the operation has one.
+- `delivery_state=delivery_unknown`: a read may be retried when explicitly marked retryable, but a mutation must be reconciled against state/evidence before any replay.
+- `delivery_state=delivered` or no proof of non-delivery: do not replay a mutation merely because the connection later failed.
+
+Check the workstation in this order:
+
+```bash
+herdr-mcp status
+herdr-mcp link status
+launchctl print gui/$(id -u)/dev.herdr-mcp.link-prod
+tail -n 100 ~/.config/herdr-mcp/link-prod.launchd.err.log
+```
+
+Then confirm workstation identity, active runtime generation health, and Edge's recent Link state. Do not delete/recreate the Connector to fix a workstation-link problem, and do not turn a Link-only failure into a global `herdr-mcp service restart` unless local server health is also bad.
 
 ## Symptom: inspect works, but file operations fail
 

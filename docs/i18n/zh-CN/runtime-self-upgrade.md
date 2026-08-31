@@ -59,6 +59,32 @@ generation B
 
 这是整个机制最重要的边界。
 
+## DEV / PROD 是 generation 之上的 provenance 平面
+
+v0.4.3+ 在同一套 generation 机制之上增加明确的源码开发平面，但**不会**因此多出第三套长期 runtime 环境：
+
+```text
+PROD
+  published / verified installed binary
+  固定 recovery source
+
+DEV
+  带 source provenance 的 repo/worktree build
+  作为 managed generation 激活
+```
+
+日常源码 dogfood 使用：
+
+```bash
+herdr-mcp dev status
+herdr-mcp dev sync
+herdr-mcp dev rollback
+```
+
+`dev sync` 在激活 repo-built DEV generation 前先固定当前 PROD binary/checksum，而且只有 server/Link generation reconcile 完成后才接受切换。`dev rollback` 回到这个固定 PROD source，不重新编译源码，也不猜“哪个 previous generation 才是稳定版”。底层 `bin/herdr-runtime-generation ...` 仍可用于实现/UAT，但不再是维护者日常源码 dogfood 的主入口。
+
+Runtime DEV/PROD 与浏览器扩展的 DEV/STANDALONE/STORE 身份模型无关。
+
 ## A/B 不是进程管理器
 
 Generation manager 不负责“随便启动任何命令”。

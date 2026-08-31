@@ -68,6 +68,26 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 
 `200` or `401` proves the local HTTP process is alive. Prefer top-level `doctor` / `status` / `update ...` commands; do not use `herdr-mcp service install` as the normal install path.
 
+### Source developers only: dogfood the current checkout
+
+Ordinary users should stay on PROD release artifacts. If you are developing herdr-mcp itself on v0.4.3+, use the explicit DEV plane instead of replacing `runtime/current` by hand:
+
+```bash
+herdr-mcp dev status
+herdr-mcp dev sync --dry-run
+herdr-mcp dev sync
+```
+
+`dev sync` builds the current clean checkout as `0.4.3-dev`, records source provenance, pins the pre-existing PROD binary/checksum, and activates the DEV binary through the same transactional runtime lifecycle. Server, Native Host and the production workstation Link must converge on the same generation before the switch is accepted. Dirty source is refused unless `--allow-dirty` is explicit.
+
+Return to the fixed PROD recovery source with:
+
+```bash
+herdr-mcp dev rollback
+```
+
+This runtime DEV/PROD plane is independent from extension DEV/STANDALONE/STORE channels. A DEV runtime switch does not deploy Edge, change DNS/OAuth, or create a third persistent test environment.
+
 ## 2. Verify Herdr before adding the Internet
 
 Do not debug Cloudflare while the local runtime cannot see Herdr.
@@ -123,7 +143,7 @@ The workstation connects **outward** to Edge over authenticated WSS. You do not 
 
 Use the repository `herdr-link` installation/status flow for your local environment, then verify Edge can see the workstation online.
 
-If OAuth works but tools report `workstation offline`, this is the layer to investigate.
+If OAuth works but tools report `workstation offline`, this is the layer to investigate. On v0.4.3+, a recently connected workstation gets a short Edge reconnect grace before the error is surfaced; persistent Link loss is then handled by the local reconnect/recycle path. See [Troubleshooting](troubleshooting.md) for the retry and mutation-safety rules.
 
 ## 5. Add the ChatGPT Connector
 

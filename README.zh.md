@@ -37,6 +37,8 @@ Languages: [English](README.md) · **简体中文** · [日本語](README.ja.md)
 
 正常情况下，ChatGPT 会通过 `herdr_inspect` 看到真实 workspace / pane / Agent，并能够继续读取 Git 和项目文件。
 
+v0.4.3+ 中，`workstation_offline` 表示 Link/Edge 到目标工作站的可达性问题，不是浏览器扩展报错。Edge 会先吸收短暂重连；仍需返回错误时，MCP result 会给出明确的 retry/delivery metadata，本机 Link 同时继续 reconnect/backoff 与 prolonged-offline recycle。mutation 到底能不能重放，以 [故障排查](docs/i18n/zh-CN/troubleshooting.md) 里的 `delivery_state` 规则为准。
+
 ### v0.4.2 的图片与视觉开发能力
 
 v0.4.2 把同一套工作站安全边界扩展到视觉与文件导入：`herdr_fs_image` 可以让 ChatGPT 直接读取 managed project 内的 PNG/JPEG/GIF/WebP；内置规划策略让 artifact 走最短安全路径——managed 本地文件直接用 `herdr_fs_*` 工具，安全签名 HTTPS URL 直接用 `herdr-mcp artifact import --signed-url` 导入，可直接消费的 MCP/Connector 文件引用直接消费，其余跨边界传输才使用私有、短生命周期的 Cloudflare R2 通用 artifact 中继。Rust runtime 在写入仓库前完成 HTTPS/SSRF、大小、MIME/文件签名、摘要、managed-root、dirty-file 和 busy-agent 校验。公共 MCP catalog 仍保持 18 个工具。
@@ -85,6 +87,18 @@ herdr-mcp update status
 herdr-mcp rollback
 herdr-mcp uninstall
 ```
+
+如果你是在开发 **herdr-mcp 自身源码**，v0.4.3+ 的 runtime 明确区分 DEV / PROD：
+
+```bash
+herdr-mcp dev status
+herdr-mcp dev sync
+herdr-mcp dev rollback
+```
+
+`dev sync` 是明确的本机 dogfood 入口：从当前 clean checkout 构建 `0.4.3-dev`，把 source commit / dirty provenance 编进 binary，先固定保存当前 PROD binary 与 SHA-256 回退来源，再复用同一套 transactional service lifecycle，让 server、Native Host 与 `dev.herdr-mcp.link-prod` 收敛到同一个 managed DEV generation。`dev status` 只读；`dev rollback` 回到固定 PROD 快照；连续多次 DEV sync 不会把“上一个 DEV”重新定义成 PROD。`dev sync --dry-run` 只预览、不修改 runtime；dirty source 默认拒绝，只有显式 `--allow-dirty` 才允许。
+
+这组命令只给维护者/源码开发使用，不是普通用户的第二套安装方式。Runtime **DEV / PROD** 与浏览器扩展的 **DEV / STANDALONE / STORE** 身份模型也是两套独立概念。
 
 `herdr-mcp service ...` 属于**高级 / 内部**服务控制，不是普通安装主路径。`0.4.1+` 可运行 `herdr-mcp scan --json` 刷新“当前客户端实际可启动的 Herdr Agent”证据清单；详细语义见 [CLI Reference](docs/i18n/zh-CN/cli-reference.md#agent-能力发现scan)。
 

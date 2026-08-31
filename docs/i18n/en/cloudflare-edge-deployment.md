@@ -103,6 +103,8 @@ This separation lets the public Connector stay stable while the local runtime re
 
 If OAuth and public `/health` work but tool calls report `workstation offline`, investigate the link instead of reinstalling the Connector.
 
+On v0.4.3+, Edge first gives a recently connected workstation a short in-memory reconnect grace. If no validated Link returns, the MCP error exposes `retryable`, `delivery_state`, `retry_after_ms` and a bounded read-only recovery policy so the Agent does not have to guess whether replay is safe. The workstation Link has its own reconnect/backoff and prolonged-offline recycle path; this recovery does not use browser-extension state and does not add request-led Durable Object writes/alarms. See [Troubleshooting](troubleshooting.md) for the exact replay rules.
+
 ## First validation sequence
 
 Validate layer by layer:

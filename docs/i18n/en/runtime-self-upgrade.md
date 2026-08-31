@@ -50,6 +50,32 @@ Therefore:
 runtime switch != Connector switch
 ```
 
+## DEV / PROD is a provenance plane over generations
+
+v0.4.3+ adds an explicit source-development plane on top of the same generation machinery. It does not create a third permanent runtime environment:
+
+```text
+PROD
+  published / verified installed binary
+  pinned recovery source
+
+DEV
+  repo/worktree build with source provenance
+  activated as a managed generation
+```
+
+For normal source dogfooding, use:
+
+```bash
+herdr-mcp dev status
+herdr-mcp dev sync
+herdr-mcp dev rollback
+```
+
+`dev sync` pins the current PROD binary/checksum before activating a repo-built DEV generation, and the switch is accepted only after server/Link generation reconciliation. `dev rollback` returns to that pinned PROD source instead of rebuilding source or guessing which previous generation was stable. The lower-level `bin/herdr-runtime-generation ...` commands remain useful for implementation/UAT work, but they are not the normal maintainer entry for source dogfooding.
+
+Runtime DEV/PROD is unrelated to the browser extension's DEV/STANDALONE/STORE identities.
+
 ## A/B is not a process manager
 
 The generation manager does not start arbitrary commands. The recommended flow is:
