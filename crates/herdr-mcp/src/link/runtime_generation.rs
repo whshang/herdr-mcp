@@ -625,6 +625,14 @@ impl RuntimeGenerationManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn reserve_request_lease(&self, request_id: &str) -> Result<String, FenceError> {
+        let mut inner = self.lock_inner();
+        inner
+            .fence
+            .begin_request(request_id.to_owned())
+            .map(|lease| lease.generation)
+    }
+
     fn validation_failure(&self, code: &str) -> RuntimeGenerationValidation {
         RuntimeGenerationValidation {
             ok: false,
@@ -782,35 +790,76 @@ impl LinkRuntimeTransport for RuntimeGenerationManager {
         info
     }
 
+    fn begin_request_lease(&self, request_id: &str) -> Result<String, String> {
+        self.reserve_request_lease(request_id)
+            .map_err(|error| format!("runtime generation refused request lease: {error:?}"))
+    }
+
     async fn dispatch_request(&self, request: RuntimeRequest) -> RuntimeToolResult {
         let request_id = request.request_id.clone();
-        let (generation, transport) = {
+        let generation = match self.reserve_request_lease(&request_id) {
+            Ok(generation) => generation,
+            Err(error) => {
+                return RuntimeToolResult::Failure {
+                    code: if matches!(error, FenceError::DuplicateRequest(_)) {
+                        "duplicate_request".to_owned()
+                    } else {
+                        "runtime_generation_dispatch_rejected".to_owned()
+                    },
+                    retryable: false,
+                    message: format!("runtime generation refused dispatch: {error:?}"),
+                    details: None,
+                };
+            }
+        };
+        self.dispatch_request_with_lease(request, generation).await
+    }
+
+    async fn dispatch_request_with_lease(
+        &self,
+        request: RuntimeRequest,
+        generation: String,
+    ) -> RuntimeToolResult {
+        let request_id = request.request_id.clone();
+        let transport = {
             let mut inner = self.lock_inner();
-            match inner.fence.begin_request(&request_id) {
-                Ok(lease) => {
-                    let transport = inner
-                        .records
-                        .get(&lease.generation)
-                        .map(|record| Arc::clone(&record.transport));
-                    (lease.generation, transport)
-                }
-                Err(FenceError::DuplicateRequest(_)) => {
+            if inner.fence.request_owner(&request_id) != Some(generation.as_str()) {
+                return RuntimeToolResult::Failure {
+                    code: "runtime_generation_dispatch_rejected".to_owned(),
+                    retryable: false,
+                    message: "request lease no longer belongs to the reserved generation"
+                        .to_owned(),
+                    details: None,
+                };
+            }
+            let active_generation = inner.fence.active_generation().to_owned();
+            if active_generation != generation {
+                let reserved_endpoint = inner
+                    .records
+                    .get(&generation)
+                    .map(|record| record.spec.endpoint.as_str());
+                let active_endpoint = inner
+                    .records
+                    .get(&active_generation)
+                    .map(|record| record.spec.endpoint.as_str());
+                if reserved_endpoint.is_some() && reserved_endpoint == active_endpoint {
+                    let _ = inner.fence.complete_request(&request_id, &generation);
                     return RuntimeToolResult::Failure {
-                        code: "duplicate_request".to_owned(),
-                        retryable: false,
-                        message: "request_id is already owned by a generation".to_owned(),
-                        details: None,
-                    };
-                }
-                Err(_) => {
-                    return RuntimeToolResult::Failure {
-                        code: "runtime_generation_dispatch_rejected".to_owned(),
-                        retryable: false,
-                        message: "runtime generation refused dispatch".to_owned(),
-                        details: None,
+                        code: "runtime_generation_superseded_before_dispatch".to_owned(),
+                        retryable: true,
+                        message: "reserved runtime generation was superseded on the shared loopback endpoint before dispatch"
+                            .to_owned(),
+                        details: Some(json!({
+                            "reserved_generation": generation,
+                            "active_generation": active_generation,
+                        })),
                     };
                 }
             }
+            inner
+                .records
+                .get(&generation)
+                .map(|record| Arc::clone(&record.transport))
         };
         let Some(transport) = transport else {
             let mut inner = self.lock_inner();
@@ -825,7 +874,14 @@ impl LinkRuntimeTransport for RuntimeGenerationManager {
         let result = transport.dispatch_request(request).await;
         {
             let mut inner = self.lock_inner();
-            let _ = inner.fence.complete_request(&request_id, &generation);
+            if let Err(error) = inner.fence.complete_request(&request_id, &generation) {
+                return RuntimeToolResult::Failure {
+                    code: "runtime_generation_completion_rejected".to_owned(),
+                    retryable: false,
+                    message: format!("runtime generation completion proof failed: {error:?}"),
+                    details: None,
+                };
+            }
         }
         result
     }
@@ -1298,6 +1354,168 @@ mod tests {
             .expect("stable");
         assert_eq!(stable_status.phase, GenerationPhase::Standby);
         assert_eq!(stable_status.in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn reserved_request_lease_survives_activation_before_dispatch() {
+        let hash = compute_contract_hash(&catalog()).unwrap();
+        let stable_state = Arc::new(MockState {
+            version: "0.3.23".to_owned(),
+            port_label: "8772".to_owned(),
+            catalog: catalog(),
+            fail_health_after: None,
+            health_calls: AtomicU32::new(0),
+            defer_tools: false,
+            release: Mutex::new(None),
+        });
+        let candidate_state = Arc::new(MockState {
+            version: "0.3.26".to_owned(),
+            port_label: "8773".to_owned(),
+            catalog: catalog(),
+            fail_health_after: None,
+            health_calls: AtomicU32::new(0),
+            defer_tools: false,
+            release: Mutex::new(None),
+        });
+        let stable = serve_mock(stable_state).await;
+        let candidate = serve_mock(candidate_state).await;
+        let manager = manager_for(&stable, options(&stable, &hash)).await;
+        assert!(
+            manager
+                .register_generation(RuntimeGenerationSpec {
+                    generation: "candidate".to_owned(),
+                    endpoint: candidate,
+                    expected_runtime_version: Some("0.3.26".to_owned()),
+                    runtime_commit: None,
+                })
+                .await
+                .unwrap()
+                .ok
+        );
+
+        // Reproduce the incident window exactly: the runner accepts and pins a
+        // request to stable, runtime-control activates candidate, then the HTTP
+        // dispatch starts. Dispatch must follow the accepted lease rather than
+        // re-reading the now-active generation.
+        let old_generation = manager.begin_request_lease("old-race").unwrap();
+        assert_eq!(old_generation, "stable");
+        assert!(
+            manager
+                .activate_generation("candidate", Some(1), Some(0))
+                .await
+                .ok
+        );
+        let status = manager.get_status();
+        let stable_status = status
+            .generations
+            .iter()
+            .find(|entry| entry.generation == "stable")
+            .expect("stable");
+        assert_eq!(stable_status.phase, GenerationPhase::Draining);
+        assert_eq!(stable_status.in_flight, 1);
+
+        let old = manager
+            .dispatch_request_with_lease(request("old-race"), old_generation)
+            .await;
+        assert_eq!(
+            old,
+            RuntimeToolResult::Success {
+                result: Some(json!({ "port": "8772" })),
+            }
+        );
+        let status = manager.get_status();
+        let stable_status = status
+            .generations
+            .iter()
+            .find(|entry| entry.generation == "stable")
+            .expect("stable");
+        assert_eq!(stable_status.phase, GenerationPhase::Standby);
+        assert_eq!(stable_status.in_flight, 0);
+
+        let new_generation = manager.begin_request_lease("new-race").unwrap();
+        assert_eq!(new_generation, "candidate");
+        let fresh = manager
+            .dispatch_request_with_lease(request("new-race"), new_generation)
+            .await;
+        assert_eq!(
+            fresh,
+            RuntimeToolResult::Success {
+                result: Some(json!({ "port": "8773" })),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_loopback_endpoint_refuses_stale_lease_after_activation() {
+        let hash = compute_contract_hash(&catalog()).unwrap();
+        let state = Arc::new(MockState {
+            version: "0.3.23".to_owned(),
+            port_label: "8772".to_owned(),
+            catalog: catalog(),
+            fail_health_after: None,
+            health_calls: AtomicU32::new(0),
+            defer_tools: false,
+            release: Mutex::new(None),
+        });
+        let endpoint = serve_mock(state).await;
+        let manager = manager_for(&endpoint, options(&endpoint, &hash)).await;
+        assert!(
+            manager
+                .register_generation(RuntimeGenerationSpec {
+                    generation: "candidate".to_owned(),
+                    endpoint: endpoint.clone(),
+                    expected_runtime_version: Some("0.3.23".to_owned()),
+                    runtime_commit: None,
+                })
+                .await
+                .unwrap()
+                .ok
+        );
+
+        let old_generation = manager.begin_request_lease("old-shared").unwrap();
+        assert_eq!(old_generation, "stable");
+        assert!(
+            manager
+                .activate_generation("candidate", Some(1), Some(0))
+                .await
+                .ok
+        );
+
+        // Production generations reuse 127.0.0.1:8772. Once the active
+        // generation changes, sending an old lease to that same endpoint could
+        // only hit the replacement process and falsely label it as the old
+        // generation. Fail the request locally instead of forging that proof.
+        let stale = manager
+            .dispatch_request_with_lease(request("old-shared"), old_generation)
+            .await;
+        assert!(matches!(
+            stale,
+            RuntimeToolResult::Failure {
+                code,
+                retryable: true,
+                ..
+            } if code == "runtime_generation_superseded_before_dispatch"
+        ));
+        let status = manager.get_status();
+        let stable_status = status
+            .generations
+            .iter()
+            .find(|entry| entry.generation == "stable")
+            .expect("stable");
+        assert_eq!(stable_status.phase, GenerationPhase::Standby);
+        assert_eq!(stable_status.in_flight, 0);
+
+        let candidate_generation = manager.begin_request_lease("fresh-shared").unwrap();
+        assert_eq!(candidate_generation, "candidate");
+        let fresh = manager
+            .dispatch_request_with_lease(request("fresh-shared"), candidate_generation)
+            .await;
+        assert_eq!(
+            fresh,
+            RuntimeToolResult::Success {
+                result: Some(json!({ "port": "8772" })),
+            }
+        );
     }
 
     #[tokio::test]

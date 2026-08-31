@@ -1198,7 +1198,7 @@ mod tests {
         let mut config = RunnerConfig::new("ws1", "boot1", 0);
         config.request_timeout_ms = 5_000;
         config.max_pending = 8;
-        LinkRunnerCore::new(config, runtime, "gen-a")
+        LinkRunnerCore::new(config, runtime)
     }
 
     fn io_config(drain_ms: u64) -> LinkIoConfig {

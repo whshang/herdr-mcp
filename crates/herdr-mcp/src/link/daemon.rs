@@ -236,7 +236,7 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
     let mut runner_config =
         RunnerConfig::new(config.workstation_id.clone(), boot_id, started_at_ms);
     runner_config.request_timeout_ms = DAEMON_REQUEST_TIMEOUT_MS;
-    let runner = LinkRunnerCore::new(runner_config, Arc::clone(&manager), base.generation);
+    let runner = LinkRunnerCore::new(runner_config, Arc::clone(&manager));
     let transport = LinkTransportCore::new(
         config.workstation_id.clone(),
         None,
@@ -560,7 +560,6 @@ mod tests {
         let runner = LinkRunnerCore::new(
             RunnerConfig::new("dev-w1", "boot-test", 1),
             Arc::clone(&manager),
-            base.generation,
         );
         let transport = LinkTransportCore::new(
             "dev-w1",

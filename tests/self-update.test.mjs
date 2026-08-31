@@ -21,6 +21,7 @@ import {
   splitServerEnv,
   buildPlan,
   buildRollbackPlan,
+  generationDrained,
   validationOk,
   parseArgs,
   _setSpawnOverride,
@@ -377,28 +378,53 @@ test("rollback ordering is phase-aware: reloaded 8772 restores plist before re-a
   const steps = buildRollbackPlan(switchedJob);
   const actions = steps.map((s) => s.action);
   assert.deepEqual(actions.slice(0, 3), ["restore_server_plist", "reload_server_from_original", "verify_original_runtime"]);
+  const linkIdx = actions.indexOf("restore_link_plist");
   const actIdx = actions.indexOf("activate_original_generation");
+  const drainIdx = actions.indexOf("wait_candidate_generation_drain");
   assert.ok(actIdx > 2, "original activation must come after 8772 restore when already reloaded");
+  assert.ok(linkIdx > 2 && linkIdx < actIdx, "Link restart identity must be restored before original activation");
+  assert.ok(drainIdx > actIdx, "candidate must drain after traffic returns to original");
   assert.equal(actions.at(-1), "stop_candidate");
+  assert.ok(drainIdx < actions.indexOf("remove_candidate_generation"));
   assert.ok(actions.indexOf("remove_candidate_generation") < actions.indexOf("stop_candidate"));
 });
 
-test("rollback ordering: not-yet-reloaded 8772 switches original pointer before restore", () => {
+test("rollback ordering restores persistent restart identities before original activation", () => {
   const notSwitched = {
     candidate_active: true,
     server_reloaded: false,
     server_plist_edited: true,
     server_plist_backup: "/x/backup/server.plist",
     server_plist: "/x/server.plist",
+    link_plist_backup: "/x/backup/link.plist",
+    link_plist: "/x/link.plist",
     candidate_generation: "candidate-0.3.27-ab12cd",
     original_active: "stable-0.3.26",
   };
   const actions = buildRollbackPlan(notSwitched).map((s) => s.action);
-  assert.equal(actions[0], "activate_original_generation");
-  // plist restore appears without a reload because 8772 never switched
+  assert.deepEqual(actions.slice(0, 3), ["restore_server_plist", "restore_link_plist", "activate_original_generation"]);
   assert.equal(actions.includes("reload_server_from_original"), false);
-  assert.ok(actions.indexOf("restore_server_plist") > actions.indexOf("activate_original_generation"));
+  assert.ok(actions.indexOf("wait_candidate_generation_drain") > actions.indexOf("activate_original_generation"));
   assert.equal(actions.at(-1), "stop_candidate");
+});
+
+test("generationDrained requires a non-active generation with zero in-flight leases", () => {
+  const status = {
+    manager: {
+      active_generation: "stable-new",
+      generations: [
+        { generation: "stable-old", phase: "draining", in_flight: 1 },
+        { generation: "stable-new", phase: "active", in_flight: 0 },
+      ],
+    },
+  };
+  assert.equal(generationDrained(status, "stable-old"), false);
+  status.manager.generations[0].in_flight = 0;
+  status.manager.generations[0].phase = "standby";
+  assert.equal(generationDrained(status, "stable-old"), true);
+  assert.equal(generationDrained(status, "stable-new"), false);
+  assert.equal(generationDrained(status, "already-removed"), true);
+  assert.equal(generationDrained(null, "stable-old"), false);
 });
 
 test("splitServerEnv isolates the token and never leaks it into the redacted env", () => {
@@ -481,11 +507,13 @@ test("rollback treats a reload attempt as a switched runtime boundary", () => {
     link_plist: "/tmp/link.plist",
     candidate_generation: "candidate-0.3.28-test",
   });
-  assert.deepEqual(steps.slice(0, 4).map((s) => s.action), [
+  assert.deepEqual(steps.slice(0, 6).map((s) => s.action), [
     "restore_server_plist",
     "reload_server_from_original",
     "verify_original_runtime",
+    "restore_link_plist",
     "activate_original_generation",
+    "wait_candidate_generation_drain",
   ]);
 });
 

@@ -128,10 +128,31 @@ pub struct RuntimeHealth {
 pub trait LinkRuntimeTransport: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn runtime_info(&self) -> RuntimeContractInfo;
+    /// Reserve the generation that owns this request at accept time.
+    ///
+    /// Static transports use their configured generation. Generation-aware
+    /// transports override this method so the returned lease comes from the
+    /// same ownership fence that controls activation/draining.
+    fn begin_request_lease(&self, _request_id: &str) -> Result<String, String> {
+        self.runtime_info()
+            .runtime_generation
+            .ok_or_else(|| "runtime generation is unavailable".to_owned())
+    }
     fn dispatch_request(
         &self,
         request: RuntimeRequest,
     ) -> impl std::future::Future<Output = RuntimeToolResult> + Send;
+    /// Dispatch a request on the generation reserved by `begin_request_lease`.
+    /// Static transports cannot switch generations, so their default behavior
+    /// is the ordinary dispatch path. Runtime generation managers override this
+    /// to route by the reserved generation instead of re-reading current active.
+    fn dispatch_request_with_lease(
+        &self,
+        request: RuntimeRequest,
+        _generation: String,
+    ) -> impl std::future::Future<Output = RuntimeToolResult> + Send {
+        self.dispatch_request(request)
+    }
     fn cancel_request(
         &self,
         request_id: &str,

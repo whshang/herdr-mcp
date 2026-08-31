@@ -21,7 +21,7 @@ use crate::relay::validation::RelayValidationOptions;
 use crate::relay::wire::{
     RelayWireError, build_compact_oversized_error, decode_relay_frame, encode_relay_message,
 };
-use serde_json::Value;
+use serde_json::{Number, Value};
 use std::io::{self, Write};
 
 pub const LINK_DEFAULT_TRANSPORT_PING_MS: i64 = 15_000;
@@ -139,6 +139,18 @@ impl From<RelayWireError> for TransportError {
     fn from(value: RelayWireError) -> Self {
         Self::Wire(value)
     }
+}
+
+fn oversized_outbound_validation_code(code: &str) -> bool {
+    matches!(
+        code,
+        "frame_too_large"
+            | "payload_too_large"
+            | "string_too_long"
+            | "too_deep"
+            | "too_many_keys"
+            | "too_many_items"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -543,23 +555,42 @@ impl LinkTransportCore {
         }
         let frame = match encode_relay_message(&message, Some(&self.validation_options())) {
             Ok(frame) => frame,
-            Err(error) if error.code == "frame_too_large" || error.code == "payload_too_large" => {
-                let RelayMessage::ToolResult(result) = &message else {
-                    return Ok(Vec::new());
+            Err(error) if oversized_outbound_validation_code(error.code.as_str()) => {
+                let compact = match &message {
+                    RelayMessage::ToolResult(result) => {
+                        let runtime_generation = match &result.runtime_generation {
+                            OptionalNullable::Value(value) => Some(value.clone()),
+                            OptionalNullable::Absent | OptionalNullable::Null => None,
+                        };
+                        RelayMessage::ToolError(build_compact_oversized_error(
+                            &self.workstation_id,
+                            &result.request_id,
+                            runtime_generation,
+                            result.served_at_ms.clone(),
+                        ))
+                    }
+                    RelayMessage::ToolError(error) => {
+                        let runtime_generation = match &error.runtime_generation {
+                            OptionalNullable::Value(value) => Some(value.clone()),
+                            OptionalNullable::Absent | OptionalNullable::Null => None,
+                        };
+                        RelayMessage::ToolError(build_compact_oversized_error(
+                            &self.workstation_id,
+                            &error.request_id,
+                            runtime_generation,
+                            error
+                                .served_at_ms
+                                .clone()
+                                .unwrap_or_else(|| Number::from(0)),
+                        ))
+                    }
+                    _ => return Ok(Vec::new()),
                 };
-                let runtime_generation = match &result.runtime_generation {
-                    OptionalNullable::Value(value) => Some(value.clone()),
-                    OptionalNullable::Absent | OptionalNullable::Null => None,
-                };
-                let compact = RelayMessage::ToolError(build_compact_oversized_error(
-                    &self.workstation_id,
-                    &result.request_id,
-                    runtime_generation,
-                    result.served_at_ms.clone(),
-                ));
                 match encode_relay_message(&compact, Some(&self.validation_options())) {
                     Ok(frame) => frame,
-                    Err(compact_error) if compact_error.code == "frame_too_large" => {
+                    Err(compact_error)
+                        if oversized_outbound_validation_code(compact_error.code.as_str()) =>
+                    {
                         return Ok(Vec::new());
                     }
                     Err(compact_error) => return Err(compact_error.into()),
@@ -676,14 +707,15 @@ fn extract_request_id(raw: &str) -> Option<String> {
 mod tests {
     use super::{
         LINK_DEFAULT_HANDSHAKE_TIMEOUT_MS, LINK_DEFAULT_MAX_FRAME_BYTES, LinkTransportCore,
-        SocketAttemptId, TransportAction, TransportConfig,
+        SocketAttemptId, TransportAction, TransportConfig, oversized_outbound_validation_code,
     };
     use crate::link::backoff::{BackoffOptions, ExponentialBackoff};
     use crate::link::lifecycle::ConnectionPhase;
     use crate::link::policy::{LinkExitKind, WS_CLOSE_SUPERSEDED};
     use crate::relay::protocol::{
         DeliveryState, HelloAckMessage, HelloAckOutcome, OptionalNullable, RelayEnvelope,
-        RelayMessage, RuntimeContractInfo, StatusFields, StatusMessage, ToolResultMessage,
+        RelayMessage, RuntimeContractInfo, StatusFields, StatusMessage, ToolErrorMessage,
+        ToolResultMessage,
     };
     use crate::relay::wire::{build_hello_message, decode_relay_frame, encode_relay_message};
     use serde_json::{Number, json};
@@ -1027,6 +1059,49 @@ mod tests {
         assert_eq!(error.code, "response_too_large");
         assert!(!error.retryable);
         assert_eq!(error.delivery_state, Some(DeliveryState::Delivered));
+    }
+
+    #[test]
+    fn oversized_outbound_tool_error_falls_back_without_link_failure() {
+        let mut core = core();
+        let attempt = open_and_handshake(&mut core);
+        core.frame_received(attempt, &success_ack(), 2_000, 0.5)
+            .unwrap();
+
+        let error = RelayMessage::ToolError(ToolErrorMessage {
+            envelope: RelayEnvelope::new("ws1"),
+            request_id: "r-error-payload-budget".to_owned(),
+            code: "local_mcp_error".to_owned(),
+            message: Some("runtime returned a large structured error".to_owned()),
+            details: Some(json!({ "payload": "x".repeat((1024 * 1024) + 1) })),
+            retryable: false,
+            delivery_state: Some(DeliveryState::Delivered),
+            served_at_ms: Some(Number::from(2_500)),
+            runtime_generation: OptionalNullable::Value("g1".to_owned()),
+        });
+
+        let raw_error = encode_relay_message(&error, Some(&core.validation_options()))
+            .expect_err("tool error payload should exceed an outbound validation budget");
+        assert!(oversized_outbound_validation_code(&raw_error.code));
+
+        let actions = core.send_outbound(error).expect("compact fallback");
+        let frame = match actions.as_slice() {
+            [TransportAction::SendFrame { frame, .. }] => frame,
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        let decoded = decode_relay_frame(frame, None).expect("compact frame");
+        let RelayMessage::ToolError(error) = decoded else {
+            panic!("expected compact tool_error");
+        };
+        assert_eq!(error.request_id, "r-error-payload-budget");
+        assert_eq!(error.code, "response_too_large");
+        assert!(!error.retryable);
+        assert_eq!(error.delivery_state, Some(DeliveryState::Delivered));
+        assert_eq!(error.served_at_ms, Some(Number::from(2_500)));
+        assert_eq!(
+            error.runtime_generation,
+            OptionalNullable::Value("g1".to_owned())
+        );
     }
 
     #[test]
