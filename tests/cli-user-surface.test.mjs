@@ -14,6 +14,7 @@ const USER_COMMANDS = [
   "herdr-mcp doctor",
   "herdr-mcp update check",
   "herdr-mcp update apply",
+  "herdr-mcp update auto",
   "herdr-mcp update status",
   "herdr-mcp rollback",
   "herdr-mcp uninstall",

@@ -56,6 +56,7 @@ mod status;
 mod tcc_broker;
 #[cfg(test)]
 mod test_env;
+mod update_scheduler;
 mod updater;
 mod updater_store;
 // Wired only from the macOS service manager; keep unit tests compiling on Linux CI.

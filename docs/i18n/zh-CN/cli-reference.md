@@ -14,10 +14,13 @@ herdr-mcp status
 herdr-mcp doctor
 herdr-mcp update check
 herdr-mcp update apply
+herdr-mcp update auto
 herdr-mcp update status
 herdr-mcp rollback
 herdr-mcp uninstall
 ```
+
+`update auto` 是后台调度入口。默认 macOS PROD 实例执行 `service install` 时会 reconcile 归属明确的 `dev.herdr-mcp.auto-update` LaunchAgent；任务在加载时先执行一次，随后每天触发。自动安装严格限制为 **PROD runtime + Stable Release**：编译为 DEV 的 runtime、`[update] check = false`、named instance、`preview` 都会在访问网络前直接跳过。发现严格更高的 Stable Release 后，继续复用正常的 provenance 验签、detached worker 和 rollback-safe 更新事务，不新增第二套下载器，也不绕过回滚门槛。`service uninstall` 会先写入归属明确的持久 update fence 并移除 scheduler；detached worker 在真正 activation 前会再次检查该 fence，因此已经排队的静默更新不能在卸载后复活服务。显式成功的 install 才会解除 fence。
 
 `service ...`、`link ...`、`native-host ...`、`candidate` 属于高级/内部命令；`dev` 是下面单独说明的**源码开发**入口。正常安装本机 runtime 不需要仓库 checkout、Node.js、npm，也不应把 `service install` 当作普通用户入口。
 

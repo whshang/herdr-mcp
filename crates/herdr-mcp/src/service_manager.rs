@@ -253,13 +253,30 @@ mod macos {
             None
         };
         let result = match command {
-            ServiceCommand::Install { adopt_node } => install(
-                &paths,
-                adopt_node,
-                mutation_lock
-                    .as_ref()
-                    .expect("install must hold the service mutation lock"),
-            )?,
+            ServiceCommand::Install { adopt_node } => {
+                crate::update_scheduler::preflight_service_install_fence()?;
+                let mut result = install(
+                    &paths,
+                    adopt_node,
+                    mutation_lock
+                        .as_ref()
+                        .expect("install must hold the service mutation lock"),
+                )?;
+                let fence_clear = crate::update_scheduler::clear_service_uninstall_fence();
+                let scheduler = match fence_clear {
+                    Ok(()) => crate::update_scheduler::reconcile_after_service_install(),
+                    Err(error) => json!({
+                        "ok": false,
+                        "installed": false,
+                        "label": crate::update_scheduler::AUTO_UPDATE_LABEL,
+                        "detail": format!("service installed but auto-update fence could not be cleared: {error}"),
+                    }),
+                };
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("auto_update_scheduler".to_owned(), scheduler);
+                }
+                result
+            }
             ServiceCommand::Status => status(&paths)?,
             ServiceCommand::Start => start(&paths)?,
             ServiceCommand::Stop => stop(&paths)?,
@@ -270,7 +287,15 @@ mod macos {
                     .as_ref()
                     .expect("rollback must hold the service mutation lock"),
             )?,
-            ServiceCommand::Uninstall => uninstall(&paths)?,
+            ServiceCommand::Uninstall => {
+                crate::update_scheduler::arm_service_uninstall_fence()?;
+                let scheduler = crate::update_scheduler::remove_before_service_uninstall_checked()?;
+                let mut result = uninstall(&paths)?;
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("auto_update_scheduler".to_owned(), scheduler);
+                }
+                result
+            }
             ServiceCommand::Guardian {
                 transaction_id,
                 parent_pid,

@@ -66,10 +66,36 @@ struct ReleasePlan {
     asset: ReleaseAsset,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoUpdatePolicy {
+    RunStable,
+    Skip(&'static str),
+}
+
+fn auto_update_policy(
+    named_instance: bool,
+    update_check: bool,
+    channel: UpdateChannel,
+    runtime_channel: &str,
+) -> AutoUpdatePolicy {
+    if named_instance {
+        AutoUpdatePolicy::Skip("named_instance")
+    } else if runtime_channel != "prod" {
+        AutoUpdatePolicy::Skip("runtime_channel_not_prod")
+    } else if !update_check {
+        AutoUpdatePolicy::Skip("update_check_disabled")
+    } else if channel != UpdateChannel::Stable {
+        AutoUpdatePolicy::Skip("preview_channel_requires_manual_update")
+    } else {
+        AutoUpdatePolicy::RunStable
+    }
+}
+
 pub fn run(command: UpdateCommand) -> Result<ExitCode, String> {
     match command {
         UpdateCommand::Check { manifest_url } => check(manifest_url.as_deref()),
         UpdateCommand::Apply { manifest_url } => apply(manifest_url.as_deref()),
+        UpdateCommand::Auto => auto(),
         UpdateCommand::Status => status(),
         UpdateCommand::Worker { job_id } => worker(&job_id),
     }
@@ -105,18 +131,82 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
 }
 
 fn apply(manifest_override: Option<&str>) -> Result<ExitCode, String> {
+    apply_inner(manifest_override, false, None)
+}
+
+fn auto() -> Result<ExitCode, String> {
+    let paths = RuntimePaths::discover()?;
+    if let AutoUpdatePolicy::Skip(reason) = auto_update_policy(
+        paths.instance.is_named(),
+        true,
+        UpdateChannel::Stable,
+        crate::runtime_meta::runtime_channel(),
+    ) {
+        print_json(&json!({
+            "ok": true,
+            "code": "auto_update_skipped",
+            "reason": reason,
+            "network_checked": false,
+        }))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    if let AutoUpdatePolicy::Skip(reason) = auto_update_policy(
+        false,
+        config.update_check,
+        config.update_channel,
+        crate::runtime_meta::runtime_channel(),
+    ) {
+        print_json(&json!({
+            "ok": true,
+            "code": "auto_update_skipped",
+            "reason": reason,
+            "update_channel": config.update_channel.as_str(),
+            "network_checked": false,
+        }))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    // Freeze the trust decision made above. Do not re-read the mutable config
+    // inside the apply path and accidentally widen a scheduled Stable update
+    // into Preview if the config changes concurrently.
+    apply_inner(None, true, Some(UpdateChannel::Stable))
+}
+
+fn apply_inner(
+    manifest_override: Option<&str>,
+    allow_current: bool,
+    channel_override: Option<UpdateChannel>,
+) -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = manifest_override;
+        let _ = (manifest_override, allow_current, channel_override);
         Err("native update apply currently requires macOS service manager".to_owned())
     }
 
     #[cfg(target_os = "macos")]
     {
-        let channel = load_update_channel()?;
+        crate::update_scheduler::ensure_updates_allowed()?;
+        let channel = match channel_override {
+            Some(channel) => channel,
+            None => load_update_channel()?,
+        };
         let plan = fetch_release_plan(manifest_override, channel)?;
         let current = current_version()?;
         if plan.version <= current {
+            if allow_current {
+                print_json(&json!({
+                    "ok": true,
+                    "code": "auto_update_current",
+                    "update_channel": channel.as_str(),
+                    "current_version": current.to_string(),
+                    "release_version": plan.version.to_string(),
+                    "tag": plan.tag,
+                    "provenance_verified": true,
+                    "network_checked": true,
+                    "update_queued": false,
+                }))?;
+                return Ok(ExitCode::SUCCESS);
+            }
             return Err(format!(
                 "release {} is not newer than current {}; refusing downgrade/reinstall",
                 plan.version, current
@@ -250,6 +340,18 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
             None,
             now_ms_i64(),
         )?;
+
+        if let Err(error) = crate::update_scheduler::ensure_updates_allowed() {
+            store.update_update_job(
+                job_id,
+                "failed",
+                Some("service uninstall fence blocked update activation"),
+                None,
+                now_ms_i64(),
+            )?;
+            cleanup_staging(&binary);
+            return Err(error);
+        }
 
         let install = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false });
         let succeeded = matches!(install, Ok(code) if code == ExitCode::SUCCESS);
@@ -1141,6 +1243,30 @@ mod tests {
             )
             .unwrap_err()
             .contains("update channel preview")
+        );
+    }
+
+    #[test]
+    fn scheduled_auto_update_is_default_instance_stable_only() {
+        assert_eq!(
+            auto_update_policy(false, true, UpdateChannel::Stable, "prod"),
+            AutoUpdatePolicy::RunStable
+        );
+        assert_eq!(
+            auto_update_policy(true, true, UpdateChannel::Stable, "prod"),
+            AutoUpdatePolicy::Skip("named_instance")
+        );
+        assert_eq!(
+            auto_update_policy(false, true, UpdateChannel::Stable, "dev"),
+            AutoUpdatePolicy::Skip("runtime_channel_not_prod")
+        );
+        assert_eq!(
+            auto_update_policy(false, false, UpdateChannel::Stable, "prod"),
+            AutoUpdatePolicy::Skip("update_check_disabled")
+        );
+        assert_eq!(
+            auto_update_policy(false, true, UpdateChannel::Preview, "prod"),
+            AutoUpdatePolicy::Skip("preview_channel_requires_manual_update")
         );
     }
 

@@ -120,6 +120,7 @@ pub enum ServiceCommand {
 pub enum UpdateCommand {
     Check { manifest_url: Option<String> },
     Apply { manifest_url: Option<String> },
+    Auto,
     Status,
     Worker { job_id: String },
 }
@@ -709,6 +710,7 @@ fn parse_update(args: &[String]) -> Result<Command, String> {
                 manifest_url: Some(value.clone()),
             }))
         }
+        [subcommand] if subcommand == "auto" => Ok(Command::Update(UpdateCommand::Auto)),
         [subcommand] if subcommand == "status" => Ok(Command::Update(UpdateCommand::Status)),
         [subcommand, flag, value] if subcommand == "worker" && flag == "--job" => {
             Ok(Command::Update(UpdateCommand::Worker {
@@ -785,7 +787,7 @@ User path:\n\
   herdr-mcp doctor\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
-  herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|status]\n\
+  herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|auto|status]\n\
   herdr-mcp rollback\n\
   herdr-mcp uninstall\n\n\
 Same-machine UAT isolation (optional):\n\
@@ -1032,6 +1034,10 @@ mod tests {
             Command::Update(UpdateCommand::Worker {
                 job_id: "upd-12345678".to_owned()
             })
+        );
+        assert_eq!(
+            parse(args(&["update", "auto"])).unwrap().command,
+            Command::Update(UpdateCommand::Auto)
         );
         assert_eq!(
             parse(args(&["link", "status"])).unwrap().command,
