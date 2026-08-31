@@ -3089,6 +3089,10 @@ const H2W_CONTENT_VERSION = "0.1.84";
       const mo = new MutationObserver((records) => {
         if (document.hidden) return;
         uiPressure?.recordMutation();
+        const ignoredChurn = BROWSER_PERFORMANCE?.mutationRecordsAreIgnoredChurn
+          ? BROWSER_PERFORMANCE.mutationRecordsAreIgnoredChurn(records)
+          : false;
+        if (ignoredChurn) return;
         const turnCacheMayBeStale = BROWSER_PERFORMANCE?.mutationTouchesConversationTurns
           ? BROWSER_PERFORMANCE.mutationTouchesConversationTurns(records)
           : true;

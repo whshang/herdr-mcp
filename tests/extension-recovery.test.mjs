@@ -125,6 +125,12 @@ test("turn mutation filter ignores tool-card and HUD churn but keeps turn change
   const tool = makeElement({ parent: assistant, matches: [toolSelector] });
   const toolChild = makeElement({ parent: tool });
 
+  assert.equal(perf.mutationRecordsAreIgnoredChurn([{
+    target: assistant,
+    addedNodes: [tool],
+    removedNodes: [],
+  }]), true);
+
   assert.equal(perf.mutationTouchesConversationTurns([{
     target: tool,
     addedNodes: [toolChild],
@@ -132,6 +138,11 @@ test("turn mutation filter ignores tool-card and HUD churn but keeps turn change
   }]), false);
 
   const streamedText = { nodeType: 3, parentElement: assistant };
+  assert.equal(perf.mutationRecordsAreIgnoredChurn([{
+    target: assistant,
+    addedNodes: [tool, streamedText],
+    removedNodes: [],
+  }]), false);
   assert.equal(perf.mutationTouchesConversationTurns([{
     target: assistant,
     addedNodes: [streamedText],
@@ -144,6 +155,14 @@ test("turn mutation filter ignores tool-card and HUD churn but keeps turn change
     addedNodes: [wrapper],
     removedNodes: [],
   }]), true);
+
+  const broadPageTarget = makeElement({ contains: [turnSelector] });
+  const unrelatedSidePane = makeElement();
+  assert.equal(perf.mutationTouchesConversationTurns([{
+    target: broadPageTarget,
+    addedNodes: [unrelatedSidePane],
+    removedNodes: [],
+  }]), false);
 });
 
 test("bounded message sampler preserves growth length while skipping tool subtrees", () => {
@@ -179,6 +198,17 @@ test("bounded message sampler preserves growth length while skipping tool subtre
   assert.ok(sample.text.startsWith("A"));
   assert.ok(sample.text.endsWith("B".repeat(256)));
   assert.doesNotMatch(sample.text, /Z/);
+
+  const poisonTool = {
+    nodeType: 1,
+    parentElement: null,
+    closest: (selector) => selector === ignoredSelector ? poisonTool : null,
+    get childNodes() { throw new Error("ignored tool subtree was traversed"); },
+  };
+  const poisonRoot = element([text("before"), poisonTool, text("after")]);
+  const poisonSample = perf.sampleBoundedMessageText(poisonRoot, { maxChars: 1024 });
+  assert.equal(poisonSample.text, "beforeafter");
+  assert.equal(poisonSample.skipped_subtrees, 1);
 });
 
 test("ui pressure classifier bands healthy, warning, high from bounded inputs", () => {
@@ -578,6 +608,8 @@ test("ChatGPT turn watcher caches latest turns and reuses settled turns for pres
   assert.match(wake, /updateContextPressureFromSettledTurns\(/);
   assert.match(wake, /CONTEXT_PRESSURE\.mergeSettledTurns\(/);
   assert.match(wake, /uiPressure\?\.recordMutation\(\)/);
+  assert.match(wake, /mutationRecordsAreIgnoredChurn\(records\)/);
+  assert.match(wake, /if \(ignoredChurn\) return/);
   assert.match(wake, /uiPressure\?\.recordTick\(\)/);
   assert.match(wake, /recordTimerDrift\(driftMs\)/);
   assert.match(wake, /rehydrate the latest-turn cache/);

@@ -20,13 +20,13 @@
     '[data-testid^="conversation-turn-"]',
   ].join(", ");
   const DEFAULT_IGNORED_TURN_MUTATION_SELECTOR = [
-    '[class*="group/tool-message"]',
+    '[class~="group/tool-message"]',
     '#h2w-page-hud',
   ].join(", ");
   const DEFAULT_MESSAGE_SAMPLE_CHARS = 64 * 1024;
   const DEFAULT_MESSAGE_TAIL_CHARS = 16 * 1024;
   const DEFAULT_IGNORED_MESSAGE_TEXT_SELECTOR = [
-    '[class*="group/tool-message"]',
+    '[class~="group/tool-message"]',
     '#h2w-page-hud',
     'script',
     'style',
@@ -127,6 +127,26 @@
     try { return Boolean(element.closest(selector)); } catch (_) { return false; }
   }
 
+  function mutationRecordsAreIgnoredChurn(records, {
+    ignoredSelector = DEFAULT_IGNORED_TURN_MUTATION_SELECTOR,
+  } = {}) {
+    const items = Array.from(records || []);
+    if (items.length === 0) return false;
+    for (const record of items) {
+      const changed = [
+        ...Array.from(record?.addedNodes || []),
+        ...Array.from(record?.removedNodes || []),
+      ];
+      if (changed.length > 0) {
+        const allChangedIgnored = changed.every((node) => insideSelector(asElement(node), ignoredSelector));
+        if (allChangedIgnored) continue;
+      }
+      if (insideSelector(asElement(record?.target), ignoredSelector)) continue;
+      return false;
+    }
+    return true;
+  }
+
   /**
    * Decide whether structural mutation records can invalidate the cached latest
    * ChatGPT user/assistant turn. Mutations wholly inside tool-card/HUD subtrees
@@ -145,7 +165,7 @@
       let sawUnignoredChangedNode = false;
       for (const node of changed) {
         const element = asElement(node);
-        if (insideSelector(element, ignoredSelector) || matchesOrContains(element, ignoredSelector)) continue;
+        if (insideSelector(element, ignoredSelector)) continue;
         sawUnignoredChangedNode = true;
         if (insideSelector(element, turnSelector) || matchesOrContains(element, turnSelector)) return true;
       }
@@ -153,7 +173,11 @@
 
       const target = asElement(record?.target);
       if (insideSelector(target, ignoredSelector)) continue;
-      if (insideSelector(target, turnSelector) || matchesOrContains(target, turnSelector)) return true;
+      // For childList mutations the changed nodes above carry subtree additions
+      // and removals. A broad target may merely contain the entire conversation
+      // plus unrelated UI (for example the tool-call side pane), so only treat
+      // the target itself being inside a turn as cache-invalidating evidence.
+      if (insideSelector(target, turnSelector)) return true;
     }
     return false;
   }
@@ -485,6 +509,7 @@
     DEFAULT_UI_PRESSURE_POLICY,
     DEFAULT_PAGE_HEALTH_POLICY,
     createCoalescedScheduler,
+    mutationRecordsAreIgnoredChurn,
     mutationTouchesConversationTurns,
     sampleBoundedMessageText,
     createUiPressureMeter,
