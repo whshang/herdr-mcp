@@ -28,6 +28,7 @@ import {
   workspaceRowsForPage,
 } from "../extension/control-center-model.js";
 import { createBrowserStateStore } from "../extension/browser-state-store.js";
+import { pruneMissingWorkspaces } from "../extension/binding-core.js";
 
 function baseSnapshot() {
   return {
@@ -284,23 +285,25 @@ test("pinned target type exposes only matching control modes", () => {
 
   assert.deepEqual(actionModesForTarget(agentTarget), [ACTION_TYPES.AGENT_PROMPT]);
   assert.deepEqual(actionModesForTarget(steerCapableAgentTarget), [ACTION_TYPES.AGENT_PROMPT, ACTION_TYPES.STEER]);
-  assert.deepEqual(actionModesForTarget(terminalTarget), []);
+  assert.deepEqual(actionModesForTarget(terminalTarget), [ACTION_TYPES.TERMINAL_INPUT]);
   assert.deepEqual(actionModesForTarget(null), []);
   assert.deepEqual(actionModesForTarget({}), []);
   assert.deepEqual(actionModesForTarget({ ...agentTarget, stale: true }), [ACTION_TYPES.AGENT_PROMPT]);
 
-  const terminalPreview = buildActionDescriptor(ACTION_TYPES.TERMINAL_TEXT, {
+  const terminalInput = buildActionDescriptor(ACTION_TYPES.TERMINAL_INPUT, {
     target: terminalTarget,
     text: "echo hello",
   });
-  assert.equal(terminalPreview.executable, false);
+  assert.equal(terminalInput.executable, true);
+  assert.equal(terminalInput.execution_mode, "trusted_terminal_input");
   assert.equal(buildActionDescriptor(ACTION_TYPES.AGENT_PROMPT, { target: terminalTarget, text: "hello" }).executable, false);
+  assert.equal(buildActionDescriptor(ACTION_TYPES.TERMINAL_INPUT, { target: agentTarget, text: "echo nope" }).executable, false);
   assert.equal(buildActionDescriptor(ACTION_TYPES.INTERRUPT, { target: agentTarget }).executable, true);
   assert.equal(buildActionDescriptor(ACTION_TYPES.INTERRUPT, { target: { ...agentTarget, status: "idle" } }).executable, false);
   assert.equal(buildActionDescriptor(ACTION_TYPES.INTERRUPT, { target: terminalTarget }).executable, false);
 });
 
-test("trusted prompt is executable, steer requires an advertised capability, and high-risk modes stay preview-only", () => {
+test("trusted prompt and fenced terminal input execute only on matching targets", () => {
   const target = createPinnedTarget(normalizeBrowserState(baseSnapshot()).panes[0]);
   assert.equal(phaseAAvailability(ACTION_TYPES.AGENT_PROMPT, { target }).enabled, true);
   const prompt = buildActionDescriptor(ACTION_TYPES.AGENT_PROMPT, { target, text: "keep compatibility" });
@@ -319,9 +322,12 @@ test("trusted prompt is executable, steer requires an advertised capability, and
   assert.equal(steer.executable, true);
   assert.equal(steer.execution_mode, "provider_probe");
 
-  const terminal = buildActionDescriptor(ACTION_TYPES.TERMINAL_INPUT, { target, text: "rm -rf /" });
-  assert.equal(terminal.executable, false);
-  assert.equal(terminal.execution_mode, "dry_run");
+  const terminalTarget = createPinnedTarget(normalizeBrowserState(baseSnapshot()).panes[1]);
+  const terminal = buildActionDescriptor(ACTION_TYPES.TERMINAL_INPUT, { target: terminalTarget, text: "echo hello" });
+  assert.equal(terminal.executable, true);
+  assert.equal(terminal.execution_mode, "trusted_terminal_input");
+  assert.equal(terminal.target.pane_id, terminalTarget.pane_id);
+  assert.equal(terminal.args.text, "echo hello");
 });
 
 test("runtime authoritative target revision survives normalization and pinning", () => {
@@ -404,7 +410,7 @@ test("workspace aggregate status exposes the highest-priority live state", () =>
   assert.equal(workspaceAggregateStatus({ panes: [] }), "unknown");
 });
 
-test("workspace rows merge current-page binding with live state and preserve stale unbind targets", () => {
+test("workspace rows prioritize live bound workspaces and exclude closed historical bindings", () => {
   const live = [
     { workspace_id: "w1", label: "Alpha", panes: [{ status: "done" }] },
     { workspace_id: "w2", label: "Beta", panes: [{ status: "working" }] },
@@ -415,10 +421,22 @@ test("workspace rows merge current-page binding with live state and preserve sta
     { workspace_id: "w9", workspace_label: "Closed workspace" },
     { workspace_id: "w9", workspace_label: "Closed workspace" },
   ]);
-  assert.deepEqual(rows.map((row) => row.workspace_id), ["w1", "w9", "w2", "w3"]);
-  assert.equal(rows[1].binding_missing, true);
-  assert.equal(rows[1].label, "Closed workspace");
+  assert.deepEqual(rows.map((row) => row.workspace_id), ["w1", "w2", "w3"]);
   assert.deepEqual(live.map((row) => row.workspace_id), ["w1", "w2", "w3"], "input order is not mutated");
+});
+
+test("closed Herdr workspaces are pruned from persisted page bindings only with an authoritative workspace list", () => {
+  const bindings = {
+    "conv::w1": { convKey: "conv", workspace_id: "w1" },
+    "conv::w9": { convKey: "conv", workspace_id: "w9" },
+  };
+  const pruned = pruneMissingWorkspaces(bindings, [{ id: "w1" }, { id: "w2" }]);
+  assert.deepEqual(Object.keys(pruned.kept), ["conv::w1"]);
+  assert.deepEqual(pruned.prunedKeys, ["conv::w9"]);
+
+  const noAuthority = pruneMissingWorkspaces(bindings, null);
+  assert.deepEqual(Object.keys(noAuthority.kept).sort(), ["conv::w1", "conv::w9"]);
+  assert.deepEqual(noAuthority.prunedKeys, []);
 });
 
 test("50-pane state and incremental burst stay small and fast", () => {

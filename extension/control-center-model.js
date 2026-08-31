@@ -64,23 +64,8 @@ export function workspaceRowsForPage(workspaces = [], bindings = []) {
       .map((binding) => String(binding?.workspace_id || ""))
       .filter(Boolean),
   );
-  const liveIds = new Set(sorted.map((workspace) => String(workspace.workspace_id)));
-  const missing = [];
-  const seen = new Set();
-  for (const binding of Array.isArray(bindings) ? bindings : []) {
-    const workspaceId = String(binding?.workspace_id || "");
-    if (!workspaceId || liveIds.has(workspaceId) || seen.has(workspaceId)) continue;
-    seen.add(workspaceId);
-    missing.push({
-      workspace_id: workspaceId,
-      label: binding.workspace_label || workspaceId,
-      panes: [],
-      binding_missing: true,
-    });
-  }
   return [
     ...sorted.filter((workspace) => boundIds.has(String(workspace.workspace_id))),
-    ...missing,
     ...sorted.filter((workspace) => !boundIds.has(String(workspace.workspace_id))),
   ];
 }

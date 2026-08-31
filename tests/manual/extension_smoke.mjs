@@ -73,6 +73,7 @@ const rustNativeHostSource = readFileSync(path.join(EXT, "..", "crates", "herdr-
 const jsonBridgeSource = readFileSync(path.join(EXT, "content", "webmcp", "json-bridge.js"), "utf8");
 const controlCenterHtml = readFileSync(path.join(EXT, "control-center.html"), "utf8");
 const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "utf8");
+const controlCenterCss = readFileSync(path.join(EXT, "control-center.css"), "utf8");
 const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
 ok(manifest.version === "0.1.82", "manifest version stays aligned with the browser product build");
@@ -632,13 +633,28 @@ ok(!("hud_manual_handoff" in zhLocale) && !("hud_bindings" in zhLocale) && !("hu
 ok(zhLocale.cc_page_handoff === "手动接力"
     && zhLocale.cc_brand === "Herdr"
     && zhLocale.cc_stats === "{working} 运行"
-    && zhLocale.cc_workspace_offline_bound.includes("离线")
-    && zhLocale.cc_workspace_bound.includes("已绑定")
+    && !("cc_workspace_offline_bound" in zhLocale)
+    && !("cc_workspace_not_visible" in zhLocale)
+    && zhLocale.cc_workspace_bound === "已绑定"
+    && enLocale.cc_workspace_bound === "Bound"
+    && jaLocale.cc_workspace_bound === "連携済"
     && zhLocale.cc_workspace_bind === "绑定"
     && zhLocale.hud_scope_binding_count === "🔗{count}"
     && zhLocale.hud_scope_binding_hint.includes("控制中心")
     && !zhLocale.hud_scope_binding_hint.includes("0 个窗格"),
   "zh copy keeps the HUD and Side Panel compact while preserving binding state");
+ok(backgroundSource.includes("pruneMissingWorkspaces")
+    && backgroundSource.includes("reconcileBindingsWithLiveWorkspaces")
+    && backgroundSource.includes('event === "workspace_removed"')
+    && !controlCenterSource.includes("binding_missing"),
+  "closed Herdr workspaces are pruned from page bindings instead of rendering historical offline rows");
+ok(controlCenterSource.includes('id.textContent = workspaceId;')
+    && !controlCenterSource.includes('id.textContent = `(${workspaceId})`;')
+    && controlCenterCss.includes('grid-template-columns: 14px 8px minmax(0, 1fr) max-content max-content')
+    && controlCenterCss.includes('.workspace-id { justify-self: end;')
+    && controlCenterCss.includes('.workspace-toggle .dot { justify-self: center;')
+    && controlCenterCss.includes('min-width: 44px'),
+  "workspace rows keep chevron/dot columns aligned, right-align bare workspace ids beside counts, and use compact binding buttons");
 ok([enLocale, zhLocale, jaLocale].every((locale) => [
   "cc_page_workspace_select_aria",
   "cc_page_bind",
@@ -653,9 +669,12 @@ ok([enLocale, zhLocale, jaLocale].every((locale) => [
   "Control Center locales remove the old separate binding-selector vocabulary");
 ok(zhLocale.cc_page_handoff_busy.includes("Herdr")
     && zhLocale.cc_page_handoff_busy_help.includes("工作区仍在工作")
-    && controlActionsSource.includes("if (!target.agent) return []")
-    && !controlCenterHtml.includes('data-i18n="cc_mode_terminal_help"'),
-  "terminal panes keep raw write preview out of the beginner-facing Side Panel");
+    && controlActionsSource.includes("if (!target.agent) return [ACTION_TYPES.TERMINAL_INPUT]")
+    && zhLocale.cc_mode_terminal === "运行命令"
+    && zhLocale.cc_mode_terminal_help.includes("直接运行")
+    && enLocale.cc_mode_terminal === "Run command"
+    && jaLocale.cc_mode_terminal === "コマンド実行",
+  "terminal panes expose one narrow real command action instead of a preview-only raw-write surface");
 ok(zhLocale.hud_automation_off === "自动 关", "zh HUD automation-off label is localized");
 ok(
   zhLocale.hud_automation_on_hint.includes("进度")
@@ -761,7 +780,7 @@ ok(!controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && controlCenterSource.includes("workspaceRowsForPage(state.workspaces || [], pageContextBindings())")
     && controlCenterModelSource.includes("export function workspaceRowsForPage")
     && controlCenterModelSource.includes("...sorted.filter((workspace) => boundIds.has")
-    && controlCenterModelSource.includes("binding_missing: true")
+    && !controlCenterModelSource.includes("binding_missing: true")
     && controlCenterSource.includes("if (!currentlyBound && !workspace) return")
     && !controlCenterSource.includes("pageWorkspaceSelect")
     && !controlCenterSource.includes("pageBindings")
@@ -775,11 +794,14 @@ ok(!controlCenterHtml.includes('data-i18n="cc_phase_title"')
     && controlCenterSource.includes("ACTION_TYPES.INTERRUPT")
     && controlActionsSource.includes('target.control_capabilities?.steer?.available === true')
     && controlActionsSource.includes('mode: "trusted_terminal_interrupt"')
+    && controlActionsSource.includes('mode: "trusted_terminal_input"')
+    && controlCenterSource.includes("ACTION_TYPES.TERMINAL_INPUT")
+    && controlCenterSource.includes('t("cc_execute_terminal")')
     && controlCenterSource.includes('crypto.randomUUID()')
     && controlCenterSource.includes('t("cc_control_uncertain_hint")')
     && controlCenterSource.includes('t("cc_preview_only_reason")')
     && controlCenterSource.includes('t("native_host_help")'),
-  "Control Center keeps explicit local targets, shows steer only when advertised, and exposes fenced Agent Ctrl+C separately from raw terminal input");
+  "Control Center keeps explicit local targets, shows steer only when advertised, and exposes fenced Agent Ctrl+C plus narrow terminal command execution");
 ok(backgroundSource.includes('event === "hello"')
     && backgroundSource.includes('type: "herdr_control_state"')
     && backgroundSource.includes('type: "herdr_control_event"')

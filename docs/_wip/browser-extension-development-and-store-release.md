@@ -776,7 +776,7 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 截至 2026-08-29：
 
 - 浏览器扩展继续支持 unpacked development build，但正式 Chrome 137+/139+ 已移除命令行 side-load flags：clone 后由 `native-host dev enable ./extension` 配置 Dev trust/owner，再在 `chrome://extensions` 的 Developer Mode 使用 **Load unpacked**；自动化/UAT 使用 Chrome for Testing/Chromium；
-- 浏览器扩展源码已进入 `0.1.76`；Side Panel 是 binding / unbinding、本机详细状态与显式 Pinned Target 的主入口；底部 Prompt Agent 已走 Native Messaging + extension-only Unix socket 的可信控制链，Steer Session 不再 Preview-only 但会如实返回 `session_not_resolved` / `no_active_turn` / `unsupported_provider` 等 outcome，绝不会拿 Prompt 冒充 true steer；Herdr API / raw Terminal Input 仍 Preview-only；HUD 保持当前网页会话的紧凑状态、快捷推进和手动接力动作面；
+- 浏览器扩展源码已进入 `0.1.82`；Side Panel 是 binding / unbinding、本机详细状态与显式 Pinned Target 的主入口；Prompt Agent 已走 Native Messaging + extension-only Unix socket 的可信控制链，Steer Session 会如实返回 `session_not_resolved` / `no_active_turn` / `unsupported_provider` 等 outcome，绝不会拿 Prompt 冒充 true steer；普通 terminal-only pane 已开放窄化且有 target fencing 的 `pane.send_input + Enter` 命令执行，Agent pane 仍要求走 Agent 操作，任意 Herdr API 和 raw key/text 注入继续 Preview-only；HUD 保持当前网页会话的紧凑状态、快捷推进和手动接力动作面；
 - Browser Control Center Phase A 与 pane lifecycle 已进入 main，0.1.65 进一步补齐 en / zh / ja、Pinned Target / Preview-only 产品文案与 Settings 入口；
 - ChatGPT Queued Insert 已进入 main，正式用户文档使用“排队 / Queue”描述其 next-turn 语义；
 - Chrome Web Store 首次发布流程**已经启动**；Developer Dashboard publisher 已可用，Store item 已创建；

@@ -11,7 +11,7 @@
 import {
   decideWorkspaceWake, agentsInWorkspace, formatWorkspaceRoster, workspaceTitleWithId,
   reconcileWorkspaceWakeKind,
-  pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
+  pruneExpired, pruneMissingWorkspaces, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
   isIdleNudgeText, looksLikeSubstantiveReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage, interpretLlmJudgeReply,
   assistantNudgeFingerprint, assistantDeclaresPendingWork,
   DEFAULT_LLM_JUDGE_PROMPT, LEGACY_DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
@@ -780,6 +780,33 @@ async function loadBindings() {
 }
 async function saveBindings(b) {
   try { await chrome.storage.local.set({ herdrWakeBindings: b }); } catch (e) {}
+}
+
+async function reconcileBindingsWithLiveWorkspaces(bindings, workspaces, source = "snapshot") {
+  const { kept, prunedKeys } = pruneMissingWorkspaces(bindings, workspaces);
+  if (!prunedKeys.length) return bindings;
+  for (const key of prunedKeys) clearProgressTimer(key);
+  await saveBindings(kept);
+  callLog(`pruned ${prunedKeys.length} bindings for closed workspaces (${source})`);
+  broadcastControlMessage({ type: "herdr_control_binding_changed" });
+  return kept;
+}
+
+async function removeBindingsForWorkspace(bindings, workspaceId) {
+  const id = String(workspaceId || "");
+  if (!id) return bindings;
+  const kept = {};
+  const removed = [];
+  for (const [key, binding] of Object.entries(bindings || {})) {
+    if (normalizeWorkspaceId(binding) === id) removed.push(key);
+    else kept[key] = binding;
+  }
+  if (!removed.length) return bindings;
+  for (const key of removed) clearProgressTimer(key);
+  await saveBindings(kept);
+  callLog(`pruned ${removed.length} bindings for removed workspace ${id}`);
+  broadcastControlMessage({ type: "herdr_control_binding_changed" });
+  return kept;
 }
 
 let queuedInsertMutationTail = Promise.resolve();
@@ -1819,7 +1846,12 @@ async function handlePushBlock(block) {
   ].includes(event)) {
     broadcastControlMessage({ type: "herdr_control_event", event: { type: event, ...data } });
   }
-  const bindings = await loadBindings();
+  let bindings = await loadBindings();
+  if (event === "hello" && Array.isArray(data.workspaces)) {
+    bindings = await reconcileBindingsWithLiveWorkspaces(bindings, data.workspaces, "push_hello");
+  } else if (event === "workspace_removed" && data.workspace) {
+    bindings = await removeBindingsForWorkspace(bindings, data.workspace);
+  }
   const entries = Object.entries(bindings);
   const scoped = data.workspace
     ? entries.filter(([, b]) => normalizeWorkspaceId(b) === data.workspace)
@@ -4415,7 +4447,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === "h2w_state") {
     void (async () => {
-      const bindings = await loadBindings();
+      let bindings = await loadBindings();
+      const authoritativeState = controlCenterLastState
+        && Date.now() - controlCenterSnapshotAt <= 5000
+        ? controlCenterLastState
+        : await fetchState();
+      if (authoritativeState?.ok && Array.isArray(authoritativeState.workspaces)) {
+        bindings = await reconcileBindingsWithLiveWorkspaces(
+          bindings,
+          authoritativeState.workspaces,
+          "control_center",
+        );
+      }
       // Opening a browser control surface wakes the service worker; restore streams and timers lost to suspension.
       void ensureAlive(bindings);
       let convInfo = null;

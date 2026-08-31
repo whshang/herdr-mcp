@@ -933,6 +933,23 @@ console.log("\n[binding flow]");
       && !Object.prototype.hasOwnProperty.call(r, "workspaces"),
     "compact HUD returns aggregate binding counts without the detailed workspace catalog", JSON.stringify(r));
   ok(storage.herdrWakeBindings[staleKey]?.workspace_label?.includes("herdr-mcp"), "stale binding label is repaired");
+
+  const closedKey = `${CONV}::wGone`;
+  storage.herdrWakeBindings[closedKey] = {
+    convKey: CONV,
+    workspace_id: "wGone",
+    workspace_label: "closed workspace",
+    persistence: "explicit",
+    created_at: Date.now(),
+    last_seen_at: Date.now(),
+  };
+  let resolveCleanup;
+  const cleanupP = new Promise((r) => { resolveCleanup = r; });
+  onMsg({ type: "h2w_state", tabId: 101 }, { tab: { id: 101 } }, (r) => resolveCleanup(r));
+  const cleanup = await cleanupP;
+  ok(cleanup?.sessionBindings?.every((binding) => binding.workspace_id !== "wGone")
+      && !storage.herdrWakeBindings[closedKey],
+    "Control Center state reconciliation prunes bindings for closed workspaces", JSON.stringify(cleanup?.sessionBindings));
   mockStateWorkspaces = [];
 }
 

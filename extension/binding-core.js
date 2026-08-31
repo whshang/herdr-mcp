@@ -70,6 +70,29 @@ export function pruneExpired(bindings, now = Date.now()) {
   return { kept, prunedKeys };
 }
 
+/** Remove bindings whose Herdr workspace no longer exists in an authoritative snapshot. */
+export function pruneMissingWorkspaces(bindings, workspaces) {
+  if (!Array.isArray(workspaces)) return { kept: { ...(bindings || {}) }, prunedKeys: [] };
+  const liveIds = new Set(
+    workspaces
+      .map((workspace) => String(
+        typeof workspace === "string" ? workspace : workspace?.id || workspace?.workspace_id || "",
+      ))
+      .filter(Boolean),
+  );
+  const kept = {};
+  const prunedKeys = [];
+  for (const [key, binding] of Object.entries(bindings || {})) {
+    const workspaceId = String(
+      binding?.workspace_id
+        || (typeof binding?.pane === "string" && binding.pane.includes(":") ? binding.pane.split(":")[0] : ""),
+    );
+    if (workspaceId && !liveIds.has(workspaceId)) prunedKeys.push(key);
+    else kept[key] = binding;
+  }
+  return { kept, prunedKeys };
+}
+
 /** Content-addressed binding revision, preferring workspace scope. */
 export function bindingRevision(b) {
   const scope = b.workspace_id || b.pane || "";

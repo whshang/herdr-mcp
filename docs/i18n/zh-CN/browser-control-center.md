@@ -6,7 +6,7 @@
 
 > 当网页 AI、本地 Agent、测试进程和终端同时工作时，怎样始终知道**哪一个现场正在发生什么，以及下一条人工控制明确指向哪里**？
 
-当前控制中心采用紧凑布局：顶部只保留 Herdr 连接/运行状态和少量全局操作；受支持的当前页面只显示一条 `ChatGPT · 已绑定 N` 上下文；workspace / pane 列表是主体。`发送指令`调用 Herdr `agent.prompt`；只有 runtime 明确声明支持原生 steer 时才显示`调整当前任务`；正在运行的 Agent 还提供独立的`停止任务`。原始终端写入仍被禁用，但不再作为普通用户可见的 Preview 功能。
+当前控制中心采用紧凑布局：顶部只保留 Herdr 连接/运行状态和少量全局操作；受支持的当前页面只显示一条 `ChatGPT · 已绑定 N` 上下文；workspace / pane 列表是主体。`发送指令`调用 Herdr `agent.prompt`；只有 runtime 明确声明支持原生 steer 时才显示`调整当前任务`；正在运行的 Agent 还提供独立的`停止任务`；普通终端 pane 提供有 target fencing 的`运行命令`，通过 `pane.send_input + Enter` 真实执行。
 
 ## 它和浏览器连续工作有什么区别
 
@@ -101,7 +101,7 @@ Side Panel 隐藏时会减少无意义 DOM 工作；重新可见或事件流重�
 - 当前页面是否绑定到这个 workspace；
 - 唯一的 **绑定 / ✓ 已绑定** toggle。
 
-当前页面已经绑定的 workspace 会排在列表前部并高亮。点击 workspace 行主体只负责展开 / 收起 pane；点击右侧绑定 toggle 只负责 bind / unbind，两种操作不会互相触发。绑定 mutation 在 UI 内串行化，避免连续点击制造难以判断的中间状态。若已绑定 workspace 已关闭或暂时不在 runtime snapshot 中，仍保留一个 `已绑定 · 离线` 的绑定行，允许直接解绑。这里的“离线”指绑定记录仍在、但该 workspace 已不在当前 Herdr live 列表中，并不是浏览器标签页不可见。
+当前页面已经绑定的 workspace 会排在列表前部并高亮。点击 workspace 行主体只负责展开 / 收起 pane；点击右侧绑定 toggle 只负责 bind / unbind，两种操作不会互相触发。绑定 mutation 在 UI 内串行化，避免连续点击制造难以判断的中间状态。workspace 一旦从 Herdr 的权威 live snapshot 中删除，对应页面绑定也会自动回收；Control Center 打开时还会做一次补偿清理，因此关闭过的历史 workspace 不会继续以“离线绑定”占据列表或造成不同页面看到不同的工作区数量。
 
 展开后继续展示 pane 级明细：
 
@@ -144,7 +144,7 @@ stale 后控制中心不会猜测新目标。需要用户重新点击 pane 才�
 | 调整当前任务 | 仅当 runtime 明确声明当前 provider 的 native steer 可用时显示 | 在不中断当前 active turn 的前提下调整正在执行的任务；不会退化成 Agent Prompt |
 | 停止任务 | 仅对正在运行的 Agent 可用；确认后向该 pane 发送 `Ctrl+C` | 用于停止当前 CLI turn/process；不冒充 provider interrupt |
 | Herdr API | 仅预览 | 不从这个 UI 执行任意 Herdr mutation |
-| 终端输入 | 仅预览 | 不从这个 UI 向终端写入原始字节/按键 |
+| 运行命令 | **真实执行**：仅普通终端 pane 显示，通过 `pane.send_input` 写入命令并发送 `Enter` | mutation 前重新校验 `target_revision`；投递不确定时不自动重试 |
 
 ### 详情
 
@@ -183,6 +183,16 @@ Prompt 还复用 `agent.prompt` 已有的持久化 idempotency/op record，而�
 
 `停止任务`是另一条更窄的本地控制路径。它只对处于 `working` 状态的 Agent 显示为可用，用户确认后通过 `pane.send_keys(["C-c"])` 发送终端中断键。它不声明 provider-level interrupt，也不会在投递结果不确定后自动重试；再次停止前先检查目标状态。
 
+### 运行命令：只对普通终端开放
+
+普通 terminal-only pane 展开后会显示`运行命令`。它不是任意 Herdr API，也不会绕过目标选择：Side Panel 先记录该 pane 的 `target_revision`，Rust 在真正写入前重新读取 live pane，只有目标仍是同一个普通终端时才调用：
+
+```text
+pane.send_input({ pane_id, text, keys: ["Enter"] })
+```
+
+如果 pane 已关闭、被替换或变成 Agent pane，直接返回 `stale_target` / `rejected`。网络或 IPC 结果不确定时返回 `uncertain`，UI 不会自动重发命令。该路径已用隔离终端做真实 UAT，验证输入与 `Enter` 会在目标 pane 中实际执行。
+
 这正是 Issue #57 原始需求最容易混淆的地方：**“已排队/已 Prompt”与“同一 active turn 已 steer”是不同 outcome，绝不能互相冒充。**
 
 ## Reliability Kernel：内存、请求压力、超时恢复与刷新死循环
@@ -203,11 +213,11 @@ Side Panel 不是孤立功能。之前规划的页面性能/自愈能力已经�
 
 这些机制由 continuity 与 Browser Control Plane 共用；新 action route 没有增加另一套 polling、heartbeat 或盲重试 daemon。
 
-## 为什么 Herdr API / 原始终端输入仍只做 Preview
+## 为什么任意 Herdr API 仍只做 Preview
 
-浏览器控制最难的不是“把字节写进终端”，而是保证：目标是不是原目标、失败是否已投递、重试会不会重复 mutation、pane 后面的 session 是否已换、不同 provider/terminal mutation 应该采用什么确认规则，以及 MV3 reload 后还能否判断 delivery phase。
+浏览器控制最难的不是“把字节写进终端”，而是保证：目标是不是原目标、失败是否已投递、重试会不会重复 mutation、pane 后面的 session 是否已换，以及 MV3 reload 后还能否判断 delivery phase。
 
-Prompt 已经通过 Rust target fencing + `agent.prompt` idempotency 满足了这些契约；任意 Herdr 方法和 raw terminal input 的作用面更广，所以继续 fail-closed，等它们各自拥有窄 schema、确认规则、幂等模型和真实 UAT 后再开放。
+Prompt 通过 Rust target fencing + `agent.prompt` idempotency 满足这些契约；终端路径现在只开放一个窄化的 `terminal_input -> pane.send_input + Enter` 动作，并复用同一 target fencing、禁止 uncertain 自动重试。任意 Herdr 方法的作用面仍然过广，因此继续 fail-closed / Preview-only。
 
 ## Runtime 或事件流断开时会看到什么
 
