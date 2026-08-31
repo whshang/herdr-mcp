@@ -50,7 +50,7 @@ export interface McpDeps {
   forward(stub: unknown, body: string): Promise<Response>;
   getStub(workstationId: string): unknown;
   listDevices?(): Promise<unknown>;
-  resolveDevice?(selector: string | undefined): Promise<DeviceRouteResult>;
+  resolveDevice?(selector: string | undefined, args?: Record<string, unknown>): Promise<DeviceRouteResult>;
   logger: { warn(event: string, fields?: Record<string, unknown>): void };
   now?: () => number;
   client?: McpClientContext;
@@ -269,7 +269,7 @@ export async function handleMcp(
     let route: DeviceRouteResult;
     try {
       route = deps.resolveDevice
-        ? await deps.resolveDevice(selectorValue)
+        ? await deps.resolveDevice(selectorValue, args)
         : {
             ok: true,
             device_id: null,
@@ -286,8 +286,11 @@ export async function handleMcp(
       return rpcResult(id, callToolResult({ ok: false, code: route.code, retryable: false }, true));
     }
 
-    const runtimeArgs = { ...args };
-    delete runtimeArgs.device;
+    // Unwrap device-aware opaque refs before forwarding to the runtime;
+    // the runtime contract remains epoch 2 without device metadata.
+    const { unwrapDeviceRefs, wrapResultWithDevice } = await import("./device-refs.js");
+    const runtimeArgs = unwrapDeviceRefs(args);
+    // runtimeArgs already strips device and binding fields
 
     const now = deps.now?.() ?? Date.now();
     const requestId = newRequestId();
@@ -358,7 +361,10 @@ export async function handleMcp(
     }
 
     if (forwarded.status === "ok" && forwarded.completion?.status === "ok") {
-      return rpcResult(id, normalizeSuccessfulToolResult(forwarded.completion.result));
+      // For device-routed calls, wrap workspace/pane ids into device-aware opaque refs
+      // so follow-up calls retain affinity without trusting arbitrary path strings.
+      const wrapped = wrapResultWithDevice(forwarded.completion.result, route.device_id);
+      return rpcResult(id, normalizeSuccessfulToolResult(wrapped));
     }
     if (forwarded.status === "ok" && forwarded.completion?.status === "error") {
       return rpcResult(id, relayErrorToolResult(forwarded.completion.error, requestId, route.workstation_id));

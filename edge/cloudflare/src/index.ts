@@ -34,7 +34,7 @@ import { DeviceRegistryDO } from "./device-registry-do.js";
 import {
   ensureLegacyDeviceRegistration,
   listPublicDevices,
-  resolveDeviceRoute,
+  resolveDeviceRouteWithContext,
 } from "./device-directory.js";
 import { authenticateMcpRequest } from "./oauth-mcp-auth.js";
 import { createOAuthIdentity } from "./oauth-edge.js";
@@ -251,9 +251,9 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
           (id) => env.WORKSTATION_DO.get(env.WORKSTATION_DO.idFromName(id)),
         );
       },
-      resolveDevice: async (selector) => {
+      resolveDevice: async (selector, args) => {
         const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
-        return resolveDeviceRoute(registry, selector, workstationId);
+        return resolveDeviceRouteWithContext(registry, { selector, args: args as Record<string, unknown> | undefined, legacyWorkstationId: workstationId });
       },
       logger,
     });
