@@ -55,6 +55,32 @@ test("reconnect grace fails fast for a workstation that has never connected", as
   assert.deepEqual(events, [], "grace decision must not mutate Durable Storage or alarms");
 });
 
+test("offline forward returns a self-describing bounded recovery policy", async () => {
+  const { subject, events } = makeSubject();
+  await init(subject);
+  const response = await subject.forwardInternal({
+    kind: "request",
+    requestId: "offline-policy",
+    op: "herdr_inspect",
+    deadlineMs: Date.now() + 1_000,
+  });
+  assert.equal(response.status, 503);
+  const body = await response.json();
+  assert.equal(body.status, "error");
+  assert.equal(body.error.code, "workstation_offline");
+  assert.equal(body.error.retryable, true);
+  assert.equal(body.error.delivery_state, "not_delivered");
+  assert.equal(body.error.retry_after_ms, 5_000);
+  assert.deepEqual(body.error.recovery, {
+    action: "retry_read_only_probe",
+    probe_tool: "herdr_inspect",
+    max_attempts: 3,
+    backoff_ms: [5_000, 10_000, 20_000],
+    mutation_replay: "only_after_not_delivered_or_verified_not_applied",
+  });
+  assert.deepEqual(events, [], "offline recovery metadata must not consume Durable Storage writes or alarms");
+});
+
 test("recently disconnected workstation waits and wakes immediately when a validated link returns", async () => {
   const { subject, sockets, events } = makeSubject();
   await init(subject);

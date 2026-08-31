@@ -86,7 +86,7 @@ edge/cloudflare/
   `openai-mcp` clients also see probe version `2026-07-28`; initialize negotiates
   unknown future versions down to `2025-11-25` (wire-compatible with the frozen
   epoch-2 contract).
-- **offline / reconnecting semantics** — `workstation_offline` (no link),
+- **offline / reconnecting semantics** — `workstation_offline` (no link) and `workstation_reconnecting` return machine-readable recovery hints: `retryable=true`, `delivery_state=not_delivered`, `retry_after_ms=5000`, plus a bounded read-only `herdr_inspect` recovery schedule `[5000,10000,20000]`; callers must not infer mutation replay safety from `retryable` alone,
   `workstation_reconnecting` (queued/undelivered), `delivery_uncertain`
   (sent but dropped; reads retryable, mutating NOT — never blind replay).
 - **payload-size checks** — 1 MiB edge frame/body budget (well below the 32 MiB DO

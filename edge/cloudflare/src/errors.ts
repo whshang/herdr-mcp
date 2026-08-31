@@ -35,11 +35,42 @@ export interface RelayErrorResult {
   atMs?: number;
   details?: unknown;
   delivery_state?: string;
+  retry_after_ms?: number;
+  recovery?: RecoveryPolicy;
+}
+
+export interface RecoveryPolicy {
+  action: "retry_read_only_probe";
+  probe_tool: "herdr_inspect";
+  max_attempts: number;
+  backoff_ms: number[];
+  mutation_replay: "only_after_not_delivered_or_verified_not_applied";
+}
+
+export const WORKSTATION_OFFLINE_RETRY_BACKOFF_MS = [5_000, 10_000, 20_000] as const;
+
+function workstationOfflineRecovery(): RecoveryPolicy {
+  return {
+    action: "retry_read_only_probe",
+    probe_tool: "herdr_inspect",
+    max_attempts: WORKSTATION_OFFLINE_RETRY_BACKOFF_MS.length,
+    backoff_ms: [...WORKSTATION_OFFLINE_RETRY_BACKOFF_MS],
+    mutation_replay: "only_after_not_delivered_or_verified_not_applied",
+  };
 }
 
 export function errorResult(
   code: RelayErrorCode,
-  opts: { retryable?: boolean; message?: string; requestId?: string; workstationId?: string; atMs?: number } = {},
+  opts: {
+    retryable?: boolean;
+    message?: string;
+    requestId?: string;
+    workstationId?: string;
+    atMs?: number;
+    delivery_state?: string;
+    retry_after_ms?: number;
+    recovery?: RecoveryPolicy;
+  } = {},
 ): RelayErrorResult {
   return {
     ok: false,
@@ -49,18 +80,31 @@ export function errorResult(
     ...(opts.requestId !== undefined ? { requestId: opts.requestId } : {}),
     ...(opts.workstationId !== undefined ? { workstationId: opts.workstationId } : {}),
     ...(opts.atMs !== undefined ? { atMs: opts.atMs } : {}),
+    ...(opts.delivery_state !== undefined ? { delivery_state: opts.delivery_state } : {}),
+    ...(opts.retry_after_ms !== undefined ? { retry_after_ms: opts.retry_after_ms } : {}),
+    ...(opts.recovery !== undefined ? { recovery: opts.recovery } : {}),
   };
 }
 
 /** Workstation is not connected (never was, or offline). Safe to retry. */
 export function offlineResult(opts: { requestId?: string; workstationId?: string; atMs?: number } = {}) {
-  return errorResult("workstation_offline", { retryable: true, message: "workstation is offline", ...opts });
+  return errorResult("workstation_offline", {
+    retryable: true,
+    delivery_state: "not_delivered",
+    retry_after_ms: WORKSTATION_OFFLINE_RETRY_BACKOFF_MS[0],
+    recovery: workstationOfflineRecovery(),
+    message: "workstation is offline; request was not delivered",
+    ...opts,
+  });
 }
 
 /** Link is connecting/reconnecting; nothing was delivered yet. Safe to retry. */
 export function reconnectingResult(opts: { requestId?: string; workstationId?: string; atMs?: number } = {}) {
   return errorResult("workstation_reconnecting", {
     retryable: true,
+    delivery_state: "not_delivered",
+    retry_after_ms: WORKSTATION_OFFLINE_RETRY_BACKOFF_MS[0],
+    recovery: workstationOfflineRecovery(),
     message: "workstation link is reconnecting; request was not delivered",
     ...opts,
   });

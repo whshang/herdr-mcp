@@ -120,6 +120,8 @@ function relayErrorToolResult(error: RelayErrorResult, requestId: string, workst
       code: error.code,
       retryable: error.retryable,
       delivery_state: error.delivery_state,
+      retry_after_ms: error.retry_after_ms,
+      recovery: error.recovery,
       message: error.message ?? null,
       request_id: requestId,
       workstation_id: workstationId,

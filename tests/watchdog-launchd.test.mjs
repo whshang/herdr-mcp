@@ -225,6 +225,10 @@ test('herdr_skill policy pins bounded outage recovery and uncertain-mutation saf
   assert.match(plannerSkill, /about \*\*20 seconds\*\*/);
   assert.match(plannerSkill, /roughly \*\*35 seconds\*\*/);
   assert.match(plannerSkill, /exactly three \*\*read-only\*\* reconnect attempts/);
+  assert.match(plannerSkill, /retry_after_ms/);
+  assert.match(plannerSkill, /retry_read_only_probe/);
+  assert.match(plannerSkill, /backoff_ms=\[5000,10000,20000\]/);
+  assert.match(plannerSkill, /delivery_state=not_delivered/);
   assert.match(plannerSkill, /agent_status_wait_timeout.*not.*offline/s);
   assert.match(plannerSkill, /\*\*never blindly resend it\*\*/);
   assert.match(plannerSkill, /workstation_info\.boot_id.*herdr_since\(cursor=0\)/s);
