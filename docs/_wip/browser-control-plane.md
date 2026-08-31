@@ -768,10 +768,11 @@ Interrupt 和 steer 分开。
 优先顺序：
 
 1. provider / Herdr 有明确 interrupt primitive -> 使用明确 primitive；
-2. 只有在显式 Terminal Input 模式下，才允许用户发送 `Ctrl-C`；
-3. 不把 `Ctrl-C` fallback 冒充 provider interrupt。
+2. 对用户已显式固定且 `working` 的 Agent pane，可以提供窄化的 `停止 (Ctrl+C)` 操作，通过 `pane.send_keys(["C-c"])` 发送终端中断；
+3. 普通 Terminal Input 仍保持独立、高风险、默认 Preview-only；
+4. 不把 `Ctrl-C` 冒充 provider interrupt。
 
-Interrupt 属于高影响 mutation，默认要求再次确认。
+Ctrl+C 停止必须复用 target fencing，投递结果不确定时禁止自动重试。真正的 provider interrupt 仍按独立 capability 处理。
 
 ---
 
