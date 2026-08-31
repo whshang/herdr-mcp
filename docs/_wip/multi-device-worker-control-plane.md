@@ -18,6 +18,7 @@ Implementation status (2026-08-31):
   Worker/Connector; second-device support is not release-qualified before that
   UAT passes.
 - [ ] Device-aware opaque workspace/pane refs, scheduling mutations, and Web Control Console remain later phases.
+- [x] Routing authority boundary frozen: browser conversation/project binding is local continuity/UI metadata only and can never be an authoritative Edge routing input (current ChatGPT MCP transport is sessionless and provides no trusted per-conversation/project identity).
 
 ## 1. Product decision
 
@@ -225,9 +226,19 @@ v0.4.3 routing priority:
 
 1. explicit device selector;
 2. device-aware opaque ref from an earlier result;
-3. trusted conversation/project binding that contains `device_id`;
-4. exactly one routable device;
-5. otherwise return `device_ambiguous`.
+3. exactly one routable device;
+4. otherwise return `device_ambiguous`.
+
+Browser conversation/project binding is **local continuity/UI metadata only**. It may *suggest* a device, but it is never authoritative routing input: the current ChatGPT/OpenAI MCP transport is intentionally sessionless (`mcp-chatgpt-transport.ts` issues/requires no `Mcp-Session-Id`), so Edge receives no trusted per-conversation/project identity. `resolveDeviceRouteWithContext()` deliberately ignores caller-controlled binding args, and `device-refs.ts` strips `binding_device_id` / `__herdr_binding_device_id` / `herdr_binding` before forwarding. Therefore v0.4.3 MUST NOT claim trusted browser conversation/project binding as an Edge routing authority.
+
+Explicitly forbidden as routing input:
+
+- Worker-global `current_device`;
+- OAuth-client-wide sticky device;
+- probing devices for matching paths;
+- trusting raw browser/model-supplied `binding_device_id`.
+
+Future trusted binding requires a server-verifiable per-conversation/project identity/token delivered through a trusted channel; the current sessionless ChatGPT MCP transport does not provide one.
 
 Deferred heuristics:
 
@@ -262,6 +273,8 @@ Conceptual shape:
 ```
 
 Consumers must use the opaque/device-aware identity instead of inferring a device from an absolute path.
+
+Opaque refs are the only device-carrying identity the Edge trusts for follow-up routing. Caller-supplied binding keys (`binding_device_id`, `__herdr_binding_device_id`, `herdr_binding`) are stripped by `device-refs.ts` and never carry routing authority.
 
 Browser local-project auto-bind work in v0.4.3 must leave room for this `device_id` dimension even if its first implementation operates only on the local device.
 
@@ -608,7 +621,7 @@ Edge maps internal workstation errors to the stable device-facing boundary and r
 - public routing extension;
 - exact `device_id` selection;
 - device-aware refs;
-- local-project/conversation binding integration;
+- browser conversation/project binding handled strictly as local continuity/UI metadata (may suggest a device; never authoritative routing input);
 - implicit selection only when exactly one device is routable;
 - `device_ambiguous` otherwise;
 - no cross-device retry/failover.
@@ -633,20 +646,21 @@ Edge maps internal workstation errors to the stable device-facing boundary and r
 
 ## 19. v0.4.3 core UAT
 
-The feature is considered functionally real when all of the following pass:
+The formal two-device UAT tests only **server-provable routing**. It never treats browser conversation/project binding as routing authority (that is local continuity/UI metadata only). The feature is considered functionally real when all of the following pass:
 
 ```text
 Device A and Device B are simultaneously online
 same Worker
 same Connector
 herdr_devices returns both
-explicit request to A executes only on A
-explicit request to B executes only on B
-opaque ref keeps its device identity
+explicit request to A executes only on A (explicit A/B isolation)
+explicit request to B executes only on B (explicit A/B isolation)
+opaque ref keeps its device identity (opaque-ref affinity)
 unqualified mutation with multiple candidates fails device_ambiguous
-retry/recovery stays on the originally selected device
-credential A cannot authenticate as Device B
-revoked Device B credential cannot reconnect
+retry/recovery stays on the originally selected device (retry stickiness)
+credential A cannot authenticate as Device B (per-device credential isolation)
+revoked Device B credential cannot reconnect (per-device revocation)
+no DeviceRegistry heartbeat churn from heartbeat/status/UI observation
 legacy v0.4.2 single-device deployment still works during upgrade
 ```
 
@@ -656,7 +670,8 @@ Additional safety gates:
 - no heartbeat-driven Device Registry writes;
 - Public Contract upgrade does not force a Rust runtime tool-surface upgrade;
 - browser extension DEV/STANDALONE/STORE switching does not change device identity;
-- local state schema compatibility work remains independent from Worker Registry storage.
+- local state schema compatibility work remains independent from Worker Registry storage;
+- the v0.4.2 -> v0.4.3 candidate -> rollback v0.4.2 -> candidate re-apply UAT is schema-neutral; there is no 5 -> 4 state-schema downgrade in the v0.4.2/v0.4.3 path (immutable tag `v0.4.2` and current `main` both carry `SCHEMA_VERSION = 5`).
 
 ## 20. Explicit non-goals
 
@@ -671,7 +686,10 @@ v0.4.3 core does not implement:
 - full RMM console;
 - long-term analytics as a required dependency;
 - complete rename of internal `workstation_*` protocol fields;
-- Worker-global current device state.
+- Worker-global current device state;
+- OAuth-client-wide sticky device;
+- probing devices for matching paths;
+- trusting raw browser/model-supplied `binding_device_id` as routing input.
 
 ## 21. Frozen implementation principle
 
