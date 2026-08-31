@@ -16,6 +16,7 @@ import {
 } from "../edge/cloudflare/dist/canonical-imports.js";
 import { EPOCH1_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch1.js";
 import { EPOCH2_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch2.js";
+import { EPOCH3_CONTRACT } from "../edge/cloudflare/dist/contracts/epoch3.js";
 import { PUBLIC_CONTRACT } from "../edge/cloudflare/dist/contracts/public.js";
 import {
   RUNTIME_EXECUTION_CONTRACT,
@@ -101,10 +102,13 @@ test("tracked Cloudflare epoch-2 catalog stays frozen to the captured 18-tool co
   assert.equal(computeContractHash(EPOCH2_CONTRACT.tools), expected);
 });
 
-test("public and runtime contract identities are independent even while both currently point at epoch 2", () => {
-  assert.equal(PUBLIC_CONTRACT, EPOCH2_CONTRACT);
+test("public epoch 3 evolves independently while runtime execution stays epoch 2", () => {
+  assert.equal(PUBLIC_CONTRACT, EPOCH3_CONTRACT);
   assert.equal(RUNTIME_EXECUTION_CONTRACT, EPOCH2_CONTRACT);
-  assert.notEqual(PUBLIC_CONTRACT.contract_hash, EPOCH1_CONTRACT.contract_hash);
+  assert.equal(PUBLIC_CONTRACT.contract_epoch, 3);
+  assert.equal(PUBLIC_CONTRACT.tool_count, 19);
+  assert.equal(PUBLIC_CONTRACT.tools.some((tool) => tool.name === "herdr_devices"), true);
+  assert.equal(computeContractHash(PUBLIC_CONTRACT.tools), PUBLIC_CONTRACT.contract_hash);
   assert.equal(isCompatibleRuntimeContract(2, EPOCH2_CONTRACT.contract_hash), true);
   assert.equal(isCompatibleRuntimeContract(1, EPOCH1_CONTRACT.contract_hash), true);
   assert.equal(isCompatibleRuntimeContract(2, EPOCH1_CONTRACT.contract_hash), false);

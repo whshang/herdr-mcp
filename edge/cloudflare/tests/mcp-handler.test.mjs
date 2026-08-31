@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
+import { EPOCH3_CONTRACT } from "../dist/contracts/epoch3.js";
 import { makeLimits } from "../dist/limits.js";
 import { handleMcp } from "../dist/mcp-handler.js";
 
@@ -13,6 +14,7 @@ function deps(over = {}) {
       limits: makeLimits(),
       logger: { warn() {} },
       getStub: (workstationId) => ({ workstationId }),
+      listDevices: async () => over.devices ?? [],
       forward: async (_stub, body) => {
         calls.push(JSON.parse(body));
         if (over.forward) return over.forward(_stub, body);
@@ -27,16 +29,17 @@ function deps(over = {}) {
 }
 
 const req = (id, method, params = {}) => ({ jsonrpc: "2.0", id, method, params });
+const DEVICE_A = "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYZ";
 
-test("initialize advertises legacy wire protocol and frozen epoch-2 identity", async () => {
+test("initialize advertises legacy wire protocol and device-aware public identity", async () => {
   const d = deps();
   const r = await handleMcp(req(1, "initialize", {}), "w1", d.value);
   assert.equal(r.status, 200);
   assert.equal(r.body.id, 1);
   assert.equal(r.body.result.protocolVersion, "2025-11-25");
   assert.equal(r.body.result.capabilities.tools.listChanged, false);
-  assert.equal(r.body.result._meta.herdr.contract_epoch, 2);
-  assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH2_CONTRACT.contract_hash);
+  assert.equal(r.body.result._meta.herdr.contract_epoch, 3);
+  assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH3_CONTRACT.contract_hash);
 });
 
 test("server/discover advertises supported versions without OAuth claims", async () => {
@@ -72,13 +75,14 @@ test("initialize negotiates unknown protocol versions down to SDK wire", async (
   assert.equal(r.body.result.protocolVersion, "2025-11-25");
 });
 
-test("tools/list is exactly the frozen 18-tool epoch-2 catalog", async () => {
+test("tools/list exposes runtime tools plus edge-local herdr_devices", async () => {
   const d = deps();
   const r = await handleMcp(req(2, "tools/list", {}), "w1", d.value);
-  assert.equal(r.body.result.tools.length, 18);
-  assert.deepEqual(r.body.result.tools, EPOCH2_CONTRACT.tools);
+  assert.equal(r.body.result.tools.length, 19);
+  assert.deepEqual(r.body.result.tools, EPOCH3_CONTRACT.tools);
   assert.equal(r.body.result.tools.some((tool) => tool.name === "herdr_skill"), true);
-  assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH2_CONTRACT.contract_hash);
+  assert.equal(r.body.result.tools.some((tool) => tool.name === "herdr_devices"), true);
+  assert.equal(r.body.result._meta.herdr.contract_hash, EPOCH3_CONTRACT.contract_hash);
 });
 
 test("tools/call forwards only frozen tools with epoch/hash and preserves id", async () => {
@@ -92,6 +96,15 @@ test("tools/call forwards only frozen tools with epoch/hash and preserves id", a
   assert.equal(d.calls[0].contractEpoch, 2);
   assert.equal(d.calls[0].contractHash, EPOCH2_CONTRACT.contract_hash);
   assert.equal(d.calls[0].deadlineMs, 31_000);
+});
+
+test("herdr_devices executes at Edge and never forwards to a workstation", async () => {
+  const devices = [{ device_id: DEVICE_A, name: "macbook" }];
+  const d = deps({ devices });
+  const r = await handleMcp(req(72, "tools/call", { name: "herdr_devices", arguments: {} }), "legacy-default", d.value);
+  assert.equal(r.body.result.isError, undefined);
+  assert.deepEqual(r.body.result.structuredContent, { ok: true, devices });
+  assert.equal(d.calls.length, 0);
 });
 
 test("tools/call preserves an existing MCP CallToolResult including image content", async () => {

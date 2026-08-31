@@ -1,6 +1,7 @@
 /** Stateless MCP/JSON-RPC handler used by both development and production Edge. */
 
 import { PUBLIC_CONTRACT } from "./contracts/public.js";
+import { RUNTIME_EXECUTION_CONTRACT } from "./contracts/runtime.js";
 import { MCP_SERVER_VERSION } from "./version.js";
 import type { RelayErrorResult } from "./errors.js";
 import { classifyOp, type EdgeLimits } from "./limits.js";
@@ -47,6 +48,7 @@ export interface McpDeps {
   limits: EdgeLimits;
   forward(stub: unknown, body: string): Promise<Response>;
   getStub(workstationId: string): unknown;
+  listDevices?(): Promise<unknown>;
   logger: { warn(event: string, fields?: Record<string, unknown>): void };
   now?: () => number;
   client?: McpClientContext;
@@ -187,7 +189,7 @@ export async function handleMcp(
       protocolVersion: negotiateProtocolVersion(params.protocolVersion),
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
-      instructions: "Stable edge MCP contract epoch 2; workstation execution is relayed over authenticated Herdr Link.",
+      instructions: `Herdr Edge public contract epoch ${PUBLIC_CONTRACT.contract_epoch}; workstation execution uses a separate authenticated runtime contract.`,
       _meta: { herdr: publicContractIdentity() },
     });
   }
@@ -197,7 +199,7 @@ export async function handleMcp(
       resultType: "complete",
       supportedVersions: discoverSupportedVersions(deps.client),
       capabilities: { tools: { listChanged: false } },
-      instructions: "Herdr Edge with frozen MCP contract epoch 2.",
+      instructions: `Herdr Edge public MCP contract epoch ${PUBLIC_CONTRACT.contract_epoch}.`,
       ttlMs: 3_600_000,
       cacheScope: "private",
       _meta: {
@@ -224,7 +226,7 @@ export async function handleMcp(
     if (!isRecord(request.params)) return rpcError(id, -32602, "Invalid params");
     const name = request.params.name;
     if (typeof name !== "string" || !PUBLIC_TOOL_NAMES.has(name)) {
-      return rpcError(id, -32602, "Invalid params", { reason: "tool is not in public contract epoch 2" });
+      return rpcError(id, -32602, "Invalid params", { reason: `tool is not in public contract epoch ${PUBLIC_CONTRACT.contract_epoch}` });
     }
     const rawArgs = request.params.arguments;
     if (rawArgs !== undefined && rawArgs !== null && !isRecord(rawArgs)) {
@@ -240,6 +242,24 @@ export async function handleMcp(
       });
     }
 
+    if (name === "herdr_devices") {
+      if (!deps.listDevices) {
+        return rpcResult(
+          id,
+          callToolResult({ ok: false, code: "device_registry_unavailable", retryable: false }, true),
+        );
+      }
+      try {
+        const devices = await deps.listDevices();
+        return rpcResult(id, callToolResult({ ok: true, devices }));
+      } catch {
+        return rpcResult(
+          id,
+          callToolResult({ ok: false, code: "device_registry_unavailable", retryable: true }, true),
+        );
+      }
+    }
+
     const now = deps.now?.() ?? Date.now();
     const requestId = newRequestId();
     const idempotencyKey =
@@ -253,8 +273,8 @@ export async function handleMcp(
       opClass: classifyOp(name),
       args,
       deadlineMs: now + deps.limits.requestTimeoutMs,
-      contractEpoch: PUBLIC_CONTRACT.contract_epoch,
-      contractHash: PUBLIC_CONTRACT.contract_hash,
+      contractEpoch: RUNTIME_EXECUTION_CONTRACT.contract_epoch,
+      contractHash: RUNTIME_EXECUTION_CONTRACT.contract_hash,
       idempotencyKey,
     };
 

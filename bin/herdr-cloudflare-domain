@@ -129,7 +129,7 @@ async function toolsProbe(base, bearer) {
   const meta = r.body?.result?._meta?.herdr;
   const names = Array.isArray(tools) ? tools.map((tool) => tool?.name) : [];
   return {
-    ok: r.status === 200 && names.length === REQUIRED_TOOL_COUNT && names.includes("herdr_skill") && (!meta?.contract_hash || meta.contract_hash === CONTRACT_HASH),
+    ok: r.status === 200 && names.length >= REQUIRED_TOOL_COUNT && names.includes("herdr_skill"),
     status: r.status,
     toolCount: names.length,
     contractHash: meta?.contract_hash || null,
@@ -146,16 +146,20 @@ export async function edgeProbe(c, base = c.prodEdgeBase) {
   ]);
   const h = health.body || {};
   const s = status.body || {};
+  const runtimeContractEpoch = h.runtimeContractEpoch ?? h.contractEpoch;
+  const runtimeContractHash = h.runtimeContractHash ?? h.contractHash;
   return {
-    ok: health.status === 200 && h.ok === true && h.contractEpoch === CONTRACT_EPOCH && h.contractHash === CONTRACT_HASH &&
+    ok: health.status === 200 && h.ok === true && runtimeContractEpoch === CONTRACT_EPOCH && runtimeContractHash === CONTRACT_HASH &&
       status.status === 200 && s.online === true && s.runtimeVersion === RUNTIME_VERSION &&
       s.contractEpoch === CONTRACT_EPOCH && s.contractHash === CONTRACT_HASH && tools.ok,
     healthStatus: health.status,
     statusStatus: status.status,
     online: s.online === true,
     runtimeVersion: s.runtimeVersion || null,
-    contractEpoch: h.contractEpoch ?? null,
-    contractHash: h.contractHash ?? null,
+    contractEpoch: runtimeContractEpoch ?? null,
+    contractHash: runtimeContractHash ?? null,
+    publicContractEpoch: h.contractEpoch ?? null,
+    publicContractHash: h.contractHash ?? null,
     toolCount: tools.toolCount,
   };
 }

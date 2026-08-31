@@ -40,7 +40,7 @@ function cfg(overrides = {}) {
   });
 }
 
-function handler({ domains = [], publicHealthy = true, onAttach, onDetach } = {}) {
+function handler({ domains = [], publicHealthy = true, publicToolCount = REQUIRED_TOOL_COUNT, onAttach, onDetach } = {}) {
   return async (input, init = {}) => {
     const u = new URL(typeof input === "string" ? input : input.url);
     const method = (init.method || "GET").toUpperCase();
@@ -63,9 +63,15 @@ function handler({ domains = [], publicHealthy = true, onAttach, onDetach } = {}
     }
     if (u.hostname === "prod.test" || u.hostname === "herdr.example.com") {
       const healthy = u.hostname === "prod.test" || publicHealthy;
-      if (u.pathname === "/health") return healthy ? json({ ok: true, contractEpoch: CONTRACT_EPOCH, contractHash: CONTRACT_HASH }) : json({ ok: false }, 503);
+      if (u.pathname === "/health") return healthy ? json({
+        ok: true,
+        contractEpoch: 3,
+        contractHash: "sha256:public-v3",
+        runtimeContractEpoch: CONTRACT_EPOCH,
+        runtimeContractHash: CONTRACT_HASH,
+      }) : json({ ok: false }, 503);
       if (u.pathname === "/status/prod-real-runtime") return healthy ? json({ ok: true, online: true, runtimeVersion: RUNTIME_VERSION, contractEpoch: CONTRACT_EPOCH, contractHash: CONTRACT_HASH }) : json({ ok: false }, 503);
-      if (u.pathname === "/mcp") return healthy ? json({ jsonrpc: "2.0", id: "domain-probe", result: { tools: tools(), _meta: { herdr: { contract_hash: CONTRACT_HASH } } } }) : json({ ok: false }, 503);
+      if (u.pathname === "/mcp") return healthy ? json({ jsonrpc: "2.0", id: "domain-probe", result: { tools: [{ name: "herdr_skill" }, ...Array.from({ length: publicToolCount - 1 }, (_, i) => ({ name: `tool_${i}` }))], _meta: { herdr: { contract_hash: "sha256:public-v3" } } } }) : json({ ok: false }, 503);
     }
     return json({ error: "unexpected", url: u.href, method }, 500);
   };
@@ -85,6 +91,18 @@ test("preflight validates workers.dev candidate and reports ready_to_attach", as
     assert.equal(r.code, "ready_to_attach");
     assert.equal(r.prod.online, true);
     assert.equal(r.prod.toolCount, REQUIRED_TOOL_COUNT);
+    assert.equal(r.prod.contractEpoch, CONTRACT_EPOCH);
+    assert.equal(r.prod.publicContractEpoch, 3);
+  });
+});
+
+test("preflight accepts a public tool surface larger than the runtime execution contract", async () => {
+  const c = cfg({ CF_API_BASE: "https://cf.test/client/v4", HERDR_CUSTOM_DOMAIN_STATE_PATH: await statePath() });
+  await withFetch(handler({ publicToolCount: REQUIRED_TOOL_COUNT + 1 }), async () => {
+    const r = await preflight(c);
+    assert.equal(r.ok, true);
+    assert.equal(r.prod.toolCount, REQUIRED_TOOL_COUNT + 1);
+    assert.equal(r.prod.contractEpoch, CONTRACT_EPOCH);
   });
 });
 

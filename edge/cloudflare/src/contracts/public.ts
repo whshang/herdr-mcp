@@ -1,4 +1,4 @@
-import { EPOCH2_CONTRACT } from "./epoch2.js";
+import { EPOCH3_CONTRACT } from "./epoch3.js";
 
-/** Current ChatGPT-visible public contract. Epoch 1 remains a rollback/link-compat baseline only. */
-export const PUBLIC_CONTRACT = EPOCH2_CONTRACT;
+/** Current ChatGPT-visible device-aware public contract. */
+export const PUBLIC_CONTRACT = EPOCH3_CONTRACT;
