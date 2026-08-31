@@ -153,7 +153,7 @@ ChatGPT may show confirmation UI for actions. Those controls belong to ChatGPT's
 
 The browser extension can handle clearly identifiable page-level Allow actions under strict conditions, but cannot bypass workspace policy or browser/system permission dialogs.
 
-See [Browser continuity](browser-continuity.md) and [Extension wake](extension-wake.md).
+See [Browser continuity](browser-continuity.md) and [Extension wake](browser-continuity.md).
 
 ## Why browser continuity exists
 

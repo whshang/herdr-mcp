@@ -144,10 +144,10 @@ async function loadForm() {
 
 function setupGuideUrl() {
   if (getLocale() === "zh") {
-    return "https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/zh-CN/quick-agent-install.md";
+    return "https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/zh-CN/agent-install.md";
   }
   if (getLocale() === "ja") return "https://github.com/whshang/herdr-mcp/blob/main/README.ja.md";
-  return "https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/quick-agent-install.md";
+  return "https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/agent-install.md";
 }
 
 function setConnectionFailure(text) {

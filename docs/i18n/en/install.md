@@ -1,6 +1,6 @@
 # Installation: from one Herdr workstation to usable Web AI development
 
-> **Role: manual/operator reference.** The primary herdr-mcp installation protocol is written directly for the executing Agent; see [Quick agent install](quick-agent-install.md) and [Agent installation](agent-install.md). Use this page for manual inspection, troubleshooting, or understanding each stage. It no longer provides a product-specific prompt to copy into a named coding agent.
+> **Role: manual/operator reference.** The primary herdr-mcp installation protocol is written directly for the executing Agent; see [Agent install](agent-install.md) and [Agent installation](agent-install.md). Use this page for manual inspection, troubleshooting, or understanding each stage. It no longer provides a product-specific prompt to copy into a named coding agent.
 
 The goal is to connect a local workstation to ChatGPT / Web AI while keeping source code and real execution on the workstation.
 
@@ -67,7 +67,7 @@ Do not add public Edge while the local doctor is unhealthy. Fix the local runtim
 
 When ChatGPT needs to reach the workstation over the Internet, use a Cloudflare Worker as the stable OAuth/MCP entry point. Prefer `workers.dev` for the first setup unless a custom domain is an explicit requirement.
 
-For automated installation, the executing Agent follows [Quick agent install](quick-agent-install.md) / [Agent installation](agent-install.md) directly; those protocols own Token scoping, Worker naming, secret injection, account choice, and the boundary for network blockers.
+For automated installation, the executing Agent follows [Agent install](agent-install.md) / [Agent installation](agent-install.md) directly; those protocols own Token scoping, Worker naming, secret injection, account choice, and the boundary for network blockers.
 
 For a manual deployment, keep these constraints:
 
@@ -168,7 +168,7 @@ At minimum:
 
 ## Automated execution entry point
 
-For automated installation, the Agent reads [Quick agent install](quick-agent-install.md) directly. Use [Agent installation](agent-install.md) when the full permissions, security, and failure-boundary contract is needed.
+For automated installation, the Agent reads [Agent install](agent-install.md) directly. Use [Agent installation](agent-install.md) when the full permissions, security, and failure-boundary contract is needed.
 
 Read deeper only when needed:
 

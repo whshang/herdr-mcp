@@ -12,7 +12,7 @@ Languages: [English](README.md) · [简体中文](README.zh.md) · **日本語**
 
 正式なインストール入口は、実行可能な Agent に直接向けて書かれたプロトコルです：
 
-- [Quick agent install（英語）](docs/i18n/en/quick-agent-install.md) — 短い end-to-end 実行プロトコル；
+- [Quick agent install（英語）](docs/i18n/en/agent-install.md) — 短い end-to-end 実行プロトコル；
 - [Agent install（英語）](docs/i18n/en/agent-install.md) — Cloudflare、Link、security、verification の詳細契約。
 
 Agent はプロトコルを自分で読み、決定的な check / mutation を直接実行し、人の承認や選択が本当に必要な場合だけ停止します。通常 workstation の PROD runtime は published GitHub Releases から導入し、git checkout からは導入しません。network/login/third-party availability が blocker なら、Agent は停止して報告し、proxy や bypass infrastructure を勝手に作りません。
@@ -86,7 +86,6 @@ herdr-mcp uninstall
 
 ## 必要になったときだけ読む
 
-- [Quick agent install（英語）](docs/i18n/en/quick-agent-install.md)
 - [Installation（英語）](docs/i18n/en/install.md)
 - [ChatGPT Connector（英語）](docs/i18n/en/chatgpt-connector.md)
 - [Browser extension（英語）](docs/i18n/en/extension.md)

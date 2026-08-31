@@ -289,7 +289,6 @@ inspect -> 4 independent reads/grep/git facts -> patch -> validation -> since
 
 已完成第一轮 machine-readable benchmark：
 
-`docs/benchmarks/tool-performance-batch-a-20260827.json`
 
 方法：baseline 与 candidate 同时连接同一个本机 Herdr socket、操作同一个仓库数据集，分别监听 `127.0.0.1:18871/18872`，每个 spec 交替 baseline/candidate 顺序采样，避免把调用顺序和瞬时机器负载固定偏向一侧。baseline 为生产 `main` merge `69fb04e`；candidate 为 `perf/tool-latency-batch-a-20260827` working tree。
 

@@ -16,7 +16,7 @@ Languages: [English](README.md) · **简体中文** · [日本語](README.ja.md)
 
 正式安装入口是一份**直接写给执行 Agent 的协议**：
 
-- [快速 Agent 安装](docs/i18n/zh-CN/quick-agent-install.md) — 精简的端到端执行协议；
+- [快速 Agent 安装](docs/i18n/zh-CN/agent-install.md) — 精简的端到端执行协议；
 - [Agent 安装](docs/i18n/zh-CN/agent-install.md) — Cloudflare、Link、安全与验证的完整执行合同。
 
 执行 Agent 应自行读取协议、直接完成确定性的检查和 mutation，只在确实需要用户本人授权或选择时暂停。普通工作站的 PROD runtime 使用 GitHub Releases 正式发布产物，不从 git checkout 安装。如果网络、登录状态或第三方服务不可用，Agent 应停止并报告 blocker，不自行搭代理、切网络或发明绕过方案。
@@ -90,7 +90,6 @@ herdr-mcp uninstall
 
 ## 需要更多信息时再看
 
-- [快速 Agent 安装协议](docs/i18n/zh-CN/quick-agent-install.md) — 推荐入口，给 Coding Agent 读；
 - [手动安装](docs/i18n/zh-CN/install.md) — 想自己一步步配置时看；
 - [ChatGPT Connector](docs/i18n/zh-CN/chatgpt-connector.md) — OAuth / MCP 连接；
 - [浏览器扩展](docs/i18n/zh-CN/extension.md) — STORE / STANDALONE / DEV 身份与连续工作；

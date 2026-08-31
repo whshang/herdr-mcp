@@ -1,7 +1,7 @@
 # 快速开始：从零体验第一次远程开发
 
 > **职责：** 本页是**安装之后**用来验证并跑通第一个真实远程任务的内容，不是另一份安装教程。
-> - 交给 Coding Agent 的权威安装协议：[快速 Agent 安装](quick-agent-install.md)。
+> - 交给 Coding Agent 的权威安装协议：[Agent 安装](agent-install.md)。
 > - 手动安装：[安装](install.md)。
 >
 > 深入理解请阅读 [设计思路](design-philosophy.md) 与 [架构](architecture.md)。

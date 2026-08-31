@@ -181,7 +181,7 @@ ChatGPT 对写入或有风险的 App action 可能显示确认 UI。这个行为
 
 时才进行自动点击。`自动 关` 时只观察。
 
-详见 [浏览器连续工作](browser-continuity.md) 与 [自动继续、恢复和接力](extension-wake.md)。
+详见 [浏览器连续工作](browser-continuity.md) 与 [自动继续、恢复和接力](browser-continuity.md)。
 
 ## Streamable HTTP 与 ChatGPT 兼容层
 

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Release planes (runtime vs extension vs contract): [`docs/release-model.md`](docs/release-model.md). GA gate SSOT: [`docs/ga-release-gate.md`](docs/ga-release-gate.md).
+Release planes and publication boundaries: [`docs/release-model.md`](docs/release-model.md).
 
 Do not bump the Rust runtime version solely to ship an extension-only UI/DOM/browser-compatibility change. If the current release tooling cannot publish the extension independently, fix or add the extension release path instead of manufacturing a runtime patch release with no runtime change.
 

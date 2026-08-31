@@ -299,6 +299,6 @@ Codex true same-turn steer 仍严格依赖可验证的 pane → app-server endpo
 
 - [浏览器扩展总览](extension.md)
 - [浏览器连续工作](browser-continuity.md)
-- [自动继续、恢复与接力](extension-wake.md)
-- [JSON → MCP bridge](extension-bridge.md)
+- [自动继续、恢复与接力](browser-continuity.md)
+- [JSON → MCP bridge](extension.md)
 - [故障排查](troubleshooting.md)
