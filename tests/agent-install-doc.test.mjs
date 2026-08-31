@@ -7,16 +7,19 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (p) => readFileSync(path.join(ROOT, p), "utf8");
 
-test("README exposes copyable local-Agent prompts that point to the authoritative raw guides", () => {
+test("README links directly to Agent-first install protocols without copy-prompt wrappers", () => {
   const en = read("README.md");
   const zh = read("README.zh.md");
   const ja = read("README.ja.md");
-  assert.match(en, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/quick-agent-install\.md/);
-  assert.match(zh, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/zh-CN\/quick-agent-install\.md/);
-  assert.match(ja, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/quick-agent-install\.md/);
   assert.match(en, /quick-agent-install\.md/);
   assert.match(zh, /quick-agent-install\.md/);
   assert.match(ja, /quick-agent-install\.md/);
+  assert.match(en, /Agent-first setup/);
+  assert.match(zh, /Agent-first 安装/);
+  assert.match(ja, /Agent-first セットアップ/);
+  for (const doc of [en, zh, ja]) {
+    assert.doesNotMatch(doc, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\//);
+  }
 });
 
 test("Agent install guides own Cloudflare-token handoff and workers.dev-only bootstrap", () => {
@@ -56,11 +59,12 @@ test("maintainer install keeps deterministic Worker/bootstrap details while end-
     assert.match(doc, /scripts\/cloudflare-worker-name\.mjs/);
     assert.match(doc, /WORKER_NAME/);
     assert.match(doc, /ACCOUNT_SUBDOMAIN/);
-    assert.match(doc, /Cloudflare API/);
+    assert.match(doc, /Cloudflare[^\n]*API/);
     assert.match(doc, /Chrome Web Store/);
-    assert.doesNotMatch(doc, /chrome:\/\/extensions|Load unpacked|herdr-mcp-extension/);
+    assert.match(doc, /STANDALONE/);
+    assert.match(doc, /DEV/);
+    assert.match(doc, /v0\.4\.2/);
     assert.match(doc, /extension/);
-    assert.match(doc, /herdr-mcp native-host install/);
     assert.match(doc, /herdr-mcp native-host status/);
     assert.match(doc, /Native Messaging/);
     assert.match(doc, /HERDR_MCP_TOKEN/);
@@ -75,25 +79,29 @@ test("maintainer install keeps deterministic Worker/bootstrap details while end-
     const doc = read(rel);
     assert.match(doc, /quick-agent-install\.md/);
     assert.match(doc, /Chrome Web Store/);
+    assert.match(doc, /STANDALONE/);
     assert.doesNotMatch(doc, /scripts\/cloudflare-worker-name\.mjs/);
   }
 });
 
-test("quick agent install guides automate Herdr/runtime and keep the extension Store-only", () => {
+test("quick Agent protocols automate Herdr/runtime and preserve STORE STANDALONE DEV boundaries", () => {
   for (const rel of [
     "docs/i18n/en/quick-agent-install.md",
     "docs/i18n/zh-CN/quick-agent-install.md",
   ]) {
     const doc = read(rel);
-    assert.match(doc, /quick-agent-install\.md/);
     assert.match(doc, /herdr\.dev\/install\.(?:sh|ps1)/);
-    assert.match(doc, /GitHub Releases/);
+    assert.match(doc, /GitHub Releases?/);
     assert.match(doc, /HERDR_LINK_PROXY/);
     assert.match(doc, /Chrome Web Store/);
+    assert.match(doc, /STANDALONE/);
+    assert.match(doc, /DEV/);
+    assert.match(doc, /v0\.4\.2/);
+    assert.match(doc, /native-host use standalone/);
     assert.doesNotMatch(doc, /herdr-mcp-extension/);
-    assert.doesNotMatch(doc, /Load unpacked|chrome:\/\/extensions|~\/\.config\/herdr-mcp\/extension/);
     assert.doesNotMatch(doc, /cp -R extension|ln -s .*extension/);
-    assert.match(doc, /local development build|本地开发版/);
+    assert.match(doc, /source-development|源码开发/);
+    assert.match(doc, /Do not build a proxy|不要自行搭代理/);
     assert.match(doc, /herdr-edge-device\.username\.workers\.dev\/mcp/);
     assert.match(doc, /herdr-mcp\.example\.com\/mcp/);
     assert.match(doc, /workers\.dev/);

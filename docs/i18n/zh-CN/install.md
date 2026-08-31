@@ -1,6 +1,6 @@
 # 安装：从一台 Herdr 工作站到可用的 Web AI 开发环境
 
-> **推荐给普通用户：** 不需要从这里手抄命令。把 [快速 Agent 安装](quick-agent-install.md) 里的一句话发给 Cursor / Codex / Claude Code 等本地 Coding Agent，让它自动安装 Herdr、herdr-mcp、Edge 和 Link，只在 Cloudflare 与 ChatGPT 必须人工操作时暂停。本页保留为手动安装和排障参考。
+> **定位：人工/运维参考。** herdr-mcp 的主安装协议直接写给执行 Agent，见 [快速 Agent 安装](quick-agent-install.md) 和 [Agent 安装合同](agent-install.md)。本页用于人工检查、排障或需要理解每个阶段时查阅，不再提供“复制一段提示词给某个 Coding Agent”的入口。
 
 目标是把一台本地工作站接到 ChatGPT / Web AI，同时保持代码和真实执行环境留在自己的机器上。
 
@@ -66,7 +66,7 @@ herdr-mcp status
 
 如果 ChatGPT 需要从公网访问工作站，使用 Cloudflare Worker 提供稳定 OAuth/MCP 入口。首次安装优先 `workers.dev`，除非你明确需要自有域名。
 
-推荐让 Coding Agent 按 [快速 Agent 安装](quick-agent-install.md) 自动完成这段，因为里面包含 Token 最小权限、Worker 命名、secret 注入、Account 选择和代理判断。
+自动化安装时由 Agent 按 [快速 Agent 安装](quick-agent-install.md) / [Agent 安装合同](agent-install.md) 直接执行这段；协议负责 Token 最小权限、Worker 命名、secret 注入、Account 选择和网络 blocker 的处理边界。
 
 手动执行时，至少遵守：
 
@@ -138,20 +138,19 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 
 浏览器扩展用于 Side Panel 控制中心、workspace binding、长对话连续性和“排队”下一轮消息。它不是基础 MCP 闭环的必需项。
 
-最终用户只从 **Chrome Web Store** 安装：
+扩展分为三种身份：**STORE / STANDALONE / DEV**。当前 stable v0.4.2 的 Native Host 只支持 Store/DEV ownership；v0.4.3+ 才把固定身份的 STANDALONE 作为正式手动/GitHub 分发路径。
 
-1. 打开 <https://chromewebstore.google.com/>；
-2. 搜索 `Herdr`，选择 Herdr 官方扩展；
-3. 点击 **添加至 Chrome / Add to Chrome**；
-4. Chrome Web Store listing 尚未正式上线时，直接跳过扩展，不改用本地开发版；
-5. 安装完成后运行：
+- STORE：普通用户默认，Chrome Web Store 固定身份与更新；
+- STANDALONE：v0.4.3+，固定非 Store 身份；Store 不可用或用户明确选择独立分发时使用；
+- DEV：仅源码开发，Load unpacked repo/worktree `extension/`，身份随路径派生。
+
+安装/切换后运行：
 
 ```bash
-herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
-以后扩展版本通过 Chrome Web Store 正常更新机制分发；普通用户不需要重复下载 zip、覆盖本地目录或手工 Reload 扩展。
+要求 active channel、extension identity、Native Host runtime generation 与预期一致。不要把 DEV 当普通用户 fallback，也不要把 GitHub/manual standalone package 称为 dev。
 
 详见 [浏览器扩展](extension.md) 与 [浏览器控制中心](browser-control-center.md)。
 
@@ -167,9 +166,9 @@ herdr-mcp native-host status
 - 新会话能调用 `herdr_inspect` 读取真实工作站；
 - 可选扩展如果已安装，`herdr-mcp native-host status` 正常且 Side Panel 能看到 workspace。
 
-## 手动安装之外
+## 自动化执行入口
 
-如果目标只是“尽快用起来”，回到 [快速 Agent 安装](quick-agent-install.md)，让本地 Coding Agent 按协议自动执行。
+需要自动完成安装时，执行 Agent 直接读取 [快速 Agent 安装](quick-agent-install.md)；需要完整权限、安全和异常边界时读取 [Agent 安装合同](agent-install.md)。
 
 更深入的内容按需查看：
 

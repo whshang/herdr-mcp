@@ -1,8 +1,8 @@
-# Local-Agent install and `workers.dev` deployment
+# Agent installation contract and `workers.dev` deployment
 
-> **Role:** maintainer/automation implementation reference for a local coding Agent. End users should start from [Quick agent install](quick-agent-install.md) or [Installation](install.md).
+> **Executor: Agent.** This is the detailed ordinary-workstation installation contract. [Quick agent install](quick-agent-install.md) is the concise form of the same contract; [Installation reference](install.md) is for manual/operator lookup.
 
-This is an execution contract for a **local coding Agent**, not a list of commands for the human to copy. End-user one-sentence onboarding lives in [Quick agent install](quick-agent-install.md). The human should only need to perform Cloudflare interactive login/API-Token creation; the Agent owns environment checks, Release-binary install, Cloudflare Worker deployment, the outbound WSS Link, and verification.
+The Agent reads and executes this page directly; the human does not need to wrap it in another product-specific prompt. Human participation is limited to actions that genuinely require personal authorization or choice, such as Cloudflare sign-in/API Token creation, an account choice that cannot be inferred safely, and ChatGPT Connector/OAuth. The Agent owns environment checks, published Release installation, Cloudflare Worker deployment, the outbound WSS Link, optional extension-channel selection, and verification.
 
 > Current boundary: fully automated background-service setup is **macOS Apple Silicon first**. Windows may receive Release artifacts as preview. Do not invent unsupported Linux lifecycle packaging. Edge deploy may use Node/`wrangler` temporarily; the local MCP runtime itself must come from GitHub Releases, not `git clone` + `npm ci`.
 
@@ -10,10 +10,11 @@ This is an execution contract for a **local coding Agent**, not a list of comman
 
 1. Execute work directly; do not offload automatable shell steps to the human. Pause only for Cloudflare interactive login/API-Token creation or selection among multiple Cloudflare Accounts.
 2. Preserve existing work. Never `reset --hard`, `clean -fd`, or overwrite user changes in an unrelated checkout.
-3. Choose one canonical public origin during the first install and keep it consistent across Worker OAuth, MCP, and Link WSS. `workers.dev` remains the zero-DNS bootstrap path; use a Custom Domain from the start when the user already owns one or when `workers.dev` is unreliable on the workstation network (for example mainland China). Do not create or mutate a Custom Domain/DNS zone without explicit user intent.
+3. Choose one canonical public origin during the first install and keep it consistent across Worker OAuth, MCP, and Link WSS. `workers.dev` remains the zero-DNS bootstrap path. Use a Custom Domain from the start only when explicit user intent or existing installation policy/configuration already selects it. A connectivity failure is a pause point, not implicit permission to create or mutate a Custom Domain/DNS zone.
 4. Treat the Cloudflare Token as a high-sensitivity credential. Never echo it or write it to the repo, `.env`, ordinary logs, screenshots, or shell history. Prefer process-environment injection; if a temporary file is unavoidable, use mode `0600` and delete it immediately after deployment.
 5. Verify every mutation before continuing. On an error, determine whether the mutation already committed before retrying.
 6. Do **not** install the local MCP runtime by cloning this repository or running `npm`/`cargo` unless the human explicitly asked for a contributor/from-source session.
+7. If network, login state, or third-party availability blocks the requested path, stop and report the blocker. Do not build a proxy, switch network nodes, rewrite system proxy settings, or invent a bypass.
 
 ## 1. Prerequisites
 
@@ -48,7 +49,7 @@ WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 
 `WORKER_NAME` and `WORKSTATION_ID` intentionally use different grammars. The helper lowercases the hostname, safely handles every character outside `[a-z0-9-]` (including `.`, `_`, whitespace, and non-ASCII input), collapses/trims `-`, and keeps the complete Worker name at or below 63 characters. The result must match `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`; for example `MacBook.local` becomes `herdr-edge-macbook-local`. Use strong randomness such as `openssl rand -hex 32` for secrets; never include secrets in the final report.
 
-## 4. Only human pause: Cloudflare API Token
+## 4. Cloudflare authorization pause
 
 Open <https://dash.cloudflare.com/profile/api-tokens> when browser control is available; otherwise give the user that URL.
 
@@ -118,20 +119,25 @@ herdr-mcp doctor
 
 Do not recreate a repo-linked `~/.local/bin/herdr-mcp` bridge. Do not point LaunchAgent at a git checkout or `target/*/herdr-mcp`.
 
-Browser extension / Native Messaging remains optional and is not required for the first ChatGPT closed loop. If the human asks for continuity later, install the official **Herdr** extension from the Chrome Web Store. If the Store listing is not live yet, skip this optional step rather than using a local development build. After `herdr-mcp doctor` is healthy and the Store extension is installed:
+Browser extension / Native Messaging remains optional and is not required for the first ChatGPT closed loop. Extension channels are separate from Runtime DEV/PROD: **STORE / STANDALONE / DEV**.
+
+- STORE: default ordinary-user path, with the fixed Chrome Web Store identity and Store updates.
+- STANDALONE: v0.4.3+ GitHub/manual fixed-identity package, used when Store installation is unavailable or the user explicitly requests independent distribution.
+- DEV: source development only, loaded unpacked from a repo/worktree `extension/` directory with a path-derived ID.
+
+The Agent must inspect what the installed runtime actually supports. v0.4.2 has Store/DEV ownership only; do not invent standalone support. After selecting/installing a supported channel, run:
 
 ```bash
-herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
-See [Browser extension](extension.md) and [Browser continuity](browser-continuity.md).
+Status should identify the expected active channel/extension identity and confirm the Native Host runtime is consistent with the active runtime generation. See [Browser extension](extension.md) and [Browser continuity](browser-continuity.md).
 
 ## 8. macOS persistent Herdr Link
 
 Store `LINK_SHARED_SECRET` in Keychain under `herdr-edge-link-<WORKSTATION_ID>`. The command text must reference the environment variable rather than a literal secret. Prefer the managed Link install path exposed by the installed `herdr-mcp` binary (`herdr-mcp link ...` / current stable product docs). Do not leave production Link ownership on a repository Bash wrapper.
 
-When `workers.dev` is blocked (for example China SNI) or the machine already uses a system proxy for ChatGPT, configure Link WSS proxy or switch to a Custom Domain. Proxy precedence: `HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`; macOS also reads `scutil --proxy`. See [Quick agent install](quick-agent-install.md) §5 for the full decision tree.
+The Link can reuse proxy settings that already exist in the user's environment. Recognition precedence is `HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`; macOS also reads the existing `scutil --proxy` state. If the selected origin is still unreachable, stop and ask the user before changing any proxy, network node, system proxy, DNS/custom-domain choice, or other connectivity setting. See [Quick agent install](quick-agent-install.md) §5.
 
 ## 9. Verify the closed loop
 

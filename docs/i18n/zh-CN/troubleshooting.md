@@ -188,7 +188,7 @@ workstation → ChatGPT
 2. `herdr-mcp status` / `herdr-mcp doctor` 应该先证明本机 runtime 正常；
 3. `herdr-mcp native-host status` 应显示 Native Messaging host 已注册；
 4. Chrome 刚更新商店扩展后，刷新受影响网页（必要时重启 Chrome），让当前 content script 重新加载；
-5. `herdr-mcp native-host status` 应显示官方 Store 扩展身份；若出现 origin mismatch，使用当前 runtime 重新执行 `herdr-mcp native-host install`。维护者的 unpacked identity 排障只放在 Store 开发 WIP，不放在最终用户指南；
+5. `herdr-mcp native-host status` 应显示用户明确选择的扩展 identity/channel，并确认 Native Host runtime 与当前 runtime generation 一致。v0.4.2 支持 Store/DEV ownership，v0.4.3+ 才可能显示 STANDALONE。出现 origin mismatch 时不要猜测另一个通道并直接覆盖；先检查当前 runtime 实际支持的命令和 Chrome 中真实安装的扩展身份；
 6. 顶部如果显示“运行时正常 · 事件流正在重连”，说明已有 snapshot，但增量事件正在恢复，不等于整个 runtime 离线；可以先点刷新让 Side Panel 做一次权威 reconciliation。
 
 Control Center 的 `提示 Agent` 现在会走本地可信控制链真实执行；`调整会话`会返回真实 provider capability/outcome，绝不会偷偷降级成 Prompt。`Herdr API` 与 raw `终端输入`仍是 Preview-only。Prompt 返回 `uncertain` 时先检查 live state 再考虑重试；Steer 返回 `session_not_resolved` 表示当前 pinned provider session 没有可验证的 control endpoint/thread/active-turn 映射，这是 capability 结果，不是 transport 故障。

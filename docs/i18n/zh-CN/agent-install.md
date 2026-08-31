@@ -1,8 +1,8 @@
-# 本地 Agent 安装与 `workers.dev` 部署
+# Agent 安装合同与 `workers.dev` 部署
 
-> **职责：** 面向维护者/自动化的实现参考，供本地 coding Agent 执行。最终用户应从 [快速 Agent 安装](quick-agent-install.md) 或 [安装](install.md) 开始。
+> **执行角色：Agent。** 本页是 herdr-mcp 普通工作站安装的详细执行合同；[快速 Agent 安装](quick-agent-install.md) 是同一合同的精简版，[安装参考](install.md) 只用于人工/运维查阅。
 
-这是一份给**本地 coding Agent**读取并执行的安装协议，不是给用户逐条复制命令的教程。面向最终用户的一句话安装入口见 [快速 Agent 安装](quick-agent-install.md)。目标是：用户只负责 Cloudflare 本人登录和创建 API Token；Agent 负责环境检查、Release 二进制安装、Cloudflare Worker、出站 WSS Link 和验证。
+Agent 直接读取并执行本文，不需要用户再把本文包装成一段“发给某个 Coding Agent”的提示词。用户只承担 Cloudflare 本人登录/API Token、无法自动判断的 Account 选择、ChatGPT Connector/OAuth 等必须本人完成的授权步骤；Agent 负责环境检查、Release 二进制安装、Cloudflare Worker、出站 WSS Link、可选浏览器扩展通道选择与验证。
 
 > 当前约束：完整的后台服务自动安装路径以 **macOS Apple Silicon** 为第一正式平台。Windows 可有 Release artifact 作为 preview。不要发明未支持的 Linux lifecycle 包装。Edge 部署可临时使用 Node/`wrangler`；本机 MCP runtime **必须**来自 GitHub Releases，而不是 `git clone` + `npm ci`。
 
@@ -10,10 +10,11 @@
 
 1. 能自动化的 shell 步骤直接执行；只在 Cloudflare 交互登录 / API Token 创建，或多个 Account 选择时暂停。
 2. 不破坏已有工作。禁止对无关 checkout 做 `reset --hard`、`clean -fd` 或覆盖用户修改。
-3. 首次安装就确定一个 canonical public origin，并让 Worker OAuth、MCP、Link WSS 全部使用同一个入口。`workers.dev` 仍是无需 DNS 的 bootstrap 路径；用户已有自定义域名，或工作站网络对 `workers.dev` 不稳定（例如中国大陆）时，从第一次部署就使用 Custom Domain。没有用户明确意图时，不创建或修改 Custom Domain/DNS zone。
+3. 首次安装就确定一个 canonical public origin，并让 Worker OAuth、MCP、Link WSS 全部使用同一个入口。`workers.dev` 仍是无需 DNS 的 bootstrap 路径。只有用户明确选择 Custom Domain，或现有安装策略/配置能证明这一意图时，才从第一次部署使用自定义域名。连通性失败是暂停点，不代表 Agent 获得创建或修改 Custom Domain/DNS zone 的权限。
 4. Cloudflare Token 是高敏凭据。禁止回显或写入仓库、`.env`、普通日志、截图、shell history。优先进程环境注入；若必须落临时文件，用 mode `0600` 并在部署后立刻删除。
 5. 每个 mutation 后先验证再继续。出错时先判断 mutation 是否已经提交，再决定是否重试。
 6. **不要**用 clone 本仓库或 `npm`/`cargo` 安装本机 MCP runtime，除非用户明确要求贡献者/从源码开发会话。
+7. 如果网络、登录状态或第三方服务不可用，停止并向用户报告 blocker；不要自行搭代理、切网络节点、修改系统代理或发明绕过路径。
 
 ## 1. 前置条件
 
@@ -48,7 +49,7 @@ WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 
 `WORKER_NAME` 与 `WORKSTATION_ID` 故意使用不同语法。helper 会把 hostname 小写，把 `[a-z0-9-]` 以外字符安全替换，压缩/修剪 `-`，并保证完整 Worker 名不超过 63 且匹配 `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`。例如 `MacBook.local` → `herdr-edge-macbook-local`。秘密用 `openssl rand -hex 32` 一类强随机；最终报告不得包含秘密。
 
-## 4. 唯一需要人暂停：Cloudflare API Token
+## 4. Cloudflare 授权暂停
 
 有浏览器控制时打开 <https://dash.cloudflare.com/profile/api-tokens>；否则把该 URL 交给用户。
 
@@ -118,20 +119,25 @@ herdr-mcp doctor
 
 不要重建指向仓库的 `~/.local/bin/herdr-mcp` bridge。不要把 LaunchAgent 指到 git checkout 或 `target/*/herdr-mcp`。
 
-浏览器扩展 / Native Messaging 仍是可选项，不是第一条 ChatGPT 闭环的必需。若用户之后要连续性，只从 Chrome Web Store 安装官方 **Herdr** 扩展；Store listing 尚未上线时直接跳过，不改用本地开发版。`herdr-mcp doctor` 健康且商店扩展安装完成后：
+浏览器扩展 / Native Messaging 仍是可选项，不是第一条 ChatGPT 闭环的必需。扩展通道与 Runtime DEV/PROD 分开建模：**STORE / STANDALONE / DEV**。
+
+- STORE：普通用户默认，Chrome Web Store 固定身份与更新。
+- STANDALONE：v0.4.3+ 的 GitHub/手动固定身份 package；Store 不可用或用户明确要求独立分发时使用。
+- DEV：仅源码开发，Load unpacked repo/worktree `extension/`，ID 路径派生。
+
+Agent 必须先读取当前 runtime 实际支持的 `native-host` 命令；v0.4.2 只有 Store/DEV，不得虚构 standalone。选择并安装通道后执行：
 
 ```bash
-herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
-详见 [浏览器扩展](extension.md) 与 [浏览器连续性](browser-continuity.md)。
+状态应明确显示预期 active channel / extension identity，并确认 Native Host runtime 与当前 runtime generation 一致。详见 [浏览器扩展](extension.md) 与 [浏览器连续性](browser-continuity.md)。
 
 ## 8. macOS 持久 Herdr Link
 
 把 `LINK_SHARED_SECRET` 存进 Keychain，服务名 `herdr-edge-link-<WORKSTATION_ID>`。命令文本只能引用环境变量，不能写字面秘密。优先使用已安装 `herdr-mcp` 二进制提供的托管 Link 安装路径（`herdr-mcp link ...` / 当前 stable 产品文档）。不要把生产 Link 所有权留在仓库 Bash 包装上。
 
-在中国或 `workers.dev` 被 SNI 拦截时，Link WSS 需走系统/显式代理或改用自定义域名。代理变量优先级：`HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`；macOS 还会读取 `scutil --proxy`。完整决策树见 [快速 Agent 安装](quick-agent-install.md) §5。
+Link 可以复用用户环境里**已经存在**的代理配置。识别优先级：`HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`；macOS 也会读取现有 `scutil --proxy` 状态。如果所选 origin 仍不可达，停止并询问用户；未经明确指示不得修改代理、网络节点、系统代理、DNS/自定义域名选择或其它网络设置。见 [快速 Agent 安装](quick-agent-install.md) §5。
 
 ## 9. 验证闭环
 

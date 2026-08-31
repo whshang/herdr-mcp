@@ -7,12 +7,12 @@ Status: **current runtime stable `v0.4.2` published** (2026-08-31). First-GA `v0
 | Plane | What ships | Version source | Consumer update path | Bound to runtime tag? |
 | --- | --- | --- | --- | --- |
 | **Runtime Release** | `herdr-mcp` Rust binary, `release-manifest.json`, platform SHA256 sidecars | `crates/herdr-mcp/Cargo.toml` → Git tag `v*` | `herdr-mcp update check/apply` on `stable` or `preview` channel | **Yes** — manifest drives updater |
-| **Browser Extension Release** | Chrome Web Store item | `extension/manifest.json` `version` | Chrome Web Store automatic update; `native-host install` binds the Store origin to the active runtime | **No** — independent Store lifecycle |
+| **Browser Extension Release** | STORE item and, from v0.4.3+, fixed-identity STANDALONE package | `extension/manifest.json` `version` | Store update or independent standalone package update; Native Host selects one supported extension owner | **No** — independent extension lifecycle |
 | **Contract Compatibility** | MCP epoch, tool catalog, state schema, Edge OAuth/MCP surface | Code + release manifest fields | Edge deploy + Link + runtime generation together | **Coupled by epoch**, not by zip filename |
 
-**Critical rule:** Runtime GitHub Releases do **not** distribute the browser extension. The extension is a Chrome Web Store product with its own version and update cadence. Browser-extension `0.1.x` and runtime `0.4.x` evolve independently; proximity in release time does not create a semver or updater coupling between them.
+**Critical rule:** Runtime GitHub Releases do **not** own or silently bundle the browser-extension lifecycle. Browser-extension `0.1.x` and runtime `0.4.x` evolve independently; proximity in release time does not create a semver or updater coupling between them. STORE is the default ordinary-user distribution. v0.4.3 adds a separate fixed-identity STANDALONE distribution path for GitHub/manual installation; DEV remains source-development only and is not a release channel.
 
-An extension-only change must **not** force a Rust runtime version bump. Maintainers may use `scripts/pack-extension.mjs` to build a deterministic Store-upload / explicit unpacked-UAT package, but that zip is not an end-user Runtime Release asset.
+An extension-only change must **not** force a Rust runtime version bump. The current v0.4.2 packer produces the Store-upload / explicit unpacked-UAT package. The v0.4.3 standalone work extends that packaging surface with an explicit fixed-identity standalone mode without adding a fixed key to the DEV source manifest. Neither package becomes a Rust Runtime Release asset.
 
 ## Runtime Release (authoritative product version)
 
@@ -54,10 +54,13 @@ Installed generations are content-addressed (`rust-<sha256-prefix>`). Update app
 
 ## Browser Extension Release
 
-- **Store packaging:** maintainers run `node scripts/pack-extension.mjs` only for Chrome Web Store upload or explicit unpacked UAT.
+- **Three identities:** STORE = ordinary-user default; STANDALONE = v0.4.3+ fixed non-Store identity for independent/GitHub distribution; DEV = path-derived source-development identity.
+- **Store packaging:** current maintainers can run `node scripts/pack-extension.mjs` for Chrome Web Store upload or explicit unpacked UAT.
+- **Standalone packaging (v0.4.3 plan):** add an explicit deterministic mode that injects the public standalone manifest key into the packaged manifest without mutating `extension/manifest.json`; the resulting package has one stable non-Store Chromium ID on every machine/path.
 - **Runtime release boundary:** `.github/workflows/rust-release.yml` never attaches an extension zip.
-- **Distribution:** end users install the extension from the Chrome Web Store. A locally packed zip is maintainer-only Store-upload / explicit unpacked-UAT input, not a Runtime GitHub Release asset.
-- **Updater separation:** `update apply` updates the Rust runtime only. After a Store install, `native-host install` binds the official Store origin to the **active runtime**; explicit unpacked development remains a maintainer override.
+- **Distribution:** STORE remains the Chrome Web Store path. STANDALONE is published through an independently auditable extension release surface/manual GitHub artifact rather than being smuggled into the runtime manifest. DEV is never presented as the standalone fallback.
+- **Updater separation:** `update apply` updates the Rust runtime only. Native Host ownership is `store | standalone | dev` only on runtimes that implement the three-channel contract; v0.4.2 remains Store/DEV and must not be described as standalone-capable.
+- **Identity SSOT:** Store identity remains `contracts/browser-extension-store.json`; v0.4.3 standalone identity is `contracts/browser-extension-standalone.json`; the DEV source manifest stays unkeyed/path-derived.
 
 ### Extension vs runtime version matrix (current snapshot)
 

@@ -6,36 +6,37 @@ The herdr-mcp browser extension is not a second agent runtime. It adds browser-s
 
 Data handling and permission use are documented in the [Browser extension privacy policy](privacy.md).
 
-## End-user installation: Chrome Web Store only
+## Installation identities: STORE / STANDALONE / DEV
 
-Normal users install the extension from Chrome Web Store and do not need a local extension build or repository checkout.
+Browser-extension identity is separate from the Runtime DEV/PROD model:
 
-1. Open the [official Herdr Chrome Web Store item](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp).
-2. Confirm the publisher/product identity, then choose the official Herdr extension.
-3. Click **Add to Chrome**.
-4. After installation, run:
+| Channel | Intended use | Chromium identity |
+| --- | --- | --- |
+| **STORE** | default ordinary-user install | fixed Chrome Web Store identity + Store updates |
+| **STANDALONE** | v0.4.3+ GitHub/manual independent distribution | fixed non-Store identity; moving the unpacked package does not change the ID |
+| **DEV** | source development | Load unpacked from repo/worktree `extension/`; path-derived ID |
+
+Current stable v0.4.2 Native Host supports Store/DEV ownership only. v0.4.3 adds standalone; v0.4.2 is not repacked or retagged to retrofit it. Do not use a path-derived DEV build as a substitute for standalone.
+
+STORE installs the [official Herdr Chrome Web Store build](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp). STANDALONE uses only a v0.4.3+ fixed-identity release package. DEV is for contributor/extension development and is loaded from an explicit repo/worktree path.
+
+After installing/selecting a channel, run:
 
 ```bash
-herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
-On a fresh `0.4.1+` installation, the normal `native-host install` path uses the official Chrome Web Store extension identity; it does not require an unpacked extension directory or a source checkout. On `0.4.2+`, a maintainer may keep one unpacked Dev build installed alongside the Store build, but herdr-mcp still authorizes exactly one active Native Messaging origin at a time.
-
-5. Open ChatGPT or another currently supported site. z.ai and DeepSeek are experimental and remain disabled by default until you enable them separately in **Herdr Settings → Experimental features**, then reload that site.
-6. Click the Herdr toolbar icon and confirm the **Browser Control Center** opens in Chrome Side Panel.
-7. Confirm the active page is recognized as the intended Project / conversation, then bind the Herdr workspace from the Control Center.
-
-> The extension is currently entering its first Chrome Web Store publication flow. Until the listing is live, normal users should skip this optional step rather than install a local development build.
+Require the active channel/extension identity to match the selected build and the Native Host runtime to match the active runtime generation. Then open ChatGPT or another supported site. z.ai and DeepSeek remain experimental and disabled by default until enabled in **Herdr Settings → Experimental features** and the page is reloaded. Open Browser Control Center from the Herdr toolbar icon, confirm the intended Project/conversation, then bind the Herdr workspace.
 
 ## Updates
 
-After a Chrome Web Store installation, Chrome's normal Web Store update mechanism delivers new extension versions. Normal users do not need a local extension package or a repository checkout.
+- **STORE** updates through Chrome Web Store.
+- **STANDALONE** updates through the GitHub/independent release surface with a new fixed-identity package; unpacking to a different path does not create a new browser identity.
+- **DEV** follows the loaded repo/worktree source and is explicitly Reloaded by the developer.
 
+If a long-open ChatGPT tab still runs an older content script after an extension update, refresh that web page so the new content script is injected.
 
-If a long-open ChatGPT tab still runs an older content script after Chrome updates the extension, refresh that web page so the new content script is injected.
-
-Browser-extension versions and Rust-runtime versions have independent release cadence. Pure UI, DOM, or browser-compatibility fixes do not require a new Rust runtime release.
+Browser-extension versions and Rust-runtime versions have independent release cadence. Pure UI, DOM, or browser-compatibility fixes do not require a new Rust runtime release, but a new Native Host identity/channel contract must be used with a runtime that actually implements it.
 
 ## Three product surfaces
 
@@ -112,8 +113,8 @@ The pane currently viewed in the Herdr UI. It may change frequently and must not
 ## First use
 
 1. Confirm `herdr-mcp doctor` is healthy.
-2. Install the extension from the Chrome Web Store.
-3. Run `herdr-mcp native-host install`.
+2. Select/install STORE, STANDALONE, or DEV according to the channel rules above.
+3. Use only Native Host commands that the installed runtime actually supports, then verify `herdr-mcp native-host status`.
 4. Open the intended ChatGPT Project / conversation.
 5. Open Browser Control Center.
 6. Bind the page from the matching workspace row.
@@ -134,26 +135,27 @@ Core rules:
 
 See [Browser continuity](browser-continuity.md) and [wake / recovery](extension-wake.md).
 
-## Development and store publishing
+## Development, Standalone, and Store publishing
 
-Local extension builds, Chrome Web Store Developer Dashboard, package upload, Trusted Testers, listing assets, and review operations are **maintainer / extension-development workflows**, not end-user installation instructions.
+DEV source loading, fixed-identity STANDALONE packages, and Chrome Web Store publication are three separate extension distribution paths. The extension version lifecycle remains independent from the Rust runtime, while Native Host channel contracts must match the capabilities of the runtime actually installed.
 
 Maintainers should use:
 
 - `contracts/browser-extension-store.json` as the single machine-readable Chrome Web Store identity SSOT; Rust consumes and validates this contract instead of hard-coding the Store ID;
+- `contracts/browser-extension-standalone.json` as the v0.4.3 Standalone fixed-identity SSOT; the package injects only the public manifest key while the DEV source `extension/manifest.json` remains unkeyed;
 - `herdr-mcp native-host dev enable [PATH]` to register and activate one unpacked Dev identity (`PATH` defaults to `./extension`);
-- `herdr-mcp native-host use store` / `herdr-mcp native-host use dev` to switch the one active/default browser owner without uninstalling the other Chrome extension;
+- `herdr-mcp native-host use store` / `use standalone` / `use dev` to switch the one active/default browser owner without uninstalling sibling extension identities; `use standalone` is a v0.4.3+ command and must not be assumed on v0.4.2;
 - `herdr-mcp native-host dev disable` to forget the Dev identity and return Store to active ownership;
 - `HERDR_EXTENSION_PATH=/path/to/unpacked/extension herdr-mcp native-host install` only as a compatibility form for older maintainer workflows;
 - `native-host dev enable` configures the Dev identity, Native Host trust, and active owner; it does **not** silently install an unpacked extension into branded Chrome. Chrome 137+ removed `--load-extension` from branded builds and 139+ also removed `--disable-extensions-except`, so after cloning use `chrome://extensions` → Developer mode → **Load unpacked** and select `extension/`. Automated smoke uses Chrome for Testing or Chromium. Chrome 146+ CfT uses `~/Library/Application Support/Google/ChromeForTesting/NativeMessagingHosts/`; `0.4.2` manages it as an optional target when that browser directory exists.
 - `docs/_wip/browser-extension-development-and-store-release.md` for the Store workflow;
 - the extension validation and release ownership rules in `AGENTS.md`.
 
-Store and Dev may coexist as Chrome extensions, but the managed Native Messaging manifest always carries one exact `allowed_origins` entry: the currently active owner. The inactive 0.1.76+ build stays installed but enters standby instead of opening the local shared stream or operational HUD. Switching the active owner also revokes an already-open old Native Messaging request/stream through the Rust host's managed-origin fence, so the previous build cannot keep local control through a persistent connection. If an unpacked directory is moved, run `dev enable` again because Chromium's unpacked identity is path-derived.
+STORE / STANDALONE / DEV may coexist as different Chrome extension identities, but the managed Native Messaging manifest always carries one exact `allowed_origins` entry: the currently active owner. Inactive builds stay installed but enter standby instead of opening the local shared stream or operational HUD. Switching the active owner also revokes an already-open old Native Messaging request/stream through the Rust host's managed-origin fence, so the previous build cannot keep local control through a persistent connection. Only DEV is path-derived; if its unpacked directory moves, register the DEV origin again.
 
-After `native-host use store` or `native-host use dev`, refresh already-open supported Web AI tabs. Page ownership is decided when the 0.1.76+ content script is injected, so a refresh lets the newly active build claim the page while the inactive sibling exits before registering page listeners or HUD/Queue UI. Safe simultaneous Store+Dev enablement therefore requires both browser builds to be 0.1.76+; the first 0.1.75 Store candidate remains a Store-only release candidate and is not rewritten in place.
+After `native-host use store`, `use standalone`, or `use dev`, refresh already-open supported Web AI tabs. Page ownership is decided when the content script is injected, so a refresh lets the newly active build claim the page while inactive siblings exit before registering page listeners or HUD/Queue UI. Use `use standalone` only with a v0.4.3+ runtime that actually advertises it; v0.4.2 remains Store/DEV only.
 
-Once the Store listing is public, end-user documentation keeps only the Chrome Web Store installation path.
+STORE remains the default ordinary-user path. STANDALONE is a supported independent distribution path, not a development build.
 
 ## Related docs
 

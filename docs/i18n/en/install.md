@@ -1,6 +1,6 @@
 # Installation: from one Herdr workstation to usable Web AI development
 
-> **Recommended for normal users:** do not copy commands from this page one by one. Give the one-line prompt in [Quick agent install](quick-agent-install.md) to Cursor / Codex / Claude Code or another local coding agent. It installs Herdr, herdr-mcp, Edge, and Link, and pauses only for Cloudflare and ChatGPT steps that require the human. This page remains the manual-install and troubleshooting reference.
+> **Role: manual/operator reference.** The primary herdr-mcp installation protocol is written directly for the executing Agent; see [Quick agent install](quick-agent-install.md) and [Agent installation](agent-install.md). Use this page for manual inspection, troubleshooting, or understanding each stage. It no longer provides a product-specific prompt to copy into a named coding agent.
 
 The goal is to connect a local workstation to ChatGPT / Web AI while keeping source code and real execution on the workstation.
 
@@ -67,7 +67,7 @@ Do not add public Edge while the local doctor is unhealthy. Fix the local runtim
 
 When ChatGPT needs to reach the workstation over the Internet, use a Cloudflare Worker as the stable OAuth/MCP entry point. Prefer `workers.dev` for the first setup unless a custom domain is an explicit requirement.
 
-The recommended route is to let a coding agent follow [Quick agent install](quick-agent-install.md), because that protocol owns Token scoping, Worker naming, secret injection, account choice, and proxy handling.
+For automated installation, the executing Agent follows [Quick agent install](quick-agent-install.md) / [Agent installation](agent-install.md) directly; those protocols own Token scoping, Worker naming, secret injection, account choice, and the boundary for network blockers.
 
 For a manual deployment, keep these constraints:
 
@@ -138,20 +138,19 @@ See [ChatGPT Connector](chatgpt-connector.md).
 
 The browser extension adds Side Panel Control Center, workspace binding, long-conversation continuity, and queued next-turn messages. It is not required for the base MCP loop.
 
-End users install only from the **Chrome Web Store**:
+The extension has three identities: **STORE / STANDALONE / DEV**. Current stable v0.4.2 Native Host supports Store/DEV ownership; v0.4.3+ introduces the fixed-identity STANDALONE path for GitHub/manual distribution.
 
-1. open <https://chromewebstore.google.com/>;
-2. search for `Herdr` and choose the official Herdr extension;
-3. click **Add to Chrome**;
-4. if the Chrome Web Store listing is not live yet, skip the extension rather than falling back to a developer-mode install;
-5. after installation run:
+- STORE: default ordinary-user path, fixed Chrome Web Store identity and Store updates;
+- STANDALONE: v0.4.3+, fixed non-Store identity for independent/GitHub distribution;
+- DEV: source development only, Load unpacked from repo/worktree `extension/`, with a path-derived identity.
+
+After installing/selecting a supported channel, run:
 
 ```bash
-herdr-mcp native-host install
 herdr-mcp native-host status
 ```
 
-Future extension versions are delivered through Chrome's normal Web Store update mechanism. Normal users do not repeatedly download ZIPs, overwrite local extension directories, or manually Reload the extension.
+Require the active channel, extension identity, and Native Host runtime generation to match the intended installation. Do not use DEV as the ordinary-user fallback, and do not call a GitHub/manual fixed-identity package "dev".
 
 See [Browser extension](extension.md) and [Browser Control Center](browser-control-center.md).
 
@@ -167,9 +166,9 @@ At minimum:
 - a new conversation can call `herdr_inspect` against the real workstation;
 - if the optional extension is installed, `herdr-mcp native-host status` is healthy and Control Center can see workspaces.
 
-## Beyond manual installation
+## Automated execution entry point
 
-If the goal is simply to get working quickly, return to [Quick agent install](quick-agent-install.md) and let the coding agent execute the protocol.
+For automated installation, the Agent reads [Quick agent install](quick-agent-install.md) directly. Use [Agent installation](agent-install.md) when the full permissions, security, and failure-boundary contract is needed.
 
 Read deeper only when needed:
 
