@@ -13,7 +13,7 @@ import {
   reconcileWorkspaceWakeKind, reconcileWorkspaceCatalogBindings,
   pruneExpired, bindingRevision, buildWakeTemplate, shouldProgressTick, shouldSendProgress,
   isIdleNudgeText, looksLikeSubstantiveReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage, interpretLlmJudgeReply,
-  assistantNudgeFingerprint, assistantDeclaresPendingWork,
+  assistantNudgeFingerprint, assistantDeclaresPendingWork, shouldAutoContinueWithoutLlm,
   DEFAULT_LLM_JUDGE_PROMPT, LEGACY_DEFAULT_LLM_JUDGE_PROMPT, DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
   conversationInfoFromSupportedUrl,
 } from "./binding-core.js";
@@ -42,7 +42,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.84";
+const H2W_SCRIPT_VERSION = "0.1.85";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
@@ -148,7 +148,7 @@ function hudLabels() {
     "judge_no_continue", "judge_turn_in_progress", "continue_sent", "continue_failed",
     "web_state", "scope_binding_count", "scope_binding_hint", "scope_unbound",
     "tip_state", "tip_recovery", "tip_last_event", "none",
-    "reason_disabled", "reason_no_conv", "reason_llm_not_configured", "reason_unbound",
+    "reason_disabled", "reason_no_conv", "reason_llm_not_configured", "reason_fallback_continue", "reason_fallback_complete", "reason_unbound",
     "reason_still_generating", "reason_not_substantive", "reason_empty_assistant", "reason_nudge_loop",
     "reason_same_assistant", "reason_cooldown", "reason_llm_done", "reason_llm_ambiguous",
     "reason_llm_continue", "reason_llm_timeout", "reason_llm_http", "reason_llm_network", "reason_llm_permission",
@@ -2307,6 +2307,35 @@ async function retryIdleNudge(convKey) {
 }
 
 /** Post-turn nudge: LLM judge plus strong assistant self-declared pending work. */
+async function autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, cooldownMs, cause = "llm_not_configured") {
+  if (!shouldAutoContinueWithoutLlm(userText, assistantText)) {
+    lastJudgedAssistantFp.set(convKey, fp);
+    clearIdleNudgeRetry(convKey);
+    return rememberIdleNudge(convKey, { nudged: false, reason: "fallback_complete", cause });
+  }
+  const nudgeText = localizedText("manual_continue_message", null, "Continue");
+  lastIdleNudgeAt.set(convKey, Date.now());
+  const wakeResult = await routeWake(b, {
+    status: "auto_continue_fallback_nudge",
+    output: `bounded auto-continue fallback; cause=${cause}`,
+    working_count: 0,
+    pane: b.pane,
+    agent: b.agent,
+  }, nudgeText);
+  if (!wakeResult?.ok) {
+    scheduleIdleNudgeRetry(convKey, cooldownMs);
+    return rememberIdleNudge(convKey, {
+      nudged: false,
+      reason: "wake_failed",
+      cause,
+      send: nudgeText,
+      error: wakeResult?.error || wakeResult?.blocked || wakeResult?.reason || "submit-failed",
+    });
+  }
+  lastJudgedAssistantFp.set(convKey, fp);
+  return rememberIdleNudge(convKey, { nudged: true, reason: "fallback_continue", cause, send: nudgeText });
+}
+
 async function maybeIdleNudge(msg) {
   const convKey = msg?.convKey || "";
   if (convKey && idleNudgeInFlight.has(convKey)) {
@@ -2344,9 +2373,6 @@ async function maybeIdleNudgeInner(msg) {
     assistantText: msg.assistantText || "",
     endedAt: msg.endedAt || Date.now(),
   });
-  if (!isLlmJudgeConfigured(CFG)) {
-    return rememberIdleNudge(convKey, { nudged: false, reason: "llm_not_configured" });
-  }
   const bindings = await loadBindings();
   const primary = primaryBindingForConv(bindings, convKey);
   if (!primary) return rememberIdleNudge(convKey, { nudged: false, reason: "unbound" });
@@ -2398,14 +2424,21 @@ async function maybeIdleNudgeInner(msg) {
 
   clearIdleNudgeRetry(convKey);
 
+  if (!isLlmJudgeConfigured(CFG)) {
+    return autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, cooldownMs);
+  }
+
   const judged = await fetchLlmJudge(userText, assistantText);
   if (!judged.ok) {
-    return rememberIdleNudge(convKey, {
-      nudged: false,
-      reason: `llm_${judged.reason}`,
-      error: judged.error || "",
-      status: judged.status || null,
-    });
+    return autoContinueWithoutLlm(
+      convKey,
+      b,
+      userText,
+      assistantText,
+      fp,
+      cooldownMs,
+      `llm_${judged.reason}`,
+    );
   }
   let verdict = interpretLlmJudgeReply(judged.content, {
     skipKeywords: CFG.llmJudgeSkipKeywords || DEFAULT_LLM_SKIP_KEYWORDS_TEXT,
@@ -2598,7 +2631,7 @@ async function routeWake(b, extra, template = CFG.wakeTemplate || defaultWakeTem
   if (activeTransferFromSource(handoffs, bindingDeliveryConvKey(b) || b?.convKey || "")) {
     return { ok: false, reason: "handoff_active" };
   }
-  const isLlmNudge = extra.status === "llm_continue_nudge";
+  const isLlmNudge = ["llm_continue_nudge", "auto_continue_fallback_nudge"].includes(extra.status);
   const rawText = String(template || "").trim();
 
   if (isLlmNudge) {

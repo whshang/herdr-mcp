@@ -19,7 +19,7 @@ import {
   progressOutputFingerprint,
   isIdleNudgeText, looksLikeSubstantiveReply, isHerdrWakeComposerText,
   interpretLlmJudgeReply, isLlmJudgeConfigured, llmJudgeCompletionsUrl, buildLlmJudgeUserMessage,
-  parseLlmSkipKeywords, llmReplyMatchesSkipKeyword, assistantNudgeFingerprint, assistantDeclaresPendingWork,
+  parseLlmSkipKeywords, llmReplyMatchesSkipKeyword, assistantNudgeFingerprint, assistantDeclaresPendingWork, shouldAutoContinueWithoutLlm,
   conversationInfoFromSupportedUrl,
 } from "../../extension/binding-core.js";
 import {
@@ -77,9 +77,9 @@ const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "u
 const controlCenterCss = readFileSync(path.join(EXT, "control-center.css"), "utf8");
 const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.84", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.84"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.84"'), "content version matches manifest");
+ok(manifest.version === "0.1.85", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.85"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.85"'), "content version matches manifest");
 const ownerGateIndex = wakeSource.indexOf('type: "h2w_extension_owner_status"');
 const queueOwnerClaimIndex = wakeSource.indexOf('setAttribute(QUEUED_INSERT_OWNER_ATTR');
 ok(ownerGateIndex >= 0
@@ -180,6 +180,12 @@ ok(backgroundSource.includes("idleNudgeInFlight")
     && backgroundSource.includes("scheduleIdleNudgeRetry(convKey, 30000)")
     && backgroundSource.includes("assistant_pending_override"),
   "LLM auto-continue retries ambiguous/send-failed turns and honors strong pending-work declarations");
+ok(backgroundSource.includes("autoContinueWithoutLlm")
+    && backgroundSource.includes('status: "auto_continue_fallback_nudge"')
+    && backgroundSource.includes("shouldAutoContinueWithoutLlm"),
+  "Auto falls back to bounded Continue when the LLM provider is unavailable");
+ok(wakeSource.includes("i === 2 && hudCache?.llmConfigured !== true"),
+  "manual LLM judge is hidden when no provider is configured");
 ok(wakeSource.includes('data-testid^="conversation-turn-"')
     && wakeSource.includes("observedConversationMessageFloor")
     && wakeSource.includes("mergeMessageCountFloor")
@@ -1399,6 +1405,9 @@ ok(looksLikeSubstantiveReply(
 ok(assistantDeclaresPendingWork("当前已经定位。\n\n下一步\n\n我会继续做两件事：读取 request id，然后修最小范围。"), "explicit Chinese self-declared next work is pending");
 ok(assistantDeclaresPendingWork("Validation is not yet complete.\nNext: I will run the production smoke test."), "explicit English self-declared next work is pending");
 ok(!assistantDeclaresPendingWork("处理已经完成。下一步建议用户可以考虑补充更多监控。"), "optional next-step advice is not forced pending");
+ok(shouldAutoContinueWithoutLlm("请检查并继续", "本轮已经完成。"), "no-LLM Auto sends one bounded fallback after an ordinary turn");
+ok(!shouldAutoContinueWithoutLlm("继续", "已经全部完成。"), "bounded no-LLM Auto does not loop after its own short Continue");
+ok(shouldAutoContinueWithoutLlm("继续", "当前已经定位。\n\n下一步\n\n我会继续做剩余测试。"), "bounded no-LLM Auto chains only on explicit pending work");
 ok(assistantNudgeFingerprint("abc") === assistantNudgeFingerprint("abc"), "fp stable");
 ok(assistantNudgeFingerprint("abc") !== assistantNudgeFingerprint("abd"), "fp differs");
 ok(parseLlmSkipKeywords("").includes("好的"), "empty skip → built-in");
