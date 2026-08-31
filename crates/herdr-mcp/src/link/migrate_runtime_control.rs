@@ -464,7 +464,7 @@ fn health_url_from_endpoint(endpoint: &str) -> String {
     }
 }
 
-fn read_binary_version_hint(home: &Path) -> Option<String> {
+pub(crate) fn read_binary_version_hint(home: &Path) -> Option<String> {
     let binary = managed_runtime_binary(home);
     let output = std::process::Command::new(&binary)
         .arg("--version")
