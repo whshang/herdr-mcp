@@ -343,8 +343,49 @@ mod macos {
         let paths = RuntimePaths::discover()?;
         let home = home_dir()?;
         let safe_config = validate_config_root(&home, &paths.config_dir, &paths.instance)?;
-        let _ = read_installation_identity(&safe_config, &paths.instance)?;
-        Ok(())
+        // A valid existing marker is the strongest ownership evidence.
+        if read_installation_identity(&safe_config, &paths.instance)?.is_some() {
+            return Ok(());
+        }
+        // No marker: the root must be new, safely empty, or already carry
+        // verifiable herdr-mcp product evidence. A pre-existing non-empty
+        // foreign root is refused BEFORE service install writes runtime/state/
+        // logs into it, so a later product uninstall can never `remove_dir_all`
+        // unrelated content merely because a missing marker could be created.
+        match fs::symlink_metadata(&safe_config) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+                "refusing install into symlink config root {}",
+                safe_config.display()
+            )),
+            Ok(metadata) if metadata.is_dir() => {
+                if config_root_is_empty(&safe_config)?
+                    || config_root_has_product_evidence(&safe_config)
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "refusing to install into pre-existing non-empty config root {}: no verifiable herdr-mcp product evidence; use a fresh/empty config root or the default ~/.config/herdr-mcp",
+                        safe_config.display()
+                    ))
+                }
+            }
+            Ok(_) => Err(format!(
+                "config root is not a directory: {}",
+                safe_config.display()
+            )),
+            Err(error) => Err(format!(
+                "cannot inspect config root {}: {error}",
+                safe_config.display()
+            )),
+        }
+    }
+
+    fn config_root_is_empty(config_dir: &Path) -> Result<bool, String> {
+        let mut entries = fs::read_dir(config_dir).map_err(|error| {
+            format!("cannot list config root {}: {error}", config_dir.display())
+        })?;
+        Ok(entries.next().is_none())
     }
 
     pub(super) fn record_installation_identity() -> Result<(), String> {
@@ -353,6 +394,20 @@ mod macos {
         let safe_config = validate_config_root(&home, &paths.config_dir, &paths.instance)?;
         if read_installation_identity(&safe_config, &paths.instance)?.is_some() {
             return Ok(());
+        }
+        // Ownership must be established from verifiable product evidence, not
+        // merely by writing a marker into an arbitrary pre-existing directory.
+        // A config root that already exists and is non-empty is only claimable
+        // when it already carries herdr-mcp-owned artifacts (the service install
+        // just wrote them). A brand-new or empty root is safe to claim. Any
+        // other pre-existing non-empty directory is refused so a later product
+        // uninstall can never `remove_dir_all` unrelated content merely because
+        // a missing marker could be created there.
+        if path_present(&safe_config) && !config_root_has_product_evidence(&safe_config) {
+            return Err(format!(
+                "refusing to record installation identity in pre-existing non-empty config root {}: no verifiable herdr-mcp product evidence; use a fresh/empty config root or the default ~/.config/herdr-mcp",
+                safe_config.display()
+            ));
         }
         fs::create_dir_all(&safe_config).map_err(|error| {
             format!(
@@ -374,6 +429,23 @@ mod macos {
         let bytes = serde_json::to_vec_pretty(&identity)
             .map_err(|error| format!("cannot encode installation identity: {error}"))?;
         write_private_atomic(&safe_config.join(INSTALL_IDENTITY_NAME), &bytes)
+    }
+
+    /// Verifiable herdr-mcp product evidence inside a config root. A marker file
+    /// alone is never enough; the root must already carry artifacts the service
+    /// install writes (runtime generations/current, state db, server log, or the
+    /// service mutation lock).
+    fn config_root_has_product_evidence(config_dir: &Path) -> bool {
+        let runtime_current = config_dir.join("runtime/current");
+        if fs::symlink_metadata(&runtime_current).is_ok() {
+            return true;
+        }
+        for owned in ["state.db", "server.log", "service-mutation.lock", "runtime"] {
+            if path_present(&config_dir.join(owned)) {
+                return true;
+            }
+        }
+        false
     }
 
     fn read_installation_identity(
@@ -1928,6 +2000,153 @@ mod macos {
             assert!(
                 read_installation_identity(&config, &InstanceId::parse("uat").unwrap()).is_err()
             );
+            let _ = fs::remove_dir_all(home);
+        }
+
+        #[test]
+        fn preflight_refuses_pre_existing_non_empty_foreign_root_before_any_write() {
+            let _guard = crate::test_env::lock();
+            let home = temp_home("marker-spoof");
+            let instance = InstanceId::default_instance();
+            let old_home = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", &home) };
+            // A pre-existing arbitrary override directory with unrelated content
+            // must be refused BEFORE service install writes any product file.
+            let foreign = home.join("state/custom-runtime");
+            fs::create_dir_all(&foreign).unwrap();
+            fs::write(foreign.join("unrelated-data.bin"), b"keep me").unwrap();
+            let previous = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+            unsafe { std::env::set_var("HERDR_MCP_CONFIG_DIR", &foreign) };
+            let paths = RuntimePaths::discover().unwrap();
+            let safe = validate_config_root(&home, &paths.config_dir, &instance).unwrap();
+            assert!(
+                preflight_installation_identity().is_err(),
+                "must refuse a pre-existing non-empty foreign root before any write"
+            );
+            // No product file or marker may have been created.
+            assert!(!safe.join(INSTALL_IDENTITY_NAME).exists());
+            assert!(!safe.join("state.db").exists());
+            assert!(!safe.join("runtime").exists());
+            assert!(foreign.join("unrelated-data.bin").exists());
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                    None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+                }
+                match old_home {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+            let _ = fs::remove_dir_all(home);
+        }
+
+        #[test]
+        fn preflight_allows_fresh_empty_and_existing_owned_roots() {
+            let _guard = crate::test_env::lock();
+            let home = temp_home("marker-fresh");
+            let old_home = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", &home) };
+            let previous = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+            // Fresh/empty root is safe to claim.
+            let fresh = home.join("state/fresh-runtime");
+            unsafe { std::env::set_var("HERDR_MCP_CONFIG_DIR", &fresh) };
+            assert!(preflight_installation_identity().is_ok());
+            // A root already carrying product evidence (a prior service install)
+            // is claimable even if it is non-empty.
+            let evidence = home.join("state/evidence-runtime");
+            fs::create_dir_all(&evidence).unwrap();
+            fs::create_dir_all(evidence.join("runtime/current")).unwrap();
+            unsafe { std::env::set_var("HERDR_MCP_CONFIG_DIR", &evidence) };
+            assert!(preflight_installation_identity().is_ok());
+            // A root with a valid existing marker is claimable. The marker's
+            // config_root is the canonicalized path (as record_installation_identity
+            // writes it), so canonicalize before writing.
+            let marked = home.join("state/marked-runtime");
+            fs::create_dir_all(&marked).unwrap();
+            let marked_canon = fs::canonicalize(&marked).unwrap();
+            let identity = InstallationIdentity {
+                schema_version: INSTALL_IDENTITY_SCHEMA,
+                instance: None,
+                config_root: marked_canon.to_string_lossy().into_owned(),
+            };
+            let bytes = serde_json::to_vec_pretty(&identity).unwrap();
+            write_private_atomic(&marked.join(INSTALL_IDENTITY_NAME), &bytes).unwrap();
+            unsafe { std::env::set_var("HERDR_MCP_CONFIG_DIR", &marked) };
+            assert!(preflight_installation_identity().is_ok());
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                    None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+                }
+                match old_home {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+            let _ = fs::remove_dir_all(home);
+        }
+
+        #[test]
+        fn record_identity_refuses_pre_existing_non_empty_foreign_root() {
+            let _guard = crate::test_env::lock();
+            let home = temp_home("marker-spoof-record");
+            let instance = InstanceId::default_instance();
+            let old_home = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", &home) };
+            let foreign = home.join("state/custom-runtime");
+            fs::create_dir_all(&foreign).unwrap();
+            fs::write(foreign.join("unrelated-data.bin"), b"keep me").unwrap();
+            let previous = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+            unsafe { std::env::set_var("HERDR_MCP_CONFIG_DIR", &foreign) };
+            let paths = RuntimePaths::discover().unwrap();
+            let safe = validate_config_root(&home, &paths.config_dir, &instance).unwrap();
+            assert!(
+                record_installation_identity().is_err(),
+                "must refuse to claim a pre-existing non-empty foreign root"
+            );
+            assert!(!safe.join(INSTALL_IDENTITY_NAME).exists());
+            assert!(foreign.join("unrelated-data.bin").exists());
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                    None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+                }
+                match old_home {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+            let _ = fs::remove_dir_all(home);
+        }
+
+        #[test]
+        fn record_identity_allows_fresh_or_product_evidence_root() {
+            let _guard = crate::test_env::lock();
+            let home = temp_home("marker-fresh-record");
+            let old_home = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", &home) };
+            let previous = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+            let fresh = home.join("state/fresh-runtime");
+            unsafe { std::env::set_var("HERDR_MCP_CONFIG_DIR", &fresh) };
+            assert!(record_installation_identity().is_ok());
+            assert!(fresh.join(INSTALL_IDENTITY_NAME).exists());
+            let evidence = home.join("state/evidence-runtime");
+            fs::create_dir_all(&evidence).unwrap();
+            fs::create_dir_all(evidence.join("runtime/current")).unwrap();
+            unsafe { std::env::set_var("HERDR_MCP_CONFIG_DIR", &evidence) };
+            assert!(record_installation_identity().is_ok());
+            assert!(evidence.join(INSTALL_IDENTITY_NAME).exists());
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                    None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+                }
+                match old_home {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
             let _ = fs::remove_dir_all(home);
         }
 
