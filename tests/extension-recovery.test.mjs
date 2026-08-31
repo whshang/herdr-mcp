@@ -146,6 +146,41 @@ test("turn mutation filter ignores tool-card and HUD churn but keeps turn change
   }]), true);
 });
 
+test("bounded message sampler preserves growth length while skipping tool subtrees", () => {
+  const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
+  const ignoredSelector = perf.DEFAULT_IGNORED_MESSAGE_TEXT_SELECTOR;
+  const text = (value) => ({ nodeType: 3, nodeValue: value, parentElement: null });
+  const element = (children = [], { ignored = false, parent = null } = {}) => {
+    const node = {
+      nodeType: 1,
+      childNodes: children,
+      parentElement: parent,
+      closest(selector) {
+        if (ignored && selector === ignoredSelector) return this;
+        return parent?.closest?.(selector) || null;
+      },
+    };
+    for (const child of children) child.parentElement = node;
+    return node;
+  };
+  const toolText = text("Z".repeat(5000));
+  const tool = element([toolText], { ignored: true });
+  const root = element([
+    text("A".repeat(700)),
+    tool,
+    text("B".repeat(700)),
+  ]);
+  const sample = perf.sampleBoundedMessageText(root, { maxChars: 1024, tailChars: 256 });
+
+  assert.equal(sample.total_chars, 1400);
+  assert.equal(sample.truncated, true);
+  assert.equal(sample.skipped_subtrees, 1);
+  assert.ok(sample.text.length <= 1024);
+  assert.ok(sample.text.startsWith("A"));
+  assert.ok(sample.text.endsWith("B".repeat(256)));
+  assert.doesNotMatch(sample.text, /Z/);
+});
+
 test("ui pressure classifier bands healthy, warning, high from bounded inputs", () => {
   const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
   const classify = perf.classifyUiPressure;
@@ -546,7 +581,9 @@ test("ChatGPT turn watcher caches latest turns and reuses settled turns for pres
   assert.match(wake, /uiPressure\?\.recordTick\(\)/);
   assert.match(wake, /recordTimerDrift\(driftMs\)/);
   assert.match(wake, /rehydrate the latest-turn cache/);
-  assert.match(wake, /let lastAsstLen = initialAssistant\.text\.length/);
+  assert.match(wake, /sampleLatestMessageText\(el\)/);
+  assert.match(wake, /let lastAsstLen = initialAssistant\.totalChars/);
+  assert.match(wake, /const curLen = currentAssistant\.totalChars/);
   assert.match(wake, /function conversationHasPendingReply\(\)/);
   assert.match(wake, /const hasPendingReply = conversationHasPendingReply/);
   assert.match(wake, /event\.isTrusted/);

@@ -23,6 +23,16 @@
     '[class*="group/tool-message"]',
     '#h2w-page-hud',
   ].join(", ");
+  const DEFAULT_MESSAGE_SAMPLE_CHARS = 64 * 1024;
+  const DEFAULT_MESSAGE_TAIL_CHARS = 16 * 1024;
+  const DEFAULT_IGNORED_MESSAGE_TEXT_SELECTOR = [
+    '[class*="group/tool-message"]',
+    '#h2w-page-hud',
+    'script',
+    'style',
+    'noscript',
+    'template',
+  ].join(", ");
 
   const DEFAULT_UI_PRESSURE_POLICY = Object.freeze({
     windowMs: UI_PRESSURE_WINDOW_MS,
@@ -146,6 +156,78 @@
       if (insideSelector(target, turnSelector) || matchesOrContains(target, turnSelector)) return true;
     }
     return false;
+  }
+
+  /**
+   * Read a bounded text sample without forcing layout. The complete text length
+   * is still counted so streaming growth remains observable after the sample is
+   * truncated. Tool/HUD/script subtrees are rejected before their text is read.
+   */
+  function sampleBoundedMessageText(root, {
+    maxChars = DEFAULT_MESSAGE_SAMPLE_CHARS,
+    tailChars = DEFAULT_MESSAGE_TAIL_CHARS,
+    ignoredSelector = DEFAULT_IGNORED_MESSAGE_TEXT_SELECTOR,
+  } = {}) {
+    if (!root) {
+      return { text: "", total_chars: 0, truncated: false, text_nodes: 0, skipped_subtrees: 0 };
+    }
+    const limit = Math.max(1024, Math.floor(Number(maxChars) || DEFAULT_MESSAGE_SAMPLE_CHARS));
+    const tailLimit = Math.min(
+      Math.floor(limit / 2),
+      Math.max(0, Math.floor(Number(tailChars) || DEFAULT_MESSAGE_TAIL_CHARS)),
+    );
+    const marker = "\n…\n";
+    const stack = [root];
+    let prefix = "";
+    let tail = "";
+    let totalChars = 0;
+    let textNodes = 0;
+    let skippedSubtrees = 0;
+
+    while (stack.length > 0) {
+      const node = stack.pop();
+      if (!node) continue;
+      if (node.nodeType === 3) {
+        const value = String(node.nodeValue || "");
+        if (!value) continue;
+        textNodes += 1;
+        totalChars += value.length;
+        if (prefix.length < limit) prefix += value.slice(0, limit - prefix.length);
+        if (tailLimit > 0) {
+          tail += value;
+          if (tail.length > tailLimit * 2) tail = tail.slice(-tailLimit);
+        }
+        continue;
+      }
+      if (node.nodeType !== 1 && node !== root) continue;
+      const element = node.nodeType === 1 ? node : null;
+      if (element && insideSelector(element, ignoredSelector)) {
+        skippedSubtrees += 1;
+        continue;
+      }
+      const children = node.childNodes;
+      if (!children) continue;
+      for (let index = children.length - 1; index >= 0; index -= 1) stack.push(children[index]);
+    }
+
+    const truncated = totalChars > limit;
+    if (!truncated) {
+      return {
+        text: prefix.trim(),
+        total_chars: totalChars,
+        truncated: false,
+        text_nodes: textNodes,
+        skipped_subtrees: skippedSubtrees,
+      };
+    }
+    const headLimit = Math.max(0, limit - tailLimit - marker.length);
+    return {
+      text: `${prefix.slice(0, headLimit)}${marker}${tail.slice(-tailLimit)}`.trim(),
+      total_chars: totalChars,
+      truncated: true,
+      text_nodes: textNodes,
+      skipped_subtrees: skippedSubtrees,
+    };
   }
 
   /**
@@ -396,11 +478,15 @@
     DEFAULT_PERMISSION_COALESCE_MS,
     DEFAULT_TURN_MUTATION_SELECTOR,
     DEFAULT_IGNORED_TURN_MUTATION_SELECTOR,
+    DEFAULT_MESSAGE_SAMPLE_CHARS,
+    DEFAULT_MESSAGE_TAIL_CHARS,
+    DEFAULT_IGNORED_MESSAGE_TEXT_SELECTOR,
     UI_PRESSURE_WINDOW_MS,
     DEFAULT_UI_PRESSURE_POLICY,
     DEFAULT_PAGE_HEALTH_POLICY,
     createCoalescedScheduler,
     mutationTouchesConversationTurns,
+    sampleBoundedMessageText,
     createUiPressureMeter,
     classifyUiPressure,
     classifyMemoryPressure,
