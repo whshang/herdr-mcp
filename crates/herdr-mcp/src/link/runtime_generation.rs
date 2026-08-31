@@ -407,6 +407,8 @@ impl RuntimeGenerationManager {
             }
             if !validation.ok {
                 let _ = inner.fence.mark_rejected_if_idle(generation);
+            } else {
+                let _ = inner.fence.restore_standby_if_rejected(generation);
             }
         }
         validation

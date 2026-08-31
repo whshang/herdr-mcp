@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEV_VERSION: &str = "0.4.3-dev";
+const DEV_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-dev");
 const STATE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -234,10 +234,11 @@ fn run_unix(
     }
 
     let sequence = NEXT_EXEC.fetch_add(1, Ordering::Relaxed);
+    let exec_id = format!("utility-{}-{sequence}", std::process::id());
     let marker = format!("__HM_EXEC_RUST_{}_{}_EXIT_", std::process::id(), sequence);
     let exec_shell = resolve_exec_shell();
     let script_path = temp_script_path(sequence);
-    let script_body = build_utility_exec_script(&exec_shell, effective_root, command);
+    let script_body = build_utility_exec_script(&exec_shell, effective_root, command, &exec_id);
     if let Err(error) = write_executable_script(&script_path, &script_body) {
         return json!({
             "ok": false,
@@ -761,10 +762,20 @@ fn finite_pid(value: Option<&Value>) -> Option<u64> {
 }
 
 #[cfg(unix)]
-fn build_utility_exec_script(exec_shell: &Path, cwd: &Path, command: &str) -> String {
+fn build_utility_exec_script(
+    exec_shell: &Path,
+    cwd: &Path,
+    command: &str,
+    exec_id: &str,
+) -> String {
     [
         format!("#!{}", exec_shell.display()),
         "set +e".to_owned(),
+        // Visible utility-pane commands are Herdr-managed executions just like
+        // native exec sessions. Preserve that identity in the child process so
+        // service/dev lifecycle guards cannot be bypassed by running a mutation
+        // through herdr_exec and severing the control path that submitted it.
+        format!("export HERDR_MCP_EXEC_ID={}", shell_quote(exec_id)),
         "export PAGER=cat".to_owned(),
         "export GIT_PAGER=cat".to_owned(),
         "export GH_PAGER=cat".to_owned(),
@@ -989,12 +1000,13 @@ fn local_fallback(
 #[cfg(unix)]
 fn run_local_shell(command: &str, cwd: &Path, timeout_ms: u64, max_bytes: usize) -> LocalResult {
     let sequence = NEXT_EXEC.fetch_add(1, Ordering::Relaxed);
+    let exec_id = format!("local-{}-{sequence}", std::process::id());
     let shell = resolve_exec_shell();
     let script_path = env::temp_dir().join(format!(
         "herdr-mcp-local-{}-{sequence}.sh",
         std::process::id()
     ));
-    let body = build_utility_exec_script(&shell, cwd, command);
+    let body = build_utility_exec_script(&shell, cwd, command, &exec_id);
     if write_executable_script(&script_path, &body).is_err() {
         return LocalResult {
             exit_code: None,
@@ -1291,7 +1303,9 @@ mod tests {
                 Path::new("/bin/sh"),
                 Path::new("/tmp/a'b"),
                 "git log -1",
+                "utility-test-1",
             );
+            assert!(script.contains("export HERDR_MCP_EXEC_ID='utility-test-1'"));
             assert!(script.contains("export GIT_PAGER=cat"));
             assert!(script.contains("export GH_PAGER=cat"));
             assert!(script.contains("trap 'rm -f -- \"$0\"' EXIT"));
@@ -1327,6 +1341,23 @@ mod tests {
         ));
         assert!(is_control_plane_taskgroup("ExceptionGroup: boom"));
         assert!(!is_control_plane_taskgroup("ordinary command timeout"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_fallback_marks_managed_execution() {
+        let result = local_fallback(
+            "printf '%s' \"$HERDR_MCP_EXEC_ID\"",
+            Path::new("/tmp"),
+            "w1",
+            5_000,
+            "test",
+            &[],
+            None,
+        );
+        assert_eq!(result["ok"], true);
+        let output = result["output"].as_str().expect("fallback output");
+        assert!(output.starts_with("local-"), "unexpected exec id: {output}");
     }
 
     #[cfg(unix)]

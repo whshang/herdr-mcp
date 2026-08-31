@@ -37,5 +37,5 @@ test("worker routes MCP server card before the generic /.well-known fallback", a
   const body = await response.json();
   assert.equal(body.serverUrl, `${issuer}/mcp`);
   assert.equal(body.name, "herdr-mcp");
-  assert.equal(body.version, "0.3.32");
+  assert.equal(body.version, "0.4.3");
 });
