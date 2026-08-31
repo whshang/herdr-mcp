@@ -179,7 +179,7 @@ Preferred release flow:
 6. On failure it must preserve or restore the prior stable generation and plist. Never change DNS, OAuth identity, Edge contract epoch or public hostname as part of a local runtime update.
 7. After any update, verify from the **same remote Connector** that `herdr_inspect` reports the expected runtime version and that Edge status converges to the new generation/version.
 
-For development of an uncommitted working tree, `herdr-self-update apply --source working-tree` may stage the current tree into an isolated release directory. For normal unattended upgrades use the committed remote source (`--source remote --ref main` or a release/tag).
+Keep runtime **DEV / PROD** distinct. On a maintainer workstation, use `herdr-mcp dev sync` from the intended repo/worktree to compile and activate a source-dogfood DEV generation. It refuses a dirty checkout unless `--allow-dirty` is explicit, pins the current PROD binary before activation, and reuses the transactional service + production-Link generation reconcile path; it never deploys Edge/DNS/OAuth. Use `herdr-mcp dev status` to verify channel/source/generation evidence and `herdr-mcp dev rollback` to return to the pinned PROD binary. Do not call a repo build PROD merely because it is running on port 8772. For ordinary release upgrades, keep using the published/verified PROD update path rather than DEV sync.
 
 ## 6. Control-plane outage recovery
 

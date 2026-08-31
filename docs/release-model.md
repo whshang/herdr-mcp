@@ -12,6 +12,17 @@ This document is the long-lived contributor SSOT for Herdr release boundaries. I
 
 Runtime and browser-extension semver are independent. An extension-only change does not require a runtime version bump, and runtime GitHub Releases do not silently own or bundle the browser-extension lifecycle.
 
+### Runtime DEV / PROD channels
+
+Runtime installation has exactly two persistent planes:
+
+- **PROD** — the ordinary installed runtime originating from a published/verified release artifact.
+- **DEV** — an explicit source-dogfood runtime built from a repository/worktree and activated as a managed generation for maintainer testing.
+
+`herdr-mcp dev sync` is the only normal source-development path that may deliberately move the default workstation from PROD to a repo-built DEV generation. It embeds DEV build provenance, pins the pre-existing PROD binary and checksum before activation, and reuses the same transactional service/Link generation lifecycle as PROD. `herdr-mcp dev rollback` returns to that pinned PROD binary; repeated DEV builds do not redefine PROD as "the previous DEV". `herdr-mcp dev status` is read-only and exposes channel/generation/provenance state.
+
+DEV/PROD are runtime planes, not browser-extension identities. Browser extension DEV/STANDALONE/STORE remains a separate release plane. Candidate/UAT processes are disposable validation resources, not a third installed runtime channel.
+
 ## Runtime publication
 
 - `.github/workflows/rust-release.yml` is the runtime release workflow.
@@ -54,6 +65,7 @@ An Edge deployment is an operator action independent of Runtime Release publicat
 | Build artifact | `target/*/herdr-mcp` | installed generation |
 | Installed generation | `~/.config/herdr-mcp/runtime/generations/rust-*` | repository build output |
 | Active runtime | `~/.config/herdr-mcp/runtime/current/herdr-mcp` | Git `HEAD` |
+| Pinned PROD recovery binary | `~/.config/herdr-mcp/runtime/channels/prod/herdr-mcp` | previous DEV generation |
 | User CLI | `~/.local/bin/herdr-mcp` → `runtime/current` | repository wrapper scripts |
 
 ## Release discipline
