@@ -1,6 +1,6 @@
 # 安装：从一台 Herdr 工作站到可用的 Web AI 开发环境
 
-> **定位：人工/运维参考。** herdr-mcp 的主安装协议直接写给执行 Agent，见 [快速 Agent 安装](quick-agent-install.md) 和 [Agent 安装合同](agent-install.md)。本页用于人工检查、排障或需要理解每个阶段时查阅，不再提供“复制一段提示词给某个 Coding Agent”的入口。
+> **定位：人工/运维参考。** herdr-mcp 的主安装协议直接写给执行 Agent，见 [Agent 安装](agent-install.md) 和 [Agent 安装合同](agent-install.md)。本页用于人工检查、排障或需要理解每个阶段时查阅，不再提供“复制一段提示词给某个 Coding Agent”的入口。
 
 目标是把一台本地工作站接到 ChatGPT / Web AI，同时保持代码和真实执行环境留在自己的机器上。
 
@@ -66,7 +66,7 @@ herdr-mcp status
 
 如果 ChatGPT 需要从公网访问工作站，使用 Cloudflare Worker 提供稳定 OAuth/MCP 入口。首次安装优先 `workers.dev`，除非你明确需要自有域名。
 
-自动化安装时由 Agent 按 [快速 Agent 安装](quick-agent-install.md) / [Agent 安装合同](agent-install.md) 直接执行这段；协议负责 Token 最小权限、Worker 命名、secret 注入、Account 选择和网络 blocker 的处理边界。
+自动化安装时由 Agent 按 [Agent 安装](agent-install.md) / [Agent 安装合同](agent-install.md) 直接执行这段；协议负责 Token 最小权限、Worker 命名、secret 注入、Account 选择和网络 blocker 的处理边界。
 
 手动执行时，至少遵守：
 
@@ -168,7 +168,7 @@ herdr-mcp native-host status
 
 ## 自动化执行入口
 
-需要自动完成安装时，执行 Agent 直接读取 [快速 Agent 安装](quick-agent-install.md)；需要完整权限、安全和异常边界时读取 [Agent 安装合同](agent-install.md)。
+需要自动完成安装时，执行 Agent 直接读取 [Agent 安装](agent-install.md)；需要完整权限、安全和异常边界时读取 [Agent 安装合同](agent-install.md)。
 
 更深入的内容按需查看：
 

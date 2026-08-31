@@ -1,6 +1,6 @@
 # Agent installation contract and `workers.dev` deployment
 
-> **Executor: Agent.** This is the detailed ordinary-workstation installation contract. [Quick agent install](quick-agent-install.md) is the concise form of the same contract; [Installation reference](install.md) is for manual/operator lookup.
+> **Executor: Agent.** This is the authoritative ordinary-workstation installation contract. It incorporates the former quick-install flow and the detailed security/operations contract. [Installation reference](install.md) is for manual/operator lookup.
 
 The Agent reads and executes this page directly; the human does not need to wrap it in another product-specific prompt. Human participation is limited to actions that genuinely require personal authorization or choice, such as Cloudflare sign-in/API Token creation, an account choice that cannot be inferred safely, and ChatGPT Connector/OAuth. The Agent owns environment checks, published Release installation, Cloudflare Worker deployment, the outbound WSS Link, optional extension-channel selection, and verification.
 
@@ -18,9 +18,22 @@ The Agent reads and executes this page directly; the human does not need to wrap
 
 ## 1. Prerequisites
 
-Run `herdr --version` and `herdr api schema >/dev/null`. Require a working `herdr` binary and the Herdr socket (default `~/.config/herdr/herdr.sock`, or an explicit `HERDR_SOCKET_PATH`). If Herdr itself is not installed/running, stop and direct the user to <https://herdr.dev>; herdr-mcp does not replace Herdr.
+Run `herdr --version` and `herdr api schema >/dev/null`. Require a working `herdr` binary and the Herdr socket (default `~/.config/herdr/herdr.sock`, or an explicit `HERDR_SOCKET_PATH`). If Herdr is missing, install the official stable build directly:
+
+```bash
+curl -fsSL https://herdr.dev/install.sh | sh
+```
+
+On Windows use `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"`. Re-run the checks afterward. If Herdr still does not become healthy, stop and report the blocker; herdr-mcp does not replace Herdr.
 
 Node.js is required only for temporary Cloudflare Worker bootstrap (`npx wrangler`) and optional contributor tooling. It is **not** required to run the local MCP runtime.
+Canonical public MCP URL examples:
+
+```text
+https://herdr-edge-device.username.workers.dev/mcp
+https://herdr-mcp.example.com/mcp
+```
+
 
 ## 2. Install the native runtime from GitHub Releases (primary)
 
@@ -125,7 +138,7 @@ Browser extension / Native Messaging remains optional and is not required for th
 - STANDALONE: v0.4.3+ GitHub/manual fixed-identity package, used when Store installation is unavailable or the user explicitly requests independent distribution.
 - DEV: source development only, loaded unpacked from a repo/worktree `extension/` directory with a path-derived ID.
 
-The Agent must inspect what the installed runtime actually supports. v0.4.2 has Store/DEV ownership only; do not invent standalone support. After selecting/installing a supported channel, run:
+The Agent must inspect what the installed runtime actually supports. v0.4.2 has Store/DEV ownership only; do not invent standalone support. STANDALONE is a source-development-independent distribution channel, while DEV remains source-development only. On runtimes that expose it, select STANDALONE explicitly with `herdr-mcp native-host use standalone`. After selecting/installing a supported channel, run:
 
 ```bash
 herdr-mcp native-host status
@@ -137,7 +150,7 @@ Status should identify the expected active channel/extension identity and confir
 
 Store `LINK_SHARED_SECRET` in Keychain under `herdr-edge-link-<WORKSTATION_ID>`. The command text must reference the environment variable rather than a literal secret. Prefer the managed Link install path exposed by the installed `herdr-mcp` binary (`herdr-mcp link ...` / current stable product docs). Do not leave production Link ownership on a repository Bash wrapper.
 
-The Link can reuse proxy settings that already exist in the user's environment. Recognition precedence is `HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`; macOS also reads the existing `scutil --proxy` state. If the selected origin is still unreachable, stop and ask the user before changing any proxy, network node, system proxy, DNS/custom-domain choice, or other connectivity setting. See [Quick agent install](quick-agent-install.md) §5.
+The Link can reuse proxy settings that already exist in the user's environment. Recognition precedence is `HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`; macOS also reads the existing `scutil --proxy` state. If the selected origin is still unreachable, stop and ask the user before changing any proxy, network node, system proxy, DNS/custom-domain choice, or other connectivity setting. See [this Agent installation protocol](agent-install.md) §5.
 
 ## 9. Verify the closed loop
 

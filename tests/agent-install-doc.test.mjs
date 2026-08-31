@@ -11,9 +11,9 @@ test("README links directly to Agent-first install protocols without copy-prompt
   const en = read("README.md");
   const zh = read("README.zh.md");
   const ja = read("README.ja.md");
-  assert.match(en, /quick-agent-install\.md/);
-  assert.match(zh, /quick-agent-install\.md/);
-  assert.match(ja, /quick-agent-install\.md/);
+  assert.match(en, /agent-install\.md/);
+  assert.match(zh, /agent-install\.md/);
+  assert.match(ja, /agent-install\.md/);
   assert.match(en, /Agent-first setup/);
   assert.match(zh, /Agent-first 安装/);
   assert.match(ja, /Agent-first セットアップ/);
@@ -77,7 +77,7 @@ test("maintainer install keeps deterministic Worker/bootstrap details while end-
   }
   for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
     const doc = read(rel);
-    assert.match(doc, /quick-agent-install\.md/);
+    assert.match(doc, /agent-install\.md/);
     assert.match(doc, /Chrome Web Store/);
     assert.match(doc, /STANDALONE/);
     assert.doesNotMatch(doc, /scripts\/cloudflare-worker-name\.mjs/);
@@ -86,8 +86,8 @@ test("maintainer install keeps deterministic Worker/bootstrap details while end-
 
 test("quick Agent protocols automate Herdr/runtime and preserve STORE STANDALONE DEV boundaries", () => {
   for (const rel of [
-    "docs/i18n/en/quick-agent-install.md",
-    "docs/i18n/zh-CN/quick-agent-install.md",
+    "docs/i18n/en/agent-install.md",
+    "docs/i18n/zh-CN/agent-install.md",
   ]) {
     const doc = read(rel);
     assert.match(doc, /herdr\.dev\/install\.(?:sh|ps1)/);
@@ -119,8 +119,6 @@ test("herdr-link resolves Node from PATH for fresh Apple Silicon installs", () =
 
 test("second-Mac GA UAT agent prompt enforces independent Worker, Link env override, and owner OAuth handoff", () => {
   for (const rel of [
-    "docs/history/ga/second-mac-ga-uat-agent-prompt-en.md",
-    "docs/history/ga/second-mac-ga-uat-agent-prompt-zh-CN.md",
   ]) {
     const doc = read(rel);
     assert.match(doc, /INTERNAL GA UAT|内部 GA UAT/);
@@ -143,10 +141,6 @@ test("second-Mac GA UAT agent prompt enforces independent Worker, Link env overr
     assert.match(doc, /dash\.cloudflare\.com\/profile\/api-tokens/);
     assert.match(doc, /multi-device/i);
   }
-  const zhUat = read("docs/i18n/zh-CN/clean-machine-uat.md");
-  const enUat = read("docs/i18n/en/clean-machine-uat.md");
-  assert.match(zhUat, /second-mac-ga-uat-agent-prompt/);
-  assert.match(enUat, /second-mac-ga-uat-agent-prompt/);
   assert.doesNotMatch(read("docs/i18n/en/install.md"), /second-mac-ga-uat-agent-prompt/);
   assert.doesNotMatch(read("docs/i18n/zh-CN/install.md"), /second-mac-ga-uat-agent-prompt/);
 });

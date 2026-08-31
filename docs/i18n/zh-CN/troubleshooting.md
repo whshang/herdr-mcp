@@ -209,7 +209,7 @@ Control Center 的`发送指令`会走本地可信控制链真实执行；`调�
 
 如果自动恢复没有证据可用，可以人工刷新后用 HUD 的 **herdr监控** 先重新获取本地状态，再继续。
 
-详见 [自动继续、恢复与接力](extension-wake.md)。
+详见 [自动继续、恢复与接力](browser-continuity.md)。
 
 ## 症状：ChatGPT “排队”后没有立即发送，或排队内容还留着
 
@@ -251,7 +251,7 @@ Control Center 的`发送指令`会走本地可信控制链真实执行；`调�
 - bridge round 是否有工具结果回填；
 - 页面刷新后是否仍保留足够 bridge context 进行恢复。
 
-不要把内部 tool-call JSON 当作最终自然语言答案。详见 [JSON → MCP Bridge](extension-bridge.md)。
+不要把内部 tool-call JSON 当作最终自然语言答案。详见 [JSON → MCP Bridge](extension.md)。
 
 ## 症状：Chrome 提示“设备上的应用”/loopback 权限
 

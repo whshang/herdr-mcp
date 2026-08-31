@@ -89,15 +89,13 @@ test("quick-start runtime section rejects Node runtime and service install prima
   }
 });
 
-test("G20 archived notes keep the known CLI FAIL list for remaining mismatches", () => {
-  const wip = read("docs/history/ga/g20-command-contract.md");
-  assert.match(wip, /G1 debt/);
-  assert.match(wip, /herdr-mcp start/);
-  assert.match(wip, /herdr-mcp watchdog/);
-  assert.match(wip, /herdr-mcp lang/);
-  assert.match(wip, /herdr-mcp connector/);
-  assert.match(wip, /cli-reference\.md/);
-  assert.match(wip, /agent-install\.md/);
+test("release model keeps publication and ownership boundaries explicit", () => {
+  const model = read("docs/release-model.md");
+  assert.match(model, /workflow_dispatch/);
+  assert.match(model, /tag push/i);
+  assert.match(model, /STORE/);
+  assert.match(model, /STANDALONE/);
+  assert.match(model, /DEV/);
 });
 
 test("README continuity path stays no-ID and fail-closed across languages", () => {

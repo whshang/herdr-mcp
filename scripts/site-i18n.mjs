@@ -19,7 +19,7 @@ export const LOCALE_NAMES = { en: "English", "zh-CN": "简体中文" };
 // locale. Maintainer-only references remain discoverable but are deliberately
 // excluded from the ordinary next/previous reading flow below.
 export const DOC_ORDER = [
-  "quick-agent-install",
+  "agent-install",
   "overview",
   "install",
   "chatgpt-connector",
@@ -38,31 +38,19 @@ export const DOC_ORDER = [
   "troubleshooting",
   "design-philosophy",
   "architecture",
-  "capability-benchmark",
-  "herdr-vs-ecosystem",
-  "remote-coding-ecosystem-research",
-  "extension-wake",
-  "extension-bridge",
-  "agent-install",
-  "clean-machine-uat",
 ];
 
-export const MAINTAINER_DOCS = [
-  "extension-wake",
-  "extension-bridge",
-  "agent-install",
-  "clean-machine-uat",
-];
+export const MAINTAINER_DOCS = [];
 
 export const READING_ORDER = DOC_ORDER.filter((slug) => !MAINTAINER_DOCS.includes(slug));
 
 // Group membership is keyed by logical slug only; labels are translated in UI.
 export const NAV_GROUPS = [
-  { slugs: ["quick-agent-install", "overview", "install", "chatgpt-connector", "quick-start"] },
+  { slugs: ["agent-install", "overview", "install", "chatgpt-connector", "quick-start"] },
   { slugs: ["best-practices", "automation", "cli-reference"] },
   { slugs: ["browser-continuity", "extension", "browser-control-center", "privacy"] },
   { slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade", "worker-fallbacks", "troubleshooting"] },
-  { slugs: ["design-philosophy", "architecture", "capability-benchmark", "herdr-vs-ecosystem", "remote-coding-ecosystem-research"] },
+  { slugs: ["design-philosophy", "architecture"] },
   { slugs: MAINTAINER_DOCS, secondary: true },
 ];
 
@@ -139,8 +127,8 @@ export const UI = {
     agentIntroTitle: "最快方式：让 Coding Agent 直接安装",
     agentIntroLead: "把下面提示词交给本地 Coding Agent。它应该先读完整安装协议，再自动执行能够自动化的步骤。",
     agentPrompt:
-      "请帮我安装并配置 Herdr 和 herdr-mcp，请先完整阅读并严格按照这个指引执行：https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/quick-agent-install.md 。herdr-mcp 本机 runtime 使用 GitHub Releases，不用 git clone。只在 Cloudflare 登录/创建 API Token，以及 ChatGPT 添加 herdr Connector/插件这两类需要我本人操作的步骤暂停并指导我，其余步骤请自动完成并验证。",
-    agentSkillLink: "阅读完整快速 Agent 安装协议",
+      "请帮我安装并配置 Herdr 和 herdr-mcp，请先完整阅读并严格按照这个指引执行：https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md 。herdr-mcp 本机 runtime 使用 GitHub Releases，不用 git clone。只在 Cloudflare 登录/创建 API Token，以及 ChatGPT 添加 herdr Connector/插件这两类需要我本人操作的步骤暂停并指导我，其余步骤请自动完成并验证。",
+    agentSkillLink: "阅读完整 Agent 安装协议",
     homeWillDoTitle: "Coding Agent 会做什么",
     homeWillDoLead: "它负责自动化安装、部署和验证；只有必须由你本人完成的身份授权才停下来。",
     homeWillDoHerdr: "检查或安装 Herdr，并从 GitHub Releases 安装稳定 herdr-mcp。",
@@ -235,7 +223,7 @@ export const UI = {
     agentIntroLead:
       "Give this prompt to your local coding agent. It should read the complete install protocol first, then automate everything that does not require you personally.",
     agentPrompt:
-      "Install and configure Herdr and herdr-mcp for me. First read and follow this guide end to end: https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/quick-agent-install.md . Install the local herdr-mcp runtime from GitHub Releases, not from a git clone. Pause only when I personally need to sign in/create a Cloudflare API Token, or when I need to add the herdr Connector/app in ChatGPT. Automate and verify everything else.",
+      "Install and configure Herdr and herdr-mcp for me. First read and follow this guide end to end: https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md . Install the local herdr-mcp runtime from GitHub Releases, not from a git clone. Pause only when I personally need to sign in/create a Cloudflare API Token, or when I need to add the herdr Connector/app in ChatGPT. Automate and verify everything else.",
     agentSkillLink: "Read the complete quick agent install protocol",
     homeWillDoTitle: "What the coding agent will do",
     homeWillDoLead: "It automates install, deployment, and verification, pausing only for identity steps that require you personally.",

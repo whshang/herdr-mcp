@@ -1,7 +1,7 @@
 # Quick start: experience the first real remote development loop
 
 > **Role:** this page is what to do **after** installation to prove the first useful remote task. It is not another installation tutorial.
-> - Give a Coding Agent the authoritative install protocol: [Quick agent install](quick-agent-install.md).
+> - Give a Coding Agent the authoritative install protocol: [Agent install](agent-install.md).
 > - Install manually: [Installation](install.md).
 >
 > For the architecture, read [Overview](overview.md) and [Architecture](architecture.md).
@@ -219,7 +219,7 @@ Then enable Auto where appropriate.
 
 Manual handoff, where supported, can be started with Auto on or off. During transfer, automatic wakes from the source pause and the target conversation inherits the source Auto state. In the same bound ChatGPT Project, a user who manually opens a fresh conversation can simply say “continue” / “resume” without providing an internal continuity ID; Herdr searches durable continuity and asks for confirmation if stable identity is ambiguous.
 
-See [Browser continuity](browser-continuity.md), [Browser Control Center](browser-control-center.md), and [Wake, recovery and handoff](extension-wake.md).
+See [Browser continuity](browser-continuity.md), [Browser Control Center](browser-control-center.md), and [Wake, recovery and handoff](browser-continuity.md).
 
 ## Three supported usage routes
 
@@ -239,7 +239,7 @@ For sites such as z.ai / DeepSeek that do not provide the same native custom MCP
 Web page → extension → Native Messaging → local MCP
 ```
 
-See [JSON → MCP bridge](extension-bridge.md).
+See [JSON → MCP bridge](extension.md).
 
 ### Local MCP client only
 

@@ -33,8 +33,8 @@ function matches(text, regex) {
 
 // First document the docs entries land on; short (sidebar-safe) titles.
 const FIRST_SLUG = DOC_ORDER[0];
-const EN_TITLE = "Quick Agent installation protocol";
-const ZH_TITLE = "快速 Agent 安装协议";
+const EN_TITLE = "Agent installation contract and workers.dev deployment";
+const ZH_TITLE = "Agent 安装合同与 workers.dev 部署";
 
 test("documentation site build publishes every logical doc x 2 locales under locale-aware URLs", async () => {
   await rm(OUT, { recursive: true, force: true });
@@ -109,7 +109,7 @@ test("each locale docs entry is a real user-first homepage", async () => {
     assert.match(entry, /data-search-open/);
     assert.match(entry, /data-search-dialog/);
     assert.match(entry, /data-copy-code/);
-    assert.match(entry, /href="\.\/quick-agent-install\.html"/);
+    assert.match(entry, /href="\.\/agent-install\.html"/);
     assert.match(entry, /href="\.\/install\.html"/);
     assert.match(entry, /href="\.\/overview\.html"/);
     assert.match(entry, /href="\.\/extension\.html"/);
@@ -354,7 +354,7 @@ test("release.json, skill artifact and design invariants are preserved", async (
   assert.match(home, /<html lang="en">/);
   assert.match(home, /rel="icon" type="image\/png" href="\.\/favicon\.png"/);
   assert.match(home, /herdr-docs-lang/, "homepage must route zh browsers to the zh mirror");
-  assert.match(home, /href="\.\/docs\/en\/quick-agent-install\.html"/, "homepage must make agent-assisted install the primary path");
+  assert.match(home, /href="\.\/docs\/en\/agent-install\.html"/, "homepage must make agent-assisted install the primary path");
   assert.match(home, /href="\.\/docs\/en\/install\.html"/, "homepage must keep manual install as a secondary path");
   assert.match(home, /href="\.\/docs\/en\/overview\.html"/, "homepage must keep a product overview link");
   assert.match(home, /href="\.\/docs\/en\/extension\.html"/, "homepage must expose the optional browser extension");
@@ -375,7 +375,7 @@ test("release.json, skill artifact and design invariants are preserved", async (
   assert.match(homeZh, /rel="icon" type="image\/png" href="\.\.\/favicon\.png"/);
   assert.ok(matches(homeZh, /\.\.\/docs\/zh-CN\//g).length >= 5, "zh homepage docs links all point at zh-CN docs");
   assert.doesNotMatch(homeZh, /href="\.\.\/docs\/"/, "zh homepage must not link the bare (English) docs entry");
-  assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/quick-agent-install\.html"/);
+  assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/agent-install\.html"/);
   assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/install\.html"/);
   assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/privacy\.html"/);
   assert.match(homeZh, /href="\.\.\/docs\/zh-CN\/extension\.html"/);

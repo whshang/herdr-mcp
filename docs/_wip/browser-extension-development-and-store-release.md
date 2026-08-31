@@ -691,7 +691,6 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 - [x] User Data / Limited Use disclosures 已填写并保存；
 - [x] remote executable code audit：Store 声明 `No`，可执行 JS 全部随扩展打包；
 - [x] extension package deterministic；
-- [x] unpacked 真实浏览器 smoke PASS：Chrome for Testing `152.0.7977.64` mac-arm64 真实加载 `0.1.76`，Dev ID=`dklcamincneeijhcelpkdbcekfemldii`，service worker / Control Center / Native owner identity 均 PASS；证据 [`history/v0.4.2/browser-extension-cft-uat-20260829.json`](../history/v0.4.2/browser-extension-cft-uat-20260829.json)；
 - [ ] Store-ID build + Native Host real smoke PASS —— **BLOCKED**：待审核中的 Unlisted `0.1.75` 尚未确认可从真实 Store item 安装；不得用 unpacked/CfT smoke 冒充 Store-ID smoke；
 - [ ] toolbar action → Side Panel、active-tab Current page、single-path binding/handoff、compact HUD、Queued Insert **真实 provider-page smoke** PASS；自动化已覆盖 Control Plane/owner/handoff/queue，但还不替代真实页面交互；
 - [ ] ChatGPT / Claude / z.ai / DeepSeek 真实支持矩阵重新验证；
@@ -762,12 +761,11 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 - `docs/i18n/zh-CN/extension.md`
 - `docs/i18n/zh-CN/browser-control-center.md`
 - `docs/i18n/zh-CN/browser-continuity.md`
-- `docs/i18n/zh-CN/extension-bridge.md`
-- `docs/i18n/zh-CN/extension-wake.md`
+- `docs/i18n/zh-CN/extension.md`
+- `docs/i18n/zh-CN/browser-continuity.md`
 - `docs/i18n/zh-CN/agent-install.md`
 - `docs/i18n/zh-CN/troubleshooting.md`
 - `AGENTS.md`
-- `docs/ga-release-gate.md`
 
 本文只负责开发期与未来 Store release planning。正式发布后，应把稳定安装方式同步到用户文档，而不是让用户长期依赖本 WIP 文档。
 

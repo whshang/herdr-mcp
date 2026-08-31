@@ -280,5 +280,4 @@ Runtime A/B 把“ChatGPT 连哪里”和“当前跑哪个本地版本”分开
 - 想理解 ChatGPT 公网连接：[ChatGPT Connector](chatgpt-connector.md)
 - 想理解网页为何能自己继续：[浏览器扩展](extension.md)
 - 想维护本机版本：[Runtime A/B 自升级](runtime-self-upgrade.md)
-- 想看工具能力取舍：[能力基准与设计取舍](capability-benchmark.md)
 - 遇到异常：[故障排查](troubleshooting.md)

@@ -1,6 +1,6 @@
 # Agent 安装合同与 `workers.dev` 部署
 
-> **执行角色：Agent。** 本页是 herdr-mcp 普通工作站安装的详细执行合同；[快速 Agent 安装](quick-agent-install.md) 是同一合同的精简版，[安装参考](install.md) 只用于人工/运维查阅。
+> **执行角色：Agent。** 本页是 herdr-mcp 普通工作站安装的唯一权威执行合同，包含精简上线路径、安全边界、Cloudflare 部署、Link、浏览器扩展通道选择与验证。[安装参考](install.md) 只用于人工/运维查阅。
 
 Agent 直接读取并执行本文，不需要用户再把本文包装成一段“发给某个 Coding Agent”的提示词。用户只承担 Cloudflare 本人登录/API Token、无法自动判断的 Account 选择、ChatGPT Connector/OAuth 等必须本人完成的授权步骤；Agent 负责环境检查、Release 二进制安装、Cloudflare Worker、出站 WSS Link、可选浏览器扩展通道选择与验证。
 
@@ -20,7 +20,17 @@ Agent 直接读取并执行本文，不需要用户再把本文包装成一段�
 
 运行 `herdr --version` 与 `herdr api schema >/dev/null`。需要可用的 `herdr` 与 Herdr socket（默认 `~/.config/herdr/herdr.sock`，或显式 `HERDR_SOCKET_PATH`）。若 Herdr 本身未安装/未运行，停下来并引导用户到 <https://herdr.dev>；herdr-mcp 不替代 Herdr。
 
+如果 Herdr 缺失，Agent 直接安装官方稳定版：
+
+```bash
+curl -fsSL https://herdr.dev/install.sh | sh
+```
+
+Windows 使用 `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"`。安装后重新检查健康状态。
+
 Node.js 只用于临时 Cloudflare Worker 引导（`npx wrangler`）和可选贡献者工具链，**不是**运行本机 MCP runtime 的依赖。
+
+规范公网 MCP URL 示例：`https://herdr-edge-device.username.workers.dev/mcp` 与 `https://herdr-mcp.example.com/mcp`。
 
 ## 2. 从 GitHub Releases 安装原生 runtime（主路径）
 
@@ -125,7 +135,7 @@ herdr-mcp doctor
 - STANDALONE：v0.4.3+ 的 GitHub/手动固定身份 package；Store 不可用或用户明确要求独立分发时使用。
 - DEV：仅源码开发，Load unpacked repo/worktree `extension/`，ID 路径派生。
 
-Agent 必须先读取当前 runtime 实际支持的 `native-host` 命令；v0.4.2 只有 Store/DEV，不得虚构 standalone。选择并安装通道后执行：
+Agent 必须先读取当前 runtime 实际支持的 `native-host` 命令；v0.4.2 只有 Store/DEV，不得虚构 standalone。STANDALONE 是独立于源码开发的分发通道，DEV 仍仅用于源码开发。支持该能力的 runtime 使用 `herdr-mcp native-host use standalone` 显式切换。选择并安装通道后执行：
 
 ```bash
 herdr-mcp native-host status
@@ -137,7 +147,7 @@ herdr-mcp native-host status
 
 把 `LINK_SHARED_SECRET` 存进 Keychain，服务名 `herdr-edge-link-<WORKSTATION_ID>`。命令文本只能引用环境变量，不能写字面秘密。优先使用已安装 `herdr-mcp` 二进制提供的托管 Link 安装路径（`herdr-mcp link ...` / 当前 stable 产品文档）。不要把生产 Link 所有权留在仓库 Bash 包装上。
 
-Link 可以复用用户环境里**已经存在**的代理配置。识别优先级：`HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`；macOS 也会读取现有 `scutil --proxy` 状态。如果所选 origin 仍不可达，停止并询问用户；未经明确指示不得修改代理、网络节点、系统代理、DNS/自定义域名选择或其它网络设置。见 [快速 Agent 安装](quick-agent-install.md) §5。
+Link 可以复用用户环境里**已经存在**的代理配置。识别优先级：`HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`；macOS 也会读取现有 `scutil --proxy` 状态。如果所选 origin 仍不可达，停止并询问用户；未经明确指示不得修改代理、网络节点、系统代理、DNS/自定义域名选择或其它网络设置。见 [本 Agent 安装协议](agent-install.md) §5。
 
 ## 9. 验证闭环
 

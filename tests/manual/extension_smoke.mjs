@@ -702,8 +702,8 @@ ok(!wakeSource.includes("Wake on") && !wakeSource.includes("Wake off") && !wakeS
 ok(!readFileSync(path.join(EXT, "options.html"), "utf8").includes("Enable wake + LLM nudge"),
   "Options source no longer exposes the legacy wake+nudge switch name");
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
-const wakeDocEn = readFileSync(path.join(EXT, "..", "docs", "i18n", "en", "extension-wake.md"), "utf8");
-const wakeDocZh = readFileSync(path.join(EXT, "..", "docs", "i18n", "zh-CN", "extension-wake.md"), "utf8");
+const wakeDocEn = readFileSync(path.join(EXT, "..", "docs", "i18n", "en", "browser-continuity.md"), "utf8");
+const wakeDocZh = readFileSync(path.join(EXT, "..", "docs", "i18n", "zh-CN", "browser-continuity.md"), "utf8");
 ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
     && !optionsHtml.includes('id="enabled"')
     && !optionsHtml.includes('id="autoAllow"')
@@ -715,7 +715,7 @@ ok(optionsHtml.includes('id="experimentalZAiEnabled"')
     && optionsSource.includes('experimentalZAiEnabled: $("experimentalZAiEnabled").checked')
     && optionsSource.includes('experimentalDeepSeekEnabled: $("experimentalDeepSeekEnabled").checked'),
   "Options exposes separate experimental z.ai and DeepSeek switches");
-ok(optionsSource.includes("github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/quick-agent-install.md")
+ok(optionsSource.includes("github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/agent-install.md")
     && optionsSource.includes("setConnectionFailure")
     && [enLocale, zhLocale, jaLocale].every((locale) => locale.open_github_setup_guide),
   "failed local connection tests link to a localized GitHub setup path");

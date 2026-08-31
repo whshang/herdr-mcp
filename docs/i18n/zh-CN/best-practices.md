@@ -88,7 +88,7 @@ git diff --check
 
 自动化开启后，应该让扩展负责这些机械动作；HUD 负责网页 / Herdr 状态、Auto、三个预置推进动作和当前会话的手动接力。需要主动切换会话时，直接使用 **HUD 的“接力”**；自动接力仍由容量和恢复策略触发。
 
-ChatGPT Project、普通 ChatGPT 会话、z.ai 和 DeepSeek 的作用域规则不同，具体以 [浏览器扩展](extension.md) 和 [自动继续与接力](extension-wake.md) 为准。
+ChatGPT Project、普通 ChatGPT 会话、z.ai 和 DeepSeek 的作用域规则不同，具体以 [浏览器扩展](extension.md) 和 [自动继续与接力](browser-continuity.md) 为准。
 
 如果用户手动在同一个已绑定 ChatGPT Project 里新开会话，只说“继续 / 接着上次”，不要先要求用户寻找 `continuity_id`。应先 resolve/search 本机 durable continuity；纯文本召回没有自动选择权，存在歧义必须确认后才能 resume，恢复后还要重新检查实时 Herdr / Git / runtime 再 mutation。
 

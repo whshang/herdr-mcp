@@ -207,7 +207,7 @@ Continuity recovery is evidence-first:
 
 If automatic recovery cannot obtain trustworthy evidence, refresh manually and use **Herdr monitor** to re-read local state before continuing.
 
-See [Wake, recovery and handoff](extension-wake.md).
+See [Wake, recovery and handoff](browser-continuity.md).
 
 ## Symptom: ChatGPT Queue did not send immediately or queued content is still pending
 
@@ -252,7 +252,7 @@ Check:
 
 Do not treat internal tool JSON as the final natural-language answer.
 
-See [JSON → MCP bridge](extension-bridge.md).
+See [JSON → MCP bridge](extension.md).
 
 ## Symptom: Chromium asks for local-device / loopback permission
 

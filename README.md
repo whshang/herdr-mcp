@@ -16,8 +16,7 @@ Languages: **English** · [简体中文](README.zh.md) · [日本語](README.ja.
 
 The canonical installation path is an **execution protocol written directly for an Agent**:
 
-- [Quick agent install](docs/i18n/en/quick-agent-install.md) — concise end-to-end protocol;
-- [Agent install](docs/i18n/en/agent-install.md) — detailed security, Cloudflare, Link, and verification contract.
+- [Agent install](docs/i18n/en/agent-install.md) — authoritative end-to-end Agent execution contract.
 
 An execution-capable Agent should read the protocol itself, perform deterministic checks and mutations directly, and pause only for genuinely interactive human authorization or choices. Ordinary workstation PROD installs use published GitHub Releases for herdr-mcp, not a repo checkout. If network/login/third-party availability blocks the requested path, the Agent should stop and report the blocker rather than inventing proxy or bypass infrastructure.
 
@@ -90,7 +89,6 @@ herdr-mcp uninstall
 
 ## Read more only when you need it
 
-- [Quick agent install](docs/i18n/en/quick-agent-install.md) — recommended onboarding protocol for a coding agent;
 - [Installation](docs/i18n/en/install.md) — manual setup;
 - [ChatGPT Connector](docs/i18n/en/chatgpt-connector.md) — OAuth / MCP connection;
 - [Browser extension](docs/i18n/en/extension.md) — STORE / STANDALONE / DEV identities and continuity;

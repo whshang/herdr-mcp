@@ -3,7 +3,8 @@
 状态：实施中
 原则：用效率最高、可能是最复杂但对用户最友好的方案，不追求短期收益。
 
-**First-GA gate SSOT**：[`docs/ga-release-gate.md`](./ga-release-gate.md)。**当前已发布 Rust runtime stable**：`v0.4.2`（tag/source commit `4838ab9`）。稳定 TCC broker 已完成跨 generation 授权验证；Developer ID 仅为 optional hardening。final production Artifact Relay/R2 UAT 已于 2026-08-31 PASS；`v0.4.2` release gate 已关闭。generic relay 已由 PR #204 收敛；PR #199 在重复 relay 工作被取代后关闭且未合并，pane-session PR #200 已合入，`continuity.search` 已由 PR #202 集成。[`docs/ga-candidate-status.md`](./ga-candidate-status.md) 保留 `v0.4.0` 首次 stable 的 GA closure snapshot。**Release model**：[`docs/release-model.md`](./release-model.md)。是否可正式对普通用户开放只看 GA 门禁（G1–G25 + 八个 veto），不是「Rust 重构做完」。
+**Release model SSOT**：[`docs/release-model.md`](./release-model.md)。Runtime、浏览器扩展与 Contract 按独立 release plane 演进；发布状态与一次性验收结果不写入本架构路线。
+
 
 > 历史迁移/发布 chronology 已拆分到 [`docs/history/architecture/rust-native-rearchitecture.md`](./history/architecture/rust-native-rearchitecture.md)（Rust 原生化重构细节）与 [`docs/history/architecture/tool-performance-optimization.md`](./history/architecture/tool-performance-optimization.md)（18 个工具性能实现细节与基准）。本文件只保留当前架构与路线。
 
@@ -34,14 +35,9 @@ Herdr 性能优化不以单点 benchmark 为目标，目标是建立长期可演
 
 ## 当前执行重点
 
-当前主线有两个彼此解耦的执行面：
+当前执行面彼此解耦：Runtime、Browser Extension、Edge/Link Contract 可以独立演进，但必须遵守 [`release-model.md`](./release-model.md) 的兼容边界。浏览器扩展持续独立迭代，不要求仅为扩展变化发布 Rust runtime。
 
-1. **Browser extension / Store / real-browser UAT** — 浏览器扩展持续独立迭代；Store 发布、实验站点 UAT、Control Center/continuity 修复使用独立扩展版本与分支，不要求每次都发布 Rust runtime。
-2. **`v0.4.2` quality/consolidation** — 实施计划与验收证据已归档到 [`history/v0.4.2/v0.4.2-quality-docs-and-operations-plan.md`](./history/v0.4.2/v0.4.2-quality-docs-and-operations-plan.md)。Wave A reliability、Wave B measured efficiency、Wave C docs taxonomy 与 docs-site homepage/navigation redesign 均已完成；稳定版只通过 tag-driven signed Release 与 supported updater dogfood 收口。
-
-当前已发布 stable runtime 为 **`v0.4.2`**（tag/source commit `4838ab9`）。稳定 TCC broker 已完成跨 generation 授权验证；Developer ID 仅为 optional hardening。final production Artifact Relay/R2 UAT 已于 2026-08-31 PASS，证据见 [`history/v0.4.2/v0.4.2-artifact-relay-production-uat-20260831.md`](./history/v0.4.2/v0.4.2-artifact-relay-production-uat-20260831.md)；`v0.4.2` 已完成 tag/publish。generic relay 已由 PR #204 收敛；PR #199 在重复 relay 工作被取代后关闭且未合并，pane-session PR #200 已合入，`continuity.search` 已由 PR #202 集成。production Rust ownership / updater / Link / Native Messaging runtime sync 已经是基线，不再重复做 alpha-era cutover。第一版 GA 的 `v0.4.0` G1–G25 与历史 release/UAT 证据继续由 [`ga-release-gate.md`](./ga-release-gate.md) 和 `docs/history/ga/` 保存，不能为了让旧文档看起来“更新”而改写历史版本号。
-
-活跃但不自动进入 `v0.4.2` feature scope 的长期设计包括 [`_wip/multi-device-worker-control-plane.md`](./_wip/multi-device-worker-control-plane.md) 与 Browser Control Plane 的后续扩展；只有测量结果或明确版本计划批准后才转为实现任务。
+活跃的长期设计包括 [`_wip/multi-device-worker-control-plane.md`](./_wip/multi-device-worker-control-plane.md) 与 Browser Control Plane 的后续扩展；只有明确版本计划批准后才转为实现任务。
 
 ## 已完成并验收
 

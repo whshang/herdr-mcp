@@ -311,6 +311,6 @@ Codex true same-turn steer remains gated on a verifiable pane → app-server end
 
 - [Browser extension overview](extension.md)
 - [Browser continuity](browser-continuity.md)
-- [Auto-continue, recovery and handoff](extension-wake.md)
-- [JSON → MCP bridge](extension-bridge.md)
+- [Auto-continue, recovery and handoff](browser-continuity.md)
+- [JSON → MCP bridge](extension.md)
 - [Troubleshooting](troubleshooting.md)

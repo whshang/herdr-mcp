@@ -302,7 +302,7 @@ function localeEntryShell({ locale, docsBySlug, searchIndex, version }) {
           <h1>${esc(ui.indexTitle)}</h1>
           <p>${esc(ui.indexLead)}</p>
           <div class="hero-actions">
-            <a class="button primary" href="./quick-agent-install.html">${esc(ui.indexCtaConnect)}</a>
+            <a class="button primary" href="./agent-install.html">${esc(ui.indexCtaConnect)}</a>
             <a class="button" href="./overview.html">${esc(ui.indexCtaArchitecture)}</a>
           </div>
         </div>
@@ -314,8 +314,6 @@ function localeEntryShell({ locale, docsBySlug, searchIndex, version }) {
         </div>
       </section>
 
-      <section class="home-why-strip"><strong>${esc(ui.homeWhyTitle)}</strong><span>${esc(ui.homeWhyBody)}</span><a href="./remote-coding-ecosystem-research.html">${esc(ui.homeResearchLink)} →</a></section>
-
       <div class="docs-paths home-product-story">
         <section class="home-section" id="flow"><div class="index-group-heading"><span class="eyebrow">01</span><h2>${esc(ui.homeFlowTitle)}</h2><p>${esc(ui.homeFlowLead)}</p></div><div class="home-flow-grid"><article><b>1</b><strong>${esc(ui.homeFlowWeb)}</strong><p>${esc(ui.homeFlowWebBody)}</p></article><article><b>2</b><strong>${esc(ui.homeFlowMcp)}</strong><p>${esc(ui.homeFlowMcpBody)}</p></article><article><b>3</b><strong>${esc(ui.homeFlowHerdr)}</strong><p>${esc(ui.homeFlowHerdrBody)}</p></article><article class="optional"><b>↺</b><strong>${esc(ui.homeFlowReturn)}</strong><p>${esc(ui.homeFlowReturnBody)}</p></article></div></section>
 
@@ -324,20 +322,18 @@ function localeEntryShell({ locale, docsBySlug, searchIndex, version }) {
         <section class="agent-intro home-install" data-agent-intro id="agent-install">
           <div class="agent-intro-head"><span class="eyebrow">03 · ${esc(ui.homeAgentPathTitle)}</span><h2>${esc(ui.agentIntroTitle)}</h2><p>${esc(ui.agentIntroLead)}</p></div>
           <pre class="agent-prompt" tabindex="0"><button type="button" class="code-copy" data-copy-code aria-label="${esc(ui.copyCode)}">${esc(ui.copyCode)}</button><code>${esc(ui.agentPrompt)}</code></pre>
-          <p class="agent-intro-note"><a href="./quick-agent-install.html">${esc(ui.agentSkillLink)}</a></p>
+          <p class="agent-intro-note"><a href="./agent-install.html">${esc(ui.agentSkillLink)}</a></p>
         </section>
 
         <section class="home-section" id="handoffs"><div class="index-group-heading"><span class="eyebrow">04</span><h2>${esc(ui.homeHandoffsTitle)}</h2></div><div class="docs-grid"><article class="doc-card handoff-card"><h2>${esc(ui.homeCloudflareTitle)}</h2><p>${esc(ui.homeCloudflareBody)}</p></article><article class="doc-card handoff-card"><h2>${esc(ui.homeChatgptTitle)}</h2><p>${esc(ui.homeChatgptBody)}</p></article></div></section>
 
-        <section class="home-section" id="paths"><div class="index-group-heading"><span class="eyebrow">05</span><h2>${esc(ui.homePathsTitle)}</h2></div><div class="docs-grid home-three"><article class="doc-card"><h2><a href="./quick-agent-install.html">${esc(ui.homeAgentPathTitle)}</a></h2><p>${esc(ui.homeAgentPathBody)}</p></article><article class="doc-card"><h2><a href="./install.html">${esc(ui.homeManualPathTitle)}</a></h2><p>${esc(ui.homeManualPathBody)}</p></article><article class="doc-card"><h2><a href="./extension.html">${esc(ui.homeBrowserPathTitle)}</a></h2><p>${esc(ui.homeBrowserPathBody)}</p></article></div></section>
-
-        <section class="home-section home-research" id="research"><div><span class="eyebrow">06 · Landscape</span><h2>${esc(ui.homeResearchTitle)}</h2><p>${esc(ui.homeResearchBody)}</p></div><a class="button" href="./remote-coding-ecosystem-research.html">${esc(ui.homeResearchLink)} →</a></section>
+        <section class="home-section" id="paths"><div class="index-group-heading"><span class="eyebrow">05</span><h2>${esc(ui.homePathsTitle)}</h2></div><div class="docs-grid home-three"><article class="doc-card"><h2><a href="./agent-install.html">${esc(ui.homeAgentPathTitle)}</a></h2><p>${esc(ui.homeAgentPathBody)}</p></article><article class="doc-card"><h2><a href="./install.html">${esc(ui.homeManualPathTitle)}</a></h2><p>${esc(ui.homeManualPathBody)}</p></article><article class="doc-card"><h2><a href="./extension.html">${esc(ui.homeBrowserPathTitle)}</a></h2><p>${esc(ui.homeBrowserPathBody)}</p></article></div></section>
 
         <section class="home-section" id="support"><div class="index-group-heading"><span class="eyebrow">07</span><h2>${esc(ui.homeSupportTitle)}</h2></div><div class="docs-grid home-three"><article class="doc-card"><h2><a href="./troubleshooting.html">${esc(docsBySlug.get("troubleshooting").title)}</a></h2><p>${esc(docsBySlug.get("troubleshooting").description)}</p></article><article class="doc-card"><h2><a href="./architecture.html">${esc(docsBySlug.get("architecture").title)}</a></h2><p>${esc(docsBySlug.get("architecture").description)}</p></article><article class="doc-card"><h2><a href="https://github.com/whshang/herdr-mcp/tree/main/docs/history">${esc(ui.homeHistory)}</a></h2><p>${esc(ui.historyNav)}</p></article></div></section>
       </div>
       <footer class="docs-footer"><a href="https://github.com/whshang/herdr-mcp">GitHub</a><a href="./privacy.html">${esc(docsBySlug.get("privacy").title)}</a></footer>
     </main>
-    <aside class="toc" aria-label="${esc(ui.onThisPage)}"><div class="toc-inner"><h2>${esc(ui.onThisPage)}</h2><ol><li><a href="#flow">${esc(ui.homeFlowTitle)}</a></li><li><a href="#value">${esc(ui.homeValueTitle)}</a></li><li><a href="#agent-install">${esc(ui.homeAgentPathTitle)}</a></li><li><a href="#handoffs">${esc(ui.homeHandoffsTitle)}</a></li><li><a href="#research">${esc(ui.homeResearchTitle)}</a></li></ol></div></aside>
+    <aside class="toc" aria-label="${esc(ui.onThisPage)}"><div class="toc-inner"><h2>${esc(ui.onThisPage)}</h2><ol><li><a href="#flow">${esc(ui.homeFlowTitle)}</a></li><li><a href="#value">${esc(ui.homeValueTitle)}</a></li><li><a href="#agent-install">${esc(ui.homeAgentPathTitle)}</a></li><li><a href="#handoffs">${esc(ui.homeHandoffsTitle)}</a></li></ol></div></aside>
   </div>
   ${searchUi({ pre, locale, searchIndex })}
 </body>
