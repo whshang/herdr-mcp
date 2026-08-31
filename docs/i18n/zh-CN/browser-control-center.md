@@ -99,9 +99,13 @@ Side Panel 隐藏时会减少无意义 DOM 工作；重新可见或事件流重�
 - workspace 聚合状态点；
 - pane 数量与 working 数量；
 - 当前页面是否绑定到这个 workspace；
-- 唯一的 **绑定 / ✓ 已绑定** toggle。
+- 唯一的 **绑定 / 已绑定** toggle。
 
-当前页面已经绑定的 workspace 会排在列表前部并高亮。点击 workspace 行主体只负责展开 / 收起 pane；点击右侧绑定 toggle 只负责 bind / unbind，两种操作不会互相触发。绑定 mutation 在 UI 内串行化，避免连续点击制造难以判断的中间状态。workspace 一旦从 Herdr 的权威 live snapshot 中删除，对应页面绑定也会自动回收；Control Center 打开时还会做一次补偿清理，因此关闭过的历史 workspace 不会继续以“离线绑定”占据列表或造成不同页面看到不同的工作区数量。
+当前页面已经绑定的 workspace 会排在列表前部并高亮。点击 workspace 行主体只负责展开 / 收起 pane；点击右侧绑定 toggle 只负责 bind / unbind，两种操作不会互相触发。绑定 mutation 在 UI 内串行化，避免连续点击制造难以判断的中间状态。
+
+binding 还会携带一个与 ChatGPT Project 身份完全独立的本地项目身份。Git workspace 由 runtime 根据 Git common-dir 元数据派生，因此主 checkout 和 linked worktree 会归为同一个本地项目；非 Git workspace 则退化为 canonical 本地目录。一个 workspace 手动绑定后，后续新开的 Herdr workspace 只要本地项目身份相同，就会自动继承当前网页作用域。ChatGPT Project 中仍然只继承该 Project；普通 `/c/<id>` 对话中只继承当前 conversation，不会串到另一个普通对话。
+
+精确的 `workspace_removed` 生命周期事件会立即删除已关闭 workspace 的绑定；MV3 service worker 休眠期间如果漏掉事件，非空的权威 workspace catalog 会做补偿 reconciliation。空的或瞬时不完整的 catalog 不会被解释为“所有 workspace 都已关闭”。关闭过的历史 workspace 也不会再被合成为“离线绑定”行。对自动继承组中的任一 workspace 执行解绑，会把当前网页作用域下的这一组一起解绑，避免下一次 reconciliation 又立即自动绑定回来。
 
 展开后继续展示 pane 级明细：
 

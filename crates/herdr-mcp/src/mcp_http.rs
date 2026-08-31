@@ -5,6 +5,7 @@ use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
 use crate::mcp::{self, RuntimeContext};
 use crate::paths::RuntimePaths;
+use crate::projects;
 use crate::prompt::PromptRegistry;
 use crate::runtime_meta;
 use crate::skill::SkillService;
@@ -20,10 +21,11 @@ use axum::routing::{get, post};
 use futures_util::stream;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1059,13 +1061,24 @@ fn push_workspace_views(workspaces: &[Value], agents: &[Value], panes: &[Value])
                     }
                 }
             }
+            let local_project_key = push_local_project_key(&roots);
             Some(json!({
                 "id": id,
                 "label": workspace.get("label").cloned().unwrap_or(Value::Null),
                 "roots": roots,
+                "local_project_key": local_project_key,
             }))
         })
         .collect()
+}
+
+fn push_local_project_key(roots: &[String]) -> Option<String> {
+    let keys = roots
+        .iter()
+        .filter(|root| !root.is_empty())
+        .map(|root| projects::local_project_key(Path::new(root)))
+        .collect::<BTreeSet<_>>();
+    (keys.len() == 1).then(|| keys.into_iter().next().unwrap())
 }
 
 fn push_filter_matches(filters: &PushFilters, data: &Value) -> bool {
@@ -1823,6 +1836,10 @@ mod tests {
         assert_eq!(payload["workspaces"][0]["id"], "w1");
         assert_eq!(payload["workspaces"][0]["label"], "alpha");
         assert_eq!(payload["workspaces"][0]["roots"], json!(["/tmp/alpha"]));
+        assert_eq!(
+            payload["workspaces"][0]["local_project_key"],
+            json!("dir:/tmp/alpha")
+        );
         assert_eq!(payload["panes"][0]["pane_id"], "w1:p1");
     }
 

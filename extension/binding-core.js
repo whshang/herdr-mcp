@@ -70,6 +70,88 @@ export function pruneExpired(bindings, now = Date.now()) {
   return { kept, prunedKeys };
 }
 
+function workspaceIdFromCatalogRow(workspace) {
+  return String(workspace?.workspace_id || workspace?.id || "");
+}
+
+function workspaceIdFromBinding(binding) {
+  if (binding?.workspace_id) return String(binding.workspace_id);
+  if (typeof binding?.pane === "string" && binding.pane.includes(":")) return binding.pane.split(":")[0];
+  return "";
+}
+
+/**
+ * Reconcile workspace bindings against one authoritative Herdr workspace catalog.
+ * Existing bindings learn local_project_key; live sibling workspaces with the same
+ * local key inherit the same browser scope; closed workspaces are removed.
+ */
+export function reconcileWorkspaceCatalogBindings(bindings, workspaces, now = Date.now()) {
+  if (!Array.isArray(workspaces)) {
+    return { kept: { ...(bindings || {}) }, prunedKeys: [], inheritedKeys: [], changed: false };
+  }
+
+  const live = new Map();
+  for (const workspace of workspaces) {
+    const workspaceId = workspaceIdFromCatalogRow(workspace);
+    if (workspaceId) live.set(workspaceId, workspace);
+  }
+
+  const kept = {};
+  const prunedKeys = [];
+  const inheritedKeys = [];
+  let changed = false;
+
+  for (const [storeKey, binding] of Object.entries(bindings || {})) {
+    const workspaceId = workspaceIdFromBinding(binding);
+    if (workspaceId && !live.has(workspaceId)) {
+      prunedKeys.push(storeKey);
+      changed = true;
+      continue;
+    }
+    const next = { ...binding };
+    const localProjectKey = live.get(workspaceId)?.local_project_key;
+    if (typeof localProjectKey === "string" && localProjectKey && next.local_project_key !== localProjectKey) {
+      next.local_project_key = localProjectKey;
+      changed = true;
+    }
+    kept[storeKey] = next;
+  }
+
+  const sources = Object.values(kept).filter((binding) => binding?.convKey && binding?.local_project_key);
+  for (const source of sources) {
+    for (const workspace of live.values()) {
+      const workspaceId = workspaceIdFromCatalogRow(workspace);
+      if (!workspaceId || workspace.local_project_key !== source.local_project_key) continue;
+      const storeKey = `${source.convKey}::${workspaceId}`;
+      if (kept[storeKey]) continue;
+      const inherited = {
+        ...source,
+        workspace_id: workspaceId,
+        workspace_label: workspaceTitleWithId({
+          id: workspaceId,
+          label: workspace.label,
+          roots: workspace.roots,
+        }),
+        pane: null,
+        focus_agent: null,
+        agent: null,
+        workingPanes: {},
+        created_at: now,
+        last_seen_at: now,
+        persistence: "local_project_inherited",
+        status: "unknown",
+        lastSettle: null,
+      };
+      inherited.revision = bindingRevision(inherited);
+      kept[storeKey] = inherited;
+      inheritedKeys.push(storeKey);
+      changed = true;
+    }
+  }
+
+  return { kept, prunedKeys, inheritedKeys, changed };
+}
+
 /** Content-addressed binding revision, preferring workspace scope. */
 export function bindingRevision(b) {
   const scope = b.workspace_id || b.pane || "";

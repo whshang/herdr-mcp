@@ -154,5 +154,6 @@ test("explicit authoritative refresh replaces stale workspace metadata", async (
     id: "w68",
     label: "herdr-mcp",
     roots: ["/repo/herdr-mcp"],
+    local_project_key: "dir:/repo/herdr-mcp",
   }]);
 });

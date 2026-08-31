@@ -1,6 +1,7 @@
 use crate::child_process;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -210,6 +211,59 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Stable local project identity shared by a Git checkout and its linked worktrees.
+///
+/// This reads Git filesystem metadata instead of spawning Git so browser state
+/// reconciliation stays cheap. Non-Git folders fall back to the canonical path.
+pub fn local_project_key(root: &Path) -> String {
+    let canonical_root = canonical_or_absolute(root);
+    if let Some(git_root) = git_toplevel(&canonical_root)
+        && let Some(common_dir) = git_common_dir(&git_root)
+    {
+        return format!("git:{}", common_dir.to_string_lossy());
+    }
+    format!("dir:{}", canonical_root.to_string_lossy())
+}
+
+fn git_common_dir(git_root: &Path) -> Option<PathBuf> {
+    let dot_git = git_root.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        canonical_or_absolute(&dot_git)
+    } else if dot_git.is_file() {
+        let raw = fs::read_to_string(&dot_git).ok()?;
+        let value = raw
+            .lines()
+            .find_map(|line| line.strip_prefix("gitdir:"))?
+            .trim();
+        let path = PathBuf::from(value);
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            git_root.join(path)
+        };
+        canonical_or_absolute(&resolved)
+    } else {
+        return None;
+    };
+
+    let common_file = git_dir.join("commondir");
+    if !common_file.is_file() {
+        return Some(git_dir);
+    }
+    let raw = fs::read_to_string(common_file).ok()?;
+    let value = raw.lines().next()?.trim();
+    if value.is_empty() {
+        return Some(git_dir);
+    }
+    let path = PathBuf::from(value);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        git_dir.join(path)
+    };
+    Some(canonical_or_absolute(&resolved))
+}
+
 fn git_statuses(roots: &[PathBuf]) -> HashMap<PathBuf, (bool, usize)> {
     thread::scope(|scope| {
         let jobs = roots
@@ -305,6 +359,13 @@ fn absolute_path(path: &Path) -> Option<PathBuf> {
     } else {
         std::env::current_dir().ok().map(|cwd| cwd.join(path))
     }
+}
+
+fn canonical_or_absolute(path: &Path) -> PathBuf {
+    fs::canonicalize(path)
+        .ok()
+        .or_else(|| absolute_path(path))
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 fn is_unmanaged_root(root: &Path, home: Option<&Path>) -> bool {
@@ -410,5 +471,36 @@ mod tests {
         assert_eq!(project.vcs, None);
         assert!(!project.managed);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_project_key_groups_linked_worktrees_and_falls_back_to_folder() {
+        let base = temp_dir();
+        let main = base.join("main");
+        let worktree = base.join("worktree");
+        let git_dir = main.join(".git");
+        let worktree_git_dir = git_dir.join("worktrees/feature");
+        fs::create_dir_all(&worktree_git_dir).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_git_dir.to_string_lossy()),
+        )
+        .unwrap();
+        fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+
+        assert_eq!(local_project_key(&main), local_project_key(&worktree));
+
+        let plain = base.join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(
+            local_project_key(&plain),
+            format!(
+                "dir:{}",
+                fs::canonicalize(&plain).unwrap().to_string_lossy()
+            )
+        );
+
+        fs::remove_dir_all(base).unwrap();
     }
 }
