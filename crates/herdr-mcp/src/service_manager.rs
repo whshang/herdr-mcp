@@ -255,6 +255,7 @@ mod macos {
         let result = match command {
             ServiceCommand::Install { adopt_node } => {
                 crate::update_scheduler::preflight_service_install_fence()?;
+                crate::product_lifecycle::preflight_installation_identity()?;
                 let mut result = install(
                     &paths,
                     adopt_node,
@@ -262,6 +263,23 @@ mod macos {
                         .as_ref()
                         .expect("install must hold the service mutation lock"),
                 )?;
+                let installation_identity =
+                    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                        match crate::product_lifecycle::record_installation_identity() {
+                            Ok(()) => json!({"ok": true, "recorded": true}),
+                            Err(error) => json!({
+                                "ok": false,
+                                "recorded": false,
+                                "detail": error,
+                            }),
+                        }
+                    } else {
+                        json!({
+                            "ok": false,
+                            "recorded": false,
+                            "skipped": "service_install_failed",
+                        })
+                    };
                 let fence_clear = crate::update_scheduler::clear_service_uninstall_fence();
                 let scheduler = match fence_clear {
                     Ok(()) => crate::update_scheduler::reconcile_after_service_install(),
@@ -273,6 +291,10 @@ mod macos {
                     }),
                 };
                 if let Some(object) = result.as_object_mut() {
+                    object.insert(
+                        "product_installation_identity".to_owned(),
+                        installation_identity,
+                    );
                     object.insert("auto_update_scheduler".to_owned(), scheduler);
                 }
                 result

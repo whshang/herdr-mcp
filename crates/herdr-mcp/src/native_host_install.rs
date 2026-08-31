@@ -132,6 +132,246 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
     }
 }
 
+/// Product-uninstall primitive with stricter ownership than the interactive
+/// `native-host uninstall` command. A bare executable/wrapper is never enough
+/// evidence for destructive cleanup: at least one currently owned manifest
+/// must bind the managed files to this Native Messaging installation.
+///
+/// Returns `Ok(None)` when no managed footprint exists and `Ok(Some(value))`
+/// after an owned footprint was removed. Foreign/partial/orphaned state fails
+/// closed before the first mutation.
+#[cfg(target_os = "macos")]
+pub(crate) fn product_uninstall_preflight() -> Result<bool, String> {
+    let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
+    reject_rollback_in_progress(&paths)?;
+
+    let footprint_present = managed_native_host_footprint_present(&paths);
+    let view = status(&paths);
+    product_uninstall_view_preflight(&view, footprint_present)
+}
+
+#[cfg(target_os = "macos")]
+fn product_uninstall_view_preflight(view: &Value, footprint_present: bool) -> Result<bool, String> {
+    if !footprint_present {
+        return Ok(false);
+    }
+    if view.get("recovery_required").and_then(Value::as_bool) == Some(true) {
+        return Err("native-host recovery is required before product uninstall".to_owned());
+    }
+    let manifests = view
+        .get("manifests")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if manifests
+        .iter()
+        .any(|manifest| manifest.get("owned").and_then(Value::as_bool) != Some(true))
+    {
+        return Err(
+            "product uninstall found a Native Messaging manifest that is not owned by herdr-mcp"
+                .to_owned(),
+        );
+    }
+    let owned_count = view
+        .get("owned_manifest_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if owned_count == 0 {
+        return Err(
+            "product uninstall found an orphan Native Host wrapper/runtime without an owned manifest; refusing destructive cleanup"
+                .to_owned(),
+        );
+    }
+    if view.get("wrapper_ok").and_then(Value::as_bool) != Some(true)
+        || view.get("runtime_binary_ok").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(
+            "product uninstall found a partial Native Host footprint; repair or remove it explicitly before product uninstall"
+                .to_owned(),
+        );
+    }
+    Ok(true)
+}
+
+/// Capture immutable Native Host ownership evidence before the product removes
+/// any manifest, wrapper, or runtime binary. The outer product-uninstall journal
+/// persists this snapshot so an interrupted uninstall can resume without
+/// treating a newly orphaned wrapper/runtime as fresh ownership evidence.
+#[cfg(target_os = "macos")]
+pub(crate) fn product_uninstall_snapshot() -> Result<Option<serde_json::Value>, String> {
+    let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
+    reject_rollback_in_progress(&paths)?;
+    let footprint_present = managed_native_host_footprint_present(&paths);
+    let view = status(&paths);
+    if !product_uninstall_view_preflight(&view, footprint_present)? {
+        return Ok(None);
+    }
+    let manifests = paths
+        .targets
+        .iter()
+        .map(|(target, _)| target.join(format!("{HOST_NAME}.json")))
+        .filter(|path| path_present(path))
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    Ok(Some(json!({
+        "schema_version": 1,
+        "runtime_binary": paths.runtime_binary,
+        "runtime_sha256": file_sha256(&paths.runtime_binary)?,
+        "wrapper": paths.wrapper,
+        "wrapper_sha256": file_sha256(&paths.wrapper)?,
+        "manifests": manifests,
+    })))
+}
+
+/// Remove or resume removal of the exact Native Host cohort captured by
+/// `product_uninstall_snapshot`. Missing members are already-completed work;
+/// every member still present must match the persisted ownership proof.
+#[cfg(target_os = "macos")]
+pub(crate) fn product_uninstall_owned_from_snapshot(
+    snapshot: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
+    reject_rollback_in_progress(&paths)?;
+    validate_product_uninstall_snapshot(snapshot, &paths)?;
+
+    let mut removed = Vec::new();
+    let manifests = snapshot
+        .get("manifests")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "native-host product snapshot is missing manifests".to_owned())?;
+    for raw in manifests {
+        let raw = raw
+            .as_str()
+            .ok_or_else(|| "native-host product snapshot manifest path is invalid".to_owned())?;
+        let path = PathBuf::from(raw);
+        if !path_present(&path) {
+            continue;
+        }
+        let view = manifest_status(&path, &paths);
+        if view.get("owned").and_then(Value::as_bool) != Some(true) {
+            return Err(format!(
+                "native-host manifest changed after product preflight; refusing removal: {}",
+                path.display()
+            ));
+        }
+        fs::remove_file(&path).map_err(|error| {
+            format!(
+                "cannot remove native-host manifest {}: {error}",
+                path.display()
+            )
+        })?;
+        removed.push(path.to_string_lossy().into_owned());
+    }
+
+    remove_snapshot_file_if_matching(
+        &paths.wrapper,
+        snapshot
+            .get("wrapper_sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "native-host product snapshot is missing wrapper_sha256".to_owned())?,
+        "wrapper",
+        &mut removed,
+    )?;
+    remove_snapshot_file_if_matching(
+        &paths.runtime_binary,
+        snapshot
+            .get("runtime_sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "native-host product snapshot is missing runtime_sha256".to_owned())?,
+        "runtime binary",
+        &mut removed,
+    )?;
+
+    consume_ready_record(&paths)?;
+    let _ = fs::remove_file(&paths.pending_file);
+    Ok(json!({
+        "ok": true,
+        "implementation": "rust",
+        "host": HOST_NAME,
+        "removed": removed,
+        "resumed_from_product_snapshot": true,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn validate_product_uninstall_snapshot(
+    snapshot: &Value,
+    paths: &InstallPaths,
+) -> Result<(), String> {
+    if snapshot.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        return Err("native-host product snapshot has unsupported schema".to_owned());
+    }
+    let runtime = snapshot
+        .get("runtime_binary")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "native-host product snapshot is missing runtime_binary".to_owned())?;
+    let wrapper = snapshot
+        .get("wrapper")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "native-host product snapshot is missing wrapper".to_owned())?;
+    if Path::new(runtime) != paths.runtime_binary || Path::new(wrapper) != paths.wrapper {
+        return Err("native-host product snapshot paths do not match this installation".to_owned());
+    }
+    let expected_manifests = paths
+        .targets
+        .iter()
+        .map(|(target, _)| target.join(format!("{HOST_NAME}.json")))
+        .collect::<BTreeSet<_>>();
+    let manifests = snapshot
+        .get("manifests")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "native-host product snapshot is missing manifests".to_owned())?;
+    if manifests.is_empty() {
+        return Err("native-host product snapshot must contain an owned manifest".to_owned());
+    }
+    for raw in manifests {
+        let raw = raw
+            .as_str()
+            .ok_or_else(|| "native-host product snapshot manifest path is invalid".to_owned())?;
+        if !expected_manifests.contains(Path::new(raw)) {
+            return Err(format!(
+                "native-host product snapshot contains an unexpected manifest path: {raw}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_snapshot_file_if_matching(
+    path: &Path,
+    expected_sha256: &str,
+    label: &str,
+    removed: &mut Vec<String>,
+) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect native-host {label}: {error}")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "native-host {label} changed into a non-regular file; refusing removal: {}",
+            path.display()
+        ));
+    }
+    let observed = file_sha256(path)?;
+    if observed != expected_sha256 {
+        return Err(format!(
+            "native-host {label} changed after product preflight; refusing removal: {}",
+            path.display()
+        ));
+    }
+    fs::remove_file(path).map_err(|error| {
+        format!(
+            "cannot remove native-host {label} {}: {error}",
+            path.display()
+        )
+    })?;
+    removed.push(path.to_string_lossy().into_owned());
+    Ok(())
+}
+
 /// Copy the active `runtime/current` binary into an owned native-host install.
 ///
 /// This is invoked after managed service update/rollback so Chrome keeps talking
@@ -2351,6 +2591,50 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn product_uninstall_requires_owned_manifest_for_any_native_host_footprint() {
+        assert!(!product_uninstall_view_preflight(&json!({}), false).unwrap());
+        assert!(
+            product_uninstall_view_preflight(
+                &json!({
+                    "recovery_required": false,
+                    "owned_manifest_count": 0,
+                    "wrapper_ok": true,
+                    "runtime_binary_ok": true,
+                    "manifests": []
+                }),
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            product_uninstall_view_preflight(
+                &json!({
+                    "recovery_required": false,
+                    "owned_manifest_count": 1,
+                    "wrapper_ok": true,
+                    "runtime_binary_ok": true,
+                    "manifests": [{"owned": false}]
+                }),
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            product_uninstall_view_preflight(
+                &json!({
+                    "recovery_required": false,
+                    "owned_manifest_count": 1,
+                    "wrapper_ok": true,
+                    "runtime_binary_ok": true,
+                    "manifests": [{"owned": true}]
+                }),
+                true,
+            )
+            .unwrap()
+        );
+    }
 
     #[test]
     fn install_targets_include_chrome_for_testing_as_optional() {

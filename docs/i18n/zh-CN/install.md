@@ -178,3 +178,14 @@ herdr-mcp native-host status
 - [Cloudflare Edge 部署](cloudflare-edge-deployment.md)
 
 维护者 UAT、GA gate 和发布证据不属于普通用户安装流程。
+
+## 修复、重装与卸载
+
+v0.4.3+ 应使用产品级 lifecycle 命令，不要手工删除 launchd plist 或 runtime 目录：
+
+```bash
+herdr-mcp reinstall
+herdr-mcp uninstall
+```
+
+`reinstall` 会修复 / 替换 managed Rust runtime，同时保留配置与凭据；generations 按正常 service GC 保留 active / rollback-safe 集合。`uninstall` 会清理经过强 ownership 校验的 herdr-mcp 本机 runtime/config 状态：默认实例覆盖自己的 service、归属明确的每日 auto-update scheduler、Link/watchdog、Native Messaging host、managed CLI link 和 config root；named instance 只删除自己的 service/watchdog/config。产品卸载会在删除 config root 前，把一个极小的 durable update-fence tombstone 写到 config 之外的用户 cache 中，因此即使 config 已完全删除，已经排队的静默 updater 也不能把 service 复活；只有显式且成功的 install/reinstall 才会清除该 tombstone。它明确保留 Herdr 本体（`herdr`、Herdr service/socket/config），以及由浏览器、Cloudflare、Keychain、TCC 分别管理的授权状态。这类 lifecycle mutation 应从独立终端执行，不要在依赖目标 service 的 managed `herdr_exec` 会话内部执行。

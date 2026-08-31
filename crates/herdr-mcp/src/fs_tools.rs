@@ -439,6 +439,8 @@ fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Val
             max_matches,
             max_bytes,
             timeout: GREP_RG_TIMEOUT,
+            #[cfg(test)]
+            before_wait: None,
         }) {
             GrepRgOutcome::Complete { matches, truncated } => {
                 return finish_grep_result(
@@ -635,6 +637,8 @@ struct GrepRgOptions<'a> {
     max_matches: usize,
     max_bytes: u64,
     timeout: Duration,
+    #[cfg(test)]
+    before_wait: Option<&'a dyn Fn(u32)>,
 }
 
 enum GrepRgOutcome {
@@ -707,6 +711,11 @@ fn try_grep_rg(options: &GrepRgOptions<'_>) -> GrepRgOutcome {
         }
         output
     });
+
+    #[cfg(test)]
+    if let Some(before_wait) = options.before_wait {
+        before_wait(pid);
+    }
 
     let status = match child_process::wait_bounded(&mut child, options.timeout) {
         Ok(Some(status)) => status,
@@ -1179,7 +1188,7 @@ mod tests {
     fn rg_timeout_reaps_the_exact_child() {
         use std::os::unix::fs::PermissionsExt;
         use std::sync::atomic::{AtomicU64, Ordering};
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
         static NEXT_FAKE_RG: AtomicU64 = AtomicU64::new(0);
         let unique = SystemTime::now()
@@ -1217,6 +1226,17 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&fake_rg, fs::Permissions::from_mode(0o755)).unwrap();
+        let started = root.join("rg.started");
+        let wait_until_script_started = |_: u32| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !started.is_file() {
+                assert!(
+                    Instant::now() < deadline,
+                    "fake rg never reached its long-running state"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
 
         let outcome = try_grep_rg(&GrepRgOptions {
             rg: &fake_rg,
@@ -1227,9 +1247,9 @@ mod tests {
             glob: None,
             max_matches: 10,
             max_bytes: 1024,
-            timeout: Duration::from_secs(2),
+            timeout: Duration::from_millis(100),
+            before_wait: Some(&wait_until_script_started),
         });
-        let started = root.join("rg.started");
         let GrepRgOutcome::TimedOut { pid } = outcome else {
             panic!(
                 "expected timed-out fake rg (script_started={})",

@@ -38,6 +38,7 @@ mod native_host_install;
 mod native_tools;
 mod patch;
 mod paths;
+mod product_lifecycle;
 mod progressive_skills;
 mod projects;
 mod prompt;
@@ -115,6 +116,8 @@ fn run() -> Result<ExitCode, String> {
                 ExitCode::from(2)
             })
         }
+        cli::Command::Uninstall => product_lifecycle::uninstall(),
+        cli::Command::Reinstall => product_lifecycle::reinstall(),
         cli::Command::DocumentsProbe => Ok(macos_privacy::run_documents_probe_child()),
         cli::Command::TccBrokerRun => Ok(tcc_broker::run_broker_once()),
         cli::Command::TccBroker(command) => tcc_broker::run_cli(command),

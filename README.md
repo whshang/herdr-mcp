@@ -125,10 +125,13 @@ herdr-mcp update apply
 herdr-mcp update auto
 herdr-mcp update status
 herdr-mcp rollback
+herdr-mcp reinstall
 herdr-mcp uninstall
 ```
 
 On macOS v0.4.3+, the default production instance installs `dev.herdr-mcp.auto-update`, a background launchd trigger that runs on load and then once every 86,400 seconds. `update auto` reaches GitHub only when the **compiled runtime channel is `prod`**, `[update] check = true`, and the release channel is `stable`; named instances, DEV runtimes, and `preview` all skip before any network request. A strictly newer Stable Release is queued through the same SHA-256 + GitHub Sigstore/SLSA verified, detached, rollback-safe updater used by `update apply`. `service uninstall` first arms a durable update fence and removes the owned scheduler so an already-running detached worker cannot resurrect the service; an explicit successful `install`/`reinstall` clears that fence. Set `[update] check = false` to disable the network check.
+
+`herdr-mcp reinstall` is the repair/replacement path: it re-applies the managed Rust service lifecycle while preserving configuration and credentials; runtime generations follow the normal service GC policy, which retains the active/rollback-safe set rather than promising every historical generation. `herdr-mcp uninstall` is the product-level local runtime/config cleanup path: the default instance removes only strongly-owned herdr-mcp service, auto-update scheduler, Link/watchdog, Native Messaging host, user CLI and config state, while a named instance removes only its own service/watchdogs/config. Before deleting the config root it leaves one tiny update-fence tombstone in the user cache; detached workers must honor that tombstone, and only a later explicit successful install/reinstall clears it. Both deliberately preserve the independent `herdr` executable/service/socket/config and separately managed Keychain/TCC/browser/Cloudflare authorization state. `herdr-mcp service uninstall` remains the narrower advanced service primitive.
 
 For **herdr-mcp source development** on v0.4.3+, the runtime plane is explicitly split into DEV and PROD:
 

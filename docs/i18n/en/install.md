@@ -178,3 +178,14 @@ Read deeper only when needed:
 - [Cloudflare Edge deployment](cloudflare-edge-deployment.md)
 
 Maintainer UAT, GA gates, and release evidence are intentionally outside the normal user installation flow.
+
+## Repair, reinstall, and uninstall
+
+On v0.4.3+, use the product-level lifecycle commands rather than manually deleting launchd files or runtime directories:
+
+```bash
+herdr-mcp reinstall
+herdr-mcp uninstall
+```
+
+`reinstall` repairs/replaces the managed Rust runtime while retaining configuration and credentials; generations follow normal service GC, preserving the active/rollback-safe set. `uninstall` removes strongly owned local herdr-mcp runtime/config state. The default instance covers its service, owned daily auto-update scheduler, Link/watchdogs, Native Messaging host, managed CLI link, and config root; a named instance removes only its own service/watchdogs/config. Product uninstall arms a tiny durable update-fence tombstone under the user cache outside the config root before teardown, so a queued silent updater cannot resurrect the removed service after the config directory is gone. That tombstone is cleared only by an explicit successful install/reinstall. It intentionally preserves Herdr itself (`herdr`, the Herdr service/socket/config), as well as separately managed browser/Cloudflare/Keychain/TCC authorization state. Run these lifecycle mutations from an independent terminal, not from a managed `herdr_exec` session that depends on the service being changed.

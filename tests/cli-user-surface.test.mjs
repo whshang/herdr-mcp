@@ -17,6 +17,7 @@ const USER_COMMANDS = [
   "herdr-mcp update auto",
   "herdr-mcp update status",
   "herdr-mcp rollback",
+  "herdr-mcp reinstall",
   "herdr-mcp uninstall",
 ];
 
@@ -71,6 +72,7 @@ test("cargo-built herdr-mcp --help lists the user path ahead of service", () => 
     "herdr-mcp doctor",
     "herdr-mcp update",
     "herdr-mcp rollback",
+    "herdr-mcp reinstall",
     "herdr-mcp uninstall",
   ]) {
     assert.match(text, new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));

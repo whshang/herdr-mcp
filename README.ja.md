@@ -122,10 +122,13 @@ herdr-mcp update apply
 herdr-mcp update auto
 herdr-mcp update status
 herdr-mcp rollback
+herdr-mcp reinstall
 herdr-mcp uninstall
 ```
 
 macOS の v0.4.3+ では、default PROD instance に `dev.herdr-mcp.auto-update` launchd job をインストールします。load 時に 1 回、その後は 86,400 秒ごとにバックグラウンドで起動します。`update auto` が GitHub にアクセスするのは **compiled runtime channel が `prod`**、`[update] check = true`、Release channel が `stable` のすべてを満たす場合だけです。named instance、DEV runtime、`preview` は network request 前に skip します。より新しい Stable Release が見つかった場合も、`update apply` と同じ SHA-256 + GitHub Sigstore/SLSA 検証、detached worker、rollback-safe update path を再利用します。`service uninstall` は durable update fence を先に arm して owned scheduler を削除するため、すでに起動済みの detached worker も uninstall 後に service を復活できません。明示的に成功した `install`/`reinstall` だけが fence を解除します。`[update] check = false` で network check を無効化できます。
+
+`herdr-mcp reinstall` は repair / replacement path です。managed Rust service lifecycle を再適用しつつ configuration と credentials を保持し、runtime generations は通常の service GC policy（active / rollback-safe set を保持）に従います。`herdr-mcp uninstall` は product-level の local runtime/config cleanup path で、default instance は強い ownership 検証を通った herdr-mcp service、auto-update scheduler、Link/watchdog、Native Messaging host、user CLI、config state のみを削除します。named instance は自身の service/watchdog/config のみに限定されます。config root を削除する前に user cache へ小さな update-fence tombstone を残し、以前に起動した detached updater が service を復活させることを防ぎます。この tombstone は後続の明示的で成功した install/reinstall だけが削除します。どちらも独立した `herdr` executable / service / socket / config と、Keychain / TCC / browser / Cloudflare が個別管理する authorization state を保持します。`herdr-mcp service uninstall` は引き続き narrower advanced service primitive です。
 
 **herdr-mcp 自体の source development** では、v0.4.3+ の runtime を DEV / PROD に明示的に分離します：
 
