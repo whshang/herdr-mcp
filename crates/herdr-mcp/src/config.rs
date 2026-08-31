@@ -38,6 +38,7 @@ pub struct Config {
     pub update_channel: UpdateChannel,
     pub update_check: bool,
     pub edge_public_origin: Option<String>,
+    pub edge_device_id: Option<String>,
 }
 
 impl Default for Config {
@@ -48,6 +49,7 @@ impl Default for Config {
             update_channel: UpdateChannel::Stable,
             update_check: true,
             edge_public_origin: None,
+            edge_device_id: None,
         }
     }
 }
@@ -94,8 +96,14 @@ impl Config {
             self.update_channel.as_str(),
             self.update_check
         );
-        if let Some(origin) = &self.edge_public_origin {
-            rendered.push_str(&format!("\n[edge]\npublic_origin = \"{origin}\"\n"));
+        if self.edge_public_origin.is_some() || self.edge_device_id.is_some() {
+            rendered.push_str("\n[edge]\n");
+            if let Some(origin) = &self.edge_public_origin {
+                rendered.push_str(&format!("public_origin = \"{origin}\"\n"));
+            }
+            if let Some(device_id) = &self.edge_device_id {
+                rendered.push_str(&format!("device_id = \"{device_id}\"\n"));
+            }
         }
         rendered
     }
@@ -103,6 +111,17 @@ impl Config {
     pub fn set_edge_public_origin(&mut self, origin: &str) -> Result<(), String> {
         self.edge_public_origin = Some(normalize_edge_public_origin(origin)?);
         Ok(())
+    }
+
+    pub fn set_edge_device_id(&mut self, device_id: &str) -> Result<(), String> {
+        self.edge_device_id = Some(normalize_device_id(device_id)?);
+        Ok(())
+    }
+
+    pub fn edge_link_keychain_service(&self) -> Option<String> {
+        self.edge_device_id
+            .as_ref()
+            .map(|device_id| format!("herdr-edge-link-{device_id}"))
     }
 
     pub fn edge_ws_url(&self) -> Result<Option<String>, String> {
@@ -172,6 +191,9 @@ fn parse(content: &str) -> Result<Config, String> {
             ("edge", "public_origin") => {
                 config.edge_public_origin = Some(normalize_edge_public_origin(unquote(value))?)
             }
+            ("edge", "device_id") => {
+                config.edge_device_id = Some(normalize_device_id(unquote(value))?)
+            }
             ("", _) => return Err(format!("line {line_number}: keys must be inside a section")),
             _ => return Err(format!("line {line_number}: unknown key {section}.{key}")),
         }
@@ -200,6 +222,30 @@ fn normalize_edge_public_origin(value: &str) -> Result<String, String> {
     }
     url.set_path("");
     Ok(url.to_string().trim_end_matches('/').to_owned())
+}
+
+pub fn normalize_device_id(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let suffix = value
+        .strip_prefix("dev_")
+        .or_else(|| value.strip_prefix("DEV_"))
+        .ok_or_else(|| "edge.device_id must start with dev_".to_owned())?
+        .to_ascii_uppercase();
+    if suffix.len() != 26 {
+        return Err("edge.device_id must contain one canonical 26-character ULID".to_owned());
+    }
+    let first = suffix
+        .chars()
+        .next()
+        .ok_or_else(|| "edge.device_id is empty".to_owned())?;
+    if !(('0'..='7').contains(&first)) {
+        return Err("edge.device_id ULID must begin with 0-7".to_owned());
+    }
+    const CROCKFORD: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    if !suffix.chars().all(|ch| CROCKFORD.contains(ch)) {
+        return Err("edge.device_id contains invalid ULID characters".to_owned());
+    }
+    Ok(format!("dev_{suffix}"))
 }
 
 fn parse_port(value: &str, line_number: usize) -> Result<u16, String> {
@@ -250,6 +296,7 @@ mod tests {
         assert_eq!(Config::default().update_channel, UpdateChannel::Stable);
         assert!(Config::default().update_check);
         assert_eq!(Config::default().edge_public_origin, None);
+        assert_eq!(Config::default().edge_device_id, None);
     }
 
     #[test]
@@ -288,6 +335,7 @@ mod tests {
 
             [edge]
             public_origin = "https://herdr.example.com"
+            device_id = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
             "#,
         )
         .unwrap();
@@ -301,6 +349,14 @@ mod tests {
             Some("https://herdr.example.com")
         );
         assert_eq!(
+            config.edge_device_id.as_deref(),
+            Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+        assert_eq!(
+            config.edge_link_keychain_service().as_deref(),
+            Some("herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+        assert_eq!(
             config.edge_ws_url().unwrap().as_deref(),
             Some("wss://herdr.example.com/ws")
         );
@@ -312,6 +368,7 @@ mod tests {
         assert!(parse("[runtime]\nport = 0").is_err());
         assert!(parse("[update]\nchannel = \"nightly\"").is_err());
         assert!(parse("[edge]\npublic_origin = \"http://example.com\"").is_err());
+        assert!(parse("[edge]\ndevice_id = \"dev_bad\"").is_err());
         assert!(parse("[unknown]\nvalue = 1").is_err());
     }
 
@@ -323,7 +380,18 @@ mod tests {
             update_channel: UpdateChannel::Preview,
             update_check: false,
             edge_public_origin: Some("https://herdr.example.com".to_owned()),
+            edge_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
         };
         assert_eq!(parse(&config.render()).unwrap(), config);
+    }
+
+    #[test]
+    fn normalizes_device_id_case_without_accepting_ambiguous_ulid_chars() {
+        assert_eq!(
+            normalize_device_id("dev_01arz3ndektsv4rrffq69g5fav").unwrap(),
+            "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        );
+        assert!(normalize_device_id("dev_01ARZ3NDEKTSV4RRFFQ69G5FAI").is_err());
+        assert!(normalize_device_id("dev_81ARZ3NDEKTSV4RRFFQ69G5FAV").is_err());
     }
 }

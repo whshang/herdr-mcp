@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use super::cutover_execute::{LaunchdOps, RealLaunchd, atomic_write};
 #[cfg(target_os = "macos")]
-use super::install::{configured_edge_ws_url, inherited_proxy_env};
+use super::install::{configured_edge_device_identity, configured_edge_ws_url, inherited_proxy_env};
 #[cfg(target_os = "macos")]
 use super::migrate_runtime_control::{
     active_rust_generation_id, read_binary_version_hint, reconcile_current_generation,
@@ -170,6 +170,16 @@ fn refresh_prod_plist_generation(
     if let Some(edge_url) = configured_edge_ws_url(home) {
         env_out.insert("HERDR_EDGE_URL".to_owned(), PlistValue::String(edge_url));
     }
+    if let Some((device_id, keychain_service)) = configured_edge_device_identity(home) {
+        env_out.insert(
+            "HERDR_WORKSTATION_ID".to_owned(),
+            PlistValue::String(device_id),
+        );
+        env_out.insert(
+            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+            PlistValue::String(keychain_service),
+        );
+    }
     for (key, value) in inherited_proxy_env() {
         if !env_out.contains_key(&key) {
             env_out.insert(key, PlistValue::String(value));
@@ -233,6 +243,13 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let config_dir = root.join(".config/herdr-mcp");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[edge]\npublic_origin = \"https://edge.example\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n",
+        )
+        .unwrap();
         let plist_path = root.join("link-prod.plist");
         let mut env = Dictionary::new();
         env.insert(
@@ -279,6 +296,20 @@ mod tests {
             env.get("HERDR_RUNTIME_VERSION")
                 .and_then(PlistValue::as_string),
             Some("0.4.3-dev")
+        );
+        assert_eq!(
+            env.get("HERDR_EDGE_URL").and_then(PlistValue::as_string),
+            Some("wss://edge.example/ws")
+        );
+        assert_eq!(
+            env.get("HERDR_WORKSTATION_ID")
+                .and_then(PlistValue::as_string),
+            Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        );
+        assert_eq!(
+            env.get("HERDR_LINK_KEYCHAIN_SERVICE")
+                .and_then(PlistValue::as_string),
+            Some("herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
         );
         std::fs::remove_dir_all(root).unwrap();
     }

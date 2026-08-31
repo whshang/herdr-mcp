@@ -323,6 +323,14 @@ pub(crate) fn configured_edge_ws_url(home: &Path) -> Option<String> {
         .and_then(|config| config.edge_ws_url().ok().flatten())
 }
 
+pub(crate) fn configured_edge_device_identity(home: &Path) -> Option<(String, String)> {
+    let path = home.join(".config").join("herdr-mcp").join("config.toml");
+    let config = Config::load_for_instance(&path, &InstanceId::default_instance()).ok()?;
+    let device_id = config.edge_device_id?;
+    let service = format!("herdr-edge-link-{device_id}");
+    Some((device_id, service))
+}
+
 pub fn candidate_plist_path(home: &Path) -> PathBuf {
     home.join("Library")
         .join("LaunchAgents")

@@ -117,6 +117,16 @@ export async function authenticateDeviceCredential(
   }
 }
 
+export async function revokeRegisteredDevice(registry: FetchStub, deviceId: string): Promise<boolean> {
+  const response = await registry.fetch(new Request(
+    `https://registry.internal/internal/devices/${encodeURIComponent(deviceId)}/revoke`,
+    { method: "POST" },
+  ));
+  if (!response.ok) return false;
+  const body: unknown = await response.json();
+  return isRecord(body) && body.ok === true;
+}
+
 export async function ensureLegacyDeviceRegistration(
   registry: FetchStub,
   workstationId: string,

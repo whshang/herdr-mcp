@@ -62,22 +62,29 @@ fn env_map_from_process() -> HashMap<String, String> {
 fn enrich_macos_credentials(
     env_map: &mut HashMap<String, String>,
 ) -> Result<(), DaemonConfigError> {
+    let configured = RuntimePaths::discover().ok().and_then(|paths| {
+        Config::load_for_instance(&paths.config_file, &paths.instance).ok()
+    });
     if optional_trimmed(env_map, "HERDR_EDGE_URL").is_none() {
-        let configured = RuntimePaths::discover().ok().and_then(|paths| {
-            Config::load_for_instance(&paths.config_file, &paths.instance)
-                .ok()
-                .and_then(|config| config.edge_ws_url().ok().flatten())
-        });
-        env_map.insert(
-            "HERDR_EDGE_URL".to_owned(),
-            configured.unwrap_or_else(|| MACOS_DEFAULT_EDGE_URL.to_owned()),
-        );
+        let edge_url = configured
+            .as_ref()
+            .and_then(|config| config.edge_ws_url().ok().flatten())
+            .unwrap_or_else(|| MACOS_DEFAULT_EDGE_URL.to_owned());
+        env_map.insert("HERDR_EDGE_URL".to_owned(), edge_url);
     }
     if optional_trimmed(env_map, "HERDR_WORKSTATION_ID").is_none() {
-        env_map.insert(
-            "HERDR_WORKSTATION_ID".to_owned(),
-            MACOS_DEFAULT_WORKSTATION_ID.to_owned(),
-        );
+        let workstation_id = configured
+            .as_ref()
+            .and_then(|config| config.edge_device_id.clone())
+            .unwrap_or_else(|| MACOS_DEFAULT_WORKSTATION_ID.to_owned());
+        env_map.insert("HERDR_WORKSTATION_ID".to_owned(), workstation_id);
+    }
+    if optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE").is_none()
+        && let Some(service) = configured
+            .as_ref()
+            .and_then(Config::edge_link_keychain_service)
+    {
+        env_map.insert("HERDR_LINK_KEYCHAIN_SERVICE".to_owned(), service);
     }
 
     if optional_trimmed(env_map, "HERDR_LINK_TOKEN").is_none() {
@@ -101,18 +108,8 @@ fn load_link_token_from_keychain(
         let username = optional_trimmed(env_map, "USER").unwrap_or_else(current_username);
         let service = optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE")
             .unwrap_or_else(|| MACOS_LINK_KEYCHAIN_SERVICE.to_owned());
-        command_text(
-            "/usr/bin/security",
-            &[
-                "find-generic-password",
-                "-a",
-                &username,
-                "-s",
-                &service,
-                "-w",
-            ],
-            "workstation link credential",
-        )
+        crate::macos_keychain::load_generic_secret(&service, &username)
+            .map_err(DaemonConfigError::Message)
     }
     #[cfg(not(target_os = "macos"))]
     {

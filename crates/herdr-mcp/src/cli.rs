@@ -14,6 +14,7 @@ pub enum Command {
         probe: bool,
     },
     Config(ConfigCommand),
+    Worker(WorkerCommand),
     Dev(DevCommand),
     Candidate {
         port: u16,
@@ -74,6 +75,20 @@ pub enum ConfigCommand {
     Show,
     Init { edge_origin: Option<String> },
     SetEdgeOrigin { edge_origin: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkerCommand {
+    EnrollmentCreate {
+        ttl_seconds: u64,
+        name: Option<String>,
+        output: Option<String>,
+    },
+    Connect {
+        enrollment_file: String,
+        edge_origin: Option<String>,
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -213,6 +228,8 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "uninstall" => no_extra(args, Command::Uninstall),
         "reinstall" => no_extra(args, Command::Reinstall),
         "config" => parse_config(&args[1..]),
+        "worker" => parse_worker(&args[1..]),
+        "device" => parse_device_alias(&args[1..]),
         "dev" => parse_dev(&args[1..]),
         "candidate" => parse_candidate(&args[1..]),
         "service" => parse_service(&args[1..]),
@@ -478,6 +495,132 @@ fn parse_link_migrate_runtime_control(args: &[String]) -> Result<Command, String
         MigrateMode::DryRun
     };
     Ok(Command::Link(LinkCommand::MigrateRuntimeControl { mode }))
+}
+
+fn parse_worker(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
+        Some("enrollment") if args.get(1).map(String::as_str) == Some("create") => {
+            parse_worker_enrollment_create(&args[2..])
+        }
+        Some("connect") => parse_worker_connect(&args[1..]),
+        Some(value) => Err(format!(
+            "unknown worker command '{value}' (expected enrollment create or connect)"
+        )),
+        None => Err("worker requires enrollment create or connect".to_owned()),
+    }
+}
+
+fn parse_device_alias(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
+        Some("enrollment") if args.get(1).map(String::as_str) == Some("create") => {
+            parse_worker_enrollment_create(&args[2..])
+        }
+        Some(value) => Err(format!(
+            "device '{value}' is not implemented yet; v0.4.3 P0 supports only device enrollment create"
+        )),
+        None => Err("device requires enrollment create".to_owned()),
+    }
+}
+
+fn parse_worker_enrollment_create(args: &[String]) -> Result<Command, String> {
+    let mut ttl_seconds = 600_u64;
+    let mut name = None;
+    let mut output = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--ttl-seconds" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--ttl-seconds requires 60..900".to_owned())?;
+                ttl_seconds = value
+                    .parse::<u64>()
+                    .map_err(|_| "--ttl-seconds requires an integer".to_owned())?;
+                if !(60..=900).contains(&ttl_seconds) {
+                    return Err("--ttl-seconds must be between 60 and 900".to_owned());
+                }
+                index += 2;
+            }
+            "--name" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--name requires a device name".to_owned())?;
+                if value.trim().is_empty() || value.len() > 128 {
+                    return Err("--name must contain 1..128 characters".to_owned());
+                }
+                name = Some(value.clone());
+                index += 2;
+            }
+            "--output" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--output requires a path".to_owned())?;
+                if value.trim().is_empty() {
+                    return Err("--output path cannot be empty".to_owned());
+                }
+                output = Some(value.clone());
+                index += 2;
+            }
+            "--code" => {
+                return Err("enrollment secrets are never accepted on argv; use the generated 0600 enrollment file".to_owned());
+            }
+            value => return Err(format!("unknown worker enrollment create argument '{value}'")),
+        }
+    }
+    Ok(Command::Worker(WorkerCommand::EnrollmentCreate {
+        ttl_seconds,
+        name,
+        output,
+    }))
+}
+
+fn parse_worker_connect(args: &[String]) -> Result<Command, String> {
+    let mut enrollment_file = None;
+    let mut edge_origin = None;
+    let mut name = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--enrollment-file" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--enrollment-file requires a path".to_owned())?;
+                if value.trim().is_empty() {
+                    return Err("--enrollment-file path cannot be empty".to_owned());
+                }
+                enrollment_file = Some(value.clone());
+                index += 2;
+            }
+            "--edge-origin" => {
+                edge_origin = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--edge-origin requires an HTTPS origin".to_owned())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--name" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--name requires a device name".to_owned())?;
+                if value.trim().is_empty() || value.len() > 128 {
+                    return Err("--name must contain 1..128 characters".to_owned());
+                }
+                name = Some(value.clone());
+                index += 2;
+            }
+            "--code" => {
+                return Err("enrollment secrets are never accepted on argv; use --enrollment-file".to_owned());
+            }
+            value => return Err(format!("unknown worker connect argument '{value}'")),
+        }
+    }
+    Ok(Command::Worker(WorkerCommand::Connect {
+        enrollment_file: enrollment_file
+            .ok_or_else(|| "worker connect requires --enrollment-file PATH".to_owned())?,
+        edge_origin,
+        name,
+    }))
 }
 
 fn parse_config(args: &[String]) -> Result<Command, String> {
@@ -826,6 +969,8 @@ User path:\n\
   herdr-mcp doctor\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
+  herdr-mcp worker enrollment create [--ttl-seconds 600] [--name NAME] [--output PATH]  (macOS only; v0.4.3 secure enrollment — Linux/Windows: unavailable, fail-closed)\n\
+  herdr-mcp worker connect --enrollment-file PATH [--edge-origin HTTPS_ORIGIN] [--name NAME]  (macOS only; requires Keychain, refusing to consume one-time code on other platforms)\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|auto|status]\n\
   herdr-mcp extension standalone <install [--ref REF]|status>\n\
   herdr-mcp rollback\n\
@@ -978,6 +1123,57 @@ mod tests {
                 edge_origin: "https://herdr.example.com".to_owned(),
             })
         );
+        assert_eq!(
+            parse(args(&[
+                "worker",
+                "enrollment",
+                "create",
+                "--ttl-seconds",
+                "120",
+                "--name",
+                "mac-b",
+                "--output",
+                "/tmp/enrollment.json",
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::EnrollmentCreate {
+                ttl_seconds: 120,
+                name: Some("mac-b".to_owned()),
+                output: Some("/tmp/enrollment.json".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "worker",
+                "connect",
+                "--enrollment-file",
+                "/tmp/enrollment.json",
+                "--edge-origin",
+                "https://edge.example",
+                "--name",
+                "mac-b",
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::Connect {
+                enrollment_file: "/tmp/enrollment.json".to_owned(),
+                edge_origin: Some("https://edge.example".to_owned()),
+                name: Some("mac-b".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(args(&["device", "enrollment", "create"]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::EnrollmentCreate {
+                ttl_seconds: 600,
+                name: None,
+                output: None,
+            })
+        );
+        assert!(parse(args(&["worker", "connect", "--code", "secret"])).is_err());
+        assert!(parse(args(&["device", "enrollment", "create", "--code", "secret"])).is_err());
         assert_eq!(
             parse(args(&["dev", "--dry-run"])).unwrap().command,
             Command::Dev(DevCommand::Sync {

@@ -33,6 +33,18 @@ function post(path, body, authorization) {
   });
 }
 
+function postAsWorkstation(path, body, workstationId, secret) {
+  return new Request(`https://edge.example${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${secret}`,
+      "x-herdr-workstation": workstationId,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
 function wsRequest(workstationId, secret) {
   return new Request(`https://edge.example/ws/${encodeURIComponent(workstationId)}`, {
     method: "GET",
@@ -103,6 +115,58 @@ test("worker enrollment requires owner auth, returns a device secret once, and b
   const legacyOnNewDevice = await worker.fetch(wsRequest(a.workstation_id, "legacy-secret"), env);
   assert.equal(legacyOnNewDevice.status, 401);
   assert.equal(forwarded.length, 1, "legacy global secret cannot authenticate a formally enrolled device");
+});
+
+test("only the default owner workstation may use Link credentials to create another enrollment", async () => {
+  const { env } = makeEnv();
+  const ownerCreate = await worker.fetch(postAsWorkstation(
+    "/devices/enrollments",
+    { ttl_seconds: 60, name: "joined-from-owner" },
+    "prod-real-runtime",
+    "legacy-secret",
+  ), env);
+  assert.equal(ownerCreate.status, 200);
+
+  const joined = await enroll(env, "member-device");
+  const memberCreate = await worker.fetch(postAsWorkstation(
+    "/devices/enrollments",
+    { ttl_seconds: 60 },
+    joined.workstation_id,
+    joined.device_secret,
+  ), env);
+  assert.equal(memberCreate.status, 401);
+  assert.equal((await memberCreate.json()).code, "enrollment_admin_required");
+});
+
+test("a device may revoke only itself with its exact credential", async () => {
+  const { env, forwarded } = makeEnv();
+  const a = await enroll(env, "self-revoke-a");
+  const b = await enroll(env, "self-revoke-b");
+
+  const impersonatedRevoke = await worker.fetch(new Request("https://edge.example/devices/revoke-self", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${a.device_secret}`,
+    },
+    body: JSON.stringify({ workstation_id: b.workstation_id }),
+  }), env);
+  assert.equal(impersonatedRevoke.status, 401);
+
+  const selfRevoke = await worker.fetch(new Request("https://edge.example/devices/revoke-self", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${a.device_secret}`,
+    },
+    body: JSON.stringify({ workstation_id: a.workstation_id }),
+  }), env);
+  assert.equal(selfRevoke.status, 200);
+  assert.equal((await selfRevoke.json()).device_id, a.device_id);
+
+  const reconnect = await worker.fetch(wsRequest(a.workstation_id, a.device_secret), env);
+  assert.equal(reconnect.status, 401);
+  assert.equal(forwarded.length, 0);
 });
 
 test("legacy shared secret is compatibility-only for the default workstation and revoke blocks reconnect", async () => {

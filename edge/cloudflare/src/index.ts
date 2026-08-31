@@ -45,6 +45,8 @@ import {
   ensureLegacyDeviceRegistration,
   listPublicDevices,
   resolveDeviceRouteWithContext,
+  revokeRegisteredDevice,
+  resolveDeviceRoute,
 } from "./device-directory.js";
 import { authenticateMcpRequest } from "./oauth-mcp-auth.js";
 import { createOAuthIdentity } from "./oauth-edge.js";
@@ -158,8 +160,8 @@ export default {
     // owner/operator auth; consumption requires only the high-entropy one-time
     // code, so a second workstation never needs Cloudflare deploy credentials.
     if (request.method === "POST" && url.pathname === "/devices/enrollments") {
-      const ownerAuth = await authenticateEdgeMcpRequest(request, env);
-      if (!ownerAuth.ok) return noStoreJsonResponse({ ok: false, code: "mcp_auth_failed" }, 401);
+      const ownerAuth = await authenticateEnrollmentCreator(request, env);
+      if (!ownerAuth) return noStoreJsonResponse({ ok: false, code: "enrollment_admin_required" }, 401);
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value)) {
         const code = parsed.ok ? "bad_request" : parsed.code;
@@ -188,6 +190,24 @@ export default {
       return result.ok
         ? noStoreJsonResponse({ ok: true, ...result.enrollment })
         : noStoreJsonResponse({ ok: false, code: result.code }, result.status);
+    }
+
+    if (request.method === "POST" && url.pathname === "/devices/revoke-self") {
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.workstation_id !== "string") {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const workstationId = parsed.value.workstation_id.trim();
+      const extracted = extractLinkCredential(request);
+      if (!extracted.ok) return noStoreJsonResponse({ ok: false, code: "link_auth_failed" }, 401);
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      const authenticated = await authenticateDeviceCredential(registry, workstationId, extracted.credential);
+      if (!authenticated.ok) return noStoreJsonResponse({ ok: false, code: authenticated.code }, 401);
+      const revoked = await revokeRegisteredDevice(registry, authenticated.device_id);
+      return revoked
+        ? noStoreJsonResponse({ ok: true, device_id: authenticated.device_id })
+        : noStoreJsonResponse({ ok: false, code: "revoke_failed" }, 503);
     }
 
     // ---- /status/:workstationId — dev presence via DO.
@@ -467,4 +487,23 @@ async function authenticateEdgeMcpRequest(request: Request, env: Env) {
   return authenticateMcpRequest(request, env, {
     verifyEdgeToken: (token) => verifyEdgeAccessToken(env, token),
   });
+}
+
+async function authenticateEnrollmentCreator(request: Request, env: Env): Promise<boolean> {
+  const owner = await authenticateEdgeMcpRequest(request, env);
+  if (owner.ok) return true;
+
+  const workstationId = request.headers.get("x-herdr-workstation")?.trim() ?? "";
+  if (!env.DEFAULT_WORKSTATION_ID || workstationId !== env.DEFAULT_WORKSTATION_ID) return false;
+  const extracted = extractLinkCredential(request);
+  if (!extracted.ok) return false;
+
+  const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+  const deviceAuth = await authenticateDeviceCredential(registry, workstationId, extracted.credential);
+  if (deviceAuth.ok) return true;
+  if (deviceAuth.code !== "device_not_found" && deviceAuth.code !== "device_credential_missing") {
+    return false;
+  }
+  const legacy = new SharedSecretLinkAuthenticator({ secret: env.LINK_SHARED_SECRET });
+  return legacy.authenticate(request, workstationId, Date.now()).ok;
 }

@@ -683,6 +683,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "ryu-js",
+ "security-framework",
  "semver",
  "serde",
  "serde_json",

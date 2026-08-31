@@ -78,6 +78,10 @@ export class DeviceRegistryDO {
     if (request.method === "POST" && url.pathname === "/internal/devices/authenticate") {
       return this.authenticateDevice(request);
     }
+    const revokeMatch = /^\/internal\/devices\/(dev_[0-9A-Z]+)\/revoke$/.exec(url.pathname);
+    if (request.method === "POST" && revokeMatch) {
+      return this.revokeDevice(revokeMatch[1]);
+    }
     if (request.method === "POST" && url.pathname === "/internal/devices/legacy/ensure") {
       return this.ensureLegacyDevice(request);
     }
@@ -251,6 +255,22 @@ export class DeviceRegistryDO {
       return json({ ok: false, code: "link_auth_failed" }, 401);
     }
     return json({ ok: true, device_id: device.device_id, credential_id: credential.credential_id });
+  }
+
+  private async revokeDevice(deviceId: string): Promise<Response> {
+    const canonical = normalizeDeviceId(deviceId);
+    if (!canonical) return json({ ok: false, code: "invalid_device_id" }, 400);
+    const existing = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + canonical));
+    if (!existing) return json({ ok: false, code: "device_not_found" }, 404);
+    const now = Date.now();
+    const revoked: DeviceRecord = {
+      ...existing,
+      authorization: "revoked",
+      revoked_at_ms: existing.revoked_at_ms ?? now,
+      updated_at_ms: now,
+    };
+    await this.state.storage.put(DEVICE_PREFIX + canonical, revoked);
+    return json({ ok: true, device: revoked });
   }
 
   private async ensureLegacyDevice(request: Request): Promise<Response> {
