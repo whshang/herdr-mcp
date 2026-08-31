@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.83";
+const H2W_CONTENT_VERSION = "0.1.84";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -1479,13 +1479,24 @@ const H2W_CONTENT_VERSION = "0.1.83";
           if (result.ok && CONVERSATION_HEALTH) {
             markConversationState(CONVERSATION_HEALTH.markReplyWaiting(conversationHealth));
           }
-          const confirm = result.ok ? await confirmReplyStarted() : { monitored: false };
-          if (confirm?.replyStarted && CONVERSATION_HEALTH && conversationHealth) {
-            markConversationState(CONVERSATION_HEALTH.markReplyStarted(conversationHealth));
-          }
-          sendBg({ type: "h2w_wake_ack", convKey: ADAPTER.getConversationKey(), result, confirm });
+          // Submission success is the response contract. Reply-start monitoring is
+          // health evidence and must not hold a manual button for up to 30 seconds.
           sendResponse(result);
-        })();
+          void (async () => {
+            const confirm = result.ok ? await confirmReplyStarted() : { monitored: false };
+            if (confirm?.replyStarted && CONVERSATION_HEALTH && conversationHealth) {
+              markConversationState(CONVERSATION_HEALTH.markReplyStarted(conversationHealth));
+            }
+            void sendBg({ type: "h2w_wake_ack", convKey: ADAPTER.getConversationKey(), result, confirm });
+          })().catch(() => {});
+        })().catch((error) => {
+          sendResponse({
+            ok: false,
+            error: "wake-handler-failed",
+            delivery_unknown: true,
+            detail: String(error?.message || error || "unknown"),
+          });
+        });
         return true;
       }
       sendResponse({});
@@ -3327,7 +3338,13 @@ const H2W_CONTENT_VERSION = "0.1.83";
   }
 
   async function manualContinueAction(action) {
-    if (hudActionBusy || hudCache?.enabled === true) return { ok: false, error: "automation_enabled" };
+    if (hudActionBusy) return { ok: false, error: "action-busy" };
+    if (hudCache?.enabled === true) return { ok: false, error: "automation_enabled" };
+    if (action === "judge" && isTurnInProgress()) {
+      const result = { ok: false, error: "turn-in-progress" };
+      showHudToast(hudText("judge_turn_in_progress", null, "Wait for the current reply to finish before LLM decide."), "err");
+      return result;
+    }
     setHudActionBusy(true);
     try {
       const result = await sendBg({
@@ -3354,7 +3371,8 @@ const H2W_CONTENT_VERSION = "0.1.83";
   }
 
   async function manualHandoffAction() {
-    if (hudActionBusy || hudCache?.manual_handoff_available !== true || hudCache?.can_handoff !== true) {
+    if (hudActionBusy) return { ok: false, error: "action-busy" };
+    if (hudCache?.manual_handoff_available !== true || hudCache?.can_handoff !== true) {
       return { ok: false, error: "handoff_unavailable" };
     }
     setHudActionBusy(true);
