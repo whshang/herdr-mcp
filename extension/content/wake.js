@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.82";
+const H2W_CONTENT_VERSION = "0.1.83";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -1026,9 +1026,14 @@ const H2W_CONTENT_VERSION = "0.1.82";
       if (clearBeforeInsert) await clearComposer();
 
       if (ADAPTER.needsMainWorldInsert) {
-        const idle = await waitForComposerIdle(15000);
+        const idle = await waitForComposerIdle(data.manual === true ? 1200 : 15000);
         if (!idle) {
-          return { ok: false, error: "composer-busy", blocked: "generating" };
+          return {
+            ok: false,
+            error: "composer-busy",
+            blocked: "generating",
+            busy_reason: composerBusyReason() || "unknown",
+          };
         }
       }
 
@@ -1194,15 +1199,23 @@ const H2W_CONTENT_VERSION = "0.1.82";
       seedConfirmed: hasHandoffTransferMarker(lastMessageByRole("user"), transferId),
     };
   }
+  function explicitStopControl(el) {
+    if (!el || !elementVisible(el)) return false;
+    const testId = String(el.getAttribute("data-testid") || "").trim().toLowerCase();
+    if (testId === "stop-button") return true;
+    const values = [el.getAttribute("aria-label"), el.getAttribute("title"), el.innerText, el.textContent]
+      .map((value) => String(value || "").trim().replace(/\s+/g, " "))
+      .filter(Boolean);
+    return values.some((value) => /^(?:stop|stop generating|stop streaming|停止|停止生成|停止流式)$/i.test(value));
+  }
+
   function stopButtons() {
-    return [...document.querySelectorAll("button, [role=button]")].filter((b) => {
-      if (!b.offsetParent) return false;
-      const blob = [
-        b.innerText, b.textContent, b.getAttribute("aria-label"),
-        b.getAttribute("data-testid"), b.getAttribute("title"),
-      ].filter(Boolean).join(" ");
-      return /stop|停止|stop generating|停止生成|stop streaming|停止流式/i.test(blob);
-    });
+    if (typeof ADAPTER.getStopButtonCandidates === "function") {
+      return ADAPTER.getStopButtonCandidates().filter(explicitStopControl);
+    }
+    const input = ADAPTER.getInputEl?.();
+    const scope = input?.closest?.("form") || input?.parentElement?.parentElement || document;
+    return [...scope.querySelectorAll("button, [role=button]")].filter(explicitStopControl);
   }
   function assistantStreaming() {
     const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
@@ -1212,17 +1225,13 @@ const H2W_CONTENT_VERSION = "0.1.82";
     if (last.querySelector('[data-is-streaming="true"]')) return true;
     return false;
   }
+  function composerBusyReason() {
+    if (stopButtons().length > 0) return "stop-control";
+    if (assistantStreaming()) return "assistant-streaming";
+    return null;
+  }
   function isComposerGenerating() {
-    if (stopButtons().length > 0) return true;
-    if (assistantStreaming()) return true;
-    const send = findSendButton();
-    if (send) {
-      const blob = [
-        send.getAttribute("aria-label"), send.getAttribute("data-testid"), send.innerText,
-      ].filter(Boolean).join(" ");
-      if (/stop|停止|generating|生成中|streaming/i.test(blob)) return true;
-    }
-    return false;
+    return composerBusyReason() !== null;
   }
 
   /** Mid-turn: streaming, stop button, or visible tool/MCP invocation still running. */
@@ -3333,7 +3342,9 @@ const H2W_CONTENT_VERSION = "0.1.82";
       } else if (result?.ok) {
         showHudToast(hudText("continue_sent"), "ok");
       } else {
-        const error = result?.error || result?.blocked || result?.reason || "manual-continue-failed";
+        const error = result?.error === "composer-busy" && result?.busy_reason
+          ? `${result.error}:${result.busy_reason}`
+          : (result?.error || result?.blocked || result?.reason || "manual-continue-failed");
         showHudToast(hudText("continue_failed", { error }), "err");
       }
       return result;

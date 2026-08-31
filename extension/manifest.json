@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Herdr — AI Workspace Bridge",
-  "version": "0.1.82",
+  "version": "0.1.83",
   "description": "Connect ChatGPT and Web AI to local Herdr workspaces with Control Center, safe continuity, handoff, and queued next turns.",
   "permissions": [
     "storage",
