@@ -39,7 +39,7 @@ const CONTROL_BLOCK_REASONS = Object.freeze({
 
 export function actionModesForTarget(target) {
   if (!target?.pane_id) return [];
-  if (!target.agent) return [ACTION_TYPES.TERMINAL_TEXT];
+  if (!target.agent) return [];
   const modes = [ACTION_TYPES.AGENT_PROMPT];
   if (target.control_capabilities?.steer?.available === true) modes.push(ACTION_TYPES.STEER);
   return modes;

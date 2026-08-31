@@ -6,7 +6,7 @@ It is not a shortcut for giving the browser unrestricted shell access. It solves
 
 > When Web AI, local agents, tests, and terminals are all active, how do you keep the real workstation state visible and make the next human control target explicit?
 
-The current Control Center is **active-page context + live observation + inline pane actions + bounded reads + fenced local actions**. Click a pane to expand its actions directly underneath it; click it again or choose Collapse to close them. `Send instruction` executes through Herdr `agent.prompt`. `Adjust current task` appears only when the runtime explicitly advertises native steer. A working Agent also exposes a separate `Stop task` action. Raw Terminal Input remains preview-only.
+The current Control Center uses a compact layout: the header keeps only Herdr connectivity/running state and a few global actions; a supported active page is reduced to one line such as `ChatGPT · 3 bound`; workspace and pane rows are the primary UI. Click a pane to expand its actions inline. `Send instruction` executes through Herdr `agent.prompt`; `Adjust current task` appears only when native steer is advertised; a working Agent exposes `Stop task`. Raw Terminal Input remains disabled and is no longer exposed as a beginner-facing preview.
 
 ## How it differs from browser continuity
 

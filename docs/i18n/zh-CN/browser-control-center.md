@@ -6,7 +6,7 @@
 
 > 当网页 AI、本地 Agent、测试进程和终端同时工作时，怎样始终知道**哪一个现场正在发生什么，以及下一条人工控制明确指向哪里**？
 
-当前控制中心已经形成**当前页面上下文 + 实时观察 + 明确目标 + 有界读取 + 有 fencing 的本地操作**。`发送指令`通过可信 Native Messaging 调用 Herdr `agent.prompt`；只有 runtime 明确声明当前 provider 支持原生 steer 时才显示`调整当前任务`；正在运行的 Agent 还提供独立的`停止 (Ctrl+C)`。任意 Herdr 方法和原始终端输入仍保持 Preview-only。
+当前控制中心采用紧凑布局：顶部只保留 Herdr 连接/运行状态和少量全局操作；受支持的当前页面只显示一条 `ChatGPT · 已绑定 N` 上下文；workspace / pane 列表是主体。`发送指令`调用 Herdr `agent.prompt`；只有 runtime 明确声明支持原生 steer 时才显示`调整当前任务`；正在运行的 Agent 还提供独立的`停止任务`。原始终端写入仍被禁用，但不再作为普通用户可见的 Preview 功能。
 
 ## 它和浏览器连续工作有什么区别
 
@@ -34,9 +34,9 @@ Control Center 统一负责**当前页面身份、绑定 / 解绑、本机详细
 - 简体中文；
 - 日本語。
 
-## “当前页面”跟随浏览器激活标签页
+## 当前页面上下文保持一行
 
-顶部 **当前页面** 卡片是浏览器上下文与本机状态之间的桥。它让既有 binding authority 读取 Chrome 当前激活 tab，并显示：
+控制中心仍读取 Chrome 当前激活 tab，但不再显示一张大卡片。受支持页面只显示一条紧凑上下文，例如 `ChatGPT · 已绑定 3`。内部仍保留：
 
 - 当前受支持站点；
 - ChatGPT Project identity（如果有）；
@@ -45,7 +45,7 @@ Control Center 统一负责**当前页面身份、绑定 / 解绑、本机详细
 
 绑定 / 解绑不再在“当前页面”卡里复制一套 selector / chip。唯一入口就是下方 **workspace 行右侧的绑定 toggle**：状态和绑定在同一行完成识别与操作。
 
-切换 Chrome 标签页或当前标签页导航后，这张卡会通过 tab activation / navigation event 自动刷新，不做固定频率轮询；相应 workspace 会排到本机 workspace 列表前部并高亮。
+切换 Chrome 标签页或当前标签页导航后，这条上下文会通过 tab activation / navigation event 自动刷新，不做固定频率轮询；相应 workspace 会排到本机 workspace 列表前部并高亮。
 
 但它**不会自动改变 Pinned Target**。当前页面 binding 回答“这个网页上下文属于哪个本机 workspace”；Pinned Target 回答“未来人工控制明确针对哪个 pane”。
 
@@ -101,7 +101,7 @@ Side Panel 隐藏时会减少无意义 DOM 工作；重新可见或事件流重�
 - 当前页面是否绑定到这个 workspace；
 - 唯一的 **绑定 / ✓ 已绑定** toggle。
 
-当前页面已经绑定的 workspace 会排在列表前部并高亮。点击 workspace 行主体只负责展开 / 收起 pane；点击右侧绑定 toggle 只负责 bind / unbind，两种操作不会互相触发。绑定 mutation 在 UI 内串行化，避免连续点击制造难以判断的中间状态。若已绑定 workspace 已关闭或暂时不在 runtime snapshot 中，仍保留一个“当前不可见”的绑定行，允许直接解绑，不会把失效绑定藏起来。
+当前页面已经绑定的 workspace 会排在列表前部并高亮。点击 workspace 行主体只负责展开 / 收起 pane；点击右侧绑定 toggle 只负责 bind / unbind，两种操作不会互相触发。绑定 mutation 在 UI 内串行化，避免连续点击制造难以判断的中间状态。若已绑定 workspace 已关闭或暂时不在 runtime snapshot 中，仍保留一个 `已绑定 · 离线` 的绑定行，允许直接解绑。这里的“离线”指绑定记录仍在、但该 workspace 已不在当前 Herdr live 列表中，并不是浏览器标签页不可见。
 
 展开后继续展示 pane 级明细：
 

@@ -284,7 +284,7 @@ test("pinned target type exposes only matching control modes", () => {
 
   assert.deepEqual(actionModesForTarget(agentTarget), [ACTION_TYPES.AGENT_PROMPT]);
   assert.deepEqual(actionModesForTarget(steerCapableAgentTarget), [ACTION_TYPES.AGENT_PROMPT, ACTION_TYPES.STEER]);
-  assert.deepEqual(actionModesForTarget(terminalTarget), [ACTION_TYPES.TERMINAL_TEXT]);
+  assert.deepEqual(actionModesForTarget(terminalTarget), []);
   assert.deepEqual(actionModesForTarget(null), []);
   assert.deepEqual(actionModesForTarget({}), []);
   assert.deepEqual(actionModesForTarget({ ...agentTarget, stale: true }), [ACTION_TYPES.AGENT_PROMPT]);
