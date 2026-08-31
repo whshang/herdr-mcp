@@ -14,6 +14,15 @@
   const DEFAULT_MUTATION_COALESCE_MS = 400;
   const DEFAULT_PERMISSION_COALESCE_MS = 150;
   const UI_PRESSURE_WINDOW_MS = 60000;
+  const DEFAULT_TURN_MUTATION_SELECTOR = [
+    '[data-message-author-role="user"]',
+    '[data-message-author-role="assistant"]',
+    '[data-testid^="conversation-turn-"]',
+  ].join(", ");
+  const DEFAULT_IGNORED_TURN_MUTATION_SELECTOR = [
+    '[class*="group/tool-message"]',
+    '#h2w-page-hud',
+  ].join(", ");
 
   const DEFAULT_UI_PRESSURE_POLICY = Object.freeze({
     windowMs: UI_PRESSURE_WINDOW_MS,
@@ -86,6 +95,57 @@
       },
       pending() { return timer !== null; },
     };
+  }
+
+  function asElement(node) {
+    if (!node) return null;
+    if (node.nodeType === 1) return node;
+    return node.parentElement || null;
+  }
+
+  function matchesOrContains(element, selector) {
+    if (!element || !selector) return false;
+    try {
+      if (typeof element.matches === "function" && element.matches(selector)) return true;
+      if (typeof element.querySelector === "function" && element.querySelector(selector)) return true;
+    } catch (_) {}
+    return false;
+  }
+
+  function insideSelector(element, selector) {
+    if (!element || !selector || typeof element.closest !== "function") return false;
+    try { return Boolean(element.closest(selector)); } catch (_) { return false; }
+  }
+
+  /**
+   * Decide whether structural mutation records can invalidate the cached latest
+   * ChatGPT user/assistant turn. Mutations wholly inside tool-card/HUD subtrees
+   * are ignored so expanding tool details does not force a full conversation
+   * rediscovery. The caller may still schedule its normal coalesced tick.
+   */
+  function mutationTouchesConversationTurns(records, {
+    turnSelector = DEFAULT_TURN_MUTATION_SELECTOR,
+    ignoredSelector = DEFAULT_IGNORED_TURN_MUTATION_SELECTOR,
+  } = {}) {
+    for (const record of records || []) {
+      const changed = [
+        ...Array.from(record?.addedNodes || []),
+        ...Array.from(record?.removedNodes || []),
+      ];
+      let sawUnignoredChangedNode = false;
+      for (const node of changed) {
+        const element = asElement(node);
+        if (insideSelector(element, ignoredSelector) || matchesOrContains(element, ignoredSelector)) continue;
+        sawUnignoredChangedNode = true;
+        if (insideSelector(element, turnSelector) || matchesOrContains(element, turnSelector)) return true;
+      }
+      if (changed.length > 0 && !sawUnignoredChangedNode) continue;
+
+      const target = asElement(record?.target);
+      if (insideSelector(target, ignoredSelector)) continue;
+      if (insideSelector(target, turnSelector) || matchesOrContains(target, turnSelector)) return true;
+    }
+    return false;
   }
 
   /**
@@ -334,10 +394,13 @@
   global.H2W_BROWSER_PERFORMANCE = Object.freeze({
     DEFAULT_MUTATION_COALESCE_MS,
     DEFAULT_PERMISSION_COALESCE_MS,
+    DEFAULT_TURN_MUTATION_SELECTOR,
+    DEFAULT_IGNORED_TURN_MUTATION_SELECTOR,
     UI_PRESSURE_WINDOW_MS,
     DEFAULT_UI_PRESSURE_POLICY,
     DEFAULT_PAGE_HEALTH_POLICY,
     createCoalescedScheduler,
+    mutationTouchesConversationTurns,
     createUiPressureMeter,
     classifyUiPressure,
     classifyMemoryPressure,

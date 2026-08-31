@@ -107,6 +107,45 @@ test("browser performance scheduler suspends while hidden and flushes on resume"
   assert.equal(runs, 1);
 });
 
+test("turn mutation filter ignores tool-card and HUD churn but keeps turn changes", () => {
+  const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
+  const makeElement = ({ parent = null, matches = [], contains = [] } = {}) => ({
+    nodeType: 1,
+    parentElement: parent,
+    matches: (selector) => matches.includes(selector),
+    closest(selector) {
+      if (matches.includes(selector)) return this;
+      return parent?.closest?.(selector) || null;
+    },
+    querySelector: (selector) => contains.includes(selector) ? {} : null,
+  });
+  const toolSelector = perf.DEFAULT_IGNORED_TURN_MUTATION_SELECTOR;
+  const turnSelector = perf.DEFAULT_TURN_MUTATION_SELECTOR;
+  const assistant = makeElement({ matches: [turnSelector] });
+  const tool = makeElement({ parent: assistant, matches: [toolSelector] });
+  const toolChild = makeElement({ parent: tool });
+
+  assert.equal(perf.mutationTouchesConversationTurns([{
+    target: tool,
+    addedNodes: [toolChild],
+    removedNodes: [],
+  }]), false);
+
+  const streamedText = { nodeType: 3, parentElement: assistant };
+  assert.equal(perf.mutationTouchesConversationTurns([{
+    target: assistant,
+    addedNodes: [streamedText],
+    removedNodes: [],
+  }]), true);
+
+  const wrapper = makeElement({ contains: [turnSelector] });
+  assert.equal(perf.mutationTouchesConversationTurns([{
+    target: makeElement(),
+    addedNodes: [wrapper],
+    removedNodes: [],
+  }]), true);
+});
+
 test("ui pressure classifier bands healthy, warning, high from bounded inputs", () => {
   const perf = loadClassicExtensionScripts().H2W_BROWSER_PERFORMANCE;
   const classify = perf.classifyUiPressure;

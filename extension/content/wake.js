@@ -3074,10 +3074,13 @@ const H2W_CONTENT_VERSION = "0.1.84";
       else onTick();
     }, 800);
     try {
-      const mo = new MutationObserver(() => {
+      const mo = new MutationObserver((records) => {
         if (document.hidden) return;
         uiPressure?.recordMutation();
-        markLatestTurnsDirty();
+        const turnCacheMayBeStale = BROWSER_PERFORMANCE?.mutationTouchesConversationTurns
+          ? BROWSER_PERFORMANCE.mutationTouchesConversationTurns(records)
+          : true;
+        if (turnCacheMayBeStale) markLatestTurnsDirty();
         if (tickScheduler) tickScheduler.schedule();
         else onTick();
       });
