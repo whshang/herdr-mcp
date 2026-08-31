@@ -302,10 +302,22 @@ impl RuntimeControlLoop {
             }
         }
 
-        self.inner
-            .processed_revision
-            .store(doc.revision, Ordering::SeqCst);
-        let status = self.status(doc.revision, desired, outcome);
+        let previous_revision = self.inner.processed_revision.load(Ordering::SeqCst);
+        let retrying = retryable_candidate_outcome(&outcome);
+        let processed_revision = if retrying {
+            previous_revision
+        } else {
+            self.inner
+                .processed_revision
+                .store(doc.revision, Ordering::SeqCst);
+            doc.revision
+        };
+        let outcome = if retrying {
+            format!("retrying:{outcome}")
+        } else {
+            outcome
+        };
+        let status = self.status(processed_revision, desired, outcome);
         let _ = atomic_json(&self.inner.status_path, &status.to_json());
         Some(status)
     }
@@ -466,6 +478,25 @@ fn same_spec(current: Option<&RuntimeGenerationSpec>, spec: &RuntimeGenerationSp
             && current.expected_runtime_version == spec.expected_runtime_version
             && current.runtime_commit == spec.runtime_commit
     })
+}
+
+fn retryable_candidate_outcome(outcome: &str) -> bool {
+    if outcome == "rolled_back:activation_rolled_back" {
+        return true;
+    }
+    let code = outcome
+        .strip_prefix("candidate_rejected:")
+        .or_else(|| outcome.strip_prefix("activation_blocked:"));
+    let Some(code) = code else {
+        return false;
+    };
+    code.starts_with("health_")
+        || matches!(code, "catalog_timeout" | "catalog_unreachable")
+        || matches!(
+            code.strip_prefix("catalog_http_")
+                .and_then(|value| value.parse::<u16>().ok()),
+            Some(408 | 425 | 429 | 500 | 502 | 503 | 504)
+        )
 }
 
 fn safe_integer(value: Option<f64>, fallback: u64, min: u64, max: u64) -> u64 {
@@ -650,7 +681,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 mod tests {
     use std::fs;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -676,6 +707,7 @@ mod tests {
     struct MockState {
         version: String,
         catalog: Vec<Value>,
+        available: AtomicBool,
     }
 
     async fn read_http_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
@@ -726,6 +758,12 @@ mod tests {
                     let Some(bytes) = read_http_request(&mut stream).await else {
                         return;
                     };
+                    if !state.available.load(Ordering::SeqCst) {
+                        let response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(response).await;
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
                     let text = String::from_utf8_lossy(&bytes);
                     let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
                     let parsed: Value = serde_json::from_str(body).unwrap_or(json!({}));
@@ -818,10 +856,12 @@ mod tests {
         let stable_state = Arc::new(MockState {
             version: "0.3.23".to_owned(),
             catalog: catalog(),
+            available: AtomicBool::new(true),
         });
         let candidate_state = Arc::new(MockState {
             version: "0.3.26".to_owned(),
             catalog: catalog(),
+            available: AtomicBool::new(true),
         });
         let stable_endpoint = serve_mock(Arc::clone(&stable_state)).await;
         let candidate_endpoint = serve_mock(candidate_state).await;
@@ -892,11 +932,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_candidate_rejection_retries_the_same_revision_and_recovers() {
+        let hash = compute_contract_hash(&catalog()).unwrap();
+        let stable_state = Arc::new(MockState {
+            version: "0.3.23".to_owned(),
+            catalog: catalog(),
+            available: AtomicBool::new(true),
+        });
+        let candidate_state = Arc::new(MockState {
+            version: "0.3.26".to_owned(),
+            catalog: catalog(),
+            available: AtomicBool::new(false),
+        });
+        let stable_endpoint = serve_mock(stable_state).await;
+        let candidate_endpoint = serve_mock(Arc::clone(&candidate_state)).await;
+        let mut options = RuntimeGenerationManagerOptions::new(
+            RuntimeGenerationSpec {
+                generation: "stable".to_owned(),
+                endpoint: stable_endpoint.clone(),
+                expected_runtime_version: Some("0.3.23".to_owned()),
+                runtime_commit: None,
+            },
+            TOKEN,
+            &hash,
+        );
+        options.observation_checks = 1;
+        options.observation_interval_ms = 0;
+        let manager = Arc::new(RuntimeGenerationManager::new(options).expect("manager"));
+        let dir = test_dir();
+        let control_path = dir.join("control.json");
+        let status_path = dir.join("status.json");
+        let loop_ = RuntimeControlLoop::new(RuntimeControlLoopOptions {
+            manager: Arc::clone(&manager),
+            base: RuntimeGenerationSpec {
+                generation: "stable".to_owned(),
+                endpoint: stable_endpoint.clone(),
+                expected_runtime_version: Some("0.3.23".to_owned()),
+                runtime_commit: None,
+            },
+            control_path: control_path.clone(),
+            status_path: status_path.clone(),
+            poll_interval_ms: Some(100),
+            now_ms: None,
+        });
+        loop_.initialize().await.expect("initialize");
+        fs::write(
+            &control_path,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "revision": 2,
+                "desired_active": "candidate",
+                "generations": [
+                    {
+                        "generation": "stable",
+                        "endpoint": stable_endpoint,
+                        "expected_runtime_version": "0.3.23",
+                    },
+                    {
+                        "generation": "candidate",
+                        "endpoint": candidate_endpoint,
+                        "expected_runtime_version": "0.3.26",
+                    },
+                ],
+                "observation": { "checks": 1, "interval_ms": 0 },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let rejected = loop_.tick().await.expect("first tick");
+        assert!(
+            rejected
+                .outcome
+                .starts_with("retrying:candidate_rejected:health_")
+        );
+        assert_eq!(rejected.processed_revision, 1);
+        assert_eq!(manager.active_generation_id(), "stable");
+
+        candidate_state.available.store(true, Ordering::SeqCst);
+        let recovered = loop_.tick().await.expect("retry tick");
+        assert_eq!(recovered.outcome, "activated");
+        assert_eq!(recovered.processed_revision, 2);
+        assert_eq!(manager.active_generation_id(), "candidate");
+
+        loop_.close();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn invalid_control_document_writes_control_invalid_status() {
         let hash = compute_contract_hash(&catalog()).unwrap();
         let stable_state = Arc::new(MockState {
             version: "0.3.23".to_owned(),
             catalog: catalog(),
+            available: AtomicBool::new(true),
         });
         let stable_endpoint = serve_mock(stable_state).await;
         let mut options = RuntimeGenerationManagerOptions::new(
