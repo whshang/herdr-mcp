@@ -302,7 +302,15 @@ fn rollback() -> Result<ExitCode, String> {
         );
     }
 
-    run_service_install(Path::new(&state.prod_snapshot_binary))?;
+    let install_code = crate::service_lifecycle::run_install_from_payload(
+        false,
+        Path::new(&state.prod_snapshot_binary),
+    )?;
+    if install_code != ExitCode::SUCCESS {
+        return Err(format!(
+            "transactional PROD payload install returned non-success status {install_code:?}"
+        ));
+    }
     let active_after = current_generation(&runtime.config_dir)?
         .ok_or_else(|| "PROD rollback succeeded but runtime/current is missing".to_owned())?;
     state.channel = "prod".to_owned();
