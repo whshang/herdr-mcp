@@ -3,6 +3,7 @@ use crate::cli::ServiceCommand;
 use crate::native_host_install;
 use crate::{herdr_supervisor, link, paths::RuntimePaths, service_manager};
 use serde_json::Value;
+use std::path::Path;
 use std::process::ExitCode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,16 +46,62 @@ pub(crate) fn run(command: ServiceCommand) -> Result<ExitCode, String> {
     }
 }
 
+/// Shared install lifecycle for the public `service install` path. The
+/// orchestrator is the executing binary; the installed payload is the same
+/// executable (`current_exe` inside `service_manager`).
 fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
+    run_install_lifecycle(|mutation_lock| {
+        service_manager::run_with_mutation_lock(
+            ServiceCommand::Install { adopt_node },
+            mutation_lock,
+        )
+    })
+}
+
+/// Crate-internal install-from-payload path used by `dev rollback`: the
+/// current orchestrator owns the entire service lifecycle transaction (mutation
+/// lock, Herdr supervisor, product identity/update fence, production Link
+/// generation reconcile, native-host sync, compensation) while the installed
+/// generation bytes come from the pinned payload path. The payload is data
+/// only; it is never executed as the orchestrator.
+pub(crate) fn run_install_from_payload(
+    adopt_node: bool,
+    payload_binary: &Path,
+) -> Result<ExitCode, String> {
+    refuse_sidecar_mutation_inside_managed_exec()?;
+    run_install_lifecycle(|mutation_lock| {
+        service_manager::run_install_from_payload(adopt_node, payload_binary, mutation_lock)
+    })
+}
+
+/// One shared install lifecycle. The mutation lock is acquired, the pre-commit
+/// supervisor/service snapshot is captured, the install commit itself runs via
+/// `install` (either `current_exe` or an explicit payload), and then the
+/// post-commit sidecar orchestration (Herdr supervisor, product identity/update
+/// fence, production Link generation reconcile, native-host sync, compensation)
+/// completes inside `finish_install_lifecycle`.
+fn run_install_lifecycle<Install>(install: Install) -> Result<ExitCode, String>
+where
+    Install: FnOnce(&service_manager::ServiceMutationLease) -> Result<ExitCode, String>,
+{
     let mutation_lock = service_manager::acquire_mutation_lock()?;
     let before_service = service_snapshot()?;
     let before_supervisor = herdr_supervisor::capture_install_state_for_service()?;
     herdr_supervisor::preflight_install_for_service()?;
+    let result = install(&mutation_lock)?;
+    finish_install_lifecycle(before_service, before_supervisor, &mutation_lock, result)
+}
 
-    let result = service_manager::run_with_mutation_lock(
-        ServiceCommand::Install { adopt_node },
-        &mutation_lock,
-    )?;
+/// The lifecycle after the service commit itself, shared by the public install
+/// and the internal install-from-payload path so the sidecar orchestration
+/// (guardian, Herdr supervisor, product identity/update fence, production Link
+/// generation reconcile, native-host sync, compensation) never diverges.
+fn finish_install_lifecycle(
+    before_service: ServiceSnapshot,
+    before_supervisor: herdr_supervisor::InstallState,
+    mutation_lock: &service_manager::ServiceMutationLease,
+    result: ExitCode,
+) -> Result<ExitCode, String> {
     if result != ExitCode::SUCCESS {
         return Ok(result);
     }
@@ -66,10 +113,10 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
         let service_recovery = match recovery {
             InstallRecovery::None => Ok(ExitCode::SUCCESS),
             InstallRecovery::Rollback => {
-                service_manager::run_with_mutation_lock(ServiceCommand::Rollback, &mutation_lock)
+                service_manager::run_with_mutation_lock(ServiceCommand::Rollback, mutation_lock)
             }
             InstallRecovery::Uninstall => {
-                service_manager::run_with_mutation_lock(ServiceCommand::Uninstall, &mutation_lock)
+                service_manager::run_with_mutation_lock(ServiceCommand::Uninstall, mutation_lock)
             }
         };
 
@@ -111,10 +158,10 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
         let service_recovery = match recovery {
             InstallRecovery::None => Ok(ExitCode::SUCCESS),
             InstallRecovery::Rollback => {
-                service_manager::run_with_mutation_lock(ServiceCommand::Rollback, &mutation_lock)
+                service_manager::run_with_mutation_lock(ServiceCommand::Rollback, mutation_lock)
             }
             InstallRecovery::Uninstall => {
-                service_manager::run_with_mutation_lock(ServiceCommand::Uninstall, &mutation_lock)
+                service_manager::run_with_mutation_lock(ServiceCommand::Uninstall, mutation_lock)
             }
         };
         let service_recovered = matches!(service_recovery, Ok(code) if code == ExitCode::SUCCESS);
@@ -169,13 +216,12 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
             let recovery = install_recovery(&before_service, &after_service);
             let service_recovery = match recovery {
                 InstallRecovery::None => Ok(ExitCode::SUCCESS),
-                InstallRecovery::Rollback => service_manager::run_with_mutation_lock(
-                    ServiceCommand::Rollback,
-                    &mutation_lock,
-                ),
+                InstallRecovery::Rollback => {
+                    service_manager::run_with_mutation_lock(ServiceCommand::Rollback, mutation_lock)
+                }
                 InstallRecovery::Uninstall => service_manager::run_with_mutation_lock(
                     ServiceCommand::Uninstall,
-                    &mutation_lock,
+                    mutation_lock,
                 ),
             };
             let service_recovered =

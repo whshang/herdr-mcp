@@ -60,6 +60,28 @@ pub(crate) fn run_with_mutation_lock(
     }
 }
 
+/// Crate-internal install-from-payload seam: the current orchestrator owns the
+/// entire service lifecycle transaction while the installed generation bytes
+/// come from an explicit payload path (used by `dev rollback` to restore a
+/// pinned older PROD binary without executing that older binary as the
+/// orchestrator). Normal public `service install` never routes through this
+/// seam; it keeps `current_exe` as both orchestrator and payload.
+pub(crate) fn run_install_from_payload(
+    adopt_node: bool,
+    payload_binary: &std::path::Path,
+    mutation_lock: &ServiceMutationLease,
+) -> Result<ExitCode, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (adopt_node, payload_binary, mutation_lock);
+        Err("service_manager_currently_requires_macos".to_owned())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::run_install_from_payload(adopt_node, payload_binary, &mutation_lock.inner)
+    }
+}
+
 /// Return the managed Rust binary targeted by the current ready rollback.
 /// This is read-only preflight data; `rollback()` independently revalidates the
 /// ledger and target immediately before mutation.
@@ -557,7 +579,17 @@ mod macos {
         instance: InstanceId,
         home: PathBuf,
         config_dir: PathBuf,
+        /// The binary whose bytes become the installed runtime generation. For a
+        /// normal install this is the executing `current_exe`; for an internal
+        /// dev-rollback install from a pinned older PROD payload it is that
+        /// payload. Generation preparation, no-op comparison, and expected
+        /// health generation all derive from this identity.
         source_binary: PathBuf,
+        /// The binary that owns this service transaction and its guardian child.
+        /// Always the executing current orchestrator (never the install payload),
+        /// so guardian recovery and lifecycle code stay on the current runtime
+        /// even when the installed generation is older.
+        orchestrator_binary: PathBuf,
         runtime_root: PathBuf,
         generations_dir: PathBuf,
         current_link: PathBuf,
@@ -718,96 +750,13 @@ mod macos {
         };
         let mutation_lock = external_mutation_lock.or(owned_mutation_lock.as_ref());
         let result = match command {
-            ServiceCommand::Install { adopt_node } => {
-                crate::update_scheduler::preflight_service_install_fence()?;
-                crate::product_lifecycle::preflight_installation_identity()?;
-                // Capture the exact prior integration state (identity marker,
-                // service-uninstall fence, auto-update scheduler) before the
-                // service commit so a failed post-commit step can restore it.
-                let identity_prior = crate::product_lifecycle::capture_installation_identity()?;
-                let integration_prior =
-                    crate::update_scheduler::InstallIntegrationSnapshot::capture()?;
-                let mut result = install(
-                    &paths,
-                    adopt_node,
-                    mutation_lock
-                        .as_ref()
-                        .expect("install must hold the service mutation lock"),
-                )?;
-                if result.get("ok").and_then(Value::as_bool) != Some(true) {
-                    // Defensive parity with the historical result shape: a
-                    // failed install reports one aggregated failure instead of
-                    // running post-commit steps against an uncommitted service.
-                    if let Some(object) = result.as_object_mut() {
-                        object.insert(
-                            "product_installation_identity".to_owned(),
-                            json!({ "ok": false, "skipped": "service_install_failed" }),
-                        );
-                    }
-                    result
-                } else {
-                    // Post-commit steps are fail-fast: product identity persistence,
-                    // update-uninstall fence clearing, then checked auto-update
-                    // scheduler setup. Any failure is propagated (never silently
-                    // swallowed) and, when the install actually changed the service,
-                    // the committed service change is compensated via rollback or
-                    // uninstall before the original error is returned, then the
-                    // pre-install integration state is restored.
-                    let scheduler = install_post_commit(
-                        &result,
-                        crate::product_lifecycle::record_installation_identity,
-                        crate::update_scheduler::clear_service_uninstall_fence,
-                        || {
-                            let value = crate::update_scheduler::reconcile_after_service_install();
-                            if value.get("ok").and_then(Value::as_bool) == Some(true) {
-                                Ok(value)
-                            } else {
-                                Err(value
-                                    .get("detail")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("auto-update scheduler setup failed")
-                                    .to_owned())
-                            }
-                        },
-                        || {
-                            let code = rollback(
-                                &paths,
-                                mutation_lock
-                                    .as_ref()
-                                    .expect("install must hold the service mutation lock"),
-                            )?;
-                            if code.get("ok").and_then(Value::as_bool) == Some(true) {
-                                Ok(())
-                            } else {
-                                Err("service rollback returned failure".to_owned())
-                            }
-                        },
-                        || {
-                            let code = uninstall(&paths)?;
-                            if code.get("ok").and_then(Value::as_bool) == Some(true) {
-                                Ok(())
-                            } else {
-                                Err("service uninstall returned failure".to_owned())
-                            }
-                        },
-                        || {
-                            integration_prior.restore(|| {
-                                crate::product_lifecycle::restore_installation_identity(
-                                    identity_prior.as_deref(),
-                                )
-                            })
-                        },
-                    )?;
-                    if let Some(object) = result.as_object_mut() {
-                        object.insert(
-                            "product_installation_identity".to_owned(),
-                            json!({"ok": true, "recorded": true}),
-                        );
-                        object.insert("auto_update_scheduler".to_owned(), scheduler);
-                    }
-                    result
-                }
-            }
+            ServiceCommand::Install { adopt_node } => install_with_post_commit(
+                &paths,
+                adopt_node,
+                mutation_lock
+                    .as_ref()
+                    .expect("install must hold the service mutation lock"),
+            )?,
             ServiceCommand::Status => status(&paths)?,
             ServiceCommand::Start => start(&paths)?,
             ServiceCommand::Stop => stop(&paths)?,
@@ -844,6 +793,122 @@ mod macos {
         })
     }
 
+    /// Run one install command against an already-discovered paths set and
+    /// return the raw result value without printing it. This is the single
+    /// shared install implementation for the public `service install` path and
+    /// the internal dev-rollback install-from-payload path: preflight fences,
+    /// identity capture, the service commit, and the fail-fast post-commit
+    /// sequence (product identity persistence, update-uninstall fence clearing,
+    /// checked auto-update scheduler setup) with rollback/uninstall compensation
+    /// and integration restore all stay here, in current orchestrator code.
+    fn install_with_post_commit(
+        paths: &ServicePaths,
+        adopt_node: bool,
+        mutation_lock: &ServiceMutationLock,
+    ) -> Result<Value, String> {
+        crate::update_scheduler::preflight_service_install_fence()?;
+        crate::product_lifecycle::preflight_installation_identity()?;
+        // Capture the exact prior integration state (identity marker,
+        // service-uninstall fence, auto-update scheduler) before the
+        // service commit so a failed post-commit step can restore it.
+        let identity_prior = crate::product_lifecycle::capture_installation_identity()?;
+        let integration_prior = crate::update_scheduler::InstallIntegrationSnapshot::capture()?;
+        let mut result = install(paths, adopt_node, mutation_lock)?;
+        if result.get("ok").and_then(Value::as_bool) != Some(true) {
+            // Defensive parity with the historical result shape: a
+            // failed install reports one aggregated failure instead of
+            // running post-commit steps against an uncommitted service.
+            if let Some(object) = result.as_object_mut() {
+                object.insert(
+                    "product_installation_identity".to_owned(),
+                    json!({ "ok": false, "skipped": "service_install_failed" }),
+                );
+            }
+            return Ok(result);
+        }
+        // Post-commit steps are fail-fast: product identity persistence,
+        // update-uninstall fence clearing, then checked auto-update
+        // scheduler setup. Any failure is propagated (never silently
+        // swallowed) and, when the install actually changed the service,
+        // the committed service change is compensated via rollback or
+        // uninstall before the original error is returned, then the
+        // pre-install integration state is restored.
+        let scheduler = install_post_commit(
+            &result,
+            crate::product_lifecycle::record_installation_identity,
+            crate::update_scheduler::clear_service_uninstall_fence,
+            || {
+                let value = crate::update_scheduler::reconcile_after_service_install();
+                if value.get("ok").and_then(Value::as_bool) == Some(true) {
+                    Ok(value)
+                } else {
+                    Err(value
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .unwrap_or("auto-update scheduler setup failed")
+                        .to_owned())
+                }
+            },
+            || {
+                let code = rollback(paths, mutation_lock)?;
+                if code.get("ok").and_then(Value::as_bool) == Some(true) {
+                    Ok(())
+                } else {
+                    Err("service rollback returned failure".to_owned())
+                }
+            },
+            || {
+                let code = uninstall(paths)?;
+                if code.get("ok").and_then(Value::as_bool) == Some(true) {
+                    Ok(())
+                } else {
+                    Err("service uninstall returned failure".to_owned())
+                }
+            },
+            || {
+                integration_prior.restore(|| {
+                    crate::product_lifecycle::restore_installation_identity(
+                        identity_prior.as_deref(),
+                    )
+                })
+            },
+        )?;
+        if let Some(object) = result.as_object_mut() {
+            object.insert(
+                "product_installation_identity".to_owned(),
+                json!({"ok": true, "recorded": true}),
+            );
+            object.insert("auto_update_scheduler".to_owned(), scheduler);
+        }
+        Ok(result)
+    }
+
+    /// Internal install-from-payload seam used by `dev rollback`: the current
+    /// orchestrator owns the whole service lifecycle transaction while the
+    /// installed generation bytes come from an explicit pinned payload path.
+    /// The independent-process fence is mirrored here so this internal path can
+    /// never run from a managed herdr_exec session, and no service result JSON
+    /// is printed so the dev command's stdout stays a single dev JSON document.
+    pub(super) fn run_install_from_payload(
+        adopt_node: bool,
+        payload_binary: &Path,
+        mutation_lock: &ServiceMutationLock,
+    ) -> Result<ExitCode, String> {
+        if env::var_os("HERDR_MCP_EXEC_ID").is_some() {
+            return Err(
+                "service mutations cannot run inside a managed herdr_exec session; run the command from an independent terminal so restarting dev.herdr-mcp.server cannot terminate its own upgrade transaction"
+                    .to_owned(),
+            );
+        }
+        let paths = ServicePaths::discover_with_payload(payload_binary)?;
+        let result = install_with_post_commit(&paths, adopt_node, mutation_lock)?;
+        Ok(if result.get("ok").and_then(Value::as_bool) == Some(true) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        })
+    }
+
     fn service_command_requires_independent_process(command: &ServiceCommand) -> bool {
         !matches!(command, ServiceCommand::Status)
     }
@@ -870,16 +935,61 @@ mod macos {
                 runtime.instance,
                 home,
                 runtime.config_dir,
+                source_binary.clone(),
                 source_binary,
                 herdr_socket,
             ))
         }
 
+        /// Discover paths with an explicit install payload distinct from the
+        /// executing orchestrator. The orchestrator (guardian/lifecycle owner)
+        /// stays the current executable; `source_binary` becomes the supplied
+        /// payload whose bytes are installed as the new generation.
+        fn discover_with_payload(payload_binary: &Path) -> Result<Self, String> {
+            let metadata = fs::symlink_metadata(payload_binary).map_err(|error| {
+                format!(
+                    "cannot inspect install payload {}: {error}",
+                    payload_binary.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "install payload must be a regular non-symlink file: {}",
+                    payload_binary.display()
+                ));
+            }
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return Err(format!(
+                    "install payload is not executable: {}",
+                    payload_binary.display()
+                ));
+            }
+            let home = env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or_else(|| "cannot determine user home directory".to_owned())?;
+            let runtime = RuntimePaths::discover()?;
+            let orchestrator_binary = env::current_exe()
+                .map_err(|error| format!("cannot locate current herdr-mcp binary: {error}"))?;
+            let herdr_socket = runtime
+                .herdr_socket
+                .ok_or_else(|| "service manager requires a Herdr Unix socket path".to_owned())?;
+            Ok(Self::for_values(
+                runtime.instance,
+                home,
+                runtime.config_dir,
+                payload_binary.to_path_buf(),
+                orchestrator_binary,
+                herdr_socket,
+            ))
+        }
+
+        #[allow(clippy::too_many_arguments)]
         fn for_values(
             instance: InstanceId,
             home: PathBuf,
             config_dir: PathBuf,
             source_binary: PathBuf,
+            orchestrator_binary: PathBuf,
             herdr_socket: PathBuf,
         ) -> Self {
             let runtime_root = config_dir.join("runtime");
@@ -912,6 +1022,7 @@ mod macos {
                 home,
                 config_dir,
                 source_binary,
+                orchestrator_binary,
                 runtime_root,
                 generations_dir,
                 current_link,
@@ -1363,7 +1474,7 @@ mod macos {
         write_guardian_record(paths, &record)?;
 
         let binary = guardian_binary_path(paths, &record.transaction_id)?;
-        atomic_copy_executable(&paths.source_binary, &binary)?;
+        atomic_copy_executable(&paths.orchestrator_binary, &binary)?;
         let log_path = guardian_log_path(paths, &record.transaction_id)?;
         let log = OpenOptions::new()
             .create(true)
@@ -3982,12 +4093,14 @@ mod macos {
                 home.clone(),
                 config_a,
                 source.clone(),
+                source.clone(),
                 socket.clone(),
             );
             let b = ServicePaths::for_values(
                 InstanceId::default_instance(),
                 home,
                 config_b,
+                source.clone(),
                 source,
                 socket,
             );
@@ -4029,6 +4142,36 @@ mod macos {
                     .and_then(PlistValue::as_unsigned_integer),
                 Some(10)
             );
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn explicit_payload_keeps_orchestrator_identity_separate() {
+            let root = root("payload-orchestrator-split");
+            let home = root.join("home");
+            let config = home.join(".config/herdr-mcp");
+            fs::create_dir_all(&config).unwrap();
+            let payload = root.join("prod-payload");
+            let orchestrator = root.join("current-orchestrator");
+            fs::write(&payload, b"old-prod-payload").unwrap();
+            fs::write(&orchestrator, b"new-v043-orchestrator").unwrap();
+            fs::set_permissions(&payload, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&orchestrator, fs::Permissions::from_mode(0o700)).unwrap();
+            let paths = ServicePaths::for_values(
+                InstanceId::default_instance(),
+                home.clone(),
+                config,
+                payload.clone(),
+                orchestrator.clone(),
+                home.join(".config/herdr/herdr.sock"),
+            );
+
+            let prepared = prepare_generation(&paths).unwrap();
+            assert_eq!(fs::read(&prepared.binary).unwrap(), b"old-prod-payload");
+            assert_eq!(paths.source_binary, payload);
+            assert_eq!(paths.orchestrator_binary, orchestrator);
+            assert_ne!(paths.source_binary, paths.orchestrator_binary);
+
             fs::remove_dir_all(root).unwrap();
         }
 
@@ -4116,6 +4259,7 @@ mod macos {
                 InstanceId::default_instance(),
                 home.clone(),
                 config,
+                source.clone(),
                 source,
                 home.join(".config/herdr/herdr.sock"),
             );
