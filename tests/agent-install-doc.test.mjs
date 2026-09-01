@@ -7,18 +7,20 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (p) => readFileSync(path.join(ROOT, p), "utf8");
 
-test("README links directly to Agent-first install protocols without copy-prompt wrappers", () => {
-  const en = read("README.md");
-  const zh = read("README.zh.md");
-  const ja = read("README.ja.md");
-  assert.match(en, /agent-install\.md/);
-  assert.match(zh, /agent-install\.md/);
-  assert.match(ja, /agent-install\.md/);
-  assert.match(en, /Agent-first setup/);
-  assert.match(zh, /Agent-first 安装/);
-  assert.match(ja, /Agent-first セットアップ/);
-  for (const doc of [en, zh, ja]) {
-    assert.doesNotMatch(doc, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\//);
+test("README gives the Agent one executable install sentence plus a short explanation", () => {
+  const cases = [
+    ["README.md", /Recommended: paste one sentence to your Agent/, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/agent-install\.md/, /The Agent checks the machine/],
+    ["README.zh.md", /推荐：给 Agent 一句话/, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/zh-CN\/agent-install\.md/, /Agent 会检查电脑环境/],
+    ["README.ja.md", /推奨：Agent に一文だけ渡す/, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\/en\/agent-install\.md/, /Agent は/],
+  ];
+  for (const [rel, heading, protocol, explanation] of cases) {
+    const doc = read(rel);
+    assert.match(doc, heading);
+    assert.match(doc, protocol);
+    assert.match(doc, /GitHub Release/i);
+    assert.match(doc, explanation);
+    assert.match(doc, /Cloudflare/);
+    assert.match(doc, /ChatGPT/);
   }
 });
 
@@ -77,10 +79,10 @@ test("maintainer install keeps deterministic Worker/bootstrap details while end-
   }
   for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
     const doc = read(rel);
-    assert.match(doc, /agent-install\.md/);
+    assert.match(doc, /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\//);
     assert.match(doc, /Chrome Web Store/);
-    assert.match(doc, /STANDALONE/);
     assert.doesNotMatch(doc, /scripts\/cloudflare-worker-name\.mjs/);
+    assert.doesNotMatch(doc, /## (?:Local runtime CLI|本机 runtime CLI)/);
   }
 });
 
