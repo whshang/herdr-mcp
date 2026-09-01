@@ -50,6 +50,8 @@ herdr-mcp worker connect "<pairing-address>" --name "<device-name>"
 
 随后 CLI 会通过不回显输入要求 6 位验证码。验证码不会作为普通命令行参数传入。
 
+配对被消费后，`worker connect` 会自动安装/启动本机 `herdr-mcp` 服务，并确保当前设备对应的 Rust production Link 已创建并加载。只有本机 service 健康、`link-prod` 已由 managed runtime 持有且设备身份正确时命令才返回成功；启动失败会进入既有的远端 revoke、Keychain 清理和 config 恢复补偿流程。
+
 使用 Agent 安装时，可以直接把这一句话发给新电脑上的 Coding Agent：
 
 ```text

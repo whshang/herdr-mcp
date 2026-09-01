@@ -22,10 +22,11 @@ use std::time::Instant;
 
 use super::cutover_execute::LaunchdOps;
 #[cfg(target_os = "macos")]
-use super::cutover_execute::{RealLaunchd, atomic_write};
+use super::cutover_execute::{RealLaunchd, atomic_write, encode_prod_rust_plist};
 #[cfg(target_os = "macos")]
 use super::install::{
-    configured_edge_device_identity, configured_edge_ws_url, inherited_proxy_env,
+    candidate_program_arguments, configured_edge_device_identity, configured_edge_ws_url,
+    inherited_proxy_env,
 };
 #[cfg(target_os = "macos")]
 use super::migrate_runtime_control::{
@@ -34,7 +35,7 @@ use super::migrate_runtime_control::{
 use super::ownership::LINK_PROD_LABEL;
 #[cfg(target_os = "macos")]
 use super::ownership::{
-    LinkImplementation, assess_agent, program_points_at_managed_runtime,
+    LinkAgentView, LinkImplementation, assess_agent, program_points_at_managed_runtime,
     read_status_active_generation,
 };
 use super::runtime_control::retryable_candidate_outcome;
@@ -78,18 +79,9 @@ pub(crate) fn reconcile_after_service_generation_change(
         let home = home_dir()
             .ok_or_else(|| "HOME is required for Link generation reconcile".to_owned())?;
         let launchd = RealLaunchd;
-        let loaded = launchd.is_loaded(LINK_PROD_LABEL)?;
-        let prod = assess_agent(&home, LINK_PROD_LABEL, loaded);
-
-        // A missing, stopped, Node-owned, or foreign prod Link is outside this
-        // lifecycle. Service install must not bootstrap or seize it implicitly.
-        if !prod.present
-            || !prod.loaded
-            || prod.implementation != LinkImplementation::Rust
-            || !program_points_at_managed_runtime(&prod.program_arguments, &home)
-        {
+        let Some(prod) = ensure_enrolled_rust_prod_link(&home, paths, &launchd)? else {
             return Ok(());
-        }
+        };
 
         let generation = active_rust_generation_id(&home)?;
         let runtime_version = read_binary_version_hint(&home);
@@ -134,6 +126,210 @@ pub(crate) fn reconcile_after_service_generation_change(
             || read_convergence_evidence(&control_path, &status_path),
         )
     }
+}
+
+/// Remove a production Link that was created by the current higher-level
+/// transaction after that transaction has failed. Callers must only invoke
+/// this when they captured evidence that link-prod did not exist before the
+/// transaction. The helper re-checks ownership and refuses to remove a
+/// Node/foreign or non-managed-runtime Link.
+#[cfg(target_os = "macos")]
+pub(crate) fn remove_fresh_owned_prod_link_after_failed_activation(
+    home: &Path,
+) -> Result<bool, String> {
+    remove_fresh_owned_prod_link_after_failed_activation_with(home, &RealLaunchd)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_fresh_owned_prod_link_after_failed_activation_with<L: LaunchdOps>(
+    home: &Path,
+    launchd: &L,
+) -> Result<bool, String> {
+    let plist_path = home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LINK_PROD_LABEL}.plist"));
+    let loaded = launchd.is_loaded(LINK_PROD_LABEL)?;
+    if !loaded && !plist_path.exists() {
+        return Ok(false);
+    }
+
+    let prod = assess_agent(home, LINK_PROD_LABEL, loaded);
+    if !prod.present
+        || prod.implementation != LinkImplementation::Rust
+        || !program_points_at_managed_runtime(&prod.program_arguments, home)
+        || prod.plist_path != plist_path
+    {
+        return Err(
+            "refusing failed-activation cleanup because production Link ownership changed or is not the standard owned Rust managed-runtime link"
+                .to_owned(),
+        );
+    }
+
+    if loaded {
+        launchd.bootout_prod(LINK_PROD_LABEL)?;
+        if launchd.is_loaded(LINK_PROD_LABEL)? {
+            return Err(format!(
+                "production Link {LINK_PROD_LABEL} is still loaded after failed-activation cleanup"
+            ));
+        }
+    }
+    if plist_path.exists() {
+        fs::remove_file(&plist_path).map_err(|error| {
+            format!(
+                "cannot remove fresh production Link plist {} after failed activation: {error}",
+                plist_path.display()
+            )
+        })?;
+    }
+    Ok(true)
+}
+
+/// Ensure that a default-instance workstation which already has an immutable
+/// per-device Edge identity also has a live Rust production Link. This is not
+/// a general ownership takeover: a missing Link is created only for an enrolled
+/// device, while an existing Node/foreign Link remains untouched. A stopped
+/// owned Rust Link may be restarted after refreshing its persisted identity.
+#[cfg(target_os = "macos")]
+fn ensure_enrolled_rust_prod_link<L: LaunchdOps>(
+    home: &Path,
+    paths: &RuntimePaths,
+    launchd: &L,
+) -> Result<Option<LinkAgentView>, String> {
+    let enrolled =
+        configured_edge_ws_url(home).is_some() && configured_edge_device_identity(home).is_some();
+    let loaded = launchd.is_loaded(LINK_PROD_LABEL)?;
+    let mut prod = assess_agent(home, LINK_PROD_LABEL, loaded);
+
+    if !prod.present {
+        if !enrolled {
+            // Preserve historical behavior for ordinary service installation
+            // before Worker enrollment.
+            return Ok(None);
+        }
+        install_fresh_rust_prod_link(home, launchd)?;
+        let loaded = launchd.is_loaded(LINK_PROD_LABEL)?;
+        prod = assess_agent(home, LINK_PROD_LABEL, loaded);
+    }
+
+    if prod.implementation != LinkImplementation::Rust
+        || !program_points_at_managed_runtime(&prod.program_arguments, home)
+    {
+        // Never rewrite or bootstrap an existing Node/foreign production Link.
+        if enrolled {
+            return Err(
+                "enrolled device requires an owned Rust production Link; refusing to seize an existing Node/foreign link-prod"
+                    .to_owned(),
+            );
+        }
+        return Ok(None);
+    }
+
+    if !prod.loaded {
+        let generation = active_rust_generation_id(home)?;
+        let runtime_version = read_binary_version_hint(home);
+        refresh_prod_plist_generation(
+            home,
+            &prod.plist_path,
+            &generation,
+            runtime_version.as_deref(),
+        )?;
+        launchd.bootstrap_prod(&prod.plist_path, LINK_PROD_LABEL)?;
+        if !launchd.is_loaded(LINK_PROD_LABEL)? {
+            return Err(format!(
+                "production Link {LINK_PROD_LABEL} is still not loaded after bootstrap"
+            ));
+        }
+        prod = assess_agent(home, LINK_PROD_LABEL, true);
+    }
+
+    if !prod.loaded {
+        return Err(format!("production Link {LINK_PROD_LABEL} is not loaded"));
+    }
+
+    let _ = paths;
+    Ok(Some(prod))
+}
+
+#[cfg(target_os = "macos")]
+fn install_fresh_rust_prod_link<L: LaunchdOps>(home: &Path, launchd: &L) -> Result<(), String> {
+    let plist_path = home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LINK_PROD_LABEL}.plist"));
+    if plist_path.exists() {
+        return Err(format!(
+            "refusing fresh production Link install because {} already exists",
+            plist_path.display()
+        ));
+    }
+
+    let parent = plist_path
+        .parent()
+        .ok_or_else(|| "production Link plist has no parent directory".to_owned())?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "cannot create production Link directory {}: {error}",
+            parent.display()
+        )
+    })?;
+
+    let mut source = Dictionary::new();
+    source.insert(
+        "Label".to_owned(),
+        PlistValue::String(LINK_PROD_LABEL.to_owned()),
+    );
+    // Fresh link-prod must watch the production runtime-control/status pair.
+    // Without these explicit paths the Rust daemon falls back to the plain
+    // candidate files and generation reconciliation can observe a different
+    // state plane from the running production Link.
+    let config_dir = home.join(".config").join("herdr-mcp");
+    let mut source_env = Dictionary::new();
+    source_env.insert(
+        "HERDR_RUNTIME_CONTROL_PATH".to_owned(),
+        PlistValue::String(
+            config_dir
+                .join("runtime-control-prod.json")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+    source_env.insert(
+        "HERDR_RUNTIME_STATUS_PATH".to_owned(),
+        PlistValue::String(
+            config_dir
+                .join("runtime-status-prod.json")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+    source.insert(
+        "EnvironmentVariables".to_owned(),
+        PlistValue::Dictionary(source_env),
+    );
+    let mut source_bytes = Vec::new();
+    PlistValue::Dictionary(source)
+        .to_writer_xml(&mut source_bytes)
+        .map_err(|error| format!("cannot encode fresh production Link source plist: {error}"))?;
+    let program = candidate_program_arguments(home)?;
+    let (rust_bytes, _) = encode_prod_rust_plist(home, &source_bytes, &program)?;
+    atomic_write(&plist_path, &rust_bytes, 0o600)?;
+
+    if let Err(error) = launchd.bootstrap_prod(&plist_path, LINK_PROD_LABEL) {
+        let _ = fs::remove_file(&plist_path);
+        return Err(format!(
+            "cannot bootstrap fresh production Link; plist was removed: {error}"
+        ));
+    }
+    if !launchd.is_loaded(LINK_PROD_LABEL)? {
+        let _ = launchd.bootout_prod(LINK_PROD_LABEL);
+        let _ = fs::remove_file(&plist_path);
+        return Err(
+            "fresh production Link bootstrap returned success but launchd reports it unloaded; plist was removed"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// Resolve the live prod runtime-control document path, preferring the prod
@@ -592,6 +788,110 @@ mod tests {
     use super::*;
     use crate::link::cutover_execute::FakeLaunchd;
     use std::path::Path;
+
+    #[cfg(target_os = "macos")]
+    fn enrolled_test_home(label: &str) -> (PathBuf, RuntimePaths) {
+        use std::os::unix::fs::symlink;
+
+        let home = std::env::temp_dir().join(format!(
+            "herdr-link-enrolled-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let config_dir = home.join(".config/herdr-mcp");
+        let runtime = config_dir.join("runtime");
+        let generation = runtime.join("generations/rust-testconnect01");
+        std::fs::create_dir_all(&generation).unwrap();
+        std::fs::write(generation.join("herdr-mcp"), b"test-binary").unwrap();
+        symlink("generations/rust-testconnect01", runtime.join("current")).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[edge]\npublic_origin = \"https://edge.example\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n",
+        )
+        .unwrap();
+        let paths = RuntimePaths {
+            instance: crate::instance::InstanceId::default_instance(),
+            config_file: config_dir.join("config.toml"),
+            config_dir: config_dir.clone(),
+            dev_state_dir: home.join(".config/herdr-mcp-dev"),
+            herdr_socket: None,
+        };
+        (home, paths)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn enrolled_device_bootstraps_missing_rust_prod_link() {
+        let (home, paths) = enrolled_test_home("fresh");
+        let launchd = FakeLaunchd::new();
+
+        let prod = ensure_enrolled_rust_prod_link(&home, &paths, &launchd)
+            .unwrap()
+            .expect("enrolled device should create link-prod");
+
+        assert!(prod.loaded);
+        assert_eq!(prod.implementation, LinkImplementation::Rust);
+        assert!(program_points_at_managed_runtime(
+            &prod.program_arguments,
+            &home
+        ));
+        assert_eq!(launchd.bootstraps().len(), 1);
+        assert_eq!(launchd.bootstraps()[0].0, LINK_PROD_LABEL);
+
+        let plist = std::fs::read_to_string(&prod.plist_path).unwrap();
+        assert!(plist.contains("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(plist.contains("herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(plist.contains("HERDR_EDGE_URL"));
+        assert!(plist.contains("HERDR_RUNTIME_CONTROL_PATH"));
+        assert!(plist.contains("runtime-control-prod.json"));
+        assert!(plist.contains("HERDR_RUNTIME_STATUS_PATH"));
+        assert!(plist.contains("runtime-status-prod.json"));
+        assert!(!plist.contains("devsec_"));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_prod_link_bootstrap_failure_removes_new_plist() {
+        let (home, paths) = enrolled_test_home("bootstrap-fail");
+        let launchd = FakeLaunchd::new();
+        launchd.fail_next_bootstrap();
+
+        let error = ensure_enrolled_rust_prod_link(&home, &paths, &launchd).unwrap_err();
+        assert!(error.contains("plist was removed"));
+        assert!(
+            !home
+                .join("Library/LaunchAgents")
+                .join(format!("{LINK_PROD_LABEL}.plist"))
+                .exists()
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_activation_cleanup_removes_only_fresh_owned_rust_prod_link() {
+        let (home, paths) = enrolled_test_home("failed-activation-cleanup");
+        let launchd = FakeLaunchd::new();
+        ensure_enrolled_rust_prod_link(&home, &paths, &launchd)
+            .unwrap()
+            .expect("enrolled device should create link-prod");
+
+        assert!(
+            remove_fresh_owned_prod_link_after_failed_activation_with(&home, &launchd).unwrap()
+        );
+        assert!(!launchd.is_loaded(LINK_PROD_LABEL).unwrap());
+        assert!(
+            !home
+                .join("Library/LaunchAgents")
+                .join(format!("{LINK_PROD_LABEL}.plist"))
+                .exists()
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

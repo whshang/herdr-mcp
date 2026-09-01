@@ -30,6 +30,8 @@
 
    CLI は**6 桁のコードの入力を求めます**（エコーバックなしの TTY プロンプト、または非対話時はエコーなしの stdin 1 行）。コードは**決してコマンドライン引数にはならず**、**決してエコーまたはログ記録されません**。
 
+   ペアリング消費後、`worker connect` はローカル `herdr-mcp` service を自動的にインストール/起動し、登録済み Rust production Link を作成してロードします。ローカル service が healthy で、`link-prod` が managed runtime と新しい device identity を使用していることを確認できた場合のみ成功を返します。失敗時は既存の revoke / Keychain / config 補償経路を使用します。
+
 3. 成功すると、一時的なペアリングが既存の高エントロピー毎デバイス秘密情報と交換されます。最終的なデバイス秘密情報は**macOS Keychain のみ**に保存されます。ペアリングコード/セッションは即座に使用不能になります。参加デバイスでは、Cloudflare デプロイ資格情報も旧来の `LINK_SHARED_SECRET` も使用されません。
 
 ## セキュリティ規則
