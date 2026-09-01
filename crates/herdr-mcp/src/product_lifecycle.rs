@@ -514,6 +514,7 @@ mod macos {
         let home = home_dir()?;
         let _safe_config = validate_config_root(&home, &paths.config_dir, &paths.instance)?;
         let _product_lock = ProductMutationLock::acquire(&home, &paths.instance)?;
+        let service_mutation_lock = crate::service_manager::acquire_mutation_lock()?;
         let status = crate::service_manager::doctor_status()?;
         let service_installed = preflight_service(&paths, &status, "reinstall")?;
         let before_generation = status
@@ -526,7 +527,10 @@ mod macos {
         // Product reinstall intentionally bypasses `service_lifecycle`: that
         // wrapper reconciles the independent Herdr supervisor. The service
         // manager is the transactional herdr-mcp-only install primitive.
-        let code = crate::service_manager::run(ServiceCommand::Install { adopt_node: false })?;
+        let code = crate::service_manager::run_with_mutation_lock(
+            ServiceCommand::Install { adopt_node: false },
+            &service_mutation_lock,
+        )?;
         if code != ExitCode::SUCCESS {
             return Ok(code);
         }
@@ -551,6 +555,7 @@ mod macos {
             Err(error) => {
                 compensate_failed_reinstall(
                     &paths,
+                    &service_mutation_lock,
                     service_installed,
                     before_generation.as_deref(),
                     &integration_snapshot,
@@ -579,6 +584,7 @@ mod macos {
 
     fn compensate_failed_reinstall(
         paths: &RuntimePaths,
+        service_mutation_lock: &crate::service_manager::ServiceMutationLease,
         service_was_installed: bool,
         before_generation: Option<&str>,
         integration_snapshot: &ReinstallIntegrationSnapshot,
@@ -592,7 +598,11 @@ mod macos {
             } else {
                 ServiceCommand::Uninstall
             };
-            let compensation = crate::service_manager::run(command).map_err(|error| {
+            let compensation = crate::service_manager::run_with_mutation_lock(
+                command,
+                service_mutation_lock,
+            )
+            .map_err(|error| {
                 format!(
                     "reinstall integration failed ({original_error}); service compensation also failed: {error}"
                 )

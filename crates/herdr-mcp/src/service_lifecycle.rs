@@ -24,6 +24,18 @@ enum RollbackSupervisorStrategy {
     Remove,
 }
 
+fn retry_sidecar_once<F>(label: &str, mut operation: F) -> Result<(), String>
+where
+    F: FnMut() -> Result<(), String>,
+{
+    match operation() {
+        Ok(()) => Ok(()),
+        Err(first) => operation().map_err(|second| {
+            format!("{label} failed: {first}; bounded retry also failed: {second}")
+        }),
+    }
+}
+
 pub(crate) fn run(command: ServiceCommand) -> Result<ExitCode, String> {
     match command {
         ServiceCommand::Install { adopt_node } => run_install(adopt_node),
@@ -34,11 +46,15 @@ pub(crate) fn run(command: ServiceCommand) -> Result<ExitCode, String> {
 }
 
 fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
+    let mutation_lock = service_manager::acquire_mutation_lock()?;
     let before_service = service_snapshot()?;
     let before_supervisor = herdr_supervisor::capture_install_state_for_service()?;
     herdr_supervisor::preflight_install_for_service()?;
 
-    let result = service_manager::run(ServiceCommand::Install { adopt_node })?;
+    let result = service_manager::run_with_mutation_lock(
+        ServiceCommand::Install { adopt_node },
+        &mutation_lock,
+    )?;
     if result != ExitCode::SUCCESS {
         return Ok(result);
     }
@@ -49,8 +65,12 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
         let cleanup_error = herdr_supervisor::remove_for_service().err();
         let service_recovery = match recovery {
             InstallRecovery::None => Ok(ExitCode::SUCCESS),
-            InstallRecovery::Rollback => service_manager::run(ServiceCommand::Rollback),
-            InstallRecovery::Uninstall => service_manager::run(ServiceCommand::Uninstall),
+            InstallRecovery::Rollback => {
+                service_manager::run_with_mutation_lock(ServiceCommand::Rollback, &mutation_lock)
+            }
+            InstallRecovery::Uninstall => {
+                service_manager::run_with_mutation_lock(ServiceCommand::Uninstall, &mutation_lock)
+            }
         };
 
         let service_recovered = matches!(service_recovery, Ok(code) if code == ExitCode::SUCCESS);
@@ -74,6 +94,11 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
             .err()
             .map(|error| format!("; previous supervisor state restore failed: {error}"))
             .unwrap_or_default();
+        if recovery != InstallRecovery::None && service_recovered {
+            return Err(format!(
+                "service install was rolled back but supervisor recovery is incomplete after Herdr supervisor activation failed: {supervisor_error}; {service_detail}{cleanup_detail}{restore_detail}"
+            ));
+        }
         return Err(format!(
             "service install committed but Herdr supervisor activation failed: {supervisor_error}; {service_detail}{cleanup_detail}{restore_detail}"
         ));
@@ -85,8 +110,12 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
         let recovery = install_recovery(&before_service, &after_service);
         let service_recovery = match recovery {
             InstallRecovery::None => Ok(ExitCode::SUCCESS),
-            InstallRecovery::Rollback => service_manager::run(ServiceCommand::Rollback),
-            InstallRecovery::Uninstall => service_manager::run(ServiceCommand::Uninstall),
+            InstallRecovery::Rollback => {
+                service_manager::run_with_mutation_lock(ServiceCommand::Rollback, &mutation_lock)
+            }
+            InstallRecovery::Uninstall => {
+                service_manager::run_with_mutation_lock(ServiceCommand::Uninstall, &mutation_lock)
+            }
         };
         let service_recovered = matches!(service_recovery, Ok(code) if code == ExitCode::SUCCESS);
         let supervisor_restore = if service_recovered {
@@ -95,8 +124,10 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
             Ok(())
         };
         let link_restore = if service_recovered && recovery != InstallRecovery::None {
-            RuntimePaths::discover()
-                .and_then(|paths| link::reconcile_after_service_generation_change(&paths))
+            retry_sidecar_once("production Link restore", || {
+                RuntimePaths::discover()
+                    .and_then(|paths| link::reconcile_after_service_generation_change(&paths))
+            })
         } else {
             Ok(())
         };
@@ -119,6 +150,11 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
             .err()
             .map(|error| format!("; production Link restore failed: {error}"))
             .unwrap_or_default();
+        if recovery != InstallRecovery::None && service_recovered {
+            return Err(format!(
+                "service install was rolled back but sidecar recovery is incomplete after production Link generation reconcile failed: {link_error}; {service_detail}{supervisor_detail}{link_detail}"
+            ));
+        }
         return Err(format!(
             "service install committed but production Link generation reconcile failed: {link_error}; {service_detail}{supervisor_detail}{link_detail}"
         ));
@@ -129,8 +165,76 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
         if !paths.instance.is_named()
             && let Err(native_host_error) = native_host_install::sync_owned_runtime_from_active()
         {
+            let after_service = service_snapshot()?;
+            let recovery = install_recovery(&before_service, &after_service);
+            let service_recovery = match recovery {
+                InstallRecovery::None => Ok(ExitCode::SUCCESS),
+                InstallRecovery::Rollback => service_manager::run_with_mutation_lock(
+                    ServiceCommand::Rollback,
+                    &mutation_lock,
+                ),
+                InstallRecovery::Uninstall => service_manager::run_with_mutation_lock(
+                    ServiceCommand::Uninstall,
+                    &mutation_lock,
+                ),
+            };
+            let service_recovered =
+                matches!(service_recovery, Ok(code) if code == ExitCode::SUCCESS);
+            let supervisor_restore = if service_recovered && recovery != InstallRecovery::None {
+                herdr_supervisor::restore_install_state_for_service(before_supervisor)
+            } else {
+                Ok(())
+            };
+            let link_restore = if service_recovered && recovery != InstallRecovery::None {
+                retry_sidecar_once("production Link restore", || {
+                    RuntimePaths::discover()
+                        .and_then(|paths| link::reconcile_after_service_generation_change(&paths))
+                })
+            } else {
+                Ok(())
+            };
+            let native_host_restore = if service_recovered && recovery != InstallRecovery::None {
+                retry_sidecar_once("native-host restore", || {
+                    native_host_install::sync_owned_runtime_from_active().map(|_| ())
+                })
+            } else {
+                Ok(())
+            };
+
+            if recovery != InstallRecovery::None
+                && service_recovered
+                && supervisor_restore.is_ok()
+                && link_restore.is_ok()
+                && native_host_restore.is_ok()
+            {
+                return Err(format!(
+                    "service install post-commit owned native-host runtime sync failed and the service change was recovered ({recovery:?}): {native_host_error}"
+                ));
+            }
+
+            let service_detail = match service_recovery {
+                Ok(code) => format!("service recovery exited with {code:?}"),
+                Err(error) => format!("service recovery failed: {error}"),
+            };
+            let supervisor_detail = supervisor_restore
+                .err()
+                .map(|error| format!("; previous supervisor state restore failed: {error}"))
+                .unwrap_or_default();
+            let link_detail = link_restore
+                .err()
+                .map(|error| format!("; production Link restore failed: {error}"))
+                .unwrap_or_default();
+            let native_host_detail = native_host_restore
+                .err()
+                .map(|error| format!("; native-host restore failed: {error}"))
+                .unwrap_or_default();
+            if recovery != InstallRecovery::None && service_recovered {
+                return Err(format!(
+                    "service install was rolled back but sidecar recovery is incomplete after owned native-host runtime sync failed: {native_host_error}; {service_detail}{supervisor_detail}{link_detail}{native_host_detail}"
+                ));
+            }
             return Err(format!(
-                "service install committed but owned native-host runtime sync failed: {native_host_error}"
+                "service install committed but owned native-host runtime sync failed: {native_host_error}; {service_detail}{supervisor_detail}{link_detail}{native_host_detail}"
             ));
         }
     }
@@ -140,6 +244,7 @@ fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
 
 fn run_rollback() -> Result<ExitCode, String> {
     refuse_sidecar_mutation_inside_managed_exec()?;
+    let mutation_lock = service_manager::acquire_mutation_lock()?;
     let before_supervisor = herdr_supervisor::capture_install_state_for_service()?;
     let target_supports_supervisor = match service_manager::rollback_target_runtime_binary()? {
         Some(binary) => herdr_supervisor::runtime_binary_supports_supervisor(&binary)?,
@@ -150,7 +255,7 @@ fn run_rollback() -> Result<ExitCode, String> {
         herdr_supervisor::remove_for_service()?;
     }
 
-    match service_manager::run(ServiceCommand::Rollback) {
+    match service_manager::run_with_mutation_lock(ServiceCommand::Rollback, &mutation_lock) {
         Ok(code) if code == ExitCode::SUCCESS => {
             if strategy == RollbackSupervisorStrategy::Preserve {
                 // The existing daemon stays alive in memory and retains its
@@ -166,6 +271,23 @@ fn run_rollback() -> Result<ExitCode, String> {
                     format!(
                         "service rollback committed but Herdr supervisor reconciliation failed: {error}"
                     )
+                })?;
+            }
+            let paths = RuntimePaths::discover()?;
+            retry_sidecar_once("production Link reconcile after service rollback", || {
+                link::reconcile_after_service_generation_change(&paths)
+            })
+            .map_err(|error| {
+                format!("service rollback completed but sidecars are incomplete: {error}")
+            })?;
+            #[cfg(target_os = "macos")]
+            if !paths.instance.is_named() {
+                retry_sidecar_once(
+                    "owned native-host runtime sync after service rollback",
+                    || native_host_install::sync_owned_runtime_from_active().map(|_| ()),
+                )
+                .map_err(|error| {
+                    format!("service rollback completed but sidecars are incomplete: {error}")
                 })?;
             }
             Ok(code)
@@ -198,10 +320,11 @@ fn rollback_supervisor_strategy(
 
 fn run_uninstall() -> Result<ExitCode, String> {
     refuse_sidecar_mutation_inside_managed_exec()?;
+    let mutation_lock = service_manager::acquire_mutation_lock()?;
     let before_supervisor = herdr_supervisor::capture_install_state_for_service()?;
     herdr_supervisor::remove_for_service()?;
 
-    match service_manager::run(ServiceCommand::Uninstall) {
+    match service_manager::run_with_mutation_lock(ServiceCommand::Uninstall, &mutation_lock) {
         Ok(code) if code == ExitCode::SUCCESS => Ok(code),
         Ok(code) => {
             restore_after_failed_service_mutation(before_supervisor, None)?;
@@ -318,6 +441,31 @@ mod tests {
             ),
             RollbackSupervisorStrategy::Remove
         );
+    }
+
+    #[test]
+    fn sidecar_retry_is_bounded_to_one_retry() {
+        let mut attempts = 0;
+        retry_sidecar_once("synthetic", || {
+            attempts += 1;
+            if attempts == 1 {
+                Err("first".to_owned())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+
+        let mut failed_attempts = 0;
+        let error = retry_sidecar_once("synthetic", || {
+            failed_attempts += 1;
+            Err(format!("failure-{failed_attempts}"))
+        })
+        .unwrap_err();
+        assert_eq!(failed_attempts, 2);
+        assert!(error.contains("failure-1"));
+        assert!(error.contains("failure-2"));
     }
 
     #[test]

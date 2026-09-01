@@ -16,11 +16,13 @@ use std::env;
 use std::fs;
 #[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 #[cfg(target_os = "macos")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use super::cutover_execute::LaunchdOps;
 #[cfg(target_os = "macos")]
-use super::cutover_execute::{LaunchdOps, RealLaunchd, atomic_write};
+use super::cutover_execute::{RealLaunchd, atomic_write};
 #[cfg(target_os = "macos")]
 use super::install::{
     configured_edge_device_identity, configured_edge_ws_url, inherited_proxy_env,
@@ -29,16 +31,16 @@ use super::install::{
 use super::migrate_runtime_control::{
     active_rust_generation_id, read_binary_version_hint, reconcile_current_generation,
 };
+use super::ownership::LINK_PROD_LABEL;
 #[cfg(target_os = "macos")]
 use super::ownership::{
-    LINK_PROD_LABEL, LinkImplementation, assess_agent, program_points_at_managed_runtime,
+    LinkImplementation, assess_agent, program_points_at_managed_runtime,
     read_status_active_generation,
 };
 
-#[cfg(target_os = "macos")]
 const ACTIVE_WAIT_BUDGET: Duration = Duration::from_secs(8);
-#[cfg(target_os = "macos")]
 const ACTIVE_RECONCILE_ATTEMPTS: usize = 2;
+const POST_KICKSTART_WAIT_BUDGET: Duration = Duration::from_secs(12);
 #[cfg(target_os = "macos")]
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -94,24 +96,81 @@ pub(crate) fn reconcile_after_service_generation_change(
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| paths.config_dir.join("runtime-status-prod.json"));
-        let wait_slice = ACTIVE_WAIT_BUDGET / ACTIVE_RECONCILE_ATTEMPTS as u32;
-        let mut last_error = None;
-        for attempt in 0..ACTIVE_RECONCILE_ATTEMPTS {
-            if attempt > 0 {
-                // Bootstrap compatibility: an already-running pre-fix Link may have
-                // consumed the first revision while the single-port runtime was
-                // restarting. If status is still stale, bump a fresh desired-state
-                // revision without restarting Link so it gets one bounded retry.
-                reconcile_current_generation(&home, &paths.config_dir)?;
-            }
-            match wait_for_active_generation(&status_path, &generation, wait_slice) {
-                Ok(()) => return Ok(()),
-                Err(error) => last_error = Some(error),
-            }
-        }
-        Err(last_error
-            .unwrap_or_else(|| format!("production Link did not activate generation {generation}")))
+        converge_active_generation_with_fallback(
+            &launchd,
+            &generation,
+            || reconcile_current_generation(&home, &paths.config_dir).map(|_| ()),
+            || {
+                let loaded = launchd.is_loaded(LINK_PROD_LABEL)?;
+                let current = assess_agent(&home, LINK_PROD_LABEL, loaded);
+                if !current.present
+                    || !current.loaded
+                    || current.implementation != LinkImplementation::Rust
+                    || !program_points_at_managed_runtime(&current.program_arguments, &home)
+                {
+                    return Err(
+                        "production Link ownership changed before bounded kickstart; refusing mutation"
+                            .to_owned(),
+                    );
+                }
+                Ok(())
+            },
+            |budget| wait_for_active_generation(&status_path, &generation, budget),
+        )
     }
+}
+
+fn converge_active_generation_with_fallback<L, Reconcile, VerifyOwnership, Wait>(
+    launchd: &L,
+    generation: &str,
+    mut reconcile: Reconcile,
+    mut verify_ownership: VerifyOwnership,
+    mut wait: Wait,
+) -> Result<(), String>
+where
+    L: LaunchdOps,
+    Reconcile: FnMut() -> Result<(), String>,
+    VerifyOwnership: FnMut() -> Result<(), String>,
+    Wait: FnMut(Duration) -> Result<(), String>,
+{
+    let wait_slice = ACTIVE_WAIT_BUDGET / ACTIVE_RECONCILE_ATTEMPTS as u32;
+    let mut last_error = None;
+    for attempt in 0..ACTIVE_RECONCILE_ATTEMPTS {
+        if attempt > 0 {
+            // An already-running Link may have consumed the first revision while
+            // the single-port runtime was restarting. Bump desired state once
+            // more without interrupting its Edge WebSocket.
+            reconcile()?;
+        }
+        match wait(wait_slice) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    // Hot-switching is the normal zero-disconnect path. If it cannot converge
+    // within the bounded window, the loaded Link process may still be running
+    // older code or may have missed control revisions during the server restart.
+    // Restart exactly the still-owned production Link once. Ownership is
+    // re-proved immediately before the mutation so a concurrent replacement
+    // cannot turn the bounded recovery into a foreign-job restart. Its program
+    // path is runtime/current, so the replacement process executes the new
+    // binary; the persisted plist remains the source for the next natural
+    // bootstrap.
+    verify_ownership()?;
+    launchd.kickstart_prod(LINK_PROD_LABEL).map_err(|error| {
+        format!(
+            "production Link hot-switch to {generation} timed out and bounded kickstart failed: {error}; prior={}",
+            last_error.as_deref().unwrap_or("unknown")
+        )
+    })?;
+    reconcile()?;
+    wait(POST_KICKSTART_WAIT_BUDGET).map_err(|error| {
+        format!(
+            "production Link did not activate generation {generation} after bounded kickstart: {error}; prior={}",
+            last_error.as_deref().unwrap_or("unknown")
+        )
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -235,6 +294,8 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::cutover_execute::FakeLaunchd;
+    use std::path::Path;
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -314,6 +375,93 @@ mod tests {
             Some("herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_generation_hot_switch_does_not_restart_link() {
+        let launchd = FakeLaunchd::with_loaded(LINK_PROD_LABEL, Path::new("/tmp/link-prod.plist"));
+        let mut reconciles = 0;
+        let mut waits = 0;
+        converge_active_generation_with_fallback(
+            &launchd,
+            "rust-new",
+            || {
+                reconciles += 1;
+                Ok(())
+            },
+            || Ok(()),
+            |_| {
+                waits += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(waits, 1);
+        assert_eq!(reconciles, 0);
+        assert!(launchd.kickstarts().is_empty());
+    }
+
+    #[test]
+    fn stale_hot_switch_restarts_owned_link_once_then_converges() {
+        let launchd = FakeLaunchd::with_loaded(LINK_PROD_LABEL, Path::new("/tmp/link-prod.plist"));
+        let mut reconciles = 0;
+        let mut waits = 0;
+        converge_active_generation_with_fallback(
+            &launchd,
+            "rust-new",
+            || {
+                reconciles += 1;
+                Ok(())
+            },
+            || Ok(()),
+            |_| {
+                waits += 1;
+                if waits < 3 {
+                    Err(format!("synthetic stale observation {waits}"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(waits, 3);
+        assert_eq!(reconciles, 2);
+        assert_eq!(launchd.kickstarts(), vec![LINK_PROD_LABEL.to_owned()]);
+    }
+
+    #[test]
+    fn ownership_change_before_restart_fails_without_kickstart() {
+        let launchd = FakeLaunchd::with_loaded(LINK_PROD_LABEL, Path::new("/tmp/link-prod.plist"));
+        let error = converge_active_generation_with_fallback(
+            &launchd,
+            "rust-new",
+            || Ok(()),
+            || Err("ownership changed".to_owned()),
+            |_| Err("still stale".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(error, "ownership changed");
+        assert!(launchd.kickstarts().is_empty());
+    }
+
+    #[test]
+    fn stale_after_single_restart_remains_a_transaction_failure() {
+        let launchd = FakeLaunchd::with_loaded(LINK_PROD_LABEL, Path::new("/tmp/link-prod.plist"));
+        let mut reconciles = 0;
+        let error = converge_active_generation_with_fallback(
+            &launchd,
+            "rust-new",
+            || {
+                reconciles += 1;
+                Ok(())
+            },
+            || Ok(()),
+            |_| Err("still stale".to_owned()),
+        )
+        .unwrap_err();
+        assert!(error.contains("after bounded kickstart"));
+        assert_eq!(reconciles, 2);
+        assert_eq!(launchd.kickstarts(), vec![LINK_PROD_LABEL.to_owned()]);
     }
 
     #[test]

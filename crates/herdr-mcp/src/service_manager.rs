@@ -26,6 +26,39 @@ pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
     }
 }
 
+pub(crate) struct ServiceMutationLease {
+    #[cfg(target_os = "macos")]
+    inner: macos::ServiceMutationLock,
+}
+
+pub(crate) fn acquire_mutation_lock() -> Result<ServiceMutationLease, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("service_manager_currently_requires_macos".to_owned())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(ServiceMutationLease {
+            inner: macos::acquire_mutation_lock()?,
+        })
+    }
+}
+
+pub(crate) fn run_with_mutation_lock(
+    command: ServiceCommand,
+    mutation_lock: &ServiceMutationLease,
+) -> Result<ExitCode, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (command, mutation_lock);
+        Err("service_manager_currently_requires_macos".to_owned())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::run_with_mutation_lock(command, &mutation_lock.inner)
+    }
+}
+
 /// Return the managed Rust binary targeted by the current ready rollback.
 /// This is read-only preflight data; `rollback()` independently revalidates the
 /// ledger and target immediately before mutation.
@@ -226,7 +259,7 @@ mod macos {
         Refuse(String),
     }
 
-    struct ServiceMutationLock {
+    pub(super) struct ServiceMutationLock {
         file: File,
     }
 
@@ -237,7 +270,26 @@ mod macos {
         child: Child,
     }
 
+    pub(super) fn acquire_mutation_lock() -> Result<ServiceMutationLock, String> {
+        let paths = ServicePaths::discover()?;
+        ServiceMutationLock::acquire(&paths)
+    }
+
     pub(super) fn run(command: ServiceCommand) -> Result<ExitCode, String> {
+        run_with_optional_mutation_lock(command, None)
+    }
+
+    pub(super) fn run_with_mutation_lock(
+        command: ServiceCommand,
+        mutation_lock: &ServiceMutationLock,
+    ) -> Result<ExitCode, String> {
+        run_with_optional_mutation_lock(command, Some(mutation_lock))
+    }
+
+    fn run_with_optional_mutation_lock(
+        command: ServiceCommand,
+        external_mutation_lock: Option<&ServiceMutationLock>,
+    ) -> Result<ExitCode, String> {
         if service_command_requires_independent_process(&command)
             && env::var_os("HERDR_MCP_EXEC_ID").is_some()
         {
@@ -247,11 +299,14 @@ mod macos {
             );
         }
         let paths = ServicePaths::discover()?;
-        let mutation_lock = if service_command_requires_mutation_lock(&command) {
+        let owned_mutation_lock = if service_command_requires_mutation_lock(&command)
+            && external_mutation_lock.is_none()
+        {
             Some(ServiceMutationLock::acquire(&paths)?)
         } else {
             None
         };
+        let mutation_lock = external_mutation_lock.or(owned_mutation_lock.as_ref());
         let result = match command {
             ServiceCommand::Install { adopt_node } => {
                 crate::update_scheduler::preflight_service_install_fence()?;
@@ -1447,12 +1502,14 @@ mod macos {
         mutation_lock: &ServiceMutationLock,
     ) -> Result<Value, String> {
         crate::macos_permissions::preserve_or_install_broker(&paths.config_dir)?;
+        let source_sha = file_sha256(&paths.source_binary)?;
+        let expected_generation = format!("rust-{}", &source_sha[..16]);
         install_with_noop_checks(
             paths,
             adopt_node,
             mutation_lock,
             || is_loaded(&paths.service_label),
-            || health_once(paths.port),
+            || health_once_for_generation(paths.port, Some(&expected_generation)),
         )
     }
 
@@ -1646,7 +1703,7 @@ mod macos {
             // resolves through `current`, so generation rollback stays valid.
             user_cli_link = Some(maybe_ensure_user_cli(paths)?);
             bootstrap_with_retry(&paths.plist, &paths.service_label)?;
-            wait_for_health(paths.port)?;
+            wait_for_generation_health(paths.port, &generation.generation_id)?;
             store.activate_runtime_generation_with_rollback(
                 &generation.generation_id,
                 rollback_id.as_deref(),
@@ -1910,9 +1967,15 @@ mod macos {
             || is_loaded(&paths.service_label),
             || is_loaded(&paths.watchdog_label),
             || is_loaded(&paths.health_watchdog_label),
-            |kind, loaded| {
-                if kind == ServiceKind::Rust && loaded {
-                    health_once(paths.port)
+            |descriptor, loaded| {
+                if descriptor.kind == ServiceKind::Rust && loaded {
+                    health_once_for_generation(
+                        paths.port,
+                        descriptor
+                            .env
+                            .get("HERDR_MCP_RUNTIME_GENERATION")
+                            .map(String::as_str),
+                    )
                 } else {
                     false
                 }
@@ -1931,12 +1994,12 @@ mod macos {
         ServiceLoaded: FnOnce() -> bool,
         LegacyLoaded: FnOnce() -> bool,
         HealthLoaded: FnOnce() -> bool,
-        Healthy: FnOnce(ServiceKind, bool) -> bool,
+        Healthy: FnOnce(&ServiceDescriptor, bool) -> bool,
     {
         let bytes = read_optional_bounded(&paths.plist, 256 * 1024)?;
         let descriptor = describe_service(bytes.as_deref(), paths)?;
         let loaded = service_loaded();
-        let health = healthy(descriptor.kind, loaded);
+        let health = healthy(&descriptor, loaded);
         let generation = descriptor.env.get("HERDR_MCP_RUNTIME_GENERATION").cloned();
         let implementation = match descriptor.kind {
             ServiceKind::Missing => "missing",
@@ -1969,7 +2032,7 @@ mod macos {
         } else {
             bootstrap_with_retry(&paths.plist, &paths.service_label)?;
         }
-        wait_for_health(paths.port)?;
+        wait_for_service_health(&descriptor, paths.port)?;
         let evidence_recorded = record_action(paths, "start", "ok", &descriptor, None);
         Ok(json!({
             "ok": true,
@@ -2000,7 +2063,7 @@ mod macos {
         } else {
             bootstrap_with_retry(&paths.plist, &paths.service_label)?;
         }
-        wait_for_health(paths.port)?;
+        wait_for_service_health(&descriptor, paths.port)?;
         let evidence_recorded = record_action(paths, "restart", "ok", &descriptor, None);
         Ok(json!({
             "ok": true,
@@ -2563,6 +2626,13 @@ mod macos {
         );
         root.insert("RunAtLoad".to_owned(), PlistValue::Boolean(true));
         root.insert("KeepAlive".to_owned(), PlistValue::Boolean(true));
+        // launchd already owns crash supervision. Throttle a fail-fast candidate
+        // so Herdr/cache readiness failures cannot turn KeepAlive into a tight
+        // respawn loop while the health watchdog is also collecting evidence.
+        root.insert(
+            "ThrottleInterval".to_owned(),
+            PlistValue::Integer(10_i64.into()),
+        );
         root.insert(
             "ProcessType".to_owned(),
             PlistValue::String("Interactive".to_owned()),
@@ -3025,11 +3095,12 @@ mod macos {
         }
         remove_regular_file(&paths.watchdog_plist)?;
         settle_service_for_restore(&paths.service_label, current_bootout_pending)?;
+        let current_descriptor = describe_service(Some(current_plist), paths)?;
         atomic_write(&paths.plist, current_plist, 0o600)?;
         restore_current(paths, Some(current_target))?;
         if current_was_loaded {
             bootstrap_with_retry(&paths.plist, &paths.service_label)?;
-            wait_for_health(paths.port)?;
+            wait_for_service_health(&current_descriptor, paths.port)?;
         }
         Ok(())
     }
@@ -3320,7 +3391,7 @@ mod macos {
         Err(format!("launchctl failed: {detail}"))
     }
 
-    fn health_once(port: u16) -> bool {
+    fn health_once_for_generation(port: u16, expected_generation: Option<&str>) -> bool {
         let client = match reqwest::blocking::Client::builder()
             .timeout(Duration::from_millis(800))
             .build()
@@ -3335,7 +3406,14 @@ mod macos {
             .filter(|response| response.status().is_success())
             .and_then(|response| response.text().ok())
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-            .is_some_and(|value| value.get("ok").and_then(Value::as_bool) == Some(true))
+            .is_some_and(|value| health_payload_matches_generation(&value, expected_generation))
+    }
+
+    fn health_payload_matches_generation(value: &Value, expected_generation: Option<&str>) -> bool {
+        value.get("ok").and_then(Value::as_bool) == Some(true)
+            && expected_generation.is_none_or(|expected| {
+                value.get("runtime_generation").and_then(Value::as_str) == Some(expected)
+            })
     }
 
     fn mcp_discover_once(descriptor: &ServiceDescriptor, port: u16) -> bool {
@@ -3373,7 +3451,13 @@ mod macos {
         let deadline = Instant::now() + HEALTH_BUDGET;
         while Instant::now() < deadline {
             let healthy = match descriptor.kind {
-                ServiceKind::Rust => health_once(port),
+                ServiceKind::Rust => health_once_for_generation(
+                    port,
+                    descriptor
+                        .env
+                        .get("HERDR_MCP_RUNTIME_GENERATION")
+                        .map(String::as_str),
+                ),
                 ServiceKind::Node => mcp_discover_once(descriptor, port),
                 _ => false,
             };
@@ -3389,16 +3473,16 @@ mod macos {
         ))
     }
 
-    fn wait_for_health(port: u16) -> Result<(), String> {
+    fn wait_for_generation_health(port: u16, generation: &str) -> Result<(), String> {
         let deadline = Instant::now() + HEALTH_BUDGET;
         while Instant::now() < deadline {
-            if health_once(port) {
+            if health_once_for_generation(port, Some(generation)) {
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(150));
         }
         Err(format!(
-            "Rust service did not become healthy on 127.0.0.1:{port} within {}s",
+            "Rust service generation {generation} did not become healthy on 127.0.0.1:{port} within {}s",
             HEALTH_BUDGET.as_secs()
         ))
     }
@@ -3409,6 +3493,19 @@ mod macos {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        #[test]
+        fn health_generation_gate_rejects_a_healthy_old_listener() {
+            let old = json!({ "ok": true, "runtime_generation": "rust-old" });
+            let new = json!({ "ok": true, "runtime_generation": "rust-new" });
+            assert!(health_payload_matches_generation(&old, None));
+            assert!(!health_payload_matches_generation(&old, Some("rust-new")));
+            assert!(health_payload_matches_generation(&new, Some("rust-new")));
+            assert!(!health_payload_matches_generation(
+                &json!({ "ok": true }),
+                Some("rust-new")
+            ));
+        }
 
         #[test]
         fn named_instance_never_writes_default_plist_or_port() {
@@ -3464,6 +3561,15 @@ mod macos {
             assert_ne!(
                 dict.get("Label").and_then(PlistValue::as_string),
                 Some(SERVICE_LABEL)
+            );
+            assert_eq!(
+                dict.get("KeepAlive").and_then(PlistValue::as_boolean),
+                Some(true)
+            );
+            assert_eq!(
+                dict.get("ThrottleInterval")
+                    .and_then(PlistValue::as_unsigned_integer),
+                Some(10)
             );
             fs::remove_dir_all(root).unwrap();
         }

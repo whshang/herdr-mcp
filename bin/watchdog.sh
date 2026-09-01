@@ -25,6 +25,12 @@ LSOF_BIN="${HERDR_MCP_LSOF_BIN:-/usr/sbin/lsof}"
 # trigger a restart.
 FAIL_THRESHOLD="${HERDR_MCP_WATCHDOG_FAIL_THRESHOLD:-2}"
 RESTART_COOLDOWN_SEC="${HERDR_MCP_WATCHDOG_COOLDOWN_SEC:-60}"
+# Do not turn a persistently unhealthy server into an endless kill/restart loop.
+# After a small burst of unsuccessful recovery attempts, keep probing read-only
+# and suppress further kickstarts for a longer backoff. A real HTTP 200 (or a
+# legitimate lifecycle/explicit-stop transition) resets the recovery circuit.
+RESTART_BURST_LIMIT="${HERDR_MCP_WATCHDOG_RESTART_BURST_LIMIT:-3}"
+RESTART_STORM_BACKOFF_SEC="${HERDR_MCP_WATCHDOG_RESTART_BACKOFF_SEC:-300}"
 # Bounded Link-health recovery uses its own persistent-mismatch threshold and a
 # longer cooldown so a generation switch can never trigger a WSS interruption
 # storm: at most one kickstart per cooldown window, only after the mismatch
@@ -120,39 +126,86 @@ lifecycle_suppression_reason() {
 update_state_and_decide() {
   LOADED="$1" HEALTH="$2" SUPPRESSION="$3" \
   FAIL_THRESHOLD="$FAIL_THRESHOLD" RESTART_COOLDOWN_SEC="$RESTART_COOLDOWN_SEC" \
+  RESTART_BURST_LIMIT="$RESTART_BURST_LIMIT" \
+  RESTART_STORM_BACKOFF_SEC="$RESTART_STORM_BACKOFF_SEC" \
   STATE_FILE="$STATE_FILE" python3 - <<'PY'
-import json, os, time
+import json, os, tempfile, time
+def atomic_write(path, state):
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".health-watchdog.", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fd = -1
+            json.dump(state, fh, indent=2); fh.write("\n")
+            fh.flush(); os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if fd >= 0: os.close(fd)
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
 path = os.environ["STATE_FILE"]
 loaded = os.environ["LOADED"] == "1"
 health = os.environ["HEALTH"]
 suppression = os.environ["SUPPRESSION"]
 threshold = max(1, int(os.environ["FAIL_THRESHOLD"]))
 cooldown = max(0, int(os.environ["RESTART_COOLDOWN_SEC"]))
+burst_limit = max(1, int(os.environ["RESTART_BURST_LIMIT"]))
+storm_backoff = max(1, int(os.environ["RESTART_STORM_BACKOFF_SEC"]))
 now = int(time.time())
 state = {}
+state_corrupt = False
 if os.path.exists(path):
     try:
         with open(path) as fh: state = json.load(fh)
-    except Exception: state = {}
+    except Exception:
+        state = {}
+        state_corrupt = True
 state["updated_at"] = now
 state["server_loaded"] = loaded
 state["last_health_code"] = health
 if not loaded:
     state["consecutive_fail"] = 0
+    state["recovery_attempts_without_health"] = 0
+    state["restart_suppressed_until"] = 0
     state["last_action"] = "stopped"
     decision = "none"
 elif suppression != "none":
     state["consecutive_fail"] = 0
+    state["recovery_attempts_without_health"] = 0
+    state["restart_suppressed_until"] = 0
     state["last_action"] = "suppressed_" + suppression
     decision = "none"
 elif health == "200":
     state["consecutive_fail"] = 0
+    state["recovery_attempts_without_health"] = 0
+    state["restart_suppressed_until"] = 0
     state["last_action"] = "healthy"
+    decision = "none"
+elif state_corrupt:
+    state["consecutive_fail"] = 0
+    state["recovery_attempts_without_health"] = burst_limit
+    state["restart_suppressed_until"] = now + storm_backoff
+    state["last_action"] = "state_corrupt_suppressed"
     decision = "none"
 else:
     state["consecutive_fail"] = int(state.get("consecutive_fail") or 0) + 1
+    attempts = int(state.get("recovery_attempts_without_health") or 0)
+    suppressed_until = int(state.get("restart_suppressed_until") or 0)
+    if suppressed_until and now >= suppressed_until:
+        attempts = 0
+        suppressed_until = 0
+        state["recovery_attempts_without_health"] = 0
+        state["restart_suppressed_until"] = 0
     last_restart = int(state.get("last_restart_at") or 0)
-    if state["consecutive_fail"] >= threshold and now - last_restart >= cooldown:
+    if suppressed_until > now:
+        state["last_action"] = "restart_storm_suppressed"
+        decision = "none"
+    elif attempts >= burst_limit:
+        state["restart_suppressed_until"] = now + storm_backoff
+        state["last_action"] = "restart_storm_suppressed"
+        decision = "none"
+    elif state["consecutive_fail"] >= threshold and now - last_restart >= cooldown:
         state["last_action"] = "restart_pending"
         decision = "kickstart"
     elif state["consecutive_fail"] >= threshold:
@@ -161,15 +214,28 @@ else:
     else:
         state["last_action"] = "check"
         decision = "none"
-with open(path, "w") as fh:
-    json.dump(state, fh, indent=2); fh.write("\n")
+atomic_write(path, state)
 print(decision)
 PY
 }
 
 record_kickstart_result() {
   RESULT="$1" STATE_FILE="$STATE_FILE" python3 - <<'PY'
-import json, os, time
+import json, os, tempfile, time
+def atomic_write(path, state):
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".health-watchdog.", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fd = -1
+            json.dump(state, fh, indent=2); fh.write("\n")
+            fh.flush(); os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if fd >= 0: os.close(fd)
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
 path = os.environ["STATE_FILE"]
 result = os.environ["RESULT"]
 state = {}
@@ -180,6 +246,7 @@ if os.path.exists(path):
 now = int(time.time())
 state["updated_at"] = now
 state["last_restart_at"] = now
+state["recovery_attempts_without_health"] = int(state.get("recovery_attempts_without_health") or 0) + 1
 if result == "ok":
     state["restarts_total"] = int(state.get("restarts_total") or 0) + 1
     state["consecutive_fail"] = 0
@@ -187,8 +254,7 @@ if result == "ok":
 else:
     state["consecutive_fail"] = 0
     state["last_action"] = "kickstart_failed"
-with open(path, "w") as fh:
-    json.dump(state, fh, indent=2); fh.write("\n")
+atomic_write(path, state)
 PY
 }
 
@@ -216,7 +282,21 @@ update_link_state_and_decide() {
   LINK_STATUS_JSON="$1" LINK_EVIDENCE="$2" SUPPRESSION="$3" \
   LINK_FAIL_THRESHOLD="$LINK_FAIL_THRESHOLD" LINK_RESTART_COOLDOWN_SEC="$LINK_RESTART_COOLDOWN_SEC" \
   STATE_FILE="$STATE_FILE" python3 - <<'PY'
-import json, os, re, time
+import json, os, re, tempfile, time
+def atomic_write(path, state):
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".health-watchdog.", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fd = -1
+            json.dump(state, fh, indent=2); fh.write("\n")
+            fh.flush(); os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if fd >= 0: os.close(fd)
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
 path = os.environ["STATE_FILE"]
 status_json = os.environ["LINK_STATUS_JSON"]
 launchd_evidence = os.environ["LINK_EVIDENCE"]
@@ -357,15 +437,28 @@ else:
     decision = "none"
 
 state["updated_at"] = now
-with open(path, "w") as fh:
-    json.dump(state, fh, indent=2); fh.write("\n")
+atomic_write(path, state)
 print(decision)
 PY
 }
 
 record_link_kickstart_result() {
   RESULT="$1" STATE_FILE="$STATE_FILE" python3 - <<'PY'
-import json, os, time
+import json, os, tempfile, time
+def atomic_write(path, state):
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".health-watchdog.", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fd = -1
+            json.dump(state, fh, indent=2); fh.write("\n")
+            fh.flush(); os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if fd >= 0: os.close(fd)
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
 path = os.environ["STATE_FILE"]
 result = os.environ["RESULT"]
 state = {}
@@ -383,8 +476,7 @@ if result == "ok":
 else:
     state["link_consecutive_fail"] = 0
     state["link_last_action"] = "link_kickstart_failed"
-with open(path, "w") as fh:
-    json.dump(state, fh, indent=2); fh.write("\n")
+atomic_write(path, state)
 PY
 }
 
