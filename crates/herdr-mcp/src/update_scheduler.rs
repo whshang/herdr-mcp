@@ -154,6 +154,188 @@ pub(crate) fn clear_service_uninstall_fence() -> Result<(), String> {
     }
 }
 
+/// Exact prior state of the auto-update scheduler and the service-uninstall
+/// fence, captured before a service install so a failed post-commit step can
+/// restore them. Fails closed on any foreign/uninspectable scheduler state.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub(crate) struct InstallIntegrationSnapshot {
+    /// Prior owned scheduler plist bytes, or `None` when absent.
+    scheduler_plist: Option<Vec<u8>>,
+    /// Prior launchd load state of the scheduler.
+    scheduler_loaded: bool,
+    /// Prior service-uninstall fence state.
+    fence_owned: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl InstallIntegrationSnapshot {
+    pub(crate) fn capture() -> Result<Self, String> {
+        let paths = RuntimePaths::discover()?;
+        if paths.instance.is_named() {
+            return Ok(Self {
+                scheduler_plist: None,
+                scheduler_loaded: false,
+                fence_owned: false,
+            });
+        }
+        let home = home_dir()?;
+        let plist_path = launch_agent_path(&home);
+        let scheduler_plist = read_optional_regular(&plist_path)?;
+        let scheduler_loaded = launchd_state(AUTO_UPDATE_LABEL)? == LaunchdState::Loaded;
+        // A loaded scheduler without an inspectable owned plist is foreign and
+        // must fail closed before the service commit, never silently replaced.
+        if scheduler_loaded && scheduler_plist.is_none() {
+            return Err(
+                "auto-update LaunchAgent is loaded without an inspectable owned plist; refusing service install"
+                    .to_owned(),
+            );
+        }
+        if let Some(bytes) = scheduler_plist.as_deref() {
+            verify_owned_plist(bytes, &paths)?;
+        }
+        let fence_owned = read_service_uninstall_fence(&paths)? == FenceState::Owned;
+        Ok(Self {
+            scheduler_plist,
+            scheduler_loaded,
+            fence_owned,
+        })
+    }
+
+    /// Restore identity, scheduler, and fence to their exact prior state in a
+    /// fail-safe order. The protective service-uninstall fence is established
+    /// FIRST so a scheduler left loaded by a later failure can never resurrect
+    /// a service that compensation just uninstalled; identity and scheduler
+    /// plist+load state are restored next; and only after the scheduler is
+    /// confirmed at its prior exact state is the fence cleared (per the prior
+    /// snapshot). Any restore error keeps the protective fence armed and is
+    /// reported as degraded-but-fenced.
+    pub(crate) fn restore(
+        &self,
+        restore_identity: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.restore_impl(restore_identity, launchd_state, bootstrap, bootout)
+    }
+
+    /// Testable core of [`Self::restore`] with injectable launchd operations so
+    /// scheduler bootstrap/bootout/state failures can be fault-injected without
+    /// a real launchd.
+    fn restore_impl<State, Bootstrap, Bootout>(
+        &self,
+        restore_identity: impl FnOnce() -> Result<(), String>,
+        state: State,
+        bootstrap: Bootstrap,
+        bootout: Bootout,
+    ) -> Result<(), String>
+    where
+        State: Fn(&str) -> Result<LaunchdState, String>,
+        Bootstrap: Fn(&Path) -> Result<(), String>,
+        Bootout: Fn(&str) -> Result<(), String>,
+    {
+        let paths = RuntimePaths::discover()?;
+        if paths.instance.is_named() {
+            return Ok(());
+        }
+        let home = home_dir()?;
+        let plist_path = launch_agent_path(&home);
+        let fence_path = service_uninstall_fence_path(&paths)?;
+
+        // Phase 1: establish the protective service-uninstall fence FIRST.
+        // Updates are refused while the fence is owned, so a scheduler left
+        // loaded by a later restore failure cannot resurrect a service.
+        let update_dir = fence_path
+            .parent()
+            .ok_or_else(|| "service-uninstall fence has no parent directory".to_owned())?;
+        ensure_real_dir(update_dir)?;
+        if read_service_uninstall_fence(&paths)? != FenceState::Owned {
+            atomic_write(&fence_path, SERVICE_UNINSTALL_FENCE_BYTES, 0o600)?;
+        }
+
+        // Phase 2: restore identity, then scheduler plist + load state.
+        let identity_result = restore_identity();
+        let scheduler_result =
+            self.restore_scheduler(&paths, &plist_path, &state, &bootstrap, &bootout);
+
+        // Phase 3: only clear the protective fence when every restore reached
+        // the prior exact state AND the prior snapshot had no fence.
+        match (identity_result, scheduler_result) {
+            (Ok(()), Ok(())) => {
+                if !self.fence_owned {
+                    fs::remove_file(&fence_path).map_err(|error| {
+                        format!("cannot clear restored service-uninstall fence: {error}")
+                    })?;
+                }
+                Ok(())
+            }
+            (identity_result, scheduler_result) => {
+                let mut failures = Vec::new();
+                if let Err(error) = identity_result {
+                    failures.push(format!("identity restore failed: {error}"));
+                }
+                if let Err(error) = scheduler_result {
+                    failures.push(format!("scheduler restore failed: {error}"));
+                }
+                Err(format!(
+                    "service install integration restore degraded-but-fenced: {}; protective service-uninstall fence remains armed",
+                    failures.join("; ")
+                ))
+            }
+        }
+    }
+
+    /// Restore the scheduler plist bytes and load state to their prior exact
+    /// state. Load state is an independent fact: even when the plist bytes
+    /// already match the prior snapshot, the loaded/unloaded state is still
+    /// restored.
+    fn restore_scheduler<State, Bootstrap, Bootout>(
+        &self,
+        paths: &RuntimePaths,
+        plist_path: &Path,
+        state: &State,
+        bootstrap: &Bootstrap,
+        bootout: &Bootout,
+    ) -> Result<(), String>
+    where
+        State: Fn(&str) -> Result<LaunchdState, String>,
+        Bootstrap: Fn(&Path) -> Result<(), String>,
+        Bootout: Fn(&str) -> Result<(), String>,
+    {
+        let current_loaded = state(AUTO_UPDATE_LABEL)? == LaunchdState::Loaded;
+        let current_plist = read_optional_regular(plist_path)?;
+        if let Some(bytes) = current_plist.as_deref() {
+            verify_owned_plist(bytes, paths)?;
+        }
+
+        // Restore the plist bytes if they differ from prior.
+        let plist_differs = match (&self.scheduler_plist, current_plist) {
+            (Some(prior), Some(current)) => prior != &current,
+            (Some(_), None) => true,
+            (None, Some(_)) => true,
+            (None, None) => false,
+        };
+        if plist_differs {
+            if current_loaded {
+                bootout(AUTO_UPDATE_LABEL)?;
+            }
+            match &self.scheduler_plist {
+                Some(prior) => atomic_write(plist_path, prior, 0o600)?,
+                None => fs::remove_file(plist_path)
+                    .map_err(|error| format!("cannot remove auto-update LaunchAgent: {error}"))?,
+            }
+        }
+
+        // Load state is an independent fact: restore it to the prior exact
+        // state even when the plist bytes already match.
+        let now_loaded = state(AUTO_UPDATE_LABEL)? == LaunchdState::Loaded;
+        match (self.scheduler_loaded, now_loaded) {
+            (true, false) => bootstrap(plist_path)?,
+            (false, true) => bootout(AUTO_UPDATE_LABEL)?,
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(target_os = "macos")]
 enum FenceState {
@@ -707,6 +889,308 @@ mod tests {
                 None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
             }
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Set up a temp HOME + config and return the env guard, root, home, and
+    /// discovered paths. The guard must be held for the whole test so env
+    /// mutations are serialized against other tests.
+    #[cfg(target_os = "macos")]
+    fn snapshot_fixture(
+        name: &str,
+    ) -> (
+        std::sync::MutexGuard<'static, ()>,
+        PathBuf,
+        PathBuf,
+        RuntimePaths,
+    ) {
+        let guard = crate::test_env::lock();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-install-snapshot-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = root.join("home");
+        let config = home.join(".config/herdr-mcp");
+        fs::create_dir_all(&config).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("HERDR_MCP_INSTANCE");
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config);
+        }
+        let paths = RuntimePaths::discover().unwrap();
+        (guard, root, home, paths)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn snapshot(
+        scheduler_plist: Option<Vec<u8>>,
+        scheduler_loaded: bool,
+        fence_owned: bool,
+    ) -> InstallIntegrationSnapshot {
+        InstallIntegrationSnapshot {
+            scheduler_plist,
+            scheduler_loaded,
+            fence_owned,
+        }
+    }
+
+    /// A fake launchd whose loaded state is tracked in a shared cell, so
+    /// bootstrap/bootout mutate the state that `state` reports.
+    #[cfg(target_os = "macos")]
+    struct FakeLaunchd {
+        loaded: std::cell::Cell<bool>,
+        bootout_fail: bool,
+        bootstrap_fail: bool,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl FakeLaunchd {
+        fn new(loaded: bool) -> Self {
+            Self {
+                loaded: std::cell::Cell::new(loaded),
+                bootout_fail: false,
+                bootstrap_fail: false,
+            }
+        }
+        fn state(&self, _label: &str) -> Result<LaunchdState, String> {
+            Ok(if self.loaded.get() {
+                LaunchdState::Loaded
+            } else {
+                LaunchdState::Absent
+            })
+        }
+        fn bootstrap(&self, _path: &Path) -> Result<(), String> {
+            if self.bootstrap_fail {
+                Err("bootstrap boom".to_owned())
+            } else {
+                self.loaded.set(true);
+                Ok(())
+            }
+        }
+        fn bootout(&self, _label: &str) -> Result<(), String> {
+            if self.bootout_fail {
+                Err("bootout boom".to_owned())
+            } else {
+                self.loaded.set(false);
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fence_owned(paths: &RuntimePaths) -> bool {
+        read_service_uninstall_fence(paths).unwrap() == FenceState::Owned
+    }
+
+    #[cfg(target_os = "macos")]
+    fn scheduler_plist_path(home: &Path) -> PathBuf {
+        launch_agent_path(home)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_install_restore_removes_scheduler_and_clears_fence_on_success() {
+        let (_guard, root, home, paths) = snapshot_fixture("fresh-ok");
+        let prior = snapshot(None, false, false);
+        // Simulate a committed fresh install: scheduler plist present + loaded,
+        // fence cleared.
+        let plist = scheduler_plist_path(&home);
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(&plist, encode_plist(&paths).unwrap()).unwrap();
+        let fake = FakeLaunchd::new(true);
+
+        prior
+            .restore_impl(
+                || Ok(()),
+                |label| fake.state(label),
+                |path| fake.bootstrap(path),
+                |label| fake.bootout(label),
+            )
+            .unwrap();
+
+        assert!(
+            !plist.exists(),
+            "fresh install restore must remove the scheduler"
+        );
+        assert!(
+            !fake.loaded.get(),
+            "fresh install restore must unload the scheduler"
+        );
+        assert!(
+            !fence_owned(&paths),
+            "prior fence was absent, so restore must leave it absent"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn upgrade_restore_restores_prior_scheduler_fence_and_identity() {
+        let (_guard, root, home, paths) = snapshot_fixture("upgrade-ok");
+        let prior_bytes = encode_plist(&paths).unwrap();
+        let prior = snapshot(Some(prior_bytes.clone()), true, true);
+        // Simulate a committed upgrade: scheduler plist rewritten + loaded,
+        // fence cleared.
+        let plist = scheduler_plist_path(&home);
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        let mut different = prior_bytes.clone();
+        different.push(b' ');
+        fs::write(&plist, &different).unwrap();
+        let fake = FakeLaunchd::new(true);
+        let mut identity_restored = false;
+
+        prior
+            .restore_impl(
+                || {
+                    identity_restored = true;
+                    Ok(())
+                },
+                |label| fake.state(label),
+                |path| fake.bootstrap(path),
+                |label| fake.bootout(label),
+            )
+            .unwrap();
+
+        assert!(identity_restored);
+        assert_eq!(
+            fs::read(&plist).unwrap(),
+            prior_bytes,
+            "plist must be restored"
+        );
+        assert!(fake.loaded.get(), "prior scheduler was loaded");
+        assert!(
+            fence_owned(&paths),
+            "prior fence was owned, so restore must re-arm it"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn same_plist_bytes_still_restores_load_state() {
+        let (_guard, root, home, paths) = snapshot_fixture("same-bytes");
+        let bytes = encode_plist(&paths).unwrap();
+        // Prior: plist present + loaded. Current: same plist bytes but unloaded.
+        let prior = snapshot(Some(bytes.clone()), true, false);
+        let plist = scheduler_plist_path(&home);
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(&plist, &bytes).unwrap();
+        let fake = FakeLaunchd::new(false);
+
+        prior
+            .restore_impl(
+                || Ok(()),
+                |label| fake.state(label),
+                |path| fake.bootstrap(path),
+                |label| fake.bootout(label),
+            )
+            .unwrap();
+
+        assert!(
+            fake.loaded.get(),
+            "load state is an independent fact: same plist bytes must still be bootstrapped to prior loaded state"
+        );
+        assert_eq!(fs::read(&plist).unwrap(), bytes);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scheduler_bootout_failure_keeps_protective_fence_armed() {
+        let (_guard, root, home, paths) = snapshot_fixture("bootout-fail");
+        let prior = snapshot(None, false, false);
+        // Committed fresh install: scheduler loaded, fence cleared.
+        let plist = scheduler_plist_path(&home);
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(&plist, encode_plist(&paths).unwrap()).unwrap();
+        let mut fake = FakeLaunchd::new(true);
+        fake.bootout_fail = true;
+
+        let err = prior
+            .restore_impl(
+                || Ok(()),
+                |label| fake.state(label),
+                |path| fake.bootstrap(path),
+                |label| fake.bootout(label),
+            )
+            .unwrap_err();
+
+        assert!(
+            err.contains("degraded-but-fenced"),
+            "restore error must be reported as degraded-but-fenced: {err}"
+        );
+        assert!(
+            fence_owned(&paths),
+            "a restore failure must leave the protective fence armed, never absent"
+        );
+        assert!(
+            fake.loaded.get(),
+            "scheduler may remain loaded, but it must be fenced"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn identity_restore_failure_keeps_protective_fence_armed() {
+        let (_guard, root, home, paths) = snapshot_fixture("identity-fail");
+        let prior = snapshot(None, false, false);
+        let plist = scheduler_plist_path(&home);
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(&plist, encode_plist(&paths).unwrap()).unwrap();
+        let fake = FakeLaunchd::new(true);
+
+        let err = prior
+            .restore_impl(
+                || Err("identity restore boom".to_owned()),
+                |label| fake.state(label),
+                |path| fake.bootstrap(path),
+                |label| fake.bootout(label),
+            )
+            .unwrap_err();
+
+        assert!(err.contains("degraded-but-fenced"));
+        assert!(err.contains("identity restore boom"));
+        assert!(
+            fence_owned(&paths),
+            "identity restore failure must leave the protective fence armed"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn noop_restore_preserves_prior_integration_state() {
+        let (_guard, root, home, paths) = snapshot_fixture("noop");
+        let bytes = encode_plist(&paths).unwrap();
+        // Prior and current are identical: plist present + loaded, fence owned.
+        let prior = snapshot(Some(bytes.clone()), true, true);
+        let plist = scheduler_plist_path(&home);
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(&plist, &bytes).unwrap();
+        let fake = FakeLaunchd::new(true);
+        let mut identity_restored = false;
+
+        prior
+            .restore_impl(
+                || {
+                    identity_restored = true;
+                    Ok(())
+                },
+                |label| fake.state(label),
+                |path| fake.bootstrap(path),
+                |label| fake.bootout(label),
+            )
+            .unwrap();
+
+        assert!(identity_restored);
+        assert_eq!(fs::read(&plist).unwrap(), bytes);
+        assert!(fake.loaded.get());
+        assert!(fence_owned(&paths));
         let _ = fs::remove_dir_all(root);
     }
 }

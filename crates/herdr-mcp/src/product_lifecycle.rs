@@ -47,6 +47,20 @@ pub(crate) fn record_installation_identity() -> Result<(), String> {
     macos::record_installation_identity()
 }
 
+/// Capture the exact prior installation-identity marker (or its absence) so a
+/// failed post-commit step can restore it. Fails closed on a non-owned marker.
+#[cfg(target_os = "macos")]
+pub(crate) fn capture_installation_identity() -> Result<Option<Vec<u8>>, String> {
+    macos::capture_installation_identity()
+}
+
+/// Restore the installation-identity marker to its exact prior bytes, or remove
+/// a newly-created owned marker when the prior state was absent.
+#[cfg(target_os = "macos")]
+pub(crate) fn restore_installation_identity(prior: Option<&[u8]>) -> Result<(), String> {
+    macos::restore_installation_identity(prior)
+}
+
 fn refuse_managed_exec_mutation() -> Result<(), String> {
     if std::env::var_os("HERDR_MCP_EXEC_ID").is_some() {
         return Err(
@@ -418,6 +432,59 @@ mod macos {
         let bytes = serde_json::to_vec_pretty(&identity)
             .map_err(|error| format!("cannot encode installation identity: {error}"))?;
         write_private_atomic(&safe_config.join(INSTALL_IDENTITY_NAME), &bytes)
+    }
+
+    pub(super) fn capture_installation_identity() -> Result<Option<Vec<u8>>, String> {
+        let paths = RuntimePaths::discover()?;
+        let home = home_dir()?;
+        let safe_config = validate_config_root(&home, &paths.config_dir, &paths.instance)?;
+        let path = safe_config.join(INSTALL_IDENTITY_NAME);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect installation identity {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 8192 {
+            return Err(format!(
+                "installation identity is not an owned regular file: {}",
+                path.display()
+            ));
+        }
+        fs::read(&path)
+            .map(Some)
+            .map_err(|error| format!("cannot read installation identity: {error}"))
+    }
+
+    pub(super) fn restore_installation_identity(prior: Option<&[u8]>) -> Result<(), String> {
+        let paths = RuntimePaths::discover()?;
+        let home = home_dir()?;
+        let safe_config = validate_config_root(&home, &paths.config_dir, &paths.instance)?;
+        let path = safe_config.join(INSTALL_IDENTITY_NAME);
+        match prior {
+            Some(bytes) => write_private_atomic(&path, bytes),
+            None => match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+                    "installation identity restore refuses symlink {}",
+                    path.display()
+                )),
+                Ok(metadata) if metadata.is_file() => fs::remove_file(&path).map_err(|error| {
+                    format!("cannot remove newly-created installation identity: {error}")
+                }),
+                Ok(_) => Err(format!(
+                    "installation identity restore found non-file {}",
+                    path.display()
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!(
+                    "cannot inspect installation identity restore path: {error}"
+                )),
+            },
+        }
     }
 
     /// Verifiable herdr-mcp product evidence inside a config root. A marker file
