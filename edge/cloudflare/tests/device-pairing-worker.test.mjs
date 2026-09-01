@@ -64,7 +64,6 @@ function wsRequest(workstationId, secret) {
 
 function makeEnv(extra = {}) {
   const storage = new FakeStorage();
-  const registry = new DeviceRegistryDO({ storage }, { LINK_SHARED_SECRET: "legacy-secret" });
   const forwarded = [];
   const workstationStub = {
     async fetch(request) {
@@ -72,6 +71,10 @@ function makeEnv(extra = {}) {
       return new Response(JSON.stringify({ ok: true }), { status: 200 });
     },
   };
+  const registry = new DeviceRegistryDO(
+    { storage },
+    { LINK_SHARED_SECRET: "legacy-secret", WORKSTATION_DO: namespace(workstationStub) },
+  );
   const unusedOAuth = { fetch: async () => new Response(JSON.stringify({ ok: false }), { status: 401 }) };
   return {
     storage,
@@ -203,30 +206,27 @@ test("a device may revoke only itself with its exact credential", async () => {
 
   const reconnect = await worker.fetch(wsRequest(a.workstation_id, a.device_secret), env);
   assert.equal(reconnect.status, 401);
-  assert.equal(forwarded.length, 0);
+  // The only forward is the teardown kill-switch call to the target WorkstationDO;
+  // the revoked credential never reaches it as a reconnect.
+  assert.deepEqual(forwarded, ["/internal/revoke"]);
 });
 
 test("legacy shared secret is compatibility-only for the default workstation and revoke blocks reconnect", async () => {
-  const { env, registry, forwarded } = makeEnv();
+  const { env, forwarded } = makeEnv();
   const legacy = await worker.fetch(wsRequest("prod-real-runtime", "legacy-secret"), env);
   assert.equal(legacy.status, 200);
   assert.equal(forwarded.length, 1);
 
   const paired = await pair(env, "revoked-mac");
-  const recordResponse = await registry.fetch(new Request(`https://registry.internal/internal/devices/${paired.device_id}`));
-  const recordBody = await recordResponse.json();
-  const now = Date.now();
-  const revoked = { ...recordBody.device, authorization: "revoked", revoked_at_ms: now, updated_at_ms: now };
-  const put = await registry.fetch(new Request(`https://registry.internal/internal/devices/${paired.device_id}`, {
-    method: "PUT",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(revoked),
-  }));
-  assert.equal(put.status, 200);
+  const revoke = await worker.fetch(post("/devices/revoke", { device_id: paired.device_id }, "owner-secret"), env);
+  assert.equal(revoke.status, 200);
+  assert.equal((await revoke.json()).device_id, paired.device_id);
 
   const reconnect = await worker.fetch(wsRequest(paired.workstation_id, paired.device_secret), env);
   assert.equal(reconnect.status, 401);
-  assert.equal(forwarded.length, 1, "revoked device must not reach its WorkstationDO");
+  // forwarded[0] is the legacy connect; forwarded[1] is the revoke teardown call.
+  // The revoked credential never reaches the WorkstationDO as a reconnect.
+  assert.deepEqual(forwarded, ["/ws/prod-real-runtime", "/internal/revoke"]);
 });
 
 test("pairing minted by one Worker deployment fails closed against another", async () => {

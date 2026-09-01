@@ -123,6 +123,8 @@ export default {
           { path: "/info", stage: "dev" },
           { path: "/ws/:workstationId", stage: "dev (WS upgrade, link auth)" },
           { path: "/status/:workstationId", stage: "dev (DO presence)" },
+          { path: "/devices/revoke-self", stage: "device self-revoke (exact credential binding)" },
+          { path: "/devices/revoke", stage: "owner/operator revoke of any enrolled device" },
           { path: "/devices/pairings", stage: "owner-authenticated device pairing creation" },
           { path: "/devices/pairings/consume", stage: "one-time device pairing consumption" },
           { path: "/mcp", stage: `public MCP epoch-${identity.contractEpoch} + sessionless ChatGPT SSE` },
@@ -164,7 +166,7 @@ export default {
     // The six-digit code NEVER travels in a URL/URI/query — consumption is
     // JSON-body-only; only the pairing_id may appear in a descriptor/fragment.
     if (request.method === "POST" && url.pathname === "/devices/pairings") {
-      const ownerAuth = await authenticatePairingCreator(request, env);
+      const ownerAuth = await authenticateOwner(request, env);
       if (!ownerAuth) return noStoreJsonResponse({ ok: false, code: "pairing_admin_required" }, 401);
       const parsed = await readBodyBounded(request, 8 * 1024);
       if (!parsed.ok || !isRecord(parsed.value)) {
@@ -230,9 +232,37 @@ export default {
       const authenticated = await authenticateDeviceCredential(registry, workstationId, extracted.credential);
       if (!authenticated.ok) return noStoreJsonResponse({ ok: false, code: authenticated.code }, 401);
       const revoked = await revokeRegisteredDevice(registry, authenticated.device_id);
-      return revoked
-        ? noStoreJsonResponse({ ok: true, device_id: authenticated.device_id })
-        : noStoreJsonResponse({ ok: false, code: "revoke_failed" }, 503);
+      if (revoked.ok) return noStoreJsonResponse({ ok: true, device_id: revoked.device_id });
+      return noStoreJsonResponse(
+        { ok: false, code: revoked.code, retryable: revoked.retryable },
+        revoked.code === "revoke_teardown_failed" ? 503 : 404,
+      );
+    }
+
+    // ---- Owner/operator revoke of any enrolled device. The caller supplies only
+    // the canonical target device_id — never a workstation_id or target secret.
+    // Authorization is the same trusted owner contract used for pairing
+    // creation: trusted MCP/OAuth/operator auth, or the exact default-workstation
+    // link credential. A joined member device credential is never sufficient
+    // unless its authenticated workstation is exactly DEFAULT_WORKSTATION_ID.
+    if (request.method === "POST" && url.pathname === "/devices/revoke") {
+      const ownerAuth = await authenticateOwner(request, env);
+      if (!ownerAuth) return noStoreJsonResponse({ ok: false, code: "revoke_admin_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.device_id !== "string") {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const deviceId = parsed.value.device_id.trim();
+      if (!deviceId) return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      const revoked = await revokeRegisteredDevice(registry, deviceId);
+      if (revoked.ok) {
+        return noStoreJsonResponse({ ok: true, device_id: revoked.device_id, revoked_at_ms: revoked.revoked_at_ms });
+      }
+      if (revoked.code === "device_not_found") return noStoreJsonResponse({ ok: false, code: "device_not_found" }, 404);
+      if (revoked.code === "invalid_device_id") return noStoreJsonResponse({ ok: false, code: "invalid_device_id" }, 400);
+      return noStoreJsonResponse({ ok: false, code: revoked.code, retryable: revoked.retryable }, 503);
     }
 
     // ---- /status/:workstationId — dev presence via DO.
@@ -524,7 +554,15 @@ function pairingWorkerContext(env: Env): string {
   return `${env.EDGE_PROJECT ?? "herdr-edge"}@${env.EDGE_ENV ?? "dev"}`;
 }
 
-async function authenticatePairingCreator(request: Request, env: Env): Promise<boolean> {
+/**
+ * Shared owner/operator authorization for the device control plane (pairing
+ * creation and owner revoke). Accepted owner contracts:
+ *  - trusted MCP/OAuth/operator auth (authenticateEdgeMcpRequest); or
+ *  - the exact DEFAULT_WORKSTATION_ID link credential (device or legacy).
+ * A joined member device credential is never sufficient unless its
+ * authenticated workstation is exactly DEFAULT_WORKSTATION_ID.
+ */
+async function authenticateOwner(request: Request, env: Env): Promise<boolean> {
   const owner = await authenticateEdgeMcpRequest(request, env);
   if (owner.ok) return true;
 

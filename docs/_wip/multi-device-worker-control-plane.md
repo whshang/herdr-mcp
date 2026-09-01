@@ -498,6 +498,17 @@ herdr-mcp device enrollment create
 
 All mutations resolve aliases to immutable `device_id` before execution.
 
+Owner revoke is already available over the HTTP control plane (no CLI needed for
+the owner product path): `POST /devices/revoke` with body `{ "device_id": ... }`
+authenticated by the same trusted owner contract as pairing creation (Edge
+MCP/OAuth/operator auth, or the exact default-workstation link credential). The
+caller supplies only the canonical target `device_id` — never a target
+`workstation_id` or target secret. The registry persists the revoked
+authorization first (fail-closed), then tears down the target device's live
+WorkstationDO/WebSocket session; reconnect stays 401. `POST /devices/revoke-self`
+remains the exact-credential self-revoke/compensation path and now also triggers
+the same teardown.
+
 ## 14. Worker Web Control Console
 
 The Console is a fleet control plane, not a replacement for the existing Browser Control Center and not a general RMM product.
@@ -613,6 +624,7 @@ Edge maps internal workstation errors to the stable device-facing boundary and r
 - [x] macOS second-device connect flow with native Keychain persistence;
 - [x] credential-to-device binding;
 - [x] self-revoke/compensation path;
+- [x] owner/operator revoke of any enrolled device by immutable `device_id` (trusted MCP/OAuth/operator auth or exact default-workstation link credential; members/non-owner denied) with immediate live WorkstationDO/WebSocket teardown and irreversible reconnect denial;
 - [x] retain legacy shared-secret compatibility for the configured default workstation only;
 - [ ] real Device A + Device B deployed UAT before release qualification.
 
