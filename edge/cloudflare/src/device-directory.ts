@@ -121,14 +121,41 @@ export async function authenticateDeviceCredential(
   }
 }
 
-export async function revokeRegisteredDevice(registry: FetchStub, deviceId: string): Promise<boolean> {
-  const response = await registry.fetch(new Request(
-    `https://registry.internal/internal/devices/${encodeURIComponent(deviceId)}/revoke`,
-    { method: "POST" },
-  ));
-  if (!response.ok) return false;
-  const body: unknown = await response.json();
-  return isRecord(body) && body.ok === true;
+export type RevokeDeviceResult =
+  | { ok: true; device_id: string; revoked: true; revoked_at_ms: number; wrote_registry: boolean }
+  | { ok: false; code: "device_not_found" | "invalid_device_id" | "revoke_teardown_failed" | "internal_error"; retryable: boolean };
+
+/**
+ * Revoke an enrolled device by immutable device_id. The registry DO persists
+ * the revoked authorization first (fail-closed), then tears down the target
+ * device's live WorkstationDO/WebSocket session. Idempotent: a repeated revoke
+ * performs no additional registry write but still re-issues teardown.
+ */
+export async function revokeRegisteredDevice(registry: FetchStub, deviceId: string): Promise<RevokeDeviceResult> {
+  try {
+    const response = await registry.fetch(new Request(
+      `https://registry.internal/internal/devices/${encodeURIComponent(deviceId)}/revoke`,
+      { method: "POST" },
+    ));
+    const body: unknown = await response.json();
+    if (response.ok && isRecord(body) && body.ok === true && typeof body.device_id === "string") {
+      return {
+        ok: true,
+        device_id: body.device_id,
+        revoked: true,
+        revoked_at_ms: typeof body.revoked_at_ms === "number" ? body.revoked_at_ms : Date.now(),
+        wrote_registry: body.wrote_registry === true,
+      };
+    }
+    if (isRecord(body) && typeof body.code === "string") {
+      if (body.code === "device_not_found") return { ok: false, code: "device_not_found", retryable: false };
+      if (body.code === "invalid_device_id") return { ok: false, code: "invalid_device_id", retryable: false };
+      if (body.code === "revoke_teardown_failed") return { ok: false, code: "revoke_teardown_failed", retryable: true };
+    }
+    return { ok: false, code: "internal_error", retryable: false };
+  } catch {
+    return { ok: false, code: "internal_error", retryable: false };
+  }
 }
 
 export async function ensureLegacyDeviceRegistration(

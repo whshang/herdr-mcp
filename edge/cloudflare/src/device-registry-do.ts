@@ -181,6 +181,19 @@ export class DeviceRegistryDO {
     const parsed = parseDeviceRecord(body);
     if (!parsed) return json({ ok: false, code: "invalid_device_record" }, 400);
     if (parsed.device_id !== deviceId) return json({ ok: false, code: "device_id_mismatch" }, 409);
+
+    // Revocation is an irreversible, dedicated operation. An arbitrary PUT must
+    // never create a revoked transition, and must never resurrect a revoked
+    // device back to active/suspended. This is required for "any revoke" to be
+    // irreversible and for reconnect denial to hold.
+    if (parsed.authorization === "revoked") {
+      return json({ ok: false, code: "revoke_via_put_forbidden" }, 409);
+    }
+    const existing = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + deviceId));
+    if (existing && existing.authorization === "revoked") {
+      return json({ ok: false, code: "device_revoked" }, 409);
+    }
+
     await this.state.storage.put(DEVICE_PREFIX + deviceId, parsed);
     return json({ ok: true, device: parsed });
   }
@@ -348,15 +361,46 @@ export class DeviceRegistryDO {
     if (!canonical) return json({ ok: false, code: "invalid_device_id" }, 400);
     const existing = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + canonical));
     if (!existing) return json({ ok: false, code: "device_not_found" }, 404);
+
     const now = Date.now();
-    const revoked: DeviceRecord = {
-      ...existing,
-      authorization: "revoked",
-      revoked_at_ms: existing.revoked_at_ms ?? now,
-      updated_at_ms: now,
-    };
-    await this.state.storage.put(DEVICE_PREFIX + canonical, revoked);
-    return json({ ok: true, device: revoked });
+    const alreadyRevoked = existing.authorization === "revoked";
+    let wroteRegistry = false;
+    if (!alreadyRevoked) {
+      const revoked: DeviceRecord = {
+        ...existing,
+        authorization: "revoked",
+        revoked_at_ms: existing.revoked_at_ms ?? now,
+        updated_at_ms: now,
+      };
+      await this.state.storage.put(DEVICE_PREFIX + canonical, revoked);
+      wroteRegistry = true;
+    }
+
+    // Kill switch: tear down the target device's live WorkstationDO/WebSocket
+    // session. The workstation_id comes from the stored record — never from the
+    // caller — so a revoke can only ever target the device it is bound to.
+    const workstationId = existing.workstation_id;
+    let teardownOk = false;
+    try {
+      if (this.env.WORKSTATION_DO) {
+        const stub = this.env.WORKSTATION_DO.get(this.env.WORKSTATION_DO.idFromName(workstationId));
+        const response = await stub.fetch(new Request("https://do.internal/internal/revoke", { method: "POST" }));
+        teardownOk = response.ok;
+      }
+    } catch {
+      teardownOk = false;
+    }
+
+    if (!teardownOk) {
+      // Authorization is already revoked (fail-closed): reconnect and new
+      // routing already deny. A retry performs no registry write and retries
+      // teardown, so this converges. Surface a retryable error.
+      return json(
+        { ok: false, code: "revoke_teardown_failed", retryable: true, device_id: canonical, revoked: true },
+        503,
+      );
+    }
+    return json({ ok: true, device_id: canonical, revoked: true, revoked_at_ms: existing.revoked_at_ms ?? now, wrote_registry: wroteRegistry });
   }
 
   private async ensureLegacyDevice(request: Request): Promise<Response> {
