@@ -24,7 +24,8 @@ use super::policy::LinkExitKind;
 use super::runner::{LinkRunnerCore, RunnerConfig};
 use super::runtime_control::{RuntimeControlLoop, RuntimeControlLoopOptions};
 use super::runtime_generation::{
-    RuntimeGenerationManager, RuntimeGenerationManagerOptions, RuntimeGenerationSpec,
+    RUNTIME_GENERATION_DEFAULT_TIMEOUT_MS, RuntimeGenerationManager,
+    RuntimeGenerationManagerOptions, RuntimeGenerationSpec,
 };
 use super::socket_driver::{LINK_SUBPROTOCOL, build_edge_url};
 use super::transport::{
@@ -204,7 +205,7 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
         config.contract_hash.clone(),
     );
     manager_options.contract_epoch = config.contract_epoch;
-    manager_options.default_timeout_ms = 30_000;
+    manager_options.default_timeout_ms = RUNTIME_GENERATION_DEFAULT_TIMEOUT_MS;
     manager_options.max_timeout_ms = 60_000;
     manager_options.observation_checks = 3;
     manager_options.observation_interval_ms = 500;
