@@ -1,4 +1,6 @@
-# Capability benchmark and design choices: what to absorb, what not to copy
+# Capability benchmark
+
+*Design choices: what to absorb and what not to copy.*
 
 This page is for maintainers and contributors. It is not a feature-count comparison. It is a long-lived ADR for deciding whether a capability from Herdr, another MCP implementation, a coding-agent framework or a browser integration belongs in herdr-mcp.
 

@@ -1,4 +1,6 @@
-# Why Herdr + herdr-mcp: the architecture and the ecosystem alternatives
+# Ecosystem comparison
+
+*Why Herdr + herdr-mcp, how the architecture differs, and when alternatives fit better.*
 
 A Web AI that wants real control over a local development machine has many shapes to choose from. This article explains where Herdr + herdr-mcp sits in that ecosystem, why this architecture exists, and when another tool is genuinely a better fit. It is a boundary decision, not a feature-count contest.
 

@@ -1,4 +1,6 @@
-# 浏览器控制中心：在 Chrome Side Panel 里观察真实 Herdr 现场
+# 浏览器控制中心
+
+*在 Chrome Side Panel 里观察真实 Herdr 现场。*
 
 浏览器控制中心把 Herdr 的 workspace / pane / Agent 运行现场放进 Chrome Side Panel。
 

@@ -1,4 +1,6 @@
-# Best practices: let the Web planner decide, let the workstation provide facts
+# Best practices
+
+*Let the Web planner decide; let the workstation provide facts.*
 
 The most reliable herdr-mcp workflow follows one rule:
 

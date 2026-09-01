@@ -1,4 +1,6 @@
-# ChatGPT Connector: connecting Web AI to your local workstation
+# ChatGPT Connector
+
+*Connect Web AI to your local workstation through MCP and OAuth.*
 
 herdr-mcp gives ChatGPT access to a real development environment without exposing your machine directly.
 

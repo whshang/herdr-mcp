@@ -29,25 +29,13 @@ function sectionAfterHeading(doc, heading) {
   return next >= 0 ? after.slice(0, next) : after;
 }
 
-test("README primary path documents the frozen top-level user CLI", () => {
-  const cases = [
-    ["README.md", "## Local runtime CLI"],
-    ["README.zh.md", "## 本机 runtime CLI"],
-    ["README.ja.md", "## Local runtime CLI"],
-  ];
-
-  for (const [rel, heading] of cases) {
+test("README keeps the exhaustive runtime CLI out of the primary user path", () => {
+  for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
     const doc = read(rel);
-    const section = sectionAfterHeading(doc, heading);
-    for (const command of USER_COMMANDS) {
-      assert.match(section, new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    }
-    assert.doesNotMatch(
-      section,
-      /^\s*herdr-mcp service install\b/m,
-      `${rel} CLI section must not use service install as the primary install instruction`
-    );
-    assert.match(section, /advanced|内部|Advanced/i);
+    assert.doesNotMatch(doc, /## (?:Local runtime CLI|本机 runtime CLI)/);
+    assert.match(doc, /herdr-mcp status/);
+    assert.match(doc, /herdr-mcp doctor/);
+    assert.doesNotMatch(doc, /^\s*herdr-mcp service install\b/m);
   }
 });
 

@@ -1,4 +1,6 @@
-# ChatGPT Connector：让网页里的 ChatGPT 真正接到本地工作站
+# ChatGPT Connector
+
+*通过 MCP 与 OAuth 把网页里的 ChatGPT 接到本地工作站。*
 
 ChatGPT 不能直接访问 `127.0.0.1`。herdr-mcp 因此把本机开发环境放在一个稳定的远程 MCP 入口后面：ChatGPT 连接 Cloudflare Edge，工作站再通过出站 WSS 主动连到 Edge。
 

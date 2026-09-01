@@ -1,4 +1,6 @@
-# Agent installation contract and `workers.dev` deployment
+# Agent install
+
+*End-to-end Agent installation contract and `workers.dev` deployment.*
 
 > **Executor: Agent.** This is the authoritative ordinary-workstation installation contract. It incorporates the former quick-install flow and the detailed security/operations contract. [Installation reference](install.md) is for manual/operator lookup.
 

@@ -1,4 +1,6 @@
-# Architecture: give a Web model a workstation that keeps working
+# Architecture
+
+*Give a Web model a workstation that keeps working.*
 
 herdr-mcp is a remote control plane between a Web AI and a local development environment managed by Herdr.
 

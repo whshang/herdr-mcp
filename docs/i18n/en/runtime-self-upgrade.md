@@ -1,4 +1,6 @@
-# Runtime A/B: upgrade the local runtime without breaking remote development
+# Runtime upgrades
+
+*A/B upgrade the local runtime without breaking remote development.*
 
 herdr-mcp separates the public connection plane from the local runtime plane.
 

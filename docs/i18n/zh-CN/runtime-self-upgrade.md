@@ -1,4 +1,6 @@
-# Runtime A/B：让本机升级不打断远程开发
+# Runtime 升级
+
+*通过 A/B 升级让本机 runtime 更新不打断远程开发。*
 
 herdr-mcp 把公网入口和本机 runtime 拆成两个独立的发布平面。
 

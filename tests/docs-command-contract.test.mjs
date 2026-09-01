@@ -8,9 +8,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (p) => readFileSync(path.join(ROOT, p), "utf8");
 
 const README_PRIMARY = [
-  ["README.md", "## Agent-first setup"],
-  ["README.zh.md", "## Agent-first 安装"],
-  ["README.ja.md", "## Agent-first セットアップ"],
+  ["README.md", "## Install"],
+  ["README.zh.md", "## 安装"],
+  ["README.ja.md", "## インストール"],
 ];
 
 const INSTALL_PRIMARY = [
@@ -54,19 +54,12 @@ test("README primary install path is native binary, not Node or service install"
     const section = sectionAfterHeading(read(rel), heading);
     assert.match(
       section,
-      /GitHub Releases|github\.com\/whshang\/herdr-mcp\/releases/i,
-      `${rel} primary path must point at GitHub Releases`
+      /raw\.githubusercontent\.com\/whshang\/herdr-mcp\/main\/docs\/i18n\//,
+      `${rel} primary path must hand the authoritative install protocol to the Agent`
     );
-    assert.match(
-      section,
-      /herdr-mcp doctor/,
-      `${rel} primary path must document herdr-mcp doctor`
-    );
-    assert.match(
-      section,
-      /do \*\*not\*\* need Node|不需要.*Node|Node\.js \/ npm は\*\*不要\*\*/i,
-      `${rel} must state Node is not required for the local MCP runtime`
-    );
+    assert.match(section, /GitHub Release/i, `${rel} primary path must pin the published native runtime`);
+    assert.match(section, /Cloudflare/);
+    assert.match(section, /ChatGPT/);
     assertNotNodeRuntimePrimary(rel, section);
   }
 });
@@ -105,9 +98,7 @@ test("release model keeps publication and ownership boundaries explicit", () => 
 test("v0.4.3 source-development docs expose DEV/PROD dogfood without the old npm rebuild path", () => {
   for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
     const doc = read(rel);
-    assert.match(doc, /herdr-mcp dev status/, `${rel} must expose read-only DEV provenance`);
-    assert.match(doc, /herdr-mcp dev sync/, `${rel} must expose the explicit DEV activation path`);
-    assert.match(doc, /herdr-mcp dev rollback/, `${rel} must expose the pinned PROD rollback path`);
+    assert.doesNotMatch(doc, /herdr-mcp dev sync/, `${rel} keeps contributor DEV activation out of the top-level user path`);
   }
 
   for (const rel of ["docs/i18n/en/cli-reference.md", "docs/i18n/zh-CN/cli-reference.md"]) {
@@ -134,16 +125,18 @@ test("workstation_offline docs preserve layered self-healing and delivery-state 
   }
 });
 
-test("README continuity path stays no-ID and fail-closed across languages", () => {
+test("continuity guide stays no-ID and fail-closed while README only links the feature", () => {
   const cases = [
-    ["README.md", /simply say \*\*“continue”\*\* or \*\*“resume”\*\*/, /without supplying an internal continuity ID/, /Recency or text similarity alone never selects a chain/],
-    ["README.zh.md", /直接说 \*\*“继续” \/ “接着上次”\*\*/, /不需要提供内部 `continuity_id`/, /不会因为“最近一次”或“文字最像”就直接猜/],
-    ["README.ja.md", /\*\*“continue” \/ “resume”\*\*/, /内部 `continuity_id` を入力せず/, /最新・文字類似だけで chain を選びません/],
+    ["docs/i18n/en/browser-continuity.md", /does not need to remember or type the `continuity_id`/, /text-only match remains confirmation-required/, /never chooses by newest-or-most-similar heuristics/],
+    ["docs/i18n/zh-CN/browser-continuity.md", /不需要记住或输入 `continuity_id`/, /单纯文本匹配即使只剩一个候选也仍需要用户确认/, /禁止用“最近一次”或“最像”直接猜/],
   ];
   for (const [rel, intent, noId, failClosed] of cases) {
     const doc = read(rel);
-    assert.match(doc, intent, `${rel} must expose the manual continue/resume path`);
-    assert.match(doc, noId, `${rel} must say an internal continuity ID is not required`);
-    assert.match(doc, failClosed, `${rel} must keep ambiguous selection fail-closed`);
+    assert.match(doc, intent, `${rel} must keep manual continuation ID-free`);
+    assert.match(doc, noId, `${rel} must require confirmation for text-only selection`);
+    assert.match(doc, failClosed, `${rel} must keep heuristic selection fail-closed`);
+  }
+  for (const rel of ["README.md", "README.zh.md", "README.ja.md"]) {
+    assert.match(read(rel), /browser-continuity\.md/);
   }
 });

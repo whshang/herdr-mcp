@@ -1,4 +1,6 @@
-# herdr-mcp CLI: local management and operations
+# CLI reference
+
+*Local herdr-mcp management and operations.*
 
 This page covers **herdr-mcp** commands only. For Herdr workspace, pane, agent and session commands, use the official [Herdr CLI reference](https://herdr.dev/docs/cli-reference/).
 

@@ -1,47 +1,64 @@
-# Connect a new computer to an existing Herdr Worker
+# Multi-device control
 
-This is the authoritative Agent execution contract for **connecting a new computer to an existing herdr-mcp Worker/Connector**. It is **not** a fresh Worker deployment.
+*Use one Herdr Worker and one ChatGPT connection to control multiple enrolled computers.*
 
-> **macOS only in v0.4.3.** Secure new-device pairing requires the macOS Keychain credential backend. On Linux/Windows the `worker pair` / `worker connect` path is **unavailable and fails closed**; the runtime itself remains supported on those platforms.
+A Herdr fleet has one public Worker/Connector and multiple independently identified computers behind it. ChatGPT can discover the fleet, choose a device for a task, and keep follow-up operations attached to that device. New computers join the existing Worker through short-lived pairing; they do not deploy another Worker or receive a shared global secret.
 
-## Before you start
+> Secure new-device pairing currently uses the macOS Keychain credential backend, so the pairing workflow is currently macOS-only.
 
-- This path requires **v0.4.3+**. Check the latest stable Release version/capability. If stable is still `<0.4.3` or the installed CLI does not expose `herdr-mcp worker pair` / `herdr-mcp worker connect`, **stop and report the version/capability blocker**. Do not install a prerelease/source build unless the user explicitly asked to test preview/source.
-- Install the latest stable PROD herdr-mcp from the **GitHub Release**, not from a repo checkout. Do not treat a source/dev build as a normal install.
-- This is **not** a fresh Worker deployment. Do **not** create a new Cloudflare Worker, Durable Object namespace, OAuth app/client, Connector, or copy the legacy global `LINK_SHARED_SECRET`. You join the Worker the user already has.
+## See the fleet from ChatGPT
 
-## How pairing works
+Use `herdr_devices` to list the devices known to the Worker. The result includes stable device identity plus current authorization, connection, scheduling, and health information.
 
-1. On the **already-authorized existing macOS computer**, the owner runs:
+A useful prompt is:
 
-   ```bash
-   herdr-mcp worker pair
-   ```
+```text
+List my Herdr devices and show which are online. Use macbook-main for the backend task and macbook-lab for the independent test task. Keep their working trees isolated and verify both results before reporting completion.
+```
 
-   This creates a short-lived pairing session (default **10 minutes**, single-use) and prints:
-   - a **pairing address** (the Worker origin plus a high-entropy pairing id in the URL fragment), and
-   - a **6-digit verification code** (formatted `123 456`).
+Routing is intentionally conservative:
 
-2. On the **new computer**, the Agent runs:
+- an explicitly named device is used for that operation;
+- follow-up references and retries keep their original device identity;
+- when only one device is routable, Herdr can select it automatically;
+- when several devices are valid candidates for a mutation and no target is specified, Herdr returns `device_ambiguous` instead of guessing.
 
-   ```bash
-   herdr-mcp worker connect "<pairing-address>" --name "<device-name>"
-   ```
+Each enrolled computer has its own credential and immutable `device_id`. Device names are human-friendly selectors; the underlying identity remains stable.
 
-   The CLI then **prompts for the 6-digit code** (no-echo TTY, or a single non-echo stdin line when noninteractive). The code is **never** a command-line argument and is **never** echoed or logged.
+## Add a new computer
 
-3. On success, the temporary pairing is exchanged for the existing high-entropy per-device secret. The final device secret is stored **only in the macOS Keychain**; the pairing code/session become immediately unusable. No Cloudflare deployment credential and no legacy `LINK_SHARED_SECRET` is used on the joining device.
+### 1. Create a short-lived pairing on an authorized computer
 
-## Security rules
+Run:
 
-- The 6-digit code is the intended short-lived pairing credential. It is single-use, expires in 10 minutes, and is limited to **5 wrong attempts** before the session is permanently locked.
-- The pairing id is high-entropy and unguessable; it is carried in the pairing address (URL fragment), not in HTTP access-log paths. The final device secret is never in the pairing address.
-- The code must **never** appear in argv, shell history, logs, or transcripts. Do **not** use `echo 123456 | ...` or any shell literal that puts the code into shell history.
-- The final device credential belongs in the macOS Keychain. Never print or log it.
+```bash
+herdr-mcp worker pair
+```
 
-## Verification
+This creates a single-use pairing session, normally valid for 10 minutes, and prints:
 
-After a successful connect, verify:
+- a pairing address containing a high-entropy pairing id; and
+- a 6-digit verification code, formatted like `123 456`.
+
+### 2. Connect the new computer
+
+On the new computer, the Agent runs:
+
+```bash
+herdr-mcp worker connect "<pairing-address>" --name "<device-name>"
+```
+
+The CLI then prompts for the 6-digit code using a no-echo input. The code is intentionally not accepted as a normal command-line argument.
+
+For an Agent-assisted setup, paste this sentence on the new computer:
+
+```text
+Connect this computer to my existing Herdr fleet by following https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md; use this pairing address: <pairing-address>, ask me for the 6-digit verification code only when the CLI prompts for it, then verify this device appears online in the same Worker.
+```
+
+### 3. Verify the new device
+
+After the connection succeeds:
 
 ```bash
 herdr-mcp status
@@ -49,14 +66,29 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-Confirm the resulting immutable `device_id`, Link online/healthy, and successful local binding.
+Then ask ChatGPT to call `herdr_devices` and confirm the new device is online under the same Worker.
 
-## Uncertain delivery / recovery
+## What pairing changes
 
-- If any mutation reports uncertain delivery, **do not blind retry**; inspect current state first.
-- If connect fails after server-side consume, rely on the built-in compensation/revoke behavior (exact remote revoke-self + local Keychain cleanup + prior-config restore) and report the evidence. Do not invent manual secret handling.
-- If the pairing code is entered incorrectly 5 times, the session is permanently locked; create a new pairing with `herdr-mcp worker pair`.
+The short-lived pairing is exchanged for a new per-device credential. The final credential is stored in macOS Keychain, and the Worker stores only the verifier needed to authenticate that device. The pairing session becomes unusable after successful consumption.
 
-## Two-device UAT
+The joining computer does **not** need:
 
-Formal two-device GA/UAT has not yet passed. This is expected v0.4.3 behavior pending release/UAT.
+- Cloudflare deployment credentials;
+- a new Worker or Durable Object deployment;
+- a new ChatGPT Connector/OAuth client; or
+- the legacy global `LINK_SHARED_SECRET`.
+
+## Pairing security
+
+- The 6-digit code is single-use and short-lived.
+- Five wrong code attempts permanently lock that pairing session; create a new one instead of retrying indefinitely.
+- The pairing id is high-entropy and stays in the URL fragment so it is not placed in normal HTTP access-log paths.
+- Never put the verification code in argv, shell history, logs, or transcripts.
+- Never print or copy the final per-device credential; it belongs in the OS credential store.
+
+## Recovery
+
+If a mutation reports uncertain delivery, inspect current state before retrying. Do not blindly repeat an operation whose delivery may already have happened.
+
+If connection fails after the server has consumed the pairing, rely on the built-in compensation/revoke behavior and inspect the resulting state. Create a fresh pairing only after the previous attempt is known to be unusable.

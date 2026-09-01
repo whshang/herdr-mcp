@@ -1,4 +1,6 @@
-# Quick start: prove the first real task after installation
+# Quick start
+
+*Prove the first real task after installation.*
 
 > **Role:** this page starts after herdr-mcp is installed and connected. For the executable install contract, use [Agent install](agent-install.md). For manual installation and operations, use [Installation](install.md).
 

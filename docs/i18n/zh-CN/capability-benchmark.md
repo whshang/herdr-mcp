@@ -1,4 +1,6 @@
-# 能力基准与设计取舍：什么该吸收，什么不该复制
+# 能力基准
+
+*设计取舍：什么该吸收，什么不该复制。*
 
 这篇面向 Maintainer / Contributor。它不是“谁功能更多”的产品对比，而是一份长期 ADR：当我们看到 Herdr、coding-tools-mcp、其它 MCP bridge 或新的 Coding Agent 能力时，判断它应该进入 herdr-mcp、复用原生能力，还是明确不做。
 

@@ -231,6 +231,31 @@ body:not(.docs-page):not(.docs-index-page) > main { width: min(1080px, calc(100%
 .grid article { padding: 18px; border: 1px solid var(--line); border-radius: 10px; }
 .grid h2 { margin: 0 0 8px; font-size: 16px; }
 .grid p { color: var(--muted-strong); font-size: 13px; }
+.landing-hero { max-width: 980px; padding-top: 24px; }
+.landing-hero h1 { max-width: 13ch; }
+html[lang="zh-CN"] .landing-hero h1 { max-width: 16ch; }
+.landing-architecture { margin: 12px 0 56px; }
+.landing-architecture .diagram { margin-bottom: 14px; border-radius: 18px; padding: 20px; background: linear-gradient(145deg, var(--surface-soft), var(--surface)); }
+.landing-architecture .diagram div { min-height: 86px; display: grid; align-content: center; gap: 4px; border-radius: 12px; }
+.landing-architecture .diagram strong { font-size: 13px; }
+.landing-architecture .diagram small { color: var(--muted); line-height: 1.45; }
+.architecture-note { max-width: 880px; margin: 0; color: var(--muted-strong); font-size: 13.5px; line-height: 1.65; }
+.landing-value-grid { margin-bottom: 54px; }
+.landing-value-grid article { min-height: 170px; padding: 22px; background: var(--surface); }
+.landing-value-grid h2 { margin-top: 10px; font-size: 18px; letter-spacing: -.02em; }
+.landing-value-grid p { line-height: 1.6; }
+.landing-install { margin: 0 0 54px; padding: 28px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface-soft); }
+.landing-section-copy { max-width: 760px; }
+.landing-section-copy h2 { margin: 8px 0 8px; font-size: clamp(28px, 4vw, 40px); letter-spacing: -.04em; }
+.landing-section-copy p { margin: 0; color: var(--muted-strong); font-size: 14px; line-height: 1.65; }
+.landing-install .agent-prompt { max-width: none; margin-top: 20px; background: var(--code-bg); }
+.landing-links-grid { margin-bottom: 54px; }
+.landing-links-grid article { background: var(--surface); }
+.landing-links-grid p:last-child { margin-bottom: 0; }
+.landing-research { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 28px; align-items: center; margin: 0 0 28px; padding: 28px; border: 1px solid var(--line); border-radius: 18px; background: linear-gradient(145deg, var(--surface), var(--surface-soft)); }
+.landing-research h2 { max-width: 780px; margin: 8px 0 9px; font-size: clamp(24px, 3vw, 34px); line-height: 1.08; letter-spacing: -.035em; }
+.landing-research p { max-width: 780px; margin: 0; color: var(--muted-strong); font-size: 13.5px; line-height: 1.6; }
+.landing-research .button { white-space: nowrap; }
 
 /* /docs/ entry: English is canonical/default; browser-language routing may
    select zh-CN when there is no explicit language pin. Keep readable fallback
@@ -261,6 +286,7 @@ body:not(.docs-page):not(.docs-index-page) footer a { text-decoration: none; }
   .nav-overlay:not([hidden]) { display: block; }
   body.nav-open { overflow: hidden; }
   .grid { grid-template-columns: repeat(2, 1fr); }
+  .landing-research { grid-template-columns: 1fr; }
   .docs-grid.home-three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .diagram { grid-template-columns: 1fr; }
   .diagram span { transform: rotate(0deg); }
@@ -287,6 +313,7 @@ body:not(.docs-page):not(.docs-index-page) footer a { text-decoration: none; }
   .hero-actions { max-width: 100%; }
   .hero-actions .button { max-width: 100%; }
   .docs-grid, .docs-grid.home-three, .grid { grid-template-columns: minmax(0, 1fr); }
+  .landing-install, .landing-research { padding: 20px; border-radius: 14px; }
   .docs-paths { gap: 34px; padding-top: 36px; }
   body:not(.docs-page):not(.docs-index-page) > main { width: min(100% - 28px, 1080px); padding-top: 46px; }
 }

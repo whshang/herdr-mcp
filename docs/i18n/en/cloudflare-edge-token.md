@@ -1,4 +1,6 @@
-# Cloudflare Edge credentials: least privilege, temporary bootstrap, verifiable state
+# Cloudflare credentials
+
+*Least privilege, temporary bootstrap, and verifiable state.*
 
 Deploying herdr-mcp Edge requires Cloudflare API permissions, but long-lived operation should not depend on an account-wide administrator credential.
 
