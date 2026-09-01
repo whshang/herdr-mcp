@@ -110,3 +110,17 @@ test("v0.4.3 pairing docs use only the implemented CLI surface", () => {
   assert.match(controlPlane, /Real two-device UAT is still pending/);
   assert.match(plan, /pending production Edge[\s\S]*second Mac/);
 });
+
+test("worker connect owns local service and enrolled production Link activation", () => {
+  const worker = read("crates/herdr-mcp/src/worker.rs");
+  const refresh = read("crates/herdr-mcp/src/link/generation_refresh.rs");
+
+  assert.match(worker, /fn activate_connected_runtime\(/);
+  assert.match(worker, /service_lifecycle::run\(ServiceCommand::Install \{ adopt_node: false \}\)/);
+  assert.match(worker, /"service_ready": true/);
+  assert.match(worker, /"link_ready": true/);
+  assert.match(refresh, /ensure_enrolled_rust_prod_link/);
+  assert.match(refresh, /install_fresh_rust_prod_link/);
+  assert.match(refresh, /configured_edge_device_identity\(home\)/);
+  assert.match(refresh, /Never rewrite or bootstrap an existing Node\/foreign production Link/);
+});

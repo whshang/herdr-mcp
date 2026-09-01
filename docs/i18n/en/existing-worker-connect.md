@@ -50,6 +50,8 @@ herdr-mcp worker connect "<pairing-address>" --name "<device-name>"
 
 The CLI then prompts for the 6-digit code using a no-echo input. The code is intentionally not accepted as a normal command-line argument.
 
+After the pairing is consumed, `worker connect` installs/starts the local `herdr-mcp` service and ensures the enrolled Rust production Link is created and loaded. The command reports success only after the local service is healthy and `link-prod` is owned by the managed runtime with the new device identity; a failure triggers the existing revoke/Keychain/config compensation path.
+
 For an Agent-assisted setup, paste this sentence on the new computer:
 
 ```text

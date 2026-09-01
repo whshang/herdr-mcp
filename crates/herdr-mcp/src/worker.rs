@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use crate::cli::ServiceCommand;
 use crate::cli::WorkerCommand;
 #[cfg(any(target_os = "macos", test))]
 use crate::config::Config;
@@ -177,9 +179,86 @@ fn connect_existing_worker(
         write_config_atomic,
         revoke_self,
         crate::macos_keychain::delete_generic_secret,
+        activate_connected_runtime,
         crate::link::reconcile_after_service_generation_change,
         consume_pairing,
     )
+}
+
+#[cfg(target_os = "macos")]
+fn activate_connected_runtime(paths: &RuntimePaths) -> Result<(), String> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is required to activate the connected runtime".to_owned())?;
+    let prod_plist = home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LINK_PROD_LABEL}.plist"));
+    let prod_plist_existed_before = prod_plist.exists();
+
+    match activate_connected_runtime_inner(paths, &home) {
+        Ok(()) => Ok(()),
+        Err(error) if !prod_plist_existed_before => {
+            match crate::link::remove_fresh_owned_prod_link_after_failed_activation(&home) {
+                Ok(_) => Err(error),
+                Err(cleanup_error) => Err(format!(
+                    "{error}; failed to clean up the fresh production Link after activation failure: {cleanup_error}"
+                )),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn activate_connected_runtime_inner(paths: &RuntimePaths, home: &Path) -> Result<(), String> {
+    let code = crate::service_lifecycle::run(ServiceCommand::Install { adopt_node: false })?;
+    if code != ExitCode::SUCCESS {
+        return Err(format!(
+            "service install returned a non-success exit code: {code:?}"
+        ));
+    }
+
+    let service = crate::service_manager::doctor_status()?;
+    if service.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err("herdr-mcp service is not healthy after worker connect activation".to_owned());
+    }
+
+    let link = crate::link::ownership::collect_status_report(home, &paths.config_dir);
+    let prod = link
+        .get("agents")
+        .and_then(Value::as_array)
+        .and_then(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent.get("label").and_then(Value::as_str) == Some(LINK_PROD_LABEL))
+        })
+        .ok_or_else(|| "production Link status is missing link-prod evidence".to_owned())?;
+    if prod.get("loaded").and_then(Value::as_bool) != Some(true)
+        || prod.get("implementation").and_then(Value::as_str) != Some("rust")
+        || prod
+            .get("points_at_managed_runtime")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(
+            "production Link is not loaded as an owned Rust managed-runtime process after worker connect activation"
+                .to_owned(),
+        );
+    }
+
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let expected_device = config
+        .edge_device_id
+        .as_deref()
+        .ok_or_else(|| "worker connect config is missing device_id after activation".to_owned())?;
+    if prod.get("workstation_id").and_then(Value::as_str) != Some(expected_device) {
+        return Err(
+            "production Link identity does not match the newly paired device after activation"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -265,7 +344,7 @@ where
 #[cfg(any(target_os = "macos", test))]
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn connect_macos_inner<F, G, H, I, J, K, L>(
+fn connect_macos_inner<F, G, H, I, J, K, L, M>(
     paths: &RuntimePaths,
     edge_origin: &str,
     pairing_id: &str,
@@ -276,8 +355,9 @@ fn connect_macos_inner<F, G, H, I, J, K, L>(
     write_config: H,
     revoke_fn: I,
     delete_secret: J,
-    reconcile: K,
-    consume: L,
+    activate: K,
+    reconcile_restore: L,
+    consume: M,
 ) -> Result<ExitCode, String>
 where
     F: Fn(&str, &str, &str) -> Result<(), String>,
@@ -286,7 +366,8 @@ where
     I: Fn(&str, &str, &str) -> Result<bool, String>,
     J: Fn(&str, &str) -> Result<(), String>,
     K: Fn(&RuntimePaths) -> Result<(), String>,
-    L: Fn(&str, &str, &str, Option<&str>) -> Result<EnrolledCredential, String>,
+    L: Fn(&RuntimePaths) -> Result<(), String>,
+    M: Fn(&str, &str, &str, Option<&str>) -> Result<EnrolledCredential, String>,
 {
     let enrolled = consume(edge_origin, pairing_id, code, name)?;
     let device_id = crate::config::normalize_device_id(&enrolled.device_id)?;
@@ -387,11 +468,11 @@ where
         ));
     }
 
-    if let Err(error) = reconcile(paths) {
-        // The config is durably written, but the persisted Link identity could not
-        // be reconciled. Roll the whole local transaction back: exact remote
+    if let Err(error) = activate(paths) {
+        // The config is durably written, but the local runtime/production Link
+        // could not be made ready. Roll the whole local transaction back: exact remote
         // revoke-self, local Keychain deletion, best-effort atomic restore of the
-        // previous config, and best-effort reconcile of the Link identity from
+        // previous config, and best-effort reconcile of the previous Link identity from
         // that config. Rollback failures are reported, never hidden, and no secret
         // is ever printed. The pairing is already consumed server-side, so it is
         // never reusable.
@@ -406,10 +487,10 @@ where
             &write_config,
             &revoke_fn,
             &delete_secret,
-            &reconcile,
+            &reconcile_restore,
         );
         return Err(format!(
-            "device {device_id} is paired but the local binding could not be reconciled: {error}; compensation revoked={} keychain_deleted={} config_restored={} link_reconciled={} restore_error={} reconcile_error={}",
+            "device {device_id} is paired but the local runtime could not be activated: {error}; compensation revoked={} keychain_deleted={} config_restored={} link_reconciled={} restore_error={} reconcile_error={}",
             evidence.revoked,
             evidence.keychain_deleted,
             evidence.config_restored,
@@ -428,6 +509,8 @@ where
         "keychain_service": keychain_service,
         "pairing_consumed": true,
         "secret_printed": false,
+        "service_ready": true,
+        "link_ready": true,
         "link_reconciled": true,
     }))?;
     Ok(ExitCode::SUCCESS)
@@ -1106,10 +1189,12 @@ mod tests {
 
         let revoke_calls = Rc::new(RefCell::new(0));
         let delete_calls = Rc::new(RefCell::new(0));
+        let activation_calls = Rc::new(RefCell::new(0));
         let reconcile_calls = Rc::new(RefCell::new(0));
         let writes = Rc::new(RefCell::new(Vec::<Config>::new()));
         let revoke_calls_hook = revoke_calls.clone();
         let delete_calls_hook = delete_calls.clone();
+        let activation_calls_hook = activation_calls.clone();
         let reconcile_calls_hook = reconcile_calls.clone();
         let writes_hook = writes.clone();
 
@@ -1138,16 +1223,13 @@ mod tests {
             *delete_calls_hook.borrow_mut() += 1;
             Ok(())
         };
-        // First reconcile call (in the transaction) fails; the rollback's
-        // reconcile-back (second call) succeeds.
+        let activate = move |_paths: &RuntimePaths| -> Result<(), String> {
+            *activation_calls_hook.borrow_mut() += 1;
+            Err("simulated activation failure".to_owned())
+        };
         let reconcile = move |_paths: &RuntimePaths| -> Result<(), String> {
-            let call = *reconcile_calls_hook.borrow();
             *reconcile_calls_hook.borrow_mut() += 1;
-            if call == 0 {
-                Err("simulated reconcile failure".to_owned())
-            } else {
-                Ok(())
-            }
+            Ok(())
         };
         let consume = move |origin: &str, id: &str, code: &str, name: Option<&str>| {
             assert_eq!(origin, "https://edge.example");
@@ -1175,13 +1257,14 @@ mod tests {
             write_config,
             revoke,
             delete,
+            activate,
             reconcile,
             consume,
         );
 
         // The transaction must fail closed with rollback evidence.
         let error = result.unwrap_err();
-        assert!(error.contains("could not be reconciled"));
+        assert!(error.contains("could not be activated"));
         assert!(error.contains("revoked=true"));
         assert!(error.contains("keychain_deleted=true"));
         assert!(error.contains("config_restored=true"));
@@ -1192,9 +1275,9 @@ mod tests {
         // Remote revoke + Keychain delete happened exactly once, in the rollback.
         assert_eq!(*revoke_calls.borrow(), 1);
         assert_eq!(*delete_calls.borrow(), 1);
-        // Reconcile ran twice: once in the transaction (failed), once as
-        // reconcile-back after config restore (succeeded).
-        assert_eq!(*reconcile_calls.borrow(), 2);
+        assert_eq!(*activation_calls.borrow(), 1);
+        // Reconcile-back runs once after restoring the old config.
+        assert_eq!(*reconcile_calls.borrow(), 1);
 
         // Final write must be the OLD config: old id present, new id absent.
         let final_writes = writes.borrow();
@@ -1261,6 +1344,7 @@ mod tests {
         };
         let revoke = |_: &str, _: &str, _: &str| -> Result<bool, String> { Ok(true) };
         let delete = |_: &str, _: &str| -> Result<(), String> { Ok(()) };
+        let activate = |_paths: &RuntimePaths| -> Result<(), String> { Ok(()) };
         let reconcile = |_paths: &RuntimePaths| -> Result<(), String> { Ok(()) };
         let consume = move |origin: &str, id: &str, code: &str, name: Option<&str>| {
             assert_eq!(origin, "https://edge.example");
@@ -1289,6 +1373,7 @@ mod tests {
             write_config,
             revoke,
             delete,
+            activate,
             reconcile,
             consume,
         );

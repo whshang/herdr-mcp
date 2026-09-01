@@ -42,6 +42,8 @@ pub mod transport;
 
 pub use cutover::{CutoverMode, run as run_link_cutover};
 pub(crate) use generation_refresh::reconcile_after_service_generation_change;
+#[cfg(target_os = "macos")]
+pub(crate) use generation_refresh::remove_fresh_owned_prod_link_after_failed_activation;
 pub use install::{
     LINK_RUST_CANDIDATE_LABEL, install as run_link_install, uninstall as run_link_uninstall,
 };
