@@ -44,6 +44,19 @@ struct SourceIdentity {
     dirty: bool,
 }
 
+#[derive(Clone, Copy)]
+struct DevRecoveryIdentity<'a> {
+    current_exe_is_active_runtime: bool,
+    runtime_channel: &'a str,
+    runtime_version: &'a str,
+    compiled_source_commit: Option<&'a str>,
+    compiled_source_dirty: bool,
+    checkout_repo: &'a str,
+    checkout_branch: Option<&'a str>,
+    checkout_commit: &'a str,
+    checkout_dirty: bool,
+}
+
 pub fn run(command: DevCommand) -> Result<ExitCode, String> {
     match command {
         DevCommand::Sync {
@@ -76,7 +89,62 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
     let active_before = current_generation(&runtime.config_dir)?.ok_or_else(|| {
         "dev sync requires an installed managed PROD runtime/current generation".to_owned()
     })?;
-    let existing = read_state(&paths.state)?;
+    let mut existing = read_state(&paths.state)?;
+    if let Some(state) = existing.as_mut()
+        && state.channel == "dev"
+        && state.dev_generation.is_none()
+        && interrupted_dev_state_matches_active_runtime(&runtime, state, &repo, &source)?
+    {
+        if !verify_snapshot(state)? {
+            return Err(
+                "refusing interrupted DEV sync recovery because the pinned PROD snapshot failed SHA-256 validation"
+                    .to_owned(),
+            );
+        }
+        let activation_evidence = verify_dev_activation(&runtime, &active_before).map_err(|error| {
+            format!(
+                "refusing interrupted DEV sync recovery because the active runtime no longer satisfies the DEV activation gate: {error}"
+            )
+        })?;
+        if !mark_interrupted_dev_recovery_committed(state, &active_before, now_ms(), dry_run) {
+            print_json(&json!({
+                "ok": true,
+                "action": "dev_sync_recovery",
+                "dry_run": true,
+                "channel": "dev",
+                "version": state.target_version,
+                "source_commit": state.source_commit,
+                "source_dirty": state.source_dirty,
+                "generation": active_before,
+                "prod_generation": state.prod_generation,
+                "prod_snapshot_sha256": state.prod_snapshot_sha256,
+                "activation_evidence": activation_evidence,
+                "server_link_generation_reconciled": activation_evidence
+                    .get("server_link_generation_reconciled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            }))?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        write_state(&paths.state, state)?;
+        print_json(&json!({
+            "ok": true,
+            "action": "dev_sync_recovered",
+            "channel": "dev",
+            "version": state.target_version,
+            "source_commit": state.source_commit,
+            "source_dirty": state.source_dirty,
+            "generation": active_before,
+            "prod_generation": state.prod_generation,
+            "prod_snapshot_sha256": state.prod_snapshot_sha256,
+            "activation_evidence": activation_evidence,
+            "server_link_generation_reconciled": activation_evidence
+                .get("server_link_generation_reconciled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }))?;
+        return Ok(ExitCode::SUCCESS);
+    }
     if let Some(state) = existing.as_ref()
         && state.channel == "dev"
         && state.dev_generation.as_deref() != Some(active_before.as_str())
@@ -227,6 +295,75 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
             .unwrap_or(false),
     }))?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn interrupted_dev_state_matches_active_runtime(
+    runtime: &RuntimePaths,
+    state: &DevRuntimeState,
+    repo: &Path,
+    source: &SourceIdentity,
+) -> Result<bool, String> {
+    let current_exe = env::current_exe()
+        .map_err(|error| format!("cannot resolve current executable for DEV recovery: {error}"))?;
+    let active_binary = runtime.config_dir.join("runtime/current/herdr-mcp");
+    let current_exe = fs::canonicalize(&current_exe).map_err(|error| {
+        format!(
+            "cannot canonicalize current executable {} for DEV recovery: {error}",
+            current_exe.display()
+        )
+    })?;
+    let active_binary = fs::canonicalize(&active_binary).map_err(|error| {
+        format!(
+            "cannot canonicalize active runtime binary {} for DEV recovery: {error}",
+            active_binary.display()
+        )
+    })?;
+    let repo_text = repo.to_string_lossy();
+    Ok(interrupted_dev_state_matches_identity(
+        state,
+        &DevRecoveryIdentity {
+            current_exe_is_active_runtime: current_exe == active_binary,
+            runtime_channel: crate::runtime_meta::runtime_channel(),
+            runtime_version: crate::runtime_meta::runtime_version(),
+            compiled_source_commit: crate::runtime_meta::compiled_source_commit(),
+            compiled_source_dirty: crate::runtime_meta::compiled_source_dirty(),
+            checkout_repo: repo_text.as_ref(),
+            checkout_branch: source.branch.as_deref(),
+            checkout_commit: source.commit.as_str(),
+            checkout_dirty: source.dirty,
+        },
+    ))
+}
+
+fn interrupted_dev_state_matches_identity(
+    state: &DevRuntimeState,
+    identity: &DevRecoveryIdentity<'_>,
+) -> bool {
+    state.channel == "dev"
+        && state.dev_generation.is_none()
+        && identity.current_exe_is_active_runtime
+        && identity.runtime_channel == "dev"
+        && identity.runtime_version == state.target_version
+        && identity.compiled_source_commit == state.source_commit.as_deref()
+        && identity.compiled_source_dirty == state.source_dirty
+        && state.source_repo.as_deref() == Some(identity.checkout_repo)
+        && state.source_branch.as_deref() == identity.checkout_branch
+        && state.source_commit.as_deref() == Some(identity.checkout_commit)
+        && state.source_dirty == identity.checkout_dirty
+}
+
+fn mark_interrupted_dev_recovery_committed(
+    state: &mut DevRuntimeState,
+    generation: &str,
+    updated_at_ms: u128,
+    dry_run: bool,
+) -> bool {
+    if dry_run {
+        return false;
+    }
+    state.dev_generation = Some(generation.to_owned());
+    state.updated_at_ms = updated_at_ms;
+    true
 }
 
 fn status() -> Result<ExitCode, String> {
@@ -1042,6 +1179,116 @@ mod tests {
                 .unwrap_err()
                 .contains("partial/foreign/stale")
         );
+    }
+
+    #[test]
+    fn interrupted_dev_recovery_requires_exact_active_runtime_identity() {
+        let state = DevRuntimeState {
+            schema_version: STATE_SCHEMA_VERSION,
+            channel: "dev".to_owned(),
+            target_version: "0.4.3-dev".to_owned(),
+            source_repo: Some("/tmp/herdr-mcp".to_owned()),
+            source_branch: Some("main".to_owned()),
+            source_commit: Some("abc123".to_owned()),
+            source_dirty: false,
+            dev_generation: None,
+            prod_generation: "rust-prod".to_owned(),
+            prod_version: "0.4.2".to_owned(),
+            prod_snapshot_binary: "/tmp/prod/herdr-mcp".to_owned(),
+            prod_snapshot_sha256: "0".repeat(64),
+            updated_at_ms: 1,
+        };
+        let identity = DevRecoveryIdentity {
+            current_exe_is_active_runtime: true,
+            runtime_channel: "dev",
+            runtime_version: "0.4.3-dev",
+            compiled_source_commit: Some("abc123"),
+            compiled_source_dirty: false,
+            checkout_repo: "/tmp/herdr-mcp",
+            checkout_branch: Some("main"),
+            checkout_commit: "abc123",
+            checkout_dirty: false,
+        };
+
+        assert!(interrupted_dev_state_matches_identity(&state, &identity));
+        assert!(!interrupted_dev_state_matches_identity(
+            &state,
+            &DevRecoveryIdentity {
+                current_exe_is_active_runtime: false,
+                ..identity
+            },
+        ));
+        assert!(!interrupted_dev_state_matches_identity(
+            &state,
+            &DevRecoveryIdentity {
+                runtime_channel: "prod",
+                ..identity
+            },
+        ));
+        assert!(!interrupted_dev_state_matches_identity(
+            &state,
+            &DevRecoveryIdentity {
+                compiled_source_commit: Some("different"),
+                ..identity
+            },
+        ));
+        assert!(!interrupted_dev_state_matches_identity(
+            &state,
+            &DevRecoveryIdentity {
+                compiled_source_dirty: true,
+                ..identity
+            },
+        ));
+        assert!(!interrupted_dev_state_matches_identity(
+            &state,
+            &DevRecoveryIdentity {
+                checkout_commit: "different",
+                ..identity
+            },
+        ));
+        assert!(!interrupted_dev_state_matches_identity(
+            &state,
+            &DevRecoveryIdentity {
+                checkout_repo: "/tmp/other-checkout",
+                ..identity
+            },
+        ));
+
+        let mut committed = state.clone();
+        committed.dev_generation = Some("rust-dev".to_owned());
+        assert!(!interrupted_dev_state_matches_identity(
+            &committed, &identity,
+        ));
+    }
+
+    #[test]
+    fn interrupted_dev_recovery_dry_run_never_mutates_state() {
+        let mut state = DevRuntimeState {
+            schema_version: STATE_SCHEMA_VERSION,
+            channel: "dev".to_owned(),
+            target_version: "0.4.3-dev".to_owned(),
+            source_repo: Some("/tmp/herdr-mcp".to_owned()),
+            source_branch: Some("main".to_owned()),
+            source_commit: Some("abc123".to_owned()),
+            source_dirty: false,
+            dev_generation: None,
+            prod_generation: "rust-prod".to_owned(),
+            prod_version: "0.4.2".to_owned(),
+            prod_snapshot_binary: "/tmp/prod/herdr-mcp".to_owned(),
+            prod_snapshot_sha256: "0".repeat(64),
+            updated_at_ms: 1,
+        };
+        let before = state.clone();
+        assert!(!mark_interrupted_dev_recovery_committed(
+            &mut state, "rust-dev", 2, true,
+        ));
+        assert_eq!(state, before);
+
+        assert!(mark_interrupted_dev_recovery_committed(
+            &mut state, "rust-dev", 2, false,
+        ));
+        assert_eq!(state.dev_generation.as_deref(), Some("rust-dev"));
+        assert_eq!(state.updated_at_ms, 2);
     }
 
     #[test]
