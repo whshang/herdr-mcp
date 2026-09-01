@@ -1,224 +1,176 @@
 # herdr-mcp
 
-**Connect ChatGPT and other Web AI to a real, persistent development workstation.**
+**English** · [简体中文](README.zh.md) · [日本語](README.ja.md)
 
-Herdr-MCP keeps the Web model as the primary planner, gives it bounded local tools through MCP, and uses [Herdr](https://herdr.dev/) as the persistent worksite where terminals, services, repositories, worktrees, and coding agents keep running across individual chat turns.
+**Keep the brain in ChatGPT. Keep the work on your computers.**
+
+Herdr-MCP lets ChatGPT and other Web AI inspect code, use Git, run commands and tests, and coordinate coding agents on your real development machines. [Herdr](https://herdr.dev/) keeps workspaces, terminals, services, repositories, worktrees, and agents alive across conversations, so long-running work does not disappear when a chat ends.
 
 ```text
 ChatGPT / Web AI
        │ MCP + OAuth
        ▼
 Cloudflare Edge
-       │ outbound authenticated link
+       │ authenticated outbound link
        ▼
    herdr-mcp
-   ├─ files / Git / exec
-   ├─ local coding agents
-   └─ Herdr workspace / pane / PTY / events
+   ├─ files / Git / commands
+   ├─ coding agents
+   └─ Herdr workspaces / terminals / events
               ▲
               └─ optional Chrome extension: continuity / handoff / control center
 ```
 
-The value is the combination: reuse the reasoning capacity and interface you already have in Web AI, keep long-running development state on your own machine, delegate complex work to replaceable local agents when useful, and keep the whole worksite observable and recoverable for human takeover.
+The model keeps planning. Your computers keep the real state. Small tasks can run directly; larger tasks can be split across independent coding agents and machines while remaining observable and recoverable.
 
-**Documentation:** https://whshang.github.io/herdr-mcp/
-
-**Chrome Web Store:** https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp
-
-**GitHub:** https://github.com/whshang/herdr-mcp
-
-Languages: **English** · [简体中文](README.zh.md) · [日本語](README.ja.md)
+**[Documentation](https://whshang.github.io/herdr-mcp/)**
 
 ## Install
 
-### Recommended: give one sentence to a coding agent
-
-Paste this into Codex, Claude Code, Cursor, Pi, OpenCode, Cline, or another execution-capable local coding agent:
+### Recommended: paste one sentence to your Agent
 
 ```text
-Install and configure Herdr and herdr-mcp for me. Read and follow https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md end to end. Use GitHub Releases for the local herdr-mcp runtime, not a git clone. Pause only for Cloudflare sign-in/API-token steps and the ChatGPT herdr app/Connector authorization that require me personally; automate and verify everything else.
+Install and configure Herdr and herdr-mcp for me by following https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md end to end; use the current stable GitHub Release, configure Cloudflare and ChatGPT, pause only when I must personally sign in or authorize access, and verify the complete connection before finishing.
 ```
 
-The Agent protocol covers Herdr, the native herdr-mcp runtime, Cloudflare Edge, the workstation Link, ChatGPT MCP/OAuth configuration, `herdr-mcp doctor`, and a real end-to-end smoke test.
-
-[Agent install guide](docs/i18n/en/agent-install.md)
+The Agent checks the machine, installs Herdr and herdr-mcp, creates or connects the Cloudflare entry, starts the workstation connection, guides you through the ChatGPT authorization step, runs health checks, and proves the setup with a real MCP request. It should only stop when an account sign-in or authorization genuinely requires you.
 
 ### Manual installation
 
-Use the manual guide when you want to control every step yourself:
+For step-by-step manual setup, use the [manual install guide](docs/i18n/en/install.md).
 
-[Manual install](docs/i18n/en/install.md)
+### ChatGPT configuration
 
-Normal runtime use does not require Node.js or npm. The published herdr-mcp runtime is native; Node/Wrangler may only be needed temporarily during Cloudflare bootstrap.
+Enable Developer Mode when required, then add the `herdr` app/Connector in **Settings → Apps** and complete OAuth.
 
-### Add a second computer
+[ChatGPT setup](docs/i18n/en/chatgpt-connector.md) · [OpenAI Developer Mode / MCP documentation](https://help.openai.com/en/articles/12584461)
 
-On v0.4.3+, an already-authorized machine can create a short-lived pairing session:
+### Cloudflare configuration
+
+Cloudflare provides the stable public MCP/OAuth entry while every development computer connects outward, so you do not need to expose an inbound port on each machine.
+
+[Cloudflare setup](docs/i18n/en/cloudflare-edge-deployment.md) · [Cloudflare Dashboard](https://dash.cloudflare.com/)
+
+## Control multiple computers
+
+One Herdr Worker and one ChatGPT connection can control multiple enrolled computers. ChatGPT can discover the fleet with `herdr_devices`, see which machines are online, and route work to an explicitly named device.
+
+A useful request looks like:
+
+```text
+List my Herdr devices. Use macbook-main for the backend task and macbook-lab for the independent test task. Keep the two working trees isolated and verify both results before reporting completion.
+```
+
+When several machines are eligible for a mutation and you do not name a target, Herdr fails with `device_ambiguous` instead of guessing. Device identity stays attached to follow-up operations and retries, and each computer has its own credential.
+
+### Add another computer to the fleet
+
+On an already-authorized computer, create a short-lived pairing session:
 
 ```bash
 herdr-mcp worker pair
 ```
 
-Then give the new computer's coding agent this prompt with the printed pairing address and 6-digit code:
+It prints a pairing address and a single-use 6-digit verification code. On the new computer, give its coding agent this one sentence:
 
 ```text
-Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: <pairing-address> Verification code: <code>
+Connect this computer to my existing Herdr fleet by following https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md; use this pairing address: <pairing-address>, ask me for the 6-digit verification code only when the CLI prompts for it, then verify this device appears online in the same Worker.
 ```
 
-This joins the existing Worker. It should not create another Worker, OAuth client, Connector, or copy a long-lived shared secret.
+The new computer joins the existing Worker and ChatGPT connection. It does not create another Worker or copy a long-lived shared secret.
 
-[Second-computer guide](docs/i18n/en/existing-worker-connect.md)
+[Multi-device guide](docs/i18n/en/existing-worker-connect.md)
 
-### ChatGPT configuration
+## Use it well
 
-Current ChatGPT custom MCP configuration lives under **Settings → Apps → Create** after Developer Mode has been enabled for the account/workspace. Business and Enterprise/Edu policy can control who is allowed to create or publish custom MCP apps, so the exact controls depend on the workspace.
+### Give the Web AI clear operating rules
 
-[ChatGPT Connector guide](docs/i18n/en/chatgpt-connector.md) · [OpenAI Developer Mode / MCP documentation](https://help.openai.com/en/articles/12584461)
-
-### Cloudflare configuration
-
-The supported public entry is a Cloudflare Worker + Durable Object with an outbound authenticated workstation Link. Start from the Cloudflare dashboard and let the Agent protocol create only the resources and least-privilege credentials it needs.
-
-[Cloudflare Edge guide](docs/i18n/en/cloudflare-edge-deployment.md) · [Cloudflare Dashboard](https://dash.cloudflare.com/)
-
-## First real test
-
-Open a new ChatGPT conversation with the `herdr` app/Connector enabled and send:
+For development work, a strong default prompt is:
 
 ```text
-Inspect my Herdr projects. Read only; do not modify anything.
+Inspect the live Herdr workspace and Git state before changing anything. Keep existing dirty worktrees isolated. Do deterministic reads, Git checks, patches, and bounded commands directly. Delegate independent or long-running work to available coding agents when that improves throughput. Verify the final diff and run the relevant tests before reporting completion.
 ```
 
-A healthy setup lets ChatGPT observe real Herdr workspaces, panes, agents, Git state, and project files through MCP.
+For risky changes, state the target, safety constraints, and acceptance criteria. For investigation, explicitly request read-only work.
 
-## How to use it well
+### Install at least one coding agent
 
-### Prompt for evidence, boundaries, and acceptance criteria
+Herdr-MCP can perform deterministic work directly. Coding agents are useful for long implementation loops, large refactors, test-fix cycles, and independent parallel modules. Herdr discovers the agents available on each computer, so the architecture does not depend on one vendor.
 
-Herdr-MCP works best when the Web model owns planning and uses the workstation as a source of facts and execution. A useful development prompt is:
+Good combinations:
 
-```text
-Inspect the live Herdr workspace and Git state before changing anything. Keep existing dirty worktrees isolated. Do deterministic reads, Git checks, patches, and bounded commands directly. Delegate independent or long-running work to local coding agents when that improves throughput. Verify the final diff and run the relevant tests before reporting completion.
-```
-
-For risky mutations, also state the target, safety constraints, and what counts as success. For investigation, explicitly request read-only work.
-
-### Install at least one local coding agent
-
-The Web model can handle many small operations directly through Herdr-MCP. A local coding agent becomes valuable for long implementation loops, large refactors, test-fix cycles, or independent parallel work. Herdr can discover available agents with evidence-backed local scanning instead of requiring one specific vendor.
-
-```bash
-herdr-mcp scan --json
-```
-
-Use the agent you already trust. Herdr is designed to keep agent choice replaceable.
-
-### Good combinations
-
-| Workload | Recommended combination |
+| Workload | Suggested combination |
 | --- | --- |
-| Read-only investigation, small patch, Git/test check | Web AI → Herdr-MCP direct tools |
-| Medium implementation | Web AI plans → one local coding agent executes → Web AI verifies |
-| Large independent modules | Web AI decomposes → multiple isolated local agents/worktrees → cross-check + tests |
-| Long unattended work | Above + Chrome extension for continuity, wake/handoff, and Browser Control Center |
-| Human takeover | Attach to the same Herdr workspace/pane and continue from the real terminal state |
+| Investigation, small patch, Git/test check | Web AI → direct Herdr-MCP tools |
+| Medium implementation | Web AI plans → one coding agent executes → Web AI verifies |
+| Large independent modules | Web AI decomposes → isolated agents/worktrees → cross-check + tests |
+| Several computers | Web AI selects devices → independent tasks per machine → combined verification |
+| Long unattended work | Add the Chrome extension for continuity and handoff |
+| Human takeover | Open the same Herdr workspace/terminal and continue from the real state |
 
-Avoid opening several agents on the same mutable working tree. Prefer one task per isolated worktree when parallel edits are necessary.
+Avoid several agents editing the same working tree. Use isolated worktrees for parallel mutations.
 
-## Browser extension
+## Chrome extension
 
-The Chrome extension is optional. The base ChatGPT → MCP → workstation path works without it.
-
-Install it when you want long-conversation continuity, workspace binding, queued next-turn messages, Browser Control Center, or browser-side capture of supported ChatGPT-generated artifacts.
+The browser extension is optional for the core ChatGPT → MCP → workstation connection. Install it when you want conversation continuity, queued next-turn messages, Browser Control Center, or supported ChatGPT artifact capture.
 
 [Chrome Web Store](https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp) · [Extension guide](docs/i18n/en/extension.md) · [Browser continuity](docs/i18n/en/browser-continuity.md)
 
 ## Common questions
 
-### Why does the supported setup use Cloudflare?
+### Why use Cloudflare?
 
-ChatGPT runs outside your private network and needs a stable HTTPS MCP/OAuth endpoint. The development workstation is usually behind NAT, a firewall, or a corporate network. Herdr-MCP therefore keeps the workstation inbound-closed and establishes an authenticated **outbound** Link to Cloudflare Edge.
+ChatGPT runs on the public Internet while development machines are usually behind NAT, firewalls, changing networks, or corporate gateways. Herdr-MCP keeps those machines inbound-closed: each machine makes an authenticated outbound connection to a stable Cloudflare entry.
 
-The Edge layer also owns public routing, OAuth-facing endpoints, multi-device selection, reconnect semantics, and bounded coordination state. That gives the Web client one stable public address while local machines can disconnect, reconnect, or change networks.
+Cloudflare also provides the public MCP/OAuth endpoint, device routing, reconnect coordination, and the small amount of shared state needed for multi-device access.
 
-### Can I use direct intranet penetration / port forwarding instead?
+### Can I use port forwarding, Tailscale, or another tunnel instead?
 
-Technically, another transport can replace Cloudflare if it provides the same security and protocol properties: a publicly reachable HTTPS MCP endpoint, trusted TLS, OAuth/authentication, safe device routing, outbound-friendly workstation connectivity, reconnect handling, and no ambiguous mutation replay.
+Another transport can work only if it provides the same properties: a public HTTPS MCP endpoint reachable by ChatGPT, trusted TLS, authentication/OAuth, safe device routing, reliable reconnect behavior, and unambiguous mutation delivery.
 
-A plain private IP, Tailscale-only address, raw port forward, or SSH tunnel is not reachable from ChatGPT's cloud runtime by itself. Generic public tunnels can expose a machine, but the current supported Herdr-MCP product path is Cloudflare Edge because the routing and recovery semantics are implemented and tested there.
+A private IP or Tailscale-only address is not directly reachable from ChatGPT's cloud service. Raw port forwarding increases exposure. Generic tunnels can publish an endpoint, but Cloudflare is the supported path because Herdr-MCP's routing, OAuth, multi-device, and recovery behavior is implemented and tested there.
 
-### What should I do when I see `workstation_offline`?
+### What do I do when I see `workstation_offline`?
 
-`workstation_offline` means the public MCP/Edge path was alive enough to answer, but Edge did not have a validated Link WebSocket to the selected workstation. The browser extension does not determine this state.
+It means Cloudflare could answer ChatGPT, but the selected computer did not have a validated live connection at that moment. Short interruptions get a reconnect grace period and the computer keeps reconnecting automatically.
 
-Start with:
+Run:
 
 ```bash
 herdr-mcp status
 herdr-mcp doctor
 ```
 
-On v0.4.3+, short Link interruptions receive a bounded reconnect grace and the local Link uses reconnect/backoff plus prolonged-offline recovery. For mutations, follow the returned delivery/retry metadata; do not blindly replay an operation whose delivery is uncertain.
-
-[Troubleshooting `workstation_offline`](docs/i18n/en/troubleshooting.md)
+If the error concerns a mutation, follow its delivery/retry metadata and do not blindly repeat an operation whose delivery is uncertain. See [Troubleshooting](docs/i18n/en/troubleshooting.md).
 
 ### Where can I see account or usage limits?
 
-Herdr-MCP itself does not purchase or meter model tokens. Web-model limits come from the ChatGPT plan/workspace and can change by model and plan. Check the plan/model usage controls available in your ChatGPT account; some limits are shown as reset windows rather than an exact remaining-token counter.
+ChatGPT model limits belong to your ChatGPT plan/workspace. Check the usage or model-limit information exposed by ChatGPT for your account; some plans show a reset window rather than an exact remaining-token number.
 
-Cloudflare consumption is separate. Check **Workers & Pages → your Worker → Analytics & Logs** and the account billing/usage pages for Worker, Durable Object, and related resource usage. Herdr-MCP keeps routine activity bounded to avoid turning idle presence into unnecessary Durable Object writes.
+Cloudflare usage is separate. Check **Workers & Pages → your Worker → Analytics & Logs** plus the account billing/usage pages for Worker and Durable Object consumption. Herdr-MCP keeps routine fleet activity bounded so idle devices do not continuously write coordination state.
 
 ### Do I need the Chrome extension?
 
-No for the first connection. Yes when you want browser continuity, local-to-Web wake/handoff, Browser Control Center, or supported ChatGPT artifact capture.
+No. The core connection works without it. Install it for browser continuity, handoff, Browser Control Center, and supported browser-side artifact capture.
 
 ### Does Herdr-MCP require a specific coding agent?
 
-No. Small deterministic work can run directly. Complex work can be delegated to whichever locally available agent fits the task.
-
-## CLI essentials
-
-Most users can let their coding agent operate these commands:
-
-```bash
-herdr-mcp install
-herdr-mcp status
-herdr-mcp doctor
-herdr-mcp update check
-herdr-mcp update apply
-herdr-mcp update auto
-herdr-mcp update status
-herdr-mcp rollback
-herdr-mcp reinstall
-herdr-mcp uninstall
-```
-
-Source developers on v0.4.3+ also have a separate DEV runtime plane:
-
-```bash
-herdr-mcp dev status
-herdr-mcp dev sync
-herdr-mcp dev rollback
-```
-
-Runtime DEV/PROD identity and browser-extension DEV/STANDALONE/STORE identity are separate concepts.
+No. Deterministic work can run directly, and complex work can be delegated to whichever compatible agents are available on the selected computer.
 
 ## Related projects and acknowledgements
 
-Herdr-MCP exists because several open projects established useful pieces of this problem. The architecture intentionally reuses those ideas rather than rebuilding every layer.
+Herdr-MCP builds on ideas demonstrated by several open projects:
 
-- [Herdr](https://github.com/herdrdev/herdr) — persistent terminal/workspace/agent runtime used as the local source of truth.
-- [coding-tools-mcp](https://github.com/xyTom/coding-tools-mcp) — strong reference for a narrow deterministic coding-MCP tool surface.
-- [MCPX](https://github.com/opentokenz/mcpx) — useful reference for durable remote MCP sessions and recovery semantics.
-- [AgenticGPT](https://github.com/slhaf/AgenticGPT) — remote-worker architecture with managed jobs and a broader service surface.
-- [codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt) — explicit Web-planner / Codex-executor collaboration.
-- [codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web) — the inverse shape: Codex as the harness with Web-model inference behind it.
-- [OpenAI tunnel-client](https://github.com/openai/tunnel-client) — reference for securely exposing MCP-compatible services to ChatGPT.
+- [Herdr](https://github.com/herdrdev/herdr) — persistent workspace, terminal, and agent environment.
+- [coding-tools-mcp](https://github.com/xyTom/coding-tools-mcp) — focused deterministic coding-MCP tools.
+- [MCPX](https://github.com/opentokenz/mcpx) — durable remote MCP sessions and recovery ideas.
+- [AgenticGPT](https://github.com/slhaf/AgenticGPT) — remote-worker architecture and managed jobs.
+- [codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt) — Web planner / Codex executor collaboration.
+- [codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web) — Codex harness with Web-model inference.
+- [OpenAI tunnel-client](https://github.com/openai/tunnel-client) — secure exposure of MCP-compatible services to ChatGPT.
 
-See [Herdr-MCP and the ecosystem](docs/i18n/en/herdr-vs-ecosystem.md) for the architectural comparison, including tmux, cmux, ACP, remote workers, coding-MCP runtimes, and Codex-first bridges.
+See [Ecosystem comparison](docs/i18n/en/herdr-vs-ecosystem.md) for more alternatives and architectural trade-offs.
 
-## License and copyright
+## License
 
-Herdr-MCP is released under the **MIT License**. Copyright remains with the project contributors and respective copyright holders of third-party projects. Third-party names, trademarks, code, and documentation remain subject to their own licenses and policies.
-
-The authoritative package license is declared in [`crates/herdr-mcp/Cargo.toml`](crates/herdr-mcp/Cargo.toml).
+Herdr-MCP is released under the **MIT License**. Third-party projects, names, trademarks, code, and documentation remain subject to their own licenses and policies.

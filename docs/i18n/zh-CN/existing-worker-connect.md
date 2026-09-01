@@ -1,49 +1,64 @@
-# 添加电脑
+# 多设备群控
 
-*把一台新电脑接入已有的 Herdr Worker。*
+*用一个 Herdr Worker 和一个 ChatGPT 连接管理多台已加入的电脑。*
 
-这是**把一台新电脑接入已有的 herdr-mcp Worker/Connector** 的权威 Agent 执行契约。它**不是**全新 Worker 部署。
+Herdr 的多设备模型是：一个公网 Worker/Connector，后面连接多台拥有独立身份的电脑。ChatGPT 可以查看设备列表、为任务选择目标设备，并让后续操作继续绑定到同一台设备。新电脑通过短期配对加入现有 Worker，不会重新部署 Worker，也不会获得一份全局共享密钥。
 
-> **v0.4.3 中仅限 macOS。** 安全的新设备配对依赖 macOS Keychain 凭据后端。在 Linux/Windows 上，`worker pair` / `worker connect` 路径**不可用且 fail closed**；runtime 本身在这些平台上仍受支持。
+> 安全配对目前使用 macOS Keychain 保存设备凭据，因此新设备配对流程当前仅支持 macOS。
 
-## 开始之前
+## 在 ChatGPT 查看设备组
 
-- 本路径要求 **v0.4.3+**。先检查最新 stable Release 的版本/能力。如果 stable 仍是 `<0.4.3`，或已安装 CLI 不提供 `herdr-mcp worker pair` / `herdr-mcp worker connect`，就**停止并报告版本/能力 blocker**。除非用户明确要求测试 preview/source，否则不要安装 prerelease/source build。
-- 从 **GitHub Release** 安装最新 stable PROD herdr-mcp，不要从 repo checkout 安装。不要把 source/dev build 当作正常安装。
-- 这**不是**全新 Worker 部署。**不要**新建 Cloudflare Worker、Durable Object namespace、OAuth app/client、Connector，也不要复制旧的全局 `LINK_SHARED_SECRET`。你加入的是用户已有的那个 Worker。
+使用 `herdr_devices` 查看当前 Worker 中的设备。结果包含稳定设备身份，以及授权、连接、调度和健康状态。
 
-## 配对如何工作
+推荐直接这样描述任务：
 
-1. 在**已授权的既有 macOS 电脑**上，属主运行：
+```text
+列出我的 Herdr 设备和在线状态。后端任务使用 macbook-main，独立测试任务使用 macbook-lab；两边 working tree 保持隔离，完成后验证两台设备的结果再汇报。
+```
 
-   ```bash
-   herdr-mcp worker pair
-   ```
+路由规则保持保守：
 
-   这会创建一个短生命周期配对会话（默认 **10 分钟**，一次性使用），并打印：
-   - 一个**配对地址**（Worker origin 加上 URL fragment 里的高熵配对 id），以及
-   - 一个 **6 位验证码**（格式 `123 456`）。
+- 明确指定设备时，操作只发往该设备；
+- 后续引用和重试继续保持原设备身份；
+- 只有一台设备可执行时，可以自动选择；
+- 多台设备都可执行修改操作、但没有指定目标时，返回 `device_ambiguous`，不会自行猜测。
 
-2. 在**新电脑**上，Agent 运行：
+每台加入的电脑都有独立凭据和不可变 `device_id`。设备名称用于方便人阅读和选择，真实身份仍由 `device_id` 保持稳定。
 
-   ```bash
-   herdr-mcp worker connect "<pairing-address>" --name "<device-name>"
-   ```
+## 把新电脑加入设备组
 
-   然后 CLI 会**提示输入 6 位验证码**（无回显 TTY，或非交互时单行无回显 stdin）。验证码**绝不**作为命令行参数，也**绝不**回显或记录。
+### 1. 在已经授权的电脑上创建短期配对
 
-3. 成功后，临时配对会兑换成已有的高熵每设备密钥。最终设备密钥**只**存入 macOS Keychain；配对码/会话立即失效。加入设备不使用任何 Cloudflare 部署凭据，也不使用旧的 `LINK_SHARED_SECRET`。
+运行：
 
-## 安全规则
+```bash
+herdr-mcp worker pair
+```
 
-- 6 位验证码就是预期的短生命周期配对凭据。它一次性使用、10 分钟过期，且最多 **5 次错误尝试**后会话被永久锁定。
-- 配对 id 是高熵且不可猜测的；它放在配对地址（URL fragment）里，不在 HTTP access-log 路径中。最终设备密钥绝不在配对地址里。
-- 验证码**绝不**出现在 argv、shell history、日志或 transcript 中。**不要**用 `echo 123456 | ...` 或任何会把验证码写进 shell history 的 shell 字面量。
-- 最终设备凭据属于 macOS Keychain。绝不打印或记录它。
+它会创建一次性配对，默认约 10 分钟有效，并显示：
 
-## 验证
+- 包含高熵 pairing id 的配对地址；
+- 一个格式类似 `123 456` 的 6 位验证码。
 
-成功 connect 后，验证：
+### 2. 在新电脑上连接
+
+新电脑上的 Agent 运行：
+
+```bash
+herdr-mcp worker connect "<pairing-address>" --name "<device-name>"
+```
+
+随后 CLI 会通过不回显输入要求 6 位验证码。验证码不会作为普通命令行参数传入。
+
+使用 Agent 安装时，可以直接把这一句话发给新电脑上的 Coding Agent：
+
+```text
+把这台电脑加入我现有的 Herdr 设备组，请按照 https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/zh-CN/existing-worker-connect.md 执行；配对地址是 <pairing-address>，等 CLI 提示时再让我输入 6 位验证码，完成后验证这台设备已经在同一个 Worker 中在线。
+```
+
+### 3. 验证新设备
+
+连接成功后运行：
 
 ```bash
 herdr-mcp status
@@ -51,14 +66,29 @@ herdr-mcp doctor
 herdr-mcp link status
 ```
 
-确认最终的不可变 `device_id`、Link online/healthy 以及本地绑定成功。
+然后让 ChatGPT 调用 `herdr_devices`，确认新设备已经出现在同一个 Worker 中并处于在线状态。
 
-## 不确定投递 / 恢复
+## 配对实际做了什么
 
-- 如果任何 mutation 报告投递不确定，**不要盲目重试**；先检查当前状态。
-- 如果 connect 在服务端消费后失败，依赖内置的补偿/revoke 行为（精确的远端 revoke-self + 本地 Keychain 清理 + 恢复先前 config）并报告证据。不要自行发明手动密钥处理。
-- 如果验证码连续输错 5 次，会话被永久锁定；用 `herdr-mcp worker pair` 重新创建一个配对。
+短期配对会换取新的单设备凭据。最终凭据写入 macOS Keychain，Worker 只保存验证该设备所需的 verifier；成功消费后，原配对立即失效。
 
-## 双设备 UAT
+新电脑不需要：
 
-正式的双设备 GA/UAT 尚未通过。这是预期的 v0.4.3 行为，待发布/UAT 确认。
+- Cloudflare 部署凭据；
+- 新建 Worker 或 Durable Object；
+- 新建 ChatGPT Connector/OAuth client；
+- 复制旧的全局 `LINK_SHARED_SECRET`。
+
+## 配对安全规则
+
+- 6 位验证码单次使用且有效期很短；
+- 连续输错 5 次会永久锁定本次配对，应重新创建配对；
+- pairing id 具有高熵，并放在 URL fragment 中，避免进入普通 HTTP access log 路径；
+- 验证码不得放进 argv、shell history、日志或对话记录；
+- 最终单设备凭据不得打印或复制，应始终留在操作系统凭据存储中。
+
+## 恢复与重试
+
+修改操作如果返回交付状态不确定，应先读取当前状态，再决定是否重试。不要直接重复一个可能已经执行成功的操作。
+
+如果服务器已经消费配对后连接失败，使用内置 compensation/revoke 机制并检查实际状态。只有确认旧配对已经无法继续后，再创建新的配对。
