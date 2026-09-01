@@ -37,12 +37,26 @@ use super::ownership::{
     LinkImplementation, assess_agent, program_points_at_managed_runtime,
     read_status_active_generation,
 };
+use super::runtime_control::retryable_candidate_outcome;
+#[cfg(target_os = "macos")]
+use serde_json::Value;
 
 const ACTIVE_WAIT_BUDGET: Duration = Duration::from_secs(8);
 const ACTIVE_RECONCILE_ATTEMPTS: usize = 2;
-const POST_KICKSTART_WAIT_BUDGET: Duration = Duration::from_secs(12);
 #[cfg(target_os = "macos")]
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+// Final bounded convergence phase after an owned kickstart. The Link may need
+// several polls to restart, re-read runtime-control, and hot-switch to the new
+// generation. We wait on provable state (control desired/revision, status
+// processed_revision/outcome, manager active/transition) rather than a fixed
+// sleep, and only roll back on a definitive non-retryable outcome, a stall, or
+// ownership drift. Wall-clock maximum = CONVERGENCE_MAX_POLLS * poll_interval
+// (20s) plus the hot-switch budget (8s) and kickstart, so the whole reconcile
+// stays bounded.
+const CONVERGENCE_MAX_POLLS: usize = 20;
+const CONVERGENCE_MAX_STALLED_POLLS: usize = 3;
+const CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Reconcile production Link generation state after a successful service
 /// generation change. Named instances never touch production Link state.
@@ -96,6 +110,7 @@ pub(crate) fn reconcile_after_service_generation_change(
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| paths.config_dir.join("runtime-status-prod.json"));
+        let control_path = prefer_existing_control(&paths.config_dir);
         converge_active_generation_with_fallback(
             &launchd,
             &generation,
@@ -116,22 +131,96 @@ pub(crate) fn reconcile_after_service_generation_change(
                 Ok(())
             },
             |budget| wait_for_active_generation(&status_path, &generation, budget),
+            || read_convergence_evidence(&control_path, &status_path),
         )
     }
 }
 
-fn converge_active_generation_with_fallback<L, Reconcile, VerifyOwnership, Wait>(
+/// Resolve the live prod runtime-control document path, preferring the prod
+/// variant when present.
+#[cfg(target_os = "macos")]
+fn prefer_existing_control(config_dir: &Path) -> PathBuf {
+    let prod = config_dir.join("runtime-control-prod.json");
+    let plain = config_dir.join("runtime-control.json");
+    if prod.is_file() { prod } else { plain }
+}
+
+/// Read the provable Link-generation evidence from the control and status
+/// documents. Missing/unparseable documents yield a default (all-None) evidence,
+/// which the convergence loop treats as a stall rather than success.
+#[cfg(target_os = "macos")]
+fn read_convergence_evidence(
+    control_path: &Path,
+    status_path: &Path,
+) -> Result<ConvergenceEvidence, String> {
+    let control = read_optional_json(control_path)?;
+    let status = read_optional_json(status_path)?;
+    let mut evidence = ConvergenceEvidence::default();
+    if let Some(control) = control {
+        evidence.control_desired = control
+            .get("desired_active")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        evidence.control_revision = control.get("revision").and_then(Value::as_u64);
+    }
+    if let Some(status) = status {
+        evidence.status_processed_revision =
+            status.get("processed_revision").and_then(Value::as_u64);
+        evidence.status_outcome = status
+            .get("outcome")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        evidence.active_generation = status
+            .pointer("/manager/active_generation")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        evidence.transition_seq = status
+            .pointer("/manager/transition_seq")
+            .and_then(Value::as_u64);
+        evidence.last_transition_to = status
+            .pointer("/manager/last_transition/to")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        evidence.last_transition_outcome = status
+            .pointer("/manager/last_transition/outcome")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
+    Ok(evidence)
+}
+
+#[cfg(target_os = "macos")]
+fn read_optional_json(path: &Path) -> Result<Option<Value>, String> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes =
+        fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() > 64 * 1024 {
+        return Err(format!(
+            "convergence evidence file exceeds size limit: {}",
+            path.display()
+        ));
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+    Ok(Some(value))
+}
+
+fn converge_active_generation_with_fallback<L, Reconcile, VerifyOwnership, Wait, Probe>(
     launchd: &L,
     generation: &str,
     mut reconcile: Reconcile,
     mut verify_ownership: VerifyOwnership,
     mut wait: Wait,
+    mut probe: Probe,
 ) -> Result<(), String>
 where
     L: LaunchdOps,
     Reconcile: FnMut() -> Result<(), String>,
     VerifyOwnership: FnMut() -> Result<(), String>,
     Wait: FnMut(Duration) -> Result<(), String>,
+    Probe: FnMut() -> Result<ConvergenceEvidence, String>,
 {
     let wait_slice = ACTIVE_WAIT_BUDGET / ACTIVE_RECONCILE_ATTEMPTS as u32;
     let mut last_error = None;
@@ -165,12 +254,219 @@ where
         )
     })?;
     reconcile()?;
-    wait(POST_KICKSTART_WAIT_BUDGET).map_err(|error| {
+    // The kickstarted Link restarts and re-reads runtime-control; it may take a
+    // few polls to re-register, health-check, and activate the generation while
+    // the single-port server finishes coming up. Instead of failing on a fixed
+    // short window, run a final bounded convergence phase keyed to provable
+    // Link state: control desired/revision, status processed_revision/outcome,
+    // and manager active/transition. We only roll back when that evidence is
+    // definitively failed, stalled, or ownership-drifted; a Link that is still
+    // visibly progressing toward the expected generation is given the full
+    // bounded budget (wild-clock maximum documented on the constants above).
+    bounded_convergence_phase(
+        generation,
+        &mut verify_ownership,
+        &mut probe,
+        CONVERGENCE_MAX_POLLS,
+        CONVERGENCE_MAX_STALLED_POLLS,
+        CONVERGENCE_POLL_INTERVAL,
+    )
+    .map_err(|error| {
         format!(
             "production Link did not activate generation {generation} after bounded kickstart: {error}; prior={}",
             last_error.as_deref().unwrap_or("unknown")
         )
     })
+}
+
+/// Provable Link-generation state used by the post-kickstart convergence phase.
+/// Every field is optional because the control/status documents are read from
+/// disk and may be absent, empty, or mid-rewrite during a Link restart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConvergenceEvidence {
+    control_desired: Option<String>,
+    control_revision: Option<u64>,
+    status_processed_revision: Option<u64>,
+    status_outcome: Option<String>,
+    active_generation: Option<String>,
+    transition_seq: Option<u64>,
+    last_transition_to: Option<String>,
+    last_transition_outcome: Option<String>,
+}
+
+impl ConvergenceEvidence {
+    /// No control/status evidence was readable at all (files missing,
+    /// unparseable, or mid-rewrite). The convergence loop treats this as a
+    /// stall, never as success or as a definitive direction verdict.
+    fn is_empty(&self) -> bool {
+        self.control_desired.is_none()
+            && self.control_revision.is_none()
+            && self.status_processed_revision.is_none()
+            && self.status_outcome.is_none()
+            && self.active_generation.is_none()
+            && self.transition_seq.is_none()
+            && self.last_transition_to.is_none()
+            && self.last_transition_outcome.is_none()
+    }
+
+    /// The Link's manager has activated exactly the expected generation.
+    fn active_on(&self, generation: &str) -> bool {
+        self.active_generation.as_deref() == Some(generation)
+    }
+
+    /// Control still desires exactly the expected generation (no drift).
+    fn control_desires(&self, generation: &str) -> bool {
+        self.control_desired.as_deref() == Some(generation)
+    }
+
+    /// The runtime-control loop reports a definitive, non-retryable failure of
+    /// the target candidate. Retryable outcomes (transient health/catalog
+    /// failures) are progress, not failure, and are left to the stall/budget
+    /// logic. Reuses the Link's own retry policy rather than duplicating it.
+    fn definitive_failure(&self) -> Option<String> {
+        let outcome = self.status_outcome.as_deref()?;
+        let raw = outcome.strip_prefix("retrying:").unwrap_or(outcome);
+        let is_failure = raw.starts_with("candidate_rejected:")
+            || raw.starts_with("activation_blocked:")
+            || raw.starts_with("rolled_back:");
+        if !is_failure || retryable_candidate_outcome(raw) {
+            return None;
+        }
+        Some(format!("runtime-control outcome {raw}"))
+    }
+
+    /// The Link has not yet consumed the latest desired control revision, or is
+    /// actively retrying a transient revision, or has recorded a transition
+    /// toward the expected generation. Direction alone (a static difference in
+    /// revisions, or a static retrying outcome) proves intent but not movement;
+    /// the convergence loop detects movement separately by comparing successive
+    /// fingerprints.
+    fn directed_toward(&self, target: &str) -> bool {
+        if self.active_on(target) || self.control_desires(target) {
+            return true;
+        }
+        if let (Some(processed), Some(control)) =
+            (self.status_processed_revision, self.control_revision)
+            && processed < control
+        {
+            return true;
+        }
+        if let Some(outcome) = self.status_outcome.as_deref()
+            && outcome.starts_with("retrying:")
+        {
+            return true;
+        }
+        if self.last_transition_to.as_deref() == Some(target) {
+            return true;
+        }
+        false
+    }
+}
+
+/// Bounded, evidence-driven convergence loop after an owned kickstart.
+///
+/// Generalize the `probe` closure so unit tests can drive deterministic
+/// sequences of evidence without real Link processes or sleeps.
+fn bounded_convergence_phase<VerifyOwnership, Probe>(
+    expected: &str,
+    verify_ownership: &mut VerifyOwnership,
+    probe: &mut Probe,
+    max_polls: usize,
+    max_stalled_polls: usize,
+    poll_interval: Duration,
+) -> Result<(), String>
+where
+    VerifyOwnership: FnMut() -> Result<(), String>,
+    Probe: FnMut() -> Result<ConvergenceEvidence, String>,
+{
+    let mut probe_errors = 0usize;
+    let mut stalled_polls = 0usize;
+    let mut last_fingerprint = None;
+    for poll in 0..max_polls {
+        match probe() {
+            Err(error) => {
+                probe_errors += 1;
+                if probe_errors >= max_stalled_polls {
+                    return Err(format!(
+                        "convergence evidence unreadable for {probe_errors} consecutive polls: {error}"
+                    ));
+                }
+            }
+            Ok(evidence) => {
+                probe_errors = 0;
+                // Success requires the control document and the live manager to
+                // both agree on the expected generation, and a final ownership
+                // re-check so a concurrent replacement cannot turn late
+                // convergence into a foreign takeover.
+                if evidence.active_on(expected) && evidence.control_desires(expected) {
+                    verify_ownership()?;
+                    return Ok(());
+                }
+                // Definitive, non-retryable failure of the target candidate
+                // means rollback is correct; do not wait out the budget.
+                if let Some(reason) = evidence.definitive_failure() {
+                    return Err(format!(
+                        "production Link reported a definitive failure while converging to {expected}: {reason}"
+                    ));
+                }
+                // Control desired drifting away from the expected generation is
+                // its own failure mode (ownership/control tampering or stale
+                // reconcile); fail closed instead of waiting forever.
+                if evidence.control_desired.is_some() && !evidence.control_desires(expected) {
+                    return Err(format!(
+                        "production Link control desired drifted away from {expected} (desired={:?}) while converging",
+                        evidence.control_desired
+                    ));
+                }
+                // A Link that is not directed toward the expected generation at
+                // all (no pending revision, no retry, no transition) has nothing
+                // to converge to. Missing/unparseable evidence is a stall, not a
+                // direction verdict, so it is left to the stall counter below.
+                if !evidence.is_empty() && !evidence.directed_toward(expected) {
+                    return Err(format!(
+                        "production Link is not directed toward generation {expected} during bounded convergence"
+                    ));
+                }
+                // Forward progress is defined by the evidence fingerprint
+                // changing between polls while still directed toward expected.
+                // A static fingerprint (same revision/outcome/transition) is a
+                // stall, not progress. The first observation establishes the
+                // baseline and counts as the first stalled poll, so a stall is
+                // detected after exactly `max_stalled_polls` identical polls.
+                let fingerprint = evidence_fingerprint(&evidence);
+                if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+                    stalled_polls += 1;
+                } else {
+                    stalled_polls = 1;
+                }
+                last_fingerprint = Some(fingerprint);
+                if stalled_polls >= max_stalled_polls {
+                    return Err(format!(
+                        "production Link stalled while converging to {expected}: no forward progress across {stalled_polls} consecutive polls"
+                    ));
+                }
+            }
+        }
+        if poll + 1 < max_polls && !poll_interval.is_zero() {
+            std::thread::sleep(poll_interval);
+        }
+    }
+    Err(format!(
+        "production Link did not activate generation {expected} within the bounded convergence budget ({max_polls} polls)"
+    ))
+}
+
+fn evidence_fingerprint(evidence: &ConvergenceEvidence) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        evidence.control_revision.unwrap_or(0),
+        evidence.status_processed_revision.unwrap_or(0),
+        evidence.status_outcome.as_deref().unwrap_or(""),
+        evidence.active_generation.as_deref().unwrap_or(""),
+        evidence.transition_seq.unwrap_or(0),
+        evidence.last_transition_to.as_deref().unwrap_or(""),
+        evidence.last_transition_outcome.as_deref().unwrap_or(""),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -394,6 +690,7 @@ mod tests {
                 waits += 1;
                 Ok(())
             },
+            || Ok(ConvergenceEvidence::default()),
         )
         .unwrap();
         assert_eq!(waits, 1);
@@ -406,6 +703,7 @@ mod tests {
         let launchd = FakeLaunchd::with_loaded(LINK_PROD_LABEL, Path::new("/tmp/link-prod.plist"));
         let mut reconciles = 0;
         let mut waits = 0;
+        let mut probe_calls = 0;
         converge_active_generation_with_fallback(
             &launchd,
             "rust-new",
@@ -422,9 +720,23 @@ mod tests {
                     Ok(())
                 }
             },
+            || {
+                probe_calls += 1;
+                Ok(ConvergenceEvidence {
+                    control_desired: Some("rust-new".to_owned()),
+                    control_revision: Some(1),
+                    status_processed_revision: Some(1),
+                    status_outcome: Some("activated".to_owned()),
+                    active_generation: Some("rust-new".to_owned()),
+                    transition_seq: Some(1),
+                    last_transition_to: Some("rust-new".to_owned()),
+                    last_transition_outcome: Some("activated".to_owned()),
+                })
+            },
         )
         .unwrap();
-        assert_eq!(waits, 3);
+        assert_eq!(waits, 2);
+        assert_eq!(probe_calls, 1);
         assert_eq!(reconciles, 2);
         assert_eq!(launchd.kickstarts(), vec![LINK_PROD_LABEL.to_owned()]);
     }
@@ -438,6 +750,7 @@ mod tests {
             || Ok(()),
             || Err("ownership changed".to_owned()),
             |_| Err("still stale".to_owned()),
+            || Ok(ConvergenceEvidence::default()),
         )
         .unwrap_err();
         assert_eq!(error, "ownership changed");
@@ -457,11 +770,214 @@ mod tests {
             },
             || Ok(()),
             |_| Err("still stale".to_owned()),
+            // Missing/unparseable evidence is a stall, not a direction verdict;
+            // the bounded convergence phase must fail after the stall budget
+            // rather than succeed or hang.
+            || Ok(ConvergenceEvidence::default()),
         )
         .unwrap_err();
         assert!(error.contains("after bounded kickstart"));
+        assert!(error.contains("stalled"));
         assert_eq!(reconciles, 2);
         assert_eq!(launchd.kickstarts(), vec![LINK_PROD_LABEL.to_owned()]);
+    }
+
+    #[test]
+    fn late_activation_after_kickstart_succeeds_without_rollback() {
+        // Regression for the v0.4.3 dev-sync late-convergence race: the Link is
+        // still visibly progressing toward the expected generation (pending
+        // revision, then a transition) after the hot-switch window. The final
+        // bounded convergence phase must let it finish instead of rolling back.
+        let mut probes = vec![
+            // Poll 1: control bumped to revision 2, Link still on old generation
+            // and has not consumed it yet (processed=1 < control=2). Directed.
+            ConvergenceEvidence {
+                control_desired: Some("rust-new".to_owned()),
+                control_revision: Some(2),
+                status_processed_revision: Some(1),
+                status_outcome: Some("active_unchanged".to_owned()),
+                active_generation: Some("rust-old".to_owned()),
+                transition_seq: Some(0),
+                last_transition_to: None,
+                last_transition_outcome: None,
+            },
+            // Poll 2: Link consumed revision 2 and is retrying a transient
+            // health failure while the single-port server finishes coming up.
+            ConvergenceEvidence {
+                control_desired: Some("rust-new".to_owned()),
+                control_revision: Some(2),
+                status_processed_revision: Some(2),
+                status_outcome: Some("retrying:candidate_rejected:health_http_503".to_owned()),
+                active_generation: Some("rust-old".to_owned()),
+                transition_seq: Some(0),
+                last_transition_to: None,
+                last_transition_outcome: None,
+            },
+            // Poll 3: Link activated the expected generation.
+            ConvergenceEvidence {
+                control_desired: Some("rust-new".to_owned()),
+                control_revision: Some(2),
+                status_processed_revision: Some(2),
+                status_outcome: Some("activated".to_owned()),
+                active_generation: Some("rust-new".to_owned()),
+                transition_seq: Some(1),
+                last_transition_to: Some("rust-new".to_owned()),
+                last_transition_outcome: Some("activated".to_owned()),
+            },
+        ];
+        let mut ownership_checks = 0;
+        bounded_convergence_phase(
+            "rust-new",
+            &mut || {
+                ownership_checks += 1;
+                Ok(())
+            },
+            &mut || Ok(probes.remove(0)),
+            20,
+            3,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(ownership_checks, 1);
+    }
+
+    #[test]
+    fn directed_but_identical_evidence_stalls_and_fails() {
+        // A static pending revision / retrying outcome proves direction but not
+        // movement. Identical evidence across consecutive polls is a stall and
+        // must fail after exactly max_stalled_polls, never succeed.
+        let mut probes = 0;
+        let error = bounded_convergence_phase(
+            "rust-new",
+            &mut || Ok(()),
+            &mut || {
+                probes += 1;
+                Ok(ConvergenceEvidence {
+                    control_desired: Some("rust-new".to_owned()),
+                    control_revision: Some(2),
+                    status_processed_revision: Some(1),
+                    status_outcome: Some("retrying:candidate_rejected:health_http_503".to_owned()),
+                    active_generation: Some("rust-old".to_owned()),
+                    transition_seq: Some(0),
+                    last_transition_to: None,
+                    last_transition_outcome: None,
+                })
+            },
+            20,
+            3,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.contains("stalled"));
+        assert_eq!(probes, 3);
+    }
+
+    #[test]
+    fn ownership_drift_after_kickstart_fails_closed() {
+        // Ownership must be re-proved before success. A concurrent replacement
+        // between the last progress poll and the success check must fail closed
+        // and never report success.
+        let mut probes = 0;
+        let error = bounded_convergence_phase(
+            "rust-new",
+            &mut || Err("production Link ownership changed".to_owned()),
+            &mut || {
+                probes += 1;
+                Ok(ConvergenceEvidence {
+                    control_desired: Some("rust-new".to_owned()),
+                    control_revision: Some(2),
+                    status_processed_revision: Some(2),
+                    status_outcome: Some("activated".to_owned()),
+                    active_generation: Some("rust-new".to_owned()),
+                    transition_seq: Some(1),
+                    last_transition_to: Some("rust-new".to_owned()),
+                    last_transition_outcome: Some("activated".to_owned()),
+                })
+            },
+            20,
+            3,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.contains("ownership changed"));
+        assert_eq!(probes, 1);
+    }
+
+    #[test]
+    fn evidence_changes_forever_but_never_activates_fails_after_max_polls() {
+        // The Link keeps making forward progress (revision/transition advance)
+        // but never reaches the expected generation. The budget must be bounded
+        // and fail after exactly max_polls, not wait forever.
+        let mut probes = 0;
+        let error = bounded_convergence_phase(
+            "rust-new",
+            &mut || Ok(()),
+            &mut || {
+                probes += 1;
+                Ok(ConvergenceEvidence {
+                    control_desired: Some("rust-new".to_owned()),
+                    control_revision: Some(2),
+                    status_processed_revision: Some(1),
+                    status_outcome: Some("retrying:candidate_rejected:health_http_503".to_owned()),
+                    active_generation: Some("rust-old".to_owned()),
+                    transition_seq: Some(probes as u64),
+                    last_transition_to: Some("rust-new".to_owned()),
+                    last_transition_outcome: Some("rolled_back".to_owned()),
+                })
+            },
+            5,
+            3,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.contains("bounded convergence budget"));
+        assert_eq!(probes, 5);
+    }
+
+    #[test]
+    fn non_retryable_outcome_fails_immediately() {
+        // A definitive, non-retryable failure of the target candidate must fail
+        // immediately rather than waiting out the budget.
+        let mut probes = 0;
+        let error = bounded_convergence_phase(
+            "rust-new",
+            &mut || Ok(()),
+            &mut || {
+                probes += 1;
+                Ok(ConvergenceEvidence {
+                    control_desired: Some("rust-new".to_owned()),
+                    control_revision: Some(2),
+                    status_processed_revision: Some(2),
+                    status_outcome: Some("candidate_rejected:contract_mismatch".to_owned()),
+                    active_generation: Some("rust-old".to_owned()),
+                    transition_seq: Some(0),
+                    last_transition_to: None,
+                    last_transition_outcome: None,
+                })
+            },
+            20,
+            3,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.contains("definitive failure"));
+        assert_eq!(probes, 1);
+    }
+
+    #[test]
+    fn retryable_health_outcome_is_not_a_definitive_failure() {
+        let evidence = ConvergenceEvidence {
+            control_desired: Some("rust-new".to_owned()),
+            control_revision: Some(2),
+            status_processed_revision: Some(2),
+            status_outcome: Some("retrying:candidate_rejected:health_http_503".to_owned()),
+            active_generation: Some("rust-old".to_owned()),
+            transition_seq: Some(0),
+            last_transition_to: None,
+            last_transition_outcome: None,
+        };
+        assert!(evidence.definitive_failure().is_none());
+        assert!(evidence.directed_toward("rust-new"));
     }
 
     #[test]

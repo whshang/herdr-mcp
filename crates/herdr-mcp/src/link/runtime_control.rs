@@ -480,7 +480,7 @@ fn same_spec(current: Option<&RuntimeGenerationSpec>, spec: &RuntimeGenerationSp
     })
 }
 
-fn retryable_candidate_outcome(outcome: &str) -> bool {
+pub(crate) fn retryable_candidate_outcome(outcome: &str) -> bool {
     if outcome == "rolled_back:activation_rolled_back" {
         return true;
     }
