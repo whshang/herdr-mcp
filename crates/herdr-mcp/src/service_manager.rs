@@ -560,6 +560,12 @@ mod macos {
     #[allow(dead_code)]
     const DEFAULT_PORT: u16 = crate::instance::DEFAULT_RUNTIME_PORT;
     const HEALTH_BUDGET: Duration = Duration::from_secs(10);
+    const LAUNCHD_THROTTLE_SECONDS: u64 = 10;
+    // `launchctl bootstrap` can succeed before launchd actually starts a job
+    // that was just booted out under the same label. Give launchd its own
+    // bounded throttle-aware start phase; runtime health gets a separate
+    // HEALTH_BUDGET only after the new process has a PID.
+    const LAUNCHD_START_BUDGET: Duration = Duration::from_secs(LAUNCHD_THROTTLE_SECONDS + 2);
     const LAUNCHD_ABSENT_BUDGET: Duration = Duration::from_secs(2);
     const LAUNCHD_BOOTOUT_BUDGET: Duration = Duration::from_secs(10);
     const LAUNCHD_RECOVERY_BUDGET: Duration = Duration::from_secs(15);
@@ -1925,7 +1931,7 @@ mod macos {
         }
         if record.server_was_loaded {
             bootstrap_with_retry(&paths.plist, &paths.service_label)?;
-            wait_for_service_health(&server, paths.port)?;
+            wait_for_service_health(&server, paths.port, &paths.service_label)?;
         }
         if record.watchdog_was_loaded {
             bootstrap_with_retry(&paths.watchdog_plist, &paths.watchdog_label)?;
@@ -2632,7 +2638,7 @@ mod macos {
         } else {
             bootstrap_with_retry(&paths.plist, &paths.service_label)?;
         }
-        wait_for_service_health(&descriptor, paths.port)?;
+        wait_for_service_health(&descriptor, paths.port, &paths.service_label)?;
         let evidence_recorded = record_action(paths, "start", "ok", &descriptor, None);
         Ok(json!({
             "ok": true,
@@ -2663,7 +2669,7 @@ mod macos {
         } else {
             bootstrap_with_retry(&paths.plist, &paths.service_label)?;
         }
-        wait_for_service_health(&descriptor, paths.port)?;
+        wait_for_service_health(&descriptor, paths.port, &paths.service_label)?;
         let evidence_recorded = record_action(paths, "restart", "ok", &descriptor, None);
         Ok(json!({
             "ok": true,
@@ -2911,7 +2917,7 @@ mod macos {
             }
             if rollback.server_was_loaded {
                 bootstrap_with_retry(&paths.plist, &paths.service_label)?;
-                wait_for_service_health(&source, paths.port)?;
+                wait_for_service_health(&source, paths.port, &paths.service_label)?;
             }
             if rollback.watchdog_was_loaded {
                 bootstrap_with_retry(&paths.watchdog_plist, &paths.watchdog_label)?;
@@ -3235,7 +3241,7 @@ mod macos {
         // respawn loop while the health watchdog is also collecting evidence.
         root.insert(
             "ThrottleInterval".to_owned(),
-            PlistValue::Integer(10_i64.into()),
+            PlistValue::Integer((LAUNCHD_THROTTLE_SECONDS as i64).into()),
         );
         root.insert(
             "ProcessType".to_owned(),
@@ -3704,7 +3710,7 @@ mod macos {
         restore_current(paths, Some(current_target))?;
         if current_was_loaded {
             bootstrap_with_retry(&paths.plist, &paths.service_label)?;
-            wait_for_service_health(&current_descriptor, paths.port)?;
+            wait_for_service_health(&current_descriptor, paths.port, &paths.service_label)?;
         }
         Ok(())
     }
@@ -4061,6 +4067,20 @@ mod macos {
         parse_launchd_service_pid(&String::from_utf8_lossy(&output.stdout))
     }
 
+    fn wait_for_launchd_started(service_label: &str) -> Result<(), String> {
+        let deadline = Instant::now() + LAUNCHD_START_BUDGET;
+        while Instant::now() < deadline {
+            if launchd_service_pid(service_label).is_some() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err(format!(
+            "launchd service {service_label} did not start within {}s",
+            LAUNCHD_START_BUDGET.as_secs()
+        ))
+    }
+
     fn fetch_health_payload(port: u16) -> Option<Value> {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_millis(800))
@@ -4155,7 +4175,12 @@ mod macos {
             .is_some_and(|value| value.get("result").is_some())
     }
 
-    fn wait_for_service_health(descriptor: &ServiceDescriptor, port: u16) -> Result<(), String> {
+    fn wait_for_service_health(
+        descriptor: &ServiceDescriptor,
+        port: u16,
+        service_label: &str,
+    ) -> Result<(), String> {
+        wait_for_launchd_started(service_label)?;
         let deadline = Instant::now() + HEALTH_BUDGET;
         while Instant::now() < deadline {
             let healthy = match descriptor.kind {
@@ -4187,6 +4212,7 @@ mod macos {
         legacy_health_version: Option<&str>,
         service_label: &str,
     ) -> Result<(), String> {
+        wait_for_launchd_started(service_label)?;
         let deadline = Instant::now() + HEALTH_BUDGET;
         while Instant::now() < deadline {
             if health_once_for_identity(
@@ -4273,6 +4299,14 @@ mod macos {
             assert_eq!(parse_launchd_service_pid(output), Some(75834));
             assert_eq!(parse_launchd_service_pid("pid = 0"), None);
             assert_eq!(parse_launchd_service_pid("state = running"), None);
+        }
+
+        #[test]
+        fn launchd_start_budget_exceeds_the_configured_throttle() {
+            assert!(
+                LAUNCHD_START_BUDGET > Duration::from_secs(LAUNCHD_THROTTLE_SECONDS),
+                "launchd must get a bounded start phase before runtime health timing begins"
+            );
         }
 
         #[test]

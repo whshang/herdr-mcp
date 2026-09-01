@@ -32,6 +32,7 @@ use super::ownership::{
 const LAUNCHD_BOOTOUT_BUDGET: Duration = Duration::from_secs(8);
 #[cfg(target_os = "macos")]
 const LAUNCHD_ABSENT_BUDGET: Duration = Duration::from_secs(4);
+pub(super) const LINK_LAUNCHD_THROTTLE_SECONDS: u64 = 10;
 #[cfg(target_os = "macos")]
 const BOOTSTRAP_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(200),
@@ -620,7 +621,7 @@ pub fn encode_prod_rust_plist(
     root.insert("KeepAlive".to_owned(), PlistValue::Dictionary(keep_alive));
     root.insert(
         "ThrottleInterval".to_owned(),
-        PlistValue::Integer(10.into()),
+        PlistValue::Integer(LINK_LAUNCHD_THROTTLE_SECONDS.into()),
     );
     root.insert(
         "ProcessType".to_owned(),

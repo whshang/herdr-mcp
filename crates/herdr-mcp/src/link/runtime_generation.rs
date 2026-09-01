@@ -36,6 +36,7 @@ use crate::relay::protocol::RuntimeContractInfo;
 
 pub const RUNTIME_GENERATION_SCHEMA_VERSION: u64 = 1;
 pub const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const RUNTIME_GENERATION_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const CATALOG_RPC_ID: &str = "generation-tools-list";
 const CATALOG_USER_AGENT: &str = "herdr-runtime-generation-probe/1";
 
@@ -196,7 +197,7 @@ impl RuntimeGenerationManagerOptions {
             bearer_token: bearer_token.into(),
             contract_hash: contract_hash.into(),
             contract_epoch: LOCAL_MCP_CONTRACT_EPOCH,
-            default_timeout_ms: 30_000,
+            default_timeout_ms: RUNTIME_GENERATION_DEFAULT_TIMEOUT_MS,
             max_timeout_ms: 60_000,
             observation_checks: 3,
             observation_interval_ms: 500,
