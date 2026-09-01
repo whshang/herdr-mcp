@@ -1,4 +1,6 @@
-# Cloudflare Edge 部署：给本地工作站一个稳定的公网入口
+# Cloudflare Edge
+
+*给本地工作站一个稳定的公网入口。*
 
 ChatGPT 在公网，本地 Herdr 工作站通常藏在 NAT、防火墙或公司网络之后。herdr-mcp 不要求你给开发机开放入站端口，而是让工作站主动建立一条出站连接到 Cloudflare Edge。
 

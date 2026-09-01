@@ -1,4 +1,6 @@
-# herdr-mcp CLI：本机管理与运维命令
+# CLI 参考
+
+*herdr-mcp 本机管理与运维命令。*
 
 本页只记录 **herdr-mcp** 自己的命令面。Herdr 本体的 workspace、pane、agent、session CLI 请看官方 [Herdr CLI Reference](https://herdr.dev/docs/cli-reference/)。
 

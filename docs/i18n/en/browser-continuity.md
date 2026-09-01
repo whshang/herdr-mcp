@@ -1,4 +1,6 @@
-# Browser Continuity: why MCP alone is not enough
+# Browser continuity
+
+*Why MCP alone is not enough for long-running Web work.*
 
 MCP gives a Web AI a way to call tools on the workstation. It does not guarantee that a browser conversation will keep running after a long local task finishes.
 

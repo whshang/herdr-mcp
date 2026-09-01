@@ -1,4 +1,6 @@
-# Browser extension privacy policy
+# Extension privacy
+
+*Browser-extension data handling, permissions, and privacy policy.*
 
 **Effective date:** 2026-08-28
 

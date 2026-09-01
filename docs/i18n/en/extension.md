@@ -1,4 +1,6 @@
-# Browser extension: continuity, Control Center, and the experimental local bridge
+# Browser extension
+
+*Continuity, Browser Control Center, and the experimental local bridge.*
 
 The herdr-mcp browser extension is an **optional browser layer** on top of a working MCP Connector. It is not a second agent runtime and it is not required for the first workstation connection.
 

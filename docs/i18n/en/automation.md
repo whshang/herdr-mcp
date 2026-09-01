@@ -1,4 +1,6 @@
-# Automation: deploy documentation, Edge, and the local Runtime independently
+# Automation
+
+*Deploy documentation, Edge, and the local Runtime independently.*
 
 This maintainer page explains **how CI/CD executes**. It does not redefine the release model.
 

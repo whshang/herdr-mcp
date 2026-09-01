@@ -1,4 +1,6 @@
-# Cloudflare Edge deployment: a stable public entry for a private workstation
+# Cloudflare Edge
+
+*A stable public entry for a private workstation.*
 
 ChatGPT is on the public Internet while a Herdr workstation is usually behind NAT, firewalls or a corporate network. herdr-mcp does not require opening an inbound port on the development machine. The workstation creates an outbound authenticated connection to Cloudflare Edge.
 

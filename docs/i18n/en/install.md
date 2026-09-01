@@ -1,4 +1,6 @@
-# Installation: from one Herdr workstation to usable Web AI development
+# Manual install
+
+*From one Herdr workstation to usable Web AI development.*
 
 > **Role: manual/operator reference.** The primary herdr-mcp installation protocol is written directly for the executing Agent; see [Agent install](agent-install.md) and [Agent installation](agent-install.md). Use this page for manual inspection, troubleshooting, or understanding each stage. It no longer provides a product-specific prompt to copy into a named coding agent.
 

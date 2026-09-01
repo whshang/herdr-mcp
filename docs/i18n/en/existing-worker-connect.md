@@ -1,4 +1,6 @@
-# Connect a new computer to an existing Herdr Worker
+# Add a computer
+
+*Connect a new computer to an existing Herdr Worker.*
 
 This is the authoritative Agent execution contract for **connecting a new computer to an existing herdr-mcp Worker/Connector**. It is **not** a fresh Worker deployment.
 

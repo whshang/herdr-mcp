@@ -1,4 +1,6 @@
-# 浏览器 JSON → MCP 桥：让没有原生 Connector 的 Web AI 调用本机工具
+# 浏览器 JSON 桥
+
+*让没有原生 Connector 的 Web AI 调用本机 MCP 工具。*
 
 > **职责：** 实验性 JSON → MCP 兼容桥的高级参考。大多数用户不需要本页。
 

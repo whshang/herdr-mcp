@@ -1,4 +1,6 @@
-# 自动化：让文档、Edge 与本机 Runtime 独立部署
+# 自动化
+
+*让文档、Edge 与本机 Runtime 独立部署。*
 
 这篇面向维护者，回答的是 **CI/CD 怎样执行**，不是重新定义 release model。
 

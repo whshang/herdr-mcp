@@ -1,4 +1,6 @@
-# Troubleshooting: locate the failing layer before restarting everything
+# Troubleshooting
+
+*Locate the failing layer before restarting everything.*
 
 herdr-mcp spans Herdr, the local runtime, workstation link, Cloudflare Edge, OAuth/MCP and browser continuity. The fastest diagnosis is to find the broken layer first.
 

@@ -1,4 +1,6 @@
-# Worker fallbacks: when to delegate, when not to
+# Agent delegation
+
+*When to delegate work to a local Agent and when to stay direct.*
 
 herdr-mcp treats the Web AI as the high-level planner. Local coding agents are replaceable execution workers, not a second orchestration layer.
 

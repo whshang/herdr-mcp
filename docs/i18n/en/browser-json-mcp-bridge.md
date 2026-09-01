@@ -1,4 +1,6 @@
-# Browser JSON → MCP bridge: local tools for Web AI without a native Connector
+# Browser JSON bridge
+
+*Local MCP tools for Web AI without a native Connector.*
 
 > **Role:** advanced reference for the experimental JSON → MCP compatibility bridge. Most users do not need this page.
 

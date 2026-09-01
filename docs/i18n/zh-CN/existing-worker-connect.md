@@ -1,4 +1,6 @@
-# 把一台新电脑接入已有的 Herdr Worker
+# 添加电脑
+
+*把一台新电脑接入已有的 Herdr Worker。*
 
 这是**把一台新电脑接入已有的 herdr-mcp Worker/Connector** 的权威 Agent 执行契约。它**不是**全新 Worker 部署。
 

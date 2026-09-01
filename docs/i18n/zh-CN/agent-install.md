@@ -1,4 +1,6 @@
-# Agent 安装合同与 `workers.dev` 部署
+# Agent 安装
+
+*端到端 Agent 安装协议与 `workers.dev` 部署。*
 
 > **执行角色：Agent。** 本页是 herdr-mcp 普通工作站安装的唯一权威执行合同，包含精简上线路径、安全边界、Cloudflare 部署、Link、浏览器扩展通道选择与验证。[安装参考](install.md) 只用于人工/运维查阅。
 

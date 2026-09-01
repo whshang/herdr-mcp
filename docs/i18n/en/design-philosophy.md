@@ -1,4 +1,6 @@
-# Design Philosophy: Connect the strongest reasoning with the real development machine
+# Design philosophy
+
+*Connect strong Web reasoning with the real development machine.*
 
 > **Role:** [Overview](overview.md) explains what herdr-mcp is and [Architecture](architecture.md) explains how the system works. This chapter answers only **why these design principles were chosen**.
 

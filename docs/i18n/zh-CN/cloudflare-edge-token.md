@@ -1,4 +1,6 @@
-# Cloudflare Edge 凭据：最小权限、临时引导、可验证
+# Cloudflare 凭据
+
+*最小权限、临时引导、可验证。*
 
 部署 herdr-mcp Edge 需要 Cloudflare API 权限，但长期运行不应该依赖一个拥有整个账号权限的万能凭据。
 

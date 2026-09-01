@@ -1,4 +1,6 @@
-# Worker 备选：什么时候应该派 Agent，什么时候不应该
+# Agent 调度
+
+*什么时候应该派本机 Agent，什么时候直接执行更合适。*
 
 herdr-mcp 把 Web AI 视为高层 planner。本地 Agent 是可以被调用的执行 worker，不是第二层总调度器。
 

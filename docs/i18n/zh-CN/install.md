@@ -1,4 +1,6 @@
-# 安装：从一台 Herdr 工作站到可用的 Web AI 开发环境
+# 手动安装
+
+*从一台 Herdr 工作站到可用的 Web AI 开发环境。*
 
 > **定位：人工/运维参考。** herdr-mcp 的主安装协议直接写给执行 Agent，见 [Agent 安装](agent-install.md) 和 [Agent 安装合同](agent-install.md)。本页用于人工检查、排障或需要理解每个阶段时查阅，不再提供“复制一段提示词给某个 Coding Agent”的入口。
 

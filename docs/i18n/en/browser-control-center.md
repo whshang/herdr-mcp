@@ -1,4 +1,6 @@
-# Browser Control Center: observe the real Herdr workspace from Chrome Side Panel
+# Browser Control Center
+
+*Observe the real Herdr workspace from the Chrome Side Panel.*
 
 The Browser Control Center brings Herdr workspace, pane, terminal, and agent state into Chrome Side Panel.
 
