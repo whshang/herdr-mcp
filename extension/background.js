@@ -42,7 +42,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.87";
+const H2W_SCRIPT_VERSION = "0.1.88";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
@@ -105,6 +105,8 @@ const FALLBACK_PROGRESS_TEMPLATE =
   "herdr workspace {workspace_label} progress (focus {agent} @ {pane} · {status}; {working_count} still working in this space).\n\nFocus pane output:\n{output}\n\n{roster}\n\n{idle_hint}\n\nUse herdr_since / inspect to continue; keep orchestrating on the web.";
 const FALLBACK_PARTIAL_TEMPLATE =
   "herdr workspace {workspace_label}: focus {agent} @ {pane} stopped ({status}); {working_count} still working in this space.\n\nFocus pane output:\n{output}\n\n{roster}\n\n{idle_hint}\n\nThis is a partial finish, not a full round settle. Keep watching or schedule the remaining workers.";
+const FALLBACK_MANUAL_CONTINUE_MESSAGE =
+  "Continue the current task according to the current goal and your previous plan. Do not repeat work that is already complete. If live state may have changed, re-check the necessary current state before continuing. Finish the remaining work, then perform the necessary validation and cleanup instead of only reporting a plan.";
 
 // ---- Browser JSON bridge (z.ai / DeepSeek without MCP Connector) ----
 // The page only receives tool schemas and results. The bearer token stays inside
@@ -133,6 +135,15 @@ function defaultProgressTemplate() {
 
 function defaultPartialTemplate() {
   return localizedText("default_partial_template", null, FALLBACK_PARTIAL_TEMPLATE);
+}
+
+function defaultManualContinueMessage() {
+  return localizedText("manual_continue_message", null, FALLBACK_MANUAL_CONTINUE_MESSAGE);
+}
+
+function configuredManualContinueMessage() {
+  const configured = String(CFG.manualContinueMessage || "").trim();
+  return configured ? configured.slice(0, 4000) : defaultManualContinueMessage();
 }
 
 function hudLabels() {
@@ -180,6 +191,7 @@ let CFG = {
   enabled: false,
   wakeTemplate: "", progressTickSec: 60, progressFallbackSec: 1200,
   progressTemplate: "",
+  manualContinueMessage: "",
   idleNudgeEnabled: true,
   // Post-turn LLM judge (OpenAI-compatible). Defaults empty — fill in Options.
   llmJudgeBaseUrl: "",
@@ -2309,12 +2321,12 @@ async function retryIdleNudge(convKey) {
 
 /** Post-turn nudge: LLM judge plus strong assistant self-declared pending work. */
 async function autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, cooldownMs, cause = "llm_not_configured") {
-  if (!shouldAutoContinueWithoutLlm(userText, assistantText)) {
+  const nudgeText = configuredManualContinueMessage();
+  if (!shouldAutoContinueWithoutLlm(userText, assistantText, nudgeText)) {
     lastJudgedAssistantFp.set(convKey, fp);
     clearIdleNudgeRetry(convKey);
     return rememberIdleNudge(convKey, { nudged: false, reason: "fallback_complete", cause, assistant_fp: fp });
   }
-  const nudgeText = localizedText("manual_continue_message", null, "Continue");
   lastIdleNudgeAt.set(convKey, Date.now());
   const wakeResult = await routeWake(b, {
     status: "auto_continue_fallback_nudge",
@@ -2784,7 +2796,7 @@ async function manualDirectContinue(tabId, convKey) {
   return deliverWakeToTab({ tabId, convKey, site: "chatgpt" }, {
     type: "h2w_wake",
     data: {
-      template: localizedText("manual_continue_message", null, "Continue"),
+      template: configuredManualContinueMessage(),
       manual: true,
       autoAllow: false,
     },
@@ -4415,6 +4427,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       if (Object.prototype.hasOwnProperty.call(incoming, "automationMode")) {
         incoming.automationMode = normalizeAutomationMode(incoming.automationMode);
+      }
+      if (Object.prototype.hasOwnProperty.call(incoming, "manualContinueMessage")) {
+        incoming.manualContinueMessage = String(incoming.manualContinueMessage || "").trim().slice(0, 4000)
+          || defaultManualContinueMessage();
       }
       delete incoming.enabled;
       delete incoming.idleNudgeEnabled;

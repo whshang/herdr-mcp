@@ -77,9 +77,9 @@ const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "u
 const controlCenterCss = readFileSync(path.join(EXT, "control-center.css"), "utf8");
 const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.87", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.87"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.87"'), "content version matches manifest");
+ok(manifest.version === "0.1.88", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.88"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.88"'), "content version matches manifest");
 const ownerGateIndex = wakeSource.indexOf('type: "h2w_extension_owner_status"');
 const queueOwnerClaimIndex = wakeSource.indexOf('setAttribute(QUEUED_INSERT_OWNER_ATTR');
 ok(ownerGateIndex >= 0
@@ -736,6 +736,14 @@ ok(!wakeSource.includes("Wake on") && !wakeSource.includes("Wake off") && !wakeS
 ok(!readFileSync(path.join(EXT, "options.html"), "utf8").includes("Enable wake + LLM nudge"),
   "Options source no longer exposes the legacy wake+nudge switch name");
 const optionsHtml = readFileSync(path.join(EXT, "options.html"), "utf8");
+ok(optionsHtml.includes('id="manualContinueMessage"')
+    && optionsSource.includes('"progressTemplate", "manualContinueMessage", "automationMode"')
+    && optionsSource.includes('manualContinueMessage: $("manualContinueMessage").value.trim() || t("manual_continue_message")')
+    && backgroundSource.includes('function configuredManualContinueMessage()')
+    && backgroundSource.includes('const nudgeText = configuredManualContinueMessage();')
+    && backgroundSource.includes('template: configuredManualContinueMessage(),')
+    && zhLocale.manual_continue_message !== "继续",
+  "manual Continue and bounded Auto fallback use one editable preset message instead of a bare Continue token");
 const wakeDocEn = readFileSync(path.join(EXT, "..", "docs", "i18n", "en", "browser-continuity.md"), "utf8");
 const wakeDocZh = readFileSync(path.join(EXT, "..", "docs", "i18n", "zh-CN", "browser-continuity.md"), "utf8");
 ok(optionsHtml.includes('<input type="checkbox" id="automationMode">')
@@ -1441,6 +1449,11 @@ ok(!assistantDeclaresPendingWork("处理已经完成。下一步建议用户可�
 ok(shouldAutoContinueWithoutLlm("请检查并继续", "本轮已经完成。"), "no-LLM Auto sends one bounded fallback after an ordinary turn");
 ok(!shouldAutoContinueWithoutLlm("继续", "已经全部完成。"), "bounded no-LLM Auto does not loop after its own short Continue");
 ok(shouldAutoContinueWithoutLlm("继续", "当前已经定位。\n\n下一步\n\n我会继续做剩余测试。"), "bounded no-LLM Auto chains only on explicit pending work");
+const configuredContinue = "Continue the current task from the exact point where the previous turn stopped. Re-check any live state that may have changed, finish the remaining work, validate it, and clean up before concluding.";
+ok(!shouldAutoContinueWithoutLlm(configuredContinue, "Everything requested is complete.", configuredContinue),
+  "bounded no-LLM Auto recognizes an exact long configured Continue message and does not loop");
+ok(shouldAutoContinueWithoutLlm(configuredContinue, "Validation is not yet complete.\nNext: I will run the production smoke test.", configuredContinue),
+  "configured Continue may chain only when the assistant explicitly declares unfinished work");
 ok(assistantNudgeFingerprint("abc") === assistantNudgeFingerprint("abc"), "fp stable");
 ok(assistantNudgeFingerprint("abc") !== assistantNudgeFingerprint("abd"), "fp differs");
 ok(parseLlmSkipKeywords("").includes("好的"), "empty skip → built-in");

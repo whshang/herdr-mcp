@@ -614,13 +614,17 @@ export function assistantDeclaresPendingWork(text) {
 
 
 /**
- * Bounded no-LLM Auto fallback. One ordinary settled turn may receive a
- * simple Continue. A turn that was itself triggered by a short Continue only
- * chains again when the assistant explicitly says work remains unfinished.
+ * Bounded no-LLM Auto fallback. One ordinary settled turn may receive the
+ * configured Continue message. A turn that was itself triggered by that exact
+ * message (or a legacy short Continue) only chains again when the assistant
+ * explicitly says work remains unfinished.
  */
-export function shouldAutoContinueWithoutLlm(userText, assistantText) {
+export function shouldAutoContinueWithoutLlm(userText, assistantText, configuredContinueText = "") {
   const pending = assistantDeclaresPendingWork(assistantText);
-  if (isIdleNudgeText(userText) && !pending) return false;
+  const normalizedUser = String(userText || "").replace(/\s+/g, " ").trim();
+  const normalizedConfigured = String(configuredContinueText || "").replace(/\s+/g, " ").trim();
+  const isConfiguredContinue = Boolean(normalizedConfigured && normalizedUser === normalizedConfigured);
+  if ((isConfiguredContinue || isIdleNudgeText(userText)) && !pending) return false;
   return true;
 }
 
