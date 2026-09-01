@@ -11,6 +11,7 @@
 //! Rust service cannot bootstrap and pass `/health`.
 
 use crate::cli::ServiceCommand;
+use serde_json::Value;
 use std::process::ExitCode;
 
 pub fn run(command: ServiceCommand) -> Result<ExitCode, String> {
@@ -88,6 +89,415 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
     #[cfg(target_os = "macos")]
     {
         macos::doctor_status()
+    }
+}
+
+/// How to compensate a committed service install when a post-commit step fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+enum InstallPostCommitRecovery {
+    /// The install was a no-op (already active); nothing to compensate.
+    None,
+    /// The install replaced a prior service; roll back to the previous generation.
+    Rollback,
+    /// The install created a fresh service; uninstall it.
+    Uninstall,
+}
+
+/// Decide the compensation for a committed install from its result alone.
+///
+/// A no-op install (`already_active`) changed nothing and needs no recovery. A
+/// real install that produced a `rollback_id` replaced a prior service and is
+/// recovered by rollback; a real install with no `rollback_id` was a fresh
+/// install and is recovered by uninstall.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn install_post_commit_recovery(result: &Value) -> InstallPostCommitRecovery {
+    if result.get("already_active").and_then(Value::as_bool) == Some(true) {
+        return InstallPostCommitRecovery::None;
+    }
+    if result.get("rollback_id").is_some_and(Value::is_null) {
+        InstallPostCommitRecovery::Uninstall
+    } else {
+        InstallPostCommitRecovery::Rollback
+    }
+}
+
+/// Run the fail-fast post-commit sequence for a committed service install.
+///
+/// Order is fixed: product identity persistence, then update-uninstall fence
+/// clearing, then checked auto-update scheduler setup. Any failure is
+/// propagated (never silently swallowed). When the install actually changed the
+/// service, the committed service change is compensated via rollback or
+/// uninstall first; only after that compensation succeeds are the pre-install
+/// integration snapshots (identity marker, service-uninstall fence, auto-update
+/// scheduler) restored, so a failed post-commit step can never leave an
+/// unfenced scheduler able to resurrect a service that compensation just
+/// uninstalled. Any compensation or restore failure is reported alongside the
+/// original error.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn install_post_commit<Identity, Fence, Scheduler, Rollback, Uninstall, Restore>(
+    result: &Value,
+    identity: Identity,
+    fence: Fence,
+    scheduler: Scheduler,
+    rollback: Rollback,
+    uninstall: Uninstall,
+    restore_integrations: Restore,
+) -> Result<Value, String>
+where
+    Identity: FnOnce() -> Result<(), String>,
+    Fence: FnOnce() -> Result<(), String>,
+    Scheduler: FnOnce() -> Result<Value, String>,
+    Rollback: FnOnce() -> Result<(), String>,
+    Uninstall: FnOnce() -> Result<(), String>,
+    Restore: FnOnce() -> Result<(), String>,
+{
+    let recovery = install_post_commit_recovery(result);
+    let post_commit = (|| -> Result<Value, String> {
+        if result.get("ok").and_then(Value::as_bool) == Some(true) {
+            identity()?;
+        }
+        fence()?;
+        scheduler()
+    })();
+    match post_commit {
+        Ok(scheduler) => Ok(scheduler),
+        Err(error) => {
+            let compensation = match recovery {
+                InstallPostCommitRecovery::None => Ok(()),
+                InstallPostCommitRecovery::Rollback => rollback(),
+                InstallPostCommitRecovery::Uninstall => uninstall(),
+            };
+            // Restore integrations only after service compensation succeeded.
+            let restore = match compensation {
+                Ok(()) => restore_integrations(),
+                Err(compensation_error) => Err(format!(
+                    "compensating service recovery failed: {compensation_error}"
+                )),
+            };
+            Err(match restore {
+                Ok(()) => format!(
+                    "service install committed but a post-commit step failed and the service change was recovered ({recovery:?}): {error}"
+                ),
+                Err(restore_error) => format!(
+                    "service install committed but a post-commit step failed: {error}; compensating service recovery and integration restore also failed: {restore_error}"
+                ),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod post_commit_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fresh_install_result() -> Value {
+        json!({
+            "ok": true,
+            "implementation": "rust",
+            "generation": "rust-abc",
+            "rollback_id": Value::Null,
+            "already_active": false,
+        })
+    }
+
+    fn upgrade_install_result() -> Value {
+        json!({
+            "ok": true,
+            "implementation": "rust",
+            "generation": "rust-abc",
+            "rollback_id": "rb-123-rust-abc",
+        })
+    }
+
+    fn noop_install_result() -> Value {
+        json!({
+            "ok": true,
+            "implementation": "rust",
+            "already_active": true,
+            "rollback_id": Value::Null,
+        })
+    }
+
+    #[test]
+    fn recovery_decision_matches_install_shape() {
+        assert_eq!(
+            install_post_commit_recovery(&noop_install_result()),
+            InstallPostCommitRecovery::None
+        );
+        assert_eq!(
+            install_post_commit_recovery(&fresh_install_result()),
+            InstallPostCommitRecovery::Uninstall
+        );
+        assert_eq!(
+            install_post_commit_recovery(&upgrade_install_result()),
+            InstallPostCommitRecovery::Rollback
+        );
+    }
+
+    #[test]
+    fn identity_failure_propagates_and_compensates_upgrade_with_rollback() {
+        let mut rolled_back = false;
+        let mut uninstalled = false;
+        let mut restored = false;
+        let err = install_post_commit(
+            &upgrade_install_result(),
+            || Err("identity boom".to_owned()),
+            || Ok(()),
+            || Ok(json!({ "ok": true })),
+            || {
+                rolled_back = true;
+                Ok(())
+            },
+            || {
+                uninstalled = true;
+                Ok(())
+            },
+            || {
+                restored = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("identity boom"));
+        assert!(err.contains("Rollback"));
+        assert!(rolled_back);
+        assert!(!uninstalled);
+        assert!(restored, "integrations must be restored after compensation");
+    }
+
+    #[test]
+    fn identity_failure_propagates_and_compensates_fresh_with_uninstall() {
+        let mut rolled_back = false;
+        let mut uninstalled = false;
+        let mut restored = false;
+        let err = install_post_commit(
+            &fresh_install_result(),
+            || Err("identity boom".to_owned()),
+            || Ok(()),
+            || Ok(json!({ "ok": true })),
+            || {
+                rolled_back = true;
+                Ok(())
+            },
+            || {
+                uninstalled = true;
+                Ok(())
+            },
+            || {
+                restored = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("identity boom"));
+        assert!(err.contains("Uninstall"));
+        assert!(!rolled_back);
+        assert!(uninstalled);
+        assert!(restored);
+    }
+
+    #[test]
+    fn fence_failure_propagates_and_compensates() {
+        let mut rolled_back = false;
+        let mut restored = false;
+        let err = install_post_commit(
+            &upgrade_install_result(),
+            || Ok(()),
+            || Err("fence boom".to_owned()),
+            || Ok(json!({ "ok": true })),
+            || {
+                rolled_back = true;
+                Ok(())
+            },
+            || unreachable!("fresh install must not be chosen for upgrade"),
+            || {
+                restored = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("fence boom"));
+        assert!(rolled_back);
+        assert!(restored);
+    }
+
+    #[test]
+    fn scheduler_failure_propagates_and_compensates() {
+        let mut uninstalled = false;
+        let mut restored = false;
+        let err = install_post_commit(
+            &fresh_install_result(),
+            || Ok(()),
+            || Ok(()),
+            || Err("scheduler boom".to_owned()),
+            || unreachable!("upgrade must not be chosen for fresh install"),
+            || {
+                uninstalled = true;
+                Ok(())
+            },
+            || {
+                restored = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("scheduler boom"));
+        assert!(uninstalled);
+        assert!(restored);
+    }
+
+    #[test]
+    fn noop_failure_propagates_without_service_compensation_but_restores_integrations() {
+        let compensated = std::cell::Cell::new(false);
+        let restored = std::cell::Cell::new(false);
+        let err = install_post_commit(
+            &noop_install_result(),
+            || Err("identity boom".to_owned()),
+            || Ok(()),
+            || Ok(json!({ "ok": true })),
+            || {
+                compensated.set(true);
+                Ok(())
+            },
+            || {
+                compensated.set(true);
+                Ok(())
+            },
+            || {
+                restored.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("identity boom"));
+        assert!(
+            !compensated.get(),
+            "a no-op install must not compensate the service"
+        );
+        assert!(
+            restored.get(),
+            "a no-op install must still restore prior integration state"
+        );
+    }
+
+    #[test]
+    fn success_returns_scheduler_without_compensation_or_restore() {
+        let compensated = std::cell::Cell::new(false);
+        let restored = std::cell::Cell::new(false);
+        let scheduler = install_post_commit(
+            &upgrade_install_result(),
+            || Ok(()),
+            || Ok(()),
+            || Ok(json!({ "ok": true, "installed": true })),
+            || {
+                compensated.set(true);
+                Ok(())
+            },
+            || {
+                compensated.set(true);
+                Ok(())
+            },
+            || {
+                restored.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            scheduler.get("installed").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(!compensated.get());
+        assert!(!restored.get());
+    }
+
+    #[test]
+    fn compensation_failure_is_reported_alongside_original_error() {
+        let err = install_post_commit(
+            &upgrade_install_result(),
+            || Ok(()),
+            || Err("fence boom".to_owned()),
+            || Ok(json!({ "ok": true })),
+            || Err("rollback boom".to_owned()),
+            || unreachable!(),
+            || unreachable!("restore must not run when compensation failed"),
+        )
+        .unwrap_err();
+        assert!(err.contains("fence boom"));
+        assert!(err.contains("rollback boom"));
+    }
+
+    #[test]
+    fn restore_failure_is_reported_alongside_original_error() {
+        let err = install_post_commit(
+            &upgrade_install_result(),
+            || Ok(()),
+            || Err("fence boom".to_owned()),
+            || Ok(json!({ "ok": true })),
+            || Ok(()),
+            || unreachable!(),
+            || Err("restore boom".to_owned()),
+        )
+        .unwrap_err();
+        assert!(err.contains("fence boom"));
+        assert!(err.contains("restore boom"));
+    }
+
+    #[test]
+    fn identity_success_then_fence_failure_restores_integrations() {
+        let mut identity_called = false;
+        let mut restored = false;
+        let err = install_post_commit(
+            &upgrade_install_result(),
+            || {
+                identity_called = true;
+                Ok(())
+            },
+            || Err("fence boom".to_owned()),
+            || Ok(json!({ "ok": true })),
+            || Ok(()),
+            || unreachable!(),
+            || {
+                restored = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(identity_called, "identity must run before the fence step");
+        assert!(err.contains("fence boom"));
+        assert!(restored);
+    }
+
+    #[test]
+    fn identity_and_fence_success_then_scheduler_failure_restores_integrations() {
+        let mut identity_called = false;
+        let mut fence_called = false;
+        let mut restored = false;
+        let err = install_post_commit(
+            &fresh_install_result(),
+            || {
+                identity_called = true;
+                Ok(())
+            },
+            || {
+                fence_called = true;
+                Ok(())
+            },
+            || Err("scheduler boom".to_owned()),
+            || unreachable!(),
+            || Ok(()),
+            || {
+                restored = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(identity_called);
+        assert!(fence_called);
+        assert!(err.contains("scheduler boom"));
+        assert!(restored);
     }
 }
 
@@ -311,6 +721,12 @@ mod macos {
             ServiceCommand::Install { adopt_node } => {
                 crate::update_scheduler::preflight_service_install_fence()?;
                 crate::product_lifecycle::preflight_installation_identity()?;
+                // Capture the exact prior integration state (identity marker,
+                // service-uninstall fence, auto-update scheduler) before the
+                // service commit so a failed post-commit step can restore it.
+                let identity_prior = crate::product_lifecycle::capture_installation_identity()?;
+                let integration_prior =
+                    crate::update_scheduler::InstallIntegrationSnapshot::capture()?;
                 let mut result = install(
                     &paths,
                     adopt_node,
@@ -318,41 +734,79 @@ mod macos {
                         .as_ref()
                         .expect("install must hold the service mutation lock"),
                 )?;
-                let installation_identity =
-                    if result.get("ok").and_then(Value::as_bool) == Some(true) {
-                        match crate::product_lifecycle::record_installation_identity() {
-                            Ok(()) => json!({"ok": true, "recorded": true}),
-                            Err(error) => json!({
-                                "ok": false,
-                                "recorded": false,
-                                "detail": error,
-                            }),
-                        }
-                    } else {
-                        json!({
-                            "ok": false,
-                            "recorded": false,
-                            "skipped": "service_install_failed",
-                        })
-                    };
-                let fence_clear = crate::update_scheduler::clear_service_uninstall_fence();
-                let scheduler = match fence_clear {
-                    Ok(()) => crate::update_scheduler::reconcile_after_service_install(),
-                    Err(error) => json!({
-                        "ok": false,
-                        "installed": false,
-                        "label": crate::update_scheduler::AUTO_UPDATE_LABEL,
-                        "detail": format!("service installed but auto-update fence could not be cleared: {error}"),
-                    }),
-                };
-                if let Some(object) = result.as_object_mut() {
-                    object.insert(
-                        "product_installation_identity".to_owned(),
-                        installation_identity,
-                    );
-                    object.insert("auto_update_scheduler".to_owned(), scheduler);
+                if result.get("ok").and_then(Value::as_bool) != Some(true) {
+                    // Defensive parity with the historical result shape: a
+                    // failed install reports one aggregated failure instead of
+                    // running post-commit steps against an uncommitted service.
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert(
+                            "product_installation_identity".to_owned(),
+                            json!({ "ok": false, "skipped": "service_install_failed" }),
+                        );
+                    }
+                    result
+                } else {
+                    // Post-commit steps are fail-fast: product identity persistence,
+                    // update-uninstall fence clearing, then checked auto-update
+                    // scheduler setup. Any failure is propagated (never silently
+                    // swallowed) and, when the install actually changed the service,
+                    // the committed service change is compensated via rollback or
+                    // uninstall before the original error is returned, then the
+                    // pre-install integration state is restored.
+                    let scheduler = install_post_commit(
+                        &result,
+                        crate::product_lifecycle::record_installation_identity,
+                        crate::update_scheduler::clear_service_uninstall_fence,
+                        || {
+                            let value = crate::update_scheduler::reconcile_after_service_install();
+                            if value.get("ok").and_then(Value::as_bool) == Some(true) {
+                                Ok(value)
+                            } else {
+                                Err(value
+                                    .get("detail")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("auto-update scheduler setup failed")
+                                    .to_owned())
+                            }
+                        },
+                        || {
+                            let code = rollback(
+                                &paths,
+                                mutation_lock
+                                    .as_ref()
+                                    .expect("install must hold the service mutation lock"),
+                            )?;
+                            if code.get("ok").and_then(Value::as_bool) == Some(true) {
+                                Ok(())
+                            } else {
+                                Err("service rollback returned failure".to_owned())
+                            }
+                        },
+                        || {
+                            let code = uninstall(&paths)?;
+                            if code.get("ok").and_then(Value::as_bool) == Some(true) {
+                                Ok(())
+                            } else {
+                                Err("service uninstall returned failure".to_owned())
+                            }
+                        },
+                        || {
+                            integration_prior.restore(|| {
+                                crate::product_lifecycle::restore_installation_identity(
+                                    identity_prior.as_deref(),
+                                )
+                            })
+                        },
+                    )?;
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert(
+                            "product_installation_identity".to_owned(),
+                            json!({"ok": true, "recorded": true}),
+                        );
+                        object.insert("auto_update_scheduler".to_owned(), scheduler);
+                    }
+                    result
                 }
-                result
             }
             ServiceCommand::Status => status(&paths)?,
             ServiceCommand::Start => start(&paths)?,
