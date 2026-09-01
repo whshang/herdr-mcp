@@ -28,12 +28,14 @@ class FakeStorage {
   async deleteAlarm() {}
 }
 
-function makeRegistry() {
-  const storage = new FakeStorage();
-  return { storage, registry: new DeviceRegistryDO({ storage }, {}) };
-}
-
+const TEST_PEPPER = "test-pepper-link-shared-secret-high-entropy-32b!!";
 const CONTEXT = "herdr-edge@test";
+
+function makeRegistry(envOverrides = {}) {
+  const storage = new FakeStorage();
+  const env = { LINK_SHARED_SECRET: TEST_PEPPER, ...envOverrides };
+  return { storage, registry: new DeviceRegistryDO({ storage }, env), env };
+}
 
 async function createPairing(registry, overrides = {}) {
   const response = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
@@ -108,10 +110,12 @@ test("storage keeps only digest-keyed verifier records; snapshot cannot be brute
   const snapshot = JSON.stringify([...storage.map]);
   assert.equal(snapshot.includes(session.pairing_id), false);
   assert.equal(snapshot.includes(session.code), false);
+  assert.equal(snapshot.includes(TEST_PEPPER), false, "pepper must never appear in DO storage snapshot");
 
   // The verifier must not be derivable from the six-digit code (or code+context)
-  // alone: it is HMAC-SHA256 keyed by the raw pairing_id, which is absent from
-  // storage, so a snapshot cannot enumerate the code offline.
+  // alone: it is HMAC-SHA256 keyed by pepper (LINK_SHARED_SECRET) over
+  // "herdr-pairing-v1:" || pairing_id || ":" || worker_context || ":" || code,
+  // so a snapshot + leaked pairing_id alone cannot enumerate the code offline without the pepper.
   const hmac = async (keyText, message) => {
     const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(keyText), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
     const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
@@ -121,15 +125,23 @@ test("storage keeps only digest-keyed verifier records; snapshot cannot be brute
     await sha256Hex(session.code),
     await sha256Hex(`${CONTEXT}:${session.code}`),
     await sha256Hex(session.code + CONTEXT),
-    await hmac(session.code, `${CONTEXT}:${session.code}`),
-    await hmac(`${CONTEXT}:${session.code}`, session.code),
+    await hmac(session.code, `herdr-pairing-v1:${session.pairing_id}:${CONTEXT}:${session.code}`),
+    await hmac(`${CONTEXT}:${session.code}`, `herdr-pairing-v1:${session.pairing_id}:${CONTEXT}:${session.code}`),
+    // Without pepper: key = pairing_id alone should NOT match
+    await hmac(session.pairing_id, `herdr-pairing-v1:${session.pairing_id}:${CONTEXT}:${session.code}`),
+    // Without domain tag
+    await hmac(TEST_PEPPER, `${session.pairing_id}:${CONTEXT}:${session.code}`),
+    await hmac(TEST_PEPPER, `${CONTEXT}:${session.code}`),
   ];
   for (const candidate of candidates) {
     assert.notEqual(candidate, record.verifier_sha256);
   }
-  // Internal consistency: HMAC(key = raw pairing_id, message = context || ":" || code).
-  const expected = await hmac(session.pairing_id, `${CONTEXT}:${session.code}`);
+  // Internal consistency: HMAC(key = pepper, message = "herdr-pairing-v1:" || pairing_id || ":" || context || ":" || code).
+  const expected = await hmac(TEST_PEPPER, `herdr-pairing-v1:${session.pairing_id}:${CONTEXT}:${session.code}`);
   assert.equal(expected, record.verifier_sha256);
+  // Prove snapshot + pairing_id insufficient: attacker with snapshot + pairing_id still needs pepper
+  const withoutPepperCandidate = await hmac(session.pairing_id, `herdr-pairing-v1:${session.pairing_id}:${CONTEXT}:${session.code}`);
+  assert.notEqual(withoutPepperCandidate, record.verifier_sha256, "snapshot + pairing_id without pepper must not verify");
 });
 
 test("wrong codes increment a per-session counter; the fifth locks permanently and retries never reset", async () => {
@@ -370,5 +382,86 @@ test("the six-digit code never travels in a URL; pairing endpoints accept JSON b
 
   const createGet = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings"));
   assert.notEqual(createGet.status, 200);
+});
+
+test("DO storage snapshot + pairing_id is insufficient without pepper (verifier depends on pepper)", async () => {
+  const pepperA = "pepper-A-high-entropy-32bytes-!!";
+  const pepperB = "pepper-B-high-entropy-32bytes-!!";
+  const { storage: storageA, registry: registryA } = makeRegistry({ LINK_SHARED_SECRET: pepperA });
+  const { body: session } = await createPairing(registryA, { ttl_seconds: 600 });
+  const entry = pairingEntry(storageA);
+  assert.ok(entry, "pairing record exists in DO storage");
+  const snapshotVerifier = entry[1].verifier_sha256;
+  // Attacker has snapshot + pairing_id, tries to brute-force code using HMAC without pepper or with wrong pepper
+  const hmac = async (keyText, message) => {
+    const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(keyText), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+    return [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  };
+  const attackerWithoutPepper = await hmac(session.pairing_id, `herdr-pairing-v1:${session.pairing_id}:${CONTEXT}:${session.code}`);
+  assert.notEqual(attackerWithoutPepper, snapshotVerifier, "without pepper, verifier cannot be derived");
+  const attackerWithWrongPepper = await hmac(pepperB, `herdr-pairing-v1:${session.pairing_id}:${CONTEXT}:${session.code}`);
+  assert.notEqual(attackerWithWrongPepper, snapshotVerifier, "wrong pepper must not verify");
+  const correct = await hmac(pepperA, `herdr-pairing-v1:${session.pairing_id}:${CONTEXT}:${session.code}`);
+  assert.equal(correct, snapshotVerifier, "correct pepper + pairing_id verifies");
+  // Also without domain tag should not match
+  const noTag = await hmac(pepperA, `${session.pairing_id}:${CONTEXT}:${session.code}`);
+  assert.notEqual(noTag, snapshotVerifier, "domain tag must be present");
+});
+
+test("wrong pepper cannot consume a pairing created with a different pepper", async () => {
+  const pepperA = "correct-pepper-32bytes-high-entropy!!";
+  const pepperB = "wrong-pepper-32bytes-high-entropy-!!-X";
+  const storage = new FakeStorage();
+  const registryA = new DeviceRegistryDO({ storage }, { LINK_SHARED_SECRET: pepperA });
+  const registryB = new DeviceRegistryDO({ storage }, { LINK_SHARED_SECRET: pepperB });
+  const { body: session } = await createPairing(registryA, { ttl_seconds: 600 });
+  // Attempt consume with wrong pepper (same storage, different Env)
+  const wrong = await registryB.fetch(new Request("https://registry.internal/internal/devices/pairings/consume", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ pairing_id: session.pairing_id, code: session.code, worker_context: CONTEXT }),
+  }));
+  assert.equal(wrong.status, 401);
+  assert.equal((await wrong.json()).code, "pairing_rejected", "wrong pepper must fail closed with uniform rejection");
+  // Correct pepper still succeeds (attempt counter incremented by one wrong attempt, but not locked)
+  const correct = await registryA.fetch(new Request("https://registry.internal/internal/devices/pairings/consume", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ pairing_id: session.pairing_id, code: session.code, worker_context: CONTEXT }),
+  }));
+  assert.equal(correct.status, 200, "correct pepper must still succeed (one prior wrong attempt does not lock)");
+});
+
+test("pepper is absent from DO storage, pairing output, and sanitized logs", async () => {
+  const { storage, registry } = makeRegistry();
+  const { body: session } = await createPairing(registry, { ttl_seconds: 600 });
+  const snapshot = JSON.stringify([...storage.map]);
+  assert.equal(snapshot.includes(TEST_PEPPER), false, "pepper must not be stored");
+  assert.equal(JSON.stringify(session).includes(TEST_PEPPER), false, "pepper must not be returned to clients");
+  const logRedacted = sanitize({ pepper: TEST_PEPPER, LINK_SHARED_SECRET: TEST_PEPPER, pairing_id: session.pairing_id, code: session.code });
+  assert.equal(JSON.stringify(logRedacted).includes(TEST_PEPPER), false, "pepper must not appear in logs even if accidentally logged");
+});
+
+test("missing pepper fails closed on both create and consume", async () => {
+  const noPepperRegistry = new DeviceRegistryDO({ storage: new FakeStorage() }, {});
+  const create = await noPepperRegistry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ttl_seconds: 60, worker_context: CONTEXT }),
+  }));
+  assert.equal(create.status, 503);
+  assert.equal((await create.json()).code, "pairing_unavailable", "missing pepper must fail closed on create");
+
+  const { storage, registry } = makeRegistry();
+  const { body: session } = await createPairing(registry, { ttl_seconds: 600 });
+  const noPepperConsumer = new DeviceRegistryDO({ storage }, {});
+  const consume = await noPepperConsumer.fetch(new Request("https://registry.internal/internal/devices/pairings/consume", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ pairing_id: session.pairing_id, code: session.code, worker_context: CONTEXT }),
+  }));
+  assert.equal(consume.status, 401);
+  assert.equal((await consume.json()).code, "pairing_rejected", "missing pepper must fail closed with uniform rejection on consume");
 });
 

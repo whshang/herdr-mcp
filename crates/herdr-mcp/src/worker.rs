@@ -139,8 +139,8 @@ fn create_pairing(
     println!();
     println!("Agent prompt (copy to the new computer's Coding Agent):");
     println!(
-        "Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: {}  Verification code: {}",
-        pairing_address, code
+        "Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: {}  Then enter the separately displayed 6-digit verification code at the no-echo prompt (the code is never part of the copyable command).",
+        pairing_address
     );
     let _ = expires_at_ms;
     Ok(ExitCode::SUCCESS)
@@ -655,14 +655,12 @@ fn required_string(value: &Value, key: &str) -> Result<String, String> {
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn validate_pairing_id(value: &str) -> Result<(), String> {
-    if value.is_empty() || value.len() > 256 {
-        return Err("pairing id has an invalid length".to_owned());
+    if !value.starts_with("pair_") {
+        return Err("pairing id must be pair_ followed by 64 lowercase hex characters".to_owned());
     }
-    if !value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.')
-    {
-        return Err("pairing id contains invalid characters".to_owned());
+    let hex = &value[5..];
+    if hex.len() != 64 || !hex.chars().all(|ch| matches!(ch, '0'..='9' | 'a'..='f')) {
+        return Err("pairing id must be pair_ followed by 64 lowercase hex characters".to_owned());
     }
     Ok(())
 }
@@ -812,9 +810,32 @@ mod tests {
         assert!(validate_pairing_code("12345").is_err());
         assert!(validate_pairing_code("12345a").is_err());
         assert!(validate_pairing_code("1234567").is_err());
-        assert!(validate_pairing_id("pair_abc123").is_ok());
+        assert!(
+            validate_pairing_id(
+                "pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+            .is_ok()
+        );
         assert!(validate_pairing_id("").is_err());
         assert!(validate_pairing_id("pair with space").is_err());
+        assert!(
+            validate_pairing_id(
+                "pair_ABCDEFaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_pairing_id(
+                "pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_pairing_id(
+                "pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+            .is_err()
+        );
         assert!(validate_device_secret(&format!("devsec_{}", "b".repeat(64))).is_ok());
         assert!(validate_device_secret("devsec_bad").is_err());
     }
@@ -835,14 +856,17 @@ mod tests {
 
     #[test]
     fn pairing_address_validation_requires_https_pair_path_and_fragment() {
-        let (origin, id) = parse_pairing_address("https://edge.example/pair#pair_abc123").unwrap();
+        let (origin, id) = parse_pairing_address("https://edge.example/pair#pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         assert_eq!(origin, "https://edge.example");
-        assert_eq!(id, "pair_abc123");
+        assert_eq!(
+            id,
+            "pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
 
-        assert!(parse_pairing_address("http://edge.example/pair#pair_abc123").is_err());
-        assert!(parse_pairing_address("https://edge.example/other#pair_abc123").is_err());
+        assert!(parse_pairing_address("http://edge.example/pair#pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_err());
+        assert!(parse_pairing_address("https://edge.example/other#pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_err());
         assert!(parse_pairing_address("https://edge.example/pair").is_err());
-        assert!(parse_pairing_address("https://edge.example/pair?x=1#pair_abc123").is_err());
+        assert!(parse_pairing_address("https://edge.example/pair?x=1#pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").is_err());
         assert!(parse_pairing_address("https://edge.example/pair#pair with space").is_err());
         assert!(parse_pairing_address("not a url").is_err());
     }
@@ -1127,7 +1151,10 @@ mod tests {
         };
         let consume = move |origin: &str, id: &str, code: &str, name: Option<&str>| {
             assert_eq!(origin, "https://edge.example");
-            assert_eq!(id, "pair_abc123");
+            assert_eq!(
+                id,
+                "pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            );
             assert_eq!(code, "123456");
             assert_eq!(name, None);
             Ok(EnrolledCredential {
@@ -1140,7 +1167,7 @@ mod tests {
         let result = connect_macos_inner(
             &paths,
             "https://edge.example",
-            "pair_abc123",
+            "pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "123456",
             None,
             store_secret,
@@ -1237,7 +1264,10 @@ mod tests {
         let reconcile = |_paths: &RuntimePaths| -> Result<(), String> { Ok(()) };
         let consume = move |origin: &str, id: &str, code: &str, name: Option<&str>| {
             assert_eq!(origin, "https://edge.example");
-            assert_eq!(id, "pair_abc123");
+            assert_eq!(
+                id,
+                "pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            );
             assert_eq!(code, "000000");
             assert_eq!(name, Some("mac-b"));
             *consume_calls_hook.borrow_mut() += 1;
@@ -1251,7 +1281,7 @@ mod tests {
         let result = connect_macos_inner(
             &paths,
             "https://edge.example",
-            "pair_abc123",
+            "pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "000000",
             Some("mac-b"),
             store_secret,

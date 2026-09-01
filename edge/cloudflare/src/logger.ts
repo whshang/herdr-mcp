@@ -15,7 +15,7 @@
 export type LogLevel = "info" | "warn" | "error";
 
 const SENSITIVE_KEY_PATTERN =
-  /(authorization|bearer|token|secret|password|passwd|credential|cookie|api[_-]?key|session|enrollment|pairing)/i;
+  /(authorization|bearer|token|secret|password|passwd|credential|cookie|api[_-]?key|session|enrollment|pairing|pepper)/i;
 
 const FORBIDDEN_VALUE_KEYS = /(body|args|arguments|prompt|result|output|content|file|data|message)/i;
 

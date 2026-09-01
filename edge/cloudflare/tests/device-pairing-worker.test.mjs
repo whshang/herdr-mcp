@@ -64,7 +64,7 @@ function wsRequest(workstationId, secret) {
 
 function makeEnv(extra = {}) {
   const storage = new FakeStorage();
-  const registry = new DeviceRegistryDO({ storage }, {});
+  const registry = new DeviceRegistryDO({ storage }, { LINK_SHARED_SECRET: "legacy-secret" });
   const forwarded = [];
   const workstationStub = {
     async fetch(request) {

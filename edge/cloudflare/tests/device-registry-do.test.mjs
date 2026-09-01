@@ -35,10 +35,13 @@ function record(deviceId, overrides = {}) {
   };
 }
 
-function makeRegistry() {
+const TEST_PEPPER = "test-pepper-link-shared-secret-high-entropy-32b!!";
+
+function makeRegistry(envOverrides = {}) {
   const storage = new FakeStorage();
   const state = { storage };
-  return { storage, registry: new DeviceRegistryDO(state, {}) };
+  const env = { LINK_SHARED_SECRET: TEST_PEPPER, ...envOverrides };
+  return { storage, registry: new DeviceRegistryDO(state, env), env };
 }
 
 test("device registry writes durable identity records and reads them without observation writes", async () => {
@@ -180,4 +183,46 @@ test("expired pairing is rejected generically and deleted", async () => {
   assert.equal(consume.status, 401);
   assert.equal((await consume.json()).code, "pairing_rejected");
   assert.equal(storage.map.has(pairingEntry[0]), false);
+});
+
+test("pairing pepper is required: missing pepper fails closed on create and consume", async () => {
+  const { registry: noPepperRegistry } = makeRegistry({ LINK_SHARED_SECRET: undefined, DEV_MCP_BEARER_SECRET: undefined });
+  const create = await noPepperRegistry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ttl_seconds: 60, worker_context: "herdr-edge@test" }),
+  }));
+  assert.equal(create.status, 503);
+  assert.equal((await create.json()).code, "pairing_unavailable");
+
+  // Also consume path fails closed with uniform rejection when pepper missing
+  const { storage, registry } = makeRegistry();
+  const ok = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ttl_seconds: 60, worker_context: "herdr-edge@test" }),
+  }));
+  const session = await ok.json();
+  const noPepperConsumeRegistry = new DeviceRegistryDO({ storage }, {});
+  const consume = await noPepperConsumeRegistry.fetch(new Request("https://registry.internal/internal/devices/pairings/consume", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ pairing_id: session.pairing_id, code: session.code, worker_context: "herdr-edge@test" }),
+  }));
+  assert.equal(consume.status, 401);
+  assert.equal((await consume.json()).code, "pairing_rejected");
+});
+
+test("pepper never appears in DO storage, logs, or pairing output", async () => {
+  const { storage, registry } = makeRegistry();
+  const create = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ttl_seconds: 60, worker_context: "herdr-edge@test" }),
+  }));
+  const session = await create.json();
+  const snapshot = JSON.stringify([...storage.map]);
+  assert.equal(snapshot.includes(TEST_PEPPER), false, "pepper must never be stored in DO");
+  assert.equal(snapshot.includes(session.pairing_id), false);
+  assert.equal(JSON.stringify(session).includes(TEST_PEPPER), false, "pepper must never be returned to clients");
 });

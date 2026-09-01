@@ -32,10 +32,12 @@ const enc = new TextEncoder();
 /**
  * Storage snapshot resistance: the lookup key is SHA-256(raw pairing_id), so a
  * snapshot alone never exposes the raw id. The stored verifier is
- * HMAC-SHA256 keyed by the raw pairing_id over worker_context || code, so a
- * storage snapshot cannot enumerate the six-digit code offline: the HMAC key
- * (the raw pairing_id, a short-lived secret capability) is absent from
- * storage. Verified in constant time. No deployment-wide pepper secret exists.
+ * HMAC-SHA256 keyed by the Worker pepper (LINK_SHARED_SECRET, absent from DO
+ * storage) over a domain-separated message "herdr-pairing-v1:" ||
+ * pairing_id || ":" || worker_context || ":" || code, so a storage snapshot
+ * + leaked pairing_id alone cannot enumerate the six-digit code offline.
+ * Verified in constant time. The pepper is never stored in the DO, never
+ * returned to clients, and never logged. Missing/invalid pepper fails closed.
  */
 interface PairingRecord {
   verifier_sha256: string;
@@ -50,16 +52,40 @@ async function pairingStorageKey(pairingId: string): Promise<string> {
   return PAIRING_PREFIX + await sha256Hex(pairingId);
 }
 
-/** HMAC-SHA256(key = raw pairing_id, message = worker_context || ":" || code). */
-async function pairingVerifier(pairingId: string, code: string, workerContext: string): Promise<string> {
+function getPairingPepper(env: Env): string | null {
+  const candidate = env.LINK_SHARED_SECRET ?? null;
+  if (
+    candidate === null ||
+    candidate.length === 0 ||
+    candidate.length > 4096 ||
+    [...candidate].some((ch) => ch.charCodeAt(0) < 0x20 || ch.charCodeAt(0) === 0x7f)
+  ) {
+    return null;
+  }
+  return candidate;
+}
+
+/**
+ * HMAC-SHA256(key = pepper, message = "herdr-pairing-v1:" || pairing_id || ":" || worker_context || ":" || code).
+ * Domain separation via fixed tag "herdr-pairing-v1" and colon separators.
+ * pairing_id is fixed 69 chars (pair_ + 64 hex), code is 6 digits, worker_context is 1..256
+ * validated without colons, so the encoding is unambiguous (lengths implicit). The pepper
+ * is the Worker-side LINK_SHARED_SECRET and never leaves the Worker environment.
+ */
+async function pairingVerifier(
+  pairingId: string,
+  code: string,
+  workerContext: string,
+  pepper: string,
+): Promise<string> {
   const key = await crypto.subtle.importKey(
     "raw",
-    enc.encode(pairingId),
+    enc.encode(pepper),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
   );
-  const mac = await crypto.subtle.sign("HMAC", key, enc.encode(`${workerContext}:${code}`));
+  const mac = await crypto.subtle.sign("HMAC", key, enc.encode(`herdr-pairing-v1:${pairingId}:${workerContext}:${code}`));
   return [...new Uint8Array(mac)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
@@ -89,9 +115,7 @@ function parseDeviceRecord(value: unknown): DeviceRecord | null {
 }
 
 export class DeviceRegistryDO {
-  constructor(private readonly state: DurableObjectState, private readonly env: Env) {
-    void this.env;
-  }
+  constructor(private readonly state: DurableObjectState, private readonly env: Env) {}
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -178,10 +202,13 @@ export class DeviceRegistryDO {
       : null;
     if (workerContext === null) return json({ ok: false, code: "bad_request" }, 400);
 
+    const pepper = getPairingPepper(this.env);
+    if (pepper === null) return json({ ok: false, code: "pairing_unavailable" }, 503);
+
     const pairingId = newPairingId();
     const code = newPairingCode();
     const now = Date.now();
-    const verifier = await pairingVerifier(pairingId, code, workerContext);
+    const verifier = await pairingVerifier(pairingId, code, workerContext, pepper);
     const record: PairingRecord = {
       verifier_sha256: verifier,
       created_at_ms: now,
@@ -226,8 +253,11 @@ export class DeviceRegistryDO {
       : null;
     if (workerContext === null) return json({ ok: false, code: "bad_request" }, 400);
 
+    const pepper = getPairingPepper(this.env);
+    if (pepper === null) return json({ ok: false, code: "pairing_rejected" }, 401);
+
     const storageKey = await pairingStorageKey(body.pairing_id);
-    const expectedVerifier = await pairingVerifier(body.pairing_id, body.code, workerContext);
+    const expectedVerifier = await pairingVerifier(body.pairing_id, body.code, workerContext, pepper);
     const now = Date.now();
 
     // The DO transaction is the authoritative serialization point: concurrent
