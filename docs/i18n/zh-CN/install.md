@@ -38,7 +38,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 
 ## 支持平台
 
-当前已发布的 stable runtime 是 **`v0.4.2`**。稳定 TCC broker 已完成跨 generation 授权验证；Apple Developer ID 仅为可选加固。macOS 上用 `herdr-mcp permissions setup` 准备 broker，用 `herdr-mcp permissions verify` 检查访问。最充分的 clean-machine qualification 证据仍来自 `v0.4.0` 的 **macOS Apple Silicon** 验收。Windows x64 Release binary 已提供，但 Windows 端到端 UAT 仍在继续；Linux runtime 暂不作为当前 stable 的正式支持面承诺。
+当前已发布的 stable runtime 是 **`v0.4.2`**。稳定 TCC broker 已完成跨 generation 授权验证；Apple Developer ID 仅为可选加固。v0.4.3 的安装流程继续保持同一个 broker compatibility revision，并在会轮换的 runtime service 启动前先确保固定 broker 已存在。macOS 交互式首次安装会直接打开 **完全磁盘访问（Full Disk Access）**，但授权动作仍必须由用户本人在系统设置中确认；`herdr-mcp permissions setup` 可再次打开同一设置页，`herdr-mcp permissions verify` 用于验证。普通 runtime generation 更新不会重写同 revision 的 broker。最充分的 clean-machine qualification 证据仍来自 `v0.4.0` 的 **macOS Apple Silicon** 验收。Windows x64 Release binary 已提供，但 Windows 端到端 UAT 仍在继续；Linux runtime 暂不作为当前 stable 的正式支持面承诺。
 
 ## 第一步：安装原生 herdr-mcp runtime
 
@@ -52,6 +52,8 @@ herdr-mcp update check
 ```
 
 `install` 会把不可变 generation 放到 `~/.config/herdr-mcp/runtime/` 并让用户 PATH 入口指向 `runtime/current/herdr-mcp`。普通用户不要用 git clone、`npm` 或 `cargo` 安装本机 runtime。
+
+macOS 上服务仍然是普通用户级 LaunchAgent；不需要 `sudo`，而且管理员权限本身也不能替代 TCC 授权。需要授予完全磁盘访问的是固定的 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`，不是持续变化的 `runtime/generations/rust-*`。非交互式安装会先准备好 broker，但不会强行打开系统设置；如果尚未授权，在用户终端执行一次 `herdr-mcp permissions setup` 即可。
 
 ## 第二步：先把本地 runtime 跑通
 

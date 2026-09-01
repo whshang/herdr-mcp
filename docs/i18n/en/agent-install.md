@@ -52,6 +52,8 @@ herdr-mcp update          # download and apply the next stable release
 
 `install` stages an immutable generation under `~/.config/herdr-mcp/runtime/` and retargets `~/.local/bin/herdr-mcp` to `runtime/current/herdr-mcp`. `herdr-mcp update` is the normal one-step upgrade path; use `herdr-mcp update check` only when an operator explicitly wants a read-only availability check. Prefer these top-level commands. Do **not** use `herdr-mcp service install` as the normal install path.
 
+On macOS v0.4.3+, first install also prepares the stable `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`. If the install is interactive and Full Disk Access has not yet been granted, System Settings opens once for the user to approve that broker. Do not try to replace this step with `sudo`, and do not continue treating a `doctor` result of `needs_setup`, `denied`, `unknown`, or `timeout` as healthy. Ask the user to complete Full Disk Access, then run `herdr-mcp permissions verify` and `herdr-mcp doctor` again. Ordinary runtime generation updates preserve the same broker and must not ask for authorization again.
+
 Use `update.channel = "preview"` only when deliberately testing prerelease builds. On the current stable runtime, the default `stable` channel is correct.
 
 ## 3. Generate local identities without printing secrets

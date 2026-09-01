@@ -301,6 +301,25 @@ fn permissions_status_setup_verify_and_broker_preservation() {
     );
     assert!(broker.is_file());
 
+    #[cfg(target_os = "macos")]
+    {
+        let marker = config.join("tcc-broker").join("authorization-required");
+        assert!(
+            marker.is_file(),
+            "fresh setup must require explicit FDA verification"
+        );
+        let status = Command::new(binary)
+            .args(["permissions", "status"])
+            .env("HERDR_MCP_CONFIG_DIR", &config)
+            .env("HOME", &root)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let status_text = String::from_utf8_lossy(&status.stdout);
+        assert!(status_text.contains("status: needs_setup"));
+        assert!(status_text.contains("probe: skipped_authorization_pending"));
+    }
+
     let output = Command::new(binary)
         .args(["permissions", "verify"])
         .env("HERDR_MCP_CONFIG_DIR", &config)
@@ -317,6 +336,16 @@ fn permissions_status_setup_verify_and_broker_preservation() {
             || text.contains("timeout")
             || text.contains("not_applicable")
     );
+    #[cfg(target_os = "macos")]
+    if output.status.success() && text.contains("status: granted") {
+        assert!(
+            !config
+                .join("tcc-broker")
+                .join("authorization-required")
+                .exists(),
+            "successful verify must clear the onboarding marker"
+        );
+    }
 
     fs::write(&broker, b"different-stable-broker-identity").unwrap();
     let output = Command::new(binary)

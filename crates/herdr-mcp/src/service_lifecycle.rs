@@ -88,6 +88,14 @@ where
     let before_service = service_snapshot()?;
     let before_supervisor = herdr_supervisor::capture_install_state_for_service()?;
     herdr_supervisor::preflight_install_for_service()?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let paths = RuntimePaths::discover()?;
+        crate::macos_permissions::preserve_or_install_broker(&paths.config_dir)
+            .map_err(|error| format!("macOS TCC broker install preflight failed: {error}"))?;
+    }
+
     let result = install(&mutation_lock)?;
     finish_install_lifecycle(before_service, before_supervisor, &mutation_lock, result)
 }
@@ -283,6 +291,8 @@ fn finish_install_lifecycle(
                 "service install committed but owned native-host runtime sync failed: {native_host_error}; {service_detail}{supervisor_detail}{link_detail}{native_host_detail}"
             ));
         }
+
+        crate::macos_permissions::post_service_install_onboarding(paths.instance.is_named());
     }
 
     Ok(result)

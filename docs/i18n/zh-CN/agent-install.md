@@ -49,6 +49,8 @@ herdr-mcp update          # 下载并应用下一版 stable release
 
 `install` 会在 `~/.config/herdr-mcp/runtime/` 写入不可变 generation，并把 `~/.local/bin/herdr-mcp` 指到 `runtime/current/herdr-mcp`。`herdr-mcp update` 是正常的一步升级入口；只有运维明确需要只读检查是否有新版本时才使用 `herdr-mcp update check`。优先使用以上顶层命令。不要把 `herdr-mcp service install` 写成普通安装主路径。
 
+macOS v0.4.3+ 首次安装还会准备固定的 `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`。如果是交互式安装且尚未获得完全磁盘访问，系统设置会打开一次，由用户本人给这个 broker 授权。不要尝试用 `sudo` 代替这一步；`doctor` 若返回 `needs_setup`、`denied`、`unknown` 或 `timeout`，不得当作健康。应提示用户完成完全磁盘访问，然后重新执行 `herdr-mcp permissions verify` 和 `herdr-mcp doctor`。普通 runtime generation 更新会保留同一个 broker，不应再次要求授权。
+
 只有明确测试 prerelease build 时才使用 `update.channel = "preview"`。当前 stable runtime 使用默认 `stable` channel 即可。
 
 ## 3. 在内存中生成身份，不要打印秘密
