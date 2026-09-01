@@ -396,15 +396,20 @@ fn sync_preflight(view: &Value) -> Result<Option<Value>, String> {
         .get("owned_manifest_count")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if owned_count == 0
-        || view.get("wrapper_ok").and_then(Value::as_bool) != Some(true)
-        || view.get("runtime_binary_ok").and_then(Value::as_bool) != Some(true)
-    {
+    let wrapper_ok = view.get("wrapper_ok").and_then(Value::as_bool) == Some(true);
+    let runtime_binary_ok = view.get("runtime_binary_ok").and_then(Value::as_bool) == Some(true);
+    if owned_count == 0 && !wrapper_ok && !runtime_binary_ok {
         return Ok(Some(json!({
             "ok": true,
             "skipped": true,
             "reason": "native_host_not_owned",
         })));
+    }
+    if owned_count == 0 || !wrapper_ok || !runtime_binary_ok {
+        return Err(
+            "native-host footprint is partial or foreign; refusing runtime synchronization"
+                .to_owned(),
+        );
     }
     Ok(None)
 }

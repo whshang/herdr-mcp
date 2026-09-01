@@ -190,8 +190,9 @@ test("service lifecycle keeps Herdr supervisor transactional across install upda
   assert.match(main, /Command::Service\(command\) => service_lifecycle::run\(command\)/);
   assert.match(updater, /service_lifecycle::run\(ServiceCommand::Install/);
   assert.doesNotMatch(updater, /herdr_supervisor::ensure_installed_for_service/);
-  assert.match(lifecycle, /InstallRecovery::Rollback => service_manager::run\(ServiceCommand::Rollback\)/);
-  assert.match(lifecycle, /InstallRecovery::Uninstall => service_manager::run\(ServiceCommand::Uninstall\)/);
+  assert.match(lifecycle, /let mutation_lock = service_manager::acquire_mutation_lock\(\)\?/);
+  assert.match(lifecycle, /InstallRecovery::Rollback => \{\s*service_manager::run_with_mutation_lock\(ServiceCommand::Rollback, &mutation_lock\)\s*\}/s);
+  assert.match(lifecycle, /InstallRecovery::Uninstall => \{\s*service_manager::run_with_mutation_lock\(ServiceCommand::Uninstall, &mutation_lock\)\s*\}/s);
   assert.match(lifecycle, /reconcile_after_service_rollback/);
   assert.match(lifecycle, /remove_for_service\(\)\?/);
   assert.match(supervisor, /refusing bootout because it may own a live Herdr child/);

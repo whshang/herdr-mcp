@@ -134,6 +134,8 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         .join("release")
         .join(executable_name("herdr-mcp"));
     verify_dev_binary(&built_binary)?;
+    let built_sha = file_sha256(&built_binary)?;
+    let expected_dev_generation = generation_from_sha256(&built_sha)?;
 
     // Persist the PROD recovery source before the service transaction. If the
     // independent terminal disappears during activation, `dev rollback` still
@@ -166,12 +168,47 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         });
     }
 
-    let active_after = current_generation(&runtime.config_dir)?.ok_or_else(|| {
-        "dev service activation succeeded but runtime/current is missing".to_owned()
-    })?;
+    let active_after = match current_generation(&runtime.config_dir) {
+        Ok(Some(generation)) => generation,
+        Ok(None) => {
+            return Err(compensate_post_install_failure(
+                "DEV post-install generation read failed",
+                "dev service activation succeeded but runtime/current is missing",
+                expected_dev_generation != active_before,
+                || run_service_rollback(&built_binary),
+                || restore_state(&paths.state, previous_state.as_ref()),
+            ));
+        }
+        Err(error) => {
+            return Err(compensate_post_install_failure(
+                "DEV post-install generation read failed",
+                &error,
+                expected_dev_generation != active_before,
+                || run_service_rollback(&built_binary),
+                || restore_state(&paths.state, previous_state.as_ref()),
+            ));
+        }
+    };
+    let activation_evidence = match verify_dev_activation(&runtime, &active_after) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return Err(compensate_post_install_failure(
+                "DEV post-activation gate failed",
+                &error,
+                active_after != active_before,
+                || run_service_rollback(&built_binary),
+                || restore_state(&paths.state, previous_state.as_ref()),
+            ));
+        }
+    };
     state.dev_generation = Some(active_after.clone());
     state.updated_at_ms = now_ms();
-    write_state(&paths.state, &state)?;
+    persist_committed_dev_state(
+        || write_state(&paths.state, &state),
+        active_after != active_before,
+        || run_service_rollback(&built_binary),
+        || restore_state(&paths.state, previous_state.as_ref()),
+    )?;
 
     print_json(&json!({
         "ok": true,
@@ -183,7 +220,11 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         "generation": active_after,
         "prod_generation": state.prod_generation,
         "prod_snapshot_sha256": state.prod_snapshot_sha256,
-        "server_link_generation_reconciled": true,
+        "activation_evidence": activation_evidence,
+        "server_link_generation_reconciled": activation_evidence
+            .get("server_link_generation_reconciled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }))?;
     Ok(ExitCode::SUCCESS)
 }
@@ -373,6 +414,213 @@ fn run_service_install(binary: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn run_service_rollback(binary: &Path) -> Result<(), String> {
+    let output = Command::new(binary)
+        .args(["service", "rollback"])
+        .env_remove("HERDR_MCP_EXEC_ID")
+        .output()
+        .map_err(|error| format!("cannot execute transactional service rollback: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "transactional service rollback failed: {}{}",
+            bounded_text(&output.stderr),
+            bounded_text(&output.stdout)
+        ));
+    }
+    Ok(())
+}
+
+fn compensate_post_install_failure<Rollback, Restore>(
+    context: &str,
+    error: &str,
+    runtime_changed: bool,
+    mut rollback: Rollback,
+    mut restore: Restore,
+) -> String
+where
+    Rollback: FnMut() -> Result<(), String>,
+    Restore: FnMut() -> Result<(), String>,
+{
+    let rollback_error = runtime_changed.then(|| rollback().err()).flatten();
+    let restore_error = restore().err();
+    format!(
+        "{context}: {error}{}{}",
+        rollback_error
+            .map(|error| format!("; service rollback failed: {error}"))
+            .unwrap_or_default(),
+        restore_error
+            .map(|error| format!("; DEV channel-state restore failed: {error}"))
+            .unwrap_or_default(),
+    )
+}
+
+fn persist_committed_dev_state<Write, Rollback, Restore>(
+    mut write: Write,
+    runtime_changed: bool,
+    mut rollback: Rollback,
+    mut restore: Restore,
+) -> Result<(), String>
+where
+    Write: FnMut() -> Result<(), String>,
+    Rollback: FnMut() -> Result<(), String>,
+    Restore: FnMut() -> Result<(), String>,
+{
+    let Err(state_error) = write() else {
+        return Ok(());
+    };
+    let rollback_error = runtime_changed.then(|| rollback().err()).flatten();
+    let restore_error = restore().err();
+    Err(format!(
+        "DEV channel-state commit failed after activation: {state_error}{}{}",
+        rollback_error
+            .map(|error| format!("; service rollback failed: {error}"))
+            .unwrap_or_default(),
+        restore_error
+            .map(|error| format!("; DEV channel-state restore failed: {error}"))
+            .unwrap_or_default(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_dev_activation(runtime: &RuntimePaths, generation: &str) -> Result<Value, String> {
+    let service = crate::service_manager::doctor_status()?;
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is required for DEV activation verification".to_owned())?;
+    let link = crate::link::ownership::collect_status_report(&home, &runtime.config_dir);
+    let native_host = crate::native_host_install::doctor_status()?;
+    validate_dev_activation_evidence(generation, &service, &link, Some(&native_host))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_dev_activation(_runtime: &RuntimePaths, _generation: &str) -> Result<Value, String> {
+    Err(
+        "DEV activation verification currently requires macOS service/Link ownership evidence"
+            .to_owned(),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_dev_activation_evidence(
+    generation: &str,
+    service: &Value,
+    link: &Value,
+    native_host: Option<&Value>,
+) -> Result<Value, String> {
+    if service.get("ok").and_then(Value::as_bool) != Some(true)
+        || service.get("healthy").and_then(Value::as_bool) != Some(true)
+    {
+        return Err("service status is not healthy after DEV activation".to_owned());
+    }
+    let service_generation = service
+        .get("generation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "service status is missing generation evidence".to_owned())?;
+    if service_generation != generation {
+        return Err(format!(
+            "service generation mismatch after DEV activation: expected {generation}, observed {service_generation}"
+        ));
+    }
+
+    if link.get("ok").and_then(Value::as_bool) != Some(true)
+        || link.get("production_owner").and_then(Value::as_str) != Some("rust")
+    {
+        return Err(
+            "production Link ownership/status is not healthy after DEV activation".to_owned(),
+        );
+    }
+    let prod = link
+        .get("agents")
+        .and_then(Value::as_array)
+        .and_then(|agents| {
+            agents.iter().find(|agent| {
+                agent.get("label").and_then(Value::as_str) == Some("dev.herdr-mcp.link-prod")
+            })
+        })
+        .ok_or_else(|| "production Link status is missing link-prod evidence".to_owned())?;
+    if prod.get("loaded").and_then(Value::as_bool) != Some(true)
+        || prod.get("implementation").and_then(Value::as_str) != Some("rust")
+        || prod
+            .get("points_at_managed_runtime")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || prod.get("points_at_repo_checkout").and_then(Value::as_bool) == Some(true)
+    {
+        return Err(
+            "production Link is not a loaded managed Rust Link after DEV activation".to_owned(),
+        );
+    }
+    let alignment = link
+        .get("production_runtime_alignment")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "production Link status is missing generation alignment evidence".to_owned()
+        })?;
+    let current = alignment
+        .get("current_generation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let active = alignment
+        .get("active_generation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let control_matches = alignment
+        .get("runtime_control_active_matches_current")
+        .and_then(Value::as_bool)
+        == Some(true);
+    if current != generation || active != generation || !control_matches {
+        return Err(format!(
+            "production Link generation mismatch after DEV activation: expected={generation} current={current} active={active} control_matches={control_matches}"
+        ));
+    }
+
+    let native_host_state = match native_host {
+        Some(view)
+            if view.get("runtime_matches_current").and_then(Value::as_bool) == Some(true)
+                && view.get("ok").and_then(Value::as_bool) == Some(true) =>
+        {
+            "current"
+        }
+        Some(view)
+            if view
+                .get("owned_manifest_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                == 0
+                && view.get("wrapper_ok").and_then(Value::as_bool) == Some(false)
+                && view.get("runtime_binary_ok").and_then(Value::as_bool) == Some(false) =>
+        {
+            "absent"
+        }
+        Some(view)
+            if view.get("reason").and_then(Value::as_str) == Some("native_host_not_owned") =>
+        {
+            // Retain compatibility with the mutation helper's explicit skip shape
+            // for pure tests/older callers, while live DEV verification uses the
+            // read-only doctor status above.
+            "not_owned"
+        }
+        Some(_) => {
+            return Err(
+                "Native Messaging state is partial/foreign/stale after DEV activation".to_owned(),
+            );
+        }
+        None => "not_applicable",
+    };
+
+    Ok(json!({
+        "server_link_generation_reconciled": true,
+        "service_generation": service_generation,
+        "link_current_generation": current,
+        "link_active_generation": active,
+        "link_loaded_environment_stale": alignment
+            .get("loaded_environment_stale")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "native_host": native_host_state,
+    }))
 }
 
 fn ensure_prod_snapshot(
@@ -577,6 +825,13 @@ fn file_sha256(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
+fn generation_from_sha256(sha256: &str) -> Result<String, String> {
+    if sha256.len() < 16 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("DEV runtime SHA-256 is malformed".to_owned());
+    }
+    Ok(format!("rust-{}", &sha256[..16]))
+}
+
 fn refuse_managed_exec_mutation(action: &str) -> Result<(), String> {
     if env::var_os("HERDR_MCP_EXEC_ID").is_some() {
         return Err(format!(
@@ -686,11 +941,165 @@ mod tests {
     }
 
     #[test]
+    fn dev_activation_gate_requires_measured_service_and_link_alignment() {
+        let generation = "rust-new";
+        let service = json!({ "ok": true, "healthy": true, "generation": generation });
+        let link = json!({
+            "ok": true,
+            "production_owner": "rust",
+            "agents": [{
+                "label": "dev.herdr-mcp.link-prod",
+                "loaded": true,
+                "implementation": "rust",
+                "points_at_managed_runtime": true,
+                "points_at_repo_checkout": false,
+            }],
+            "production_runtime_alignment": {
+                "current_generation": generation,
+                "active_generation": generation,
+                "runtime_control_active_matches_current": true,
+                "loaded_environment_stale": true,
+            }
+        });
+        let native = json!({ "ok": true, "runtime_matches_current": true });
+        let evidence =
+            validate_dev_activation_evidence(generation, &service, &link, Some(&native)).unwrap();
+        assert_eq!(evidence["server_link_generation_reconciled"], true);
+        assert_eq!(evidence["link_loaded_environment_stale"], true);
+        assert_eq!(evidence["native_host"], "current");
+
+        let stale = json!({
+            "ok": true,
+            "production_owner": "rust",
+            "agents": [{
+                "label": "dev.herdr-mcp.link-prod",
+                "loaded": true,
+                "implementation": "rust",
+                "points_at_managed_runtime": true,
+                "points_at_repo_checkout": false,
+            }],
+            "production_runtime_alignment": {
+                "current_generation": generation,
+                "active_generation": "rust-old",
+                "runtime_control_active_matches_current": false,
+            }
+        });
+        assert!(
+            validate_dev_activation_evidence(generation, &service, &stale, Some(&native))
+                .unwrap_err()
+                .contains("production Link generation mismatch")
+        );
+    }
+
+    #[test]
+    fn dev_activation_gate_accepts_absent_native_host_but_rejects_partial_state() {
+        let generation = "rust-new";
+        let service = json!({ "ok": true, "healthy": true, "generation": generation });
+        let link = json!({
+            "ok": true,
+            "production_owner": "rust",
+            "agents": [{
+                "label": "dev.herdr-mcp.link-prod",
+                "loaded": true,
+                "implementation": "rust",
+                "points_at_managed_runtime": true,
+                "points_at_repo_checkout": false,
+            }],
+            "production_runtime_alignment": {
+                "current_generation": generation,
+                "active_generation": generation,
+                "runtime_control_active_matches_current": true,
+            }
+        });
+        let absent = json!({
+            "ok": false,
+            "owned_manifest_count": 0,
+            "wrapper_ok": false,
+            "runtime_binary_ok": false,
+            "runtime_matches_current": false,
+        });
+        let evidence =
+            validate_dev_activation_evidence(generation, &service, &link, Some(&absent)).unwrap();
+        assert_eq!(evidence["native_host"], "absent");
+
+        let partial = json!({
+            "ok": false,
+            "owned_manifest_count": 0,
+            "wrapper_ok": true,
+            "runtime_binary_ok": false,
+            "runtime_matches_current": false,
+        });
+        assert!(
+            validate_dev_activation_evidence(generation, &service, &link, Some(&partial))
+                .unwrap_err()
+                .contains("partial/foreign/stale")
+        );
+    }
+
+    #[test]
     fn ordinary_release_build_defaults_to_prod_identity() {
         assert_eq!(crate::runtime_meta::runtime_channel(), "prod");
         assert_eq!(
             crate::runtime_meta::runtime_version(),
             env!("CARGO_PKG_VERSION")
         );
+    }
+
+    #[test]
+    fn final_dev_state_commit_failure_compensates_runtime_and_state() {
+        use std::cell::Cell;
+
+        let rollback_calls = Cell::new(0usize);
+        let restore_calls = Cell::new(0usize);
+        let error = persist_committed_dev_state(
+            || Err("synthetic state write failure".to_owned()),
+            true,
+            || {
+                rollback_calls.set(rollback_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                restore_calls.set(restore_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("DEV channel-state commit failed after activation"));
+        assert_eq!(rollback_calls.get(), 1);
+        assert_eq!(restore_calls.get(), 1);
+    }
+
+    #[test]
+    fn post_install_generation_read_failure_uses_expected_generation_for_compensation() {
+        use std::cell::Cell;
+
+        assert_eq!(
+            generation_from_sha256(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            )
+            .unwrap(),
+            "rust-0123456789abcdef"
+        );
+        assert!(generation_from_sha256("bad").is_err());
+
+        let rollback_calls = Cell::new(0usize);
+        let restore_calls = Cell::new(0usize);
+        let error = compensate_post_install_failure(
+            "DEV post-install generation read failed",
+            "synthetic runtime/current read failure",
+            true,
+            || {
+                rollback_calls.set(rollback_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                restore_calls.set(restore_calls.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(error.contains("synthetic runtime/current read failure"));
+        assert_eq!(rollback_calls.get(), 1);
+        assert_eq!(restore_calls.get(), 1);
     }
 }

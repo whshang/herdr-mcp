@@ -43,6 +43,11 @@ const BOOTSTRAP_RETRY_DELAYS: [Duration; 3] = [
 pub trait LaunchdOps {
     fn bootout_prod(&self, label: &str) -> Result<(), String>;
     fn bootstrap_prod(&self, plist: &Path, label: &str) -> Result<(), String>;
+    /// Restart an already-loaded production Link without changing launchd
+    /// ownership. This is a bounded recovery primitive for a Link process that
+    /// failed to consume a generation-control revision; callers must prove
+    /// ownership before invoking it.
+    fn kickstart_prod(&self, label: &str) -> Result<(), String>;
     /// Probe whether `label` is loaded. Probe failures must be `Err` (never
     /// silently treated as absent).
     fn is_loaded(&self, label: &str) -> Result<bool, String>;
@@ -111,6 +116,27 @@ impl LaunchdOps for RealLaunchd {
         }
     }
 
+    fn kickstart_prod(&self, label: &str) -> Result<(), String> {
+        assert_prod_only_label(label)?;
+        #[cfg(target_os = "macos")]
+        {
+            if !launchd_probe_loaded(label)? {
+                return Err(format!("refusing to kickstart unloaded {label}"));
+            }
+            run_launchctl([
+                OsStr::new("kickstart"),
+                OsStr::new("-k"),
+                OsStr::new(&format!("{}/{}", launchd_domain(), label)),
+            ])
+            .map(|_| ())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = label;
+            Err("link cutover --execute is macOS-only".to_owned())
+        }
+    }
+
     fn is_loaded(&self, label: &str) -> Result<bool, String> {
         #[cfg(target_os = "macos")]
         {
@@ -135,6 +161,7 @@ struct FakeLaunchdState {
     loaded: BTreeMap<String, PathBuf>,
     bootouts: Vec<String>,
     bootstraps: Vec<(String, PathBuf)>,
+    kickstarts: Vec<String>,
     fail_bootstrap_once: bool,
 }
 
@@ -164,6 +191,10 @@ impl FakeLaunchd {
     pub fn bootstraps(&self) -> Vec<(String, PathBuf)> {
         self.inner.lock().unwrap().bootstraps.clone()
     }
+
+    pub fn kickstarts(&self) -> Vec<String> {
+        self.inner.lock().unwrap().kickstarts.clone()
+    }
 }
 
 impl LaunchdOps for FakeLaunchd {
@@ -186,6 +217,16 @@ impl LaunchdOps for FakeLaunchd {
             .bootstraps
             .push((label.to_owned(), plist.to_path_buf()));
         state.loaded.insert(label.to_owned(), plist.to_path_buf());
+        Ok(())
+    }
+
+    fn kickstart_prod(&self, label: &str) -> Result<(), String> {
+        assert_prod_only_label(label)?;
+        let mut state = self.inner.lock().unwrap();
+        if !state.loaded.contains_key(label) {
+            return Err(format!("refusing to kickstart unloaded {label}"));
+        }
+        state.kickstarts.push(label.to_owned());
         Ok(())
     }
 

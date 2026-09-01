@@ -132,6 +132,8 @@ function runOnce(harness, extraEnv = {}) {
       HERDR_MCP_RUNTIME_BIN: harness.runtime,
       HERDR_MCP_WATCHDOG_FAIL_THRESHOLD: '2',
       HERDR_MCP_WATCHDOG_COOLDOWN_SEC: '0',
+      HERDR_MCP_WATCHDOG_RESTART_BURST_LIMIT: '3',
+      HERDR_MCP_WATCHDOG_RESTART_BACKOFF_SEC: '300',
       HERDR_MCP_LINK_WATCHDOG_FAIL_THRESHOLD: '2',
       HERDR_MCP_LINK_WATCHDOG_COOLDOWN_SEC: '0',
       ...extraEnv,
@@ -162,6 +164,8 @@ test('watchdog pins the managed Rust service and removes Node process heuristics
 test('watchdog defaults are bounded for in-turn recovery', () => {
   assert.ok(script.includes('HERDR_MCP_WATCHDOG_FAIL_THRESHOLD:-2'));
   assert.ok(script.includes('HERDR_MCP_WATCHDOG_COOLDOWN_SEC:-60'));
+  assert.ok(script.includes('HERDR_MCP_WATCHDOG_RESTART_BURST_LIMIT:-3'));
+  assert.ok(script.includes('HERDR_MCP_WATCHDOG_RESTART_BACKOFF_SEC:-300'));
   assert.ok(script.includes('HERDR_MCP_WATCHDOG_INTERVAL_SEC:-15'));
   assert.ok(script.includes('HERDR_MCP_WATCHDOG_HEALTH_TIMEOUT_SEC:-2'));
   assert.ok(script.includes('--connect-timeout 1'));
@@ -262,6 +266,63 @@ test('restart cooldown prevents repeated kickstarts', async () => {
   const state = JSON.parse(await readFile(join(harness.cfg, 'health-watchdog.state.json'), 'utf8'));
   assert.equal(state.restarts_total, 1);
   assert.equal(state.last_action, 'cooldown');
+});
+
+test('server restart storm is suppressed until a real healthy probe resets the circuit', async () => {
+  const harness = await makeHarness({ loaded: true, healthCode: '503' });
+  const env = {
+    HERDR_MCP_WATCHDOG_FAIL_THRESHOLD: '1',
+    HERDR_MCP_WATCHDOG_COOLDOWN_SEC: '0',
+    HERDR_MCP_WATCHDOG_RESTART_BURST_LIMIT: '2',
+    HERDR_MCP_WATCHDOG_RESTART_BACKOFF_SEC: '300',
+  };
+  for (let i = 0; i < 3; i += 1) {
+    const result = runOnce(harness, env);
+    assert.equal(result.status, 0, result.stderr);
+  }
+  let launchctlLog = await readFile(harness.log, 'utf8');
+  assert.equal((launchctlLog.match(/kickstart -k/g) || []).length, 2);
+  let state = JSON.parse(await readFile(join(harness.cfg, 'health-watchdog.state.json'), 'utf8'));
+  assert.equal(state.recovery_attempts_without_health, 2);
+  assert.equal(state.last_action, 'restart_storm_suppressed');
+  assert.ok(state.restart_suppressed_until > state.updated_at);
+
+  await writeExecutable(harness.curl, "#!/bin/bash\nprintf '200'\n");
+  const healthy = runOnce(harness, env);
+  assert.equal(healthy.status, 0, healthy.stderr);
+  state = JSON.parse(await readFile(join(harness.cfg, 'health-watchdog.state.json'), 'utf8'));
+  assert.equal(state.recovery_attempts_without_health, 0);
+  assert.equal(state.restart_suppressed_until, 0);
+  assert.equal(state.last_action, 'healthy');
+
+  await writeExecutable(harness.curl, "#!/bin/bash\nprintf '503'\n");
+  const recoveredEligibility = runOnce(harness, env);
+  assert.equal(recoveredEligibility.status, 0, recoveredEligibility.stderr);
+  launchctlLog = await readFile(harness.log, 'utf8');
+  assert.equal((launchctlLog.match(/kickstart -k/g) || []).length, 3);
+});
+
+test('watchdog state writes are atomic and malformed state fails closed', async () => {
+  assert.match(script, /tempfile\.mkstemp/);
+  assert.match(script, /os\.fsync\(fh\.fileno\(\)\)/);
+  assert.match(script, /os\.replace\(tmp, path\)/);
+  assert.doesNotMatch(script, /with open\(path, "w"\)/);
+
+  const harness = await makeHarness({ loaded: true, healthCode: '503' });
+  await writeFile(join(harness.cfg, 'health-watchdog.state.json'), '{"recovery_attempts_without_health": 2');
+  const result = runOnce(harness, {
+    HERDR_MCP_WATCHDOG_FAIL_THRESHOLD: '1',
+    HERDR_MCP_WATCHDOG_COOLDOWN_SEC: '0',
+    HERDR_MCP_WATCHDOG_RESTART_BURST_LIMIT: '2',
+    HERDR_MCP_WATCHDOG_RESTART_BACKOFF_SEC: '300',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const launchctlLog = await readFile(harness.log, 'utf8');
+  assert.doesNotMatch(launchctlLog, /kickstart -k/);
+  const state = JSON.parse(await readFile(join(harness.cfg, 'health-watchdog.state.json'), 'utf8'));
+  assert.equal(state.last_action, 'state_corrupt_suppressed');
+  assert.equal(state.recovery_attempts_without_health, 2);
+  assert.ok(state.restart_suppressed_until > state.updated_at);
 });
 
 test('herdr_skill policy pins bounded outage recovery and uncertain-mutation safety', () => {

@@ -178,6 +178,12 @@ pub fn health_fields(cache: &EventCache, exec: Option<&ExecRegistry>) -> Map<Str
     );
     output.insert("version".to_owned(), json!(runtime_version()));
     output.insert("channel".to_owned(), json!(runtime_channel()));
+    if let Some(generation) = env::var_os("HERDR_MCP_RUNTIME_GENERATION")
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.is_empty())
+    {
+        output.insert("runtime_generation".to_owned(), json!(generation));
+    }
     output.insert("build".to_owned(), build_info());
     output.insert("native_migration".to_owned(), migration_status());
     output.insert(
