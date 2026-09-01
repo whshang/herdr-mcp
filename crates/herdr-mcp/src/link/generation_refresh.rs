@@ -39,10 +39,15 @@ use super::ownership::{
     read_status_active_generation,
 };
 use super::runtime_control::retryable_candidate_outcome;
+use super::runtime_generation::RUNTIME_GENERATION_DEFAULT_TIMEOUT_MS;
 #[cfg(target_os = "macos")]
 use serde_json::Value;
 
-const ACTIVE_WAIT_BUDGET: Duration = Duration::from_secs(8);
+// Runtime-control validation is a loopback RPC, but its own bounded request
+// timeout is still 30s. The outer service transaction must not interrupt that
+// legitimate in-flight validation and misclassify it as a stalled Link.
+const ACTIVE_WAIT_BUDGET: Duration =
+    Duration::from_millis(RUNTIME_GENERATION_DEFAULT_TIMEOUT_MS + 5_000);
 const ACTIVE_RECONCILE_ATTEMPTS: usize = 2;
 #[cfg(target_os = "macos")]
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -55,7 +60,11 @@ const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // ownership drift. Wall-clock maximum = CONVERGENCE_MAX_POLLS * poll_interval
 // (20s) plus the hot-switch budget (8s) and kickstart, so the whole reconcile
 // stays bounded.
-const CONVERGENCE_MAX_POLLS: usize = 20;
+// Post-kickstart convergence covers both launchd's throttle window and one
+// complete runtime-control validation timeout, with a small scheduling margin.
+const CONVERGENCE_MAX_POLLS: usize = (RUNTIME_GENERATION_DEFAULT_TIMEOUT_MS as usize / 1_000)
+    + LINK_LAUNCHD_THROTTLE_SECONDS as usize
+    + 5;
 const CONVERGENCE_MAX_STALLED_POLLS: usize = 3;
 const CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 // `launchctl kickstart -k` can return while launchd is still honoring the
@@ -633,6 +642,29 @@ where
                         "production Link is not directed toward generation {expected} during bounded convergence"
                     ));
                 }
+                // A pending control revision or an explicit retrying outcome is
+                // itself an in-flight runtime-control operation. Its inner
+                // health/catalog RPC may legally consume the full validation
+                // timeout, so do not let the much tighter static-fingerprint
+                // stall detector preempt it. The overall max-poll budget still
+                // bounds a genuinely wedged retry/pending state.
+                let revision_in_flight = matches!(
+                    (evidence.status_processed_revision, evidence.control_revision),
+                    (Some(processed), Some(control)) if processed < control
+                );
+                let retry_in_flight = evidence
+                    .status_outcome
+                    .as_deref()
+                    .is_some_and(|outcome| outcome.starts_with("retrying:"));
+                if revision_in_flight || retry_in_flight {
+                    stalled_polls = 0;
+                    last_fingerprint = Some(evidence_fingerprint(&evidence));
+                    if poll + 1 < max_polls && !poll_interval.is_zero() {
+                        std::thread::sleep(poll_interval);
+                    }
+                    continue;
+                }
+
                 // Forward progress is defined by the evidence fingerprint
                 // changing between polls while still directed toward expected.
                 // A static fingerprint (same revision/outcome/transition) is a
@@ -1213,10 +1245,11 @@ mod tests {
     }
 
     #[test]
-    fn directed_but_identical_evidence_stalls_and_fails() {
-        // A static pending revision / retrying outcome proves direction but not
-        // movement. Identical evidence across consecutive polls is a stall and
-        // must fail after exactly max_stalled_polls, never succeed.
+    fn pending_retrying_evidence_uses_the_full_bounded_budget() {
+        // A pending revision or retrying outcome can be inside the Link's own
+        // bounded 30s validation RPC. The outer transaction must not preempt
+        // that inner budget after only three identical polls; it still fails at
+        // the overall convergence budget if the retry never resolves.
         let mut probes = 0;
         let error = bounded_convergence_phase(
             "rust-new",
@@ -1228,6 +1261,38 @@ mod tests {
                     control_revision: Some(2),
                     status_processed_revision: Some(1),
                     status_outcome: Some("retrying:candidate_rejected:health_http_503".to_owned()),
+                    active_generation: Some("rust-old".to_owned()),
+                    transition_seq: Some(0),
+                    last_transition_to: None,
+                    last_transition_outcome: None,
+                })
+            },
+            7,
+            3,
+            3,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.contains("bounded convergence budget"));
+        assert_eq!(probes, 7);
+    }
+
+    #[test]
+    fn processed_but_static_evidence_stalls_after_tight_budget() {
+        // Once the current control revision has been processed, a static
+        // active-old state is no longer an in-flight validation. Keep the tight
+        // stall detector for this genuinely non-progressing state.
+        let mut probes = 0;
+        let error = bounded_convergence_phase(
+            "rust-new",
+            &mut || Ok(()),
+            &mut || {
+                probes += 1;
+                Ok(ConvergenceEvidence {
+                    control_desired: Some("rust-new".to_owned()),
+                    control_revision: Some(2),
+                    status_processed_revision: Some(2),
+                    status_outcome: Some("active_unchanged".to_owned()),
                     active_generation: Some("rust-old".to_owned()),
                     transition_seq: Some(0),
                     last_transition_to: None,
