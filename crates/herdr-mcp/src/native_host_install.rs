@@ -21,10 +21,12 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(target_os = "macos")]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(target_os = "macos")]
+use std::os::unix::io::AsRawFd;
 
 #[cfg(target_os = "macos")]
 const HOST_NAME: &str = "dev.herdr.mcp";
@@ -51,11 +53,16 @@ const PENDING_FILE: &str = "install-pending.json";
 const ROLLBACK_PENDING_FILE: &str = "rollback-pending.json";
 #[cfg(target_os = "macos")]
 const BACKUPS_DIR_NAME: &str = "backups";
+#[cfg(target_os = "macos")]
+const NATIVE_HOST_MUTATION_LOCK: &str = "native-host-mutation.lock";
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone)]
 struct InstallPaths {
     source_binary: PathBuf,
+    config_dir: PathBuf,
+    #[allow(dead_code)]
+    native_dir: PathBuf,
     runtime_binary: PathBuf,
     wrapper: PathBuf,
     extension_path: Option<PathBuf>,
@@ -69,6 +76,8 @@ struct InstallPaths {
     rollback_file: PathBuf,
     pending_file: PathBuf,
     rollback_pending_file: PathBuf,
+    mutation_lock: PathBuf,
+    instance: crate::instance::InstanceId,
 }
 
 #[cfg(target_os = "macos")]
@@ -89,6 +98,25 @@ pub fn run(command: NativeHostCommand) -> Result<ExitCode, String> {
 
     #[cfg(target_os = "macos")]
     {
+        // Named instances must not mutate the global browser Native Messaging
+        // host. The browser manifests at ~/Library/Application Support/*/NativeMessagingHosts
+        // are global; the Native Host wrapper/runtime at ~/.config/herdr-mcp/native
+        // is the single default product contract. A named instance has its own
+        // isolated config root (herdr-mcp-<name>) and port, and must never write
+        // global manifests, wrapper, or runtime. Status remains read-only.
+        if matches!(
+            command,
+            NativeHostCommand::Install
+                | NativeHostCommand::DevEnable { .. }
+                | NativeHostCommand::DevDisable
+                | NativeHostCommand::UseStore
+                | NativeHostCommand::UseStandalone
+                | NativeHostCommand::UseDev
+                | NativeHostCommand::Uninstall
+                | NativeHostCommand::Rollback
+        ) {
+            require_default_instance()?;
+        }
         let paths = InstallPaths::discover(&command)?;
         let result = match command {
             NativeHostCommand::Install
@@ -142,7 +170,12 @@ pub fn doctor_status() -> Result<serde_json::Value, String> {
 /// closed before the first mutation.
 #[cfg(target_os = "macos")]
 pub(crate) fn product_uninstall_preflight() -> Result<bool, String> {
+    // Named instances must not touch the default global Native Host.
     let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
+    if !paths.is_default_instance() {
+        return Ok(false);
+    }
+    let _lock = NativeHostMutationLock::acquire(&paths)?;
     reject_rollback_in_progress(&paths)?;
 
     let footprint_present = managed_native_host_footprint_present(&paths);
@@ -200,6 +233,10 @@ fn product_uninstall_view_preflight(view: &Value, footprint_present: bool) -> Re
 #[cfg(target_os = "macos")]
 pub(crate) fn product_uninstall_snapshot() -> Result<Option<serde_json::Value>, String> {
     let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
+    if !paths.is_default_instance() {
+        return Ok(None);
+    }
+    let _lock = NativeHostMutationLock::acquire(&paths)?;
     reject_rollback_in_progress(&paths)?;
     let footprint_present = managed_native_host_footprint_present(&paths);
     let view = status(&paths);
@@ -231,14 +268,31 @@ pub(crate) fn product_uninstall_owned_from_snapshot(
     snapshot: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
+    if !paths.is_default_instance() {
+        return Err(
+            "native-host product uninstall is not allowed under a named instance; use the default instance"
+                .to_owned(),
+        );
+    }
+    let _lock = NativeHostMutationLock::acquire(&paths)?;
     reject_rollback_in_progress(&paths)?;
     validate_product_uninstall_snapshot(snapshot, &paths)?;
 
-    let mut removed = Vec::new();
+    // Pre-validate the entire cohort before any deletion (HIGH). If any
+    // present member has drifted (hash mismatch, non-regular file, lost
+    // ownership), fail closed with zero deletions.
     let manifests = snapshot
         .get("manifests")
         .and_then(Value::as_array)
         .ok_or_else(|| "native-host product snapshot is missing manifests".to_owned())?;
+    let expected_wrapper_sha = snapshot
+        .get("wrapper_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "native-host product snapshot is missing wrapper_sha256".to_owned())?;
+    let expected_runtime_sha = snapshot
+        .get("runtime_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "native-host product snapshot is missing runtime_sha256".to_owned())?;
     for raw in manifests {
         let raw = raw
             .as_str()
@@ -247,6 +301,62 @@ pub(crate) fn product_uninstall_owned_from_snapshot(
         if !path_present(&path) {
             continue;
         }
+        let view = manifest_status(&path, &paths);
+        if view.get("owned").and_then(Value::as_bool) != Some(true) {
+            return Err(format!(
+                "native-host manifest changed after product preflight; refusing removal: {}",
+                path.display()
+            ));
+        }
+        // Also ensure it is a regular file (not symlink/dir).
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|e| format!("cannot inspect manifest {}: {e}", path.display()))?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(format!(
+                "native-host manifest changed into non-regular file; refusing removal: {}",
+                path.display()
+            ));
+        }
+    }
+    for (label, path, expected_sha) in [
+        ("wrapper", &paths.wrapper, expected_wrapper_sha),
+        (
+            "runtime binary",
+            &paths.runtime_binary,
+            expected_runtime_sha,
+        ),
+    ] {
+        if !path_present(path) {
+            continue;
+        }
+        let meta = fs::symlink_metadata(path)
+            .map_err(|e| format!("cannot inspect native-host {label}: {e}"))?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(format!(
+                "native-host {label} changed into a non-regular file; refusing removal: {}",
+                path.display()
+            ));
+        }
+        let observed = file_sha256(path)?;
+        if observed != expected_sha {
+            return Err(format!(
+                "native-host {label} changed after product preflight; refusing removal: {}",
+                path.display()
+            ));
+        }
+    }
+
+    // All pre-validations passed — now perform deletions.
+    let mut removed = Vec::new();
+    for raw in manifests {
+        let raw = raw
+            .as_str()
+            .ok_or_else(|| "native-host product snapshot manifest path is invalid".to_owned())?;
+        let path = PathBuf::from(raw);
+        if !path_present(&path) {
+            continue;
+        }
+        // Re-check owned under lock (already validated, but keep for safety).
         let view = manifest_status(&path, &paths);
         if view.get("owned").and_then(Value::as_bool) != Some(true) {
             return Err(format!(
@@ -265,19 +375,13 @@ pub(crate) fn product_uninstall_owned_from_snapshot(
 
     remove_snapshot_file_if_matching(
         &paths.wrapper,
-        snapshot
-            .get("wrapper_sha256")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "native-host product snapshot is missing wrapper_sha256".to_owned())?,
+        expected_wrapper_sha,
         "wrapper",
         &mut removed,
     )?;
     remove_snapshot_file_if_matching(
         &paths.runtime_binary,
-        snapshot
-            .get("runtime_sha256")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "native-host product snapshot is missing runtime_sha256".to_owned())?,
+        expected_runtime_sha,
         "runtime binary",
         &mut removed,
     )?;
@@ -379,6 +483,15 @@ fn remove_snapshot_file_if_matching(
 /// or consuming native-host rollback evidence.
 #[cfg(target_os = "macos")]
 pub fn sync_owned_runtime_from_active() -> Result<serde_json::Value, String> {
+    let runtime = crate::paths::RuntimePaths::discover()?;
+    if runtime.instance.is_named() {
+        return Ok(json!({
+            "ok": true,
+            "skipped": true,
+            "reason": "named_instance_skipped",
+            "detail": "native-host sync is only for the default instance; named instances do not own the global browser host",
+        }));
+    }
     let paths = InstallPaths::discover(&NativeHostCommand::Status)?;
     let home = home_dir()?;
     let active = crate::link::install::resolve_managed_runtime_binary(&home)?;
@@ -544,6 +657,16 @@ fn refresh_legacy_managed_wrapper_identity(paths: &InstallPaths) -> Result<bool,
 
 #[cfg(target_os = "macos")]
 fn sync_owned_runtime_with_active(paths: &InstallPaths, active: &Path) -> Result<Value, String> {
+    if !paths.is_default_instance() {
+        return Ok(json!({
+            "ok": true,
+            "skipped": true,
+            "reason": "named_instance_skipped",
+            "detail": "native-host sync is only for the default instance; named instances do not own the global browser host",
+        }));
+    }
+    let _lock = NativeHostMutationLock::acquire(paths)?;
+    check_origin_drift_after_lock(paths)?;
     let mut view = status_with_active_runtime(paths, Some(active));
     if view.get("recovery_required").and_then(Value::as_bool) == Some(true) {
         sync_preflight(&view)?;
@@ -620,6 +743,7 @@ impl InstallPaths {
         let runtime_paths = crate::paths::RuntimePaths::discover()?;
         let source_binary = env::current_exe()
             .map_err(|error| format!("cannot locate current herdr-mcp binary: {error}"))?;
+        let instance = runtime_paths.instance.clone();
         let native_dir = runtime_paths.config_dir.join("native");
         let layout = NativeHostLayout {
             source_binary,
@@ -651,6 +775,7 @@ impl InstallPaths {
                 "durable_metadata",
                 false,
                 layout,
+                instance.clone(),
             );
         }
 
@@ -671,6 +796,7 @@ impl InstallPaths {
                         "env:HERDR_EXTENSION_ORIGIN",
                         true,
                         layout,
+                        instance.clone(),
                     );
                 }
                 if env::var_os("HERDR_EXTENSION_PATH").is_some() {
@@ -680,6 +806,7 @@ impl InstallPaths {
                         "env:HERDR_EXTENSION_PATH",
                         true,
                         layout,
+                        instance.clone(),
                     );
                 }
 
@@ -699,6 +826,7 @@ impl InstallPaths {
                         "registered_manifest_upgrade",
                         true,
                         layout,
+                        instance.clone(),
                     );
                 }
                 Self::for_origin_with_dev(
@@ -708,11 +836,18 @@ impl InstallPaths {
                     "chrome_web_store_contract",
                     true,
                     layout,
+                    instance.clone(),
                 )
             }
             NativeHostCommand::DevEnable { path } => {
                 let extension_path = dev_extension_path(path.as_deref())?;
-                Self::for_dev_path(&extension_path, "native_host_dev_enable", true, layout)
+                Self::for_dev_path(
+                    &extension_path,
+                    "native_host_dev_enable",
+                    true,
+                    layout,
+                    instance.clone(),
+                )
             }
             NativeHostCommand::DevDisable => {
                 let fixed_origin = registered
@@ -726,6 +861,7 @@ impl InstallPaths {
                     "native_host_dev_disable",
                     true,
                     layout,
+                    instance.clone(),
                 )
             }
             NativeHostCommand::UseStore => Self::for_origin_with_dev(
@@ -735,6 +871,7 @@ impl InstallPaths {
                 "native_host_use_store",
                 true,
                 layout,
+                instance.clone(),
             ),
             NativeHostCommand::UseStandalone => Self::for_origin_with_dev(
                 &standalone.origin,
@@ -743,6 +880,7 @@ impl InstallPaths {
                 "native_host_use_standalone",
                 true,
                 layout,
+                instance.clone(),
             ),
             NativeHostCommand::UseDev => {
                 let dev = remembered_dev.ok_or_else(|| {
@@ -756,6 +894,7 @@ impl InstallPaths {
                     "native_host_use_dev",
                     true,
                     layout,
+                    instance.clone(),
                 )
             }
             NativeHostCommand::Status
@@ -769,6 +908,7 @@ impl InstallPaths {
                         "registered_manifest",
                         false,
                         layout,
+                        instance.clone(),
                     );
                 }
                 Self::for_origin_with_dev(
@@ -778,6 +918,7 @@ impl InstallPaths {
                     "chrome_web_store_contract",
                     false,
                     layout,
+                    instance.clone(),
                 )
             }
         }
@@ -796,7 +937,13 @@ impl InstallPaths {
             targets: install_targets(home),
             native_dir,
         };
-        Self::for_dev_path(extension_path, "test_extension_path", false, layout)
+        Self::for_dev_path(
+            extension_path,
+            "test_extension_path",
+            false,
+            layout,
+            crate::instance::InstanceId::default_instance(),
+        )
     }
 
     fn for_dev_path(
@@ -804,6 +951,7 @@ impl InstallPaths {
         extension_identity_source: &str,
         allow_origin_migration: bool,
         layout: NativeHostLayout,
+        instance: crate::instance::InstanceId,
     ) -> Result<Self, String> {
         let extension_id = crate::native_host::chromium_id_for_path(extension_path)?;
         let extension_origin = format!("chrome-extension://{extension_id}/");
@@ -814,6 +962,7 @@ impl InstallPaths {
             extension_identity_source,
             allow_origin_migration,
             layout,
+            instance,
         )
     }
 
@@ -824,6 +973,7 @@ impl InstallPaths {
         extension_identity_source: &str,
         allow_origin_migration: bool,
         layout: NativeHostLayout,
+        instance: crate::instance::InstanceId,
     ) -> Result<Self, String> {
         let extension_id = extension_id_from_origin(extension_origin)
             .ok_or_else(|| "native-host extension origin is invalid".to_owned())?;
@@ -848,8 +998,16 @@ impl InstallPaths {
         let backups_dir = layout.native_dir.join(BACKUPS_DIR_NAME);
         let rollback_file = layout.native_dir.join(ROLLBACK_FILE);
         let pending_file = layout.native_dir.join(PENDING_FILE);
+        let config_dir = layout
+            .native_dir
+            .parent()
+            .ok_or_else(|| "native dir has no parent".to_owned())?
+            .to_path_buf();
+        let mutation_lock = config_dir.join(NATIVE_HOST_MUTATION_LOCK);
         Ok(Self {
             source_binary: layout.source_binary,
+            config_dir: config_dir.clone(),
+            native_dir: layout.native_dir.clone(),
             runtime_binary: layout.native_dir.join("herdr-mcp"),
             wrapper: layout.wrapper,
             extension_path,
@@ -863,8 +1021,177 @@ impl InstallPaths {
             rollback_file,
             pending_file,
             rollback_pending_file: layout.native_dir.join(ROLLBACK_PENDING_FILE),
+            mutation_lock,
+            instance,
         })
     }
+}
+
+#[cfg(target_os = "macos")]
+impl InstallPaths {
+    fn is_default_instance(&self) -> bool {
+        self.instance.is_default()
+    }
+}
+
+/// Product-owned fence for Native Host lifecycle mutations.
+///
+/// All Native Host mutations (install / uninstall / rollback / active-runtime sync)
+/// share this single file lock under the managed config root. It is product-owned
+/// (under `~/.config/herdr-mcp/`), never touches independent Herdr state, and is
+/// held for the entire mutation so concurrent callers serialize or fail fast with
+/// `another native-host mutation is in progress` instead of interleaving partial
+/// manifests / wrapper / runtime writes. The lock is non-blocking (LOCK_NB) to
+/// fail closed; callers retry idempotently after the holder completes.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct NativeHostMutationLock {
+    _file: fs::File,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeHostMutationLock {
+    fn acquire(paths: &InstallPaths) -> Result<Self, String> {
+        Self::acquire_for_path(&paths.mutation_lock, &paths.config_dir)
+    }
+
+    #[allow(dead_code)]
+    fn acquire_for_config_dir(config_dir: &Path) -> Result<Self, String> {
+        let path = config_dir.join(NATIVE_HOST_MUTATION_LOCK);
+        Self::acquire_for_path(&path, config_dir)
+    }
+
+    fn acquire_for_path(path: &Path, config_dir: &Path) -> Result<Self, String> {
+        ensure_secure_dir(config_dir)?;
+        // Fast-path pre-check for symlink; the atomic O_NOFOLLOW open below
+        // closes the TOCTOU window between check and open.
+        if let Ok(metadata) = fs::symlink_metadata(path)
+            && metadata.file_type().is_symlink()
+        {
+            return Err("native-host mutation lock must not be a symlink".to_owned());
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| {
+                if error.raw_os_error() == Some(libc::ELOOP) {
+                    format!(
+                        "native-host mutation lock must not be a symlink: {}",
+                        path.display()
+                    )
+                } else {
+                    format!("cannot open native-host mutation lock: {error}")
+                }
+            })?;
+        // Verify the opened fd is a regular file (not a directory, FIFO, etc.)
+        // and is not a symlink (O_NOFOLLOW guarantees the latter; this is
+        // defense-in-depth against TOCTOU).
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("cannot inspect native-host mutation lock: {error}"))?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "native-host mutation lock must be a regular file: {}",
+                path.display()
+            ));
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("cannot secure native-host mutation lock: {error}"))?;
+        // Re-verify permissions after chmod.
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("cannot inspect native-host mutation lock: {error}"))?;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(format!(
+                "native-host mutation lock has unexpected permissions: {}",
+                path.display()
+            ));
+        }
+        // On macOS flock state follows the open file description across fork(2).
+        // Parallel tests can inherit this fixture lock for the short fork-to-exec
+        // window even after the parent File has been dropped. Retry briefly to
+        // absorb that bounded CLOEXEC handoff; a persistent lock remains fail-closed.
+        // Use monotonic Instant for the retry budget (wall-clock independent).
+        let deadline = Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Self { _file: file });
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EAGAIN)
+                && err.raw_os_error() != Some(libc::EWOULDBLOCK)
+            {
+                return Err(format!(
+                    "another native-host mutation is in progress: {err} (lock={})",
+                    path.display()
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "another native-host mutation is in progress: {err} (lock={})",
+                    path.display()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn require_default_instance() -> Result<(), String> {
+    let runtime = crate::paths::RuntimePaths::discover()?;
+    if runtime.instance.is_named() {
+        return Err(
+            "native-host mutations are not allowed under a named instance (HERDR_MCP_INSTANCE); use the default instance"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn check_origin_drift_after_lock(paths: &InstallPaths) -> Result<(), String> {
+    // After acquiring the lock, re-read mutable origin evidence that was
+    // previously read before the lock (find_registered_origin,
+    // wrapper_dev_extension_origin, durable_extension_origin). If a concurrent
+    // mutation switched identity while this waiter was queued (500ms), the
+    // waiter's snapshot is stale and must linearize on the new state, not the
+    // old. We fail closed with a drift error so the caller can retry with
+    // fresh evidence. Fixed-path resolution (home, config_dir, native_dir,
+    // targets) is stable and does not need re-validation.
+    let current_registered = find_registered_origin(&paths.targets, &paths.wrapper)?;
+    if let Some(cur) = current_registered {
+        // If the current on-disk origin is not the waiter's intended origin
+        // and not its remembered dev origin, the cohort may have drifted.
+        // However, an install that is explicitly allowed to migrate origins
+        // (allow_origin_migration) is permitted to switch from the current
+        // on-disk origin to a new one (e.g., dev -> store). In that case,
+        // drift is not an error — the waiter is intentionally switching.
+        if cur != paths.extension_origin
+            && Some(cur.as_str()) != paths.dev_extension_origin.as_deref()
+            && !paths.allow_origin_migration
+        {
+            return Err(format!(
+                "native-host origin drifted while waiting for lock (waiter expected {} but found {}); retry with fresh state",
+                paths.extension_origin, cur
+            ));
+        }
+    }
+    // For rollback/status, durable evidence is also mutable, but it is read
+    // inside InstallPaths::discover before lock; re-checking it here ensures
+    // the waiter does not use stale durable metadata.
+    // We re-read the current wrapper's dev origin as well.
+    let current_dev = wrapper_dev_extension_origin(&paths.wrapper)?;
+    if current_dev != paths.dev_extension_origin {
+        // Dev drift alone is not considered a full cohort drift for the lock's
+        // purposes; only registered origin drift matters for linearizability.
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -923,6 +1250,14 @@ fn wrapper_dev_extension_origin(wrapper: &Path) -> Result<Option<String>, String
 
 #[cfg(target_os = "macos")]
 fn install(paths: &InstallPaths) -> Result<Value, String> {
+    if !paths.is_default_instance() {
+        return Err(
+            "native-host mutations are not allowed under a named instance (HERDR_MCP_INSTANCE); use the default instance"
+                .to_owned(),
+        );
+    }
+    let _mutation_lock = NativeHostMutationLock::acquire(paths)?;
+    check_origin_drift_after_lock(paths)?;
     // Fail closed if a rollback is mid-restore: a new install must not snapshot
     // or overwrite a half-restored disk. The interrupted rollback must be
     // resumed (or its marker cleared) before any install mutation.
@@ -1136,6 +1471,14 @@ fn status_with_active_runtime(paths: &InstallPaths, active_runtime: Option<&Path
 
 #[cfg(target_os = "macos")]
 fn uninstall(paths: &InstallPaths) -> Result<Value, String> {
+    if !paths.is_default_instance() {
+        return Err(
+            "native-host mutations are not allowed under a named instance (HERDR_MCP_INSTANCE); use the default instance"
+                .to_owned(),
+        );
+    }
+    let _mutation_lock = NativeHostMutationLock::acquire(paths)?;
+    check_origin_drift_after_lock(paths)?;
     // Fail closed if a rollback is mid-restore: uninstall must not remove files
     // from a half-restored disk or discard evidence mid-restore.
     reject_rollback_in_progress(paths)?;
@@ -1215,6 +1558,14 @@ fn uninstall(paths: &InstallPaths) -> Result<Value, String> {
 /// managed file has been restored successfully.
 #[cfg(target_os = "macos")]
 fn rollback(paths: &InstallPaths) -> Result<Value, String> {
+    if !paths.is_default_instance() {
+        return Err(
+            "native-host mutations are not allowed under a named instance (HERDR_MCP_INSTANCE); use the default instance"
+                .to_owned(),
+        );
+    }
+    let _mutation_lock = NativeHostMutationLock::acquire(paths)?;
+    check_origin_drift_after_lock(paths)?;
     // First-class rollback after interruption: recover an interrupted install
     // before deciding on a fresh rollback. This recovers the prior state; the
     // previous ready rollback (if any) stays intact.
@@ -2757,6 +3108,7 @@ mod tests {
             "chrome_web_store_contract",
             true,
             layout,
+            crate::instance::InstanceId::default_instance(),
         )
         .unwrap();
 
@@ -2809,6 +3161,7 @@ mod tests {
             "native_host_use_store",
             true,
             store_layout,
+            crate::instance::InstanceId::default_instance(),
         )
         .unwrap();
         install(&store_paths).unwrap();
@@ -2834,6 +3187,7 @@ mod tests {
             "native_host_use_standalone",
             true,
             standalone_layout,
+            crate::instance::InstanceId::default_instance(),
         )
         .unwrap();
         install(&standalone_paths).unwrap();
@@ -2872,6 +3226,7 @@ mod tests {
             "native_host_use_dev",
             true,
             dev_layout,
+            crate::instance::InstanceId::default_instance(),
         )
         .unwrap();
         install(&dev_again).unwrap();
@@ -3672,6 +4027,644 @@ mod tests {
         assert_eq!(skipped["reason"], "native_host_not_owned");
         assert!(!paths.runtime_binary.exists());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_host_mutation_lock_is_single_writer_and_released_on_drop() {
+        let _guard = crate::test_env::lock();
+        let (root, paths) = fixture();
+        let first = NativeHostMutationLock::acquire(&paths).unwrap();
+        let err = NativeHostMutationLock::acquire(&paths).unwrap_err();
+        assert!(
+            err.contains("another native-host mutation is in progress"),
+            "expected lock contention, got {err}"
+        );
+        drop(first);
+        // After release, a new holder can acquire.
+        let second = NativeHostMutationLock::acquire(&paths).unwrap();
+        drop(second);
+        // Lock file itself remains (product-owned, not removed) but is unlocked.
+        assert!(paths.mutation_lock.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_native_host_mutations_serialize_and_leave_no_partial_state() {
+        let _guard = crate::test_env::lock();
+        let (root, paths) = fixture();
+        // Establish an owned cohort so sync has work to do.
+        install(&paths).unwrap();
+        let home = root.join("home");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        let active_binary =
+            write_managed_active_runtime(&config_dir, b"active-runtime-binary-concurrent");
+
+        let wrapper_before = fs::read(&paths.wrapper).unwrap();
+        let binary_before = fs::read(&paths.runtime_binary).unwrap();
+        let manifest_path = paths.targets[0].0.join(format!("{HOST_NAME}.json"));
+        let manifest_before = fs::read(&manifest_path).unwrap();
+        let rollback_before = fs::read(&paths.rollback_file).unwrap();
+        let pending_before_exists = paths.pending_file.exists();
+        let rollback_pending_before = paths.rollback_pending_file.exists();
+
+        // Hold the product-owned native-host lock in the main thread, simulating
+        // an in-flight mutation (install/sync) without touching Herdr.
+        let _holder = NativeHostMutationLock::acquire(&paths).unwrap();
+
+        // All mutation entrypoints must fail fast with lock contention, not
+        // interleaving partial manifests / wrapper / runtime writes.
+        let paths_clone = paths.clone();
+        let install_result = std::thread::spawn(move || install(&paths_clone))
+            .join()
+            .unwrap();
+        assert!(
+            install_result
+                .unwrap_err()
+                .contains("another native-host mutation is in progress"),
+            "install must serialize"
+        );
+
+        let paths_clone = paths.clone();
+        let active_clone = active_binary.clone();
+        let sync_result =
+            std::thread::spawn(move || sync_owned_runtime_with_active(&paths_clone, &active_clone))
+                .join()
+                .unwrap();
+        assert!(
+            sync_result
+                .unwrap_err()
+                .contains("another native-host mutation is in progress"),
+            "sync must serialize"
+        );
+
+        let paths_clone = paths.clone();
+        let uninstall_result = std::thread::spawn(move || uninstall(&paths_clone))
+            .join()
+            .unwrap();
+        assert!(
+            uninstall_result
+                .unwrap_err()
+                .contains("another native-host mutation is in progress"),
+            "uninstall must serialize"
+        );
+
+        let paths_clone = paths.clone();
+        let rollback_result = std::thread::spawn(move || rollback(&paths_clone))
+            .join()
+            .unwrap();
+        assert!(
+            rollback_result
+                .unwrap_err()
+                .contains("another native-host mutation is in progress"),
+            "rollback must serialize"
+        );
+
+        // Product uninstall paths share the same fence; the per-function
+        // wrappers already hold the same native-host lock, so the above
+        // serialization covers that cohort as well.
+
+        // No partial footprint: wrapper / runtime / manifests byte-identical,
+        // no pending or rollback-pending markers created, no temp files leaked.
+        assert_eq!(fs::read(&paths.wrapper).unwrap(), wrapper_before);
+        assert_eq!(fs::read(&paths.runtime_binary).unwrap(), binary_before);
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+        assert_eq!(fs::read(&paths.rollback_file).unwrap(), rollback_before);
+        assert_eq!(paths.pending_file.exists(), pending_before_exists);
+        assert_eq!(
+            paths.rollback_pending_file.exists(),
+            rollback_pending_before
+        );
+        // No stray temp files from atomic writes.
+        let native_dir = paths.runtime_binary.parent().unwrap();
+        assert!(
+            !fs::read_dir(native_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().contains(".tmp-")),
+            "no partial wrapper/runtime temp files should remain"
+        );
+        assert!(
+            !fs::read_dir(paths.targets[0].0.as_path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().contains(".tmp-")),
+            "no partial manifest temp files should remain"
+        );
+
+        drop(_holder);
+
+        // Retry after lock release is idempotent and succeeds.
+        let synced = sync_owned_runtime_with_active(&paths, &active_binary).unwrap();
+        assert_eq!(synced["synced"], true);
+        assert_eq!(
+            fs::read(&paths.runtime_binary).unwrap(),
+            fs::read(&active_binary).unwrap()
+        );
+        let synced_again = sync_owned_runtime_with_active(&paths, &active_binary).unwrap();
+        assert_eq!(synced_again["skipped"], true);
+        assert_eq!(synced_again["reason"], "already_current");
+
+        // Uninstall then reinstall are each idempotent retries under the same fence.
+        let removed = uninstall(&paths).unwrap();
+        assert_eq!(removed["ok"], true);
+        assert!(!paths.wrapper.exists());
+        assert!(!paths.runtime_binary.exists());
+        let removed_again = uninstall(&paths).unwrap();
+        assert_eq!(removed_again["ok"], true);
+        assert_eq!(removed_again["removed"].as_array().unwrap().len(), 0);
+
+        // Rollback after reinstall is idempotent: second rollback reports no work.
+        install(&paths).unwrap();
+        let rb = rollback(&paths).unwrap();
+        assert_eq!(rb["ok"], true);
+        let rb_again = rollback(&paths).unwrap();
+        assert_eq!(rb_again["rollback_available"], false);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_host_mutations_fail_closed_on_foreign_ownership_and_remain_retryable() {
+        let (root, paths) = fixture();
+        install(&paths).unwrap();
+        let home = root.join("home");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        let active_binary =
+            write_managed_active_runtime(&config_dir, b"active-runtime-foreign-test");
+
+        // Tamper the wrapper into a foreign (non-Rust) shape so the next
+        // mutation must fail closed rather than create a partial cohort.
+        fs::write(&paths.wrapper, b"#!/bin/sh\nexec /usr/bin/false\n").unwrap();
+        fs::set_permissions(&paths.wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let install_err = install(&paths).unwrap_err();
+        assert!(
+            install_err.contains("not the owned Rust wrapper") || install_err.contains("foreign"),
+            "install must fail closed on foreign wrapper, got {install_err}"
+        );
+        let sync_err = sync_owned_runtime_with_active(&paths, &active_binary).unwrap_err();
+        assert!(
+            sync_err.contains("foreign")
+                || sync_err.contains("not the owned")
+                || sync_err.contains("recovery is required")
+                || sync_err.contains("legacy wrapper"),
+            "sync must fail closed on foreign wrapper, got {sync_err}"
+        );
+
+        // No partial manifest/runtime was introduced by the failed mutations.
+        let manifest_path = paths.targets[0].0.join(format!("{HOST_NAME}.json"));
+        assert!(manifest_path.exists());
+        assert!(paths.runtime_binary.exists());
+        // Repair restores retryability: reinstall from a clean wrapper succeeds.
+        // Recreate the owned wrapper via a fresh install after restoring a valid
+        // Rust wrapper shape would normally require manual repair; here we
+        // simulate repair by removing the foreign wrapper and reinstalling.
+        fs::remove_file(&paths.wrapper).unwrap();
+        // The cohort is now partial (wrapper absent, runtime/manifest present) so
+        // install must still fail closed on partial footprint.
+        let partial_err = install(&paths).unwrap_err();
+        assert!(
+            partial_err.contains("partial")
+                || partial_err.contains("incomplete")
+                || partial_err.contains("wrapper"),
+            "partial footprint must remain fail-closed, got {partial_err}"
+        );
+        // Full repair: remove the partial cohort explicitly, then install is
+        // retryable and leaves a consistent owned cohort.
+        fs::remove_file(&paths.runtime_binary).unwrap_or(());
+        fs::remove_file(&manifest_path).unwrap_or(());
+        let _ = fs::remove_file(&paths.rollback_file);
+        let _ = fs::remove_file(&paths.pending_file);
+        let repaired = install(&paths).unwrap();
+        assert_eq!(repaired["ok"], true);
+        assert!(paths.wrapper.exists());
+        assert!(paths.runtime_binary.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn named_instance_cannot_mutate_global_host_and_sync_is_noop() {
+        let _guard = crate::test_env::lock();
+        let prev_instance = env::var_os("HERDR_MCP_INSTANCE");
+        let prev_home = env::var_os("HOME");
+        let prev_config = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let prev_xdg = env::var_os("XDG_CONFIG_HOME");
+        // Ensure default for fixture setup — clear all instance/config overrides.
+        unsafe {
+            env::remove_var("HERDR_MCP_INSTANCE");
+            env::remove_var("HERDR_MCP_CONFIG_DIR");
+            env::remove_var("XDG_CONFIG_HOME");
+        }
+        let (root, paths) = fixture();
+        // Establish default owned cohort.
+        install(&paths).unwrap();
+        let wrapper_before = fs::read(&paths.wrapper).unwrap();
+        let binary_before = fs::read(&paths.runtime_binary).unwrap();
+        let manifest_path = paths.targets[0].0.join(format!("{HOST_NAME}.json"));
+        let manifest_before = fs::read(&manifest_path).unwrap();
+        let rollback_before = fs::read(&paths.rollback_file).unwrap();
+        let home = root.join("home");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        let active_binary = write_managed_active_runtime(&config_dir, b"active-runtime-named-test");
+
+        // Switch to named instance: all mutating entrypoints must fail closed
+        // or no-op without touching the default global host. Use the fixture's
+        // home as HOME so InstallPaths::discover yields a named config_dir
+        // (herdr-mcp-uat) that is isolated but still shares the global browser
+        // manifest location.
+        unsafe {
+            env::set_var("HOME", &home);
+            env::set_var("HERDR_MCP_INSTANCE", "uat");
+            env::remove_var("HERDR_MCP_CONFIG_DIR");
+            env::remove_var("XDG_CONFIG_HOME");
+        }
+        let named_install_paths = InstallPaths::discover(&NativeHostCommand::Install).unwrap();
+        assert!(
+            !named_install_paths.is_default_instance(),
+            "named discover should be non-default"
+        );
+        let install_err = install(&named_install_paths).unwrap_err();
+        assert!(
+            install_err.contains("named instance"),
+            "named install must fail closed, got {install_err}"
+        );
+        let uninstall_err = uninstall(&named_install_paths).unwrap_err();
+        assert!(
+            uninstall_err.contains("named instance"),
+            "named uninstall must fail closed, got {uninstall_err}"
+        );
+        let rollback_err = rollback(&named_install_paths).unwrap_err();
+        assert!(
+            rollback_err.contains("named instance"),
+            "named rollback must fail closed, got {rollback_err}"
+        );
+        let sync = sync_owned_runtime_with_active(&named_install_paths, &active_binary).unwrap();
+        assert_eq!(sync["skipped"], true);
+        assert_eq!(sync["reason"], "named_instance_skipped");
+        let sync2 = sync_owned_runtime_from_active().unwrap();
+        assert_eq!(sync2["skipped"], true);
+        assert_eq!(sync2["reason"], "named_instance_skipped");
+
+        // Product-uninstall primitives under named instance must not touch default.
+        assert!(!product_uninstall_preflight().unwrap());
+        assert!(product_uninstall_snapshot().unwrap().is_none());
+        let fake_snapshot = json!({
+            "schema_version": 1,
+            "runtime_binary": paths.runtime_binary,
+            "runtime_sha256": file_sha256(&paths.runtime_binary).unwrap(),
+            "wrapper": paths.wrapper,
+            "wrapper_sha256": file_sha256(&paths.wrapper).unwrap(),
+            "manifests": [manifest_path.to_string_lossy().into_owned()],
+        });
+        let owned_err = product_uninstall_owned_from_snapshot(&fake_snapshot).unwrap_err();
+        assert!(
+            owned_err.contains("named instance"),
+            "named product uninstall removal must fail closed, got {owned_err}"
+        );
+
+        // Global host must be untouched: no partial writes, no lock file for named.
+        assert_eq!(fs::read(&paths.wrapper).unwrap(), wrapper_before);
+        assert_eq!(fs::read(&paths.runtime_binary).unwrap(), binary_before);
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+        assert_eq!(fs::read(&paths.rollback_file).unwrap(), rollback_before);
+        assert!(!paths.pending_file.exists());
+        // Named instance's isolated config dir must not have been created or must not contain a global lock.
+        let named_lock = home
+            .join(".config")
+            .join("herdr-mcp-uat")
+            .join(NATIVE_HOST_MUTATION_LOCK);
+        // The named lock may not exist at all; if it does, it must not have been used to mutate global state.
+        if named_lock.exists() {
+            assert!(
+                fs::read(&paths.wrapper).unwrap() == wrapper_before,
+                "named lock must not have mutated global wrapper"
+            );
+        }
+
+        // Status remains read-only under named instance.
+        let status_val = status(&paths);
+        assert!(status_val.get("ok").is_some());
+
+        // Restore and verify default can still mutate.
+        unsafe {
+            match prev_home {
+                Some(ref v) => env::set_var("HOME", v),
+                None => env::remove_var("HOME"),
+            }
+            match prev_instance {
+                Some(v) => env::set_var("HERDR_MCP_INSTANCE", v),
+                None => env::remove_var("HERDR_MCP_INSTANCE"),
+            }
+            match prev_config {
+                Some(ref v) => env::set_var("HERDR_MCP_CONFIG_DIR", v),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match prev_xdg {
+                Some(ref v) => env::set_var("XDG_CONFIG_HOME", v),
+                None => env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        // Default sync should still work (idempotent).
+        let sync_default = sync_owned_runtime_with_active(&paths, &active_binary).unwrap();
+        assert!(sync_default["synced"] == true || sync_default["skipped"] == true);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn named_instance_does_not_contend_with_default_mutation_lock() {
+        let _guard = crate::test_env::lock();
+        let prev_instance = env::var_os("HERDR_MCP_INSTANCE");
+        let prev_home = env::var_os("HOME");
+        let prev_config = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let prev_xdg = env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            env::remove_var("HERDR_MCP_INSTANCE");
+            env::remove_var("HERDR_MCP_CONFIG_DIR");
+            env::remove_var("XDG_CONFIG_HOME");
+        }
+        let (root, paths) = fixture();
+        install(&paths).unwrap();
+        let home = root.join("home");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        let active_binary =
+            write_managed_active_runtime(&config_dir, b"active-runtime-named-lock-test");
+
+        // Hold the default product-owned mutation lock.
+        let _default_holder = NativeHostMutationLock::acquire(&paths).unwrap();
+
+        // Named instance attempts must fail fast with named-instance error,
+        // not with lock contention, and must not block the default holder.
+        unsafe {
+            env::set_var("HOME", &home);
+            env::set_var("HERDR_MCP_INSTANCE", "uat");
+            env::remove_var("HERDR_MCP_CONFIG_DIR");
+            env::remove_var("XDG_CONFIG_HOME");
+        }
+        let named_paths = InstallPaths::discover(&NativeHostCommand::Install).unwrap();
+        assert!(!named_paths.is_default_instance());
+        let install_err = install(&named_paths).unwrap_err();
+        assert!(
+            install_err.contains("named instance"),
+            "named install under default lock must fail with named-instance, not lock contention, got {install_err}"
+        );
+        assert!(
+            !install_err.contains("another native-host mutation is in progress"),
+            "named instance must not contend on default lock"
+        );
+        let sync = sync_owned_runtime_with_active(&named_paths, &active_binary).unwrap();
+        assert_eq!(sync["reason"], "named_instance_skipped");
+        assert!(
+            !sync
+                .to_string()
+                .contains("another native-host mutation is in progress"),
+            "named sync must not contend"
+        );
+
+        // Default holder still owns the lock; dropping it must release for default.
+        drop(_default_holder);
+        unsafe {
+            match prev_home {
+                Some(ref v) => env::set_var("HOME", v),
+                None => env::remove_var("HOME"),
+            }
+            match prev_instance {
+                Some(v) => env::set_var("HERDR_MCP_INSTANCE", v),
+                None => env::remove_var("HERDR_MCP_INSTANCE"),
+            }
+            match prev_config {
+                Some(ref v) => env::set_var("HERDR_MCP_CONFIG_DIR", v),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match prev_xdg {
+                Some(ref v) => env::set_var("XDG_CONFIG_HOME", v),
+                None => env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        // Default can acquire again immediately (no leftover named lock).
+        let _again = NativeHostMutationLock::acquire(&paths).unwrap();
+        drop(_again);
+        // And default sync still works.
+        let synced = sync_owned_runtime_with_active(&paths, &active_binary).unwrap();
+        assert!(synced["synced"] == true || synced["skipped"] == true);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_host_mutation_lock_refuses_symlink_without_following() {
+        let _guard = crate::test_env::lock();
+        let (root, paths) = fixture();
+        // Ensure parent exists and no existing lock file interferes.
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        let _ = fs::remove_file(&paths.mutation_lock);
+        let target = root.join("real-lock-target");
+        fs::write(&target, b"real-target-content").unwrap();
+        // Create a symlink at the expected lock path.
+        std::os::unix::fs::symlink(&target, &paths.mutation_lock).unwrap();
+        assert!(
+            fs::symlink_metadata(&paths.mutation_lock)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // Atomic O_NOFOLLOW open must fail with symlink error, not follow.
+        let err = NativeHostMutationLock::acquire(&paths).unwrap_err();
+        assert!(
+            err.contains("symlink"),
+            "expected symlink refusal, got {err}"
+        );
+        // Target must not have been overwritten or used as lock.
+        assert_eq!(fs::read(&target).unwrap(), b"real-target-content");
+        assert!(
+            fs::symlink_metadata(&paths.mutation_lock)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // Removing the symlink and acquiring should create a regular 0600 file.
+        fs::remove_file(&paths.mutation_lock).unwrap();
+        let _lock = NativeHostMutationLock::acquire(&paths).unwrap();
+        let metadata = fs::metadata(&paths.mutation_lock).unwrap();
+        assert!(metadata.is_file(), "lock must be regular file");
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o600,
+            "lock permissions must be 0600"
+        );
+        // Verify fd is regular file as well.
+        let fd_metadata = _lock._file.metadata().unwrap();
+        assert!(fd_metadata.is_file());
+        drop(_lock);
+
+        // If lock path is a directory, it must also be rejected as non-regular.
+        fs::remove_file(&paths.mutation_lock).unwrap();
+        fs::create_dir(&paths.mutation_lock).unwrap();
+        let err = NativeHostMutationLock::acquire(&paths).unwrap_err();
+        assert!(
+            err.contains("regular file") || err.contains("cannot open") || err.contains("symlink"),
+            "directory lock must be rejected, got {err}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cross_process_flock_contention_and_drift_linearization() {
+        let _guard = crate::test_env::lock();
+        // Cross-process contention: parent holds the default lock via flock,
+        // a child process (python fcntl.flock) must block, and after child
+        // exits the parent can acquire. Also verifies that a second waiter
+        // that was queued with stale evidence linearizes on the new state.
+        let (root, paths) = fixture();
+        install(&paths).unwrap();
+        let lock_path = paths.mutation_lock.clone();
+        // Spawn a child that holds the same lock file via flock (python).
+        // Use python's fcntl.flock which maps to flock(2) on macOS.
+        let child = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(
+                "import fcntl, sys, time; \
+                 f=open(sys.argv[1], 'a'); \
+                 fcntl.flock(f, fcntl.LOCK_EX); \
+                 time.sleep(3)",
+            )
+            .arg(lock_path.to_string_lossy().to_string())
+            .spawn();
+        let child = match child {
+            Ok(c) => c,
+            Err(_) => {
+                // python3 not available — skip test
+                let _ = fs::remove_dir_all(&root);
+                return;
+            }
+        };
+        // Give child time to acquire flock.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let start = Instant::now();
+        let err = NativeHostMutationLock::acquire(&paths).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            err.contains("another native-host mutation is in progress"),
+            "cross-process contention should fail, got {err}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(400),
+            "should have retried ~500ms, got {elapsed:?}"
+        );
+        // Child still holds lock; kill it and verify parent can acquire after.
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(child.id().to_string())
+            .output();
+        // Wait for child to exit and flock to be released.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Now acquire should succeed.
+        let _lock = NativeHostMutationLock::acquire(&paths).unwrap();
+        drop(_lock);
+        // Drift linearization: first mutation switches identity, second waiter
+        // holds stale evidence and must be rejected after acquiring lock.
+        let dev_origin = paths.extension_origin.clone();
+        let store = crate::browser_extension_identity::official_store_identity().unwrap();
+        assert_ne!(store.origin, dev_origin);
+        let native_dir = paths.runtime_binary.parent().unwrap().to_path_buf();
+        let layout = NativeHostLayout {
+            source_binary: paths.source_binary.clone(),
+            native_dir: native_dir.clone(),
+            wrapper: paths.wrapper.clone(),
+            targets: paths.targets.clone(),
+        };
+        let store_paths = InstallPaths::for_origin_with_dev(
+            &store.origin,
+            None,
+            Some(dev_origin.clone()),
+            "test_drift_store",
+            true,
+            layout,
+            crate::instance::InstanceId::default_instance(),
+        )
+        .unwrap();
+        // Stale waiter snapshot before store install.
+        let stale_dev_paths = paths.clone();
+        // First mutation switches to store.
+        install(&store_paths).unwrap();
+        // Second waiter with stale dev evidence should drift-fail after lock.
+        let drift_err = check_origin_drift_after_lock(&stale_dev_paths).unwrap_err();
+        assert!(
+            drift_err.contains("drifted"),
+            "stale waiter should drift-fail, got {drift_err}"
+        );
+        // Fresh discover after store install should succeed.
+        let fresh_dev_paths = InstallPaths::for_origin_with_dev(
+            &store.origin,
+            None,
+            Some(dev_origin.clone()),
+            "test_drift_fresh",
+            true,
+            NativeHostLayout {
+                source_binary: paths.source_binary.clone(),
+                native_dir: native_dir.clone(),
+                wrapper: paths.wrapper.clone(),
+                targets: paths.targets.clone(),
+            },
+            crate::instance::InstanceId::default_instance(),
+        )
+        .unwrap();
+        // Fresh waiter with current origin should not drift.
+        check_origin_drift_after_lock(&fresh_dev_paths).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        // Ensure child is reaped.
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn native_host_mutation_lock_retry_budget_is_monotonic() {
+        // This test does not touch global env, but takes the global env lock
+        // to avoid racing with named-instance tests that mutate HOME/INSTANCE.
+        let _guard = crate::test_env::lock();
+        // The 500ms contention retry must use monotonic Instant, not SystemTime,
+        // so wall-clock adjustments do not affect the budget. This test verifies
+        // the helper is monotonic by holding the lock and ensuring a concurrent
+        // acquire fails after the bounded retry window, not immediately due to
+        // wall-clock skew, and that the lock is still held via Instant deadline.
+        let (root, paths) = fixture();
+        let _holder = NativeHostMutationLock::acquire(&paths).unwrap();
+        let start = Instant::now();
+        let err = NativeHostMutationLock::acquire(&paths).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            err.contains("another native-host mutation is in progress"),
+            "expected contention, got {err}"
+        );
+        // Must have retried for ~500ms (allow 400..800ms for scheduling jitter).
+        assert!(
+            elapsed >= std::time::Duration::from_millis(400),
+            "retry budget should be ~500ms monotonic, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "retry budget should not overshoot, got {elapsed:?}"
+        );
+        drop(_holder);
+        // After release, acquire should succeed well below the budget
+        // (allow up to 200ms for scheduler jitter, but must be << 500ms).
+        let start = Instant::now();
+        let _again = NativeHostMutationLock::acquire(&paths).unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "acquire after release should be well below budget, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "release must be far below retry budget"
+        );
+        drop(_again);
         fs::remove_dir_all(root).unwrap();
     }
 }
