@@ -7,7 +7,7 @@ import {
 const $ = (id) => document.getElementById(id);
 const KEYS = [
   "herdrMcpUrl", "wakeTemplate", "progressTickSec", "progressFallbackSec",
-  "progressTemplate", "automationMode", "enabled",
+  "progressTemplate", "manualContinueMessage", "automationMode", "enabled",
   "idleNudgeEnabled", "llmJudgeBaseUrl", "llmJudgeApiKey", "llmJudgeModel",
   "llmJudgePromptTemplate", "llmJudgeSkipKeywords",
   "experimentalZAiEnabled", "experimentalDeepSeekEnabled",
@@ -79,6 +79,8 @@ function applyI18n() {
   $("hint_url").textContent = t("hint_url");
   $("lab_wake").textContent = t("label_wake_template");
   $("hint_wake").textContent = t("hint_wake_template");
+  $("lab_manual_continue").textContent = t("label_manual_continue_message");
+  $("hint_manual_continue").textContent = t("hint_manual_continue_message");
   $("lab_tick").textContent = t("label_tick");
   $("hint_tick").textContent = t("hint_tick");
   $("lab_fallback").textContent = t("label_fallback");
@@ -126,6 +128,9 @@ async function loadForm() {
   $("progressTickSec").value = cfg.progressTickSec ?? 60;
   $("progressFallbackSec").value = cfg.progressFallbackSec ?? 1200;
   $("progressTemplate").value = cfg.progressTemplate || t("default_progress_template");
+  $("manualContinueMessage").value = (cfg.manualContinueMessage && String(cfg.manualContinueMessage).trim())
+    ? cfg.manualContinueMessage
+    : t("manual_continue_message");
   $("llmJudgeBaseUrl").value = cfg.llmJudgeBaseUrl || "";
   $("llmJudgeApiKey").value = cfg.llmJudgeApiKey || "";
   $("llmJudgeModel").value = cfg.llmJudgeModel || "";
@@ -180,6 +185,7 @@ $("save").addEventListener("click", async () => {
     progressTickSec: parseTickSec($("progressTickSec").value, 60),
     progressFallbackSec: parseTickSec($("progressFallbackSec").value, 1200),
     progressTemplate: $("progressTemplate").value,
+    manualContinueMessage: $("manualContinueMessage").value.trim() || t("manual_continue_message"),
     automationMode: $("automationMode").checked ? "project_auto" : "manual",
     llmJudgeBaseUrl: $("llmJudgeBaseUrl").value.trim(),
     llmJudgeApiKey: $("llmJudgeApiKey").value.trim(),
@@ -212,6 +218,7 @@ $("save").addEventListener("click", async () => {
   await removeHostPermissions(staleOrigins);
   loadedHostPermissionOrigins = nextPermissionOrigins;
   setStatus(`✓ ${t("saved")}`, "ok");
+  $("manualContinueMessage").value = config.manualContinueMessage;
   $("llmJudgePromptTemplate").value = config.llmJudgePromptTemplate;
   $("llmJudgeSkipKeywords").value = config.llmJudgeSkipKeywords;
 });
