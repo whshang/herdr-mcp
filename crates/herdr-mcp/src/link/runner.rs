@@ -530,17 +530,20 @@ impl<T: LinkRuntimeTransport> LinkRunnerCore<T> {
                 retryable,
                 message,
                 details,
-            } => RelayMessage::ToolError(build_tool_error_message(
-                self.config.workstation_id.clone(),
-                request_id,
-                code,
-                retryable,
-                message,
-                details,
-                Some(DeliveryState::Delivered),
-                number(now_ms),
-                Some(serving_generation),
-            )),
+            } => {
+                let delivery_state = runtime_failure_delivery_state(&code);
+                RelayMessage::ToolError(build_tool_error_message(
+                    self.config.workstation_id.clone(),
+                    request_id,
+                    code,
+                    retryable,
+                    message,
+                    details,
+                    Some(delivery_state),
+                    number(now_ms),
+                    Some(serving_generation),
+                ))
+            }
         }
     }
 
@@ -573,19 +576,52 @@ fn number(value: i64) -> Number {
     Number::from(value.max(0))
 }
 
+fn runtime_failure_delivery_state(code: &str) -> DeliveryState {
+    match code {
+        "runtime_generation_superseded_before_dispatch"
+        | "runtime_generation_dispatch_rejected"
+        | "generation_not_found" => DeliveryState::NotDelivered,
+        _ => DeliveryState::Delivered,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
     use serde_json::{Map, Number, json};
 
-    use super::{LinkRunnerCore, RunnerConfig};
+    use super::{LinkRunnerCore, RunnerConfig, runtime_failure_delivery_state};
     use crate::link::local_mcp::{LinkRuntimeTransport, RuntimeHealth, RuntimeToolResult};
     use crate::link::request_core::RuntimeRequest;
     use crate::relay::protocol::{
         CancelMessage, DeliveryState, OptionalNullable, RelayEnvelope, RelayMessage,
         RuntimeContractInfo, StatusFields, StatusMessage, ToolRequestMessage,
     };
+
+    #[test]
+    fn predispatch_runtime_failures_are_not_marked_delivered() {
+        assert_eq!(
+            runtime_failure_delivery_state("runtime_generation_superseded_before_dispatch"),
+            DeliveryState::NotDelivered
+        );
+        assert_eq!(
+            runtime_failure_delivery_state("runtime_generation_dispatch_rejected"),
+            DeliveryState::NotDelivered
+        );
+        assert_eq!(
+            runtime_failure_delivery_state("generation_not_found"),
+            DeliveryState::NotDelivered
+        );
+        assert_eq!(
+            runtime_failure_delivery_state("local_mcp_runtime_generation_mismatch"),
+            DeliveryState::Delivered
+        );
+        assert_eq!(
+            runtime_failure_delivery_state("runtime_generation_completion_rejected"),
+            DeliveryState::Delivered
+        );
+    }
 
     struct MockRuntime {
         generation: Mutex<Option<String>>,

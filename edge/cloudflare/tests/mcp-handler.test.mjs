@@ -104,6 +104,72 @@ test("tools/call forwards only frozen tools with epoch/hash and preserves id", a
   assert.equal(d.calls[0].deadlineMs, 31_000);
 });
 
+test("read-only call retries once after generation supersede proved not delivered", async () => {
+  let forwards = 0;
+  const d = deps({
+    forward: async () => {
+      forwards += 1;
+      if (forwards === 1) {
+        return new Response(JSON.stringify({
+          status: "ok",
+          completion: {
+            status: "error",
+            error: {
+              ok: false,
+              code: "runtime_generation_superseded_before_dispatch",
+              retryable: true,
+              delivery_state: "not_delivered",
+              message: "runtime/current changed before dispatch",
+            },
+          },
+        }));
+      }
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: { status: "ok", result: { served: true, generation: "new" } },
+      }));
+    },
+  });
+
+  const r = await handleMcp(req(701, "tools/call", { name: "herdr_inspect", arguments: {} }), "w1", d.value);
+  assert.equal(r.body.result.isError, undefined);
+  assert.equal(r.body.result.structuredContent.served, true);
+  assert.equal(r.body.result.structuredContent.generation, "new");
+  assert.equal(d.calls.length, 2);
+  assert.notEqual(d.calls[0].requestId, d.calls[1].requestId);
+  assert.equal(d.calls[0].op, "herdr_inspect");
+  assert.equal(d.calls[1].op, "herdr_inspect");
+  assert.equal(d.calls[0].deadlineMs, d.calls[1].deadlineMs);
+});
+
+test("mutating call never retries generation supersede even when not delivered", async () => {
+  const d = deps({
+    forward: async () => new Response(JSON.stringify({
+      status: "ok",
+      completion: {
+        status: "error",
+        error: {
+          ok: false,
+          code: "runtime_generation_superseded_before_dispatch",
+          retryable: true,
+          delivery_state: "not_delivered",
+          message: "runtime/current changed before dispatch",
+        },
+      },
+    })),
+  });
+
+  const r = await handleMcp(
+    req(702, "tools/call", { name: "herdr_prompt", arguments: { target: "w1:p1", text: "test" } }),
+    "w1",
+    d.value,
+  );
+  assert.equal(r.body.result.isError, true);
+  assert.equal(r.body.result.structuredContent.code, "runtime_generation_superseded_before_dispatch");
+  assert.equal(r.body.result.structuredContent.delivery_state, "not_delivered");
+  assert.equal(d.calls.length, 1);
+});
+
 test("herdr_devices executes at Edge and never forwards to a workstation", async () => {
   const devices = [{ device_id: DEVICE_A, name: "macbook" }];
   const d = deps({ devices });
