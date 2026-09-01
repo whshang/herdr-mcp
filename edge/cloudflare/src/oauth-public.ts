@@ -19,9 +19,9 @@
  *    RS256 JWTs aud=resource, mirroring `src/oauth.ts` `issueTokens`.
  *  - Refresh rotation uses the DO's atomic `/internal/oauth/refresh/exchange`
  *    (consume + ownership check + new issue), never a fiddly two-step.
- *  - PKCE and ChatGPT private_key_jwt verification come from
- *    `oauth-token-crypto.ts` (zero-dep Web Crypto); JWKS fetching uses the
- *    injected `fetchFn` so tests never touch the network.
+ *  - Generic public-client CIMD metadata and ChatGPT private_key_jwt JWKS are
+ *    fetched through the injected `fetchFn`; PKCE and assertion verification
+ *    use `oauth-token-crypto.ts` (zero-dep Web Crypto).
  *  - No filesystem, no process env, no jose, no node:crypto — runs
  *    identically under Node tests and the Workers runtime.
  *
@@ -108,7 +108,7 @@ export interface OAuthPublicOptions {
   /** Exact production issuer/resource identity (see createOAuthIdentity). */
   identity: OAuthEdgeIdentity;
   store: OAuthPublicStore;
-  /** Injected JWKS fetch for ChatGPT CIMD assertions (default globalThis.fetch). */
+  /** Injected fetch for CIMD metadata + ChatGPT JWKS (default globalThis.fetch). */
   fetchFn?: typeof globalThis.fetch;
   /** Injectable clock, default Date.now. */
   nowMs?: () => number;
@@ -134,6 +134,7 @@ const DEFAULT_CODE_TTL_MS = 5 * 60_000;
 const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
 const DEFAULT_MAX_QUERY_BYTES = 16 * 1024;
 const DEFAULT_MAX_PARAM_BYTES = 4096;
+const DEFAULT_MAX_CIMD_BYTES = 64 * 1024;
 const JWT_BEARER = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
 // Route table (exact paths from src/oauth.ts).
@@ -317,28 +318,126 @@ function redirectUriAllowed(client: OAuthClientRecord, redirectUri: string): boo
   return false;
 }
 
-/**
- * Resolve a registered client, or a ChatGPT CIMD client_id (HTTPS URL on
- * chatgpt.com). CIMD clients are synthesized exactly like src/oauth.ts and are
- * validated against the chatgpt redirect allowlist, not the store.
- */
+function isSafeCimdClientId(clientId: string): boolean {
+  try {
+    const u = new URL(clientId);
+    if (u.protocol !== "https:" || u.username || u.password) return false;
+    if (u.port && u.port !== "443") return false;
+    const host = u.hostname.toLowerCase().replace(/\.$/, "");
+    if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) {
+      return false;
+    }
+    // Client metadata is an internet identity document. Reject IP literals so
+    // the authorization endpoint cannot be used as a private-network fetcher.
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.includes(":")) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isJsonContentType(contentType: string): boolean {
+  const mime = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  return mime === "application/json" || (mime.startsWith("application/") && mime.endsWith("+json"));
+}
+
+async function resolveCimdClient(
+  clientId: string,
+  fetchFn: typeof globalThis.fetch,
+  nowSec: number,
+  maxParamBytes: number,
+): Promise<OAuthClientRecord | null> {
+  if (!isSafeCimdClientId(clientId)) return null;
+  let response: Response;
+  try {
+    response = await fetchFn(clientId, {
+      method: "GET",
+      headers: { accept: "application/json, application/*+json" },
+      redirect: "error",
+    });
+  } catch {
+    return null;
+  }
+  if (response.status !== 200 || !isJsonContentType(response.headers.get("content-type") ?? "")) return null;
+  const declaredLength = Number(response.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declaredLength) && declaredLength > DEFAULT_MAX_CIMD_BYTES) return null;
+
+  let text: string;
+  try {
+    text = await response.text();
+  } catch {
+    return null;
+  }
+  if (enc.encode(text).byteLength > DEFAULT_MAX_CIMD_BYTES) return null;
+
+  let metadata: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    metadata = parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+
+  // CIMD requires exact string equality between the requested URL and the
+  // document's client_id. Shared-secret authentication is forbidden.
+  if (metadata.client_id !== clientId) return null;
+  if (metadata.client_secret !== undefined || metadata.client_secret_expires_at !== undefined) return null;
+  if (metadata.token_endpoint_auth_method !== "none") return null;
+
+  const redirects = metadata.redirect_uris;
+  if (!Array.isArray(redirects) || redirects.length === 0 || redirects.length > 32) return null;
+  const redirectUris: string[] = [];
+  for (const uri of redirects) {
+    if (typeof uri !== "string" || uri.length === 0 || uri.length > maxParamBytes) return null;
+    redirectUris.push(uri);
+  }
+
+  const grantsRaw = metadata.grant_types;
+  const grantTypes = Array.isArray(grantsRaw)
+    ? grantsRaw.filter((g): g is string => g === "authorization_code" || g === "refresh_token")
+    : ["authorization_code", "refresh_token"];
+  if (!grantTypes.includes("authorization_code")) return null;
+
+  return {
+    client_secret_hash: "",
+    redirect_uris: redirectUris,
+    token_endpoint_auth_method: "none",
+    grant_types: grantTypes,
+    scope: OAUTH_SCOPE,
+    ...(typeof metadata.client_name === "string" && metadata.client_name.length <= maxParamBytes
+      ? { client_name: metadata.client_name }
+      : {}),
+    issued_at: nowSec,
+  };
+}
+
+/** Resolve DCR clients plus URL-based Client ID Metadata Documents (CIMD). */
 async function resolveClient(
   clientId: string,
   store: OAuthPublicStore,
   nowSec: number,
+  fetchFn: typeof globalThis.fetch,
+  maxParamBytes: number,
 ): Promise<OAuthClientRecord | null> {
   const existing = await store.getClient(clientId);
   if (existing) return existing;
-  if (!isChatgptOAuthClientId(clientId)) return null;
-  return {
-    client_secret_hash: "",
-    redirect_uris: [],
-    token_endpoint_auth_method: "none",
-    grant_types: ["authorization_code", "refresh_token"],
-    scope: OAUTH_SCOPE,
-    client_name: "ChatGPT CIMD",
-    issued_at: nowSec,
-  };
+
+  // Preserve ChatGPT's established private_key_jwt flow without an extra
+  // metadata fetch; its redirect URI remains constrained by the allowlist.
+  if (isChatgptOAuthClientId(clientId)) {
+    return {
+      client_secret_hash: "",
+      redirect_uris: [],
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      scope: OAUTH_SCOPE,
+      client_name: "ChatGPT CIMD",
+      issued_at: nowSec,
+    };
+  }
+
+  return resolveCimdClient(clientId, fetchFn, nowSec, maxParamBytes);
 }
 
 async function authenticateClient(
@@ -486,7 +585,7 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
 
   const nowMs = ctx.nowMs();
   const nowSec = Math.floor(nowMs / 1000);
-  const client = await resolveClient(clientId, ctx.store, nowSec);
+  const client = await resolveClient(clientId, ctx.store, nowSec, ctx.fetchFn, ctx.maxParamBytes);
   if (!client) {
     // RFC 6749 §4.1.2.1: unknown client / unverifiable redirect_uri → no redirect.
     return ctx.json({ error: "invalid_request", error_description: "unknown client_id" }, 400);
@@ -596,7 +695,7 @@ async function handleToken(request: Request, ctx: HandlerCtx): Promise<Response>
   }
   const nowMs = ctx.nowMs();
   const nowSec = Math.floor(nowMs / 1000);
-  const client = clientId ? await resolveClient(clientId, ctx.store, nowSec) : null;
+  const client = clientId ? await resolveClient(clientId, ctx.store, nowSec, ctx.fetchFn, ctx.maxParamBytes) : null;
   if (!clientId || !client) {
     return tokenError(ctx, "invalid_client", "unknown client_id");
   }

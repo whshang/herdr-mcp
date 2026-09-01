@@ -28,13 +28,13 @@
  *    the previous refresh token is rejected on reuse.
  *  - `resource` is normalized (missing / base URL / base+"/mcp" all map to the
  *    canonical protected resource) and cross-checked at the token endpoint.
- *  - CIMD: `client_id_metadata_document_supported` + ChatGPT HTTPS client_ids;
- *    token endpoint accepts `none` and verifies `private_key_jwt` against the
- *    CIMD JWKS when a client_assertion is presented.
+ *  - CIMD: `client_id_metadata_document_supported` + HTTPS Client ID Metadata
+ *    Documents for public clients; ChatGPT keeps its existing private_key_jwt
+ *    verification path.
  *
- * Claude compatibility is retained: HERDR_MCP_TOKEN still validates as a
- * static Bearer credential on /mcp, and the DCR + PKCE + refresh flow is
- * exactly what Claude's connector already performs.
+ * Claude compatibility includes both the legacy DCR path and Claude.ai's
+ * URL-based CIMD + PKCE flow. HERDR_MCP_TOKEN remains a static Bearer
+ * credential on /mcp.
  */
 import { randomBytes, createHash, timingSafeEqual, generateKeyPairSync } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
@@ -69,6 +69,8 @@ const SCOPE = "mcp";
 const ACCESS_TOKEN_TTL_S = Number(process.env.HERDR_MCP_OAUTH_ACCESS_TTL_S ?? "86400");
 const REFRESH_TOKEN_TTL_S = Number(process.env.HERDR_MCP_OAUTH_REFRESH_TTL_S ?? "2592000"); // 30 days
 const CODE_TTL_MS = 5 * 60_000;
+const MAX_CIMD_BYTES = 64 * 1024;
+const MAX_CIMD_PARAM_BYTES = 4096;
 const PKCE_VERIFIER_RE = /^[A-Za-z0-9\-._~]{43,128}$/;
 
 // RS256 keypair for access-token JWTs (aud=resource). Generated once under OAUTH_DIR.
@@ -468,35 +470,115 @@ function isChatgptRedirectUri(uri: string): boolean {
   }
 }
 
-function isCimdClientId(clientId: string): boolean {
-  return /^https:\/\//i.test(clientId);
+function isSafeCimdClientId(clientId: string): boolean {
+  try {
+    const u = new URL(clientId);
+    if (u.protocol !== "https:" || u.username || u.password) return false;
+    if (u.port && u.port !== "443") return false;
+    const host = u.hostname.toLowerCase().replace(/\.$/, "");
+    if (
+      !host ||
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      host.endsWith(".local") ||
+      host.endsWith(".internal")
+    ) {
+      return false;
+    }
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.includes(":")) return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-/**
- * Resolve a DCR-registered client, or a ChatGPT CIMD client_id (HTTPS URL).
- * See https://developers.openai.com/plugins/build/auth.md — ChatGPT prefers CIMD
- * when client_id_metadata_document_supported is true.
- */
-function resolveClient(clientId: string): StoredClient | undefined {
-  const existing = clients.get(clientId);
-  if (existing) return existing;
-  if (!isCimdClientId(clientId)) return undefined;
-  let host = "";
+function isJsonContentType(contentType: string): boolean {
+  const mime = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  return mime === "application/json" || (mime.startsWith("application/") && mime.endsWith("+json"));
+}
+
+async function resolveCimdClient(clientId: string): Promise<StoredClient | undefined> {
+  if (!isSafeCimdClientId(clientId)) return undefined;
+  let response: globalThis.Response;
   try {
-    host = new URL(clientId).hostname.toLowerCase();
+    response = await fetch(clientId, {
+      method: "GET",
+      headers: { accept: "application/json, application/*+json" },
+      redirect: "error",
+    });
   } catch {
     return undefined;
   }
-  if (host !== "chatgpt.com" && host !== "www.chatgpt.com") return undefined;
+  if (response.status !== 200 || !isJsonContentType(response.headers.get("content-type") ?? "")) {
+    return undefined;
+  }
+  const declaredLength = Number(response.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_CIMD_BYTES) return undefined;
+
+  let text: string;
+  try {
+    text = await response.text();
+  } catch {
+    return undefined;
+  }
+  if (Buffer.byteLength(text, "utf8") > MAX_CIMD_BYTES) return undefined;
+
+  let metadata: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    metadata = parsed as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+
+  if (metadata.client_id !== clientId) return undefined;
+  if (metadata.client_secret !== undefined || metadata.client_secret_expires_at !== undefined) return undefined;
+  if (metadata.token_endpoint_auth_method !== "none") return undefined;
+
+  const redirects = metadata.redirect_uris;
+  if (!Array.isArray(redirects) || redirects.length === 0 || redirects.length > 32) return undefined;
+  const redirectUris: string[] = [];
+  for (const uri of redirects) {
+    if (typeof uri !== "string" || uri.length === 0 || uri.length > MAX_CIMD_PARAM_BYTES) return undefined;
+    redirectUris.push(uri);
+  }
+
+  const grantsRaw = metadata.grant_types;
+  const grantTypes = Array.isArray(grantsRaw)
+    ? grantsRaw.filter((g): g is string => g === "authorization_code" || g === "refresh_token")
+    : ["authorization_code", "refresh_token"];
+  if (!grantTypes.includes("authorization_code")) return undefined;
+
   return {
     client_secret_hash: "",
-    redirect_uris: [], // validated via isChatgptRedirectUri
+    redirect_uris: redirectUris,
     token_endpoint_auth_method: "none",
-    grant_types: ["authorization_code", "refresh_token"],
+    grant_types: grantTypes,
     scope: SCOPE,
-    client_name: "ChatGPT CIMD",
+    ...(typeof metadata.client_name === "string" && metadata.client_name.length <= MAX_CIMD_PARAM_BYTES
+      ? { client_name: metadata.client_name }
+      : {}),
     issued_at: Math.floor(Date.now() / 1000),
   };
+}
+
+/** Resolve DCR clients plus URL-based Client ID Metadata Documents (CIMD). */
+async function resolveClient(clientId: string): Promise<StoredClient | undefined> {
+  const existing = clients.get(clientId);
+  if (existing) return existing;
+  if (isChatgptOAuthClientId(clientId)) {
+    return {
+      client_secret_hash: "",
+      redirect_uris: [], // validated via isChatgptRedirectUri
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      scope: SCOPE,
+      client_name: "ChatGPT CIMD",
+      issued_at: Math.floor(Date.now() / 1000),
+    };
+  }
+  return resolveCimdClient(clientId);
 }
 
 function redirectUriAllowed(client: StoredClient, redirectUri: string): boolean {
@@ -614,7 +696,7 @@ async function handleRegister(req: Request, res: Response): Promise<void> {
  * client_id, a registered redirect_uri, and PKCE S256. RFC 9207 `iss` is
  * added to both success and error responses.
  */
-function handleAuthorize(req: Request, res: Response): void {
+async function handleAuthorize(req: Request, res: Response): Promise<void> {
   const q = req.query;
   const redirectUri = typeof q["redirect_uri"] === "string" ? q["redirect_uri"] : "";
   const state = typeof q["state"] === "string" ? q["state"] : "";
@@ -625,7 +707,7 @@ function handleAuthorize(req: Request, res: Response): void {
     typeof q["code_challenge_method"] === "string" ? q["code_challenge_method"] : "S256";
   const scope = typeof q["scope"] === "string" ? q["scope"] : "";
 
-  const client = resolveClient(clientId);
+  const client = await resolveClient(clientId);
   if (!client) {
     // RFC 6749 §4.1.2.1: unknown client / unverifiable redirect_uri → no redirect.
     res.status(400).json({ error: "invalid_request", error_description: "unknown client_id" });
@@ -711,7 +793,7 @@ async function handleToken(req: Request, res: Response): Promise<void> {
     tokenError(res, "invalid_target", `resource must be ${oauthIssuer()} or ${oauthResourceUrl()}`);
     return;
   }
-  const client = clientId ? resolveClient(clientId) : undefined;
+  const client = clientId ? await resolveClient(clientId) : undefined;
   if (!clientId || !client) {
     tokenError(res, "invalid_client", "unknown client_id");
     return;
@@ -730,7 +812,7 @@ async function handleToken(req: Request, res: Response): Promise<void> {
     }
     try {
       let jwksUrl: URL;
-      if (isCimdClientId(clientId)) {
+      if (isChatgptOAuthClientId(clientId)) {
         jwksUrl = new URL("/oauth/jwks.json", new URL(clientId).origin);
       } else {
         tokenError(res, "invalid_client", "client_assertion requires CIMD client_id");
