@@ -464,7 +464,7 @@ fn launchd_label_loaded(label: &str) -> bool {
     }
 }
 
-fn parse_launchd_environment_value(output: &str, key: &str) -> Option<String> {
+pub(crate) fn parse_launchd_environment_value(output: &str, key: &str) -> Option<String> {
     let prefix = format!("{key} =>");
     output.lines().find_map(|line| {
         let line = line.trim();
