@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.86";
+const H2W_CONTENT_VERSION = "0.1.87";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -3143,6 +3143,7 @@ const H2W_CONTENT_VERSION = "0.1.86";
   let hudCache = null;
   let hudEls = null;
   let hudActionBusy = false;
+  let lastAutoFeedbackKey = "";
   let nativeConversationTitle = "";
   let renderedHerdrTitle = "";
   let titleSnapshot = null;
@@ -3287,12 +3288,49 @@ const H2W_CONTENT_VERSION = "0.1.86";
     return text;
   }
 
+  function autoDecisionFeedback(last) {
+    const reason = String(last?.reason || "").trim();
+    const marker = {
+      llm_done: ["✓", "ok"],
+      llm_continue: ["→", "ok"],
+      llm_ambiguous: ["?", "warn"],
+      fallback_continue: ["→", "warn"],
+      fallback_complete: ["✓", "warn"],
+      wake_failed: ["!", "error"],
+      llm_timeout: ["!", "error"],
+      llm_http: ["!", "error"],
+      llm_network: ["!", "error"],
+      llm_permission: ["!", "error"],
+      llm_bad_response: ["!", "error"],
+    }[reason];
+    if (!marker) return null;
+    const result = hudText(`reason_${reason}`, null, reason);
+    const cause = String(last?.cause || "").trim();
+    const causeLabel = cause ? hudText(`reason_${cause}`, null, cause) : "";
+    const retry = reason === "llm_ambiguous" || reason === "wake_failed";
+    const message = retry
+      ? hudText("auto_result_retry", { result }, `Auto: ${result}; no message sent, will retry.`)
+      : causeLabel && cause !== reason
+        ? hudText("auto_result_with_cause", { result, cause: causeLabel }, `Auto: ${result} (${causeLabel})`)
+        : hudText("auto_result", { result }, `Auto: ${result}`);
+    const turnKey = String(last?.assistant_fp || last?.at || "");
+    return {
+      symbol: marker[0],
+      tone: marker[1],
+      reason,
+      message,
+      key: `${turnKey}:${reason}`,
+      at: Number(last?.at || 0),
+    };
+  }
+
   function hudLabelsReady(labels) {
     const required = [
       "web_state", "scope_binding_count", "scope_binding_hint", "scope_unbound",
       "manual_continue", "manual_status", "manual_judge", "handoff", "handoff_hint",
       "handoff_resume", "handoff_working", "handoff_starting", "handoff_started", "handoff_fallback", "handoff_failed", "handoff_llm_required",
       "automation_on", "automation_off", "aria_toggle_automation",
+      "auto_judging", "auto_result", "auto_result_retry", "auto_result_with_cause",
     ];
     return Boolean(
       labels
@@ -3457,6 +3495,8 @@ const H2W_CONTENT_VERSION = "0.1.86";
         }
         .quick.on { color: #166534; background: #f0fdf4; border-color: #bbf7d0; }
         .quick.off { color: #6b7280; background: #f5f5f5; }
+        .quick.decision-warn { color: #92400e; border-color: #f0c36d; }
+        .quick.decision-error { color: #991b1b; border-color: #e49a9a; }
         .manual.locked { opacity: .45; cursor: not-allowed; }
         .toast {
           position: fixed; z-index: 2147483646; left: 50%; bottom: 42px; transform: translateX(-50%);
@@ -3465,6 +3505,7 @@ const H2W_CONTENT_VERSION = "0.1.86";
           box-shadow: 0 4px 16px rgba(0,0,0,.12); font: 11px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
         }
         .toast.ok { border-color: #86d49f; }
+        .toast.warn { border-color: #f0c36d; color: #92400e; }
         .toast.err { border-color: #e49a9a; color: #991b1b; }
         @media (max-width: 820px) {
           .scope-counts { display: none; }
@@ -3479,7 +3520,10 @@ const H2W_CONTENT_VERSION = "0.1.86";
           .quick, .manual { background: #292929; border-color: #454545; }
           .quick.on { color: #bbf7d0; background: #1d5130; border-color: #5aa773; }
           .quick.off { color: #bbb; background: #292929; }
+          .quick.decision-warn { color: #fde68a; border-color: #a16207; }
+          .quick.decision-error { color: #fecaca; border-color: #7f1d1d; }
           .toast { color: #eee; background: rgba(30,30,30,.98); border-color: #555; }
+          .toast.warn { color: #fde68a; border-color: #a16207; }
           .toast.err { color: #fecaca; border-color: #7f1d1d; }
         }
       </style>
@@ -3659,14 +3703,30 @@ const H2W_CONTENT_VERSION = "0.1.86";
     syncHudManualButtons();
     ui.quick.hidden = !hud?.project_id
       && hud?.conversation_automation_available !== true;
-    ui.quick.textContent = preferenceEnabled ? hudText("automation_on", null, "Auto on") : hudText("automation_off", null, "Auto off");
-    ui.quick.className = `quick ${preferenceEnabled ? "on" : "off"}`;
+    const autoJudging = effectiveEnabled && hudPending;
+    const autoFeedback = effectiveEnabled && !autoJudging && !isTurnInProgress()
+      ? autoDecisionFeedback(hud?.last)
+      : null;
+    ui.quick.textContent = preferenceEnabled
+      ? `${hudText("automation_on", null, "Auto on")}${autoJudging ? " …" : (autoFeedback ? ` ${autoFeedback.symbol}` : "")}`
+      : hudText("automation_off", null, "Auto off");
+    ui.quick.className = `quick ${preferenceEnabled ? "on" : "off"}${autoFeedback ? ` decision-${autoFeedback.tone}` : ""}`;
     ui.quick.setAttribute("aria-pressed", String(preferenceEnabled));
     ui.quick.setAttribute("aria-label", hudText("aria_toggle_automation"));
     const conversationAutomation = hud?.conversation_automation_available === true && !hud?.project_id;
-    ui.quick.title = conversationAutomation
+    const autoHint = conversationAutomation
       ? (preferenceEnabled ? hudText("conversation_automation_on_hint") : hudText("conversation_automation_off_hint"))
       : (preferenceEnabled ? hudText("automation_on_hint") : hudText("automation_off_hint"));
+    const autoStatusHint = autoJudging
+      ? hudText("auto_judging", null, "Auto: deciding whether to continue…")
+      : autoFeedback?.message || "";
+    ui.quick.title = autoStatusHint ? `${autoHint}\n${autoStatusHint}` : autoHint;
+    if (autoFeedback?.key && autoFeedback.key !== lastAutoFeedbackKey) {
+      lastAutoFeedbackKey = autoFeedback.key;
+      if (!autoFeedback.at || Date.now() - autoFeedback.at <= 30_000) {
+        showHudToast(autoFeedback.message, autoFeedback.tone === "error" ? "err" : autoFeedback.tone);
+      }
+    }
     const visual = hudVisualClass(state);
     ui.bar.className = `bar${effectiveEnabled ? " automation-on" : ""}${visual ? ` ${visual}` : ""}`;
   }

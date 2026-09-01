@@ -42,7 +42,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.86";
+const H2W_SCRIPT_VERSION = "0.1.87";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
@@ -146,6 +146,7 @@ function hudLabels() {
     "automation_on_hint", "automation_off_hint", "conversation_automation_on_hint", "conversation_automation_off_hint",
     "aria_toggle_automation", "automation_enabled", "automation_disabled", "automation_update_failed",
     "judge_no_continue", "judge_turn_in_progress", "herdr_status_checked", "continue_sent", "continue_failed",
+    "auto_judging", "auto_result", "auto_result_retry", "auto_result_with_cause",
     "web_state", "scope_binding_count", "scope_binding_hint", "scope_unbound",
     "tip_state", "tip_recovery", "tip_last_event", "none",
     "reason_disabled", "reason_no_conv", "reason_llm_not_configured", "reason_fallback_continue", "reason_fallback_complete", "reason_unbound",
@@ -2311,7 +2312,7 @@ async function autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, c
   if (!shouldAutoContinueWithoutLlm(userText, assistantText)) {
     lastJudgedAssistantFp.set(convKey, fp);
     clearIdleNudgeRetry(convKey);
-    return rememberIdleNudge(convKey, { nudged: false, reason: "fallback_complete", cause });
+    return rememberIdleNudge(convKey, { nudged: false, reason: "fallback_complete", cause, assistant_fp: fp });
   }
   const nudgeText = localizedText("manual_continue_message", null, "Continue");
   lastIdleNudgeAt.set(convKey, Date.now());
@@ -2328,12 +2329,13 @@ async function autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, c
       nudged: false,
       reason: "wake_failed",
       cause,
+      assistant_fp: fp,
       send: nudgeText,
       error: wakeResult?.error || wakeResult?.blocked || wakeResult?.reason || "submit-failed",
     });
   }
   lastJudgedAssistantFp.set(convKey, fp);
-  return rememberIdleNudge(convKey, { nudged: true, reason: "fallback_continue", cause, send: nudgeText });
+  return rememberIdleNudge(convKey, { nudged: true, reason: "fallback_continue", cause, assistant_fp: fp, send: nudgeText });
 }
 
 async function maybeIdleNudge(msg) {
@@ -2458,11 +2460,11 @@ async function maybeIdleNudgeInner(msg) {
   if (verdict.done) {
     lastJudgedAssistantFp.set(convKey, fp);
     clearIdleNudgeRetry(convKey);
-    return rememberIdleNudge(convKey, { nudged: false, reason: "llm_done", raw: verdict.raw });
+    return rememberIdleNudge(convKey, { nudged: false, reason: "llm_done", raw: verdict.raw, assistant_fp: fp });
   }
   if (!verdict.cont || !verdict.nudgeText) {
     scheduleIdleNudgeRetry(convKey, 30000);
-    return rememberIdleNudge(convKey, { nudged: false, reason: "llm_ambiguous", raw: verdict.raw });
+    return rememberIdleNudge(convKey, { nudged: false, reason: "llm_ambiguous", raw: verdict.raw, assistant_fp: fp });
   }
 
   lastIdleNudgeAt.set(convKey, Date.now());
@@ -2480,6 +2482,7 @@ async function maybeIdleNudgeInner(msg) {
       nudged: false,
       reason: "wake_failed",
       raw: verdict.raw,
+      assistant_fp: fp,
       send: verdict.nudgeText,
       error: wakeResult?.error || wakeResult?.blocked || wakeResult?.reason || "submit-failed",
     });
@@ -2489,6 +2492,7 @@ async function maybeIdleNudgeInner(msg) {
     nudged: true,
     reason: "llm_continue",
     raw: verdict.raw,
+    assistant_fp: fp,
     send: verdict.nudgeText,
   });
 }
@@ -4383,7 +4387,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           nudged: !!last.nudged,
           raw: last.raw != null ? String(last.raw).slice(0, 80) : "",
           send: last.send != null ? String(last.send).slice(0, 80) : "",
-          error: last.error ? String(last.error).slice(0, 80) : "",
+          cause: last.cause != null ? String(last.cause).slice(0, 80) : "",
+          error: last.error != null ? String(last.error).slice(0, 80) : "",
+          assistant_fp: last.assistant_fp != null ? String(last.assistant_fp).slice(0, 96) : "",
         } : null,
       });
     })();

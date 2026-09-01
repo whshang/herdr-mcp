@@ -77,9 +77,9 @@ const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "u
 const controlCenterCss = readFileSync(path.join(EXT, "control-center.css"), "utf8");
 const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.86", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.86"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.86"'), "content version matches manifest");
+ok(manifest.version === "0.1.87", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.87"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.87"'), "content version matches manifest");
 const ownerGateIndex = wakeSource.indexOf('type: "h2w_extension_owner_status"');
 const queueOwnerClaimIndex = wakeSource.indexOf('setAttribute(QUEUED_INSERT_OWNER_ATTR');
 ok(ownerGateIndex >= 0
@@ -854,6 +854,12 @@ ok(backgroundSource.includes('event === "hello"')
     && controlCenterSource.includes('refreshSnapshot(true)')
     && !controlCenterSource.includes("setInterval("),
   "Control Center uses a live side-panel port, one initial/reconnect snapshot, and incremental lifecycle events without fixed polling");
+ok(controlCenterSource.includes('const EXPANDED_WORKSPACES_KEY = "herdrControlExpandedWorkspaces"')
+    && controlCenterSource.includes('restoreExpansionPreference(stored[EXPANDED_WORKSPACES_KEY])')
+    && controlCenterSource.includes('[EXPANDED_WORKSPACES_KEY]: [...expandedWorkspaces].sort()')
+    && controlCenterSource.includes('void persistExpansionPreference();')
+    && controlCenterSource.includes('chrome.storage.local.get([TARGET_KEY, EXPANDED_WORKSPACES_KEY])'),
+  "Control Center persists explicit workspace expansion state so panel reloads cannot reopen user-collapsed rows");
 ok(chatGptAdapterSource.includes("getStopButtonCandidates()")
     && chatGptAdapterSource.includes('button[data-testid="stop-button"]')
     && !wakeSource.includes('document.querySelectorAll("button, [role=button]").filter')
@@ -891,6 +897,18 @@ ok(manualStatusBlock.includes("fetchStateFresh()")
 ok(localAuthSource.includes("void opened.catch(() => {});")
     && localAuthSource.includes("void done.catch(() => {});"),
   "native stream failures are observed immediately without hiding later await errors");
+ok(backgroundSource.includes('assistant_fp: fp')
+    && backgroundSource.includes('assistant_fp: last.assistant_fp')
+    && wakeSource.includes('function autoDecisionFeedback(last)')
+    && wakeSource.includes('const autoJudging = effectiveEnabled && hudPending')
+    && wakeSource.includes('autoJudging ? " …"')
+    && wakeSource.includes('llm_done: ["✓", "ok"]')
+    && wakeSource.includes('llm_ambiguous: ["?", "warn"]')
+    && wakeSource.includes('wake_failed: ["!", "error"]')
+    && wakeSource.includes('lastAutoFeedbackKey')
+    && wakeSource.includes('showHudToast(autoFeedback.message')
+    && wakeSource.includes('decision-${autoFeedback.tone}'),
+  "Auto visibly distinguishes no-send, ambiguous/retry, continue, fallback, and failure outcomes without duplicate same-turn toasts");
 const queueTurnEndedStart = backgroundSource.indexOf('if (msg?.type === "h2w_turn_ended")');
 const queueTurnEndedEnd = queueTurnEndedStart >= 0 ? backgroundSource.indexOf('if (msg?.type === "h2w_handoff_start")', queueTurnEndedStart) : -1;
 const queueTurnEndedBlock = queueTurnEndedStart >= 0 && queueTurnEndedEnd > queueTurnEndedStart
