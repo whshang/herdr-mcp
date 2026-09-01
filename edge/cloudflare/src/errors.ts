@@ -13,6 +13,7 @@ export type RelayErrorCode =
   | "workstation_offline"
   | "workstation_reconnecting"
   | "workstation_draining"
+  | "runtime_generation_superseded_before_dispatch"
   | "runtime_unavailable"
   | "request_timeout"
   | "delivery_uncertain"
@@ -171,6 +172,7 @@ export function mapLinkErrorCode(code: string): RelayErrorCode {
     case "workstation_offline":
     case "workstation_reconnecting":
     case "workstation_draining":
+    case "runtime_generation_superseded_before_dispatch":
     case "runtime_unavailable":
     case "request_timeout":
     case "delivery_uncertain":

@@ -37,6 +37,10 @@ test("errors: timeout read retryable, mutating not", () => {
 test("errors: mapLinkErrorCode keeps known, degrades unknown to internal", () => {
   assert.equal(mapLinkErrorCode("workstation_offline"), "workstation_offline");
   assert.equal(mapLinkErrorCode("request_timeout"), "request_timeout");
+  assert.equal(
+    mapLinkErrorCode("runtime_generation_superseded_before_dispatch"),
+    "runtime_generation_superseded_before_dispatch",
+  );
   assert.equal(mapLinkErrorCode("local_mcp_unreachable"), "runtime_unavailable");
   assert.equal(mapLinkErrorCode("local_mcp_http_error"), "runtime_unavailable");
   assert.equal(mapLinkErrorCode("local_mcp_timeout"), "request_timeout");

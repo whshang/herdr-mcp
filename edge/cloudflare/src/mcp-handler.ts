@@ -134,6 +134,21 @@ function relayErrorToolResult(error: RelayErrorResult, requestId: string, workst
   );
 }
 
+function generationSupersededReadRetry(error: RelayErrorResult | undefined, opClass: string): boolean {
+  return opClass === "read"
+    && error?.code === "runtime_generation_superseded_before_dispatch"
+    && error.retryable === true
+    && error.delivery_state === "not_delivered";
+}
+
+function forwardEnvelopeError(forwarded: ForwardEnvelope): RelayErrorResult | undefined {
+  if (forwarded.status === "ok" && forwarded.completion?.status === "error") {
+    return forwarded.completion.error;
+  }
+  if (forwarded.status === "error") return forwarded.error;
+  return undefined;
+}
+
 export function publicContractTools(): readonly unknown[] {
   return PUBLIC_CONTRACT.tools;
 }
@@ -294,6 +309,7 @@ export async function handleMcp(
 
     const now = deps.now?.() ?? Date.now();
     const requestId = newRequestId();
+    const opClass = classifyOp(name);
     const idempotencyKey =
       typeof runtimeArgs.idempotency_key === "string" && runtimeArgs.idempotency_key.length > 0
         ? runtimeArgs.idempotency_key
@@ -302,7 +318,7 @@ export async function handleMcp(
       kind: "request",
       requestId,
       op: name,
-      opClass: classifyOp(name),
+      opClass,
       args: runtimeArgs,
       deadlineMs: now + deps.limits.requestTimeoutMs,
       contractEpoch: RUNTIME_EXECUTION_CONTRACT.contract_epoch,
@@ -316,34 +332,71 @@ export async function handleMcp(
       deviceId: route.device_id,
       routingReason: route.routing_reason,
       op: name,
-      opClass: internal.opClass,
+      opClass,
     });
 
-    let response: Response;
-    try {
-      response = await deps.forward(deps.getStub(route.workstation_id), JSON.stringify(internal));
-    } catch (error) {
-      return rpcResult(
-        id,
-        callToolResult(
-          {
-            ok: false,
-            code: "edge_forward_failed",
-            retryable: true,
-            delivery_state: "not_delivered",
-            message: String(error),
-            request_id: requestId,
-            workstation_id: route.workstation_id,
-          },
-          true,
-        ),
-      );
+    let activeRequestId = requestId;
+    let activeInternal = internal;
+    let forwarded: ForwardEnvelope | undefined;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let response: Response;
+      try {
+        response = await deps.forward(deps.getStub(route.workstation_id), JSON.stringify(activeInternal));
+      } catch (error) {
+        return rpcResult(
+          id,
+          callToolResult(
+            {
+              ok: false,
+              code: "edge_forward_failed",
+              retryable: true,
+              delivery_state: "not_delivered",
+              message: String(error),
+              request_id: activeRequestId,
+              workstation_id: route.workstation_id,
+            },
+            true,
+          ),
+        );
+      }
+
+      try {
+        forwarded = (await response.json()) as ForwardEnvelope;
+      } catch {
+        return rpcResult(
+          id,
+          callToolResult(
+            {
+              ok: false,
+              code: "invalid_edge_response",
+              retryable: false,
+              delivery_state: "delivery_unknown",
+              request_id: activeRequestId,
+              workstation_id: route.workstation_id,
+            },
+            true,
+          ),
+        );
+      }
+
+      const retryError = forwardEnvelopeError(forwarded);
+      if (attempt === 0 && generationSupersededReadRetry(retryError, opClass)) {
+        const retryRequestId = newRequestId();
+        deps.logger.warn("mcp.tools_call.generation_retry", {
+          requestId: activeRequestId,
+          retryRequestId,
+          workstationId: route.workstation_id,
+          deviceId: route.device_id,
+          op: name,
+        });
+        activeRequestId = retryRequestId;
+        activeInternal = { ...activeInternal, requestId: retryRequestId };
+        continue;
+      }
+      break;
     }
 
-    let forwarded: ForwardEnvelope;
-    try {
-      forwarded = (await response.json()) as ForwardEnvelope;
-    } catch {
+    if (!forwarded) {
       return rpcResult(
         id,
         callToolResult(
@@ -352,7 +405,7 @@ export async function handleMcp(
             code: "invalid_edge_response",
             retryable: false,
             delivery_state: "delivery_unknown",
-            request_id: requestId,
+            request_id: activeRequestId,
             workstation_id: route.workstation_id,
           },
           true,
@@ -367,10 +420,10 @@ export async function handleMcp(
       return rpcResult(id, normalizeSuccessfulToolResult(wrapped));
     }
     if (forwarded.status === "ok" && forwarded.completion?.status === "error") {
-      return rpcResult(id, relayErrorToolResult(forwarded.completion.error, requestId, route.workstation_id));
+      return rpcResult(id, relayErrorToolResult(forwarded.completion.error, activeRequestId, route.workstation_id));
     }
     if (forwarded.status === "error" && forwarded.error) {
-      return rpcResult(id, relayErrorToolResult(forwarded.error, requestId, route.workstation_id));
+      return rpcResult(id, relayErrorToolResult(forwarded.error, activeRequestId, route.workstation_id));
     }
     return rpcResult(
       id,
@@ -380,7 +433,7 @@ export async function handleMcp(
           code: "invalid_edge_response",
           retryable: false,
           delivery_state: "delivery_unknown",
-          request_id: requestId,
+          request_id: activeRequestId,
           workstation_id: route.workstation_id,
         },
         true,
