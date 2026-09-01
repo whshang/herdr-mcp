@@ -16,11 +16,15 @@ use std::env;
 use std::fs;
 #[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::Instant;
 
-use super::cutover_execute::{LINK_LAUNCHD_THROTTLE_SECONDS, LaunchdOps};
+use super::cutover_execute::LINK_LAUNCHD_THROTTLE_SECONDS;
+#[cfg(any(target_os = "macos", test))]
+use super::cutover_execute::LaunchdOps;
 #[cfg(target_os = "macos")]
 use super::cutover_execute::{RealLaunchd, atomic_write, encode_prod_rust_plist};
 #[cfg(target_os = "macos")]
@@ -32,11 +36,12 @@ use super::install::{
 use super::migrate_runtime_control::{
     active_rust_generation_id, read_binary_version_hint, reconcile_current_generation,
 };
+#[cfg(any(target_os = "macos", test))]
 use super::ownership::LINK_PROD_LABEL;
 #[cfg(target_os = "macos")]
 use super::ownership::{
-    LinkAgentView, LinkImplementation, assess_agent, program_points_at_managed_runtime,
-    read_status_active_generation,
+    LinkAgentView, LinkImplementation, assess_agent, parse_launchd_environment_value,
+    program_points_at_managed_runtime, read_status_active_generation,
 };
 use super::runtime_control::retryable_candidate_outcome;
 use super::runtime_generation::RUNTIME_GENERATION_DEFAULT_TIMEOUT_MS;
@@ -119,8 +124,8 @@ pub(crate) fn reconcile_after_service_generation_change(
             .map(PathBuf::from)
             .unwrap_or_else(|| paths.config_dir.join("runtime-status-prod.json"));
         let control_path = prefer_existing_control(&paths.config_dir);
+        let prod_plist_path = prod.plist_path.clone();
         converge_active_generation_with_fallback(
-            &launchd,
             &generation,
             || reconcile_current_generation(&home, &paths.config_dir).map(|_| ()),
             || {
@@ -138,6 +143,7 @@ pub(crate) fn reconcile_after_service_generation_change(
                 }
                 Ok(())
             },
+            || restart_prod_link_for_generation(&launchd, &prod_plist_path, &generation),
             |budget| wait_for_active_generation(&status_path, &generation, budget),
             || read_convergence_evidence(&control_path, &status_path),
         )
@@ -419,18 +425,18 @@ fn read_optional_json(path: &Path) -> Result<Option<Value>, String> {
     Ok(Some(value))
 }
 
-fn converge_active_generation_with_fallback<L, Reconcile, VerifyOwnership, Wait, Probe>(
-    launchd: &L,
+fn converge_active_generation_with_fallback<Reconcile, VerifyOwnership, Restart, Wait, Probe>(
     generation: &str,
     mut reconcile: Reconcile,
     mut verify_ownership: VerifyOwnership,
+    mut restart: Restart,
     mut wait: Wait,
     mut probe: Probe,
 ) -> Result<(), String>
 where
-    L: LaunchdOps,
     Reconcile: FnMut() -> Result<(), String>,
     VerifyOwnership: FnMut() -> Result<(), String>,
+    Restart: FnMut() -> Result<(), String>,
     Wait: FnMut(Duration) -> Result<(), String>,
     Probe: FnMut() -> Result<ConvergenceEvidence, String>,
 {
@@ -454,14 +460,14 @@ where
     // older code or may have missed control revisions during the server restart.
     // Restart exactly the still-owned production Link once. Ownership is
     // re-proved immediately before the mutation so a concurrent replacement
-    // cannot turn the bounded recovery into a foreign-job restart. Its program
-    // path is runtime/current, so the replacement process executes the new
-    // binary; the persisted plist remains the source for the next natural
-    // bootstrap.
+    // cannot turn the bounded recovery into a foreign-job restart. The restart
+    // strategy also checks the *loaded* launchd generation: a plain kickstart
+    // does not re-read a changed plist, so a stale loaded environment must be
+    // bootout/bootstrap reloaded from the already-refreshed owned plist.
     verify_ownership()?;
-    launchd.kickstart_prod(LINK_PROD_LABEL).map_err(|error| {
+    restart().map_err(|error| {
         format!(
-            "production Link hot-switch to {generation} timed out and bounded kickstart failed: {error}; prior={}",
+            "production Link hot-switch to {generation} timed out and bounded restart failed: {error}; prior={}",
             last_error.as_deref().unwrap_or("unknown")
         )
     })?;
@@ -486,10 +492,66 @@ where
     )
     .map_err(|error| {
         format!(
-            "production Link did not activate generation {generation} after bounded kickstart: {error}; prior={}",
+            "production Link did not activate generation {generation} after bounded restart: {error}; prior={}",
             last_error.as_deref().unwrap_or("unknown")
         )
     })
+}
+
+#[cfg(target_os = "macos")]
+fn restart_prod_link_for_generation<L: LaunchdOps>(
+    launchd: &L,
+    plist_path: &Path,
+    generation: &str,
+) -> Result<(), String> {
+    let loaded_generation = read_loaded_prod_generation()?;
+    restart_prod_link_for_observed_generation(
+        launchd,
+        plist_path,
+        generation,
+        loaded_generation.as_deref(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn read_loaded_prod_generation() -> Result<Option<String>, String> {
+    let target = format!("gui/{}/{}", unsafe { libc::geteuid() }, LINK_PROD_LABEL);
+    let output = Command::new("/bin/launchctl")
+        .args(["print", target.as_str()])
+        .output()
+        .map_err(|error| format!("cannot inspect loaded production Link: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(format!(
+            "cannot inspect loaded production Link generation: {detail}"
+        ));
+    }
+    Ok(parse_launchd_environment_value(
+        &String::from_utf8_lossy(&output.stdout),
+        "HERDR_RUNTIME_GENERATION",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn restart_prod_link_for_observed_generation<L: LaunchdOps>(
+    launchd: &L,
+    plist_path: &Path,
+    generation: &str,
+    loaded_generation: Option<&str>,
+) -> Result<(), String> {
+    if loaded_generation == Some(generation) {
+        return launchd.kickstart_prod(LINK_PROD_LABEL);
+    }
+
+    launchd.bootout_prod(LINK_PROD_LABEL)?;
+    launchd
+        .bootstrap_prod(plist_path, LINK_PROD_LABEL)
+        .map_err(|error| {
+            format!(
+                "production Link loaded generation {} did not match {generation}; plist reload failed: {error}",
+                loaded_generation.unwrap_or("missing")
+            )
+        })
 }
 
 /// Provable Link-generation state used by the post-kickstart convergence phase.
@@ -1029,13 +1091,13 @@ mod tests {
         let mut reconciles = 0;
         let mut waits = 0;
         converge_active_generation_with_fallback(
-            &launchd,
             "rust-new",
             || {
                 reconciles += 1;
                 Ok(())
             },
             || Ok(()),
+            || launchd.kickstart_prod(LINK_PROD_LABEL),
             |_| {
                 waits += 1;
                 Ok(())
@@ -1055,13 +1117,13 @@ mod tests {
         let mut waits = 0;
         let mut probe_calls = 0;
         converge_active_generation_with_fallback(
-            &launchd,
             "rust-new",
             || {
                 reconciles += 1;
                 Ok(())
             },
             || Ok(()),
+            || launchd.kickstart_prod(LINK_PROD_LABEL),
             |_| {
                 waits += 1;
                 if waits < 3 {
@@ -1095,10 +1157,10 @@ mod tests {
     fn ownership_change_before_restart_fails_without_kickstart() {
         let launchd = FakeLaunchd::with_loaded(LINK_PROD_LABEL, Path::new("/tmp/link-prod.plist"));
         let error = converge_active_generation_with_fallback(
-            &launchd,
             "rust-new",
             || Ok(()),
             || Err("ownership changed".to_owned()),
+            || -> Result<(), String> { panic!("restart must not run after ownership drift") },
             |_| Err("still stale".to_owned()),
             || Ok(ConvergenceEvidence::default()),
         )
@@ -1112,13 +1174,13 @@ mod tests {
         let launchd = FakeLaunchd::with_loaded(LINK_PROD_LABEL, Path::new("/tmp/link-prod.plist"));
         let mut reconciles = 0;
         let error = converge_active_generation_with_fallback(
-            &launchd,
             "rust-new",
             || {
                 reconciles += 1;
                 Ok(())
             },
             || Ok(()),
+            || launchd.kickstart_prod(LINK_PROD_LABEL),
             |_| Err("still stale".to_owned()),
             // Missing/unparseable evidence is a stall, not a direction verdict;
             // the bounded convergence phase must fail after the stall budget
@@ -1126,9 +1188,40 @@ mod tests {
             || Ok(ConvergenceEvidence::default()),
         )
         .unwrap_err();
-        assert!(error.contains("after bounded kickstart"));
+        assert!(error.contains("after bounded restart"));
         assert!(error.contains("stalled"));
         assert_eq!(reconciles, 2);
+        assert_eq!(launchd.kickstarts(), vec![LINK_PROD_LABEL.to_owned()]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_loaded_launchd_generation_reloads_owned_plist() {
+        let plist = Path::new("/tmp/link-prod.plist");
+        let launchd = FakeLaunchd::with_loaded(LINK_PROD_LABEL, plist);
+
+        restart_prod_link_for_observed_generation(&launchd, plist, "rust-new", Some("rust-old"))
+            .unwrap();
+
+        assert_eq!(launchd.bootouts(), vec![LINK_PROD_LABEL.to_owned()]);
+        assert_eq!(
+            launchd.bootstraps(),
+            vec![(LINK_PROD_LABEL.to_owned(), plist.to_path_buf())]
+        );
+        assert!(launchd.kickstarts().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn aligned_loaded_launchd_generation_uses_bounded_kickstart() {
+        let plist = Path::new("/tmp/link-prod.plist");
+        let launchd = FakeLaunchd::with_loaded(LINK_PROD_LABEL, plist);
+
+        restart_prod_link_for_observed_generation(&launchd, plist, "rust-new", Some("rust-new"))
+            .unwrap();
+
+        assert!(launchd.bootouts().is_empty());
+        assert!(launchd.bootstraps().is_empty());
         assert_eq!(launchd.kickstarts(), vec![LINK_PROD_LABEL.to_owned()]);
     }
 
