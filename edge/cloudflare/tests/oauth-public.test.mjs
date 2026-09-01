@@ -362,7 +362,7 @@ test("authorize: PKCE code_challenge required and S256 only", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// 7. ChatGPT CIMD authorization
+// 7. CIMD authorization
 // ---------------------------------------------------------------------------
 
 test("authorize: ChatGPT CIMD client_id accepted with allowlisted redirect", async () => {
@@ -388,6 +388,88 @@ test("authorize: CIMD redirect NOT on allowlist is rejected", async () => {
   const resp = await GET(`/oauth/authorize?${qs}`, opts);
   assert.equal(resp.status, 400);
   assert.equal((await resp.json()).error_description, "redirect_uri is not registered for this client");
+});
+
+test("authorize+token: Claude URL client_id resolves its CIMD metadata without DCR", async () => {
+  const cimd = "https://claude.ai/oauth/mcp-oauth-client-metadata";
+  const redirect = "https://claude.ai/api/mcp/auth_callback";
+  let metadataFetches = 0;
+  const fetchFn = async (input, init = {}) => {
+    assert.equal(String(input), cimd);
+    assert.equal(init.method, "GET");
+    assert.equal(init.redirect, "error");
+    metadataFetches += 1;
+    return new Response(JSON.stringify({
+      client_id: cimd,
+      client_name: "Claude",
+      redirect_uris: [redirect],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const opts = makeOptions({ fetchFn });
+
+  const { code, verifier } = await makeAuthCode(opts, cimd, redirect);
+  assert.ok(code);
+  const token = await POST("/oauth/token", {
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: redirect,
+    client_id: cimd,
+    code_verifier: verifier,
+    resource: IDENTITY.resource,
+  }, opts);
+  assert.equal(token.status, 200);
+  assert.ok((await token.json()).access_token);
+  assert.equal(metadataFetches, 2, "authorize and token each validate current CIMD metadata");
+});
+
+test("authorize: generic CIMD requires exact client_id and forbids shared-secret auth", async () => {
+  const cimd = "https://client.example/oauth/client-metadata";
+  const redirect = "https://client.example/oauth/callback";
+  const challenge = await s256Challenge("G".repeat(44));
+  const qs = new URLSearchParams({ client_id: cimd, redirect_uri: redirect, code_challenge: challenge });
+
+  const mismatched = makeOptions({
+    fetchFn: async () => new Response(JSON.stringify({
+      client_id: `${cimd}/other`,
+      redirect_uris: [redirect],
+      token_endpoint_auth_method: "none",
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  const mismatchResp = await GET(`/oauth/authorize?${qs}`, mismatched);
+  assert.equal(mismatchResp.status, 400);
+  assert.equal((await mismatchResp.json()).error_description, "unknown client_id");
+
+  const sharedSecret = makeOptions({
+    fetchFn: async () => new Response(JSON.stringify({
+      client_id: cimd,
+      redirect_uris: [redirect],
+      token_endpoint_auth_method: "client_secret_post",
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  const secretResp = await GET(`/oauth/authorize?${qs}`, sharedSecret);
+  assert.equal(secretResp.status, 400);
+  assert.equal((await secretResp.json()).error_description, "unknown client_id");
+});
+
+test("authorize: unsafe CIMD hosts are rejected before fetch", async () => {
+  let fetched = false;
+  const opts = makeOptions({ fetchFn: async () => { fetched = true; throw new Error("must not fetch"); } });
+  const challenge = await s256Challenge("H".repeat(44));
+  const qs = new URLSearchParams({
+    client_id: "https://127.0.0.1/oauth/client-metadata",
+    redirect_uri: "https://127.0.0.1/callback",
+    code_challenge: challenge,
+  });
+  const resp = await GET(`/oauth/authorize?${qs}`, opts);
+  assert.equal(resp.status, 400);
+  assert.equal((await resp.json()).error_description, "unknown client_id");
+  assert.equal(fetched, false);
 });
 
 // ---------------------------------------------------------------------------
