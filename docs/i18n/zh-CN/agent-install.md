@@ -44,10 +44,10 @@ Node.js 只用于临时 Cloudflare Worker 引导（`npx wrangler`）和可选贡
 herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
-herdr-mcp update          # same as update check
+herdr-mcp update          # 下载并应用下一版 stable release
 ```
 
-`install` 会在 `~/.config/herdr-mcp/runtime/` 写入不可变 generation，并把 `~/.local/bin/herdr-mcp` 指到 `runtime/current/herdr-mcp`。优先使用以上顶层命令。不要把 `herdr-mcp service install` 写成普通安装主路径。
+`install` 会在 `~/.config/herdr-mcp/runtime/` 写入不可变 generation，并把 `~/.local/bin/herdr-mcp` 指到 `runtime/current/herdr-mcp`。`herdr-mcp update` 是正常的一步升级入口；只有运维明确需要只读检查是否有新版本时才使用 `herdr-mcp update check`。优先使用以上顶层命令。不要把 `herdr-mcp service install` 写成普通安装主路径。
 
 只有明确测试 prerelease build 时才使用 `update.channel = "preview"`。当前 stable runtime 使用默认 `stable` channel 即可。
 

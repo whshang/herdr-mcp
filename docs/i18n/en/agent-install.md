@@ -47,10 +47,10 @@ https://herdr-mcp.example.com/mcp
 herdr-mcp install
 herdr-mcp doctor
 herdr-mcp status
-herdr-mcp update          # same as update check
+herdr-mcp update          # download and apply the next stable release
 ```
 
-`install` stages an immutable generation under `~/.config/herdr-mcp/runtime/` and retargets `~/.local/bin/herdr-mcp` to `runtime/current/herdr-mcp`. Prefer these top-level commands. Do **not** use `herdr-mcp service install` as the normal install path.
+`install` stages an immutable generation under `~/.config/herdr-mcp/runtime/` and retargets `~/.local/bin/herdr-mcp` to `runtime/current/herdr-mcp`. `herdr-mcp update` is the normal one-step upgrade path; use `herdr-mcp update check` only when an operator explicitly wants a read-only availability check. Prefer these top-level commands. Do **not** use `herdr-mcp service install` as the normal install path.
 
 Use `update.channel = "preview"` only when deliberately testing prerelease builds. On the current stable runtime, the default `stable` channel is correct.
 

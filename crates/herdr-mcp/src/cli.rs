@@ -886,7 +886,7 @@ fn parse_update(args: &[String]) -> Result<Command, String> {
                 job_id: value.clone(),
             }))
         }
-        [] => Ok(Command::Update(UpdateCommand::Check { manifest_url: None })),
+        [] => Ok(Command::Update(UpdateCommand::Apply { manifest_url: None })),
         [subcommand, ..] => Err(format!(
             "invalid update command or arguments for '{subcommand}'"
         )),
@@ -1569,7 +1569,7 @@ mod tests {
         assert!(parse(args(&["install", "--adopt-node"])).is_err());
         assert_eq!(
             parse(args(&["update"])).unwrap().command,
-            Command::Update(UpdateCommand::Check { manifest_url: None })
+            Command::Update(UpdateCommand::Apply { manifest_url: None })
         );
         assert!(parse(args(&["update", "apply", "--force"])).is_err());
         assert!(parse(args(&["native-host"])).is_err());

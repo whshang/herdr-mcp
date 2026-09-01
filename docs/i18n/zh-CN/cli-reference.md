@@ -14,6 +14,7 @@ herdr-mcp 的命令可以按用途理解，而不是按 `bin/` 文件名死记�
 herdr-mcp install
 herdr-mcp status
 herdr-mcp doctor
+herdr-mcp update
 herdr-mcp update check
 herdr-mcp update apply
 herdr-mcp update auto
@@ -22,6 +23,8 @@ herdr-mcp rollback
 herdr-mcp reinstall
 herdr-mcp uninstall
 ```
+
+`update` 是普通用户的一步升级入口，等价于 `update apply`。只有明确需要在决定升级前做只读版本/来源检查时才使用 `update check`。
 
 `update auto` 是后台调度入口。默认 macOS PROD 实例执行 `service install` 时会 reconcile 归属明确的 `dev.herdr-mcp.auto-update` LaunchAgent；任务在加载时先执行一次，随后每天触发。自动安装严格限制为 **PROD runtime + Stable Release**：编译为 DEV 的 runtime、`[update] check = false`、named instance、`preview` 都会在访问网络前直接跳过。发现严格更高的 Stable Release 后，继续复用正常的 provenance 验签、detached worker 和 rollback-safe 更新事务，不新增第二套下载器，也不绕过回滚门槛。`service uninstall` 会先写入归属明确的持久 update fence 并移除 scheduler；detached worker 在真正 activation 前会再次检查该 fence，因此已经排队的静默更新不能在卸载后复活服务。显式成功的 install 才会解除 fence。
 
