@@ -10,6 +10,8 @@
 
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -33,6 +35,7 @@ use super::transport::{
 use crate::relay::protocol::HelloMessage;
 
 pub const LINK_SUBPROTOCOL: &str = "herdr-link.v1";
+const DEVICE_NAME_HEADER: &str = "x-herdr-device-name-b64";
 pub const LINK_AUTH_PROTOCOL_PREFIX: &str = "herdr-auth.";
 pub const DEFAULT_WS_HARD_LIMIT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_WS_WRITE_BUFFER_BYTES: usize = 16 * 1024;
@@ -374,6 +377,7 @@ fn client_request(
     edge_url: &str,
     application_protocol: &str,
     link_token: &str,
+    device_name: Option<&str>,
 ) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, SocketDriverError> {
     validate_wss_url(edge_url)?;
     let mut request = edge_url
@@ -383,6 +387,12 @@ fn client_request(
     let header = HeaderValue::from_str(&protocols.join(", "))
         .map_err(|_| SocketDriverError::InvalidSubprotocol)?;
     request.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, header);
+    if let Some(name) = device_name.and_then(crate::device_name::normalize_device_display_name) {
+        let encoded = URL_SAFE_NO_PAD.encode(name.as_bytes());
+        if let Ok(header) = HeaderValue::from_str(&encoded) {
+            request.headers_mut().insert(DEVICE_NAME_HEADER, header);
+        }
+    }
     Ok(request)
 }
 
@@ -468,12 +478,13 @@ pub async fn connect_socket_attempt(
     edge_url: &str,
     application_protocol: &str,
     link_token: &str,
+    device_name: Option<&str>,
     attempt_id: SocketAttemptId,
     config: SocketDriverConfig,
 ) -> Result<SocketAttemptHandle, SocketDriverError> {
     ensure_rustls_crypto_provider();
     let config = config.normalized();
-    let request = client_request(edge_url, application_protocol, link_token)?;
+    let request = client_request(edge_url, application_protocol, link_token, device_name)?;
     let (socket, response) = if let Some(proxy) = resolve_link_proxy() {
         let (target_host, target_port) =
             wss_target(edge_url).ok_or(SocketDriverError::InvalidUrl)?;
@@ -832,8 +843,13 @@ mod tests {
 
     #[test]
     fn request_header_contains_app_then_hex_auth_protocol() {
-        let request =
-            client_request("wss://edge.test/ws/w5C", LINK_SUBPROTOCOL, "tok-123").unwrap();
+        let request = client_request(
+            "wss://edge.test/ws/w5C",
+            LINK_SUBPROTOCOL,
+            "tok-123",
+            Some("青闲 MacBook Air"),
+        )
+        .unwrap();
         assert_eq!(
             request
                 .headers()
@@ -842,6 +858,15 @@ mod tests {
                 .to_str()
                 .unwrap(),
             "herdr-link.v1, herdr-auth.746f6b2d313233"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(DEVICE_NAME_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            URL_SAFE_NO_PAD.encode("青闲 MacBook Air".as_bytes())
         );
         assert!(!request.uri().to_string().contains("tok-123"));
     }

@@ -926,14 +926,28 @@ mod macos {
         )
     }
 
+    fn resolved_current_executable() -> Result<PathBuf, String> {
+        let executable = env::current_exe()
+            .map_err(|error| format!("cannot locate current herdr-mcp binary: {error}"))?;
+        resolve_executable_path(&executable)
+    }
+
+    fn resolve_executable_path(executable: &Path) -> Result<PathBuf, String> {
+        fs::canonicalize(executable).map_err(|error| {
+            format!(
+                "cannot resolve current herdr-mcp executable {}: {error}",
+                executable.display()
+            )
+        })
+    }
+
     impl ServicePaths {
         fn discover() -> Result<Self, String> {
             let home = env::var_os("HOME")
                 .map(PathBuf::from)
                 .ok_or_else(|| "cannot determine user home directory".to_owned())?;
             let runtime = RuntimePaths::discover()?;
-            let source_binary = env::current_exe()
-                .map_err(|error| format!("cannot locate current herdr-mcp binary: {error}"))?;
+            let source_binary = resolved_current_executable()?;
             let herdr_socket = runtime
                 .herdr_socket
                 .ok_or_else(|| "service manager requires a Herdr Unix socket path".to_owned())?;
@@ -974,8 +988,7 @@ mod macos {
                 .map(PathBuf::from)
                 .ok_or_else(|| "cannot determine user home directory".to_owned())?;
             let runtime = RuntimePaths::discover()?;
-            let orchestrator_binary = env::current_exe()
-                .map_err(|error| format!("cannot locate current herdr-mcp binary: {error}"))?;
+            let orchestrator_binary = resolved_current_executable()?;
             let legacy_health_version = legacy_health_version_for_payload(payload_binary)?;
             let herdr_socket = runtime
                 .herdr_socket
@@ -4450,6 +4463,26 @@ mod macos {
                 home.join(".config/herdr/herdr.sock"),
             );
             (root, paths)
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn executable_resolution_accepts_managed_symlink_but_returns_real_file() {
+            let root = root("current-exe-symlink");
+            fs::create_dir_all(&root).unwrap();
+            let target = root.join("runtime-current-herdr-mcp");
+            fs::write(&target, b"managed-runtime").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+            let cli = root.join("herdr-mcp");
+            symlink(&target, &cli).unwrap();
+
+            let resolved = resolve_executable_path(&cli).unwrap();
+            assert_eq!(resolved, fs::canonicalize(&target).unwrap());
+            let metadata = fs::symlink_metadata(&resolved).unwrap();
+            assert!(metadata.is_file());
+            assert!(!metadata.file_type().is_symlink());
+
+            let _ = fs::remove_dir_all(root);
         }
 
         fn create_generation_dir(paths: &ServicePaths, generation_id: &str) -> PathBuf {

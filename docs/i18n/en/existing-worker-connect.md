@@ -45,10 +45,12 @@ This creates a single-use pairing session, normally valid for 10 minutes, and pr
 On the new computer, the Agent runs:
 
 ```bash
-herdr-mcp worker connect "<pairing-address>" --name "<device-name>"
+herdr-mcp worker connect "<pairing-address>"
 ```
 
 The CLI then prompts for the 6-digit code using a no-echo input. The code is intentionally not accepted as a normal command-line argument.
+
+By default, the joining computer registers its macOS **Computer Name** as the device display name. Use `--name "<device-name>"` only when the user explicitly wants a different initial name. An owner-supplied `worker pair --name ...` is also an explicit override and takes precedence.
 
 After the pairing is consumed, `worker connect` installs/starts the local `herdr-mcp` service and ensures the enrolled Rust production Link is created and loaded. The command reports success only after the local service is healthy and `link-prod` is owned by the managed runtime with the new device identity; a failure triggers the existing revoke/Keychain/config compensation path.
 
@@ -69,6 +71,14 @@ herdr-mcp link status
 ```
 
 Then ask ChatGPT to call `herdr_devices` and confirm the new device is online under the same Worker.
+
+To explicitly rename the current enrolled computer later, run:
+
+```bash
+herdr-mcp worker rename "<new-device-name>"
+```
+
+`herdr-mcp device rename ...` is an equivalent alias. Rename changes only the human-facing display name; the immutable `device_id`, workstation identity, credential, authorization and scheduling state stay unchanged. Link reconnects do not overwrite an explicit rename. The default/legacy workstation likewise records its local Computer Name when it is first registered.
 
 ## What pairing changes
 

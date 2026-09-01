@@ -68,7 +68,7 @@ test("legacy registration helper uses the registry mutation endpoint without exp
 
 test("device routing prefers explicit immutable identity and resolves unique aliases", async () => {
   const devices = [
-    { device_id: DEV_A, workstation_id: "prod-real-runtime", name: "macbook", authorization: "active", scheduling: "enabled" },
+    { device_id: DEV_A, workstation_id: "prod-real-runtime", name: "qingxian-macbookair", aliases: ["macbook"], authorization: "active", scheduling: "enabled" },
     { device_id: DEV_B, workstation_id: DEV_B, name: "build-linux", authorization: "active", scheduling: "enabled" },
   ];
   assert.deepEqual(await resolveDeviceRoute(registryWith(devices), DEV_B.toLowerCase(), "legacy"), {
@@ -78,6 +78,12 @@ test("device routing prefers explicit immutable identity and resolves unique ali
     routing_reason: "explicit_device",
   });
   assert.deepEqual(await resolveDeviceRoute(registryWith(devices), "macbook", "legacy"), {
+    ok: true,
+    device_id: DEV_A,
+    workstation_id: "prod-real-runtime",
+    routing_reason: "explicit_device",
+  });
+  assert.deepEqual(await resolveDeviceRoute(registryWith(devices), "qingxian-macbookair", "legacy"), {
     ok: true,
     device_id: DEV_A,
     workstation_id: "prod-real-runtime",

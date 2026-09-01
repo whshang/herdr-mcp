@@ -13,6 +13,8 @@ export interface DeviceRecord {
   device_id: string;
   workstation_id: string;
   name: string;
+  /** Bounded compatibility aliases retained across explicit display-name changes. */
+  aliases?: string[];
   authorization: DeviceAuthorization;
   scheduling: DeviceScheduling;
   credential_id: string | null;
@@ -66,6 +68,17 @@ export function validateDeviceRecord(record: DeviceRecord): string | null {
   if (normalizedId === null || normalizedId !== record.device_id) return "invalid_device_id";
   if (!isWorkstationId(record.workstation_id)) return "invalid_workstation_id";
   if (record.name.trim().length === 0 || record.name.length > 128) return "invalid_device_name";
+  if (record.aliases !== undefined) {
+    if (!Array.isArray(record.aliases) || record.aliases.length > 32) return "invalid_device_aliases";
+    const seen = new Set<string>();
+    for (const alias of record.aliases) {
+      if (typeof alias !== "string" || alias.trim() !== alias || alias.length === 0 || alias.length > 128) {
+        return "invalid_device_alias";
+      }
+      if (alias === record.name || seen.has(alias)) return "invalid_device_alias";
+      seen.add(alias);
+    }
+  }
   if (!Number.isSafeInteger(record.enrolled_at_ms) || record.enrolled_at_ms < 0) return "invalid_enrolled_at";
   if (!Number.isSafeInteger(record.updated_at_ms) || record.updated_at_ms < record.enrolled_at_ms) {
     return "invalid_updated_at";

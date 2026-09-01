@@ -52,13 +52,22 @@ function postAsWorkstation(path, body, workstationId, secret) {
   });
 }
 
-function wsRequest(workstationId, secret) {
+function base64UrlUtf8(value) {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function wsRequest(workstationId, secret, deviceName) {
+  const headers = {
+    Upgrade: "websocket",
+    "sec-websocket-protocol": `herdr-link.v1, ${buildLinkAuthProtocol(secret)}`,
+  };
+  if (deviceName) headers["x-herdr-device-name-b64"] = base64UrlUtf8(deviceName);
   return new Request(`https://edge.example/ws/${encodeURIComponent(workstationId)}`, {
     method: "GET",
-    headers: {
-      Upgrade: "websocket",
-      "sec-websocket-protocol": `herdr-link.v1, ${buildLinkAuthProtocol(secret)}`,
-    },
+    headers,
   });
 }
 
@@ -209,6 +218,70 @@ test("a device may revoke only itself with its exact credential", async () => {
   // The only forward is the teardown kill-switch call to the target WorkstationDO;
   // the revoked credential never reaches it as a reconnect.
   assert.deepEqual(forwarded, ["/internal/revoke"]);
+});
+
+test("a joined device may explicitly rename only itself", async () => {
+  const { env, registry } = makeEnv();
+  const a = await pair(env, "rename-a");
+  const b = await pair(env, "rename-b");
+
+  const impersonated = await worker.fetch(postAsWorkstation(
+    "/devices/rename-self",
+    { workstation_id: b.workstation_id, name: "stolen-name" },
+    a.workstation_id,
+    a.device_secret,
+  ), env);
+  assert.equal(impersonated.status, 401);
+
+  const ownerCannotUseSelfRouteForMember = await worker.fetch(postAsWorkstation(
+    "/devices/rename-self",
+    { workstation_id: b.workstation_id, name: "owner-forced-name" },
+    b.workstation_id,
+    "owner-secret",
+  ), env);
+  assert.equal(ownerCannotUseSelfRouteForMember.status, 401);
+
+  const renamed = await worker.fetch(postAsWorkstation(
+    "/devices/rename-self",
+    { workstation_id: a.workstation_id, name: "qingxian-macbookair" },
+    a.workstation_id,
+    a.device_secret,
+  ), env);
+  assert.equal(renamed.status, 200);
+  const body = await renamed.json();
+  assert.equal(body.device_id, a.device_id);
+  assert.equal(body.name, "qingxian-macbookair");
+  assert.equal(body.wrote_registry, true);
+
+  const list = await registry.fetch(new Request("https://registry.internal/internal/devices"));
+  const devices = (await list.json()).devices;
+  assert.equal(devices.find((device) => device.device_id === a.device_id).name, "qingxian-macbookair");
+  assert.equal(devices.find((device) => device.device_id === b.device_id).name, "rename-b");
+});
+
+test("legacy default device takes its first Link device name and reconnect never overwrites explicit rename", async () => {
+  const { env, registry } = makeEnv();
+  const first = await worker.fetch(wsRequest("prod-real-runtime", "legacy-secret", "青闲的 MacBook Air"), env);
+  assert.equal(first.status, 200);
+
+  let list = await registry.fetch(new Request("https://registry.internal/internal/devices"));
+  let legacy = (await list.json()).devices.find((device) => device.workstation_id === "prod-real-runtime");
+  assert.equal(legacy.name, "青闲的 MacBook Air");
+
+  const rename = await worker.fetch(postAsWorkstation(
+    "/devices/rename-self",
+    { workstation_id: "prod-real-runtime", name: "qingxian-macbookair" },
+    "prod-real-runtime",
+    "legacy-secret",
+  ), env);
+  assert.equal(rename.status, 200);
+  assert.equal((await rename.json()).name, "qingxian-macbookair");
+
+  const reconnect = await worker.fetch(wsRequest("prod-real-runtime", "legacy-secret", "Different Automatic Name"), env);
+  assert.equal(reconnect.status, 200);
+  list = await registry.fetch(new Request("https://registry.internal/internal/devices"));
+  legacy = (await list.json()).devices.find((device) => device.workstation_id === "prod-real-runtime");
+  assert.equal(legacy.name, "qingxian-macbookair");
 });
 
 test("legacy shared secret is compatibility-only for the default workstation and revoke blocks reconnect", async () => {

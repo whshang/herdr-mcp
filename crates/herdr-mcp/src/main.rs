@@ -12,6 +12,7 @@ mod config;
 mod contract;
 mod dev;
 pub mod development_orchestration;
+mod device_name;
 mod events;
 mod exec_compact;
 mod exec_sessions;
