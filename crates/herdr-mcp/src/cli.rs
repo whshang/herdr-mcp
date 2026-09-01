@@ -87,6 +87,9 @@ pub enum WorkerCommand {
         pairing_address: String,
         name: Option<String>,
     },
+    Rename {
+        name: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -499,20 +502,22 @@ fn parse_worker(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
         Some("pair") => parse_worker_pair(&args[1..]),
         Some("connect") => parse_worker_connect(&args[1..]),
+        Some("rename") => parse_worker_rename(&args[1..]),
         Some(value) => Err(format!(
-            "unknown worker command '{value}' (expected pair or connect)"
+            "unknown worker command '{value}' (expected pair, connect, or rename)"
         )),
-        None => Err("worker requires pair or connect".to_owned()),
+        None => Err("worker requires pair, connect, or rename".to_owned()),
     }
 }
 
 fn parse_device_alias(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
         Some("pair") => parse_worker_pair(&args[1..]),
+        Some("rename") => parse_worker_rename(&args[1..]),
         Some(value) => Err(format!(
-            "device '{value}' is not implemented yet; v0.4.3 P0 supports only device pairing"
+            "device '{value}' is not implemented yet; v0.4.3 supports device pair and rename"
         )),
-        None => Err("device requires pair".to_owned()),
+        None => Err("device requires pair or rename".to_owned()),
     }
 }
 
@@ -538,10 +543,10 @@ fn parse_worker_pair(args: &[String]) -> Result<Command, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "--name requires a device name".to_owned())?;
-                if value.trim().is_empty() || value.len() > 128 {
-                    return Err("--name must contain 1..128 characters".to_owned());
-                }
-                name = Some(value.clone());
+                name = Some(
+                    crate::device_name::normalize_device_display_name(value)
+                        .ok_or_else(|| "--name must contain 1..128 UTF-16 code units".to_owned())?,
+                );
                 index += 2;
             }
             "--code" | "--pin" => {
@@ -574,10 +579,10 @@ fn parse_worker_connect(args: &[String]) -> Result<Command, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "--name requires a device name".to_owned())?;
-                if value.trim().is_empty() || value.len() > 128 {
-                    return Err("--name must contain 1..128 characters".to_owned());
-                }
-                name = Some(value.clone());
+                name = Some(
+                    crate::device_name::normalize_device_display_name(value)
+                        .ok_or_else(|| "--name must contain 1..128 UTF-16 code units".to_owned())?,
+                );
                 index += 2;
             }
             "--code" | "--pin" => {
@@ -621,6 +626,15 @@ fn parse_worker_connect(args: &[String]) -> Result<Command, String> {
             .ok_or_else(|| "worker connect requires a pairing address".to_owned())?,
         name,
     }))
+}
+
+fn parse_worker_rename(args: &[String]) -> Result<Command, String> {
+    let [name] = args else {
+        return Err("worker rename requires exactly one new device name".to_owned());
+    };
+    let name = crate::device_name::normalize_device_display_name(name)
+        .ok_or_else(|| "device name must contain 1..128 UTF-16 code units".to_owned())?;
+    Ok(Command::Worker(WorkerCommand::Rename { name }))
 }
 
 fn parse_config(args: &[String]) -> Result<Command, String> {
@@ -1161,6 +1175,25 @@ mod tests {
                 name: None,
             })
         );
+        assert_eq!(
+            parse(args(&["worker", "rename", "  qingxian-macbookair  "]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::Rename {
+                name: "qingxian-macbookair".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(args(&["device", "rename", "青闲的 MacBook Air"]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::Rename {
+                name: "青闲的 MacBook Air".to_owned(),
+            })
+        );
+        assert!(parse(args(&["worker", "rename"])).is_err());
+        assert!(parse(args(&["worker", "rename", "a", "b"])).is_err());
+        assert!(parse(args(&["worker", "rename", &"😀".repeat(65)])).is_err());
         assert!(parse(args(&["worker", "connect", "--code", "secret"])).is_err());
         assert!(parse(args(&["device", "pair", "--code", "secret"])).is_err());
         assert!(parse(args(&["worker", "pair", "--code", "secret"])).is_err());

@@ -79,6 +79,11 @@ fn enrich_macos_credentials(
             .unwrap_or_else(|| MACOS_DEFAULT_WORKSTATION_ID.to_owned());
         env_map.insert("HERDR_WORKSTATION_ID".to_owned(), workstation_id);
     }
+    if optional_trimmed(env_map, "HERDR_DEVICE_NAME").is_none()
+        && let Some(name) = crate::device_name::system_device_display_name()
+    {
+        env_map.insert("HERDR_DEVICE_NAME".to_owned(), name);
+    }
     if optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE").is_none()
         && let Some(service) = configured
             .as_ref()

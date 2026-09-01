@@ -120,6 +120,42 @@ test("legacy workstation registration creates one stable device and does not rew
   assert.equal(storage.writeCount, writesAfterFirst);
 });
 
+test("device rename updates only display metadata and repeated rename is write-free", async () => {
+  const { storage, registry } = makeRegistry();
+  const ensure = await registry.fetch(new Request("https://registry.internal/internal/devices/legacy/ensure", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workstation_id: "prod-real-runtime", name: "MacBook Air" }),
+  }));
+  assert.equal(ensure.status, 200);
+  const ensured = await ensure.json();
+  const writesBeforeRename = storage.writeCount;
+
+  const renameRequest = () => new Request("https://registry.internal/internal/devices/rename", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workstation_id: "prod-real-runtime", name: "qingxian-macbookair" }),
+  });
+  const first = await registry.fetch(renameRequest());
+  assert.equal(first.status, 200);
+  const firstBody = await first.json();
+  assert.equal(firstBody.device_id, ensured.device.device_id);
+  assert.equal(firstBody.name, "qingxian-macbookair");
+  assert.equal(firstBody.wrote_registry, true);
+  assert.equal(storage.writeCount, writesBeforeRename + 1);
+
+  const stored = await registry.fetch(new Request(`https://registry.internal/internal/devices/${ensured.device.device_id}`));
+  const storedDevice = (await stored.json()).device;
+  assert.equal(storedDevice.name, "qingxian-macbookair");
+  assert.deepEqual(storedDevice.aliases, ["MacBook Air"]);
+  const writesBeforeNoop = storage.writeCount;
+
+  const second = await registry.fetch(renameRequest());
+  assert.equal(second.status, 200);
+  assert.equal((await second.json()).wrote_registry, false);
+  assert.equal(storage.writeCount, writesBeforeNoop);
+});
+
 test("device pairing stores only digest-keyed verifiers, is single-use, and authenticates only its bound workstation", async () => {
   const { storage, registry } = makeRegistry();
   const create = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
@@ -161,6 +197,34 @@ test("device pairing stores only digest-keyed verifiers, is single-use, and auth
   const replay = await registry.fetch(consumeRequest());
   assert.equal(replay.status, 401);
   assert.equal((await replay.json()).code, "pairing_rejected");
+});
+
+test("pairing defaults the display name from the joining device when the owner did not override it", async () => {
+  const { registry } = makeRegistry();
+  const create = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ttl_seconds: 60, worker_context: "herdr-edge@test" }),
+  }));
+  assert.equal(create.status, 200);
+  const created = await create.json();
+
+  const consume = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings/consume", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      pairing_id: created.pairing_id,
+      code: created.code,
+      name: "青闲的 MacBook Air",
+      worker_context: "herdr-edge@test",
+    }),
+  }));
+  assert.equal(consume.status, 200);
+  const paired = await consume.json();
+
+  const stored = await registry.fetch(new Request(`https://registry.internal/internal/devices/${paired.device_id}`));
+  assert.equal(stored.status, 200);
+  assert.equal((await stored.json()).device.name, "青闲的 MacBook Air");
 });
 
 test("expired pairing is rejected generically and deleted", async () => {

@@ -133,6 +133,9 @@ export class DeviceRegistryDO {
     if (request.method === "POST" && url.pathname === "/internal/devices/authenticate") {
       return this.authenticateDevice(request);
     }
+    if (request.method === "POST" && url.pathname === "/internal/devices/rename") {
+      return this.renameDevice(request);
+    }
     const revokeMatch = /^\/internal\/devices\/(dev_[0-9A-Z]+)\/revoke$/.exec(url.pathname);
     if (request.method === "POST" && revokeMatch) {
       return this.revokeDevice(revokeMatch[1]);
@@ -354,6 +357,42 @@ export class DeviceRegistryDO {
       return json({ ok: false, code: "link_auth_failed" }, 401);
     }
     return json({ ok: true, device_id: device.device_id, credential_id: credential.credential_id });
+  }
+
+  private async renameDevice(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    if (!isRecord(body) || !isWorkstationId(body.workstation_id)) {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    const name = normalizeOptionalName(body.name);
+    if (name === null) return json({ ok: false, code: "invalid_device_name" }, 400);
+
+    const deviceId = await this.state.storage.get<string>(WORKSTATION_PREFIX + body.workstation_id);
+    if (!deviceId) return json({ ok: false, code: "device_not_found" }, 404);
+    const existing = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + deviceId));
+    if (!existing) return json({ ok: false, code: "registry_corrupt" }, 409);
+    if (existing.authorization === "revoked") {
+      return json({ ok: false, code: "device_revoked" }, 409);
+    }
+    if (existing.name === name) {
+      return json({ ok: true, device_id: existing.device_id, name, updated_at_ms: existing.updated_at_ms, wrote_registry: false });
+    }
+
+    const renamed: DeviceRecord = {
+      ...existing,
+      name,
+      aliases: [existing.name, ...(existing.aliases ?? [])]
+        .filter((alias, index, aliases) => alias !== name && aliases.indexOf(alias) === index)
+        .slice(0, 32),
+      updated_at_ms: Date.now(),
+    };
+    await this.state.storage.put(DEVICE_PREFIX + deviceId, renamed);
+    return json({ ok: true, device_id: renamed.device_id, name: renamed.name, updated_at_ms: renamed.updated_at_ms, wrote_registry: true });
   }
 
   private async revokeDevice(deviceId: string): Promise<Response> {

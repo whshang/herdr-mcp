@@ -49,6 +49,7 @@ const DAEMON_DRAIN_MS: u64 = 5_000;
 pub struct LinkDaemonConfig {
     pub edge_url: String,
     pub workstation_id: String,
+    pub device_name: Option<String>,
     pub link_token: String,
     pub runtime_token: String,
     pub runtime_endpoint: String,
@@ -84,6 +85,8 @@ pub fn read_link_daemon_config(
 ) -> Result<LinkDaemonConfig, DaemonConfigError> {
     let edge_url = required(env_map, "HERDR_EDGE_URL")?;
     let workstation_id = required(env_map, "HERDR_WORKSTATION_ID")?;
+    let device_name = optional_trimmed(env_map, "HERDR_DEVICE_NAME")
+        .and_then(|value| crate::device_name::normalize_device_display_name(&value));
     let link_token = required(env_map, "HERDR_LINK_TOKEN")?;
     let runtime_token = required(env_map, "HERDR_MCP_TOKEN")?;
     let runtime_endpoint = optional_trimmed(env_map, "HERDR_MCP_ENDPOINT")
@@ -152,6 +155,7 @@ pub fn read_link_daemon_config(
     Ok(LinkDaemonConfig {
         edge_url,
         workstation_id,
+        device_name,
         link_token,
         runtime_token,
         runtime_endpoint,
@@ -261,6 +265,7 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
         edge_url,
         application_protocol: LINK_SUBPROTOCOL.to_owned(),
         link_token: config.link_token.clone(),
+        device_name: config.device_name.clone(),
         socket: Default::default(),
         drain_ms: DAEMON_DRAIN_MS,
         offline_recycle_ms: super::io_loop::LINK_DEFAULT_OFFLINE_RECYCLE_MS,
@@ -414,6 +419,17 @@ mod tests {
     }
 
     #[test]
+    fn daemon_config_carries_a_bounded_device_display_name() {
+        let cfg = read_link_daemon_config(&env(&[("HERDR_DEVICE_NAME", "  青闲的 MacBook Air  ")]))
+            .expect("config");
+        assert_eq!(cfg.device_name.as_deref(), Some("青闲的 MacBook Air"));
+
+        let cfg = read_link_daemon_config(&env(&[("HERDR_DEVICE_NAME", &"😀".repeat(65))]))
+            .expect("config");
+        assert_eq!(cfg.device_name, None);
+    }
+
+    #[test]
     fn daemon_config_uses_public_epoch2_identity_and_loopback_mcp_default() {
         let cfg = read_link_daemon_config(&env(&[])).expect("config");
         assert_eq!(cfg.contract_epoch, PUBLIC_CONTRACT_EPOCH);
@@ -520,6 +536,7 @@ mod tests {
         let cfg = LinkDaemonConfig {
             edge_url: "wss://herdr-edge-dev.example/ws".to_owned(),
             workstation_id: "dev-w1".to_owned(),
+            device_name: Some("Test Mac".to_owned()),
             link_token: "link-secret".to_owned(),
             runtime_token: "runtime-secret".to_owned(),
             runtime_endpoint: "http://127.0.0.1:8772/mcp".to_owned(),
@@ -587,6 +604,7 @@ mod tests {
                 edge_url: cfg.edge_url,
                 application_protocol: LINK_SUBPROTOCOL.to_owned(),
                 link_token: cfg.link_token,
+                device_name: cfg.device_name,
                 socket: Default::default(),
                 drain_ms: DAEMON_DRAIN_MS,
                 offline_recycle_ms: crate::link::io_loop::LINK_DEFAULT_OFFLINE_RECYCLE_MS,

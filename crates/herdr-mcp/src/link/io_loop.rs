@@ -36,6 +36,7 @@ pub(crate) struct LinkIoConfig {
     pub edge_url: String,
     pub application_protocol: String,
     pub link_token: String,
+    pub device_name: Option<String>,
     pub socket: SocketDriverConfig,
     pub drain_ms: u64,
     pub offline_recycle_ms: u64,
@@ -49,6 +50,7 @@ impl LinkIoConfig {
             edge_url: edge_url.into(),
             application_protocol: LINK_SUBPROTOCOL.to_owned(),
             link_token: link_token.into(),
+            device_name: None,
             socket: SocketDriverConfig::default(),
             drain_ms: LINK_DEFAULT_DRAIN_MS,
             offline_recycle_ms: LINK_DEFAULT_OFFLINE_RECYCLE_MS,
@@ -89,6 +91,7 @@ pub(crate) struct SocketConnectRequest {
     edge_url: String,
     application_protocol: String,
     link_token: String,
+    device_name: Option<String>,
     attempt_id: SocketAttemptId,
     config: SocketDriverConfig,
 }
@@ -147,6 +150,7 @@ impl LoopSocketConnector for ProductionSocketConnector {
             &request.edge_url,
             &request.application_protocol,
             &request.link_token,
+            request.device_name.as_deref(),
             request.attempt_id,
             request.config,
         )
@@ -640,6 +644,7 @@ where
             edge_url: self.config.edge_url.clone(),
             application_protocol: self.config.application_protocol.clone(),
             link_token: self.config.link_token.clone(),
+            device_name: self.config.device_name.clone(),
             attempt_id,
             config: self.config.socket,
         };
@@ -1207,6 +1212,7 @@ mod tests {
             edge_url: "wss://edge.test/link".to_owned(),
             application_protocol: LINK_SUBPROTOCOL.to_owned(),
             link_token: "test-link-token".to_owned(),
+            device_name: None,
             socket: Default::default(),
             drain_ms,
             offline_recycle_ms: LINK_DEFAULT_OFFLINE_RECYCLE_MS,

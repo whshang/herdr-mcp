@@ -44,6 +44,7 @@ import {
   createPairingSession,
   ensureLegacyDeviceRegistration,
   listPublicDevices,
+  renameRegisteredDevice,
   resolveDeviceRouteWithContext,
   revokeRegisteredDevice,
   resolveDeviceRoute,
@@ -76,6 +77,22 @@ function noStoreJsonResponse(payload: unknown, status = 200): Response {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function deviceNameFromLinkRequest(request: Request): string | undefined {
+  const encoded = request.headers.get("x-herdr-device-name-b64");
+  if (!encoded || encoded.length > 1024 || !/^[A-Za-z0-9_-]+$/.test(encoded)) return undefined;
+  try {
+    const b64 = encoded.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = b64.length % 4 === 0 ? "" : "=".repeat(4 - (b64.length % 4));
+    const binary = atob(b64 + pad);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+    const name = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes).trim();
+    return name.length > 0 && name.length <= 128 ? name : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export default {
@@ -239,6 +256,48 @@ export default {
       );
     }
 
+    if (request.method === "POST" && url.pathname === "/devices/rename-self") {
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.workstation_id !== "string" || typeof parsed.value.name !== "string") {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const workstationId = parsed.value.workstation_id.trim();
+      const name = parsed.value.name.trim();
+      if (!workstationId || !/^[A-Za-z0-9_.-]{1,64}$/.test(workstationId) || !name || name.length > 128) {
+        return noStoreJsonResponse({ ok: false, code: "bad_request" }, 400);
+      }
+      const extracted = extractLinkCredential(request);
+      if (!extracted.ok) return noStoreJsonResponse({ ok: false, code: "link_auth_failed" }, 401);
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      const deviceAuth = await authenticateDeviceCredential(registry, workstationId, extracted.credential);
+      let authorized = deviceAuth.ok;
+      if (!authorized) {
+        const ownerAuth = await authenticateOwner(request, env);
+        const ownerWorkstation = request.headers.get("x-herdr-workstation")?.trim() ?? "";
+        authorized = ownerAuth
+          && workstationId === env.DEFAULT_WORKSTATION_ID
+          && ownerWorkstation === workstationId;
+      }
+      if (!authorized) return noStoreJsonResponse({ ok: false, code: "rename_auth_failed" }, 401);
+
+      const renamed = await renameRegisteredDevice(registry, workstationId, name);
+      if (renamed.ok) {
+        return noStoreJsonResponse({
+          ok: true,
+          device_id: renamed.device_id,
+          name: renamed.name,
+          updated_at_ms: renamed.updated_at_ms,
+          wrote_registry: renamed.wrote_registry,
+        });
+      }
+      const status = renamed.code === "device_not_found" ? 404
+        : renamed.code === "device_revoked" || renamed.code === "registry_corrupt" ? 409
+          : renamed.code === "invalid_device_name" ? 400
+            : 503;
+      return noStoreJsonResponse({ ok: false, code: renamed.code }, status);
+    }
+
     // ---- Owner/operator revoke of any enrolled device. The caller supplies only
     // the canonical target device_id — never a workstation_id or target secret.
     // Authorization is the same trusted owner contract used for pairing
@@ -320,7 +379,11 @@ export default {
 
       if (authenticatedBy === "legacy") {
         try {
-          const registered = await ensureLegacyDeviceRegistration(registry, workstationId);
+          const registered = await ensureLegacyDeviceRegistration(
+            registry,
+            workstationId,
+            deviceNameFromLinkRequest(request),
+          );
           if (registered.created) {
             logger.info("device.legacy_registered", { workstationId, deviceId: registered.device_id });
           }

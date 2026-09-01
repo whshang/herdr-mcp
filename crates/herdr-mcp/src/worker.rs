@@ -73,7 +73,11 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         WorkerCommand::Connect {
             pairing_address,
             name,
-        } => connect_existing_worker(&paths, &pairing_address, name.as_deref()),
+        } => {
+            let name = name.or_else(crate::device_name::system_device_display_name);
+            connect_existing_worker(&paths, &pairing_address, name.as_deref())
+        }
+        WorkerCommand::Rename { name } => rename_current_device(&paths, &name),
     }
 }
 
@@ -183,6 +187,49 @@ fn connect_existing_worker(
         crate::link::reconcile_after_service_generation_change,
         consume_pairing,
     )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rename_current_device(_paths: &RuntimePaths, _name: &str) -> Result<ExitCode, String> {
+    Err(
+        "worker rename currently requires macOS Keychain; refusing to rename on this platform"
+            .to_owned(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn rename_current_device(paths: &RuntimePaths, name: &str) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_owner_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client()?
+        .post(endpoint(&identity.edge_origin, "/devices/rename-self")?)
+        .headers(headers)
+        .json(&json!({
+            "workstation_id": identity.workstation_id,
+            "name": name,
+        }))
+        .send()
+        .map_err(|error| format!("cannot rename current device: {error}"))?;
+    let payload = parse_json_response(response, "device rename")?;
+    let device_id = required_string(&payload, "device_id")?;
+    let renamed = required_string(&payload, "name")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "worker_rename",
+            "device_id": device_id,
+            "name": renamed,
+        }))
+        .map_err(|error| format!("cannot encode device rename result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(target_os = "macos")]

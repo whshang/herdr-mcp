@@ -121,6 +121,53 @@ export async function authenticateDeviceCredential(
   }
 }
 
+export type RenameDeviceResult =
+  | { ok: true; device_id: string; name: string; updated_at_ms: number; wrote_registry: boolean }
+  | { ok: false; code: "device_not_found" | "device_revoked" | "invalid_device_name" | "registry_corrupt" | "internal_error" };
+
+export async function renameRegisteredDevice(
+  registry: FetchStub,
+  workstationId: string,
+  name: string,
+): Promise<RenameDeviceResult> {
+  try {
+    const response = await registry.fetch(new Request("https://registry.internal/internal/devices/rename", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workstation_id: workstationId, name }),
+    }));
+    const body: unknown = await response.json();
+    if (
+      response.ok &&
+      isRecord(body) &&
+      body.ok === true &&
+      typeof body.device_id === "string" &&
+      typeof body.name === "string" &&
+      typeof body.updated_at_ms === "number"
+    ) {
+      return {
+        ok: true,
+        device_id: body.device_id,
+        name: body.name,
+        updated_at_ms: body.updated_at_ms,
+        wrote_registry: body.wrote_registry === true,
+      };
+    }
+    const code = isRecord(body) && typeof body.code === "string" ? body.code : "internal_error";
+    switch (code) {
+      case "device_not_found":
+      case "device_revoked":
+      case "invalid_device_name":
+      case "registry_corrupt":
+        return { ok: false, code };
+      default:
+        return { ok: false, code: "internal_error" };
+    }
+  } catch {
+    return { ok: false, code: "internal_error" };
+  }
+}
+
 export type RevokeDeviceResult =
   | { ok: true; device_id: string; revoked: true; revoked_at_ms: number; wrote_registry: boolean }
   | { ok: false; code: "device_not_found" | "invalid_device_id" | "revoke_teardown_failed" | "internal_error"; retryable: boolean };
@@ -161,11 +208,12 @@ export async function revokeRegisteredDevice(registry: FetchStub, deviceId: stri
 export async function ensureLegacyDeviceRegistration(
   registry: FetchStub,
   workstationId: string,
+  name?: string,
 ): Promise<{ device_id: string; created: boolean }> {
   const response = await registry.fetch(new Request("https://registry.internal/internal/devices/legacy/ensure", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ workstation_id: workstationId, name: workstationId }),
+    body: JSON.stringify({ workstation_id: workstationId, name: name ?? workstationId }),
   }));
   if (!response.ok) throw new Error(`legacy device registration returned HTTP ${response.status}`);
   const body: unknown = await response.json();
@@ -290,7 +338,7 @@ export async function resolveDeviceRouteWithContext(
     const canonicalId = normalizeDeviceId(trimmed);
     const matches = canonicalId
       ? devices.filter((device) => device.device_id === canonicalId)
-      : devices.filter((device) => device.name === trimmed);
+      : devices.filter((device) => device.name === trimmed || device.aliases?.includes(trimmed) === true);
     if (matches.length === 0) return { ok: false, code: "device_not_found" };
     if (matches.length > 1) return { ok: false, code: "device_ambiguous" };
     const selected = matches[0];

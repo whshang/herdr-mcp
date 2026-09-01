@@ -25,10 +25,12 @@
 2. **新しいコンピュータ**で、Agent が次を実行します:
 
    ```bash
-   herdr-mcp worker connect "<pairing-address>" --name "<device-name>"
+   herdr-mcp worker connect "<pairing-address>"
    ```
 
    CLI は**6 桁のコードの入力を求めます**（エコーバックなしの TTY プロンプト、または非対話時はエコーなしの stdin 1 行）。コードは**決してコマンドライン引数にはならず**、**決してエコーまたはログ記録されません**。
+
+   デフォルトでは、参加するコンピュータの macOS **Computer Name** が device display name として登録されます。ユーザーが別名を明示的に希望する場合だけ `--name "<device-name>"` を指定してください。`worker pair --name ...` も明示的な上書きであり、参加側の自動検出名より優先されます。
 
    ペアリング消費後、`worker connect` はローカル `herdr-mcp` service を自動的にインストール/起動し、登録済み Rust production Link を作成してロードします。ローカル service が healthy で、`link-prod` が managed runtime と新しい device identity を使用していることを確認できた場合のみ成功を返します。失敗時は既存の revoke / Keychain / config 補償経路を使用します。
 
@@ -52,6 +54,14 @@ herdr-mcp link status
 ```
 
 結果として得られる不変な `device_id`、Link の online/healthy、ローカルバインドの成功を確認してください。
+
+後から現在の登録済みコンピュータを明示的に改名する場合だけ、次を実行します:
+
+```bash
+herdr-mcp worker rename "<new-device-name>"
+```
+
+`herdr-mcp device rename ...` も同じ操作です。rename が変更するのは人向けの表示名だけで、不変な `device_id`、workstation identity、資格情報、authorization、scheduling は変わりません。Link の再接続で明示的な rename が上書きされることもありません。default/legacy workstation も最初の登録時にローカル Computer Name を記録します。
 
 ## 不確実な配信 / リカバリ
 

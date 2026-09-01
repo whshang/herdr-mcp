@@ -45,10 +45,12 @@ herdr-mcp worker pair
 新电脑上的 Agent 运行：
 
 ```bash
-herdr-mcp worker connect "<pairing-address>" --name "<device-name>"
+herdr-mcp worker connect "<pairing-address>"
 ```
 
 随后 CLI 会通过不回显输入要求 6 位验证码。验证码不会作为普通命令行参数传入。
+
+默认情况下，新加入电脑会自动使用 macOS 的**电脑名称（Computer Name）**作为 device display name。只有用户明确希望使用其他名字时，才传 `--name "<device-name>"`。如果创建配对时显式使用了 `worker pair --name ...`，它同样属于用户覆盖，并优先于新电脑自动读取的名称。
 
 配对被消费后，`worker connect` 会自动安装/启动本机 `herdr-mcp` 服务，并确保当前设备对应的 Rust production Link 已创建并加载。只有本机 service 健康、`link-prod` 已由 managed runtime 持有且设备身份正确时命令才返回成功；启动失败会进入既有的远端 revoke、Keychain 清理和 config 恢复补偿流程。
 
@@ -69,6 +71,14 @@ herdr-mcp link status
 ```
 
 然后让 ChatGPT 调用 `herdr_devices`，确认新设备已经出现在同一个 Worker 中并处于在线状态。
+
+以后只有用户明确要求改名时，才运行：
+
+```bash
+herdr-mcp worker rename "<new-device-name>"
+```
+
+`herdr-mcp device rename ...` 是等价别名。rename 只修改面向人的显示名称；不可变 `device_id`、workstation identity、设备凭据、授权和调度状态全部保持不变。Link 重连不会覆盖用户显式改过的名字。最初的 default/legacy workstation 在首次登记时也会自动记录本机 Computer Name。
 
 ## 配对实际做了什么
 
