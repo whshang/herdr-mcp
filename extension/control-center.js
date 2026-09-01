@@ -14,6 +14,7 @@ import { boundedTail } from "./browser-state.js";
 import { detectOrLoadLocale, getLocale, t } from "./i18n.js";
 
 const TARGET_KEY = "herdrControlPinnedTarget";
+const EXPANDED_WORKSPACES_KEY = "herdrControlExpandedWorkspaces";
 const store = createBrowserStateStore();
 const expandedWorkspaces = new Set();
 let expansionSeeded = false;
@@ -227,6 +228,26 @@ function seedExpansion(state) {
     }
   }
   expansionSeeded = true;
+}
+
+function restoreExpansionPreference(value) {
+  if (!Array.isArray(value)) return false;
+  expandedWorkspaces.clear();
+  for (const workspaceId of value) {
+    const id = String(workspaceId || "").trim();
+    if (id) expandedWorkspaces.add(id);
+  }
+  expansionSeeded = true;
+  return true;
+}
+
+async function persistExpansionPreference() {
+  expansionSeeded = true;
+  try {
+    await chrome.storage.local.set({
+      [EXPANDED_WORKSPACES_KEY]: [...expandedWorkspaces].sort(),
+    });
+  } catch (_) { /* UI state remains valid for this panel lifetime. */ }
 }
 
 function currentPane() {
@@ -657,6 +678,7 @@ workspaceList.addEventListener("click", async (event) => {
     const workspaceId = toggle.dataset.workspaceToggle;
     if (expandedWorkspaces.has(workspaceId)) expandedWorkspaces.delete(workspaceId);
     else expandedWorkspaces.add(workspaceId);
+    void persistExpansionPreference();
     renderAll();
     return;
   }
@@ -685,7 +707,7 @@ workspaceList.addEventListener("click", async (event) => {
 $("refreshButton").addEventListener("click", () => { void refreshSnapshot(true); });
 $("collapseButton").addEventListener("click", () => {
   expandedWorkspaces.clear();
-  expansionSeeded = true;
+  void persistExpansionPreference();
   renderAll();
 });
 $("settingsButton").addEventListener("click", () => chrome.runtime.openOptionsPage());
@@ -776,8 +798,9 @@ async function start() {
   await detectOrLoadLocale();
   applyStaticI18n();
   document.documentElement.classList.remove("i18n-pending");
-  const stored = await chrome.storage.local.get(TARGET_KEY);
+  const stored = await chrome.storage.local.get([TARGET_KEY, EXPANDED_WORKSPACES_KEY]);
   pinnedTarget = stored[TARGET_KEY] || null;
+  restoreExpansionPreference(stored[EXPANDED_WORKSPACES_KEY]);
   connectControlPort(false);
   renderAll();
   await refreshSnapshot();
