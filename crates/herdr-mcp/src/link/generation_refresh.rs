@@ -20,7 +20,7 @@ use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::Instant;
 
-use super::cutover_execute::LaunchdOps;
+use super::cutover_execute::{LINK_LAUNCHD_THROTTLE_SECONDS, LaunchdOps};
 #[cfg(target_os = "macos")]
 use super::cutover_execute::{RealLaunchd, atomic_write, encode_prod_rust_plist};
 #[cfg(target_os = "macos")]
@@ -58,6 +58,13 @@ const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CONVERGENCE_MAX_POLLS: usize = 20;
 const CONVERGENCE_MAX_STALLED_POLLS: usize = 3;
 const CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+// `launchctl kickstart -k` can return while launchd is still honoring the
+// loaded Link job's ThrottleInterval. During that restart window the persisted
+// status can legitimately stay byte-for-byte stale because the replacement
+// process has not started and consumed runtime-control yet. Give only this
+// pre-progress phase a throttle-aware grace period; after any evidence changes,
+// the normal tight stall detector applies again.
+const CONVERGENCE_RESTART_GRACE_POLLS: usize = LINK_LAUNCHD_THROTTLE_SECONDS as usize + 4;
 
 /// Reconcile production Link generation state after a successful service
 /// generation change. Named instances never touch production Link state.
@@ -465,6 +472,7 @@ where
         &mut probe,
         CONVERGENCE_MAX_POLLS,
         CONVERGENCE_MAX_STALLED_POLLS,
+        CONVERGENCE_RESTART_GRACE_POLLS,
         CONVERGENCE_POLL_INTERVAL,
     )
     .map_err(|error| {
@@ -569,6 +577,7 @@ fn bounded_convergence_phase<VerifyOwnership, Probe>(
     probe: &mut Probe,
     max_polls: usize,
     max_stalled_polls: usize,
+    restart_grace_polls: usize,
     poll_interval: Duration,
 ) -> Result<(), String>
 where
@@ -578,6 +587,7 @@ where
     let mut probe_errors = 0usize;
     let mut stalled_polls = 0usize;
     let mut last_fingerprint = None;
+    let mut saw_forward_progress = false;
     for poll in 0..max_polls {
         match probe() {
             Err(error) => {
@@ -633,10 +643,18 @@ where
                 if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
                     stalled_polls += 1;
                 } else {
+                    if last_fingerprint.is_some() {
+                        saw_forward_progress = true;
+                    }
                     stalled_polls = 1;
                 }
                 last_fingerprint = Some(fingerprint);
-                if stalled_polls >= max_stalled_polls {
+                let stall_limit = if saw_forward_progress {
+                    max_stalled_polls
+                } else {
+                    restart_grace_polls.max(max_stalled_polls)
+                };
+                if stalled_polls >= stall_limit {
                     return Err(format!(
                         "production Link stalled while converging to {expected}: no forward progress across {stalled_polls} consecutive polls"
                     ));
@@ -1135,10 +1153,63 @@ mod tests {
             &mut || Ok(probes.remove(0)),
             20,
             3,
+            14,
             Duration::ZERO,
         )
         .unwrap();
         assert_eq!(ownership_checks, 1);
+    }
+
+    #[test]
+    fn kickstart_restart_grace_allows_static_prestart_evidence_then_activation() {
+        // Real macOS UAT showed `launchctl kickstart -k` returning while the
+        // loaded Link job was still inside its 10s ThrottleInterval. The old
+        // status therefore remained identical for more than three polls even
+        // though the replacement Link later started and consumed the desired
+        // revision. That pre-start silence must not trigger service rollback.
+        let mut probes = 0usize;
+        bounded_convergence_phase(
+            "rust-new",
+            &mut || Ok(()),
+            &mut || {
+                probes += 1;
+                if probes <= 11 {
+                    return Ok(ConvergenceEvidence {
+                        control_desired: Some("rust-new".to_owned()),
+                        control_revision: Some(2),
+                        status_processed_revision: Some(1),
+                        status_outcome: Some("active_unchanged".to_owned()),
+                        active_generation: Some("rust-old".to_owned()),
+                        transition_seq: Some(0),
+                        last_transition_to: None,
+                        last_transition_outcome: None,
+                    });
+                }
+                Ok(ConvergenceEvidence {
+                    control_desired: Some("rust-new".to_owned()),
+                    control_revision: Some(2),
+                    status_processed_revision: Some(2),
+                    status_outcome: Some("activated".to_owned()),
+                    active_generation: Some("rust-new".to_owned()),
+                    transition_seq: Some(1),
+                    last_transition_to: Some("rust-new".to_owned()),
+                    last_transition_outcome: Some("activated".to_owned()),
+                })
+            },
+            20,
+            3,
+            CONVERGENCE_RESTART_GRACE_POLLS,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(probes, 12);
+    }
+
+    #[test]
+    fn restart_grace_exceeds_loaded_link_launchd_throttle() {
+        let grace = CONVERGENCE_POLL_INTERVAL
+            .saturating_mul(CONVERGENCE_RESTART_GRACE_POLLS.saturating_sub(1) as u32);
+        assert!(grace > Duration::from_secs(LINK_LAUNCHD_THROTTLE_SECONDS));
     }
 
     #[test]
@@ -1164,6 +1235,7 @@ mod tests {
                 })
             },
             20,
+            3,
             3,
             Duration::ZERO,
         )
@@ -1196,6 +1268,7 @@ mod tests {
             },
             20,
             3,
+            3,
             Duration::ZERO,
         )
         .unwrap_err();
@@ -1227,6 +1300,7 @@ mod tests {
             },
             5,
             3,
+            3,
             Duration::ZERO,
         )
         .unwrap_err();
@@ -1256,6 +1330,7 @@ mod tests {
                 })
             },
             20,
+            3,
             3,
             Duration::ZERO,
         )
