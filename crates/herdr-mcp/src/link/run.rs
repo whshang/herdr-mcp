@@ -65,16 +65,21 @@ fn enrich_macos_credentials(
     let configured = RuntimePaths::discover()
         .ok()
         .and_then(|paths| Config::load_for_instance(&paths.config_file, &paths.instance).ok());
+    enrich_macos_credentials_with_config(env_map, configured.as_ref())
+}
+
+fn enrich_macos_credentials_with_config(
+    env_map: &mut HashMap<String, String>,
+    configured: Option<&Config>,
+) -> Result<(), DaemonConfigError> {
     if optional_trimmed(env_map, "HERDR_EDGE_URL").is_none() {
         let edge_url = configured
-            .as_ref()
             .and_then(|config| config.edge_ws_url().ok().flatten())
             .unwrap_or_else(|| MACOS_DEFAULT_EDGE_URL.to_owned());
         env_map.insert("HERDR_EDGE_URL".to_owned(), edge_url);
     }
     if optional_trimmed(env_map, "HERDR_WORKSTATION_ID").is_none() {
         let workstation_id = configured
-            .as_ref()
             .and_then(|config| config.edge_device_id.clone())
             .unwrap_or_else(|| MACOS_DEFAULT_WORKSTATION_ID.to_owned());
         env_map.insert("HERDR_WORKSTATION_ID".to_owned(), workstation_id);
@@ -85,9 +90,7 @@ fn enrich_macos_credentials(
         env_map.insert("HERDR_DEVICE_NAME".to_owned(), name);
     }
     if optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE").is_none()
-        && let Some(service) = configured
-            .as_ref()
-            .and_then(Config::edge_link_keychain_service)
+        && let Some(service) = configured.and_then(Config::edge_link_keychain_service)
     {
         env_map.insert("HERDR_LINK_KEYCHAIN_SERVICE".to_owned(), service);
     }
@@ -246,7 +249,7 @@ mod tests {
             ("HERDR_LINK_TOKEN".to_owned(), "link-secret".to_owned()),
             ("HERDR_MCP_TOKEN".to_owned(), "runtime-secret".to_owned()),
         ]);
-        enrich_macos_credentials(&mut env_map).expect("enrich");
+        enrich_macos_credentials_with_config(&mut env_map, None).expect("enrich");
         assert_eq!(
             env_map.get("HERDR_EDGE_URL").map(String::as_str),
             Some(MACOS_DEFAULT_EDGE_URL)

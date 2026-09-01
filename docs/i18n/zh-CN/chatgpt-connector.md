@@ -106,27 +106,30 @@ OAuth 成功以后 workstation 仍可能离线，所以不要把 OAuth 当作完
 
 ## 为什么新会话很重要：tool snapshot
 
-ChatGPT 会缓存一个会话看到的 MCP 工具定义。服务器升级以后，已经存在的对话不一定立刻刷新工具 schema。
+ChatGPT 使用经过审核的 MCP action 冻结快照。只升级本地 runtime 或部署 Edge，并不会自动把新增 action 启用到已经批准的 Workspace App 中。
 
-herdr-mcp 当前 production contract 是：
+Herdr 0.4.3 明确区分两层 contract：
 
-**contract epoch 2 / 18 tools，包含 `herdr_skill`。**
+**ChatGPT public contract：epoch 3 / 19 tools；workstation runtime execution contract：epoch 2 / 18 tools。** 新增的第 19 个 action 是 Edge-local `herdr_devices`，不会转发到 workstation。
 
 典型现象：
 
 ```text
-服务器已经 epoch 2 / 18 tools
+服务器已经 public epoch 3 / 19 tools
         │
-        ├─ 新会话：18 tools ✓
+        ├─ 已刷新 action 集：可以看到 19 tools ✓
         │
-        └─ 老会话：仍看到 epoch 1 / 17 tools
+        └─ 旧/冻结 action 集：可能仍只有 18 tools
 ```
 
-这时不要马上重装服务器。先：
+升级 runtime 后：
 
 1. 确认 Edge / runtime 暴露的是当前版本；
-2. 在 ChatGPT 刷新自定义 App/Connector actions（如果当前 Workspace UI 提供此动作）；
-3. 新建会话重新获取 tool snapshot。
+2. **不要**仅因为 workstation runtime 升级就断开、删除或重新添加 Connector；
+3. Herdr public action catalog 发生变化时，通过当前账户可用的 Workspace App 管理入口刷新、审核并发布 actions；新增 action 如需显式启用则同时启用；
+4. action snapshot 更新后，用新会话重新验证。
+
+不要为了陈旧 tool snapshot 重装 workstation。v0.4.2 runtime 仍可继续执行 epoch-2 / 18-tool workstation contract；只有升级到 v0.4.3 后才获得新的多设备 runtime 能力。
 
 工具 catalog 真正发生不兼容变化时，项目使用 contract epoch 管理；普通 runtime bugfix 不应该随意改变 catalog。
 

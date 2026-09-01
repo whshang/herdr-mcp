@@ -13,6 +13,7 @@ herdr-mcp install
 herdr-mcp status
 herdr-mcp doctor
 herdr-mcp permissions status
+herdr-mcp update
 herdr-mcp update check
 herdr-mcp update apply
 herdr-mcp update auto
@@ -21,6 +22,8 @@ herdr-mcp rollback
 herdr-mcp reinstall
 herdr-mcp uninstall
 ```
+
+`update` is the normal one-step user upgrade and is equivalent to `update apply`. Use `update check` only for an explicit read-only availability/provenance check before deciding whether to upgrade.
 
 `update auto` is the scheduler entrypoint. On the default macOS production instance, `service install` reconciles the owned `dev.herdr-mcp.auto-update` LaunchAgent. It runs on load and then daily. Automatic installation is intentionally **PROD-runtime + Stable-release only**: a compiled DEV runtime, `[update] check = false`, named instances, or `preview` all skip before network access. When a strictly newer Stable Release exists, the command reuses the normal provenance-verified detached update transaction; it does not introduce a second downloader or bypass rollback gates. `service uninstall` first arms an owned durable update fence and removes the scheduler; detached workers re-check that fence before activation, so service removal cannot be undone by a queued silent update. An explicit successful install clears the fence.
 

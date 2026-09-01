@@ -632,6 +632,9 @@ fn parse_worker_rename(args: &[String]) -> Result<Command, String> {
     let [name] = args else {
         return Err("worker rename requires exactly one new device name".to_owned());
     };
+    if name.starts_with('-') {
+        return Err(format!("unknown worker rename argument '{name}'"));
+    }
     let name = crate::device_name::normalize_device_display_name(name)
         .ok_or_else(|| "device name must contain 1..128 UTF-16 code units".to_owned())?;
     Ok(Command::Worker(WorkerCommand::Rename { name }))
@@ -886,7 +889,7 @@ fn parse_update(args: &[String]) -> Result<Command, String> {
                 job_id: value.clone(),
             }))
         }
-        [] => Ok(Command::Update(UpdateCommand::Check { manifest_url: None })),
+        [] => Ok(Command::Update(UpdateCommand::Apply { manifest_url: None })),
         [subcommand, ..] => Err(format!(
             "invalid update command or arguments for '{subcommand}'"
         )),
@@ -1193,6 +1196,8 @@ mod tests {
         );
         assert!(parse(args(&["worker", "rename"])).is_err());
         assert!(parse(args(&["worker", "rename", "a", "b"])).is_err());
+        assert!(parse(args(&["worker", "rename", "--help"])).is_err());
+        assert!(parse(args(&["worker", "rename", "-h"])).is_err());
         assert!(parse(args(&["worker", "rename", &"😀".repeat(65)])).is_err());
         assert!(parse(args(&["worker", "connect", "--code", "secret"])).is_err());
         assert!(parse(args(&["device", "pair", "--code", "secret"])).is_err());
@@ -1569,7 +1574,7 @@ mod tests {
         assert!(parse(args(&["install", "--adopt-node"])).is_err());
         assert_eq!(
             parse(args(&["update"])).unwrap().command,
-            Command::Update(UpdateCommand::Check { manifest_url: None })
+            Command::Update(UpdateCommand::Apply { manifest_url: None })
         );
         assert!(parse(args(&["update", "apply", "--force"])).is_err());
         assert!(parse(args(&["native-host"])).is_err());

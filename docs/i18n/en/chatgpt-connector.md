@@ -96,28 +96,29 @@ OAuth success does not prove that the workstation is online.
 
 ## Tool snapshots and new conversations
 
-ChatGPT caches MCP tool definitions per conversation.
+ChatGPT uses a reviewed/frozen snapshot of MCP action definitions. A runtime or Edge deployment does not automatically enable newly added actions in an already approved workspace app.
 
-Current production contract:
+Herdr 0.4.3 separates the two contracts intentionally:
 
-**contract epoch 2 / 18 tools, including `herdr_skill`.**
+**public ChatGPT contract: epoch 3 / 19 tools; workstation runtime execution contract: epoch 2 / 18 tools.** The extra public action is Edge-local `herdr_devices`; it is never forwarded to a workstation.
 
 Example:
 
 ```text
-Server: epoch 2 / 18 tools
+Server: public epoch 3 / 19 tools
 
-New conversation       ✓ sees epoch 2
-Old conversation       → may keep old snapshot
+Refreshed action set   ✓ can expose epoch 3
+Old/frozen action set  → may remain on 18 tools
 ```
 
 After runtime upgrades:
 
 1. verify Edge/runtime version;
-2. refresh the connector if the UI provides that action;
-3. create a new conversation.
+2. do **not** disconnect/delete/re-add the Connector merely because the workstation runtime was upgraded;
+3. when the Herdr public action catalog changed, refresh/review/publish the app actions through the workspace controls available on the account, and explicitly enable new actions when required;
+4. use a fresh conversation after the action snapshot changes.
 
-Do not reinstall the workstation for a stale tool snapshot.
+Do not reinstall the workstation for a stale tool snapshot. Existing v0.4.2 runtimes continue to execute the epoch-2 18-tool workstation contract; they simply do not gain the v0.4.3 multi-device runtime features until upgraded.
 
 ## Why the catalog is intentionally small
 
