@@ -39,7 +39,7 @@ Then run `herdr --version` again. Herdr's own install behavior is authoritative 
 
 ## Supported platform boundary
 
-Current published stable runtime is **`v0.4.2`**. The stable macOS TCC broker has completed cross-generation authorization verification; Developer ID signing is optional hardening. On macOS, `herdr-mcp permissions setup` prepares the broker and `herdr-mcp permissions verify` checks access. The strongest clean-machine qualification evidence remains the `v0.4.0` **macOS Apple Silicon** run. A Windows x64 release binary is available, while Windows end-to-end UAT is still being completed. Linux is not yet claimed as a supported current-stable herdr-mcp runtime surface.
+Current published stable runtime is **`v0.4.2`**. The stable macOS TCC broker has completed cross-generation authorization verification; Developer ID signing is optional hardening. The v0.4.3 install path preserves the same broker compatibility revision and ensures the fixed broker exists before the rotating runtime service starts. An interactive first install opens **Full Disk Access** for that broker; macOS still requires the user to grant the permission explicitly. `herdr-mcp permissions setup` reopens the same panel and `herdr-mcp permissions verify` checks access. Runtime generation updates never rewrite a same-revision broker. The strongest clean-machine qualification evidence remains the `v0.4.0` **macOS Apple Silicon** run. A Windows x64 release binary is available, while Windows end-to-end UAT is still being completed. Linux is not yet claimed as a supported current-stable herdr-mcp runtime surface.
 
 ## Step 1: install the native herdr-mcp runtime
 
@@ -53,6 +53,8 @@ herdr-mcp update check
 ```
 
 `install` stages an immutable generation under `~/.config/herdr-mcp/runtime/` and points the user PATH entry at `runtime/current/herdr-mcp`. Normal users do not install the local runtime with a git clone, `npm`, or `cargo`.
+
+On macOS the service remains a normal user LaunchAgent; `sudo` is not required and does not grant TCC access. The permission target is the stable `~/.config/herdr-mcp/tcc-broker/herdr-mcp-broker`, not a rotating `runtime/generations/rust-*` binary. A non-interactive install prepares the broker but does not open System Settings; run `herdr-mcp permissions setup` once at a user terminal if Full Disk Access is not already granted.
 
 ## Step 2: make the local runtime healthy first
 

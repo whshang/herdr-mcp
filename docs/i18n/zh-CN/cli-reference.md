@@ -51,6 +51,16 @@ herdr-mcp dev rollback
 
 DEV/PROD 切换只影响本机 runtime lifecycle，不部署 Cloudflare Edge，不修改 DNS/OAuth，也不创建第三套长期 test 环境。Runtime DEV/PROD 与扩展 DEV/STANDALONE/STORE 身份模型相互独立。
 
+## macOS 权限
+
+```bash
+herdr-mcp permissions status
+herdr-mcp permissions setup
+herdr-mcp permissions verify
+```
+
+`status` 会返回 `granted`、`denied`、`needs_setup`、`unknown` 或 `timeout`。`setup` 会尽可能直接打开**完全磁盘访问（Full Disk Access）**，但不会声称已经替用户授权；macOS 仍要求用户本人确认。`verify` 通过固定 TCC broker 验证受保护目录。v0.4.3 起，交互式 `herdr-mcp install` 会在 service 启动前准备 broker，并在仍需授权时打开同一设置页。若 file/git 工具返回 `macos_tcc_access_blocked`，给 `herdr-mcp-broker` 开启完全磁盘访问后再执行 `verify`。
+
 ## Agent 能力发现：`scan`
 
 `doctor` 回答的是**“这套安装现在健康吗？”**；`scan` 回答的是**“这台机器上的 Agent 到底有哪些已经被证据确认的能力？”**。

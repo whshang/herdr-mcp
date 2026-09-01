@@ -8,6 +8,10 @@
 use crate::tcc_broker;
 use serde_json::{Value, json};
 use std::io::ErrorKind;
+#[cfg(target_os = "macos")]
+use std::io::IsTerminal;
+#[cfg(any(target_os = "macos", test))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(target_os = "macos")]
@@ -17,7 +21,8 @@ use std::time::Duration;
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(target_os = "macos", test))]
 const HINT_SETUP: &str = "run `herdr-mcp permissions setup`";
-const HINT_DENIED: &str = "enable Files and Folders or Full Disk Access for herdr-mcp-broker, then `herdr-mcp permissions verify`";
+const HINT_DENIED: &str =
+    "enable Full Disk Access for herdr-mcp-broker, then `herdr-mcp permissions verify`";
 #[cfg(any(target_os = "macos", test))]
 const HINT_TIMEOUT: &str =
     "probe timed out (2s); finish the macOS prompt, then `herdr-mcp permissions verify`";
@@ -27,6 +32,11 @@ const HINT_UNKNOWN: &str = "re-run `herdr-mcp permissions verify`";
 const HINT_GRANTED: &str = "protected path readable";
 #[cfg(any(not(target_os = "macos"), test))]
 const HINT_NOT_APPLICABLE: &str = "macOS only";
+#[cfg(any(target_os = "macos", test))]
+const FULL_DISK_ACCESS_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
+#[cfg(any(target_os = "macos", test))]
+const AUTHORIZATION_PENDING_FILE: &str = "authorization-required";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermissionState {
@@ -76,13 +86,13 @@ impl PermissionState {
     }
 
     fn doctor_pass(self) -> bool {
-        #[cfg(any(target_os = "macos", test))]
-        {
-            !matches!(self, Self::Denied | Self::Timeout)
-        }
-        #[cfg(all(not(target_os = "macos"), not(test)))]
-        {
-            true
+        match self {
+            #[cfg(any(target_os = "macos", test))]
+            Self::Granted => true,
+            #[cfg(any(not(target_os = "macos"), test))]
+            Self::NotApplicable => true,
+            #[allow(unreachable_patterns)]
+            _ => false,
         }
     }
 }
@@ -140,31 +150,46 @@ pub(crate) fn collect_status() -> Result<PermissionReport, String> {
 
     #[cfg(target_os = "macos")]
     {
-        let config_dir = crate::paths::RuntimePaths::discover()?.config_dir;
-        let path = tcc_broker::broker_path(&config_dir);
-        let installed = tcc_broker::status(&path).is_some();
-        let update_available = broker_update_available(&config_dir);
-        if !installed {
-            return Ok(PermissionReport {
-                state: PermissionState::NeedsSetup,
-                broker_installed: false,
-                broker_path: path,
-                broker_update_available: false,
-                probe: "skipped",
-                hint: HINT_SETUP.to_owned(),
-            });
-        }
-        let (state, probe) = classify_probe(probe_protected_path(&path));
-        let hint = state.hint().to_owned();
-        Ok(PermissionReport {
-            state,
+        collect_macos_status(false)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_status(force_probe: bool) -> Result<PermissionReport, String> {
+    let config_dir = crate::paths::RuntimePaths::discover()?.config_dir;
+    let path = tcc_broker::broker_path(&config_dir);
+    let installed = tcc_broker::status(&path).is_some();
+    let update_available = broker_update_available(&config_dir);
+    if !installed {
+        return Ok(PermissionReport {
+            state: PermissionState::NeedsSetup,
+            broker_installed: false,
+            broker_path: path,
+            broker_update_available: false,
+            probe: "skipped",
+            hint: HINT_SETUP.to_owned(),
+        });
+    }
+    if !force_probe && authorization_required(&config_dir)? {
+        return Ok(PermissionReport {
+            state: PermissionState::NeedsSetup,
             broker_installed: true,
             broker_path: path,
             broker_update_available: update_available,
-            probe,
-            hint,
-        })
+            probe: "skipped_authorization_pending",
+            hint: HINT_DENIED.to_owned(),
+        });
     }
+    let (state, probe) = classify_probe(probe_protected_path(&path));
+    let hint = state.hint().to_owned();
+    Ok(PermissionReport {
+        state,
+        broker_installed: true,
+        broker_path: path,
+        broker_update_available: update_available,
+        probe,
+        hint,
+    })
 }
 
 pub(crate) fn doctor_layer_from(report: &Result<PermissionReport, String>) -> String {
@@ -242,11 +267,12 @@ fn run_setup(upgrade_broker: bool) -> Result<ExitCode, String> {
     println!("broker_update_available: {}", sync.broker_update_available);
     #[cfg(target_os = "macos")]
     {
+        mark_authorization_required(&config_dir)?;
         if std::env::var_os("HERDR_MCP_PERMISSIONS_DRY_RUN").is_some() {
             println!("opened: skipped");
         } else {
-            match open_privacy_settings() {
-                Ok(()) => println!("opened: Privacy & Security"),
+            match open_full_disk_access_settings() {
+                Ok(()) => println!("opened: Full Disk Access"),
                 Err(error) => {
                     println!("opened: false");
                     println!("settings_open_failed: {error}");
@@ -265,6 +291,74 @@ fn run_setup(upgrade_broker: bool) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Best-effort completion step for an interactive macOS install.
+///
+/// The service transaction is already committed before this runs. Failure to
+/// open System Settings must therefore never roll back a healthy service. The
+/// stable broker is installed separately during install preflight; this step
+/// only asks the user to authorize that stable broker once.
+#[cfg(target_os = "macos")]
+pub(crate) fn post_service_install_onboarding(instance_is_named: bool) {
+    if instance_is_named {
+        return;
+    }
+
+    let config_dir = match crate::paths::RuntimePaths::discover() {
+        Ok(paths) => paths.config_dir,
+        Err(error) => {
+            eprintln!("macOS permissions: unable to locate stable broker: {error}");
+            return;
+        }
+    };
+    let pending = match authorization_required(&config_dir) {
+        Ok(pending) => pending,
+        Err(error) => {
+            eprintln!("macOS permissions: unable to read onboarding state: {error}");
+            return;
+        }
+    };
+    if !pending {
+        return;
+    }
+    let broker_path = tcc_broker::broker_path(&config_dir);
+
+    eprintln!(
+        "macOS permissions: Full Disk Access is required for uninterrupted access to protected project folders"
+    );
+    eprintln!("permission target: {}", broker_path.display());
+    eprintln!("after granting access, run `herdr-mcp permissions verify`");
+
+    let interactive = std::io::stdin().is_terminal()
+        || std::io::stdout().is_terminal()
+        || std::io::stderr().is_terminal();
+    let dry_run = std::env::var_os("HERDR_MCP_PERMISSIONS_DRY_RUN").is_some();
+    if !should_open_full_disk_access_onboarding(PermissionState::NeedsSetup, interactive, dry_run) {
+        eprintln!("run `herdr-mcp permissions setup` to open Full Disk Access settings");
+        return;
+    }
+
+    if let Err(error) = open_full_disk_access_settings() {
+        eprintln!("macOS permissions: could not open Full Disk Access settings: {error}");
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn should_open_full_disk_access_onboarding(
+    state: PermissionState,
+    interactive: bool,
+    dry_run: bool,
+) -> bool {
+    interactive
+        && !dry_run
+        && matches!(
+            state,
+            PermissionState::Denied
+                | PermissionState::NeedsSetup
+                | PermissionState::Unknown
+                | PermissionState::Timeout
+        )
+}
+
 fn run_verify() -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     {
@@ -275,7 +369,8 @@ fn run_verify() -> Result<ExitCode, String> {
 
     #[cfg(target_os = "macos")]
     {
-        let report = collect_status()?;
+        let config_dir = crate::paths::RuntimePaths::discover()?.config_dir;
+        let report = collect_macos_status(true)?;
         print_status(&report);
         // TCC verification must not make the rotating runtime (or a git child
         // spawned by it) the responsible client. The broker probe validates
@@ -292,6 +387,9 @@ fn run_verify() -> Result<ExitCode, String> {
             }
         );
         let ok = report.state == PermissionState::Granted;
+        if ok {
+            clear_authorization_required(&config_dir)?;
+        }
         Ok(if ok {
             ExitCode::SUCCESS
         } else {
@@ -306,6 +404,8 @@ fn run_verify() -> Result<ExitCode, String> {
 pub fn preserve_or_install_broker(config_dir: &Path) -> Result<BrokerSync, String> {
     let path = tcc_broker::broker_path(config_dir);
     if tcc_broker::status(&path).is_none() {
+        #[cfg(target_os = "macos")]
+        mark_authorization_required(config_dir)?;
         tcc_broker::install(config_dir, false)?;
         let info = tcc_broker::status(&path);
         return Ok(BrokerSync {
@@ -322,6 +422,91 @@ pub fn preserve_or_install_broker(config_dir: &Path) -> Result<BrokerSync, Strin
         broker_update_available: broker_update_available(config_dir),
         sha256: info.map(|info| info.sha256),
     })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn authorization_pending_path(config_dir: &Path) -> PathBuf {
+    tcc_broker::broker_path(config_dir)
+        .parent()
+        .expect("broker path always has a parent")
+        .join(AUTHORIZATION_PENDING_FILE)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn authorization_required(config_dir: &Path) -> Result<bool, String> {
+    let path = authorization_pending_path(config_dir);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "macOS permission onboarding marker must not be a symlink: {}",
+            path.display()
+        )),
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "macOS permission onboarding marker must be a regular file: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "cannot inspect macOS permission onboarding marker {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn mark_authorization_required(config_dir: &Path) -> Result<(), String> {
+    let path = authorization_pending_path(config_dir);
+    if authorization_required(config_dir)? {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "macOS permission onboarding marker has no parent".to_owned())?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "cannot create macOS permission onboarding directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| {
+            format!(
+                "cannot create macOS permission onboarding marker {}: {error}",
+                path.display()
+            )
+        })?;
+    file.write_all(b"v1\n").map_err(|error| {
+        format!(
+            "cannot write macOS permission onboarding marker {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn clear_authorization_required(config_dir: &Path) -> Result<(), String> {
+    let path = authorization_pending_path(config_dir);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(format!(
+            "refusing to remove non-regular macOS permission onboarding marker: {}",
+            path.display()
+        )),
+        Ok(_) => std::fs::remove_file(&path).map_err(|error| {
+            format!(
+                "cannot clear macOS permission onboarding marker {}: {error}",
+                path.display()
+            )
+        }),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot inspect macOS permission onboarding marker {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -520,9 +705,9 @@ fn classify_probe(outcome: ProbeOutcome) -> (PermissionState, &'static str) {
 }
 
 #[cfg(target_os = "macos")]
-fn open_privacy_settings() -> Result<(), String> {
+fn open_full_disk_access_settings() -> Result<(), String> {
     let status = std::process::Command::new("/usr/bin/open")
-        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders")
+        .arg(FULL_DISK_ACCESS_SETTINGS_URL)
         .status()
         .map_err(|error| format!("cannot open Privacy & Security: {error}"))?;
     if status.success() {
@@ -580,9 +765,55 @@ mod tests {
         assert!(PermissionState::Granted.doctor_pass());
         assert!(!PermissionState::Denied.doctor_pass());
         assert!(!PermissionState::Timeout.doctor_pass());
-        assert!(PermissionState::NeedsSetup.doctor_pass());
+        assert!(!PermissionState::NeedsSetup.doctor_pass());
+        assert!(!PermissionState::Unknown.doctor_pass());
         assert_eq!(PermissionState::NotApplicable.as_str(), "not_applicable");
         assert!(PermissionState::NotApplicable.doctor_pass());
+    }
+
+    #[test]
+    fn install_onboarding_only_opens_full_disk_access_when_interactive() {
+        assert!(should_open_full_disk_access_onboarding(
+            PermissionState::Denied,
+            true,
+            false
+        ));
+        assert!(!should_open_full_disk_access_onboarding(
+            PermissionState::Granted,
+            true,
+            false
+        ));
+        assert!(!should_open_full_disk_access_onboarding(
+            PermissionState::Denied,
+            false,
+            false
+        ));
+        assert!(!should_open_full_disk_access_onboarding(
+            PermissionState::Denied,
+            true,
+            true
+        ));
+        assert!(FULL_DISK_ACCESS_SETTINGS_URL.contains("Privacy_AllFiles"));
+    }
+
+    #[test]
+    fn authorization_pending_marker_round_trips_and_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let config = temp_dir("authorization-pending");
+        mark_authorization_required(&config).unwrap();
+        assert!(authorization_required(&config).unwrap());
+        clear_authorization_required(&config).unwrap();
+        assert!(!authorization_required(&config).unwrap());
+
+        let marker = authorization_pending_path(&config);
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        symlink(config.join("elsewhere"), &marker).unwrap();
+        assert!(authorization_required(&config).is_err());
+        assert!(clear_authorization_required(&config).is_err());
+
+        let _ = fs::remove_file(&marker);
+        let _ = fs::remove_dir_all(&config);
     }
 
     #[test]

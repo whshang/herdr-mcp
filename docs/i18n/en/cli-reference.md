@@ -58,7 +58,7 @@ herdr-mcp permissions setup
 herdr-mcp permissions verify
 ```
 
-`status` is `granted`, `denied`, `needs_setup`, `unknown`, or `timeout`. `setup` may open Privacy & Security and does not grant access. `verify` checks a protected path. If file/git tools return `macos_tcc_access_blocked`, grant Files and Folders or Full Disk Access to `herdr-mcp-broker`, then verify again.
+`status` is `granted`, `denied`, `needs_setup`, `unknown`, or `timeout`. `setup` opens the **Full Disk Access** pane when possible and does not claim to grant access; macOS still requires explicit user approval. `verify` checks a protected path through the stable broker. A fresh interactive `herdr-mcp install` prepares that broker before the service starts and opens the same Full Disk Access pane when authorization is still needed. If file/git tools return `macos_tcc_access_blocked`, grant Full Disk Access to `herdr-mcp-broker`, then verify again.
 
 ## Capability discovery: `scan`
 
