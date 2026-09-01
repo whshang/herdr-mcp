@@ -2825,9 +2825,13 @@ mod macos {
                 "service rollback committed and previous implementation passed its health gate",
             )
             .is_ok();
-        let native_host_sync = crate::native_host_install::sync_owned_runtime_from_active()
-            .map(|value| value.get("synced").and_then(Value::as_bool) == Some(true))
-            .unwrap_or(false);
+        let native_host_sync = if paths.instance.is_named() {
+            false
+        } else {
+            crate::native_host_install::sync_owned_runtime_from_active()
+                .map(|value| value.get("synced").and_then(Value::as_bool) == Some(true))
+                .unwrap_or(false)
+        };
         Ok(json!({
             "ok": true,
             "action": "rollback",
