@@ -397,7 +397,7 @@ test("authorize+token: Claude URL client_id resolves its CIMD metadata without D
   const fetchFn = async (input, init = {}) => {
     assert.equal(String(input), cimd);
     assert.equal(init.method, "GET");
-    assert.equal(init.redirect, "error");
+    assert.equal(init.redirect, "manual");
     metadataFetches += 1;
     return new Response(JSON.stringify({
       client_id: cimd,
@@ -426,6 +426,27 @@ test("authorize+token: Claude URL client_id resolves its CIMD metadata without D
   assert.equal(token.status, 200);
   assert.ok((await token.json()).access_token);
   assert.equal(metadataFetches, 2, "authorize and token each validate current CIMD metadata");
+});
+
+test("authorize: generic CIMD keeps redirects manual and rejects 3xx metadata", async () => {
+  const cimd = "https://client.example/oauth/client-metadata";
+  const redirect = "https://client.example/oauth/callback";
+  const challenge = await s256Challenge("R".repeat(44));
+  const qs = new URLSearchParams({ client_id: cimd, redirect_uri: redirect, code_challenge: challenge });
+  const opts = makeOptions({
+    fetchFn: async (input, init = {}) => {
+      assert.equal(String(input), cimd);
+      assert.equal(init.redirect, "manual");
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://redirect.example/oauth/client-metadata" },
+      });
+    },
+  });
+
+  const resp = await GET(`/oauth/authorize?${qs}`, opts);
+  assert.equal(resp.status, 400);
+  assert.equal((await resp.json()).error_description, "unknown client_id");
 });
 
 test("authorize: generic CIMD requires exact client_id and forbids shared-secret auth", async () => {

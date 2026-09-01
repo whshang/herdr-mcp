@@ -353,7 +353,9 @@ async function resolveCimdClient(
     response = await fetchFn(clientId, {
       method: "GET",
       headers: { accept: "application/json, application/*+json" },
-      redirect: "error",
+      // Workers does not implement redirect:"error". Manual keeps the 3xx
+      // response visible so the status===200 gate below still fails closed.
+      redirect: "manual",
     });
   } catch {
     return null;

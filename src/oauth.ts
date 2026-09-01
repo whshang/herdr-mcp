@@ -504,7 +504,9 @@ async function resolveCimdClient(clientId: string): Promise<StoredClient | undef
     response = await fetch(clientId, {
       method: "GET",
       headers: { accept: "application/json, application/*+json" },
-      redirect: "error",
+      // Cloudflare Workers implements only "follow" and "manual". Keep
+      // redirects visible and reject them via the status===200 check below.
+      redirect: "manual",
     });
   } catch {
     return undefined;
