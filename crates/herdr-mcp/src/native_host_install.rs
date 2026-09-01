@@ -672,12 +672,25 @@ fn sync_owned_runtime_with_active(paths: &InstallPaths, active: &Path) -> Result
         sync_preflight(&view)?;
     }
 
-    let identity_migrated = if view
+    // Stale manifest-only footprints are not an owned Native Host cohort. Old
+    // releases could leave browser manifests behind after the managed wrapper
+    // and native runtime were removed. Without either owned executable there
+    // is no identity to migrate and runtime sync must not touch those manifests.
+    // A footprint containing either executable still goes through the strict
+    // legacy-cohort proof below and remains fail-closed when partial or foreign.
+    let owned_manifest_count = view
         .get("owned_manifest_count")
         .and_then(Value::as_u64)
-        .unwrap_or(0)
-        == 0
+        .unwrap_or(0);
+    if owned_manifest_count == 0
+        && !path_present(&paths.runtime_binary)
+        && !path_present(&paths.wrapper)
+        && let Some(result) = sync_preflight(&view)?
     {
+        return Ok(result);
+    }
+
+    let identity_migrated = if owned_manifest_count == 0 {
         refresh_legacy_managed_wrapper_identity(paths)?
     } else {
         false
@@ -4026,6 +4039,29 @@ mod tests {
         assert_eq!(skipped["skipped"], true);
         assert_eq!(skipped["reason"], "native_host_not_owned");
         assert!(!paths.runtime_binary.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_skips_stale_manifest_only_legacy_footprint_without_mutating_it() {
+        let (root, paths) = fixture();
+        let home = root.join("home");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        let active_binary = write_managed_active_runtime(&config_dir, b"active-runtime-binary-v3");
+        let manifest_path = paths.targets[0].0.join(format!("{HOST_NAME}.json"));
+        fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+        write_json_file(&manifest_path, &manifest_value(&paths), 0o600).unwrap();
+        let manifest_before = fs::read(&manifest_path).unwrap();
+
+        assert!(!paths.runtime_binary.exists());
+        assert!(!paths.wrapper.exists());
+        let skipped = sync_owned_runtime_with_active(&paths, &active_binary).unwrap();
+        assert_eq!(skipped["skipped"], true);
+        assert_eq!(skipped["reason"], "native_host_not_owned");
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+        assert!(!paths.runtime_binary.exists());
+        assert!(!paths.wrapper.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
