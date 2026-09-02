@@ -94,6 +94,11 @@ where
         let paths = RuntimePaths::discover()?;
         crate::macos_permissions::preserve_or_install_broker(&paths.config_dir)
             .map_err(|error| format!("macOS TCC broker install preflight failed: {error}"))?;
+        crate::macos_credential_helper::preserve_or_install(&paths.config_dir).map_err(
+            |error| format!("macOS credential helper install preflight failed: {error}"),
+        )?;
+        crate::macos_credential_helper::prewarm_existing_default(&paths.config_dir)
+            .map_err(|error| format!("macOS credential helper preflight failed: {error}"))?;
     }
 
     let result = install(&mutation_lock)?;

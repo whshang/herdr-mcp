@@ -59,13 +59,21 @@ fn validate_label(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub fn delete_generic_secret(service: &str, account: &str) -> Result<(), String> {
     validate_label(service, "service")?;
     validate_label(account, "account")?;
-    delete_generic_password(service, account).map_err(|error| {
-        format!("cannot delete workstation credential from macOS Keychain: {error}")
-    })
+    #[cfg(target_os = "macos")]
+    {
+        delete_generic_password(service, account).map_err(|error| {
+            format!("cannot delete workstation credential from macOS Keychain: {error}")
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (service, account);
+        Err("workstation credential deletion requires macOS Keychain".to_owned())
+    }
 }
 
 #[cfg(test)]
