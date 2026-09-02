@@ -86,10 +86,13 @@ mod macos {
     use std::os::unix::io::AsRawFd;
     use std::path::{Component, Path, PathBuf};
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     const JOURNAL_SCHEMA: u8 = 2;
     const JOURNAL_NAME: &str = "product-uninstall.json";
+    const LAUNCHD_BOOTOUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    const LAUNCHD_BOOTOUT_MAX_POLLS: usize = 200;
     const INSTALL_IDENTITY_SCHEMA: u8 = 1;
     const INSTALL_IDENTITY_NAME: &str = "product-install.json";
     const PHASE_AUTO_UPDATE: &str = "auto_update_scheduler";
@@ -1267,20 +1270,7 @@ mod macos {
     }
 
     fn remove_launch_agent(plan: &LaunchAgentRemoval) -> Result<(), String> {
-        if launchd_loaded(&plan.label)? {
-            let target = format!("gui/{}/{}", unsafe { libc::geteuid() }, plan.label);
-            let output = Command::new("/bin/launchctl")
-                .args(["bootout", &target])
-                .output()
-                .map_err(|error| format!("cannot bootout {}: {error}", plan.label))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "cannot bootout owned LaunchAgent {}: {}",
-                    plan.label,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
-            }
-        }
+        ensure_launchd_job_stopped_fail_closed(&plan.label)?;
         match fs::remove_file(&plan.path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1306,26 +1296,64 @@ mod macos {
     }
 
     fn ensure_service_stopped_fail_closed(label: &str) -> Result<(), String> {
-        if !launchd_loaded(label)? {
+        ensure_launchd_job_stopped_fail_closed(label)
+    }
+
+    fn ensure_launchd_job_stopped_fail_closed(label: &str) -> Result<(), String> {
+        ensure_launchd_job_stopped_with(
+            label,
+            LAUNCHD_BOOTOUT_MAX_POLLS,
+            || launchd_loaded(label),
+            || {
+                let target = format!("gui/{}/{}", unsafe { libc::geteuid() }, label);
+                let output = Command::new("/bin/launchctl")
+                    .args(["bootout", &target])
+                    .output()
+                    .map_err(|error| {
+                        format!("cannot bootout owned LaunchAgent {label}: {error}")
+                    })?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "cannot bootout owned LaunchAgent {label}: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ))
+                }
+            },
+            thread::sleep,
+        )
+    }
+
+    fn ensure_launchd_job_stopped_with<Loaded, Bootout, Sleep>(
+        label: &str,
+        max_polls: usize,
+        mut loaded: Loaded,
+        mut bootout: Bootout,
+        mut sleep: Sleep,
+    ) -> Result<(), String>
+    where
+        Loaded: FnMut() -> Result<bool, String>,
+        Bootout: FnMut() -> Result<(), String>,
+        Sleep: FnMut(Duration),
+    {
+        if !loaded()? {
             return Ok(());
         }
-        let target = format!("gui/{}/{}", unsafe { libc::geteuid() }, label);
-        let output = Command::new("/bin/launchctl")
-            .args(["bootout", &target])
-            .output()
-            .map_err(|error| format!("cannot bootout owned service {label}: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "cannot bootout owned service {label}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+        bootout()?;
+        for poll in 0..=max_polls {
+            if !loaded()? {
+                return Ok(());
+            }
+            if poll == max_polls {
+                return Err(format!(
+                    "LaunchAgent {label} remained loaded for {}ms after bootout; refusing product cleanup",
+                    LAUNCHD_BOOTOUT_POLL_INTERVAL.as_millis() * max_polls as u128
+                ));
+            }
+            sleep(LAUNCHD_BOOTOUT_POLL_INTERVAL);
         }
-        if launchd_loaded(label)? {
-            return Err(format!(
-                "service {label} remained loaded after bootout; refusing product cleanup"
-            ));
-        }
-        Ok(())
+        unreachable!("bounded launchd bootout loop must return")
     }
 
     fn interpret_launchctl_print(success: bool, stderr: &str) -> Result<bool, String> {
@@ -1893,6 +1921,66 @@ mod macos {
             );
             assert!(interpret_launchctl_print(false, "Operation not permitted").is_err());
             assert!(interpret_launchctl_print(false, "").is_err());
+        }
+
+        #[test]
+        fn product_uninstall_waits_for_bootout_to_converge_before_cleanup() {
+            let mut states = std::collections::VecDeque::from([true, true, true, false]);
+            let mut bootouts = 0usize;
+            let mut sleeps = 0usize;
+            ensure_launchd_job_stopped_with(
+                "dev.herdr-mcp.uat.server",
+                4,
+                || Ok(states.pop_front().unwrap_or(false)),
+                || {
+                    bootouts += 1;
+                    Ok(())
+                },
+                |_| sleeps += 1,
+            )
+            .unwrap();
+            assert_eq!(bootouts, 1);
+            assert_eq!(sleeps, 2);
+        }
+
+        #[test]
+        fn product_uninstall_bootout_wait_is_bounded_and_fail_closed() {
+            let mut bootouts = 0usize;
+            let mut sleeps = 0usize;
+            let error = ensure_launchd_job_stopped_with(
+                "dev.herdr-mcp.uat.server",
+                2,
+                || Ok(true),
+                || {
+                    bootouts += 1;
+                    Ok(())
+                },
+                |_| sleeps += 1,
+            )
+            .unwrap_err();
+            assert!(error.contains("remained loaded"));
+            assert!(error.contains("100ms"));
+            assert_eq!(bootouts, 1);
+            assert_eq!(sleeps, 2);
+        }
+
+        #[test]
+        fn product_uninstall_does_not_bootout_an_absent_job() {
+            let mut bootouts = 0usize;
+            let mut sleeps = 0usize;
+            ensure_launchd_job_stopped_with(
+                "dev.herdr-mcp.uat.server",
+                2,
+                || Ok(false),
+                || {
+                    bootouts += 1;
+                    Ok(())
+                },
+                |_| sleeps += 1,
+            )
+            .unwrap();
+            assert_eq!(bootouts, 0);
+            assert_eq!(sleeps, 0);
         }
 
         #[test]
