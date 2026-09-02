@@ -47,7 +47,7 @@ herdr-mcp dev rollback
 
 - `dev status` 只读，显示 runtime channel、active/dev/prod generation、source repo/branch/commit/dirty provenance、`runtime/current` 是否与记录一致，以及固定 PROD 快照是否通过校验。
 - `dev sync --dry-run` 只展示计划，不构建、不切换 runtime。
-- `dev sync` 默认要求 clean source checkout，把源码构建成例如 `0.4.3-dev` 的 DEV identity；进入 DEV 前先把现有 PROD binary 与 SHA-256 evidence 固定保存在 `~/.config/herdr-mcp/runtime/channels/prod/`，再复用正式 transactional service install。只有 server、Native Host、`dev.herdr-mcp.link-prod` 都 reconcile 到同一个 managed generation，激活才算成功。
+- `dev sync` 默认要求 clean source checkout，把源码构建成例如 `<version>-dev` 的 DEV identity；进入 DEV 前先把现有 PROD binary 与 SHA-256 evidence 固定保存在 `~/.config/herdr-mcp/runtime/channels/prod/`，再复用正式 transactional service install。只有 server、Native Host、`dev.herdr-mcp.link-prod` 都 reconcile 到同一个 managed generation，激活才算成功。
 - `dev sync --allow-dirty` 是给明确的本地实验使用的 provenance override，不应作为日常默认值。
 - `dev rollback` 校验并重新安装固定 PROD binary。连续多次 DEV sync 保留最初固定的 PROD 恢复源，不会把“上一个 DEV generation”当作新的 PROD。
 
@@ -90,7 +90,7 @@ probe 子进程没有 stdin，超时上限为三秒，输出有大小上限，�
 
 ### Web planner 的动态规划建议
 
-v0.4.3 继续保持 18 个 public MCP tools，不新增专用 planning tool。`herdr_skill` 的 progressive bootstrap 会声明一个现有 `herdr_call` 可调用的本地只读方法：
+v0.4.3+ 继续保持 18 个 public MCP tools，不新增专用 planning tool。`herdr_skill` 的 progressive bootstrap 会声明一个现有 `herdr_call` 可调用的本地只读方法：
 
 ```text
 herdr_call(

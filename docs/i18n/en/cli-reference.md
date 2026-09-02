@@ -46,7 +46,7 @@ herdr-mcp dev rollback
 
 - `dev status` is read-only. It reports current runtime channel, active/dev/prod generations, source repo/branch/commit/dirty provenance, whether `runtime/current` matches recorded state, and whether the pinned PROD snapshot validates.
 - `dev sync --dry-run` shows the intended transaction without building or switching runtime state.
-- `dev sync` requires a clean source checkout by default, builds a DEV identity such as `0.4.3-dev`, pins the pre-existing PROD binary and SHA-256 evidence under `~/.config/herdr-mcp/runtime/channels/prod/`, then reuses the normal transactional service install path. Server, Native Host and `dev.herdr-mcp.link-prod` must reconcile to the same managed generation before activation is accepted.
+- `dev sync` requires a clean source checkout by default, builds a DEV identity such as `<version>-dev`, pins the pre-existing PROD binary and SHA-256 evidence under `~/.config/herdr-mcp/runtime/channels/prod/`, then reuses the normal transactional service install path. Server, Native Host and `dev.herdr-mcp.link-prod` must reconcile to the same managed generation before activation is accepted.
 - `dev sync --allow-dirty` is an explicit provenance override for deliberate local experiments. Do not make it the default.
 - `dev rollback` verifies and reinstalls the pinned PROD binary. Repeated DEV syncs preserve that fixed PROD recovery source rather than treating the previous DEV generation as PROD.
 
@@ -89,7 +89,7 @@ Static evidence is kept in a bounded capability inventory under the herdr-mcp co
 
 ### Dynamic planning advice for the Web planner
 
-v0.4.3 keeps the workstation Runtime Execution Contract at 18 tools and does not add a dedicated planning tool. The public Edge contract has 19 actions because `herdr_devices` is Edge-local. The progressive `herdr_skill` bootstrap advertises a read-only local method routed through the existing `herdr_call` tool:
+v0.4.3+ keeps the workstation Runtime Execution Contract at 18 tools and does not add a dedicated planning tool. The public Edge contract has 19 actions because `herdr_devices` is Edge-local. The progressive `herdr_skill` bootstrap advertises a read-only local method routed through the existing `herdr_call` tool:
 
 ```text
 herdr_call(
