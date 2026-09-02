@@ -38,7 +38,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 
 ## 支持平台
 
-当前已发布的 stable runtime 是 **`v0.4.2`**。稳定 TCC broker 已完成跨 generation 授权验证；Apple Developer ID 仅为可选加固。v0.4.3 的安装流程继续保持同一个 broker compatibility revision，并在会轮换的 runtime service 启动前先确保固定 broker 已存在。macOS 交互式首次安装会直接打开 **完全磁盘访问（Full Disk Access）**，但授权动作仍必须由用户本人在系统设置中确认；`herdr-mcp permissions setup` 可再次打开同一设置页，`herdr-mcp permissions verify` 用于验证。普通 runtime generation 更新不会重写同 revision 的 broker。最充分的 clean-machine qualification 证据仍来自 `v0.4.0` 的 **macOS Apple Silicon** 验收。Windows x64 Release binary 已提供，但 Windows 端到端 UAT 仍在继续；Linux runtime 暂不作为当前 stable 的正式支持面承诺。
+当前已发布的 stable runtime 是 **`v0.4.3`**。稳定 TCC broker 已完成跨 generation 授权验证；Apple Developer ID 仅为可选加固。v0.4.3 的安装流程继续保持同一个 broker compatibility revision，并在会轮换的 runtime service 启动前先确保固定 broker 已存在。macOS 交互式首次安装会直接打开 **完全磁盘访问（Full Disk Access）**，但授权动作仍必须由用户本人在系统设置中确认；`herdr-mcp permissions setup` 可再次打开同一设置页，`herdr-mcp permissions verify` 用于验证。普通 runtime generation 更新不会重写同 revision 的 broker。最充分的 clean-machine qualification 证据仍来自 `v0.4.0` 的 **macOS Apple Silicon** 验收。Windows x64 Release binary 已提供，但 Windows 端到端 UAT 仍在继续；Linux runtime 暂不作为当前 stable 的正式支持面承诺。
 
 macOS 的 v0.4.3 还把生产设备凭据从会轮换的 runtime 代码中分离出来：Keychain 读写统一经过固定的 `~/.config/herdr-mcp/herdr-mcp-credential-helper`。已有安装第一次迁移到这个 helper 时，macOS 可能只需要一次明确的钥匙串授权；该预检发生在 service / Link mutation 之前，弹窗被忽略或拒绝时会直接中止，不会进入反复重启 Link、反复弹窗的状态。普通 runtime 升级会保留同 compatibility revision 的 helper，因此每个新的 `runtime/generations/rust-*` 不再分别成为新的 Keychain client。这个 credential helper 与上面的完全磁盘访问 / TCC broker 是两个独立的稳定身份。
 
@@ -144,7 +144,7 @@ curl -s -o /dev/null -w '%{http_code}\n' "${EDGE_ORIGIN}/mcp"
 
 浏览器扩展用于 Side Panel 控制中心、workspace binding、长对话连续性和“排队”下一轮消息。它不是基础 MCP 闭环的必需项。
 
-扩展分为三种身份：**STORE / STANDALONE / DEV**。当前 stable v0.4.2 的 Native Host 只支持 Store/DEV ownership；v0.4.3+ 才把固定身份的 STANDALONE 作为正式手动/GitHub 分发路径。
+扩展分为三种身份：**STORE / STANDALONE / DEV**。v0.4.2 的 Native Host 只支持 Store/DEV ownership；v0.4.3+ 增加固定身份的 STANDALONE，作为正式手动/GitHub 分发路径。
 
 - STORE：普通用户默认，Chrome Web Store 固定身份与更新；
 - STANDALONE：v0.4.3+，固定非 Store 身份；Store 不可用或用户明确选择独立分发时使用；
