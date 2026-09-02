@@ -125,7 +125,7 @@ pub fn augment_inspect(view: &mut Value, cache: Option<&EventCache>, exec: Optio
         );
         workstation.insert(
             "exec_sessions".to_owned(),
-            exec.map(|registry| Value::Array(registry.list_views()))
+            exec.map(|registry| Value::Array(compact_exec_session_views(registry.list_views())))
                 .unwrap_or_else(|| Value::Array(vec![])),
         );
         workstation.insert("exec_sessions_source".to_owned(), json!("rust-native"));
@@ -157,6 +157,80 @@ pub fn augment_inspect(view: &mut Value, cache: Option<&EventCache>, exec: Optio
                 "artifacts": artifacts,
             }),
         );
+    }
+}
+
+fn compact_exec_session_views(views: Vec<Value>) -> Vec<Value> {
+    const RECENT_CLOSED: usize = 3;
+    let mut selected = views
+        .iter()
+        .filter(|view| view.get("running").and_then(Value::as_bool) == Some(true))
+        .cloned()
+        .collect::<Vec<_>>();
+    selected.extend(
+        views
+            .iter()
+            .rev()
+            .filter(|view| view.get("running").and_then(Value::as_bool) != Some(true))
+            .take(RECENT_CLOSED)
+            .cloned(),
+    );
+    selected.sort_by(|left, right| {
+        left.get("started_at")
+            .and_then(Value::as_str)
+            .cmp(&right.get("started_at").and_then(Value::as_str))
+    });
+    selected
+        .into_iter()
+        .map(|mut view| {
+            if let Some(command) = view.get("command").and_then(Value::as_str) {
+                view["command"] = json!(redact_command_summary(command));
+            }
+            view
+        })
+        .collect()
+}
+
+fn redact_command_summary(command: &str) -> String {
+    const SECRET_FLAGS: &[&str] = &["--api-key", "--token", "--password", "--secret"];
+    let mut output = Vec::new();
+    let mut redact_next = false;
+    for token in command.split_whitespace() {
+        if redact_next {
+            output.push("<redacted>".to_owned());
+            redact_next = false;
+            continue;
+        }
+        if SECRET_FLAGS.contains(&token) {
+            output.push(token.to_owned());
+            redact_next = true;
+            continue;
+        }
+        if let Some(flag) = SECRET_FLAGS
+            .iter()
+            .find(|flag| token.starts_with(&format!("{flag}=")))
+        {
+            output.push(format!("{flag}=<redacted>"));
+            continue;
+        }
+        if let Some((key, _)) = token.split_once('=') {
+            let key = key.to_ascii_uppercase();
+            if key.ends_with("_TOKEN")
+                || key.ends_with("_SECRET")
+                || key.ends_with("_PASSWORD")
+                || key.ends_with("_API_KEY")
+            {
+                output.push(format!("{key}=<redacted>"));
+                continue;
+            }
+        }
+        output.push(token.to_owned());
+    }
+    let summary = output.join(" ");
+    if summary.chars().count() <= 160 {
+        summary
+    } else {
+        format!("{}…", summary.chars().take(159).collect::<String>())
     }
 }
 
@@ -309,5 +383,24 @@ mod tests {
                 "serialized inspect must not contain {secret}"
             );
         }
+    }
+
+    #[test]
+    fn exec_session_summary_keeps_running_plus_recent_and_redacts_commands() {
+        let views = vec![
+            json!({"session_id":"old","running":false,"started_at":"2026-01-01T00:00:00Z","command":"echo old"}),
+            json!({"session_id":"recent-a","running":false,"started_at":"2026-01-02T00:00:00Z","command":"API_TOKEN=secret tool --api-key hidden"}),
+            json!({"session_id":"recent-b","running":false,"started_at":"2026-01-03T00:00:00Z","command":"echo b"}),
+            json!({"session_id":"recent-c","running":false,"started_at":"2026-01-04T00:00:00Z","command":"echo c"}),
+            json!({"session_id":"running","running":true,"started_at":"2026-01-01T12:00:00Z","command":"tool --token=live-secret"}),
+        ];
+        let compact = compact_exec_session_views(views);
+        assert_eq!(compact.len(), 4);
+        assert!(compact.iter().any(|view| view["session_id"] == "running"));
+        assert!(!compact.iter().any(|view| view["session_id"] == "old"));
+        let text = serde_json::to_string(&compact).unwrap();
+        assert!(!text.contains("live-secret"));
+        assert!(!text.contains("hidden"));
+        assert!(!text.contains("API_TOKEN=secret"));
     }
 }

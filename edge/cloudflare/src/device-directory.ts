@@ -245,12 +245,15 @@ export type DeviceRouteResult =
   | {
       ok: true;
       device_id: string | null;
+      device_name?: string;
       workstation_id: string;
       routing_reason: "explicit_device" | "device_ref" | "single_available_device" | "legacy_default_device";
     }
   | {
       ok: false;
       code: "device_not_found" | "device_ambiguous" | "device_ref_conflict" | "device_paused" | "device_suspended" | "device_revoked" | "device_unavailable";
+      selected_device?: { device_id: string; name: string };
+      candidate_devices?: Array<{ device_id: string; name: string }>;
     };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -289,10 +292,11 @@ async function readRegistryDevices(registry: FetchStub): Promise<DeviceRecord[]>
 }
 
 function unavailableReason(device: DeviceRecord): DeviceRouteResult {
-  if (device.authorization === "revoked") return { ok: false, code: "device_revoked" };
-  if (device.authorization === "suspended") return { ok: false, code: "device_suspended" };
-  if (device.scheduling !== "enabled") return { ok: false, code: "device_paused" };
-  return { ok: false, code: "device_unavailable" };
+  const selected_device = { device_id: device.device_id, name: device.name };
+  if (device.authorization === "revoked") return { ok: false, code: "device_revoked", selected_device };
+  if (device.authorization === "suspended") return { ok: false, code: "device_suspended", selected_device };
+  if (device.scheduling !== "enabled") return { ok: false, code: "device_paused", selected_device };
+  return { ok: false, code: "device_unavailable", selected_device };
 }
 
 export async function resolveDeviceRoute(
@@ -323,7 +327,7 @@ export async function resolveDeviceRouteWithContext(
     const { extractDeviceIdFromArgs } = await import("./device-refs.js");
     extractedRef = extractDeviceIdFromArgs(ctx.args);
     if (extractedRef) {
-      if (extractedRef.deviceId === "__conflict__" || extractedRef.deviceId === "__type_mismatch__") {
+      if (extractedRef.deviceId === "__conflict__" || extractedRef.deviceId === "__type_mismatch__" || extractedRef.deviceId === "__malformed__") {
         return { ok: false, code: "device_ref_conflict" };
       }
     }
@@ -340,7 +344,13 @@ export async function resolveDeviceRouteWithContext(
       ? devices.filter((device) => device.device_id === canonicalId)
       : devices.filter((device) => device.name === trimmed || device.aliases?.includes(trimmed) === true);
     if (matches.length === 0) return { ok: false, code: "device_not_found" };
-    if (matches.length > 1) return { ok: false, code: "device_ambiguous" };
+    if (matches.length > 1) {
+      return {
+        ok: false,
+        code: "device_ambiguous",
+        candidate_devices: matches.map((device) => ({ device_id: device.device_id, name: device.name })),
+      };
+    }
     const selected = matches[0];
     if (!isRoutableDevice(selected)) return unavailableReason(selected);
     if (extractedRef && extractedRef.deviceId !== selected.device_id) {
@@ -349,6 +359,7 @@ export async function resolveDeviceRouteWithContext(
     return {
       ok: true,
       device_id: selected.device_id,
+      device_name: selected.name,
       workstation_id: selected.workstation_id,
       routing_reason: "explicit_device",
     };
@@ -362,6 +373,7 @@ export async function resolveDeviceRouteWithContext(
     return {
       ok: true,
       device_id: device.device_id,
+      device_name: device.name,
       workstation_id: device.workstation_id,
       routing_reason: "device_ref",
     };
@@ -374,13 +386,20 @@ export async function resolveDeviceRouteWithContext(
   // an unavailable default reports its own state, and corrupt duplicate legacy
   // mappings remain fail-closed.
   const legacyMatches = devices.filter((device) => device.workstation_id === ctx.legacyWorkstationId);
-  if (legacyMatches.length > 1) return { ok: false, code: "device_ambiguous" };
+  if (legacyMatches.length > 1) {
+    return {
+      ok: false,
+      code: "device_ambiguous",
+      candidate_devices: legacyMatches.map((device) => ({ device_id: device.device_id, name: device.name })),
+    };
+  }
   if (legacyMatches.length === 1) {
     const selected = legacyMatches[0];
     if (!isRoutableDevice(selected)) return unavailableReason(selected);
     return {
       ok: true,
       device_id: selected.device_id,
+      device_name: selected.name,
       workstation_id: selected.workstation_id,
       routing_reason: "legacy_default_device",
     };
@@ -391,13 +410,26 @@ export async function resolveDeviceRouteWithContext(
     return {
       ok: true,
       device_id: routable[0].device_id,
+      device_name: routable[0].name,
       workstation_id: routable[0].workstation_id,
       routing_reason: "single_available_device",
     };
   }
-  if (routable.length > 1) return { ok: false, code: "device_ambiguous" };
+  if (routable.length > 1) {
+    return {
+      ok: false,
+      code: "device_ambiguous",
+      candidate_devices: routable.map((device) => ({ device_id: device.device_id, name: device.name })),
+    };
+  }
   if (devices.length === 1) return unavailableReason(devices[0]);
-  if (devices.length > 1) return { ok: false, code: "device_unavailable" };
+  if (devices.length > 1) {
+    return {
+      ok: false,
+      code: "device_unavailable",
+      candidate_devices: devices.map((device) => ({ device_id: device.device_id, name: device.name })),
+    };
+  }
   return {
     ok: true,
     device_id: null,

@@ -17,6 +17,80 @@ pub const LOCAL_DESCRIBE_METHOD: &str = "herdr_mcp.skill.describe";
 pub const LOCAL_LOAD_METHOD: &str = "herdr_mcp.skill.load";
 pub const PLANNING_ADVISE_METHOD: &str = "herdr_mcp.planning.advise";
 
+pub fn local_method_schemas(query: &str) -> Vec<Value> {
+    let schemas = vec![
+        json!({
+            "method": LOCAL_LIST_METHOD,
+            "source": "herdr_mcp_local",
+            "params": {
+                "properties": {"project_root": {"type": "string"}},
+                "required": [],
+                "empty": true,
+            },
+        }),
+        json!({
+            "method": LOCAL_DESCRIBE_METHOD,
+            "source": "herdr_mcp_local",
+            "params": {
+                "properties": {
+                    "id": {"type": "string"},
+                    "project_root": {"type": "string"},
+                },
+                "required": ["id"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": LOCAL_LOAD_METHOD,
+            "source": "herdr_mcp_local",
+            "params": {
+                "properties": {
+                    "ids": {"type": "array", "items": {"type": "string"}},
+                    "expected_digests": {"type": "object"},
+                    "project_root": {"type": "string"},
+                },
+                "required": ["ids"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": PLANNING_ADVISE_METHOD,
+            "source": "herdr_mcp_local",
+            "params": {
+                "properties": {
+                    "deterministic_tool": {"type": "string"},
+                    "project_root": {"type": "string"},
+                    "explicit_target": {"type": "string"},
+                    "requires_code_edit": {"type": "boolean"},
+                    "requires_shell": {"type": "boolean"},
+                    "requires_vision": {"type": "boolean"},
+                    "minimum_reasoning_tier": {"type": "integer", "minimum": 0, "maximum": 255},
+                    "destructive_production_mutation": {"type": "boolean"},
+                    "delegates_other_workers": {"type": "boolean"},
+                    "independent_units": {"type": "integer", "minimum": 1, "maximum": 64},
+                    "ownership_isolated": {"type": "boolean"},
+                    "shared_runtime_state": {"type": "boolean"},
+                },
+                "required": [],
+                "empty": true,
+            },
+        }),
+    ];
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return schemas;
+    }
+    schemas
+        .into_iter()
+        .filter(|schema| {
+            schema
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(|method| method.to_ascii_lowercase().contains(&query))
+        })
+        .collect()
+}
+
 const BUILTIN_SOURCE_IDENTITY: &str = "herdr-mcp:builtin";
 const GLOBAL_POLICY_URI: &str = "skill://herdr-mcp/AGENTS.md";
 const GLOBAL_AGENTS: &str = include_str!("../../../assets/herdr/AGENTS.md");
@@ -402,7 +476,7 @@ impl ProgressiveSkillService {
                     "minimum_reasoning_tier": "optional integer 0..255",
                     "destructive_production_mutation": "optional boolean",
                     "delegates_other_workers": "optional boolean",
-                    "independent_units": "optional integer 1..64; defaults to 1",
+                    "independent_units": "optional integer 1..64; omitted means task independence is unknown",
                     "ownership_isolated": "optional boolean",
                     "shared_runtime_state": "optional boolean"
                 }
@@ -820,7 +894,9 @@ fn planning_worker_json(worker: &WorkerCapability) -> Value {
         "control_target": worker.pane_id.as_deref().unwrap_or(worker.agent_id.as_str()),
         "kind": worker.kind,
         "provider": worker.provider,
+        "provider_source": worker.provider_source,
         "model": worker.model,
+        "model_source": worker.model_source,
         "status": worker.current_status,
         "project": worker.current_project,
         "verified": {
@@ -889,13 +965,13 @@ fn optional_u8(params: &Value, key: &str) -> Result<Option<u8>, Value> {
     }
 }
 
-fn optional_independent_units(params: &Value) -> Result<usize, Value> {
+fn optional_independent_units(params: &Value) -> Result<Option<usize>, Value> {
     match params.get("independent_units") {
-        None | Some(Value::Null) => Ok(1),
+        None | Some(Value::Null) => Ok(None),
         Some(value) => value
             .as_u64()
             .filter(|value| (1..=64).contains(value))
-            .map(|value| value as usize)
+            .map(|value| Some(value as usize))
             .ok_or_else(|| invalid_params("independent_units must be an integer from 1 to 64")),
     }
 }
@@ -911,7 +987,9 @@ fn dispatch_advice_json(advice: &DispatchAdvice) -> Value {
                 "control_target": candidate.control_target,
                 "kind": candidate.kind,
                 "provider": candidate.provider,
+                "provider_source": candidate.provider_source,
                 "model": candidate.model,
+                "model_source": candidate.model_source,
                 "status": candidate.current_status,
                 "project": candidate.current_project,
                 "workspace_id": candidate.workspace_id,
@@ -1685,6 +1763,30 @@ mod tests {
         );
         assert_eq!(result["ok"], false);
         assert_eq!(result["code"], "invalid_params");
+    }
+
+    #[test]
+    fn local_method_discovery_exposes_planning_schema() {
+        let methods = local_method_schemas("planning");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0]["method"], PLANNING_ADVISE_METHOD);
+        assert_eq!(methods[0]["source"], "herdr_mcp_local");
+        assert_eq!(
+            methods[0]["params"]["properties"]["independent_units"]["maximum"],
+            64
+        );
+    }
+
+    #[test]
+    fn empty_planning_advice_does_not_invent_task_independence() {
+        let service = ProgressiveSkillService::new();
+        let result =
+            service.planning_advise_method_with_inventory(&json!({}), &planning_snapshot(), &[]);
+        assert_eq!(
+            result["advice"]["parallelism"]["reason"],
+            "task_independence_unspecified"
+        );
+        assert_eq!(result["advice"]["parallelism"]["worth_considering"], false);
     }
 
     #[test]

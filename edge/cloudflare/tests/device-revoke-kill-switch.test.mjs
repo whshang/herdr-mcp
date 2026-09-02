@@ -487,7 +487,11 @@ test("explicit MCP routing after revoke returns device_revoked", async () => {
   assert.equal(revoke.status, 200);
 
   const route = await resolveDeviceRoute(env.registry, b.device_id, "legacy");
-  assert.deepEqual(route, { ok: false, code: "device_revoked" });
+  assert.deepEqual(route, {
+    ok: false,
+    code: "device_revoked",
+    selected_device: { device_id: b.device_id, name: "route-b" },
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -9,8 +9,6 @@ use crate::state_cache::{DigestSnapshot, EventCache};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
-const SCHEMA_SOURCE: &str = "herdr api schema --json (live, 60s cache)";
-
 pub fn inspect(
     client: &HerdrClient,
     cache: Option<&EventCache>,
@@ -29,12 +27,25 @@ pub fn since(cache: &EventCache, cursor: u64, workspace: Option<&str>) -> Value 
 }
 
 pub fn methods(query: &str) -> Value {
+    let mut local = crate::progressive_skills::local_method_schemas(query);
     match schema::list_methods(query) {
-        Ok(methods) => json!({
+        Ok(methods) => {
+            let mut combined = methods.iter().map(method_json).collect::<Vec<_>>();
+            combined.append(&mut local);
+            json!({
+                "ok": true,
+                "count": combined.len(),
+                "methods": combined,
+                "source": "herdr api schema --json (live, 60s cache)",
+                "local_method_source": "herdr_mcp_local_registry",
+            })
+        }
+        Err(error) if !local.is_empty() => json!({
             "ok": true,
-            "count": methods.len(),
-            "methods": methods.iter().map(method_json).collect::<Vec<_>>(),
-            "source": SCHEMA_SOURCE,
+            "count": local.len(),
+            "methods": local,
+            "source": "herdr_mcp_local_registry",
+            "warnings": [{"code": "herdr_schema_unavailable", "message": error}],
         }),
         Err(error) => json!({
             "ok": false,
@@ -121,6 +132,7 @@ pub fn call_with_local(
 fn method_json(method: &MethodSchema) -> Value {
     json!({
         "method": method.method,
+        "source": "herdr_socket",
         "params": {
             "properties": method.properties,
             "required": method.required,
@@ -264,9 +276,9 @@ mod tests {
                 json!({"cursor": 7, "workspace_id": "w2"}),
             ],
             agents: vec![
-                json!({"name": "pi", "workspace": "w1"}),
-                json!({"name": "claude", "workspace": "w1"}),
-                json!({"name": "pi", "workspace": "w2"}),
+                json!({"name": "pi-one", "kind": "pi", "workspace": "w1"}),
+                json!({"name": "claude-one", "kind": "claude", "workspace": "w1"}),
+                json!({"name": "pi-two", "kind": "pi", "workspace": "w2"}),
             ],
             workspaces: vec![
                 json!({"workspace_id": "w1", "label": "one", "pane_count": 1, "tab_count": 1}),
@@ -281,7 +293,8 @@ mod tests {
         assert_eq!(result["event_count"], 1);
         assert_eq!(result["events"][0]["workspace_id"], "w1");
         assert_eq!(result["agents"].as_array().unwrap().len(), 1);
-        assert_eq!(result["agents"][0]["name"], "pi");
+        assert_eq!(result["agents"][0]["name"], "pi-one");
+        assert_eq!(result["agents"][0]["kind"], "pi");
         assert_eq!(result["workspaces"].as_array().unwrap().len(), 1);
         assert_eq!(result["workspaces"][0]["workspace_id"], "w1");
         assert_eq!(result["agents_hidden"], 1);

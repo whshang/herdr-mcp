@@ -83,6 +83,24 @@ pub struct CapabilityInventoryStore {
 }
 
 impl CapabilityInventoryStore {
+    pub fn has_scan_cache(config_dir: &Path) -> bool {
+        let dir = config_dir.join("capability");
+        if reject_symlink(&dir, "capability state directory").is_err() {
+            return false;
+        }
+        let path = dir.join("inventory.db");
+        if reject_symlink(&path, "capability inventory database").is_err() || !path.is_file() {
+            return false;
+        }
+        Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()
+            .and_then(|conn| {
+                conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .ok()
+            })
+            .is_some_and(|version| version > 0 && version <= INVENTORY_SCHEMA_VERSION)
+    }
+
     pub fn open(config_dir: &Path) -> Result<Self, String> {
         let dir = config_dir.join("capability");
         reject_symlink(&dir, "capability state directory")?;

@@ -5,6 +5,7 @@ use crate::mutation;
 use crate::projects;
 use regex::Regex;
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -31,6 +32,8 @@ const OUTPUT_LIMIT: usize = 8_000;
 const PARTIAL_OUTPUT_LIMIT: usize = 4_000;
 const STALE_SCRIPT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static NEXT_EXEC: AtomicU64 = AtomicU64::new(0);
+static UTILITY_PREPARE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static UTILITY_PANE_IDS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 type LocalChunks = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
 
 #[derive(Debug, Clone)]
@@ -534,11 +537,14 @@ fn prepare_utility_pane(
     workspace_id: &str,
     cwd: &Path,
 ) -> Result<(String, bool), PrepareError> {
+    let _guard = UTILITY_PREPARE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let cached = panes_from_snapshot(snapshot, workspace_id);
-    if let Some(pane) = cached
-        .iter()
-        .find(|pane| pane.label.as_deref() == Some(UTILITY_LABEL))
-    {
+    let remembered = utility_pane_id(workspace_id);
+    if let Some(pane) = choose_utility_pane(&cached, remembered.as_deref()) {
+        remember_utility_pane(workspace_id, &pane.id);
         return Ok((pane.id.clone(), false));
     }
 
@@ -558,18 +564,20 @@ fn prepare_utility_pane(
                 });
             }
         };
-        if let Some(pane) = panes
-            .iter()
-            .find(|pane| pane.label.as_deref() == Some(UTILITY_LABEL))
-        {
+        if let Some(pane) = choose_utility_pane(&panes, remembered.as_deref()) {
+            remember_utility_pane(workspace_id, &pane.id);
             return Ok((pane.id.clone(), false));
         }
+        forget_utility_pane(workspace_id, remembered.as_deref());
         let seed = panes
             .first()
             .or_else(|| cached.first())
             .map(|pane| pane.id.as_str());
         match split_utility_pane(client, workspace_id, seed, cwd) {
-            Ok(pane_id) => return Ok((pane_id, true)),
+            Ok(pane_id) => {
+                remember_utility_pane(workspace_id, &pane_id);
+                return Ok((pane_id, true));
+            }
             Err(error) if is_control_plane_taskgroup(&error.message) => {
                 last_taskgroup = Some(error.message);
                 thread::sleep(Duration::from_millis(100 + attempt * 200));
@@ -595,6 +603,11 @@ fn recover_utility_pane(
     cwd: &Path,
     stale_id: &str,
 ) -> Result<(String, bool), PrepareError> {
+    let _guard = UTILITY_PREPARE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    forget_utility_pane(workspace_id, Some(stale_id));
     let panes = fresh_panes(client, workspace_id).map_err(|error| {
         if is_control_plane_taskgroup(&error.message) {
             PrepareError::ControlPlane(error.message)
@@ -609,6 +622,7 @@ fn recover_utility_pane(
         .iter()
         .find(|pane| pane.id != stale_id && pane.label.as_deref() == Some(UTILITY_LABEL))
     {
+        remember_utility_pane(workspace_id, &pane.id);
         return Ok((pane.id.clone(), false));
     }
     let cached = panes_from_snapshot(snapshot, workspace_id);
@@ -624,7 +638,10 @@ fn recover_utility_pane(
                 .map(|pane| pane.id.clone())
         });
     split_utility_pane(client, workspace_id, seed.as_deref(), cwd)
-        .map(|pane| (pane, true))
+        .map(|pane| {
+            remember_utility_pane(workspace_id, &pane);
+            (pane, true)
+        })
         .map_err(|error| {
             if is_control_plane_taskgroup(&error.message) {
                 PrepareError::ControlPlane(error.message)
@@ -635,6 +652,46 @@ fn recover_utility_pane(
                 }
             }
         })
+}
+
+fn choose_utility_pane<'a>(
+    panes: &'a [PaneRecord],
+    remembered: Option<&str>,
+) -> Option<&'a PaneRecord> {
+    remembered
+        .and_then(|pane_id| panes.iter().find(|pane| pane.id == pane_id))
+        .or_else(|| {
+            panes
+                .iter()
+                .find(|pane| pane.label.as_deref() == Some(UTILITY_LABEL))
+        })
+}
+
+fn utility_pane_id(workspace_id: &str) -> Option<String> {
+    UTILITY_PANE_IDS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(workspace_id)
+        .cloned()
+}
+
+fn remember_utility_pane(workspace_id: &str, pane_id: &str) {
+    UTILITY_PANE_IDS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(workspace_id.to_owned(), pane_id.to_owned());
+}
+
+fn forget_utility_pane(workspace_id: &str, expected: Option<&str>) {
+    let mut cache = UTILITY_PANE_IDS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if expected.is_none() || cache.get(workspace_id).map(String::as_str) == expected {
+        cache.remove(workspace_id);
+    }
 }
 
 #[cfg(unix)]
@@ -1273,6 +1330,22 @@ mod tests {
             select_project_root(Some("/tmp/c"), &roots).unwrap_err(),
             PathBuf::from("/tmp/c")
         );
+    }
+
+    #[test]
+    fn remembered_utility_pane_survives_label_propagation_delay() {
+        let panes = vec![
+            PaneRecord {
+                id: "w1:p1".to_owned(),
+                label: None,
+            },
+            PaneRecord {
+                id: "w1:p2".to_owned(),
+                label: None,
+            },
+        ];
+        let selected = choose_utility_pane(&panes, Some("w1:p2")).unwrap();
+        assert_eq!(selected.id, "w1:p2");
     }
 
     #[test]

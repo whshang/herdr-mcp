@@ -289,19 +289,32 @@ async function runtimeContext(): Promise<Record<string, unknown>> {
     readOptionalJson(selfUpdatePath),
     workerFallbackContext(),
   ]);
+  const runtimeGeneration = compactRuntimeStatus(runtimeStatus);
+  const buildCommit = process.env.HERDR_MCP_BUILD_COMMIT || null;
+  const runtimeChannel = process.env.HERDR_MCP_BUILD_CHANNEL || "prod";
   return {
     server_version: SERVER_VERSION,
-    build_commit: process.env.HERDR_MCP_BUILD_COMMIT || "dev",
+    runtime_channel: runtimeChannel,
+    build_commit: buildCommit,
+    active_runtime: {
+      version: SERVER_VERSION,
+      channel: runtimeChannel,
+      source_commit: buildCommit,
+      generation: runtimeGeneration?.active_generation ?? null,
+      truth_source: "active_binary+runtime_generation_manager",
+    },
     contract_profile: process.env.HERDR_MCP_CONTRACT_PROFILE || "current",
     network_skill_refresh: !networkOff(),
     worker_fallbacks: workerFallbacks,
-    runtime_generation: compactRuntimeStatus(runtimeStatus),
+    runtime_generation: runtimeGeneration,
     self_update: updateStatus
       ? {
           state: updateStatus.state ?? updateStatus.status ?? null,
           target_version: updateStatus.target_version ?? null,
           source: updateStatus.source ?? null,
           updated_at: updateStatus.updated_at ?? null,
+          semantics: "historical_operation",
+          active_runtime_authority: false,
         }
       : null,
   };

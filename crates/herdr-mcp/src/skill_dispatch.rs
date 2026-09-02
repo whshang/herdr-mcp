@@ -11,7 +11,7 @@ pub struct TaskProfile {
     pub minimum_reasoning_tier: Option<u8>,
     pub destructive_production_mutation: bool,
     pub delegates_other_workers: bool,
-    pub independent_units: usize,
+    pub independent_units: Option<usize>,
     pub ownership_isolated: bool,
     pub shared_runtime_state: bool,
 }
@@ -22,7 +22,9 @@ pub struct WorkerCandidate {
     pub control_target: String,
     pub kind: Option<String>,
     pub provider: Option<String>,
+    pub provider_source: Option<String>,
     pub model: Option<String>,
+    pub model_source: Option<String>,
     pub current_status: String,
     pub current_project: Option<String>,
     pub workspace_id: Option<String>,
@@ -195,7 +197,9 @@ fn candidate(worker: &WorkerCapability) -> WorkerCandidate {
             .unwrap_or_else(|| worker.agent_id.clone()),
         kind: worker.kind.clone(),
         provider: worker.provider.clone(),
+        provider_source: worker.provider_source.clone(),
         model: worker.model.clone(),
+        model_source: worker.model_source.clone(),
         current_status: worker.current_status.clone(),
         current_project: worker.current_project.clone(),
         workspace_id: worker.workspace_id.clone(),
@@ -229,7 +233,10 @@ fn blocked_advice(
 }
 
 fn parallelism_advice(task: &TaskProfile) -> ParallelismAdvice {
-    if task.independent_units < 2 {
+    let Some(independent_units) = task.independent_units else {
+        return no_parallelism("task_independence_unspecified");
+    };
+    if independent_units < 2 {
         return no_parallelism("fewer_than_two_independent_units");
     }
     if task.shared_runtime_state {
@@ -240,7 +247,7 @@ fn parallelism_advice(task: &TaskProfile) -> ParallelismAdvice {
     }
     ParallelismAdvice {
         worth_considering: true,
-        max_useful_lanes: task.independent_units,
+        max_useful_lanes: independent_units,
         reason: "independent_units_may_benefit_from_parallel_lanes".to_owned(),
     }
 }
@@ -302,7 +309,9 @@ mod tests {
             agent_id: id.to_owned(),
             kind: Some("synthetic".to_owned()),
             provider: None,
+            provider_source: None,
             model: None,
+            model_source: None,
             profile: None,
             supports_code_edit: Some(true),
             supports_shell: Some(true),
@@ -588,7 +597,7 @@ mod tests {
     fn parallelism_is_advisory_and_comes_from_task_structure() {
         let task = TaskProfile {
             requires_code_edit: true,
-            independent_units: 3,
+            independent_units: Some(3),
             ownership_isolated: true,
             ..TaskProfile::default()
         };
@@ -601,7 +610,7 @@ mod tests {
     #[test]
     fn shared_state_or_unisolated_mutation_keeps_parallelism_serial() {
         let shared = TaskProfile {
-            independent_units: 3,
+            independent_units: Some(3),
             ownership_isolated: true,
             shared_runtime_state: true,
             ..TaskProfile::default()
@@ -614,7 +623,7 @@ mod tests {
 
         let unisolated = TaskProfile {
             requires_code_edit: true,
-            independent_units: 3,
+            independent_units: Some(3),
             ..TaskProfile::default()
         };
         assert!(
@@ -622,5 +631,13 @@ mod tests {
                 .parallelism
                 .worth_considering
         );
+    }
+
+    #[test]
+    fn unspecified_task_structure_does_not_invent_parallelism_evidence() {
+        let advice = advise_dispatch(&TaskProfile::default(), &snapshot(vec![]));
+        assert!(!advice.parallelism.worth_considering);
+        assert_eq!(advice.parallelism.max_useful_lanes, 1);
+        assert_eq!(advice.parallelism.reason, "task_independence_unspecified");
     }
 }

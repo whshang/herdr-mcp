@@ -1866,7 +1866,7 @@ mod tests {
             }]
         }));
         let payload = push_state_payload(&cache);
-        assert_eq!(payload["agents"][0]["name"], "pi");
+        assert_eq!(payload["agents"][0]["name"], "w1:p1");
         assert_eq!(payload["agents"][0]["pane"], "w1:p1");
         assert_eq!(payload["agents"][0]["status"], "working");
         assert_eq!(payload["agents"][0]["workspace"], "w1");
