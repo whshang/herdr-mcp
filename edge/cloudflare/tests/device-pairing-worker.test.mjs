@@ -132,6 +132,60 @@ test("pairing creation requires owner auth and returns one-time material with wo
   assert.equal(snapshot.includes(body.code), false, "raw code must never be stored");
 });
 
+test("pairing optional name accepts omission, rejects null, and preserves explicit names", async () => {
+  const { env } = makeEnv();
+
+  const unnamedCreate = await worker.fetch(
+    post("/devices/pairings", { ttl_seconds: 60 }, "owner-secret"),
+    env,
+  );
+  assert.equal(unnamedCreate.status, 200, "omitting name is the supported unspecified-name contract");
+  const unnamedSession = await unnamedCreate.json();
+  const unnamedConsume = await worker.fetch(
+    post("/devices/pairings/consume", {
+      pairing_id: unnamedSession.pairing_id,
+      code: unnamedSession.code,
+    }),
+    env,
+  );
+  assert.equal(unnamedConsume.status, 200, "consume also accepts an omitted optional name");
+
+  const nullCreate = await worker.fetch(
+    post("/devices/pairings", { ttl_seconds: 60, name: null }, "owner-secret"),
+    env,
+  );
+  assert.equal(nullCreate.status, 400);
+  assert.equal((await nullCreate.json()).code, "invalid_device_name");
+
+  const namedCreate = await worker.fetch(
+    post("/devices/pairings", { ttl_seconds: 60, name: "Nathan Mac" }, "owner-secret"),
+    env,
+  );
+  assert.equal(namedCreate.status, 200);
+  const namedSession = await namedCreate.json();
+
+  const nullConsume = await worker.fetch(
+    post("/devices/pairings/consume", {
+      pairing_id: namedSession.pairing_id,
+      code: namedSession.code,
+      name: null,
+    }),
+    env,
+  );
+  assert.equal(nullConsume.status, 400);
+  assert.equal((await nullConsume.json()).code, "invalid_device_name");
+
+  const namedConsume = await worker.fetch(
+    post("/devices/pairings/consume", {
+      pairing_id: namedSession.pairing_id,
+      code: namedSession.code,
+      name: "Nathan Mac",
+    }),
+    env,
+  );
+  assert.equal(namedConsume.status, 200);
+});
+
 test("pairing consume is unauthenticated, single-use, and returns the device secret exactly once", async () => {
   const { env, storage } = makeEnv();
   const create = await worker.fetch(post("/devices/pairings", { ttl_seconds: 60, name: "once-only" }, "owner-secret"), env);
