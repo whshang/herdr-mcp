@@ -264,6 +264,27 @@ mod tests {
     }
 
     #[test]
+    fn enrich_uses_link_upstream_origin_when_configured() {
+        let mut env_map = HashMap::from([
+            ("HERDR_LINK_TOKEN".to_owned(), "link-secret".to_owned()),
+            ("HERDR_MCP_TOKEN".to_owned(), "runtime-secret".to_owned()),
+        ]);
+        let config = Config {
+            edge_public_origin: Some("https://custom.example.com".to_owned()),
+            edge_link_upstream_origin: Some("https://backend.workers.dev".to_owned()),
+            edge_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            ..Config::default()
+        };
+        enrich_macos_credentials_with_config(&mut env_map, Some(&config)).expect("enrich");
+        assert_eq!(
+            env_map.get("HERDR_EDGE_URL").map(String::as_str),
+            Some("wss://backend.workers.dev/ws")
+        );
+        let cfg = read_link_daemon_config(&env_map).expect("config");
+        assert_eq!(cfg.edge_url, "wss://backend.workers.dev/ws");
+    }
+
+    #[test]
     fn credential_errors_never_embed_secret_values() {
         let error = DaemonConfigError::Message(
             "herdr-link macOS: unable to load workstation link credential".to_owned(),

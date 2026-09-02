@@ -4,6 +4,8 @@
 //! It answers: who owns Link today, and which gates still block
 //! `production_ready=true` for G5.
 
+use crate::config::Config;
+use crate::instance::InstanceId;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -553,11 +555,20 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
         "absent"
     };
 
+    let config_path = home.join(".config").join("herdr-mcp").join("config.toml");
+    let config = Config::load_for_instance(&config_path, &InstanceId::default_instance()).ok();
+    let edge_public_origin = config.as_ref().and_then(|c| c.edge_public_origin.clone());
+    let link_upstream_origin = config
+        .as_ref()
+        .and_then(|c| c.link_upstream_origin().map(|s| s.to_owned()));
+
     json!({
         "ok": true,
         "cutover_performed": false,
         "production_owner": production_owner,
         "production_ready_eligible": all_ok,
+        "edge_public_origin": edge_public_origin,
+        "link_upstream_origin": link_upstream_origin,
         "gates": gates.iter().map(|gate| json!({
             "id": gate.id,
             "ok": gate.ok,

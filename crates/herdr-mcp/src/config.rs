@@ -38,6 +38,7 @@ pub struct Config {
     pub update_channel: UpdateChannel,
     pub update_check: bool,
     pub edge_public_origin: Option<String>,
+    pub edge_link_upstream_origin: Option<String>,
     pub edge_device_id: Option<String>,
 }
 
@@ -49,6 +50,7 @@ impl Default for Config {
             update_channel: UpdateChannel::Stable,
             update_check: true,
             edge_public_origin: None,
+            edge_link_upstream_origin: None,
             edge_device_id: None,
         }
     }
@@ -96,10 +98,16 @@ impl Config {
             self.update_channel.as_str(),
             self.update_check
         );
-        if self.edge_public_origin.is_some() || self.edge_device_id.is_some() {
+        if self.edge_public_origin.is_some()
+            || self.edge_link_upstream_origin.is_some()
+            || self.edge_device_id.is_some()
+        {
             rendered.push_str("\n[edge]\n");
             if let Some(origin) = &self.edge_public_origin {
                 rendered.push_str(&format!("public_origin = \"{origin}\"\n"));
+            }
+            if let Some(upstream) = &self.edge_link_upstream_origin {
+                rendered.push_str(&format!("link_upstream_origin = \"{upstream}\"\n"));
             }
             if let Some(device_id) = &self.edge_device_id {
                 rendered.push_str(&format!("device_id = \"{device_id}\"\n"));
@@ -116,6 +124,19 @@ impl Config {
 
     #[cfg(not(any(target_os = "macos", test)))]
     pub fn set_edge_public_origin(&mut self, _origin: &str) -> Result<(), String> {
+        Err("edge configuration requires macOS".to_owned())
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    #[allow(dead_code)]
+    pub fn set_edge_link_upstream_origin(&mut self, origin: &str) -> Result<(), String> {
+        self.edge_link_upstream_origin = Some(normalize_edge_public_origin(origin)?);
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", test)))]
+    #[allow(dead_code)]
+    pub fn set_edge_link_upstream_origin(&mut self, _origin: &str) -> Result<(), String> {
         Err("edge configuration requires macOS".to_owned())
     }
 
@@ -137,14 +158,22 @@ impl Config {
         None
     }
 
+    /// The effective origin used by the Link transport (prefers explicit
+    /// `link_upstream_origin`, falling back to `public_origin`).
+    pub fn link_upstream_origin(&self) -> Option<&str> {
+        self.edge_link_upstream_origin
+            .as_deref()
+            .or(self.edge_public_origin.as_deref())
+    }
+
     pub fn edge_ws_url(&self) -> Result<Option<String>, String> {
-        let Some(origin) = &self.edge_public_origin else {
+        let Some(origin) = self.link_upstream_origin() else {
             return Ok(None);
         };
         let mut url =
-            Url::parse(origin).map_err(|error| format!("invalid edge public origin: {error}"))?;
+            Url::parse(origin).map_err(|error| format!("invalid edge upstream origin: {error}"))?;
         url.set_scheme("wss")
-            .map_err(|_| "edge public origin must use https://".to_owned())?;
+            .map_err(|_| "edge upstream origin must use https://".to_owned())?;
         url.set_path("/ws");
         url.set_query(None);
         url.set_fragment(None);
@@ -203,6 +232,10 @@ fn parse(content: &str) -> Result<Config, String> {
             }
             ("edge", "public_origin") => {
                 config.edge_public_origin = Some(normalize_edge_public_origin(unquote(value))?)
+            }
+            ("edge", "link_upstream_origin") => {
+                config.edge_link_upstream_origin =
+                    Some(normalize_edge_public_origin(unquote(value))?)
             }
             ("edge", "device_id") => {
                 config.edge_device_id = Some(normalize_device_id(unquote(value))?)
@@ -361,6 +394,11 @@ mod tests {
             config.edge_public_origin.as_deref(),
             Some("https://herdr.example.com")
         );
+        assert_eq!(config.edge_link_upstream_origin, None);
+        assert_eq!(
+            config.link_upstream_origin(),
+            Some("https://herdr.example.com")
+        );
         assert_eq!(
             config.edge_device_id.as_deref(),
             Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
@@ -376,11 +414,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_distinct_link_upstream_origin() {
+        let config = parse(
+            r#"
+            [edge]
+            public_origin = "https://custom.example.com"
+            link_upstream_origin = "https://backend.workers.dev"
+            device_id = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.edge_public_origin.as_deref(),
+            Some("https://custom.example.com")
+        );
+        assert_eq!(
+            config.edge_link_upstream_origin.as_deref(),
+            Some("https://backend.workers.dev")
+        );
+        // Link upstream origin overrides public origin for Link socket target
+        assert_eq!(
+            config.link_upstream_origin(),
+            Some("https://backend.workers.dev")
+        );
+        assert_eq!(
+            config.edge_ws_url().unwrap().as_deref(),
+            Some("wss://backend.workers.dev/ws")
+        );
+    }
+
+    #[test]
     fn rejects_unknown_or_invalid_config() {
         assert!(parse("port = 1").is_err());
         assert!(parse("[runtime]\nport = 0").is_err());
         assert!(parse("[update]\nchannel = \"nightly\"").is_err());
         assert!(parse("[edge]\npublic_origin = \"http://example.com\"").is_err());
+        assert!(parse("[edge]\nlink_upstream_origin = \"http://example.com\"").is_err());
         assert!(parse("[edge]\ndevice_id = \"dev_bad\"").is_err());
         assert!(parse("[unknown]\nvalue = 1").is_err());
     }
@@ -393,6 +463,7 @@ mod tests {
             update_channel: UpdateChannel::Preview,
             update_check: false,
             edge_public_origin: Some("https://herdr.example.com".to_owned()),
+            edge_link_upstream_origin: Some("https://backend.workers.dev".to_owned()),
             edge_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
         };
         assert_eq!(parse(&config.render()).unwrap(), config);

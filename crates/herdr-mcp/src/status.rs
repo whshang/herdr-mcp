@@ -220,8 +220,8 @@ fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusR
     println!("LAYER local-ipc {}", format_local_ipc_layer(paths));
     println!("LAYER native-messaging {}", format_native_messaging_layer());
     println!("LAYER link {}", format_link_layer(paths));
-    let edge = resolve_edge_config();
-    println!("LAYER edge {}", format_edge_configured_layer(&edge));
+    let edge = resolve_edge_config(config);
+    println!("LAYER edge {}", format_edge_configured_layer(&edge, config));
     let remote = edge
         .as_ref()
         .map(probe_edge_remote)
@@ -373,14 +373,19 @@ fn format_link_layer(paths: &RuntimePaths) -> String {
     crate::link::doctor_layer_summary(&home, &paths.config_dir)
 }
 
-fn format_edge_configured_layer(edge: &Option<EdgeConfigView>) -> String {
+fn format_edge_configured_layer(edge: &Option<EdgeConfigView>, config: &Config) -> String {
+    let upstream_info = match config.edge_link_upstream_origin.as_deref() {
+        Some(upstream) => format!(" upstream={upstream}"),
+        None => String::new(),
+    };
     match edge {
         Some(edge) => format!(
-            "configured-local source={} label={} host={} origin={} plist={}",
+            "configured-local source={} label={} host={} origin={}{} plist={}",
             edge.source.as_str(),
             edge.label.as_deref().unwrap_or("-"),
             edge.host,
             edge.origin,
+            upstream_info,
             edge.plist
                 .as_ref()
                 .map(|path| path.display().to_string())
@@ -392,6 +397,7 @@ fn format_edge_configured_layer(edge: &Option<EdgeConfigView>) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EdgeConfigSource {
+    ConfigToml,
     LinkProdPlist,
     LinkPlist,
     LinkCandidatePlist,
@@ -401,6 +407,7 @@ enum EdgeConfigSource {
 impl EdgeConfigSource {
     fn as_str(self) -> &'static str {
         match self {
+            Self::ConfigToml => "config-toml",
             Self::LinkProdPlist => "link-prod-plist",
             Self::LinkPlist => "link-plist",
             Self::LinkCandidatePlist => "link-candidate-plist",
@@ -435,7 +442,21 @@ impl RemoteProbeReport {
     }
 }
 
-fn resolve_edge_config() -> Option<EdgeConfigView> {
+fn resolve_edge_config(config: &Config) -> Option<EdgeConfigView> {
+    // If [edge].public_origin is configured in config.toml, it is the authoritative public identity
+    if let Some(public_origin) = config.edge_public_origin.as_deref()
+        && let Ok(parsed) = url::Url::parse(public_origin)
+        && let Some(host) = parsed.host_str()
+    {
+        return Some(EdgeConfigView {
+            host: host.to_owned(),
+            origin: public_origin.to_owned(),
+            plist: None,
+            source: EdgeConfigSource::ConfigToml,
+            label: None,
+        });
+    }
+
     let home = home_dir()?;
     let plist_candidates = [
         ("dev.herdr-mcp.link-prod", EdgeConfigSource::LinkProdPlist),
@@ -1009,14 +1030,14 @@ mod tests {
             source: EdgeConfigSource::ProcessEnv,
             label: None,
         };
-        let formatted = format_edge_configured_layer(&Some(edge));
+        let formatted = format_edge_configured_layer(&Some(edge), &Config::default());
         assert!(formatted.contains("source=link-env"));
         assert!(!formatted.contains("unconfigured"));
     }
 
     #[test]
     fn unconfigured_edge_layer_names_missing_link_and_env() {
-        let formatted = format_edge_configured_layer(&None);
+        let formatted = format_edge_configured_layer(&None, &Config::default());
         assert!(formatted.contains("unconfigured"));
         assert!(formatted.contains("HERDR_EDGE_URL"));
     }

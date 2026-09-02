@@ -81,10 +81,13 @@ impl std::fmt::Display for DaemonConfigError {
 impl std::error::Error for DaemonConfigError {}
 
 /// Read daemon config from an env map. Keys match Node `readLinkDaemonConfig`.
+/// In v0.4.5, HERDR_LINK_UPSTREAM_URL can override HERDR_EDGE_URL for Link WebSocket transport.
 pub fn read_link_daemon_config(
     env_map: &HashMap<String, String>,
 ) -> Result<LinkDaemonConfig, DaemonConfigError> {
-    let edge_url = required(env_map, "HERDR_EDGE_URL")?;
+    let edge_url = optional_trimmed(env_map, "HERDR_LINK_UPSTREAM_URL")
+        .or_else(|| optional_trimmed(env_map, "HERDR_EDGE_URL"))
+        .ok_or_else(|| DaemonConfigError::Missing("HERDR_EDGE_URL".to_owned()))?;
     let workstation_id = required(env_map, "HERDR_WORKSTATION_ID")?;
     let device_name = optional_trimmed(env_map, "HERDR_DEVICE_NAME")
         .and_then(|value| crate::device_name::normalize_device_display_name(&value));
@@ -439,6 +442,16 @@ mod tests {
         assert_eq!(cfg.runtime_version, None);
         assert_eq!(cfg.edge_url, "wss://herdr-edge-dev.example/ws");
         assert_eq!(cfg.workstation_id, "dev-w1");
+    }
+
+    #[test]
+    fn daemon_config_allows_link_upstream_url_override() {
+        let cfg = read_link_daemon_config(&env(&[(
+            "HERDR_LINK_UPSTREAM_URL",
+            "wss://backend.workers.dev/ws",
+        )]))
+        .expect("config");
+        assert_eq!(cfg.edge_url, "wss://backend.workers.dev/ws");
     }
 
     #[test]

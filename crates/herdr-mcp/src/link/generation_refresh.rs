@@ -1085,6 +1085,63 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prod_plist_refresh_uses_link_upstream_origin_when_configured() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-link-gen-refresh-upstream-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let config_dir = root.join(".config/herdr-mcp");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[edge]\npublic_origin = \"https://custom.example\"\nlink_upstream_origin = \"https://backend.workers.dev\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n",
+        )
+        .unwrap();
+        let plist_path = root.join("link-prod.plist");
+        let mut env = Dictionary::new();
+        env.insert(
+            "HERDR_RUNTIME_GENERATION".to_owned(),
+            PlistValue::String("rust-old".to_owned()),
+        );
+        let mut root_dict = Dictionary::new();
+        root_dict.insert(
+            "Label".to_owned(),
+            PlistValue::String(LINK_PROD_LABEL.to_owned()),
+        );
+        root_dict.insert(
+            "EnvironmentVariables".to_owned(),
+            PlistValue::Dictionary(env),
+        );
+        let mut bytes = Vec::new();
+        PlistValue::Dictionary(root_dict)
+            .to_writer_xml(&mut bytes)
+            .unwrap();
+        std::fs::write(&plist_path, bytes).unwrap();
+
+        assert!(
+            refresh_prod_plist_generation(&root, &plist_path, "rust-new", Some("0.4.3-dev"),)
+                .unwrap()
+        );
+        let updated = PlistValue::from_file(&plist_path).unwrap();
+        let env = updated
+            .as_dictionary()
+            .unwrap()
+            .get("EnvironmentVariables")
+            .unwrap()
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(
+            env.get("HERDR_EDGE_URL").and_then(PlistValue::as_string),
+            Some("wss://backend.workers.dev/ws")
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn active_generation_hot_switch_does_not_restart_link() {
         let launchd = FakeLaunchd::with_loaded(LINK_PROD_LABEL, Path::new("/tmp/link-prod.plist"));
