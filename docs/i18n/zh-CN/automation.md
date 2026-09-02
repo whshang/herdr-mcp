@@ -100,7 +100,7 @@ CI 的目的不是“部署一切”，而是给各个平面提供共享证据�
 
 Runtime implementation 可以频繁变化，但 ChatGPT 看到的 public MCP catalog 不应该悄悄变化。
 
-当前 production contract 是 **epoch 2 / 18 tools**。兼容测试可以保留历史 epoch 作为 rollback evidence，但普通 runtime commit 不应该因为“顺手改了 schema”就改变公开 ABI。
+当前 v0.4.3 的公共 Edge contract 是 **epoch 3 / 19 actions**，workstation Runtime Execution Contract 仍是 **epoch 2 / 18 tools**。新增的 `herdr_devices` 只在 Edge 执行，不转发到 workstation。兼容测试可以保留历史 epoch 作为 rollback evidence，但普通 runtime commit 不应该因为“顺手改了 schema”就改变任一 contract。
 
 ## 3. Cloudflare Edge：稳定公网入口
 

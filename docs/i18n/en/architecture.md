@@ -99,7 +99,7 @@ native Herdr method
 
 This preserves native reachability without turning every Herdr method into a permanent public MCP ABI.
 
-The current production contract is **epoch 2 / 18 tools**. Tool-catalog changes are explicit contract migrations, not incidental runtime changes.
+The workstation Runtime Execution Contract remains **epoch 2 / 18 tools**. Production v0.4.3 exposes **public Edge epoch 3 / 19 actions** by adding Edge-local `herdr_devices`; workstation tool-catalog changes remain explicit contract migrations, not incidental runtime changes.
 
 ## Progressive skills and capability truth
 

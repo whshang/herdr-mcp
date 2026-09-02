@@ -12,9 +12,9 @@
 
 - **Rust runtime 拥有生产 MCP / service / updater / Link / Native Messaging 路径**；`bin/herdr-extension-host` 只是委托 Rust 的兼容入口，不是第二套 installer/broker。
 - **生产 Link 是 Rust**，执行 `~/.config/herdr-mcp/runtime/current/herdr-mcp link run`。
-- **公共 MCP contract 保持 epoch 2 / 18 tools**，不增加第 19 个 tool，不因内部优化改变 schema。
+- **公共 Edge contract 为 epoch 3 / 19 actions，workstation Runtime Execution Contract 保持 epoch 2 / 18 tools**；第 19 个 `herdr_devices` 由 Edge 本地执行，不转发到 workstation。
 - **浏览器控制面是有界的**：不宣称 browser true-steer；普通终端只开放有 target fencing 的窄化 `Run command -> pane.send_input + Enter`，任意 Herdr method 仍保持 preview-only。
-- **`v0.4.2` 已发布能力可作为当前产品能力呈现**；任何尚未发布的后续特性仍必须描述为 development/upcoming，不能提前写成当前产品能力。
+- **`v0.4.3` 已发布能力可作为当前产品能力呈现**；任何尚未发布的后续特性仍必须描述为 development/upcoming，不能提前写成当前产品能力。
 
 ## 总体目标
 
@@ -37,7 +37,7 @@ Herdr 性能优化不以单点 benchmark 为目标，目标是建立长期可演
 
 当前执行面彼此解耦：Runtime、Browser Extension、Edge/Link Contract 可以独立演进，但必须遵守 [`release-model.md`](./release-model.md) 的兼容边界。浏览器扩展持续独立迭代，不要求仅为扩展变化发布 Rust runtime。
 
-活跃的长期设计包括 [`_wip/multi-device-worker-control-plane.md`](./_wip/multi-device-worker-control-plane.md) 与 Browser Control Plane 的后续扩展；只有明确版本计划批准后才转为实现任务。
+`v0.4.3` multi-device core 已发布，其冻结设计与 release plan 已归档到 [`history/architecture/`](./history/architecture/)。当前活跃长期设计继续以 Browser Control Plane 等未完成主题为准；多设备 scheduling/admin/console 只有在后续明确立项后才进入 `_wip`。
 
 ## 已完成并验收
 
@@ -64,7 +64,7 @@ Herdr 性能优化不以单点 benchmark 为目标，目标是建立长期可演
 
 冻结边界：
 
-- public MCP 继续 epoch 2 / 18 tools，不增加第 19 个 tool；
+- workstation Runtime Execution Contract 继续 epoch 2 / 18 tools；公共 Edge 的第 19 个 action `herdr_devices` 独立于这套 runtime tool catalog；
 - `herdr_mcp.skill.list/describe/load` 只走现有 `herdr_call` local namespace；
 - giant policy 拆为 global `AGENTS.md` + 8 个 on-demand Skill；其中 `engineering-robustness` 把 regression-first、silent-wrongness、AI self-verification 与多 state-plane 验收作为按需 reference 内化；
 - `HERDR_MCP_PROGRESSIVE_SKILLS` 在真实多 Agent UAT 前保持兼容默认；

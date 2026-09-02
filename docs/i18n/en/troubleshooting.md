@@ -61,7 +61,7 @@ Check Edge health/status and the workstation link.
 
 ### Does a new ChatGPT conversation get the current catalog?
 
-The current production public contract is **epoch 2 / 18 tools**, including `herdr_skill`.
+The current public ChatGPT contract is **epoch 3 / 19 actions**. Workstation execution remains **epoch 2 / 18 tools**, including `herdr_skill`; the extra public action is Edge-local `herdr_devices`.
 
 Old conversations may retain an older `tools/list` snapshot. Before reinstalling anything, verify the server and open a new conversation.
 

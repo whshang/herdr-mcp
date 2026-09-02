@@ -124,7 +124,7 @@ A candidate becomes active only after validation:
 5. optional runtime version checks pass;
 6. observation checks remain healthy when required.
 
-The current public contract is **epoch 2 / 18 tools**. Exact build hashes are release evidence, not long-lived documentation facts. Activation follows the current frozen contract definition.
+The current public Edge contract is **epoch 3 / 19 actions**, while workstation Runtime Execution remains **epoch 2 / 18 tools**. Exact build hashes are release evidence, not long-lived documentation facts. Activation follows the current frozen contract definitions.
 
 ## Runtime upgrade and contract migration are different
 

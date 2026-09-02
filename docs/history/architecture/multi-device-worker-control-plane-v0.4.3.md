@@ -1,8 +1,10 @@
 # Herdr Multi-Device Worker Control Plane
 
-Status: **v0.4.3 core design frozen for implementation**
+Status: **historical v0.4.3 core design — released 2026-09-02**
 Baseline: `origin/main` at branch creation (`1f8f9cf`, after v0.4.2)
 Scope owner: Cloudflare Worker control plane + Rust Link compatibility
+
+Archive note: the dated implementation-status checklist below records the pre-GA state. Any pending boxes in that checklist are historical and must not be interpreted as current release blockers. Current product guidance lives in `README*` and `docs/i18n/`.
 
 Implementation status (2026-08-31):
 
