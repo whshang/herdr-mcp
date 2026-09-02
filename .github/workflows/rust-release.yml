@@ -18,6 +18,17 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Validate authored release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk -F'\"' '/^version = / { print $2; exit }' crates/herdr-mcp/Cargo.toml)"
+          release_tag="v$version"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "$release_tag" ]]; then
+            echo "release tag does not match Cargo version" >&2
+            exit 1
+          fi
+          node scripts/validate-release-notes.mjs "$release_tag"
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
       - name: Authoritative release gate
@@ -175,6 +186,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@v4
         with:
           name: rust-release-bundle
@@ -212,7 +224,9 @@ jobs:
             echo "GitHub Release $GITHUB_REF_NAME already exists; refusing publish overwrite" >&2
             exit 1
           fi
-          release_flags=(--verify-tag --generate-notes)
+          notes_file="docs/releases/$GITHUB_REF_NAME.md"
+          node scripts/validate-release-notes.mjs "$GITHUB_REF_NAME" "$notes_file"
+          release_flags=(--verify-tag --notes-file "$notes_file")
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             release_flags+=(--prerelease)
           fi

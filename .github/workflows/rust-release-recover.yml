@@ -42,6 +42,23 @@ jobs:
           source_digest="$(git rev-parse "$TAG^{commit}")"
           source_version="$(git show "${source_digest}:crates/herdr-mcp/Cargo.toml" | awk -F'\"' '/^version = / { print $2; exit }')"
           [[ "$TAG" == "v$source_version" ]] || { echo "tag does not match source Cargo version" >&2; exit 1; }
+          source_notes="$RUNNER_TEMP/release-notes-$TAG.md"
+          if git cat-file -e "${source_digest}:docs/releases/$TAG.md" 2>/dev/null; then
+            git show "${source_digest}:docs/releases/$TAG.md" > "$source_notes"
+            source_notes_validator="$RUNNER_TEMP/validate-release-notes-${SOURCE_RUN_ID}.mjs"
+            git show "${source_digest}:scripts/validate-release-notes.mjs" > "$source_notes_validator"
+            node "$source_notes_validator" "$TAG" "$source_notes"
+          else
+            # Compatibility for stable tags published before authored release notes
+            # became a tag-time contract. These notes are backfilled in the current
+            # repository and validated by the current policy; new tags never use
+            # this branch because rust-release.yml rejects a missing tag-owned file.
+            legacy_notes="docs/releases/$TAG.md"
+            [[ -f "$legacy_notes" ]] || { echo "release notes are missing for historical tag $TAG" >&2; exit 1; }
+            node scripts/validate-release-notes.mjs "$TAG" "$legacy_notes"
+            cp "$legacy_notes" "$source_notes"
+            echo "warning: using validated backfilled release notes for historical tag $TAG" >&2
+          fi
           source_state_schema="$(git show "${source_digest}:crates/herdr-mcp/src/state_store.rs" | sed -nE 's/^pub const SCHEMA_VERSION: i64 = ([0-9]+);$/\1/p' | head -n1)"
           [[ "$source_state_schema" =~ ^[0-9]+$ ]] || { echo "cannot read source state schema" >&2; exit 1; }
           source_contract="$(git show "${source_digest}:contracts/epoch2.json")"
@@ -253,7 +270,9 @@ jobs:
             echo "GitHub Release $TAG already exists; refusing recovery overwrite" >&2
             exit 1
           fi
-          release_flags=(--verify-tag --generate-notes)
+          notes_file="$RUNNER_TEMP/release-notes-$TAG.md"
+          [[ -s "$notes_file" ]] || { echo "validated release notes are missing" >&2; exit 1; }
+          release_flags=(--verify-tag --notes-file "$notes_file")
           if [[ "$TAG" == *-* ]]; then
             release_flags+=(--prerelease)
           fi

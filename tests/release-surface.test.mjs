@@ -313,7 +313,12 @@ test("Rust GitHub Release provenance keeps manual qualification attested and tag
     /GH_REPO: \$\{\{ github\.repository \}\}/,
     "publish must name the GitHub repository explicitly because the job does not checkout git metadata",
   );
-  assert.match(publish, /release_flags=\(--verify-tag --generate-notes\)/);
+  assert.match(release, /Validate authored release notes/);
+  assert.match(release, /release_tag=\"v\$version\"/);
+  assert.match(release, /node scripts\/validate-release-notes\.mjs \"\$release_tag\"/);
+  assert.match(publish, /notes_file=\"docs\/releases\/\$GITHUB_REF_NAME\.md\"/);
+  assert.match(publish, /release_flags=\(--verify-tag --notes-file \"\$notes_file\"\)/);
+  assert.doesNotMatch(publish, /--generate-notes/);
   assert.match(publish, /release_flags\+=\(--prerelease\)/, "semver prereleases must be marked as GitHub prereleases");
   assert.match(qualification, /needs: attest/);
   assert.match(qualification, /if: github\.event_name == 'workflow_dispatch'/);
@@ -365,6 +370,10 @@ test("Rust Release recovery republishes only a previously attested GitHub run", 
   assert.match(recovery, /--deny-self-hosted-runners/);
   assert.match(recovery, /gh release create/);
   assert.match(recovery, /--verify-tag/);
+  assert.match(recovery, /docs\/releases\/\$TAG\.md/);
+  assert.match(recovery, /validate-release-notes/);
+  assert.match(recovery, /--notes-file/);
+  assert.doesNotMatch(recovery, /--generate-notes/);
   assert.match(recovery, /--prerelease/);
 });
 
