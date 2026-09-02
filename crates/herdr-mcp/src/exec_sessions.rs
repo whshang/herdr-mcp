@@ -909,14 +909,15 @@ where
     });
 }
 
-fn wait_for_output_readers(session: &Arc<Session>) {
+fn wait_for_output_readers(session: &Arc<Session>) -> bool {
     let SessionBackend::Native { output_readers, .. } = &session.backend else {
-        return;
+        return true;
     };
     let deadline = Instant::now() + OUTPUT_DRAIN_BUDGET;
     while output_readers.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(2));
     }
+    output_readers.load(Ordering::Acquire) == 0
 }
 
 fn push_chunk(session: &Arc<Session>, stream: StreamKind, chunk: &[u8]) {
@@ -1176,7 +1177,7 @@ fn cleanup_pane_files(script_path: &Path, spool: &PaneSpoolPaths) {
     }
 }
 
-fn refresh_pane_session(session: &Arc<Session>) -> bool {
+fn refresh_pane_session(session: &Arc<Session>, registry: Option<&RegistryInner>) -> bool {
     let SessionBackend::Pane {
         client,
         pane_id,
@@ -1193,7 +1194,7 @@ fn refresh_pane_session(session: &Arc<Session>) -> bool {
     let Some(exit_code) = read_pane_exit_code(&spool.status) else {
         return false;
     };
-    let transitioned = mark_closed_with_signal(session, Some(exit_code), None);
+    let transitioned = complete_session(session, registry, Some(exit_code), None);
     if transitioned {
         cleanup_pane_files(script_path, spool);
         let _ =
@@ -1213,71 +1214,24 @@ fn refresh_session_status(session: &Arc<Session>, registry: Option<&RegistryInne
                 .lock()
                 .map_err(|_| "child lock poisoned".to_owned())
                 .and_then(|mut child| child.try_wait().map_err(|error| error.to_string()));
-            let transitioned = match result {
+            match result {
                 Ok(Some(exit)) => {
-                    wait_for_output_readers(session);
-                    mark_closed(session, &exit)
+                    if !wait_for_output_readers(session) {
+                        return false;
+                    }
+                    let signal = exit_signal(&exit);
+                    complete_session(session, registry, exit.code(), signal.as_deref());
+                    true
                 }
-                Ok(None) => return false,
-                Err(_) => mark_closed_unknown(session),
-            };
-            if transitioned && let Some(registry) = registry {
-                persist_closed_session(registry, session);
+                Ok(None) => false,
+                Err(_) => {
+                    complete_session(session, registry, None, None);
+                    true
+                }
             }
-            true
         }
-        SessionBackend::Pane { .. } => {
-            let closed = refresh_pane_session(session);
-            if closed && let Some(registry) = registry {
-                persist_closed_session(registry, session);
-            }
-            closed
-        }
+        SessionBackend::Pane { .. } => refresh_pane_session(session, registry),
     }
-}
-
-fn mark_closed(session: &Arc<Session>, exit: &ExitStatus) -> bool {
-    let Ok(mut status) = session.status.lock() else {
-        return false;
-    };
-    if status.closed {
-        return false;
-    }
-    status.closed = true;
-    status.exit_code = exit.code();
-    status.signal = exit_signal(exit);
-    status.ended_at_ms = Some(now_ms());
-    true
-}
-
-fn mark_closed_unknown(session: &Arc<Session>) -> bool {
-    let Ok(mut status) = session.status.lock() else {
-        return false;
-    };
-    if status.closed {
-        return false;
-    }
-    status.closed = true;
-    status.ended_at_ms = Some(now_ms());
-    true
-}
-
-fn mark_closed_with_signal(
-    session: &Arc<Session>,
-    exit_code: Option<i32>,
-    signal: Option<&str>,
-) -> bool {
-    let Ok(mut status) = session.status.lock() else {
-        return false;
-    };
-    if status.closed {
-        return false;
-    }
-    status.closed = true;
-    status.exit_code = exit_code;
-    status.signal = signal.map(str::to_owned);
-    status.ended_at_ms = Some(now_ms());
-    true
 }
 
 fn parse_stream(stream: &str) -> Option<Option<StreamKind>> {
@@ -1456,14 +1410,12 @@ fn terminate_session(session: &Arc<Session>, force: bool, registry: Option<&Regi
                 PANE_RPC_TIMEOUT,
             );
             cleanup_pane_files(script_path, spool);
-            if mark_closed_with_signal(
+            complete_session(
                 session,
+                registry,
                 None,
                 Some(if force { "SIGKILL" } else { "SIGTERM" }),
-            ) && let Some(registry) = registry
-            {
-                persist_closed_session(registry, session);
-            }
+            );
         }
     }
 }
@@ -1489,9 +1441,13 @@ fn process_group_for_session(pid: u32) -> Option<u32> {
     }
 }
 
-fn persist_closed_session(inner: &RegistryInner, session: &Arc<Session>) {
-    let status = session_status(session);
-    let ended_at = status.ended_at_ms.unwrap_or_else(now_ms);
+fn persist_closed_evidence(
+    inner: &RegistryInner,
+    session: &Arc<Session>,
+    ended_at: u64,
+    exit_code: Option<i32>,
+    signal: Option<&str>,
+) {
     let result = inner
         .state_store
         .lock()
@@ -1501,8 +1457,8 @@ fn persist_closed_session(inner: &RegistryInner, session: &Arc<Session>) {
                 &session.id,
                 "closed",
                 Some(ended_at),
-                status.exit_code,
-                status.signal.as_deref(),
+                exit_code,
+                signal,
                 ended_at.saturating_add(SESSION_TTL_MS),
             )
         });
@@ -1512,6 +1468,29 @@ fn persist_closed_session(inner: &RegistryInner, session: &Arc<Session>) {
     if let Err(_error) = write_session_spool(&inner.state_dir, session) {
         inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn complete_session(
+    session: &Arc<Session>,
+    registry: Option<&RegistryInner>,
+    exit_code: Option<i32>,
+    signal: Option<&str>,
+) -> bool {
+    let Ok(mut status) = session.status.lock() else {
+        return false;
+    };
+    if status.closed {
+        return false;
+    }
+    let ended_at = now_ms();
+    if let Some(registry) = registry {
+        persist_closed_evidence(registry, session, ended_at, exit_code, signal);
+    }
+    status.closed = true;
+    status.exit_code = exit_code;
+    status.signal = signal.map(str::to_owned);
+    status.ended_at_ms = Some(ended_at);
+    true
 }
 
 fn recover_state_store(store: &StateStore) -> Result<RecoveryResult, String> {
@@ -2268,7 +2247,7 @@ mod tests {
         let weak = Arc::downgrade(&session);
         spawn_monitor(Arc::clone(&session), Weak::new());
 
-        assert!(mark_closed_with_signal(&session, None, Some("pane_closed")));
+        assert!(complete_session(&session, None, None, Some("pane_closed")));
         drop(session);
         for _ in 0..500 {
             if weak.upgrade().is_none() {
