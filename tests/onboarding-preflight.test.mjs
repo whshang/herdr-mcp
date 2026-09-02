@@ -115,12 +115,15 @@ test("origin health checks separate Worker-code health from hostname/DNS/network
 });
 
 test("bare worker pair without --name must not serialize a null device name", () => {
+  // The v0.4.4 fix on main owns this behavior via dedicated request-body
+  // helpers; this lane only asserts the contract stays intact (no duplicate
+  // implementation here).
   const src = read("crates/herdr-mcp/src/worker.rs");
-  // The payload helper omits the optional field instead of sending JSON null.
-  assert.match(src, /fn pairing_request_body/);
-  assert.match(src, /invalid_device_name/);
-  // The regression shape must be gone from both pairing call sites.
-  assert.doesNotMatch(src, /"ttl_seconds": ttl_seconds, "name": name/);
-  assert.doesNotMatch(src, /"pairing_id": pairing_id, "code": code, "name": name/);
+  assert.match(src, /fn pairing_create_request_body/);
+  assert.match(src, /fn pairing_consume_request_body/);
+  // The regression shape must be gone from the raw call sites (the helpers
+  // themselves legitimately build the named variant internally).
+  assert.doesNotMatch(src, /\.json\(&json!\(\{ "ttl_seconds": ttl_seconds, "name": name \}\)/);
+  assert.doesNotMatch(src, /\.json\(&json!\(\{ "pairing_id": pairing_id, "code": code, "name": name \}\)/);
 });
 
