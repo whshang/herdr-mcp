@@ -57,6 +57,9 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /phase=completed/);
     assert.match(r.content, /progress.*bytes_read.*bytes_total.*elapsed_ms/s);
     assert.equal(r.runtime.contract_profile, process.env.HERDR_MCP_CONTRACT_PROFILE || "current");
+    assert.equal(r.runtime.build_commit, process.env.HERDR_MCP_BUILD_COMMIT || null);
+    assert.equal(r.runtime.active_runtime.source_commit, process.env.HERDR_MCP_BUILD_COMMIT || null);
+    assert.equal(r.runtime.active_runtime.truth_source, "active_binary+runtime_generation_manager");
     assert.equal(typeof r.runtime.worker_fallbacks, "object");
     assert.equal(r.runtime.worker_fallbacks.dsh_headless.invocation, "herdr_exec_start -> dsh --profile headless <task>");
     assert.equal(r.runtime.worker_fallbacks.dsh_tui.role, "human-interactive fallback");

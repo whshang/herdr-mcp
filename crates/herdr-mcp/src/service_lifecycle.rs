@@ -50,12 +50,16 @@ pub(crate) fn run(command: ServiceCommand) -> Result<ExitCode, String> {
 /// orchestrator is the executing binary; the installed payload is the same
 /// executable (`current_exe` inside `service_manager`).
 fn run_install(adopt_node: bool) -> Result<ExitCode, String> {
-    run_install_lifecycle(|mutation_lock| {
+    let result = run_install_lifecycle(|mutation_lock| {
         service_manager::run_with_mutation_lock(
             ServiceCommand::Install { adopt_node },
             mutation_lock,
         )
-    })
+    })?;
+    if result == ExitCode::SUCCESS {
+        crate::dev::reconcile_after_public_prod_install()?;
+    }
+    Ok(result)
 }
 
 /// Crate-internal install-from-payload path used by `dev rollback`: the

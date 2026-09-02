@@ -433,10 +433,20 @@ fn runtime_context(config: &SkillConfig) -> Value {
     let update_status = read_optional_json(&config.self_update_path);
     let worker_fallbacks = worker_fallback_context(config);
     let contract = contract::identity().ok();
+    let runtime_generation = compact_runtime_status(runtime_status.as_ref());
+    let source_commit = crate::runtime_meta::compiled_source_commit();
     json!({
         "server_version": crate::runtime_meta::runtime_version(),
         "runtime_channel": crate::runtime_meta::runtime_channel(),
-        "build_commit": env::var("HERDR_MCP_BUILD_COMMIT").unwrap_or_else(|_| "dev".to_owned()),
+        "build_commit": source_commit,
+        "active_runtime": {
+            "version": crate::runtime_meta::runtime_version(),
+            "channel": crate::runtime_meta::runtime_channel(),
+            "source_commit": source_commit,
+            "source_dirty": crate::runtime_meta::compiled_source_dirty(),
+            "generation": runtime_generation.get("active_generation").cloned().unwrap_or(Value::Null),
+            "truth_source": "active_binary+runtime_generation_manager",
+        },
         "contract_profile": env::var("HERDR_MCP_CONTRACT_PROFILE").unwrap_or_else(|_| "current".to_owned()),
         "tool_execution": {
             "contract_epoch": contract.as_ref().map(|value| value.epoch),
@@ -449,7 +459,7 @@ fn runtime_context(config: &SkillConfig) -> Value {
         },
         "network_skill_refresh": config.network,
         "worker_fallbacks": worker_fallbacks,
-        "runtime_generation": compact_runtime_status(runtime_status.as_ref()),
+        "runtime_generation": runtime_generation,
         "self_update": compact_update_status(update_status.as_ref()),
     })
 }
@@ -488,6 +498,8 @@ fn compact_update_status(value: Option<&Value>) -> Value {
         "target_version": value.get("target_version").cloned().unwrap_or(Value::Null),
         "source": value.get("source").cloned().unwrap_or(Value::Null),
         "updated_at": value.get("updated_at").cloned().unwrap_or(Value::Null),
+        "semantics": "historical_operation",
+        "active_runtime_authority": false,
     })
 }
 
@@ -789,7 +801,14 @@ mod tests {
         .unwrap();
         let runtime = runtime_context(&config);
         assert_eq!(runtime["runtime_generation"]["active_generation"], "g2");
+        assert_eq!(runtime["active_runtime"]["generation"], "g2");
+        assert_eq!(
+            runtime["active_runtime"]["truth_source"],
+            "active_binary+runtime_generation_manager"
+        );
         assert_eq!(runtime["self_update"]["state"], "idle");
+        assert_eq!(runtime["self_update"]["semantics"], "historical_operation");
+        assert_eq!(runtime["self_update"]["active_runtime_authority"], false);
         assert_eq!(runtime["tool_execution"]["contract_epoch"], 2);
         assert_eq!(runtime["tool_execution"]["tool_count"], 18);
         assert_eq!(

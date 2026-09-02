@@ -7,7 +7,9 @@ pub struct WorkerCapability {
     pub agent_id: String,
     pub kind: Option<String>,
     pub provider: Option<String>,
+    pub provider_source: Option<String>,
     pub model: Option<String>,
+    pub model_source: Option<String>,
     pub profile: Option<String>,
     pub supports_code_edit: Option<bool>,
     pub supports_shell: Option<bool>,
@@ -95,7 +97,11 @@ fn worker_from_agent(
         .and_then(Value::as_str)
         .map(str::to_owned);
     let name = agent.get("name").and_then(Value::as_str).map(str::to_owned);
-    let agent_id = name.clone().or_else(|| kind.clone())?;
+    let pane_id = agent
+        .get("pane_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let agent_id = name.clone().or_else(|| pane_id.clone())?;
     let status = agent
         .get("agent_status")
         .or_else(|| agent.get("status"))
@@ -106,12 +112,69 @@ fn worker_from_agent(
     let scanned = kind
         .as_deref()
         .and_then(|kind| inventory.iter().find(|record| record.agent == kind));
+    let live_pi = if kind.as_deref() == Some("pi") {
+        agent
+            .get("agent_session")
+            .and_then(Value::as_object)
+            .filter(|session| {
+                session.get("source").and_then(Value::as_str) == Some("herdr:pi")
+                    && session.get("kind").and_then(Value::as_str) == Some("path")
+            })
+            .and_then(|session| session.get("value"))
+            .and_then(Value::as_str)
+            .map(|value| crate::capability_probe::pi_live_model_evidence(value, unix_ms()))
+    } else {
+        None
+    };
     Some(WorkerCapability {
         agent_id,
         kind: kind.clone(),
-        provider: scanned
-            .and_then(|record| record.provider.as_ref().map(|value| value.value.clone())),
-        model: scanned.and_then(|record| record.model.as_ref().map(|value| value.value.clone())),
+        provider: live_pi
+            .as_ref()
+            .and_then(|evidence| evidence.provider.as_ref().map(|value| value.value.clone()))
+            .or_else(|| {
+                scanned.and_then(|record| record.provider.as_ref().map(|value| value.value.clone()))
+            }),
+        provider_source: if live_pi
+            .as_ref()
+            .is_some_and(|evidence| evidence.provider.is_some())
+        {
+            Some("active_session".to_owned())
+        } else if scanned.is_some_and(|record| record.provider.is_some()) {
+            Some(
+                if kind.as_deref() == Some("pi") {
+                    "configured_default"
+                } else {
+                    "capability_inventory"
+                }
+                .to_owned(),
+            )
+        } else {
+            None
+        },
+        model: live_pi
+            .as_ref()
+            .and_then(|evidence| evidence.model.as_ref().map(|value| value.value.clone()))
+            .or_else(|| {
+                scanned.and_then(|record| record.model.as_ref().map(|value| value.value.clone()))
+            }),
+        model_source: if live_pi
+            .as_ref()
+            .is_some_and(|evidence| evidence.model.is_some())
+        {
+            Some("active_session".to_owned())
+        } else if scanned.is_some_and(|record| record.model.is_some()) {
+            Some(
+                if kind.as_deref() == Some("pi") {
+                    "configured_default"
+                } else {
+                    "capability_inventory"
+                }
+                .to_owned(),
+            )
+        } else {
+            None
+        },
         profile: scanned
             .and_then(|record| record.profile.as_ref().map(|value| value.value.clone())),
         supports_code_edit: scanned
@@ -135,10 +198,7 @@ fn worker_from_agent(
         current_status: status,
         current_project: cwd.clone(),
         cwd,
-        pane_id: agent
-            .get("pane_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        pane_id,
         workspace_id: agent
             .get("workspace_id")
             .or_else(|| agent.get("workspace"))
@@ -146,6 +206,14 @@ fn worker_from_agent(
             .map(str::to_owned),
         interactive_ready: agent.get("interactive_ready").and_then(Value::as_bool),
     })
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 #[cfg(test)]
@@ -221,6 +289,66 @@ mod tests {
     }
 
     #[test]
+    fn resolver_prefers_live_pi_model_over_scanned_default() {
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("PI_CODING_AGENT_DIR");
+        let dir = std::env::temp_dir().join(format!("herdr-pi-live-{}", std::process::id()));
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let session = sessions.join("current.jsonl");
+        std::fs::write(
+            &session,
+            "{\"provider\":\"zai-coding-cn\",\"modelId\":\"glm-5.3-flash\"}\n",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &dir) };
+        let mut pi = record("pi");
+        pi.provider = Some(Evidence {
+            value: "provider-a".to_owned(),
+            source: "test".to_owned(),
+            authority: "configured".to_owned(),
+            observed_at_ms: 1,
+            detail: None,
+        });
+        pi.model = Some(Evidence {
+            value: "model-a".to_owned(),
+            source: "test".to_owned(),
+            authority: "configured".to_owned(),
+            observed_at_ms: 1,
+            detail: None,
+        });
+        let visibility = AgentVisibility::Allow(["pi".to_owned()].into_iter().collect());
+        let snapshot = project_capabilities_with_inventory(
+            &json!({"agents":[{
+                "agent":"pi","name":"pi-live","agent_status":"idle","pane_id":"w1:p1",
+                "agent_session":{"agent":"pi","kind":"path","source":"herdr:pi","value":session}
+            }]}),
+            &visibility,
+            &[pi],
+        );
+        assert_eq!(
+            snapshot.workers[0].provider.as_deref(),
+            Some("zai-coding-cn")
+        );
+        assert_eq!(
+            snapshot.workers[0].provider_source.as_deref(),
+            Some("active_session")
+        );
+        assert_eq!(snapshot.workers[0].model.as_deref(), Some("glm-5.3-flash"));
+        assert_eq!(
+            snapshot.workers[0].model_source.as_deref(),
+            Some("active_session")
+        );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+                None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn resolver_keeps_unverified_traits_unknown_without_inventory() {
         let visibility = AgentVisibility::Allow(["pi".to_owned()].into_iter().collect());
         let snapshot = project_capabilities(
@@ -228,7 +356,8 @@ mod tests {
                 "agents": [{
                     "agent": "pi",
                     "agent_status": "idle",
-                    "cwd": "/repo"
+                    "cwd": "/repo",
+                    "pane_id": "w1:p1"
                 }]
             }),
             &visibility,

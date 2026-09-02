@@ -74,18 +74,21 @@ test("device routing prefers explicit immutable identity and resolves unique ali
   assert.deepEqual(await resolveDeviceRoute(registryWith(devices), DEV_B.toLowerCase(), "legacy"), {
     ok: true,
     device_id: DEV_B,
+    device_name: "build-linux",
     workstation_id: DEV_B,
     routing_reason: "explicit_device",
   });
   assert.deepEqual(await resolveDeviceRoute(registryWith(devices), "macbook", "legacy"), {
     ok: true,
     device_id: DEV_A,
+    device_name: "qingxian-macbookair",
     workstation_id: "prod-real-runtime",
     routing_reason: "explicit_device",
   });
   assert.deepEqual(await resolveDeviceRoute(registryWith(devices), "qingxian-macbookair", "legacy"), {
     ok: true,
     device_id: DEV_A,
+    device_name: "qingxian-macbookair",
     workstation_id: "prod-real-runtime",
     routing_reason: "explicit_device",
   });
@@ -96,13 +99,35 @@ test("device routing fails closed for ambiguity and paused/suspended devices", a
     { device_id: DEV_A, workstation_id: DEV_A, name: "build", authorization: "active", scheduling: "enabled" },
     { device_id: DEV_B, workstation_id: DEV_B, name: "build", authorization: "active", scheduling: "enabled" },
   ];
-  assert.deepEqual(await resolveDeviceRoute(registryWith(duplicateNames), undefined, "legacy"), { ok: false, code: "device_ambiguous" });
-  assert.deepEqual(await resolveDeviceRoute(registryWith(duplicateNames), "build", "legacy"), { ok: false, code: "device_ambiguous" });
+  assert.deepEqual(await resolveDeviceRoute(registryWith(duplicateNames), undefined, "legacy"), {
+    ok: false,
+    code: "device_ambiguous",
+    candidate_devices: [
+      { device_id: DEV_A, name: "build" },
+      { device_id: DEV_B, name: "build" },
+    ],
+  });
+  assert.deepEqual(await resolveDeviceRoute(registryWith(duplicateNames), "build", "legacy"), {
+    ok: false,
+    code: "device_ambiguous",
+    candidate_devices: [
+      { device_id: DEV_A, name: "build" },
+      { device_id: DEV_B, name: "build" },
+    ],
+  });
 
   const paused = [{ ...duplicateNames[0], scheduling: "paused" }];
-  assert.deepEqual(await resolveDeviceRoute(registryWith(paused), DEV_A, "legacy"), { ok: false, code: "device_paused" });
+  assert.deepEqual(await resolveDeviceRoute(registryWith(paused), DEV_A, "legacy"), {
+    ok: false,
+    code: "device_paused",
+    selected_device: { device_id: DEV_A, name: "build" },
+  });
   const suspended = [{ ...duplicateNames[0], authorization: "suspended" }];
-  assert.deepEqual(await resolveDeviceRoute(registryWith(suspended), DEV_A, "legacy"), { ok: false, code: "device_suspended" });
+  assert.deepEqual(await resolveDeviceRoute(registryWith(suspended), DEV_A, "legacy"), {
+    ok: false,
+    code: "device_suspended",
+    selected_device: { device_id: DEV_A, name: "build" },
+  });
 });
 
 test("implicit routing preserves the legacy default workstation after additional devices enroll", async () => {
@@ -113,6 +138,7 @@ test("implicit routing preserves the legacy default workstation after additional
   assert.deepEqual(await resolveDeviceRoute(registryWith(devices), undefined, "prod-real-runtime"), {
     ok: true,
     device_id: DEV_A,
+    device_name: "primary",
     workstation_id: "prod-real-runtime",
     routing_reason: "legacy_default_device",
   });
@@ -121,6 +147,7 @@ test("implicit routing preserves the legacy default workstation after additional
   assert.deepEqual(await resolveDeviceRoute(registryWith(pausedDefault), undefined, "prod-real-runtime"), {
     ok: false,
     code: "device_paused",
+    selected_device: { device_id: DEV_A, name: "primary" },
   });
 
   const noLegacyMatch = [
@@ -130,6 +157,10 @@ test("implicit routing preserves the legacy default workstation after additional
   assert.deepEqual(await resolveDeviceRoute(registryWith(noLegacyMatch), undefined, "legacy"), {
     ok: false,
     code: "device_ambiguous",
+    candidate_devices: [
+      { device_id: DEV_A, name: "primary" },
+      { device_id: DEV_B, name: "secondary" },
+    ],
   });
 });
 
@@ -138,6 +169,7 @@ test("device routing selects one routable device and preserves legacy fallback o
   assert.deepEqual(await resolveDeviceRoute(registryWith(single), undefined, "legacy"), {
     ok: true,
     device_id: DEV_A,
+    device_name: "macbook",
     workstation_id: "prod-real-runtime",
     routing_reason: "single_available_device",
   });

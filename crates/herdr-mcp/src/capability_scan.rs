@@ -269,6 +269,11 @@ fn scan_agent(
     } else {
         Default::default()
     };
+    let pi_model = if agent == "pi" {
+        crate::capability_probe::pi_default_model_evidence(observed_at_ms)
+    } else {
+        Default::default()
+    };
     AgentCapabilityRecord {
         schema_version: INVENTORY_SCHEMA_VERSION,
         agent: agent.to_owned(),
@@ -289,9 +294,9 @@ fn scan_agent(
         executable_available,
         available_for_start,
         binary_version,
-        provider: None,
-        model: None,
-        profile: None,
+        provider: pi_model.provider,
+        model: pi_model.model,
+        profile: pi_model.profile,
         supports_code_edit: deep.supports_code_edit,
         supports_shell: deep.supports_shell,
         supports_vision: None,

@@ -122,11 +122,15 @@ test("wrapResultWithDevice retains device_id in opaque refs for device-routed ca
     panes: [{ pane_id: "w1:p1", workspace_id: "w1" }],
     agents: [{ pane_id: "w1:p1", workspace_id: "w1" }],
   };
-  const wrapped = wrapResultWithDevice(result, DEV_A);
+  const wrapped = wrapResultWithDevice(result, DEV_A, "macbook");
   assert.ok(isDeviceAwareRef(wrapped.workspaces[0].workspace_id));
-  assert.equal(decodeDeviceRef(wrapped.workspaces[0].workspace_id).d, DEV_A);
-  assert.equal(decodeDeviceRef(wrapped.panes[0].pane_id).d, DEV_A);
-  assert.equal(decodeDeviceRef(wrapped.panes[0].workspace_id).d, DEV_A);
+  assert.equal(decodeDeviceRef(wrapped.workspaces[0].workspace_id_ref).d, DEV_A);
+  assert.equal(wrapped.workspaces[0].workspace_id, wrapped.workspaces[0].workspace_id_ref);
+  assert.equal(decodeDeviceRef(wrapped.panes[0].pane_id_ref).d, DEV_A);
+  assert.equal(wrapped.panes[0].pane_id, wrapped.panes[0].pane_id_ref);
+  assert.equal(decodeDeviceRef(wrapped.panes[0].workspace_id_ref).d, DEV_A);
+  assert.equal(wrapped.device_id, DEV_A);
+  assert.equal(wrapped.device_name, "macbook");
   // legacy null device leaves result unwrapped
   const unwrapped = wrapResultWithDevice(result, null);
   assert.deepEqual(unwrapped, result);
@@ -143,16 +147,22 @@ test("wrapResultWithDevice handles real CallToolResult shape and preserves image
       panes: [{ pane_id: "w1:p1", workspace_id: "w1" }],
     },
   };
-  const wrapped = wrapResultWithDevice(callResult, DEV_A);
-  // structuredContent must be wrapped
+  const wrapped = wrapResultWithDevice(callResult, DEV_A, "macbook");
   assert.ok(isDeviceAwareRef(wrapped.structuredContent.workspaces[0].workspace_id));
-  assert.equal(decodeDeviceRef(wrapped.structuredContent.workspaces[0].workspace_id).d, DEV_A);
-  assert.equal(decodeDeviceRef(wrapped.structuredContent.panes[0].pane_id).d, DEV_A);
-  // content array must be preserved unchanged except not leaking device_id into text
+  assert.equal(decodeDeviceRef(wrapped.structuredContent.workspaces[0].workspace_id_ref).d, DEV_A);
+  assert.equal(
+    wrapped.structuredContent.workspaces[0].workspace_id,
+    wrapped.structuredContent.workspaces[0].workspace_id_ref,
+  );
+  assert.equal(decodeDeviceRef(wrapped.structuredContent.panes[0].pane_id_ref).d, DEV_A);
+  assert.equal(wrapped.structuredContent.device_id, DEV_A);
+  assert.equal(wrapped.structuredContent.device_name, "macbook");
+  const textPayload = JSON.parse(wrapped.content[0].text);
+  assert.equal(textPayload.device_id, DEV_A);
+  assert.equal(textPayload.device_name, "macbook");
   assert.equal(wrapped.content.length, 2);
   assert.equal(wrapped.content[1].type, "image");
   assert.equal(wrapped.content[1].data, "base64...");
-  assert.equal(wrapped.content[0].text.includes(DEV_A), false);
 });
 
 test("device routing priority: explicit vs ref conflict fails closed; ref alone succeeds; binding ignored", async () => {
@@ -167,15 +177,20 @@ test("device routing priority: explicit vs ref conflict fails closed; ref alone 
   assert.ok(conflict.code === "device_ref_conflict" || conflict.code === "device_ambiguous");
   // ref wins when no explicit
   assert.deepEqual(await resolveDeviceRouteWithContext(registryWith(devices), { args: { workspace: refB }, legacyWorkstationId: "legacy" }), {
-    ok: true, device_id: DEV_B, workstation_id: "ws-b", routing_reason: "device_ref",
+    ok: true, device_id: DEV_B, device_name: "b", workstation_id: "ws-b", routing_reason: "device_ref",
   });
   // binding is NOT trusted – with only binding, should fall to ambiguous (2 routable)
   assert.deepEqual(await resolveDeviceRouteWithContext(registryWith(devices), { args: { binding_device_id: DEV_A }, legacyWorkstationId: "legacy" }), {
-    ok: false, code: "device_ambiguous",
+    ok: false,
+    code: "device_ambiguous",
+    candidate_devices: [
+      { device_id: DEV_A, name: "a" },
+      { device_id: DEV_B, name: "b" },
+    ],
   });
   // intentional targeting of B via explicit + raw id should succeed
   assert.deepEqual(await resolveDeviceRouteWithContext(registryWith(devices), { selector: DEV_B, args: { workspace: "w1" }, legacyWorkstationId: "legacy" }), {
-    ok: true, device_id: DEV_B, workstation_id: "ws-b", routing_reason: "explicit_device",
+    ok: true, device_id: DEV_B, device_name: "b", workstation_id: "ws-b", routing_reason: "explicit_device",
   });
 });
 
@@ -188,7 +203,11 @@ test("device routing via ref fails closed for unknown or paused device and ambig
   const unknownRef = encodeDeviceRef(UNKNOWN_DEV, "w1");
   assert.deepEqual(await resolveDeviceRouteWithContext(registryWith(devices), { args: { workspace: unknownRef }, legacyWorkstationId: "legacy" }), { ok: false, code: "device_not_found" });
   const pausedRef = encodeDeviceRef(DEV_B, "w1");
-  assert.deepEqual(await resolveDeviceRouteWithContext(registryWith(devices), { args: { workspace: pausedRef }, legacyWorkstationId: "legacy" }), { ok: false, code: "device_paused" });
+  assert.deepEqual(await resolveDeviceRouteWithContext(registryWith(devices), { args: { workspace: pausedRef }, legacyWorkstationId: "legacy" }), {
+    ok: false,
+    code: "device_paused",
+    selected_device: { device_id: DEV_B, name: "b" },
+  });
   // Conflicting refs in same call -> ambiguous/ref_conflict
   const refA = encodeDeviceRef(DEV_A, "w1");
   const refB = encodeDeviceRef(DEV_B, "w2");
@@ -197,6 +216,8 @@ test("device routing via ref fails closed for unknown or paused device and ambig
   assert.ok(conflict.code === "device_ambiguous" || conflict.code === "device_ref_conflict");
   // type mismatch -> ref_conflict
   const paneRef = encodeDeviceRef(DEV_A, undefined, "w1:p1");
+  const malformed = await resolveDeviceRouteWithContext(registryWith(devices), { args: { workspace: "herdr_ref_not-valid" }, legacyWorkstationId: "legacy" });
+  assert.deepEqual(malformed, { ok: false, code: "device_ref_conflict" });
   const typeMismatch = await resolveDeviceRouteWithContext(registryWith(devices), { args: { workspace: paneRef }, legacyWorkstationId: "legacy" });
   assert.equal(typeMismatch.ok, false);
   assert.equal(typeMismatch.code, "device_ref_conflict");
@@ -205,13 +226,20 @@ test("device routing via ref fails closed for unknown or paused device and ambig
     { device_id: DEV_A, workstation_id: "ws-a", name: "a", authorization: "active", scheduling: "enabled" },
     { device_id: DEV_B, workstation_id: "ws-b", name: "b", authorization: "active", scheduling: "enabled" },
   ];
-  assert.deepEqual(await resolveDeviceRouteWithContext(registryWith(bothRoutable), { legacyWorkstationId: "legacy" }), { ok: false, code: "device_ambiguous" });
+  assert.deepEqual(await resolveDeviceRouteWithContext(registryWith(bothRoutable), { legacyWorkstationId: "legacy" }), {
+    ok: false,
+    code: "device_ambiguous",
+    candidate_devices: [
+      { device_id: DEV_A, name: "a" },
+      { device_id: DEV_B, name: "b" },
+    ],
+  });
 });
 
 test("legacy single-device bindings/refs remain backward compatible", async () => {
   const single = [{ device_id: DEV_A, workstation_id: "ws-a", name: "a", authorization: "active", scheduling: "enabled" }];
   assert.deepEqual(await resolveDeviceRouteWithContext(registryWith(single), { args: { workspace: "w1" }, legacyWorkstationId: "legacy" }), {
-    ok: true, device_id: DEV_A, workstation_id: "ws-a", routing_reason: "single_available_device",
+    ok: true, device_id: DEV_A, device_name: "a", workstation_id: "ws-a", routing_reason: "single_available_device",
   });
   assert.deepEqual(await resolveDeviceRouteWithContext(registryWith([]), { args: { workspace: "w1" }, legacyWorkstationId: "legacy-ws" }), {
     ok: true, device_id: null, workstation_id: "legacy-ws", routing_reason: "legacy_default_device",
@@ -249,12 +277,16 @@ test("follow-up tool calls with device-aware opaque ref route to same device bef
   const r1 = await handleMcp({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "herdr_inspect", arguments: { device: DEV_A } } }, "legacy", deps);
   // r1 must return wrapped ids inside structuredContent and preserve image content without leaking device_id into text
   const sc1 = r1.body.result.structuredContent;
-  const wrappedId = sc1.workspaces[0].workspace_id;
+  const wrappedId = sc1.workspaces[0].workspace_id_ref;
+  assert.equal(sc1.workspaces[0].workspace_id, wrappedId);
   assert.ok(isDeviceAwareRef(wrappedId));
   assert.equal(decodeDeviceRef(wrappedId).d, DEV_A);
+  assert.equal(sc1.device_id, DEV_A);
+  assert.equal(sc1.device_name, "a");
+  assert.equal(JSON.parse(r1.body.result.content[0].text).device_id, DEV_A);
   assert.equal(r1.body.result.content.length, 2);
   assert.equal(r1.body.result.content[1].type, "image");
-  assert.equal(r1.body.result.content[0].text.includes(DEV_A), false);
+  assert.equal(JSON.parse(r1.body.result.content[0].text).device_name, "a");
   // Follow-up uses the opaque ref without explicit device -> must route to same device
   const r2 = await handleMcp({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "herdr_exec", arguments: { workspace: wrappedId, command: "ls" } } }, "legacy", deps);
   assert.equal(r2.body.result.isError, undefined);
@@ -262,6 +294,9 @@ test("follow-up tool calls with device-aware opaque ref route to same device bef
   const r3 = await handleMcp({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "herdr_exec", arguments: { workspace: "w1", command: "ls" } } }, "legacy", deps);
   assert.equal(r3.body.result.isError, true);
   assert.equal(r3.body.result.structuredContent.code, "device_ambiguous");
+  assert.equal(r3.body.result.structuredContent.delivery_state, "not_delivered");
+  assert.equal(r3.body.result.structuredContent.candidate_devices.length, 2);
+  assert.match(r3.body.result.structuredContent.next_action, /explicit device/);
 });
 
 test("explicit device plus opaque ref to different device fails closed", async () => {
@@ -285,7 +320,7 @@ test("explicit device plus opaque ref to different device fails closed", async (
   assert.ok(r.body.result.structuredContent.code === "device_ref_conflict" || r.body.result.structuredContent.code === "device_ambiguous");
 });
 
-test("mcp handler strips device metadata and does not leak into ChatGPT text", async () => {
+test("mcp handler exposes device metadata in ChatGPT text", async () => {
   const deps = {
     limits: makeLimits(),
     logger: { warn() {} },
@@ -302,5 +337,5 @@ test("mcp handler strips device metadata and does not leak into ChatGPT text", a
   };
   const r = await handleMcp({ jsonrpc: "2.0", id: 20, method: "tools/call", params: { name: "herdr_fs_read", arguments: { device: DEV_A, path: "/repo/file.txt" } } }, "legacy", deps);
   const text = r.body.result.content[0].text;
-  assert.equal(text.includes(DEV_A), false, "device_id must not appear in ChatGPT-visible text");
+  assert.equal(text.includes(DEV_A), true, "device_id must appear in ChatGPT-visible text");
 });

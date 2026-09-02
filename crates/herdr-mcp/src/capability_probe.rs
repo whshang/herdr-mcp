@@ -12,6 +12,8 @@ pub const PROBE_ADAPTER_VERSION: u32 = 2;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_PROBE_OUTPUT_BYTES: usize = 32 * 1024;
 const MAX_HERDR_START_KINDS: usize = 256;
+const MAX_PI_SETTINGS_BYTES: u64 = 64 * 1024;
+const MAX_PI_SESSION_BYTES: u64 = 128 * 1024;
 const SAFE_ENV_KEYS: &[&str] = &["PATH", "LANG", "LC_ALL", "TMPDIR"];
 static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const SAFE_SELF_DESCRIPTION_AGENTS: &[&str] = &[
@@ -41,7 +43,39 @@ pub fn version_probe(agent: &str, path: &Path, observed_at_ms: i64) -> Option<Ev
         return None;
     }
     let output = run_bounded(path, &[OsStr::new("--version")], COMMAND_TIMEOUT).ok()?;
-    version_evidence(output, observed_at_ms)
+    let mut evidence = version_evidence(output, observed_at_ms)?;
+    evidence.detail = binary_identity(path)
+        .ok()
+        .map(|value| format!("binary_identity={value}"));
+    Some(evidence)
+}
+
+pub fn binary_identity(path: &Path) -> Result<String, String> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "cannot resolve capability binary {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = std::fs::metadata(&canonical).map_err(|error| {
+        format!(
+            "cannot inspect capability binary {}: {error}",
+            canonical.display()
+        )
+    })?;
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let mut digest = Sha256::new();
+    digest.update(b"herdr-capability-binary-identity-v1\0");
+    digest.update(canonical.as_os_str().as_encoded_bytes());
+    digest.update(b"\0");
+    digest.update(metadata.len().to_le_bytes());
+    digest.update(modified_ns.to_le_bytes());
+    Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
 fn version_evidence(output: CommandOutput, observed_at_ms: i64) -> Option<Evidence<String>> {
@@ -141,6 +175,149 @@ fn reported_bool(source: &str, observed_at_ms: i64, detail: String) -> Evidence<
 
 fn safe_self_description_agent(agent: &str) -> bool {
     SAFE_SELF_DESCRIPTION_AGENTS.contains(&agent)
+}
+
+#[derive(Debug, Default)]
+pub struct PiModelEvidence {
+    pub provider: Option<Evidence<String>>,
+    pub model: Option<Evidence<String>>,
+    pub profile: Option<Evidence<String>>,
+}
+
+pub fn pi_default_model_evidence(observed_at_ms: i64) -> PiModelEvidence {
+    let Some(agent_dir) = pi_agent_dir() else {
+        return PiModelEvidence::default();
+    };
+    let primary = agent_dir.join("settings.json");
+    let path = if primary.is_file() {
+        primary
+    } else {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return PiModelEvidence::default();
+        };
+        let legacy = home.join(".pi").join("settings.json");
+        if !legacy.is_file() {
+            return PiModelEvidence::default();
+        }
+        legacy
+    };
+    let Some(value) = read_small_json(&path, MAX_PI_SETTINGS_BYTES) else {
+        return PiModelEvidence::default();
+    };
+    PiModelEvidence {
+        provider: evidence_string(
+            &value,
+            "defaultProvider",
+            "pi_settings",
+            "configured",
+            observed_at_ms,
+        ),
+        model: evidence_string(
+            &value,
+            "defaultModel",
+            "pi_settings",
+            "configured",
+            observed_at_ms,
+        ),
+        profile: evidence_string(
+            &value,
+            "defaultThinkingLevel",
+            "pi_settings",
+            "configured",
+            observed_at_ms,
+        ),
+    }
+}
+
+pub fn pi_live_model_evidence(session_value: &str, observed_at_ms: i64) -> PiModelEvidence {
+    let path = Path::new(session_value);
+    let Some(root) = pi_agent_dir().map(|dir| dir.join("sessions")) else {
+        return PiModelEvidence::default();
+    };
+    let (Ok(root), Ok(path)) = (std::fs::canonicalize(root), std::fs::canonicalize(path)) else {
+        return PiModelEvidence::default();
+    };
+    if !path.starts_with(&root) || !path.is_file() {
+        return PiModelEvidence::default();
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return PiModelEvidence::default();
+    };
+    let mut text = String::new();
+    if file
+        .take(MAX_PI_SESSION_BYTES)
+        .read_to_string(&mut text)
+        .is_err()
+    {
+        return PiModelEvidence::default();
+    }
+    let mut provider = None;
+    let mut model = None;
+    for line in text.lines().take(128) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        provider = provider.or_else(|| {
+            evidence_string(&value, "provider", "pi_session", "observed", observed_at_ms)
+        });
+        model = model.or_else(|| {
+            evidence_string(&value, "model", "pi_session", "observed", observed_at_ms).or_else(
+                || evidence_string(&value, "modelId", "pi_session", "observed", observed_at_ms),
+            )
+        });
+        if provider.is_some() && model.is_some() {
+            break;
+        }
+    }
+    PiModelEvidence {
+        provider,
+        model,
+        profile: None,
+    }
+}
+
+fn pi_agent_dir() -> Option<PathBuf> {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".pi").join("agent"))
+        })
+}
+
+fn read_small_json(path: &Path, max_bytes: u64) -> Option<Value> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+    serde_json::from_reader(std::fs::File::open(path).ok()?).ok()
+}
+
+fn evidence_string(
+    value: &Value,
+    key: &str,
+    source: &str,
+    authority: &str,
+    observed_at_ms: i64,
+) -> Option<Evidence<String>> {
+    let value = value.get(key)?.as_str()?.trim();
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | ':'))
+    {
+        return None;
+    }
+    Some(Evidence {
+        value: value.to_owned(),
+        source: source.to_owned(),
+        authority: authority.to_owned(),
+        observed_at_ms,
+        detail: None,
+    })
 }
 
 pub fn find_executable(name: &str) -> Option<PathBuf> {
@@ -260,6 +437,21 @@ pub fn fingerprint(
     });
     digest.update(b"\0");
     digest.update(PROBE_ADAPTER_VERSION.to_le_bytes());
+    if agent == "pi" {
+        let configured = pi_default_model_evidence(0);
+        for (key, evidence) in [
+            ("provider", configured.provider.as_ref()),
+            ("model", configured.model.as_ref()),
+            ("profile", configured.profile.as_ref()),
+        ] {
+            if let Some(evidence) = evidence {
+                digest.update(key.as_bytes());
+                digest.update(b"=");
+                digest.update(evidence.value.as_bytes());
+                digest.update(b"\0");
+            }
+        }
+    }
     if let Some(binary) = binary {
         digest.update(binary.as_os_str().as_encoded_bytes());
         let metadata = std::fs::metadata(binary).map_err(|error| {
@@ -494,6 +686,52 @@ mod tests {
         assert!(!safe_self_description_agent("future-agent"));
     }
 
+    #[test]
+    fn pi_model_evidence_uses_native_config_and_rejects_outside_session_paths() {
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("PI_CODING_AGENT_DIR");
+        let dir = temp_dir("pi-model-evidence");
+        let agent_dir = dir.join("pi-agent");
+        let sessions = agent_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"defaultProvider":"provider-a","defaultModel":"model-a","defaultThinkingLevel":"high","apiKey":"must-not-leak"}"#,
+        )
+        .unwrap();
+        let session = sessions.join("current.jsonl");
+        fs::write(
+            &session,
+            "{\"provider\":\"zai-coding-cn\",\"modelId\":\"glm-5.3-flash\",\"prompt\":\"must-not-leak\"}\n",
+        )
+        .unwrap();
+        let outside = dir.join("outside.jsonl");
+        fs::write(
+            &outside,
+            "{\"provider\":\"outside\",\"modelId\":\"outside\"}\n",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &agent_dir) };
+
+        let configured = pi_default_model_evidence(1);
+        assert_eq!(configured.provider.unwrap().value, "provider-a");
+        assert_eq!(configured.model.unwrap().value, "model-a");
+        assert_eq!(configured.profile.unwrap().value, "high");
+        let live = pi_live_model_evidence(session.to_str().unwrap(), 2);
+        assert_eq!(live.provider.unwrap().value, "zai-coding-cn");
+        assert_eq!(live.model.unwrap().value, "glm-5.3-flash");
+        let rejected = pi_live_model_evidence(outside.to_str().unwrap(), 3);
+        assert!(rejected.provider.is_none() && rejected.model.is_none());
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+                None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+            }
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn disallowed_agent_probe_does_not_execute_binary() {
@@ -672,6 +910,35 @@ mod tests {
         let binary_changed =
             fingerprint("demo", &first_manifest, Some(&binary), Some(true)).unwrap();
         assert_ne!(first, binary_changed);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pi_fingerprint_changes_with_configured_model() {
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("PI_CODING_AGENT_DIR");
+        let dir = temp_dir("pi-fingerprint");
+        fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &dir) };
+        fs::write(
+            dir.join("settings.json"),
+            r#"{"defaultProvider":"provider-a","defaultModel":"model-a"}"#,
+        )
+        .unwrap();
+        let first = fingerprint("pi", &json!({}), None, Some(true)).unwrap();
+        fs::write(
+            dir.join("settings.json"),
+            r#"{"defaultProvider":"zai-coding-cn","defaultModel":"glm-5.3-flash"}"#,
+        )
+        .unwrap();
+        let second = fingerprint("pi", &json!({}), None, Some(true)).unwrap();
+        assert_ne!(first, second);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+                None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+            }
+        }
         let _ = fs::remove_dir_all(dir);
     }
 }

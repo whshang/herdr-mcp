@@ -240,6 +240,21 @@ impl CacheState {
             return;
         }
 
+        if kind == "pane_updated"
+            && let Some(pane) = pane.as_ref()
+            && pane_update_only_scroll(&self.state, pane)
+            && let Some(pane_id) = pane.get("pane_id").and_then(Value::as_str)
+        {
+            upsert(
+                &mut self.state,
+                "panes",
+                "pane_id",
+                pane_id,
+                Value::Object(pane.clone()),
+            );
+            return;
+        }
+
         self.event_count = self.event_count.saturating_add(1);
         self.last_event_at = Some(at.clone());
         self.digest_cursor = self.digest_cursor.saturating_add(1);
@@ -484,8 +499,17 @@ impl CacheState {
             .map(|agent| {
                 let pane = agent.get("pane_id").and_then(Value::as_str);
                 let session = agent.get("agent_session").filter(|value| value.is_object());
+                let target = agent
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Value::String(value.to_owned()))
+                    .or_else(|| agent.get("pane_id").cloned())
+                    .unwrap_or(Value::Null);
                 json!({
-                    "name": agent.get("agent").cloned().unwrap_or(Value::Null),
+                    "name": target,
+                    "agent_id": target,
+                    "kind": agent.get("kind").cloned().or_else(|| agent.get("agent_kind").cloned()).or_else(|| agent.get("agent").cloned()).unwrap_or(Value::Null),
                     "pane": agent.get("pane_id").cloned().unwrap_or(Value::Null),
                     "status": agent.get("agent_status").cloned().or_else(|| agent.get("status").cloned()).unwrap_or(Value::Null),
                     "workspace": agent.get("workspace_id").cloned().unwrap_or(Value::Null),
@@ -607,6 +631,25 @@ fn snapshot_topology_diff(before: &Value, after: &Value) -> Vec<Value> {
         }));
     }
     events
+}
+
+fn pane_update_only_scroll(state: &Value, incoming: &Map<String, Value>) -> bool {
+    let Some(pane_id) = incoming.get("pane_id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(previous) = find_by_id(state, "panes", "pane_id", pane_id).and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let mut previous = previous.clone();
+    let mut incoming = incoming.clone();
+    let previous_scroll = previous.remove("scroll");
+    let incoming_scroll = incoming.remove("scroll");
+    previous.remove("state_change_seq");
+    incoming.remove("state_change_seq");
+    previous_scroll != incoming_scroll
+        && (previous_scroll.is_some() || incoming_scroll.is_some())
+        && previous == incoming
 }
 
 fn coalesce_digest_updates(events: Vec<Value>) -> Vec<Value> {
@@ -1542,8 +1585,42 @@ mod tests {
         assert_eq!(digest.cursor, 1);
         assert_eq!(digest.events.len(), 1);
         assert_eq!(digest.events[0]["workspace_id"], "w1");
+        assert_eq!(digest.agents[0]["name"], "w1:p1");
+        assert_eq!(digest.agents[0]["agent_id"], "w1:p1");
+        assert_eq!(digest.agents[0]["kind"], "pi");
         assert_eq!(digest.agents[0]["last_activity_at"], "2026-08-25T04:30:00Z");
         assert_eq!(digest.agents[0]["started_at"], "2026-08-25T04:00:01.123Z");
+    }
+
+    #[test]
+    fn pane_scroll_only_update_does_not_advance_digest_or_activity() {
+        let mut state = CacheState::default();
+        state.bootstrap(fixture());
+        let pane = |max_offset, state_change_seq| {
+            json!({
+                "event": "pane_updated",
+                "pane": {
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "cwd": "/tmp/demo",
+                    "agent": "pi",
+                    "agent_status": "working",
+                    "state_change_seq": state_change_seq,
+                    "scroll": {"max_offset_from_bottom": max_offset, "offset_from_bottom": 0}
+                }
+            })
+        };
+        state.apply_event(pane(100, 9), "2026-08-25T04:30:00Z".to_owned());
+        assert_eq!(state.digest_cursor, 1);
+        state.apply_event(pane(120, 10), "2026-08-25T04:31:00Z".to_owned());
+        assert_eq!(state.digest_cursor, 1);
+        let digest = state.digest_since(0);
+        assert_eq!(digest.events.len(), 1);
+        assert_eq!(digest.agents[0]["last_activity_at"], "2026-08-25T04:30:00Z");
+        assert_eq!(
+            array(&state.state, "panes")[0]["scroll"]["max_offset_from_bottom"],
+            120
+        );
     }
 
     #[test]

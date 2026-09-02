@@ -101,7 +101,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
                     .to_owned(),
             );
         }
-        let activation_evidence = verify_dev_activation(&runtime, &active_before).map_err(|error| {
+        let activation_evidence = verify_runtime_activation(&runtime, &active_before).map_err(|error| {
             format!(
                 "refusing interrupted DEV sync recovery because the active runtime no longer satisfies the DEV activation gate: {error}"
             )
@@ -145,14 +145,50 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         }))?;
         return Ok(ExitCode::SUCCESS);
     }
-    if let Some(state) = existing.as_ref()
+    let mut recovered_from_stale_dev = false;
+    if let Some(state) = existing.as_mut()
         && state.channel == "dev"
         && state.dev_generation.as_deref() != Some(active_before.as_str())
     {
-        return Err(format!(
-            "dev runtime state drift: state expects {:?} but runtime/current is {active_before}; run `herdr-mcp dev status` before another sync",
-            state.dev_generation
-        ));
+        let active_binary = runtime.config_dir.join("runtime/current/herdr-mcp");
+        let active_version = binary_version(&active_binary)?;
+        if is_dev_runtime_version(&active_version) {
+            return Err(format!(
+                "dev runtime state drift: state expects {:?} but runtime/current is {active_before}; run `herdr-mcp dev status` before another sync",
+                state.dev_generation
+            ));
+        }
+        verify_runtime_activation(&runtime, &active_before).map_err(|error| {
+            format!(
+                "dev runtime state drift: state expects {:?} but runtime/current is {active_before}; active runtime fails verification: {error}",
+                state.dev_generation
+            )
+        })?;
+
+        if dry_run {
+            transition_state_to_prod(
+                state,
+                &active_before,
+                &active_version,
+                &paths.prod_binary,
+                state.prod_snapshot_sha256.clone(),
+                now_ms(),
+            );
+            recovered_from_stale_dev = true;
+        } else {
+            refuse_managed_exec_mutation("dev sync")?;
+            let prod_sha = refresh_prod_snapshot(&runtime, &paths)?;
+            transition_state_to_prod(
+                state,
+                &active_before,
+                &active_version,
+                &paths.prod_binary,
+                prod_sha,
+                now_ms(),
+            );
+            write_state(&paths.state, state)?;
+            recovered_from_stale_dev = true;
+        }
     }
 
     let prod_generation = match existing.as_ref() {
@@ -163,7 +199,12 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         Some(state) if state.channel == "dev" => state.prod_version.clone(),
         _ => binary_version(&runtime.config_dir.join("runtime/current/herdr-mcp"))?,
     };
-    let plan = json!({
+    if is_dev_runtime_version(&prod_version) {
+        return Err(format!(
+            "refusing to treat active runtime as PROD source because its version '{prod_version}' is a DEV version"
+        ));
+    }
+    let mut plan = json!({
         "ok": true,
         "action": "dev_sync",
         "channel_from": existing.as_ref().map(|state| state.channel.as_str()).unwrap_or("prod"),
@@ -183,6 +224,9 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         "dns_mutation": false,
         "oauth_mutation": false,
     });
+    if recovered_from_stale_dev {
+        plan["recovered_from_stale_dev"] = json!(true);
+    }
     if dry_run {
         print_json(&plan)?;
         return Ok(ExitCode::SUCCESS);
@@ -257,7 +301,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
             ));
         }
     };
-    let activation_evidence = match verify_dev_activation(&runtime, &active_after) {
+    let activation_evidence = match verify_runtime_activation(&runtime, &active_after) {
         Ok(evidence) => evidence,
         Err(error) => {
             return Err(compensate_post_install_failure(
@@ -628,21 +672,95 @@ where
     ))
 }
 
+fn is_dev_runtime_version(version: &str) -> bool {
+    version.ends_with("-dev")
+}
+
+fn transition_state_to_prod(
+    state: &mut DevRuntimeState,
+    active_generation: &str,
+    active_version: &str,
+    prod_snapshot_binary: &Path,
+    prod_snapshot_sha256: String,
+    now_ms: u128,
+) {
+    state.channel = "prod".to_owned();
+    state.prod_generation = active_generation.to_owned();
+    state.prod_version = active_version.to_owned();
+    state.prod_snapshot_binary = prod_snapshot_binary.to_string_lossy().into_owned();
+    state.prod_snapshot_sha256 = prod_snapshot_sha256;
+    state.updated_at_ms = now_ms;
+}
+
+fn refresh_prod_snapshot(runtime: &RuntimePaths, paths: &DevPaths) -> Result<String, String> {
+    let current_binary = runtime.config_dir.join("runtime/current/herdr-mcp");
+    let metadata = fs::metadata(&current_binary)
+        .map_err(|error| format!("cannot inspect current PROD binary: {error}"))?;
+    if !metadata.is_file() {
+        return Err("current PROD runtime binary is not a regular file".to_owned());
+    }
+    secure_dir(&paths.prod_dir)?;
+    atomic_copy_executable(&current_binary, &paths.prod_binary)?;
+    file_sha256(&paths.prod_binary)
+}
+
+pub(crate) fn reconcile_after_public_prod_install() -> Result<(), String> {
+    if crate::runtime_meta::runtime_channel() != "prod" {
+        return Ok(());
+    }
+    let runtime = RuntimePaths::discover()?;
+    if runtime.instance.is_named() {
+        return Ok(());
+    }
+    let paths = dev_paths(&runtime);
+    let mut state = match read_state(&paths.state)? {
+        Some(state) => state,
+        None => return Ok(()),
+    };
+    let active_generation = current_generation(&runtime.config_dir)?.ok_or_else(|| {
+        "service install succeeded but runtime/current generation is missing during channel state reconcile"
+            .to_owned()
+    })?;
+    let active_binary = runtime.config_dir.join("runtime/current/herdr-mcp");
+    let active_version = binary_version(&active_binary)?;
+    if is_dev_runtime_version(&active_version) {
+        return Err(format!(
+            "refusing to reconcile channel state to PROD because active runtime version '{active_version}' is a DEV version"
+        ));
+    }
+    verify_runtime_activation(&runtime, &active_generation).map_err(|error| {
+        format!(
+            "refusing to reconcile channel state to PROD because active runtime fails verification: {error}"
+        )
+    })?;
+    let prod_sha = refresh_prod_snapshot(&runtime, &paths)?;
+    transition_state_to_prod(
+        &mut state,
+        &active_generation,
+        &active_version,
+        &paths.prod_binary,
+        prod_sha,
+        now_ms(),
+    );
+    write_state(&paths.state, &state)?;
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
-fn verify_dev_activation(runtime: &RuntimePaths, generation: &str) -> Result<Value, String> {
+fn verify_runtime_activation(runtime: &RuntimePaths, generation: &str) -> Result<Value, String> {
     let service = crate::service_manager::doctor_status()?;
     let home = env::var_os("HOME")
         .map(PathBuf::from)
-        .ok_or_else(|| "HOME is required for DEV activation verification".to_owned())?;
+        .ok_or_else(|| "HOME is required for runtime activation verification".to_owned())?;
     let link = crate::link::ownership::collect_status_report(&home, &runtime.config_dir);
     let native_host = crate::native_host_install::doctor_status()?;
     validate_dev_activation_evidence(generation, &service, &link, Some(&native_host))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn verify_dev_activation(_runtime: &RuntimePaths, _generation: &str) -> Result<Value, String> {
+fn verify_runtime_activation(_runtime: &RuntimePaths, _generation: &str) -> Result<Value, String> {
     Err(
-        "DEV activation verification currently requires macOS service/Link ownership evidence"
+        "runtime activation verification currently requires macOS service/Link ownership evidence"
             .to_owned(),
     )
 }
@@ -793,6 +911,12 @@ fn ensure_prod_snapshot(
         ));
     }
     let current_binary = config_dir.join("runtime/current/herdr-mcp");
+    let version = binary_version(&current_binary)?;
+    if is_dev_runtime_version(&version) {
+        return Err(format!(
+            "refusing PROD snapshot: current runtime version '{version}' is a DEV version and cannot be snapshotted as PROD"
+        ));
+    }
     let metadata = fs::metadata(&current_binary)
         .map_err(|error| format!("cannot inspect current PROD binary: {error}"))?;
     if !metadata.is_file() {
@@ -1356,5 +1480,78 @@ mod tests {
         assert!(error.contains("synthetic runtime/current read failure"));
         assert_eq!(rollback_calls.get(), 1);
         assert_eq!(restore_calls.get(), 1);
+    }
+
+    #[test]
+    fn dev_runtime_version_predicate_matches_established_convention() {
+        assert!(is_dev_runtime_version("0.4.3-dev"));
+        assert!(is_dev_runtime_version("0.4.4-dev"));
+        assert!(!is_dev_runtime_version("0.4.3"));
+        assert!(!is_dev_runtime_version("0.4.4"));
+        assert!(!is_dev_runtime_version("0.4.3-beta.1"));
+    }
+
+    #[test]
+    fn stale_dev_state_reconciles_to_verified_prod_while_preserving_provenance() {
+        let generation = "rust-9d973285cc085040";
+        let service = json!({ "ok": true, "healthy": true, "generation": generation });
+        let link = json!({
+            "ok": true,
+            "production_owner": "rust",
+            "agents": [{
+                "label": "dev.herdr-mcp.link-prod",
+                "loaded": true,
+                "implementation": "rust",
+                "points_at_managed_runtime": true,
+                "points_at_repo_checkout": false,
+            }],
+            "production_runtime_alignment": {
+                "current_generation": generation,
+                "active_generation": generation,
+                "runtime_control_active_matches_current": true,
+            }
+        });
+        let native = json!({ "ok": true, "runtime_matches_current": true });
+        assert!(
+            validate_dev_activation_evidence(generation, &service, &link, Some(&native)).is_ok()
+        );
+
+        let mut state = DevRuntimeState {
+            schema_version: STATE_SCHEMA_VERSION,
+            channel: "dev".to_owned(),
+            target_version: "0.4.3-dev".to_owned(),
+            source_repo: Some("/tmp/repo".to_owned()),
+            source_branch: Some("main".to_owned()),
+            source_commit: Some("abc123".to_owned()),
+            source_dirty: false,
+            dev_generation: Some("rust-3979663c8cc7e4f7".to_owned()),
+            prod_generation: "rust-old-prod".to_owned(),
+            prod_version: "0.4.3-dev".to_owned(),
+            prod_snapshot_binary: "/tmp/old".to_owned(),
+            prod_snapshot_sha256: "old-sha".to_owned(),
+            updated_at_ms: 100,
+        };
+
+        transition_state_to_prod(
+            &mut state,
+            generation,
+            "0.4.3",
+            Path::new("/tmp/channels/prod/herdr-mcp"),
+            "new-sha".to_owned(),
+            200,
+        );
+
+        assert_eq!(state.channel, "prod");
+        assert_eq!(state.prod_generation, generation);
+        assert_eq!(state.prod_version, "0.4.3");
+        assert_eq!(state.prod_snapshot_binary, "/tmp/channels/prod/herdr-mcp");
+        assert_eq!(state.prod_snapshot_sha256, "new-sha");
+        assert_eq!(state.updated_at_ms, 200);
+        assert_eq!(state.target_version, "0.4.3-dev");
+        assert_eq!(state.source_commit.as_deref(), Some("abc123"));
+        assert_eq!(
+            state.dev_generation.as_deref(),
+            Some("rust-3979663c8cc7e4f7")
+        );
     }
 }

@@ -136,7 +136,10 @@ function extractFromObject(args: Record<string, unknown>): { deviceId: string; f
     if (typeof value !== "string") continue;
     if (!REF_FIELDS.has(key)) continue;
     const decoded = decodeDeviceRef(value);
-    if (!decoded) continue;
+    if (!decoded) {
+      if (value.startsWith(REF_PREFIX)) return { deviceId: "__malformed__", field: key, raw: value, kind: "ref" };
+      continue;
+    }
     const expected = fieldRefKind(key);
     const actual = refPayloadKind(decoded);
     // Wrong ref type for the target field must fail closed, not silently coerce
@@ -154,7 +157,10 @@ function extractFromObject(args: Record<string, unknown>): { deviceId: string; f
         if (typeof v !== "string") continue;
         if (!REF_FIELDS.has(k)) continue;
         const decoded = decodeDeviceRef(v);
-        if (!decoded) continue;
+        if (!decoded) {
+          if (v.startsWith(REF_PREFIX)) return { deviceId: "__malformed__", field: `params.${k}`, raw: v, kind: "ref" };
+          continue;
+        }
         const expected = fieldRefKind(k);
         const actual = refPayloadKind(decoded);
         if (expected && actual && expected !== actual) {
@@ -260,12 +266,12 @@ export function unwrapDeviceRefs(args: Record<string, unknown>): Record<string, 
  * Wrap runtime result workspace/pane ids into device-aware opaque refs when the
  * call was routed to a specific device. This ensures follow-up calls retain
  * device affinity without trusting arbitrary path strings.
- * Handles both plain result objects and full MCP CallToolResult shapes
- * ({content, structuredContent}) – only structuredContent is wrapped, text
- * content (including image/audio passthrough) is preserved unchanged and never
- * contains routing metadata.
+ * Handles both plain result objects and full MCP CallToolResult shapes.
+ * Existing structured id fields remain device-aware exactly as before; 0.4.4
+ * also exposes sibling *_ref fields and mirrors the same routing metadata into
+ * JSON text blocks so text-oriented MCP clients do not lose affinity.
  */
-export function wrapResultWithDevice(result: unknown, deviceId: string | null): unknown {
+export function wrapResultWithDevice(result: unknown, deviceId: string | null, deviceName?: string): unknown {
   if (!deviceId || !result || typeof result !== "object") return result;
   const normalized = normalizeDeviceId(deviceId);
   if (!normalized) return result;
@@ -282,29 +288,61 @@ export function wrapResultWithDevice(result: unknown, deviceId: string | null): 
       const ws = container.workspaces as Array<Record<string, unknown>>;
       for (const entry of ws) {
         const id = (entry.workspace_id ?? entry.id) as string | undefined;
-        if (typeof id === "string") entry.workspace_id = wrapId(id);
+        if (typeof id === "string") {
+          const ref = wrapId(id);
+          entry.workspace_id = ref;
+          entry.workspace_id_ref = ref;
+        }
       }
     }
     if (Array.isArray(container.panes)) {
       const panes = container.panes as Array<Record<string, unknown>>;
       for (const entry of panes) {
-        if (typeof entry.pane_id === "string") entry.pane_id = wrapId(entry.pane_id as string);
-        if (typeof entry.workspace_id === "string") entry.workspace_id = wrapId(entry.workspace_id as string);
+        if (typeof entry.pane_id === "string") {
+          const ref = wrapId(entry.pane_id as string);
+          entry.pane_id = ref;
+          entry.pane_id_ref = ref;
+        }
+        if (typeof entry.workspace_id === "string") {
+          const ref = wrapId(entry.workspace_id as string);
+          entry.workspace_id = ref;
+          entry.workspace_id_ref = ref;
+        }
       }
     }
     if (Array.isArray(container.agents)) {
       const agents = container.agents as Array<Record<string, unknown>>;
       for (const entry of agents) {
-        if (typeof entry.pane_id === "string") entry.pane_id = wrapId(entry.pane_id as string);
-        if (typeof entry.workspace_id === "string") entry.workspace_id = wrapId(entry.workspace_id as string);
-        if (typeof entry.pane === "string") entry.pane = wrapId(entry.pane as string);
-        if (typeof entry.workspace === "string") entry.workspace = wrapId(entry.workspace as string);
+        if (typeof entry.pane_id === "string") {
+          const ref = wrapId(entry.pane_id as string);
+          entry.pane_id = ref;
+          entry.pane_ref = ref;
+        }
+        if (typeof entry.workspace_id === "string") {
+          const ref = wrapId(entry.workspace_id as string);
+          entry.workspace_id = ref;
+          entry.workspace_ref = ref;
+        }
+        if (typeof entry.pane === "string") {
+          const ref = wrapId(entry.pane as string);
+          entry.pane = ref;
+          entry.pane_ref = ref;
+        }
+        if (typeof entry.workspace === "string") {
+          const ref = wrapId(entry.workspace as string);
+          entry.workspace = ref;
+          entry.workspace_ref = ref;
+        }
       }
     }
     if (Array.isArray(container.tabs)) {
       const tabs = container.tabs as Array<Record<string, unknown>>;
       for (const entry of tabs) {
-        if (typeof entry.workspace_id === "string") entry.workspace_id = wrapId(entry.workspace_id as string);
+        if (typeof entry.workspace_id === "string") {
+          const ref = wrapId(entry.workspace_id as string);
+          entry.workspace_id = ref;
+          entry.workspace_id_ref = ref;
+        }
       }
     }
   }
@@ -312,20 +350,38 @@ export function wrapResultWithDevice(result: unknown, deviceId: string | null): 
   // Deep clone via JSON for now; result is expected to be JSON-serializable
   const clone = JSON.parse(JSON.stringify(result)) as Record<string, unknown>;
 
-  // If this is a full CallToolResult, wrap inside structuredContent and
-  // also inside any top-level workspaces for backward compat; never mutate
-  // content[].text or image/audio blocks.
+  function addProvenance(container: Record<string, unknown>): void {
+    container.device_id = normalized;
+    if (deviceName) container.device_name = deviceName;
+  }
+
+  // Preserve the pre-0.4.4 in-place device-aware ids and add explicit sibling
+  // refs/provenance to structured and text-visible JSON results. Non-JSON text
+  // and binary blocks remain untouched.
   if (Array.isArray(clone.content) && isRecord(clone.structuredContent)) {
-    wrapContainer(clone.structuredContent as Record<string, unknown>);
-    // Some runtimes may also duplicate at top-level; wrap there too if present
+    const structured = clone.structuredContent as Record<string, unknown>;
+    wrapContainer(structured);
+    addProvenance(structured);
     wrapContainer(clone);
+    addProvenance(clone);
+    for (const block of clone.content as Array<Record<string, unknown>>) {
+      if (block.type !== "text" || typeof block.text !== "string") continue;
+      try {
+        const parsed = JSON.parse(block.text) as unknown;
+        if (!isRecord(parsed)) continue;
+        wrapContainer(parsed);
+        addProvenance(parsed);
+        block.text = JSON.stringify(parsed);
+      } catch { /* preserve non-JSON text */ }
+    }
     return clone;
   }
   if (isRecord(clone.structuredContent)) {
-    // Structured content without content wrapper (edge case)
     wrapContainer(clone.structuredContent as Record<string, unknown>);
+    addProvenance(clone.structuredContent as Record<string, unknown>);
   }
   wrapContainer(clone);
+  addProvenance(clone);
   return clone;
 }
 

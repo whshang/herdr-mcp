@@ -1,5 +1,6 @@
 use crate::agent_visibility::AgentVisibility;
 use crate::capability_inventory::{AgentCapabilityRecord, CapabilityInventoryStore, ProbeLevel};
+use crate::capability_probe::{binary_identity, version_probe};
 use crate::capability_resolver::{WorkerCapability, project_capabilities_with_inventory};
 use crate::herdr::HerdrClient;
 use crate::paths::RuntimePaths;
@@ -44,9 +45,19 @@ pub fn inspect_core(client: &HerdrClient, cached_snapshot: Option<Value>) -> Val
     };
 
     let visibility = AgentVisibility::from_env();
-    let inventory = RuntimePaths::discover()
+    let (inventory, inventory_scanned) = RuntimePaths::discover()
         .ok()
-        .and_then(|paths| CapabilityInventoryStore::load_existing(&paths.config_dir).ok())
+        .map(|paths| {
+            let scanned = CapabilityInventoryStore::has_scan_cache(&paths.config_dir);
+            let mut inventory =
+                CapabilityInventoryStore::load_existing(&paths.config_dir).unwrap_or_default();
+            if refresh_stale_binary_versions(&mut inventory) > 0
+                && let Ok(mut store) = CapabilityInventoryStore::open(&paths.config_dir)
+            {
+                let _ = store.replace_all(&inventory);
+            }
+            (inventory, scanned)
+        })
         .unwrap_or_default();
     project_snapshot(
         &snapshot_result.value,
@@ -54,7 +65,38 @@ pub fn inspect_core(client: &HerdrClient, cached_snapshot: Option<Value>) -> Val
         snapshot_result.source,
         &visibility,
         &inventory,
+        inventory_scanned,
     )
+}
+
+fn refresh_stale_binary_versions(inventory: &mut [AgentCapabilityRecord]) -> usize {
+    let observed_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let mut refreshed = 0;
+    for record in inventory {
+        let (Some(path), Some(previous)) = (&record.binary_path, &record.binary_version) else {
+            continue;
+        };
+        let path = std::path::Path::new(path);
+        let Ok(current_identity) = binary_identity(path) else {
+            continue;
+        };
+        let expected = previous
+            .detail
+            .as_deref()
+            .and_then(|detail| detail.strip_prefix("binary_identity="));
+        if expected == Some(current_identity.as_str()) {
+            continue;
+        }
+        if let Some(next) = version_probe(&record.agent, path, observed_at_ms) {
+            record.binary_version = Some(next);
+            refreshed += 1;
+        }
+    }
+    refreshed
 }
 
 fn project_snapshot(
@@ -63,6 +105,7 @@ fn project_snapshot(
     source: SnapshotSource,
     visibility: &AgentVisibility,
     inventory: &[AgentCapabilityRecord],
+    inventory_scanned: bool,
 ) -> Value {
     let topology = projects::derive(snapshot);
     let agents_raw = array(snapshot, "agents");
@@ -178,10 +221,11 @@ fn project_snapshot(
     output.insert(
         "capability_inventory".to_owned(),
         json!({
-            "source": if inventory.is_empty() { "not_scanned" } else { "scan_cache" },
+            "source": if inventory_scanned { "scan_cache" } else { "not_scanned" },
+            "needs_scan": !inventory_scanned,
             "record_count": inventory.len(),
             "visible_worker_records": visible_scanned_workers,
-            "available_agents": available_agents,
+            "available_agents": if inventory_scanned { Value::Array(available_agents) } else { Value::Null },
             "hidden_available_agents": hidden_available_agents,
             "unknown_semantics": "absent capability fields are unverified, never inferred",
             "refresh": "herdr-mcp scan --probe",
@@ -314,8 +358,16 @@ fn project_pane(pane: &Value, agent_by_pane: &HashMap<String, Value>) -> Value {
 }
 
 fn project_pane_agent(agent: &Value) -> Value {
+    let target = agent
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|value| Value::String(value.to_owned()))
+        .or_else(|| agent.get("pane_id").cloned())
+        .unwrap_or(Value::Null);
     json!({
-        "name": agent.get("agent").cloned().unwrap_or(Value::Null),
+        "name": target,
+        "kind": agent.get("kind").cloned().or_else(|| agent.get("agent_kind").cloned()).or_else(|| agent.get("agent").cloned()).unwrap_or(Value::Null),
         "status": status(agent),
         "terminal_title": agent.get("terminal_title").cloned().unwrap_or(Value::Null),
         "state_change_seq": agent.get("state_change_seq").cloned().unwrap_or(Value::Null),
@@ -323,6 +375,13 @@ fn project_pane_agent(agent: &Value) -> Value {
 }
 
 fn project_agent(agent: &Value, capability_by_pane: &HashMap<String, Value>) -> Value {
+    let target = agent
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|value| Value::String(value.to_owned()))
+        .or_else(|| agent.get("pane_id").cloned())
+        .unwrap_or(Value::Null);
     let session_ref = agent
         .get("agent_session")
         .filter(|value| value.is_object())
@@ -341,8 +400,9 @@ fn project_agent(agent: &Value, capability_by_pane: &HashMap<String, Value>) -> 
         .unwrap_or(Value::Null);
 
     json!({
-        "name": agent.get("agent").cloned().unwrap_or(Value::Null),
-        "kind": agent.get("kind").cloned().or_else(|| agent.get("agent_kind").cloned()).unwrap_or(Value::Null),
+        "name": target,
+        "agent_id": target,
+        "kind": agent.get("kind").cloned().or_else(|| agent.get("agent_kind").cloned()).or_else(|| agent.get("agent").cloned()).unwrap_or(Value::Null),
         "pane": agent.get("pane_id").cloned().unwrap_or(Value::Null),
         "status": status(agent),
         "workspace": agent.get("workspace_id").cloned().unwrap_or(Value::Null),
@@ -365,7 +425,9 @@ fn project_capability(worker: &WorkerCapability, record: Option<&AgentCapability
         };
     }
     put!("provider", worker.provider.as_deref());
+    put!("provider_source", worker.provider_source.as_deref());
     put!("model", worker.model.as_deref());
+    put!("model_source", worker.model_source.as_deref());
     put!("profile", worker.profile.as_deref());
     put!("supports_code_edit", worker.supports_code_edit);
     put!("supports_shell", worker.supports_shell);
@@ -465,6 +527,7 @@ mod tests {
                 "cwd": "/tmp/demo"
             }],
             "agents": [{
+                "name": "pi-task-one",
                 "agent": "pi",
                 "agent_status": "working",
                 "workspace_id": "w1",
@@ -485,6 +548,7 @@ mod tests {
             SnapshotSource::Snapshot,
             &visibility,
             &[],
+            false,
         );
 
         assert_eq!(output["ok"], true);
@@ -495,7 +559,11 @@ mod tests {
         assert_eq!(output["workspaces"][0]["projects"][0]["root"], "/tmp/demo");
         assert_eq!(output["workspaces"][0]["projects"][0]["managed"], false);
         assert_eq!(output["tabs"][0]["workspace"], "w1");
-        assert_eq!(output["panes"][0]["agent"]["name"], "pi");
+        assert_eq!(output["panes"][0]["agent"]["name"], "pi-task-one");
+        assert_eq!(output["panes"][0]["agent"]["kind"], "pi");
+        assert_eq!(output["agents"][0]["name"], "pi-task-one");
+        assert_eq!(output["agents"][0]["agent_id"], "pi-task-one");
+        assert_eq!(output["agents"][0]["kind"], "pi");
         assert_eq!(output["agents"][0]["status"], "working");
         assert_eq!(output["agents"][0]["session_ref"]["source"], "herdr:pi");
         assert_eq!(output["herdr_version"], "0.8.2");
@@ -503,10 +571,60 @@ mod tests {
         assert_eq!(output["agent_visibility"], "allowlist");
         assert_eq!(output["agents_hidden"], 0);
         assert_eq!(output["capability_inventory"]["source"], "not_scanned");
+        assert_eq!(output["capability_inventory"]["needs_scan"], true);
+        assert!(output["capability_inventory"]["available_agents"].is_null());
         assert_eq!(output["agents"][0]["capabilities"]["source"], "live_only");
         assert_eq!(output["workstation_info"]["default_cwd"], "/tmp/demo");
         assert_eq!(output["workstation_info"]["managed_git_roots"], json!([]));
         assert!(output.get("warnings").is_none());
+    }
+
+    #[test]
+    fn missing_native_agent_name_uses_addressable_pane_id_not_kind() {
+        let mut snapshot = fixture();
+        snapshot["agents"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("name");
+        let visibility = AgentVisibility::Allow(["pi".to_owned()].into_iter().collect());
+        let output = project_snapshot(
+            &snapshot,
+            &json!({"version": "0.8.2", "protocol": 20}),
+            SnapshotSource::Snapshot,
+            &visibility,
+            &[],
+            false,
+        );
+        assert_eq!(output["agents"][0]["name"], "w1:p1");
+        assert_eq!(output["agents"][0]["agent_id"], "w1:p1");
+        assert_eq!(output["agents"][0]["kind"], "pi");
+        assert_eq!(output["panes"][0]["agent"]["name"], "w1:p1");
+        assert_eq!(output["panes"][0]["agent"]["kind"], "pi");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_binary_identity_refreshes_cached_version() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("herdr-inspect-version-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("pi");
+        std::fs::write(&binary, "#!/bin/sh\necho 'pi 9.9.9'\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut record = scanned_record("pi");
+        record.binary_path = Some(binary.display().to_string());
+        record.binary_version.as_mut().unwrap().detail = None;
+        assert_eq!(
+            refresh_stale_binary_versions(std::slice::from_mut(&mut record)),
+            1
+        );
+        assert_eq!(record.binary_version.unwrap().value, "pi 9.9.9");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn scanned_record(agent: &str) -> AgentCapabilityRecord {
@@ -589,6 +707,7 @@ mod tests {
             SnapshotSource::Snapshot,
             &visibility,
             &[scanned_record("pi"), scanned_record("claude")],
+            true,
         );
         assert_eq!(output["agents"].as_array().unwrap().len(), 1);
         assert_eq!(output["agents_hidden"], 1);
@@ -630,10 +749,29 @@ mod tests {
             SnapshotSource::Lists,
             &visibility,
             &[],
+            false,
         );
         assert_eq!(
             output["warnings"],
             json!(["snapshot_failed_used_list_apis"])
+        );
+    }
+
+    #[test]
+    fn scanned_empty_inventory_is_distinct_from_not_scanned() {
+        let output = project_snapshot(
+            &fixture(),
+            &json!({"version": "0.8.2", "protocol": 20}),
+            SnapshotSource::Snapshot,
+            &AgentVisibility::All,
+            &[],
+            true,
+        );
+        assert_eq!(output["capability_inventory"]["source"], "scan_cache");
+        assert_eq!(output["capability_inventory"]["needs_scan"], false);
+        assert_eq!(
+            output["capability_inventory"]["available_agents"],
+            json!([])
         );
     }
 }

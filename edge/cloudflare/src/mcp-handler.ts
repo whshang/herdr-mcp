@@ -298,7 +298,19 @@ export async function handleMcp(
       );
     }
     if (!route.ok) {
-      return rpcResult(id, callToolResult({ ok: false, code: route.code, retryable: false }, true));
+      return rpcResult(id, callToolResult({
+        ok: false,
+        code: route.code,
+        retryable: false,
+        delivery_state: "not_delivered",
+        failure_layer: "edge_routing",
+        requested_target: args.target ?? args.pane_id ?? args.pane ?? args.workspace_id ?? args.workspace ?? null,
+        selected_device: route.selected_device ?? null,
+        candidate_devices: route.candidate_devices ?? [],
+        next_action: route.code === "device_ambiguous"
+          ? "retry with an explicit device selector or a device-aware ref"
+          : "inspect device routing state and retry only after selecting an enrolled routable device",
+      }, true));
     }
 
     // Unwrap device-aware opaque refs before forwarding to the runtime;
@@ -416,7 +428,7 @@ export async function handleMcp(
     if (forwarded.status === "ok" && forwarded.completion?.status === "ok") {
       // For device-routed calls, wrap workspace/pane ids into device-aware opaque refs
       // so follow-up calls retain affinity without trusting arbitrary path strings.
-      const wrapped = wrapResultWithDevice(forwarded.completion.result, route.device_id);
+      const wrapped = wrapResultWithDevice(forwarded.completion.result, route.device_id, route.device_name);
       return rpcResult(id, normalizeSuccessfulToolResult(wrapped));
     }
     if (forwarded.status === "ok" && forwarded.completion?.status === "error") {
