@@ -108,7 +108,7 @@ HTTP_PROXY / http_proxy
 ALL_PROXY / all_proxy
 ```
 
-macOS 也会读取 `scutil --proxy`。不要还没验证代理就把网络问题扩大成 DNS / Custom Domain 变更。
+支持 `socks5://` 与 `socks5h://`（始终按 `socks5h` remote-DNS 语义拨号，`workers.dev` 由代理解析）；不支持代理认证。macOS 也会读取 `scutil --proxy`（HTTPS、HTTP、SOCKS）；PAC 只检测不执行，仅配置 PAC 时 Link 直连。不要还没验证代理就把网络问题扩大成 DNS / Custom Domain 变更。
 
 ## 第五步：验证公网路径
 

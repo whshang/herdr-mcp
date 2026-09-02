@@ -197,7 +197,7 @@ Status should identify the expected active channel/extension identity and confir
 
 Store `LINK_SHARED_SECRET` in Keychain under `herdr-edge-link-<WORKSTATION_ID>`. The command text must reference the environment variable rather than a literal secret. Prefer the managed Link install path exposed by the installed `herdr-mcp` binary (`herdr-mcp link ...` / current stable product docs). Do not leave production Link ownership on a repository Bash wrapper.
 
-The Link can reuse proxy settings that already exist in the user's environment. Recognition precedence is `HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`; macOS also reads the existing `scutil --proxy` state. If the selected origin is still unreachable, stop and ask the user before changing any proxy, network node, system proxy, DNS/custom-domain choice, or other connectivity setting. See [this Agent installation protocol](agent-install.md) §5.
+The Link can reuse proxy settings that already exist in the user's environment. Recognition precedence is `HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`; macOS also reads the existing `scutil --proxy` state (HTTPS, then HTTP, then SOCKS). `socks5://`/`socks5h://` URLs are supported with remote-DNS semantics, proxy authentication is not supported, and a macOS PAC configuration is detected but never evaluated. If the selected origin is still unreachable, stop and ask the user before changing any proxy, network node, system proxy, DNS/custom-domain choice, or other connectivity setting. See [this Agent installation protocol](agent-install.md) §5.
 
 ## 9. Verify the closed loop
 

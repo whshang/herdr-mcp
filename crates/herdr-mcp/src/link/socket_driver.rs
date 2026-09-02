@@ -27,7 +27,9 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
-use super::proxy::{connect_via_http_proxy, resolve_link_proxy, wss_target};
+use super::proxy::{
+    LinkProxyResolution, connect_via_proxy, resolve_link_proxy_detailed, wss_target,
+};
 use super::transport::{
     LINK_DEFAULT_MAX_FRAME_BYTES, LinkTransportCore, SocketAttemptId, TransportAction,
     TransportError,
@@ -485,12 +487,21 @@ pub async fn connect_socket_attempt(
     ensure_rustls_crypto_provider();
     let config = config.normalized();
     let request = client_request(edge_url, application_protocol, link_token, device_name)?;
-    let (socket, response) = if let Some(proxy) = resolve_link_proxy() {
-        let (target_host, target_port) =
-            wss_target(edge_url).ok_or(SocketDriverError::InvalidUrl)?;
-        let tcp = connect_via_http_proxy(&proxy.url, &target_host, target_port)
-            .await
-            .map_err(|_| SocketDriverError::ConnectFailed)?;
+    let proxied_tcp = match resolve_link_proxy_detailed() {
+        LinkProxyResolution::Proxy(proxy) => {
+            let (target_host, target_port) =
+                wss_target(edge_url).ok_or(SocketDriverError::InvalidUrl)?;
+            Some(
+                connect_via_proxy(&proxy.url, &target_host, target_port)
+                    .await
+                    .map_err(|_| SocketDriverError::ConnectFailed)?,
+            )
+        }
+        // A detected-but-unevaluated PAC configuration connects directly:
+        // Link intentionally ships no PAC engine.
+        LinkProxyResolution::Direct | LinkProxyResolution::PacDetectedNotEvaluated { .. } => None,
+    };
+    let (socket, response) = if let Some(tcp) = proxied_tcp {
         client_async_tls_with_config(request, tcp, Some(config.websocket_config()), None)
             .await
             .map_err(|_| SocketDriverError::ConnectFailed)?

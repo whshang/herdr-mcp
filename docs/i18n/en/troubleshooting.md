@@ -68,6 +68,22 @@ OAuth may succeed while the workstation is offline. Public login success does no
 
 Check Edge health/status and the workstation link.
 
+### Is the link blocked by the local network?
+
+The Link reuses proxies that already exist in the environment. Resolution order:
+
+```text
+HERDR_LINK_PROXY > HTTPS_PROXY/https_proxy > HTTP_PROXY/http_proxy > ALL_PROXY/all_proxy
+  > macOS system proxy (scutil --proxy: HTTPS, then HTTP, then SOCKS)
+```
+
+Details that matter when `workers.dev` is unreachable:
+
+- `socks5://` and `socks5h://` are supported. SOCKS5 dials use remote-DNS semantics: the hostname is sent to the proxy unresolved, so a locally polluted DNS resolver cannot break `workers.dev` connectivity.
+- Proxy authentication (HTTP Basic or SOCKS5 username/password) is not supported; proxy URLs with embedded credentials are rejected, and credentials never appear in status or error output.
+- On macOS, a PAC configuration is detected but never evaluated. Link does not fetch or execute PAC scripts; with only a PAC configured, the Link connects directly.
+- Do not "fix" link connectivity by disabling TLS, rewriting system proxy settings, or turning the Link into a general-purpose forwarder.
+
 ### Does a new ChatGPT conversation get the current catalog?
 
 The current public ChatGPT contract is **epoch 3 / 19 actions**. Workstation execution remains **epoch 2 / 18 tools**, including `herdr_skill`; the extra public action is Edge-local `herdr_devices`.

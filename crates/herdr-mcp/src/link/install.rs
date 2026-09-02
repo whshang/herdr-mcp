@@ -294,7 +294,8 @@ pub fn default_candidate_env() -> BTreeMap<String, String> {
 }
 
 pub(crate) fn inherited_proxy_env() -> BTreeMap<String, String> {
-    const KEYS: [&str; 8] = [
+    const KEYS: [&str; 9] = [
+        "HERDR_LINK_PROXY",
         "https_proxy",
         "http_proxy",
         "all_proxy",

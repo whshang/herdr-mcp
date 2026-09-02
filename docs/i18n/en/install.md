@@ -108,7 +108,7 @@ HTTP_PROXY / http_proxy
 ALL_PROXY / all_proxy
 ```
 
-On macOS, Link can also read `scutil --proxy`. Do not expand a connectivity problem into DNS / custom-domain changes before checking the proxy path.
+`socks5://` and `socks5h://` URLs are supported (`socks5h` remote-DNS semantics are always used, so `workers.dev` is resolved by the proxy). Proxy authentication is not supported. On macOS, Link can also read `scutil --proxy` (HTTPS, then HTTP, then SOCKS); a PAC configuration is detected but never evaluated, and PAC-only setups connect directly. Do not expand a connectivity problem into DNS / custom-domain changes before checking the proxy path.
 
 ## Step 5: verify the public path
 
