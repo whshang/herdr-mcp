@@ -5,6 +5,7 @@ import {
   EXPECTED_RUNTIME_CONTRACT_HASH,
   extractFrameByteLength,
   handleRequest,
+  holdRelaySocketLifetime,
   MAX_FRAME_BYTES,
   RELAY_SERVICE_NAME,
   validateRelayRequest,
@@ -350,4 +351,85 @@ Deno.test("bindRelaySockets forwards bidirectionally and enforces 1 MiB frame li
   assertEquals(clientWs.closeCode, 1009);
   assertEquals(upstreamWs.closed, true);
   assertEquals(upstreamWs.closeCode, 1009);
+});
+
+Deno.test("health endpoint supports a provider path prefix", async () => {
+  const response = await handleRequest(
+    new Request("https://relay.example/herdr-relay/health"),
+    { pathPrefix: "/herdr-relay" },
+  );
+  assertEquals(response.status, 200);
+  const body = await response.json();
+  assertEquals(body.status, "ok");
+  assertEquals(body.service, RELAY_SERVICE_NAME);
+});
+
+Deno.test("provider path prefix preserves Relay v1 validation", async () => {
+  let healthUrl: string | undefined;
+  const response = await handleRequest(
+    new Request(
+      "https://relay.example/herdr-relay/v1/my-team.workers.dev/ws/dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      {
+        headers: {
+          upgrade: "websocket",
+          "sec-websocket-protocol": "herdr-link.v1, herdr-auth.deadbeef0123",
+        },
+      },
+    ),
+    {
+      pathPrefix: "/herdr-relay",
+      mockFetch: ((input: RequestInfo | URL) => {
+        healthUrl = String(input);
+        return Promise.resolve(
+          new Response(JSON.stringify({ service: "not-herdr-edge" }), {
+            status: 200,
+          }),
+        );
+      }) as typeof fetch,
+    },
+  );
+  assertEquals(response.status, 502);
+  assertEquals(healthUrl, "https://my-team.workers.dev/health");
+});
+
+Deno.test("Deno default routing does not treat provider-prefixed health as health", async () => {
+  const response = await handleRequest(
+    new Request("https://relay.example/herdr-relay/health"),
+  );
+  assertEquals(response.status, 426);
+});
+
+Deno.test("relay socket lifetime hook resolves on close", async () => {
+  const socket = new EventTarget();
+  let held: Promise<unknown> | undefined;
+  holdRelaySocketLifetime(
+    socket as unknown as Pick<WebSocket, "addEventListener">,
+    (promise) => {
+      held = promise;
+    },
+  );
+  if (!held) throw new Error("waitUntil hook was not called");
+  let resolved = false;
+  held.then(() => {
+    resolved = true;
+  });
+  await Promise.resolve();
+  assertEquals(resolved, false);
+  socket.dispatchEvent(new Event("close"));
+  await held;
+  assertEquals(resolved, true);
+});
+
+Deno.test("relay socket lifetime hook resolves on error", async () => {
+  const socket = new EventTarget();
+  let held: Promise<unknown> | undefined;
+  holdRelaySocketLifetime(
+    socket as unknown as Pick<WebSocket, "addEventListener">,
+    (promise) => {
+      held = promise;
+    },
+  );
+  if (!held) throw new Error("waitUntil hook was not called");
+  socket.dispatchEvent(new Event("error"));
+  await held;
 });

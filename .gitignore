@@ -62,3 +62,6 @@ docs/_wip/*
 !docs/_wip/zh-CN/
 TODO.md
 OPTIMIZATION.md
+
+# Supabase CLI local state
+supabase/.temp/
