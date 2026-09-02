@@ -1,0 +1,25 @@
+{
+  "name": "herdr-relay-deno",
+  "version": "0.4.5",
+  "exports": "./server.ts",
+  "deploy": {
+    "org": "herdr-mcp",
+    "app": "relay",
+    "runtime": {
+      "type": "dynamic",
+      "entrypoint": "./server.ts"
+    }
+  },
+  "compilerOptions": {
+    "strict": true
+  },
+  "lint": {
+    "rules": {
+      "exclude": [
+        "no-import-prefix",
+        "no-unversioned-import",
+        "no-explicit-any"
+      ]
+    }
+  }
+}
