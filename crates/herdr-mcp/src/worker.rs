@@ -61,6 +61,22 @@ struct EnrolledCredential {
     device_secret: String,
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn pairing_create_request_body(ttl_seconds: u64, name: Option<&str>) -> Value {
+    match name {
+        Some(name) => json!({ "ttl_seconds": ttl_seconds, "name": name }),
+        None => json!({ "ttl_seconds": ttl_seconds }),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn pairing_consume_request_body(pairing_id: &str, code: &str, name: Option<&str>) -> Value {
+    match name {
+        Some(name) => json!({ "pairing_id": pairing_id, "code": code, "name": name }),
+        None => json!({ "pairing_id": pairing_id, "code": code }),
+    }
+}
+
 pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
     let paths = RuntimePaths::discover()?;
     if paths.instance.is_named() {
@@ -109,7 +125,7 @@ fn create_pairing(
     let response = client()?
         .post(endpoint)
         .headers(headers)
-        .json(&json!({ "ttl_seconds": ttl_seconds, "name": name }))
+        .json(&pairing_create_request_body(ttl_seconds, name))
         .send()
         .map_err(|error| format!("cannot create device pairing: {error}"))?;
     let payload = parse_json_response(response, "device pairing creation")?;
@@ -573,7 +589,7 @@ fn consume_pairing(
     let response = client()?
         .post(endpoint(edge_origin, "/devices/pairings/consume")?)
         .header(CONTENT_TYPE, "application/json")
-        .json(&json!({ "pairing_id": pairing_id, "code": code, "name": name }))
+        .json(&pairing_consume_request_body(pairing_id, code, name))
         .send()
         .map_err(|error| format!("cannot consume device pairing: {error}"))?;
     let payload = parse_json_response(response, "device pairing consumption")?;
@@ -982,6 +998,25 @@ mod tests {
     fn pairing_code_formats_with_a_space_for_humans() {
         assert_eq!(format_pairing_code("123456"), "123 456");
         assert_eq!(format_pairing_code("000000"), "000 000");
+    }
+
+    #[test]
+    fn pairing_request_bodies_omit_unspecified_name_and_preserve_explicit_name() {
+        let unnamed_create = pairing_create_request_body(600, None);
+        assert_eq!(unnamed_create["ttl_seconds"], 600);
+        assert!(unnamed_create.get("name").is_none());
+
+        let named_create = pairing_create_request_body(600, Some("Nathan Mac"));
+        assert_eq!(named_create["name"], "Nathan Mac");
+
+        let pairing_id = "pair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let unnamed_consume = pairing_consume_request_body(pairing_id, "123456", None);
+        assert_eq!(unnamed_consume["pairing_id"], pairing_id);
+        assert_eq!(unnamed_consume["code"], "123456");
+        assert!(unnamed_consume.get("name").is_none());
+
+        let named_consume = pairing_consume_request_body(pairing_id, "123456", Some("Nathan Mac"));
+        assert_eq!(named_consume["name"], "Nathan Mac");
     }
 
     #[test]
