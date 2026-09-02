@@ -266,7 +266,7 @@ test("follow-up tool calls with device-aware opaque ref route to same device bef
       // Runtime returns full CallToolResult with structuredContent + image content
       const runtimeResult = {
         content: [
-          { type: "text", text: JSON.stringify({ ok: true }) },
+          { type: "text", text: JSON.stringify({ ok: true, workspaces: [{ id: "w1" }] }) },
           { type: "image", data: "pngdata", mimeType: "image/png" },
         ],
         structuredContent: { workspaces: [{ workspace_id: "w1" }], ok: true },
@@ -290,6 +290,12 @@ test("follow-up tool calls with device-aware opaque ref route to same device bef
   // Follow-up uses the opaque ref without explicit device -> must route to same device
   const r2 = await handleMcp({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "herdr_exec", arguments: { workspace: wrappedId, command: "ls" } } }, "legacy", deps);
   assert.equal(r2.body.result.isError, undefined);
+  const textPayload = JSON.parse(r1.body.result.content[0].text);
+  assert.equal(textPayload.workspaces[0].id, "w1");
+  const textRef = textPayload.workspaces[0].workspace_ref;
+  assert.equal(decodeDeviceRef(textRef).d, DEV_A);
+  const r2Text = await handleMcp({ jsonrpc: "2.0", id: 21, method: "tools/call", params: { name: "herdr_exec", arguments: { workspace: textRef, command: "ls" } } }, "legacy", deps);
+  assert.equal(r2Text.body.result.isError, undefined);
   // Ambiguous without selector/ref should fail
   const r3 = await handleMcp({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "herdr_exec", arguments: { workspace: "w1", command: "ls" } } }, "legacy", deps);
   assert.equal(r3.body.result.isError, true);
@@ -341,36 +347,38 @@ test("private text transfer requires explicit device and rejects ref-derived rou
     now: () => 1000,
   };
 
-  const missingDevice = await handleMcp({
-    jsonrpc: "2.0",
-    id: 11,
-    method: "tools/call",
-    params: {
-      name: "herdr_call",
-      arguments: { method: "herdr_mcp.text.write", params: JSON.stringify({ path: "/tmp/demo", content: "hello", sha256: "abc" }) },
-    },
-  }, "legacy", deps);
-  assert.equal(missingDevice.body.result.isError, true);
-  assert.equal(missingDevice.body.result.structuredContent.code, "device_required");
-  assert.equal(forwards, 0);
-
   const forgedRef = encodeDeviceRef(DEV_B, "w1");
-  const refRouted = await handleMcp({
-    jsonrpc: "2.0",
-    id: 12,
-    method: "tools/call",
-    params: {
-      name: "herdr_call",
-      arguments: {
-        device: DEV_A,
-        method: "herdr_mcp.text.write",
-        params: JSON.stringify({ path: "/tmp/demo", content: "hello", sha256: "abc", workspace: forgedRef }),
+  for (const method of ["herdr_mcp.text.read", "herdr_mcp.text.write"]) {
+    const params = method.endsWith(".read")
+      ? { path: "/tmp/demo" }
+      : { path: "/tmp/demo", content: "hello", sha256: "abc" };
+    const missingDevice = await handleMcp({
+      jsonrpc: "2.0",
+      id: `${method}-missing`,
+      method: "tools/call",
+      params: { name: "herdr_call", arguments: { method, params: JSON.stringify(params) } },
+    }, "legacy", deps);
+    assert.equal(missingDevice.body.result.isError, true);
+    assert.equal(missingDevice.body.result.structuredContent.code, "device_required");
+    assert.equal(forwards, 0);
+
+    const refRouted = await handleMcp({
+      jsonrpc: "2.0",
+      id: `${method}-ref`,
+      method: "tools/call",
+      params: {
+        name: "herdr_call",
+        arguments: {
+          device: DEV_A,
+          method,
+          params: JSON.stringify({ ...params, workspace: forgedRef }),
+        },
       },
-    },
-  }, "legacy", deps);
-  assert.equal(refRouted.body.result.isError, true);
-  assert.equal(refRouted.body.result.structuredContent.code, "device_ref_not_allowed");
-  assert.equal(forwards, 0);
+    }, "legacy", deps);
+    assert.equal(refRouted.body.result.isError, true);
+    assert.equal(refRouted.body.result.structuredContent.code, "device_ref_not_allowed");
+    assert.equal(forwards, 0);
+  }
 
   const explicit = await handleMcp({
     jsonrpc: "2.0",
