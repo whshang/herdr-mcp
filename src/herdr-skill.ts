@@ -283,10 +283,8 @@ async function workerFallbackContext(): Promise<Record<string, unknown>> {
 async function runtimeContext(): Promise<Record<string, unknown>> {
   const stateDir = process.env.HERDR_MCP_STATE_DIR || join(homedir(), ".config", "herdr-mcp");
   const runtimeStatusPath = process.env.HERDR_RUNTIME_STATUS_PATH || join(stateDir, "runtime-status-prod.json");
-  const selfUpdatePath = process.env.HERDR_SELF_UPDATE_STATUS_PATH || join(stateDir, "self-update-status.json");
-  const [runtimeStatus, updateStatus, workerFallbacks] = await Promise.all([
+  const [runtimeStatus, workerFallbacks] = await Promise.all([
     readOptionalJson(runtimeStatusPath),
-    readOptionalJson(selfUpdatePath),
     workerFallbackContext(),
   ]);
   const runtimeGeneration = compactRuntimeStatus(runtimeStatus);
@@ -307,16 +305,6 @@ async function runtimeContext(): Promise<Record<string, unknown>> {
     network_skill_refresh: !networkOff(),
     worker_fallbacks: workerFallbacks,
     runtime_generation: runtimeGeneration,
-    self_update: updateStatus
-      ? {
-          state: updateStatus.state ?? updateStatus.status ?? null,
-          target_version: updateStatus.target_version ?? null,
-          source: updateStatus.source ?? null,
-          updated_at: updateStatus.updated_at ?? null,
-          semantics: "historical_operation",
-          active_runtime_authority: false,
-        }
-      : null,
   };
 }
 

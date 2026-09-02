@@ -192,7 +192,22 @@ fn compact_exec_session_views(views: Vec<Value>) -> Vec<Value> {
 }
 
 fn redact_command_summary(command: &str) -> String {
-    const SECRET_FLAGS: &[&str] = &["--api-key", "--token", "--password", "--secret"];
+    const SECRET_FLAGS: &[&str] = &[
+        "--api-key",
+        "--token",
+        "--access-token",
+        "--auth-token",
+        "--refresh-token",
+        "--password",
+        "--secret",
+        "--client-secret",
+        "--credential",
+        "--client-id",
+        "--app-id",
+        "--release-id",
+        "--profile",
+        "--tenant-key",
+    ];
     let mut output = Vec::new();
     let mut redact_next = false;
     for token in command.split_whitespace() {
@@ -219,6 +234,16 @@ fn redact_command_summary(command: &str) -> String {
                 || key.ends_with("_SECRET")
                 || key.ends_with("_PASSWORD")
                 || key.ends_with("_API_KEY")
+                || key.ends_with("_ACCESS_TOKEN")
+                || key.ends_with("_AUTH_TOKEN")
+                || key.ends_with("_REFRESH_TOKEN")
+                || key.ends_with("_CLIENT_SECRET")
+                || key.ends_with("_CREDENTIAL")
+                || key.ends_with("_CLIENT_ID")
+                || key.ends_with("_APP_ID")
+                || key.ends_with("_RELEASE_ID")
+                || key.ends_with("_PROFILE")
+                || key.ends_with("_TENANT_KEY")
             {
                 output.push(format!("{key}=<redacted>"));
                 continue;
@@ -390,7 +415,7 @@ mod tests {
         let views = vec![
             json!({"session_id":"old","running":false,"started_at":"2026-01-01T00:00:00Z","command":"echo old"}),
             json!({"session_id":"recent-a","running":false,"started_at":"2026-01-02T00:00:00Z","command":"API_TOKEN=secret tool --api-key hidden"}),
-            json!({"session_id":"recent-b","running":false,"started_at":"2026-01-03T00:00:00Z","command":"echo b"}),
+            json!({"session_id":"recent-b","running":false,"started_at":"2026-01-03T00:00:00Z","command":"tool --app-id app_example --release-id release_example --profile profile_example"}),
             json!({"session_id":"recent-c","running":false,"started_at":"2026-01-04T00:00:00Z","command":"echo c"}),
             json!({"session_id":"running","running":true,"started_at":"2026-01-01T12:00:00Z","command":"tool --token=live-secret"}),
         ];
@@ -402,5 +427,8 @@ mod tests {
         assert!(!text.contains("live-secret"));
         assert!(!text.contains("hidden"));
         assert!(!text.contains("API_TOKEN=secret"));
+        assert!(!text.contains("app_example"));
+        assert!(!text.contains("release_example"));
+        assert!(!text.contains("profile_example"));
     }
 }

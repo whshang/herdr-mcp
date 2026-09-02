@@ -35,7 +35,6 @@ struct SkillConfig {
     native_timeout: Duration,
     network: bool,
     runtime_status_path: PathBuf,
-    self_update_path: PathBuf,
     dsh_home: PathBuf,
 }
 
@@ -56,9 +55,6 @@ impl SkillConfig {
         let runtime_status_path = env::var_os("HERDR_RUNTIME_STATUS_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| state_dir.join("runtime-status-prod.json"));
-        let self_update_path = env::var_os("HERDR_SELF_UPDATE_STATUS_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| state_dir.join("self-update-status.json"));
         let dsh_home = env::var_os("DSH_HOME")
             .map(PathBuf::from)
             .or_else(|| home_dir().map(|home| home.join(".dsh")))
@@ -70,7 +66,6 @@ impl SkillConfig {
             native_timeout: Duration::from_millis(native_timeout_ms),
             network: env::var("HERDR_SKILL_NETWORK").ok().as_deref() != Some("0"),
             runtime_status_path,
-            self_update_path,
             dsh_home,
         })
     }
@@ -430,7 +425,6 @@ fn native_skill(config: &SkillConfig) -> NativeSkill {
 
 fn runtime_context(config: &SkillConfig) -> Value {
     let runtime_status = read_optional_json(&config.runtime_status_path);
-    let update_status = read_optional_json(&config.self_update_path);
     let worker_fallbacks = worker_fallback_context(config);
     let contract = contract::identity().ok();
     let runtime_generation = compact_runtime_status(runtime_status.as_ref());
@@ -460,7 +454,6 @@ fn runtime_context(config: &SkillConfig) -> Value {
         "network_skill_refresh": config.network,
         "worker_fallbacks": worker_fallbacks,
         "runtime_generation": runtime_generation,
-        "self_update": compact_update_status(update_status.as_ref()),
     })
 }
 
@@ -486,20 +479,6 @@ fn compact_runtime_status(value: Option<&Value>) -> Value {
         "previous_generation": manager.get("previous_generation").cloned().unwrap_or(Value::Null),
         "last_good_generation": manager.get("last_good_generation").cloned().unwrap_or(Value::Null),
         "transition_seq": manager.get("transition_seq").cloned().unwrap_or(Value::Null),
-    })
-}
-
-fn compact_update_status(value: Option<&Value>) -> Value {
-    let Some(value) = value.and_then(Value::as_object) else {
-        return Value::Null;
-    };
-    json!({
-        "state": value.get("state").or_else(|| value.get("status")).cloned().unwrap_or(Value::Null),
-        "target_version": value.get("target_version").cloned().unwrap_or(Value::Null),
-        "source": value.get("source").cloned().unwrap_or(Value::Null),
-        "updated_at": value.get("updated_at").cloned().unwrap_or(Value::Null),
-        "semantics": "historical_operation",
-        "active_runtime_authority": false,
     })
 }
 
@@ -714,7 +693,6 @@ mod tests {
             native_timeout: Duration::from_millis(200),
             network: false,
             runtime_status_path: root.join("runtime-status-prod.json"),
-            self_update_path: root.join("self-update-status.json"),
             dsh_home: root.join("dsh"),
         }
     }
@@ -794,11 +772,6 @@ mod tests {
             br#"{"manager":{"active_generation":"g2","previous_generation":"g1","last_good_generation":"g2","transition_seq":7,"secret":"do-not-echo"}}"#,
         )
         .unwrap();
-        fs::write(
-            &config.self_update_path,
-            br#"{"state":"idle","target_version":"0.4.0","source":"release","updated_at":"now","token":"do-not-echo"}"#,
-        )
-        .unwrap();
         let runtime = runtime_context(&config);
         assert_eq!(runtime["runtime_generation"]["active_generation"], "g2");
         assert_eq!(runtime["active_runtime"]["generation"], "g2");
@@ -806,9 +779,7 @@ mod tests {
             runtime["active_runtime"]["truth_source"],
             "active_binary+runtime_generation_manager"
         );
-        assert_eq!(runtime["self_update"]["state"], "idle");
-        assert_eq!(runtime["self_update"]["semantics"], "historical_operation");
-        assert_eq!(runtime["self_update"]["active_runtime_authority"], false);
+        assert!(runtime.get("self_update").is_none());
         assert_eq!(runtime["tool_execution"]["contract_epoch"], 2);
         assert_eq!(runtime["tool_execution"]["tool_count"], 18);
         assert_eq!(
