@@ -331,11 +331,21 @@ test("mcp handler exposes device metadata in ChatGPT text", async () => {
       assert.equal(Object.hasOwn(parsed.args, "device"), false);
       // binding keys are stripped even though not trusted
       assert.equal(Object.hasOwn(parsed.args, "binding_device_id"), false);
-      return new Response(JSON.stringify({ status: "ok", completion: { status: "ok", result: { text: "hello" } } }), { headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: {
+          status: "ok",
+          result: {
+            content: [{ type: "text", text: JSON.stringify({ ok: true, workspaces: [{ id: "w1" }] }) }],
+            structuredContent: null,
+          },
+        },
+      }), { headers: { "content-type": "application/json" } });
     },
     now: () => 1000,
   };
   const r = await handleMcp({ jsonrpc: "2.0", id: 20, method: "tools/call", params: { name: "herdr_fs_read", arguments: { device: DEV_A, path: "/repo/file.txt" } } }, "legacy", deps);
-  const text = r.body.result.content[0].text;
-  assert.equal(text.includes(DEV_A), true, "device_id must appear in ChatGPT-visible text");
+  const text = JSON.parse(r.body.result.content[0].text);
+  assert.equal(text.device_id, DEV_A, "device_id must appear in ChatGPT-visible text");
+  assert.equal(decodeDeviceRef(text.workspaces[0].workspace_id).d, DEV_A, "workspace ref must retain device affinity");
 });

@@ -358,10 +358,12 @@ export function wrapResultWithDevice(result: unknown, deviceId: string | null, d
   // Preserve the pre-0.4.4 in-place device-aware ids and add explicit sibling
   // refs/provenance to structured and text-visible JSON results. Non-JSON text
   // and binary blocks remain untouched.
-  if (Array.isArray(clone.content) && isRecord(clone.structuredContent)) {
-    const structured = clone.structuredContent as Record<string, unknown>;
-    wrapContainer(structured);
-    addProvenance(structured);
+  if (Array.isArray(clone.content)) {
+    if (isRecord(clone.structuredContent)) {
+      const structured = clone.structuredContent as Record<string, unknown>;
+      wrapContainer(structured);
+      addProvenance(structured);
+    }
     wrapContainer(clone);
     addProvenance(clone);
     for (const block of clone.content as Array<Record<string, unknown>>) {
