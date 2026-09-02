@@ -178,11 +178,11 @@ fn connect_existing_worker(
         &pairing_id,
         &code,
         name,
-        crate::macos_keychain::store_generic_secret,
+        crate::macos_credential_helper::store,
         Config::load_for_instance,
         write_config_atomic,
         revoke_self,
-        crate::macos_keychain::delete_generic_secret,
+        crate::macos_credential_helper::delete,
         activate_connected_runtime,
         crate::link::reconcile_after_service_generation_change,
         consume_pairing,
@@ -620,7 +620,7 @@ fn resolve_owner_link_identity(
         }
     };
     let account = current_account()?;
-    let credential = crate::macos_keychain::load_generic_secret(&keychain_service, &account)?;
+    let credential = crate::macos_credential_helper::load(&keychain_service, &account)?;
     let _ = paths;
     Ok(OwnerLinkIdentity {
         edge_origin,

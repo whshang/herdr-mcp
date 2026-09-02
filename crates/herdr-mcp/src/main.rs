@@ -29,6 +29,7 @@ mod inspect;
 mod instance;
 mod link;
 mod local_skills;
+mod macos_credential_helper;
 mod macos_keychain;
 mod macos_permissions;
 mod macos_privacy;
@@ -123,6 +124,7 @@ fn run() -> Result<ExitCode, String> {
         cli::Command::Reinstall => product_lifecycle::reinstall(),
         cli::Command::DocumentsProbe => Ok(macos_privacy::run_documents_probe_child()),
         cli::Command::TccBrokerRun => Ok(tcc_broker::run_broker_once()),
+        cli::Command::CredentialHelperRun => Ok(macos_credential_helper::run_once()),
         cli::Command::TccBroker(command) => tcc_broker::run_cli(command),
         cli::Command::Permissions(command) => macos_permissions::run_cli(command),
         cli::Command::HerdrSupervisor(command) => herdr_supervisor::run(command),

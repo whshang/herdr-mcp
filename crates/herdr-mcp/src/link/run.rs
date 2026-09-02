@@ -116,7 +116,7 @@ fn load_link_token_from_keychain(
         let username = optional_trimmed(env_map, "USER").unwrap_or_else(current_username);
         let service = optional_trimmed(env_map, "HERDR_LINK_KEYCHAIN_SERVICE")
             .unwrap_or_else(|| MACOS_LINK_KEYCHAIN_SERVICE.to_owned());
-        crate::macos_keychain::load_generic_secret(&service, &username)
+        crate::macos_credential_helper::load(&service, &username)
             .map_err(DaemonConfigError::Message)
     }
     #[cfg(not(target_os = "macos"))]

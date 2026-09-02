@@ -30,6 +30,7 @@ pub enum Command {
     Link(LinkCommand),
     TccBroker(TccBrokerCommand),
     TccBrokerRun,
+    CredentialHelperRun,
     Permissions(crate::macos_permissions::PermissionsCommand),
 }
 
@@ -221,6 +222,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "doctor" => no_extra(args, Command::Doctor),
         "__documents-probe" => no_extra(args, Command::DocumentsProbe),
         "__tcc-broker" => no_extra(args, Command::TccBrokerRun),
+        "__credential-helper" => no_extra(args, Command::CredentialHelperRun),
         "tcc-broker" => parse_tcc_broker(&args[1..]),
         "permissions" => parse_permissions(&args[1..]),
         "herdr-supervisor" => parse_herdr_supervisor(&args[1..]),
