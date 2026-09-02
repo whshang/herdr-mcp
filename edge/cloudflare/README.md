@@ -30,7 +30,7 @@ edge/cloudflare/
 ├── wrangler.toml             ← dev config: herdr-edge-dev, workers.dev, no routes
 ├── wrangler.prod.toml        ← production candidate: still validates on workers.dev first
 ├── wrangler.user.example.toml
-├── provision-r2.mjs          ← idempotent R2 bucket create before wrangler deploy
+├── provision-r2.mjs          ← optional idempotent R2 bucket provisioning for artifact relay
 ├── tsconfig.json             ← edge-local type check + compile (outDir: dist/)
 ├── .dev.vars.example         ← copy to .dev.vars, change the secret
 ├── .gitignore                ← ignores dist/ (build output)

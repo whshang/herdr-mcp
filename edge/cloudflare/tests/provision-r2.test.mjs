@@ -17,7 +17,7 @@ test("provisioner parses private ARTIFACT_BUCKET bindings from wrangler configs"
   const user = parseR2Bindings(readFileSync(path.join(DIR, "../wrangler.user.example.toml"), "utf8"));
   assert.deepEqual(dev, [{ binding: "ARTIFACT_BUCKET", bucket_name: "herdr-edge-dev-artifacts" }]);
   assert.deepEqual(prod, [{ binding: "ARTIFACT_BUCKET", bucket_name: "herdr-edge-prod-artifacts" }]);
-  assert.deepEqual(user, [{ binding: "ARTIFACT_BUCKET", bucket_name: "herdr-edge-artifacts" }]);
+  assert.deepEqual(user, []);
 });
 
 test("provisioner treats already-exists as success and can no-op deploy", async () => {

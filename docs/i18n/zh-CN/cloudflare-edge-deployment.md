@@ -47,7 +47,7 @@ Cloudflare 层主要承担：
 - 持久 WSS link 的连接管理；
 - runtime online/offline 与 generation/version 状态；
 - MCP request/response relay；
-- 短时私有 R2 通用 artifact 中继（`/artifacts`，仅 Worker binding）。
+- 可选的短时私有 R2 通用 artifact 中继（`/artifacts`，仅 Worker binding）。
 
 Edge **不保存你的 Git 仓库**，也不代替本机 Herdr。代码、shell 和 Agent 仍在工作站执行。R2 桶只是临时通用 artifact 中继，不是素材库。
 
@@ -96,13 +96,14 @@ https://<worker>.<account-subdomain>.workers.dev
 
 ### 部署
 
-先幂等创建私有 R2 中继桶，再部署 Worker。该桶只通过 Worker binding 访问，不要挂 public r2.dev 域名。
+直接部署核心 Worker。普通 user template 默认关闭 R2，因此核心路径不要求开通 R2 订阅或支付方式。
 
 ```bash
 cd edge/cloudflare
-node provision-r2.mjs --config wrangler.user.toml
 npx wrangler deploy --config wrangler.user.toml
 ```
+
+私有 R2 artifact 中继是可选能力。只有明确启用时才增加 `ARTIFACT_BUCKET` binding，并执行 `node provision-r2.mjs --config wrangler.user.toml` 进行 provision；该桶必须只通过 Worker binding 访问，不能挂 public r2.dev 域名。
 
 部署 Worker 成功只代表公网代码存在，下一步还要验证 workstation link。
 

@@ -70,9 +70,9 @@ WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 
 Open <https://dash.cloudflare.com/profile/api-tokens> when browser control is available; otherwise give the user that URL.
 
-The simplest supported path is Cloudflare's current **Edit Cloudflare Workers** template, scoped to the single Account used for this install, **plus Account → Workers R2 Storage → Edit**. Do **not** add DNS Write. R2 write is required so the private artifact relay bucket can be created before Worker deploy.
+The simplest supported core path is Cloudflare's current **Edit Cloudflare Workers** template, scoped to the single Account used for this install. Do **not** add DNS Write or R2 permission for the core install.
 
-For a tighter custom token, retain at least Account → **Workers Scripts → Write/Edit**, Account → **Workers R2 Storage → Edit**, Account → **Account Settings → Read**, User → **Memberships → Read**, and User → **User Details → Read**. `workers.dev` bootstrap does not need Zone/DNS permissions.
+For a tighter custom token, retain at least Account → **Workers Scripts → Write/Edit**, Account → **Account Settings → Read**, User → **Memberships → Read**, and User → **User Details → Read**. `workers.dev` bootstrap does not need Zone/DNS permissions. **Workers R2 Storage → Edit** is required only if the user explicitly enables the optional private artifact relay.
 
 Tell the user the secret is shown once and ask them to paste it only into the current local-Agent session; prefer a dedicated secret-input channel when available.
 
@@ -109,12 +109,13 @@ GET it again afterward and require the returned value to match before deploying 
 
 Obtain the Edge Worker sources needed for deploy (temporary shallow clone or Release-adjacent docs package is acceptable for this Edge step only). Generate ignored `wrangler.user.toml` from the published user example, then set `name`, `DEFAULT_WORKSTATION_ID`, and `OAUTH_ISSUER=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`. Keep `workers_dev = true` and `routes = []`.
 
-Create the private R2 bucket named in `wrangler.user.toml` (idempotent if it already exists), then deploy the Worker. Do not skip the provision step: `wrangler deploy` fails closed when the bound bucket is missing.
+Deploy the core Worker directly. The published user template has no active R2 binding, so a fresh core install does not create an R2 bucket or require an R2 subscription/payment method.
 
 ```bash
-node provision-r2.mjs --config wrangler.user.toml
 npx wrangler deploy --config wrangler.user.toml
 ```
+
+If the user explicitly enables the optional private artifact relay later, add an `ARTIFACT_BUCKET` binding, use an R2-capable deployment credential, and run `node provision-r2.mjs --config wrangler.user.toml` before redeploying. Keep that bucket private.
 
 Never overwrite a pre-existing Worker unless this install can prove it owns it; choose a machine-specific/random-suffixed name instead. Then store the WSS shared secret as a Cloudflare Worker secret:
 
