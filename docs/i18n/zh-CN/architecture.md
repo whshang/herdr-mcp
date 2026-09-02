@@ -93,7 +93,7 @@ Herdr 本身拥有大量 Socket API 方法。herdr-mcp 没有把它们逐个包�
 
 ## 18 个工具为什么够用
 
-生产公共契约当前固定为 **contract epoch 2 / 18 tools**。设计目标是让模型容易选对工具，而不是让工具列表看起来壮观。
+workstation Runtime Execution Contract 当前固定为 **epoch 2 / 18 tools**；v0.4.3 的公共 Edge contract 是 **epoch 3 / 19 actions**，新增项仅为 Edge-local `herdr_devices`。设计目标是让模型容易选对工具，而不是让工具列表看起来壮观。
 
 ### 1. 观察：我现在在哪
 
@@ -245,7 +245,7 @@ Herdr daemon 的 snapshot / event 聚合偶尔可能出现 TaskGroup / Exception
 
 Runtime A/B 把“ChatGPT 连哪里”和“当前跑哪个本地版本”分开。新 runtime 先构建、验证 contract、健康检查，再切换 active generation；旧 generation 可以排空或回滚。详见 [Runtime A/B 自升级](runtime-self-upgrade.md)。
 
-工具契约发生不兼容变化时使用 contract epoch 管理。当前生产为 epoch 2 / 18 tools；旧 epoch 仅用于明确的兼容和回滚场景。
+工具契约发生不兼容变化时使用 contract epoch 管理。当前 workstation Runtime Execution Contract 为 epoch 2 / 18 tools，公共 Edge contract 为 epoch 3 / 19 actions；旧 epoch 仅用于明确的兼容和回滚场景。
 
 ## 进程与职责
 

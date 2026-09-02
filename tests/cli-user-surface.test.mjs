@@ -72,45 +72,6 @@ test("cargo-built herdr-mcp --help lists the user path ahead of service", () => 
   assert.ok(install >= 0 && service > install, "user-path install must precede service");
 });
 
-const ENROLLMENT_COMMANDS = [
-  "herdr-mcp worker pair",
-  "herdr-mcp device pair",
-  "herdr-mcp worker connect <pairing-address>",
-];
-
-test("v0.4.3 pairing docs use only the implemented CLI surface", () => {
-  const controlPlane = read("docs/_wip/multi-device-worker-control-plane.md");
-  const boundary = sectionAfterHeading(controlPlane, "## 13. CLI boundary");
-  const pairing = sectionAfterHeading(controlPlane, "## 11. Pairing");
-  const plan = read("docs/_wip/v0.4.3-plan.md");
-  const p0c = sectionAfterHeading(plan, "### P0-C — Secure pairing");
-
-  for (const section of [boundary, pairing, p0c]) {
-    for (const command of ENROLLMENT_COMMANDS) {
-      assert.match(section, new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    }
-  }
-
-  // The unimplemented onboarding tree must not be presented as the current path.
-  assert.doesNotMatch(
-    pairing,
-    /herdr-mcp worker setup\b/,
-    "pairing section must not present unimplemented `worker setup` as current onboarding",
-  );
-  assert.match(boundary, /Later command tree:[\s\S]*herdr-mcp worker setup/);
-
-  // Secrets never ride argv; joining devices never need deploy credentials.
-  assert.match(pairing, /never accepted as a command-line argument/);
-  assert.match(pairing, /Cloudflare deployment credentials are not required/);
-  assert.match(p0c, /never accepted on argv/);
-
-  // Owner-only pairing creation and pending two-device UAT are stated.
-  assert.match(pairing, /owner\/default workstation creates pairings/);
-  assert.match(pairing, /cannot recursively create further pairings/);
-  assert.match(controlPlane, /Real two-device UAT is still pending/);
-  assert.match(plan, /pending production Edge[\s\S]*second Mac/);
-});
-
 test("worker connect owns local service and enrolled production Link activation", () => {
   const worker = read("crates/herdr-mcp/src/worker.rs");
   const refresh = read("crates/herdr-mcp/src/link/generation_refresh.rs");

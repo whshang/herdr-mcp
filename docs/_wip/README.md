@@ -9,4 +9,4 @@ Lifecycle:
 - reusable current product guidance → promote into `docs/i18n/<locale>/`, an ADR/current architecture document, or another maintained SSOT;
 - one-off local data that may contain credentials or machine-specific state → keep outside the repository.
 
-Current active WIP includes the v0.4.3 integration plan (`v0.4.3-plan.md`), browser control plane settlement, DEV/STANDALONE/STORE extension distribution work, modular progressive skills, and the multi-device Worker control plane. The v0.4.2 release/qualification work is historical and must not remain an active-plan label. Remove or archive a plan when its implementation decision is complete; do not leave completed evidence here for convenience.
+Current active WIP includes browser control plane settlement, DEV/STANDALONE/STORE extension distribution work, and modular progressive skills. The completed v0.4.3 release plan and multi-device core design are archived under `docs/history/architecture/`. Completed release/qualification work must not remain an active-plan label. Remove or archive a plan when its implementation decision is complete; do not leave completed evidence here for convenience.

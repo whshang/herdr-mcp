@@ -87,7 +87,7 @@ Static evidence is kept in a bounded capability inventory under the herdr-mcp co
 
 ### Dynamic planning advice for the Web planner
 
-v0.4.3 keeps the 18-tool public MCP contract and does not add a dedicated planning tool. The progressive `herdr_skill` bootstrap advertises a read-only local method routed through the existing `herdr_call` tool:
+v0.4.3 keeps the workstation Runtime Execution Contract at 18 tools and does not add a dedicated planning tool. The public Edge contract has 19 actions because `herdr_devices` is Edge-local. The progressive `herdr_skill` bootstrap advertises a read-only local method routed through the existing `herdr_call` tool:
 
 ```text
 herdr_call(
