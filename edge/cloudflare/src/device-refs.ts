@@ -372,6 +372,7 @@ export function wrapResultWithDevice(result: unknown, deviceId: string | null, d
         const parsed = JSON.parse(block.text) as unknown;
         if (!isRecord(parsed)) continue;
         wrapContainer(parsed);
+        if (isRecord(parsed.result)) wrapContainer(parsed.result);
         addProvenance(parsed);
         block.text = JSON.stringify(parsed);
       } catch { /* preserve non-JSON text */ }
