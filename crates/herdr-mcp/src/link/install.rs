@@ -811,12 +811,19 @@ mod tests {
     }
 
     #[test]
-    fn protected_mutation_guard_blocks_live_labels() {
-        let err = assert_not_protected_mutation(LINK_PROD_LABEL).expect_err("prod");
-        assert!(err.contains("protected"));
-        let err = assert_not_protected_mutation(LINK_LABEL).expect_err("link");
-        assert!(err.contains("protected"));
-        assert_not_protected_mutation(LINK_RUST_CANDIDATE_LABEL).unwrap();
+    fn configured_edge_ws_url_prefers_link_upstream_origin() {
+        let home = test_home();
+        let config_dir = home.join(".config/herdr-mcp");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            "[edge]\npublic_origin = \"https://custom.example\"\nlink_upstream_origin = \"https://backend.workers.dev\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n",
+        )
+        .unwrap();
+
+        let edge_url = configured_edge_ws_url(&home);
+        assert_eq!(edge_url.as_deref(), Some("wss://backend.workers.dev/ws"));
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

@@ -443,6 +443,31 @@ impl RemoteProbeReport {
 }
 
 fn resolve_edge_config(config: &Config) -> Option<EdgeConfigView> {
+    let home = home_dir();
+
+    // Check if a real link LaunchAgent plist exists
+    let plist_info = home.as_ref().and_then(|h| {
+        let plist_candidates = [
+            ("dev.herdr-mcp.link-prod", EdgeConfigSource::LinkProdPlist),
+            ("dev.herdr-mcp.link", EdgeConfigSource::LinkPlist),
+            (
+                "dev.herdr-mcp.link-rust-candidate",
+                EdgeConfigSource::LinkCandidatePlist,
+            ),
+        ];
+        for (label, source) in plist_candidates {
+            let path = h
+                .join("Library")
+                .join("LaunchAgents")
+                .join(format!("{label}.plist"));
+            if path.is_file() {
+                let host = edge_host_from_plist(&path);
+                return Some((path, label.to_owned(), source, host));
+            }
+        }
+        None
+    });
+
     // If [edge].public_origin is configured in config.toml, it is the authoritative public identity
     if let Some(public_origin) = config.edge_public_origin.as_deref()
         && let Ok(parsed) = url::Url::parse(public_origin)
@@ -451,39 +476,22 @@ fn resolve_edge_config(config: &Config) -> Option<EdgeConfigView> {
         return Some(EdgeConfigView {
             host: host.to_owned(),
             origin: public_origin.to_owned(),
-            plist: None,
+            plist: plist_info.as_ref().map(|(p, _, _, _)| p.clone()),
             source: EdgeConfigSource::ConfigToml,
-            label: None,
+            label: plist_info.as_ref().map(|(_, l, _, _)| l.clone()),
         });
     }
 
-    let home = home_dir()?;
-    let plist_candidates = [
-        ("dev.herdr-mcp.link-prod", EdgeConfigSource::LinkProdPlist),
-        ("dev.herdr-mcp.link", EdgeConfigSource::LinkPlist),
-        (
-            "dev.herdr-mcp.link-rust-candidate",
-            EdgeConfigSource::LinkCandidatePlist,
-        ),
-    ];
-    for (label, source) in plist_candidates {
-        let path = home
-            .join("Library")
-            .join("LaunchAgents")
-            .join(format!("{label}.plist"));
-        if !path.is_file() {
-            continue;
-        }
-        if let Some(host) = edge_host_from_plist(&path) {
-            let origin = https_origin_for_host(&host)?;
-            return Some(EdgeConfigView {
-                host,
-                origin,
-                plist: Some(path),
-                source,
-                label: Some(label.to_owned()),
-            });
-        }
+    if let Some((path, label, source, Some(host))) = plist_info
+        && let Some(origin) = https_origin_for_host(&host)
+    {
+        return Some(EdgeConfigView {
+            host,
+            origin,
+            plist: Some(path),
+            source,
+            label: Some(label),
+        });
     }
 
     let edge_url = std::env::var("HERDR_EDGE_URL")

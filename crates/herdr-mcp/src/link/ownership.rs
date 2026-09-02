@@ -560,7 +560,7 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
     let edge_public_origin = config.as_ref().and_then(|c| c.edge_public_origin.clone());
     let link_upstream_origin = config
         .as_ref()
-        .and_then(|c| c.link_upstream_origin().map(|s| s.to_owned()));
+        .and_then(|c| c.edge_link_upstream_origin.clone());
 
     json!({
         "ok": true,

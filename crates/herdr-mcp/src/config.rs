@@ -130,7 +130,10 @@ impl Config {
     #[cfg(any(target_os = "macos", test))]
     #[allow(dead_code)]
     pub fn set_edge_link_upstream_origin(&mut self, origin: &str) -> Result<(), String> {
-        self.edge_link_upstream_origin = Some(normalize_edge_public_origin(origin)?);
+        self.edge_link_upstream_origin = Some(normalize_edge_origin_field(
+            origin,
+            "edge.link_upstream_origin",
+        )?);
         Ok(())
     }
 
@@ -234,8 +237,10 @@ fn parse(content: &str) -> Result<Config, String> {
                 config.edge_public_origin = Some(normalize_edge_public_origin(unquote(value))?)
             }
             ("edge", "link_upstream_origin") => {
-                config.edge_link_upstream_origin =
-                    Some(normalize_edge_public_origin(unquote(value))?)
+                config.edge_link_upstream_origin = Some(normalize_edge_origin_field(
+                    unquote(value),
+                    "edge.link_upstream_origin",
+                )?)
             }
             ("edge", "device_id") => {
                 config.edge_device_id = Some(normalize_device_id(unquote(value))?)
@@ -248,26 +253,29 @@ fn parse(content: &str) -> Result<Config, String> {
     Ok(config)
 }
 
-fn normalize_edge_public_origin(value: &str) -> Result<String, String> {
-    let mut url =
-        Url::parse(value).map_err(|error| format!("edge.public_origin is invalid: {error}"))?;
+fn normalize_edge_origin_field(value: &str, field_name: &str) -> Result<String, String> {
+    let mut url = Url::parse(value).map_err(|error| format!("{field_name} is invalid: {error}"))?;
     if url.scheme() != "https" {
-        return Err("edge.public_origin must use https://".to_owned());
+        return Err(format!("{field_name} must use https://"));
     }
     if url.host_str().is_none() {
-        return Err("edge.public_origin must include a host".to_owned());
+        return Err(format!("{field_name} must include a host"));
     }
     if url.username() != "" || url.password().is_some() {
-        return Err("edge.public_origin must not include credentials".to_owned());
+        return Err(format!("{field_name} must not include credentials"));
     }
     if url.query().is_some() || url.fragment().is_some() {
-        return Err("edge.public_origin must not include query or fragment".to_owned());
+        return Err(format!("{field_name} must not include query or fragment"));
     }
     if url.path() != "/" && !url.path().is_empty() {
-        return Err("edge.public_origin must not include a path".to_owned());
+        return Err(format!("{field_name} must not include a path"));
     }
     url.set_path("");
     Ok(url.to_string().trim_end_matches('/').to_owned())
+}
+
+fn normalize_edge_public_origin(value: &str) -> Result<String, String> {
+    normalize_edge_origin_field(value, "edge.public_origin")
 }
 
 pub fn normalize_device_id(value: &str) -> Result<String, String> {
@@ -449,8 +457,11 @@ mod tests {
         assert!(parse("port = 1").is_err());
         assert!(parse("[runtime]\nport = 0").is_err());
         assert!(parse("[update]\nchannel = \"nightly\"").is_err());
-        assert!(parse("[edge]\npublic_origin = \"http://example.com\"").is_err());
-        assert!(parse("[edge]\nlink_upstream_origin = \"http://example.com\"").is_err());
+        let public_err = parse("[edge]\npublic_origin = \"http://example.com\"").unwrap_err();
+        assert!(public_err.contains("edge.public_origin must use https://"));
+        let upstream_err =
+            parse("[edge]\nlink_upstream_origin = \"http://example.com\"").unwrap_err();
+        assert!(upstream_err.contains("edge.link_upstream_origin must use https://"));
         assert!(parse("[edge]\ndevice_id = \"dev_bad\"").is_err());
         assert!(parse("[unknown]\nvalue = 1").is_err());
     }
