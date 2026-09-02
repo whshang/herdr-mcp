@@ -336,7 +336,7 @@ test("mcp handler exposes device metadata in ChatGPT text", async () => {
         completion: {
           status: "ok",
           result: {
-            content: [{ type: "text", text: JSON.stringify({ ok: true, workspaces: [{ id: "w1" }] }) }],
+            content: [{ type: "text", text: JSON.stringify({ ok: true, result: { workspaces: [{ id: "w1" }] } }) }],
             structuredContent: null,
           },
         },
@@ -347,5 +347,5 @@ test("mcp handler exposes device metadata in ChatGPT text", async () => {
   const r = await handleMcp({ jsonrpc: "2.0", id: 20, method: "tools/call", params: { name: "herdr_fs_read", arguments: { device: DEV_A, path: "/repo/file.txt" } } }, "legacy", deps);
   const text = JSON.parse(r.body.result.content[0].text);
   assert.equal(text.device_id, DEV_A, "device_id must appear in ChatGPT-visible text");
-  assert.equal(decodeDeviceRef(text.workspaces[0].workspace_id).d, DEV_A, "workspace ref must retain device affinity");
+  assert.equal(decodeDeviceRef(text.result.workspaces[0].workspace_id).d, DEV_A, "workspace ref must retain device affinity");
 });
