@@ -12,17 +12,45 @@ Agent 直接读取并执行本文，不需要用户再把本文包装成一段�
 
 1. 能自动化的 shell 步骤直接执行；只在 Cloudflare 交互登录 / API Token 创建，或多个 Account 选择时暂停。
 2. 不破坏已有工作。禁止对无关 checkout 做 `reset --hard`、`clean -fd` 或覆盖用户修改。
-3. 首次安装就确定一个 canonical public origin，并让 Worker OAuth、MCP、Link WSS 全部使用同一个入口。`workers.dev` 仍是无需 DNS 的 bootstrap 路径。只有用户明确选择 Custom Domain，或现有安装策略/配置能证明这一意图时，才从第一次部署使用自定义域名。连通性失败是暂停点，不代表 Agent 获得创建或修改 Custom Domain/DNS zone 的权限。
+3. 首次安装就确定一个 canonical public origin，并让 Worker OAuth、MCP 身份始终使用该入口。Link transport 不得因为连通性修复而静默改写 OAuth issuer。`workers.dev` 仍是无需 DNS 的 bootstrap 路径。只有用户明确选择 Custom Domain，或现有安装策略/配置能证明这一意图时，才从第一次部署使用自定义域名。连通性失败是暂停点，不代表 Agent 获得创建或修改 Custom Domain/DNS zone 的权限。
 4. Cloudflare Token 是高敏凭据。禁止回显或写入仓库、`.env`、普通日志、截图、shell history。优先进程环境注入；若必须落临时文件，用 mode `0600` 并在部署后立刻删除。
 5. 每个 mutation 后先验证再继续。出错时先判断 mutation 是否已经提交，再决定是否重试。
 6. **不要**用 clone 本仓库或 `npm`/`cargo` 安装本机 MCP runtime，除非用户明确要求贡献者/从源码开发会话。
 7. 如果网络、登录状态或第三方服务不可用，停止并向用户报告 blocker；不要自行搭代理、切网络节点、修改系统代理或发明绕过路径。
 
+## 0.5 Fleet 所有权闸门——任何 Cloudflare mutation 之前
+
+在请求 Cloudflare Token、命名 Worker、创建 R2、部署 Edge 或新建 ChatGPT Connector 之前，必须先确认 fleet 意图。新电脑本地 `~/.config/herdr-mcp` 为空，**不代表**这是用户的第一台 Herdr 电脑。
+
+- 如果用户已经提供 Herdr pairing address，这台电脑就是加入已有 Worker。安装/验证本机 runtime 与 macOS 权限后，执行 `herdr-mcp worker connect "<pairing-address>"`；CLI 默认使用 macOS Computer Name，只有用户明确要求不同的初始显示名时才传 `--name`。跳过 Worker/R2/Connector 创建。
+- 如果用户明确说已有另一台 Herdr 电脑但还没有 pairing address，在一台已授权的旧电脑上执行 `herdr-mcp worker pair`，然后在新电脑用 `worker connect` 消费这个一次性 pairing；复用已有公网 MCP/OAuth origin。
+- 只有用户明确确认这是第一台 Herdr 电脑/第一个 fleet，才继续下面的 first-owner Cloudflare 路径。
+- 如果意图不清楚，只问一个所有权问题：**创建第一个 Herdr Worker，还是加入已有 Herdr Worker？** 禁止根据本机缺少凭据自行推断。
+- pairing、旧 Worker 升级、hostname 连通性或权限失败都仍属于 existing-fleet 修复路径。除非用户明确改变 fleet 意图，否则禁止 fallback 到随机后缀的新 Worker、R2 桶或 Connector。
+
 ## 1. 前置条件
 
-运行 `herdr --version` 与 `herdr api schema >/dev/null`。需要可用的 `herdr` 与 Herdr socket（默认 `~/.config/herdr/herdr.sock`，或显式 `HERDR_SOCKET_PATH`）。若 Herdr 本身未安装/未运行，停下来并引导用户到 <https://herdr.dev>；herdr-mcp 不替代 Herdr。
+先让当前 shell 看见标准用户级二进制目录，再运行 `herdr --version` 与 `herdr api schema >/dev/null`：
 
-如果 Herdr 缺失，Agent 直接安装官方稳定版：
+```bash
+HERDR_PATH_BEFORE="$(command -v herdr 2>/dev/null || true)"
+export PATH="$HOME/.local/bin:$PATH"
+hash -r 2>/dev/null || true
+herdr --version
+herdr api schema >/dev/null
+```
+
+需要可用的 `herdr` 与 Herdr socket（默认 `~/.config/herdr/herdr.sock`，或显式 `HERDR_SOCKET_PATH`）。如果 `HERDR_PATH_BEFORE` 为空，但 `~/.local/bin/herdr` 已经存在，应判定为 shell PATH 缺陷，而不是“Herdr 未安装”。zsh 只有在新的交互 shell 仍找不到 Herdr 时才修复：
+
+```bash
+if [ -x "$HOME/.local/bin/herdr" ] && ! zsh -ic 'command -v herdr >/dev/null 2>&1'; then
+  line='export PATH="$HOME/.local/bin:$PATH"'
+  grep -Fqx "$line" "$HOME/.zshrc" 2>/dev/null || printf '\n%s\n' "$line" >> "$HOME/.zshrc"
+fi
+zsh -ic 'command -v herdr && herdr --version'
+```
+
+如果 Herdr 确实缺失，Agent 直接安装官方稳定版：
 
 ```bash
 curl -fsSL https://herdr.dev/install.sh | sh
@@ -114,7 +142,7 @@ npx wrangler deploy --config wrangler.user.toml
 
 如果用户以后明确启用可选的私有 artifact 中继，再增加 `ARTIFACT_BUCKET` binding、使用具备 R2 权限的部署凭据，并在重新部署前执行 `node provision-r2.mjs --config wrangler.user.toml`。桶必须保持私有。
 
-除非能证明拥有权，否则不要覆盖已有 Worker；改用机器相关/随机后缀名。然后把 WSS 共享秘密存为 Worker secret：
+除非能证明拥有权，否则不要覆盖已有 Worker。如果目标名称已存在，先停下来判断它是不是用户已有的 Herdr Worker；**禁止**为了绕过所有权确认而直接创建随机后缀 Worker。只有用户明确确认 first-fleet，且能证明已有 Worker 与本次无关时，才选择新的唯一 Worker 名。然后把 WSS 共享秘密存为 Worker secret：
 
 ```bash
 printf '%s' "$LINK_SHARED_SECRET" | npx wrangler secret put LINK_SHARED_SECRET --config wrangler.user.toml
