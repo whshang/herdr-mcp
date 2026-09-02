@@ -63,6 +63,8 @@ List my Herdr devices. Use macbook-main for the backend task and macbook-lab for
 
 When several machines are eligible for a mutation and you do not name a target, Herdr fails with `device_ambiguous` instead of guessing. Device identity stays attached to follow-up operations and retries, and each computer has its own credential.
 
+Web AI can also copy small non-secret UTF-8 text between enrolled computers through private workstation methods without adding another public MCP tool. The source is read with an integrity digest and the target write is bounded to HOME, regular non-symlink files, 256 KiB, explicit overwrite, default backup, and secret-like path/content rejection. Binary files, directory synchronization, and credentials are deliberately out of scope.
+
 ### Add another computer to the fleet
 
 On an already-authorized computer, create a short-lived pairing session:

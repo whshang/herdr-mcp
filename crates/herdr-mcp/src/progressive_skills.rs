@@ -16,6 +16,8 @@ pub const LOCAL_LIST_METHOD: &str = "herdr_mcp.skill.list";
 pub const LOCAL_DESCRIBE_METHOD: &str = "herdr_mcp.skill.describe";
 pub const LOCAL_LOAD_METHOD: &str = "herdr_mcp.skill.load";
 pub const PLANNING_ADVISE_METHOD: &str = "herdr_mcp.planning.advise";
+pub const TEXT_READ_METHOD: &str = "herdr_mcp.text.read";
+pub const TEXT_WRITE_METHOD: &str = "herdr_mcp.text.write";
 
 pub fn local_method_schemas(query: &str) -> Vec<Value> {
     let schemas = vec![
@@ -73,6 +75,33 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 },
                 "required": [],
                 "empty": true,
+            },
+        }),
+        json!({
+            "method": TEXT_READ_METHOD,
+            "source": "herdr_mcp_local",
+            "params": {
+                "properties": {
+                    "path": {"type": "string"},
+                    "max_bytes": {"type": "integer", "minimum": 1, "maximum": 262144},
+                },
+                "required": ["path"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": TEXT_WRITE_METHOD,
+            "source": "herdr_mcp_local",
+            "params": {
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "sha256": {"type": "string"},
+                    "overwrite": {"type": "boolean"},
+                    "backup": {"type": "boolean"},
+                },
+                "required": ["path", "content", "sha256"],
+                "empty": false,
             },
         }),
     ];
@@ -496,6 +525,8 @@ impl ProgressiveSkillService {
             LOCAL_DESCRIBE_METHOD => self.describe_method(params),
             LOCAL_LOAD_METHOD => self.load_method(params),
             PLANNING_ADVISE_METHOD => self.planning_advise_method(params, snapshot),
+            TEXT_READ_METHOD => crate::text_transfer::read(params),
+            TEXT_WRITE_METHOD => crate::text_transfer::write(params),
             _ => json!({
                 "ok": false,
                 "code": "unknown_local_method",
@@ -1775,6 +1806,12 @@ mod tests {
             methods[0]["params"]["properties"]["independent_units"]["maximum"],
             64
         );
+
+        let methods = local_method_schemas("text.");
+        assert_eq!(methods.len(), 2);
+        assert_eq!(methods[0]["method"], TEXT_READ_METHOD);
+        assert_eq!(methods[1]["method"], TEXT_WRITE_METHOD);
+        assert_eq!(methods[0]["source"], "herdr_mcp_local");
     }
 
     #[test]
