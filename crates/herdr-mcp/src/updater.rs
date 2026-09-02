@@ -32,7 +32,7 @@ use std::process::ExitCode;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 #[cfg(target_os = "macos")]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 #[cfg(target_os = "macos")]
@@ -48,6 +48,12 @@ const ATTESTATION_MAX_BYTES: usize = 2 * 1024 * 1024;
 const BINARY_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
+#[cfg(target_os = "macos")]
+const DOWNLOAD_PROGRESS_STEP_PERCENT: u64 = 5;
+#[cfg(target_os = "macos")]
+const UPDATE_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(target_os = "macos")]
+const UPDATE_WATCH_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReleaseAsset {
@@ -70,6 +76,79 @@ struct ReleasePlan {
 enum AutoUpdatePolicy {
     RunStable,
     Skip(&'static str),
+}
+
+#[cfg(target_os = "macos")]
+struct UpdateProgress<W: Write> {
+    writer: W,
+    enabled: bool,
+    last_download_bucket: Option<u64>,
+    last_job_snapshot: Option<(String, Option<String>)>,
+}
+
+#[cfg(target_os = "macos")]
+impl<W: Write> UpdateProgress<W> {
+    fn new(writer: W, enabled: bool) -> Self {
+        Self {
+            writer,
+            enabled,
+            last_download_bucket: None,
+            last_job_snapshot: None,
+        }
+    }
+
+    fn phase(&mut self, message: impl AsRef<str>) {
+        if !self.enabled {
+            return;
+        }
+        let _ = writeln!(self.writer, "[herdr-mcp update] {}", message.as_ref());
+        let _ = self.writer.flush();
+    }
+
+    fn download(&mut self, downloaded: u64, total: u64) {
+        if !self.enabled || total == 0 {
+            return;
+        }
+        let percent = downloaded
+            .saturating_mul(100)
+            .saturating_div(total)
+            .min(100);
+        let bucket = if percent == 100 {
+            100
+        } else {
+            (percent / DOWNLOAD_PROGRESS_STEP_PERCENT) * DOWNLOAD_PROGRESS_STEP_PERCENT
+        };
+        if self.last_download_bucket == Some(bucket) {
+            return;
+        }
+        self.last_download_bucket = Some(bucket);
+        let mib = 1024.0 * 1024.0;
+        let _ = writeln!(
+            self.writer,
+            "[herdr-mcp update] Download {bucket:>3}% ({:.1}/{:.1} MiB)",
+            downloaded as f64 / mib,
+            total as f64 / mib
+        );
+        let _ = self.writer.flush();
+    }
+
+    fn job(&mut self, job: &UpdateJobRecord) {
+        if !self.enabled {
+            return;
+        }
+        let snapshot = (job.state.clone(), job.detail.clone());
+        if self.last_job_snapshot.as_ref() == Some(&snapshot) {
+            return;
+        }
+        self.last_job_snapshot = Some(snapshot);
+        let detail = job.detail.as_deref().unwrap_or("no detail");
+        self.phase(format!("Installer {}: {detail}", job.state));
+    }
+
+    #[cfg(test)]
+    fn into_inner(self) -> W {
+        self.writer
+    }
 }
 
 fn auto_update_policy(
@@ -131,7 +210,7 @@ fn check(manifest_override: Option<&str>) -> Result<ExitCode, String> {
 }
 
 fn apply(manifest_override: Option<&str>) -> Result<ExitCode, String> {
-    apply_inner(manifest_override, false, None)
+    apply_inner(manifest_override, false, None, true)
 }
 
 fn auto() -> Result<ExitCode, String> {
@@ -169,17 +248,23 @@ fn auto() -> Result<ExitCode, String> {
     // Freeze the trust decision made above. Do not re-read the mutable config
     // inside the apply path and accidentally widen a scheduled Stable update
     // into Preview if the config changes concurrently.
-    apply_inner(None, true, Some(UpdateChannel::Stable))
+    apply_inner(None, true, Some(UpdateChannel::Stable), false)
 }
 
 fn apply_inner(
     manifest_override: Option<&str>,
     allow_current: bool,
     channel_override: Option<UpdateChannel>,
+    progress_enabled: bool,
 ) -> Result<ExitCode, String> {
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (manifest_override, allow_current, channel_override);
+        let _ = (
+            manifest_override,
+            allow_current,
+            channel_override,
+            progress_enabled,
+        );
         Err("native update apply currently requires macOS service manager".to_owned())
     }
 
@@ -190,8 +275,18 @@ fn apply_inner(
             Some(channel) => channel,
             None => load_update_channel()?,
         };
+        let stderr = std::io::stderr();
+        let mut progress = UpdateProgress::new(stderr.lock(), progress_enabled);
+        progress.phase(format!(
+            "Checking {} release metadata and provenance...",
+            channel.as_str()
+        ));
         let plan = fetch_release_plan(manifest_override, channel)?;
         let current = current_version()?;
+        progress.phase(format!(
+            "Release {} verified; current version is {}.",
+            plan.version, current
+        ));
         if plan.version <= current {
             if allow_current {
                 print_json(&json!({
@@ -215,11 +310,14 @@ fn apply_inner(
         let paths = RuntimePaths::discover()?;
         let store = UpdateStore::open(&paths)?;
         recover_or_reject_active_update(&store, &paths)?;
-        let (job_id, binary_path) = stage_release(&paths, &plan)?;
+        progress.phase("Preparing a rollback-safe update job...");
+        let (job_id, binary_path) = stage_release(&paths, &plan, &mut progress)?;
+        progress.phase("Download verified. Probing candidate runtime identity...");
         if let Err(error) = probe_candidate_binary(&binary_path, &plan.version) {
             cleanup_staging(&binary_path);
             return Err(error);
         }
+        progress.phase("Candidate identity verified. Starting installer...");
 
         let now = now_ms_i64();
         let job = UpdateJobRecord {
@@ -241,7 +339,7 @@ fn apply_inner(
         }
 
         let child = spawn_worker(&paths, &binary_path, &job_id);
-        let child = match child {
+        let mut child = match child {
             Ok(child) => child,
             Err(error) => {
                 let _ = store.update_update_job(
@@ -259,6 +357,26 @@ fn apply_inner(
             .set_update_worker_pid(&job_id, child.id(), now_ms_i64())
             .is_ok();
 
+        if progress.enabled {
+            if let Some(job) = watch_update_job(&store, &job_id, &mut child, &mut progress)? {
+                print_json(&json!({
+                    "ok": true,
+                    "code": "update_succeeded",
+                    "job_id": job_id,
+                    "version": plan.version.to_string(),
+                    "target": plan.asset.target,
+                    "asset": plan.asset.name,
+                    "worker_pid": child.id(),
+                    "worker_pid_persisted": worker_pid_persisted,
+                    "job": public_job_view(&job),
+                }))?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            progress.phase(
+                "Installer is still running in the background; use `herdr-mcp update status` for the final state.",
+            );
+        }
+
         print_json(&json!({
             "ok": true,
             "code": "update_queued",
@@ -268,6 +386,7 @@ fn apply_inner(
             "asset": plan.asset.name,
             "worker_pid": child.id(),
             "worker_pid_persisted": worker_pid_persisted,
+            "next_action": "herdr-mcp update status",
         }))?;
         Ok(ExitCode::SUCCESS)
     }
@@ -336,7 +455,7 @@ fn worker(job_id: &str) -> Result<ExitCode, String> {
         store.update_update_job(
             job_id,
             "installing",
-            Some("candidate verified; service install started"),
+            Some("candidate verified; service install and launchd health gate started"),
             None,
             now_ms_i64(),
         )?;
@@ -627,7 +746,11 @@ fn recover_or_reject_active_update(
 }
 
 #[cfg(target_os = "macos")]
-fn stage_release(paths: &RuntimePaths, plan: &ReleasePlan) -> Result<(String, PathBuf), String> {
+fn stage_release<W: Write>(
+    paths: &RuntimePaths,
+    plan: &ReleasePlan,
+    progress: &mut UpdateProgress<W>,
+) -> Result<(String, PathBuf), String> {
     let root = paths.config_dir.join("update").join("jobs");
     ensure_real_dir(&paths.config_dir)?;
     ensure_real_dir(&paths.config_dir.join("update"))?;
@@ -650,13 +773,19 @@ fn stage_release(paths: &RuntimePaths, plan: &ReleasePlan) -> Result<(String, Pa
         "herdr-mcp-candidate"
     });
     let client = update_client()?;
+    progress.phase(format!("Verifying attestation for {}...", plan.asset.name));
     verify_artifact_attestation(
         &client,
         &plan.asset.name,
         &plan.asset.sha256,
         &plan.identity,
     )?;
-    if let Err(error) = download_asset(&client, &plan.asset, &binary) {
+    progress.phase(format!(
+        "Downloading {} ({:.1} MiB)...",
+        plan.asset.name,
+        plan.asset.size as f64 / (1024.0 * 1024.0)
+    ));
+    if let Err(error) = download_asset(&client, &plan.asset, &binary, progress) {
         let _ = fs::remove_dir_all(&job_dir);
         return Err(error);
     }
@@ -664,7 +793,12 @@ fn stage_release(paths: &RuntimePaths, plan: &ReleasePlan) -> Result<(String, Pa
 }
 
 #[cfg(target_os = "macos")]
-fn download_asset(client: &Client, asset: &ReleaseAsset, target: &Path) -> Result<(), String> {
+fn download_asset<W: Write>(
+    client: &Client,
+    asset: &ReleaseAsset,
+    target: &Path,
+    progress: &mut UpdateProgress<W>,
+) -> Result<(), String> {
     let mut response = client
         .get(asset.url.clone())
         .send()
@@ -693,6 +827,7 @@ fn download_asset(client: &Client, asset: &ReleaseAsset, target: &Path) -> Resul
         let mut digest = Sha256::new();
         let mut total = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
+        progress.download(0, asset.size);
         loop {
             let read = response
                 .read(&mut buffer)
@@ -707,6 +842,7 @@ fn download_asset(client: &Client, asset: &ReleaseAsset, target: &Path) -> Resul
             digest.update(&buffer[..read]);
             file.write_all(&buffer[..read])
                 .map_err(|error| format!("cannot write staged update binary: {error}"))?;
+            progress.download(total, asset.size);
         }
         if total != asset.size {
             return Err("release asset byte count does not match manifest".to_owned());
@@ -728,6 +864,63 @@ fn download_asset(client: &Client, asset: &ReleaseAsset, target: &Path) -> Resul
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+#[cfg(target_os = "macos")]
+fn watch_update_job<W: Write>(
+    store: &UpdateStore,
+    job_id: &str,
+    child: &mut std::process::Child,
+    progress: &mut UpdateProgress<W>,
+) -> Result<Option<UpdateJobRecord>, String> {
+    let started = Instant::now();
+    loop {
+        let job = store.update_job(job_id)?.ok_or_else(|| {
+            format!("update job {job_id} disappeared while installer was running")
+        })?;
+        progress.job(&job);
+        match job.state.as_str() {
+            "succeeded" => return Ok(Some(job)),
+            "failed" => {
+                return Err(format!(
+                    "update job {job_id} failed: {}",
+                    job.detail.as_deref().unwrap_or("no detail")
+                ));
+            }
+            "queued" | "installing" => {}
+            other => {
+                return Err(format!(
+                    "update job {job_id} entered unexpected state {other}"
+                ));
+            }
+        }
+
+        if started.elapsed() >= UPDATE_WATCH_TIMEOUT {
+            return Ok(None);
+        }
+        if child
+            .try_wait()
+            .map_err(|error| format!("cannot inspect update worker: {error}"))?
+            .is_some()
+        {
+            std::thread::sleep(UPDATE_WATCH_POLL_INTERVAL);
+            let final_job = store
+                .update_job(job_id)?
+                .ok_or_else(|| format!("update job {job_id} disappeared after worker exit"))?;
+            progress.job(&final_job);
+            return match final_job.state.as_str() {
+                "succeeded" => Ok(Some(final_job)),
+                "failed" => Err(format!(
+                    "update job {job_id} failed: {}",
+                    final_job.detail.as_deref().unwrap_or("no detail")
+                )),
+                other => Err(format!(
+                    "update worker exited while job {job_id} was still {other}; inspect with `herdr-mcp update status`"
+                )),
+            };
+        }
+        std::thread::sleep(UPDATE_WATCH_POLL_INTERVAL);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1268,6 +1461,61 @@ mod tests {
             auto_update_policy(false, true, UpdateChannel::Preview, "prod"),
             AutoUpdatePolicy::Skip("preview_channel_requires_manual_update")
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn manual_update_progress_reports_phases_download_and_installer_state() {
+        let mut progress = UpdateProgress::new(Vec::<u8>::new(), true);
+        progress.phase("Checking stable release metadata and provenance...");
+        let total = 20 * 1024 * 1024;
+        progress.download(0, total);
+        progress.download(1024 * 1024, total);
+        progress.download(1024 * 1024 + 1, total);
+        progress.download(total, total);
+
+        let now = now_ms_i64();
+        let mut job = UpdateJobRecord {
+            job_id: "upd-progress-12345678".to_owned(),
+            version: "9.9.9".to_owned(),
+            target: current_target().unwrap().to_owned(),
+            asset_name: "candidate".to_owned(),
+            sha256: "a".repeat(64),
+            binary_path: "/tmp/candidate".to_owned(),
+            state: "queued".to_owned(),
+            detail: Some("verified candidate staged".to_owned()),
+            worker_pid: Some(std::process::id()),
+            created_at: now,
+            updated_at: now,
+        };
+        progress.job(&job);
+        progress.job(&job);
+        job.state = "installing".to_owned();
+        job.detail =
+            Some("candidate verified; service install and launchd health gate started".to_owned());
+        progress.job(&job);
+        job.state = "succeeded".to_owned();
+        job.detail = Some("service install committed and health gate passed".to_owned());
+        progress.job(&job);
+
+        let output = String::from_utf8(progress.into_inner()).unwrap();
+        assert!(output.contains("Checking stable release metadata"));
+        assert!(output.contains("Download   0%"));
+        assert!(output.contains("Download   5%"));
+        assert_eq!(output.matches("Download   5%").count(), 1);
+        assert!(output.contains("Download 100%"));
+        assert_eq!(output.matches("Installer queued").count(), 1);
+        assert!(output.contains("Installer installing"));
+        assert!(output.contains("Installer succeeded"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn automatic_update_progress_stays_silent() {
+        let mut progress = UpdateProgress::new(Vec::<u8>::new(), false);
+        progress.phase("hidden");
+        progress.download(10, 100);
+        assert!(progress.into_inner().is_empty());
     }
 
     #[test]
