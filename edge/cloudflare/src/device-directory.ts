@@ -367,6 +367,25 @@ export async function resolveDeviceRouteWithContext(
     };
   }
 
+  // 3) Backward-compatible implicit routing. Before multi-device support, an
+  // omitted selector always meant the configured legacy/default workstation.
+  // Preserve that meaning when the registry contains exactly one record bound
+  // to that workstation_id. Never silently fail over to a different machine:
+  // an unavailable default reports its own state, and corrupt duplicate legacy
+  // mappings remain fail-closed.
+  const legacyMatches = devices.filter((device) => device.workstation_id === ctx.legacyWorkstationId);
+  if (legacyMatches.length > 1) return { ok: false, code: "device_ambiguous" };
+  if (legacyMatches.length === 1) {
+    const selected = legacyMatches[0];
+    if (!isRoutableDevice(selected)) return unavailableReason(selected);
+    return {
+      ok: true,
+      device_id: selected.device_id,
+      workstation_id: selected.workstation_id,
+      routing_reason: "legacy_default_device",
+    };
+  }
+
   const routable = devices.filter(isRoutableDevice);
   if (routable.length === 1) {
     return {

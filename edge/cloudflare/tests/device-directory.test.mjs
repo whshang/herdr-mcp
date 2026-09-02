@@ -105,6 +105,34 @@ test("device routing fails closed for ambiguity and paused/suspended devices", a
   assert.deepEqual(await resolveDeviceRoute(registryWith(suspended), DEV_A, "legacy"), { ok: false, code: "device_suspended" });
 });
 
+test("implicit routing preserves the legacy default workstation after additional devices enroll", async () => {
+  const devices = [
+    { device_id: DEV_A, workstation_id: "prod-real-runtime", name: "primary", authorization: "active", scheduling: "enabled" },
+    { device_id: DEV_B, workstation_id: DEV_B, name: "secondary", authorization: "active", scheduling: "enabled" },
+  ];
+  assert.deepEqual(await resolveDeviceRoute(registryWith(devices), undefined, "prod-real-runtime"), {
+    ok: true,
+    device_id: DEV_A,
+    workstation_id: "prod-real-runtime",
+    routing_reason: "legacy_default_device",
+  });
+
+  const pausedDefault = [{ ...devices[0], scheduling: "paused" }, devices[1]];
+  assert.deepEqual(await resolveDeviceRoute(registryWith(pausedDefault), undefined, "prod-real-runtime"), {
+    ok: false,
+    code: "device_paused",
+  });
+
+  const noLegacyMatch = [
+    { ...devices[0], workstation_id: "ws-a" },
+    { ...devices[1], workstation_id: "ws-b" },
+  ];
+  assert.deepEqual(await resolveDeviceRoute(registryWith(noLegacyMatch), undefined, "legacy"), {
+    ok: false,
+    code: "device_ambiguous",
+  });
+});
+
 test("device routing selects one routable device and preserves legacy fallback only for an empty registry", async () => {
   const single = [{ device_id: DEV_A, workstation_id: "prod-real-runtime", name: "macbook", authorization: "active", scheduling: "enabled" }];
   assert.deepEqual(await resolveDeviceRoute(registryWith(single), undefined, "legacy"), {
