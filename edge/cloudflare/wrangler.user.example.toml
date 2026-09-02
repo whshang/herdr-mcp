@@ -35,9 +35,15 @@ new_sqlite_classes = ["OAuthStoreDO"]
 tag = "v3"
 new_sqlite_classes = ["DeviceRegistryDO"]
 
-# Optional private Worker-only artifact relay. Core Herdr does not require R2.
-# Enabling this feature requires an R2 subscription/payment setup and an R2-capable deploy token.
-# Keep the bucket private; never attach a public r2.dev domain.
+# Optional artifact relay bucket. R2 is NOT part of the core install: the core
+# Worker deploys and runs correctly without any R2 binding or permission, and
+# artifact relay endpoints report artifact_relay_disabled while it is absent.
+# Enable it only when the user explicitly wants the optional artifact relay:
+# 1. uncomment this block and choose a unique bucket name per Worker/account;
+# 2. grant the token Account -> Workers R2 Storage -> Edit (plus any R2
+#    billing/subscription step Cloudflare requires);
+# 3. run `node provision-r2.mjs --config wrangler.user.toml` before deploy.
+# Do not attach a public r2.dev domain or make this bucket publicly readable.
 # [[r2_buckets]]
 # binding = "ARTIFACT_BUCKET"
 # bucket_name = "herdr-edge-artifacts"

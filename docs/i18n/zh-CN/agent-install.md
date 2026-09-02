@@ -12,51 +12,46 @@ Agent 直接读取并执行本文，不需要用户再把本文包装成一段�
 
 1. 能自动化的 shell 步骤直接执行；只在 Cloudflare 交互登录 / API Token 创建，或多个 Account 选择时暂停。
 2. 不破坏已有工作。禁止对无关 checkout 做 `reset --hard`、`clean -fd` 或覆盖用户修改。
-3. 首次安装就确定一个 canonical public origin，并让 Worker OAuth、MCP 身份始终使用该入口。Link transport 不得因为连通性修复而静默改写 OAuth issuer。`workers.dev` 仍是无需 DNS 的 bootstrap 路径。只有用户明确选择 Custom Domain，或现有安装策略/配置能证明这一意图时，才从第一次部署使用自定义域名。连通性失败是暂停点，不代表 Agent 获得创建或修改 Custom Domain/DNS zone 的权限。
+3. 首次安装就确定一个 canonical public origin，并让 Worker OAuth、MCP、Link WSS 全部使用同一个入口。`workers.dev` 仍是无需 DNS 的 bootstrap 路径。只有用户明确选择 Custom Domain，或现有安装策略/配置能证明这一意图时，才从第一次部署使用自定义域名。连通性失败是暂停点，不代表 Agent 获得创建或修改 Custom Domain/DNS zone 的权限。
 4. Cloudflare Token 是高敏凭据。禁止回显或写入仓库、`.env`、普通日志、截图、shell history。优先进程环境注入；若必须落临时文件，用 mode `0600` 并在部署后立刻删除。
 5. 每个 mutation 后先验证再继续。出错时先判断 mutation 是否已经提交，再决定是否重试。
 6. **不要**用 clone 本仓库或 `npm`/`cargo` 安装本机 MCP runtime，除非用户明确要求贡献者/从源码开发会话。
 7. 如果网络、登录状态或第三方服务不可用，停止并向用户报告 blocker；不要自行搭代理、切网络节点、修改系统代理或发明绕过路径。
-
-## 0.5 Fleet 所有权闸门——任何 Cloudflare mutation 之前
-
-在请求 Cloudflare Token、命名 Worker、创建 R2、部署 Edge 或新建 ChatGPT Connector 之前，必须先确认 fleet 意图。新电脑本地 `~/.config/herdr-mcp` 为空，**不代表**这是用户的第一台 Herdr 电脑。
-
-- 如果用户已经提供 Herdr pairing address，这台电脑就是加入已有 Worker。安装/验证本机 runtime 与 macOS 权限后，执行 `herdr-mcp worker connect "<pairing-address>"`；CLI 默认使用 macOS Computer Name，只有用户明确要求不同的初始显示名时才传 `--name`。跳过 Worker/R2/Connector 创建。
-- 如果用户明确说已有另一台 Herdr 电脑但还没有 pairing address，在一台已授权的旧电脑上执行 `herdr-mcp worker pair`，然后在新电脑用 `worker connect` 消费这个一次性 pairing；复用已有公网 MCP/OAuth origin。
-- 只有用户明确确认这是第一台 Herdr 电脑/第一个 fleet，才继续下面的 first-owner Cloudflare 路径。
-- 如果意图不清楚，只问一个所有权问题：**创建第一个 Herdr Worker，还是加入已有 Herdr Worker？** 禁止根据本机缺少凭据自行推断。
-- pairing、旧 Worker 升级、hostname 连通性或权限失败都仍属于 existing-fleet 修复路径。除非用户明确改变 fleet 意图，否则禁止 fallback 到随机后缀的新 Worker、R2 桶或 Connector。
+8. 在任何 Cloudflare 部署之前先判定 fleet 意图。如果用户已有 Herdr Worker（已授权/已入列的电脑、已有的 ChatGPT Connector，或已提供 pairing address），按[多设备控制](existing-worker-connect.md)执行：在 owner 电脑上 `worker pair`，在本机 `worker connect`。绝不为迁就已有 fleet 而部署第二个 Worker、R2 桶或 Connector；也绝不把「本机没有本地 Edge 凭据」当成「不存在 Worker」的证据。
+9. 如果本机未配置且没有 pairing address，先问一个明确问题：这是第一台 Herdr 电脑，还是加入已有 Herdr Worker 的电脑？只有「第一台」才走下文的 Cloudflare 部署路径；「加入」走 `worker pair` + `worker connect`，本机不需要 Cloudflare token。
 
 ## 1. 前置条件
 
-先让当前 shell 看见标准用户级二进制目录，再运行 `herdr --version` 与 `herdr api schema >/dev/null`：
+运行 `herdr --version` 与 `herdr api schema >/dev/null`。需要可用的 `herdr` 与 Herdr socket（默认 `~/.config/herdr/herdr.sock`，或显式 `HERDR_SOCKET_PATH`）。若 Herdr 本身未安装/未运行，停下来并引导用户到 <https://herdr.dev>；herdr-mcp 不替代 Herdr。
 
-```bash
-HERDR_PATH_BEFORE="$(command -v herdr 2>/dev/null || true)"
-export PATH="$HOME/.local/bin:$PATH"
-hash -r 2>/dev/null || true
-herdr --version
-herdr api schema >/dev/null
-```
-
-需要可用的 `herdr` 与 Herdr socket（默认 `~/.config/herdr/herdr.sock`，或显式 `HERDR_SOCKET_PATH`）。如果 `HERDR_PATH_BEFORE` 为空，但 `~/.local/bin/herdr` 已经存在，应判定为 shell PATH 缺陷，而不是“Herdr 未安装”。zsh 只有在新的交互 shell 仍找不到 Herdr 时才修复：
-
-```bash
-if [ -x "$HOME/.local/bin/herdr" ] && ! zsh -ic 'command -v herdr >/dev/null 2>&1'; then
-  line='export PATH="$HOME/.local/bin:$PATH"'
-  grep -Fqx "$line" "$HOME/.zshrc" 2>/dev/null || printf '\n%s\n' "$line" >> "$HOME/.zshrc"
-fi
-zsh -ic 'command -v herdr && herdr --version'
-```
-
-如果 Herdr 确实缺失，Agent 直接安装官方稳定版：
+如果 Herdr 缺失，Agent 直接安装官方稳定版：
 
 ```bash
 curl -fsSL https://herdr.dev/install.sh | sh
 ```
 
 Windows 使用 `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"`。安装后重新检查健康状态。
+
+### PATH preflight：实际可执行文件与 shell PATH 分开检测
+
+在任何安装步骤之前做一次，安装完成后再做一次：
+
+1. 检查真实二进制：`ls -l ~/.local/bin/herdr-mcp ~/.local/bin/herdr`，存在则先用绝对路径执行。
+2. 单独检查用户交互 shell 的 PATH：`zsh -ic 'command -v herdr-mcp'`（或用户的登录 shell）。二进制存在但 `command -v` 为空，属于 **`installed_but_not_on_shell_path`**，不是「未安装」——不要重装，也不要制造第二个 PATH owner 或指向仓库的用户 CLI。
+3. 按顺序自修复：先 `export PATH="$HOME/.local/bin:$PATH"` 让当前进程不被阻塞；再持久化修复——先 `grep -q '.local/bin' ~/.zshrc` 确认不存在，才向 `~/.zprofile`/`~/.zshrc` 幂等追加同一行 `export`。如果不应修改 shell 启动配置，明确说明原因，并继续使用绝对路径。
+4. 继续之前用两个面证明：当前 shell 执行 `herdr-mcp --version`，新登录 shell 执行 `zsh -lc 'command -v herdr-mcp'`。否则 Agent 会话结束后就会出现 `command not found`。
+
+### macOS 权限 preflight：在后台服务安装之前验证 TCC/FDA
+
+权限检查要放在 onboarding 前段——Cloudflare 工作之前——而不是装完才发现：
+
+```bash
+herdr-mcp permissions status
+herdr-mcp permissions verify
+herdr-mcp doctor
+```
+
+`doctor` 权限结果为 `needs_setup`、`denied`、`unknown` 或 `timeout` 时，现在就停下来修复，不得当作健康。提前一次性完成稳定 TCC broker 的完全磁盘访问授权，才能避免之后 runtime、Herdr socket、项目访问反复逐路径弹权限。不要用 `sudo` 代替 broker 授权。
 
 Node.js 只用于临时 Cloudflare Worker 引导（`npx wrangler`）和可选贡献者工具链，**不是**运行本机 MCP runtime 的依赖。
 
@@ -83,21 +78,25 @@ macOS v0.4.3+ 首次安装还会准备固定的 `~/.config/herdr-mcp/tcc-broker/
 
 ## 3. 在内存中生成身份，不要打印秘密
 
-在 Agent 内存中生成：`HERDR_MCP_TOKEN`、`LINK_SHARED_SECRET`，以及限制在 `[A-Za-z0-9_.-]`、最长 64 字符的 `WORKSTATION_ID`。有临时 Edge checkout 时，`WORKER_NAME` 只能通过仓库 helper 生成，Agent 不得自造 hostname slug：
+在 Agent 内存中生成：`HERDR_MCP_TOKEN` 与 `LINK_SHARED_SECRET`。**不要**自造 `WORKSTATION_ID`/device id。设备身份契约归 runtime 所有：不可变的 `device_id` 形如 `dev_` + 一个 canonical 26 字符 Crockford ULID（例如 `dev_01ARZ3NDEKTSV4RRFFQ69G5FAV`），在 onboarding/pairing 时自动生成。hostname 派生的自由格式 workstation 标识只是遗留部署变量，不是设备身份——pairing 会生成并校验真正的那个。
+
+人类可读的电脑名（例如 macOS Computer Name）是独立的显示名。它默认作为 `worker connect` 的 `--name`，之后可用 `worker rename` 改名，永远不会改变不可变的 `device_id`。
+
+有临时 Edge checkout 时，`WORKER_NAME` 只能通过仓库 helper 生成，Agent 不得自造 hostname slug：
 
 ```bash
 WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 ```
 
-`WORKER_NAME` 与 `WORKSTATION_ID` 故意使用不同语法。helper 会把 hostname 小写，把 `[a-z0-9-]` 以外字符安全替换，压缩/修剪 `-`，并保证完整 Worker 名不超过 63 且匹配 `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`。例如 `MacBook.local` → `herdr-edge-macbook-local`。秘密用 `openssl rand -hex 32` 一类强随机；最终报告不得包含秘密。
+helper 会把 hostname 小写，把 `[a-z0-9-]` 以外字符安全替换，压缩/修剪 `-`，并保证完整 Worker 名不超过 63 且匹配 `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`。例如 `MacBook.local` → `herdr-edge-macbook-local`。`WORKER_NAME`（Cloudflare Worker 命名）与 `dev_<ULID>` 设备身份故意使用不同语法。秘密用 `openssl rand -hex 32` 一类强随机；最终报告不得包含秘密。
 
 ## 4. Cloudflare 授权暂停
 
 有浏览器控制时打开 <https://dash.cloudflare.com/profile/api-tokens>；否则把该 URL 交给用户。
 
-最简单的核心安装路径是 Cloudflare 当前的 **Edit Cloudflare Workers** 模板，限定到本次安装使用的单个 Account。核心安装**不要**额外申请 DNS Write 或 R2 权限。
+最简单支持路径是 Cloudflare 当前的 **Edit Cloudflare Workers** 模板，限定到本次安装使用的单个 Account。**核心安装不需要 R2**：默认部署是 `workers.dev` 上的 Workers + Durable Objects，不能因为未开通 R2 或账户没绑卡而失败。只有用户明确启用可选 artifact relay（§6）时才加 Account → **Workers R2 Storage → Edit**。**不要**加 DNS Write。不要超出所选路径实际需要的权限。
 
-更紧的自定义 token 至少保留 Account → **Workers Scripts → Write/Edit**、Account → **Account Settings → Read**、User → **Memberships → Read**、User → **User Details → Read**。`workers.dev` bootstrap 不需要 Zone/DNS 权限。只有用户明确启用可选的私有 artifact 中继时，才需要 **Workers R2 Storage → Edit**。
+更紧的自定义 token 至少保留 Account → **Workers Scripts → Write/Edit**、Account → **Account Settings → Read**、User → **Memberships → Read**、User → **User Details → Read**。读取账户 `workers.dev` subdomain 需要 `Account Settings → Read`。用户之后启用 artifact relay 时再加 Account → **Workers R2 Storage → Edit**。`workers.dev` bootstrap 不需要 Zone/DNS 权限。
 
 告知用户秘密只显示一次，并要求只粘贴到当前本地 Agent 会话；有专用密输通道时优先使用。
 
@@ -107,7 +106,17 @@ WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
 
 - 一个 Account → 自动选择；
 - 多个 Account → 只问要用哪个 Account 名；
-- Token 无效/权限不足 → 停止 mutation 并说明缺什么权限。
+- Token 无效/权限不足 → 停止 mutation 并指出具体缺哪个权限。
+
+Token 可以验证为**有效**（`/user/tokens/verify` 返回 active）却仍在具体调用上得到 `403`——这说明缺权限，不是 token 坏了。先把失败调用映射到权限，再补授权，不要盲目重建一个更大的 token：
+
+- `GET .../workers/subdomain` 返回 403 → 缺 **Account Settings → Read**；
+- `wrangler deploy` / Workers Scripts 调用失败 → 缺 **Workers Scripts → Edit**；
+- R2 桶 provisioning 失败 → 未授予可选的 **Workers R2 Storage → Edit**（核心安装本来就不需要；只有用户明确启用 artifact relay 时才算错误）。
+
+按权限诊断，不要无根据扩大权限；补齐权限之前不要重试 mutation。
+
+**部署前的已有 Worker 检测。** 拿到 `ACCOUNT_ID` 后先列 `GET /client/v4/accounts/<ACCOUNT_ID>/workers/scripts`。如果那里已有 Herdr Worker——或用户已有 Herdr 的 ChatGPT Connector——立即停止部署路径，切换到[多设备控制](existing-worker-connect.md)的既有 fleet 流程（owner 电脑 `worker pair`，本机 `worker connect`）。只有 §0 得到明确「第一台」答复后才允许部署新 Worker。
 
 选定后只把 account ID 放在当前部署进程环境：
 
@@ -134,15 +143,20 @@ Content-Type: application/json
 
 仅为 Edge 部署获取 Worker 源码（临时 shallow clone 或与 Release 相邻的文档包均可）。从已发布的 user example 生成被忽略的 `wrangler.user.toml`，设置 `name`、`DEFAULT_WORKSTATION_ID`、`OAUTH_ISSUER=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`。保持 `workers_dev = true` 与 `routes = []`。
 
-直接部署核心 Worker。发布的 user template 默认没有启用 R2 binding，因此全新核心安装不会创建 R2 桶，也不要求开通 R2 订阅/支付方式。
+**R2 可选，默认关闭。** 核心安装保持 `wrangler.user.toml` 中的 `[[r2_buckets]]` 注释状态，已发布的 user example 就是这样发布的。Edge 代码把 `ARTIFACT_BUCKET` 视为可选，核心部署必须在 Workers Free、无 R2、无绑卡的情况下成功。只有用户明确启用可选 artifact relay 时：取消注释该绑定、确认 token 有 **Workers R2 Storage → Edit**（以及 Cloudflare 要求的 R2 计费步骤），并在部署前执行 provisioning。绑定的桶不存在时 `wrangler deploy` 会 fail-closed——这正是默认路径不发布该绑定的原因。R2 保持关闭时，跳过 provisioning 直接部署：
 
 ```bash
 npx wrangler deploy --config wrangler.user.toml
 ```
 
-如果用户以后明确启用可选的私有 artifact 中继，再增加 `ARTIFACT_BUCKET` binding、使用具备 R2 权限的部署凭据，并在重新部署前执行 `node provision-r2.mjs --config wrangler.user.toml`。桶必须保持私有。
+artifact relay 启用（仅可选路径）：
 
-除非能证明拥有权，否则不要覆盖已有 Worker。如果目标名称已存在，先停下来判断它是不是用户已有的 Herdr Worker；**禁止**为了绕过所有权确认而直接创建随机后缀 Worker。只有用户明确确认 first-fleet，且能证明已有 Worker 与本次无关时，才选择新的唯一 Worker 名。然后把 WSS 共享秘密存为 Worker secret：
+```bash
+node provision-r2.mjs --config wrangler.user.toml
+npx wrangler deploy --config wrangler.user.toml
+```
+
+除非能证明拥有权，否则不要覆盖已有 Worker；改用机器相关/随机后缀名。然后把 WSS 共享秘密存为 Worker secret：
 
 ```bash
 printf '%s' "$LINK_SHARED_SECRET" | npx wrangler secret put LINK_SHARED_SECRET --config wrangler.user.toml
@@ -184,7 +198,16 @@ Link 可以复用用户环境里**已经存在**的代理配置。识别优先�
 
 ## 9. 验证闭环
 
-验证本机 `server/discover`、`herdr-mcp status`、`herdr-mcp doctor`、Link status、Worker `/health`、公网 `/mcp`、OAuth discovery，并确认未创建 Custom Domain/DNS/Tunnel。doctor 可在不发送 token 的前提下探测 Edge `/health`、OAuth metadata、`/mcp`；永远不要打印 token。
+验证本机 `server/discover`、`herdr-mcp status`、`herdr-mcp doctor`、Link status、Worker `/health`、公网 `/mcp`、OAuth discovery，并确认默认 `workers.dev` bootstrap 没有创建 Custom Domain/DNS/Tunnel（Custom Domain 只在用户明确要求时添加，见 §0）。doctor 可在不发送 token 的前提下探测 Edge `/health`、OAuth metadata、`/mcp`；永远不要打印 token。
+
+### 区分 Worker 健康与 hostname/网络路径健康
+
+一类探测证明不了两件事，要分开读：
+
+- **Worker 代码健康**：origin 对 `GET /health` 返回 200，未认证的 `GET /mcp` 返回预期的 401。这证明已部署的 Worker、路由与 OAuth metadata——无论哪个 hostname 应答。
+- **hostname/DNS/网络路径故障**：超时、DNS 解析失败、TLS/SNI 失败或被过滤，而同一 Worker 的另一个 hostname 可用（例如 `*.workers.dev` 超时而该 Worker 的 Custom Domain 返回 200，或相反）。这是传输路径问题，不是 Worker 缺陷：绝不用重新部署 Worker 或创建第二个 Worker/R2/Connector 来「修」它。
+
+用户有想用的域名时，优先把 Custom Domain 作为稳定 production origin（显式配置，OAuth issuer 在客户端接入前设置好）；否则继续以 `workers.dev` 为 production origin，网络路径问题交给后续 Link transport fallback 阶梯（direct → 已验证本地代理 → 共享 relay）。连通性修复不得顺带改名或迁移 OAuth issuer。
 
 ## 10. 清理 bootstrap Token
 
