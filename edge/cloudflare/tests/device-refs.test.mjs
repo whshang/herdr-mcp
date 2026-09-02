@@ -124,11 +124,13 @@ test("wrapResultWithDevice retains device_id in opaque refs for device-routed ca
   };
   const wrapped = wrapResultWithDevice(result, DEV_A, "macbook");
   assert.ok(isDeviceAwareRef(wrapped.workspaces[0].workspace_id));
-  assert.equal(decodeDeviceRef(wrapped.workspaces[0].workspace_id_ref).d, DEV_A);
-  assert.equal(wrapped.workspaces[0].workspace_id, wrapped.workspaces[0].workspace_id_ref);
-  assert.equal(decodeDeviceRef(wrapped.panes[0].pane_id_ref).d, DEV_A);
-  assert.equal(wrapped.panes[0].pane_id, wrapped.panes[0].pane_id_ref);
-  assert.equal(decodeDeviceRef(wrapped.panes[0].workspace_id_ref).d, DEV_A);
+  assert.equal(decodeDeviceRef(wrapped.workspaces[0].workspace_id).d, DEV_A);
+  assert.ok(isDeviceAwareRef(wrapped.panes[0].pane_id));
+  assert.equal(decodeDeviceRef(wrapped.panes[0].pane_id).d, DEV_A);
+  assert.equal(decodeDeviceRef(wrapped.panes[0].workspace_id).d, DEV_A);
+  assert.equal(decodeDeviceRef(wrapped.agents[0].pane_id).d, DEV_A);
+  assert.equal(decodeDeviceRef(wrapped.agents[0].workspace_id).d, DEV_A);
+  assert.equal(Object.hasOwn(wrapped.workspaces[0], "workspace_ref"), false);
   assert.equal(wrapped.device_id, DEV_A);
   assert.equal(wrapped.device_name, "macbook");
   // legacy null device leaves result unwrapped
@@ -149,17 +151,16 @@ test("wrapResultWithDevice handles real CallToolResult shape and preserves image
   };
   const wrapped = wrapResultWithDevice(callResult, DEV_A, "macbook");
   assert.ok(isDeviceAwareRef(wrapped.structuredContent.workspaces[0].workspace_id));
-  assert.equal(decodeDeviceRef(wrapped.structuredContent.workspaces[0].workspace_id_ref).d, DEV_A);
-  assert.equal(
-    wrapped.structuredContent.workspaces[0].workspace_id,
-    wrapped.structuredContent.workspaces[0].workspace_id_ref,
-  );
-  assert.equal(decodeDeviceRef(wrapped.structuredContent.panes[0].pane_id_ref).d, DEV_A);
+  assert.equal(decodeDeviceRef(wrapped.structuredContent.workspaces[0].workspace_id).d, DEV_A);
+  assert.ok(isDeviceAwareRef(wrapped.structuredContent.panes[0].pane_id));
+  assert.equal(decodeDeviceRef(wrapped.structuredContent.panes[0].pane_id).d, DEV_A);
   assert.equal(wrapped.structuredContent.device_id, DEV_A);
   assert.equal(wrapped.structuredContent.device_name, "macbook");
   const textPayload = JSON.parse(wrapped.content[0].text);
   assert.equal(textPayload.device_id, DEV_A);
   assert.equal(textPayload.device_name, "macbook");
+  assert.equal(textPayload.workspaces[0].workspace_id, "w1");
+  assert.equal(decodeDeviceRef(textPayload.workspaces[0].workspace_ref).d, DEV_A);
   assert.equal(wrapped.content.length, 2);
   assert.equal(wrapped.content[1].type, "image");
   assert.equal(wrapped.content[1].data, "base64...");
@@ -277,8 +278,7 @@ test("follow-up tool calls with device-aware opaque ref route to same device bef
   const r1 = await handleMcp({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "herdr_inspect", arguments: { device: DEV_A } } }, "legacy", deps);
   // r1 must return wrapped ids inside structuredContent and preserve image content without leaking device_id into text
   const sc1 = r1.body.result.structuredContent;
-  const wrappedId = sc1.workspaces[0].workspace_id_ref;
-  assert.equal(sc1.workspaces[0].workspace_id, wrappedId);
+  const wrappedId = sc1.workspaces[0].workspace_id;
   assert.ok(isDeviceAwareRef(wrappedId));
   assert.equal(decodeDeviceRef(wrappedId).d, DEV_A);
   assert.equal(sc1.device_id, DEV_A);
@@ -320,6 +320,75 @@ test("explicit device plus opaque ref to different device fails closed", async (
   assert.ok(r.body.result.structuredContent.code === "device_ref_conflict" || r.body.result.structuredContent.code === "device_ambiguous");
 });
 
+test("private text transfer requires explicit device and rejects ref-derived routing", async () => {
+  const devices = [
+    { device_id: DEV_A, workstation_id: "ws-a", name: "a", authorization: "active", scheduling: "enabled" },
+    { device_id: DEV_B, workstation_id: "ws-b", name: "b", authorization: "active", scheduling: "enabled" },
+  ];
+  let forwards = 0;
+  const deps = {
+    limits: makeLimits(),
+    logger: { warn() {} },
+    getStub: (id) => ({ workstationId: id }),
+    resolveDevice: async (sel, args) => resolveDeviceRouteWithContext(registryWith(devices), { selector: sel, args, legacyWorkstationId: "legacy" }),
+    forward: async () => {
+      forwards += 1;
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: { status: "ok", result: { content: [{ type: "text", text: JSON.stringify({ ok: true }) }] } },
+      }), { headers: { "content-type": "application/json" } });
+    },
+    now: () => 1000,
+  };
+
+  const missingDevice = await handleMcp({
+    jsonrpc: "2.0",
+    id: 11,
+    method: "tools/call",
+    params: {
+      name: "herdr_call",
+      arguments: { method: "herdr_mcp.text.write", params: JSON.stringify({ path: "/tmp/demo", content: "hello", sha256: "abc" }) },
+    },
+  }, "legacy", deps);
+  assert.equal(missingDevice.body.result.isError, true);
+  assert.equal(missingDevice.body.result.structuredContent.code, "device_required");
+  assert.equal(forwards, 0);
+
+  const forgedRef = encodeDeviceRef(DEV_B, "w1");
+  const refRouted = await handleMcp({
+    jsonrpc: "2.0",
+    id: 12,
+    method: "tools/call",
+    params: {
+      name: "herdr_call",
+      arguments: {
+        device: DEV_A,
+        method: "herdr_mcp.text.write",
+        params: JSON.stringify({ path: "/tmp/demo", content: "hello", sha256: "abc", workspace: forgedRef }),
+      },
+    },
+  }, "legacy", deps);
+  assert.equal(refRouted.body.result.isError, true);
+  assert.equal(refRouted.body.result.structuredContent.code, "device_ref_not_allowed");
+  assert.equal(forwards, 0);
+
+  const explicit = await handleMcp({
+    jsonrpc: "2.0",
+    id: 13,
+    method: "tools/call",
+    params: {
+      name: "herdr_call",
+      arguments: {
+        device: DEV_A,
+        method: "herdr_mcp.text.write",
+        params: JSON.stringify({ path: "/tmp/demo", content: "hello", sha256: "abc" }),
+      },
+    },
+  }, "legacy", deps);
+  assert.equal(explicit.body.result.isError, undefined);
+  assert.equal(forwards, 1);
+});
+
 test("mcp handler exposes device metadata in ChatGPT text", async () => {
   const deps = {
     limits: makeLimits(),
@@ -347,5 +416,6 @@ test("mcp handler exposes device metadata in ChatGPT text", async () => {
   const r = await handleMcp({ jsonrpc: "2.0", id: 20, method: "tools/call", params: { name: "herdr_fs_read", arguments: { device: DEV_A, path: "/repo/file.txt" } } }, "legacy", deps);
   const text = JSON.parse(r.body.result.content[0].text);
   assert.equal(text.device_id, DEV_A, "device_id must appear in ChatGPT-visible text");
-  assert.equal(decodeDeviceRef(text.result.workspaces[0].workspace_id).d, DEV_A, "workspace ref must retain device affinity");
+  assert.equal(text.result.workspaces[0].id, "w1", "workspace id must remain bare in text-visible JSON");
+  assert.equal(decodeDeviceRef(text.result.workspaces[0].workspace_ref).d, DEV_A, "workspace ref must retain device affinity");
 });

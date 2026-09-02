@@ -267,9 +267,9 @@ export function unwrapDeviceRefs(args: Record<string, unknown>): Record<string, 
  * call was routed to a specific device. This ensures follow-up calls retain
  * device affinity without trusting arbitrary path strings.
  * Handles both plain result objects and full MCP CallToolResult shapes.
- * Existing structured id fields remain device-aware exactly as before; 0.4.4
- * also exposes sibling *_ref fields and mirrors the same routing metadata into
- * JSON text blocks so text-oriented MCP clients do not lose affinity.
+ * Existing structured id fields remain device-aware exactly as before. 0.4.4
+ * mirrors routing metadata into JSON text blocks additively: bare ids stay bare
+ * there and sibling pane_ref/workspace_ref fields carry device affinity.
  */
 export function wrapResultWithDevice(result: unknown, deviceId: string | null, deviceName?: string): unknown {
   if (!deviceId || !result || typeof result !== "object") return result;
@@ -283,66 +283,66 @@ export function wrapResultWithDevice(result: unknown, deviceId: string | null, d
     return value;
   }
 
-  function wrapContainer(container: Record<string, unknown>): void {
+  function wrapStructuredContainer(container: Record<string, unknown>): void {
     if (Array.isArray(container.workspaces)) {
-      const ws = container.workspaces as Array<Record<string, unknown>>;
-      for (const entry of ws) {
+      const workspaces = container.workspaces as Array<Record<string, unknown>>;
+      for (const entry of workspaces) {
         const id = (entry.workspace_id ?? entry.id) as string | undefined;
-        if (typeof id === "string") {
-          const ref = wrapId(id);
-          entry.workspace_id = ref;
-          entry.workspace_id_ref = ref;
-        }
+        if (typeof id === "string") entry.workspace_id = wrapId(id);
       }
     }
     if (Array.isArray(container.panes)) {
       const panes = container.panes as Array<Record<string, unknown>>;
       for (const entry of panes) {
-        if (typeof entry.pane_id === "string") {
-          const ref = wrapId(entry.pane_id as string);
-          entry.pane_id = ref;
-          entry.pane_id_ref = ref;
-        }
-        if (typeof entry.workspace_id === "string") {
-          const ref = wrapId(entry.workspace_id as string);
-          entry.workspace_id = ref;
-          entry.workspace_id_ref = ref;
-        }
+        if (typeof entry.pane_id === "string") entry.pane_id = wrapId(entry.pane_id);
+        if (typeof entry.workspace_id === "string") entry.workspace_id = wrapId(entry.workspace_id);
       }
     }
     if (Array.isArray(container.agents)) {
       const agents = container.agents as Array<Record<string, unknown>>;
       for (const entry of agents) {
-        if (typeof entry.pane_id === "string") {
-          const ref = wrapId(entry.pane_id as string);
-          entry.pane_id = ref;
-          entry.pane_ref = ref;
-        }
-        if (typeof entry.workspace_id === "string") {
-          const ref = wrapId(entry.workspace_id as string);
-          entry.workspace_id = ref;
-          entry.workspace_ref = ref;
-        }
-        if (typeof entry.pane === "string") {
-          const ref = wrapId(entry.pane as string);
-          entry.pane = ref;
-          entry.pane_ref = ref;
-        }
-        if (typeof entry.workspace === "string") {
-          const ref = wrapId(entry.workspace as string);
-          entry.workspace = ref;
-          entry.workspace_ref = ref;
-        }
+        if (typeof entry.pane_id === "string") entry.pane_id = wrapId(entry.pane_id);
+        if (typeof entry.workspace_id === "string") entry.workspace_id = wrapId(entry.workspace_id);
+        if (typeof entry.pane === "string") entry.pane = wrapId(entry.pane);
+        if (typeof entry.workspace === "string") entry.workspace = wrapId(entry.workspace);
       }
     }
     if (Array.isArray(container.tabs)) {
       const tabs = container.tabs as Array<Record<string, unknown>>;
       for (const entry of tabs) {
-        if (typeof entry.workspace_id === "string") {
-          const ref = wrapId(entry.workspace_id as string);
-          entry.workspace_id = ref;
-          entry.workspace_id_ref = ref;
-        }
+        if (typeof entry.workspace_id === "string") entry.workspace_id = wrapId(entry.workspace_id);
+      }
+    }
+  }
+
+  function addTextRefs(container: Record<string, unknown>): void {
+    if (Array.isArray(container.workspaces)) {
+      const workspaces = container.workspaces as Array<Record<string, unknown>>;
+      for (const entry of workspaces) {
+        const id = (entry.workspace_id ?? entry.id) as string | undefined;
+        if (typeof id === "string") entry.workspace_ref = wrapId(id);
+      }
+    }
+    if (Array.isArray(container.panes)) {
+      const panes = container.panes as Array<Record<string, unknown>>;
+      for (const entry of panes) {
+        if (typeof entry.pane_id === "string") entry.pane_ref = wrapId(entry.pane_id);
+        if (typeof entry.workspace_id === "string") entry.workspace_ref = wrapId(entry.workspace_id);
+      }
+    }
+    if (Array.isArray(container.agents)) {
+      const agents = container.agents as Array<Record<string, unknown>>;
+      for (const entry of agents) {
+        const paneId = (entry.pane_id ?? entry.pane) as string | undefined;
+        const workspaceId = (entry.workspace_id ?? entry.workspace) as string | undefined;
+        if (typeof paneId === "string") entry.pane_ref = wrapId(paneId);
+        if (typeof workspaceId === "string") entry.workspace_ref = wrapId(workspaceId);
+      }
+    }
+    if (Array.isArray(container.tabs)) {
+      const tabs = container.tabs as Array<Record<string, unknown>>;
+      for (const entry of tabs) {
+        if (typeof entry.workspace_id === "string") entry.workspace_ref = wrapId(entry.workspace_id);
       }
     }
   }
@@ -361,18 +361,18 @@ export function wrapResultWithDevice(result: unknown, deviceId: string | null, d
   if (Array.isArray(clone.content)) {
     if (isRecord(clone.structuredContent)) {
       const structured = clone.structuredContent as Record<string, unknown>;
-      wrapContainer(structured);
+      wrapStructuredContainer(structured);
       addProvenance(structured);
     }
-    wrapContainer(clone);
+    wrapStructuredContainer(clone);
     addProvenance(clone);
     for (const block of clone.content as Array<Record<string, unknown>>) {
       if (block.type !== "text" || typeof block.text !== "string") continue;
       try {
         const parsed = JSON.parse(block.text) as unknown;
         if (!isRecord(parsed)) continue;
-        wrapContainer(parsed);
-        if (isRecord(parsed.result)) wrapContainer(parsed.result);
+        addTextRefs(parsed);
+        if (isRecord(parsed.result)) addTextRefs(parsed.result);
         addProvenance(parsed);
         block.text = JSON.stringify(parsed);
       } catch { /* preserve non-JSON text */ }
@@ -380,10 +380,10 @@ export function wrapResultWithDevice(result: unknown, deviceId: string | null, d
     return clone;
   }
   if (isRecord(clone.structuredContent)) {
-    wrapContainer(clone.structuredContent as Record<string, unknown>);
+    wrapStructuredContainer(clone.structuredContent as Record<string, unknown>);
     addProvenance(clone.structuredContent as Record<string, unknown>);
   }
-  wrapContainer(clone);
+  wrapStructuredContainer(clone);
   addProvenance(clone);
   return clone;
 }
