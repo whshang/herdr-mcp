@@ -39,7 +39,7 @@ Then run `herdr --version` again. Herdr's own install behavior is authoritative 
 
 ## Supported platform boundary
 
-Current published stable runtime is **`v0.4.2`**. The stable macOS TCC broker has completed cross-generation authorization verification; Developer ID signing is optional hardening. The v0.4.3 install path preserves the same broker compatibility revision and ensures the fixed broker exists before the rotating runtime service starts. An interactive first install opens **Full Disk Access** for that broker; macOS still requires the user to grant the permission explicitly. `herdr-mcp permissions setup` reopens the same panel and `herdr-mcp permissions verify` checks access. Runtime generation updates never rewrite a same-revision broker. The strongest clean-machine qualification evidence remains the `v0.4.0` **macOS Apple Silicon** run. A Windows x64 release binary is available, while Windows end-to-end UAT is still being completed. Linux is not yet claimed as a supported current-stable herdr-mcp runtime surface.
+Current published stable runtime is **`v0.4.3`**. The stable macOS TCC broker has completed cross-generation authorization verification; Developer ID signing is optional hardening. The v0.4.3 install path preserves the same broker compatibility revision and ensures the fixed broker exists before the rotating runtime service starts. An interactive first install opens **Full Disk Access** for that broker; macOS still requires the user to grant the permission explicitly. `herdr-mcp permissions setup` reopens the same panel and `herdr-mcp permissions verify` checks access. Runtime generation updates never rewrite a same-revision broker. The strongest clean-machine qualification evidence remains the `v0.4.0` **macOS Apple Silicon** run. A Windows x64 release binary is available, while Windows end-to-end UAT is still being completed. Linux is not yet claimed as a supported current-stable herdr-mcp runtime surface.
 
 On macOS, v0.4.3 also separates production device credentials from rotating runtime code. Keychain reads/writes go through the fixed `~/.config/herdr-mcp/herdr-mcp-credential-helper`. An existing installation may require one explicit macOS Keychain approval when this helper is introduced; that preflight happens before service/Link mutation and fails safely if the prompt is ignored or denied. Ordinary runtime updates preserve the same helper compatibility revision, so a new `runtime/generations/rust-*` binary does not become a new Keychain client on every upgrade. This credential helper is independent from the Full Disk Access/TCC broker above.
 
@@ -144,7 +144,7 @@ See [ChatGPT Connector](chatgpt-connector.md).
 
 The browser extension adds Side Panel Control Center, workspace binding, long-conversation continuity, and queued next-turn messages. It is not required for the base MCP loop.
 
-The extension has three identities: **STORE / STANDALONE / DEV**. Current stable v0.4.2 Native Host supports Store/DEV ownership; v0.4.3+ introduces the fixed-identity STANDALONE path for GitHub/manual distribution.
+The extension has three identities: **STORE / STANDALONE / DEV**. The v0.4.2 Native Host supports Store/DEV ownership; v0.4.3+ adds the fixed-identity STANDALONE path for GitHub/manual distribution.
 
 - STORE: default ordinary-user path, fixed Chrome Web Store identity and Store updates;
 - STANDALONE: v0.4.3+, fixed non-Store identity for independent/GitHub distribution;
