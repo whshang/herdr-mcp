@@ -1044,6 +1044,30 @@ mod tests {
     }
 
     #[test]
+    fn split_edge_layer_keeps_public_origin_upstream_and_plist_evidence_distinct() {
+        let edge = EdgeConfigView {
+            host: "custom.example".to_owned(),
+            origin: "https://custom.example".to_owned(),
+            plist: Some(PathBuf::from(
+                "/Users/test/Library/LaunchAgents/dev.herdr-mcp.link-prod.plist",
+            )),
+            source: EdgeConfigSource::ConfigToml,
+            label: Some("dev.herdr-mcp.link-prod".to_owned()),
+        };
+        let config = Config {
+            edge_public_origin: Some("https://custom.example".to_owned()),
+            edge_link_upstream_origin: Some("https://backend.workers.dev".to_owned()),
+            ..Config::default()
+        };
+
+        let formatted = format_edge_configured_layer(&Some(edge), &config);
+        assert!(formatted.contains("origin=https://custom.example"));
+        assert!(formatted.contains("upstream=https://backend.workers.dev"));
+        assert!(formatted.contains("dev.herdr-mcp.link-prod.plist"));
+        assert!(formatted.contains("label=dev.herdr-mcp.link-prod"));
+    }
+
+    #[test]
     fn unconfigured_edge_layer_names_missing_link_and_env() {
         let formatted = format_edge_configured_layer(&None, &Config::default());
         assert!(formatted.contains("unconfigured"));

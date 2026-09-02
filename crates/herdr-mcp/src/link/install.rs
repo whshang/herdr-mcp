@@ -827,6 +827,15 @@ mod tests {
     }
 
     #[test]
+    fn protected_mutation_guard_blocks_live_labels() {
+        let err = assert_not_protected_mutation(LINK_PROD_LABEL).expect_err("prod");
+        assert!(err.contains("protected"));
+        let err = assert_not_protected_mutation(LINK_LABEL).expect_err("link");
+        assert!(err.contains("protected"));
+        assert_not_protected_mutation(LINK_RUST_CANDIDATE_LABEL).unwrap();
+    }
+
+    #[test]
     fn refuse_delete_protects_live_plist_labels() {
         let home = test_home();
         let path = home.join("dev.herdr-mcp.link-prod.plist");
