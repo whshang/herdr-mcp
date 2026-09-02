@@ -93,7 +93,7 @@ Herdr 本身拥有大量 Socket API 方法。herdr-mcp 没有把它们逐个包�
 
 ## 18 个工具为什么够用
 
-workstation Runtime Execution Contract 当前固定为 **epoch 2 / 18 tools**；v0.4.3 的公共 Edge contract 是 **epoch 3 / 19 actions**，新增项仅为 Edge-local `herdr_devices`。设计目标是让模型容易选对工具，而不是让工具列表看起来壮观。
+workstation Runtime Execution Contract 当前固定为 **epoch 2 / 18 tools**；当前公共 Edge contract 仍是 **epoch 3 / 19 actions**，该 contract 自 v0.4.3 引入，新增项仅为 Edge-local `herdr_devices`。设计目标是让模型容易选对工具，而不是让工具列表看起来壮观。
 
 ### 1. 观察：我现在在哪
 

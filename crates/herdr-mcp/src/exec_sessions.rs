@@ -1,6 +1,8 @@
 use crate::exec_compact;
 use crate::herdr::HerdrClient;
-use crate::state_store::{ExecSessionFence, StateStore};
+use crate::state_store::{ClosedExecSessionRecord, ExecSessionFence, StateStore};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -72,6 +74,7 @@ enum SessionBackend {
         stdout_offset: Mutex<u64>,
         stderr_offset: Mutex<u64>,
     },
+    Completed,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +99,7 @@ struct Session {
 
 #[derive(Debug)]
 struct RegistryInner {
+    state_dir: PathBuf,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     recovered: Mutex<HashMap<String, String>>,
     state_store: Mutex<StateStore>,
@@ -112,6 +116,215 @@ struct RecoveryResult {
     reaped: usize,
     detached: usize,
     closed: usize,
+}
+
+const RECOVERY_SPOOL_CAP: usize = 64 * 1024;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SavedCompletionEvidence {
+    version: u32,
+    session_id: String,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+    truncated: bool,
+    stdout_tail: String,
+    stderr_tail: String,
+}
+
+fn exec_spool_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("exec-spools")
+}
+
+fn exec_spool_path(state_dir: &Path, session_id: &str) -> PathBuf {
+    exec_spool_dir(state_dir).join(format!("{}.spool", marker_safe_id(session_id)))
+}
+
+fn extract_stream_tail(buffers: &Buffers, stream: StreamKind, max_bytes: usize) -> Vec<u8> {
+    let mut chunks_data = Vec::new();
+    let mut total_len = 0usize;
+    for chunk in buffers.chunks.iter().rev() {
+        if chunk.stream == stream {
+            chunks_data.push(&chunk.data[..]);
+            total_len = total_len.saturating_add(chunk.data.len());
+            if total_len >= max_bytes {
+                break;
+            }
+        }
+    }
+    chunks_data.reverse();
+    let mut combined = Vec::with_capacity(total_len.min(max_bytes));
+    for slice in chunks_data {
+        combined.extend_from_slice(slice);
+    }
+    if combined.len() > max_bytes {
+        let skip = combined.len() - max_bytes;
+        combined[skip..].to_vec()
+    } else {
+        combined
+    }
+}
+
+fn write_session_spool(state_dir: &Path, session: &Session) -> Result<(), String> {
+    let spool_dir = exec_spool_dir(state_dir);
+    fs::create_dir_all(&spool_dir).map_err(|error| {
+        format!(
+            "cannot create exec spool directory {}: {error}",
+            spool_dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    let _ = fs::set_permissions(&spool_dir, fs::Permissions::from_mode(0o700));
+
+    let path = exec_spool_path(state_dir, &session.id);
+    let (stdout_tail, stderr_tail, stdout_bytes, stderr_bytes, truncated) = {
+        let Ok(buffers) = session.buffers.lock() else {
+            return Err("session buffers lock poisoned".to_owned());
+        };
+        let stdout_data = extract_stream_tail(&buffers, StreamKind::Stdout, RECOVERY_SPOOL_CAP);
+        let stderr_data = extract_stream_tail(&buffers, StreamKind::Stderr, RECOVERY_SPOOL_CAP);
+        let truncated = buffers.truncated
+            || buffers.stdout_bytes > RECOVERY_SPOOL_CAP
+            || buffers.stderr_bytes > RECOVERY_SPOOL_CAP;
+        (
+            BASE64.encode(&stdout_data),
+            BASE64.encode(&stderr_data),
+            buffers.stdout_bytes,
+            buffers.stderr_bytes,
+            truncated,
+        )
+    };
+
+    let artifact = SavedCompletionEvidence {
+        version: 1,
+        session_id: session.id.clone(),
+        stdout_bytes,
+        stderr_bytes,
+        truncated,
+        stdout_tail,
+        stderr_tail,
+    };
+
+    let payload = serde_json::to_vec(&artifact)
+        .map_err(|error| format!("cannot serialize session artifact {}: {error}", session.id))?;
+
+    let tmp_path = spool_dir.join(format!("{}.tmp", marker_safe_id(&session.id)));
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let mut file = options
+        .open(&tmp_path)
+        .map_err(|error| format!("cannot open tmp spool file {}: {error}", tmp_path.display()))?;
+    file.write_all(&payload)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "cannot write tmp spool file {}: {error}",
+                tmp_path.display()
+            )
+        })?;
+    #[cfg(unix)]
+    let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    drop(file);
+
+    fs::rename(&tmp_path, &path).map_err(|error| {
+        format!(
+            "cannot atomically commit spool file {}: {error}",
+            path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn load_session_from_spool_or_record(
+    state_dir: &Path,
+    record: &ClosedExecSessionRecord,
+) -> Arc<Session> {
+    let spool_path = exec_spool_path(state_dir, &record.session_id);
+    let mut chunks = Vec::new();
+    let mut stdout_bytes = 0;
+    let mut stderr_bytes = 0;
+    let mut truncated = false;
+
+    if let Ok(bytes) = fs::read(&spool_path)
+        && let Ok(artifact) = serde_json::from_slice::<SavedCompletionEvidence>(&bytes)
+        && artifact.version == 1
+        && artifact.session_id == record.session_id
+    {
+        let stdout_data = BASE64.decode(&artifact.stdout_tail).unwrap_or_default();
+        let stderr_data = BASE64.decode(&artifact.stderr_tail).unwrap_or_default();
+        stdout_bytes = stdout_data.len();
+        stderr_bytes = stderr_data.len();
+        let mut next_seq = 0u64;
+        if !stdout_data.is_empty() {
+            chunks.push(Chunk {
+                seq: next_seq,
+                stream: StreamKind::Stdout,
+                data: stdout_data,
+            });
+            next_seq = next_seq.saturating_add(1);
+        }
+        if !stderr_data.is_empty() {
+            chunks.push(Chunk {
+                seq: next_seq,
+                stream: StreamKind::Stderr,
+                data: stderr_data,
+            });
+        }
+        truncated = artifact.truncated;
+    }
+
+    let next_seq = chunks.last().map_or(0, |c| c.seq.saturating_add(1));
+    let buffers = Buffers {
+        chunks,
+        next_seq,
+        stdout_bytes,
+        stderr_bytes,
+        truncated,
+    };
+    let status = SessionStatus {
+        closed: true,
+        exit_code: record.exit_code,
+        signal: record.signal.clone(),
+        ended_at_ms: record.ended_at_ms,
+    };
+    Arc::new(Session {
+        id: record.session_id.clone(),
+        cwd: PathBuf::new(),
+        command: String::new(),
+        started_at_ms: record.started_at_ms,
+        pid: None,
+        backend: SessionBackend::Completed,
+        buffers: Mutex::new(buffers),
+        status: Mutex::new(status),
+    })
+}
+
+fn clean_expired_spools(state_dir: &Path, unexpired_session_ids: &HashSet<String>) {
+    let spool_dir = exec_spool_dir(state_dir);
+    if !spool_dir.exists() {
+        return;
+    }
+    let unexpired_safe_ids = unexpired_session_ids
+        .iter()
+        .map(|id| marker_safe_id(id))
+        .collect::<HashSet<_>>();
+    if let Ok(entries) = fs::read_dir(&spool_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("spool") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                    && !unexpired_safe_ids.contains(stem)
+                {
+                    let _ = fs::remove_file(&path);
+                }
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("tmp") {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -134,12 +347,36 @@ impl ExecRegistry {
         #[cfg(unix)]
         fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))
             .map_err(|error| format!("cannot secure exec state directory: {error}"))?;
+        let spool_dir = exec_spool_dir(&state_dir);
+        fs::create_dir_all(&spool_dir)
+            .map_err(|error| format!("cannot create exec spool directory: {error}"))?;
+        #[cfg(unix)]
+        let _ = fs::set_permissions(&spool_dir, fs::Permissions::from_mode(0o700));
+
         let state_store = StateStore::open_in_dir(&state_dir, "state.db")?;
-        state_store.prune_exec_sessions(now_ms())?;
+        let now = now_ms();
+        state_store.prune_exec_sessions(now)?;
         let recovery = recover_state_store(&state_store)?;
+
+        let unexpired_ids = state_store
+            .unexpired_exec_session_ids(now)
+            .unwrap_or_default();
+        clean_expired_spools(&state_dir, &unexpired_ids);
+
+        let closed_records = state_store
+            .closed_exec_sessions(now, RECOVERY_MAX_ENTRIES)
+            .unwrap_or_default();
+
+        let mut initial_sessions = HashMap::new();
+        for record in &closed_records {
+            let session = load_session_from_spool_or_record(&state_dir, record);
+            initial_sessions.insert(record.session_id.clone(), session);
+        }
+
         Ok(Self {
             inner: Arc::new(RegistryInner {
-                sessions: Mutex::new(HashMap::new()),
+                state_dir,
+                sessions: Mutex::new(initial_sessions),
                 recovered: Mutex::new(recovery.states),
                 state_store: Mutex::new(state_store),
                 client,
@@ -386,6 +623,7 @@ impl ExecRegistry {
             "running"
         };
         let elapsed_ms = session_elapsed_ms(&session, &status);
+        let is_recovered = matches!(session.backend, SessionBackend::Completed);
         let mut result = Map::new();
         result.insert("ok".to_owned(), json!(true));
         result.insert("session_id".to_owned(), json!(id));
@@ -393,6 +631,18 @@ impl ExecRegistry {
         result.insert("phase".to_owned(), json!(phase));
         result.insert("exit_code".to_owned(), json!(status.exit_code));
         result.insert("signal".to_owned(), json!(status.signal));
+        if is_recovered {
+            result.insert("recovered".to_owned(), json!(true));
+        }
+        if session.started_at_ms > 0 {
+            result.insert(
+                "started_at".to_owned(),
+                json!(iso_from_ms(session.started_at_ms)),
+            );
+        }
+        if let Some(ended_at_ms) = status.ended_at_ms {
+            result.insert("finished_at".to_owned(), json!(iso_from_ms(ended_at_ms)));
+        }
         result.insert("truncated".to_owned(), json!(truncated));
         result.insert("stream".to_owned(), json!(stream));
         result.insert("offset".to_owned(), json!(offset));
@@ -528,29 +778,49 @@ impl ExecRegistry {
     }
 
     fn session(&self, id: &str) -> Option<Arc<Session>> {
-        self.inner
-            .sessions
+        if let Ok(sessions) = self.inner.sessions.lock()
+            && let Some(session) = sessions.get(id)
+        {
+            return Some(Arc::clone(session));
+        }
+        let record = self
+            .inner
+            .state_store
             .lock()
             .ok()
-            .and_then(|sessions| sessions.get(id).cloned())
+            .and_then(|store| store.get_closed_exec_session(id).ok())
+            .flatten()?;
+        let session = load_session_from_spool_or_record(&self.inner.state_dir, &record);
+        if let Ok(mut sessions) = self.inner.sessions.lock() {
+            sessions.insert(id.to_owned(), Arc::clone(&session));
+        }
+        Some(session)
     }
 
     fn prune(&self) {
         let now = now_ms();
         if let Ok(mut sessions) = self.inner.sessions.lock() {
-            sessions.retain(|_, session| {
+            sessions.retain(|id, session| {
                 let status = session_status(session);
-                status
+                let keep = status
                     .ended_at_ms
-                    .is_none_or(|ended| now.saturating_sub(ended) <= SESSION_TTL_MS)
+                    .is_none_or(|ended| now.saturating_sub(ended) <= SESSION_TTL_MS);
+                if !keep {
+                    let spool_path = exec_spool_path(&self.inner.state_dir, id);
+                    let _ = fs::remove_file(spool_path);
+                }
+                keep
             });
         }
-        if let Ok(store) = self.inner.state_store.lock()
-            && store.prune_exec_sessions(now).is_err()
-        {
-            self.inner
-                .persistence_failures
-                .fetch_add(1, Ordering::Relaxed);
+        if let Ok(store) = self.inner.state_store.lock() {
+            if store.prune_exec_sessions(now).is_err() {
+                self.inner
+                    .persistence_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if let Ok(unexpired_ids) = store.unexpired_exec_session_ids(now) {
+                clean_expired_spools(&self.inner.state_dir, &unexpired_ids);
+            }
         }
     }
 }
@@ -562,21 +832,36 @@ fn session_view(session: &Arc<Session>) -> Value {
         .lock()
         .map(|buffers| buffers.truncated)
         .unwrap_or(false);
-    let command = if session.command.chars().count() > 200 {
-        format!("{}…", session.command.chars().take(200).collect::<String>())
+    let is_recovered = matches!(session.backend, SessionBackend::Completed);
+    let command = if session.command.is_empty() {
+        Value::Null
+    } else if session.command.chars().count() > 200 {
+        json!(format!(
+            "{}…",
+            session.command.chars().take(200).collect::<String>()
+        ))
     } else {
-        session.command.clone()
+        json!(session.command)
     };
-    json!({
+    let cwd = if session.cwd.as_os_str().is_empty() {
+        Value::Null
+    } else {
+        json!(session.cwd.to_string_lossy())
+    };
+    let mut view = json!({
         "session_id": session.id,
-        "cwd": session.cwd.to_string_lossy(),
+        "cwd": cwd,
         "command": command,
         "started_at": iso_from_ms(session.started_at_ms),
         "running": !status.closed,
         "exit_code": status.exit_code,
         "signal": status.signal,
         "truncated": truncated,
-    })
+    });
+    if is_recovered && let Some(obj) = view.as_object_mut() {
+        obj.insert("recovered".to_owned(), json!(true));
+    }
+    view
 }
 
 fn session_status(session: &Arc<Session>) -> SessionStatus {
@@ -624,14 +909,15 @@ where
     });
 }
 
-fn wait_for_output_readers(session: &Arc<Session>) {
+fn wait_for_output_readers(session: &Arc<Session>) -> bool {
     let SessionBackend::Native { output_readers, .. } = &session.backend else {
-        return;
+        return true;
     };
     let deadline = Instant::now() + OUTPUT_DRAIN_BUDGET;
     while output_readers.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(2));
     }
+    output_readers.load(Ordering::Acquire) == 0
 }
 
 fn push_chunk(session: &Arc<Session>, stream: StreamKind, chunk: &[u8]) {
@@ -891,7 +1177,7 @@ fn cleanup_pane_files(script_path: &Path, spool: &PaneSpoolPaths) {
     }
 }
 
-fn refresh_pane_session(session: &Arc<Session>) -> bool {
+fn refresh_pane_session(session: &Arc<Session>, registry: Option<&RegistryInner>) -> bool {
     let SessionBackend::Pane {
         client,
         pane_id,
@@ -908,7 +1194,7 @@ fn refresh_pane_session(session: &Arc<Session>) -> bool {
     let Some(exit_code) = read_pane_exit_code(&spool.status) else {
         return false;
     };
-    let transitioned = mark_closed_with_signal(session, Some(exit_code), None);
+    let transitioned = complete_session(session, registry, Some(exit_code), None);
     if transitioned {
         cleanup_pane_files(script_path, spool);
         let _ =
@@ -922,76 +1208,30 @@ fn refresh_session_status(session: &Arc<Session>, registry: Option<&RegistryInne
         return true;
     }
     match &session.backend {
+        SessionBackend::Completed => true,
         SessionBackend::Native { child, .. } => {
             let result = child
                 .lock()
                 .map_err(|_| "child lock poisoned".to_owned())
                 .and_then(|mut child| child.try_wait().map_err(|error| error.to_string()));
-            let transitioned = match result {
+            match result {
                 Ok(Some(exit)) => {
-                    wait_for_output_readers(session);
-                    mark_closed(session, &exit)
+                    if !wait_for_output_readers(session) {
+                        return false;
+                    }
+                    let signal = exit_signal(&exit);
+                    complete_session(session, registry, exit.code(), signal.as_deref());
+                    true
                 }
-                Ok(None) => return false,
-                Err(_) => mark_closed_unknown(session),
-            };
-            if transitioned && let Some(registry) = registry {
-                persist_closed_session(registry, session);
+                Ok(None) => false,
+                Err(_) => {
+                    complete_session(session, registry, None, None);
+                    true
+                }
             }
-            true
         }
-        SessionBackend::Pane { .. } => {
-            let closed = refresh_pane_session(session);
-            if closed && let Some(registry) = registry {
-                persist_closed_session(registry, session);
-            }
-            closed
-        }
+        SessionBackend::Pane { .. } => refresh_pane_session(session, registry),
     }
-}
-
-fn mark_closed(session: &Arc<Session>, exit: &ExitStatus) -> bool {
-    let Ok(mut status) = session.status.lock() else {
-        return false;
-    };
-    if status.closed {
-        return false;
-    }
-    status.closed = true;
-    status.exit_code = exit.code();
-    status.signal = exit_signal(exit);
-    status.ended_at_ms = Some(now_ms());
-    true
-}
-
-fn mark_closed_unknown(session: &Arc<Session>) -> bool {
-    let Ok(mut status) = session.status.lock() else {
-        return false;
-    };
-    if status.closed {
-        return false;
-    }
-    status.closed = true;
-    status.ended_at_ms = Some(now_ms());
-    true
-}
-
-fn mark_closed_with_signal(
-    session: &Arc<Session>,
-    exit_code: Option<i32>,
-    signal: Option<&str>,
-) -> bool {
-    let Ok(mut status) = session.status.lock() else {
-        return false;
-    };
-    if status.closed {
-        return false;
-    }
-    status.closed = true;
-    status.exit_code = exit_code;
-    status.signal = signal.map(str::to_owned);
-    status.ended_at_ms = Some(now_ms());
-    true
 }
 
 fn parse_stream(stream: &str) -> Option<Option<StreamKind>> {
@@ -1137,6 +1377,7 @@ fn signal_name(signal: i32) -> String {
 
 fn terminate_session(session: &Arc<Session>, force: bool, registry: Option<&RegistryInner>) {
     match &session.backend {
+        SessionBackend::Completed => {}
         SessionBackend::Native { child, .. } => {
             #[cfg(unix)]
             {
@@ -1169,14 +1410,12 @@ fn terminate_session(session: &Arc<Session>, force: bool, registry: Option<&Regi
                 PANE_RPC_TIMEOUT,
             );
             cleanup_pane_files(script_path, spool);
-            if mark_closed_with_signal(
+            complete_session(
                 session,
+                registry,
                 None,
                 Some(if force { "SIGKILL" } else { "SIGTERM" }),
-            ) && let Some(registry) = registry
-            {
-                persist_closed_session(registry, session);
-            }
+            );
         }
     }
 }
@@ -1202,9 +1441,13 @@ fn process_group_for_session(pid: u32) -> Option<u32> {
     }
 }
 
-fn persist_closed_session(inner: &RegistryInner, session: &Arc<Session>) {
-    let status = session_status(session);
-    let ended_at = status.ended_at_ms.unwrap_or_else(now_ms);
+fn persist_closed_evidence(
+    inner: &RegistryInner,
+    session: &Arc<Session>,
+    ended_at: u64,
+    exit_code: Option<i32>,
+    signal: Option<&str>,
+) {
     let result = inner
         .state_store
         .lock()
@@ -1214,14 +1457,40 @@ fn persist_closed_session(inner: &RegistryInner, session: &Arc<Session>) {
                 &session.id,
                 "closed",
                 Some(ended_at),
-                status.exit_code,
-                status.signal.as_deref(),
+                exit_code,
+                signal,
                 ended_at.saturating_add(SESSION_TTL_MS),
             )
         });
     if result.is_err() {
         inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
     }
+    if let Err(_error) = write_session_spool(&inner.state_dir, session) {
+        inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn complete_session(
+    session: &Arc<Session>,
+    registry: Option<&RegistryInner>,
+    exit_code: Option<i32>,
+    signal: Option<&str>,
+) -> bool {
+    let Ok(mut status) = session.status.lock() else {
+        return false;
+    };
+    if status.closed {
+        return false;
+    }
+    let ended_at = now_ms();
+    if let Some(registry) = registry {
+        persist_closed_evidence(registry, session, ended_at, exit_code, signal);
+    }
+    status.closed = true;
+    status.exit_code = exit_code;
+    status.signal = signal.map(str::to_owned);
+    status.ended_at_ms = Some(ended_at);
+    true
 }
 
 fn recover_state_store(store: &StateStore) -> Result<RecoveryResult, String> {
@@ -1978,7 +2247,7 @@ mod tests {
         let weak = Arc::downgrade(&session);
         spawn_monitor(Arc::clone(&session), Weak::new());
 
-        assert!(mark_closed_with_signal(&session, None, Some("pane_closed")));
+        assert!(complete_session(&session, None, None, Some("pane_closed")));
         drop(session);
         for _ in 0..500 {
             if weak.upgrade().is_none() {
@@ -2078,6 +2347,7 @@ mod tests {
             while Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).ok();
                         let request: Value = serde_json::from_str(
                             BufReader::new(stream.try_clone().unwrap())
                                 .lines()
@@ -2174,5 +2444,252 @@ mod tests {
         fs::write(&spool.status, "partial").unwrap();
         assert_eq!(read_pane_exit_code(&spool.status), None);
         cleanup_pane_files(Path::new("/tmp/no-pane-script"), &spool);
+    }
+
+    #[test]
+    fn completed_session_evidence_survives_restart_without_reexecution() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-restart-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let marker_path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-marker-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_file(&marker_path);
+
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let cmd = format!(
+            "printf 'marker-run\\n' >> {}; printf 'hello-stdout\\n'; printf 'hello-stderr\\n' >&2; exit 42",
+            shell_quote(&marker_path.to_string_lossy())
+        );
+        let started = registry.start(Path::new("/tmp"), &cmd).unwrap();
+        let id = started["session_id"].as_str().unwrap().to_owned();
+
+        let initial_view = wait_until_closed(&registry, &id, "both", 65536);
+        assert_eq!(initial_view["phase"], "completed");
+        assert_eq!(initial_view["running"], false);
+        assert_eq!(initial_view["exit_code"], 42);
+        assert!(
+            initial_view["text"]
+                .as_str()
+                .unwrap()
+                .contains("hello-stdout")
+        );
+        assert!(
+            initial_view["text"]
+                .as_str()
+                .unwrap()
+                .contains("hello-stderr")
+        );
+        assert!(initial_view["started_at"].is_string());
+        assert!(initial_view["finished_at"].is_string());
+
+        let marker_content = fs::read_to_string(&marker_path).unwrap();
+        assert_eq!(marker_content.matches("marker-run").count(), 1);
+
+        #[cfg(unix)]
+        {
+            let spool = exec_spool_path(&path, &id);
+            let mode = fs::metadata(&spool).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        drop(registry);
+
+        let restarted = ExecRegistry::new(path.clone()).unwrap();
+
+        let restarted_both = restarted.read(&id, "both", 0, 65536);
+        assert_eq!(restarted_both["ok"], true);
+        assert_eq!(restarted_both["phase"], "completed");
+        assert_eq!(restarted_both["running"], false);
+        assert_eq!(restarted_both["exit_code"], 42);
+        assert_eq!(restarted_both["signal"], Value::Null);
+        assert_eq!(restarted_both["recovered"], true);
+        assert!(restarted_both["started_at"].is_string());
+        assert!(restarted_both["finished_at"].is_string());
+        assert_eq!(restarted_both["started_at"], initial_view["started_at"]);
+        assert_eq!(restarted_both["finished_at"], initial_view["finished_at"]);
+        let both_text = restarted_both["text"].as_str().unwrap();
+        assert!(both_text.contains("hello-stdout"));
+        assert!(both_text.contains("hello-stderr"));
+
+        // Verify spool does NOT persist command strings or cwd
+        let spool_content = fs::read_to_string(exec_spool_path(&path, &id)).unwrap();
+        assert!(!spool_content.contains("marker-run"));
+        assert!(!spool_content.contains("printf"));
+
+        let restarted_stdout = restarted.read(&id, "stdout", 0, 65536);
+        assert_eq!(restarted_stdout["ok"], true);
+        assert_eq!(restarted_stdout["recovered"], true);
+        assert_eq!(restarted_stdout["text"], "hello-stdout\n");
+
+        let restarted_stderr = restarted.read(&id, "stderr", 0, 65536);
+        assert_eq!(restarted_stderr["ok"], true);
+        assert_eq!(restarted_stderr["recovered"], true);
+        assert_eq!(restarted_stderr["text"], "hello-stderr\n");
+
+        let marker_after = fs::read_to_string(&marker_path).unwrap();
+        assert_eq!(marker_after.matches("marker-run").count(), 1);
+
+        let views = restarted.list_views();
+        let recovered_view = views.iter().find(|v| v["session_id"] == id).unwrap();
+        assert_eq!(recovered_view["recovered"], true);
+        assert_eq!(recovered_view["running"], false);
+        assert_eq!(recovered_view["exit_code"], 42);
+        assert_eq!(recovered_view["command"], Value::Null);
+
+        let missing = restarted.read("es_nonexistent_12345", "both", 0, 64);
+        assert_eq!(missing["ok"], false);
+        assert_eq!(missing["reason"], "session_not_found");
+
+        let expired_id = "es_expired_restart_test";
+        let store = StateStore::open_in_dir(&path, "state.db").unwrap();
+        store
+            .record_exec_running(expired_id, 99999, None, 100)
+            .unwrap();
+        store
+            .settle_exec_session(expired_id, "closed", Some(200), Some(0), None, 300)
+            .unwrap();
+        drop(store);
+        let restarted_with_expired = ExecRegistry::new(path.clone()).unwrap();
+        let expired_view = restarted_with_expired.read(expired_id, "both", 0, 64);
+        assert_eq!(expired_view["ok"], false);
+        assert_eq!(expired_view["reason"], "session_not_found");
+
+        drop(restarted_with_expired);
+        drop(restarted);
+        let _ = fs::remove_file(&marker_path);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn unexpired_spools_beyond_recovery_batch_limit_are_not_cleaned_up() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-beyond-batch-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let store = StateStore::open_in_dir(&path, "state.db").unwrap();
+        let now = now_ms();
+
+        // Create 70 completed sessions (more than RECOVERY_MAX_ENTRIES=64)
+        for i in 0..70 {
+            let session_id = format!("es_batch_{i}");
+            store
+                .record_exec_running(&session_id, 1000 + i, None, now)
+                .unwrap();
+            store
+                .settle_exec_session(
+                    &session_id,
+                    "closed",
+                    Some(now + 10),
+                    Some(0),
+                    None,
+                    now + SESSION_TTL_MS,
+                )
+                .unwrap();
+            let spool_session = Session {
+                id: session_id.clone(),
+                cwd: PathBuf::new(),
+                command: String::new(),
+                started_at_ms: now,
+                pid: None,
+                backend: SessionBackend::Completed,
+                buffers: Mutex::new(Buffers {
+                    chunks: vec![Chunk {
+                        seq: 0,
+                        stream: StreamKind::Stdout,
+                        data: format!("output-{i}\n").into_bytes(),
+                    }],
+                    next_seq: 1,
+                    stdout_bytes: format!("output-{i}\n").len(),
+                    stderr_bytes: 0,
+                    truncated: false,
+                }),
+                status: Mutex::new(SessionStatus {
+                    closed: true,
+                    exit_code: Some(0),
+                    signal: None,
+                    ended_at_ms: Some(now + 10),
+                }),
+            };
+            write_session_spool(&path, &spool_session).unwrap();
+        }
+        drop(store);
+        drop(registry);
+
+        // Reopen registry - must NOT delete the 65th+ spool
+        let restarted = ExecRegistry::new(path.clone()).unwrap();
+
+        // Check session 69 (the 70th session)
+        let s69 = restarted.read("es_batch_69", "stdout", 0, 64);
+        assert_eq!(s69["ok"], true);
+        assert_eq!(s69["phase"], "completed");
+        assert_eq!(s69["text"], "output-69\n");
+        assert_eq!(s69["recovered"], true);
+
+        drop(restarted);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn recovered_read_beyond_spool_cap_reaches_terminal_offset_without_unread_gap() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-large-spool-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+
+        let started = registry
+            .start(
+                Path::new("/tmp"),
+                "awk 'BEGIN{for(i=0;i<4000;i++) print \"line-\" i, \"padding-01234567890123456789\"}'; exit 0",
+            )
+            .unwrap();
+        let id = started["session_id"].as_str().unwrap().to_owned();
+
+        let initial_view = wait_until_closed(&registry, &id, "stdout", MAX_BUFFER_PER_STREAM);
+        assert_eq!(initial_view["phase"], "completed");
+        assert_eq!(initial_view["exit_code"], 0);
+        let original_total = initial_view["bytes_total"].as_u64().unwrap() as usize;
+        assert!(original_total > RECOVERY_SPOOL_CAP);
+
+        drop(registry);
+
+        let restarted = ExecRegistry::new(path.clone()).unwrap();
+
+        let recovered_view = restarted.read(&id, "stdout", 0, 262_144);
+        assert_eq!(recovered_view["ok"], true);
+        assert_eq!(recovered_view["phase"], "completed");
+        assert_eq!(recovered_view["running"], false);
+        assert_eq!(recovered_view["recovered"], true);
+        assert_eq!(recovered_view["truncated"], true);
+
+        let bytes_total = recovered_view["bytes_total"].as_u64().unwrap() as usize;
+        let next_offset = recovered_view["next_offset"].as_u64().unwrap() as usize;
+        assert_eq!(bytes_total, RECOVERY_SPOOL_CAP);
+        assert_eq!(next_offset, bytes_total);
+
+        let text = recovered_view["text"].as_str().unwrap();
+        assert_eq!(text.len(), RECOVERY_SPOOL_CAP);
+        assert!(text.contains("line-3999"));
+
+        let terminal_view = restarted.read(&id, "stdout", next_offset, 65536);
+        assert_eq!(terminal_view["ok"], true);
+        assert_eq!(terminal_view["phase"], "completed");
+        assert_eq!(terminal_view["running"], false);
+        assert_eq!(terminal_view["recovered"], true);
+        assert_eq!(terminal_view["text"], "");
+        assert_eq!(terminal_view["offset"], next_offset);
+        assert_eq!(terminal_view["next_offset"], next_offset);
+        assert_eq!(terminal_view["bytes_total"], bytes_total);
+
+        drop(restarted);
+        let _ = fs::remove_dir_all(&path);
     }
 }

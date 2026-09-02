@@ -81,7 +81,7 @@ CI proves that a commit does not break other planes. Typical gates include:
 - package dry-run;
 - `git diff --check`.
 
-The public Edge contract is intentionally more stable than runtime implementation. Production v0.4.3 exposes **public epoch 3 / 19 actions**, while the workstation Runtime Execution Contract remains **epoch 2 / 18 tools**. The extra public action, `herdr_devices`, executes at Edge and is never forwarded to a workstation. Historical compatibility tests may exist, but normal runtime changes should not silently change either contract.
+The public Edge contract is intentionally more stable than runtime implementation. The current public contract remains **epoch 3 / 19 actions**, introduced in v0.4.3, while the workstation Runtime Execution Contract remains **epoch 2 / 18 tools**. The extra public action, `herdr_devices`, executes at Edge and is never forwarded to a workstation. Historical compatibility tests may exist, but normal runtime changes should not silently change either contract.
 
 ## Cloudflare Edge deployment
 

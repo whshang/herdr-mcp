@@ -56,6 +56,10 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /phase=started/);
     assert.match(r.content, /phase=completed/);
     assert.match(r.content, /progress.*bytes_read.*bytes_total.*elapsed_ms/s);
+    assert.match(r.content, /completion resource sweep/);
+    assert.match(r.content, /Do not wait for the user to notice accumulated panes/);
+    assert.match(r.content, /settled Agent.*does not need to remain open.*preserve task history/s);
+    assert.match(r.content, /canonical reusable `herdr-mcp:utility` pane/);
     assert.equal(r.runtime.contract_profile, process.env.HERDR_MCP_CONTRACT_PROFILE || "current");
     assert.equal(r.runtime.build_commit, process.env.HERDR_MCP_BUILD_COMMIT || null);
     assert.equal(r.runtime.active_runtime.source_commit, process.env.HERDR_MCP_BUILD_COMMIT || null);

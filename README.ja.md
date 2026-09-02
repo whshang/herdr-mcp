@@ -63,6 +63,8 @@ Herdr デバイス一覧を確認してください。backend は macbook-main�
 
 複数マシンが mutation の候補になるのに対象を指定しなかった場合、Herdr は推測せず `device_ambiguous` を返します。後続操作や retry も選択済みデバイスを保持し、各コンピュータは独立した credential を持ちます。
 
+Web AI は private workstation method を使い、登録済みコンピュータ間で少量の非機密 UTF-8 テキストをコピーすることもできます。public MCP tool は増えません。読み取りには integrity digest が付き、書き込みは HOME 配下の通常ファイル（symlink 不可）、256 KiB 上限、明示的な overwrite、既定の backup、機密らしい path/content の拒否に制限されます。binary、directory sync、credential transfer は対象外です。
+
 ### 新しいコンピュータを既存のデバイス群へ追加する
 
 すでに認可済みのコンピュータで短時間の pairing を作成します。
@@ -109,6 +111,8 @@ pairing address と一度だけ使える 6 桁 verification code が表示され
 | 人間が引き継ぐ | 同じ Herdr workspace/terminal を開き、実際の状態から継続 |
 
 複数 Agent に同じ working tree を同時編集させないでください。並列 mutation は isolated worktree を使います。
+
+長い test/build は `herdr_exec_start` で開始し、`herdr_exec_read(session_id, offset=next_offset)` で継続取得します。terminal scrollback を completion evidence として扱いません。完了済み session は bounded な最終出力と exit evidence を保持し、runtime replacement 後も回復できます。restart 時点で実行中だった process は、安全に takeover されたとは推測しません。
 
 ## Chrome extension
 

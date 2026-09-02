@@ -63,6 +63,8 @@ Cloudflare 提供稳定的公网 MCP/OAuth 入口，每台开发机主动向外�
 
 当有多台电脑都可以执行修改操作，而提示词没有指定目标时，Herdr 会返回 `device_ambiguous`，不会自行猜测。后续操作和重试会保持设备身份，每台电脑也使用独立凭据。
 
+Web AI 也可以通过私有 workstation method 在已加入的电脑之间复制少量、非敏感的 UTF-8 文本，不增加新的 public MCP tool。源端读取带完整性摘要；目标写入仅允许 HOME 下的普通非符号链接文件，大小上限 256 KiB，覆盖必须显式指定，默认创建备份，并拒绝疑似敏感的路径或内容。二进制文件、目录同步和凭据传输不在此能力范围内。
+
 ### 把新电脑加入现有设备组
 
 在已经授权的电脑上创建短期配对：
@@ -109,6 +111,8 @@ Herdr-MCP 可以直接完成确定性的操作。长时间实现、大型重构�
 | 人工接管 | 直接进入同一个 Herdr workspace/终端继续操作 |
 
 避免多个 Agent 同时修改同一个 working tree。并行修改时优先使用隔离 worktree。
+
+长测试和构建应使用 `herdr_exec_start`，后续通过 `herdr_exec_read(session_id, offset=next_offset)` 接力读取，不把终端滚屏当成完成证据。已经结束的 session 会在有界保留期内保存最终输出摘要与 exit evidence，即使 runtime 被替换也能恢复；仍在运行的进程在重启后不会被假定为已经安全接管。
 
 ## Chrome 扩展
 

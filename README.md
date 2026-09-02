@@ -112,6 +112,8 @@ Good combinations:
 
 Avoid several agents editing the same working tree. Use isolated worktrees for parallel mutations.
 
+For long tests and builds, the planner uses `herdr_exec_start` and resumes with `herdr_exec_read(session_id, offset=next_offset)` instead of treating terminal scrollback as completion evidence. Completed sessions keep bounded final output and exit evidence long enough to survive a runtime replacement; a running process is never assumed to have been safely taken over after a restart.
+
 ## Chrome extension
 
 The browser extension is optional for the core ChatGPT → MCP → workstation connection. Install it when you want conversation continuity, queued next-turn messages, Browser Control Center, or supported ChatGPT artifact capture.

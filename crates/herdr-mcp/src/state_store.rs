@@ -1014,6 +1014,16 @@ pub struct ExecSessionFence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedExecSessionRecord {
+    pub session_id: String,
+    pub started_at_ms: u64,
+    pub ended_at_ms: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
+    pub expires_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeGenerationRecord {
     pub generation_id: String,
     pub runtime_path: String,
@@ -1190,6 +1200,122 @@ impl StateStore {
                 [i64::try_from(now_ms).unwrap_or(i64::MAX)],
             )
             .map_err(|error| format!("cannot prune expired exec sessions: {error}"))
+    }
+
+    pub fn get_closed_exec_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ClosedExecSessionRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
+                 FROM exec_sessions
+                 WHERE session_id = ?1 AND state = 'closed'",
+            )
+            .map_err(|error| format!("cannot prepare closed exec session query: {error}"))?;
+        let mut rows = stmt
+            .query_map([session_id], |row| {
+                let session_id: String = row.get(0)?;
+                let started_at: i64 = row.get(1)?;
+                let ended_at: Option<i64> = row.get(2)?;
+                let exit_code: Option<i32> = row.get(3)?;
+                let signal: Option<String> = row.get(4)?;
+                let expires_at: Option<i64> = row.get(5)?;
+                Ok((
+                    session_id, started_at, ended_at, exit_code, signal, expires_at,
+                ))
+            })
+            .map_err(|error| format!("cannot query closed exec session: {error}"))?;
+        match rows.next() {
+            Some(row) => {
+                let (session_id, started_at, ended_at, exit_code, signal, expires_at) =
+                    row.map_err(|error| format!("cannot decode closed exec session: {error}"))?;
+                let started_at_ms = u64::try_from(started_at).unwrap_or(0);
+                let ended_at_ms = ended_at.map(|v| u64::try_from(v).unwrap_or(0));
+                let expires_at_ms = expires_at.map(|v| u64::try_from(v).unwrap_or(0));
+                Ok(Some(ClosedExecSessionRecord {
+                    session_id,
+                    started_at_ms,
+                    ended_at_ms,
+                    exit_code,
+                    signal,
+                    expires_at_ms,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn closed_exec_sessions(
+        &self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<ClosedExecSessionRecord>, String> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let now_i64 = i64::try_from(now_ms).unwrap_or(i64::MAX);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
+                 FROM exec_sessions
+                 WHERE state = 'closed' AND (expires_at IS NULL OR expires_at > ?1)
+                 ORDER BY started_at ASC
+                 LIMIT ?2",
+            )
+            .map_err(|error| format!("cannot prepare closed exec sessions query: {error}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![now_i64, limit], |row| {
+                let session_id: String = row.get(0)?;
+                let started_at: i64 = row.get(1)?;
+                let ended_at: Option<i64> = row.get(2)?;
+                let exit_code: Option<i32> = row.get(3)?;
+                let signal: Option<String> = row.get(4)?;
+                let expires_at: Option<i64> = row.get(5)?;
+                Ok((
+                    session_id, started_at, ended_at, exit_code, signal, expires_at,
+                ))
+            })
+            .map_err(|error| format!("cannot query closed exec sessions: {error}"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (session_id, started_at, ended_at, exit_code, signal, expires_at) =
+                row.map_err(|error| format!("cannot decode closed exec sessions row: {error}"))?;
+            let started_at_ms = u64::try_from(started_at).unwrap_or(0);
+            let ended_at_ms = ended_at.map(|v| u64::try_from(v).unwrap_or(0));
+            let expires_at_ms = expires_at.map(|v| u64::try_from(v).unwrap_or(0));
+            result.push(ClosedExecSessionRecord {
+                session_id,
+                started_at_ms,
+                ended_at_ms,
+                exit_code,
+                signal,
+                expires_at_ms,
+            });
+        }
+        Ok(result)
+    }
+
+    pub fn unexpired_exec_session_ids(
+        &self,
+        now_ms: u64,
+    ) -> Result<std::collections::HashSet<String>, String> {
+        let now_i64 = i64::try_from(now_ms).unwrap_or(i64::MAX);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id FROM exec_sessions
+                 WHERE expires_at IS NULL OR expires_at > ?1",
+            )
+            .map_err(|error| format!("cannot prepare unexpired exec sessions query: {error}"))?;
+        let rows = stmt
+            .query_map([now_i64], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query unexpired exec sessions: {error}"))?;
+        let mut result = std::collections::HashSet::new();
+        for row in rows {
+            result.insert(row.map_err(|error| format!("cannot decode session id: {error}"))?);
+        }
+        Ok(result)
     }
 
     pub fn stage_runtime_generation(
@@ -3003,5 +3129,61 @@ mod tests {
         std::fs::remove_file(&linked_dir).ok();
         std::fs::remove_dir_all(&real_dir).ok();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn closed_exec_sessions_query_settled_records() {
+        let store = StateStore::open(":memory:").unwrap();
+        store
+            .record_exec_running("es_running", 100, Some(100), 1000)
+            .unwrap();
+        store
+            .record_exec_running("es_closed_a", 101, Some(101), 1100)
+            .unwrap();
+        store
+            .settle_exec_session("es_closed_a", "closed", Some(1150), Some(0), None, 5000)
+            .unwrap();
+        store
+            .record_exec_running("es_closed_b", 102, Some(102), 1200)
+            .unwrap();
+        store
+            .settle_exec_session(
+                "es_closed_b",
+                "closed",
+                Some(1250),
+                Some(1),
+                Some("SIGTERM"),
+                2000,
+            )
+            .unwrap();
+
+        let single = store
+            .get_closed_exec_session("es_closed_a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(single.session_id, "es_closed_a");
+        assert_eq!(single.started_at_ms, 1100);
+        assert_eq!(single.ended_at_ms, Some(1150));
+        assert_eq!(single.exit_code, Some(0));
+        assert_eq!(single.signal, None);
+        assert_eq!(single.expires_at_ms, Some(5000));
+
+        assert!(
+            store
+                .get_closed_exec_session("es_running")
+                .unwrap()
+                .is_none()
+        );
+
+        // At t=1500, both closed sessions are unexpired
+        let unexpired = store.closed_exec_sessions(1500, 10).unwrap();
+        assert_eq!(unexpired.len(), 2);
+        assert_eq!(unexpired[0].session_id, "es_closed_a");
+        assert_eq!(unexpired[1].session_id, "es_closed_b");
+
+        // At t=3000, es_closed_b (expires_at=2000) is filtered out
+        let filtered = store.closed_exec_sessions(3000, 10).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].session_id, "es_closed_a");
     }
 }

@@ -281,6 +281,31 @@ export async function handleMcp(
     if (selectorValue !== undefined && typeof selectorValue !== "string") {
       return rpcError(id, -32602, "Invalid params", { reason: "device must be a string" });
     }
+    const localMethod = name === "herdr_call" && typeof args.method === "string" ? args.method : null;
+    const explicitTextDevice = localMethod === "herdr_mcp.text.read" || localMethod === "herdr_mcp.text.write";
+    if (explicitTextDevice) {
+      if (typeof selectorValue !== "string" || selectorValue.trim().length === 0) {
+        return rpcResult(id, callToolResult({
+          ok: false,
+          code: "device_required",
+          retryable: false,
+          delivery_state: "not_delivered",
+          failure_layer: "edge_routing",
+          next_action: "retry the text transfer with an explicit enrolled device selector",
+        }, true));
+      }
+      const { extractDeviceIdFromArgs } = await import("./device-refs.js");
+      if (extractDeviceIdFromArgs(args)) {
+        return rpcResult(id, callToolResult({
+          ok: false,
+          code: "device_ref_not_allowed",
+          retryable: false,
+          delivery_state: "not_delivered",
+          failure_layer: "edge_routing",
+          next_action: "remove pane/workspace refs from text-transfer params and use only the explicit device selector",
+        }, true));
+      }
+    }
     let route: DeviceRouteResult;
     try {
       route = deps.resolveDevice
