@@ -24,7 +24,7 @@ herdr-mcp reinstall
 herdr-mcp uninstall
 ```
 
-`update` 是普通用户的一步升级入口，等价于 `update apply`。只有明确需要在决定升级前做只读版本/来源检查时才使用 `update check`。
+从 v0.4.3 起，`update` 是普通用户的一步升级入口，等价于 `update apply`。已安装的 v0.4.2 binary 仍会把 bare `herdr-mcp update` 当作只读检查，并把 `herdr-mcp update apply` 返回为 `next_action`，因此从 v0.4.2 跨版本升级时应执行一次 `herdr-mcp update apply`。只有明确需要只读检查版本与 provenance 时才使用 `update check`。
 
 `update auto` 是后台调度入口。默认 macOS PROD 实例执行 `service install` 时会 reconcile 归属明确的 `dev.herdr-mcp.auto-update` LaunchAgent；任务在加载时先执行一次，随后每天触发。自动安装严格限制为 **PROD runtime + Stable Release**：编译为 DEV 的 runtime、`[update] check = false`、named instance、`preview` 都会在访问网络前直接跳过。发现严格更高的 Stable Release 后，继续复用正常的 provenance 验签、detached worker 和 rollback-safe 更新事务，不新增第二套下载器，也不绕过回滚门槛。`service uninstall` 会先写入归属明确的持久 update fence 并移除 scheduler；detached worker 在真正 activation 前会再次检查该 fence，因此已经排队的静默更新不能在卸载后复活服务。显式成功的 install 才会解除 fence。
 
