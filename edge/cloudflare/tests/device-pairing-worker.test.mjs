@@ -52,6 +52,13 @@ function postAsWorkstation(path, body, workstationId, secret) {
   });
 }
 
+function get(path, authorization, workstationId = null) {
+  const headers = {};
+  if (authorization) headers.authorization = `Bearer ${authorization}`;
+  if (workstationId) headers["x-herdr-workstation"] = workstationId;
+  return new Request(`https://edge.example${path}`, { method: "GET", headers });
+}
+
 function base64UrlUtf8(value) {
   const bytes = new TextEncoder().encode(value);
   let binary = "";
@@ -228,6 +235,28 @@ test("joined device credentials cannot create pairings; only the owner workstati
   ), env);
   assert.equal(memberCreate.status, 401);
   assert.equal((await memberCreate.json()).code, "pairing_admin_required");
+});
+
+test("device inventory is owner-readable, sanitized, and denied to joined member credentials", async () => {
+  const { env } = makeEnv();
+  const joined = await pair(env, "fleet-member");
+
+  const ownerList = await worker.fetch(get("/devices", "owner-secret"), env);
+  assert.equal(ownerList.status, 200);
+  assert.equal(ownerList.headers.get("cache-control"), "no-store");
+  const ownerBody = await ownerList.json();
+  assert.equal(ownerBody.ok, true);
+  assert.equal(typeof ownerBody.observed_at_ms, "number");
+  assert.equal(ownerBody.devices.some((device) => device.device_id === joined.device_id), true);
+  assert.equal(JSON.stringify(ownerBody).includes(joined.device_secret), false, "inventory never exposes device credentials");
+
+  const memberList = await worker.fetch(get(
+    "/devices",
+    joined.device_secret,
+    joined.workstation_id,
+  ), env);
+  assert.equal(memberList.status, 401);
+  assert.equal((await memberList.json()).code, "device_inventory_admin_required");
 });
 
 test("device credentials are isolated: credential A never authenticates or routes as device B", async () => {
