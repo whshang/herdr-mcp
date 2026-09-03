@@ -36,6 +36,10 @@ use std::time::Duration;
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(any(target_os = "macos", test))]
+use time::OffsetDateTime;
+#[cfg(any(target_os = "macos", test))]
+use time::format_description::well_known::Rfc3339;
+#[cfg(any(target_os = "macos", test))]
 use url::Url;
 
 #[cfg(any(target_os = "macos", test))]
@@ -75,6 +79,13 @@ fn pairing_consume_request_body(pairing_id: &str, code: &str, name: Option<&str>
         Some(name) => json!({ "pairing_id": pairing_id, "code": code, "name": name }),
         None => json!({ "pairing_id": pairing_id, "code": code }),
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn format_pairing_expiry(expires_at_ms: u64) -> Option<String> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires_at_ms) * 1_000_000)
+        .ok()
+        .and_then(|value| value.format(&Rfc3339).ok())
 }
 
 pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
@@ -215,15 +226,14 @@ fn create_pairing(
         .ok_or_else(|| "device pairing creation returned no expiry".to_owned())?;
 
     let pairing_address = format!("{}/pair#{}", owner.edge_origin, pairing_id);
-    let ttl_minutes = ttl_seconds / 60;
     println!("Pairing created for Worker {}", owner.edge_origin);
     println!();
     println!("Pairing address: {}", pairing_address);
     println!("Verification code: {}", format_pairing_code(code));
-    println!(
-        "Expires in {} minutes ({} seconds).",
-        ttl_minutes, ttl_seconds
-    );
+    if let Some(expires_at) = format_pairing_expiry(expires_at_ms) {
+        println!("Expires at: {expires_at} (UTC)");
+    }
+    println!("Valid for at most {ttl_seconds} seconds; use it immediately.");
     println!();
     println!("On the new computer, run:");
     println!("  herdr-mcp worker connect \"{}\"", pairing_address);
@@ -234,7 +244,6 @@ fn create_pairing(
         "Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: {}  Then enter the separately displayed 6-digit verification code at the no-echo prompt (the code is never part of the copyable command).",
         pairing_address
     );
-    let _ = expires_at_ms;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1068,6 +1077,14 @@ mod tests {
     fn pairing_code_formats_with_a_space_for_humans() {
         assert_eq!(format_pairing_code("123456"), "123 456");
         assert_eq!(format_pairing_code("000000"), "000 000");
+    }
+
+    #[test]
+    fn pairing_expiry_formats_as_absolute_rfc3339_utc() {
+        assert_eq!(
+            format_pairing_expiry(0).as_deref(),
+            Some("1970-01-01T00:00:00Z")
+        );
     }
 
     #[test]

@@ -73,14 +73,14 @@ Do not add public Edge while the local doctor is unhealthy. Fix the local runtim
 
 ## Step 3: deploy the public Edge
 
-When ChatGPT needs to reach the workstation over the Internet, use a Cloudflare Worker as the stable OAuth/MCP entry point. Prefer `workers.dev` for the first setup unless a custom domain is an explicit requirement.
+When ChatGPT needs to reach the workstation over the Internet, use a Cloudflare Worker as the stable OAuth/MCP entry point. Keep `workers.dev` enabled as the zero-domain bootstrap/diagnostic origin, but when the selected Cloudflare Account already has a suitable active zone, prefer a dedicated Custom Domain such as `herdr-mcp.example.com` for the long-lived OAuth/MCP identity before Connector authorization. If no suitable zone exists or the user declines, continue on `workers.dev` without blocking installation.
 
 For automated installation, the executing Agent follows [Agent install](agent-install.md) / [Agent installation](agent-install.md) directly; those protocols own Token scoping, Worker naming, secret injection, account choice, and the boundary for network blockers.
 
 For a manual deployment, keep these constraints:
 
 - Cloudflare API Token is an ephemeral process value, not a repository or log value;
-- default to `workers_dev = true` and `routes = []`;
+- keep `workers_dev = true`; `routes = []` is the zero-domain bootstrap state, not the preferred final identity when a suitable active zone is available; use the Worker Custom Domain flow for the final hostname rather than generic DNS Write;
 - derive the Worker name using the repository helper:
 
 ```bash

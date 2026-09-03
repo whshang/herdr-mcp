@@ -301,7 +301,7 @@ export async function handleMcp(
         return rpcResult(id, callToolResult({
           ok: true,
           devices,
-          pairing_hint: "To connect a new computer, call herdr_call(method=\"herdr_mcp.device.pair\", params='{\"ttl_seconds\":600,\"name\":\"<optional>\"}'). params is a JSON string in the public schema. Do not provide a device selector.",
+          pairing_hint: "When the user asks to add a new computer or generate its setup link, call herdr_call(method=\"herdr_mcp.device.pair\", params='{\"ttl_seconds\":600,\"name\":\"<optional>\"}'). params is a JSON string in the public schema. Do not provide a device selector. Present the returned pairing address, one-time code, exact expiry, and new-device command together.",
         }));
       } catch {
         return rpcResult(
@@ -454,6 +454,7 @@ export async function handleMcp(
             callToolResult({ ok: false, code: result.code, retryable: false }, true),
           );
         }
+        const expiresAt = new Date(result.expires_at_ms).toISOString();
         return rpcResult(
           id,
           callToolResult({
@@ -461,9 +462,12 @@ export async function handleMcp(
             pairing_id: result.pairing_id,
             code: result.code,
             expires_at_ms: result.expires_at_ms,
+            expires_at: expiresAt,
+            ttl_seconds: ttlSeconds ?? 600,
             pairing_address: result.pairing_address,
             worker_origin: result.worker_origin,
-            instructions: `Run on the new computer: herdr-mcp worker connect "${result.pairing_address}" and enter verification code ${result.code} when prompted.`,
+            new_device_command: `herdr-mcp worker connect "${result.pairing_address}"`,
+            instructions: `This one-time pairing expires at ${expiresAt}. Run on the new computer: herdr-mcp worker connect "${result.pairing_address}" and enter verification code ${result.code} only when the no-echo prompt asks for it.`,
           }),
         );
       } catch {

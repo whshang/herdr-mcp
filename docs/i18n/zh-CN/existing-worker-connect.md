@@ -27,18 +27,24 @@ Herdr 的多设备模型是：一个公网 Worker/Connector，后面连接多台
 
 ## 把新电脑加入设备组
 
-### 1. 在已经授权的电脑上创建短期配对
+### 1. 推荐：直接在 ChatGPT 对话中创建短期配对
 
-运行：
+在已经授权的 Herdr 对话里直接说：
 
-```bash
-herdr-mcp worker pair
+```text
+给我的新电脑生成一个 Herdr 配对链接，10 分钟有效。
 ```
 
-它会创建一次性配对，默认约 10 分钟有效，并显示：
+ChatGPT 可以直接在 Edge 创建 pairing，不要求任何已登记工作站在线。返回结果应把这些信息一起展示：
 
 - 包含高熵 pairing id 的配对地址；
-- 一个格式类似 `123 456` 的 6 位验证码。
+- 一次性 6 位验证码；
+- 精确过期时间；
+- 可直接复制到新电脑执行的 `herdr-mcp worker connect "<pairing-address>"` 命令。
+
+正常最长有效期为 600 秒，应立即使用，不要把它当成长期邀请链接保存。
+
+CLI fallback：在 fleet 中任意已授权 macOS 电脑运行 `herdr-mcp worker pair` 仍可创建同样的短期 pairing；CLI 同时显示精确 UTC 过期时间和相对有效期。
 
 ### 2. 在新电脑上连接
 
@@ -96,7 +102,7 @@ herdr-mcp worker rename "<new-device-name>"
 - 6 位验证码单次使用且有效期很短；
 - 连续输错 5 次会永久锁定本次配对，应重新创建配对；
 - pairing id 具有高熵，并放在 URL fragment 中，避免进入普通 HTTP access log 路径；
-- 验证码不得放进 argv、shell history、日志或对话记录；
+- 用户明确在已 OAuth 授权的 owner 对话里创建 pairing 时，该对话可以显示这枚一次性验证码；除此之外，不得把验证码持久化到 argv、shell history、Git、普通日志、复制出来的 transcript 或无人值守自动化；
 - 最终单设备凭据不得打印或复制，应始终留在操作系统凭据存储中。
 
 ## 恢复与重试

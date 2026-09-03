@@ -30,10 +30,10 @@ Cloudflare Edge
 ### 推荐：给 Agent 一句话
 
 ```text
-帮我安装并配置 Herdr 和 herdr-mcp，请完整按照 https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md 执行；使用当前 Stable GitHub Release，完成 Cloudflare 和 ChatGPT 配置，只在必须由我本人登录或授权时暂停，并在结束前验证整条连接真实可用。
+帮我安装并配置 Herdr 和 herdr-mcp，请完整按照 https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md 执行；使用当前 Stable GitHub Release，完成 Cloudflare 和 ChatGPT 配置；如果我的 Cloudflare 账户已有合适的 active zone，优先引导使用专用 Custom Domain，否则保留 workers.dev；自动检测工作站网络和 fallback 路径，只在必须由我本人登录或授权时暂停，并在结束前验证整条连接真实可用。
 ```
 
-Agent 会检查电脑环境、安装 Herdr 和 herdr-mcp、创建或连接 Cloudflare 公网入口、启动开发机连接、指导你完成 ChatGPT 授权，然后执行健康检查和真实 MCP 请求验证。只有账号登录、授权这类必须由你本人完成的操作才需要暂停。
+Agent 会检查电脑环境、安装 Herdr 和 herdr-mcp，先用 `workers.dev` bootstrap Worker；Cloudflare Account 有合适 zone 时，会在 OAuth/Connector 固化前优先建议并完成 Custom Domain；随后启动开发机连接、指导你完成 ChatGPT 授权，自动验证实际网络路径，并用真实 MCP 请求验收。没有域名也不会卡住：Link 会在需要时从 direct `workers.dev` 无感切到已有本地代理，再到已验收的共享 Relay fallback。
 
 ### 手动安装
 
@@ -53,7 +53,7 @@ Cloudflare 提供稳定的公网 MCP/OAuth 入口，每台开发机主动向外�
 
 ### Shared Relay 只是兜底中转，不是你的公网入口
 
-Herdr-MCP 默认让开发机 Link 尽量直连。只要你配置了自己的 Cloudflare Custom Domain，就不会使用公共 Relay Pool。没有 Custom Domain 时，Link 会先直连该 Worker 的 `workers.dev`，存在已验证的本地代理时再尝试本地代理；只有这些路径都不可用时，才会进入 Herdr 维护的 Relay Pool。
+Herdr-MCP 默认让开发机 Link 尽量直连。只要你配置了自己的 Cloudflare Custom Domain，就不会使用公共 Relay Pool。没有 Custom Domain 时，Link 会先直连该 Worker 的 `workers.dev`，存在已验证的本地代理时再尝试本地代理；只有这些路径都不可用时，才会自动进入 Herdr 维护的 Relay Pool。全新安装内置 v0.4.5 中国大陆真实裸网 UAT 已验收的 Deno/Supabase baseline；本机存在更新且有效的签名 Pool cache 时会完整覆盖这个 baseline。
 
 Relay 不会替换你的 MCP/OAuth 地址，不接管设备身份，也不是通用代理。它只把已经经过 Herdr 身份认证的 `herdr-link` WebSocket 转发到你自己的 `workers.dev` Worker。正式 Pool 使用 Deno 与 Supabase 两个独立故障域，按设备做 sticky、容量加权的稳定分片，并支持有界 failover。Deno 承担绝大多数长期连接；Supabase 因 Hosted Edge Function 生命周期和 Free 额度更紧，只承担少量容量分片并作为完整备用。普通用户无需注册这两个平台，也无需填写 Relay URL。
 
@@ -73,13 +73,15 @@ Web AI 也可以通过私有 workstation method 在已加入的电脑之间复�
 
 ### 把新电脑加入现有设备组
 
-在已经授权的电脑上创建短期配对：
+推荐直接在已经授权的 ChatGPT 对话里说：
 
-```bash
-herdr-mcp worker pair
+```text
+给我的新电脑生成一个 Herdr 配对链接，10 分钟有效。
 ```
 
-命令会给出配对地址和一次性的 6 位验证码。然后把下面一句发给新电脑上的 Coding Agent：
+Herdr 会直接在 Edge 创建 pairing，不要求旧电脑在线。ChatGPT 会一起给出配对地址、一次性 6 位验证码、精确过期时间，以及可复制的 `herdr-mcp worker connect "<pairing-address>"` 命令。已授权 Mac 上的 `herdr-mcp worker pair` 仍保留为 CLI fallback。
+
+然后把下面一句发给新电脑上的 Coding Agent：
 
 ```text
 把这台电脑加入我现有的 Herdr 设备组，请按照 https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/zh-CN/existing-worker-connect.md 执行；配对地址是 <pairing-address>，等 CLI 提示时再让我输入 6 位验证码，完成后验证这台设备已经在同一个 Worker 中在线。

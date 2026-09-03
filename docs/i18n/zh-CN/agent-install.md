@@ -1,6 +1,6 @@
 # Agent 安装
 
-*端到端 Agent 安装协议与 `workers.dev` 部署。*
+*端到端 Agent 安装协议、Cloudflare 公网入口选择与可靠 Link 配置。*
 
 > **执行角色：Agent。** 本页是 herdr-mcp 普通工作站安装的唯一权威执行合同，包含精简上线路径、安全边界、Cloudflare 部署、Link、浏览器扩展通道选择与验证。[安装参考](install.md) 只用于人工/运维查阅。
 
@@ -10,9 +10,9 @@ Agent 直接读取并执行本文，不需要用户再把本文包装成一段�
 
 ## 0. Agent 合同
 
-1. 能自动化的 shell 步骤直接执行；只在 Cloudflare 交互登录 / API Token 创建，或多个 Account 选择时暂停。
+1. 能自动化的 shell 步骤直接执行；只在 Cloudflare 交互登录 / API Token 创建、确实无法安全推断的 Account/zone 选择，或用户意图尚不明确时一次性确认是否采用推荐 Custom Domain，才暂停。
 2. 不破坏已有工作。禁止对无关 checkout 做 `reset --hard`、`clean -fd` 或覆盖用户修改。
-3. 首次安装就确定一个 canonical public origin，并让 Worker OAuth、MCP 身份始终使用该入口。Link transport 不得因为连通性修复而静默改写 OAuth issuer。`workers.dev` 仍是无需 DNS 的 bootstrap 路径。只有用户明确选择 Custom Domain，或现有安装策略/配置能证明这一意图时，才从第一次部署使用自定义域名。连通性失败是暂停点，不代表 Agent 获得创建或修改 Custom Domain/DNS zone 的权限。
+3. 首次安装就确定一个 canonical public origin，并让 Worker OAuth、MCP 身份始终使用该入口。`workers.dev` 是零域名的 **bootstrap** 路径；当所选 Cloudflare Account 已经有 active zone 时，它不应默认成为长期 production identity。在创建 ChatGPT Connector/OAuth identity **之前**，Agent 要先发现可用 zone，并优先把 Custom Domain（例如 `herdr-mcp.example.com`）作为稳定 production identity。只有一个明显安全的 zone/hostname 时，把它作为推荐选项；多个 zone 都合理时只问用户选哪个。没有 active zone、用户不想使用、或 hostname 已与现有记录冲突时，直接继续 `workers.dev`，不得阻塞安装。Cloudflare Custom Domain 会自动创建对应 Worker DNS 记录和证书，正常路径不需要通用 DNS Write。Link transport 不得因后续连通性修复而静默改写已经选定的 OAuth issuer。
 4. Cloudflare Token 是高敏凭据。禁止回显或写入仓库、`.env`、普通日志、截图、shell history。优先进程环境注入；若必须落临时文件，用 mode `0600` 并在部署后立刻删除。
 5. 每个 mutation 后先验证再继续。出错时先判断 mutation 是否已经提交，再决定是否重试。
 6. **不要**用 clone 本仓库或 `npm`/`cargo` 安装本机 MCP runtime，除非用户明确要求贡献者/从源码开发会话。
@@ -23,7 +23,7 @@ Agent 直接读取并执行本文，不需要用户再把本文包装成一段�
 在请求 Cloudflare Token、命名 Worker、创建 R2、部署 Edge 或新建 ChatGPT Connector 之前，必须先确认 fleet 意图。新电脑本地 `~/.config/herdr-mcp` 为空，**不代表**这是用户的第一台 Herdr 电脑。
 
 - 如果用户已经提供 Herdr pairing address，这台电脑就是加入已有 Worker。安装/验证本机 runtime 与 macOS 权限后，执行 `herdr-mcp worker connect "<pairing-address>"`；CLI 默认使用 macOS Computer Name，只有用户明确要求不同的初始显示名时才传 `--name`。跳过 Worker/R2/Connector 创建。
-- 如果用户明确说已有另一台 Herdr 电脑但还没有 pairing address，在一台已授权的旧电脑上执行 `herdr-mcp worker pair`，然后在新电脑用 `worker connect` 消费这个一次性 pairing；复用已有公网 MCP/OAuth origin。
+- 如果用户明确说已有另一台 Herdr 电脑但还没有 pairing address，优先直接在已经授权的 ChatGPT/Herdr 对话中调用 Edge-local `herdr_mcp.device.pair` 创建短期配对；不要求旧电脑在线。把配对地址、一次性 6 位验证码、精确过期时间一起展示。已授权旧电脑上的 `herdr-mcp worker pair` 保留为 CLI fallback。新电脑用 `worker connect` 消费 pairing，并复用已有公网 MCP/OAuth origin。
 - 只有用户明确确认这是第一台 Herdr 电脑/第一个 fleet，才继续下面的 first-owner Cloudflare 路径。
 - 如果意图不清楚，只问一个所有权问题：**创建第一个 Herdr Worker，还是加入已有 Herdr Worker？** 禁止根据本机缺少凭据自行推断。
 - pairing、旧 Worker 升级、hostname 连通性或权限失败都仍属于 existing-fleet 修复路径。除非用户明确改变 fleet 意图，否则禁止 fallback 到随机后缀的新 Worker、R2 桶或 Connector。
@@ -102,9 +102,9 @@ helper 会把 hostname 小写，把 `[a-z0-9-]` 以外字符安全替换，压�
 
 有浏览器控制时打开 <https://dash.cloudflare.com/profile/api-tokens>；否则把该 URL 交给用户。
 
-最简单支持路径是 Cloudflare 当前的 **Edit Cloudflare Workers** 模板，限定到本次安装使用的单个 Account。**核心安装不需要 R2**：默认部署是 `workers.dev` 上的 Workers + Durable Objects，不能因为未开通 R2 或账户没绑卡而失败。只有用户明确启用可选 artifact relay（§6）时才加 Account → **Workers R2 Storage → Edit**。**不要**加 DNS Write。不要超出所选路径实际需要的权限。
+最简单支持路径是 Cloudflare 当前的 **Edit Cloudflare Workers** 模板，限定到本次安装使用的单个 Account。它已经包含推荐 Custom Domain route 所需的 Worker script 与 **Workers Routes Write** 权限，不需要通用 DNS Write。**核心安装不需要 R2**，不能因为未开通 R2 或账户没绑卡而失败。只有用户明确启用可选 artifact relay（§6）时才加 Account → **Workers R2 Storage → Edit**。不要超出所选路径实际需要的权限。
 
-更紧的自定义 token 至少保留 Account → **Workers Scripts → Write/Edit**、Account → **Account Settings → Read**、User → **Memberships → Read**、User → **User Details → Read**。读取账户 `workers.dev` subdomain 需要 `Account Settings → Read`。用户之后启用 artifact relay 时再加 Account → **Workers R2 Storage → Edit**。`workers.dev` bootstrap 不需要 Zone/DNS 权限。
+更紧的自定义 token 至少保留 Account → **Workers Scripts → Write/Edit**、Account → **Account Settings → Read**、User → **Memberships → Read**、User → **User Details → Read**。读取账户 `workers.dev` subdomain 需要 `Account Settings → Read`。要发现并绑定 Custom Domain，再增加 Zone → **Zone → Read** 与 Zone → **Workers Routes → Write/Edit**，能限定到目标 zone 时就不要放大范围。正常 Custom Domain 路径**不要**增加 Zone → DNS Write。用户之后启用 artifact relay 时再加 Account → **Workers R2 Storage → Edit**。
 
 告知用户秘密只显示一次，并要求只粘贴到当前本地 Agent 会话；有专用密输通道时优先使用。
 
@@ -136,6 +136,8 @@ export CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID"
 
 有 `ACCOUNT_ID` 后请求 `GET /client/v4/accounts/<ACCOUNT_ID>/workers/subdomain`。复用已有 account subdomain，**永不改名**。Worker origin 永远是 `<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`。
 
+在最终公网 identity 固化前，同时枚举 Token 可见的 active zones。这一步只是发现，不代表可以任意修改 DNS。有 active zone 时，准备一个不冲突的专用 hostname（默认建议 `herdr-mcp.<zone>`），检查它没有被不兼容的 DNS record/Worker 占用，并优先把它作为最终 MCP/OAuth Custom Domain。没有合适 zone 或用户选择不用域名时，把 `workers.dev` 记录为 canonical origin 并直接继续；这不是降级安装错误，工作站侧的网络可达性由 Link transport fallback 负责。
+
 若尚无 subdomain，只在确认不存在时创建；用 `herdr-<short-account-id>`，冲突再加随机后缀。GET 明确无 subdomain 后才：
 
 ```text
@@ -149,7 +151,14 @@ Content-Type: application/json
 
 ## 6. 部署 Edge，不要求永久仓库 checkout
 
-仅为 Edge 部署获取 Worker 源码（临时 shallow clone 或与 Release 相邻的文档包均可）。从已发布的 user example 生成被忽略的 `wrangler.user.toml`，设置 `name`、`DEFAULT_WORKSTATION_ID`、`OAUTH_ISSUER=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`。保持 `workers_dev = true` 与 `routes = []`。
+仅为 Edge 部署获取 Worker 源码（临时 shallow clone 或与 Release 相邻的文档包均可）。从已发布的 user example 生成被忽略的 `wrangler.user.toml`，先设置 `name` 与 `DEFAULT_WORKSTATION_ID`。保持 `workers_dev = true`，让 `https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev` 始终可作为零域名 bootstrap/诊断 origin。
+
+先部署一次 `workers.dev` 并证明 `/health`，再在创建 ChatGPT Connector 前确定唯一长期 public origin：
+
+- **有 active Cloudflare zone 时推荐：**增加 `[[routes]]`，设置 `pattern = "herdr-mcp.<zone>"`（或用户选定的专用 hostname）与 `custom_domain = true`，把 `OAUTH_ISSUER` 改为 `https://<custom-host>`，重新部署，并要求该 hostname 的 `/health`、未认证 `/mcp`、OAuth discovery 全部通过。Cloudflare 会自动创建 Custom Domain 的 DNS 记录与证书。
+- **没有合适 zone / 用户不使用：**保持 `routes = []`，设置 `OAUTH_ISSUER=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`，把这个 `workers.dev` origin 固化为 canonical public identity。
+
+不要先让 Connector 绑定 bootstrap hostname，随后又静默迁域名。OAuth client 一旦接入，public-origin 修改就是显式迁移操作。
 
 **R2 可选，默认关闭。** 核心安装保持 `wrangler.user.toml` 中的 `[[r2_buckets]]` 注释状态，已发布的 user example 就是这样发布的。Edge 代码把 `ARTIFACT_BUCKET` 视为可选，核心部署必须在 Workers Free、无 R2、无绑卡的情况下成功。只有用户明确启用可选 artifact relay 时：取消注释该绑定、确认 token 有 **Workers R2 Storage → Edit**（以及 Cloudflare 要求的 R2 计费步骤），并在部署前执行 provisioning。绑定的桶不存在时 `wrangler deploy` 会 fail-closed——这正是默认路径不发布该绑定的原因。R2 保持关闭时，跳过 provisioning 直接部署：
 
@@ -202,11 +211,13 @@ herdr-mcp native-host status
 
 把 `LINK_SHARED_SECRET` 存进 Keychain，服务名 `herdr-edge-link-<WORKSTATION_ID>`。命令文本只能引用环境变量，不能写字面秘密。优先使用已安装 `herdr-mcp` 二进制提供的托管 Link 安装路径（`herdr-mcp link ...` / 当前 stable 产品文档）。不要把生产 Link 所有权留在仓库 Bash 包装上。
 
-Link 可以复用用户环境里**已经存在**的代理配置。识别优先级：`HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`；macOS 也会读取现有 `scutil --proxy` 状态（HTTPS、HTTP、SOCKS）。支持 `socks5://`/`socks5h://`（remote-DNS 语义），不支持代理认证；macOS PAC 只检测不执行。如果所选 origin 仍不可达，停止并询问用户；未经明确指示不得修改代理、网络节点、系统代理、DNS/自定义域名选择或其它网络设置。见 [本 Agent 安装协议](agent-install.md) §5。
+Agent 应该自己探测网络可达性，而不是让用户先选择 transport。执行 `herdr-mcp doctor`、`herdr-mcp link status`，并对最终 public origin / backing `workers.dev` 做有界 `/health` 探测。Link 会复用用户环境里**已经存在**的代理配置，识别优先级：`HERDR_LINK_PROXY` > `HTTPS_PROXY`/`https_proxy` > `HTTP_PROXY`/`http_proxy` > `ALL_PROXY`/`all_proxy`；macOS 也会读取现有 `scutil --proxy` 状态（HTTPS、HTTP、SOCKS）。支持 `socks5://`/`socks5h://`（remote-DNS 语义），不支持代理认证；macOS PAC 只检测不执行。
+
+transport 选择默认无感完成：配置了 Custom Domain 时，Link 使用这条稳定 direct path，不使用共享 Relay Pool；没有 Custom Domain 时，依次尝试 direct `workers.dev` → 已经配置并验证的本地代理 → 内置已验收的 Herdr Relay baseline（Deno 为主、Supabase fallback），若本机存在更新且有效的签名 Relay Pool cache，则完整覆盖 baseline。用户不需要 Deno/Supabase 账号，也不需要配置 Relay URL。不要为了让探测变绿而自行修改系统代理、网络节点、DNS 或已经选定的公网 identity。
 
 ## 9. 验证闭环
 
-验证本机 `server/discover`、`herdr-mcp status`、`herdr-mcp doctor`、Link status、Worker `/health`、公网 `/mcp`、OAuth discovery，并确认默认 `workers.dev` bootstrap 没有创建 Custom Domain/DNS/Tunnel（Custom Domain 只在用户明确要求时添加，见 §0）。doctor 可在不发送 token 的前提下探测 Edge `/health`、OAuth metadata、`/mcp`；永远不要打印 token。
+验证本机 `server/discover`、`herdr-mcp status`、`herdr-mcp doctor`、Link status、Worker `/health`、公网 `/mcp`、OAuth discovery，并同时记录 bootstrap `workers.dev` origin 与最终 canonical public origin。选择了 Custom Domain 就必须在注册 Connector 前证明该 hostname；最终使用 `workers.dev` 时，则证明公网 identity 健康，并确认 `link status` 能看到可用的自动 fallback ladder / Relay candidate pool。doctor 可在不发送 token 的前提下探测 Edge `/health`、OAuth metadata、`/mcp`；永远不要打印 token。
 
 ### 区分 Worker 健康与 hostname/网络路径健康
 
@@ -215,7 +226,7 @@ Link 可以复用用户环境里**已经存在**的代理配置。识别优先�
 - **Worker 代码健康**：origin 对 `GET /health` 返回 200，未认证的 `GET /mcp` 返回预期的 401。这证明已部署的 Worker、路由与 OAuth metadata——无论哪个 hostname 应答。
 - **hostname/DNS/网络路径故障**：超时、DNS 解析失败、TLS/SNI 失败或被过滤，而同一 Worker 的另一个 hostname 可用（例如 `*.workers.dev` 超时而该 Worker 的 Custom Domain 返回 200，或相反）。这是传输路径问题，不是 Worker 缺陷：绝不用重新部署 Worker 或创建第二个 Worker/R2/Connector 来「修」它。
 
-用户有想用的域名时，优先把 Custom Domain 作为稳定 production origin（显式配置，OAuth issuer 在客户端接入前设置好）；否则继续以 `workers.dev` 为 production origin，网络路径问题交给后续 Link transport fallback 阶梯（direct → 已验证本地代理 → 共享 relay）。连通性修复不得顺带改名或迁移 OAuth issuer。
+所选 Cloudflare Account 已有 active zone 时，优先建议专用 Custom Domain 作为稳定 production origin，并在客户端接入前完成配置；没有合适 zone 或用户不使用时，继续以 `workers.dev` 为 production origin，网络路径问题由 Link 自动 fallback（direct → 已验证本地代理 → qualified shared Relay）。连通性修复不得顺带改名或迁移 OAuth issuer。
 
 ## 10. 清理 bootstrap Token
 
@@ -223,7 +234,7 @@ Unset `CLOUDFLARE_API_TOKEN` 与 `CLOUDFLARE_ACCOUNT_ID`，删除临时凭据文
 
 ## 11. 最终报告
 
-只回报非敏感事实：已安装 runtime generation/version、本机 MCP 状态、Herdr Link 状态、Cloudflare Account 名 + 缩短 ID、Worker 名、`workers.dev` origin、`/health`、`/mcp`。
+只回报非敏感事实：已安装 runtime generation/version、本机 MCP 状态、Herdr Link 状态、Cloudflare Account 名 + 缩短 ID、Worker 名、bootstrap `workers.dev` origin、最终 canonical public origin（Custom Domain 或 `workers.dev`）、Link transport/fallback readiness、`/health`、`/mcp`。
 
 最后引导用户开启 ChatGPT Developer mode，用 `/mcp` 创建自定义 MCP Connector 并完成 OAuth。永远不要把本机 `HERDR_MCP_TOKEN` 或 Cloudflare Token 粘贴进 ChatGPT。
 

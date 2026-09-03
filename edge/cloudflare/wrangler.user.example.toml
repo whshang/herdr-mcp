@@ -1,6 +1,9 @@
 # Generic Herdr Cloudflare Edge config.
 # Copy to wrangler.user.toml (keep that local) and replace the placeholders.
-# A custom domain is OPTIONAL: workers.dev is the default supported endpoint.
+# A custom domain is OPTIONAL: workers.dev is the zero-domain bootstrap and a
+# fully supported final endpoint when no suitable Cloudflare zone is available.
+# When the account already has an active zone, prefer the Custom Domain block
+# below before registering OAuth/MCP clients.
 
 name = "herdr-edge"
 main = "src/index.ts"
@@ -51,7 +54,9 @@ new_sqlite_classes = ["DeviceRegistryDO"]
 [triggers]
 crons = ["*/10 * * * *"]
 
-# Optional after workers.dev validation:
+# Recommended after workers.dev bootstrap validation when the selected Cloudflare
+# account already has an active zone. Finalize this before registering OAuth/MCP
+# clients; Cloudflare Custom Domains manage the Worker DNS record/certificate.
 # [[routes]]
 # pattern = "herdr.example.com"
 # custom_domain = true

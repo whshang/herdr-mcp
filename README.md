@@ -30,10 +30,10 @@ The model keeps planning. Your computers keep the real state. Small tasks can ru
 ### Recommended: paste one sentence to your Agent
 
 ```text
-Install and configure Herdr and herdr-mcp for me by following https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md end to end; use the current stable GitHub Release, configure Cloudflare and ChatGPT, pause only when I must personally sign in or authorize access, and verify the complete connection before finishing.
+Install and configure Herdr and herdr-mcp for me by following https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md end to end; use the current stable GitHub Release, configure Cloudflare and ChatGPT, prefer a dedicated Cloudflare Custom Domain when my account already has a suitable active zone, otherwise keep workers.dev, automatically verify the workstation network/fallback path, pause only when I must personally sign in or authorize access, and verify the complete connection before finishing.
 ```
 
-The Agent checks the machine, installs Herdr and herdr-mcp, creates or connects the Cloudflare entry, starts the workstation connection, guides you through the ChatGPT authorization step, runs health checks, and proves the setup with a real MCP request. It should only stop when an account sign-in or authorization genuinely requires you.
+The Agent checks the machine, installs Herdr and herdr-mcp, bootstraps the Worker on `workers.dev`, recommends/finalizes a Custom Domain before OAuth when your Cloudflare account has a suitable zone, starts the workstation connection, guides you through ChatGPT authorization, tests the actual network path, and proves the setup with a real MCP request. No domain is required: without one, the Link transparently falls back from direct `workers.dev` to an already-configured local proxy and then to the qualified shared Relay baseline when necessary.
 
 ### Manual installation
 
@@ -53,7 +53,7 @@ Cloudflare provides the stable public MCP/OAuth entry while every development co
 
 ### Shared Relay is fallback transport, not your public endpoint
 
-Herdr-MCP normally keeps the workstation Link direct. If you configured your own Cloudflare Custom Domain, the shared Relay Pool is not used. Without a Custom Domain, the Link tries the Worker `workers.dev` origin directly, then a validated local proxy when one exists; only when those paths are unavailable can it fall back to the Herdr-operated Relay Pool.
+Herdr-MCP normally keeps the workstation Link direct. If you configured your own Cloudflare Custom Domain, the shared Relay Pool is not used. Without a Custom Domain, the Link tries the Worker `workers.dev` origin directly, then a validated local proxy when one exists; only when those paths are unavailable does it fall back automatically to the Herdr-operated Relay Pool. Fresh installs carry the exact Deno/Supabase baseline qualified by the v0.4.5 mainland-China no-proxy UAT; a newer valid signed pool cache can replace that baseline.
 
 The Relay does not replace your MCP/OAuth address, terminate your device identity, or turn Herdr into a generic proxy. It only forwards the already-authenticated `herdr-link` WebSocket to your own `workers.dev` Worker. The production pool uses independent Deno and Supabase failure domains with sticky, capacity-weighted per-device selection and bounded failover. Deno carries the large majority of long-lived connections; Supabase receives a small capacity share and remains a full fallback because its hosted Edge Function lifetime and Free-plan invocation budget are tighter. Normal users do not create either provider account or configure a Relay URL.
 
@@ -73,13 +73,15 @@ Web AI can also copy small non-secret UTF-8 text between enrolled computers thro
 
 ### Add another computer to the fleet
 
-On an already-authorized computer, create a short-lived pairing session:
+Preferred: ask in the already-authorized ChatGPT conversation:
 
-```bash
-herdr-mcp worker pair
+```text
+Generate a Herdr pairing link for my new computer, valid for 10 minutes.
 ```
 
-It prints a pairing address and a single-use 6-digit verification code. On the new computer, give its coding agent this one sentence:
+Herdr creates the pairing directly at Edge, so no old workstation needs to be online. ChatGPT returns the pairing address, one-time 6-digit code, exact expiry, and the copyable `herdr-mcp worker connect "<pairing-address>"` command. `herdr-mcp worker pair` on an authorized Mac remains the CLI fallback.
+
+On the new computer, give its coding agent this one sentence:
 
 ```text
 Connect this computer to my existing Herdr fleet by following https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md; use this pairing address: <pairing-address>, ask me for the 6-digit verification code only when the CLI prompts for it, then verify this device appears online in the same Worker.

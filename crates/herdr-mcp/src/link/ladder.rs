@@ -18,7 +18,8 @@
 //! - A successful route is sticky for the healthy connection.
 //! - Status/doctor exposes non-secret selected transport/proxy/relay/failover evidence.
 //! - Invalid or non-workers.dev relay candidates fail closed and cannot become a generic proxy.
-//! - No hardcoded operator/private upstreams or default relays before qualification.
+//! - No operator/private upstreams. Embedded Relay defaults are limited to exact
+//!   public endpoints that passed the v0.4.5 mainland-China qualification UAT.
 //! - Route exhaustion saturates on the last candidate without tight cycling back to direct.
 
 use url::Url;
@@ -240,13 +241,31 @@ fn order_relay_candidates(
     ordered
 }
 
-/// Default embedded relay candidates.
+/// Qualified baseline Relay candidates for fresh installs.
 ///
-/// Kept deliberately empty until exact-host mainland UAT passes per the
-/// v0.4.5 release plan. Relay endpoints are injected via configuration/data
-/// seam once qualified.
+/// These exact public endpoints passed the v0.4.5 mainland-China no-proxy UAT.
+/// A fresh runtime therefore has a bounded fallback when no newer signed Relay
+/// Pool manifest is present in cache. A valid cached remote manifest replaces
+/// this baseline; it does not merge with it.
 pub fn default_embedded_relays() -> Vec<RelayEndpoint> {
-    Vec::new()
+    vec![
+        RelayEndpoint {
+            id: "deno".to_owned(),
+            url: "wss://relay.herdr-mcp.deno.net/v1".to_owned(),
+            priority: 200,
+            weight: 100,
+            failure_domain: "deno-deploy".to_owned(),
+            enabled: true,
+        },
+        RelayEndpoint {
+            id: "supabase".to_owned(),
+            url: "wss://sppeaueojvcxifimozqx.supabase.co/functions/v1/herdr-relay/v1".to_owned(),
+            priority: 200,
+            weight: 1,
+            failure_domain: "supabase-ap-southeast-1".to_owned(),
+            enabled: true,
+        },
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -731,12 +750,24 @@ mod tests {
     use crate::link::proxy::ProxySource;
 
     #[test]
-    fn default_embedded_relays_is_empty_before_qualification() {
+    fn default_embedded_relays_match_the_qualified_mainland_pool() {
         let pool = default_embedded_relays();
-        assert!(
-            pool.is_empty(),
-            "default embedded relay pool must be empty before exact-host mainland UAT qualification"
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool[0].id, "deno");
+        assert_eq!(pool[0].url, "wss://relay.herdr-mcp.deno.net/v1");
+        assert_eq!(pool[0].priority, 200);
+        assert_eq!(pool[0].weight, 100);
+        assert_eq!(pool[0].failure_domain, "deno-deploy");
+        assert!(pool[0].enabled);
+        assert_eq!(pool[1].id, "supabase");
+        assert_eq!(
+            pool[1].url,
+            "wss://sppeaueojvcxifimozqx.supabase.co/functions/v1/herdr-relay/v1"
         );
+        assert_eq!(pool[1].priority, 200);
+        assert_eq!(pool[1].weight, 1);
+        assert_eq!(pool[1].failure_domain, "supabase-ap-southeast-1");
+        assert!(pool[1].enabled);
     }
 
     fn relay_fixture(id: &str, weight: u32) -> RelayEndpoint {

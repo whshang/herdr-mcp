@@ -208,6 +208,7 @@ test("herdr_devices executes at Edge and exposes pairing hint without tools/list
   assert.ok(r.body.result.structuredContent.pairing_hint.includes("herdr_mcp.device.pair"));
   assert.ok(r.body.result.structuredContent.pairing_hint.includes("params='{\"ttl_seconds\":600"));
   assert.ok(r.body.result.structuredContent.pairing_hint.includes("params is a JSON string"));
+  assert.ok(r.body.result.structuredContent.pairing_hint.includes("exact expiry"));
   assert.equal(d.calls.length, 0);
 });
 
@@ -245,7 +246,15 @@ test("herdr_call herdr_mcp.device.pair executes at Edge and creates pairing with
   assert.equal(r.body.result.structuredContent.code, "654321");
   assert.match(r.body.result.structuredContent.pairing_id, /^pair_[0-9a-f]{64}$/);
   assert.equal(r.body.result.structuredContent.pairing_address, "https://edge.example/pair#pair_" + "11".repeat(32));
+  assert.equal(r.body.result.structuredContent.expires_at, "1970-01-01T00:10:00.000Z");
+  assert.equal(r.body.result.structuredContent.ttl_seconds, 300);
+  assert.equal(
+    r.body.result.structuredContent.new_device_command,
+    `herdr-mcp worker connect "https://edge.example/pair#pair_${"11".repeat(32)}"`,
+  );
   assert.ok(r.body.result.structuredContent.instructions.includes("herdr-mcp worker connect"));
+  assert.ok(r.body.result.structuredContent.instructions.includes("1970-01-01T00:10:00.000Z"));
+  assert.ok(r.body.result.structuredContent.instructions.includes("no-echo prompt"));
   assert.deepEqual(pairingInput, { ttl_seconds: 300, name: "new-workstation" });
   assert.equal(d.calls.length, 0, "must never forward to a workstation");
   assert.equal(d.targets.length, 0);

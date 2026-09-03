@@ -1105,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_signed_cache_supplies_revision_floor_but_no_routes_and_blocks_rollback() {
+    fn expired_signed_cache_supplies_revision_floor_and_falls_back_to_embedded_pool() {
         let paths = test_paths("expired-floor");
         let cached = envelope(
             &payload(
@@ -1120,7 +1120,8 @@ mod tests {
         accept_cache_with_keys(&paths, &cached, TEST_NOW, test_key_lookup).unwrap();
         let expired_now = TEST_NOW + 172_800;
         let loaded = load_cached_pool_with_keys(&paths, expired_now, test_key_lookup);
-        assert!(loaded.relays.is_empty());
+        assert_eq!(loaded.source, "embedded");
+        assert_eq!(loaded.relays, default_embedded_relays());
         assert_eq!(loaded.revision_floor, Some(5));
         assert_eq!(loaded.freshness, "expired");
 
@@ -1287,11 +1288,16 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_contains_only_public_trust_and_embedded_pool_remains_empty() {
+    fn production_registry_contains_only_public_trust_and_qualified_embedded_pool() {
         assert!(production_verification_key(RELAY_PROD_2026_09_KEY_ID).is_some());
         assert!(production_verification_key("test-key").is_none());
         assert!(production_verification_key("unknown-key").is_none());
-        assert!(default_embedded_relays().is_empty());
+        let embedded = default_embedded_relays();
+        assert_eq!(embedded.len(), 2);
+        assert_eq!(embedded[0].id, "deno");
+        assert_eq!(embedded[0].weight, 100);
+        assert_eq!(embedded[1].id, "supabase");
+        assert_eq!(embedded[1].weight, 1);
     }
 
     #[test]
@@ -1325,7 +1331,7 @@ mod tests {
 
         fs::write(cache_path(&paths.config_dir), b"corrupt-cache").unwrap();
         let rejected = load_cached_pool_with_keys(&paths, TEST_NOW, test_key_lookup);
-        assert!(rejected.relays.is_empty());
+        assert_eq!(rejected.relays, default_embedded_relays());
         assert_eq!(rejected.source, "embedded");
         assert_eq!(rejected.freshness, "untrusted");
         let ladder = TransportLadder::from_config(
@@ -1342,7 +1348,7 @@ mod tests {
             ladder
                 .routes()
                 .iter()
-                .all(|route| route.kind != TransportRouteKind::SharedRelay)
+                .any(|route| route.kind == TransportRouteKind::SharedRelay)
         );
         let _ = fs::remove_dir_all(&paths.config_dir);
     }

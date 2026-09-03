@@ -27,18 +27,24 @@ Each enrolled computer has its own credential and immutable `device_id`. Device 
 
 ## Add a new computer
 
-### 1. Create a short-lived pairing on an authorized computer
+### 1. Preferred: create the pairing directly in ChatGPT
 
-Run:
+In an already-authorized Herdr conversation, simply ask:
 
-```bash
-herdr-mcp worker pair
+```text
+Generate a Herdr pairing link for my new computer, valid for 10 minutes.
 ```
 
-This creates a single-use pairing session, normally valid for 10 minutes, and prints:
+ChatGPT can create the pairing directly at Edge; no enrolled workstation has to be online. The response should show together:
 
-- a pairing address containing a high-entropy pairing id; and
-- a 6-digit verification code, formatted like `123 456`.
+- the pairing address containing a high-entropy pairing id;
+- the single-use 6-digit verification code;
+- the exact expiry time; and
+- the copyable `herdr-mcp worker connect "<pairing-address>"` command.
+
+The normal maximum TTL is 600 seconds. Use the pairing immediately instead of treating it as a durable invitation.
+
+CLI fallback: on any authorized macOS computer in the fleet, `herdr-mcp worker pair` creates the same short-lived pairing and now prints the exact UTC expiry as well as the relative validity window.
 
 ### 2. Connect the new computer
 
@@ -96,7 +102,7 @@ The joining computer does **not** need:
 - The 6-digit code is single-use and short-lived.
 - Five wrong code attempts permanently lock that pairing session; create a new one instead of retrying indefinitely.
 - The pairing id is high-entropy and stays in the URL fragment so it is not placed in normal HTTP access-log paths.
-- Never put the verification code in argv, shell history, logs, or transcripts.
+- The OAuth-authorized owner conversation may display the one-time code when the user explicitly creates a pairing there. Outside that narrow flow, never persist the code in argv, shell history, Git, ordinary logs, copied transcripts, or unattended automation.
 - Never print or copy the final per-device credential; it belongs in the OS credential store.
 
 ## Recovery
