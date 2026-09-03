@@ -77,9 +77,15 @@ const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "u
 const controlCenterCss = readFileSync(path.join(EXT, "control-center.css"), "utf8");
 const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.89", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.89"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.89"'), "content version matches manifest");
+ok(manifest.version === "0.1.90", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.90"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.90"'), "content version matches manifest");
+ok(controlCenterHtml.includes('id="deviceToggleButton"')
+    && controlCenterHtml.includes('id="devicePanelBody"')
+    && controlCenterSource.includes('DEVICE_PANEL_COLLAPSED_KEY')
+    && controlCenterSource.includes('persistDevicePanelCollapse')
+    && controlCenterSource.includes('device?.authorization !== "revoked"'),
+  "Control Center device inventory is independently collapsible and defensively hides revoked tombstones");
 const ownerGateIndex = wakeSource.indexOf('type: "h2w_extension_owner_status"');
 const queueOwnerClaimIndex = wakeSource.indexOf('setAttribute(QUEUED_INSERT_OWNER_ATTR');
 ok(ownerGateIndex >= 0
@@ -881,8 +887,12 @@ ok(controlCenterSource.includes('const EXPANDED_WORKSPACES_KEY = "herdrControlEx
     && controlCenterSource.includes('restoreExpansionPreference(stored[EXPANDED_WORKSPACES_KEY])')
     && controlCenterSource.includes('[EXPANDED_WORKSPACES_KEY]: [...expandedWorkspaces].sort()')
     && controlCenterSource.includes('void persistExpansionPreference();')
-    && controlCenterSource.includes('chrome.storage.local.get([TARGET_KEY, EXPANDED_WORKSPACES_KEY])'),
-  "Control Center persists explicit workspace expansion state so panel reloads cannot reopen user-collapsed rows");
+    && controlCenterSource.includes('const DEVICE_PANEL_COLLAPSED_KEY = "herdrControlDevicePanelCollapsed"')
+    && controlCenterSource.includes('chrome.storage.local.get([')
+    && controlCenterSource.includes('TARGET_KEY,')
+    && controlCenterSource.includes('EXPANDED_WORKSPACES_KEY,')
+    && controlCenterSource.includes('DEVICE_PANEL_COLLAPSED_KEY,'),
+  "Control Center persists explicit workspace and device-panel expansion state so panel reloads cannot reopen user-collapsed regions");
 ok(chatGptAdapterSource.includes("getStopButtonCandidates()")
     && chatGptAdapterSource.includes('button[data-testid="stop-button"]')
     && !wakeSource.includes('document.querySelectorAll("button, [role=button]").filter')

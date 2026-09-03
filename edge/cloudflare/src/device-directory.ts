@@ -442,7 +442,11 @@ export async function listPublicDevices(
   registry: FetchStub,
   getWorkstationStub: (workstationId: string) => FetchStub,
 ): Promise<PublicDeviceSummary[]> {
-  const devices = await readRegistryDevices(registry);
+  // Revoked records are durable authorization tombstones, not fleet members.
+  // Keep them in DeviceRegistryDO so old credentials can never resurrect, but
+  // omit them from normal inventory surfaces and avoid stale status lookups.
+  const devices = (await readRegistryDevices(registry))
+    .filter((device) => device.authorization !== "revoked");
   return Promise.all(devices.map(async (device) => {
     const status = await readStatus(getWorkstationStub(device.workstation_id));
     return {

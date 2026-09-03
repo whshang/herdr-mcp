@@ -63,6 +63,14 @@ herdr-mcp worker rename "<new-device-name>"
 
 `herdr-mcp device rename ...` も同じ操作です。rename が変更するのは人向けの表示名だけで、不変な `device_id`、workstation identity、資格情報、authorization、scheduling は変わりません。Link の再接続で明示的な rename が上書きされることもありません。default/legacy workstation も最初の登録時にローカル Computer Name を記録します。
 
+別の登録済みデバイスの認可を恒久的に取り消す場合は、まず `herdr_devices` で不変の `device_id` を確認し、owner ワークステーションで次を実行します:
+
+```bash
+herdr-mcp worker revoke "<device-id>" --confirm
+```
+
+revoke はそのデバイス identity と資格情報に対して恒久的です。稼働中の Link は切断され、古い資格情報では再接続できません。古い identity の復活を防ぐため内部には最小の revoked tombstone を保持しますが、通常のデバイス一覧には表示しません。後で同じコンピュータを再追加する場合は、新しい pairing で新しいデバイス identity として登録してください。
+
 ## 不確実な配信 / リカバリ
 
 - いずれかの mutation が不確実な配信を報告した場合は、**盲目的に再試行せず**、まず現在の状態を確認してください。

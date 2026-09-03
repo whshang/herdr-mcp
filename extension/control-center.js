@@ -15,6 +15,7 @@ import { detectOrLoadLocale, getLocale, t } from "./i18n.js";
 
 const TARGET_KEY = "herdrControlPinnedTarget";
 const EXPANDED_WORKSPACES_KEY = "herdrControlExpandedWorkspaces";
+const DEVICE_PANEL_COLLAPSED_KEY = "herdrControlDevicePanelCollapsed";
 const store = createBrowserStateStore();
 const expandedWorkspaces = new Set();
 let expansionSeeded = false;
@@ -26,6 +27,7 @@ let selectedMode = null;
 let pageContext = { loading: true, tabId: null, windowId: null, response: null, error: null };
 let pageContextRefreshSeq = 0;
 let fleetContext = { loading: true, response: null, error: null, updatedAt: 0 };
+let devicePanelCollapsed = false;
 let bindingMutationWorkspaceId = null;
 let actionInFlight = false;
 
@@ -34,6 +36,9 @@ const runtimeDot = $("runtimeDot");
 const runtimeText = $("runtimeText");
 const runtimeStats = $("runtimeStats");
 const deviceSummary = $("deviceSummary");
+const deviceToggleButton = $("deviceToggleButton");
+const deviceChevron = $("deviceChevron");
+const devicePanelBody = $("devicePanelBody");
 const deviceList = $("deviceList");
 const deviceHelp = $("deviceHelp");
 const workspaceList = $("workspaceList");
@@ -151,6 +156,19 @@ function fleetFailureText(response) {
   return t("cc_devices_unavailable", { error: response?.error || code || "unknown" });
 }
 
+function renderDevicePanelCollapse() {
+  devicePanelBody.hidden = devicePanelCollapsed;
+  deviceToggleButton.setAttribute("aria-expanded", String(!devicePanelCollapsed));
+  deviceToggleButton.title = t(devicePanelCollapsed ? "cc_devices_expand" : "cc_devices_collapse");
+  deviceChevron.textContent = devicePanelCollapsed ? "›" : "⌄";
+}
+
+async function persistDevicePanelCollapse() {
+  try {
+    await chrome.storage.local.set({ [DEVICE_PANEL_COLLAPSED_KEY]: devicePanelCollapsed });
+  } catch (_) { /* UI state remains valid for this panel lifetime. */ }
+}
+
 function renderFleet() {
   deviceList.replaceChildren();
   deviceHelp.hidden = true;
@@ -179,11 +197,14 @@ function renderFleet() {
     return;
   }
 
-  const devices = Array.isArray(response.devices) ? [...response.devices] : [];
+  // Revoked identities are authorization tombstones, not current fleet members.
+  // Edge filters them too; keep this defensive filter for older/stale runtimes.
+  const devices = Array.isArray(response.devices)
+    ? response.devices.filter((device) => device?.authorization !== "revoked")
+    : [];
   devices.sort((a, b) => {
-    const rank = (device) => device.authorization === "revoked" ? 3
-      : device.connection === "online" ? 0
-        : device.connection === "stale" ? 1 : 2;
+    const rank = (device) => device.connection === "online" ? 0
+      : device.connection === "stale" ? 1 : 2;
     return rank(a) - rank(b) || String(a.name || a.device_id).localeCompare(String(b.name || b.device_id));
   });
   const online = devices.filter((device) => device.authorization === "active" && device.connection === "online").length;
@@ -204,7 +225,7 @@ function renderFleet() {
   const localDeviceId = String(response.local?.device_id || "");
   for (const device of devices) {
     const row = document.createElement("div");
-    row.className = `device-row${device.authorization === "revoked" ? " revoked" : ""}`;
+    row.className = "device-row";
 
     const dot = document.createElement("span");
     dot.className = `dot ${fleetStatusDot(device)}`;
@@ -745,6 +766,7 @@ try {
 
 function renderAll() {
   const state = store.get();
+  renderDevicePanelCollapse();
   renderRuntime(state);
   renderPageContext(state);
   renderTarget();
@@ -868,8 +890,15 @@ $("refreshButton").addEventListener("click", () => {
 });
 $("collapseButton").addEventListener("click", () => {
   expandedWorkspaces.clear();
+  devicePanelCollapsed = true;
   void persistExpansionPreference();
+  void persistDevicePanelCollapse();
   renderAll();
+});
+deviceToggleButton.addEventListener("click", () => {
+  devicePanelCollapsed = !devicePanelCollapsed;
+  void persistDevicePanelCollapse();
+  renderDevicePanelCollapse();
 });
 $("settingsButton").addEventListener("click", () => chrome.runtime.openOptionsPage());
 unpinButton.addEventListener("click", async () => {
@@ -959,9 +988,14 @@ async function start() {
   await detectOrLoadLocale();
   applyStaticI18n();
   document.documentElement.classList.remove("i18n-pending");
-  const stored = await chrome.storage.local.get([TARGET_KEY, EXPANDED_WORKSPACES_KEY]);
+  const stored = await chrome.storage.local.get([
+    TARGET_KEY,
+    EXPANDED_WORKSPACES_KEY,
+    DEVICE_PANEL_COLLAPSED_KEY,
+  ]);
   pinnedTarget = stored[TARGET_KEY] || null;
   restoreExpansionPreference(stored[EXPANDED_WORKSPACES_KEY]);
+  devicePanelCollapsed = stored[DEVICE_PANEL_COLLAPSED_KEY] === true;
   connectControlPort(false);
   renderAll();
   renderFleet();

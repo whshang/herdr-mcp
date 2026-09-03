@@ -86,6 +86,14 @@ herdr-mcp worker rename "<new-device-name>"
 
 `herdr-mcp device rename ...` 是等价别名。rename 只修改面向人的显示名称；不可变 `device_id`、workstation identity、设备凭据、授权和调度状态全部保持不变。Link 重连不会覆盖用户显式改过的名字。最初的 default/legacy workstation 在首次登记时也会自动记录本机 Computer Name。
 
+如果要永久撤销另一台已登记设备的授权，先通过 `herdr_devices` 取得它不可变的 `device_id`，然后在 owner 工作站运行：
+
+```bash
+herdr-mcp worker revoke "<device-id>" --confirm
+```
+
+revoke 对该设备身份和凭据是永久操作：在线 Link 会立即断开，旧凭据以后不能再次连接；系统内部会保留最小 revoked tombstone 防止旧身份“复活”，但正常设备列表会隐藏这些 tombstone。以后若要重新加入这台电脑，需要重新生成配对并登记为新的设备身份。
+
 ## 配对实际做了什么
 
 短期配对会换取新的单设备凭据。最终凭据写入 macOS Keychain，Worker 只保存验证该设备所需的 verifier；成功消费后，原配对立即失效。

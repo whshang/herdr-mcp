@@ -105,6 +105,7 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
             connect_existing_worker(&paths, &pairing_address, name.as_deref())
         }
         WorkerCommand::Rename { name } => rename_current_device(&paths, &name),
+        WorkerCommand::Revoke { device_id } => revoke_device(&paths, &device_id),
     }
 }
 
@@ -282,6 +283,46 @@ fn connect_existing_worker(
         crate::link::reconcile_after_service_generation_change,
         consume_pairing,
     )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn revoke_device(_paths: &RuntimePaths, _device_id: &str) -> Result<ExitCode, String> {
+    Err(
+        "worker revoke currently requires macOS Keychain; refusing to revoke on this platform"
+            .to_owned(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn revoke_device(paths: &RuntimePaths, device_id: &str) -> Result<ExitCode, String> {
+    let device_id = crate::config::normalize_device_id(device_id)?;
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_owner_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client()?
+        .post(endpoint(&identity.edge_origin, "/devices/revoke")?)
+        .headers(headers)
+        .json(&json!({ "device_id": device_id }))
+        .send()
+        .map_err(|error| format!("cannot revoke Worker device: {error}"))?;
+    let payload = parse_json_response(response, "device revoke")?;
+    let revoked_device_id = required_string(&payload, "device_id")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "worker_revoke",
+            "device_id": revoked_device_id,
+            "revoked_at_ms": payload.get("revoked_at_ms").cloned().unwrap_or(Value::Null),
+        }))
+        .map_err(|error| format!("cannot encode device revoke result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(not(target_os = "macos"))]
