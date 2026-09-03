@@ -38,3 +38,21 @@ test("runtime parity fixture pins the shared Node/Rust wire invariants", async (
   assert.deepEqual(parity.stateless_handshake_sse_methods, ["initialize", "tools/list"]);
   assert.deepEqual(parity.stateless_json_methods, ["server/discover", "tools/call"]);
 });
+
+test("relay adapters expected runtime contract constants match authoritative epoch2 fixture", async () => {
+  const fixture = JSON.parse(await readFile(new URL("contracts/epoch2.json", root), "utf8"));
+
+  for (const relativePath of [
+    "relay/deno/server.ts",
+    "supabase/functions/herdr-relay/index.ts",
+  ]) {
+    const source = await readFile(new URL(relativePath, root), "utf8");
+    const epochMatch = source.match(/export const EXPECTED_RUNTIME_CONTRACT_EPOCH = (\d+);/);
+    const hashMatch = source.match(/export const EXPECTED_RUNTIME_CONTRACT_HASH =\s*"([^"]+)";/);
+
+    assert.ok(epochMatch, `EXPECTED_RUNTIME_CONTRACT_EPOCH constant found in ${relativePath}`);
+    assert.ok(hashMatch, `EXPECTED_RUNTIME_CONTRACT_HASH constant found in ${relativePath}`);
+    assert.equal(Number(epochMatch[1]), fixture.contract_epoch, `epoch in ${relativePath} matches epoch2 fixture`);
+    assert.equal(hashMatch[1], fixture.contract_hash, `hash in ${relativePath} matches epoch2 fixture`);
+  }
+});
