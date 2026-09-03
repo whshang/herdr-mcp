@@ -275,7 +275,7 @@ export async function handleMcp(
         return rpcResult(id, callToolResult({
           ok: true,
           devices,
-          pairing_hint: "To connect a new computer, call herdr_call(method=\"herdr_mcp.device.pair\", params={\"ttl_seconds\":600, \"name\":\"<optional>\"}). Do not provide a device selector.",
+          pairing_hint: "To connect a new computer, call herdr_call(method=\"herdr_mcp.device.pair\", params='{\"ttl_seconds\":600,\"name\":\"<optional>\"}'). params is a JSON string in the public schema. Do not provide a device selector.",
         }));
       } catch {
         return rpcResult(

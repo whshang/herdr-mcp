@@ -37,7 +37,7 @@ Discover registered devices and their status with `herdr_devices`.
 To connect a new computer without requiring an existing or online workstation, create a short-lived pairing session directly at Edge using `herdr_call`:
 
 ```text
-herdr_call(method="herdr_mcp.device.pair", params={"ttl_seconds":600,"name":"<optional-name>"})
+herdr_call(method="herdr_mcp.device.pair", params='{"ttl_seconds":600,"name":"<optional-name>"}')
 ```
 
 `herdr_mcp.device.pair` is Edge-local: it does not accept a `device` selector or pane/workspace refs, and no enrolled workstation is required. The returned pairing session provides the verification code and connection address for `herdr-mcp worker connect`.

@@ -193,6 +193,8 @@ test("herdr_devices executes at Edge and exposes pairing hint without tools/list
   assert.deepEqual(r.body.result.structuredContent.devices, devices);
   assert.ok(typeof r.body.result.structuredContent.pairing_hint === "string");
   assert.ok(r.body.result.structuredContent.pairing_hint.includes("herdr_mcp.device.pair"));
+  assert.ok(r.body.result.structuredContent.pairing_hint.includes("params='{\"ttl_seconds\":600"));
+  assert.ok(r.body.result.structuredContent.pairing_hint.includes("params is a JSON string"));
   assert.equal(d.calls.length, 0);
 });
 
