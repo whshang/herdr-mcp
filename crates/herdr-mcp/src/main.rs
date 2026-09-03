@@ -47,6 +47,7 @@ mod projects;
 mod prompt;
 mod relay;
 mod release_trust;
+mod residue;
 mod runtime_meta;
 mod schema;
 mod service_lifecycle;

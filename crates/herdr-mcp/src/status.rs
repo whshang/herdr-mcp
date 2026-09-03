@@ -100,6 +100,7 @@ pub fn print_status(paths: &RuntimePaths, config: &Config) {
         "auto update scheduler: {}",
         crate::update_scheduler::status_line()
     );
+    println!("lifecycle residue: {}", crate::residue::status_line());
 }
 
 pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
@@ -234,6 +235,7 @@ fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusR
     println!("LAYER oauth-metadata {}", remote.oauth_metadata);
     println!("LAYER mcp-endpoint {}", remote.mcp_endpoint);
     println!("LAYER update-state {}", format_update_state_layer(paths));
+    println!("{}", crate::residue::doctor_line());
 }
 
 fn format_herdr_layer(paths: &RuntimePaths, report: &StatusReport) -> String {
