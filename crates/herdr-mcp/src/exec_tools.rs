@@ -4,6 +4,7 @@ use crate::mutation;
 use crate::projects;
 use serde_json::{Value, json};
 use std::fs;
+use std::path::Path;
 
 pub fn start(snapshot: &Value, registry: &ExecRegistry, args: &Value) -> Value {
     let root = match required_str(args, "root") {
@@ -20,21 +21,28 @@ pub fn start(snapshot: &Value, registry: &ExecRegistry, args: &Value) -> Value {
         Err(error) => return error,
     };
     let topology = projects::derive_routing(snapshot);
-    let managed = match fs_security::validate_existing_with_topology(&topology, root) {
+    let protected_root = crate::macos_permissions::is_protected_user_path(Path::new(root));
+    let managed = match if protected_root {
+        fs_security::validate_exact_project_root_with_topology(&topology, root)
+    } else {
+        fs_security::validate_existing_with_topology(&topology, root)
+    } {
         Ok(value) => value,
         Err(error) => return error,
     };
-    if !managed.real.is_dir() {
-        return json!({"ok": false, "reason": "not_a_directory", "root": managed.resolved.to_string_lossy()});
-    }
-    let expected = fs::canonicalize(&managed.root).unwrap_or_else(|_| managed.root.clone());
-    if managed.real != expected {
-        return json!({
-            "ok": false,
-            "reason": "root_not_project_root",
-            "root": managed.resolved.to_string_lossy(),
-            "project_root": managed.root.to_string_lossy(),
-        });
+    if !protected_root {
+        if !managed.real.is_dir() {
+            return json!({"ok": false, "reason": "not_a_directory", "root": managed.resolved.to_string_lossy()});
+        }
+        let expected = fs::canonicalize(&managed.root).unwrap_or_else(|_| managed.root.clone());
+        if managed.real != expected {
+            return json!({
+                "ok": false,
+                "reason": "root_not_project_root",
+                "root": managed.resolved.to_string_lossy(),
+                "project_root": managed.root.to_string_lossy(),
+            });
+        }
     }
     let working =
         match mutation::check_with_topology(snapshot, &topology, &managed.root, confirm_busy) {

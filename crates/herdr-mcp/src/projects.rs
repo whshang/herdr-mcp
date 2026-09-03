@@ -23,6 +23,8 @@ pub struct ProjectInfo {
     pub managed: bool,
     pub dirty: bool,
     pub changed_files: usize,
+    pub git_status_observed: bool,
+    pub git_status_source: Option<&'static str>,
     pub pane_ids: Vec<String>,
     pub cwds: Vec<PathBuf>,
 }
@@ -66,12 +68,14 @@ pub(crate) fn reset_derive_routing_call_count() {
 fn derive_inner(snapshot: &Value, include_git_status: bool) -> ProjectTopology {
     let pane_to_workspace = pane_workspaces(snapshot);
     let pane_cwds = pane_cwds(snapshot);
+    let declared_roots = declared_workspace_roots(snapshot);
     let home = home_dir();
 
     let mut grouped =
         BTreeMap::<PathBuf, (Option<&'static str>, BTreeSet<String>, BTreeSet<PathBuf>)>::new();
     for (pane_id, cwd) in pane_cwds {
-        let git_root = git_toplevel(&cwd);
+        let git_root = declared_git_root(&pane_id, &cwd, &pane_to_workspace, &declared_roots)
+            .or_else(|| git_toplevel_tcc_safe(snapshot, &cwd));
         let (root, vcs) = match git_root {
             Some(root) => (root, Some("git")),
             None => (cwd.clone(), None),
@@ -91,7 +95,7 @@ fn derive_inner(snapshot: &Value, include_git_status: bool) -> ProjectTopology {
                 managed.then_some(root.clone())
             })
             .collect::<Vec<_>>();
-        git_statuses(&status_roots)
+        git_statuses(snapshot, &status_roots)
     } else {
         HashMap::new()
     };
@@ -100,13 +104,18 @@ fn derive_inner(snapshot: &Value, include_git_status: bool) -> ProjectTopology {
         .into_iter()
         .map(|(root, (vcs, pane_ids, cwds))| {
             let managed = vcs.is_some() && !is_unmanaged_root(&root, home.as_deref());
-            let (dirty, changed_files) = statuses.get(&root).copied().unwrap_or((false, 0));
+            let status = statuses.get(&root);
+            let (dirty, changed_files) = status
+                .map(|status| (status.dirty, status.changed_files))
+                .unwrap_or((false, 0));
             let info = ProjectInfo {
                 root: root.clone(),
                 vcs,
                 managed,
                 dirty,
                 changed_files,
+                git_status_observed: status.is_some(),
+                git_status_source: status.map(|status| status.source),
                 pane_ids: pane_ids.into_iter().collect(),
                 cwds: cwds.into_iter().collect(),
             };
@@ -118,6 +127,43 @@ fn derive_inner(snapshot: &Value, include_git_status: bool) -> ProjectTopology {
         projects,
         pane_to_workspace,
     }
+}
+
+fn declared_workspace_roots(snapshot: &Value) -> HashMap<String, PathBuf> {
+    array(snapshot, "workspaces")
+        .iter()
+        .filter_map(|workspace| {
+            let workspace_id = workspace.get("workspace_id")?.as_str()?;
+            let worktree = workspace.get("worktree")?.as_object()?;
+            let root = worktree
+                .get("checkout_path")
+                .and_then(Value::as_str)
+                .or_else(|| worktree.get("path").and_then(Value::as_str))?;
+            let root = PathBuf::from(root);
+            root.is_absolute().then(|| (workspace_id.to_owned(), root))
+        })
+        .collect()
+}
+
+fn declared_git_root(
+    pane_id: &str,
+    cwd: &Path,
+    pane_to_workspace: &HashMap<String, String>,
+    declared_roots: &HashMap<String, PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(root) = pane_to_workspace
+        .get(pane_id)
+        .and_then(|workspace| declared_roots.get(workspace))
+        .filter(|root| cwd.starts_with(root))
+    {
+        return Some(root.clone());
+    }
+
+    declared_roots
+        .values()
+        .filter(|root| cwd.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .cloned()
 }
 
 pub fn workspaces_for_root(topology: &ProjectTopology, root: &Path) -> Vec<String> {
@@ -211,6 +257,13 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
+fn git_toplevel_tcc_safe(snapshot: &Value, cwd: &Path) -> Option<PathBuf> {
+    if should_use_stable_broker(cwd) {
+        return broker_git_status(snapshot, cwd).map(|status| status.root);
+    }
+    git_toplevel(cwd)
+}
+
 /// Stable local project identity shared by a Git checkout and its linked worktrees.
 ///
 /// This reads Git filesystem metadata instead of spawning Git so browser state
@@ -264,39 +317,84 @@ fn git_common_dir(git_root: &Path) -> Option<PathBuf> {
     Some(canonical_or_absolute(&resolved))
 }
 
-fn git_statuses(roots: &[PathBuf]) -> HashMap<PathBuf, (bool, usize)> {
+#[derive(Debug, Clone)]
+struct GitStatus {
+    root: PathBuf,
+    dirty: bool,
+    changed_files: usize,
+    source: &'static str,
+}
+
+fn git_statuses(snapshot: &Value, roots: &[PathBuf]) -> HashMap<PathBuf, GitStatus> {
     thread::scope(|scope| {
         let jobs = roots
             .iter()
             .map(|root| {
                 let root = root.clone();
                 scope.spawn(move || {
-                    let status = git_status(&root);
+                    let status = git_status(snapshot, &root);
                     (root, status)
                 })
             })
             .collect::<Vec<_>>();
 
-        jobs.into_iter().filter_map(|job| job.join().ok()).collect()
+        jobs.into_iter()
+            .filter_map(|job| job.join().ok())
+            .filter_map(|(root, status)| status.map(|status| (root, status)))
+            .collect()
     })
 }
 
-fn git_status(root: &Path) -> (bool, usize) {
-    let Some(output) = run_git(
+fn git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
+    if should_use_stable_broker(root) {
+        return broker_git_status(snapshot, root);
+    }
+    git_status_direct(root).map(|(dirty, changed_files)| GitStatus {
+        root: root.to_path_buf(),
+        dirty,
+        changed_files,
+        source: "local_git",
+    })
+}
+
+fn git_status_direct(root: &Path) -> Option<(bool, usize)> {
+    let output = run_git(
         root,
         &["status", "--porcelain", "--untracked-files=normal"],
         GIT_STATUS_TIMEOUT,
-    ) else {
-        return (false, 0);
-    };
+    )?;
     if !output.success {
-        return (false, 0);
+        return None;
     }
     let changed_files = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|line| !line.trim().is_empty())
         .count();
-    (changed_files > 0, changed_files)
+    Some((changed_files > 0, changed_files))
+}
+
+fn should_use_stable_broker(path: &Path) -> bool {
+    crate::macos_permissions::is_protected_user_path(path)
+        && !crate::tcc_broker::is_broker_child_process()
+}
+
+fn broker_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
+    let value = crate::tcc_broker::git_status_via_stable_broker(snapshot, root).ok()?;
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let resolved_root = value.get("root").and_then(Value::as_str)?;
+    let changed_files = value
+        .get("counts")
+        .and_then(|counts| counts.get("files"))
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())?;
+    Some(GitStatus {
+        root: PathBuf::from(resolved_root),
+        dirty: changed_files > 0,
+        changed_files,
+        source: "tcc_broker",
+    })
 }
 
 struct CommandOutput {
@@ -438,6 +536,8 @@ mod tests {
         assert!(project.managed);
         assert!(project.dirty);
         assert_eq!(project.changed_files, 1);
+        assert!(project.git_status_observed);
+        assert_eq!(project.git_status_source, Some("local_git"));
         assert_eq!(project.pane_ids, vec!["w1:p1"]);
         assert_eq!(topology.pane_to_workspace["w1:p1"], "w1");
 
@@ -447,6 +547,8 @@ mod tests {
         assert!(routed_project.managed);
         assert!(!routed_project.dirty);
         assert_eq!(routed_project.changed_files, 0);
+        assert!(!routed_project.git_status_observed);
+        assert_eq!(routed_project.git_status_source, None);
         assert_eq!(routed_project.pane_ids, vec!["w1:p1"]);
         assert_eq!(routing.pane_to_workspace["w1:p1"], "w1");
 
@@ -471,6 +573,35 @@ mod tests {
         assert_eq!(project.vcs, None);
         assert!(!project.managed);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn routing_trusts_declared_worktree_without_touching_the_filesystem() {
+        let root = PathBuf::from("/Users/example/Documents/does-not-need-to-exist");
+        let nested = root.join("nested");
+        let snapshot = json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {
+                    "checkout_path": root.to_string_lossy(),
+                    "repo_root": root.to_string_lossy(),
+                    "repo_key": "/Users/example/Documents/does-not-need-to-exist/.git"
+                }
+            }],
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": nested.to_string_lossy()
+            }],
+            "agents": []
+        });
+
+        let topology = derive_routing(&snapshot);
+        let project = topology.projects.get(&root).unwrap();
+        assert_eq!(project.vcs, Some("git"));
+        assert!(project.managed);
+        assert!(!project.git_status_observed);
+        assert_eq!(project.cwds, vec![nested]);
     }
 
     #[test]
