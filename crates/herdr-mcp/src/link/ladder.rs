@@ -7,6 +7,11 @@
 //! 4. sticky shared Relay endpoints
 //! 5. next healthy relay after bounded transport failures
 //!
+//! Explicit `HERDR_LINK_PROXY` authority: when an explicit `HERDR_LINK_PROXY` is
+//! configured and validated, it is attempted first before direct connections.
+//! Discovered system/env proxies (`HTTPS_PROXY`, `ALL_PROXY`, macOS system)
+//! remain fallback routes after direct attempts.
+//!
 //! Critical invariants:
 //! - Transport changes never replay an in-flight mutation.
 //! - Ordinary socket drops use existing reconnect backoff before failover.
@@ -14,10 +19,11 @@
 //! - Status/doctor exposes non-secret selected transport/proxy/relay/failover evidence.
 //! - Invalid or non-workers.dev relay candidates fail closed and cannot become a generic proxy.
 //! - No hardcoded operator/private upstreams or default relays before qualification.
+//! - Route exhaustion saturates on the last candidate without tight cycling back to direct.
 
 use url::Url;
 
-use super::proxy::{LinkProxyResolution, ResolvedProxy, resolve_link_proxy_detailed};
+use super::proxy::{LinkProxyResolution, ProxySource, ResolvedProxy, resolve_link_proxy_detailed};
 use super::socket_driver::build_edge_url;
 
 pub const WORKERS_DEV_SUFFIX: &str = ".workers.dev";
@@ -194,12 +200,16 @@ pub struct TransportRoute {
     pub relay_id: Option<String>,
 }
 
+fn is_loopback_or_test_host(host: &str) -> bool {
+    host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.ends_with(".test")
+        || host.ends_with(".local")
+}
+
 fn extract_origin_host(raw: &str) -> Result<String, LadderError> {
     let url = Url::parse(raw).map_err(|_| LadderError::InvalidOrigin(raw.to_owned()))?;
-    match url.scheme() {
-        "http" | "https" | "ws" | "wss" => {}
-        _ => return Err(LadderError::InsecureScheme(raw.to_owned())),
-    }
     let host = url
         .host_str()
         .ok_or_else(|| LadderError::InvalidOrigin(raw.to_owned()))?
@@ -207,14 +217,22 @@ fn extract_origin_host(raw: &str) -> Result<String, LadderError> {
     if host.is_empty() {
         return Err(LadderError::InvalidOrigin(raw.to_owned()));
     }
-    Ok(host)
+    match url.scheme() {
+        "https" | "wss" => Ok(host),
+        "http" | "ws" if is_loopback_or_test_host(&host) => Ok(host),
+        _ => Err(LadderError::InsecureScheme(raw.to_owned())),
+    }
 }
 
 fn normalize_origin_to_ws_base(raw: &str) -> Result<String, LadderError> {
     let mut url = Url::parse(raw).map_err(|_| LadderError::InvalidOrigin(raw.to_owned()))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| LadderError::InvalidOrigin(raw.to_owned()))?
+        .to_ascii_lowercase();
     let scheme = match url.scheme() {
-        "http" | "ws" => "ws",
         "https" | "wss" => "wss",
+        "http" | "ws" if is_loopback_or_test_host(&host) => "ws",
         _ => return Err(LadderError::InsecureScheme(raw.to_owned())),
     };
     let _ = url.set_scheme(scheme);
@@ -228,10 +246,12 @@ fn normalize_origin_to_ws_base(raw: &str) -> Result<String, LadderError> {
 }
 
 /// Build ordered transport routes according to the transport ladder policy:
-/// 1. Direct Custom Domain when configured
-/// 2. Direct workers.dev
-/// 3. Validated explicit/system local proxy
-/// 4. Shared Relay endpoints (sorted by priority descending)
+/// - If explicit `HERDR_LINK_PROXY` is resolved, local proxy is route 0 (authoritative).
+/// - Otherwise:
+///   1. Direct Custom Domain when configured
+///   2. Direct workers.dev
+///   3. Validated system/env local proxy (targeting workers.dev upstream)
+///   4. Shared Relay endpoints (sorted by priority descending)
 ///
 /// Fails explicitly if given malformed origins or if no valid route can be formed.
 /// Never manufactures or synthesizes a hardcoded upstream.
@@ -245,7 +265,6 @@ pub fn build_ladder_routes(
 ) -> Result<Vec<TransportRoute>, LadderError> {
     validate_workstation_id(workstation_id)?;
 
-    // Validate and classify public origin if provided
     let mut custom_domain = None;
     let mut workers_dev = None;
 
@@ -277,7 +296,37 @@ pub fn build_ladder_routes(
         }
     }
 
+    // Build local proxy route if proxy is configured
+    // Proxy target prefers backing link upstream (workers.dev) over custom domain
+    let local_proxy_route = if let Some(resolved_proxy) = &proxy {
+        let target = workers_dev.or(custom_domain);
+        if let Some(target_origin) = target {
+            let base_url = normalize_origin_to_ws_base(target_origin)?;
+            let ws_url = build_edge_url(&base_url, workstation_id)
+                .map_err(|_| LadderError::InvalidUrl(base_url))?;
+            Some(TransportRoute {
+                kind: TransportRouteKind::LocalProxy,
+                endpoint_url: ws_url,
+                proxy: Some(resolved_proxy.clone()),
+                relay_id: None,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let is_explicit_herdr_proxy = proxy
+        .as_ref()
+        .is_some_and(|p| p.source == ProxySource::HerdrLinkProxy);
+
     let mut routes = Vec::new();
+
+    // Explicit HERDR_LINK_PROXY is authoritative and attempted first
+    if is_explicit_herdr_proxy && let Some(p_route) = &local_proxy_route {
+        routes.push(p_route.clone());
+    }
 
     // 1. Direct Custom Domain
     if let Some(cd) = custom_domain {
@@ -305,20 +354,9 @@ pub fn build_ladder_routes(
         });
     }
 
-    // 3. Validated explicit/system local proxy
-    if let Some(resolved_proxy) = proxy {
-        let target = custom_domain.or(workers_dev);
-        if let Some(target_origin) = target {
-            let base_url = normalize_origin_to_ws_base(target_origin)?;
-            let ws_url = build_edge_url(&base_url, workstation_id)
-                .map_err(|_| LadderError::InvalidUrl(base_url))?;
-            routes.push(TransportRoute {
-                kind: TransportRouteKind::LocalProxy,
-                endpoint_url: ws_url,
-                proxy: Some(resolved_proxy),
-                relay_id: None,
-            });
-        }
+    // 3. Fallback local proxy (when not explicit HERDR_LINK_PROXY)
+    if !is_explicit_herdr_proxy && let Some(p_route) = local_proxy_route {
+        routes.push(p_route);
     }
 
     // 4. & 5. Sticky shared Relay endpoints & pool failovers
@@ -446,17 +484,23 @@ impl TransportLadder {
     ///
     /// Increments the route's consecutive failure count. Once failures reach
     /// `max_failures_per_route`, advances `current_index` to the next route in
-    /// the ladder and returns `true`. Otherwise returns `false` (stays on the
-    /// current route for standard reconnect backoff).
+    /// the ladder (saturating at the final route upon exhaustion) and returns `true`.
+    /// Otherwise returns `false` (stays on the current route for standard reconnect backoff).
     pub fn record_failure(&mut self) -> bool {
         if self.routes.is_empty() {
             return false;
         }
         self.consecutive_failures += 1;
         if self.consecutive_failures >= self.max_failures_per_route {
-            self.current_index = (self.current_index + 1) % self.routes.len();
-            self.consecutive_failures = 0;
-            true
+            if self.current_index + 1 < self.routes.len() {
+                self.current_index += 1;
+                self.consecutive_failures = 0;
+                true
+            } else {
+                // Route exhaustion: saturate on the final route without tight wrap-around
+                self.consecutive_failures = self.max_failures_per_route;
+                false
+            }
         } else {
             false
         }
@@ -467,14 +511,19 @@ impl TransportLadder {
 pub struct TransportEvidence {
     pub mcp_origin: String,
     pub link_upstream: String,
-    pub link_transport: String,
+    pub live_transport: String,
+    pub configured_preferred_transport: String,
     pub proxy_source: String,
     pub relay: String,
     pub pool_source: String,
     pub failover_ready: bool,
+    pub candidate_count: usize,
 }
 
 /// Collect non-secret transport ladder evidence for `status` and `doctor`.
+///
+/// Reports `live_transport: unknown` when querying outside the live daemon
+/// rather than manufacturing a false direct/relay claim from static config.
 pub fn collect_transport_evidence(
     edge_public_origin: Option<&str>,
     link_upstream_origin: Option<&str>,
@@ -536,23 +585,23 @@ pub fn collect_transport_evidence(
     )
     .unwrap_or_default();
 
+    let candidate_count = routes.len();
     let first_route = routes.first();
-    let link_transport = first_route
+    let configured_preferred_transport = first_route
         .map(|r| r.kind.category_str().to_owned())
         .unwrap_or_else(|| "none".to_owned());
-    let relay = first_route
-        .and_then(|r| r.relay_id.clone())
-        .unwrap_or_else(|| "none".to_owned());
-    let failover_ready = routes.len() > 1;
+    let failover_ready = candidate_count > 1;
 
     TransportEvidence {
         mcp_origin,
         link_upstream,
-        link_transport,
+        live_transport: "unknown".to_owned(),
+        configured_preferred_transport,
         proxy_source,
-        relay,
+        relay: "unknown".to_owned(),
         pool_source: "embedded".to_owned(),
         failover_ready,
+        candidate_count,
     }
 }
 
@@ -636,6 +685,20 @@ mod tests {
             Err(LadderError::InsecureScheme(_))
         ));
 
+        // Production plain http rejects on non-local domain
+        let err_insecure_http = build_ladder_routes(
+            "wss://my-worker.workers.dev/ws",
+            Some("http://production-domain.com"),
+            None,
+            "dev_test",
+            None,
+            &[],
+        );
+        assert!(matches!(
+            err_insecure_http,
+            Err(LadderError::InsecureScheme(_))
+        ));
+
         let ladder_err = TransportLadder::new(vec![], 2);
         assert!(matches!(ladder_err, Err(LadderError::NoAvailableRoutes)));
     }
@@ -643,7 +706,7 @@ mod tests {
     #[test]
     fn preserves_existing_edge_url_when_no_origins_configured() {
         let routes = build_ladder_routes(
-            "wss://my-custom.domain.com/ws",
+            "wss://my-custom.domain.test/ws",
             None,
             None,
             "dev_test",
@@ -656,86 +719,107 @@ mod tests {
         assert_eq!(routes[0].kind, TransportRouteKind::DirectCustomDomain);
         assert_eq!(
             routes[0].endpoint_url,
-            "wss://my-custom.domain.com/ws/dev_test"
+            "wss://my-custom.domain.test/ws/dev_test"
         );
         assert!(routes[0].proxy.is_none());
     }
 
     #[test]
-    fn ladder_orders_direct_custom_domain_then_direct_workers_dev_then_proxy_then_relays() {
-        let proxy = Some(ResolvedProxy {
+    fn herdr_link_proxy_is_authoritative_first_route() {
+        let explicit_proxy = Some(ResolvedProxy {
             url: "http://127.0.0.1:7890".to_owned(),
-            source: ProxySource::HttpsProxy,
+            source: ProxySource::HerdrLinkProxy,
         });
-        let relays = vec![
-            RelayEndpoint {
-                id: "relay-a".to_owned(),
-                url: "wss://relay-a.test.net/v1".to_owned(),
-                priority: 100,
-                failure_domain: "domain-a".to_owned(),
-                enabled: true,
-            },
-            RelayEndpoint {
-                id: "relay-b".to_owned(),
-                url: "wss://relay-b.test.net/v1".to_owned(),
-                priority: 80,
-                failure_domain: "domain-b".to_owned(),
-                enabled: true,
-            },
-        ];
 
         let routes = build_ladder_routes(
-            "wss://herdr.example.com/ws",
-            Some("https://herdr.example.com"),
+            "wss://herdr.example.test/ws",
+            Some("https://herdr.example.test"),
             Some("https://my-worker.workers.dev"),
             "dev_test",
-            proxy,
-            &relays,
+            explicit_proxy,
+            &[],
         )
         .unwrap();
 
-        assert_eq!(routes.len(), 5);
-        assert_eq!(routes[0].kind, TransportRouteKind::DirectCustomDomain);
+        // HERDR_LINK_PROXY goes first!
+        assert_eq!(routes.len(), 3);
+        assert_eq!(routes[0].kind, TransportRouteKind::LocalProxy);
         assert_eq!(
             routes[0].endpoint_url,
-            "wss://herdr.example.com/ws/dev_test"
-        );
-        assert!(routes[0].proxy.is_none());
-
-        assert_eq!(routes[1].kind, TransportRouteKind::DirectWorkersDev);
-        assert_eq!(
-            routes[1].endpoint_url,
             "wss://my-worker.workers.dev/ws/dev_test"
         );
-        assert!(routes[1].proxy.is_none());
+        assert!(routes[0].proxy.is_some());
 
-        assert_eq!(routes[2].kind, TransportRouteKind::LocalProxy);
+        assert_eq!(routes[1].kind, TransportRouteKind::DirectCustomDomain);
+        assert_eq!(
+            routes[1].endpoint_url,
+            "wss://herdr.example.test/ws/dev_test"
+        );
+
+        assert_eq!(routes[2].kind, TransportRouteKind::DirectWorkersDev);
         assert_eq!(
             routes[2].endpoint_url,
-            "wss://herdr.example.com/ws/dev_test"
-        );
-        assert_eq!(
-            routes[2].proxy.as_ref().unwrap().url,
-            "http://127.0.0.1:7890"
-        );
-
-        assert_eq!(routes[3].kind, TransportRouteKind::SharedRelay);
-        assert_eq!(routes[3].relay_id.as_deref(), Some("relay-a"));
-        assert_eq!(
-            routes[3].endpoint_url,
-            "wss://relay-a.test.net/v1/my-worker.workers.dev/ws/dev_test"
-        );
-
-        assert_eq!(routes[4].kind, TransportRouteKind::SharedRelay);
-        assert_eq!(routes[4].relay_id.as_deref(), Some("relay-b"));
-        assert_eq!(
-            routes[4].endpoint_url,
-            "wss://relay-b.test.net/v1/my-worker.workers.dev/ws/dev_test"
+            "wss://my-worker.workers.dev/ws/dev_test"
         );
     }
 
     #[test]
-    fn ladder_bounded_failover_advances_after_threshold() {
+    fn system_or_env_proxy_is_fallback_after_direct_routes() {
+        let env_proxy = Some(ResolvedProxy {
+            url: "http://127.0.0.1:7890".to_owned(),
+            source: ProxySource::HttpsProxy,
+        });
+
+        let routes = build_ladder_routes(
+            "wss://herdr.example.test/ws",
+            Some("https://herdr.example.test"),
+            Some("https://my-worker.workers.dev"),
+            "dev_test",
+            env_proxy,
+            &[],
+        )
+        .unwrap();
+
+        // Direct routes first, then env proxy
+        assert_eq!(routes.len(), 3);
+        assert_eq!(routes[0].kind, TransportRouteKind::DirectCustomDomain);
+        assert_eq!(routes[1].kind, TransportRouteKind::DirectWorkersDev);
+        assert_eq!(routes[2].kind, TransportRouteKind::LocalProxy);
+        assert_eq!(
+            routes[2].endpoint_url,
+            "wss://my-worker.workers.dev/ws/dev_test"
+        );
+    }
+
+    #[test]
+    fn local_proxy_targets_workers_dev_upstream_over_custom_domain() {
+        let proxy = Some(ResolvedProxy {
+            url: "http://127.0.0.1:7890".to_owned(),
+            source: ProxySource::AllProxy,
+        });
+
+        let routes = build_ladder_routes(
+            "wss://herdr.example.test/ws",
+            Some("https://herdr.example.test"),
+            Some("https://my-worker.workers.dev"),
+            "dev_test",
+            proxy,
+            &[],
+        )
+        .unwrap();
+
+        let proxy_route = routes
+            .iter()
+            .find(|r| r.kind == TransportRouteKind::LocalProxy)
+            .expect("local proxy route must exist");
+        assert_eq!(
+            proxy_route.endpoint_url, "wss://my-worker.workers.dev/ws/dev_test",
+            "local proxy route must target backing workers.dev origin"
+        );
+    }
+
+    #[test]
+    fn ladder_bounded_failover_advances_and_saturates_without_modulo_wrap() {
         let routes = vec![
             TransportRoute {
                 kind: TransportRouteKind::DirectCustomDomain,
@@ -782,10 +866,20 @@ mod tests {
         assert!(!ladder.record_failure());
         assert_eq!(ladder.current_index(), 1);
 
-        // Failure 2 on route 1 -> triggers failover to route 2
+        // Failure 2 on route 1 -> triggers failover to route 2 (last route)
         assert!(ladder.record_failure());
         assert_eq!(ladder.current_index(), 2);
         assert_eq!(ladder.current_route().kind, TransportRouteKind::SharedRelay);
+
+        // Failures on route 2 must saturate on route 2 without modulo-wrapping back to route 0
+        assert!(!ladder.record_failure());
+        assert_eq!(ladder.current_index(), 2);
+        assert!(!ladder.record_failure());
+        assert_eq!(
+            ladder.current_index(),
+            2,
+            "route exhaustion must saturate on final route instead of cycling"
+        );
     }
 
     #[test]
@@ -840,13 +934,14 @@ mod tests {
     #[test]
     fn collects_non_secret_transport_evidence() {
         let evidence = collect_transport_evidence(
-            Some("https://herdr.example.com"),
+            Some("https://herdr.example.test"),
             Some("https://backend.workers.dev"),
         );
         assert_eq!(evidence.mcp_origin, "custom-domain");
         assert_eq!(evidence.link_upstream, "workers.dev");
-        assert_eq!(evidence.link_transport, "direct");
-        assert_eq!(evidence.relay, "none");
+        assert_eq!(evidence.live_transport, "unknown");
+        assert_eq!(evidence.configured_preferred_transport, "direct");
+        assert_eq!(evidence.relay, "unknown");
         assert_eq!(evidence.pool_source, "embedded");
     }
 }

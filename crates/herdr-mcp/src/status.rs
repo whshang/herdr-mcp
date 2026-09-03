@@ -383,10 +383,11 @@ fn format_link_transport_layer(config: &Config) -> String {
         config.edge_link_upstream_origin.as_deref(),
     );
     format!(
-        "mcp_origin={} link_upstream={} link_transport={} proxy_source={} relay={} pool_source={} failover_ready={}",
+        "mcp_origin={} link_upstream={} live_transport={} configured_preferred_transport={} proxy_source={} relay={} pool_source={} failover_ready={}",
         evidence.mcp_origin,
         evidence.link_upstream,
-        evidence.link_transport,
+        evidence.live_transport,
+        evidence.configured_preferred_transport,
         evidence.proxy_source,
         evidence.relay,
         evidence.pool_source,

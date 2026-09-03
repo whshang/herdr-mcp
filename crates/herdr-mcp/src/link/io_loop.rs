@@ -5,9 +5,8 @@
 //! Protocol, reconnect, close-code, heartbeat/silence, request settlement, and
 //! generation-fencing policy remain in the lower staged kernels.
 //!
-//! No CLI, daemon, service, runtime-current, or production path constructs this
-//! loop yet. Production Link remains on the Node implementation until later
-//! cutover gates are complete.
+//! CLI `herdr-mcp link run` and candidate daemon execute this loop via
+//! [`super::daemon::run_link_daemon`].
 
 use std::collections::VecDeque;
 use std::future::{Future, pending};
@@ -616,7 +615,11 @@ where
                     delay_ms,
                 } => self.arm_handshake(attempt_id, duration_from_i64_ms(delay_ms)),
                 TransportAction::CancelHandshakeTimeout { attempt_id } => {
+                    let was_handshake = self.handshake_attempt.is_some();
                     self.cancel_handshake(attempt_id);
+                    if was_handshake && self.core.phase() == ConnectionPhase::Reconnecting {
+                        self.ladder.record_failure();
+                    }
                 }
                 TransportAction::ScheduleReconnect(schedule) => {
                     if !self.stopping {
@@ -1315,6 +1318,20 @@ mod tests {
             None,
         )
         .expect("hello_ack encodes")
+    }
+
+    fn hello_ack_failure(code: &str, message: &str) -> String {
+        encode_relay_message(
+            &RelayMessage::HelloAck(HelloAckMessage {
+                envelope: RelayEnvelope::new("ws1"),
+                outcome: HelloAckOutcome::Failure {
+                    code: code.to_owned(),
+                    message: message.to_owned(),
+                },
+            }),
+            None,
+        )
+        .expect("hello_ack failure encodes")
     }
 
     fn tool_request_frame(request_id: &str) -> String {
@@ -2115,5 +2132,150 @@ mod tests {
         ));
         send_closed(&second, WS_CLOSE_NORMAL, "done");
         assert_eq!(task.await.unwrap().unwrap(), LinkExitKind::Stopped);
+    }
+
+    #[tokio::test]
+    async fn retryable_hello_ack_refusal_advances_ladder_failure_accounting() {
+        let runtime = Arc::new(MockRuntime::immediate(RuntimeToolResult::Success {
+            result: None,
+        }));
+        let routes = vec![
+            TransportRoute {
+                kind: TransportRouteKind::DirectCustomDomain,
+                endpoint_url: "wss://custom.test/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::DirectWorkersDev,
+                endpoint_url: "wss://worker.workers.dev/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+        ];
+
+        let (connector, mut controls) = FakeConnector::new([]);
+        let mut cfg = io_config(100);
+        cfg.ladder = Some(TransportLadder::new(routes, 1).unwrap());
+
+        let io = LinkIoLoop::with_connector(
+            cfg,
+            make_core(1_000, 100, 3_000, 262_144, None),
+            make_runner(runtime),
+            Arc::clone(&connector),
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(io.run(stop_rx));
+
+        // Attempt 1 opens on route 0
+        let mut first = next_control(&mut controls).await;
+        send_open(&first);
+        assert!(matches!(
+            decode_send(next_command(&mut first).await),
+            RelayMessage::Hello(_)
+        ));
+
+        // Edge returns retryable hello_ack failure
+        first
+            .event_tx
+            .send(WebSocketEvent::Text {
+                attempt_id: first.attempt_id,
+                text: hello_ack_failure("internal_error", "server temporarily unavailable"),
+            })
+            .unwrap();
+
+        // Socket 1 terminates on refusal
+        assert!(matches!(
+            next_command(&mut first).await,
+            WebSocketCommand::Terminate { .. }
+        ));
+
+        // Ladder failure budget advances to route 1 for attempt 2
+        let mut second = next_control(&mut controls).await;
+        assert_ne!(first.attempt_id, second.attempt_id);
+        bring_online(&mut second).await;
+
+        let urls = connector.requested_urls();
+        assert_eq!(
+            urls,
+            vec![
+                "wss://custom.test/ws/ws1",
+                "wss://worker.workers.dev/ws/ws1"
+            ],
+            "retryable hello_ack refusal must advance ladder accounting to next route"
+        );
+
+        stop_tx.send(true).unwrap();
+        assert!(matches!(
+            next_command(&mut second).await,
+            WebSocketCommand::Close {
+                code: WS_CLOSE_NORMAL,
+                ..
+            }
+        ));
+        send_closed(&second, WS_CLOSE_NORMAL, "done");
+        assert_eq!(task.await.unwrap().unwrap(), LinkExitKind::Stopped);
+    }
+
+    #[tokio::test]
+    async fn fatal_hello_ack_refusal_exits_without_route_failover() {
+        let runtime = Arc::new(MockRuntime::immediate(RuntimeToolResult::Success {
+            result: None,
+        }));
+        let routes = vec![
+            TransportRoute {
+                kind: TransportRouteKind::DirectCustomDomain,
+                endpoint_url: "wss://custom.test/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::DirectWorkersDev,
+                endpoint_url: "wss://worker.workers.dev/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+        ];
+
+        let (connector, mut controls) = FakeConnector::new([]);
+        let mut cfg = io_config(100);
+        cfg.ladder = Some(TransportLadder::new(routes, 1).unwrap());
+
+        let io = LinkIoLoop::with_connector(
+            cfg,
+            make_core(1_000, 100, 3_000, 262_144, None),
+            make_runner(runtime),
+            Arc::clone(&connector),
+        );
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(io.run(stop_rx));
+
+        // Attempt 1 opens on route 0
+        let mut first = next_control(&mut controls).await;
+        send_open(&first);
+        assert!(matches!(
+            decode_send(next_command(&mut first).await),
+            RelayMessage::Hello(_)
+        ));
+
+        // Edge returns fatal auth_rejected refusal
+        first
+            .event_tx
+            .send(WebSocketEvent::Text {
+                attempt_id: first.attempt_id,
+                text: hello_ack_failure("auth_rejected", "credential revoked"),
+            })
+            .unwrap();
+
+        // Must exit immediately with AuthRejected without route failover
+        let exit = task.await.unwrap().unwrap();
+        assert_eq!(exit, LinkExitKind::AuthRejected);
+
+        let urls = connector.requested_urls();
+        assert_eq!(
+            urls,
+            vec!["wss://custom.test/ws/ws1"],
+            "fatal hello_ack refusal must not trigger ladder failover"
+        );
     }
 }

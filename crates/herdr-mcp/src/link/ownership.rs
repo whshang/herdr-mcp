@@ -576,11 +576,13 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
         "transport": {
             "mcp_origin": transport_evidence.mcp_origin,
             "link_upstream": transport_evidence.link_upstream,
-            "link_transport": transport_evidence.link_transport,
+            "live_transport": transport_evidence.live_transport,
+            "configured_preferred_transport": transport_evidence.configured_preferred_transport,
             "proxy_source": transport_evidence.proxy_source,
             "relay": transport_evidence.relay,
             "pool_source": transport_evidence.pool_source,
             "failover_ready": transport_evidence.failover_ready,
+            "candidate_count": transport_evidence.candidate_count,
         },
         "gates": gates.iter().map(|gate| json!({
             "id": gate.id,
