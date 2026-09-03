@@ -136,6 +136,13 @@ function encodeCompletedRow(
   return { completion };
 }
 
+function releasesIdempotencyBinding(completion: Completion): boolean {
+  return completion.status === "error"
+    && completion.error.code === "runtime_generation_superseded_before_dispatch"
+    && completion.error.retryable === true
+    && completion.error.delivery_state === "not_delivered";
+}
+
 /** Tolerate both the current envelope and legacy bare-Completion rows. */
 function decodeCompletedRow(value: unknown): CompletedRow | null {
   if (value === null || typeof value !== "object") return null;
@@ -986,6 +993,10 @@ export class WorkstationDO {
     }
     const entry = this.registry.get(requestId);
     if (!entry || entry.state === "settled") return false;
+    const releaseIdempotency = releasesIdempotencyBinding(completion);
+    const settlementEntry = releaseIdempotency
+      ? { ...entry, idempotencyKey: undefined }
+      : entry;
 
     // Persist durably FIRST (completed + idem evidence before the pending
     // delete). The completed row embeds the idempotency binding, so even if the
@@ -996,15 +1007,15 @@ export class WorkstationDO {
     // retry can converge; on restart the completed twin wins and the stale
     // pending row is cleaned up.
     try {
-      await this.state.storage.put(PREFIX_COMPLETED + requestId, encodeCompletedRow(entry, completion) as unknown as string);
-      if (entry.idempotencyKey !== undefined) {
+      await this.state.storage.put(PREFIX_COMPLETED + requestId, encodeCompletedRow(settlementEntry, completion) as unknown as string);
+      if (settlementEntry.idempotencyKey !== undefined) {
         const record: IdempotencyRecord = {
-          idempotencyKey: entry.idempotencyKey,
+          idempotencyKey: settlementEntry.idempotencyKey,
           requestId,
-          op: entry.op,
+          op: settlementEntry.op,
           settledAtMs: completion.servedAtMs,
         };
-        await this.state.storage.put(PREFIX_IDEM + entry.idempotencyKey, record as unknown as string);
+        await this.state.storage.put(PREFIX_IDEM + settlementEntry.idempotencyKey, record as unknown as string);
       }
       await this.state.storage.delete(PREFIX_PENDING + requestId);
     } catch (persistErr) {
@@ -1016,6 +1027,7 @@ export class WorkstationDO {
       return false;
     }
 
+    if (releaseIdempotency) entry.idempotencyKey = undefined;
     this.registry.settle(requestId, completion);
     const resolve = this.resolvers.get(requestId);
     if (resolve) {

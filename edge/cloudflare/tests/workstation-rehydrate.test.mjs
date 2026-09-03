@@ -45,6 +45,13 @@ function fakeState(storage, sockets = []) {
   };
 }
 
+async function waitForToolRequests(sent, count) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (sent.filter((frame) => frame.kind === "tool_request").length >= count) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
 test("cold start is read-only and never replays stale durable mutations", async () => {
   const now = Date.now();
   const rows = Array.from({ length: 16 }, (_, i) => {
@@ -157,4 +164,59 @@ test("deadline settlement cancels an already-sent Link request exactly once", as
 
   await subject.settleAsTimeout(p.requestId);
   assert.equal(sent.length, 1, "settled timeout must not emit duplicate cancel");
+});
+
+test("generation supersede proven not delivered releases mutation idempotency for a real retry", async () => {
+  const storage = new FakeStorage();
+  const sent = [];
+  const activeSocket = {
+    deserializeAttachment: () => ({ active: true, registered: true }),
+    send: (frame) => sent.push(JSON.parse(frame)),
+  };
+  const subject = new WorkstationDO(fakeState(storage, [activeSocket]), {});
+  const idempotencyKey = "generation-reresolve";
+  await subject.fetch(new Request("https://do/internal/status"));
+
+  const first = subject.forwardInternal({
+    kind: "request",
+    requestId: "generation-old",
+    op: "herdr_prompt",
+    args: { target: "w1:p1", text: "continue" },
+    deadlineMs: Date.now() + 1_000,
+    idempotencyKey,
+  });
+  await waitForToolRequests(sent, 1);
+  await subject.handleToolError({
+    protocol_version: 1,
+    kind: "tool_error",
+    workstation_id: "prod-real-runtime",
+    request_id: "generation-old",
+    code: "runtime_generation_superseded_before_dispatch",
+    retryable: true,
+    delivery_state: "not_delivered",
+    served_at_ms: Date.now(),
+  });
+  await first;
+  assert.equal(storage.map.has(`idem:${idempotencyKey}`), false);
+
+  const second = subject.forwardInternal({
+    kind: "request",
+    requestId: "generation-new",
+    op: "herdr_prompt",
+    args: { target: "w1:p1", text: "continue" },
+    deadlineMs: Date.now() + 1_000,
+    idempotencyKey,
+  });
+  await waitForToolRequests(sent, 2);
+  assert.equal(sent.filter((frame) => frame.kind === "tool_request").length, 2);
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: "generation-new",
+    result: { ok: true },
+    served_at_ms: Date.now(),
+  });
+  await second;
+  assert.equal(storage.map.get(`idem:${idempotencyKey}`).requestId, "generation-new");
 });
