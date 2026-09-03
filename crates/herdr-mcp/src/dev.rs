@@ -11,8 +11,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "macos")]
+use std::thread;
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
+
 const DEV_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-dev");
 const STATE_SCHEMA_VERSION: u32 = 1;
+
+#[cfg(target_os = "macos")]
+const DEV_ACTIVATION_HEALTH_BUDGET: Duration = Duration::from_secs(10);
+#[cfg(target_os = "macos")]
+const DEV_ACTIVATION_HEALTH_POLL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct DevRuntimeState {
@@ -748,13 +758,68 @@ pub(crate) fn reconcile_after_public_prod_install() -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn verify_runtime_activation(runtime: &RuntimePaths, generation: &str) -> Result<Value, String> {
-    let service = crate::service_manager::doctor_status()?;
+    // `service install` proves health before it returns, but post-commit
+    // integration work can still overlap a short launchd/watchdog convergence
+    // window. Re-measure the exact expected generation for a bounded period
+    // instead of turning one transient unhealthy sample into a compensating
+    // rollback. Wrong/missing generation evidence remains fail-closed below.
+    let deadline = Instant::now() + DEV_ACTIVATION_HEALTH_BUDGET;
+    let service = wait_for_dev_service_activation_with(
+        generation,
+        crate::service_manager::doctor_status,
+        || Instant::now() < deadline,
+        || thread::sleep(DEV_ACTIVATION_HEALTH_POLL),
+    )?;
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "HOME is required for runtime activation verification".to_owned())?;
     let link = crate::link::ownership::collect_status_report(&home, &runtime.config_dir);
     let native_host = crate::native_host_install::doctor_status()?;
     validate_dev_activation_evidence(generation, &service, &link, Some(&native_host))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn service_activation_ready(generation: &str, service: &Value) -> Result<bool, String> {
+    if service.get("implementation").and_then(Value::as_str) != Some("rust") {
+        return Err("service implementation is not Rust after DEV activation".to_owned());
+    }
+    let observed_generation = service
+        .get("generation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "service status is missing generation evidence".to_owned())?;
+    if observed_generation != generation {
+        return Err(format!(
+            "service generation mismatch after DEV activation: expected {generation}, observed {observed_generation}"
+        ));
+    }
+    Ok(service.get("ok").and_then(Value::as_bool) == Some(true)
+        && service.get("healthy").and_then(Value::as_bool) == Some(true))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn wait_for_dev_service_activation_with<Probe, CanRetry, Pause>(
+    generation: &str,
+    mut probe: Probe,
+    mut can_retry: CanRetry,
+    mut pause: Pause,
+) -> Result<Value, String>
+where
+    Probe: FnMut() -> Result<Value, String>,
+    CanRetry: FnMut() -> bool,
+    Pause: FnMut(),
+{
+    loop {
+        let service = probe()?;
+        if service_activation_ready(generation, &service)? {
+            return Ok(service);
+        }
+        if !can_retry() {
+            return Err(format!(
+                "service status did not become healthy for DEV generation {generation} within the post-activation convergence budget"
+            ));
+        }
+        pause();
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1207,6 +1272,72 @@ mod tests {
                 .unwrap(),
             "0.4.2"
         );
+    }
+
+    #[test]
+    fn dev_activation_service_probe_waits_for_transient_health_but_fails_wrong_generation() {
+        let generation = "rust-new";
+        let mut probes = vec![
+            json!({
+                "ok": false,
+                "healthy": false,
+                "implementation": "rust",
+                "generation": generation,
+            }),
+            json!({
+                "ok": true,
+                "healthy": true,
+                "implementation": "rust",
+                "generation": generation,
+            }),
+        ]
+        .into_iter();
+        let mut pauses = 0;
+        let service = wait_for_dev_service_activation_with(
+            generation,
+            || Ok(probes.next().expect("two probes expected")),
+            || true,
+            || pauses += 1,
+        )
+        .unwrap();
+        assert_eq!(service["healthy"], true);
+        assert_eq!(pauses, 1);
+
+        let wrong = json!({
+            "ok": true,
+            "healthy": true,
+            "implementation": "rust",
+            "generation": "rust-old",
+        });
+        assert!(
+            service_activation_ready(generation, &wrong)
+                .unwrap_err()
+                .contains("service generation mismatch")
+        );
+    }
+
+    #[test]
+    fn dev_activation_service_probe_stops_after_bounded_unhealthy_window() {
+        let generation = "rust-new";
+        let unhealthy = json!({
+            "ok": false,
+            "healthy": false,
+            "implementation": "rust",
+            "generation": generation,
+        });
+        let mut retries = 1_u8;
+        let error = wait_for_dev_service_activation_with(
+            generation,
+            || Ok(unhealthy.clone()),
+            || {
+                let retry = retries > 0;
+                retries = retries.saturating_sub(1);
+                retry
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert!(error.contains("post-activation convergence budget"));
     }
 
     #[test]
