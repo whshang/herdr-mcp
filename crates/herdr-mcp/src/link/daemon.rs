@@ -63,6 +63,7 @@ pub struct LinkDaemonConfig {
     pub runtime_control_poll_ms: u64,
     pub public_origin: Option<String>,
     pub link_upstream_origin: Option<String>,
+    pub preferred_route_kind: Option<super::ladder::TransportRouteKind>,
     pub ladder: Option<super::ladder::TransportLadder>,
 }
 
@@ -158,6 +159,16 @@ pub fn read_link_daemon_config(
 
     let public_origin = optional_trimmed(env_map, "HERDR_PUBLIC_ORIGIN");
     let link_upstream_origin = optional_trimmed(env_map, "HERDR_LINK_UPSTREAM_ORIGIN");
+    let preferred_route_kind = match optional_trimmed(env_map, "HERDR_LINK_ROUTE") {
+        None => None,
+        Some(value) if value == "auto" => None,
+        Some(value) if value == "relay" => Some(super::ladder::TransportRouteKind::SharedRelay),
+        Some(_) => {
+            return Err(DaemonConfigError::Message(
+                "HERDR_LINK_ROUTE must be auto or relay".to_owned(),
+            ));
+        }
+    };
 
     Ok(LinkDaemonConfig {
         edge_url,
@@ -175,6 +186,7 @@ pub fn read_link_daemon_config(
         runtime_control_poll_ms,
         public_origin,
         link_upstream_origin,
+        preferred_route_kind,
         ladder: None,
     })
 }
@@ -271,7 +283,7 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
     let edge_url = build_edge_url(&config.edge_url, &config.workstation_id).map_err(|error| {
         format!("herdr-link daemon: cannot build edge url with workstation id: {error:?}")
     })?;
-    let ladder = match config.ladder {
+    let mut ladder = match config.ladder {
         Some(ladder) => ladder,
         None => {
             let proxy = match super::proxy::resolve_link_proxy_detailed() {
@@ -297,6 +309,14 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
             .map_err(|error| format!("herdr-link daemon: transport ladder error: {error}"))?
         }
     };
+    if let Some(kind) = config.preferred_route_kind
+        && !ladder.select_initial_route_kind(kind)
+    {
+        return Err(format!(
+            "herdr-link daemon: requested initial transport {} is unavailable",
+            kind.as_str()
+        ));
+    }
     let io_config = LinkIoConfig {
         edge_url,
         application_protocol: LINK_SUBPROTOCOL.to_owned(),
@@ -475,6 +495,25 @@ mod tests {
         assert_eq!(cfg.runtime_version, None);
         assert_eq!(cfg.edge_url, "wss://herdr-edge-dev.example/ws");
         assert_eq!(cfg.workstation_id, "dev-w1");
+        assert_eq!(cfg.preferred_route_kind, None);
+    }
+
+    #[test]
+    fn daemon_config_accepts_only_bounded_initial_route_preferences() {
+        let relay = read_link_daemon_config(&env(&[("HERDR_LINK_ROUTE", "relay")]))
+            .expect("relay preference");
+        assert_eq!(
+            relay.preferred_route_kind,
+            Some(super::super::ladder::TransportRouteKind::SharedRelay)
+        );
+
+        let auto = read_link_daemon_config(&env(&[("HERDR_LINK_ROUTE", "auto")]))
+            .expect("auto preference");
+        assert_eq!(auto.preferred_route_kind, None);
+
+        let error = read_link_daemon_config(&env(&[("HERDR_LINK_ROUTE", "direct")]))
+            .expect_err("unsupported preference");
+        assert!(error.to_string().contains("must be auto or relay"));
     }
 
     #[test]
@@ -586,6 +625,7 @@ mod tests {
             runtime_control_poll_ms: 1_000,
             public_origin: None,
             link_upstream_origin: None,
+            preferred_route_kind: None,
             ladder: None,
         };
 

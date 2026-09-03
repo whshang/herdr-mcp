@@ -7,9 +7,10 @@
 //! `HERDR-RELAY-POOL-V1\0 || u32_be(payload_len) || payload_bytes`
 //!
 //! The client never canonicalizes or reserializes JSON before signature
-//! verification. Production verification keys are intentionally empty until a
-//! reviewed public key is provisioned as an explicit release step. Test keys
-//! exist only under `cfg(test)`.
+//! verification. Production builds carry public verification keys only; the
+//! matching signing private keys are publisher-side material and must never be
+//! stored in the repository or runtime config. Test keys exist only under
+//! `cfg(test)`.
 //!
 //! Link startup only reads the last-known-good cache. Network fetching is a
 //! separate bounded primitive and is not wired into the healthy Link loop: a
@@ -43,6 +44,11 @@ const MAX_FAILURE_DOMAIN_LEN: usize = 128;
 const MAX_RELAY_URL_LEN: usize = 2048;
 const MAX_PRIORITY: u32 = 1_000_000;
 const GENERATED_FUTURE_SKEW_SECONDS: i64 = 300;
+const RELAY_PROD_2026_09_KEY_ID: &str = "relay-prod-2026-09";
+const RELAY_PROD_2026_09_PUBLIC_KEY: [u8; 32] = [
+    0x22, 0xe4, 0xea, 0xeb, 0xbd, 0xfa, 0x2a, 0xfa, 0x9b, 0xdd, 0x85, 0x8a, 0x2d, 0x52, 0x1e, 0x2b,
+    0xf9, 0xa9, 0xb8, 0x0d, 0xba, 0xa7, 0xb1, 0x33, 0xad, 0xcd, 0xca, 0x14, 0x3a, 0x60, 0x17, 0xee,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestError {
@@ -662,10 +668,10 @@ fn io_error(error: std::io::Error) -> ManifestError {
 }
 
 fn production_verification_key(key_id: &str) -> Option<VerifyingKey> {
-    let _ = key_id;
-    // Intentionally empty until a reviewed production public key is provisioned.
-    // Never add private key material here.
-    None
+    match key_id {
+        RELAY_PROD_2026_09_KEY_ID => VerifyingKey::from_bytes(&RELAY_PROD_2026_09_PUBLIC_KEY).ok(),
+        _ => None,
+    }
 }
 
 /// Build a bounded, no-redirect HTTPS client and fetch one manifest envelope.
@@ -1253,8 +1259,10 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_and_default_embedded_pool_remain_empty() {
+    fn production_registry_contains_only_public_trust_and_embedded_pool_remains_empty() {
+        assert!(production_verification_key(RELAY_PROD_2026_09_KEY_ID).is_some());
         assert!(production_verification_key("test-key").is_none());
+        assert!(production_verification_key("unknown-key").is_none());
         assert!(default_embedded_relays().is_empty());
     }
 

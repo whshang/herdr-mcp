@@ -27,6 +27,7 @@
     "cloudflare:cutover": "bin/herdr-custom-domain-cutover",
     "runtime:generation": "bin/herdr-runtime-generation",
     "self:update": "bin/herdr-self-update",
+    "relay:manifest:sign": "node scripts/sign-relay-manifest.mjs",
     "relay:supabase:bundle": "node scripts/build-supabase-relay.mjs",
     "relay:supabase:check": "node scripts/build-supabase-relay.mjs --check"
   },

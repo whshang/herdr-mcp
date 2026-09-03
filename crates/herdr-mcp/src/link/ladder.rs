@@ -453,6 +453,23 @@ impl TransportLadder {
         self.current_index
     }
 
+    /// Select the first route of `kind` before the ladder has gone online.
+    ///
+    /// This is deliberately a one-time initial-selection seam for diagnostics
+    /// and provider UAT. It never changes an already-active sticky route and it
+    /// never manufactures a route that is absent from the validated ladder.
+    pub fn select_initial_route_kind(&mut self, kind: TransportRouteKind) -> bool {
+        if self.active_route.is_some() {
+            return false;
+        }
+        let Some(index) = self.routes.iter().position(|route| route.kind == kind) else {
+            return false;
+        };
+        self.current_index = index;
+        self.consecutive_failures = 0;
+        true
+    }
+
     pub fn consecutive_failures(&self) -> usize {
         self.consecutive_failures
     }
@@ -880,6 +897,33 @@ mod tests {
             2,
             "route exhaustion must saturate on final route instead of cycling"
         );
+    }
+
+    #[test]
+    fn initial_route_selection_can_start_on_validated_relay_but_never_retarget_online_route() {
+        let routes = vec![
+            TransportRoute {
+                kind: TransportRouteKind::DirectWorkersDev,
+                endpoint_url: "wss://worker.workers.dev/ws/w1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::SharedRelay,
+                endpoint_url: "wss://relay.test/v1/worker.workers.dev/ws/w1".to_owned(),
+                proxy: None,
+                relay_id: Some("relay-1".to_owned()),
+            },
+        ];
+
+        let mut ladder = TransportLadder::new(routes, 2).unwrap();
+        assert!(ladder.select_initial_route_kind(TransportRouteKind::SharedRelay));
+        assert_eq!(ladder.current_index(), 1);
+        assert_eq!(ladder.current_route().kind, TransportRouteKind::SharedRelay);
+
+        ladder.record_success();
+        assert!(!ladder.select_initial_route_kind(TransportRouteKind::DirectWorkersDev));
+        assert_eq!(ladder.current_route().kind, TransportRouteKind::SharedRelay);
     }
 
     #[test]
