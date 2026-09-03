@@ -46,7 +46,7 @@ Windows 使用 `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/ins
 
 1. 检查真实二进制：`ls -l ~/.local/bin/herdr-mcp ~/.local/bin/herdr`，存在则先用绝对路径执行。
 2. 单独检查用户交互 shell 的 PATH：`zsh -ic 'command -v herdr-mcp'`（或用户的登录 shell）。二进制存在但 `command -v` 为空，属于 **`installed_but_not_on_shell_path`**，不是「未安装」——不要重装，也不要制造第二个 PATH owner 或指向仓库的用户 CLI。
-3. 按顺序自修复：先 `export PATH="$HOME/.local/bin:$PATH"` 让当前进程不被阻塞；再持久化修复。zsh 使用 `line='export PATH="$HOME/.local/bin:$PATH"'`，并执行 `grep -Fqx "$line" "$HOME/.zshrc" 2>/dev/null || printf '\n%s\n' "$line" >> "$HOME/.zshrc"`；不能因为启动文件里出现其它 `.local/bin` 文本就误判精确 PATH 条目已经存在。如果不应修改 shell 启动配置，明确说明原因，并继续使用绝对路径。
+3. 按顺序自修复：先 `export PATH="$HOME/.local/bin:$PATH"` 让当前进程不被阻塞；再持久化修复。zsh 使用 `line='export PATH="$HOME/.local/bin:$PATH"'`，并执行 `grep -Fqx "$line" "$HOME/.zprofile" 2>/dev/null || printf '\n%s\n' "$line" >> "$HOME/.zprofile"`；不能因为启动文件里出现其它 `.local/bin` 文本就误判精确 PATH 条目已经存在。如果不应修改 shell 启动配置，明确说明原因，并继续使用绝对路径。
 4. 继续之前分别证明：当前 shell 执行 `herdr-mcp --version`，新的交互 shell 执行 `zsh -ic 'command -v herdr && herdr --version'`，新的登录 shell 执行 `zsh -lc 'command -v herdr-mcp'`。否则 Agent 会话结束后就可能出现 `command not found`。
 
 ### macOS 权限 preflight：在后台服务安装之前验证 TCC/FDA
