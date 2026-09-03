@@ -272,7 +272,11 @@ export async function handleMcp(
       }
       try {
         const devices = await deps.listDevices();
-        return rpcResult(id, callToolResult({ ok: true, devices }));
+        return rpcResult(id, callToolResult({
+          ok: true,
+          devices,
+          pairing_hint: "To connect a new computer, call herdr_call(method=\"herdr_mcp.device.pair\", params={\"ttl_seconds\":600, \"name\":\"<optional>\"}). Do not provide a device selector.",
+        }));
       } catch {
         return rpcResult(
           id,
@@ -296,6 +300,19 @@ export async function handleMcp(
           delivery_state: "not_delivered",
           failure_layer: "edge_routing",
         }, true));
+      }
+
+      for (const key of Object.keys(args)) {
+        if (key !== "method" && key !== "params") {
+          return rpcResult(id, callToolResult({
+            ok: false,
+            code: "invalid_params",
+            message: `unknown top-level argument '${key}'; herdr_call with method 'herdr_mcp.device.pair' only accepts 'method' and optional 'params'`,
+            retryable: false,
+            delivery_state: "not_delivered",
+            failure_layer: "edge_routing",
+          }, true));
+        }
       }
       let methodParams: Record<string, unknown> = {};
       const rawParams = args.params;

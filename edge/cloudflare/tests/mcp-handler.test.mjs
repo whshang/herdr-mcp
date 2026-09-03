@@ -171,12 +171,28 @@ test("mutating call never retries generation supersede even when not delivered",
   assert.equal(d.calls.length, 1);
 });
 
-test("herdr_devices executes at Edge and never forwards to a workstation", async () => {
+test("herdr_devices executes at Edge and exposes pairing hint without tools/list contract drift", async () => {
   const devices = [{ device_id: DEVICE_A, name: "macbook" }];
   const d = deps({ devices });
+
+  // 1. tools/list schema and contract hash remain completely untouched
+  const listResp = await handleMcp(req(71, "tools/list", {}), "legacy-default", d.value);
+  assert.equal(listResp.body.result._meta.herdr.contract_hash, EPOCH3_CONTRACT.contract_hash);
+  const devicesTool = listResp.body.result.tools.find((t) => t.name === "herdr_devices");
+  assert.deepEqual(devicesTool.inputSchema, {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    properties: {},
+    additionalProperties: false,
+  });
+
+  // 2. herdr_devices response exposes the devices and non-secret action hint
   const r = await handleMcp(req(72, "tools/call", { name: "herdr_devices", arguments: {} }), "legacy-default", d.value);
   assert.equal(r.body.result.isError, undefined);
-  assert.deepEqual(r.body.result.structuredContent, { ok: true, devices });
+  assert.equal(r.body.result.structuredContent.ok, true);
+  assert.deepEqual(r.body.result.structuredContent.devices, devices);
+  assert.ok(typeof r.body.result.structuredContent.pairing_hint === "string");
+  assert.ok(r.body.result.structuredContent.pairing_hint.includes("herdr_mcp.device.pair"));
   assert.equal(d.calls.length, 0);
 });
 
@@ -388,6 +404,33 @@ test("herdr_call herdr_mcp.device.pair handles object params and validation erro
   );
   assert.equal(rUnknownKey.body.result.isError, true);
   assert.equal(rUnknownKey.body.result.structuredContent.code, "invalid_params");
+
+  // Rejects unknown top-level keys in arguments (e.g. ttl_seconds placed at top level or typo)
+  let createCalled = false;
+  const dTrack = deps({
+    createPairing: async () => {
+      createCalled = true;
+      return { ok: true, pairing_id: "pair_1", code: "123456", expires_at_ms: 100, pairing_address: "https://edge.example/pair#pair_1" };
+    },
+  });
+  for (const badArgs of [
+    { method: "herdr_mcp.device.pair", ttl_seconds: 300 },
+    { method: "herdr_mcp.device.pair", target: "pane1" },
+    { method: "herdr_mcp.device.pair", extra: "field" },
+  ]) {
+    createCalled = false;
+    const rTopLevelKey = await handleMcp(
+      req(731, "tools/call", {
+        name: "herdr_call",
+        arguments: badArgs,
+      }),
+      "legacy-default",
+      dTrack.value,
+    );
+    assert.equal(rTopLevelKey.body.result.isError, true);
+    assert.equal(rTopLevelKey.body.result.structuredContent.code, "invalid_params");
+    assert.equal(createCalled, false, "no pairing session must be created on invalid top-level arguments");
+  }
 });
 
 test("explicit device routing selects one workstation and strips Edge-only device metadata", async () => {
