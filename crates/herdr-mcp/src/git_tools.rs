@@ -969,6 +969,19 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        // These repositories are short-lived test fixtures. A write command may
+        // otherwise launch detached auto-maintenance that races remove_dir_all
+        // after the assertions have already completed on busy CI runners.
+        for (key, value) in [("maintenance.auto", "false"), ("gc.auto", "0")] {
+            assert!(
+                Command::new("git")
+                    .args(["config", key, value])
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
     }
 
     fn git_commit(root: &Path, message: &str) {
