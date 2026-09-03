@@ -36,6 +36,7 @@ jobs:
       - run: npm ci
       - name: Store contract and browser regression gate
         run: |
+          npm run build
           node --test \
             tests/browser-control-plane.test.mjs \
             tests/browser-extension-store-contract.test.mjs \
