@@ -5,7 +5,6 @@ use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
 use crate::mcp::{self, RuntimeContext};
 use crate::paths::RuntimePaths;
-use crate::projects;
 use crate::prompt::PromptRegistry;
 use crate::runtime_meta;
 use crate::skill::SkillService;
@@ -25,7 +24,6 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1068,6 +1066,7 @@ fn normalized_status(value: &Value) -> Option<String> {
 }
 
 fn push_workspace_views(workspaces: &[Value], agents: &[Value], panes: &[Value]) -> Vec<Value> {
+    let declared_project_keys = push_declared_project_keys(workspaces);
     workspaces
         .iter()
         .filter_map(|workspace| {
@@ -1084,6 +1083,16 @@ fn push_workspace_views(workspaces: &[Value], agents: &[Value], panes: &[Value])
                         roots.push(root.to_owned());
                     }
                 }
+            }
+            if roots.is_empty()
+                && let Some(root) = workspace
+                    .get("worktree")
+                    .and_then(Value::as_object)
+                    .and_then(|worktree| worktree.get("checkout_path"))
+                    .and_then(Value::as_str)
+                && !root.is_empty()
+            {
+                roots.push(root.to_owned());
             }
             if roots.is_empty()
                 && let Some(cwd) = workspace.get("cwd").and_then(Value::as_str)
@@ -1118,7 +1127,7 @@ fn push_workspace_views(workspaces: &[Value], agents: &[Value], panes: &[Value])
                     }
                 }
             }
-            let local_project_key = push_local_project_key(&roots);
+            let local_project_key = push_local_project_key(&roots, &declared_project_keys);
             Some(json!({
                 "id": id,
                 "label": workspace.get("label").cloned().unwrap_or(Value::Null),
@@ -1129,11 +1138,48 @@ fn push_workspace_views(workspaces: &[Value], agents: &[Value], panes: &[Value])
         .collect()
 }
 
-fn push_local_project_key(roots: &[String]) -> Option<String> {
+fn push_declared_project_keys(workspaces: &[Value]) -> HashMap<String, String> {
+    let mut keys = HashMap::new();
+    for workspace in workspaces {
+        let Some(worktree) = workspace.get("worktree").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(repo_key) = worktree
+            .get("repo_key")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let project_key = format!("git:{repo_key}");
+        for root in ["checkout_path", "repo_root"]
+            .into_iter()
+            .filter_map(|field| worktree.get(field).and_then(Value::as_str))
+            .filter(|value| !value.is_empty())
+        {
+            keys.insert(root.to_owned(), project_key.clone());
+        }
+    }
+    keys
+}
+
+fn push_local_project_key(
+    roots: &[String],
+    declared_project_keys: &HashMap<String, String>,
+) -> Option<String> {
     let keys = roots
         .iter()
         .filter(|root| !root.is_empty())
-        .map(|root| projects::local_project_key(Path::new(root)))
+        .map(|root| {
+            declared_project_keys
+                .get(root)
+                .cloned()
+                // Push-state projection is a liveness path. Never rediscover
+                // Git identity from the filesystem here: a root may live in a
+                // macOS privacy folder and the rotating runtime must not prompt
+                // merely because the browser extension reconnects.
+                .unwrap_or_else(|| format!("dir:{root}"))
+        })
         .collect::<BTreeSet<_>>();
     (keys.len() == 1).then(|| keys.into_iter().next().unwrap())
 }
@@ -1956,6 +2002,45 @@ mod tests {
             json!("dir:/tmp/alpha")
         );
         assert_eq!(payload["panes"][0]["pane_id"], "w1:p1");
+    }
+
+    #[test]
+    fn push_state_uses_declared_worktree_identity_without_filesystem_discovery() {
+        let checkout = "/Users/test/Documents/herdr-mcp-not-present";
+        let repo_root = "/Users/test/Documents/herdr-mcp";
+        let repo_key = "/Users/test/Documents/herdr-mcp/.git";
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "label": "alpha",
+                "worktree": {
+                    "checkout_path": checkout,
+                    "is_linked_worktree": true,
+                    "repo_key": repo_key,
+                    "repo_root": repo_root
+                }
+            }],
+            "panes": [],
+            "agents": []
+        }));
+        let payload = push_state_payload(&cache);
+        assert_eq!(payload["workspaces"][0]["roots"], json!([checkout]));
+        assert_eq!(
+            payload["workspaces"][0]["local_project_key"],
+            json!(format!("git:{repo_key}"))
+        );
+    }
+
+    #[test]
+    fn push_local_project_key_never_rediscovers_git_from_disk() {
+        let root = test_root("push-project-key-no-fs");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let root_text = root.to_string_lossy().into_owned();
+        assert_eq!(
+            push_local_project_key(std::slice::from_ref(&root_text), &HashMap::new()),
+            Some(format!("dir:{root_text}"))
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

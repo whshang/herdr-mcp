@@ -131,8 +131,8 @@ fn check_with_policy_and_topology(
         }));
     }
 
-    let root_real = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     if !policy.write_roots.is_empty() {
+        let root_real = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let allowed = policy.write_roots.iter().any(|base| {
             let base_real = fs::canonicalize(base).unwrap_or_else(|_| base.clone());
             fs_security::path_within(&base_real, &root_real)

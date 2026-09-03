@@ -54,6 +54,7 @@ pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Hard wall-clock budget for a single broker request.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const BROKER_CHILD_ENV: &str = "HERDR_MCP_TCC_BROKER_CHILD";
 
 /// The 8 focused operations the broker may dispatch. This is the complete
 /// allowlist — no arbitrary operation names are accepted.
@@ -777,16 +778,39 @@ pub fn route_fs_git(op: &str, snapshot: &Value, args: &Value) -> Option<Result<V
     if std::env::var("HERDR_MCP_TCC_BROKER").ok().as_deref() != Some("1") {
         return None;
     }
-    let config_dir = match crate::paths::RuntimePaths::discover() {
-        Ok(paths) => paths.config_dir,
-        Err(message) => return Some(Err(message)),
-    };
+    Some(run_stable_broker(op, snapshot, args))
+}
+
+/// Run the already-supported `git status` broker operation even when a direct
+/// CLI/runtime path did not inherit the service's broker-routing flag. This
+/// keeps protected project discovery on the long-lived broker identity without
+/// adding a wire operation or changing the broker compatibility revision.
+pub(crate) fn git_status_via_stable_broker(snapshot: &Value, root: &Path) -> Result<Value, String> {
+    run_stable_broker(
+        "git",
+        snapshot,
+        &json!({
+            "root": root.to_string_lossy(),
+            "action": "status",
+            "max_bytes": 65_536,
+        }),
+    )
+}
+
+/// Fence recursive protected-path routing when the installed one-shot broker
+/// itself executes Git/filesystem security checks.
+pub(crate) fn is_broker_child_process() -> bool {
+    std::env::var(BROKER_CHILD_ENV).ok().as_deref() == Some("1")
+}
+
+fn run_stable_broker(op: &str, snapshot: &Value, args: &Value) -> Result<Value, String> {
+    let config_dir = crate::paths::RuntimePaths::discover()?.config_dir;
     let broker = broker_path(&config_dir);
     if !broker.is_file() {
-        return Some(Err(format!(
+        return Err(format!(
             "tcc-broker not installed at {} (run `herdr-mcp tcc-broker install`)",
             broker.display()
-        )));
+        ));
     }
     let request = json!({
         "protocol": "herdr-tcc-broker",
@@ -797,20 +821,15 @@ pub fn route_fs_git(op: &str, snapshot: &Value, args: &Value) -> Option<Result<V
     });
     let request_bytes = match serde_json::to_vec(&request) {
         Ok(bytes) => bytes,
-        Err(message) => return Some(Err(format!("cannot serialize broker request: {message}"))),
+        Err(message) => return Err(format!("cannot serialize broker request: {message}")),
     };
     if request_bytes.len() > MAX_REQUEST_BYTES {
-        return Some(Err(format!(
-            "broker request exceeds {MAX_REQUEST_BYTES} bytes"
-        )));
+        return Err(format!("broker request exceeds {MAX_REQUEST_BYTES} bytes"));
     }
-    Some(run_broker_child(&broker, &request_bytes))
+    run_broker_child(&broker, &request_bytes)
 }
 
 fn run_broker_child(broker: &Path, request_bytes: &[u8]) -> Result<Value, String> {
-    use crate::child_process;
-    use std::process::{Command, Stdio};
-
     // Fail closed: never spawn a broker path that is a symlink or not a
     // regular file.
     let metadata = std::fs::symlink_metadata(broker)
@@ -822,9 +841,25 @@ fn run_broker_child(broker: &Path, request_bytes: &[u8]) -> Result<Value, String
         ));
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        run_broker_child_disclaimed(broker, request_bytes)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        run_broker_child_standard(broker, request_bytes)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_broker_child_standard(broker: &Path, request_bytes: &[u8]) -> Result<Value, String> {
+    use crate::child_process;
+    use std::process::{Command, Stdio};
+
     let mut command = Command::new(broker);
     command
         .arg("__tcc-broker")
+        .env(BROKER_CHILD_ENV, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -867,6 +902,247 @@ fn run_broker_child(broker: &Path, request_bytes: &[u8]) -> Result<Value, String
 
     let Some(status) = status else {
         // wait_bounded already terminated and reaped the child on timeout.
+        return Err("broker request timed out".to_owned());
+    };
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&err).trim().to_owned();
+        return Err(format!(
+            "broker exited with {}: {}",
+            status.code().unwrap_or(-1),
+            if detail.is_empty() {
+                "no stderr".to_owned()
+            } else {
+                detail
+            }
+        ));
+    }
+    if out.len() > MAX_RESPONSE_BYTES {
+        return Err(format!(
+            "broker response exceeds {MAX_RESPONSE_BYTES} bytes"
+        ));
+    }
+    serde_json::from_slice(&out).map_err(|error| format!("invalid broker response JSON: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn run_broker_child_disclaimed(broker: &Path, request_bytes: &[u8]) -> Result<Value, String> {
+    use crate::child_process;
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+    use std::ptr;
+    use std::time::Instant;
+
+    type ResponsibilitySpawnattrsSetdisclaim =
+        unsafe extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int;
+
+    fn pipe_pair() -> Result<(File, File), String> {
+        let mut fds = [-1_i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(format!(
+                "cannot create TCC broker pipe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        for fd in fds {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+            {
+                unsafe {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                }
+                return Err(format!(
+                    "cannot secure TCC broker pipe: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+    }
+
+    fn posix_ok(code: libc::c_int, context: &str) -> Result<(), String> {
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "{context}: {}",
+                std::io::Error::from_raw_os_error(code)
+            ))
+        }
+    }
+
+    fn wait_pid_bounded(pid: libc::pid_t, timeout: Duration) -> Result<Option<ExitStatus>, String> {
+        let started = Instant::now();
+        loop {
+            let mut raw_status = 0_i32;
+            let waited = unsafe { libc::waitpid(pid, &mut raw_status, libc::WNOHANG) };
+            if waited == pid {
+                return Ok(Some(ExitStatus::from_raw(raw_status)));
+            }
+            if waited < 0 {
+                return Err(format!(
+                    "broker waitpid failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if started.elapsed() >= timeout {
+                let _ = unsafe { libc::kill(-pid, libc::SIGTERM) };
+                let grace = Instant::now();
+                while grace.elapsed() < Duration::from_millis(500) {
+                    let mut raw_status = 0_i32;
+                    let waited = unsafe { libc::waitpid(pid, &mut raw_status, libc::WNOHANG) };
+                    if waited == pid {
+                        return Ok(None);
+                    }
+                    if waited < 0 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+                let mut raw_status = 0_i32;
+                let _ = unsafe { libc::waitpid(pid, &mut raw_status, 0) };
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let (stdin_read, mut stdin_write) = pipe_pair()?;
+    let (mut stdout_read, stdout_write) = pipe_pair()?;
+    let (mut stderr_read, stderr_write) = pipe_pair()?;
+    let broker_c = CString::new(broker.as_os_str().as_bytes())
+        .map_err(|_| format!("broker path contains NUL: {}", broker.display()))?;
+    let arg_mode = CString::new("__tcc-broker").expect("static broker arg has no NUL");
+    let mut argv = vec![
+        broker_c.as_ptr().cast_mut(),
+        arg_mode.as_ptr().cast_mut(),
+        ptr::null_mut(),
+    ];
+    let mut env_storage = std::env::vars_os()
+        .filter(|(key, _)| key != BROKER_CHILD_ENV)
+        .map(|(key, value)| {
+            let mut bytes = key.as_os_str().as_bytes().to_vec();
+            bytes.push(b'=');
+            bytes.extend_from_slice(value.as_os_str().as_bytes());
+            CString::new(bytes).map_err(|_| "environment contains NUL".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    env_storage
+        .push(CString::new(format!("{BROKER_CHILD_ENV}=1")).expect("static broker env has no NUL"));
+    let mut envp = env_storage
+        .iter()
+        .map(|entry| entry.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+    envp.push(ptr::null_mut());
+
+    let mut actions: libc::posix_spawn_file_actions_t = ptr::null_mut();
+    posix_ok(
+        unsafe { libc::posix_spawn_file_actions_init(&mut actions) },
+        "cannot initialize broker spawn file actions",
+    )?;
+    let mut attrs: libc::posix_spawnattr_t = ptr::null_mut();
+    if let Err(error) = posix_ok(
+        unsafe { libc::posix_spawnattr_init(&mut attrs) },
+        "cannot initialize broker spawn attributes",
+    ) {
+        unsafe {
+            libc::posix_spawn_file_actions_destroy(&mut actions);
+        }
+        return Err(error);
+    }
+
+    let spawn_result = (|| {
+        for (from, to) in [
+            (stdin_read.as_raw_fd(), libc::STDIN_FILENO),
+            (stdout_write.as_raw_fd(), libc::STDOUT_FILENO),
+            (stderr_write.as_raw_fd(), libc::STDERR_FILENO),
+        ] {
+            posix_ok(
+                unsafe { libc::posix_spawn_file_actions_adddup2(&mut actions, from, to) },
+                "cannot configure broker stdio",
+            )?;
+            if from != to {
+                posix_ok(
+                    unsafe { libc::posix_spawn_file_actions_addclose(&mut actions, from) },
+                    "cannot close broker inherited stdio fd",
+                )?;
+            }
+        }
+        let flags = (libc::POSIX_SPAWN_SETPGROUP | libc::POSIX_SPAWN_CLOEXEC_DEFAULT) as i16;
+        posix_ok(
+            unsafe { libc::posix_spawnattr_setflags(&mut attrs, flags) },
+            "cannot configure broker spawn flags",
+        )?;
+        posix_ok(
+            unsafe { libc::posix_spawnattr_setpgroup(&mut attrs, 0) },
+            "cannot configure broker process group",
+        )?;
+
+        let symbol_name = CString::new("responsibility_spawnattrs_setdisclaim")
+            .expect("static responsibility symbol has no NUL");
+        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol_name.as_ptr()) };
+        if symbol.is_null() {
+            return Err(
+                "macOS responsibility_spawnattrs_setdisclaim is unavailable; refusing to launch TCC broker with rotating runtime responsibility"
+                    .to_owned(),
+            );
+        }
+        let disclaim: ResponsibilitySpawnattrsSetdisclaim = unsafe { std::mem::transmute(symbol) };
+        posix_ok(
+            unsafe { disclaim(&mut attrs, 1) },
+            "cannot disclaim rotating runtime TCC responsibility for broker",
+        )?;
+
+        let mut pid = 0_i32;
+        posix_ok(
+            unsafe {
+                libc::posix_spawn(
+                    &mut pid,
+                    broker_c.as_ptr(),
+                    &actions,
+                    &attrs,
+                    argv.as_mut_ptr(),
+                    envp.as_mut_ptr(),
+                )
+            },
+            "cannot spawn disclaimed TCC broker",
+        )?;
+        Ok(pid)
+    })();
+    unsafe {
+        libc::posix_spawnattr_destroy(&mut attrs);
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+    }
+    let pid = spawn_result?;
+    let _registration = child_process::register_owned_pid("tcc-broker", pid as u32);
+
+    drop(stdin_read);
+    drop(stdout_write);
+    drop(stderr_write);
+
+    let request_owned = request_bytes.to_vec();
+    let write_handle = std::thread::spawn(move || {
+        let _ = stdin_write.write_all(&request_owned);
+    });
+    let stdout_handle =
+        std::thread::spawn(move || read_capped(&mut stdout_read, MAX_RESPONSE_BYTES));
+    let stderr_handle = std::thread::spawn(move || read_capped(&mut stderr_read, 64 * 1024));
+
+    let status = wait_pid_bounded(pid, REQUEST_TIMEOUT)?;
+    let _ = write_handle.join();
+    let out = stdout_handle
+        .join()
+        .map_err(|_| "broker stdout reader panicked".to_owned())?;
+    let err = stderr_handle
+        .join()
+        .map_err(|_| "broker stderr reader panicked".to_owned())?;
+
+    let Some(status) = status else {
         return Err("broker request timed out".to_owned());
     };
     if !status.success() {
@@ -1116,6 +1392,21 @@ mod tests {
         assert!(!text.contains("runtime"));
         assert!(!text.contains("generations"));
         assert!(!text.contains("rust-"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn disclaimed_broker_spawn_round_trips_json() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("disclaimed-spawn");
+        let broker = dir.join("broker.sh");
+        fs::write(&broker, b"#!/bin/sh\ncat\n").unwrap();
+        fs::set_permissions(&broker, fs::Permissions::from_mode(0o700)).unwrap();
+        let input = json!({"ok": true, "source": "disclaimed-test"});
+        let output = run_broker_child(&broker, &serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(output, input);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

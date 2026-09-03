@@ -525,6 +525,14 @@ fn absolute_path(path: &Path) -> PathBuf {
 }
 
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    if crate::macos_permissions::is_protected_user_path(left)
+        || crate::macos_permissions::is_protected_user_path(right)
+    {
+        // Both candidates come from the live Herdr snapshot / explicit tool
+        // argument. Do not canonicalize protected folders in the rotating
+        // runtime merely to compare two project-root identities.
+        return left == right;
+    }
     let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
     let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
     left == right
