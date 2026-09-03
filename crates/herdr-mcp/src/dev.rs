@@ -16,7 +16,6 @@ use std::thread;
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
-const DEV_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-dev");
 const STATE_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(target_os = "macos")]
@@ -87,6 +86,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
             .to_owned()
     })?;
     let source = source_identity(&repo)?;
+    let target_version = source_dev_version(&repo)?;
     if source.dirty && !allow_dirty {
         return Err(
             "dev sync refuses a dirty source tree by default; commit/stash the changes or rerun with --allow-dirty so the provenance is explicit"
@@ -219,7 +219,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         "action": "dev_sync",
         "channel_from": existing.as_ref().map(|state| state.channel.as_str()).unwrap_or("prod"),
         "channel_to": "dev",
-        "target_version": DEV_VERSION,
+        "target_version": target_version,
         "source_repo": repo,
         "source_branch": source.branch,
         "source_commit": source.commit,
@@ -250,12 +250,12 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         &prod_generation,
     )?;
     let prod_sha = file_sha256(&paths.prod_binary)?;
-    build_dev_binary(&repo, &source)?;
+    build_dev_binary(&repo, &source, &target_version)?;
     let built_binary = repo
         .join("target")
         .join("release")
         .join(executable_name("herdr-mcp"));
-    verify_dev_binary(&built_binary)?;
+    verify_dev_binary(&built_binary, &target_version)?;
     let built_sha = file_sha256(&built_binary)?;
     let expected_dev_generation = generation_from_sha256(&built_sha)?;
 
@@ -267,7 +267,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
     let mut state = DevRuntimeState {
         schema_version: STATE_SCHEMA_VERSION,
         channel: "dev".to_owned(),
-        target_version: DEV_VERSION.to_owned(),
+        target_version: target_version.clone(),
         source_repo: Some(repo.to_string_lossy().into_owned()),
         source_branch: source.branch.clone(),
         source_commit: Some(source.commit.clone()),
@@ -336,7 +336,7 @@ fn sync(dry_run: bool, allow_dirty: bool) -> Result<ExitCode, String> {
         "ok": true,
         "action": "dev_sync",
         "channel": "dev",
-        "version": DEV_VERSION,
+        "version": target_version,
         "source_commit": source.commit,
         "source_dirty": source.dirty,
         "generation": active_after,
@@ -548,12 +548,53 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn build_dev_binary(repo: &Path, source: &SourceIdentity) -> Result<(), String> {
+fn source_dev_version(repo: &Path) -> Result<String, String> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--locked", "--no-deps", "--format-version", "1"])
+        .current_dir(repo)
+        .output()
+        .map_err(|error| format!("failed to run cargo metadata for DEV target version: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo metadata failed while resolving DEV target version: {}",
+            bounded_text(&output.stderr)
+        ));
+    }
+    let metadata: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("cannot decode cargo metadata for DEV target version: {error}"))?;
+    dev_version_from_metadata(&metadata)
+}
+
+fn dev_version_from_metadata(metadata: &Value) -> Result<String, String> {
+    let packages = metadata
+        .get("packages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "cargo metadata missing packages for DEV target version".to_owned())?;
+    let package = packages
+        .iter()
+        .find(|package| package.get("name").and_then(Value::as_str) == Some("herdr-mcp"))
+        .ok_or_else(|| {
+            "cargo metadata missing herdr-mcp package for DEV target version".to_owned()
+        })?;
+    let version = package
+        .get("version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "cargo metadata missing herdr-mcp package version".to_owned())?;
+    semver::Version::parse(version)
+        .map_err(|error| format!("invalid herdr-mcp package version '{version}': {error}"))?;
+    Ok(format!("{version}-dev"))
+}
+
+fn build_dev_binary(
+    repo: &Path,
+    source: &SourceIdentity,
+    target_version: &str,
+) -> Result<(), String> {
     let status = Command::new("cargo")
         .args(["build", "--release", "--locked", "-p", "herdr-mcp"])
         .current_dir(repo)
         .env("HERDR_MCP_BUILD_CHANNEL", "dev")
-        .env("HERDR_MCP_BUILD_VERSION", DEV_VERSION)
+        .env("HERDR_MCP_BUILD_VERSION", target_version)
         .env("HERDR_MCP_BUILD_COMMIT", &source.commit)
         .env(
             "HERDR_MCP_BUILD_DIRTY",
@@ -567,11 +608,11 @@ fn build_dev_binary(repo: &Path, source: &SourceIdentity) -> Result<(), String> 
     Ok(())
 }
 
-fn verify_dev_binary(binary: &Path) -> Result<(), String> {
+fn verify_dev_binary(binary: &Path, expected_version: &str) -> Result<(), String> {
     let version = binary_version(binary)?;
-    if version != DEV_VERSION {
+    if version != expected_version {
         return Err(format!(
-            "DEV binary identity mismatch: expected {DEV_VERSION}, observed {version}"
+            "DEV binary identity mismatch: expected {expected_version}, observed {version}"
         ));
     }
     Ok(())
@@ -1272,6 +1313,22 @@ mod tests {
                 .unwrap(),
             "0.4.2"
         );
+    }
+
+    #[test]
+    fn dev_target_version_comes_from_target_checkout_metadata() {
+        let metadata = json!({
+            "packages": [
+                { "name": "some-sibling", "version": "1.0.0" },
+                { "name": "herdr-mcp", "version": "9.8.7" }
+            ]
+        });
+        assert_eq!(dev_version_from_metadata(&metadata).unwrap(), "9.8.7-dev");
+
+        let missing = json!({ "packages": [{ "name": "some-sibling", "version": "1.0.0" }] });
+        assert!(dev_version_from_metadata(&missing).is_err());
+        let malformed = json!({ "packages": [{ "name": "herdr-mcp", "version": "not-semver" }] });
+        assert!(dev_version_from_metadata(&malformed).is_err());
     }
 
     #[test]
