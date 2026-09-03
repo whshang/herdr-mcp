@@ -260,7 +260,6 @@ fn redact_command_summary(command: &str) -> String {
 }
 
 pub fn health_fields(cache: &EventCache, exec: Option<&ExecRegistry>) -> Map<String, Value> {
-    let diagnostics = cache.diagnostics();
     let sealed = env::var_os("HOME")
         .map(|home| {
             crate::link::seal::production_ready_from_seal(
@@ -290,15 +289,7 @@ pub fn health_fields(cache: &EventCache, exec: Option<&ExecRegistry>) -> Map<Str
         exec.map(ExecRegistry::health_diagnostics)
             .unwrap_or(Value::Null),
     );
-    output.insert(
-        "event_cache".to_owned(),
-        json!({
-            "boot_id": cache.boot_id(),
-            "event_count": diagnostics.event_count,
-            "last_event_at": diagnostics.last_event_at,
-            "needs_reconcile": diagnostics.needs_reconcile,
-        }),
-    );
+    output.insert("event_cache".to_owned(), cache.health_diagnostics());
     output
 }
 
