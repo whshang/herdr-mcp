@@ -97,6 +97,10 @@ Browser extension
 
 真正的推理仍然由 Web AI 或本地 Agent 完成。
 
+这也是浏览器扩展最核心的存在理由。ChatGPT 在一个工具回合里可以把任务派给 Agent，但助手回复发出后，Web Planner 不能继续在后台轮询；Herdr 也不能直接反向启动新的模型推理回合。因此扩展把本机状态变化当作“继续推理”的触发信号：有真实新输出时可以发送有界 progress；`working → idle/done/blocked` 只唤醒一次；浏览器或 runtime 暂时断开时，重连还能补发离线期间发生的 settle。收到 wake 后，Web Planner 必须重新读取实时 Herdr/Git 状态，审查 Agent 产出和 diff；独立 branch/worktree 的完成结果在确认后再 cherry-pick/合并，并运行当前任务需要的验收。阻塞、失败、超时类结果继续诊断；wake 本身不能作为“任务已完成”的证据。
+
+这套行为也是 Rust/runtime 迭代必须保持的兼容契约。只要修改本地 runtime、Native Messaging 或事件传输，就要继续保证 browser binding、settle 单次唤醒、progress 去重、旧 source 拒绝、Native Messaging 信任边界、handoff/queue 迁移和扩展版本一致性这些回归项。
+
 ChatGPT Project 里，连续性的 binding 不再依赖某一个 conversation。workspace 直接绑定稳定 `project_id`，所以可以在 Project 首页先绑定；具体 `/c/<id>` 只作为当前 `active_conv_key`，决定 progress/continue 应投递到哪里。接力时 Project binding 与 continuity id 都不搬家，只在新 seed 确认后切换 active target。
 
 从 0.4.2 开始，已绑定会话的 finalized user / assistant turn 会通过 Native Messaging 增量写入本机 Rust `state.db` 的 Continuity Journal。浏览器准备接力时会实时向 Rust 确认当前 `continuity_id` 仍存在；确认成功后，新会话只需要携带这个 ID，并通过现有 `herdr_call(method="continuity.resume", ...)` 恢复有界的最近工作上下文，再重新检查实时 Herdr、runtime 与 Git 状态。

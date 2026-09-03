@@ -209,7 +209,7 @@
   "herdr_status_checked": "Herdr 已检查：{workspaces} 个工作区，{agents} 个 Agent，{working} 个仍在运行。",
   "recovery_probe_template": "Herdr 恢复检查：上一轮助手回复没有明显开始。\n不要调用工具，不要重复或继续任何外部操作，也不要执行写入或修改。\n只报告上一轮请求在本会话中是否看起来已经完成。如果无法确认，只回复：需要恢复。",
   "stale_view_activation_template": "Herdr 浏览器恢复：页面因上一轮助手回复疑似显示陈旧或中途停滞而刷新。请重新读取当前页面最新的对话状态，从上一轮实际停止的位置继续；不要重复已经完成的工作。执行任何外部写入或修改前，按需要重新检查当前 Herdr、运行时和 Git 状态。",
-  "default_wake_template": "Herdr 工作区 {workspace_label}：智能体已停止（焦点 {agent} @ {pane} → {status}）。\n\n焦点窗格输出：\n{output}\n\n{roster}\n\n{idle_hint}\n\n根据以上结果继续编排；优先使用文件读取、修改和命令执行类工具（fs/exec），避免不必要的高成本模型。",
+  "default_wake_template": "Herdr 工作区 {workspace_label}：智能体已停止（焦点 {agent} @ {pane} → {status}）。\n\n焦点窗格输出：\n{output}\n\n{roster}\n\n{idle_hint}\n\n现在恢复网页规划器：重新读取实时 Herdr/Git 状态并审查智能体结果与代码差异。若这是独立分支/工作树已完成的工作，先审查，再 cherry-pick/合并到目标分支，并运行当前任务要求的验收；若状态是阻塞、失败、超时或仍未完成，则继续处理。不要仅凭这条 wake 判定任务完成，也不要重复交付状态不确定的写操作。",
   "default_progress_template": "Herdr 工作区 {workspace_label} 进度（焦点 {agent} @ {pane} · {status}；当前仍有 {working_count} 个任务在运行）。\n\n焦点窗格输出：\n{output}\n\n{roster}\n\n{idle_hint}\n\n使用 herdr_since / herdr_inspect 获取增量或当前状态，并在网页端继续编排。",
   "default_partial_template": "Herdr 工作区 {workspace_label}：焦点 {agent} @ {pane} 已停止（{status}）；当前仍有 {working_count} 个任务在运行。\n\n焦点窗格输出：\n{output}\n\n{roster}\n\n{idle_hint}\n\n这只是部分完成，不代表整轮结束。继续观察或调度剩余任务。",
   "default_llm_judge_prompt": "判断下面这段对话里助手是否已经做完用户要求的全部任务。若已全部做完，只回复：好的。若还有下一步、未完成或待验证，只回复：继续，按你的建议推进。不要解释、不要加其它字。对话：\n{content}",

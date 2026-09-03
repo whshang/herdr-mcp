@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Build a deterministic zip of extension/ for GitHub Release distribution.
+ * Build a deterministic zip of extension/ for Chrome Web Store upload or
+ * explicit maintainer UAT.
  *
  * Maintainer-only Chrome Web Store / explicit unpacked-UAT packaging utility.
  * Output: herdr-mcp-extension-<manifest.version>.zip (+ .sha256 sidecar).

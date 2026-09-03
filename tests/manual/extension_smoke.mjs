@@ -655,6 +655,19 @@ for (const code of ["en", "zh", "ja"]) {
 const enLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "en.json"), "utf8"));
 const zhLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "zh.json"), "utf8"));
 const jaLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "ja.json"), "utf8"));
+for (const [code, locale] of [["en", enLocale], ["zh", zhLocale], ["ja", jaLocale]]) {
+  const settledWake = locale.default_wake_template || "";
+  ok(settledWake.includes("cherry-pick") && settledWake.includes("Herdr/Git"),
+    `${code} settled wake returns control to the Web planner with live-state review`);
+}
+ok(enLocale.default_wake_template.includes("acceptance checks")
+    && zhLocale.default_wake_template.includes("验收")
+    && jaLocale.default_wake_template.includes("検証"),
+  "settled wake requires post-Agent integration/acceptance instead of treating wake as completion");
+ok(enLocale.default_wake_template.includes("Do not mark the task complete from this wake alone")
+    && zhLocale.default_wake_template.includes("不要仅凭这条 wake 判定任务完成")
+    && jaLocale.default_wake_template.includes("この wake だけで完了扱いにせず"),
+  "settled wake is continuation evidence, never completion evidence");
 ok([enLocale, zhLocale, jaLocale].every((locale) => !Object.keys(locale).some((key) => key.startsWith("popup_"))),
   "deleted toolbar Popup leaves no dead popup locale identity");
 ok(zhLocale.hud_manual_continue === "继续", "zh HUD continue label is exact");
@@ -988,6 +1001,9 @@ ok(!d.wake && d.status === "working", "working arms without waking");
 // Settled after working wakes once.
 d = decideWake({ status: "working", lastSettle: null }, "settled", { status: "done", seq: 11 });
 ok(d.wake && d.status === "done" && d.lastSettle.seq === 11, "working to settled wakes once");
+// A blocked/timeout-like terminal state also returns control to the Web planner.
+d = decideWake({ status: "working", lastSettle: null }, "settled", { status: "blocked", seq: "blocked-11" });
+ok(d.wake && d.status === "blocked", "working to blocked wakes for planner recovery");
 // Duplicate sequence does not wake.
 d = decideWake({ status: "done", lastSettle: { seq: 11, at: 1 } }, "settled", { status: "done", seq: 11 });
 ok(!d.wake, "duplicate settle sequence does not wake");

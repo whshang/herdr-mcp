@@ -209,7 +209,7 @@
   "herdr_status_checked": "Herdr 確認済み：{workspaces} ワークスペース、{agents} Agent、{working} 件が稼働中。",
   "recovery_probe_template": "Herdr 復旧チェック：直前の助手ターンが明確に開始されていません。\nツールを呼び出さず、外部操作を繰り返したり続行したりせず、mutation も行わないでください。\n直前の依頼がこの会話で完了したように見えるかだけを報告してください。確認できない場合は「復旧が必要」とだけ返信してください。",
   "stale_view_activation_template": "Herdr ブラウザ復旧：直前の助手応答が古いキャッシュ表示または途中停止の可能性があるため、このページを再読み込みしました。現在表示されている最新の会話状態を読み直し、前の応答が実際に止まった位置から続けてください。完了済みの作業を繰り返さず、外部 mutation の前に必要に応じて現在の Herdr/runtime/Git 状態を再確認してください。",
-  "default_wake_template": "Herdr ワークスペース {workspace_label}：Agent 停止（フォーカス {agent} @ {pane} → {status}）。\n\nフォーカスペイン出力：\n{output}\n\n{roster}\n\n{idle_hint}\n\nこの結果から編成を続けてください。高コストモデルより fs/exec を優先してください。",
+  "default_wake_template": "Herdr ワークスペース {workspace_label}：Agent 停止（フォーカス {agent} @ {pane} → {status}）。\n\nフォーカスペイン出力：\n{output}\n\n{roster}\n\n{idle_hint}\n\nWeb Planner を再開してください。最新の Herdr/Git 状態を読み直し、Agent の結果と diff を確認します。独立 branch/worktree の完了結果ならレビュー後に cherry-pick/merge し、このタスクに必要な検証を実行します。blocked、failed、timeout、未完了なら復旧を続けます。この wake だけで完了扱いにせず、delivery が不確かな mutation を繰り返さないでください。",
   "default_progress_template": "Herdr ワークスペース {workspace_label} 進捗（フォーカス {agent} @ {pane} · {status}；{working_count} 件がまだ稼働中）。\n\nフォーカスペイン出力：\n{output}\n\n{roster}\n\n{idle_hint}\n\nherdr_since / inspect を使って続行し、Web 上で編成を継続してください。",
   "default_partial_template": "Herdr ワークスペース {workspace_label}：フォーカス {agent} @ {pane} は停止（{status}）；{working_count} 件がまだ稼働中。\n\nフォーカスペイン出力：\n{output}\n\n{roster}\n\n{idle_hint}\n\nこれは部分完了であり、ラウンド全体の完了ではありません。残りの worker を監視または再配置してください。",
   "default_llm_judge_prompt": "以下の会話で、助手がユーザーの依頼をすべて完了したか判定してください。すべて完了なら「完了」とだけ返信してください。次の手順、未完了、検証待ちがあれば「続行」とだけ返信してください。説明や他の文字は追加しないでください。会話：\n{content}",
