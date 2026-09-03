@@ -101,6 +101,10 @@ pub fn print_status(paths: &RuntimePaths, config: &Config) {
         crate::update_scheduler::status_line()
     );
     println!("lifecycle residue: {}", crate::residue::status_line());
+    println!(
+        "relay pool: {}",
+        crate::link::relay_manifest::status_line(paths, unix_now_seconds())
+    );
 }
 
 pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
@@ -225,6 +229,10 @@ fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusR
         "LAYER link-transport {}",
         format_link_transport_layer(config)
     );
+    println!(
+        "LAYER relay-pool {}",
+        crate::link::relay_manifest::status_line(paths, unix_now_seconds())
+    );
     let edge = resolve_edge_config(config);
     println!("LAYER edge {}", format_edge_configured_layer(&edge, config));
     let remote = edge
@@ -236,6 +244,13 @@ fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusR
     println!("LAYER mcp-endpoint {}", remote.mcp_endpoint);
     println!("LAYER update-state {}", format_update_state_layer(paths));
     println!("{}", crate::residue::doctor_line());
+}
+
+fn unix_now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
 }
 
 fn format_herdr_layer(paths: &RuntimePaths, report: &StatusReport) -> String {

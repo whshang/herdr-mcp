@@ -278,7 +278,13 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
                 super::proxy::LinkProxyResolution::Proxy(p) => Some(p),
                 _ => None,
             };
-            let relays = super::ladder::default_embedded_relays();
+            // Startup reads only the already validated last-known-good cache.
+            // Remote fetching is deliberately a separate bounded primitive: there
+            // is no safe asynchronous reload owner in this daemon yet.
+            let paths = crate::paths::RuntimePaths::discover()
+                .map_err(|error| format!("herdr-link daemon: runtime paths: {error}"))?;
+            let pool = super::relay_manifest::load_cached_pool(&paths, system_now_ms() / 1000);
+            let relays = pool.relays;
             super::ladder::TransportLadder::from_config(
                 &config.edge_url,
                 config.public_origin.as_deref(),

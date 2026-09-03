@@ -32,6 +32,7 @@ pub mod migrate_runtime_control;
 pub mod ownership;
 pub mod policy;
 pub mod proxy;
+pub mod relay_manifest;
 pub mod request_core;
 pub mod run;
 pub mod runner;
