@@ -14,7 +14,7 @@ const STORE_ID = identity.chrome_web_store.extension_id;
 test("Store listing SSOT matches the production extension identity and manifest", () => {
   assert.equal(store.extension_id, STORE_ID);
   assert.equal(store.product_name, manifest.name);
-  assert.equal(store.product_name, "Herdr MCP - Herdr Workspace Connector");
+  assert.equal(store.product_name, "Herdr MCP - Workspace Connector");
   assert.doesNotMatch(store.product_name, /—/);
   assert.equal(store.summary, manifest.description);
   assert.match(store.item_url, new RegExp(`${STORE_ID}$`));

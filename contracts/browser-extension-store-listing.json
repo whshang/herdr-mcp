@@ -3,7 +3,7 @@
   "chrome_web_store": {
     "extension_id": "kpcengcaammanfnbclapecdgahdmhanp",
     "item_url": "https://chromewebstore.google.com/detail/kpcengcaammanfnbclapecdgahdmhanp",
-    "product_name": "Herdr MCP - Herdr Workspace Connector",
+    "product_name": "Herdr MCP - Workspace Connector",
     "summary": "Connect ChatGPT and Web AI to local Herdr workspaces with Control Center, safe continuity, handoff, and queued next turns.",
     "category": "Developer Tools",
     "homepage_url": "https://whshang.github.io/herdr-mcp/",

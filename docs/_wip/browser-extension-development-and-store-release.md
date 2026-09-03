@@ -462,7 +462,7 @@ Store ID 与 Native Messaging origin 是一次性身份边界：production ident
 
 `0.1.76+` 开发源码会在启动控制路径前查询 Native Host `identity`。当前 active build 能通过 Chromium admission 获得 identity；同机安装但 inactive 的 Store/Dev build 会在 Chromium 层被拒绝并进入 standby，不启动共享 push stream，也不渲染 operational HUD。切换 active owner 后，已经存在的旧 Native Messaging request/stream 也会由 Rust Native Host 重新核对当前受管 manifest；持续 SSE stream 最迟在下一次 1 秒 owner-fence tick 或下一帧时失效，避免旧连接跨切换继续拥有本地控制权。该机制不要求修改已经提交审核的 `0.1.75` Store candidate。
 
-这个共存契约要求两份同时启用的扩展都升级到 `0.1.76+`。历史 `0.1.75` 是首次 Store 审核候选；当前源码已经推进到 `0.1.89`。Store item 已 Published — unlisted 后，下一次常规 Store update 应直接上传当前通过 gate 的版本，不再按历史候选逐版补发。不要为了兼容旧 Store build 新增 `management` 权限、修改 Chrome Preferences 或自动禁用另一份扩展。
+这个共存契约要求两份同时启用的扩展都升级到 `0.1.76+`。历史 `0.1.75` 是首次 Store 审核候选；当前源码已经推进到 `0.1.90`。当前 0.1.89 的 Public 可见性更新审核应撤回，并由通过完整 Store gate 的 0.1.90 包一次性替代；不再按历史候选逐版补发。不要为了兼容旧 Store build 新增 `management` 权限、修改 Chrome Preferences 或自动禁用另一份扩展。
 
 官方 Native Messaging 规则：
 
