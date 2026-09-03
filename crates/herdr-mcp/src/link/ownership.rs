@@ -561,6 +561,10 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
     let link_upstream_origin = config
         .as_ref()
         .and_then(|c| c.edge_link_upstream_origin.clone());
+    let transport_evidence = crate::link::collect_transport_evidence(
+        edge_public_origin.as_deref(),
+        link_upstream_origin.as_deref(),
+    );
 
     json!({
         "ok": true,
@@ -569,6 +573,15 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
         "production_ready_eligible": all_ok,
         "edge_public_origin": edge_public_origin,
         "link_upstream_origin": link_upstream_origin,
+        "transport": {
+            "mcp_origin": transport_evidence.mcp_origin,
+            "link_upstream": transport_evidence.link_upstream,
+            "link_transport": transport_evidence.link_transport,
+            "proxy_source": transport_evidence.proxy_source,
+            "relay": transport_evidence.relay,
+            "pool_source": transport_evidence.pool_source,
+            "failover_ready": transport_evidence.failover_ready,
+        },
         "gates": gates.iter().map(|gate| json!({
             "id": gate.id,
             "ok": gate.ok,

@@ -220,6 +220,10 @@ fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusR
     println!("LAYER local-ipc {}", format_local_ipc_layer(paths));
     println!("LAYER native-messaging {}", format_native_messaging_layer());
     println!("LAYER link {}", format_link_layer(paths));
+    println!(
+        "LAYER link-transport {}",
+        format_link_transport_layer(config)
+    );
     let edge = resolve_edge_config(config);
     println!("LAYER edge {}", format_edge_configured_layer(&edge, config));
     let remote = edge
@@ -371,6 +375,23 @@ fn format_native_messaging_layer() -> String {
 fn format_link_layer(paths: &RuntimePaths) -> String {
     let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
     crate::link::doctor_layer_summary(&home, &paths.config_dir)
+}
+
+fn format_link_transport_layer(config: &Config) -> String {
+    let evidence = crate::link::collect_transport_evidence(
+        config.edge_public_origin.as_deref(),
+        config.edge_link_upstream_origin.as_deref(),
+    );
+    format!(
+        "mcp_origin={} link_upstream={} link_transport={} proxy_source={} relay={} pool_source={} failover_ready={}",
+        evidence.mcp_origin,
+        evidence.link_upstream,
+        evidence.link_transport,
+        evidence.proxy_source,
+        evidence.relay,
+        evidence.pool_source,
+        evidence.failover_ready,
+    )
 }
 
 fn format_edge_configured_layer(edge: &Option<EdgeConfigView>, config: &Config) -> String {

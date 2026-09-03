@@ -100,6 +100,18 @@ fn enrich_macos_credentials_with_config(
         env_map.insert("HERDR_LINK_TOKEN".to_owned(), token);
     }
 
+    if optional_trimmed(env_map, "HERDR_PUBLIC_ORIGIN").is_none()
+        && let Some(origin) = configured.and_then(|config| config.edge_public_origin.clone())
+    {
+        env_map.insert("HERDR_PUBLIC_ORIGIN".to_owned(), origin);
+    }
+    if optional_trimmed(env_map, "HERDR_LINK_UPSTREAM_ORIGIN").is_none()
+        && let Some(upstream) =
+            configured.and_then(|config| config.edge_link_upstream_origin.clone())
+    {
+        env_map.insert("HERDR_LINK_UPSTREAM_ORIGIN".to_owned(), upstream);
+    }
+
     if optional_trimmed(env_map, "HERDR_MCP_TOKEN").is_none() {
         let token = load_runtime_token_from_server_plist(env_map)?;
         env_map.insert("HERDR_MCP_TOKEN".to_owned(), token);

@@ -61,6 +61,9 @@ pub struct LinkDaemonConfig {
     pub runtime_control_path: PathBuf,
     pub runtime_status_path: PathBuf,
     pub runtime_control_poll_ms: u64,
+    pub public_origin: Option<String>,
+    pub link_upstream_origin: Option<String>,
+    pub ladder: Option<super::ladder::TransportLadder>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +156,9 @@ pub fn read_link_daemon_config(
         ));
     }
 
+    let public_origin = optional_trimmed(env_map, "HERDR_PUBLIC_ORIGIN");
+    let link_upstream_origin = optional_trimmed(env_map, "HERDR_LINK_UPSTREAM_ORIGIN");
+
     Ok(LinkDaemonConfig {
         edge_url,
         workstation_id,
@@ -167,6 +173,9 @@ pub fn read_link_daemon_config(
         runtime_control_path,
         runtime_status_path,
         runtime_control_poll_ms,
+        public_origin,
+        link_upstream_origin,
+        ladder: None,
     })
 }
 
@@ -262,6 +271,26 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
     let edge_url = build_edge_url(&config.edge_url, &config.workstation_id).map_err(|error| {
         format!("herdr-link daemon: cannot build edge url with workstation id: {error:?}")
     })?;
+    let ladder = match config.ladder {
+        Some(ladder) => ladder,
+        None => {
+            let proxy = match super::proxy::resolve_link_proxy_detailed() {
+                super::proxy::LinkProxyResolution::Proxy(p) => Some(p),
+                _ => None,
+            };
+            let relays = super::ladder::default_embedded_relays();
+            super::ladder::TransportLadder::from_config(
+                &config.edge_url,
+                config.public_origin.as_deref(),
+                config.link_upstream_origin.as_deref(),
+                &config.workstation_id,
+                proxy,
+                &relays,
+                super::ladder::DEFAULT_MAX_FAILURES_PER_ROUTE,
+            )
+            .map_err(|error| format!("herdr-link daemon: transport ladder error: {error}"))?
+        }
+    };
     let io_config = LinkIoConfig {
         edge_url,
         application_protocol: LINK_SUBPROTOCOL.to_owned(),
@@ -272,6 +301,7 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
         offline_recycle_ms: super::io_loop::LINK_DEFAULT_OFFLINE_RECYCLE_MS,
         now_ms: Arc::new(system_now_ms),
         rng_sample: Arc::new(system_rng_sample),
+        ladder: Some(ladder),
     };
     let io = LinkIoLoop::production(io_config, transport, runner);
 
@@ -548,6 +578,9 @@ mod tests {
             runtime_control_path: control_path.clone(),
             runtime_status_path: status_path.clone(),
             runtime_control_poll_ms: 1_000,
+            public_origin: None,
+            link_upstream_origin: None,
+            ladder: None,
         };
 
         let base = RuntimeGenerationSpec {
@@ -611,6 +644,7 @@ mod tests {
                 offline_recycle_ms: crate::link::io_loop::LINK_DEFAULT_OFFLINE_RECYCLE_MS,
                 now_ms: Arc::new(|| 0),
                 rng_sample: Arc::new(|| 0.0),
+                ladder: None,
             },
             transport,
             runner,
