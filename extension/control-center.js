@@ -25,6 +25,7 @@ let eventStreamHealthy = null;
 let selectedMode = null;
 let pageContext = { loading: true, tabId: null, windowId: null, response: null, error: null };
 let pageContextRefreshSeq = 0;
+let fleetContext = { loading: true, response: null, error: null, updatedAt: 0 };
 let bindingMutationWorkspaceId = null;
 let actionInFlight = false;
 
@@ -32,6 +33,9 @@ const $ = (id) => document.getElementById(id);
 const runtimeDot = $("runtimeDot");
 const runtimeText = $("runtimeText");
 const runtimeStats = $("runtimeStats");
+const deviceSummary = $("deviceSummary");
+const deviceList = $("deviceList");
+const deviceHelp = $("deviceHelp");
 const workspaceList = $("workspaceList");
 const controlDock = $("controlDock");
 const pageContextCard = $("pageContextCard");
@@ -107,6 +111,146 @@ function activityLabel(at, nowMs = Date.now()) {
   const minutes = Math.floor(seconds / 60);
   if (minutes < 60) return t("cc_time_minutes_ago", { value: minutes });
   return t("cc_time_hours_ago", { value: Math.floor(minutes / 60) });
+}
+
+function fleetStatusDot(device) {
+  if (device?.authorization === "revoked" || device?.connection === "offline") return "offline";
+  if (device?.authorization === "suspended" || device?.connection === "stale") return "stale";
+  if (device?.connection === "online" && device?.health === "ok") return "healthy";
+  return "";
+}
+
+function deviceAuthorizationLabel(value) {
+  const key = `cc_device_authorization_${String(value || "unknown")}`;
+  const label = t(key);
+  return label === key ? String(value || t("cc_status_unknown")) : label;
+}
+
+function deviceConnectionLabel(value) {
+  const key = `cc_device_connection_${String(value || "offline")}`;
+  const label = t(key);
+  return label === key ? String(value || t("cc_status_unknown")) : label;
+}
+
+function deviceLastSeenLabel(value) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 0) return t("cc_device_last_seen_unknown");
+  if (ms < 10_000) return t("cc_time_now");
+  if (ms < 60_000) return t("cc_time_seconds_ago", { value: Math.floor(ms / 1000) });
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 60) return t("cc_time_minutes_ago", { value: minutes });
+  return t("cc_time_hours_ago", { value: Math.floor(minutes / 60) });
+}
+
+function fleetFailureText(response) {
+  const code = String(response?.code || "");
+  if (code === "device_inventory_admin_required") return t("cc_devices_owner_required");
+  if (response?.http_status === 404 || code === "not_found" || code === "device_inventory_platform_unsupported") {
+    return t("cc_devices_runtime_unavailable");
+  }
+  return t("cc_devices_unavailable", { error: response?.error || code || "unknown" });
+}
+
+function renderFleet() {
+  deviceList.replaceChildren();
+  deviceHelp.hidden = true;
+  deviceHelp.className = "device-help";
+  deviceHelp.textContent = "";
+
+  if (fleetContext.loading) {
+    const loading = document.createElement("div");
+    loading.className = "device-empty";
+    loading.textContent = t("cc_devices_loading");
+    deviceList.appendChild(loading);
+    deviceSummary.textContent = "";
+    return;
+  }
+
+  const response = fleetContext.response;
+  if (!response?.ok) {
+    deviceSummary.textContent = "";
+    const empty = document.createElement("div");
+    empty.className = "device-empty";
+    empty.textContent = t("cc_devices_not_available");
+    deviceList.appendChild(empty);
+    deviceHelp.hidden = false;
+    deviceHelp.classList.add("error");
+    deviceHelp.textContent = fleetFailureText(response || { error: fleetContext.error });
+    return;
+  }
+
+  const devices = Array.isArray(response.devices) ? [...response.devices] : [];
+  devices.sort((a, b) => {
+    const rank = (device) => device.authorization === "revoked" ? 3
+      : device.connection === "online" ? 0
+        : device.connection === "stale" ? 1 : 2;
+    return rank(a) - rank(b) || String(a.name || a.device_id).localeCompare(String(b.name || b.device_id));
+  });
+  const online = devices.filter((device) => device.authorization === "active" && device.connection === "online").length;
+  deviceSummary.textContent = t("cc_devices_summary", { online, total: devices.length });
+  const observedAt = Number(response.observed_at_ms || 0);
+  deviceSummary.title = observedAt > 0
+    ? t("cc_devices_observed", { value: new Date(observedAt).toLocaleTimeString() })
+    : "";
+
+  if (!devices.length) {
+    const empty = document.createElement("div");
+    empty.className = "device-empty";
+    empty.textContent = t("cc_devices_empty");
+    deviceList.appendChild(empty);
+    return;
+  }
+
+  const localDeviceId = String(response.local?.device_id || "");
+  for (const device of devices) {
+    const row = document.createElement("div");
+    row.className = `device-row${device.authorization === "revoked" ? " revoked" : ""}`;
+
+    const dot = document.createElement("span");
+    dot.className = `dot ${fleetStatusDot(device)}`;
+
+    const main = document.createElement("div");
+    main.className = "device-main";
+    const nameLine = document.createElement("div");
+    nameLine.className = "device-name-line";
+    const name = document.createElement("span");
+    name.className = "device-name";
+    name.textContent = device.name || device.device_id || t("cc_status_unknown");
+    nameLine.appendChild(name);
+    if (localDeviceId && device.device_id === localDeviceId) {
+      const current = document.createElement("span");
+      current.className = "device-this";
+      current.textContent = t("cc_device_this");
+      nameLine.appendChild(current);
+    }
+    const meta = document.createElement("div");
+    meta.className = "device-meta";
+    const runtime = [device.runtime_version, device.runtime_generation].filter(Boolean).join(" · ") || t("cc_status_unknown");
+    const staleGeneration = localDeviceId === device.device_id && response.local?.link_generation_stale === true
+      ? ` · ${t("cc_device_generation_stale")}` : "";
+    meta.textContent = `${deviceAuthorizationLabel(device.authorization)} · ${deviceConnectionLabel(device.connection)} · ${String(device.health || t("cc_status_unknown"))} · ${runtime}${staleGeneration}`;
+    main.append(nameLine, meta);
+
+    const lastSeen = document.createElement("span");
+    lastSeen.className = "device-last-seen";
+    lastSeen.textContent = deviceLastSeenLabel(device.last_seen_ago_ms);
+    lastSeen.title = device.device_id || "";
+    row.append(dot, main, lastSeen);
+    deviceList.appendChild(row);
+  }
+}
+
+async function refreshFleet() {
+  fleetContext = { ...fleetContext, loading: true, error: null };
+  renderFleet();
+  const response = await bg({ type: "herdr_control_fleet" });
+  fleetContext = {
+    loading: false,
+    response,
+    error: response?.error || null,
+    updatedAt: Date.now(),
+  };
+  renderFleet();
 }
 
 function paneSummary(pane) {
@@ -339,9 +483,11 @@ function renderWorkspaceTree(state) {
       bindingToggle.textContent = bindingMutationWorkspaceId === workspaceId
         ? t("cc_workspace_binding_updating")
         : (contextBound ? t("cc_workspace_bound") : t("cc_workspace_bind"));
-      bindingToggle.title = contextBound
-        ? t("cc_workspace_unbind_hint", { workspace: workspaceName })
-        : t("cc_workspace_bind_hint", { workspace: workspaceName });
+      bindingToggle.title = bindingBusy
+        ? t("cc_workspace_binding_busy_reason")
+        : contextBound
+          ? t("cc_workspace_unbind_hint", { workspace: workspaceName })
+          : t("cc_workspace_bind_hint", { workspace: workspaceName });
       bindingToggle.setAttribute("aria-label", contextBound
         ? t("cc_workspace_unbind_aria", { workspace: workspaceName })
         : t("cc_workspace_bind_aria", { workspace: workspaceName }));
@@ -421,6 +567,16 @@ function renderTarget() {
   const interruptDescriptor = buildActionDescriptor(ACTION_TYPES.INTERRUPT, { target });
   agentQuickActions.hidden = !hasTarget || !target?.agent;
   interruptButton.disabled = actionInFlight || !interruptDescriptor.executable;
+  const readBlockedReason = !hasTarget
+    ? t("cc_pin_first")
+    : stale
+      ? t("cc_target_stale_disabled_reason")
+      : !pane ? t("cc_target_unavailable_reason") : "";
+  inspectButton.title = readBlockedReason || t("cc_inspect_state");
+  readTailButton.title = readBlockedReason || t("cc_read_tail");
+  interruptButton.title = actionInFlight
+    ? t("cc_action_busy_reason")
+    : interruptDescriptor.executable ? "" : t("cc_stop_unavailable_reason");
 
   if (!hasTarget) {
     targetTitle.textContent = "";
@@ -533,7 +689,8 @@ function renderComposerState() {
   composer.placeholder = t(mode.placeholder);
   actionModeBadge.textContent = descriptor.executable ? t("cc_live_badge") : t("cc_preview_badge");
   actionModeBadge.classList.toggle("live", descriptor.executable);
-  if (!pinnedTarget?.pane_id) blockedReason.textContent = t("cc_pin_first");
+  if (actionInFlight) blockedReason.textContent = t("cc_action_busy_reason");
+  else if (!pinnedTarget?.pane_id) blockedReason.textContent = t("cc_pin_first");
   else if (pinnedTarget.stale) blockedReason.textContent = t("cc_target_stale_short");
   else if (descriptor.executable) blockedReason.textContent = "";
   else blockedReason.textContent = t("cc_preview_only_reason");
@@ -545,6 +702,7 @@ function renderComposerState() {
         : t("cc_execute_prompt"))
     : t("cc_preview_action");
   sendButton.disabled = actionInFlight || !pinnedTarget?.pane_id || pinnedTarget?.stale === true;
+  sendButton.title = sendButton.disabled ? blockedReason.textContent : "";
 
 }
 
@@ -603,6 +761,7 @@ store.subscribe(() => coalescer.schedule());
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     if (!controlPort) connectControlPort(true);
+    if (!fleetContext.updatedAt || Date.now() - fleetContext.updatedAt > 30_000) void refreshFleet();
     coalescer.flush();
   }
 });
@@ -704,7 +863,9 @@ workspaceList.addEventListener("click", async (event) => {
   renderAll();
 });
 
-$("refreshButton").addEventListener("click", () => { void refreshSnapshot(true); });
+$("refreshButton").addEventListener("click", () => {
+  void Promise.all([refreshSnapshot(true), refreshFleet(), refreshPageContext()]);
+});
 $("collapseButton").addEventListener("click", () => {
   expandedWorkspaces.clear();
   void persistExpansionPreference();
@@ -803,8 +964,8 @@ async function start() {
   restoreExpansionPreference(stored[EXPANDED_WORKSPACES_KEY]);
   connectControlPort(false);
   renderAll();
-  await refreshSnapshot();
-  await refreshPageContext();
+  renderFleet();
+  await Promise.all([refreshSnapshot(), refreshPageContext(), refreshFleet()]);
 }
 
 void start();

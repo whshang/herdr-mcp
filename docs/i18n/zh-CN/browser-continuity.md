@@ -482,7 +482,7 @@ ChatGPT 还会虚拟化旧 DOM，所以“当前页面只挂着 5 条消息”�
 
 当前支持已绑定的 ChatGPT Project，以及稳定 `/c/<chat_id>` 的 z.ai 会话。手动接力在当前作用域 `自动 开` 或 `自动 关` 时都可以启动；新目标会话继承源会话的 Auto 状态。ChatGPT 接力只切换 Project binding 的 active target；z.ai 才迁移会话级 binding。接力期间源会话的自动 wake 暂停，workspace 仍有 working Agent 时则拒绝开始，避免 settled/wake 与 cutover 竞争。
 
-正常情况下仍优先让当前网页主模型生成 handoff packet，因为它持有最完整的会话上下文。如果页面已经显示单次对话硬上限、接力 prompt 无法提交，或者主模型在有界等待后已停止生成但仍没有给出摘要，Herdr 会改用 Options 中已配置的 OpenAI-compatible LLM 兜底。兜底模型接收经过上限裁剪的 user/assistant 会话 transcript，仍必须输出同一个经过校验的 `HERDR_HANDOFF_V1` packet，之后继续复用原有 target / seed / binding / continuity commit 安全链。
+手动 ChatGPT Project 接力会先解析持久化 Continuity Journal，并直接用 continuity reference 在同一 Project 的新会话中恢复，不再向源会话发送接力摘要请求。binding 中的 continuity 元数据缺失或过期时，本机 runtime 会按当前 conversation identity 找回同一条 chain。确实没有可用 Journal 时，才允许 Options 中已配置的 OpenAI-compatible LLM 从只读、经过上限裁剪的 source transcript 生成经过校验的 `HERDR_HANDOFF_V1` packet；两条来源都不可用时直接失败，当前会话和页面地址保持不变。自动接力、历史兼容路径和 conversation-scoped 站点继续遵循各自现有契约。
 
 z.ai 的 handoff 控制消息走 raw channel，不经过 JSON→MCP task wrapper，避免摘要请求被误解释成 coding task。
 

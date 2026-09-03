@@ -43,6 +43,25 @@ button.compact-action { border-color: transparent; padding: 3px 5px; color: var(
 button.compact-action:hover { border-color: var(--border); color: var(--text); }
 button.danger { border-color: color-mix(in srgb, var(--danger) 62%, var(--border)); color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--panel-2)); }
 
+.device-panel { margin: 6px 8px 0; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); overflow: hidden; }
+.device-panel-heading { display: flex; align-items: center; gap: 7px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.device-panel-heading strong { font-size: 11px; }
+.device-summary { margin-left: auto; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.device-list { display: grid; }
+.device-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) max-content; gap: 7px; align-items: center; padding: 6px 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent); }
+.device-row:last-child { border-bottom: 0; }
+.device-row.revoked { opacity: .58; }
+.device-main { min-width: 0; }
+.device-name-line { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.device-name { min-width: 0; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.device-this { flex: 0 0 auto; color: var(--accent); font-size: 9px; font-weight: 700; }
+.device-meta { margin-top: 2px; color: var(--muted); font-size: 9.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.device-last-seen { color: var(--muted); font-size: 9.5px; white-space: nowrap; text-align: right; }
+.device-help, .device-empty { padding: 8px; color: var(--muted); font-size: 10px; }
+.device-help { border-top: 1px solid var(--border); }
+.device-help.error { color: var(--danger); }
+.device-help[hidden] { display: none; }
+
 .page-context-strip { display: flex; align-items: center; gap: 5px; margin: 6px 8px 0; padding: 4px 7px; color: var(--muted); font-size: 10px; }
 .page-context-strip[hidden] { display: none; }
 .page-context-strip strong { color: var(--text); font-size: 10.5px; }

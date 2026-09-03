@@ -77,9 +77,9 @@ const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "u
 const controlCenterCss = readFileSync(path.join(EXT, "control-center.css"), "utf8");
 const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.88", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.88"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.88"'), "content version matches manifest");
+ok(manifest.version === "0.1.89", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.89"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.89"'), "content version matches manifest");
 const ownerGateIndex = wakeSource.indexOf('type: "h2w_extension_owner_status"');
 const queueOwnerClaimIndex = wakeSource.indexOf('setAttribute(QUEUED_INSERT_OWNER_ATTR');
 ok(ownerGateIndex >= 0
@@ -774,8 +774,10 @@ ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")'
   "permission-card automation is folded into effective Project automation");
 ok(wakeDocEn.includes("The HUD exposes Continue / Check Herdr / LLM decide plus Manual handoff")
     && wakeDocZh.includes("HUD 提供 `继续 / 查 Herdr / LLM 判断`")
-    && wakeDocEn.includes("configured OpenAI-compatible LLM as a fallback")
-    && wakeDocZh.includes("OpenAI-compatible LLM 兜底"),
+    && wakeDocEn.includes("configured OpenAI-compatible LLM may create")
+    && wakeDocEn.includes("leaves the current conversation unchanged")
+    && wakeDocZh.includes("已配置的 OpenAI-compatible LLM")
+    && wakeDocZh.includes("当前会话和页面地址保持不变"),
   "Wake docs place manual handoff in the HUD and document the configured LLM fallback");
 const actionClickStart = backgroundSource.indexOf("chrome.action.onClicked.addListener");
 const actionClickEnd = actionClickStart >= 0 ? backgroundSource.indexOf("void rebuildStreams();", actionClickStart) : -1;

@@ -6,6 +6,7 @@
  *   GET  /health                          edge health (no DO involved)
  *   GET  /info                            route/stage table for debugging
  *   GET  /status/:workstationId           DO presence snapshot (dev-open)
+ *   GET  /devices                         owner-authenticated device inventory
  *   POST /devices/pairings               owner-authenticated pairing session creation
  *   POST /devices/pairings/consume       one-time pairing consumption by a new device
  *   GET  /ws/:workstationId               workstation link WSS upgrade (auth)
@@ -142,6 +143,7 @@ export default {
           { path: "/status/:workstationId", stage: "dev (DO presence)" },
           { path: "/devices/revoke-self", stage: "device self-revoke (exact credential binding)" },
           { path: "/devices/revoke", stage: "owner/operator revoke of any enrolled device" },
+          { path: "/devices", stage: "owner-authenticated device inventory" },
           { path: "/devices/pairings", stage: "owner-authenticated device pairing creation" },
           { path: "/devices/pairings/consume", stage: "one-time device pairing consumption" },
           { path: "/mcp", stage: `public MCP epoch-${identity.contractEpoch} + sessionless ChatGPT SSE` },
@@ -182,6 +184,21 @@ export default {
     // stored or logged; the DO keeps only digest-keyed, HMAC-bound verifiers.
     // The six-digit code NEVER travels in a URL/URI/query — consumption is
     // JSON-body-only; only the pairing_id may appear in a descriptor/fragment.
+    if (request.method === "GET" && url.pathname === "/devices") {
+      const ownerAuth = await authenticateOwner(request, env);
+      if (!ownerAuth) return noStoreJsonResponse({ ok: false, code: "device_inventory_admin_required" }, 401);
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      try {
+        const devices = await listPublicDevices(
+          registry,
+          (workstationId) => env.WORKSTATION_DO.get(env.WORKSTATION_DO.idFromName(workstationId)),
+        );
+        return noStoreJsonResponse({ ok: true, devices, observed_at_ms: Date.now() });
+      } catch {
+        return noStoreJsonResponse({ ok: false, code: "device_registry_unavailable" }, 503);
+      }
+    }
+
     if (request.method === "POST" && url.pathname === "/devices/pairings") {
       const ownerAuth = await authenticateOwner(request, env);
       if (!ownerAuth) return noStoreJsonResponse({ ok: false, code: "pairing_admin_required" }, 401);

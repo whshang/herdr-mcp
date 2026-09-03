@@ -322,6 +322,7 @@ fn candidate_router(state: AppState) -> Router {
             "/extension/control/action",
             post(post_extension_control_action),
         )
+        .route("/extension/fleet", get(get_extension_fleet))
         .route(
             "/extension/continuity/turn",
             post(post_extension_continuity_turn),
@@ -332,6 +333,28 @@ fn candidate_router(state: AppState) -> Router {
         )
         .route("/health", get(health))
         .with_state(state)
+}
+
+async fn get_extension_fleet(State(state): State<AppState>) -> Response {
+    if !state.trusted_extension_ipc {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let result = tokio::task::spawn_blocking(|| {
+        let paths = RuntimePaths::discover()?;
+        crate::worker::extension_fleet_snapshot(&paths)
+    })
+    .await;
+    match result {
+        Ok(Ok(payload)) => json_response(StatusCode::OK, &payload),
+        Ok(Err(error)) => json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"ok": false, "code": "device_inventory_unavailable", "error": error}),
+        ),
+        Err(error) => json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"ok": false, "code": "device_inventory_unavailable", "error": error.to_string()}),
+        ),
+    }
 }
 
 async fn post_extension_continuity_turn(State(state): State<AppState>, body: Bytes) -> Response {
@@ -455,25 +478,58 @@ async fn post_extension_continuity_resolve(State(state): State<AppState>, body: 
             );
         }
     };
-    let Some(continuity_id) = payload
+    let requested_continuity_id = payload
         .get("continuity_id")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+        .filter(|value| !value.is_empty());
+    let conversation_id = payload
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if requested_continuity_id.is_none() && conversation_id.is_none() {
         return json_response(
             StatusCode::BAD_REQUEST,
-            &json!({"ok": false, "error": "continuity_id_required"}),
+            &json!({"ok": false, "error": "continuity_id_or_conversation_id_required"}),
         );
-    };
-    if continuity_id.len() > 160 {
+    }
+    if requested_continuity_id.is_some_and(|value| value.len() > 160)
+        || conversation_id.is_some_and(|value| value.len() > 256)
+    {
         return json_response(
             StatusCode::BAD_REQUEST,
             &json!({"ok": false, "error": "continuity_field_too_large"}),
         );
     }
     let resolved = match state.state_store.lock() {
-        Ok(store) => store.continuity_resume(continuity_id, 1),
+        Ok(store) => {
+            let continuity_id = if let Some(continuity_id) = requested_continuity_id {
+                Some(continuity_id.to_owned())
+            } else if let Some(conversation_id) = conversation_id {
+                match store.continuity_for_conversation(conversation_id) {
+                    Ok(value) => value,
+                    Err(error) if error == "continuity_binding_ambiguous" => {
+                        return json_response(
+                            StatusCode::CONFLICT,
+                            &json!({"ok": false, "error": "continuity_ambiguous"}),
+                        );
+                    }
+                    Err(error) => {
+                        return json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &json!({"ok": false, "error": error}),
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+            match continuity_id {
+                Some(continuity_id) => store.continuity_resume(&continuity_id, 1),
+                None => Ok(None),
+            }
+        }
         Err(_) => Err("continuity_store_lock_poisoned".to_owned()),
     };
     match resolved {
@@ -1770,7 +1826,15 @@ mod tests {
         };
 
         let tcp = candidate_router(test_state(&root.join("tcp")));
-        let response = tcp.oneshot(request()).await.unwrap();
+        let response = tcp.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let fleet = Request::builder()
+            .method(Method::GET)
+            .uri("/extension/fleet")
+            .header(AUTHORIZATION, "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = tcp.oneshot(fleet).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let mut extension_state = test_state(&root.join("extension"));
@@ -1794,7 +1858,20 @@ mod tests {
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(json!({"continuity_id": "hc:test"}).to_string()))
             .unwrap();
-        let response = app.oneshot(resolve).await.unwrap();
+        let response = app.clone().oneshot(resolve).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["continuity_id"], "hc:test");
+
+        let resolve_by_conversation = Request::builder()
+            .method(Method::POST)
+            .uri("/extension/continuity/resolve")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"conversation_id": "conv-1"}).to_string()))
+            .unwrap();
+        let response = app.oneshot(resolve_by_conversation).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let result: Value = serde_json::from_slice(&body).unwrap();

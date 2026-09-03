@@ -36,6 +36,14 @@ Control Center 统一负责**当前页面身份、绑定 / 解绑、本机详细
 - 简体中文；
 - 日本語。
 
+## Worker 设备
+
+Control Center 现在也展示一块紧凑的只读 Worker 设备列表。`authorization`、`connection`、`health` 分开显示，同时给出 runtime 版本 / generation 和最近在线时间；当前电脑会明确标记，本机能够证明 Link generation 不一致时也会直接显示。
+
+这条路径不会把 Worker credential 交给 Chrome。Side Panel 只请求 extension service worker，后者继续走现有 Native Messaging / 本机 IPC；本机 runtime 使用已有 owner 授权读取 Worker，然后只返回经过裁剪的设备摘要。后来加入、但没有 Worker owner 权限的成员电脑会看到具体权限说明，不会因此扩大设备凭据权限。
+
+设备列表在 Control Center 打开、人工刷新，以及隐藏较久后重新显示时刷新；不新增固定频率轮询。
+
 ## 当前页面上下文保持一行
 
 控制中心仍读取 Chrome 当前激活 tab，但不再显示一张大卡片。受支持页面只显示一条紧凑上下文，例如 `ChatGPT · 已绑定 3`。内部仍保留：

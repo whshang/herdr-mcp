@@ -98,6 +98,76 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
 }
 
 #[cfg(not(target_os = "macos"))]
+pub(crate) fn extension_fleet_snapshot(_paths: &RuntimePaths) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "ok": false,
+        "code": "device_inventory_platform_unsupported",
+    }))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let owner = resolve_owner_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&owner.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&owner.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client()?
+        .get(endpoint(&owner.edge_origin, "/devices")?)
+        .headers(headers)
+        .send()
+        .map_err(|error| format!("cannot read Worker device inventory: {error}"))?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .map_err(|_| format!("Worker device inventory returned non-JSON HTTP {status}"))?;
+    if !status.is_success() || payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        let code = payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("device_inventory_unavailable");
+        return Ok(json!({
+            "ok": false,
+            "code": code,
+            "http_status": status.as_u16(),
+        }));
+    }
+
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is required to inspect the production Link".to_owned())?;
+    let link = crate::link::ownership::collect_status_report(&home, &paths.config_dir);
+    let alignment = link
+        .get("production_runtime_alignment")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let local_device_id = config.edge_device_id.clone().or_else(|| {
+        owner
+            .workstation_id
+            .starts_with("dev_")
+            .then(|| owner.workstation_id.clone())
+    });
+
+    Ok(json!({
+        "ok": true,
+        "devices": payload.get("devices").cloned().unwrap_or_else(|| json!([])),
+        "observed_at_ms": payload.get("observed_at_ms").cloned().unwrap_or(Value::Null),
+        "local": {
+            "device_id": local_device_id,
+            "runtime_version": crate::runtime_meta::runtime_version(),
+            "runtime_generation": alignment.get("current_generation").cloned().unwrap_or(Value::Null),
+            "link_active_generation": alignment.get("active_generation").cloned().unwrap_or(Value::Null),
+            "link_loaded_generation": alignment.get("loaded_launchd_generation").cloned().unwrap_or(Value::Null),
+            "link_generation_stale": alignment.get("loaded_environment_stale").cloned().unwrap_or(Value::Null),
+            "link_owner": link.get("production_owner").cloned().unwrap_or(Value::Null),
+        },
+    }))
+}
+
+#[cfg(not(target_os = "macos"))]
 fn create_pairing(
     _paths: &RuntimePaths,
     _ttl_seconds: u64,
