@@ -79,7 +79,7 @@ impl ResidueReport {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub fn scan_residue(home: &Path) -> ResidueReport {
     let launch_agents = home.join("Library/LaunchAgents");
     let config_parent = home.join(".config");
