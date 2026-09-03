@@ -758,6 +758,48 @@ impl ExecRegistry {
         })
     }
 
+    /// Cheap liveness snapshot for the HTTP `/health` route.
+    ///
+    /// Unlike `diagnostics`, this must never perform pruning, filesystem
+    /// cleanup, SQLite work, or wait for an exec-session mutex. The health
+    /// watchdog uses a short timeout and must distinguish a live-but-busy
+    /// runtime from a dead process instead of turning normal maintenance
+    /// contention into a restart loop.
+    pub fn health_diagnostics(&self) -> Value {
+        let (count, running, sessions_busy) = match self.inner.sessions.try_lock() {
+            Ok(sessions) => {
+                let mut running = 0usize;
+                let mut status_busy = false;
+                for session in sessions.values() {
+                    match session.status.try_lock() {
+                        Ok(status) => running += usize::from(!status.closed),
+                        Err(_) => status_busy = true,
+                    }
+                }
+                (json!(sessions.len()), json!(running), status_busy)
+            }
+            Err(_) => (Value::Null, Value::Null, true),
+        };
+        let (state_store_ready, state_store_busy) = match self.inner.state_store.try_lock() {
+            Ok(_) => (true, false),
+            Err(std::sync::TryLockError::WouldBlock) => (true, true),
+            Err(std::sync::TryLockError::Poisoned(_)) => (false, false),
+        };
+        json!({
+            "ready": true,
+            "count": count,
+            "running": running,
+            "sessions_busy": sessions_busy,
+            "reaped_on_boot": self.inner.reaped_on_boot,
+            "detached_on_boot": self.inner.detached_on_boot,
+            "closed_on_boot": self.inner.closed_on_boot,
+            "state_store_ready": state_store_ready,
+            "state_store_busy": state_store_busy,
+            "state_store_schema": crate::state_store::SCHEMA_VERSION,
+            "persistence_failures": self.inner.persistence_failures.load(Ordering::Relaxed),
+        })
+    }
+
     fn recovered_or_missing(&self, id: &str) -> Value {
         let state = self
             .inner
@@ -2633,6 +2675,36 @@ mod tests {
         assert_eq!(s69["recovered"], true);
 
         drop(restarted);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn health_diagnostics_does_not_wait_for_exec_maintenance_locks() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-health-nonblocking-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+
+        let sessions = registry.inner.sessions.lock().unwrap();
+        let state_store = registry.inner.state_store.lock().unwrap();
+        let health = registry.health_diagnostics();
+
+        assert_eq!(health["ready"], true);
+        assert_eq!(health["sessions_busy"], true);
+        assert!(health["count"].is_null());
+        assert!(health["running"].is_null());
+        assert_eq!(health["state_store_ready"], true);
+        assert_eq!(health["state_store_busy"], true);
+        assert_eq!(
+            health["state_store_schema"],
+            crate::state_store::SCHEMA_VERSION
+        );
+
+        drop(state_store);
+        drop(sessions);
+        drop(registry);
         let _ = fs::remove_dir_all(&path);
     }
 
