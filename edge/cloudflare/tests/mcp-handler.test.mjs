@@ -20,6 +20,7 @@ function deps(over = {}) {
         return { workstationId };
       },
       listDevices: async () => over.devices ?? [],
+      createPairing: over.createPairing,
       resolveDevice: over.resolveDevice,
       forward: async (_stub, body) => {
         calls.push(JSON.parse(body));
@@ -177,6 +178,216 @@ test("herdr_devices executes at Edge and never forwards to a workstation", async
   assert.equal(r.body.result.isError, undefined);
   assert.deepEqual(r.body.result.structuredContent, { ok: true, devices });
   assert.equal(d.calls.length, 0);
+});
+
+test("herdr_call herdr_mcp.device.pair executes at Edge and creates pairing without workstation", async () => {
+  let pairingInput = null;
+  const d = deps({
+    createPairing: async (input) => {
+      pairingInput = input;
+      return {
+        ok: true,
+        pairing_id: "pair_" + "11".repeat(32),
+        code: "654321",
+        expires_at_ms: 600_000,
+        pairing_address: "https://edge.example/pair#pair_" + "11".repeat(32),
+        worker_origin: "https://edge.example",
+      };
+    },
+  });
+
+  // Call with stringified JSON params
+  const r = await handleMcp(
+    req(720, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.device.pair",
+        params: JSON.stringify({ ttl_seconds: 300, name: "new-workstation" }),
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(r.body.id, 720);
+  assert.equal(r.body.result.isError, undefined);
+  assert.equal(r.body.result.structuredContent.ok, true);
+  assert.equal(r.body.result.structuredContent.code, "654321");
+  assert.match(r.body.result.structuredContent.pairing_id, /^pair_[0-9a-f]{64}$/);
+  assert.equal(r.body.result.structuredContent.pairing_address, "https://edge.example/pair#pair_" + "11".repeat(32));
+  assert.ok(r.body.result.structuredContent.instructions.includes("herdr-mcp worker connect"));
+  assert.deepEqual(pairingInput, { ttl_seconds: 300, name: "new-workstation" });
+  assert.equal(d.calls.length, 0, "must never forward to a workstation");
+  assert.equal(d.targets.length, 0);
+});
+
+test("herdr_call herdr_mcp.device.pair handles object params and validation errors", async () => {
+  let pairingInput = null;
+  const d = deps({
+    createPairing: async (input) => {
+      pairingInput = input;
+      return {
+        ok: true,
+        pairing_id: "pair_" + "22".repeat(32),
+        code: "123456",
+        expires_at_ms: 600_000,
+        pairing_address: "https://edge.example/pair#pair_" + "22".repeat(32),
+      };
+    },
+  });
+
+  // Call with object params
+  const r1 = await handleMcp(
+    req(721, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.device.pair",
+        params: { ttl_seconds: 600 },
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(r1.body.result.structuredContent.ok, true);
+  assert.deepEqual(pairingInput, { ttl_seconds: 600, name: undefined });
+
+  // Call with invalid JSON params string
+  const rBadJson = await handleMcp(
+    req(722, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.device.pair",
+        params: "{not-json",
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(rBadJson.body.result.isError, true);
+  assert.equal(rBadJson.body.result.structuredContent.code, "invalid_params");
+
+  // Call with invalid name
+  const rBadName = await handleMcp(
+    req(723, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.device.pair",
+        params: { name: "   " },
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(rBadName.body.result.isError, true);
+  assert.equal(rBadName.body.result.structuredContent.code, "invalid_device_name");
+
+  // Unavailable pairing dependency
+  const dNoPair = deps({});
+  const rNoPair = await handleMcp(
+    req(724, "tools/call", {
+      name: "herdr_call",
+      arguments: { method: "herdr_mcp.device.pair" },
+    }),
+    "legacy-default",
+    dNoPair.value,
+  );
+  assert.equal(rNoPair.body.result.isError, true);
+  assert.equal(rNoPair.body.result.structuredContent.code, "pairing_unavailable");
+
+  // Rejects explicit top-level device selector
+  const rDevice = await handleMcp(
+    req(725, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.device.pair",
+        device: DEVICE_A,
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(rDevice.body.result.isError, true);
+  assert.equal(rDevice.body.result.structuredContent.code, "device_selector_not_allowed");
+
+  // Rejects device refs in params
+  const rDeviceRef = await handleMcp(
+    req(726, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.device.pair",
+        params: { pane_id: `herdr_ref_${DEVICE_A}_pane1` },
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(rDeviceRef.body.result.isError, true);
+  assert.equal(rDeviceRef.body.result.structuredContent.code, "device_ref_not_allowed");
+
+  // Rejects array or scalar params
+  for (const badParams of [[1, 2, 3], 42, true]) {
+    const rBadType = await handleMcp(
+      req(727, "tools/call", {
+        name: "herdr_call",
+        arguments: {
+          method: "herdr_mcp.device.pair",
+          params: badParams,
+        },
+      }),
+      "legacy-default",
+      d.value,
+    );
+    assert.equal(rBadType.body.result.isError, true);
+    assert.equal(rBadType.body.result.structuredContent.code, "invalid_params");
+  }
+
+  // Rejects invalid ttl_seconds (too low, too high, float, string)
+  for (const badTtl of [59, 601, 0, -10, 300.5, "300"]) {
+    const rBadTtl = await handleMcp(
+      req(728, "tools/call", {
+        name: "herdr_call",
+        arguments: {
+          method: "herdr_mcp.device.pair",
+          params: { ttl_seconds: badTtl },
+        },
+      }),
+      "legacy-default",
+      d.value,
+    );
+    assert.equal(rBadTtl.body.result.isError, true);
+    assert.equal(rBadTtl.body.result.structuredContent.code, "invalid_pairing_ttl");
+  }
+
+  // Rejects invalid name types and lengths (>128 chars)
+  for (const badName of [123, true, "", "a".repeat(129)]) {
+    const rBadNameType = await handleMcp(
+      req(729, "tools/call", {
+        name: "herdr_call",
+        arguments: {
+          method: "herdr_mcp.device.pair",
+          params: { name: badName },
+        },
+      }),
+      "legacy-default",
+      d.value,
+    );
+    assert.equal(rBadNameType.body.result.isError, true);
+    assert.equal(rBadNameType.body.result.structuredContent.code, "invalid_device_name");
+  }
+
+  // Rejects unknown keys in params (e.g. camelCase ttlSeconds typo)
+  const rUnknownKey = await handleMcp(
+    req(730, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.device.pair",
+        params: { ttlSeconds: 300 },
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(rUnknownKey.body.result.isError, true);
+  assert.equal(rUnknownKey.body.result.structuredContent.code, "invalid_params");
 });
 
 test("explicit device routing selects one workstation and strips Edge-only device metadata", async () => {
