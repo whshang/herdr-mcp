@@ -86,7 +86,13 @@ herdr-mcp worker rename "<new-device-name>"
 
 `herdr-mcp device rename ...` 是等价别名。rename 只修改面向人的显示名称；不可变 `device_id`、workstation identity、设备凭据、授权和调度状态全部保持不变。Link 重连不会覆盖用户显式改过的名字。最初的 default/legacy workstation 在首次登记时也会自动记录本机 Computer Name。
 
-如果要永久撤销另一台已登记设备的授权，先通过 `herdr_devices` 取得它不可变的 `device_id`，然后在 owner 工作站运行：
+如果要永久撤销另一台已登记设备的授权，现在优先直接在已经授权的 ChatGPT/Herdr 网页对话里完成：让 ChatGPT 列出设备，选中目标设备不可变的 `device_id`，然后永久 revoke。Edge-local 动作等价于：
+
+```text
+herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
+```
+
+这个路径不要求任何工作站在线，也绝不接受 display name。CLI fallback：先通过 `herdr_devices` 取得不可变的 `device_id`，然后在 owner 工作站运行：
 
 ```bash
 herdr-mcp worker revoke "<device-id>" --confirm

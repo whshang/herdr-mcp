@@ -504,6 +504,22 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
           pairing_address: pairingAddress,
         };
       },
+      revokeDevice: async (deviceId) => {
+        const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+        const result = await revokeRegisteredDevice(registry, deviceId);
+        if (!result.ok) {
+          return {
+            ok: false,
+            code: result.code,
+            retryable: result.retryable,
+          };
+        }
+        return {
+          ok: true,
+          device_id: result.device_id,
+          revoked_at_ms: result.revoked_at_ms,
+        };
+      },
       resolveDevice: async (selector, args) => {
         const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
         return resolveDeviceRouteWithContext(registry, { selector, args: args as Record<string, unknown> | undefined, legacyWorkstationId: workstationId });

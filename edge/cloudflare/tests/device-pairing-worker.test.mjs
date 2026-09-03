@@ -507,7 +507,37 @@ test("OAuth owner can create pairing via herdr_call herdr_mcp.device.pair with n
   assert.equal(replay.status, 401);
   assert.equal((await replay.json()).code, "pairing_rejected");
 
-  // 4. OAuth owner can also create pairing via POST /devices/pairings without workstation headers
+  // 4. The same OAuth owner conversation can permanently revoke the newly
+  // enrolled immutable device at Edge, without forwarding to any workstation.
+  const revokeMcp = await worker.fetch(new Request("https://edge.example/mcp", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer oauth-chatgpt-token",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "tools/call",
+      params: {
+        name: "herdr_call",
+        arguments: {
+          method: "herdr_mcp.device.revoke",
+          params: JSON.stringify({ device_id: creds.device_id, confirm: true }),
+        },
+      },
+    }),
+  }), env);
+  assert.equal(revokeMcp.status, 200);
+  const revokeBody = await revokeMcp.json();
+  assert.equal(revokeBody.result.isError, undefined);
+  assert.equal(revokeBody.result.structuredContent.ok, true);
+  assert.equal(revokeBody.result.structuredContent.revoked, true);
+  assert.equal(revokeBody.result.structuredContent.device_id, creds.device_id);
+  assert.equal(typeof revokeBody.result.structuredContent.revoked_at_ms, "number");
+  assert.deepEqual(forwarded, ["/internal/revoke"], "Edge-local revoke may only use the dedicated WorkstationDO revoke fence, never /internal/forward");
+
+  // 5. OAuth owner can also create pairing via POST /devices/pairings without workstation headers
   const restCreate = await worker.fetch(new Request("https://edge.example/devices/pairings", {
     method: "POST",
     headers: {
@@ -521,7 +551,7 @@ test("OAuth owner can create pairing via herdr_call herdr_mcp.device.pair with n
   assert.equal(restBody.ok, true);
   assert.match(restBody.pairing_id, /^pair_[0-9a-f]{64}$/);
 
-  // 5. Invalid input regressions on herdr_call herdr_mcp.device.pair:
+  // 6. Invalid input regressions on herdr_call herdr_mcp.device.pair:
   // (a) Top-level device selector is rejected
   const withDevice = await worker.fetch(new Request("https://edge.example/mcp", {
     method: "POST",

@@ -21,6 +21,7 @@ function deps(over = {}) {
       },
       listDevices: async () => over.devices ?? [],
       createPairing: over.createPairing,
+      revokeDevice: over.revokeDevice,
       resolveDevice: over.resolveDevice,
       forward: async (_stub, body) => {
         calls.push(JSON.parse(body));
@@ -209,6 +210,9 @@ test("herdr_devices executes at Edge and exposes pairing hint without tools/list
   assert.ok(r.body.result.structuredContent.pairing_hint.includes("params='{\"ttl_seconds\":600"));
   assert.ok(r.body.result.structuredContent.pairing_hint.includes("params is a JSON string"));
   assert.ok(r.body.result.structuredContent.pairing_hint.includes("exact expiry"));
+  assert.ok(r.body.result.structuredContent.revoke_hint.includes("herdr_mcp.device.revoke"));
+  assert.ok(r.body.result.structuredContent.revoke_hint.includes('"confirm":true'));
+  assert.ok(r.body.result.structuredContent.revoke_hint.includes("Never revoke by display name"));
   assert.equal(d.calls.length, 0);
 });
 
@@ -455,6 +459,69 @@ test("herdr_call herdr_mcp.device.pair handles object params and validation erro
     assert.equal(rTopLevelKey.body.result.structuredContent.code, "invalid_params");
     assert.equal(createCalled, false, "no pairing session must be created on invalid top-level arguments");
   }
+});
+
+test("herdr_call herdr_mcp.device.revoke executes at Edge only with immutable id and explicit confirmation", async () => {
+  let revoked = null;
+  const d = deps({
+    revokeDevice: async (deviceId) => {
+      revoked = deviceId;
+      return { ok: true, device_id: deviceId, revoked_at_ms: 1_234_567 };
+    },
+  });
+
+  const r = await handleMcp(
+    req(732, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.device.revoke",
+        params: JSON.stringify({ device_id: DEVICE_A, confirm: true }),
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(r.body.result.isError, undefined);
+  assert.equal(r.body.result.structuredContent.ok, true);
+  assert.equal(r.body.result.structuredContent.revoked, true);
+  assert.equal(r.body.result.structuredContent.device_id, DEVICE_A);
+  assert.equal(r.body.result.structuredContent.revoked_at_ms, 1_234_567);
+  assert.equal(revoked, DEVICE_A);
+  assert.equal(d.calls.length, 0, "Edge-local revoke must never forward to a workstation");
+  assert.equal(d.targets.length, 0);
+
+  const noConfirm = await handleMcp(
+    req(733, "tools/call", {
+      name: "herdr_call",
+      arguments: { method: "herdr_mcp.device.revoke", params: { device_id: DEVICE_A } },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(noConfirm.body.result.isError, true);
+  assert.equal(noConfirm.body.result.structuredContent.code, "confirmation_required");
+
+  const badName = await handleMcp(
+    req(734, "tools/call", {
+      name: "herdr_call",
+      arguments: { method: "herdr_mcp.device.revoke", params: { device_id: "macbook-air", confirm: true } },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(badName.body.result.isError, true);
+  assert.equal(badName.body.result.structuredContent.code, "invalid_device_id");
+
+  const nameSelector = await handleMcp(
+    req(735, "tools/call", {
+      name: "herdr_call",
+      arguments: { method: "herdr_mcp.device.revoke", params: { device: DEVICE_A, confirm: true } },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(nameSelector.body.result.isError, true);
+  assert.equal(nameSelector.body.result.structuredContent.code, "invalid_params");
 });
 
 test("explicit device routing selects one workstation and strips Edge-only device metadata", async () => {

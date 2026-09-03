@@ -58,6 +58,14 @@ herdr_call(method="herdr_mcp.device.pair", params='{"ttl_seconds":600,"name":"<o
 
 When the user asks in conversation to add, pair, configure, or generate a setup link for a new computer, prefer this Edge-local method instead of telling them to find an old workstation and run `worker pair`. Use the default 600-second TTL unless the user requests a shorter value. Present the pairing address, the one-time 6-digit verification code, and the exact `expires_at` time together, and make the expiry conspicuous. Also give the copyable `herdr-mcp worker connect "<pairing-address>"` command for the new computer. The code is intentionally returned to the OAuth-authorized owner conversation for this user-requested flow; treat it as short-lived enrollment data, never persist it to Git, shell history, ordinary logs, or unattended automation, and enter it only at the new computer's no-echo prompt.
 
+To permanently revoke an old enrolled computer from an OAuth-authorized owner conversation, first call `herdr_devices`, select the exact immutable `device_id`, then call:
+
+```text
+herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
+```
+
+`herdr_mcp.device.revoke` is Edge-local and does not require any workstation to be online. It accepts only the immutable device identity plus explicit `confirm=true`; never substitute a display name or pane/workspace ref. Revocation permanently fences that credential and identity. To add the computer again later, create a new pairing and enroll a new device identity. The owner CLI `herdr-mcp worker revoke <device-id> --confirm` remains the fallback.
+
 ## Conversation continuity recovery
 
 When a fresh or uncertain conversation contains prior-work intent such as “continue”, “resume”, “接着”, or “继续上次”, search durable continuity before asking the user for an internal ID. Generic continuity wording is a trigger only; it is never enough evidence to choose a chain.

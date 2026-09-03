@@ -24,6 +24,7 @@ Agent 直接读取并执行本文，不需要用户再把本文包装成一段�
 
 - 如果用户已经提供 Herdr pairing address，这台电脑就是加入已有 Worker。安装/验证本机 runtime 与 macOS 权限后，执行 `herdr-mcp worker connect "<pairing-address>"`；CLI 默认使用 macOS Computer Name，只有用户明确要求不同的初始显示名时才传 `--name`。跳过 Worker/R2/Connector 创建。
 - 如果用户明确说已有另一台 Herdr 电脑但还没有 pairing address，优先直接在已经授权的 ChatGPT/Herdr 对话中调用 Edge-local `herdr_mcp.device.pair` 创建短期配对；不要求旧电脑在线。把配对地址、一次性 6 位验证码、精确过期时间一起展示。已授权旧电脑上的 `herdr-mcp worker pair` 保留为 CLI fallback。新电脑用 `worker connect` 消费 pairing，并复用已有公网 MCP/OAuth origin。
+- 如果用户要求永久移除一台旧设备，也优先在同一个已授权 ChatGPT/Herdr 网页对话里完成：先用 `herdr_devices` 列出设备，以不可变 `device_id` 选中目标，再调用 Edge-local `herdr_mcp.device.revoke` 并传 `confirm=true`。绝不按 display name revoke；旧设备无需在线。`herdr-mcp worker revoke <device-id> --confirm` 保留为 CLI fallback。
 - 只有用户明确确认这是第一台 Herdr 电脑/第一个 fleet，才继续下面的 first-owner Cloudflare 路径。
 - 如果意图不清楚，只问一个所有权问题：**创建第一个 Herdr Worker，还是加入已有 Herdr Worker？** 禁止根据本机缺少凭据自行推断。
 - pairing、旧 Worker 升级、hostname 连通性或权限失败都仍属于 existing-fleet 修复路径。除非用户明确改变 fleet 意图，否则禁止 fallback 到随机后缀的新 Worker、R2 桶或 Connector。

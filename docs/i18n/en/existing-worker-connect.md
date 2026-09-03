@@ -86,7 +86,13 @@ herdr-mcp worker rename "<new-device-name>"
 
 `herdr-mcp device rename ...` is an equivalent alias. Rename changes only the human-facing display name; the immutable `device_id`, workstation identity, credential, authorization and scheduling state stay unchanged. Link reconnects do not overwrite an explicit rename. The default/legacy workstation likewise records its local Computer Name when it is first registered.
 
-To permanently remove authorization from another enrolled device, first get its immutable `device_id` from `herdr_devices`, then run this on the owner workstation:
+To permanently remove authorization from another enrolled device, prefer the already-authorized ChatGPT/Herdr conversation: ask ChatGPT to list devices, select the exact immutable `device_id`, and permanently revoke that device. The Edge-local action is equivalent to:
+
+```text
+herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
+```
+
+This path does not require any workstation to be online and never accepts a display name. CLI fallback: first get the immutable `device_id` from `herdr_devices`, then run this on the owner workstation:
 
 ```bash
 herdr-mcp worker revoke "<device-id>" --confirm

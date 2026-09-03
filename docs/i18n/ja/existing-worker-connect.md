@@ -63,7 +63,13 @@ herdr-mcp worker rename "<new-device-name>"
 
 `herdr-mcp device rename ...` も同じ操作です。rename が変更するのは人向けの表示名だけで、不変な `device_id`、workstation identity、資格情報、authorization、scheduling は変わりません。Link の再接続で明示的な rename が上書きされることもありません。default/legacy workstation も最初の登録時にローカル Computer Name を記録します。
 
-別の登録済みデバイスの認可を恒久的に取り消す場合は、まず `herdr_devices` で不変の `device_id` を確認し、owner ワークステーションで次を実行します:
+別の登録済みデバイスの認可を恒久的に取り消す場合、現在の推奨経路は認可済みの ChatGPT/Herdr Web 会話です。ChatGPT にデバイス一覧を表示させ、対象の不変 `device_id` を選び、そのデバイスを恒久的に revoke させます。Edge-local 操作は次と同等です:
+
+```text
+herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
+```
+
+この経路はワークステーションのオンライン状態を必要とせず、display name は受け付けません。CLI fallback として、まず `herdr_devices` で不変の `device_id` を確認し、owner ワークステーションで次を実行します:
 
 ```bash
 herdr-mcp worker revoke "<device-id>" --confirm
