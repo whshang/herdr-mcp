@@ -287,7 +287,8 @@ pub fn health_fields(cache: &EventCache, exec: Option<&ExecRegistry>) -> Map<Str
     output.insert("native_migration".to_owned(), migration_status());
     output.insert(
         "exec_sessions".to_owned(),
-        exec.map(ExecRegistry::diagnostics).unwrap_or(Value::Null),
+        exec.map(ExecRegistry::health_diagnostics)
+            .unwrap_or(Value::Null),
     );
     output.insert(
         "event_cache".to_owned(),
