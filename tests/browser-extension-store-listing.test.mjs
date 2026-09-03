@@ -53,6 +53,9 @@ test("Store package workflow prepares every main extension update without publis
   }
   assert.match(workflow, /tests\/manual\/extension_smoke\.mjs/);
   assert.match(workflow, /tests\/manual\/background_bind_test\.mjs/);
+  const buildIndex = workflow.indexOf("npm run build");
+  const testIndex = workflow.indexOf("node --test");
+  assert.ok(buildIndex >= 0 && testIndex > buildIndex, "Store workflow builds untracked dist/server.js before tests that spawn it");
   assert.match(workflow, /scripts\/pack-extension\.mjs --out-dir store-artifact/);
   assert.match(workflow, /contracts\/browser-extension-store\.json/);
   assert.match(workflow, /actions\/upload-artifact@v4/);
