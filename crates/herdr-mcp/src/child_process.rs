@@ -1,6 +1,4 @@
-#[cfg(any(target_os = "macos", test))]
 use std::io::Read;
-#[cfg(any(target_os = "macos", test))]
 use std::process::Stdio;
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
@@ -36,7 +34,6 @@ pub(crate) fn configure_process_group(command: &mut Command) {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
 pub(crate) struct BoundedOutput {
     pub(crate) status: ExitStatus,
@@ -45,7 +42,6 @@ pub(crate) struct BoundedOutput {
     pub(crate) truncated: bool,
 }
 
-#[cfg(any(target_os = "macos", test))]
 pub(crate) fn run_bounded_output(
     command: &mut Command,
     timeout: Duration,
@@ -54,7 +50,6 @@ pub(crate) fn run_bounded_output(
     run_bounded_output_inner(command, timeout, max_bytes, true)
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn run_bounded_output_inner(
     command: &mut Command,
     timeout: Duration,
@@ -90,7 +85,6 @@ fn run_bounded_output_inner(
     }))
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn read_capped_and_drain(reader: &mut impl Read, max_bytes: usize) -> (Vec<u8>, bool) {
     let mut retained = Vec::with_capacity(max_bytes.min(64 * 1024));
     let mut buffer = [0_u8; 8192];

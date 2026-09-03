@@ -108,6 +108,25 @@ The result separates evidence from the decision: live compatible/rejected worker
 
 The Web planner can then choose direct execution, reuse an existing Agent, create one new lane, or parallelize only when work is genuinely independent and mutation ownership is isolated. Existing idle/done Agents, worktrees, and duplicate utility panes are exposed as reuse signals; cleanup remains planner-owned after completion rather than becoming a background cleanup daemon.
 
+### Fresh GitHub PR / Auto-merge status
+
+v0.4.5 adds another read-only local method through the existing `herdr_call` tool without changing the 18-tool workstation contract:
+
+```text
+herdr_call(
+  method="herdr_mcp.github.status",
+  params={
+    "project_root":"/path/to/project",
+    "pr_number":284,
+    "previous_fingerprint":"sha256:..."
+  }
+)
+```
+
+The method reads GitHub through the workstation's authenticated `gh` CLI on every call. It therefore provides an explicit `source=local_gh_api`, `fresh=true`, and `cache_policy=bypass_connector_cache` boundary for repository Auto-merge settings and PR/check state instead of relying on a Connector projection immediately after a settings mutation. The project root must be a live Herdr-managed Git root and its `origin` must be on `github.com`.
+
+When `pr_number` is present, the result includes the PR state, merge state, Auto-merge request, required checks, and supplemental statuses such as external deployments. Every response has a deterministic state `fingerprint`. Pass that value back as `previous_fingerprint` while monitoring a PR; if nothing relevant changed, the next call returns only compact summary counts plus `changed=false` rather than replaying the complete status table. This is the preferred planner path instead of `gh run watch`, whose terminal snapshots repeatedly duplicate unchanged job output.
+
 ## Connector information
 
 ```bash
