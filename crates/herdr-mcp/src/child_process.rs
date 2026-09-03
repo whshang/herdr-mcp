@@ -259,7 +259,10 @@ mod registry {
     }
 
     pub(super) fn register(kind: &str, child: &Child) -> Registration {
-        let pid = child.id();
+        register_pid(kind, child.id())
+    }
+
+    pub(super) fn register_pid(kind: &str, pid: u32) -> Registration {
         if !registry_enabled() {
             return Registration { pid: None };
         }
@@ -756,8 +759,18 @@ pub(crate) fn register_owned_child(kind: &str, child: &Child) -> OwnedChildRegis
     registry::register(kind, child)
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn register_owned_pid(kind: &str, pid: u32) -> OwnedChildRegistration {
+    registry::register_pid(kind, pid)
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn register_owned_child(_kind: &str, _child: &Child) -> OwnedChildRegistration {
+    OwnedChildRegistration
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn register_owned_pid(_kind: &str, _pid: u32) -> OwnedChildRegistration {
     OwnedChildRegistration
 }
 
