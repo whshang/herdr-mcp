@@ -227,6 +227,7 @@ where
     drain_generation: u64,
     drain_timer: Option<JoinHandle<()>>,
     ladder: TransportLadder,
+    attempt_pre_online: bool,
     stopping: bool,
     draining: bool,
 }
@@ -290,6 +291,7 @@ where
             drain_generation: 0,
             drain_timer: None,
             ladder,
+            attempt_pre_online: true,
             stopping: false,
             draining: false,
         }
@@ -389,13 +391,6 @@ where
             self.socket.take();
         }
 
-        if matches!(event, WebSocketEvent::Closed { .. })
-            && (self.core.phase() == ConnectionPhase::Connecting
-                || self.core.phase() == ConnectionPhase::Handshake)
-        {
-            self.ladder.record_failure();
-        }
-
         let now_ms = self.now_ms();
         let hello = if matches!(event, WebSocketEvent::Opened { .. }) {
             match self.runner.hello_message(now_ms) {
@@ -436,7 +431,6 @@ where
                         Ok(None)
                     }
                     Err(_) => {
-                        self.ladder.record_failure();
                         let actions = self.core.socket_connect_failed(
                             attempt_id,
                             self.now_ms(),
@@ -452,7 +446,6 @@ where
                 }
                 self.handshake_attempt = None;
                 self.handshake_timer.take();
-                self.ladder.record_failure();
                 let actions =
                     self.core
                         .handshake_timed_out(attempt_id, self.now_ms(), self.rng_sample())?;
@@ -615,13 +608,13 @@ where
                     delay_ms,
                 } => self.arm_handshake(attempt_id, duration_from_i64_ms(delay_ms)),
                 TransportAction::CancelHandshakeTimeout { attempt_id } => {
-                    let was_handshake = self.handshake_attempt.is_some();
                     self.cancel_handshake(attempt_id);
-                    if was_handshake && self.core.phase() == ConnectionPhase::Reconnecting {
-                        self.ladder.record_failure();
-                    }
                 }
                 TransportAction::ScheduleReconnect(schedule) => {
+                    if self.attempt_pre_online {
+                        self.attempt_pre_online = false;
+                        self.ladder.record_failure();
+                    }
                     if !self.stopping {
                         self.arm_reconnect(schedule);
                     }
@@ -653,10 +646,14 @@ where
                 | TransportAction::InboundRejected { .. }
                 | TransportAction::SocketErrorObserved { .. } => {}
                 TransportAction::Online { .. } => {
+                    self.attempt_pre_online = false;
                     self.cancel_offline_recycle();
                     self.ladder.record_success();
                 }
-                TransportAction::Disconnected { .. } => self.arm_offline_recycle(),
+                TransportAction::Disconnected { .. } => {
+                    self.attempt_pre_online = false;
+                    self.arm_offline_recycle();
+                }
                 TransportAction::HeartbeatDue { .. } | TransportAction::Inbound { .. } => {
                     unreachable!("runner routes higher-layer transport actions before the I/O pump")
                 }
@@ -675,6 +672,7 @@ where
         if let Some(socket) = self.socket.take() {
             socket.abort();
         }
+        self.attempt_pre_online = true;
         let current_route = self.ladder.current_route().clone();
         let request = SocketConnectRequest {
             edge_url: current_route.endpoint_url,
@@ -2277,5 +2275,97 @@ mod tests {
             vec!["wss://custom.test/ws/ws1"],
             "fatal hello_ack refusal must not trigger ladder failover"
         );
+    }
+
+    #[tokio::test]
+    async fn single_handshake_drop_consumes_single_budget_unit() {
+        let runtime = Arc::new(MockRuntime::immediate(RuntimeToolResult::Success {
+            result: None,
+        }));
+        let routes = vec![
+            TransportRoute {
+                kind: TransportRouteKind::DirectCustomDomain,
+                endpoint_url: "wss://custom.test/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::DirectWorkersDev,
+                endpoint_url: "wss://worker.workers.dev/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+        ];
+
+        let (connector, mut controls) = FakeConnector::new([]);
+        let mut cfg = io_config(100);
+        // max_failures_per_route = 2: a single handshake drop must NOT advance route
+        cfg.ladder = Some(TransportLadder::new(routes, 2).unwrap());
+
+        let io = LinkIoLoop::with_connector(
+            cfg,
+            make_core(1_000, 100, 3_000, 262_144, None),
+            make_runner(runtime),
+            Arc::clone(&connector),
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(io.run(stop_rx));
+
+        // Attempt 1 opens on route 0
+        let mut first = next_control(&mut controls).await;
+        send_open(&first);
+        assert!(matches!(
+            decode_send(next_command(&mut first).await),
+            RelayMessage::Hello(_)
+        ));
+
+        // Handshake drops (socket closed before hello_ack)
+        send_closed(&first, ABNORMAL_CLOSE_CODE, "handshake network drop");
+
+        // Attempt 2 reconnects on route 0 (first failure counted exactly once, budget remaining = 1)
+        let mut second = next_control(&mut controls).await;
+        assert_ne!(first.attempt_id, second.attempt_id);
+
+        let urls_after_first_drop = connector.requested_urls();
+        assert_eq!(
+            urls_after_first_drop,
+            vec!["wss://custom.test/ws/ws1", "wss://custom.test/ws/ws1"],
+            "single handshake drop must consume exactly 1 failure unit and stay on route 0"
+        );
+
+        // Attempt 2 opens and drops during handshake as well (second failure)
+        send_open(&second);
+        assert!(matches!(
+            decode_send(next_command(&mut second).await),
+            RelayMessage::Hello(_)
+        ));
+        send_closed(&second, ABNORMAL_CLOSE_CODE, "second handshake drop");
+
+        // Attempt 3 reconnects on route 1 (second failure triggers failover after threshold 2)
+        let mut third = next_control(&mut controls).await;
+        assert_ne!(second.attempt_id, third.attempt_id);
+        bring_online(&mut third).await;
+
+        let urls_after_second_drop = connector.requested_urls();
+        assert_eq!(
+            urls_after_second_drop,
+            vec![
+                "wss://custom.test/ws/ws1",
+                "wss://custom.test/ws/ws1",
+                "wss://worker.workers.dev/ws/ws1"
+            ],
+            "second failed attempt must advance ladder to route 1"
+        );
+
+        stop_tx.send(true).unwrap();
+        assert!(matches!(
+            next_command(&mut third).await,
+            WebSocketCommand::Close {
+                code: WS_CLOSE_NORMAL,
+                ..
+            }
+        ));
+        send_closed(&third, WS_CLOSE_NORMAL, "done");
+        assert_eq!(task.await.unwrap().unwrap(), LinkExitKind::Stopped);
     }
 }
