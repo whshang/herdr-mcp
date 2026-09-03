@@ -4,7 +4,7 @@ use crate::snapshot;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
@@ -941,6 +941,41 @@ impl EventCache {
             })
     }
 
+    /// Lightweight liveness metadata for `/health`.
+    ///
+    /// Health checks must never wait behind the event-cache writer. A Link
+    /// generation transition can legitimately reconcile a large snapshot or
+    /// process a burst of events while launchd/service activation is probing
+    /// `/health`. Blocking here turns healthy process contention into a false
+    /// service failure and can trigger an unnecessary DEV rollback.
+    pub fn health_diagnostics(&self) -> Value {
+        let boot_id = self.boot_id();
+        match self.shared.state.try_read() {
+            Ok(state) => json!({
+                "boot_id": boot_id,
+                "event_count": state.event_count,
+                "last_event_at": state.last_event_at,
+                "needs_reconcile": state.needs_reconcile,
+                "busy": false,
+            }),
+            Err(TryLockError::WouldBlock) => json!({
+                "boot_id": boot_id,
+                "event_count": 0,
+                "last_event_at": Value::Null,
+                "needs_reconcile": true,
+                "busy": true,
+            }),
+            Err(TryLockError::Poisoned(_)) => json!({
+                "boot_id": boot_id,
+                "event_count": 0,
+                "last_event_at": Value::Null,
+                "needs_reconcile": true,
+                "busy": false,
+                "poisoned": true,
+            }),
+        }
+    }
+
     pub fn shutdown(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
         self.shared.stream_connected.store(false, Ordering::Release);
@@ -1489,6 +1524,16 @@ mod tests {
         let cache = EventCache::from_snapshot_for_test(fixture());
         assert_eq!(cache.classify_health(), EventCacheHealth::Healthy);
         assert!(cache.classify_health().doctor_pass());
+    }
+
+    #[test]
+    fn health_diagnostics_does_not_wait_for_event_cache_writer() {
+        let cache = EventCache::from_snapshot_for_test(fixture());
+        let _writer = cache.shared.state.write().unwrap();
+        let diagnostics = cache.health_diagnostics();
+        assert_eq!(diagnostics["busy"], true);
+        assert_eq!(diagnostics["needs_reconcile"], true);
+        assert_eq!(diagnostics["event_count"], 0);
     }
 
     #[test]
