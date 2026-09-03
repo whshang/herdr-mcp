@@ -43,6 +43,7 @@ const MAX_RELAY_ID_LEN: usize = 64;
 const MAX_FAILURE_DOMAIN_LEN: usize = 128;
 const MAX_RELAY_URL_LEN: usize = 2048;
 const MAX_PRIORITY: u32 = 1_000_000;
+const MAX_WEIGHT: u32 = 1_000_000;
 const GENERATED_FUTURE_SKEW_SECONDS: i64 = 300;
 const RELAY_PROD_2026_09_KEY_ID: &str = "relay-prod-2026-09";
 const RELAY_PROD_2026_09_PUBLIC_KEY: [u8; 32] = [
@@ -133,8 +134,14 @@ struct ManifestRelayWire {
     id: String,
     url: String,
     priority: u32,
+    #[serde(default = "default_manifest_relay_weight")]
+    weight: u32,
     failure_domain: String,
     enabled: bool,
+}
+
+const fn default_manifest_relay_weight() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,11 +334,17 @@ fn validate_static_payload(
                 "relay priority is out of bounds",
             ));
         }
+        if relay.weight == 0 || relay.weight > MAX_WEIGHT {
+            return Err(ManifestError::InvalidPayload(
+                "relay weight is out of bounds",
+            ));
+        }
         validate_relay_url(&relay.url)?;
         relays.push(RelayEndpoint {
             id: relay.id,
             url: relay.url,
             priority: relay.priority,
+            weight: relay.weight,
             failure_domain: relay.failure_domain,
             enabled: relay.enabled,
         });
@@ -415,15 +428,30 @@ fn validate_relay_url(raw: &str) -> Result<(), ManifestError> {
 
 /// Read the cache synchronously without network I/O.
 pub fn load_cached_pool(paths: &RuntimePaths, now: i64) -> RelayPoolLoad {
-    load_cached_pool_with_keys(paths, now, production_verification_key)
+    load_cached_pool_from_config_dir(&paths.config_dir, now)
+}
+
+pub fn load_cached_pool_from_config_dir(config_dir: &Path, now: i64) -> RelayPoolLoad {
+    load_cached_pool_from_config_dir_with_keys(config_dir, now, production_verification_key)
 }
 
 fn load_cached_pool_with_keys<F>(paths: &RuntimePaths, now: i64, key_lookup: F) -> RelayPoolLoad
 where
     F: Fn(&str) -> Option<VerifyingKey> + Copy,
 {
+    load_cached_pool_from_config_dir_with_keys(&paths.config_dir, now, key_lookup)
+}
+
+fn load_cached_pool_from_config_dir_with_keys<F>(
+    config_dir: &Path,
+    now: i64,
+    key_lookup: F,
+) -> RelayPoolLoad
+where
+    F: Fn(&str) -> Option<VerifyingKey> + Copy,
+{
     let fallback = default_embedded_relays();
-    let raw = match read_cache_bytes(&paths.config_dir) {
+    let raw = match read_cache_bytes(config_dir) {
         Ok(Some(raw)) => raw,
         Ok(None) => {
             return RelayPoolLoad {

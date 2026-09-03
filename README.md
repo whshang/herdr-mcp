@@ -51,6 +51,12 @@ Cloudflare provides the stable public MCP/OAuth entry while every development co
 
 [Cloudflare setup](docs/i18n/en/cloudflare-edge-deployment.md) · [Cloudflare Dashboard](https://dash.cloudflare.com/)
 
+### Shared Relay is fallback transport, not your public endpoint
+
+Herdr-MCP normally keeps the workstation Link direct. If you configured your own Cloudflare Custom Domain, the shared Relay Pool is not used. Without a Custom Domain, the Link tries the Worker `workers.dev` origin directly, then a validated local proxy when one exists; only when those paths are unavailable can it fall back to the Herdr-operated Relay Pool.
+
+The Relay does not replace your MCP/OAuth address, terminate your device identity, or turn Herdr into a generic proxy. It only forwards the already-authenticated `herdr-link` WebSocket to your own `workers.dev` Worker. The production pool uses independent Deno and Supabase failure domains with sticky, capacity-weighted per-device selection and bounded failover. Deno carries the large majority of long-lived connections; Supabase receives a small capacity share and remains a full fallback because its hosted Edge Function lifetime and Free-plan invocation budget are tighter. Normal users do not create either provider account or configure a Relay URL.
+
 ## Control multiple computers
 
 One Herdr Worker and one ChatGPT connection can control multiple enrolled computers. ChatGPT can discover the fleet with `herdr_devices`, see which machines are online, and route work to an explicitly named device.

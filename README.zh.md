@@ -51,6 +51,12 @@ Cloudflare 提供稳定的公网 MCP/OAuth 入口，每台开发机主动向外�
 
 [Cloudflare 配置](docs/i18n/zh-CN/cloudflare-edge-deployment.md) · [Cloudflare Dashboard](https://dash.cloudflare.com/)
 
+### Shared Relay 只是兜底中转，不是你的公网入口
+
+Herdr-MCP 默认让开发机 Link 尽量直连。只要你配置了自己的 Cloudflare Custom Domain，就不会使用公共 Relay Pool。没有 Custom Domain 时，Link 会先直连该 Worker 的 `workers.dev`，存在已验证的本地代理时再尝试本地代理；只有这些路径都不可用时，才会进入 Herdr 维护的 Relay Pool。
+
+Relay 不会替换你的 MCP/OAuth 地址，不接管设备身份，也不是通用代理。它只把已经经过 Herdr 身份认证的 `herdr-link` WebSocket 转发到你自己的 `workers.dev` Worker。正式 Pool 使用 Deno 与 Supabase 两个独立故障域，按设备做 sticky、容量加权的稳定分片，并支持有界 failover。Deno 承担绝大多数长期连接；Supabase 因 Hosted Edge Function 生命周期和 Free 额度更紧，只承担少量容量分片并作为完整备用。普通用户无需注册这两个平台，也无需填写 Relay URL。
+
 ## 群控多台电脑
 
 一个 Herdr Worker 和一个 ChatGPT 连接可以同时管理多台已加入的电脑。ChatGPT 可以通过 `herdr_devices` 查看设备列表和在线状态，并把任务明确路由到指定设备。

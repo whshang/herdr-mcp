@@ -51,8 +51,9 @@ pub use install::{
 };
 #[allow(unused_imports)]
 pub use ladder::{
-    LadderError, RelayEndpoint, TransportEvidence, TransportLadder, TransportRoute,
-    TransportRouteKind, build_ladder_routes, build_relay_edge_url, collect_transport_evidence,
+    LadderError, RELAY_POLICY_DESCRIPTION, RELAY_POLICY_SLUG, RELAY_SELECTION_SLUG, RelayEndpoint,
+    TransportEvidence, TransportLadder, TransportRoute, TransportRouteKind, build_ladder_routes,
+    build_relay_edge_url, collect_transport_evidence, collect_transport_evidence_with_pool,
     default_embedded_relays,
 };
 pub use migrate_runtime_control::{MigrateMode, run as run_link_migrate_runtime_control};

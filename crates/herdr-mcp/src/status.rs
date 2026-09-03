@@ -105,6 +105,7 @@ pub fn print_status(paths: &RuntimePaths, config: &Config) {
         "relay pool: {}",
         crate::link::relay_manifest::status_line(paths, unix_now_seconds())
     );
+    println!("relay use: {}", crate::link::RELAY_POLICY_DESCRIPTION);
 }
 
 pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
@@ -227,7 +228,7 @@ fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusR
     println!("LAYER link {}", format_link_layer(paths));
     println!(
         "LAYER link-transport {}",
-        format_link_transport_layer(config)
+        format_link_transport_layer(paths, config)
     );
     println!(
         "LAYER relay-pool {}",
@@ -394,19 +395,24 @@ fn format_link_layer(paths: &RuntimePaths) -> String {
     crate::link::doctor_layer_summary(&home, &paths.config_dir)
 }
 
-fn format_link_transport_layer(config: &Config) -> String {
-    let evidence = crate::link::collect_transport_evidence(
+fn format_link_transport_layer(paths: &RuntimePaths, config: &Config) -> String {
+    let pool = crate::link::relay_manifest::load_cached_pool(paths, unix_now_seconds());
+    let evidence = crate::link::collect_transport_evidence_with_pool(
         config.edge_public_origin.as_deref(),
         config.edge_link_upstream_origin.as_deref(),
+        &pool.relays,
+        pool.source,
     );
     format!(
-        "mcp_origin={} link_upstream={} live_transport={} configured_preferred_transport={} proxy_source={} relay={} pool_source={} failover_ready={}",
+        "mcp_origin={} link_upstream={} live_transport={} configured_preferred_transport={} proxy_source={} relay={} relay_policy={} relay_selection={} pool_source={} failover_ready={}",
         evidence.mcp_origin,
         evidence.link_upstream,
         evidence.live_transport,
         evidence.configured_preferred_transport,
         evidence.proxy_source,
         evidence.relay,
+        evidence.relay_policy,
+        evidence.relay_selection,
         evidence.pool_source,
         evidence.failover_ready,
     )

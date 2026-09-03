@@ -51,6 +51,12 @@ Cloudflare が安定した公開 MCP/OAuth 入口を提供し、各開発マシ�
 
 [Cloudflare setup](docs/i18n/en/cloudflare-edge-deployment.md) · [Cloudflare Dashboard](https://dash.cloudflare.com/)
 
+### Shared Relay は公開入口ではなくフォールバックです
+
+Herdr-MCP は通常 workstation Link を直接接続します。自分の Cloudflare Custom Domain を設定している場合、共有 Relay Pool は使用しません。Custom Domain がない場合は、まず Worker の `workers.dev` へ直接接続し、検証済みのローカル proxy があれば次にそれを試します。それらが利用できない場合だけ、Herdr が運用する Relay Pool へフォールバックします。
+
+Relay は MCP/OAuth URL やデバイス identity を置き換えず、汎用 proxy にもなりません。認証済みの `herdr-link` WebSocket を、自分の `workers.dev` Worker へ転送するだけです。本番 Pool は独立した Deno / Supabase failure domain を使い、デバイス単位の sticky・capacity-weighted selection と bounded failover を行います。長時間接続の大部分は Deno が担当し、Hosted Edge Function の lifetime と Free quota がより厳しい Supabase は少量の capacity share と完全な fallback を担当します。通常の利用者が両 provider のアカウントや Relay URL を設定する必要はありません。
+
 ## 複数コンピュータをまとめて操作する
 
 1 つの Herdr Worker と 1 つの ChatGPT 接続で、登録済みの複数コンピュータを扱えます。ChatGPT は `herdr_devices` でデバイス一覧とオンライン状態を確認し、明示したデバイスへ作業をルーティングできます。

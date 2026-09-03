@@ -43,6 +43,7 @@ test("relay manifest signer signs exact payload bytes with the frozen domain", (
             id: "deno-prod",
             url: "wss://relay.herdr-mcp.deno.net/v1",
             priority: 200,
+            weight: 100,
             failure_domain: "deno",
             enabled: true,
           },

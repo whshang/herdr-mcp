@@ -151,8 +151,93 @@ pub struct RelayEndpoint {
     pub id: String,
     pub url: String,
     pub priority: u32,
+    #[serde(default = "default_relay_weight")]
+    pub weight: u32,
     pub failure_domain: String,
     pub enabled: bool,
+}
+
+pub const RELAY_POLICY_SLUG: &str = "fallback-only-no-custom-domain";
+pub const RELAY_SELECTION_SLUG: &str = "stable-weighted-per-device";
+pub const RELAY_POLICY_DESCRIPTION: &str = "shared Relay is an outbound fallback only: it is used only when no Custom Domain is configured and direct workers.dev plus any local proxy path are unavailable";
+
+const FNV1A64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV1A64_PRIME: u64 = 0x100000001b3;
+
+const fn default_relay_weight() -> u32 {
+    1
+}
+
+fn stable_relay_hash(parts: &[&str]) -> u64 {
+    let mut hash = FNV1A64_OFFSET_BASIS;
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            hash ^= 0xff;
+            hash = hash.wrapping_mul(FNV1A64_PRIME);
+        }
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV1A64_PRIME);
+        }
+    }
+    hash
+}
+
+fn order_relay_candidates(
+    relay_pool: &[RelayEndpoint],
+    workstation_id: &str,
+) -> Vec<RelayEndpoint> {
+    let mut candidates = relay_pool
+        .iter()
+        .filter(|relay| relay.enabled && relay.weight > 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let mut ordered = Vec::with_capacity(candidates.len());
+    let mut start = 0;
+    while start < candidates.len() {
+        let priority = candidates[start].priority;
+        let mut end = start + 1;
+        while end < candidates.len() && candidates[end].priority == priority {
+            end += 1;
+        }
+
+        let mut tier = candidates[start..end].to_vec();
+        tier.sort_by(|left, right| left.id.cmp(&right.id));
+        let total_weight = tier
+            .iter()
+            .map(|relay| u64::from(relay.weight))
+            .sum::<u64>();
+        if total_weight > 0 {
+            let priority_text = priority.to_string();
+            let slot = stable_relay_hash(&[workstation_id, &priority_text]) % total_weight;
+            let mut cumulative = 0_u64;
+            let primary_index = tier
+                .iter()
+                .position(|relay| {
+                    cumulative = cumulative.saturating_add(u64::from(relay.weight));
+                    slot < cumulative
+                })
+                .unwrap_or(0);
+            let primary = tier.remove(primary_index);
+            tier.sort_by(|left, right| {
+                stable_relay_hash(&[workstation_id, &right.id])
+                    .cmp(&stable_relay_hash(&[workstation_id, &left.id]))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            ordered.push(primary);
+            ordered.extend(tier);
+        }
+
+        start = end;
+    }
+    ordered
 }
 
 /// Default embedded relay candidates.
@@ -251,7 +336,8 @@ fn normalize_origin_to_ws_base(raw: &str) -> Result<String, LadderError> {
 ///   1. Direct Custom Domain when configured
 ///   2. Direct workers.dev
 ///   3. Validated system/env local proxy (targeting workers.dev upstream)
-///   4. Shared Relay endpoints (sorted by priority descending)
+///   4. Shared Relay endpoints only when no Custom Domain exists. Equal-priority
+///      providers use stable per-workstation weighted selection, then bounded failover.
 ///
 /// Fails explicitly if given malformed origins or if no valid route can be formed.
 /// Never manufactures or synthesizes a hardcoded upstream.
@@ -359,16 +445,16 @@ pub fn build_ladder_routes(
         routes.push(p_route);
     }
 
-    // 4. & 5. Sticky shared Relay endpoints & pool failovers
-    if let Some(wd) = workers_dev {
+    // 4. & 5. Sticky shared Relay endpoints & pool failovers. Relay is an
+    // emergency egress fallback, not a replacement for an operator-owned
+    // Custom Domain.
+    if custom_domain.is_none()
+        && let Some(wd) = workers_dev
+    {
         let host = extract_origin_host(wd)?;
         if validate_workers_dev_host(&host).is_ok() {
-            let mut sorted_relays = relay_pool.to_vec();
-            sorted_relays.sort_by_key(|b| std::cmp::Reverse(b.priority));
-            for relay in sorted_relays {
-                if relay.enabled
-                    && let Ok(relay_url) = build_relay_edge_url(&relay.url, &host, workstation_id)
-                {
+            for relay in order_relay_candidates(relay_pool, workstation_id) {
+                if let Ok(relay_url) = build_relay_edge_url(&relay.url, &host, workstation_id) {
                     routes.push(TransportRoute {
                         kind: TransportRouteKind::SharedRelay,
                         endpoint_url: relay_url,
@@ -532,6 +618,8 @@ pub struct TransportEvidence {
     pub configured_preferred_transport: String,
     pub proxy_source: String,
     pub relay: String,
+    pub relay_policy: String,
+    pub relay_selection: String,
     pub pool_source: String,
     pub failover_ready: bool,
     pub candidate_count: usize,
@@ -544,6 +632,20 @@ pub struct TransportEvidence {
 pub fn collect_transport_evidence(
     edge_public_origin: Option<&str>,
     link_upstream_origin: Option<&str>,
+) -> TransportEvidence {
+    collect_transport_evidence_with_pool(
+        edge_public_origin,
+        link_upstream_origin,
+        &default_embedded_relays(),
+        "embedded",
+    )
+}
+
+pub fn collect_transport_evidence_with_pool(
+    edge_public_origin: Option<&str>,
+    link_upstream_origin: Option<&str>,
+    relay_pool: &[RelayEndpoint],
+    pool_source: &str,
 ) -> TransportEvidence {
     let mcp_origin = match edge_public_origin {
         Some(origin) => {
@@ -587,7 +689,6 @@ pub fn collect_transport_evidence(
         _ => ("none".to_owned(), None),
     };
 
-    let relays = default_embedded_relays();
     let edge_candidate = link_upstream_origin
         .or(edge_public_origin)
         .unwrap_or("wss://unconfigured.local/ws");
@@ -598,7 +699,7 @@ pub fn collect_transport_evidence(
         link_upstream_origin,
         "probe-device",
         resolved_proxy,
-        &relays,
+        relay_pool,
     )
     .unwrap_or_default();
 
@@ -616,7 +717,9 @@ pub fn collect_transport_evidence(
         configured_preferred_transport,
         proxy_source,
         relay: "unknown".to_owned(),
-        pool_source: "embedded".to_owned(),
+        relay_policy: RELAY_POLICY_SLUG.to_owned(),
+        relay_selection: RELAY_SELECTION_SLUG.to_owned(),
+        pool_source: pool_source.to_owned(),
         failover_ready,
         candidate_count,
     }
@@ -634,6 +737,82 @@ mod tests {
             pool.is_empty(),
             "default embedded relay pool must be empty before exact-host mainland UAT qualification"
         );
+    }
+
+    fn relay_fixture(id: &str, weight: u32) -> RelayEndpoint {
+        RelayEndpoint {
+            id: id.to_owned(),
+            url: format!("wss://{id}.relay.test/v1"),
+            priority: 200,
+            weight,
+            failure_domain: id.to_owned(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn relay_is_not_offered_when_custom_domain_exists() {
+        let relays = vec![relay_fixture("deno", 100), relay_fixture("supabase", 1)];
+        let routes = build_ladder_routes(
+            "wss://herdr.example.test/ws",
+            Some("https://herdr.example.test"),
+            Some("https://my-worker.workers.dev"),
+            "dev_test",
+            None,
+            &relays,
+        )
+        .unwrap();
+
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.kind != TransportRouteKind::SharedRelay)
+        );
+    }
+
+    #[test]
+    fn equal_priority_relays_use_stable_weighted_per_device_selection() {
+        let relays = vec![relay_fixture("deno", 9), relay_fixture("supabase", 1)];
+        let mut deno = 0;
+        let mut supabase = 0;
+
+        for index in 0..1000 {
+            let workstation_id = format!("dev_weighted_{index}");
+            let routes = build_ladder_routes(
+                "wss://my-worker.workers.dev/ws",
+                Some("https://my-worker.workers.dev"),
+                None,
+                &workstation_id,
+                None,
+                &relays,
+            )
+            .unwrap();
+            let relay_routes = routes
+                .iter()
+                .filter(|route| route.kind == TransportRouteKind::SharedRelay)
+                .collect::<Vec<_>>();
+            assert_eq!(relay_routes.len(), 2);
+            match relay_routes[0].relay_id.as_deref() {
+                Some("deno") => deno += 1,
+                Some("supabase") => supabase += 1,
+                other => panic!("unexpected relay primary {other:?}"),
+            }
+
+            let repeated = build_ladder_routes(
+                "wss://my-worker.workers.dev/ws",
+                Some("https://my-worker.workers.dev"),
+                None,
+                &workstation_id,
+                None,
+                &relays,
+            )
+            .unwrap();
+            assert_eq!(routes, repeated, "selection must be sticky for one device");
+        }
+
+        assert!(deno > 800, "9:1 weight should keep most devices on Deno");
+        assert!(supabase > 0, "secondary provider must receive some load");
+        assert_eq!(deno + supabase, 1000);
     }
 
     #[test]

@@ -13,6 +13,7 @@ const MAX_RELAY_ID_LEN = 64;
 const MAX_FAILURE_DOMAIN_LEN = 128;
 const MAX_RELAY_URL_LEN = 2048;
 const MAX_PRIORITY = 1_000_000;
+const MAX_WEIGHT = 1_000_000;
 
 function fail(message) {
   console.error(`relay-manifest-sign: ${message}`);
@@ -64,12 +65,18 @@ function parseTimestamp(value, label) {
 
 function validateRelay(relay, index) {
   if (!relay || typeof relay !== "object" || Array.isArray(relay)) fail(`relay[${index}] must be an object`);
-  exactKeys(relay, ["id", "url", "priority", "failure_domain", "enabled"], `relay[${index}]`);
+  const relayKeys = ["id", "url", "priority", "failure_domain", "enabled"];
+  if (Object.hasOwn(relay, "weight")) relayKeys.push("weight");
+  exactKeys(relay, relayKeys, `relay[${index}]`);
   boundedString(relay.id, MAX_RELAY_ID_LEN, `relay[${index}].id`);
   boundedString(relay.failure_domain, MAX_FAILURE_DOMAIN_LEN, `relay[${index}].failure_domain`);
   boundedString(relay.url, MAX_RELAY_URL_LEN, `relay[${index}].url`);
   if (!Number.isInteger(relay.priority) || relay.priority < 0 || relay.priority > MAX_PRIORITY) {
     fail(`relay[${index}].priority is out of range`);
+  }
+  const weight = relay.weight ?? 1;
+  if (!Number.isInteger(weight) || weight <= 0 || weight > MAX_WEIGHT) {
+    fail(`relay[${index}].weight is out of range`);
   }
   if (typeof relay.enabled !== "boolean") fail(`relay[${index}].enabled must be boolean`);
 
