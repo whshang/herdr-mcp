@@ -21,13 +21,13 @@ local herdr-mcp runtime
 Herdr / Git / shell
 ```
 
-这篇文档讲 Edge 为什么这样部署、第一次怎样跑通、什么时候需要 Custom Domain，以及旧 Tunnel 架构怎样安全迁移。
+这篇文档讲 Edge 为什么这样部署、怎样用 `workers.dev` 零域名 bootstrap、什么时候应优先把 Custom Domain 作为正式入口，以及旧 Tunnel 架构怎样安全迁移。
 
 ## 先记住三个原则
 
-### 1. 新安装从 `workers.dev` 开始
+### 1. 新安装先用 `workers.dev` bootstrap；有 active zone 时在客户端接入前优先 Custom Domain
 
-不需要先买域名，也不需要先配置 DNS。
+没有域名也能完整安装。Cloudflare Account 已有合适 active zone 时，推荐在 ChatGPT Connector/OAuth 固化前使用专用 Custom Domain；Cloudflare 会自动创建对应 DNS 记录和证书，不需要手工 DNS 配置。
 
 ### 2. 工作站只建立出站连接
 
@@ -47,11 +47,11 @@ Cloudflare 层主要承担：
 - 持久 WSS link 的连接管理；
 - runtime online/offline 与 generation/version 状态；
 - MCP request/response relay；
-- 短时私有 R2 通用 artifact 中继（`/artifacts`，仅 Worker binding）。
+- 可选的短时私有 R2 通用 artifact 中继（`/artifacts`，仅 Worker binding）。
 
 Edge **不保存你的 Git 仓库**，也不代替本机 Herdr。代码、shell 和 Agent 仍在工作站执行。R2 桶只是临时通用 artifact 中继，不是素材库。
 
-## 第一次部署：workers.dev
+## Bootstrap 部署：workers.dev
 
 从用户配置模板开始：
 
@@ -86,7 +86,7 @@ MCP endpoint：
 https://<worker>.<account-subdomain>.workers.dev/mcp
 ```
 
-OAuth issuer / `HERDR_MCP_BASE_URL` 应使用同一个 origin：
+bootstrap 阶段主要用这个 hostname 证明 Worker 代码健康。如果准备使用 Custom Domain，此时不要先注册最终 ChatGPT Connector；OAuth issuer / `HERDR_MCP_BASE_URL` 必须在客户端接入前与最终 canonical origin 保持一致。
 
 ```text
 https://<worker>.<account-subdomain>.workers.dev
@@ -96,15 +96,32 @@ https://<worker>.<account-subdomain>.workers.dev
 
 ### 部署
 
-先幂等创建私有 R2 中继桶，再部署 Worker。该桶只通过 Worker binding 访问，不要挂 public r2.dev 域名。
+直接部署核心 Worker。普通 user template 默认关闭 R2，因此核心路径不要求开通 R2 订阅或支付方式。
 
 ```bash
 cd edge/cloudflare
-node provision-r2.mjs --config wrangler.user.toml
 npx wrangler deploy --config wrangler.user.toml
 ```
 
-部署 Worker 成功只代表公网代码存在，下一步还要验证 workstation link。
+私有 R2 artifact 中继是可选能力。只有明确启用时才增加 `ARTIFACT_BUCKET` binding，并执行 `node provision-r2.mjs --config wrangler.user.toml` 进行 provision；该桶必须只通过 Worker binding 访问，不能挂 public r2.dev 域名。
+
+部署 Worker 成功只代表公网代码存在。下一步先确定最终 public origin，再验证 workstation link。
+
+## 在 OAuth/MCP 客户端接入前确定最终公网入口
+
+所选 Cloudflare Account 已有 active zone 时，推荐用 `herdr-mcp.example.com` 这类专用 Custom Domain 作为 production identity。Cloudflare 官方建议 production Worker 使用 Route 或 Custom Domain，而不是长期依赖 `workers.dev`；Herdr Worker 本身就是该 hostname 的 origin，因此这里应使用 **Custom Domain**，不是套在其它 origin 前面的普通 Worker Route。
+
+Wrangler 示例：
+
+```toml
+[[routes]]
+pattern = "herdr-mcp.example.com"
+custom_domain = true
+```
+
+把 `OAUTH_ISSUER` 设置为 `https://herdr-mcp.example.com`，重新部署，并在创建 ChatGPT Connector 前验证该 Custom Domain 的 `/health`、未认证 `/mcp`、OAuth discovery。Cloudflare 会自动创建 DNS 记录与证书。这个 hostname 必须属于 active Cloudflare zone，并且不能与已有 CNAME 或不兼容的 Worker/DNS 用途冲突。
+
+如果没有合适 zone 或用户不想使用域名，则继续把 `workers.dev` 固化为 canonical public origin；这是完整支持的配置，不是安装失败。
 
 ## Workstation Link
 
@@ -171,7 +188,7 @@ Cloudflare Tunnel 直连只保留为遗留迁移场景，不是新安装主路�
 
 ## 什么时候使用 Custom Domain
 
-`workers.dev` 已经能完整运行。如果你有自己的 Cloudflare zone，可以进一步绑定：
+如果账户已经有合适的 active Cloudflare zone，并且能为 Herdr 分配一个专用 hostname，默认优先使用 Custom Domain：
 
 ```text
 https://herdr.example.com
@@ -183,8 +200,9 @@ Custom Domain 的价值主要是：
 - OAuth issuer 归你自己的域名治理；
 - 团队环境名称更清楚；
 - 将来更换 Edge implementation 时，可以尽量保留外部 URL。
+- 某些网络环境过滤 `workers.dev` 时，用户自己的 Cloudflare hostname 仍可能保持直连。
 
-它不是 Herdr 技术前置条件。
+它仍然不是 Herdr 技术前置条件。不要把“必须先有域名”重新变成首次安装门槛。
 
 ## Custom Domain 操作
 

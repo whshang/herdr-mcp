@@ -53,17 +53,56 @@ herdr api schema >/dev/null
 
 If local HTTP works but `herdr_inspect` cannot see real workspaces, investigate the Herdr daemon/socket before touching Cloudflare.
 
+### Is the binary installed but off the shell PATH?
+
+```bash
+ls -l ~/.local/bin/herdr-mcp
+zsh -ic 'command -v herdr-mcp'
+```
+
+A present binary with an empty `command -v` result is `installed_but_not_on_shell_path`, not a missing installation. Export `~/.local/bin` for the current process, persist the same line idempotently in the shell startup file, and do not reinstall or create a second PATH owner.
+
 ### Can Edge see the workstation?
 
 OAuth may succeed while the workstation is offline. Public login success does not prove the local development machine is connected.
 
 Check Edge health/status and the workstation link.
 
+### Is the link blocked by the local network?
+
+The Link reuses proxies that already exist in the environment. Resolution order:
+
+```text
+HERDR_LINK_PROXY > HTTPS_PROXY/https_proxy > HTTP_PROXY/http_proxy > ALL_PROXY/all_proxy
+  > macOS system proxy (scutil --proxy: HTTPS, then HTTP, then SOCKS)
+```
+
+Details that matter when `workers.dev` is unreachable:
+
+- `socks5://` and `socks5h://` are supported. SOCKS5 dials use remote-DNS semantics: the hostname is sent to the proxy unresolved, so a locally polluted DNS resolver cannot break `workers.dev` connectivity.
+- Proxy authentication (HTTP Basic or SOCKS5 username/password) is not supported; proxy URLs with embedded credentials are rejected, and credentials never appear in status or error output.
+- On macOS, a PAC configuration is detected but never evaluated. Link does not fetch or execute PAC scripts; with only a PAC configured, the Link connects directly.
+- Do not "fix" link connectivity by disabling TLS, rewriting system proxy settings, or turning the Link into a general-purpose forwarder.
+
 ### Does a new ChatGPT conversation get the current catalog?
 
 The current public ChatGPT contract is **epoch 3 / 19 actions**. Workstation execution remains **epoch 2 / 18 tools**, including `herdr_skill`; the extra public action is Edge-local `herdr_devices`.
 
 Old conversations may retain an older `tools/list` snapshot. Before reinstalling anything, verify the server and open a new conversation.
+
+## Symptom: Cloudflare API returns 403 while the token verifies as valid
+
+`/user/tokens/verify` only proves the token is active. A 403 on a specific call names a missing permission:
+
+- `GET .../accounts/<id>/workers/subdomain` fails → **Account Settings Read** is missing;
+- Worker script deploy calls fail → **Workers Scripts Edit** is missing;
+- R2 provisioning fails → the optional **Workers R2 Storage Edit** was never granted. The core install does not need it; this is an error only when the user explicitly enabled the artifact relay.
+
+Grant exactly the missing permission and retry. Do not recreate a broader token blindly and do not report it as a generic deployment failure.
+
+## Symptom: one hostname fails while another hostname of the same Worker works
+
+If `*.workers.dev` times out or fails DNS/TLS while the same Worker's Custom Domain returns `/health` 200 (or the reverse), the Worker code is healthy and the failure is hostname/DNS/network-path specific. Do not redeploy the Worker and do not create another Worker/R2/Connector. Prefer a Custom Domain as the stable production origin when the user owns a domain; otherwise keep `workers.dev` and let the Link transport fallback (direct → validated local proxy → shared relay) handle the network path.
 
 ## Symptom: Connector cannot be added or OAuth loops
 

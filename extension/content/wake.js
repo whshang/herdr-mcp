@@ -8,7 +8,7 @@
 //   ChatGPT Connector cards are watched continuously; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.88";
+const H2W_CONTENT_VERSION = "0.1.90";
 (async function () {
   // Store and unpacked Dev builds can be installed at the same time. Only the
   // Native Messaging origin selected by herdr-mcp may own page-side control.
@@ -3243,6 +3243,7 @@ const H2W_CONTENT_VERSION = "0.1.88";
     if (!hudEls) return;
     const chatGptConversationActionsAvailable = ADAPTER.name !== "chatgpt" || Boolean(chatGptConversationId());
     const locked = hudActionBusy || hudCache?.enabled === true || !chatGptConversationActionsAvailable;
+    const manualHints = [hudLabels?.manual_continue_hint, hudLabels?.manual_status_hint, hudLabels?.manual_judge_hint];
     for (let i = 0; i < (hudEls.manualButtons || []).length; i += 1) {
       const button = hudEls.manualButtons[i];
       const unavailable = i === 2 && hudCache?.llmConfigured !== true;
@@ -3250,20 +3251,35 @@ const H2W_CONTENT_VERSION = "0.1.88";
       button.classList.toggle("locked", locked);
       button.disabled = locked || unavailable;
       button.setAttribute("aria-disabled", String(locked || unavailable));
+      button.title = locked
+        ? (hudActionBusy ? hudText("manual_disabled_busy") : hudText("manual_disabled_auto"))
+        : (manualHints[i] || "");
     }
 
     const handoffStatus = String(hudCache?.handoff?.status || "");
     const transferBusy = ["summary_requested", "summary_ready", "target_opening", "seed_submitting"].includes(handoffStatus)
       && hudCache?.handoff?.can_resume !== true;
     const handoffAvailable = hudCache?.manual_handoff_available === true;
+    const workingCount = Number(hudCache?.bound_working_count || 0);
     const handoffLocked = hudActionBusy
       || hudCache?.can_handoff !== true
-      || Number(hudCache?.bound_working_count || 0) > 0
+      || workingCount > 0
       || transferBusy;
     hudEls.handoff.hidden = !handoffAvailable;
     hudEls.handoff.classList.toggle("locked", handoffLocked);
     hudEls.handoff.disabled = handoffLocked;
     hudEls.handoff.setAttribute("aria-disabled", String(handoffLocked));
+    hudEls.handoff.title = hudActionBusy
+      ? hudText("handoff_blocked_action_busy")
+      : workingCount > 0
+        ? hudText("handoff_blocked_working", { count: workingCount })
+        : transferBusy
+          ? hudText("handoff_blocked_transfer_busy")
+          : hudCache?.bound !== true
+            ? hudText("handoff_blocked_unbound")
+            : hudCache?.can_handoff !== true
+              ? hudText("handoff_blocked_unavailable")
+              : hudText("handoff_hint");
   }
 
   function showHudToast(text, kind = "") {
@@ -3451,6 +3467,8 @@ const H2W_CONTENT_VERSION = "0.1.88";
         showHudToast(
           error === "handoff_fallback_llm_not_configured"
             ? hudText("handoff_llm_required")
+            : result?.source_preserved === true
+              ? hudText("handoff_failed_source_preserved", { error })
             : hudText("handoff_failed", { error }),
           "err",
         );

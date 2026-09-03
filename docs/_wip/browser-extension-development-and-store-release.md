@@ -397,7 +397,9 @@ Chrome Web Store 要求申请完成 single purpose 所需的最小权限。不�
 
 2026-08-29 的真实 Store 预检验证了这一要求：0.1.74 的常驻 `<all_urls>` 会触发 **Broad Host Permissions** 延迟审核提示。0.1.75 已移除常驻 `<all_urls>`，把常驻 host access 缩到本机 Herdr、ChatGPT 与 Claude；z.ai/DeepSeek 和用户配置的 OpenAI-compatible endpoint 改为 optional host permission，并且只在用户显式启用/保存/测试时申请精确 origin。由于 Chrome Web Store 仍把 manifest 中用于“任意用户自定义 endpoint”的 optional wildcard declaration 视为 Broad Host Permissions，0.1.75 接受 in-depth review，而不是为了消除审核提示新增一个与当前 0.4.1 不兼容的 native-host 外部代理协议。
 
-当前最终用户文档已经改为：**Chrome Web Store 是唯一正式浏览器扩展安装路径**。Store listing 正式上线前，普通用户直接跳过扩展，不回退到 `Load unpacked`。
+当前最终用户文档已经改为：**Chrome Web Store 是唯一正式浏览器扩展安装路径**。README、文档站和安装文档都使用固定 Store ID 的直链，不依赖商店搜索结果。
+
+2026-09-03 操作者已确认固定 Store item `kpcengcaammanfnbclapecdgahdmhanp` 的 Dashboard 状态为 **Published — unlisted**。这说明审核/发布链已通过且知道 URL 的用户可以安装，但 `Unlisted` 按 Chrome Web Store 定义不会进入公开商店 listing/search。需要被普通商店搜索发现时，把 Distribution → Visibility 改为 **Public**，确认目标 regions（面向全球时选 All regions），再通过 Dashboard 完成这次 visibility 变更的人工发布。首次从 Unlisted 切 Public 继续保留人工操作；之后才允许 API 沿用已经生效的 visibility 做常规版本更新。
 
 官方参考：
 
@@ -416,7 +418,7 @@ unpacked development extension
 real browser smoke
 ```
 
-Chrome Web Store publisher、Store item、listing/privacy draft 和 production Store identity 已经建立；**仍禁止在 Native Messaging Store-origin 闭环真实通过前提交 review / public publish**。Chrome Web Store API 自动发布继续后置，首次发布仍以人工 Dashboard 流程为准。
+Chrome Web Store publisher、Store item、listing/privacy 和 production Store identity 已经建立，且 Store item 已进入 Published — unlisted。当前下一道真实产品 gate 是 Store 安装后的 Native Messaging / page-owner / continuity UAT，以及把当前扩展版本及时更新到 Store。Public 可见性首次切换仍通过人工 Dashboard 完成；自动上传/发布凭据暂不进入仓库。
 
 Store ID 与 Native Messaging origin 是一次性身份边界：production identity 的机器可读 SSOT 为 `contracts/browser-extension-store.json`。Rust 通过编译期嵌入并校验该 contract 使用 Store identity，源码不保存 Store ID 字面量。
 
@@ -460,7 +462,7 @@ Store ID 与 Native Messaging origin 是一次性身份边界：production ident
 
 `0.1.76+` 开发源码会在启动控制路径前查询 Native Host `identity`。当前 active build 能通过 Chromium admission 获得 identity；同机安装但 inactive 的 Store/Dev build 会在 Chromium 层被拒绝并进入 standby，不启动共享 push stream，也不渲染 operational HUD。切换 active owner 后，已经存在的旧 Native Messaging request/stream 也会由 Rust Native Host 重新核对当前受管 manifest；持续 SSE stream 最迟在下一次 1 秒 owner-fence tick 或下一帧时失效，避免旧连接跨切换继续拥有本地控制权。该机制不要求修改已经提交审核的 `0.1.75` Store candidate。
 
-这个共存契约要求两份同时启用的扩展都升级到 `0.1.76+`。当前正在审核的 `0.1.75` 先按 Store-only 路径完成审核与真实安装 UAT，不回改候选包；随后通过正常 Store update 发布 `0.1.76`，再执行 Store+Dev 同机共存 UAT。不要为了让旧 `0.1.75` 参与共存而新增 `management` 权限、修改 Chrome Preferences 或自动禁用另一份扩展。
+这个共存契约要求两份同时启用的扩展都升级到 `0.1.76+`。历史 `0.1.75` 是首次 Store 审核候选；当前源码已经推进到 `0.1.90`。当前 0.1.89 的 Public 可见性更新审核应撤回，并由通过完整 Store gate 的 0.1.90 包一次性替代；不再按历史候选逐版补发。不要为了兼容旧 Store build 新增 `management` 权限、修改 Chrome Preferences 或自动禁用另一份扩展。
 
 官方 Native Messaging 规则：
 
@@ -525,16 +527,11 @@ Chrome Web Store
 
 ## 10. Chrome Web Store 打包
 
-未来新增一个确定性脚本，例如：
+确定性打包已经由 `scripts/pack-extension.mjs` 实现，输出：
 
 ```text
-scripts/package-chrome-extension.mjs
-```
-
-目标输出：
-
-```text
-dist/chrome/herdr-web-wake-<version>.zip
+release-assets/herdr-mcp-extension-<version>.zip
+release-assets/herdr-mcp-extension-<version>.zip.sha256
 ```
 
 ZIP 必须满足：
@@ -553,7 +550,7 @@ extension/
   manifest.json
 ```
 
-打包脚本应：
+打包脚本已经：
 
 - 从 manifest 读取版本；
 - 只包含运行时必须文件；
@@ -561,6 +558,8 @@ extension/
 - 输出 SHA-256；
 - 可复现构建；
 - 在 CI 中解压后重新跑 manifest/static smoke。
+
+`extension/` 或 Store contract 进入 `main` 时，`.github/workflows/extension-store.yml` 会自动运行 Store identity/listing/package gate、`extension_smoke` 和 `background_bind_test`，再生成可直接上传 Dashboard 的 ZIP + SHA-256 + `STORE-RELEASE.txt`。该 workflow **只准备 Store artifact，不调用 Chrome Web Store publish API**。这样每次扩展版本更新都有对应的可审计上传包，同时避免把 Google 发布凭据和首次 visibility 切换提前自动化。
 
 ## 11. Store Listing / Privacy / Policy
 
@@ -625,7 +624,7 @@ remote-hosted-code audit
 
 ## 12. 上架渠道顺序
 
-未来不要直接 Public。
+当前已经走到 Unlisted：
 
 建议：
 
@@ -634,7 +633,7 @@ Local unpacked
     ↓
 Private trusted testers
     ↓
-Unlisted beta
+Unlisted（当前）
     ↓
 Public
 ```
@@ -648,9 +647,9 @@ Chrome Web Store 支持 Public / Unlisted / Private；三种可见性都需要�
 
 如果未来维持单独 beta item，必须遵守 Chrome 对 testing/beta listing 的命名与重复内容规则。
 
-## 13. Chrome Web Store API：以后再自动化
+## 13. Chrome Web Store API：Public 首次切换后再自动化发布
 
-公开发布稳定后再接 CI 自动上传/提交，不在首次上架前做。
+仓库已先自动化“验证 + 产出上传包”，Google 账号凭据和 publish 动作继续后置。首次 `Unlisted → Public` visibility 变更必须先在 Dashboard 人工发布成功；Chrome Web Store API 的 publish 会沿用现有 visibility，官方也明确说明手工修改 visibility 后，需要先人工按新 visibility 发布一次，之后 API 才能继续发布。
 
 未来流程可为：
 
@@ -681,7 +680,7 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 以下全部满足才允许从 WIP 转正式 release plan：
 
 - [x] extension single purpose 已冻结并写入 Store Privacy；
-- [x] Store item 已创建但尚未公开；
+- [x] Store item 已创建并通过审核，当前 Dashboard 为 **Published — unlisted**；
 - [x] production Store ID 已冻结到 `contracts/browser-extension-store.json`；
 - [x] Native Host installer 从 `0.4.1` Store-first 单-origin 演进到 `0.4.2` Store+Dev trusted identities / single active owner；既有双隔离 fresh-install/status/rollback 与 dev→Store→rollback 证据保留，`0.4.2` 另补 Chrome for Testing optional manifest target，Native Host lifecycle 29/29 PASS；
 - [x] dev/store identity 策略明确：Store 与 Dev 可同时安装，Native Messaging 只承认唯一 active origin；`dev enable` / `use store|dev` / `dev disable` 显式控制，inactive `0.1.76+` build 进入 standby；
@@ -691,10 +690,11 @@ Chrome Web Store API 当前支持创建/更新/发布 item；发布账号要求�
 - [x] User Data / Limited Use disclosures 已填写并保存；
 - [x] remote executable code audit：Store 声明 `No`，可执行 JS 全部随扩展打包；
 - [x] extension package deterministic；
-- [ ] Store-ID build + Native Host real smoke PASS —— **BLOCKED**：待审核中的 Unlisted `0.1.75` 尚未确认可从真实 Store item 安装；不得用 unpacked/CfT smoke 冒充 Store-ID smoke；
+- [ ] 当前 Store build + Native Host real smoke PASS —— Store item 已可通过直链安装；需要用实际 Store build 验证 Native Host owner、Control Center、continuity/wake，再把当前源码版本上传为正常 Store update；不得用 unpacked/CfT smoke 冒充 Store-ID smoke；
 - [ ] toolbar action → Side Panel、active-tab Current page、single-path binding/handoff、compact HUD、Queued Insert **真实 provider-page smoke** PASS；自动化已覆盖 Control Plane/owner/handoff/queue，但还不替代真实页面交互；
 - [ ] ChatGPT / Claude / z.ai / DeepSeek 真实支持矩阵重新验证；
 - [x] handoff/recovery 自动化回归 PASS：正确 build 前置后 browser/store/control/native/recovery/auth 集合 75/75 PASS，`tests/manual/extension_smoke.mjs` PASS；
+- [x] reverse-wake 回归契约：working→settled/blocked、offline settle recovery、progress 去重、stale source、Native Messaging、handoff/queue、版本一致性都由现有 extension tests 持续覆盖；settled wake 文案另外固定“重新 inspect → 审查 Agent diff → cherry-pick/merge → 验收”的 Web Planner 接续职责；
 - [x] Rust Native Messaging install/status/uninstall/rollback 单测 PASS：加入 CfT target 后 29/29 PASS，restore failpoint 改为语义边界而非固定 target 数量；clippy `-D warnings` PASS；
 - [x] reviewer test instructions 可复现：`contracts/browser-extension-store-listing.json` 的 `review_notes` 明确 matching runtime、`native-host install`、ChatGPT + Side Panel 验证和 optional-site 权限边界；
 - [x] screenshots/listing metadata 与真实产品一致；

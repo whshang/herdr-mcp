@@ -200,7 +200,7 @@ test("status is read-only and reports custom domain binding", async () => {
   });
 });
 
-test("open-source Worker template defaults to workers.dev and does not require a custom domain", async () => {
+test("open-source Worker template bootstraps on workers.dev without requiring a domain and recommends final custom-domain selection", async () => {
   const template = await readFile(new URL("../edge/cloudflare/wrangler.user.example.toml", import.meta.url), "utf8");
   const docs = await readFile(new URL("../docs/i18n/en/cloudflare-edge-deployment.md", import.meta.url), "utf8");
   assert.match(template, /workers_dev = true/);
@@ -208,6 +208,7 @@ test("open-source Worker template defaults to workers.dev and does not require a
   assert.match(template, /YOUR_ACCOUNT_SUBDOMAIN\.workers\.dev/);
   assert.doesNotMatch(template, /agentforme\.cc\.cd/);
   assert.match(docs, /does not require users to own a domain/);
-  assert.match(docs, /Custom Domain.*recommended, optional/s);
-  assert.match(docs, /workers\.dev.*default, fully supported/s);
+  assert.match(docs, /workers\.dev.*remains fully supported/s);
+  assert.match(docs, /active zone.*Custom Domain/s);
+  assert.match(docs, /creates the required DNS record and certificate/s);
 });

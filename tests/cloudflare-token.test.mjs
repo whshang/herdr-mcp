@@ -5,14 +5,15 @@ import test from 'node:test';
 const edgeScript = await readFile(new URL('../bin/herdr-cloudflare-token', import.meta.url), 'utf8');
 const dnsScript = await readFile(new URL('../bin/herdr-cloudflare-dns-token', import.meta.url), 'utf8');
 const tokenDoc = await readFile(new URL('../docs/i18n/en/cloudflare-edge-token.md', import.meta.url), 'utf8');
+const zhTokenDoc = await readFile(new URL('../docs/i18n/zh-CN/cloudflare-edge-token.md', import.meta.url), 'utf8');
 const deploymentDoc = await readFile(new URL('../docs/i18n/en/cloudflare-edge-deployment.md', import.meta.url), 'utf8');
 
 test('long-lived Cloudflare token keeps Edge permissions separate from DNS migration', () => {
   assert.match(edgeScript, /Workers Routes Write/);
   assert.match(edgeScript, /Workers Scripts Write/);
-  assert.match(edgeScript, /Workers R2 Storage Write/);
-  assert.match(edgeScript, /\/r2\/buckets\?per_page=1/);
-  assert.match(edgeScript, /r2Access/);
+  assert.doesNotMatch(edgeScript, /Workers R2 Storage Write/);
+  assert.doesNotMatch(edgeScript, /\/r2\/buckets/);
+  assert.doesNotMatch(edgeScript, /r2Access/);
   assert.match(edgeScript, /0o600/);
   assert.doesNotMatch(edgeScript, /DNS Write/);
   assert.doesNotMatch(edgeScript, /Tunnel Edit|Account Admin/);
@@ -52,7 +53,11 @@ test('Cloudflare docs describe workers.dev default, optional Custom Domain, and 
   assert.match(tokenDoc, /bootstrap credential/);
   assert.match(tokenDoc, /Workers Routes Write/);
   assert.match(tokenDoc, /Workers Scripts Write/);
-  assert.match(tokenDoc, /Workers R2 Storage Write/);
+  assert.match(tokenDoc, /R2[^\n]*optional|optional[^\n]*R2/i);
+  assert.match(tokenDoc, /does not request[^\n]*R2 access by default/i);
+  assert.doesNotMatch(tokenDoc, /helper creates[^\n]*R2|helper[^\n]*Workers R2 Storage Write[^\n]*before deploy/i);
+  assert.match(zhTokenDoc, /不会默认申请 R2 权限/);
+  assert.doesNotMatch(zhTokenDoc, /helper 同时申请[^\n]*Workers R2 Storage Write/);
   assert.match(tokenDoc, /0600/);
   assert.match(deploymentDoc, /does not require users to own a domain/);
   assert.match(deploymentDoc, /workers\.dev/);

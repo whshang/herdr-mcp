@@ -42,7 +42,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.88";
+const H2W_SCRIPT_VERSION = "0.1.90";
 const CORE_TAB_URLS = ["*://claude.ai/*", "*://chatgpt.com/*"];
 const EXPERIMENTAL_TAB_URLS = {
   "z.ai": "*://chat.z.ai/*",
@@ -150,7 +150,9 @@ function hudLabels() {
   const keys = [
     "automation_on", "automation_off", "manual_continue", "manual_status", "manual_judge",
     "manual_continue_hint", "manual_status_hint", "manual_judge_hint",
-    "handoff", "handoff_resume", "handoff_working", "handoff_hint", "handoff_starting", "handoff_started", "handoff_fallback", "handoff_failed", "handoff_llm_required",
+    "manual_disabled_auto", "manual_disabled_busy",
+    "handoff", "handoff_resume", "handoff_working", "handoff_hint", "handoff_starting", "handoff_started", "handoff_fallback", "handoff_failed", "handoff_failed_source_preserved", "handoff_llm_required",
+    "handoff_blocked_unbound", "handoff_blocked_working", "handoff_blocked_transfer_busy", "handoff_blocked_action_busy", "handoff_blocked_unavailable",
     "queue_insert", "queue_insert_count", "queue_insert_hint", "queue_need_message", "queue_added", "queue_sent", "queue_waiting",
     "queue_full", "queue_failed", "queue_extension_reloaded", "queue_background_unavailable", "queue_storage_unavailable",
     "queue_added_draft_changed", "queue_added_clear_failed", "queue_clear_confirm", "queue_cleared",
@@ -1460,6 +1462,39 @@ async function durableChainWindow(continuityIdRaw) {
   };
 }
 
+async function durableChainForConversation(conversationIdRaw) {
+  const conversationId = String(conversationIdRaw || "").trim();
+  if (!conversationId) return null;
+  try {
+    const response = await localHerdrFetch(continuityResolveUrl(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ conversation_id: conversationId }),
+      nativeTimeoutMs: CONTINUITY_IPCC_TIMEOUT_MS,
+    });
+    const parsed = response.ok ? await response.json().catch(() => null) : null;
+    const continuityId = String(parsed?.continuity_id || "").trim();
+    const durable = parsed?.ok === true && Boolean(continuityId);
+    noteLocalRuntimeReachability(durable);
+    if (!durable) return null;
+    const acked = await loadRustAcked();
+    return {
+      continuity_id: continuityId,
+      durable: true,
+      rust_acked_hint: acked[continuityId] === true,
+      turn_count: 1,
+      raw_bytes: 0,
+      per_chain_cap: 200,
+      raw_cap_bytes: 16 * 1024 * 1024,
+      created_at: null,
+      updated_at: parsed?.updated_at || null,
+    };
+  } catch (_) {
+    noteLocalRuntimeReachability(false);
+    return null;
+  }
+}
+
 function latestTransferForConversation(transfers, convKey) {
   let best = null;
   for (const row of Object.values(transfers || {})) {
@@ -2222,6 +2257,14 @@ async function failWithHandoffFallback(transferId, options = {}) {
   if (fallback.ok) return fallback;
   const failed = await markTransfer(transferId, { status: "failed", error: fallback.error || "handoff_fallback_failed" });
   return { ok: false, error: fallback.error || "handoff_fallback_failed", handoff: handoffView(failed) };
+}
+
+async function prepareManualProjectHandoffWithoutSourcePrompt(transferId, snapshot = null, reason = "manual_project_continuity_unavailable") {
+  const fallback = await summarizeHandoffWithFallbackLlm(transferId, { snapshot, reason });
+  if (fallback.ok) return { ...fallback, source_preserved: true };
+  const error = fallback.error || "handoff_fallback_failed";
+  const failed = await markTransfer(transferId, { status: "failed", error });
+  return { ok: false, error, source_preserved: true, handoff: handoffView(failed) };
 }
 
 async function handleTimedHandoffSummaryFallback(transferId) {
@@ -3737,7 +3780,12 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   if (active) {
     if (active.status === "seed_uncertain") return resumeUncertainHandoff(active);
     const ageMs = Date.now() - Number(active.updated_at || active.created_at || Date.now());
-    if (ageMs >= 120000 && active.status === "summary_requested") return resumeSummaryRequested(active);
+    if (ageMs >= 120000 && active.status === "summary_requested") {
+      if (manualChatGptProjectHandoff(active)) {
+        return prepareManualProjectHandoffWithoutSourcePrompt(active.id, null, "manual_project_resume");
+      }
+      return resumeSummaryRequested(active);
+    }
     if (ageMs >= 120000 && ["summary_ready", "target_opening"].includes(active.status)) {
       if (active.target_tab_id && await tabStillExists(active.target_tab_id)) {
         return seedHandoffIntoTarget(active.id, active.target_tab_id);
@@ -3776,11 +3824,19 @@ async function startHandoffForTab(tabId, trigger = "manual") {
   if (chainIds.length > 1) return { ok: false, error: "binding_continuity_conflict" };
   const now = Date.now();
   const transferId = newTransferId(now);
-  const continuityId = chainIds[0] || newContinuityId(now);
+  let continuityId = chainIds[0] || null;
   // Durable continuity is checked before touching the source conversation. When
   // Rust already owns this chain, rollover needs only the stable continuity_id;
   // do not spend another source turn generating HERDR_HANDOFF_V1.
-  const durable = await durableChainWindow(continuityId);
+  let durable = continuityId ? await durableChainWindow(continuityId) : null;
+  if ((!durable?.durable || !durable?.turn_count) && convInfo.conversation_id) {
+    const resolved = await durableChainForConversation(convInfo.conversation_id);
+    if (resolved?.durable && resolved?.continuity_id) {
+      continuityId = resolved.continuity_id;
+      durable = resolved;
+    }
+  }
+  if (!continuityId) continuityId = newContinuityId(now);
   const durableAvailable = Boolean(durable?.durable && durable?.turn_count > 0);
   let sourceAssistantFp = null;
   let sourceSnapshot = null;
@@ -3831,6 +3887,14 @@ async function startHandoffForTab(tabId, trigger = "manual") {
       continuity_reference: true,
       handoff: handoffView(row),
     };
+  }
+
+  if (manualChatGptProjectHandoff(row)) {
+    return prepareManualProjectHandoffWithoutSourcePrompt(
+      transferId,
+      sourceSnapshot,
+      "manual_project_continuity_unavailable",
+    );
   }
 
   const sourceLimitBlocked = sourceSnapshot?.handoffBlockReason === "conversation_limit_ui";
@@ -3982,6 +4046,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: true, state });
       }
       else sendResponse(state || { ok: false });
+    })();
+    return true;
+  }
+  if (msg?.type === "herdr_control_fleet") {
+    void (async () => {
+      const url = `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/extension/fleet`;
+      try {
+        const response = await localHerdrFetch(url, {
+          method: "GET",
+          nativeTimeoutMs: 15_000,
+        });
+        const payload = await response.json().catch(() => null);
+        sendResponse(payload && typeof payload === "object"
+          ? { ...payload, local_http_status: response.status }
+          : { ok: false, code: "device_inventory_invalid_response", http_status: response.status });
+      } catch (error) {
+        sendResponse({
+          ok: false,
+          code: "device_inventory_unavailable",
+          error: String(error?.message || error || "device-inventory-request-failed"),
+        });
+      }
     })();
     return true;
   }

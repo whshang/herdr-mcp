@@ -413,3 +413,202 @@ test("pairing minted by one Worker deployment fails closed against another", asy
   ), envA);
   assert.equal(sameWorker.status, 200);
 });
+
+test("OAuth owner can create pairing via herdr_call herdr_mcp.device.pair with no old workstation, consume unchanged, unauthenticated rejected", async () => {
+  const oauthStub = {
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname === "/internal/oauth/access/verify") {
+        const body = await request.json();
+        if (body.token === "oauth-chatgpt-token") {
+          return new Response(JSON.stringify({ ok: true, client_id: "chatgpt-connector" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+      }
+      return new Response(JSON.stringify({ ok: false }), { status: 401 });
+    },
+  };
+
+  const { env, forwarded } = makeEnv({
+    OAUTH_STORE_DO: namespace(oauthStub),
+    DEFAULT_WORKSTATION_ID: "old-dead-macbook", // Old workstation is configured but never contacted
+  });
+
+  // 1. Unauthenticated caller cannot create pairing via /mcp or /devices/pairings
+  const unauthMcp = await worker.fetch(new Request("https://edge.example/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "herdr_call", arguments: { method: "herdr_mcp.device.pair" } },
+    }),
+  }), env);
+  assert.equal(unauthMcp.status, 401);
+
+  const unauthRest = await worker.fetch(post("/devices/pairings", { ttl_seconds: 60 }), env);
+  assert.equal(unauthRest.status, 401);
+  assert.equal((await unauthRest.json()).code, "pairing_admin_required");
+
+  // 2. OAuth owner creates pairing via herdr_call without any old workstation credential or header
+  const mcpCreate = await worker.fetch(new Request("https://edge.example/mcp", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer oauth-chatgpt-token",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "herdr_call",
+        arguments: {
+          method: "herdr_mcp.device.pair",
+          params: JSON.stringify({ ttl_seconds: 300, name: "new-macbook" }),
+        },
+      },
+    }),
+  }), env);
+
+  assert.equal(mcpCreate.status, 200);
+  const mcpBody = await mcpCreate.json();
+  assert.equal(mcpBody.result.isError, undefined);
+  const pairResult = mcpBody.result.structuredContent;
+  assert.equal(pairResult.ok, true);
+  assert.match(pairResult.pairing_id, /^pair_[0-9a-f]{64}$/);
+  assert.match(pairResult.code, /^[0-9]{6}$/);
+  assert.equal(typeof pairResult.expires_at_ms, "number");
+  assert.equal(pairResult.pairing_address, `https://edge.example/pair#${pairResult.pairing_id}`);
+  assert.equal(pairResult.pairing_address.includes(pairResult.code), false, "code must never appear in pairing address URL/fragment");
+  assert.ok(pairResult.instructions.includes("herdr-mcp worker connect"));
+  assert.equal(forwarded.length, 0, "no workstation DO forward may happen during pair creation");
+
+  // 3. New computer consumes pairing via /devices/pairings/consume (unchanged)
+  const consumeResp = await worker.fetch(post("/devices/pairings/consume", {
+    pairing_id: pairResult.pairing_id,
+    code: pairResult.code,
+  }), env);
+  assert.equal(consumeResp.status, 200);
+  const creds = await consumeResp.json();
+  assert.equal(creds.ok, true);
+  assert.match(creds.device_id, /^dev_[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+  assert.match(creds.credential_id, /^cred_[0-9a-f]{32}$/);
+  assert.match(creds.device_secret, /^devsec_[0-9a-f]{64}$/);
+
+  // Single-use replay fails closed
+  const replay = await worker.fetch(post("/devices/pairings/consume", {
+    pairing_id: pairResult.pairing_id,
+    code: pairResult.code,
+  }), env);
+  assert.equal(replay.status, 401);
+  assert.equal((await replay.json()).code, "pairing_rejected");
+
+  // 4. The same OAuth owner conversation can permanently revoke the newly
+  // enrolled immutable device at Edge, without forwarding to any workstation.
+  const revokeMcp = await worker.fetch(new Request("https://edge.example/mcp", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer oauth-chatgpt-token",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "tools/call",
+      params: {
+        name: "herdr_call",
+        arguments: {
+          method: "herdr_mcp.device.revoke",
+          params: JSON.stringify({ device_id: creds.device_id, confirm: true }),
+        },
+      },
+    }),
+  }), env);
+  assert.equal(revokeMcp.status, 200);
+  const revokeBody = await revokeMcp.json();
+  assert.equal(revokeBody.result.isError, undefined);
+  assert.equal(revokeBody.result.structuredContent.ok, true);
+  assert.equal(revokeBody.result.structuredContent.revoked, true);
+  assert.equal(revokeBody.result.structuredContent.device_id, creds.device_id);
+  assert.equal(typeof revokeBody.result.structuredContent.revoked_at_ms, "number");
+  assert.deepEqual(forwarded, ["/internal/revoke"], "Edge-local revoke may only use the dedicated WorkstationDO revoke fence, never /internal/forward");
+
+  // 5. OAuth owner can also create pairing via POST /devices/pairings without workstation headers
+  const restCreate = await worker.fetch(new Request("https://edge.example/devices/pairings", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer oauth-chatgpt-token",
+    },
+    body: JSON.stringify({ ttl_seconds: 120 }),
+  }), env);
+  assert.equal(restCreate.status, 200);
+  const restBody = await restCreate.json();
+  assert.equal(restBody.ok, true);
+  assert.match(restBody.pairing_id, /^pair_[0-9a-f]{64}$/);
+
+  // 6. Invalid input regressions on herdr_call herdr_mcp.device.pair:
+  // (a) Top-level device selector is rejected
+  const withDevice = await worker.fetch(new Request("https://edge.example/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer oauth-chatgpt-token" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "herdr_call", arguments: { method: "herdr_mcp.device.pair", device: "dev_someolddevice" } },
+    }),
+  }), env);
+  const withDeviceBody = await withDevice.json();
+  assert.equal(withDeviceBody.result.isError, true);
+  assert.equal(withDeviceBody.result.structuredContent.code, "device_selector_not_allowed");
+
+  // (b) Invalid TTL is rejected
+  const badTtl = await worker.fetch(new Request("https://edge.example/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer oauth-chatgpt-token" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "herdr_call", arguments: { method: "herdr_mcp.device.pair", params: { ttl_seconds: 999 } } },
+    }),
+  }), env);
+  const badTtlBody = await badTtl.json();
+  assert.equal(badTtlBody.result.isError, true);
+  assert.equal(badTtlBody.result.structuredContent.code, "invalid_pairing_ttl");
+
+  // (c) Invalid name is rejected
+  const badName = await worker.fetch(new Request("https://edge.example/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer oauth-chatgpt-token" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: { name: "herdr_call", arguments: { method: "herdr_mcp.device.pair", params: { name: "" } } },
+    }),
+  }), env);
+  const badNameBody = await badName.json();
+  assert.equal(badNameBody.result.isError, true);
+  assert.equal(badNameBody.result.structuredContent.code, "invalid_device_name");
+
+  // (d) Unknown parameter key (e.g. ttlSeconds typo) is rejected
+  const badKey = await worker.fetch(new Request("https://edge.example/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer oauth-chatgpt-token" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 6,
+      method: "tools/call",
+      params: { name: "herdr_call", arguments: { method: "herdr_mcp.device.pair", params: { ttlSeconds: 300 } } },
+    }),
+  }), env);
+  const badKeyBody = await badKey.json();
+  assert.equal(badKeyBody.result.isError, true);
+  assert.equal(badKeyBody.result.structuredContent.code, "invalid_params");
+});

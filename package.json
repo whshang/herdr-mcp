@@ -1,6 +1,6 @@
 {
   "name": "herdr-mcp",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "Lean MCP HTTP gateway: ChatGPT Connector / Cursor drive local Herdr plus gated fs/git/exec; Chrome extension wakes the web chat",
   "type": "module",
   "main": "dist/server.js",
@@ -26,7 +26,10 @@
     "cloudflare:domain": "bin/herdr-cloudflare-domain",
     "cloudflare:cutover": "bin/herdr-custom-domain-cutover",
     "runtime:generation": "bin/herdr-runtime-generation",
-    "self:update": "bin/herdr-self-update"
+    "self:update": "bin/herdr-self-update",
+    "relay:manifest:sign": "node scripts/sign-relay-manifest.mjs",
+    "relay:supabase:bundle": "node scripts/build-supabase-relay.mjs",
+    "relay:supabase:check": "node scripts/build-supabase-relay.mjs --check"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

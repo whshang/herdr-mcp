@@ -85,6 +85,7 @@ const queuedInsertDeliveries = [];
 const controlActionRequests = [];
 let mockContinuityPersistenceEnabled = false;
 const mockContinuityChains = new Set();
+const mockContinuityByConversation = new Map();
 const continuityTurnRequests = [];
 const continuityResolveRequests = [];
 let blockQueuedInsertDelivery = false;
@@ -291,14 +292,16 @@ globalThis.chrome = {
       if (message.path === "/extension/continuity/resolve") {
         const body = JSON.parse(message.body || "{}");
         continuityResolveRequests.push(body);
+        const continuityId = body.continuity_id || mockContinuityByConversation.get(body.conversation_id) || null;
         const found = mockLocalRuntimeAvailable
           && mockContinuityPersistenceEnabled
-          && mockContinuityChains.has(body.continuity_id);
+          && Boolean(continuityId)
+          && mockContinuityChains.has(continuityId);
         callback({
           ok: true, transport: "ipc", status: found ? 200 : 404,
           headers: { "content-type": "application/json" },
           body: JSON.stringify(found
-            ? { ok: true, continuity_id: body.continuity_id, status: "active" }
+            ? { ok: true, continuity_id: continuityId, status: "active" }
             : { ok: false, error: "continuity_not_found" }),
         });
         return;
@@ -471,6 +474,16 @@ function installContentScript(tabId, url, convKey, site = "chatgpt") {
         return;
       }
       if (msg?.type === "h2w_queue_state") { sendResponse({ ok: true }); return; }
+      if (msg?.type === "h2w_snapshot_turn") {
+        sendResponse({
+          userText: "continue project work",
+          assistantText: "project work is ready for handoff",
+          transcript: "[user]\ncontinue project work\n\n[assistant]\nproject work is ready for handoff",
+          turnInProgress: false,
+          generating: false,
+        });
+        return;
+      }
       if (msg?.type === "h2w_handoff_prompt") { handoffPrompt = msg.template || ""; sendResponse({ ok: true }); return; }
       if (msg?.type === "h2w_handoff_probe") {
         sendResponse({
@@ -1493,28 +1506,57 @@ console.log("\n[project handoff]");
   ok(projectOff?.ok === true && projectOff?.enabled === false,
     "Project automation can be turned off before an explicit manual handoff", JSON.stringify(projectOff));
 
+  const failedUpdateBefore = tabUpdateCount;
+  const failedPromptBefore = handoffPrompt;
+  let resolveNoFallbackStart;
+  const noFallbackStartP = new Promise((r) => { resolveNoFallbackStart = r; });
+  onMsg({ type: "h2w_handoff_start", tabId: 401 }, { tab: { id: 401 } }, (r) => resolveNoFallbackStart(r));
+  const noFallbackStart = await noFallbackStartP;
+  ok(noFallbackStart?.ok === false
+      && noFallbackStart?.source_preserved === true
+      && noFallbackStart?.error === "handoff_fallback_llm_not_configured",
+    "manual Project handoff fails closed when neither durable continuity nor fallback LLM is available",
+    JSON.stringify(noFallbackStart));
+  ok(handoffPrompt === failedPromptBefore && tabUpdateCount === failedUpdateBefore,
+    "failed manual Project handoff leaves the source conversation and route unchanged");
+
+  const fallbackRequestsBefore = llmHandoffRequests.length;
+  llmHandoffResponder = (body) => {
+    const prompt = String(body?.messages?.[0]?.content || "");
+    const transferId = prompt.match(/<<<HERDR_HANDOFF_V1 id=([^>]+)>>>/)?.[1] || "missing";
+    return [
+      `<<<HERDR_HANDOFF_V1 id=${transferId}>>>`,
+      "# Project handoff",
+      "Current objective: verify browser continuity.",
+      "Next: verify live state before mutation.",
+      "<<<END_HERDR_HANDOFF_V1>>>",
+    ].join("\n");
+  };
+  let resolveFallbackConfig;
+  const fallbackConfigP = new Promise((r) => { resolveFallbackConfig = r; });
+  onMsg({
+    type: "h2w_set_config",
+    config: {
+      llmJudgeBaseUrl: "https://llm.test/v1",
+      llmJudgeApiKey: "test-key",
+      llmJudgeModel: "handoff-test",
+    },
+  }, {}, (r) => resolveFallbackConfig(r));
+  await fallbackConfigP;
+
   let resolveStart;
   const startP = new Promise((r) => { resolveStart = r; });
   onMsg({ type: "h2w_handoff_start", tabId: 401 }, { tab: { id: 401 } }, (r) => resolveStart(r));
   const started = await startP;
-  ok(started?.ok === true && started.pending === true, "rollover requests a handoff summary", JSON.stringify(started));
+  ok(started?.ok === true && started.pending === true && started?.source_preserved === true,
+    "manual Project rollover uses the read-only fallback without touching the source conversation", JSON.stringify(started));
   const transferId = Object.values(storage.herdrConversationTransfers || {})
     .filter((transfer) => transfer?.source_conv_key === PROJECT_SOURCE)
     .sort((a, b) => Number(b.created_at || 0) - Number(a.created_at || 0))[0]?.id;
-  ok(!!transferId && handoffPrompt.includes(`id=${transferId}`), "source prompt carries the persisted transfer id");
-
-  const assistantText = [
-    `<<<HERDR_HANDOFF_V1 id=${transferId}>>>`,
-    "# Project handoff",
-    "Current objective: verify browser continuity.",
-    "Next: verify live state before mutation.",
-    "<<<END_HERDR_HANDOFF_V1>>>",
-  ].join("\n");
-  let resolveEnded;
-  const endedP = new Promise((r) => { resolveEnded = r; });
-  onMsg({ type: "h2w_turn_ended", convKey: PROJECT_SOURCE, assistantText, userText: "roll over" }, { tab: { id: 401 } }, (r) => resolveEnded(r));
-  const ended = await endedP;
-  ok(ended?.handled === true && ended?.ok === true, "marked assistant packet is accepted", JSON.stringify(ended));
+  ok(!!transferId && handoffPrompt === failedPromptBefore,
+    "manual ChatGPT Project handoff never submits HERDR_HANDOFF_V1 into the source conversation");
+  ok(llmHandoffRequests.length === fallbackRequestsBefore + 1,
+    "missing durable continuity uses exactly one configured fallback LLM request");
 
   await waitForTest(() => storage.herdrConversationTransfers?.[transferId]?.status === "seed_uncertain");
   const uncertain = storage.herdrConversationTransfers[transferId];
@@ -1680,6 +1722,8 @@ console.log("\n[project handoff]");
     "route backfill preserves server message ids and the existing continuity chain",
     JSON.stringify(backfillRequests));
 
+  mockContinuityByConversation.set("source123", durableContinuityId);
+  delete storage.herdrWakeBindings[targetKey].continuity_id;
   const resolveCountBeforeDurableStart = continuityResolveRequests.length;
   let resolveAutoStart;
   const autoStartP = new Promise((r) => { resolveAutoStart = r; });
@@ -1697,8 +1741,9 @@ console.log("\n[project handoff]");
   ok(handoffPrompt === "",
     "durable rollover never submits a summary prompt to the source conversation");
   ok(continuityResolveRequests.length > resolveCountBeforeDurableStart
-      && continuityResolveRequests.slice(resolveCountBeforeDurableStart).every((request) => request.continuity_id === durableContinuityId),
-    "durable rollover live-resolves the exact continuity id before cutover");
+      && continuityResolveRequests.slice(resolveCountBeforeDurableStart)
+        .some((request) => request.conversation_id === "source123" && !request.continuity_id),
+    "durable rollover recovers the continuity chain from the current conversation when binding metadata is missing");
   await waitForTest(() => storage.herdrConversationTransfers?.[autoTransfer?.id]?.status === "committed");
   ok(seedTemplateCaptures.some((seed) => seed.includes(`[HERDR_CONTINUITY_REF id=${autoTransfer?.id} continuity_id=${durableContinuityId}]`)
       && seed.includes("continuity.resume")
@@ -1707,6 +1752,7 @@ console.log("\n[project handoff]");
     JSON.stringify(seedTemplateCaptures).slice(0, 300));
   mockContinuityPersistenceEnabled = false;
   mockContinuityChains.clear();
+  mockContinuityByConversation.clear();
   ok(storage.herdrConversationTransfers[autoTransfer?.id]?.status === "committed",
     "Auto-on Project handoff commits normally");
   ok(tabCreateCount === autoCreateBefore && tabUpdateCount === autoUpdateBefore + 1,

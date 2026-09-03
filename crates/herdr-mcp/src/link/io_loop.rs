@@ -5,9 +5,8 @@
 //! Protocol, reconnect, close-code, heartbeat/silence, request settlement, and
 //! generation-fencing policy remain in the lower staged kernels.
 //!
-//! No CLI, daemon, service, runtime-current, or production path constructs this
-//! loop yet. Production Link remains on the Node implementation until later
-//! cutover gates are complete.
+//! CLI `herdr-mcp link run` and candidate daemon execute this loop via
+//! [`super::daemon::run_link_daemon`].
 
 use std::collections::VecDeque;
 use std::future::{Future, pending};
@@ -17,13 +16,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use super::ladder::{
+    DEFAULT_MAX_FAILURES_PER_ROUTE, TransportLadder, TransportRoute, TransportRouteKind,
+};
 use super::lifecycle::{ConnectionPhase, ReconnectSchedule};
 use super::local_mcp::LinkRuntimeTransport;
 use super::policy::LinkExitKind;
+use super::proxy::ResolvedProxy;
 use super::runner::{LinkRunnerCore, RunnerError};
 use super::socket_driver::{
     ABNORMAL_CLOSE_CODE, LINK_SUBPROTOCOL, SocketAttemptHandle, SocketDriverConfig,
-    SocketDriverError, WebSocketEvent, connect_socket_attempt, feed_socket_event,
+    SocketDriverError, WebSocketEvent, connect_socket_attempt_with_proxy, feed_socket_event,
 };
 use super::transport::{LinkTransportCore, SocketAttemptId, TransportAction, TransportError};
 use crate::relay::protocol::RelayMessage;
@@ -42,6 +45,7 @@ pub(crate) struct LinkIoConfig {
     pub offline_recycle_ms: u64,
     pub now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
     pub rng_sample: Arc<dyn Fn() -> f64 + Send + Sync>,
+    pub ladder: Option<TransportLadder>,
 }
 
 impl LinkIoConfig {
@@ -56,6 +60,7 @@ impl LinkIoConfig {
             offline_recycle_ms: LINK_DEFAULT_OFFLINE_RECYCLE_MS,
             now_ms: Arc::new(system_now_ms),
             rng_sample: Arc::new(system_rng_sample),
+            ladder: None,
         }
     }
 }
@@ -88,12 +93,13 @@ impl From<RunnerError> for LinkIoError {
 }
 
 pub(crate) struct SocketConnectRequest {
-    edge_url: String,
-    application_protocol: String,
-    link_token: String,
-    device_name: Option<String>,
-    attempt_id: SocketAttemptId,
-    config: SocketDriverConfig,
+    pub(crate) edge_url: String,
+    pub(crate) application_protocol: String,
+    pub(crate) link_token: String,
+    pub(crate) device_name: Option<String>,
+    pub(crate) attempt_id: SocketAttemptId,
+    pub(crate) config: SocketDriverConfig,
+    pub(crate) proxy: Option<ResolvedProxy>,
 }
 
 pub(crate) trait LoopSocketHandle: Send + 'static {
@@ -146,13 +152,14 @@ impl LoopSocketConnector for ProductionSocketConnector {
         &self,
         request: SocketConnectRequest,
     ) -> Result<Self::Handle, SocketDriverError> {
-        connect_socket_attempt(
+        connect_socket_attempt_with_proxy(
             &request.edge_url,
             &request.application_protocol,
             &request.link_token,
             request.device_name.as_deref(),
             request.attempt_id,
             request.config,
+            request.proxy.as_ref(),
         )
         .await
     }
@@ -219,6 +226,8 @@ where
     silence_timer: Option<JoinHandle<()>>,
     drain_generation: u64,
     drain_timer: Option<JoinHandle<()>>,
+    ladder: TransportLadder,
+    attempt_pre_online: bool,
     stopping: bool,
     draining: bool,
 }
@@ -247,6 +256,16 @@ where
         runner: LinkRunnerCore<T>,
         connector: Arc<C>,
     ) -> Self {
+        let ladder = config.ladder.clone().unwrap_or_else(|| {
+            let fallback_route = TransportRoute {
+                kind: TransportRouteKind::DirectWorkersDev,
+                endpoint_url: config.edge_url.clone(),
+                proxy: None,
+                relay_id: None,
+            };
+            TransportLadder::new(vec![fallback_route], DEFAULT_MAX_FAILURES_PER_ROUTE)
+                .expect("single route ladder is valid")
+        });
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         Self {
             config,
@@ -271,6 +290,8 @@ where
             silence_timer: None,
             drain_generation: 0,
             drain_timer: None,
+            ladder,
+            attempt_pre_online: true,
             stopping: false,
             draining: false,
         }
@@ -590,6 +611,10 @@ where
                     self.cancel_handshake(attempt_id);
                 }
                 TransportAction::ScheduleReconnect(schedule) => {
+                    if self.attempt_pre_online {
+                        self.attempt_pre_online = false;
+                        self.ladder.record_failure();
+                    }
                     if !self.stopping {
                         self.arm_reconnect(schedule);
                     }
@@ -620,8 +645,15 @@ where
                 }
                 | TransportAction::InboundRejected { .. }
                 | TransportAction::SocketErrorObserved { .. } => {}
-                TransportAction::Online { .. } => self.cancel_offline_recycle(),
-                TransportAction::Disconnected { .. } => self.arm_offline_recycle(),
+                TransportAction::Online { .. } => {
+                    self.attempt_pre_online = false;
+                    self.cancel_offline_recycle();
+                    self.ladder.record_success();
+                }
+                TransportAction::Disconnected { .. } => {
+                    self.attempt_pre_online = false;
+                    self.arm_offline_recycle();
+                }
                 TransportAction::HeartbeatDue { .. } | TransportAction::Inbound { .. } => {
                     unreachable!("runner routes higher-layer transport actions before the I/O pump")
                 }
@@ -640,13 +672,16 @@ where
         if let Some(socket) = self.socket.take() {
             socket.abort();
         }
+        self.attempt_pre_online = true;
+        let current_route = self.ladder.current_route().clone();
         let request = SocketConnectRequest {
-            edge_url: self.config.edge_url.clone(),
+            edge_url: current_route.endpoint_url,
             application_protocol: self.config.application_protocol.clone(),
             link_token: self.config.link_token.clone(),
             device_name: self.config.device_name.clone(),
             attempt_id,
             config: self.config.socket,
+            proxy: current_route.proxy,
         };
         let connector = Arc::clone(&self.connector);
         let event_tx = self.event_tx.clone();
@@ -924,7 +959,8 @@ mod tests {
 
     use super::{
         LINK_DEFAULT_OFFLINE_RECYCLE_MS, LinkIoConfig, LinkIoError, LinkIoLoop,
-        LoopSocketConnector, LoopSocketHandle, SocketConnectRequest,
+        LoopSocketConnector, LoopSocketHandle, SocketConnectRequest, TransportLadder,
+        TransportRoute, TransportRouteKind,
     };
     use crate::link::backoff::{BackoffOptions, ExponentialBackoff};
     use crate::link::local_mcp::{LinkRuntimeTransport, RuntimeHealth, RuntimeToolResult};
@@ -932,7 +968,8 @@ mod tests {
     use crate::link::request_core::RuntimeRequest;
     use crate::link::runner::{LinkRunnerCore, RunnerConfig};
     use crate::link::socket_driver::{
-        LINK_SUBPROTOCOL, SocketDriverError, WebSocketCommand, WebSocketEvent, command_for_action,
+        ABNORMAL_CLOSE_CODE, LINK_SUBPROTOCOL, SocketDriverError, WebSocketCommand, WebSocketEvent,
+        command_for_action,
     };
     use crate::link::transport::{
         LINK_DEFAULT_TRANSPORT_PING_MS, LinkTransportCore, SocketAttemptId, TransportAction,
@@ -1001,6 +1038,7 @@ mod tests {
     struct FakeConnector {
         plans: Mutex<VecDeque<ConnectPlan>>,
         attempts: Mutex<Vec<SocketAttemptId>>,
+        requested_urls: Mutex<Vec<String>>,
         control_tx: mpsc::UnboundedSender<FakeSocketControl>,
         refuse_commands: Arc<AtomicBool>,
     }
@@ -1014,6 +1052,7 @@ mod tests {
                 Arc::new(Self {
                     plans: Mutex::new(plans.into_iter().collect()),
                     attempts: Mutex::new(Vec::new()),
+                    requested_urls: Mutex::new(Vec::new()),
                     control_tx,
                     refuse_commands: Arc::new(AtomicBool::new(false)),
                 }),
@@ -1035,6 +1074,13 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
         }
+
+        fn requested_urls(&self) -> Vec<String> {
+            self.requested_urls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
     }
 
     impl LoopSocketConnector for FakeConnector {
@@ -1049,6 +1095,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(request.attempt_id);
+            self.requested_urls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.edge_url.clone());
             let plan = self
                 .plans
                 .lock()
@@ -1220,6 +1270,7 @@ mod tests {
                 10_000_i64.saturating_add(started.elapsed().as_millis() as i64)
             }),
             rng_sample: Arc::new(|| 0.0),
+            ladder: None,
         }
     }
 
@@ -1265,6 +1316,20 @@ mod tests {
             None,
         )
         .expect("hello_ack encodes")
+    }
+
+    fn hello_ack_failure(code: &str, message: &str) -> String {
+        encode_relay_message(
+            &RelayMessage::HelloAck(HelloAckMessage {
+                envelope: RelayEnvelope::new("ws1"),
+                outcome: HelloAckOutcome::Failure {
+                    code: code.to_owned(),
+                    message: message.to_owned(),
+                },
+            }),
+            None,
+        )
+        .expect("hello_ack failure encodes")
     }
 
     fn tool_request_frame(request_id: &str) -> String {
@@ -1812,6 +1877,495 @@ mod tests {
             }
         ));
         send_closed(&second, WS_CLOSE_NORMAL, "done");
+        assert_eq!(task.await.unwrap().unwrap(), LinkExitKind::Stopped);
+    }
+
+    #[tokio::test]
+    async fn no_mutation_replay_across_transport_switch() {
+        let gate = Arc::new(Notify::new());
+        let started = Arc::new(Semaphore::new(0));
+        let runtime = Arc::new(MockRuntime::blocked(
+            RuntimeToolResult::Success {
+                result: Some(json!({"mutation": "applied_once"})),
+            },
+            Arc::clone(&gate),
+            Arc::clone(&started),
+        ));
+
+        // Plan: Attempt 1 succeeds, Attempt 2 fails (triggering ladder failover to route 1), Attempt 3 succeeds
+        let plans = [
+            ConnectPlan::Success(Duration::ZERO),
+            ConnectPlan::Fail(Duration::ZERO),
+            ConnectPlan::Success(Duration::ZERO),
+        ];
+        let (connector, mut controls) = FakeConnector::new(plans);
+        let mut cfg = io_config(500);
+        let routes = vec![
+            TransportRoute {
+                kind: TransportRouteKind::DirectCustomDomain,
+                endpoint_url: "wss://custom.test/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::DirectWorkersDev,
+                endpoint_url: "wss://worker.workers.dev/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+        ];
+        cfg.ladder = Some(TransportLadder::new(routes, 1).unwrap());
+
+        let io = LinkIoLoop::with_connector(
+            cfg,
+            make_core(1_000, 100, 3_000, 262_144, None),
+            make_runner(runtime),
+            Arc::clone(&connector),
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(io.run(stop_rx));
+
+        // 1. First socket attempt on route 0 goes online
+        let mut first = next_control(&mut controls).await;
+        bring_online(&mut first).await;
+
+        // 2. Dispatch a tool request (mutation)
+        first
+            .event_tx
+            .send(WebSocketEvent::Text {
+                attempt_id: first.attempt_id,
+                text: tool_request_frame("mut-1"),
+            })
+            .unwrap();
+
+        // 3. Wait for runtime execution to start
+        let permit = tokio::time::timeout(Duration::from_millis(500), started.acquire())
+            .await
+            .expect("timeout waiting for mutation dispatch")
+            .expect("semaphore acquire failed");
+        permit.forget();
+        assert_eq!(started.available_permits(), 0);
+
+        // 4. Simulate socket drop while mutation is in-flight locally
+        send_closed(&first, ABNORMAL_CLOSE_CODE, "socket drop");
+
+        // 5. Reconnect attempt 2 on route 0 fails per plan, advancing ladder to route 1
+        // Attempt 3 on route 1 succeeds and goes online
+        let mut third = next_control(&mut controls).await;
+        assert_ne!(first.attempt_id, third.attempt_id);
+        bring_online(&mut third).await;
+
+        // 6. Complete the in-flight mutation
+        gate.notify_waiters();
+
+        // 7. Result is delivered on the new socket attempt
+        assert!(matches!(
+            decode_send(next_command(&mut third).await),
+            RelayMessage::ToolResult(result)
+                if result.request_id == "mut-1"
+                    && result.result == Some(json!({"mutation": "applied_once"}))
+        ));
+
+        // 8. Verify the runtime dispatch was executed exactly once (no duplicate execution)
+        assert_eq!(
+            started.available_permits(),
+            0,
+            "mutation must not be re-dispatched across transport switch"
+        );
+        let urls = connector.requested_urls();
+        assert_eq!(
+            urls,
+            vec![
+                "wss://custom.test/ws/ws1",
+                "wss://custom.test/ws/ws1",
+                "wss://worker.workers.dev/ws/ws1"
+            ],
+            "transport switch must advance to route 1 across attempts"
+        );
+
+        // Graceful stop
+        stop_tx.send(true).unwrap();
+        assert!(matches!(
+            next_command(&mut third).await,
+            WebSocketCommand::Close {
+                code: WS_CLOSE_NORMAL,
+                ..
+            }
+        ));
+        send_closed(&third, WS_CLOSE_NORMAL, "done");
+        assert_eq!(task.await.unwrap().unwrap(), LinkExitKind::Stopped);
+    }
+
+    #[tokio::test]
+    async fn bounded_failover_advances_across_ladder_routes() {
+        let runtime = Arc::new(MockRuntime::immediate(RuntimeToolResult::Success {
+            result: None,
+        }));
+        let routes = vec![
+            TransportRoute {
+                kind: TransportRouteKind::DirectCustomDomain,
+                endpoint_url: "wss://custom.test/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::DirectWorkersDev,
+                endpoint_url: "wss://worker.workers.dev/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::SharedRelay,
+                endpoint_url: "wss://relay.test/v1/worker.workers.dev/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: Some("relay-1".to_owned()),
+            },
+        ];
+
+        // First 4 attempts fail (2 on route 0, 2 on route 1), 5th on route 2 succeeds
+        let plans = [
+            ConnectPlan::Fail(Duration::ZERO),
+            ConnectPlan::Fail(Duration::ZERO),
+            ConnectPlan::Fail(Duration::ZERO),
+            ConnectPlan::Fail(Duration::ZERO),
+            ConnectPlan::Success(Duration::ZERO),
+        ];
+        let (connector, mut controls) = FakeConnector::new(plans);
+
+        let mut cfg = io_config(100);
+        cfg.ladder = Some(TransportLadder::new(routes, 2).unwrap());
+
+        let io = LinkIoLoop::with_connector(
+            cfg,
+            make_core(1_000, 100, 3_000, 262_144, None),
+            make_runner(runtime),
+            Arc::clone(&connector),
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(io.run(stop_rx));
+
+        let mut control = next_control(&mut controls).await;
+        bring_online(&mut control).await;
+
+        let urls = connector.requested_urls();
+        assert_eq!(urls.len(), 5);
+        assert_eq!(urls[0], "wss://custom.test/ws/ws1");
+        assert_eq!(urls[1], "wss://custom.test/ws/ws1"); // Bounded retry on route 0
+        assert_eq!(urls[2], "wss://worker.workers.dev/ws/ws1"); // Failover to route 1
+        assert_eq!(urls[3], "wss://worker.workers.dev/ws/ws1"); // Bounded retry on route 1
+        assert_eq!(urls[4], "wss://relay.test/v1/worker.workers.dev/ws/ws1"); // Failover to route 2
+
+        stop_tx.send(true).unwrap();
+        assert!(matches!(
+            next_command(&mut control).await,
+            WebSocketCommand::Close {
+                code: WS_CLOSE_NORMAL,
+                ..
+            }
+        ));
+        send_closed(&control, WS_CLOSE_NORMAL, "done");
+        assert_eq!(task.await.unwrap().unwrap(), LinkExitKind::Stopped);
+    }
+
+    #[tokio::test]
+    async fn successful_route_is_sticky_across_ordinary_socket_drop() {
+        let runtime = Arc::new(MockRuntime::immediate(RuntimeToolResult::Success {
+            result: None,
+        }));
+        let routes = vec![
+            TransportRoute {
+                kind: TransportRouteKind::DirectCustomDomain,
+                endpoint_url: "wss://custom.test/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::DirectWorkersDev,
+                endpoint_url: "wss://worker.workers.dev/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+        ];
+
+        let (connector, mut controls) = FakeConnector::new([]);
+        let mut cfg = io_config(100);
+        cfg.ladder = Some(TransportLadder::new(routes, 2).unwrap());
+
+        let io = LinkIoLoop::with_connector(
+            cfg,
+            make_core(1_000, 100, 3_000, 262_144, None),
+            make_runner(runtime),
+            Arc::clone(&connector),
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(io.run(stop_rx));
+
+        // Attempt 1 connects and goes online on route 0
+        let mut first = next_control(&mut controls).await;
+        bring_online(&mut first).await;
+
+        // Normal socket drop
+        send_closed(&first, ABNORMAL_CLOSE_CODE, "connection dropped");
+
+        // Reconnect attempt 2 must preserve sticky route 0
+        let mut second = next_control(&mut controls).await;
+        assert_ne!(first.attempt_id, second.attempt_id);
+        bring_online(&mut second).await;
+
+        let urls = connector.requested_urls();
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0], "wss://custom.test/ws/ws1");
+        assert_eq!(
+            urls[1], "wss://custom.test/ws/ws1",
+            "first reconnect attempt must stay sticky on the previously successful route"
+        );
+
+        stop_tx.send(true).unwrap();
+        assert!(matches!(
+            next_command(&mut second).await,
+            WebSocketCommand::Close {
+                code: WS_CLOSE_NORMAL,
+                ..
+            }
+        ));
+        send_closed(&second, WS_CLOSE_NORMAL, "done");
+        assert_eq!(task.await.unwrap().unwrap(), LinkExitKind::Stopped);
+    }
+
+    #[tokio::test]
+    async fn retryable_hello_ack_refusal_advances_ladder_failure_accounting() {
+        let runtime = Arc::new(MockRuntime::immediate(RuntimeToolResult::Success {
+            result: None,
+        }));
+        let routes = vec![
+            TransportRoute {
+                kind: TransportRouteKind::DirectCustomDomain,
+                endpoint_url: "wss://custom.test/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::DirectWorkersDev,
+                endpoint_url: "wss://worker.workers.dev/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+        ];
+
+        let (connector, mut controls) = FakeConnector::new([]);
+        let mut cfg = io_config(100);
+        cfg.ladder = Some(TransportLadder::new(routes, 1).unwrap());
+
+        let io = LinkIoLoop::with_connector(
+            cfg,
+            make_core(1_000, 100, 3_000, 262_144, None),
+            make_runner(runtime),
+            Arc::clone(&connector),
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(io.run(stop_rx));
+
+        // Attempt 1 opens on route 0
+        let mut first = next_control(&mut controls).await;
+        send_open(&first);
+        assert!(matches!(
+            decode_send(next_command(&mut first).await),
+            RelayMessage::Hello(_)
+        ));
+
+        // Edge returns retryable hello_ack failure
+        first
+            .event_tx
+            .send(WebSocketEvent::Text {
+                attempt_id: first.attempt_id,
+                text: hello_ack_failure("internal_error", "server temporarily unavailable"),
+            })
+            .unwrap();
+
+        // Socket 1 terminates on refusal
+        assert!(matches!(
+            next_command(&mut first).await,
+            WebSocketCommand::Terminate { .. }
+        ));
+
+        // Ladder failure budget advances to route 1 for attempt 2
+        let mut second = next_control(&mut controls).await;
+        assert_ne!(first.attempt_id, second.attempt_id);
+        bring_online(&mut second).await;
+
+        let urls = connector.requested_urls();
+        assert_eq!(
+            urls,
+            vec![
+                "wss://custom.test/ws/ws1",
+                "wss://worker.workers.dev/ws/ws1"
+            ],
+            "retryable hello_ack refusal must advance ladder accounting to next route"
+        );
+
+        stop_tx.send(true).unwrap();
+        assert!(matches!(
+            next_command(&mut second).await,
+            WebSocketCommand::Close {
+                code: WS_CLOSE_NORMAL,
+                ..
+            }
+        ));
+        send_closed(&second, WS_CLOSE_NORMAL, "done");
+        assert_eq!(task.await.unwrap().unwrap(), LinkExitKind::Stopped);
+    }
+
+    #[tokio::test]
+    async fn fatal_hello_ack_refusal_exits_without_route_failover() {
+        let runtime = Arc::new(MockRuntime::immediate(RuntimeToolResult::Success {
+            result: None,
+        }));
+        let routes = vec![
+            TransportRoute {
+                kind: TransportRouteKind::DirectCustomDomain,
+                endpoint_url: "wss://custom.test/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::DirectWorkersDev,
+                endpoint_url: "wss://worker.workers.dev/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+        ];
+
+        let (connector, mut controls) = FakeConnector::new([]);
+        let mut cfg = io_config(100);
+        cfg.ladder = Some(TransportLadder::new(routes, 1).unwrap());
+
+        let io = LinkIoLoop::with_connector(
+            cfg,
+            make_core(1_000, 100, 3_000, 262_144, None),
+            make_runner(runtime),
+            Arc::clone(&connector),
+        );
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(io.run(stop_rx));
+
+        // Attempt 1 opens on route 0
+        let mut first = next_control(&mut controls).await;
+        send_open(&first);
+        assert!(matches!(
+            decode_send(next_command(&mut first).await),
+            RelayMessage::Hello(_)
+        ));
+
+        // Edge returns fatal auth_rejected refusal
+        first
+            .event_tx
+            .send(WebSocketEvent::Text {
+                attempt_id: first.attempt_id,
+                text: hello_ack_failure("auth_rejected", "credential revoked"),
+            })
+            .unwrap();
+
+        // Must exit immediately with AuthRejected without route failover
+        let exit = task.await.unwrap().unwrap();
+        assert_eq!(exit, LinkExitKind::AuthRejected);
+
+        let urls = connector.requested_urls();
+        assert_eq!(
+            urls,
+            vec!["wss://custom.test/ws/ws1"],
+            "fatal hello_ack refusal must not trigger ladder failover"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_handshake_drop_consumes_single_budget_unit() {
+        let runtime = Arc::new(MockRuntime::immediate(RuntimeToolResult::Success {
+            result: None,
+        }));
+        let routes = vec![
+            TransportRoute {
+                kind: TransportRouteKind::DirectCustomDomain,
+                endpoint_url: "wss://custom.test/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+            TransportRoute {
+                kind: TransportRouteKind::DirectWorkersDev,
+                endpoint_url: "wss://worker.workers.dev/ws/ws1".to_owned(),
+                proxy: None,
+                relay_id: None,
+            },
+        ];
+
+        let (connector, mut controls) = FakeConnector::new([]);
+        let mut cfg = io_config(100);
+        // max_failures_per_route = 2: a single handshake drop must NOT advance route
+        cfg.ladder = Some(TransportLadder::new(routes, 2).unwrap());
+
+        let io = LinkIoLoop::with_connector(
+            cfg,
+            make_core(1_000, 100, 3_000, 262_144, None),
+            make_runner(runtime),
+            Arc::clone(&connector),
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(io.run(stop_rx));
+
+        // Attempt 1 opens on route 0
+        let mut first = next_control(&mut controls).await;
+        send_open(&first);
+        assert!(matches!(
+            decode_send(next_command(&mut first).await),
+            RelayMessage::Hello(_)
+        ));
+
+        // Handshake drops (socket closed before hello_ack)
+        send_closed(&first, ABNORMAL_CLOSE_CODE, "handshake network drop");
+
+        // Attempt 2 reconnects on route 0 (first failure counted exactly once, budget remaining = 1)
+        let mut second = next_control(&mut controls).await;
+        assert_ne!(first.attempt_id, second.attempt_id);
+
+        let urls_after_first_drop = connector.requested_urls();
+        assert_eq!(
+            urls_after_first_drop,
+            vec!["wss://custom.test/ws/ws1", "wss://custom.test/ws/ws1"],
+            "single handshake drop must consume exactly 1 failure unit and stay on route 0"
+        );
+
+        // Attempt 2 opens and drops during handshake as well (second failure)
+        send_open(&second);
+        assert!(matches!(
+            decode_send(next_command(&mut second).await),
+            RelayMessage::Hello(_)
+        ));
+        send_closed(&second, ABNORMAL_CLOSE_CODE, "second handshake drop");
+
+        // Attempt 3 reconnects on route 1 (second failure triggers failover after threshold 2)
+        let mut third = next_control(&mut controls).await;
+        assert_ne!(second.attempt_id, third.attempt_id);
+        bring_online(&mut third).await;
+
+        let urls_after_second_drop = connector.requested_urls();
+        assert_eq!(
+            urls_after_second_drop,
+            vec![
+                "wss://custom.test/ws/ws1",
+                "wss://custom.test/ws/ws1",
+                "wss://worker.workers.dev/ws/ws1"
+            ],
+            "second failed attempt must advance ladder to route 1"
+        );
+
+        stop_tx.send(true).unwrap();
+        assert!(matches!(
+            next_command(&mut third).await,
+            WebSocketCommand::Close {
+                code: WS_CLOSE_NORMAL,
+                ..
+            }
+        ));
+        send_closed(&third, WS_CLOSE_NORMAL, "done");
         assert_eq!(task.await.unwrap().unwrap(), LinkExitKind::Stopped);
     }
 }

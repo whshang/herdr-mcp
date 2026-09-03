@@ -72,7 +72,7 @@ herdr-mcp status
 
 ## 第三步：部署稳定公网 Edge
 
-如果 ChatGPT 需要从公网访问工作站，使用 Cloudflare Worker 提供稳定 OAuth/MCP 入口。首次安装优先 `workers.dev`，除非你明确需要自有域名。
+如果 ChatGPT 需要从公网访问工作站，使用 Cloudflare Worker 提供稳定 OAuth/MCP 入口。保持 `workers.dev` 作为零域名 bootstrap/诊断 origin；但如果选定的 Cloudflare Account 已有合适的 active zone，应在 Connector/OAuth 授权前优先使用 `herdr-mcp.example.com` 这类专用 Custom Domain 作为长期稳定身份。没有合适 zone 或用户不采用自定义域名时，继续使用 `workers.dev`，不要阻塞安装。
 
 自动化安装时由 Agent 按 [Agent 安装](agent-install.md) / [Agent 安装合同](agent-install.md) 直接执行这段；协议负责 Token 最小权限、Worker 命名、secret 注入、Account 选择和网络 blocker 的处理边界。
 
@@ -80,7 +80,7 @@ herdr-mcp status
 
 - Cloudflare API Token 只作为临时进程环境变量；
 - 不把 Token 写进仓库、日志、截图或 shell history；
-- 默认 `workers_dev = true`、`routes = []`；
+- 保持 `workers_dev = true`；`routes = []` 只是零域名 bootstrap 状态，不是已有合适 active zone 时的优先最终身份；最终 hostname 优先走 Worker Custom Domain，不申请通用 DNS Write；
 - Worker 名使用仓库 helper：
 
 ```bash
@@ -108,7 +108,7 @@ HTTP_PROXY / http_proxy
 ALL_PROXY / all_proxy
 ```
 
-macOS 也会读取 `scutil --proxy`。不要还没验证代理就把网络问题扩大成 DNS / Custom Domain 变更。
+支持 `socks5://` 与 `socks5h://`（始终按 `socks5h` remote-DNS 语义拨号，`workers.dev` 由代理解析）；不支持代理认证。macOS 也会读取 `scutil --proxy`（HTTPS、HTTP、SOCKS）；PAC 只检测不执行，仅配置 PAC 时 Link 直连。不要还没验证代理就把网络问题扩大成 DNS / Custom Domain 变更。
 
 ## 第五步：验证公网路径
 

@@ -1,6 +1,9 @@
 # Generic Herdr Cloudflare Edge config.
 # Copy to wrangler.user.toml (keep that local) and replace the placeholders.
-# A custom domain is OPTIONAL: workers.dev is the default supported endpoint.
+# A custom domain is OPTIONAL: workers.dev is the zero-domain bootstrap and a
+# fully supported final endpoint when no suitable Cloudflare zone is available.
+# When the account already has an active zone, prefer the Custom Domain block
+# below before registering OAuth/MCP clients.
 
 name = "herdr-edge"
 main = "src/index.ts"
@@ -35,16 +38,25 @@ new_sqlite_classes = ["OAuthStoreDO"]
 tag = "v3"
 new_sqlite_classes = ["DeviceRegistryDO"]
 
-# Private Worker-only R2 relay. Choose a unique bucket name per Worker/account.
+# Optional artifact relay bucket. R2 is NOT part of the core install: the core
+# Worker deploys and runs correctly without any R2 binding or permission, and
+# artifact relay endpoints report artifact_relay_disabled while it is absent.
+# Enable it only when the user explicitly wants the optional artifact relay:
+# 1. uncomment this block and choose a unique bucket name per Worker/account;
+# 2. grant the token Account -> Workers R2 Storage -> Edit (plus any R2
+#    billing/subscription step Cloudflare requires);
+# 3. run `node provision-r2.mjs --config wrangler.user.toml` before deploy.
 # Do not attach a public r2.dev domain or make this bucket publicly readable.
-[[r2_buckets]]
-binding = "ARTIFACT_BUCKET"
-bucket_name = "herdr-edge-artifacts"
+# [[r2_buckets]]
+# binding = "ARTIFACT_BUCKET"
+# bucket_name = "herdr-edge-artifacts"
 
 [triggers]
 crons = ["*/10 * * * *"]
 
-# Optional after workers.dev validation:
+# Recommended after workers.dev bootstrap validation when the selected Cloudflare
+# account already has an active zone. Finalize this before registering OAuth/MCP
+# clients; Cloudflare Custom Domains manage the Worker DNS record/certificate.
 # [[routes]]
 # pattern = "herdr.example.com"
 # custom_domain = true

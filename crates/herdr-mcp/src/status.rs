@@ -100,6 +100,12 @@ pub fn print_status(paths: &RuntimePaths, config: &Config) {
         "auto update scheduler: {}",
         crate::update_scheduler::status_line()
     );
+    println!("lifecycle residue: {}", crate::residue::status_line());
+    println!(
+        "relay pool: {}",
+        crate::link::relay_manifest::status_line(paths, unix_now_seconds())
+    );
+    println!("relay use: {}", crate::link::RELAY_POLICY_DESCRIPTION);
 }
 
 pub fn print_doctor(paths: &RuntimePaths, config: &Config) -> bool {
@@ -220,8 +226,16 @@ fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusR
     println!("LAYER local-ipc {}", format_local_ipc_layer(paths));
     println!("LAYER native-messaging {}", format_native_messaging_layer());
     println!("LAYER link {}", format_link_layer(paths));
-    let edge = resolve_edge_config();
-    println!("LAYER edge {}", format_edge_configured_layer(&edge));
+    println!(
+        "LAYER link-transport {}",
+        format_link_transport_layer(paths, config)
+    );
+    println!(
+        "LAYER relay-pool {}",
+        crate::link::relay_manifest::status_line(paths, unix_now_seconds())
+    );
+    let edge = resolve_edge_config(config);
+    println!("LAYER edge {}", format_edge_configured_layer(&edge, config));
     let remote = edge
         .as_ref()
         .map(probe_edge_remote)
@@ -230,6 +244,14 @@ fn print_layer_ownership(paths: &RuntimePaths, config: &Config, report: &StatusR
     println!("LAYER oauth-metadata {}", remote.oauth_metadata);
     println!("LAYER mcp-endpoint {}", remote.mcp_endpoint);
     println!("LAYER update-state {}", format_update_state_layer(paths));
+    println!("{}", crate::residue::doctor_line());
+}
+
+fn unix_now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
 }
 
 fn format_herdr_layer(paths: &RuntimePaths, report: &StatusReport) -> String {
@@ -373,14 +395,42 @@ fn format_link_layer(paths: &RuntimePaths) -> String {
     crate::link::doctor_layer_summary(&home, &paths.config_dir)
 }
 
-fn format_edge_configured_layer(edge: &Option<EdgeConfigView>) -> String {
+fn format_link_transport_layer(paths: &RuntimePaths, config: &Config) -> String {
+    let pool = crate::link::relay_manifest::load_cached_pool(paths, unix_now_seconds());
+    let evidence = crate::link::collect_transport_evidence_with_pool(
+        config.edge_public_origin.as_deref(),
+        config.edge_link_upstream_origin.as_deref(),
+        &pool.relays,
+        pool.source,
+    );
+    format!(
+        "mcp_origin={} link_upstream={} live_transport={} configured_preferred_transport={} proxy_source={} relay={} relay_policy={} relay_selection={} pool_source={} failover_ready={}",
+        evidence.mcp_origin,
+        evidence.link_upstream,
+        evidence.live_transport,
+        evidence.configured_preferred_transport,
+        evidence.proxy_source,
+        evidence.relay,
+        evidence.relay_policy,
+        evidence.relay_selection,
+        evidence.pool_source,
+        evidence.failover_ready,
+    )
+}
+
+fn format_edge_configured_layer(edge: &Option<EdgeConfigView>, config: &Config) -> String {
+    let upstream_info = match config.edge_link_upstream_origin.as_deref() {
+        Some(upstream) => format!(" upstream={upstream}"),
+        None => String::new(),
+    };
     match edge {
         Some(edge) => format!(
-            "configured-local source={} label={} host={} origin={} plist={}",
+            "configured-local source={} label={} host={} origin={}{} plist={}",
             edge.source.as_str(),
             edge.label.as_deref().unwrap_or("-"),
             edge.host,
             edge.origin,
+            upstream_info,
             edge.plist
                 .as_ref()
                 .map(|path| path.display().to_string())
@@ -392,6 +442,7 @@ fn format_edge_configured_layer(edge: &Option<EdgeConfigView>) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EdgeConfigSource {
+    ConfigToml,
     LinkProdPlist,
     LinkPlist,
     LinkCandidatePlist,
@@ -401,6 +452,7 @@ enum EdgeConfigSource {
 impl EdgeConfigSource {
     fn as_str(self) -> &'static str {
         match self {
+            Self::ConfigToml => "config-toml",
             Self::LinkProdPlist => "link-prod-plist",
             Self::LinkPlist => "link-plist",
             Self::LinkCandidatePlist => "link-candidate-plist",
@@ -435,34 +487,56 @@ impl RemoteProbeReport {
     }
 }
 
-fn resolve_edge_config() -> Option<EdgeConfigView> {
-    let home = home_dir()?;
-    let plist_candidates = [
-        ("dev.herdr-mcp.link-prod", EdgeConfigSource::LinkProdPlist),
-        ("dev.herdr-mcp.link", EdgeConfigSource::LinkPlist),
-        (
-            "dev.herdr-mcp.link-rust-candidate",
-            EdgeConfigSource::LinkCandidatePlist,
-        ),
-    ];
-    for (label, source) in plist_candidates {
-        let path = home
-            .join("Library")
-            .join("LaunchAgents")
-            .join(format!("{label}.plist"));
-        if !path.is_file() {
-            continue;
+fn resolve_edge_config(config: &Config) -> Option<EdgeConfigView> {
+    let home = home_dir();
+
+    // Check if a real link LaunchAgent plist exists
+    let plist_info = home.as_ref().and_then(|h| {
+        let plist_candidates = [
+            ("dev.herdr-mcp.link-prod", EdgeConfigSource::LinkProdPlist),
+            ("dev.herdr-mcp.link", EdgeConfigSource::LinkPlist),
+            (
+                "dev.herdr-mcp.link-rust-candidate",
+                EdgeConfigSource::LinkCandidatePlist,
+            ),
+        ];
+        for (label, source) in plist_candidates {
+            let path = h
+                .join("Library")
+                .join("LaunchAgents")
+                .join(format!("{label}.plist"));
+            if path.is_file() {
+                let host = edge_host_from_plist(&path);
+                return Some((path, label.to_owned(), source, host));
+            }
         }
-        if let Some(host) = edge_host_from_plist(&path) {
-            let origin = https_origin_for_host(&host)?;
-            return Some(EdgeConfigView {
-                host,
-                origin,
-                plist: Some(path),
-                source,
-                label: Some(label.to_owned()),
-            });
-        }
+        None
+    });
+
+    // If [edge].public_origin is configured in config.toml, it is the authoritative public identity
+    if let Some(public_origin) = config.edge_public_origin.as_deref()
+        && let Ok(parsed) = url::Url::parse(public_origin)
+        && let Some(host) = parsed.host_str()
+    {
+        return Some(EdgeConfigView {
+            host: host.to_owned(),
+            origin: public_origin.to_owned(),
+            plist: plist_info.as_ref().map(|(p, _, _, _)| p.clone()),
+            source: EdgeConfigSource::ConfigToml,
+            label: plist_info.as_ref().map(|(_, l, _, _)| l.clone()),
+        });
+    }
+
+    if let Some((path, label, source, Some(host))) = plist_info
+        && let Some(origin) = https_origin_for_host(&host)
+    {
+        return Some(EdgeConfigView {
+            host,
+            origin,
+            plist: Some(path),
+            source,
+            label: Some(label),
+        });
     }
 
     let edge_url = std::env::var("HERDR_EDGE_URL")
@@ -1009,14 +1083,38 @@ mod tests {
             source: EdgeConfigSource::ProcessEnv,
             label: None,
         };
-        let formatted = format_edge_configured_layer(&Some(edge));
+        let formatted = format_edge_configured_layer(&Some(edge), &Config::default());
         assert!(formatted.contains("source=link-env"));
         assert!(!formatted.contains("unconfigured"));
     }
 
     #[test]
+    fn split_edge_layer_keeps_public_origin_upstream_and_plist_evidence_distinct() {
+        let edge = EdgeConfigView {
+            host: "custom.example".to_owned(),
+            origin: "https://custom.example".to_owned(),
+            plist: Some(PathBuf::from(
+                "/Users/test/Library/LaunchAgents/dev.herdr-mcp.link-prod.plist",
+            )),
+            source: EdgeConfigSource::ConfigToml,
+            label: Some("dev.herdr-mcp.link-prod".to_owned()),
+        };
+        let config = Config {
+            edge_public_origin: Some("https://custom.example".to_owned()),
+            edge_link_upstream_origin: Some("https://backend.workers.dev".to_owned()),
+            ..Config::default()
+        };
+
+        let formatted = format_edge_configured_layer(&Some(edge), &config);
+        assert!(formatted.contains("origin=https://custom.example"));
+        assert!(formatted.contains("upstream=https://backend.workers.dev"));
+        assert!(formatted.contains("dev.herdr-mcp.link-prod.plist"));
+        assert!(formatted.contains("label=dev.herdr-mcp.link-prod"));
+    }
+
+    #[test]
     fn unconfigured_edge_layer_names_missing_link_and_env() {
-        let formatted = format_edge_configured_layer(&None);
+        let formatted = format_edge_configured_layer(&None, &Config::default());
         assert!(formatted.contains("unconfigured"));
         assert!(formatted.contains("HERDR_EDGE_URL"));
     }

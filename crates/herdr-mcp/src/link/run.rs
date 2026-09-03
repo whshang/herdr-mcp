@@ -34,9 +34,21 @@ const SERVER_PLIST_REL: &str = "Library/LaunchAgents/dev.herdr-mcp.server.plist"
 /// CLI entry: load config and run the staged daemon in the foreground.
 pub fn run() -> Result<ExitCode, String> {
     let config = load_link_run_config().map_err(|error| error.to_string())?;
-    // Fail closed before opening a WebSocket when Edge still publishes epoch 1.
-    let _edge = super::edge_contract::probe_edge_contract_for_rust_link(&config.edge_url)
-        .map_err(|error| format!("herdr-mcp link run: {error}"))?;
+    // Reachable incompatible Edges always fail closed. The only deferable case
+    // is direct transport unavailability when a qualified Relay route is
+    // actually available. Qualified means either the compiled mainland-UAT
+    // baseline or a validated signed remote pool. Authenticated Edge hello
+    // remains the final runtime-contract fence after Relay transport succeeds.
+    if let Err(error) = super::edge_contract::probe_edge_contract_for_rust_link(&config.edge_url) {
+        let relay_available = validated_relay_route_available(&config)?;
+        if should_defer_contract_probe_to_hello(&error, relay_available) {
+            eprintln!(
+                "[herdr-link] warn direct Edge /health is unreachable; using a qualified Relay route and deferring the final runtime-contract fence to authenticated Edge hello"
+            );
+        } else {
+            return Err(format!("herdr-mcp link run: {error}"));
+        }
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -45,6 +57,42 @@ pub fn run() -> Result<ExitCode, String> {
         .block_on(run_link_daemon(config))
         .map_err(|error| format!("herdr-mcp link run: {error}"))?;
     Ok(ExitCode::from(code as u8))
+}
+
+fn should_defer_contract_probe_to_hello(
+    error: &super::edge_contract::EdgeContractError,
+    relay_available: bool,
+) -> bool {
+    relay_available && error.is_transport_unavailable()
+}
+
+fn validated_relay_route_available(config: &LinkDaemonConfig) -> Result<bool, String> {
+    let paths = RuntimePaths::discover()
+        .map_err(|error| format!("herdr-mcp link run: runtime paths: {error}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0);
+    let pool = super::relay_manifest::load_cached_pool(&paths, now);
+    if !relay_pool_can_bridge_direct_outage(&pool) {
+        return Ok(false);
+    }
+    let routes = super::ladder::build_ladder_routes(
+        &config.edge_url,
+        config.public_origin.as_deref(),
+        config.link_upstream_origin.as_deref(),
+        &config.workstation_id,
+        None,
+        &pool.relays,
+    )
+    .map_err(|error| format!("herdr-mcp link run: transport ladder error: {error}"))?;
+    Ok(routes
+        .iter()
+        .any(|route| route.kind == super::ladder::TransportRouteKind::SharedRelay))
+}
+
+fn relay_pool_can_bridge_direct_outage(pool: &super::relay_manifest::RelayPoolLoad) -> bool {
+    !pool.relays.is_empty() && matches!(pool.source, "embedded" | "cached-remote")
 }
 
 /// Build daemon config from process environment (+ macOS credential fallbacks).
@@ -98,6 +146,18 @@ fn enrich_macos_credentials_with_config(
     if optional_trimmed(env_map, "HERDR_LINK_TOKEN").is_none() {
         let token = load_link_token_from_keychain(env_map)?;
         env_map.insert("HERDR_LINK_TOKEN".to_owned(), token);
+    }
+
+    if optional_trimmed(env_map, "HERDR_PUBLIC_ORIGIN").is_none()
+        && let Some(origin) = configured.and_then(|config| config.edge_public_origin.clone())
+    {
+        env_map.insert("HERDR_PUBLIC_ORIGIN".to_owned(), origin);
+    }
+    if optional_trimmed(env_map, "HERDR_LINK_UPSTREAM_ORIGIN").is_none()
+        && let Some(upstream) =
+            configured.and_then(|config| config.edge_link_upstream_origin.clone())
+    {
+        env_map.insert("HERDR_LINK_UPSTREAM_ORIGIN".to_owned(), upstream);
     }
 
     if optional_trimmed(env_map, "HERDR_MCP_TOKEN").is_none() {
@@ -264,6 +324,27 @@ mod tests {
     }
 
     #[test]
+    fn enrich_uses_link_upstream_origin_when_configured() {
+        let mut env_map = HashMap::from([
+            ("HERDR_LINK_TOKEN".to_owned(), "link-secret".to_owned()),
+            ("HERDR_MCP_TOKEN".to_owned(), "runtime-secret".to_owned()),
+        ]);
+        let config = Config {
+            edge_public_origin: Some("https://custom.example.com".to_owned()),
+            edge_link_upstream_origin: Some("https://backend.workers.dev".to_owned()),
+            edge_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            ..Config::default()
+        };
+        enrich_macos_credentials_with_config(&mut env_map, Some(&config)).expect("enrich");
+        assert_eq!(
+            env_map.get("HERDR_EDGE_URL").map(String::as_str),
+            Some("wss://backend.workers.dev/ws")
+        );
+        let cfg = read_link_daemon_config(&env_map).expect("config");
+        assert_eq!(cfg.edge_url, "wss://backend.workers.dev/ws");
+    }
+
+    #[test]
     fn credential_errors_never_embed_secret_values() {
         let error = DaemonConfigError::Message(
             "herdr-link macOS: unable to load workstation link credential".to_owned(),
@@ -272,6 +353,47 @@ mod tests {
         assert!(text.contains("unable to load workstation link credential"));
         assert!(!text.contains("link-secret"));
         assert!(!text.contains("runtime-secret"));
+    }
+
+    #[test]
+    fn contract_probe_is_deferred_only_for_transport_unavailability_with_relay() {
+        let transport = super::super::edge_contract::EdgeContractError::TransportUnavailable(
+            "connection reset".to_owned(),
+        );
+        let mismatch =
+            super::super::edge_contract::EdgeContractError::Message("epoch mismatch".to_owned());
+        assert!(should_defer_contract_probe_to_hello(&transport, true));
+        assert!(!should_defer_contract_probe_to_hello(&transport, false));
+        assert!(!should_defer_contract_probe_to_hello(&mismatch, true));
+    }
+
+    #[test]
+    fn direct_outage_bridge_accepts_qualified_embedded_or_signed_remote_pool_only() {
+        use crate::link::ladder::default_embedded_relays;
+        use crate::link::relay_manifest::RelayPoolLoad;
+
+        let embedded = RelayPoolLoad {
+            relays: default_embedded_relays(),
+            source: "embedded",
+            metadata: None,
+            freshness: "missing",
+            error_class: None,
+            revision_floor: None,
+        };
+        assert!(relay_pool_can_bridge_direct_outage(&embedded));
+
+        let mut remote = embedded.clone();
+        remote.source = "cached-remote";
+        remote.freshness = "fresh";
+        assert!(relay_pool_can_bridge_direct_outage(&remote));
+
+        let mut empty = embedded.clone();
+        empty.relays.clear();
+        assert!(!relay_pool_can_bridge_direct_outage(&empty));
+
+        let mut unknown = embedded;
+        unknown.source = "unknown";
+        assert!(!relay_pool_can_bridge_direct_outage(&unknown));
     }
 
     #[test]

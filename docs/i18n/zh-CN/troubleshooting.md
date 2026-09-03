@@ -54,6 +54,22 @@ herdr api schema >/dev/null
 
 检查 Edge `/health` / workstation status。OAuth 可以在 workstation 离线时仍然成功，所以“登录成功”不能证明本机已经连上。
 
+### 本地网络挡住了 Link 吗
+
+Link 复用环境里已有的代理配置，解析顺序：
+
+```text
+HERDR_LINK_PROXY > HTTPS_PROXY/https_proxy > HTTP_PROXY/http_proxy > ALL_PROXY/all_proxy
+  > macOS 系统代理（scutil --proxy：HTTPS、HTTP、SOCKS）
+```
+
+`workers.dev` 不可达时，这些细节值得先确认：
+
+- 支持 `socks5://` 与 `socks5h://`。SOCKS5 拨号使用 remote-DNS 语义：域名不经本地解析、直接交给代理解析，本地 DNS 污染不会影响 `workers.dev` 连通性。
+- 不支持代理认证（HTTP Basic、SOCKS5 用户名密码）；带内嵌凭据的代理 URL 会被拒绝，凭据也不会出现在 status 或错误输出里。
+- macOS 上会检测 PAC 配置但不会执行：Link 不拉取、不运行 PAC 脚本；只配置了 PAC 时 Link 直连。
+- 不要用关 TLS、改系统代理、把 Link 变成通用转发这类方式去“修”连通性。
+
 ### 4. 新 ChatGPT 会话有当前工具吗
 
 当前 ChatGPT 公共 contract 是 **epoch 3 / 19 actions**。workstation execution 仍是 **epoch 2 / 18 tools**，其中包含 `herdr_skill`；额外的公共 action 是只在 Edge 执行的 `herdr_devices`。

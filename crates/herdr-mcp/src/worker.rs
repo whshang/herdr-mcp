@@ -36,6 +36,10 @@ use std::time::Duration;
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(any(target_os = "macos", test))]
+use time::OffsetDateTime;
+#[cfg(any(target_os = "macos", test))]
+use time::format_description::well_known::Rfc3339;
+#[cfg(any(target_os = "macos", test))]
 use url::Url;
 
 #[cfg(any(target_os = "macos", test))]
@@ -77,6 +81,13 @@ fn pairing_consume_request_body(pairing_id: &str, code: &str, name: Option<&str>
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn format_pairing_expiry(expires_at_ms: u64) -> Option<String> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires_at_ms) * 1_000_000)
+        .ok()
+        .and_then(|value| value.format(&Rfc3339).ok())
+}
+
 pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
     let paths = RuntimePaths::discover()?;
     if paths.instance.is_named() {
@@ -94,7 +105,78 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
             connect_existing_worker(&paths, &pairing_address, name.as_deref())
         }
         WorkerCommand::Rename { name } => rename_current_device(&paths, &name),
+        WorkerCommand::Revoke { device_id } => revoke_device(&paths, &device_id),
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn extension_fleet_snapshot(_paths: &RuntimePaths) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "ok": false,
+        "code": "device_inventory_platform_unsupported",
+    }))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn extension_fleet_snapshot(paths: &RuntimePaths) -> Result<Value, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let owner = resolve_owner_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&owner.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&owner.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client()?
+        .get(endpoint(&owner.edge_origin, "/devices")?)
+        .headers(headers)
+        .send()
+        .map_err(|error| format!("cannot read Worker device inventory: {error}"))?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .map_err(|_| format!("Worker device inventory returned non-JSON HTTP {status}"))?;
+    if !status.is_success() || payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        let code = payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("device_inventory_unavailable");
+        return Ok(json!({
+            "ok": false,
+            "code": code,
+            "http_status": status.as_u16(),
+        }));
+    }
+
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is required to inspect the production Link".to_owned())?;
+    let link = crate::link::ownership::collect_status_report(&home, &paths.config_dir);
+    let alignment = link
+        .get("production_runtime_alignment")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let local_device_id = config.edge_device_id.clone().or_else(|| {
+        owner
+            .workstation_id
+            .starts_with("dev_")
+            .then(|| owner.workstation_id.clone())
+    });
+
+    Ok(json!({
+        "ok": true,
+        "devices": payload.get("devices").cloned().unwrap_or_else(|| json!([])),
+        "observed_at_ms": payload.get("observed_at_ms").cloned().unwrap_or(Value::Null),
+        "local": {
+            "device_id": local_device_id,
+            "runtime_version": crate::runtime_meta::runtime_version(),
+            "runtime_generation": alignment.get("current_generation").cloned().unwrap_or(Value::Null),
+            "link_active_generation": alignment.get("active_generation").cloned().unwrap_or(Value::Null),
+            "link_loaded_generation": alignment.get("loaded_launchd_generation").cloned().unwrap_or(Value::Null),
+            "link_generation_stale": alignment.get("loaded_environment_stale").cloned().unwrap_or(Value::Null),
+            "link_owner": link.get("production_owner").cloned().unwrap_or(Value::Null),
+        },
+    }))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -145,15 +227,14 @@ fn create_pairing(
         .ok_or_else(|| "device pairing creation returned no expiry".to_owned())?;
 
     let pairing_address = format!("{}/pair#{}", owner.edge_origin, pairing_id);
-    let ttl_minutes = ttl_seconds / 60;
     println!("Pairing created for Worker {}", owner.edge_origin);
     println!();
     println!("Pairing address: {}", pairing_address);
     println!("Verification code: {}", format_pairing_code(code));
-    println!(
-        "Expires in {} minutes ({} seconds).",
-        ttl_minutes, ttl_seconds
-    );
+    if let Some(expires_at) = format_pairing_expiry(expires_at_ms) {
+        println!("Expires at: {expires_at} (UTC)");
+    }
+    println!("Valid for at most {ttl_seconds} seconds; use it immediately.");
     println!();
     println!("On the new computer, run:");
     println!("  herdr-mcp worker connect \"{}\"", pairing_address);
@@ -164,7 +245,6 @@ fn create_pairing(
         "Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: {}  Then enter the separately displayed 6-digit verification code at the no-echo prompt (the code is never part of the copyable command).",
         pairing_address
     );
-    let _ = expires_at_ms;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -203,6 +283,46 @@ fn connect_existing_worker(
         crate::link::reconcile_after_service_generation_change,
         consume_pairing,
     )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn revoke_device(_paths: &RuntimePaths, _device_id: &str) -> Result<ExitCode, String> {
+    Err(
+        "worker revoke currently requires macOS Keychain; refusing to revoke on this platform"
+            .to_owned(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn revoke_device(paths: &RuntimePaths, device_id: &str) -> Result<ExitCode, String> {
+    let device_id = crate::config::normalize_device_id(device_id)?;
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_owner_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client()?
+        .post(endpoint(&identity.edge_origin, "/devices/revoke")?)
+        .headers(headers)
+        .json(&json!({ "device_id": device_id }))
+        .send()
+        .map_err(|error| format!("cannot revoke Worker device: {error}"))?;
+    let payload = parse_json_response(response, "device revoke")?;
+    let revoked_device_id = required_string(&payload, "device_id")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "worker_revoke",
+            "device_id": revoked_device_id,
+            "revoked_at_ms": payload.get("revoked_at_ms").cloned().unwrap_or(Value::Null),
+        }))
+        .map_err(|error| format!("cannot encode device revoke result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -998,6 +1118,14 @@ mod tests {
     fn pairing_code_formats_with_a_space_for_humans() {
         assert_eq!(format_pairing_code("123456"), "123 456");
         assert_eq!(format_pairing_code("000000"), "000 000");
+    }
+
+    #[test]
+    fn pairing_expiry_formats_as_absolute_rfc3339_utc() {
+        assert_eq!(
+            format_pairing_expiry(0).as_deref(),
+            Some("1970-01-01T00:00:00Z")
+        );
     }
 
     #[test]

@@ -30,10 +30,10 @@ Cloudflare Edge
 ### 推奨：Agent に一文だけ渡す
 
 ```text
-Herdr と herdr-mcp をインストールして設定してください。https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md を最後まで読み、現在の Stable GitHub Release を使って Cloudflare と ChatGPT まで設定し、私自身のログインや認可が必要な場面だけ停止し、最後に接続全体を実際の MCP リクエストで検証してください。
+Herdr と herdr-mcp をインストールして設定してください。https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/en/agent-install.md を最後まで読み、現在の Stable GitHub Release を使って Cloudflare と ChatGPT まで設定してください。Cloudflare account に適切な active zone がある場合は専用 Custom Domain を優先し、ない場合は workers.dev を維持してください。workstation の network/fallback path を自動検証し、私自身のログインや認可が必要な場面だけ停止し、最後に接続全体を実際の MCP リクエストで検証してください。
 ```
 
-Agent はマシンを確認し、Herdr と herdr-mcp をインストールし、Cloudflare の公開入口を作成または接続し、開発マシンからの接続を開始します。その後 ChatGPT の認可を案内し、ヘルスチェックと実際の MCP リクエストまで検証します。本人によるサインインや認可が必要な場合だけ停止します。
+Agent は `workers.dev` で Worker を bootstrap し、適切な Cloudflare zone があれば OAuth/Connector を固定する前に Custom Domain を推奨・設定します。その後 workstation Link と ChatGPT 認可を進め、実際の network path と MCP request を検証します。domain がなくてもインストールは停止せず、必要なら Link が direct `workers.dev` → 既存 local proxy → qualified shared Relay の順で自動 fallback します。
 
 ### 手動インストール
 
@@ -51,6 +51,12 @@ Cloudflare が安定した公開 MCP/OAuth 入口を提供し、各開発マシ�
 
 [Cloudflare setup](docs/i18n/en/cloudflare-edge-deployment.md) · [Cloudflare Dashboard](https://dash.cloudflare.com/)
 
+### Shared Relay は公開入口ではなくフォールバックです
+
+Herdr-MCP は通常 workstation Link を直接接続します。自分の Cloudflare Custom Domain を設定している場合、共有 Relay Pool は使用しません。Custom Domain がない場合は、まず Worker の `workers.dev` へ直接接続し、検証済みのローカル proxy があれば次にそれを試し、それらが利用できない場合だけ Herdr の Relay Pool へ自動 fallback します。fresh install には v0.4.5 の中国本土 no-proxy UAT で検証した Deno/Supabase baseline が含まれ、新しい有効な signed pool cache があれば baseline を置き換えます。
+
+Relay は MCP/OAuth URL やデバイス identity を置き換えず、汎用 proxy にもなりません。認証済みの `herdr-link` WebSocket を、自分の `workers.dev` Worker へ転送するだけです。本番 Pool は独立した Deno / Supabase failure domain を使い、デバイス単位の sticky・capacity-weighted selection と bounded failover を行います。長時間接続の大部分は Deno が担当し、Hosted Edge Function の lifetime と Free quota がより厳しい Supabase は少量の capacity share と完全な fallback を担当します。通常の利用者が両 provider のアカウントや Relay URL を設定する必要はありません。
+
 ## 複数コンピュータをまとめて操作する
 
 1 つの Herdr Worker と 1 つの ChatGPT 接続で、登録済みの複数コンピュータを扱えます。ChatGPT は `herdr_devices` でデバイス一覧とオンライン状態を確認し、明示したデバイスへ作業をルーティングできます。
@@ -67,13 +73,15 @@ Web AI は private workstation method を使い、登録済みコンピュータ
 
 ### 新しいコンピュータを既存のデバイス群へ追加する
 
-すでに認可済みのコンピュータで短時間の pairing を作成します。
+推奨は、すでに認可済みの ChatGPT 会話で次のように依頼することです。
 
-```bash
-herdr-mcp worker pair
+```text
+新しいコンピュータ用に、10 分間有効な Herdr pairing link を生成してください。
 ```
 
-pairing address と一度だけ使える 6 桁 verification code が表示されます。新しいコンピュータ上の Coding Agent に次の一文を渡します。
+Herdr は Edge 上で直接 pairing を作成するため、古い workstation が online である必要はありません。ChatGPT は pairing address、単回使用の 6 桁 code、正確な expiry、コピー可能な `herdr-mcp worker connect "<pairing-address>"` をまとめて返します。認可済み Mac 上の `herdr-mcp worker pair` は CLI fallback として残ります。
+
+新しいコンピュータ上の Coding Agent に次の一文を渡します。
 
 ```text
 このコンピュータを既存の Herdr デバイス群へ接続してください。https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md に従い、pairing address は <pairing-address> を使い、CLI が要求した時だけ 6 桁 verification code を私に入力させ、完了後に同じ Worker 上でこのデバイスが online と表示されることを確認してください。

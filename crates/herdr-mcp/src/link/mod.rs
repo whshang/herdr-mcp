@@ -25,12 +25,14 @@ pub mod generation_refresh;
 pub mod heartbeat;
 pub mod install;
 pub mod io_loop;
+pub mod ladder;
 pub mod lifecycle;
 pub mod local_mcp;
 pub mod migrate_runtime_control;
 pub mod ownership;
 pub mod policy;
 pub mod proxy;
+pub mod relay_manifest;
 pub mod request_core;
 pub mod run;
 pub mod runner;
@@ -46,6 +48,13 @@ pub(crate) use generation_refresh::reconcile_after_service_generation_change;
 pub(crate) use generation_refresh::remove_fresh_owned_prod_link_after_failed_activation;
 pub use install::{
     LINK_RUST_CANDIDATE_LABEL, install as run_link_install, uninstall as run_link_uninstall,
+};
+#[allow(unused_imports)]
+pub use ladder::{
+    LadderError, RELAY_POLICY_DESCRIPTION, RELAY_POLICY_SLUG, RELAY_SELECTION_SLUG, RelayEndpoint,
+    TransportEvidence, TransportLadder, TransportRoute, TransportRouteKind, build_ladder_routes,
+    build_relay_edge_url, collect_transport_evidence, collect_transport_evidence_with_pool,
+    default_embedded_relays,
 };
 pub use migrate_runtime_control::{MigrateMode, run as run_link_migrate_runtime_control};
 pub use ownership::{

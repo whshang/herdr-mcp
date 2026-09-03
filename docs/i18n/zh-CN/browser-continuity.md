@@ -97,6 +97,10 @@ Browser extension
 
 真正的推理仍然由 Web AI 或本地 Agent 完成。
 
+这也是浏览器扩展最核心的存在理由。ChatGPT 在一个工具回合里可以把任务派给 Agent，但助手回复发出后，Web Planner 不能继续在后台轮询；Herdr 也不能直接反向启动新的模型推理回合。因此扩展把本机状态变化当作“继续推理”的触发信号：有真实新输出时可以发送有界 progress；`working → idle/done/blocked` 只唤醒一次；浏览器或 runtime 暂时断开时，重连还能补发离线期间发生的 settle。收到 wake 后，Web Planner 必须重新读取实时 Herdr/Git 状态，审查 Agent 产出和 diff；独立 branch/worktree 的完成结果在确认后再 cherry-pick/合并，并运行当前任务需要的验收。阻塞、失败、超时类结果继续诊断；wake 本身不能作为“任务已完成”的证据。
+
+这套行为也是 Rust/runtime 迭代必须保持的兼容契约。只要修改本地 runtime、Native Messaging 或事件传输，就要继续保证 browser binding、settle 单次唤醒、progress 去重、旧 source 拒绝、Native Messaging 信任边界、handoff/queue 迁移和扩展版本一致性这些回归项。
+
 ChatGPT Project 里，连续性的 binding 不再依赖某一个 conversation。workspace 直接绑定稳定 `project_id`，所以可以在 Project 首页先绑定；具体 `/c/<id>` 只作为当前 `active_conv_key`，决定 progress/continue 应投递到哪里。接力时 Project binding 与 continuity id 都不搬家，只在新 seed 确认后切换 active target。
 
 从 0.4.2 开始，已绑定会话的 finalized user / assistant turn 会通过 Native Messaging 增量写入本机 Rust `state.db` 的 Continuity Journal。浏览器准备接力时会实时向 Rust 确认当前 `continuity_id` 仍存在；确认成功后，新会话只需要携带这个 ID，并通过现有 `herdr_call(method="continuity.resume", ...)` 恢复有界的最近工作上下文，再重新检查实时 Herdr、runtime 与 Git 状态。
@@ -482,7 +486,7 @@ ChatGPT 还会虚拟化旧 DOM，所以“当前页面只挂着 5 条消息”�
 
 当前支持已绑定的 ChatGPT Project，以及稳定 `/c/<chat_id>` 的 z.ai 会话。手动接力在当前作用域 `自动 开` 或 `自动 关` 时都可以启动；新目标会话继承源会话的 Auto 状态。ChatGPT 接力只切换 Project binding 的 active target；z.ai 才迁移会话级 binding。接力期间源会话的自动 wake 暂停，workspace 仍有 working Agent 时则拒绝开始，避免 settled/wake 与 cutover 竞争。
 
-正常情况下仍优先让当前网页主模型生成 handoff packet，因为它持有最完整的会话上下文。如果页面已经显示单次对话硬上限、接力 prompt 无法提交，或者主模型在有界等待后已停止生成但仍没有给出摘要，Herdr 会改用 Options 中已配置的 OpenAI-compatible LLM 兜底。兜底模型接收经过上限裁剪的 user/assistant 会话 transcript，仍必须输出同一个经过校验的 `HERDR_HANDOFF_V1` packet，之后继续复用原有 target / seed / binding / continuity commit 安全链。
+手动 ChatGPT Project 接力会先解析持久化 Continuity Journal，并直接用 continuity reference 在同一 Project 的新会话中恢复，不再向源会话发送接力摘要请求。binding 中的 continuity 元数据缺失或过期时，本机 runtime 会按当前 conversation identity 找回同一条 chain。确实没有可用 Journal 时，才允许 Options 中已配置的 OpenAI-compatible LLM 从只读、经过上限裁剪的 source transcript 生成经过校验的 `HERDR_HANDOFF_V1` packet；两条来源都不可用时直接失败，当前会话和页面地址保持不变。自动接力、历史兼容路径和 conversation-scoped 站点继续遵循各自现有契约。
 
 z.ai 的 handoff 控制消息走 raw channel，不经过 JSON→MCP task wrapper，避免摘要请求被误解释成 coding task。
 

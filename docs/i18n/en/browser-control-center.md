@@ -36,6 +36,14 @@ The panel follows the same extension language setting as Options and the in-page
 - Simplified Chinese;
 - Japanese.
 
+## Worker devices
+
+The Control Center also shows a compact read-only Worker device list. It keeps device authorization, connection, and health separate and includes runtime version/generation plus last-seen freshness. The locally connected computer is marked explicitly, and local Link-generation mismatch is shown when the runtime can prove it.
+
+This view does not give Chrome a Worker credential. The Side Panel asks the extension service worker, which uses the existing Native Messaging / local-IPC path; the local runtime performs the owner-authorized Worker read and returns only the sanitized device summary. A joined member computer that does not have Worker-owner authority sees an explicit permission explanation instead of receiving broader fleet privileges.
+
+Device inventory is refreshed when the Control Center opens, on explicit Refresh, and when a stale hidden panel becomes visible again. It does not add a fixed polling loop.
+
 ## Current page follows the active browser tab
 
 The top **Current page** card is the bridge between browser context and local state. It asks the existing binding authority for the active Chrome tab and shows:

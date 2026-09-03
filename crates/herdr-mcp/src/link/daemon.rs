@@ -61,6 +61,10 @@ pub struct LinkDaemonConfig {
     pub runtime_control_path: PathBuf,
     pub runtime_status_path: PathBuf,
     pub runtime_control_poll_ms: u64,
+    pub public_origin: Option<String>,
+    pub link_upstream_origin: Option<String>,
+    pub preferred_route_kind: Option<super::ladder::TransportRouteKind>,
+    pub ladder: Option<super::ladder::TransportLadder>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +157,19 @@ pub fn read_link_daemon_config(
         ));
     }
 
+    let public_origin = optional_trimmed(env_map, "HERDR_PUBLIC_ORIGIN");
+    let link_upstream_origin = optional_trimmed(env_map, "HERDR_LINK_UPSTREAM_ORIGIN");
+    let preferred_route_kind = match optional_trimmed(env_map, "HERDR_LINK_ROUTE") {
+        None => None,
+        Some(value) if value == "auto" => None,
+        Some(value) if value == "relay" => Some(super::ladder::TransportRouteKind::SharedRelay),
+        Some(_) => {
+            return Err(DaemonConfigError::Message(
+                "HERDR_LINK_ROUTE must be auto or relay".to_owned(),
+            ));
+        }
+    };
+
     Ok(LinkDaemonConfig {
         edge_url,
         workstation_id,
@@ -167,6 +184,10 @@ pub fn read_link_daemon_config(
         runtime_control_path,
         runtime_status_path,
         runtime_control_poll_ms,
+        public_origin,
+        link_upstream_origin,
+        preferred_route_kind,
+        ladder: None,
     })
 }
 
@@ -262,6 +283,40 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
     let edge_url = build_edge_url(&config.edge_url, &config.workstation_id).map_err(|error| {
         format!("herdr-link daemon: cannot build edge url with workstation id: {error:?}")
     })?;
+    let mut ladder = match config.ladder {
+        Some(ladder) => ladder,
+        None => {
+            let proxy = match super::proxy::resolve_link_proxy_detailed() {
+                super::proxy::LinkProxyResolution::Proxy(p) => Some(p),
+                _ => None,
+            };
+            // Startup reads only the already validated last-known-good cache.
+            // Remote fetching is deliberately a separate bounded primitive: there
+            // is no safe asynchronous reload owner in this daemon yet.
+            let paths = crate::paths::RuntimePaths::discover()
+                .map_err(|error| format!("herdr-link daemon: runtime paths: {error}"))?;
+            let pool = super::relay_manifest::load_cached_pool(&paths, system_now_ms() / 1000);
+            let relays = pool.relays;
+            super::ladder::TransportLadder::from_config(
+                &config.edge_url,
+                config.public_origin.as_deref(),
+                config.link_upstream_origin.as_deref(),
+                &config.workstation_id,
+                proxy,
+                &relays,
+                super::ladder::DEFAULT_MAX_FAILURES_PER_ROUTE,
+            )
+            .map_err(|error| format!("herdr-link daemon: transport ladder error: {error}"))?
+        }
+    };
+    if let Some(kind) = config.preferred_route_kind
+        && !ladder.select_initial_route_kind(kind)
+    {
+        return Err(format!(
+            "herdr-link daemon: requested initial transport {} is unavailable",
+            kind.as_str()
+        ));
+    }
     let io_config = LinkIoConfig {
         edge_url,
         application_protocol: LINK_SUBPROTOCOL.to_owned(),
@@ -272,6 +327,7 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
         offline_recycle_ms: super::io_loop::LINK_DEFAULT_OFFLINE_RECYCLE_MS,
         now_ms: Arc::new(system_now_ms),
         rng_sample: Arc::new(system_rng_sample),
+        ladder: Some(ladder),
     };
     let io = LinkIoLoop::production(io_config, transport, runner);
 
@@ -439,6 +495,25 @@ mod tests {
         assert_eq!(cfg.runtime_version, None);
         assert_eq!(cfg.edge_url, "wss://herdr-edge-dev.example/ws");
         assert_eq!(cfg.workstation_id, "dev-w1");
+        assert_eq!(cfg.preferred_route_kind, None);
+    }
+
+    #[test]
+    fn daemon_config_accepts_only_bounded_initial_route_preferences() {
+        let relay = read_link_daemon_config(&env(&[("HERDR_LINK_ROUTE", "relay")]))
+            .expect("relay preference");
+        assert_eq!(
+            relay.preferred_route_kind,
+            Some(super::super::ladder::TransportRouteKind::SharedRelay)
+        );
+
+        let auto = read_link_daemon_config(&env(&[("HERDR_LINK_ROUTE", "auto")]))
+            .expect("auto preference");
+        assert_eq!(auto.preferred_route_kind, None);
+
+        let error = read_link_daemon_config(&env(&[("HERDR_LINK_ROUTE", "direct")]))
+            .expect_err("unsupported preference");
+        assert!(error.to_string().contains("must be auto or relay"));
     }
 
     #[test]
@@ -548,6 +623,10 @@ mod tests {
             runtime_control_path: control_path.clone(),
             runtime_status_path: status_path.clone(),
             runtime_control_poll_ms: 1_000,
+            public_origin: None,
+            link_upstream_origin: None,
+            preferred_route_kind: None,
+            ladder: None,
         };
 
         let base = RuntimeGenerationSpec {
@@ -611,6 +690,7 @@ mod tests {
                 offline_recycle_ms: crate::link::io_loop::LINK_DEFAULT_OFFLINE_RECYCLE_MS,
                 now_ms: Arc::new(|| 0),
                 rng_sample: Arc::new(|| 0.0),
+                ladder: None,
             },
             transport,
             runner,

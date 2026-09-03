@@ -1,0 +1,65 @@
+name: Chrome Web Store package
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'extension/**'
+      - 'contracts/browser-extension-store.json'
+      - 'contracts/browser-extension-store-listing.json'
+      - 'scripts/pack-extension.mjs'
+      - 'tests/browser-extension-store-contract.test.mjs'
+      - 'tests/browser-extension-store-listing.test.mjs'
+      - 'tests/pack-extension.test.mjs'
+      - 'tests/manual/extension_smoke.mjs'
+      - 'tests/manual/background_bind_test.mjs'
+      - '.github/workflows/extension-store.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chrome-web-store-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Store contract and browser regression gate
+        run: |
+          node --test \
+            tests/browser-control-plane.test.mjs \
+            tests/browser-extension-store-contract.test.mjs \
+            tests/browser-extension-store-listing.test.mjs \
+            tests/chatgpt-artifact-capture.test.mjs \
+            tests/continuity-journal.test.mjs \
+            tests/extension-auth.test.mjs \
+            tests/extension-local-auth.test.mjs \
+            tests/extension-native-host.test.mjs \
+            tests/extension-recovery.test.mjs \
+            tests/options-i18n.test.mjs \
+            tests/pack-extension.test.mjs \
+            tests/queued-insert.test.mjs
+          node tests/manual/extension_smoke.mjs
+          node tests/manual/background_bind_test.mjs
+      - name: Build upload-ready Store package
+        run: |
+          node scripts/pack-extension.mjs --out-dir store-artifact
+          VERSION="$(node -p "require('./extension/manifest.json').version")"
+          STORE_ID="$(node -p "require('./contracts/browser-extension-store.json').chrome_web_store.extension_id")"
+          printf 'extension_id=%s\nversion=%s\nsource_commit=%s\n' "$STORE_ID" "$VERSION" "$GITHUB_SHA" > store-artifact/STORE-RELEASE.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chrome-web-store-${{ github.sha }}
+          path: store-artifact/*
+          if-no-files-found: error
+          retention-days: 30

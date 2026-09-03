@@ -27,7 +27,9 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
-use super::proxy::{connect_via_http_proxy, resolve_link_proxy, wss_target};
+use super::proxy::{
+    LinkProxyResolution, ResolvedProxy, connect_via_proxy, resolve_link_proxy_detailed, wss_target,
+};
 use super::transport::{
     LINK_DEFAULT_MAX_FRAME_BYTES, LinkTransportCore, SocketAttemptId, TransportAction,
     TransportError,
@@ -471,26 +473,32 @@ pub fn feed_socket_event(
     }
 }
 
-/// Connect one production socket attempt. Connection failures are deliberately
-/// collapsed to a non-secret error; tungstenite handshake diagnostics may
-/// contain request metadata and must never expose the reversible auth protocol.
-pub async fn connect_socket_attempt(
+/// Connect one production socket attempt with an explicit resolved proxy
+/// configuration (or direct connection when `proxy` is `None`).
+pub async fn connect_socket_attempt_with_proxy(
     edge_url: &str,
     application_protocol: &str,
     link_token: &str,
     device_name: Option<&str>,
     attempt_id: SocketAttemptId,
     config: SocketDriverConfig,
+    proxy: Option<&ResolvedProxy>,
 ) -> Result<SocketAttemptHandle, SocketDriverError> {
     ensure_rustls_crypto_provider();
     let config = config.normalized();
     let request = client_request(edge_url, application_protocol, link_token, device_name)?;
-    let (socket, response) = if let Some(proxy) = resolve_link_proxy() {
+    let proxied_tcp = if let Some(proxy) = proxy {
         let (target_host, target_port) =
             wss_target(edge_url).ok_or(SocketDriverError::InvalidUrl)?;
-        let tcp = connect_via_http_proxy(&proxy.url, &target_host, target_port)
-            .await
-            .map_err(|_| SocketDriverError::ConnectFailed)?;
+        Some(
+            connect_via_proxy(&proxy.url, &target_host, target_port)
+                .await
+                .map_err(|_| SocketDriverError::ConnectFailed)?,
+        )
+    } else {
+        None
+    };
+    let (socket, response) = if let Some(tcp) = proxied_tcp {
         client_async_tls_with_config(request, tcp, Some(config.websocket_config()), None)
             .await
             .map_err(|_| SocketDriverError::ConnectFailed)?
@@ -524,6 +532,33 @@ pub async fn connect_socket_attempt(
         event_rx,
         task,
     })
+}
+
+/// Connect one production socket attempt. Connection failures are deliberately
+/// collapsed to a non-secret error; tungstenite handshake diagnostics may
+/// contain request metadata and must never expose the reversible auth protocol.
+pub async fn connect_socket_attempt(
+    edge_url: &str,
+    application_protocol: &str,
+    link_token: &str,
+    device_name: Option<&str>,
+    attempt_id: SocketAttemptId,
+    config: SocketDriverConfig,
+) -> Result<SocketAttemptHandle, SocketDriverError> {
+    let proxy = match resolve_link_proxy_detailed() {
+        LinkProxyResolution::Proxy(resolved) => Some(resolved),
+        _ => None,
+    };
+    connect_socket_attempt_with_proxy(
+        edge_url,
+        application_protocol,
+        link_token,
+        device_name,
+        attempt_id,
+        config,
+        proxy.as_ref(),
+    )
+    .await
 }
 
 async fn send_event(event_tx: &mpsc::Sender<WebSocketEvent>, event: WebSocketEvent) -> bool {

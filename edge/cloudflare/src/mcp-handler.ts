@@ -8,6 +8,7 @@ import { classifyOp, type EdgeLimits } from "./limits.js";
 import { checkArgsBudget } from "./payload.js";
 import { newRequestId } from "./pending.js";
 import type { DeviceRouteResult } from "./device-directory.js";
+import { normalizeDeviceId } from "./device-model.js";
 import type { InternalForwardRequest } from "./workstation-do.js";
 import {
   isChatgptOAuthClientId,
@@ -50,6 +51,14 @@ export interface McpDeps {
   forward(stub: unknown, body: string): Promise<Response>;
   getStub(workstationId: string): unknown;
   listDevices?(): Promise<unknown>;
+  createPairing?(input: { ttl_seconds?: number; name?: string }): Promise<
+    | { ok: true; pairing_id: string; code: string; expires_at_ms: number; pairing_address: string; worker_origin?: string }
+    | { ok: false; code: string; status?: number }
+  >;
+  revokeDevice?(deviceId: string): Promise<
+    | { ok: true; device_id: string; revoked_at_ms: number }
+    | { ok: false; code: string; retryable?: boolean; status?: number }
+  >;
   resolveDevice?(selector: string | undefined, args?: Record<string, unknown>): Promise<DeviceRouteResult>;
   logger: { warn(event: string, fields?: Record<string, unknown>): void };
   now?: () => number;
@@ -294,7 +303,12 @@ export async function handleMcp(
       }
       try {
         const devices = await deps.listDevices();
-        return rpcResult(id, callToolResult({ ok: true, devices }));
+        return rpcResult(id, callToolResult({
+          ok: true,
+          devices,
+          pairing_hint: "When the user asks to add a new computer or generate its setup link, call herdr_call(method=\"herdr_mcp.device.pair\", params='{\"ttl_seconds\":600,\"name\":\"<optional>\"}'). params is a JSON string in the public schema. Do not provide a device selector. Present the returned pairing address, one-time code, exact expiry, and new-device command together.",
+          revoke_hint: "When the user explicitly asks to permanently revoke an enrolled computer, select its immutable device_id from this list and call herdr_call(method=\"herdr_mcp.device.revoke\", params='{\"device_id\":\"dev_...\",\"confirm\":true}'). Never revoke by display name. Revoke is permanent for that device identity and credential.",
+        }));
       } catch {
         return rpcResult(
           id,
@@ -303,11 +317,277 @@ export async function handleMcp(
       }
     }
 
+    const localMethod = name === "herdr_call" && typeof args.method === "string" ? args.method : null;
+
+    // Edge-local pairing creation: allows an OAuth-authorized owner to initiate
+    // a device pairing session directly at Edge without requiring an enrolled
+    // or online workstation.
+    if (localMethod === "herdr_mcp.device.pair") {
+      if (args.device !== undefined) {
+        return rpcResult(id, callToolResult({
+          ok: false,
+          code: "device_selector_not_allowed",
+          message: "herdr_mcp.device.pair is Edge-local and does not accept a device selector; no existing workstation is required or used",
+          retryable: false,
+          delivery_state: "not_delivered",
+          failure_layer: "edge_routing",
+        }, true));
+      }
+
+      for (const key of Object.keys(args)) {
+        if (key !== "method" && key !== "params") {
+          return rpcResult(id, callToolResult({
+            ok: false,
+            code: "invalid_params",
+            message: `unknown top-level argument '${key}'; herdr_call with method 'herdr_mcp.device.pair' only accepts 'method' and optional 'params'`,
+            retryable: false,
+            delivery_state: "not_delivered",
+            failure_layer: "edge_routing",
+          }, true));
+        }
+      }
+      let methodParams: Record<string, unknown> = {};
+      const rawParams = args.params;
+      if (rawParams !== undefined && rawParams !== null) {
+        if (typeof rawParams === "string") {
+          const trimmed = rawParams.trim();
+          if (trimmed.length > 0) {
+            try {
+              const parsed = JSON.parse(trimmed);
+              if (isRecord(parsed)) {
+                methodParams = parsed;
+              } else {
+                return rpcResult(
+                  id,
+                  callToolResult({ ok: false, code: "invalid_params", message: "params must be a JSON object" }, true),
+                );
+              }
+            } catch {
+              return rpcResult(
+                id,
+                callToolResult({ ok: false, code: "invalid_params", message: "params is not valid JSON" }, true),
+              );
+            }
+          }
+        } else if (isRecord(rawParams)) {
+          methodParams = rawParams;
+        } else {
+          return rpcResult(
+            id,
+            callToolResult({ ok: false, code: "invalid_params", message: "params must be an object or a JSON object string" }, true),
+          );
+        }
+      }
+
+      const { extractDeviceIdFromArgs } = await import("./device-refs.js");
+      if (extractDeviceIdFromArgs(args) || extractDeviceIdFromArgs(methodParams)) {
+        return rpcResult(id, callToolResult({
+          ok: false,
+          code: "device_ref_not_allowed",
+          message: "herdr_mcp.device.pair is Edge-local and does not accept workstation or pane refs",
+          retryable: false,
+          delivery_state: "not_delivered",
+          failure_layer: "edge_routing",
+        }, true));
+      }
+
+      for (const key of Object.keys(methodParams)) {
+        if (key !== "ttl_seconds" && key !== "name") {
+          return rpcResult(
+            id,
+            callToolResult({
+              ok: false,
+              code: "invalid_params",
+              message: `unknown parameter '${key}'; allowed parameters for herdr_mcp.device.pair are 'ttl_seconds' and 'name'`,
+              retryable: false,
+            }, true),
+          );
+        }
+      }
+
+      let ttlSeconds: number | undefined;
+      if (methodParams.ttl_seconds !== undefined) {
+        if (
+          typeof methodParams.ttl_seconds !== "number" ||
+          !Number.isSafeInteger(methodParams.ttl_seconds) ||
+          methodParams.ttl_seconds < 60 ||
+          methodParams.ttl_seconds > 600
+        ) {
+          return rpcResult(
+            id,
+            callToolResult({
+              ok: false,
+              code: "invalid_pairing_ttl",
+              message: "ttl_seconds must be a safe integer between 60 and 600 seconds",
+              retryable: false,
+            }, true),
+          );
+        }
+        ttlSeconds = methodParams.ttl_seconds;
+      }
+
+      let pairingName: string | undefined;
+      if (methodParams.name !== undefined) {
+        if (
+          typeof methodParams.name !== "string" ||
+          methodParams.name.trim().length === 0 ||
+          methodParams.name.length > 128
+        ) {
+          return rpcResult(
+            id,
+            callToolResult({
+              ok: false,
+              code: "invalid_device_name",
+              message: "name must be a non-empty string up to 128 characters",
+              retryable: false,
+            }, true),
+          );
+        }
+        pairingName = methodParams.name.trim();
+      }
+
+      if (!deps.createPairing) {
+        return rpcResult(
+          id,
+          callToolResult({ ok: false, code: "pairing_unavailable", retryable: false }, true),
+        );
+      }
+      try {
+        const result = await deps.createPairing({ ttl_seconds: ttlSeconds, name: pairingName });
+        if (!result.ok) {
+          return rpcResult(
+            id,
+            callToolResult({ ok: false, code: result.code, retryable: false }, true),
+          );
+        }
+        const expiresAt = new Date(result.expires_at_ms).toISOString();
+        return rpcResult(
+          id,
+          callToolResult({
+            ok: true,
+            pairing_id: result.pairing_id,
+            code: result.code,
+            expires_at_ms: result.expires_at_ms,
+            expires_at: expiresAt,
+            ttl_seconds: ttlSeconds ?? 600,
+            pairing_address: result.pairing_address,
+            worker_origin: result.worker_origin,
+            new_device_command: `herdr-mcp worker connect "${result.pairing_address}"`,
+            instructions: `This one-time pairing expires at ${expiresAt}. Run on the new computer: herdr-mcp worker connect "${result.pairing_address}" and enter verification code ${result.code} only when the no-echo prompt asks for it.`,
+          }),
+        );
+      } catch {
+        return rpcResult(
+          id,
+          callToolResult({ ok: false, code: "pairing_create_failed", retryable: true }, true),
+        );
+      }
+    }
+
+    // Edge-local owner revoke: permanently revoke one enrolled immutable device
+    // identity without requiring any workstation to be online. This stays under
+    // the existing herdr_call public tool, so it does not change contract epoch
+    // or tool count.
+    if (localMethod === "herdr_mcp.device.revoke") {
+      for (const key of Object.keys(args)) {
+        if (key !== "method" && key !== "params") {
+          return rpcResult(id, callToolResult({
+            ok: false,
+            code: "invalid_params",
+            message: `unknown top-level argument '${key}'; herdr_call with method 'herdr_mcp.device.revoke' only accepts 'method' and 'params'`,
+            retryable: false,
+            delivery_state: "not_delivered",
+            failure_layer: "edge_routing",
+          }, true));
+        }
+      }
+
+      let methodParams: Record<string, unknown> = {};
+      const rawParams = args.params;
+      if (typeof rawParams === "string") {
+        const trimmed = rawParams.trim();
+        if (trimmed.length > 0) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            if (!isRecord(parsed)) {
+              return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: "params must be a JSON object" }, true));
+            }
+            methodParams = parsed;
+          } catch {
+            return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: "params is not valid JSON" }, true));
+          }
+        }
+      } else if (isRecord(rawParams)) {
+        methodParams = rawParams;
+      } else {
+        return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: "params must be an object or a JSON object string" }, true));
+      }
+
+      for (const key of Object.keys(methodParams)) {
+        if (key !== "device_id" && key !== "confirm") {
+          return rpcResult(id, callToolResult({
+            ok: false,
+            code: "invalid_params",
+            message: `unknown parameter '${key}'; allowed parameters for herdr_mcp.device.revoke are 'device_id' and 'confirm'`,
+            retryable: false,
+          }, true));
+        }
+      }
+
+      if (typeof methodParams.device_id !== "string") {
+        return rpcResult(id, callToolResult({
+          ok: false,
+          code: "invalid_device_id",
+          message: "device_id must be one immutable enrolled device id",
+          retryable: false,
+        }, true));
+      }
+      const deviceId = normalizeDeviceId(methodParams.device_id);
+      if (!deviceId) {
+        return rpcResult(id, callToolResult({
+          ok: false,
+          code: "invalid_device_id",
+          message: "device_id must be a canonical dev_<26-character ULID> identity; display names are not accepted",
+          retryable: false,
+        }, true));
+      }
+      if (methodParams.confirm !== true) {
+        return rpcResult(id, callToolResult({
+          ok: false,
+          code: "confirmation_required",
+          message: "permanent device revoke requires confirm=true",
+          retryable: false,
+          delivery_state: "not_delivered",
+        }, true));
+      }
+      if (!deps.revokeDevice) {
+        return rpcResult(id, callToolResult({ ok: false, code: "device_revoke_unavailable", retryable: false }, true));
+      }
+      try {
+        const result = await deps.revokeDevice(deviceId);
+        if (!result.ok) {
+          return rpcResult(id, callToolResult({
+            ok: false,
+            code: result.code,
+            retryable: result.retryable ?? false,
+          }, true));
+        }
+        return rpcResult(id, callToolResult({
+          ok: true,
+          device_id: result.device_id,
+          revoked: true,
+          revoked_at_ms: result.revoked_at_ms,
+          message: "Device authorization permanently revoked. Its old credential cannot reconnect; re-enrollment requires a new pairing and device identity.",
+        }));
+      } catch {
+        return rpcResult(id, callToolResult({ ok: false, code: "device_revoke_failed", retryable: true }, true));
+      }
+    }
+
     const selectorValue = args.device;
     if (selectorValue !== undefined && typeof selectorValue !== "string") {
       return rpcError(id, -32602, "Invalid params", { reason: "device must be a string" });
     }
-    const localMethod = name === "herdr_call" && typeof args.method === "string" ? args.method : null;
     const explicitTextDevice = localMethod === "herdr_mcp.text.read" || localMethod === "herdr_mcp.text.write";
     if (explicitTextDevice) {
       if (typeof selectorValue !== "string" || selectorValue.trim().length === 0) {

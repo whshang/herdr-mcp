@@ -20,10 +20,18 @@ The goal is to remove the bootstrap credential from the normal workflow as soon 
 The project helper creates a token scoped to:
 
 - **Workers Routes Write** for the target zone;
-- **Workers Scripts Write** for the corresponding account;
-- **Workers R2 Storage Write** for the corresponding account, so Worker setup can create and verify the private artifact bucket before deploy.
+- **Workers Scripts Write** for the corresponding account.
 
-It does not request broad account administrator access by default. Cloudflare may label the R2 capability as **Workers R2 Storage:Edit** in parts of the UI; the API permission-group name used by the helper is **Workers R2 Storage Write**.
+It does not request broad account administrator access or R2 access by default. The private R2 artifact relay is an explicit optional capability: enable it only when needed, after the operator accepts Cloudflare's R2 subscription/payment setup, and then use a separately R2-capable deployment credential for bucket provisioning.
+
+### Core install vs optional artifact relay
+
+Split the permissions the same way the product splits capabilities:
+
+- **Core install** needs only **Workers Scripts Write** for the account (a manually created token should also carry Account Settings Read, Memberships Read, and User Details Read). The core deploy is Workers + Durable Objects on `workers.dev` and must succeed on Workers Free without R2, without a bound payment card, and without the R2 permission.
+- **Optional artifact relay** adds **Workers R2 Storage Write** only when the user explicitly enables artifact relay, together with any Cloudflare R2 billing/subscription step. Do not request it speculatively.
+
+A 403 on a specific call from a token that verifies as active means a missing permission, not a broken token: `GET .../workers/subdomain` → Account Settings Read; Worker script deploy → Workers Scripts Write; R2 provisioning → the optional Workers R2 Storage Write. Name the missing permission, grant exactly that, and retry. Do not report it as a generic deployment failure.
 
 A pure `workers.dev` deployment may not need a zone route for every operation. Grant only the permissions required by the deployment path you actually use.
 
@@ -104,7 +112,7 @@ A good verification confirms:
 - correct account identity;
 - Workers Scripts access;
 - Workers Routes access for the target zone where required;
-- Workers R2 Storage access for private artifact-bucket provisioning.
+- Workers R2 Storage access for private artifact-bucket provisioning (verified only when the optional artifact relay is enabled; a core install deliberately omits it).
 
 When deployment fails, distinguish credential failure from Worker/DO configuration failure.
 

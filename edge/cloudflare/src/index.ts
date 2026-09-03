@@ -483,6 +483,43 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
           (id) => env.WORKSTATION_DO.get(env.WORKSTATION_DO.idFromName(id)),
         );
       },
+      createPairing: async (input) => {
+        const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+        const pairingInput = {
+          worker_context: pairingWorkerContext(env),
+          ttl_seconds: input?.ttl_seconds,
+          name: input?.name,
+        };
+        const result = await createPairingSession(registry, pairingInput);
+        if (!result.ok) {
+          return { ok: false, code: result.code, status: result.status };
+        }
+        const pairingAddress = `${url.origin}/pair#${result.pairing.pairing_id}`;
+        return {
+          ok: true,
+          pairing_id: result.pairing.pairing_id,
+          code: result.pairing.code,
+          expires_at_ms: result.pairing.expires_at_ms,
+          worker_origin: url.origin,
+          pairing_address: pairingAddress,
+        };
+      },
+      revokeDevice: async (deviceId) => {
+        const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+        const result = await revokeRegisteredDevice(registry, deviceId);
+        if (!result.ok) {
+          return {
+            ok: false,
+            code: result.code,
+            retryable: result.retryable,
+          };
+        }
+        return {
+          ok: true,
+          device_id: result.device_id,
+          revoked_at_ms: result.revoked_at_ms,
+        };
+      },
       resolveDevice: async (selector, args) => {
         const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
         return resolveDeviceRouteWithContext(registry, { selector, args: args as Record<string, unknown> | undefined, legacyWorkstationId: workstationId });

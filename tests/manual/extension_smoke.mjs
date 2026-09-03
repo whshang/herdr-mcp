@@ -77,9 +77,15 @@ const controlCenterSource = readFileSync(path.join(EXT, "control-center.js"), "u
 const controlCenterCss = readFileSync(path.join(EXT, "control-center.css"), "utf8");
 const controlActionsSource = readFileSync(path.join(EXT, "control-actions.js"), "utf8");
 const controlCenterModelSource = readFileSync(path.join(EXT, "control-center-model.js"), "utf8");
-ok(manifest.version === "0.1.88", "manifest version stays aligned with the browser product build");
-ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.88"'), "background version matches manifest");
-ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.88"'), "content version matches manifest");
+ok(manifest.version === "0.1.90", "manifest version stays aligned with the browser product build");
+ok(backgroundSource.includes('const H2W_SCRIPT_VERSION = "0.1.90"'), "background version matches manifest");
+ok(wakeSource.includes('const H2W_CONTENT_VERSION = "0.1.90"'), "content version matches manifest");
+ok(controlCenterHtml.includes('id="deviceToggleButton"')
+    && controlCenterHtml.includes('id="devicePanelBody"')
+    && controlCenterSource.includes('DEVICE_PANEL_COLLAPSED_KEY')
+    && controlCenterSource.includes('persistDevicePanelCollapse')
+    && controlCenterSource.includes('device?.authorization !== "revoked"'),
+  "Control Center device inventory is independently collapsible and defensively hides revoked tombstones");
 const ownerGateIndex = wakeSource.indexOf('type: "h2w_extension_owner_status"');
 const queueOwnerClaimIndex = wakeSource.indexOf('setAttribute(QUEUED_INSERT_OWNER_ATTR');
 ok(ownerGateIndex >= 0
@@ -655,6 +661,19 @@ for (const code of ["en", "zh", "ja"]) {
 const enLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "en.json"), "utf8"));
 const zhLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "zh.json"), "utf8"));
 const jaLocale = JSON.parse(readFileSync(path.join(EXT, "locales", "ja.json"), "utf8"));
+for (const [code, locale] of [["en", enLocale], ["zh", zhLocale], ["ja", jaLocale]]) {
+  const settledWake = locale.default_wake_template || "";
+  ok(settledWake.includes("cherry-pick") && settledWake.includes("Herdr/Git"),
+    `${code} settled wake returns control to the Web planner with live-state review`);
+}
+ok(enLocale.default_wake_template.includes("acceptance checks")
+    && zhLocale.default_wake_template.includes("验收")
+    && jaLocale.default_wake_template.includes("検証"),
+  "settled wake requires post-Agent integration/acceptance instead of treating wake as completion");
+ok(enLocale.default_wake_template.includes("Do not mark the task complete from this wake alone")
+    && zhLocale.default_wake_template.includes("不要仅凭这条 wake 判定任务完成")
+    && jaLocale.default_wake_template.includes("この wake だけで完了扱いにせず"),
+  "settled wake is continuation evidence, never completion evidence");
 ok([enLocale, zhLocale, jaLocale].every((locale) => !Object.keys(locale).some((key) => key.startsWith("popup_"))),
   "deleted toolbar Popup leaves no dead popup locale identity");
 ok(zhLocale.hud_manual_continue === "继续", "zh HUD continue label is exact");
@@ -774,8 +793,10 @@ ok(!readFileSync(path.join(EXT, "options.js"), "utf8").includes('$("autoAllow")'
   "permission-card automation is folded into effective Project automation");
 ok(wakeDocEn.includes("The HUD exposes Continue / Check Herdr / LLM decide plus Manual handoff")
     && wakeDocZh.includes("HUD 提供 `继续 / 查 Herdr / LLM 判断`")
-    && wakeDocEn.includes("configured OpenAI-compatible LLM as a fallback")
-    && wakeDocZh.includes("OpenAI-compatible LLM 兜底"),
+    && wakeDocEn.includes("configured OpenAI-compatible LLM may create")
+    && wakeDocEn.includes("leaves the current conversation unchanged")
+    && wakeDocZh.includes("已配置的 OpenAI-compatible LLM")
+    && wakeDocZh.includes("当前会话和页面地址保持不变"),
   "Wake docs place manual handoff in the HUD and document the configured LLM fallback");
 const actionClickStart = backgroundSource.indexOf("chrome.action.onClicked.addListener");
 const actionClickEnd = actionClickStart >= 0 ? backgroundSource.indexOf("void rebuildStreams();", actionClickStart) : -1;
@@ -866,8 +887,12 @@ ok(controlCenterSource.includes('const EXPANDED_WORKSPACES_KEY = "herdrControlEx
     && controlCenterSource.includes('restoreExpansionPreference(stored[EXPANDED_WORKSPACES_KEY])')
     && controlCenterSource.includes('[EXPANDED_WORKSPACES_KEY]: [...expandedWorkspaces].sort()')
     && controlCenterSource.includes('void persistExpansionPreference();')
-    && controlCenterSource.includes('chrome.storage.local.get([TARGET_KEY, EXPANDED_WORKSPACES_KEY])'),
-  "Control Center persists explicit workspace expansion state so panel reloads cannot reopen user-collapsed rows");
+    && controlCenterSource.includes('const DEVICE_PANEL_COLLAPSED_KEY = "herdrControlDevicePanelCollapsed"')
+    && controlCenterSource.includes('chrome.storage.local.get([')
+    && controlCenterSource.includes('TARGET_KEY,')
+    && controlCenterSource.includes('EXPANDED_WORKSPACES_KEY,')
+    && controlCenterSource.includes('DEVICE_PANEL_COLLAPSED_KEY,'),
+  "Control Center persists explicit workspace and device-panel expansion state so panel reloads cannot reopen user-collapsed regions");
 ok(chatGptAdapterSource.includes("getStopButtonCandidates()")
     && chatGptAdapterSource.includes('button[data-testid="stop-button"]')
     && !wakeSource.includes('document.querySelectorAll("button, [role=button]").filter')
@@ -986,6 +1011,9 @@ ok(!d.wake && d.status === "working", "working arms without waking");
 // Settled after working wakes once.
 d = decideWake({ status: "working", lastSettle: null }, "settled", { status: "done", seq: 11 });
 ok(d.wake && d.status === "done" && d.lastSettle.seq === 11, "working to settled wakes once");
+// A blocked/timeout-like terminal state also returns control to the Web planner.
+d = decideWake({ status: "working", lastSettle: null }, "settled", { status: "blocked", seq: "blocked-11" });
+ok(d.wake && d.status === "blocked", "working to blocked wakes for planner recovery");
 // Duplicate sequence does not wake.
 d = decideWake({ status: "done", lastSettle: { seq: 11, at: 1 } }, "settled", { status: "done", seq: 11 });
 ok(!d.wake, "duplicate settle sequence does not wake");

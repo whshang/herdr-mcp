@@ -4,6 +4,8 @@
 //! It answers: who owns Link today, and which gates still block
 //! `production_ready=true` for G5.
 
+use crate::config::Config;
+use crate::instance::InstanceId;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -553,11 +555,46 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
         "absent"
     };
 
+    let config_path = home.join(".config").join("herdr-mcp").join("config.toml");
+    let config = Config::load_for_instance(&config_path, &InstanceId::default_instance()).ok();
+    let edge_public_origin = config.as_ref().and_then(|c| c.edge_public_origin.clone());
+    let link_upstream_origin = config
+        .as_ref()
+        .and_then(|c| c.edge_link_upstream_origin.clone());
+    let relay_pool = crate::link::relay_manifest::load_cached_pool_from_config_dir(
+        config_dir,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+            .unwrap_or(0),
+    );
+    let transport_evidence = crate::link::collect_transport_evidence_with_pool(
+        edge_public_origin.as_deref(),
+        link_upstream_origin.as_deref(),
+        &relay_pool.relays,
+        relay_pool.source,
+    );
+
     json!({
         "ok": true,
         "cutover_performed": false,
         "production_owner": production_owner,
         "production_ready_eligible": all_ok,
+        "edge_public_origin": edge_public_origin,
+        "link_upstream_origin": link_upstream_origin,
+        "transport": {
+            "mcp_origin": transport_evidence.mcp_origin,
+            "link_upstream": transport_evidence.link_upstream,
+            "live_transport": transport_evidence.live_transport,
+            "configured_preferred_transport": transport_evidence.configured_preferred_transport,
+            "proxy_source": transport_evidence.proxy_source,
+            "relay": transport_evidence.relay,
+            "relay_policy": transport_evidence.relay_policy,
+            "relay_selection": transport_evidence.relay_selection,
+            "pool_source": transport_evidence.pool_source,
+            "failover_ready": transport_evidence.failover_ready,
+            "candidate_count": transport_evidence.candidate_count,
+        },
         "gates": gates.iter().map(|gate| json!({
             "id": gate.id,
             "ok": gate.ok,
@@ -589,6 +626,7 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
             "Read-only report. Does not mutate launchd, plists, or Node Link.",
             "Candidate label is dev.herdr-mcp.link-rust-candidate (link install/uninstall); never confuses with live Node link/link-prod.",
             "Live production cutover requires independent dual verification; see docs/link-production-cutover.md",
+            crate::link::RELAY_POLICY_DESCRIPTION,
         ],
     })
 }

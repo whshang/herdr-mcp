@@ -1082,6 +1082,15 @@ mod macos {
         config_dir: &Path,
         instance: &InstanceId,
     ) -> Result<Vec<LaunchAgentRemoval>, String> {
+        preflight_launch_agents_with(home, config_dir, instance, launchd_loaded)
+    }
+
+    fn preflight_launch_agents_with<Loaded: Fn(&str) -> Result<bool, String>>(
+        home: &Path,
+        config_dir: &Path,
+        instance: &InstanceId,
+        loaded: Loaded,
+    ) -> Result<Vec<LaunchAgentRemoval>, String> {
         let mut plans = Vec::new();
         if instance.is_default() {
             for label in [
@@ -1089,33 +1098,37 @@ mod macos {
                 LINK_PROD_LABEL,
                 crate::link::LINK_RUST_CANDIDATE_LABEL,
             ] {
-                plans.push(preflight_link_agent(home, config_dir, label)?);
+                plans.push(preflight_link_agent_with(home, config_dir, label, &loaded)?);
             }
+            plans.push(preflight_herdr_supervisor_with(home, config_dir, &loaded)?);
         }
-        plans.push(preflight_watchdog(
+        plans.push(preflight_watchdog_with(
             home,
             config_dir,
             &instance.watchdog_label(),
             "watchdog.sh",
+            &loaded,
         )?);
-        plans.push(preflight_watchdog(
+        plans.push(preflight_watchdog_with(
             home,
             config_dir,
             &instance.health_watchdog_label(),
             "health-watchdog.sh",
+            &loaded,
         )?);
         Ok(plans)
     }
 
-    fn preflight_link_agent(
+    fn preflight_link_agent_with<Loaded: Fn(&str) -> Result<bool, String>>(
         home: &Path,
         config_dir: &Path,
         label: &str,
+        loaded: Loaded,
     ) -> Result<LaunchAgentRemoval, String> {
         let path = launch_agent_path(home, label);
-        let loaded = launchd_loaded(label)?;
+        let is_loaded = loaded(label)?;
         if !path_present(&path) {
-            if loaded {
+            if is_loaded {
                 return Err(format!(
                     "uninstall found loaded Link {label} without an inspectable plist; refusing blind removal"
                 ));
@@ -1221,16 +1234,65 @@ mod macos {
         Ok(script.ends_with(Path::new("dist/link/macos-daemon.js")))
     }
 
-    fn preflight_watchdog(
+    fn preflight_herdr_supervisor_with<Loaded: Fn(&str) -> Result<bool, String>>(
+        home: &Path,
+        config_dir: &Path,
+        loaded: Loaded,
+    ) -> Result<LaunchAgentRemoval, String> {
+        let label = crate::instance::DEFAULT_HERDR_SUPERVISOR_LABEL;
+        let path = launch_agent_path(home, label);
+        let is_loaded = loaded(label)?;
+        if !path_present(&path) {
+            if is_loaded {
+                return Err(format!(
+                    "uninstall found loaded Herdr supervisor {label} without an inspectable plist"
+                ));
+            }
+            return Ok(absent_plan(label, path));
+        }
+        reject_symlink(&path, "Herdr supervisor plist")?;
+        let value = plist::Value::from_file(&path)
+            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+        let dict = value
+            .as_dictionary()
+            .ok_or_else(|| "Herdr supervisor plist root must be a dictionary".to_owned())?;
+        let plist_label = dict
+            .get("Label")
+            .and_then(plist::Value::as_string)
+            .unwrap_or("");
+        let args = plist_program_arguments_from_dict(dict)?;
+        let expected_binary = config_dir.join("runtime/current/herdr-mcp");
+        let expected_args = vec![
+            expected_binary.to_string_lossy().into_owned(),
+            "herdr-supervisor".to_owned(),
+            "run".to_owned(),
+        ];
+        let owned = plist_label == label && args == expected_args;
+        if !owned {
+            return Err(format!(
+                "Herdr supervisor {label} does not match the exact owned argv contract ({} herdr-supervisor run)",
+                expected_binary.display()
+            ));
+        }
+        Ok(LaunchAgentRemoval {
+            label: label.to_owned(),
+            path,
+            present: true,
+            reason: "owned herdr-mcp dependency supervisor".to_owned(),
+        })
+    }
+
+    fn preflight_watchdog_with<Loaded: Fn(&str) -> Result<bool, String>>(
         home: &Path,
         config_dir: &Path,
         label: &str,
         script_basename: &str,
+        loaded: Loaded,
     ) -> Result<LaunchAgentRemoval, String> {
         let path = launch_agent_path(home, label);
-        let loaded = launchd_loaded(label)?;
+        let is_loaded = loaded(label)?;
         if !path_present(&path) {
-            if loaded {
+            if is_loaded {
                 return Err(format!(
                     "uninstall found loaded watchdog {label} without an inspectable plist"
                 ));
@@ -2360,6 +2422,124 @@ mod macos {
             assert_eq!(loaded.completed, journal.completed);
             assert!(
                 validate_journal(&loaded, &config, &InstanceId::parse("uat").unwrap()).is_err()
+            );
+            let _ = fs::remove_dir_all(home);
+        }
+
+        #[test]
+        fn herdr_supervisor_requires_exact_owned_argv_and_label() {
+            let home = temp_home("supervisor");
+            let config = home.join(".config/herdr-mcp");
+            fs::create_dir_all(&config).unwrap();
+            let label = crate::instance::DEFAULT_HERDR_SUPERVISOR_LABEL;
+            let path = launch_agent_path(&home, label);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+            let mut dict = plist::Dictionary::new();
+            dict.insert("Label".to_owned(), plist::Value::String(label.to_owned()));
+            dict.insert(
+                "ProgramArguments".to_owned(),
+                plist::Value::Array(vec![
+                    plist::Value::String(
+                        config
+                            .join("runtime/current/herdr-mcp")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    plist::Value::String("herdr-supervisor".to_owned()),
+                    plist::Value::String("run".to_owned()),
+                ]),
+            );
+            plist::Value::Dictionary(dict.clone())
+                .to_file_xml(&path)
+                .unwrap();
+
+            let plan = preflight_herdr_supervisor_with(&home, &config, |_| Ok(false)).unwrap();
+            assert!(plan.present);
+            assert_eq!(plan.label, label);
+            assert_eq!(plan.reason, "owned herdr-mcp dependency supervisor");
+
+            // Foreign label must fail closed
+            dict.insert(
+                "Label".to_owned(),
+                plist::Value::String("foreign.supervisor".to_owned()),
+            );
+            plist::Value::Dictionary(dict.clone())
+                .to_file_xml(&path)
+                .unwrap();
+            assert!(preflight_herdr_supervisor_with(&home, &config, |_| Ok(false)).is_err());
+
+            // Wrong subcommand must fail closed
+            dict.insert("Label".to_owned(), plist::Value::String(label.to_owned()));
+            dict.insert(
+                "ProgramArguments".to_owned(),
+                plist::Value::Array(vec![
+                    plist::Value::String(
+                        config
+                            .join("runtime/current/herdr-mcp")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    plist::Value::String("herdr-supervisor".to_owned()),
+                    plist::Value::String("status".to_owned()),
+                ]),
+            );
+            plist::Value::Dictionary(dict).to_file_xml(&path).unwrap();
+            assert!(preflight_herdr_supervisor_with(&home, &config, |_| Ok(false)).is_err());
+
+            let _ = fs::remove_dir_all(home);
+        }
+
+        #[test]
+        fn preflight_launch_agents_isolates_named_instances_from_default_cohort() {
+            let home = temp_home("cohort-isolation");
+            let default_config = home.join(".config/herdr-mcp");
+            let named_config = home.join(".config/herdr-mcp-uat");
+            fs::create_dir_all(&default_config).unwrap();
+            fs::create_dir_all(&named_config).unwrap();
+            let agents = home.join("Library/LaunchAgents");
+            fs::create_dir_all(&agents).unwrap();
+
+            let default_id = InstanceId::default_instance();
+            let named_id = InstanceId::parse("uat").unwrap();
+
+            // Default instance preflight includes Link agents and Herdr supervisor
+            let default_plans =
+                preflight_launch_agents_with(&home, &default_config, &default_id, |_| Ok(false))
+                    .unwrap();
+            assert!(
+                default_plans
+                    .iter()
+                    .any(|p| p.label == crate::instance::DEFAULT_HERDR_SUPERVISOR_LABEL)
+            );
+            assert!(default_plans.iter().any(|p| p.label == LINK_PROD_LABEL));
+
+            // Named instance preflight strictly excludes default supervisor and links
+            let named_plans =
+                preflight_launch_agents_with(&home, &named_config, &named_id, |_| Ok(false))
+                    .unwrap();
+            assert!(
+                !named_plans
+                    .iter()
+                    .any(|p| p.label == crate::instance::DEFAULT_HERDR_SUPERVISOR_LABEL)
+            );
+            assert!(!named_plans.iter().any(|p| p.label == LINK_PROD_LABEL));
+            assert!(!named_plans.iter().any(|p| p.label == LINK_LABEL));
+
+            let _ = fs::remove_dir_all(home);
+        }
+
+        #[test]
+        fn cutover_backup_paths_are_strictly_outside_launch_agents() {
+            let home = temp_home("backup-path");
+            let backup = crate::link::cutover::prod_plist_backup_path(&home);
+            assert!(
+                !backup.starts_with(home.join("Library/LaunchAgents")),
+                "backup must never be placed in ~/Library/LaunchAgents"
+            );
+            assert!(
+                backup.starts_with(home.join(".config/herdr-mcp/backups")),
+                "backup must live under herdr-mcp backup storage"
             );
             let _ = fs::remove_dir_all(home);
         }

@@ -421,6 +421,19 @@ export function connectUpstreamWebSocket(
 /**
  * Wire bidirectional frames between client and already-open upstream WebSocket.
  */
+export function holdRelaySocketLifetime(
+  socket: Pick<WebSocket, "addEventListener">,
+  waitUntil?: (promise: Promise<unknown>) => void,
+): void {
+  if (!waitUntil) return;
+  const lifetime = new Promise<void>((resolve) => {
+    const done = () => resolve();
+    socket.addEventListener("close", done, { once: true });
+    socket.addEventListener("error", done, { once: true });
+  });
+  waitUntil(lifetime);
+}
+
 export function bindRelaySockets(
   clientWs: WebSocket,
   upstreamWs: WebSocket,
@@ -538,9 +551,19 @@ export async function handleRequest(
     mockHealthPort?: number;
     mockFetch?: typeof fetch;
     mockUpstreamFactory?: (url: string, protocols: string[]) => WebSocket;
+    pathPrefix?: string;
+    waitUntil?: (promise: Promise<unknown>) => void;
   },
 ): Promise<Response> {
   const url = new URL(req.url);
+  if (options?.pathPrefix) {
+    const prefix = options.pathPrefix.replace(/\/+$/, "");
+    if (url.pathname === prefix) {
+      url.pathname = "/";
+    } else if (url.pathname.startsWith(`${prefix}/`)) {
+      url.pathname = url.pathname.slice(prefix.length);
+    }
+  }
 
   // Health endpoint
   if (
@@ -646,6 +669,7 @@ export async function handleRequest(
     });
 
     bindRelaySockets(clientWs, upstreamResult.ws);
+    holdRelaySocketLifetime(clientWs, options?.waitUntil);
     return response;
   }
 

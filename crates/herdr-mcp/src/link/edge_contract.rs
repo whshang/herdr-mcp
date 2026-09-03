@@ -19,12 +19,20 @@ pub struct EdgeHealthContract {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdgeContractError {
+    TransportUnavailable(String),
     Message(String),
+}
+
+impl EdgeContractError {
+    pub fn is_transport_unavailable(&self) -> bool {
+        matches!(self, Self::TransportUnavailable(_))
+    }
 }
 
 impl std::fmt::Display for EdgeContractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::TransportUnavailable(message) => write!(f, "{message}"),
             Self::Message(message) => write!(f, "{message}"),
         }
     }
@@ -142,14 +150,24 @@ fn fetch_health_body(health_url: &str) -> Result<String, EdgeContractError> {
         ])
         .output()
         .map_err(|error| {
-            EdgeContractError::Message(format!("cannot probe Edge /health: {error}"))
+            EdgeContractError::TransportUnavailable(format!("cannot probe Edge /health: {error}"))
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(EdgeContractError::Message(format!(
+        let message = format!(
             "Edge /health probe failed for {health_url}: {}",
             stderr.trim()
-        )));
+        );
+        // curl exit 22 means the HTTP endpoint was reachable but --fail
+        // rejected the status. Reachable-but-unhealthy/protocol evidence must
+        // never be bypassed by Relay. DNS/connect/TLS/reset/timeout failures
+        // are transport-unavailable and may defer the final contract fence to
+        // the authenticated Edge hello when a signed Relay route exists.
+        return if output.status.code() == Some(22) {
+            Err(EdgeContractError::Message(message))
+        } else {
+            Err(EdgeContractError::TransportUnavailable(message))
+        };
     }
     String::from_utf8(output.stdout)
         .map_err(|_| EdgeContractError::Message("Edge /health returned non-UTF8 body".to_owned()))
@@ -197,5 +215,15 @@ mod tests {
         assert!(err.contains("epoch 1"));
         assert!(err.contains("runtime epoch 2"));
         assert!(err.contains("compatible Edge"));
+    }
+
+    #[test]
+    fn only_transport_unavailability_is_relay_deferable() {
+        assert!(
+            EdgeContractError::TransportUnavailable("reset".to_owned()).is_transport_unavailable()
+        );
+        assert!(
+            !EdgeContractError::Message("epoch mismatch".to_owned()).is_transport_unavailable()
+        );
     }
 }

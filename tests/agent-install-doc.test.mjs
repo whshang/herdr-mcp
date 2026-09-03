@@ -38,10 +38,36 @@ test("Agent install guides own Cloudflare-token handoff and workers.dev-only boo
     assert.match(doc, /wrangler deploy --config wrangler\.user\.toml/);
     assert.match(doc, /provision-r2\.mjs/);
     assert.match(doc, /Workers R2 Storage/);
+    assert.match(doc, /optional|可选/i);
     assert.match(doc, /wrangler secret put LINK_SHARED_SECRET/);
     assert.match(doc, /workers_dev = true/);
     assert.match(doc, /routes = \[\]/);
   }
+});
+
+test("Agent install resolves fleet ownership before any Cloudflare mutation", () => {
+  const en = read("docs/i18n/en/agent-install.md");
+  const zh = read("docs/i18n/zh-CN/agent-install.md");
+
+  assert.ok(en.indexOf("Fleet ownership gate") >= 0);
+  assert.ok(en.indexOf("Fleet ownership gate") < en.indexOf("Cloudflare authorization pause"));
+  assert.ok(zh.indexOf("Fleet 所有权闸门") >= 0);
+  assert.ok(zh.indexOf("Fleet 所有权闸门") < zh.indexOf("Cloudflare 授权暂停"));
+
+  for (const doc of [en, zh]) {
+    assert.match(doc, /herdr-mcp worker pair/);
+    assert.match(doc, /herdr-mcp worker connect "<pairing-address>"/);
+    assert.match(doc, /(?:--name[^\n]*(?:explicitly|明确)|(?:explicitly|明确)[^\n]*--name)/i);
+    assert.match(doc, /~\/\.config\/herdr-mcp/);
+    assert.match(doc, /export PATH="\$HOME\/\.local\/bin:\$PATH"/);
+    assert.match(doc, /grep -Fqx/);
+    assert.match(doc, /zsh -ic 'command -v herdr && herdr --version'/);
+    assert.match(doc, /random-suffixed Worker|随机后缀[^\n]*Worker/);
+    assert.match(doc, /first[- ]fleet/i);
+  }
+
+  assert.doesNotMatch(en, /choose a machine-specific\/random-suffixed name instead/);
+  assert.doesNotMatch(zh, /改用机器相关\/随机后缀名/);
 });
 
 test("Agent install guide makes the bootstrap Token ephemeral and DNS-free", () => {

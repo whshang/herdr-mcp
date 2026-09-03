@@ -91,6 +91,9 @@ pub enum WorkerCommand {
     Rename {
         name: String,
     },
+    Revoke {
+        device_id: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -505,10 +508,11 @@ fn parse_worker(args: &[String]) -> Result<Command, String> {
         Some("pair") => parse_worker_pair(&args[1..]),
         Some("connect") => parse_worker_connect(&args[1..]),
         Some("rename") => parse_worker_rename(&args[1..]),
+        Some("revoke") => parse_worker_revoke(&args[1..]),
         Some(value) => Err(format!(
-            "unknown worker command '{value}' (expected pair, connect, or rename)"
+            "unknown worker command '{value}' (expected pair, connect, rename, or revoke)"
         )),
-        None => Err("worker requires pair, connect, or rename".to_owned()),
+        None => Err("worker requires pair, connect, rename, or revoke".to_owned()),
     }
 }
 
@@ -516,10 +520,11 @@ fn parse_device_alias(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
         Some("pair") => parse_worker_pair(&args[1..]),
         Some("rename") => parse_worker_rename(&args[1..]),
+        Some("revoke") => parse_worker_revoke(&args[1..]),
         Some(value) => Err(format!(
-            "device '{value}' is not implemented yet; v0.4.3 supports device pair and rename"
+            "device '{value}' is not implemented yet; supported commands are pair, rename, and revoke"
         )),
-        None => Err("device requires pair or rename".to_owned()),
+        None => Err("device requires pair, rename, or revoke".to_owned()),
     }
 }
 
@@ -640,6 +645,19 @@ fn parse_worker_rename(args: &[String]) -> Result<Command, String> {
     let name = crate::device_name::normalize_device_display_name(name)
         .ok_or_else(|| "device name must contain 1..128 UTF-16 code units".to_owned())?;
     Ok(Command::Worker(WorkerCommand::Rename { name }))
+}
+
+fn parse_worker_revoke(args: &[String]) -> Result<Command, String> {
+    let [device_id, confirm] = args else {
+        return Err(
+            "worker revoke requires: <device-id> --confirm; revocation is permanent".to_owned(),
+        );
+    };
+    if confirm != "--confirm" {
+        return Err("worker revoke requires --confirm because revocation is permanent".to_owned());
+    }
+    let device_id = crate::config::normalize_device_id(device_id)?;
+    Ok(Command::Worker(WorkerCommand::Revoke { device_id }))
 }
 
 fn parse_config(args: &[String]) -> Result<Command, String> {
@@ -1201,6 +1219,29 @@ mod tests {
         assert!(parse(args(&["worker", "rename", "--help"])).is_err());
         assert!(parse(args(&["worker", "rename", "-h"])).is_err());
         assert!(parse(args(&["worker", "rename", &"😀".repeat(65)])).is_err());
+        assert_eq!(
+            parse(args(&[
+                "worker",
+                "revoke",
+                "dev_01m1e4vf6vgxamgd0cn9we8n7m",
+                "--confirm",
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::Revoke {
+                device_id: "dev_01M1E4VF6VGXAMGD0CN9WE8N7M".to_owned(),
+            })
+        );
+        assert!(
+            parse(args(&[
+                "worker",
+                "revoke",
+                "dev_01M1E4VF6VGXAMGD0CN9WE8N7M",
+            ]))
+            .is_err()
+        );
+        assert!(parse(args(&["worker", "revoke", "not-a-device", "--confirm",])).is_err());
+
         assert!(parse(args(&["worker", "connect", "--code", "secret"])).is_err());
         assert!(parse(args(&["device", "pair", "--code", "secret"])).is_err());
         assert!(parse(args(&["worker", "pair", "--code", "secret"])).is_err());

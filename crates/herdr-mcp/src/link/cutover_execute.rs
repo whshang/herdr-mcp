@@ -947,6 +947,26 @@ mod tests {
     }
 
     #[test]
+    fn encode_uses_link_upstream_origin_when_configured() {
+        let home = test_home();
+        setup_managed_runtime(&home);
+        let config_dir = home.join(".config/herdr-mcp");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            "[edge]\npublic_origin = \"https://custom.example\"\nlink_upstream_origin = \"https://backend.workers.dev\"\n",
+        )
+        .unwrap();
+        let program = candidate_program_arguments(&home).unwrap();
+        let (bytes, _keys) =
+            encode_prod_rust_plist(&home, &node_prod_plist_xml(&home), &program).unwrap();
+        let xml = String::from_utf8_lossy(&bytes);
+        assert!(xml.contains("wss://backend.workers.dev/ws"));
+        assert!(!xml.contains("wss://custom.example/ws"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn synthetic_uat_activate_verify_succeeds_with_fake_launchd() {
         let home = test_home();
         setup_managed_runtime(&home);

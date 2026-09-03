@@ -294,7 +294,8 @@ pub fn default_candidate_env() -> BTreeMap<String, String> {
 }
 
 pub(crate) fn inherited_proxy_env() -> BTreeMap<String, String> {
-    const KEYS: [&str; 8] = [
+    const KEYS: [&str; 9] = [
+        "HERDR_LINK_PROXY",
         "https_proxy",
         "http_proxy",
         "all_proxy",
@@ -807,6 +808,22 @@ mod tests {
         let err = encode_candidate_plist(&home, &program, &env).expect_err("token");
         assert!(err.contains("credential-like"));
         assert!(!err.contains("secret"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn configured_edge_ws_url_prefers_link_upstream_origin() {
+        let home = test_home();
+        let config_dir = home.join(".config/herdr-mcp");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            "[edge]\npublic_origin = \"https://custom.example\"\nlink_upstream_origin = \"https://backend.workers.dev\"\ndevice_id = \"dev_01ARZ3NDEKTSV4RRFFQ69G5FAV\"\n",
+        )
+        .unwrap();
+
+        let edge_url = configured_edge_ws_url(&home);
+        assert_eq!(edge_url.as_deref(), Some("wss://backend.workers.dev/ws"));
         let _ = fs::remove_dir_all(&home);
     }
 

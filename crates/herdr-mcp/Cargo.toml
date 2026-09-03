@@ -1,6 +1,6 @@
 [package]
 name = "herdr-mcp"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 license = "MIT"
 description = "Native Herdr MCP runtime and supervisor"
@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 libc = "0.2"
 base64 = "0.22"
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 axum = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
@@ -32,7 +33,7 @@ sha2 = "0.10"
 sigstore-trust-root = { version = "0.11.0", default-features = false }
 sigstore-types = "0.11.0"
 sigstore-verify = "0.11.0"
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }

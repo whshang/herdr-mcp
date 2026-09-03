@@ -27,18 +27,24 @@ Herdr 的多设备模型是：一个公网 Worker/Connector，后面连接多台
 
 ## 把新电脑加入设备组
 
-### 1. 在已经授权的电脑上创建短期配对
+### 1. 推荐：直接在 ChatGPT 对话中创建短期配对
 
-运行：
+在已经授权的 Herdr 对话里直接说：
 
-```bash
-herdr-mcp worker pair
+```text
+给我的新电脑生成一个 Herdr 配对链接，10 分钟有效。
 ```
 
-它会创建一次性配对，默认约 10 分钟有效，并显示：
+ChatGPT 可以直接在 Edge 创建 pairing，不要求任何已登记工作站在线。返回结果应把这些信息一起展示：
 
 - 包含高熵 pairing id 的配对地址；
-- 一个格式类似 `123 456` 的 6 位验证码。
+- 一次性 6 位验证码；
+- 精确过期时间；
+- 可直接复制到新电脑执行的 `herdr-mcp worker connect "<pairing-address>"` 命令。
+
+正常最长有效期为 600 秒，应立即使用，不要把它当成长期邀请链接保存。
+
+CLI fallback：在 fleet 中任意已授权 macOS 电脑运行 `herdr-mcp worker pair` 仍可创建同样的短期 pairing；CLI 同时显示精确 UTC 过期时间和相对有效期。
 
 ### 2. 在新电脑上连接
 
@@ -80,6 +86,20 @@ herdr-mcp worker rename "<new-device-name>"
 
 `herdr-mcp device rename ...` 是等价别名。rename 只修改面向人的显示名称；不可变 `device_id`、workstation identity、设备凭据、授权和调度状态全部保持不变。Link 重连不会覆盖用户显式改过的名字。最初的 default/legacy workstation 在首次登记时也会自动记录本机 Computer Name。
 
+如果要永久撤销另一台已登记设备的授权，现在优先直接在已经授权的 ChatGPT/Herdr 网页对话里完成：让 ChatGPT 列出设备，选中目标设备不可变的 `device_id`，然后永久 revoke。Edge-local 动作等价于：
+
+```text
+herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
+```
+
+这个路径不要求任何工作站在线，也绝不接受 display name。CLI fallback：先通过 `herdr_devices` 取得不可变的 `device_id`，然后在 owner 工作站运行：
+
+```bash
+herdr-mcp worker revoke "<device-id>" --confirm
+```
+
+revoke 对该设备身份和凭据是永久操作：在线 Link 会立即断开，旧凭据以后不能再次连接；系统内部会保留最小 revoked tombstone 防止旧身份“复活”，但正常设备列表会隐藏这些 tombstone。以后若要重新加入这台电脑，需要重新生成配对并登记为新的设备身份。
+
 ## 配对实际做了什么
 
 短期配对会换取新的单设备凭据。最终凭据写入 macOS Keychain，Worker 只保存验证该设备所需的 verifier；成功消费后，原配对立即失效。
@@ -96,7 +116,7 @@ herdr-mcp worker rename "<new-device-name>"
 - 6 位验证码单次使用且有效期很短；
 - 连续输错 5 次会永久锁定本次配对，应重新创建配对；
 - pairing id 具有高熵，并放在 URL fragment 中，避免进入普通 HTTP access log 路径；
-- 验证码不得放进 argv、shell history、日志或对话记录；
+- 用户明确在已 OAuth 授权的 owner 对话里创建 pairing 时，该对话可以显示这枚一次性验证码；除此之外，不得把验证码持久化到 argv、shell history、Git、普通日志、复制出来的 transcript 或无人值守自动化；
 - 最终单设备凭据不得打印或复制，应始终留在操作系统凭据存储中。
 
 ## 恢复与重试

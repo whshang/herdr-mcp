@@ -46,6 +46,10 @@ Its job is narrower:
 
 The Web model remains the planner. Herdr remains the runtime truth. The extension keeps the two sides connected over time.
 
+This boundary is the main reason the extension exists. A ChatGPT tool round can dispatch an Agent and then end; the Web planner cannot keep polling after that assistant response has been sent, and Herdr cannot directly start a new model turn. The extension therefore treats local state changes as continuation signals. A meaningful output change may produce a bounded progress wake; a working → idle/done/blocked transition wakes once; reconnect can recover a settle that happened while the browser/runtime link was unavailable. The wake tells the Web planner to re-read live Herdr/Git state, inspect the Agent result and diff, review/cherry-pick or merge isolated completed work where appropriate, and run the task's acceptance checks. A blocked/failed/timeout-like result remains work to diagnose; the wake itself is never completion evidence.
+
+That behavior is a compatibility contract across Rust/runtime changes. Regression coverage must keep the browser binding, one-shot settle semantics, progress deduplication, stale-source rejection, Native Messaging trust boundary, handoff/queue migration, and extension-version alignment intact whenever local runtime or event transport code changes.
+
 ## Why the binding is a workspace, not an agent
 
 Real work often involves more than one pane:
@@ -64,7 +68,7 @@ The binding stores the stable workspace identity; the label is only presentation
 
 ## Progress and settled events
 
-During long work, the extension can send progress updates when there is meaningful new local output. When the bound workspace settles, it can wake the Web conversation once so the planner can inspect results and decide what to do next.
+During long work, the extension can send progress updates when there is meaningful new local output. When the bound workspace settles, it can wake the Web conversation once so the planner can inspect results, integrate completed Agent work when appropriate, run acceptance checks, and decide what to do next.
 
 The important rule is to avoid turning continuity into notification spam. Progress checks and progress sends are different concepts: the extension may check frequently but only send when there is new information or a configured fallback interval has elapsed.
 
@@ -397,7 +401,7 @@ Manual handoff is useful at a natural work boundary before the current conversat
 
 It is supported for bound ChatGPT Project conversations and stable z.ai `/c/<chat_id>` conversations. Manual handoff can start with Auto on or off; the target conversation inherits the source Auto state. Automatic wakes from the source pause while the transfer is active. For ChatGPT, cutover changes only the Project binding's active conversation target; for z.ai it migrates the conversation-scoped binding. The workspace must not have active working agents, so settled/wake delivery cannot race the cutover.
 
-Normally the current web model creates the handoff packet because it has the richest conversation context. If the page already signals a hard conversation limit, the handoff prompt cannot be submitted, or a settled primary summary does not arrive within the bounded grace period, Herdr uses the configured OpenAI-compatible LLM as a fallback. The fallback receives a bounded user/assistant source transcript, must produce the same validated `HERDR_HANDOFF_V1` packet, and then rejoins the existing target/seed/binding/continuity commit path.
+For a manual ChatGPT Project handoff, Herdr first resolves the durable Continuity Journal and seeds the new Project conversation from that reference without writing a summary request into the source conversation. If binding metadata is missing or stale, the runtime resolves the same chain from the current conversation identity. If no durable chain exists, the configured OpenAI-compatible LLM may create the validated `HERDR_HANDOFF_V1` packet from a bounded read-only source transcript. When neither source is available, handoff fails closed and leaves the current conversation unchanged. Automatic/legacy compatibility paths and conversation-scoped sites keep their separately documented contracts.
 
 z.ai summary/seed control messages use a raw channel so they are not wrapped again as JSON→MCP coding tasks.
 
