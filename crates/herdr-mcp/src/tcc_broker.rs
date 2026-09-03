@@ -54,6 +54,7 @@ pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Hard wall-clock budget for a single broker request.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const BROKER_CHILD_ENV: &str = "HERDR_MCP_TCC_BROKER_CHILD";
 
 /// The 8 focused operations the broker may dispatch. This is the complete
 /// allowlist — no arbitrary operation names are accepted.
@@ -777,16 +778,39 @@ pub fn route_fs_git(op: &str, snapshot: &Value, args: &Value) -> Option<Result<V
     if std::env::var("HERDR_MCP_TCC_BROKER").ok().as_deref() != Some("1") {
         return None;
     }
-    let config_dir = match crate::paths::RuntimePaths::discover() {
-        Ok(paths) => paths.config_dir,
-        Err(message) => return Some(Err(message)),
-    };
+    Some(run_stable_broker(op, snapshot, args))
+}
+
+/// Run the already-supported `git status` broker operation even when a direct
+/// CLI/runtime path did not inherit the service's broker-routing flag. This
+/// keeps protected project discovery on the long-lived broker identity without
+/// adding a wire operation or changing the broker compatibility revision.
+pub(crate) fn git_status_via_stable_broker(snapshot: &Value, root: &Path) -> Result<Value, String> {
+    run_stable_broker(
+        "git",
+        snapshot,
+        &json!({
+            "root": root.to_string_lossy(),
+            "action": "status",
+            "max_bytes": 65_536,
+        }),
+    )
+}
+
+/// Fence recursive protected-path routing when the installed one-shot broker
+/// itself executes Git/filesystem security checks.
+pub(crate) fn is_broker_child_process() -> bool {
+    std::env::var(BROKER_CHILD_ENV).ok().as_deref() == Some("1")
+}
+
+fn run_stable_broker(op: &str, snapshot: &Value, args: &Value) -> Result<Value, String> {
+    let config_dir = crate::paths::RuntimePaths::discover()?.config_dir;
     let broker = broker_path(&config_dir);
     if !broker.is_file() {
-        return Some(Err(format!(
+        return Err(format!(
             "tcc-broker not installed at {} (run `herdr-mcp tcc-broker install`)",
             broker.display()
-        )));
+        ));
     }
     let request = json!({
         "protocol": "herdr-tcc-broker",
@@ -797,14 +821,12 @@ pub fn route_fs_git(op: &str, snapshot: &Value, args: &Value) -> Option<Result<V
     });
     let request_bytes = match serde_json::to_vec(&request) {
         Ok(bytes) => bytes,
-        Err(message) => return Some(Err(format!("cannot serialize broker request: {message}"))),
+        Err(message) => return Err(format!("cannot serialize broker request: {message}")),
     };
     if request_bytes.len() > MAX_REQUEST_BYTES {
-        return Some(Err(format!(
-            "broker request exceeds {MAX_REQUEST_BYTES} bytes"
-        )));
+        return Err(format!("broker request exceeds {MAX_REQUEST_BYTES} bytes"));
     }
-    Some(run_broker_child(&broker, &request_bytes))
+    run_broker_child(&broker, &request_bytes)
 }
 
 fn run_broker_child(broker: &Path, request_bytes: &[u8]) -> Result<Value, String> {
@@ -825,6 +847,7 @@ fn run_broker_child(broker: &Path, request_bytes: &[u8]) -> Result<Value, String
     let mut command = Command::new(broker);
     command
         .arg("__tcc-broker")
+        .env(BROKER_CHILD_ENV, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

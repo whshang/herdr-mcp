@@ -38,6 +38,31 @@ const FULL_DISK_ACCESS_SETTINGS_URL: &str =
 #[cfg(any(target_os = "macos", test))]
 const AUTHORIZATION_PENDING_FILE: &str = "authorization-required";
 
+/// Whether `path` is inside one of macOS' user privacy-protected folders.
+///
+/// High-frequency runtime metadata/preflight paths must use this before
+/// touching the filesystem. The rotating runtime must not become the TCC
+/// responsible client for Documents/Desktop/Downloads access; protected I/O
+/// belongs to the stable broker (or to the Herdr terminal that already owns
+/// the user's interactive workspace).
+pub(crate) fn is_protected_user_path(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return false;
+        };
+        ["Documents", "Desktop", "Downloads"]
+            .into_iter()
+            .map(|name| home.join(name))
+            .any(|protected| path.starts_with(protected))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermissionState {
     #[cfg(any(target_os = "macos", test))]

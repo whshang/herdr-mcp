@@ -302,6 +302,8 @@ fn project_json(
         "pane_ids": project.pane_ids,
         "dirty": project.dirty,
         "changed_files": project.changed_files,
+        "git_status_observed": project.git_status_observed,
+        "git_status_source": project.git_status_source,
         "vcs": project.vcs,
         "managed": project.managed,
         "also_open_in": also_open_in,
@@ -557,7 +559,11 @@ mod tests {
         assert_eq!(output["workspaces"][0]["id"], "w1");
         assert_eq!(output["workspaces"][0]["cwd"], "/tmp/demo");
         assert_eq!(output["workspaces"][0]["projects"][0]["root"], "/tmp/demo");
-        assert_eq!(output["workspaces"][0]["projects"][0]["managed"], false);
+        assert_eq!(output["workspaces"][0]["projects"][0]["managed"], true);
+        assert_eq!(
+            output["workspaces"][0]["projects"][0]["git_status_observed"],
+            false
+        );
         assert_eq!(output["tabs"][0]["workspace"], "w1");
         assert_eq!(output["panes"][0]["agent"]["name"], "pi-task-one");
         assert_eq!(output["panes"][0]["agent"]["kind"], "pi");
@@ -575,7 +581,10 @@ mod tests {
         assert!(output["capability_inventory"]["available_agents"].is_null());
         assert_eq!(output["agents"][0]["capabilities"]["source"], "live_only");
         assert_eq!(output["workstation_info"]["default_cwd"], "/tmp/demo");
-        assert_eq!(output["workstation_info"]["managed_git_roots"], json!([]));
+        assert_eq!(
+            output["workstation_info"]["managed_git_roots"],
+            json!(["/tmp/demo"])
+        );
         assert!(output.get("warnings").is_none());
     }
 

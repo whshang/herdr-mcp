@@ -49,6 +49,42 @@ pub fn validate_existing_with_topology(
     validate_existing_with_roots(&managed_roots_from(topology), input)
 }
 
+/// Validate that `input` is exactly one project root already declared by the
+/// live topology without touching the filesystem.
+///
+/// This is intentionally narrower than ordinary fs validation. It exists for
+/// command preflight where the tool contract already requires a project root
+/// and the actual protected-folder execution is delegated to a Herdr pane.
+/// Never use it to authorize arbitrary descendant reads/writes.
+pub fn validate_exact_project_root_with_topology(
+    topology: &ProjectTopology,
+    input: &str,
+) -> Result<ManagedPath, Value> {
+    let roots = managed_roots_from(topology);
+    let resolved = resolve_input(input)?;
+    let Some(root) = roots.iter().find(|root| **root == resolved).cloned() else {
+        return Err(json!({
+            "ok": false,
+            "reason": "root_not_project_root",
+            "path": resolved.to_string_lossy(),
+            "managed_roots": roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
+            "hint": "root must exactly match a managed project root from the live snapshot",
+        }));
+    };
+    if denied_secret_path(&resolved) {
+        return Err(json!({
+            "ok": false,
+            "reason": "secret_path_denied",
+            "path": resolved.to_string_lossy(),
+        }));
+    }
+    Ok(ManagedPath {
+        root: root.clone(),
+        resolved: root.clone(),
+        real: root,
+    })
+}
+
 /// Validate an existing path against one project root that was already
 /// validated as managed by the caller.
 pub fn validate_existing_in_root(project_root: &Path, input: &str) -> Result<ManagedPath, Value> {
@@ -312,6 +348,48 @@ mod tests {
         assert_eq!(via_topology.root, via_snapshot.root);
         assert_eq!(via_topology.real, via_snapshot.real);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_project_root_validation_is_metadata_only() {
+        let root = PathBuf::from("/Users/example/Documents/not-present-on-test-host");
+        let mut project_map = std::collections::BTreeMap::new();
+        project_map.insert(
+            root.clone(),
+            crate::projects::ProjectInfo {
+                root: root.clone(),
+                vcs: Some("git"),
+                managed: true,
+                dirty: false,
+                changed_files: 0,
+                git_status_observed: false,
+                git_status_source: None,
+                pane_ids: vec!["w1:p1".to_owned()],
+                cwds: vec![root.clone()],
+            },
+        );
+        let topology = ProjectTopology {
+            projects: project_map,
+            pane_to_workspace: [("w1:p1".to_owned(), "w1".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+
+        let managed = validate_exact_project_root_with_topology(
+            &topology,
+            root.to_str().expect("utf8 test path"),
+        )
+        .expect("declared root should not need to exist on disk");
+        assert_eq!(managed.root, root);
+        assert_eq!(managed.real, managed.root);
+
+        let nested = managed.root.join("nested");
+        let error = validate_exact_project_root_with_topology(
+            &topology,
+            nested.to_str().expect("utf8 test path"),
+        )
+        .expect_err("descendant is not an exact command project root");
+        assert_eq!(error["reason"], "root_not_project_root");
     }
 
     #[test]
