@@ -520,6 +520,16 @@ where
 }
 
 fn read_cache_bytes(config_dir: &Path) -> Result<Option<Vec<u8>>, ManifestError> {
+    read_cache_bytes_inner(config_dir, |_| {})
+}
+
+fn read_cache_bytes_inner<F>(
+    config_dir: &Path,
+    before_open: F,
+) -> Result<Option<Vec<u8>>, ManifestError>
+where
+    F: FnOnce(&Path),
+{
     let cache = cache_path(config_dir);
     let metadata = match fs::symlink_metadata(&cache) {
         Ok(metadata) => metadata,
@@ -534,7 +544,36 @@ fn read_cache_bytes(config_dir: &Path) -> Result<Option<Vec<u8>>, ManifestError>
     if metadata.len() > MAX_MANIFEST_BYTES as u64 {
         return Err(ManifestError::UntrustedCache("cache exceeds size limit"));
     }
-    let mut file = fs::File::open(&cache).map_err(io_error)?;
+    before_open(&cache);
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(&cache).map_err(io_error)?;
+    let opened_metadata = file.metadata().map_err(io_error)?;
+    if !opened_metadata.is_file() || opened_metadata.len() > MAX_MANIFEST_BYTES as u64 {
+        return Err(ManifestError::UntrustedCache(
+            "cache changed before it could be opened safely",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.dev() != opened_metadata.dev() || metadata.ino() != opened_metadata.ino() {
+            return Err(ManifestError::UntrustedCache(
+                "cache changed before it could be opened safely",
+            ));
+        }
+    }
     read_bounded(&mut file, MAX_MANIFEST_BYTES)
         .map(Some)
         .map_err(|error| ManifestError::UntrustedCache(error.class()))
@@ -1156,6 +1195,19 @@ mod tests {
                     "cache path is not a regular owned file"
                 ))
             ));
+
+            // Reproduce the audit finding: the cache is regular during the
+            // metadata check, then an attacker replaces it with a symlink
+            // immediately before open. The opened handle must fail closed.
+            fs::remove_file(&cache).unwrap();
+            fs::write(&cache, valid(10)).unwrap();
+            let raced_target = paths.config_dir.join("raced-target.json");
+            fs::write(&raced_target, valid(11)).unwrap();
+            let raced = read_cache_bytes_inner(&paths.config_dir, |path| {
+                fs::remove_file(path).unwrap();
+                symlink(&raced_target, path).unwrap();
+            });
+            assert!(raced.is_err());
         }
         let _ = fs::remove_dir_all(&paths.config_dir);
     }
