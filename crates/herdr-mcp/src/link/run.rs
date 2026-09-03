@@ -34,9 +34,20 @@ const SERVER_PLIST_REL: &str = "Library/LaunchAgents/dev.herdr-mcp.server.plist"
 /// CLI entry: load config and run the staged daemon in the foreground.
 pub fn run() -> Result<ExitCode, String> {
     let config = load_link_run_config().map_err(|error| error.to_string())?;
-    // Fail closed before opening a WebSocket when Edge still publishes epoch 1.
-    let _edge = super::edge_contract::probe_edge_contract_for_rust_link(&config.edge_url)
-        .map_err(|error| format!("herdr-mcp link run: {error}"))?;
+    // Reachable incompatible Edges always fail closed. The only deferable case
+    // is direct transport unavailability when a validated signed Relay route is
+    // actually available; authenticated Edge hello remains the final runtime-
+    // contract fence after the Relay establishes transport.
+    if let Err(error) = super::edge_contract::probe_edge_contract_for_rust_link(&config.edge_url) {
+        let relay_available = validated_relay_route_available(&config)?;
+        if should_defer_contract_probe_to_hello(&error, relay_available) {
+            eprintln!(
+                "[herdr-link] warn direct Edge /health is unreachable; using a validated signed Relay route and deferring the final runtime-contract fence to authenticated Edge hello"
+            );
+        } else {
+            return Err(format!("herdr-mcp link run: {error}"));
+        }
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -45,6 +56,38 @@ pub fn run() -> Result<ExitCode, String> {
         .block_on(run_link_daemon(config))
         .map_err(|error| format!("herdr-mcp link run: {error}"))?;
     Ok(ExitCode::from(code as u8))
+}
+
+fn should_defer_contract_probe_to_hello(
+    error: &super::edge_contract::EdgeContractError,
+    relay_available: bool,
+) -> bool {
+    relay_available && error.is_transport_unavailable()
+}
+
+fn validated_relay_route_available(config: &LinkDaemonConfig) -> Result<bool, String> {
+    let paths = RuntimePaths::discover()
+        .map_err(|error| format!("herdr-mcp link run: runtime paths: {error}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0);
+    let pool = super::relay_manifest::load_cached_pool(&paths, now);
+    if pool.source != "cached-remote" || pool.relays.is_empty() {
+        return Ok(false);
+    }
+    let routes = super::ladder::build_ladder_routes(
+        &config.edge_url,
+        config.public_origin.as_deref(),
+        config.link_upstream_origin.as_deref(),
+        &config.workstation_id,
+        None,
+        &pool.relays,
+    )
+    .map_err(|error| format!("herdr-mcp link run: transport ladder error: {error}"))?;
+    Ok(routes
+        .iter()
+        .any(|route| route.kind == super::ladder::TransportRouteKind::SharedRelay))
 }
 
 /// Build daemon config from process environment (+ macOS credential fallbacks).
@@ -305,6 +348,18 @@ mod tests {
         assert!(text.contains("unable to load workstation link credential"));
         assert!(!text.contains("link-secret"));
         assert!(!text.contains("runtime-secret"));
+    }
+
+    #[test]
+    fn contract_probe_is_deferred_only_for_transport_unavailability_with_relay() {
+        let transport = super::super::edge_contract::EdgeContractError::TransportUnavailable(
+            "connection reset".to_owned(),
+        );
+        let mismatch =
+            super::super::edge_contract::EdgeContractError::Message("epoch mismatch".to_owned());
+        assert!(should_defer_contract_probe_to_hello(&transport, true));
+        assert!(!should_defer_contract_probe_to_hello(&transport, false));
+        assert!(!should_defer_contract_probe_to_hello(&mismatch, true));
     }
 
     #[test]
