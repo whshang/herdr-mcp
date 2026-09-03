@@ -16,6 +16,7 @@ pub const LOCAL_LIST_METHOD: &str = "herdr_mcp.skill.list";
 pub const LOCAL_DESCRIBE_METHOD: &str = "herdr_mcp.skill.describe";
 pub const LOCAL_LOAD_METHOD: &str = "herdr_mcp.skill.load";
 pub const PLANNING_ADVISE_METHOD: &str = "herdr_mcp.planning.advise";
+pub const GITHUB_STATUS_METHOD: &str = "herdr_mcp.github.status";
 pub const TEXT_READ_METHOD: &str = "herdr_mcp.text.read";
 pub const TEXT_WRITE_METHOD: &str = "herdr_mcp.text.write";
 
@@ -75,6 +76,19 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 },
                 "required": [],
                 "empty": true,
+            },
+        }),
+        json!({
+            "method": GITHUB_STATUS_METHOD,
+            "source": "herdr_mcp_local",
+            "params": {
+                "properties": {
+                    "project_root": {"type": "string"},
+                    "pr_number": {"type": "integer", "minimum": 1},
+                    "previous_fingerprint": {"type": "string"},
+                },
+                "required": ["project_root"],
+                "empty": false,
             },
         }),
         json!({
@@ -529,6 +543,16 @@ impl ProgressiveSkillService {
                     "shared_runtime_state": "optional boolean"
                 }
             },
+            "github_status": {
+                "method": GITHUB_STATUS_METHOD,
+                "effect": "read_only_fresh_status",
+                "source": "local authenticated gh API; bypasses connector cache",
+                "params": {
+                    "project_root": "required managed git project/worktree root",
+                    "pr_number": "optional positive integer; omit for repository Auto-merge state only",
+                    "previous_fingerprint": "optional fingerprint from the prior call; unchanged state returns a compact changed=false response"
+                }
+            },
             "capability_snapshot": capability_summary_with_inventory(snapshot, inventory),
             "planning_context": planning_context_with_inventory(snapshot, inventory),
             "bytes": content.len(),
@@ -544,6 +568,7 @@ impl ProgressiveSkillService {
             LOCAL_DESCRIBE_METHOD => self.describe_method(params),
             LOCAL_LOAD_METHOD => self.load_method(params),
             PLANNING_ADVISE_METHOD => self.planning_advise_method(params, snapshot),
+            GITHUB_STATUS_METHOD => crate::github_status::status(params, snapshot),
             TEXT_READ_METHOD => crate::text_transfer::read(params),
             TEXT_WRITE_METHOD => crate::text_transfer::write(params),
             _ => json!({
@@ -1878,6 +1903,11 @@ mod tests {
         assert_eq!(methods[0]["method"], TEXT_READ_METHOD);
         assert_eq!(methods[1]["method"], TEXT_WRITE_METHOD);
         assert_eq!(methods[0]["source"], "herdr_mcp_local");
+
+        let methods = local_method_schemas("github");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0]["method"], GITHUB_STATUS_METHOD);
+        assert_eq!(methods[0]["params"]["required"][0], "project_root");
     }
 
     #[test]

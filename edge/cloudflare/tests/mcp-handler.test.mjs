@@ -105,12 +105,12 @@ test("tools/call forwards only frozen tools with epoch/hash and preserves id", a
   assert.equal(d.calls[0].deadlineMs, 31_000);
 });
 
-test("read-only call retries once after generation supersede proved not delivered", async () => {
+test("read-only call retries across a stale generation window after supersede proved not delivered", async () => {
   let forwards = 0;
   const d = deps({
     forward: async () => {
       forwards += 1;
-      if (forwards === 1) {
+      if (forwards <= 3) {
         return new Response(JSON.stringify({
           status: "ok",
           completion: {
@@ -120,6 +120,7 @@ test("read-only call retries once after generation supersede proved not delivere
               code: "runtime_generation_superseded_before_dispatch",
               retryable: true,
               delivery_state: "not_delivered",
+              retry_after_ms: 0,
               message: "runtime/current changed before dispatch",
             },
           },
@@ -136,39 +137,51 @@ test("read-only call retries once after generation supersede proved not delivere
   assert.equal(r.body.result.isError, undefined);
   assert.equal(r.body.result.structuredContent.served, true);
   assert.equal(r.body.result.structuredContent.generation, "new");
-  assert.equal(d.calls.length, 2);
-  assert.notEqual(d.calls[0].requestId, d.calls[1].requestId);
-  assert.equal(d.calls[0].op, "herdr_inspect");
-  assert.equal(d.calls[1].op, "herdr_inspect");
-  assert.equal(d.calls[0].deadlineMs, d.calls[1].deadlineMs);
+  assert.equal(d.calls.length, 4);
+  assert.equal(new Set(d.calls.map((call) => call.requestId)).size, 4);
+  assert.equal(d.calls.every((call) => call.op === "herdr_inspect"), true);
+  assert.equal(new Set(d.calls.map((call) => call.deadlineMs)).size, 1);
 });
 
-test("mutating call never retries generation supersede even when not delivered", async () => {
+test("mutating call retries generation supersede only after the runtime proves it was not delivered", async () => {
+  let forwards = 0;
   const d = deps({
-    forward: async () => new Response(JSON.stringify({
-      status: "ok",
-      completion: {
-        status: "error",
-        error: {
-          ok: false,
-          code: "runtime_generation_superseded_before_dispatch",
-          retryable: true,
-          delivery_state: "not_delivered",
-          message: "runtime/current changed before dispatch",
-        },
-      },
-    })),
+    forward: async () => {
+      forwards += 1;
+      if (forwards <= 2) {
+        return new Response(JSON.stringify({
+          status: "ok",
+          completion: {
+            status: "error",
+            error: {
+              ok: false,
+              code: "runtime_generation_superseded_before_dispatch",
+              retryable: true,
+              delivery_state: "not_delivered",
+              retry_after_ms: 0,
+              message: "runtime/current changed before dispatch",
+            },
+          },
+        }));
+      }
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: { status: "ok", result: { session_id: "es-new-generation" } },
+      }));
+    },
   });
 
   const r = await handleMcp(
-    req(702, "tools/call", { name: "herdr_prompt", arguments: { target: "w1:p1", text: "test" } }),
+    req(702, "tools/call", { name: "herdr_exec_start", arguments: { root: "/tmp/project", command: "pytest" } }),
     "w1",
     d.value,
   );
-  assert.equal(r.body.result.isError, true);
-  assert.equal(r.body.result.structuredContent.code, "runtime_generation_superseded_before_dispatch");
-  assert.equal(r.body.result.structuredContent.delivery_state, "not_delivered");
-  assert.equal(d.calls.length, 1);
+  assert.equal(r.body.result.isError, undefined);
+  assert.equal(r.body.result.structuredContent.session_id, "es-new-generation");
+  assert.equal(d.calls.length, 3);
+  assert.equal(new Set(d.calls.map((call) => call.requestId)).size, 3);
+  assert.equal(d.calls.every((call) => call.op === "herdr_exec_start"), true);
+  assert.equal(new Set(d.calls.map((call) => call.deadlineMs)).size, 1);
 });
 
 test("herdr_devices executes at Edge and exposes pairing hint without tools/list contract drift", async () => {
@@ -526,6 +539,7 @@ test("tools/call maps relay delivery errors to MCP isError tool results", async 
           mutation_replay: "only_after_not_delivered_or_verified_not_applied",
         },
         message: "offline",
+        details: { source: "edge-test" },
       },
     })),
   });
@@ -536,6 +550,7 @@ test("tools/call maps relay delivery errors to MCP isError tool results", async 
   assert.equal(r.body.result.structuredContent.retryable, true);
   assert.equal(r.body.result.structuredContent.delivery_state, "not_delivered");
   assert.equal(r.body.result.structuredContent.retry_after_ms, 5000);
+  assert.deepEqual(r.body.result.structuredContent.details, { source: "edge-test" });
   assert.deepEqual(r.body.result.structuredContent.recovery, {
     action: "retry_read_only_probe",
     probe_tool: "herdr_inspect",

@@ -69,6 +69,8 @@ interface ForwardEnvelope {
 }
 
 const PUBLIC_TOOL_NAMES: ReadonlySet<string> = new Set<string>(PUBLIC_CONTRACT.tools.map((tool) => tool.name));
+const GENERATION_SUPERSEDE_RETRY_BACKOFF_MS = [100, 400, 1_000, 1_500] as const;
+const GENERATION_SUPERSEDE_CLIENT_RETRY_AFTER_MS = 1_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -122,15 +124,27 @@ function normalizeSuccessfulToolResult(value: unknown): Record<string, unknown> 
 }
 
 function relayErrorToolResult(error: RelayErrorResult, requestId: string, workstationId: string): Record<string, unknown> {
+  const supersededDetails = error.code === "runtime_generation_superseded_before_dispatch" && isRecord(error.details)
+    ? error.details
+    : undefined;
   return callToolResult(
     {
       ok: false,
       code: error.code,
       retryable: error.retryable,
       delivery_state: error.delivery_state,
-      retry_after_ms: error.retry_after_ms,
+      retry_after_ms: error.retry_after_ms
+        ?? (supersededDetails ? GENERATION_SUPERSEDE_CLIENT_RETRY_AFTER_MS : undefined),
       recovery: error.recovery,
       message: error.message ?? null,
+      details: error.details ?? null,
+      ...(supersededDetails
+        ? {
+            old_generation: supersededDetails.reserved_generation ?? null,
+            current_generation: supersededDetails.current_generation ?? supersededDetails.active_generation ?? null,
+            superseded_at_ms: error.atMs ?? null,
+          }
+        : {}),
       request_id: requestId,
       workstation_id: workstationId,
     },
@@ -138,11 +152,23 @@ function relayErrorToolResult(error: RelayErrorResult, requestId: string, workst
   );
 }
 
-function generationSupersededReadRetry(error: RelayErrorResult | undefined, opClass: string): boolean {
-  return opClass === "read"
-    && error?.code === "runtime_generation_superseded_before_dispatch"
+function generationSupersededRetry(error: RelayErrorResult | undefined): boolean {
+  return error?.code === "runtime_generation_superseded_before_dispatch"
     && error.retryable === true
     && error.delivery_state === "not_delivered";
+}
+
+function generationSupersededRetryDelay(error: RelayErrorResult | undefined, attempt: number): number {
+  const hinted = error?.retry_after_ms;
+  if (typeof hinted === "number" && Number.isFinite(hinted) && hinted >= 0) {
+    return Math.min(hinted, 2_000);
+  }
+  return GENERATION_SUPERSEDE_RETRY_BACKOFF_MS[attempt] ?? 0;
+}
+
+async function waitMs(delayMs: number): Promise<void> {
+  if (delayMs <= 0) return;
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
 }
 
 function forwardEnvelopeError(forwarded: ForwardEnvelope): RelayErrorResult | undefined {
@@ -545,7 +571,7 @@ export async function handleMcp(
     let activeRequestId = requestId;
     let activeInternal = internal;
     let forwarded: ForwardEnvelope | undefined;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt <= GENERATION_SUPERSEDE_RETRY_BACKOFF_MS.length; attempt += 1) {
       let response: Response;
       try {
         response = await deps.forward(deps.getStub(route.workstation_id), JSON.stringify(activeInternal));
@@ -587,15 +613,20 @@ export async function handleMcp(
       }
 
       const retryError = forwardEnvelopeError(forwarded);
-      if (attempt === 0 && generationSupersededReadRetry(retryError, opClass)) {
+      if (attempt < GENERATION_SUPERSEDE_RETRY_BACKOFF_MS.length && generationSupersededRetry(retryError)) {
         const retryRequestId = newRequestId();
+        const retryDelayMs = generationSupersededRetryDelay(retryError, attempt);
         deps.logger.warn("mcp.tools_call.generation_retry", {
           requestId: activeRequestId,
           retryRequestId,
           workstationId: route.workstation_id,
           deviceId: route.device_id,
           op: name,
+          opClass,
+          attempt: attempt + 1,
+          retryDelayMs,
         });
+        await waitMs(retryDelayMs);
         activeRequestId = retryRequestId;
         activeInternal = { ...activeInternal, requestId: retryRequestId };
         continue;
