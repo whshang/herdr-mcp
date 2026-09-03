@@ -39,6 +39,24 @@ test("device directory joins durable identity with read-only WorkstationDO state
   assert.equal(Object.hasOwn(devices[0], "credential_id"), false);
 });
 
+test("device directory hides revoked tombstones without querying their realtime status", async () => {
+  const registry = {
+    fetch: async () => response({ ok: true, devices: [
+      { device_id: DEV_A, workstation_id: DEV_A, name: "active", authorization: "active", scheduling: "enabled" },
+      { device_id: DEV_B, workstation_id: DEV_B, name: "revoked-uat", authorization: "revoked", scheduling: "enabled", revoked_at_ms: 123 },
+    ] }),
+  };
+  const statusReads = [];
+  const devices = await listPublicDevices(registry, (id) => ({
+    fetch: async () => {
+      statusReads.push(id);
+      return response({ online: true, connected: true, runtimeHealth: "ok" });
+    },
+  }));
+  assert.deepEqual(devices.map((device) => device.device_id), [DEV_A]);
+  assert.deepEqual(statusReads, [DEV_A]);
+});
+
 test("device directory degrades one failed realtime status to offline", async () => {
   const registry = {
     fetch: async () => response({ ok: true, devices: [

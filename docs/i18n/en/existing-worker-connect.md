@@ -86,6 +86,14 @@ herdr-mcp worker rename "<new-device-name>"
 
 `herdr-mcp device rename ...` is an equivalent alias. Rename changes only the human-facing display name; the immutable `device_id`, workstation identity, credential, authorization and scheduling state stay unchanged. Link reconnects do not overwrite an explicit rename. The default/legacy workstation likewise records its local Computer Name when it is first registered.
 
+To permanently remove authorization from another enrolled device, first get its immutable `device_id` from `herdr_devices`, then run this on the owner workstation:
+
+```bash
+herdr-mcp worker revoke "<device-id>" --confirm
+```
+
+Revocation is permanent for that device identity and credential: the live Link is disconnected, the old credential can never reconnect, and the revoked tombstone is retained internally to prevent resurrection. Revoked tombstones are hidden from normal fleet/device lists. To add that computer again later, create a new pairing and enroll it as a new device identity.
+
 ## What pairing changes
 
 The short-lived pairing is exchanged for a new per-device credential. The final credential is stored in macOS Keychain, and the Worker stores only the verifier needed to authenticate that device. The pairing session becomes unusable after successful consumption.

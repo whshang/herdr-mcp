@@ -25,13 +25,18 @@
 
     <section id="devicePanel" class="device-panel" aria-live="polite">
       <div class="device-panel-heading">
-        <strong data-i18n="cc_devices_heading">Worker devices</strong>
+        <button id="deviceToggleButton" type="button" class="device-panel-toggle" aria-expanded="true">
+          <span id="deviceChevron" class="device-chevron" aria-hidden="true">⌄</span>
+          <strong data-i18n="cc_devices_heading">Worker devices</strong>
+        </button>
         <span id="deviceSummary" class="device-summary"></span>
       </div>
-      <div id="deviceList" class="device-list">
-        <div class="device-empty" data-i18n="cc_devices_loading">Loading devices…</div>
+      <div id="devicePanelBody">
+        <div id="deviceList" class="device-list">
+          <div class="device-empty" data-i18n="cc_devices_loading">Loading devices…</div>
+        </div>
+        <div id="deviceHelp" class="device-help" hidden></div>
       </div>
-      <div id="deviceHelp" class="device-help" hidden></div>
     </section>
 
     <section id="pageContextCard" class="page-context-strip" aria-live="polite" hidden>

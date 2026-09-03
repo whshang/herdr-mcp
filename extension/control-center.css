@@ -46,6 +46,10 @@ button.danger { border-color: color-mix(in srgb, var(--danger) 62%, var(--border
 .device-panel { margin: 6px 8px 0; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); overflow: hidden; }
 .device-panel-heading { display: flex; align-items: center; gap: 7px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
 .device-panel-heading strong { font-size: 11px; }
+.device-panel-toggle { display: inline-flex; align-items: center; gap: 5px; min-width: 0; padding: 0; border: 0; background: transparent; color: var(--text); text-align: left; }
+.device-panel-toggle:hover { background: transparent; color: var(--accent); }
+.device-chevron { width: 10px; color: var(--muted); font-size: 11px; line-height: 1; text-align: center; }
+#devicePanelBody[hidden] { display: none; }
 .device-summary { margin-left: auto; color: var(--muted); font-size: 10px; white-space: nowrap; }
 .device-list { display: grid; }
 .device-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) max-content; gap: 7px; align-items: center; padding: 6px 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent); }
