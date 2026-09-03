@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Herdr — AI Workspace Bridge",
+  "name": "Herdr MCP - Herdr Workspace Connector",
   "version": "0.1.89",
   "description": "Connect ChatGPT and Web AI to local Herdr workspaces with Control Center, safe continuity, handoff, and queued next turns.",
   "permissions": [
@@ -29,6 +29,7 @@
   "action": {
     "default_icon": {
       "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     },
@@ -36,6 +37,7 @@
   },
   "icons": {
     "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },

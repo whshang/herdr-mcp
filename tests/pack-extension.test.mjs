@@ -58,6 +58,16 @@ test("repo pack-extension uses live extension manifest version", async () => {
       typeof manifest.description === "string" && manifest.description.length <= 132,
       `Chrome Web Store manifest description must be <= 132 characters; got ${manifest.description?.length ?? "missing"}`,
     );
+    const expectedIcons = { 16: "icons/icon16.png", 32: "icons/icon32.png", 48: "icons/icon48.png", 128: "icons/icon128.png" };
+    assert.deepEqual(manifest.icons, expectedIcons);
+    assert.deepEqual(manifest.action?.default_icon, expectedIcons);
+    for (const [sizeText, relativePath] of Object.entries(expectedIcons)) {
+      const size = Number(sizeText);
+      const bytes = await readFile(join(repoRoot, "extension", relativePath));
+      assert.deepEqual([...bytes.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10], `${relativePath} must be PNG`);
+      assert.equal(bytes.readUInt32BE(16), size, `${relativePath} width`);
+      assert.equal(bytes.readUInt32BE(20), size, `${relativePath} height`);
+    }
     const result = await packExtension({ root: repoRoot, outDir });
     assert.equal(result.version, manifest.version);
     assert.equal(result.zipName, `herdr-mcp-extension-${manifest.version}.zip`);
