@@ -13,13 +13,17 @@
 //! - Non-loaded backup/temporary artifacts left under LaunchAgents.
 //! - Independent Herdr LaunchAgents (`dev.herdr.*`).
 
+#[cfg(any(target_os = "macos", test))]
 use crate::instance::{
     DEFAULT_HEALTH_WATCHDOG_LABEL, DEFAULT_HERDR_SUPERVISOR_LABEL, DEFAULT_SERVICE_LABEL,
     DEFAULT_WATCHDOG_LABEL, InstanceId,
 };
+#[cfg(any(target_os = "macos", test))]
 use std::fs;
+#[cfg(any(target_os = "macos", test))]
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "macos", test))]
 pub const DEFAULT_LABELS: &[&str] = &[
     DEFAULT_SERVICE_LABEL,
     "dev.herdr-mcp.link",
@@ -32,6 +36,7 @@ pub const DEFAULT_LABELS: &[&str] = &[
 ];
 
 /// Tri-state launchd load observation.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchdLoadState {
     Loaded,
@@ -39,6 +44,7 @@ pub enum LaunchdLoadState {
     Unknown,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResidueReport {
     /// Owned default plists present AND confirmed loaded in launchd.
@@ -63,6 +69,7 @@ pub struct ResidueReport {
     pub independent_herdr: Vec<(PathBuf, LaunchdLoadState)>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl ResidueReport {
     pub fn is_clean(&self) -> bool {
         self.stale_named.is_empty()
@@ -72,6 +79,7 @@ impl ResidueReport {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn scan_residue(home: &Path) -> ResidueReport {
     let launch_agents = home.join("Library/LaunchAgents");
     let config_parent = home.join(".config");
@@ -128,6 +136,7 @@ fn launchd_load_state(label: &str) -> (LaunchdLoadState, String) {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn scan_residue_with<Loaded: Fn(&str) -> (LaunchdLoadState, String)>(
     launch_agents_dir: &Path,
     config_parent: &Path,
@@ -289,6 +298,7 @@ pub fn scan_residue_with<Loaded: Fn(&str) -> (LaunchdLoadState, String)>(
     report
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn is_backup_or_temp_artifact(name: &str) -> bool {
     name.starts_with('.')
         || name.ends_with(".bak")
@@ -303,6 +313,7 @@ fn is_backup_or_temp_artifact(name: &str) -> bool {
         || (name.contains(".plist.") && !name.ends_with(".plist"))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_named_label(rest: &str) -> Option<(&str, &str)> {
     if let Some(name) = rest.strip_suffix(".server") {
         Some((name, "server"))
@@ -348,6 +359,7 @@ pub fn status_line() -> String {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn doctor_line_from_report(report: &ResidueReport) -> String {
     let status = if report.is_clean() {
         "clean"
@@ -368,6 +380,7 @@ pub fn doctor_line_from_report(report: &ResidueReport) -> String {
     )
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn status_line_from_report(report: &ResidueReport) -> String {
     if report.is_clean() {
         format!(
