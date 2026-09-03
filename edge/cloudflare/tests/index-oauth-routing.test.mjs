@@ -1,8 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import worker from "../dist/index.js";
 
 const issuer = "https://herdr-mcp.agentforme.cc.cd";
+const packageJson = JSON.parse(
+  readFileSync(new URL("../../../package.json", import.meta.url), "utf8"),
+);
 
 function env() {
   const stub = { fetch: async () => new Response(JSON.stringify({ ok: false, code: "unused" }), { status: 500 }) };
@@ -37,5 +41,5 @@ test("worker routes MCP server card before the generic /.well-known fallback", a
   const body = await response.json();
   assert.equal(body.serverUrl, `${issuer}/mcp`);
   assert.equal(body.name, "herdr-mcp");
-  assert.equal(body.version, "0.4.4");
+  assert.equal(body.version, packageJson.version);
 });
