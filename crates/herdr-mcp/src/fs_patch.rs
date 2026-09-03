@@ -66,7 +66,7 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
         Ok(_) => {
             return json!({"ok": false, "code": "PATCH_FAILED", "message": "No files were modified."});
         }
-        Err(error) => return error.to_value(),
+        Err(error) => return precommit_patch_error(error),
     };
 
     let working = if dry_run {
@@ -155,7 +155,7 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
                     source.resolved.to_string_lossy().as_ref(),
                 ) {
                     Ok(value) => value,
-                    Err(error) => return error.to_value(),
+                    Err(error) => return precommit_patch_error(error),
                 };
                 for hunk in &hunks {
                     for line in hunk {
@@ -376,6 +376,15 @@ fn patch_failure(code: &str, message: &str, path: &Path) -> Value {
     })
 }
 
+fn precommit_patch_error(error: patch::PatchError) -> Value {
+    let mut value = error.to_value();
+    if let Value::Object(output) = &mut value {
+        output.insert("mutation_state".to_owned(), json!("not_applied"));
+        output.insert("partial_applied".to_owned(), json!(false));
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,6 +499,28 @@ mod tests {
             &json!({"root": root, "patch": patch, "confirm_dirty": true}),
         );
         assert_eq!(forced["ok"], true);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn context_failure_reports_no_mutation_and_keeps_prior_stage_unchanged() {
+        let root = repo();
+        let snap = snapshot(&root);
+        let patch = "*** Begin Patch\n*** Update File: update.txt\n@@\n one\n-old\n+new\n two\n*** Update File: delete.txt\n@@\n-missing\n+changed\n*** End Patch";
+
+        let result = apply(&snap, &json!({"root": root, "patch": patch}));
+
+        assert_eq!(result["code"], "PATCH_CONTEXT_NOT_FOUND");
+        assert_eq!(result["mutation_state"], "not_applied");
+        assert_eq!(result["partial_applied"], false);
+        assert_eq!(
+            fs::read_to_string(root.join("update.txt")).unwrap(),
+            "one\nold\ntwo\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("delete.txt")).unwrap(),
+            "delete me\n"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
