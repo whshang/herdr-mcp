@@ -13,6 +13,20 @@ Use `herdr_inspect` for a fresh workspace/pane/agent baseline, then reuse explic
 
 UI/terminal focus is observational; mutations still require the intended explicit workspace/pane/project identity. Reconnect with read-only observations before deciding whether any uncertain mutation may be retried.
 
+## Discussion grounding across devices, workspaces, and history
+
+Before discussing or planning prior project work when more than one device/workspace/history could plausibly match, resolve context in this order:
+
+```text
+device -> project/workspace -> continuity/history -> live Git/runtime -> requirements/planning
+```
+
+- Preserve an explicit device selector or device-aware opaque ref already supplied by the conversation. If no device is explicit, use only deterministic routing evidence; when multiple devices remain plausible, fail closed/confirm instead of choosing by name similarity, last activity, or UI focus.
+- On the selected device, match the intended project root/workspace from live `herdr_inspect` evidence. Prefer explicit workspace/project identity. Do not treat a similarly named workspace, the focused workspace, or the newest workspace as equivalent.
+- Resolve continuity only after device/project/workspace identity is stable enough to constrain the search. Explicit continuity ref wins; exact conversation identity is next; then search with stable project/workspace/conversation facts. Query text is distinguishing evidence, never sole auto-selection authority.
+- A resumed journal is historical evidence. Refresh live Git/runtime/Agent state on the resolved device/workspace before relying on it for implementation decisions.
+- Only after these identities are grounded should requirement grilling, architecture discussion, task decomposition, or mutation begin. Facts discoverable from the selected device/repository are the planner's job to read, not questions for the user.
+
 For Edge connectivity failures, consume structured recovery metadata when present. `workstation_offline` / `workstation_reconnecting` should expose `retryable=true`, `delivery_state=not_delivered`, `retry_after_ms`, and `recovery={action:"retry_read_only_probe",probe_tool:"herdr_inspect",max_attempts:3,backoff_ms:[5000,10000,20000],...}`. Follow that bounded read-only probe schedule rather than inferring a retry policy from prose. A mutation may be reissued after recovery only when the failed result explicitly proves `not_delivered`; `delivery_unknown`, `delivered`, or a missing delivery state requires live evidence before replay.
 
 ## Native methods
@@ -60,4 +74,4 @@ Resolution order is explicit continuity reference -> exact conversation resolve 
 - `resolution=confirmation_required`: never choose by recency or textual similarity. Present the bounded candidates and ask which prior work chain the user means, then resume exactly the confirmed ID. A query-only match remains confirmation-required even when it returns one candidate.
 - `resolution=none`: do not invent an ID; ask for a distinguishing detail or treat the request as fresh work when the user confirms that intent.
 
-After resume, re-inspect live Herdr/runtime/Git facts before mutation. The journal records historical working context; it does not authorize stale branches, worktrees, processes, or runtime assumptions.
+After resume, re-inspect live Herdr/runtime/Git facts on the resolved device/workspace before mutation. The journal records historical working context; it does not authorize stale branches, worktrees, processes, or runtime assumptions.
