@@ -36,8 +36,9 @@ test("PATH preflight separates the installed binary from the interactive-shell P
     assert.match(doc, /installed_but_not_on_shell_path/);
     assert.match(doc, /zsh -ic 'command -v herdr-mcp'/);
     assert.match(doc, /zsh -lc 'command -v herdr-mcp'/);
-    // Self-heal first, durable fix second, and no second PATH owner.
+    // Self-heal first, persist to the login-shell owner, and avoid a second PATH owner.
     assert.match(doc, /export PATH="\$HOME\/\.local\/bin:\$PATH"/);
+    assert.match(doc, /grep -Fqx[^\n]*\.zprofile/);
     assert.match(doc, /second PATH owner|第二个 PATH owner/);
   }
   const triage = read("docs/i18n/en/troubleshooting.md");
