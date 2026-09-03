@@ -136,6 +136,8 @@ const DEVELOPMENT_ORCHESTRATION: &str =
     include_str!("../../../assets/herdr/skills/development-orchestration/SKILL.md");
 const ENGINEERING_ROBUSTNESS: &str =
     include_str!("../../../assets/herdr/skills/engineering-robustness/SKILL.md");
+const REQUIREMENTS_GRILLING: &str =
+    include_str!("../../../assets/herdr/skills/requirements-grilling/SKILL.md");
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Digest(String);
@@ -200,7 +202,7 @@ struct BuiltinSkillSpec {
     owned_tools: &'static [&'static str],
 }
 
-const BUILTIN_SKILLS: [BuiltinSkillSpec; 8] = [
+const BUILTIN_SKILLS: [BuiltinSkillSpec; 9] = [
     BuiltinSkillSpec {
         id: "workstation-control",
         description: "Control live Herdr workspaces, panes, agents, incremental state, and native methods.",
@@ -344,6 +346,23 @@ const BUILTIN_SKILLS: [BuiltinSkillSpec; 8] = [
         ],
         requires_capabilities: &[],
         related_skills: &["development-orchestration", "execution", "git-repository"],
+        risk_domains: &[],
+        owned_tools: &[],
+    },
+    BuiltinSkillSpec {
+        id: "requirements-grilling",
+        description: "Interrogate material unresolved requirements one decision at a time, after grounding device/workspace/history and independently retrieving discoverable facts.",
+        content: REQUIREMENTS_GRILLING,
+        triggers: &[
+            "unclear requirements",
+            "ambiguous scope",
+            "design decision",
+            "requirements interview",
+            "requirements grill",
+            "stress-test plan",
+        ],
+        requires_capabilities: &[],
+        related_skills: &["workstation-control", "development-orchestration"],
         risk_domains: &[],
         owned_tools: &[],
     },
@@ -578,6 +597,31 @@ impl ProgressiveSkillService {
             "ok": true,
             "decision_owner": "web_planner",
             "advice": dispatch_advice_json(&advice),
+            "context_resolution": {
+                "level": "required_before_prior_or_ambiguous_project_discussion",
+                "order": ["device", "project_workspace", "continuity_history", "live_git_runtime", "requirements_planning"],
+                "detail_skill": "workstation-control"
+            },
+            "orchestration_policy": {
+                "detail_skill": "development-orchestration",
+                "levels": {
+                    "minimum_entities": "required",
+                    "parallelism": "advisory",
+                    "progress_control": "required_when_delegated_or_long_running",
+                    "cross_audit": "required_for_multi_lane_mutation; conditional_for_single_lane",
+                    "verification": "required_for_mutation",
+                    "reclamation": "required_for_planner_created_resources"
+                },
+                "parallelism": {
+                    "worth_considering": advice.parallelism.worth_considering,
+                    "max_useful_lanes": advice.parallelism.max_useful_lanes
+                }
+            },
+            "requirements_resolution": {
+                "level": "conditional_on_material_ambiguity",
+                "detail_skill": "requirements-grilling",
+                "question_mode": "one_at_a_time"
+            },
             "startable_candidates": startable_candidates_json(inventory, &visibility, snapshot, &task),
             "resource_context": resource_context_json(snapshot),
             "refresh": {
@@ -1446,10 +1490,11 @@ mod tests {
     fn catalog_is_stable_and_covers_all_non_skill_tools_once() {
         let service = ProgressiveSkillService::new();
         let catalog = service.catalog();
-        assert_eq!(catalog.len(), 8);
+        assert_eq!(catalog.len(), 9);
         assert_eq!(catalog[0].id, "workstation-control");
         assert_eq!(catalog[6].id, "development-orchestration");
         assert_eq!(catalog[7].id, "engineering-robustness");
+        assert_eq!(catalog[8].id, "requirements-grilling");
         let tools = catalog
             .iter()
             .flat_map(|item| item.owned_tools.iter().cloned())
@@ -1539,7 +1584,7 @@ mod tests {
             let listed = service
                 .local_call(LOCAL_LIST_METHOD, &json!({}), &snapshot())
                 .unwrap();
-            assert_eq!(listed["count"], 8);
+            assert_eq!(listed["count"], 9);
             assert_eq!(service.cache_len(), 0);
             let first = service
                 .local_call(
@@ -1689,7 +1734,7 @@ mod tests {
         let result = service.bootstrap_with_inventory(&snapshot(), &[]);
         assert_eq!(result["ok"], true);
         assert_eq!(result["mode"], "progressive");
-        assert_eq!(result["catalog"].as_array().unwrap().len(), 8);
+        assert_eq!(result["catalog"].as_array().unwrap().len(), 9);
         assert_eq!(result["load"]["method"], LOCAL_LOAD_METHOD);
         assert_eq!(result["planning_advice"]["method"], PLANNING_ADVISE_METHOD);
         assert_eq!(result["planning_advice"]["decision_owner"], "web_planner");
@@ -1752,6 +1797,27 @@ mod tests {
         assert_eq!(result["advice"]["candidates"][0]["status"], "idle");
         assert_eq!(result["advice"]["parallelism"]["worth_considering"], true);
         assert_eq!(result["advice"]["parallelism"]["max_useful_lanes"], 2);
+        assert_eq!(result["context_resolution"]["order"][0], "device");
+        assert_eq!(
+            result["orchestration_policy"]["levels"]["minimum_entities"],
+            "required"
+        );
+        assert_eq!(
+            result["orchestration_policy"]["levels"]["parallelism"],
+            "advisory"
+        );
+        assert_eq!(
+            result["orchestration_policy"]["parallelism"]["max_useful_lanes"],
+            2
+        );
+        assert_eq!(
+            result["orchestration_policy"]["levels"]["reclamation"],
+            "required_for_planner_created_resources"
+        );
+        assert_eq!(
+            result["requirements_resolution"]["question_mode"],
+            "one_at_a_time"
+        );
         assert_eq!(result["startable_candidates"]["available_total"], 2);
         assert_eq!(result["startable_candidates"]["compatible_total"], 1);
         assert_eq!(result["startable_candidates"]["rejected_total"], 1);
@@ -1896,7 +1962,7 @@ description: \"user ego\"
             )
             .unwrap();
         assert_eq!(listed["ok"], true);
-        assert_eq!(listed["count"], 9); // 8 builtin + 1 unique project alpha
+        assert_eq!(listed["count"], 10); // 9 builtin + 1 unique project alpha
         let skills = listed["skills"].as_array().unwrap();
         let alpha = skills
             .iter()
@@ -1937,7 +2003,7 @@ description: \"user ego\"
                 )
                 .unwrap();
             assert_eq!(listed["ok"], true);
-            assert_eq!(listed["count"], 8);
+            assert_eq!(listed["count"], 9);
         });
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&project);
@@ -2134,7 +2200,7 @@ description: \"user ego\"
                 &snapshot(),
             )
             .unwrap();
-        assert_eq!(listed["count"], 8, "oversized skill is skipped");
+        assert_eq!(listed["count"], 9, "oversized skill is skipped");
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("HOME", value),
