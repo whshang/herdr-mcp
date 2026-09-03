@@ -769,11 +769,6 @@ pub(crate) fn register_owned_child(_kind: &str, _child: &Child) -> OwnedChildReg
     OwnedChildRegistration
 }
 
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn register_owned_pid(_kind: &str, _pid: u32) -> OwnedChildRegistration {
-    OwnedChildRegistration
-}
-
 pub(crate) fn reap_confirmed_orphans_on_boot() -> String {
     #[cfg(target_os = "macos")]
     {
