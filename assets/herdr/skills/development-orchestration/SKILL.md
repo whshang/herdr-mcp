@@ -7,6 +7,8 @@ description: Compose Herdr tools and domain Skills into dependency-aware develop
 
 Compositional Skill; owns no additional public tool.
 
+Five-beat execution cadence: `如无必要勿增实体 → 规划拆分多线并行 → 进度监控方向纠偏 → 交叉审计回归验证 → 分支清理窗格回收`. The Required/Advisory rules below define its exact semantics.
+
 ## Topology
 
 ```text

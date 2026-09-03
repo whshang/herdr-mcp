@@ -86,7 +86,7 @@ inspect once
   -> since(cursor) for incremental follow-up
 ```
 
-Before discussing prior or multi-device project work, load `workstation-control` and resolve its `device -> project/workspace -> continuity/history -> live Git/runtime` sequence. When material product/engineering decisions remain unresolved after facts are read, load `requirements-grilling`. For non-trivial lane planning, load `development-orchestration`; its Required/Advisory sections own the orchestration rules, while `herdr_mcp.planning.advise` exposes compact machine-readable levels and live resource/candidate evidence.
+Before discussing prior or multi-device project work, load `workstation-control` and resolve its `device -> project/workspace -> continuity/history -> live Git/runtime` sequence. When material product/engineering decisions remain unresolved after facts are read, load `requirements-grilling`. For non-trivial lane planning, load `development-orchestration`; it owns the five-beat execution cadence and Required/Advisory semantics, while `herdr_mcp.planning.advise` exposes compact machine-readable levels and live resource/candidate evidence.
 
 ## 1B. Workspace, tab, pane and worktree lifecycle
 

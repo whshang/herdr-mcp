@@ -17,7 +17,7 @@ Global policy for a remote/Web planner. Project and nested `AGENTS.md` files may
 11. For non-trivial implementation, bug fixes, reliability/refactor work, or releases, load `engineering-robustness` and close the loop from regression evidence through the real delivery boundary.
 12. On the resolved device, prior-work continuity intent in a fresh or uncertain conversation searches the durable Continuity Journal before asking for an ID. Auto-resume only one chain uniquely backed by stable conversation/project/workspace identity; otherwise show bounded candidates and ask the user to confirm. Recency or text similarity alone never selects a chain.
 13. Ground prior or multi-device project work before planning: `device -> project/workspace -> continuity/history -> live Git/runtime`. Load `workstation-control` for the resolution rules; ambiguity fails closed instead of being resolved by focus, recency, or similarity.
-14. For non-trivial orchestration, load `development-orchestration`. Its Required/Advisory sections are the single source of truth for minimum entities, parallel ownership, progress correction, cross-audit, validation, and reclamation.
+14. For non-trivial orchestration, load `development-orchestration`. It owns the five-beat execution cadence and its Required/Advisory semantics.
 
 ## Instruction precedence
 
