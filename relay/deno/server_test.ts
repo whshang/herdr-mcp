@@ -351,3 +351,12 @@ Deno.test("bindRelaySockets forwards bidirectionally and enforces 1 MiB frame li
   assertEquals(upstreamWs.closed, true);
   assertEquals(upstreamWs.closeCode, 1009);
 });
+
+Deno.test("relay expected runtime contract matches authoritative contracts/epoch2.json", async () => {
+  const text = await Deno.readTextFile(
+    new URL("../../contracts/epoch2.json", import.meta.url),
+  );
+  const fixture = JSON.parse(text);
+  assertEquals(EXPECTED_RUNTIME_CONTRACT_EPOCH, fixture.contract_epoch);
+  assertEquals(EXPECTED_RUNTIME_CONTRACT_HASH, fixture.contract_hash);
+});
