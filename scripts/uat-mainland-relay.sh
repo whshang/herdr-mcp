@@ -27,8 +27,8 @@ WORKERS_HEALTH="$WORKERS_ORIGIN/health"
 DENO_HEALTH="https://relay.herdr-mcp.deno.net/health"
 SUPABASE_HEALTH="https://sppeaueojvcxifimozqx.supabase.co/functions/v1/herdr-relay/health"
 
-for path in "$BIN" "$PLIST" "$R3" "$R4" "$R5"; do
-  [[ -e "$path" ]] || { echo "ERROR: required path missing: $path" >&2; exit 10; }
+for required_path in "$BIN" "$PLIST" "$R3" "$R4" "$R5"; do
+  [[ -e "$required_path" ]] || { echo "ERROR: required path missing: $required_path" >&2; exit 10; }
 done
 [[ -x "$BIN" ]] || { echo "ERROR: active herdr-mcp binary is not executable" >&2; exit 11; }
 [[ -z "$(git status --porcelain)" ]] || { echo "ERROR: UAT checkout is dirty" >&2; git status --short; exit 12; }
@@ -38,11 +38,25 @@ DEV_STATUS="$($BIN dev status)"
 RUNTIME_COMMIT="$(printf '%s\n' "$DEV_STATUS" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["source_commit"])')"
 GEN="$(printf '%s\n' "$DEV_STATUS" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["active_generation"])')"
 VERSION="$(printf '%s\n' "$DEV_STATUS" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
-[[ "$HEAD" == "$RUNTIME_COMMIT" ]] || {
-  echo "ERROR: Git HEAD and active DEV runtime differ" >&2
-  echo "HEAD=$HEAD runtime=$RUNTIME_COMMIT" >&2
-  exit 13
-}
+if [[ "$HEAD" != "$RUNTIME_COMMIT" ]]; then
+  git merge-base --is-ancestor "$RUNTIME_COMMIT" "$HEAD" || {
+    echo "ERROR: active DEV runtime commit is not an ancestor of Git HEAD" >&2
+    echo "HEAD=$HEAD runtime=$RUNTIME_COMMIT" >&2
+    exit 13
+  }
+  RUNTIME_DRIFT="$(git diff --name-only "$RUNTIME_COMMIT..$HEAD" --)"
+  [[ -n "$RUNTIME_DRIFT" ]] || {
+    echo "ERROR: Git/runtime provenance differs without a visible source diff" >&2
+    exit 13
+  }
+  while IFS= read -r changed_path; do
+    [[ "$changed_path" == "scripts/uat-mainland-relay.sh" ]] || {
+      echo "ERROR: Git HEAD contains runtime-relevant changes not present in active DEV runtime: $changed_path" >&2
+      exit 13
+    }
+  done <<< "$RUNTIME_DRIFT"
+  echo "INFO: active DEV runtime is one harness-only commit behind HEAD; Rust/runtime bytes are unchanged"
+fi
 
 LINK_STATUS="$($BIN link status)"
 read_link_field() {
