@@ -573,6 +573,7 @@ mod tests {
         assert_eq!(project.cwds, vec![nested]);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn declared_protected_repo_storage_routes_linked_checkout_to_broker() {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
