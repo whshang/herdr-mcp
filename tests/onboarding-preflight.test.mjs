@@ -18,8 +18,9 @@ test("onboarding resolves first-vs-existing fleet intent before any Cloudflare d
     assert.match(doc, /pairing address/);
     assert.match(doc, /worker pair/);
     assert.match(doc, /worker connect/);
-    // Never deploy a second Worker/R2/Connector for an existing fleet.
+    // Never deploy a second Worker/R2/Connector or evade ownership with a random suffix.
     assert.match(doc, /second Worker|R2 bucket|R2 桶/);
+    assert.match(doc, /do \*\*not\*\* evade[^\n]*random-suffixed Worker|禁止[^\n]*绕过[^\n]*随机后缀 Worker/);
     assert.match(doc, /existing-worker-connect\.md/);
     // Pre-deploy existing-Worker detection via the Cloudflare API.
     assert.match(doc, /workers\/scripts/);
@@ -107,8 +108,10 @@ test("origin health checks separate Worker-code health from hostname/DNS/network
     assert.match(doc, /GET \/health/);
     assert.match(doc, /[Hh]ostname\/DNS\/network-path|hostname\/DNS\/网络路径/);
     assert.match(doc, /never .*redeploy|绝不用重新部署 Worker/);
-    // Custom Domain is preferred as production origin when the user owns one.
+    // Custom Domain is preferred as production origin when the user owns one, while Link transport stays separate.
     assert.match(doc, /prefer a Custom Domain|优先把 Custom Domain/);
+    assert.match(doc, /Link transport[^\n]*(?:must not silently rewrite|不得[^\n]*静默改写)[^\n]*OAuth issuer/);
+    assert.doesNotMatch(doc, /consistent across Worker OAuth, MCP, and Link WSS|Worker OAuth、MCP、Link WSS 全部使用同一个入口/);
   }
   const triage = read("docs/i18n/en/troubleshooting.md");
   assert.match(triage, /one hostname fails while another hostname of the same Worker works/);

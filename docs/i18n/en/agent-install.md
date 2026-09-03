@@ -12,13 +12,21 @@ The Agent reads and executes this page directly; the human does not need to wrap
 
 1. Execute work directly; do not offload automatable shell steps to the human. Pause only for Cloudflare interactive login/API-Token creation or selection among multiple Cloudflare Accounts.
 2. Preserve existing work. Never `reset --hard`, `clean -fd`, or overwrite user changes in an unrelated checkout.
-3. Choose one canonical public origin during the first install and keep it consistent across Worker OAuth, MCP, and Link WSS. `workers.dev` remains the zero-DNS bootstrap path. Use a Custom Domain from the start only when explicit user intent or existing installation policy/configuration already selects it. A connectivity failure is a pause point, not implicit permission to create or mutate a Custom Domain/DNS zone.
+3. Choose one canonical public origin during the first install and keep it consistent for Worker OAuth and MCP identity. The Link transport must not silently rewrite that OAuth issuer. `workers.dev` remains the zero-DNS bootstrap path. Use a Custom Domain from the start only when explicit user intent or existing installation policy/configuration already selects it. A connectivity failure is a pause point, not implicit permission to create or mutate a Custom Domain/DNS zone.
 4. Treat the Cloudflare Token as a high-sensitivity credential. Never echo it or write it to the repo, `.env`, ordinary logs, screenshots, or shell history. Prefer process-environment injection; if a temporary file is unavoidable, use mode `0600` and delete it immediately after deployment.
 5. Verify every mutation before continuing. On an error, determine whether the mutation already committed before retrying.
 6. Do **not** install the local MCP runtime by cloning this repository or running `npm`/`cargo` unless the human explicitly asked for a contributor/from-source session.
 7. If network, login state, or third-party availability blocks the requested path, stop and report the blocker. Do not build a proxy, switch network nodes, rewrite system proxy settings, or invent a bypass.
-8. Resolve fleet intent before any Cloudflare provisioning. If the user already has a Herdr Worker (an enrolled/authorized computer, an existing ChatGPT Connector, or a supplied pairing address), follow [Multi-device control](existing-worker-connect.md): create `worker pair` on the owner computer and `worker connect` on this one. Never deploy a second Worker, R2 bucket, or Connector to work around an existing fleet, and never treat "this machine has no local Edge credentials" as evidence that no Worker exists.
-9. If the machine is unconfigured and no pairing address exists, ask one explicit question first: is this the first Herdr computer, or a computer joining an existing Herdr Worker? Only the "first" answer enters the Cloudflare deploy path below; the "join" answer uses `worker pair` + `worker connect` and needs no Cloudflare token on this machine.
+
+## 0.5 Fleet ownership gate — before any Cloudflare mutation
+
+Resolve fleet intent before requesting a Cloudflare Token, naming a Worker, creating R2, deploying Edge, or creating another ChatGPT Connector. An empty local `~/.config/herdr-mcp` directory does **not** mean this is the user's first Herdr computer.
+
+- If the user supplied a Herdr pairing address, this computer is joining an existing Worker. Install/verify the local runtime and macOS permission, then use `herdr-mcp worker connect "<pairing-address>"`. The CLI uses the macOS Computer Name by default; pass `--name` only when the user explicitly wants a different initial display name. Skip Worker/R2/Connector creation.
+- If the user says another Herdr computer already exists but no pairing address is available, use an authorized existing computer to run `herdr-mcp worker pair`, then consume that one-time pairing on the new computer with `worker connect`. Reuse the existing public MCP/OAuth origin.
+- If the user explicitly confirms this is the first Herdr computer/fleet, continue with the first-owner Cloudflare path below.
+- If intent is unclear, ask exactly one ownership question: **create the first Herdr Worker, or join an existing Herdr Worker?** Do not infer the answer from missing local credentials.
+- Pairing, old-Worker upgrade, hostname reachability, or permission failures stay on the existing-fleet repair path. Never fall back to creating a random-suffixed Worker, R2 bucket, or Connector unless the user explicitly changes the fleet intent.
 
 ## 1. Prerequisites
 
@@ -36,8 +44,8 @@ Do this before any install step, and repeat after installing:
 
 1. Check the actual binary: `ls -l ~/.local/bin/herdr-mcp ~/.local/bin/herdr` and run it by absolute path if present.
 2. Check the user's interactive-shell PATH separately: `zsh -ic 'command -v herdr-mcp'` (or the user's login shell). A present binary with an empty `command -v` result is **`installed_but_not_on_shell_path`**, not a missing installation — do not reinstall, and do not create a second PATH owner or a repository-linked user CLI.
-3. Self-heal in this order: `export PATH="$HOME/.local/bin:$PATH"` for the current process first, so subsequent steps are not blocked; then persist the fix durably and idempotently — append the same `export` line to the user's `~/.zprofile`/`~/.zshrc` only after checking it is not already present (`grep -q '.local/bin' ~/.zshrc`). If the shell startup configuration must not be modified, say so explicitly and continue using absolute paths.
-4. Prove both surfaces before continuing: `herdr-mcp --version` in the current shell, and `zsh -lc 'command -v herdr-mcp'` in a fresh login shell. This prevents the `command not found` failure mode that otherwise appears after the Agent's session ends.
+3. Self-heal in this order: `export PATH="$HOME/.local/bin:$PATH"` for the current process first, so subsequent steps are not blocked; then persist the fix durably and idempotently. For zsh, set `line='export PATH="$HOME/.local/bin:$PATH"'` and use `grep -Fqx "$line" "$HOME/.zshrc" 2>/dev/null || printf '\n%s\n' "$line" >> "$HOME/.zshrc"`; do not treat an unrelated `.local/bin` substring as proof that the exact PATH entry exists. If the shell startup configuration must not be modified, say so explicitly and continue using absolute paths.
+4. Prove both surfaces before continuing: run `herdr-mcp --version` in the current shell, `zsh -ic 'command -v herdr && herdr --version'` in a fresh interactive shell, and `zsh -lc 'command -v herdr-mcp'` in a fresh login shell. This prevents the `command not found` failure mode that otherwise appears after the Agent's session ends.
 
 ### macOS permission preflight: verify TCC/FDA before background setup
 
@@ -159,7 +167,7 @@ node provision-r2.mjs --config wrangler.user.toml
 npx wrangler deploy --config wrangler.user.toml
 ```
 
-Never overwrite a pre-existing Worker unless this install can prove it owns it; choose a machine-specific/random-suffixed name instead. Then store the WSS shared secret as a Cloudflare Worker secret:
+Never overwrite a pre-existing Worker unless this install can prove it owns it. If the intended name already exists, stop and determine whether it is the user's existing Herdr Worker; do **not** evade that ownership check by creating a random-suffixed Worker. Only an explicitly confirmed first-fleet install may choose a new unique Worker name after proving the existing Worker is unrelated. Then store the WSS shared secret as a Cloudflare Worker secret:
 
 ```bash
 printf '%s' "$LINK_SHARED_SECRET" | npx wrangler secret put LINK_SHARED_SECRET --config wrangler.user.toml

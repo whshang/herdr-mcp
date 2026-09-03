@@ -20,10 +20,9 @@ The goal is to remove the bootstrap credential from the normal workflow as soon 
 The project helper creates a token scoped to:
 
 - **Workers Routes Write** for the target zone;
-- **Workers Scripts Write** for the corresponding account;
-- **Workers R2 Storage Write** for the corresponding account, so Worker setup can create and verify the private artifact bucket before deploy.
+- **Workers Scripts Write** for the corresponding account.
 
-It does not request broad account administrator access by default. Cloudflare may label the R2 capability as **Workers R2 Storage:Edit** in parts of the UI; the API permission-group name used by the helper is **Workers R2 Storage Write**.
+It does not request broad account administrator access or R2 access by default. The private R2 artifact relay is an explicit optional capability: enable it only when needed, after the operator accepts Cloudflare's R2 subscription/payment setup, and then use a separately R2-capable deployment credential for bucket provisioning.
 
 ### Core install vs optional artifact relay
 
