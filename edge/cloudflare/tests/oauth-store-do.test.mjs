@@ -83,6 +83,21 @@ const client = {
 };
 const token = (exp = 5000) => ({ client_id: "c1", resource: "https://issuer/mcp", scope: "mcp", expires_at: exp });
 const code = (exp = 5000) => ({ client_id: "c1", redirect_uri: "https://example.com/cb", code_challenge: "x".repeat(43), resource: "https://issuer/mcp", expires_at: exp });
+const approval = (overrides = {}) => ({
+  client_id: "c1",
+  redirect_uri: "https://example.com/cb",
+  code_challenge: "x".repeat(43),
+  resource: "https://issuer/mcp",
+  scope: "mcp",
+  state: "state-1",
+  approval_code_hash: "approval-hash",
+  resume_hash: "resume-hash",
+  created_at_ms: 100,
+  expires_at_ms: 10_000,
+  attempts: 0,
+  status: "pending",
+  ...overrides,
+});
 
 async function body(response) { return response.json(); }
 
@@ -136,6 +151,151 @@ test("authorization code consume is one-use and expiry-aware", async () => {
   const expired = await h.post("/internal/oauth/code/consume", { hash: "expired", now_ms: 100 });
   assert.equal((await body(expired)).code, "expired");
   assert.equal(h.storage.map.has("code:expired"), false);
+});
+
+test("connector approval is request-bound, five wrong attempts lock it, and correct approval creates a grant", async () => {
+  const h = harness();
+  assert.equal((await body(await h.post("/internal/oauth/approval/put", {
+    request_id: "req-1",
+    record: approval(),
+    now_ms: 100,
+  }))).ok, true);
+
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const wrong = await h.post("/internal/oauth/approval/approve", {
+      request_id: "req-1",
+      code_hash: `wrong-${attempt}`,
+      approver: "device:owner",
+      now_ms: 200 + attempt,
+    });
+    assert.equal(wrong.status, 403);
+    assert.equal((await body(wrong)).code, "invalid_code");
+  }
+  const locked = await h.post("/internal/oauth/approval/approve", {
+    request_id: "req-1",
+    code_hash: "wrong-5",
+    approver: "device:owner",
+    now_ms: 300,
+  });
+  assert.equal(locked.status, 423);
+  assert.equal((await body(locked)).code, "locked");
+  const correctAfterLock = await h.post("/internal/oauth/approval/approve", {
+    request_id: "req-1",
+    code_hash: "approval-hash",
+    approver: "device:owner",
+    now_ms: 301,
+  });
+  assert.equal(correctAfterLock.status, 423);
+
+  await h.post("/internal/oauth/approval/put", {
+    request_id: "req-2",
+    record: approval({ approval_code_hash: "good", resume_hash: "resume-2" }),
+    now_ms: 100,
+  });
+  const ok = await body(await h.post("/internal/oauth/approval/approve", {
+    request_id: "req-2",
+    code_hash: "good",
+    approver: "device:owner",
+    now_ms: 400,
+  }));
+  assert.equal(ok.ok, true);
+  assert.equal(ok.record.client_id, "c1");
+  const grant = await body(await h.post("/internal/oauth/grant/get", { client_id: "c1" }));
+  assert.equal(grant.record.status, "active");
+  assert.equal(grant.record.can_approve_connectors, true);
+  assert.equal(grant.record.approved_by, "device:owner");
+});
+
+test("connector approval resume token is independent, one-use, and cannot be substituted", async () => {
+  const h = harness();
+  await h.post("/internal/oauth/approval/put", {
+    request_id: "req-resume",
+    record: approval({ approval_code_hash: "good", resume_hash: "resume-good" }),
+    now_ms: 100,
+  });
+  await h.post("/internal/oauth/approval/approve", {
+    request_id: "req-resume",
+    code_hash: "good",
+    approver: "device:owner",
+    now_ms: 200,
+  });
+  const wrongResume = await h.post("/internal/oauth/approval/consume", {
+    request_id: "req-resume",
+    resume_hash: "resume-wrong",
+    now_ms: 300,
+  });
+  assert.equal(wrongResume.status, 403);
+  assert.equal((await body(wrongResume)).code, "invalid_resume");
+
+  const first = await body(await h.post("/internal/oauth/approval/consume", {
+    request_id: "req-resume",
+    resume_hash: "resume-good",
+    now_ms: 301,
+  }));
+  assert.equal(first.ok, true);
+  assert.equal(first.record.redirect_uri, "https://example.com/cb");
+  assert.equal(first.record.code_challenge, "x".repeat(43));
+  assert.equal(first.record.state, "state-1");
+
+  const replay = await h.post("/internal/oauth/approval/consume", {
+    request_id: "req-resume",
+    resume_hash: "resume-good",
+    now_ms: 302,
+  });
+  assert.equal(replay.status, 404);
+});
+
+test("connector grant revoke fences issued JWT and refresh credentials while legacy no-grant access remains compatible", async () => {
+  const h = harness();
+  const legacyIssued = await body(await h.post("/internal/oauth/token/issue", {
+    client_id: "legacy-client",
+    resource: "https://issuer/mcp",
+    now_sec: 1000,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 10000,
+  }));
+  const legacyVerify = await h.post("/internal/oauth/access/verify", {
+    token: legacyIssued.token.access_token,
+    now_sec: 1001,
+  });
+  assert.equal(legacyVerify.status, 200, "pre-v0.4.6 clients without grant records keep ordinary access");
+
+  await h.post("/internal/oauth/approval/put", {
+    request_id: "req-revoke",
+    record: approval({ client_id: "c-revoke", approval_code_hash: "good", resume_hash: "resume" }),
+    now_ms: 100,
+  });
+  await h.post("/internal/oauth/approval/approve", {
+    request_id: "req-revoke",
+    code_hash: "good",
+    approver: "device:owner",
+    now_ms: 200,
+  });
+  const issued = await body(await h.post("/internal/oauth/token/issue", {
+    client_id: "c-revoke",
+    resource: "https://issuer/mcp",
+    now_sec: 1000,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 10000,
+  }));
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: issued.token.access_token, now_sec: 1001 })).status, 200);
+
+  const revoked = await body(await h.post("/internal/oauth/grant/revoke", {
+    client_id: "c-revoke",
+    revoked_by: "device:owner",
+    now_ms: 400,
+  }));
+  assert.equal(revoked.ok, true);
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: issued.token.access_token, now_sec: 1002 })).status, 401);
+  const refreshHash = await hashOpaqueToken(issued.token.refresh_token);
+  assert.equal((await h.post("/internal/oauth/refresh/get", { hash: refreshHash, now_sec: 1002 })).status, 404);
+  assert.equal((await h.post("/internal/oauth/token/issue", {
+    client_id: "c-revoke",
+    resource: "https://issuer/mcp",
+    now_sec: 1002,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 10000,
+  })).status, 400);
 });
 
 test("signing key is generated once, private JWK never leaves the internal public response", async () => {
@@ -219,7 +379,7 @@ test("bulk import is bounded, validates, and is idempotent without overwrite", a
   assert.deepEqual(second.result.tokens, { imported: 0, skipped: 1, invalid: 1 });
   assert.deepEqual(second.result.refresh, { imported: 0, skipped: 1, invalid: 0 });
   const stats = await body(await h.get("/internal/oauth/stats"));
-  assert.deepEqual(stats, { ok: true, clients: 1, access: 1, refresh: 1, codes: 0 });
+  assert.deepEqual(stats, { ok: true, clients: 1, access: 1, refresh: 1, codes: 0, approvals: 0, grants: 0 });
 });
 
 test("bulk import rejects too many records and large declared bodies", async () => {

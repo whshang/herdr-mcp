@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import worker from "../dist/index.js";
 import { buildLinkAuthProtocol } from "../dist/auth.js";
 import { DeviceRegistryDO } from "../dist/device-registry-do.js";
+import { OAuthStoreDO } from "../dist/oauth-store-do.js";
 
 // Transaction-capable fake: concurrent transactions are serialized like a real
 // Durable Object storage transaction, so the race test exercises the same
@@ -118,6 +119,80 @@ async function pair(env, name) {
   assert.equal(consume.headers.get("cache-control"), "no-store");
   return consume.json();
 }
+
+test("new Connector requires explicit exact owner-device approval; generic owner bearer is insufficient", async () => {
+  const h = makeEnv();
+  const oauthStorage = new FakeStorage();
+  const oauth = new OAuthStoreDO({ storage: oauthStorage }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+
+  const registration = await worker.fetch(new Request("https://edge.example/oauth/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      redirect_uris: ["https://client.example/callback"],
+      token_endpoint_auth_method: "none",
+      client_name: "Test Connector",
+    }),
+  }), h.env);
+  assert.equal(registration.status, 201);
+  const client = await registration.json();
+
+  const authorize = new URL("https://edge.example/oauth/authorize");
+  authorize.searchParams.set("client_id", client.client_id);
+  authorize.searchParams.set("redirect_uri", "https://client.example/callback");
+  authorize.searchParams.set("response_type", "code");
+  authorize.searchParams.set("code_challenge", "A".repeat(43));
+  authorize.searchParams.set("code_challenge_method", "S256");
+  authorize.searchParams.set("state", "state-connector");
+  const pendingResponse = await worker.fetch(new Request(authorize), h.env);
+  assert.equal(pendingResponse.status, 200);
+  const html = await pendingResponse.text();
+  const requestId = /const requestId="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
+  const resumeToken = /const resumeToken="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
+  const approvalCode = /<p class="code">(\d{6})<\/p>/.exec(html)?.[1];
+  assert.ok(requestId && resumeToken && approvalCode);
+
+  const unauthInspect = await worker.fetch(post("/connectors/inspect", { request_id: requestId }), h.env);
+  assert.equal(unauthInspect.status, 401);
+  const genericOwner = await worker.fetch(post("/connectors/approve", { request_id: requestId, code: approvalCode }, "owner-secret"), h.env);
+  assert.equal(genericOwner.status, 401, "generic MCP/operator bearer must not bootstrap connector approval authority");
+
+  const inspect = await worker.fetch(postAsWorkstation(
+    "/connectors/inspect",
+    { request_id: requestId },
+    "prod-real-runtime",
+    "legacy-secret",
+  ), h.env);
+  assert.equal(inspect.status, 200);
+  const details = await inspect.json();
+  assert.equal(details.client_id, client.client_id);
+  assert.equal(details.client_name, "Test Connector");
+  assert.equal(details.redirect_uri, "https://client.example/callback");
+  assert.equal(details.scope, "mcp");
+
+  const approved = await worker.fetch(postAsWorkstation(
+    "/connectors/approve",
+    { request_id: requestId, code: approvalCode },
+    "prod-real-runtime",
+    "legacy-secret",
+  ), h.env);
+  assert.equal(approved.status, 200);
+  assert.equal((await approved.json()).client_id, client.client_id);
+
+  const poll = new URL("https://edge.example/oauth/authorize/poll");
+  poll.searchParams.set("request_id", requestId);
+  poll.searchParams.set("resume_token", resumeToken);
+  const settled = await worker.fetch(new Request(poll), h.env);
+  assert.equal(settled.status, 200);
+  const settledBody = await settled.json();
+  assert.equal(settledBody.status, "approved");
+  const redirect = new URL(settledBody.redirect);
+  assert.equal(redirect.origin + redirect.pathname, "https://client.example/callback");
+  assert.equal(redirect.searchParams.get("state"), "state-connector");
+  assert.ok(redirect.searchParams.get("code"));
+});
 
 test("pairing creation requires owner auth and returns one-time material with worker origin metadata", async () => {
   const { env, storage } = makeEnv();

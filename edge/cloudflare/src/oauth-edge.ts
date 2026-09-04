@@ -185,6 +185,32 @@ export async function hashOpaqueToken(token: string): Promise<string> {
   return bytesToHex(new Uint8Array(digest));
 }
 
+/**
+ * Store a short human approval code only as a deployment-secret-bound HMAC.
+ * A Durable Object storage snapshot must not turn the six-digit code into an
+ * offline 1,000,000-value brute-force problem.
+ */
+export async function hashOAuthApprovalCode(
+  secret: string,
+  requestId: string,
+  code: string,
+): Promise<string> {
+  if (!secret) throw new Error("oauth approval secret is required");
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const digest = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    enc.encode(`herdr-mcp-oauth-approval:${requestId}:${code}`),
+  );
+  return bytesToHex(new Uint8Array(digest));
+}
+
 // ---------------------------------------------------------------------------
 // JWT access-token verification (RS256, stateless)
 // ---------------------------------------------------------------------------

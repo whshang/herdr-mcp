@@ -6,6 +6,8 @@ const CLIENT_PREFIX = "client:";
 const ACCESS_PREFIX = "access:";
 const REFRESH_PREFIX = "refresh:";
 const CODE_PREFIX = "code:";
+const APPROVAL_PREFIX = "approval:";
+const GRANT_PREFIX = "grant:";
 const SIGNING_KEY = "signing:key:v1";
 const MAX_IMPORT_BYTES = 256 * 1024;
 const MAX_IMPORT_RECORDS = 512;
@@ -34,6 +36,35 @@ export interface OAuthCodeRecord {
   code_challenge: string;
   resource: string;
   expires_at: number;
+}
+
+export interface OAuthApprovalRecord {
+  client_id: string;
+  redirect_uri: string;
+  code_challenge: string;
+  resource: string;
+  scope: string;
+  state: string;
+  approval_code_hash: string;
+  resume_hash: string;
+  created_at_ms: number;
+  expires_at_ms: number;
+  attempts: number;
+  status: "pending" | "approved" | "locked";
+  approved_at_ms?: number;
+  approved_by?: string;
+}
+
+export interface OAuthConnectorGrantRecord {
+  client_id: string;
+  resource: string;
+  scope: string;
+  status: "active" | "revoked";
+  can_approve_connectors: boolean;
+  approved_at_ms: number;
+  approved_by: string;
+  revoked_at_ms?: number;
+  revoked_by?: string;
 }
 
 type StoredJwk = JsonWebKey & { kid?: string; alg?: string; use?: string };
@@ -147,6 +178,60 @@ export function normalizeOAuthCode(value: unknown, nowMs = Date.now()): OAuthCod
   };
 }
 
+function normalizeOAuthApproval(value: unknown, nowMs = Date.now()): OAuthApprovalRecord | null {
+  if (!record(value)) return null;
+  if (!boundedString(value.client_id, 4096)) return null;
+  if (!boundedString(value.redirect_uri, 4096)) return null;
+  if (!boundedString(value.code_challenge, 256)) return null;
+  if (!boundedString(value.resource, 4096)) return null;
+  if (typeof value.scope !== "string" || value.scope.length === 0 || value.scope.length > 512) return null;
+  if (typeof value.state !== "string" || value.state.length > 4096) return null;
+  if (!boundedString(value.approval_code_hash, 256) || !boundedString(value.resume_hash, 256)) return null;
+  if (!finiteEpoch(value.created_at_ms) || !finiteEpoch(value.expires_at_ms) || value.expires_at_ms <= nowMs) return null;
+  if (!Number.isSafeInteger(value.attempts) || (value.attempts as number) < 0 || (value.attempts as number) > 5) return null;
+  if (value.status !== "pending" && value.status !== "approved" && value.status !== "locked") return null;
+  const approvedAt = finiteEpoch(value.approved_at_ms) ? value.approved_at_ms as number : undefined;
+  const approvedBy = typeof value.approved_by === "string" && value.approved_by.length <= 4096 ? value.approved_by : undefined;
+  return {
+    client_id: value.client_id,
+    redirect_uri: value.redirect_uri,
+    code_challenge: value.code_challenge,
+    resource: value.resource,
+    scope: value.scope,
+    state: value.state,
+    approval_code_hash: value.approval_code_hash,
+    resume_hash: value.resume_hash,
+    created_at_ms: value.created_at_ms,
+    expires_at_ms: value.expires_at_ms,
+    attempts: value.attempts as number,
+    status: value.status,
+    ...(approvedAt !== undefined ? { approved_at_ms: approvedAt } : {}),
+    ...(approvedBy !== undefined ? { approved_by: approvedBy } : {}),
+  };
+}
+
+function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantRecord | null {
+  if (!record(value)) return null;
+  if (!boundedString(value.client_id, 4096) || !boundedString(value.resource, 4096)) return null;
+  if (typeof value.scope !== "string" || value.scope.length === 0 || value.scope.length > 512) return null;
+  if (value.status !== "active" && value.status !== "revoked") return null;
+  if (typeof value.can_approve_connectors !== "boolean") return null;
+  if (!finiteEpoch(value.approved_at_ms) || !boundedString(value.approved_by, 4096)) return null;
+  const revokedAt = finiteEpoch(value.revoked_at_ms) ? value.revoked_at_ms as number : undefined;
+  const revokedBy = typeof value.revoked_by === "string" && value.revoked_by.length <= 4096 ? value.revoked_by : undefined;
+  return {
+    client_id: value.client_id,
+    resource: value.resource,
+    scope: value.scope,
+    status: value.status,
+    can_approve_connectors: value.can_approve_connectors,
+    approved_at_ms: value.approved_at_ms,
+    approved_by: value.approved_by,
+    ...(revokedAt !== undefined ? { revoked_at_ms: revokedAt } : {}),
+    ...(revokedBy !== undefined ? { revoked_by: revokedBy } : {}),
+  };
+}
+
 async function boundedJson(request: Request): Promise<{ ok: true; value: unknown } | { ok: false; status: number }> {
   const declared = Number(request.headers.get("content-length") ?? "0");
   if (Number.isFinite(declared) && declared > MAX_IMPORT_BYTES) return { ok: false, status: 413 };
@@ -181,6 +266,12 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/refresh/consume") return this.consumeRefresh(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/code/put") return this.putCode(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/code/consume") return this.consumeCode(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/approval/put") return this.putApproval(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/approval/get") return this.getApproval(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/approval/approve") return this.approveApproval(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/approval/consume") return this.consumeApproval(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/grant/get") return this.getGrant(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/signing/ensure") return this.signingPublicKey();
     if (request.method === "POST" && url.pathname === "/internal/oauth/access/verify") return this.verifyAccess(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/token/issue") return this.issuePair(request);
@@ -277,6 +368,177 @@ export class OAuthStoreDO {
     return json({ ok: true, record: value });
   }
 
+  private async putApproval(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const requestId = body?.request_id;
+    const nowMs = finiteEpoch(body?.now_ms) ? body!.now_ms as number : Date.now();
+    const normalized = normalizeOAuthApproval(body?.record, nowMs);
+    if (!boundedString(requestId, 256) || !normalized) return json({ ok: false, code: "bad_request" }, 400);
+    const key = APPROVAL_PREFIX + requestId;
+    if (await this.state.storage.get(key) !== undefined) return json({ ok: false, code: "already_exists" }, 409);
+    await this.state.storage.put(key, normalized);
+    return json({ ok: true });
+  }
+
+  private async getApproval(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const requestId = body?.request_id;
+    const nowMs = finiteEpoch(body?.now_ms) ? body!.now_ms as number : Date.now();
+    if (!boundedString(requestId, 256)) return json({ ok: false, code: "bad_request" }, 400);
+    const key = APPROVAL_PREFIX + requestId;
+    const current = await this.state.storage.get<OAuthApprovalRecord>(key);
+    if (!current) return json({ ok: false, code: "not_found" }, 404);
+    if (current.expires_at_ms <= nowMs) {
+      await this.state.storage.delete(key);
+      return json({ ok: false, code: "expired" }, 404);
+    }
+    return json({ ok: true, record: current });
+  }
+
+  private async approveApproval(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const requestId = body?.request_id;
+    const codeHash = body?.code_hash;
+    const approver = body?.approver;
+    const nowMs = finiteEpoch(body?.now_ms) ? body!.now_ms as number : Date.now();
+    if (!boundedString(requestId, 256) || !boundedString(codeHash, 256) || !boundedString(approver, 4096)) {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    const key = APPROVAL_PREFIX + requestId;
+    let result: { ok: boolean; code?: string; record?: OAuthApprovalRecord } = { ok: false, code: "not_found" };
+    await this.state.storage.transaction(async (txn) => {
+      const current = await txn.get<OAuthApprovalRecord>(key);
+      if (!current) return;
+      if (current.expires_at_ms <= nowMs) {
+        await txn.delete(key);
+        result = { ok: false, code: "expired" };
+        return;
+      }
+      if (current.status === "locked") {
+        result = { ok: false, code: "locked" };
+        return;
+      }
+      if (current.approval_code_hash !== codeHash) {
+        const attempts = Math.min(5, current.attempts + 1);
+        await txn.put(key, { ...current, attempts, status: attempts >= 5 ? "locked" : current.status });
+        result = { ok: false, code: attempts >= 5 ? "locked" : "invalid_code" };
+        return;
+      }
+      if (current.status === "approved") {
+        result = { ok: true, record: current };
+        return;
+      }
+      const approved: OAuthApprovalRecord = {
+        ...current,
+        status: "approved",
+        approved_at_ms: nowMs,
+        approved_by: approver,
+      };
+      const grant: OAuthConnectorGrantRecord = {
+        client_id: current.client_id,
+        resource: current.resource,
+        scope: current.scope,
+        status: "active",
+        can_approve_connectors: true,
+        approved_at_ms: nowMs,
+        approved_by: approver,
+      };
+      await txn.put(key, approved);
+      await txn.put(GRANT_PREFIX + current.client_id, grant);
+      result = { ok: true, record: approved };
+    });
+    if (!result.ok) {
+      const status = result.code === "invalid_code" ? 403
+        : result.code === "locked" ? 423
+          : 404;
+      return json({ ok: false, code: result.code }, status);
+    }
+    return json({ ok: true, record: result.record });
+  }
+
+  private async consumeApproval(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const requestId = body?.request_id;
+    const resumeHash = body?.resume_hash;
+    const nowMs = finiteEpoch(body?.now_ms) ? body!.now_ms as number : Date.now();
+    if (!boundedString(requestId, 256) || !boundedString(resumeHash, 256)) return json({ ok: false, code: "bad_request" }, 400);
+    const key = APPROVAL_PREFIX + requestId;
+    let result: { ok: boolean; code?: string; record?: OAuthApprovalRecord } = { ok: false, code: "not_found" };
+    await this.state.storage.transaction(async (txn) => {
+      const current = await txn.get<OAuthApprovalRecord>(key);
+      if (!current) return;
+      if (current.expires_at_ms <= nowMs) {
+        await txn.delete(key);
+        result = { ok: false, code: "expired" };
+        return;
+      }
+      if (current.resume_hash !== resumeHash) {
+        result = { ok: false, code: "invalid_resume" };
+        return;
+      }
+      if (current.status === "pending") {
+        result = { ok: false, code: "pending" };
+        return;
+      }
+      if (current.status === "locked") {
+        result = { ok: false, code: "locked" };
+        return;
+      }
+      await txn.delete(key);
+      result = { ok: true, record: current };
+    });
+    if (!result.ok) {
+      const status = result.code === "pending" ? 202
+        : result.code === "invalid_resume" ? 403
+          : result.code === "locked" ? 423
+            : 404;
+      return json({ ok: false, code: result.code }, status);
+    }
+    return json({ ok: true, record: result.record });
+  }
+
+  private async getGrant(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const clientId = body?.client_id;
+    if (!boundedString(clientId, 4096)) return json({ ok: false, code: "bad_request" }, 400);
+    const value = await this.state.storage.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + clientId);
+    return value ? json({ ok: true, record: value }) : json({ ok: false, code: "not_found" }, 404);
+  }
+
+  private async revokeGrant(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const clientId = body?.client_id;
+    const revokedBy = body?.revoked_by;
+    const nowMs = finiteEpoch(body?.now_ms) ? body!.now_ms as number : Date.now();
+    if (!boundedString(clientId, 4096) || !boundedString(revokedBy, 4096)) return json({ ok: false, code: "bad_request" }, 400);
+    const key = GRANT_PREFIX + clientId;
+    const current = await this.state.storage.get<OAuthConnectorGrantRecord>(key);
+    if (!current) return json({ ok: false, code: "not_found" }, 404);
+    const revoked: OAuthConnectorGrantRecord = {
+      ...current,
+      status: "revoked",
+      revoked_at_ms: nowMs,
+      revoked_by: revokedBy,
+    };
+    await this.state.storage.put(key, revoked);
+    const [refresh, access] = await Promise.all([
+      this.state.storage.list<OAuthTokenRecord>({ prefix: REFRESH_PREFIX }),
+      this.state.storage.list<OAuthTokenRecord>({ prefix: ACCESS_PREFIX }),
+    ]);
+    const deletes: string[] = [];
+    for (const [tokenKey, token] of refresh) if (token.client_id === clientId) deletes.push(tokenKey);
+    for (const [tokenKey, token] of access) if (token.client_id === clientId) deletes.push(tokenKey);
+    if (deletes.length > 0) await Promise.all(deletes.map((tokenKey) => this.state.storage.delete(tokenKey)));
+    return json({ ok: true, client_id: clientId, revoked_at_ms: nowMs, deleted_tokens: deletes.length });
+  }
+
+  private async grantAllowsAccess(clientId: string): Promise<boolean> {
+    const grant = await this.state.storage.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + clientId);
+    // Missing means a pre-v0.4.6 legacy grant. Preserve ordinary MCP access,
+    // but approval authority is never inferred from a missing grant record.
+    return grant?.status !== "revoked";
+  }
+
   private async ensureSigningKey(): Promise<SigningKeyRecord> {
     if (this.signingKeyPromise) return this.signingKeyPromise;
     this.signingKeyPromise = (async () => {
@@ -338,7 +600,12 @@ export class OAuthStoreDO {
         );
         const verifier = createRs256AccessTokenVerifier(createOAuthIdentity(issuer), publicKey);
         const verdict = await verifier.verify(token, nowSec);
-        if (verdict.ok) return json({ ok: true, client_id: verdict.clientId ?? null, source: "edge_jwt" });
+        if (verdict.ok) {
+          if (verdict.clientId && !(await this.grantAllowsAccess(verdict.clientId))) {
+            return json({ ok: false, code: "invalid_token" }, 401);
+          }
+          return json({ ok: true, client_id: verdict.clientId ?? null, source: "edge_jwt" });
+        }
       } catch {
         // Continue to the opaque compatibility lookup below.
       }
@@ -352,6 +619,7 @@ export class OAuthStoreDO {
       await this.state.storage.delete(key);
       return json({ ok: false, code: "invalid_token" }, 401);
     }
+    if (!(await this.grantAllowsAccess(legacy.client_id))) return json({ ok: false, code: "invalid_token" }, 401);
     return json({ ok: true, client_id: legacy.client_id, source: "opaque" });
   }
 
@@ -411,6 +679,7 @@ export class OAuthStoreDO {
   private async issuePair(request: Request): Promise<Response> {
     const input = this.parseIssueInput(await this.body(request));
     if (!input) return json({ ok: false, code: "bad_request" }, 400);
+    if (!(await this.grantAllowsAccess(input.client_id))) return json({ ok: false, code: "invalid_grant" }, 400);
     return json({ ok: true, token: await this.createPair(input) });
   }
 
@@ -430,6 +699,7 @@ export class OAuthStoreDO {
     if (previous.client_id !== input.client_id || previous.resource !== input.resource) {
       return json({ ok: false, code: "invalid_grant" }, 400);
     }
+    if (!(await this.grantAllowsAccess(input.client_id))) return json({ ok: false, code: "invalid_grant" }, 400);
     return json({ ok: true, token: await this.createPair(input) });
   }
 
@@ -582,11 +852,13 @@ export class OAuthStoreDO {
   }
 
   private async stats(): Promise<Response> {
-    const [clients, access, refresh, codes] = await Promise.all([
+    const [clients, access, refresh, codes, approvals, grants] = await Promise.all([
       this.state.storage.list({ prefix: CLIENT_PREFIX }),
       this.state.storage.list({ prefix: ACCESS_PREFIX }),
       this.state.storage.list({ prefix: REFRESH_PREFIX }),
       this.state.storage.list({ prefix: CODE_PREFIX }),
+      this.state.storage.list({ prefix: APPROVAL_PREFIX }),
+      this.state.storage.list({ prefix: GRANT_PREFIX }),
     ]);
     return json({
       ok: true,
@@ -594,6 +866,8 @@ export class OAuthStoreDO {
       access: access.size,
       refresh: refresh.size,
       codes: codes.size,
+      approvals: approvals.size,
+      grants: grants.size,
     });
   }
 }

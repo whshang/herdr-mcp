@@ -43,3 +43,14 @@ test("worker routes MCP server card before the generic /.well-known fallback", a
   assert.equal(body.name, "herdr-mcp");
   assert.equal(body.version, packageJson.version);
 });
+
+test("OAuth authorization fails closed when the short-code HMAC secret is unavailable", async () => {
+  const response = await worker.fetch(
+    new Request(`${issuer}/oauth/authorize?client_id=anything`),
+    env(),
+  );
+  assert.equal(response.status, 503);
+  const body = await response.json();
+  assert.equal(body.error, "server_error");
+  assert.equal(body.error_description, "OAuth owner approval is not configured");
+});

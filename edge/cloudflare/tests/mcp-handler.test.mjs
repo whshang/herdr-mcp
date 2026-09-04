@@ -22,6 +22,8 @@ function deps(over = {}) {
       listDevices: async () => over.devices ?? [],
       createPairing: over.createPairing,
       revokeDevice: over.revokeDevice,
+      approveConnector: over.approveConnector,
+      revokeConnector: over.revokeConnector,
       resolveDevice: over.resolveDevice,
       forward: async (_stub, body) => {
         calls.push(JSON.parse(body));
@@ -522,6 +524,80 @@ test("herdr_call herdr_mcp.device.revoke executes at Edge only with immutable id
   );
   assert.equal(nameSelector.body.result.isError, true);
   assert.equal(nameSelector.body.result.structuredContent.code, "invalid_params");
+});
+
+test("connector approve/revoke private methods are Edge-local, schema-bounded, and add no public tool", async () => {
+  let approved = null;
+  let revoked = null;
+  const d = deps({
+    approveConnector: async (input) => {
+      approved = input;
+      return { ok: true, client_id: "dcr-abc", approved_at_ms: 1234 };
+    },
+    revokeConnector: async (clientId) => {
+      revoked = clientId;
+      return { ok: true };
+    },
+  });
+  const approve = await handleMcp(
+    req(736, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.connector.approve",
+        params: { request_id: "req-abc", code: "123456" },
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.deepEqual(approved, { request_id: "req-abc", code: "123456" });
+  assert.equal(approve.body.result.structuredContent.client_id, "dcr-abc");
+  assert.equal(d.calls.length, 0);
+  assert.equal(d.targets.length, 0);
+
+  const argvSecret = await handleMcp(
+    req(737, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.connector.approve",
+        params: { request_id: "req-abc", code: "123456", extra: true },
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(argvSecret.body.result.isError, true);
+  assert.equal(argvSecret.body.result.structuredContent.code, "invalid_params");
+
+  const noConfirm = await handleMcp(
+    req(738, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.connector.revoke",
+        params: { client_id: "dcr-abc" },
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(noConfirm.body.result.structuredContent.code, "confirmation_required");
+
+  const revoke = await handleMcp(
+    req(739, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.connector.revoke",
+        params: { client_id: "dcr-abc", confirm: true },
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(revoke.body.result.structuredContent.revoked, true);
+  assert.equal(revoked, "dcr-abc");
+
+  const listed = await handleMcp(req(740, "tools/list", {}), "legacy-default", d.value);
+  assert.equal(listed.body.result.tools.some((tool) => tool.name.includes("connector")), false);
 });
 
 test("explicit device routing selects one workstation and strips Edge-only device metadata", async () => {

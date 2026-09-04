@@ -51,7 +51,7 @@ import {
   resolveDeviceRoute,
 } from "./device-directory.js";
 import { authenticateMcpRequest } from "./oauth-mcp-auth.js";
-import { createOAuthIdentity } from "./oauth-edge.js";
+import { createOAuthIdentity, hashOAuthApprovalCode } from "./oauth-edge.js";
 import { createOAuthPublicStore, handleOAuthPublic } from "./oauth-public.js";
 
 export { DeviceRegistryDO, OAuthStoreDO, WorkstationDO };
@@ -174,7 +174,64 @@ export default {
         access: stats.access ?? 0,
         refresh: stats.refresh ?? 0,
         codes: stats.codes ?? 0,
+        approvals: stats.approvals ?? 0,
+        grants: stats.grants ?? 0,
       }, response.ok ? 200 : 503);
+    }
+
+    // ---- Connector approval bootstrap. Unlike the older generic owner
+    // helper, these routes deliberately accept ONLY the exact owner device
+    // credential. Pre-v0.4.6 OAuth tokens were issued without consent and
+    // therefore can never bootstrap connector-administration authority.
+    if (request.method === "POST" && url.pathname === "/connectors/inspect") {
+      const ownerDevice = await authenticateOwnerDevice(request, env);
+      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.request_id !== "string") {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const requestId = parsed.value.request_id.trim();
+      if (!requestId || requestId.length > 256) return noStoreJsonResponse({ ok: false, code: "invalid_connector_approval" }, 400);
+      const result = await inspectConnectorRequest(env, requestId);
+      return result.ok
+        ? noStoreJsonResponse(result)
+        : noStoreJsonResponse({ ok: false, code: result.code }, 404);
+    }
+
+    if (request.method === "POST" && url.pathname === "/connectors/approve") {
+      const ownerDevice = await authenticateOwnerDevice(request, env);
+      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value)) {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const requestId = typeof parsed.value.request_id === "string" ? parsed.value.request_id.trim() : "";
+      const code = typeof parsed.value.code === "string" ? parsed.value.code.trim() : "";
+      if (!requestId || requestId.length > 256 || !/^\d{6}$/.test(code)) {
+        return noStoreJsonResponse({ ok: false, code: "invalid_connector_approval" }, 400);
+      }
+      const result = await approveConnectorRequest(env, requestId, code, `device:${ownerDevice}`);
+      return result.ok
+        ? noStoreJsonResponse({ action: "connector_approve", ...result })
+        : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "invalid_code" ? 403 : result.code === "locked" ? 423 : 404);
+    }
+
+    if (request.method === "POST" && url.pathname === "/connectors/revoke") {
+      const ownerDevice = await authenticateOwnerDevice(request, env);
+      if (!ownerDevice) return noStoreJsonResponse({ ok: false, code: "connector_owner_device_required" }, 401);
+      const parsed = await readBodyBounded(request, 8 * 1024);
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.client_id !== "string") {
+        const code = parsed.ok ? "bad_request" : parsed.code;
+        return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
+      }
+      const clientId = parsed.value.client_id.trim();
+      if (!clientId || clientId.length > 4096) return noStoreJsonResponse({ ok: false, code: "invalid_client_id" }, 400);
+      const result = await revokeConnectorGrant(env, clientId, `device:${ownerDevice}`);
+      return result.ok
+        ? noStoreJsonResponse({ ok: true, action: "connector_revoke", client_id: clientId })
+        : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "connector_grant_not_found" ? 404 : 500);
     }
 
     // ---- Device pairing control plane. Pairing creation requires
@@ -520,6 +577,23 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
           revoked_at_ms: result.revoked_at_ms,
         };
       },
+      approveConnector: async (input) => {
+        if (!(await oauthClientCanApproveConnectors(env, devAuth.clientId))) {
+          return { ok: false, code: "connector_approval_authority_required" };
+        }
+        return approveConnectorRequest(
+          env,
+          input.request_id,
+          input.code,
+          `oauth:${devAuth.clientId}`,
+        );
+      },
+      revokeConnector: async (clientId) => {
+        if (!(await oauthClientCanApproveConnectors(env, devAuth.clientId))) {
+          return { ok: false, code: "connector_approval_authority_required" };
+        }
+        return revokeConnectorGrant(env, clientId, `oauth:${devAuth.clientId}`);
+      },
       resolveDevice: async (selector, args) => {
         const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
         return resolveDeviceRouteWithContext(registry, { selector, args: args as Record<string, unknown> | undefined, legacyWorkstationId: workstationId });
@@ -547,10 +621,20 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
 
 async function handleEdgeOAuthPublic(request: Request, env: Env): Promise<Response | null> {
   if (!env.OAUTH_ISSUER) return null;
+  if (!env.LINK_SHARED_SECRET) {
+    const path = new URL(request.url).pathname;
+    if (path === "/oauth/authorize" || path === "/oauth/authorize/poll") {
+      return noStoreJsonResponse({
+        error: "server_error",
+        error_description: "OAuth owner approval is not configured",
+      }, 503);
+    }
+  }
   const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
   return handleOAuthPublic(request, {
     identity: createOAuthIdentity(env.OAUTH_ISSUER),
     store: createOAuthPublicStore(stub),
+    approvalSecret: env.LINK_SHARED_SECRET ?? "",
     fetchFn: globalThis.fetch,
     serverName: "herdr-mcp",
     serverVersion: MCP_SERVER_VERSION,
@@ -683,17 +767,101 @@ async function authenticateOwner(request: Request, env: Env): Promise<boolean> {
   const owner = await authenticateEdgeMcpRequest(request, env);
   if (owner.ok) return true;
 
+  return (await authenticateOwnerDevice(request, env)) !== null;
+}
+
+async function authenticateOwnerDevice(request: Request, env: Env): Promise<string | null> {
+
   const workstationId = request.headers.get("x-herdr-workstation")?.trim() ?? "";
-  if (!env.DEFAULT_WORKSTATION_ID || workstationId !== env.DEFAULT_WORKSTATION_ID) return false;
+  if (!env.DEFAULT_WORKSTATION_ID || workstationId !== env.DEFAULT_WORKSTATION_ID) return null;
   const extracted = extractLinkCredential(request);
-  if (!extracted.ok) return false;
+  if (!extracted.ok) return null;
 
   const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
   const deviceAuth = await authenticateDeviceCredential(registry, workstationId, extracted.credential);
-  if (deviceAuth.ok) return true;
+  if (deviceAuth.ok) return workstationId;
   if (deviceAuth.code !== "device_not_found" && deviceAuth.code !== "device_credential_missing") {
-    return false;
+    return null;
   }
   const legacy = new SharedSecretLinkAuthenticator({ secret: env.LINK_SHARED_SECRET });
-  return legacy.authenticate(request, workstationId, Date.now()).ok;
+  return legacy.authenticate(request, workstationId, Date.now()).ok ? workstationId : null;
+}
+
+async function oauthClientCanApproveConnectors(env: Env, clientId: string | undefined): Promise<boolean> {
+  if (!clientId) return false;
+  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+  const store = createOAuthPublicStore(stub);
+  const grant = await store.getGrant(clientId);
+  return grant?.status === "active" && grant.can_approve_connectors === true;
+}
+
+async function approveConnectorRequest(
+  env: Env,
+  requestId: string,
+  code: string,
+  approver: string,
+): Promise<{ ok: true; client_id: string; approved_at_ms: number | null } | { ok: false; code: string }> {
+  if (!env.LINK_SHARED_SECRET) return { ok: false, code: "connector_approval_not_configured" };
+  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+  const store = createOAuthPublicStore(stub);
+  const result = await store.approveApproval(
+    requestId,
+    await hashOAuthApprovalCode(env.LINK_SHARED_SECRET, requestId, code),
+    approver,
+    Date.now(),
+  );
+  if (!result.ok) return { ok: false, code: result.code };
+  return {
+    ok: true,
+    client_id: result.record.client_id,
+    approved_at_ms: result.record.approved_at_ms ?? null,
+  };
+}
+
+async function inspectConnectorRequest(
+  env: Env,
+  requestId: string,
+): Promise<
+  | {
+      ok: true;
+      request_id: string;
+      client_id: string;
+      client_name: string | null;
+      redirect_uri: string;
+      resource: string;
+      scope: string;
+      status: string;
+      expires_at_ms: number;
+    }
+  | { ok: false; code: string }
+> {
+  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+  const store = createOAuthPublicStore(stub);
+  const approval = await store.getApproval(requestId, Date.now());
+  if (!approval) return { ok: false, code: "connector_approval_not_found" };
+  const client = await store.getClient(approval.client_id);
+  return {
+    ok: true,
+    request_id: requestId,
+    client_id: approval.client_id,
+    client_name: client?.client_name ?? null,
+    redirect_uri: approval.redirect_uri,
+    resource: approval.resource,
+    scope: approval.scope,
+    status: approval.status,
+    expires_at_ms: approval.expires_at_ms,
+  };
+}
+
+async function revokeConnectorGrant(
+  env: Env,
+  clientId: string,
+  revokedBy: string,
+): Promise<{ ok: true } | { ok: false; code: string }> {
+  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+  const store = createOAuthPublicStore(stub);
+  const grant = await store.getGrant(clientId);
+  if (!grant) return { ok: false, code: "connector_grant_not_found" };
+  if (!(await store.revokeGrant(clientId, revokedBy, Date.now()))) return { ok: false, code: "connector_revoke_failed" };
+  return { ok: true };
 }

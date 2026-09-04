@@ -8,6 +8,8 @@ import { OAuthStoreDO } from "../dist/oauth-store-do.js";
 import {
   createOAuthIdentity,
   createRs256AccessTokenVerifier,
+  hashOAuthApprovalCode,
+  hashOpaqueToken,
   oauthEdgeMetadata,
   protectedResourceEdgeMetadata,
 } from "../dist/oauth-edge.js";
@@ -36,6 +38,7 @@ const ISSUER = "https://herdr-mcp.example.com";
 const IDENTITY = createOAuthIdentity(ISSUER);
 const NOW_MS = 1_700_000_000_000;
 const NOW_SEC = Math.floor(NOW_MS / 1000);
+const APPROVAL_SECRET = "test-owner-approval-secret-not-for-production";
 
 function makeOptions(overrides = {}) {
   const storage = new StorageMock();
@@ -45,6 +48,7 @@ function makeOptions(overrides = {}) {
   return {
     identity: IDENTITY,
     store,
+    approvalSecret: APPROVAL_SECRET,
     nowMs: () => NOW_MS,
     serverName: "herdr-mcp",
     serverVersion: "0.3.26",
@@ -103,18 +107,64 @@ async function registerClient(opts, overrides = {}) {
   return resp.json();
 }
 
-/** Authorize for a client and return { code, verifier }. */
-async function makeAuthCode(opts, client_id, redirect_uri = "https://app.example/cb") {
+async function pendingAuthorization(opts, client_id, redirect_uri = "https://app.example/cb", state = "st") {
   const verifier = "E".repeat(43) + "zZ-._";
   const challenge = await s256Challenge(verifier);
   const qs = new URLSearchParams({
     client_id, redirect_uri, response_type: "code",
-    code_challenge: challenge, code_challenge_method: "S256", state: "st",
+    code_challenge: challenge, code_challenge_method: "S256", state,
   });
   const resp = await GET(`/oauth/authorize?${qs}`, opts);
-  assert.equal(resp.status, 302, "authorize should redirect");
-  const loc = new URL(resp.headers.get("location"));
-  return { code: loc.searchParams.get("code"), verifier };
+  assert.equal(resp.status, 200, "unapproved connector should receive the approval page, not an OAuth code");
+  assert.match(resp.headers.get("content-type") ?? "", /^text\/html/);
+  const html = await resp.text();
+  const requestId = /const requestId="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
+  const resumeToken = /const resumeToken="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
+  const approvalCode = /<p class="code">(\d{6})<\/p>/.exec(html)?.[1];
+  assert.ok(requestId, "approval page should expose request id");
+  assert.ok(resumeToken, "approval page should carry an opaque resume token for same-page polling");
+  assert.ok(approvalCode, "approval page should expose the one-time six-digit code");
+  assert.ok(html.includes(`herdr-mcp connector approve ${requestId}`));
+  assert.match(html, /already-authorized Herdr WebChat/);
+  return { requestId, resumeToken, approvalCode, verifier, challenge, state };
+}
+
+async function approvePending(opts, pending, approver = "device:dev_owner") {
+  const approved = await opts.store.approveApproval(
+    pending.requestId,
+    await hashOAuthApprovalCode(APPROVAL_SECRET, pending.requestId, pending.approvalCode),
+    approver,
+    NOW_MS,
+  );
+  assert.equal(approved.ok, true, "owner approval should succeed");
+  const poll = await GET(`/oauth/authorize/poll?${new URLSearchParams({
+    request_id: pending.requestId,
+    resume_token: pending.resumeToken,
+  })}`, opts);
+  assert.equal(poll.status, 200);
+  const body = await poll.json();
+  assert.equal(body.status, "approved");
+  const loc = new URL(body.redirect);
+  return { code: loc.searchParams.get("code"), location: loc };
+}
+
+/** Authorize for a client through the explicit owner-approval flow. */
+async function makeAuthCode(opts, client_id, redirect_uri = "https://app.example/cb") {
+  const grant = await opts.store.getGrant(client_id);
+  if (grant?.status === "active") {
+    const verifier = "E".repeat(43) + "zZ-._";
+    const challenge = await s256Challenge(verifier);
+    const qs = new URLSearchParams({
+      client_id, redirect_uri, response_type: "code",
+      code_challenge: challenge, code_challenge_method: "S256", state: "st",
+    });
+    const resp = await GET(`/oauth/authorize?${qs}`, opts);
+    assert.equal(resp.status, 302, "an already approved active connector grant should not require approval again");
+    return { code: new URL(resp.headers.get("location")).searchParams.get("code"), verifier };
+  }
+  const pending = await pendingAuthorization(opts, client_id, redirect_uri);
+  const approved = await approvePending(opts, pending);
+  return { code: approved.code, verifier: pending.verifier };
 }
 
 /** Exchange an auth code; body may be partially overridden. */
@@ -273,25 +323,30 @@ test("DCR client_secret_post stores SHA-256 hash, not the raw secret", async () 
 // 6. Authorization endpoint
 // ---------------------------------------------------------------------------
 
-test("authorize: registered client + PKCE S256 + RFC9207 iss + one-use code", async () => {
+test("authorize: first use requires owner approval, then issues RFC9207 one-use code", async () => {
   const opts = makeOptions();
   const { client_id } = await registerClient(opts, { token_endpoint_auth_method: "none" });
-  const verifier = "A".repeat(43) + "a-._~";
-  const challenge = await s256Challenge(verifier);
-  const qs = new URLSearchParams({
-    client_id, redirect_uri: "https://app.example/cb", response_type: "code",
-    code_challenge: challenge, code_challenge_method: "S256", state: "st123",
-  });
-  const resp = await GET(`/oauth/authorize?${qs}`, opts);
-  assert.equal(resp.status, 302);
-  const loc = new URL(resp.headers.get("location"));
+  const pending = await pendingAuthorization(opts, client_id, "https://app.example/cb", "st123");
+  const storedApproval = await opts.store.getApproval(pending.requestId, NOW_MS);
+  assert.ok(storedApproval);
+  assert.equal(
+    storedApproval.approval_code_hash,
+    await hashOAuthApprovalCode(APPROVAL_SECRET, pending.requestId, pending.approvalCode),
+  );
+  assert.notEqual(
+    storedApproval.approval_code_hash,
+    await hashOpaqueToken(`${pending.requestId}:${pending.approvalCode}`),
+    "a DO storage snapshot must not expose an offline-verifiable six-digit code hash",
+  );
+  const approved = await approvePending(opts, pending);
+  const loc = approved.location;
   assert.equal(loc.origin + loc.pathname, "https://app.example/cb");
   assert.ok(loc.searchParams.get("code"));
   assert.equal(loc.searchParams.get("state"), "st123");
   assert.equal(loc.searchParams.get("iss"), ISSUER); // RFC 9207
 
   // Exchange with the correct verifier (no secret needed — auth_method none).
-  const tok = await POST("/oauth/token", tokenBody(client_id, loc.searchParams.get("code"), verifier), opts);
+  const tok = await POST("/oauth/token", tokenBody(client_id, loc.searchParams.get("code"), pending.verifier), opts);
   assert.equal(tok.status, 200);
   const pair = await tok.json();
   assert.equal(pair.token_type, "Bearer");
@@ -307,7 +362,7 @@ test("authorize: registered client + PKCE S256 + RFC9207 iss + one-use code", as
   assert.equal(verdict.clientId, client_id);
 
   // One-use: replay identical exchange fails.
-  const replay = await POST("/oauth/token", tokenBody(client_id, loc.searchParams.get("code"), verifier), opts);
+  const replay = await POST("/oauth/token", tokenBody(client_id, loc.searchParams.get("code"), pending.verifier), opts);
   assert.equal(replay.status, 400);
   assert.equal((await replay.json()).error, "invalid_grant");
 });
