@@ -704,7 +704,10 @@ fn parse_automation_create(args: &[String]) -> Result<Command, String> {
 }
 
 fn validate_connector_id(connector_id: &str) -> Result<(), String> {
+    // Edge uses a randomBase64Url suffix; we only require a plausible length
+    // rather than an exact one (which would break if Edge changes suffix width).
     let valid = connector_id.starts_with("conn_")
+        && connector_id.len() >= 12
         && connector_id.len() <= 4096
         && connector_id[5..]
             .bytes()
