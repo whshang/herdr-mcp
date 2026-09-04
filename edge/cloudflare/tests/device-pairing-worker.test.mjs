@@ -194,6 +194,118 @@ test("new Connector requires explicit exact owner-device approval; generic owner
   assert.ok(redirect.searchParams.get("code"));
 });
 
+test("MCP Connector administration requires an active explicit admin grant at the Worker boundary", async () => {
+  let approvalCalls = 0;
+  const oauthStub = {
+    async fetch(request) {
+      const url = new URL(request.url);
+      const input = await request.json();
+      if (url.pathname === "/internal/oauth/access/verify" && input.token === "oauth-admin-token") {
+        return new Response(JSON.stringify({ ok: true, client_id: "admin-connector" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.pathname === "/internal/oauth/grant/get" && input.client_id === "admin-connector") {
+        return new Response(JSON.stringify({
+          ok: true,
+          record: {
+            client_id: "admin-connector",
+            resource: "https://edge.example/mcp",
+            scope: "mcp",
+            status: "active",
+            can_approve_connectors: true,
+            approved_at_ms: 1,
+            approved_by: "device:prod-real-runtime",
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.pathname === "/internal/oauth/approval/approve" && input.request_id === "req-child") {
+        approvalCalls += 1;
+        return new Response(JSON.stringify({
+          ok: true,
+          record: { client_id: "child-connector", approved_at_ms: 2 },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ ok: false, code: "not_found" }), {
+        status: 404,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  };
+  const h = makeEnv({ OAUTH_STORE_DO: namespace(oauthStub), OAUTH_ISSUER: "https://edge.example" });
+  const response = await worker.fetch(new Request("https://edge.example/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer oauth-admin-token" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 31,
+      method: "tools/call",
+      params: {
+        name: "herdr_call",
+        arguments: {
+          method: "herdr_mcp.connector.approve",
+          params: { request_id: "req-child", code: "123456" },
+        },
+      },
+    }),
+  }), h.env);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.result.structuredContent.ok, true);
+  assert.equal(body.result.structuredContent.client_id, "child-connector");
+  assert.equal(approvalCalls, 1);
+
+  const nonAdminStub = {
+    async fetch(request) {
+      const url = new URL(request.url);
+      const input = await request.json();
+      if (url.pathname === "/internal/oauth/access/verify" && input.token === "oauth-member-token") {
+        return new Response(JSON.stringify({ ok: true, client_id: "member-connector" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.pathname === "/internal/oauth/grant/get" && input.client_id === "member-connector") {
+        return new Response(JSON.stringify({
+          ok: true,
+          record: {
+            client_id: "member-connector",
+            resource: "https://edge.example/mcp",
+            scope: "mcp",
+            status: "active",
+            can_approve_connectors: false,
+            approved_at_ms: 1,
+            approved_by: "oauth:admin-connector",
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      throw new Error(`unexpected OAuth store call ${url.pathname}`);
+    },
+  };
+  const deniedEnv = makeEnv({ OAUTH_STORE_DO: namespace(nonAdminStub), OAUTH_ISSUER: "https://edge.example" });
+  const denied = await worker.fetch(new Request("https://edge.example/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer oauth-member-token" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 32,
+      method: "tools/call",
+      params: {
+        name: "herdr_call",
+        arguments: {
+          method: "herdr_mcp.connector.approve",
+          params: { request_id: "req-grandchild", code: "654321" },
+        },
+      },
+    }),
+  }), deniedEnv.env);
+  assert.equal(denied.status, 200);
+  const deniedBody = await denied.json();
+  assert.equal(deniedBody.result.isError, true);
+  assert.equal(deniedBody.result.structuredContent.code, "connector_approval_authority_required");
+});
+
 test("pairing creation requires owner auth and returns one-time material with worker origin metadata", async () => {
   const { env, storage } = makeEnv();
   const denied = await worker.fetch(post("/devices/pairings", { ttl_seconds: 60 }), env);

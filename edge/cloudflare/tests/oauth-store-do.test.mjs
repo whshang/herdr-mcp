@@ -204,6 +204,23 @@ test("connector approval is request-bound, five wrong attempts lock it, and corr
   assert.equal(grant.record.status, "active");
   assert.equal(grant.record.can_approve_connectors, true);
   assert.equal(grant.record.approved_by, "device:owner");
+
+  await h.post("/internal/oauth/approval/put", {
+    request_id: "req-delegated",
+    record: approval({ client_id: "c2", approval_code_hash: "delegated-good", resume_hash: "delegated-resume" }),
+    now_ms: 401,
+  });
+  const delegated = await body(await h.post("/internal/oauth/approval/approve", {
+    request_id: "req-delegated",
+    code_hash: "delegated-good",
+    approver: "oauth:c1",
+    now_ms: 500,
+  }));
+  assert.equal(delegated.ok, true);
+  const delegatedGrant = await body(await h.post("/internal/oauth/grant/get", { client_id: "c2" }));
+  assert.equal(delegatedGrant.record.status, "active");
+  assert.equal(delegatedGrant.record.can_approve_connectors, false);
+  assert.equal(delegatedGrant.record.approved_by, "oauth:c1");
 });
 
 test("connector approval resume token is independent, one-use, and cannot be substituted", async () => {

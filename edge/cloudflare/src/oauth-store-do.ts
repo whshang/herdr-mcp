@@ -439,7 +439,11 @@ export class OAuthStoreDO {
         resource: current.resource,
         scope: current.scope,
         status: "active",
-        can_approve_connectors: true,
+        // Connector administration is not transitively delegated. Only a
+        // Connector explicitly approved by the enrolled owner device may
+        // approve another Connector; OAuth-delegated children remain ordinary
+        // MCP grants.
+        can_approve_connectors: approver.startsWith("device:"),
         approved_at_ms: nowMs,
         approved_by: approver,
       };
