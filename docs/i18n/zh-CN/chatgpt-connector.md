@@ -51,7 +51,7 @@ ChatGPT 能完成 initialize / discovery / `tools/list`。
    https://<your-edge-origin>/mcp
    ```
 
-4. 完成浏览器 OAuth；
+4. 完成浏览器 OAuth。首次授权时，Herdr 不会静默放行，而是显示一个短期批准请求；从任意已登记到这个 Worker 的电脑，或另一个已经被该 Worker 明确批准的 Herdr WebChat 完成批准；
 5. 保存后新建一个聊天进行验收。
 
 **不要填写本机 `HERDR_MCP_TOKEN`。** ChatGPT 公网入口使用 OAuth；静态 bearer 只用于本机 curl / Cursor 和兼容路径。
@@ -77,20 +77,26 @@ Edge origin 应当稳定。本地 runtime 可以升级、A/B 切代甚至回滚�
 
 ## OAuth 链路
 
-ChatGPT 会探索远程服务器的 OAuth / protected-resource metadata。herdr-mcp Edge 对这条链路负责：
+ChatGPT 会探索远程服务器的 OAuth / protected-resource metadata。Dynamic Client Registration（DCR）只负责登记 client metadata，**不等于授权**。从 v0.4.6 开始，新 Connector 在 Worker 记录明确批准之前不能取得可用 token：
 
 ```text
-ChatGPT
-  │ discover protected resource
-  │ discover authorization server / OpenID metadata
+Connector
+  │ metadata discovery + DCR
   │ authorize + PKCE
-  │ token
   ▼
-OAuth access token
-  │
+Herdr pending approval 页面
+  │ request id + 短期 6 位批准码
+  ├─ 任意已登记电脑：
+  │    herdr-mcp connector approve <request-id>
+  └─ 另一个被 Worker 明确批准的 Herdr WebChat
+       herdr_call → herdr_mcp.connector.approve
   ▼
-/mcp
+authorization code → token → /mcp
 ```
+
+同一个 Worker 内的已登记设备在这条控制面上没有 owner/member 高下之分；Worker/operator 凭据同样是管理凭据。v0.4.6 之前、在没有明确批准步骤时签发的 OAuth token 可以继续做普通 MCP 兼容访问，但不会因此自动获得 fleet 管理权限；需要批准 Connector、创建 pairing、查看 fleet 或 revoke 设备时，应先按 v0.4.6 流程重新授权。Worker 也可以撤销 Connector grant，包括还没有 grant 记录的旧版 client。
+
+批准码是单用途、短时、限制错误次数的交互凭据，不接受普通 CLI argv 传入。若目的是取消 Herdr 授权，仅在 Web AI 的 UI 中 Disconnect 并不能替代 Worker 端 revoke。
 
 实现兼容 Client ID Metadata Document、PKCE、JWT access token 和当前 ChatGPT MCP 客户端行为。
 

@@ -96,7 +96,7 @@ export function oauthEdgeMetadata(identity: OAuthEdgeIdentity): Record<string, u
     registration_endpoint: `${iss}/oauth/register`,
     scopes_supported: [OAUTH_SCOPE],
     response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code", "refresh_token"],
+    grant_types_supported: ["authorization_code", "refresh_token", "client_credentials"],
     token_endpoint_auth_methods_supported: ["none", "private_key_jwt", "client_secret_post"],
     code_challenge_methods_supported: ["S256"],
     authorization_response_iss_parameter_supported: true, // RFC 9207 §4.2

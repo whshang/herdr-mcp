@@ -93,6 +93,13 @@ export interface IssuedTokenPair {
   scope: string;
 }
 
+export interface IssuedAccessToken {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  scope: string;
+}
+
 export interface TokenIssueInput {
   client_id: string;
   resource: string;
@@ -121,6 +128,7 @@ export interface OAuthPublicStore {
   getGrant(clientId: string): Promise<OAuthConnectorGrantRecord | null>;
   revokeGrant(clientId: string, revokedBy: string, nowMs: number): Promise<boolean>;
   issueTokens(input: TokenIssueInput): Promise<IssuedTokenPair | null>;
+  issueAutomationAccess(input: Omit<TokenIssueInput, "refresh_ttl_sec">): Promise<IssuedAccessToken | null>;
   exchangeRefresh(input: RefreshExchangeInput): Promise<IssuedTokenPair | null>;
 }
 
@@ -128,7 +136,7 @@ export interface OAuthPublicOptions {
   /** Exact production issuer/resource identity (see createOAuthIdentity). */
   identity: OAuthEdgeIdentity;
   store: OAuthPublicStore;
-  /** Existing deployment secret used only to HMAC short owner-approval codes. */
+  /** Existing deployment secret used only to HMAC short fleet-approval codes. */
   approvalSecret: string;
   /** Injected fetch for CIMD metadata + ChatGPT JWKS (default globalThis.fetch). */
   fetchFn?: typeof globalThis.fetch;
@@ -154,6 +162,7 @@ const DEFAULT_ACCESS_TTL_S = 86400;
 const DEFAULT_REFRESH_TTL_S = 2592000; // 30 days
 const DEFAULT_CODE_TTL_MS = 5 * 60_000;
 const DEFAULT_APPROVAL_TTL_MS = 10 * 60_000;
+const AUTOMATION_ACCESS_TTL_S = 60 * 60;
 const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
 const DEFAULT_MAX_QUERY_BYTES = 16 * 1024;
 const DEFAULT_MAX_PARAM_BYTES = 4096;
@@ -280,10 +289,10 @@ function approvalPage(input: {
 <title>${escapeHtml(title)}</title>
 <style>body{font:16px system-ui,sans-serif;max-width:680px;margin:10vh auto;padding:0 24px;color:#171717}code{font-size:1.05em;word-break:break-all}.code{font-size:2rem;letter-spacing:.18em;font-weight:700}.muted{color:#666}</style></head>
 <body><h1>${escapeHtml(title)}</h1>
-<p>This Connector is waiting for approval from an already trusted Herdr owner.</p>
+<p>This Connector is waiting for approval from an already authorized Herdr fleet.</p>
 <p>Request ID:<br><code>${escapeHtml(input.requestId)}</code></p>
 <p>Approval code:</p><p class="code">${escapeHtml(input.code)}</p>
-<p>On an already-enrolled owner computer, run:<br><code>herdr-mcp connector approve ${escapeHtml(input.requestId)}</code><br>and enter the six-digit code when prompted. You may also ask an already-authorized Herdr WebChat that has connector-approval authority to approve this request.</p>
+<p>On any computer already enrolled in this Herdr Worker, run:<br><code>herdr-mcp connector approve ${escapeHtml(input.requestId)}</code><br>and enter the six-digit code when prompted. You may also ask another Herdr WebChat that was explicitly approved by this Worker to approve the request.</p>
 <p class="muted">Expires ${escapeHtml(expiresAt)}. Do not enter this code into an untrusted site.</p>
 <p id="status">Waiting for approval…</p>
 <script>
@@ -305,7 +314,8 @@ async function poll(){
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
-      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+      "x-frame-options": "DENY",
       "referrer-policy": "no-referrer",
       "x-content-type-options": "nosniff",
     },
@@ -686,7 +696,7 @@ async function issueAuthorizationRedirect(
 
 /**
  * Authorization endpoint. Registered/DCR clients do not self-authorize: an
- * unknown grant becomes a short-lived pending owner-approval request.
+ * unknown grant becomes a short-lived pending fleet-approval request.
  */
 async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
   if (url.search.length > ctx.maxQueryBytes) {
@@ -907,6 +917,27 @@ async function handleToken(request: Request, ctx: HandlerCtx): Promise<Response>
     return tokenError(ctx, "invalid_client", "client authentication failed");
   }
 
+  if (grantType === "client_credentials") {
+    const scopeParam = first("scope");
+    if (!client.grant_types.includes("client_credentials")) {
+      return tokenError(ctx, "unauthorized_client", "client_credentials is not enabled for this client");
+    }
+    if (client.token_endpoint_auth_method !== "client_secret_post" || assertion) {
+      return tokenError(ctx, "invalid_client", "automation clients require client_secret authentication");
+    }
+    if (scopeParam && scopeParam !== OAUTH_SCOPE) {
+      return tokenError(ctx, "invalid_scope", `unsupported scope '${scopeParam}'`);
+    }
+    const token = await ctx.store.issueAutomationAccess({
+      client_id: clientId,
+      resource,
+      now_sec: nowSec,
+      access_ttl_sec: Math.min(ctx.accessTtlSec, AUTOMATION_ACCESS_TTL_S),
+    });
+    if (!token) return tokenError(ctx, "invalid_grant", "automation client is revoked or not authorized");
+    return ctx.json(token, 200, { "cache-control": "no-store" });
+  }
+
   if (grantType === "authorization_code") {
     const code = first("code");
     const redirectUri = first("redirect_uri");
@@ -1100,6 +1131,17 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
     return pair;
   };
 
+  const accessToken = async (resp: Response): Promise<IssuedAccessToken | null> => {
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as {
+      ok?: boolean;
+      token?: IssuedAccessToken & { key_id?: string };
+    };
+    if (!data.ok || !data.token) return null;
+    const { key_id: _keyId, ...token } = data.token;
+    return token;
+  };
+
   return {
     async getClient(clientId) {
       const resp = await internal("/internal/oauth/client/get", { client_id: clientId });
@@ -1195,6 +1237,15 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
         refresh_ttl_sec: input.refresh_ttl_sec,
       });
       return tokenPair(resp);
+    },
+    async issueAutomationAccess(input) {
+      const resp = await internal("/internal/oauth/automation/token/issue", {
+        client_id: input.client_id,
+        resource: input.resource,
+        now_sec: input.now_sec,
+        access_ttl_sec: input.access_ttl_sec,
+      });
+      return accessToken(resp);
     },
     async exchangeRefresh(input) {
       const resp = await internal("/internal/oauth/refresh/exchange", {

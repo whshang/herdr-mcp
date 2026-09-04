@@ -38,7 +38,7 @@ const ISSUER = "https://herdr-mcp.example.com";
 const IDENTITY = createOAuthIdentity(ISSUER);
 const NOW_MS = 1_700_000_000_000;
 const NOW_SEC = Math.floor(NOW_MS / 1000);
-const APPROVAL_SECRET = "test-owner-approval-secret-not-for-production";
+const APPROVAL_SECRET = "test-fleet-approval-secret-not-for-production";
 
 function makeOptions(overrides = {}) {
   const storage = new StorageMock();
@@ -125,7 +125,10 @@ async function pendingAuthorization(opts, client_id, redirect_uri = "https://app
   assert.ok(resumeToken, "approval page should carry an opaque resume token for same-page polling");
   assert.ok(approvalCode, "approval page should expose the one-time six-digit code");
   assert.ok(html.includes(`herdr-mcp connector approve ${requestId}`));
-  assert.match(html, /already-authorized Herdr WebChat/);
+  assert.match(html, /any computer already enrolled in this Herdr Worker/);
+  assert.match(html, /explicitly approved by this Worker/);
+  assert.match(resp.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+  assert.equal(resp.headers.get("x-frame-options"), "DENY");
   return { requestId, resumeToken, approvalCode, verifier, challenge, state };
 }
 
@@ -136,7 +139,7 @@ async function approvePending(opts, pending, approver = "device:dev_owner") {
     approver,
     NOW_MS,
   );
-  assert.equal(approved.ok, true, "owner approval should succeed");
+  assert.equal(approved.ok, true, "fleet approval should succeed");
   const poll = await GET(`/oauth/authorize/poll?${new URLSearchParams({
     request_id: pending.requestId,
     resume_token: pending.resumeToken,
@@ -148,7 +151,7 @@ async function approvePending(opts, pending, approver = "device:dev_owner") {
   return { code: loc.searchParams.get("code"), location: loc };
 }
 
-/** Authorize for a client through the explicit owner-approval flow. */
+/** Authorize for a client through the explicit fleet-approval flow. */
 async function makeAuthCode(opts, client_id, redirect_uri = "https://app.example/cb") {
   const grant = await opts.store.getGrant(client_id);
   if (grant?.status === "active") {
@@ -323,7 +326,7 @@ test("DCR client_secret_post stores SHA-256 hash, not the raw secret", async () 
 // 6. Authorization endpoint
 // ---------------------------------------------------------------------------
 
-test("authorize: first use requires owner approval, then issues RFC9207 one-use code", async () => {
+test("authorize: first use requires fleet approval, then issues RFC9207 one-use code", async () => {
   const opts = makeOptions();
   const { client_id } = await registerClient(opts, { token_endpoint_auth_method: "none" });
   const pending = await pendingAuthorization(opts, client_id, "https://app.example/cb", "st123");
@@ -637,6 +640,89 @@ test("token: auth_method none requires no secret", async () => {
   const { code, verifier } = await makeAuthCode(opts, client_id);
   const resp = await POST("/oauth/token", tokenBody(client_id, code, verifier), opts);
   assert.equal(resp.status, 200);
+});
+
+test("token: client_credentials is reserved for approved automation clients and returns short-lived access only", async () => {
+  const opts = makeOptions();
+  const client_id = "svc_gitlab_pipeline_01";
+  const client_secret = "herdr_svc_test-secret";
+  const create = await opts.__do.fetch(new Request("https://oauth.internal/internal/oauth/automation/create", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      client_id,
+      client_secret_hash: await sha256Hex(client_secret),
+      client_name: "gitlab:group/project:prod",
+      resource: IDENTITY.resource,
+      scope: "mcp",
+      created_by: "device:admin",
+      now_ms: NOW_MS,
+    }),
+  }));
+  assert.equal(create.status, 200);
+
+  const wrongSecret = await POST("/oauth/token", {
+    grant_type: "client_credentials",
+    client_id,
+    client_secret: "wrong",
+    resource: IDENTITY.resource,
+  }, opts);
+  assert.equal(wrongSecret.status, 400);
+  assert.equal((await wrongSecret.json()).error, "invalid_client");
+
+  const response = await POST("/oauth/token", {
+    grant_type: "client_credentials",
+    client_id,
+    client_secret,
+    resource: IDENTITY.resource,
+    scope: "mcp",
+  }, opts);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const token = await response.json();
+  assert.equal(token.expires_in, 3600);
+  assert.equal(token.scope, "mcp");
+  assert.equal(token.refresh_token, undefined);
+  assert.ok(token.access_token.includes("."));
+
+  const verify = await opts.__do.fetch(new Request("https://oauth.internal/internal/oauth/access/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: token.access_token, now_sec: NOW_SEC + 1 }),
+  }));
+  assert.equal(verify.status, 200);
+
+  assert.equal(await opts.store.revokeGrant(client_id, "device:admin", NOW_MS + 2000), true);
+  const afterRevoke = await POST("/oauth/token", {
+    grant_type: "client_credentials",
+    client_id,
+    client_secret,
+    resource: IDENTITY.resource,
+  }, opts);
+  assert.equal(afterRevoke.status, 400);
+  assert.equal((await afterRevoke.json()).error, "invalid_grant");
+  const verifyRevoked = await opts.__do.fetch(new Request("https://oauth.internal/internal/oauth/access/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: token.access_token, now_sec: NOW_SEC + 2 }),
+  }));
+  assert.equal(verifyRevoked.status, 401);
+});
+
+test("DCR cannot self-register a client_credentials automation principal", async () => {
+  const opts = makeOptions();
+  const registered = await registerClient(opts, {
+    grant_types: ["client_credentials"],
+    token_endpoint_auth_method: "client_secret_post",
+  });
+  const response = await POST("/oauth/token", {
+    grant_type: "client_credentials",
+    client_id: registered.client_id,
+    client_secret: registered.client_secret,
+    resource: IDENTITY.resource,
+  }, opts);
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error, "unauthorized_client");
 });
 
 test("token: unknown client_id is invalid_client", async () => {

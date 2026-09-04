@@ -45,14 +45,14 @@ test("Agent install guides own Cloudflare-token handoff and workers.dev-only boo
   }
 });
 
-test("Agent install resolves fleet ownership before any Cloudflare mutation", () => {
+test("Agent install resolves fleet existence before any Cloudflare mutation", () => {
   const en = read("docs/i18n/en/agent-install.md");
   const zh = read("docs/i18n/zh-CN/agent-install.md");
 
-  assert.ok(en.indexOf("Fleet ownership gate") >= 0);
-  assert.ok(en.indexOf("Fleet ownership gate") < en.indexOf("Cloudflare authorization pause"));
-  assert.ok(zh.indexOf("Fleet 所有权闸门") >= 0);
-  assert.ok(zh.indexOf("Fleet 所有权闸门") < zh.indexOf("Cloudflare 授权暂停"));
+  assert.ok(en.indexOf("Fleet existence gate") >= 0);
+  assert.ok(en.indexOf("Fleet existence gate") < en.indexOf("Cloudflare authorization pause"));
+  assert.ok(zh.indexOf("Fleet 存在性闸门") >= 0);
+  assert.ok(zh.indexOf("Fleet 存在性闸门") < zh.indexOf("Cloudflare 授权暂停"));
 
   for (const doc of [en, zh]) {
     assert.match(doc, /herdr-mcp worker pair/);
@@ -63,7 +63,7 @@ test("Agent install resolves fleet ownership before any Cloudflare mutation", ()
     assert.match(doc, /grep -Fqx/);
     assert.match(doc, /zsh -ic 'command -v herdr && herdr --version'/);
     assert.match(doc, /random-suffixed Worker|随机后缀[^\n]*Worker/);
-    assert.match(doc, /first[- ]fleet/i);
+    assert.match(doc, /first[- ](?:Worker|fleet)|第一(?:台|套)[^\n]*Worker/i);
   }
 
   assert.doesNotMatch(en, /choose a machine-specific\/random-suffixed name instead/);
@@ -145,7 +145,7 @@ test("herdr-link resolves Node from PATH for fresh Apple Silicon installs", () =
   assert.doesNotMatch(src, /^NODE_BIN="\/usr\/local\/bin\/node"$/m);
 });
 
-test("second-Mac GA UAT agent prompt enforces independent Worker, Link env override, and owner OAuth handoff", () => {
+test("second-Mac GA UAT agent prompt enforces independent Worker, Link env override, and fleet OAuth handoff", () => {
   for (const rel of [
   ]) {
     const doc = read(rel);

@@ -73,13 +73,13 @@ Web AI 也可以通过私有 workstation method 在已加入的电脑之间复�
 
 ### 把新电脑加入现有设备组
 
-推荐直接在已经授权的 ChatGPT 对话里说：
+推荐直接在已经经过这个 Worker **明确批准**的 Herdr WebChat 里说：
 
 ```text
 给我的新电脑生成一个 Herdr 配对链接，10 分钟有效。
 ```
 
-Herdr 会直接在 Edge 创建 pairing，不要求旧电脑在线。ChatGPT 会一起给出配对地址、一次性 6 位验证码、精确过期时间，以及可复制的 `herdr-mcp worker connect "<pairing-address>"` 命令。已授权 Mac 上的 `herdr-mcp worker pair` 仍保留为 CLI fallback。
+Herdr 会在 Worker 控制面创建 pairing，这个动作不需要路由到某一台电脑，但仍然必须已经有一个 fleet 管理主体：明确批准过的 WebChat、任意已经登记的电脑，或 Worker operator 凭据。若当前 WebChat 没有该权限，就在**任意已登记的 Mac**上运行 `herdr-mcp worker pair`。绝不能拿正在安装的全新电脑执行 `worker pair` 来探测；如果这是第一台设备，先完成 Cloudflare Worker 初始化。pairing 返回配对地址、一次性 6 位验证码、精确过期时间，以及可复制的 `herdr-mcp worker connect "<pairing-address>"` 命令。
 
 然后把下面一句发给新电脑上的 Coding Agent：
 

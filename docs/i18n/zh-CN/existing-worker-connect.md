@@ -27,15 +27,15 @@ Herdr 的多设备模型是：一个公网 Worker/Connector，后面连接多台
 
 ## 把新电脑加入设备组
 
-### 1. 推荐：直接在 ChatGPT 对话中创建短期配对
+### 1. 推荐：从现有 fleet 管理通道创建短期配对
 
-在已经授权的 Herdr 对话里直接说：
+在已经被这个 Worker **明确批准**的 Herdr WebChat 里直接说：
 
 ```text
 给我的新电脑生成一个 Herdr 配对链接，10 分钟有效。
 ```
 
-ChatGPT 可以直接在 Edge 创建 pairing，不要求任何已登记工作站在线。返回结果应把这些信息一起展示：
+Worker 可以直接在 Edge 创建 pairing，这个动作不需要路由到任何工作站，但它不能凭空建立管理权：必须已经存在明确批准过的 WebChat、任意一台已登记电脑，或 Worker operator 凭据。返回结果应把这些信息一起展示：
 
 - 包含高熵 pairing id 的配对地址；
 - 一次性 6 位验证码；
@@ -44,7 +44,7 @@ ChatGPT 可以直接在 Edge 创建 pairing，不要求任何已登记工作站�
 
 正常最长有效期为 600 秒，应立即使用，不要把它当成长期邀请链接保存。
 
-CLI fallback：在 fleet 中任意已授权 macOS 电脑运行 `herdr-mcp worker pair` 仍可创建同样的短期 pairing；CLI 同时显示精确 UTC 过期时间和相对有效期。
+如果当前 WebChat 返回 `fleet_admin_required`，就在 fleet 中任意一台已经登记的 macOS 电脑运行 `herdr-mcp worker pair`；它会创建同样的短期 pairing，并同时显示精确 UTC 过期时间和相对有效期。绝不能在正在安装的全新电脑上运行 `worker pair` 来探测是否已有 fleet。如果这是第一套 Herdr Worker、还不存在任何已登记/已批准主体，先完成 Cloudflare Worker 初始化再配对。
 
 ### 2. 在新电脑上连接
 
@@ -86,13 +86,13 @@ herdr-mcp worker rename "<new-device-name>"
 
 `herdr-mcp device rename ...` 是等价别名。rename 只修改面向人的显示名称；不可变 `device_id`、workstation identity、设备凭据、授权和调度状态全部保持不变。Link 重连不会覆盖用户显式改过的名字。最初的 default/legacy workstation 在首次登记时也会自动记录本机 Computer Name。
 
-如果要永久撤销另一台已登记设备的授权，现在优先直接在已经授权的 ChatGPT/Herdr 网页对话里完成：让 ChatGPT 列出设备，选中目标设备不可变的 `device_id`，然后永久 revoke。Edge-local 动作等价于：
+如果要永久撤销另一台已登记设备的授权，优先在已经被 Worker 明确批准的 Herdr WebChat 里完成：列出设备，选中目标设备不可变的 `device_id`，然后永久 revoke。Edge-local 动作等价于：
 
 ```text
 herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
 ```
 
-这个路径不要求任何工作站在线，也绝不接受 display name。CLI fallback：先通过 `herdr_devices` 取得不可变的 `device_id`，然后在 owner 工作站运行：
+这个动作不路由到任何工作站，也绝不接受 display name。如果当前 WebChat 没有 fleet 管理权限，先通过 `herdr_devices` 取得不可变的 `device_id`，然后在任意已登记工作站运行：
 
 ```bash
 herdr-mcp worker revoke "<device-id>" --confirm
@@ -116,7 +116,7 @@ revoke 对该设备身份和凭据是永久操作：在线 Link 会立即断开�
 - 6 位验证码单次使用且有效期很短；
 - 连续输错 5 次会永久锁定本次配对，应重新创建配对；
 - pairing id 具有高熵，并放在 URL fragment 中，避免进入普通 HTTP access log 路径；
-- 用户明确在已 OAuth 授权的 owner 对话里创建 pairing 时，该对话可以显示这枚一次性验证码；除此之外，不得把验证码持久化到 argv、shell history、Git、普通日志、复制出来的 transcript 或无人值守自动化；
+- 用户明确在已被 Worker 批准的 WebChat 里创建 pairing 时，该对话可以显示这枚一次性验证码；除此之外，不得把验证码持久化到 argv、shell history、Git、普通日志、复制出来的 transcript 或无人值守自动化；
 - 最终单设备凭据不得打印或复制，应始终留在操作系统凭据存储中。
 
 ## 恢复与重试

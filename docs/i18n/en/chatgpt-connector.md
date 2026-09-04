@@ -49,7 +49,7 @@ The exact ChatGPT UI evolves. The general flow is:
 https://<your-edge-origin>/mcp
 ```
 
-4. Complete OAuth in the browser.
+4. Complete OAuth in the browser. On first authorization, Herdr shows a short-lived approval request instead of silently granting access; approve it from any computer already enrolled in this Worker or from another Herdr WebChat that was explicitly approved by this Worker.
 5. Create a new conversation for validation.
 
 Never paste `HERDR_MCP_TOKEN` into ChatGPT. Public ChatGPT access uses OAuth. Static bearer is for local clients such as curl or Cursor.
@@ -73,16 +73,26 @@ Keep the Edge origin stable. Local runtime generations can upgrade behind it wit
 
 ## OAuth flow
 
-The Edge handles the OAuth boundary:
+The Edge handles the OAuth boundary. Dynamic Client Registration (DCR) only registers client metadata; it is **not** authorization. Since v0.4.6, a new Connector cannot exchange for a token until the Worker records an explicit fleet approval:
 
 ```text
-ChatGPT
-  │ metadata discovery
+Connector
+  │ metadata discovery + DCR
   │ authorize + PKCE
-  │ token
   ▼
-MCP request
+Herdr pending approval page
+  │ request id + short-lived 6-digit code
+  ├─ any enrolled computer:
+  │    herdr-mcp connector approve <request-id>
+  └─ another explicitly approved Herdr WebChat
+       herdr_call → herdr_mcp.connector.approve
+  ▼
+authorization code → token → MCP request
 ```
+
+Devices enrolled in the same Worker have no owner/member hierarchy for this control plane. Worker/operator credentials are also administration credentials. A pre-v0.4.6 OAuth token that was issued before explicit approval remains usable for ordinary MCP compatibility, but it does not silently gain fleet-administration authority; re-authorize it through the v0.4.6 flow before using it to approve Connectors, pair devices, inspect the fleet, or revoke devices. Connector grants can be revoked at the Worker, including legacy clients that predate grant records.
+
+The approval code is single-purpose, short-lived, attempt-bounded, and is entered interactively rather than accepted on CLI argv. Disconnecting a Connector in a provider UI is not a substitute for server-side revocation when you intend to remove Herdr authorization.
 
 Troubleshoot:
 

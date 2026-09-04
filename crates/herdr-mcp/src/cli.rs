@@ -100,6 +100,16 @@ pub enum WorkerCommand {
     ConnectorRevoke {
         client_id: String,
     },
+    AutomationCreate {
+        name: String,
+    },
+    AutomationList,
+    AutomationRotate {
+        client_id: String,
+    },
+    AutomationRevoke {
+        client_id: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -243,6 +253,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "worker" => parse_worker(&args[1..]),
         "device" => parse_device_alias(&args[1..]),
         "connector" => parse_connector(&args[1..]),
+        "automation" => parse_automation(&args[1..]),
         "dev" => parse_dev(&args[1..]),
         "candidate" => parse_candidate(&args[1..]),
         "service" => parse_service(&args[1..]),
@@ -567,6 +578,71 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             "unknown connector command '{value}' (expected approve or revoke)"
         )),
         None => Err("connector requires approve or revoke".to_owned()),
+    }
+}
+
+fn parse_automation(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
+        Some("create") => {
+            let [flag, name] = &args[1..] else {
+                return Err("automation create requires --name NAME".to_owned());
+            };
+            if flag != "--name" {
+                return Err("automation create requires --name NAME".to_owned());
+            }
+            let name = name.trim();
+            if name.is_empty() || name.len() > 256 {
+                return Err("automation --name must contain 1..256 characters".to_owned());
+            }
+            Ok(Command::Worker(WorkerCommand::AutomationCreate {
+                name: name.to_owned(),
+            }))
+        }
+        Some("list") if args.len() == 1 => Ok(Command::Worker(WorkerCommand::AutomationList)),
+        Some("rotate") => {
+            let [client_id, confirm] = &args[1..] else {
+                return Err("automation rotate requires: <client-id> --confirm".to_owned());
+            };
+            validate_automation_client_id(client_id)?;
+            if confirm != "--confirm" {
+                return Err("automation rotate requires --confirm because the old secret is invalidated immediately".to_owned());
+            }
+            Ok(Command::Worker(WorkerCommand::AutomationRotate {
+                client_id: client_id.clone(),
+            }))
+        }
+        Some("revoke") => {
+            let [client_id, confirm] = &args[1..] else {
+                return Err("automation revoke requires: <client-id> --confirm".to_owned());
+            };
+            validate_automation_client_id(client_id)?;
+            if confirm != "--confirm" {
+                return Err(
+                    "automation revoke requires --confirm because revocation is immediate"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::Worker(WorkerCommand::AutomationRevoke {
+                client_id: client_id.clone(),
+            }))
+        }
+        Some(value) => Err(format!(
+            "unknown automation command '{value}' (expected create, list, rotate, or revoke)"
+        )),
+        None => Err("automation requires create, list, rotate, or revoke".to_owned()),
+    }
+}
+
+fn validate_automation_client_id(client_id: &str) -> Result<(), String> {
+    let valid = client_id.starts_with("svc_")
+        && (12..=132).contains(&client_id.len())
+        && client_id[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err("automation client id must be a valid svc_ identifier".to_owned())
     }
 }
 
@@ -1048,10 +1124,14 @@ User path:\n\
   herdr-mcp doctor\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
-  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS enrolled-owner device only; creates pairing for another computer)\n\
+  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS enrolled device only; creates pairing for another computer)\n\
   herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS only; requires Keychain, reads the 6-digit code from an interactive or stdin prompt, never argv)\n\
-  herdr-mcp connector approve <approval-request-id>  (macOS owner device; reads the 6-digit code interactively, never argv)\n\
+  herdr-mcp connector approve <approval-request-id>  (macOS enrolled device; reads the 6-digit code interactively, never argv)\n\
   herdr-mcp connector revoke <client-id> --confirm\n\
+  herdr-mcp automation create --name NAME  (creates one CI/service principal; secret is shown once)\n\
+  herdr-mcp automation list\n\
+  herdr-mcp automation rotate <client-id> --confirm\n\
+  herdr-mcp automation revoke <client-id> --confirm\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|auto|status]\n\
   herdr-mcp extension standalone <install [--ref REF]|status>\n\
   herdr-mcp rollback\n\
@@ -1736,6 +1816,56 @@ mod tests {
     }
 
     #[test]
+    fn parses_automation_service_principal_lifecycle() {
+        assert_eq!(
+            parse(args(&[
+                "automation",
+                "create",
+                "--name",
+                "gitlab:group/project:prod"
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::AutomationCreate {
+                name: "gitlab:group/project:prod".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(args(&["automation", "list"])).unwrap().command,
+            Command::Worker(WorkerCommand::AutomationList)
+        );
+        assert_eq!(
+            parse(args(&[
+                "automation",
+                "rotate",
+                "svc_abcdefgh1234",
+                "--confirm"
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::AutomationRotate {
+                client_id: "svc_abcdefgh1234".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "automation",
+                "revoke",
+                "svc_abcdefgh1234",
+                "--confirm"
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::AutomationRevoke {
+                client_id: "svc_abcdefgh1234".to_owned(),
+            })
+        );
+        assert!(parse(args(&["automation", "create", "gitlab"])).is_err());
+        assert!(parse(args(&["automation", "rotate", "svc_abcdefgh1234"])).is_err());
+        assert!(parse(args(&["automation", "revoke", "dcr-client", "--confirm"])).is_err());
+    }
+
+    #[test]
     fn parses_instance_flag_before_command() {
         let parsed = parse(args(&["--instance", "uat", "status"])).unwrap();
         assert_eq!(parsed.instance.as_deref(), Some("uat"));
@@ -1767,6 +1897,8 @@ mod tests {
             "herdr-mcp scan",
             "herdr-mcp connector approve",
             "herdr-mcp connector revoke",
+            "herdr-mcp automation create",
+            "herdr-mcp automation list",
             "herdr-mcp update",
             "herdr-mcp rollback",
             "herdr-mcp uninstall",

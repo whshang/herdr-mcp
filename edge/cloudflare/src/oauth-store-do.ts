@@ -57,12 +57,16 @@ export interface OAuthApprovalRecord {
 
 export interface OAuthConnectorGrantRecord {
   client_id: string;
-  resource: string;
-  scope: string;
   status: "active" | "revoked";
-  can_approve_connectors: boolean;
-  approved_at_ms: number;
-  approved_by: string;
+  principal_type?: "connector" | "automation";
+  resource?: string;
+  scope?: string;
+  approved_at_ms?: number;
+  approved_by?: string;
+  last_token_issued_at_ms?: number;
+  token_issue_count?: number;
+  last_rotated_at_ms?: number;
+  last_rotated_by?: string;
   revoked_at_ms?: number;
   revoked_by?: string;
 }
@@ -212,21 +216,36 @@ function normalizeOAuthApproval(value: unknown, nowMs = Date.now()): OAuthApprov
 
 function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantRecord | null {
   if (!record(value)) return null;
-  if (!boundedString(value.client_id, 4096) || !boundedString(value.resource, 4096)) return null;
-  if (typeof value.scope !== "string" || value.scope.length === 0 || value.scope.length > 512) return null;
+  if (!boundedString(value.client_id, 4096)) return null;
   if (value.status !== "active" && value.status !== "revoked") return null;
-  if (typeof value.can_approve_connectors !== "boolean") return null;
-  if (!finiteEpoch(value.approved_at_ms) || !boundedString(value.approved_by, 4096)) return null;
+  const principalType = value.principal_type === "connector" || value.principal_type === "automation"
+    ? value.principal_type
+    : undefined;
+  const resource = boundedString(value.resource, 4096) ? value.resource : undefined;
+  const scope = typeof value.scope === "string" && value.scope.length > 0 && value.scope.length <= 512 ? value.scope : undefined;
+  const approvedAt = finiteEpoch(value.approved_at_ms) ? value.approved_at_ms as number : undefined;
+  const approvedBy = boundedString(value.approved_by, 4096) ? value.approved_by : undefined;
+  const lastTokenIssuedAt = finiteEpoch(value.last_token_issued_at_ms) ? value.last_token_issued_at_ms as number : undefined;
+  const tokenIssueCount = Number.isSafeInteger(value.token_issue_count) && (value.token_issue_count as number) >= 0
+    ? value.token_issue_count as number
+    : undefined;
+  const lastRotatedAt = finiteEpoch(value.last_rotated_at_ms) ? value.last_rotated_at_ms as number : undefined;
+  const lastRotatedBy = boundedString(value.last_rotated_by, 4096) ? value.last_rotated_by : undefined;
+  if (value.status === "active" && (!resource || !scope || approvedAt === undefined || !approvedBy)) return null;
   const revokedAt = finiteEpoch(value.revoked_at_ms) ? value.revoked_at_ms as number : undefined;
   const revokedBy = typeof value.revoked_by === "string" && value.revoked_by.length <= 4096 ? value.revoked_by : undefined;
   return {
     client_id: value.client_id,
-    resource: value.resource,
-    scope: value.scope,
     status: value.status,
-    can_approve_connectors: value.can_approve_connectors,
-    approved_at_ms: value.approved_at_ms,
-    approved_by: value.approved_by,
+    ...(principalType !== undefined ? { principal_type: principalType } : {}),
+    ...(resource !== undefined ? { resource } : {}),
+    ...(scope !== undefined ? { scope } : {}),
+    ...(approvedAt !== undefined ? { approved_at_ms: approvedAt } : {}),
+    ...(approvedBy !== undefined ? { approved_by: approvedBy } : {}),
+    ...(lastTokenIssuedAt !== undefined ? { last_token_issued_at_ms: lastTokenIssuedAt } : {}),
+    ...(tokenIssueCount !== undefined ? { token_issue_count: tokenIssueCount } : {}),
+    ...(lastRotatedAt !== undefined ? { last_rotated_at_ms: lastRotatedAt } : {}),
+    ...(lastRotatedBy !== undefined ? { last_rotated_by: lastRotatedBy } : {}),
     ...(revokedAt !== undefined ? { revoked_at_ms: revokedAt } : {}),
     ...(revokedBy !== undefined ? { revoked_by: revokedBy } : {}),
   };
@@ -272,6 +291,10 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/approval/consume") return this.consumeApproval(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/get") return this.getGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/automation/create") return this.createAutomation(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/automation/list") return this.listAutomations();
+    if (request.method === "POST" && url.pathname === "/internal/oauth/automation/rotate") return this.rotateAutomation(request);
+    if (request.method === "POST" && url.pathname === "/internal/oauth/automation/token/issue") return this.issueAutomationAccess(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/signing/ensure") return this.signingPublicKey();
     if (request.method === "POST" && url.pathname === "/internal/oauth/access/verify") return this.verifyAccess(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/token/issue") return this.issuePair(request);
@@ -439,11 +462,7 @@ export class OAuthStoreDO {
         resource: current.resource,
         scope: current.scope,
         status: "active",
-        // Connector administration is not transitively delegated. Only a
-        // Connector explicitly approved by the enrolled owner device may
-        // approve another Connector; OAuth-delegated children remain ordinary
-        // MCP grants.
-        can_approve_connectors: approver.startsWith("device:"),
+        principal_type: "connector",
         approved_at_ms: nowMs,
         approved_by: approver,
       };
@@ -517,23 +536,188 @@ export class OAuthStoreDO {
     if (!boundedString(clientId, 4096) || !boundedString(revokedBy, 4096)) return json({ ok: false, code: "bad_request" }, 400);
     const key = GRANT_PREFIX + clientId;
     const current = await this.state.storage.get<OAuthConnectorGrantRecord>(key);
-    if (!current) return json({ ok: false, code: "not_found" }, 404);
-    const revoked: OAuthConnectorGrantRecord = {
-      ...current,
-      status: "revoked",
-      revoked_at_ms: nowMs,
-      revoked_by: revokedBy,
-    };
-    await this.state.storage.put(key, revoked);
-    const [refresh, access] = await Promise.all([
+    const [client, refresh, access] = await Promise.all([
+      this.state.storage.get<OAuthClientRecord>(CLIENT_PREFIX + clientId),
       this.state.storage.list<OAuthTokenRecord>({ prefix: REFRESH_PREFIX }),
       this.state.storage.list<OAuthTokenRecord>({ prefix: ACCESS_PREFIX }),
     ]);
     const deletes: string[] = [];
     for (const [tokenKey, token] of refresh) if (token.client_id === clientId) deletes.push(tokenKey);
     for (const [tokenKey, token] of access) if (token.client_id === clientId) deletes.push(tokenKey);
+    if (!current && !client && deletes.length === 0) return json({ ok: false, code: "not_found" }, 404);
+    const revoked: OAuthConnectorGrantRecord = {
+      ...(current ?? { client_id: clientId }),
+      status: "revoked",
+      revoked_at_ms: nowMs,
+      revoked_by: revokedBy,
+    };
+    await this.state.storage.put(key, revoked);
     if (deletes.length > 0) await Promise.all(deletes.map((tokenKey) => this.state.storage.delete(tokenKey)));
-    return json({ ok: true, client_id: clientId, revoked_at_ms: nowMs, deleted_tokens: deletes.length });
+    return json({
+      ok: true,
+      client_id: clientId,
+      revoked_at_ms: nowMs,
+      deleted_tokens: deletes.length,
+      legacy_tombstone_created: current === undefined,
+    });
+  }
+
+  private async createAutomation(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const clientId = body?.client_id;
+    const clientSecretHash = body?.client_secret_hash;
+    const clientName = body?.client_name;
+    const resource = body?.resource;
+    const scope = body?.scope;
+    const createdBy = body?.created_by;
+    const nowMs = finiteEpoch(body?.now_ms) ? body!.now_ms as number : Date.now();
+    if (
+      !boundedString(clientId, 256) || !clientId.startsWith("svc_") ||
+      !boundedString(clientSecretHash, 256) || !boundedString(clientName, 256) ||
+      !boundedString(resource, 4096) || scope !== "mcp" || !boundedString(createdBy, 4096)
+    ) return json({ ok: false, code: "bad_request" }, 400);
+
+    let created = false;
+    await this.state.storage.transaction(async (txn) => {
+      if (await txn.get(CLIENT_PREFIX + clientId)) return;
+      const client: OAuthClientRecord = {
+        client_secret_hash: clientSecretHash,
+        redirect_uris: [],
+        token_endpoint_auth_method: "client_secret_post",
+        grant_types: ["client_credentials"],
+        scope: "mcp",
+        client_name: clientName,
+        issued_at: Math.floor(nowMs / 1000),
+      };
+      const grant: OAuthConnectorGrantRecord = {
+        client_id: clientId,
+        status: "active",
+        principal_type: "automation",
+        resource,
+        scope: "mcp",
+        approved_at_ms: nowMs,
+        approved_by: createdBy,
+        token_issue_count: 0,
+      };
+      await txn.put(CLIENT_PREFIX + clientId, client);
+      await txn.put(GRANT_PREFIX + clientId, grant);
+      created = true;
+    });
+    return created
+      ? json({ ok: true, client_id: clientId, client_name: clientName, created_at_ms: nowMs })
+      : json({ ok: false, code: "automation_client_exists" }, 409);
+  }
+
+  private async listAutomations(): Promise<Response> {
+    const grants = await this.state.storage.list<OAuthConnectorGrantRecord>({ prefix: GRANT_PREFIX });
+    const automations: Array<Record<string, unknown>> = [];
+    for (const [key, rawGrant] of grants) {
+      const grant = normalizeConnectorGrant(rawGrant);
+      if (!grant || grant.principal_type !== "automation") continue;
+      const clientId = key.slice(GRANT_PREFIX.length);
+      const client = normalizeOAuthClient(await this.state.storage.get<OAuthClientRecord>(CLIENT_PREFIX + clientId));
+      if (!client) continue;
+      automations.push({
+        client_id: clientId,
+        name: client.client_name ?? clientId,
+        status: grant.status,
+        created_at_ms: grant.approved_at_ms ?? client.issued_at * 1000,
+        created_by: grant.approved_by ?? null,
+        last_token_issued_at_ms: grant.last_token_issued_at_ms ?? null,
+        token_issue_count: grant.token_issue_count ?? 0,
+        last_rotated_at_ms: grant.last_rotated_at_ms ?? null,
+        last_rotated_by: grant.last_rotated_by ?? null,
+        revoked_at_ms: grant.revoked_at_ms ?? null,
+      });
+      if (automations.length >= 256) break;
+    }
+    automations.sort((a, b) => Number(b.created_at_ms ?? 0) - Number(a.created_at_ms ?? 0));
+    return json({ ok: true, automations });
+  }
+
+  private async rotateAutomation(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const clientId = body?.client_id;
+    const clientSecretHash = body?.client_secret_hash;
+    const rotatedBy = body?.rotated_by;
+    const nowMs = finiteEpoch(body?.now_ms) ? body!.now_ms as number : Date.now();
+    if (!boundedString(clientId, 256) || !boundedString(clientSecretHash, 256) || !boundedString(rotatedBy, 4096)) {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    const outcome: { value: "rotated" | "not_found" | "not_automation" | "revoked" } = { value: "not_found" };
+    await this.state.storage.transaction(async (txn) => {
+      const client = normalizeOAuthClient(await txn.get<OAuthClientRecord>(CLIENT_PREFIX + clientId));
+      const grant = normalizeConnectorGrant(await txn.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + clientId));
+      if (!client || !grant) return;
+      if (grant.principal_type !== "automation") { outcome.value = "not_automation"; return; }
+      if (grant.status !== "active") { outcome.value = "revoked"; return; }
+      await txn.put(CLIENT_PREFIX + clientId, { ...client, client_secret_hash: clientSecretHash });
+      await txn.put(GRANT_PREFIX + clientId, {
+        ...grant,
+        last_rotated_at_ms: nowMs,
+        last_rotated_by: rotatedBy,
+      });
+      outcome.value = "rotated";
+    });
+    if (outcome.value === "rotated") return json({ ok: true, client_id: clientId, rotated_at_ms: nowMs });
+    if (outcome.value === "revoked") return json({ ok: false, code: "automation_client_revoked" }, 409);
+    if (outcome.value === "not_automation") return json({ ok: false, code: "not_automation_client" }, 409);
+    return json({ ok: false, code: "automation_client_not_found" }, 404);
+  }
+
+  private async issueAutomationAccess(request: Request): Promise<Response> {
+    const body = await this.body(request);
+    const clientId = body?.client_id;
+    const resource = body?.resource;
+    const nowSec = finiteEpoch(body?.now_sec) ? Math.floor(body!.now_sec as number) : Math.floor(Date.now() / 1000);
+    const accessTtlSec = finiteEpoch(body?.access_ttl_sec) ? Math.floor(body!.access_ttl_sec as number) : 3600;
+    if (!boundedString(clientId, 256) || !boundedString(resource, 4096) || accessTtlSec < 60 || accessTtlSec > 86400) {
+      return json({ ok: false, code: "bad_request" }, 400);
+    }
+    const initial = normalizeConnectorGrant(await this.state.storage.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + clientId));
+    if (!initial || initial.status !== "active" || initial.principal_type !== "automation" || initial.resource !== resource || initial.scope !== "mcp") {
+      return json({ ok: false, code: "invalid_grant" }, 400);
+    }
+    const key = await this.ensureSigningKey();
+    const privateKey = await crypto.subtle.importKey(
+      "jwk",
+      key.private_jwk,
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const issuer = this.env.OAUTH_ISSUER?.replace(/\/+$/, "");
+    if (!issuer) return json({ ok: false, code: "oauth_issuer_missing" }, 500);
+    const accessToken = await issueRs256AccessJwt(
+      privateKey,
+      issuer,
+      resource,
+      clientId,
+      accessTtlSec,
+      { nowSec, additionalClaims: { key_id: key.kid } },
+    );
+    let committed = false;
+    await this.state.storage.transaction(async (txn) => {
+      const current = normalizeConnectorGrant(await txn.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + clientId));
+      if (!current || current.status !== "active" || current.principal_type !== "automation" || current.resource !== resource) return;
+      await txn.put(GRANT_PREFIX + clientId, {
+        ...current,
+        last_token_issued_at_ms: nowSec * 1000,
+        token_issue_count: (current.token_issue_count ?? 0) + 1,
+      });
+      committed = true;
+    });
+    if (!committed) return json({ ok: false, code: "invalid_grant" }, 400);
+    return json({
+      ok: true,
+      token: {
+        access_token: accessToken,
+        token_type: "Bearer",
+        expires_in: accessTtlSec,
+        scope: "mcp",
+        key_id: key.kid,
+      },
+    });
   }
 
   private async grantAllowsAccess(clientId: string): Promise<boolean> {

@@ -40,7 +40,7 @@ Control Center 统一负责**当前页面身份、绑定 / 解绑、本机详细
 
 Control Center 现在也展示一块紧凑的只读 Worker 设备列表。`authorization`、`connection`、`health` 分开显示，同时给出 runtime 版本 / generation 和最近在线时间；当前电脑会明确标记，本机能够证明 Link generation 不一致时也会直接显示。
 
-这条路径不会把 Worker credential 交给 Chrome。Side Panel 只请求 extension service worker，后者继续走现有 Native Messaging / 本机 IPC；本机 runtime 使用已有 owner 授权读取 Worker，然后只返回经过裁剪的设备摘要。后来加入、但没有 Worker owner 权限的成员电脑会看到具体权限说明，不会因此扩大设备凭据权限。
+这条路径不会把 Worker credential 交给 Chrome。Side Panel 只请求 extension service worker，后者继续走现有 Native Messaging / 本机 IPC；本机 runtime 使用当前已登记设备的 fleet credential 读取 Worker，然后只返回经过裁剪的设备摘要。同一个 Worker 内的设备没有 owner/member 层级；如果本机没有可用的 fleet credential，面板会显示明确权限说明，而不是把更高权限交给浏览器。
 
 设备列表在 Control Center 打开、人工刷新，以及隐藏较久后重新显示时刷新；不新增固定频率轮询。
 

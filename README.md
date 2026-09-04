@@ -73,13 +73,13 @@ Web AI can also copy small non-secret UTF-8 text between enrolled computers thro
 
 ### Add another computer to the fleet
 
-Preferred: ask in the already-authorized ChatGPT conversation:
+Preferred: ask in a Herdr WebChat that was explicitly approved by this Worker:
 
 ```text
 Generate a Herdr pairing link for my new computer, valid for 10 minutes.
 ```
 
-Herdr creates the pairing directly at Edge, so no old workstation needs to be online. ChatGPT returns the pairing address, one-time 6-digit code, exact expiry, and the copyable `herdr-mcp worker connect "<pairing-address>"` command. `herdr-mcp worker pair` on an authorized Mac remains the CLI fallback.
+Herdr creates the pairing at the Worker control plane, so the operation does not need to route through a workstation. This still requires an existing fleet-admin principal: an explicitly approved WebChat, any already-enrolled computer, or a Worker operator credential. If the WebChat lacks that authority, run `herdr-mcp worker pair` on any already-enrolled Mac. Never run `worker pair` on the fresh computer as a discovery probe; if this is the first Worker, complete the Cloudflare bootstrap first. The pairing result includes the address, one-time 6-digit code, exact expiry, and the copyable `herdr-mcp worker connect "<pairing-address>"` command.
 
 On the new computer, give its coding agent this one sentence:
 

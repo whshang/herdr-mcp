@@ -73,13 +73,13 @@ Web AI は private workstation method を使い、登録済みコンピュータ
 
 ### 新しいコンピュータを既存のデバイス群へ追加する
 
-推奨は、すでに認可済みの ChatGPT 会話で次のように依頼することです。
+推奨は、この Worker から明示的に承認済みの Herdr WebChat で次のように依頼することです。
 
 ```text
 新しいコンピュータ用に、10 分間有効な Herdr pairing link を生成してください。
 ```
 
-Herdr は Edge 上で直接 pairing を作成するため、古い workstation が online である必要はありません。ChatGPT は pairing address、単回使用の 6 桁 code、正確な expiry、コピー可能な `herdr-mcp worker connect "<pairing-address>"` をまとめて返します。認可済み Mac 上の `herdr-mcp worker pair` は CLI fallback として残ります。
+Herdr は Worker control plane で pairing を作成するため、その操作自体を特定の workstation へ route する必要はありません。ただし既存の fleet-admin principal は必要です。明示的に承認済みの WebChat、登録済みコンピュータ、または Worker operator credential が該当します。現在の WebChat にその権限がない場合は、登録済みの任意の Mac で `herdr-mcp worker pair` を実行します。新規コンピュータで `worker pair` を検出目的に実行してはいけません。最初の Worker なら先に Cloudflare bootstrap を完了します。pairing result には address、単回使用の 6 桁 code、正確な expiry、コピー可能な `herdr-mcp worker connect "<pairing-address>"` が含まれます。
 
 新しいコンピュータ上の Coding Agent に次の一文を渡します。
 

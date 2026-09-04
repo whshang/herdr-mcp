@@ -102,6 +102,33 @@ Runtime implementation 可以频繁变化，但 ChatGPT 看到的 public MCP cat
 
 当前公共 Edge contract 仍是 **epoch 3 / 19 actions**（自 v0.4.3 引入），workstation Runtime Execution Contract 仍是 **epoch 2 / 18 tools**。新增的 `herdr_devices` 只在 Edge 执行，不转发到 workstation。兼容测试可以保留历史 epoch 作为 rollback evidence，但普通 runtime commit 不应该因为“顺手改了 schema”就改变任一 contract。
 
+### GitLab CI 与其它无人值守 MCP 调用方
+
+不要把 `HERDR_MCP_TOKEN`、`STATIC_MCP_BEARER_SECRET` 或一个全局共享 access token 塞进 CI。共享密钥无法区分具体流水线，也无法针对单个项目独立监控、轮换和 revoke。
+
+应该在任意一台已登记设备上创建独立的 **Automation Client**：
+
+```bash
+herdr-mcp automation create --name "gitlab:group/project:prod"
+herdr-mcp automation list
+herdr-mcp automation rotate <svc_client_id> --confirm
+herdr-mcp automation revoke <svc_client_id> --confirm
+```
+
+每个真正独立的信任边界使用一个 client，通常至少按 GitLab project + environment 拆分。`create` 只显示一次长期 `client_secret`；`rotate` 只显示一次替换后的新 secret；Worker 只保存 verifier。把以下值存入 GitLab masked/protected variables：
+
+```text
+HERDR_MCP_URL
+HERDR_MCP_CLIENT_ID
+HERDR_MCP_CLIENT_SECRET
+```
+
+每个 job 开始时，用 `client_credentials` 在 Worker 的 `/oauth/token` 换取短期 MCP access token。access token 最长一小时，不发 refresh token。Worker 只在换 token 时更新 `last_token_issued_at_ms` 和 `token_issue_count`，不会为了监控而给每次 MCP 请求增加 Durable Object 写放大。
+
+Automation Client 只有普通 MCP 权限，没有 fleet-admin 权限，不能 pair/revoke Device、approve/revoke Connector，也不能继续创建 Automation Client。revoke 以不可变 `client_id` 为对象，同时阻止后续换 token，并在 Worker 鉴权时立即使已经签出的 access token 失效。
+
+已经明确授权的 WebChat 可以通过 Edge-local private method 查看 Automation Client 清单并执行 revoke；清单永远不返回长期 secret。默认不要把 `client_secret` 放进聊天记录，创建和 rotate 应在已登记设备的 CLI 上完成，再直接写入 CI secret manager。
+
 ## 3. Cloudflare Edge：稳定公网入口
 
 Workflow：

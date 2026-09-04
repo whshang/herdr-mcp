@@ -67,6 +67,14 @@ export interface McpDeps {
     | { ok: true }
     | { ok: false; code: string }
   >;
+  listAutomations?(): Promise<
+    | { ok: true; automations: unknown[] }
+    | { ok: false; code: string }
+  >;
+  revokeAutomation?(clientId: string): Promise<
+    | { ok: true }
+    | { ok: false; code: string }
+  >;
   resolveDevice?(selector: string | undefined, args?: Record<string, unknown>): Promise<DeviceRouteResult>;
   logger: { warn(event: string, fields?: Record<string, unknown>): void };
   now?: () => number;
@@ -314,8 +322,8 @@ export async function handleMcp(
         return rpcResult(id, callToolResult({
           ok: true,
           devices,
-          pairing_hint: "When the user asks to add a new computer or generate its setup link, call herdr_call(method=\"herdr_mcp.device.pair\", params='{\"ttl_seconds\":600,\"name\":\"<optional>\"}'). params is a JSON string in the public schema. Do not provide a device selector. Present the returned pairing address, one-time code, exact expiry, and new-device command together.",
-          revoke_hint: "When the user explicitly asks to permanently revoke an enrolled computer, select its immutable device_id from this list and call herdr_call(method=\"herdr_mcp.device.revoke\", params='{\"device_id\":\"dev_...\",\"confirm\":true}'). Never revoke by display name. Revoke is permanent for that device identity and credential.",
+          pairing_hint: "When the user asks to add a new computer, an explicitly approved WebChat can call herdr_call(method=\"herdr_mcp.device.pair\", params='{\"ttl_seconds\":600,\"name\":\"<optional>\"}'). `params` is a JSON string in the frozen public schema. This is a Worker fleet-admin action and does not route through a workstation. If this conversation lacks fleet-admin authority, create the pairing from any already-enrolled computer with `herdr-mcp worker pair`. A completely new first Worker must be bootstrapped before pairing. Present the pairing address, one-time code, exact expiry, and new-device command together.",
+          revoke_hint: "When the user explicitly asks to permanently revoke an enrolled computer, an explicitly approved WebChat can select its immutable device_id and call herdr_call(method=\"herdr_mcp.device.revoke\", params='{\"device_id\":\"dev_...\",\"confirm\":true}'). This is a Worker fleet-admin action. Never revoke by display name.",
         }));
       } catch {
         return rpcResult(
@@ -327,15 +335,15 @@ export async function handleMcp(
 
     const localMethod = name === "herdr_call" && typeof args.method === "string" ? args.method : null;
 
-    // Edge-local pairing creation: allows an OAuth-authorized owner to initiate
-    // a device pairing session directly at Edge without requiring an enrolled
-    // or online workstation.
+    // Edge-local pairing creation. The operation does not route through a
+    // workstation, but the current MCP principal must already have explicit
+    // Worker fleet-admin authority.
     if (localMethod === "herdr_mcp.device.pair") {
       if (args.device !== undefined) {
         return rpcResult(id, callToolResult({
           ok: false,
           code: "device_selector_not_allowed",
-          message: "herdr_mcp.device.pair is Edge-local and does not accept a device selector; no existing workstation is required or used",
+          message: "herdr_mcp.device.pair is Edge-local and does not accept a device selector; authorization comes from the current Worker fleet-admin principal rather than a routed workstation",
           retryable: false,
           delivery_state: "not_delivered",
           failure_layer: "edge_routing",
@@ -492,7 +500,7 @@ export async function handleMcp(
       }
     }
 
-    // Edge-local owner revoke: permanently revoke one enrolled immutable device
+    // Edge-local fleet-admin revoke: permanently revoke one enrolled immutable device
     // identity without requiring any workstation to be online. This stays under
     // the existing herdr_call public tool, so it does not change contract epoch
     // or tool count.
@@ -677,6 +685,81 @@ export async function handleMcp(
         client_id: clientId,
         revoked: true,
         message: "Connector grant revoked. Existing v0.4.6-issued access/refresh credentials are fenced by the grant tombstone.",
+      }));
+    }
+
+    if (localMethod === "herdr_mcp.automation.list" || localMethod === "herdr_mcp.automation.revoke") {
+      if (args.device !== undefined) {
+        return rpcResult(id, callToolResult({
+          ok: false,
+          code: "device_selector_not_allowed",
+          message: `${localMethod} is Edge-local and does not accept a device selector`,
+          retryable: false,
+          delivery_state: "not_delivered",
+          failure_layer: "edge_routing",
+        }, true));
+      }
+      for (const key of Object.keys(args)) {
+        if (key !== "method" && key !== "params") {
+          return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: `unknown top-level argument '${key}'` }, true));
+        }
+      }
+      let methodParams: Record<string, unknown> = {};
+      const rawParams = args.params;
+      if (typeof rawParams === "string") {
+        try {
+          const parsed = rawParams.trim() ? JSON.parse(rawParams) : {};
+          if (!isRecord(parsed)) throw new Error("not_object");
+          methodParams = parsed;
+        } catch {
+          return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: "params must be a JSON object" }, true));
+        }
+      } else if (isRecord(rawParams)) {
+        methodParams = rawParams;
+      } else if (rawParams !== undefined && rawParams !== null) {
+        return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: "params must be an object or JSON object string" }, true));
+      }
+
+      if (localMethod === "herdr_mcp.automation.list") {
+        if (Object.keys(methodParams).length !== 0) {
+          return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: "automation list accepts no parameters" }, true));
+        }
+        if (!deps.listAutomations) {
+          return rpcResult(id, callToolResult({ ok: false, code: "automation_list_unavailable", retryable: false }, true));
+        }
+        const result = await deps.listAutomations();
+        if (!result.ok) return rpcResult(id, callToolResult({ ok: false, code: result.code, retryable: false }, true));
+        return rpcResult(id, callToolResult({
+          ok: true,
+          action: "automation_list",
+          automations: result.automations,
+          message: "Automation credentials are service principals for unattended MCP clients. Long-lived client secrets are never returned by inventory.",
+        }));
+      }
+
+      for (const key of Object.keys(methodParams)) {
+        if (key !== "client_id" && key !== "confirm") {
+          return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: `unknown parameter '${key}'` }, true));
+        }
+      }
+      const clientId = typeof methodParams.client_id === "string" ? methodParams.client_id.trim() : "";
+      if (!/^svc_[A-Za-z0-9_-]{8,128}$/.test(clientId)) {
+        return rpcResult(id, callToolResult({ ok: false, code: "invalid_client_id", retryable: false }, true));
+      }
+      if (methodParams.confirm !== true) {
+        return rpcResult(id, callToolResult({ ok: false, code: "confirmation_required", message: "automation revoke requires confirm=true", retryable: false }, true));
+      }
+      if (!deps.revokeAutomation) {
+        return rpcResult(id, callToolResult({ ok: false, code: "automation_revoke_unavailable", retryable: false }, true));
+      }
+      const result = await deps.revokeAutomation(clientId);
+      if (!result.ok) return rpcResult(id, callToolResult({ ok: false, code: result.code, retryable: false }, true));
+      return rpcResult(id, callToolResult({
+        ok: true,
+        action: "automation_revoke",
+        client_id: clientId,
+        revoked: true,
+        message: "Automation credential revoked. Existing access tokens are fenced immediately and this client can no longer mint new tokens.",
       }));
     }
 
