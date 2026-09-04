@@ -120,6 +120,22 @@ test("fleet private method schemas are discoverable without changing the base pu
   assert.ok(acquire.params.required.includes("expected_chain_revision"));
   assert.ok(acquire.params.required.includes("idempotency_key"));
 
+  const chains = await handleMcp(req(100, "tools/call", {
+    name: "herdr_methods",
+    arguments: { query: "work_chain" },
+  }), "w1", d.value);
+  const createChain = chains.body.result.structuredContent.methods.find((entry) => entry.method === "herdr_mcp.work_chain.create");
+  assert.equal("portable_evidence_refs" in createChain.params.properties, false);
+
+  const lanes = await handleMcp(req(101, "tools/call", {
+    name: "herdr_methods",
+    arguments: { query: "execution_lane" },
+  }), "w1", d.value);
+  const laneCreate = lanes.body.result.structuredContent.methods.find((entry) => entry.method === "herdr_mcp.execution_lane.create");
+  const laneUpdate = lanes.body.result.structuredContent.methods.find((entry) => entry.method === "herdr_mcp.execution_lane.update");
+  assert.equal("validation_refs" in laneCreate.params.properties, false);
+  assert.equal("validation_refs" in laneUpdate.params.properties, false);
+
   const listed = await handleMcp(req(2, "tools/list", {}), "w1", d.value);
   assert.deepEqual(listed.body.result.tools, EPOCH3_CONTRACT.tools);
   assert.equal(EPOCH3_CONTRACT.contract_epoch, 3);
@@ -171,7 +187,7 @@ test("fleet methods reject public device routing metadata and unsupported runtim
 
 test("public /mcp derives operator identity and rejects caller-supplied identity or capability fields", async () => {
   const h = makeWorkerHarness();
-  for (const field of ["principal", "client_id", "holder_principal", "can_control_fleet", "can_force_takeover"]) {
+  for (const field of ["principal", "client_id", "controller_id", "conversation_id", "holder_principal", "can_control_fleet", "can_force_takeover"]) {
     const injected = await publicFleetCall(h.env, "dev-operator-secret", 10, "herdr_mcp.work_chain.create", {
       idempotency_key: `inject-${field}`,
       [field]: field === "can_control_fleet" || field === "can_force_takeover" ? true : "attacker",
@@ -185,6 +201,12 @@ test("public /mcp derives operator identity and rejects caller-supplied identity
   });
   assert.equal(created.result.ok, true);
   assert.equal(created.result.chain.creator_principal, "operator:dev_bearer");
+
+  const sameCredential = await publicFleetCall(h.env, "dev-operator-secret", 12, "herdr_mcp.work_chain.create", {
+    idempotency_key: "public-create-same-credential",
+  });
+  assert.equal(sameCredential.result.ok, true);
+  assert.equal(sameCredential.result.chain.creator_principal, "operator:dev_bearer");
 
   const publicInternalBypass = await worker.fetch(new Request("https://edge.example/internal/devices/fleet-control", {
     method: "POST",

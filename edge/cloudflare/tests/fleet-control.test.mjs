@@ -9,12 +9,20 @@ const PRINCIPAL_A = "oauth:controller-a";
 const PRINCIPAL_B = "oauth:controller-b";
 
 class FakeStorage {
-  constructor(map = new Map()) { this.map = map; }
+  constructor(map = new Map()) { this.map = map; this.transactionSeq = 0; this.activeTransaction = null; this.writeLog = []; }
   async get(key) { return this.map.get(key); }
-  async put(key, value) { this.map.set(key, structuredClone(value)); }
+  async put(key, value) {
+    this.map.set(key, structuredClone(value));
+    if (this.activeTransaction !== null) this.writeLog.push({ key, transaction: this.activeTransaction });
+  }
   async delete(key) { return this.map.delete(key); }
   async list({ prefix } = {}) { return new Map([...this.map].filter(([key]) => !prefix || key.startsWith(prefix))); }
-  async transaction(fn) { return fn(this); }
+  async transaction(fn) {
+    const transaction = ++this.transactionSeq;
+    this.activeTransaction = transaction;
+    try { return await fn(this); }
+    finally { this.activeTransaction = null; }
+  }
 }
 
 function device(deviceId, authorization = "active") {
@@ -171,6 +179,46 @@ test("work chain and planner lease enforce exclusive holder, renewal, release, p
   assert.equal(released.chain.planner_lease, null);
 });
 
+test("alpha.1 rejects caller-supplied evidence refs and successful chains remain reconstructable", async () => {
+  const { storage, registry } = makeRegistry();
+
+  for (const [suffix, ref] of [
+    ["blank", "   "],
+    ["absolute", "/Users/example/private"],
+    ["url", "https://example.invalid/evidence"],
+  ]) {
+    const rejected = await call(registry, "herdr_mcp.work_chain.create", {
+      idempotency_key: `chain-ref-${suffix}`,
+      portable_evidence_refs: [ref],
+    });
+    assert.equal(rejected.code, "invalid_params");
+    assert.equal(rejected.field, "portable_evidence_refs");
+  }
+
+  const created = await createChain(registry, "chain-readable");
+  assert.equal(created.ok, true);
+  assert.deepEqual(created.chain.portable_evidence_refs, []);
+
+  const inspected = await call(registry, "herdr_mcp.work_chain.inspect", {
+    work_chain_id: created.chain.work_chain_id,
+  });
+  assert.equal(inspected.ok, true);
+
+  const acquired = await acquire(registry, created.chain, "chain-readable-acquire");
+  assert.equal(acquired.ok, true);
+
+  const legacyStoredChain = structuredClone(await storage.get(`fleet:chain:v1:${created.chain.work_chain_id}`));
+  delete legacyStoredChain.portable_evidence_refs;
+  await storage.put(`fleet:chain:v1:${created.chain.work_chain_id}`, legacyStoredChain);
+
+  const reconstructed = makeRegistry(storage).registry;
+  const afterReconstruction = await call(reconstructed, "herdr_mcp.work_chain.inspect", {
+    work_chain_id: created.chain.work_chain_id,
+  }, PRINCIPAL_B, 2000);
+  assert.equal(afterReconstruction.ok, true);
+  assert.deepEqual(afterReconstruction.chain.portable_evidence_refs, []);
+});
+
 test("expired lease is reclaimable with monotonically increasing generation", async () => {
   const { registry } = makeRegistry();
   const created = await createChain(registry, "expired-chain");
@@ -193,9 +241,16 @@ test("idempotency replays identical mutation and rejects payload mismatch", asyn
   assert.equal(replay.replayed, true);
   assert.equal(replay.chain.work_chain_id, first.chain.work_chain_id);
 
-  const mismatch = await call(registry, "herdr_mcp.work_chain.create", {
-    idempotency_key: "same-key",
-    portable_evidence_refs: ["ev_changed"],
+  const acquired = await acquire(registry, first.chain, "same-lease-key");
+  assert.equal(acquired.ok, true);
+  const acquiredReplay = await acquire(registry, first.chain, "same-lease-key");
+  assert.equal(acquiredReplay.replayed, true);
+
+  const mismatch = await call(registry, "herdr_mcp.planner_lease.acquire", {
+    work_chain_id: first.chain.work_chain_id,
+    expected_chain_revision: first.chain.revision,
+    ttl_ms: 60000,
+    idempotency_key: "same-lease-key",
   });
   assert.equal(mismatch.code, "idempotency_key_payload_mismatch");
 
@@ -204,7 +259,7 @@ test("idempotency replays identical mutation and rejects payload mismatch", asyn
   assert.notEqual(otherPrincipal.chain.work_chain_id, first.chain.work_chain_id);
 });
 
-test("idempotency expires after 24h and storage stays bounded without timers", async () => {
+test("idempotency admission quota stays bounded while existing control resources remain operable", async () => {
   const { registry } = makeRegistry();
   const first = await call(registry, "herdr_mcp.work_chain.create", { idempotency_key: "expiry-key" }, PRINCIPAL_A, 1000);
   const expired = await call(registry, "herdr_mcp.work_chain.create", { idempotency_key: "expiry-key" }, PRINCIPAL_A, 1000 + 24 * 60 * 60 * 1000 + 1);
@@ -213,14 +268,146 @@ test("idempotency expires after 24h and storage stays bounded without timers", a
   assert.notEqual(expired.chain.work_chain_id, first.chain.work_chain_id);
 
   const bounded = makeRegistry();
-  for (let index = 0; index < 512; index += 1) {
-    const created = await call(bounded.registry, "herdr_mcp.work_chain.create", { idempotency_key: `bounded-${index}` }, PRINCIPAL_A, 2000 + index);
+  await putDevice(bounded.storage, device(DEVICE_A));
+  await putDevice(bounded.storage, device(DEVICE_B));
+  const chain = await call(bounded.registry, "herdr_mcp.work_chain.create", { idempotency_key: "bounded-control-chain" }, PRINCIPAL_A, 2000);
+  const lease = await acquire(bounded.registry, chain.chain, "bounded-control-acquire", PRINCIPAL_A, 2001);
+  const lane = await call(bounded.registry, "herdr_mcp.execution_lane.create", {
+    work_chain_id: chain.chain.work_chain_id,
+    expected_chain_revision: lease.chain.revision,
+    expected_lease_generation: 1,
+    idempotency_key: "bounded-control-lane",
+    device_id: DEVICE_A,
+    repo_id: "github.com/whshang/herdr-mcp",
+    base_commit: "e9281b488e093f522020db2a2c6100d92b69499f",
+    branch_ref: "feat/bounded-control",
+    status: "active",
+  }, PRINCIPAL_A, 2002);
+  assert.equal(lane.ok, true);
+
+  for (let index = 0; index < 254; index += 1) {
+    const created = await call(bounded.registry, "herdr_mcp.work_chain.create", { idempotency_key: `bounded-admission-${index}` }, PRINCIPAL_A, 2100 + index);
     assert.equal(created.ok, true);
   }
-  const saturated = await call(bounded.registry, "herdr_mcp.work_chain.create", { idempotency_key: "bounded-overflow" }, PRINCIPAL_A, 3000);
+  const saturated = await call(bounded.registry, "herdr_mcp.work_chain.create", { idempotency_key: "bounded-admission-overflow" }, PRINCIPAL_A, 3000);
   assert.equal(saturated.code, "idempotency_capacity_exceeded");
+  assert.equal(saturated.quota_scope, "admission");
+  assert.equal(saturated.live_records, 256);
+  assert.equal(saturated.limit, 256);
+  assert.ok(saturated.recover_after_ms > 0);
+
+  const renewedParams = {
+    work_chain_id: chain.chain.work_chain_id,
+    expected_chain_revision: lane.chain.revision,
+    expected_lease_generation: 1,
+    ttl_ms: 30000,
+    idempotency_key: "bounded-control-renew",
+  };
+  const renewed = await call(bounded.registry, "herdr_mcp.planner_lease.renew", renewedParams, PRINCIPAL_A, 3100);
+  assert.equal(renewed.ok, true);
+  const renewReplay = await call(bounded.registry, "herdr_mcp.planner_lease.renew", renewedParams, PRINCIPAL_A, 3101);
+  assert.equal(renewReplay.replayed, true);
+
+  const takeoverParams = {
+    work_chain_id: chain.chain.work_chain_id,
+    expected_chain_revision: renewed.chain.revision,
+    expected_lease_generation: 1,
+    ttl_ms: 30000,
+    reason: "operator recovers a saturated admission plane",
+    idempotency_key: "bounded-control-takeover",
+  };
+  const takeover = await call(bounded.registry, "herdr_mcp.planner_lease.takeover", takeoverParams, PRINCIPAL_B, 3200, true);
+  assert.equal(takeover.ok, true);
+  const takeoverReplay = await call(bounded.registry, "herdr_mcp.planner_lease.takeover", takeoverParams, PRINCIPAL_B, 3201, true);
+  assert.equal(takeoverReplay.replayed, true);
+  assert.equal(takeoverReplay.planner_lease.generation, takeover.planner_lease.generation);
+
+  const reassigned = await call(bounded.registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: chain.chain.work_chain_id,
+    expected_chain_revision: takeover.chain.revision,
+    expected_lease_generation: 2,
+    lane_id: lane.lane.lane_id,
+    expected_lane_generation: 1,
+    reassign: true,
+    device_id: DEVICE_B,
+    status: "active",
+    idempotency_key: "bounded-control-reassign",
+  }, PRINCIPAL_B, 3300);
+  assert.equal(reassigned.ok, true);
+
+  const completed = await call(bounded.registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: chain.chain.work_chain_id,
+    expected_chain_revision: reassigned.chain.revision,
+    expected_lease_generation: 2,
+    lane_id: reassigned.lane.lane_id,
+    expected_lane_generation: reassigned.lane.lane_generation,
+    status: "completed",
+    idempotency_key: "bounded-control-complete",
+  }, PRINCIPAL_B, 3400);
+  assert.equal(completed.ok, true);
+
+  const released = await call(bounded.registry, "herdr_mcp.planner_lease.release", {
+    work_chain_id: chain.chain.work_chain_id,
+    expected_chain_revision: completed.chain.revision,
+    expected_lease_generation: 2,
+    idempotency_key: "bounded-control-release",
+  }, PRINCIPAL_B, 3500);
+  assert.equal(released.ok, true);
+
+  const releaseChainWrite = [...bounded.storage.writeLog].reverse().find((entry) => entry.key === `fleet:chain:v1:${chain.chain.work_chain_id}`);
+  assert.ok(releaseChainWrite);
+  assert.ok(bounded.storage.writeLog.some((entry) => entry.transaction === releaseChainWrite.transaction && entry.key.startsWith("fleet:idempotency:v1:")));
+
   const records = await bounded.storage.list({ prefix: "fleet:idempotency:v1:" });
-  assert.equal(records.size, 512);
+  assert.ok(records.size <= 512);
+
+  const recoveredAdmission = await call(bounded.registry, "herdr_mcp.work_chain.create", {
+    idempotency_key: "bounded-admission-after-expiry",
+  }, PRINCIPAL_A, 2000 + 24 * 60 * 60 * 1000 + 1);
+  assert.equal(recoveredAdmission.ok, true);
+});
+
+test("one principal cannot consume the other Alpha.1 operator principal's control reserve", async () => {
+  const { registry } = makeRegistry();
+  const created = await createChain(registry, "principal-control-chain", PRINCIPAL_A);
+  let chain = created.chain;
+
+  for (let index = 0; index < 64; index += 1) {
+    const acquired = await call(registry, "herdr_mcp.planner_lease.acquire", {
+      work_chain_id: chain.work_chain_id,
+      expected_chain_revision: chain.revision,
+      idempotency_key: `principal-a-acquire-${index}`,
+      ttl_ms: 30000,
+    }, PRINCIPAL_A, 4000 + index * 2);
+    assert.equal(acquired.ok, true);
+    const released = await call(registry, "herdr_mcp.planner_lease.release", {
+      work_chain_id: chain.work_chain_id,
+      expected_chain_revision: acquired.chain.revision,
+      expected_lease_generation: acquired.planner_lease.generation,
+      idempotency_key: `principal-a-release-${index}`,
+    }, PRINCIPAL_A, 4001 + index * 2);
+    assert.equal(released.ok, true);
+    chain = released.chain;
+  }
+
+  const principalASaturated = await call(registry, "herdr_mcp.planner_lease.acquire", {
+    work_chain_id: chain.work_chain_id,
+    expected_chain_revision: chain.revision,
+    idempotency_key: "principal-a-over-control-reserve",
+    ttl_ms: 30000,
+  }, PRINCIPAL_A, 5000);
+  assert.equal(principalASaturated.code, "idempotency_capacity_exceeded");
+  assert.equal(principalASaturated.quota_scope, "control_principal");
+  assert.equal(principalASaturated.live_records, 128);
+  assert.equal(principalASaturated.limit, 128);
+
+  const principalBStillOperates = await call(registry, "herdr_mcp.planner_lease.acquire", {
+    work_chain_id: chain.work_chain_id,
+    expected_chain_revision: chain.revision,
+    idempotency_key: "principal-b-control-reserve",
+    ttl_ms: 30000,
+  }, PRINCIPAL_B, 5000);
+  assert.equal(principalBStillOperates.ok, true);
 });
 
 test("execution lanes require explicit active device and portable repo/branch identity", async () => {
@@ -240,7 +427,7 @@ test("execution lanes require explicit active device and portable repo/branch id
     base_commit: "e9281b488e093f522020db2a2c6100d92b69499f",
     branch_ref: "refs/heads/feat/lane-a",
     file_scope: ["edge/cloudflare/src"],
-    runtime_scope: ["edge"],
+    runtime_scope: ["runtime:edge"],
   });
   assert.equal(laneA.ok, true);
   assert.equal(laneA.lane.repo_id, "github.com/whshang/herdr-mcp");
@@ -296,6 +483,125 @@ test("execution lanes require explicit active device and portable repo/branch id
     file_scope: ["src/../outside"],
   });
   assert.equal(traversalScope.code, "invalid_params");
+});
+
+test("execution lane identity and scopes use portable canonical syntax", async () => {
+  const { storage, registry } = makeRegistry();
+  await putDevice(storage, device(DEVICE_A));
+  const created = await createChain(registry, "portable-lane-chain");
+  const lease = await acquire(registry, created.chain, "portable-lane-lease");
+  const base = {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: lease.chain.revision,
+    expected_lease_generation: 1,
+    device_id: DEVICE_A,
+    repo_id: "github.com/whshang/herdr-mcp",
+    base_commit: "e9281b488e093f522020db2a2c6100d92b69499f",
+    branch_ref: "feat/portable-lane",
+  };
+
+  const abbreviated = await call(registry, "herdr_mcp.execution_lane.create", {
+    ...base,
+    idempotency_key: "portable-abbreviated-sha",
+    base_commit: "e9281b4",
+  });
+  assert.equal(abbreviated.code, "invalid_lane_identity");
+
+  for (const [suffix, branchRef] of [
+    ["tilde", "bad~branch"],
+    ["caret", "bad^branch"],
+    ["question", "bad?branch"],
+    ["star", "bad*branch"],
+    ["bracket", "bad[branch"],
+    ["double-slash", "bad//branch"],
+    ["leading-dot", ".bad"],
+    ["lock", "bad.lock"],
+  ]) {
+    const rejected = await call(registry, "herdr_mcp.execution_lane.create", {
+      ...base,
+      idempotency_key: `portable-branch-${suffix}`,
+      branch_ref: branchRef,
+    });
+    assert.equal(rejected.code, "invalid_lane_identity", branchRef);
+  }
+
+  const badRepo = await call(registry, "herdr_mcp.execution_lane.create", {
+    ...base,
+    idempotency_key: "portable-repo-dot-segment",
+    repo_id: "github.com/whshang/./herdr-mcp",
+  });
+  assert.equal(badRepo.code, "invalid_lane_identity");
+
+  for (const [suffix, fileScope] of [
+    ["url", ["https://evil.example/task"]],
+    ["shell", ["$(shell)"]],
+    ["absolute", ["/tmp/task"]],
+    ["empty-segment", ["src//task"]],
+    ["traversal", ["src/../task"]],
+  ]) {
+    const rejected = await call(registry, "herdr_mcp.execution_lane.create", {
+      ...base,
+      idempotency_key: `portable-file-scope-${suffix}`,
+      branch_ref: `feat/file-scope-${suffix}`,
+      file_scope: fileScope,
+    });
+    assert.equal(rejected.code, "invalid_params", suffix);
+  }
+
+  for (const [suffix, runtimeScope] of [
+    ["url", ["https://runtime.example"]],
+    ["shell", ["$(runtime)"]],
+  ]) {
+    const rejected = await call(registry, "herdr_mcp.execution_lane.create", {
+      ...base,
+      idempotency_key: `portable-runtime-scope-${suffix}`,
+      branch_ref: `feat/runtime-scope-${suffix}`,
+      runtime_scope: runtimeScope,
+    });
+    assert.equal(rejected.code, "invalid_params", suffix);
+  }
+
+  const sha1Lane = await call(registry, "herdr_mcp.execution_lane.create", {
+    ...base,
+    idempotency_key: "portable-sha1",
+    branch_ref: "refs/heads/feat/portable-sha1",
+    file_scope: ["edge/cloudflare/src"],
+    runtime_scope: ["runtime:edge"],
+  });
+  assert.equal(sha1Lane.ok, true);
+  assert.equal(sha1Lane.lane.branch_ref, "feat/portable-sha1");
+
+  const sha256Lane = await call(registry, "herdr_mcp.execution_lane.create", {
+    ...base,
+    expected_chain_revision: sha1Lane.chain.revision,
+    idempotency_key: "portable-sha256",
+    base_commit: "a".repeat(64),
+    branch_ref: "feat/portable-sha256",
+    file_scope: ["crates/herdr-mcp/src"],
+    runtime_scope: ["service:herdr-mcp"],
+  });
+  assert.equal(sha256Lane.ok, true);
+
+  const validationRef = await call(registry, "herdr_mcp.execution_lane.create", {
+    ...base,
+    expected_chain_revision: sha256Lane.chain.revision,
+    idempotency_key: "portable-validation-ref",
+    branch_ref: "feat/portable-validation-ref",
+    validation_refs: ["https://example.invalid/validation"],
+  });
+  assert.equal(validationRef.code, "invalid_params");
+  assert.equal(validationRef.field, "validation_refs");
+
+  const legacyStoredLane = structuredClone(await storage.get(`fleet:lane:v1:${sha256Lane.lane.lane_id}`));
+  delete legacyStoredLane.validation_refs;
+  await storage.put(`fleet:lane:v1:${sha256Lane.lane.lane_id}`, legacyStoredLane);
+
+  const reconstructed = makeRegistry(storage).registry;
+  const inspected = await call(reconstructed, "herdr_mcp.execution_lane.inspect", {
+    lane_id: sha256Lane.lane.lane_id,
+  }, PRINCIPAL_B, 5000);
+  assert.equal(inspected.ok, true);
+  assert.deepEqual(inspected.lane.validation_refs, []);
 });
 
 test("unknown, revoked, and missing devices fail closed without auto-routing", async () => {

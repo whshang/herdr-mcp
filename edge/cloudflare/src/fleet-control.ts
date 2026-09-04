@@ -16,6 +16,12 @@ const MIN_LEASE_TTL_MS = 30_000;
 const MAX_LEASE_TTL_MS = 30 * 60_000;
 export const FLEET_IDEMPOTENCY_TTL_MS = 24 * 60 * 60_000;
 export const FLEET_IDEMPOTENCY_MAX_RECORDS = 512;
+// Alpha.1 has exactly two trusted credential principals. Reserve half of the
+// bounded ledger for existing-resource control and split that reserve evenly,
+// so admission pressure or one credential cannot starve the other controller.
+export const FLEET_IDEMPOTENCY_ADMISSION_MAX_RECORDS = 256;
+export const FLEET_IDEMPOTENCY_CONTROL_MAX_RECORDS = 256;
+export const FLEET_IDEMPOTENCY_CONTROL_MAX_PER_PRINCIPAL = 128;
 
 export const FLEET_CONTROL_METHODS = [
   "herdr_mcp.work_chain.create",
@@ -33,7 +39,7 @@ export const FLEET_CONTROL_METHODS = [
 export type FleetControlMethod = (typeof FLEET_CONTROL_METHODS)[number];
 
 const METHOD_FIELDS: Record<FleetControlMethod, { required: string[]; optional?: string[] }> = {
-  "herdr_mcp.work_chain.create": { required: ["idempotency_key"], optional: ["portable_evidence_refs"] },
+  "herdr_mcp.work_chain.create": { required: ["idempotency_key"] },
   "herdr_mcp.work_chain.inspect": { required: ["work_chain_id"] },
   "herdr_mcp.planner_lease.acquire": { required: ["work_chain_id", "expected_chain_revision", "idempotency_key"], optional: ["ttl_ms"] },
   "herdr_mcp.planner_lease.inspect": { required: ["work_chain_id"] },
@@ -42,12 +48,12 @@ const METHOD_FIELDS: Record<FleetControlMethod, { required: string[]; optional?:
   "herdr_mcp.planner_lease.takeover": { required: ["work_chain_id", "expected_chain_revision", "expected_lease_generation", "idempotency_key", "reason"], optional: ["ttl_ms"] },
   "herdr_mcp.execution_lane.create": {
     required: ["work_chain_id", "expected_chain_revision", "expected_lease_generation", "idempotency_key", "device_id", "repo_id", "base_commit", "branch_ref"],
-    optional: ["file_scope", "runtime_scope", "agent_ref", "status", "validation_summary", "validation_refs"],
+    optional: ["file_scope", "runtime_scope", "agent_ref", "status", "validation_summary"],
   },
   "herdr_mcp.execution_lane.inspect": { required: ["lane_id"] },
   "herdr_mcp.execution_lane.update": {
     required: ["work_chain_id", "expected_chain_revision", "expected_lease_generation", "expected_lane_generation", "lane_id", "idempotency_key"],
-    optional: ["status", "validation_summary", "validation_refs", "reassign", "device_id"],
+    optional: ["status", "validation_summary", "reassign", "device_id"],
   },
 };
 
@@ -62,16 +68,14 @@ const FIELD_SCHEMAS: Record<string, Record<string, unknown>> = {
   reason: { type: "string", minLength: 1, maxLength: MAX_TAKEOVER_REASON },
   device_id: { type: "string", minLength: 1, maxLength: 128 },
   repo_id: { type: "string", minLength: 1, maxLength: 512 },
-  base_commit: { type: "string", pattern: "^[0-9a-fA-F]{7,64}$" },
-  branch_ref: { type: "string", minLength: 1, maxLength: 512 },
-  file_scope: { type: "array", maxItems: MAX_SCOPE_ITEMS, items: { type: "string", maxLength: 1024 } },
-  runtime_scope: { type: "array", maxItems: MAX_SCOPE_ITEMS, items: { type: "string", maxLength: 1024 } },
-  portable_evidence_refs: { type: "array", maxItems: MAX_SCOPE_ITEMS, items: { type: "string", maxLength: 1024 } },
+  base_commit: { type: "string", pattern: "^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$" },
+  branch_ref: { type: "string", minLength: 1, maxLength: 512, description: "canonical Git branch name; refs/heads/<name> is accepted and normalized to <name>" },
+  file_scope: { type: "array", maxItems: MAX_SCOPE_ITEMS, items: { type: "string", maxLength: 1024 }, description: "repo-relative path prefixes; alpha.1 does not accept glob or shell syntax" },
+  runtime_scope: { type: "array", maxItems: MAX_SCOPE_ITEMS, items: { type: "string", maxLength: 128, pattern: "^(?:service|runtime):[A-Za-z0-9][A-Za-z0-9._-]{0,119}$" } },
   agent_ref: { type: "string", minLength: 1, maxLength: 1024 },
   status: { type: "string", enum: ["planned", "active", "blocked", "completed", "cancelled"] },
   reassign: { type: "boolean" },
   validation_summary: { type: ["string", "null"], maxLength: 4096 },
-  validation_refs: { type: "array", maxItems: MAX_SCOPE_ITEMS, items: { type: "string", maxLength: 1024 } },
 };
 
 export function discoverFleetControlMethods(query = ""): Array<Record<string, unknown>> {
@@ -163,6 +167,7 @@ interface IdempotencyRecord {
   schema_version: 1;
   operation: FleetControlMethod;
   request_hash: string;
+  principal_hash?: string;
   result: Record<string, unknown>;
   created_at_ms: number;
   expires_at_ms: number;
@@ -197,7 +202,7 @@ function integer(value: unknown, min = 0): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= min;
 }
 
-function normalizeScope(value: unknown): string[] | null {
+function normalizeFileScope(value: unknown): string[] | null {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > MAX_SCOPE_ITEMS) return null;
   const result: string[] = [];
@@ -205,22 +210,28 @@ function normalizeScope(value: unknown): string[] | null {
     if (!boundedString(item, 1024)) return null;
     const trimmed = item.trim();
     const segments = trimmed.split("/");
-    if (!trimmed || trimmed.startsWith("/") || trimmed.startsWith("~") || trimmed.includes("\\")
-      || /^[A-Za-z]:[\\/]/.test(trimmed) || segments.some((segment) => segment === "." || segment === "..")) return null;
+    if (!trimmed || trimmed !== item || trimmed.startsWith("/") || trimmed.includes("~") || trimmed.includes("\\")
+      || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(trimmed) || /[\u0000-\u001f\u007f:$`"'(){};|&<>!*?\[\]#]/.test(trimmed)
+      || segments.some((segment) => !segment || segment === "." || segment === "..")) return null;
     result.push(trimmed);
   }
   return result;
 }
 
-function normalizeRefs(value: unknown): string[] | null {
+function normalizeRuntimeScope(value: unknown): string[] | null {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > MAX_SCOPE_ITEMS) return null;
-  const refs: string[] = [];
+  const result: string[] = [];
   for (const item of value) {
-    if (!boundedString(item, 1024)) return null;
-    refs.push(item.trim());
+    if (!boundedString(item, 128) || item !== item.trim() || !/^(?:service|runtime):[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(item)) return null;
+    result.push(item);
   }
-  return refs;
+  return result;
+}
+
+function normalizeStoredEmptyRefs(value: unknown): string[] | null {
+  if (value === undefined) return [];
+  return Array.isArray(value) && value.length === 0 ? [] : null;
 }
 
 export function normalizeRepoId(value: unknown): string | null {
@@ -231,9 +242,9 @@ export function normalizeRepoId(value: unknown): string | null {
   const scp = /^git@([^:]+):(.+)$/.exec(repo);
   if (scp) repo = `${scp[1]}/${scp[2]}`;
   repo = repo.replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "");
-  if (repo.includes("..") || repo.includes("\\") || repo.includes(":") || repo.startsWith("~")) return null;
+  if (repo.includes("\\") || repo.includes(":") || repo.startsWith("~") || /[\u0000-\u0020\u007f]/.test(repo)) return null;
   const parts = repo.split("/");
-  if (parts.length < 3 || parts.some((part) => !/^[A-Za-z0-9._-]+$/.test(part))) return null;
+  if (parts.length < 3 || parts.some((part) => !part || part === "." || part === ".." || !/^[A-Za-z0-9._-]+$/.test(part))) return null;
   const [host, ...path] = parts;
   if (!host.includes(".")) return null;
   return `${host.toLowerCase()}/${path.join("/")}`;
@@ -242,9 +253,12 @@ export function normalizeRepoId(value: unknown): string | null {
 export function normalizeBranchRef(value: unknown): string | null {
   if (!boundedString(value, 512)) return null;
   let branch = value;
-  while (branch.startsWith("refs/heads/")) branch = branch.slice("refs/heads/".length);
-  if (!branch || branch.startsWith("refs/") || branch.startsWith("/") || branch.startsWith("~") || branch.includes("\\") || /\s/.test(branch)
-    || branch.includes("..") || branch.endsWith("/") || branch.endsWith(".") || branch.includes("@{")) return null;
+  if (branch.startsWith("refs/heads/")) branch = branch.slice("refs/heads/".length);
+  if (!branch || branch === "@" || branch.startsWith("refs/") || branch.startsWith("/") || branch.startsWith("-")
+    || branch.includes("//") || branch.includes("..") || branch.includes("@{") || branch.endsWith("/") || branch.endsWith(".")
+    || /[\u0000-\u0020\u007f~^:?*\[\\]/.test(branch)) return null;
+  const segments = branch.split("/");
+  if (segments.some((segment) => !segment || segment.startsWith(".") || segment.endsWith(".lock"))) return null;
   return branch;
 }
 
@@ -253,7 +267,7 @@ function validBranchRef(value: unknown): value is string {
 }
 
 function validCommit(value: unknown): value is string {
-  return typeof value === "string" && /^[0-9a-fA-F]{7,64}$/.test(value);
+  return typeof value === "string" && /^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test(value);
 }
 
 function newOpaqueId(prefix: "wc" | "lane"): string {
@@ -292,7 +306,8 @@ function normalizeChain(value: unknown): WorkChainRecord | null {
   if (value.status !== "active" && value.status !== "completed" && value.status !== "cancelled") return null;
   if (!boundedString(value.creator_principal, MAX_PRINCIPAL)) return null;
   if (value.checkpoint_schema_version !== 1 || !integer(value.checkpoint_revision, 0)) return null;
-  if (!Array.isArray(value.portable_evidence_refs) || value.portable_evidence_refs.some((item) => !boundedString(item, 1024))) return null;
+  const portableEvidenceRefs = normalizeStoredEmptyRefs(value.portable_evidence_refs);
+  if (!portableEvidenceRefs) return null;
   if (!integer(value.planner_lease_generation, 0) || !integer(value.created_at_ms, 0) || !integer(value.updated_at_ms, 0)) return null;
   const lease = value.planner_lease;
   if (lease !== null) {
@@ -306,25 +321,30 @@ function normalizeChain(value: unknown): WorkChainRecord | null {
     if (!integer(takeover.previous_generation, 1) || !integer(takeover.new_generation, 1) || takeover.new_generation <= takeover.previous_generation) return null;
     if (!boundedString(takeover.reason, MAX_TAKEOVER_REASON) || !integer(takeover.at_ms, 0)) return null;
   }
-  return value as unknown as WorkChainRecord;
+  return { ...value, portable_evidence_refs: portableEvidenceRefs, last_planner_takeover: takeover ?? null } as unknown as WorkChainRecord;
 }
 
 function normalizeLane(value: unknown): ExecutionLaneRecord | null {
   if (!isRecord(value) || value.schema_version !== 1) return null;
   if (!boundedString(value.lane_id, 128) || !boundedString(value.work_chain_id, 128) || !integer(value.lane_generation, 1)) return null;
-  if (!boundedString(value.device_id, 128) || !boundedString(value.repo_id, 512) || !validCommit(value.base_commit) || !validBranchRef(value.branch_ref)) return null;
-  if (!Array.isArray(value.file_scope) || !Array.isArray(value.runtime_scope) || !Array.isArray(value.validation_refs)) return null;
+  const repoId = normalizeRepoId(value.repo_id);
+  const fileScope = normalizeFileScope(value.file_scope);
+  const runtimeScope = normalizeRuntimeScope(value.runtime_scope);
+  const validationRefs = normalizeStoredEmptyRefs(value.validation_refs);
+  if (!boundedString(value.device_id, 128) || !repoId || repoId !== value.repo_id || !validCommit(value.base_commit) || !validBranchRef(value.branch_ref)) return null;
+  if (!fileScope || !runtimeScope || !validationRefs) return null;
   if (!boundedString(value.owner_principal, MAX_PRINCIPAL)) return null;
   if (!(value.agent_ref === null || boundedString(value.agent_ref, 1024))) return null;
   if (value.status !== "planned" && value.status !== "active" && value.status !== "blocked" && value.status !== "completed" && value.status !== "cancelled") return null;
-  if (!(value.validation_summary === null || typeof value.validation_summary === "string")) return null;
+  if (!(value.validation_summary === null || boundedString(value.validation_summary, 4096))) return null;
   if (!integer(value.created_at_ms, 0) || !integer(value.updated_at_ms, 0)) return null;
-  return value as unknown as ExecutionLaneRecord;
+  return { ...value, file_scope: fileScope, runtime_scope: runtimeScope, validation_refs: validationRefs } as unknown as ExecutionLaneRecord;
 }
 
 function normalizeIdempotency(value: unknown): IdempotencyRecord | null {
   if (!isRecord(value) || value.schema_version !== 1) return null;
   if (typeof value.operation !== "string" || !isFleetControlMethod(value.operation) || !boundedString(value.request_hash, 128) || !isRecord(value.result)) return null;
+  if (value.principal_hash !== undefined && (typeof value.principal_hash !== "string" || !/^[0-9a-f]{64}$/.test(value.principal_hash))) return null;
   if (!integer(value.created_at_ms, 0) || !integer(value.expires_at_ms, 0) || value.expires_at_ms <= value.created_at_ms) return null;
   return value as unknown as IdempotencyRecord;
 }
@@ -332,7 +352,8 @@ function normalizeIdempotency(value: unknown): IdempotencyRecord | null {
 function normalizeLaneReservation(value: unknown): LaneReservationRecord | null {
   if (!isRecord(value) || value.schema_version !== 1) return null;
   if (!boundedString(value.lane_id, 128) || !boundedString(value.work_chain_id, 128)) return null;
-  if (!boundedString(value.repo_id, 512) || !validBranchRef(value.branch_ref) || !integer(value.created_at_ms, 0)) return null;
+  const repoId = normalizeRepoId(value.repo_id);
+  if (!repoId || repoId !== value.repo_id || !validBranchRef(value.branch_ref) || !integer(value.created_at_ms, 0)) return null;
   return value as unknown as LaneReservationRecord;
 }
 
@@ -385,18 +406,69 @@ function laneTransitionAllowed(from: ExecutionLaneRecord["status"], to: Executio
   return false;
 }
 
-async function pruneIdempotency(tx: DurableObjectTransaction, nowMs: number): Promise<number> {
+type IdempotencyQuotaClass = "admission" | "control";
+
+interface IdempotencyUsage {
+  total: number;
+  admission: number;
+  control: number;
+  control_for_principal: number;
+  earliest_total_expiry_ms: number | null;
+  earliest_admission_expiry_ms: number | null;
+  earliest_control_expiry_ms: number | null;
+  earliest_control_principal_expiry_ms: number | null;
+}
+
+function idempotencyQuotaClass(method: FleetControlMethod): IdempotencyQuotaClass {
+  return method === "herdr_mcp.work_chain.create" || method === "herdr_mcp.execution_lane.create" ? "admission" : "control";
+}
+
+function earlier(current: number | null, candidate: number): number {
+  return current === null ? candidate : Math.min(current, candidate);
+}
+
+async function pruneIdempotencyUsage(tx: DurableObjectTransaction, nowMs: number, principalHash: string): Promise<IdempotencyUsage> {
   const stored = await tx.list<unknown>({ prefix: IDEMPOTENCY_PREFIX });
-  let live = 0;
+  const usage: IdempotencyUsage = {
+    total: 0,
+    admission: 0,
+    control: 0,
+    control_for_principal: 0,
+    earliest_total_expiry_ms: null,
+    earliest_admission_expiry_ms: null,
+    earliest_control_expiry_ms: null,
+    earliest_control_principal_expiry_ms: null,
+  };
   for (const [key, value] of stored) {
     const record = normalizeIdempotency(value);
     if (!record || record.expires_at_ms <= nowMs) {
       await tx.delete(key);
       continue;
     }
-    live += 1;
+    usage.total += 1;
+    usage.earliest_total_expiry_ms = earlier(usage.earliest_total_expiry_ms, record.expires_at_ms);
+    if (idempotencyQuotaClass(record.operation) === "admission") {
+      usage.admission += 1;
+      usage.earliest_admission_expiry_ms = earlier(usage.earliest_admission_expiry_ms, record.expires_at_ms);
+    } else {
+      usage.control += 1;
+      usage.earliest_control_expiry_ms = earlier(usage.earliest_control_expiry_ms, record.expires_at_ms);
+      if (record.principal_hash === principalHash) {
+        usage.control_for_principal += 1;
+        usage.earliest_control_principal_expiry_ms = earlier(usage.earliest_control_principal_expiry_ms, record.expires_at_ms);
+      }
+    }
   }
-  return live;
+  return usage;
+}
+
+function idempotencyCapacityError(quotaScope: string, liveRecords: number, limit: number, earliestExpiryMs: number | null, nowMs: number): FleetControlResult {
+  return error("idempotency_capacity_exceeded", {
+    quota_scope: quotaScope,
+    live_records: liveRecords,
+    limit,
+    recover_after_ms: earliestExpiryMs === null ? FLEET_IDEMPOTENCY_TTL_MS : Math.max(1, earliestExpiryMs - nowMs),
+  });
 }
 
 export async function executeFleetControl(storage: DurableObjectStorage, method: FleetControlMethod, params: Record<string, unknown>, authority: FleetControllerAuthority, nowMs = Date.now()): Promise<FleetControlResult> {
@@ -429,6 +501,7 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
   if (!idemKey) return error("idempotency_key_required");
   const hash = await requestHash(method, params);
   const idemStorageKey = await idempotencyStorageKey(principal, idemKey);
+  const principalHash = await sha256Hex(principal);
 
   return storage.transaction(async (tx) => {
     const priorRaw = await tx.get<unknown>(idemStorageKey);
@@ -438,15 +511,25 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
       return { ...(prior.result as { ok: boolean; [key: string]: unknown }), replayed: true } as FleetControlResult;
     }
     if (priorRaw !== undefined) await tx.delete(idemStorageKey);
-    const liveIdempotency = await pruneIdempotency(tx, nowMs);
-    if (liveIdempotency >= FLEET_IDEMPOTENCY_MAX_RECORDS) return error("idempotency_capacity_exceeded");
+    const usage = await pruneIdempotencyUsage(tx, nowMs, principalHash);
+    const quotaClass = idempotencyQuotaClass(method);
+    if (quotaClass === "admission" && usage.admission >= FLEET_IDEMPOTENCY_ADMISSION_MAX_RECORDS) {
+      return idempotencyCapacityError("admission", usage.admission, FLEET_IDEMPOTENCY_ADMISSION_MAX_RECORDS, usage.earliest_admission_expiry_ms, nowMs);
+    }
+    if (quotaClass === "control" && usage.control_for_principal >= FLEET_IDEMPOTENCY_CONTROL_MAX_PER_PRINCIPAL) {
+      return idempotencyCapacityError("control_principal", usage.control_for_principal, FLEET_IDEMPOTENCY_CONTROL_MAX_PER_PRINCIPAL, usage.earliest_control_principal_expiry_ms, nowMs);
+    }
+    if (quotaClass === "control" && usage.control >= FLEET_IDEMPOTENCY_CONTROL_MAX_RECORDS) {
+      return idempotencyCapacityError("control", usage.control, FLEET_IDEMPOTENCY_CONTROL_MAX_RECORDS, usage.earliest_control_expiry_ms, nowMs);
+    }
+    if (usage.total >= FLEET_IDEMPOTENCY_MAX_RECORDS) {
+      return idempotencyCapacityError("global", usage.total, FLEET_IDEMPOTENCY_MAX_RECORDS, usage.earliest_total_expiry_ms, nowMs);
+    }
 
     let result: FleetControlResult;
     if (method === "herdr_mcp.work_chain.create") {
-      const portableRefs = normalizeRefs(params.portable_evidence_refs);
-      if (!portableRefs || (params.status !== undefined && params.status !== "active")) return error("invalid_params");
       const id = newOpaqueId("wc");
-      const chain: WorkChainRecord = { schema_version: 1, work_chain_id: id, revision: 1, status: "active", creator_principal: principal, checkpoint_schema_version: 1, checkpoint_revision: 0, portable_evidence_refs: portableRefs, planner_lease_generation: 0, planner_lease: null, last_planner_takeover: null, created_at_ms: nowMs, updated_at_ms: nowMs };
+      const chain: WorkChainRecord = { schema_version: 1, work_chain_id: id, revision: 1, status: "active", creator_principal: principal, checkpoint_schema_version: 1, checkpoint_revision: 0, portable_evidence_refs: [], planner_lease_generation: 0, planner_lease: null, last_planner_takeover: null, created_at_ms: nowMs, updated_at_ms: nowMs };
       await tx.put(CHAIN_PREFIX + id, chain);
       result = { ok: true, chain };
     } else {
@@ -515,10 +598,10 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
         const repoId = normalizeRepoId(params.repo_id);
         const branchRef = normalizeBranchRef(params.branch_ref);
         if (!repoId || !validCommit(params.base_commit) || !branchRef) return error("invalid_lane_identity");
-        const fileScope = normalizeScope(params.file_scope);
-        const runtimeScope = normalizeScope(params.runtime_scope);
-        const validationRefs = normalizeRefs(params.validation_refs);
-        if (!fileScope || !runtimeScope || !validationRefs) return error("invalid_params");
+        const fileScope = normalizeFileScope(params.file_scope);
+        if (!fileScope) return error("invalid_params", { field: "file_scope" });
+        const runtimeScope = normalizeRuntimeScope(params.runtime_scope);
+        if (!runtimeScope) return error("invalid_params", { field: "runtime_scope" });
         const status = params.status === undefined ? "planned" : params.status;
         if (status !== "planned" && status !== "active") return error("invalid_lane_status");
         const reservationKey = await laneReservationStorageKey(repoId, branchRef);
@@ -531,7 +614,7 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
           await tx.delete(reservationKey);
         }
         const laneId = newOpaqueId("lane");
-        const lane: ExecutionLaneRecord = { schema_version: 1, lane_id: laneId, work_chain_id: id, lane_generation: 1, device_id: params.device_id, repo_id: repoId, base_commit: params.base_commit.toLowerCase(), branch_ref: branchRef, file_scope: fileScope, runtime_scope: runtimeScope, owner_principal: principal, agent_ref: boundedString(params.agent_ref, 1024) ? params.agent_ref : null, status, validation_summary: boundedString(params.validation_summary, 4096) ? params.validation_summary : null, validation_refs: validationRefs, created_at_ms: nowMs, updated_at_ms: nowMs };
+        const lane: ExecutionLaneRecord = { schema_version: 1, lane_id: laneId, work_chain_id: id, lane_generation: 1, device_id: params.device_id, repo_id: repoId, base_commit: params.base_commit.toLowerCase(), branch_ref: branchRef, file_scope: fileScope, runtime_scope: runtimeScope, owner_principal: principal, agent_ref: boundedString(params.agent_ref, 1024) ? params.agent_ref : null, status, validation_summary: boundedString(params.validation_summary, 4096) ? params.validation_summary : null, validation_refs: [], created_at_ms: nowMs, updated_at_ms: nowMs };
         await tx.put(LANE_PREFIX + laneId, lane);
         await tx.put(reservationKey, { schema_version: 1, lane_id: laneId, work_chain_id: id, repo_id: repoId, branch_ref: branchRef, created_at_ms: nowMs } satisfies LaneReservationRecord);
         const next: WorkChainRecord = { ...chain, revision: chain.revision + 1, updated_at_ms: nowMs };
@@ -559,11 +642,9 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
           if (!targetDevice) return error("device_not_found");
           if (targetDevice.authorization !== "active") return error("device_not_authorized", { authorization: targetDevice.authorization });
         }
-        const validationRefs = params.validation_refs === undefined ? lane.validation_refs : normalizeRefs(params.validation_refs);
-        if (!validationRefs) return error("invalid_params");
         const validationSummary = params.validation_summary === undefined ? lane.validation_summary : params.validation_summary === null ? null : boundedString(params.validation_summary, 4096) ? params.validation_summary : undefined;
         if (validationSummary === undefined) return error("invalid_params");
-        const nextLane: ExecutionLaneRecord = { ...lane, lane_generation: lane.lane_generation + 1, device_id: targetDeviceId, owner_principal: reassign ? principal : lane.owner_principal, status: nextStatus, validation_summary: validationSummary, validation_refs: validationRefs, updated_at_ms: nowMs };
+        const nextLane: ExecutionLaneRecord = { ...lane, lane_generation: lane.lane_generation + 1, device_id: targetDeviceId, owner_principal: reassign ? principal : lane.owner_principal, status: nextStatus, validation_summary: validationSummary, updated_at_ms: nowMs };
         await tx.put(LANE_PREFIX + lane.lane_id, nextLane);
         if (!terminalLane(lane.status) && terminalLane(nextLane.status)) {
           await tx.delete(await laneReservationStorageKey(lane.repo_id, lane.branch_ref));
@@ -579,6 +660,7 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
       schema_version: 1,
       operation: method,
       request_hash: hash,
+      principal_hash: principalHash,
       result: result as Record<string, unknown>,
       created_at_ms: nowMs,
       expires_at_ms: nowMs + FLEET_IDEMPOTENCY_TTL_MS,
