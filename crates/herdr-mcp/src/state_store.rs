@@ -1231,6 +1231,25 @@ impl StateStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("cannot begin work memory bind: {error}"))?;
+        let partition_owner = tx
+            .query_row(
+                "SELECT continuity_id FROM continuity_chains
+                 WHERE project_ref = ?1 AND repo_id = ?2 AND work_chain_id = ?3
+                   AND continuity_id <> ?4
+                 LIMIT 1",
+                params![
+                    input.project_ref,
+                    input.repo_id,
+                    input.work_chain_id,
+                    input.continuity_id
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect work memory partition owner: {error}"))?;
+        if partition_owner.is_some() {
+            return Err("work_memory_partition_already_bound".to_owned());
+        }
         tx.execute(
             "INSERT INTO continuity_chains (
                 continuity_id, title, project_id, status, created_at, updated_at,
@@ -1892,6 +1911,7 @@ impl StateStore {
                         snippet(continuity_memory_fts, 3, '', '', '…', 24)
                  FROM continuity_memory_fts
                  WHERE continuity_memory_fts MATCH ?1 AND continuity_id = ?2
+                 ORDER BY rank
                  LIMIT ?3",
             )
             .map_err(|error| format!("cannot prepare work memory search: {error}"))?;
@@ -4435,6 +4455,35 @@ mod tests {
                 bound_at: 101,
             })
             .unwrap();
+
+        let empty_resume = store
+            .work_memory_resume_by_partition(
+                "project:herdr-mcp",
+                "github.com/whshang/herdr-mcp",
+                "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                32,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty_resume.checkpoint_revision, 0);
+        assert!(empty_resume.checkpoint.is_none());
+        assert!(empty_resume.turns.is_empty());
+        assert!(empty_resume.evidence.is_empty());
+
+        let partition_conflict = store
+            .bind_work_memory(WorkMemoryBindingInput {
+                continuity_id: "wm:alpha-alias",
+                project_ref: "project:herdr-mcp",
+                repo_id: "github.com/whshang/herdr-mcp",
+                work_chain_id: "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                provider: "chatgpt",
+                account_ref: Some("account-a"),
+                space_ref: Some("project-space"),
+                session_ref: "alias-session",
+                bound_at: 102,
+            })
+            .unwrap_err();
+        assert_eq!(partition_conflict, "work_memory_partition_already_bound");
         let chatgpt_turn = store
             .append_work_memory_turn(WorkMemoryTurnInput {
                 continuity_id: "wm:alpha",
@@ -4617,18 +4666,32 @@ mod tests {
             })
             .unwrap();
 
+        let ranked_evidence = store
+            .append_work_memory_evidence(WorkMemoryEvidenceInput {
+                continuity_id: "wm:alpha",
+                kind: "result",
+                content: "alpha2 portable-evidence-keyword result result result result result result",
+                provider: None,
+                account_ref: None,
+                space_ref: None,
+                session_ref: None,
+                portable_source: None,
+                created_at: 202,
+            })
+            .unwrap();
+
         let hits = store
             .work_memory_search(
                 "project:herdr-mcp",
                 "github.com/whshang/herdr-mcp",
                 "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "portable-evidence-keyword",
+                "portable-evidence-keyword result",
                 10,
             )
             .unwrap();
-        assert_eq!(hits.len(), 1);
+        assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].source_kind, "evidence");
-        assert_eq!(hits[0].source_id, evidence.evidence_id);
+        assert_eq!(hits[0].source_id, ranked_evidence.evidence_id);
     }
 
     #[cfg(unix)]

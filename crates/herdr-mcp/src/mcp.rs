@@ -636,7 +636,7 @@ fn work_memory_call(
                 Ok(value) => value,
                 Err(error) => return error,
             };
-            let text = match work_memory_required_string(params, "text", 256 * 1024) {
+            let text = match work_memory_required_text(params, "text", 256 * 1024) {
                 Ok(value) => value,
                 Err(error) => return error,
             };
@@ -693,7 +693,7 @@ fn work_memory_call(
                 Ok(value) => value,
                 Err(error) => return error,
             };
-            let content = match work_memory_required_string(params, "content", 256 * 1024) {
+            let content = match work_memory_required_text(params, "content", 256 * 1024) {
                 Ok(value) => value,
                 Err(error) => return error,
             };
@@ -831,12 +831,12 @@ fn work_memory_call(
                     return json!({"ok": false, "code": "work_memory_expected_checkpoint_revision_invalid"});
                 }
             };
-            let summary = match work_memory_required_string(params, "summary", 8 * 1024) {
+            let summary = match work_memory_required_text(params, "summary", 8 * 1024) {
                 Ok(value) => value,
                 Err(error) => return error,
             };
             let checkpoint_json =
-                match work_memory_required_string(params, "checkpoint_json", 64 * 1024) {
+                match work_memory_required_text(params, "checkpoint_json", 64 * 1024) {
                     Ok(value) => value,
                     Err(error) => return error,
                 };
@@ -1054,6 +1054,25 @@ fn work_memory_required_string<'a>(
         || value.len() > max_bytes
         || value != value.trim()
         || value.chars().any(char::is_control)
+    {
+        return Err(json!({"ok": false, "code": format!("work_memory_{key}_invalid")}));
+    }
+    Ok(value)
+}
+
+fn work_memory_required_text<'a>(
+    params: &'a Value,
+    key: &str,
+    max_bytes: usize,
+) -> Result<&'a str, Value> {
+    let Some(value) = params.get(key).and_then(Value::as_str) else {
+        return Err(json!({"ok": false, "code": format!("work_memory_{key}_required")}));
+    };
+    if value.len() > max_bytes
+        || value.trim().is_empty()
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
     {
         return Err(json!({"ok": false, "code": format!("work_memory_{key}_invalid")}));
     }
@@ -1582,7 +1601,7 @@ mod tests {
                     "session_ref": "same-session",
                     "provider_message_ref": "same-message",
                     "role": if provider == "chatgpt" { "user" } else { "assistant" },
-                    "text": format!("{provider} work memory turn"),
+                    "text": format!("{provider} work memory turn\n\n```text\nline\t2\n```"),
                     "observed_at": if provider == "chatgpt" { 110 } else { 111 },
                 }),
             );
@@ -1598,7 +1617,7 @@ mod tests {
             &json!({
                 "continuity_id": "wm:mcp",
                 "kind": "result",
-                "content": "provider-neutral durable result",
+                "content": "provider-neutral durable result\n\n```text\nexit\t0\n```",
                 "provider": "gemini",
                 "account_ref": "account-b",
                 "space_ref": "project-space",
@@ -1626,8 +1645,8 @@ mod tests {
             &json!({
                 "continuity_id": "wm:mcp",
                 "expected_checkpoint_revision": 0,
-                "summary": "MCP checkpoint",
-                "checkpoint_json": "{\"goal\":\"alpha2\"}",
+                "summary": "MCP checkpoint\nready for handoff",
+                "checkpoint_json": "{\n\t\"goal\": \"alpha2\"\n}",
                 "through_message_id": message_ids[1],
                 "through_evidence_id": evidence["evidence_id"],
                 "created_at": 120,

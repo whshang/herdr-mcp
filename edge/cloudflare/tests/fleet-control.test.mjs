@@ -320,6 +320,25 @@ test("alpha.2 compact checkpoint is planner-fenced, strictly portable, and recon
   ));
 });
 
+test("alpha.2 compact checkpoint rejects updates after the planner lease expires", async () => {
+  const { registry } = makeRegistry();
+  const created = await createChain(registry, "checkpoint-expired-chain");
+  const lease = await acquire(registry, created.chain, "checkpoint-expired-lease", PRINCIPAL_A, 1000);
+  const checkpointJson = JSON.stringify({ goal: "alpha2", state: "expired" });
+  const rejected = await call(registry, "herdr_mcp.work_chain.checkpoint.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: lease.chain.revision,
+    expected_lease_generation: lease.planner_lease.generation,
+    expected_checkpoint_revision: 0,
+    idempotency_key: "checkpoint-expired-update",
+    summary: "Must not commit after lease expiry",
+    checkpoint_json: checkpointJson,
+    checkpoint_sha256: createHash("sha256").update(checkpointJson).digest("hex"),
+    portable_evidence_refs: [],
+  }, PRINCIPAL_A, 32001);
+  assert.equal(rejected.code, "planner_lease_missing_or_expired");
+});
+
 test("expired lease is reclaimable with monotonically increasing generation", async () => {
   const { registry } = makeRegistry();
   const created = await createChain(registry, "expired-chain");
