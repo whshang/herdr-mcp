@@ -66,13 +66,7 @@ herdr-mcp worker rename "<new-device-name>"
 herdr-mcp worker revoke "<device-id>" --confirm
 ```
 
-デバイス/オペレーターが fleet 管理を担当します。この操作は display name を受け付けず、不変の `device_id` を使用する必要があります。Edge-local 操作は次と同等です:
-
-```text
-herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
-```
-
-この経路はワークステーションのオンライン状態を必要とせず、display name は受け付けません。
+デバイス/オペレーターが fleet 管理を担当します。この操作は display name を受け付けず、不変の `device_id` を使用する必要があります。承認済み WebChat Connector は通常の MCP 権限のみで、デバイスを revoke できません。
 
 revoke はそのデバイス identity と資格情報に対して恒久的です。稼働中の Link は切断され、古い資格情報では再接続できません。古い identity の復活を防ぐため内部には最小の revoked tombstone を保持しますが、通常のデバイス一覧には表示しません。後で同じコンピュータを再追加する場合は、新しい pairing で新しいデバイス identity として登録してください。
 

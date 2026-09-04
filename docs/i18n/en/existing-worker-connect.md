@@ -90,13 +90,7 @@ To permanently remove authorization from another enrolled device, run this on an
 herdr-mcp worker revoke "<device-id>" --confirm
 ```
 
-The device/operator owns fleet administration. This action never accepts a display name; you must use the immutable `device_id`. The Edge-local equivalent is:
-
-```text
-herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
-```
-
-This action does not route through a workstation and never accepts a display name.
+The device/operator owns fleet administration. This action never accepts a display name; you must use the immutable `device_id`. An approved WebChat Connector is ordinary MCP only and cannot revoke devices.
 
 Revocation is permanent for that device identity and credential: the live Link is disconnected, the old credential can never reconnect, and the revoked tombstone is retained internally to prevent resurrection. Revoked tombstones are hidden from normal fleet/device lists. To add that computer again later, create a new pairing and enroll it as a new device identity.
 

@@ -130,11 +130,12 @@ herdr_call(
 
 ## Connector 与 Automation 凭据
 
-交互式 Connector 作为 Worker fleet principal 进行批准和撤销：
+交互式 Connector 通过已登记 Device/operator 控制通道批准和撤销。批准只授予普通 MCP 访问，不会把 Connector 变成 fleet principal：
 
 ```bash
 herdr-mcp connector approve <approval-request-id>
-herdr-mcp connector revoke <client-id> --confirm
+herdr-mcp connector list
+herdr-mcp connector revoke <connector-id> --confirm
 ```
 
 批准命令会交互式读取 6 位授权码，不要把授权码放进 argv 或 shell history。所有已登记 Device 都是平等的 Worker 管理通道，不存在 owner/member 设备层级。
@@ -142,13 +143,13 @@ herdr-mcp connector revoke <client-id> --confirm
 GitLab CI 等无人值守调用方使用可独立 revoke 的 Automation Client：
 
 ```bash
-herdr-mcp automation create --name "gitlab:group/project:prod"
+herdr-mcp automation create --name "gitlab:group/project:prod" --device <device-id-or-unique-name>
 herdr-mcp automation list
 herdr-mcp automation rotate <svc_client_id> --confirm
 herdr-mcp automation revoke <svc_client_id> --confirm
 ```
 
-`create` 和 `rotate` 只显示一次 `client_secret`，应直接存进 CI secret manager；`list` 永远不返回 secret，只返回有限的签发统计。Automation Client 用 OAuth `client_credentials` 通过 `client_id + client_secret` 换短期 access token，只拥有普通 MCP 权限，不拥有 fleet-admin 权限。
+`create` 必须显式指定目标设备并保存 Worker 解析后的不可变 `device_id`，不会在 fleet 中静默替用户选机器。`create` 和 `rotate` 只显示一次 `client_secret`，应直接存进 CI secret manager；`list` 永远不返回 secret，只返回绑定设备和有限的签发统计。Automation Client 用 OAuth `client_credentials` 通过 `client_id + client_secret` 换短期 access token，只拥有绑定设备上的普通 MCP 权限，不拥有 fleet-admin 权限。
 
 本机静态 bearer、公网 OAuth Connector 与 Automation Client 是三套边界。`HERDR_MCP_TOKEN` 只服务本机 TCP runtime，不要复制进 ChatGPT 或 GitLab CI。
 

@@ -77,7 +77,7 @@ Edge origin 应当稳定。本地 runtime 可以升级、A/B 切代甚至回滚�
 
 ## OAuth 链路
 
-ChatGPT 会探索远程服务器的 OAuth / protected-resource metadata。Dynamic Client Registration（DCR）只负责登记 client metadata，**不等于授权**。从 v0.4.6 开始，新 Connector 在 Worker 记录明确批准之前不能取得可用 token：
+ChatGPT 会探索远程服务器的 OAuth / protected-resource metadata。Dynamic Client Registration（DCR）只负责登记 client metadata，**不等于授权**。从 v0.4.6 开始，新 Connector 必须由已登记 Device/operator 控制通道明确批准后才能取得可用 token：
 
 ```text
 Connector
@@ -86,15 +86,13 @@ Connector
   ▼
 Herdr pending approval 页面
   │ request id + 短期 6 位批准码
-  ├─ 任意已登记电脑：
-  │    herdr-mcp connector approve <request-id>
-  └─ 另一个被 Worker 明确批准的 Herdr WebChat
-       herdr_call → herdr_mcp.connector.approve
+  └─ 任意已登记电脑：
+       herdr-mcp connector approve <request-id>
   ▼
 authorization code → token → /mcp
 ```
 
-同一个 Worker 内的已登记设备在这条控制面上没有 owner/member 高下之分；Worker/operator 凭据同样是管理凭据。v0.4.6 之前、在没有明确批准步骤时签发的 OAuth token 可以继续做普通 MCP 兼容访问，但不会因此自动获得 fleet 管理权限；需要批准 Connector、创建 pairing、查看 fleet 或 revoke 设备时，应先按 v0.4.6 流程重新授权。Worker 也可以撤销 Connector grant，包括还没有 grant 记录的旧版 client。
+同一个 Worker 内的已登记设备在这条控制面上没有 owner/member 高下之分；Device/operator 负责 fleet 管理。已批准 Connector 只获得普通 MCP 访问，不能批准/撤销其它 Connector，也不能创建 pairing 或 revoke Device。v0.4.6 之前、在没有明确批准步骤时签发的 OAuth token 可以继续做普通 MCP 兼容访问，直到 operator 显式撤销其 client grant。v0.4.6 的当前 Connector 实例用 `herdr-mcp connector list` 取得不可变 `connector_id`，再用 `herdr-mcp connector revoke <connector-id> --confirm` 单独撤销；更早、还没有 Connector-instance 记录的 legacy client 仍可通过兼容 grant tombstone 被彻底封禁。
 
 批准码是单用途、短时、限制错误次数的交互凭据，不接受普通 CLI argv 传入。若目的是取消 Herdr 授权，仅在 Web AI 的 UI 中 Disconnect 并不能替代 Worker 端 revoke。
 

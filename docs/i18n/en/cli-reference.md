@@ -129,11 +129,12 @@ When `pr_number` is present, the result includes the PR state, merge state, Auto
 
 ## Connector and Automation credentials
 
-Interactive Connectors are approved/revoked as Worker fleet principals:
+Interactive Connectors are approved/revoked from an enrolled-device/operator control channel. Approval grants ordinary MCP access; it does not make the Connector a fleet principal:
 
 ```bash
 herdr-mcp connector approve <approval-request-id>
-herdr-mcp connector revoke <client-id> --confirm
+herdr-mcp connector list
+herdr-mcp connector revoke <connector-id> --confirm
 ```
 
 The approval command reads the six-digit code interactively; do not put that code on argv or in shell history. Any enrolled device is an equivalent Worker administration channel; there is no owner/member device hierarchy.
@@ -141,13 +142,13 @@ The approval command reads the six-digit code interactively; do not put that cod
 Unattended callers such as GitLab CI use independently revocable Automation Clients:
 
 ```bash
-herdr-mcp automation create --name "gitlab:group/project:prod"
+herdr-mcp automation create --name "gitlab:group/project:prod" --device <device-id-or-unique-name>
 herdr-mcp automation list
 herdr-mcp automation rotate <svc_client_id> --confirm
 herdr-mcp automation revoke <svc_client_id> --confirm
 ```
 
-`create` and `rotate` display `client_secret` once. Store it directly in the CI secret manager. `list` never returns secrets and includes bounded issuance metadata. Automation Clients exchange `client_id` + `client_secret` for a short-lived access token with OAuth `client_credentials`; they have ordinary MCP authority, never fleet-admin authority.
+`create` requires an explicit target device and stores the resolved immutable `device_id`; it never silently chooses among the fleet. `create` and `rotate` display `client_secret` once. Store it directly in the CI secret manager. `list` never returns secrets and includes the bound device plus bounded issuance metadata. Automation Clients exchange `client_id` + `client_secret` for a short-lived access token with OAuth `client_credentials`; they have ordinary MCP authority only on the bound device, never fleet-admin authority.
 
 Local static bearer credentials, public OAuth Connectors, and Automation Clients are separate boundaries. `HERDR_MCP_TOKEN` is only the local TCP runtime bearer and does not belong in ChatGPT or GitLab CI.
 

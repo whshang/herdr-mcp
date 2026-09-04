@@ -48,25 +48,11 @@ Verify control operations with the cheapest relevant live observation; request s
 
 Discover registered devices and their status with `herdr_devices`.
 
-Fleet administration belongs to the Worker, not to a privileged device. Devices enrolled in the same Worker have no owner/member hierarchy. An explicitly approved Connector/WebChat is also a fleet administration channel; a pre-v0.4.6 OAuth token that never went through explicit approval remains ordinary MCP compatibility only.
+Fleet administration belongs to enrolled devices and Worker operator credentials. Devices enrolled in the same Worker have no owner/member hierarchy. An explicitly approved Connector/WebChat is an ordinary MCP principal, not a fleet-administration channel; approval never grants permission to pair/revoke devices or administer other principals. A pre-v0.4.6 OAuth token that never went through explicit approval remains ordinary MCP compatibility only until an operator explicitly revokes its client grant.
 
-If the current WebChat has explicit fleet authority, create a short-lived pairing session directly at Edge using `herdr_call`:
+When the user asks to add, pair, configure, or generate a setup link for a new computer, create the short-lived pairing from any already-enrolled computer with `herdr-mcp worker pair`. Never run `worker pair` on the fresh computer to discover whether a fleet exists. If this is the first Worker and no enrolled device exists, complete first-Worker Cloudflare bootstrap instead of attempting pairing. Use the default 600-second TTL unless the user requests a shorter value. Present the pairing address, the one-time 6-digit verification code, and the exact `expires_at` time together. Also give the copyable `herdr-mcp worker connect "<pairing-address>"` command. Treat the code as short-lived enrollment data; never persist it to Git, shell history, ordinary logs, or unattended automation, and enter it only at the new computer's no-echo prompt.
 
-```text
-herdr_call(method="herdr_mcp.device.pair", params='{"ttl_seconds":600,"name":"<optional-name>"}')
-```
-
-`herdr_mcp.device.pair` is Edge-local: it does not accept a `device` selector or pane/workspace refs and it does not route the operation through a workstation. The returned pairing session provides the verification code and connection address for `herdr-mcp worker connect`. Edge-local does **not** mean unauthenticated: the current principal must already be authorized by this Worker.
-
-When the user asks to add, pair, configure, or generate a setup link for a new computer, prefer this Edge-local method when the WebChat is explicitly approved. If it returns `fleet_admin_required`, use `herdr-mcp worker pair` on any already-enrolled computer. Never run `worker pair` on the fresh computer to discover whether a fleet exists. If this is the first Worker and no enrolled/approved principal exists, complete first-Worker Cloudflare bootstrap instead of attempting pairing. Use the default 600-second TTL unless the user requests a shorter value. Present the pairing address, the one-time 6-digit verification code, and the exact `expires_at` time together. Also give the copyable `herdr-mcp worker connect "<pairing-address>"` command. Treat the code as short-lived enrollment data; never persist it to Git, shell history, ordinary logs, or unattended automation, and enter it only at the new computer's no-echo prompt.
-
-To permanently revoke an enrolled computer from an explicitly approved WebChat, first call `herdr_devices`, select the exact immutable `device_id`, then call:
-
-```text
-herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
-```
-
-`herdr_mcp.device.revoke` is Edge-local and does not route through a workstation. It accepts only the immutable device identity plus explicit `confirm=true`; never substitute a display name or pane/workspace ref. Revocation permanently fences that credential and identity. To add the computer again later, create a new pairing and enroll a new device identity. If the WebChat lacks fleet authority, `herdr-mcp worker revoke <device-id> --confirm` from any enrolled computer is the fallback.
+To permanently revoke an enrolled computer, first use `herdr_devices` to identify the exact immutable `device_id`, then run `herdr-mcp worker revoke <device-id> --confirm` on any already-enrolled computer. Never substitute a display name or pane/workspace ref. Revocation permanently fences that credential and identity; re-enrollment requires a new pairing and new device identity.
 
 ## Conversation continuity recovery
 

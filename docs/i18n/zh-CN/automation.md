@@ -109,13 +109,13 @@ Runtime implementation 可以频繁变化，但 ChatGPT 看到的 public MCP cat
 应该在任意一台已登记设备上创建独立的 **Automation Client**：
 
 ```bash
-herdr-mcp automation create --name "gitlab:group/project:prod"
+herdr-mcp automation create --name "gitlab:group/project:prod" --device <device-id-or-unique-name>
 herdr-mcp automation list
 herdr-mcp automation rotate <svc_client_id> --confirm
 herdr-mcp automation revoke <svc_client_id> --confirm
 ```
 
-每个真正独立的信任边界使用一个 client，通常至少按 GitLab project + environment 拆分。`create` 只显示一次长期 `client_secret`；`rotate` 只显示一次替换后的新 secret；Worker 只保存 verifier。把以下值存入 GitLab masked/protected variables：
+每个真正独立的信任边界使用一个 client，通常至少按 GitLab project + environment 拆分。每个 Automation Client 必须绑定到一台已登记设备；`--device` 可以传不可变 `device_id` 或唯一设备名，Worker 会保存解析后的不可变 id。`create` 只显示一次长期 `client_secret`；`rotate` 只显示一次替换后的新 secret；Worker 只保存 verifier。把以下值存入 GitLab masked/protected variables：
 
 ```text
 HERDR_MCP_URL
@@ -125,9 +125,9 @@ HERDR_MCP_CLIENT_SECRET
 
 每个 job 开始时，用 `client_credentials` 在 Worker 的 `/oauth/token` 换取短期 MCP access token。access token 最长一小时，不发 refresh token。Worker 只在换 token 时更新 `last_token_issued_at_ms` 和 `token_issue_count`，不会为了监控而给每次 MCP 请求增加 Durable Object 写放大。
 
-Automation Client 只有普通 MCP 权限，没有 fleet-admin 权限，不能 pair/revoke Device、approve/revoke Connector，也不能继续创建 Automation Client。revoke 以不可变 `client_id` 为对象，同时阻止后续换 token，并在 Worker 鉴权时立即使已经签出的 access token 失效。
+Automation Client 只有普通 MCP 权限，并且只作用于绑定设备。调用省略 `device` 时 Worker 自动路由到绑定设备；显式选择或引用其它设备会 fail closed。它没有 fleet-admin 权限，不能 pair/revoke Device、approve/revoke Connector、继续创建 Automation Client，也不能发现其它设备。revoke 以不可变 `client_id` 为对象，同时阻止后续换 token，并在 Worker 鉴权时立即使已经签出的 access token 失效。
 
-已经明确授权的 WebChat 可以通过 Edge-local private method 查看 Automation Client 清单并执行 revoke；清单永远不返回长期 secret。默认不要把 `client_secret` 放进聊天记录，创建和 rotate 应在已登记设备的 CLI 上完成，再直接写入 CI secret manager。
+Automation 的 list/rotate/revoke 都属于已登记 Device/operator 控制面；已批准 WebChat Connector 不获得这些管理方法。清单永远不返回长期 secret。默认不要把 `client_secret` 放进聊天记录，创建和 rotate 应在已登记设备的 CLI 上完成，再直接写入 CI secret manager。
 
 ## 3. Cloudflare Edge：稳定公网入口
 
