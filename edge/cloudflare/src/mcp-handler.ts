@@ -10,6 +10,7 @@ import { newRequestId } from "./pending.js";
 import type { DeviceRouteResult } from "./device-directory.js";
 import { normalizeDeviceId } from "./device-model.js";
 import type { InternalForwardRequest } from "./workstation-do.js";
+import { discoverFleetControlMethods, invalidFleetControlParam, isFleetControlMethod, type FleetControlMethod } from "./fleet-control.js";
 import {
   isChatgptOAuthClientId,
   isOpenAiMcpUserAgent,
@@ -44,6 +45,7 @@ export interface McpResponse {
 export interface McpClientContext {
   userAgent?: string | null;
   oauthClientId?: string | null;
+  authSource?: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge" | null;
 }
 
 export interface McpDeps {
@@ -67,6 +69,7 @@ export interface McpDeps {
     | { ok: true }
     | { ok: false; code: string }
   >;
+  fleetControl?(method: FleetControlMethod, params: Record<string, unknown>): Promise<Record<string, unknown>>;
   resolveDevice?(selector: string | undefined, args?: Record<string, unknown>): Promise<DeviceRouteResult>;
   logger: { warn(event: string, fields?: Record<string, unknown>): void };
   now?: () => number;
@@ -325,7 +328,52 @@ export async function handleMcp(
       }
     }
 
+    if (name === "herdr_methods" && typeof args.query === "string" && /work_chain|planner_lease|execution_lane|fleet/i.test(args.query)) {
+      const methods = discoverFleetControlMethods(args.query);
+      return rpcResult(id, callToolResult({ ok: true, count: methods.length, methods, source: "edge_fleet_control_v1" }));
+    }
+
     const localMethod = name === "herdr_call" && typeof args.method === "string" ? args.method : null;
+
+    if (localMethod && isFleetControlMethod(localMethod)) {
+      if (args.device !== undefined) {
+        return rpcResult(id, callToolResult({ ok: false, code: "device_selector_not_allowed", retryable: false, delivery_state: "not_delivered" }, true));
+      }
+      for (const key of Object.keys(args)) {
+        if (key !== "method" && key !== "params") {
+          return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", retryable: false, message: `unknown top-level argument '${key}'` }, true));
+        }
+      }
+      let methodParams: Record<string, unknown> = {};
+      if (typeof args.params === "string") {
+        const raw = args.params.trim();
+        if (raw) {
+          try {
+            const parsed = JSON.parse(raw);
+            if (!isRecord(parsed)) throw new Error("not object");
+            methodParams = parsed;
+          } catch {
+            return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", retryable: false, message: "params must be a JSON object" }, true));
+          }
+        }
+      } else if (args.params !== undefined && args.params !== null) {
+        if (!isRecord(args.params)) return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", retryable: false }, true));
+        methodParams = args.params;
+      }
+      const invalidParam = invalidFleetControlParam(localMethod, methodParams);
+      if (invalidParam) {
+        return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", retryable: false, field: invalidParam }, true));
+      }
+      if (!deps.fleetControl) {
+        return rpcResult(id, callToolResult({ ok: false, code: "fleet_control_unsupported", retryable: false, delivery_state: "not_delivered" }, true));
+      }
+      try {
+        const result = await deps.fleetControl(localMethod, methodParams);
+        return rpcResult(id, callToolResult(result, result.ok === false));
+      } catch {
+        return rpcResult(id, callToolResult({ ok: false, code: "fleet_control_unavailable", retryable: true, delivery_state: "not_delivered" }, true));
+      }
+    }
 
     // Edge-local pairing creation: allows an OAuth-authorized owner to initiate
     // a device pairing session directly at Edge without requiring an enrolled

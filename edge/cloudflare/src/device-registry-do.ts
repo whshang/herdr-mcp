@@ -17,6 +17,7 @@ import {
   validateDeviceRecord,
   type DeviceRecord,
 } from "./device-model.js";
+import { executeFleetControl, isFleetControlMethod, type FleetControllerAuthority } from "./fleet-control.js";
 
 const DEVICE_PREFIX = "device:";
 const WORKSTATION_PREFIX = "workstation:";
@@ -142,6 +143,9 @@ export class DeviceRegistryDO {
     }
     if (request.method === "POST" && url.pathname === "/internal/devices/legacy/ensure") {
       return this.ensureLegacyDevice(request);
+    }
+    if (request.method === "POST" && url.pathname === "/internal/devices/fleet-control") {
+      return this.fleetControl(request);
     }
 
     const match = /^\/internal\/devices\/([^/]+)$/.exec(url.pathname);
@@ -485,6 +489,44 @@ export class DeviceRegistryDO {
     });
 
     return result.ok ? json(result) : json(result, 409);
+  }
+
+  private async fleetControl(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, code: "bad_request", retryable: false }, 400);
+    }
+    if (!isRecord(body)) return json({ ok: false, code: "bad_request", retryable: false }, 400);
+    for (const key of Object.keys(body)) {
+      if (key !== "method" && key !== "params" && key !== "authority" && key !== "now_ms") {
+        return json({ ok: false, code: "bad_request", retryable: false }, 400);
+      }
+    }
+    const method = typeof body.method === "string" ? body.method : "";
+    const params = isRecord(body.params) ? body.params : null;
+    const rawAuthority = isRecord(body.authority) ? body.authority : null;
+    if (rawAuthority) {
+      for (const key of Object.keys(rawAuthority)) {
+        if (key !== "principal" && key !== "can_force_takeover") {
+          return json({ ok: false, code: "bad_request", retryable: false }, 400);
+        }
+      }
+    }
+    const authority: FleetControllerAuthority | null = rawAuthority
+      && typeof rawAuthority.principal === "string"
+      && typeof rawAuthority.can_force_takeover === "boolean"
+      ? { principal: rawAuthority.principal, can_force_takeover: rawAuthority.can_force_takeover }
+      : null;
+    if (!isFleetControlMethod(method) || !authority || !params) {
+      return json({ ok: false, code: "bad_request", retryable: false }, 400);
+    }
+    const nowMs = typeof body.now_ms === "number" && Number.isSafeInteger(body.now_ms) && body.now_ms >= 0
+      ? body.now_ms
+      : Date.now();
+    const result = await executeFleetControl(this.state.storage, method, params, authority, nowMs);
+    return json(result, result.ok ? 200 : 409);
   }
 }
 
