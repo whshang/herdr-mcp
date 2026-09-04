@@ -114,16 +114,21 @@ fn validate_with_registry(
 
     if schema.empty {
         if !given.is_empty() {
-            warnings.push(ValidationIssue {
+            let issue = ValidationIssue {
                 name: "params".to_owned(),
                 message: format!(
                     "method takes no params; got: {}",
                     given.keys().cloned().collect::<Vec<_>>().join(", ")
                 ),
-            });
+            };
+            if method_is_read_only(method) {
+                warnings.push(issue);
+            } else {
+                errors.push(issue);
+            }
         }
         return ValidationResult {
-            ok: true,
+            ok: errors.is_empty(),
             errors,
             warnings,
         };
@@ -140,10 +145,15 @@ fn validate_with_registry(
 
     for (name, value) in given {
         let Some(property) = schema.properties.get(name) else {
-            errors.push(ValidationIssue {
+            let issue = ValidationIssue {
                 name: name.clone(),
                 message: format!("unknown param \"{name}\" (not in schema)"),
-            });
+            };
+            if method_is_read_only(method) {
+                warnings.push(issue);
+            } else {
+                errors.push(issue);
+            }
             continue;
         };
         let Some(primitive) = primitive_type(property, &registry.defs) else {
@@ -184,6 +194,44 @@ fn validate_with_registry(
         errors,
         warnings,
     }
+}
+
+// Unknown parameters can redirect a side effect when an optional target is
+// misspelled. Methods represented by the live schema therefore fail closed by
+// default; only explicit observation methods keep warning-only compatibility.
+fn method_is_read_only(method: &str) -> bool {
+    matches!(
+        method,
+        "ping"
+            | "server.agent_manifests"
+            | "session.snapshot"
+            | "workspace.list"
+            | "workspace.get"
+            | "worktree.list"
+            | "tab.list"
+            | "tab.get"
+            | "agent.list"
+            | "agent.get"
+            | "agent.read"
+            | "agent.explain"
+            | "agent.wait"
+            | "pane.layout"
+            | "pane.process_info"
+            | "layout.export"
+            | "pane.neighbor"
+            | "pane.edges"
+            | "pane.list"
+            | "pane.current"
+            | "pane.get"
+            | "pane.read"
+            | "pane.graphics.info"
+            | "events.subscribe"
+            | "events.wait"
+            | "pane.wait_for_output"
+            | "plugin.list"
+            | "plugin.action.list"
+            | "plugin.log.list"
+    )
 }
 
 #[derive(Debug)]
@@ -485,6 +533,12 @@ mod tests {
                                 "method": {"const": "agent.start"},
                                 "params": {"$ref": "#/schemas/request/$defs/AgentStartParams"}
                             }
+                        },
+                        {
+                            "properties": {
+                                "method": {"const": "workspace.get"},
+                                "params": {"$ref": "#/schemas/request/$defs/WorkspaceGetParams"}
+                            }
                         }
                     ],
                     "$defs": {
@@ -495,6 +549,13 @@ mod tests {
                                 "workspace_id": {"type": "string"},
                                 "count": {"type": "integer"},
                                 "kind": {"enum": ["pi", "grok"]}
+                            },
+                            "required": ["workspace_id"]
+                        },
+                        "WorkspaceGetParams": {
+                            "type": "object",
+                            "properties": {
+                                "workspace_id": {"type": "string"}
                             },
                             "required": ["workspace_id"]
                         }
@@ -508,7 +569,7 @@ mod tests {
     #[test]
     fn parses_method_param_schema() {
         let registry = registry();
-        assert_eq!(registry.methods.len(), 2);
+        assert_eq!(registry.methods.len(), 3);
         assert!(registry.methods[0].empty);
         assert_eq!(registry.methods[1].required, vec!["workspace_id"]);
         assert!(registry.methods[1].properties.contains_key("kind"));
@@ -525,6 +586,19 @@ mod tests {
         assert!(!valid.ok);
         assert_eq!(valid.errors.len(), 1);
         assert!(valid.warnings.is_empty());
+
+        let readonly = validate_with_registry(
+            &registry,
+            "workspace.get",
+            &json!({"workspace_id": "w1", "future": true}),
+        );
+        assert!(readonly.ok);
+        assert!(readonly.errors.is_empty());
+        assert_eq!(readonly.warnings.len(), 1);
+
+        let read_only_empty = validate_with_registry(&registry, "ping", &json!({"future": true}));
+        assert!(read_only_empty.ok);
+        assert_eq!(read_only_empty.warnings.len(), 1);
 
         let invalid = validate_with_registry(
             &registry,

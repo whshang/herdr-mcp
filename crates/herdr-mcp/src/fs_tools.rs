@@ -21,7 +21,10 @@ const LIST_DEFAULT_ENTRIES: usize = 200;
 const LIST_MAX_ENTRIES: usize = 2000;
 const GREP_DEFAULT_MATCHES: usize = 50;
 const GREP_MAX_MATCHES: usize = 1000;
-const GREP_DEFAULT_FILE_BYTES: u64 = 64 * 1024;
+// Keep the default bounded, but large enough for ordinary implementation files.
+// A 64 KiB ceiling discarded valid rg hits in normal source files and could
+// turn a real match into a successful-looking empty result.
+const GREP_DEFAULT_FILE_BYTES: u64 = 256 * 1024;
 const GREP_MAX_FILE_BYTES: u64 = 1024 * 1024;
 const GREP_COMPACT_AFTER: usize = 24;
 const GREP_RG_TIMEOUT: Duration = Duration::from_secs(5);
