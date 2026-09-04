@@ -82,6 +82,16 @@ fn pairing_consume_request_body(pairing_id: &str, code: &str, name: Option<&str>
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn automation_create_request_body(name: &str, device: &str) -> Value {
+    json!({ "name": name, "device": device })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn connector_revoke_request_body(connector_id: &str) -> Value {
+    json!({ "connector_id": connector_id })
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn format_pairing_expiry(expires_at_ms: u64) -> Option<String> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires_at_ms) * 1_000_000)
         .ok()
@@ -107,8 +117,11 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         WorkerCommand::Rename { name } => rename_current_device(&paths, &name),
         WorkerCommand::Revoke { device_id } => revoke_device(&paths, &device_id),
         WorkerCommand::ConnectorApprove { request_id } => approve_connector(&paths, &request_id),
-        WorkerCommand::ConnectorRevoke { client_id } => revoke_connector(&paths, &client_id),
-        WorkerCommand::AutomationCreate { name } => create_automation(&paths, &name),
+        WorkerCommand::ConnectorList => list_connectors(&paths),
+        WorkerCommand::ConnectorRevoke { connector_id } => revoke_connector(&paths, &connector_id),
+        WorkerCommand::AutomationCreate { name, device } => {
+            create_automation(&paths, &name, &device)
+        }
         WorkerCommand::AutomationList => list_automations(&paths),
         WorkerCommand::AutomationRotate { client_id } => rotate_automation(&paths, &client_id),
         WorkerCommand::AutomationRevoke { client_id } => revoke_automation(&paths, &client_id),
@@ -416,7 +429,7 @@ fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode,
 }
 
 #[cfg(not(target_os = "macos"))]
-fn revoke_connector(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode, String> {
+fn revoke_connector(_paths: &RuntimePaths, _connector_id: &str) -> Result<ExitCode, String> {
     Err(
         "connector revoke currently requires the macOS enrolled-device credential backend"
             .to_owned(),
@@ -424,10 +437,10 @@ fn revoke_connector(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode,
 }
 
 #[cfg(target_os = "macos")]
-fn revoke_connector(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, String> {
-    let client_id = client_id.trim();
-    if client_id.is_empty() || client_id.len() > 4096 {
-        return Err("connector client id is invalid".to_owned());
+fn revoke_connector(paths: &RuntimePaths, connector_id: &str) -> Result<ExitCode, String> {
+    let connector_id = connector_id.trim();
+    if !connector_id.starts_with("conn_") || connector_id.len() > 4096 {
+        return Err("connector id must be a valid conn_ identifier".to_owned());
     }
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_fleet_link_identity(paths, &config)?;
@@ -440,7 +453,7 @@ fn revoke_connector(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, S
     let response = client()?
         .post(endpoint(&identity.edge_origin, "/connectors/revoke")?)
         .headers(headers)
-        .json(&json!({ "client_id": client_id }))
+        .json(&connector_revoke_request_body(connector_id))
         .send()
         .map_err(|error| format!("cannot revoke Connector: {error}"))?;
     let payload = parse_json_response(response, "connector revoke")?;
@@ -449,7 +462,7 @@ fn revoke_connector(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, S
         serde_json::to_string_pretty(&json!({
             "ok": true,
             "action": "connector_revoke",
-            "client_id": payload.get("client_id").cloned().unwrap_or(Value::String(client_id.to_owned())),
+            "connector_id": payload.get("connector_id").cloned().unwrap_or(Value::String(connector_id.to_owned())),
         }))
         .map_err(|error| format!("cannot encode connector revoke result: {error}"))?
     );
@@ -457,12 +470,48 @@ fn revoke_connector(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, S
 }
 
 #[cfg(not(target_os = "macos"))]
-fn create_automation(_paths: &RuntimePaths, _name: &str) -> Result<ExitCode, String> {
+fn list_connectors(_paths: &RuntimePaths) -> Result<ExitCode, String> {
+    Err(
+        "connector inventory currently requires the macOS enrolled-device credential backend"
+            .to_owned(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn list_connectors(paths: &RuntimePaths) -> Result<ExitCode, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client()?
+        .get(endpoint(&identity.edge_origin, "/connectors")?)
+        .headers(headers)
+        .send()
+        .map_err(|error| format!("cannot list Connectors: {error}"))?;
+    let payload = parse_json_response(response, "connector inventory")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("cannot encode connector inventory: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn create_automation(
+    _paths: &RuntimePaths,
+    _name: &str,
+    _device: &str,
+) -> Result<ExitCode, String> {
     Err("automation credential provisioning currently requires the macOS enrolled-device credential backend".to_owned())
 }
 
 #[cfg(target_os = "macos")]
-fn create_automation(paths: &RuntimePaths, name: &str) -> Result<ExitCode, String> {
+fn create_automation(paths: &RuntimePaths, name: &str, device: &str) -> Result<ExitCode, String> {
     let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
     let identity = resolve_fleet_link_identity(paths, &config)?;
     let mut headers = bearer_headers(&identity.credential)?;
@@ -474,7 +523,7 @@ fn create_automation(paths: &RuntimePaths, name: &str) -> Result<ExitCode, Strin
     let response = client()?
         .post(endpoint(&identity.edge_origin, "/automations")?)
         .headers(headers)
-        .json(&json!({ "name": name }))
+        .json(&automation_create_request_body(name, device))
         .send()
         .map_err(|error| format!("cannot create automation credential: {error}"))?;
     let payload = parse_json_response(response, "automation credential creation")?;
@@ -488,6 +537,8 @@ fn create_automation(paths: &RuntimePaths, name: &str) -> Result<ExitCode, Strin
             "ok": true,
             "action": "automation_create",
             "name": name,
+            "device": device,
+            "device_id": payload.get("device_id").cloned().unwrap_or(Value::Null),
             "client_id": client_id,
             "client_secret": client_secret,
             "token_endpoint": token_endpoint,
@@ -1562,6 +1613,37 @@ mod tests {
 
         let mut short = std::io::Cursor::new(b"123\n".to_vec());
         assert!(read_pairing_code_from(&mut short).is_err());
+    }
+
+    #[test]
+    fn automation_create_body_is_explicitly_device_bound() {
+        let body = automation_create_request_body(
+            "gitlab:group/project:prod",
+            "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+        assert_eq!(body["name"], "gitlab:group/project:prod");
+        assert_eq!(body["device"], "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        // A unique-name selector is passed through verbatim; never resolved client-side.
+        let named = automation_create_request_body("gitlab:ci:pipeline", "build-runner-01");
+        assert_eq!(named["device"], "build-runner-01");
+    }
+
+    #[test]
+    fn connector_revoke_body_uses_connector_id_not_client_id() {
+        let body = connector_revoke_request_body("conn_abc123XYZ");
+        assert_eq!(body["connector_id"], "conn_abc123XYZ");
+        assert!(body.get("client_id").is_none());
+    }
+
+    #[test]
+    fn management_request_bodies_never_carry_enrollment_secrets() {
+        // The body builders only ever include the device selector and never a
+        // device/owner secret, so a leaked request can never expose credentials.
+        let automation = automation_create_request_body("gitlab:ci", "build-runner-01");
+        assert!(!automation.to_string().contains("secret"));
+        assert!(!automation.to_string().contains("credential"));
+        let revoke = connector_revoke_request_body("conn_abc");
+        assert!(!revoke.to_string().contains("secret"));
     }
 
     #[test]

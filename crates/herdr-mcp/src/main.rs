@@ -94,8 +94,14 @@ fn run() -> Result<ExitCode, String> {
         unsafe { std::env::set_var("HERDR_MCP_INSTANCE", name) };
     }
     match parsed.command {
-        cli::Command::Help => {
-            print!("{}", cli::help());
+        cli::Command::Help { section } => {
+            let text = match section {
+                cli::HelpSection::General => cli::help(),
+                cli::HelpSection::Worker => cli::worker_help(),
+                cli::HelpSection::Connector => cli::connector_help(),
+                cli::HelpSection::Automation => cli::automation_help(),
+            };
+            print!("{text}");
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Version => {
