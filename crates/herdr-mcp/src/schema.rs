@@ -140,11 +140,9 @@ fn validate_with_registry(
 
     for (name, value) in given {
         let Some(property) = schema.properties.get(name) else {
-            warnings.push(ValidationIssue {
+            errors.push(ValidationIssue {
                 name: name.clone(),
-                message: format!(
-                    "unknown param \"{name}\" (not in schema - daemon may still accept it)"
-                ),
+                message: format!("unknown param \"{name}\" (not in schema)"),
             });
             continue;
         };
@@ -524,8 +522,9 @@ mod tests {
             "agent.start",
             &json!({"workspace_id": "w1", "count": 2, "kind": "pi", "future": true}),
         );
-        assert!(valid.ok);
-        assert_eq!(valid.warnings.len(), 1);
+        assert!(!valid.ok);
+        assert_eq!(valid.errors.len(), 1);
+        assert!(valid.warnings.is_empty());
 
         let invalid = validate_with_registry(
             &registry,

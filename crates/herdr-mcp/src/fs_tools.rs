@@ -497,6 +497,18 @@ fn finish_grep_result(
     started_at_ms: u64,
     elapsed_ms: u64,
 ) -> Value {
+    if matches.is_empty() && truncated {
+        return json!({
+            "ok": false,
+            "code": "grep_incomplete",
+            "message": "grep could not complete within the requested limits; retry with a higher max_bytes",
+            "root": resolved_root.to_string_lossy(),
+            "engine": engine,
+            "truncated": true,
+            "started_at": iso_from_ms(started_at_ms),
+            "elapsed_ms": elapsed_ms,
+        });
+    }
     let compact = if truncated {
         None
     } else {
@@ -1271,6 +1283,13 @@ mod tests {
         assert_eq!(line, 3);
         assert_eq!(content, "alpha two");
         assert!(parse_rg_line("not a match").is_none());
+    }
+
+    #[test]
+    fn empty_truncated_grep_fails_closed() {
+        let result = finish_grep_result(Path::new("/repo"), vec![], true, "rust", 0, 1);
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["code"], "grep_incomplete");
     }
 
     #[test]
