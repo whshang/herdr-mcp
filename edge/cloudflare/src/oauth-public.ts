@@ -140,6 +140,7 @@ export interface OAuthPublicStore {
   revokeGrant(clientId: string, revokedBy: string, nowMs: number): Promise<boolean>;
   getConnector(connectorId: string): Promise<OAuthConnectorRecord | null>;
   listConnectors(): Promise<OAuthConnectorRecord[]>;
+  connectorInventory(): Promise<Record<string, unknown>>;
   revokeConnector(connectorId: string, revokedBy: string, nowMs: number): Promise<boolean>;
   revokeClientConnectors(clientId: string, revokedBy: string, nowMs: number): Promise<boolean>;
   issueTokens(input: TokenIssueInput): Promise<IssuedTokenPair | null>;
@@ -1411,6 +1412,11 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
       if (!resp.ok) return [];
       const data = (await resp.json()) as { connectors?: OAuthConnectorRecord[] };
       return Array.isArray(data.connectors) ? data.connectors : [];
+    },
+    async connectorInventory() {
+      const resp = await internal("/internal/oauth/connector/inventory", {});
+      if (!resp.ok) return { ok: false, code: "connector_inventory_unavailable" };
+      return await resp.json() as Record<string, unknown>;
     },
     async revokeConnector(connectorId, revokedBy, nowMs) {
       const resp = await internal("/internal/oauth/connector/revoke", {

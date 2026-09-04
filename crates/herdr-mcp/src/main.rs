@@ -28,6 +28,7 @@ mod herdr;
 mod herdr_supervisor;
 mod inspect;
 mod instance;
+mod instance_admin;
 mod link;
 mod local_skills;
 mod macos_credential_helper;
@@ -100,6 +101,7 @@ fn run() -> Result<ExitCode, String> {
                 cli::HelpSection::Worker => cli::worker_help(),
                 cli::HelpSection::Connector => cli::connector_help(),
                 cli::HelpSection::Automation => cli::automation_help(),
+                cli::HelpSection::Instance => cli::instance_help(),
             };
             print!("{text}");
             Ok(ExitCode::SUCCESS)
@@ -202,6 +204,7 @@ fn run() -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        cli::Command::Instance(command) => instance_admin::run(command),
         cli::Command::Worker(command) => worker::run(command),
         cli::Command::Dev(command) => dev::run(command),
         cli::Command::Candidate { port } => {

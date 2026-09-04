@@ -408,6 +408,7 @@ export class OAuthStoreDO {
     if (request.method === "POST" && url.pathname === "/internal/oauth/grant/revoke") return this.revokeGrant(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/get") return this.getConnector(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/list") return this.listConnectors();
+    if (request.method === "POST" && url.pathname === "/internal/oauth/connector/inventory") return this.connectorInventory();
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/revoke") return this.revokeConnector(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/connector/revoke-client") return this.revokeClientConnectors(request);
     if (request.method === "POST" && url.pathname === "/internal/oauth/automation/create") return this.createAutomation(request);
@@ -808,6 +809,94 @@ export class OAuthStoreDO {
     }
     connectors.sort((a, b) => Number(b.approved_at_ms ?? 0) - Number(a.approved_at_ms ?? 0));
     return json({ ok: true, connectors });
+  }
+
+  private async connectorInventory(): Promise<Response> {
+    const [clientRows, connectorRows, grantRows, accessRows, refreshRows] = await Promise.all([
+      this.state.storage.list<OAuthClientRecord>({ prefix: CLIENT_PREFIX }),
+      this.state.storage.list<OAuthConnectorRecord>({ prefix: CONNECTOR_PREFIX }),
+      this.state.storage.list<OAuthConnectorGrantRecord>({ prefix: GRANT_PREFIX }),
+      this.state.storage.list<OAuthTokenRecord>({ prefix: ACCESS_PREFIX }),
+      this.state.storage.list<OAuthTokenRecord>({ prefix: REFRESH_PREFIX }),
+    ]);
+    const nowSec = Math.floor(Date.now() / 1000);
+    const representedClients = new Set<string>();
+    const activeAccessByClient = new Map<string, number>();
+    const activeRefreshByClient = new Map<string, number>();
+    const activeAccessByConnector = new Map<string, number>();
+    const activeRefreshByConnector = new Map<string, number>();
+
+    const countToken = (
+      token: OAuthTokenRecord,
+      byClient: Map<string, number>,
+      byConnector: Map<string, number>,
+    ) => {
+      if (!Number.isFinite(token.expires_at) || token.expires_at <= nowSec) return;
+      byClient.set(token.client_id, (byClient.get(token.client_id) ?? 0) + 1);
+      if (token.connector_id) {
+        byConnector.set(token.connector_id, (byConnector.get(token.connector_id) ?? 0) + 1);
+      }
+    };
+    for (const token of accessRows.values()) countToken(token, activeAccessByClient, activeAccessByConnector);
+    for (const token of refreshRows.values()) countToken(token, activeRefreshByClient, activeRefreshByConnector);
+
+    const connectors: Array<Record<string, unknown>> = [];
+    for (const raw of connectorRows.values()) {
+      const connector = normalizeConnector(raw);
+      if (!connector) continue;
+      representedClients.add(connector.client_id);
+      const client = normalizeOAuthClient(await this.state.storage.get<OAuthClientRecord>(CLIENT_PREFIX + connector.client_id));
+      connectors.push({
+        ...connector,
+        client_name: client?.client_name ?? null,
+        active_access_tokens: activeAccessByConnector.get(connector.connector_id) ?? 0,
+        active_refresh_tokens: activeRefreshByConnector.get(connector.connector_id) ?? 0,
+      });
+      if (connectors.length >= 256) break;
+    }
+    connectors.sort((a, b) => Number(b.approved_at_ms ?? 0) - Number(a.approved_at_ms ?? 0));
+
+    const legacyClients: Array<Record<string, unknown>> = [];
+    for (const [key, rawClient] of clientRows) {
+      const clientId = key.slice(CLIENT_PREFIX.length);
+      if (representedClients.has(clientId)) continue;
+      const client = normalizeOAuthClient(rawClient);
+      if (!client) continue;
+      const grant = normalizeConnectorGrant(grantRows.get(GRANT_PREFIX + clientId));
+      if (grant?.principal_type === "automation") continue;
+      const access = activeAccessByClient.get(clientId) ?? 0;
+      const refresh = activeRefreshByClient.get(clientId) ?? 0;
+      const grantStatus = grant?.status ?? null;
+      const registrationState = grantStatus === "revoked"
+        ? "revoked"
+        : access > 0 || refresh > 0
+          ? "active_credentials"
+          : grantStatus === "active"
+            ? "granted"
+            : "registered_only";
+      legacyClients.push({
+        client_id: clientId,
+        client_name: client.client_name ?? null,
+        issued_at: client.issued_at,
+        grant_status: grantStatus,
+        registration_state: registrationState,
+        active_access_tokens: access,
+        active_refresh_tokens: refresh,
+      });
+      if (legacyClients.length >= 256) break;
+    }
+    legacyClients.sort((a, b) => Number(b.issued_at ?? 0) - Number(a.issued_at ?? 0));
+
+    const sum = (values: Map<string, number>) => [...values.values()].reduce((total, value) => total + value, 0);
+    return json({
+      ok: true,
+      connectors,
+      legacy_clients: legacyClients,
+      token_counts: {
+        active_access: sum(activeAccessByClient),
+        active_refresh: sum(activeRefreshByClient),
+      },
+    });
   }
 
   private async revokeConnector(request: Request): Promise<Response> {

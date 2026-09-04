@@ -91,6 +91,10 @@ fn connector_revoke_request_body(connector_id: &str) -> Value {
     json!({ "connector_id": connector_id })
 }
 
+fn connector_client_revoke_request_body(client_id: &str) -> Value {
+    json!({ "client_id": client_id })
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn format_pairing_expiry(expires_at_ms: u64) -> Option<String> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires_at_ms) * 1_000_000)
@@ -104,6 +108,7 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         return Err("Worker pairing is available only on the default Herdr instance".to_owned());
     }
     match command {
+        WorkerCommand::List => list_devices(&paths),
         WorkerCommand::Pair { ttl_seconds, name } => {
             create_pairing(&paths, ttl_seconds, name.as_deref())
         }
@@ -119,6 +124,9 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         WorkerCommand::ConnectorApprove { request_id } => approve_connector(&paths, &request_id),
         WorkerCommand::ConnectorList => list_connectors(&paths),
         WorkerCommand::ConnectorRevoke { connector_id } => revoke_connector(&paths, &connector_id),
+        WorkerCommand::ConnectorClientRevoke { client_id } => {
+            revoke_connector_client(&paths, &client_id)
+        }
         WorkerCommand::AutomationCreate { name, device } => {
             create_automation(&paths, &name, &device)
         }
@@ -126,6 +134,23 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         WorkerCommand::AutomationRotate { client_id } => rotate_automation(&paths, &client_id),
         WorkerCommand::AutomationRevoke { client_id } => revoke_automation(&paths, &client_id),
     }
+}
+
+fn list_devices(paths: &RuntimePaths) -> Result<ExitCode, String> {
+    let payload = extension_fleet_snapshot(paths)?;
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        let code = payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("device_inventory_unavailable");
+        return Err(format!("device inventory unavailable: {code}"));
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload)
+            .map_err(|error| format!("cannot encode device inventory: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -465,6 +490,47 @@ fn revoke_connector(paths: &RuntimePaths, connector_id: &str) -> Result<ExitCode
             "connector_id": payload.get("connector_id").cloned().unwrap_or(Value::String(connector_id.to_owned())),
         }))
         .map_err(|error| format!("cannot encode connector revoke result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn revoke_connector_client(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode, String> {
+    Err(
+        "connector client revoke currently requires the macOS enrolled-device credential backend"
+            .to_owned(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn revoke_connector_client(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, String> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() || client_id.len() > 4096 {
+        return Err("connector client id must be non-empty and at most 4096 bytes".to_owned());
+    }
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_fleet_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client()?
+        .post(endpoint(&identity.edge_origin, "/connectors/revoke")?)
+        .headers(headers)
+        .json(&connector_client_revoke_request_body(client_id))
+        .send()
+        .map_err(|error| format!("cannot revoke Connector client: {error}"))?;
+    let payload = parse_json_response(response, "connector client revoke")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "connector_client_revoke",
+            "client_id": payload.get("client_id").cloned().unwrap_or(Value::String(client_id.to_owned())),
+        }))
+        .map_err(|error| format!("cannot encode connector client revoke result: {error}"))?
     );
     Ok(ExitCode::SUCCESS)
 }
@@ -1569,6 +1635,10 @@ mod tests {
 
         let named_consume = pairing_consume_request_body(pairing_id, "123456", Some("Nathan Mac"));
         assert_eq!(named_consume["name"], "Nathan Mac");
+
+        let revoke_client = connector_client_revoke_request_body("https://legacy.example/client");
+        assert_eq!(revoke_client["client_id"], "https://legacy.example/client");
+        assert!(revoke_client.get("connector_id").is_none());
     }
 
     #[test]

@@ -189,7 +189,10 @@ export default {
       const fleetAdmin = await authenticateFleetAdmin(request, env);
       if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
       const store = createOAuthPublicStore(env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1")));
-      return noStoreJsonResponse({ ok: true, connectors: await store.listConnectors() });
+      const inventory = await store.connectorInventory();
+      return inventory.ok === false
+        ? noStoreJsonResponse(inventory, 503)
+        : noStoreJsonResponse(inventory);
     }
 
     if (request.method === "POST" && url.pathname === "/connectors/inspect") {

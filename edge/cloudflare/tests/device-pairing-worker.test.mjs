@@ -437,6 +437,29 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   assert.equal(redirect.searchParams.get("state"), "state-connector");
   assert.ok(redirect.searchParams.get("code"));
 
+  const nowSec = Math.floor(Date.now() / 1000);
+  await oauthStorage.put("client:https://legacy.example/oauth/client-metadata.json", {
+    client_secret_hash: "must-never-be-returned",
+    redirect_uris: ["https://legacy.example/callback"],
+    token_endpoint_auth_method: "client_secret_post",
+    grant_types: ["authorization_code", "refresh_token"],
+    scope: "mcp",
+    client_name: "Legacy WebChat",
+    issued_at: nowSec - 60,
+  });
+  await oauthStorage.put("access:legacy-test", {
+    client_id: "https://legacy.example/oauth/client-metadata.json",
+    resource: "https://edge.example/mcp",
+    scope: "mcp",
+    expires_at: nowSec + 3600,
+  });
+  await oauthStorage.put("refresh:legacy-test", {
+    client_id: "https://legacy.example/oauth/client-metadata.json",
+    resource: "https://edge.example/mcp",
+    scope: "mcp",
+    expires_at: nowSec + 7200,
+  });
+
   const inventory = await worker.fetch(new Request("https://edge.example/connectors", {
     headers: { authorization: "Bearer owner-secret" },
   }), h.env);
@@ -445,6 +468,19 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   assert.equal(inventoryBody.connectors.length, 1);
   const connectorId = inventoryBody.connectors[0].connector_id;
   assert.match(connectorId, /^conn_[A-Za-z0-9_-]+$/);
+  assert.equal(inventoryBody.legacy_clients.length, 1);
+  assert.deepEqual(inventoryBody.legacy_clients[0], {
+    client_id: "https://legacy.example/oauth/client-metadata.json",
+    client_name: "Legacy WebChat",
+    issued_at: nowSec - 60,
+    grant_status: null,
+    registration_state: "active_credentials",
+    active_access_tokens: 1,
+    active_refresh_tokens: 1,
+  });
+  assert.equal(inventoryBody.legacy_clients[0].client_secret_hash, undefined);
+  assert.equal(inventoryBody.token_counts.active_access, 1);
+  assert.equal(inventoryBody.token_counts.active_refresh, 1);
 
   const revokeInstance = await worker.fetch(
     post("/connectors/revoke", { connector_id: connectorId }, "owner-secret"),
