@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
 import { DeviceRegistryDO } from "../dist/device-registry-do.js";
 
@@ -217,6 +218,106 @@ test("alpha.1 rejects caller-supplied evidence refs and successful chains remain
   }, PRINCIPAL_B, 2000);
   assert.equal(afterReconstruction.ok, true);
   assert.deepEqual(afterReconstruction.chain.portable_evidence_refs, []);
+});
+
+test("alpha.2 compact checkpoint is planner-fenced, strictly portable, and reconstructable", async () => {
+  const { storage, registry } = makeRegistry();
+  const created = await createChain(registry, "checkpoint-chain");
+  const lease = await acquire(registry, created.chain, "checkpoint-lease", PRINCIPAL_A, 1000);
+  const checkpointJson = JSON.stringify({ goal: "alpha2", state: "ready" });
+  const checkpointSha256 = createHash("sha256").update(checkpointJson).digest("hex");
+  const validRef = {
+    kind: "git_source",
+    repo_id: "github.com/whshang/herdr-mcp",
+    commit_sha: "0".repeat(40),
+    repo_relative_path: "crates/herdr-mcp/src/state_store.rs",
+    line_start: 1,
+    line_end: 10,
+    evidence_sha256: "a".repeat(64),
+  };
+
+  for (const [suffix, ref] of [
+    ["absolute", { ...validRef, repo_relative_path: "/Users/example/private" }],
+    ["url", { ...validRef, repo_relative_path: "https://example.invalid/evidence" }],
+    ["short-sha", { ...validRef, commit_sha: "e9281b4" }],
+    ["local-id", { evidence_id: "ev_0123456789abcdef0123456789abcdef", kind: "result", sha256: "a".repeat(64) }],
+  ]) {
+    const rejected = await call(registry, "herdr_mcp.work_chain.checkpoint.update", {
+      work_chain_id: created.chain.work_chain_id,
+      expected_chain_revision: lease.chain.revision,
+      expected_lease_generation: lease.planner_lease.generation,
+      expected_checkpoint_revision: 0,
+      idempotency_key: `checkpoint-ref-${suffix}`,
+      summary: "Alpha2 checkpoint",
+      checkpoint_json: checkpointJson,
+      checkpoint_sha256: checkpointSha256,
+      portable_evidence_refs: [ref],
+    }, PRINCIPAL_A, 1100);
+    assert.equal(rejected.code, "invalid_portable_evidence_refs");
+  }
+
+  const badHash = await call(registry, "herdr_mcp.work_chain.checkpoint.update", {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: lease.chain.revision,
+    expected_lease_generation: lease.planner_lease.generation,
+    expected_checkpoint_revision: 0,
+    idempotency_key: "checkpoint-bad-hash",
+    summary: "Alpha2 checkpoint",
+    checkpoint_json: checkpointJson,
+    checkpoint_sha256: "f".repeat(64),
+    portable_evidence_refs: [validRef],
+  }, PRINCIPAL_A, 1150);
+  assert.equal(badHash.code, "checkpoint_hash_mismatch");
+
+  const updatedParams = {
+    work_chain_id: created.chain.work_chain_id,
+    expected_chain_revision: lease.chain.revision,
+    expected_lease_generation: lease.planner_lease.generation,
+    expected_checkpoint_revision: 0,
+    idempotency_key: "checkpoint-valid",
+    summary: "Alpha2 checkpoint",
+    checkpoint_json: checkpointJson,
+    checkpoint_sha256: checkpointSha256,
+    portable_evidence_refs: [validRef],
+  };
+  const updated = await call(registry, "herdr_mcp.work_chain.checkpoint.update", updatedParams, PRINCIPAL_A, 1200);
+  assert.equal(updated.ok, true);
+  assert.equal(updated.chain.checkpoint_revision, 1);
+  assert.equal(updated.chain.compact_checkpoint.revision, 1);
+  assert.deepEqual(updated.chain.portable_evidence_refs, [validRef]);
+
+  const replay = await call(registry, "herdr_mcp.work_chain.checkpoint.update", updatedParams, PRINCIPAL_A, 1201);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.chain.checkpoint_revision, 1);
+
+  const stale = await call(registry, "herdr_mcp.work_chain.checkpoint.update", {
+    ...updatedParams,
+    expected_chain_revision: updated.chain.revision,
+    idempotency_key: "checkpoint-stale",
+  }, PRINCIPAL_A, 1300);
+  assert.equal(stale.code, "checkpoint_revision_conflict");
+  assert.equal(stale.actual, 1);
+
+  const chainKey = `fleet:chain:v1:${created.chain.work_chain_id}`;
+  const stored = await storage.get(chainKey);
+  assert.equal(JSON.stringify(stored).includes("/Users/"), false);
+  assert.equal(JSON.stringify(stored).includes("https://"), false);
+  assert.equal(JSON.stringify(stored).includes("raw transcript"), false);
+
+  const reconstructed = makeRegistry(storage).registry;
+  const inspected = await call(reconstructed, "herdr_mcp.work_chain.inspect", {
+    work_chain_id: created.chain.work_chain_id,
+  }, PRINCIPAL_B, 1400);
+  assert.equal(inspected.ok, true);
+  assert.equal(inspected.chain.checkpoint_revision, 1);
+  assert.equal(inspected.chain.compact_checkpoint.checkpoint_sha256, checkpointSha256);
+  assert.deepEqual(inspected.chain.portable_evidence_refs, [validRef]);
+
+  const chainWrite = [...storage.writeLog].reverse().find((entry) => entry.key === chainKey);
+  assert.ok(chainWrite);
+  assert.ok(storage.writeLog.some((entry) =>
+    entry.transaction === chainWrite.transaction && entry.key.startsWith("fleet:idempotency:v1:")
+  ));
 });
 
 test("expired lease is reclaimable with monotonically increasing generation", async () => {
