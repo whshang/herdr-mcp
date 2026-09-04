@@ -115,19 +115,32 @@ async function pendingAuthorization(opts, client_id, redirect_uri = "https://app
     code_challenge: challenge, code_challenge_method: "S256", state,
   });
   const resp = await GET(`/oauth/authorize?${qs}`, opts);
-  assert.equal(resp.status, 200, "unapproved connector should receive the approval page, not an OAuth code");
+  const unexpectedBody = resp.status === 200 ? "" : await resp.clone().text();
+  assert.equal(
+    resp.status,
+    200,
+    `unapproved connector should receive the approval page, not an OAuth code; body=${unexpectedBody}`,
+  );
   assert.match(resp.headers.get("content-type") ?? "", /^text\/html/);
   const html = await resp.text();
   const requestId = /const requestId="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
   const resumeToken = /const resumeToken="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
-  const approvalCode = /<p class="code">(\d{6})<\/p>/.exec(html)?.[1];
+  const approvalCode = /<div class="approval-code">(\d{6})<\/div>/.exec(html)?.[1];
   assert.ok(requestId, "approval page should expose request id");
   assert.ok(resumeToken, "approval page should carry an opaque resume token for same-page polling");
   assert.ok(approvalCode, "approval page should expose the one-time six-digit code");
   assert.ok(html.includes(`herdr-mcp connector approve ${requestId}`));
-  assert.match(html, /any computer already enrolled in this Herdr Worker/);
-  assert.match(html, /explicitly approved by this Worker/);
+  assert.match(html, /id="copy-command"/);
+  assert.match(html, /navigator\.clipboard/);
+  assert.match(html, /document\.execCommand\('copy'\)/);
+  assert.match(html, /Requires herdr-mcp v0\.4\.6 or newer\./);
+  assert.match(html, /unknown command 'connector'/);
+  assert.match(html, /computer that is already enrolled in this Worker/);
+  assert.match(html, /Approval grants ordinary MCP access; it does not grant fleet-administration authority\./);
+  assert.doesNotMatch(html, /another Herdr WebChat/);
   assert.match(resp.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+  assert.match(resp.headers.get("content-security-policy") ?? "", /style-src 'unsafe-inline'/);
+  assert.match(resp.headers.get("content-security-policy") ?? "", /script-src 'unsafe-inline'/);
   assert.equal(resp.headers.get("x-frame-options"), "DENY");
   return { requestId, resumeToken, approvalCode, verifier, challenge, state };
 }
@@ -302,6 +315,21 @@ test("all six DCR aliases register and the client persists via the DO", async ()
     assert.ok(found);
     assert.equal(found.client_secret_hash.length, 64, "store holds hex hash not raw secret");
     assert.notEqual(found.client_secret_hash, data.client_secret);
+  }
+});
+
+test("multiple fresh DCR clients remain resolvable under a fixed handler clock", async () => {
+  // Regression: DCR cleanup must use the same authoritative request/handler
+  // clock as issued_at. A fixed injected nowMs must not make a freshly
+  // registered sibling look expired and delete it.
+  const opts = makeOptions();
+  const a = await registerClient(opts, { client_name: "client-a" });
+  const b = await registerClient(opts, { client_name: "client-b" });
+  const c = await registerClient(opts, { client_name: "client-c" });
+  for (const { client_id } of [a, b, c]) {
+    const found = await opts.store.getClient(client_id);
+    assert.ok(found, `client ${client_id} must remain resolvable`);
+    assert.equal(found.client_secret_hash.length, 64);
   }
 });
 
@@ -656,6 +684,8 @@ test("token: client_credentials is reserved for approved automation clients and 
       resource: IDENTITY.resource,
       scope: "mcp",
       created_by: "device:admin",
+      device_id: "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYZ",
+      device_name: "ci-bound-mac",
       now_ms: NOW_MS,
     }),
   }));

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
 import { EPOCH3_CONTRACT } from "../dist/contracts/epoch3.js";
+import { encodeDeviceRef } from "../dist/device-refs.js";
 import { makeLimits } from "../dist/limits.js";
 import { handleMcp } from "../dist/mcp-handler.js";
 
@@ -26,6 +27,7 @@ function deps(over = {}) {
       revokeConnector: over.revokeConnector,
       listAutomations: over.listAutomations,
       revokeAutomation: over.revokeAutomation,
+      client: over.client,
       resolveDevice: over.resolveDevice,
       forward: async (_stub, body) => {
         calls.push(JSON.parse(body));
@@ -42,6 +44,64 @@ function deps(over = {}) {
 
 const req = (id, method, params = {}) => ({ jsonrpc: "2.0", id, method, params });
 const DEVICE_A = "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYZ";
+const DEVICE_B = "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYA";
+
+test("device-bound automation defaults to its device and rejects other selectors or refs", async () => {
+  const resolved = [];
+  const d = deps({
+    client: { automationDeviceId: DEVICE_A },
+    devices: [
+      { device_id: DEVICE_A, name: "auto-a" },
+      { device_id: DEVICE_B, name: "auto-b" },
+    ],
+    resolveDevice: async (selector) => {
+      resolved.push(selector);
+      return {
+        ok: true,
+        device_id: selector,
+        workstation_id: selector === DEVICE_A ? "ws-a" : "ws-b",
+        routing_reason: "explicit_device_id",
+      };
+    },
+  });
+
+  const implicit = await handleMcp(req(901, "tools/call", {
+    name: "herdr_call",
+    arguments: { method: "pane.read", params: JSON.stringify({ pane_id: "w1:p1", source: "recent" }) },
+  }), "legacy", d.value);
+  assert.equal(implicit.body.result.isError, undefined);
+  assert.deepEqual(resolved, [DEVICE_A], "omitted device must resolve only to the automation-bound device");
+  assert.equal(d.calls.length, 1);
+
+  const explicitOther = await handleMcp(req(902, "tools/call", {
+    name: "herdr_call",
+    arguments: { device: DEVICE_B, method: "pane.read", params: "{}" },
+  }), "legacy", d.value);
+  assert.equal(explicitOther.body.result.isError, true);
+  assert.equal(explicitOther.body.result.structuredContent.code, "automation_device_scope_violation");
+  assert.equal(explicitOther.body.result.structuredContent.delivery_state, "not_delivered");
+  assert.deepEqual(resolved, [DEVICE_A], "cross-device selector must fail before route resolution");
+  assert.equal(d.calls.length, 1, "cross-device selector must not forward");
+
+  const otherRef = encodeDeviceRef(DEVICE_B, undefined, "w2:p1");
+  const refOther = await handleMcp(req(903, "tools/call", {
+    name: "herdr_call",
+    arguments: { method: "pane.read", params: JSON.stringify({ pane_id: otherRef, source: "recent" }) },
+  }), "legacy", d.value);
+  assert.equal(refOther.body.result.isError, true);
+  assert.equal(refOther.body.result.structuredContent.code, "automation_device_scope_violation");
+  assert.equal(refOther.body.result.structuredContent.delivery_state, "not_delivered");
+  assert.deepEqual(resolved, [DEVICE_A], "cross-device ref must fail before route resolution");
+  assert.equal(d.calls.length, 1, "cross-device ref must not forward");
+
+  const fleet = await handleMcp(req(904, "tools/call", {
+    name: "herdr_devices",
+    arguments: {},
+  }), "legacy", d.value);
+  assert.equal(fleet.body.result.structuredContent.scope, "bound_device");
+  assert.equal(fleet.body.result.structuredContent.bound_device_id, DEVICE_A);
+  assert.deepEqual(fleet.body.result.structuredContent.devices.map((device) => device.device_id), [DEVICE_A]);
+});
 
 test("initialize advertises legacy wire protocol and device-aware public identity", async () => {
   const d = deps();
@@ -210,12 +270,11 @@ test("herdr_devices executes at Edge and exposes pairing hint without tools/list
   assert.equal(r.body.result.structuredContent.ok, true);
   assert.deepEqual(r.body.result.structuredContent.devices, devices);
   assert.ok(typeof r.body.result.structuredContent.pairing_hint === "string");
-  assert.ok(r.body.result.structuredContent.pairing_hint.includes("herdr_mcp.device.pair"));
-  assert.ok(r.body.result.structuredContent.pairing_hint.includes("params='{\"ttl_seconds\":600"));
-  assert.ok(r.body.result.structuredContent.pairing_hint.includes("`params` is a JSON string"));
-  assert.ok(r.body.result.structuredContent.pairing_hint.includes("exact expiry"));
-  assert.ok(r.body.result.structuredContent.revoke_hint.includes("herdr_mcp.device.revoke"));
-  assert.ok(r.body.result.structuredContent.revoke_hint.includes('"confirm":true'));
+  assert.ok(r.body.result.structuredContent.pairing_hint.includes("herdr-mcp worker pair"));
+  assert.ok(r.body.result.structuredContent.pairing_hint.includes("herdr-mcp worker connect"));
+  assert.ok(r.body.result.structuredContent.revoke_hint.includes("herdr-mcp worker revoke <device_id>"));
+  assert.equal(r.body.result.structuredContent.pairing_hint.includes("herdr_mcp.device.pair"), false);
+  assert.equal(r.body.result.structuredContent.revoke_hint.includes("herdr_mcp.device.revoke"), false);
   assert.ok(r.body.result.structuredContent.revoke_hint.includes("Never revoke by display name"));
   assert.equal(d.calls.length, 0);
 });
@@ -602,24 +661,11 @@ test("connector approve/revoke private methods are Edge-local, schema-bounded, a
   assert.equal(listed.body.result.tools.some((tool) => tool.name.includes("connector")), false);
 });
 
-test("automation inventory/revoke are Edge-local private methods and never expose a secret", async () => {
-  let revoked = null;
-  const d = deps({
-    listAutomations: async () => ({
-      ok: true,
-      automations: [{
-        client_id: "svc_abcdefgh1234",
-        name: "gitlab:group/project:prod",
-        status: "active",
-        token_issue_count: 4,
-        last_token_issued_at_ms: 1234,
-      }],
-    }),
-    revokeAutomation: async (clientId) => {
-      revoked = clientId;
-      return { ok: true };
-    },
-  });
+test("automation list/revoke are not MCP private methods; public tools never expose automation", async () => {
+  // Automation administration is REST-only (fleet-admin). It must NOT be
+  // reachable as an MCP private method, so an approved WebChat Connector can
+  // never administer automation clients.
+  const d = deps({});
 
   const list = await handleMcp(
     req(741, "tools/call", {
@@ -629,25 +675,12 @@ test("automation inventory/revoke are Edge-local private methods and never expos
     "legacy-default",
     d.value,
   );
-  assert.equal(list.body.result.structuredContent.automations.length, 1);
-  assert.equal(list.body.result.structuredContent.automations[0].client_secret, undefined);
+  assert.equal(list.body.result.isError, true);
+  assert.equal(list.body.result.structuredContent.code, "unknown_method");
   assert.equal(d.calls.length, 0);
 
-  const noConfirm = await handleMcp(
-    req(742, "tools/call", {
-      name: "herdr_call",
-      arguments: {
-        method: "herdr_mcp.automation.revoke",
-        params: { client_id: "svc_abcdefgh1234" },
-      },
-    }),
-    "legacy-default",
-    d.value,
-  );
-  assert.equal(noConfirm.body.result.structuredContent.code, "confirmation_required");
-
   const revoke = await handleMcp(
-    req(743, "tools/call", {
+    req(742, "tools/call", {
       name: "herdr_call",
       arguments: {
         method: "herdr_mcp.automation.revoke",
@@ -657,8 +690,9 @@ test("automation inventory/revoke are Edge-local private methods and never expos
     "legacy-default",
     d.value,
   );
-  assert.equal(revoke.body.result.structuredContent.revoked, true);
-  assert.equal(revoked, "svc_abcdefgh1234");
+  assert.equal(revoke.body.result.isError, true);
+  assert.equal(revoke.body.result.structuredContent.code, "unknown_method");
+  assert.equal(d.calls.length, 0);
 
   const publicTools = await handleMcp(req(744, "tools/list", {}), "legacy-default", d.value);
   assert.equal(publicTools.body.result.tools.some((tool) => tool.name.includes("automation")), false);

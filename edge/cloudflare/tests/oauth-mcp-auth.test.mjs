@@ -74,6 +74,31 @@ test("production issuer RS256 JWT validates with migrated public PEM", async () 
   assert.equal(result.clientId, "https://chatgpt.com/client");
 });
 
+test("migrated public-PEM JWT obeys the injected legacy client grant fence", async () => {
+  const kp = await keyPair();
+  const pem = await publicPem(kp.publicKey);
+  const now = Math.floor(Date.now() / 1000);
+  const token = await jwt(kp.privateKey, {
+    iss: ISSUER,
+    aud: `${ISSUER}/mcp`,
+    sub: "legacy-client",
+    client_id: "legacy-client",
+    iat: now,
+    exp: now + 3600,
+  });
+  const env = { OAUTH_ISSUER: ISSUER, OAUTH_JWT_PUBLIC_PEM: pem };
+
+  assert.equal((await authenticateMcpRequest(request(token), env, {
+    verifyLegacyClient: async (clientId) => clientId === "legacy-client",
+  })).ok, true);
+  assert.deepEqual(await authenticateMcpRequest(request(token), env, {
+    verifyLegacyClient: async () => false,
+  }), { ok: false, code: "mcp_auth_failed" });
+  assert.deepEqual(await authenticateMcpRequest(request(token), env, {
+    verifyLegacyClient: async () => { throw new Error("grant store unavailable"); },
+  }), { ok: false, code: "mcp_auth_failed" });
+});
+
 test("wrong audience, issuer, signature, or missing OAuth config fail closed", async () => {
   const kp = await keyPair();
   const other = await keyPair();

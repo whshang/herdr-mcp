@@ -44,6 +44,8 @@ export interface McpResponse {
 export interface McpClientContext {
   userAgent?: string | null;
   oauthClientId?: string | null;
+  /** Bound device_id for an automation principal; forces routing to that device. */
+  automationDeviceId?: string | null;
 }
 
 export interface McpDeps {
@@ -64,14 +66,6 @@ export interface McpDeps {
     | { ok: false; code: string }
   >;
   revokeConnector?(clientId: string): Promise<
-    | { ok: true }
-    | { ok: false; code: string }
-  >;
-  listAutomations?(): Promise<
-    | { ok: true; automations: unknown[] }
-    | { ok: false; code: string }
-  >;
-  revokeAutomation?(clientId: string): Promise<
     | { ok: true }
     | { ok: false; code: string }
   >;
@@ -318,12 +312,26 @@ export async function handleMcp(
         );
       }
       try {
-        const devices = await deps.listDevices();
+        const allDevices = await deps.listDevices();
+        const boundDeviceId = deps.client?.automationDeviceId ?? null;
+        // An automation principal may only see its bound device; it must not
+        // use fleet discovery to bypass its device scope.
+        const devices = boundDeviceId && Array.isArray(allDevices)
+          ? allDevices.filter((device) => isRecord(device) && device.device_id === boundDeviceId)
+          : allDevices;
         return rpcResult(id, callToolResult({
           ok: true,
           devices,
-          pairing_hint: "When the user asks to add a new computer, an explicitly approved WebChat can call herdr_call(method=\"herdr_mcp.device.pair\", params='{\"ttl_seconds\":600,\"name\":\"<optional>\"}'). `params` is a JSON string in the frozen public schema. This is a Worker fleet-admin action and does not route through a workstation. If this conversation lacks fleet-admin authority, create the pairing from any already-enrolled computer with `herdr-mcp worker pair`. A completely new first Worker must be bootstrapped before pairing. Present the pairing address, one-time code, exact expiry, and new-device command together.",
-          revoke_hint: "When the user explicitly asks to permanently revoke an enrolled computer, an explicitly approved WebChat can select its immutable device_id and call herdr_call(method=\"herdr_mcp.device.revoke\", params='{\"device_id\":\"dev_...\",\"confirm\":true}'). This is a Worker fleet-admin action. Never revoke by display name.",
+          ...(boundDeviceId
+            ? {
+                scope: "bound_device",
+                bound_device_id: boundDeviceId,
+                pairing_hint: "This automation principal is bound to one enrolled device and cannot add or revoke computers. To add a computer, run `herdr-mcp worker pair` on an already-enrolled computer and `herdr-mcp worker connect` on the new one.",
+              }
+            : {
+                pairing_hint: "To add a computer, run `herdr-mcp worker pair` on an already-enrolled computer and `herdr-mcp worker connect` on the new one. A completely new first Worker must be bootstrapped before pairing. Present the pairing address, one-time code, exact expiry, and new-device command together.",
+                revoke_hint: "To permanently revoke an enrolled computer, run `herdr-mcp worker revoke <device_id>` on an already-enrolled computer. Never revoke by display name.",
+              }),
         }));
       } catch {
         return rpcResult(
@@ -688,79 +696,23 @@ export async function handleMcp(
       }));
     }
 
-    if (localMethod === "herdr_mcp.automation.list" || localMethod === "herdr_mcp.automation.revoke") {
-      if (args.device !== undefined) {
+    // Unknown Edge-private namespaces fail closed rather than routing to a
+    // workstation. A removed or mistyped herdr_mcp.* private method must never
+    // be forwarded as ordinary MCP work, so a WebChat Connector cannot use an
+    // obsolete/unknown private method to reach the fleet control plane. The
+    // text.read/write methods are legitimate workstation-routed transfers and
+    // pass through to normal routing below.
+    if (localMethod !== null && localMethod.startsWith("herdr_mcp.")) {
+      if (localMethod !== "herdr_mcp.text.read" && localMethod !== "herdr_mcp.text.write") {
         return rpcResult(id, callToolResult({
           ok: false,
-          code: "device_selector_not_allowed",
-          message: `${localMethod} is Edge-local and does not accept a device selector`,
+          code: "unknown_method",
+          message: `${localMethod} is not a known Edge-local herdr_mcp private method; it is not forwarded to any workstation. If it is a fleet-administration action, run the corresponding herdr-mcp command on an enrolled computer.`,
           retryable: false,
           delivery_state: "not_delivered",
           failure_layer: "edge_routing",
         }, true));
       }
-      for (const key of Object.keys(args)) {
-        if (key !== "method" && key !== "params") {
-          return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: `unknown top-level argument '${key}'` }, true));
-        }
-      }
-      let methodParams: Record<string, unknown> = {};
-      const rawParams = args.params;
-      if (typeof rawParams === "string") {
-        try {
-          const parsed = rawParams.trim() ? JSON.parse(rawParams) : {};
-          if (!isRecord(parsed)) throw new Error("not_object");
-          methodParams = parsed;
-        } catch {
-          return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: "params must be a JSON object" }, true));
-        }
-      } else if (isRecord(rawParams)) {
-        methodParams = rawParams;
-      } else if (rawParams !== undefined && rawParams !== null) {
-        return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: "params must be an object or JSON object string" }, true));
-      }
-
-      if (localMethod === "herdr_mcp.automation.list") {
-        if (Object.keys(methodParams).length !== 0) {
-          return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: "automation list accepts no parameters" }, true));
-        }
-        if (!deps.listAutomations) {
-          return rpcResult(id, callToolResult({ ok: false, code: "automation_list_unavailable", retryable: false }, true));
-        }
-        const result = await deps.listAutomations();
-        if (!result.ok) return rpcResult(id, callToolResult({ ok: false, code: result.code, retryable: false }, true));
-        return rpcResult(id, callToolResult({
-          ok: true,
-          action: "automation_list",
-          automations: result.automations,
-          message: "Automation credentials are service principals for unattended MCP clients. Long-lived client secrets are never returned by inventory.",
-        }));
-      }
-
-      for (const key of Object.keys(methodParams)) {
-        if (key !== "client_id" && key !== "confirm") {
-          return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: `unknown parameter '${key}'` }, true));
-        }
-      }
-      const clientId = typeof methodParams.client_id === "string" ? methodParams.client_id.trim() : "";
-      if (!/^svc_[A-Za-z0-9_-]{8,128}$/.test(clientId)) {
-        return rpcResult(id, callToolResult({ ok: false, code: "invalid_client_id", retryable: false }, true));
-      }
-      if (methodParams.confirm !== true) {
-        return rpcResult(id, callToolResult({ ok: false, code: "confirmation_required", message: "automation revoke requires confirm=true", retryable: false }, true));
-      }
-      if (!deps.revokeAutomation) {
-        return rpcResult(id, callToolResult({ ok: false, code: "automation_revoke_unavailable", retryable: false }, true));
-      }
-      const result = await deps.revokeAutomation(clientId);
-      if (!result.ok) return rpcResult(id, callToolResult({ ok: false, code: result.code, retryable: false }, true));
-      return rpcResult(id, callToolResult({
-        ok: true,
-        action: "automation_revoke",
-        client_id: clientId,
-        revoked: true,
-        message: "Automation credential revoked. Existing access tokens are fenced immediately and this client can no longer mint new tokens.",
-      }));
     }
 
     const selectorValue = args.device;
@@ -791,16 +743,53 @@ export async function handleMcp(
         }, true));
       }
     }
+    const boundAutomationDevice = deps.client?.automationDeviceId ?? null;
     let route: DeviceRouteResult;
     try {
-      route = deps.resolveDevice
-        ? await deps.resolveDevice(selectorValue, args)
-        : {
-            ok: true,
-            device_id: null,
-            workstation_id: workstationId,
-            routing_reason: "legacy_default_device",
-          };
+      if (boundAutomationDevice) {
+        // An automation principal is scoped to exactly one enrolled device. An
+        // omitted selector routes automatically to the bound device; any explicit
+        // selector or device ref referring to a different device fails closed so
+        // the automation client can never route to or discover another device.
+        const { extractDeviceIdFromArgs } = await import("./device-refs.js");
+        const ref = extractDeviceIdFromArgs(args);
+        const refTarget = ref ? ref.deviceId : null;
+        if (selectorValue !== undefined && selectorValue.trim() !== "") {
+          const normalizedSelector = normalizeDeviceId(selectorValue.trim());
+          const selectorTarget = normalizedSelector ?? selectorValue.trim();
+          if (selectorTarget !== boundAutomationDevice) {
+            return rpcResult(id, callToolResult({
+              ok: false,
+              code: "automation_device_scope_violation",
+              message: "This automation principal is bound to one device and cannot route to another enrolled device. Use the bound device id or omit the device selector.",
+              retryable: false,
+              delivery_state: "not_delivered",
+              failure_layer: "edge_routing",
+              bound_device_id: boundAutomationDevice,
+            }, true));
+          }
+        } else if (refTarget !== null && refTarget !== boundAutomationDevice) {
+          return rpcResult(id, callToolResult({
+            ok: false,
+            code: "automation_device_scope_violation",
+            message: "This automation principal is bound to one device and cannot route to another enrolled device via a device ref.",
+            retryable: false,
+            delivery_state: "not_delivered",
+            failure_layer: "edge_routing",
+            bound_device_id: boundAutomationDevice,
+          }, true));
+        }
+        route = await deps.resolveDevice!(boundAutomationDevice, args);
+      } else {
+        route = deps.resolveDevice
+          ? await deps.resolveDevice(selectorValue, args)
+          : {
+              ok: true,
+              device_id: null,
+              workstation_id: workstationId,
+              routing_reason: "legacy_default_device",
+            };
+      }
     } catch {
       return rpcResult(
         id,

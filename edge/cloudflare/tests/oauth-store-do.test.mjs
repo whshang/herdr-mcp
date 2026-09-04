@@ -200,9 +200,14 @@ test("connector approval is request-bound, five wrong attempts lock it, and corr
   }));
   assert.equal(ok.ok, true);
   assert.equal(ok.record.client_id, "c1");
-  const grant = await body(await h.post("/internal/oauth/grant/get", { client_id: "c1" }));
-  assert.equal(grant.record.status, "active");
-  assert.equal(grant.record.approved_by, "device:owner");
+  assert.ok(ok.record.connector_id);
+  const connector = await body(await h.post("/internal/oauth/connector/get", { connector_id: ok.record.connector_id }));
+  assert.equal(connector.connector.status, "active");
+  assert.equal(connector.connector.client_id, "c1");
+  assert.equal(connector.connector.approved_by, "device:owner");
+  assert.equal(connector.connector.grant_generation, 1);
+  assert.equal(connector.connector.principal_type, "connector");
+  assert.equal(connector.connector.capabilities[0], "mcp_access");
 
   await h.post("/internal/oauth/approval/put", {
     request_id: "req-delegated",
@@ -212,13 +217,15 @@ test("connector approval is request-bound, five wrong attempts lock it, and corr
   const delegated = await body(await h.post("/internal/oauth/approval/approve", {
     request_id: "req-delegated",
     code_hash: "delegated-good",
-    approver: "oauth:c1",
+    approver: "device:owner",
     now_ms: 500,
   }));
   assert.equal(delegated.ok, true);
-  const delegatedGrant = await body(await h.post("/internal/oauth/grant/get", { client_id: "c2" }));
-  assert.equal(delegatedGrant.record.status, "active");
-  assert.equal(delegatedGrant.record.approved_by, "oauth:c1");
+  assert.ok(delegated.record.connector_id);
+  const delegatedConnector = await body(await h.post("/internal/oauth/connector/get", { connector_id: delegated.record.connector_id }));
+  assert.equal(delegatedConnector.connector.status, "active");
+  assert.equal(delegatedConnector.connector.client_id, "c2");
+  assert.equal(delegatedConnector.connector.approved_by, "device:owner");
 });
 
 test("connector approval resume token is independent, one-use, and cannot be substituted", async () => {
@@ -340,6 +347,8 @@ test("automation client is independently named, monitored, rotated, and revoke f
     resource: "https://issuer/mcp",
     scope: "mcp",
     created_by: "device:admin",
+    device_id: "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYZ",
+    device_name: "ci-bound-mac",
     now_ms: 1000,
   }));
   assert.equal(created.ok, true);
@@ -352,6 +361,8 @@ test("automation client is independently named, monitored, rotated, and revoke f
   const grant = await body(await h.post("/internal/oauth/grant/get", { client_id: "svc_gitlab_prod_01" }));
   assert.equal(grant.record.status, "active");
   assert.equal(grant.record.principal_type, "automation");
+  assert.equal(grant.record.device_id, "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYZ");
+  assert.equal(grant.record.device_name, "ci-bound-mac");
   assert.equal(grant.record.token_issue_count, 0);
 
   const issued = await body(await h.post("/internal/oauth/automation/token/issue", {
@@ -371,6 +382,8 @@ test("automation client is independently named, monitored, rotated, and revoke f
   const listed = await body(await h.post("/internal/oauth/automation/list", {}));
   assert.equal(listed.automations.length, 1);
   assert.equal(listed.automations[0].name, "gitlab:group/project:prod");
+  assert.equal(listed.automations[0].device_id, "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYZ");
+  assert.equal(listed.automations[0].device_name, "ci-bound-mac");
   assert.equal(listed.automations[0].created_by, "device:admin");
   assert.equal(listed.automations[0].token_issue_count, 1);
   assert.equal(listed.automations[0].last_token_issued_at_ms, 2000);

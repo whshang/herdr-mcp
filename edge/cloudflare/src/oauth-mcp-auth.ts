@@ -13,11 +13,12 @@ export interface OAuthMcpAuthEnv {
 }
 
 export type McpAuthResult =
-  | { ok: true; source: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge"; clientId?: string }
+  | { ok: true; source: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge"; clientId?: string; principalType?: string; deviceId?: string }
   | { ok: false; code: "mcp_auth_failed" };
 
 export interface OAuthMcpAuthDeps {
-  verifyEdgeToken?: (token: string) => Promise<{ ok: boolean; clientId?: string }>;
+  verifyEdgeToken?: (token: string) => Promise<{ ok: boolean; clientId?: string; principalType?: string; deviceId?: string }>;
+  verifyLegacyClient?: (clientId: string) => Promise<boolean>;
 }
 
 let cachedPublicPem = "";
@@ -103,6 +104,16 @@ export async function authenticateMcpRequest(
       const verifier = createRs256AccessTokenVerifier(identity, await publicKeyFor(pem));
       const verdict = await verifier.verify(token, Math.floor(Date.now() / 1000));
       if (verdict.ok) {
+        if (deps.verifyLegacyClient) {
+          if (!verdict.clientId) return { ok: false, code: "mcp_auth_failed" };
+          try {
+            if (!(await deps.verifyLegacyClient(verdict.clientId))) {
+              return { ok: false, code: "mcp_auth_failed" };
+            }
+          } catch {
+            return { ok: false, code: "mcp_auth_failed" };
+          }
+        }
         const result: AccessTokenInfo = verdict.clientId
           ? { ok: true, clientId: verdict.clientId }
           : { ok: true };
@@ -119,9 +130,14 @@ export async function authenticateMcpRequest(
     try {
       const edge = await deps.verifyEdgeToken(token);
       if (edge.ok) {
-        return edge.clientId
-          ? { ok: true, source: "oauth_edge", clientId: edge.clientId }
-          : { ok: true, source: "oauth_edge" };
+        if (!edge.clientId) return { ok: false, code: "mcp_auth_failed" };
+        return {
+          ok: true,
+          source: "oauth_edge",
+          clientId: edge.clientId,
+          ...(edge.principalType ? { principalType: edge.principalType } : {}),
+          ...(edge.deviceId ? { deviceId: edge.deviceId } : {}),
+        };
       }
     } catch {
       // Fail closed below.

@@ -60,11 +60,47 @@ function get(path, authorization, workstationId = null) {
   return new Request(`https://edge.example${path}`, { method: "GET", headers });
 }
 
+// Finite POST /mcp initialize exchange — never a streaming GET /mcp SSE probe.
+function mcpInitialize(authorization, id = 1) {
+  const headers = { "content-type": "application/json" };
+  if (authorization) headers.authorization = `Bearer ${authorization}`;
+  return new Request(`https://edge.example/mcp`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id, method: "initialize", params: {} }),
+  });
+}
+
 function base64UrlUtf8(value) {
   const bytes = new TextEncoder().encode(value);
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function legacyPemJwt(clientId, issuer = "https://edge.example") {
+  const keys = await crypto.subtle.generateKey(
+    { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+    true,
+    ["sign", "verify"],
+  );
+  const der = new Uint8Array(await crypto.subtle.exportKey("spki", keys.publicKey));
+  const chunks = Buffer.from(der).toString("base64").match(/.{1,64}/g) ?? [];
+  const pem = `-----BEGIN PUBLIC KEY-----\n${chunks.join("\n")}\n-----END PUBLIC KEY-----\n`;
+  const now = Math.floor(Date.now() / 1000);
+  const enc = new TextEncoder();
+  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "at+jwt" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({
+    iss: issuer,
+    aud: `${issuer}/mcp`,
+    sub: clientId,
+    client_id: clientId,
+    iat: now,
+    exp: now + 3600,
+  })).toString("base64url");
+  const signing = `${header}.${payload}`;
+  const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", keys.privateKey, enc.encode(signing));
+  return { pem, token: `${signing}.${Buffer.from(signature).toString("base64url")}` };
 }
 
 function wsRequest(workstationId, secret, deviceName) {
@@ -120,15 +156,51 @@ async function pair(env, name) {
   return consume.json();
 }
 
-test("fleet admin provisions independently revocable Automation Client for CI without granting fleet-admin", async () => {
+test("legacy public-PEM JWT keeps ordinary compatibility until its client grant is revoked", async () => {
+  const h = makeEnv({ OAUTH_ISSUER: "https://edge.example" });
+  const oauthStorage = new FakeStorage();
+  const oauth = new OAuthStoreDO({ storage: oauthStorage }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  const clientId = "legacy-pem-client";
+  const legacy = await legacyPemJwt(clientId);
+  h.env.OAUTH_JWT_PUBLIC_PEM = legacy.pem;
+
+  const before = await worker.fetch(mcpInitialize(legacy.token), h.env);
+  assert.equal(before.status, 200, "pre-v0.4.6 JWT without a grant record keeps ordinary MCP compatibility");
+  const beforeBody = await before.json();
+  assert.equal(beforeBody.result.serverInfo.name, "herdr-mcp");
+
+  const revoked = await oauth.fetch(new Request("https://oauth.internal/internal/oauth/grant/revoke", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_id: clientId, revoked_by: "device:test", now_ms: Date.now() }),
+  }));
+  assert.equal(revoked.status, 200);
+
+  const after = await worker.fetch(mcpInitialize(legacy.token, 2), h.env);
+  assert.equal(after.status, 401, "legacy PEM JWT is fenced immediately by the revoke tombstone");
+});
+
+test("fleet admin provisions independently revocable Automation Client bound to a device for CI without granting fleet-admin", async () => {
   const h = makeEnv();
   const oauthStorage = new FakeStorage();
   const oauth = new OAuthStoreDO({ storage: oauthStorage }, { OAUTH_ISSUER: "https://edge.example" });
   h.env.OAUTH_STORE_DO = namespace(oauth);
   h.env.OAUTH_ISSUER = "https://edge.example";
 
-  const createdResponse = await worker.fetch(
+  // An Automation Client must be bound to exactly one enrolled device.
+  const boundDevice = await pair(h.env, "ci-bound-mac");
+  const deviceSelector = boundDevice.device_id; // immutable dev_<26> identity
+
+  const missingDevice = await worker.fetch(
     post("/automations", { name: "gitlab:group/project:prod" }, "owner-secret"),
+    h.env,
+  );
+  assert.equal(missingDevice.status, 400);
+  assert.equal((await missingDevice.json()).code, "bad_request");
+
+  const createdResponse = await worker.fetch(
+    post("/automations", { name: "gitlab:group/project:prod", device: deviceSelector }, "owner-secret"),
     h.env,
   );
   assert.equal(createdResponse.status, 201);
@@ -136,6 +208,8 @@ test("fleet admin provisions independently revocable Automation Client for CI wi
   assert.match(created.client_id, /^svc_[A-Za-z0-9_-]+$/);
   assert.match(created.client_secret, /^herdr_svc_/);
   assert.equal(created.scope, "mcp");
+  assert.equal(created.device_id, deviceSelector);
+  assert.equal(created.device_name, "ci-bound-mac");
 
   const listResponse = await worker.fetch(get("/automations", "owner-secret"), h.env);
   assert.equal(listResponse.status, 200);
@@ -143,6 +217,7 @@ test("fleet admin provisions independently revocable Automation Client for CI wi
   assert.equal(listed.automations.length, 1);
   assert.equal(listed.automations[0].client_id, created.client_id);
   assert.equal(listed.automations[0].name, "gitlab:group/project:prod");
+  assert.equal(listed.automations[0].device_id, deviceSelector);
   assert.equal(listed.automations[0].client_secret, undefined);
 
   const tokenResponse = await worker.fetch(new Request("https://edge.example/oauth/token", {
@@ -207,6 +282,101 @@ test("fleet admin provisions independently revocable Automation Client for CI wi
   assert.equal(existingAccessAfterRevoke.status, 401);
 });
 
+test("automation token routes only to its bound device and cannot discover/route to another", async () => {
+  const h = makeEnv();
+  const oauthStorage = new FakeStorage();
+  const oauth = new OAuthStoreDO({ storage: oauthStorage }, { OAUTH_ISSUER: "https://edge.example" });
+  h.env.OAUTH_STORE_DO = namespace(oauth);
+  h.env.OAUTH_ISSUER = "https://edge.example";
+
+  const boundDevice = await pair(h.env, "auto-bound");
+  const otherDevice = await pair(h.env, "auto-other");
+  const created = await (await worker.fetch(
+    post("/automations", { name: "gitlab:p:prod", device: boundDevice.device_id }, "owner-secret"),
+    h.env,
+  )).json();
+
+  const mintToken = async (secret) => {
+    const resp = await worker.fetch(new Request("https://edge.example/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: created.client_id,
+        client_secret: secret,
+        resource: "https://edge.example/mcp",
+      }),
+    }), h.env);
+    assert.equal(resp.status, 200);
+    return (await resp.json()).access_token;
+  };
+  const token = await mintToken(created.client_secret);
+
+  const call = async (args) => {
+    const resp = await worker.fetch(new Request("https://edge.example/mcp", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 50, method: "tools/call", params: { name: "herdr_call", arguments: args } }),
+    }), h.env);
+    return resp.json();
+  };
+
+  // Explicit use of the bound device remains allowed. Omitted-device default
+  // routing is covered at the handler boundary in mcp-handler.test.mjs.
+  const forwardedBeforeBound = h.forwarded.length;
+  await call({ method: "herdr_mcp.text.read", device: boundDevice.device_id });
+  assert.equal(
+    h.forwarded.length,
+    forwardedBeforeBound + 1,
+    "routing to the bound device reaches the workstation exactly once",
+  );
+
+  // Explicitly selecting another device fails closed with a stable error.
+  const other = await call({ method: "herdr_mcp.text.read", device: otherDevice.device_id });
+  assert.equal(other.result.isError, true);
+  assert.equal(other.result.structuredContent.code, "automation_device_scope_violation");
+  assert.equal(other.result.structuredContent.delivery_state, "not_delivered");
+  assert.equal(h.forwarded.length, forwardedBeforeBound + 1, "cross-device selection must not forward");
+
+  // herdr_devices is filtered to the bound device only.
+  const listResponse = await worker.fetch(new Request("https://edge.example/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 51, method: "tools/call", params: { name: "herdr_devices", arguments: {} } }),
+  }), h.env);
+  const list = await listResponse.json();
+  assert.equal(list.result.structuredContent.scope, "bound_device");
+  assert.equal(list.result.structuredContent.bound_device_id, boundDevice.device_id);
+  assert.equal(list.result.structuredContent.devices.length, 1);
+  assert.equal(list.result.structuredContent.devices[0].device_id, boundDevice.device_id);
+  assert.equal(
+    list.result.structuredContent.devices.some((d) => d.device_id === otherDevice.device_id),
+    false,
+    "automation must never discover another device via herdr_devices",
+  );
+
+  // Automation cannot pair or revoke devices or approve Connectors.
+  const pairDenied = await call({ method: "herdr_mcp.device.pair" });
+  assert.equal(pairDenied.result.structuredContent.code, "fleet_admin_required");
+  const revoke = await call({ method: "herdr_mcp.device.revoke", params: { device_id: otherDevice.device_id, confirm: true } });
+  assert.equal(revoke.result.structuredContent.code, "fleet_admin_required");
+  const approve = await call({ method: "herdr_mcp.connector.approve", params: { request_id: "r", code: "123456" } });
+  assert.equal(approve.result.structuredContent.code, "fleet_admin_required");
+
+  // Revoking the grant immediately fences the already-issued automation JWT.
+  const revokeResp = await worker.fetch(
+    post("/automations/revoke", { client_id: created.client_id }, "owner-secret"),
+    h.env,
+  );
+  assert.equal(revokeResp.status, 200);
+  const after = await worker.fetch(new Request("https://edge.example/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 52, method: "initialize", params: {} }),
+  }), h.env);
+  assert.equal(after.status, 401, "revoked automation grant fences an already-issued access JWT");
+});
+
 test("new Connector requires Worker fleet-admin approval and operator credentials may approve", async () => {
   const h = makeEnv();
   const oauthStorage = new FakeStorage();
@@ -238,7 +408,7 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   const html = await pendingResponse.text();
   const requestId = /const requestId="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
   const resumeToken = /const resumeToken="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
-  const approvalCode = /<p class="code">(\d{6})<\/p>/.exec(html)?.[1];
+  const approvalCode = /<div class="approval-code">(\d{6})<\/div>/.exec(html)?.[1];
   assert.ok(requestId && resumeToken && approvalCode);
 
   const unauthInspect = await worker.fetch(post("/connectors/inspect", { request_id: requestId }), h.env);
@@ -268,9 +438,11 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   assert.ok(redirect.searchParams.get("code"));
 });
 
-test("MCP Connector administration requires an explicit active grant; approved Connectors are equal fleet principals", async () => {
-  let approvalCalls = 0;
-  const oauthStub = {
+test("MCP Connector administration requires fleet-admin; approved Connectors are ordinary principals", async () => {
+  // Even an explicitly active grant for a Connector must NOT be able to
+  // approve/revoke other Connectors. Only an enrolled Device / operator
+  // (dev_bearer / static_bearer / device credential) may administer Connectors.
+  const activeConnectorStub = {
     async fetch(request) {
       const url = new URL(request.url);
       const input = await request.json();
@@ -289,16 +461,12 @@ test("MCP Connector administration requires an explicit active grant; approved C
             scope: "mcp",
             status: "active",
             approved_at_ms: 1,
-            approved_by: "oauth:another-approved-connector",
+            approved_by: "device:dev_01M1TEST000000000000000000",
           },
         }), { status: 200, headers: { "content-type": "application/json" } });
       }
       if (url.pathname === "/internal/oauth/approval/approve" && input.request_id === "req-child") {
-        approvalCalls += 1;
-        return new Response(JSON.stringify({
-          ok: true,
-          record: { client_id: "child-connector", approved_at_ms: 2 },
-        }), { status: 200, headers: { "content-type": "application/json" } });
+        throw new Error("approved Connector must never reach the Connector-approval store");
       }
       return new Response(JSON.stringify({ ok: false, code: "not_found" }), {
         status: 404,
@@ -306,7 +474,7 @@ test("MCP Connector administration requires an explicit active grant; approved C
       });
     },
   };
-  const h = makeEnv({ OAUTH_STORE_DO: namespace(oauthStub), OAUTH_ISSUER: "https://edge.example" });
+  const h = makeEnv({ OAUTH_STORE_DO: namespace(activeConnectorStub), OAUTH_ISSUER: "https://edge.example" });
   const response = await worker.fetch(new Request("https://edge.example/mcp", {
     method: "POST",
     headers: { "content-type": "application/json", authorization: "Bearer oauth-admin-token" },
@@ -325,9 +493,8 @@ test("MCP Connector administration requires an explicit active grant; approved C
   }), h.env);
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.equal(body.result.structuredContent.ok, true);
-  assert.equal(body.result.structuredContent.client_id, "child-connector");
-  assert.equal(approvalCalls, 1);
+  assert.equal(body.result.isError, true);
+  assert.equal(body.result.structuredContent.code, "fleet_admin_required");
 
   const legacyNoGrantStub = {
     async fetch(request) {
@@ -669,7 +836,7 @@ test("pairing minted by one Worker deployment fails closed against another", asy
   assert.equal(sameWorker.status, 200);
 });
 
-test("explicitly approved OAuth Connector can administer the fleet without routing through a workstation", async () => {
+test("approved OAuth Connector is ordinary MCP only and cannot administer the fleet", async () => {
   const oauthStub = {
     async fetch(request) {
       const url = new URL(request.url);
@@ -793,8 +960,8 @@ test("explicitly approved OAuth Connector can administer the fleet without routi
   assert.equal(automationMcpBody.result.isError, true);
   assert.equal(automationMcpBody.result.structuredContent.code, "fleet_admin_required");
 
-  // 4. An explicitly approved Connector creates pairing at the Worker control
-  // plane without forwarding the operation to any workstation.
+  // 4. An explicitly approved Connector is ordinary MCP only: it cannot
+  // create a pairing, revoke a device, or use any REST fleet-admin route.
   const mcpCreate = await worker.fetch(new Request("https://edge.example/mcp", {
     method: "POST",
     headers: {
@@ -814,42 +981,13 @@ test("explicitly approved OAuth Connector can administer the fleet without routi
       },
     }),
   }), env);
-
   assert.equal(mcpCreate.status, 200);
   const mcpBody = await mcpCreate.json();
-  assert.equal(mcpBody.result.isError, undefined);
-  const pairResult = mcpBody.result.structuredContent;
-  assert.equal(pairResult.ok, true);
-  assert.match(pairResult.pairing_id, /^pair_[0-9a-f]{64}$/);
-  assert.match(pairResult.code, /^[0-9]{6}$/);
-  assert.equal(typeof pairResult.expires_at_ms, "number");
-  assert.equal(pairResult.pairing_address, `https://edge.example/pair#${pairResult.pairing_id}`);
-  assert.equal(pairResult.pairing_address.includes(pairResult.code), false, "code must never appear in pairing address URL/fragment");
-  assert.ok(pairResult.instructions.includes("herdr-mcp worker connect"));
-  assert.equal(forwarded.length, 0, "no workstation DO forward may happen during pair creation");
+  assert.equal(mcpBody.result.isError, true);
+  assert.equal(mcpBody.result.structuredContent.code, "fleet_admin_required");
+  assert.equal(forwarded.length, 0, "no workstation DO forward may happen for a denied Connector");
 
-  // 4. New computer consumes pairing via /devices/pairings/consume (unchanged)
-  const consumeResp = await worker.fetch(post("/devices/pairings/consume", {
-    pairing_id: pairResult.pairing_id,
-    code: pairResult.code,
-  }), env);
-  assert.equal(consumeResp.status, 200);
-  const creds = await consumeResp.json();
-  assert.equal(creds.ok, true);
-  assert.match(creds.device_id, /^dev_[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
-  assert.match(creds.credential_id, /^cred_[0-9a-f]{32}$/);
-  assert.match(creds.device_secret, /^devsec_[0-9a-f]{64}$/);
-
-  // Single-use replay fails closed
-  const replay = await worker.fetch(post("/devices/pairings/consume", {
-    pairing_id: pairResult.pairing_id,
-    code: pairResult.code,
-  }), env);
-  assert.equal(replay.status, 401);
-  assert.equal((await replay.json()).code, "pairing_rejected");
-
-  // 5. The same approved Connector can permanently revoke the newly
-  // enrolled immutable device at Edge, without forwarding to any workstation.
+  // 5. The approved Connector cannot revoke a device either.
   const revokeMcp = await worker.fetch(new Request("https://edge.example/mcp", {
     method: "POST",
     headers: {
@@ -864,21 +1002,17 @@ test("explicitly approved OAuth Connector can administer the fleet without routi
         name: "herdr_call",
         arguments: {
           method: "herdr_mcp.device.revoke",
-          params: JSON.stringify({ device_id: creds.device_id, confirm: true }),
+          params: JSON.stringify({ device_id: "dev_01M1TEST000000000000000000", confirm: true }),
         },
       },
     }),
   }), env);
   assert.equal(revokeMcp.status, 200);
   const revokeBody = await revokeMcp.json();
-  assert.equal(revokeBody.result.isError, undefined);
-  assert.equal(revokeBody.result.structuredContent.ok, true);
-  assert.equal(revokeBody.result.structuredContent.revoked, true);
-  assert.equal(revokeBody.result.structuredContent.device_id, creds.device_id);
-  assert.equal(typeof revokeBody.result.structuredContent.revoked_at_ms, "number");
-  assert.deepEqual(forwarded, ["/internal/revoke"], "Edge-local revoke may only use the dedicated WorkstationDO revoke fence, never /internal/forward");
+  assert.equal(revokeBody.result.isError, true);
+  assert.equal(revokeBody.result.structuredContent.code, "fleet_admin_required");
 
-  // 6. The approved Connector can also use the REST fleet-admin route without workstation headers
+  // 6. The approved Connector cannot use the REST fleet-admin route either.
   const restCreate = await worker.fetch(new Request("https://edge.example/devices/pairings", {
     method: "POST",
     headers: {
@@ -887,16 +1021,16 @@ test("explicitly approved OAuth Connector can administer the fleet without routi
     },
     body: JSON.stringify({ ttl_seconds: 120 }),
   }), env);
-  assert.equal(restCreate.status, 200);
-  const restBody = await restCreate.json();
-  assert.equal(restBody.ok, true);
-  assert.match(restBody.pairing_id, /^pair_[0-9a-f]{64}$/);
+  assert.equal(restCreate.status, 401);
+  assert.equal((await restCreate.json()).code, "pairing_admin_required");
 
-  // 7. Invalid input regressions on herdr_call herdr_mcp.device.pair:
+  // 7. Invalid input regressions on herdr_call herdr_mcp.device.pair are still
+  // enforced for a genuine fleet-admin principal (operator dev_bearer).
+  const owner = "owner-secret";
   // (a) Top-level device selector is rejected
   const withDevice = await worker.fetch(new Request("https://edge.example/mcp", {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: "Bearer oauth-chatgpt-token" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${owner}` },
     body: JSON.stringify({
       jsonrpc: "2.0",
       id: 3,
@@ -911,7 +1045,7 @@ test("explicitly approved OAuth Connector can administer the fleet without routi
   // (b) Invalid TTL is rejected
   const badTtl = await worker.fetch(new Request("https://edge.example/mcp", {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: "Bearer oauth-chatgpt-token" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${owner}` },
     body: JSON.stringify({
       jsonrpc: "2.0",
       id: 4,
@@ -926,7 +1060,7 @@ test("explicitly approved OAuth Connector can administer the fleet without routi
   // (c) Invalid name is rejected
   const badName = await worker.fetch(new Request("https://edge.example/mcp", {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: "Bearer oauth-chatgpt-token" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${owner}` },
     body: JSON.stringify({
       jsonrpc: "2.0",
       id: 5,
@@ -941,7 +1075,7 @@ test("explicitly approved OAuth Connector can administer the fleet without routi
   // (d) Unknown parameter key (e.g. ttlSeconds typo) is rejected
   const badKey = await worker.fetch(new Request("https://edge.example/mcp", {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: "Bearer oauth-chatgpt-token" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${owner}` },
     body: JSON.stringify({
       jsonrpc: "2.0",
       id: 6,

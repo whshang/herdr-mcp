@@ -256,13 +256,23 @@ export default {
       const fleetAdmin = await authenticateFleetAdmin(request, env);
       if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
       const parsed = await readBodyBounded(request, 8 * 1024);
-      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.name !== "string") {
+      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.name !== "string" || typeof parsed.value.device !== "string") {
         const code = parsed.ok ? "bad_request" : parsed.code;
         return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
       }
       const name = parsed.value.name.trim();
       if (!name || name.length > 256) return noStoreJsonResponse({ ok: false, code: "invalid_automation_name" }, 400);
-      const result = await createAutomationClient(env, name, fleetAdmin);
+      const deviceSelector = parsed.value.device.trim();
+      if (!deviceSelector) return noStoreJsonResponse({ ok: false, code: "invalid_automation_device" }, 400);
+      const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+      const resolved = await resolveDeviceRouteWithContext(registry, {
+        selector: deviceSelector,
+        legacyWorkstationId: env.DEFAULT_WORKSTATION_ID ?? "dev-ws1",
+      });
+      if (!resolved.ok || !resolved.device_id) {
+        return noStoreJsonResponse({ ok: false, code: "automation_device_not_routable" }, 400);
+      }
+      const result = await createAutomationClient(env, name, fleetAdmin, resolved.device_id, resolved.device_name ?? null);
       return result.ok
         ? noStoreJsonResponse(result, 201)
         : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "oauth_not_configured" ? 503 : 409);
@@ -569,12 +579,10 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
   if (!devAuth.ok) {
     return mcpUnauthorized(env);
   }
-  let mcpFleetPrincipal: string | null = null;
-  if (devAuth.source === "dev_bearer" || devAuth.source === "static_bearer") {
-    mcpFleetPrincipal = `operator:${devAuth.source}`;
-  } else if (devAuth.clientId && await oauthClientHasFleetAuthority(env, devAuth.clientId)) {
-    mcpFleetPrincipal = `oauth:${devAuth.clientId}`;
-  }
+  const mcpFleetPrincipal =
+    devAuth.source === "dev_bearer" || devAuth.source === "static_bearer"
+      ? `operator:${devAuth.source}`
+      : null;
 
   if (request.method === "GET" && isMcpPath) {
     return withMcpCors(createSessionlessMcpProbeResponse({ signal: request.signal }));
@@ -593,6 +601,7 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
       client: {
         userAgent: request.headers.get("user-agent"),
         oauthClientId: devAuth.clientId ?? null,
+        automationDeviceId: devAuth.principalType === "automation" ? (devAuth.deviceId ?? null) : null,
       },
       forward: async (stub: unknown, body: string) => {
         const internal = new Request("https://do.internal/internal/forward", {
@@ -669,18 +678,6 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
           return { ok: false, code: "fleet_admin_required" };
         }
         return revokeConnectorGrant(env, clientId, mcpFleetPrincipal);
-      },
-      listAutomations: async () => {
-        if (!mcpFleetPrincipal) {
-          return { ok: false, code: "fleet_admin_required" };
-        }
-        return listAutomationClients(env);
-      },
-      revokeAutomation: async (clientId) => {
-        if (!mcpFleetPrincipal) {
-          return { ok: false, code: "fleet_admin_required" };
-        }
-        return revokeAutomationClient(env, clientId, mcpFleetPrincipal);
       },
       resolveDevice: async (selector, args) => {
         const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
@@ -814,7 +811,7 @@ async function handleOAuthAdmin(request: Request, env: Env): Promise<Response> {
   return jsonResponse({ ok: false, code: "not_found" }, 404);
 }
 
-async function verifyEdgeAccessToken(env: Env, token: string): Promise<{ ok: boolean; clientId?: string }> {
+async function verifyEdgeAccessToken(env: Env, token: string): Promise<{ ok: boolean; clientId?: string; principalType?: string; deviceId?: string }> {
   const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
   const response = await stub.fetch(new Request("https://oauth.internal/internal/oauth/access/verify", {
     method: "POST",
@@ -824,13 +821,34 @@ async function verifyEdgeAccessToken(env: Env, token: string): Promise<{ ok: boo
   if (!response.ok) return { ok: false };
   const payload = await response.json() as Record<string, unknown>;
   const clientId = typeof payload.client_id === "string" ? payload.client_id : undefined;
-  return clientId ? { ok: true, clientId } : { ok: payload.ok === true };
+  const principalType = typeof payload.principal_type === "string" ? payload.principal_type : undefined;
+  const deviceId = typeof payload.device_id === "string" ? payload.device_id : undefined;
+  if (!clientId) return { ok: false };
+  return {
+    ok: true,
+    clientId,
+    ...(principalType ? { principalType } : {}),
+    ...(deviceId ? { deviceId } : {}),
+  };
 }
 
 async function authenticateEdgeMcpRequest(request: Request, env: Env) {
   return authenticateMcpRequest(request, env, {
     verifyEdgeToken: (token) => verifyEdgeAccessToken(env, token),
+    verifyLegacyClient: (clientId) => verifyLegacyOAuthClientGrantFence(env, clientId),
   });
+}
+
+async function verifyLegacyOAuthClientGrantFence(env: Env, clientId: string): Promise<boolean> {
+  const response = await oauthInternal(env, "/internal/oauth/grant/get", { client_id: clientId });
+  if (response.status === 404) {
+    // Pre-v0.4.6 clients have no grant record and retain ordinary MCP access
+    // until an explicit revoke creates a durable tombstone.
+    return true;
+  }
+  if (!response.ok) return false;
+  const payload = await response.json().catch(() => null) as { record?: { status?: string } } | null;
+  return payload?.record?.status === "active";
 }
 
 /**
@@ -846,18 +864,15 @@ function pairingWorkerContext(env: Env): string {
 /**
  * Worker-owned fleet administration. There is no owner/member device
  * hierarchy: any active enrolled device is an equivalent administration
- * channel. Explicit v0.4.6+ OAuth grants and Worker operator credentials are
- * also accepted. Legacy OAuth tokens without a grant keep ordinary MCP
- * compatibility but never gain fleet-admin authority implicitly.
+ * channel. Worker operator credentials are also accepted. OAuth Connectors,
+ * including explicitly approved v0.4.6+ instances, remain ordinary MCP
+ * principals and never gain fleet administration merely by being approved.
  */
 async function authenticateFleetAdmin(request: Request, env: Env): Promise<string | null> {
   const mcp = await authenticateEdgeMcpRequest(request, env);
   if (mcp.ok) {
     if (mcp.source === "dev_bearer" || mcp.source === "static_bearer") {
       return `operator:${mcp.source}`;
-    }
-    if (mcp.clientId && await oauthClientHasFleetAuthority(env, mcp.clientId)) {
-      return `oauth:${mcp.clientId}`;
     }
   }
   return authenticateFleetDevice(request, env);
@@ -885,14 +900,6 @@ async function authenticateFleetDevice(request: Request, env: Env): Promise<stri
     : null;
 }
 
-async function oauthClientHasFleetAuthority(env: Env, clientId: string | undefined): Promise<boolean> {
-  if (!clientId) return false;
-  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
-  const store = createOAuthPublicStore(stub);
-  const grant = await store.getGrant(clientId);
-  return grant?.status === "active" && grant.principal_type !== "automation";
-}
-
 async function oauthInternal(env: Env, path: string, body: Record<string, unknown>): Promise<Response> {
   const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
   return stub.fetch(new Request(`https://oauth.internal${path}`, {
@@ -906,8 +913,10 @@ async function createAutomationClient(
   env: Env,
   name: string,
   createdBy: string,
+  deviceId: string,
+  deviceName: string | null,
 ): Promise<
-  | { ok: true; action: "automation_create"; client_id: string; client_secret: string; name: string; token_endpoint: string; scope: "mcp" }
+  | { ok: true; action: "automation_create"; client_id: string; client_secret: string; name: string; device_id: string; device_name: string | null; token_endpoint: string; scope: "mcp" }
   | { ok: false; code: string }
 > {
   if (!env.OAUTH_ISSUER) return { ok: false, code: "oauth_not_configured" };
@@ -921,6 +930,8 @@ async function createAutomationClient(
     resource: identity.resource,
     scope: "mcp",
     created_by: createdBy,
+    device_id: deviceId,
+    device_name: deviceName,
     now_ms: Date.now(),
   });
   if (!response.ok) {
@@ -933,6 +944,8 @@ async function createAutomationClient(
     client_id: clientId,
     client_secret: clientSecret,
     name,
+    device_id: deviceId,
+    device_name: deviceName,
     token_endpoint: `${identity.issuer}/oauth/token`,
     scope: "mcp",
   };
