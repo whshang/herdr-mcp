@@ -27,24 +27,22 @@ Each enrolled computer has its own credential and immutable `device_id`. Device 
 
 ## Add a new computer
 
-### 1. Preferred: create the pairing from an existing fleet-admin channel
+### 1. Create the pairing from an enrolled device
 
-In a Herdr WebChat that was explicitly approved by this Worker, simply ask:
+On any computer already enrolled in the fleet, run:
 
-```text
-Generate a Herdr pairing link for my new computer, valid for 10 minutes.
+```bash
+herdr-mcp worker pair
 ```
 
-The Worker can create the pairing at Edge without routing the operation through a workstation. That does not bootstrap authority from nothing: an explicitly approved WebChat, any already-enrolled computer, or a Worker operator credential must already exist. The response should show together:
+`worker pair` is a device/operator fleet action: it requires credentials proving that this machine is already enrolled in the target Worker. It creates the pairing at the Worker control plane without routing the operation through a workstation. The response should show together:
 
 - the pairing address containing a high-entropy pairing id;
 - the single-use 6-digit verification code;
 - the exact expiry time; and
 - the copyable `herdr-mcp worker connect "<pairing-address>"` command.
 
-The normal maximum TTL is 600 seconds. Use the pairing immediately instead of treating it as a durable invitation.
-
-If the current WebChat returns `fleet_admin_required`, use the CLI on any already-enrolled macOS computer in the fleet: `herdr-mcp worker pair` creates the same short-lived pairing and prints the exact UTC expiry as well as the relative validity window. Never run `worker pair` on the fresh computer as a detection probe. If this is the first Herdr Worker and no enrolled/approved fleet principal exists yet, complete first-Worker Cloudflare bootstrap before pairing.
+The normal maximum TTL is 600 seconds. Use the pairing immediately instead of treating it as a durable invitation. Never run `worker pair` on the fresh computer as a detection probe. If this is the first Herdr Worker and no enrolled device exists yet, complete first-Worker Cloudflare bootstrap before pairing.
 
 ### 2. Connect the new computer
 
@@ -86,17 +84,19 @@ herdr-mcp worker rename "<new-device-name>"
 
 `herdr-mcp device rename ...` is an equivalent alias. Rename changes only the human-facing display name; the immutable `device_id`, workstation identity, credential, authorization and scheduling state stay unchanged. Link reconnects do not overwrite an explicit rename. The default/legacy workstation likewise records its local Computer Name when it is first registered.
 
-To permanently remove authorization from another enrolled device, prefer an explicitly approved Herdr WebChat: ask it to list devices, select the exact immutable `device_id`, and permanently revoke that device. The Edge-local action is equivalent to:
+To permanently remove authorization from another enrolled device, run this on any enrolled workstation. First get the immutable `device_id` from `herdr_devices`, then:
+
+```bash
+herdr-mcp worker revoke "<device-id>" --confirm
+```
+
+The device/operator owns fleet administration. This action never accepts a display name; you must use the immutable `device_id`. The Edge-local equivalent is:
 
 ```text
 herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
 ```
 
-This action does not route through a workstation and never accepts a display name. If the WebChat lacks fleet authority, first get the immutable `device_id` from `herdr_devices`, then run this on any enrolled workstation:
-
-```bash
-herdr-mcp worker revoke "<device-id>" --confirm
-```
+This action does not route through a workstation and never accepts a display name.
 
 Revocation is permanent for that device identity and credential: the live Link is disconnected, the old credential can never reconnect, and the revoked tombstone is retained internally to prevent resurrection. Revoked tombstones are hidden from normal fleet/device lists. To add that computer again later, create a new pairing and enroll it as a new device identity.
 
@@ -116,7 +116,6 @@ The joining computer does **not** need:
 - The 6-digit code is single-use and short-lived.
 - Five wrong code attempts permanently lock that pairing session; create a new one instead of retrying indefinitely.
 - The pairing id is high-entropy and stays in the URL fragment so it is not placed in normal HTTP access-log paths.
-- An explicitly approved WebChat may display the one-time code when the user explicitly creates a pairing there. Outside that narrow flow, never persist the code in argv, shell history, Git, ordinary logs, copied transcripts, or unattended automation.
 - Never print or copy the final per-device credential; it belongs in the OS credential store.
 
 ## Recovery

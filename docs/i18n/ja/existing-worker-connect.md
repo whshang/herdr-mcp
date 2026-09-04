@@ -12,15 +12,13 @@
 
 ## ペアリングの仕組み
 
-1. **推奨: 認可済みの ChatGPT / Herdr 会話から直接ペアリングを作成します。** 例えば次のように依頼します:
+1. **推奨: 登録済みのデバイスからペアリングを作成します。** fleet 内の任意の登録済みコンピュータで次を実行します:
 
-   ```text
-   新しいコンピュータ用に、10 分間有効な Herdr ペアリングリンクを生成してください。
+   ```bash
+   herdr-mcp worker pair
    ```
 
-   ChatGPT は Edge 上で直接ペアリングを作成でき、既存ワークステーションがオンラインである必要はありません。結果には、**ペアリングアドレス**、単回使用の **6 桁コード**、**正確な有効期限**、およびコピー可能な `herdr-mcp worker connect "<pairing-address>"` コマンドをまとめて表示します。通常の最大 TTL は 600 秒です。
-
-   CLI fallback として、fleet 内の認可済み macOS コンピュータで `herdr-mcp worker pair` を実行しても同じ短期 pairing を作成できます。CLI も UTC の正確な期限を表示します。
+   `worker pair` は device/operator が管理する fleet アクションであり、このマシンが対象 Worker に登録済みであることを証明する資格情報が必要です。Worker control plane で pairing を作成するため、既存ワークステーションがオンラインである必要はありません。結果には、**ペアリングアドレス**、単回使用の **6 桁コード**、**正確な有効期限**、およびコピー可能な `herdr-mcp worker connect "<pairing-address>"` コマンドをまとめて表示します。通常の最大 TTL は 600 秒です。
 
 2. **新しいコンピュータ**で、Agent が次を実行します:
 
@@ -40,7 +38,6 @@
 
 - 6 桁のコードは、意図された短時間有効なペアリング資格情報です。単回使用で、10 分で期限切れになり、**誤った試行が 5 回**を超えるとセッションは永久にロックされます。
 - ペアリング id は高エントロピーで推測不可能であり、ペアリングアドレス（URL フラグメント）に含まれます。HTTP アクセスログのパスには含まれません。最終的なデバイス秘密情報はペアリングアドレスには決して含まれません。
-- ユーザーが OAuth 認可済み owner 会話で明示的に pairing を作成した場合、その会話には単回使用コードを表示できます。それ以外では、コードを argv、シェル履歴、Git、通常ログ、コピーした transcript、無人自動化に保存しないでください。`echo 123456 | ...` のような方法も使用しません。
 - 最終的なデバイス資格情報は macOS Keychain に属します。印刷またはログ記録しないでください。
 
 ## 検証
@@ -63,17 +60,19 @@ herdr-mcp worker rename "<new-device-name>"
 
 `herdr-mcp device rename ...` も同じ操作です。rename が変更するのは人向けの表示名だけで、不変な `device_id`、workstation identity、資格情報、authorization、scheduling は変わりません。Link の再接続で明示的な rename が上書きされることもありません。default/legacy workstation も最初の登録時にローカル Computer Name を記録します。
 
-別の登録済みデバイスの認可を恒久的に取り消す場合、現在の推奨経路は認可済みの ChatGPT/Herdr Web 会話です。ChatGPT にデバイス一覧を表示させ、対象の不変 `device_id` を選び、そのデバイスを恒久的に revoke させます。Edge-local 操作は次と同等です:
+別の登録済みデバイスの認可を恒久的に取り消す場合、登録済みの任意のワークステーションで実行します。まず `herdr_devices` で不変の `device_id` を確認し、次を実行します:
+
+```bash
+herdr-mcp worker revoke "<device-id>" --confirm
+```
+
+デバイス/オペレーターが fleet 管理を担当します。この操作は display name を受け付けず、不変の `device_id` を使用する必要があります。Edge-local 操作は次と同等です:
 
 ```text
 herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
 ```
 
-この経路はワークステーションのオンライン状態を必要とせず、display name は受け付けません。CLI fallback として、まず `herdr_devices` で不変の `device_id` を確認し、owner ワークステーションで次を実行します:
-
-```bash
-herdr-mcp worker revoke "<device-id>" --confirm
-```
+この経路はワークステーションのオンライン状態を必要とせず、display name は受け付けません。
 
 revoke はそのデバイス identity と資格情報に対して恒久的です。稼働中の Link は切断され、古い資格情報では再接続できません。古い identity の復活を防ぐため内部には最小の revoked tombstone を保持しますが、通常のデバイス一覧には表示しません。後で同じコンピュータを再追加する場合は、新しい pairing で新しいデバイス identity として登録してください。
 
