@@ -18,6 +18,10 @@ test("onboarding resolves first-vs-existing fleet intent before any Cloudflare d
     assert.match(doc, /pairing address/);
     assert.match(doc, /worker pair/);
     assert.match(doc, /worker connect/);
+    // A fresh machine must never probe ownership by running owner-side pair.
+    assert.match(doc, /Never run `herdr-mcp worker pair` on the computer currently being installed|绝不能[^\n]*当前正在安装[^\n]*`herdr-mcp worker pair`/);
+    assert.match(doc, /owner-side|owner 侧/);
+    assert.match(doc, /already enrolled|已经加入该 fleet/);
     // Never deploy a second Worker/R2/Connector or evade ownership with a random suffix.
     assert.match(doc, /second Worker|R2 bucket|R2 桶/);
     assert.match(doc, /do \*\*not\*\* evade[^\n]*random-suffixed Worker|禁止[^\n]*绕过[^\n]*随机后缀 Worker/);

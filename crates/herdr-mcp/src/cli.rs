@@ -94,6 +94,12 @@ pub enum WorkerCommand {
     Revoke {
         device_id: String,
     },
+    ConnectorApprove {
+        request_id: String,
+    },
+    ConnectorRevoke {
+        client_id: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -236,6 +242,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "config" => parse_config(&args[1..]),
         "worker" => parse_worker(&args[1..]),
         "device" => parse_device_alias(&args[1..]),
+        "connector" => parse_connector(&args[1..]),
         "dev" => parse_dev(&args[1..]),
         "candidate" => parse_candidate(&args[1..]),
         "service" => parse_service(&args[1..]),
@@ -525,6 +532,41 @@ fn parse_device_alias(args: &[String]) -> Result<Command, String> {
             "device '{value}' is not implemented yet; supported commands are pair, rename, and revoke"
         )),
         None => Err("device requires pair, rename, or revoke".to_owned()),
+    }
+}
+
+fn parse_connector(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
+        Some("approve") => {
+            let [request_id] = &args[1..] else {
+                return Err("connector approve requires exactly one approval request id; the 6-digit code is entered interactively".to_owned());
+            };
+            if request_id.starts_with('-') || request_id.trim().is_empty() || request_id.len() > 256
+            {
+                return Err("connector approve requires a valid approval request id".to_owned());
+            }
+            Ok(Command::Worker(WorkerCommand::ConnectorApprove {
+                request_id: request_id.clone(),
+            }))
+        }
+        Some("revoke") => {
+            let [client_id, confirm] = &args[1..] else {
+                return Err("connector revoke requires: <client-id> --confirm".to_owned());
+            };
+            if client_id.starts_with('-') || client_id.trim().is_empty() || client_id.len() > 4096 {
+                return Err("connector revoke requires a valid client id".to_owned());
+            }
+            if confirm != "--confirm" {
+                return Err("connector revoke requires --confirm".to_owned());
+            }
+            Ok(Command::Worker(WorkerCommand::ConnectorRevoke {
+                client_id: client_id.clone(),
+            }))
+        }
+        Some(value) => Err(format!(
+            "unknown connector command '{value}' (expected approve or revoke)"
+        )),
+        None => Err("connector requires approve or revoke".to_owned()),
     }
 }
 
@@ -1006,8 +1048,10 @@ User path:\n\
   herdr-mcp doctor\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
-  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS only; v0.4.3 secure pairing — Linux/Windows: unavailable, fail-closed)\n\
+  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS enrolled-owner device only; creates pairing for another computer)\n\
   herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS only; requires Keychain, reads the 6-digit code from an interactive or stdin prompt, never argv)\n\
+  herdr-mcp connector approve <approval-request-id>  (macOS owner device; reads the 6-digit code interactively, never argv)\n\
+  herdr-mcp connector revoke <client-id> --confirm\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|auto|status]\n\
   herdr-mcp extension standalone <install [--ref REF]|status>\n\
   herdr-mcp rollback\n\
@@ -1669,6 +1713,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_connector_owner_approval_without_accepting_code_on_argv() {
+        assert_eq!(
+            parse(args(&["connector", "approve", "req_abc"]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::ConnectorApprove {
+                request_id: "req_abc".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(args(&["connector", "revoke", "dcr-client", "--confirm"]))
+                .unwrap()
+                .command,
+            Command::Worker(WorkerCommand::ConnectorRevoke {
+                client_id: "dcr-client".to_owned(),
+            })
+        );
+        assert!(parse(args(&["connector", "approve", "req_abc", "123456"])).is_err());
+        assert!(parse(args(&["connector", "approve", "--code", "123456"])).is_err());
+        assert!(parse(args(&["connector", "revoke", "dcr-client"])).is_err());
+    }
+
+    #[test]
     fn parses_instance_flag_before_command() {
         let parsed = parse(args(&["--instance", "uat", "status"])).unwrap();
         assert_eq!(parsed.instance.as_deref(), Some("uat"));
@@ -1698,6 +1765,8 @@ mod tests {
             "herdr-mcp doctor",
             "herdr-mcp permissions",
             "herdr-mcp scan",
+            "herdr-mcp connector approve",
+            "herdr-mcp connector revoke",
             "herdr-mcp update",
             "herdr-mcp rollback",
             "herdr-mcp uninstall",

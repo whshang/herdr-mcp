@@ -24,6 +24,8 @@ Agent 直接读取并执行本文，不需要用户再把本文包装成一段�
 
 - 如果用户已经提供 Herdr pairing address，这台电脑就是加入已有 Worker。安装/验证本机 runtime 与 macOS 权限后，执行 `herdr-mcp worker connect "<pairing-address>"`；CLI 默认使用 macOS Computer Name，只有用户明确要求不同的初始显示名时才传 `--name`。跳过 Worker/R2/Connector 创建。
 - 如果用户明确说已有另一台 Herdr 电脑但还没有 pairing address，优先直接在已经授权的 ChatGPT/Herdr 对话中调用 Edge-local `herdr_mcp.device.pair` 创建短期配对；不要求旧电脑在线。把配对地址、一次性 6 位验证码、精确过期时间一起展示。已授权旧电脑上的 `herdr-mcp worker pair` 保留为 CLI fallback。新电脑用 `worker connect` 消费 pairing，并复用已有公网 MCP/OAuth origin。
+- **绝不能**在当前正在安装的这台新电脑上执行 `herdr-mcp worker pair` 来“探测是否已有 fleet”。`worker pair` 是 **owner 侧**操作，必须先证明本机已经加入该 fleet。全新机器如果既没有已登记的 device identity，也没有已有 Edge origin，应 fail closed，明确提示“首台设备初始化”或“用 pairing address 执行 `worker connect`”，而不是暴露缺失 LaunchAgent/Keychain 的底层错误。
+- 如果用户无法提供 Cloudflare Account/origin 信息，同时也没有任何已经授权的旧设备或已授权 WebChat 可以生成 pairing，就停止并只问下面那一个 fleet ownership 问题。不要猜成“已有 fleet”，也不要执行 `worker pair`。如果用户选择**加入已有 Worker**，必须先从已授权来源拿到 pairing；如果选择**创建第一台 Worker**，才继续 Cloudflare bootstrap，并仅在确实需要 Cloudflare 授权时暂停。
 - 如果用户要求永久移除一台旧设备，也优先在同一个已授权 ChatGPT/Herdr 网页对话里完成：先用 `herdr_devices` 列出设备，以不可变 `device_id` 选中目标，再调用 Edge-local `herdr_mcp.device.revoke` 并传 `confirm=true`。绝不按 display name revoke；旧设备无需在线。`herdr-mcp worker revoke <device-id> --confirm` 保留为 CLI fallback。
 - 只有用户明确确认这是第一台 Herdr 电脑/第一个 fleet，才继续下面的 first-owner Cloudflare 路径。
 - 如果意图不清楚，只问一个所有权问题：**创建第一个 Herdr Worker，还是加入已有 Herdr Worker？** 禁止根据本机缺少凭据自行推断。
@@ -125,7 +127,7 @@ Token 可以验证为**有效**（`/user/tokens/verify` 返回 active）却仍�
 
 按权限诊断，不要无根据扩大权限；补齐权限之前不要重试 mutation。
 
-**部署前的已有 Worker 检测。** 拿到 `ACCOUNT_ID` 后先列 `GET /client/v4/accounts/<ACCOUNT_ID>/workers/scripts`。如果那里已有 Herdr Worker——或用户已有 Herdr 的 ChatGPT Connector——立即停止部署路径，切换到[多设备控制](existing-worker-connect.md)的既有 fleet 流程（owner 电脑 `worker pair`，本机 `worker connect`）。只有 §0 得到明确「第一台」答复后才允许部署新 Worker。
+**部署前的已有 Worker 检测。** 拿到 `ACCOUNT_ID` 后先列 `GET /client/v4/accounts/<ACCOUNT_ID>/workers/scripts`。如果那里已有 Herdr Worker——或用户已有能够创建 pairing 的已授权 Herdr WebChat/Connector——立即停止部署路径，切换到[多设备控制](existing-worker-connect.md)的既有 fleet 流程（从已授权来源创建 pairing，本机执行 `worker connect`）。`worker pair` 只是在**已经登记的 owner 电脑**上的 fallback，绝不能拿当前这台全新机器执行它来探测 fleet。只有 §0 得到明确「第一台」答复后才允许部署新 Worker。
 
 选定后只把 account ID 放在当前部署进程环境：
 

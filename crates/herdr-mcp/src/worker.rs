@@ -45,7 +45,7 @@ use url::Url;
 #[cfg(any(target_os = "macos", test))]
 use std::os::unix::fs::OpenOptionsExt;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const LEGACY_LINK_KEYCHAIN_SERVICE: &str = "herdr-edge-prod-link-secret";
 #[cfg(target_os = "macos")]
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -106,6 +106,8 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
         }
         WorkerCommand::Rename { name } => rename_current_device(&paths, &name),
         WorkerCommand::Revoke { device_id } => revoke_device(&paths, &device_id),
+        WorkerCommand::ConnectorApprove { request_id } => approve_connector(&paths, &request_id),
+        WorkerCommand::ConnectorRevoke { client_id } => revoke_connector(&paths, &client_id),
     }
 }
 
@@ -321,6 +323,131 @@ fn revoke_device(paths: &RuntimePaths, device_id: &str) -> Result<ExitCode, Stri
             "revoked_at_ms": payload.get("revoked_at_ms").cloned().unwrap_or(Value::Null),
         }))
         .map_err(|error| format!("cannot encode device revoke result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn approve_connector(_paths: &RuntimePaths, _request_id: &str) -> Result<ExitCode, String> {
+    Err(
+        "connector approval currently requires the macOS enrolled-device credential backend"
+            .to_owned(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn approve_connector(paths: &RuntimePaths, request_id: &str) -> Result<ExitCode, String> {
+    if request_id.trim().is_empty() || request_id.len() > 256 {
+        return Err("connector approval request id is invalid".to_owned());
+    }
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_owner_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let inspect = client()?
+        .post(endpoint(&identity.edge_origin, "/connectors/inspect")?)
+        .headers(headers.clone())
+        .json(&json!({ "request_id": request_id }))
+        .send()
+        .map_err(|error| format!("cannot inspect Connector approval: {error}"))?;
+    let details = parse_json_response(inspect, "connector approval inspection")?;
+    eprintln!("Connector approval request:");
+    eprintln!(
+        "  client: {} ({})",
+        details
+            .get("client_name")
+            .and_then(Value::as_str)
+            .unwrap_or("unnamed client"),
+        details
+            .get("client_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    );
+    eprintln!(
+        "  redirect: {}",
+        details
+            .get("redirect_uri")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    );
+    eprintln!(
+        "  resource/scope: {} / {}",
+        details
+            .get("resource")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        details
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    );
+    if let Some(expires_at_ms) = details.get("expires_at_ms").and_then(Value::as_u64)
+        && let Some(expires_at) = format_pairing_expiry(expires_at_ms)
+    {
+        eprintln!("  expires: {expires_at}");
+    }
+    let code = read_pairing_code_tty()?;
+    let response = client()?
+        .post(endpoint(&identity.edge_origin, "/connectors/approve")?)
+        .headers(headers)
+        .json(&json!({ "request_id": request_id, "code": code }))
+        .send()
+        .map_err(|error| format!("cannot approve Connector: {error}"))?;
+    let payload = parse_json_response(response, "connector approval")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "connector_approve",
+            "client_id": payload.get("client_id").cloned().unwrap_or(Value::Null),
+            "approved_at_ms": payload.get("approved_at_ms").cloned().unwrap_or(Value::Null),
+        }))
+        .map_err(|error| format!("cannot encode connector approval result: {error}"))?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn revoke_connector(_paths: &RuntimePaths, _client_id: &str) -> Result<ExitCode, String> {
+    Err(
+        "connector revoke currently requires the macOS enrolled-device credential backend"
+            .to_owned(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn revoke_connector(paths: &RuntimePaths, client_id: &str) -> Result<ExitCode, String> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() || client_id.len() > 4096 {
+        return Err("connector client id is invalid".to_owned());
+    }
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    let identity = resolve_owner_link_identity(paths, &config)?;
+    let mut headers = bearer_headers(&identity.credential)?;
+    headers.insert(
+        "x-herdr-workstation",
+        HeaderValue::from_str(&identity.workstation_id)
+            .map_err(|_| "current workstation identity is not a valid HTTP header".to_owned())?,
+    );
+    let response = client()?
+        .post(endpoint(&identity.edge_origin, "/connectors/revoke")?)
+        .headers(headers)
+        .json(&json!({ "client_id": client_id }))
+        .send()
+        .map_err(|error| format!("cannot revoke Connector: {error}"))?;
+    let payload = parse_json_response(response, "connector revoke")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "action": "connector_revoke",
+            "client_id": payload.get("client_id").cloned().unwrap_or(Value::String(client_id.to_owned())),
+        }))
+        .map_err(|error| format!("cannot encode connector revoke result: {error}"))?
     );
     Ok(ExitCode::SUCCESS)
 }
@@ -736,27 +863,26 @@ fn resolve_owner_link_identity(
     paths: &RuntimePaths,
     config: &Config,
 ) -> Result<OwnerLinkIdentity, String> {
-    let plist_env = production_link_environment()?;
-    let workstation_id = config
-        .edge_device_id
-        .clone()
-        .or_else(|| plist_env.get("HERDR_WORKSTATION_ID").cloned())
-        .ok_or_else(|| "production Link does not expose a workstation identity".to_owned())?;
-    let keychain_service = config
-        .edge_link_keychain_service()
-        .or_else(|| plist_env.get("HERDR_LINK_KEYCHAIN_SERVICE").cloned())
-        .unwrap_or_else(|| LEGACY_LINK_KEYCHAIN_SERVICE.to_owned());
-    let edge_origin = match config.edge_public_origin.clone() {
-        Some(origin) => normalize_edge_origin(&origin)?,
-        None => {
-            let edge_url = plist_env.get("HERDR_EDGE_URL").ok_or_else(|| {
-                "configure [edge].public_origin before creating a pairing".to_owned()
-            })?;
-            origin_from_ws_url(edge_url)?
-        }
+    // A current enrolled device has both the canonical device id and Edge
+    // origin in config, so it must not depend on a LaunchAgent plist merely to
+    // create another short-lived pairing. Older installs may still need the
+    // production Link environment as a compatibility fallback.
+    let needs_legacy_link_fallback =
+        config.edge_device_id.is_none() || config.edge_public_origin.is_none();
+    let plist_env = if needs_legacy_link_fallback {
+        production_link_environment_if_present()?
+    } else {
+        None
     };
+    let (workstation_id, keychain_service, edge_origin) =
+        resolve_owner_link_fields(config, plist_env.as_ref())?;
     let account = current_account()?;
-    let credential = crate::macos_credential_helper::load(&keychain_service, &account)?;
+    let credential =
+        crate::macos_credential_helper::load(&keychain_service, &account).map_err(|error| {
+            owner_device_required_error(&format!(
+                "the enrolled owner credential is unavailable: {error}"
+            ))
+        })?;
     let _ = paths;
     Ok(OwnerLinkIdentity {
         edge_origin,
@@ -766,7 +892,8 @@ fn resolve_owner_link_identity(
 }
 
 #[cfg(target_os = "macos")]
-fn production_link_environment() -> Result<std::collections::BTreeMap<String, String>, String> {
+fn production_link_environment_if_present()
+-> Result<Option<std::collections::BTreeMap<String, String>>, String> {
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "HOME is required to locate the production Link plist".to_owned())?;
@@ -774,6 +901,16 @@ fn production_link_environment() -> Result<std::collections::BTreeMap<String, St
         .join("Library")
         .join("LaunchAgents")
         .join(format!("{LINK_PROD_LABEL}.plist"));
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect production Link plist {}: {error}",
+                path.display()
+            ));
+        }
+    }
     let root = plist::Value::from_file(&path).map_err(|error| {
         format!(
             "cannot read production Link plist {}: {error}",
@@ -785,14 +922,57 @@ fn production_link_environment() -> Result<std::collections::BTreeMap<String, St
         .and_then(|dict| dict.get("EnvironmentVariables"))
         .and_then(plist::Value::as_dictionary)
         .ok_or_else(|| "production Link plist has no EnvironmentVariables".to_owned())?;
-    Ok(env_dict
-        .iter()
-        .filter_map(|(key, value)| {
-            value
-                .as_string()
-                .map(|value| (key.clone(), value.to_owned()))
-        })
-        .collect())
+    Ok(Some(
+        env_dict
+            .iter()
+            .filter_map(|(key, value)| {
+                value
+                    .as_string()
+                    .map(|value| (key.clone(), value.to_owned()))
+            })
+            .collect(),
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn owner_device_required_error(reason: &str) -> String {
+    format!(
+        "`herdr-mcp worker pair` requires an already-enrolled Herdr owner device; {reason}. \
+On a new computer joining an existing fleet, use `herdr-mcp worker connect <pairing-address>` with a pairing created by an already-authorized device or WebChat. \
+If this is the first Herdr device, complete the first-owner Cloudflare bootstrap instead of running `worker pair`."
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn resolve_owner_link_fields(
+    config: &Config,
+    plist_env: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<(String, String, String), String> {
+    let workstation_id = config
+        .edge_device_id
+        .clone()
+        .or_else(|| plist_env.and_then(|env| env.get("HERDR_WORKSTATION_ID").cloned()))
+        .ok_or_else(|| {
+            owner_device_required_error("no enrolled device identity is present on this machine")
+        })?;
+    let keychain_service = config
+        .edge_link_keychain_service()
+        .or_else(|| plist_env.and_then(|env| env.get("HERDR_LINK_KEYCHAIN_SERVICE").cloned()))
+        .unwrap_or_else(|| LEGACY_LINK_KEYCHAIN_SERVICE.to_owned());
+    let edge_origin = match config.edge_public_origin.clone() {
+        Some(origin) => normalize_edge_origin(&origin)?,
+        None => {
+            let edge_url = plist_env
+                .and_then(|env| env.get("HERDR_EDGE_URL"))
+                .ok_or_else(|| {
+                    owner_device_required_error(
+                        "no existing fleet Cloudflare/Edge origin is present on this machine",
+                    )
+                })?;
+            origin_from_ws_url(edge_url)?
+        }
+    };
+    Ok((workstation_id, keychain_service, edge_origin))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1112,6 +1292,58 @@ mod tests {
             origin_from_ws_url("wss://herdr.example.com/ws?ignored=1").unwrap(),
             "https://herdr.example.com"
         );
+    }
+
+    #[test]
+    fn fresh_machine_cannot_be_mistaken_for_pairing_owner() {
+        let error = resolve_owner_link_fields(&Config::default(), None).unwrap_err();
+        assert!(error.contains("requires an already-enrolled Herdr owner device"));
+        assert!(error.contains("worker connect <pairing-address>"));
+        assert!(error.contains("first-owner Cloudflare bootstrap"));
+        assert!(!error.contains("dev.herdr-mcp.link-prod.plist"));
+        assert!(!error.contains("Io("));
+    }
+
+    #[test]
+    fn enrolled_config_does_not_require_link_plist_for_owner_identity() {
+        let mut config = Config::default();
+        config
+            .set_edge_device_id("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .unwrap();
+        config
+            .set_edge_public_origin("https://edge.example")
+            .unwrap();
+
+        let (device_id, keychain_service, origin) =
+            resolve_owner_link_fields(&config, None).unwrap();
+        assert_eq!(device_id, "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(
+            keychain_service,
+            "herdr-edge-link-dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        );
+        assert_eq!(origin, "https://edge.example");
+    }
+
+    #[test]
+    fn legacy_owner_can_still_resolve_from_production_link_environment() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "HERDR_WORKSTATION_ID".to_owned(),
+            "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        );
+        env.insert(
+            "HERDR_EDGE_URL".to_owned(),
+            "wss://edge.example/ws/dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        );
+        env.insert(
+            "HERDR_LINK_KEYCHAIN_SERVICE".to_owned(),
+            "legacy-owner-service".to_owned(),
+        );
+        let (device_id, keychain_service, origin) =
+            resolve_owner_link_fields(&Config::default(), Some(&env)).unwrap();
+        assert_eq!(device_id, "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(keychain_service, "legacy-owner-service");
+        assert_eq!(origin, "https://edge.example");
     }
 
     #[test]

@@ -40,6 +40,7 @@
 
 import {
   OAUTH_SCOPE,
+  hashOAuthApprovalCode,
   hashOpaqueToken,
   mcpServerCardMetadata,
   normalizeResource,
@@ -53,7 +54,12 @@ import {
   verifyChatgptPrivateKeyJwt,
   verifyPkceS256,
 } from "./oauth-token-crypto.js";
-import type { OAuthClientRecord, OAuthCodeRecord } from "./oauth-store-do.js";
+import type {
+  OAuthApprovalRecord,
+  OAuthClientRecord,
+  OAuthCodeRecord,
+  OAuthConnectorGrantRecord,
+} from "./oauth-store-do.js";
 import { MCP_SERVER_VERSION } from "./version.js";
 
 // ---------------------------------------------------------------------------
@@ -69,6 +75,14 @@ export interface DoStub {
 export type ConsumeCodeResult =
   | { ok: true; record: OAuthCodeRecord }
   | { ok: false; code: "not_found" | "expired" };
+
+export type ConsumeApprovalResult =
+  | { ok: true; record: OAuthApprovalRecord }
+  | { ok: false; code: "not_found" | "expired" | "pending" | "locked" | "invalid_resume" };
+
+export type ApproveApprovalResult =
+  | { ok: true; record: OAuthApprovalRecord }
+  | { ok: false; code: "not_found" | "expired" | "invalid_code" | "locked" };
 
 /** Public token response — identical shape to src/oauth.ts `issueTokens`. */
 export interface IssuedTokenPair {
@@ -100,6 +114,12 @@ export interface OAuthPublicStore {
   putClient(clientId: string, record: OAuthClientRecord): Promise<boolean>;
   putCode(hash: string, record: OAuthCodeRecord, nowMs: number): Promise<boolean>;
   consumeCode(hash: string, nowMs: number): Promise<ConsumeCodeResult>;
+  putApproval(requestId: string, record: OAuthApprovalRecord, nowMs: number): Promise<boolean>;
+  getApproval(requestId: string, nowMs: number): Promise<OAuthApprovalRecord | null>;
+  approveApproval(requestId: string, codeHash: string, approver: string, nowMs: number): Promise<ApproveApprovalResult>;
+  consumeApproval(requestId: string, resumeHash: string, nowMs: number): Promise<ConsumeApprovalResult>;
+  getGrant(clientId: string): Promise<OAuthConnectorGrantRecord | null>;
+  revokeGrant(clientId: string, revokedBy: string, nowMs: number): Promise<boolean>;
   issueTokens(input: TokenIssueInput): Promise<IssuedTokenPair | null>;
   exchangeRefresh(input: RefreshExchangeInput): Promise<IssuedTokenPair | null>;
 }
@@ -108,6 +128,8 @@ export interface OAuthPublicOptions {
   /** Exact production issuer/resource identity (see createOAuthIdentity). */
   identity: OAuthEdgeIdentity;
   store: OAuthPublicStore;
+  /** Existing deployment secret used only to HMAC short owner-approval codes. */
+  approvalSecret: string;
   /** Injected fetch for CIMD metadata + ChatGPT JWKS (default globalThis.fetch). */
   fetchFn?: typeof globalThis.fetch;
   /** Injectable clock, default Date.now. */
@@ -131,6 +153,7 @@ const DEFAULT_SERVER_VERSION = MCP_SERVER_VERSION;
 const DEFAULT_ACCESS_TTL_S = 86400;
 const DEFAULT_REFRESH_TTL_S = 2592000; // 30 days
 const DEFAULT_CODE_TTL_MS = 5 * 60_000;
+const DEFAULT_APPROVAL_TTL_MS = 10 * 60_000;
 const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
 const DEFAULT_MAX_QUERY_BYTES = 16 * 1024;
 const DEFAULT_MAX_PARAM_BYTES = 4096;
@@ -165,6 +188,7 @@ const REGISTER_PATHS = new Set<string>([
 
 const MCP_JSON_PATH = "/.well-known/mcp.json";
 const AUTHORIZE_PATH = "/oauth/authorize";
+const AUTHORIZE_POLL_PATH = "/oauth/authorize/poll";
 const TOKEN_PATH = "/oauth/token";
 
 function isOwnedPath(path: string): boolean {
@@ -174,6 +198,7 @@ function isOwnedPath(path: string): boolean {
     REGISTER_PATHS.has(path) ||
     path === MCP_JSON_PATH ||
     path === AUTHORIZE_PATH ||
+    path === AUTHORIZE_POLL_PATH ||
     path === TOKEN_PATH
   );
 }
@@ -217,6 +242,74 @@ function randomHex(bytes: number): string {
   return Array.from(buf)
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+function randomApprovalCode(): string {
+  const max = 0x1_0000_0000;
+  const bucket = 1_000_000;
+  const limit = Math.floor(max / bucket) * bucket;
+  const value = new Uint32Array(1);
+  do {
+    crypto.getRandomValues(value);
+  } while (value[0] >= limit);
+  return String(value[0] % bucket).padStart(6, "0");
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function approvalPage(input: {
+  issuer: string;
+  requestId: string;
+  code: string;
+  resumeToken: string;
+  expiresAtMs: number;
+  clientName?: string;
+}): Response {
+  const poll = `${input.issuer}${AUTHORIZE_POLL_PATH}`;
+  const expiresAt = new Date(input.expiresAtMs).toISOString();
+  const title = input.clientName ? `Approve ${input.clientName}` : "Approve Herdr Connector";
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>body{font:16px system-ui,sans-serif;max-width:680px;margin:10vh auto;padding:0 24px;color:#171717}code{font-size:1.05em;word-break:break-all}.code{font-size:2rem;letter-spacing:.18em;font-weight:700}.muted{color:#666}</style></head>
+<body><h1>${escapeHtml(title)}</h1>
+<p>This Connector is waiting for approval from an already trusted Herdr owner.</p>
+<p>Request ID:<br><code>${escapeHtml(input.requestId)}</code></p>
+<p>Approval code:</p><p class="code">${escapeHtml(input.code)}</p>
+<p>On an already-enrolled owner computer, run:<br><code>herdr-mcp connector approve ${escapeHtml(input.requestId)}</code><br>and enter the six-digit code when prompted. You may also ask an already-authorized Herdr WebChat that has connector-approval authority to approve this request.</p>
+<p class="muted">Expires ${escapeHtml(expiresAt)}. Do not enter this code into an untrusted site.</p>
+<p id="status">Waiting for approval…</p>
+<script>
+const endpoint=${JSON.stringify(poll)};
+const requestId=${JSON.stringify(input.requestId)};
+const resumeToken=${JSON.stringify(input.resumeToken)};
+async function poll(){
+  try{
+    const u=new URL(endpoint);u.searchParams.set('request_id',requestId);u.searchParams.set('resume_token',resumeToken);
+    const r=await fetch(u.toString(),{cache:'no-store'});const p=await r.json();
+    if(p.status==='approved'&&p.redirect){location.replace(p.redirect);return;}
+    if(p.status==='pending'){setTimeout(poll,1500);return;}
+    document.getElementById('status').textContent=p.message||'Approval failed or expired.';
+  }catch{setTimeout(poll,2500)}
+}poll();
+</script></body></html>`;
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+    },
+  });
 }
 
 function firstOf(v: unknown): string {
@@ -459,6 +552,7 @@ async function authenticateClient(
 interface HandlerCtx {
   identity: OAuthEdgeIdentity;
   store: OAuthPublicStore;
+  approvalSecret: string;
   fetchFn: typeof globalThis.fetch;
   nowMs: () => number;
   accessTtlSec: number;
@@ -556,9 +650,43 @@ async function handleRegister(request: Request, ctx: HandlerCtx): Promise<Respon
   );
 }
 
+async function issueAuthorizationRedirect(
+  ctx: HandlerCtx,
+  input: {
+    clientId: string;
+    redirectUri: string;
+    codeChallenge: string;
+    resource: string;
+    state: string;
+    nowMs: number;
+  },
+): Promise<Response> {
+  const code = randomBase64UrlToken();
+  const codeHash = await hashOpaqueToken(code);
+  const persisted = await ctx.store.putCode(
+    codeHash,
+    {
+      client_id: input.clientId,
+      redirect_uri: input.redirectUri,
+      code_challenge: input.codeChallenge,
+      resource: input.resource,
+      expires_at: input.nowMs + ctx.codeTtlMs,
+    },
+    input.nowMs,
+  );
+  if (!persisted) return serverError(ctx, "authorization code issuance failed");
+  const params = new URLSearchParams({ code, iss: ctx.identity.issuer });
+  if (input.state) params.set("state", input.state);
+  const sep = input.redirectUri.includes("?") ? "&" : "?";
+  return new Response(null, {
+    status: 302,
+    headers: { ...ctx.cors, location: `${input.redirectUri}${sep}${params.toString()}` },
+  });
+}
+
 /**
- * Authorization endpoint (auto-completes; RFC 9207 `iss` on success and error
- * redirects). Requires registered client, allowlisted redirect_uri, PKCE S256.
+ * Authorization endpoint. Registered/DCR clients do not self-authorize: an
+ * unknown grant becomes a short-lived pending owner-approval request.
  */
 async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
   if (url.search.length > ctx.maxQueryBytes) {
@@ -630,29 +758,79 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
     return redirectError("invalid_target", "unsupported resource");
   }
 
-  const code = randomBase64UrlToken();
-  const codeHash = await hashOpaqueToken(code);
-  const persisted = await ctx.store.putCode(
-    codeHash,
+  const existingGrant = await ctx.store.getGrant(clientId);
+  if (existingGrant?.status === "active" && existingGrant.resource === resource && existingGrant.scope === OAUTH_SCOPE) {
+    return issueAuthorizationRedirect(ctx, {
+      clientId,
+      redirectUri,
+      codeChallenge,
+      resource,
+      state,
+      nowMs,
+    });
+  }
+
+  const requestId = randomBase64UrlToken();
+  const approvalCode = randomApprovalCode();
+  const resumeToken = randomBase64UrlToken();
+  const expiresAtMs = nowMs + DEFAULT_APPROVAL_TTL_MS;
+  const persisted = await ctx.store.putApproval(
+    requestId,
     {
       client_id: clientId,
       redirect_uri: redirectUri,
       code_challenge: codeChallenge,
       resource,
-      expires_at: nowMs + ctx.codeTtlMs,
+      scope: OAUTH_SCOPE,
+      state,
+      approval_code_hash: await hashOAuthApprovalCode(ctx.approvalSecret, requestId, approvalCode),
+      resume_hash: await hashOpaqueToken(`${requestId}:${resumeToken}`),
+      created_at_ms: nowMs,
+      expires_at_ms: expiresAtMs,
+      attempts: 0,
+      status: "pending",
     },
     nowMs,
   );
-  if (!persisted) {
-    return ctx.json(
-      { error: "server_error", error_description: "authorization code issuance failed" },
-      500,
-      { "cache-control": "no-store" },
-    );
+  if (!persisted) return serverError(ctx, "connector approval request creation failed");
+  return approvalPage({
+    issuer: ctx.identity.issuer,
+    requestId,
+    code: approvalCode,
+    resumeToken,
+    expiresAtMs,
+    clientName: client.client_name,
+  });
+}
+
+async function handleAuthorizePoll(url: URL, ctx: HandlerCtx): Promise<Response> {
+  const requestId = url.searchParams.get("request_id") ?? "";
+  const resumeToken = url.searchParams.get("resume_token") ?? "";
+  if (!requestId || !resumeToken || requestId.length > ctx.maxParamBytes || resumeToken.length > ctx.maxParamBytes) {
+    return ctx.json({ status: "error", message: "invalid approval resume request" }, 400, { "cache-control": "no-store" });
   }
-  const params = new URLSearchParams({ code, iss: ctx.identity.issuer }); // RFC 9207
-  if (state) params.set("state", state);
-  return redirect(params);
+  const nowMs = ctx.nowMs();
+  const result = await ctx.store.consumeApproval(
+    requestId,
+    await hashOpaqueToken(`${requestId}:${resumeToken}`),
+    nowMs,
+  );
+  if (!result.ok) {
+    if (result.code === "pending") return ctx.json({ status: "pending" }, 202, { "cache-control": "no-store" });
+    const status = result.code === "invalid_resume" ? 403 : result.code === "locked" ? 423 : 410;
+    return ctx.json({ status: "error", code: result.code, message: "approval failed, expired, or was already consumed" }, status, { "cache-control": "no-store" });
+  }
+  const redirect = await issueAuthorizationRedirect(ctx, {
+    clientId: result.record.client_id,
+    redirectUri: result.record.redirect_uri,
+    codeChallenge: result.record.code_challenge,
+    resource: result.record.resource,
+    state: result.record.state,
+    nowMs,
+  });
+  const location = redirect.headers.get("location");
+  if (!location) return serverError(ctx, "authorization redirect creation failed");
+  return ctx.json({ status: "approved", redirect: location }, 200, { "cache-control": "no-store" });
 }
 
 /** RFC 6749 token endpoint: authorization_code + refresh_token (rotating). */
@@ -835,6 +1013,7 @@ export async function handleOAuthPublic(
   const hctx: HandlerCtx = {
     identity,
     store,
+    approvalSecret: options.approvalSecret,
     fetchFn,
     nowMs,
     accessTtlSec,
@@ -870,6 +1049,9 @@ export async function handleOAuthPublic(
     }
     if (path === AUTHORIZE_PATH) {
       return handleAuthorize(url, hctx);
+    }
+    if (path === AUTHORIZE_POLL_PATH) {
+      return handleAuthorizePoll(url, hctx);
     }
     return null;
   }
@@ -941,6 +1123,68 @@ export function createOAuthPublicStore(stub: DoStub): OAuthPublicStore {
       }
       const data = (await resp.json()) as { ok?: boolean; record?: OAuthCodeRecord };
       return data.record ? { ok: true, record: data.record } : { ok: false, code: "not_found" };
+    },
+    async putApproval(requestId, record, nowMs) {
+      const resp = await internal("/internal/oauth/approval/put", {
+        request_id: requestId,
+        record,
+        now_ms: nowMs,
+      });
+      return resp.ok;
+    },
+    async getApproval(requestId, nowMs) {
+      const resp = await internal("/internal/oauth/approval/get", {
+        request_id: requestId,
+        now_ms: nowMs,
+      });
+      if (!resp.ok) return null;
+      const data = (await resp.json()) as { ok?: boolean; record?: OAuthApprovalRecord };
+      return data.record ?? null;
+    },
+    async approveApproval(requestId, codeHash, approver, nowMs) {
+      const resp = await internal("/internal/oauth/approval/approve", {
+        request_id: requestId,
+        code_hash: codeHash,
+        approver,
+        now_ms: nowMs,
+      });
+      if (!resp.ok) {
+        const data = (await resp.json().catch(() => null)) as { code?: string } | null;
+        const allowed = new Set(["expired", "invalid_code", "locked"]);
+        const code = data?.code && allowed.has(data.code) ? data.code : "not_found";
+        return { ok: false, code } as ApproveApprovalResult;
+      }
+      const data = (await resp.json()) as { ok?: boolean; record?: OAuthApprovalRecord };
+      return data.record ? { ok: true, record: data.record } : { ok: false, code: "not_found" };
+    },
+    async consumeApproval(requestId, resumeHash, nowMs) {
+      const resp = await internal("/internal/oauth/approval/consume", {
+        request_id: requestId,
+        resume_hash: resumeHash,
+        now_ms: nowMs,
+      });
+      if (!resp.ok) {
+        const data = (await resp.json().catch(() => null)) as { code?: string } | null;
+        const allowed = new Set(["expired", "pending", "locked", "invalid_resume"]);
+        const code = data?.code && allowed.has(data.code) ? data.code : "not_found";
+        return { ok: false, code } as ConsumeApprovalResult;
+      }
+      const data = (await resp.json()) as { ok?: boolean; record?: OAuthApprovalRecord };
+      return data.record ? { ok: true, record: data.record } : { ok: false, code: "not_found" };
+    },
+    async getGrant(clientId) {
+      const resp = await internal("/internal/oauth/grant/get", { client_id: clientId });
+      if (!resp.ok) return null;
+      const data = (await resp.json()) as { ok?: boolean; record?: OAuthConnectorGrantRecord };
+      return data.record ?? null;
+    },
+    async revokeGrant(clientId, revokedBy, nowMs) {
+      const resp = await internal("/internal/oauth/grant/revoke", {
+        client_id: clientId,
+        revoked_by: revokedBy,
+        now_ms: nowMs,
+      });
+      return resp.ok;
     },
     async issueTokens(input) {
       const resp = await internal("/internal/oauth/token/issue", {

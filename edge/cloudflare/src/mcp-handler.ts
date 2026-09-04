@@ -59,6 +59,14 @@ export interface McpDeps {
     | { ok: true; device_id: string; revoked_at_ms: number }
     | { ok: false; code: string; retryable?: boolean; status?: number }
   >;
+  approveConnector?(input: { request_id: string; code: string }): Promise<
+    | { ok: true; client_id: string; approved_at_ms: number | null }
+    | { ok: false; code: string }
+  >;
+  revokeConnector?(clientId: string): Promise<
+    | { ok: true }
+    | { ok: false; code: string }
+  >;
   resolveDevice?(selector: string | undefined, args?: Record<string, unknown>): Promise<DeviceRouteResult>;
   logger: { warn(event: string, fields?: Record<string, unknown>): void };
   now?: () => number;
@@ -582,6 +590,94 @@ export async function handleMcp(
       } catch {
         return rpcResult(id, callToolResult({ ok: false, code: "device_revoke_failed", retryable: true }, true));
       }
+    }
+
+    if (localMethod === "herdr_mcp.connector.approve" || localMethod === "herdr_mcp.connector.revoke") {
+      if (args.device !== undefined) {
+        return rpcResult(id, callToolResult({
+          ok: false,
+          code: "device_selector_not_allowed",
+          message: `${localMethod} is Edge-local and does not accept a device selector`,
+          retryable: false,
+          delivery_state: "not_delivered",
+          failure_layer: "edge_routing",
+        }, true));
+      }
+      for (const key of Object.keys(args)) {
+        if (key !== "method" && key !== "params") {
+          return rpcResult(id, callToolResult({
+            ok: false,
+            code: "invalid_params",
+            message: `unknown top-level argument '${key}'; ${localMethod} only accepts 'method' and 'params'`,
+            retryable: false,
+          }, true));
+        }
+      }
+      let methodParams: Record<string, unknown> = {};
+      const rawParams = args.params;
+      if (typeof rawParams === "string") {
+        try {
+          const parsed = rawParams.trim() ? JSON.parse(rawParams) : {};
+          if (!isRecord(parsed)) throw new Error("not_object");
+          methodParams = parsed;
+        } catch {
+          return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: "params must be a JSON object" }, true));
+        }
+      } else if (isRecord(rawParams)) {
+        methodParams = rawParams;
+      } else if (rawParams !== undefined && rawParams !== null) {
+        return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: "params must be an object or JSON object string" }, true));
+      }
+
+      if (localMethod === "herdr_mcp.connector.approve") {
+        for (const key of Object.keys(methodParams)) {
+          if (key !== "request_id" && key !== "code") {
+            return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: `unknown parameter '${key}'` }, true));
+          }
+        }
+        const requestId = typeof methodParams.request_id === "string" ? methodParams.request_id.trim() : "";
+        const code = typeof methodParams.code === "string" ? methodParams.code.trim() : "";
+        if (!requestId || requestId.length > 256 || !/^\d{6}$/.test(code)) {
+          return rpcResult(id, callToolResult({ ok: false, code: "invalid_connector_approval", retryable: false }, true));
+        }
+        if (!deps.approveConnector) {
+          return rpcResult(id, callToolResult({ ok: false, code: "connector_approval_unavailable", retryable: false }, true));
+        }
+        const result = await deps.approveConnector({ request_id: requestId, code });
+        if (!result.ok) return rpcResult(id, callToolResult({ ok: false, code: result.code, retryable: false }, true));
+        return rpcResult(id, callToolResult({
+          ok: true,
+          action: "connector_approve",
+          client_id: result.client_id,
+          approved_at_ms: result.approved_at_ms,
+          message: "Connector grant approved. The waiting authorization page can now complete the PKCE redirect.",
+        }));
+      }
+
+      for (const key of Object.keys(methodParams)) {
+        if (key !== "client_id" && key !== "confirm") {
+          return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: `unknown parameter '${key}'` }, true));
+        }
+      }
+      const clientId = typeof methodParams.client_id === "string" ? methodParams.client_id.trim() : "";
+      if (!clientId || clientId.length > 4096) {
+        return rpcResult(id, callToolResult({ ok: false, code: "invalid_client_id", retryable: false }, true));
+      }
+      if (methodParams.confirm !== true) {
+        return rpcResult(id, callToolResult({ ok: false, code: "confirmation_required", message: "connector revoke requires confirm=true", retryable: false }, true));
+      }
+      if (!deps.revokeConnector) {
+        return rpcResult(id, callToolResult({ ok: false, code: "connector_revoke_unavailable", retryable: false }, true));
+      }
+      const result = await deps.revokeConnector(clientId);
+      if (!result.ok) return rpcResult(id, callToolResult({ ok: false, code: result.code, retryable: false }, true));
+      return rpcResult(id, callToolResult({
+        ok: true,
+        action: "connector_revoke",
+        client_id: clientId,
+        revoked: true,
+        message: "Connector grant revoked. Existing v0.4.6-issued access/refresh credentials are fenced by the grant tombstone.",
+      }));
     }
 
     const selectorValue = args.device;
