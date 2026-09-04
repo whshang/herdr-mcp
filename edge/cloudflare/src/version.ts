@@ -4,7 +4,7 @@ import { RUNTIME_EXECUTION_CONTRACT } from "./contracts/runtime.js";
 
 export const EDGE_VERSION = "0.1.0-dev";
 export const EDGE_PROJECT = "herdr-edge-dev";
-export const MCP_SERVER_VERSION = "0.4.5";
+export const MCP_SERVER_VERSION = "0.4.6";
 
 export const CONTRACT_EPOCH = PUBLIC_CONTRACT.contract_epoch;
 export const CONTRACT_HASH = PUBLIC_CONTRACT.contract_hash;
