@@ -811,6 +811,50 @@ test("tools/call maps relay delivery errors to MCP isError tool results", async 
   });
 });
 
+test("read-only tools/call retries a non-JSON transient Edge 524 with a fresh request id", async () => {
+  let attempts = 0;
+  const d = deps({
+    forward: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return new Response("upstream timeout", {
+          status: 524,
+          headers: { "content-type": "text/html", "retry-after": "0" },
+        });
+      }
+      return new Response(JSON.stringify({
+        status: "ok",
+        completion: { status: "ok", result: { recovered: true } },
+      }), { headers: { "content-type": "application/json" } });
+    },
+  });
+  const r = await handleMcp(req(91, "tools/call", { name: "herdr_inspect", arguments: {} }), "w1", d.value);
+  assert.equal(r.body.result.structuredContent.recovered, true);
+  assert.equal(d.calls.length, 2);
+  assert.notEqual(d.calls[0].requestId, d.calls[1].requestId, "safe read retry must use a fresh request id");
+});
+
+test("mutating tools/call never replays a non-JSON transient Edge 502", async () => {
+  const d = deps({
+    forward: async () => new Response("bad gateway", {
+      status: 502,
+      headers: { "content-type": "text/html", "retry-after": "3" },
+    }),
+  });
+  const r = await handleMcp(
+    req(92, "tools/call", { name: "herdr_prompt", arguments: { target: "w1:p1", text: "test" } }),
+    "w1",
+    d.value,
+  );
+  assert.equal(d.calls.length, 1, "ambiguous mutation must never be replayed after a gateway error");
+  assert.equal(r.body.result.isError, true);
+  assert.equal(r.body.result.structuredContent.code, "edge_http_transient");
+  assert.equal(r.body.result.structuredContent.retryable, false);
+  assert.equal(r.body.result.structuredContent.delivery_state, "delivery_unknown");
+  assert.equal(r.body.result.structuredContent.http_status, 502);
+  assert.equal(r.body.result.structuredContent.retry_after_ms, 2000);
+});
+
 test("JSON-RPC request validation and method errors preserve ids", async () => {
   const d = deps();
   const invalid = await handleMcp([], "w1", d.value);

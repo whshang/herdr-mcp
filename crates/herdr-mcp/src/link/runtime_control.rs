@@ -495,7 +495,7 @@ pub(crate) fn retryable_candidate_outcome(outcome: &str) -> bool {
         || matches!(
             code.strip_prefix("catalog_http_")
                 .and_then(|value| value.parse::<u16>().ok()),
-            Some(408 | 425 | 429 | 500 | 502 | 503 | 504)
+            Some(408 | 425 | 429 | 500 | 502 | 503 | 504 | 524)
         )
 }
 
@@ -687,7 +687,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    use super::{RuntimeControlLoop, RuntimeControlLoopOptions, validate_runtime_control_document};
+    use super::{
+        RuntimeControlLoop, RuntimeControlLoopOptions, retryable_candidate_outcome,
+        validate_runtime_control_document,
+    };
     use crate::link::runtime_generation::{
         RuntimeGenerationManager, RuntimeGenerationManagerOptions, RuntimeGenerationSpec,
     };
@@ -847,6 +850,16 @@ mod tests {
         }))
         .unwrap_err();
         assert!(duplicate.to_string().contains("duplicate generation id"));
+    }
+
+    #[test]
+    fn cloudflare_524_catalog_failure_is_retryable() {
+        assert!(retryable_candidate_outcome(
+            "candidate_rejected:catalog_http_524"
+        ));
+        assert!(!retryable_candidate_outcome(
+            "candidate_rejected:catalog_http_404"
+        ));
     }
 
     #[tokio::test]

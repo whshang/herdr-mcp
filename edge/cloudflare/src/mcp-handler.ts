@@ -86,6 +86,8 @@ interface ForwardEnvelope {
 const PUBLIC_TOOL_NAMES: ReadonlySet<string> = new Set<string>(PUBLIC_CONTRACT.tools.map((tool) => tool.name));
 const GENERATION_SUPERSEDE_RETRY_BACKOFF_MS = [100, 400, 1_000, 1_500] as const;
 const GENERATION_SUPERSEDE_CLIENT_RETRY_AFTER_MS = 1_000;
+const TRANSIENT_EDGE_HTTP_RETRY_BACKOFF_MS = [100, 400] as const;
+const TRANSIENT_EDGE_HTTP_RETRY_AFTER_MAX_MS = 2_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -179,6 +181,26 @@ function generationSupersededRetryDelay(error: RelayErrorResult | undefined, att
     return Math.min(hinted, 2_000);
   }
   return GENERATION_SUPERSEDE_RETRY_BACKOFF_MS[attempt] ?? 0;
+}
+
+function transientEdgeHttpStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function retryAfterMs(response: Response, nowMs: number): number | undefined {
+  const raw = response.headers.get("retry-after")?.trim();
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(Math.ceil(seconds * 1_000), TRANSIENT_EDGE_HTTP_RETRY_AFTER_MAX_MS);
+  }
+  const at = Date.parse(raw);
+  if (!Number.isFinite(at)) return undefined;
+  return Math.min(Math.max(0, at - nowMs), TRANSIENT_EDGE_HTTP_RETRY_AFTER_MAX_MS);
+}
+
+function transientEdgeHttpRetryDelay(response: Response, attempt: number, nowMs: number): number {
+  return retryAfterMs(response, nowMs) ?? TRANSIENT_EDGE_HTTP_RETRY_BACKOFF_MS[attempt] ?? 0;
 }
 
 async function waitMs(delayMs: number): Promise<void> {
@@ -874,14 +896,44 @@ export async function handleMcp(
       try {
         forwarded = (await response.json()) as ForwardEnvelope;
       } catch {
+        const transientHttp = transientEdgeHttpStatus(response.status);
+        if (transientHttp && opClass === "read" && attempt < TRANSIENT_EDGE_HTTP_RETRY_BACKOFF_MS.length) {
+          const retryRequestId = newRequestId();
+          const retryDelayMs = transientEdgeHttpRetryDelay(response, attempt, deps.now?.() ?? Date.now());
+          deps.logger.warn("mcp.tools_call.edge_http_retry", {
+            requestId: activeRequestId,
+            retryRequestId,
+            workstationId: route.workstation_id,
+            deviceId: route.device_id,
+            op: name,
+            opClass,
+            httpStatus: response.status,
+            attempt: attempt + 1,
+            retryDelayMs,
+          });
+          await waitMs(retryDelayMs);
+          activeRequestId = retryRequestId;
+          activeInternal = { ...activeInternal, requestId: retryRequestId };
+          continue;
+        }
+        const hintedRetryAfterMs = transientHttp
+          ? retryAfterMs(response, deps.now?.() ?? Date.now())
+          : undefined;
         return rpcResult(
           id,
           callToolResult(
             {
               ok: false,
-              code: "invalid_edge_response",
-              retryable: false,
+              code: transientHttp ? "edge_http_transient" : "invalid_edge_response",
+              retryable: transientHttp && opClass === "read",
               delivery_state: "delivery_unknown",
+              ...(transientHttp ? { http_status: response.status } : {}),
+              ...(hintedRetryAfterMs !== undefined ? { retry_after_ms: hintedRetryAfterMs } : {}),
+              message: transientHttp
+                ? (opClass === "read"
+                    ? "temporary Edge HTTP failure; retrying this read is safe"
+                    : "temporary Edge HTTP failure; mutation delivery is unknown — inspect state before replay")
+                : null,
               request_id: activeRequestId,
               workstation_id: route.workstation_id,
             },

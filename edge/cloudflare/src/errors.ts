@@ -49,6 +49,7 @@ export interface RecoveryPolicy {
 }
 
 export const WORKSTATION_OFFLINE_RETRY_BACKOFF_MS = [5_000, 10_000, 20_000] as const;
+export const EDGE_CAPACITY_RETRY_AFTER_MS = 1_000;
 
 function workstationOfflineRecovery(): RecoveryPolicy {
   return {
@@ -153,7 +154,9 @@ export function uncertainResult(opts: { requestId?: string; workstationId?: stri
 export function capacityResult(opts: { requestId?: string; workstationId?: string; atMs?: number } = {}) {
   return errorResult("edge_capacity_exceeded", {
     retryable: true,
-    message: "edge pending-request capacity exceeded; retry later",
+    delivery_state: "not_delivered",
+    retry_after_ms: EDGE_CAPACITY_RETRY_AFTER_MS,
+    message: "edge pending-request capacity exceeded; request was not delivered, retry after backpressure",
     ...opts,
   });
 }
