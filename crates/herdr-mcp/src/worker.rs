@@ -261,7 +261,7 @@ fn create_pairing(
     println!();
     println!("Agent prompt (copy to the new computer's Coding Agent):");
     println!(
-        "Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: {}  Then enter the separately displayed 6-digit verification code at the no-echo prompt (the code is never part of the copyable command).",
+        "Read and follow https://github.com/whshang/herdr-mcp/blob/main/docs/i18n/en/existing-worker-connect.md to connect this computer to my existing Herdr Worker. Pairing address: {}  Then enter the separately displayed 6-digit verification code at the visible CLI prompt (the code is never part of the copyable command).",
         pairing_address
     );
     Ok(ExitCode::SUCCESS)
@@ -1381,30 +1381,15 @@ fn read_pairing_code_from<R: BufRead>(reader: &mut R) -> Result<String, String> 
 fn read_pairing_code_tty() -> Result<String, String> {
     use std::io::IsTerminal;
     let stdin = io::stdin();
-    if !stdin.is_terminal() {
-        // Noninteractive: read a single line from stdin without echo concerns.
-        let mut reader = io::BufReader::new(stdin.lock());
-        return read_pairing_code_from(&mut reader);
+    if stdin.is_terminal() {
+        // The six-digit value is a short-lived verification code, not a
+        // password. Keep it out of argv/shell history, but let users see what
+        // they type so transcription mistakes are obvious.
+        eprint!("Enter 6-digit verification code: ");
+        let _ = io::stderr().flush();
     }
-    // Interactive TTY: disable echo while reading the code, then always restore.
-    let fd = libc::STDIN_FILENO;
-    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
-    if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } != 0 {
-        return Err("cannot read terminal settings for pairing code input".to_owned());
-    }
-    let original = unsafe { termios.assume_init() };
-    let mut no_echo = original;
-    no_echo.c_lflag &= !libc::ECHO;
-    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &no_echo) } != 0 {
-        return Err("cannot disable echo for pairing code input".to_owned());
-    }
-    eprint!("Enter 6-digit verification code: ");
-    let _ = io::stderr().flush();
-    let result = read_pairing_code_from(&mut io::BufReader::new(io::stdin().lock()));
-    // Always restore echo, even on error.
-    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
-    eprintln!();
-    result
+    let mut reader = io::BufReader::new(stdin.lock());
+    read_pairing_code_from(&mut reader)
 }
 
 #[cfg(any(target_os = "macos", test))]

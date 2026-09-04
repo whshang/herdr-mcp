@@ -369,7 +369,7 @@ summary{cursor:pointer;font-size:13px;font-weight:700;color:#4d5562;user-select:
       <code id="approval-command">${escapeHtml(approvalCommand)}</code>
       <button class="copy" type="button" id="copy-command" aria-label="Copy approval command">Copy</button>
     </div>
-    <p class="helper">Requires herdr-mcp v0.4.6 or newer. Then enter the six-digit code above at the no-echo prompt. The code is intentionally not included in the command or shell history. If the CLI says <code>unknown command 'connector'</code>, update herdr-mcp first and retry while keeping this page open.</p>
+    <p class="helper">Requires herdr-mcp v0.4.6 or newer. Then enter the six-digit code above at the visible CLI prompt. The code is intentionally not included in the command or shell history. If the CLI says <code>unknown command 'connector'</code>, update herdr-mcp first and retry while keeping this page open.</p>
   </div>
 </div>
 

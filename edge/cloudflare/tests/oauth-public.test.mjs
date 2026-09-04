@@ -134,6 +134,8 @@ async function pendingAuthorization(opts, client_id, redirect_uri = "https://app
   assert.match(html, /navigator\.clipboard/);
   assert.match(html, /document\.execCommand\('copy'\)/);
   assert.match(html, /Requires herdr-mcp v0\.4\.6 or newer\./);
+  assert.match(html, /visible CLI prompt/);
+  assert.doesNotMatch(html, /no-echo prompt/);
   assert.match(html, /unknown command 'connector'/);
   assert.match(html, /computer that is already enrolled in this Worker/);
   assert.match(html, /Approval grants ordinary MCP access; it does not grant fleet-administration authority\./);
@@ -512,6 +514,48 @@ test("authorize+token: Claude URL client_id resolves its CIMD metadata without D
   assert.equal(token.status, 200);
   assert.ok((await token.json()).access_token);
   assert.equal(metadataFetches, 2, "authorize and token each validate current CIMD metadata");
+});
+
+test("authorize+token: Notion CIMD public client works with form-encoded PKCE exchange", async () => {
+  const cimd = "https://app.notion.com/oauth/mcp-client-metadata.json";
+  const redirect = "https://app.notion.com/workflows/mcp/oauth/callback";
+  let metadataFetches = 0;
+  const fetchFn = async (input, init = {}) => {
+    assert.equal(String(input), cimd);
+    assert.equal(init.method, "GET");
+    assert.equal(init.redirect, "manual");
+    metadataFetches += 1;
+    return new Response(JSON.stringify({
+      client_id: cimd,
+      client_name: "Notion",
+      client_uri: "https://app.notion.com",
+      redirect_uris: [redirect],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+      application_type: "web",
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const opts = makeOptions({ fetchFn });
+
+  const { code, verifier } = await makeAuthCode(opts, cimd, redirect);
+  assert.ok(code);
+  const token = await POST("/oauth/token", {
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: redirect,
+    client_id: cimd,
+    code_verifier: verifier,
+    resource: IDENTITY.resource,
+  }, opts, { form: true });
+  assert.equal(token.status, 200);
+  const payload = await token.json();
+  assert.ok(payload.access_token);
+  assert.ok(payload.refresh_token);
+  assert.equal(metadataFetches, 2, "authorize and token each validate current Notion CIMD metadata");
 });
 
 test("authorize: generic CIMD keeps redirects manual and rejects 3xx metadata", async () => {

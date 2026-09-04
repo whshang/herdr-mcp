@@ -1211,7 +1211,7 @@ User path:\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS enrolled device only; creates pairing for another computer)\n\
-  herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS only; requires Keychain, reads the 6-digit code from an interactive or stdin prompt, never argv)\n\
+  herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS only; requires Keychain, reads the 6-digit code as visible interactive terminal input (or one stdin line), never argv)\n\
   herdr-mcp connector list  (enrolled-device credential; non-secret connector inventory)\n\
   herdr-mcp connector approve <approval-request-id>  (macOS enrolled device; reads the 6-digit code interactively, never argv)\n\
   herdr-mcp connector revoke <connector-id> --confirm  (connector ids begin with conn_)\n\
@@ -1281,7 +1281,7 @@ All of these require the credential of a device already enrolled in the fleet.\n
 pub fn connector_help() -> &'static str {
     "Herdr MCP connector management (OAuth connectors registered against the fleet)\n\n\
 All of these require the credential of a device already enrolled in the fleet;\nthere is no WebChat delegated admin path. Secrets are never echoed or written\nto argv.\n\n\
-  herdr-mcp connector list\n      Lists the non-secret connector inventory (connector_id, client, source,\n      status, timestamps) as returned by the Edge.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code\n      interactively (or stdin) and never from argv.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes a connector by its connector_id (begins with conn_).\n"
+  herdr-mcp connector list\n      Lists the non-secret connector inventory (connector_id, client, source,\n      status, timestamps) as returned by the Edge.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code as visible terminal input\n      (or one stdin line) and never from argv.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes a connector by its connector_id (begins with conn_).\n"
 }
 
 pub fn automation_help() -> &'static str {

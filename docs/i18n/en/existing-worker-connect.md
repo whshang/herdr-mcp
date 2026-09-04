@@ -52,7 +52,7 @@ On the new computer, the Agent runs:
 herdr-mcp worker connect "<pairing-address>"
 ```
 
-The CLI then prompts for the 6-digit code using a no-echo input. The code is intentionally not accepted as a normal command-line argument.
+The CLI then prompts for the 6-digit code as normal visible terminal input so you can verify what you typed. The code is intentionally not accepted as a normal command-line argument, so it stays out of shell history.
 
 By default, the joining computer registers its macOS **Computer Name** as the device display name. Use `--name "<device-name>"` only when the user explicitly wants a different initial name. A `worker pair --name ...` value supplied by the pairing creator is also an explicit override and takes precedence.
 

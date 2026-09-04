@@ -497,7 +497,7 @@ export async function handleMcp(
             pairing_address: result.pairing_address,
             worker_origin: result.worker_origin,
             new_device_command: `herdr-mcp worker connect "${result.pairing_address}"`,
-            instructions: `This one-time pairing expires at ${expiresAt}. Run on the new computer: herdr-mcp worker connect "${result.pairing_address}" and enter verification code ${result.code} only when the no-echo prompt asks for it.`,
+            instructions: `This one-time pairing expires at ${expiresAt}. Run on the new computer: herdr-mcp worker connect "${result.pairing_address}" and enter verification code ${result.code} only when the visible CLI prompt asks for it.`,
           }),
         );
       } catch {

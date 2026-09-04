@@ -52,7 +52,7 @@ herdr-mcp worker pair
 herdr-mcp worker connect "<pairing-address>"
 ```
 
-随后 CLI 会通过不回显输入要求 6 位验证码。验证码不会作为普通命令行参数传入。
+随后 CLI 会要求输入 6 位验证码，输入的数字会正常显示，便于核对。验证码不会作为普通命令行参数传入，因此不会进入 shell history。
 
 默认情况下，新加入电脑会自动使用 macOS 的**电脑名称（Computer Name）**作为 device display name。只有用户明确希望使用其他名字时，才传 `--name "<device-name>"`。如果创建配对时显式使用了 `worker pair --name ...`，它同样属于用户覆盖，并优先于新电脑自动读取的名称。
 

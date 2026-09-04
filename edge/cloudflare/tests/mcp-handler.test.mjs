@@ -321,7 +321,7 @@ test("herdr_call herdr_mcp.device.pair executes at Edge and creates pairing with
   );
   assert.ok(r.body.result.structuredContent.instructions.includes("herdr-mcp worker connect"));
   assert.ok(r.body.result.structuredContent.instructions.includes("1970-01-01T00:10:00.000Z"));
-  assert.ok(r.body.result.structuredContent.instructions.includes("no-echo prompt"));
+  assert.ok(r.body.result.structuredContent.instructions.includes("visible CLI prompt"));
   assert.deepEqual(pairingInput, { ttl_seconds: 300, name: "new-workstation" });
   assert.equal(d.calls.length, 0, "must never forward to a workstation");
   assert.equal(d.targets.length, 0);
