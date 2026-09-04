@@ -203,6 +203,7 @@ test("connector approval is request-bound, five wrong attempts lock it, and corr
   const grant = await body(await h.post("/internal/oauth/grant/get", { client_id: "c1" }));
   assert.equal(grant.record.status, "active");
   assert.equal(grant.record.can_approve_connectors, true);
+  assert.equal(grant.record.can_control_fleet, undefined, "ordinary connector approval must not grant Fleet Control authority");
   assert.equal(grant.record.approved_by, "device:owner");
 });
 

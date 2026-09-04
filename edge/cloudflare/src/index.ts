@@ -523,6 +523,7 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
       client: {
         userAgent: request.headers.get("user-agent"),
         oauthClientId: devAuth.clientId ?? null,
+        authSource: devAuth.source,
       },
       forward: async (stub: unknown, body: string) => {
         const internal = new Request("https://do.internal/internal/forward", {
@@ -576,6 +577,17 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
           device_id: result.device_id,
           revoked_at_ms: result.revoked_at_ms,
         };
+      },
+      fleetControl: async (method, params) => {
+        const authority = fleetControllerAuthority(devAuth);
+        if (!authority) return { ok: false, code: "fleet_control_authorization_required", retryable: false };
+        const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
+        const response = await registry.fetch(new Request("https://devices.internal/internal/devices/fleet-control", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ method, params, authority, now_ms: Date.now() }),
+        }));
+        return await response.json() as Record<string, unknown>;
       },
       approveConnector: async (input) => {
         if (!(await oauthClientCanApproveConnectors(env, devAuth.clientId))) {
@@ -793,6 +805,13 @@ async function oauthClientCanApproveConnectors(env: Env, clientId: string | unde
   const store = createOAuthPublicStore(stub);
   const grant = await store.getGrant(clientId);
   return grant?.status === "active" && grant.can_approve_connectors === true;
+}
+
+function fleetControllerAuthority(auth: { source: string; clientId?: string }): { principal: string; can_force_takeover: boolean } | null {
+  if (auth.source === "dev_bearer" || auth.source === "static_bearer") {
+    return { principal: `operator:${auth.source}`, can_force_takeover: true };
+  }
+  return null;
 }
 
 async function approveConnectorRequest(
