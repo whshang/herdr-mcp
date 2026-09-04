@@ -29,6 +29,7 @@ export const FLEET_IDEMPOTENCY_CONTROL_CRITICAL_MAX_PER_PRINCIPAL = 32;
 export const FLEET_CONTROL_METHODS = [
   "herdr_mcp.work_chain.create",
   "herdr_mcp.work_chain.inspect",
+  "herdr_mcp.work_chain.checkpoint.update",
   "herdr_mcp.planner_lease.acquire",
   "herdr_mcp.planner_lease.inspect",
   "herdr_mcp.planner_lease.renew",
@@ -44,6 +45,13 @@ export type FleetControlMethod = (typeof FLEET_CONTROL_METHODS)[number];
 const METHOD_FIELDS: Record<FleetControlMethod, { required: string[]; optional?: string[] }> = {
   "herdr_mcp.work_chain.create": { required: ["idempotency_key"] },
   "herdr_mcp.work_chain.inspect": { required: ["work_chain_id"] },
+  "herdr_mcp.work_chain.checkpoint.update": {
+    required: [
+      "work_chain_id", "expected_chain_revision", "expected_lease_generation",
+      "expected_checkpoint_revision", "idempotency_key", "summary",
+      "checkpoint_json", "checkpoint_sha256", "portable_evidence_refs",
+    ],
+  },
   "herdr_mcp.planner_lease.acquire": { required: ["work_chain_id", "expected_chain_revision", "idempotency_key"], optional: ["ttl_ms"] },
   "herdr_mcp.planner_lease.inspect": { required: ["work_chain_id"] },
   "herdr_mcp.planner_lease.renew": { required: ["work_chain_id", "expected_chain_revision", "expected_lease_generation", "idempotency_key"], optional: ["ttl_ms"] },
@@ -67,6 +75,7 @@ const FIELD_SCHEMAS: Record<string, Record<string, unknown>> = {
   expected_chain_revision: { type: "integer", minimum: 1 },
   expected_lease_generation: { type: "integer", minimum: 0 },
   expected_lane_generation: { type: "integer", minimum: 1 },
+  expected_checkpoint_revision: { type: "integer", minimum: 0 },
   ttl_ms: { type: "integer", minimum: MIN_LEASE_TTL_MS, maximum: MAX_LEASE_TTL_MS },
   reason: { type: "string", minLength: 1, maxLength: MAX_TAKEOVER_REASON },
   device_id: { type: "string", minLength: 1, maxLength: 128 },
@@ -79,6 +88,27 @@ const FIELD_SCHEMAS: Record<string, Record<string, unknown>> = {
   status: { type: "string", enum: ["planned", "active", "blocked", "completed", "cancelled"] },
   reassign: { type: "boolean" },
   validation_summary: { type: ["string", "null"], maxLength: 4096 },
+  summary: { type: "string", minLength: 1, maxLength: 8192 },
+  checkpoint_json: { type: "string", minLength: 2, maxLength: 65536 },
+  checkpoint_sha256: { type: "string", pattern: "^[0-9a-fA-F]{64}$" },
+  portable_evidence_refs: {
+    type: "array",
+    maxItems: 64,
+    items: {
+      type: "object",
+      properties: {
+        kind: { const: "git_source" },
+        repo_id: { type: "string", minLength: 1, maxLength: 512 },
+        commit_sha: { type: "string", pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+        repo_relative_path: { type: "string", minLength: 1, maxLength: 1024 },
+        line_start: { type: "integer", minimum: 1 },
+        line_end: { type: "integer", minimum: 1 },
+        evidence_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+      },
+      required: ["kind", "repo_id", "commit_sha", "repo_relative_path", "evidence_sha256"],
+      additionalProperties: false,
+    },
+  },
 };
 
 export function discoverFleetControlMethods(query = ""): Array<Record<string, unknown>> {
@@ -130,6 +160,25 @@ export interface PlannerTakeoverAudit {
   at_ms: number;
 }
 
+export interface PortableEvidenceRef {
+  kind: "git_source";
+  repo_id: string;
+  commit_sha: string;
+  repo_relative_path: string;
+  line_start?: number;
+  line_end?: number;
+  evidence_sha256: string;
+}
+
+export interface CompactWorkMemoryCheckpoint {
+  schema_version: 1;
+  revision: number;
+  summary: string;
+  checkpoint_json: string;
+  checkpoint_sha256: string;
+  updated_at_ms: number;
+}
+
 export interface WorkChainRecord {
   schema_version: 1;
   work_chain_id: string;
@@ -138,7 +187,8 @@ export interface WorkChainRecord {
   creator_principal: string;
   checkpoint_schema_version: 1;
   checkpoint_revision: number;
-  portable_evidence_refs: string[];
+  compact_checkpoint: CompactWorkMemoryCheckpoint | null;
+  portable_evidence_refs: PortableEvidenceRef[];
   planner_lease_generation: number;
   planner_lease: PlannerLease | null;
   last_planner_takeover: PlannerTakeoverAudit | null;
@@ -238,6 +288,52 @@ function normalizeStoredEmptyRefs(value: unknown): string[] | null {
   return Array.isArray(value) && value.length === 0 ? [] : null;
 }
 
+function normalizePortableEvidenceRefs(value: unknown): PortableEvidenceRef[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 64) return null;
+  const result: PortableEvidenceRef[] = [];
+  for (const item of value) {
+    if (!isRecord(item) || Object.keys(item).some((key) => ![
+      "kind", "repo_id", "commit_sha", "repo_relative_path", "line_start", "line_end", "evidence_sha256",
+    ].includes(key))) return null;
+    if (item.kind !== "git_source") return null;
+    const repoId = normalizeRepoId(item.repo_id);
+    if (!repoId || repoId !== item.repo_id) return null;
+    if (typeof item.commit_sha !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(item.commit_sha)) return null;
+    const sourcePath = normalizeFileScope([item.repo_relative_path]);
+    if (!sourcePath || sourcePath.length !== 1) return null;
+    const lineStart = item.line_start === undefined ? undefined : integer(item.line_start, 1) ? item.line_start : null;
+    const lineEnd = item.line_end === undefined ? undefined : integer(item.line_end, 1) ? item.line_end : null;
+    if (lineStart === null || lineEnd === null || (lineEnd !== undefined && lineStart === undefined) || (lineStart !== undefined && lineEnd !== undefined && lineEnd < lineStart)) return null;
+    if (typeof item.evidence_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(item.evidence_sha256)) return null;
+    result.push({
+      kind: "git_source",
+      repo_id: repoId,
+      commit_sha: item.commit_sha,
+      repo_relative_path: sourcePath[0],
+      ...(lineStart === undefined ? {} : { line_start: lineStart }),
+      ...(lineEnd === undefined ? {} : { line_end: lineEnd }),
+      evidence_sha256: item.evidence_sha256,
+    });
+  }
+  return result;
+}
+
+function normalizeCompactCheckpoint(value: unknown, revision: number): CompactWorkMemoryCheckpoint | null | undefined {
+  if (value === undefined || value === null) return revision === 0 ? null : undefined;
+  if (!isRecord(value) || value.schema_version !== 1 || value.revision !== revision || revision < 1) return undefined;
+  if (!boundedString(value.summary, 8192) || value.summary !== value.summary.trim()) return undefined;
+  if (!boundedString(value.checkpoint_json, 65536) || typeof value.checkpoint_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.checkpoint_sha256)) return undefined;
+  try {
+    const parsed = JSON.parse(value.checkpoint_json);
+    if (!isRecord(parsed)) return undefined;
+  } catch {
+    return undefined;
+  }
+  if (!integer(value.updated_at_ms, 0)) return undefined;
+  return value as unknown as CompactWorkMemoryCheckpoint;
+}
+
 export function normalizeRepoId(value: unknown): string | null {
   if (!boundedString(value, 512)) return null;
   let repo = value.trim();
@@ -312,8 +408,10 @@ function normalizeChain(value: unknown): WorkChainRecord | null {
   if (value.status !== "active" && value.status !== "completed" && value.status !== "cancelled") return null;
   if (!boundedString(value.creator_principal, MAX_PRINCIPAL)) return null;
   if (value.checkpoint_schema_version !== 1 || !integer(value.checkpoint_revision, 0)) return null;
-  const portableEvidenceRefs = normalizeStoredEmptyRefs(value.portable_evidence_refs);
+  const portableEvidenceRefs = normalizePortableEvidenceRefs(value.portable_evidence_refs);
   if (!portableEvidenceRefs) return null;
+  const compactCheckpoint = normalizeCompactCheckpoint(value.compact_checkpoint, value.checkpoint_revision);
+  if (compactCheckpoint === undefined) return null;
   if (!integer(value.planner_lease_generation, 0) || !integer(value.created_at_ms, 0) || !integer(value.updated_at_ms, 0)) return null;
   const lease = value.planner_lease;
   if (lease !== null) {
@@ -327,7 +425,12 @@ function normalizeChain(value: unknown): WorkChainRecord | null {
     if (!integer(takeover.previous_generation, 1) || !integer(takeover.new_generation, 1) || takeover.new_generation <= takeover.previous_generation) return null;
     if (!boundedString(takeover.reason, MAX_TAKEOVER_REASON) || !integer(takeover.at_ms, 0)) return null;
   }
-  return { ...value, portable_evidence_refs: portableEvidenceRefs, last_planner_takeover: takeover ?? null } as unknown as WorkChainRecord;
+  return {
+    ...value,
+    compact_checkpoint: compactCheckpoint,
+    portable_evidence_refs: portableEvidenceRefs,
+    last_planner_takeover: takeover ?? null,
+  } as unknown as WorkChainRecord;
 }
 
 function normalizeLane(value: unknown): ExecutionLaneRecord | null {
@@ -560,7 +663,7 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
     let result: FleetControlResult;
     if (method === "herdr_mcp.work_chain.create") {
       const id = newOpaqueId("wc");
-      const chain: WorkChainRecord = { schema_version: 1, work_chain_id: id, revision: 1, status: "active", creator_principal: principal, checkpoint_schema_version: 1, checkpoint_revision: 0, portable_evidence_refs: [], planner_lease_generation: 0, planner_lease: null, last_planner_takeover: null, created_at_ms: nowMs, updated_at_ms: nowMs };
+      const chain: WorkChainRecord = { schema_version: 1, work_chain_id: id, revision: 1, status: "active", creator_principal: principal, checkpoint_schema_version: 1, checkpoint_revision: 0, compact_checkpoint: null, portable_evidence_refs: [], planner_lease_generation: 0, planner_lease: null, last_planner_takeover: null, created_at_ms: nowMs, updated_at_ms: nowMs };
       await tx.put(CHAIN_PREFIX + id, chain);
       result = { ok: true, chain };
     } else {
@@ -571,7 +674,48 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
       const revisionError = requireRevision(params, chain);
       if (revisionError) return revisionError;
 
-      if (method === "herdr_mcp.planner_lease.acquire") {
+      if (method === "herdr_mcp.work_chain.checkpoint.update") {
+        const leaseOrError = requireLease(params, chain, principal, nowMs);
+        if (!isPlannerLease(leaseOrError)) return leaseOrError;
+        if (!integer(params.expected_checkpoint_revision, 0)) return error("expected_checkpoint_revision_required");
+        if (params.expected_checkpoint_revision !== chain.checkpoint_revision) {
+          return error("checkpoint_revision_conflict", { expected: params.expected_checkpoint_revision, actual: chain.checkpoint_revision });
+        }
+        const summary = boundedString(params.summary, 8192) && params.summary === params.summary.trim() ? params.summary : null;
+        const checkpointJson = boundedString(params.checkpoint_json, 65536) ? params.checkpoint_json : null;
+        const checkpointSha256 = typeof params.checkpoint_sha256 === "string" && /^[0-9a-fA-F]{64}$/.test(params.checkpoint_sha256)
+          ? params.checkpoint_sha256.toLowerCase()
+          : null;
+        if (!summary || !checkpointJson || !checkpointSha256) return error("invalid_checkpoint");
+        try {
+          if (!isRecord(JSON.parse(checkpointJson))) return error("invalid_checkpoint_json");
+        } catch {
+          return error("invalid_checkpoint_json");
+        }
+        if (await sha256Hex(checkpointJson) !== checkpointSha256) return error("checkpoint_hash_mismatch");
+        if (!Array.isArray(params.portable_evidence_refs)) return error("invalid_portable_evidence_refs");
+        const portableEvidenceRefs = normalizePortableEvidenceRefs(params.portable_evidence_refs);
+        if (!portableEvidenceRefs) return error("invalid_portable_evidence_refs");
+        const checkpointRevision = chain.checkpoint_revision + 1;
+        const checkpoint: CompactWorkMemoryCheckpoint = {
+          schema_version: 1,
+          revision: checkpointRevision,
+          summary,
+          checkpoint_json: checkpointJson,
+          checkpoint_sha256: checkpointSha256,
+          updated_at_ms: nowMs,
+        };
+        const next: WorkChainRecord = {
+          ...chain,
+          revision: chain.revision + 1,
+          checkpoint_revision: checkpointRevision,
+          compact_checkpoint: checkpoint,
+          portable_evidence_refs: portableEvidenceRefs,
+          updated_at_ms: nowMs,
+        };
+        await tx.put(CHAIN_PREFIX + id, next);
+        result = { ok: true, chain: next, checkpoint, portable_evidence_refs: portableEvidenceRefs };
+      } else if (method === "herdr_mcp.planner_lease.acquire") {
         const ttl = leaseTtlMs(params.ttl_ms);
         if (ttl === null) return error("invalid_lease_ttl");
         const live = activeLease(chain, nowMs);

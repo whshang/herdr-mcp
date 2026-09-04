@@ -10,7 +10,10 @@ use crate::native_tools;
 use crate::prompt::{self, PromptRegistry};
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
-use crate::state_store::{ContinuitySearchInput, StateStore};
+use crate::state_store::{
+    ContinuitySearchInput, StateStore, WorkMemoryBindingInput, WorkMemoryCheckpointInput,
+    WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput, WorkMemoryTurnInput,
+};
 use crate::tcc_broker;
 use crate::utility_exec;
 use serde_json::{Value, json};
@@ -185,6 +188,8 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             };
             if method.starts_with("continuity.") {
                 continuity_call(context.state_store, method, &params)
+            } else if method.starts_with("work_memory.") {
+                work_memory_call(context.state_store, method, &params)
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
             } else {
@@ -492,6 +497,630 @@ fn continuity_call(
             }
         }
         _ => json!({"ok": false, "code": "unknown_local_method", "method": method}),
+    }
+}
+
+fn work_memory_call(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    method: &str,
+    params: &Value,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "work_memory_params_invalid"});
+    };
+    let Ok(mut store) = store.lock() else {
+        return json!({"ok": false, "code": "work_memory_store_unavailable"});
+    };
+    match method {
+        "work_memory.bind" => {
+            if let Some(error) = work_memory_reject_unknown(
+                object,
+                &[
+                    "continuity_id",
+                    "project_ref",
+                    "repo_id",
+                    "work_chain_id",
+                    "provider",
+                    "account_ref",
+                    "space_ref",
+                    "session_ref",
+                    "bound_at",
+                ],
+            ) {
+                return error;
+            }
+            let continuity_id = match work_memory_required_string(params, "continuity_id", 160) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let project_ref = match work_memory_required_string(params, "project_ref", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let repo_id = match work_memory_required_string(params, "repo_id", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let work_chain_id = match work_memory_required_string(params, "work_chain_id", 128) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let provider = match work_memory_required_string(params, "provider", 32) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let account_ref = match work_memory_optional_string(params, "account_ref", 256) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let space_ref = match work_memory_optional_string(params, "space_ref", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let session_ref = match work_memory_required_string(params, "session_ref", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let bound_at = match work_memory_required_i64(params, "bound_at") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            match store.bind_work_memory(WorkMemoryBindingInput {
+                continuity_id,
+                project_ref,
+                repo_id,
+                work_chain_id,
+                provider,
+                account_ref,
+                space_ref,
+                session_ref,
+                bound_at,
+            }) {
+                Ok(()) => json!({
+                    "ok": true,
+                    "continuity_id": continuity_id,
+                    "project_ref": project_ref,
+                    "repo_id": repo_id,
+                    "work_chain_id": work_chain_id,
+                    "provider": provider,
+                    "session_ref": session_ref,
+                    "retention_policy": "retain_all",
+                }),
+                Err(error) => work_memory_store_error(error),
+            }
+        }
+        "work_memory.append_turn" => {
+            if let Some(error) = work_memory_reject_unknown(
+                object,
+                &[
+                    "continuity_id",
+                    "provider",
+                    "account_ref",
+                    "space_ref",
+                    "session_ref",
+                    "provider_message_ref",
+                    "role",
+                    "text",
+                    "fingerprint",
+                    "observed_at",
+                ],
+            ) {
+                return error;
+            }
+            let continuity_id = match work_memory_required_string(params, "continuity_id", 160) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let provider = match work_memory_required_string(params, "provider", 32) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let account_ref = match work_memory_optional_string(params, "account_ref", 256) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let space_ref = match work_memory_optional_string(params, "space_ref", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let session_ref = match work_memory_required_string(params, "session_ref", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let provider_message_ref =
+                match work_memory_required_string(params, "provider_message_ref", 512) {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+            let role = match work_memory_required_string(params, "role", 32) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let text = match work_memory_required_text(params, "text", 256 * 1024) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let fingerprint = match work_memory_optional_string(params, "fingerprint", 256) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let observed_at = match work_memory_required_i64(params, "observed_at") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            match store.append_work_memory_turn(WorkMemoryTurnInput {
+                continuity_id,
+                provider,
+                account_ref,
+                space_ref,
+                session_ref,
+                provider_message_ref,
+                role,
+                text,
+                fingerprint,
+                observed_at,
+            }) {
+                Ok(record) => json!({
+                    "ok": true,
+                    "inserted": record.inserted,
+                    "message_id": record.message_id,
+                }),
+                Err(error) => work_memory_store_error(error),
+            }
+        }
+        "work_memory.append_evidence" => {
+            if let Some(error) = work_memory_reject_unknown(
+                object,
+                &[
+                    "continuity_id",
+                    "kind",
+                    "content",
+                    "provider",
+                    "account_ref",
+                    "space_ref",
+                    "session_ref",
+                    "portable_source",
+                    "created_at",
+                ],
+            ) {
+                return error;
+            }
+            let continuity_id = match work_memory_required_string(params, "continuity_id", 160) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let kind = match work_memory_required_string(params, "kind", 32) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let content = match work_memory_required_text(params, "content", 256 * 1024) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let provider = match work_memory_optional_string(params, "provider", 32) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let account_ref = match work_memory_optional_string(params, "account_ref", 256) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let space_ref = match work_memory_optional_string(params, "space_ref", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let session_ref = match work_memory_optional_string(params, "session_ref", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let portable_source = match params.get("portable_source") {
+                None | Some(Value::Null) => None,
+                Some(source @ Value::Object(source_object)) => {
+                    if let Some(error) = work_memory_reject_unknown(
+                        source_object,
+                        &[
+                            "repo_id",
+                            "commit_sha",
+                            "repo_relative_path",
+                            "line_start",
+                            "line_end",
+                        ],
+                    ) {
+                        return error;
+                    }
+                    let repo_id = match work_memory_required_string(source, "repo_id", 512) {
+                        Ok(value) => value,
+                        Err(error) => return error,
+                    };
+                    let commit_sha = match work_memory_required_string(source, "commit_sha", 64) {
+                        Ok(value) => value,
+                        Err(error) => return error,
+                    };
+                    let repo_relative_path =
+                        match work_memory_required_string(source, "repo_relative_path", 1024) {
+                            Ok(value) => value,
+                            Err(error) => return error,
+                        };
+                    let line_start = match source.get("line_start") {
+                        None | Some(Value::Null) => None,
+                        Some(value) => match value.as_i64() {
+                            Some(value) => Some(value),
+                            None => {
+                                return json!({"ok": false, "code": "work_memory_line_start_invalid"});
+                            }
+                        },
+                    };
+                    let line_end = match source.get("line_end") {
+                        None | Some(Value::Null) => None,
+                        Some(value) => match value.as_i64() {
+                            Some(value) => Some(value),
+                            None => {
+                                return json!({"ok": false, "code": "work_memory_line_end_invalid"});
+                            }
+                        },
+                    };
+                    Some(WorkMemoryPortableSourceInput {
+                        repo_id,
+                        commit_sha,
+                        repo_relative_path,
+                        line_start,
+                        line_end,
+                    })
+                }
+                Some(_) => {
+                    return json!({"ok": false, "code": "work_memory_portable_source_invalid"});
+                }
+            };
+            let created_at = match work_memory_required_i64(params, "created_at") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            match store.append_work_memory_evidence(WorkMemoryEvidenceInput {
+                continuity_id,
+                kind,
+                content,
+                provider,
+                account_ref,
+                space_ref,
+                session_ref,
+                portable_source,
+                created_at,
+            }) {
+                Ok(record) => json!({
+                    "ok": true,
+                    "evidence_id": record.evidence_id,
+                    "sha256": record.sha256,
+                    "portable_evidence_ref": record.portable_ref.map(|reference| json!({
+                        "kind": reference.kind,
+                        "repo_id": reference.repo_id,
+                        "commit_sha": reference.commit_sha,
+                        "repo_relative_path": reference.repo_relative_path,
+                        "line_start": reference.line_start,
+                        "line_end": reference.line_end,
+                        "evidence_sha256": reference.evidence_sha256,
+                    })),
+                }),
+                Err(error) => work_memory_store_error(error),
+            }
+        }
+        "work_memory.checkpoint.put" => {
+            if let Some(error) = work_memory_reject_unknown(
+                object,
+                &[
+                    "continuity_id",
+                    "expected_checkpoint_revision",
+                    "summary",
+                    "checkpoint_json",
+                    "through_message_id",
+                    "through_evidence_id",
+                    "created_at",
+                ],
+            ) {
+                return error;
+            }
+            let continuity_id = match work_memory_required_string(params, "continuity_id", 160) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let expected_checkpoint_revision = match work_memory_required_i64(
+                params,
+                "expected_checkpoint_revision",
+            ) {
+                Ok(value) if value >= 0 => value,
+                _ => {
+                    return json!({"ok": false, "code": "work_memory_expected_checkpoint_revision_invalid"});
+                }
+            };
+            let summary = match work_memory_required_text(params, "summary", 8 * 1024) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let checkpoint_json =
+                match work_memory_required_text(params, "checkpoint_json", 64 * 1024) {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+            match serde_json::from_str::<Value>(checkpoint_json) {
+                Ok(Value::Object(_)) => {}
+                _ => return json!({"ok": false, "code": "work_memory_checkpoint_json_invalid"}),
+            }
+            let through_message_id =
+                match work_memory_optional_string(params, "through_message_id", 512) {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+            let through_evidence_id =
+                match work_memory_optional_string(params, "through_evidence_id", 128) {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+            let created_at = match work_memory_required_i64(params, "created_at") {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            match store.put_work_memory_checkpoint(WorkMemoryCheckpointInput {
+                continuity_id,
+                expected_checkpoint_revision,
+                summary,
+                checkpoint_json,
+                through_message_id,
+                through_evidence_id,
+                created_at,
+            }) {
+                Ok(checkpoint) => json!({
+                    "ok": true,
+                    "checkpoint": {
+                        "revision": checkpoint.revision,
+                        "summary": checkpoint.summary,
+                        "checkpoint_json": checkpoint.checkpoint_json,
+                        "sha256": checkpoint.sha256,
+                        "through_message_id": checkpoint.through_message_id,
+                        "through_evidence_id": checkpoint.through_evidence_id,
+                        "created_at": checkpoint.created_at,
+                        "verified": true,
+                    }
+                }),
+                Err(error) => work_memory_store_error(error),
+            }
+        }
+        "work_memory.resume" => {
+            if let Some(error) = work_memory_reject_unknown(
+                object,
+                &["project_ref", "repo_id", "work_chain_id", "max_turns"],
+            ) {
+                return error;
+            }
+            let project_ref = match work_memory_required_string(params, "project_ref", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let repo_id = match work_memory_required_string(params, "repo_id", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let work_chain_id = match work_memory_required_string(params, "work_chain_id", 128) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let max_turns = match params.get("max_turns") {
+                None | Some(Value::Null) => 32,
+                Some(value) => match value.as_u64() {
+                    Some(value @ 1..=64) => value as usize,
+                    _ => return json!({"ok": false, "code": "work_memory_max_turns_invalid"}),
+                },
+            };
+            match store.work_memory_resume_by_partition(
+                project_ref,
+                repo_id,
+                work_chain_id,
+                max_turns,
+            ) {
+                Ok(Some(record)) => json!({
+                    "ok": true,
+                    "continuity_id": record.continuity_id,
+                    "project_ref": record.project_ref,
+                    "repo_id": record.repo_id,
+                    "work_chain_id": record.work_chain_id,
+                    "checkpoint_revision": record.checkpoint_revision,
+                    "retention_policy": record.retention_policy,
+                    "checkpoint": record.checkpoint.map(|checkpoint| json!({
+                        "revision": checkpoint.revision,
+                        "summary": checkpoint.summary,
+                        "checkpoint_json": checkpoint.checkpoint_json,
+                        "sha256": checkpoint.sha256,
+                        "through_message_id": checkpoint.through_message_id,
+                        "through_evidence_id": checkpoint.through_evidence_id,
+                        "created_at": checkpoint.created_at,
+                        "verified": true,
+                    })),
+                    "turns": record.turns.into_iter().map(|turn| json!({
+                        "provider": turn.provider,
+                        "account_ref": turn.account_ref,
+                        "space_ref": turn.space_ref,
+                        "session_ref": turn.session_ref,
+                        "provider_message_ref": turn.provider_message_ref,
+                        "role": turn.role,
+                        "text": turn.text,
+                        "observed_at": turn.observed_at,
+                    })).collect::<Vec<_>>(),
+                    "evidence": record.evidence.into_iter().map(|item| json!({
+                        "evidence_id": item.evidence_id,
+                        "kind": item.kind,
+                        "content": item.content,
+                        "sha256": item.sha256,
+                        "provider": item.provider,
+                        "session_ref": item.session_ref,
+                        "portable_ref": item.portable_ref.map(|reference| json!({
+                            "kind": reference.kind,
+                            "repo_id": reference.repo_id,
+                            "commit_sha": reference.commit_sha,
+                            "repo_relative_path": reference.repo_relative_path,
+                            "line_start": reference.line_start,
+                            "line_end": reference.line_end,
+                            "evidence_sha256": reference.evidence_sha256,
+                        })),
+                        "created_at": item.created_at,
+                    })).collect::<Vec<_>>(),
+                    "portable_evidence_refs": record.evidence_refs.into_iter().map(|reference| json!({
+                        "kind": reference.kind,
+                        "repo_id": reference.repo_id,
+                        "commit_sha": reference.commit_sha,
+                        "repo_relative_path": reference.repo_relative_path,
+                        "line_start": reference.line_start,
+                        "line_end": reference.line_end,
+                        "evidence_sha256": reference.evidence_sha256,
+                    })).collect::<Vec<_>>(),
+                    "updated_at": record.updated_at,
+                    "instruction": "Treat Work Memory as persisted project context. Re-check live Herdr/runtime/Git state before mutation.",
+                }),
+                Ok(None) => json!({"ok": false, "code": "work_memory_not_found"}),
+                Err(error) => work_memory_store_error(error),
+            }
+        }
+        "work_memory.search" => {
+            if let Some(error) = work_memory_reject_unknown(
+                object,
+                &["project_ref", "repo_id", "work_chain_id", "query", "limit"],
+            ) {
+                return error;
+            }
+            let project_ref = match work_memory_required_string(params, "project_ref", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let repo_id = match work_memory_required_string(params, "repo_id", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let work_chain_id = match work_memory_required_string(params, "work_chain_id", 128) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let query = match work_memory_required_string(params, "query", 512) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let limit = match params.get("limit") {
+                None | Some(Value::Null) => 10,
+                Some(value) => match value.as_u64() {
+                    Some(value @ 1..=20) => value as usize,
+                    _ => return json!({"ok": false, "code": "work_memory_limit_invalid"}),
+                },
+            };
+            match store.work_memory_search(project_ref, repo_id, work_chain_id, query, limit) {
+                Ok(hits) => json!({
+                    "ok": true,
+                    "project_ref": project_ref,
+                    "repo_id": repo_id,
+                    "work_chain_id": work_chain_id,
+                    "hits": hits.into_iter().map(|hit| json!({
+                        "source_kind": hit.source_kind,
+                        "source_id": hit.source_id,
+                        "excerpt": hit.excerpt,
+                    })).collect::<Vec<_>>()
+                }),
+                Err(error) => work_memory_store_error(error),
+            }
+        }
+        _ => json!({"ok": false, "code": "unknown_local_method", "method": method}),
+    }
+}
+
+fn work_memory_reject_unknown(
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> Option<Value> {
+    object
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+        .map(|key| {
+            json!({
+                "ok": false,
+                "code": "work_memory_params_invalid",
+                "message": format!("unknown Work Memory param: {key}"),
+            })
+        })
+}
+
+fn work_memory_required_string<'a>(
+    params: &'a Value,
+    key: &str,
+    max_bytes: usize,
+) -> Result<&'a str, Value> {
+    let Some(value) = params.get(key).and_then(Value::as_str) else {
+        return Err(json!({"ok": false, "code": format!("work_memory_{key}_required")}));
+    };
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value != value.trim()
+        || value.chars().any(char::is_control)
+    {
+        return Err(json!({"ok": false, "code": format!("work_memory_{key}_invalid")}));
+    }
+    Ok(value)
+}
+
+fn work_memory_required_text<'a>(
+    params: &'a Value,
+    key: &str,
+    max_bytes: usize,
+) -> Result<&'a str, Value> {
+    let Some(value) = params.get(key).and_then(Value::as_str) else {
+        return Err(json!({"ok": false, "code": format!("work_memory_{key}_required")}));
+    };
+    if value.len() > max_bytes
+        || value.trim().is_empty()
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(json!({"ok": false, "code": format!("work_memory_{key}_invalid")}));
+    }
+    Ok(value)
+}
+
+fn work_memory_optional_string<'a>(
+    params: &'a Value,
+    key: &str,
+    max_bytes: usize,
+) -> Result<Option<&'a str>, Value> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            if value.is_empty()
+                || value.len() > max_bytes
+                || value != value.trim()
+                || value.chars().any(char::is_control)
+            {
+                Err(json!({"ok": false, "code": format!("work_memory_{key}_invalid")}))
+            } else {
+                Ok(Some(value.as_str()))
+            }
+        }
+        Some(_) => Err(json!({"ok": false, "code": format!("work_memory_{key}_invalid")})),
+    }
+}
+
+fn work_memory_required_i64(params: &Value, key: &str) -> Result<i64, Value> {
+    params
+        .get(key)
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| json!({"ok": false, "code": format!("work_memory_{key}_invalid")}))
+}
+
+fn work_memory_store_error(error: String) -> Value {
+    if let Some(actual) = error.strip_prefix("work_memory_checkpoint_revision_conflict:") {
+        return json!({
+            "ok": false,
+            "code": "work_memory_checkpoint_revision_conflict",
+            "actual": actual.parse::<i64>().ok(),
+        });
+    }
+    if error.starts_with("work_memory_") {
+        json!({"ok": false, "code": error})
+    } else {
+        json!({"ok": false, "code": "work_memory_store_failed", "message": error})
     }
 }
 
@@ -935,6 +1564,130 @@ mod tests {
         );
         assert_eq!(invalid["ok"], false);
         assert_eq!(invalid["code"], "continuity_search_params_invalid");
+    }
+
+    #[test]
+    fn work_memory_private_methods_share_state_store_and_provider_qualify_messages() {
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let mut message_ids = Vec::new();
+        for (provider, account_ref) in [("chatgpt", "account-a"), ("gemini", "account-b")] {
+            let bound = work_memory_call(
+                &store,
+                "work_memory.bind",
+                &json!({
+                    "continuity_id": "wm:mcp",
+                    "project_ref": "project:herdr-mcp",
+                    "repo_id": "github.com/whshang/herdr-mcp",
+                    "work_chain_id": "wc_cccccccccccccccccccccccccccccccc",
+                    "provider": provider,
+                    "account_ref": account_ref,
+                    "space_ref": "project-space",
+                    "session_ref": "same-session",
+                    "bound_at": 100,
+                }),
+            );
+            assert_eq!(bound["ok"], true);
+
+            let appended = work_memory_call(
+                &store,
+                "work_memory.append_turn",
+                &json!({
+                    "continuity_id": "wm:mcp",
+                    "provider": provider,
+                    "account_ref": account_ref,
+                    "space_ref": "project-space",
+                    "session_ref": "same-session",
+                    "provider_message_ref": "same-message",
+                    "role": if provider == "chatgpt" { "user" } else { "assistant" },
+                    "text": format!("{provider} work memory turn\n\n```text\nline\t2\n```"),
+                    "observed_at": if provider == "chatgpt" { 110 } else { 111 },
+                }),
+            );
+            assert_eq!(appended["ok"], true);
+            assert_eq!(appended["inserted"], true);
+            message_ids.push(appended["message_id"].as_str().unwrap().to_owned());
+        }
+        assert_ne!(message_ids[0], message_ids[1]);
+
+        let evidence = work_memory_call(
+            &store,
+            "work_memory.append_evidence",
+            &json!({
+                "continuity_id": "wm:mcp",
+                "kind": "result",
+                "content": "provider-neutral durable result\n\n```text\nexit\t0\n```",
+                "provider": "gemini",
+                "account_ref": "account-b",
+                "space_ref": "project-space",
+                "session_ref": "same-session",
+                "portable_source": {
+                    "repo_id": "github.com/whshang/herdr-mcp",
+                    "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                    "repo_relative_path": "crates/herdr-mcp/src/mcp.rs",
+                    "line_start": 1,
+                    "line_end": 10
+                },
+                "created_at": 112,
+            }),
+        );
+        assert_eq!(evidence["ok"], true);
+        assert!(evidence["evidence_id"].as_str().unwrap().starts_with("ev_"));
+        assert_eq!(
+            evidence["portable_evidence_ref"]["repo_relative_path"],
+            "crates/herdr-mcp/src/mcp.rs"
+        );
+
+        let checkpoint = work_memory_call(
+            &store,
+            "work_memory.checkpoint.put",
+            &json!({
+                "continuity_id": "wm:mcp",
+                "expected_checkpoint_revision": 0,
+                "summary": "MCP checkpoint\nready for handoff",
+                "checkpoint_json": "{\n\t\"goal\": \"alpha2\"\n}",
+                "through_message_id": message_ids[1],
+                "through_evidence_id": evidence["evidence_id"],
+                "created_at": 120,
+            }),
+        );
+        assert_eq!(checkpoint["ok"], true);
+        assert_eq!(checkpoint["checkpoint"]["revision"], 1);
+        assert_eq!(checkpoint["checkpoint"]["verified"], true);
+
+        let resumed = work_memory_call(
+            &store,
+            "work_memory.resume",
+            &json!({
+                "project_ref": "project:herdr-mcp",
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "work_chain_id": "wc_cccccccccccccccccccccccccccccccc",
+                "max_turns": 8
+            }),
+        );
+        assert_eq!(resumed["ok"], true);
+        assert_eq!(
+            resumed["work_chain_id"],
+            "wc_cccccccccccccccccccccccccccccccc"
+        );
+        assert_eq!(resumed["turns"].as_array().unwrap().len(), 2);
+        assert_eq!(resumed["turns"][0]["provider"], "chatgpt");
+        assert_eq!(resumed["turns"][1]["provider"], "gemini");
+
+        let searched = work_memory_call(
+            &store,
+            "work_memory.search",
+            &json!({
+                "project_ref": "project:herdr-mcp",
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "work_chain_id": "wc_cccccccccccccccccccccccccccccccc",
+                "query": "durable result"
+            }),
+        );
+        assert_eq!(searched["ok"], true);
+        assert_eq!(searched["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(searched["hits"][0]["source_kind"], "evidence");
     }
 
     #[test]

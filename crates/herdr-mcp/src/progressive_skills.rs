@@ -19,6 +19,12 @@ pub const PLANNING_ADVISE_METHOD: &str = "herdr_mcp.planning.advise";
 pub const GITHUB_STATUS_METHOD: &str = "herdr_mcp.github.status";
 pub const TEXT_READ_METHOD: &str = "herdr_mcp.text.read";
 pub const TEXT_WRITE_METHOD: &str = "herdr_mcp.text.write";
+pub const WORK_MEMORY_BIND_METHOD: &str = "work_memory.bind";
+pub const WORK_MEMORY_APPEND_TURN_METHOD: &str = "work_memory.append_turn";
+pub const WORK_MEMORY_APPEND_EVIDENCE_METHOD: &str = "work_memory.append_evidence";
+pub const WORK_MEMORY_CHECKPOINT_PUT_METHOD: &str = "work_memory.checkpoint.put";
+pub const WORK_MEMORY_RESUME_METHOD: &str = "work_memory.resume";
+pub const WORK_MEMORY_SEARCH_METHOD: &str = "work_memory.search";
 
 pub fn local_method_schemas(query: &str) -> Vec<Value> {
     let schemas = vec![
@@ -115,6 +121,127 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "backup": {"type": "boolean"},
                 },
                 "required": ["path", "content", "sha256"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": WORK_MEMORY_BIND_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "params": {
+                "properties": {
+                    "continuity_id": {"type": "string", "maxLength": 160},
+                    "project_ref": {"type": "string", "maxLength": 512},
+                    "repo_id": {"type": "string", "maxLength": 512},
+                    "work_chain_id": {"type": "string", "maxLength": 128},
+                    "provider": {"type": "string", "maxLength": 32},
+                    "account_ref": {"type": ["string", "null"], "maxLength": 256},
+                    "space_ref": {"type": ["string", "null"], "maxLength": 512},
+                    "session_ref": {"type": "string", "maxLength": 512},
+                    "bound_at": {"type": "integer", "minimum": 0},
+                },
+                "required": ["continuity_id", "project_ref", "repo_id", "work_chain_id", "provider", "session_ref", "bound_at"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": WORK_MEMORY_APPEND_TURN_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "params": {
+                "properties": {
+                    "continuity_id": {"type": "string", "maxLength": 160},
+                    "provider": {"type": "string", "maxLength": 32},
+                    "account_ref": {"type": ["string", "null"], "maxLength": 256},
+                    "space_ref": {"type": ["string", "null"], "maxLength": 512},
+                    "session_ref": {"type": "string", "maxLength": 512},
+                    "provider_message_ref": {"type": "string", "maxLength": 512},
+                    "role": {"type": "string", "maxLength": 32},
+                    "text": {"type": "string", "maxLength": 262144},
+                    "fingerprint": {"type": ["string", "null"], "maxLength": 256},
+                    "observed_at": {"type": "integer", "minimum": 0},
+                },
+                "required": ["continuity_id", "provider", "session_ref", "provider_message_ref", "role", "text", "observed_at"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": WORK_MEMORY_APPEND_EVIDENCE_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "params": {
+                "properties": {
+                    "continuity_id": {"type": "string", "maxLength": 160},
+                    "kind": {"type": "string", "maxLength": 32},
+                    "content": {"type": "string", "maxLength": 262144},
+                    "provider": {"type": ["string", "null"], "maxLength": 32},
+                    "account_ref": {"type": ["string", "null"], "maxLength": 256},
+                    "space_ref": {"type": ["string", "null"], "maxLength": 512},
+                    "session_ref": {"type": ["string", "null"], "maxLength": 512},
+                    "portable_source": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "repo_id": {"type": "string", "maxLength": 512},
+                            "commit_sha": {"type": "string", "maxLength": 64},
+                            "repo_relative_path": {"type": "string", "maxLength": 1024},
+                            "line_start": {"type": ["integer", "null"]},
+                            "line_end": {"type": ["integer", "null"]},
+                        },
+                        "required": ["repo_id", "commit_sha", "repo_relative_path"],
+                        "additionalProperties": false,
+                    },
+                    "created_at": {"type": "integer", "minimum": 0},
+                },
+                "required": ["continuity_id", "kind", "content", "created_at"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": WORK_MEMORY_CHECKPOINT_PUT_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "params": {
+                "properties": {
+                    "continuity_id": {"type": "string", "maxLength": 160},
+                    "expected_checkpoint_revision": {"type": "integer", "minimum": 0},
+                    "summary": {"type": "string", "maxLength": 8192},
+                    "checkpoint_json": {"type": "string", "maxLength": 65536},
+                    "through_message_id": {"type": ["string", "null"], "maxLength": 512},
+                    "through_evidence_id": {"type": ["string", "null"], "maxLength": 128},
+                    "created_at": {"type": "integer", "minimum": 0},
+                },
+                "required": ["continuity_id", "expected_checkpoint_revision", "summary", "checkpoint_json", "created_at"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": WORK_MEMORY_RESUME_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "params": {
+                "properties": {
+                    "project_ref": {"type": "string", "maxLength": 512},
+                    "repo_id": {"type": "string", "maxLength": 512},
+                    "work_chain_id": {"type": "string", "maxLength": 128},
+                    "max_turns": {"type": "integer", "minimum": 1, "maximum": 64},
+                },
+                "required": ["project_ref", "repo_id", "work_chain_id"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": WORK_MEMORY_SEARCH_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "params": {
+                "properties": {
+                    "project_ref": {"type": "string", "maxLength": 512},
+                    "repo_id": {"type": "string", "maxLength": 512},
+                    "work_chain_id": {"type": "string", "maxLength": 128},
+                    "query": {"type": "string", "maxLength": 512},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                },
+                "required": ["project_ref", "repo_id", "work_chain_id", "query"],
                 "empty": false,
             },
         }),
@@ -1908,6 +2035,17 @@ mod tests {
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0]["method"], GITHUB_STATUS_METHOD);
         assert_eq!(methods[0]["params"]["required"][0], "project_root");
+
+        let methods = local_method_schemas("work_memory.");
+        assert_eq!(methods.len(), 6);
+        assert_eq!(methods[0]["method"], WORK_MEMORY_BIND_METHOD);
+        assert_eq!(methods[0]["schema_version"], 1);
+        assert_eq!(methods[4]["method"], WORK_MEMORY_RESUME_METHOD);
+        assert_eq!(
+            methods[4]["params"]["required"],
+            json!(["project_ref", "repo_id", "work_chain_id"])
+        );
+        assert_eq!(methods[5]["method"], WORK_MEMORY_SEARCH_METHOD);
     }
 
     #[test]

@@ -19,6 +19,7 @@
 #![allow(dead_code)]
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
@@ -31,7 +32,7 @@ pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
 /// assert it remains exactly equal to the append-only migration count.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Meta-table key holding the applied schema version. Stored as a string.
 const META_SCHEMA_VERSION: &str = "schema_version";
@@ -228,6 +229,84 @@ CREATE INDEX IF NOT EXISTS idx_continuity_transfers_chain
     ON continuity_transfers(continuity_id, updated_at DESC);
 "#;
 
+/// Migration 6: project-level Work Memory on the existing Continuity Journal.
+/// Full raw turns/evidence remain local; FTS5 is an index over the same DB.
+const MIGRATION_V6: &str = r#"
+ALTER TABLE continuity_chains ADD COLUMN project_ref TEXT;
+ALTER TABLE continuity_chains ADD COLUMN repo_id TEXT;
+ALTER TABLE continuity_chains ADD COLUMN work_chain_id TEXT;
+ALTER TABLE continuity_chains ADD COLUMN checkpoint_revision INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE continuity_chains ADD COLUMN retention_policy TEXT NOT NULL DEFAULT 'retain_all';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_continuity_chains_work_partition
+    ON continuity_chains(project_ref, repo_id, work_chain_id)
+    WHERE project_ref IS NOT NULL AND repo_id IS NOT NULL AND work_chain_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS continuity_provider_bindings (
+    continuity_id TEXT NOT NULL,
+    provider      TEXT NOT NULL,
+    account_ref   TEXT NOT NULL DEFAULT '',
+    space_ref     TEXT NOT NULL DEFAULT '',
+    session_ref   TEXT NOT NULL,
+    bound_at      INTEGER NOT NULL,
+    PRIMARY KEY (continuity_id, provider, account_ref, space_ref, session_ref),
+    FOREIGN KEY (continuity_id) REFERENCES continuity_chains(continuity_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_continuity_provider_session
+    ON continuity_provider_bindings(provider, account_ref, space_ref, session_ref);
+
+ALTER TABLE continuity_turns ADD COLUMN provider TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE continuity_turns ADD COLUMN account_ref TEXT NOT NULL DEFAULT '';
+ALTER TABLE continuity_turns ADD COLUMN space_ref TEXT NOT NULL DEFAULT '';
+ALTER TABLE continuity_turns ADD COLUMN provider_session_ref TEXT NOT NULL DEFAULT '';
+ALTER TABLE continuity_turns ADD COLUMN provider_message_ref TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_continuity_turns_provider_message
+    ON continuity_turns(
+        continuity_id, provider, account_ref, space_ref,
+        provider_session_ref, provider_message_ref
+    ) WHERE provider_message_ref IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS continuity_evidence (
+    continuity_id TEXT NOT NULL,
+    evidence_id   TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    content       TEXT NOT NULL,
+    sha256        TEXT NOT NULL,
+    provider      TEXT,
+    account_ref   TEXT,
+    space_ref     TEXT,
+    session_ref   TEXT,
+    portable_repo_id TEXT,
+    portable_commit_sha TEXT,
+    portable_path TEXT,
+    portable_line_start INTEGER,
+    portable_line_end INTEGER,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (continuity_id, evidence_id),
+    FOREIGN KEY (continuity_id) REFERENCES continuity_chains(continuity_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_continuity_evidence_order
+    ON continuity_evidence(continuity_id, created_at DESC);
+
+ALTER TABLE continuity_checkpoints ADD COLUMN checkpoint_revision INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE continuity_checkpoints ADD COLUMN checkpoint_json TEXT;
+ALTER TABLE continuity_checkpoints ADD COLUMN checkpoint_sha256 TEXT;
+ALTER TABLE continuity_checkpoints ADD COLUMN verified INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE continuity_checkpoints ADD COLUMN through_evidence_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_continuity_checkpoints_revision
+    ON continuity_checkpoints(continuity_id, checkpoint_revision)
+    WHERE checkpoint_revision > 0;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS continuity_memory_fts USING fts5(
+    continuity_id UNINDEXED,
+    source_kind UNINDEXED,
+    source_id UNINDEXED,
+    text
+);
+INSERT INTO continuity_memory_fts(continuity_id, source_kind, source_id, text)
+    SELECT continuity_id, 'turn', message_id, text FROM continuity_turns;
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
 const MIGRATIONS: &[&str] = &[
@@ -236,6 +315,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V3,
     MIGRATION_V4,
     MIGRATION_V5,
+    MIGRATION_V6,
 ];
 
 /// Existing durable operation found while reserving an idempotency key.
@@ -320,6 +400,147 @@ pub struct ContinuitySearchCandidate {
     pub workspace_ids: Vec<String>,
     pub recent_user_excerpt: Option<String>,
     pub recent_assistant_excerpt: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkMemoryBindingInput<'a> {
+    pub continuity_id: &'a str,
+    pub project_ref: &'a str,
+    pub repo_id: &'a str,
+    pub work_chain_id: &'a str,
+    pub provider: &'a str,
+    pub account_ref: Option<&'a str>,
+    pub space_ref: Option<&'a str>,
+    pub session_ref: &'a str,
+    pub bound_at: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkMemoryTurnInput<'a> {
+    pub continuity_id: &'a str,
+    pub provider: &'a str,
+    pub account_ref: Option<&'a str>,
+    pub space_ref: Option<&'a str>,
+    pub session_ref: &'a str,
+    pub provider_message_ref: &'a str,
+    pub role: &'a str,
+    pub text: &'a str,
+    pub fingerprint: Option<&'a str>,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkMemoryEvidenceInput<'a> {
+    pub continuity_id: &'a str,
+    pub kind: &'a str,
+    pub content: &'a str,
+    pub provider: Option<&'a str>,
+    pub account_ref: Option<&'a str>,
+    pub space_ref: Option<&'a str>,
+    pub session_ref: Option<&'a str>,
+    pub portable_source: Option<WorkMemoryPortableSourceInput<'a>>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkMemoryPortableSourceInput<'a> {
+    pub repo_id: &'a str,
+    pub commit_sha: &'a str,
+    pub repo_relative_path: &'a str,
+    pub line_start: Option<i64>,
+    pub line_end: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkMemoryCheckpointInput<'a> {
+    pub continuity_id: &'a str,
+    pub expected_checkpoint_revision: i64,
+    pub summary: &'a str,
+    pub checkpoint_json: &'a str,
+    pub through_message_id: Option<&'a str>,
+    pub through_evidence_id: Option<&'a str>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMemoryPortableEvidenceRef {
+    pub kind: String,
+    pub repo_id: String,
+    pub commit_sha: String,
+    pub repo_relative_path: String,
+    pub line_start: Option<i64>,
+    pub line_end: Option<i64>,
+    pub evidence_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMemoryEvidenceAppendRecord {
+    pub evidence_id: String,
+    pub sha256: String,
+    pub portable_ref: Option<WorkMemoryPortableEvidenceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMemoryTurnRecord {
+    pub provider: String,
+    pub account_ref: String,
+    pub space_ref: String,
+    pub session_ref: String,
+    pub provider_message_ref: String,
+    pub role: String,
+    pub text: String,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMemoryTurnAppendRecord {
+    pub inserted: bool,
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMemoryCheckpointRecord {
+    pub revision: i64,
+    pub summary: String,
+    pub checkpoint_json: String,
+    pub sha256: String,
+    pub through_message_id: Option<String>,
+    pub through_evidence_id: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMemoryEvidenceRecord {
+    pub evidence_id: String,
+    pub kind: String,
+    pub content: String,
+    pub sha256: String,
+    pub provider: Option<String>,
+    pub session_ref: Option<String>,
+    pub portable_ref: Option<WorkMemoryPortableEvidenceRef>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMemoryResumeRecord {
+    pub continuity_id: String,
+    pub project_ref: String,
+    pub repo_id: String,
+    pub work_chain_id: String,
+    pub checkpoint_revision: i64,
+    pub retention_policy: String,
+    pub checkpoint: Option<WorkMemoryCheckpointRecord>,
+    pub turns: Vec<WorkMemoryTurnRecord>,
+    pub evidence: Vec<WorkMemoryEvidenceRecord>,
+    pub evidence_refs: Vec<WorkMemoryPortableEvidenceRef>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMemorySearchHit {
+    pub source_kind: String,
+    pub source_id: String,
+    pub excerpt: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -706,6 +927,14 @@ impl StateStore {
                 ],
             )
             .map_err(|error| format!("cannot append continuity turn: {error}"))?;
+        if inserted == 1 {
+            tx.execute(
+                "INSERT INTO continuity_memory_fts(continuity_id, source_kind, source_id, text)
+                 VALUES (?1, 'turn', ?2, ?3)",
+                params![continuity_id, message_id, text],
+            )
+            .map_err(|error| format!("cannot index continuity turn: {error}"))?;
+        }
         tx.commit()
             .map_err(|error| format!("cannot commit continuity append: {error}"))?;
         Ok(inserted == 1)
@@ -982,6 +1211,1018 @@ impl StateStore {
             _ => Err("continuity_binding_ambiguous".to_owned()),
         }
     }
+
+    pub fn bind_work_memory(&mut self, input: WorkMemoryBindingInput<'_>) -> Result<(), String> {
+        validate_work_memory_partition(
+            input.continuity_id,
+            input.project_ref,
+            input.repo_id,
+            input.work_chain_id,
+        )?;
+        validate_provider_binding(
+            input.provider,
+            input.account_ref,
+            input.space_ref,
+            input.session_ref,
+        )?;
+        let account_ref = input.account_ref.unwrap_or("");
+        let space_ref = input.space_ref.unwrap_or("");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin work memory bind: {error}"))?;
+        let partition_owner = tx
+            .query_row(
+                "SELECT continuity_id FROM continuity_chains
+                 WHERE project_ref = ?1 AND repo_id = ?2 AND work_chain_id = ?3
+                   AND continuity_id <> ?4
+                 LIMIT 1",
+                params![
+                    input.project_ref,
+                    input.repo_id,
+                    input.work_chain_id,
+                    input.continuity_id
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect work memory partition owner: {error}"))?;
+        if partition_owner.is_some() {
+            return Err("work_memory_partition_already_bound".to_owned());
+        }
+        tx.execute(
+            "INSERT INTO continuity_chains (
+                continuity_id, title, project_id, status, created_at, updated_at,
+                project_ref, repo_id, work_chain_id
+             ) VALUES (?1, NULL, NULL, 'active', ?5, ?5, ?2, ?3, ?4)
+             ON CONFLICT(continuity_id) DO NOTHING",
+            params![
+                input.continuity_id,
+                input.project_ref,
+                input.repo_id,
+                input.work_chain_id,
+                input.bound_at
+            ],
+        )
+        .map_err(|error| format!("cannot create work memory chain: {error}"))?;
+        let existing = tx
+            .query_row(
+                "SELECT project_ref, repo_id, work_chain_id FROM continuity_chains WHERE continuity_id = ?1",
+                [input.continuity_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| format!("cannot read work memory partition: {error}"))?;
+        if existing
+            .0
+            .as_deref()
+            .is_some_and(|value| value != input.project_ref)
+            || existing
+                .1
+                .as_deref()
+                .is_some_and(|value| value != input.repo_id)
+            || existing
+                .2
+                .as_deref()
+                .is_some_and(|value| value != input.work_chain_id)
+        {
+            return Err("work_memory_partition_mismatch".to_owned());
+        }
+        tx.execute(
+            "UPDATE continuity_chains SET
+                project_ref = COALESCE(project_ref, ?2),
+                repo_id = COALESCE(repo_id, ?3),
+                work_chain_id = COALESCE(work_chain_id, ?4),
+                updated_at = MAX(updated_at, ?5)
+             WHERE continuity_id = ?1",
+            params![
+                input.continuity_id,
+                input.project_ref,
+                input.repo_id,
+                input.work_chain_id,
+                input.bound_at
+            ],
+        )
+        .map_err(|error| format!("cannot bind work memory partition: {error}"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO continuity_provider_bindings (
+                continuity_id, provider, account_ref, space_ref, session_ref, bound_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                input.continuity_id,
+                input.provider,
+                account_ref,
+                space_ref,
+                input.session_ref,
+                input.bound_at
+            ],
+        )
+        .map_err(|error| format!("cannot persist work memory provider binding: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit work memory bind: {error}"))
+    }
+
+    pub fn append_work_memory_turn(
+        &mut self,
+        input: WorkMemoryTurnInput<'_>,
+    ) -> Result<WorkMemoryTurnAppendRecord, String> {
+        if !matches!(input.role, "user" | "assistant") {
+            return Err("work_memory_role_invalid".to_owned());
+        }
+        if input.text.len() > 256 * 1024 || input.text.is_empty() {
+            return Err("work_memory_turn_invalid".to_owned());
+        }
+        validate_provider_binding(
+            input.provider,
+            input.account_ref,
+            input.space_ref,
+            input.session_ref,
+        )?;
+        validate_work_memory_ref(input.provider_message_ref, 512, "provider_message_ref")?;
+        let account_ref = input.account_ref.unwrap_or("");
+        let space_ref = input.space_ref.unwrap_or("");
+        let message_id = qualified_work_memory_message_id(
+            input.continuity_id,
+            input.provider,
+            account_ref,
+            space_ref,
+            input.session_ref,
+            input.provider_message_ref,
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin work memory turn append: {error}"))?;
+        require_provider_binding(
+            &tx,
+            input.continuity_id,
+            input.provider,
+            account_ref,
+            space_ref,
+            input.session_ref,
+        )?;
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO continuity_turns (
+                    continuity_id, conversation_id, message_id, role, text,
+                    fingerprint, observed_at, provider, account_ref, space_ref,
+                    provider_session_ref, provider_message_ref
+                 ) VALUES (?1, ?5, ?7, ?8, ?9, ?10, ?11, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    input.continuity_id,
+                    input.provider,
+                    account_ref,
+                    space_ref,
+                    input.session_ref,
+                    input.provider_message_ref,
+                    message_id,
+                    input.role,
+                    input.text,
+                    input.fingerprint,
+                    input.observed_at
+                ],
+            )
+            .map_err(|error| format!("cannot append work memory turn: {error}"))?;
+        if inserted == 1 {
+            tx.execute(
+                "INSERT INTO continuity_memory_fts(continuity_id, source_kind, source_id, text)
+                 VALUES (?1, 'turn', ?2, ?3)",
+                params![input.continuity_id, message_id, input.text],
+            )
+            .map_err(|error| format!("cannot index work memory turn: {error}"))?;
+            tx.execute(
+                "UPDATE continuity_chains SET updated_at = MAX(updated_at, ?2) WHERE continuity_id = ?1",
+                params![input.continuity_id, input.observed_at],
+            )
+            .map_err(|error| format!("cannot update work memory chain: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit work memory turn: {error}"))?;
+        Ok(WorkMemoryTurnAppendRecord {
+            inserted: inserted == 1,
+            message_id,
+        })
+    }
+
+    pub fn append_work_memory_evidence(
+        &mut self,
+        input: WorkMemoryEvidenceInput<'_>,
+    ) -> Result<WorkMemoryEvidenceAppendRecord, String> {
+        validate_work_memory_ref(input.continuity_id, 160, "continuity_id")?;
+        if !valid_work_memory_token(input.kind, 32)
+            || input.content.is_empty()
+            || input.content.len() > 256 * 1024
+        {
+            return Err("work_memory_evidence_invalid".to_owned());
+        }
+        if let Some(provider) = input.provider {
+            let session_ref = input
+                .session_ref
+                .ok_or_else(|| "work_memory_evidence_session_required".to_owned())?;
+            validate_provider_binding(provider, input.account_ref, input.space_ref, session_ref)?;
+        }
+        let portable_ref = input
+            .portable_source
+            .map(|source| validate_portable_source(source, input.content))
+            .transpose()?;
+        let content_sha = sha256_text(input.content);
+        let identity = format!(
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}\0{:?}",
+            input.continuity_id,
+            input.kind,
+            content_sha,
+            input.provider.unwrap_or(""),
+            input.account_ref.unwrap_or(""),
+            input.space_ref.unwrap_or(""),
+            input.session_ref.unwrap_or(""),
+            portable_ref
+                .as_ref()
+                .map(|value| value.repo_id.as_str())
+                .unwrap_or(""),
+            portable_ref
+                .as_ref()
+                .map(|value| value.commit_sha.as_str())
+                .unwrap_or(""),
+            portable_ref
+                .as_ref()
+                .map(|value| value.repo_relative_path.as_str())
+                .unwrap_or(""),
+            portable_ref.as_ref().and_then(|value| value.line_start),
+            portable_ref.as_ref().and_then(|value| value.line_end),
+        );
+        let evidence_id = format!("ev_{}", &sha256_text(&identity)[..32]);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin work memory evidence append: {error}"))?;
+        if let Some(provider) = input.provider {
+            require_provider_binding(
+                &tx,
+                input.continuity_id,
+                provider,
+                input.account_ref.unwrap_or(""),
+                input.space_ref.unwrap_or(""),
+                input.session_ref.unwrap_or(""),
+            )?;
+        } else {
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM continuity_chains WHERE continuity_id = ?1",
+                    [input.continuity_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| format!("cannot resolve work memory chain: {error}"))?;
+            if exists.is_none() {
+                return Err("work_memory_not_found".to_owned());
+            }
+        }
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO continuity_evidence (
+                    continuity_id, evidence_id, kind, content, sha256,
+                    provider, account_ref, space_ref, session_ref,
+                    portable_repo_id, portable_commit_sha, portable_path,
+                    portable_line_start, portable_line_end, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    input.continuity_id,
+                    evidence_id,
+                    input.kind,
+                    input.content,
+                    content_sha,
+                    input.provider,
+                    input.account_ref,
+                    input.space_ref,
+                    input.session_ref,
+                    portable_ref.as_ref().map(|value| value.repo_id.as_str()),
+                    portable_ref.as_ref().map(|value| value.commit_sha.as_str()),
+                    portable_ref
+                        .as_ref()
+                        .map(|value| value.repo_relative_path.as_str()),
+                    portable_ref.as_ref().and_then(|value| value.line_start),
+                    portable_ref.as_ref().and_then(|value| value.line_end),
+                    input.created_at
+                ],
+            )
+            .map_err(|error| format!("cannot append work memory evidence: {error}"))?;
+        if inserted == 1 {
+            tx.execute(
+                "INSERT INTO continuity_memory_fts(continuity_id, source_kind, source_id, text)
+                 VALUES (?1, 'evidence', ?2, ?3)",
+                params![input.continuity_id, evidence_id, input.content],
+            )
+            .map_err(|error| format!("cannot index work memory evidence: {error}"))?;
+            tx.execute(
+                "UPDATE continuity_chains SET updated_at = MAX(updated_at, ?2) WHERE continuity_id = ?1",
+                params![input.continuity_id, input.created_at],
+            )
+            .map_err(|error| format!("cannot update work memory chain: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit work memory evidence: {error}"))?;
+        Ok(WorkMemoryEvidenceAppendRecord {
+            evidence_id,
+            sha256: content_sha,
+            portable_ref,
+        })
+    }
+
+    pub fn put_work_memory_checkpoint(
+        &mut self,
+        input: WorkMemoryCheckpointInput<'_>,
+    ) -> Result<WorkMemoryCheckpointRecord, String> {
+        validate_work_memory_ref(input.continuity_id, 160, "continuity_id")?;
+        if input.expected_checkpoint_revision < 0
+            || input.summary.is_empty()
+            || input.summary.len() > 8 * 1024
+            || input.checkpoint_json.is_empty()
+            || input.checkpoint_json.len() > 64 * 1024
+            || !matches!(
+                serde_json::from_str::<serde_json::Value>(input.checkpoint_json),
+                Ok(serde_json::Value::Object(_))
+            )
+            || input.through_message_id.is_none() && input.through_evidence_id.is_none()
+        {
+            return Err("work_memory_checkpoint_invalid".to_owned());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin work memory checkpoint: {error}"))?;
+        let current = tx
+            .query_row(
+                "SELECT checkpoint_revision FROM continuity_chains
+                 WHERE continuity_id = ?1 AND project_ref IS NOT NULL
+                   AND repo_id IS NOT NULL AND work_chain_id IS NOT NULL",
+                [input.continuity_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot read work memory checkpoint revision: {error}"))?
+            .ok_or_else(|| "work_memory_not_found".to_owned())?;
+        if current != input.expected_checkpoint_revision {
+            return Err(format!(
+                "work_memory_checkpoint_revision_conflict:{current}"
+            ));
+        }
+        if let Some(message_id) = input.through_message_id {
+            validate_work_memory_ref(message_id, 128, "through_message_id")?;
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM continuity_turns
+                     WHERE continuity_id = ?1 AND message_id = ?2",
+                    params![input.continuity_id, message_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| format!("cannot verify work memory checkpoint turn: {error}"))?;
+            if exists.is_none() {
+                return Err("work_memory_checkpoint_turn_not_found".to_owned());
+            }
+        }
+        if let Some(evidence_id) = input.through_evidence_id {
+            if !valid_local_evidence_id(evidence_id) {
+                return Err("work_memory_checkpoint_evidence_invalid".to_owned());
+            }
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM continuity_evidence
+                     WHERE continuity_id = ?1 AND evidence_id = ?2",
+                    params![input.continuity_id, evidence_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| {
+                    format!("cannot verify work memory checkpoint evidence: {error}")
+                })?;
+            if exists.is_none() {
+                return Err("work_memory_checkpoint_evidence_not_found".to_owned());
+            }
+        }
+        let revision = current + 1;
+        let checkpoint_id = format!("wmcp:{revision}");
+        let checkpoint_sha256 = sha256_text(input.checkpoint_json);
+        tx.execute(
+            "INSERT INTO continuity_checkpoints (
+                continuity_id, checkpoint_id, through_message_id, summary,
+                anchors_json, created_at, checkpoint_revision, checkpoint_json,
+                checkpoint_sha256, verified, through_evidence_id
+             ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, 1, ?9)",
+            params![
+                input.continuity_id,
+                checkpoint_id,
+                input.through_message_id,
+                input.summary,
+                input.created_at,
+                revision,
+                input.checkpoint_json,
+                checkpoint_sha256,
+                input.through_evidence_id
+            ],
+        )
+        .map_err(|error| format!("cannot write work memory checkpoint: {error}"))?;
+        tx.execute(
+            "UPDATE continuity_chains SET checkpoint_revision = ?2,
+                updated_at = MAX(updated_at, ?3) WHERE continuity_id = ?1",
+            params![input.continuity_id, revision, input.created_at],
+        )
+        .map_err(|error| format!("cannot advance work memory checkpoint: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit work memory checkpoint: {error}"))?;
+        Ok(WorkMemoryCheckpointRecord {
+            revision,
+            summary: input.summary.to_owned(),
+            checkpoint_json: input.checkpoint_json.to_owned(),
+            sha256: checkpoint_sha256,
+            through_message_id: input.through_message_id.map(str::to_owned),
+            through_evidence_id: input.through_evidence_id.map(str::to_owned),
+            created_at: input.created_at,
+        })
+    }
+
+    pub fn work_memory_resume_by_partition(
+        &self,
+        project_ref: &str,
+        repo_id: &str,
+        work_chain_id: &str,
+        max_turns: usize,
+    ) -> Result<Option<WorkMemoryResumeRecord>, String> {
+        validate_work_memory_partition_identity(project_ref, repo_id, work_chain_id)?;
+        let continuity_id = self
+            .conn
+            .query_row(
+                "SELECT continuity_id FROM continuity_chains
+                 WHERE project_ref = ?1 AND repo_id = ?2 AND work_chain_id = ?3
+                   AND status = 'active'",
+                params![project_ref, repo_id, work_chain_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot resolve work memory partition: {error}"))?;
+        match continuity_id {
+            Some(continuity_id) => self.work_memory_resume(&continuity_id, max_turns),
+            None => Ok(None),
+        }
+    }
+
+    pub fn work_memory_resume(
+        &self,
+        continuity_id: &str,
+        max_turns: usize,
+    ) -> Result<Option<WorkMemoryResumeRecord>, String> {
+        let chain = self
+            .conn
+            .query_row(
+                "SELECT project_ref, repo_id, work_chain_id, checkpoint_revision,
+                        retention_policy, updated_at
+                 FROM continuity_chains WHERE continuity_id = ?1 AND status = 'active'",
+                [continuity_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read work memory chain: {error}"))?;
+        let Some((
+            project_ref,
+            repo_id,
+            work_chain_id,
+            checkpoint_revision,
+            retention_policy,
+            updated_at,
+        )) = chain
+        else {
+            return Ok(None);
+        };
+        let (Some(project_ref), Some(repo_id), Some(work_chain_id)) =
+            (project_ref, repo_id, work_chain_id)
+        else {
+            return Err("work_memory_partition_unbound".to_owned());
+        };
+        let checkpoint = self
+            .conn
+            .query_row(
+                "SELECT checkpoint_revision, summary, checkpoint_json,
+                        checkpoint_sha256, through_message_id, through_evidence_id, created_at
+                 FROM continuity_checkpoints
+                 WHERE continuity_id = ?1 AND verified = 1 AND checkpoint_revision > 0
+                 ORDER BY checkpoint_revision DESC LIMIT 1",
+                [continuity_id],
+                |row| {
+                    Ok(WorkMemoryCheckpointRecord {
+                        revision: row.get(0)?,
+                        summary: row.get(1)?,
+                        checkpoint_json: row
+                            .get::<_, Option<String>>(2)?
+                            .unwrap_or_else(|| "{}".to_owned()),
+                        sha256: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        through_message_id: row.get(4)?,
+                        through_evidence_id: row.get(5)?,
+                        created_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read work memory checkpoint: {error}"))?;
+        if checkpoint_revision > 0 {
+            let Some(checkpoint) = checkpoint.as_ref() else {
+                return Err("work_memory_checkpoint_missing".to_owned());
+            };
+            if checkpoint.revision != checkpoint_revision
+                || sha256_text(&checkpoint.checkpoint_json) != checkpoint.sha256
+                || !matches!(
+                    serde_json::from_str::<serde_json::Value>(&checkpoint.checkpoint_json),
+                    Ok(serde_json::Value::Object(_))
+                )
+            {
+                return Err("work_memory_checkpoint_corrupt".to_owned());
+            }
+        }
+        let limit = i64::try_from(max_turns.clamp(1, 64)).unwrap_or(64);
+        let mut turn_stmt = self
+            .conn
+            .prepare(
+                "SELECT provider, account_ref, space_ref,
+                        CASE WHEN provider_session_ref <> '' THEN provider_session_ref ELSE conversation_id END,
+                        COALESCE(provider_message_ref, message_id), role, text, observed_at
+                 FROM continuity_turns WHERE continuity_id = ?1
+                 ORDER BY observed_at DESC LIMIT ?2",
+            )
+            .map_err(|error| format!("cannot prepare work memory turns: {error}"))?;
+        let rows = turn_stmt
+            .query_map(params![continuity_id, limit], |row| {
+                Ok(WorkMemoryTurnRecord {
+                    provider: row.get(0)?,
+                    account_ref: row.get(1)?,
+                    space_ref: row.get(2)?,
+                    session_ref: row.get(3)?,
+                    provider_message_ref: row.get(4)?,
+                    role: row.get(5)?,
+                    text: row.get(6)?,
+                    observed_at: row.get(7)?,
+                })
+            })
+            .map_err(|error| format!("cannot query work memory turns: {error}"))?;
+        let mut turns = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode work memory turn: {error}"))?;
+        turns.reverse();
+        let mut turn_bytes = turns.iter().map(|turn| turn.text.len()).sum::<usize>();
+        while turns.len() > 1 && turn_bytes > 64 * 1024 {
+            turn_bytes = turn_bytes.saturating_sub(turns[0].text.len());
+            turns.remove(0);
+        }
+        let mut evidence_stmt = self
+            .conn
+            .prepare(
+                "SELECT evidence_id, kind, content, sha256, provider, session_ref,
+                        portable_repo_id, portable_commit_sha, portable_path,
+                        portable_line_start, portable_line_end, created_at
+                 FROM continuity_evidence WHERE continuity_id = ?1
+                 ORDER BY created_at DESC LIMIT 24",
+            )
+            .map_err(|error| format!("cannot prepare work memory evidence: {error}"))?;
+        let evidence_rows = evidence_stmt
+            .query_map([continuity_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            })
+            .map_err(|error| format!("cannot query work memory evidence: {error}"))?;
+        let raw_evidence = evidence_rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode work memory evidence: {error}"))?;
+        let mut evidence = Vec::with_capacity(raw_evidence.len());
+        for (
+            evidence_id,
+            kind,
+            content,
+            sha256,
+            provider,
+            session_ref,
+            portable_repo_id,
+            portable_commit_sha,
+            portable_path,
+            portable_line_start,
+            portable_line_end,
+            created_at,
+        ) in raw_evidence
+        {
+            let portable_ref = normalize_stored_portable_ref(
+                portable_repo_id,
+                portable_commit_sha,
+                portable_path,
+                portable_line_start,
+                portable_line_end,
+                &sha256,
+            )?;
+            evidence.push(WorkMemoryEvidenceRecord {
+                evidence_id,
+                kind,
+                content,
+                sha256,
+                provider,
+                session_ref,
+                portable_ref,
+                created_at,
+            });
+        }
+        evidence.reverse();
+        let mut evidence_bytes = evidence
+            .iter()
+            .map(|item| item.content.len())
+            .sum::<usize>();
+        while evidence.len() > 1 && evidence_bytes > 64 * 1024 {
+            evidence_bytes = evidence_bytes.saturating_sub(evidence[0].content.len());
+            evidence.remove(0);
+        }
+        let evidence_refs = evidence
+            .iter()
+            .filter_map(|item| item.portable_ref.clone())
+            .collect();
+        Ok(Some(WorkMemoryResumeRecord {
+            continuity_id: continuity_id.to_owned(),
+            project_ref,
+            repo_id,
+            work_chain_id,
+            checkpoint_revision,
+            retention_policy,
+            checkpoint,
+            turns,
+            evidence,
+            evidence_refs,
+            updated_at,
+        }))
+    }
+
+    pub fn work_memory_search(
+        &self,
+        project_ref: &str,
+        repo_id: &str,
+        work_chain_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkMemorySearchHit>, String> {
+        validate_work_memory_partition_identity(project_ref, repo_id, work_chain_id)?;
+        let query = work_memory_fts_query(query)?;
+        let continuity_id = self
+            .conn
+            .query_row(
+                "SELECT continuity_id FROM continuity_chains
+                 WHERE project_ref = ?1 AND repo_id = ?2 AND work_chain_id = ?3
+                   AND status = 'active'",
+                params![project_ref, repo_id, work_chain_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot resolve work memory partition: {error}"))?;
+        let Some(continuity_id) = continuity_id else {
+            return Ok(Vec::new());
+        };
+        let limit = i64::try_from(limit.clamp(1, 20)).unwrap_or(20);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT source_kind, source_id,
+                        snippet(continuity_memory_fts, 3, '', '', '…', 24)
+                 FROM continuity_memory_fts
+                 WHERE continuity_memory_fts MATCH ?1 AND continuity_id = ?2
+                 ORDER BY rank
+                 LIMIT ?3",
+            )
+            .map_err(|error| format!("cannot prepare work memory search: {error}"))?;
+        let rows = stmt
+            .query_map(params![query, continuity_id, limit], |row| {
+                Ok(WorkMemorySearchHit {
+                    source_kind: row.get(0)?,
+                    source_id: row.get(1)?,
+                    excerpt: row.get(2)?,
+                })
+            })
+            .map_err(|error| format!("cannot query work memory search: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode work memory search: {error}"))
+    }
+}
+
+fn validate_work_memory_partition(
+    continuity_id: &str,
+    project_ref: &str,
+    repo_id: &str,
+    work_chain_id: &str,
+) -> Result<(), String> {
+    validate_work_memory_ref(continuity_id, 160, "continuity_id")?;
+    validate_work_memory_partition_identity(project_ref, repo_id, work_chain_id)
+}
+
+fn validate_work_memory_partition_identity(
+    project_ref: &str,
+    repo_id: &str,
+    work_chain_id: &str,
+) -> Result<(), String> {
+    validate_work_memory_ref(project_ref, 512, "project_ref")?;
+    if !valid_canonical_work_memory_repo_id(repo_id) {
+        return Err("work_memory_repo_id_invalid".to_owned());
+    }
+    if !valid_work_chain_id(work_chain_id) {
+        return Err("work_memory_work_chain_id_invalid".to_owned());
+    }
+    Ok(())
+}
+
+fn valid_canonical_work_memory_repo_id(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 512
+        || value.contains(['\\', ':', '~'])
+        || value
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return false;
+    }
+    let parts = value.split('/').collect::<Vec<_>>();
+    if parts.len() < 3
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || *part == "."
+                || *part == ".."
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+    {
+        return false;
+    }
+    let host = parts[0];
+    if !host.contains('.') || host != host.to_ascii_lowercase() {
+        return false;
+    }
+    host != "github.com"
+        || parts[1..]
+            .iter()
+            .all(|part| *part == part.to_ascii_lowercase())
+}
+
+fn validate_portable_source(
+    source: WorkMemoryPortableSourceInput<'_>,
+    content: &str,
+) -> Result<WorkMemoryPortableEvidenceRef, String> {
+    if !valid_canonical_work_memory_repo_id(source.repo_id) {
+        return Err("work_memory_portable_repo_id_invalid".to_owned());
+    }
+    if !matches!(source.commit_sha.len(), 40 | 64)
+        || !source
+            .commit_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("work_memory_portable_commit_invalid".to_owned());
+    }
+    if !valid_repo_relative_source_path(source.repo_relative_path) {
+        return Err("work_memory_portable_path_invalid".to_owned());
+    }
+    if source.line_start.is_some_and(|value| value < 1)
+        || source.line_end.is_some_and(|value| value < 1)
+        || source.line_end.is_some() && source.line_start.is_none()
+        || matches!((source.line_start, source.line_end), (Some(start), Some(end)) if end < start)
+    {
+        return Err("work_memory_portable_range_invalid".to_owned());
+    }
+    Ok(WorkMemoryPortableEvidenceRef {
+        kind: "git_source".to_owned(),
+        repo_id: source.repo_id.to_owned(),
+        commit_sha: source.commit_sha.to_owned(),
+        repo_relative_path: source.repo_relative_path.to_owned(),
+        line_start: source.line_start,
+        line_end: source.line_end,
+        evidence_sha256: sha256_text(content),
+    })
+}
+
+fn normalize_stored_portable_ref(
+    repo_id: Option<String>,
+    commit_sha: Option<String>,
+    repo_relative_path: Option<String>,
+    line_start: Option<i64>,
+    line_end: Option<i64>,
+    evidence_sha256: &str,
+) -> Result<Option<WorkMemoryPortableEvidenceRef>, String> {
+    if repo_id.is_none() && commit_sha.is_none() && repo_relative_path.is_none() {
+        if line_start.is_some() || line_end.is_some() {
+            return Err("work_memory_portable_ref_corrupt".to_owned());
+        }
+        return Ok(None);
+    }
+    let (Some(repo_id), Some(commit_sha), Some(repo_relative_path)) =
+        (repo_id, commit_sha, repo_relative_path)
+    else {
+        return Err("work_memory_portable_ref_corrupt".to_owned());
+    };
+    let reference = validate_portable_source(
+        WorkMemoryPortableSourceInput {
+            repo_id: &repo_id,
+            commit_sha: &commit_sha,
+            repo_relative_path: &repo_relative_path,
+            line_start,
+            line_end,
+        },
+        "",
+    )?;
+    if !matches!(evidence_sha256.len(), 64)
+        || !evidence_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("work_memory_portable_ref_corrupt".to_owned());
+    }
+    Ok(Some(WorkMemoryPortableEvidenceRef {
+        evidence_sha256: evidence_sha256.to_owned(),
+        ..reference
+    }))
+}
+
+fn valid_repo_relative_source_path(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 1024
+        || value != value.trim()
+        || value.starts_with('/')
+        || value.starts_with('~')
+        || value.contains('\\')
+        || value.chars().any(|ch| {
+            ch.is_control()
+                || matches!(
+                    ch,
+                    ':' | '$'
+                        | '`'
+                        | '"'
+                        | '\''
+                        | '('
+                        | ')'
+                        | '{'
+                        | '}'
+                        | ';'
+                        | '|'
+                        | '&'
+                        | '<'
+                        | '>'
+                        | '!'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '#'
+                )
+        })
+    {
+        return false;
+    }
+    if value.find(':').is_some_and(|index| {
+        value[..index]
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+    }) {
+        return false;
+    }
+    value
+        .split('/')
+        .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+fn valid_work_chain_id(value: &str) -> bool {
+    value.len() == 35
+        && value.starts_with("wc_")
+        && value[3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_local_evidence_id(value: &str) -> bool {
+    value.len() == 35
+        && value.starts_with("ev_")
+        && value[3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn validate_provider_binding(
+    provider: &str,
+    account_ref: Option<&str>,
+    space_ref: Option<&str>,
+    session_ref: &str,
+) -> Result<(), String> {
+    if !valid_work_memory_token(provider, 32) {
+        return Err("work_memory_provider_invalid".to_owned());
+    }
+    if let Some(value) = account_ref {
+        validate_work_memory_ref(value, 256, "account_ref")?;
+    }
+    if let Some(value) = space_ref {
+        validate_work_memory_ref(value, 512, "space_ref")?;
+    }
+    validate_work_memory_ref(session_ref, 512, "session_ref")
+}
+
+fn validate_work_memory_ref(value: &str, max_bytes: usize, field: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value != value.trim()
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!("work_memory_{field}_invalid"));
+    }
+    Ok(())
+}
+
+fn valid_work_memory_token(value: &str, max_bytes: usize) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= max_bytes
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn require_provider_binding(
+    tx: &rusqlite::Transaction<'_>,
+    continuity_id: &str,
+    provider: &str,
+    account_ref: &str,
+    space_ref: &str,
+    session_ref: &str,
+) -> Result<(), String> {
+    let exists = tx
+        .query_row(
+            "SELECT 1 FROM continuity_provider_bindings
+             WHERE continuity_id = ?1 AND provider = ?2 AND account_ref = ?3
+               AND space_ref = ?4 AND session_ref = ?5",
+            params![continuity_id, provider, account_ref, space_ref, session_ref],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("cannot resolve work memory provider binding: {error}"))?;
+    exists
+        .map(|_| ())
+        .ok_or_else(|| "work_memory_binding_required".to_owned())
+}
+
+fn sha256_text(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn qualified_work_memory_message_id(
+    continuity_id: &str,
+    provider: &str,
+    account_ref: &str,
+    space_ref: &str,
+    session_ref: &str,
+    provider_message_ref: &str,
+) -> String {
+    let identity = format!(
+        "{continuity_id}\0{provider}\0{account_ref}\0{space_ref}\0{session_ref}\0{provider_message_ref}"
+    );
+    format!("wm_{}", sha256_text(&identity))
+}
+
+fn work_memory_fts_query(query: &str) -> Result<String, String> {
+    let query = query.trim();
+    if query.is_empty() || query.len() > 512 || query.chars().any(char::is_control) {
+        return Err("work_memory_query_invalid".to_owned());
+    }
+    let tokens = query
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+        .take(16)
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return Err("work_memory_query_invalid".to_owned());
+    }
+    Ok(tokens.join(" AND "))
 }
 
 fn bounded_continuity_excerpt(text: &str) -> String {
@@ -2881,7 +4122,7 @@ mod tests {
     #[test]
     fn continuity_turns_are_idempotent_resumable_and_ambiguity_fails_closed() {
         let mut store = StateStore::open(":memory:").unwrap();
-        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(
             store
                 .append_continuity_turn(ContinuityTurnInput {
@@ -3095,6 +4336,362 @@ mod tests {
 
         let long = "x".repeat(300);
         assert_eq!(bounded_continuity_excerpt(&long).chars().count(), 241);
+    }
+
+    #[test]
+    fn schema_v5_migrates_to_work_memory_v6_without_losing_continuity() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        for migration in MIGRATIONS.iter().take(5) {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, '5')",
+            [META_SCHEMA_VERSION],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO continuity_chains(
+                continuity_id, title, project_id, status, created_at, updated_at
+             ) VALUES ('hc:legacy', 'Legacy', 'project-old', 'active', 10, 11)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO continuity_turns(
+                continuity_id, conversation_id, message_id, role, text, fingerprint, observed_at
+             ) VALUES ('hc:legacy', 'conv-old', 'msg-old', 'user', 'legacy continuity survives', NULL, 11)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 6);
+        let legacy = store.continuity_resume("hc:legacy", 8).unwrap().unwrap();
+        assert_eq!(legacy.turns.len(), 1);
+        assert_eq!(legacy.turns[0].text, "legacy continuity survives");
+        let indexed: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM continuity_memory_fts
+                 WHERE continuity_id = 'hc:legacy' AND source_id = 'msg-old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+        store
+            .append_continuity_turn(ContinuityTurnInput {
+                continuity_id: "hc:legacy",
+                conversation_id: "conv-old",
+                workspace_id: None,
+                project_id: Some("project-old"),
+                title: None,
+                message_id: "msg-after-v6",
+                role: "assistant",
+                text: "post migration continuity remains searchable",
+                fingerprint: None,
+                observed_at: 12,
+            })
+            .unwrap();
+        store
+            .bind_work_memory(WorkMemoryBindingInput {
+                continuity_id: "hc:legacy",
+                project_ref: "project:legacy",
+                repo_id: "github.com/whshang/herdr-mcp",
+                work_chain_id: "wc_dddddddddddddddddddddddddddddddd",
+                provider: "chatgpt",
+                account_ref: None,
+                space_ref: None,
+                session_ref: "legacy-session",
+                bound_at: 13,
+            })
+            .unwrap();
+        let hits = store
+            .work_memory_search(
+                "project:legacy",
+                "github.com/whshang/herdr-mcp",
+                "wc_dddddddddddddddddddddddddddddddd",
+                "post migration searchable",
+                5,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source_id, "msg-after-v6");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn work_memory_is_provider_qualified_checkpointed_and_partition_searchable() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        store
+            .bind_work_memory(WorkMemoryBindingInput {
+                continuity_id: "wm:alpha",
+                project_ref: "project:herdr-mcp",
+                repo_id: "github.com/whshang/herdr-mcp",
+                work_chain_id: "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                provider: "chatgpt",
+                account_ref: Some("account-a"),
+                space_ref: Some("project-space"),
+                session_ref: "shared-session",
+                bound_at: 100,
+            })
+            .unwrap();
+        store
+            .bind_work_memory(WorkMemoryBindingInput {
+                continuity_id: "wm:alpha",
+                project_ref: "project:herdr-mcp",
+                repo_id: "github.com/whshang/herdr-mcp",
+                work_chain_id: "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                provider: "gemini",
+                account_ref: Some("account-b"),
+                space_ref: Some("project-space"),
+                session_ref: "shared-session",
+                bound_at: 101,
+            })
+            .unwrap();
+
+        let empty_resume = store
+            .work_memory_resume_by_partition(
+                "project:herdr-mcp",
+                "github.com/whshang/herdr-mcp",
+                "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                32,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty_resume.checkpoint_revision, 0);
+        assert!(empty_resume.checkpoint.is_none());
+        assert!(empty_resume.turns.is_empty());
+        assert!(empty_resume.evidence.is_empty());
+
+        let partition_conflict = store
+            .bind_work_memory(WorkMemoryBindingInput {
+                continuity_id: "wm:alpha-alias",
+                project_ref: "project:herdr-mcp",
+                repo_id: "github.com/whshang/herdr-mcp",
+                work_chain_id: "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                provider: "chatgpt",
+                account_ref: Some("account-a"),
+                space_ref: Some("project-space"),
+                session_ref: "alias-session",
+                bound_at: 102,
+            })
+            .unwrap_err();
+        assert_eq!(partition_conflict, "work_memory_partition_already_bound");
+        let chatgpt_turn = store
+            .append_work_memory_turn(WorkMemoryTurnInput {
+                continuity_id: "wm:alpha",
+                provider: "chatgpt",
+                account_ref: Some("account-a"),
+                space_ref: Some("project-space"),
+                session_ref: "shared-session",
+                provider_message_ref: "same-message-id",
+                role: "user",
+                text: "implement alpha2 work memory",
+                fingerprint: None,
+                observed_at: 110,
+            })
+            .unwrap();
+        assert!(chatgpt_turn.inserted);
+        let gemini_turn = store
+            .append_work_memory_turn(WorkMemoryTurnInput {
+                continuity_id: "wm:alpha",
+                provider: "gemini",
+                account_ref: Some("account-b"),
+                space_ref: Some("project-space"),
+                session_ref: "shared-session",
+                provider_message_ref: "same-message-id",
+                role: "assistant",
+                text: "gemini resumes the same work chain",
+                fingerprint: None,
+                observed_at: 111,
+            })
+            .unwrap();
+        assert!(gemini_turn.inserted);
+        assert_ne!(chatgpt_turn.message_id, gemini_turn.message_id);
+        let evidence = store
+            .append_work_memory_evidence(WorkMemoryEvidenceInput {
+                continuity_id: "wm:alpha",
+                kind: "result",
+                content: "alpha2 portable-evidence-keyword result",
+                provider: Some("gemini"),
+                account_ref: Some("account-b"),
+                space_ref: Some("project-space"),
+                session_ref: Some("shared-session"),
+                portable_source: Some(WorkMemoryPortableSourceInput {
+                    repo_id: "github.com/whshang/herdr-mcp",
+                    commit_sha: "0123456789abcdef0123456789abcdef01234567",
+                    repo_relative_path: "crates/herdr-mcp/src/state_store.rs",
+                    line_start: Some(1),
+                    line_end: Some(10),
+                }),
+                created_at: 112,
+            })
+            .unwrap();
+        assert!(evidence.evidence_id.starts_with("ev_"));
+        assert_eq!(evidence.sha256.len(), 64);
+        assert!(evidence.portable_ref.is_some());
+
+        for source in [
+            WorkMemoryPortableSourceInput {
+                repo_id: "github.com/whshang/herdr-mcp",
+                commit_sha: "e9281b4",
+                repo_relative_path: "crates/herdr-mcp/src/state_store.rs",
+                line_start: None,
+                line_end: None,
+            },
+            WorkMemoryPortableSourceInput {
+                repo_id: "github.com/whshang/herdr-mcp",
+                commit_sha: "0123456789abcdef0123456789abcdef01234567",
+                repo_relative_path: "/Users/example/private",
+                line_start: None,
+                line_end: None,
+            },
+            WorkMemoryPortableSourceInput {
+                repo_id: "github.com/whshang/herdr-mcp",
+                commit_sha: "0123456789abcdef0123456789abcdef01234567",
+                repo_relative_path: "https://example.invalid/source",
+                line_start: None,
+                line_end: None,
+            },
+        ] {
+            assert!(
+                store
+                    .append_work_memory_evidence(WorkMemoryEvidenceInput {
+                        continuity_id: "wm:alpha",
+                        kind: "result",
+                        content: "must not become portable",
+                        provider: None,
+                        account_ref: None,
+                        space_ref: None,
+                        session_ref: None,
+                        portable_source: Some(source),
+                        created_at: 113,
+                    })
+                    .is_err()
+            );
+        }
+
+        let ungrounded = store
+            .put_work_memory_checkpoint(WorkMemoryCheckpointInput {
+                continuity_id: "wm:alpha",
+                expected_checkpoint_revision: 0,
+                summary: "Ungrounded",
+                checkpoint_json: r#"{"goal":"invalid"}"#,
+                through_message_id: None,
+                through_evidence_id: None,
+                created_at: 119,
+            })
+            .unwrap_err();
+        assert_eq!(ungrounded, "work_memory_checkpoint_invalid");
+
+        let checkpoint = store
+            .put_work_memory_checkpoint(WorkMemoryCheckpointInput {
+                continuity_id: "wm:alpha",
+                expected_checkpoint_revision: 0,
+                summary: "Alpha2 checkpoint",
+                checkpoint_json: r#"{"goal":"ship alpha2","planner":"chatgpt"}"#,
+                through_message_id: Some(&gemini_turn.message_id),
+                through_evidence_id: Some(&evidence.evidence_id),
+                created_at: 120,
+            })
+            .unwrap();
+        assert_eq!(checkpoint.revision, 1);
+        let conflict = store
+            .put_work_memory_checkpoint(WorkMemoryCheckpointInput {
+                continuity_id: "wm:alpha",
+                expected_checkpoint_revision: 0,
+                summary: "stale",
+                checkpoint_json: r#"{"stale":true}"#,
+                through_message_id: Some(&gemini_turn.message_id),
+                through_evidence_id: Some(&evidence.evidence_id),
+                created_at: 121,
+            })
+            .unwrap_err();
+        assert_eq!(conflict, "work_memory_checkpoint_revision_conflict:1");
+
+        let resume = store
+            .work_memory_resume_by_partition(
+                "project:herdr-mcp",
+                "github.com/whshang/herdr-mcp",
+                "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                32,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(resume.project_ref, "project:herdr-mcp");
+        assert_eq!(resume.repo_id, "github.com/whshang/herdr-mcp");
+        assert_eq!(resume.work_chain_id, "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(resume.checkpoint_revision, 1);
+        assert_eq!(resume.checkpoint.as_ref().unwrap().revision, 1);
+        assert_eq!(resume.turns.len(), 2);
+        assert_eq!(resume.turns[0].provider, "chatgpt");
+        assert_eq!(resume.turns[1].provider, "gemini");
+        assert_eq!(resume.evidence.len(), 1);
+        assert_eq!(
+            resume.evidence_refs,
+            vec![evidence.portable_ref.clone().unwrap()]
+        );
+
+        store
+            .bind_work_memory(WorkMemoryBindingInput {
+                continuity_id: "wm:beta",
+                project_ref: "project:herdr-mcp",
+                repo_id: "github.com/whshang/herdr-mcp",
+                work_chain_id: "wc_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                provider: "chatgpt",
+                account_ref: Some("account-a"),
+                space_ref: Some("project-space"),
+                session_ref: "beta-session",
+                bound_at: 200,
+            })
+            .unwrap();
+        store
+            .append_work_memory_evidence(WorkMemoryEvidenceInput {
+                continuity_id: "wm:beta",
+                kind: "result",
+                content: "alpha2 portable-evidence-keyword belongs to beta",
+                provider: None,
+                account_ref: None,
+                space_ref: None,
+                session_ref: None,
+                portable_source: None,
+                created_at: 201,
+            })
+            .unwrap();
+
+        let ranked_evidence = store
+            .append_work_memory_evidence(WorkMemoryEvidenceInput {
+                continuity_id: "wm:alpha",
+                kind: "result",
+                content: "alpha2 portable-evidence-keyword result result result result result result",
+                provider: None,
+                account_ref: None,
+                space_ref: None,
+                session_ref: None,
+                portable_source: None,
+                created_at: 202,
+            })
+            .unwrap();
+
+        let hits = store
+            .work_memory_search(
+                "project:herdr-mcp",
+                "github.com/whshang/herdr-mcp",
+                "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "portable-evidence-keyword result",
+                10,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].source_kind, "evidence");
+        assert_eq!(hits[0].source_id, ranked_evidence.evidence_id);
     }
 
     #[cfg(unix)]
