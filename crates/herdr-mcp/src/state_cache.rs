@@ -1208,8 +1208,13 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    let peer_closed = error.code == "event_stream_closed";
                     set_last_error(&shared, error.to_string());
-                    // Force a status-only replacement on the next iteration.
+                    if peer_closed {
+                        break;
+                    }
+                    // Transient status errors keep the topology stream alive and
+                    // retry only the per-pane status subscription.
                     status_subscriptions.clear();
                 }
             }
