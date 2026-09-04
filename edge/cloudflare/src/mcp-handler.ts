@@ -65,7 +65,7 @@ export interface McpDeps {
     | { ok: true; client_id: string; approved_at_ms: number | null }
     | { ok: false; code: string }
   >;
-  revokeConnector?(clientId: string): Promise<
+  revokeConnector?(connectorId: string): Promise<
     | { ok: true }
     | { ok: false; code: string }
   >;
@@ -671,13 +671,13 @@ export async function handleMcp(
       }
 
       for (const key of Object.keys(methodParams)) {
-        if (key !== "client_id" && key !== "confirm") {
+        if (key !== "connector_id" && key !== "confirm") {
           return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: `unknown parameter '${key}'` }, true));
         }
       }
-      const clientId = typeof methodParams.client_id === "string" ? methodParams.client_id.trim() : "";
-      if (!clientId || clientId.length > 4096) {
-        return rpcResult(id, callToolResult({ ok: false, code: "invalid_client_id", retryable: false }, true));
+      const connectorId = typeof methodParams.connector_id === "string" ? methodParams.connector_id.trim() : "";
+      if (!/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)) {
+        return rpcResult(id, callToolResult({ ok: false, code: "invalid_connector_id", retryable: false }, true));
       }
       if (methodParams.confirm !== true) {
         return rpcResult(id, callToolResult({ ok: false, code: "confirmation_required", message: "connector revoke requires confirm=true", retryable: false }, true));
@@ -685,14 +685,14 @@ export async function handleMcp(
       if (!deps.revokeConnector) {
         return rpcResult(id, callToolResult({ ok: false, code: "connector_revoke_unavailable", retryable: false }, true));
       }
-      const result = await deps.revokeConnector(clientId);
+      const result = await deps.revokeConnector(connectorId);
       if (!result.ok) return rpcResult(id, callToolResult({ ok: false, code: result.code, retryable: false }, true));
       return rpcResult(id, callToolResult({
         ok: true,
         action: "connector_revoke",
-        client_id: clientId,
+        connector_id: connectorId,
         revoked: true,
-        message: "Connector grant revoked. Existing v0.4.6-issued access/refresh credentials are fenced by the grant tombstone.",
+        message: "Connector instance revoked. Existing access/refresh credentials for this connector identity are fenced immediately.",
       }));
     }
 

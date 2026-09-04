@@ -104,7 +104,11 @@ export async function authenticateMcpRequest(
       const verifier = createRs256AccessTokenVerifier(identity, await publicKeyFor(pem));
       const verdict = await verifier.verify(token, Math.floor(Date.now() / 1000));
       if (verdict.ok) {
-        if (deps.verifyLegacyClient) {
+        const legacyShape = verdict.principalType === undefined
+          && verdict.deviceId === undefined
+          && verdict.connectorId === undefined
+          && verdict.grantGeneration === undefined;
+        if (legacyShape && deps.verifyLegacyClient) {
           if (!verdict.clientId) return { ok: false, code: "mcp_auth_failed" };
           try {
             if (!(await deps.verifyLegacyClient(verdict.clientId))) {
@@ -114,12 +118,14 @@ export async function authenticateMcpRequest(
             return { ok: false, code: "mcp_auth_failed" };
           }
         }
-        const result: AccessTokenInfo = verdict.clientId
-          ? { ok: true, clientId: verdict.clientId }
-          : { ok: true };
-        return result.clientId
-          ? { ok: true, source: "oauth_jwt", clientId: result.clientId }
-          : { ok: true, source: "oauth_jwt" };
+        if (legacyShape) {
+          const result: AccessTokenInfo = verdict.clientId
+            ? { ok: true, clientId: verdict.clientId }
+            : { ok: true };
+          return result.clientId
+            ? { ok: true, source: "oauth_jwt", clientId: result.clientId }
+            : { ok: true, source: "oauth_jwt" };
+        }
       }
     } catch {
       // A token not signed by the legacy key may be an Edge-issued JWT.

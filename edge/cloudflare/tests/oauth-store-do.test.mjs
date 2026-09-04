@@ -110,6 +110,85 @@ test("normalizers enforce bounded OAuth state", () => {
   assert.equal(normalizeOAuthCode(code(100), 100), null);
 });
 
+test("pending approval limits are per-client and global, and expired pending rows are reclaimed", async () => {
+  const h = harness();
+  for (let i = 0; i < 4; i++) {
+    const response = await h.post("/internal/oauth/approval/put", {
+      request_id: `req-client-${i}`,
+      record: approval({
+        client_id: "bounded-client",
+        state: `state-${i}`,
+        code_challenge: `${String(i).repeat(1)}${"x".repeat(42)}`,
+      }),
+      now_ms: 100,
+    });
+    assert.equal(response.status, 200);
+  }
+  const fifth = await h.post("/internal/oauth/approval/put", {
+    request_id: "req-client-5",
+    record: approval({ client_id: "bounded-client", state: "state-5", code_challenge: `5${"x".repeat(42)}` }),
+    now_ms: 100,
+  });
+  assert.equal(fifth.status, 429);
+  assert.equal((await body(fifth)).code, "client_pending_limit");
+
+  const global = harness();
+  for (let i = 0; i < 128; i++) {
+    global.storage.map.set(`approval:req-global-${i}`, approval({
+      client_id: `global-${i}`,
+      state: `state-${i}`,
+      expires_at_ms: 20_000,
+    }));
+  }
+  const overflow = await global.post("/internal/oauth/approval/put", {
+    request_id: "req-global-overflow",
+    record: approval({ client_id: "global-overflow", state: "overflow", expires_at_ms: 20_000 }),
+    now_ms: 100,
+  });
+  assert.equal(overflow.status, 429);
+  assert.equal((await body(overflow)).code, "pending_capacity_reached");
+
+  const reclaimed = await global.post("/internal/oauth/approval/put", {
+    request_id: "req-after-expiry",
+    record: approval({
+      client_id: "after-expiry",
+      state: "after-expiry",
+      created_at_ms: 30_000,
+      expires_at_ms: 40_000,
+    }),
+    now_ms: 30_000,
+  });
+  assert.equal(reclaimed.status, 200);
+  assert.equal(global.storage.map.has("approval:req-global-0"), false);
+});
+
+test("unapproved DCR capacity fails closed while one-hour-expired clients are reclaimed", async () => {
+  const recent = harness();
+  for (let i = 0; i < 256; i++) {
+    recent.storage.map.set(`client:dcr-recent-${i}`, { ...client, issued_at: 1_000 });
+  }
+  const blocked = await recent.post("/internal/oauth/client/put", {
+    client_id: "dcr-overflow",
+    record: { ...client, issued_at: 1_001 },
+    now_ms: 1_001_000,
+  });
+  assert.equal(blocked.status, 429);
+  assert.equal((await body(blocked)).code, "dcr_capacity_reached");
+
+  const expired = harness();
+  for (let i = 0; i < 256; i++) {
+    expired.storage.map.set(`client:dcr-expired-${i}`, { ...client, issued_at: 0 });
+  }
+  const accepted = await expired.post("/internal/oauth/client/put", {
+    client_id: "dcr-new",
+    record: { ...client, issued_at: 3_601 },
+    now_ms: 3_601_000,
+  });
+  assert.equal(accepted.status, 200);
+  assert.equal(expired.storage.map.has("client:dcr-expired-0"), false);
+  assert.equal(expired.storage.map.has("client:dcr-new"), true);
+});
+
 test("client put/get and token put/get", async () => {
   const h = harness();
   assert.equal((await body(await h.post("/internal/oauth/client/put", { client_id: "c1", record: client }))).ok, true);
@@ -336,6 +415,78 @@ test("connector grant revoke fences current and legacy JWT/refresh credentials w
     access_ttl_sec: 3600,
     refresh_ttl_sec: 10000,
   })).status, 400);
+});
+
+test("connector instance revoke is isolated while client kill-switch fences every instance and unknown legacy client", async () => {
+  const h = harness();
+  const approve = async (requestId, codeHash) => {
+    await h.post("/internal/oauth/approval/put", {
+      request_id: requestId,
+      record: approval({
+        client_id: "shared-client",
+        approval_code_hash: codeHash,
+        resume_hash: `resume-${requestId}`,
+      }),
+      now_ms: 100,
+    });
+    return body(await h.post("/internal/oauth/approval/approve", {
+      request_id: requestId,
+      code_hash: codeHash,
+      approver: "device:owner",
+      now_ms: 200,
+    }));
+  };
+  const first = await approve("req-inst-1", "good-1");
+  const second = await approve("req-inst-2", "good-2");
+  assert.notEqual(first.record.connector_id, second.record.connector_id);
+
+  const issueFor = async (record) => body(await h.post("/internal/oauth/token/issue", {
+    client_id: "shared-client",
+    connector_id: record.connector_id,
+    grant_generation: 1,
+    resource: "https://issuer/mcp",
+    now_sec: 1000,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 10000,
+  }));
+  const firstIssued = await issueFor(first.record);
+  const secondIssued = await issueFor(second.record);
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: firstIssued.token.access_token, now_sec: 1001 })).status, 200);
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: secondIssued.token.access_token, now_sec: 1001 })).status, 200);
+
+  assert.equal((await h.post("/internal/oauth/connector/revoke", {
+    connector_id: first.record.connector_id,
+    revoked_by: "device:owner",
+    now_ms: 300,
+  })).status, 200);
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: firstIssued.token.access_token, now_sec: 1002 })).status, 401);
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: secondIssued.token.access_token, now_sec: 1002 })).status, 200);
+
+  const killed = await body(await h.post("/internal/oauth/connector/revoke-client", {
+    client_id: "shared-client",
+    revoked_by: "operator:test",
+    now_ms: 400,
+  }));
+  assert.equal(killed.ok, true);
+  assert.equal(killed.revoked_connectors, 1);
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: secondIssued.token.access_token, now_sec: 1003 })).status, 401);
+
+  const legacy = await body(await h.post("/internal/oauth/token/issue", {
+    client_id: "unknown-legacy-client",
+    resource: "https://issuer/mcp",
+    now_sec: 1000,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 10000,
+  }));
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: legacy.token.access_token, now_sec: 1001 })).status, 200);
+  const legacyKill = await body(await h.post("/internal/oauth/connector/revoke-client", {
+    client_id: "unknown-legacy-client",
+    revoked_by: "operator:test",
+    now_ms: 500,
+  }));
+  assert.equal(legacyKill.ok, true);
+  assert.equal(legacyKill.legacy_tombstone_created, true);
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: legacy.token.access_token, now_sec: 1002 })).status, 401);
 });
 
 test("automation client is independently named, monitored, rotated, and revoke fences issued access tokens", async () => {

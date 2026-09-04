@@ -181,12 +181,17 @@ export default {
       }, response.ok ? 200 : 503);
     }
 
-    // ---- Connector approval bootstrap. Fleet administration belongs to the
-    // Worker, not to a privileged workstation. Any currently enrolled device,
-    // explicit v0.4.6+ Connector grant, or Worker operator credential may act
-    // as an administration channel. Pre-v0.4.6 OAuth tokens were issued
-    // without explicit consent and therefore never gain fleet-admin authority
-    // merely by remaining valid for ordinary MCP compatibility.
+    // ---- Connector approval bootstrap. Fleet administration belongs to an
+    // enrolled Device or Worker operator credential. Approved Connectors remain
+    // ordinary MCP principals and never become fleet-administration channels.
+    // Pre-v0.4.6 OAuth tokens likewise keep ordinary MCP compatibility only.
+    if (request.method === "GET" && url.pathname === "/connectors") {
+      const fleetAdmin = await authenticateFleetAdmin(request, env);
+      if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
+      const store = createOAuthPublicStore(env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1")));
+      return noStoreJsonResponse({ ok: true, connectors: await store.listConnectors() });
+    }
+
     if (request.method === "POST" && url.pathname === "/connectors/inspect") {
       const fleetAdmin = await authenticateFleetAdmin(request, env);
       if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
@@ -226,16 +231,29 @@ export default {
       const fleetAdmin = await authenticateFleetAdmin(request, env);
       if (!fleetAdmin) return noStoreJsonResponse({ ok: false, code: "fleet_admin_required" }, 401);
       const parsed = await readBodyBounded(request, 8 * 1024);
-      if (!parsed.ok || !isRecord(parsed.value) || typeof parsed.value.client_id !== "string") {
+      if (!parsed.ok || !isRecord(parsed.value)) {
         const code = parsed.ok ? "bad_request" : parsed.code;
         return noStoreJsonResponse({ ok: false, code }, !parsed.ok && parsed.code === "payload_too_large" ? 413 : 400);
       }
-      const clientId = parsed.value.client_id.trim();
-      if (!clientId || clientId.length > 4096) return noStoreJsonResponse({ ok: false, code: "invalid_client_id" }, 400);
-      const result = await revokeConnectorGrant(env, clientId, fleetAdmin);
+      const connectorId = typeof parsed.value.connector_id === "string" ? parsed.value.connector_id.trim() : "";
+      const clientId = typeof parsed.value.client_id === "string" ? parsed.value.client_id.trim() : "";
+      if ((connectorId.length > 0) === (clientId.length > 0)) {
+        return noStoreJsonResponse({ ok: false, code: "invalid_connector_revoke" }, 400);
+      }
+      if (connectorId) {
+        if (!/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)) {
+          return noStoreJsonResponse({ ok: false, code: "invalid_connector_id" }, 400);
+        }
+        const result = await revokeConnectorInstance(env, connectorId, fleetAdmin);
+        return result.ok
+          ? noStoreJsonResponse({ ok: true, action: "connector_revoke", connector_id: connectorId })
+          : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "connector_not_found" ? 404 : 500);
+      }
+      if (clientId.length > 4096) return noStoreJsonResponse({ ok: false, code: "invalid_client_id" }, 400);
+      const result = await revokeConnectorClient(env, clientId, fleetAdmin);
       return result.ok
-        ? noStoreJsonResponse({ ok: true, action: "connector_revoke", client_id: clientId })
-        : noStoreJsonResponse({ ok: false, code: result.code }, result.code === "connector_grant_not_found" ? 404 : 500);
+        ? noStoreJsonResponse({ ok: true, action: "connector_client_revoke", client_id: clientId })
+        : noStoreJsonResponse({ ok: false, code: result.code }, 500);
     }
 
     // ---- Non-interactive automation principals (GitLab CI, other CI/CD).
@@ -673,11 +691,11 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
           mcpFleetPrincipal,
         );
       },
-      revokeConnector: async (clientId) => {
+      revokeConnector: async (connectorId) => {
         if (!mcpFleetPrincipal) {
           return { ok: false, code: "fleet_admin_required" };
         }
-        return revokeConnectorGrant(env, clientId, mcpFleetPrincipal);
+        return revokeConnectorInstance(env, connectorId, mcpFleetPrincipal);
       },
       resolveDevice: async (selector, args) => {
         const registry = env.DEVICE_REGISTRY_DO.get(env.DEVICE_REGISTRY_DO.idFromName("devices-v1"));
@@ -1056,15 +1074,27 @@ async function inspectConnectorRequest(
   };
 }
 
-async function revokeConnectorGrant(
+async function revokeConnectorInstance(
+  env: Env,
+  connectorId: string,
+  revokedBy: string,
+): Promise<{ ok: true } | { ok: false; code: string }> {
+  const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
+  const store = createOAuthPublicStore(stub);
+  if (!(await store.getConnector(connectorId))) return { ok: false, code: "connector_not_found" };
+  if (!(await store.revokeConnector(connectorId, revokedBy, Date.now()))) return { ok: false, code: "connector_revoke_failed" };
+  return { ok: true };
+}
+
+async function revokeConnectorClient(
   env: Env,
   clientId: string,
   revokedBy: string,
 ): Promise<{ ok: true } | { ok: false; code: string }> {
   const stub = env.OAUTH_STORE_DO.get(env.OAUTH_STORE_DO.idFromName("oauth-v1"));
   const store = createOAuthPublicStore(stub);
-  const grant = await store.getGrant(clientId);
-  if (!grant) return { ok: false, code: "connector_grant_not_found" };
-  if (!(await store.revokeGrant(clientId, revokedBy, Date.now()))) return { ok: false, code: "connector_revoke_failed" };
+  if (!(await store.revokeClientConnectors(clientId, revokedBy, Date.now()))) {
+    return { ok: false, code: "connector_client_revoke_failed" };
+  }
   return { ok: true };
 }

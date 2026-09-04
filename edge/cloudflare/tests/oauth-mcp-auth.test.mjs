@@ -99,6 +99,43 @@ test("migrated public-PEM JWT obeys the injected legacy client grant fence", asy
   }), { ok: false, code: "mcp_auth_failed" });
 });
 
+test("new-shaped PEM JWT cannot bypass Edge principal and device verification", async () => {
+  const kp = await keyPair();
+  const pem = await publicPem(kp.publicKey);
+  const now = Math.floor(Date.now() / 1000);
+  const deviceId = "dev_01M1TEST000000000000000000";
+  const token = await jwt(kp.privateKey, {
+    iss: ISSUER,
+    aud: `${ISSUER}/mcp`,
+    sub: "svc_ci",
+    client_id: "svc_ci",
+    principal_type: "automation",
+    device_id: deviceId,
+    iat: now,
+    exp: now + 3600,
+  });
+  let edgeVerified = false;
+  const result = await authenticateMcpRequest(request(token), {
+    OAUTH_ISSUER: ISSUER,
+    OAUTH_JWT_PUBLIC_PEM: pem,
+  }, {
+    verifyLegacyClient: async () => true,
+    verifyEdgeToken: async (presented) => {
+      assert.equal(presented, token);
+      edgeVerified = true;
+      return { ok: true, clientId: "svc_ci", principalType: "automation", deviceId };
+    },
+  });
+  assert.equal(edgeVerified, true);
+  assert.deepEqual(result, {
+    ok: true,
+    source: "oauth_edge",
+    clientId: "svc_ci",
+    principalType: "automation",
+    deviceId,
+  });
+});
+
 test("wrong audience, issuer, signature, or missing OAuth config fail closed", async () => {
   const kp = await keyPair();
   const other = await keyPair();

@@ -593,6 +593,49 @@ test("token: authorization_code with client_secret_post succeeds (no-store)", as
   assert.ok((await resp.json()).access_token.includes("."));
 });
 
+test("public Connector access and refresh are fenced immediately by conn_ instance revoke", async () => {
+  const opts = makeOptions();
+  const { client_id, client_secret } = await registerClient(opts);
+  const pending = await pendingAuthorization(opts, client_id);
+  const approved = await approvePending(opts, pending);
+  const response = await POST("/oauth/token", tokenBody(client_id, approved.code, pending.verifier, { client_secret }), opts);
+  assert.equal(response.status, 200);
+  const issued = await response.json();
+  assert.equal(typeof issued.access_token, "string");
+  assert.equal(typeof issued.refresh_token, "string");
+
+  const connectors = await opts.store.listConnectors();
+  assert.equal(connectors.length, 1);
+  const connectorId = connectors[0].connector_id;
+  assert.match(connectorId, /^conn_[A-Za-z0-9_-]+$/);
+
+  const before = await opts.__do.fetch(new Request("https://do.internal/internal/oauth/access/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: issued.access_token, now_sec: NOW_SEC + 1 }),
+  }));
+  assert.equal(before.status, 200);
+  const refreshHash = await hashOpaqueToken(issued.refresh_token);
+  assert.equal((await opts.__do.fetch(new Request("https://do.internal/internal/oauth/refresh/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hash: refreshHash, now_sec: NOW_SEC + 1 }),
+  }))).status, 200);
+
+  assert.equal(await opts.store.revokeConnector(connectorId, "device:owner", NOW_MS + 2_000), true);
+  const after = await opts.__do.fetch(new Request("https://do.internal/internal/oauth/access/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: issued.access_token, now_sec: NOW_SEC + 3 }),
+  }));
+  assert.equal(after.status, 401);
+  assert.equal((await opts.__do.fetch(new Request("https://do.internal/internal/oauth/refresh/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hash: refreshHash, now_sec: NOW_SEC + 3 }),
+  }))).status, 404);
+});
+
 test("authorization_code failures: client / redirect / resource / PKCE / secret", async () => {
   const opts = makeOptions();
   // Use auth_method none so the code ownership/redirect/resource/PKCE checks

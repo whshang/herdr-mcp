@@ -49,7 +49,7 @@ The exact ChatGPT UI evolves. The general flow is:
 https://<your-edge-origin>/mcp
 ```
 
-4. Complete OAuth in the browser. On first authorization, Herdr shows a short-lived approval request instead of silently granting access; approve it from any computer already enrolled in this Worker or from another Herdr WebChat that was explicitly approved by this Worker.
+4. Complete OAuth in the browser. On first authorization, Herdr shows a short-lived approval request instead of silently granting access; approve it from any computer already enrolled in this Worker with `herdr-mcp connector approve <approval-request-id>`. An approved WebChat Connector remains ordinary MCP only and cannot approve another Connector.
 5. Create a new conversation for validation.
 
 Never paste `HERDR_MCP_TOKEN` into ChatGPT. Public ChatGPT access uses OAuth. Static bearer is for local clients such as curl or Cursor.

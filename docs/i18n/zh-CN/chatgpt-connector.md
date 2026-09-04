@@ -51,7 +51,7 @@ ChatGPT 能完成 initialize / discovery / `tools/list`。
    https://<your-edge-origin>/mcp
    ```
 
-4. 完成浏览器 OAuth。首次授权时，Herdr 不会静默放行，而是显示一个短期批准请求；从任意已登记到这个 Worker 的电脑，或另一个已经被该 Worker 明确批准的 Herdr WebChat 完成批准；
+4. 完成浏览器 OAuth。首次授权时，Herdr 不会静默放行，而是显示一个短期批准请求；在任意已登记到这个 Worker 的电脑上运行 `herdr-mcp connector approve <approval-request-id>` 完成批准。已批准的 WebChat Connector 仍只有普通 MCP 权限，不能继续批准另一个 Connector；
 5. 保存后新建一个聊天进行验收。
 
 **不要填写本机 `HERDR_MCP_TOKEN`。** ChatGPT 公网入口使用 OAuth；静态 bearer 只用于本机 curl / Cursor 和兼容路径。

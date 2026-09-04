@@ -436,6 +436,29 @@ test("new Connector requires Worker fleet-admin approval and operator credential
   assert.equal(redirect.origin + redirect.pathname, "https://client.example/callback");
   assert.equal(redirect.searchParams.get("state"), "state-connector");
   assert.ok(redirect.searchParams.get("code"));
+
+  const inventory = await worker.fetch(new Request("https://edge.example/connectors", {
+    headers: { authorization: "Bearer owner-secret" },
+  }), h.env);
+  assert.equal(inventory.status, 200);
+  const inventoryBody = await inventory.json();
+  assert.equal(inventoryBody.connectors.length, 1);
+  const connectorId = inventoryBody.connectors[0].connector_id;
+  assert.match(connectorId, /^conn_[A-Za-z0-9_-]+$/);
+
+  const revokeInstance = await worker.fetch(
+    post("/connectors/revoke", { connector_id: connectorId }, "owner-secret"),
+    h.env,
+  );
+  assert.equal(revokeInstance.status, 200);
+  assert.equal((await revokeInstance.json()).connector_id, connectorId);
+
+  const killUnknownLegacy = await worker.fetch(
+    post("/connectors/revoke", { client_id: "legacy-client-without-store-record" }, "owner-secret"),
+    h.env,
+  );
+  assert.equal(killUnknownLegacy.status, 200);
+  assert.equal((await killUnknownLegacy.json()).client_id, "legacy-client-without-store-record");
 });
 
 test("MCP Connector administration requires fleet-admin; approved Connectors are ordinary principals", async () => {

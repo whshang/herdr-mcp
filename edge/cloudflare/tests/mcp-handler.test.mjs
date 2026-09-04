@@ -595,8 +595,8 @@ test("connector approve/revoke private methods are Edge-local, schema-bounded, a
       approved = input;
       return { ok: true, client_id: "dcr-abc", approved_at_ms: 1234 };
     },
-    revokeConnector: async (clientId) => {
-      revoked = clientId;
+    revokeConnector: async (connectorId) => {
+      revoked = connectorId;
       return { ok: true };
     },
   });
@@ -635,7 +635,7 @@ test("connector approve/revoke private methods are Edge-local, schema-bounded, a
       name: "herdr_call",
       arguments: {
         method: "herdr_mcp.connector.revoke",
-        params: { client_id: "dcr-abc" },
+        params: { connector_id: "conn_abcdefgh" },
       },
     }),
     "legacy-default",
@@ -648,14 +648,15 @@ test("connector approve/revoke private methods are Edge-local, schema-bounded, a
       name: "herdr_call",
       arguments: {
         method: "herdr_mcp.connector.revoke",
-        params: { client_id: "dcr-abc", confirm: true },
+        params: { connector_id: "conn_abcdefgh", confirm: true },
       },
     }),
     "legacy-default",
     d.value,
   );
   assert.equal(revoke.body.result.structuredContent.revoked, true);
-  assert.equal(revoked, "dcr-abc");
+  assert.equal(revoked, "conn_abcdefgh");
+  assert.equal(revoke.body.result.structuredContent.connector_id, "conn_abcdefgh");
 
   const listed = await handleMcp(req(740, "tools/list", {}), "legacy-default", d.value);
   assert.equal(listed.body.result.tools.some((tool) => tool.name.includes("connector")), false);

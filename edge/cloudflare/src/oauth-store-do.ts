@@ -874,7 +874,6 @@ export class OAuthStoreDO {
 
     const currentGrant = await this.state.storage.get<OAuthConnectorGrantRecord>(GRANT_PREFIX + clientId);
     const client = await this.state.storage.get<OAuthClientRecord>(CLIENT_PREFIX + clientId);
-    if (!client && !currentGrant && revokedConnectors === 0) return json({ ok: false, code: "not_found" }, 404);
     await this.state.storage.put(GRANT_PREFIX + clientId, {
       ...(currentGrant ?? { client_id: clientId }),
       status: "revoked",
@@ -895,7 +894,7 @@ export class OAuthStoreDO {
       client_id: clientId,
       revoked_connectors: revokedConnectors,
       deleted_tokens: deletes.length,
-      legacy_tombstone: true,
+      legacy_tombstone_created: !client && !currentGrant && revokedConnectors === 0,
     });
   }
 
@@ -1085,6 +1084,7 @@ export class OAuthStoreDO {
     connectorId: string | undefined,
     grantGeneration: number | undefined,
   ): Promise<boolean> {
+    if (!(await this.grantAllowsAccess(clientId))) return false;
     if (!connectorId && grantGeneration === undefined) return this.grantAllowsAccess(clientId);
     if (!connectorId || !grantGeneration) return false;
     const connector = normalizeConnector(
