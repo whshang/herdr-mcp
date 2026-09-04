@@ -17,11 +17,14 @@ const MAX_LEASE_TTL_MS = 30 * 60_000;
 export const FLEET_IDEMPOTENCY_TTL_MS = 24 * 60 * 60_000;
 export const FLEET_IDEMPOTENCY_MAX_RECORDS = 512;
 // Alpha.1 has exactly two trusted credential principals. Reserve half of the
-// bounded ledger for existing-resource control and split that reserve evenly,
-// so admission pressure or one credential cannot starve the other controller.
+// bounded ledger for existing-resource control, split it evenly between the
+// credentials, then keep 32 records per credential for critical recovery so
+// routine control traffic cannot consume every exit/fencing opportunity.
 export const FLEET_IDEMPOTENCY_ADMISSION_MAX_RECORDS = 256;
 export const FLEET_IDEMPOTENCY_CONTROL_MAX_RECORDS = 256;
 export const FLEET_IDEMPOTENCY_CONTROL_MAX_PER_PRINCIPAL = 128;
+export const FLEET_IDEMPOTENCY_CONTROL_ROUTINE_MAX_PER_PRINCIPAL = 96;
+export const FLEET_IDEMPOTENCY_CONTROL_CRITICAL_MAX_PER_PRINCIPAL = 32;
 
 export const FLEET_CONTROL_METHODS = [
   "herdr_mcp.work_chain.create",
@@ -168,6 +171,7 @@ interface IdempotencyRecord {
   operation: FleetControlMethod;
   request_hash: string;
   principal_hash?: string;
+  quota_class?: IdempotencyQuotaClass;
   result: Record<string, unknown>;
   created_at_ms: number;
   expires_at_ms: number;
@@ -223,7 +227,7 @@ function normalizeRuntimeScope(value: unknown): string[] | null {
   if (!Array.isArray(value) || value.length > MAX_SCOPE_ITEMS) return null;
   const result: string[] = [];
   for (const item of value) {
-    if (!boundedString(item, 128) || item !== item.trim() || !/^(?:service|runtime):[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(item)) return null;
+    if (!boundedString(item, 128) || item !== item.trim() || !/^(?:service|runtime):[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(item)) return null;
     result.push(item);
   }
   return result;
@@ -247,7 +251,9 @@ export function normalizeRepoId(value: unknown): string | null {
   if (parts.length < 3 || parts.some((part) => !part || part === "." || part === ".." || !/^[A-Za-z0-9._-]+$/.test(part))) return null;
   const [host, ...path] = parts;
   if (!host.includes(".")) return null;
-  return `${host.toLowerCase()}/${path.join("/")}`;
+  const canonicalHost = host.toLowerCase();
+  const canonicalPath = canonicalHost === "github.com" ? path.map((part) => part.toLowerCase()) : path;
+  return `${canonicalHost}/${canonicalPath.join("/")}`;
 }
 
 export function normalizeBranchRef(value: unknown): string | null {
@@ -345,6 +351,7 @@ function normalizeIdempotency(value: unknown): IdempotencyRecord | null {
   if (!isRecord(value) || value.schema_version !== 1) return null;
   if (typeof value.operation !== "string" || !isFleetControlMethod(value.operation) || !boundedString(value.request_hash, 128) || !isRecord(value.result)) return null;
   if (value.principal_hash !== undefined && (typeof value.principal_hash !== "string" || !/^[0-9a-f]{64}$/.test(value.principal_hash))) return null;
+  if (value.quota_class !== undefined && value.quota_class !== "admission" && value.quota_class !== "control_routine" && value.quota_class !== "control_critical") return null;
   if (!integer(value.created_at_ms, 0) || !integer(value.expires_at_ms, 0) || value.expires_at_ms <= value.created_at_ms) return null;
   return value as unknown as IdempotencyRecord;
 }
@@ -406,21 +413,34 @@ function laneTransitionAllowed(from: ExecutionLaneRecord["status"], to: Executio
   return false;
 }
 
-type IdempotencyQuotaClass = "admission" | "control";
+type IdempotencyQuotaClass = "admission" | "control_routine" | "control_critical";
 
 interface IdempotencyUsage {
   total: number;
   admission: number;
   control: number;
-  control_for_principal: number;
+  control_routine_for_principal: number;
+  control_critical_for_principal: number;
   earliest_total_expiry_ms: number | null;
   earliest_admission_expiry_ms: number | null;
   earliest_control_expiry_ms: number | null;
-  earliest_control_principal_expiry_ms: number | null;
+  earliest_control_routine_principal_expiry_ms: number | null;
+  earliest_control_critical_principal_expiry_ms: number | null;
 }
 
-function idempotencyQuotaClass(method: FleetControlMethod): IdempotencyQuotaClass {
-  return method === "herdr_mcp.work_chain.create" || method === "herdr_mcp.execution_lane.create" ? "admission" : "control";
+function idempotencyQuotaClass(method: FleetControlMethod, params?: Record<string, unknown>): IdempotencyQuotaClass {
+  if (method === "herdr_mcp.work_chain.create" || method === "herdr_mcp.execution_lane.create") return "admission";
+  if (method === "herdr_mcp.planner_lease.renew" || method === "herdr_mcp.planner_lease.release" || method === "herdr_mcp.planner_lease.takeover") {
+    return "control_critical";
+  }
+  if (method === "herdr_mcp.execution_lane.update" && (params === undefined || params.reassign === true || params.status === "completed" || params.status === "cancelled")) {
+    return "control_critical";
+  }
+  return "control_routine";
+}
+
+function storedIdempotencyQuotaClass(record: IdempotencyRecord): IdempotencyQuotaClass {
+  return record.quota_class ?? idempotencyQuotaClass(record.operation);
 }
 
 function earlier(current: number | null, candidate: number): number {
@@ -433,11 +453,13 @@ async function pruneIdempotencyUsage(tx: DurableObjectTransaction, nowMs: number
     total: 0,
     admission: 0,
     control: 0,
-    control_for_principal: 0,
+    control_routine_for_principal: 0,
+    control_critical_for_principal: 0,
     earliest_total_expiry_ms: null,
     earliest_admission_expiry_ms: null,
     earliest_control_expiry_ms: null,
-    earliest_control_principal_expiry_ms: null,
+    earliest_control_routine_principal_expiry_ms: null,
+    earliest_control_critical_principal_expiry_ms: null,
   };
   for (const [key, value] of stored) {
     const record = normalizeIdempotency(value);
@@ -447,15 +469,21 @@ async function pruneIdempotencyUsage(tx: DurableObjectTransaction, nowMs: number
     }
     usage.total += 1;
     usage.earliest_total_expiry_ms = earlier(usage.earliest_total_expiry_ms, record.expires_at_ms);
-    if (idempotencyQuotaClass(record.operation) === "admission") {
+    const quotaClass = storedIdempotencyQuotaClass(record);
+    if (quotaClass === "admission") {
       usage.admission += 1;
       usage.earliest_admission_expiry_ms = earlier(usage.earliest_admission_expiry_ms, record.expires_at_ms);
     } else {
       usage.control += 1;
       usage.earliest_control_expiry_ms = earlier(usage.earliest_control_expiry_ms, record.expires_at_ms);
       if (record.principal_hash === principalHash) {
-        usage.control_for_principal += 1;
-        usage.earliest_control_principal_expiry_ms = earlier(usage.earliest_control_principal_expiry_ms, record.expires_at_ms);
+        if (quotaClass === "control_routine") {
+          usage.control_routine_for_principal += 1;
+          usage.earliest_control_routine_principal_expiry_ms = earlier(usage.earliest_control_routine_principal_expiry_ms, record.expires_at_ms);
+        } else {
+          usage.control_critical_for_principal += 1;
+          usage.earliest_control_critical_principal_expiry_ms = earlier(usage.earliest_control_critical_principal_expiry_ms, record.expires_at_ms);
+        }
       }
     }
   }
@@ -512,14 +540,17 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
     }
     if (priorRaw !== undefined) await tx.delete(idemStorageKey);
     const usage = await pruneIdempotencyUsage(tx, nowMs, principalHash);
-    const quotaClass = idempotencyQuotaClass(method);
+    const quotaClass = idempotencyQuotaClass(method, params);
     if (quotaClass === "admission" && usage.admission >= FLEET_IDEMPOTENCY_ADMISSION_MAX_RECORDS) {
       return idempotencyCapacityError("admission", usage.admission, FLEET_IDEMPOTENCY_ADMISSION_MAX_RECORDS, usage.earliest_admission_expiry_ms, nowMs);
     }
-    if (quotaClass === "control" && usage.control_for_principal >= FLEET_IDEMPOTENCY_CONTROL_MAX_PER_PRINCIPAL) {
-      return idempotencyCapacityError("control_principal", usage.control_for_principal, FLEET_IDEMPOTENCY_CONTROL_MAX_PER_PRINCIPAL, usage.earliest_control_principal_expiry_ms, nowMs);
+    if (quotaClass === "control_routine" && usage.control_routine_for_principal >= FLEET_IDEMPOTENCY_CONTROL_ROUTINE_MAX_PER_PRINCIPAL) {
+      return idempotencyCapacityError("control_routine_principal", usage.control_routine_for_principal, FLEET_IDEMPOTENCY_CONTROL_ROUTINE_MAX_PER_PRINCIPAL, usage.earliest_control_routine_principal_expiry_ms, nowMs);
     }
-    if (quotaClass === "control" && usage.control >= FLEET_IDEMPOTENCY_CONTROL_MAX_RECORDS) {
+    if (quotaClass === "control_critical" && usage.control_critical_for_principal >= FLEET_IDEMPOTENCY_CONTROL_CRITICAL_MAX_PER_PRINCIPAL) {
+      return idempotencyCapacityError("control_critical_principal", usage.control_critical_for_principal, FLEET_IDEMPOTENCY_CONTROL_CRITICAL_MAX_PER_PRINCIPAL, usage.earliest_control_critical_principal_expiry_ms, nowMs);
+    }
+    if (quotaClass !== "admission" && usage.control >= FLEET_IDEMPOTENCY_CONTROL_MAX_RECORDS) {
       return idempotencyCapacityError("control", usage.control, FLEET_IDEMPOTENCY_CONTROL_MAX_RECORDS, usage.earliest_control_expiry_ms, nowMs);
     }
     if (usage.total >= FLEET_IDEMPOTENCY_MAX_RECORDS) {
@@ -661,6 +692,7 @@ export async function executeFleetControl(storage: DurableObjectStorage, method:
       operation: method,
       request_hash: hash,
       principal_hash: principalHash,
+      quota_class: quotaClass,
       result: result as Record<string, unknown>,
       created_at_ms: nowMs,
       expires_at_ms: nowMs + FLEET_IDEMPOTENCY_TTL_MS,

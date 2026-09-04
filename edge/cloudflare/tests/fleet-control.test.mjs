@@ -367,47 +367,117 @@ test("idempotency admission quota stays bounded while existing control resources
   assert.equal(recoveredAdmission.ok, true);
 });
 
-test("one principal cannot consume the other Alpha.1 operator principal's control reserve", async () => {
-  const { registry } = makeRegistry();
-  const created = await createChain(registry, "principal-control-chain", PRINCIPAL_A);
-  let chain = created.chain;
+test("routine control saturation preserves critical recovery capacity for both Alpha.1 principals", async () => {
+  const { storage, registry } = makeRegistry();
+  await putDevice(storage, device(DEVICE_A));
+  await putDevice(storage, device(DEVICE_B));
 
-  for (let index = 0; index < 64; index += 1) {
-    const acquired = await call(registry, "herdr_mcp.planner_lease.acquire", {
-      work_chain_id: chain.work_chain_id,
-      expected_chain_revision: chain.revision,
-      idempotency_key: `principal-a-acquire-${index}`,
-      ttl_ms: 30000,
-    }, PRINCIPAL_A, 4000 + index * 2);
-    assert.equal(acquired.ok, true);
-    const released = await call(registry, "herdr_mcp.planner_lease.release", {
-      work_chain_id: chain.work_chain_id,
-      expected_chain_revision: acquired.chain.revision,
-      expected_lease_generation: acquired.planner_lease.generation,
-      idempotency_key: `principal-a-release-${index}`,
-    }, PRINCIPAL_A, 4001 + index * 2);
-    assert.equal(released.ok, true);
-    chain = released.chain;
+  const releaseChainCreated = await createChain(registry, "routine-release-chain", PRINCIPAL_A, 4000);
+  const releaseLease = await acquire(registry, releaseChainCreated.chain, "routine-release-acquire", PRINCIPAL_A, 4001);
+
+  const controlChainCreated = await createChain(registry, "routine-control-chain", PRINCIPAL_A, 4002);
+  const controlLease = await acquire(registry, controlChainCreated.chain, "routine-control-acquire", PRINCIPAL_A, 4003);
+  let laneState = await call(registry, "herdr_mcp.execution_lane.create", {
+    work_chain_id: controlChainCreated.chain.work_chain_id,
+    expected_chain_revision: controlLease.chain.revision,
+    expected_lease_generation: 1,
+    idempotency_key: "routine-control-lane",
+    device_id: DEVICE_A,
+    repo_id: "github.com/whshang/herdr-mcp",
+    base_commit: "e9281b488e093f522020db2a2c6100d92b69499f",
+    branch_ref: "feat/routine-control",
+    status: "active",
+  }, PRINCIPAL_A, 4004);
+  assert.equal(laneState.ok, true);
+
+  // Two acquires already occupy routine-control slots. Fill the remaining 94.
+  for (let index = 0; index < 94; index += 1) {
+    laneState = await call(registry, "herdr_mcp.execution_lane.update", {
+      work_chain_id: controlChainCreated.chain.work_chain_id,
+      expected_chain_revision: laneState.chain.revision,
+      expected_lease_generation: 1,
+      lane_id: laneState.lane.lane_id,
+      expected_lane_generation: laneState.lane.lane_generation,
+      status: "active",
+      validation_summary: `routine-${index}`,
+      idempotency_key: `routine-control-update-${index}`,
+    }, PRINCIPAL_A, 4100 + index);
+    assert.equal(laneState.ok, true);
   }
 
-  const principalASaturated = await call(registry, "herdr_mcp.planner_lease.acquire", {
-    work_chain_id: chain.work_chain_id,
-    expected_chain_revision: chain.revision,
-    idempotency_key: "principal-a-over-control-reserve",
-    ttl_ms: 30000,
-  }, PRINCIPAL_A, 5000);
-  assert.equal(principalASaturated.code, "idempotency_capacity_exceeded");
-  assert.equal(principalASaturated.quota_scope, "control_principal");
-  assert.equal(principalASaturated.live_records, 128);
-  assert.equal(principalASaturated.limit, 128);
+  const routineSaturated = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: controlChainCreated.chain.work_chain_id,
+    expected_chain_revision: laneState.chain.revision,
+    expected_lease_generation: 1,
+    lane_id: laneState.lane.lane_id,
+    expected_lane_generation: laneState.lane.lane_generation,
+    status: "active",
+    validation_summary: "routine-overflow",
+    idempotency_key: "routine-control-overflow",
+  }, PRINCIPAL_A, 4300);
+  assert.equal(routineSaturated.code, "idempotency_capacity_exceeded");
+  assert.equal(routineSaturated.quota_scope, "control_routine_principal");
+  assert.equal(routineSaturated.live_records, 96);
+  assert.equal(routineSaturated.limit, 96);
 
-  const principalBStillOperates = await call(registry, "herdr_mcp.planner_lease.acquire", {
-    work_chain_id: chain.work_chain_id,
-    expected_chain_revision: chain.revision,
-    idempotency_key: "principal-b-control-reserve",
+  const renewed = await call(registry, "herdr_mcp.planner_lease.renew", {
+    work_chain_id: controlChainCreated.chain.work_chain_id,
+    expected_chain_revision: laneState.chain.revision,
+    expected_lease_generation: 1,
     ttl_ms: 30000,
-  }, PRINCIPAL_B, 5000);
-  assert.equal(principalBStillOperates.ok, true);
+    idempotency_key: "routine-critical-renew",
+  }, PRINCIPAL_A, 4301);
+  assert.equal(renewed.ok, true);
+
+  const releasedA = await call(registry, "herdr_mcp.planner_lease.release", {
+    work_chain_id: releaseChainCreated.chain.work_chain_id,
+    expected_chain_revision: releaseLease.chain.revision,
+    expected_lease_generation: 1,
+    idempotency_key: "routine-critical-release-a",
+  }, PRINCIPAL_A, 4302);
+  assert.equal(releasedA.ok, true);
+
+  const takeover = await call(registry, "herdr_mcp.planner_lease.takeover", {
+    work_chain_id: controlChainCreated.chain.work_chain_id,
+    expected_chain_revision: renewed.chain.revision,
+    expected_lease_generation: 1,
+    ttl_ms: 30000,
+    reason: "recover while the other principal routine quota is saturated",
+    idempotency_key: "routine-critical-takeover-b",
+  }, PRINCIPAL_B, 4303, true);
+  assert.equal(takeover.ok, true);
+
+  const reassigned = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: controlChainCreated.chain.work_chain_id,
+    expected_chain_revision: takeover.chain.revision,
+    expected_lease_generation: 2,
+    lane_id: laneState.lane.lane_id,
+    expected_lane_generation: laneState.lane.lane_generation,
+    reassign: true,
+    device_id: DEVICE_B,
+    status: "active",
+    idempotency_key: "routine-critical-reassign-b",
+  }, PRINCIPAL_B, 4304);
+  assert.equal(reassigned.ok, true);
+
+  const completed = await call(registry, "herdr_mcp.execution_lane.update", {
+    work_chain_id: controlChainCreated.chain.work_chain_id,
+    expected_chain_revision: reassigned.chain.revision,
+    expected_lease_generation: 2,
+    lane_id: reassigned.lane.lane_id,
+    expected_lane_generation: reassigned.lane.lane_generation,
+    status: "completed",
+    idempotency_key: "routine-critical-complete-b",
+  }, PRINCIPAL_B, 4305);
+  assert.equal(completed.ok, true);
+
+  const releasedB = await call(registry, "herdr_mcp.planner_lease.release", {
+    work_chain_id: controlChainCreated.chain.work_chain_id,
+    expected_chain_revision: completed.chain.revision,
+    expected_lease_generation: 2,
+    idempotency_key: "routine-critical-release-b",
+  }, PRINCIPAL_B, 4306);
+  assert.equal(releasedB.ok, true);
 });
 
 test("execution lanes require explicit active device and portable repo/branch identity", async () => {
@@ -423,7 +493,7 @@ test("execution lanes require explicit active device and portable repo/branch id
     expected_lease_generation: 1,
     idempotency_key: "lane-a",
     device_id: DEVICE_A,
-    repo_id: "https://github.com/whshang/herdr-mcp.git",
+    repo_id: "https://github.com/WhShang/Herdr-MCP.git",
     base_commit: "e9281b488e093f522020db2a2c6100d92b69499f",
     branch_ref: "refs/heads/feat/lane-a",
     file_scope: ["edge/cloudflare/src"],
