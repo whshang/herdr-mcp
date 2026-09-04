@@ -90,7 +90,7 @@ herdr-mcp worker rename "<new-device-name>"
 herdr-mcp worker revoke "<device-id>" --confirm
 ```
 
-设备/操作员负责 fleet 管理。这个动作绝不接受 display name，必须使用不可变 `device_id`。已批准的 WebChat Connector 只有普通 MCP 权限，不能 revoke Device。
+设备/操作员负责 fleet 管理。这个动作绝不接受 display name，必须使用不可变 `device_id`。已批准的 WebChat Connector 只有普通 MCP 权限，不能 revoke Device。已登记设备之间不存在 owner/member 高下之分，都是同一操作员控制平面下的对等成员。
 
 revoke 对该设备身份和凭据是永久操作：在线 Link 会立即断开，旧凭据以后不能再次连接；系统内部会保留最小 revoked tombstone 防止旧身份“复活”，但正常设备列表会隐藏这些 tombstone。以后若要重新加入这台电脑，需要重新生成配对并登记为新的设备身份。
 

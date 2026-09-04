@@ -21,10 +21,9 @@ test("onboarding resolves first-vs-existing fleet intent before any Cloudflare d
     // A fresh machine must never probe fleet existence by running pair locally.
     assert.match(doc, /Never run `herdr-mcp worker pair` on the computer currently being installed|绝不能[^\n]*当前正在安装[^\n]*`herdr-mcp worker pair`/);
     assert.match(doc, /already enrolled|already-enrolled|已经登记|已登记/);
-    assert.match(doc, /no owner\/member hierarchy|没有 owner\/member 高下之分/);
     // Never deploy a second Worker/R2/Connector or evade ownership with a random suffix.
     assert.match(doc, /second Worker|R2 bucket|R2 桶/);
-    assert.match(doc, /do \*\*not\*\* evade[^\n]*random-suffixed Worker|禁止[^\n]*绕过[^\n]*随机后缀 Worker/);
+    assert.match(doc, /Never fall back[^\n]*random-suffixed Worker|禁止[^\n]*fallback[^\n]*随机后缀[^\n]*Worker/);
     assert.match(doc, /existing-worker-connect\.md/);
     // Pre-deploy existing-Worker detection via the Cloudflare API.
     assert.match(doc, /workers\/scripts/);
@@ -32,6 +31,7 @@ test("onboarding resolves first-vs-existing fleet intent before any Cloudflare d
   // The dedicated multi-device contract already forbids re-deployment.
   const fleet = read("docs/i18n/en/existing-worker-connect.md");
   assert.match(fleet, /do not deploy another Worker/);
+  assert.match(fleet, /no owner\/member hierarchy/);
 });
 
 test("PATH preflight separates the installed binary from the interactive-shell PATH and self-heals", () => {
@@ -114,7 +114,7 @@ test("origin health checks separate Worker-code health from hostname/DNS/network
     assert.match(doc, /[Hh]ostname\/DNS\/network-path|hostname\/DNS\/网络路径/);
     assert.match(doc, /never .*redeploy|绝不用重新部署 Worker/);
     // Custom Domain is preferred as production origin when the user owns one, while Link transport stays separate.
-    assert.match(doc, /prefer a Custom Domain|优先把 Custom Domain/);
+    assert.match(doc, /prefer (?:the )?Custom Domain|优先把 Custom Domain/);
     assert.match(doc, /Link transport[^\n]*(?:must not silently rewrite|不得[^\n]*静默改写)[^\n]*OAuth issuer/);
     assert.doesNotMatch(doc, /consistent across Worker OAuth, MCP, and Link WSS|Worker OAuth、MCP、Link WSS 全部使用同一个入口/);
   }
