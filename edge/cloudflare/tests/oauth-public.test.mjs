@@ -400,6 +400,42 @@ test("authorize: first use requires fleet approval, then issues RFC9207 one-use 
   assert.equal((await replay.json()).error, "invalid_grant");
 });
 
+test("authorize: identical pending retry renders safe recovery page instead of JSON", async () => {
+  const opts = makeOptions();
+  const { client_id } = await registerClient(opts, {
+    token_endpoint_auth_method: "none",
+    client_name: "Retrying WebChat",
+  });
+  const pending = await pendingAuthorization(opts, client_id, "https://app.example/cb", "same-state");
+  const qs = new URLSearchParams({
+    client_id,
+    redirect_uri: "https://app.example/cb",
+    response_type: "code",
+    code_challenge: pending.challenge,
+    code_challenge_method: "S256",
+    state: pending.state,
+  });
+
+  const retry = await GET(`/oauth/authorize?${qs}`, opts);
+  assert.equal(retry.status, 200);
+  assert.match(retry.headers.get("content-type") ?? "", /^text\/html/);
+  assert.equal(retry.headers.get("cache-control"), "no-store");
+  assert.match(retry.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+  assert.ok(Number(retry.headers.get("retry-after")) > 0);
+  const html = await retry.text();
+  assert.match(html, /Approval already pending/);
+  assert.match(html, /Use the original approval page if it is still open/);
+  assert.match(html, /retry automatically after the old request expires/);
+  assert.ok(html.includes(pending.requestId));
+  assert.match(html, /location\.reload\(\)/);
+  assert.doesNotMatch(html, /class="approval-code"/);
+  assert.doesNotMatch(html, /const resumeToken=/);
+  assert.doesNotMatch(html, /authorization_pending/);
+
+  const approvals = await opts.store.getApproval(pending.requestId, NOW_MS);
+  assert.ok(approvals, "the original pending approval must remain authoritative");
+});
+
 test("authorize: unknown client returns 400 JSON, no redirect", async () => {
   const opts = makeOptions();
   const qs = new URLSearchParams({ client_id: "unknown", redirect_uri: "https://app.example/cb", code_challenge: "a".repeat(43) });

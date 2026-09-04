@@ -445,6 +445,51 @@ async function poll(){
   });
 }
 
+function pendingApprovalPage(input: {
+  requestId: string;
+  expiresAtMs: number;
+  nowMs: number;
+  clientName?: string;
+}): Response {
+  const expiresAt = new Date(input.expiresAtMs).toISOString();
+  const retryAfterMs = Math.max(250, input.expiresAtMs - input.nowMs + 250);
+  const retryAfterSec = Math.max(1, Math.ceil(retryAfterMs / 1000));
+  const clientLabel = input.clientName ?? "Web AI Connector";
+  const html = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connector approval already pending</title>
+<style>
+:root{color-scheme:light dark;--card:#fff;--text:#16181d;--muted:#69707d;--line:#e5e7eb;--soft:#f7f8fa;--warn:#8a5a00;--warnSoft:#fff6df;--shadow:0 24px 70px rgba(20,24,32,.12)}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;min-height:100dvh;padding:32px 20px;background:radial-gradient(circle at 50% -10%,#fff 0,#f5f6f8 52%,#eef0f3 100%);color:var(--text);font:15px/1.55 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center}.shell{width:min(680px,100%)}.brand{display:flex;align-items:center;gap:10px;margin:0 0 14px 4px;color:#4d5562;font-size:13px;font-weight:650;letter-spacing:.08em;text-transform:uppercase}.mark{display:grid;place-items:center;width:28px;height:28px;border-radius:9px;background:#17191f;color:#fff;font-weight:800}.card{background:var(--card);border:1px solid rgba(20,24,32,.08);border-radius:24px;box-shadow:var(--shadow);overflow:hidden}.main{padding:34px 36px 30px}h1{margin:0;font-size:clamp(27px,5vw,38px);line-height:1.12;letter-spacing:-.035em}.lead{margin:13px 0;color:var(--muted);font-size:16px}.notice{margin:24px 0;padding:16px 18px;border-radius:15px;background:var(--warnSoft);color:var(--warn);font-weight:650}.details{margin-top:22px;padding-top:18px;border-top:1px solid var(--line);display:grid;grid-template-columns:100px minmax(0,1fr);gap:8px 14px;font-size:13px}.details span:nth-child(odd){color:var(--muted)}code{overflow-wrap:anywhere}.footer{padding:15px 36px;border-top:1px solid var(--line);background:var(--soft);color:var(--muted);font-size:12px}@media(max-width:560px){body{padding:16px 12px}.main{padding:26px 20px}.footer{padding:14px 20px}.details{grid-template-columns:1fr;gap:3px}.details span:nth-child(even){margin-bottom:8px}}@media(prefers-color-scheme:dark){:root{--card:#15181d;--text:#f4f5f7;--muted:#9aa2af;--line:#2a2f37;--soft:#111419;--warn:#f0c46d;--warnSoft:#352812;--shadow:0 28px 80px rgba(0,0,0,.45)}body{background:radial-gradient(circle at 50% -10%,#22262d 0,#111419 48%,#0b0d10 100%)}.brand{color:#b2b8c2}.mark{background:#f4f5f7;color:#111318}.card{border-color:#292e36}}
+</style></head><body><main class="shell">
+<div class="brand"><span class="mark" aria-hidden="true">H</span><span>Herdr secure access</span></div>
+<section class="card"><div class="main">
+<h1>Approval already pending</h1>
+<p class="lead"><strong>${escapeHtml(clientLabel)}</strong> retried the same OAuth authorization request while its first Herdr approval page is still active.</p>
+<div class="notice" id="status" role="status">Use the original approval page if it is still open. If that page was closed, keep this page open; it will retry automatically after the old request expires.</div>
+<div class="details"><span>Request ID</span><code>${escapeHtml(input.requestId)}</code><span>Expires</span><code>${escapeHtml(expiresAt)}</code><span>Retry</span><span id="countdown">after expiry</span></div>
+</div><div class="footer">No approval code, resume token, access token or client secret is recovered or exposed on this page.</div></section></main>
+<script>
+const retryAfterMs=${retryAfterMs};
+const deadline=Date.now()+retryAfterMs;
+const countdown=document.getElementById('countdown');
+function tick(){const left=Math.max(0,deadline-Date.now());countdown.textContent=left>0?'in '+Math.ceil(left/1000)+'s':'retrying…';if(left>0)setTimeout(tick,1000)}
+tick();setTimeout(()=>location.reload(),retryAfterMs);
+</script></body></html>`;
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "retry-after": String(retryAfterSec),
+      "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
+
 function firstOf(v: unknown): string {
   if (Array.isArray(v)) return typeof v[0] === "string" ? v[0] : "";
   return typeof v === "string" ? v : "";
@@ -935,12 +980,17 @@ async function handleAuthorize(url: URL, ctx: HandlerCtx): Promise<Response> {
   );
   if (!persisted.ok) {
     if (persisted.code === "duplicate_pending") {
-      return ctx.json({
-        error: "authorization_pending",
-        error_description: "an identical Connector approval request is already pending; use the original approval page",
-        request_id: persisted.existing_request_id ?? null,
-        expires_at_ms: persisted.expires_at_ms ?? null,
-      }, 409, { "cache-control": "no-store" });
+      const existingRequestId = persisted.existing_request_id;
+      const existingExpiresAtMs = persisted.expires_at_ms;
+      if (existingRequestId && typeof existingExpiresAtMs === "number") {
+        return pendingApprovalPage({
+          requestId: existingRequestId,
+          expiresAtMs: existingExpiresAtMs,
+          nowMs,
+          clientName: client.client_name,
+        });
+      }
+      return serverError(ctx, "duplicate Connector approval could not be resolved safely");
     }
     if (persisted.status === 429) {
       return ctx.json({
