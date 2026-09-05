@@ -84,9 +84,8 @@ jobs:
           source_manifest_schema="$(jq -r '.manifest_schema' <<<"$source_resolution")"
           source_target_matrix="$(jq -c '.targets' <<<"$source_resolution")"
           source_target_count="$(jq '.targets | length' <<<"$source_resolution")"
-          # Runtime release contains only target binaries plus release-manifest.json.
-          # Browser extension distribution is owned by Chrome Web Store.
-          source_release_asset_count="$((source_target_count + 1))"
+          # The exact recovered file set is derived from the immutable release manifest below.
+          # Newer releases may include a top-level Edge artifact; older manifests remain valid.
 
           run_json="$(gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID")"
           [[ "$(jq -r '.event' <<<"$run_json")" == "push" ]] || { echo "source run was not triggered by a tag push" >&2; exit 1; }
@@ -121,7 +120,6 @@ jobs:
           echo "source_target_mode=$source_target_mode" >> "$GITHUB_OUTPUT"
           echo "source_manifest_schema=$source_manifest_schema" >> "$GITHUB_OUTPUT"
           echo "source_target_matrix=$source_target_matrix" >> "$GITHUB_OUTPUT"
-          echo "source_release_asset_count=$source_release_asset_count" >> "$GITHUB_OUTPUT"
 
       - name: Download exact attested release bundle
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -226,6 +224,22 @@ jobs:
               expected_url = f"https://github.com/{repo}/releases/download/{quote(tag, safe='')}/{quote(name, safe='')}"
               if asset.get("url") != expected_url:
                   raise SystemExit(f"non-GitHub or mismatched release URL: {name}")
+          edge = manifest.get("edge")
+          if edge is not None:
+              name = edge.get("name")
+              expected_name = f"herdr-edge-{source_version}.mjs"
+              if name != expected_name:
+                  raise SystemExit(f"Edge release asset name mismatch: {name}")
+              expected.add(name)
+              path = root / name
+              data = path.read_bytes()
+              if len(data) != edge.get("size"):
+                  raise SystemExit(f"Edge size mismatch: {name}")
+              if hashlib.sha256(data).hexdigest() != edge.get("sha256"):
+                  raise SystemExit(f"Edge sha256 mismatch: {name}")
+              expected_url = f"https://github.com/{repo}/releases/download/{quote(tag, safe='')}/{quote(name, safe='')}"
+              if edge.get("url") != expected_url:
+                  raise SystemExit(f"non-GitHub or mismatched Edge release URL: {name}")
           actual = {p.name for p in root.iterdir() if p.is_file()}
           if actual != expected:
               missing = sorted(expected - actual)

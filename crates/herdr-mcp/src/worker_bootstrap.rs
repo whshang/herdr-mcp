@@ -1,9 +1,11 @@
 use crate::paths::RuntimePaths;
+use crate::release_trust;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,7 +15,12 @@ const CLOUDFLARE_DEVICE_AUTH: &str = "https://dash.cloudflare.com/oauth2/device/
 const CLOUDFLARE_TOKEN: &str = "https://dash.cloudflare.com/oauth2/token";
 const CLOUDFLARE_CLIENT_ID: &str = "54d11594-84e4-41aa-b438-e81b8fa78ee7";
 const CLOUDFLARE_SCOPES: &str = "account:read user:read workers_scripts:write offline_access";
-const WRANGLER_VERSION: &str = "4.129.0";
+const EDGE_COMPATIBILITY_DATE: &str = "2024-09-23";
+const EDGE_MAIN_MODULE: &str = "herdr-edge.mjs";
+const EDGE_CRON: &str = "*/10 * * * *";
+const EDGE_MANIFEST_MAX_BYTES: usize = 1024 * 1024;
+const EDGE_BUNDLE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const EDGE_ATTESTATION_MAX_BYTES: usize = 2 * 1024 * 1024;
 const JOURNAL_SCHEMA: u32 = 1;
 const JOURNAL_FILE: &str = "first-worker-v1.json";
 const TEMP_OPERATOR_SECRET: &str = "STATIC_MCP_BEARER_SECRET";
@@ -292,6 +299,94 @@ impl<'a> Cloudflare<'a> {
         })
     }
 
+    fn upload_worker(
+        &self,
+        gate: &MutationGate,
+        account_id: &str,
+        worker_name: &str,
+        bundle: &[u8],
+        metadata: &Value,
+    ) -> Result<(), String> {
+        gate.require("deploy Worker")?;
+        let module = reqwest::blocking::multipart::Part::bytes(bundle.to_vec())
+            .file_name(EDGE_MAIN_MODULE)
+            .mime_str("application/javascript+module")
+            .map_err(|error| format!("cannot encode Edge module upload: {error}"))?;
+        let form = reqwest::blocking::multipart::Form::new()
+            .text("metadata", metadata.to_string())
+            .part(EDGE_MAIN_MODULE.to_owned(), module);
+        let url = format!("{CLOUDFLARE_API}/accounts/{account_id}/workers/scripts/{worker_name}");
+        let response = self
+            .client
+            .put(url)
+            .bearer_auth(self.token.expose()?)
+            .multipart(form)
+            .send()
+            .map_err(|error| {
+                sanitize_error(
+                    &format!("Cloudflare Worker upload failed: {error}"),
+                    self.token,
+                )
+            })?;
+        let status = response.status();
+        let payload: Value = response.json().map_err(|_| {
+            format!(
+                "Cloudflare Worker upload returned non-JSON HTTP {}",
+                status.as_u16()
+            )
+        })?;
+        let success = payload
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(status.is_success());
+        if !status.is_success() || !success {
+            return Err(sanitize_error(
+                &format!(
+                    "Cloudflare Worker upload HTTP {}: {}",
+                    status.as_u16(),
+                    cloudflare_error_summary(&payload)
+                ),
+                self.token,
+            ));
+        }
+        Ok(())
+    }
+
+    fn enable_worker_subdomain(
+        &self,
+        gate: &MutationGate,
+        account_id: &str,
+        worker_name: &str,
+    ) -> Result<(), String> {
+        gate.require("enable Worker workers.dev subdomain")?;
+        let result = self.request(
+            reqwest::Method::POST,
+            &format!("accounts/{account_id}/workers/scripts/{worker_name}/subdomain"),
+            Some(&json!({ "enabled": true, "previews_enabled": false })),
+        )?;
+        if result.get("enabled").and_then(Value::as_bool) != Some(true) {
+            return Err(
+                "Cloudflare did not confirm the Worker workers.dev subdomain as enabled".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    fn set_worker_schedule(
+        &self,
+        gate: &MutationGate,
+        account_id: &str,
+        worker_name: &str,
+    ) -> Result<(), String> {
+        gate.require("configure Worker cron")?;
+        self.request(
+            reqwest::Method::PUT,
+            &format!("accounts/{account_id}/workers/scripts/{worker_name}/schedules"),
+            Some(&json!([{ "cron": EDGE_CRON }])),
+        )?;
+        Ok(())
+    }
+
     fn put_secret(
         &self,
         gate: &MutationGate,
@@ -466,21 +561,12 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
     if !script_exists || journal.phase < Phase::WorkerDeployed {
         journal.advance(Phase::WorkerDeploying);
         write_journal(&journal_path, &journal)?;
-        let bundle = prepare_edge_bundle(&source_commit)?;
-        let deploy_result = deploy_worker(
-            &gate,
-            &token,
-            &account.id,
-            &worker_name,
-            &edge_origin,
-            &runtime_version,
-            &bundle.edge_dir,
-        );
-        let cleanup_result = fs::remove_dir_all(&bundle.root);
-        deploy_result?;
-        if let Err(error) = cleanup_result {
-            eprintln!("warning: could not remove non-secret bootstrap source directory: {error}");
-        }
+        let bundle = prepare_edge_bundle(&source_commit, &runtime_version)?;
+        let metadata =
+            worker_upload_metadata(&worker_name, &edge_origin, &runtime_version, !script_exists)?;
+        cloudflare.upload_worker(&gate, &account.id, &worker_name, &bundle.bytes, &metadata)?;
+        cloudflare.enable_worker_subdomain(&gate, &account.id, &worker_name)?;
+        cloudflare.set_worker_schedule(&gate, &account.id, &worker_name)?;
         verify_health(&edge_origin, &worker_name, Some(&runtime_version))?;
         journal.advance(Phase::WorkerDeployed);
         write_journal(&journal_path, &journal)?;
@@ -864,158 +950,226 @@ fn select_account(cloudflare: &Cloudflare<'_>) -> Result<Account, String> {
 }
 
 struct EdgeBundle {
-    root: PathBuf,
-    edge_dir: PathBuf,
+    bytes: Vec<u8>,
 }
 
-fn prepare_edge_bundle(source_commit: &str) -> Result<EdgeBundle, String> {
-    let root = std::env::temp_dir().join(format!(
-        "herdr-bootstrap-{}-{}",
-        std::process::id(),
-        now_ms()
-    ));
-    fs::create_dir_all(&root)
-        .map_err(|error| format!("cannot create bootstrap source directory: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("cannot secure bootstrap source directory: {error}"))?;
+#[derive(Debug, Clone)]
+struct EdgeReleaseDescriptor {
+    name: String,
+    size: usize,
+    sha256: String,
+    url: url::Url,
+    identity: release_trust::ReleaseIdentity,
+}
+
+fn prepare_edge_bundle(source_commit: &str, runtime_version: &str) -> Result<EdgeBundle, String> {
+    if let Some(path) = std::env::var_os("HERDR_MCP_EDGE_BUNDLE_PATH") {
+        if crate::runtime_meta::runtime_channel() != "dev" {
+            return Err("HERDR_MCP_EDGE_BUNDLE_PATH is allowed only in a DEV runtime".to_owned());
+        }
+        let path = PathBuf::from(path);
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("cannot inspect DEV Edge bundle: {error}"))?;
+        if !metadata.is_file()
+            || metadata.len() == 0
+            || metadata.len() > EDGE_BUNDLE_MAX_BYTES as u64
+        {
+            return Err("DEV Edge bundle is missing, empty, or too large".to_owned());
+        }
+        return fs::read(&path)
+            .map(|bytes| EdgeBundle { bytes })
+            .map_err(|error| format!("cannot read DEV Edge bundle: {error}"));
     }
-    let archive = root.join("source.tar.gz");
-    let url = format!("https://codeload.github.com/whshang/herdr-mcp/tar.gz/{source_commit}");
-    let mut response = reqwest::blocking::Client::builder()
+
+    let tag = format!("v{runtime_version}");
+    let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent(format!("herdr-mcp-bootstrap/{runtime_version}"))
         .build()
-        .map_err(|error| format!("cannot create source download client: {error}"))?
-        .get(url)
+        .map_err(|error| format!("cannot create Edge release download client: {error}"))?;
+    let manifest_url = format!(
+        "https://github.com/{}/releases/download/{tag}/release-manifest.json",
+        release_trust::RELEASE_REPOSITORY
+    );
+    let manifest_bytes = read_http_bounded(
+        client.get(&manifest_url),
+        EDGE_MANIFEST_MAX_BYTES,
+        "release manifest",
+    )?;
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("release manifest is invalid JSON: {error}"))?;
+    let descriptor = parse_edge_release_manifest(&manifest, source_commit, runtime_version)?;
+    let bytes = read_http_bounded(
+        client.get(descriptor.url.clone()),
+        EDGE_BUNDLE_MAX_BYTES,
+        "Edge bundle",
+    )?;
+    if bytes.len() != descriptor.size {
+        return Err("Edge bundle size does not match the release manifest".to_owned());
+    }
+    let actual_sha256 = sha256_hex(&bytes);
+    if actual_sha256 != descriptor.sha256 {
+        return Err("Edge bundle sha256 does not match the release manifest".to_owned());
+    }
+    let attestation_url = release_trust::attestation_api_url(&descriptor.sha256)?;
+    let attestation = read_http_bounded(
+        client
+            .get(attestation_url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28"),
+        EDGE_ATTESTATION_MAX_BYTES,
+        "Edge artifact attestation",
+    )?;
+    release_trust::verify_github_attestations(
+        &attestation,
+        &descriptor.name,
+        &descriptor.sha256,
+        &descriptor.identity,
+    )?;
+    Ok(EdgeBundle { bytes })
+}
+
+fn parse_edge_release_manifest(
+    manifest: &Value,
+    source_commit: &str,
+    runtime_version: &str,
+) -> Result<EdgeReleaseDescriptor, String> {
+    if manifest.get("schema_version").and_then(Value::as_u64)
+        != Some(release_trust::MANIFEST_SCHEMA_VERSION)
+        || manifest.get("product").and_then(Value::as_str) != Some("herdr-mcp")
+        || manifest.get("version").and_then(Value::as_str) != Some(runtime_version)
+    {
+        return Err("release manifest identity does not match this runtime".to_owned());
+    }
+    let tag = format!("v{runtime_version}");
+    if manifest.get("tag").and_then(Value::as_str) != Some(tag.as_str()) {
+        return Err("release manifest tag/version mismatch".to_owned());
+    }
+    let identity = release_trust::parse_manifest_identity(manifest, &tag)?;
+    if identity.source_commit != source_commit {
+        return Err("release manifest source commit does not match this runtime".to_owned());
+    }
+    let edge = manifest
+        .get("edge")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "release manifest is missing the Edge artifact".to_owned())?;
+    let expected_name = format!("herdr-edge-{runtime_version}.mjs");
+    let name = edge
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| *value == expected_name)
+        .ok_or_else(|| "release manifest Edge artifact name is invalid".to_owned())?
+        .to_owned();
+    let size = edge
+        .get("size")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0 && *value <= EDGE_BUNDLE_MAX_BYTES as u64)
+        .ok_or_else(|| "release manifest Edge artifact size is invalid".to_owned())?
+        as usize;
+    let sha256 = edge
+        .get("sha256")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "release manifest Edge artifact sha256 is invalid".to_owned())?
+        .to_ascii_lowercase();
+    let url = edge
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "release manifest Edge artifact URL is missing".to_owned())?
+        .parse::<url::Url>()
+        .map_err(|_| "release manifest Edge artifact URL is invalid".to_owned())?;
+    let expected_url = format!(
+        "https://github.com/{}/releases/download/{tag}/{expected_name}",
+        release_trust::RELEASE_REPOSITORY
+    )
+    .parse::<url::Url>()
+    .map_err(|_| "cannot construct trusted Edge release URL".to_owned())?;
+    if url != expected_url {
+        return Err(
+            "release manifest Edge artifact URL does not match the trusted release".to_owned(),
+        );
+    }
+    Ok(EdgeReleaseDescriptor {
+        name,
+        size,
+        sha256,
+        url,
+        identity,
+    })
+}
+
+fn read_http_bounded(
+    request: reqwest::blocking::RequestBuilder,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let mut response = request
         .send()
-        .map_err(|error| format!("cannot download release-matched Edge source: {error}"))?;
+        .map_err(|error| format!("{label} download failed: {error}"))?;
     if !response.status().is_success() {
         return Err(format!(
-            "release-matched Edge source download returned HTTP {}",
+            "{label} download returned HTTP {}",
             response.status().as_u16()
         ));
     }
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&archive)
-        .map_err(|error| format!("cannot create bootstrap source archive: {error}"))?;
-    io::copy(&mut response, &mut file)
-        .map_err(|error| format!("cannot save bootstrap source archive: {error}"))?;
-    file.sync_all()
-        .map_err(|error| format!("cannot sync bootstrap source archive: {error}"))?;
-    let output = Command::new("/usr/bin/tar")
-        .args(["-xzf"])
-        .arg(&archive)
-        .args(["-C"])
-        .arg(&root)
-        .output()
-        .map_err(|error| format!("cannot extract release-matched Edge source: {error}"))?;
-    if !output.status.success() {
-        return Err("cannot extract release-matched Edge source".to_owned());
-    }
-    let checkout = fs::read_dir(&root)
-        .map_err(|error| format!("cannot inspect extracted Edge source: {error}"))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.is_dir())
-        .ok_or_else(|| "release-matched Edge source archive contained no checkout".to_owned())?;
-    let edge_dir = checkout.join("edge").join("cloudflare");
-    if !edge_dir.join("src").join("index.ts").is_file()
-        || !edge_dir.join("wrangler.user.example.toml").is_file()
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
     {
-        return Err(
-            "release-matched source archive is missing the Cloudflare Edge bundle".to_owned(),
-        );
+        return Err(format!("{label} is too large"));
     }
-    Ok(EdgeBundle { root, edge_dir })
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {label}: {error}"))?;
+    if bytes.len() > max_bytes {
+        return Err(format!("{label} is too large"));
+    }
+    Ok(bytes)
 }
 
-fn deploy_worker(
-    gate: &MutationGate,
-    token: &SecretBytes,
-    account_id: &str,
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
+}
+
+fn worker_upload_metadata(
     worker_name: &str,
     edge_origin: &str,
     runtime_version: &str,
-    edge_dir: &Path,
-) -> Result<(), String> {
-    gate.require("deploy Worker")?;
-    let example = fs::read_to_string(edge_dir.join("wrangler.user.example.toml"))
-        .map_err(|error| format!("cannot read release Wrangler template: {error}"))?;
-    let config = render_wrangler_config(&example, worker_name, edge_origin, runtime_version)?;
-    let config_path = edge_dir.join("wrangler.user.toml");
-    write_private_file(&config_path, config.as_bytes())?;
-    let mut command = Command::new("npx");
-    command
-        .arg("--yes")
-        .arg(format!("wrangler@{WRANGLER_VERSION}"))
-        .args(["deploy", "--config", "wrangler.user.toml"])
-        .current_dir(edge_dir)
-        .env("CLOUDFLARE_API_TOKEN", token.expose()?)
-        .env("CLOUDFLARE_ACCOUNT_ID", account_id)
-        .env("WRANGLER_SEND_METRICS", "false")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let command_summary = crate::runtime_meta::redact_command_summary(&format!(
-        "npx --yes wrangler@{WRANGLER_VERSION} deploy --config wrangler.user.toml"
-    ));
-    let output = command
-        .output()
-        .map_err(|error| format!("cannot run {command_summary}: {error}"))?;
-    if !output.status.success() {
-        let stderr = sanitize_error(&String::from_utf8_lossy(&output.stderr), token);
-        let stdout = sanitize_error(&String::from_utf8_lossy(&output.stdout), token);
-        return Err(format!(
-            "pinned Wrangler deploy failed: {} {}",
-            stdout.trim(),
-            stderr.trim()
-        ));
-    }
-    Ok(())
-}
-
-fn render_wrangler_config(
-    example: &str,
-    worker_name: &str,
-    edge_origin: &str,
-    runtime_version: &str,
-) -> Result<String, String> {
+    include_migrations: bool,
+) -> Result<Value, String> {
     if !valid_worker_name(worker_name) || !edge_origin.starts_with("https://") {
-        return Err("invalid Worker identity for Wrangler config".to_owned());
+        return Err("invalid Worker identity for direct Edge upload".to_owned());
     }
-    let mut out = String::new();
-    for line in example.lines() {
-        if line.trim_start().starts_with("DEFAULT_WORKSTATION_ID =") {
-            continue;
-        }
-        let rendered = if line.starts_with("name = ") {
-            format!("name = \"{worker_name}\"")
-        } else if line.starts_with("EDGE_PROJECT = ") {
-            format!("EDGE_PROJECT = \"{worker_name}\"")
-        } else if line.starts_with("EDGE_VERSION = ") {
-            format!("EDGE_VERSION = \"{runtime_version}\"")
-        } else if line.starts_with("OAUTH_ISSUER = ") {
-            format!("OAUTH_ISSUER = \"{edge_origin}\"")
-        } else {
-            line.to_owned()
-        };
-        out.push_str(&rendered);
-        out.push('\n');
+    let mut metadata = json!({
+        "main_module": EDGE_MAIN_MODULE,
+        "compatibility_date": EDGE_COMPATIBILITY_DATE,
+        "bindings": [
+            { "type": "durable_object_namespace", "name": "WORKSTATION_DO", "class_name": "WorkstationDO" },
+            { "type": "durable_object_namespace", "name": "OAUTH_STORE_DO", "class_name": "OAuthStoreDO" },
+            { "type": "durable_object_namespace", "name": "DEVICE_REGISTRY_DO", "class_name": "DeviceRegistryDO" },
+            { "type": "plain_text", "name": "EDGE_ENV", "text": "prod" },
+            { "type": "plain_text", "name": "EDGE_PROJECT", "text": worker_name },
+            { "type": "plain_text", "name": "EDGE_VERSION", "text": runtime_version },
+            { "type": "plain_text", "name": "OAUTH_ISSUER", "text": edge_origin }
+        ]
+    });
+    if include_migrations {
+        metadata["migrations"] = json!({
+            "new_tag": "v3",
+            "steps": [
+                { "new_sqlite_classes": ["WorkstationDO"] },
+                { "new_sqlite_classes": ["OAuthStoreDO"] },
+                { "new_sqlite_classes": ["DeviceRegistryDO"] }
+            ]
+        });
     }
-    let r2_enabled = out
-        .lines()
-        .any(|line| line.trim_start().starts_with("[[r2_buckets]]"));
-    if !out.contains("workers_dev = true") || r2_enabled {
-        return Err(
-            "release Wrangler template violates the core Workers Free bootstrap contract"
-                .to_owned(),
-        );
-    }
-    Ok(out)
+    Ok(metadata)
 }
 
 fn create_and_consume_first_pairing(
@@ -1673,7 +1827,7 @@ mod tests {
         assert!(!output.contains(access_literal));
 
         let log = crate::runtime_meta::redact_command_summary(&format!(
-            "wrangler deploy --token {access_literal}"
+            "cloudflare worker upload --token {access_literal}"
         ));
         assert!(!log.contains(access_literal));
 
@@ -1704,35 +1858,43 @@ mod tests {
     }
 
     #[test]
-    fn wrangler_config_is_workers_free_and_has_no_fake_workstation() {
-        let example = r#"name = \"herdr-edge\"
-workers_dev = true
-routes = []
-[vars]
-EDGE_PROJECT = \"herdr-edge\"
-EDGE_VERSION = \"0.1.0\"
-DEFAULT_WORKSTATION_ID = \"my-workstation\"
-OAUTH_ISSUER = \"https://old.example\"
-# [[r2_buckets]]
-# binding = \"ARTIFACT_BUCKET\"
-"#;
-        let rendered = render_wrangler_config(
-            example,
+    fn direct_upload_metadata_is_core_only_and_has_no_fake_workstation() {
+        let metadata = worker_upload_metadata(
             "herdr-edge-mac",
             "https://herdr-edge-mac.example.workers.dev",
             "0.4.6",
+            true,
         )
         .unwrap();
-        assert!(rendered.contains("workers_dev = true"));
-        assert!(!rendered.contains("DEFAULT_WORKSTATION_ID"));
-        assert!(!rendered.contains("\n[[r2_buckets]]\n"));
-        assert!(rendered.contains("EDGE_VERSION = \"0.4.6\""));
+        assert_eq!(
+            metadata.get("main_module").and_then(Value::as_str),
+            Some(EDGE_MAIN_MODULE)
+        );
+        let text = metadata.to_string();
+        assert!(!text.contains("DEFAULT_WORKSTATION_ID"));
+        assert!(!text.contains("ARTIFACT_BUCKET"));
+        assert!(text.contains("WORKSTATION_DO"));
+        assert!(text.contains("OAUTH_STORE_DO"));
+        assert!(text.contains("DEVICE_REGISTRY_DO"));
+        assert!(text.contains("\"EDGE_VERSION\",\"text\":\"0.4.6\""));
+        assert_eq!(
+            metadata
+                .pointer("/migrations/new_tag")
+                .and_then(Value::as_str),
+            Some("v3")
+        );
     }
 
     #[test]
-    fn wrangler_is_pinned_not_latest() {
-        assert_eq!(WRANGLER_VERSION, "4.129.0");
-        assert_ne!(WRANGLER_VERSION, "latest");
+    fn existing_worker_direct_upload_does_not_repeat_migrations() {
+        let metadata = worker_upload_metadata(
+            "herdr-edge-mac",
+            "https://herdr-edge-mac.example.workers.dev",
+            "0.4.6",
+            false,
+        )
+        .unwrap();
+        assert!(metadata.get("migrations").is_none());
     }
 
     #[test]

@@ -61,7 +61,7 @@ herdr-mcp doctor
 
 `doctor` 权限结果为 `needs_setup`、`denied`、`unknown` 或 `timeout` 时，现在就停下来修复，不得当作健康。提前一次性完成稳定 TCC broker 的完全磁盘访问授权，才能避免之后 runtime、Herdr socket、项目访问反复逐路径弹权限。不要用 `sudo` 代替 broker 授权。
 
-Node.js 只用于临时 Cloudflare Worker 引导（`npx wrangler`）和可选贡献者工具链，**不是**运行本机 MCP runtime 的依赖。
+普通安装和第一台 Worker 引导**不需要 Node.js**。Release 已包含 CI 构建好的 Edge artifact，`herdr-mcp worker bootstrap` 会通过 Cloudflare API 直接部署；Node/Wrangler 只保留给贡献者和维护者。
 
 规范公网 MCP URL 示例：`https://herdr-edge-device.username.workers.dev/mcp` 与 `https://herdr-mcp.example.com/mcp`。
 
@@ -90,13 +90,7 @@ macOS v0.4.3+ 首次安装还会准备固定的 `~/.config/herdr-mcp/tcc-broker/
 
 人类可读的电脑名（例如 macOS Computer Name）是独立的显示名。它默认作为 `worker connect` 的 `--name`，之后可用 `worker rename` 改名，永远不会改变不可变的 `device_id`。
 
-有临时 Edge checkout 时，`WORKER_NAME` 只能通过仓库 helper 生成，Agent 不得自造 hostname slug：
-
-```bash
-WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
-```
-
-helper 会把 hostname 小写，把 `[a-z0-9-]` 以外字符安全替换，压缩/修剪 `-`，并保证完整 Worker 名不超过 63 且匹配 `^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`。例如 `MacBook.local` → `herdr-edge-macbook-local`。`WORKER_NAME`（Cloudflare Worker 命名）与 `dev_<ULID>` 设备身份故意使用不同语法。秘密用 `openssl rand -hex 32` 一类强随机；最终报告不得包含秘密。
+`herdr-mcp worker bootstrap` 会在 runtime 内部按同一套有界 DNS-label 规则从本机电脑名派生 Worker 名。Agent 不需要源码 checkout、Node.js 或单独生成 `WORKER_NAME`。Cloudflare Worker 命名与 canonical `dev_<ULID>` 设备身份继续使用不同语法；bootstrap 生成的秘密不会出现在普通输出中。
 
 ## 4. Cloudflare 授权
 
@@ -110,7 +104,7 @@ helper 会把 hostname 小写，把 `[a-z0-9-]` 以外字符安全替换，压�
 
 ## 5. Token 到达后的 Cloudflare 预检
 
-只以临时 `CLOUDFLARE_API_TOKEN` 注入，不要写成命令行字面量。验证 `GET https://api.cloudflare.com/client/v4/user/tokens/verify`，再对临时 Edge 工作目录运行 `npx wrangler whoami`。
+API Token fallback 只放在当前进程环境或 bootstrap 的隐藏输入中，绝不能写成命令行字面量。`herdr-mcp worker bootstrap` 会验证 `/user/tokens/verify`、解析 Account 与 `workers.dev` subdomain、检查已有 Worker scripts，并直接通过 Cloudflare API 完成部署；普通 onboarding 不运行 Wrangler。
 
 - 一个 Account → 自动选择；
 - 多个 Account → 只问要用哪个 Account 名；
@@ -119,71 +113,32 @@ helper 会把 hostname 小写，把 `[a-z0-9-]` 以外字符安全替换，压�
 Token 可以验证为**有效**（`/user/tokens/verify` 返回 active）却仍在具体调用上得到 `403`——这说明缺权限，不是 token 坏了。先把失败调用映射到权限，再补授权，不要盲目重建一个更大的 token：
 
 - `GET .../workers/subdomain` 返回 403 → 缺 **Account Settings → Read**；
-- `wrangler deploy` / Workers Scripts 调用失败 → 缺 **Workers Scripts → Edit**；
+- Worker Script upload / Workers Scripts 调用失败 → 缺 **Workers Scripts → Edit**；
 - R2 桶 provisioning 失败 → 未授予可选的 **Workers R2 Storage → Edit**（核心安装本来就不需要；只有用户明确启用 artifact relay 时才算错误）。
 
 按权限诊断，不要无根据扩大权限；补齐权限之前不要重试 mutation。
 
 **部署前的已有 Worker 检测。** 拿到 `ACCOUNT_ID` 后先列 `GET /client/v4/accounts/<ACCOUNT_ID>/workers/scripts`。如果那里已有 Herdr Worker，立即停止部署路径，切换到[多设备控制](existing-worker-connect.md)的既有 fleet 流程（由任意已登记设备创建 pairing，本机执行 `worker connect`）。绝不能拿当前这台全新机器执行 `worker pair` 来探测 fleet。只有 §0 得到明确「第一台」答复后才允许部署新 Worker。
 
-选定后只把 account ID 放在当前部署进程环境：
+选定 Account 后，bootstrap 只在进程内存里保留 account id 与 Cloudflare credential。它通过 Cloudflare API 读取或创建账户 `workers.dev` subdomain，已有 subdomain 永不改名。canonical `workers.dev` origin 为 `<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`。
+
+## 6. 通过已安装 runtime 部署 Edge
+
+直接运行：
 
 ```bash
-export CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID"
+herdr-mcp worker bootstrap
 ```
 
-不要把个人 `account_id` 写进被跟踪的 Wrangler 配置。后续 `wrangler deploy` / `wrangler secret put` 继承该临时环境。
+普通 first-Worker 路径不需要源码 checkout、`wrangler.user.toml`、Node.js、npm 或用户侧 Wrangler。Release pipeline 已提前构建 `herdr-edge-<version>.mjs`。bootstrap 会下载精确匹配的 release manifest 与 Edge artifact，要求 release source commit 与当前 runtime 一致，校验大小、SHA-256 和 GitHub artifact attestation，再通过 Cloudflare Worker API 直接上传模块。
 
-有 `ACCOUNT_ID` 后请求 `GET /client/v4/accounts/<ACCOUNT_ID>/workers/subdomain`。复用已有 account subdomain，**永不改名**。Worker origin 永远是 `<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`。
+对真正空的 Herdr setup，同一个命令继续完成整个状态机：配置三个 Durable Object bindings 与首次 migrations，写入非秘密 Worker variables，启用 Worker `workers.dev` subdomain，配置 cron trigger，provision bootstrap secrets，创建并消费首次 pairing，把 canonical `dev_<ULID>` credential 写入本机，删除临时 operator credential，安装/对齐 production Link，并要求最终 readiness 全部通过。Worker 代码只部署一次；canonical device enrollment 不会触发第二次 Worker 部署。
 
-**公网入口选择。** 在最终公网 identity 固化前，枚举 Token 可见的 active zones。这一步只是发现，不代表可以任意修改 DNS。
+**R2 继续可选且默认关闭。** 核心 Worker upload 不含 `ARTIFACT_BUCKET` binding，不要求 R2 subscription 或绑卡。可选 artifact relay 在核心安装健康后作为独立 operator 操作处理。
 
-- **没有 active zone：**直接使用 `workers.dev`，不要问域名。把 `workers.dev` 记录为 canonical origin 并直接继续；这不是降级安装错误，工作站侧的网络可达性由 Link transport fallback 负责。
-- **只有一个明显 active zone：**推荐/自动选择专用 hostname `herdr-mcp.<zone>`（或用户选定的专用 hostname），检查它没有被不兼容的 DNS record/Worker 占用，并优先把它作为最终 MCP/OAuth Custom Domain。
-- **多个 materially different zones：**只问一次用哪个 zone。
+bootstrap 先证明 `workers.dev` origin。选定的 Cloudflare Account 有合适 active zone 且用户希望使用稳定 Custom Domain 时，在创建 ChatGPT Connector 前按 Cloudflare Custom Domain 文档固化最终 public origin。Worker 代码部署与 public-origin/DNS 修改继续分开；不要让 Connector 先绑定一个 origin 再静默迁移。
 
-若尚无 subdomain，只在确认不存在时创建；用 `herdr-<short-account-id>`，冲突再加随机后缀。GET 明确无 subdomain 后才：
-
-```text
-PUT /client/v4/accounts/<ACCOUNT_ID>/workers/subdomain
-Content-Type: application/json
-
-{"subdomain":"<candidate>"}
-```
-
-创建后再 GET，要求返回值匹配才继续部署。
-
-## 6. 部署 Edge，不要求永久仓库 checkout
-
-仅为 Edge 部署获取 Worker 源码（临时 shallow clone 或与 Release 相邻的文档包均可）。从已发布的 user example 生成被忽略的 `wrangler.user.toml`，先设置 `name` 与 `DEFAULT_WORKSTATION_ID`。保持 `workers_dev = true`，让 `https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev` 始终可作为零域名 bootstrap/诊断 origin。
-
-先部署一次 `workers.dev` 并证明 `/health`，再在创建 ChatGPT Connector 前确定唯一长期 public origin：
-
-- **有 active Cloudflare zone 时推荐：**增加 `[[routes]]`，设置 `pattern = "herdr-mcp.<zone>"`（或用户选定的专用 hostname）与 `custom_domain = true`，把 `OAUTH_ISSUER` 改为 `https://<custom-host>`，重新部署，并要求该 hostname 的 `/health`、未认证 `/mcp`、OAuth discovery 全部通过。Cloudflare 会自动创建 Custom Domain 的 DNS 记录与证书。
-- **没有合适 zone / 用户不使用：**保持 `routes = []`，设置 `OAUTH_ISSUER=https://<WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev`，把这个 `workers.dev` origin 固化为 canonical public identity。
-
-不要先让 Connector 绑定 bootstrap hostname，随后又静默迁域名。OAuth client 一旦接入，public-origin 修改就是显式迁移操作。
-
-**R2 可选，默认关闭。** 核心安装保持 `wrangler.user.toml` 中的 `[[r2_buckets]]` 注释状态，已发布的 user example 就是这样发布的。Edge 代码把 `ARTIFACT_BUCKET` 视为可选，核心部署必须在 Workers Free、无 R2、无绑卡的情况下成功。只有用户明确启用可选 artifact relay 时：取消注释该绑定、确认 token 有 **Workers R2 Storage → Edit**（以及 Cloudflare 要求的 R2 计费步骤），并在部署前执行 provisioning。绑定的桶不存在时 `wrangler deploy` 会 fail-closed——这正是默认路径不发布该绑定的原因。R2 保持关闭时，跳过 provisioning 直接部署：
-
-```bash
-npx wrangler deploy --config wrangler.user.toml
-```
-
-artifact relay 启用（仅可选路径）：
-
-```bash
-node provision-r2.mjs --config wrangler.user.toml
-npx wrangler deploy --config wrangler.user.toml
-```
-
-除非能证明拥有权，否则不要覆盖已有 Worker。如果目标名称已存在，先停下来判断它是不是用户已有的 Herdr Worker；**禁止**为了绕过所有权确认而直接创建随机后缀 Worker。只有用户明确确认 first-fleet，且能证明已有 Worker 与本次无关时，才选择新的唯一 Worker 名。然后把 WSS 共享秘密存为 Worker secret：
-
-```bash
-printf '%s' "$LINK_SHARED_SECRET" | npx wrangler secret put LINK_SHARED_SECRET --config wrangler.user.toml
-```
-
-不需要 Zone/DNS mutation。只为 Edge 部署用的临时 checkout **不得**成为 `herdr-mcp` 的生产 PATH。
+绝不能覆盖无关的已有 Worker。mutation gate 打开前先分类已有 scripts：属于本次但未完成的 bootstrap 就恢复；已有 Herdr fleet 就切到 pairing/connect；所有权不明确就 fail closed。
 
 ## 7. macOS 本机 MCP 服务所有权
 
