@@ -30,6 +30,18 @@ pub const BROWSER_ENDPOINT_INSPECT_METHOD: &str = "herdr_mcp.browser_endpoint.in
 pub const BROWSER_RESOURCE_LIST_METHOD: &str = "herdr_mcp.browser_resource.list";
 pub const BROWSER_RESOURCE_INSPECT_METHOD: &str = "herdr_mcp.browser_resource.inspect";
 pub const BROWSER_RESOURCE_RESOLVE_METHOD: &str = "herdr_mcp.browser_resource.resolve";
+pub const BROWSER_SPACE_CREATE_METHOD: &str = "herdr_mcp.browser_space.create";
+pub const BROWSER_SPACE_OPEN_METHOD: &str = "herdr_mcp.browser_space.open";
+pub const BROWSER_SPACE_INSPECT_METHOD: &str = "herdr_mcp.browser_space.inspect";
+pub const BROWSER_SESSION_CREATE_METHOD: &str = "herdr_mcp.browser_session.create";
+pub const BROWSER_SESSION_OPEN_METHOD: &str = "herdr_mcp.browser_session.open";
+pub const BROWSER_SESSION_INSPECT_METHOD: &str = "herdr_mcp.browser_session.inspect";
+pub const BROWSER_MESSAGE_APPEND_METHOD: &str = "herdr_mcp.browser_message.append";
+pub const BROWSER_COMPOSER_SET_REASONING_METHOD: &str = "herdr_mcp.browser_composer.set_reasoning";
+pub const BROWSER_COMPOSER_SET_APPS_METHOD: &str = "herdr_mcp.browser_composer.set_apps";
+pub const BROWSER_DISPATCH_SUBMIT_METHOD: &str = "herdr_mcp.browser_dispatch.submit";
+pub const BROWSER_DISPATCH_STATUS_METHOD: &str = "herdr_mcp.browser_dispatch.status";
+pub const BROWSER_DISPATCH_STOP_METHOD: &str = "herdr_mcp.browser_dispatch.stop";
 
 pub fn local_method_schemas(query: &str) -> Vec<Value> {
     let schemas = vec![
@@ -321,6 +333,199 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "expected_observation_generation": {"type": ["integer", "null"], "minimum": 1},
                 },
                 "required": ["endpoint_ref", "provider", "kind"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_SPACE_CREATE_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "endpoint_ref": {"type": "string", "maxLength": 96},
+                    "provider": {"type": "string", "maxLength": 32},
+                    "account_ref": {"type": "string", "maxLength": 96},
+                    "display_label": {"type": "string", "maxLength": 256},
+                    "expected_generation": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                },
+                "required": ["endpoint_ref", "provider", "account_ref", "display_label", "expected_generation", "idempotency_key"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_SPACE_OPEN_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "space_ref": {"type": "string", "maxLength": 96},
+                    "expected_generation": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                },
+                "required": ["space_ref", "expected_generation", "idempotency_key"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_SPACE_INSPECT_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "space_ref": {"type": ["string", "null"], "maxLength": 96},
+                    "endpoint_ref": {"type": ["string", "null"], "maxLength": 96},
+                    "provider": {"type": ["string", "null"], "maxLength": 32},
+                    "account_ref": {"type": ["string", "null"], "maxLength": 96},
+                    "display_label": {"type": ["string", "null"], "maxLength": 256},
+                },
+                "required": [],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_SESSION_CREATE_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "endpoint_ref": {"type": "string", "maxLength": 96},
+                    "provider": {"type": "string", "maxLength": 32},
+                    "account_ref": {"type": "string", "maxLength": 96},
+                    "space_ref": {"type": ["string", "null"], "maxLength": 96},
+                    "display_label": {"type": "string", "maxLength": 256},
+                    "expected_generation": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                },
+                "required": ["endpoint_ref", "provider", "account_ref", "display_label", "expected_generation", "idempotency_key"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_SESSION_OPEN_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "session_ref": {"type": "string", "maxLength": 96},
+                    "expected_generation": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                },
+                "required": ["session_ref", "expected_generation", "idempotency_key"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_SESSION_INSPECT_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "session_ref": {"type": "string", "maxLength": 96},
+                },
+                "required": ["session_ref"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_MESSAGE_APPEND_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "session_ref": {"type": "string", "maxLength": 96},
+                    "message": {"type": "string", "maxLength": 262144},
+                    "expected_generation": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                },
+                "required": ["session_ref", "message", "expected_generation", "idempotency_key"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_COMPOSER_SET_REASONING_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "session_ref": {"type": "string", "maxLength": 96},
+                    "reasoning_effort": {"type": "string", "enum": ["economy", "balanced", "thorough"]},
+                    "expected_generation": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                },
+                "required": ["session_ref", "reasoning_effort", "expected_generation", "idempotency_key"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_COMPOSER_SET_APPS_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "session_ref": {"type": "string", "maxLength": 96},
+                    "required_apps": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 64}},
+                    "expected_generation": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                },
+                "required": ["session_ref", "required_apps", "expected_generation", "idempotency_key"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_DISPATCH_SUBMIT_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "session_ref": {"type": "string", "maxLength": 96},
+                    "message": {"type": "string", "maxLength": 262144},
+                    "reasoning_effort": {"type": ["string", "null"], "enum": ["economy", "balanced", "thorough", null]},
+                    "required_apps": {"type": ["array", "null"], "maxItems": 32, "items": {"type": "string", "maxLength": 64}},
+                    "expected_generation": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                    "work_chain_id": {"type": ["string", "null"], "maxLength": 128},
+                    "lane_id": {"type": ["string", "null"], "maxLength": 160},
+                },
+                "required": ["session_ref", "message", "expected_generation", "idempotency_key"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_DISPATCH_STATUS_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "dispatch_id": {"type": "string", "maxLength": 96},
+                },
+                "required": ["dispatch_id"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_DISPATCH_STOP_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "mutation",
+            "params": {
+                "properties": {
+                    "dispatch_id": {"type": "string", "maxLength": 96},
+                    "expected_generation": {"type": "integer", "minimum": 1},
+                    "idempotency_key": {"type": "string", "maxLength": 256},
+                },
+                "required": ["dispatch_id", "expected_generation", "idempotency_key"],
                 "empty": false,
             },
         }),
@@ -2127,13 +2332,29 @@ mod tests {
         assert_eq!(methods[5]["method"], WORK_MEMORY_SEARCH_METHOD);
 
         let methods = local_method_schemas("herdr_mcp.browser_");
-        assert_eq!(methods.len(), 5);
+        assert_eq!(methods.len(), 17);
         assert_eq!(methods[0]["method"], BROWSER_ENDPOINT_LIST_METHOD);
         assert_eq!(methods[1]["method"], BROWSER_ENDPOINT_INSPECT_METHOD);
         assert_eq!(methods[2]["method"], BROWSER_RESOURCE_LIST_METHOD);
         assert_eq!(methods[3]["method"], BROWSER_RESOURCE_INSPECT_METHOD);
         assert_eq!(methods[4]["method"], BROWSER_RESOURCE_RESOLVE_METHOD);
-        assert!(methods.iter().all(|method| method["access"] == "read_only"));
+        assert_eq!(methods[5]["method"], BROWSER_SPACE_CREATE_METHOD);
+        assert_eq!(methods[7]["method"], BROWSER_SPACE_INSPECT_METHOD);
+        assert_eq!(methods[8]["method"], BROWSER_SESSION_CREATE_METHOD);
+        assert_eq!(methods[10]["method"], BROWSER_SESSION_INSPECT_METHOD);
+        assert_eq!(methods[11]["method"], BROWSER_MESSAGE_APPEND_METHOD);
+        assert_eq!(methods[12]["method"], BROWSER_COMPOSER_SET_REASONING_METHOD);
+        assert_eq!(methods[13]["method"], BROWSER_COMPOSER_SET_APPS_METHOD);
+        assert_eq!(methods[14]["method"], BROWSER_DISPATCH_SUBMIT_METHOD);
+        assert_eq!(methods[15]["method"], BROWSER_DISPATCH_STATUS_METHOD);
+        assert_eq!(methods[16]["method"], BROWSER_DISPATCH_STOP_METHOD);
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| method["access"] == "read_only")
+                .count(),
+            8
+        );
         assert!(methods.iter().all(|method| {
             let name = method["method"].as_str().unwrap();
             !name.contains("consent") && !name.contains("observe") && !name.contains("register")

@@ -191,6 +191,8 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 continuity_call(context.state_store, method, &params)
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
+            } else if BrowserOperation::parse(method).is_some() {
+                browser_operation_call(context.state_store, method, &params)
             } else if method.starts_with("herdr_mcp.browser_endpoint.")
                 || method.starts_with("herdr_mcp.browser_resource.")
             {
@@ -1029,6 +1031,422 @@ fn work_memory_call(
         }
         _ => json!({"ok": false, "code": "unknown_local_method", "method": method}),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserOperation {
+    SpaceCreate,
+    SpaceOpen,
+    SpaceInspect,
+    SessionCreate,
+    SessionOpen,
+    SessionInspect,
+    MessageAppend,
+    ComposerSetReasoning,
+    ComposerSetApps,
+    DispatchSubmit,
+    DispatchStatus,
+    DispatchStop,
+}
+
+impl BrowserOperation {
+    fn parse(method: &str) -> Option<Self> {
+        match method {
+            "herdr_mcp.browser_space.create" => Some(Self::SpaceCreate),
+            "herdr_mcp.browser_space.open" => Some(Self::SpaceOpen),
+            "herdr_mcp.browser_space.inspect" => Some(Self::SpaceInspect),
+            "herdr_mcp.browser_session.create" => Some(Self::SessionCreate),
+            "herdr_mcp.browser_session.open" => Some(Self::SessionOpen),
+            "herdr_mcp.browser_session.inspect" => Some(Self::SessionInspect),
+            "herdr_mcp.browser_message.append" => Some(Self::MessageAppend),
+            "herdr_mcp.browser_composer.set_reasoning" => Some(Self::ComposerSetReasoning),
+            "herdr_mcp.browser_composer.set_apps" => Some(Self::ComposerSetApps),
+            "herdr_mcp.browser_dispatch.submit" => Some(Self::DispatchSubmit),
+            "herdr_mcp.browser_dispatch.status" => Some(Self::DispatchStatus),
+            "herdr_mcp.browser_dispatch.stop" => Some(Self::DispatchStop),
+            _ => None,
+        }
+    }
+
+    fn method(self) -> &'static str {
+        match self {
+            Self::SpaceCreate => "herdr_mcp.browser_space.create",
+            Self::SpaceOpen => "herdr_mcp.browser_space.open",
+            Self::SpaceInspect => "herdr_mcp.browser_space.inspect",
+            Self::SessionCreate => "herdr_mcp.browser_session.create",
+            Self::SessionOpen => "herdr_mcp.browser_session.open",
+            Self::SessionInspect => "herdr_mcp.browser_session.inspect",
+            Self::MessageAppend => "herdr_mcp.browser_message.append",
+            Self::ComposerSetReasoning => "herdr_mcp.browser_composer.set_reasoning",
+            Self::ComposerSetApps => "herdr_mcp.browser_composer.set_apps",
+            Self::DispatchSubmit => "herdr_mcp.browser_dispatch.submit",
+            Self::DispatchStatus => "herdr_mcp.browser_dispatch.status",
+            Self::DispatchStop => "herdr_mcp.browser_dispatch.stop",
+        }
+    }
+}
+
+fn browser_operation_call(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    method: &str,
+    params: &Value,
+) -> Value {
+    let Some(operation) = BrowserOperation::parse(method) else {
+        return json!({"ok": false, "code": "unknown_local_method", "method": method});
+    };
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "browser_operation_params_invalid"});
+    };
+    if let Some(error) = browser_reject_forbidden_input(object) {
+        return error;
+    }
+    if let Err(error) = validate_browser_operation_params(operation, params) {
+        return error;
+    }
+
+    match operation {
+        BrowserOperation::SpaceInspect => {
+            browser_operation_inspect_resource(store, params, "space")
+        }
+        BrowserOperation::SessionInspect => {
+            browser_operation_inspect_resource(store, params, "session")
+        }
+        BrowserOperation::DispatchStatus => {
+            let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
+            let Ok(store) = store.lock() else {
+                return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+            };
+            match store.browser_dispatch(dispatch_id) {
+                Ok(Some(dispatch)) => json!({
+                    "ok": true,
+                    "dispatch": browser_dispatch_json(dispatch),
+                }),
+                Ok(None) => json!({"ok": false, "code": "browser_dispatch_not_found"}),
+                Err(error) => browser_store_error(error),
+            }
+        }
+        _ => json!({
+            "ok": false,
+            "code": "resource_unavailable",
+            "operation": operation.method(),
+        }),
+    }
+}
+
+fn validate_browser_operation_params(
+    operation: BrowserOperation,
+    params: &Value,
+) -> Result<(), Value> {
+    let object = params.as_object().unwrap();
+    let allowed: &[&str] = match operation {
+        BrowserOperation::SpaceCreate => &[
+            "endpoint_ref",
+            "provider",
+            "account_ref",
+            "display_label",
+            "expected_generation",
+            "idempotency_key",
+        ],
+        BrowserOperation::SpaceOpen => &["space_ref", "expected_generation", "idempotency_key"],
+        BrowserOperation::SpaceInspect => &[
+            "space_ref",
+            "endpoint_ref",
+            "provider",
+            "account_ref",
+            "display_label",
+        ],
+        BrowserOperation::SessionCreate => &[
+            "endpoint_ref",
+            "provider",
+            "account_ref",
+            "space_ref",
+            "display_label",
+            "expected_generation",
+            "idempotency_key",
+        ],
+        BrowserOperation::SessionOpen => &["session_ref", "expected_generation", "idempotency_key"],
+        BrowserOperation::SessionInspect => &["session_ref"],
+        BrowserOperation::MessageAppend => &[
+            "session_ref",
+            "message",
+            "expected_generation",
+            "idempotency_key",
+        ],
+        BrowserOperation::ComposerSetReasoning => &[
+            "session_ref",
+            "reasoning_effort",
+            "expected_generation",
+            "idempotency_key",
+        ],
+        BrowserOperation::ComposerSetApps => &[
+            "session_ref",
+            "required_apps",
+            "expected_generation",
+            "idempotency_key",
+        ],
+        BrowserOperation::DispatchSubmit => &[
+            "session_ref",
+            "message",
+            "reasoning_effort",
+            "required_apps",
+            "expected_generation",
+            "idempotency_key",
+            "work_chain_id",
+            "lane_id",
+        ],
+        BrowserOperation::DispatchStatus => &["dispatch_id"],
+        BrowserOperation::DispatchStop => {
+            &["dispatch_id", "expected_generation", "idempotency_key"]
+        }
+    };
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(json!({
+            "ok": false,
+            "code": "browser_operation_params_invalid",
+            "message": format!("unknown browser operation param: {key}"),
+        }));
+    }
+
+    match operation {
+        BrowserOperation::SpaceCreate => {
+            browser_required_string(params, "endpoint_ref", 96)?;
+            browser_required_string(params, "provider", 32)?;
+            browser_required_string(params, "account_ref", 96)?;
+            browser_required_string(params, "display_label", 256)?;
+            browser_required_generation(params)?;
+            browser_required_idempotency_key(params)?;
+        }
+        BrowserOperation::SpaceOpen => {
+            browser_required_string(params, "space_ref", 96)?;
+            browser_required_generation(params)?;
+            browser_required_idempotency_key(params)?;
+        }
+        BrowserOperation::SpaceInspect => {
+            let space_ref = browser_optional_string(params, "space_ref", 96)?;
+            if space_ref.is_none() {
+                browser_required_string(params, "endpoint_ref", 96)?;
+                browser_required_string(params, "provider", 32)?;
+                browser_required_string(params, "account_ref", 96)?;
+                let _ = browser_optional_string(params, "display_label", 256)?;
+            } else if object.len() != 1 {
+                return Err(json!({"ok": false, "code": "browser_operation_params_invalid"}));
+            }
+        }
+        BrowserOperation::SessionCreate => {
+            browser_required_string(params, "endpoint_ref", 96)?;
+            browser_required_string(params, "provider", 32)?;
+            browser_required_string(params, "account_ref", 96)?;
+            let _ = browser_optional_string(params, "space_ref", 96)?;
+            browser_required_string(params, "display_label", 256)?;
+            browser_required_generation(params)?;
+            browser_required_idempotency_key(params)?;
+        }
+        BrowserOperation::SessionOpen => {
+            browser_required_string(params, "session_ref", 96)?;
+            browser_required_generation(params)?;
+            browser_required_idempotency_key(params)?;
+        }
+        BrowserOperation::SessionInspect => {
+            browser_required_string(params, "session_ref", 96)?;
+        }
+        BrowserOperation::MessageAppend => {
+            browser_required_string(params, "session_ref", 96)?;
+            browser_required_string(params, "message", 262_144)?;
+            browser_required_generation(params)?;
+            browser_required_idempotency_key(params)?;
+        }
+        BrowserOperation::ComposerSetReasoning => {
+            browser_required_string(params, "session_ref", 96)?;
+            browser_required_reasoning_effort(params, false)?;
+            browser_required_generation(params)?;
+            browser_required_idempotency_key(params)?;
+        }
+        BrowserOperation::ComposerSetApps => {
+            browser_required_string(params, "session_ref", 96)?;
+            browser_required_apps(params, false)?;
+            browser_required_generation(params)?;
+            browser_required_idempotency_key(params)?;
+        }
+        BrowserOperation::DispatchSubmit => {
+            browser_required_string(params, "session_ref", 96)?;
+            browser_required_string(params, "message", 262_144)?;
+            browser_required_reasoning_effort(params, true)?;
+            browser_required_apps(params, true)?;
+            browser_required_generation(params)?;
+            browser_required_idempotency_key(params)?;
+            let _ = browser_optional_string(params, "work_chain_id", 128)?;
+            let _ = browser_optional_string(params, "lane_id", 160)?;
+        }
+        BrowserOperation::DispatchStatus => {
+            browser_required_string(params, "dispatch_id", 96)?;
+        }
+        BrowserOperation::DispatchStop => {
+            browser_required_string(params, "dispatch_id", 96)?;
+            browser_required_generation(params)?;
+            browser_required_idempotency_key(params)?;
+        }
+    }
+    Ok(())
+}
+
+fn browser_reject_forbidden_input(object: &serde_json::Map<String, Value>) -> Option<Value> {
+    const FORBIDDEN: &[&str] = &[
+        "selector",
+        "css_selector",
+        "xpath",
+        "javascript",
+        "js",
+        "script",
+        "cdp",
+        "cdp_command",
+        "macro",
+        "keyboard",
+        "mouse",
+        "url",
+        "raw_url",
+        "navigation",
+        "shell",
+        "command",
+        "cookie",
+        "cookies",
+        "bearer",
+        "bearer_token",
+        "refresh_token",
+        "credential",
+        "credentials",
+        "native_id",
+        "native_identity",
+    ];
+    object
+        .keys()
+        .find(|key| FORBIDDEN.contains(&key.as_str()))
+        .map(|key| json!({"ok": false, "code": "browser_forbidden_input", "field": key}))
+}
+
+fn browser_required_generation(params: &Value) -> Result<i64, Value> {
+    match params.get("expected_generation").and_then(Value::as_i64) {
+        Some(value) if value >= 1 => Ok(value),
+        _ => Err(json!({"ok": false, "code": "browser_expected_generation_invalid"})),
+    }
+}
+
+fn browser_required_idempotency_key(params: &Value) -> Result<&str, Value> {
+    browser_required_string(params, "idempotency_key", 256)
+}
+
+fn browser_required_reasoning_effort(
+    params: &Value,
+    optional: bool,
+) -> Result<Option<&str>, Value> {
+    let Some(value) = params.get("reasoning_effort") else {
+        return if optional {
+            Ok(None)
+        } else {
+            Err(json!({"ok": false, "code": "browser_reasoning_effort_required"}))
+        };
+    };
+    if value.is_null() && optional {
+        return Ok(None);
+    }
+    let Some(value) = value.as_str() else {
+        return Err(json!({"ok": false, "code": "browser_reasoning_effort_invalid"}));
+    };
+    if !matches!(value, "economy" | "balanced" | "thorough") {
+        return Err(json!({"ok": false, "code": "browser_reasoning_effort_invalid"}));
+    }
+    Ok(Some(value))
+}
+
+fn browser_required_apps(params: &Value, optional: bool) -> Result<Vec<&str>, Value> {
+    let Some(value) = params.get("required_apps") else {
+        return if optional {
+            Ok(Vec::new())
+        } else {
+            Err(json!({"ok": false, "code": "browser_required_apps_required"}))
+        };
+    };
+    if value.is_null() && optional {
+        return Ok(Vec::new());
+    }
+    let Some(items) = value.as_array() else {
+        return Err(json!({"ok": false, "code": "browser_required_apps_invalid"}));
+    };
+    if items.len() > 32 {
+        return Err(json!({"ok": false, "code": "browser_required_apps_invalid"}));
+    }
+    let mut apps = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(app) = item.as_str() else {
+            return Err(json!({"ok": false, "code": "browser_required_apps_invalid"}));
+        };
+        let app = app.trim();
+        if app.is_empty() || app.len() > 64 || app.chars().any(char::is_control) {
+            return Err(json!({"ok": false, "code": "browser_required_apps_invalid"}));
+        }
+        apps.push(app);
+    }
+    apps.sort_unstable();
+    apps.dedup();
+    if apps.len() != items.len() {
+        return Err(json!({"ok": false, "code": "browser_required_apps_invalid"}));
+    }
+    Ok(apps)
+}
+
+fn browser_operation_inspect_resource(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    params: &Value,
+    kind: &str,
+) -> Value {
+    let Ok(store) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+    };
+    let resource = if kind == "space" {
+        if let Some(space_ref) = params.get("space_ref").and_then(Value::as_str) {
+            store.browser_resource(space_ref)
+        } else {
+            store
+                .resolve_browser_resource(BrowserResourceResolveInput {
+                    endpoint_ref: params.get("endpoint_ref").and_then(Value::as_str).unwrap(),
+                    provider: params.get("provider").and_then(Value::as_str).unwrap(),
+                    kind,
+                    parent_ref: params.get("account_ref").and_then(Value::as_str),
+                    display_label: params.get("display_label").and_then(Value::as_str),
+                    expected_observation_generation: None,
+                })
+                .map(Some)
+        }
+    } else {
+        store.browser_resource(params.get("session_ref").and_then(Value::as_str).unwrap())
+    };
+    match resource {
+        Ok(Some(resource)) if resource.kind == kind => json!({
+            "ok": true,
+            "resource": browser_resource_json(resource),
+            "actuation_available": false,
+        }),
+        Ok(Some(_)) | Ok(None) => json!({"ok": false, "code": "browser_resource_not_found"}),
+        Err(error) => browser_store_error(error),
+    }
+}
+
+fn browser_dispatch_json(dispatch: crate::state_store::BrowserDispatchRecord) -> Value {
+    json!({
+        "dispatch_id": dispatch.dispatch_id,
+        "endpoint_ref": dispatch.endpoint_ref,
+        "provider": dispatch.provider,
+        "operation": dispatch.operation,
+        "target_session_ref": dispatch.target_session_ref,
+        "reasoning_effort": dispatch.reasoning_effort,
+        "required_apps": dispatch.required_apps,
+        "expected_generation": dispatch.expected_generation,
+        "delivery_state": dispatch.delivery_state.as_str(),
+        "generation_owner": dispatch.generation_owner,
+        "work_chain_id": dispatch.work_chain_id,
+        "lane_id": dispatch.lane_id,
+        "created_at": dispatch.created_at,
+        "updated_at": dispatch.updated_at,
+    })
 }
 
 fn browser_registry_call(
@@ -2139,6 +2557,190 @@ mod tests {
         let identity = contract::identity().unwrap();
         assert_eq!(identity.epoch, 2);
         assert_eq!(identity.tool_count, 18);
+    }
+
+    #[test]
+    fn browser_typed_operations_route_with_frozen_provider_neutral_inputs() {
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let endpoint_ref = format!("bep_{}", "a".repeat(64));
+        let account_ref = format!("br_{}", "b".repeat(64));
+        let space_ref = format!("br_{}", "c".repeat(64));
+        let session_ref = format!("br_{}", "d".repeat(64));
+        let dispatch_id = format!("bd_{}", "e".repeat(64));
+        let cases = vec![
+            (
+                "herdr_mcp.browser_space.create",
+                json!({
+                    "endpoint_ref": endpoint_ref,
+                    "provider": "chatgpt",
+                    "account_ref": account_ref,
+                    "display_label": "Project",
+                    "expected_generation": 7,
+                    "idempotency_key": "space-create-1"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_space.open",
+                json!({
+                    "space_ref": space_ref,
+                    "expected_generation": 7,
+                    "idempotency_key": "space-open-1"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_space.inspect",
+                json!({"space_ref": space_ref}),
+            ),
+            (
+                "herdr_mcp.browser_session.create",
+                json!({
+                    "endpoint_ref": endpoint_ref,
+                    "provider": "chatgpt",
+                    "account_ref": account_ref,
+                    "space_ref": space_ref,
+                    "display_label": "Conversation",
+                    "expected_generation": 7,
+                    "idempotency_key": "session-create-1"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_session.open",
+                json!({
+                    "session_ref": session_ref,
+                    "expected_generation": 7,
+                    "idempotency_key": "session-open-1"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_session.inspect",
+                json!({"session_ref": session_ref}),
+            ),
+            (
+                "herdr_mcp.browser_message.append",
+                json!({
+                    "session_ref": session_ref,
+                    "message": "hello",
+                    "expected_generation": 7,
+                    "idempotency_key": "message-append-1"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_composer.set_reasoning",
+                json!({
+                    "session_ref": session_ref,
+                    "reasoning_effort": "balanced",
+                    "expected_generation": 7,
+                    "idempotency_key": "reasoning-1"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_composer.set_apps",
+                json!({
+                    "session_ref": session_ref,
+                    "required_apps": ["herdr"],
+                    "expected_generation": 7,
+                    "idempotency_key": "apps-1"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_dispatch.submit",
+                json!({
+                    "session_ref": session_ref,
+                    "message": "ship it",
+                    "reasoning_effort": "thorough",
+                    "required_apps": ["herdr"],
+                    "expected_generation": 7,
+                    "idempotency_key": "dispatch-1",
+                    "work_chain_id": "wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "lane_id": "lane-alpha"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_dispatch.status",
+                json!({"dispatch_id": dispatch_id}),
+            ),
+            (
+                "herdr_mcp.browser_dispatch.stop",
+                json!({
+                    "dispatch_id": dispatch_id,
+                    "expected_generation": 7,
+                    "idempotency_key": "dispatch-stop-1"
+                }),
+            ),
+        ];
+
+        for (method, params) in cases {
+            let result = browser_operation_call(&store, method, &params);
+            assert_ne!(result["code"], "unknown_local_method", "{method}");
+            assert_ne!(
+                result["code"], "browser_operation_params_invalid",
+                "{method}"
+            );
+            assert_ne!(result["code"], "browser_forbidden_input", "{method}");
+        }
+    }
+
+    #[test]
+    fn browser_typed_operations_reject_forbidden_and_provider_native_inputs() {
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let session_ref = format!("br_{}", "d".repeat(64));
+        for field in [
+            "selector",
+            "xpath",
+            "javascript",
+            "cdp",
+            "macro",
+            "url",
+            "shell",
+            "bearer_token",
+            "refresh_token",
+            "credentials",
+            "native_identity",
+        ] {
+            let mut params = json!({
+                "session_ref": session_ref,
+                "message": "safe message",
+                "expected_generation": 7,
+                "idempotency_key": "dispatch-forbidden-1"
+            });
+            params
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_owned(), json!("attacker-controlled"));
+            let result =
+                browser_operation_call(&store, "herdr_mcp.browser_dispatch.submit", &params);
+            assert_eq!(result["code"], "browser_forbidden_input", "{field}");
+            assert_eq!(result["field"], field);
+        }
+
+        let native_reasoning = browser_operation_call(
+            &store,
+            "herdr_mcp.browser_composer.set_reasoning",
+            &json!({
+                "session_ref": session_ref,
+                "reasoning_effort": "medium",
+                "expected_generation": 7,
+                "idempotency_key": "reasoning-native-1"
+            }),
+        );
+        assert_eq!(native_reasoning["code"], "browser_reasoning_effort_invalid");
+
+        let arbitrary_json = browser_operation_call(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &json!({
+                "session_ref": session_ref,
+                "message": "safe message",
+                "expected_generation": 7,
+                "idempotency_key": "dispatch-options-1",
+                "options": {"anything": true}
+            }),
+        );
+        assert_eq!(arbitrary_json["code"], "browser_operation_params_invalid");
     }
 
     #[test]
