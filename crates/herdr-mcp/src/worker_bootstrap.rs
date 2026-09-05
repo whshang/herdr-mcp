@@ -1,8 +1,9 @@
 use crate::paths::RuntimePaths;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,15 +17,18 @@ const WRANGLER_VERSION: &str = "4.129.0";
 const JOURNAL_SCHEMA: u32 = 1;
 const JOURNAL_FILE: &str = "first-worker-v1.json";
 const TEMP_OPERATOR_SECRET: &str = "STATIC_MCP_BEARER_SECRET";
+const TEMP_OPERATOR_EXPIRY_SECRET: &str = "STATIC_MCP_BEARER_EXPIRES_AT_MS";
 const PAIRING_PEPPER_SECRET: &str = "LINK_SHARED_SECRET";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const DEVICE_FLOW_MAX: Duration = Duration::from_secs(300);
+const TEMP_OPERATOR_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 enum Phase {
     Classified,
     SubdomainReady,
+    WorkerDeploying,
     WorkerDeployed,
     SecretsProvisioned,
     DeviceEnrolled,
@@ -75,7 +79,6 @@ impl BootstrapJournal {
     }
 }
 
-#[derive(Debug)]
 struct SecretBytes(Vec<u8>);
 
 impl SecretBytes {
@@ -95,6 +98,29 @@ impl Drop for SecretBytes {
     fn drop(&mut self) {
         self.0.fill(0);
     }
+}
+
+impl fmt::Debug for SecretBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretBytes([REDACTED])")
+    }
+}
+
+#[derive(Deserialize)]
+struct DeviceFlowAuthorizationResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: Option<String>,
+    expires_in: Option<u64>,
+    interval: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct DeviceFlowTokenResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -366,7 +392,7 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
 
     println!("Herdr first Worker bootstrap");
     println!("[1/7] Check — local first-device state is eligible.");
-    let token = acquire_cloudflare_credential()?;
+    let (token, refresh_token) = acquire_cloudflare_credential()?;
     let cloudflare = Cloudflare::new(&token)?;
     println!("[2/7] Cloudflare — temporary authorization acquired; it will not be persisted.");
 
@@ -438,6 +464,8 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
 
     let script_exists = scripts.iter().any(|script| script.name == worker_name);
     if !script_exists || journal.phase < Phase::WorkerDeployed {
+        journal.advance(Phase::WorkerDeploying);
+        write_journal(&journal_path, &journal)?;
         let bundle = prepare_edge_bundle(&source_commit)?;
         let deploy_result = deploy_worker(
             &gate,
@@ -465,6 +493,7 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
     if journal.phase < Phase::DeviceEnrolled {
         let pepper = random_secret(32)?;
         let operator = random_secret(32)?;
+        let operator_expiry = SecretBytes::from_string(temporary_operator_expiry_ms().to_string())?;
         cloudflare.put_secret(
             &gate,
             &account.id,
@@ -476,11 +505,19 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
             &gate,
             &account.id,
             &worker_name,
+            TEMP_OPERATOR_EXPIRY_SECRET,
+            &operator_expiry,
+        )?;
+        cloudflare.put_secret(
+            &gate,
+            &account.id,
+            &worker_name,
             TEMP_OPERATOR_SECRET,
             &operator,
         )?;
         let names = cloudflare.list_secret_names(&account.id, &worker_name)?;
         if !names.iter().any(|name| name == PAIRING_PEPPER_SECRET)
+            || !names.iter().any(|name| name == TEMP_OPERATOR_EXPIRY_SECRET)
             || !names.iter().any(|name| name == TEMP_OPERATOR_SECRET)
         {
             return Err(
@@ -511,18 +548,16 @@ fn run_inner(paths: &RuntimePaths) -> Result<ExitCode, String> {
     }
     println!("[5/7] Computer — canonical device enrollment is active.");
 
-    let names = cloudflare.list_secret_names(&account.id, &worker_name)?;
-    if names.iter().any(|name| name == TEMP_OPERATOR_SECRET) {
-        cloudflare.delete_secret(&gate, &account.id, &worker_name, TEMP_OPERATOR_SECRET)?;
-    }
-    let names = cloudflare.list_secret_names(&account.id, &worker_name)?;
-    if names.iter().any(|name| name == TEMP_OPERATOR_SECRET) {
-        return Err(
-            "temporary Worker operator credential still exists after deletion attempt".to_owned(),
-        );
-    }
+    remove_temporary_operator(
+        |name| cloudflare.delete_secret(&gate, &account.id, &worker_name, name),
+        || cloudflare.list_secret_names(&account.id, &worker_name),
+    )?;
     journal.advance(Phase::OperatorRemoved);
     write_journal(&journal_path, &journal)?;
+
+    drop(cloudflare);
+    drop(refresh_token);
+    drop(token);
 
     verify_public_oauth(&edge_origin)?;
     verify_current_device_inventory(paths, journal.canonical_device_id.as_deref())?;
@@ -552,11 +587,29 @@ fn classify_fleet(
     journal: Option<&BootstrapJournal>,
 ) -> Result<FleetClassification, String> {
     let target_exists = scripts.iter().any(|script| script.name == target_worker);
-    let journal_owns_target = journal
-        .map(|value| value.worker_name == target_worker && value.phase >= Phase::WorkerDeployed)
-        .unwrap_or(false);
-    if target_exists && journal_owns_target {
-        return Ok(FleetClassification::ResumeOwned);
+    if target_exists {
+        let journal_matches = journal
+            .map(|value| value.worker_name == target_worker)
+            .unwrap_or(false);
+        let journal_proves_deployed = journal
+            .map(|value| value.phase >= Phase::WorkerDeployed)
+            .unwrap_or(false);
+        let observed_matching_health = match (journal, subdomain) {
+            (Some(value), Some(subdomain))
+                if journal_matches && value.phase >= Phase::WorkerDeploying =>
+            {
+                let origin = format!("https://{target_worker}.{subdomain}.workers.dev");
+                verify_health(&origin, target_worker, Some(&value.runtime_version)).is_ok()
+            }
+            _ => false,
+        };
+        if resumable_target_observation(
+            journal_matches,
+            journal_proves_deployed,
+            observed_matching_health,
+        ) {
+            return Ok(FleetClassification::ResumeOwned);
+        }
     }
 
     for script in scripts
@@ -586,14 +639,17 @@ fn classify_fleet(
     Ok(FleetClassification::FirstFleet)
 }
 
-fn acquire_cloudflare_credential() -> Result<SecretBytes, String> {
+fn acquire_cloudflare_credential() -> Result<(SecretBytes, Option<SecretBytes>), String> {
     if let Ok(value) = std::env::var("CLOUDFLARE_API_TOKEN") {
+        if !verify_api_token_shape(&value) {
+            return Err("CLOUDFLARE_API_TOKEN has an invalid shape".to_owned());
+        }
         let token = SecretBytes::from_string(value)?;
         verify_api_token(&token)?;
-        return Ok(token);
+        return Ok((token, None));
     }
     match acquire_device_flow() {
-        Ok(token) => Ok(token),
+        Ok(tokens) => Ok(tokens),
         Err(device_error) => {
             if !stdin_is_tty() {
                 return Err(format!(
@@ -605,9 +661,12 @@ fn acquire_cloudflare_credential() -> Result<SecretBytes, String> {
                 "API-token fallback permissions: Workers Scripts -> Edit; Account Settings -> Read."
             );
             let value = read_hidden_line("Paste temporary Cloudflare API token (input hidden): ")?;
+            if !verify_api_token_shape(&value) {
+                return Err("Cloudflare API token has an invalid shape".to_owned());
+            }
             let token = SecretBytes::from_string(value)?;
             verify_api_token(&token)?;
-            Ok(token)
+            Ok((token, None))
         }
     }
 }
@@ -622,7 +681,7 @@ fn verify_api_token(token: &SecretBytes) -> Result<(), String> {
     Ok(())
 }
 
-fn acquire_device_flow() -> Result<SecretBytes, String> {
+fn acquire_device_flow() -> Result<(SecretBytes, Option<SecretBytes>), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::limited(4))
@@ -639,36 +698,29 @@ fn acquire_device_flow() -> Result<SecretBytes, String> {
         .send()
         .map_err(|error| format!("device authorization request failed: {error}"))?;
     let status = response.status();
-    let payload: Value = response.json().map_err(|_| {
-        format!(
-            "device authorization returned non-JSON HTTP {}",
-            status.as_u16()
-        )
-    })?;
     if !status.is_success() {
         return Err(format!(
             "device authorization returned HTTP {}",
             status.as_u16()
         ));
     }
-    let device_code = required_string(&payload, "device_code")?;
-    let user_code = required_string(&payload, "user_code")?;
-    let verification_uri = required_string(&payload, "verification_uri")?;
-    let expires = payload
-        .get("expires_in")
-        .and_then(Value::as_u64)
-        .unwrap_or(300)
-        .min(300);
-    let mut interval = payload
-        .get("interval")
-        .and_then(Value::as_u64)
-        .unwrap_or(5)
-        .max(1);
+    let payload: DeviceFlowAuthorizationResponse = response.json().map_err(|_| {
+        format!(
+            "device authorization returned invalid JSON HTTP {}",
+            status.as_u16()
+        )
+    })?;
+    let device_code = SecretBytes::from_string(payload.device_code)?;
+    if payload.user_code.trim().is_empty() || payload.verification_uri.trim().is_empty() {
+        return Err("device authorization response is missing required public fields".to_owned());
+    }
+    let user_code = payload.user_code;
+    let verification_uri = payload.verification_uri;
+    let expires = payload.expires_in.unwrap_or(300).min(300);
+    let mut interval = payload.interval.unwrap_or(5).max(1);
     let verification_uri_complete = payload
-        .get("verification_uri_complete")
-        .and_then(Value::as_str)
-        .unwrap_or(&verification_uri)
-        .to_owned();
+        .verification_uri_complete
+        .unwrap_or_else(|| verification_uri.clone());
 
     println!("Open this Cloudflare page and approve Herdr: {verification_uri}");
     println!("Verification code: {user_code}");
@@ -684,7 +736,7 @@ fn acquire_device_flow() -> Result<SecretBytes, String> {
         std::thread::sleep(Duration::from_secs(interval));
         let body = form_body(&[
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-            ("device_code", &device_code),
+            ("device_code", device_code.expose()?),
             ("client_id", CLOUDFLARE_CLIENT_ID),
         ]);
         let response = match client
@@ -696,18 +748,19 @@ fn acquire_device_flow() -> Result<SecretBytes, String> {
             Ok(response) => response,
             Err(_) => continue,
         };
-        let payload: Value = match response.json() {
+        let payload: DeviceFlowTokenResponse = match response.json() {
             Ok(payload) => payload,
             Err(_) => continue,
         };
-        if let Some(token) = payload.get("access_token").and_then(Value::as_str) {
-            return SecretBytes::from_string(token.to_owned());
+        if let Some(token) = payload.access_token {
+            let access = SecretBytes::from_string(token)?;
+            let refresh = payload
+                .refresh_token
+                .map(SecretBytes::from_string)
+                .transpose()?;
+            return Ok((access, refresh));
         }
-        match payload
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("unexpected_response")
-        {
+        match payload.error.as_deref().unwrap_or("unexpected_response") {
             "authorization_pending" => {}
             "slow_down" => interval = interval.saturating_add(5).min(30),
             "access_denied" => return Err("Cloudflare authorization was denied".to_owned()),
@@ -715,6 +768,55 @@ fn acquire_device_flow() -> Result<SecretBytes, String> {
             other => return Err(format!("Cloudflare device authorization failed: {other}")),
         }
     }
+}
+
+fn resumable_target_observation(
+    journal_matches: bool,
+    journal_proves_deployed: bool,
+    observed_matching_health: bool,
+) -> bool {
+    journal_matches && (journal_proves_deployed || observed_matching_health)
+}
+
+fn temporary_operator_expiry_ms() -> u64 {
+    now_ms().saturating_add(TEMP_OPERATOR_TTL.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+fn remove_temporary_operator<D, L>(mut delete: D, mut list: L) -> Result<(), String>
+where
+    D: FnMut(&str) -> Result<(), String>,
+    L: FnMut() -> Result<Vec<String>, String>,
+{
+    let before = list()?;
+    if before.iter().any(|name| name == TEMP_OPERATOR_SECRET) {
+        delete(TEMP_OPERATOR_SECRET).map_err(|error| {
+            format!(
+                "failed to delete temporary Worker operator credential; bootstrap is NOT complete and the bounded TTL remains the safety fence: {error}"
+            )
+        })?;
+    }
+    if before
+        .iter()
+        .any(|name| name == TEMP_OPERATOR_EXPIRY_SECRET)
+    {
+        delete(TEMP_OPERATOR_EXPIRY_SECRET).map_err(|error| {
+            format!("failed to delete temporary Worker operator expiry marker: {error}")
+        })?;
+    }
+    let after = list()?;
+    if after.iter().any(|name| name == TEMP_OPERATOR_SECRET) {
+        return Err(
+            "temporary Worker operator credential still exists after deletion attempt; bootstrap is NOT complete"
+                .to_owned(),
+        );
+    }
+    if after.iter().any(|name| name == TEMP_OPERATOR_EXPIRY_SECRET) {
+        return Err(
+            "temporary Worker operator expiry marker still exists after deletion attempt; bootstrap is NOT complete"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn select_account(cloudflare: &Cloudflare<'_>) -> Result<Account, String> {
@@ -904,7 +1006,10 @@ fn render_wrangler_config(
         out.push_str(&rendered);
         out.push('\n');
     }
-    if !out.contains("workers_dev = true") || out.contains("[[r2_buckets]]\n") {
+    let r2_enabled = out
+        .lines()
+        .any(|line| line.trim_start().starts_with("[[r2_buckets]]"));
+    if !out.contains("workers_dev = true") || r2_enabled {
         return Err(
             "release Wrangler template violates the core Workers Free bootstrap contract"
                 .to_owned(),
@@ -1194,7 +1299,7 @@ fn random_secret(bytes: usize) -> Result<SecretBytes, String> {
     getrandom::fill(&mut raw)
         .map_err(|error| format!("secure random generation failed: {error}"))?;
     let mut out = String::with_capacity(bytes * 2);
-    for byte in raw.iter().copied() {
+    for byte in &raw {
         use std::fmt::Write as _;
         write!(&mut out, "{byte:02x}").map_err(|error| error.to_string())?;
     }
@@ -1356,11 +1461,11 @@ fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-fn open_browser(url: &str) {
+fn open_browser(_url: &str) {
     #[cfg(target_os = "macos")]
     {
         let _ = Command::new("/usr/bin/open")
-            .arg(url)
+            .arg(_url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1476,6 +1581,58 @@ mod tests {
     }
 
     #[test]
+    fn network_interruption_after_worker_deploy_resumes_only_after_readback_proof() {
+        assert!(resumable_target_observation(true, false, true));
+        assert!(!resumable_target_observation(true, false, false));
+        assert!(!resumable_target_observation(false, false, true));
+    }
+
+    #[test]
+    fn same_name_worker_without_resume_proof_is_not_silently_skipped() {
+        let occupied = vec![Script {
+            name: "herdr-edge-mac".to_owned(),
+        }];
+        assert_eq!(
+            classify_fleet(&occupied, None, "herdr-edge-mac", None).unwrap(),
+            FleetClassification::AmbiguousTarget
+        );
+    }
+
+    #[test]
+    fn under_scoped_token_failure_cannot_open_mutation_gate() {
+        let gate = MutationGate::default();
+        let preflight: Result<(), String> =
+            Err("Cloudflare API HTTP 403: missing Workers Scripts -> Edit permission".to_owned());
+        assert!(preflight.is_err());
+        assert!(gate.require("deploy Worker").is_err());
+    }
+
+    #[test]
+    fn temporary_operator_delete_failure_is_terminal_and_ttl_is_bounded() {
+        let names = vec![
+            TEMP_OPERATOR_SECRET.to_owned(),
+            TEMP_OPERATOR_EXPIRY_SECRET.to_owned(),
+        ];
+        let error = remove_temporary_operator(
+            |name| {
+                if name == TEMP_OPERATOR_SECRET {
+                    Err("simulated Cloudflare delete failure".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(names.clone()),
+        )
+        .unwrap_err();
+        assert!(error.contains("NOT complete"));
+        assert!(error.contains("bounded TTL"));
+        let now = now_ms();
+        let expiry = temporary_operator_expiry_ms();
+        assert!(expiry > now);
+        assert!(expiry.saturating_sub(now) <= TEMP_OPERATOR_TTL.as_millis() as u64 + 1_000);
+    }
+
+    #[test]
     fn journal_serialization_contains_no_secret_fields() {
         let journal = BootstrapJournal::new(
             "a".repeat(40),
@@ -1496,6 +1653,42 @@ mod tests {
                 "journal leaked forbidden field marker: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn credentials_are_redacted_from_debug_output_logs_status_and_journal() {
+        let access_literal = "cf_access_012345678901234567890123456789";
+        let refresh_literal = "cf_refresh_012345678901234567890123456789";
+        let access = SecretBytes::from_string(access_literal.to_owned()).unwrap();
+        let refresh = SecretBytes::from_string(refresh_literal.to_owned()).unwrap();
+
+        let debug = format!("{access:?} {refresh:?}");
+        assert!(!debug.contains(access_literal));
+        assert!(!debug.contains(refresh_literal));
+
+        let output = sanitize_error(
+            &format!("request failed Authorization: Bearer {access_literal}"),
+            &access,
+        );
+        assert!(!output.contains(access_literal));
+
+        let log = crate::runtime_meta::redact_command_summary(&format!(
+            "wrangler deploy --token {access_literal}"
+        ));
+        assert!(!log.contains(access_literal));
+
+        let status = crate::status::sanitize_probe_token(&format!("Bearer {refresh_literal}"));
+        assert!(!status.contains(refresh_literal));
+
+        let journal = BootstrapJournal::new(
+            "a".repeat(40),
+            "0.4.6".to_owned(),
+            "1234567890abcdef".to_owned(),
+            "herdr-edge-mac".to_owned(),
+        );
+        let journal_text = serde_json::to_string(&journal).unwrap();
+        assert!(!journal_text.contains(access_literal));
+        assert!(!journal_text.contains(refresh_literal));
     }
 
     #[test]

@@ -56,7 +56,6 @@ struct FleetLinkIdentity {
     credential: String,
 }
 
-#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug)]
 pub(crate) struct EnrolledCredential {
     pub(crate) device_id: String,
@@ -483,6 +482,15 @@ pub(crate) fn adopt_bootstrap_enrollment(
         crate::link::reconcile_after_service_generation_change,
         move |_, _, _, _| Ok(enrolled.clone()),
     )
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn adopt_bootstrap_enrollment(
+    _paths: &RuntimePaths,
+    _edge_origin: &str,
+    _enrolled: EnrolledCredential,
+) -> Result<ExitCode, String> {
+    Err("first-Worker enrollment activation requires macOS Keychain".to_owned())
 }
 
 #[cfg(not(target_os = "macos"))]
