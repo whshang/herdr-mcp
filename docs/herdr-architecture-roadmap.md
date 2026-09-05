@@ -39,7 +39,7 @@ Herdr 性能优化不以单点 benchmark 为目标，目标是建立长期可演
 
 `v0.4.3` multi-device core 已发布，其冻结设计与 release plan 已归档到 [`history/architecture/`](./history/architecture/)。当前活跃长期设计继续以 Browser Control Plane 等未完成主题为准；多设备 scheduling/admin/console 只有在后续明确立项后才进入 `_wip`。
 
-Herdr-MCP 1.0 当前进入分阶段纵向实现，阶段边界独立于 0.4.x 发布线：
+Herdr-MCP 1.0 当前进入分阶段纵向实现，阶段边界独立于 0.4.x 发布线。唯一正式里程碑序列如下；阶段进度台账见 [`_wip/v1.0-status.md`](./_wip/v1.0-status.md)：
 
 ```text
 alpha.1  Fleet Control Kernel
@@ -47,12 +47,16 @@ alpha.2  Project Work Memory
 alpha.3  Browser Endpoint / Resource Registry
 alpha.4  ChatGPT Web adapter vertical
 alpha.5  Gemini second-provider vertical
-beta     reliability / recovery / long-retention qualification
+beta.1   reliability / postcondition（reload/stale-view 恢复、uncertain delivery 结算）
+beta.2   multi-device / multi-endpoint / multi-account reservation + failover
+rc.1     security / migration / N-1·N+1 兼容 / rollback / 双设备验收
 ```
+
+**序列权威说明**：冻结规划基线（[`docs/history/architecture/v1.0-architecture-plan.md`](./history/architecture/v1.0-architecture-plan.md)，自 `47a6f80` 逐字恢复）§16.2 的表格写于 alpha.5 追加之前，只覆盖 alpha.1–4 → beta.1 → beta.2 → rc.1、不含 alpha.5。自 alpha.5 追加起，该表格不再是里程碑序列的权威，上表（本文件）才是唯一正式序列。alpha.5 存在的原因正是冻结 plan §17 WebChat gate 的 "at least two providers prove the semantic adapter seam"：单一 ChatGPT vertical（alpha.4）无法证明 adapter seam 是 provider-neutral 的，因此必须在 beta.1 reliability/postcondition 之前增加第二个 Provider（Gemini）纵向阶段。
 
 1.0 以 v0.4.6 的 pre-1.0 stabilization 合同为基础，不复制其 Connector/OAuth authority、Automation Client、onboarding/readiness、runtime/EventCache liveness、planner tool-integrity、multi-device/Relay、Native Messaging local-auth、browser continuity/target-fencing 等实现。若 v0.4.6 的发布分支尚未回并 `main`，只在集成阶段吸收其已验证提交；1.0 feature branches 不另写同类机制。
 
-Alpha 2 规格见 [`_wip/v1.0-alpha2-work-memory.md`](./_wip/v1.0-alpha2-work-memory.md)。alpha.5 明确位于 ChatGPT adapter 后、reliability beta 前；在 alpha.5 完成真实双 Provider UAT 以前，Work Memory 可以作为跨 Provider 状态合同实现，但不能宣称 ChatGPT/Gemini WebChat 已具备生产级跨 Provider 调度。
+阶段规格：alpha.1 见 [`_wip/v1.0-phase1-fleet-control-kernel.md`](./_wip/v1.0-phase1-fleet-control-kernel.md)；alpha.2 见 [`_wip/v1.0-alpha2-work-memory.md`](./_wip/v1.0-alpha2-work-memory.md)；alpha.3 见 [`_wip/v1.0-alpha3-browser-registry.md`](./_wip/v1.0-alpha3-browser-registry.md)（spec 当前在分支 `feat/v1.0-browser-registry-alpha3-20260905`，尚未合并）。alpha.4 起尚未立项。alpha.5 明确位于 ChatGPT adapter 后、beta.1 reliability/postcondition 前；在 alpha.5 完成真实双 Provider UAT 以前，Work Memory 可以作为跨 Provider 状态合同实现，但不能宣称 ChatGPT/Gemini WebChat 已具备生产级跨 Provider 调度。
 
 1.0 的两个正式跨 Provider 验收场景固定为：
 

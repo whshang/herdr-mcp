@@ -10,3 +10,12 @@ Lifecycle:
 - one-off local data that may contain credentials or machine-specific state → keep outside the repository.
 
 Current active WIP includes the v0.4.5 follow-up maintenance plan (planner efficiency plus onboarding/network resilience), browser control plane settlement, DEV/STANDALONE/STORE extension distribution work, and modular progressive skills. The completed v0.4.3 and v0.4.4 release plans, plus the multi-device core design, are archived under `docs/history/architecture/`. Completed release/qualification work must not remain an active-plan label. Remove or archive a plan when its implementation decision is complete; do not leave completed evidence here for convenience.
+
+## v1.0 series index
+
+- Frozen planning baseline (read-only SSOT for D1–D5, canonical WebChat resource model, typed operations, and §17 compatibility gates): [`../history/architecture/v1.0-architecture-plan.md`](../history/architecture/v1.0-architecture-plan.md), restored verbatim from `47a6f80:docs/_wip/v1.0-architecture-plan.md`.
+- Milestone sequence authority: [`../herdr-architecture-roadmap.md`](../herdr-architecture-roadmap.md) (alpha.1 → alpha.2 → alpha.3 → alpha.4 → alpha.5 → beta.1 → beta.2 → rc.1).
+- alpha.1 spec: [`v1.0-phase1-fleet-control-kernel.md`](v1.0-phase1-fleet-control-kernel.md)
+- alpha.2 spec: [`v1.0-alpha2-work-memory.md`](v1.0-alpha2-work-memory.md)
+- alpha.3 spec: `v1.0-alpha3-browser-registry.md` — lives on branch `feat/v1.0-browser-registry-alpha3-20260905`, not yet merged, so it is not resolvable in this tree yet.
+- Stage progress ledger: [`v1.0-status.md`](v1.0-status.md) (engineering-stage progress only; release status remains owned by `docs/release-model.md`).
