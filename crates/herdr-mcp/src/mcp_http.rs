@@ -343,6 +343,7 @@ struct AppState {
     activity: McpActivityRegistry,
     bearer_token: Arc<[u8]>,
     trusted_extension_ipc: bool,
+    runtime_generation: Option<String>,
     local_device_id: Option<String>,
     browser_actuation: BrowserActuationBroker,
 }
@@ -408,6 +409,9 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             activity: McpActivityRegistry::default(),
             bearer_token: Arc::<[u8]>::from(token.into_bytes()),
             trusted_extension_ipc: false,
+            runtime_generation: env::var("HERDR_MCP_RUNTIME_GENERATION")
+                .ok()
+                .filter(|value| !value.is_empty()),
             local_device_id,
             browser_actuation: BrowserActuationBroker::default(),
         };
@@ -2295,15 +2299,6 @@ fn trusted_edge_webchat_control_grants(
 }
 
 fn trusted_edge_runtime_generation_fence(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
-    let current = env::var("HERDR_MCP_RUNTIME_GENERATION").ok();
-    trusted_edge_runtime_generation_fence_with_current(state, headers, current.as_deref())
-}
-
-fn trusted_edge_runtime_generation_fence_with_current(
-    state: &AppState,
-    headers: &HeaderMap,
-    current_generation: Option<&str>,
-) -> Result<(), ()> {
     if !state.trusted_extension_ipc || !headers.contains_key(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER) {
         return Ok(());
     }
@@ -2312,7 +2307,7 @@ fn trusted_edge_runtime_generation_fence_with_current(
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
         .ok_or(())?;
-    match current_generation.filter(|value| !value.is_empty()) {
+    match state.runtime_generation.as_deref() {
         Some(current) if current == expected => Ok(()),
         _ => Err(()),
     }
@@ -2639,6 +2634,7 @@ mod tests {
             activity: McpActivityRegistry::default(),
             bearer_token: Arc::<[u8]>::from(b"test-token".to_vec()),
             trusted_extension_ipc: false,
+            runtime_generation: Some("rust-caller-grant-proof".to_owned()),
             local_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
             browser_actuation: BrowserActuationBroker::default(),
         }
@@ -3061,40 +3057,26 @@ mod tests {
             HeaderValue::from_static("rust-old"),
         );
         assert_eq!(
-            trusted_edge_runtime_generation_fence_with_current(
-                &tcp_state,
-                &headers,
-                Some("rust-new")
-            ),
+            trusted_edge_runtime_generation_fence(&tcp_state, &headers),
             Ok(()),
             "ordinary TCP cannot activate the trusted generation-fence path"
         );
 
         let mut trusted_state = test_state(&root.join("trusted"));
         trusted_state.trusted_extension_ipc = true;
+        trusted_state.runtime_generation = Some("rust-new".to_owned());
         assert_eq!(
-            trusted_edge_runtime_generation_fence_with_current(
-                &trusted_state,
-                &headers,
-                Some("rust-new")
-            ),
+            trusted_edge_runtime_generation_fence(&trusted_state, &headers),
             Err(())
         );
+        trusted_state.runtime_generation = Some("rust-old".to_owned());
         assert_eq!(
-            trusted_edge_runtime_generation_fence_with_current(
-                &trusted_state,
-                &headers,
-                Some("rust-old")
-            ),
+            trusted_edge_runtime_generation_fence(&trusted_state, &headers),
             Ok(())
         );
         headers.remove(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER);
         assert_eq!(
-            trusted_edge_runtime_generation_fence_with_current(
-                &trusted_state,
-                &headers,
-                Some("rust-old")
-            ),
+            trusted_edge_runtime_generation_fence(&trusted_state, &headers),
             Err(()),
             "grant-bearing trusted IPC without a reserved generation fails closed"
         );
