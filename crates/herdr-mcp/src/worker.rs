@@ -88,6 +88,7 @@ fn connector_revoke_request_body(connector_id: &str) -> Value {
     json!({ "connector_id": connector_id })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn connector_client_revoke_request_body(client_id: &str) -> Value {
     json!({ "client_id": client_id })
 }
@@ -196,6 +197,7 @@ fn render_device_inventory(mut payload: Value, now_ms: u64) -> Value {
     payload
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn render_connector_inventory(mut payload: Value, now_ms: u64) -> Value {
     if let Some(connectors) = payload.get_mut("connectors").and_then(Value::as_array_mut) {
         for connector in connectors {
@@ -217,6 +219,7 @@ fn render_connector_inventory(mut payload: Value, now_ms: u64) -> Value {
     payload
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn render_automation_inventory(mut payload: Value, now_ms: u64) -> Value {
     if let Some(automations) = payload.get_mut("automations").and_then(Value::as_array_mut) {
         for automation in automations {
