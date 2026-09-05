@@ -95,6 +95,7 @@ pub enum ConfigCommand {
 #[derive(Debug, PartialEq, Eq)]
 pub enum WorkerCommand {
     List,
+    Bootstrap,
     Pair {
         ttl_seconds: u64,
         name: Option<String>,
@@ -619,14 +620,15 @@ fn parse_worker(args: &[String]) -> Result<Command, String> {
             section: HelpSection::Worker,
         }),
         Some("list") if args.len() == 1 => Ok(Command::Worker(WorkerCommand::List)),
+        Some("bootstrap") if args.len() == 1 => Ok(Command::Worker(WorkerCommand::Bootstrap)),
         Some("pair") => parse_worker_pair(&args[1..]),
         Some("connect") => parse_worker_connect(&args[1..]),
         Some("rename") => parse_worker_rename(&args[1..]),
         Some("revoke") => parse_worker_revoke(&args[1..]),
         Some(value) => Err(format!(
-            "unknown worker command '{value}' (expected list, pair, connect, rename, or revoke)"
+            "unknown worker command '{value}' (expected list, bootstrap, pair, connect, rename, or revoke)"
         )),
-        None => Err("worker requires list, pair, connect, rename, or revoke".to_owned()),
+        None => Err("worker requires list, bootstrap, pair, connect, rename, or revoke".to_owned()),
     }
 }
 
@@ -1306,6 +1308,7 @@ User path:\n\
   herdr-mcp instance list  (default + named instance inventory; default is read-only)\n\
   herdr-mcp instance reap <name> --confirm  (ownership-checked named-instance uninstall; never default)\n\
   herdr-mcp qualification <lock|unlock|status>  (hold the runtime generation during release qualification)\n\
+  herdr-mcp worker bootstrap  (macOS first device only; guided Cloudflare Worker + enrollment bootstrap)\n\
   herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS enrolled device only; creates pairing for another computer)\n\
   herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS only; requires Keychain, reads the 6-digit code as visible interactive terminal input (or one stdin line), never argv)\n\
   herdr-mcp device list  (non-secret enrolled-device inventory; worker list is an alias)\n\
@@ -1372,7 +1375,13 @@ HERDR_LINK_MIGRATE_RUNTIME_CONTROL=1) and never mutates LaunchAgents.\n"
 
 pub fn worker_help() -> &'static str {
     "Herdr MCP device / worker management\n\n\
-All of these require the credential of a device already enrolled in the fleet.\n\n\
+Use bootstrap only when no Herdr Worker/fleet exists yet. The other management\n\
+commands require an enrolled-device credential.\n\n\
+  herdr-mcp worker bootstrap\n\
+      Guides the first computer through Cloudflare authorization, creates or\n\
+      safely resumes one release-matched Worker, enrolls the canonical device,\n\
+      removes the temporary operator credential, starts the production Link,\n\
+      and succeeds only when link status reports operational_ready=true.\n\n\
   herdr-mcp device list\n      Lists the non-secret enrolled-device inventory and local Link/runtime\n      alignment. herdr-mcp worker list is a compatibility alias.\n\n\
   herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]\n      Creates a pairing address for another computer to enroll.\n\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n      Enrolls this machine; requires Keychain, reads the 6-digit code from an\n      interactive or stdin prompt, never argv.\n\n  herdr-mcp device rename <name>\n      Renames the current enrolled device.\n\n  herdr-mcp device revoke <device-id> --confirm\n      Revokes the given enrolled device id.\n"
 }

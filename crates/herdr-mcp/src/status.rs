@@ -718,7 +718,7 @@ fn issuer_host(issuer: &str) -> Option<String> {
     parsed.host_str().map(str::to_owned)
 }
 
-fn sanitize_probe_token(value: &str) -> String {
+pub(crate) fn sanitize_probe_token(value: &str) -> String {
     let lower = value.to_ascii_lowercase();
     if lower.contains("token")
         || lower.contains("secret")

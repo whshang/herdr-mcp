@@ -57,11 +57,11 @@ struct FleetLinkIdentity {
 }
 
 #[cfg(any(target_os = "macos", test))]
-#[derive(Debug)]
-struct EnrolledCredential {
-    device_id: String,
-    workstation_id: String,
-    device_secret: String,
+#[derive(Clone, Debug)]
+pub(crate) struct EnrolledCredential {
+    pub(crate) device_id: String,
+    pub(crate) workstation_id: String,
+    pub(crate) device_secret: String,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -240,6 +240,7 @@ pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
     }
     match command {
         WorkerCommand::List => list_devices(&paths),
+        WorkerCommand::Bootstrap => crate::worker_bootstrap::run(&paths),
         WorkerCommand::Pair { ttl_seconds, name } => {
             create_pairing(&paths, ttl_seconds, name.as_deref())
         }
@@ -458,6 +459,29 @@ fn connect_existing_worker(
         activate_connected_runtime,
         crate::link::reconcile_after_service_generation_change,
         consume_pairing,
+    )
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn adopt_bootstrap_enrollment(
+    paths: &RuntimePaths,
+    edge_origin: &str,
+    enrolled: EnrolledCredential,
+) -> Result<ExitCode, String> {
+    connect_macos_inner(
+        paths,
+        edge_origin,
+        "bootstrap-enrollment",
+        "000000",
+        None,
+        crate::macos_credential_helper::store,
+        Config::load_for_instance,
+        write_config_atomic,
+        revoke_self,
+        crate::macos_credential_helper::delete,
+        activate_connected_runtime,
+        crate::link::reconcile_after_service_generation_change,
+        move |_, _, _, _| Ok(enrolled.clone()),
     )
 }
 
