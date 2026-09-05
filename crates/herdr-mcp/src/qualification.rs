@@ -76,6 +76,7 @@ pub fn ensure_generation_change_allowed_in(config_dir: &Path, trigger: &str) -> 
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn generation_trigger(default: &str) -> String {
     std::env::var("HERDR_MCP_GENERATION_TRIGGER")
         .ok()

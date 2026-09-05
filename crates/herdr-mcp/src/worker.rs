@@ -14,7 +14,6 @@ use reqwest::blocking::{Client, Response};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 #[cfg(target_os = "macos")]
 use reqwest::redirect::Policy;
-#[cfg(any(target_os = "macos", test))]
 use serde_json::{Value, json};
 #[cfg(any(target_os = "macos", test))]
 use std::env;
@@ -35,9 +34,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
-#[cfg(any(target_os = "macos", test))]
 use time::OffsetDateTime;
-#[cfg(any(target_os = "macos", test))]
 use time::format_description::well_known::Rfc3339;
 #[cfg(any(target_os = "macos", test))]
 use url::Url;
@@ -95,14 +92,12 @@ fn connector_client_revoke_request_body(client_id: &str) -> Value {
     json!({ "client_id": client_id })
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn format_pairing_expiry(expires_at_ms: u64) -> Option<String> {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires_at_ms) * 1_000_000)
         .ok()
         .and_then(|value| value.format(&Rfc3339).ok())
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn inventory_now_ms() -> u64 {
     OffsetDateTime::now_utc()
         .unix_timestamp_nanos()
@@ -111,7 +106,6 @@ fn inventory_now_ms() -> u64 {
         .min(i128::from(u64::MAX)) as u64
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn readable_age(now_ms: u64, timestamp_ms: u64) -> String {
     if timestamp_ms > now_ms {
         return "clock skew".to_owned();
@@ -132,7 +126,6 @@ fn readable_age(now_ms: u64, timestamp_ms: u64) -> String {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn readable_timestamp(timestamp_ms: u64, now_ms: u64) -> String {
     let absolute = format_pairing_expiry(timestamp_ms).unwrap_or_else(|| "invalid time".to_owned());
     let age = readable_age(now_ms, timestamp_ms);
@@ -143,7 +136,6 @@ fn readable_timestamp(timestamp_ms: u64, now_ms: u64) -> String {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn annotate_inventory_entry(
     entry: &mut Value,
     created_at_ms: Option<u64>,
@@ -193,7 +185,6 @@ fn annotate_inventory_entry(
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn render_device_inventory(mut payload: Value, now_ms: u64) -> Value {
     if let Some(devices) = payload.get_mut("devices").and_then(Value::as_array_mut) {
         for device in devices {
@@ -205,7 +196,6 @@ fn render_device_inventory(mut payload: Value, now_ms: u64) -> Value {
     payload
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn render_connector_inventory(mut payload: Value, now_ms: u64) -> Value {
     if let Some(connectors) = payload.get_mut("connectors").and_then(Value::as_array_mut) {
         for connector in connectors {
@@ -227,7 +217,6 @@ fn render_connector_inventory(mut payload: Value, now_ms: u64) -> Value {
     payload
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn render_automation_inventory(mut payload: Value, now_ms: u64) -> Value {
     if let Some(automations) = payload.get_mut("automations").and_then(Value::as_array_mut) {
         for automation in automations {
