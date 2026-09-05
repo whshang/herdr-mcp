@@ -181,6 +181,41 @@ test("new Connector requires explicit exact owner-device approval; generic owner
   assert.equal(approved.status, 200);
   assert.equal((await approved.json()).client_id, client.client_id);
 
+  const target = await pair(h.env, "webchat-grant-target");
+  const grantInput = {
+    client_id: client.client_id,
+    device_id: target.device_id,
+    endpoint_ref: `be_${"a".repeat(64)}`,
+    provider: "chatgpt",
+    account_ref: `br_${"b".repeat(64)}`,
+    allowed: true,
+  };
+  const genericGrant = await worker.fetch(post("/connectors/webchat-control", grantInput, "owner-secret"), h.env);
+  assert.equal(genericGrant.status, 401, "generic MCP/operator bearer cannot widen WebChat Control");
+  const ownerGrant = await worker.fetch(postAsWorkstation(
+    "/connectors/webchat-control",
+    grantInput,
+    "prod-real-runtime",
+    "legacy-secret",
+  ), h.env);
+  assert.equal(ownerGrant.status, 200);
+  const ownerGrantBody = await ownerGrant.json();
+  assert.equal(ownerGrantBody.action, "connector_webchat_control_set");
+  assert.deepEqual(ownerGrantBody.grants, [{
+    device_id: target.device_id,
+    endpoint_ref: grantInput.endpoint_ref,
+    provider: "chatgpt",
+    account_ref: grantInput.account_ref,
+  }]);
+
+  const storedGrant = await oauth.fetch(new Request("https://oauth.internal/internal/oauth/grant/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_id: client.client_id }),
+  }));
+  assert.equal(storedGrant.status, 200);
+  assert.deepEqual((await storedGrant.json()).record.webchat_control, ownerGrantBody.grants);
+
   const poll = new URL("https://edge.example/oauth/authorize/poll");
   poll.searchParams.set("request_id", requestId);
   poll.searchParams.set("resume_token", resumeToken);

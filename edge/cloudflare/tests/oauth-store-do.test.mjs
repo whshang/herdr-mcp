@@ -204,7 +204,50 @@ test("connector approval is request-bound, five wrong attempts lock it, and corr
   assert.equal(grant.record.status, "active");
   assert.equal(grant.record.can_approve_connectors, true);
   assert.equal(grant.record.can_control_fleet, undefined, "ordinary connector approval must not grant Fleet Control authority");
+  assert.deepEqual(grant.record.webchat_control, [], "new connector approval starts with WebChat Control disabled");
   assert.equal(grant.record.approved_by, "device:owner");
+});
+
+test("WebChat Control grants normalize legacy records and add/remove one exact tuple without duplicates", async () => {
+  const h = harness();
+  h.storage.map.set("grant:legacy-client", {
+    client_id: "legacy-client",
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    status: "active",
+    can_approve_connectors: true,
+    approved_at_ms: 100,
+    approved_by: "device:owner",
+  });
+
+  const legacy = await body(await h.post("/internal/oauth/grant/get", { client_id: "legacy-client" }));
+  assert.equal(legacy.ok, true);
+  assert.deepEqual(legacy.record.webchat_control, [], "pre-Alpha-4 grants fail closed instead of inheriting control");
+
+  const tuple = {
+    client_id: "legacy-client",
+    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    endpoint_ref: `be_${"a".repeat(64)}`,
+    provider: "chatgpt",
+    account_ref: `br_${"b".repeat(64)}`,
+    changed_by: "oauth:owner-client",
+  };
+  const enabled = await body(await h.post("/internal/oauth/grant/webchat-control", { ...tuple, allowed: true }));
+  assert.equal(enabled.ok, true);
+  assert.deepEqual(enabled.record.webchat_control, [{
+    device_id: tuple.device_id,
+    endpoint_ref: tuple.endpoint_ref,
+    provider: tuple.provider,
+    account_ref: tuple.account_ref,
+  }]);
+
+  const replay = await body(await h.post("/internal/oauth/grant/webchat-control", { ...tuple, allowed: true }));
+  assert.equal(replay.ok, true);
+  assert.equal(replay.record.webchat_control.length, 1, "idempotent enable must not duplicate the tuple");
+
+  const disabled = await body(await h.post("/internal/oauth/grant/webchat-control", { ...tuple, allowed: false }));
+  assert.equal(disabled.ok, true);
+  assert.deepEqual(disabled.record.webchat_control, []);
 });
 
 test("connector approval resume token is independent, one-use, and cannot be substituted", async () => {
