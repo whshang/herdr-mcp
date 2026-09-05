@@ -3085,9 +3085,6 @@ mod tests {
 
     #[tokio::test]
     async fn workstation_bearer_does_not_become_webchat_control_grant() {
-        let _env_guard = crate::test_env::lock();
-        let previous_generation = env::var_os("HERDR_MCP_RUNTIME_GENERATION");
-        unsafe { env::set_var("HERDR_MCP_RUNTIME_GENERATION", "rust-caller-grant-proof") };
         let root = test_root("browser-caller-grant-boundary");
         let state = test_state(&root);
         let (endpoint_ref, account_ref, session_ref) = {
@@ -3214,12 +3211,6 @@ mod tests {
         assert_eq!(local["actuation_available"], true);
         assert!(local["actuation_reason"].is_null());
         assert!(!local.to_string().contains("native-session-hidden"));
-        unsafe {
-            match previous_generation {
-                Some(value) => env::set_var("HERDR_MCP_RUNTIME_GENERATION", value),
-                None => env::remove_var("HERDR_MCP_RUNTIME_GENERATION"),
-            }
-        }
         std::fs::remove_dir_all(root).ok();
     }
 
