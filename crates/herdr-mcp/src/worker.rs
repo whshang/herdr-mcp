@@ -14,7 +14,9 @@ use reqwest::blocking::{Client, Response};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 #[cfg(target_os = "macos")]
 use reqwest::redirect::Policy;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(any(target_os = "macos", test))]
+use serde_json::json;
 #[cfg(any(target_os = "macos", test))]
 use std::env;
 #[cfg(any(target_os = "macos", test))]
