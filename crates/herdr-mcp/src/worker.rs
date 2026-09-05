@@ -102,6 +102,143 @@ fn format_pairing_expiry(expires_at_ms: u64) -> Option<String> {
         .and_then(|value| value.format(&Rfc3339).ok())
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn inventory_now_ms() -> u64 {
+    OffsetDateTime::now_utc()
+        .unix_timestamp_nanos()
+        .max(0)
+        .saturating_div(1_000_000)
+        .min(i128::from(u64::MAX)) as u64
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn readable_age(now_ms: u64, timestamp_ms: u64) -> String {
+    if timestamp_ms > now_ms {
+        return "clock skew".to_owned();
+    }
+    let seconds = now_ms.saturating_sub(timestamp_ms) / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        format!("{}h", seconds / (60 * 60))
+    } else if seconds < 30 * 24 * 60 * 60 {
+        format!("{}d", seconds / (24 * 60 * 60))
+    } else if seconds < 365 * 24 * 60 * 60 {
+        format!("{}mo", seconds / (30 * 24 * 60 * 60))
+    } else {
+        format!("{}y", seconds / (365 * 24 * 60 * 60))
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn readable_timestamp(timestamp_ms: u64, now_ms: u64) -> String {
+    let absolute = format_pairing_expiry(timestamp_ms).unwrap_or_else(|| "invalid time".to_owned());
+    let age = readable_age(now_ms, timestamp_ms);
+    if age == "clock skew" {
+        format!("{absolute} (clock skew)")
+    } else {
+        format!("{absolute} ({age} ago)")
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn annotate_inventory_entry(
+    entry: &mut Value,
+    created_at_ms: Option<u64>,
+    last_used_at_ms: Option<u64>,
+    now_ms: u64,
+    unknown_legacy_usage: bool,
+) {
+    let Some(object) = entry.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "age".to_owned(),
+        Value::String(
+            created_at_ms
+                .map(|value| readable_age(now_ms, value))
+                .unwrap_or_else(|| "unknown".to_owned()),
+        ),
+    );
+    match last_used_at_ms {
+        Some(value) => {
+            object.insert(
+                "last_used".to_owned(),
+                Value::String(readable_timestamp(value, now_ms)),
+            );
+            object.insert("usage_state".to_owned(), Value::String("used".to_owned()));
+        }
+        None if unknown_legacy_usage => {
+            object.insert(
+                "last_used".to_owned(),
+                Value::String("unknown (pre-v0.4.6)".to_owned()),
+            );
+            object.insert(
+                "usage_state".to_owned(),
+                Value::String("unknown_legacy".to_owned()),
+            );
+        }
+        None => {
+            object.insert(
+                "last_used".to_owned(),
+                Value::String("never used".to_owned()),
+            );
+            object.insert(
+                "usage_state".to_owned(),
+                Value::String("never_used".to_owned()),
+            );
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn render_device_inventory(mut payload: Value, now_ms: u64) -> Value {
+    if let Some(devices) = payload.get_mut("devices").and_then(Value::as_array_mut) {
+        for device in devices {
+            let created = device.get("enrolled_at_ms").and_then(Value::as_u64);
+            let last_used = device.get("last_seen_at_ms").and_then(Value::as_u64);
+            annotate_inventory_entry(device, created, last_used, now_ms, false);
+        }
+    }
+    payload
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn render_connector_inventory(mut payload: Value, now_ms: u64) -> Value {
+    if let Some(connectors) = payload.get_mut("connectors").and_then(Value::as_array_mut) {
+        for connector in connectors {
+            let created = connector.get("created_at_ms").and_then(Value::as_u64);
+            let last_used = connector.get("last_used_at_ms").and_then(Value::as_u64);
+            annotate_inventory_entry(connector, created, last_used, now_ms, false);
+        }
+    }
+    if let Some(legacy) = payload
+        .get_mut("legacy_clients")
+        .and_then(Value::as_array_mut)
+    {
+        for client in legacy {
+            let created = client.get("created_at_ms").and_then(Value::as_u64);
+            let last_used = client.get("last_used_at_ms").and_then(Value::as_u64);
+            annotate_inventory_entry(client, created, last_used, now_ms, true);
+        }
+    }
+    payload
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn render_automation_inventory(mut payload: Value, now_ms: u64) -> Value {
+    if let Some(automations) = payload.get_mut("automations").and_then(Value::as_array_mut) {
+        for automation in automations {
+            let created = automation.get("created_at_ms").and_then(Value::as_u64);
+            let last_used = automation.get("last_used_at_ms").and_then(Value::as_u64);
+            annotate_inventory_entry(automation, created, last_used, now_ms, false);
+        }
+    }
+    payload
+}
+
 pub fn run(command: WorkerCommand) -> Result<ExitCode, String> {
     let paths = RuntimePaths::discover()?;
     if paths.instance.is_named() {
@@ -145,6 +282,7 @@ fn list_devices(paths: &RuntimePaths) -> Result<ExitCode, String> {
             .unwrap_or("device_inventory_unavailable");
         return Err(format!("device inventory unavailable: {code}"));
     }
+    let payload = render_device_inventory(payload, inventory_now_ms());
     println!(
         "{}",
         serde_json::to_string_pretty(&payload)
@@ -558,7 +696,10 @@ fn list_connectors(paths: &RuntimePaths) -> Result<ExitCode, String> {
         .headers(headers)
         .send()
         .map_err(|error| format!("cannot list Connectors: {error}"))?;
-    let payload = parse_json_response(response, "connector inventory")?;
+    let payload = render_connector_inventory(
+        parse_json_response(response, "connector inventory")?,
+        inventory_now_ms(),
+    );
     println!(
         "{}",
         serde_json::to_string_pretty(&payload)
@@ -642,7 +783,10 @@ fn list_automations(paths: &RuntimePaths) -> Result<ExitCode, String> {
         .headers(headers)
         .send()
         .map_err(|error| format!("cannot list automation credentials: {error}"))?;
-    let payload = parse_json_response(response, "automation credential inventory")?;
+    let payload = render_automation_inventory(
+        parse_json_response(response, "automation credential inventory")?,
+        inventory_now_ms(),
+    );
     println!(
         "{}",
         serde_json::to_string_pretty(&payload)
@@ -1616,6 +1760,81 @@ mod tests {
             format_pairing_expiry(0).as_deref(),
             Some("1970-01-01T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn inventory_rendering_exposes_age_usage_and_never_used() {
+        let now = 1_000_000_000_u64;
+        let two_days_ago = now - 2 * 24 * 60 * 60 * 1_000;
+        let three_hours_ago = now - 3 * 60 * 60 * 1_000;
+
+        let connectors = render_connector_inventory(
+            json!({
+                "ok": true,
+                "connectors": [{
+                    "connector_id": "conn_example123",
+                    "client_id": "client-1",
+                    "client_name": "ChatGPT",
+                    "scope": "mcp",
+                    "created_at_ms": two_days_ago,
+                    "last_used_at_ms": null,
+                    "grant_origin": "explicit_approval"
+                }],
+                "legacy_clients": [{
+                    "client_id": "legacy-1",
+                    "client_name": "Old client",
+                    "created_at_ms": two_days_ago,
+                    "last_used_at_ms": null,
+                    "grant_origin": "pre_v0_4_6_legacy"
+                }]
+            }),
+            now,
+        );
+        assert_eq!(connectors["connectors"][0]["age"], "2d");
+        assert_eq!(connectors["connectors"][0]["last_used"], "never used");
+        assert_eq!(connectors["connectors"][0]["usage_state"], "never_used");
+        assert_eq!(
+            connectors["legacy_clients"][0]["last_used"],
+            "unknown (pre-v0.4.6)"
+        );
+        assert_eq!(
+            connectors["legacy_clients"][0]["usage_state"],
+            "unknown_legacy"
+        );
+
+        let automations = render_automation_inventory(
+            json!({
+                "automations": [{
+                    "client_id": "svc_example123",
+                    "name": "gitlab:project",
+                    "created_at_ms": two_days_ago,
+                    "last_used_at_ms": three_hours_ago
+                }]
+            }),
+            now,
+        );
+        assert_eq!(automations["automations"][0]["age"], "2d");
+        assert!(
+            automations["automations"][0]["last_used"]
+                .as_str()
+                .unwrap()
+                .contains("(3h ago)")
+        );
+
+        let devices = render_device_inventory(
+            json!({
+                "devices": [{
+                    "device_id": "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    "name": "macbook",
+                    "enrolled_at_ms": two_days_ago,
+                    "last_seen_at_ms": null
+                }]
+            }),
+            now,
+        );
+        assert_eq!(devices["devices"][0]["age"], "2d");
+        assert_eq!(devices["devices"][0]["last_used"], "never used");
+        assert_eq!(devices["devices"][0]["usage_state"], "never_used");
     }
 
     #[test]

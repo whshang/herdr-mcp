@@ -822,6 +822,17 @@ test("token: client_credentials is reserved for approved automation clients and 
   }, opts);
   assert.equal(wrongSecret.status, 400);
   assert.equal((await wrongSecret.json()).error, "invalid_client");
+  const afterFailedAuth = await opts.__do.fetch(new Request("https://oauth.internal/internal/oauth/automation/list", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  }));
+  const failedInventory = await afterFailedAuth.json();
+  assert.equal(
+    failedInventory.automations[0].last_used_at_ms,
+    null,
+    "failed client authentication must not update last_used_at",
+  );
 
   const response = await POST("/oauth/token", {
     grant_type: "client_credentials",
@@ -837,6 +848,17 @@ test("token: client_credentials is reserved for approved automation clients and 
   assert.equal(token.scope, "mcp");
   assert.equal(token.refresh_token, undefined);
   assert.ok(token.access_token.includes("."));
+  const afterSuccessfulAuth = await opts.__do.fetch(new Request("https://oauth.internal/internal/oauth/automation/list", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  }));
+  const successfulInventory = await afterSuccessfulAuth.json();
+  assert.equal(
+    successfulInventory.automations[0].last_used_at_ms,
+    NOW_SEC * 1000,
+    "successful client authentication updates last_used_at",
+  );
 
   const verify = await opts.__do.fetch(new Request("https://oauth.internal/internal/oauth/access/verify", {
     method: "POST",

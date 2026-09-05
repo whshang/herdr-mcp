@@ -451,6 +451,10 @@ test("connector instance revoke is isolated while client kill-switch fences ever
   }));
   const firstIssued = await issueFor(first.record);
   const secondIssued = await issueFor(second.record);
+  const firstAfterIssue = await body(await h.post("/internal/oauth/connector/get", {
+    connector_id: first.record.connector_id,
+  }));
+  assert.equal(firstAfterIssue.connector.last_used_at_ms, 1000 * 1000);
   assert.equal((await h.post("/internal/oauth/access/verify", { token: firstIssued.token.access_token, now_sec: 1001 })).status, 200);
   assert.equal((await h.post("/internal/oauth/access/verify", { token: secondIssued.token.access_token, now_sec: 1001 })).status, 200);
 
@@ -537,6 +541,7 @@ test("automation client is independently named, monitored, rotated, and revoke f
   assert.equal(listed.automations[0].device_name, "ci-bound-mac");
   assert.equal(listed.automations[0].created_by, "device:admin");
   assert.equal(listed.automations[0].token_issue_count, 1);
+  assert.equal(listed.automations[0].last_used_at_ms, 2000);
   assert.equal(listed.automations[0].last_token_issued_at_ms, 2000);
   assert.equal(listed.automations[0].last_rotated_at_ms, null);
 

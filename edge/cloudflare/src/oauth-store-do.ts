@@ -82,6 +82,7 @@ export interface OAuthConnectorRecord {
   alias?: string;
   approved_at_ms: number;
   approved_by: string;
+  last_used_at_ms?: number;
   last_token_issued_at_ms?: number;
   token_issue_count?: number;
   revoked_at_ms?: number;
@@ -99,6 +100,7 @@ export interface OAuthConnectorGrantRecord {
   device_name?: string;
   approved_at_ms?: number;
   approved_by?: string;
+  last_used_at_ms?: number;
   last_token_issued_at_ms?: number;
   token_issue_count?: number;
   last_rotated_at_ms?: number;
@@ -292,6 +294,7 @@ function normalizeConnector(value: unknown): OAuthConnectorRecord | null {
   if (!finiteEpoch(value.approved_at_ms) || !boundedString(value.approved_by, 4096)) return null;
   const alias = typeof value.alias === "string" && value.alias.length > 0 && value.alias.length <= 256 ? value.alias : undefined;
   const lastTokenIssuedAt = finiteEpoch(value.last_token_issued_at_ms) ? value.last_token_issued_at_ms as number : undefined;
+  const lastUsedAt = finiteEpoch(value.last_used_at_ms) ? value.last_used_at_ms as number : lastTokenIssuedAt;
   const tokenIssueCount = Number.isSafeInteger(value.token_issue_count) && (value.token_issue_count as number) >= 0
     ? value.token_issue_count as number
     : undefined;
@@ -311,6 +314,7 @@ function normalizeConnector(value: unknown): OAuthConnectorRecord | null {
     approved_at_ms: value.approved_at_ms,
     approved_by: value.approved_by,
     ...(alias ? { alias } : {}),
+    ...(lastUsedAt !== undefined ? { last_used_at_ms: lastUsedAt } : {}),
     ...(lastTokenIssuedAt !== undefined ? { last_token_issued_at_ms: lastTokenIssuedAt } : {}),
     ...(tokenIssueCount !== undefined ? { token_issue_count: tokenIssueCount } : {}),
     ...(revokedAt !== undefined ? { revoked_at_ms: revokedAt } : {}),
@@ -330,6 +334,7 @@ function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantRecord | nu
   const approvedAt = finiteEpoch(value.approved_at_ms) ? value.approved_at_ms as number : undefined;
   const approvedBy = boundedString(value.approved_by, 4096) ? value.approved_by : undefined;
   const lastTokenIssuedAt = finiteEpoch(value.last_token_issued_at_ms) ? value.last_token_issued_at_ms as number : undefined;
+  const lastUsedAt = finiteEpoch(value.last_used_at_ms) ? value.last_used_at_ms as number : lastTokenIssuedAt;
   const tokenIssueCount = Number.isSafeInteger(value.token_issue_count) && (value.token_issue_count as number) >= 0
     ? value.token_issue_count as number
     : undefined;
@@ -357,6 +362,7 @@ function normalizeConnectorGrant(value: unknown): OAuthConnectorGrantRecord | nu
     ...(deviceName !== undefined ? { device_name: deviceName } : {}),
     ...(approvedAt !== undefined ? { approved_at_ms: approvedAt } : {}),
     ...(approvedBy !== undefined ? { approved_by: approvedBy } : {}),
+    ...(lastUsedAt !== undefined ? { last_used_at_ms: lastUsedAt } : {}),
     ...(lastTokenIssuedAt !== undefined ? { last_token_issued_at_ms: lastTokenIssuedAt } : {}),
     ...(tokenIssueCount !== undefined ? { token_issue_count: tokenIssueCount } : {}),
     ...(lastRotatedAt !== undefined ? { last_rotated_at_ms: lastRotatedAt } : {}),
@@ -849,6 +855,9 @@ export class OAuthStoreDO {
       connectors.push({
         ...connector,
         client_name: client?.client_name ?? null,
+        created_at_ms: connector.approved_at_ms,
+        last_used_at_ms: connector.last_used_at_ms ?? null,
+        grant_origin: "explicit_approval",
         active_access_tokens: activeAccessByConnector.get(connector.connector_id) ?? 0,
         active_refresh_tokens: activeRefreshByConnector.get(connector.connector_id) ?? 0,
       });
@@ -878,6 +887,9 @@ export class OAuthStoreDO {
         client_id: clientId,
         client_name: client.client_name ?? null,
         issued_at: client.issued_at,
+        created_at_ms: client.issued_at * 1000,
+        last_used_at_ms: null,
+        grant_origin: "pre_v0_4_6_legacy",
         grant_status: grantStatus,
         registration_state: registrationState,
         active_access_tokens: access,
@@ -1052,10 +1064,13 @@ export class OAuthStoreDO {
         client_id: clientId,
         name: client.client_name ?? clientId,
         status: grant.status,
+        scope: grant.scope ?? null,
+        resource: grant.resource ?? null,
         device_id: grant.device_id ?? null,
         device_name: grant.device_name ?? null,
         created_at_ms: grant.approved_at_ms ?? client.issued_at * 1000,
         created_by: grant.approved_by ?? null,
+        last_used_at_ms: grant.last_used_at_ms ?? null,
         last_token_issued_at_ms: grant.last_token_issued_at_ms ?? null,
         token_issue_count: grant.token_issue_count ?? 0,
         last_rotated_at_ms: grant.last_rotated_at_ms ?? null,
@@ -1143,6 +1158,7 @@ export class OAuthStoreDO {
       if (!current || current.status !== "active" || current.principal_type !== "automation" || current.resource !== resource) return;
       await txn.put(GRANT_PREFIX + clientId, {
         ...current,
+        last_used_at_ms: nowSec * 1000,
         last_token_issued_at_ms: nowSec * 1000,
         token_issue_count: (current.token_issue_count ?? 0) + 1,
       });
@@ -1212,6 +1228,7 @@ export class OAuthStoreDO {
       if (!connector || connector.status !== "active" || connector.grant_generation !== grantGeneration) return;
       await txn.put(key, {
         ...connector,
+        last_used_at_ms: nowMs,
         last_token_issued_at_ms: nowMs,
         token_issue_count: (connector.token_issue_count ?? 0) + 1,
       } satisfies OAuthConnectorRecord);
