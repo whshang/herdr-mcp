@@ -1274,8 +1274,8 @@ User path:\n\
   herdr-mcp doctor\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
-  herdr-mcp instance list  (named validation instances only)\n\
-  herdr-mcp instance reap <name> --confirm  (ownership-checked named-instance uninstall)\n\
+  herdr-mcp instance list  (default + named instance inventory; default is read-only)\n\
+  herdr-mcp instance reap <name> --confirm  (ownership-checked named-instance uninstall; never default)\n\
   herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS enrolled device only; creates pairing for another computer)\n\
   herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS only; requires Keychain, reads the 6-digit code as visible interactive terminal input (or one stdin line), never argv)\n\
   herdr-mcp device list  (non-secret enrolled-device inventory; worker list is an alias)\n\
@@ -1360,9 +1360,9 @@ All of these require the credential of a device already enrolled in the fleet.\n
 }
 
 pub fn instance_help() -> &'static str {
-    "Herdr MCP named validation instance management\n\n\
-The default production instance is never included and cannot be reaped.\n\n\
-  herdr-mcp instance list\n      Lists recognized named instance config roots and server LaunchAgents,\n      including loaded/orphan state.\n\n  herdr-mcp instance reap <name> --confirm\n      Runs the existing ownership-checked product uninstall for exactly one\n      named instance. It never targets ~/.config/herdr-mcp or runtime releases.\n"
+    "Herdr MCP validation instance management\n\n\
+The default production instance is shown for comparison but is read-only and\ncan never be reaped. Only named validation instances are cleanup targets.\n\n\
+  herdr-mcp instance list\n      Lists the default plus recognized named instances with label, port, config\n      root, artifact age, loaded/running state, pid, and orphan state.\n\n  herdr-mcp instance reap <name> --confirm\n      Runs the existing ownership-checked product uninstall for exactly one\n      named instance. It never targets ~/.config/herdr-mcp or runtime releases.\n"
 }
 
 #[cfg(test)]
