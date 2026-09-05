@@ -32,7 +32,7 @@ pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
 /// assert it remains exactly equal to the append-only migration count.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Meta-table key holding the applied schema version. Stored as a string.
 const META_SCHEMA_VERSION: &str = "schema_version";
@@ -359,6 +359,42 @@ CREATE INDEX IF NOT EXISTS idx_browser_resources_lookup
     ON browser_resources(endpoint_ref, provider, kind, parent_ref, last_observed_at DESC);
 "#;
 
+/// Migration 8: minimum durable browser-dispatch identity and idempotency.
+///
+/// The row stores only provider-neutral refs, semantic intent, and caller-
+/// supplied digests. Delivery history and late settlement belong to beta.1.
+const MIGRATION_V8: &str = r#"
+CREATE TABLE IF NOT EXISTS browser_dispatches (
+    dispatch_id           TEXT PRIMARY KEY NOT NULL,
+    endpoint_ref           TEXT NOT NULL,
+    provider               TEXT NOT NULL,
+    operation              TEXT NOT NULL,
+    target_session_ref     TEXT NOT NULL,
+    request_digest         TEXT NOT NULL,
+    message_digest         TEXT NOT NULL,
+    reasoning_effort       TEXT,
+    required_apps_json     TEXT NOT NULL,
+    expected_generation    INTEGER NOT NULL,
+    idempotency_key_digest TEXT NOT NULL,
+    delivery_state         TEXT NOT NULL,
+    generation_owner       INTEGER,
+    work_chain_id          TEXT,
+    lane_id                TEXT,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    FOREIGN KEY (endpoint_ref) REFERENCES browser_endpoints(endpoint_ref) ON DELETE CASCADE,
+    FOREIGN KEY (target_session_ref) REFERENCES browser_resources(resource_ref),
+    CHECK (expected_generation > 0),
+    CHECK (generation_owner IS NULL OR generation_owner = expected_generation),
+    CHECK (delivery_state IN (
+        'not_applied', 'applied', 'uncertain', 'rejected',
+        'browser_offline', 'resource_unavailable', 'stopped'
+    ))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_browser_dispatches_idempotency
+    ON browser_dispatches(endpoint_ref, provider, operation, idempotency_key_digest);
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
 const MIGRATIONS: &[&str] = &[
@@ -369,6 +405,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V5,
     MIGRATION_V6,
     MIGRATION_V7,
+    MIGRATION_V8,
 ];
 
 /// Existing durable operation found while reserving an idempotency key.
@@ -683,6 +720,97 @@ pub struct BrowserResourceResolveInput<'a> {
     pub parent_ref: Option<&'a str>,
     pub display_label: Option<&'a str>,
     pub expected_observation_generation: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserDeliveryState {
+    NotApplied,
+    Applied,
+    Uncertain,
+    Rejected,
+    BrowserOffline,
+    ResourceUnavailable,
+    Stopped,
+}
+
+impl BrowserDeliveryState {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "not_applied" => Ok(Self::NotApplied),
+            "applied" => Ok(Self::Applied),
+            "uncertain" => Ok(Self::Uncertain),
+            "rejected" => Ok(Self::Rejected),
+            "browser_offline" => Ok(Self::BrowserOffline),
+            "resource_unavailable" => Ok(Self::ResourceUnavailable),
+            "stopped" => Ok(Self::Stopped),
+            _ => Err("browser_delivery_state_invalid".to_owned()),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplied => "not_applied",
+            Self::Applied => "applied",
+            Self::Uncertain => "uncertain",
+            Self::Rejected => "rejected",
+            Self::BrowserOffline => "browser_offline",
+            Self::ResourceUnavailable => "resource_unavailable",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserDispatchReserveInput<'a> {
+    pub endpoint_ref: &'a str,
+    pub provider: &'a str,
+    pub operation: &'a str,
+    pub target_session_ref: &'a str,
+    pub request_digest: &'a str,
+    pub message_digest: &'a str,
+    pub reasoning_effort: Option<&'a str>,
+    pub required_apps: &'a [&'a str],
+    pub expected_generation: i64,
+    pub idempotency_key_digest: &'a str,
+    pub work_chain_id: Option<&'a str>,
+    pub lane_id: Option<&'a str>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserDispatchUpdateInput<'a> {
+    pub dispatch_id: &'a str,
+    pub expected_generation: i64,
+    pub delivery_state: BrowserDeliveryState,
+    pub generation_owner: Option<i64>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserDispatchRecord {
+    pub dispatch_id: String,
+    pub endpoint_ref: String,
+    pub provider: String,
+    pub operation: String,
+    pub target_session_ref: String,
+    pub request_digest: String,
+    pub message_digest: String,
+    pub reasoning_effort: Option<String>,
+    pub required_apps: Vec<String>,
+    pub expected_generation: i64,
+    pub idempotency_key_digest: String,
+    pub delivery_state: BrowserDeliveryState,
+    pub generation_owner: Option<i64>,
+    pub work_chain_id: Option<String>,
+    pub lane_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserDispatchReservation {
+    Reserved(BrowserDispatchRecord),
+    Existing(BrowserDispatchRecord),
 }
 
 // ---------------------------------------------------------------------------
@@ -2567,6 +2695,311 @@ impl StateStore {
             _ => Err("browser_resource_ambiguous".to_owned()),
         }
     }
+
+    pub fn reserve_browser_dispatch(
+        &mut self,
+        input: BrowserDispatchReserveInput<'_>,
+    ) -> Result<BrowserDispatchReservation, String> {
+        validate_browser_endpoint_ref(input.endpoint_ref)?;
+        validate_browser_token(input.provider, 32, "provider")?;
+        validate_browser_token(input.operation, 64, "dispatch_operation")?;
+        validate_browser_resource_ref(input.target_session_ref)?;
+        validate_browser_digest(input.request_digest, "request_digest")?;
+        validate_browser_digest(input.message_digest, "message_digest")?;
+        validate_browser_digest(input.idempotency_key_digest, "idempotency_key_digest")?;
+        if input.expected_generation < 1 {
+            return Err("browser_expected_generation_invalid".to_owned());
+        }
+        if input.created_at < 0 {
+            return Err("browser_created_at_invalid".to_owned());
+        }
+        if let Some(reasoning_effort) = input.reasoning_effort
+            && !matches!(reasoning_effort, "economy" | "balanced" | "thorough")
+        {
+            return Err("browser_reasoning_effort_invalid".to_owned());
+        }
+        let required_apps_json = normalize_browser_required_apps(input.required_apps)?;
+        if let Some(work_chain_id) = input.work_chain_id
+            && !valid_work_chain_id(work_chain_id)
+        {
+            return Err("browser_work_chain_id_invalid".to_owned());
+        }
+        if let Some(lane_id) = input.lane_id {
+            validate_browser_ref_text(lane_id, 160, "lane_id")?;
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser dispatch reservation: {error}"))?;
+        let dispatch_id = browser_opaque_ref(
+            "bd_",
+            &[
+                "browser-dispatch-v1",
+                input.endpoint_ref,
+                input.provider,
+                input.operation,
+                input.idempotency_key_digest,
+            ],
+        );
+        if let Some(existing) = read_browser_dispatch_by_scope(
+            &tx,
+            input.endpoint_ref,
+            input.provider,
+            input.operation,
+            input.idempotency_key_digest,
+        )? {
+            if existing.dispatch_id != dispatch_id
+                || existing.target_session_ref != input.target_session_ref
+                || existing.request_digest != input.request_digest
+                || existing.message_digest != input.message_digest
+                || existing.reasoning_effort.as_deref() != input.reasoning_effort
+                || existing.required_apps_json != required_apps_json
+                || existing.expected_generation != input.expected_generation
+                || existing.work_chain_id.as_deref() != input.work_chain_id
+                || existing.lane_id.as_deref() != input.lane_id
+            {
+                return Err("browser_dispatch_idempotency_conflict".to_owned());
+            }
+            let record = decode_browser_dispatch(existing)?;
+            tx.commit().map_err(|error| {
+                format!("cannot commit existing browser dispatch reservation: {error}")
+            })?;
+            return Ok(BrowserDispatchReservation::Existing(record));
+        }
+        require_current_browser_generation(
+            &tx,
+            input.endpoint_ref,
+            input.provider,
+            input.expected_generation,
+        )?;
+        require_browser_session_target(
+            &tx,
+            input.endpoint_ref,
+            input.provider,
+            input.target_session_ref,
+            input.expected_generation,
+        )?;
+        tx.execute(
+            "INSERT INTO browser_dispatches(
+                    dispatch_id, endpoint_ref, provider, operation,
+                    target_session_ref, request_digest, message_digest,
+                    reasoning_effort, required_apps_json, expected_generation,
+                    idempotency_key_digest, delivery_state, generation_owner,
+                    work_chain_id, lane_id, created_at, updated_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                    'not_applied', NULL, ?12, ?13, ?14, ?14
+                 )",
+            params![
+                dispatch_id,
+                input.endpoint_ref,
+                input.provider,
+                input.operation,
+                input.target_session_ref,
+                input.request_digest,
+                input.message_digest,
+                input.reasoning_effort,
+                required_apps_json,
+                input.expected_generation,
+                input.idempotency_key_digest,
+                input.work_chain_id,
+                input.lane_id,
+                input.created_at,
+            ],
+        )
+        .map_err(|error| format!("cannot reserve browser dispatch: {error}"))?;
+        let record = read_browser_dispatch_by_ref(&tx, &dispatch_id)?
+            .ok_or_else(|| "browser dispatch reservation has no authoritative row".to_owned())
+            .and_then(decode_browser_dispatch)?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser dispatch reservation: {error}"))?;
+        Ok(BrowserDispatchReservation::Reserved(record))
+    }
+
+    pub fn browser_dispatch(
+        &self,
+        dispatch_id: &str,
+    ) -> Result<Option<BrowserDispatchRecord>, String> {
+        validate_browser_dispatch_id(dispatch_id)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("cannot begin browser dispatch read: {error}"))?;
+        let record = read_browser_dispatch_by_ref(&tx, dispatch_id)?
+            .map(decode_browser_dispatch)
+            .transpose()?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser dispatch read: {error}"))?;
+        Ok(record)
+    }
+
+    pub fn update_browser_dispatch(
+        &mut self,
+        input: BrowserDispatchUpdateInput<'_>,
+    ) -> Result<BrowserDispatchRecord, String> {
+        validate_browser_dispatch_id(input.dispatch_id)?;
+        if input.expected_generation < 1 {
+            return Err("browser_expected_generation_invalid".to_owned());
+        }
+        if input
+            .generation_owner
+            .is_some_and(|owner| owner != input.expected_generation)
+        {
+            return Err("browser_generation_owner_mismatch".to_owned());
+        }
+        if input.updated_at < 0 {
+            return Err("browser_updated_at_invalid".to_owned());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser dispatch update: {error}"))?;
+        let current = read_browser_dispatch_by_ref(&tx, input.dispatch_id)?
+            .ok_or_else(|| "browser_dispatch_not_found".to_owned())?;
+        require_current_browser_generation(
+            &tx,
+            &current.endpoint_ref,
+            &current.provider,
+            input.expected_generation,
+        )?;
+        if current.expected_generation != input.expected_generation {
+            return Err("stale_capability_generation".to_owned());
+        }
+        let changed = tx
+            .execute(
+                "UPDATE browser_dispatches
+                 SET delivery_state = ?2, generation_owner = ?3,
+                     updated_at = MAX(updated_at, ?4)
+                 WHERE dispatch_id = ?1 AND expected_generation = ?5",
+                params![
+                    input.dispatch_id,
+                    input.delivery_state.as_str(),
+                    input.generation_owner,
+                    input.updated_at,
+                    input.expected_generation,
+                ],
+            )
+            .map_err(|error| format!("cannot update browser dispatch: {error}"))?;
+        if changed != 1 {
+            return Err("stale_capability_generation".to_owned());
+        }
+        let record = read_browser_dispatch_by_ref(&tx, input.dispatch_id)?
+            .ok_or_else(|| "browser_dispatch_not_found".to_owned())
+            .and_then(decode_browser_dispatch)?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser dispatch update: {error}"))?;
+        Ok(record)
+    }
+}
+
+#[derive(Debug)]
+struct StoredBrowserDispatch {
+    dispatch_id: String,
+    endpoint_ref: String,
+    provider: String,
+    operation: String,
+    target_session_ref: String,
+    request_digest: String,
+    message_digest: String,
+    reasoning_effort: Option<String>,
+    required_apps_json: String,
+    expected_generation: i64,
+    idempotency_key_digest: String,
+    delivery_state: String,
+    generation_owner: Option<i64>,
+    work_chain_id: Option<String>,
+    lane_id: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+const BROWSER_DISPATCH_SELECT: &str = "SELECT dispatch_id, endpoint_ref, provider, operation,
+            target_session_ref, request_digest, message_digest,
+            reasoning_effort, required_apps_json, expected_generation,
+            idempotency_key_digest, delivery_state, generation_owner,
+            work_chain_id, lane_id, created_at, updated_at
+     FROM browser_dispatches";
+
+fn decode_stored_browser_dispatch(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredBrowserDispatch> {
+    Ok(StoredBrowserDispatch {
+        dispatch_id: row.get(0)?,
+        endpoint_ref: row.get(1)?,
+        provider: row.get(2)?,
+        operation: row.get(3)?,
+        target_session_ref: row.get(4)?,
+        request_digest: row.get(5)?,
+        message_digest: row.get(6)?,
+        reasoning_effort: row.get(7)?,
+        required_apps_json: row.get(8)?,
+        expected_generation: row.get(9)?,
+        idempotency_key_digest: row.get(10)?,
+        delivery_state: row.get(11)?,
+        generation_owner: row.get(12)?,
+        work_chain_id: row.get(13)?,
+        lane_id: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
+    })
+}
+
+fn read_browser_dispatch_by_ref(
+    conn: &Connection,
+    dispatch_id: &str,
+) -> Result<Option<StoredBrowserDispatch>, String> {
+    conn.query_row(
+        &format!("{BROWSER_DISPATCH_SELECT} WHERE dispatch_id = ?1"),
+        [dispatch_id],
+        decode_stored_browser_dispatch,
+    )
+    .optional()
+    .map_err(|error| format!("cannot read browser dispatch: {error}"))
+}
+
+fn read_browser_dispatch_by_scope(
+    conn: &Connection,
+    endpoint_ref: &str,
+    provider: &str,
+    operation: &str,
+    idempotency_key_digest: &str,
+) -> Result<Option<StoredBrowserDispatch>, String> {
+    conn.query_row(
+        &format!(
+            "{BROWSER_DISPATCH_SELECT}
+             WHERE endpoint_ref = ?1 AND provider = ?2 AND operation = ?3
+               AND idempotency_key_digest = ?4"
+        ),
+        params![endpoint_ref, provider, operation, idempotency_key_digest],
+        decode_stored_browser_dispatch,
+    )
+    .optional()
+    .map_err(|error| format!("cannot read browser dispatch reservation: {error}"))
+}
+
+fn decode_browser_dispatch(stored: StoredBrowserDispatch) -> Result<BrowserDispatchRecord, String> {
+    let delivery_state = BrowserDeliveryState::parse(&stored.delivery_state)?;
+    let required_apps = parse_browser_required_apps(&stored.required_apps_json)?;
+    Ok(BrowserDispatchRecord {
+        dispatch_id: stored.dispatch_id,
+        endpoint_ref: stored.endpoint_ref,
+        provider: stored.provider,
+        operation: stored.operation,
+        target_session_ref: stored.target_session_ref,
+        request_digest: stored.request_digest,
+        message_digest: stored.message_digest,
+        reasoning_effort: stored.reasoning_effort,
+        required_apps,
+        expected_generation: stored.expected_generation,
+        idempotency_key_digest: stored.idempotency_key_digest,
+        delivery_state,
+        generation_owner: stored.generation_owner,
+        work_chain_id: stored.work_chain_id,
+        lane_id: stored.lane_id,
+        created_at: stored.created_at,
+        updated_at: stored.updated_at,
+    })
 }
 
 fn decode_browser_endpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserEndpointRecord> {
@@ -2683,6 +3116,31 @@ fn validate_browser_resource_ref(value: &str) -> Result<(), String> {
     }
 }
 
+fn validate_browser_dispatch_id(value: &str) -> Result<(), String> {
+    if value.len() == 67
+        && value.starts_with("bd_")
+        && value[3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err("browser_dispatch_id_invalid".to_owned())
+    }
+}
+
+fn validate_browser_digest(value: &str, field: &str) -> Result<(), String> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(format!("browser_{field}_invalid"))
+    }
+}
+
 fn validate_browser_resource_kind(value: &str) -> Result<(), String> {
     if matches!(value, "account" | "space" | "session") {
         Ok(())
@@ -2767,6 +3225,94 @@ fn normalize_browser_capabilities(value: &str) -> Result<String, String> {
     normalized_ops.dedup();
     serde_json::to_string(&serde_json::json!({ "operations": normalized_ops }))
         .map_err(|_| "browser_capabilities_invalid".to_owned())
+}
+
+fn normalize_browser_required_apps(required_apps: &[&str]) -> Result<String, String> {
+    if required_apps.len() > 32 {
+        return Err("browser_required_apps_invalid".to_owned());
+    }
+    let mut normalized = Vec::with_capacity(required_apps.len());
+    for app in required_apps {
+        if !valid_work_memory_token(app, 64) {
+            return Err("browser_required_apps_invalid".to_owned());
+        }
+        normalized.push((*app).to_owned());
+    }
+    normalized.sort();
+    normalized.dedup();
+    serde_json::to_string(&normalized).map_err(|_| "browser_required_apps_invalid".to_owned())
+}
+
+fn parse_browser_required_apps(value: &str) -> Result<Vec<String>, String> {
+    let parsed: Vec<String> =
+        serde_json::from_str(value).map_err(|_| "browser_required_apps_invalid".to_owned())?;
+    if parsed.len() > 32 || parsed.iter().any(|app| !valid_work_memory_token(app, 64)) {
+        return Err("browser_required_apps_invalid".to_owned());
+    }
+    let mut normalized = parsed.clone();
+    normalized.sort();
+    normalized.dedup();
+    if normalized != parsed {
+        return Err("browser_required_apps_invalid".to_owned());
+    }
+    Ok(parsed)
+}
+
+fn require_current_browser_generation(
+    conn: &Connection,
+    endpoint_ref: &str,
+    provider: &str,
+    expected_generation: i64,
+) -> Result<(), String> {
+    let current = conn
+        .query_row(
+            "SELECT observation_generation FROM browser_provider_state
+             WHERE endpoint_ref = ?1 AND provider = ?2",
+            params![endpoint_ref, provider],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("cannot inspect browser dispatch generation: {error}"))?;
+    match current {
+        None => Err("browser_capability_unknown".to_owned()),
+        Some(current) if current != expected_generation => {
+            Err("stale_capability_generation".to_owned())
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+fn require_browser_session_target(
+    conn: &Connection,
+    endpoint_ref: &str,
+    provider: &str,
+    target_session_ref: &str,
+    expected_generation: i64,
+) -> Result<(), String> {
+    let target = conn
+        .query_row(
+            "SELECT endpoint_ref, provider, kind, observation_generation
+             FROM browser_resources WHERE resource_ref = ?1",
+            [target_session_ref],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("cannot inspect browser dispatch target: {error}"))?
+        .ok_or_else(|| "browser_resource_not_found".to_owned())?;
+    if target.0 != endpoint_ref || target.1 != provider || target.2 != "session" {
+        return Err("browser_dispatch_target_invalid".to_owned());
+    }
+    if target.3 != expected_generation {
+        return Err("stale_capability_generation".to_owned());
+    }
+    Ok(())
 }
 
 fn validate_browser_resource_parent(
@@ -4028,21 +4574,25 @@ fn open_connection(path: Option<&Path>) -> Result<Connection, String> {
 /// Ensure the `meta` key/value table exists, then run pending migrations and
 /// bump `schema_version`. Version higher than our maximum fails closed.
 fn migrate(conn: &mut Connection) -> Result<(), String> {
+    migrate_to(conn, SCHEMA_VERSION, MIGRATIONS)
+}
+
+fn migrate_to(conn: &mut Connection, target: i64, migrations: &[&str]) -> Result<(), String> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )
     .map_err(|error| format!("cannot bootstrap meta table: {error}"))?;
 
     let current = i64_schema_version(conn)?;
-    let target = SCHEMA_VERSION;
     if current > target {
         return Err(format!(
             "state store schema version {current} is newer than this binary supports \
-             ({target}); refusing to run (fail-closed, no silent downgrade)"
+             ({target}); refusing to run (fail-closed, no silent downgrade); rollback \
+             requires a schema-{target} database backup or a schema-{current}-capable binary"
         ));
     }
 
-    for (index, migration) in MIGRATIONS.iter().enumerate() {
+    for (index, migration) in migrations.iter().enumerate() {
         let version = (index + 1) as i64;
         if current >= version {
             continue;
@@ -4208,6 +4758,73 @@ mod tests {
         ))
     }
 
+    fn browser_dispatch_fixture(
+        store: &mut StateStore,
+        generation: i64,
+        native_identity_prefix: &str,
+    ) -> (String, String, String) {
+        let endpoint = store
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                profile_seed: "profile-seed-0123456789abcdef",
+                browser_family: "chrome",
+                extension_version: "0.1.90",
+                observed_at: 1,
+            })
+            .unwrap();
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: generation,
+                capabilities_json: r#"{"operations":["composer.submit","generation.status","generation.stop"]}"#,
+                observed_at: 2,
+            })
+            .unwrap();
+        let account = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "account",
+                parent_ref: None,
+                native_identity: &format!("{native_identity_prefix}-account"),
+                display_label: None,
+                observation_generation: generation,
+                observed_at: 3,
+            })
+            .unwrap();
+        let session_a = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&account.resource_ref),
+                native_identity: &format!("{native_identity_prefix}-session-a"),
+                display_label: None,
+                observation_generation: generation,
+                observed_at: 4,
+            })
+            .unwrap();
+        let session_b = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&account.resource_ref),
+                native_identity: &format!("{native_identity_prefix}-session-b"),
+                display_label: None,
+                observation_generation: generation,
+                observed_at: 5,
+            })
+            .unwrap();
+        (
+            endpoint.endpoint_ref,
+            session_a.resource_ref,
+            session_b.resource_ref,
+        )
+    }
+
     #[test]
     fn new_db_creates_and_migrates_to_latest() {
         assert_eq!(SCHEMA_VERSION as usize, MIGRATIONS.len());
@@ -4222,9 +4839,11 @@ mod tests {
             "runtime_generations",
             "service_events",
             "service_rollbacks",
+            "browser_dispatches",
         ] {
             assert!(tables.contains(&table.to_owned()), "missing table {table}");
         }
+        assert!(!tables.contains(&"browser_delivery_events".to_owned()));
         let indexes = store.index_names().unwrap();
         for index in [
             "idx_operations_idempotency",
@@ -4235,6 +4854,7 @@ mod tests {
             "idx_service_events_at",
             "idx_service_rollbacks_ready",
             "idx_service_rollbacks_created",
+            "idx_browser_dispatches_idempotency",
         ] {
             assert!(indexes.contains(&index.to_owned()), "missing index {index}");
         }
@@ -4955,6 +5575,24 @@ mod tests {
         let message = result.err().unwrap();
         assert!(message.contains("newer than this binary supports"));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn schema_seven_binary_refuses_v8_and_requires_compatible_rollback_state() {
+        let path = temp_db_path();
+        {
+            let store = StateStore::open(&path).unwrap();
+            assert_eq!(store.schema_version().unwrap(), 8);
+        }
+        let mut schema_seven_connection = open_connection(Some(&path)).unwrap();
+        let error = migrate_to(&mut schema_seven_connection, 7, &MIGRATIONS[..7]).unwrap_err();
+        assert!(error.contains("newer than this binary supports (7)"));
+        assert!(error.contains("schema-7 database backup"));
+        assert!(error.contains("schema-8-capable binary"));
+        drop(schema_seven_connection);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
     }
 
     #[test]
@@ -5687,7 +6325,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v6_upgrades_to_browser_registry_v7_without_losing_continuity() {
+    fn schema_v6_upgrades_through_browser_registry_without_losing_continuity() {
         let path = temp_db_path();
         {
             let conn = Connection::open(&path).unwrap();
@@ -5716,7 +6354,7 @@ mod tests {
         }
 
         let store = StateStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(
             store
                 .scalar_i64(
@@ -5730,19 +6368,359 @@ mod tests {
             "browser_endpoints",
             "browser_provider_state",
             "browser_resources",
+            "browser_dispatches",
         ] {
             assert!(tables.contains(&table.to_owned()), "missing {table}");
         }
         assert!(
-            !tables
-                .iter()
-                .any(|table| table.contains("reservation") || table.contains("dispatch")),
-            "Alpha 3 must not create browser reservation/dispatch state"
+            !tables.iter().any(|table| table.contains("reservation")),
+            "browser reservation remains out of scope"
         );
         drop(store);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn schema_v7_to_v8_adds_only_dispatch_table_and_preserves_browser_registry() {
+        let path = temp_db_path();
+        let endpoint_ref;
+        let session_ref;
+        let tables_before;
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+            for migration in MIGRATIONS.iter().take(7) {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '7')",
+                [META_SCHEMA_VERSION],
+            )
+            .unwrap();
+            endpoint_ref =
+                browser_opaque_ref("bep_", &["browser-endpoint-v1", "device-v7", "profile-v7"]);
+            session_ref = browser_opaque_ref(
+                "br_",
+                &[
+                    "browser-resource-v1",
+                    &endpoint_ref,
+                    "chatgpt",
+                    "session",
+                    "",
+                    "native-v7",
+                ],
+            );
+            conn.execute(
+                "INSERT INTO browser_endpoints(
+                    endpoint_ref, device_id, browser_family, extension_version,
+                    first_observed_at, last_observed_at
+                 ) VALUES (?1, 'device-v7', 'chrome', '0.1.90', 1, 1)",
+                [&endpoint_ref],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO browser_provider_state(
+                    endpoint_ref, provider, adapter_protocol_version,
+                    observation_generation, capabilities_json, observed_at
+                 ) VALUES (?1, 'chatgpt', 1, 7, '{\"operations\":[]}', 1)",
+                [&endpoint_ref],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO browser_resources(
+                    resource_ref, endpoint_ref, provider, kind, parent_ref,
+                    native_identity_sha256, observation_generation,
+                    first_observed_at, last_observed_at
+                 ) VALUES (?1, ?2, 'chatgpt', 'session', '', ?3, 7, 1, 1)",
+                params![session_ref, endpoint_ref, sha256_text("native-v7")],
+            )
+            .unwrap();
+            tables_before = list_names(
+                &conn,
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+            )
+            .unwrap();
+        }
+
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 8);
+        assert!(store.browser_endpoint(&endpoint_ref).unwrap().is_some());
+        assert!(store.browser_resource(&session_ref).unwrap().is_some());
+        let tables_after = store.table_names().unwrap();
+        let new_tables = tables_after
+            .iter()
+            .filter(|table| !tables_before.contains(table))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(new_tables, vec!["browser_dispatches"]);
+        assert!(!tables_after.contains(&"browser_delivery_events".to_owned()));
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn browser_dispatch_replay_is_durable_conflicting_and_provider_neutral() {
+        const RAW_NATIVE_IDENTITY: &str = "sentinel-provider-native-identity-987";
+        const RAW_MESSAGE: &str = "sentinel raw browser message must never persist";
+        let path = temp_db_path();
+        let dispatch_id;
+        let mut actuation_count = 0usize;
+        {
+            let mut store = StateStore::open(&path).unwrap();
+            assert_eq!(store.path(), Some(path.as_path()));
+            let (endpoint_ref, session_ref, other_session_ref) =
+                browser_dispatch_fixture(&mut store, 7, RAW_NATIVE_IDENTITY);
+            let required_apps = ["herdr"];
+            let request_digest = sha256_text("provider-neutral-request");
+            let message_digest = sha256_text(RAW_MESSAGE);
+            let idempotency_key_digest = sha256_text("caller-idempotency-key");
+            let input = BrowserDispatchReserveInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                operation: "browser_dispatch.submit",
+                target_session_ref: &session_ref,
+                request_digest: &request_digest,
+                message_digest: &message_digest,
+                reasoning_effort: Some("balanced"),
+                required_apps: &required_apps,
+                expected_generation: 7,
+                idempotency_key_digest: &idempotency_key_digest,
+                work_chain_id: Some("wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                lane_id: Some("lane-alpha"),
+                created_at: 10,
+            };
+            let BrowserDispatchReservation::Reserved(reserved) =
+                store.reserve_browser_dispatch(input).unwrap()
+            else {
+                panic!("first reservation must be new");
+            };
+            actuation_count += 1;
+            dispatch_id = reserved.dispatch_id.clone();
+            assert_eq!(actuation_count, 1);
+            let conflict = store
+                .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                    target_session_ref: &other_session_ref,
+                    ..input
+                })
+                .unwrap_err();
+            assert_eq!(conflict, "browser_dispatch_idempotency_conflict");
+            let conflict = store
+                .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                    request_digest: &sha256_text("different-request"),
+                    ..input
+                })
+                .unwrap_err();
+            assert_eq!(conflict, "browser_dispatch_idempotency_conflict");
+            let conflict = store
+                .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                    expected_generation: 8,
+                    ..input
+                })
+                .unwrap_err();
+            assert_eq!(conflict, "browser_dispatch_idempotency_conflict");
+        }
+        {
+            let mut reopened = StateStore::open(&path).unwrap();
+            let endpoint_ref = reopened
+                .scalar_text(
+                    "SELECT endpoint_ref FROM browser_dispatches WHERE dispatch_id = \
+                     (SELECT dispatch_id FROM browser_dispatches LIMIT 1)",
+                )
+                .unwrap()
+                .unwrap();
+            let session_ref = reopened
+                .scalar_text("SELECT target_session_ref FROM browser_dispatches LIMIT 1")
+                .unwrap()
+                .unwrap();
+            let required_apps = ["herdr"];
+            let request_digest = sha256_text("provider-neutral-request");
+            let message_digest = sha256_text(RAW_MESSAGE);
+            let idempotency_key_digest = sha256_text("caller-idempotency-key");
+            let BrowserDispatchReservation::Existing(existing) = reopened
+                .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                    endpoint_ref: &endpoint_ref,
+                    provider: "chatgpt",
+                    operation: "browser_dispatch.submit",
+                    target_session_ref: &session_ref,
+                    request_digest: &request_digest,
+                    message_digest: &message_digest,
+                    reasoning_effort: Some("balanced"),
+                    required_apps: &required_apps,
+                    expected_generation: 7,
+                    idempotency_key_digest: &idempotency_key_digest,
+                    work_chain_id: Some("wc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    lane_id: Some("lane-alpha"),
+                    created_at: 99,
+                })
+                .unwrap()
+            else {
+                panic!("reopen replay must return existing");
+            };
+            assert_eq!(existing.dispatch_id, dispatch_id);
+            assert_eq!(
+                actuation_count, 1,
+                "a replay after reopening the durable store must not regain actuation eligibility"
+            );
+            assert_eq!(
+                reopened
+                    .scalar_i64("SELECT COUNT(*) FROM browser_dispatches")
+                    .unwrap(),
+                Some(1)
+            );
+            reopened
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        let persisted = std::fs::read(&path).unwrap();
+        assert!(
+            !persisted
+                .windows(RAW_NATIVE_IDENTITY.len())
+                .any(|window| window == RAW_NATIVE_IDENTITY.as_bytes())
+        );
+        assert!(
+            !persisted
+                .windows(RAW_MESSAGE.len())
+                .any(|window| window == RAW_MESSAGE.as_bytes())
+        );
+        let entries = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with(path.file_name().unwrap().to_str().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(
+            entries.iter().all(|name| {
+                name == path.file_name().unwrap().to_str().unwrap()
+                    || name.ends_with("-wal")
+                    || name.ends_with("-shm")
+            }),
+            "dispatch persistence must reuse the existing SQLite path: {entries:?}"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn browser_dispatch_state_and_generation_fences_fail_closed() {
+        for state in [
+            "not_applied",
+            "applied",
+            "uncertain",
+            "rejected",
+            "browser_offline",
+            "resource_unavailable",
+            "stopped",
+        ] {
+            assert_eq!(BrowserDeliveryState::parse(state).unwrap().as_str(), state);
+        }
+        assert_eq!(
+            BrowserDeliveryState::parse("delivered").unwrap_err(),
+            "browser_delivery_state_invalid"
+        );
+
+        let mut store = StateStore::open(":memory:").unwrap();
+        let (endpoint_ref, session_ref, _) =
+            browser_dispatch_fixture(&mut store, 7, "generation-fence");
+        let request_digest = sha256_text("request");
+        let message_digest = sha256_text("message");
+        let idempotency_key_digest = sha256_text("generation-key");
+        let required_apps = ["herdr"];
+        let BrowserDispatchReservation::Reserved(reserved) = store
+            .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                operation: "browser_dispatch.submit",
+                target_session_ref: &session_ref,
+                request_digest: &request_digest,
+                message_digest: &message_digest,
+                reasoning_effort: Some("thorough"),
+                required_apps: &required_apps,
+                expected_generation: 7,
+                idempotency_key_digest: &idempotency_key_digest,
+                work_chain_id: None,
+                lane_id: None,
+                created_at: 10,
+            })
+            .unwrap()
+        else {
+            panic!("expected reserved dispatch");
+        };
+        assert_eq!(
+            store
+                .update_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &reserved.dispatch_id,
+                    expected_generation: 7,
+                    delivery_state: BrowserDeliveryState::Applied,
+                    generation_owner: Some(8),
+                    updated_at: 11,
+                })
+                .unwrap_err(),
+            "browser_generation_owner_mismatch"
+        );
+        let owned = store
+            .update_browser_dispatch(BrowserDispatchUpdateInput {
+                dispatch_id: &reserved.dispatch_id,
+                expected_generation: 7,
+                delivery_state: BrowserDeliveryState::Applied,
+                generation_owner: Some(7),
+                updated_at: 12,
+            })
+            .unwrap();
+        assert_eq!(owned.generation_owner, Some(7));
+
+        store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 8,
+                capabilities_json: r#"{"operations":["composer.submit","generation.status","generation.stop"]}"#,
+                observed_at: 20,
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .update_browser_dispatch(BrowserDispatchUpdateInput {
+                    dispatch_id: &reserved.dispatch_id,
+                    expected_generation: 7,
+                    delivery_state: BrowserDeliveryState::Stopped,
+                    generation_owner: Some(7),
+                    updated_at: 21,
+                })
+                .unwrap_err(),
+            "stale_capability_generation",
+            "stored generation_owner is evidence and cannot authorize stale work"
+        );
+        assert_eq!(
+            store
+                .reserve_browser_dispatch(BrowserDispatchReserveInput {
+                    idempotency_key_digest: &sha256_text("new-key-after-advance"),
+                    created_at: 22,
+                    ..BrowserDispatchReserveInput {
+                        endpoint_ref: &endpoint_ref,
+                        provider: "chatgpt",
+                        operation: "browser_dispatch.submit",
+                        target_session_ref: &session_ref,
+                        request_digest: &request_digest,
+                        message_digest: &message_digest,
+                        reasoning_effort: Some("thorough"),
+                        required_apps: &required_apps,
+                        expected_generation: 7,
+                        idempotency_key_digest: &idempotency_key_digest,
+                        work_chain_id: None,
+                        lane_id: None,
+                        created_at: 10,
+                    }
+                })
+                .unwrap_err(),
+            "stale_capability_generation"
+        );
     }
 
     #[test]
