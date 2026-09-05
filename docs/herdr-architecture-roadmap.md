@@ -56,7 +56,7 @@ rc.1     security / migration / N-1·N+1 兼容 / rollback / 双设备验收
 
 1.0 以 v0.4.6 的 pre-1.0 stabilization 合同为基础，不复制其 Connector/OAuth authority、Automation Client、onboarding/readiness、runtime/EventCache liveness、planner tool-integrity、multi-device/Relay、Native Messaging local-auth、browser continuity/target-fencing 等实现。若 v0.4.6 的发布分支尚未回并 `main`，只在集成阶段吸收其已验证提交；1.0 feature branches 不另写同类机制。
 
-阶段规格：alpha.1 见 [`_wip/v1.0-phase1-fleet-control-kernel.md`](./_wip/v1.0-phase1-fleet-control-kernel.md)；alpha.2 见 [`_wip/v1.0-alpha2-work-memory.md`](./_wip/v1.0-alpha2-work-memory.md)；alpha.3 见 [`_wip/v1.0-alpha3-browser-registry.md`](./_wip/v1.0-alpha3-browser-registry.md)（spec 当前在分支 `feat/v1.0-browser-registry-alpha3-20260905`，尚未合并）。alpha.4 起尚未立项。alpha.5 明确位于 ChatGPT adapter 后、beta.1 reliability/postcondition 前；在 alpha.5 完成真实双 Provider UAT 以前，Work Memory 可以作为跨 Provider 状态合同实现，但不能宣称 ChatGPT/Gemini WebChat 已具备生产级跨 Provider 调度。
+阶段规格：alpha.1 见 [`_wip/v1.0-phase1-fleet-control-kernel.md`](./_wip/v1.0-phase1-fleet-control-kernel.md)；alpha.2 见 [`_wip/v1.0-alpha2-work-memory.md`](./_wip/v1.0-alpha2-work-memory.md)；alpha.3 见 [`_wip/v1.0-alpha3-browser-registry.md`](./_wip/v1.0-alpha3-browser-registry.md)，已随 PR #315 合并。alpha.4 起尚未合并实现。alpha.5 明确位于 ChatGPT adapter 后、beta.1 reliability/postcondition 前；在 alpha.5 完成真实双 Provider UAT 以前，Work Memory 可以作为跨 Provider 状态合同实现，但不能宣称 ChatGPT/Gemini WebChat 已具备生产级跨 Provider 调度。
 
 1.0 的两个正式跨 Provider 验收场景固定为：
 
