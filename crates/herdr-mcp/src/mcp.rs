@@ -3842,6 +3842,193 @@ mod tests {
     }
 
     #[test]
+    fn browser_dispatch_idempotency_survives_store_reopen_without_second_actuation() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct CountingActuator {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl BrowserActuator for CountingActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: true,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                })
+            }
+        }
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-mcp-browser-dispatch-restart-{}-{suffix}.sqlite",
+            std::process::id()
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let actuator = CountingActuator {
+            calls: calls.clone(),
+        };
+
+        let session_ref;
+        let first_dispatch_id;
+        {
+            let store = Arc::new(Mutex::new(StateStore::open(&path).unwrap()));
+            session_ref = {
+                let mut guard = store.lock().unwrap();
+                let endpoint = guard
+                    .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                        device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                        profile_seed: "restart-idempotency-profile",
+                        browser_family: "chrome",
+                        extension_version: "0.1.90",
+                        observed_at: 10,
+                    })
+                    .unwrap();
+                guard
+                    .observe_browser_provider(BrowserProviderObservationInput {
+                        endpoint_ref: &endpoint.endpoint_ref,
+                        provider: "chatgpt",
+                        adapter_protocol_version: 1,
+                        observation_generation: 7,
+                        capabilities_json: r#"{"operations":["composer.submit"]}"#,
+                        observed_at: 11,
+                    })
+                    .unwrap();
+                let account = guard
+                    .observe_browser_resource(BrowserResourceObservationInput {
+                        endpoint_ref: &endpoint.endpoint_ref,
+                        provider: "chatgpt",
+                        kind: "account",
+                        parent_ref: None,
+                        native_identity: "restart-account-hidden",
+                        display_label: None,
+                        observation_generation: 7,
+                        observed_at: 12,
+                    })
+                    .unwrap();
+                let session = guard
+                    .observe_browser_resource(BrowserResourceObservationInput {
+                        endpoint_ref: &endpoint.endpoint_ref,
+                        provider: "chatgpt",
+                        kind: "session",
+                        parent_ref: Some(&account.resource_ref),
+                        native_identity: "restart-session-hidden",
+                        display_label: None,
+                        observation_generation: 7,
+                        observed_at: 13,
+                    })
+                    .unwrap();
+                guard
+                    .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                        endpoint_ref: &endpoint.endpoint_ref,
+                        expected_revision: 0,
+                        webchat_control_allowed: true,
+                        tool_bridge_allowed: false,
+                        tool_bridge_mutation_allowed: false,
+                        observed_at: 14,
+                    })
+                    .unwrap();
+                session.resource_ref
+            };
+            let params = json!({
+                "session_ref": session_ref,
+                "message": "persisted dispatch before runtime restart",
+                "expected_generation": 7,
+                "idempotency_key": "runtime-restart-idempotency-key"
+            });
+            let first = browser_operation_call_with_grant(
+                &store,
+                "herdr_mcp.browser_dispatch.submit",
+                &params,
+                true,
+                Some(&actuator),
+            );
+            assert_eq!(first["ok"], true);
+            assert_eq!(first["replayed"], false);
+            first_dispatch_id = first["dispatch"]["dispatch_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+
+        {
+            let reopened = Arc::new(Mutex::new(StateStore::open(&path).unwrap()));
+            let params = json!({
+                "session_ref": session_ref,
+                "message": "persisted dispatch before runtime restart",
+                "expected_generation": 7,
+                "idempotency_key": "runtime-restart-idempotency-key"
+            });
+            let replay = browser_operation_call_with_grant(
+                &reopened,
+                "herdr_mcp.browser_dispatch.submit",
+                &params,
+                true,
+                Some(&actuator),
+            );
+            assert_eq!(replay["ok"], true);
+            assert_eq!(replay["replayed"], true);
+            assert_eq!(replay["dispatch"]["dispatch_id"], first_dispatch_id);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "replaying the durable idempotency key after reopening the runtime store must not invoke browser actuation"
+            );
+
+            let control = browser_operation_call_with_grant(
+                &reopened,
+                "herdr_mcp.browser_dispatch.submit",
+                &json!({
+                    "session_ref": session_ref,
+                    "message": "new dispatch after runtime restart",
+                    "expected_generation": 7,
+                    "idempotency_key": "runtime-restart-control-key"
+                }),
+                true,
+                Some(&actuator),
+            );
+            assert_eq!(control["ok"], true);
+            assert_eq!(control["replayed"], false);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "the reopened runtime still invokes the actuator for a genuinely new idempotency key"
+            );
+        }
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
     fn browser_actuation_intersection_fails_closed_with_stable_reasons() {
         use crate::state_store::{
             BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,

@@ -6388,6 +6388,73 @@ mod tests {
     }
 
     #[test]
+    fn schema_v5_upgrades_through_v6_v7_v8_without_losing_continuity() {
+        let path = temp_db_path();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+            for migration in MIGRATIONS.iter().take(5) {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '5')",
+                [META_SCHEMA_VERSION],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO continuity_chains(
+                    continuity_id, title, project_id, status, created_at, updated_at
+                 ) VALUES ('wm:pre-v6', 'pre-v6', 'project-v5', 'active', 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO continuity_turns(
+                    continuity_id, conversation_id, message_id, role, text, observed_at
+                 ) VALUES ('wm:pre-v6', 'conversation-v5', 'message-v5', 'user', 'persist-v5', 2)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM continuity_chains WHERE continuity_id = 'wm:pre-v6'"
+                )
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .scalar_text(
+                    "SELECT text FROM continuity_turns WHERE continuity_id = 'wm:pre-v6' AND message_id = 'message-v5'"
+                )
+                .unwrap()
+                .as_deref(),
+            Some("persist-v5")
+        );
+        let tables = store.table_names().unwrap();
+        for table in [
+            "continuity_evidence",
+            "browser_endpoints",
+            "browser_provider_state",
+            "browser_resources",
+            "browser_dispatches",
+        ] {
+            assert!(tables.contains(&table.to_owned()), "missing {table}");
+        }
+        assert!(!tables.contains(&"browser_delivery_events".to_owned()));
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
     fn schema_v6_upgrades_through_browser_registry_without_losing_continuity() {
         let path = temp_db_path();
         {
