@@ -36,6 +36,13 @@ const SUPPORTED_VERSIONS: [&str; 5] = [
     "2024-10-07",
 ];
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserCallerGrant {
+    pub endpoint_ref: String,
+    pub provider: String,
+    pub account_ref: String,
+}
+
 pub struct RuntimeContext<'a> {
     pub client: &'a HerdrClient,
     pub cache: &'a EventCache,
@@ -43,7 +50,7 @@ pub struct RuntimeContext<'a> {
     pub prompt: &'a PromptRegistry,
     pub skill: &'a SkillService,
     pub state_store: &'a std::sync::Arc<std::sync::Mutex<StateStore>>,
-    pub caller_webchat_control_granted: bool,
+    pub caller_webchat_control_grants: &'a [BrowserCallerGrant],
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
 }
 
@@ -206,21 +213,21 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
             } else if BrowserOperation::parse(method).is_some() {
-                browser_operation_call_with_grant(
+                browser_operation_call_with_grants(
                     context.state_store,
                     method,
                     &params,
-                    context.caller_webchat_control_granted,
+                    context.caller_webchat_control_grants,
                     context.browser_actuator,
                 )
             } else if method.starts_with("herdr_mcp.browser_endpoint.")
                 || method.starts_with("herdr_mcp.browser_resource.")
             {
-                browser_registry_call_with_grant(
+                browser_registry_call_with_grants(
                     context.state_store,
                     method,
                     &params,
-                    context.caller_webchat_control_granted,
+                    context.caller_webchat_control_grants,
                 )
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
@@ -1453,14 +1460,49 @@ fn browser_operation_call(
     method: &str,
     params: &Value,
 ) -> Value {
-    browser_operation_call_with_grant(store, method, params, false, None)
+    browser_operation_call_with_grants(store, method, params, &[], None)
 }
 
+#[cfg(test)]
+fn browser_test_grants(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+) -> Vec<BrowserCallerGrant> {
+    let Ok(store) = store.lock() else {
+        return Vec::new();
+    };
+    store
+        .browser_resources(None, None, Some("account"), None, 64)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|resource| BrowserCallerGrant {
+            endpoint_ref: resource.endpoint_ref,
+            provider: resource.provider,
+            account_ref: resource.resource_ref,
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn browser_operation_call_with_grant(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     method: &str,
     params: &Value,
     caller_webchat_control_granted: bool,
+    browser_actuator: Option<&dyn BrowserActuator>,
+) -> Value {
+    let grants = if caller_webchat_control_granted {
+        browser_test_grants(store)
+    } else {
+        Vec::new()
+    };
+    browser_operation_call_with_grants(store, method, params, &grants, browser_actuator)
+}
+
+fn browser_operation_call_with_grants(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    method: &str,
+    params: &Value,
+    caller_webchat_control_grants: &[BrowserCallerGrant],
     browser_actuator: Option<&dyn BrowserActuator>,
 ) -> Value {
     let Some(operation) = BrowserOperation::parse(method) else {
@@ -1484,7 +1526,7 @@ fn browser_operation_call_with_grant(
             &store_guard,
             operation,
             params,
-            caller_webchat_control_granted,
+            caller_webchat_control_grants,
         ) {
             Ok((true, None)) => {}
             Ok((false, Some(reason))) => {
@@ -1511,14 +1553,14 @@ fn browser_operation_call_with_grant(
             params,
             "space",
             operation,
-            caller_webchat_control_granted,
+            caller_webchat_control_grants,
         ),
         BrowserOperation::SessionInspect => browser_operation_inspect_resource(
             store,
             params,
             "session",
             operation,
-            caller_webchat_control_granted,
+            caller_webchat_control_grants,
         ),
         BrowserOperation::DispatchSubmit => {
             browser_dispatch_submit(store, params, browser_actuator)
@@ -1764,7 +1806,7 @@ fn browser_operation_actuation_decision(
     store: &StateStore,
     operation: BrowserOperation,
     params: &Value,
-    caller_webchat_control_granted: bool,
+    caller_webchat_control_grants: &[BrowserCallerGrant],
 ) -> Result<(bool, Option<&'static str>), String> {
     let target = match operation {
         BrowserOperation::SpaceCreate => {
@@ -1841,7 +1883,7 @@ fn browser_operation_actuation_decision(
         store,
         operation.capability_operation(),
         &target,
-        caller_webchat_control_granted,
+        caller_webchat_control_grants,
         params.get("expected_generation").and_then(Value::as_i64),
     )?;
     if decision != (true, None) || operation != BrowserOperation::DispatchSubmit {
@@ -1900,10 +1942,15 @@ fn browser_resource_actuation_decision(
     store: &StateStore,
     capability_operation: &str,
     resource: &crate::state_store::BrowserResourceRecord,
-    caller_webchat_control_granted: bool,
+    caller_webchat_control_grants: &[BrowserCallerGrant],
     expected_generation: Option<i64>,
 ) -> Result<(bool, Option<&'static str>), String> {
-    if !caller_webchat_control_granted {
+    let account_ref = browser_resource_account_ref(store, resource)?;
+    if !caller_webchat_control_grants.iter().any(|grant| {
+        grant.endpoint_ref == resource.endpoint_ref
+            && grant.provider == resource.provider
+            && grant.account_ref == account_ref
+    }) {
         return Ok((false, Some("caller_grant_missing")));
     }
 
@@ -1936,6 +1983,49 @@ fn browser_resource_actuation_decision(
         return Ok((false, Some("capability_not_allowed")));
     }
     Ok((true, None))
+}
+
+fn browser_resource_account_ref(
+    store: &StateStore,
+    resource: &crate::state_store::BrowserResourceRecord,
+) -> Result<String, String> {
+    if resource.kind == "account" {
+        return Ok(resource.resource_ref.clone());
+    }
+    let parent_ref = resource
+        .parent_ref
+        .as_deref()
+        .ok_or_else(|| "browser_resource_parent_missing".to_owned())?;
+    let parent = store
+        .browser_resource(parent_ref)?
+        .ok_or_else(|| "browser_resource_parent_not_found".to_owned())?;
+    if parent.endpoint_ref != resource.endpoint_ref
+        || parent.provider != resource.provider
+        || parent.observation_generation != resource.observation_generation
+    {
+        return Err("browser_resource_scope_mismatch".to_owned());
+    }
+    match (resource.kind.as_str(), parent.kind.as_str()) {
+        ("space", "account") | ("session", "account") => Ok(parent.resource_ref),
+        ("session", "space") => {
+            let account_ref = parent
+                .parent_ref
+                .as_deref()
+                .ok_or_else(|| "browser_resource_parent_missing".to_owned())?;
+            let account = store
+                .browser_resource(account_ref)?
+                .ok_or_else(|| "browser_resource_parent_not_found".to_owned())?;
+            if account.kind != "account"
+                || account.endpoint_ref != resource.endpoint_ref
+                || account.provider != resource.provider
+                || account.observation_generation != resource.observation_generation
+            {
+                return Err("browser_resource_scope_mismatch".to_owned());
+            }
+            Ok(account.resource_ref)
+        }
+        _ => Err("browser_resource_scope_mismatch".to_owned()),
+    }
 }
 
 fn browser_capability_snapshot_allows(capabilities_json: &str, operation: &str) -> Option<bool> {
@@ -2031,7 +2121,7 @@ fn browser_operation_inspect_resource(
     params: &Value,
     kind: &str,
     operation: BrowserOperation,
-    caller_webchat_control_granted: bool,
+    caller_webchat_control_grants: &[BrowserCallerGrant],
 ) -> Value {
     let Ok(store) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
@@ -2060,7 +2150,7 @@ fn browser_operation_inspect_resource(
                 &store,
                 operation.capability_operation(),
                 &resource,
-                caller_webchat_control_granted,
+                caller_webchat_control_grants,
                 None,
             ) {
                 Ok(decision) => decision,
@@ -2103,14 +2193,29 @@ fn browser_registry_call(
     method: &str,
     params: &Value,
 ) -> Value {
-    browser_registry_call_with_grant(store, method, params, false)
+    browser_registry_call_with_grants(store, method, params, &[])
 }
 
+#[cfg(test)]
 fn browser_registry_call_with_grant(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     method: &str,
     params: &Value,
     caller_webchat_control_granted: bool,
+) -> Value {
+    let grants = if caller_webchat_control_granted {
+        browser_test_grants(store)
+    } else {
+        Vec::new()
+    };
+    browser_registry_call_with_grants(store, method, params, &grants)
+}
+
+fn browser_registry_call_with_grants(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    method: &str,
+    params: &Value,
+    caller_webchat_control_grants: &[BrowserCallerGrant],
 ) -> Value {
     let Some(object) = params.as_object() else {
         return json!({"ok": false, "code": "browser_registry_params_invalid"});
@@ -2240,7 +2345,7 @@ fn browser_registry_call_with_grant(
                             &store,
                             capability_operation,
                             &resource,
-                            caller_webchat_control_granted,
+                            caller_webchat_control_grants,
                             None,
                         ) {
                             Ok(decision) => decision,
@@ -2345,7 +2450,7 @@ fn browser_registry_call_with_grant(
                             &store,
                             capability_operation,
                             &resource,
-                            caller_webchat_control_granted,
+                            caller_webchat_control_grants,
                             expected_observation_generation,
                         ) {
                             Ok(decision) => decision,
@@ -3853,11 +3958,30 @@ mod tests {
             })
             .unwrap();
 
-        let inspect = browser_operation_call_with_grant(
+        let wrong_account_grants = [BrowserCallerGrant {
+            endpoint_ref: endpoint_ref.clone(),
+            provider: "chatgpt".to_owned(),
+            account_ref: format!("br_{}", "e".repeat(64)),
+        }];
+        let wrong_account = browser_operation_call_with_grants(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &dispatch_params,
+            &wrong_account_grants,
+            None,
+        );
+        assert_eq!(wrong_account["code"], "caller_grant_missing");
+
+        let exact_grants = [BrowserCallerGrant {
+            endpoint_ref: endpoint_ref.clone(),
+            provider: "chatgpt".to_owned(),
+            account_ref: account_ref.clone(),
+        }];
+        let inspect = browser_operation_call_with_grants(
             &store,
             "herdr_mcp.browser_session.inspect",
             &json!({"session_ref": session_ref}),
-            true,
+            &exact_grants,
             None,
         );
         assert_eq!(inspect["ok"], true);
@@ -3920,23 +4044,29 @@ mod tests {
         );
         assert_eq!(capability_not_allowed["code"], "capability_not_allowed");
 
+        let unknown_resource_ref = format!("br_{}", "f".repeat(64));
         let unknown_resource = BrowserResourceRecord {
-            resource_ref: format!("br_{}", "f".repeat(64)),
+            resource_ref: unknown_resource_ref.clone(),
             endpoint_ref: endpoint_ref.clone(),
             provider: "missing-provider".to_owned(),
-            kind: "session".to_owned(),
-            parent_ref: Some(account_ref),
+            kind: "account".to_owned(),
+            parent_ref: None,
             native_identity_sha256: "0".repeat(64),
             display_label: None,
             observation_generation: 7,
             first_observed_at: 15,
             last_observed_at: 15,
         };
+        let unknown_grants = [BrowserCallerGrant {
+            endpoint_ref: endpoint_ref.clone(),
+            provider: "missing-provider".to_owned(),
+            account_ref: unknown_resource_ref,
+        }];
         let capability_unknown = browser_resource_actuation_decision(
             &store.lock().unwrap(),
-            "session.inspect",
+            "identity.inspect",
             &unknown_resource,
-            true,
+            &unknown_grants,
             None,
         )
         .unwrap();

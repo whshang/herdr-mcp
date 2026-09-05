@@ -3,7 +3,9 @@ use crate::exec_sessions::ExecRegistry;
 #[cfg(unix)]
 use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
-use crate::mcp::{self, BrowserActuator, BrowserPostconditionEvidence, RuntimeContext};
+use crate::mcp::{
+    self, BrowserActuator, BrowserCallerGrant, BrowserPostconditionEvidence, RuntimeContext,
+};
 use crate::paths::RuntimePaths;
 use crate::prompt::PromptRegistry;
 use crate::runtime_meta;
@@ -40,6 +42,9 @@ const MAX_BROWSER_ACTUATION_RESULT_BYTES: usize = 64 * 1024;
 const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(12);
 const BROWSER_EXTENSION_LIVE_WINDOW: Duration = Duration::from_secs(2);
 const RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
+const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
+const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
+const MAX_EDGE_WEBCHAT_CONTROL_GRANTS_HEADER_BYTES: usize = 8 * 1024;
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
@@ -2028,6 +2033,32 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             }),
         );
     }
+    if trusted_edge_runtime_generation_fence(&state, &headers).is_err() {
+        let mut response = json_response(
+            StatusCode::CONFLICT,
+            &json!({
+                "jsonrpc": "2.0",
+                "error": {"code": -32002, "message": "Runtime generation mismatch"},
+                "id": null
+            }),
+        );
+        attach_runtime_generation_header(&mut response);
+        return response;
+    }
+    let caller_webchat_control_grants = match trusted_edge_webchat_control_grants(&state, &headers)
+    {
+        Ok(grants) => grants,
+        Err(()) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid trusted caller grant context"},
+                    "id": null
+                }),
+            );
+        }
+    };
     let request: Value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) if !value.is_array() => value,
         Ok(_) => {
@@ -2078,9 +2109,9 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             prompt: &blocking_state.prompt,
             skill: &blocking_state.skill,
             state_store: &blocking_state.state_store,
-            // The local bearer authenticates the workstation transport only. A business
-            // WebChat-control grant must arrive through a separately authenticated handoff.
-            caller_webchat_control_granted: false,
+            // The workstation bearer authenticates only TCP transport. Browser business
+            // authority is admitted exclusively from the trusted Unix IPC handoff above.
+            caller_webchat_control_grants: &caller_webchat_control_grants,
             browser_actuator: Some(&blocking_state.browser_actuation),
         };
         mcp::handle(&blocking_request, &context)
@@ -2206,6 +2237,103 @@ fn wants_sse(headers: &HeaderMap, request: &Value) -> bool {
         .get(ACCEPT)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+}
+
+fn trusted_edge_webchat_control_grants(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Vec<BrowserCallerGrant>, ()> {
+    // The reserved handoff header is ignored on TCP even if a bearer-authenticated
+    // client attempts to spoof it. Only the 0600 Unix IPC listener can elevate it.
+    if !state.trusted_extension_ipc {
+        return Ok(Vec::new());
+    }
+    let Some(raw) = headers.get(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER) else {
+        return Ok(Vec::new());
+    };
+    let text = raw.to_str().map_err(|_| ())?;
+    if text.len() > MAX_EDGE_WEBCHAT_CONTROL_GRANTS_HEADER_BYTES {
+        return Err(());
+    }
+    let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
+    let items = value.as_array().ok_or(())?;
+    if items.len() > 32 {
+        return Err(());
+    }
+    let mut grants = Vec::with_capacity(items.len());
+    for item in items {
+        let object = item.as_object().ok_or(())?;
+        if object.len() != 3
+            || !object.contains_key("endpoint_ref")
+            || !object.contains_key("provider")
+            || !object.contains_key("account_ref")
+        {
+            return Err(());
+        }
+        let endpoint_ref = object
+            .get("endpoint_ref")
+            .and_then(Value::as_str)
+            .ok_or(())?;
+        let provider = object.get("provider").and_then(Value::as_str).ok_or(())?;
+        let account_ref = object
+            .get("account_ref")
+            .and_then(Value::as_str)
+            .ok_or(())?;
+        if !valid_browser_grant_ref(endpoint_ref, 96)
+            || !valid_browser_grant_provider(provider)
+            || !valid_browser_grant_ref(account_ref, 96)
+        {
+            return Err(());
+        }
+        grants.push(BrowserCallerGrant {
+            endpoint_ref: endpoint_ref.to_owned(),
+            provider: provider.to_owned(),
+            account_ref: account_ref.to_owned(),
+        });
+    }
+    Ok(grants)
+}
+
+fn trusted_edge_runtime_generation_fence(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
+    let current = env::var("HERDR_MCP_RUNTIME_GENERATION").ok();
+    trusted_edge_runtime_generation_fence_with_current(state, headers, current.as_deref())
+}
+
+fn trusted_edge_runtime_generation_fence_with_current(
+    state: &AppState,
+    headers: &HeaderMap,
+    current_generation: Option<&str>,
+) -> Result<(), ()> {
+    if !state.trusted_extension_ipc || !headers.contains_key(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER) {
+        return Ok(());
+    }
+    let expected = headers
+        .get(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .ok_or(())?;
+    match current_generation.filter(|value| !value.is_empty()) {
+        Some(current) if current == expected => Ok(()),
+        _ => Err(()),
+    }
+}
+
+fn valid_browser_grant_ref(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+}
+
+fn valid_browser_grant_provider(value: &str) -> bool {
+    if value.is_empty() || value.len() > 32 {
+        return false;
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        })
 }
 
 fn request_authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -2917,11 +3045,70 @@ mod tests {
         assert!(!authorized(&HeaderMap::new(), b"secret"));
     }
 
+    #[test]
+    fn trusted_webchat_grant_generation_fence_is_predispatch_and_tcp_cannot_opt_in() {
+        let root = test_root("browser-grant-generation-fence");
+        let tcp_state = test_state(&root.join("tcp"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            EDGE_WEBCHAT_CONTROL_GRANTS_HEADER,
+            HeaderValue::from_static(
+                r#"[{"endpoint_ref":"be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","provider":"chatgpt","account_ref":"br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]"#,
+            ),
+        );
+        headers.insert(
+            EDGE_EXPECTED_RUNTIME_GENERATION_HEADER,
+            HeaderValue::from_static("rust-old"),
+        );
+        assert_eq!(
+            trusted_edge_runtime_generation_fence_with_current(
+                &tcp_state,
+                &headers,
+                Some("rust-new")
+            ),
+            Ok(()),
+            "ordinary TCP cannot activate the trusted generation-fence path"
+        );
+
+        let mut trusted_state = test_state(&root.join("trusted"));
+        trusted_state.trusted_extension_ipc = true;
+        assert_eq!(
+            trusted_edge_runtime_generation_fence_with_current(
+                &trusted_state,
+                &headers,
+                Some("rust-new")
+            ),
+            Err(())
+        );
+        assert_eq!(
+            trusted_edge_runtime_generation_fence_with_current(
+                &trusted_state,
+                &headers,
+                Some("rust-old")
+            ),
+            Ok(())
+        );
+        headers.remove(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER);
+        assert_eq!(
+            trusted_edge_runtime_generation_fence_with_current(
+                &trusted_state,
+                &headers,
+                Some("rust-old")
+            ),
+            Err(()),
+            "grant-bearing trusted IPC without a reserved generation fails closed"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn workstation_bearer_does_not_become_webchat_control_grant() {
+        let _env_guard = crate::test_env::lock();
+        let previous_generation = env::var_os("HERDR_MCP_RUNTIME_GENERATION");
+        unsafe { env::set_var("HERDR_MCP_RUNTIME_GENERATION", "rust-caller-grant-proof") };
         let root = test_root("browser-caller-grant-boundary");
         let state = test_state(&root);
-        let session_ref = {
+        let (endpoint_ref, account_ref, session_ref) = {
             let mut store = state.state_store.lock().unwrap();
             let endpoint = store
                 .register_browser_endpoint(BrowserEndpointRegistrationInput {
@@ -2976,28 +3163,42 @@ mod tests {
                     observed_at: 14,
                 })
                 .unwrap();
-            session.resource_ref
+            (
+                endpoint.endpoint_ref,
+                account.resource_ref,
+                session.resource_ref,
+            )
         };
 
-        let app = candidate_router(state);
-        let request = rpc_request(
+        let grant_header = serde_json::to_string(&json!([{
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "account_ref": account_ref,
+        }]))
+        .unwrap();
+        let body = json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"tools/call",
+            "params":{
+                "name":"herdr_call",
+                "arguments":{
+                    "method":"herdr_mcp.browser_session.inspect",
+                    "params": serde_json::to_string(&json!({"session_ref": session_ref})).unwrap()
+                }
+            }
+        });
+
+        let mut extension_state = state.clone();
+        extension_state.trusted_extension_ipc = true;
+        let tcp = candidate_router(state);
+        let spoofed_tcp = rpc_request(
             Method::POST,
             "/mcp",
-            Some(json!({
-                "jsonrpc":"2.0",
-                "id":1,
-                "method":"tools/call",
-                "params":{
-                    "name":"herdr_call",
-                    "arguments":{
-                        "method":"herdr_mcp.browser_session.inspect",
-                        "params": serde_json::to_string(&json!({"session_ref": session_ref})).unwrap()
-                    }
-                }
-            })),
-            &[],
+            Some(body.clone()),
+            &[(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER, grant_header.as_str())],
         );
-        let response = app.oneshot(request).await.unwrap();
+        let response = tcp.oneshot(spoofed_tcp).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let payload: Value = serde_json::from_slice(&bytes).unwrap();
@@ -3007,6 +3208,36 @@ mod tests {
         assert_eq!(local["actuation_available"], false);
         assert_eq!(local["actuation_reason"], "caller_grant_missing");
         assert!(!local.to_string().contains("native-session-hidden"));
+
+        let trusted = candidate_router(extension_state);
+        let trusted_request = rpc_request(
+            Method::POST,
+            "/mcp",
+            Some(body),
+            &[
+                (EDGE_WEBCHAT_CONTROL_GRANTS_HEADER, grant_header.as_str()),
+                (
+                    EDGE_EXPECTED_RUNTIME_GENERATION_HEADER,
+                    "rust-caller-grant-proof",
+                ),
+            ],
+        );
+        let response = trusted.oneshot(trusted_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = payload["result"]["content"][0]["text"].as_str().unwrap();
+        let local: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(local["ok"], true);
+        assert_eq!(local["actuation_available"], true);
+        assert!(local["actuation_reason"].is_null());
+        assert!(!local.to_string().contains("native-session-hidden"));
+        unsafe {
+            match previous_generation {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_GENERATION", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_GENERATION"),
+            }
+        }
         std::fs::remove_dir_all(root).ok();
     }
 
