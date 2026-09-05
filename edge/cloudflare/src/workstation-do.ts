@@ -1237,6 +1237,10 @@ export class WorkstationDO {
     this.notifyLinkAvailable();
 
     const now = Date.now();
+    const previousDisconnectedAtMs = this.session?.disconnectedAtMs;
+    const previousLastRecoveredAtMs = this.session?.lastRecoveredAtMs;
+    const previousLastReconnectDurationMs = this.session?.lastReconnectDurationMs;
+    const previousReconnectCount = this.session?.reconnectCount ?? 0;
     this.session = sessionFromClaims({
       workstationId: hello.workstation_id,
       linkVersion: hello.link_version,
@@ -1251,6 +1255,20 @@ export class WorkstationDO {
       contractEpoch: hello.runtime?.contract_epoch ?? undefined,
       capabilities: hello.capabilities,
     });
+    if (previousLastRecoveredAtMs !== undefined) {
+      this.session.lastRecoveredAtMs = previousLastRecoveredAtMs;
+    }
+    if (previousLastReconnectDurationMs !== undefined) {
+      this.session.lastReconnectDurationMs = previousLastReconnectDurationMs;
+    }
+    if (previousReconnectCount > 0) {
+      this.session.reconnectCount = previousReconnectCount;
+    }
+    if (previousDisconnectedAtMs !== undefined && previousDisconnectedAtMs <= now) {
+      this.session.lastRecoveredAtMs = now;
+      this.session.lastReconnectDurationMs = now - previousDisconnectedAtMs;
+      this.session.reconnectCount = previousReconnectCount + 1;
+    }
     await this.state.storage.put(KEY_SESSION, serializeSession(this.session));
     this.lastSeenPersistedAtMs = now;
 
@@ -1276,6 +1294,8 @@ export class WorkstationDO {
       workstationId: hello.workstation_id,
       linkVersion: hello.link_version,
       bootId: hello.boot_id,
+      reconnectDurationMs: this.session.lastReconnectDurationMs,
+      reconnectCount: this.session.reconnectCount ?? 0,
     });
   }
 
