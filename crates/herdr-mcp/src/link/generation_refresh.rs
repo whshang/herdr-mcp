@@ -143,6 +143,10 @@ pub(crate) fn reconcile_after_service_generation_change(
                 }
                 Ok(())
             },
+            || {
+                read_loaded_prod_generation()
+                    .map(|loaded| loaded.as_deref() == Some(generation.as_str()))
+            },
             || restart_prod_link_for_generation(&launchd, &prod_plist_path, &generation),
             |budget| wait_for_active_generation(&status_path, &generation, budget),
             || read_convergence_evidence(&control_path, &status_path),
@@ -425,10 +429,18 @@ fn read_optional_json(path: &Path) -> Result<Option<Value>, String> {
     Ok(Some(value))
 }
 
-fn converge_active_generation_with_fallback<Reconcile, VerifyOwnership, Restart, Wait, Probe>(
+fn converge_active_generation_with_fallback<
+    Reconcile,
+    VerifyOwnership,
+    LoadedGenerationMatches,
+    Restart,
+    Wait,
+    Probe,
+>(
     generation: &str,
     mut reconcile: Reconcile,
     mut verify_ownership: VerifyOwnership,
+    mut loaded_generation_matches: LoadedGenerationMatches,
     mut restart: Restart,
     mut wait: Wait,
     mut probe: Probe,
@@ -436,6 +448,7 @@ fn converge_active_generation_with_fallback<Reconcile, VerifyOwnership, Restart,
 where
     Reconcile: FnMut() -> Result<(), String>,
     VerifyOwnership: FnMut() -> Result<(), String>,
+    LoadedGenerationMatches: FnMut() -> Result<bool, String>,
     Restart: FnMut() -> Result<(), String>,
     Wait: FnMut(Duration) -> Result<(), String>,
     Probe: FnMut() -> Result<ConvergenceEvidence, String>,
@@ -450,7 +463,13 @@ where
             reconcile()?;
         }
         match wait(wait_slice) {
-            Ok(()) => return Ok(()),
+            Ok(()) if loaded_generation_matches()? => return Ok(()),
+            Ok(()) => {
+                last_error = Some(format!(
+                    "runtime-control activated {generation}, but the loaded production Link process is still from an older generation"
+                ));
+                break;
+            }
             Err(error) => last_error = Some(error),
         }
     }
@@ -495,7 +514,13 @@ where
             "production Link did not activate generation {generation} after bounded restart: {error}; prior={}",
             last_error.as_deref().unwrap_or("unknown")
         )
-    })
+    })?;
+    if !loaded_generation_matches()? {
+        return Err(format!(
+            "production Link runtime-control activated {generation}, but the reloaded Link process still reports an older launchd generation"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1154,6 +1179,7 @@ mod tests {
                 Ok(())
             },
             || Ok(()),
+            || Ok(true),
             || launchd.kickstart_prod(LINK_PROD_LABEL),
             |_| {
                 waits += 1;
@@ -1165,6 +1191,47 @@ mod tests {
         assert_eq!(waits, 1);
         assert_eq!(reconciles, 0);
         assert!(launchd.kickstarts().is_empty());
+    }
+
+    #[test]
+    fn active_runtime_control_with_stale_loaded_binary_reloads_link_once() {
+        let reloaded = std::cell::Cell::new(false);
+        let restarts = std::cell::Cell::new(0_u32);
+        let mut reconciles = 0;
+        converge_active_generation_with_fallback(
+            "rust-new",
+            || {
+                reconciles += 1;
+                Ok(())
+            },
+            || Ok(()),
+            || Ok(reloaded.get()),
+            || {
+                restarts.set(restarts.get() + 1);
+                reloaded.set(true);
+                Ok(())
+            },
+            |_| Ok(()),
+            || {
+                Ok(ConvergenceEvidence {
+                    control_desired: Some("rust-new".to_owned()),
+                    control_revision: Some(2),
+                    status_processed_revision: Some(2),
+                    status_outcome: Some("activated".to_owned()),
+                    active_generation: Some("rust-new".to_owned()),
+                    transition_seq: Some(2),
+                    last_transition_to: Some("rust-new".to_owned()),
+                    last_transition_outcome: Some("activated".to_owned()),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(restarts.get(), 1);
+        assert!(reloaded.get());
+        assert_eq!(
+            reconciles, 1,
+            "post-reload control state is reconciled once"
+        );
     }
 
     #[test]
@@ -1180,6 +1247,7 @@ mod tests {
                 Ok(())
             },
             || Ok(()),
+            || Ok(true),
             || launchd.kickstart_prod(LINK_PROD_LABEL),
             |_| {
                 waits += 1;
@@ -1217,6 +1285,7 @@ mod tests {
             "rust-new",
             || Ok(()),
             || Err("ownership changed".to_owned()),
+            || Ok(true),
             || -> Result<(), String> { panic!("restart must not run after ownership drift") },
             |_| Err("still stale".to_owned()),
             || Ok(ConvergenceEvidence::default()),
@@ -1237,6 +1306,7 @@ mod tests {
                 Ok(())
             },
             || Ok(()),
+            || Ok(true),
             || launchd.kickstart_prod(LINK_PROD_LABEL),
             |_| Err("still stale".to_owned()),
             // Missing/unparseable evidence is a stall, not a direction verdict;

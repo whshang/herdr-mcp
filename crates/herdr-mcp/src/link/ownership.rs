@@ -573,16 +573,20 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
     let rust_cli_has_link_run = crate::link::LINK_RUN_WIRED;
     let gates =
         evaluate_production_ready_gates(home, config_dir, &prod, &link, rust_cli_has_link_run);
-    let all_ok = gates.iter().all(|gate| gate.ok);
+    // runtime-control can hot-switch the local request target without replacing
+    // the long-lived Link executable. A stale loaded launchd generation means
+    // the data plane is still running old Link code even when active=current.
+    let all_ok = gates.iter().all(|gate| gate.ok) && !loaded_environment_stale;
     // User/data-plane readiness must not depend on the maintainer release
     // gates. `operational_ready` is true when the ordinary operational path is
     // healthy; `cutover_sealed` additionally requires the auditable link seal
     // and dual-verification UAT evidence. Keep `production_ready_eligible` for
     // backward compatibility (it is the maintainer cutover gate).
-    let operational_ready = gates
-        .iter()
-        .filter(|gate| gate.category == GateCategory::DataPlane)
-        .all(|gate| gate.ok);
+    let operational_ready = !loaded_environment_stale
+        && gates
+            .iter()
+            .filter(|gate| gate.category == GateCategory::DataPlane)
+            .all(|gate| gate.ok);
     let cutover_sealed = all_ok;
     let cutover_pending = !all_ok && operational_ready;
     let production_owner = if prod.implementation == LinkImplementation::Rust && prod.loaded {
@@ -674,7 +678,9 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
             "cutover_pending": cutover_pending,
             "data_plane_gates": operational_gate_ids(&gates),
             "maintainer_cutover_gates": maintainer_gate_ids(&gates),
-            "next_action": if operational_ready && cutover_pending {
+            "next_action": if loaded_environment_stale {
+                "Production Link process is stale relative to runtime/current; reload the owned link-prod before treating the data plane as ready"
+            } else if operational_ready && cutover_pending {
                 "Operation is healthy; production cutover still needs the maintainer link seal + dual-UAT evidence (see docs/link-production-cutover.md)"
             } else if operational_ready {
                 "Operation is ready; no maintainer action required for ordinary use"
