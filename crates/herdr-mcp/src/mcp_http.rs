@@ -1788,6 +1788,9 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             prompt: &blocking_state.prompt,
             skill: &blocking_state.skill,
             state_store: &blocking_state.state_store,
+            // The local bearer authenticates the workstation transport only. A business
+            // WebChat-control grant must arrive through a separately authenticated handoff.
+            caller_webchat_control_granted: false,
         };
         mcp::handle(&blocking_request, &context)
     })
@@ -2551,6 +2554,99 @@ mod tests {
         assert!(authorized(&headers, b"secret"));
         assert!(!authorized(&headers, b"other"));
         assert!(!authorized(&HeaderMap::new(), b"secret"));
+    }
+
+    #[tokio::test]
+    async fn workstation_bearer_does_not_become_webchat_control_grant() {
+        let root = test_root("browser-caller-grant-boundary");
+        let state = test_state(&root);
+        let session_ref = {
+            let mut store = state.state_store.lock().unwrap();
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "caller-grant-boundary-profile",
+                    browser_family: "chrome",
+                    extension_version: "0.1.90",
+                    observed_at: 10,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["identity.inspect","session.inspect"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "native-account-hidden",
+                    display_label: Some("Work"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "native-session-hidden",
+                    display_label: Some("Conversation"),
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            store
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 14,
+                })
+                .unwrap();
+            session.resource_ref
+        };
+
+        let app = candidate_router(state);
+        let request = rpc_request(
+            Method::POST,
+            "/mcp",
+            Some(json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{
+                    "name":"herdr_call",
+                    "arguments":{
+                        "method":"herdr_mcp.browser_session.inspect",
+                        "params": serde_json::to_string(&json!({"session_ref": session_ref})).unwrap()
+                    }
+                }
+            })),
+            &[],
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = payload["result"]["content"][0]["text"].as_str().unwrap();
+        let local: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(local["ok"], true);
+        assert_eq!(local["actuation_available"], false);
+        assert_eq!(local["actuation_reason"], "caller_grant_missing");
+        assert!(!local.to_string().contains("native-session-hidden"));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]

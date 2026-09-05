@@ -40,6 +40,7 @@ pub struct RuntimeContext<'a> {
     pub prompt: &'a PromptRegistry,
     pub skill: &'a SkillService,
     pub state_store: &'a std::sync::Arc<std::sync::Mutex<StateStore>>,
+    pub caller_webchat_control_granted: bool,
 }
 
 pub fn handle(request: &Value, context: &RuntimeContext<'_>) -> Option<Value> {
@@ -192,11 +193,21 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
             } else if BrowserOperation::parse(method).is_some() {
-                browser_operation_call(context.state_store, method, &params)
+                browser_operation_call_with_grant(
+                    context.state_store,
+                    method,
+                    &params,
+                    context.caller_webchat_control_granted,
+                )
             } else if method.starts_with("herdr_mcp.browser_endpoint.")
                 || method.starts_with("herdr_mcp.browser_resource.")
             {
-                browser_registry_call(context.state_store, method, &params)
+                browser_registry_call_with_grant(
+                    context.state_store,
+                    method,
+                    &params,
+                    context.caller_webchat_control_granted,
+                )
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
             } else {
@@ -1084,12 +1095,46 @@ impl BrowserOperation {
             Self::DispatchStop => "herdr_mcp.browser_dispatch.stop",
         }
     }
+
+    fn is_mutation(self) -> bool {
+        !matches!(
+            self,
+            Self::SpaceInspect | Self::SessionInspect | Self::DispatchStatus
+        )
+    }
+
+    fn capability_operation(self) -> &'static str {
+        match self {
+            Self::SpaceCreate => "space.create",
+            Self::SpaceOpen => "space.open",
+            Self::SpaceInspect => "space.inspect",
+            Self::SessionCreate => "session.create",
+            Self::SessionOpen => "session.open",
+            Self::SessionInspect => "session.inspect",
+            Self::MessageAppend => "message.append",
+            Self::ComposerSetReasoning => "composer.set_reasoning",
+            Self::ComposerSetApps => "composer.select_tool",
+            Self::DispatchSubmit => "composer.submit",
+            Self::DispatchStatus => "generation.status",
+            Self::DispatchStop => "generation.stop",
+        }
+    }
 }
 
+#[cfg(test)]
 fn browser_operation_call(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     method: &str,
     params: &Value,
+) -> Value {
+    browser_operation_call_with_grant(store, method, params, false)
+}
+
+fn browser_operation_call_with_grant(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    method: &str,
+    params: &Value,
+    caller_webchat_control_granted: bool,
 ) -> Value {
     let Some(operation) = BrowserOperation::parse(method) else {
         return json!({"ok": false, "code": "unknown_local_method", "method": method});
@@ -1104,13 +1149,50 @@ fn browser_operation_call(
         return error;
     }
 
+    if operation.is_mutation() {
+        let Ok(store_guard) = store.lock() else {
+            return json!({"ok": false, "code": "browser_operation_store_unavailable"});
+        };
+        match browser_operation_actuation_decision(
+            &store_guard,
+            operation,
+            params,
+            caller_webchat_control_granted,
+        ) {
+            Ok((true, None)) => {}
+            Ok((false, Some(reason))) => {
+                return json!({
+                    "ok": false,
+                    "code": reason,
+                    "actuation_available": false,
+                });
+            }
+            Ok(_) => {
+                return json!({
+                    "ok": false,
+                    "code": "capability_unknown",
+                    "actuation_available": false,
+                });
+            }
+            Err(error) => return browser_store_error(error),
+        }
+    }
+
     match operation {
-        BrowserOperation::SpaceInspect => {
-            browser_operation_inspect_resource(store, params, "space")
-        }
-        BrowserOperation::SessionInspect => {
-            browser_operation_inspect_resource(store, params, "session")
-        }
+        BrowserOperation::SpaceInspect => browser_operation_inspect_resource(
+            store,
+            params,
+            "space",
+            operation,
+            caller_webchat_control_granted,
+        ),
+        BrowserOperation::SessionInspect => browser_operation_inspect_resource(
+            store,
+            params,
+            "session",
+            operation,
+            caller_webchat_control_granted,
+        ),
         BrowserOperation::DispatchStatus => {
             let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
             let Ok(store) = store.lock() else {
@@ -1323,6 +1405,166 @@ fn browser_reject_forbidden_input(object: &serde_json::Map<String, Value>) -> Op
         .map(|key| json!({"ok": false, "code": "browser_forbidden_input", "field": key}))
 }
 
+fn browser_operation_actuation_decision(
+    store: &StateStore,
+    operation: BrowserOperation,
+    params: &Value,
+    caller_webchat_control_granted: bool,
+) -> Result<(bool, Option<&'static str>), String> {
+    let target = match operation {
+        BrowserOperation::SpaceCreate => {
+            let resource = browser_operation_resource(
+                store,
+                params.get("account_ref").and_then(Value::as_str).unwrap(),
+                "account",
+            )?;
+            if resource.endpoint_ref != params.get("endpoint_ref").and_then(Value::as_str).unwrap()
+                || resource.provider != params.get("provider").and_then(Value::as_str).unwrap()
+            {
+                return Err("browser_resource_scope_mismatch".to_owned());
+            }
+            resource
+        }
+        BrowserOperation::SessionCreate => {
+            let account_ref = params.get("account_ref").and_then(Value::as_str).unwrap();
+            let resource = browser_operation_resource(store, account_ref, "account")?;
+            if resource.endpoint_ref != params.get("endpoint_ref").and_then(Value::as_str).unwrap()
+                || resource.provider != params.get("provider").and_then(Value::as_str).unwrap()
+            {
+                return Err("browser_resource_scope_mismatch".to_owned());
+            }
+            if let Some(space_ref) = params.get("space_ref").and_then(Value::as_str) {
+                let space = browser_operation_resource(store, space_ref, "space")?;
+                if space.endpoint_ref != resource.endpoint_ref
+                    || space.provider != resource.provider
+                    || space.parent_ref.as_deref() != Some(account_ref)
+                {
+                    return Err("browser_resource_scope_mismatch".to_owned());
+                }
+                if space.observation_generation != resource.observation_generation {
+                    return Ok((false, Some("stale_capability_generation")));
+                }
+            }
+            resource
+        }
+        BrowserOperation::SpaceOpen => browser_operation_resource(
+            store,
+            params.get("space_ref").and_then(Value::as_str).unwrap(),
+            "space",
+        )?,
+        BrowserOperation::SessionOpen
+        | BrowserOperation::MessageAppend
+        | BrowserOperation::ComposerSetReasoning
+        | BrowserOperation::ComposerSetApps
+        | BrowserOperation::DispatchSubmit => browser_operation_resource(
+            store,
+            params.get("session_ref").and_then(Value::as_str).unwrap(),
+            "session",
+        )?,
+        BrowserOperation::DispatchStop => {
+            let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
+            let dispatch = store
+                .browser_dispatch(dispatch_id)?
+                .ok_or_else(|| "browser_dispatch_not_found".to_owned())?;
+            let resource =
+                browser_operation_resource(store, &dispatch.target_session_ref, "session")?;
+            if resource.endpoint_ref != dispatch.endpoint_ref
+                || resource.provider != dispatch.provider
+            {
+                return Err("browser_dispatch_scope_mismatch".to_owned());
+            }
+            resource
+        }
+        BrowserOperation::SpaceInspect
+        | BrowserOperation::SessionInspect
+        | BrowserOperation::DispatchStatus => {
+            return Err("browser_operation_not_mutating".to_owned());
+        }
+    };
+
+    browser_resource_actuation_decision(
+        store,
+        operation.capability_operation(),
+        &target,
+        caller_webchat_control_granted,
+        params.get("expected_generation").and_then(Value::as_i64),
+    )
+}
+
+fn browser_operation_resource(
+    store: &StateStore,
+    resource_ref: &str,
+    expected_kind: &str,
+) -> Result<crate::state_store::BrowserResourceRecord, String> {
+    let resource = store
+        .browser_resource(resource_ref)?
+        .ok_or_else(|| "browser_resource_not_found".to_owned())?;
+    if resource.kind != expected_kind {
+        return Err("browser_resource_kind_mismatch".to_owned());
+    }
+    Ok(resource)
+}
+
+fn browser_resource_actuation_decision(
+    store: &StateStore,
+    capability_operation: &str,
+    resource: &crate::state_store::BrowserResourceRecord,
+    caller_webchat_control_granted: bool,
+    expected_generation: Option<i64>,
+) -> Result<(bool, Option<&'static str>), String> {
+    if !caller_webchat_control_granted {
+        return Ok((false, Some("caller_grant_missing")));
+    }
+
+    // Alpha 4 factor 2 is intentionally the literal true; there is no policy state or branch here.
+
+    let endpoint = store
+        .browser_endpoint(&resource.endpoint_ref)?
+        .ok_or_else(|| "browser_endpoint_not_found".to_owned())?;
+    if !endpoint.webchat_control_allowed {
+        return Ok((false, Some("local_consent_off")));
+    }
+
+    let Some(provider_state) =
+        store.browser_provider_state(&resource.endpoint_ref, &resource.provider)?
+    else {
+        return Ok((false, Some("capability_unknown")));
+    };
+    if expected_generation.is_some_and(|value| value != provider_state.observation_generation)
+        || resource.observation_generation != provider_state.observation_generation
+    {
+        return Ok((false, Some("stale_capability_generation")));
+    }
+
+    let Some(allowed) =
+        browser_capability_snapshot_allows(&provider_state.capabilities_json, capability_operation)
+    else {
+        return Ok((false, Some("capability_unknown")));
+    };
+    if !allowed {
+        return Ok((false, Some("capability_not_allowed")));
+    }
+    Ok((true, None))
+}
+
+fn browser_capability_snapshot_allows(capabilities_json: &str, operation: &str) -> Option<bool> {
+    let parsed = serde_json::from_str::<Value>(capabilities_json).ok()?;
+    let object = parsed.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let operations = object.get("operations")?.as_array()?;
+    if operations.iter().any(|value| value.as_str().is_none()) {
+        return None;
+    }
+    Some(
+        operations
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|candidate| candidate == operation),
+    )
+}
+
 fn browser_required_generation(params: &Value) -> Result<i64, Value> {
     match params.get("expected_generation").and_then(Value::as_i64) {
         Some(value) if value >= 1 => Ok(value),
@@ -1397,6 +1639,8 @@ fn browser_operation_inspect_resource(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
     kind: &str,
+    operation: BrowserOperation,
+    caller_webchat_control_granted: bool,
 ) -> Value {
     let Ok(store) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
@@ -1420,11 +1664,24 @@ fn browser_operation_inspect_resource(
         store.browser_resource(params.get("session_ref").and_then(Value::as_str).unwrap())
     };
     match resource {
-        Ok(Some(resource)) if resource.kind == kind => json!({
-            "ok": true,
-            "resource": browser_resource_json(resource),
-            "actuation_available": false,
-        }),
+        Ok(Some(resource)) if resource.kind == kind => {
+            let (actuation_available, actuation_reason) = match browser_resource_actuation_decision(
+                &store,
+                operation.capability_operation(),
+                &resource,
+                caller_webchat_control_granted,
+                None,
+            ) {
+                Ok(decision) => decision,
+                Err(error) => return browser_store_error(error),
+            };
+            json!({
+                "ok": true,
+                "resource": browser_resource_json(resource),
+                "actuation_available": actuation_available,
+                "actuation_reason": actuation_reason,
+            })
+        }
         Ok(Some(_)) | Ok(None) => json!({"ok": false, "code": "browser_resource_not_found"}),
         Err(error) => browser_store_error(error),
     }
@@ -1449,10 +1706,20 @@ fn browser_dispatch_json(dispatch: crate::state_store::BrowserDispatchRecord) ->
     })
 }
 
+#[cfg(test)]
 fn browser_registry_call(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     method: &str,
     params: &Value,
+) -> Value {
+    browser_registry_call_with_grant(store, method, params, false)
+}
+
+fn browser_registry_call_with_grant(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    method: &str,
+    params: &Value,
+    caller_webchat_control_granted: bool,
 ) -> Value {
     let Some(object) = params.as_object() else {
         return json!({"ok": false, "code": "browser_registry_params_invalid"});
@@ -1568,11 +1835,33 @@ fn browser_registry_call(
                             "tool_bridge_workstation_mutation": false,
                             "revision": 0,
                         }));
+                    let capability_operation = match resource.kind.as_str() {
+                        "account" => "identity.inspect",
+                        "space" => "space.inspect",
+                        "session" => "session.inspect",
+                        _ => "",
+                    };
+                    let (actuation_available, actuation_reason) = if capability_operation.is_empty()
+                    {
+                        (false, Some("capability_unknown"))
+                    } else {
+                        match browser_resource_actuation_decision(
+                            &store,
+                            capability_operation,
+                            &resource,
+                            caller_webchat_control_granted,
+                            None,
+                        ) {
+                            Ok(decision) => decision,
+                            Err(error) => return browser_store_error(error),
+                        }
+                    };
                     json!({
                         "ok": true,
                         "resource": browser_resource_json(resource),
                         "consent": consent,
-                        "actuation_available": false,
+                        "actuation_available": actuation_available,
+                        "actuation_reason": actuation_reason,
                     })
                 }
                 Ok(None) => json!({"ok": false, "code": "browser_resource_not_found"}),
@@ -1651,11 +1940,33 @@ fn browser_registry_call(
                             "tool_bridge_workstation_mutation": false,
                             "revision": 0,
                         }));
+                    let capability_operation = match resource.kind.as_str() {
+                        "account" => "identity.inspect",
+                        "space" => "space.inspect",
+                        "session" => "session.inspect",
+                        _ => "",
+                    };
+                    let (actuation_available, actuation_reason) = if capability_operation.is_empty()
+                    {
+                        (false, Some("capability_unknown"))
+                    } else {
+                        match browser_resource_actuation_decision(
+                            &store,
+                            capability_operation,
+                            &resource,
+                            caller_webchat_control_granted,
+                            expected_observation_generation,
+                        ) {
+                            Ok(decision) => decision,
+                            Err(error) => return browser_store_error(error),
+                        }
+                    };
                     json!({
                         "ok": true,
                         "resource": browser_resource_json(resource),
                         "consent": consent,
-                        "actuation_available": false,
+                        "actuation_available": actuation_available,
+                        "actuation_reason": actuation_reason,
                     })
                 }
                 Err(error) => browser_store_error(error),
@@ -2741,6 +3052,195 @@ mod tests {
             }),
         );
         assert_eq!(arbitrary_json["code"], "browser_operation_params_invalid");
+    }
+
+    #[test]
+    fn browser_actuation_intersection_fails_closed_with_stable_reasons() {
+        use crate::state_store::{
+            BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
+            BrowserProviderObservationInput, BrowserResourceObservationInput,
+            BrowserResourceRecord,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (endpoint_ref, account_ref, session_ref) = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "alpha4-actuation-profile-seed",
+                    browser_family: "chrome",
+                    extension_version: "0.1.90",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["identity.inspect","session.inspect","composer.submit"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "native-account-hidden",
+                    display_label: Some("Work"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "native-session-hidden",
+                    display_label: Some("Conversation"),
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            (
+                endpoint.endpoint_ref,
+                account.resource_ref,
+                session.resource_ref,
+            )
+        };
+
+        let dispatch_params = json!({
+            "session_ref": session_ref,
+            "message": "ship it",
+            "expected_generation": 7,
+            "idempotency_key": "actuation-dispatch-1"
+        });
+
+        let missing_grant = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &dispatch_params,
+            false,
+        );
+        assert_eq!(missing_grant["code"], "caller_grant_missing");
+
+        let remote_consent = browser_registry_call_with_grant(
+            &store,
+            "herdr_mcp.browser_endpoint.consent",
+            &json!({"endpoint_ref": endpoint_ref, "webchat_control": true}),
+            true,
+        );
+        assert_eq!(remote_consent["code"], "unknown_local_method");
+        assert!(
+            !store
+                .lock()
+                .unwrap()
+                .browser_endpoint(&endpoint_ref)
+                .unwrap()
+                .unwrap()
+                .webchat_control_allowed
+        );
+
+        let local_consent_off = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &dispatch_params,
+            true,
+        );
+        assert_eq!(local_consent_off["code"], "local_consent_off");
+
+        store
+            .lock()
+            .unwrap()
+            .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                endpoint_ref: &endpoint_ref,
+                expected_revision: 0,
+                webchat_control_allowed: true,
+                tool_bridge_allowed: false,
+                tool_bridge_mutation_allowed: false,
+                observed_at: 14,
+            })
+            .unwrap();
+
+        let inspect = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_session.inspect",
+            &json!({"session_ref": session_ref}),
+            true,
+        );
+        assert_eq!(inspect["ok"], true);
+        assert_eq!(inspect["actuation_available"], true);
+        assert!(inspect["actuation_reason"].is_null());
+
+        let all_factors_true = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &dispatch_params,
+            true,
+        );
+        assert_eq!(all_factors_true["code"], "resource_unavailable");
+
+        let capability_not_allowed = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_composer.set_reasoning",
+            &json!({
+                "session_ref": session_ref,
+                "reasoning_effort": "balanced",
+                "expected_generation": 7,
+                "idempotency_key": "actuation-reasoning-1"
+            }),
+            true,
+        );
+        assert_eq!(capability_not_allowed["code"], "capability_not_allowed");
+
+        let unknown_resource = BrowserResourceRecord {
+            resource_ref: format!("br_{}", "f".repeat(64)),
+            endpoint_ref: endpoint_ref.clone(),
+            provider: "missing-provider".to_owned(),
+            kind: "session".to_owned(),
+            parent_ref: Some(account_ref),
+            native_identity_sha256: "0".repeat(64),
+            display_label: None,
+            observation_generation: 7,
+            first_observed_at: 15,
+            last_observed_at: 15,
+        };
+        let capability_unknown = browser_resource_actuation_decision(
+            &store.lock().unwrap(),
+            "session.inspect",
+            &unknown_resource,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(capability_unknown, (false, Some("capability_unknown")));
+
+        store
+            .lock()
+            .unwrap()
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 8,
+                capabilities_json: r#"{"operations":["identity.inspect","session.inspect","composer.submit"]}"#,
+                observed_at: 16,
+            })
+            .unwrap();
+        let stale = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &dispatch_params,
+            true,
+        );
+        assert_eq!(stale["code"], "stale_capability_generation");
     }
 
     #[test]
