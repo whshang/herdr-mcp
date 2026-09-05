@@ -1,6 +1,18 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpSection {
+    General,
+    Worker,
+    Connector,
+    Automation,
+    Instance,
+    Qualification,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    Help,
+    Help {
+        section: HelpSection,
+    },
     Version,
     Status,
     Doctor,
@@ -14,6 +26,8 @@ pub enum Command {
         probe: bool,
     },
     Config(ConfigCommand),
+    Instance(InstanceCommand),
+    Qualification(QualificationCommand),
     Worker(WorkerCommand),
     Dev(DevCommand),
     Candidate {
@@ -80,6 +94,7 @@ pub enum ConfigCommand {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum WorkerCommand {
+    List,
     Pair {
         ttl_seconds: u64,
         name: Option<String>,
@@ -97,9 +112,37 @@ pub enum WorkerCommand {
     ConnectorApprove {
         request_id: String,
     },
+    ConnectorList,
     ConnectorRevoke {
+        connector_id: String,
+    },
+    ConnectorClientRevoke {
         client_id: String,
     },
+    AutomationCreate {
+        name: String,
+        device: String,
+    },
+    AutomationList,
+    AutomationRotate {
+        client_id: String,
+    },
+    AutomationRevoke {
+        client_id: String,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum InstanceCommand {
+    List,
+    Reap { name: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum QualificationCommand {
+    Lock,
+    Unlock,
+    Status,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -175,6 +218,9 @@ where
     let args = args.into_iter().collect::<Vec<_>>();
     let (instance, args) = strip_instance_flag(&args)?;
     let command = parse_command(&args)?;
+    if instance.is_some() && matches!(command, Command::Instance(_)) {
+        return Err("--instance cannot be combined with instance list/reap".to_owned());
+    }
     Ok(Parsed { instance, command })
 }
 
@@ -217,11 +263,18 @@ fn strip_instance_flag(args: &[String]) -> Result<(Option<String>, Vec<String>),
 
 fn parse_command(args: &[String]) -> Result<Command, String> {
     let Some(command) = args.first().map(String::as_str) else {
-        return Ok(Command::Help);
+        return Ok(Command::Help {
+            section: HelpSection::General,
+        });
     };
 
     match command {
-        "help" | "-h" | "--help" => no_extra(args, Command::Help),
+        "help" | "-h" | "--help" => no_extra(
+            args,
+            Command::Help {
+                section: HelpSection::General,
+            },
+        ),
         "version" | "-V" | "--version" => no_extra(args, Command::Version),
         "install" => no_extra(
             args,
@@ -240,9 +293,12 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "uninstall" => no_extra(args, Command::Uninstall),
         "reinstall" => no_extra(args, Command::Reinstall),
         "config" => parse_config(&args[1..]),
+        "instance" => parse_instance(&args[1..]),
+        "qualification" => parse_qualification(&args[1..]),
         "worker" => parse_worker(&args[1..]),
         "device" => parse_device_alias(&args[1..]),
         "connector" => parse_connector(&args[1..]),
+        "automation" => parse_automation(&args[1..]),
         "dev" => parse_dev(&args[1..]),
         "candidate" => parse_candidate(&args[1..]),
         "service" => parse_service(&args[1..]),
@@ -253,6 +309,53 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "artifact" => parse_artifact(&args[1..]),
         "link" => parse_link(&args[1..]),
         value => Err(format!("unknown command '{value}'\n\n{}", help())),
+    }
+}
+
+fn parse_instance(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
+        Some("--help" | "-h") => Ok(Command::Help {
+            section: HelpSection::Instance,
+        }),
+        Some("list") if args.len() == 1 => Ok(Command::Instance(InstanceCommand::List)),
+        Some("reap") => {
+            let [name, confirm] = &args[1..] else {
+                return Err("instance reap requires: <name> --confirm".to_owned());
+            };
+            let id = crate::instance::InstanceId::parse(name)?;
+            if !id.is_named() {
+                return Err("the default instance cannot be reaped".to_owned());
+            }
+            if confirm != "--confirm" {
+                return Err("instance reap requires --confirm".to_owned());
+            }
+            Ok(Command::Instance(InstanceCommand::Reap {
+                name: name.clone(),
+            }))
+        }
+        Some(value) => Err(format!(
+            "unknown instance command '{value}' (expected list or reap)"
+        )),
+        None => Err("instance requires list or reap".to_owned()),
+    }
+}
+
+fn parse_qualification(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
+        Some("--help" | "-h") => Ok(Command::Help {
+            section: HelpSection::Qualification,
+        }),
+        Some("lock") if args.len() == 1 => Ok(Command::Qualification(QualificationCommand::Lock)),
+        Some("unlock") if args.len() == 1 => {
+            Ok(Command::Qualification(QualificationCommand::Unlock))
+        }
+        Some("status") if args.len() == 1 => {
+            Ok(Command::Qualification(QualificationCommand::Status))
+        }
+        Some(value) => Err(format!(
+            "unknown qualification command '{value}' (expected lock, unlock, or status)"
+        )),
+        None => Err("qualification requires lock, unlock, or status".to_owned()),
     }
 }
 
@@ -512,31 +615,43 @@ fn parse_link_migrate_runtime_control(args: &[String]) -> Result<Command, String
 
 fn parse_worker(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
+        Some("--help" | "-h") => Ok(Command::Help {
+            section: HelpSection::Worker,
+        }),
+        Some("list") if args.len() == 1 => Ok(Command::Worker(WorkerCommand::List)),
         Some("pair") => parse_worker_pair(&args[1..]),
         Some("connect") => parse_worker_connect(&args[1..]),
         Some("rename") => parse_worker_rename(&args[1..]),
         Some("revoke") => parse_worker_revoke(&args[1..]),
         Some(value) => Err(format!(
-            "unknown worker command '{value}' (expected pair, connect, rename, or revoke)"
+            "unknown worker command '{value}' (expected list, pair, connect, rename, or revoke)"
         )),
-        None => Err("worker requires pair, connect, rename, or revoke".to_owned()),
+        None => Err("worker requires list, pair, connect, rename, or revoke".to_owned()),
     }
 }
 
 fn parse_device_alias(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
+        Some("--help" | "-h") => Ok(Command::Help {
+            section: HelpSection::Worker,
+        }),
+        Some("list") if args.len() == 1 => Ok(Command::Worker(WorkerCommand::List)),
         Some("pair") => parse_worker_pair(&args[1..]),
         Some("rename") => parse_worker_rename(&args[1..]),
         Some("revoke") => parse_worker_revoke(&args[1..]),
         Some(value) => Err(format!(
-            "device '{value}' is not implemented yet; supported commands are pair, rename, and revoke"
+            "device '{value}' is not implemented yet; supported commands are list, pair, rename, and revoke"
         )),
-        None => Err("device requires pair, rename, or revoke".to_owned()),
+        None => Err("device requires list, pair, rename, or revoke".to_owned()),
     }
 }
 
 fn parse_connector(args: &[String]) -> Result<Command, String> {
     match args.first().map(String::as_str) {
+        Some("--help" | "-h") => Ok(Command::Help {
+            section: HelpSection::Connector,
+        }),
+        Some("list") if args.len() == 1 => Ok(Command::Worker(WorkerCommand::ConnectorList)),
         Some("approve") => {
             let [request_id] = &args[1..] else {
                 return Err("connector approve requires exactly one approval request id; the 6-digit code is entered interactively".to_owned());
@@ -550,23 +665,163 @@ fn parse_connector(args: &[String]) -> Result<Command, String> {
             }))
         }
         Some("revoke") => {
-            let [client_id, confirm] = &args[1..] else {
-                return Err("connector revoke requires: <client-id> --confirm".to_owned());
+            let [connector_id, confirm] = &args[1..] else {
+                return Err(
+                    "connector revoke requires: <connector-id> --confirm (connector ids begin with conn_)"
+                        .to_owned(),
+                );
             };
-            if client_id.starts_with('-') || client_id.trim().is_empty() || client_id.len() > 4096 {
-                return Err("connector revoke requires a valid client id".to_owned());
-            }
+            validate_connector_id(connector_id)?;
             if confirm != "--confirm" {
                 return Err("connector revoke requires --confirm".to_owned());
             }
             Ok(Command::Worker(WorkerCommand::ConnectorRevoke {
+                connector_id: connector_id.clone(),
+            }))
+        }
+        Some("revoke-client") => {
+            let [client_id, confirm] = &args[1..] else {
+                return Err("connector revoke-client requires: <client-id> --confirm".to_owned());
+            };
+            let client_id = client_id.trim();
+            if client_id.is_empty() || client_id.starts_with('-') || client_id.len() > 4096 {
+                return Err("connector revoke-client requires a valid client id".to_owned());
+            }
+            if confirm != "--confirm" {
+                return Err("connector revoke-client requires --confirm because all credentials for that client are invalidated immediately".to_owned());
+            }
+            Ok(Command::Worker(WorkerCommand::ConnectorClientRevoke {
+                client_id: client_id.to_owned(),
+            }))
+        }
+        Some(value) => Err(format!(
+            "unknown connector command '{value}' (expected list, approve, revoke, or revoke-client)"
+        )),
+        None => Err("connector requires list, approve, revoke, or revoke-client".to_owned()),
+    }
+}
+
+fn parse_automation(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
+        Some("--help" | "-h") => Ok(Command::Help {
+            section: HelpSection::Automation,
+        }),
+        Some("create") => parse_automation_create(&args[1..]),
+        Some("list") if args.len() == 1 => Ok(Command::Worker(WorkerCommand::AutomationList)),
+        Some("rotate") => {
+            let [client_id, confirm] = &args[1..] else {
+                return Err("automation rotate requires: <client-id> --confirm".to_owned());
+            };
+            validate_automation_client_id(client_id)?;
+            if confirm != "--confirm" {
+                return Err("automation rotate requires --confirm because the old secret is invalidated immediately".to_owned());
+            }
+            Ok(Command::Worker(WorkerCommand::AutomationRotate {
+                client_id: client_id.clone(),
+            }))
+        }
+        Some("revoke") => {
+            let [client_id, confirm] = &args[1..] else {
+                return Err("automation revoke requires: <client-id> --confirm".to_owned());
+            };
+            validate_automation_client_id(client_id)?;
+            if confirm != "--confirm" {
+                return Err(
+                    "automation revoke requires --confirm because revocation is immediate"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::Worker(WorkerCommand::AutomationRevoke {
                 client_id: client_id.clone(),
             }))
         }
         Some(value) => Err(format!(
-            "unknown connector command '{value}' (expected approve or revoke)"
+            "unknown automation command '{value}' (expected create, list, rotate, or revoke)"
         )),
-        None => Err("connector requires approve or revoke".to_owned()),
+        None => Err("automation requires create, list, rotate, or revoke".to_owned()),
+    }
+}
+
+fn parse_automation_create(args: &[String]) -> Result<Command, String> {
+    let mut name = None;
+    let mut device = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--name" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "automation create requires --name NAME".to_owned())?
+                    .trim()
+                    .to_owned();
+                if value.is_empty() || value.len() > 256 {
+                    return Err("automation --name must contain 1..256 characters".to_owned());
+                }
+                name = Some(value);
+                index += 2;
+            }
+            "--device" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| {
+                        "automation create requires --device <device-id-or-unique-name>".to_owned()
+                    })?
+                    .trim()
+                    .to_owned();
+                if value.is_empty() || value.len() > 512 {
+                    return Err(
+                        "automation --device must name a bound target device (id or unique name)"
+                            .to_owned(),
+                    );
+                }
+                device = Some(value);
+                index += 2;
+            }
+            value => {
+                return Err(format!(
+                    "unknown automation create argument '{value}' (expected --name NAME and --device DEVICE)"
+                ));
+            }
+        }
+    }
+    let name = name.ok_or_else(|| {
+        "automation create requires --name and --device; no silent device selection".to_owned()
+    })?;
+    let device = device.ok_or_else(|| {
+        "automation create requires --device <device-id-or-unique-name>; a target device must be chosen explicitly".to_owned()
+    })?;
+    Ok(Command::Worker(WorkerCommand::AutomationCreate {
+        name,
+        device,
+    }))
+}
+
+fn validate_connector_id(connector_id: &str) -> Result<(), String> {
+    // Edge uses a randomBase64Url suffix; we only require a plausible length
+    // rather than an exact one (which would break if Edge changes suffix width).
+    let valid = connector_id.starts_with("conn_")
+        && connector_id.len() >= 12
+        && connector_id.len() <= 4096
+        && connector_id[5..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err("connector id must be a valid conn_ identifier".to_owned())
+    }
+}
+
+fn validate_automation_client_id(client_id: &str) -> Result<(), String> {
+    let valid = client_id.starts_with("svc_")
+        && (12..=132).contains(&client_id.len())
+        && client_id[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err("automation client id must be a valid svc_ identifier".to_owned())
     }
 }
 
@@ -1048,10 +1303,20 @@ User path:\n\
   herdr-mcp doctor\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
-  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS enrolled-owner device only; creates pairing for another computer)\n\
-  herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS only; requires Keychain, reads the 6-digit code from an interactive or stdin prompt, never argv)\n\
-  herdr-mcp connector approve <approval-request-id>  (macOS owner device; reads the 6-digit code interactively, never argv)\n\
-  herdr-mcp connector revoke <client-id> --confirm\n\
+  herdr-mcp instance list  (default + named instance inventory; default is read-only)\n\
+  herdr-mcp instance reap <name> --confirm  (ownership-checked named-instance uninstall; never default)\n\
+  herdr-mcp qualification <lock|unlock|status>  (hold the runtime generation during release qualification)\n\
+  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS enrolled device only; creates pairing for another computer)\n\
+  herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS only; requires Keychain, reads the 6-digit code as visible interactive terminal input (or one stdin line), never argv)\n\
+  herdr-mcp device list  (non-secret enrolled-device inventory; worker list is an alias)\n\
+  herdr-mcp connector list  (enrolled-device credential; non-secret connector inventory)\n\
+  herdr-mcp connector approve <approval-request-id>  (macOS enrolled device; reads the 6-digit code interactively, never argv)\n\
+  herdr-mcp connector revoke <connector-id> --confirm  (connector ids begin with conn_)\n\
+  herdr-mcp connector revoke-client <client-id> --confirm  (legacy client/grant kill switch)\n\
+  herdr-mcp automation create --name NAME --device <device-id-or-unique-name>  (creates one CI/service principal bound to a device; secret is shown once)\n\
+  herdr-mcp automation list\n\
+  herdr-mcp automation rotate <client-id> --confirm\n\
+  herdr-mcp automation revoke <client-id> --confirm\n\
   herdr-mcp update [check [--manifest URL]|apply [--manifest URL]|auto|status]\n\
   herdr-mcp extension standalone <install [--ref REF]|status>\n\
   herdr-mcp rollback\n\
@@ -1105,6 +1370,36 @@ writes a pending sibling; --apply rewrites the live control file only with\n\
 HERDR_LINK_MIGRATE_RUNTIME_CONTROL=1) and never mutates LaunchAgents.\n"
 }
 
+pub fn worker_help() -> &'static str {
+    "Herdr MCP device / worker management\n\n\
+All of these require the credential of a device already enrolled in the fleet.\n\n\
+  herdr-mcp device list\n      Lists the non-secret enrolled-device inventory and local Link/runtime\n      alignment. herdr-mcp worker list is a compatibility alias.\n\n\
+  herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]\n      Creates a pairing address for another computer to enroll.\n\n  herdr-mcp worker connect <pairing-address> [--name NAME]\n      Enrolls this machine; requires Keychain, reads the 6-digit code from an\n      interactive or stdin prompt, never argv.\n\n  herdr-mcp device rename <name>\n      Renames the current enrolled device.\n\n  herdr-mcp device revoke <device-id> --confirm\n      Revokes the given enrolled device id.\n"
+}
+
+pub fn connector_help() -> &'static str {
+    "Herdr MCP connector management (OAuth connectors registered against the fleet)\n\n\
+All of these require the credential of a device already enrolled in the fleet;\nthere is no WebChat delegated admin path. Secrets are never echoed or written\nto argv.\n\n\
+  herdr-mcp connector list\n      Lists current connector instances plus non-secret legacy client/grant\n      inventory and token counts as returned by the Edge.\n\n  herdr-mcp connector approve <approval-request-id>\n      Approves a pending owner/approver request. Reads the 6-digit code as visible terminal input\n      (or one stdin line) and never from argv.\n\n  herdr-mcp connector revoke <connector-id> --confirm\n      Revokes a connector by its connector_id (begins with conn_).\n\n  herdr-mcp connector revoke-client <client-id> --confirm\n      Revokes every Connector/grant for a legacy OAuth client and invalidates\n      its issued access/refresh credentials.\n"
+}
+
+pub fn automation_help() -> &'static str {
+    "Herdr MCP automation (CI/service principal) management\n\n\
+All of these require the credential of a device already enrolled in the fleet.\n\n\
+  herdr-mcp automation create --name NAME --device <device-id-or-unique-name>\n      Creates one CI/service principal explicitly bound to the given device.\n      --name and --device are both required and may appear in either order; a\n      target device is never auto-chosen. The secret is shown once.\n\n  herdr-mcp automation list\n      Lists the automation clients and their bound devices.\n\n  herdr-mcp automation rotate <client-id> --confirm\n      Rotates the client secret (old secret invalidated immediately).\n\n  herdr-mcp automation revoke <client-id> --confirm\n      Revokes the automation client (immediate).\n"
+}
+
+pub fn instance_help() -> &'static str {
+    "Herdr MCP validation instance management\n\n\
+The default production instance is shown for comparison but is read-only and\ncan never be reaped. Only named validation instances are cleanup targets.\n\n\
+  herdr-mcp instance list\n      Lists the default plus recognized named instances with label, port, config\n      root, artifact age, loaded/running state, pid, and orphan state.\n\n  herdr-mcp instance reap <name> --confirm\n      Runs the existing ownership-checked product uninstall for exactly one\n      named instance. It never targets ~/.config/herdr-mcp or runtime releases.\n"
+}
+
+pub fn qualification_help() -> &'static str {
+    "Herdr MCP release qualification generation lock\n\n\
+  herdr-mcp qualification lock\n      Holds the current runtime generation. Auto-update and service generation\n      replacement fail closed until the lock is removed.\n\n  herdr-mcp qualification status\n      Shows whether the local qualification lock is active.\n\n  herdr-mcp qualification unlock\n      Releases the qualification lock and restores normal generation changes.\n"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1115,7 +1410,12 @@ mod tests {
 
     #[test]
     fn parses_core_commands() {
-        assert_eq!(parse(args(&[])).unwrap().command, Command::Help);
+        assert_eq!(
+            parse(args(&[])).unwrap().command,
+            Command::Help {
+                section: HelpSection::General,
+            }
+        );
         assert_eq!(parse(args(&["version"])).unwrap().command, Command::Version);
         assert_eq!(
             parse(args(&["install"])).unwrap().command,
@@ -1723,16 +2023,159 @@ mod tests {
             })
         );
         assert_eq!(
-            parse(args(&["connector", "revoke", "dcr-client", "--confirm"]))
-                .unwrap()
-                .command,
+            parse(args(&["connector", "list"])).unwrap().command,
+            Command::Worker(WorkerCommand::ConnectorList)
+        );
+        assert_eq!(
+            parse(args(&[
+                "connector",
+                "revoke",
+                "conn_abc123XYZ",
+                "--confirm"
+            ]))
+            .unwrap()
+            .command,
             Command::Worker(WorkerCommand::ConnectorRevoke {
-                client_id: "dcr-client".to_owned(),
+                connector_id: "conn_abc123XYZ".to_owned(),
             })
+        );
+        assert_eq!(
+            parse(args(&[
+                "connector",
+                "revoke-client",
+                "https://legacy.example/oauth/client-metadata.json",
+                "--confirm"
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::ConnectorClientRevoke {
+                client_id: "https://legacy.example/oauth/client-metadata.json".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(args(&["device", "list"])).unwrap().command,
+            Command::Worker(WorkerCommand::List)
+        );
+        assert_eq!(
+            parse(args(&["worker", "list"])).unwrap().command,
+            Command::Worker(WorkerCommand::List)
         );
         assert!(parse(args(&["connector", "approve", "req_abc", "123456"])).is_err());
         assert!(parse(args(&["connector", "approve", "--code", "123456"])).is_err());
-        assert!(parse(args(&["connector", "revoke", "dcr-client"])).is_err());
+        assert!(parse(args(&["connector", "revoke", "conn_abc", "--confirm"])).is_err());
+        assert!(parse(args(&["connector", "revoke", "dcr-client", "--confirm"])).is_err());
+        assert!(parse(args(&["connector", "revoke", "conn_abc", "--nope"])).is_err());
+        assert!(parse(args(&["connector", "revoke", "conn_abc"])).is_err());
+        assert!(parse(args(&["connector", "revoke-client", "legacy"])).is_err());
+    }
+
+    #[test]
+    fn parses_connector_and_worker_help_success() {
+        assert_eq!(
+            parse(args(&["connector", "--help"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::Connector,
+            }
+        );
+        assert_eq!(
+            parse(args(&["connector", "-h"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::Connector,
+            }
+        );
+        assert_eq!(
+            parse(args(&["worker", "--help"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::Worker,
+            }
+        );
+        assert_eq!(
+            parse(args(&["automation", "--help"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::Automation,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_automation_service_principal_lifecycle() {
+        assert_eq!(
+            parse(args(&[
+                "automation",
+                "create",
+                "--name",
+                "gitlab:group/project:prod",
+                "--device",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::AutomationCreate {
+                name: "gitlab:group/project:prod".to_owned(),
+                device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            })
+        );
+        // --device may precede --name.
+        assert_eq!(
+            parse(args(&[
+                "automation",
+                "create",
+                "--device",
+                "build-runner-01",
+                "--name",
+                "gitlab:ci:pipeline",
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::AutomationCreate {
+                name: "gitlab:ci:pipeline".to_owned(),
+                device: "build-runner-01".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(args(&["automation", "list"])).unwrap().command,
+            Command::Worker(WorkerCommand::AutomationList)
+        );
+        assert_eq!(
+            parse(args(&[
+                "automation",
+                "rotate",
+                "svc_abcdefgh1234",
+                "--confirm",
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::AutomationRotate {
+                client_id: "svc_abcdefgh1234".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "automation",
+                "revoke",
+                "svc_abcdefgh1234",
+                "--confirm",
+            ]))
+            .unwrap()
+            .command,
+            Command::Worker(WorkerCommand::AutomationRevoke {
+                client_id: "svc_abcdefgh1234".to_owned(),
+            })
+        );
+        // --device is required; a device must never be silently chosen.
+        assert!(parse(args(&["automation", "create", "gitlab"])).is_err());
+        assert!(parse(args(&["automation", "create", "--name", "gitlab:ci"])).is_err());
+        assert!(
+            parse(args(&[
+                "automation",
+                "create",
+                "--device",
+                "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            ]))
+            .is_err()
+        );
+        assert!(parse(args(&["automation", "rotate", "svc_abcdefgh1234"])).is_err());
+        assert!(parse(args(&["automation", "revoke", "dcr-client", "--confirm"])).is_err());
     }
 
     #[test]
@@ -1754,6 +2197,44 @@ mod tests {
             ]))
             .is_err()
         );
+        assert_eq!(
+            parse(args(&["instance", "list"])).unwrap().command,
+            Command::Instance(InstanceCommand::List)
+        );
+        assert_eq!(
+            parse(args(&["instance", "reap", "uat043", "--confirm"]))
+                .unwrap()
+                .command,
+            Command::Instance(InstanceCommand::Reap {
+                name: "uat043".to_owned(),
+            })
+        );
+        assert!(parse(args(&["instance", "reap", "uat043"])).is_err());
+        assert!(parse(args(&["--instance", "uat", "instance", "list"])).is_err());
+    }
+
+    #[test]
+    fn parses_qualification_generation_lock_commands() {
+        assert_eq!(
+            parse(args(&["qualification", "lock"])).unwrap().command,
+            Command::Qualification(QualificationCommand::Lock)
+        );
+        assert_eq!(
+            parse(args(&["qualification", "status"])).unwrap().command,
+            Command::Qualification(QualificationCommand::Status)
+        );
+        assert_eq!(
+            parse(args(&["qualification", "unlock"])).unwrap().command,
+            Command::Qualification(QualificationCommand::Unlock)
+        );
+        assert_eq!(
+            parse(args(&["qualification", "--help"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::Qualification,
+            }
+        );
+        assert!(parse(args(&["qualification"])).is_err());
+        assert!(parse(args(&["qualification", "pause"])).is_err());
     }
 
     #[test]
@@ -1765,8 +2246,15 @@ mod tests {
             "herdr-mcp doctor",
             "herdr-mcp permissions",
             "herdr-mcp scan",
+            "herdr-mcp instance list",
+            "herdr-mcp qualification <lock|unlock|status>",
+            "herdr-mcp connector list",
             "herdr-mcp connector approve",
             "herdr-mcp connector revoke",
+            "herdr-mcp automation create",
+            "herdr-mcp automation list",
+            "herdr-mcp connector revoke <connector-id> --confirm",
+            "herdr-mcp automation create --name NAME --device <device-id-or-unique-name>",
             "herdr-mcp update",
             "herdr-mcp rollback",
             "herdr-mcp uninstall",

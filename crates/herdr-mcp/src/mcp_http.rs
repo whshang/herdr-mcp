@@ -36,7 +36,6 @@ const RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
-const PUSH_CACHE_POLL: Duration = Duration::from_millis(250);
 const MAX_MCP_ACTIVITY_RECORDS: usize = 2000;
 const MAX_MCP_ACTIVITY_RESULTS: usize = 50;
 const MAX_MCP_ACTIVITY_LOOKBACK_MS: u64 = 30 * 60_000;
@@ -576,6 +575,7 @@ struct PushFilters {
 
 struct PushStreamState {
     cache: Arc<EventCache>,
+    cursor_rx: tokio::sync::watch::Receiver<u64>,
     cursor: u64,
     filters: PushFilters,
     statuses: HashMap<String, String>,
@@ -772,6 +772,10 @@ fn push_state_payload(cache: &EventCache) -> Value {
 }
 
 fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Response {
+    // Subscribe before reading the initial digest so an event racing this setup
+    // cannot be missed. At worst an already-included event causes one harmless
+    // immediate no-op wake on the first loop iteration.
+    let cursor_rx = cache.subscribe_cursor();
     let digest = cache.digest_since(u64::MAX);
     let agents = push_agent_views(&digest.agents);
     let statuses = agents
@@ -785,6 +789,7 @@ fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Respons
         .collect();
     let state = PushStreamState {
         cache,
+        cursor_rx,
         cursor: digest.cursor,
         filters,
         statuses,
@@ -820,7 +825,15 @@ fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Respons
         }
 
         loop {
-            tokio::time::sleep(PUSH_CACHE_POLL).await;
+            let heartbeat_wait = SSE_HEARTBEAT.saturating_sub(state.last_heartbeat.elapsed());
+            tokio::select! {
+                changed = state.cursor_rx.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                }
+                _ = tokio::time::sleep(heartbeat_wait) => {}
+            }
             let digest = state.cache.digest_since(state.cursor);
             state.cursor = digest.cursor;
             let current_agents = push_agent_views(&digest.agents);
@@ -2046,8 +2059,10 @@ mod tests {
     #[test]
     fn push_transition_emits_only_new_work_and_working_to_settled() {
         let cache = Arc::new(EventCache::from_snapshot_for_test(json!({})));
+        let cursor_rx = cache.subscribe_cursor();
         let mut state = PushStreamState {
             cache,
+            cursor_rx,
             cursor: 0,
             filters: PushFilters::default(),
             statuses: HashMap::new(),

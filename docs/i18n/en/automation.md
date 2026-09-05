@@ -83,6 +83,33 @@ CI proves that a commit does not break other planes. Typical gates include:
 
 The public Edge contract is intentionally more stable than runtime implementation. The current public contract remains **epoch 3 / 19 actions**, introduced in v0.4.3, while the workstation Runtime Execution Contract remains **epoch 2 / 18 tools**. The extra public action, `herdr_devices`, executes at Edge and is never forwarded to a workstation. Historical compatibility tests may exist, but normal runtime changes should not silently change either contract.
 
+### GitLab CI and other unattended MCP callers
+
+Do not put `HERDR_MCP_TOKEN`, `STATIC_MCP_BEARER_SECRET`, or one shared fleet-wide access token into CI. Those credentials do not provide per-pipeline identity or independent revocation.
+
+Provision an **Automation Client** from any enrolled workstation instead:
+
+```bash
+herdr-mcp automation create --name "gitlab:group/project:prod" --device <device-id-or-unique-name>
+herdr-mcp automation list
+herdr-mcp automation rotate <svc_client_id> --confirm
+herdr-mcp automation revoke <svc_client_id> --confirm
+```
+
+Use a separate client for each meaningful trust boundary, normally at least per GitLab project and environment. Every Automation Client is bound to exactly one enrolled device; `--device` accepts its immutable `device_id` or a unique device name, and the Worker stores the resolved immutable id. `create` returns the long-lived `client_secret` once; `rotate` returns its replacement once. The Worker stores only the verifier. Put these values in masked/protected GitLab variables:
+
+```text
+HERDR_MCP_URL
+HERDR_MCP_CLIENT_ID
+HERDR_MCP_CLIENT_SECRET
+```
+
+At job start, exchange the client credentials at the Worker's `/oauth/token` endpoint with `grant_type=client_credentials`. The result is a short-lived MCP access token with a maximum lifetime of one hour and no refresh token. Minting a token updates bounded inventory metadata (`last_token_issued_at_ms` and `token_issue_count`) instead of writing one Durable Object record per MCP request.
+
+Automation Clients have ordinary MCP authority only and are scoped to their bound device. If a call omits `device`, the Worker routes it to that bound device; selecting or referring to another device fails closed. They cannot administer the fleet, pair/revoke devices, approve/revoke Connectors, create another Automation Client, or discover the rest of the fleet. Revocation is keyed by immutable `client_id`, blocks future token minting, and fences already-issued access tokens at Worker verification time.
+
+Automation inventory/rotate/revoke are enrolled-device/operator control-plane actions. Approved WebChat Connectors do not receive these administration methods. Long-lived client secrets are intentionally not returned by inventory and should not be copied into a chat transcript; create/rotate them from an enrolled workstation CLI and store them directly in the CI secret manager.
+
 ## Cloudflare Edge deployment
 
 Workflow:

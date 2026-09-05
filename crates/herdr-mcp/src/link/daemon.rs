@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -97,7 +97,7 @@ pub fn read_link_daemon_config(
     let runtime_endpoint = optional_trimmed(env_map, "HERDR_MCP_ENDPOINT")
         .unwrap_or_else(|| LOCAL_MCP_DEFAULT_ENDPOINT.to_owned());
     let runtime_generation = optional_trimmed(env_map, "HERDR_RUNTIME_GENERATION")
-        .unwrap_or_else(|| "local-mcp-active".to_owned());
+        .unwrap_or_else(|| DEFAULT_RUNTIME_GENERATION.to_owned());
     let runtime_version = optional_trimmed(env_map, "HERDR_RUNTIME_VERSION");
     let contract_hash = optional_trimmed(env_map, "HERDR_CONTRACT_HASH")
         .unwrap_or_else(|| PUBLIC_CONTRACT_HASH.to_owned());
@@ -202,6 +202,14 @@ pub fn exit_status_for_kind(kind: LinkExitKind) -> i32 {
     }
 }
 
+/// The env-default placeholder generation. A fresh first-owner install leaves
+/// `runtime-control.json` seeded at this id unless it is reconciled to the exact
+/// managed `runtime/current` generation. The strict dispatch fence compares the
+/// reserved generation against `runtime/current`, so a placeholder that diverges
+/// from `rust-*` makes the first remote request fail with
+/// `runtime_generation_superseded_before_dispatch` before any reconcile runs.
+pub const DEFAULT_RUNTIME_GENERATION: &str = "local-mcp-active";
+
 /// Assemble and run the staged candidate-only Link daemon.
 ///
 /// Requires epoch 2 because the staged Rust `RuntimeGenerationManager` only
@@ -214,8 +222,19 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
         ));
     }
 
+    // Close the fresh first-owner gap at the lifecycle/reconcile boundary. When
+    // the configured generation is the env-default placeholder `local-mcp-active`
+    // (a fresh setup that has not been pointed at an exact generation yet) and a
+    // managed `runtime/current` generation exists, seed the base generation from
+    // the exact managed id. This keeps the initial `runtime-control.json` aligned
+    // with the exact generation the strict dispatch fence compares against,
+    // instead of leaving the placeholder active and tripping
+    // `runtime_generation_superseded_before_dispatch` on the first remote request.
+    // An explicit `HERDR_RUNTIME_GENERATION` is preserved verbatim.
+    let generation = resolve_daemon_base_generation(&config)?;
+
     let base = RuntimeGenerationSpec {
-        generation: config.runtime_generation.clone(),
+        generation,
         endpoint: config.runtime_endpoint.clone(),
         expected_runtime_version: config.runtime_version.clone(),
         runtime_commit: None,
@@ -399,6 +418,46 @@ fn default_runtime_control_dir() -> PathBuf {
 
 fn new_boot_id() -> String {
     format!("boot-{}-{}", std::process::id(), system_now_ms())
+}
+
+/// Resolve the base runtime generation for a fresh daemon start.
+///
+/// The env-default placeholder (`local-mcp-active`) must follow the exact
+/// managed `runtime/current` generation whenever one exists; otherwise a fresh
+/// first-owner setup leaves the control/active generation at the placeholder
+/// while `runtime/current` is `rust-*`, and the strict dispatch fence refuses
+/// every request with `runtime_generation_superseded_before_dispatch`. An
+/// explicit configured generation is returned unchanged.
+///
+/// The link is read from exactly the path the dispatch fence compares against
+/// (`<runtime-control dir>/runtime/current`), so this stays a managed-loopback
+/// reconciliation and never invents a generation from an unrelated location.
+fn resolve_daemon_base_generation(config: &LinkDaemonConfig) -> Result<String, String> {
+    if config.runtime_generation != DEFAULT_RUNTIME_GENERATION {
+        return Ok(config.runtime_generation.clone());
+    }
+    let managed_current_link = config
+        .runtime_control_path
+        .parent()
+        .map(|dir| dir.join("runtime").join("current"));
+    match managed_current_link
+        .as_deref()
+        .and_then(managed_generation_from_link)
+    {
+        Some(generation) => Ok(generation),
+        // No managed runtime/current yet (pre-install or non-macos host): keep
+        // the placeholder so the candidate still runs against its loopback MCP.
+        None => Ok(DEFAULT_RUNTIME_GENERATION.to_owned()),
+    }
+}
+
+/// Read `runtime/current` -> `rust-*` generation name, if present. Returns `None`
+/// when the link is missing, unreadable, or does not point at a `rust-*`
+/// generation, so a placeholder or foreign target is never adopted.
+fn managed_generation_from_link(link: &Path) -> Option<String> {
+    let target = std::fs::read_link(link).ok()?;
+    let name = target.file_name()?.to_str()?.trim();
+    name.starts_with("rust-").then(|| name.to_owned())
 }
 
 fn system_now_ms() -> i64 {
@@ -616,7 +675,7 @@ mod tests {
             link_token: "link-secret".to_owned(),
             runtime_token: "runtime-secret".to_owned(),
             runtime_endpoint: "http://127.0.0.1:8772/mcp".to_owned(),
-            runtime_generation: "local-mcp-active".to_owned(),
+            runtime_generation: DEFAULT_RUNTIME_GENERATION.to_owned(),
             runtime_version: Some("0.4.3-dev".to_owned()),
             contract_epoch: PUBLIC_CONTRACT_EPOCH,
             contract_hash: PUBLIC_CONTRACT_HASH.to_owned(),
@@ -699,5 +758,113 @@ mod tests {
         drop(io);
         control.close();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression for v0.4.6 #306: a fresh first-owner install seeds the default
+    // runtime-control at the placeholder `local-mcp-active` while service install
+    // has already switched `runtime/current` to an exact `rust-*` generation. The
+    // strict dispatch fence then refuses the first remote request with
+    // `runtime_generation_superseded_before_dispatch`. The daemon must derive the
+    // base generation from the exact managed `runtime/current` when the env
+    // default placeholder is in effect, so a fresh daemon starts aligned with the
+    // exact generation the fence compares against.
+    #[test]
+    fn default_placeholder_generation_follows_exact_managed_runtime_current() {
+        use std::os::unix::fs::symlink;
+
+        let home = std::env::temp_dir().join(format!(
+            "herdr-daemon-gen-resolve-{}-{}",
+            std::process::id(),
+            system_now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        // The fence reads the link at `<runtime-control dir>/runtime/current`, so
+        // the scratch HOME must mirror the real config layout the daemon uses.
+        let config_dir = home.join(".config/herdr-mcp");
+        let runtime = config_dir.join("runtime");
+        let generations = runtime.join("generations");
+        let generation = generations.join("rust-9b9b9b9b9b9b9b9b");
+        std::fs::create_dir_all(&generation).unwrap();
+        std::fs::write(generation.join("herdr-mcp"), b"fake-binary").unwrap();
+        let current = runtime.join("current");
+        symlink("generations/rust-9b9b9b9b9b9b9b9b", &current).unwrap();
+
+        // A fresh default daemon config (placeholder generation, managed loopback
+        // endpoint) must resolve to the exact managed generation.
+        let mut cfg = LinkDaemonConfig {
+            edge_url: "wss://herdr-edge-dev.example/ws".to_owned(),
+            workstation_id: "dev-w1".to_owned(),
+            device_name: None,
+            link_token: "link-secret".to_owned(),
+            runtime_token: "runtime-secret".to_owned(),
+            runtime_endpoint: "http://127.0.0.1:8772/mcp".to_owned(),
+            runtime_generation: DEFAULT_RUNTIME_GENERATION.to_owned(),
+            runtime_version: Some("0.4.3-dev".to_owned()),
+            contract_epoch: PUBLIC_CONTRACT_EPOCH,
+            contract_hash: PUBLIC_CONTRACT_HASH.to_owned(),
+            runtime_control_path: config_dir.join("runtime-control.json"),
+            runtime_status_path: config_dir.join("runtime-status.json"),
+            runtime_control_poll_ms: 1_000,
+            public_origin: None,
+            link_upstream_origin: None,
+            preferred_route_kind: None,
+            ladder: None,
+        };
+
+        let resolved = resolve_daemon_base_generation(&cfg).expect("resolve");
+        assert_eq!(resolved, "rust-9b9b9b9b9b9b9b9b");
+
+        // An explicit configured generation is never rewritten.
+        cfg.runtime_generation = "rust-explicit01".to_owned();
+        assert_eq!(
+            resolve_daemon_base_generation(&cfg).expect("explicit"),
+            "rust-explicit01"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // A fresh daemon with no managed runtime/current yet (pre-install or a
+    // non-macos host) keeps the placeholder generation so the candidate still
+    // runs against its loopback MCP instead of failing closed. A non-rust target
+    // (e.g. a Node-era placeholder) is likewise never adopted.
+    #[test]
+    fn placeholder_generation_kept_when_managed_runtime_current_absent() {
+        use std::os::unix::fs::symlink;
+        let home = std::env::temp_dir().join(format!(
+            "herdr-daemon-gen-absent-{}-{}",
+            std::process::id(),
+            system_now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let config_dir = home.join(".config/herdr-mcp");
+        let runtime = config_dir.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        symlink("generations/stable-node-era", runtime.join("current")).unwrap();
+
+        let cfg = LinkDaemonConfig {
+            edge_url: "wss://herdr-edge-dev.example/ws".to_owned(),
+            workstation_id: "dev-w1".to_owned(),
+            device_name: None,
+            link_token: "link-secret".to_owned(),
+            runtime_token: "runtime-secret".to_owned(),
+            runtime_endpoint: "http://127.0.0.1:8772/mcp".to_owned(),
+            runtime_generation: DEFAULT_RUNTIME_GENERATION.to_owned(),
+            runtime_version: None,
+            contract_epoch: PUBLIC_CONTRACT_EPOCH,
+            contract_hash: PUBLIC_CONTRACT_HASH.to_owned(),
+            runtime_control_path: config_dir.join("runtime-control.json"),
+            runtime_status_path: config_dir.join("runtime-status.json"),
+            runtime_control_poll_ms: 1_000,
+            public_origin: None,
+            link_upstream_origin: None,
+            preferred_route_kind: None,
+            ladder: None,
+        };
+
+        assert_eq!(
+            resolve_daemon_base_generation(&cfg).expect("resolve"),
+            DEFAULT_RUNTIME_GENERATION
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

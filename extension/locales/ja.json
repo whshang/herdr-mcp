@@ -331,7 +331,7 @@
   "cc_devices_observed": "{value} に取得",
   "cc_devices_empty": "登録済みデバイスはありません。",
   "cc_devices_not_available": "デバイス一覧を利用できません",
-  "cc_devices_owner_required": "このコンピューターには Worker owner 権限がないため、完全なデバイス一覧を読み取れません。",
+  "cc_devices_owner_required": "このコンピューターには利用可能な Worker fleet 資格情報がないため、完全なデバイス一覧を読み取れません。",
   "cc_devices_runtime_unavailable": "現在のローカル Runtime はまだ 0.4.5 のデバイス表示を提供していません。",
   "cc_devices_unavailable": "Worker デバイスの読み取りに失敗しました: {error}",
   "cc_device_this": "このデバイス",

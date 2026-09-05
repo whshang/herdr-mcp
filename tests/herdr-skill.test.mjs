@@ -60,6 +60,15 @@ test("fetchHerdrSkill offline mode returns bundled project policy plus live runt
     assert.match(r.content, /Do not wait for the user to notice accumulated panes/);
     assert.match(r.content, /settled Agent.*does not need to remain open.*preserve task history/s);
     assert.match(r.content, /canonical reusable `herdr-mcp:utility` pane/);
+    assert.match(r.content, /Automation Client/);
+    assert.match(r.content, /grant_type=client_credentials/);
+    assert.match(r.content, /maximum one hour, no refresh token/);
+    assert.match(r.content, /ordinary MCP principals bound to exactly one enrolled device, not fleet administrators/);
+    assert.match(r.content, /Automation administration remains an enrolled-device\/operator CLI\/REST action/);
+    assert.doesNotMatch(r.content, /herdr_mcp\.automation\.(?:list|revoke)/);
+    assert.match(r.content, /127\.0\.0\.1:8772\/mcp.*still requires its local bearer/s);
+    assert.match(r.content, /trusted Unix-IPC listener is deliberately tokenless/);
+    assert.match(r.content, /browser never receives or stores `HERDR_MCP_TOKEN`/);
     assert.equal(r.runtime.contract_profile, process.env.HERDR_MCP_CONTRACT_PROFILE || "current");
     assert.equal(r.runtime.build_commit, process.env.HERDR_MCP_BUILD_COMMIT || null);
     assert.equal(r.runtime.active_runtime.source_commit, process.env.HERDR_MCP_BUILD_COMMIT || null);

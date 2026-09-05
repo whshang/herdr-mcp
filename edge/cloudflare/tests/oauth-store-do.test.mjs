@@ -110,6 +110,85 @@ test("normalizers enforce bounded OAuth state", () => {
   assert.equal(normalizeOAuthCode(code(100), 100), null);
 });
 
+test("pending approval limits are per-client and global, and expired pending rows are reclaimed", async () => {
+  const h = harness();
+  for (let i = 0; i < 4; i++) {
+    const response = await h.post("/internal/oauth/approval/put", {
+      request_id: `req-client-${i}`,
+      record: approval({
+        client_id: "bounded-client",
+        state: `state-${i}`,
+        code_challenge: `${String(i).repeat(1)}${"x".repeat(42)}`,
+      }),
+      now_ms: 100,
+    });
+    assert.equal(response.status, 200);
+  }
+  const fifth = await h.post("/internal/oauth/approval/put", {
+    request_id: "req-client-5",
+    record: approval({ client_id: "bounded-client", state: "state-5", code_challenge: `5${"x".repeat(42)}` }),
+    now_ms: 100,
+  });
+  assert.equal(fifth.status, 429);
+  assert.equal((await body(fifth)).code, "client_pending_limit");
+
+  const global = harness();
+  for (let i = 0; i < 128; i++) {
+    global.storage.map.set(`approval:req-global-${i}`, approval({
+      client_id: `global-${i}`,
+      state: `state-${i}`,
+      expires_at_ms: 20_000,
+    }));
+  }
+  const overflow = await global.post("/internal/oauth/approval/put", {
+    request_id: "req-global-overflow",
+    record: approval({ client_id: "global-overflow", state: "overflow", expires_at_ms: 20_000 }),
+    now_ms: 100,
+  });
+  assert.equal(overflow.status, 429);
+  assert.equal((await body(overflow)).code, "pending_capacity_reached");
+
+  const reclaimed = await global.post("/internal/oauth/approval/put", {
+    request_id: "req-after-expiry",
+    record: approval({
+      client_id: "after-expiry",
+      state: "after-expiry",
+      created_at_ms: 30_000,
+      expires_at_ms: 40_000,
+    }),
+    now_ms: 30_000,
+  });
+  assert.equal(reclaimed.status, 200);
+  assert.equal(global.storage.map.has("approval:req-global-0"), false);
+});
+
+test("unapproved DCR capacity fails closed while one-hour-expired clients are reclaimed", async () => {
+  const recent = harness();
+  for (let i = 0; i < 256; i++) {
+    recent.storage.map.set(`client:dcr-recent-${i}`, { ...client, issued_at: 1_000 });
+  }
+  const blocked = await recent.post("/internal/oauth/client/put", {
+    client_id: "dcr-overflow",
+    record: { ...client, issued_at: 1_001 },
+    now_ms: 1_001_000,
+  });
+  assert.equal(blocked.status, 429);
+  assert.equal((await body(blocked)).code, "dcr_capacity_reached");
+
+  const expired = harness();
+  for (let i = 0; i < 256; i++) {
+    expired.storage.map.set(`client:dcr-expired-${i}`, { ...client, issued_at: 0 });
+  }
+  const accepted = await expired.post("/internal/oauth/client/put", {
+    client_id: "dcr-new",
+    record: { ...client, issued_at: 3_601 },
+    now_ms: 3_601_000,
+  });
+  assert.equal(accepted.status, 200);
+  assert.equal(expired.storage.map.has("client:dcr-expired-0"), false);
+  assert.equal(expired.storage.map.has("client:dcr-new"), true);
+});
+
 test("client put/get and token put/get", async () => {
   const h = harness();
   assert.equal((await body(await h.post("/internal/oauth/client/put", { client_id: "c1", record: client }))).ok, true);
@@ -200,10 +279,32 @@ test("connector approval is request-bound, five wrong attempts lock it, and corr
   }));
   assert.equal(ok.ok, true);
   assert.equal(ok.record.client_id, "c1");
-  const grant = await body(await h.post("/internal/oauth/grant/get", { client_id: "c1" }));
-  assert.equal(grant.record.status, "active");
-  assert.equal(grant.record.can_approve_connectors, true);
-  assert.equal(grant.record.approved_by, "device:owner");
+  assert.ok(ok.record.connector_id);
+  const connector = await body(await h.post("/internal/oauth/connector/get", { connector_id: ok.record.connector_id }));
+  assert.equal(connector.connector.status, "active");
+  assert.equal(connector.connector.client_id, "c1");
+  assert.equal(connector.connector.approved_by, "device:owner");
+  assert.equal(connector.connector.grant_generation, 1);
+  assert.equal(connector.connector.principal_type, "connector");
+  assert.equal(connector.connector.capabilities[0], "mcp_access");
+
+  await h.post("/internal/oauth/approval/put", {
+    request_id: "req-delegated",
+    record: approval({ client_id: "c2", approval_code_hash: "delegated-good", resume_hash: "delegated-resume" }),
+    now_ms: 401,
+  });
+  const delegated = await body(await h.post("/internal/oauth/approval/approve", {
+    request_id: "req-delegated",
+    code_hash: "delegated-good",
+    approver: "device:owner",
+    now_ms: 500,
+  }));
+  assert.equal(delegated.ok, true);
+  assert.ok(delegated.record.connector_id);
+  const delegatedConnector = await body(await h.post("/internal/oauth/connector/get", { connector_id: delegated.record.connector_id }));
+  assert.equal(delegatedConnector.connector.status, "active");
+  assert.equal(delegatedConnector.connector.client_id, "c2");
+  assert.equal(delegatedConnector.connector.approved_by, "device:owner");
 });
 
 test("connector approval resume token is independent, one-use, and cannot be substituted", async () => {
@@ -245,7 +346,7 @@ test("connector approval resume token is independent, one-use, and cannot be sub
   assert.equal(replay.status, 404);
 });
 
-test("connector grant revoke fences issued JWT and refresh credentials while legacy no-grant access remains compatible", async () => {
+test("connector grant revoke fences current and legacy JWT/refresh credentials with a durable tombstone", async () => {
   const h = harness();
   const legacyIssued = await body(await h.post("/internal/oauth/token/issue", {
     client_id: "legacy-client",
@@ -259,6 +360,23 @@ test("connector grant revoke fences issued JWT and refresh credentials while leg
     now_sec: 1001,
   });
   assert.equal(legacyVerify.status, 200, "pre-v0.4.6 clients without grant records keep ordinary access");
+
+  const legacyRevoked = await body(await h.post("/internal/oauth/grant/revoke", {
+    client_id: "legacy-client",
+    revoked_by: "operator:test",
+    now_ms: 350,
+  }));
+  assert.equal(legacyRevoked.ok, true);
+  assert.equal(legacyRevoked.legacy_tombstone_created, true);
+  const legacyGrant = await body(await h.post("/internal/oauth/grant/get", { client_id: "legacy-client" }));
+  assert.equal(legacyGrant.record.status, "revoked");
+  assert.equal(
+    (await h.post("/internal/oauth/access/verify", { token: legacyIssued.token.access_token, now_sec: 1002 })).status,
+    401,
+    "a legacy JWT is fenced immediately after the Worker records its revoke tombstone",
+  );
+  const legacyRefreshHash = await hashOpaqueToken(legacyIssued.token.refresh_token);
+  assert.equal((await h.post("/internal/oauth/refresh/get", { hash: legacyRefreshHash, now_sec: 1002 })).status, 404);
 
   await h.post("/internal/oauth/approval/put", {
     request_id: "req-revoke",
@@ -286,6 +404,7 @@ test("connector grant revoke fences issued JWT and refresh credentials while leg
     now_ms: 400,
   }));
   assert.equal(revoked.ok, true);
+  assert.equal(revoked.legacy_tombstone_created, false);
   assert.equal((await h.post("/internal/oauth/access/verify", { token: issued.token.access_token, now_sec: 1002 })).status, 401);
   const refreshHash = await hashOpaqueToken(issued.token.refresh_token);
   assert.equal((await h.post("/internal/oauth/refresh/get", { hash: refreshHash, now_sec: 1002 })).status, 404);
@@ -296,6 +415,174 @@ test("connector grant revoke fences issued JWT and refresh credentials while leg
     access_ttl_sec: 3600,
     refresh_ttl_sec: 10000,
   })).status, 400);
+});
+
+test("connector instance revoke is isolated while client kill-switch fences every instance and unknown legacy client", async () => {
+  const h = harness();
+  const approve = async (requestId, codeHash) => {
+    await h.post("/internal/oauth/approval/put", {
+      request_id: requestId,
+      record: approval({
+        client_id: "shared-client",
+        approval_code_hash: codeHash,
+        resume_hash: `resume-${requestId}`,
+      }),
+      now_ms: 100,
+    });
+    return body(await h.post("/internal/oauth/approval/approve", {
+      request_id: requestId,
+      code_hash: codeHash,
+      approver: "device:owner",
+      now_ms: 200,
+    }));
+  };
+  const first = await approve("req-inst-1", "good-1");
+  const second = await approve("req-inst-2", "good-2");
+  assert.notEqual(first.record.connector_id, second.record.connector_id);
+
+  const issueFor = async (record) => body(await h.post("/internal/oauth/token/issue", {
+    client_id: "shared-client",
+    connector_id: record.connector_id,
+    grant_generation: 1,
+    resource: "https://issuer/mcp",
+    now_sec: 1000,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 10000,
+  }));
+  const firstIssued = await issueFor(first.record);
+  const secondIssued = await issueFor(second.record);
+  const firstAfterIssue = await body(await h.post("/internal/oauth/connector/get", {
+    connector_id: first.record.connector_id,
+  }));
+  assert.equal(firstAfterIssue.connector.last_used_at_ms, 1000 * 1000);
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: firstIssued.token.access_token, now_sec: 1001 })).status, 200);
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: secondIssued.token.access_token, now_sec: 1001 })).status, 200);
+
+  assert.equal((await h.post("/internal/oauth/connector/revoke", {
+    connector_id: first.record.connector_id,
+    revoked_by: "device:owner",
+    now_ms: 300,
+  })).status, 200);
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: firstIssued.token.access_token, now_sec: 1002 })).status, 401);
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: secondIssued.token.access_token, now_sec: 1002 })).status, 200);
+
+  const killed = await body(await h.post("/internal/oauth/connector/revoke-client", {
+    client_id: "shared-client",
+    revoked_by: "operator:test",
+    now_ms: 400,
+  }));
+  assert.equal(killed.ok, true);
+  assert.equal(killed.revoked_connectors, 1);
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: secondIssued.token.access_token, now_sec: 1003 })).status, 401);
+
+  const legacy = await body(await h.post("/internal/oauth/token/issue", {
+    client_id: "unknown-legacy-client",
+    resource: "https://issuer/mcp",
+    now_sec: 1000,
+    access_ttl_sec: 3600,
+    refresh_ttl_sec: 10000,
+  }));
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: legacy.token.access_token, now_sec: 1001 })).status, 200);
+  const legacyKill = await body(await h.post("/internal/oauth/connector/revoke-client", {
+    client_id: "unknown-legacy-client",
+    revoked_by: "operator:test",
+    now_ms: 500,
+  }));
+  assert.equal(legacyKill.ok, true);
+  assert.equal(legacyKill.legacy_tombstone_created, true);
+  assert.equal((await h.post("/internal/oauth/access/verify", { token: legacy.token.access_token, now_sec: 1002 })).status, 401);
+});
+
+test("automation client is independently named, monitored, rotated, and revoke fences issued access tokens", async () => {
+  const h = harness();
+  const created = await body(await h.post("/internal/oauth/automation/create", {
+    client_id: "svc_gitlab_prod_01",
+    client_secret_hash: "secret-hash-v1",
+    client_name: "gitlab:group/project:prod",
+    resource: "https://issuer/mcp",
+    scope: "mcp",
+    created_by: "device:admin",
+    device_id: "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYZ",
+    device_name: "ci-bound-mac",
+    now_ms: 1000,
+  }));
+  assert.equal(created.ok, true);
+
+  const clientRecord = await body(await h.post("/internal/oauth/client/get", { client_id: "svc_gitlab_prod_01" }));
+  assert.equal(clientRecord.record.client_secret_hash, "secret-hash-v1");
+  assert.deepEqual(clientRecord.record.grant_types, ["client_credentials"]);
+  assert.deepEqual(clientRecord.record.redirect_uris, []);
+
+  const grant = await body(await h.post("/internal/oauth/grant/get", { client_id: "svc_gitlab_prod_01" }));
+  assert.equal(grant.record.status, "active");
+  assert.equal(grant.record.principal_type, "automation");
+  assert.equal(grant.record.device_id, "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYZ");
+  assert.equal(grant.record.device_name, "ci-bound-mac");
+  assert.equal(grant.record.token_issue_count, 0);
+
+  const issued = await body(await h.post("/internal/oauth/automation/token/issue", {
+    client_id: "svc_gitlab_prod_01",
+    resource: "https://issuer/mcp",
+    now_sec: 2,
+    access_ttl_sec: 3600,
+  }));
+  assert.equal(issued.ok, true);
+  assert.equal(typeof issued.token.access_token, "string");
+  assert.equal(issued.token.refresh_token, undefined, "automation credentials never receive refresh tokens");
+  assert.equal(
+    (await h.post("/internal/oauth/access/verify", { token: issued.token.access_token, now_sec: 3 })).status,
+    200,
+  );
+
+  const listed = await body(await h.post("/internal/oauth/automation/list", {}));
+  assert.equal(listed.automations.length, 1);
+  assert.equal(listed.automations[0].name, "gitlab:group/project:prod");
+  assert.equal(listed.automations[0].device_id, "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYZ");
+  assert.equal(listed.automations[0].device_name, "ci-bound-mac");
+  assert.equal(listed.automations[0].created_by, "device:admin");
+  assert.equal(listed.automations[0].token_issue_count, 1);
+  assert.equal(listed.automations[0].last_used_at_ms, 2000);
+  assert.equal(listed.automations[0].last_token_issued_at_ms, 2000);
+  assert.equal(listed.automations[0].last_rotated_at_ms, null);
+
+  const rotated = await body(await h.post("/internal/oauth/automation/rotate", {
+    client_id: "svc_gitlab_prod_01",
+    client_secret_hash: "secret-hash-v2",
+    rotated_by: "device:admin",
+    now_ms: 3000,
+  }));
+  assert.equal(rotated.ok, true);
+  const rotatedClient = await body(await h.post("/internal/oauth/client/get", { client_id: "svc_gitlab_prod_01" }));
+  assert.equal(rotatedClient.record.client_secret_hash, "secret-hash-v2");
+  const afterRotate = await body(await h.post("/internal/oauth/automation/list", {}));
+  assert.equal(afterRotate.automations[0].created_at_ms, 1000, "rotation must not rewrite creation time");
+  assert.equal(afterRotate.automations[0].created_by, "device:admin");
+  assert.equal(afterRotate.automations[0].last_rotated_at_ms, 3000);
+  assert.equal(afterRotate.automations[0].last_rotated_by, "device:admin");
+
+  const revoked = await body(await h.post("/internal/oauth/grant/revoke", {
+    client_id: "svc_gitlab_prod_01",
+    revoked_by: "device:admin",
+    now_ms: 4000,
+  }));
+  assert.equal(revoked.ok, true);
+  assert.equal(
+    (await h.post("/internal/oauth/access/verify", { token: issued.token.access_token, now_sec: 5 })).status,
+    401,
+    "revocation fences already-issued short-lived automation JWTs immediately",
+  );
+  assert.equal((await h.post("/internal/oauth/automation/token/issue", {
+    client_id: "svc_gitlab_prod_01",
+    resource: "https://issuer/mcp",
+    now_sec: 5,
+    access_ttl_sec: 3600,
+  })).status, 400);
+  assert.equal((await h.post("/internal/oauth/automation/rotate", {
+    client_id: "svc_gitlab_prod_01",
+    client_secret_hash: "secret-hash-v3",
+    rotated_by: "device:admin",
+    now_ms: 5000,
+  })).status, 409);
 });
 
 test("signing key is generated once, private JWK never leaves the internal public response", async () => {

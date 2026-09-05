@@ -157,7 +157,12 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         "herdr_since" => {
             let cursor = arguments.get("cursor").and_then(Value::as_u64).unwrap_or(0);
             let workspace = arguments.get("workspace").and_then(Value::as_str);
-            native_tools::since(context.cache, cursor, workspace)
+            let transition = context
+                .state_store
+                .lock()
+                .map_err(|_| "state store lock is poisoned".to_owned())
+                .and_then(|store| store.latest_generation_transition());
+            native_tools::since(context.cache, cursor, workspace, transition)
         }
         "herdr_call" => {
             let method = arguments

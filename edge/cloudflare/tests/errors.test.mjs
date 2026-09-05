@@ -64,5 +64,8 @@ test("errors: structured results carry requestId", () => {
   assert.equal(reconnectingResult({ requestId: "r1" }).retryable, true);
   assert.equal(reconnectingResult({ requestId: "r1" }).delivery_state, "not_delivered");
   assert.equal(uncertainResult({ requestId: "r1" }).retryable, false);
-  assert.equal(capacityResult({ requestId: "r1" }).retryable, true);
+  const capacity = capacityResult({ requestId: "r1" });
+  assert.equal(capacity.retryable, true);
+  assert.equal(capacity.delivery_state, "not_delivered");
+  assert.equal(capacity.retry_after_ms, 1_000);
 });

@@ -199,7 +199,7 @@ test("device pairing stores only digest-keyed verifiers, is single-use, and auth
   assert.equal((await replay.json()).code, "pairing_rejected");
 });
 
-test("pairing defaults the display name from the joining device when the owner did not override it", async () => {
+test("pairing defaults the display name from the joining device when the pairing creator did not override it", async () => {
   const { registry } = makeRegistry();
   const create = await registry.fetch(new Request("https://registry.internal/internal/devices/pairings", {
     method: "POST",

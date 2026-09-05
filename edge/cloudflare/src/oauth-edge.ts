@@ -96,7 +96,7 @@ export function oauthEdgeMetadata(identity: OAuthEdgeIdentity): Record<string, u
     registration_endpoint: `${iss}/oauth/register`,
     scopes_supported: [OAUTH_SCOPE],
     response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code", "refresh_token"],
+    grant_types_supported: ["authorization_code", "refresh_token", "client_credentials"],
     token_endpoint_auth_methods_supported: ["none", "private_key_jwt", "client_secret_post"],
     code_challenge_methods_supported: ["S256"],
     authorization_response_iss_parameter_supported: true, // RFC 9207 §4.2
@@ -216,7 +216,7 @@ export async function hashOAuthApprovalCode(
 // ---------------------------------------------------------------------------
 
 export type JwtVerdict =
-  | { ok: true; clientId?: string }
+  | { ok: true; clientId?: string; connectorId?: string; grantGeneration?: number; principalType?: string; deviceId?: string }
   /** Unverifiable (malformed / bad signature / bad alg / wrong issuer / bad JSON). */
   | { ok: false; kind: "unverifiable"; reason: string }
   /** Verified structurally but a required claim fails (aud/exp/nbf). */
@@ -311,7 +311,32 @@ export function createRs256AccessTokenVerifier(
       (typeof payload.client_id === "string" && payload.client_id.length > 0 && payload.client_id) ||
       (typeof payload.sub === "string" && payload.sub.length > 0 && payload.sub) ||
       undefined;
-    return clientId ? { ok: true, clientId } : { ok: true };
+    const connectorId =
+      typeof payload.connector_id === "string" && /^conn_[A-Za-z0-9_-]{8,128}$/.test(payload.connector_id)
+        ? payload.connector_id
+        : undefined;
+    const grantGeneration =
+      Number.isSafeInteger(payload.grant_generation) && Number(payload.grant_generation) > 0
+        ? Number(payload.grant_generation)
+        : undefined;
+    if ((connectorId === undefined) !== (grantGeneration === undefined)) {
+      return { ok: false, kind: "rejected", reason: "incomplete connector grant identity" };
+    }
+    const principalType =
+      typeof payload.principal_type === "string" && (payload.principal_type === "automation" || payload.principal_type === "connector")
+        ? payload.principal_type
+        : undefined;
+    const deviceId =
+      typeof payload.device_id === "string" && /^dev_[0-9A-HJKMNP-TV-Z]{26}$/i.test(payload.device_id)
+        ? payload.device_id
+        : undefined;
+    return {
+      ok: true,
+      ...(clientId ? { clientId } : {}),
+      ...(connectorId ? { connectorId, grantGeneration } : {}),
+      ...(principalType ? { principalType } : {}),
+      ...(deviceId ? { deviceId } : {}),
+    };
   };
   return { verify };
 }
@@ -338,6 +363,10 @@ export interface OpaqueAccessTokenStore {
 export interface AccessTokenInfo {
   ok: boolean;
   clientId?: string;
+  connectorId?: string;
+  grantGeneration?: number;
+  principalType?: string;
+  deviceId?: string;
 }
 
 /**
@@ -371,7 +400,15 @@ export async function resolveAccessToken(
       verdict = { ok: false, kind: "unverifiable", reason: "verification failed" };
     }
     if (verdict.ok) {
-      return verdict.clientId ? { ok: true, clientId: verdict.clientId } : { ok: true };
+      return {
+        ok: true,
+        ...(verdict.clientId ? { clientId: verdict.clientId } : {}),
+        ...(verdict.connectorId
+          ? { connectorId: verdict.connectorId, grantGeneration: verdict.grantGeneration }
+          : {}),
+        ...(verdict.principalType ? { principalType: verdict.principalType } : {}),
+        ...(verdict.deviceId ? { deviceId: verdict.deviceId } : {}),
+      };
     }
     // Structurally-valid JWT rejected on a claim → fail closed, no opaque fallback.
     if (verdict.kind === "rejected") return { ok: false };

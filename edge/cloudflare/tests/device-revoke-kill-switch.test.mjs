@@ -191,9 +191,9 @@ async function connectDevice(env, device) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Owner (OAuth/operator) revokes B without B's secret.
+// 1. Worker operator revokes B without B's secret.
 // ---------------------------------------------------------------------------
-test("owner revokes an enrolled device B without possessing B's device_secret", async () => {
+test("Worker operator revokes an enrolled device B without possessing B's device_secret", async () => {
   const env = makeEnv();
   const a = await pair(env, "owner-revoke-a");
   const b = await pair(env, "owner-revoke-b");
@@ -220,9 +220,9 @@ test("owner revokes an enrolled device B without possessing B's device_secret", 
 });
 
 // ---------------------------------------------------------------------------
-// 2. Default-workstation owner revokes B.
+// 2. Legacy default-workstation enrolled credential revokes B.
 // ---------------------------------------------------------------------------
-test("default-workstation owner link revokes B without B's secret", async () => {
+test("legacy default-workstation enrolled link revokes B without B's secret", async () => {
   const env = makeEnv();
   const b = await pair(env, "owner-ws-revoke-b");
   await connectDevice(env, b);
@@ -241,17 +241,14 @@ test("default-workstation owner link revokes B without B's secret", async () => 
 });
 
 // ---------------------------------------------------------------------------
-// 3. Member A cannot revoke B (zero registry/WorkstationDO mutation).
+// 3. Any enrolled device is an equal fleet-admin channel and may revoke B.
 // ---------------------------------------------------------------------------
-test("member device A cannot revoke B and causes zero mutation", async () => {
+test("enrolled device A can revoke B without an owner/member hierarchy", async () => {
   const env = makeEnv();
   const a = await pair(env, "member-a");
   const b = await pair(env, "member-b");
   await connectDevice(env, a);
   const bSocket = await connectDevice(env, b);
-
-  const beforeRegistryWrites = env.registryStorage.writeCount;
-  const beforeBStorageWrites = b.ws.storage.writeCount;
 
   const memberRevoke = await worker.fetch(postAsWorkstation(
     "/devices/revoke",
@@ -259,15 +256,13 @@ test("member device A cannot revoke B and causes zero mutation", async () => {
     a.workstation_id,
     a.device_secret,
   ), env);
-  assert.equal(memberRevoke.status, 401);
-  assert.equal((await memberRevoke.json()).code, "revoke_admin_required");
-
-  // Zero registry writes, zero B WorkstationDO writes, B socket untouched.
-  assert.equal(env.registryStorage.writeCount, beforeRegistryWrites, "member revoke must not mutate the registry");
-  assert.equal(b.ws.storage.writeCount, beforeBStorageWrites, "member revoke must not mutate the target WorkstationDO");
-  assert.equal(bSocket.closed, undefined, "member revoke must not close the target socket");
-  assert.equal(bSocket.attachment.active, true, "member revoke must leave the target socket active");
-  assert.equal(b.ws.subject.revoked, false, "member revoke must not set the target DO revocation tombstone");
+  assert.equal(memberRevoke.status, 200);
+  assert.equal((await memberRevoke.json()).device_id, b.device_id);
+  assert.equal(bSocket.closed?.code, 4401, "fleet revoke must close the target socket");
+  assert.equal(bSocket.attachment.active, false, "fleet revoke must mark the target socket inactive");
+  assert.equal(b.ws.subject.revoked, true, "fleet revoke must set the target DO revocation tombstone");
+  assert.equal(a.ws.sockets[0].closed, undefined, "admin device A must remain connected");
+  assert.equal(a.ws.sockets[0].attachment.active, true, "admin device A must remain active");
 });
 
 // ---------------------------------------------------------------------------

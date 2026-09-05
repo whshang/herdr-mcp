@@ -715,6 +715,7 @@ fn digest_update_key(event: &Value) -> Option<(String, String)> {
 
 struct SharedCache {
     state: RwLock<CacheState>,
+    cursor_watch: tokio::sync::watch::Sender<u64>,
     ready: Mutex<bool>,
     ready_condvar: Condvar,
     stop: AtomicBool,
@@ -731,8 +732,10 @@ pub struct EventCache {
 
 impl EventCache {
     pub fn start(client: HerdrClient) -> Self {
+        let (cursor_watch, _) = tokio::sync::watch::channel(0_u64);
         let shared = Arc::new(SharedCache {
             state: RwLock::new(CacheState::default()),
+            cursor_watch,
             ready: Mutex::new(false),
             ready_condvar: Condvar::new(),
             stop: AtomicBool::new(false),
@@ -753,9 +756,11 @@ impl EventCache {
     pub fn from_snapshot_for_test(snapshot: Value) -> Self {
         let mut state = CacheState::default();
         state.bootstrap(snapshot);
+        let (cursor_watch, _) = tokio::sync::watch::channel(state.digest_cursor);
         Self {
             shared: Arc::new(SharedCache {
                 state: RwLock::new(state),
+                cursor_watch,
                 ready: Mutex::new(true),
                 ready_condvar: Condvar::new(),
                 stop: AtomicBool::new(false),
@@ -770,6 +775,10 @@ impl EventCache {
 
     pub fn boot_id(&self) -> &str {
         &self.boot_id
+    }
+
+    pub fn subscribe_cursor(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.shared.cursor_watch.subscribe()
     }
 
     pub fn wait_ready(&self, timeout: Duration) -> bool {
@@ -1092,6 +1101,7 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
                 if let Ok(mut state) = shared.state.write() {
                     state.reconcile_snapshot(snapshot.value, now_iso());
                 }
+                publish_cursor(&shared);
             }
             Err(error) => {
                 shared.stream_connected.store(false, Ordering::Release);
@@ -1152,6 +1162,7 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
                         if let Ok(mut state) = shared.state.write() {
                             state.reconcile_snapshot(snapshot.value, now_iso());
                         }
+                        publish_cursor(&shared);
                     }
                     Err(error) => {
                         set_last_error(&shared, error);
@@ -1208,8 +1219,13 @@ fn run_loop(client: HerdrClient, shared: Arc<SharedCache>) {
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    let peer_closed = error.code == "event_stream_closed";
                     set_last_error(&shared, error.to_string());
-                    // Force a status-only replacement on the next iteration.
+                    if peer_closed {
+                        break;
+                    }
+                    // Transient status errors keep the topology stream alive and
+                    // retry only the per-pane status subscription.
                     status_subscriptions.clear();
                 }
             }
@@ -1250,6 +1266,7 @@ fn replace_status_stream(
     if let Ok(mut state) = shared.state.write() {
         state.reconcile_snapshot(snapshot.value, now_iso());
     }
+    publish_cursor(shared);
     *stream = next;
     *subscriptions = desired;
     clear_last_error(shared);
@@ -1267,13 +1284,31 @@ fn apply_live_event(
     } else {
         false
     };
+    publish_cursor(shared);
     if needs_reconcile {
         let snapshot = snapshot::fetch(client)?;
         if let Ok(mut state) = shared.state.write() {
             state.reconcile_snapshot(snapshot.value, now_iso());
         }
+        publish_cursor(shared);
     }
     Ok(())
+}
+
+fn publish_cursor(shared: &SharedCache) {
+    let Ok(state) = shared.state.read() else {
+        return;
+    };
+    let cursor = state.digest_cursor;
+    drop(state);
+    shared.cursor_watch.send_if_modified(|published| {
+        if *published == cursor {
+            false
+        } else {
+            *published = cursor;
+            true
+        }
+    });
 }
 
 fn discard_initial_replay(stream: &mut EventStream, stop: &AtomicBool) -> Result<usize, String> {
@@ -1471,6 +1506,24 @@ mod tests {
             next_reconnect_backoff(&mut failures),
             Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn cursor_watch_notifies_only_when_digest_cursor_changes() {
+        let cache = EventCache::from_snapshot_for_test(json!({}));
+        let mut receiver = cache.subscribe_cursor();
+        assert_eq!(*receiver.borrow(), 0);
+        assert!(!receiver.has_changed().unwrap());
+
+        if let Ok(mut state) = cache.shared.state.write() {
+            state.digest_cursor = 1;
+        }
+        publish_cursor(&cache.shared);
+        assert!(receiver.has_changed().unwrap());
+        assert_eq!(*receiver.borrow_and_update(), 1);
+
+        publish_cursor(&cache.shared);
+        assert!(!receiver.has_changed().unwrap());
     }
 
     fn fixture() -> Value {

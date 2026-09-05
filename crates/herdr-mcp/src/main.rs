@@ -28,6 +28,7 @@ mod herdr;
 mod herdr_supervisor;
 mod inspect;
 mod instance;
+mod instance_admin;
 mod link;
 mod local_skills;
 mod macos_credential_helper;
@@ -46,6 +47,7 @@ mod product_lifecycle;
 mod progressive_skills;
 mod projects;
 mod prompt;
+mod qualification;
 mod relay;
 mod release_trust;
 mod residue;
@@ -78,6 +80,10 @@ mod workstation;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Pin runtime start evidence at process entry so later cursor-reset
+    // attribution is measured against the actual process lifetime, not the
+    // first diagnostics call that happens to request build metadata.
+    let _ = runtime_meta::runtime_started_at_ms();
     match run() {
         Ok(code) => code,
         Err(error) => {
@@ -94,8 +100,16 @@ fn run() -> Result<ExitCode, String> {
         unsafe { std::env::set_var("HERDR_MCP_INSTANCE", name) };
     }
     match parsed.command {
-        cli::Command::Help => {
-            print!("{}", cli::help());
+        cli::Command::Help { section } => {
+            let text = match section {
+                cli::HelpSection::General => cli::help(),
+                cli::HelpSection::Worker => cli::worker_help(),
+                cli::HelpSection::Connector => cli::connector_help(),
+                cli::HelpSection::Automation => cli::automation_help(),
+                cli::HelpSection::Instance => cli::instance_help(),
+                cli::HelpSection::Qualification => cli::qualification_help(),
+            };
+            print!("{text}");
             Ok(ExitCode::SUCCESS)
         }
         cli::Command::Version => {
@@ -196,6 +210,8 @@ fn run() -> Result<ExitCode, String> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        cli::Command::Instance(command) => instance_admin::run(command),
+        cli::Command::Qualification(command) => qualification::run(command),
         cli::Command::Worker(command) => worker::run(command),
         cli::Command::Dev(command) => dev::run(command),
         cli::Command::Candidate { port } => {
@@ -203,7 +219,24 @@ fn run() -> Result<ExitCode, String> {
             mcp_http::serve_candidate(port)
         }
         cli::Command::Service(command) => service_lifecycle::run(command),
-        cli::Command::Update(command) => updater::run(command),
+        cli::Command::Update(command) => {
+            let trigger = match &command {
+                cli::UpdateCommand::Auto => Some("auto_update"),
+                cli::UpdateCommand::Apply { .. } => Some("manual_update"),
+                _ => None,
+            };
+            if let Some(trigger) = trigger {
+                // Fail before update network/discovery/download work. The
+                // service manager re-checks under its mutation lease before
+                // any generation replacement, so this early gate improves
+                // latency while the service boundary remains authoritative.
+                qualification::ensure_generation_change_allowed(trigger)?;
+                // Detached update workers inherit this non-secret attribution
+                // tag and the candidate service-install records it durably.
+                unsafe { std::env::set_var("HERDR_MCP_GENERATION_TRIGGER", trigger) };
+            }
+            updater::run(command)
+        }
         cli::Command::Extension(command) => match command {
             cli::ExtensionCommand::StandaloneInstall { reference } => {
                 standalone_extension::run_install(standalone_extension::StandaloneInstallOptions {

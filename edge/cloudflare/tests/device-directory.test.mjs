@@ -21,12 +21,12 @@ function registryWith(devices) {
 test("device directory joins durable identity with read-only WorkstationDO state", async () => {
   const registry = {
     fetch: async () => response({ ok: true, devices: [
-      { device_id: DEV_A, workstation_id: "prod-real-runtime", name: "macbook", authorization: "active", scheduling: "enabled" },
-      { device_id: DEV_B, workstation_id: DEV_B, name: "build-linux", authorization: "active", scheduling: "paused" },
+      { device_id: DEV_A, workstation_id: "prod-real-runtime", name: "macbook", authorization: "active", scheduling: "enabled", enrolled_at_ms: 100 },
+      { device_id: DEV_B, workstation_id: DEV_B, name: "build-linux", authorization: "active", scheduling: "paused", enrolled_at_ms: 200 },
     ] }),
   };
   const statuses = new Map([
-    ["prod-real-runtime", { online: true, connected: true, runtimeHealth: "healthy", runtimeVersion: "0.4.2", runtimeGeneration: "rust-a", lastSeenAgoMs: 12, activeRequests: 2 }],
+    ["prod-real-runtime", { online: true, connected: true, runtimeHealth: "healthy", runtimeVersion: "0.4.2", runtimeGeneration: "rust-a", lastSeenAtMs: 900, lastSeenAgoMs: 12, lastRecoveredAtMs: 5_000, lastReconnectDurationMs: 220, reconnectCount: 2, lastReconnectCrossedRecycleThreshold: false, activeRequests: 2 }],
     [DEV_B, { online: false, connected: true, runtimeHealth: "healthy", runtimeVersion: "0.4.2", activeRequests: 0 }],
   ]);
   const devices = await listPublicDevices(registry, (id) => ({ fetch: async () => response(statuses.get(id)) }));
@@ -34,7 +34,15 @@ test("device directory joins durable identity with read-only WorkstationDO state
   assert.equal(devices[0].device_id, DEV_A);
   assert.equal(devices[0].connection, "online");
   assert.equal(devices[0].runtime_generation, "rust-a");
+  assert.equal(devices[0].enrolled_at_ms, 100);
+  assert.equal(devices[0].last_seen_at_ms, 900);
+  assert.equal(devices[0].last_recovered_at_ms, 5_000);
+  assert.equal(devices[0].last_reconnect_duration_ms, 220);
+  assert.equal(devices[0].reconnect_count, 2);
+  assert.equal(devices[0].last_reconnect_crossed_recycle_threshold, false);
   assert.equal(devices[1].connection, "stale");
+  assert.equal(devices[1].last_recovered_at_ms, null);
+  assert.equal(devices[1].reconnect_count, 0);
   assert.equal(Object.hasOwn(devices[0], "workstation_id"), false);
   assert.equal(Object.hasOwn(devices[0], "credential_id"), false);
 });

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { WorkstationDO } from "../dist/workstation-do.js";
+import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
 
 class FakeStorage {
   constructor(events) {
@@ -102,4 +103,53 @@ test("recently disconnected workstation waits and wakes immediately when a valid
   const elapsed = Date.now() - started;
   assert.ok(elapsed >= 10 && elapsed < 80, `validated link should wake grace promptly, elapsed=${elapsed}`);
   assert.deepEqual(events, [], "reconnect grace must remain process-local with zero DO writes/alarms");
+});
+
+test("validated hello records disconnect recovery duration and count in durable status", async () => {
+  const { subject } = makeSubject();
+  await init(subject);
+  const disconnectedAtMs = Date.now() - 42;
+  subject.session = {
+    schemaVersion: 1,
+    workstationId: "prod-real-runtime",
+    status: "offline",
+    connectedAtMs: disconnectedAtMs - 1_000,
+    disconnectedAtMs,
+    reconnectCount: 3,
+  };
+  const sent = [];
+  let attachment = null;
+  const ws = {
+    serializeAttachment: (value) => { attachment = value; },
+    deserializeAttachment: () => attachment ?? {},
+    send: (frame) => sent.push(JSON.parse(frame)),
+    close: () => {},
+  };
+  await subject.handleHello({
+    protocol_version: 1,
+    kind: "hello",
+    workstation_id: "prod-real-runtime",
+    link_version: "0.4.6",
+    boot_id: "boot-recovered",
+    connected_at_ms: Date.now(),
+    runtime: {
+      runtime_version: "0.4.6",
+      runtime_generation: "rust-recovered",
+      contract_epoch: EPOCH2_CONTRACT.contract_epoch,
+      contract_hash: EPOCH2_CONTRACT.contract_hash,
+    },
+    capabilities: [],
+  }, ws);
+
+  const response = await subject.fetch(new Request("https://do/internal/status"));
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.status, "online");
+  assert.equal(body.reconnectCount, 4);
+  assert.ok(body.lastReconnectDurationMs >= 0);
+  assert.ok(body.lastReconnectDurationMs < 5_000);
+  assert.equal(body.lastReconnectCrossedRecycleThreshold, false);
+  assert.equal(typeof body.lastRecoveredAtMs, "number");
+  assert.equal(sent.at(-1).kind, "hello_ack");
+  assert.equal(sent.at(-1).ok, true);
 });

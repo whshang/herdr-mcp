@@ -44,6 +44,8 @@ export interface McpResponse {
 export interface McpClientContext {
   userAgent?: string | null;
   oauthClientId?: string | null;
+  /** Bound device_id for an automation principal; forces routing to that device. */
+  automationDeviceId?: string | null;
 }
 
 export interface McpDeps {
@@ -63,7 +65,7 @@ export interface McpDeps {
     | { ok: true; client_id: string; approved_at_ms: number | null }
     | { ok: false; code: string }
   >;
-  revokeConnector?(clientId: string): Promise<
+  revokeConnector?(connectorId: string): Promise<
     | { ok: true }
     | { ok: false; code: string }
   >;
@@ -84,6 +86,8 @@ interface ForwardEnvelope {
 const PUBLIC_TOOL_NAMES: ReadonlySet<string> = new Set<string>(PUBLIC_CONTRACT.tools.map((tool) => tool.name));
 const GENERATION_SUPERSEDE_RETRY_BACKOFF_MS = [100, 400, 1_000, 1_500] as const;
 const GENERATION_SUPERSEDE_CLIENT_RETRY_AFTER_MS = 1_000;
+const TRANSIENT_EDGE_HTTP_RETRY_BACKOFF_MS = [100, 400] as const;
+const TRANSIENT_EDGE_HTTP_RETRY_AFTER_MAX_MS = 2_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -177,6 +181,26 @@ function generationSupersededRetryDelay(error: RelayErrorResult | undefined, att
     return Math.min(hinted, 2_000);
   }
   return GENERATION_SUPERSEDE_RETRY_BACKOFF_MS[attempt] ?? 0;
+}
+
+function transientEdgeHttpStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function retryAfterMs(response: Response, nowMs: number): number | undefined {
+  const raw = response.headers.get("retry-after")?.trim();
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(Math.ceil(seconds * 1_000), TRANSIENT_EDGE_HTTP_RETRY_AFTER_MAX_MS);
+  }
+  const at = Date.parse(raw);
+  if (!Number.isFinite(at)) return undefined;
+  return Math.min(Math.max(0, at - nowMs), TRANSIENT_EDGE_HTTP_RETRY_AFTER_MAX_MS);
+}
+
+function transientEdgeHttpRetryDelay(response: Response, attempt: number, nowMs: number): number {
+  return retryAfterMs(response, nowMs) ?? TRANSIENT_EDGE_HTTP_RETRY_BACKOFF_MS[attempt] ?? 0;
 }
 
 async function waitMs(delayMs: number): Promise<void> {
@@ -310,12 +334,26 @@ export async function handleMcp(
         );
       }
       try {
-        const devices = await deps.listDevices();
+        const allDevices = await deps.listDevices();
+        const boundDeviceId = deps.client?.automationDeviceId ?? null;
+        // An automation principal may only see its bound device; it must not
+        // use fleet discovery to bypass its device scope.
+        const devices = boundDeviceId && Array.isArray(allDevices)
+          ? allDevices.filter((device) => isRecord(device) && device.device_id === boundDeviceId)
+          : allDevices;
         return rpcResult(id, callToolResult({
           ok: true,
           devices,
-          pairing_hint: "When the user asks to add a new computer or generate its setup link, call herdr_call(method=\"herdr_mcp.device.pair\", params='{\"ttl_seconds\":600,\"name\":\"<optional>\"}'). params is a JSON string in the public schema. Do not provide a device selector. Present the returned pairing address, one-time code, exact expiry, and new-device command together.",
-          revoke_hint: "When the user explicitly asks to permanently revoke an enrolled computer, select its immutable device_id from this list and call herdr_call(method=\"herdr_mcp.device.revoke\", params='{\"device_id\":\"dev_...\",\"confirm\":true}'). Never revoke by display name. Revoke is permanent for that device identity and credential.",
+          ...(boundDeviceId
+            ? {
+                scope: "bound_device",
+                bound_device_id: boundDeviceId,
+                pairing_hint: "This automation principal is bound to one enrolled device and cannot add or revoke computers. To add a computer, run `herdr-mcp worker pair` on an already-enrolled computer and `herdr-mcp worker connect` on the new one.",
+              }
+            : {
+                pairing_hint: "To add a computer, run `herdr-mcp worker pair` on an already-enrolled computer and `herdr-mcp worker connect` on the new one. A completely new first Worker must be bootstrapped before pairing. Present the pairing address, one-time code, exact expiry, and new-device command together.",
+                revoke_hint: "To permanently revoke an enrolled computer, run `herdr-mcp worker revoke <device_id>` on an already-enrolled computer. Never revoke by display name.",
+              }),
         }));
       } catch {
         return rpcResult(
@@ -327,15 +365,15 @@ export async function handleMcp(
 
     const localMethod = name === "herdr_call" && typeof args.method === "string" ? args.method : null;
 
-    // Edge-local pairing creation: allows an OAuth-authorized owner to initiate
-    // a device pairing session directly at Edge without requiring an enrolled
-    // or online workstation.
+    // Edge-local pairing creation. The operation does not route through a
+    // workstation, but the current MCP principal must already have explicit
+    // Worker fleet-admin authority.
     if (localMethod === "herdr_mcp.device.pair") {
       if (args.device !== undefined) {
         return rpcResult(id, callToolResult({
           ok: false,
           code: "device_selector_not_allowed",
-          message: "herdr_mcp.device.pair is Edge-local and does not accept a device selector; no existing workstation is required or used",
+          message: "herdr_mcp.device.pair is Edge-local and does not accept a device selector; authorization comes from the current Worker fleet-admin principal rather than a routed workstation",
           retryable: false,
           delivery_state: "not_delivered",
           failure_layer: "edge_routing",
@@ -481,7 +519,7 @@ export async function handleMcp(
             pairing_address: result.pairing_address,
             worker_origin: result.worker_origin,
             new_device_command: `herdr-mcp worker connect "${result.pairing_address}"`,
-            instructions: `This one-time pairing expires at ${expiresAt}. Run on the new computer: herdr-mcp worker connect "${result.pairing_address}" and enter verification code ${result.code} only when the no-echo prompt asks for it.`,
+            instructions: `This one-time pairing expires at ${expiresAt}. Run on the new computer: herdr-mcp worker connect "${result.pairing_address}" and enter verification code ${result.code} only when the visible CLI prompt asks for it.`,
           }),
         );
       } catch {
@@ -492,7 +530,7 @@ export async function handleMcp(
       }
     }
 
-    // Edge-local owner revoke: permanently revoke one enrolled immutable device
+    // Edge-local fleet-admin revoke: permanently revoke one enrolled immutable device
     // identity without requiring any workstation to be online. This stays under
     // the existing herdr_call public tool, so it does not change contract epoch
     // or tool count.
@@ -655,13 +693,13 @@ export async function handleMcp(
       }
 
       for (const key of Object.keys(methodParams)) {
-        if (key !== "client_id" && key !== "confirm") {
+        if (key !== "connector_id" && key !== "confirm") {
           return rpcResult(id, callToolResult({ ok: false, code: "invalid_params", message: `unknown parameter '${key}'` }, true));
         }
       }
-      const clientId = typeof methodParams.client_id === "string" ? methodParams.client_id.trim() : "";
-      if (!clientId || clientId.length > 4096) {
-        return rpcResult(id, callToolResult({ ok: false, code: "invalid_client_id", retryable: false }, true));
+      const connectorId = typeof methodParams.connector_id === "string" ? methodParams.connector_id.trim() : "";
+      if (!/^conn_[A-Za-z0-9_-]{8,128}$/.test(connectorId)) {
+        return rpcResult(id, callToolResult({ ok: false, code: "invalid_connector_id", retryable: false }, true));
       }
       if (methodParams.confirm !== true) {
         return rpcResult(id, callToolResult({ ok: false, code: "confirmation_required", message: "connector revoke requires confirm=true", retryable: false }, true));
@@ -669,15 +707,34 @@ export async function handleMcp(
       if (!deps.revokeConnector) {
         return rpcResult(id, callToolResult({ ok: false, code: "connector_revoke_unavailable", retryable: false }, true));
       }
-      const result = await deps.revokeConnector(clientId);
+      const result = await deps.revokeConnector(connectorId);
       if (!result.ok) return rpcResult(id, callToolResult({ ok: false, code: result.code, retryable: false }, true));
       return rpcResult(id, callToolResult({
         ok: true,
         action: "connector_revoke",
-        client_id: clientId,
+        connector_id: connectorId,
         revoked: true,
-        message: "Connector grant revoked. Existing v0.4.6-issued access/refresh credentials are fenced by the grant tombstone.",
+        message: "Connector instance revoked. Existing access/refresh credentials for this connector identity are fenced immediately.",
       }));
+    }
+
+    // Unknown Edge-private namespaces fail closed rather than routing to a
+    // workstation. A removed or mistyped herdr_mcp.* private method must never
+    // be forwarded as ordinary MCP work, so a WebChat Connector cannot use an
+    // obsolete/unknown private method to reach the fleet control plane. The
+    // text.read/write methods are legitimate workstation-routed transfers and
+    // pass through to normal routing below.
+    if (localMethod !== null && localMethod.startsWith("herdr_mcp.")) {
+      if (localMethod !== "herdr_mcp.text.read" && localMethod !== "herdr_mcp.text.write") {
+        return rpcResult(id, callToolResult({
+          ok: false,
+          code: "unknown_method",
+          message: `${localMethod} is not a known Edge-local herdr_mcp private method; it is not forwarded to any workstation. If it is a fleet-administration action, run the corresponding herdr-mcp command on an enrolled computer.`,
+          retryable: false,
+          delivery_state: "not_delivered",
+          failure_layer: "edge_routing",
+        }, true));
+      }
     }
 
     const selectorValue = args.device;
@@ -708,16 +765,53 @@ export async function handleMcp(
         }, true));
       }
     }
+    const boundAutomationDevice = deps.client?.automationDeviceId ?? null;
     let route: DeviceRouteResult;
     try {
-      route = deps.resolveDevice
-        ? await deps.resolveDevice(selectorValue, args)
-        : {
-            ok: true,
-            device_id: null,
-            workstation_id: workstationId,
-            routing_reason: "legacy_default_device",
-          };
+      if (boundAutomationDevice) {
+        // An automation principal is scoped to exactly one enrolled device. An
+        // omitted selector routes automatically to the bound device; any explicit
+        // selector or device ref referring to a different device fails closed so
+        // the automation client can never route to or discover another device.
+        const { extractDeviceIdFromArgs } = await import("./device-refs.js");
+        const ref = extractDeviceIdFromArgs(args);
+        const refTarget = ref ? ref.deviceId : null;
+        if (selectorValue !== undefined && selectorValue.trim() !== "") {
+          const normalizedSelector = normalizeDeviceId(selectorValue.trim());
+          const selectorTarget = normalizedSelector ?? selectorValue.trim();
+          if (selectorTarget !== boundAutomationDevice) {
+            return rpcResult(id, callToolResult({
+              ok: false,
+              code: "automation_device_scope_violation",
+              message: "This automation principal is bound to one device and cannot route to another enrolled device. Use the bound device id or omit the device selector.",
+              retryable: false,
+              delivery_state: "not_delivered",
+              failure_layer: "edge_routing",
+              bound_device_id: boundAutomationDevice,
+            }, true));
+          }
+        } else if (refTarget !== null && refTarget !== boundAutomationDevice) {
+          return rpcResult(id, callToolResult({
+            ok: false,
+            code: "automation_device_scope_violation",
+            message: "This automation principal is bound to one device and cannot route to another enrolled device via a device ref.",
+            retryable: false,
+            delivery_state: "not_delivered",
+            failure_layer: "edge_routing",
+            bound_device_id: boundAutomationDevice,
+          }, true));
+        }
+        route = await deps.resolveDevice!(boundAutomationDevice, args);
+      } else {
+        route = deps.resolveDevice
+          ? await deps.resolveDevice(selectorValue, args)
+          : {
+              ok: true,
+              device_id: null,
+              workstation_id: workstationId,
+              routing_reason: "legacy_default_device",
+            };
+      }
     } catch {
       return rpcResult(
         id,
@@ -802,14 +896,44 @@ export async function handleMcp(
       try {
         forwarded = (await response.json()) as ForwardEnvelope;
       } catch {
+        const transientHttp = transientEdgeHttpStatus(response.status);
+        if (transientHttp && opClass === "read" && attempt < TRANSIENT_EDGE_HTTP_RETRY_BACKOFF_MS.length) {
+          const retryRequestId = newRequestId();
+          const retryDelayMs = transientEdgeHttpRetryDelay(response, attempt, deps.now?.() ?? Date.now());
+          deps.logger.warn("mcp.tools_call.edge_http_retry", {
+            requestId: activeRequestId,
+            retryRequestId,
+            workstationId: route.workstation_id,
+            deviceId: route.device_id,
+            op: name,
+            opClass,
+            httpStatus: response.status,
+            attempt: attempt + 1,
+            retryDelayMs,
+          });
+          await waitMs(retryDelayMs);
+          activeRequestId = retryRequestId;
+          activeInternal = { ...activeInternal, requestId: retryRequestId };
+          continue;
+        }
+        const hintedRetryAfterMs = transientHttp
+          ? retryAfterMs(response, deps.now?.() ?? Date.now())
+          : undefined;
         return rpcResult(
           id,
           callToolResult(
             {
               ok: false,
-              code: "invalid_edge_response",
-              retryable: false,
+              code: transientHttp ? "edge_http_transient" : "invalid_edge_response",
+              retryable: transientHttp && opClass === "read",
               delivery_state: "delivery_unknown",
+              ...(transientHttp ? { http_status: response.status } : {}),
+              ...(hintedRetryAfterMs !== undefined ? { retry_after_ms: hintedRetryAfterMs } : {}),
+              message: transientHttp
+                ? (opClass === "read"
+                    ? "temporary Edge HTTP failure; retrying this read is safe"
+                    : "temporary Edge HTTP failure; mutation delivery is unknown — inspect state before replay")
+                : null,
               request_id: activeRequestId,
               workstation_id: route.workstation_id,
             },

@@ -27,24 +27,22 @@ Herdr 的多设备模型是：一个公网 Worker/Connector，后面连接多台
 
 ## 把新电脑加入设备组
 
-### 1. 推荐：直接在 ChatGPT 对话中创建短期配对
+### 1. 从已登记设备创建短期配对
 
-在已经授权的 Herdr 对话里直接说：
+在任意一台已登记的电脑上运行：
 
-```text
-给我的新电脑生成一个 Herdr 配对链接，10 分钟有效。
+```bash
+herdr-mcp worker pair
 ```
 
-ChatGPT 可以直接在 Edge 创建 pairing，不要求任何已登记工作站在线。返回结果应把这些信息一起展示：
+`worker pair` 属于设备/操作员管理的 fleet 动作，需要凭据证明本机已经加入目标 Worker。它会在 Worker 控制面创建 pairing，不需要把动作路由到任何工作站。返回结果应把这些信息一起展示：
 
 - 包含高熵 pairing id 的配对地址；
 - 一次性 6 位验证码；
 - 精确过期时间；
 - 可直接复制到新电脑执行的 `herdr-mcp worker connect "<pairing-address>"` 命令。
 
-正常最长有效期为 600 秒，应立即使用，不要把它当成长期邀请链接保存。
-
-CLI fallback：在 fleet 中任意已授权 macOS 电脑运行 `herdr-mcp worker pair` 仍可创建同样的短期 pairing；CLI 同时显示精确 UTC 过期时间和相对有效期。
+正常最长有效期为 600 秒，应立即使用，不要把它当成长期邀请链接保存。绝不能在正在安装的全新电脑上运行 `worker pair` 来探测是否已有 fleet。如果这是第一套 Herdr Worker、还不存在任何已登记设备，先完成 Cloudflare Worker 初始化再配对。
 
 ### 2. 在新电脑上连接
 
@@ -54,7 +52,7 @@ CLI fallback：在 fleet 中任意已授权 macOS 电脑运行 `herdr-mcp worker
 herdr-mcp worker connect "<pairing-address>"
 ```
 
-随后 CLI 会通过不回显输入要求 6 位验证码。验证码不会作为普通命令行参数传入。
+随后 CLI 会要求输入 6 位验证码，输入的数字会正常显示，便于核对。验证码不会作为普通命令行参数传入，因此不会进入 shell history。
 
 默认情况下，新加入电脑会自动使用 macOS 的**电脑名称（Computer Name）**作为 device display name。只有用户明确希望使用其他名字时，才传 `--name "<device-name>"`。如果创建配对时显式使用了 `worker pair --name ...`，它同样属于用户覆盖，并优先于新电脑自动读取的名称。
 
@@ -86,17 +84,13 @@ herdr-mcp worker rename "<new-device-name>"
 
 `herdr-mcp device rename ...` 是等价别名。rename 只修改面向人的显示名称；不可变 `device_id`、workstation identity、设备凭据、授权和调度状态全部保持不变。Link 重连不会覆盖用户显式改过的名字。最初的 default/legacy workstation 在首次登记时也会自动记录本机 Computer Name。
 
-如果要永久撤销另一台已登记设备的授权，现在优先直接在已经授权的 ChatGPT/Herdr 网页对话里完成：让 ChatGPT 列出设备，选中目标设备不可变的 `device_id`，然后永久 revoke。Edge-local 动作等价于：
-
-```text
-herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
-```
-
-这个路径不要求任何工作站在线，也绝不接受 display name。CLI fallback：先通过 `herdr_devices` 取得不可变的 `device_id`，然后在 owner 工作站运行：
+如果要永久撤销另一台已登记设备的授权，在任意已登记工作站运行。先通过 `herdr_devices` 取得不可变的 `device_id`，然后：
 
 ```bash
 herdr-mcp worker revoke "<device-id>" --confirm
 ```
+
+设备/操作员负责 fleet 管理。这个动作绝不接受 display name，必须使用不可变 `device_id`。已批准的 WebChat Connector 只有普通 MCP 权限，不能 revoke Device。已登记设备之间不存在 owner/member 高下之分，都是同一操作员控制平面下的对等成员。
 
 revoke 对该设备身份和凭据是永久操作：在线 Link 会立即断开，旧凭据以后不能再次连接；系统内部会保留最小 revoked tombstone 防止旧身份“复活”，但正常设备列表会隐藏这些 tombstone。以后若要重新加入这台电脑，需要重新生成配对并登记为新的设备身份。
 
@@ -116,7 +110,6 @@ revoke 对该设备身份和凭据是永久操作：在线 Link 会立即断开�
 - 6 位验证码单次使用且有效期很短；
 - 连续输错 5 次会永久锁定本次配对，应重新创建配对；
 - pairing id 具有高熵，并放在 URL fragment 中，避免进入普通 HTTP access log 路径；
-- 用户明确在已 OAuth 授权的 owner 对话里创建 pairing 时，该对话可以显示这枚一次性验证码；除此之外，不得把验证码持久化到 argv、shell history、Git、普通日志、复制出来的 transcript 或无人值守自动化；
 - 最终单设备凭据不得打印或复制，应始终留在操作系统凭据存储中。
 
 ## 恢复与重试

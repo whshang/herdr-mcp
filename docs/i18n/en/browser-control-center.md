@@ -40,7 +40,7 @@ The panel follows the same extension language setting as Options and the in-page
 
 The Control Center also shows a compact read-only Worker device list. It keeps device authorization, connection, and health separate and includes runtime version/generation plus last-seen freshness. The locally connected computer is marked explicitly, and local Link-generation mismatch is shown when the runtime can prove it.
 
-This view does not give Chrome a Worker credential. The Side Panel asks the extension service worker, which uses the existing Native Messaging / local-IPC path; the local runtime performs the owner-authorized Worker read and returns only the sanitized device summary. A joined member computer that does not have Worker-owner authority sees an explicit permission explanation instead of receiving broader fleet privileges.
+This view does not give Chrome a Worker credential. The Side Panel asks the extension service worker, which uses the existing Native Messaging / local-IPC path; the local runtime performs the Worker read with the current enrolled-device credential and returns only the sanitized device summary. Enrolled devices have no owner/member hierarchy. If this machine does not have a usable fleet credential, the panel shows an explicit permission explanation instead of giving the browser broader authority.
 
 Device inventory is refreshed when the Control Center opens, on explicit Refresh, and when a stale hidden panel becomes visible again. It does not add a fixed polling loop.
 

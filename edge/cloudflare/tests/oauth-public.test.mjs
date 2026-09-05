@@ -38,7 +38,7 @@ const ISSUER = "https://herdr-mcp.example.com";
 const IDENTITY = createOAuthIdentity(ISSUER);
 const NOW_MS = 1_700_000_000_000;
 const NOW_SEC = Math.floor(NOW_MS / 1000);
-const APPROVAL_SECRET = "test-owner-approval-secret-not-for-production";
+const APPROVAL_SECRET = "test-fleet-approval-secret-not-for-production";
 
 function makeOptions(overrides = {}) {
   const storage = new StorageMock();
@@ -115,17 +115,35 @@ async function pendingAuthorization(opts, client_id, redirect_uri = "https://app
     code_challenge: challenge, code_challenge_method: "S256", state,
   });
   const resp = await GET(`/oauth/authorize?${qs}`, opts);
-  assert.equal(resp.status, 200, "unapproved connector should receive the approval page, not an OAuth code");
+  const unexpectedBody = resp.status === 200 ? "" : await resp.clone().text();
+  assert.equal(
+    resp.status,
+    200,
+    `unapproved connector should receive the approval page, not an OAuth code; body=${unexpectedBody}`,
+  );
   assert.match(resp.headers.get("content-type") ?? "", /^text\/html/);
   const html = await resp.text();
   const requestId = /const requestId="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
   const resumeToken = /const resumeToken="([A-Za-z0-9_-]+)";/.exec(html)?.[1];
-  const approvalCode = /<p class="code">(\d{6})<\/p>/.exec(html)?.[1];
+  const approvalCode = /<div class="approval-code">(\d{6})<\/div>/.exec(html)?.[1];
   assert.ok(requestId, "approval page should expose request id");
   assert.ok(resumeToken, "approval page should carry an opaque resume token for same-page polling");
   assert.ok(approvalCode, "approval page should expose the one-time six-digit code");
   assert.ok(html.includes(`herdr-mcp connector approve ${requestId}`));
-  assert.match(html, /already-authorized Herdr WebChat/);
+  assert.match(html, /id="copy-command"/);
+  assert.match(html, /navigator\.clipboard/);
+  assert.match(html, /document\.execCommand\('copy'\)/);
+  assert.match(html, /Requires herdr-mcp v0\.4\.6 or newer\./);
+  assert.match(html, /visible CLI prompt/);
+  assert.doesNotMatch(html, /no-echo prompt/);
+  assert.match(html, /unknown command 'connector'/);
+  assert.match(html, /computer that is already enrolled in this Worker/);
+  assert.match(html, /Approval grants ordinary MCP access; it does not grant fleet-administration authority\./);
+  assert.doesNotMatch(html, /another Herdr WebChat/);
+  assert.match(resp.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+  assert.match(resp.headers.get("content-security-policy") ?? "", /style-src 'unsafe-inline'/);
+  assert.match(resp.headers.get("content-security-policy") ?? "", /script-src 'unsafe-inline'/);
+  assert.equal(resp.headers.get("x-frame-options"), "DENY");
   return { requestId, resumeToken, approvalCode, verifier, challenge, state };
 }
 
@@ -136,7 +154,7 @@ async function approvePending(opts, pending, approver = "device:dev_owner") {
     approver,
     NOW_MS,
   );
-  assert.equal(approved.ok, true, "owner approval should succeed");
+  assert.equal(approved.ok, true, "fleet approval should succeed");
   const poll = await GET(`/oauth/authorize/poll?${new URLSearchParams({
     request_id: pending.requestId,
     resume_token: pending.resumeToken,
@@ -148,7 +166,7 @@ async function approvePending(opts, pending, approver = "device:dev_owner") {
   return { code: loc.searchParams.get("code"), location: loc };
 }
 
-/** Authorize for a client through the explicit owner-approval flow. */
+/** Authorize for a client through the explicit fleet-approval flow. */
 async function makeAuthCode(opts, client_id, redirect_uri = "https://app.example/cb") {
   const grant = await opts.store.getGrant(client_id);
   if (grant?.status === "active") {
@@ -302,6 +320,21 @@ test("all six DCR aliases register and the client persists via the DO", async ()
   }
 });
 
+test("multiple fresh DCR clients remain resolvable under a fixed handler clock", async () => {
+  // Regression: DCR cleanup must use the same authoritative request/handler
+  // clock as issued_at. A fixed injected nowMs must not make a freshly
+  // registered sibling look expired and delete it.
+  const opts = makeOptions();
+  const a = await registerClient(opts, { client_name: "client-a" });
+  const b = await registerClient(opts, { client_name: "client-b" });
+  const c = await registerClient(opts, { client_name: "client-c" });
+  for (const { client_id } of [a, b, c]) {
+    const found = await opts.store.getClient(client_id);
+    assert.ok(found, `client ${client_id} must remain resolvable`);
+    assert.equal(found.client_secret_hash.length, 64);
+  }
+});
+
 test("DCR rejects missing redirect_uris; no client is created", async () => {
   const opts = makeOptions();
   const resp = await POST("/oauth/register", { scope: "mcp" }, opts);
@@ -323,7 +356,7 @@ test("DCR client_secret_post stores SHA-256 hash, not the raw secret", async () 
 // 6. Authorization endpoint
 // ---------------------------------------------------------------------------
 
-test("authorize: first use requires owner approval, then issues RFC9207 one-use code", async () => {
+test("authorize: first use requires fleet approval, then issues RFC9207 one-use code", async () => {
   const opts = makeOptions();
   const { client_id } = await registerClient(opts, { token_endpoint_auth_method: "none" });
   const pending = await pendingAuthorization(opts, client_id, "https://app.example/cb", "st123");
@@ -365,6 +398,42 @@ test("authorize: first use requires owner approval, then issues RFC9207 one-use 
   const replay = await POST("/oauth/token", tokenBody(client_id, loc.searchParams.get("code"), pending.verifier), opts);
   assert.equal(replay.status, 400);
   assert.equal((await replay.json()).error, "invalid_grant");
+});
+
+test("authorize: identical pending retry renders safe recovery page instead of JSON", async () => {
+  const opts = makeOptions();
+  const { client_id } = await registerClient(opts, {
+    token_endpoint_auth_method: "none",
+    client_name: "Retrying WebChat",
+  });
+  const pending = await pendingAuthorization(opts, client_id, "https://app.example/cb", "same-state");
+  const qs = new URLSearchParams({
+    client_id,
+    redirect_uri: "https://app.example/cb",
+    response_type: "code",
+    code_challenge: pending.challenge,
+    code_challenge_method: "S256",
+    state: pending.state,
+  });
+
+  const retry = await GET(`/oauth/authorize?${qs}`, opts);
+  assert.equal(retry.status, 200);
+  assert.match(retry.headers.get("content-type") ?? "", /^text\/html/);
+  assert.equal(retry.headers.get("cache-control"), "no-store");
+  assert.match(retry.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+  assert.ok(Number(retry.headers.get("retry-after")) > 0);
+  const html = await retry.text();
+  assert.match(html, /Approval already pending/);
+  assert.match(html, /Use the original approval page if it is still open/);
+  assert.match(html, /retry automatically after the old request expires/);
+  assert.ok(html.includes(pending.requestId));
+  assert.match(html, /location\.reload\(\)/);
+  assert.doesNotMatch(html, /class="approval-code"/);
+  assert.doesNotMatch(html, /const resumeToken=/);
+  assert.doesNotMatch(html, /authorization_pending/);
+
+  const approvals = await opts.store.getApproval(pending.requestId, NOW_MS);
+  assert.ok(approvals, "the original pending approval must remain authoritative");
 });
 
 test("authorize: unknown client returns 400 JSON, no redirect", async () => {
@@ -483,6 +552,48 @@ test("authorize+token: Claude URL client_id resolves its CIMD metadata without D
   assert.equal(metadataFetches, 2, "authorize and token each validate current CIMD metadata");
 });
 
+test("authorize+token: Notion CIMD public client works with form-encoded PKCE exchange", async () => {
+  const cimd = "https://app.notion.com/oauth/mcp-client-metadata.json";
+  const redirect = "https://app.notion.com/workflows/mcp/oauth/callback";
+  let metadataFetches = 0;
+  const fetchFn = async (input, init = {}) => {
+    assert.equal(String(input), cimd);
+    assert.equal(init.method, "GET");
+    assert.equal(init.redirect, "manual");
+    metadataFetches += 1;
+    return new Response(JSON.stringify({
+      client_id: cimd,
+      client_name: "Notion",
+      client_uri: "https://app.notion.com",
+      redirect_uris: [redirect],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+      application_type: "web",
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const opts = makeOptions({ fetchFn });
+
+  const { code, verifier } = await makeAuthCode(opts, cimd, redirect);
+  assert.ok(code);
+  const token = await POST("/oauth/token", {
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: redirect,
+    client_id: cimd,
+    code_verifier: verifier,
+    resource: IDENTITY.resource,
+  }, opts, { form: true });
+  assert.equal(token.status, 200);
+  const payload = await token.json();
+  assert.ok(payload.access_token);
+  assert.ok(payload.refresh_token);
+  assert.equal(metadataFetches, 2, "authorize and token each validate current Notion CIMD metadata");
+});
+
 test("authorize: generic CIMD keeps redirects manual and rejects 3xx metadata", async () => {
   const cimd = "https://client.example/oauth/client-metadata";
   const redirect = "https://client.example/oauth/callback";
@@ -562,6 +673,49 @@ test("token: authorization_code with client_secret_post succeeds (no-store)", as
   assert.ok((await resp.json()).access_token.includes("."));
 });
 
+test("public Connector access and refresh are fenced immediately by conn_ instance revoke", async () => {
+  const opts = makeOptions();
+  const { client_id, client_secret } = await registerClient(opts);
+  const pending = await pendingAuthorization(opts, client_id);
+  const approved = await approvePending(opts, pending);
+  const response = await POST("/oauth/token", tokenBody(client_id, approved.code, pending.verifier, { client_secret }), opts);
+  assert.equal(response.status, 200);
+  const issued = await response.json();
+  assert.equal(typeof issued.access_token, "string");
+  assert.equal(typeof issued.refresh_token, "string");
+
+  const connectors = await opts.store.listConnectors();
+  assert.equal(connectors.length, 1);
+  const connectorId = connectors[0].connector_id;
+  assert.match(connectorId, /^conn_[A-Za-z0-9_-]+$/);
+
+  const before = await opts.__do.fetch(new Request("https://do.internal/internal/oauth/access/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: issued.access_token, now_sec: NOW_SEC + 1 }),
+  }));
+  assert.equal(before.status, 200);
+  const refreshHash = await hashOpaqueToken(issued.refresh_token);
+  assert.equal((await opts.__do.fetch(new Request("https://do.internal/internal/oauth/refresh/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hash: refreshHash, now_sec: NOW_SEC + 1 }),
+  }))).status, 200);
+
+  assert.equal(await opts.store.revokeConnector(connectorId, "device:owner", NOW_MS + 2_000), true);
+  const after = await opts.__do.fetch(new Request("https://do.internal/internal/oauth/access/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: issued.access_token, now_sec: NOW_SEC + 3 }),
+  }));
+  assert.equal(after.status, 401);
+  assert.equal((await opts.__do.fetch(new Request("https://do.internal/internal/oauth/refresh/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ hash: refreshHash, now_sec: NOW_SEC + 3 }),
+  }))).status, 404);
+});
+
 test("authorization_code failures: client / redirect / resource / PKCE / secret", async () => {
   const opts = makeOptions();
   // Use auth_method none so the code ownership/redirect/resource/PKCE checks
@@ -637,6 +791,113 @@ test("token: auth_method none requires no secret", async () => {
   const { code, verifier } = await makeAuthCode(opts, client_id);
   const resp = await POST("/oauth/token", tokenBody(client_id, code, verifier), opts);
   assert.equal(resp.status, 200);
+});
+
+test("token: client_credentials is reserved for approved automation clients and returns short-lived access only", async () => {
+  const opts = makeOptions();
+  const client_id = "svc_gitlab_pipeline_01";
+  const client_secret = "herdr_svc_test-secret";
+  const create = await opts.__do.fetch(new Request("https://oauth.internal/internal/oauth/automation/create", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      client_id,
+      client_secret_hash: await sha256Hex(client_secret),
+      client_name: "gitlab:group/project:prod",
+      resource: IDENTITY.resource,
+      scope: "mcp",
+      created_by: "device:admin",
+      device_id: "dev_01J9Z6P8G2K4M6N8Q0RSTVWXYZ",
+      device_name: "ci-bound-mac",
+      now_ms: NOW_MS,
+    }),
+  }));
+  assert.equal(create.status, 200);
+
+  const wrongSecret = await POST("/oauth/token", {
+    grant_type: "client_credentials",
+    client_id,
+    client_secret: "wrong",
+    resource: IDENTITY.resource,
+  }, opts);
+  assert.equal(wrongSecret.status, 400);
+  assert.equal((await wrongSecret.json()).error, "invalid_client");
+  const afterFailedAuth = await opts.__do.fetch(new Request("https://oauth.internal/internal/oauth/automation/list", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  }));
+  const failedInventory = await afterFailedAuth.json();
+  assert.equal(
+    failedInventory.automations[0].last_used_at_ms,
+    null,
+    "failed client authentication must not update last_used_at",
+  );
+
+  const response = await POST("/oauth/token", {
+    grant_type: "client_credentials",
+    client_id,
+    client_secret,
+    resource: IDENTITY.resource,
+    scope: "mcp",
+  }, opts);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const token = await response.json();
+  assert.equal(token.expires_in, 3600);
+  assert.equal(token.scope, "mcp");
+  assert.equal(token.refresh_token, undefined);
+  assert.ok(token.access_token.includes("."));
+  const afterSuccessfulAuth = await opts.__do.fetch(new Request("https://oauth.internal/internal/oauth/automation/list", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  }));
+  const successfulInventory = await afterSuccessfulAuth.json();
+  assert.equal(
+    successfulInventory.automations[0].last_used_at_ms,
+    NOW_SEC * 1000,
+    "successful client authentication updates last_used_at",
+  );
+
+  const verify = await opts.__do.fetch(new Request("https://oauth.internal/internal/oauth/access/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: token.access_token, now_sec: NOW_SEC + 1 }),
+  }));
+  assert.equal(verify.status, 200);
+
+  assert.equal(await opts.store.revokeGrant(client_id, "device:admin", NOW_MS + 2000), true);
+  const afterRevoke = await POST("/oauth/token", {
+    grant_type: "client_credentials",
+    client_id,
+    client_secret,
+    resource: IDENTITY.resource,
+  }, opts);
+  assert.equal(afterRevoke.status, 400);
+  assert.equal((await afterRevoke.json()).error, "invalid_grant");
+  const verifyRevoked = await opts.__do.fetch(new Request("https://oauth.internal/internal/oauth/access/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: token.access_token, now_sec: NOW_SEC + 2 }),
+  }));
+  assert.equal(verifyRevoked.status, 401);
+});
+
+test("DCR cannot self-register a client_credentials automation principal", async () => {
+  const opts = makeOptions();
+  const registered = await registerClient(opts, {
+    grant_types: ["client_credentials"],
+    token_endpoint_auth_method: "client_secret_post",
+  });
+  const response = await POST("/oauth/token", {
+    grant_type: "client_credentials",
+    client_id: registered.client_id,
+    client_secret: registered.client_secret,
+    resource: IDENTITY.resource,
+  }, opts);
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error, "unauthorized_client");
 });
 
 test("token: unknown client_id is invalid_client", async () => {

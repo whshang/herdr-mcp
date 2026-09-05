@@ -71,7 +71,7 @@ test("normalizeResource maps '' / issuer / issuer+/mcp and rejects foreign", () 
   assert.equal(normalizeResource(id, "https://herdr-mcp.example.com/other"), null);
 });
 
-test("oauthEdgeMetadata deep-equals the src/oauth.ts document (keys + values + order)", () => {
+test("oauthEdgeMetadata preserves the legacy discovery contract and adds pre-provisioned Automation Client grant", () => {
   const id = createOAuthIdentity("https://herdr-mcp.example.com");
   const doc = oauthEdgeMetadata(id);
   assert.deepEqual(doc, {
@@ -81,14 +81,17 @@ test("oauthEdgeMetadata deep-equals the src/oauth.ts document (keys + values + o
     registration_endpoint: "https://herdr-mcp.example.com/oauth/register",
     scopes_supported: ["mcp"],
     response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code", "refresh_token"],
+    grant_types_supported: ["authorization_code", "refresh_token", "client_credentials"],
     token_endpoint_auth_methods_supported: ["none", "private_key_jwt", "client_secret_post"],
     code_challenge_methods_supported: ["S256"],
     authorization_response_iss_parameter_supported: true,
     client_id_metadata_document_supported: true,
     protected_resources: ["https://herdr-mcp.example.com/mcp"],
   });
-  // Exact key set — any drift from the local runtime's discovery doc is a cutover break.
+  // Keep the discovery shape stable. `client_credentials` is the intentional
+  // Edge-only extension for Worker-provisioned Automation Clients; DCR still
+  // cannot self-register that grant and the legacy local Node compatibility
+  // server does not become a second automation-credential authority.
   assert.deepEqual(Object.keys(doc).sort(), [
     "authorization_endpoint",
     "authorization_response_iss_parameter_supported",

@@ -99,7 +99,7 @@ fn validate_existing_with_roots(roots: &[PathBuf], input: &str) -> Result<Manage
             "reason": "outside_managed_roots",
             "path": resolved.to_string_lossy(),
             "managed_roots": roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
-            "hint": "only paths inside git-backed project roots visible in the live snapshot are accessible",
+            "hint": outside_managed_roots_hint(),
         }));
     };
     if denied_secret_path(&resolved) {
@@ -159,7 +159,7 @@ fn validate_target_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedP
             "reason": "outside_managed_roots",
             "path": resolved.to_string_lossy(),
             "managed_roots": roots.iter().map(|root| root.to_string_lossy()).collect::<Vec<_>>(),
-            "hint": "only paths inside git-backed project roots visible in the live snapshot are accessible",
+            "hint": outside_managed_roots_hint(),
         }));
     };
     if denied_secret_path(&resolved) {
@@ -218,6 +218,17 @@ fn validate_target_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedP
         resolved,
         real,
     })
+}
+
+/// Shared actionable hint for `outside_managed_roots` failures.
+///
+/// A path is rejected because it is not inside a git-backed project root
+/// visible in the live Herdr snapshot. When the snapshot exposes no managed
+/// roots, the hint must tell the user to open/create a Herdr workspace or pane
+/// whose cwd is inside the intended Git repository, keep it available, then
+/// retry. A coding agent is not required for this step.
+pub fn outside_managed_roots_hint() -> &'static str {
+    "only paths inside git-backed project roots visible in the live snapshot are accessible; open or create a Herdr workspace/pane whose cwd is inside the intended Git repository and keep it available, then retry (no coding agent required)"
 }
 
 pub fn denied_secret_path(path: &Path) -> bool {
@@ -471,5 +482,38 @@ mod tests {
             assert!(denied_secret_path(Path::new(path)), "{path}");
         }
         assert!(!denied_secret_path(Path::new("/repo/src/config.ts")));
+    }
+
+    #[test]
+    fn empty_managed_roots_hint_is_actionable_without_a_coding_agent() {
+        // v0.4.6 #2: when the live snapshot exposes no managed git roots, the
+        // hint must explicitly direct the user to open/create a Herdr workspace
+        // or pane inside the intended Git repository, keep it available, then
+        // retry — and must not imply a coding agent is required.
+        let hint = outside_managed_roots_hint().to_ascii_lowercase();
+        assert!(hint.contains("herdr workspace"), "{hint}");
+        assert!(hint.contains("pane"), "{hint}");
+        assert!(hint.contains("cwd"));
+        assert!(hint.contains("git repository"));
+        assert!(hint.contains("keep it available"));
+        assert!(hint.contains("retry"));
+        assert!(hint.contains("coding agent"));
+        assert!(hint.contains("no coding agent required"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outside_existing_file_carries_the_actionable_hint() {
+        let root = repo();
+        let outside =
+            std::env::temp_dir().join(format!("herdr-mcp-hint-{}.txt", std::process::id()));
+        fs::write(&outside, "outside").unwrap();
+        let result = validate_existing(&snapshot(&root), outside.to_str().unwrap()).unwrap_err();
+        assert_eq!(result["reason"], "outside_managed_roots");
+        let hint = result["hint"].as_str().unwrap();
+        assert!(hint.contains("Herdr workspace/pane"));
+        assert!(hint.contains("keep it available"));
+        let _ = fs::remove_file(outside);
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -128,15 +128,30 @@ herdr_call(
 
 传入 `pr_number` 后会返回 PR state、merge state、Auto-merge request、required checks，以及 Deno Deploy 等 supplemental status。每次结果都有确定性的 `fingerprint`；继续监控时把它作为 `previous_fingerprint` 传回，如果状态没有变化，下一次只返回精简 summary 和 `changed=false`，不会重新输出整张检查表。因此 planner 应优先使用该方法，而不是会反复打印完整 job snapshot 的 `gh run watch`。
 
-## Connector 信息
+## Connector 与 Automation 凭据
+
+交互式 Connector 通过已登记 Device/operator 控制通道批准和撤销。批准只授予普通 MCP 访问，不会把 Connector 变成 fleet principal：
 
 ```bash
-herdr-mcp connector
+herdr-mcp connector approve <approval-request-id>
+herdr-mcp connector list
+herdr-mcp connector revoke <connector-id> --confirm
 ```
 
-用于查看当前 Connector / 公网入口相关信息。
+批准命令会交互式读取 6 位授权码，不要把授权码放进 argv 或 shell history。所有已登记 Device 都是平等的 Worker 管理通道，不存在 owner/member 设备层级。
 
-本机静态 bearer 和公网 ChatGPT OAuth 是两套边界。不要因为 CLI 能显示本地连接信息，就把 `HERDR_MCP_TOKEN` 复制进 ChatGPT。
+GitLab CI 等无人值守调用方使用可独立 revoke 的 Automation Client：
+
+```bash
+herdr-mcp automation create --name "gitlab:group/project:prod" --device <device-id-or-unique-name>
+herdr-mcp automation list
+herdr-mcp automation rotate <svc_client_id> --confirm
+herdr-mcp automation revoke <svc_client_id> --confirm
+```
+
+`create` 必须显式指定目标设备并保存 Worker 解析后的不可变 `device_id`，不会在 fleet 中静默替用户选机器。`create` 和 `rotate` 只显示一次 `client_secret`，应直接存进 CI secret manager；`list` 永远不返回 secret，只返回绑定设备和有限的签发统计。Automation Client 用 OAuth `client_credentials` 通过 `client_id + client_secret` 换短期 access token，只拥有绑定设备上的普通 MCP 权限，不拥有 fleet-admin 权限。
+
+本机静态 bearer、公网 OAuth Connector 与 Automation Client 是三套边界。`HERDR_MCP_TOKEN` 只服务本机 TCP runtime，不要复制进 ChatGPT 或 GitLab CI。
 
 完整接入见 [ChatGPT Connector](chatgpt-connector.md)。
 
@@ -157,6 +172,8 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 herdr-mcp status
 herdr-mcp logs
 ```
+
+即使是 loopback，`http://127.0.0.1:8772/mcp` 也故意保持鉴权。第一方本机客户端可以从受保护的本地状态自动取得 runtime credential，让用户无需手工粘贴；裸 `curl` 或第三方 TCP client 必须显式带 bearer。官方浏览器插件不使用这个 TCP token，而是通过 Chromium Native Messaging 进入 mode-`0600` 的 `extension.sock` trusted IPC；这条通道本身 tokenless，并会剥离网页传入的 `Authorization`。
 
 本机 HTTP 返回 `200` 或 `401` 都说明 runtime 在监听；连接失败才说明进程/端口层有问题。
 

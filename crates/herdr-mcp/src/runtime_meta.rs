@@ -29,6 +29,7 @@ const MIGRATED_TOOLS: [&str; 18] = [
 ];
 
 static STARTED_AT: OnceLock<String> = OnceLock::new();
+static STARTED_AT_MS: OnceLock<i64> = OnceLock::new();
 
 pub fn runtime_channel() -> &'static str {
     match option_env!("HERDR_MCP_BUILD_CHANNEL") {
@@ -293,12 +294,22 @@ pub fn health_fields(cache: &EventCache, exec: Option<&ExecRegistry>) -> Map<Str
     output
 }
 
+pub fn runtime_started_at_ms() -> i64 {
+    *STARTED_AT_MS.get_or_init(|| {
+        let millis = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+        i64::try_from(millis).unwrap_or(0)
+    })
+}
+
 fn started_at() -> String {
     STARTED_AT
         .get_or_init(|| {
-            OffsetDateTime::now_utc()
-                .format(&Rfc3339)
-                .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+            OffsetDateTime::from_unix_timestamp_nanos(
+                i128::from(runtime_started_at_ms()) * 1_000_000,
+            )
+            .ok()
+            .and_then(|value| value.format(&Rfc3339).ok())
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned())
         })
         .clone()
 }

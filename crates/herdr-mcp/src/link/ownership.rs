@@ -66,8 +66,31 @@ pub struct LinkAgentView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateStatus {
     pub id: String,
+    pub category: GateCategory,
     pub ok: bool,
     pub detail: String,
+}
+
+/// Whether a production-`link status` gate describes ordinary user/data-plane
+/// operation or a maintainer release/cutover requirement.
+///
+/// `DataPlane` gates must pass for an ordinary successful installation to be
+/// operationally ready. `MaintainerCutover` gates (the auditable link seal and
+/// dual-verification UAT evidence) are required only to flip the production
+/// cutover; their absence must not make an ordinary installation look broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateCategory {
+    DataPlane,
+    MaintainerCutover,
+}
+
+impl GateCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DataPlane => "data_plane",
+            Self::MaintainerCutover => "maintainer_cutover",
+        }
+    }
 }
 
 /// Classify LaunchAgent ProgramArguments as Node, Rust, unknown, or absent.
@@ -340,6 +363,7 @@ pub fn evaluate_production_ready_gates(
     vec![
         GateStatus {
             id: "rust_cli_link_run".to_owned(),
+            category: GateCategory::DataPlane,
             ok: rust_cli_has_link_run,
             detail: if rust_cli_has_link_run {
                 "herdr-mcp link run is present in this binary".to_owned()
@@ -349,6 +373,7 @@ pub fn evaluate_production_ready_gates(
         },
         GateStatus {
             id: "launchd_prod_program_is_rust_runtime".to_owned(),
+            category: GateCategory::DataPlane,
             ok: prod_is_rust,
             detail: format!(
                 "label={} implementation={} program0={}",
@@ -362,6 +387,7 @@ pub fn evaluate_production_ready_gates(
         },
         GateStatus {
             id: "launchd_not_repo_checkout".to_owned(),
+            category: GateCategory::DataPlane,
             ok: checkout_refused,
             detail: if checkout_refused {
                 "prod ProgramArguments do not point at repo dist/link".to_owned()
@@ -371,6 +397,7 @@ pub fn evaluate_production_ready_gates(
         },
         GateStatus {
             id: "runtime_control_generation_rust_compatible".to_owned(),
+            category: GateCategory::DataPlane,
             ok: generation_ok,
             detail: format!(
                 "current={} desired={} active={}",
@@ -381,6 +408,7 @@ pub fn evaluate_production_ready_gates(
         },
         GateStatus {
             id: "health_runtime_not_candidate".to_owned(),
+            category: GateCategory::MaintainerCutover,
             ok: sealed,
             detail: if sealed {
                 "active link-production-ready seal present".to_owned()
@@ -391,11 +419,13 @@ pub fn evaluate_production_ready_gates(
         },
         GateStatus {
             id: "user_cli_not_repo_bash_bridge".to_owned(),
+            category: GateCategory::DataPlane,
             ok: user_cli_ok,
             detail: format!("~/.local/bin/herdr-mcp -> {}", describe_symlink(&user_cli)),
         },
         GateStatus {
             id: "node_link_not_required".to_owned(),
+            category: GateCategory::DataPlane,
             ok: node_not_required,
             detail: format!(
                 "prod={} canary/dev={} checkout_refused={} (canary Node soak is allowed)",
@@ -406,6 +436,7 @@ pub fn evaluate_production_ready_gates(
         },
         GateStatus {
             id: "dual_verification_uat".to_owned(),
+            category: GateCategory::MaintainerCutover,
             ok: dual_uat,
             detail: if dual_uat {
                 "dual-uat evidence recorded under seals/evidence/dual-uat.json".to_owned()
@@ -542,7 +573,22 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
     let rust_cli_has_link_run = crate::link::LINK_RUN_WIRED;
     let gates =
         evaluate_production_ready_gates(home, config_dir, &prod, &link, rust_cli_has_link_run);
-    let all_ok = gates.iter().all(|gate| gate.ok);
+    // runtime-control can hot-switch the local request target without replacing
+    // the long-lived Link executable. A stale loaded launchd generation means
+    // the data plane is still running old Link code even when active=current.
+    let all_ok = gates.iter().all(|gate| gate.ok) && !loaded_environment_stale;
+    // User/data-plane readiness must not depend on the maintainer release
+    // gates. `operational_ready` is true when the ordinary operational path is
+    // healthy; `cutover_sealed` additionally requires the auditable link seal
+    // and dual-verification UAT evidence. Keep `production_ready_eligible` for
+    // backward compatibility (it is the maintainer cutover gate).
+    let operational_ready = !loaded_environment_stale
+        && gates
+            .iter()
+            .filter(|gate| gate.category == GateCategory::DataPlane)
+            .all(|gate| gate.ok);
+    let cutover_sealed = all_ok;
+    let cutover_pending = !all_ok && operational_ready;
     let production_owner = if prod.implementation == LinkImplementation::Rust && prod.loaded {
         "rust"
     } else if (prod.implementation == LinkImplementation::Node && (prod.loaded || prod.present))
@@ -580,6 +626,9 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
         "cutover_performed": false,
         "production_owner": production_owner,
         "production_ready_eligible": all_ok,
+        "operational_ready": operational_ready,
+        "cutover_sealed": cutover_sealed,
+        "cutover_pending": cutover_pending,
         "edge_public_origin": edge_public_origin,
         "link_upstream_origin": link_upstream_origin,
         "transport": {
@@ -597,6 +646,7 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
         },
         "gates": gates.iter().map(|gate| json!({
             "id": gate.id,
+            "category": gate.category.as_str(),
             "ok": gate.ok,
             "detail": gate.detail,
         })).collect::<Vec<_>>(),
@@ -622,13 +672,49 @@ pub fn collect_status_report(home: &Path, config_dir: &Path) -> Value {
                 "loaded/configured Link generation is aligned with runtime/current"
             },
         },
+        "operational_summary": {
+            "operational_ready": operational_ready,
+            "cutover_sealed": cutover_sealed,
+            "cutover_pending": cutover_pending,
+            "data_plane_gates": operational_gate_ids(&gates),
+            "maintainer_cutover_gates": maintainer_gate_ids(&gates),
+            "next_action": if loaded_environment_stale {
+                "Production Link process is stale relative to runtime/current; reload the owned link-prod before treating the data plane as ready"
+            } else if operational_ready && cutover_pending {
+                "Operation is healthy; production cutover still needs the maintainer link seal + dual-UAT evidence (see docs/link-production-cutover.md)"
+            } else if operational_ready {
+                "Operation is ready; no maintainer action required for ordinary use"
+            } else {
+                "Operation is not fully ready; review the failing data-plane gates above"
+            },
+        },
         "notes": [
             "Read-only report. Does not mutate launchd, plists, or Node Link.",
             "Candidate label is dev.herdr-mcp.link-rust-candidate (link install/uninstall); never confuses with live Node link/link-prod.",
             "Live production cutover requires independent dual verification; see docs/link-production-cutover.md",
-            crate::link::RELAY_POLICY_DESCRIPTION,
+            if transport_evidence.live_transport == "unknown" {
+                "live_transport=unknown outside the live daemon; this is NOT an operational failure when the other data-plane gates are healthy. It only means the active transport route is observed from the running Link process, not from status/doctor, and no value is fabricated."
+            } else {
+                crate::link::RELAY_POLICY_DESCRIPTION
+            },
         ],
     })
+}
+
+fn operational_gate_ids(gates: &[GateStatus]) -> Vec<&str> {
+    gates
+        .iter()
+        .filter(|gate| gate.category == GateCategory::DataPlane)
+        .map(|gate| gate.id.as_str())
+        .collect()
+}
+
+fn maintainer_gate_ids(gates: &[GateStatus]) -> Vec<&str> {
+    gates
+        .iter()
+        .filter(|gate| gate.category == GateCategory::MaintainerCutover)
+        .map(|gate| gate.id.as_str())
+        .collect()
 }
 
 fn agent_json(agent: &LinkAgentView, home: &Path) -> Value {
@@ -958,6 +1044,110 @@ environment = {
                 None => env::remove_var("HOME"),
             }
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // v0.4.6 #307: an ordinary successful installation must not look broken
+    // merely because the maintainer release/cutover gates (link seal and
+    // dual-verification UAT) are absent. `operational_ready` reflects the
+    // user/data-plane path only; `cutover_sealed` / `production_ready_eligible`
+    // additionally require the maintainer governance. This test would fail on
+    // v0.4.5 behavior where the two were conflated.
+    #[cfg(unix)]
+    #[test]
+    fn operational_ready_does_not_require_maintainer_cutover_gates() {
+        use std::os::unix::fs::symlink;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let root = std::env::temp_dir().join(format!("herdr-link-ready-{stamp}"));
+        let home = root.join("home");
+        let config_dir = home.join(".config").join("herdr-mcp");
+        let runtime = config_dir.join("runtime");
+        let generation = runtime.join("generations/rust-7d7db9d2063970d2");
+        fs::create_dir_all(&generation).unwrap();
+        fs::write(generation.join("herdr-mcp"), b"fake").unwrap();
+        symlink("generations/rust-7d7db9d2063970d2", runtime.join("current")).unwrap();
+        fs::write(
+            config_dir.join("runtime-control-prod.json"),
+            r#"{"schema_version":1,"desired_active":"rust-7d7db9d2063970d2"}"#,
+        )
+        .unwrap();
+        fs::write(
+            config_dir.join("runtime-status-prod.json"),
+            r#"{"schema_version":1,"manager":{"active_generation":"rust-7d7db9d2063970d2"}}"#,
+        )
+        .unwrap();
+        let user_cli = home.join(".local/bin/herdr-mcp");
+        fs::create_dir_all(user_cli.parent().unwrap()).unwrap();
+        let expected_cli_target = home
+            .join(".config")
+            .join("herdr-mcp")
+            .join("runtime")
+            .join("current")
+            .join("herdr-mcp");
+        symlink(&expected_cli_target, &user_cli).unwrap();
+
+        let binary = runtime.join("current/herdr-mcp");
+        let prod = LinkAgentView {
+            label: LINK_PROD_LABEL.to_owned(),
+            plist_path: home
+                .join("Library")
+                .join("LaunchAgents")
+                .join("dev.herdr-mcp.link-prod.plist"),
+            present: true,
+            loaded: true,
+            implementation: LinkImplementation::Rust,
+            program_arguments: args(&[binary.to_str().unwrap(), "link", "run"]),
+            edge_url: None,
+            workstation_id: None,
+            control_path: None,
+            status_path: None,
+            runtime_generation: Some("rust-7d7db9d2063970d2".to_owned()),
+        };
+        let link = LinkAgentView {
+            label: LINK_LABEL.to_owned(),
+            plist_path: home
+                .join("Library")
+                .join("LaunchAgents")
+                .join("dev.herdr-mcp.link.plist"),
+            present: false,
+            loaded: false,
+            implementation: LinkImplementation::Absent,
+            program_arguments: vec![],
+            edge_url: None,
+            workstation_id: None,
+            control_path: None,
+            status_path: None,
+            runtime_generation: None,
+        };
+
+        // Data-plane gates pass (Rust prod link on managed runtime, no repo
+        // checkout, generation aligned, user CLI correct, node not required).
+        // The maintainer gates (seal + dual-UAT) are absent.
+        let gates = evaluate_production_ready_gates(&home, &config_dir, &prod, &link, true);
+        let operational_ready = gates
+            .iter()
+            .filter(|gate| gate.category == GateCategory::DataPlane)
+            .all(|gate| gate.ok);
+        let cutover_sealed = gates.iter().all(|gate| gate.ok);
+
+        assert!(operational_ready, "data-plane must be operationally ready");
+        assert!(
+            !cutover_sealed,
+            "cutover must not be sealed without maintainer seal + dual-UAT"
+        );
+        // The maintainer gates are the only ones failing.
+        let failing = gates
+            .iter()
+            .filter(|gate| !gate.ok)
+            .map(|gate| gate.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failing,
+            vec!["health_runtime_not_candidate", "dual_verification_uat"]
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

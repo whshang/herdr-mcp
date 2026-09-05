@@ -226,13 +226,20 @@ export async function ensureLegacyDeviceRegistration(
 export interface PublicDeviceSummary {
   device_id: string;
   name: string;
+  enrolled_at_ms: number;
   authorization: DeviceRecord["authorization"];
   scheduling: DeviceRecord["scheduling"];
   connection: "online" | "stale" | "offline";
   health: string;
   runtime_version: string | null;
   runtime_generation: string | null;
+  last_seen_at_ms: number | null;
   last_seen_ago_ms: number | null;
+  reconnecting_since_ms: number | null;
+  last_recovered_at_ms: number | null;
+  last_reconnect_duration_ms: number | null;
+  reconnect_count: number;
+  last_reconnect_crossed_recycle_threshold: boolean | null;
   active_requests: number;
 }
 
@@ -452,13 +459,29 @@ export async function listPublicDevices(
     return {
       device_id: device.device_id,
       name: device.name,
+      enrolled_at_ms: device.enrolled_at_ms,
       authorization: device.authorization,
       scheduling: device.scheduling,
       connection: connectionFromStatus(status),
       health: typeof status?.runtimeHealth === "string" ? status.runtimeHealth : "unknown",
       runtime_version: typeof status?.runtimeVersion === "string" ? status.runtimeVersion : null,
       runtime_generation: typeof status?.runtimeGeneration === "string" ? status.runtimeGeneration : null,
+      last_seen_at_ms: typeof status?.lastSeenAtMs === "number" && status.lastSeenAtMs >= 0 ? status.lastSeenAtMs : null,
       last_seen_ago_ms: typeof status?.lastSeenAgoMs === "number" && status.lastSeenAgoMs >= 0 ? status.lastSeenAgoMs : null,
+      reconnecting_since_ms: typeof status?.reconnectingSinceMs === "number" && status.reconnectingSinceMs >= 0
+        ? status.reconnectingSinceMs
+        : null,
+      last_recovered_at_ms: typeof status?.lastRecoveredAtMs === "number" && status.lastRecoveredAtMs >= 0
+        ? status.lastRecoveredAtMs
+        : null,
+      last_reconnect_duration_ms: typeof status?.lastReconnectDurationMs === "number" && status.lastReconnectDurationMs >= 0
+        ? status.lastReconnectDurationMs
+        : null,
+      reconnect_count: nonNegativeInteger(status?.reconnectCount),
+      last_reconnect_crossed_recycle_threshold:
+        typeof status?.lastReconnectCrossedRecycleThreshold === "boolean"
+          ? status.lastReconnectCrossedRecycleThreshold
+          : null,
       active_requests: nonNegativeInteger(status?.activeRequests),
     } satisfies PublicDeviceSummary;
   }));
