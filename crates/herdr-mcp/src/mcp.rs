@@ -44,6 +44,16 @@ pub struct RuntimeContext<'a> {
     pub skill: &'a SkillService,
     pub state_store: &'a std::sync::Arc<std::sync::Mutex<StateStore>>,
     pub caller_webchat_control_granted: bool,
+    pub browser_actuator: Option<&'a dyn BrowserActuator>,
+}
+
+pub trait BrowserActuator: Send + Sync {
+    fn actuate(
+        &self,
+        operation: &str,
+        params: &Value,
+        expected_generation: i64,
+    ) -> Result<BrowserPostconditionEvidence, String>;
 }
 
 pub fn handle(request: &Value, context: &RuntimeContext<'_>) -> Option<Value> {
@@ -201,6 +211,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     method,
                     &params,
                     context.caller_webchat_control_granted,
+                    context.browser_actuator,
                 )
             } else if method.starts_with("herdr_mcp.browser_endpoint.")
                 || method.starts_with("herdr_mcp.browser_resource.")
@@ -1125,22 +1136,22 @@ impl BrowserOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BrowserPostconditionEvidence {
-    observed_generation: i64,
-    command_accepted: bool,
-    browser_online: bool,
-    resource_available: bool,
-    rejected: bool,
-    stable_resource_ref_observed: bool,
-    lifecycle_observed: bool,
-    canonical_url_observed: bool,
-    accepted_message_observed: bool,
-    message_baseline_advanced: bool,
-    reasoning_effort_readback: Option<String>,
-    required_apps_readback: Vec<String>,
-    generation_owner: Option<i64>,
-    generation_status_observed: bool,
-    generation_stopped: bool,
+pub struct BrowserPostconditionEvidence {
+    pub observed_generation: i64,
+    pub command_accepted: bool,
+    pub browser_online: bool,
+    pub resource_available: bool,
+    pub rejected: bool,
+    pub stable_resource_ref_observed: bool,
+    pub lifecycle_observed: bool,
+    pub canonical_url_observed: bool,
+    pub accepted_message_observed: bool,
+    pub message_baseline_advanced: bool,
+    pub reasoning_effort_readback: Option<String>,
+    pub required_apps_readback: Vec<String>,
+    pub generation_owner: Option<i64>,
+    pub generation_status_observed: bool,
+    pub generation_stopped: bool,
 }
 
 impl BrowserPostconditionEvidence {
@@ -1241,9 +1252,10 @@ fn browser_delivery_state_from_postcondition(
     }
 }
 
-fn browser_dispatch_submit_without_actuator(
+fn browser_dispatch_submit(
     store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
     params: &Value,
+    actuator: Option<&dyn BrowserActuator>,
 ) -> Value {
     let session_ref = params.get("session_ref").and_then(Value::as_str).unwrap();
     let message = params.get("message").and_then(Value::as_str).unwrap();
@@ -1279,15 +1291,15 @@ fn browser_dispatch_submit_without_actuator(
     let idempotency_key_digest = browser_sha256(idempotency_key);
     let now = browser_epoch_ms();
 
-    let Ok(mut store) = store.lock() else {
+    let Ok(mut store_guard) = store.lock() else {
         return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
-    let session = match store.browser_resource(session_ref) {
+    let session = match store_guard.browser_resource(session_ref) {
         Ok(Some(resource)) => resource,
         Ok(None) => return json!({"ok": false, "code": "browser_resource_not_found"}),
         Err(error) => return browser_store_error(error),
     };
-    let reservation = store.reserve_browser_dispatch(BrowserDispatchReserveInput {
+    let reservation = store_guard.reserve_browser_dispatch(BrowserDispatchReserveInput {
         endpoint_ref: &session.endpoint_ref,
         provider: &session.provider,
         operation: "browser_dispatch.submit",
@@ -1321,7 +1333,7 @@ fn browser_dispatch_submit_without_actuator(
 
     // Claiming the actuation lane becomes uncertain before any browser command can be sent.
     // A runtime crash after this point can therefore never replay the same idempotency key.
-    if let Err(error) = store.update_browser_dispatch(BrowserDispatchUpdateInput {
+    if let Err(error) = store_guard.update_browser_dispatch(BrowserDispatchUpdateInput {
         dispatch_id: &reserved.dispatch_id,
         expected_generation,
         delivery_state: BrowserDeliveryState::Uncertain,
@@ -1331,7 +1343,18 @@ fn browser_dispatch_submit_without_actuator(
         return browser_store_error(error);
     }
 
-    let evidence = BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+    drop(store_guard);
+    let evidence = match actuator {
+        Some(actuator) => match actuator.actuate(
+            BrowserOperation::DispatchSubmit.method(),
+            params,
+            expected_generation,
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => return browser_store_error(error),
+        },
+        None => BrowserPostconditionEvidence::resource_unavailable(expected_generation),
+    };
     let delivery_state = match browser_delivery_state_from_postcondition(
         BrowserOperation::DispatchSubmit,
         params,
@@ -1340,6 +1363,9 @@ fn browser_dispatch_submit_without_actuator(
     ) {
         Ok(state) => state,
         Err(error) => return browser_store_error(error),
+    };
+    let Ok(mut store) = store.lock() else {
+        return json!({"ok": false, "code": "browser_operation_store_unavailable"});
     };
     let dispatch = match store.update_browser_dispatch(BrowserDispatchUpdateInput {
         dispatch_id: &reserved.dispatch_id,
@@ -1376,7 +1402,7 @@ fn browser_operation_call(
     method: &str,
     params: &Value,
 ) -> Value {
-    browser_operation_call_with_grant(store, method, params, false)
+    browser_operation_call_with_grant(store, method, params, false, None)
 }
 
 fn browser_operation_call_with_grant(
@@ -1384,6 +1410,7 @@ fn browser_operation_call_with_grant(
     method: &str,
     params: &Value,
     caller_webchat_control_granted: bool,
+    browser_actuator: Option<&dyn BrowserActuator>,
 ) -> Value {
     let Some(operation) = BrowserOperation::parse(method) else {
         return json!({"ok": false, "code": "unknown_local_method", "method": method});
@@ -1442,7 +1469,9 @@ fn browser_operation_call_with_grant(
             operation,
             caller_webchat_control_granted,
         ),
-        BrowserOperation::DispatchSubmit => browser_dispatch_submit_without_actuator(store, params),
+        BrowserOperation::DispatchSubmit => {
+            browser_dispatch_submit(store, params, browser_actuator)
+        }
         BrowserOperation::DispatchStatus => {
             let dispatch_id = params.get("dispatch_id").and_then(Value::as_str).unwrap();
             let Ok(store) = store.lock() else {
@@ -1462,7 +1491,15 @@ fn browser_operation_call_with_grant(
                 .get("expected_generation")
                 .and_then(Value::as_i64)
                 .unwrap();
-            let evidence = BrowserPostconditionEvidence::resource_unavailable(expected_generation);
+            let evidence = match browser_actuator {
+                Some(actuator) => {
+                    match actuator.actuate(operation.method(), params, expected_generation) {
+                        Ok(evidence) => evidence,
+                        Err(error) => return browser_store_error(error),
+                    }
+                }
+                None => BrowserPostconditionEvidence::resource_unavailable(expected_generation),
+            };
             let delivery_state = match browser_delivery_state_from_postcondition(
                 operation,
                 params,
@@ -1749,13 +1786,49 @@ fn browser_operation_actuation_decision(
         }
     };
 
-    browser_resource_actuation_decision(
+    let decision = browser_resource_actuation_decision(
         store,
         operation.capability_operation(),
         &target,
         caller_webchat_control_granted,
         params.get("expected_generation").and_then(Value::as_i64),
-    )
+    )?;
+    if decision != (true, None) || operation != BrowserOperation::DispatchSubmit {
+        return Ok(decision);
+    }
+
+    let Some(provider_state) =
+        store.browser_provider_state(&target.endpoint_ref, &target.provider)?
+    else {
+        return Ok((false, Some("capability_unknown")));
+    };
+    if params
+        .get("reasoning_effort")
+        .is_some_and(|value| !value.is_null())
+    {
+        match browser_capability_snapshot_allows(
+            &provider_state.capabilities_json,
+            "composer.set_reasoning",
+        ) {
+            Some(true) => {}
+            Some(false) => return Ok((false, Some("capability_not_allowed"))),
+            None => return Ok((false, Some("capability_unknown"))),
+        }
+    }
+    if !browser_required_apps(params, true)
+        .map_err(|_| "browser_required_apps_invalid".to_owned())?
+        .is_empty()
+    {
+        match browser_capability_snapshot_allows(
+            &provider_state.capabilities_json,
+            "composer.select_tool",
+        ) {
+            Some(true) => {}
+            Some(false) => return Ok((false, Some("capability_not_allowed"))),
+            None => return Ok((false, Some("capability_unknown"))),
+        }
+    }
+    Ok((true, None))
 }
 
 fn browser_operation_resource(
@@ -3467,6 +3540,7 @@ mod tests {
             "herdr_mcp.browser_dispatch.submit",
             &params,
             true,
+            None,
         );
         assert_eq!(first["code"], "resource_unavailable");
         assert_eq!(first["replayed"], false);
@@ -3481,6 +3555,7 @@ mod tests {
             "herdr_mcp.browser_dispatch.submit",
             &params,
             true,
+            None,
         );
         assert_eq!(replay["replayed"], true);
         assert_eq!(replay["dispatch"]["dispatch_id"], dispatch_id);
@@ -3570,6 +3645,7 @@ mod tests {
             "herdr_mcp.browser_dispatch.submit",
             &dispatch_params,
             false,
+            None,
         );
         assert_eq!(missing_grant["code"], "caller_grant_missing");
 
@@ -3595,6 +3671,7 @@ mod tests {
             "herdr_mcp.browser_dispatch.submit",
             &dispatch_params,
             true,
+            None,
         );
         assert_eq!(local_consent_off["code"], "local_consent_off");
 
@@ -3616,6 +3693,7 @@ mod tests {
             "herdr_mcp.browser_session.inspect",
             &json!({"session_ref": session_ref}),
             true,
+            None,
         );
         assert_eq!(inspect["ok"], true);
         assert_eq!(inspect["actuation_available"], true);
@@ -3626,8 +3704,42 @@ mod tests {
             "herdr_mcp.browser_dispatch.submit",
             &dispatch_params,
             true,
+            None,
         );
         assert_eq!(all_factors_true["code"], "resource_unavailable");
+
+        let dispatch_reasoning_not_allowed = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &json!({
+                "session_ref": session_ref,
+                "message": "ship with reasoning",
+                "reasoning_effort": "balanced",
+                "expected_generation": 7,
+                "idempotency_key": "actuation-dispatch-reasoning-1"
+            }),
+            true,
+            None,
+        );
+        assert_eq!(
+            dispatch_reasoning_not_allowed["code"],
+            "capability_not_allowed"
+        );
+
+        let dispatch_apps_not_allowed = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &json!({
+                "session_ref": session_ref,
+                "message": "ship with app",
+                "required_apps": ["herdr"],
+                "expected_generation": 7,
+                "idempotency_key": "actuation-dispatch-app-1"
+            }),
+            true,
+            None,
+        );
+        assert_eq!(dispatch_apps_not_allowed["code"], "capability_not_allowed");
 
         let capability_not_allowed = browser_operation_call_with_grant(
             &store,
@@ -3639,6 +3751,7 @@ mod tests {
                 "idempotency_key": "actuation-reasoning-1"
             }),
             true,
+            None,
         );
         assert_eq!(capability_not_allowed["code"], "capability_not_allowed");
 
@@ -3681,6 +3794,7 @@ mod tests {
             "herdr_mcp.browser_dispatch.submit",
             &dispatch_params,
             true,
+            None,
         );
         assert_eq!(stale["code"], "stale_capability_generation");
     }

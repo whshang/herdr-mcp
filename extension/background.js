@@ -93,6 +93,10 @@ const HANDOFF_GENERATING_RECHECK_MS = 45000;
 const PROJECT_AUTOMATION_STORAGE_KEY = "herdrProjectAutomation";
 const CONVERSATION_AUTOMATION_STORAGE_KEY = "herdrConversationAutomation";
 const BROWSER_PROFILE_SEED_STORAGE_KEY = "herdrBrowserProfileSeedV1";
+const BROWSER_OBSERVATION_GENERATION_STORAGE_KEY = "herdrBrowserObservationGenerationV1";
+const browserSessionTargets = new Map();
+let browserEndpoint = null;
+let browserObservationGeneration = null;
 const AUTOMATION_MODE_MANUAL = "manual";
 const AUTOMATION_MODE_PROJECT = "project_auto";
 const HANDOFF_RETENTION_MS = 7 * 86400000;
@@ -1307,6 +1311,112 @@ function browserRegistryUrl() {
   return `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/extension/browser/registry`;
 }
 
+function browserActuationUrl() {
+  return `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/extension/browser/actuation`;
+}
+
+async function getBrowserObservationGeneration() {
+  if (Number.isSafeInteger(browserObservationGeneration) && browserObservationGeneration > 0) {
+    return browserObservationGeneration;
+  }
+  const stored = (await chrome.storage.local.get(BROWSER_OBSERVATION_GENERATION_STORAGE_KEY))[
+    BROWSER_OBSERVATION_GENERATION_STORAGE_KEY
+  ];
+  const prior = Number.isSafeInteger(stored) && stored > 0 ? stored : 0;
+  browserObservationGeneration = Math.max(prior + 1, Date.now());
+  await chrome.storage.local.set({
+    [BROWSER_OBSERVATION_GENERATION_STORAGE_KEY]: browserObservationGeneration,
+  });
+  return browserObservationGeneration;
+}
+
+async function postBrowserRegistry(payload) {
+  const response = await localHerdrFetch(browserRegistryUrl(), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+    nativeTimeoutMs: STATE_FETCH_MS,
+  });
+  const parsed = await response.json().catch(() => null);
+  if (!response.ok || parsed?.ok !== true) {
+    throw new Error(parsed?.code || `browser-registry-http-${response.status}`);
+  }
+  return parsed;
+}
+
+async function observeChatGptConversation({ tabId, convKey, pageInfo, accountNativeIdentity }) {
+  if (!tabId || !pageInfo?.conversation_id || !accountNativeIdentity) return null;
+  const endpoint = browserEndpoint || await registerLocalBrowserEndpoint();
+  if (!endpoint?.endpoint_ref) return null;
+  const profileSeed = await getOrCreateBrowserProfileSeed();
+  const observationGeneration = await getBrowserObservationGeneration();
+  await postBrowserRegistry({
+    operation: "provider.observe",
+    profile_seed: profileSeed,
+    endpoint_ref: endpoint.endpoint_ref,
+    provider: "chatgpt",
+    adapter_protocol_version: 1,
+    observation_generation: observationGeneration,
+    capabilities: { operations: ["composer.submit", "generation.status", "session.inspect"] },
+    observed_at: Date.now(),
+  });
+  const account = await postBrowserRegistry({
+    operation: "resource.observe",
+    profile_seed: profileSeed,
+    endpoint_ref: endpoint.endpoint_ref,
+    provider: "chatgpt",
+    kind: "account",
+    parent_ref: null,
+    native_identity: accountNativeIdentity,
+    display_label: null,
+    observation_generation: observationGeneration,
+    observed_at: Date.now(),
+  });
+  let parentRef = account.resource?.resource_ref || null;
+  let spaceRef = null;
+  if (pageInfo.project_id && parentRef) {
+    const space = await postBrowserRegistry({
+      operation: "resource.observe",
+      profile_seed: profileSeed,
+      endpoint_ref: endpoint.endpoint_ref,
+      provider: "chatgpt",
+      kind: "space",
+      parent_ref: parentRef,
+      native_identity: pageInfo.project_id,
+      display_label: null,
+      observation_generation: observationGeneration,
+      observed_at: Date.now(),
+    });
+    spaceRef = space.resource?.resource_ref || null;
+    parentRef = spaceRef || parentRef;
+  }
+  if (!parentRef) return null;
+  const session = await postBrowserRegistry({
+    operation: "resource.observe",
+    profile_seed: profileSeed,
+    endpoint_ref: endpoint.endpoint_ref,
+    provider: "chatgpt",
+    kind: "session",
+    parent_ref: parentRef,
+    native_identity: pageInfo.conversation_id,
+    display_label: null,
+    observation_generation: observationGeneration,
+    observed_at: Date.now(),
+  });
+  const sessionRef = session.resource?.resource_ref || null;
+  if (!sessionRef) return null;
+  browserSessionTargets.set(sessionRef, {
+    tabId,
+    convKey,
+    conversationId: pageInfo.conversation_id,
+    projectId: pageInfo.project_id || null,
+    observationGeneration,
+    spaceRef,
+    lastSeenAt: Date.now(),
+  });
+  return { sessionRef, observationGeneration };
+}
+
 function validBrowserProfileSeed(value) {
   return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
@@ -1337,7 +1447,12 @@ async function registerLocalBrowserEndpoint() {
       nativeTimeoutMs: STATE_FETCH_MS,
     });
     const parsed = await response.json().catch(() => null);
-    return response.ok && parsed?.ok === true ? parsed.endpoint || null : null;
+    if (response.ok && parsed?.ok === true && parsed.endpoint) {
+      browserEndpoint = parsed.endpoint;
+      await getBrowserObservationGeneration();
+      return browserEndpoint;
+    }
+    return null;
   } catch (_) {
     return null;
   }
@@ -1913,6 +2028,102 @@ async function runPushStream(ctrl) {
   if (pushStream?.ctrl === ctrl) pushStream = null;
 }
 
+async function postBrowserActuationEvidence(actuationId, evidence) {
+  const response = await localHerdrFetch(browserActuationUrl(), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ actuation_id: actuationId, ...evidence }),
+    nativeTimeoutMs: STATE_FETCH_MS,
+  });
+  if (!response.ok) {
+    const parsed = await response.json().catch(() => null);
+    throw new Error(parsed?.code || `browser-actuation-http-${response.status}`);
+  }
+}
+
+function unavailableBrowserActuationEvidence(expectedGeneration, observedGeneration = expectedGeneration) {
+  return {
+    observed_generation: Math.max(1, Number(observedGeneration) || Number(expectedGeneration) || 1),
+    command_accepted: false,
+    browser_online: true,
+    resource_available: false,
+    rejected: false,
+    stable_resource_ref_observed: false,
+    lifecycle_observed: false,
+    canonical_url_observed: false,
+    accepted_message_observed: false,
+    message_baseline_advanced: false,
+    reasoning_effort_readback: null,
+    required_apps_readback: [],
+    generation_owner: null,
+    generation_status_observed: false,
+    generation_stopped: false,
+  };
+}
+
+async function handleBrowserActuation(command) {
+  const actuationId = String(command?.actuation_id || "");
+  const operation = String(command?.operation || "");
+  const expectedGeneration = Number(command?.expected_generation || 0);
+  const params = command?.params && typeof command.params === "object" ? command.params : {};
+  if (command?.protocol !== "herdr-browser-actuation/v1"
+      || !/^ba_[0-9a-f]{16}$/.test(actuationId)
+      || !Number.isSafeInteger(expectedGeneration)
+      || expectedGeneration < 1) {
+    return;
+  }
+  const sessionRef = String(params.session_ref || "");
+  const target = browserSessionTargets.get(sessionRef);
+  if (!target) {
+    await postBrowserActuationEvidence(
+      actuationId,
+      unavailableBrowserActuationEvidence(expectedGeneration),
+    );
+    return;
+  }
+  if (target.observationGeneration !== expectedGeneration) {
+    await postBrowserActuationEvidence(
+      actuationId,
+      unavailableBrowserActuationEvidence(expectedGeneration, target.observationGeneration),
+    );
+    return;
+  }
+  let tab = null;
+  try { tab = await chrome.tabs.get(target.tabId); } catch (_) {}
+  const live = chatGptConversationInfo(tab?.url || "");
+  if (!tab || live?.conversation_id !== target.conversationId) {
+    browserSessionTargets.delete(sessionRef);
+    await postBrowserActuationEvidence(
+      actuationId,
+      unavailableBrowserActuationEvidence(expectedGeneration),
+    );
+    return;
+  }
+  try {
+    const response = await sendChatGptTabMessage(target.tabId, {
+      type: "h2w_browser_actuation",
+      command: {
+        operation,
+        expected_generation: expectedGeneration,
+        params,
+        expectedConvKey: target.convKey,
+      },
+    });
+    const evidence = response?.evidence && typeof response.evidence === "object"
+      ? response.evidence
+      : { ...unavailableBrowserActuationEvidence(expectedGeneration), command_accepted: true, resource_available: true };
+    await postBrowserActuationEvidence(actuationId, evidence);
+  } catch (_) {
+    // The command may already have crossed into the content script. Report an
+    // uncertain attempt rather than a retryable not-applied result.
+    await postBrowserActuationEvidence(actuationId, {
+      ...unavailableBrowserActuationEvidence(expectedGeneration),
+      command_accepted: true,
+      resource_available: true,
+    }).catch(() => {});
+  }
+}
+
 async function handlePushBlock(block) {
   let event = null, data = null;
   for (const line of block.split("\n")) {
@@ -1920,6 +2131,10 @@ async function handlePushBlock(block) {
     else if (line.startsWith("data:")) { try { data = JSON.parse(line.slice(5).trim()); } catch {} }
   }
   if (!event || !data) return;
+  if (event === "browser_actuation") {
+    await handleBrowserActuation(data);
+    return;
+  }
   if (event === "hello") {
     // A reconnect is the reconciliation boundary for the Control Center.
     // Fetch exactly one authoritative snapshot; steady-state changes remain
@@ -4226,6 +4441,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       const bindings = await loadBindings();
       const pageInfo = conversationInfoFromSupportedUrl(msg.url || msg.convKey);
+      let browserObservation = null;
+      if (pageInfo?.site === "chatgpt" && pageInfo.conversation_id && sender.tab?.id) {
+        try {
+          browserObservation = await observeChatGptConversation({
+            tabId: sender.tab.id,
+            convKey: String(msg.convKey || ""),
+            pageInfo,
+            accountNativeIdentity: String(msg.accountNativeIdentity || "").trim(),
+          });
+        } catch (error) {
+          callLog("browser observation failed:", error?.message || String(error));
+        }
+      }
       let matched = bindingsForConv(bindings, msg.convKey);
       if (!matched.length && sender.tab?.id) {
         if (pageInfo?.site === "chatgpt") {
@@ -4276,9 +4504,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           pane: first.pane,
           status: first.status || null,
           bindings: matched.map((b) => bindingView(b)),
+          browser_session_ref: browserObservation?.sessionRef || null,
+          browser_generation: browserObservation?.observationGeneration || null,
         });
       } else {
-        sendResponse({ bound: false });
+        sendResponse({
+          bound: false,
+          browser_session_ref: browserObservation?.sessionRef || null,
+          browser_generation: browserObservation?.observationGeneration || null,
+        });
       }
     })();
     return true;

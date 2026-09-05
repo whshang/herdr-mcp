@@ -3,7 +3,7 @@ use crate::exec_sessions::ExecRegistry;
 #[cfg(unix)]
 use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
-use crate::mcp::{self, RuntimeContext};
+use crate::mcp::{self, BrowserActuator, BrowserPostconditionEvidence, RuntimeContext};
 use crate::paths::RuntimePaths;
 use crate::prompt::PromptRegistry;
 use crate::runtime_meta;
@@ -29,13 +29,16 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_BROWSER_REGISTRY_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_BROWSER_ACTUATION_RESULT_BYTES: usize = 64 * 1024;
+const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(12);
+const BROWSER_EXTENSION_LIVE_WINDOW: Duration = Duration::from_secs(2);
 const RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
@@ -45,8 +48,141 @@ const MAX_MCP_ACTIVITY_RECORDS: usize = 2000;
 const MAX_MCP_ACTIVITY_RESULTS: usize = 50;
 const MAX_MCP_ACTIVITY_LOOKBACK_MS: u64 = 30 * 60_000;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
+static NEXT_BROWSER_ACTUATION: AtomicU64 = AtomicU64::new(0);
 
 const SETTLED_AGENT_STATES: &[&str] = &["idle", "done", "blocked"];
+
+#[derive(Clone, Default)]
+struct BrowserActuationBroker {
+    inner: Arc<(Mutex<BrowserActuationState>, Condvar)>,
+}
+
+#[derive(Default)]
+struct BrowserActuationState {
+    queued: VecDeque<Value>,
+    pending: BTreeSet<String>,
+    completions: HashMap<String, BrowserPostconditionEvidence>,
+    last_extension_poll: Option<Instant>,
+}
+
+impl BrowserActuationBroker {
+    fn take_next_for_extension(&self) -> Option<Value> {
+        let Ok(mut state) = self.inner.0.lock() else {
+            return None;
+        };
+        state.last_extension_poll = Some(Instant::now());
+        state.queued.pop_front()
+    }
+
+    fn complete(
+        &self,
+        actuation_id: &str,
+        evidence: BrowserPostconditionEvidence,
+    ) -> Result<(), String> {
+        let (lock, ready) = &*self.inner;
+        let mut state = lock
+            .lock()
+            .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
+        if !state.pending.contains(actuation_id) {
+            return Err("browser_actuation_not_pending".to_owned());
+        }
+        state.completions.insert(actuation_id.to_owned(), evidence);
+        ready.notify_all();
+        Ok(())
+    }
+
+    fn extension_live(state: &BrowserActuationState) -> bool {
+        state
+            .last_extension_poll
+            .is_some_and(|seen| seen.elapsed() <= BROWSER_EXTENSION_LIVE_WINDOW)
+    }
+}
+
+impl BrowserActuator for BrowserActuationBroker {
+    fn actuate(
+        &self,
+        operation: &str,
+        params: &Value,
+        expected_generation: i64,
+    ) -> Result<BrowserPostconditionEvidence, String> {
+        let actuation_id = format!(
+            "ba_{:016x}",
+            NEXT_BROWSER_ACTUATION.fetch_add(1, Ordering::Relaxed)
+        );
+        let (lock, ready) = &*self.inner;
+        let mut state = lock
+            .lock()
+            .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
+        if !Self::extension_live(&state) {
+            return Ok(BrowserPostconditionEvidence {
+                observed_generation: expected_generation,
+                command_accepted: false,
+                browser_online: false,
+                resource_available: true,
+                rejected: false,
+                stable_resource_ref_observed: false,
+                lifecycle_observed: false,
+                canonical_url_observed: false,
+                accepted_message_observed: false,
+                message_baseline_advanced: false,
+                reasoning_effort_readback: None,
+                required_apps_readback: Vec::new(),
+                generation_owner: None,
+                generation_status_observed: false,
+                generation_stopped: false,
+            });
+        }
+        state.pending.insert(actuation_id.clone());
+        state.queued.push_back(json!({
+            "protocol": "herdr-browser-actuation/v1",
+            "actuation_id": actuation_id,
+            "operation": operation,
+            "expected_generation": expected_generation,
+            "params": params,
+        }));
+        ready.notify_all();
+
+        let deadline = Instant::now() + BROWSER_ACTUATION_TIMEOUT;
+        loop {
+            if let Some(evidence) = state.completions.remove(&actuation_id) {
+                state.pending.remove(&actuation_id);
+                return Ok(evidence);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                state.pending.remove(&actuation_id);
+                state.queued.retain(|command| {
+                    command.get("actuation_id").and_then(Value::as_str)
+                        != Some(actuation_id.as_str())
+                });
+                // Once a command may have crossed the SSE boundary, a missing
+                // acknowledgement is delivery-uncertain and must never invite replay.
+                return Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: false,
+                    lifecycle_observed: false,
+                    canonical_url_observed: false,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: None,
+                    generation_status_observed: false,
+                    generation_stopped: false,
+                });
+            }
+            let timeout = deadline.saturating_duration_since(now);
+            let waited = ready
+                .wait_timeout(state, timeout)
+                .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
+            state = waited.0;
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 struct SessionRegistry {
@@ -203,6 +339,7 @@ struct AppState {
     bearer_token: Arc<[u8]>,
     trusted_extension_ipc: bool,
     local_device_id: Option<String>,
+    browser_actuation: BrowserActuationBroker,
 }
 
 pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
@@ -267,6 +404,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             bearer_token: Arc::<[u8]>::from(token.into_bytes()),
             trusted_extension_ipc: false,
             local_device_id,
+            browser_actuation: BrowserActuationBroker::default(),
         };
         let app = candidate_router(state.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -335,6 +473,10 @@ fn candidate_router(state: AppState) -> Router {
             post(post_extension_browser_registry),
         )
         .route(
+            "/extension/browser/actuation",
+            post(post_extension_browser_actuation),
+        )
+        .route(
             "/extension/continuity/turn",
             post(post_extension_continuity_turn),
         )
@@ -395,6 +537,134 @@ async fn post_extension_browser_registry(State(state): State<AppState>, body: By
     };
     match result {
         Ok(value) => json_response(StatusCode::OK, &value),
+        Err(code) => browser_registry_http_store_error(&code),
+    }
+}
+
+async fn post_extension_browser_actuation(State(state): State<AppState>, body: Bytes) -> Response {
+    if !state.trusted_extension_ipc {
+        return browser_registry_http_error(
+            StatusCode::FORBIDDEN,
+            "trusted_extension_ipc_required",
+        );
+    }
+    if body.len() > MAX_BROWSER_ACTUATION_RESULT_BYTES {
+        return browser_registry_http_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "browser_actuation_result_too_large",
+        );
+    }
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(Value::Object(object)) => Value::Object(object),
+        _ => {
+            return browser_registry_http_error(
+                StatusCode::BAD_REQUEST,
+                "browser_actuation_result_invalid_json",
+            );
+        }
+    };
+    if let Err(code) = browser_registry_allow_fields(
+        &payload,
+        &[
+            "actuation_id",
+            "observed_generation",
+            "command_accepted",
+            "browser_online",
+            "resource_available",
+            "rejected",
+            "stable_resource_ref_observed",
+            "lifecycle_observed",
+            "canonical_url_observed",
+            "accepted_message_observed",
+            "message_baseline_advanced",
+            "reasoning_effort_readback",
+            "required_apps_readback",
+            "generation_owner",
+            "generation_status_observed",
+            "generation_stopped",
+        ],
+    ) {
+        return browser_registry_http_store_error(&code);
+    }
+    let result = (|| -> Result<(), String> {
+        let actuation_id = browser_registry_string(&payload, "actuation_id", 96)?;
+        if !actuation_id.starts_with("ba_") {
+            return Err("browser_actuation_id_invalid".to_owned());
+        }
+        let observed_generation = browser_registry_positive_i64(&payload, "observed_generation")?;
+        let reasoning_effort_readback = match payload.get("reasoning_effort_readback") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value))
+                if matches!(value.as_str(), "economy" | "balanced" | "thorough") =>
+            {
+                Some(value.clone())
+            }
+            _ => return Err("browser_reasoning_effort_readback_invalid".to_owned()),
+        };
+        let required_apps_readback = match payload.get("required_apps_readback") {
+            Some(Value::Array(items)) if items.len() <= 32 => {
+                let mut apps = Vec::with_capacity(items.len());
+                for item in items {
+                    let Some(app) = item.as_str() else {
+                        return Err("browser_required_apps_readback_invalid".to_owned());
+                    };
+                    if app.is_empty()
+                        || app.len() > 64
+                        || app != app.trim()
+                        || app.chars().any(char::is_control)
+                    {
+                        return Err("browser_required_apps_readback_invalid".to_owned());
+                    }
+                    apps.push(app.to_owned());
+                }
+                apps.sort();
+                apps.dedup();
+                apps
+            }
+            _ => return Err("browser_required_apps_readback_invalid".to_owned()),
+        };
+        let generation_owner = match payload.get("generation_owner") {
+            None | Some(Value::Null) => None,
+            Some(value) => match value.as_i64() {
+                Some(value) if value >= 1 => Some(value),
+                _ => return Err("browser_generation_owner_invalid".to_owned()),
+            },
+        };
+        state.browser_actuation.complete(
+            actuation_id,
+            BrowserPostconditionEvidence {
+                observed_generation,
+                command_accepted: browser_registry_bool(&payload, "command_accepted")?,
+                browser_online: browser_registry_bool(&payload, "browser_online")?,
+                resource_available: browser_registry_bool(&payload, "resource_available")?,
+                rejected: browser_registry_bool(&payload, "rejected")?,
+                stable_resource_ref_observed: browser_registry_bool(
+                    &payload,
+                    "stable_resource_ref_observed",
+                )?,
+                lifecycle_observed: browser_registry_bool(&payload, "lifecycle_observed")?,
+                canonical_url_observed: browser_registry_bool(&payload, "canonical_url_observed")?,
+                accepted_message_observed: browser_registry_bool(
+                    &payload,
+                    "accepted_message_observed",
+                )?,
+                message_baseline_advanced: browser_registry_bool(
+                    &payload,
+                    "message_baseline_advanced",
+                )?,
+                reasoning_effort_readback,
+                required_apps_readback,
+                generation_owner,
+                generation_status_observed: browser_registry_bool(
+                    &payload,
+                    "generation_status_observed",
+                )?,
+                generation_stopped: browser_registry_bool(&payload, "generation_stopped")?,
+            },
+        )
+    })();
+    match result {
+        Ok(()) => json_response(StatusCode::OK, &json!({"ok": true})),
         Err(code) => browser_registry_http_store_error(&code),
     }
 }
@@ -977,6 +1247,8 @@ struct PushStreamState {
     statuses: HashMap<String, String>,
     first: bool,
     last_heartbeat: Instant,
+    browser_actuation: BrowserActuationBroker,
+    trusted_extension_ipc: bool,
 }
 
 async fn push_state(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1071,7 +1343,12 @@ async fn push_events(
         pane: query.get("pane").filter(|v| !v.is_empty()).cloned(),
         workspace: query.get("workspace").filter(|v| !v.is_empty()).cloned(),
     };
-    push_events_response(state.cache, filters)
+    push_events_response(
+        state.cache,
+        filters,
+        state.browser_actuation,
+        state.trusted_extension_ipc,
+    )
 }
 
 async fn push_mcp_activity(
@@ -1167,7 +1444,12 @@ fn push_state_payload(cache: &EventCache) -> Value {
     })
 }
 
-fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Response {
+fn push_events_response(
+    cache: Arc<EventCache>,
+    filters: PushFilters,
+    browser_actuation: BrowserActuationBroker,
+    trusted_extension_ipc: bool,
+) -> Response {
     let digest = cache.digest_since(u64::MAX);
     let agents = push_agent_views(&digest.agents);
     let statuses = agents
@@ -1186,6 +1468,8 @@ fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Respons
         statuses,
         first: true,
         last_heartbeat: Instant::now(),
+        browser_actuation,
+        trusted_extension_ipc,
     };
     let events = stream::unfold(state, |mut state| async move {
         if state.first {
@@ -1221,6 +1505,12 @@ fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Respons
             state.cursor = digest.cursor;
             let current_agents = push_agent_views(&digest.agents);
             let mut body = String::new();
+
+            if state.trusted_extension_ipc
+                && let Some(command) = state.browser_actuation.take_next_for_extension()
+            {
+                body.push_str(&sse_event("browser_actuation", &command));
+            }
 
             for event in &digest.events {
                 if let Some((name, data)) = push_browser_lifecycle_event(event, &state.cache)
@@ -1791,6 +2081,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             // The local bearer authenticates the workstation transport only. A business
             // WebChat-control grant must arrive through a separately authenticated handoff.
             caller_webchat_control_granted: false,
+            browser_actuator: Some(&blocking_state.browser_actuation),
         };
         mcp::handle(&blocking_request, &context)
     })
@@ -2221,6 +2512,7 @@ mod tests {
             bearer_token: Arc::<[u8]>::from(b"test-token".to_vec()),
             trusted_extension_ipc: false,
             local_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            browser_actuation: BrowserActuationBroker::default(),
         }
     }
 
@@ -2547,6 +2839,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn browser_actuation_result_is_trusted_ipc_only_and_correlated() {
+        let root = test_root("browser-actuation-route");
+        let request = |payload: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/extension/browser/actuation")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        };
+        let evidence = |actuation_id: &str| {
+            json!({
+                "actuation_id": actuation_id,
+                "observed_generation": 7,
+                "command_accepted": true,
+                "browser_online": true,
+                "resource_available": true,
+                "rejected": false,
+                "stable_resource_ref_observed": true,
+                "lifecycle_observed": true,
+                "canonical_url_observed": true,
+                "accepted_message_observed": true,
+                "message_baseline_advanced": false,
+                "reasoning_effort_readback": null,
+                "required_apps_readback": [],
+                "generation_owner": 7,
+                "generation_status_observed": true,
+                "generation_stopped": false
+            })
+        };
+
+        let tcp = candidate_router(test_state(&root.join("tcp")));
+        let response = tcp
+            .oneshot(request(evidence("ba_0000000000000001")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let mut extension_state = test_state(&root.join("extension"));
+        extension_state.trusted_extension_ipc = true;
+        let broker = extension_state.browser_actuation.clone();
+        assert!(broker.take_next_for_extension().is_none());
+        let broker_for_task = broker.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            broker_for_task.actuate(
+                "herdr_mcp.browser_dispatch.submit",
+                &json!({"session_ref":"br_test","message":"hello"}),
+                7,
+            )
+        });
+        let command = loop {
+            if let Some(command) = broker.take_next_for_extension() {
+                break command;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let actuation_id = command["actuation_id"].as_str().unwrap().to_owned();
+        let app = candidate_router(extension_state);
+        let response = app.oneshot(request(evidence(&actuation_id))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let observed = task.await.unwrap().unwrap();
+        assert!(observed.command_accepted);
+        assert!(observed.accepted_message_observed);
+        assert_eq!(observed.generation_owner, Some(7));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn bearer_check_is_exact() {
         let mut headers = HeaderMap::new();
@@ -2758,6 +3119,8 @@ mod tests {
             statuses: HashMap::new(),
             first: false,
             last_heartbeat: Instant::now(),
+            browser_actuation: BrowserActuationBroker::default(),
+            trusted_extension_ipc: false,
         };
         let working = json!({
             "agent":"pi","pane":"w1:p1","status":"working","workspace":"w1"
