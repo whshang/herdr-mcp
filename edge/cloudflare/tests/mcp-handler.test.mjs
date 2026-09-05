@@ -97,7 +97,16 @@ test("tools/list exposes runtime tools plus edge-local herdr_devices", async () 
 });
 
 test("tools/call forwards only frozen tools with epoch/hash and preserves id", async () => {
-  const d = deps();
+  const d = deps({
+    client: {
+      webchatControlGrants: [{
+        device_id: DEVICE_A,
+        endpoint_ref: `be_${"a".repeat(64)}`,
+        provider: "chatgpt",
+        account_ref: `br_${"b".repeat(64)}`,
+      }],
+    },
+  });
   const r = await handleMcp(req(7, "tools/call", { name: "herdr_inspect", arguments: {} }), "w1", d.value);
   assert.equal(r.body.id, 7);
   assert.equal(r.body.result.isError, undefined);
@@ -107,6 +116,7 @@ test("tools/call forwards only frozen tools with epoch/hash and preserves id", a
   assert.equal(d.calls[0].contractEpoch, 2);
   assert.equal(d.calls[0].contractHash, EPOCH2_CONTRACT.contract_hash);
   assert.equal(d.calls[0].deadlineMs, 31_000);
+  assert.equal(d.calls[0].trace, undefined, "browser grants must not alter non-browser MCP forwarding");
 });
 
 test("read-only call retries across a stale generation window after supersede proved not delivered", async () => {

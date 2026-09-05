@@ -227,6 +227,33 @@ test("new Connector requires explicit exact owner-device approval; generic owner
   assert.equal(redirect.origin + redirect.pathname, "https://client.example/callback");
   assert.equal(redirect.searchParams.get("state"), "state-connector");
   assert.ok(redirect.searchParams.get("code"));
+
+  const genericRevoke = await worker.fetch(
+    post("/connectors/revoke", { client_id: client.client_id }, "owner-secret"),
+    h.env,
+  );
+  assert.equal(genericRevoke.status, 401, "generic MCP/operator bearer must not revoke connector grants");
+
+  const revoked = await worker.fetch(postAsWorkstation(
+    "/connectors/revoke",
+    { client_id: client.client_id },
+    "prod-real-runtime",
+    "legacy-secret",
+  ), h.env);
+  assert.equal(revoked.status, 200);
+  const revokedBody = await revoked.json();
+  assert.equal(revokedBody.ok, true);
+  assert.equal(revokedBody.action, "connector_revoke");
+  assert.equal(revokedBody.client_id, client.client_id);
+
+  const storedRevokedGrant = await oauth.fetch(new Request("https://oauth.internal/internal/oauth/grant/get", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_id: client.client_id }),
+  }));
+  assert.equal(storedRevokedGrant.status, 200);
+  const storedRevokedGrantBody = await storedRevokedGrant.json();
+  assert.equal(storedRevokedGrantBody.record.status, "revoked");
 });
 
 test("pairing creation requires owner auth and returns one-time material with worker origin metadata", async () => {
