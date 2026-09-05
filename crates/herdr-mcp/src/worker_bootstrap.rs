@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CLOUDFLARE_API: &str = "https://api.cloudflare.com/client/v4";
@@ -1620,9 +1620,9 @@ fn open_browser(_url: &str) {
     {
         let _ = Command::new("/usr/bin/open")
             .arg(_url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn();
     }
 }
