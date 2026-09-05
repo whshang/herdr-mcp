@@ -1803,6 +1803,69 @@ impl StateStore {
         })
     }
 
+    pub fn append_browser_dispatch_work_memory_evidence(
+        &mut self,
+        work_chain_id: &str,
+        provider: &str,
+        session_ref: &str,
+        content: &str,
+        created_at: i64,
+    ) -> Result<WorkMemoryEvidenceAppendRecord, String> {
+        if !valid_work_chain_id(work_chain_id) {
+            return Err("work_memory_work_chain_id_invalid".to_owned());
+        }
+        let mut continuity_ids = self
+            .conn
+            .prepare(
+                "SELECT continuity_id FROM continuity_chains
+                 WHERE work_chain_id = ?1 AND status = 'active'
+                 ORDER BY continuity_id LIMIT 2",
+            )
+            .map_err(|error| format!("cannot resolve browser dispatch work chain: {error}"))?
+            .query_map([work_chain_id], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query browser dispatch work chain: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read browser dispatch work chain: {error}"))?;
+        let continuity_id = match continuity_ids.len() {
+            0 => return Err("work_memory_not_found".to_owned()),
+            1 => continuity_ids.remove(0),
+            _ => return Err("work_memory_ambiguous".to_owned()),
+        };
+
+        let mut bindings = self
+            .conn
+            .prepare(
+                "SELECT account_ref, space_ref FROM continuity_provider_bindings
+                 WHERE continuity_id = ?1 AND provider = ?2 AND session_ref = ?3
+                 ORDER BY account_ref, space_ref LIMIT 2",
+            )
+            .map_err(|error| format!("cannot resolve browser dispatch provider binding: {error}"))?
+            .query_map(params![continuity_id, provider, session_ref], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("cannot query browser dispatch provider binding: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read browser dispatch provider binding: {error}"))?;
+        let (account_ref, space_ref) = match bindings.len() {
+            0 => return Err("work_memory_provider_binding_missing".to_owned()),
+            1 => bindings.remove(0),
+            _ => return Err("work_memory_provider_binding_ambiguous".to_owned()),
+        };
+        let account_ref = (!account_ref.is_empty()).then_some(account_ref);
+        let space_ref = (!space_ref.is_empty()).then_some(space_ref);
+        self.append_work_memory_evidence(WorkMemoryEvidenceInput {
+            continuity_id: &continuity_id,
+            kind: "browser_dispatch",
+            content,
+            provider: Some(provider),
+            account_ref: account_ref.as_deref(),
+            space_ref: space_ref.as_deref(),
+            session_ref: Some(session_ref),
+            portable_source: None,
+            created_at,
+        })
+    }
+
     pub fn put_work_memory_checkpoint(
         &mut self,
         input: WorkMemoryCheckpointInput<'_>,

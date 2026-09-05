@@ -1320,11 +1320,14 @@ fn browser_dispatch_submit(
                 dispatch.delivery_state,
                 BrowserDeliveryState::Applied | BrowserDeliveryState::Stopped
             );
+            let work_memory_writeback =
+                browser_dispatch_work_memory_writeback(&mut store_guard, &dispatch);
             return json!({
                 "ok": success,
                 "code": if success { Value::Null } else { json!(dispatch.delivery_state.as_str()) },
                 "dispatch": browser_dispatch_json(dispatch),
                 "replayed": true,
+                "work_memory_writeback": work_memory_writeback,
             });
         }
         Ok(BrowserDispatchReservation::Reserved(dispatch)) => dispatch,
@@ -1377,12 +1380,60 @@ fn browser_dispatch_submit(
         Ok(dispatch) => dispatch,
         Err(error) => return browser_store_error(error),
     };
+    let work_memory_writeback = browser_dispatch_work_memory_writeback(&mut store, &dispatch);
+    let success = matches!(
+        delivery_state,
+        BrowserDeliveryState::Applied | BrowserDeliveryState::Stopped
+    );
     json!({
-        "ok": false,
-        "code": delivery_state.as_str(),
+        "ok": success,
+        "code": if success { Value::Null } else { json!(delivery_state.as_str()) },
         "dispatch": browser_dispatch_json(dispatch),
         "replayed": false,
+        "work_memory_writeback": work_memory_writeback,
     })
+}
+
+fn browser_dispatch_work_memory_writeback(
+    store: &mut StateStore,
+    dispatch: &crate::state_store::BrowserDispatchRecord,
+) -> Value {
+    let Some(work_chain_id) = dispatch.work_chain_id.as_deref() else {
+        return Value::Null;
+    };
+    let content = json!({
+        "schema": "herdr.browser_dispatch_evidence/v1",
+        "dispatch_id": dispatch.dispatch_id,
+        "provider": dispatch.provider,
+        "session_ref": dispatch.target_session_ref,
+        "operation": dispatch.operation,
+        "delivery_state": dispatch.delivery_state.as_str(),
+        "expected_generation": dispatch.expected_generation,
+        "generation_owner": dispatch.generation_owner,
+        "message_digest": dispatch.message_digest,
+        "reasoning_effort": dispatch.reasoning_effort,
+        "required_apps": dispatch.required_apps,
+        "lane_id": dispatch.lane_id,
+    })
+    .to_string();
+    match store.append_browser_dispatch_work_memory_evidence(
+        work_chain_id,
+        &dispatch.provider,
+        &dispatch.target_session_ref,
+        &content,
+        dispatch.updated_at,
+    ) {
+        Ok(record) => json!({
+            "ok": true,
+            "evidence_id": record.evidence_id,
+            "sha256": record.sha256,
+            "portable_evidence_ref": Value::Null,
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "code": error,
+        }),
+    }
 }
 
 fn browser_sha256(value: &str) -> String {
@@ -3569,6 +3620,120 @@ mod tests {
         assert_eq!(status["ok"], true);
         assert_eq!(status["dispatch"]["delivery_state"], "resource_unavailable");
         assert!(!status.to_string().contains("delivery-session-hidden"));
+
+        struct AppliedActuator;
+        impl BrowserActuator for AppliedActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: true,
+                    lifecycle_observed: true,
+                    canonical_url_observed: true,
+                    accepted_message_observed: true,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: Some(expected_generation),
+                    generation_status_observed: true,
+                    generation_stopped: false,
+                })
+            }
+        }
+
+        store
+            .lock()
+            .unwrap()
+            .bind_work_memory(WorkMemoryBindingInput {
+                continuity_id: "wm:browser-dispatch",
+                project_ref: "project:herdr-mcp",
+                repo_id: "github.com/whshang/herdr-mcp",
+                work_chain_id: "wc_dddddddddddddddddddddddddddddddd",
+                provider: "chatgpt",
+                account_ref: None,
+                space_ref: None,
+                session_ref: &session_ref,
+                bound_at: 20,
+            })
+            .unwrap();
+        let applied_params = json!({
+            "session_ref": session_ref,
+            "message": "dispatch and persist evidence",
+            "expected_generation": 7,
+            "idempotency_key": "delivery-applied-idempotency-key",
+            "work_chain_id": "wc_dddddddddddddddddddddddddddddddd",
+            "lane_id": "lane-browser"
+        });
+        let applied = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &applied_params,
+            true,
+            Some(&AppliedActuator),
+        );
+        assert_eq!(applied["ok"], true);
+        assert!(applied["code"].is_null());
+        assert_eq!(applied["dispatch"]["delivery_state"], "applied");
+        assert_eq!(applied["work_memory_writeback"]["ok"], true);
+        assert!(applied["work_memory_writeback"]["portable_evidence_ref"].is_null());
+        let applied_dispatch_id = applied["dispatch"]["dispatch_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let evidence_search = work_memory_call(
+            &store,
+            "work_memory.search",
+            &json!({
+                "project_ref": "project:herdr-mcp",
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "work_chain_id": "wc_dddddddddddddddddddddddddddddddd",
+                "query": applied_dispatch_id,
+                "limit": 10
+            }),
+        );
+        assert_eq!(evidence_search["ok"], true);
+        assert_eq!(evidence_search["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(evidence_search["hits"][0]["source_kind"], "evidence");
+        assert!(
+            !evidence_search
+                .to_string()
+                .contains("dispatch and persist evidence")
+        );
+
+        let applied_replay = browser_operation_call_with_grant(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &applied_params,
+            true,
+            Some(&AppliedActuator),
+        );
+        assert_eq!(applied_replay["ok"], true);
+        assert_eq!(applied_replay["replayed"], true);
+        assert_eq!(
+            applied_replay["work_memory_writeback"]["evidence_id"],
+            applied["work_memory_writeback"]["evidence_id"]
+        );
+        let evidence_search = work_memory_call(
+            &store,
+            "work_memory.search",
+            &json!({
+                "project_ref": "project:herdr-mcp",
+                "repo_id": "github.com/whshang/herdr-mcp",
+                "work_chain_id": "wc_dddddddddddddddddddddddddddddddd",
+                "query": applied_dispatch_id,
+                "limit": 10
+            }),
+        );
+        assert_eq!(evidence_search["hits"].as_array().unwrap().len(), 1);
     }
 
     #[test]
