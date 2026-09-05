@@ -732,6 +732,23 @@ export async function handleMcp(
     if (selectorValue !== undefined && typeof selectorValue !== "string") {
       return rpcError(id, -32602, "Invalid params", { reason: "device must be a string" });
     }
+    const isBrowserPrivateMethod = typeof localMethod === "string" && (
+      localMethod.startsWith("herdr_mcp.browser_endpoint.") ||
+      localMethod.startsWith("herdr_mcp.browser_resource.")
+    );
+    if (isBrowserPrivateMethod) {
+      if (typeof selectorValue !== "string" || selectorValue.trim().length === 0) {
+        return rpcResult(id, callToolResult({
+          ok: false,
+          code: "device_required",
+          retryable: false,
+          delivery_state: "not_delivered",
+          failure_layer: "edge_routing",
+          next_action: "retry the browser registry query with an explicit enrolled device selector",
+        }, true));
+      }
+    }
+
     const explicitTextDevice = localMethod === "herdr_mcp.text.read" || localMethod === "herdr_mcp.text.write";
     if (explicitTextDevice) {
       if (typeof selectorValue !== "string" || selectorValue.trim().length === 0) {

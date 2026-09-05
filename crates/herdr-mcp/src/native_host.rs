@@ -72,6 +72,7 @@ const ALLOWED_PROXY_PATHS: &[&str] = &[
     "/push/mcp-activity",
     "/extension/control/action",
     "/extension/fleet",
+    "/extension/browser/registry",
     "/extension/continuity/turn",
     "/extension/continuity/resolve",
 ];
@@ -856,6 +857,10 @@ mod tests {
         assert_eq!(
             validate_proxy_path(Some(&json!("/extension/fleet"))).unwrap(),
             "/extension/fleet"
+        );
+        assert_eq!(
+            validate_proxy_path(Some(&json!("/extension/browser/registry"))).unwrap(),
+            "/extension/browser/registry"
         );
         assert_eq!(
             validate_proxy_path(Some(&json!("/extension/continuity/turn"))).unwrap(),

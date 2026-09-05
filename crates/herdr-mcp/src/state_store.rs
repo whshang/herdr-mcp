@@ -32,7 +32,7 @@ pub const BUSY_TIMEOUT_MS: i64 = 5_000;
 /// Max migration version the current binary understands. Keep this numeric so
 /// release manifests can pin rollback-compatible durable-state readers; tests
 /// assert it remains exactly equal to the append-only migration count.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Meta-table key holding the applied schema version. Stored as a string.
 const META_SCHEMA_VERSION: &str = "schema_version";
@@ -307,6 +307,58 @@ INSERT INTO continuity_memory_fts(continuity_id, source_kind, source_id, text)
     SELECT continuity_id, 'turn', message_id, text FROM continuity_turns;
 "#;
 
+/// Migration 7: provider-neutral Browser Endpoint and Resource Registry.
+///
+/// Browser identity stays local to the existing state store. The raw browser
+/// profile seed and raw provider-native resource ids are intentionally absent:
+/// callers pass them only to trusted local registration APIs, which persist
+/// opaque refs/digests. Browser resource reservation/failover is a later
+/// milestone and therefore has no table in this migration.
+const MIGRATION_V7: &str = r#"
+CREATE TABLE IF NOT EXISTS browser_endpoints (
+    endpoint_ref                    TEXT PRIMARY KEY NOT NULL,
+    device_id                       TEXT NOT NULL,
+    browser_family                  TEXT NOT NULL,
+    extension_version               TEXT NOT NULL,
+    webchat_control_allowed         INTEGER NOT NULL DEFAULT 0,
+    tool_bridge_allowed             INTEGER NOT NULL DEFAULT 0,
+    tool_bridge_mutation_allowed    INTEGER NOT NULL DEFAULT 0,
+    consent_revision                INTEGER NOT NULL DEFAULT 0,
+    first_observed_at               INTEGER NOT NULL,
+    last_observed_at                INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_browser_endpoints_device
+    ON browser_endpoints(device_id, last_observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS browser_provider_state (
+    endpoint_ref                TEXT NOT NULL,
+    provider                    TEXT NOT NULL,
+    adapter_protocol_version    INTEGER NOT NULL,
+    observation_generation      INTEGER NOT NULL,
+    capabilities_json           TEXT NOT NULL,
+    observed_at                 INTEGER NOT NULL,
+    PRIMARY KEY (endpoint_ref, provider),
+    FOREIGN KEY (endpoint_ref) REFERENCES browser_endpoints(endpoint_ref) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS browser_resources (
+    resource_ref                TEXT PRIMARY KEY NOT NULL,
+    endpoint_ref                TEXT NOT NULL,
+    provider                    TEXT NOT NULL,
+    kind                        TEXT NOT NULL,
+    parent_ref                  TEXT NOT NULL DEFAULT '',
+    native_identity_sha256      TEXT NOT NULL,
+    display_label               TEXT,
+    observation_generation      INTEGER NOT NULL,
+    first_observed_at           INTEGER NOT NULL,
+    last_observed_at            INTEGER NOT NULL,
+    FOREIGN KEY (endpoint_ref) REFERENCES browser_endpoints(endpoint_ref) ON DELETE CASCADE,
+    UNIQUE(endpoint_ref, provider, kind, parent_ref, native_identity_sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_browser_resources_lookup
+    ON browser_resources(endpoint_ref, provider, kind, parent_ref, last_observed_at DESC);
+"#;
+
 /// Ordered, append-only migration list. Index `i` (0-based) upgrades from
 /// version `i` to version `i + 1`.
 const MIGRATIONS: &[&str] = &[
@@ -316,6 +368,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V4,
     MIGRATION_V5,
     MIGRATION_V6,
+    MIGRATION_V7,
 ];
 
 /// Existing durable operation found while reserving an idempotency key.
@@ -541,6 +594,95 @@ pub struct WorkMemorySearchHit {
     pub source_kind: String,
     pub source_id: String,
     pub excerpt: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserEndpointRegistrationInput<'a> {
+    pub device_id: &'a str,
+    pub profile_seed: &'a str,
+    pub browser_family: &'a str,
+    pub extension_version: &'a str,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserEndpointConsentInput<'a> {
+    pub endpoint_ref: &'a str,
+    pub expected_revision: i64,
+    pub webchat_control_allowed: bool,
+    pub tool_bridge_allowed: bool,
+    pub tool_bridge_mutation_allowed: bool,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserEndpointRecord {
+    pub endpoint_ref: String,
+    pub device_id: String,
+    pub browser_family: String,
+    pub extension_version: String,
+    pub webchat_control_allowed: bool,
+    pub tool_bridge_allowed: bool,
+    pub tool_bridge_mutation_allowed: bool,
+    pub consent_revision: i64,
+    pub first_observed_at: i64,
+    pub last_observed_at: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserProviderObservationInput<'a> {
+    pub endpoint_ref: &'a str,
+    pub provider: &'a str,
+    pub adapter_protocol_version: i64,
+    pub observation_generation: i64,
+    pub capabilities_json: &'a str,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserProviderStateRecord {
+    pub endpoint_ref: String,
+    pub provider: String,
+    pub adapter_protocol_version: i64,
+    pub observation_generation: i64,
+    pub capabilities_json: String,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserResourceObservationInput<'a> {
+    pub endpoint_ref: &'a str,
+    pub provider: &'a str,
+    pub kind: &'a str,
+    pub parent_ref: Option<&'a str>,
+    pub native_identity: &'a str,
+    pub display_label: Option<&'a str>,
+    pub observation_generation: i64,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserResourceRecord {
+    pub resource_ref: String,
+    pub endpoint_ref: String,
+    pub provider: String,
+    pub kind: String,
+    pub parent_ref: Option<String>,
+    pub native_identity_sha256: String,
+    pub display_label: Option<String>,
+    pub observation_generation: i64,
+    pub first_observed_at: i64,
+    pub last_observed_at: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BrowserResourceResolveInput<'a> {
+    pub endpoint_ref: &'a str,
+    pub provider: &'a str,
+    pub kind: &'a str,
+    pub parent_ref: Option<&'a str>,
+    pub display_label: Option<&'a str>,
+    pub expected_observation_generation: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1927,6 +2069,766 @@ impl StateStore {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot decode work memory search: {error}"))
     }
+
+    pub fn register_browser_endpoint(
+        &mut self,
+        input: BrowserEndpointRegistrationInput<'_>,
+    ) -> Result<BrowserEndpointRecord, String> {
+        validate_browser_device_id(input.device_id)?;
+        validate_browser_profile_seed(input.profile_seed)?;
+        validate_browser_token(input.browser_family, 32, "browser_family")?;
+        validate_browser_ref_text(input.extension_version, 64, "extension_version")?;
+        if input.observed_at < 0 {
+            return Err("browser_observed_at_invalid".to_owned());
+        }
+        let endpoint_ref = browser_opaque_ref(
+            "bep_",
+            &["browser-endpoint-v1", input.device_id, input.profile_seed],
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser endpoint transaction: {error}"))?;
+        let existing = tx
+            .query_row(
+                "SELECT device_id, browser_family FROM browser_endpoints WHERE endpoint_ref = ?1",
+                params![endpoint_ref],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect browser endpoint identity: {error}"))?;
+        if let Some((device_id, browser_family)) = existing {
+            if device_id != input.device_id || browser_family != input.browser_family {
+                return Err("browser_endpoint_identity_conflict".to_owned());
+            }
+            tx.execute(
+                "UPDATE browser_endpoints
+                 SET extension_version = ?2,
+                     last_observed_at = MAX(last_observed_at, ?3)
+                 WHERE endpoint_ref = ?1",
+                params![endpoint_ref, input.extension_version, input.observed_at],
+            )
+            .map_err(|error| format!("cannot update browser endpoint: {error}"))?;
+        } else {
+            tx.execute(
+                "INSERT INTO browser_endpoints(
+                    endpoint_ref, device_id, browser_family, extension_version,
+                    webchat_control_allowed, tool_bridge_allowed,
+                    tool_bridge_mutation_allowed, consent_revision,
+                    first_observed_at, last_observed_at
+                 ) VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0, ?5, ?5)",
+                params![
+                    endpoint_ref,
+                    input.device_id,
+                    input.browser_family,
+                    input.extension_version,
+                    input.observed_at,
+                ],
+            )
+            .map_err(|error| format!("cannot insert browser endpoint: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser endpoint: {error}"))?;
+        self.browser_endpoint(&endpoint_ref)?
+            .ok_or_else(|| "browser_endpoint_not_found".to_owned())
+    }
+
+    pub fn set_browser_endpoint_consent(
+        &mut self,
+        input: BrowserEndpointConsentInput<'_>,
+    ) -> Result<BrowserEndpointRecord, String> {
+        validate_browser_endpoint_ref(input.endpoint_ref)?;
+        if input.expected_revision < 0 {
+            return Err("browser_consent_expected_revision_invalid".to_owned());
+        }
+        if input.tool_bridge_mutation_allowed && !input.tool_bridge_allowed {
+            return Err("browser_consent_hierarchy_invalid".to_owned());
+        }
+        if input.observed_at < 0 {
+            return Err("browser_observed_at_invalid".to_owned());
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE browser_endpoints
+                 SET webchat_control_allowed = ?2,
+                     tool_bridge_allowed = ?3,
+                     tool_bridge_mutation_allowed = ?4,
+                     consent_revision = consent_revision + 1,
+                     last_observed_at = MAX(last_observed_at, ?5)
+                 WHERE endpoint_ref = ?1 AND consent_revision = ?6",
+                params![
+                    input.endpoint_ref,
+                    i64::from(input.webchat_control_allowed),
+                    i64::from(input.tool_bridge_allowed),
+                    i64::from(input.tool_bridge_mutation_allowed),
+                    input.observed_at,
+                    input.expected_revision,
+                ],
+            )
+            .map_err(|error| format!("cannot update browser endpoint consent: {error}"))?;
+        if changed == 0 {
+            if self.browser_endpoint(input.endpoint_ref)?.is_none() {
+                return Err("browser_endpoint_not_found".to_owned());
+            }
+            return Err("browser_consent_cas_conflict".to_owned());
+        }
+        self.browser_endpoint(input.endpoint_ref)?
+            .ok_or_else(|| "browser_endpoint_not_found".to_owned())
+    }
+
+    pub fn browser_endpoint(
+        &self,
+        endpoint_ref: &str,
+    ) -> Result<Option<BrowserEndpointRecord>, String> {
+        validate_browser_endpoint_ref(endpoint_ref)?;
+        self.conn
+            .query_row(
+                "SELECT endpoint_ref, device_id, browser_family, extension_version,
+                        webchat_control_allowed, tool_bridge_allowed,
+                        tool_bridge_mutation_allowed, consent_revision, first_observed_at, last_observed_at
+                 FROM browser_endpoints WHERE endpoint_ref = ?1",
+                params![endpoint_ref],
+                decode_browser_endpoint,
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect browser endpoint: {error}"))
+    }
+
+    pub fn browser_endpoints(&self, limit: usize) -> Result<Vec<BrowserEndpointRecord>, String> {
+        let limit = i64::try_from(limit.clamp(1, 64)).unwrap_or(64);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT endpoint_ref, device_id, browser_family, extension_version,
+                        webchat_control_allowed, tool_bridge_allowed,
+                        tool_bridge_mutation_allowed, consent_revision, first_observed_at, last_observed_at
+                 FROM browser_endpoints
+                 ORDER BY last_observed_at DESC, endpoint_ref
+                 LIMIT ?1",
+            )
+            .map_err(|error| format!("cannot prepare browser endpoint list: {error}"))?;
+        let rows = stmt
+            .query_map(params![limit], decode_browser_endpoint)
+            .map_err(|error| format!("cannot list browser endpoints: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode browser endpoints: {error}"))
+    }
+
+    pub fn observe_browser_provider(
+        &mut self,
+        input: BrowserProviderObservationInput<'_>,
+    ) -> Result<BrowserProviderStateRecord, String> {
+        validate_browser_endpoint_ref(input.endpoint_ref)?;
+        validate_browser_token(input.provider, 32, "provider")?;
+        if input.adapter_protocol_version < 1 {
+            return Err("browser_adapter_protocol_version_invalid".to_owned());
+        }
+        if input.observation_generation < 1 {
+            return Err("browser_observation_generation_invalid".to_owned());
+        }
+        if input.observed_at < 0 {
+            return Err("browser_observed_at_invalid".to_owned());
+        }
+        let capabilities_json = normalize_browser_capabilities(input.capabilities_json)?;
+        if self.browser_endpoint(input.endpoint_ref)?.is_none() {
+            return Err("browser_endpoint_not_found".to_owned());
+        }
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT adapter_protocol_version, observation_generation, capabilities_json, observed_at
+                 FROM browser_provider_state WHERE endpoint_ref = ?1 AND provider = ?2",
+                params![input.endpoint_ref, input.provider],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect browser provider state: {error}"))?;
+        if let Some((protocol, generation, current_capabilities, observed_at)) = existing {
+            if input.observation_generation < generation
+                || input.observation_generation == generation
+                    && (input.adapter_protocol_version != protocol
+                        || capabilities_json != current_capabilities)
+            {
+                return Err("stale_capability_generation".to_owned());
+            }
+            if input.observation_generation == generation {
+                return Ok(BrowserProviderStateRecord {
+                    endpoint_ref: input.endpoint_ref.to_owned(),
+                    provider: input.provider.to_owned(),
+                    adapter_protocol_version: protocol,
+                    observation_generation: generation,
+                    capabilities_json: current_capabilities,
+                    observed_at,
+                });
+            }
+        }
+        self.conn
+            .execute(
+                "INSERT INTO browser_provider_state(
+                    endpoint_ref, provider, adapter_protocol_version,
+                    observation_generation, capabilities_json, observed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(endpoint_ref, provider) DO UPDATE SET
+                    adapter_protocol_version = excluded.adapter_protocol_version,
+                    observation_generation = excluded.observation_generation,
+                    capabilities_json = excluded.capabilities_json,
+                    observed_at = excluded.observed_at",
+                params![
+                    input.endpoint_ref,
+                    input.provider,
+                    input.adapter_protocol_version,
+                    input.observation_generation,
+                    capabilities_json,
+                    input.observed_at,
+                ],
+            )
+            .map_err(|error| format!("cannot store browser provider state: {error}"))?;
+        self.browser_provider_state(input.endpoint_ref, input.provider)?
+            .ok_or_else(|| "browser_provider_state_not_found".to_owned())
+    }
+
+    pub fn browser_provider_state(
+        &self,
+        endpoint_ref: &str,
+        provider: &str,
+    ) -> Result<Option<BrowserProviderStateRecord>, String> {
+        validate_browser_endpoint_ref(endpoint_ref)?;
+        validate_browser_token(provider, 32, "provider")?;
+        self.conn
+            .query_row(
+                "SELECT endpoint_ref, provider, adapter_protocol_version,
+                        observation_generation, capabilities_json, observed_at
+                 FROM browser_provider_state WHERE endpoint_ref = ?1 AND provider = ?2",
+                params![endpoint_ref, provider],
+                decode_browser_provider_state,
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect browser provider state: {error}"))
+    }
+
+    pub fn browser_provider_states(
+        &self,
+        endpoint_ref: &str,
+    ) -> Result<Vec<BrowserProviderStateRecord>, String> {
+        validate_browser_endpoint_ref(endpoint_ref)?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT endpoint_ref, provider, adapter_protocol_version,
+                        observation_generation, capabilities_json, observed_at
+                 FROM browser_provider_state WHERE endpoint_ref = ?1 ORDER BY provider",
+            )
+            .map_err(|error| format!("cannot prepare browser provider list: {error}"))?;
+        let rows = stmt
+            .query_map(params![endpoint_ref], decode_browser_provider_state)
+            .map_err(|error| format!("cannot list browser provider states: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode browser provider states: {error}"))
+    }
+
+    pub fn observe_browser_resource(
+        &mut self,
+        input: BrowserResourceObservationInput<'_>,
+    ) -> Result<BrowserResourceRecord, String> {
+        validate_browser_endpoint_ref(input.endpoint_ref)?;
+        validate_browser_token(input.provider, 32, "provider")?;
+        validate_browser_resource_kind(input.kind)?;
+        if input.observation_generation < 1 {
+            return Err("browser_observation_generation_invalid".to_owned());
+        }
+        if input.observed_at < 0 {
+            return Err("browser_observed_at_invalid".to_owned());
+        }
+        validate_browser_native_identity(input.native_identity)?;
+        if let Some(label) = input.display_label {
+            validate_browser_ref_text(label, 256, "display_label")?;
+        }
+        let provider_state = self
+            .browser_provider_state(input.endpoint_ref, input.provider)?
+            .ok_or_else(|| "browser_capability_unknown".to_owned())?;
+        if provider_state.observation_generation != input.observation_generation {
+            return Err("stale_capability_generation".to_owned());
+        }
+        let parent_ref = input.parent_ref.unwrap_or("");
+        validate_browser_resource_parent(
+            &self.conn,
+            input.endpoint_ref,
+            input.provider,
+            input.kind,
+            parent_ref,
+            input.observation_generation,
+        )?;
+        let native_identity_sha256 = sha256_text(input.native_identity);
+        let resource_ref = browser_opaque_ref(
+            "br_",
+            &[
+                "browser-resource-v1",
+                input.endpoint_ref,
+                input.provider,
+                input.kind,
+                parent_ref,
+                input.native_identity,
+            ],
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin browser resource transaction: {error}"))?;
+        let existing_ref = tx
+            .query_row(
+                "SELECT resource_ref FROM browser_resources
+                 WHERE endpoint_ref = ?1 AND provider = ?2 AND kind = ?3
+                   AND parent_ref = ?4 AND native_identity_sha256 = ?5",
+                params![
+                    input.endpoint_ref,
+                    input.provider,
+                    input.kind,
+                    parent_ref,
+                    native_identity_sha256,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect browser resource identity: {error}"))?;
+        if let Some(existing_ref) = existing_ref {
+            if existing_ref != resource_ref {
+                return Err("browser_resource_identity_conflict".to_owned());
+            }
+            tx.execute(
+                "UPDATE browser_resources
+                 SET display_label = ?2,
+                     observation_generation = ?3,
+                     last_observed_at = MAX(last_observed_at, ?4)
+                 WHERE resource_ref = ?1",
+                params![
+                    resource_ref,
+                    input.display_label,
+                    input.observation_generation,
+                    input.observed_at,
+                ],
+            )
+            .map_err(|error| format!("cannot update browser resource: {error}"))?;
+        } else {
+            tx.execute(
+                "INSERT INTO browser_resources(
+                    resource_ref, endpoint_ref, provider, kind, parent_ref,
+                    native_identity_sha256, display_label, observation_generation,
+                    first_observed_at, last_observed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                params![
+                    resource_ref,
+                    input.endpoint_ref,
+                    input.provider,
+                    input.kind,
+                    parent_ref,
+                    native_identity_sha256,
+                    input.display_label,
+                    input.observation_generation,
+                    input.observed_at,
+                ],
+            )
+            .map_err(|error| format!("cannot insert browser resource: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit browser resource: {error}"))?;
+        self.browser_resource(&resource_ref)?
+            .ok_or_else(|| "browser_resource_not_found".to_owned())
+    }
+
+    pub fn browser_resource(
+        &self,
+        resource_ref: &str,
+    ) -> Result<Option<BrowserResourceRecord>, String> {
+        validate_browser_resource_ref(resource_ref)?;
+        self.conn
+            .query_row(
+                "SELECT resource_ref, endpoint_ref, provider, kind, parent_ref,
+                        native_identity_sha256, display_label, observation_generation,
+                        first_observed_at, last_observed_at
+                 FROM browser_resources WHERE resource_ref = ?1",
+                params![resource_ref],
+                decode_browser_resource,
+            )
+            .optional()
+            .map_err(|error| format!("cannot inspect browser resource: {error}"))
+    }
+
+    pub fn browser_resources(
+        &self,
+        endpoint_ref: Option<&str>,
+        provider: Option<&str>,
+        kind: Option<&str>,
+        parent_ref: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<BrowserResourceRecord>, String> {
+        if let Some(value) = endpoint_ref {
+            validate_browser_endpoint_ref(value)?;
+        }
+        if let Some(value) = provider {
+            validate_browser_token(value, 32, "provider")?;
+        }
+        if let Some(value) = kind {
+            validate_browser_resource_kind(value)?;
+        }
+        if let Some(value) = parent_ref {
+            validate_browser_resource_ref(value)?;
+        }
+        let limit = i64::try_from(limit.clamp(1, 64)).unwrap_or(64);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT resource_ref, endpoint_ref, provider, kind, parent_ref,
+                        native_identity_sha256, display_label, observation_generation,
+                        first_observed_at, last_observed_at
+                 FROM browser_resources
+                 WHERE (?1 IS NULL OR endpoint_ref = ?1)
+                   AND (?2 IS NULL OR provider = ?2)
+                   AND (?3 IS NULL OR kind = ?3)
+                   AND (?4 IS NULL OR parent_ref = ?4)
+                 ORDER BY last_observed_at DESC, resource_ref
+                 LIMIT ?5",
+            )
+            .map_err(|error| format!("cannot prepare browser resource list: {error}"))?;
+        let rows = stmt
+            .query_map(
+                params![endpoint_ref, provider, kind, parent_ref, limit],
+                decode_browser_resource,
+            )
+            .map_err(|error| format!("cannot list browser resources: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode browser resources: {error}"))
+    }
+
+    pub fn resolve_browser_resource(
+        &self,
+        input: BrowserResourceResolveInput<'_>,
+    ) -> Result<BrowserResourceRecord, String> {
+        validate_browser_endpoint_ref(input.endpoint_ref)?;
+        validate_browser_token(input.provider, 32, "provider")?;
+        validate_browser_resource_kind(input.kind)?;
+        if let Some(parent_ref) = input.parent_ref {
+            validate_browser_resource_ref(parent_ref)?;
+        }
+        if let Some(label) = input.display_label {
+            validate_browser_ref_text(label, 256, "display_label")?;
+        }
+        let provider_state = self
+            .browser_provider_state(input.endpoint_ref, input.provider)?
+            .ok_or_else(|| "browser_capability_unknown".to_owned())?;
+        if input
+            .expected_observation_generation
+            .is_some_and(|expected| expected != provider_state.observation_generation)
+        {
+            return Err("stale_capability_generation".to_owned());
+        }
+        let parent_ref = input.parent_ref.unwrap_or("");
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT resource_ref, endpoint_ref, provider, kind, parent_ref,
+                        native_identity_sha256, display_label, observation_generation,
+                        first_observed_at, last_observed_at
+                 FROM browser_resources
+                 WHERE endpoint_ref = ?1 AND provider = ?2 AND kind = ?3
+                   AND parent_ref = ?4
+                   AND (?5 IS NULL OR display_label = ?5)
+                   AND observation_generation = ?6
+                 ORDER BY resource_ref
+                 LIMIT 2",
+            )
+            .map_err(|error| format!("cannot prepare browser resource resolution: {error}"))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    input.endpoint_ref,
+                    input.provider,
+                    input.kind,
+                    parent_ref,
+                    input.display_label,
+                    provider_state.observation_generation,
+                ],
+                decode_browser_resource,
+            )
+            .map_err(|error| format!("cannot resolve browser resource: {error}"))?;
+        let matches = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode browser resource resolution: {error}"))?;
+        match matches.as_slice() {
+            [] => Err("browser_resource_not_found".to_owned()),
+            [record] => Ok(record.clone()),
+            _ => Err("browser_resource_ambiguous".to_owned()),
+        }
+    }
+}
+
+fn decode_browser_endpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserEndpointRecord> {
+    Ok(BrowserEndpointRecord {
+        endpoint_ref: row.get(0)?,
+        device_id: row.get(1)?,
+        browser_family: row.get(2)?,
+        extension_version: row.get(3)?,
+        webchat_control_allowed: row.get::<_, i64>(4)? != 0,
+        tool_bridge_allowed: row.get::<_, i64>(5)? != 0,
+        tool_bridge_mutation_allowed: row.get::<_, i64>(6)? != 0,
+        consent_revision: row.get(7)?,
+        first_observed_at: row.get(8)?,
+        last_observed_at: row.get(9)?,
+    })
+}
+
+fn decode_browser_provider_state(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<BrowserProviderStateRecord> {
+    Ok(BrowserProviderStateRecord {
+        endpoint_ref: row.get(0)?,
+        provider: row.get(1)?,
+        adapter_protocol_version: row.get(2)?,
+        observation_generation: row.get(3)?,
+        capabilities_json: row.get(4)?,
+        observed_at: row.get(5)?,
+    })
+}
+
+fn decode_browser_resource(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserResourceRecord> {
+    let parent_ref = row.get::<_, String>(4)?;
+    Ok(BrowserResourceRecord {
+        resource_ref: row.get(0)?,
+        endpoint_ref: row.get(1)?,
+        provider: row.get(2)?,
+        kind: row.get(3)?,
+        parent_ref: (!parent_ref.is_empty()).then_some(parent_ref),
+        native_identity_sha256: row.get(5)?,
+        display_label: row.get(6)?,
+        observation_generation: row.get(7)?,
+        first_observed_at: row.get(8)?,
+        last_observed_at: row.get(9)?,
+    })
+}
+
+fn validate_browser_device_id(value: &str) -> Result<(), String> {
+    match crate::config::normalize_device_id(value) {
+        Ok(normalized) if normalized == value => Ok(()),
+        _ => Err("browser_device_id_invalid".to_owned()),
+    }
+}
+
+fn validate_browser_profile_seed(value: &str) -> Result<(), String> {
+    if !(16..=256).contains(&value.len())
+        || value != value.trim()
+        || value.chars().any(char::is_control)
+    {
+        return Err("browser_profile_seed_invalid".to_owned());
+    }
+    Ok(())
+}
+
+pub fn derive_browser_endpoint_ref(device_id: &str, profile_seed: &str) -> Result<String, String> {
+    validate_browser_device_id(device_id)?;
+    validate_browser_profile_seed(profile_seed)?;
+    Ok(browser_opaque_ref(
+        "bep_",
+        &["browser-endpoint-v1", device_id, profile_seed],
+    ))
+}
+
+fn validate_browser_token(value: &str, max_bytes: usize, field: &str) -> Result<(), String> {
+    if !valid_work_memory_token(value, max_bytes) {
+        return Err(format!("browser_{field}_invalid"));
+    }
+    Ok(())
+}
+
+fn validate_browser_ref_text(value: &str, max_bytes: usize, field: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value != value.trim()
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!("browser_{field}_invalid"));
+    }
+    Ok(())
+}
+
+fn validate_browser_endpoint_ref(value: &str) -> Result<(), String> {
+    if value.len() == 68
+        && value.starts_with("bep_")
+        && value[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err("browser_endpoint_ref_invalid".to_owned())
+    }
+}
+
+fn validate_browser_resource_ref(value: &str) -> Result<(), String> {
+    if value.len() == 67
+        && value.starts_with("br_")
+        && value[3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err("browser_resource_ref_invalid".to_owned())
+    }
+}
+
+fn validate_browser_resource_kind(value: &str) -> Result<(), String> {
+    if matches!(value, "account" | "space" | "session") {
+        Ok(())
+    } else {
+        Err("browser_resource_kind_invalid".to_owned())
+    }
+}
+
+fn validate_browser_native_identity(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 1024
+        || value != value.trim()
+        || value.contains("://")
+        || value.chars().any(char::is_control)
+    {
+        return Err("browser_native_identity_invalid".to_owned());
+    }
+    Ok(())
+}
+
+const ALLOWED_BROWSER_CAPABILITY_OPERATIONS: &[&str] = &[
+    "composer.inspect",
+    "composer.select_model",
+    "composer.select_tool",
+    "composer.set_message",
+    "composer.set_reasoning",
+    "composer.submit",
+    "generation.status",
+    "generation.stop",
+    "identity.inspect",
+    "message.append",
+    "message.read",
+    "session.archive",
+    "session.create",
+    "session.delete",
+    "session.inspect",
+    "session.list",
+    "session.move_to_space",
+    "session.open",
+    "session.remove_from_space",
+    "session.rename",
+    "space.archive",
+    "space.create",
+    "space.delete",
+    "space.inspect",
+    "space.list",
+    "space.rename",
+];
+
+fn normalize_browser_capabilities(value: &str) -> Result<String, String> {
+    if value.is_empty() || value.len() > 16 * 1024 {
+        return Err("browser_capabilities_invalid".to_owned());
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(value).map_err(|_| "browser_capabilities_invalid".to_owned())?;
+    let serde_json::Value::Object(object) = parsed else {
+        return Err("browser_capabilities_invalid".to_owned());
+    };
+    if object.len() != 1 || !object.contains_key("operations") {
+        return Err("browser_capabilities_invalid".to_owned());
+    }
+    let Some(ops) = object
+        .get("operations")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Err("browser_capabilities_invalid".to_owned());
+    };
+    if ops.len() > 64 {
+        return Err("browser_capabilities_invalid".to_owned());
+    }
+    let mut normalized_ops = Vec::with_capacity(ops.len());
+    for item in ops {
+        let Some(op) = item.as_str() else {
+            return Err("browser_capabilities_invalid".to_owned());
+        };
+        if !ALLOWED_BROWSER_CAPABILITY_OPERATIONS.contains(&op) {
+            return Err("browser_capabilities_invalid".to_owned());
+        }
+        normalized_ops.push(op.to_owned());
+    }
+    normalized_ops.sort();
+    normalized_ops.dedup();
+    serde_json::to_string(&serde_json::json!({ "operations": normalized_ops }))
+        .map_err(|_| "browser_capabilities_invalid".to_owned())
+}
+
+fn validate_browser_resource_parent(
+    conn: &Connection,
+    endpoint_ref: &str,
+    provider: &str,
+    kind: &str,
+    parent_ref: &str,
+    observation_generation: i64,
+) -> Result<(), String> {
+    if kind == "account" {
+        return if parent_ref.is_empty() {
+            Ok(())
+        } else {
+            Err("browser_resource_parent_invalid".to_owned())
+        };
+    }
+    if parent_ref.is_empty() {
+        return Err("browser_resource_parent_required".to_owned());
+    }
+    validate_browser_resource_ref(parent_ref)?;
+    let parent = conn
+        .query_row(
+            "SELECT endpoint_ref, provider, kind, observation_generation
+             FROM browser_resources WHERE resource_ref = ?1",
+            params![parent_ref],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("cannot inspect browser resource parent: {error}"))?
+        .ok_or_else(|| "browser_resource_parent_not_found".to_owned())?;
+    if parent.0 != endpoint_ref || parent.1 != provider {
+        return Err("browser_resource_parent_scope_mismatch".to_owned());
+    }
+    if parent.3 != observation_generation {
+        return Err("stale_capability_generation".to_owned());
+    }
+    let kind_ok = match kind {
+        "space" => parent.2 == "account",
+        "session" => matches!(parent.2.as_str(), "account" | "space"),
+        _ => false,
+    };
+    if !kind_ok {
+        return Err("browser_resource_parent_kind_invalid".to_owned());
+    }
+    Ok(())
+}
+
+fn browser_opaque_ref(prefix: &str, parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{prefix}{:x}", hasher.finalize())
 }
 
 fn validate_work_memory_partition(
@@ -4339,7 +5241,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v5_migrates_to_work_memory_v6_without_losing_continuity() {
+    fn schema_v5_migrates_through_work_memory_v6_to_latest_without_losing_continuity() {
         let dir = temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.db");
@@ -4371,7 +5273,7 @@ mod tests {
         drop(conn);
 
         let mut store = StateStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let legacy = store.continuity_resume("hc:legacy", 8).unwrap().unwrap();
         assert_eq!(legacy.turns.len(), 1);
         assert_eq!(legacy.turns[0].text, "legacy continuity survives");
@@ -4782,5 +5684,463 @@ mod tests {
         let filtered = store.closed_exec_sessions(3000, 10).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].session_id, "es_closed_a");
+    }
+
+    #[test]
+    fn schema_v6_upgrades_to_browser_registry_v7_without_losing_continuity() {
+        let path = temp_db_path();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+                .unwrap();
+            for migration in MIGRATIONS.iter().take(6) {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '6')",
+                [META_SCHEMA_VERSION],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO continuity_chains(
+                    continuity_id, title, status, created_at, updated_at,
+                    project_ref, repo_id, work_chain_id
+                 ) VALUES (
+                    'wm:pre-v7', 'pre-v7', 'active', 1, 1,
+                    'project:browser', 'git.example.com/team/repo',
+                    'wc_0123456789abcdef0123456789abcdef'
+                 )",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM continuity_chains WHERE continuity_id = 'wm:pre-v7'"
+                )
+                .unwrap(),
+            Some(1)
+        );
+        let tables = store.table_names().unwrap();
+        for table in [
+            "browser_endpoints",
+            "browser_provider_state",
+            "browser_resources",
+        ] {
+            assert!(tables.contains(&table.to_owned()), "missing {table}");
+        }
+        assert!(
+            !tables
+                .iter()
+                .any(|table| table.contains("reservation") || table.contains("dispatch")),
+            "Alpha 3 must not create browser reservation/dispatch state"
+        );
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn browser_registry_is_local_opaque_fenced_and_fail_closed() {
+        const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const PROFILE_SEED: &str = "profile-seed-0123456789abcdef";
+        let mut store = StateStore::open(":memory:").unwrap();
+
+        let endpoint = store
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: DEVICE,
+                profile_seed: PROFILE_SEED,
+                browser_family: "chrome",
+                extension_version: "0.1.90",
+                observed_at: 10,
+            })
+            .unwrap();
+        assert!(endpoint.endpoint_ref.starts_with("bep_"));
+        assert!(!endpoint.endpoint_ref.contains(PROFILE_SEED));
+        assert_eq!(endpoint.device_id, DEVICE);
+        assert!(!endpoint.webchat_control_allowed);
+        assert!(!endpoint.tool_bridge_allowed);
+        assert!(!endpoint.tool_bridge_mutation_allowed);
+
+        assert_eq!(endpoint.consent_revision, 0);
+
+        // CAS conflict when expected_revision does not match current revision.
+        assert_eq!(
+            store
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 5,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: true,
+                    tool_bridge_mutation_allowed: true,
+                    observed_at: 11,
+                })
+                .unwrap_err(),
+            "browser_consent_cas_conflict"
+        );
+
+        // Successful consent mutation from revision 0 -> 1.
+        let consent = store
+            .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                expected_revision: 0,
+                webchat_control_allowed: true,
+                tool_bridge_allowed: true,
+                tool_bridge_mutation_allowed: true,
+                observed_at: 11,
+            })
+            .unwrap();
+        assert!(consent.webchat_control_allowed);
+        assert!(consent.tool_bridge_allowed);
+        assert!(consent.tool_bridge_mutation_allowed);
+        assert_eq!(consent.consent_revision, 1);
+
+        // Turn OFF WebChat control from revision 1 -> 2.
+        let consent_off = store
+            .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                expected_revision: 1,
+                webchat_control_allowed: false,
+                tool_bridge_allowed: false,
+                tool_bridge_mutation_allowed: false,
+                observed_at: 12,
+            })
+            .unwrap();
+        assert!(!consent_off.webchat_control_allowed);
+        assert_eq!(consent_off.consent_revision, 2);
+
+        // Stale ON request (with old revision 1 or 0) fails closed and cannot overwrite newer OFF.
+        assert_eq!(
+            store
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 1,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: true,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 13,
+                })
+                .unwrap_err(),
+            "browser_consent_cas_conflict"
+        );
+        // Verify still OFF
+        let current_ep = store
+            .browser_endpoint(&endpoint.endpoint_ref)
+            .unwrap()
+            .unwrap();
+        assert!(!current_ep.webchat_control_allowed);
+        assert_eq!(current_ep.consent_revision, 2);
+
+        // Valid widening with current revision 2 -> 3
+        let consent_widen = store
+            .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                expected_revision: 2,
+                webchat_control_allowed: true,
+                tool_bridge_allowed: true,
+                tool_bridge_mutation_allowed: true,
+                observed_at: 14,
+            })
+            .unwrap();
+        assert!(consent_widen.webchat_control_allowed);
+        assert_eq!(consent_widen.consent_revision, 3);
+
+        assert_eq!(
+            store
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 3,
+                    webchat_control_allowed: false,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: true,
+                    observed_at: 15,
+                })
+                .unwrap_err(),
+            "browser_consent_hierarchy_invalid"
+        );
+
+        // Re-registration is idempotent and never resets locally granted consent or revision.
+        let re_registered = store
+            .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                device_id: DEVICE,
+                profile_seed: PROFILE_SEED,
+                browser_family: "chrome",
+                extension_version: "0.1.91",
+                observed_at: 16,
+            })
+            .unwrap();
+        assert_eq!(re_registered.endpoint_ref, endpoint.endpoint_ref);
+        assert!(re_registered.tool_bridge_mutation_allowed);
+        assert_eq!(re_registered.consent_revision, 3);
+        assert_eq!(re_registered.extension_version, "0.1.91");
+
+        // Provider capabilities: allowlist only. Unknown keys, apiKey, password, account_id all fail closed.
+        for forbidden in [
+            r#"{"apiKey":"secret-123"}"#,
+            r#"{"password":"hunter2"}"#,
+            r#"{"account_id":"user_123"}"#,
+            r#"{"token":"tok_123"}"#,
+            r#"{"operations":["identity.inspect"],"extra_field":true}"#,
+            r#"{"operations":["unknown.op"]}"#,
+            r#"{"operations":[123]}"#,
+            r#"{"operations":"not_an_array"}"#,
+        ] {
+            assert_eq!(
+                store
+                    .observe_browser_provider(BrowserProviderObservationInput {
+                        endpoint_ref: &endpoint.endpoint_ref,
+                        provider: "chatgpt",
+                        adapter_protocol_version: 1,
+                        observation_generation: 1,
+                        capabilities_json: forbidden,
+                        observed_at: 19,
+                    })
+                    .unwrap_err(),
+                "browser_capabilities_invalid",
+                "failed to reject forbidden capability: {forbidden}"
+            );
+        }
+
+        let state_v1 = store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 1,
+                capabilities_json: r#"{ "operations": ["space.list", "identity.inspect"] }"#,
+                observed_at: 20,
+            })
+            .unwrap();
+        assert_eq!(state_v1.observation_generation, 1);
+        assert_eq!(
+            state_v1.capabilities_json,
+            r#"{"operations":["identity.inspect","space.list"]}"#
+        );
+        let replay = store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 1,
+                capabilities_json: r#"{"operations":["identity.inspect","space.list"]}"#,
+                observed_at: 21,
+            })
+            .unwrap();
+        assert_eq!(
+            replay, state_v1,
+            "same generation + same state is replay-safe"
+        );
+        assert_eq!(
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 1,
+                    capabilities_json: r#"{"operations":["identity.inspect"]}"#,
+                    observed_at: 22,
+                })
+                .unwrap_err(),
+            "stale_capability_generation"
+        );
+
+        let account = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "account",
+                parent_ref: None,
+                native_identity: "acct-native-123",
+                display_label: Some("Work account"),
+                observation_generation: 1,
+                observed_at: 30,
+            })
+            .unwrap();
+        assert!(account.resource_ref.starts_with("br_"));
+        assert_ne!(account.native_identity_sha256, "acct-native-123");
+        assert_eq!(account.parent_ref, None);
+        assert_eq!(
+            store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "https://chatgpt.com/raw/account",
+                    display_label: None,
+                    observation_generation: 1,
+                    observed_at: 31,
+                })
+                .unwrap_err(),
+            "browser_native_identity_invalid"
+        );
+        assert_eq!(
+            store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "space",
+                    parent_ref: None,
+                    native_identity: "space-without-account",
+                    display_label: None,
+                    observation_generation: 1,
+                    observed_at: 32,
+                })
+                .unwrap_err(),
+            "browser_resource_parent_required"
+        );
+        let space = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "space",
+                parent_ref: Some(&account.resource_ref),
+                native_identity: "project-native-456",
+                display_label: Some("Herdr"),
+                observation_generation: 1,
+                observed_at: 33,
+            })
+            .unwrap();
+        let session = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&space.resource_ref),
+                native_identity: "conversation-native-789",
+                display_label: Some("Alpha 3"),
+                observation_generation: 1,
+                observed_at: 34,
+            })
+            .unwrap();
+        assert_eq!(
+            session.parent_ref.as_deref(),
+            Some(space.resource_ref.as_str())
+        );
+
+        // Same label is not silently guessed; resource identity remains the native opaque digest.
+        let _other = store
+            .observe_browser_resource(BrowserResourceObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                kind: "session",
+                parent_ref: Some(&space.resource_ref),
+                native_identity: "conversation-native-other",
+                display_label: Some("Alpha 3"),
+                observation_generation: 1,
+                observed_at: 35,
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_browser_resource(BrowserResourceResolveInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&space.resource_ref),
+                    display_label: Some("Alpha 3"),
+                    expected_observation_generation: Some(1),
+                })
+                .unwrap_err(),
+            "browser_resource_ambiguous"
+        );
+        assert_eq!(
+            store
+                .resolve_browser_resource(BrowserResourceResolveInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&space.resource_ref),
+                    display_label: Some("missing"),
+                    expected_observation_generation: Some(1),
+                })
+                .unwrap_err(),
+            "browser_resource_not_found"
+        );
+
+        let state_v2 = store
+            .observe_browser_provider(BrowserProviderObservationInput {
+                endpoint_ref: &endpoint.endpoint_ref,
+                provider: "chatgpt",
+                adapter_protocol_version: 1,
+                observation_generation: 2,
+                capabilities_json: r#"{"operations":["identity.inspect","space.create","space.list"]}"#,
+                observed_at: 40,
+            })
+            .unwrap();
+        assert_eq!(state_v2.observation_generation, 2);
+        assert_eq!(
+            store
+                .resolve_browser_resource(BrowserResourceResolveInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&space.resource_ref),
+                    display_label: Some("Alpha 3"),
+                    expected_observation_generation: Some(1),
+                })
+                .unwrap_err(),
+            "stale_capability_generation"
+        );
+        assert_eq!(
+            store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&space.resource_ref),
+                    native_identity: "conversation-native-new-generation",
+                    display_label: None,
+                    observation_generation: 1,
+                    observed_at: 41,
+                })
+                .unwrap_err(),
+            "stale_capability_generation"
+        );
+        assert_eq!(
+            store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&space.resource_ref),
+                    native_identity: "conversation-native-new-generation",
+                    display_label: None,
+                    observation_generation: 2,
+                    observed_at: 42,
+                })
+                .unwrap_err(),
+            "stale_capability_generation",
+            "a parent observed under generation 1 must be re-observed before generation-2 children"
+        );
+
+        // The schema contains no field capable of persisting either raw local secret.
+        let endpoint_columns = store
+            .conn
+            .prepare("PRAGMA table_info(browser_endpoints)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let resource_columns = store
+            .conn
+            .prepare("PRAGMA table_info(browser_resources)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!endpoint_columns.iter().any(|name| name.contains("seed")));
+        assert!(
+            !resource_columns
+                .iter()
+                .any(|name| name == "native_identity")
+        );
     }
 }

@@ -88,6 +88,7 @@ const mockContinuityChains = new Set();
 const mockContinuityByConversation = new Map();
 const continuityTurnRequests = [];
 const continuityResolveRequests = [];
+const browserRegistryRequests = [];
 let blockQueuedInsertDelivery = false;
 let holdInitialLocaleRead = true;
 let initialLocaleReadSeen = false;
@@ -262,6 +263,26 @@ globalThis.chrome = {
             delivery_phase: body.action === "steer" ? "not_submitted" : "submitted",
             target: body.target,
             op_id: body.action === "agent_prompt" ? "op:prompt:test" : null,
+          }),
+        });
+        return;
+      }
+      if (message.path === "/extension/browser/registry") {
+        const body = JSON.parse(message.body || "{}");
+        browserRegistryRequests.push(body);
+        callback({
+          ok: true,
+          transport: "ipc",
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            ok: true,
+            endpoint: {
+              endpoint_ref: "bep_test",
+              device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+              browser_family: "chrome",
+              extension_version: body.extension_version,
+            },
           }),
         });
         return;
@@ -529,6 +550,28 @@ ok(coldHud?.ok === true
     && coldHud?.labels?.scope_binding_hint,
   "cold-start HUD returns the complete localized label contract after config readiness",
   JSON.stringify(coldHud?.labels || {}));
+
+console.log("\n[browser endpoint registry bootstrap]");
+ok(await waitForTest(() => browserRegistryRequests.length === 1),
+  "service-worker startup registers one browser endpoint through Native Messaging");
+const browserRegister = browserRegistryRequests[0] || {};
+ok(browserRegister.operation === "endpoint.register"
+    && browserRegister.browser_family === "chrome"
+    && browserRegister.extension_version === "0.1.90"
+    && /^[0-9a-f]{64}$/.test(browserRegister.profile_seed || ""),
+  "browser endpoint registration carries one opaque profile seed and product identity",
+  JSON.stringify(browserRegister));
+ok(!Object.prototype.hasOwnProperty.call(browserRegister, "device_id")
+    && !Object.prototype.hasOwnProperty.call(browserRegister, "authorization")
+    && !Object.prototype.hasOwnProperty.call(browserRegister, "token"),
+  "browser endpoint registration cannot override device identity or carry bearer credentials");
+const storedBrowserSeed = storage.herdrBrowserProfileSeedV1;
+ok(storedBrowserSeed === browserRegister.profile_seed,
+  "browser profile seed persists only in extension local storage");
+for (const startup of listeners.onStartup) startup();
+await new Promise((resolve) => setTimeout(resolve, 0));
+ok(browserRegistryRequests.length === 1 && storage.herdrBrowserProfileSeedV1 === storedBrowserSeed,
+  "browser startup does not create a second endpoint registration loop or rotate the profile seed");
 
 const actionClick = listeners.onActionClicked[0];
 ok(!!actionClick, "toolbar action click listener registered");

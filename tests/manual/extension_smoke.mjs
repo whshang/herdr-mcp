@@ -216,6 +216,17 @@ ok(
   "extension uses tokenless Native Messaging IPC with Rust as the sole host owner",
 );
 ok(
+  backgroundSource.includes('const BROWSER_PROFILE_SEED_STORAGE_KEY = "herdrBrowserProfileSeedV1"')
+    && backgroundSource.includes("crypto.getRandomValues(new Uint8Array(32))")
+    && backgroundSource.includes("/extension/browser/registry")
+    && backgroundSource.includes('operation: "endpoint.register"')
+    && backgroundSource.includes('browser_family: "chrome"')
+    && backgroundSource.includes("extension_version: H2W_SCRIPT_VERSION")
+    && !backgroundSource.includes('operation: "endpoint.register",\n        device_id:')
+    && rustNativeHostSource.includes('"/extension/browser/registry"'),
+  "browser endpoint bootstrap uses one local profile seed and the exact Native Messaging registry route",
+);
+ok(
   jsonBridgeSource.includes("const ROUND_YIELD_INTERVAL = 12")
     && jsonBridgeSource.includes("while (taskSeq === currentTaskSeq)")
     && !jsonBridgeSource.includes("MAX_ROUNDS")

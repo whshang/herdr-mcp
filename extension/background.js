@@ -92,6 +92,7 @@ const HANDOFF_PRIMARY_SUMMARY_GRACE_MS = 60000;
 const HANDOFF_GENERATING_RECHECK_MS = 45000;
 const PROJECT_AUTOMATION_STORAGE_KEY = "herdrProjectAutomation";
 const CONVERSATION_AUTOMATION_STORAGE_KEY = "herdrConversationAutomation";
+const BROWSER_PROFILE_SEED_STORAGE_KEY = "herdrBrowserProfileSeedV1";
 const AUTOMATION_MODE_MANUAL = "manual";
 const AUTOMATION_MODE_PROJECT = "project_auto";
 const HANDOFF_RETENTION_MS = 7 * 86400000;
@@ -1300,6 +1301,46 @@ function continuityTurnUrl() {
 
 function continuityResolveUrl() {
   return `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/extension/continuity/resolve`;
+}
+
+function browserRegistryUrl() {
+  return `${CFG.herdrMcpUrl.replace(/\/+$/, "")}/extension/browser/registry`;
+}
+
+function validBrowserProfileSeed(value) {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+async function getOrCreateBrowserProfileSeed() {
+  const stored = (await chrome.storage.local.get(BROWSER_PROFILE_SEED_STORAGE_KEY))[BROWSER_PROFILE_SEED_STORAGE_KEY];
+  if (validBrowserProfileSeed(stored)) return stored;
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  const seed = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  await chrome.storage.local.set({ [BROWSER_PROFILE_SEED_STORAGE_KEY]: seed });
+  return seed;
+}
+
+async function registerLocalBrowserEndpoint() {
+  await configReady;
+  try {
+    const profileSeed = await getOrCreateBrowserProfileSeed();
+    const response = await localHerdrFetch(browserRegistryUrl(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        operation: "endpoint.register",
+        profile_seed: profileSeed,
+        browser_family: "chrome",
+        extension_version: H2W_SCRIPT_VERSION,
+        observed_at: Date.now(),
+      }),
+      nativeTimeoutMs: STATE_FETCH_MS,
+    });
+    const parsed = await response.json().catch(() => null);
+    return response.ok && parsed?.ok === true ? parsed.endpoint || null : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 /** Post one finalized turn to Rust. Durable only on HTTP 200 + parsed {ok:true}. */
@@ -5191,6 +5232,7 @@ try {
   callLog("action click unavailable:", e.message);
 }
 void rebuildStreams();
+void registerLocalBrowserEndpoint();
 
 // Wake the service worker each minute to restore missing SSE streams and timers.
 try {

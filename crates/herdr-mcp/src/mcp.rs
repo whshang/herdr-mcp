@@ -11,8 +11,9 @@ use crate::prompt::{self, PromptRegistry};
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
 use crate::state_store::{
-    ContinuitySearchInput, StateStore, WorkMemoryBindingInput, WorkMemoryCheckpointInput,
-    WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput, WorkMemoryTurnInput,
+    BrowserResourceResolveInput, ContinuitySearchInput, StateStore, WorkMemoryBindingInput,
+    WorkMemoryCheckpointInput, WorkMemoryEvidenceInput, WorkMemoryPortableSourceInput,
+    WorkMemoryTurnInput,
 };
 use crate::tcc_broker;
 use crate::utility_exec;
@@ -190,6 +191,10 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                 continuity_call(context.state_store, method, &params)
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
+            } else if method.starts_with("herdr_mcp.browser_endpoint.")
+                || method.starts_with("herdr_mcp.browser_resource.")
+            {
+                browser_registry_call(context.state_store, method, &params)
             } else if method.starts_with("artifact.") {
                 artifact_call(&config_dir(), &context.cache.snapshot(), method, &params)
             } else {
@@ -1026,6 +1031,317 @@ fn work_memory_call(
     }
 }
 
+fn browser_registry_call(
+    store: &std::sync::Arc<std::sync::Mutex<StateStore>>,
+    method: &str,
+    params: &Value,
+) -> Value {
+    let Some(object) = params.as_object() else {
+        return json!({"ok": false, "code": "browser_registry_params_invalid"});
+    };
+    let Ok(store) = store.lock() else {
+        return json!({"ok": false, "code": "browser_registry_store_unavailable"});
+    };
+    match method {
+        "herdr_mcp.browser_endpoint.list" => {
+            if let Some(error) = browser_reject_unknown(object, &["limit"]) {
+                return error;
+            }
+            let limit = match browser_optional_limit(params, 32) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            match store.browser_endpoints(limit) {
+                Ok(endpoints) => json!({
+                    "ok": true,
+                    "endpoints": endpoints.into_iter().map(browser_endpoint_json).collect::<Vec<_>>()
+                }),
+                Err(error) => browser_store_error(error),
+            }
+        }
+        "herdr_mcp.browser_endpoint.inspect" => {
+            if let Some(error) = browser_reject_unknown(object, &["endpoint_ref"]) {
+                return error;
+            }
+            let endpoint_ref = match browser_required_string(params, "endpoint_ref", 96) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            match store.browser_endpoint(endpoint_ref) {
+                Ok(Some(endpoint)) => match store.browser_provider_states(endpoint_ref) {
+                    Ok(provider_states) => json!({
+                        "ok": true,
+                        "endpoint": browser_endpoint_json(endpoint),
+                        "provider_states": provider_states.into_iter().map(|state| {
+                            json!({
+                                "provider": state.provider,
+                                "adapter_protocol_version": state.adapter_protocol_version,
+                                "observation_generation": state.observation_generation,
+                                "capabilities": serde_json::from_str::<Value>(&state.capabilities_json).unwrap_or_else(|_| json!({})),
+                                "observed_at": state.observed_at,
+                            })
+                        }).collect::<Vec<_>>()
+                    }),
+                    Err(error) => browser_store_error(error),
+                },
+                Ok(None) => json!({"ok": false, "code": "browser_endpoint_not_found"}),
+                Err(error) => browser_store_error(error),
+            }
+        }
+        "herdr_mcp.browser_resource.list" => {
+            if let Some(error) = browser_reject_unknown(
+                object,
+                &["endpoint_ref", "provider", "kind", "parent_ref", "limit"],
+            ) {
+                return error;
+            }
+            let endpoint_ref = match browser_optional_string(params, "endpoint_ref", 96) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let provider = match browser_optional_string(params, "provider", 32) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let kind = match browser_optional_string(params, "kind", 16) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let parent_ref = match browser_optional_string(params, "parent_ref", 96) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let limit = match browser_optional_limit(params, 32) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            match store.browser_resources(endpoint_ref, provider, kind, parent_ref, limit) {
+                Ok(resources) => json!({
+                    "ok": true,
+                    "resources": resources.into_iter().map(browser_resource_json).collect::<Vec<_>>(),
+                    "actuation_available": false,
+                }),
+                Err(error) => browser_store_error(error),
+            }
+        }
+        "herdr_mcp.browser_resource.inspect" => {
+            if let Some(error) = browser_reject_unknown(object, &["resource_ref"]) {
+                return error;
+            }
+            let resource_ref = match browser_required_string(params, "resource_ref", 96) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            match store.browser_resource(resource_ref) {
+                Ok(Some(resource)) => {
+                    let consent = store
+                        .browser_endpoint(&resource.endpoint_ref)
+                        .ok()
+                        .flatten()
+                        .map(|endpoint| json!({
+                            "webchat_control": endpoint.webchat_control_allowed,
+                            "tool_bridge": endpoint.tool_bridge_allowed,
+                            "tool_bridge_workstation_mutation": endpoint.tool_bridge_mutation_allowed,
+                            "revision": endpoint.consent_revision,
+                        }))
+                        .unwrap_or_else(|| json!({
+                            "webchat_control": false,
+                            "tool_bridge": false,
+                            "tool_bridge_workstation_mutation": false,
+                            "revision": 0,
+                        }));
+                    json!({
+                        "ok": true,
+                        "resource": browser_resource_json(resource),
+                        "consent": consent,
+                        "actuation_available": false,
+                    })
+                }
+                Ok(None) => json!({"ok": false, "code": "browser_resource_not_found"}),
+                Err(error) => browser_store_error(error),
+            }
+        }
+        "herdr_mcp.browser_resource.resolve" => {
+            if let Some(error) = browser_reject_unknown(
+                object,
+                &[
+                    "endpoint_ref",
+                    "provider",
+                    "kind",
+                    "parent_ref",
+                    "display_label",
+                    "expected_observation_generation",
+                ],
+            ) {
+                return error;
+            }
+            let endpoint_ref = match browser_required_string(params, "endpoint_ref", 96) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let provider = match browser_required_string(params, "provider", 32) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let kind = match browser_required_string(params, "kind", 16) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let parent_ref = match browser_optional_string(params, "parent_ref", 96) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let display_label = match browser_optional_string(params, "display_label", 256) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let expected_observation_generation =
+                match params.get("expected_observation_generation") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => match value.as_i64() {
+                        Some(value) if value >= 1 => Some(value),
+                        _ => {
+                            return json!({
+                                "ok": false,
+                                "code": "browser_expected_observation_generation_invalid"
+                            });
+                        }
+                    },
+                };
+            match store.resolve_browser_resource(BrowserResourceResolveInput {
+                endpoint_ref,
+                provider,
+                kind,
+                parent_ref,
+                display_label,
+                expected_observation_generation,
+            }) {
+                Ok(resource) => {
+                    let consent = store
+                        .browser_endpoint(&resource.endpoint_ref)
+                        .ok()
+                        .flatten()
+                        .map(|endpoint| json!({
+                            "webchat_control": endpoint.webchat_control_allowed,
+                            "tool_bridge": endpoint.tool_bridge_allowed,
+                            "tool_bridge_workstation_mutation": endpoint.tool_bridge_mutation_allowed,
+                            "revision": endpoint.consent_revision,
+                        }))
+                        .unwrap_or_else(|| json!({
+                            "webchat_control": false,
+                            "tool_bridge": false,
+                            "tool_bridge_workstation_mutation": false,
+                            "revision": 0,
+                        }));
+                    json!({
+                        "ok": true,
+                        "resource": browser_resource_json(resource),
+                        "consent": consent,
+                        "actuation_available": false,
+                    })
+                }
+                Err(error) => browser_store_error(error),
+            }
+        }
+        _ => json!({"ok": false, "code": "unknown_local_method", "method": method}),
+    }
+}
+
+fn browser_reject_unknown(
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> Option<Value> {
+    object
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+        .map(|key| {
+            json!({
+                "ok": false,
+                "code": "browser_registry_params_invalid",
+                "message": format!("unknown browser registry param: {key}"),
+            })
+        })
+}
+
+fn browser_required_string<'a>(
+    params: &'a Value,
+    field: &str,
+    max_bytes: usize,
+) -> Result<&'a str, Value> {
+    let Some(value) = params.get(field).and_then(Value::as_str) else {
+        return Err(json!({"ok": false, "code": format!("browser_{field}_required")}));
+    };
+    let value = value.trim();
+    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(json!({"ok": false, "code": format!("browser_{field}_invalid")}));
+    }
+    Ok(value)
+}
+
+fn browser_optional_string<'a>(
+    params: &'a Value,
+    field: &str,
+    max_bytes: usize,
+) -> Result<Option<&'a str>, Value> {
+    match params.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+                return Err(json!({"ok": false, "code": format!("browser_{field}_invalid")}));
+            }
+            Ok(Some(value))
+        }
+        Some(_) => Err(json!({"ok": false, "code": format!("browser_{field}_invalid")})),
+    }
+}
+
+fn browser_optional_limit(params: &Value, default: usize) -> Result<usize, Value> {
+    match params.get("limit") {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => match value.as_u64() {
+            Some(value @ 1..=64) => Ok(value as usize),
+            _ => Err(json!({"ok": false, "code": "browser_limit_invalid"})),
+        },
+    }
+}
+
+fn browser_endpoint_json(endpoint: crate::state_store::BrowserEndpointRecord) -> Value {
+    json!({
+        "endpoint_ref": endpoint.endpoint_ref,
+        "device_id": endpoint.device_id,
+        "browser_family": endpoint.browser_family,
+        "extension_version": endpoint.extension_version,
+        "consent": {
+            "webchat_control": endpoint.webchat_control_allowed,
+            "tool_bridge": endpoint.tool_bridge_allowed,
+            "tool_bridge_workstation_mutation": endpoint.tool_bridge_mutation_allowed,
+            "revision": endpoint.consent_revision,
+        },
+        "consent_revision": endpoint.consent_revision,
+        "first_observed_at": endpoint.first_observed_at,
+        "last_observed_at": endpoint.last_observed_at,
+    })
+}
+
+fn browser_resource_json(resource: crate::state_store::BrowserResourceRecord) -> Value {
+    json!({
+        "resource_ref": resource.resource_ref,
+        "endpoint_ref": resource.endpoint_ref,
+        "provider": resource.provider,
+        "kind": resource.kind,
+        "parent_ref": resource.parent_ref,
+        "display_label": resource.display_label,
+        "observation_generation": resource.observation_generation,
+        "first_observed_at": resource.first_observed_at,
+        "last_observed_at": resource.last_observed_at,
+    })
+}
+
+fn browser_store_error(error: String) -> Value {
+    json!({"ok": false, "code": error})
+}
+
 fn work_memory_reject_unknown(
     object: &serde_json::Map<String, Value>,
     allowed: &[&str],
@@ -1688,6 +2004,141 @@ mod tests {
         assert_eq!(searched["ok"], true);
         assert_eq!(searched["hits"].as_array().unwrap().len(), 1);
         assert_eq!(searched["hits"][0]["source_kind"], "evidence");
+    }
+
+    #[test]
+    fn browser_registry_private_methods_are_read_only_stable_ref_queries() {
+        use crate::state_store::{
+            BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+            BrowserResourceObservationInput,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (endpoint_ref, account_ref) = {
+            let mut guard = store.lock().unwrap();
+            let endpoint = guard
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "private-browser-profile-seed-1234",
+                    browser_family: "chrome",
+                    extension_version: "0.1.90",
+                    observed_at: 10,
+                })
+                .unwrap();
+            guard
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["identity.inspect"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = guard
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "native-account-hidden",
+                    display_label: Some("Work"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            (endpoint.endpoint_ref, account.resource_ref)
+        };
+
+        let listed = browser_registry_call(
+            &store,
+            "herdr_mcp.browser_endpoint.list",
+            &json!({"limit": 4}),
+        );
+        assert_eq!(listed["ok"], true);
+        assert_eq!(listed["endpoints"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["endpoints"][0]["endpoint_ref"], endpoint_ref);
+        assert_eq!(listed["endpoints"][0]["consent"]["webchat_control"], false);
+
+        let inspected = browser_registry_call(
+            &store,
+            "herdr_mcp.browser_endpoint.inspect",
+            &json!({"endpoint_ref": endpoint_ref}),
+        );
+        assert_eq!(inspected["ok"], true);
+        assert_eq!(inspected["provider_states"][0]["provider"], "chatgpt");
+        assert_eq!(inspected["provider_states"][0]["observation_generation"], 7);
+
+        let resolved = browser_registry_call(
+            &store,
+            "herdr_mcp.browser_resource.resolve",
+            &json!({
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "kind": "account",
+                "display_label": "Work",
+                "expected_observation_generation": 7
+            }),
+        );
+        assert_eq!(resolved["ok"], true);
+        assert_eq!(resolved["resource"]["resource_ref"], account_ref);
+        assert_eq!(resolved["resource"]["display_label"], "Work");
+        assert_eq!(resolved["consent"]["webchat_control"], false);
+        assert_eq!(resolved["consent"]["revision"], 0);
+        assert_eq!(resolved["actuation_available"], false);
+        assert!(!resolved.to_string().contains("native-account-hidden"));
+
+        let inspected_res = browser_registry_call(
+            &store,
+            "herdr_mcp.browser_resource.inspect",
+            &json!({"resource_ref": account_ref}),
+        );
+        assert_eq!(inspected_res["ok"], true);
+        assert_eq!(inspected_res["resource"]["resource_ref"], account_ref);
+        assert_eq!(inspected_res["consent"]["webchat_control"], false);
+        assert_eq!(inspected_res["actuation_available"], false);
+
+        let listed_res = browser_registry_call(
+            &store,
+            "herdr_mcp.browser_resource.list",
+            &json!({"endpoint_ref": endpoint_ref}),
+        );
+        assert_eq!(listed_res["ok"], true);
+        assert_eq!(listed_res["actuation_available"], false);
+
+        let injected = browser_registry_call(
+            &store,
+            "herdr_mcp.browser_resource.resolve",
+            &json!({
+                "endpoint_ref": endpoint_ref,
+                "provider": "chatgpt",
+                "kind": "account",
+                "native_identity": "attacker-controlled",
+            }),
+        );
+        assert_eq!(injected["ok"], false);
+        assert_eq!(injected["code"], "browser_registry_params_invalid");
+
+        let device_override = browser_registry_call(
+            &store,
+            "herdr_mcp.browser_endpoint.list",
+            &json!({"device_id": "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"}),
+        );
+        assert_eq!(device_override["ok"], false);
+        assert_eq!(device_override["code"], "browser_registry_params_invalid");
+
+        let remote_consent = browser_registry_call(
+            &store,
+            "herdr_mcp.browser_endpoint.consent",
+            &json!({"endpoint_ref": endpoint_ref, "webchat_control": true}),
+        );
+        assert_eq!(remote_consent["ok"], false);
+        assert_eq!(remote_consent["code"], "unknown_local_method");
+
+        let identity = contract::identity().unwrap();
+        assert_eq!(identity.epoch, 2);
+        assert_eq!(identity.tool_count, 18);
     }
 
     #[test]

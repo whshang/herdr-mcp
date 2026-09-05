@@ -9,7 +9,10 @@ use crate::prompt::PromptRegistry;
 use crate::runtime_meta;
 use crate::skill::SkillService;
 use crate::state_cache::EventCache;
-use crate::state_store::{ContinuityTurnInput, StateStore};
+use crate::state_store::{
+    BrowserEndpointConsentInput, BrowserEndpointRegistrationInput, BrowserProviderObservationInput,
+    BrowserResourceObservationInput, ContinuityTurnInput, StateStore,
+};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
@@ -32,6 +35,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_BROWSER_REGISTRY_REQUEST_BYTES: usize = 64 * 1024;
 const RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
@@ -198,6 +202,7 @@ struct AppState {
     activity: McpActivityRegistry,
     bearer_token: Arc<[u8]>,
     trusted_extension_ipc: bool,
+    local_device_id: Option<String>,
 }
 
 pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
@@ -209,6 +214,9 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
                 .to_owned()
         })?;
     let paths = RuntimePaths::discover()?;
+    let local_device_id =
+        crate::config::Config::load_for_instance(&paths.config_file, &paths.instance)?
+            .edge_device_id;
     let socket = paths
         .herdr_socket
         .ok_or_else(|| "candidate runtime requires a Herdr local transport".to_owned())?;
@@ -258,6 +266,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             activity: McpActivityRegistry::default(),
             bearer_token: Arc::<[u8]>::from(token.into_bytes()),
             trusted_extension_ipc: false,
+            local_device_id,
         };
         let app = candidate_router(state.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -322,6 +331,10 @@ fn candidate_router(state: AppState) -> Router {
         )
         .route("/extension/fleet", get(get_extension_fleet))
         .route(
+            "/extension/browser/registry",
+            post(post_extension_browser_registry),
+        )
+        .route(
             "/extension/continuity/turn",
             post(post_extension_continuity_turn),
         )
@@ -331,6 +344,389 @@ fn candidate_router(state: AppState) -> Router {
         )
         .route("/health", get(health))
         .with_state(state)
+}
+
+async fn post_extension_browser_registry(State(state): State<AppState>, body: Bytes) -> Response {
+    if !state.trusted_extension_ipc {
+        return browser_registry_http_error(
+            StatusCode::FORBIDDEN,
+            "trusted_extension_ipc_required",
+        );
+    }
+    if body.len() > MAX_BROWSER_REGISTRY_REQUEST_BYTES {
+        return browser_registry_http_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "browser_registry_request_too_large",
+        );
+    }
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(Value::Object(object)) => Value::Object(object),
+        _ => {
+            return browser_registry_http_error(
+                StatusCode::BAD_REQUEST,
+                "browser_registry_invalid_json",
+            );
+        }
+    };
+    let Some(operation) = payload.get("operation").and_then(Value::as_str) else {
+        return browser_registry_http_error(
+            StatusCode::BAD_REQUEST,
+            "browser_registry_operation_required",
+        );
+    };
+    let observed_at = match payload.get("observed_at") {
+        None => i64::try_from(epoch_ms()).unwrap_or(i64::MAX),
+        Some(value) => match value.as_i64() {
+            Some(value) if value >= 0 => value,
+            _ => {
+                return browser_registry_http_error(
+                    StatusCode::BAD_REQUEST,
+                    "browser_observed_at_invalid",
+                );
+            }
+        },
+    };
+    let result = match operation {
+        "endpoint.register" => extension_browser_endpoint_register(&state, &payload, observed_at),
+        "endpoint.consent" => extension_browser_endpoint_consent(&state, &payload, observed_at),
+        "provider.observe" => extension_browser_provider_observe(&state, &payload, observed_at),
+        "resource.observe" => extension_browser_resource_observe(&state, &payload, observed_at),
+        _ => Err("browser_registry_operation_unknown".to_owned()),
+    };
+    match result {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(code) => browser_registry_http_store_error(&code),
+    }
+}
+
+fn extension_browser_endpoint_register(
+    state: &AppState,
+    payload: &Value,
+    observed_at: i64,
+) -> Result<Value, String> {
+    browser_registry_allow_fields(
+        payload,
+        &[
+            "operation",
+            "profile_seed",
+            "browser_family",
+            "extension_version",
+            "observed_at",
+        ],
+    )?;
+    let device_id = state
+        .local_device_id
+        .as_deref()
+        .ok_or_else(|| "browser_device_identity_unavailable".to_owned())?;
+    let profile_seed = browser_registry_string(payload, "profile_seed", 256)?;
+    let browser_family = browser_registry_string(payload, "browser_family", 32)?;
+    let extension_version = browser_registry_string(payload, "extension_version", 64)?;
+    let mut store = state
+        .state_store
+        .lock()
+        .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
+    let endpoint = store.register_browser_endpoint(BrowserEndpointRegistrationInput {
+        device_id,
+        profile_seed,
+        browser_family,
+        extension_version,
+        observed_at,
+    })?;
+    Ok(json!({
+        "ok": true,
+        "endpoint": browser_endpoint_http_json(endpoint),
+    }))
+}
+
+fn browser_registry_authoritative_endpoint_ref(
+    state: &AppState,
+    payload: &Value,
+) -> Result<String, String> {
+    let profile_seed = browser_registry_string(payload, "profile_seed", 256)?;
+    let device_id = state
+        .local_device_id
+        .as_deref()
+        .ok_or_else(|| "browser_device_identity_unavailable".to_owned())?;
+    let authoritative_ref =
+        crate::state_store::derive_browser_endpoint_ref(device_id, profile_seed)?;
+    if browser_registry_optional_string(payload, "endpoint_ref", 96)?
+        .is_some_and(|caller_ref| caller_ref != authoritative_ref)
+    {
+        return Err("browser_endpoint_ref_mismatch".to_owned());
+    }
+    Ok(authoritative_ref)
+}
+
+fn extension_browser_endpoint_consent(
+    state: &AppState,
+    payload: &Value,
+    observed_at: i64,
+) -> Result<Value, String> {
+    browser_registry_allow_fields(
+        payload,
+        &[
+            "operation",
+            "profile_seed",
+            "endpoint_ref",
+            "expected_consent_revision",
+            "expected_revision",
+            "webchat_control_allowed",
+            "tool_bridge_allowed",
+            "tool_bridge_mutation_allowed",
+            "observed_at",
+        ],
+    )?;
+    let endpoint_ref = browser_registry_authoritative_endpoint_ref(state, payload)?;
+    let expected_revision = match payload
+        .get("expected_consent_revision")
+        .or_else(|| payload.get("expected_revision"))
+        .and_then(Value::as_i64)
+    {
+        Some(value) if value >= 0 => value,
+        _ => return Err("browser_expected_consent_revision_required".to_owned()),
+    };
+    let webchat_control_allowed = browser_registry_bool(payload, "webchat_control_allowed")?;
+    let tool_bridge_allowed = browser_registry_bool(payload, "tool_bridge_allowed")?;
+    let tool_bridge_mutation_allowed =
+        browser_registry_bool(payload, "tool_bridge_mutation_allowed")?;
+    let mut store = state
+        .state_store
+        .lock()
+        .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
+    let endpoint = store.set_browser_endpoint_consent(BrowserEndpointConsentInput {
+        endpoint_ref: &endpoint_ref,
+        expected_revision,
+        webchat_control_allowed,
+        tool_bridge_allowed,
+        tool_bridge_mutation_allowed,
+        observed_at,
+    })?;
+    Ok(json!({
+        "ok": true,
+        "endpoint": browser_endpoint_http_json(endpoint),
+    }))
+}
+
+fn extension_browser_provider_observe(
+    state: &AppState,
+    payload: &Value,
+    observed_at: i64,
+) -> Result<Value, String> {
+    browser_registry_allow_fields(
+        payload,
+        &[
+            "operation",
+            "profile_seed",
+            "endpoint_ref",
+            "provider",
+            "adapter_protocol_version",
+            "observation_generation",
+            "capabilities",
+            "observed_at",
+        ],
+    )?;
+    let endpoint_ref = browser_registry_authoritative_endpoint_ref(state, payload)?;
+    let provider = browser_registry_string(payload, "provider", 32)?;
+    let adapter_protocol_version =
+        browser_registry_positive_i64(payload, "adapter_protocol_version")?;
+    let observation_generation = browser_registry_positive_i64(payload, "observation_generation")?;
+    let capabilities = payload
+        .get("capabilities")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| "browser_capabilities_invalid".to_owned())?;
+    let capabilities_json = serde_json::to_string(capabilities)
+        .map_err(|_| "browser_capabilities_invalid".to_owned())?;
+    let mut store = state
+        .state_store
+        .lock()
+        .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
+    let provider_state = store.observe_browser_provider(BrowserProviderObservationInput {
+        endpoint_ref: &endpoint_ref,
+        provider,
+        adapter_protocol_version,
+        observation_generation,
+        capabilities_json: &capabilities_json,
+        observed_at,
+    })?;
+    Ok(json!({
+        "ok": true,
+        "provider_state": {
+            "endpoint_ref": provider_state.endpoint_ref,
+            "provider": provider_state.provider,
+            "adapter_protocol_version": provider_state.adapter_protocol_version,
+            "observation_generation": provider_state.observation_generation,
+            "capabilities": serde_json::from_str::<Value>(&provider_state.capabilities_json)
+                .unwrap_or_else(|_| json!({})),
+            "observed_at": provider_state.observed_at,
+        }
+    }))
+}
+
+fn extension_browser_resource_observe(
+    state: &AppState,
+    payload: &Value,
+    observed_at: i64,
+) -> Result<Value, String> {
+    browser_registry_allow_fields(
+        payload,
+        &[
+            "operation",
+            "profile_seed",
+            "endpoint_ref",
+            "provider",
+            "kind",
+            "parent_ref",
+            "native_identity",
+            "display_label",
+            "observation_generation",
+            "observed_at",
+        ],
+    )?;
+    let endpoint_ref = browser_registry_authoritative_endpoint_ref(state, payload)?;
+    let provider = browser_registry_string(payload, "provider", 32)?;
+    let kind = browser_registry_string(payload, "kind", 16)?;
+    let parent_ref = browser_registry_optional_string(payload, "parent_ref", 96)?;
+    let native_identity = browser_registry_string(payload, "native_identity", 1024)?;
+    let display_label = browser_registry_optional_string(payload, "display_label", 256)?;
+    let observation_generation = browser_registry_positive_i64(payload, "observation_generation")?;
+    let mut store = state
+        .state_store
+        .lock()
+        .map_err(|_| "browser_registry_store_unavailable".to_owned())?;
+    let resource = store.observe_browser_resource(BrowserResourceObservationInput {
+        endpoint_ref: &endpoint_ref,
+        provider,
+        kind,
+        parent_ref,
+        native_identity,
+        display_label,
+        observation_generation,
+        observed_at,
+    })?;
+    Ok(json!({
+        "ok": true,
+        "resource": browser_resource_http_json(resource),
+    }))
+}
+
+fn browser_registry_allow_fields(payload: &Value, allowed: &[&str]) -> Result<(), String> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "browser_registry_invalid_json".to_owned())?;
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err("browser_registry_params_invalid".to_owned());
+    }
+    Ok(())
+}
+
+fn browser_registry_string<'a>(
+    payload: &'a Value,
+    field: &str,
+    max_bytes: usize,
+) -> Result<&'a str, String> {
+    let value = payload
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("browser_{field}_required"))?;
+    if value.is_empty()
+        || value.len() > max_bytes
+        || value != value.trim()
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!("browser_{field}_invalid"));
+    }
+    Ok(value)
+}
+
+fn browser_registry_optional_string<'a>(
+    payload: &'a Value,
+    field: &str,
+    max_bytes: usize,
+) -> Result<Option<&'a str>, String> {
+    match payload.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            if value.is_empty()
+                || value.len() > max_bytes
+                || value != value.trim()
+                || value.chars().any(char::is_control)
+            {
+                return Err(format!("browser_{field}_invalid"));
+            }
+            Ok(Some(value))
+        }
+        Some(_) => Err(format!("browser_{field}_invalid")),
+    }
+}
+
+fn browser_registry_bool(payload: &Value, field: &str) -> Result<bool, String> {
+    payload
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("browser_{field}_invalid"))
+}
+
+fn browser_registry_positive_i64(payload: &Value, field: &str) -> Result<i64, String> {
+    match payload.get(field).and_then(Value::as_i64) {
+        Some(value) if value >= 1 => Ok(value),
+        _ => Err(format!("browser_{field}_invalid")),
+    }
+}
+
+fn browser_registry_http_store_error(code: &str) -> Response {
+    let status = if code.ends_with("_not_found") {
+        StatusCode::NOT_FOUND
+    } else if code.contains("stale_")
+        || code.contains("_ambiguous")
+        || code.contains("_conflict")
+        || code.contains("_mismatch")
+        || code.contains("_hierarchy_")
+        || code.contains("_parent_")
+        || code == "browser_device_identity_unavailable"
+    {
+        StatusCode::CONFLICT
+    } else if code == "browser_registry_store_unavailable" {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    browser_registry_http_error(status, code)
+}
+
+fn browser_registry_http_error(status: StatusCode, code: &str) -> Response {
+    json_response(status, &json!({"ok": false, "code": code}))
+}
+
+fn browser_endpoint_http_json(endpoint: crate::state_store::BrowserEndpointRecord) -> Value {
+    json!({
+        "endpoint_ref": endpoint.endpoint_ref,
+        "device_id": endpoint.device_id,
+        "browser_family": endpoint.browser_family,
+        "extension_version": endpoint.extension_version,
+        "consent": {
+            "webchat_control": endpoint.webchat_control_allowed,
+            "tool_bridge": endpoint.tool_bridge_allowed,
+            "tool_bridge_workstation_mutation": endpoint.tool_bridge_mutation_allowed,
+            "revision": endpoint.consent_revision,
+        },
+        "consent_revision": endpoint.consent_revision,
+        "first_observed_at": endpoint.first_observed_at,
+        "last_observed_at": endpoint.last_observed_at,
+    })
+}
+
+fn browser_resource_http_json(resource: crate::state_store::BrowserResourceRecord) -> Value {
+    json!({
+        "resource_ref": resource.resource_ref,
+        "endpoint_ref": resource.endpoint_ref,
+        "provider": resource.provider,
+        "kind": resource.kind,
+        "parent_ref": resource.parent_ref,
+        "display_label": resource.display_label,
+        "observation_generation": resource.observation_generation,
+        "first_observed_at": resource.first_observed_at,
+        "last_observed_at": resource.last_observed_at,
+    })
 }
 
 async fn get_extension_fleet(State(state): State<AppState>) -> Response {
@@ -1821,6 +2217,7 @@ mod tests {
             activity: McpActivityRegistry::default(),
             bearer_token: Arc::<[u8]>::from(b"test-token".to_vec()),
             trusted_extension_ipc: false,
+            local_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
         }
     }
 
@@ -1932,6 +2329,218 @@ mod tests {
             .unwrap();
         assert_eq!(resume.turns.len(), 1);
         assert_eq!(resume.turns[0].text, "continue");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn browser_registry_route_is_trusted_local_and_device_authoritative() {
+        let root = test_root("browser-registry-route");
+        let register = json!({
+            "operation": "endpoint.register",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "browser_family": "chrome",
+            "extension_version": "0.1.90",
+            "observed_at": 1000
+        });
+        let request = |payload: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/extension/browser/registry")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        };
+
+        let tcp = candidate_router(test_state(&root.join("tcp")));
+        let response = tcp.oneshot(request(register.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let mut extension_state = test_state(&root.join("extension"));
+        extension_state.trusted_extension_ipc = true;
+        extension_state.local_device_id = Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned());
+        let store = extension_state.state_store.clone();
+        let app = candidate_router(extension_state);
+
+        let response = app
+            .clone()
+            .oneshot(request(register.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["endpoint"]["device_id"],
+            "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        );
+        assert_eq!(result["endpoint"]["consent"]["webchat_control"], false);
+        assert!(!result.to_string().contains("extension-profile-seed"));
+        let endpoint_ref = result["endpoint"]["endpoint_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let injected = json!({
+            "operation": "endpoint.register",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "browser_family": "chrome",
+            "extension_version": "0.1.90",
+            "device_id": "dev_01M1E4VF6VGXAMGD0CN9WE8N7M"
+        });
+        let response = app.clone().oneshot(request(injected)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["code"], "browser_registry_params_invalid");
+
+        let consent = json!({
+            "operation": "endpoint.consent",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "endpoint_ref": endpoint_ref,
+            "expected_consent_revision": 0,
+            "webchat_control_allowed": true,
+            "tool_bridge_allowed": true,
+            "tool_bridge_mutation_allowed": false,
+            "observed_at": 1001
+        });
+        let response = app.clone().oneshot(request(consent)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let consent_res: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(consent_res["endpoint"]["consent"]["revision"], 1);
+        assert_eq!(consent_res["endpoint"]["consent_revision"], 1);
+
+        let provider = json!({
+            "operation": "provider.observe",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "adapter_protocol_version": 1,
+            "observation_generation": 1,
+            "capabilities": {"operations": ["identity.inspect", "space.list"]},
+            "observed_at": 1002
+        });
+        let response = app.clone().oneshot(request(provider)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let account = json!({
+            "operation": "resource.observe",
+            "profile_seed": "extension-profile-seed-0123456789abcdef",
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "account",
+            "native_identity": "native-account-do-not-return",
+            "display_label": "Work",
+            "observation_generation": 1,
+            "observed_at": 1003
+        });
+        let response = app.clone().oneshot(request(account)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["ok"], true);
+        assert!(!result.to_string().contains("native-account-do-not-return"));
+        assert!(result["resource"].get("native_identity_sha256").is_none());
+
+        let endpoint = store
+            .lock()
+            .unwrap()
+            .browser_endpoint(&endpoint_ref)
+            .unwrap()
+            .unwrap();
+        assert_eq!(endpoint.device_id, "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert!(endpoint.webchat_control_allowed);
+        assert!(endpoint.tool_bridge_allowed);
+        assert!(!endpoint.tool_bridge_mutation_allowed);
+        assert_eq!(endpoint.consent_revision, 1);
+
+        // Two-profile cross-profile mutation regression: Profile B cannot mutate Profile A
+        let profile_b_seed = "extension-profile-seed-ffffffffffffffff";
+        let reg_b = json!({
+            "operation": "endpoint.register",
+            "profile_seed": profile_b_seed,
+            "browser_family": "chrome",
+            "extension_version": "0.1.90",
+            "observed_at": 1100
+        });
+        let response = app.clone().oneshot(request(reg_b)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let b_res: Value = serde_json::from_slice(&body).unwrap();
+        let endpoint_ref_b = b_res["endpoint"]["endpoint_ref"].as_str().unwrap();
+        assert_ne!(endpoint_ref_b, endpoint_ref);
+
+        // Profile B attempts to mutate Profile A's consent (passes B seed but A endpoint_ref) -> fails
+        let b_cross_consent = json!({
+            "operation": "endpoint.consent",
+            "profile_seed": profile_b_seed,
+            "endpoint_ref": endpoint_ref,
+            "expected_consent_revision": 1,
+            "webchat_control_allowed": false,
+            "tool_bridge_allowed": false,
+            "tool_bridge_mutation_allowed": false,
+            "observed_at": 1101
+        });
+        let response = app.clone().oneshot(request(b_cross_consent)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let cross_err: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cross_err["code"], "browser_endpoint_ref_mismatch");
+
+        // Profile B attempts to observe provider on Profile A -> fails
+        let b_cross_provider = json!({
+            "operation": "provider.observe",
+            "profile_seed": profile_b_seed,
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "adapter_protocol_version": 1,
+            "observation_generation": 2,
+            "capabilities": {"operations": ["identity.inspect"]},
+            "observed_at": 1102
+        });
+        let response = app
+            .clone()
+            .oneshot(request(b_cross_provider))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let cross_err: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cross_err["code"], "browser_endpoint_ref_mismatch");
+
+        // Profile B attempts to observe resource on Profile A -> fails
+        let b_cross_resource = json!({
+            "operation": "resource.observe",
+            "profile_seed": profile_b_seed,
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "kind": "account",
+            "native_identity": "attacker-account",
+            "display_label": "Attacker",
+            "observation_generation": 1,
+            "observed_at": 1103
+        });
+        let response = app
+            .clone()
+            .oneshot(request(b_cross_resource))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let cross_err: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cross_err["code"], "browser_endpoint_ref_mismatch");
+
+        // Verify Profile A endpoint remains completely intact
+        let endpoint_a = store
+            .lock()
+            .unwrap()
+            .browser_endpoint(&endpoint_ref)
+            .unwrap()
+            .unwrap();
+        assert!(endpoint_a.webchat_control_allowed);
+        assert_eq!(endpoint_a.consent_revision, 1);
+
         let _ = std::fs::remove_dir_all(root);
     }
 
