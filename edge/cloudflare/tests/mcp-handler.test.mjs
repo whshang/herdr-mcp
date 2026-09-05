@@ -25,6 +25,7 @@ function deps(over = {}) {
       approveConnector: over.approveConnector,
       revokeConnector: over.revokeConnector,
       resolveDevice: over.resolveDevice,
+      client: over.client,
       forward: async (_stub, body) => {
         calls.push(JSON.parse(body));
         if (over.forward) return over.forward(_stub, body);
@@ -96,7 +97,16 @@ test("tools/list exposes runtime tools plus edge-local herdr_devices", async () 
 });
 
 test("tools/call forwards only frozen tools with epoch/hash and preserves id", async () => {
-  const d = deps();
+  const d = deps({
+    client: {
+      webchatControlGrants: [{
+        device_id: DEVICE_A,
+        endpoint_ref: `be_${"a".repeat(64)}`,
+        provider: "chatgpt",
+        account_ref: `br_${"b".repeat(64)}`,
+      }],
+    },
+  });
   const r = await handleMcp(req(7, "tools/call", { name: "herdr_inspect", arguments: {} }), "w1", d.value);
   assert.equal(r.body.id, 7);
   assert.equal(r.body.result.isError, undefined);
@@ -106,6 +116,7 @@ test("tools/call forwards only frozen tools with epoch/hash and preserves id", a
   assert.equal(d.calls[0].contractEpoch, 2);
   assert.equal(d.calls[0].contractHash, EPOCH2_CONTRACT.contract_hash);
   assert.equal(d.calls[0].deadlineMs, 31_000);
+  assert.equal(d.calls[0].trace, undefined, "browser grants must not alter non-browser MCP forwarding");
 });
 
 test("read-only call retries across a stale generation window after supersede proved not delivered", async () => {
@@ -596,6 +607,29 @@ test("connector approve/revoke private methods are Edge-local, schema-bounded, a
   assert.equal(revoke.body.result.structuredContent.revoked, true);
   assert.equal(revoked, "dcr-abc");
 
+  const remoteGrant = await handleMcp(
+    req(7391, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.connector.webchat_control.set",
+        device: DEVICE_A,
+        params: {
+          client_id: "dcr-abc",
+          endpoint_ref: `be_${"a".repeat(64)}`,
+          provider: "chatgpt",
+          account_ref: `br_${"b".repeat(64)}`,
+          allowed: true,
+          confirm: true,
+        },
+      },
+    }),
+    "legacy-default",
+    d.value,
+  );
+  assert.equal(remoteGrant.body.result.isError, true);
+  assert.equal(remoteGrant.body.result.structuredContent.code, "connector_owner_device_required");
+  assert.equal(d.calls.length, 0, "OAuth MCP callers cannot self-authorize WebChat Control");
+
   const listed = await handleMcp(req(740, "tools/list", {}), "legacy-default", d.value);
   assert.equal(listed.body.result.tools.some((tool) => tool.name.includes("connector")), false);
 });
@@ -733,6 +767,22 @@ test("JSON-RPC request validation and method errors preserve ids", async () => {
 
 test("browser private methods require explicit enrolled device selector before forwarding", async () => {
   const d = deps({
+    client: {
+      webchatControlGrants: [
+        {
+          device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          provider: "chatgpt",
+          account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        },
+        {
+          device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+          endpoint_ref: "be_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          provider: "chatgpt",
+          account_ref: "br_dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        },
+      ],
+    },
     resolveDevice: async (selector) => {
       if (selector === "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV") {
         return { ok: true, device_id: selector, workstation_id: "w-target", routing_reason: "explicit_device_selector" };
@@ -785,4 +835,11 @@ test("browser private methods require explicit enrolled device selector before f
   assert.equal(d.calls[0].op, "herdr_call");
   assert.equal(d.calls[0].args.method, "herdr_mcp.browser_endpoint.list");
   assert.equal(d.calls[0].args.device, undefined, "device selector stripped by unwrapDeviceRefs");
+  assert.deepEqual(d.calls[0].trace, {
+    webchat_control_grants: [{
+      endpoint_ref: "be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      provider: "chatgpt",
+      account_ref: "br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }],
+  }, "only grants for the routed device cross the Edge -> Link handoff");
 });

@@ -42,10 +42,18 @@ export interface McpResponse {
   body: Record<string, unknown> | null;
 }
 
+export interface WebChatControlGrant {
+  device_id: string;
+  endpoint_ref: string;
+  provider: string;
+  account_ref: string;
+}
+
 export interface McpClientContext {
   userAgent?: string | null;
   oauthClientId?: string | null;
   authSource?: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge" | null;
+  webchatControlGrants?: readonly WebChatControlGrant[];
 }
 
 export interface McpDeps {
@@ -728,14 +736,22 @@ export async function handleMcp(
       }));
     }
 
+    if (localMethod === "herdr_mcp.connector.webchat_control.set") {
+      return rpcResult(id, callToolResult({
+        ok: false,
+        code: "connector_owner_device_required",
+        message: "WebChat Control grants can be changed only by an enrolled owner device.",
+        retryable: false,
+        delivery_state: "not_delivered",
+      }, true));
+    }
+
     const selectorValue = args.device;
     if (selectorValue !== undefined && typeof selectorValue !== "string") {
       return rpcError(id, -32602, "Invalid params", { reason: "device must be a string" });
     }
-    const isBrowserPrivateMethod = typeof localMethod === "string" && (
-      localMethod.startsWith("herdr_mcp.browser_endpoint.") ||
-      localMethod.startsWith("herdr_mcp.browser_resource.")
-    );
+    const isBrowserPrivateMethod = typeof localMethod === "string"
+      && localMethod.startsWith("herdr_mcp.browser_");
     if (isBrowserPrivateMethod) {
       if (typeof selectorValue !== "string" || selectorValue.trim().length === 0) {
         return rpcResult(id, callToolResult({
@@ -818,6 +834,15 @@ export async function handleMcp(
       typeof runtimeArgs.idempotency_key === "string" && runtimeArgs.idempotency_key.length > 0
         ? runtimeArgs.idempotency_key
         : undefined;
+    const webchatControlGrants = isBrowserPrivateMethod && route.device_id
+      ? (deps.client?.webchatControlGrants ?? [])
+        .filter((grant) => grant.device_id === route.device_id)
+        .map((grant) => ({
+          endpoint_ref: grant.endpoint_ref,
+          provider: grant.provider,
+          account_ref: grant.account_ref,
+        }))
+      : [];
     const internal: InternalForwardRequest = {
       kind: "request",
       requestId,
@@ -828,6 +853,9 @@ export async function handleMcp(
       contractEpoch: RUNTIME_EXECUTION_CONTRACT.contract_epoch,
       contractHash: RUNTIME_EXECUTION_CONTRACT.contract_hash,
       idempotencyKey,
+      ...(webchatControlGrants.length > 0
+        ? { trace: { webchat_control_grants: webchatControlGrants } }
+        : {}),
     };
 
     deps.logger.warn("mcp.tools_call.forward", {

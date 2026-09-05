@@ -170,6 +170,7 @@ export interface InternalForwardRequest {
   contractEpoch?: number;
   contractHash?: string;
   idempotencyKey?: string;
+  trace?: Record<string, unknown>;
 }
 
 export type ForwardOutcome =
@@ -584,6 +585,7 @@ export class WorkstationDO {
       contract_hash: req.contractHash,
       idempotency_key: req.idempotencyKey,
       arguments: (req.args ?? undefined) as Record<string, unknown> | undefined,
+      trace: req.trace,
     };
 
     if (this.session?.status === "draining") {

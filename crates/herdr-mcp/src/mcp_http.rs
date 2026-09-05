@@ -3,7 +3,9 @@ use crate::exec_sessions::ExecRegistry;
 #[cfg(unix)]
 use crate::extension_ipc::ExtensionIpcSocket;
 use crate::herdr::HerdrClient;
-use crate::mcp::{self, RuntimeContext};
+use crate::mcp::{
+    self, BrowserActuator, BrowserCallerGrant, BrowserPostconditionEvidence, RuntimeContext,
+};
 use crate::paths::RuntimePaths;
 use crate::prompt::PromptRegistry;
 use crate::runtime_meta;
@@ -29,14 +31,20 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_BROWSER_REGISTRY_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_BROWSER_ACTUATION_RESULT_BYTES: usize = 64 * 1024;
+const BROWSER_ACTUATION_TIMEOUT: Duration = Duration::from_secs(12);
+const BROWSER_EXTENSION_LIVE_WINDOW: Duration = Duration::from_secs(2);
 const RUNTIME_GENERATION_HEADER: &str = "x-herdr-runtime-generation";
+const EDGE_WEBCHAT_CONTROL_GRANTS_HEADER: &str = "x-herdr-edge-webchat-control-grants";
+const EDGE_EXPECTED_RUNTIME_GENERATION_HEADER: &str = "x-herdr-edge-expected-runtime-generation";
+const MAX_EDGE_WEBCHAT_CONTROL_GRANTS_HEADER_BYTES: usize = 8 * 1024;
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
@@ -45,8 +53,141 @@ const MAX_MCP_ACTIVITY_RECORDS: usize = 2000;
 const MAX_MCP_ACTIVITY_RESULTS: usize = 50;
 const MAX_MCP_ACTIVITY_LOOKBACK_MS: u64 = 30 * 60_000;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
+static NEXT_BROWSER_ACTUATION: AtomicU64 = AtomicU64::new(0);
 
 const SETTLED_AGENT_STATES: &[&str] = &["idle", "done", "blocked"];
+
+#[derive(Clone, Default)]
+struct BrowserActuationBroker {
+    inner: Arc<(Mutex<BrowserActuationState>, Condvar)>,
+}
+
+#[derive(Default)]
+struct BrowserActuationState {
+    queued: VecDeque<Value>,
+    pending: BTreeSet<String>,
+    completions: HashMap<String, BrowserPostconditionEvidence>,
+    last_extension_poll: Option<Instant>,
+}
+
+impl BrowserActuationBroker {
+    fn take_next_for_extension(&self) -> Option<Value> {
+        let Ok(mut state) = self.inner.0.lock() else {
+            return None;
+        };
+        state.last_extension_poll = Some(Instant::now());
+        state.queued.pop_front()
+    }
+
+    fn complete(
+        &self,
+        actuation_id: &str,
+        evidence: BrowserPostconditionEvidence,
+    ) -> Result<(), String> {
+        let (lock, ready) = &*self.inner;
+        let mut state = lock
+            .lock()
+            .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
+        if !state.pending.contains(actuation_id) {
+            return Err("browser_actuation_not_pending".to_owned());
+        }
+        state.completions.insert(actuation_id.to_owned(), evidence);
+        ready.notify_all();
+        Ok(())
+    }
+
+    fn extension_live(state: &BrowserActuationState) -> bool {
+        state
+            .last_extension_poll
+            .is_some_and(|seen| seen.elapsed() <= BROWSER_EXTENSION_LIVE_WINDOW)
+    }
+}
+
+impl BrowserActuator for BrowserActuationBroker {
+    fn actuate(
+        &self,
+        operation: &str,
+        params: &Value,
+        expected_generation: i64,
+    ) -> Result<BrowserPostconditionEvidence, String> {
+        let actuation_id = format!(
+            "ba_{:016x}",
+            NEXT_BROWSER_ACTUATION.fetch_add(1, Ordering::Relaxed)
+        );
+        let (lock, ready) = &*self.inner;
+        let mut state = lock
+            .lock()
+            .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
+        if !Self::extension_live(&state) {
+            return Ok(BrowserPostconditionEvidence {
+                observed_generation: expected_generation,
+                command_accepted: false,
+                browser_online: false,
+                resource_available: true,
+                rejected: false,
+                stable_resource_ref_observed: false,
+                lifecycle_observed: false,
+                canonical_url_observed: false,
+                accepted_message_observed: false,
+                message_baseline_advanced: false,
+                reasoning_effort_readback: None,
+                required_apps_readback: Vec::new(),
+                generation_owner: None,
+                generation_status_observed: false,
+                generation_stopped: false,
+            });
+        }
+        state.pending.insert(actuation_id.clone());
+        state.queued.push_back(json!({
+            "protocol": "herdr-browser-actuation/v1",
+            "actuation_id": actuation_id,
+            "operation": operation,
+            "expected_generation": expected_generation,
+            "params": params,
+        }));
+        ready.notify_all();
+
+        let deadline = Instant::now() + BROWSER_ACTUATION_TIMEOUT;
+        loop {
+            if let Some(evidence) = state.completions.remove(&actuation_id) {
+                state.pending.remove(&actuation_id);
+                return Ok(evidence);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                state.pending.remove(&actuation_id);
+                state.queued.retain(|command| {
+                    command.get("actuation_id").and_then(Value::as_str)
+                        != Some(actuation_id.as_str())
+                });
+                // Once a command may have crossed the SSE boundary, a missing
+                // acknowledgement is delivery-uncertain and must never invite replay.
+                return Ok(BrowserPostconditionEvidence {
+                    observed_generation: expected_generation,
+                    command_accepted: true,
+                    browser_online: true,
+                    resource_available: true,
+                    rejected: false,
+                    stable_resource_ref_observed: false,
+                    lifecycle_observed: false,
+                    canonical_url_observed: false,
+                    accepted_message_observed: false,
+                    message_baseline_advanced: false,
+                    reasoning_effort_readback: None,
+                    required_apps_readback: Vec::new(),
+                    generation_owner: None,
+                    generation_status_observed: false,
+                    generation_stopped: false,
+                });
+            }
+            let timeout = deadline.saturating_duration_since(now);
+            let waited = ready
+                .wait_timeout(state, timeout)
+                .map_err(|_| "browser_actuation_broker_unavailable".to_owned())?;
+            state = waited.0;
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 struct SessionRegistry {
@@ -202,7 +343,9 @@ struct AppState {
     activity: McpActivityRegistry,
     bearer_token: Arc<[u8]>,
     trusted_extension_ipc: bool,
+    runtime_generation: Option<String>,
     local_device_id: Option<String>,
+    browser_actuation: BrowserActuationBroker,
 }
 
 pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
@@ -266,7 +409,11 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
             activity: McpActivityRegistry::default(),
             bearer_token: Arc::<[u8]>::from(token.into_bytes()),
             trusted_extension_ipc: false,
+            runtime_generation: env::var("HERDR_MCP_RUNTIME_GENERATION")
+                .ok()
+                .filter(|value| !value.is_empty()),
             local_device_id,
+            browser_actuation: BrowserActuationBroker::default(),
         };
         let app = candidate_router(state.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -335,6 +482,10 @@ fn candidate_router(state: AppState) -> Router {
             post(post_extension_browser_registry),
         )
         .route(
+            "/extension/browser/actuation",
+            post(post_extension_browser_actuation),
+        )
+        .route(
             "/extension/continuity/turn",
             post(post_extension_continuity_turn),
         )
@@ -395,6 +546,134 @@ async fn post_extension_browser_registry(State(state): State<AppState>, body: By
     };
     match result {
         Ok(value) => json_response(StatusCode::OK, &value),
+        Err(code) => browser_registry_http_store_error(&code),
+    }
+}
+
+async fn post_extension_browser_actuation(State(state): State<AppState>, body: Bytes) -> Response {
+    if !state.trusted_extension_ipc {
+        return browser_registry_http_error(
+            StatusCode::FORBIDDEN,
+            "trusted_extension_ipc_required",
+        );
+    }
+    if body.len() > MAX_BROWSER_ACTUATION_RESULT_BYTES {
+        return browser_registry_http_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "browser_actuation_result_too_large",
+        );
+    }
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(Value::Object(object)) => Value::Object(object),
+        _ => {
+            return browser_registry_http_error(
+                StatusCode::BAD_REQUEST,
+                "browser_actuation_result_invalid_json",
+            );
+        }
+    };
+    if let Err(code) = browser_registry_allow_fields(
+        &payload,
+        &[
+            "actuation_id",
+            "observed_generation",
+            "command_accepted",
+            "browser_online",
+            "resource_available",
+            "rejected",
+            "stable_resource_ref_observed",
+            "lifecycle_observed",
+            "canonical_url_observed",
+            "accepted_message_observed",
+            "message_baseline_advanced",
+            "reasoning_effort_readback",
+            "required_apps_readback",
+            "generation_owner",
+            "generation_status_observed",
+            "generation_stopped",
+        ],
+    ) {
+        return browser_registry_http_store_error(&code);
+    }
+    let result = (|| -> Result<(), String> {
+        let actuation_id = browser_registry_string(&payload, "actuation_id", 96)?;
+        if !actuation_id.starts_with("ba_") {
+            return Err("browser_actuation_id_invalid".to_owned());
+        }
+        let observed_generation = browser_registry_positive_i64(&payload, "observed_generation")?;
+        let reasoning_effort_readback = match payload.get("reasoning_effort_readback") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value))
+                if matches!(value.as_str(), "economy" | "balanced" | "thorough") =>
+            {
+                Some(value.clone())
+            }
+            _ => return Err("browser_reasoning_effort_readback_invalid".to_owned()),
+        };
+        let required_apps_readback = match payload.get("required_apps_readback") {
+            Some(Value::Array(items)) if items.len() <= 32 => {
+                let mut apps = Vec::with_capacity(items.len());
+                for item in items {
+                    let Some(app) = item.as_str() else {
+                        return Err("browser_required_apps_readback_invalid".to_owned());
+                    };
+                    if app.is_empty()
+                        || app.len() > 64
+                        || app != app.trim()
+                        || app.chars().any(char::is_control)
+                    {
+                        return Err("browser_required_apps_readback_invalid".to_owned());
+                    }
+                    apps.push(app.to_owned());
+                }
+                apps.sort();
+                apps.dedup();
+                apps
+            }
+            _ => return Err("browser_required_apps_readback_invalid".to_owned()),
+        };
+        let generation_owner = match payload.get("generation_owner") {
+            None | Some(Value::Null) => None,
+            Some(value) => match value.as_i64() {
+                Some(value) if value >= 1 => Some(value),
+                _ => return Err("browser_generation_owner_invalid".to_owned()),
+            },
+        };
+        state.browser_actuation.complete(
+            actuation_id,
+            BrowserPostconditionEvidence {
+                observed_generation,
+                command_accepted: browser_registry_bool(&payload, "command_accepted")?,
+                browser_online: browser_registry_bool(&payload, "browser_online")?,
+                resource_available: browser_registry_bool(&payload, "resource_available")?,
+                rejected: browser_registry_bool(&payload, "rejected")?,
+                stable_resource_ref_observed: browser_registry_bool(
+                    &payload,
+                    "stable_resource_ref_observed",
+                )?,
+                lifecycle_observed: browser_registry_bool(&payload, "lifecycle_observed")?,
+                canonical_url_observed: browser_registry_bool(&payload, "canonical_url_observed")?,
+                accepted_message_observed: browser_registry_bool(
+                    &payload,
+                    "accepted_message_observed",
+                )?,
+                message_baseline_advanced: browser_registry_bool(
+                    &payload,
+                    "message_baseline_advanced",
+                )?,
+                reasoning_effort_readback,
+                required_apps_readback,
+                generation_owner,
+                generation_status_observed: browser_registry_bool(
+                    &payload,
+                    "generation_status_observed",
+                )?,
+                generation_stopped: browser_registry_bool(&payload, "generation_stopped")?,
+            },
+        )
+    })();
+    match result {
+        Ok(()) => json_response(StatusCode::OK, &json!({"ok": true})),
         Err(code) => browser_registry_http_store_error(&code),
     }
 }
@@ -977,6 +1256,8 @@ struct PushStreamState {
     statuses: HashMap<String, String>,
     first: bool,
     last_heartbeat: Instant,
+    browser_actuation: BrowserActuationBroker,
+    trusted_extension_ipc: bool,
 }
 
 async fn push_state(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1071,7 +1352,12 @@ async fn push_events(
         pane: query.get("pane").filter(|v| !v.is_empty()).cloned(),
         workspace: query.get("workspace").filter(|v| !v.is_empty()).cloned(),
     };
-    push_events_response(state.cache, filters)
+    push_events_response(
+        state.cache,
+        filters,
+        state.browser_actuation,
+        state.trusted_extension_ipc,
+    )
 }
 
 async fn push_mcp_activity(
@@ -1167,7 +1453,12 @@ fn push_state_payload(cache: &EventCache) -> Value {
     })
 }
 
-fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Response {
+fn push_events_response(
+    cache: Arc<EventCache>,
+    filters: PushFilters,
+    browser_actuation: BrowserActuationBroker,
+    trusted_extension_ipc: bool,
+) -> Response {
     let digest = cache.digest_since(u64::MAX);
     let agents = push_agent_views(&digest.agents);
     let statuses = agents
@@ -1186,6 +1477,8 @@ fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Respons
         statuses,
         first: true,
         last_heartbeat: Instant::now(),
+        browser_actuation,
+        trusted_extension_ipc,
     };
     let events = stream::unfold(state, |mut state| async move {
         if state.first {
@@ -1221,6 +1514,12 @@ fn push_events_response(cache: Arc<EventCache>, filters: PushFilters) -> Respons
             state.cursor = digest.cursor;
             let current_agents = push_agent_views(&digest.agents);
             let mut body = String::new();
+
+            if state.trusted_extension_ipc
+                && let Some(command) = state.browser_actuation.take_next_for_extension()
+            {
+                body.push_str(&sse_event("browser_actuation", &command));
+            }
 
             for event in &digest.events {
                 if let Some((name, data)) = push_browser_lifecycle_event(event, &state.cache)
@@ -1738,6 +2037,32 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             }),
         );
     }
+    if trusted_edge_runtime_generation_fence(&state, &headers).is_err() {
+        let mut response = json_response(
+            StatusCode::CONFLICT,
+            &json!({
+                "jsonrpc": "2.0",
+                "error": {"code": -32002, "message": "Runtime generation mismatch"},
+                "id": null
+            }),
+        );
+        attach_runtime_generation_header(&mut response);
+        return response;
+    }
+    let caller_webchat_control_grants = match trusted_edge_webchat_control_grants(&state, &headers)
+    {
+        Ok(grants) => grants,
+        Err(()) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid trusted caller grant context"},
+                    "id": null
+                }),
+            );
+        }
+    };
     let request: Value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) if !value.is_array() => value,
         Ok(_) => {
@@ -1788,6 +2113,10 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             prompt: &blocking_state.prompt,
             skill: &blocking_state.skill,
             state_store: &blocking_state.state_store,
+            // The workstation bearer authenticates only TCP transport. Browser business
+            // authority is admitted exclusively from the trusted Unix IPC handoff above.
+            caller_webchat_control_grants: &caller_webchat_control_grants,
+            browser_actuator: Some(&blocking_state.browser_actuation),
         };
         mcp::handle(&blocking_request, &context)
     })
@@ -1912,6 +2241,94 @@ fn wants_sse(headers: &HeaderMap, request: &Value) -> bool {
         .get(ACCEPT)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+}
+
+fn trusted_edge_webchat_control_grants(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Vec<BrowserCallerGrant>, ()> {
+    // The reserved handoff header is ignored on TCP even if a bearer-authenticated
+    // client attempts to spoof it. Only the 0600 Unix IPC listener can elevate it.
+    if !state.trusted_extension_ipc {
+        return Ok(Vec::new());
+    }
+    let Some(raw) = headers.get(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER) else {
+        return Ok(Vec::new());
+    };
+    let text = raw.to_str().map_err(|_| ())?;
+    if text.len() > MAX_EDGE_WEBCHAT_CONTROL_GRANTS_HEADER_BYTES {
+        return Err(());
+    }
+    let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
+    let items = value.as_array().ok_or(())?;
+    if items.len() > 32 {
+        return Err(());
+    }
+    let mut grants = Vec::with_capacity(items.len());
+    for item in items {
+        let object = item.as_object().ok_or(())?;
+        if object.len() != 3
+            || !object.contains_key("endpoint_ref")
+            || !object.contains_key("provider")
+            || !object.contains_key("account_ref")
+        {
+            return Err(());
+        }
+        let endpoint_ref = object
+            .get("endpoint_ref")
+            .and_then(Value::as_str)
+            .ok_or(())?;
+        let provider = object.get("provider").and_then(Value::as_str).ok_or(())?;
+        let account_ref = object
+            .get("account_ref")
+            .and_then(Value::as_str)
+            .ok_or(())?;
+        if !valid_browser_grant_ref(endpoint_ref, 96)
+            || !valid_browser_grant_provider(provider)
+            || !valid_browser_grant_ref(account_ref, 96)
+        {
+            return Err(());
+        }
+        grants.push(BrowserCallerGrant {
+            endpoint_ref: endpoint_ref.to_owned(),
+            provider: provider.to_owned(),
+            account_ref: account_ref.to_owned(),
+        });
+    }
+    Ok(grants)
+}
+
+fn trusted_edge_runtime_generation_fence(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
+    if !state.trusted_extension_ipc || !headers.contains_key(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER) {
+        return Ok(());
+    }
+    let expected = headers
+        .get(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .ok_or(())?;
+    match state.runtime_generation.as_deref() {
+        Some(current) if current == expected => Ok(()),
+        _ => Err(()),
+    }
+}
+
+fn valid_browser_grant_ref(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+}
+
+fn valid_browser_grant_provider(value: &str) -> bool {
+    if value.is_empty() || value.len() > 32 {
+        return false;
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        })
 }
 
 fn request_authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -2217,7 +2634,9 @@ mod tests {
             activity: McpActivityRegistry::default(),
             bearer_token: Arc::<[u8]>::from(b"test-token".to_vec()),
             trusted_extension_ipc: false,
+            runtime_generation: Some("rust-caller-grant-proof".to_owned()),
             local_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            browser_actuation: BrowserActuationBroker::default(),
         }
     }
 
@@ -2544,6 +2963,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn browser_actuation_result_is_trusted_ipc_only_and_correlated() {
+        let root = test_root("browser-actuation-route");
+        let request = |payload: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/extension/browser/actuation")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        };
+        let evidence = |actuation_id: &str| {
+            json!({
+                "actuation_id": actuation_id,
+                "observed_generation": 7,
+                "command_accepted": true,
+                "browser_online": true,
+                "resource_available": true,
+                "rejected": false,
+                "stable_resource_ref_observed": true,
+                "lifecycle_observed": true,
+                "canonical_url_observed": true,
+                "accepted_message_observed": true,
+                "message_baseline_advanced": false,
+                "reasoning_effort_readback": null,
+                "required_apps_readback": [],
+                "generation_owner": 7,
+                "generation_status_observed": true,
+                "generation_stopped": false
+            })
+        };
+
+        let tcp = candidate_router(test_state(&root.join("tcp")));
+        let response = tcp
+            .oneshot(request(evidence("ba_0000000000000001")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let mut extension_state = test_state(&root.join("extension"));
+        extension_state.trusted_extension_ipc = true;
+        let broker = extension_state.browser_actuation.clone();
+        assert!(broker.take_next_for_extension().is_none());
+        let broker_for_task = broker.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            broker_for_task.actuate(
+                "herdr_mcp.browser_dispatch.submit",
+                &json!({"session_ref":"br_test","message":"hello"}),
+                7,
+            )
+        });
+        let command = loop {
+            if let Some(command) = broker.take_next_for_extension() {
+                break command;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let actuation_id = command["actuation_id"].as_str().unwrap().to_owned();
+        let app = candidate_router(extension_state);
+        let response = app.oneshot(request(evidence(&actuation_id))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let observed = task.await.unwrap().unwrap();
+        assert!(observed.command_accepted);
+        assert!(observed.accepted_message_observed);
+        assert_eq!(observed.generation_owner, Some(7));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn bearer_check_is_exact() {
         let mut headers = HeaderMap::new();
@@ -2551,6 +3039,179 @@ mod tests {
         assert!(authorized(&headers, b"secret"));
         assert!(!authorized(&headers, b"other"));
         assert!(!authorized(&HeaderMap::new(), b"secret"));
+    }
+
+    #[test]
+    fn trusted_webchat_grant_generation_fence_is_predispatch_and_tcp_cannot_opt_in() {
+        let root = test_root("browser-grant-generation-fence");
+        let tcp_state = test_state(&root.join("tcp"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            EDGE_WEBCHAT_CONTROL_GRANTS_HEADER,
+            HeaderValue::from_static(
+                r#"[{"endpoint_ref":"be_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","provider":"chatgpt","account_ref":"br_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]"#,
+            ),
+        );
+        headers.insert(
+            EDGE_EXPECTED_RUNTIME_GENERATION_HEADER,
+            HeaderValue::from_static("rust-old"),
+        );
+        assert_eq!(
+            trusted_edge_runtime_generation_fence(&tcp_state, &headers),
+            Ok(()),
+            "ordinary TCP cannot activate the trusted generation-fence path"
+        );
+
+        let mut trusted_state = test_state(&root.join("trusted"));
+        trusted_state.trusted_extension_ipc = true;
+        trusted_state.runtime_generation = Some("rust-new".to_owned());
+        assert_eq!(
+            trusted_edge_runtime_generation_fence(&trusted_state, &headers),
+            Err(())
+        );
+        trusted_state.runtime_generation = Some("rust-old".to_owned());
+        assert_eq!(
+            trusted_edge_runtime_generation_fence(&trusted_state, &headers),
+            Ok(())
+        );
+        headers.remove(EDGE_EXPECTED_RUNTIME_GENERATION_HEADER);
+        assert_eq!(
+            trusted_edge_runtime_generation_fence(&trusted_state, &headers),
+            Err(()),
+            "grant-bearing trusted IPC without a reserved generation fails closed"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn workstation_bearer_does_not_become_webchat_control_grant() {
+        let root = test_root("browser-caller-grant-boundary");
+        let state = test_state(&root);
+        let (endpoint_ref, account_ref, session_ref) = {
+            let mut store = state.state_store.lock().unwrap();
+            let endpoint = store
+                .register_browser_endpoint(BrowserEndpointRegistrationInput {
+                    device_id: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    profile_seed: "caller-grant-boundary-profile",
+                    browser_family: "chrome",
+                    extension_version: "0.1.90",
+                    observed_at: 10,
+                })
+                .unwrap();
+            store
+                .observe_browser_provider(BrowserProviderObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    adapter_protocol_version: 1,
+                    observation_generation: 7,
+                    capabilities_json: r#"{"operations":["identity.inspect","session.inspect"]}"#,
+                    observed_at: 11,
+                })
+                .unwrap();
+            let account = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "account",
+                    parent_ref: None,
+                    native_identity: "native-account-hidden",
+                    display_label: Some("Work"),
+                    observation_generation: 7,
+                    observed_at: 12,
+                })
+                .unwrap();
+            let session = store
+                .observe_browser_resource(BrowserResourceObservationInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    provider: "chatgpt",
+                    kind: "session",
+                    parent_ref: Some(&account.resource_ref),
+                    native_identity: "native-session-hidden",
+                    display_label: Some("Conversation"),
+                    observation_generation: 7,
+                    observed_at: 13,
+                })
+                .unwrap();
+            store
+                .set_browser_endpoint_consent(BrowserEndpointConsentInput {
+                    endpoint_ref: &endpoint.endpoint_ref,
+                    expected_revision: 0,
+                    webchat_control_allowed: true,
+                    tool_bridge_allowed: false,
+                    tool_bridge_mutation_allowed: false,
+                    observed_at: 14,
+                })
+                .unwrap();
+            (
+                endpoint.endpoint_ref,
+                account.resource_ref,
+                session.resource_ref,
+            )
+        };
+
+        let grant_header = serde_json::to_string(&json!([{
+            "endpoint_ref": endpoint_ref,
+            "provider": "chatgpt",
+            "account_ref": account_ref,
+        }]))
+        .unwrap();
+        let body = json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"tools/call",
+            "params":{
+                "name":"herdr_call",
+                "arguments":{
+                    "method":"herdr_mcp.browser_session.inspect",
+                    "params": serde_json::to_string(&json!({"session_ref": session_ref})).unwrap()
+                }
+            }
+        });
+
+        let mut extension_state = state.clone();
+        extension_state.trusted_extension_ipc = true;
+        let tcp = candidate_router(state);
+        let spoofed_tcp = rpc_request(
+            Method::POST,
+            "/mcp",
+            Some(body.clone()),
+            &[(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER, grant_header.as_str())],
+        );
+        let response = tcp.oneshot(spoofed_tcp).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = payload["result"]["content"][0]["text"].as_str().unwrap();
+        let local: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(local["ok"], true);
+        assert_eq!(local["actuation_available"], false);
+        assert_eq!(local["actuation_reason"], "caller_grant_missing");
+        assert!(!local.to_string().contains("native-session-hidden"));
+
+        let trusted = candidate_router(extension_state);
+        let trusted_request = rpc_request(
+            Method::POST,
+            "/mcp",
+            Some(body),
+            &[
+                (EDGE_WEBCHAT_CONTROL_GRANTS_HEADER, grant_header.as_str()),
+                (
+                    EDGE_EXPECTED_RUNTIME_GENERATION_HEADER,
+                    "rust-caller-grant-proof",
+                ),
+            ],
+        );
+        let response = trusted.oneshot(trusted_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        let text = payload["result"]["content"][0]["text"].as_str().unwrap();
+        let local: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(local["ok"], true);
+        assert_eq!(local["actuation_available"], true);
+        assert!(local["actuation_reason"].is_null());
+        assert!(!local.to_string().contains("native-session-hidden"));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
@@ -2662,6 +3323,8 @@ mod tests {
             statuses: HashMap::new(),
             first: false,
             last_heartbeat: Instant::now(),
+            browser_actuation: BrowserActuationBroker::default(),
+            trusted_extension_ipc: false,
         };
         let working = json!({
             "agent":"pi","pane":"w1:p1","status":"working","workspace":"w1"
