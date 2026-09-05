@@ -25,6 +25,11 @@ pub const WORK_MEMORY_APPEND_EVIDENCE_METHOD: &str = "work_memory.append_evidenc
 pub const WORK_MEMORY_CHECKPOINT_PUT_METHOD: &str = "work_memory.checkpoint.put";
 pub const WORK_MEMORY_RESUME_METHOD: &str = "work_memory.resume";
 pub const WORK_MEMORY_SEARCH_METHOD: &str = "work_memory.search";
+pub const BROWSER_ENDPOINT_LIST_METHOD: &str = "herdr_mcp.browser_endpoint.list";
+pub const BROWSER_ENDPOINT_INSPECT_METHOD: &str = "herdr_mcp.browser_endpoint.inspect";
+pub const BROWSER_RESOURCE_LIST_METHOD: &str = "herdr_mcp.browser_resource.list";
+pub const BROWSER_RESOURCE_INSPECT_METHOD: &str = "herdr_mcp.browser_resource.inspect";
+pub const BROWSER_RESOURCE_RESOLVE_METHOD: &str = "herdr_mcp.browser_resource.resolve";
 
 pub fn local_method_schemas(query: &str) -> Vec<Value> {
     let schemas = vec![
@@ -242,6 +247,80 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                 },
                 "required": ["project_ref", "repo_id", "work_chain_id", "query"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_ENDPOINT_LIST_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 64},
+                },
+                "required": [],
+                "empty": true,
+            },
+        }),
+        json!({
+            "method": BROWSER_ENDPOINT_INSPECT_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "endpoint_ref": {"type": "string", "maxLength": 96},
+                },
+                "required": ["endpoint_ref"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_RESOURCE_LIST_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "endpoint_ref": {"type": ["string", "null"], "maxLength": 96},
+                    "provider": {"type": ["string", "null"], "maxLength": 32},
+                    "kind": {"type": ["string", "null"], "enum": ["account", "space", "session", null]},
+                    "parent_ref": {"type": ["string", "null"], "maxLength": 96},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 64},
+                },
+                "required": [],
+                "empty": true,
+            },
+        }),
+        json!({
+            "method": BROWSER_RESOURCE_INSPECT_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "resource_ref": {"type": "string", "maxLength": 96},
+                },
+                "required": ["resource_ref"],
+                "empty": false,
+            },
+        }),
+        json!({
+            "method": BROWSER_RESOURCE_RESOLVE_METHOD,
+            "source": "herdr_mcp_local",
+            "schema_version": 1,
+            "access": "read_only",
+            "params": {
+                "properties": {
+                    "endpoint_ref": {"type": "string", "maxLength": 96},
+                    "provider": {"type": "string", "maxLength": 32},
+                    "kind": {"type": "string", "enum": ["account", "space", "session"]},
+                    "parent_ref": {"type": ["string", "null"], "maxLength": 96},
+                    "display_label": {"type": ["string", "null"], "maxLength": 256},
+                    "expected_observation_generation": {"type": ["integer", "null"], "minimum": 1},
+                },
+                "required": ["endpoint_ref", "provider", "kind"],
                 "empty": false,
             },
         }),
@@ -2046,6 +2125,19 @@ mod tests {
             json!(["project_ref", "repo_id", "work_chain_id"])
         );
         assert_eq!(methods[5]["method"], WORK_MEMORY_SEARCH_METHOD);
+
+        let methods = local_method_schemas("herdr_mcp.browser_");
+        assert_eq!(methods.len(), 5);
+        assert_eq!(methods[0]["method"], BROWSER_ENDPOINT_LIST_METHOD);
+        assert_eq!(methods[1]["method"], BROWSER_ENDPOINT_INSPECT_METHOD);
+        assert_eq!(methods[2]["method"], BROWSER_RESOURCE_LIST_METHOD);
+        assert_eq!(methods[3]["method"], BROWSER_RESOURCE_INSPECT_METHOD);
+        assert_eq!(methods[4]["method"], BROWSER_RESOURCE_RESOLVE_METHOD);
+        assert!(methods.iter().all(|method| method["access"] == "read_only"));
+        assert!(methods.iter().all(|method| {
+            let name = method["method"].as_str().unwrap();
+            !name.contains("consent") && !name.contains("observe") && !name.contains("register")
+        }));
     }
 
     #[test]

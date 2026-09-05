@@ -730,3 +730,59 @@ test("JSON-RPC request validation and method errors preserve ids", async () => {
   assert.equal(notification.status, 204);
   assert.equal(notification.body, null);
 });
+
+test("browser private methods require explicit enrolled device selector before forwarding", async () => {
+  const d = deps({
+    resolveDevice: async (selector) => {
+      if (selector === "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV") {
+        return { ok: true, device_id: selector, workstation_id: "w-target", routing_reason: "explicit_device_selector" };
+      }
+      return { ok: false, code: "device_not_found" };
+    },
+  });
+
+  // Missing device selector fails before forward
+  for (const method of ["herdr_mcp.browser_endpoint.list", "herdr_mcp.browser_resource.resolve"]) {
+    const missing = await handleMcp(
+      req(1, "tools/call", { name: "herdr_call", arguments: { method, params: JSON.stringify({ limit: 10 }) } }),
+      "w1",
+      d.value,
+    );
+    assert.equal(missing.body.result.isError, true);
+    assert.equal(missing.body.result.structuredContent.ok, false);
+    assert.equal(missing.body.result.structuredContent.code, "device_required");
+    assert.equal(missing.body.result.structuredContent.delivery_state, "not_delivered");
+    assert.equal(missing.body.result.structuredContent.failure_layer, "edge_routing");
+    assert.equal(d.calls.length, 0, "no request forwarded to workstation when device is missing");
+  }
+
+  // Empty string device selector fails before forward
+  const emptyDevice = await handleMcp(
+    req(2, "tools/call", { name: "herdr_call", arguments: { method: "herdr_mcp.browser_endpoint.list", device: "  " } }),
+    "w1",
+    d.value,
+  );
+  assert.equal(emptyDevice.body.result.isError, true);
+  assert.equal(emptyDevice.body.result.structuredContent.code, "device_required");
+  assert.equal(d.calls.length, 0);
+
+  // Explicit non-empty device selector succeeds and forwards to the resolved workstation
+  const explicit = await handleMcp(
+    req(3, "tools/call", {
+      name: "herdr_call",
+      arguments: {
+        method: "herdr_mcp.browser_endpoint.list",
+        device: "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        params: JSON.stringify({ limit: 5 }),
+      },
+    }),
+    "w1",
+    d.value,
+  );
+  assert.equal(explicit.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1, "request forwarded to workstation");
+  assert.equal(d.targets[0], "w-target");
+  assert.equal(d.calls[0].op, "herdr_call");
+  assert.equal(d.calls[0].args.method, "herdr_mcp.browser_endpoint.list");
+  assert.equal(d.calls[0].args.device, undefined, "device selector stripped by unwrapDeviceRefs");
+});
