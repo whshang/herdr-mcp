@@ -4558,17 +4558,22 @@ mod tests {
         let (root, paths) = fixture();
         install(&paths).unwrap();
         let lock_path = paths.mutation_lock.clone();
+        let ready_path = root.join("flock-ready");
         // Spawn a child that holds the same lock file via flock (python).
-        // Use python's fcntl.flock which maps to flock(2) on macOS.
+        // Use python's fcntl.flock which maps to flock(2) on macOS. The child
+        // publishes a fixture-only readiness marker after acquiring the lock so
+        // the assertion cannot race a loaded full-suite scheduler.
         let child = std::process::Command::new("python3")
             .arg("-c")
             .arg(
                 "import fcntl, sys, time; \
                  f=open(sys.argv[1], 'a'); \
                  fcntl.flock(f, fcntl.LOCK_EX); \
+                 open(sys.argv[2], 'w').write('locked'); \
                  time.sleep(3)",
             )
             .arg(lock_path.to_string_lossy().to_string())
+            .arg(ready_path.to_string_lossy().to_string())
             .spawn();
         let child = match child {
             Ok(c) => c,
@@ -4578,8 +4583,14 @@ mod tests {
                 return;
             }
         };
-        // Give child time to acquire flock.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let ready_deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while !ready_path.exists() && Instant::now() < ready_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            ready_path.exists(),
+            "child did not signal flock acquisition before the fixture deadline"
+        );
         let start = Instant::now();
         let err = NativeHostMutationLock::acquire(&paths).unwrap_err();
         let elapsed = start.elapsed();

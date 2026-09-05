@@ -8,6 +8,7 @@ import {
 export interface OAuthMcpAuthEnv {
   DEV_MCP_BEARER_SECRET?: string;
   STATIC_MCP_BEARER_SECRET?: string;
+  STATIC_MCP_BEARER_EXPIRES_AT_MS?: string;
   OAUTH_ISSUER?: string;
   OAUTH_JWT_PUBLIC_PEM?: string;
 }
@@ -91,8 +92,15 @@ export async function authenticateMcpRequest(
   const dev = authenticateStaticMcpBearer(request, env.DEV_MCP_BEARER_SECRET);
   if (dev.ok) return { ok: true, source: "dev_bearer" };
 
-  const staticBearer = authenticateStaticMcpBearer(request, env.STATIC_MCP_BEARER_SECRET);
-  if (staticBearer.ok) return { ok: true, source: "static_bearer" };
+  const staticExpiryRaw = env.STATIC_MCP_BEARER_EXPIRES_AT_MS?.trim();
+  const staticExpiry = staticExpiryRaw ? Number(staticExpiryRaw) : undefined;
+  const staticBearerActive = staticExpiry === undefined
+    ? true
+    : Number.isSafeInteger(staticExpiry) && staticExpiry > Date.now();
+  if (staticBearerActive) {
+    const staticBearer = authenticateStaticMcpBearer(request, env.STATIC_MCP_BEARER_SECRET);
+    if (staticBearer.ok) return { ok: true, source: "static_bearer" };
+  }
 
   const token = presentedBearer(request);
   if (!token) return { ok: false, code: "mcp_auth_failed" };

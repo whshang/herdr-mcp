@@ -75,6 +75,7 @@ mod user_cli;
 mod utility_exec;
 mod web_artifact_cache;
 mod worker;
+mod worker_bootstrap;
 mod workstation;
 
 use std::process::ExitCode;
