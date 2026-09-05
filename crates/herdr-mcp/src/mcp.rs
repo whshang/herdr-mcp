@@ -52,6 +52,7 @@ pub struct RuntimeContext<'a> {
     pub state_store: &'a std::sync::Arc<std::sync::Mutex<StateStore>>,
     pub caller_webchat_control_grants: &'a [BrowserCallerGrant],
     pub browser_actuator: Option<&'a dyn BrowserActuator>,
+    pub browser_mutation_gate: Option<&'a std::sync::Mutex<()>>,
 }
 
 pub trait BrowserActuator: Send + Sync {
@@ -219,6 +220,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
                     &params,
                     context.caller_webchat_control_grants,
                     context.browser_actuator,
+                    context.browser_mutation_gate,
                 )
             } else if method.starts_with("herdr_mcp.browser_endpoint.")
                 || method.starts_with("herdr_mcp.browser_resource.")
@@ -1460,7 +1462,7 @@ fn browser_operation_call(
     method: &str,
     params: &Value,
 ) -> Value {
-    browser_operation_call_with_grants(store, method, params, &[], None)
+    browser_operation_call_with_grants(store, method, params, &[], None, None)
 }
 
 #[cfg(test)]
@@ -1495,7 +1497,15 @@ fn browser_operation_call_with_grant(
     } else {
         Vec::new()
     };
-    browser_operation_call_with_grants(store, method, params, &grants, browser_actuator)
+    browser_operation_call_with_grants(store, method, params, &grants, browser_actuator, None)
+}
+
+fn browser_operation_alpha4_supported(operation: BrowserOperation, params: &Value) -> bool {
+    if operation != BrowserOperation::DispatchSubmit {
+        return !operation.is_mutation();
+    }
+    params.get("reasoning_effort").is_none_or(Value::is_null)
+        && browser_required_apps(params, true).is_ok_and(|apps| apps.is_empty())
 }
 
 fn browser_operation_call_with_grants(
@@ -1504,6 +1514,7 @@ fn browser_operation_call_with_grants(
     params: &Value,
     caller_webchat_control_grants: &[BrowserCallerGrant],
     browser_actuator: Option<&dyn BrowserActuator>,
+    browser_mutation_gate: Option<&std::sync::Mutex<()>>,
 ) -> Value {
     let Some(operation) = BrowserOperation::parse(method) else {
         return json!({"ok": false, "code": "unknown_local_method", "method": method});
@@ -1518,17 +1529,55 @@ fn browser_operation_call_with_grants(
         return error;
     }
 
+    // Serialize the authorization decision through browser actuation against
+    // trusted local consent changes. If consent-off wins this lock, the mutation
+    // observes it below; if the mutation wins, that already-authorized attempt
+    // completes before the consent revision may change.
+    let _mutation_gate = if operation.is_mutation() {
+        match browser_mutation_gate {
+            Some(gate) => match gate.lock() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    return json!({
+                        "ok": false,
+                        "code": "browser_mutation_gate_unavailable",
+                    });
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
     if operation.is_mutation() {
         let Ok(store_guard) = store.lock() else {
             return json!({"ok": false, "code": "browser_operation_store_unavailable"});
         };
+        let alpha4_supported = browser_operation_alpha4_supported(operation, params);
         match browser_operation_actuation_decision(
             &store_guard,
             operation,
             params,
             caller_webchat_control_grants,
         ) {
-            Ok((true, None)) => {}
+            Ok((true, None)) if alpha4_supported => {}
+            Ok((true, None)) => {
+                return json!({
+                    "ok": false,
+                    "code": "unsupported",
+                    "operation": operation.method(),
+                    "actuation_available": false,
+                });
+            }
+            Ok((false, Some("capability_not_allowed"))) if !alpha4_supported => {
+                return json!({
+                    "ok": false,
+                    "code": "unsupported",
+                    "operation": operation.method(),
+                    "actuation_available": false,
+                });
+            }
             Ok((false, Some(reason))) => {
                 return json!({
                     "ok": false,
@@ -1602,14 +1651,25 @@ fn browser_operation_call_with_grants(
                 Ok(state) => state,
                 Err(error) => return browser_store_error(error),
             };
-            json!({
-                "ok": false,
-                "code": delivery_state.as_str(),
-                "operation": operation.method(),
-                "delivery_state": delivery_state.as_str(),
-            })
+            browser_operation_delivery_result(operation, delivery_state)
         }
     }
+}
+
+fn browser_operation_delivery_result(
+    operation: BrowserOperation,
+    delivery_state: BrowserDeliveryState,
+) -> Value {
+    let success = matches!(
+        delivery_state,
+        BrowserDeliveryState::Applied | BrowserDeliveryState::Stopped
+    );
+    json!({
+        "ok": success,
+        "code": if success { Value::Null } else { json!(delivery_state.as_str()) },
+        "operation": operation.method(),
+        "delivery_state": delivery_state.as_str(),
+    })
 }
 
 fn validate_browser_operation_params(
@@ -3619,6 +3679,32 @@ mod tests {
     }
 
     #[test]
+    fn browser_operation_result_reports_only_proven_terminal_success() {
+        let applied = browser_operation_delivery_result(
+            BrowserOperation::MessageAppend,
+            BrowserDeliveryState::Applied,
+        );
+        assert_eq!(applied["ok"], true);
+        assert!(applied["code"].is_null());
+        assert_eq!(applied["delivery_state"], "applied");
+
+        let stopped = browser_operation_delivery_result(
+            BrowserOperation::DispatchStop,
+            BrowserDeliveryState::Stopped,
+        );
+        assert_eq!(stopped["ok"], true);
+        assert!(stopped["code"].is_null());
+        assert_eq!(stopped["delivery_state"], "stopped");
+
+        let uncertain = browser_operation_delivery_result(
+            BrowserOperation::MessageAppend,
+            BrowserDeliveryState::Uncertain,
+        );
+        assert_eq!(uncertain["ok"], false);
+        assert_eq!(uncertain["code"], "uncertain");
+    }
+
+    #[test]
     fn browser_dispatch_gateway_persists_terminal_attempt_and_never_replays_actuation() {
         use crate::state_store::{
             BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
@@ -4029,6 +4115,123 @@ mod tests {
     }
 
     #[test]
+    fn alpha4_browser_mutation_support_matrix_is_frozen() {
+        let cases = [
+            (
+                "herdr_mcp.browser_space.create",
+                json!({
+                    "endpoint_ref": "be_alpha4",
+                    "provider": "chatgpt",
+                    "account_ref": "br_account",
+                    "display_label": "Project",
+                    "expected_generation": 7,
+                    "idempotency_key": "unsupported-space-create"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_space.open",
+                json!({
+                    "space_ref": "br_space",
+                    "expected_generation": 7,
+                    "idempotency_key": "unsupported-space-open"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_session.create",
+                json!({
+                    "endpoint_ref": "be_alpha4",
+                    "provider": "chatgpt",
+                    "account_ref": "br_account",
+                    "display_label": "Conversation",
+                    "expected_generation": 7,
+                    "idempotency_key": "unsupported-session-create"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_session.open",
+                json!({
+                    "session_ref": "br_session",
+                    "expected_generation": 7,
+                    "idempotency_key": "unsupported-session-open"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_message.append",
+                json!({
+                    "session_ref": "br_session",
+                    "message": "append without submit",
+                    "expected_generation": 7,
+                    "idempotency_key": "unsupported-message-append"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_composer.set_reasoning",
+                json!({
+                    "session_ref": "br_session",
+                    "reasoning_effort": "balanced",
+                    "expected_generation": 7,
+                    "idempotency_key": "unsupported-reasoning"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_composer.set_apps",
+                json!({
+                    "session_ref": "br_session",
+                    "required_apps": ["herdr"],
+                    "expected_generation": 7,
+                    "idempotency_key": "unsupported-apps"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_dispatch.stop",
+                json!({
+                    "dispatch_id": "bd_alpha4",
+                    "expected_generation": 7,
+                    "idempotency_key": "unsupported-stop"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_dispatch.submit",
+                json!({
+                    "session_ref": "br_session",
+                    "message": "submit with reasoning",
+                    "reasoning_effort": "balanced",
+                    "expected_generation": 7,
+                    "idempotency_key": "unsupported-submit-reasoning"
+                }),
+            ),
+            (
+                "herdr_mcp.browser_dispatch.submit",
+                json!({
+                    "session_ref": "br_session",
+                    "message": "submit with app",
+                    "required_apps": ["herdr"],
+                    "expected_generation": 7,
+                    "idempotency_key": "unsupported-submit-apps"
+                }),
+            ),
+        ];
+
+        for (method, params) in cases {
+            let operation = BrowserOperation::parse(method).unwrap();
+            assert!(
+                !browser_operation_alpha4_supported(operation, &params),
+                "method={method} must stay explicit unsupported in Alpha 4"
+            );
+        }
+
+        assert!(browser_operation_alpha4_supported(
+            BrowserOperation::DispatchSubmit,
+            &json!({
+                "session_ref": "br_session",
+                "message": "plain dispatch",
+                "expected_generation": 7,
+                "idempotency_key": "supported-plain-dispatch"
+            })
+        ));
+    }
+
+    #[test]
     fn browser_actuation_intersection_fails_closed_with_stable_reasons() {
         use crate::state_store::{
             BrowserEndpointConsentInput, BrowserEndpointRegistrationInput,
@@ -4156,6 +4359,7 @@ mod tests {
             &dispatch_params,
             &wrong_account_grants,
             None,
+            None,
         );
         assert_eq!(wrong_account["code"], "caller_grant_missing");
 
@@ -4170,10 +4374,54 @@ mod tests {
             &json!({"session_ref": session_ref}),
             &exact_grants,
             None,
+            None,
         );
         assert_eq!(inspect["ok"], true);
         assert_eq!(inspect["actuation_available"], true);
         assert!(inspect["actuation_reason"].is_null());
+
+        struct GateProbeActuator<'a> {
+            gate: &'a Mutex<()>,
+        }
+        impl BrowserActuator for GateProbeActuator<'_> {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                expected_generation: i64,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                assert!(
+                    self.gate.try_lock().is_err(),
+                    "the consent/mutation gate must remain held through browser actuation"
+                );
+                Ok(BrowserPostconditionEvidence::resource_unavailable(
+                    expected_generation,
+                ))
+            }
+        }
+        struct PanicActuator;
+        impl BrowserActuator for PanicActuator {
+            fn actuate(
+                &self,
+                _operation: &str,
+                _params: &Value,
+                _expected_generation: i64,
+            ) -> Result<BrowserPostconditionEvidence, String> {
+                panic!("explicit unsupported mutations must not reach browser actuation")
+            }
+        }
+        let mutation_gate = Mutex::new(());
+        let gated_attempt = browser_operation_call_with_grants(
+            &store,
+            "herdr_mcp.browser_dispatch.submit",
+            &dispatch_params,
+            &exact_grants,
+            Some(&GateProbeActuator {
+                gate: &mutation_gate,
+            }),
+            Some(&mutation_gate),
+        );
+        assert_eq!(gated_attempt["code"], "resource_unavailable");
 
         let all_factors_true = browser_operation_call_with_grant(
             &store,
@@ -4195,12 +4443,9 @@ mod tests {
                 "idempotency_key": "actuation-dispatch-reasoning-1"
             }),
             true,
-            None,
+            Some(&PanicActuator),
         );
-        assert_eq!(
-            dispatch_reasoning_not_allowed["code"],
-            "capability_not_allowed"
-        );
+        assert_eq!(dispatch_reasoning_not_allowed["code"], "unsupported");
 
         let dispatch_apps_not_allowed = browser_operation_call_with_grant(
             &store,
@@ -4213,11 +4458,11 @@ mod tests {
                 "idempotency_key": "actuation-dispatch-app-1"
             }),
             true,
-            None,
+            Some(&PanicActuator),
         );
-        assert_eq!(dispatch_apps_not_allowed["code"], "capability_not_allowed");
+        assert_eq!(dispatch_apps_not_allowed["code"], "unsupported");
 
-        let capability_not_allowed = browser_operation_call_with_grant(
+        let unsupported_reasoning = browser_operation_call_with_grant(
             &store,
             "herdr_mcp.browser_composer.set_reasoning",
             &json!({
@@ -4227,9 +4472,9 @@ mod tests {
                 "idempotency_key": "actuation-reasoning-1"
             }),
             true,
-            None,
+            Some(&PanicActuator),
         );
-        assert_eq!(capability_not_allowed["code"], "capability_not_allowed");
+        assert_eq!(unsupported_reasoning["code"], "unsupported");
 
         let unknown_resource_ref = format!("br_{}", "f".repeat(64));
         let unknown_resource = BrowserResourceRecord {

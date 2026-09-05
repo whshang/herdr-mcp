@@ -346,6 +346,7 @@ struct AppState {
     runtime_generation: Option<String>,
     local_device_id: Option<String>,
     browser_actuation: BrowserActuationBroker,
+    browser_mutation_gate: Arc<Mutex<()>>,
 }
 
 pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
@@ -414,6 +415,7 @@ pub fn serve_candidate(port: u16) -> Result<ExitCode, String> {
                 .filter(|value| !value.is_empty()),
             local_device_id,
             browser_actuation: BrowserActuationBroker::default(),
+            browser_mutation_gate: Arc::new(Mutex::new(())),
         };
         let app = candidate_router(state.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -768,6 +770,10 @@ fn extension_browser_endpoint_consent(
     let tool_bridge_allowed = browser_registry_bool(payload, "tool_bridge_allowed")?;
     let tool_bridge_mutation_allowed =
         browser_registry_bool(payload, "tool_bridge_mutation_allowed")?;
+    let _mutation_gate = state
+        .browser_mutation_gate
+        .lock()
+        .map_err(|_| "browser_mutation_gate_unavailable".to_owned())?;
     let mut store = state
         .state_store
         .lock()
@@ -2117,6 +2123,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             // authority is admitted exclusively from the trusted Unix IPC handoff above.
             caller_webchat_control_grants: &caller_webchat_control_grants,
             browser_actuator: Some(&blocking_state.browser_actuation),
+            browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
         };
         mcp::handle(&blocking_request, &context)
     })
@@ -2637,7 +2644,65 @@ mod tests {
             runtime_generation: Some("rust-caller-grant-proof".to_owned()),
             local_device_id: Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
             browser_actuation: BrowserActuationBroker::default(),
+            browser_mutation_gate: Arc::new(Mutex::new(())),
         }
+    }
+
+    #[test]
+    fn extension_consent_serializes_with_browser_mutation_gate() {
+        let root = test_root("browser-consent-mutation-gate");
+        let mut state = test_state(&root);
+        state.trusted_extension_ipc = true;
+        let profile_seed = "alpha4-consent-mutation-gate-profile";
+        let registered = extension_browser_endpoint_register(
+            &state,
+            &json!({
+                "profile_seed": profile_seed,
+                "browser_family": "chrome",
+                "extension_version": "0.1.90"
+            }),
+            10,
+        )
+        .unwrap();
+        let endpoint_ref = registered["endpoint"]["endpoint_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let payload = json!({
+            "profile_seed": profile_seed,
+            "endpoint_ref": endpoint_ref,
+            "expected_consent_revision": 0,
+            "webchat_control_allowed": false,
+            "tool_bridge_allowed": false,
+            "tool_bridge_mutation_allowed": false
+        });
+
+        let gate_guard = state.browser_mutation_gate.lock().unwrap();
+        let worker_state = state.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(extension_browser_endpoint_consent(
+                &worker_state,
+                &payload,
+                11,
+            ))
+            .unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "trusted consent mutation must wait while browser actuation owns the gate"
+        );
+        drop(gate_guard);
+
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("consent mutation resumes after actuation gate release")
+            .unwrap();
+        assert_eq!(result["endpoint"]["consent"]["webchat_control"], false);
+        assert_eq!(result["endpoint"]["consent_revision"], 1);
+        worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn rpc_request(
