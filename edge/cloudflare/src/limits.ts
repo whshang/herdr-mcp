@@ -33,8 +33,12 @@ export const MAX_REQUEST_TIMEOUT_MS = 60_000;
 
 /** Link presence: after this long with no hello/heartbeat the link is stale. */
 export const DEFAULT_LINK_STALE_AFTER_MS = 45_000;
-/** Brief request-side grace for a workstation that was connected moments ago. */
-export const DEFAULT_LINK_RECONNECT_GRACE_MS = 2_000;
+/**
+ * Request-side grace for a workstation that was connected moments ago.
+ * Rust Link allows a 10 s WebSocket handshake plus bounded reconnect jitter;
+ * keep this below the 30 s request budget while covering one full handshake.
+ */
+export const DEFAULT_LINK_RECONNECT_GRACE_MS = 15_000;
 
 /**
  * Persist `last_seen` only as a low-frequency recovery checkpoint. Live
