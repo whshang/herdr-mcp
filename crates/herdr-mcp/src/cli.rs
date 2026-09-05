@@ -5,6 +5,7 @@ pub enum HelpSection {
     Connector,
     Automation,
     Instance,
+    Qualification,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -26,6 +27,7 @@ pub enum Command {
     },
     Config(ConfigCommand),
     Instance(InstanceCommand),
+    Qualification(QualificationCommand),
     Worker(WorkerCommand),
     Dev(DevCommand),
     Candidate {
@@ -134,6 +136,13 @@ pub enum WorkerCommand {
 pub enum InstanceCommand {
     List,
     Reap { name: String },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum QualificationCommand {
+    Lock,
+    Unlock,
+    Status,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -285,6 +294,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "reinstall" => no_extra(args, Command::Reinstall),
         "config" => parse_config(&args[1..]),
         "instance" => parse_instance(&args[1..]),
+        "qualification" => parse_qualification(&args[1..]),
         "worker" => parse_worker(&args[1..]),
         "device" => parse_device_alias(&args[1..]),
         "connector" => parse_connector(&args[1..]),
@@ -327,6 +337,25 @@ fn parse_instance(args: &[String]) -> Result<Command, String> {
             "unknown instance command '{value}' (expected list or reap)"
         )),
         None => Err("instance requires list or reap".to_owned()),
+    }
+}
+
+fn parse_qualification(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
+        Some("--help" | "-h") => Ok(Command::Help {
+            section: HelpSection::Qualification,
+        }),
+        Some("lock") if args.len() == 1 => Ok(Command::Qualification(QualificationCommand::Lock)),
+        Some("unlock") if args.len() == 1 => {
+            Ok(Command::Qualification(QualificationCommand::Unlock))
+        }
+        Some("status") if args.len() == 1 => {
+            Ok(Command::Qualification(QualificationCommand::Status))
+        }
+        Some(value) => Err(format!(
+            "unknown qualification command '{value}' (expected lock, unlock, or status)"
+        )),
+        None => Err("qualification requires lock, unlock, or status".to_owned()),
     }
 }
 
@@ -1276,6 +1305,7 @@ User path:\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp instance list  (default + named instance inventory; default is read-only)\n\
   herdr-mcp instance reap <name> --confirm  (ownership-checked named-instance uninstall; never default)\n\
+  herdr-mcp qualification <lock|unlock|status>  (hold the runtime generation during release qualification)\n\
   herdr-mcp worker pair [--ttl-seconds 600] [--name NAME]  (macOS enrolled device only; creates pairing for another computer)\n\
   herdr-mcp worker connect <pairing-address> [--name NAME]  (macOS only; requires Keychain, reads the 6-digit code as visible interactive terminal input (or one stdin line), never argv)\n\
   herdr-mcp device list  (non-secret enrolled-device inventory; worker list is an alias)\n\
@@ -1363,6 +1393,11 @@ pub fn instance_help() -> &'static str {
     "Herdr MCP validation instance management\n\n\
 The default production instance is shown for comparison but is read-only and\ncan never be reaped. Only named validation instances are cleanup targets.\n\n\
   herdr-mcp instance list\n      Lists the default plus recognized named instances with label, port, config\n      root, artifact age, loaded/running state, pid, and orphan state.\n\n  herdr-mcp instance reap <name> --confirm\n      Runs the existing ownership-checked product uninstall for exactly one\n      named instance. It never targets ~/.config/herdr-mcp or runtime releases.\n"
+}
+
+pub fn qualification_help() -> &'static str {
+    "Herdr MCP release qualification generation lock\n\n\
+  herdr-mcp qualification lock\n      Holds the current runtime generation. Auto-update and service generation\n      replacement fail closed until the lock is removed.\n\n  herdr-mcp qualification status\n      Shows whether the local qualification lock is active.\n\n  herdr-mcp qualification unlock\n      Releases the qualification lock and restores normal generation changes.\n"
 }
 
 #[cfg(test)]
@@ -2179,6 +2214,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_qualification_generation_lock_commands() {
+        assert_eq!(
+            parse(args(&["qualification", "lock"])).unwrap().command,
+            Command::Qualification(QualificationCommand::Lock)
+        );
+        assert_eq!(
+            parse(args(&["qualification", "status"])).unwrap().command,
+            Command::Qualification(QualificationCommand::Status)
+        );
+        assert_eq!(
+            parse(args(&["qualification", "unlock"])).unwrap().command,
+            Command::Qualification(QualificationCommand::Unlock)
+        );
+        assert_eq!(
+            parse(args(&["qualification", "--help"])).unwrap().command,
+            Command::Help {
+                section: HelpSection::Qualification,
+            }
+        );
+        assert!(parse(args(&["qualification"])).is_err());
+        assert!(parse(args(&["qualification", "pause"])).is_err());
+    }
+
+    #[test]
     fn help_documents_user_path_ahead_of_service() {
         let text = help();
         for needle in [
@@ -2188,6 +2247,7 @@ mod tests {
             "herdr-mcp permissions",
             "herdr-mcp scan",
             "herdr-mcp instance list",
+            "herdr-mcp qualification <lock|unlock|status>",
             "herdr-mcp connector list",
             "herdr-mcp connector approve",
             "herdr-mcp connector revoke",

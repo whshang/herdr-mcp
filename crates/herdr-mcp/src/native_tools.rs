@@ -6,6 +6,7 @@ use crate::runtime_meta;
 use crate::schema::{self, MethodSchema, ValidationIssue};
 use crate::skill::SkillService;
 use crate::state_cache::{DigestSnapshot, EventCache};
+use crate::state_store::GenerationTransitionRecord;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
@@ -20,10 +21,22 @@ pub fn inspect(
     view
 }
 
-pub fn since(cache: &EventCache, cursor: u64, workspace: Option<&str>) -> Value {
+pub fn since(
+    cache: &EventCache,
+    cursor: u64,
+    workspace: Option<&str>,
+    transition: Result<Option<GenerationTransitionRecord>, String>,
+) -> Value {
     let digest = cache.digest_since(cursor);
     let visibility = AgentVisibility::from_env();
-    since_result(cache.boot_id(), cursor, digest, workspace, &visibility)
+    since_result(
+        cache.boot_id(),
+        cursor,
+        digest,
+        workspace,
+        &visibility,
+        transition,
+    )
 }
 
 pub fn methods(query: &str) -> Value {
@@ -154,6 +167,7 @@ fn since_result(
     digest: DigestSnapshot,
     workspace: Option<&str>,
     visibility: &AgentVisibility,
+    transition: Result<Option<GenerationTransitionRecord>, String>,
 ) -> Value {
     let mut events = digest.events;
     let mut agents = digest.agents;
@@ -222,10 +236,41 @@ fn since_result(
     );
     visibility.append_meta(&mut output, hidden);
     if cursor_reset {
-        output.insert(
-            "warnings".to_owned(),
-            json!(["cursor_reset_boot_or_rollover"]),
-        );
+        let current_generation = std::env::var("HERDR_MCP_RUNTIME_GENERATION").ok();
+        let started_at_ms = runtime_meta::runtime_started_at_ms();
+        match transition {
+            Ok(Some(record))
+                if record.new_generation.as_deref() == current_generation.as_deref()
+                    && record.timestamp_ms.abs_diff(started_at_ms) <= 120_000 =>
+            {
+                output.insert(
+                    "cursor_reset_reason".to_owned(),
+                    json!("runtime_generation_replaced"),
+                );
+                output.insert(
+                    "generation_transition".to_owned(),
+                    serde_json::to_value(record).unwrap_or(Value::Null),
+                );
+                output.insert(
+                    "warnings".to_owned(),
+                    json!(["cursor_reset_runtime_replaced"]),
+                );
+            }
+            Ok(_) => {
+                output.insert("cursor_reset_reason".to_owned(), json!("cursor_rollover"));
+                output.insert("warnings".to_owned(), json!(["cursor_reset_rollover"]));
+            }
+            Err(error) => {
+                output.insert(
+                    "cursor_reset_reason".to_owned(),
+                    json!("attribution_unavailable"),
+                );
+                output.insert(
+                    "warnings".to_owned(),
+                    json!([format!("cursor_reset_attribution_unavailable: {error}")]),
+                );
+            }
+        }
     }
     output.insert(
         "hint".to_owned(),
@@ -286,7 +331,7 @@ mod tests {
             ],
         };
         let visibility = AgentVisibility::Allow(["pi".to_owned()].into_iter().collect());
-        let result = since_result("boot", 99, digest, Some("one"), &visibility);
+        let result = since_result("boot", 99, digest, Some("one"), &visibility, Ok(None));
 
         assert_eq!(result["cursor"], 7);
         assert_eq!(result["cursor_reset"], true);
@@ -298,6 +343,55 @@ mod tests {
         assert_eq!(result["workspaces"].as_array().unwrap().len(), 1);
         assert_eq!(result["workspaces"][0]["workspace_id"], "w1");
         assert_eq!(result["agents_hidden"], 1);
-        assert_eq!(result["warnings"], json!(["cursor_reset_boot_or_rollover"]));
+        assert_eq!(result["cursor_reset_reason"], "cursor_rollover");
+        assert_eq!(result["warnings"], json!(["cursor_reset_rollover"]));
+    }
+
+    #[test]
+    fn since_attributes_cursor_reset_to_matching_runtime_generation_transition() {
+        let _guard = crate::test_env::lock();
+        let previous_generation = std::env::var_os("HERDR_MCP_RUNTIME_GENERATION");
+        unsafe { std::env::set_var("HERDR_MCP_RUNTIME_GENERATION", "rust-new") };
+        let started_at_ms = runtime_meta::runtime_started_at_ms();
+        let digest = DigestSnapshot {
+            cursor: 2,
+            events: Vec::new(),
+            agents: Vec::new(),
+            workspaces: Vec::new(),
+        };
+        let transition = GenerationTransitionRecord {
+            timestamp_ms: started_at_ms,
+            previous_generation: Some("rust-old".to_owned()),
+            new_generation: Some("rust-new".to_owned()),
+            previous_source_commit: Some("old-commit".to_owned()),
+            new_source_commit: Some("new-commit".to_owned()),
+            trigger: "dev_sync".to_owned(),
+        };
+        let result = since_result(
+            "boot-new",
+            99,
+            digest,
+            None,
+            &AgentVisibility::All,
+            Ok(Some(transition)),
+        );
+        assert_eq!(result["cursor_reset"], true);
+        assert_eq!(result["cursor_reset_reason"], "runtime_generation_replaced");
+        assert_eq!(
+            result["generation_transition"]["previous_generation"],
+            "rust-old"
+        );
+        assert_eq!(
+            result["generation_transition"]["new_generation"],
+            "rust-new"
+        );
+        assert_eq!(result["generation_transition"]["trigger"], "dev_sync");
+        assert_eq!(result["warnings"], json!(["cursor_reset_runtime_replaced"]));
+        unsafe {
+            match previous_generation {
+                Some(value) => std::env::set_var("HERDR_MCP_RUNTIME_GENERATION", value),
+                None => std::env::remove_var("HERDR_MCP_RUNTIME_GENERATION"),
+            }
+        }
     }
 }

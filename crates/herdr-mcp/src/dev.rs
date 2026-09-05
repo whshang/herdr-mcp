@@ -493,6 +493,7 @@ fn rollback() -> Result<ExitCode, String> {
         );
     }
 
+    unsafe { std::env::set_var("HERDR_MCP_GENERATION_TRIGGER", "dev_rollback") };
     let install_code = crate::service_lifecycle::run_install_from_payload(
         false,
         Path::new(&state.prod_snapshot_binary),
@@ -644,6 +645,7 @@ fn run_service_install(binary: &Path) -> Result<(), String> {
     let output = Command::new(binary)
         .args(["service", "install"])
         .env_remove("HERDR_MCP_EXEC_ID")
+        .env("HERDR_MCP_GENERATION_TRIGGER", "dev_sync")
         .output()
         .map_err(|error| format!("cannot execute transactional service install: {error}"))?;
     if !output.status.success() {
@@ -660,6 +662,8 @@ fn run_service_rollback(binary: &Path) -> Result<(), String> {
     let output = Command::new(binary)
         .args(["service", "rollback"])
         .env_remove("HERDR_MCP_EXEC_ID")
+        .env("HERDR_MCP_GENERATION_TRIGGER", "dev_sync_compensation")
+        .env("HERDR_MCP_INTERNAL_GENERATION_RECOVERY", "1")
         .output()
         .map_err(|error| format!("cannot execute transactional service rollback: {error}"))?;
     if !output.status.success() {

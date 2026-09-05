@@ -19,6 +19,7 @@
 #![allow(dead_code)]
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
@@ -1035,6 +1036,16 @@ pub struct RuntimeGenerationRecord {
     pub deactivated_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationTransitionRecord {
+    pub timestamp_ms: i64,
+    pub previous_generation: Option<String>,
+    pub new_generation: Option<String>,
+    pub previous_source_commit: Option<String>,
+    pub new_source_commit: Option<String>,
+    pub trigger: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceRollbackRecord {
     pub rollback_id: String,
@@ -1357,6 +1368,32 @@ impl StateStore {
         rollback_id: Option<&str>,
         now_ms: i64,
     ) -> Result<(), String> {
+        self.activate_runtime_generation_inner(generation_id, rollback_id, now_ms, None)
+    }
+
+    pub fn activate_runtime_generation_with_transition(
+        &mut self,
+        generation_id: &str,
+        rollback_id: Option<&str>,
+        now_ms: i64,
+        transition: &GenerationTransitionRecord,
+    ) -> Result<(), String> {
+        if transition.new_generation.as_deref() != Some(generation_id) {
+            return Err(format!(
+                "generation transition new_generation {:?} does not match activation {generation_id}",
+                transition.new_generation
+            ));
+        }
+        self.activate_runtime_generation_inner(generation_id, rollback_id, now_ms, Some(transition))
+    }
+
+    fn activate_runtime_generation_inner(
+        &mut self,
+        generation_id: &str,
+        rollback_id: Option<&str>,
+        now_ms: i64,
+        transition: Option<&GenerationTransitionRecord>,
+    ) -> Result<(), String> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1414,8 +1451,53 @@ impl StateStore {
                 ));
             }
         }
+        if let Some(transition) = transition {
+            let detail = serde_json::to_string(transition)
+                .map_err(|error| format!("cannot encode generation transition: {error}"))?;
+            if detail.len() > 512 {
+                return Err("generation transition detail exceeds service event bound".to_owned());
+            }
+            tx.execute(
+                "INSERT INTO service_events (action, outcome, generation_id, at, detail)
+                 VALUES ('generation_transition', 'committed', ?1, ?2, ?3)",
+                params![generation_id, transition.timestamp_ms, detail],
+            )
+            .map_err(|error| format!("cannot record generation transition: {error}"))?;
+        }
         tx.commit()
             .map_err(|error| format!("cannot commit generation activation: {error}"))
+    }
+
+    pub fn latest_generation_transition(
+        &self,
+    ) -> Result<Option<GenerationTransitionRecord>, String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT generation_id, at, detail
+                 FROM service_events
+                 WHERE action = 'generation_transition' AND outcome = 'committed'
+                 ORDER BY event_id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read latest generation transition: {error}"))?;
+        let Some((generation_id, at_ms, detail)) = row else {
+            return Ok(None);
+        };
+        let transition: GenerationTransitionRecord = serde_json::from_str(&detail)
+            .map_err(|error| format!("cannot decode latest generation transition: {error}"))?;
+        if transition.new_generation != generation_id || transition.timestamp_ms != at_ms {
+            return Err("generation transition event metadata is inconsistent".to_owned());
+        }
+        Ok(Some(transition))
     }
 
     pub fn active_runtime_generation(&self) -> Result<Option<RuntimeGenerationRecord>, String> {
@@ -1464,6 +1546,29 @@ impl StateStore {
                 params![action, outcome, generation_id, at_ms, detail],
             )
             .map_err(|error| format!("cannot record service event: {error}"))?;
+        Ok(())
+    }
+
+    pub fn record_generation_transition(
+        &self,
+        transition: &GenerationTransitionRecord,
+    ) -> Result<(), String> {
+        let detail = serde_json::to_string(transition)
+            .map_err(|error| format!("cannot encode generation transition: {error}"))?;
+        if detail.len() > 512 {
+            return Err("generation transition detail exceeds service event bound".to_owned());
+        }
+        self.conn
+            .execute(
+                "INSERT INTO service_events (action, outcome, generation_id, at, detail)
+                 VALUES ('generation_transition', 'committed', ?1, ?2, ?3)",
+                params![
+                    transition.new_generation.as_deref(),
+                    transition.timestamp_ms,
+                    detail
+                ],
+            )
+            .map_err(|error| format!("cannot record generation transition: {error}"))?;
         Ok(())
     }
 
@@ -2264,6 +2369,49 @@ mod tests {
                 )
                 .unwrap(),
             Some(512)
+        );
+    }
+
+    #[test]
+    fn generation_transition_is_committed_with_activation_and_round_trips_all_fields() {
+        let mut store = StateStore::open(":memory:").unwrap();
+        store
+            .stage_runtime_generation("rust-old", "/runtime/old", "sha-old", "install", 10)
+            .unwrap();
+        store
+            .stage_runtime_generation("rust-new", "/runtime/new", "sha-new", "dev-sync", 20)
+            .unwrap();
+        store.activate_runtime_generation("rust-old", 30).unwrap();
+        let transition = GenerationTransitionRecord {
+            timestamp_ms: 40,
+            previous_generation: Some("rust-old".to_owned()),
+            new_generation: Some("rust-new".to_owned()),
+            previous_source_commit: Some("old-commit".to_owned()),
+            new_source_commit: Some("new-commit".to_owned()),
+            trigger: "dev_sync".to_owned(),
+        };
+        store
+            .activate_runtime_generation_with_transition("rust-new", None, 40, &transition)
+            .unwrap();
+        assert_eq!(
+            store
+                .active_runtime_generation()
+                .unwrap()
+                .unwrap()
+                .generation_id,
+            "rust-new"
+        );
+        assert_eq!(
+            store.latest_generation_transition().unwrap(),
+            Some(transition)
+        );
+        assert_eq!(
+            store
+                .scalar_i64(
+                    "SELECT COUNT(*) FROM service_events WHERE action = 'generation_transition'"
+                )
+                .unwrap(),
+            Some(1)
         );
     }
 
