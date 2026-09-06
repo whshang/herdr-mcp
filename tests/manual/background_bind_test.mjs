@@ -270,12 +270,8 @@ globalThis.chrome = {
       if (message.path === "/extension/browser/registry") {
         const body = JSON.parse(message.body || "{}");
         browserRegistryRequests.push(body);
-        callback({
-          ok: true,
-          transport: "ipc",
-          status: 200,
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
+        const result = body.operation === "endpoint.register"
+          ? {
             ok: true,
             endpoint: {
               endpoint_ref: "bep_test",
@@ -283,7 +279,22 @@ globalThis.chrome = {
               browser_family: "chrome",
               extension_version: body.extension_version,
             },
-          }),
+          }
+          : body.operation === "resource.observe"
+            ? {
+              ok: true,
+              resource: {
+                resource_ref: body.kind === "account" ? "bra_gemini_account" : "brs_gemini_session",
+                kind: body.kind,
+              },
+            }
+            : { ok: true };
+        callback({
+          ok: true,
+          transport: "ipc",
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(result),
         });
         return;
       }
@@ -616,6 +627,52 @@ function dispatchMessage(msg, sender = {}) {
     onMsg(msg, sender, done);
     setTimeout(() => done(undefined), 1000);
   });
+}
+
+console.log("\n[Gemini browser registry observation]");
+{
+  const before = browserRegistryRequests.length;
+  const geminiUrl = "https://gemini.google.com/app/gemini-session-1";
+  const registered = await dispatchMessage({
+    type: "h2w_register",
+    site: "gemini",
+    convKey: geminiUrl,
+    url: geminiUrl,
+    accountNativeIdentity: `google-account-sha256:${"a".repeat(64)}`,
+  }, { tab: { id: 91, url: geminiUrl } });
+  const observed = browserRegistryRequests.slice(before);
+  ok(registered?.bound === false
+      && registered?.browser_session_ref === "brs_gemini_session"
+      && Number.isSafeInteger(registered?.browser_generation),
+    "Gemini registration returns the opaque browser session and capability generation",
+    JSON.stringify(registered));
+  ok(observed.length === 3
+      && observed[0]?.operation === "provider.observe"
+      && observed[0]?.provider === "gemini"
+      && observed[1]?.operation === "resource.observe"
+      && observed[1]?.kind === "account"
+      && observed[1]?.parent_ref === null
+      && observed[2]?.operation === "resource.observe"
+      && observed[2]?.kind === "session"
+      && observed[2]?.parent_ref === "bra_gemini_account"
+      && !observed.some((request) => request?.kind === "space"),
+    "Gemini observes account -> session without fabricating a space resource",
+    JSON.stringify(observed));
+
+  const beforeUnsupported = browserRegistryRequests.length;
+  const unsupportedUrl = "https://gemini.google.com/gem/custom/app/gemini-session-2";
+  const unsupported = await dispatchMessage({
+    type: "h2w_register",
+    site: "gemini",
+    convKey: unsupportedUrl,
+    url: unsupportedUrl,
+    accountNativeIdentity: `google-account-sha256:${"b".repeat(64)}`,
+  }, { tab: { id: 92, url: unsupportedUrl } });
+  ok(unsupported?.bound === false
+      && unsupported?.browser_session_ref == null
+      && browserRegistryRequests.length === beforeUnsupported,
+    "Gemini unsupported URL shapes fail closed without creating browser resources",
+    JSON.stringify(unsupported));
 }
 
 console.log("\n[trusted browser control action]");
