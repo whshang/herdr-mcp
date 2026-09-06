@@ -41,15 +41,10 @@ pub fn status(params: &Value, snapshot: &Value) -> Value {
     if root_raw.trim().is_empty() {
         return invalid_params("project_root must be a non-empty string");
     }
-    let root = PathBuf::from(root_raw);
-    if !snapshot_contains_project_root(snapshot, &root) {
-        return json!({
-            "ok": false,
-            "code": "project_root_not_managed",
-            "message": "project_root must match a project/worktree in the live Herdr snapshot",
-            "project_root": root_raw,
-        });
-    }
+    let root = match managed_project_root(snapshot, root_raw) {
+        Ok(root) => root,
+        Err(error) => return error,
+    };
 
     let pr_number = match object.get("pr_number") {
         None | Some(Value::Null) => None,
@@ -156,22 +151,16 @@ pub fn status(params: &Value, snapshot: &Value) -> Value {
     )
 }
 
-fn snapshot_contains_project_root(snapshot: &Value, root: &Path) -> bool {
-    let root = root.to_string_lossy();
-    snapshot
-        .get("workspaces")
-        .and_then(Value::as_array)
-        .is_some_and(|workspaces| {
-            workspaces.iter().any(|workspace| {
-                workspace
-                    .get("worktree")
-                    .and_then(|worktree| worktree.get("checkout_path"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|path| path == root)
-                    || workspace
-                        .get("cwd")
-                        .and_then(Value::as_str)
-                        .is_some_and(|path| path == root)
+fn managed_project_root(snapshot: &Value, root_raw: &str) -> Result<PathBuf, Value> {
+    let topology = crate::projects::derive_routing(snapshot);
+    crate::fs_security::validate_exact_project_root_with_topology(&topology, root_raw)
+        .map(|managed| managed.root)
+        .map_err(|_| {
+            json!({
+                "ok": false,
+                "code": "project_root_not_managed",
+                "message": "project_root must match a project/worktree in the live Herdr snapshot",
+                "project_root": root_raw,
             })
         })
 }
@@ -472,6 +461,34 @@ fn bounded_stderr(stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_REPO: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_repo() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sequence = NEXT_REPO.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "herdr-github-status-{}-{unique}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        root
+    }
 
     #[test]
     fn parses_common_github_remotes() {
@@ -528,18 +545,25 @@ mod tests {
     }
 
     #[test]
-    fn project_root_must_be_live_managed_root() {
+    fn project_root_uses_the_shared_managed_project_topology() {
+        let root = temp_repo();
         let snapshot = json!({
-            "workspaces": [{"worktree": {"checkout_path": "/repo"}}]
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": root.to_string_lossy(),
+            }],
+            "agents": []
         });
-        assert!(snapshot_contains_project_root(
-            &snapshot,
-            Path::new("/repo")
-        ));
-        assert!(!snapshot_contains_project_root(
-            &snapshot,
-            Path::new("/other")
-        ));
+
+        assert_eq!(
+            managed_project_root(&snapshot, root.to_str().unwrap()).unwrap(),
+            root
+        );
+        let other = root.parent().unwrap().join("not-the-project");
+        let error = managed_project_root(&snapshot, other.to_str().unwrap()).unwrap_err();
+        assert_eq!(error["code"], "project_root_not_managed");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
