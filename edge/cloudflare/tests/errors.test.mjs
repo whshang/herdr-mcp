@@ -37,6 +37,9 @@ test("errors: timeout read retryable, mutating not", () => {
   assert.equal(read.retryable, true);
   assert.equal(mutating.retryable, false);
   assert.equal(unknown.retryable, false);
+  assert.match(read.message, /retrying a read is safe/);
+  assert.match(mutating.message, /mutating operation/);
+  assert.match(unknown.message, /verify live state before replay/);
   assert.equal(read.requires_human, false);
   assert.equal(mutating.requires_human, false);
   assert.equal(unknown.requires_human, false);

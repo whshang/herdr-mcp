@@ -154,11 +154,14 @@ export function drainingResult(opts: { requestId?: string; workstationId?: strin
  */
 export function timeoutResult(opts: { requestId?: string; workstationId?: string; atMs?: number; opClass?: OpClass } = {}) {
   const retryable = opts.opClass === "read";
+  const message = opts.opClass === "read"
+    ? "request exceeded its deadline; retrying a read is safe"
+    : opts.opClass === "mutating"
+      ? "request exceeded its deadline; outcome unknown — do not blindly retry a mutating operation"
+      : "request exceeded its deadline; outcome unknown — verify live state before replay";
   return errorResult("request_timeout", {
     retryable,
-    message: retryable
-      ? "request exceeded its deadline; retrying a read is safe"
-      : "request exceeded its deadline; outcome unknown — do not blindly retry a mutating op",
+    message,
     ...opts,
   });
 }

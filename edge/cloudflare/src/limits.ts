@@ -26,10 +26,15 @@ export const DEFAULT_MAX_COMPLETED_RECORDS = 512;
 /** How long a completion remains replayable after settle. */
 export const DEFAULT_COMPLETED_RECORD_TTL_MS = 600_000; // 10 min
 
-/** Request timeout budget (clamped, mirrors local ≤60 s RPC convention). */
+/**
+ * Edge/Link transport timeout budget. Public tool execution remains capped at
+ * 60s, but the transport needs a small settlement margin so a 60s local tool
+ * timeout can still return its final result instead of racing the Edge timer.
+ */
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const MIN_REQUEST_TIMEOUT_MS = 1_000;
-export const MAX_REQUEST_TIMEOUT_MS = 60_000;
+export const MAX_REQUEST_TIMEOUT_MS = 65_000;
+export const REQUEST_SETTLEMENT_GRACE_MS = 5_000;
 
 /** Link presence: after this long with no hello/heartbeat the link is stale. */
 export const DEFAULT_LINK_STALE_AFTER_MS = 45_000;

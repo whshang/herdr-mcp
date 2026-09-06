@@ -29,7 +29,9 @@ pub const MAX_KEYS_PER_OBJECT: usize = 512;
 pub const MAX_ITEMS_PER_ARRAY: usize = 4096;
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MIN_TIMEOUT_MS: u64 = 1_000;
-pub const MAX_TIMEOUT_MS: u64 = 60_000;
+// Transport may outlive the public 60s tool timeout briefly so the final
+// timeout/result frame can settle without racing the Link/Edge deadline.
+pub const MAX_TIMEOUT_MS: u64 = 65_000;
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 const ID_GRAMMAR_DISPLAY: &str = "/^[A-Za-z0-9][A-Za-z0-9._:-]*$/";
 

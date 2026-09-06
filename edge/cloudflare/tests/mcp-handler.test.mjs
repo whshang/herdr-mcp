@@ -170,6 +170,17 @@ test("tools/call forwards only frozen tools with epoch/hash and preserves id", a
   assert.equal(d.calls[0].deadlineMs, 31_000);
 });
 
+test("tool timeout gets transport settlement grace instead of racing the Edge deadline", async () => {
+  const d = deps();
+  const r = await handleMcp(req(8, "tools/call", {
+    name: "herdr_exec",
+    arguments: { workspace: "w2", command: "git status", timeout_ms: 60_000 },
+  }), "w1", d.value);
+  assert.equal(r.body.result.isError, undefined);
+  assert.equal(d.calls.length, 1);
+  assert.equal(d.calls[0].deadlineMs, 66_000);
+});
+
 test("read-only call retries across a stale generation window after supersede proved not delivered", async () => {
   let forwards = 0;
   const d = deps({

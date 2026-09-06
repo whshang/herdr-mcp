@@ -57,9 +57,9 @@ export const MAX_KEYS_PER_OBJECT = 512;
 export const MAX_ITEMS_PER_ARRAY = 4096;
 /** Default raw frame byte budget (well below the DO 32 MiB platform cap). */
 export const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024; // 1 MiB
-/** Defaults for timeout_ms on the wire: 1s..60s (mirrors local RPC cap). */
+/** Wire transport timeout allows 5s settlement grace above the 60s tool cap. */
 export const MIN_TIMEOUT_MS = 1_000;
-export const MAX_TIMEOUT_MS = 60_000;
+export const MAX_TIMEOUT_MS = 65_000;
 
 export interface RelayValidationOptions {
   /** Raw UTF-8 frame byte budget, pre-parse. */

@@ -104,7 +104,7 @@ export const MAX_KEYS_PER_OBJECT = 512;
 export const MAX_ITEMS_PER_ARRAY = 4096;
 export const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
 export const MIN_TIMEOUT_MS = 1_000;
-export const MAX_TIMEOUT_MS = 60_000;
+export const MAX_TIMEOUT_MS = 65_000;
 
 export const ID_GRAMMAR = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
