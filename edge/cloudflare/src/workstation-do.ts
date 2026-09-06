@@ -47,6 +47,8 @@ import {
 import {
   classifyOp,
   makeLimits,
+  MAX_LINK_REQUEST_TIMEOUT_MS,
+  MIN_REQUEST_TIMEOUT_MS,
   HEARTBEAT_PERSIST_THROTTLE_MS,
   EDGE_STATUS_REPLY_INTERVAL_MS,
 } from "./limits.js";
@@ -573,13 +575,18 @@ export class WorkstationDO {
       );
     }
 
+    const deadlineMs = req.deadlineMs ?? now + this.limits.requestTimeoutMs;
+    const linkTimeoutMs = Math.min(
+      MAX_LINK_REQUEST_TIMEOUT_MS,
+      Math.max(MIN_REQUEST_TIMEOUT_MS, deadlineMs - now),
+    );
     const wire: ToolRequestMessage = {
       protocol_version: RELAY_PROTOCOL_VERSION,
       kind: "tool_request",
       workstation_id: workstationId,
       request_id: requestId,
       operation: req.op,
-      timeout_ms: req.deadlineMs ? req.deadlineMs - now : this.limits.requestTimeoutMs,
+      timeout_ms: linkTimeoutMs,
       contract_epoch: req.contractEpoch,
       contract_hash: req.contractHash,
       idempotency_key: req.idempotencyKey,
@@ -590,7 +597,6 @@ export class WorkstationDO {
       return this.json({ status: "error", error: drainingResult({ requestId, workstationId, atMs: now }) }, 503);
     }
 
-    const deadlineMs = now + (wire.timeout_ms ?? this.limits.requestTimeoutMs);
     if (!this.hasActiveLink()) {
       const waited = await this.waitForActiveLink(deadlineMs);
       // Re-check revocation after waiting: a revoke that woke the waiter must

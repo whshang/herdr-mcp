@@ -43,7 +43,7 @@ pub const LEGACY_EPOCH1_CONTRACT_HASH: &str =
 const DAEMON_TRANSPORT_PING_MS: i64 = 15_000;
 const DAEMON_HEARTBEAT_MS: i64 = 60_000;
 const DAEMON_MAX_SILENCE_MS: i64 = 60_000;
-const DAEMON_REQUEST_TIMEOUT_MS: u64 = 65_000;
+const DAEMON_REQUEST_TIMEOUT_MS: u64 = 60_000;
 const DAEMON_DRAIN_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,7 +246,7 @@ pub async fn run_link_daemon(config: LinkDaemonConfig) -> Result<i32, String> {
     );
     manager_options.contract_epoch = config.contract_epoch;
     manager_options.default_timeout_ms = RUNTIME_GENERATION_DEFAULT_TIMEOUT_MS;
-    manager_options.max_timeout_ms = 65_000;
+    manager_options.max_timeout_ms = 60_000;
     manager_options.observation_checks = 3;
     manager_options.observation_interval_ms = 500;
     manager_options.managed_current_link = config

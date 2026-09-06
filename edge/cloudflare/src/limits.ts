@@ -35,6 +35,8 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const MIN_REQUEST_TIMEOUT_MS = 1_000;
 export const MAX_REQUEST_TIMEOUT_MS = 65_000;
 export const REQUEST_SETTLEMENT_GRACE_MS = 5_000;
+/** Legacy/current Link wire contract remains capped at the public 60s tool budget. */
+export const MAX_LINK_REQUEST_TIMEOUT_MS = 60_000;
 
 /** Link presence: after this long with no hello/heartbeat the link is stale. */
 export const DEFAULT_LINK_STALE_AFTER_MS = 45_000;
