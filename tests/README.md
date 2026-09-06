@@ -21,8 +21,6 @@ Not in `npm test`. Run explicitly when needed:
 
 | File | When |
 |---|---|
-| `oauth_flow.mjs` | OAuth discovery + token smoke |
-| `push_sse.mjs` | `/push/events` (+ `--integration` for live agent) |
 | `mcp_activity_smoke.mjs` | `/push/mcp-activity` ring buffer |
 | `extension_smoke.mjs` | Extension static + pure logic |
 | `background_bind_test.mjs` | Binding state machine with chrome mocks |

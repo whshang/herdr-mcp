@@ -8,16 +8,18 @@ import {
 export interface OAuthMcpAuthEnv {
   DEV_MCP_BEARER_SECRET?: string;
   STATIC_MCP_BEARER_SECRET?: string;
+  STATIC_MCP_BEARER_EXPIRES_AT_MS?: string;
   OAUTH_ISSUER?: string;
   OAUTH_JWT_PUBLIC_PEM?: string;
 }
 
 export type McpAuthResult =
-  | { ok: true; source: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge"; clientId?: string }
+  | { ok: true; source: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge"; clientId?: string; principalType?: string; deviceId?: string }
   | { ok: false; code: "mcp_auth_failed" };
 
 export interface OAuthMcpAuthDeps {
-  verifyEdgeToken?: (token: string) => Promise<{ ok: boolean; clientId?: string }>;
+  verifyEdgeToken?: (token: string) => Promise<{ ok: boolean; clientId?: string; principalType?: string; deviceId?: string }>;
+  verifyLegacyClient?: (clientId: string) => Promise<boolean>;
 }
 
 let cachedPublicPem = "";
@@ -90,8 +92,15 @@ export async function authenticateMcpRequest(
   const dev = authenticateStaticMcpBearer(request, env.DEV_MCP_BEARER_SECRET);
   if (dev.ok) return { ok: true, source: "dev_bearer" };
 
-  const staticBearer = authenticateStaticMcpBearer(request, env.STATIC_MCP_BEARER_SECRET);
-  if (staticBearer.ok) return { ok: true, source: "static_bearer" };
+  const staticExpiryRaw = env.STATIC_MCP_BEARER_EXPIRES_AT_MS?.trim();
+  const staticExpiry = staticExpiryRaw ? Number(staticExpiryRaw) : undefined;
+  const staticBearerActive = staticExpiry === undefined
+    ? true
+    : Number.isSafeInteger(staticExpiry) && staticExpiry > Date.now();
+  if (staticBearerActive) {
+    const staticBearer = authenticateStaticMcpBearer(request, env.STATIC_MCP_BEARER_SECRET);
+    if (staticBearer.ok) return { ok: true, source: "static_bearer" };
+  }
 
   const token = presentedBearer(request);
   if (!token) return { ok: false, code: "mcp_auth_failed" };
@@ -103,12 +112,28 @@ export async function authenticateMcpRequest(
       const verifier = createRs256AccessTokenVerifier(identity, await publicKeyFor(pem));
       const verdict = await verifier.verify(token, Math.floor(Date.now() / 1000));
       if (verdict.ok) {
-        const result: AccessTokenInfo = verdict.clientId
-          ? { ok: true, clientId: verdict.clientId }
-          : { ok: true };
-        return result.clientId
-          ? { ok: true, source: "oauth_jwt", clientId: result.clientId }
-          : { ok: true, source: "oauth_jwt" };
+        const legacyShape = verdict.principalType === undefined
+          && verdict.deviceId === undefined
+          && verdict.connectorId === undefined
+          && verdict.grantGeneration === undefined;
+        if (legacyShape && deps.verifyLegacyClient) {
+          if (!verdict.clientId) return { ok: false, code: "mcp_auth_failed" };
+          try {
+            if (!(await deps.verifyLegacyClient(verdict.clientId))) {
+              return { ok: false, code: "mcp_auth_failed" };
+            }
+          } catch {
+            return { ok: false, code: "mcp_auth_failed" };
+          }
+        }
+        if (legacyShape) {
+          const result: AccessTokenInfo = verdict.clientId
+            ? { ok: true, clientId: verdict.clientId }
+            : { ok: true };
+          return result.clientId
+            ? { ok: true, source: "oauth_jwt", clientId: result.clientId }
+            : { ok: true, source: "oauth_jwt" };
+        }
       }
     } catch {
       // A token not signed by the legacy key may be an Edge-issued JWT.
@@ -119,9 +144,14 @@ export async function authenticateMcpRequest(
     try {
       const edge = await deps.verifyEdgeToken(token);
       if (edge.ok) {
-        return edge.clientId
-          ? { ok: true, source: "oauth_edge", clientId: edge.clientId }
-          : { ok: true, source: "oauth_edge" };
+        if (!edge.clientId) return { ok: false, code: "mcp_auth_failed" };
+        return {
+          ok: true,
+          source: "oauth_edge",
+          clientId: edge.clientId,
+          ...(edge.principalType ? { principalType: edge.principalType } : {}),
+          ...(edge.deviceId ? { deviceId: edge.deviceId } : {}),
+        };
       }
     } catch {
       // Fail closed below.

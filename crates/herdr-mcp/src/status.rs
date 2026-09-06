@@ -718,7 +718,7 @@ fn issuer_host(issuer: &str) -> Option<String> {
     parsed.host_str().map(str::to_owned)
 }
 
-fn sanitize_probe_token(value: &str) -> String {
+pub(crate) fn sanitize_probe_token(value: &str) -> String {
     let lower = value.to_ascii_lowercase();
     if lower.contains("token")
         || lower.contains("secret")
@@ -885,7 +885,7 @@ fn probe_event_cache(paths: &RuntimePaths) -> EventCacheProbe {
         Duration::from_secs(1),
         Duration::from_secs(2),
     );
-    let since_result = native_tools::since(&cache, 0, None);
+    let since_result = native_tools::since(&cache, 0, None, Ok(None));
     let snapshot_state = cache.snapshot();
     let diagnostics = cache.diagnostics();
     let since_ok = since_result["ok"].as_bool() == Some(true);

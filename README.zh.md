@@ -30,7 +30,7 @@ Cloudflare Edge
 ### 推荐：给 Agent 一句话
 
 ```text
-帮我安装并配置 Herdr 和 herdr-mcp，请完整按照 https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md 执行；使用当前 Stable GitHub Release，完成 Cloudflare 和 ChatGPT 配置；如果我的 Cloudflare 账户已有合适的 active zone，优先引导使用专用 Custom Domain，否则保留 workers.dev；自动检测工作站网络和 fallback 路径，只在必须由我本人登录或授权时暂停，并在结束前验证整条连接真实可用。
+帮我安装 Herdr 和 herdr-mcp，请完整按照 https://raw.githubusercontent.com/whshang/herdr-mcp/main/docs/i18n/zh-CN/agent-install.md 执行：使用当前 Stable GitHub Release，完成 Cloudflare 和 ChatGPT 配置；如果我的 Cloudflare 账户已有合适的 active zone，优先使用专用 Custom Domain，否则保留 workers.dev；R2 保持可选；自动检测工作站网络路径，只在必须由我本人登录、创建 Cloudflare Token 或授权 ChatGPT 时暂停。
 ```
 
 Agent 会检查电脑环境、安装 Herdr 和 herdr-mcp，先用 `workers.dev` bootstrap Worker；Cloudflare Account 有合适 zone 时，会在 OAuth/Connector 固化前优先建议并完成 Custom Domain；随后启动开发机连接、指导你完成 ChatGPT 授权，自动验证实际网络路径，并用真实 MCP 请求验收。没有域名也不会卡住：Link 会在需要时从 direct `workers.dev` 无感切到已有本地代理，再到已验收的共享 Relay fallback。
@@ -73,13 +73,13 @@ Web AI 也可以通过私有 workstation method 在已加入的电脑之间复�
 
 ### 把新电脑加入现有设备组
 
-推荐直接在已经授权的 ChatGPT 对话里说：
+在任意一台已登记的电脑上运行：
 
 ```text
-给我的新电脑生成一个 Herdr 配对链接，10 分钟有效。
+herdr-mcp worker pair
 ```
 
-Herdr 会直接在 Edge 创建 pairing，不要求旧电脑在线。ChatGPT 会一起给出配对地址、一次性 6 位验证码、精确过期时间，以及可复制的 `herdr-mcp worker connect "<pairing-address>"` 命令。已授权 Mac 上的 `herdr-mcp worker pair` 仍保留为 CLI fallback。
+Herdr 会在 Worker 控制面创建 pairing，这个动作不需要路由到某一台电脑。pairing 属于设备/操作员管理的 fleet 动作，只能在**任意一台已登记的电脑**上通过 `herdr-mcp worker pair` 执行。绝不能拿正在安装的全新电脑执行 `worker pair` 来探测；如果这是第一台设备，先完成 Cloudflare Worker 初始化。pairing 返回配对地址、一次性 6 位验证码、精确过期时间，以及可复制的 `herdr-mcp worker connect "<pairing-address>"` 命令。
 
 然后把下面一句发给新电脑上的 Coding Agent：
 

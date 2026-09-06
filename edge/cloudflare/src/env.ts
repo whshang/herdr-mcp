@@ -23,6 +23,8 @@ export interface Env {
   DEV_MCP_BEARER_SECRET?: string;
   /** Optional static bearer compatibility with the current localhost runtime. */
   STATIC_MCP_BEARER_SECRET?: string;
+  /** Optional absolute Unix-ms expiry fence for a temporary static bearer. */
+  STATIC_MCP_BEARER_EXPIRES_AT_MS?: string;
   /** Exact production OAuth issuer used to validate already-issued access JWTs. */
   OAUTH_ISSUER?: string;
   /** Existing production OAuth RS256 public key, supplied as a Worker secret. */

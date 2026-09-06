@@ -77,20 +77,22 @@ When ChatGPT needs to reach the workstation over the Internet, use a Cloudflare 
 
 For automated installation, the executing Agent follows [Agent install](agent-install.md) / [Agent installation](agent-install.md) directly; those protocols own Token scoping, Worker naming, secret injection, account choice, and the boundary for network blockers.
 
-For a manual deployment, keep these constraints:
-
-- Cloudflare API Token is an ephemeral process value, not a repository or log value;
-- keep `workers_dev = true`; `routes = []` is the zero-domain bootstrap state, not the preferred final identity when a suitable active zone is available; use the Worker Custom Domain flow for the final hostname rather than generic DNS Write;
-- derive the Worker name using the repository helper:
+For a manual/operator deployment, use the installed runtime too:
 
 ```bash
-WORKER_NAME="$(node scripts/cloudflare-worker-name.mjs "$(hostname)")"
+herdr-mcp worker bootstrap
 ```
 
+This command owns Worker naming, release-artifact verification, direct Cloudflare API upload, secrets, first-device enrollment, and readiness verification. Ordinary manual installation does not require a source checkout, Node.js, npm, Wrangler, or `wrangler.user.toml`.
+
+Keep these constraints:
+
+- Cloudflare API Token is an ephemeral process value, not a repository or log value;
+- keep `workers.dev` as the zero-domain bootstrap origin; when a suitable active zone is available, finalize a Worker Custom Domain before Connector authorization rather than using generic DNS Write;
 - keep `LINK_SHARED_SECRET` as a Worker secret;
 - the workstation makes outbound authenticated WSS and does not expose a public local port.
 
-See [Agent-assisted installation](agent-install.md) and [Cloudflare Edge deployment](cloudflare-edge-deployment.md) for the detailed manual contract.
+See [Agent-assisted installation](agent-install.md) for the ordinary bootstrap contract. [Cloudflare Edge deployment](cloudflare-edge-deployment.md) retains the source/Wrangler workflow only as a maintainer and deep-operations reference.
 
 ## Step 4: install and verify the Herdr Link
 

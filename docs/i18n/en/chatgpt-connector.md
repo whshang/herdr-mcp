@@ -49,7 +49,7 @@ The exact ChatGPT UI evolves. The general flow is:
 https://<your-edge-origin>/mcp
 ```
 
-4. Complete OAuth in the browser.
+4. Complete OAuth in the browser. On first authorization, Herdr shows a short-lived approval request instead of silently granting access; approve it from any computer already enrolled in this Worker with `herdr-mcp connector approve <approval-request-id>`. An approved WebChat Connector remains ordinary MCP only and cannot approve another Connector.
 5. Create a new conversation for validation.
 
 Never paste `HERDR_MCP_TOKEN` into ChatGPT. Public ChatGPT access uses OAuth. Static bearer is for local clients such as curl or Cursor.
@@ -73,16 +73,24 @@ Keep the Edge origin stable. Local runtime generations can upgrade behind it wit
 
 ## OAuth flow
 
-The Edge handles the OAuth boundary:
+The Edge handles the OAuth boundary. Dynamic Client Registration (DCR) only registers client metadata; it is **not** authorization. Since v0.4.6, a new Connector cannot exchange for a token until an enrolled-device/operator control channel records an explicit approval:
 
 ```text
-ChatGPT
-  │ metadata discovery
+Connector
+  │ metadata discovery + DCR
   │ authorize + PKCE
-  │ token
   ▼
-MCP request
+Herdr pending approval page
+  │ request id + short-lived 6-digit code
+  └─ any enrolled computer:
+       herdr-mcp connector approve <request-id>
+  ▼
+authorization code → token → MCP request
 ```
+
+Devices enrolled in the same Worker have no owner/member hierarchy for this control plane. Worker/operator credentials administer the fleet; an approved Connector receives ordinary MCP access only and cannot approve/revoke other Connectors or pair/revoke devices. A pre-v0.4.6 OAuth token that was issued before explicit approval remains usable for ordinary MCP compatibility until an operator explicitly revokes its client grant. Use `herdr-mcp connector list` to obtain the immutable `connector_id` for current v0.4.6 Connector instances and `herdr-mcp connector revoke <connector-id> --confirm` to revoke one independently. Legacy clients that predate Connector-instance records remain revocable through the compatibility grant tombstone.
+
+The approval code is single-purpose, short-lived, attempt-bounded, and is entered interactively rather than accepted on CLI argv. Disconnecting a Connector in a provider UI is not a substitute for server-side revocation when you intend to remove Herdr authorization.
 
 Troubleshoot:
 

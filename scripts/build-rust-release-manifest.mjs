@@ -49,6 +49,10 @@ export function releaseAssetName(version, target) {
   return `herdr-mcp-${version}-${target}${suffix}`;
 }
 
+export function edgeReleaseAssetName(version) {
+  return `herdr-edge-${version}.mjs`;
+}
+
 async function sha256File(path) {
   const bytes = await readFile(path);
   return createHash("sha256").update(bytes).digest("hex");
@@ -107,6 +111,20 @@ export async function buildRustReleaseManifest({
     });
   }
 
+  const edgeName = edgeReleaseAssetName(version);
+  if (!names.has(edgeName)) throw new Error(`missing Edge release asset: ${edgeName}`);
+  const edgePath = join(assetsDir, edgeName);
+  const edgeInfo = await stat(edgePath);
+  if (!edgeInfo.isFile() || edgeInfo.size <= 0 || edgeInfo.size > 64 * 1024 * 1024) {
+    throw new Error(`invalid Edge release asset: ${edgeName}`);
+  }
+  const edge = {
+    name: edgeName,
+    size: edgeInfo.size,
+    sha256: await sha256File(edgePath),
+    url: `https://github.com/${repo}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(edgeName)}`,
+  };
+
   return {
     schema_version: 2,
     product: "herdr-mcp",
@@ -136,6 +154,7 @@ export async function buildRustReleaseManifest({
       hash: contract.contract_hash,
       tool_count: contract.tool_count,
     },
+    edge,
     assets,
   };
 }

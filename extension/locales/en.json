@@ -331,7 +331,7 @@
   "cc_devices_observed": "Observed at {value}",
   "cc_devices_empty": "No registered devices.",
   "cc_devices_not_available": "Device inventory unavailable",
-  "cc_devices_owner_required": "This computer does not have Worker owner permission to read the full device inventory.",
+  "cc_devices_owner_required": "This computer does not have a usable Worker fleet credential to read the full device inventory.",
   "cc_devices_runtime_unavailable": "The current local runtime does not expose the 0.4.5 device inventory view yet.",
   "cc_devices_unavailable": "Could not read Worker devices: {error}",
   "cc_device_this": "this device",

@@ -52,5 +52,5 @@ test("OAuth authorization fails closed when the short-code HMAC secret is unavai
   assert.equal(response.status, 503);
   const body = await response.json();
   assert.equal(body.error, "server_error");
-  assert.equal(body.error_description, "OAuth owner approval is not configured");
+  assert.equal(body.error_description, "OAuth fleet approval is not configured");
 });

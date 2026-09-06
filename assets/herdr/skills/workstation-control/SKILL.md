@@ -48,23 +48,11 @@ Verify control operations with the cheapest relevant live observation; request s
 
 Discover registered devices and their status with `herdr_devices`.
 
-To connect a new computer without requiring an existing or online workstation, create a short-lived pairing session directly at Edge using `herdr_call`:
+Fleet administration belongs to enrolled devices and Worker operator credentials. Devices enrolled in the same Worker have no owner/member hierarchy. An explicitly approved Connector/WebChat is an ordinary MCP principal, not a fleet-administration channel; approval never grants permission to pair/revoke devices or administer other principals. A pre-v0.4.6 OAuth token that never went through explicit approval remains ordinary MCP compatibility only until an operator explicitly revokes its client grant.
 
-```text
-herdr_call(method="herdr_mcp.device.pair", params='{"ttl_seconds":600,"name":"<optional-name>"}')
-```
+When the user asks to add, pair, configure, or generate a setup link for a new computer, create the short-lived pairing from any already-enrolled computer with `herdr-mcp worker pair`. Never run `worker pair` on the fresh computer to discover whether a fleet exists. If this is the first Worker and no enrolled device exists, complete first-Worker Cloudflare bootstrap instead of attempting pairing. Use the default 600-second TTL unless the user requests a shorter value. Present the pairing address, the one-time 6-digit verification code, and the exact `expires_at` time together. Also give the copyable `herdr-mcp worker connect "<pairing-address>"` command. Treat the code as short-lived enrollment data; never persist it to Git, shell history, ordinary logs, or unattended automation, and enter it only at the new computer's interactive CLI prompt; the digits remain visible while typed.
 
-`herdr_mcp.device.pair` is Edge-local: it does not accept a `device` selector or pane/workspace refs, and no enrolled workstation is required. The returned pairing session provides the verification code and connection address for `herdr-mcp worker connect`.
-
-When the user asks in conversation to add, pair, configure, or generate a setup link for a new computer, prefer this Edge-local method instead of telling them to find an old workstation and run `worker pair`. Use the default 600-second TTL unless the user requests a shorter value. Present the pairing address, the one-time 6-digit verification code, and the exact `expires_at` time together, and make the expiry conspicuous. Also give the copyable `herdr-mcp worker connect "<pairing-address>"` command for the new computer. The code is intentionally returned to the OAuth-authorized owner conversation for this user-requested flow; treat it as short-lived enrollment data, never persist it to Git, shell history, ordinary logs, or unattended automation, and enter it only at the new computer's no-echo prompt.
-
-To permanently revoke an old enrolled computer from an OAuth-authorized owner conversation, first call `herdr_devices`, select the exact immutable `device_id`, then call:
-
-```text
-herdr_call(method="herdr_mcp.device.revoke", params='{"device_id":"dev_...","confirm":true}')
-```
-
-`herdr_mcp.device.revoke` is Edge-local and does not require any workstation to be online. It accepts only the immutable device identity plus explicit `confirm=true`; never substitute a display name or pane/workspace ref. Revocation permanently fences that credential and identity. To add the computer again later, create a new pairing and enroll a new device identity. The owner CLI `herdr-mcp worker revoke <device-id> --confirm` remains the fallback.
+To permanently revoke an enrolled computer, first use `herdr_devices` to identify the exact immutable `device_id`, then run `herdr-mcp worker revoke <device-id> --confirm` on any already-enrolled computer. Never substitute a display name or pane/workspace ref. Revocation permanently fences that credential and identity; re-enrollment requires a new pairing and new device identity.
 
 ## Conversation continuity recovery
 

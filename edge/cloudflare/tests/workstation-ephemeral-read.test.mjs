@@ -103,6 +103,33 @@ test("known reads settle successfully with zero Durable Storage mutations", asyn
   }
 });
 
+test("Edge settlement grace does not widen the legacy Link wire timeout", async () => {
+  const { subject, events } = makeSubject();
+  await init(subject, events);
+  const requestId = "settlement-grace-wire-cap";
+  const pending = subject.forwardInternal({
+    kind: "request",
+    requestId,
+    op: "herdr_exec",
+    opClass: "unknown",
+    deadlineMs: Date.now() + 65_000,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const sent = events.find((event) => event[0] === "send" && event[1].kind === "tool_request");
+  assert.ok(sent, "request should reach the Link");
+  assert.equal(sent[1].timeout_ms, 60_000, "legacy/current Link wire timeout must remain <=60s");
+  await subject.handleToolResult({
+    protocol_version: 1,
+    kind: "tool_result",
+    workstation_id: "prod-real-runtime",
+    request_id: requestId,
+    result: { ok: true },
+    served_at_ms: Date.now(),
+  });
+  const response = await pending;
+  assert.equal(response.status, 200);
+});
+
 test("read timeout emits cancel but performs zero Durable Storage mutations", async () => {
   const { subject, events } = makeSubject();
   await init(subject, events);
